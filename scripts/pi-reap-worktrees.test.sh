@@ -1132,6 +1132,18 @@ ANCHORS = {
         "        abstain_gate \"$path\" \"$branch\" \"$refs\" 0 \"$_ia_st\" && return 0",
         "        abstain_gate \"$path\" \"$branch\" \"$refs\" 0 && return 0   # MUTANT: the class token is dropped",
     ),
+    # (11) LOOSEN THE refs=merged CARVE-OUT (#2179 review round 8). Round 7 gated the interrupted-add
+    # token on `[ "$refs" = merged ]` precisely because that arm ALSO admits `branch-retained:*`,
+    # whose branch still HOLDS commits and is therefore not 0-ahead residue. The positive half was
+    # pinned (dropping the block reds A29p), the NEGATIVE half was not: A29p/A29q are both 0-ahead,
+    # so loosening the comparison published a commit-holding record as residue and left the suite
+    # GREEN. The mutant widens the test to any surviving ref; A29r is the commit-holding fixture and
+    # A29r-MUT drives this anchor. ⛔ THE ANCHOR IS THE COMPARISON LINE, which occurs exactly once
+    # (the bare `abstain_gate` form at the aged rule site does not contain it).
+    "branch-retained-no-token": (
+        "        if [ \"$refs\" = merged ]; then",
+        "        if [ \"$refs\" != \"\" ]; then   # MUTANT: the 0-ahead carve-out is loosened",
+    ),
 }
 s = open(src).read()
 old, new = ANCHORS[name]
@@ -3930,6 +3942,16 @@ assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" \
     "A29p the tally carries it (still a subset of preserved=)"
 assert_contains "$OUT" "STALLED REVIEW LIST" "A29p the list itself is PRINTED"
 assert_contains "$OUT" "  $WT" "A29p …with the stranded record's path"
+# ⛔ THE LEGEND PRINTED UNDER THE ROW IS PART OF THE ARTIFACT (review round 8, PR #3881): it said
+# `floor=<n>h is the class floor it is past` UNDER a row reading `floor=1800s`, and named a release
+# flag (`--reap-abandoned-wip`) that cannot move this class at all. Both are pinned here because the
+# legend is static text with no other assertion anywhere in this file.
+assert_contains "$OUT" "AT OR PAST" \
+    "A29p the legend states the qualifier the row is printed under, on the row's own terms"
+assert_contains "$OUT" "in that class's own unit" \
+    "A29p …and the UNIT, so `floor=1800s` is not contradicted two lines further down"
+assert_contains "$OUT" "CANNOT release that one" \
+    "A29p …and a class-aware remedy, because `--reap-abandoned-wip` cannot release a stash-withheld record"
 assert_dir "$WT" "A29p nothing was removed — the stash entry still parks lane work"
 
 # A29p-MUT: the token is what makes the leg above able to fail. This mutation IS the pre-fix code —
@@ -3954,6 +3976,78 @@ assert_absent "$ROW" "stalled=1" \
 assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
     "A29p-MUT …and the tally falls with it"
 assert_absent "$OUT" "STALLED REVIEW LIST" "A29p-MUT …and no list is printed at all"
+
+# ── A29r: the refs=merged CARVE-OUT is load-bearing — a commit-holding interrupted add is NOT named ──
+# ⛔ REVIEW ROUND 8, PR #3881. Round 7 gated the token on `[ "$refs" = merged ]` because the arm ALSO
+# admits `branch-retained:*`, whose branch still HOLDS commits and is therefore not 0-ahead residue at
+# all. The code is right — but nothing could falsify it: A29p/A29q are both 0-ahead, so loosening the
+# comparison emitted the token for a commit-holding record and left the whole suite GREEN. This leg is
+# that falsifier: A29p's fixture plus ONE commit the main ref does not have.
+ENV=A29r; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ia" feat/2963-tm)"
+commit_in_wt "$WT" "2020-01-01T00:00:00 +0000" retained   # the branch HOLDS a commit main does not
+printf 'edited\n' >"$WT/base.txt"
+ADMIN="$REPO/.git/worktrees/$ENV-ia"
+printf 'initializing' >"$ADMIN/locked"
+touch -t 202001010000 "$ADMIN/locked"
+register_stash "$REPO" feat/2963-tm
+rm -f "$T/$ENV/reap.log"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count main..feat/2963-tm)" "1" \
+    "A29r precondition: the branch HOLDS a commit (refs=branch-retained:*, not the 0-ahead class)"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_eq "$RC" "0" "A29r a preserve-only pass is not a failed pass"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29r non-vacuity: the stash ENTRY withheld the removal, so the record took the SAME arm as A29p"
+assert_absent "$ROW" "stalled=1" \
+    "A29r a record whose branch holds a commit is NOT 0-ahead residue — so it is never named"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
+    "A29r …the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29r …and no list is printed at all"
+assert_dir "$WT" "A29r nothing was removed — the commit and the parked work are still there"
+
+# A29r-MUT: loosening the carve-out is exactly what A29r measures. The mutation widens
+# `[ "$refs" = merged ]` to "any surviving ref", i.e. it re-publishes a commit-holding record as
+# 0-ahead residue — the direction no leg could see before A29r existed.
+ENV=A29s; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ia" feat/2964-tm)"
+commit_in_wt "$WT" "2020-01-01T00:00:00 +0000" retained
+printf 'edited\n' >"$WT/base.txt"
+ADMIN="$REPO/.git/worktrees/$ENV-ia"
+printf 'initializing' >"$ADMIN/locked"
+touch -t 202001010000 "$ADMIN/locked"
+register_stash "$REPO" feat/2964-tm
+MUT29R="$T/mutant-branch-retained-token.sh"
+mutate_reaper_anchored "$MUT29R" branch-retained-no-token
+OUT="$(REAPER="$MUT29R" REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "stalled=1 class=interrupted-add" \
+    "A29r-MUT WITHOUT the carve-out a commit-holding record IS published as 0-ahead residue — so A29r MEASURES it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" \
+    "A29r-MUT …and the tally inflates with it"
+assert_contains "$OUT" "STALLED REVIEW LIST" \
+    "A29r-MUT …and a record that HOLDS a commit is printed on the review list"
+assert_dir "$WT" "A29r-MUT the mutation changes the REPORT only — nothing is removed either way"
+
+# ── A29u: the ARTIFACT'S OWN --help NAMES THE THIRD FLOOR, ITS UNIT, AND ITS RELEASE PATH ──────
+# ⛔ REVIEW ROUND 8, PR #3881. The interrupted-add row prints `age=<n>s floor=1800s`, while `--help`
+# said the floor is "always an hour count", named only TWO floors, and mentioned
+# `REAP_WT_STALE_INIT_SECONDS` nowhere — so an operator holding a `floor=1800s` row had no entry for
+# it. Nothing in this file pinned any of that prose, which is exactly why three rounds' worth of
+# documentation fixes could have been undone in silence. One leg, one grep per claim.
+HELP="$("$REAPER" --help)"
+assert_contains "$HELP" "REAP_WT_STALE_INIT_SECONDS" \
+    "A29u --help NAMES the interrupted-add floor (a `floor=1800s` row is look-up-able)"
+assert_contains "$HELP" "The three floors a listed row can name" \
+    "A29u …and says there are THREE floors, not two"
+assert_absent "$HELP" "always an hour count" \
+    "A29u …and no longer claims every floor is an hour count (the sub-hour floor is in seconds)"
+assert_absent "$HELP" "The two floors a listed row can name" \
+    "A29u …and the two-floor sentence is gone (it contradicted the row it describes)"
+assert_contains "$HELP" "CANNOT release this one" \
+    "A29u …and the release paths are class-aware, so a stash-withheld row names a remedy that works"
 
 # ── A29-MUT: the COLLECTOR is load-bearing (drop it and A29a goes red) ───────────────────
 # The token is emitted inside `classify_one`, which runs in a command substitution, so the parent's

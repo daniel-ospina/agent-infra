@@ -140,7 +140,7 @@
 # can be asserted from here: a record it RELEASES is removed AND its 0-ahead lane ref deleted, so the
 # issue it named is dispatchable again on the next pre-flight; a record it does NOT release is either
 # inside its floor (nothing to assert yet — the next sweep acts) or on the STALLED list, NAMED with
-# the issue, its age, the class floor it is past, and the reason no later pass will move it.
+# the issue, its age, the class floor it is at or past, and the reason no later pass will move it.
 #
 # WHAT PUTS A RECORD ON THE LIST — only 0-commits-ahead lane residue (`refs=merged`, i.e. the branch
 # holds no commit the main ref does not), PAST its class floor, and only when this pass could not
@@ -157,13 +157,21 @@
 #     0-ahead residue at all. A stash entry is released by nothing (`stranded_stash_for` re-reads the
 #     same register on every later pass), so a `merged` interrupted add withheld by it blocked its
 #     issue for ever while the pass printed `stalled=0`.
-# `floor=<n>h` is the class floor that record is PAST, so every emitted value is a real floor from
-# `--help`'s vocabulary — never a bound that could not be applied (review round 2, PR #3881: an
-# earlier revision printed hour floors for records whose age could not be read). ⛔ THE ONE SUB-HOUR
-# FLOOR IS STATED IN SECONDS (`floor=1800s`): the interrupted-add floor is
+# `floor=` is the class floor that record is AT OR PAST, so every emitted value is a real, APPLIED
+# floor from `--help`'s operator-settable vocabulary — all three of them, which is why the third had
+# to be added there — never a bound that could not be applied (review round 2, PR #3881: an earlier
+# revision printed hour floors for records whose age could not be read).
+# ⛔ "AT OR PAST", NOT "PAST" (review round 8, PR #3881): the hour floors are compared strictly
+# (`> floor`, `<= floor` returns early) and printed CEILINGED, so a row there is always past its
+# floor; the interrupted-add arm's own gate is `-ge` on the class's seconds, so a record at exactly
+# 1800 s IS listed and reads `age=1800s floor=1800s` — a header that said "past" would deny a row
+# this file prints. The distinction is invisible to an operator and load-bearing to a reader.
+# ⛔ THE ONE SUB-HOUR FLOOR IS STATED IN SECONDS (`floor=1800s`): the interrupted-add floor is
 # `REAP_WT_STALE_INIT_SECONDS` (1800), and rounding it into hours would print `age=1h floor=1h` for
 # every record in (1800s, 3600s] — the exact "at its floor" ambiguity `age_h_ceil` exists to remove.
-# `age=` always carries the unit its own row's floor is stated in, so the two are comparable.
+# `age=` always carries the unit its own row's floor is stated in, so the two are comparable — and
+# the legend printed directly UNDER the rows states that unit too, because the row and its legend are
+# ONE contract read together (round 8: the legend said `floor=<n>h` under a `floor=1800s` row).
 #
 # ⛔ FOUR STATES ARE DELIBERATELY NOT STALLED, each for a stated reason:
 #   * a LIVE CLAIM — the issue is held by a lease, and leases expire;
@@ -1075,7 +1083,8 @@ fail-closed abort) neither writes nor deletes it.
 residue this pass did NOT release and no later pass will release on its own. It is
 a SUBSET of \`preserved=\`. A non-zero tally prints the list itself, each row
 naming the ISSUE its branch holds out of dispatch, with the reason and the floor
-in force — always an hour count, because a record that cannot be dated is not listed. A selected
+in force, in the unit THAT CLASS'S floor is stated in — whole hours for the two hour floors below,
+SECONDS for the one sub-hour floor — because a record that cannot be dated is not listed. A selected
 removal that FAILED (unverified backup, removal-time re-check) is deliberately NOT listed either: it
 is counted under \`remove=\` and reported by \`failed=\`/exit 4, and keeping it out is what makes
 \`stalled=\` an exact SUBSET of \`preserved=\`. The bound is the class floor plus one sweep.
@@ -1085,10 +1094,22 @@ A record is NAMED on that list for one of three reasons (the row's \`why=\`):
   why=withheld-by-abstention a STASH ENTRY names the branch, past its floor (durable parked work)
   why=ignored-data-held     the tree holds NON-REGENERABLE IGNORED data past its floor — no flag
                             moves that class at all, so only an operator can release it
-The two floors a listed row can name, both operator-settable:
-  REAP_WT_GHOST_AGE_HOURS (2)   the clean 0-commits-ahead lane class (ghost-zero-ahead)
-  REAP_WT_WIP_AGE_HOURS   (24)  the dirty and non-regenerable-ignored-data classes
-A record INSIDE its floor is never listed: the next sweep resolves it.
+The three floors a listed row can name, all operator-settable:
+  REAP_WT_GHOST_AGE_HOURS     (2)    the clean 0-commits-ahead lane class (ghost-zero-ahead)
+  REAP_WT_WIP_AGE_HOURS       (24)   the dirty and non-regenerable-ignored-data classes
+  REAP_WT_STALE_INIT_SECONDS  (1800) the interrupted-add class: an \`initializing\` lock older than
+                                     this is an add that never returned. THE ONE FLOOR STATED IN
+                                     SECONDS, because it is sub-hour — rounding it into hours would
+                                     print \`age=1h floor=1h\` for a record that is past it.
+A record INSIDE its floor is never listed: the next sweep resolves it (for the interrupted-add
+class, exactly AT the floor counts as inside-or-past — it IS listed, as \`age=1800s floor=1800s\`).
+
+Each \`why=\` names the ONLY release path, and they are NOT interchangeable:
+  opt-in-off             \`--reap-abandoned-wip\` (backup verified FIRST)
+  ignored-data-held      move or accept the NON-REGENERABLE ignored data, then the class releases
+  withheld-by-abstention drop the STASH ENTRY the branch's work is parked in (\`git stash drop\`).
+                         \`--reap-abandoned-wip\` CANNOT release this one: the stash entry withholds
+                         the record BEFORE that arm is reached, so arming the flag changes nothing.
 
 `git worktree remove` deletes the CHECKOUT, never the branch — named-branch
 worktrees lose no commits, and this script never runs \`git branch -D\`.
@@ -5925,10 +5946,14 @@ run() {
             log_line "  $_sp"
             log_line "      reason=$_sr  $_sd"
         done <<<"$STALLED_LIST"
-        log_line "  each row names the ISSUE its branch holds out of dispatch. Release a dirty record with"
-        log_line "  \`--reap-abandoned-wip\` (backup verified FIRST), or land/complete the work; a record that"
-        log_line "  stays here past its bound IS the #2179 defect."
-        log_line "  floor=<n>h is the class floor it is past."
+        log_line "  each row names the ISSUE its branch holds out of dispatch, and its why= names the ONLY"
+        log_line "  release path:  opt-in-off             -> --reap-abandoned-wip (backup verified FIRST)"
+        log_line "                 ignored-data-held      -> move or accept the non-regenerable ignored data"
+        log_line "                 withheld-by-abstention -> drop the stash ENTRY the work is parked in;"
+        log_line "                                           --reap-abandoned-wip CANNOT release that one"
+        log_line "  …or land/complete the work. A record that stays here past its bound IS the #2179 defect."
+        log_line "  floor= is the class floor the record is AT OR PAST, in that class's own unit:"
+        log_line "  <n>h for the hour floors, <n>s for the sub-hour interrupted-add floor."
     fi
 
     log_line ""
