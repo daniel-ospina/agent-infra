@@ -40,6 +40,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -1235,5 +1236,7 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, decl
 
 await partC();
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} test-module-load: ${pass} passed, ${fail} failed, ${skip} skipped`);
+// agent-infra#2723 — emit through the shared emitter so the failing arm always
+// carries the `runner::test-module-load` identity the merge rail reads.
+reportVerdict("test-module-load", pass, fail, { skip });
 process.exit(fail === 0 ? 0 : 1);

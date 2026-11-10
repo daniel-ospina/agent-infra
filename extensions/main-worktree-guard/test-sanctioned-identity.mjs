@@ -70,6 +70,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
 import { closureOf, computePin, diskTree, gitTree, parseRefArg, pinReport, sanctionedPaths } from "./sanctioned-pin-tree.mjs";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = realpathSync(fileURLToPath(new URL(".", import.meta.url)));
 const REPO = realpathSync(join(HERE, "..", ".."));
@@ -577,5 +578,9 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
   }
 }
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ""}`);
+// agent-infra#2723 — the aggregate carried COUNTS and no label, so the merge rail
+// (`scripts/ci_exemption.py`'s `runner::<label>` family) could not name this suite
+// and refused the whole PR blind. Measured on #2667 @ 5e320a09: this suite's only
+// machine-readable output was `❌ 12 passed, 6 failed`.
+reportVerdict("sanctioned-identity", pass, fail, { skip });
 process.exit(fail === 0 ? 0 : 1);

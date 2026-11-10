@@ -32,6 +32,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { computePin, diskTree, gitTree, parseRefArg, pinReport, PIN_REL } from "./sanctioned-pin-tree.mjs";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..", "..");
@@ -326,5 +327,7 @@ try {
   // every fixture repo is removed by its arm; nothing global to clean up
 }
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} ${pass} passed, ${fail} failed`);
+// agent-infra#2723 — the aggregate carried COUNTS and no label, so the merge rail
+// could not name this suite and refused the whole PR blind.
+reportVerdict("sanctioned-pin-merge-base", pass, fail);
 process.exit(fail === 0 ? 0 : 1);
