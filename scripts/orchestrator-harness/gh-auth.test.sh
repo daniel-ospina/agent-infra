@@ -67,8 +67,13 @@ echo "==> gh-auth self-test ($HERE)"
 # `hosts.yml` in exactly one fixture so "the account fallback" is a measurement and not an assumption.
 LANE_HOME="$TMP/lane-home"; ACCT="$TMP/acct"; ACCT_EMPTY="$TMP/acct-empty"
 mkdir -p "$LANE_HOME" "$ACCT_EMPTY" "$ACCT/.config/gh" "$TMP/cfg-a"
+# LANE_STORE is a lane HOME that HOLDS the store, and XDG_EMPTY is a set-but-empty XDG dir: the shape
+# where gh reads `<XDG>/gh` and never `$HOME/.config/gh` (below, A5b-A5d and B8).
+LANE_STORE="$TMP/lane-store"; XDG_EMPTY="$TMP/xdg-empty"
+mkdir -p "$LANE_STORE/.config/gh" "$XDG_EMPTY"
 printf 'github.com:\n    user: fixture\n    oauth_token: gho_fixture\n' > "$ACCT/.config/gh/hosts.yml"
 cp "$ACCT/.config/gh/hosts.yml" "$TMP/cfg-a/hosts.yml"
+cp "$ACCT/.config/gh/hosts.yml" "$LANE_STORE/.config/gh/hosts.yml"
 ENVF="$TMP/keys.env"
 
 # `gh_auth_resolve` reads ambient GH_CONFIG_DIR / XDG_CONFIG_HOME / GH_TOKEN, so every unit arm runs in
@@ -193,6 +198,22 @@ ck "A4 an ambient GH_CONFIG_DIR that holds NOTHING is reported, never silently o
 r="$(u ". '$GH_AUTH'; XDG_CONFIG_HOME='$ACCT/.config' gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "xdg|$ACCT/.config/gh" ]; rc=$?
 ck "A5 \$XDG_CONFIG_HOME/gh is next in gh's order ('$r')" $rc
+# ⛔ A SET `XDG_CONFIG_HOME` IS A CHAIN WITH NO FALLBACK PAST IT, so `$HOME/.config/gh` is NOT gh's default
+# in that shape — the manual's condition is that XDG is SET, not that a store exists under it, and Go's
+# `os.UserConfigDir` answers a non-empty XDG unconditionally. Pre-fix the `home` arm was unguarded, so this
+# shape answered `home` ("nothing to export") over a `gh` that reads `<XDG>/gh`, and the refusal then
+# asserted "the lane's gh IS credentialed". The store IS a real credential gh will not find on its own, so
+# it is exported under its OWN state (A5b/A5c), and the XDG-unset arm still resolves to plain `home` with
+# nothing exported (A5d) so the fix cannot buy its green by exporting everywhere.
+r="$(u ". '$GH_AUTH'; XDG_CONFIG_HOME='$XDG_EMPTY' gh_auth_resolve '$LANE_STORE' '$ENVF' '$ACCT_EMPTY'")"
+[ "$r" = "home-xdg|$LANE_STORE/.config/gh" ]; rc=$?
+ck "A5b XDG SET with no store under it does NOT make \$HOME/.config/gh gh's default, and the store there is named as its own state ('$r')" $rc
+r="$(u ". '$GH_AUTH'; XDG_CONFIG_HOME='$XDG_EMPTY' gh_auth_ensure '$LANE_STORE' '$ENVF' '$ACCT_EMPTY' >/dev/null; printf '%s' \"\${GH_CONFIG_DIR:-<unset>}\"")"
+[ "$r" = "$LANE_STORE/.config/gh" ]; rc=$?
+ck "A5c …and it is EXPORTED, because gh would never read it while XDG is set ('$r')" $rc
+r="$(u ". '$GH_AUTH'; gh_auth_ensure '$LANE_STORE' '$ENVF' '$ACCT_EMPTY' >/dev/null; printf '%s|%s' \"\$(gh_auth_resolve '$LANE_STORE' '$ENVF' '$ACCT_EMPTY')\" \"\${GH_CONFIG_DIR:-<unset>}\"")"
+[ "$r" = "home|$LANE_STORE/.config/gh|<unset>" ]; rc=$?
+ck "A5d …while with XDG UNSET it is still gh's own default: state=home and NOTHING exported (the export is not blanket) ('$r')" $rc
 r="$(u ". '$GH_AUTH'; GH_TOKEN=fixture-token gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "token|" ]; rc=$?
 ck "A6 a non-blank token NAME outranks every config dir, so the read cannot be blamed on one ('$r')" $rc
@@ -443,6 +464,23 @@ run_lane 3 40 "P0-blocker,harness" "crash on boot" evidence-fail 2516 b7 "$ACCT"
 ck "B7 under the ceiling an unreadable exemption still starts the lane (rc=$LANE_RC) — it is measured, not held" $rc
 grep -q 'EXEMPTION-UNREADABLE' "$TMP/b7.log"; rc=$?
 ck "B7b …and the log still carries the failure, so 'OK' can no longer imply the issue was judged" $rc
+
+# B8: THE SHAPE FINDING 1 NAMED, END TO END — `XDG_CONFIG_HOME` set with no store under it, and the store
+# in the LANE home. `gh` reads `<XDG>/gh` and nothing else while XDG is set, so pre-fix the resolver answered
+# `home` ("nothing to export"), the export never happened, the stub `gh` refused the way real gh does, and
+# the refusal asserted "the lane's gh IS credentialed (state=home …)" — over a lane whose every call fails.
+# Post-fix the store is exported under `home-xdg` and the P0 evidence READ. The account home is EMPTY here on
+# purpose: the only credential in the fixture is the lane home's, so nothing else can rescue the arm.
+run_lane 81 15 "P0-blocker,harness" "crash on boot" ok 2520 b8 "$ACCT_EMPTY" \
+  HOME="$LANE_STORE" XDG_CONFIG_HOME="$XDG_EMPTY"
+{ [ "$LANE_RC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "B8 XDG set, store only in the LANE home ⇒ the credential RESOLVES and the lane RUNS (rc=$LANE_RC)" $rc
+grep -q '\[gh-auth\] state=home-xdg' "$TMP/b8.log"; rc=$?
+ck "B8b …the lane log says state=home-xdg, so it cannot read as gh's own default ('$(grep -o 'state=[^ ]*' "$TMP/b8.log" | head -1)')" $rc
+grep -q 'EXEMPT .*P0 work' "$TMP/b8.log"; rc=$?
+ck "B8c …and the P0 evidence was READ, not assumed" $rc
+grep -q 'IS credentialed' "$TMP/b8.log" && rc=1 || rc=0
+ck "B8d …and nothing claims a credential the module never provided" $rc
 
 echo
 echo "───────────────────────────────────────"
