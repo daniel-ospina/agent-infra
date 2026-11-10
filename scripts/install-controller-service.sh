@@ -1753,20 +1753,79 @@ do_install() {
     # plausible heartbeat without asking whether the process that wrote it is alive, and a loop that ticked
     # once and exited leaves a FRESH heartbeat behind — so the poll could pass on a dead incarnation's last
     # tick while the unit had already converged to `failed`, and the verdict then printed a green "installed"
-    # with a pid that was gone. Re-read the facts the manager holds AFTER the poll, in the same pass as the
-    # proof: a `failed`/`inactive` unit, or a MainPID that is not live, is a start that produced no
-    # controller, whatever the heartbeat says.
+    # with a pid that was gone.
+    # ⛔ AND THE RE-READ IS AN ALLOW-LIST, NOT A DENY-LIST (review P1, #2627). The first shape of this gate
+    # refused only the words `failed` and `inactive`, which left TWO reachable green states:
+    #   (a) an UNREADABLE manager read — `|| true` folded it into an empty word that matches neither, so the
+    #       case fell through and the verdict printed `installed: … controller pid: <a pid read BEFORE the
+    #       poll>`. That is the cannot-read shape this same file treats as FATAL elsewhere
+    #       (`unit_active_state` returns 3 for it, :1220-1231), and it is caused by an expired `sudo -n`
+    #       timestamp or a user-scope manager with no DBus (`cloud-cell-supervisor.sh:2303-2306`);
+    #   (b) `activating` — with `Restart=always` + `RestartSec=15`, the moment a ticked-once loop exits the
+    #       unit is `activating (auto-restart)`, NOT `failed`. `controller_proof` passes there on the DEAD
+    #       incarnation's fresh heartbeat (its legs are `hb >= since` and `age <= 2*CYC`, neither of which
+    #       asks who wrote it), the lock leg fails on the dead pid, `is-active` answers `activating`, the case
+    #       fell through, and `--install` exited 0 — which `cloud-cell-bringup.sh` gates `CELL READY` on.
+    # So the verdict accepts ONLY the active tier, and only together with a LIVE MainPID read AFTER the poll
+    # (the `$pid` above is the pre-poll value; a restart inside the wait replaces it).
+    # The accepted words are systemd's OWN active tier, which is exactly the set `systemctl is-active` exits 0
+    # for (`systemctl-is-active.c::verb_is_active`: UNIT_ACTIVE, UNIT_RELOADING, UNIT_REFRESHING; the full
+    # ActiveState vocabulary is `unit-def.c::unit_active_state_table`). `activating`/`deactivating`/
+    # `maintenance`/`failed`/`inactive`/`unknown`/`not-found` and an empty (unreadable) answer are refusals.
+    # ⛔ `unit_active_state` MUST NOT BE REUSED HERE: it maps `activating` to 0 on purpose, because that is
+    # the right answer for the READS (`--status` reports a restarting unit as on its way) and the wrong one
+    # for this verdict — the very distinction the `pre_active` gate above already draws.
     if controller_proof "$proof_since" "$proof_o"; then
-        local _post_state
-        _post_state="$(sc_run is-active "$UNIT_NAME" 2>/dev/null || true)"
+        local _post_state _post_rc
+        # keep the rc: `|| true` is what made an unreadable read indistinguishable from a healthy one
+        if _post_state="$(sc_run is-active "$UNIT_NAME" 2>/dev/null)"; then _post_rc=0; else _post_rc=$?; fi
+        if [ "$_post_rc" -ne 0 ] && [ -z "${_post_state:-}" ]; then
+            err "cannot read whether $UNIT_NAME is active at the end of the proof wait — '$SC is-active' exited $_post_rc"
+            err "  with no answer, so this install cannot say a controller is running (the cell may have no supervisor):"
+            err "  a stale 'sudo -n' timestamp or a user-scope manager with no DBus answers exactly like this."
+            err "  journalctl -u $UNIT_NAME -n 40"
+            return 1
+        fi
         case "$_post_state" in
-            failed|inactive)
-                err "$UNIT_NAME reported '$_post_state' at the end of the proof wait — the unit has already given up:"
-                err "  a heartbeat is not a controller, and this one's author is gone (no live loop holds the lock)."
+            active|reloading|refreshing)
+                # a word systemd calls active must not come with a failing rc: two contradictory answers are
+                # not a proof, and picking the friendlier one is how a gate fails open
+                [ "$_post_rc" -eq 0 ] || {
+                    err "REFUSING: $UNIT_NAME answered '$_post_state' but '$SC is-active' exited $_post_rc — the read contradicts itself:"
+                    err "  a state word is a proof only when the verb that printed it agrees."
+                    return 1; } ;;
+            activating|deactivating)
+                err "REFUSING: $UNIT_NAME is '$_post_state' at the end of the proof wait — with Restart=always that is the"
+                err "  RestartSec window after the loop exited, not a running controller: the proof passed on the DEAD"
+                err "  incarnation's heartbeat (a heartbeat is not a controller, and this one's author is gone)."
+                sc_run status "$UNIT_NAME" --no-pager 2>&1 | sed 's/^/  /' | head -20 >&2 || true
+                err "  journalctl -u $UNIT_NAME -n 40"
+                return 1 ;;
+            *)
+                err "REFUSING: $UNIT_NAME answered '${_post_state:-<no answer>}' at the end of the proof wait — that is not"
+                err "  a running controller, whatever heartbeat the proof read (a heartbeat is not a controller)."
                 sc_run status "$UNIT_NAME" --no-pager 2>&1 | sed 's/^/  /' | head -20 >&2 || true
                 err "  journalctl -u $UNIT_NAME -n 40"
                 return 1 ;;
         esac
+        # ⛔ THE MAINPID IS READ AFTER THE POLL (review P1, #2627). The check this gate CLAIMED in its own
+        # comment (:1757: "a MainPID that is not live") did not exist: only the state word was re-read, so an
+        # `active` unit whose process had exited certified the install and the report printed the pre-poll pid.
+        _post_pid="$(unit_main_pid)" || {
+            err "cannot read $UNIT_NAME's MainPID at the end of the proof wait — the unit answers '$_post_state' but"
+            err "  nothing here can say a controller is running: read journalctl -u $UNIT_NAME -n 40"
+            return 1; }
+        [ "${_post_pid:-0}" != "0" ] || {
+            err "$UNIT_NAME is '$_post_state' with MainPID 0 at the end of the proof wait — no controller process:"
+            err "  read journalctl -u $UNIT_NAME -n 40"
+            return 1; }
+        kill -0 "$_post_pid" 2>/dev/null || {
+            err "$UNIT_NAME is '$_post_state' but its MainPID $_post_pid is NOT live at the end of the proof wait —"
+            err "  the process that wrote this heartbeat is gone, so the proof's author is gone with it:"
+            err "  read journalctl -u $UNIT_NAME -n 40"
+            return 1; }
+        # report the pid that is actually running, not the one read before the wait
+        pid="$_post_pid"
     fi
     controller_proof "$proof_since" "$proof_o" || {
         err "$UNIT_NAME is active with MainPID $pid, but NO CONTROLLER PROVED ITSELF in ${waited}s of ${proof_budget}s (${proof_budget_src}):"
