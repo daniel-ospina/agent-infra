@@ -659,6 +659,23 @@ coverage for every upstream file: recorded incidents went from 39 staged files t
   pre-#3716 2-dot scope too — the opt-out's "previous scope" promise holds for every
   scope producer (substitution aside, no scope is narrowed while the flag is set).
 
+Scope producers are `git commit` (staged / sweep / pathspec / branch / gh-chain arms) and
+`git push` (the tracking-ref arm unless the #3716 narrowing applies: the tracking ref is
+NOT an ancestor-or-equal of the pushed tip AND the integration base IS one; the tier-B/C
+paths keep their pre-#755 behaviour). Tier-C push fallback remains a
+deliberate non-goal; **rebase/cherry-pick push-leg de-flooding (#737, delivered in
+2026-09-25 as tortoise #3716) is no longer one** — a history-rewriting push is now
+scoped against the trusted base (3-dot), and no subtraction guard set can subtract from
+that narrowed range (guard (5) cannot pass: the tracking ref is not an ancestor of
+`srcRef`, hence not of `srcRef^1` — and every guard is required; see the push-range
+paragraph above). The narrowing's base must EQUAL the declared integration ref
+(the repo-local `git config --local vgate.integrationRef` — the activation
+surface; a `--global`/env key does NOT activate — confirmed by a checked-in
+`.vgate/integration-ref` tripwire that must declare the same single ref when
+present; agent-infra #1491),
+is resolved on pinned commit OIDs, and is never chosen from a ref name or the
+push remote's `main`. No config ⇒ no narrowing (fail closed).
+
 ### A record under a SIBLING worktree root is satisfied by CONTENT (#2886)
 
 Records are keyed on `(worktree root, relative path)`. A **rebase re-creates the branch in a
@@ -683,23 +700,6 @@ digest, so unchanged bytes re-rooted into a new worktree need no second verdict.
   and the roots they were borrowed from.
 - **Opt out:** `ELDATO_VGATE_NO_SUBTRACT=1`, like every other narrowing (it can cost time,
   never coverage).
-
-Scope producers are `git commit` (staged / sweep / pathspec / branch / gh-chain arms) and
-`git push` (the tracking-ref arm unless the #3716 narrowing applies: the tracking ref is
-NOT an ancestor-or-equal of the pushed tip AND the integration base IS one; the tier-B/C
-paths keep their pre-#755 behaviour). Tier-C push fallback remains a
-deliberate non-goal; **rebase/cherry-pick push-leg de-flooding (#737, delivered in
-2026-09-25 as tortoise #3716) is no longer one** — a history-rewriting push is now
-scoped against the trusted base (3-dot), and no subtraction guard set can subtract from
-that narrowed range (guard (5) cannot pass: the tracking ref is not an ancestor of
-`srcRef`, hence not of `srcRef^1` — and every guard is required; see the push-range
-paragraph above). The narrowing's base must EQUAL the declared integration ref
-(the repo-local `git config --local vgate.integrationRef` — the activation
-surface; a `--global`/env key does NOT activate — confirmed by a checked-in
-`.vgate/integration-ref` tripwire that must declare the same single ref when
-present; agent-infra #1491),
-is resolved on pinned commit OIDs, and is never chosen from a ref name or the
-push remote's `main`. No config ⇒ no narrowing (fail closed).
 
 ### VGATE ceremony diagnostics & recovery (#561)
 
