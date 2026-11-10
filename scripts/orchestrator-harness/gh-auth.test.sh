@@ -42,9 +42,11 @@
 #     ambient store — two orderings that were unpinned at the head that introduced the ordered read, each
 #     with a mutant that kept the suite at `passed: 61 failed: 0`.
 #
-# ⛔ HERMETIC: every arm runs `env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME -u GH_TOKEN -u GITHUB_TOKEN`, so a
-# runner that exports one of those (this fleet's cells DO) cannot turn a credential arm green by
-# accident — the failure #2138 records in `test_objective.py`, one suite over. The passwd record is the
+# ⛔ HERMETIC: every arm runs `env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME -u GH_TOKEN -u GITHUB_TOKEN` — the
+# resolver/cause arms through `u()` (`:85`), the end-to-end `run_lane` arms through the `env -u` it builds
+# itself — so a runner that exports one of those (this fleet's cells DO) cannot move an arm in EITHER
+# direction: the failure #2138 records in `test_objective.py`, one suite over, and the false BLOCK four
+# `gh_auth_cause` arms produced before review round 14 put them under `u()` too. The passwd record is the
 # ONE non-hermetic read in `gh-auth.sh` (the account home), and §A/§B replace it with a fixture through
 # `gh_auth_account_home`'s own name — a function override, not an env switch, so nothing a `keys.env`
 # sets can move it.
@@ -653,12 +655,19 @@ ck "B11d …and does NOT carry the credential caveat, which on this state would 
 # B10: A DIRECTORY THIS READ CANNOT OPEN IS NOT AN EMPTY ONE. ⛔ `[ -f dir/hosts.yml ]` answers FALSE for
 # both facts, so a store directory at `chmod 000` used to be reported as "holds no hosts.yml" — a
 # directory the read had never opened. `_gh_auth_store_in` separates them and the cause discloses.
+# ⛔ THESE ARMS RUN THROUGH `u()`, LIKE EVERY OTHER RESOLVER/CAUSE ARM (review round 14, P3): they used
+# to run in the SUITE'S OWN shell, so an ambient `GH_CONFIG_DIR` or `GH_TOKEN` — which this fleet's cells
+# really do export — reached them. Measured before the fix: `GH_CONFIG_DIR=<a store> bash gh-auth.test.sh`
+# → 98/1 (B10c red), `GH_TOKEN=x bash gh-auth.test.sh` → 97/2 (B10c and B10e red) — a FALSE BLOCK on a
+# correct tree — and B10d stayed green over an empty `CAN_NONE`, i.e. an arm that could not fail in that
+# environment. Being hermetic is what lets the header's claim be true; the environment is the suite's own
+# subject, so the suite of all things must not judge by it.
 UNREAD="$TMP/unread"; mkdir -p "$UNREAD/.config/gh"; : > "$UNREAD/.config/gh/hosts.yml"; chmod 000 "$UNREAD/.config/gh"
-( . "$GH_AUTH" >/dev/null 2>&1; [ "$(_gh_auth_store_in "$UNREAD/.config/gh")" = unreadable ] ); rc=$?
+u ". '$GH_AUTH' >/dev/null 2>&1; [ \"\$(_gh_auth_store_in '$UNREAD/.config/gh')\" = unreadable ]"; rc=$?
 ck "B10 _gh_auth_store_in calls a store directory it cannot open UNREADABLE, not empty" $rc
-( . "$GH_AUTH" >/dev/null 2>&1; case "$(_gh_auth_store_in "$ACCT_EMPTY")" in empty) exit 0 ;; *) exit 1 ;; esac ); rc=$?
+u ". '$GH_AUTH' >/dev/null 2>&1; case \"\$(_gh_auth_store_in '$ACCT_EMPTY')\" in empty) exit 0 ;; *) exit 1 ;; esac"; rc=$?
 ck "B10b …and a readable directory with no hosts.yml is still EMPTY (the discrimination is real, not blanket)" $rc
-CAN_NONE="$( . "$GH_AUTH" >/dev/null 2>&1; gh_auth_cause "$UNREAD" "$TMP/none.env" "$ACCT_EMPTY" )"
+CAN_NONE="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_cause '$UNREAD' '$TMP/none.env' '$ACCT_EMPTY'")"
 case "$CAN_NONE" in *"<unreadable: $UNREAD/.config/gh>"*) rc=0 ;; *) rc=1 ;; esac
 ck "B10c …and on the \`none\` outcome the cause prints <unreadable: …> for it rather than naming it as empty" $rc
 # ⛔ THE PATTERN HERE SAID `holds no hosts.yml` AND THE `none` BRANCH SAYS `no hosts.yml` — MEASURED: the arm
@@ -667,7 +676,7 @@ ck "B10c …and on the \`none\` outcome the cause prints <unreadable: …> for i
 case "$CAN_NONE" in *"no hosts.yml under $UNREAD/.config/gh or"*) rc=1 ;; *) rc=0 ;; esac
 ck "B10d …so it never names an unopenable dir as one it checked and found empty" $rc
 chmod 755 "$UNREAD/.config/gh"
-CAN_AMB="$( . "$GH_AUTH" >/dev/null 2>&1; chmod 000 "$UNREAD/.config/gh"; GH_CONFIG_DIR="$UNREAD/.config/gh" gh_auth_cause "$ACCT_EMPTY" "$TMP/none.env" "$ACCT_EMPTY"; chmod 755 "$UNREAD/.config/gh" )"
+CAN_AMB="$(u ". '$GH_AUTH' >/dev/null 2>&1; chmod 000 '$UNREAD/.config/gh'; GH_CONFIG_DIR='$UNREAD/.config/gh' gh_auth_cause '$ACCT_EMPTY' '$TMP/none.env' '$ACCT_EMPTY'; chmod 755 '$UNREAD/.config/gh'")"
 case "$CAN_AMB" in *"is set but this read could not OPEN it"*) rc=0 ;; *) rc=1 ;; esac
 ck "B10e …and an unreadable ambient GH_CONFIG_DIR is refused as unopenable, not as 'holds no hosts.yml'" $rc
 case "$CAN_AMB" in *"is set but holds no hosts.yml"*) rc=1 ;; *) rc=0 ;; esac
