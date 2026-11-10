@@ -1562,10 +1562,22 @@ jobs:
           node-version: '22'
       - name: Install undici for the real-transport arms (test-only)
         timeout-minutes: 5
+        # ⛔ THE COPY SET IS THE MODULE GRAPH, NOT THE EXTENSION DIRECTORY (#2723).
+        # The harness imports its verdict emitter as `../shared/verdict.mjs`, and ESM
+        # resolves a relative specifier against the IMPORTING module's URL — so under
+        # this temp root that specifier means `$RUNNER_TEMP/shared/verdict.mjs`, not
+        # the repo's `extensions/shared/verdict.mjs`. Copying only the extension left
+        # the sibling absent and the job died at load with
+        # `ERR_MODULE_NOT_FOUND … /_temp/shared/verdict.mjs` — the suite never ran, so
+        # this job reported RED for a reason that named no defect in the pool hygiene
+        # code. Materialise the emitter at the path the harness actually resolves;
+        # `extensions/shared/test-verdict.mjs` §4 now refuses a copy step that omits
+        # any import a materialised harness makes outside its own directory.
         run: |
           tmp="$RUNNER_TEMP/pool-hygiene-ext"
-          mkdir -p "$tmp"
+          mkdir -p "$tmp" "$RUNNER_TEMP/shared"
           cp -R extensions/http-pool-hygiene/. "$tmp/"
+          cp extensions/shared/verdict.mjs "$RUNNER_TEMP/shared/"
           npm install --no-save --no-audit --no-fund --prefix "$tmp" undici@8.9.0
       - name: http-pool-hygiene suite (real transport REQUIRED)
         timeout-minutes: 5

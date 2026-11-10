@@ -34,7 +34,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { reportVerdict, verdictLine } from "./verdict.mjs";
 
@@ -190,7 +190,7 @@ function resolveHarness(token) {
 }
 
 function workflowNodeHarnesses() {
-  const found = new Map(); // repo-relative path -> the workflow that runs it
+  const found = new Map(); // repo-relative path -> {wf, token}
   const files = readdirSync(WORKFLOWS).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   for (const wf of files) {
     const body = readFileSync(join(WORKFLOWS, wf), "utf8");
@@ -198,7 +198,7 @@ function workflowNodeHarnesses() {
       if (!/^\s*(?:-\s*)?run:/.test(line) || !/\bnode\b/.test(line)) continue;
       for (const token of line.match(/[A-Za-z0-9_./-]+\.mjs/g) ?? []) {
         const resolved = resolveHarness(token);
-        if (resolved) found.set(resolved, wf);
+        if (resolved) found.set(resolved, { wf, token });
       }
     }
   }
@@ -213,7 +213,7 @@ else bad("#3 the enumeration found a non-empty corpus", `only ${harnesses.size} 
 
 const sorted = [...harnesses.keys()].sort();
 for (const path of sorted) {
-  const wf = harnesses.get(path);
+  const wf = harnesses.get(path).wf;
   const body = readFileSync(join(REPO, path), "utf8");
   const emitterImport = String.raw`(?:^|\n)\s*import\s+\{[^}]*\breportVerdict\b[^}]*\}\s+from\s+["'][./][^"']*verdict\.mjs["']`;
   if (new RegExp(emitterImport).test(body)) { ok(`#3 ${path} (${wf}) emits through reportVerdict`); continue; }
@@ -235,6 +235,112 @@ for (const path of sorted) {
   if (offenders.length === 0) ok(`#3 ${path} prints no hand-rolled aggregate`);
   else bad(`#3 ${path} prints no hand-rolled aggregate`,
     offenders.map(([n, l]) => `line ${n}: ${l.trim()}`).join("\n     "));
+}
+
+// ── 4. a MATERIALISED harness must ship the imports it makes outside its dir ─
+console.log("\n#4 a `$RUNNER_TEMP`-copied harness ships every escaping relative import");
+
+// WHY THIS ARM EXISTS (measured, PR #3896 run 42838546373). `http-pool-hygiene`
+// copies only `extensions/http-pool-hygiene/.` into `$RUNNER_TEMP`, so the
+// harness's `import … from "../shared/verdict.mjs"` resolved to
+// `$RUNNER_TEMP/shared/verdict.mjs` — a path nothing had created. The job died at
+// LOAD with `ERR_MODULE_NOT_FOUND` before a single assertion ran, and it reported
+// RED for a reason that named no defect in the code under test. ESM resolves a
+// relative specifier against the importing module's own URL, so a copy RELOCATES
+// the base of every escaping import; the copy step therefore has to be the module
+// graph, not the directory. §3 could not see this: it reads the repo file and
+// proves the import EXISTS, which it always did — the file was just never copied.
+
+const VAR_ASSIGN = /^\s*([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|(\S+))\s*$/;
+
+/** Expand the step's own `VAR=…` assignments; leave GitHub-supplied vars literal. */
+function expandVars(text, vars) {
+  let out = text;
+  for (let i = 0; i < 8; i++) {
+    const next = out.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (m, name) =>
+      vars.has(name) ? vars.get(name) : m);
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
+/** Every `cp` in a workflow, as {source, dest, dirMode}. */
+function copyMappings(wfBody) {
+  const vars = new Map();
+  const out = [];
+  for (const raw of wfBody.split("\n")) {
+    const line = raw.trim();
+    const assign = VAR_ASSIGN.exec(line);
+    if (assign) {
+      vars.set(assign[1], assign[2] ?? assign[3] ?? assign[4] ?? "");
+      continue;
+    }
+    if (!/^cp\s/.test(line)) continue;
+    const words = [...line.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+    const args = words.slice(1).filter((w) => !w.startsWith("-"));
+    if (args.length < 2) continue;
+    const destRaw = expandVars(args[args.length - 1], vars);
+    const destIsDir = /\/$/.test(destRaw) || args.length > 2;
+    const dest = destRaw.replace(/\/+$/, "");
+    for (const srcRaw of args.slice(0, -1)) {
+      const src = expandVars(srcRaw, vars);
+      // `cp -R dir/. dst` and `cp -R dir/* dst` both materialise dir's CONTENTS.
+      const dirMode = /\/\.[/]?$/.test(src) || /\/\*$/.test(src);
+      out.push({
+        source: dirMode ? src.replace(/\/(?:\.|\*)\/?$/, "") : src,
+        dest,
+        destIsDir,
+        dirMode,
+      });
+    }
+  }
+  return out;
+}
+
+/** Relative specifiers in a file that escape the file's OWN directory. */
+function escapingImports(body) {
+  const specs = new Set();
+  const re = /(?:^|\n)\s*(?:import|export)\b[^"'`]*?from\s*["'](\.{1,2}\/[^"']+)["']/g;
+  for (const m of body.matchAll(re)) if (m[1].startsWith("../")) specs.add(m[1]);
+  return [...specs];
+}
+
+const materialised = sorted.filter((p) => !existsSync(join(REPO, harnesses.get(p).token)));
+if (materialised.length >= 1)
+  ok(`#4 the corpus holds ${materialised.length} workflow-materialised harness(es)`);
+else
+  bad("#4 the corpus holds a materialised harness",
+    "none found — copy-source resolution found only in-place runs, so this arm is INERT");
+
+for (const path of materialised) {
+  const { wf, token } = harnesses.get(path);
+  const body = readFileSync(join(WORKFLOWS, wf), "utf8");
+  const maps = copyMappings(body);
+  const ownDir = path.split("/").slice(0, -1).join("/");
+  // The mapping that materialises the harness's OWN directory fixes the base the
+  // runtime will resolve its relative specifiers against.
+  const own = maps.find((m) => m.dirMode && m.source === ownDir);
+  if (!own) {
+    bad(`#4 ${path} (${wf}) is copied by a mapping this pin can read`,
+      `no \`cp -R ${ownDir}/. <dest>\` found, so the materialised base is unknown`);
+    continue;
+  }
+  ok(`#4 ${path} (${wf}) materialises its own dir at ${own.dest}`);
+  for (const spec of escapingImports(readFileSync(join(REPO, path), "utf8"))) {
+    const expected = posix.normalize(posix.join(own.dest, spec));
+    const provided = maps.some((m) => {
+      if (m.dirMode) return posix.normalize(m.dest) === posix.dirname(expected);
+      if (!m.destIsDir) return posix.normalize(m.dest) === expected;
+      return posix.normalize(posix.join(m.dest, m.source.split("/").pop())) === expected;
+    });
+    if (provided) ok(`#4 ${path} (${wf}) ships ${spec} at ${expected}`);
+    else
+      bad(`#4 ${path} (${wf}) ships ${spec} at ${expected}`,
+        "the copy step materialises no such file, so the harness dies at LOAD with " +
+        "ERR_MODULE_NOT_FOUND and the job reports RED for a reason naming no defect in " +
+        "the code under test (#2723 / PR #3896 run 42838546373)");
+  }
 }
 
 // ── aggregate ───────────────────────────────────────────────────────────────
