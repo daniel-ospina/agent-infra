@@ -67,11 +67,14 @@
 #     $ GH_TOKEN=''    GITHUB_TOKEN=realtok gh auth token   ->  realtok          a zero-length value falls through
 #
 # gh takes the FIRST name holding a NON-EMPTY value and uses it even when it is all-blank — so a
-# blank-but-SET `GH_TOKEN` shadows a REAL `GITHUB_TOKEN` exactly as it shadows a store. Asking the two
-# names INDEPENDENTLY (`present` then `blank`) answered `token|` for that shape while `gh_auth_cause`
-# stayed silent, and the gate then asserted the lane's gh IS credentialed over a lane whose every call
-# fails: the same false claim `token-blank` was added to remove, one shape over. `gh_auth_token_state`
-# therefore decides BOTH names in ONE ordered read, and every consumer reads that one answer.
+# blank-but-SET `GH_TOKEN` shadows a REAL `GITHUB_TOKEN` exactly as it shadows a store, and a blank
+# `GITHUB_TOKEN` behind a REAL `GH_TOKEN` shadows NOTHING (a blank value only ever matters on the name gh
+# actually RESOLVES). Asking the two names INDEPENDENTLY answered `token|` for the first shape while
+# `gh_auth_cause` stayed silent, and the gate then asserted the lane's gh IS credentialed over a lane
+# whose every call fails: the same false claim `token-blank` was added to remove, one shape over.
+# `gh_auth_token_state` therefore decides BOTH names in ONE ordered read, it is the ONLY entry point for
+# that rule (see the note where the two old predicates were removed), and `gh_auth_resolve` puts it before
+# every store arm — the ambient one included, because a token outranks a store in gh's order too.
 #
 # ⛔ THE FILE IS PARSED STATICALLY, NEVER EXECUTED. `lane-env.sh` sources `keys.env` at top level for
 # the LANE's own credentials, and this module deliberately does NOT copy that: the dispatcher has
@@ -117,6 +120,10 @@ gh_auth_token_state() {
 # while a reader could take them for the covered interface and reintroduce exactly that split (fresh-context
 # review of #3872, finding 3: dead guards the next lane reads as tested). The blank-vs-empty distinction
 # they documented is pinned where it is DECIDED: `gh_auth_token_state`'s three arms and A7/A7b/A7c.
+# ⛔ AND THE ORDER ITSELF IS PINNED IN ALL FOUR AXES, not only the one the bug was found in (review
+# round 4, P2): a blank `GITHUB_TOKEN` behind a REAL `GH_TOKEN` shadows NOTHING where the mirror rule
+# (`worker-terminal.sh:1087`'s "a blank one in either hides a valid one") would answer `token-blank`, and a
+# blank token still outranks an AMBIENT store — A7i-A7k and B2i, each red under the mutant it exists for.
 
 # gh_auth_account_home — the ACCOUNT's home, which on a cell is NOT `$HOME` (HOME is redirected to the
 # operational home). Best-effort and never fatal: `getent` is Linux, `dscl` is macOS, `~user` is bash.
