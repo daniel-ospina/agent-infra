@@ -236,7 +236,7 @@ gh_auth_ensure() {
 # ⛔ EVERY LANE GETS THIS LINE, healthy or not: "which store did the gate read, and did the lane get the
 # same one" is the question #2509 took two boxes and a manual `gh` session to answer.
 gh_auth_log() {
-  local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" st d why
+  local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" st d why dshow
   [ -n "$ef" ] || ef="${ENV_FILE:-${home}/keys.env}"
   # ⛔ UNSUBSTITUTED, so the export survives (see `gh_auth_ensure`'s ⛔); the globals carry the answer.
   gh_auth_ensure "$home" "$ef" "$acct" >/dev/null
@@ -256,10 +256,11 @@ gh_auth_log() {
   # ⛔ `dir=` is a CONFIG DIR on every state but `token-blank`, where the second field is the token NAME
   # that shadowed — printing `dir=GH_TOKEN` beside `state=token-blank` reads as a directory, and a log line
   # whose field means two things is the kind of ambiguity this module exists to remove.
-  local dshow="${d:--}"
+  dshow="${d:--}"
   [ "$st" = token-blank ] && dshow='-'
   printf '[gh-auth] state=%s dir=%s lane_home=%s — %s\n' "$st" "$dshow" "${home:--}" "$why"
 }
+
 # gh_auth_cause <lane-home> [env-file] [account-home] — the CAUSE + REMEDY, or EMPTY when a credential
 # resolves (in which case the caller must NOT blame the credential).
 # ⛔ IT SPEAKS ONLY ON A POSITIVE READING (see POLARITY above): `none` means every directory gh would
