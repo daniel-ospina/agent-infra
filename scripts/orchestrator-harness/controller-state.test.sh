@@ -395,6 +395,31 @@ case "$(cat "$T/acq-keep")" in
   *"nothing was removed"*) ck "§2 …and it does not claim 'nothing was removed' with no location (that is the orphaned-copy text)" 1 ;;
   *) ck "§2 …and it does not claim 'nothing was removed' with no location" 0 ;;
 esac
+
+# ⛔ A NON-REGULAR OBJECT AT THE RECORD PATH MUST NOT BLOCK THE SINGLETON (fresh-context review of
+# #3846, cycle 3, MEASURED). `( set -o noclobber; … > "$LOCKF" )` is NOT `O_EXCL` for a non-regular
+# file: with a FIFO at `.orch.lock` bash opened it O_WRONLY and the acquire hung for the whole 5 s probe
+# cap and was still blocked when killed — the controller neither started nor refused. Under launchd
+# KeepAlive that is an endless SILENT restart, and every `harness-up` / `status` read of the same path
+# hangs with it. The row is bounded by a watcher, so a regression FAILS here instead of hanging the
+# suite (which is how this defect would otherwise present).
+LKP="$T/lkp"; mkdir -p "$LKP"
+mkfifo "$LKP/.orch.lock"
+( . "$MOD"; orc_singleton_acquire "$LKP/.orch.lock"; printf '%s|%s\n' "$?" "$ORC_SINGLETON_WHY" ) > "$T/acq-fifo" 2>&1 &
+FPID=$!
+_i=0; while kill -0 "$FPID" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i+1)); done
+if kill -0 "$FPID" 2>/dev/null; then
+  kill -9 "$FPID" 2>/dev/null
+  ck "§2 a FIFO at the record path does NOT block the singleton (a noclobber \`>\` on a FIFO opens O_WRONLY and hangs)" 1
+else
+  case "$(cat "$T/acq-fifo")" in
+    0\|*EMPTY*) ck "§2 a FIFO at the record path does not block the singleton — the odd object is reclaimed as an EMPTY record" 0 ;;
+    *) ck "§2 a FIFO at the record path returned '$(cat "$T/acq-fifo" | tr '\n' ' ')' — wanted rc 0 reclaiming it" 1 ;;
+  esac
+  [ -f "$LKP/.orch.lock" ] \
+    && ck "§2 …and what is left at the record path is a REGULAR record (the six shipped readers can parse it)" 0 \
+    || ck "§2 …and the record path is not a regular file after the reclaim: $(ls -l "$LKP/.orch.lock" 2>/dev/null | cut -c1)" 1
+fi
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 hdr "§3 FAIL CLOSED — an unjudgeable record is a refusal, not a guess"
 # The age is unreadable when `ps` cannot answer. `PS_BIN` is the seam the fleet's own suites use

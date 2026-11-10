@@ -835,6 +835,14 @@ ck "(d) an UNJUDGED refusal (exit 74) is NAMED REFUSED-UNJUDGED, not folded into
    "$(case "$launchd_row" in *REFUSED-UNJUDGED*) case "$launchd_row" in *REFUSED-SINGLETON*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
 ck "(d) …and it gives the OPPOSITE remedy — investigate, and removing the record IS allowed when nothing holds it [$(printf '%s' "$launchd_row" | cut -c1-240)]" \
    "$(case "$launchd_row" in *"rm -f"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ …BUT rc 2 IS TWO SHAPES, AND BOTH ROWS MUST NOT PROMISE `rm -f` FOR ONE OF THEM (fresh-context
+# review of #3846, cycle 3). When the displaced record could NOT be put back, `$LOCKF` is absent or
+# 0-byte and that record sits at a `.reclaim.` path — `rm -f` there is a no-op and the remedy is to
+# MOVE it back. Measured at the reviewing head: rc=2, `$LOCKF` 0 bytes, the kept copy holding the
+# displaced pid. This row is the operator's only surface for it, so a revert to the single-shape text
+# has to redden here rather than pass silently.
+ck "(d) …and it distinguishes the KEPT-copy shape, whose remedy is to move the file back [$(printf '%s' "$launchd_row" | cut -c241-560)]" \
+   "$(case "$launchd_row" in *"move that file back"*) echo 0 ;; *) echo 1 ;; esac)"
 
 # ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
 # code is absent (review cycle 2).

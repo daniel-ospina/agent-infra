@@ -195,9 +195,12 @@ _lc_refused() {
 # into one that reports a refusal as a crash and one that does not.
 _lc_refusal_exit() {
   # ⛔ THE REFUSAL'S OWN CODE IS PROPAGATED (74 UNJUDGED / 75 HELD). Opposite remedies: 75 says the
-  # holder is the authority and the lock must be left alone; 74 says the record could not be read or
-  # dated, so somebody has to look and may remove it. `orch-loop.sh` writes `[singleton] rc=<n>` for
-  # exactly this reason — collapsing the two here would undo the distinction the loop just made, and
+  # holder is the authority and the lock must be left alone; 74 says somebody has to look — either the
+  # record could not be read or DATED (removing it is the remedy when nothing holds it), or a displaced
+  # record could NOT be put back and is KEPT at a `.orch.lock.reclaim.<pid>` path beside an absent or
+  # 0-byte lock, where `rm -f` is a no-op and the remedy is to `mv` it back. `orch-loop.sh` writes
+  # `[singleton] rc=<n>` for exactly this reason — and names WHICH 74 shape it is, so this wrapper
+  # does not have to guess. Collapsing the two here would undo the distinction the loop just made, and
   # `harness-up` would assert the 75 story on a 74 state.
   local _rc="" _tail=""
   [ -f "$_LC_LOG" ] && _tail="$(tail -c "+$(( _LC_OFFSET + 1 ))" "$_LC_LOG" 2>/dev/null)"

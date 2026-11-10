@@ -129,16 +129,50 @@ orc_state_pick() {
 # stop path of six tools. So the format is untouched and the IDENTITY lives in the two things the
 # file already has: its pid, and its mtime.
 
+# _orc_record_path_ok <path> — 0 when opening this path as the lock record CANNOT BLOCK: absent, or a
+# regular file. ⛔ A NOCLOBBER `>` IS NOT `O_EXCL` FOR A NON-REGULAR FILE, AND IT BLOCKS (measured,
+# fresh-context review of #3846 cycle 3): with a FIFO at `.orch.lock`, `( set -o noclobber; … > fifo )`
+# opened it O_WRONLY and hung for the whole 5 s probe — the controller neither started nor refused, which
+# under launchd KeepAlive is an endless silent restart and a `harness-up` read that hangs with it. A
+# device node or a socket at that path is not a record either. A SYMLINK to a regular file is fine
+# (`-f` follows it, exactly as the six shipped readers do), and a dangling symlink is "absent" here —
+# creating through it is what every other tool does.
+_orc_record_path_ok() {
+  local p="${1:-}"
+  [ -n "$p" ] || return 1
+  [ -e "$p" ] || return 0
+  [ -f "$p" ]
+}
+
 # orc_lock_write <lockf> — 0 when THIS process created the record (noclobber is the atomicity).
-orc_lock_write() { ( set -o noclobber; printf '%s\n' "$$" > "$1" ) 2>/dev/null; }
+# The path guard comes FIRST: a caller must not be able to hang on a non-regular object at the record
+# path, and returning 1 sends it to the EMPTY-record reclaim, which MOVES that object aside and then
+# creates a real record (measured: the FIFO is displaced and the acquire returns rc 0).
+orc_lock_write() {
+  _orc_record_path_ok "${1:-}" || return 1
+  ( set -o noclobber; printf '%s\n' "$$" > "$1" ) 2>/dev/null
+}
 
 # orc_lock_pid <lockf> — the digits in the record, or "". The SAME read every sibling tool uses,
 # so this file cannot disagree with them about who holds the lock.
+# ⛔ NEVER READ A RECORD THAT IS NOT A REGULAR FILE (fresh-context review of #3846, cycle 3, MEASURED).
+# `< "$fifo"` BLOCKS until a writer opens it, and the record path is in a state dir that other tools
+# and operators also write to: a FIFO there hung `orc_singleton_acquire` for the FULL 5 s probe cap and
+# was still blocked when it was SIGKILLed (record left as `type=p`), so the controller neither started
+# nor refused — under launchd KeepAlive that is an endless silent restart, and `harness-up`'s read of
+# the same path hangs with it. `[ -f ]` is the test: a bare pid file is a REGULAR file, a FIFO/device/
+# directory/socket there is not a record at all, and a symlink to a regular file is still read (the six
+# shipped readers follow it too). Anything else yields "" — the same answer as an empty record, which
+# every reader already treats as STOPPED — so the caller takes the EMPTY-record reclaim path and
+# displaces the odd object instead of blocking on it.
 # ⛔ `2>/dev/null` BEFORE the redirect, not after: redirections apply left to right, so a FAILED
 # `<` reports to a stderr that is already silenced here — but with the order reversed the shell itself
 # printed `…/.orch.lock: No such file or directory` onto the controller's stderr for a record that was
 # legitimately absent mid-reclaim (measured; it read as a fault in the module).
-orc_lock_pid() { tr -dc '0-9' 2>/dev/null < "$1"; }
+orc_lock_pid() {
+  [ -f "${1:-}" ] || return 0
+  tr -dc '0-9' 2>/dev/null < "$1"
+}
 
 # orc_mtime <file> — epoch seconds of the record's last write. `date -r` is BSD and GNU both.
 orc_mtime() { date -r "$1" +%s 2>/dev/null; }
@@ -189,6 +223,9 @@ orc_lock_fill() {
   [ -n "$at" ] && return 1                     # a REAL holder owns the path; our copy is surplus
   pid="$(orc_lock_pid "$tmp")"
   [ -n "$pid" ] || return 2                    # nothing to restore — the caller must not delete the temp
+  # ⛔ THE FALLBACK WRITE GETS THE SAME PATH GUARD AS `orc_lock_write`: a plain `>` onto a FIFO blocks
+  # (measured), and this branch is precisely the one where the path is NOT a record we could read.
+  _orc_record_path_ok "$lockf" || return 2
   # The path is not held (absent, or a record with no pid in it) and could not be linked into. Restore
   # it the other atomic way: a noclobber create can only succeed if the path is still free, so a third
   # starter that got there first still wins. The mtime cost noted above is the right trade HERE: the
@@ -385,6 +422,15 @@ _orc_reclaim() {
 orc_singleton_acquire() {
   local lockf="${1:-}" holder="" lt="" rc=0
   ORC_SINGLETON_WHY=""
+  # ⛔ THE OUT-PARAMETERS ARE CLEARED HERE, NOT ONLY INSIDE `orc_lock_reclaim` (fresh-context review of
+  # #3846, cycle 3, measured). `orc_lock_reclaim` resets them per RECLAIM, but a second acquire that
+  # returns 2 without reaching a reclaim (an unreadable age, say) then reported the PREVIOUS call's
+  # temp path — and `orch-loop.sh:2472` branches on `ORC_RECLAIM_TEMP`, so it would print "KEPT at
+  # <stale path>" and tell the operator to `mv` a stale temp over a live holder's record. Latent today
+  # (the one shipped caller acquires once per process), but this file is a library and the same two
+  # lines `ORC_SINGLETON_WHY` already gets cost nothing.
+  ORC_RECLAIM_HOLDER=""
+  ORC_RECLAIM_TEMP=""
   if [ -z "$lockf" ]; then ORC_SINGLETON_WHY="no lock path was supplied"; return 2; fi
   if orc_lock_write "$lockf"; then ORC_SINGLETON_WHY="acquired"; return 0; fi
   holder="$(orc_lock_pid "$lockf")"

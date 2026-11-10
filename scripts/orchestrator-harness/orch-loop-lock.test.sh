@@ -144,6 +144,22 @@ has_all "$SECTION" 'LOCKF=' 'acq() {' '_orch_lock_verdict() {'
 ck "the section defines the lock file, the verdict, and the acquisition" $?
 [ "$(grep -c '^LOCKF=' "$SUBJECT")" = 1 ]
 ck "LOCKF is defined ONCE in the whole loop (no split identity of the lock path)" $?
+# The module is resolved in TWO homes before the section runs: a flat deploy and a state-dir split.
+has_all "$SUBJECT" 'controller-state.sh' 'orc_state_pick'
+ck "the loop sources controller-state.sh before the lock section (one home for the decision)" $?
+# ⛔ THE rc=2 OPERATOR TEXT IS TWO SHAPES AND MUST STAY TWO (fresh-context review of #3846, cycle 3).
+# rc 2 reaches this section two ways: an unreadable record that is still THERE (removing it IS the
+# remedy once nothing holds it), and a record that could not be PUT BACK, where `$LOCKF` is absent or
+# 0-byte and the displaced record sits at `ORC_RECLAIM_TEMP` — so `rm -f $LOCKF` is a no-op and the copy
+# has to be moved BACK. Written as ONE sentence, the second shape sent the operator to that no-op while
+# the only copy sat orphaned. Pinned STRUCTURALLY because the second shape needs a hostile state dir to
+# reach; a revert to the single echo reddens here.
+has_all "$SECTION" 'ORC_RECLAIM_TEMP' 'KEPT at'
+ck "the rc=2 refusal has a branch for the KEPT-copy shape (not one sentence for both)" $?
+has_all "$SECTION" "mv '\$ORC_RECLAIM_TEMP'"
+ck "…and it tells the operator to move the kept copy BACK, not to delete a record that is already gone" $?
+has_all "$SECTION" 'could not be judged'
+ck "…while the unreadable-record shape keeps its own wording and its own rm -f remedy" $?
 
 # ── 9b) STRUCTURAL: the block is ABOVE the EXIT trap, and the trap is the ONLY releaser ───────────
 # ⛔ ONLY A REAL `^trap` LINE COUNTS (MEASURED: the previous form used `grep -nF` over the whole file,
