@@ -301,7 +301,7 @@ done < "$TMP/farm-sorted.txt"
   || fail "a declared farm file is missing or differs from the repo copy (stale copy!)"
 
 # (b) guards + the deny
-for g in review-enforcer verification-gate main-worktree-guard search-guard audit-logger.ts shared; do
+for g in review-enforcer verification-gate main-worktree-guard search-guard gui-device-guard audit-logger.ts shared; do
   [ -e "$DEST/extensions/$g" ] && ok "guard installed: extensions/$g" \
     || fail "GUARD MISSING: extensions/$g"
 done
