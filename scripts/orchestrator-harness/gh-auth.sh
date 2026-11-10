@@ -109,28 +109,14 @@ gh_auth_token_state() {
   esac
 }
 
-# gh_auth_token_present — 0 iff this environment carries a value gh will USE as a token.
-# ⛔ A BLANK VALUE IS NOT A CREDENTIAL, and neither is a real value SHADOWED by a blank one: `GH_TOKEN='   '`
-# is exported by real `keys.env` files and gh resolves it instead of everything else, so the same
-# `*[![:space:]]*` test `worker-terminal.sh` uses applies — through `gh_auth_token_state`, so the order
-# question is answered in exactly one place.
-gh_auth_token_present() {
-  case "$(gh_auth_token_state)" in token\|*) return 0 ;; esac
-  return 1
-}
-
-# gh_auth_blank_token_name — 0 + the NAME on stdout iff the token name gh RESOLVES holds no credential.
-# ⛔ THIS IS NOT THE NEGATION OF `gh_auth_token_present`, and the difference is the whole finding: an
-# UNSET name and a ZERO-LENGTH value are cases gh falls straight through (the store IS read), while a
-# non-empty all-blank value is what gh resolves INSTEAD of the store (measured; see the header). Only the
-# last one shadows, so only the last one is `token-blank` — calling an empty value a shadow would refuse
-# nothing and mis-describe a lane whose store works. ⛔ AND IT NAMES THE NAME gh RESOLVES, not the first
-# blank one it finds: a blank `GITHUB_TOKEN` behind a REAL `GH_TOKEN` shadows nothing at all.
-gh_auth_blank_token_name() {
-  local s
-  s="$(gh_auth_token_state)" || return 1
-  case "$s" in token-blank\|*) printf '%s\n' "${s#token-blank|}" ;; *) return 1 ;; esac
-}
+# ⛔ NO SECOND PREDICATE OVER THE TOKEN NAMES, DELIBERATELY. `gh_auth_token_state` above is the ONE
+# ordered decision, and every consumer (`gh_auth_resolve`, `gh_auth_cause`, `gh_auth_ensure`) reads it.
+# Two exported helpers over the same two names (`token_present`, then `blank_token_name`) lived here and
+# became unreachable the moment the ordered decision replaced them: each asked ONE name, so together they
+# answered `token|` for a blank-but-SET `GH_TOKEN` beside a real `GITHUB_TOKEN` — the precedence bug —
+# while a reader could take them for the covered interface and reintroduce exactly that split (fresh-context
+# review of #3872, finding 3: dead guards the next lane reads as tested). The blank-vs-empty distinction
+# they documented is pinned where it is DECIDED: `gh_auth_token_state`'s three arms and A7/A7b/A7c.
 
 # gh_auth_account_home — the ACCOUNT's home, which on a cell is NOT `$HOME` (HOME is redirected to the
 # operational home). Best-effort and never fatal: `getent` is Linux, `dscl` is macOS, `~user` is bash.
@@ -201,7 +187,10 @@ _gh_auth_file_value() {
 #   xdg              $XDG_CONFIG_HOME/gh holds hosts.yml
 #   keys             GH_CONFIG_DIR read from the env file (absolute, and holds hosts.yml)
 #   keys-xdg         XDG_CONFIG_HOME read from the env file (becomes `<v>/gh`)
-#   home             $HOME/.config/gh holds hosts.yml (gh's own default — nothing to export)
+#   home             $HOME/.config/gh holds hosts.yml and XDG_CONFIG_HOME is UNSET, so it is gh's own
+#                    default (nothing to export)
+#   home-xdg         $HOME/.config/gh holds hosts.yml but XDG_CONFIG_HOME is SET, so gh reads
+#                    `<xdg>/gh` instead and this store is exported (gh would never find it on its own)
 #   account          the lane HOME holds none and the ACCOUNT home does (the cell shape)
 #   none             no credential this module can see
 # The `[env-file]` and `[account-home]` ARGUMENTS are the test seams — argv, not environment, for the
@@ -235,7 +224,25 @@ gh_auth_resolve() {
   if v="$(_gh_auth_file_value "$ef" XDG_CONFIG_HOME)"; then
     [ -f "$v/gh/hosts.yml" ] && { printf 'keys-xdg|%s\n' "$v/gh"; return 0; }
   fi
-  if [ -n "$home" ] && [ -f "$home/.config/gh/hosts.yml" ]; then printf 'home|%s\n' "$home/.config/gh"; return 0; fi
+  # ⛔ A SET `XDG_CONFIG_HOME` IS A CHAIN WITH NO FALLBACK PAST IT, SO THE `home` ARM MUST NOT BE CLAIMED
+  # UNDER ONE (fresh-context review of #3872, finding 1). The manual quoted in the header makes
+  # `$XDG_CONFIG_HOME/gh` the answer *if `$XDG_CONFIG_HOME` is set* — the condition is that the variable is
+  # SET, not that a store exists under it — and Go's `os.UserConfigDir` (what gh's `AppDataDir` returns on
+  # Linux) answers `$XDG_CONFIG_HOME` for any NON-EMPTY value, so `$HOME/.config/gh` is NEVER read in that
+  # shape. Claiming `home` there printed "the lane HOME holds gh's own default store — nothing to export"
+  # over a gh reading somewhere else, and `gh_auth_cause` is silent for `home`, so the refusal then
+  # asserted "the lane's gh IS credentialed" — the false credential claim this module exists to delete,
+  # one shape over, on the arm whose remedy was therefore wrong too. No arm covered it: A5 pins XDG
+  # *holding* a store, and B2 sets XDG to an empty dir WITH an ambient `GH_CONFIG_DIR`, so `home` was
+  # never reached under a set XDG at all.
+  # The store that IS there is a real credential gh will not find on its own — the same shape as `account`
+  # (and `keys-xdg` already exports over an env-file `XDG_CONFIG_HOME`) — so it is PROVIDED, under its own
+  # state so no log line can read it as gh's default and no reader has to guess whether an export happened.
+  if [ -n "$home" ] && [ -f "$home/.config/gh/hosts.yml" ]; then
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then printf 'home-xdg|%s\n' "$home/.config/gh"
+    else printf 'home|%s\n' "$home/.config/gh"; fi
+    return 0
+  fi
   [ -n "$acct" ] || acct="$(gh_auth_account_home)"
   if [ -n "$acct" ] && [ -f "$acct/.config/gh/hosts.yml" ]; then
     printf 'account|%s\n' "$acct/.config/gh"; return 0
@@ -252,8 +259,10 @@ gh_auth_resolve() {
 # is FUNCTION scoped and evaporated on return"). `gh_auth_log` therefore calls this UNSUBSTITUTED and
 # reads the globals; `gh_auth.test.sh` B1 is the arm that fails if that ever regresses (the stub `gh`
 # sees no credential and the lane is held).
-# ⛔ ONLY THE THREE ARMS THAT NEED IT EXPORT. `home` is gh's default (exporting it would restate the
-# default and hide a later `HOME` change), and `ambient*`/`token` are the caller's own settings.
+# ⛔ ONLY THE ARMS THAT NEED IT EXPORT. `home` is gh's default (exporting it would restate the default
+# and hide a later `HOME` change), `home-xdg` is NOT gh's default — a set `XDG_CONFIG_HOME` outranks
+# `$HOME/.config/gh` — so it is one of the exporting arms, and `ambient*`/`token` are the caller's own
+# settings.
 # ⛔ AND THE EXPORT IS WHAT MAKES THE PROBE AND THE WORKER AGREE: `run_agent` inherits this process's
 # environment into the lane it starts, and `wt_spawn`'s launch line reads `GH_CONFIG_DIR`/`XDG_CONFIG_HOME`
 # from ITS env — so resolving here without exporting would let the gate read one store and the lane
@@ -266,7 +275,7 @@ gh_auth_ensure() {
   # `token-blank` is deliberately ABSENT: gh resolves the blank token instead of any store, so exporting
   # a config dir for it would be an inert export that reads as a fix.
   case "$GH_AUTH_STATE" in
-    keys|keys-xdg|account) [ "${GH_CONFIG_DIR:-}" = "$GH_AUTH_DIR" ] || export GH_CONFIG_DIR="$GH_AUTH_DIR" ;;
+    keys|keys-xdg|account|home-xdg) [ "${GH_CONFIG_DIR:-}" = "$GH_AUTH_DIR" ] || export GH_CONFIG_DIR="$GH_AUTH_DIR" ;;
   esac
   printf '%s\n' "$r"
 }
@@ -290,6 +299,7 @@ gh_auth_log() {
     keys)            why="read from $ef (parsed statically; the file is never executed) and exported" ;;
     keys-xdg)        why="XDG_CONFIG_HOME read from $ef (parsed statically) and exported as GH_CONFIG_DIR" ;;
     home)            why="the lane HOME holds gh's own default store — nothing to export" ;;
+    home-xdg)        why='the lane HOME holds a store, but $XDG_CONFIG_HOME is set and gh reads ONLY $XDG_CONFIG_HOME/gh while it is set — so the lane HOME store is exported as GH_CONFIG_DIR (gh would not find it on its own)' ;;
     account)         why="the lane HOME holds no store and the ACCOUNT home does — GH_CONFIG_DIR exported so the gate, the lane and every worker it starts read the same hosts.yml" ;;
     *)               why='NO gh credential: no GH_TOKEN/GITHUB_TOKEN value and no hosts.yml in any directory gh would read — every gh call in this lane will fail' ;;
   esac
