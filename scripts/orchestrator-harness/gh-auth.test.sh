@@ -711,9 +711,13 @@ ck "B13b …and FALSE for an absent one, so it is a test and not a constant" $rc
 # it. Every non-root box — CI's runners, and the lane that found this — measures the real discrimination.
 FUNREAD="$TMP/store-unread"; mkdir -p "$FUNREAD/.config/gh"; cp "$ACCT/.config/gh/hosts.yml" "$FUNREAD/.config/gh/hosts.yml"
 chmod 000 "$FUNREAD/.config/gh/hosts.yml"
+# ⛔ ONE RESERVATION LINE PER SKIPPED ARM (review round 17, P3): the first cut incremented once and printed
+# one line for TWO skipped assertions, so B13h vanished from the output entirely while the count said
+# SKIPPED: 1 — a reservation that under-counts itself is a silent skip wearing a label.
 if [ "$(id -u)" = 0 ]; then
-  SKIPPED=$((SKIPPED+1))
-  printf '  ⏭️  B13g SKIPPED (uid 0 bypasses permission bits, so an unreadable FILE cannot be built here) — the readability dimension is UNMEASURED in this run\n'
+  SKIPPED=$((SKIPPED+2))
+  printf '  ⏭️  B13g SKIPPED (uid 0 bypasses permission bits, so an unreadable FILE cannot be built here) — this run leaves the -r half UNMEASURED\n'
+  printf '  ⏭️  B13h SKIPPED (same reservation: the helper arm needs that same unreadable FILE) — UNMEASURED in this run\n'
 else
   u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable '$FUNREAD/.config/gh/hosts.yml'" && rc=1 || rc=0
   ck "B13g …and a REAL hosts.yml that exists but cannot be read is not one — the -r half, not just -f" $rc
@@ -734,6 +738,67 @@ ck "B13e …and the cause DISCLOSES it as unreadable rather than naming it empty
 _r2="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; GH_CONFIG_DIR='$STORE/.config/gh' gh_auth_resolve '$LANE_HOME' '$TMP/none.env' '$ACCT_EMPTY'")"
 [ "${_r2%%|*}" = ambient-missing ]; rc=$?
 ck "B13f …and a set-but-unreadable ambient GH_CONFIG_DIR stays ambient-missing ('${_r2%%|*}'), which is the state whose cause names the fault" $rc
+
+# ⛔ THE OTHER HALF OF THE PREDICATE (review round 17, P2): `-r` ALONE is not the test — a DIRECTORY named
+# `hosts.yml` is readable, so a predicate that dropped `-f` would call it a store, the helper `ok`, the
+# resolver `home`, the cause silent and the refusal "IS credentialed" over a path `gh` cannot read as
+# config. This shape needs NO uid reservation (`mkdir` works at any uid), which is exactly why it is the
+# cheap mirror of B13g/B13h.
+DUNREAD="$TMP/store-dirfile"; mkdir -p "$DUNREAD/.config/gh/hosts.yml"
+u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable '$DUNREAD/.config/gh/hosts.yml'" && rc=1 || rc=0
+ck "B13i …a DIRECTORY named hosts.yml is not a store either — the -f half, at any uid" $rc
+_di="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$DUNREAD/.config/gh'")"
+[ "$_di" = unreadable ]; rc=$?
+ck "B13j …and the helper calls that dirent UNREADABLE, not absent ('$_di')" $rc
+# A DANGLING SYMLINK is the same class (a store symlinked into a volume that is not mounted): absent to
+# `-e`, present to `ls -ld`, and reporting it as "no hosts.yml" sends the operator to create a store over
+# a path that is already there.
+SUNREAD="$TMP/store-symlink"; mkdir -p "$SUNREAD/.config/gh"; ln -sf /nonexistent-volume/hosts.yml "$SUNREAD/.config/gh/hosts.yml"
+_si="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$SUNREAD/.config/gh'")"
+[ "$_si" = unreadable ]; rc=$?
+ck "B13k …and a hosts.yml symlinked to something that is not mounted is UNREADABLE, not absent ('$_si')" $rc
+_sc="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_cause '$SUNREAD' '$TMP/none.env' '$ACCT_EMPTY'")"
+case "$_sc" in *"<unreadable: $SUNREAD/.config/gh>"*) rc=0 ;; *) rc=1 ;; esac
+ck "B13l …and the cause discloses it rather than saying 'no hosts.yml under' a path the operator can see" $rc
+
+# ⛔ READABILITY IS PINNED ON **EVERY** STORE ARM, NOT JUST `home` AND `ambient` (review round 17, P2):
+# flipping the predicate back to `[ -f ]` in the `keys` arm ALONE left the suite green, and on a
+# `keys.env`-declared store whose `hosts.yml` cannot be read the resolver then answered `keys|…` with a
+# SILENT cause while `_gh_auth_store_in` on the same directory answered `unreadable` — the two disagreeing
+# is exactly what `_gh_auth_store_readable` exists to prevent. The positive direction of each of these
+# four arms is already pinned by the A-arms (A5/A6/A8/A10), so each arm below only has to prove the arm
+# is NOT claimed when the store cannot be read.
+# ⛔ THE `keys` FIXTURE MUST LAND WHERE THAT ARM PROBES (measured, review round 18): the arm tests
+# `$v/hosts.yml` where `$v` IS the env file's `GH_CONFIG_DIR` value — so the store file sits DIRECTLY in
+# that directory, not under `.config/gh`. The first cut wrote it one level too deep, so the arm answered
+# "not keys" because there was no store at all, and the mutant that reverts the arm stayed GREEN.
+KSTORE="$TMP/store-keys"; mkdir -p "$KSTORE"; cp "$ACCT/.config/gh/hosts.yml" "$KSTORE/hosts.yml"
+printf 'GH_CONFIG_DIR=%s\n' "$KSTORE" > "$TMP/keys-store.env"
+XSTORE="$TMP/store-xdg"; mkdir -p "$XSTORE/gh"; cp "$ACCT/.config/gh/hosts.yml" "$XSTORE/gh/hosts.yml"
+printf 'XDG_CONFIG_HOME=%s\n' "$XSTORE" > "$TMP/keys-xdg.env"
+ASTORE="$TMP/acct-store"; mkdir -p "$ASTORE/.config/gh"; cp "$ACCT/.config/gh/hosts.yml" "$ASTORE/.config/gh/hosts.yml"
+_c1="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_resolve '$LANE_HOME' '$TMP/keys-store.env' '$ACCT_EMPTY'")"
+_c2="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_resolve '$LANE_HOME' '$TMP/keys-xdg.env' '$ACCT_EMPTY'")"
+_c3="$(u ". '$GH_AUTH' >/dev/null 2>&1; XDG_CONFIG_HOME='$XSTORE' gh_auth_resolve '$LANE_HOME' '$TMP/none.env' '$ACCT_EMPTY'")"
+_c4="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_resolve '$LANE_HOME' '$TMP/none.env' '$ASTORE'")"
+_ctrl=0
+[ "${_c1%%|*}" = keys ] || _ctrl=1
+[ "${_c2%%|*}" = keys-xdg ] || _ctrl=1
+[ "${_c3%%|*}" = xdg ] || _ctrl=1
+[ "${_c4%%|*}" = account ] || _ctrl=1
+ck "B13q …CONTROL: with the predicate intact each of those fixtures IS the store its arm claims (keys/keys-xdg/xdg/account) — so the four arms above fail for the RIGHT reason" $_ctrl
+_k="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; gh_auth_resolve '$LANE_HOME' '$TMP/keys-store.env' '$ACCT_EMPTY'")"
+[ "${_k%%|*}" != keys ]; rc=$?
+ck "B13m …the env-file \`keys\` arm is not claimed for an unreadable store (got '${_k%%|*}')" $rc
+_kx="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; gh_auth_resolve '$LANE_HOME' '$TMP/keys-xdg.env' '$ACCT_EMPTY'")"
+[ "${_kx%%|*}" != keys-xdg ]; rc=$?
+ck "B13n …nor the \`keys-xdg\` arm (got '${_kx%%|*}')" $rc
+_xd="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; XDG_CONFIG_HOME='$XSTORE' gh_auth_resolve '$LANE_HOME' '$TMP/none.env' '$ACCT_EMPTY'")"
+[ "${_xd%%|*}" != xdg ]; rc=$?
+ck "B13o …nor the ambient \`xdg\` arm (got '${_xd%%|*}')" $rc
+_ac="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; gh_auth_resolve '$LANE_HOME' '$TMP/none.env' '$ASTORE'")"
+[ "${_ac%%|*}" = none ]; rc=$?
+ck "B13p …nor the \`account\` arm: with no readable store anywhere the lane resolves 'none' (got '${_ac%%|*}')" $rc
 
 echo
 echo "───────────────────────────────────────"

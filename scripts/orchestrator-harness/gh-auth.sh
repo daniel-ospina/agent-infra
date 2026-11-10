@@ -352,7 +352,9 @@ gh_auth_log() {
 # `chmod 000` holding a real hosts.yml makes `-f` false, so before this helper `gh_auth_cause` said
 # "holds no hosts.yml" about a directory it had never opened, and `ambient-missing` said the same about
 # an explicitly-set `GH_CONFIG_DIR` whose store was right there. A directory we cannot open is a source
-# we did not read, and the refusal says so.
+# we did not read, and the refusal says so. `empty` therefore means EMPTY: a `hosts.yml` dirent that is
+# present but is not a readable regular file (a directory, a FIFO, a dangling symlink, an unreadable
+# file) is `unreadable`.
 # ⛔ THE SAME CONFLATION EXISTED ONE LAYER DOWN (review round 15, P2): `[ -f dir/hosts.yml ]` answers TRUE
 # for a store FILE this process cannot READ, so a lane store whose `hosts.yml` is `chmod 000` — a
 # root-owned or backup-restored file on a cell — was claimed as a credential: `gh_auth_resolve` answered
@@ -369,7 +371,13 @@ _gh_auth_store_in() {
   local d="${1:-}"
   [ -n "$d" ] || { printf 'empty\n'; return 0; }
   if _gh_auth_store_readable "$d/hosts.yml"; then printf 'ok\n'; return 0; fi
-  if [ -f "$d/hosts.yml" ]; then printf 'unreadable\n'; return 0; fi
+  # ⛔ A DIRENT THAT IS THERE BUT IS NOT A READABLE REGULAR FILE IS **UNREADABLE**, NOT ABSENT (review
+  # round 17, P3): `[ -f ]` answers false for a DIRECTORY named `hosts.yml`, for a FIFO, and for a symlink
+  # whose target is not there — and reporting those as "no hosts.yml" sends the operator to create a store
+  # over a path they can see with `ls -ld`. Realistic shape: a store symlinked into a volume that is not
+  # mounted. `-e` follows symlinks and `-L` does not, so the pair catches every dirent; the readable
+  # predicate above has already handled the regular-and-readable case.
+  if [ -e "$d/hosts.yml" ] || [ -L "$d/hosts.yml" ]; then printf 'unreadable\n'; return 0; fi
   if [ -d "$d" ] && { [ ! -r "$d" ] || [ ! -x "$d" ]; }; then printf 'unreadable\n'; return 0; fi
   printf 'empty\n'
 }
