@@ -1518,15 +1518,48 @@ assert_eq "$DP_RC" "0" "§30r a lock whose recorded pid is GONE is reclaimed pro
 assert_contains "$DP_OUT" "is gone (a killed run)" "§30r ...and the reclaim names the killed run"
 if [ -f "$DP_BOX/$LCK_KEY.json" ]; then ok "§30r ...and the pull then did its work"; else bad "§30r ...the pull skipped the record"; fi
 rm -rf "$DP_BOX/.registry-sync.lock"
-# (t) — NOT PINNED HERE, and said so rather than faked. `claim_stale`'s put-back (and `claim_restore`'s)
-# now require the `mv` to have actually PLACED the directory: if the lock name appears between the
-# `[ ! -e "$LOCKDIR" ]` test and the `mv`, `mv` moves the held directory INSIDE the new one and exits 0, so
-# the old code reported "restored, not removed", never set `PENDING_STALE`, and then ACQUIRED beside the
-# live holder it had just disarmed (round 12, reproduced by the reviewer with three actors). Scheduling
-# that window with an `mv` shim inside this harness did not reproduce reliably here (the shim's own mkdir
-# re-created the name on the claim path, which sent the arm down the ceiling branch instead), so this arm
-# is RECORDED AS UNPINNED. The fix's evidence is the reviewer's reproduction, not a suite assertion.
-
+# (t) `mv`'s rc IS NOT PROOF OF A RESTORE. If the lock name appears BETWEEN the `[ ! -e ]` test and the
+# `mv`, the `mv` moves the held directory INSIDE the new one and exits 0 — the old code reported
+# "restored, not removed", never set `PENDING_STALE`, and lost the live holder's lock ownership (round 12).
+# Injected with a two-phase `mv` shim: phase 1 makes the claim move a directory whose pid does NOT match
+# what was judged (forcing the put-back) and leaves the name FREE; phase 2 creates the name immediately
+# before the put-back's real `mv`, so the `mv` nests. The pin is the MESSAGE + the held state: in this
+# construction the pre-fix build also failed closed, so "did not acquire" would not discriminate.
+SHIM_T="$T/shim-t"; mkdir -p "$SHIM_T"; : > "$T/t.claim"; : > "$T/t.nest"
+REAL_MV_T="$(command -v mv)"
+cat > "$SHIM_T/mv" <<EOS
+#!/bin/sh
+case "\$2" in
+  */.registry-sync.lock.stale.*)                     # the CLAIM
+    "$REAL_MV_T" "\$@" || exit \$?
+    printf '999999\n' > "\$2/pid"                    # not the tid this run judged -> put-back path
+    printf 'x' > "$T/t.claim"; exit 0 ;;
+  */.registry-sync.lock)                             # the PUT-BACK
+    mkdir -p "\$2"                                   # a third party takes the name between test and mv
+    printf 'x' > "$T/t.nest"
+    exec "$REAL_MV_T" "\$@" ;;
+esac
+exec "$REAL_MV_T" "\$@"
+EOS
+chmod +x "$SHIM_T/mv"
+mini_fixture nestmv
+NT_SEED="$MINI_ROOT/seed"; mkdir -p "$NT_SEED"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+  "$HEAD_A" > "$NT_SEED/$LCK_KEY.json"
+mini_rs "$NT_SEED" push >/dev/null 2>&1
+NT_BOX="$MINI_ROOT/box"; mkdir -p "$NT_BOX"
+mkdir -p "$NT_BOX/.registry-sync.lock"
+touch -t 202001010000 "$NT_BOX/.registry-sync.lock"
+NT_OUT="$(PATH="$SHIM_T:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$NT_BOX" --remote origin --timeout 30 2>&1)"; NT_RC=$?
+if [ -s "$T/t.claim" ] && [ -s "$T/t.nest" ]; then
+  ok "§30t (premise) the claim AND the name-appearing put-back both happened"
+else
+  bad "§30t (premise) the interleaving did not happen — the arm proves nothing"
+fi
+assert_not_contains "$NT_OUT" "restored, not removed" "§30t a NESTED put-back is not reported as a restore"
+assert_contains "$NT_OUT" "HELD for restore" "§30t ...it is HELD for restore instead"
+assert_absent "$NT_BOX" "$NT_BOX/$LCK_KEY.json" "§30t ...and the run does not write without the lock"
+rm -rf "$NT_BOX/.registry-sync.lock" "$NT_BOX"/.registry-sync.lock.stale.*
 # (s) NO AMBIENT KNOB CAN WEAKEN THE LOCK. `LOCK_STALE_MAX` was `${REGISTRY_SYNC_LOCK_STALE_MAX:-…}` with a
 # floor of 1 s, so an exported value of 1 let the CEILING arm steal a LIVE lock inside its own critical
 # section — the "disable a gate by ambient env" class, and nothing on this box ever read the variable
@@ -1642,13 +1675,42 @@ assert_contains "$P_OUT" "HELD for restore" "§30q (premise) the put-back really
 assert_absent "$LKD" "$LKD/$LCK_KEY.json" "§30q a run with an OUTSTANDING put-back does not enter the critical section"
 assert_eq "$P_RC" "1" "§30q ...and it fails closed"
 rm -rf "$LKD/.registry-sync.lock" "$LKD"/.registry-sync.lock.stale.*; lock_reset
-# §30m — NOT PINNED, and said so rather than faked. `reg_lock` now refuses to enter the critical section
-# when it cannot write its own `pid` (a lock it cannot record itself in is a lock it can never release:
-# `reg_unlock` removes only a lock whose pid is ours, so the directory would stay and the pid-less arm
-# does not fire until the staleness ceiling). There is no hermetic way to inject that failure through
-# the CLI: `umask 0777` is the only lever and it also makes the run's OWN scratch files unreadable
-# (measured: `store.tsv: Permission denied`), so it fails for an unrelated reason before reaching the
-# lock. The arm is reported as UNPINNED instead of being written vacuously.
+# §30m — A LOCK WE CANNOT RECORD OURSELVES IN IS A LOCK WE CANNOT RELEASE, and it IS injectable: a `mkdir`
+# shim that intercepts ONLY the lock name makes the lock dir but leaves it mode 500, so the pid write
+# fails. `reg_lock` must then refuse to enter and clean the directory up — otherwise it enters a lock it
+# can never release (`reg_unlock` removes only a lock whose pid is ours), and the pid-less reclaim arm
+# does not fire until the staleness ceiling. (Round 13 corrected this arm's earlier UNPINNED verdict: the
+# `umask 0777` lever is collateral-damaged, but a targeted shim is not.)
+mini_fixture unrec
+UR_SEED="$MINI_ROOT/seed"; mkdir -p "$UR_SEED"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+  "$HEAD_A" > "$UR_SEED/$LCK_KEY.json"
+mini_rs "$UR_SEED" push >/dev/null 2>&1
+UR_BOX="$MINI_ROOT/box"; mkdir -p "$UR_BOX"
+SHIM_M="$T/shim-m"; mkdir -p "$SHIM_M"; REAL_MKDIR="$(command -v mkdir)"
+cat > "$SHIM_M/mkdir" <<EOS
+#!/bin/sh
+case "\$1" in
+  */.registry-sync.lock)
+    "$REAL_MKDIR" "\$@" || exit \$?
+    chmod 500 "\$1"
+    exit 0 ;;
+esac
+exec "$REAL_MKDIR" "\$@"
+EOS
+chmod +x "$SHIM_M/mkdir"
+UR_OUT="$(PATH="$SHIM_M:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$UR_BOX" --remote origin --timeout 30 2>&1)"; UR_RC=$?
+if [ ! -e "$UR_BOX/$LCK_KEY.json" ]; then
+  ok "§30m (premise) nothing was written, so the run really refused to enter"
+else
+  bad "§30m (premise) the run wrote a record — the shim did not block the pid write"
+fi
+assert_eq "$UR_RC" "1" "§30m a lock it cannot record itself in is NOT entered (fail closed)"
+if [ -d "$UR_BOX/.registry-sync.lock" ]; then
+  bad "§30m ...and the lock it could not record was LEFT BEHIND (an unreleasable lock)"
+else
+  ok "§30m ...and the lock it could not record was cleaned up"
+fi
 
 # ═══ 31. this box's record is NEWER but UNUSABLE — named, not silently kept for ever ══════
 # Review finding P2 on PR #3894: `git grep 'own rail can use' -- scripts/*.test.sh` → no match, and
