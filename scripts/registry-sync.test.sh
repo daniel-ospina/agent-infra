@@ -1034,6 +1034,32 @@ fi
 ND_OUT="$(mini_rs "$NESTDD" push)"
 assert_not_contains "$ND_OUT" "pushed $NEST_KEY" "§29o a NaN stamp is UNUSABLE — never published"
 assert_contains "$ND_OUT" "not one the fleet's rail can USE" "§29o ...and the refusal NAMES usability"
+# §29q — THE PEER'S BYTES ARE AN ORDERING AUTHORITY ONLY IF THE READER CAN USE THEM. `push_decision` read
+# the peer's `reviewed_at` with `field`, which happily reads a flat record strict JSON REFUSES — so an
+# unreadable peer record whose TEXT said 2099 outranked a usable local record for ever: the run reported
+# `keep — the peer is NEWER`, withheld this box's record, and called itself converged with
+# `unreadable=0` (round 8, measured). The store's ref is planted with git plumbing because `push` now
+# refuses to publish such a record — which is itself the point.
+mini_fixture peerbad
+PB_BOX="$MINI_ROOT/box"; mkdir -p "$PB_BOX"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-01T00:00:00Z"}\n' \
+  "$HEAD_A" > "$PB_BOX/$NEST_KEY.json"
+PB_PEER="$T/peerbad.peer"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2099-01-01T00:00:00Z",}\n' \
+  "$HEAD_B" > "$PB_PEER"
+if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$PB_PEER" 2>/dev/null; then
+  bad "§29q (premise) the planted peer record parses — it must NOT (a trailing comma)"
+else
+  ok "§29q (premise) the planted peer record is one the strict reader REFUSES"
+fi
+PB_BLOB="$(git -C "$MINI_STORE" hash-object -w "$PB_PEER")"
+PB_TREE="$(printf '100644 blob %s\trecord.json\n' "$PB_BLOB" | git -C "$MINI_STORE" mktree)"
+PB_COMMIT="$(git -C "$MINI_STORE" -c user.name=sync -c user.email=sync@test.invalid commit-tree "$PB_TREE" -m "$NEST_KEY")"
+git -C "$MINI_STORE" push -q origin "$PB_COMMIT:refs/reviews/$NEST_KEY" 2>/dev/null || :
+PB_OUT="$(mini_rs "$PB_BOX" push)"; PB_RC=$?
+assert_eq "$PB_RC" "4" "§29q an UNREADABLE peer record cannot outrank this box's usable one (exit 4, not converged)"
+assert_contains "$PB_OUT" "not one this box's rail can USE" "§29q ...and the run NAMES the peer's record as unreadable"
+assert_not_contains "$PB_OUT" "the peer is NEWER" "§29q ...instead of claiming the peer is newer on bytes it cannot read"
 # §29i — `null` is not a timestamp. The literal text sorts ABOVE every real stamp (`'n' > '2'`), so reading
 # it as `null` made a record with no stamp win the ordering instead of being unreadable.
 NEST9D="$MINI_ROOT/box9"; mkdir -p "$NEST9D"
@@ -1047,6 +1073,10 @@ assert_not_contains "$N9_OUT" "pushed $NEST_KEY" '§29i ...so it is never publis
 # returns empty and the whitespace route (which exists for exactly this shape) can never fire — this box
 # then cannot publish a record the gate WOULD use, and no peer can materialise it (round 6, measured:
 # 180/255 fuzzed separator variants, all of them this class).
+NESTED_="$MINI_ROOT/boxe"
+# its OWN fixture: `mini_fixture` rebinds the global store, so an arm that shares one with a later arm
+# silently reads whichever store was created last (measured: §29p picked up a later arm's POISONED ref).
+mini_fixture spaced
 NESTED_="$MINI_ROOT/boxe"; mkdir -p "$NESTED_"
 printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo" :"daniel-ospina/agent-infra","reviewed_at" :"2026-11-02T00:00:00Z"}\n' \
   "$HEAD_B" > "$NESTED_/$NEST_KEY.json"
@@ -1159,8 +1189,9 @@ fi
 # (f) the counterpart the ownership-checked release needs: a run that DID take the lock must still free
 # it. `reg_unlock` now removes only a lock whose `pid` is its own, so a wrong comparison (or a release
 # that skips removal) would leave the lock behind on every pull — and the next run would then see a
-# dead-pid lock. Asserted on the run that just reclaimed and pulled.
-lock_reset
+# dead-pid lock. Asserted on the run that just reclaimed and pulled — BEFORE any reset, or it would be
+# vacuous (round 8: a `lock_reset` here deleted the very directory the assertion looks for, so it could
+# only ever print ✅).
 if [ -d "$LKD/.registry-sync.lock" ]; then
   bad "§30f a successful pull RELEASED its lock (a leftover would make the next run wait for a dead holder)"
 else
@@ -1338,6 +1369,39 @@ else
 fi
 assert_eq "$N_RC" "1" "§30n ...and that run fails closed rather than writing beside the acquirer"
 rm -rf "$LKD/.registry-sync.lock" "$LKD"/.registry-sync.lock.stale.*; lock_reset
+# (o) THE BOUND IS PER RUN, NOT PER KEY. `pull_one` takes the lock once per record, so a lock this box can
+# NEVER acquire cost the ~5 s bound PER KEY — measured 18 s for a 3-key registry, i.e. hours at the 4,027
+# size this file cites, inside atomic-land.sh's pre-sync (round 8). One failure is memoised for the run.
+mini_fixture lockmany
+LM_SEED="$MINI_ROOT/seed"; mkdir -p "$LM_SEED"
+for LM_PR in 901 902 903; do
+  printf '{"pr":%s,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"acme/widget","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+    "$LM_PR" "$HEAD_A" > "$LM_SEED/acme-widget-$LM_PR.json"
+done
+mini_rs "$LM_SEED" push >/dev/null 2>&1
+LM_BOX="$MINI_ROOT/box"; mkdir -p "$LM_BOX"
+mkdir -p "$LM_BOX/.registry-sync.lock"; printf '1\n' > "$LM_BOX/.registry-sync.lock/pid"
+O_T0="$(python3 -c 'import time;print(time.time())')"
+run_bounded 40 bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LM_BOX" --remote origin --timeout 30
+O_TO="$RB_TIMED_OUT"; O_OUT="$RB_OUT"; O_RC="$RB_RC"
+O_SECS="$(python3 -c "import time;print(int(time.time()-$O_T0))")"
+# PREMISE: the store really holds 3 keys (so the un-memoised cost WOULD be 3 x the bound) and the run
+# really reached the lock (so the wait, not something else, is what the elapsed time measures).
+if [ "$(git -C "$MINI_STORE" ls-remote --refs origin 'refs/reviews/*' 2>/dev/null | command wc -l | tr -d ' ')" = "3" ]; then
+  ok "§30o (premise) the store holds 3 keys, so the per-key cost would be 3 x the bound"
+else
+  bad "§30o (premise) the store does not hold 3 keys — the per-key cost would not be exercised"
+fi
+assert_contains "$O_OUT" "could not serialise" "§30o (premise) the run DID reach the lock"
+assert_eq "$O_TO" "0" "§30o a permanently unacquirable lock does not make the run unbounded"
+assert_eq "$O_RC" "1" "§30o ...it still fails closed"
+# 3 keys x the ~5 s bound would be ~15-18 s (measured); the memoised run pays it ONCE.
+if [ "$O_SECS" -lt 12 ]; then
+  ok "§30o ...and the ~5 s wait is paid ONCE for the run (${O_SECS}s for 3 keys), not once per key"
+else
+  bad "§30o ...the lock wait was paid per key (${O_SECS}s for 3 keys), so the run is O(keys) x 5s"
+fi
+rm -rf "$LM_BOX/.registry-sync.lock"
 # §30m — NOT PINNED, and said so rather than faked. `reg_lock` now refuses to enter the critical section
 # when it cannot write its own `pid` (a lock it cannot record itself in is a lock it can never release:
 # `reg_unlock` removes only a lock whose pid is ours, so the directory would stay and the pid-less arm

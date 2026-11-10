@@ -586,7 +586,24 @@ claim_stale() { # <judged-pid> <message>
   if [ ! -e "$LOCKDIR" ] && mv "$gone" "$LOCKDIR" 2>/dev/null; then
     warn "  · $LOCKDIR was re-created while being reclaimed — restored, not removed."
   else
-    warn "  · $LOCKDIR was re-created while being reclaimed — leaving $gone in place rather than deleting a live lock."
+    # ⛔ THE PUT-BACK CAN LOSE THE NAME TO A THIRD ACQUIRER, and abandoning the moved directory as
+    # "harmless debris" falsifies this block's own claim: the moved lock may be a LIVE holder's, and
+    # freeing the name lets another run into the critical section beside it (measured, all four actors
+    # real). So the restore is REMEMBERED and retried on every later pass of `reg_lock`'s bounded loop,
+    # and this run refuses to acquire while one is outstanding.
+    PENDING_STALE="$gone"
+    warn "  · $LOCKDIR was re-created while being reclaimed — $gone is HELD for restore (this run will not enter)."
+  fi
+  return 1
+}
+
+# claim_restore → 0 when there is nothing outstanding, or the held directory is back at the lock name.
+claim_restore() {
+  [ -n "${PENDING_STALE:-}" ] || return 0
+  [ -e "$PENDING_STALE" ] || { PENDING_STALE=""; return 0; }
+  if [ ! -e "$LOCKDIR" ] && mv "$PENDING_STALE" "$LOCKDIR" 2>/dev/null; then
+    PENDING_STALE=""
+    return 0
   fi
   return 1
 }
@@ -609,7 +626,14 @@ pid_state() { # <pid> → alive | gone | unknown
 
 reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
   local i=0 pidf pid age state
-  [ -d "$REG_DIR" ] || mkdir -p "$REG_DIR" 2>/dev/null || return 1
+  # ⛔ THE BOUND IS PER RUN, NOT PER KEY. `pull_one` takes the lock once per record, so a lock this box
+  # can NEVER acquire (a root-owned lock left by a `sudo` run in a shared registry) cost the ~5 s bound
+  # PER KEY: measured 18 s for a 3-key registry, i.e. ~5.5 h at the 4,027-record size this file cites —
+  # inside atomic-land.sh's pre-sync, where the state is permanent. `--doc`'s "a landing can never hang on
+  # it" was therefore false for N > 1. One failure is memoised for the rest of the run, which still
+  # counts every key FAILED and still writes nothing.
+  [ "${LOCK_UNACQUIRABLE:-0}" = "1" ] && return 1
+  [ -d "$REG_DIR" ] || mkdir -p "$REG_DIR" 2>/dev/null || { LOCK_UNACQUIRABLE=1; return 1; }
   LOCKDIR="$REG_DIR/.registry-sync.lock"
   LOCK_OWNED=0
   while [ "$i" -lt 50 ]; do
@@ -625,6 +649,7 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
       fi
       chmod -R u+rwX "$LOCKDIR" 2>/dev/null || :
       rm -rf "$LOCKDIR" 2>/dev/null || :
+      LOCK_UNACQUIRABLE=1
       return 1
     fi
     pidf="$LOCKDIR/pid"; pid=""
@@ -654,8 +679,10 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
         claim_stale "" "  ⚠️ reclaiming $LOCKDIR — no usable pid after ${age}s (its holder died before it could record itself)." || :
       fi
     fi
+    claim_restore || :
     sleep 0.1; i=$((i + 1))
   done
+  LOCK_UNACQUIRABLE=1
   return 1
 }
 reg_unlock() {
@@ -676,6 +703,8 @@ reg_unlock() {
 PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 LOCAL_UNUSABLE=0 FAILED=0 PUSH_FAILED=0 UNCHANGED=0
 LOCKDIR=""
 LOCK_OWNED=0
+PENDING_STALE=""
+LOCK_UNACQUIRABLE=0
 # ── ONE listing per run (agent-infra#3180) ───────────────────────────────────────────────────────
 # `union` = `do_pull` then `do_push`, and both called `fetch_refs` — 4 git network calls to read the
 # SAME namespace twice (measured: ls-remote 2.4-3.9 s + fetch 3.7 s, so ~10-15 s of a land bought
@@ -729,6 +758,17 @@ push_decision() { # <key> <file>  → DEC = push | skip | same | supersede | unr
   if ! remote_record "$key" >"$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
     rm -f "$tmp"
     DEC="unreadable"; DEC_MSG="the peer's ref carries no readable record.json"
+    return 0
+  fi
+  # ⛔ THE PEER'S BYTES ARE AN ORDERING AUTHORITY ONLY IF THE READER CAN USE THEM (#2510 review round 8).
+  # `field` reads a flat record that strict JSON REFUSES (a trailing comma), so an unreadable peer record
+  # whose text says `reviewed_at=2099…` outranked a usable local record for ever: the run reported
+  # `keep — the peer is NEWER`, withheld this box's record, and called itself converged with
+  # `unreadable=0` — enforcing rule 1 against a guess, and CERTIFYING a poisoned store as converged. The
+  # pull side has refused these bytes since the start; the push side now does too, before any `field` read.
+  if ! record_usable "$tmp"; then
+    rm -f "$tmp"
+    DEC="unreadable"; DEC_MSG="the peer's record at this key is not one this box's rail can USE (no 40-hex head_sha, no verdict, or not strict JSON), so it cannot say which side is newer"
     return 0
   fi
   rat="$(field "$tmp" reviewed_at)"
