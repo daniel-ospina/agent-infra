@@ -205,8 +205,25 @@ jobs:
           fi
           echo "✅ non-vacuity: a fabricated deployed answer is refused"
       - name: canonical copy is complete (the source of truth has all shared files)
+        # ⛔ THE PREMISE IS ASSERTED, NOT INHERITED (#2726). `check-single-source.sh` takes the
+        # deployed dir from `${O:-}` (see its arg parsing), and the fleet's CELL RUNNERS EXPORT `O`:
+        # measured 2026-10-25 on `ai-runner-cell3-x64-1`/`-2`, doctor named `/tmp/cell-home/orchestrator`
+        # while the runner's own HOME was `/tmp/ai-runner-work-c1-3/…` (#2735's thread). On such a
+        # runner this arm silently graded the BOX's deployment instead of the canonical tree, and
+        # redded a source of truth that was complete: measured on `cmux` with `O=$HOME/orchestrator`,
+        # rc 1 and `FAIL: 56 divergence(s) — the harness has more than one source` — under a step whose
+        # name promises canonical COMPLETENESS, so the message sent the operator to the wrong surface.
+        # This step is deliberately about the canonical tree; the deployed-byte arms are the `--o "$d"`
+        # steps below, which are hermetic by construction because an explicit `--o` wins over `${O:-}`.
+        # So `unset O` makes the premise true, and the assertion after it NAMES the failure in place if
+        # a future edit drops the unset — instead of redding silently with a misleading count.
+        # ⛔ A job-level `env:` cannot do this: `env` overrides values and has NO way to delete a
+        # variable inherited from the runner service (GitHub's `env` context excludes those), so the
+        # unset has to happen in the step's own shell.
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm grades the canonical tree, not the box's deployment"; exit 1; }
           bash scripts/orchestrator-harness/check-single-source.sh
       - name: a REAL comparison passes (deployed copy identical to canonical)
         run: |
@@ -232,8 +249,15 @@ jobs:
           bash scripts/orchestrator-harness/check-single-source.sh --o "$d" || rc=$?
           [ "$rc" -eq 1 ] || { echo "FAIL: a byte-divergent deployed copy must exit 1, got $rc"; exit 1; }
       - name: NON-VACUITY — checking nothing is UNKNOWN, never a pass
+        # ⛔ SAME PREMISE, SAME REASON (#2726), and here it is what makes the arm non-vacuous: it only
+        # proves "checking nothing is UNKNOWN" on a box that genuinely has nothing to compare. With `O`
+        # exported the checker had a target, that target DIVERGED, and it answered 1 (DIVERGENCE) where
+        # this arm requires 2 (UNKNOWN) — measured on `cmux`: `FAIL: --require-target with no target
+        # must exit 2, got 1`. That is a red about the RUNNER's env, reported as a red about the check.
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm needs a box with nothing to compare"; exit 1; }
           rc=0
           bash scripts/orchestrator-harness/check-single-source.sh --require-target --quiet || rc=$?
           [ "$rc" -eq 2 ] || { echo "FAIL: --require-target with no target must exit 2, got $rc"; exit 1; }
