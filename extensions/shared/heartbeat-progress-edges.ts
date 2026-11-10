@@ -811,6 +811,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "agent-infra#2888 — the ONE absolute backstop for a dispatch lane, in seconds, consumed by lane.sh, fix-one.sh and nonblocking-dispatch.sh. It is deliberately not the PRIMARY bound: lane-bound.sh's 2700 s PROGRESS allowance decides wedged-vs-slow, and this number (7200, PROVISIONAL) must sit strictly ABOVE it or the backstop pre-empts the bound it is supposed to back up — the shipped pair was wall 2400 < allowance 2700, which is precisely how a flat 40-minute cap came to censor ≥50% of repair lanes at their median. Registered here because a NEW stall bound must not land unregistered: the reverse scan is the only thing that makes a second, silent threshold visible.",
   },
   {
+    name: "IDLE_BOUND_S",
+    owners: ["scripts/orchestrator-harness/lane-merge.sh"],
+    value: "${LANE_BOUND_IDLE_S:-2700}",
+    axis: "kill",
+    overrides: ["IDLE_BOUND_S=2700"],
+    guardedBy: NONE,
+    note: "#3584 — lane-merge.sh's own view of lane-bound.sh's IDLE progress allowance (2700 s). It is READ and it decides a kill twice over: it caps the check wait when no watchdog-visible heartbeat target exists (an uncapped wait is TERMed as `stalled` with NO verdict, which is strictly worse than any hand-off), and it caps each `--watch` chunk, since a watch chunk writes no heartbeat and a sequence longer than this is killed with nothing written. Registered rather than exempted because the reverse scan is the only thing that stops a second, silent copy of the 2700 s appearing in the harness — this declaration landed with the #3584 watchdog cap and red `verify` until it was listed here. `guardedBy: NONE` is deliberate, not a gap, and for the same reason its lane-bound sibling records it: every suite that exercises this bound drives the ENV spelling `LANE_BOUND_IDLE_S`, which never names the bare symbol, so citing one here would be exactly the misattribution the citation test refuses — the two fields would then disagree about which is lying. The value and the declaration COUNT (two, hence the override above: the 2700 default and the `is_limit` fallback on the same line) are pinned by this registry's own forward check.",
+  },
+  {
     name: "REAP_MIN_S",
     owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
     value: "${REAP_MIN_S:-2700}",
