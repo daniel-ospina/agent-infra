@@ -535,7 +535,8 @@ ck "B6d …and nothing claims the exemption was granted" $rc
 # B7: the same failed evidence read UNDER the ceiling — the lane runs (the ratio allows it), and the log
 # STILL says the evidence read failed. ⛔ PRE-CHANGE SOMETHING *WAS* SAID, and saying otherwise is the
 # false premise review round 12 caught: `origin/main` appended a bracketed clause to the VERDICT line
-# (`:4266/4279`, echoed with `$lb_line` at `:4282/:4285`), so under the ceiling it read
+# (append `:4266`/`:4279`; the OK echoes that carry it are `:4272`/`:4285` — `:4282` is the refusal's),
+# so under the ceiling it read
 # `[land-backlog] OK … [the <TAG> exemption read ALSO failed: …]`. The gain this suite pins is the
 # DEDICATED line — greppable by its own token, printed whatever the verdict said, naming WHICH fault —
 # not the invention of a trace that existed.

@@ -1296,9 +1296,9 @@ land_backlog_exempt() { # <issue> <owner/repo> -> prints the reason + ". ", rc 0
 # ⛔ THE DEFECT THIS NAMES: when the label/title read failed, the ONLY trace was a bracketed clause
 # APPENDED to the verdict line, so the failure inherited that verdict's shape and said nothing about
 # WHICH fault it was. On an UNDER-ceiling repo the pre-change log therefore read
-# `[land-backlog] OK <n> open / <r> landings per hour … [the <TAG> exemption read ALSO failed: …]` (the
-# append is at `origin/main:4266/4279`, echoed with `$lb_line` at `:4282/:4285`): an OK line carrying a
-# failed read. Measured 2026-11-09, the same cause — no gh credential in the lane's redirected HOME —
+# `[land-backlog] OK <n> open / <r> landings per hour … [the <TAG> exemption read ALSO failed: …]` (on
+# `origin/main` the append is at `:4266`/`:4279`, and the OK echoes that carry it are `:4272`/`:4285`;
+# `:4282` is the refusal's echo, not the under-ceiling one): an OK line carrying a failed read. Measured 2026-11-09, the same cause — no gh credential in the lane's redirected HOME —
 # failed BOTH reads, and a P0-blocker held by a broken gh chain was distinguishable from one judged
 # non-urgent only by a trailing bracket nobody would grep for. This line is printed whenever the
 # evidence read failed, whatever the ratio read then said, and it names which fault it is.
@@ -1318,8 +1318,12 @@ land_backlog_exempt_note() { # <label> <exempt-why>
     case "$st" in
       # ⛔ THE SAME FALSE-CLAIM GUARD AS THE REFUSAL: an unresolved state is not evidence of a credential, and the
       # advice "fix the READ, not the credential" is exactly wrong on the arm where the credential is the cause.
-      # `token-blank` belongs here too: gh resolves the blank token INSTEAD of any store, so the credential is the
-      # cause even though a name is set (see `gh-auth.sh`'s header measurement).
+      # ⛔ `token-blank` IS ON THIS LIST, NOT THE CREDENTIAL-CAUSE ONE ABOVE, AND THAT LABEL IS DEFENSIVE: the
+      # `cause`-non-empty branch above is the one that fires for it, because `gh_auth_cause` speaks for it by
+      # contract (A17, `gh-auth.test.sh:330`) — and it does so precisely so a blank-but-set token can never reach
+      # a line that says "the lane's gh IS credentialed" (gh resolves the blank instead of any store, so the
+      # credential IS the cause even though a name is set — see `gh-auth.sh`'s header measurement). This arm is
+      # reachable only with an empty state, i.e. when the module is absent.
       ''|none|ambient-missing|token-blank)
         printf '[land-backlog] NOTE %s: EXEMPTION-UNREADABLE — the %s labels/title read FAILED, and this lane'"'"'s gh credential could NOT be resolved either (state=%s) — so the CAUSE MAY BE THE CREDENTIAL (check `gh auth status` under the lane'"'"'s HOME / the [gh-auth] line). A P0/base-red exemption cannot be proven, so the ratio decides below, and OVER the ceiling that means HELD.\n' \
           "$label" "${TAG:-issue}" "${st:-unresolved}"
@@ -1337,12 +1341,17 @@ land_backlog_exempt_note() { # <label> <exempt-why>
 # byte-identical copies of a refusal whose remedy was the RATIO one — "land/fix the open PRs (this is
 # the drain), or dispatch a P0/base-red item" — printed on the `UNREADABLE` arm as well. Measured
 # 2026-11-09: the cause was a lane whose `gh` had NO credential at all, so acting on the printed remedy
-# meant landing PRs to fix a `hosts.yml` problem. ⛔ THE CREDENTIAL REMEDY REPLACES THE RATIO ONE ONLY
-# WHERE THE CAUSE CAN BE NAMED (`gh_auth_cause` speaks). Every other `UNREADABLE` arm keeps the ratio
-# remedy WITH a caveat naming what could NOT be measured — `⛔ BUT FIRST … could NOT be resolved`
-# (state `none`/`ambient-missing`/`token-blank`, or an empty state when the module is absent) or
-# `IS credentialed (state=…) … check the gh/network chain` — because a refusal that names no remedy is
-# the silence #2210 forbids, and on those arms the ratio may well be the true cause.
+# meant landing PRs to fix a `hosts.yml` problem. ⛔ THE CREDENTIAL REMEDY REPLACES THE RATIO ONE ON
+# EXACTLY THE ARMS WHERE THE CAUSE CAN BE NAMED, i.e. the three shapes `gh_auth_cause` speaks for
+# (`none`, `ambient-missing`, `token-blank`), and the credential branch is therefore the NORMAL one.
+# ⛔ THE RATIO+CAVEAT ARM IS REACHABLE ONLY WHEN THE MODULE IS ABSENT: `cause` is empty, so no cause can
+# be named, and there the refusal keeps the ratio remedy WITH `⛔ BUT FIRST … could NOT be resolved
+# (state=unresolved)` rather than asserting either cause — a refusal that names no remedy is the silence
+# #2210 forbids. Its other `case` labels (`none`, `ambient-missing`, `token-blank`) are DEFENSIVE and
+# UNREACHABLE by A17's contract — the cause speaks for all three, so they can only be hit if that
+# coverage ever diverges — and they are kept so that such a divergence degrades to the caveat instead of
+# to silence. (Review round 13, P3: this header previously stated the routing BACKWARDS, which is worse
+# than silence in a comment that licenses deleting the caveat arms.)
 # ⛔ STILL A REFUSAL: no agent started, nothing consumed, and the item stays eligible on another box —
 # #2210's contract is that the refusal is READABLE, not that it is quiet.
 land_backlog_refuse() { # <label> <verdict-line> <exempt-why>
@@ -1359,8 +1368,12 @@ land_backlog_refuse() { # <label> <verdict-line> <exempt-why>
           # ⛔ AN EMPTY RESOLUTION IS NOT EVIDENCE OF A CREDENTIAL (fresh-eyes pass on this diff): with the module
           # absent (or silent) `gh_auth_cause` cannot speak, so claiming "the lane's gh IS credentialed" would be a
           # confident false statement about the exact thing this change exists to measure. Say what was NOT measured.
-          # `token-blank` is the THIRD shape of that false claim (measured, gh 2.103.3): a blank-but-set GH_TOKEN
-          # outranks every config dir, so the lane has no usable credential and no store this module could point at.
+          # ⛔ `token-blank` IS THE THIRD SHAPE OF THAT FALSE CLAIM (measured, gh 2.103.3: a blank-but-set
+          # GH_TOKEN outranks every config dir, so the lane has no usable credential and no store this module
+          # could point at) — and, like the NOTE's, these labels are DEFENSIVE: `gh_auth_cause` SPEAKS for
+          # `none`/`ambient-missing`/`token-blank`, so those three take the credential-remedy branch above and
+          # this arm is reached with an EMPTY state only (module absent). Kept so a future divergence in the
+          # cause's coverage degrades to the caveat rather than to a claim of a credential.
           ''|none|ambient-missing|token-blank)
             printf ' Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. ⛔ BUT FIRST: this lane'"'"'s gh credential could NOT be resolved either (state=%s), so the read may be a CREDENTIAL fault — check `gh auth status` under the lane'"'"'s HOME before acting on the ratio. The issue returns to the pool and is re-dispatched when the next read succeeds.\n' \
               "${st:-unresolved}"
