@@ -1423,6 +1423,80 @@ cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
 # reason (a behind harness, not a post-seed edit).
 PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
 
+# (e2b) `apply --pin-only` ON A CELL WHOSE CONTROLLER IS LIVE (agent-infra#2738).
+# The guard above `harness_apply` used to run BEFORE the `--pin-only` branch, so the one verb that exists
+# for a running cell was refused by it — and the refusal's own message offered `--force`, which defeats the
+# SAME guard on the SEEDING path, so `--force` stopped distinguishing "advance the pin" from "re-seed `$O`
+# under a live loop". MEASURED 2026-10-24 19:05Z on `pi-cell-3`: the pin record named `709ceb911b03` and
+# that pin directory did not exist, the repair was `apply --pin-only`, it printed
+# `FATAL: a controller is RUNNING (pid 2446252)`, and `--force` was the only way through.
+# ⛔ THE FIXTURE IS A REAL LIVE CONTROLLER, not a stubbed verdict: `seen_controller_pids`'s lock leg needs
+# a running `bash …/orch-loop.sh` whose pid an `.orch.lock` written AFTERWARDS names (the age direction
+# therefore reads "began before the lock" — a controller, not pid reuse), so the pin-only assertion below
+# cannot be satisfied by a fixture the guard simply ignores. Both directions are needed: an exemption that
+# had also DELETED the guard reddens the plain-apply assertion, and a missing exemption reddens the
+# pin-only one.
+mkdir -p "$P/lockctl"
+printf '#!/bin/sh\nsleep 300\n' > "$P/lockctl/orch-loop.sh"; chmod +x "$P/lockctl/orch-loop.sh"
+bash "$P/lockctl/orch-loop.sh" >/dev/null 2>&1 & _PIN_LIVE=$!
+sleep 0.3
+printf '%s\n' "$_PIN_LIVE" > "$P/o/.orch.lock"
+# Point the box BACK at the pre-(e) pin and hand-edit $O, so "the pin advanced" and "$O was not re-seeded"
+# are both observable rather than implied.
+# ⛔ ASSIGNING `PH` IS NOT ENOUGH — THE RECORD MUST BE MOVED TOO, OR THE ADVANCE ARM IS VACUOUS
+# (independent review of this PR, P1, and it was right). `prov` passes `HARNESS="$PH"` but the NEXT
+# `apply` re-resolves the harness from `$HARNESS_PIN_FILE`, which §(e)/(e2) left naming
+# `pin/<the tip>`: the post-call record would then already satisfy the "advanced" pattern and the arm
+# would pass over a `--pin-only` that did NOTHING. The value written here is also the exact pi-cell-3
+# shape — a record naming a pin directory that does NOT exist — so the arm exercises the repair, not a
+# no-op.
+PH="$P/pin/000000000000/scripts/orchestrator-harness"
+printf '%s\n' "$PH" > "$P/home/.harness-path"
+_REC_BEFORE="$(cat "$P/home/.harness-path" 2>/dev/null)"
+printf '\n# hand edit a pin-only would erase\n' >> "$P/o/orch-loop.sh"
+prov apply --pin-only
+[ "$PROV_RC" -eq 0 ] \
+  && ok "apply --pin-only is ALLOWED on a cell whose controller is live (the no-skew advance is reachable)" \
+  || bad "apply --pin-only was REFUSED with a live controller — the guard still gates the pin-only path (rc=$PROV_RC): $PROV_OUT"
+_PIN_AFTER="$(cat "$P/home/.harness-path" 2>/dev/null)"
+[ "$_PIN_AFTER" != "$_REC_BEFORE" ] \
+  && ok "…and it REWROTE the pin record (fixture check: it named a non-existent pin before the call)" \
+  || bad "the pin record still names '$_REC_BEFORE' — `--pin-only` exited 0 without advancing anything (the reachable-but-inert mutant)"
+case "$_PIN_AFTER" in
+  "$P/pin/$(printf '%s' "$WANT" | cut -c1-12)"/*) ok "…and the pin really advanced to origin/main under the live controller (the measured pi-cell-3 repair)" ;;
+  *) bad "--pin-only recorded '$_PIN_AFTER' instead of the pin for $WANT — the exempted path did nothing: $PROV_OUT" ;;
+esac
+grep -q 'hand edit a pin-only would erase' "$P/o/orch-loop.sh" 2>/dev/null \
+  && ok "…and it did NOT seed \$O under the live loop (the skew the guard exists to prevent is still absent)" \
+  || bad "--pin-only re-seeded \$O/orch-loop.sh — the exemption let the exempted path do the guarded thing"
+# THE GUARD IS NOT GONE — the same live controller must still refuse the SEEDING path, or the exemption
+# above is indistinguishable from having deleted the guard.
+prov apply
+[ "$PROV_RC" -ne 0 ] \
+  && ok "…while a plain apply is STILL refused with a live controller (the guard kept its seeding path)" \
+  || bad "a plain apply SEEDED the running cell's state dir — exempting --pin-only removed the guard instead of scoping it (rc=$PROV_RC): $PROV_OUT"
+case "$PROV_OUT" in
+  *"a controller is RUNNING (pid $_PIN_LIVE"*) ok "…naming the pid it can see, so the refusal is this fixture's controller" ;;
+  *) bad "the refusal did not name the live pid $_PIN_LIVE — it came from something else, so the arm above proves nothing: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"apply --pin-only"*) ok "…and it NAMES a non-destructive remedy, so an operator is not steered to the flag that defeats the guard" ;;
+  *) bad "the refusal still offers only 'stop' and '--force' — the pi-cell-3 dead end (agent-infra#2738): $PROV_OUT" ;;
+esac
+kill -KILL "$_PIN_LIVE" 2>/dev/null; wait "$_PIN_LIVE" 2>/dev/null
+rm -f "$P/o/.orch.lock"
+# The control: with that controller gone the SAME plain apply seeds, which is what makes the two refusal
+# assertions above attributable to the live controller rather than to some other precondition of the
+# fixture.
+prov apply
+[ "$PROV_RC" -eq 0 ] \
+  && ok "…and once the controller is gone the SAME apply seeds (the refusal was the live controller, not the fixture)" \
+  || bad "a plain apply was still refused with no controller running, so the guard arms above prove nothing (rc=$PROV_RC): $PROV_OUT"
+cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
+  && ok "…and that seed erased the hand edit, so the 'did NOT seed' arm above was not vacuous" \
+  || bad "the control seed left the hand edit in \$O/orch-loop.sh, so 'did not seed' proved nothing"
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+
 # (e3) STATUS must bound the self-refresh verdict by the LOOP's cycle, not an operator-shell default.
 # A verdict older than two cycles is a fact about the PAST: with a 900 s default (the loop uses 240) a
 # controller that stopped re-pinning 30 minutes ago still printed a fresh-looking line.
