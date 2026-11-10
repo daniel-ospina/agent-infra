@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kreviewer-3888-1794323734-p4189594-fbf7d2b3",
+  "_sha": "fd04e86fa347a60287b4ba1c29ab6d065792e9c4",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/mandate-preflight.JsUy2V/seam3b.log"
+    },
+    {
+      "kind": "branch",
+      "value": "disk-hygiene"
+    },
+    {
+      "kind": "sha",
+      "value": "3f2ea9e09798055810327710d44730712af7ed80"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-3888"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 28,
+  "ended_at": 1794323762,
+  "exit_code": 0,
+  "heartbeat_at": 1794323762,
+  "host": "cmux",
+  "issue": 3888,
+  "kind": "reviewer",
+  "lane_id": "cmux.kreviewer-3888-1794323734-p4189594-fbf7d2b3",
+  "lease_until": 1794324367,
+  "pid": 4189594,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794323734,
+  "state": "DONE",
+  "tag": "3888",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-3888"
+}
