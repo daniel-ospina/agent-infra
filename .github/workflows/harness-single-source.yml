@@ -140,7 +140,9 @@ jobs:
         # agree with what is on disk — `absent` only where nothing is there, any other kind only
         # where something is (`unreadable` makes no claim, so it is not cross-checked). The
         # NON-VACUITY block at the end of this step reds if that cross-check ever stops refusing a
-        # fabricated answer, so the repair cannot decay into a green no-op.
+        # fabricated answer, so the repair cannot decay into a green no-op — and since #3045 those
+        # mutations are FABRICATED rather than derived from the box, because a box-derived one was
+        # invisible on exactly the runner the job usually lands on.
         run: |
           set -euo pipefail
           rc=0
@@ -185,46 +187,122 @@ jobs:
           check() { python3 "$chk" "$1" "$GITHUB_SHA" "$2"; }
           check "$out" "$rc"
 
-          # NON-VACUITY — the cross-check above must REFUSE a deployed answer this box contradicts.
-          # The mutation flips the kind to the one REALITY denies (present → `absent`, absent →
-          # `stamp`), so it is the degenerate always-one-value doctor that this arm catches, on
-          # whichever runner the job lands on.
+          # NON-VACUITY — the cross-check above must REFUSE a fabricated deployed answer, and it
+          # must do so on BOTH of its branches. ⛔ THE MUTATIONS BELOW ARE FABRICATED, NEVER DERIVED
+          # FROM THE BOX (#3045). This arm used to read `present = os.path.lexists(dep["path"])` and
+          # flip the kind away from what it observed — which made the arm a function of the runner, in
+          # the one direction that matters: on a BARE GitHub-hosted runner (kind `absent`, nothing on
+          # disk — the population this job mostly lands on, and the state `paths:` keeps it running in)
+          # the flip emitted `stamp`, and the OLD `assert dep["kind"] == "absent"` refused `stamp` too,
+          # so a VERBATIM REVERT of the cross-check left this step exiting 0 and printing
+          # `✅ non-vacuity` over a checker that cross-checked nothing. Measured 2026-11-10 against a
+          # reproduction of this step: reverted checker revealed by the bare-runner case ⇒ arm exit 0
+          # (blind), and on a box WITH a deployment the revert reds the FIRST `check` instead of this
+          # arm — so the regression was never attributable to the guard that exists to name it. A path
+          # the mutation asserts into existence makes both arms gradable on any machine (#3045's own
+          # prescription), and each branch of the cross-check now has its own contradictory payload.
           mut="$(mktemp)"
           cat >"$mut" <<'PY'
-          import json, os, sys
+          import json, sys
           d = json.load(sys.stdin)
           dep = d["deployed"]
-          present = bool(dep["path"]) and os.path.lexists(dep["path"])
-          dep["kind"] = "absent" if present else "stamp"
+          # REALITY: this path exists on every runner. THE ANSWER: nothing is there.
+          dep["path"] = "/"
+          dep["kind"] = "absent"
           sys.stdout.write(json.dumps(d))
           PY
           mutated="$(printf '%s\n' "$out" | python3 "$mut")"
           if check "$mutated" "$rc" >/dev/null 2>&1; then
-            echo "❌ NON-VACUITY: the doctor cross-check ACCEPTED a deployed kind this box contradicts: $mutated"
+            echo "❌ NON-VACUITY: the doctor cross-check ACCEPTED an 'absent' beside a path that exists: $mutated"
             exit 1
           fi
-          echo "✅ non-vacuity: a fabricated deployed answer is refused"
+          echo "✅ non-vacuity: a fabricated 'absent' is refused"
+
+          # … and the OTHER branch: an answer claiming something IS there, beside a path that is not.
+          # Both directions are pinned so that deleting EITHER branch of the cross-check is caught
+          # here instead of decaying into a green no-op.
+          mut2="$(mktemp)"
+          cat >"$mut2" <<'PY'
+          import json, sys
+          d = json.load(sys.stdin)
+          dep = d["deployed"]
+          # REALITY: nothing can be here. THE ANSWER: a deployment is.
+          dep["path"] = "/nonexistent-0000000000000000"
+          dep["kind"] = "stamp"
+          sys.stdout.write(json.dumps(d))
+          PY
+          mutated2="$(printf '%s\n' "$out" | python3 "$mut2")"
+          if check "$mutated2" "$rc" >/dev/null 2>&1; then
+            echo "❌ NON-VACUITY: the doctor cross-check ACCEPTED a 'stamp' beside a path that does not exist: $mutated2"
+            exit 1
+          fi
+          echo "✅ non-vacuity: a fabricated present-kind is refused"
       - name: canonical copy is complete (the source of truth has all shared files)
+        # ⛔ THE PREMISE IS ASSERTED, NOT INHERITED (#2726). `check-single-source.sh` takes the
+        # deployed dir from `${O:-}` (see its arg parsing), and the fleet's CELL RUNNERS EXPORT `O`:
+        # measured 2026-10-25 on `ai-runner-cell3-x64-1`/`-2`, doctor named `/tmp/cell-home/orchestrator`
+        # while the runner's own HOME was `/tmp/ai-runner-work-c1-3/…` (#2735's thread). On such a
+        # runner this arm silently graded the BOX's deployment instead of the canonical tree, and
+        # redded a source of truth that was complete: measured on `cmux` with `O=$HOME/orchestrator`,
+        # rc 1 and `FAIL: 56 divergence(s) — the harness has more than one source` — under a step whose
+        # name promises canonical COMPLETENESS, so the message sent the operator to the wrong surface.
+        # This step is deliberately about the canonical tree; the deployed-byte arms are the `--o "$d"`
+        # steps below, which are hermetic by construction because an explicit `--o` wins over `${O:-}`.
+        # So `unset O` makes the premise true, and the assertion after it NAMES the failure in place if
+        # a future edit drops the unset — instead of redding silently with a misleading count.
+        # ⛔ A job-level `env:` cannot do this: `env` overrides values and has NO way to delete a
+        # variable inherited from the runner service (GitHub's `env` context excludes those), so the
+        # unset has to happen in the step's own shell.
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm grades the canonical tree, not the box's deployment"; exit 1; }
           bash scripts/orchestrator-harness/check-single-source.sh
       - name: a REAL comparison passes (deployed copy identical to canonical)
+        # ⛔ THE PREMISE IS ON EVERY ARM THAT INVOKES THE CHECKER, NOT ONLY THE `${O:-}` ONES (#2726,
+        # review round). `--o "$d"` does win over the fallback, so this pair of lines is a no-op HERE —
+        # and that is the point: the guard no longer reasons about the `--o` VALUE, because `--o "$d"`
+        # with `d=""` sets `O_DIR` to the empty string, which `check-single-source.sh:155` reads as
+        # "no target" and re-enters `O_DIR="${O:-}"`. A step that LOOKS explicit therefore still graded
+        # the runner. A uniform premise has no value-shaped hole in it.
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm compares a copy it builds itself, not the box's deployment"; exit 1; }
           d="$(mktemp -d)"
           cp scripts/orchestrator-harness/*.sh "$d"/
           bash scripts/orchestrator-harness/check-single-source.sh --require-target --o "$d"
       - name: NON-VACUITY — a planted fork is refused
+        # ⛔ THE SAME PREMISE, AND HERE IT IS A PROVEN FALSE PASS (#2726). `--fork` sets no `O_DIR`, so
+        # the checker still falls back to `${O:-}` and grades the BOX's deployment as well — while this
+        # step asserts only `rc == 1` and never WHAT diverged. Measured on `cmux`, the shape the fleet's
+        # cell runners export (`O=$HOME/orchestrator`): a fork holding NONE of the 11 fork-arm files
+        # printed `ok: /tmp/empty-fork holds none of the 11 fork-arm files`, produced **0** fork
+        # divergences, and still exited 1 on the deployment's 56 — so the step PASSED with the arm it
+        # exists to prove stone dead. With `O` unset the same run exits 0 and the assertion is honest.
+        # Both halves are fixed: `unset O` makes the premise true, and the grep below refuses a red
+        # that does not NAME the planted fork, so no future env leak can satisfy this step again.
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm grades the planted fork, not the box's deployment"; exit 1; }
           mkdir -p /tmp/planted-fork
           cp scripts/orchestrator-harness/lane.sh /tmp/planted-fork/lane.sh
           rc=0
-          bash scripts/orchestrator-harness/check-single-source.sh --fork /tmp/planted-fork || rc=$?
+          bash scripts/orchestrator-harness/check-single-source.sh --fork /tmp/planted-fork 2>/tmp/planted-fork.err || rc=$?
           [ "$rc" -eq 1 ] || { echo "FAIL: a reappearing fork must exit 1, got $rc"; exit 1; }
+          # ⛔ rc 1 IS NOT THE CLAIM — the claim is that the FORK was refused. Any other divergence in
+          # the same run also answers 1, and the deployment surface supplies tens of them on a real
+          # runner. A fork refusal always names the fork path, so its absence is a dead arm, not a red.
+          grep -q '/tmp/planted-fork/lane.sh' /tmp/planted-fork.err || {
+            echo "FAIL: rc 1, but no divergence names /tmp/planted-fork/lane.sh — the planted fork was NOT what redded this run:";
+            sed -n '1,20p' /tmp/planted-fork.err; exit 1; }
       - name: NON-VACUITY — a divergent deployed copy is refused
+        # Same premise as every other arm here — see the note on the step above (#2726, review round).
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm grades the copy it diverges on purpose, not the box's deployment"; exit 1; }
           d="$(mktemp -d)"
           cp scripts/orchestrator-harness/*.sh "$d"/
           printf '%s\n' '# drift' >> "$d/spawn-gate.sh"
@@ -232,8 +310,15 @@ jobs:
           bash scripts/orchestrator-harness/check-single-source.sh --o "$d" || rc=$?
           [ "$rc" -eq 1 ] || { echo "FAIL: a byte-divergent deployed copy must exit 1, got $rc"; exit 1; }
       - name: NON-VACUITY — checking nothing is UNKNOWN, never a pass
+        # ⛔ SAME PREMISE, SAME REASON (#2726), and here it is what makes the arm non-vacuous: it only
+        # proves "checking nothing is UNKNOWN" on a box that genuinely has nothing to compare. With `O`
+        # exported the checker had a target, that target DIVERGED, and it answered 1 (DIVERGENCE) where
+        # this arm requires 2 (UNKNOWN) — measured on `cmux`: `FAIL: --require-target with no target
+        # must exit 2, got 1`. That is a red about the RUNNER's env, reported as a red about the check.
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm needs a box with nothing to compare"; exit 1; }
           rc=0
           bash scripts/orchestrator-harness/check-single-source.sh --require-target --quiet || rc=$?
           [ "$rc" -eq 2 ] || { echo "FAIL: --require-target with no target must exit 2, got $rc"; exit 1; }

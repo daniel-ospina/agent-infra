@@ -41,6 +41,7 @@ import {
   ERROR_CLASSES,
 } from "./frontmatter-validate.mjs";
 import { FIXTURES, PI_VERSION_PIN } from "./frontmatter-fixtures.mjs";
+import { reportVerdict } from "../extensions/shared/verdict.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const LINT_SCRIPT = path.join(REPO_ROOT, "scripts", "check-skill-lint.mjs");
@@ -335,7 +336,12 @@ test("CLI over the live tree → '0 issue(s). Clean.' exit 0", () => {
   assert.match(r.stdout, /Clean\./);
 });
 
-console.log(`\ncheck-skill-lint.test.mjs: ${passed} passed, ${failed} failed`);
+// agent-infra#2723 — ONE attributable aggregate through the shared emitter. This
+// line is the `ci / unit-test` job's ONLY failure identity on the PR lane
+// (`ci.yml`'s `test-command` runs this suite and its sibling), and the hand-rolled
+// `label: N passed, M failed` shape it replaces carried NO `❌`/`✅` marker, so a
+// failing run parsed to `ids=0 … runner=0` and the merge rail refused the PR blind.
+reportVerdict("check-skill-lint.test.mjs", passed, failed);
 if (failed > 0) {
   console.error("❌ SOME TESTS FAILED");
   process.exit(1);

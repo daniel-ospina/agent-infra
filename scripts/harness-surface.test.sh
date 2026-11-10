@@ -649,8 +649,9 @@ case "${LAUNCHD_MODE:-running}" in
   crashloop) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n\truns = 7\n'; exit 0 ;;
   # NO launch count at all: the row may print the code and must invent no count.
   died) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n'; exit 0 ;;
-  # A CLEAN exit with a climbing launch count: `orch-loop.sh`'s "already running" path does `exit 0`,
-  # so KeepAlive relaunches it cleanly, for ever. This must NOT read as a crash.
+  # A CLEAN exit with a climbing launch count: a job that ends normally is relaunched by KeepAlive,
+  # for ever. This must NOT read as a crash. (The lock-refusal case used to land here; since
+  # agent-infra#2095 it exits 75 and has its own `refused-singleton` row below.)
   clean-exit) printf '\tstate = spawn scheduled\n\tlast exit code = 0\n\truns = 7\n'; exit 0 ;;
   # Loaded, no process, and launchd has NEVER launched it (runs = 0 settles "never kicked").
   never-started) printf '\tstate = spawn scheduled\n\truns = 0\n'; exit 0 ;;
@@ -661,6 +662,12 @@ case "${LAUNCHD_MODE:-running}" in
   signed) printf '\tstate = spawn scheduled\n\tlast exit code = -15\n\truns = 3\n'; exit 0 ;;
   # NON-CANONICAL INTEGER: `00` must normalise to a clean 0, not read as a crash (round 5).
   zerozero) printf '\tstate = spawn scheduled\n\tlast exit code = 00\n\truns = 5\n'; exit 0 ;;
+  # ⛔ A DELIBERATE REFUSAL, NOT A DEATH (agent-infra#2095): `orch-loop.sh` exits 75 when another
+  # controller of this state dir holds `.orch.lock`. KeepAlive relaunches it every ThrottleInterval,
+  # so a `DIED … every attempt is failing` row would be a permanent FALSE-RED on a healthy box.
+  refused-singleton) printf '\tstate = spawn scheduled\n\tlast exit code = 75\n\truns = 9\n'; exit 0 ;;
+  # An UNJUDGED refusal: the lock record exists but cannot be read or dated. OPPOSITE REMEDY to 75.
+  refused-unjudged) printf '\tstate = spawn scheduled\n\tlast exit code = 74\n\truns = 4\n'; exit 0 ;;
   # Loaded with no process AND no exit data at all: the row may not invent one.
   no-data) printf '\tstate = spawn scheduled\n'; exit 0 ;;
   *) printf '\tstate = running\n\tpid = 4242\n'; exit 0 ;;
@@ -745,10 +752,11 @@ ck "(d) …but a cumulative count is NOT turned into any crash/persistence verdi
    "$(case "$launchd_row" in ""|*CRASH*|*PERSIST*|*LOOP*|*"will not help"*) echo 1 ;; *) echo 0 ;; esac)"
 ck "(d) …and persistence is stated CONDITIONALLY, so the count is evidence not a verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in *"if it STAYS here"*) echo 0 ;; *) echo 1 ;; esac)"
-# ⛔ A CLEAN EXIT IS NOT A CRASH (review cycle 2). `orch-loop.sh`'s lock path prints "already running"
-# and `exit 0`; with KeepAlive that is a job that exits IMMEDIATELY and cleanly, every time. Calling
-# it DIED and pointing at `launchd.err` (that message goes to STDOUT) is a named WRONG CAUSE — worse
-# than the old agnostic wording.
+# ⛔ A CLEAN EXIT IS NOT A CRASH (review cycle 2). `orch-loop.sh` used to answer a held lock with
+# "already running" and `exit 0`, so this was the lock-refusal state. ⛔ SINCE agent-infra#2095 THAT IS
+# NO LONGER TRUE: the lock path exits **75** and has its own row (`REFUSED-SINGLETON`, asserted below),
+# so this arm is about a job that genuinely exited 0. Calling either one DIED and pointing at
+# `launchd.err` is a named WRONG CAUSE — worse than the old agnostic wording.
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
         LAUNCHD_MODE=clean-exit HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
@@ -758,8 +766,119 @@ ck "(d) a CLEAN exit (0) is NAMED EXITED-CLEAN, not DIED [$launchd_row]" \
    "$(case "$launchd_row" in *EXITED-CLEAN*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(d) …and it does NOT claim every attempt is failing [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in ""|*"every attempt is failing"*) echo 1 ;; *) echo 0 ;; esac)"
-ck "(d) …and it points at launchd.OUT, which is where 'already running' is written [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+ck "(d) …and it points at launchd.OUT, which is where the controller's own output is written [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in *launchd.out*launchd.err*|*launchd.err*) echo 1 ;; *launchd.out*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND IT MUST NOT READ A HISTORICAL `[singleton]` LINE AS THIS RUN'S VERDICT (fresh-context review of
+# #3846). `orch-loop.log` is APPEND-ONLY and never rotated, so a line from an earlier refusal is
+# PERMANENT — and this row used to say "a 0 here with a [singleton] line … is the same refusal", which
+# tells an operator that a CLEAN exit was a refusal for ever after one loud day. A stale line can never
+# be a verdict; the row has to point at the line's own `me=`/`rc=` and its age instead.
+ck "(d) …and it does NOT read a stale [singleton] line as this run's verdict [$(printf '%s' "$launchd_row" | cut -c1-240)]" \
+   "$(case "$launchd_row" in *"IS NOT THE VERDICT OF THIS RUN"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ 75 IS A REFUSAL, AND IT MUST NOT READ AS A DEATH (agent-infra#2095). Without its own arm exit 75
+# fell through to `DIED … every attempt is failing`, which under KeepAlive repeats for ever on a
+# CORRECT refusal — the same class as the false-green the old silent `exit 0` produced, in the other
+# direction. Removing the `REFUSED-SINGLETON` arm reddens all three checks below.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=refused-singleton HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a singleton REFUSAL (exit 75) is NAMED REFUSED-SINGLETON [$launchd_row]" \
+   "$(case "$launchd_row" in *REFUSED-SINGLETON*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and it does NOT read as a crash — no 'every attempt is failing', no launchd.err framing [$(printf '%s' "$launchd_row" | cut -c1-220)]" \
+   "$(case "$launchd_row" in ""|*"every attempt is failing"*|*DIED*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(d) …and it says the refusal is the singleton working, and points at the [singleton] record [$(printf '%s' "$launchd_row" | cut -c1-220)]" \
+   "$(case "$launchd_row" in *"singleton working"*orch-loop.log*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND THE WITNESS PATH IT SENDS THEM TO MUST EXIST (fresh review of #3846, P3). Since agent-infra#2095
+# `orch-loop.sh` ranks `ORC_STATE_DIR` above `O` and writes `[singleton]` — and the lock itself — into the
+# dir it RESOLVED, so on a box whose plist renders `ORC_STATE_DIR` a row naming `<O>/logs/orch-loop.log`
+# sends the operator to a file that does not contain the witness. That is the same defect
+# `launchd-controller.sh` fixed with `_LC_STATE="${ORC_STATE_DIR:-$O}"` (its test case J), one reader over.
+# ⛔ THE SECOND ARM IS THE CONTROL: with `ORC_STATE_DIR` unset the row still names `$O`, so no existing
+# install's output changes and the arm above is reading the block rather than a hard-coded path.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" ORC_STATE_DIR="$TMP/splitstate" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=refused-singleton HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a split state dir: the 75 row names the RESOLVED dir's log AND lock, not \$O's [$(printf '%s' "$launchd_row" | cut -c1-260)]" \
+   "$(case "$launchd_row" in *"$TMP/splitstate/logs/orch-loop.log"*"$TMP/splitstate/.orch.lock"*) case "$launchd_row" in *"$TMP/home/orchestrator/logs/orch-loop.log"*|*"$TMP/home/orchestrator/.orch.lock"*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=refused-unjudged HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) control: with ORC_STATE_DIR unset the 74 row still names \$O, so an existing install's row is unchanged [$(printf '%s' "$launchd_row" | cut -c1-260)]" \
+   "$(case "$launchd_row" in *"$TMP/home/orchestrator/logs/orch-loop.log"*) echo 0 ;; *) echo 1 ;; esac)"
+# NON-VACUITY CONTROL: the same row family still calls a genuine failure DIED. Without this, an arm
+# that labelled EVERY exit code REFUSED-SINGLETON would pass the three checks above.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=crashloop HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) control: exit 128 is still DIED, not REFUSED-SINGLETON [$launchd_row]" \
+   "$(case "$launchd_row" in *DIED*|*"last exit 128"*) case "$launchd_row" in *REFUSED-SINGLETON*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
+ck "(d) control: …and it still says every attempt is failing [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in *"every attempt is failing"*) echo 0 ;; *) echo 1 ;; esac)"
+
+# ⛔ UNJUDGED IS ITS OWN ROW, BECAUSE ITS REMEDY IS THE OPPOSITE (fresh-context review of #3846). 75 says
+# the holder is the authority and the lock must be left alone; 74 says the record could not be read, so
+# somebody has to look and may remove it. One row for both tells the operator the wrong thing.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=refused-unjudged HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) an UNJUDGED refusal (exit 74) is NAMED REFUSED-UNJUDGED, not folded into the 75 row [$launchd_row]" \
+   "$(case "$launchd_row" in *REFUSED-UNJUDGED*) case "$launchd_row" in *REFUSED-SINGLETON*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
+ck "(d) …and it gives the OPPOSITE remedy — investigate, and removing the record IS allowed when nothing holds it [$(printf '%s' "$launchd_row" | cut -c1-240)]" \
+   "$(case "$launchd_row" in *"rm -f"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ …BUT rc 2 IS TWO SHAPES, AND BOTH ROWS MUST NOT PROMISE `rm -f` FOR ONE OF THEM (fresh-context
+# review of #3846, cycle 3). When the displaced record could NOT be put back, `$LOCKF` is absent or
+# 0-byte and that record sits at a `.reclaim.` path — `rm -f` there is a no-op and the remedy is to
+# MOVE it back. Measured at the reviewing head: rc=2, `$LOCKF` 0 bytes, the kept copy holding the
+# displaced pid. This row is the operator's only surface for it, so a revert to the single-shape text
+# has to redden here rather than pass silently.
+ck "(d) …and it distinguishes the KEPT-copy shape, whose remedy is to move the file back [$(printf '%s' "$launchd_row" | cut -c241-560)]" \
+   "$(case "$launchd_row" in *"move that file back"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND THE FILE'S OWN ROW LEGEND IS PINNED WITH IT (fresh-context review of #3846, cycle 4). The legend
+# at the top of this script is the header an agent greps for what each row MEANS, and it still described
+# 74 as ONE shape seventy lines above the row that had just been taught both — same object, two homes,
+# so an edit to one left the other asserting the no-op remedy. A revert to the single-shape legend
+# reddens here.
+# ⛔ CAPTURE, THEN TEST IN THE SHELL — NEVER `awk … | grep -q` (#841/#864). `grep -q` exits on its
+# first match, so the producer on its left takes EPIPE and SIGPIPEs; under `pipefail` (which callers
+# and CI shells set) the PIPELINE then reports failure even though the pattern matched, so the
+# assertion reads RED on a tree that is correct. A guard that can answer the opposite of what it
+# asserts is worse than no guard.
+# ⛔ AND `check-no-sigpipe-grep.sh` DOES flag this shape, just not for the reason the eye sees: the
+# flagged unit was the `grep -qF 'TWO SHAPES' && awk … | grep -qF 'NO-OP'` command LIST, where the
+# guard reads the first `grep` as the producer feeding the second pipe (it recognises
+# printf|echo|grep). MEASURED at c8b542750751 — `scripts/harness-surface.test.sh — 1 occurrence(s),
+# undeclared` in CI job 129714693871 — so this arm was itself a red `sigpipe-grep` check until it was
+# written this way. The guard's OWN note is why BOTH arms below capture rather than pipe: "any OTHER
+# producer piped into a quiet grep has the same failure mode (#864)", so a lone `awk | grep -q` is the
+# same latent false negative even when the scanner does not name it.
+legend="$(awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null || true)"
+case "$legend" in *'TWO SHAPES'*) leg_shapes=1 ;; *) leg_shapes=0 ;; esac
+case "$legend" in *'NO-OP'*)      leg_noop=1   ;; *) leg_noop=0   ;; esac
+has_legend=0
+[ "$leg_shapes" = 1 ] && [ "$leg_noop" = 1 ] && has_legend=1
+ck "(d) the row LEGEND also names rc 2 as two shapes with opposite remedies (not one, above the row)" "$([ "$has_legend" = 1 ] && echo 0 || echo 1)"
+# ⛔ AND IT MUST NOT SEND THE OPERATOR TO `$O` (fresh-context review of #3846, cycle 5). The lock lives in
+# the RESOLVED state dir (`${ORC_STATE_DIR:-$O}`, `hp_launchd_dead_text`) — this file records that exact
+# wording as the P3 defect it fixed one reader over, and the legend named `$O/.orch.lock` anyway, 26 lines
+# above its own correction. A path-naming revert reddens here instead of shipping a path that may not exist.
+# ⛔ AND IT IS THE SAME CAPTURE, NOT A SECOND PIPE (see the #841/#864 note above). A `awk … | grep -q`
+# here would be the same latent false NEGATIVE one row up — and on a NEGATIVE assertion a false
+# negative is the whole assertion: `legend_has_O` would stay 0 on a legend that names `$O`, so the pin
+# would silently stop pinning. `case` against the captured string cannot be defeated by a SIGPIPE.
+legend_has_O=0
+case "$legend" in *'$O/.orch.lock'*) legend_has_O=1 ;; *) legend_has_O=0 ;; esac
+ck "(d) …and the legend names NO \$O path for the lock (it is in the resolved state dir)" "$([ "$legend_has_O" = 1 ] && echo 1 || echo 0)"
+
 # ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
 # code is absent (review cycle 2).
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \

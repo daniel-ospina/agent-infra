@@ -18,6 +18,7 @@ import { register, registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -1278,5 +1279,7 @@ check("non-vacuity: the handler was driven", handler !== null && pass >= 25, `pa
 
 rmSync(FIX, { recursive: true, force: true });
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} gui-device-guard suite: ${pass} passed, ${fail} failed`);
+// agent-infra#2723 — one attributable emitter so a failing run always carries the
+// `runner::gui-device-guard-suite` identity the merge rail reads.
+reportVerdict("gui-device-guard-suite", pass, fail);
 process.exit(fail === 0 ? 0 : 1);

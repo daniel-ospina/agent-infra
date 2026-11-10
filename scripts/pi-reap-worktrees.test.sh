@@ -40,7 +40,14 @@
 #   open-pr                 G5a  (branch is an open PR head => PRESERVE)
 #   gh-unavailable          G5c  (=> exit 3, dry AND armed)
 #   no-github-remote        G5d  (PR gate N/A => still reclaims)
-#   too-recent              G6a  (HEAD < aged-days => PRESERVE)
+#   too-recent              G6a  (RULE D: a clean, holder-free, no-open-PR checkout is DISPOSABLE —
+#                                floor REAP_WT_DISPOSABLE_AGE_MINUTES, 12 h; G6a2/G6a3 pin the
+#                                cooldown direction and the `=0` restore, G6a4 pins that a floor already
+#                                at 0 STAYS 0, G6d2/N5a pin that a merged/patch-equivalent head keeps
+#                                its own floor, G6w2 pins that the clean gate still outranks it)
+#   ⛔ dirty is never collected G6w  (76d old, past every floor, held by the clean gate alone; G6w2 is
+#                                the row RULE D can actually reach — 2d, inside the 7d window and past
+#                                the 12h cooldown — and the `no-clean-gate` mutant reclaims it)
 #   aged / branch-retained  G6b  (unmerged named branch => REMOVE,
 #                                refs=branch-retained, ref survives)
 #   aged boundary           G6c  (strict > at 7d, 7d+1s, 7d+2s)
@@ -244,6 +251,7 @@ ep() { python3 -c 'import datetime,sys;print(int(datetime.datetime.fromisoformat
 NOW="$(ep 2026-09-15T20:00:00+00:00)"
 OLD_DATE="2026-07-01T12:00:00+00:00"     # 76 days before NOW
 RECENT_DATE="2026-09-13T12:00:00+00:00"  # 2 days before NOW
+TWO_HOURS_DATE="2026-09-15T18:00:00+00:00" # 2 hours before NOW — inside a 12 h cooldown, past rule 7's 45 min
 
 # ── shims ──────────────────────────────────────────────────────────────
 mkdir -p "$T/bin"
@@ -793,6 +801,7 @@ run_reaper() {
     REAP_WT_MERGED_AGE_DAYS="${REAP_WT_MERGED_AGE_DAYS_OVERRIDE:-0}" \
     REAP_WT_SCRATCH_AGE_DAYS="${REAP_WT_SCRATCH_AGE_DAYS_OVERRIDE:-1}" \
     REAP_WT_SCRATCH_GLOB="${REAP_WT_SCRATCH_GLOB_OVERRIDE:-wt-*|cell-wt-*}" \
+    REAP_WT_DISPOSABLE_AGE_MINUTES="${REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE:-0}" \
     REAP_WT_MAX_DAYS=1000000 \
     REAP_WT_MAIN_REF="${REAP_WT_MAIN_REF_OVERRIDE:-}" \
     TAR_BIN="${TAR_BIN_OVERRIDE:-tar}" \
@@ -1769,26 +1778,149 @@ WT_RECENT="$(add_named_wt "$REPO" "$ENV-recent" feat/g6-recent)"
 commit_in_wt "$WT_RECENT" "$RECENT_DATE" recent
 WT_AGED="$(add_named_wt "$REPO" "$ENV-aged" feat/g6-aged)"
 commit_in_wt "$WT_AGED" "$OLD_DATE" aged          # UNMERGED, aged, owns its commit
+# ── G6a: RULE D — THE DISPOSABLE-CLEAN FLOOR, and it is OFF unless it is ARMED ────────────────────
+# The capability that answers `worktree=0`. A CLEAN, holder-free, no-open-PR checkout was held by the
+# 7-day abandonment PROXY alone; measured on cell-3 (2026-11-10) that was 60 of 194 preserved rows
+# while the box reaped ZERO worktrees per hourly pass. Cleanliness + the census + the open-PR veto +
+# `refs=` ARE the safety property, so the floor for such a row can be a COOLDOWN (12 h), not a week.
+# ⛔ IT IS NOT THE DEFAULT, and G6a0 pins that: rule 6's 7-day window is a recorded, tested decision
+# (A2/A3/A14a/E3b/E4/G14d all measure it), so shipping it ON would reverse that decision silently.
+# Arming it is a deliberate per-box act, the same shape #1678 already uses for the reaper itself.
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" "G6a HEAD 2d old => preserve too-recent"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
+    "G6a0 DEFAULT (unarmed) still keeps a 2d clean row behind rule 6's 7-day window — the recorded decision is not reversed"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "ruleD" "G6a0 …and no row cites a ruleD floor while the rule is unarmed"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=reclaimable" \
+    "G6a ARMED (720m) a clean+holder-free+no-open-PR row at 2d => REMOVED under RULE D (not held by the 7d proxy)"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "floor=720m(ruleD)" \
+    "G6a the row NAMES the floor that decided it — a removal citing an unexpected floor is the complaint this change answers"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "proof=disposable-floor(" \
+    "G6a …and the removal's proof label agrees with its marker (a row the cooldown decided must not call itself an aged floor)"
+# ── G6a2: the floor is still a COOLDOWN — raise it above the row's age and the row is preserved.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=4320 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
+    "G6a2 a floor ABOVE the row's age (3d > 2d) preserves it — RULE D only ever LOWERS a floor, never removes one"
+# ⛔ AND THE UNITS ON THAT ROW ARE PART OF ITS CLAIM. `age:<n>s≤<n>m` states the age in SECONDS and
+# the floor in MINUTES; the `%sms` literal that used to be here expanded a 2-day row to
+# `age:172800ms` — 2.9 minutes to any reader — in the one field this change exists to make legible.
+# The `assert_contains` is the PRECONDITION (an absent row would otherwise satisfy assert_absent
+# vacuously), the `assert_absent` is the measurement (#3888 review 2, finding 3).
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "proof=age:" \
+    "G6a2 precondition: the preserved row carries its age/floor proof at all"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "ms≤" \
+    "G6a2 …and it never labels a SECONDS value as ms (a 2d row would read age:172800ms = 2.9 minutes)"
+# ── G6a3: 0 DISABLES it and restores the pre-rule behaviour EXACTLY, which is what makes the change
+# reversible on a box without a code change.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=0 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
+    "G6a3 REAP_WT_DISPOSABLE_AGE_MINUTES=0 restores the 7d floor exactly"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "ruleD" \
+    "G6a3 … and the row no longer cites the ruleD floor (the disable is visible, not implied)"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "floor=720m" \
+    "G6a3 … and no 720m floor survives the disable"
 assert_contains "$(row_for "$OUT" "$WT_AGED")" "reason=reclaimable" "G6b aged HEAD => remove"
 assert_contains "$(row_for "$OUT" "$WT_AGED")" "refs=branch-retained:feat/g6-aged" \
     "G6b UNMERGED named branch reported as branch-retained (the 48-row class)"
-run_reaper $ENV --apply --repo "$REPO" >/dev/null
+# ARMED for the apply leg: WT_RECENT is only removable because RULE D was armed above, so the two
+# rows below measure the armed policy end-to-end rather than the default window.
+REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --apply --repo "$REPO" >/dev/null
 assert_nodir "$WT_AGED" "G6b --apply removed the unmerged branch-retained worktree"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/g6-aged | wc -l | tr -d ' ')" "1" \
     "G6b the unmerged branch ref still resolves after removal"
-assert_dir "$WT_RECENT" "G6b --apply kept the too-recent worktree"
-# strict-> boundary: exactly 7d survives; 7d+1s and 7d+2s are reaped
+assert_nodir "$WT_RECENT" "G6b --apply removed the 2d clean row (RULE D)"
+# ── G6a4: RULE D LOWERS a floor, so a floor already at ZERO STAYS zero. REAP_WT_AGED_DAYS=0 is a
+# supported, documented operator setting (validation admits 0; `--aged-days 0` is the operator remedy)
+# and 0 means "no floor". The pre-fix zero-disjunct RAISED a 12 h cooldown onto it, so on the box that
+# chose the MOST aggressive age setting every clean row younger than 12 h was preserved instead — the
+# exact "reaper reclaims nothing" class RULE D exists to end, produced by RULE D itself.
+# ⛔ ITS OWN ENV/REPO on purpose: it reassigns OUT, so it runs AFTER the G6 rows that still read the
+# G6 pass's output (G6b above). A row_for over another repo silently matches nothing.
+ENV=G6a4; REPO="$(mk_repo $ENV)"
+WT_H2="$(add_named_wt "$REPO" "$ENV-2h" feat/g6a4-2h)"
+commit_in_wt "$WT_H2" "$TWO_HOURS_DATE" h2
+OUT="$(REAP_WT_AGED_DAYS_OVERRIDE=0 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_H2")" "reason=reclaimable" \
+    "G6a4 precondition: with NO age floor a clean 2h row is reclaimed"
+OUT="$(REAP_WT_AGED_DAYS_OVERRIDE=0 REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_H2")" "reason=reclaimable" \
+    "G6a4 armed RULE D does NOT raise a 12h floor onto REAP_WT_AGED_DAYS=0 (it only ever LOWERS one)"
+assert_absent "$(row_for "$OUT" "$WT_H2")" "reason=too-recent" \
+    "G6a4 …the pre-fix zero-disjunct made this same 2h row too-recent (floor raised 0 -> 720m)"
+# ⛔ THE OTHER HALF OF THE MIN: when the armed cooldown does NOT lower the floor, it must not CLAIM it
+# did. This is the one configuration in the whole suite where `disp_s >= floor_s`, so it is the only
+# row that can observe the `else disp_s=0` disarm — drop that arm and every other armed row takes the
+# lowering branch, so nothing reds while this row's marker starts lying (`floor=<n>m(ruleD)` /
+# `proof=disposable-floor(…)` on a removal the AGED floor decided). A reader then re-tunes the dial
+# that did nothing — the "reclaims the wrong thing with no legible cause" loop this change answers.
+assert_absent "$(row_for "$OUT" "$WT_H2")" "ruleD" \
+    "G6a4 …an armed cooldown that does NOT lower the floor must not CLAIM it did (the else disp_s=0 disarm)"
+assert_contains "$(row_for "$OUT" "$WT_H2")" "floor=0m(aged)" \
+    "G6a4 …so the marker still names the AGED floor that actually decided it (0m, i.e. no floor)"
+assert_absent "$(row_for "$OUT" "$WT_H2")" "proof=disposable-floor(" \
+    "G6a4 …and the removal's proof label agrees with its marker (never disposable-floor while the floor stayed 0)"
+# strict-> boundary: exactly 7d survives; 7d+1s and 7d+2s are reaped.
+# ⛔ PINNED WITH RULE D OFF. This group's subject is the AGED floor's `>` boundary, and RULE D caps that
+# floor at 12 h by default — so leaving it on would measure the disposable floor while claiming to
+# measure the 7-day one. `=0` is exactly the "pre-rule behaviour" the contract promises to restore.
 ENV=G6c; REPO="$(mk_repo $ENV)"
 WT_EDGE="$(add_named_wt "$REPO" "$ENV-edge" feat/g6-edge)"
 commit_in_wt "$WT_EDGE" "$(python3 -c 'import datetime;print((datetime.datetime.fromisoformat("2026-09-15T20:00:00+00:00")-datetime.timedelta(days=7)).isoformat())')" edge
-OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=0 run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=too-recent" "G6c exactly 7d survives (strict >)"
-OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 1)) run_reaper $ENV --dry-run --repo "$REPO")"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 1)) run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=reclaimable" "G6c 7d+1s is reaped (strict >)"
-OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 2)) run_reaper $ENV --dry-run --repo "$REPO")"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 2)) run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=reclaimable" "G6c 7d+2s is reaped (strict >)"
+
+# ── G6w: ⛔ A DIRTY CHECKOUT IS NEVER COLLECTED — the ONE case removal destroys work ────────────
+# RULE D lowers an AGE floor; it must never reach the CLEAN gate, because uncommitted work is the only
+# loss `git worktree remove` can inflict that nothing recovers (the branch and every commit survive the
+# removal). ⛔ WHAT EACH ROW CAN AND CANNOT PROVE, stated because the earlier claim was too strong:
+#   * G6w  (76 d, dirty) is refused by the PRE-EXISTING rule 2, past every floor including the
+#     disposable one — so it is GREEN on the pre-rule code too. It is the end-to-end survival proof
+#     (the uncommitted line is still there after `--apply`), not a proof about RULE D.
+#   * G6w2 (2 d, dirty) is the row RULE D can actually reach: inside rule 6's 7 d window, past the
+#     12 h cooldown. It is the ONLY shape that can distinguish "clean gate first" from "floor first",
+#     so it is what detects a reordering that put RULE D's floor in front of the clean gate.
+#   * the `no-clean-gate` mutant drops the gate and both rows become removable, which is the
+#     non-vacuity leg (it mutates a PRE-EXISTING gate, so it anchors the survival property, not RULE D.
+ENV=G6w; REPO="$(mk_repo $ENV)"
+WT_DIRTW="$(add_named_wt "$REPO" "$ENV-dirty" feat/g6w-dirty)"
+commit_in_wt "$WT_DIRTW" "$OLD_DATE" dirty
+WT_DIRTW2="$(add_named_wt "$REPO" "$ENV-dirty-2d" feat/g6w-dirty-2d)"
+commit_in_wt "$WT_DIRTW2" "$RECENT_DATE" dirty2d
+printf 'uncommitted-work-that-nothing-can-recover\n' >>"$WT_DIRTW2/base.txt"
+printf 'uncommitted-work-that-nothing-can-recover\n' >>"$WT_DIRTW/base.txt"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW")" "reason=dirty" \
+    "G6w a DIRTY checkout 76d old is preserved — past EVERY floor, held by the clean gate alone"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW")" "reason=reclaimable" \
+    "G6w … and is never classified for removal at all (so 'preserved' cannot be a near-miss)"
+# G6w2 — the row RULE D can REACH, with the rule ARMED. 2 d is inside rule 6's 7 d window and past the
+# 12 h cooldown, so this is the one shape where the ORDER of the clean gate and the floor is
+# observable: floor-first would classify 2 d as removable, gate-first cannot.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW2")" "reason=dirty" \
+    "G6w2 a DIRTY 2d row inside the ARMED cooldown's reach is still refused by the clean gate"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW2")" "reason=too-recent" \
+    "G6w2 … refused as DIRTY, not parked behind the floor (the two orders are distinguishable here)"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW2")" "reason=reclaimable" \
+    "G6w2 … and never classified for removal"
+run_reaper $ENV --apply --repo "$REPO" >/dev/null
+assert_dir "$WT_DIRTW" "G6w --apply left the dirty checkout in place"
+assert_contains "$(cat "$WT_DIRTW/base.txt" 2>/dev/null)" "uncommitted-work-that-nothing-can-recover" \
+    "G6w the uncommitted line SURVIVED — the only property the whole rule table exists to protect"
+assert_dir "$WT_DIRTW2" "G6w2 --apply left the armed-cooldown dirty checkout in place"
+MUTW="$T/mutant-no-clean-gate-g6w.sh"
+mutate_reaper_anchored "$MUTW" no-clean-gate
+OUT="$(REAPER="$MUTW" REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW")" "reason=dirty" \
+    "G6w MUTANT really dropped the clean gate (otherwise the assertion below proves nothing)"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW")" "reason=reclaimable" \
+    "G6w WITHOUT the clean gate the dirty checkout becomes reclaimable — so G6w MEASURES the gate"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW2")" "reason=reclaimable" \
+    "G6w2 WITHOUT the clean gate the ARMED-cooldown dirty row becomes reclaimable — so the survival claim is not a vacuous green"
 
 # ── G6d: a MERGED head is exempt from the age floor (agent-infra#2032) ──
 # The floor's job is "work may still be in progress"; a merge is the proof it is not.
@@ -1811,6 +1943,18 @@ assert_contains "$(row_for "$OUT" "$WT_MERGED")" "reason=too-recent" \
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO" --aged-days 0)"
 assert_contains "$(row_for "$OUT" "$WT_MERGED")" "reason=reclaimable" \
     "G6d --aged-days 0 is unaffected (the floor is already zero)"
+# G6d2 — RULE D MUST NOT TOUCH A MERGED HEAD. Its 0-day floor is a separate, deliberate decision, so
+# the armed cooldown must leave the row exactly where the merged rule put it and the marker must still
+# say `merged`. ⛔ WITHOUT THIS ROW THE GATE IS UNPINNED: every merged/patch-equivalent fixture used to
+# run with the rule UNARMED, and an unarmed rule never computes `disp_s` at all — so deleting either
+# `floor_src=merged` assignment left the suite green (#3888 review F3).
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_MERGED")" "reason=reclaimable" \
+    "G6d2 a MERGED head stays reclaimable with RULE D armed — the cooldown never re-decides a merged floor"
+assert_contains "$(row_for "$OUT" "$WT_MERGED")" "floor=0m(merged)" \
+    "G6d2 …and the row still names the MERGED floor, not the cooldown"
+assert_absent "$(row_for "$OUT" "$WT_MERGED")" "ruleD" \
+    "G6d2 …with no ruleD marker anywhere on it"
 run_reaper $ENV --apply --repo "$REPO" >/dev/null
 assert_nodir "$WT_MERGED" "G6d --apply removed the merged checkout"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/g6-merged | wc -l | tr -d ' ')" "1" \
@@ -2393,6 +2537,24 @@ assert_contains "$OUT" "bad REAP_WT_WIP_AGE_HOURS" "A14j ... and the refusal nam
 OUT="$(REAP_WT_STALE_INIT_SECONDS=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "A14j a non-numeric REAP_WT_STALE_INIT_SECONDS => exit 2 (the interrupted-add floor)"
 assert_contains "$OUT" "bad REAP_WT_STALE_INIT_SECONDS" "A14j ... and the refusal names the seam it refused"
+# A14k — RULE D's cooldown is BOUNDED, not merely digit-checked. (#3881 took `A14j` for the three
+# STALLED seams while this branch was open, so the id here is `A14k` — the registry's `guardedBy`
+# cites it, and reusing `A14j` would leave that one id on main's six assertions plus this leg's
+# five, so the citation would stop identifying a guard.)
+# The floor is computed as `minutes * 60` in shell ARITHMETIC, so a digit string big enough to
+# overflow makes it NEGATIVE — and a negative floor makes every `[ "$floor_s" -gt 0 ]` gate false,
+# i.e. the floor silently DISAPPEARS and the pass reaps clean non-merged checkouts at any age while
+# printing a `floor=0m(…)` marker as if that were ordinary. That is the `seam_too_large` fail-open
+# recorded at scripts/disk-reaper.sh:697-704, one seam over. The ceiling is the day dials' own bound,
+# expressed in this dial's unit.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=200000000000000000 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14k an overflowing REAP_WT_DISPOSABLE_AGE_MINUTES => exit 2 (never a silently deleted floor)"
+assert_contains "$OUT" "bad REAP_WT_DISPOSABLE_AGE_MINUTES" "A14k … and the refusal names the seam"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=2000000000 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14k a cooldown above REAP_WT_MAX_DAYS*1440 => exit 2 (the ceiling is the day dials' bound)"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14k a non-numeric cooldown => exit 2"
+assert_contains "$OUT" "bad REAP_WT_DISPOSABLE_AGE_MINUTES" "A14k … a non-numeric one too, named"
 # A14i — the pass's SUMMARY must satisfy ITS OWN identities on a REAL pass: `examined = classified +
 # deferred` and `classified = remove + preserved`. Two identities over four counters is where a
 # deferral double-count (or a missing one) becomes readable instead of inferred; the doc states them,
@@ -4344,6 +4506,14 @@ assert_contains "$(cat "$T/$ENV/reap.log")" "CLASSIFY patch-equivalent $WT_SQ" \
     "N5 the age floor was lifted by the patch evidence, and the log says on what basis"
 assert_contains "$(row_for "$OUT" "$WT_SQ")" "reason=reclaimable" \
     "N5 a squash-merged checkout 2d old is reclaimed without waiting out the 7d floor"
+# N5a — the SECOND shape RULE D's gate must not touch: patch-equivalence lifts the floor to the MERGED
+# dial without `refs=merged`, so `floor_src` is the ONLY thing that keeps the cooldown off it. Armed
+# here, because an unarmed rule never reads `floor_src` (#3888 review F3).
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_SQ")" "reason=reclaimable" \
+    "N5a a PATCH-EQUIVALENT head stays reclaimable with RULE D armed (its floor came from the merged dial)"
+assert_contains "$(row_for "$OUT" "$WT_SQ")" "floor=0m(merged)" \
+    "N5a …and names the MERGED floor rather than the cooldown"
 OUT="$(REAP_WT_MERGED_AGE_DAYS_OVERRIDE=7 run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_SQ")" "reason=too-recent" \
     "N5 with the merged floor pinned to 7d the same fixture is kept (the exemption is the decider)"
@@ -4375,6 +4545,21 @@ assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "reason=reclaimable" \
     "N6 a dead lane's wt-* scratch dir 2d old is reclaimed (REAP_WT_SCRATCH_AGE_DAYS)"
 assert_contains "$(row_for "$OUT" "$WT_NAMED")" "reason=no-pr" \
     "N6 the SAME row under a non-scratch path keeps the 7d floor (the rule is path-scoped)"
+# ⛔ AND WITH RULE D ARMED. `floor_src=scratch` is the SECOND arm of RULE D's gate (the `floor_src =
+# aged` test), and the F3 fix pinned only the MERGED arm (G6d2/N5a): no armed run in this suite ran
+# over a scratch fixture, so deleting that assignment left the WHOLE suite green while an armed box
+# silently capped a lane-scratch checkout at the 12 h cooldown instead of REAP_WT_SCRATCH_AGE_DAYS —
+# re-deciding the recorded #2354 floor that the reaper's RULE D header block and the registry note
+# both state as a guarantee. ⛔ THE GUARANTEE IS CONDITIONAL AND THIS FIXTURE IS THE CONDITION'S
+# FAVOURABLE SIDE: the scratch arm fires where `REAP_WT_SCRATCH_AGE_DAYS` is BELOW the aged floor,
+# which holds here (1 d < the 7 d default). With the two dials EQUAL nothing is capped, the floor came
+# from the AGED dial, and an armed cooldown lowers that row like any other — the header states that
+# boundary rather than claiming an unconditional exemption. (#3888 review 2, finding 2.)
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "floor=1440m(scratch)" \
+    "N6a armed RULE D leaves a wt-* scratch dir on its OWN floor (REAP_WT_SCRATCH_AGE_DAYS=1d), not on the cooldown"
+assert_absent "$(row_for "$OUT" "$WT_SCRATCH")" "ruleD" \
+    "N6a …and never claims the cooldown decided it"
 # The pattern is narrow IN TWO DIRECTIONS, and both halves need a fixture: `wt-*` must not read as a
 # PREFIX (a checkout named `wtfoo` is not a lane scratch dir), and the second alternative of the
 # default glob (`cell-wt-*`) must actually match. Asserting both against $WT_NAMED pinned neither —

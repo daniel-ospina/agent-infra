@@ -45,6 +45,7 @@
 // Run: node extensions/main-worktree-guard/test-m4-recovery-window.mjs
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { join } from "node:path";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const CG = join(HERE, "classify-git.mjs");
@@ -617,5 +618,7 @@ await partB();
 restoreAmbient();
 
 console.log(failures.join("\n"));
-console.log(`\n${fail === 0 ? "✅" : "❌"} test-m4-recovery-window: ${pass} passed, ${fail} failed`);
+// agent-infra#2723 — emit through the shared emitter so the failing arm always
+// carries the `runner::test-m4-recovery-window` identity the merge rail reads.
+reportVerdict("test-m4-recovery-window", pass, fail);
 process.exit(fail === 0 ? 0 : 1);

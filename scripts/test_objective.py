@@ -3703,8 +3703,10 @@ def test_the_default_repo_is_LOUD_and_the_checkout_wins_over_it(monkeypatch):
     """`repo_src` names WHICH input chose the repo -- the silent default, ended.
 
     ⛔ THE FALLBACK IS NOT REMOVED, IT IS MADE VISIBLE (agent-infra#2710 scope item 1). Removing it
-    outright would blind the Mac\'s beat, whose farm copy is not a git checkout and carries no
-    deriver; leaving it SILENT is what read tortoise\'s check-runs for agent-infra\'s SHAs for hours.
+    outright would blind the Mac\'s beat, whose farm copy is not a git checkout — so nothing is
+    DERIVABLE there (the deriver IS farmed beside this script since ai#1552, so the missing half is
+    the checkout, not the file); leaving it SILENT is what read tortoise\'s check-runs for
+    agent-infra\'s SHAs for hours.
     """
     assert objective.resolve_repo(env="", checkout="")[:3] == (
         objective.REPO_DEFAULT, "default", "")
@@ -3861,10 +3863,12 @@ def test_the_deriver_is_SOURCED_and_actually_READS_a_checkout(tmp_path):
 
 
 def test_a_deployment_WITHOUT_the_deriver_says_so_instead_of_guessing(tmp_path):
-    """The farm copy (`~/.pi/agent/scripts/`) has no `repo-slug.sh`: `deriver-missing`, not a guess.
+    """A deployment that did not carry `repo-slug.sh` says `deriver-missing`, not a guess.
 
-    Two causes, two remedies -- and the reason must reach the LINE (`repo_check=`), or the operator
-    applies "run from the checkout you mean" for ever on a box that is missing the file.
+    ⛔ NOT THE FARM: the farm copy (`~/.pi/agent/scripts/`) DOES carry the deriver since ai#1552, so
+    the shape under test here is a hand-deployed copy (`objective.py` alone). Two causes, two
+    remedies -- and the reason must reach the LINE (`repo_check=`), or the operator applies "run from
+    the checkout you mean" for ever on a box that is missing the file.
     """
     import importlib.util as ilu
     import shutil as sh

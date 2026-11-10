@@ -34,6 +34,7 @@ import {
   renderMainCheckoutMessage,
   resolveDispatchCwd,
 } from "./classify-cwd.mjs";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -623,5 +624,8 @@ try {
   cleanup();
 }
 
-console.log(`\n${pass} passed, ${fail} failed`);
+// agent-infra#2723 — the aggregate carried neither a `❌` marker nor a label, so a
+// failing run of this suite yielded NO identity and the merge rail refused the
+// whole PR blind.
+reportVerdict("test-cwd-guard", pass, fail);
 process.exit(fail > 0 ? 1 : 0);

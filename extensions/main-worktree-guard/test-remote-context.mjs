@@ -60,6 +60,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -1362,5 +1363,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
   }
 }
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} test-remote-context: ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ""}`);
+// agent-infra#2723 — emit through the shared emitter so the failing arm always
+// carries the `runner::test-remote-context` identity the merge rail reads.
+reportVerdict("test-remote-context", pass, fail, { skip });
 process.exit(fail === 0 ? 0 : 1);

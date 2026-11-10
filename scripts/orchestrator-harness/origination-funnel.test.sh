@@ -2360,7 +2360,29 @@ OUT_C="$(check_run "$SKEW/o" "$SKEW/none")"; RC_C=$?
 [ "$RC_C" = "2" ] && ok "check: no recorder anywhere exits 2 (cannot be verified, never a pass)" \
   || bad "check: an unprovable box exited $RC_C, not 2 — $OUT_C"
 case "$OUT_C" in *"relation=unwritable"*) ok "check: and says the record is unwritable" ;; *) bad "check: no relation=unwritable — $OUT_C" ;; esac
-
+# ⛔ AND ON A SPLIT BOX THE SEED IS A CODE HOME, NOT A STATE-DIR PATH (#2095; fresh-context review of
+# #3846, P2). `orch-loop.sh` sets `O` = the controller's STATE DIR and `O_WORK` = the harness root, so
+# `<state>/refresh-candidates.sh` never exists there — and `[ "$REFRESH_SH" = "$O/refresh-candidates.sh" ]`
+# therefore answered `relation=skew` / exit **1** on a box that is perfectly healthy: a monitor reading
+# "this box cannot prove its origination", from a comparison against a path the arrangement guarantees is
+# empty. The arm below is the same bytes with the split as the ONLY difference.
+SPLIT_C="$T/split-check"; rm -rf "$SPLIT_C"; mkdir -p "$SPLIT_C/state/state" "$SPLIT_C/root"
+printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$SPLIT_C/root/refresh-candidates.sh"
+cat "$HELPFNS" "$CHECKBLOCK" > "$T/check-drive.sh"
+OUT_C="$(O="$SPLIT_C/state" O_WORK="$SPLIT_C/root" REFRESH_SELF_DIR="$SPLIT_C/root" bash "$T/check-drive.sh" --check-refresh 2>&1)"; RC_C=$?
+[ "$RC_C" = "0" ] && ok "check: a SPLIT state dir (\$O = state, \$O_WORK = harness root) exits 0 — the seed is the harness root's copy" \
+  || bad "check: the split box exited $RC_C, not 0 — a healthy box reads as 'cannot prove its origination': $OUT_C"
+case "$OUT_C" in *"relation=ok"*) ok "check: and records relation=ok on the split box" ;; *) bad "check: no relation=ok on the split box — $OUT_C" ;; esac
+# …and when a split box has something to FIX, the remedy names the HARNESS ROOT, not the state dir
+# (`re-seed $O` on a split box installs a harness INTO the state dir — undoing the split this PR makes).
+SPLIT_BAD="$T/split-check-bad"; rm -rf "$SPLIT_BAD"; mkdir -p "$SPLIT_BAD/state" "$SPLIT_BAD/root"
+printf '%s\n' '#!/usr/bin/env bash' '# a copy from before #2229: refresh_record_write appears here only as prose' \
+  'echo "refresh: queued nothing"' > "$SPLIT_BAD/root/refresh-candidates.sh"
+OUT_C="$(O="$SPLIT_BAD/state" O_WORK="$SPLIT_BAD/root" REFRESH_SELF_DIR="$SPLIT_BAD/root" bash "$T/check-drive.sh" --check-refresh 2>&1)"; RC_C=$?
+[ "$RC_C" = "2" ] && ok "check: a split box whose harness-root copy cannot record exits 2 (unwritable, not a pass)" \
+  || bad "check: a split box with an incapable harness-root copy exited $RC_C, not 2 — $OUT_C"
+case "$OUT_C" in *"re-seed $SPLIT_BAD/root"*) ok "check: and the remedy names the HARNESS ROOT, not the state dir (re-seeding the state dir would un-split the box)" ;; *) bad "check: the remedy does not name the harness root — $OUT_C" ;; esac
+case "$OUT_C" in *"--o $SPLIT_BAD/state"*) bad "check: the remedy names the STATE dir as the re-seed target — that installs a harness into the state dir" ;; *) ok "check: and never points the operator at the state dir" ;; esac
 # ⛔ AND THE SHIPPED ENTRYPOINT, NOT ONLY AN EXCERPT (#2308 review, P2). `check_run` above RE-CREATES
 # the block in `$T/check-drive.sh`, so it grades the block and not the path a monitor or a CI job runs:
 # a `$1` consumed earlier, a changed default for `O`/`REFRESH_SELF_DIR`, or any guard added above the
@@ -2383,6 +2405,15 @@ OUT_S="$(ship_run "$SKEW/o" "$SKEW/none" "$T/repo")"; RC_S=$?
 OUT_S="$(ship_run "$SKEW/ok/o" "" "")"; RC_S=$?
 [ "$RC_S" = "78" ] && ok "ship: the SHIPPED entrypoint exits 78 when the controller cannot start (REPO unset)" \
   || bad "ship: the shipped --check-refresh exited $RC_S with REPO unset, not 78 — a startup failure would read as a verdict: $OUT_S"
+
+# …and the shipped entrypoint agrees (the block above is an extract; this is the path a monitor runs).
+# NO `REFRESH_SELF_DIR` / `O_WORK` IS PASSED HERE, DELIBERATELY: the shipped loop derives both from its
+# OWN location (`_HERE_RS`, then `ORC_WORK_ROOT`/`O_WORK`), so hand-setting them to a fixture would grade
+# a tree the loop never uses. The production shape is exactly this: `O` names a state dir, and every
+# code question resolves to the tree the loop runs from.
+OUT_S="$(REPO="$T/repo" O="$SPLIT_C/state" bash "$LOOP" --check-refresh 2>&1)"; RC_S=$?
+[ "$RC_S" = "0" ] && ok "ship: the SHIPPED entrypoint exits 0 on a split box (the P2 defect in its own terms)" \
+  || bad "ship: the shipped --check-refresh exited $RC_S on a healthy split box, not 0 — $OUT_S"
 
 # (e) THE WIRING: the spawn must use the RESOLVED script, or the fix is inert on the box it was
 # written for (the shipped loop used to hardcode `$O/refresh-candidates.sh`).
@@ -2479,6 +2510,19 @@ if [ -s "$SPAWNBLOCK" ] && grep -q 'refresh-candidates.sh' "$SPAWNBLOCK" && grep
   grep -q 'SEED-SKEW' "$SP3/log" 2>/dev/null \
     && bad "spawn+seeded: an INTACT seed still disclosed a skew — the line would become noise nobody reads (log: $(cat "$SP3/log" 2>/dev/null | tr '\n' '|'))" \
     || ok "spawn+seeded: an intact seed says nothing about a skew"
+  # ⛔ AND THE SPLIT BOX IS NOT A SKEW (#2095; fresh-context review of #3846, P2). `O` is the STATE dir
+  # and `O_WORK` is the harness root there, so the seed lives in `$O_WORK` — the old `$O`-only key logged
+  # a SEED-SKEW line EVERY CYCLE for a copy that is exactly the seeded one, turning the same instrument
+  # the beat uses for a genuine skew into noise that stops discriminating.
+  SP4="$T/spawn-split"; mkdir -p "$SP4/o/state" "$SP4/root"
+  printf '%s\n' '#!/usr/bin/env bash' "printf 'x' >> '$SP4/root-invoked'" 'refresh_record_write() { :; }' > "$SP4/root/refresh-candidates.sh"
+  printf '7\n' > "$SP4/o/candidates.txt"
+  O="$SP4/o" O_WORK="$SP4/root" LOG="$SP4/log" REFRESH_SELF_DIR="$SP4/root" bash "$SPAWNBLOCK" >/dev/null 2>&1
+  [ -s "$SP4/root-invoked" ] && ok "spawn+split: the harness root's copy runs (non-vacuity: the arm is reached)" \
+    || bad "spawn+split: no refresh ran at all — the driven block did not reach the spawn"
+  grep -q 'SEED-SKEW' "$SP4/log" 2>/dev/null \
+    && bad "spawn+split: a HEALTHY split box disclosed a skew ($(cat "$SP4/log" 2>/dev/null | tr '\n' '|')) — the line becomes noise nobody reads" \
+    || ok "spawn+split: the harness root's copy IS the seed, so a split box says nothing about a skew"
 else
   bad "spawn+skew: could not extract the refresh spawn block — the disclosure is ungraded"
 fi

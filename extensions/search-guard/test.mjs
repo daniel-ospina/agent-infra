@@ -18,6 +18,7 @@ import { register, registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -394,5 +395,7 @@ for (const [rule, cmd, cwd] of MUTATIONS) {
 chmodSync(UNREADABLE, 0o755);
 rmSync(FIX, { recursive: true, force: true });
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} search-guard suite: ${pass} passed, ${fail} failed`);
+// agent-infra#2723 — one attributable emitter so a failing run always carries the
+// `runner::search-guard-suite` identity the merge rail reads.
+reportVerdict("search-guard-suite", pass, fail);
 process.exit(fail === 0 ? 0 : 1);

@@ -712,7 +712,7 @@ fi
 # unit whose every tick exits 127 while `list-timers` reads green. Before this line NEITHER was on a
 # cell, which is why a capability that had shipped, been tested and carried a header was scheduled on
 # zero boxes — the installer could not even find the thing it was meant to install.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py conflict-rebase.py conflict-rebase-timer.sh install-conflict-rebase-timer.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh install-controller-service.sh cloud-cell-supervisor.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor-machine.sh pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh wip-sweep.sh objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py conflict-rebase.py conflict-rebase-timer.sh install-conflict-rebase-timer.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh disk-reaper-deployed-check.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh install-controller-service.sh cloud-cell-supervisor.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor-machine.sh pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh wip-sweep.sh objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -762,8 +762,10 @@ done
 # installer loop below is content-agnostic, and `cell-install.sh:FARM_LAYOUT` already maps this array
 # to `scripts/orchestrator-harness → scripts`, so a cell gets it too. Measured 2026-11-07.
 # ⚠️ What farming flat does NOT carry is the doctor's OPTIONAL harness siblings (`lane-reap.sh`,
-# `rail-refusal.sh`, `repo-slug.sh`, `live-ownership.sh`), which it resolves from `$SELF_DIR` — still
-# absent on a farm-only box, where they degrade rather than die.
+# `rail-refusal.sh`, `live-ownership.sh`), which it resolves from `$SELF_DIR` — still absent on a
+# farm-only box, where they degrade rather than die. ⛔ `repo-slug.sh` IS NO LONGER ONE OF THEM: it is
+# a PRODUCER the doctor actually execs, so degrading was a farm gap, not an accepted shape — see the
+# array below.
 # ⛔ THE CANDIDATE ORDER IS NOT "FARMED COPY LAST", and an earlier version of this comment said it
 # was. `doctor_path()`'s loop (`cloud-cell-supervisor.sh`) tries, in order: `$O/cloud-cell-doctor.sh`,
 # `$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh`,
@@ -781,7 +783,19 @@ done
 # all) and reordering it is a design change, not a comment fix.
 # Before this entry candidate 3 was simply ABSENT on a farm-only box, so nothing shadowed — and the
 # supervisor's every role `die`d.
-mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh)
+# ⛔ agent-infra#1899/#1552: `repo-slug.sh` IS A PRODUCER, NOT A SIBLING TO DEGRADE ON. The doctor
+# (`cloud-cell-doctor.sh`, farmed flat into `$DEST/scripts/`) resolves it at `:160` as
+# `${O%/}/repo-slug.sh $SELF_DIR/repo-slug.sh`, and `$SELF_DIR` IS `$DEST/scripts` for the farmed copy —
+# so a farm-only box had the consumer and not the executable it calls, which `test-setup-no-nesting.sh`
+# reports as `producer(s) exec'd by a farmed consumer and DELIVERED BY NOTHING: repo-slug.sh` (#1552).
+# Same src-one-down/dest-flat shape as the two above, and the same reason: `repo-slug.sh` lives in
+# `scripts/orchestrator-harness/`, and its destination is the FLAT `$DEST/scripts/` that the doctor
+# already searches. ⛔ NOT THE BRING-UP'S WARNING: `cloud-cell-bringup.sh` resolves its own copy from
+# `${BRINGUP_HERE}/orchestrator-harness/repo-slug.sh` or `${CELL_HOME}/orchestrator/repo-slug.sh`
+# (`:168-169`), neither of which is `$DEST/scripts` — so its "repo identity UNVERIFIED" walk is
+# untouched by this entry and needs its own fix. An earlier revision of this comment claimed the
+# warning was the degradation this entry removes; it is not, and the paths were measured.
+mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh repo-slug.sh)
 for base in "${mcp_harness_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
   f="$INFRA_ROOT/scripts/orchestrator-harness/$base"
