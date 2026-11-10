@@ -196,12 +196,14 @@ jobs:
     # classify ANY check on that head). Derivation, from CI's own history over 12 completed runs
     # (2026-11-09): this job's p50 0.2 / p90 0.2 / max 0.2 min; EVERY step below carries its own
     # bound sized from that STEP's measured max (x5, floor 5; `uses:` steps 10 — the repo's existing
-    # convention), so the step bounds sum to 30 min.
+    # convention), so the step bounds sum to 35 min.
     # ⛔ THE STEP BOUND IS THE BOUND, AND IT IS THE RED ONE: a step trip is `failure`. A JOB trip is
     # `cancelled`, which this repo's rail reads NON-RED (#3242) — so the job-level number here is a
     # backstop only, and it is kept ABOVE the step sum (the invariant
-    # `scripts/check-ci-lane-parity.mjs` enforces for these files).
-    timeout-minutes: 35
+    # `scripts/check-ci-lane-parity.mjs` enforces for these files: EVERY step of a bounded job must
+    # carry its OWN finite bound, and the job bound must EXCEED their sum — the gui-device-guard step
+    # added by #2249 arrived without one and reddened the required `bash-suites-gate` job with exit 2).
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 10
@@ -212,6 +214,13 @@ jobs:
       - name: search-guard suite (threat table, handler-driven, non-vacuity)
         timeout-minutes: 5
         run: node extensions/search-guard/test.mjs
+      - name: gui-device-guard suite (#2249, threat table + handler-driven non-vacuity)
+        # Zero-dependency by contract: index.ts imports `node:` + `extensions/shared/`
+        # only, so this runs in the job that has NO `npm ci`. It drives the REAL
+        # registered `tool_call` handler — importing the classifier alone would stay
+        # green while index.ts was inert in every session (#744/#697).
+        timeout-minutes: 5
+        run: node extensions/gui-device-guard/test.mjs
       - name: search-cost harness (corpus contract, both directions)
         timeout-minutes: 5
         run: bash tests/search-cost/run.sh
