@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-42-1794289577-p882330-da7122dc",
+  "_sha": "b95a513fd639d547832406a70c9ed3a534fd1b6c",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.mMxXaJsMRJ/fix.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/2509-gh-config-dir-in-lane-env"
+    },
+    {
+      "kind": "sha",
+      "value": "93bd141839aaaebc5cef23b37b6782d9b8ab18d1"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-2509"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 24,
+  "ended_at": 1794289601,
+  "exit_code": 0,
+  "heartbeat_at": 1794289601,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1794289577-p882330-da7122dc",
+  "lease_until": 1794290206,
+  "pid": 882330,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794289577,
+  "state": "DONE",
+  "tag": "42",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-2509"
+}
