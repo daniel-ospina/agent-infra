@@ -1,0 +1,184 @@
+
+ RUN  v4.1.9 /private/tmp/pi-fix/packages/coding-agent
+
+···········································--···········································xxxx·xxxxxxxx
+
+⎯⎯⎯⎯⎯⎯ Failed Tests 12 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/agent-session-compaction.test.ts > AgentSession compaction e2e > should trigger manual compaction via compact()
+Error: Summarization failed: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJDhJt8YEbShM3jG17Z"}
+ ❯ generateSummaryWithUsage src/core/compaction/compaction.ts:729:9
+    727|  const failure = getSummarizationFailure(response, "Summarization");
+    728|  if (failure) {
+    729|   throw new Error(failure);
+       |         ^
+    730|  }
+    731|  if (response.content.some((block) => block.type === "toolCall")) {
+ ❯ compact src/core/compaction/compaction.ts:941:18
+ ❯ AgentSession.compact src/core/agent-session.ts:2105:20
+ ❯ test/agent-session-compaction.test.ts:95:18
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/12]⎯
+
+ FAIL  test/agent-session-compaction.test.ts > AgentSession compaction e2e > should maintain valid session state after compaction
+Error: Summarization failed: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJDjyNHJqAdA62Du2SL"}
+ ❯ generateSummaryWithUsage src/core/compaction/compaction.ts:729:9
+    727|  const failure = getSummarizationFailure(response, "Summarization");
+    728|  if (failure) {
+    729|   throw new Error(failure);
+       |         ^
+    730|  }
+    731|  if (response.content.some((block) => block.type === "toolCall")) {
+ ❯ compact src/core/compaction/compaction.ts:941:18
+ ❯ AgentSession.compact src/core/agent-session.ts:2105:20
+ ❯ test/agent-session-compaction.test.ts:121:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/12]⎯
+
+ FAIL  test/agent-session-compaction.test.ts > AgentSession compaction e2e > should persist compaction to session file
+Error: Summarization failed: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJDnLkLneJenTUwKjjE"}
+ ❯ generateSummaryWithUsage src/core/compaction/compaction.ts:729:9
+    727|  const failure = getSummarizationFailure(response, "Summarization");
+    728|  if (failure) {
+    729|   throw new Error(failure);
+       |         ^
+    730|  }
+    731|  if (response.content.some((block) => block.type === "toolCall")) {
+ ❯ compact src/core/compaction/compaction.ts:941:18
+ ❯ AgentSession.compact src/core/agent-session.ts:2105:20
+ ❯ test/agent-session-compaction.test.ts:145:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/12]⎯
+
+ FAIL  test/agent-session-compaction.test.ts > AgentSession compaction e2e > should work with --no-session mode (in-memory only)
+Error: Summarization failed: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJDpnaszZA6VBUUPCkQ"}
+ ❯ generateSummaryWithUsage src/core/compaction/compaction.ts:729:9
+    727|  const failure = getSummarizationFailure(response, "Summarization");
+    728|  if (failure) {
+    729|   throw new Error(failure);
+       |         ^
+    730|  }
+    731|  if (response.content.some((block) => block.type === "toolCall")) {
+ ❯ compact src/core/compaction/compaction.ts:941:18
+ ❯ AgentSession.compact src/core/agent-session.ts:2105:20
+ ❯ test/agent-session-compaction.test.ts:174:18
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/12]⎯
+
+ FAIL  test/agent-session-compaction.test.ts > AgentSession compaction e2e > should emit compaction events during manual compaction
+Error: Nothing to compact (session too small)
+ ❯ AgentSession.compact src/core/agent-session.ts:2064:11
+    2062|      throw new Error("Already compacted");
+    2063|     }
+    2064|     throw new Error("Nothing to compact (session too small)");
+       |           ^
+    2065|    }
+    2066|
+ ❯ test/agent-session-compaction.test.ts:193:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/12]⎯
+
+ FAIL  test/compaction-extensions.test.ts > Compaction extensions > should emit before_compact and compact events
+Error: Summarization failed: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJDh8DZq2WQmCyzUnVk"}
+ ❯ generateSummaryWithUsage src/core/compaction/compaction.ts:729:9
+    727|  const failure = getSummarizationFailure(response, "Summarization");
+    728|  if (failure) {
+    729|   throw new Error(failure);
+       |         ^
+    730|  }
+    731|  if (response.content.some((block) => block.type === "toolCall")) {
+ ❯ compact src/core/compaction/compaction.ts:941:18
+ ❯ AgentSession.compact src/core/agent-session.ts:2105:20
+ ❯ test/compaction-extensions.test.ts:134:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/12]⎯
+
+ FAIL  test/compaction-extensions.test.ts > Compaction extensions > should allow extensions to cancel compaction
+AssertionError: expected [Function] to throw error including 'Compaction cancelled' but got 'Nothing to compact (session too small)'
+
+Expected: "Compaction cancelled"
+Received: "Nothing to compact (session too small)"
+
+ ❯ test/compaction-extensions.test.ts:167:33
+    165|   await session.agent.waitForIdle();
+    166|
+    167|   await expect(session.compact()).rejects.toThrow("Compaction cancelle…
+       |                                 ^
+    168|
+    169|   const compactEvents = capturedEvents.filter((e) => e.type === "sessi…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/12]⎯
+
+ FAIL  test/compaction-extensions.test.ts > Compaction extensions > should include entries in compact event after compaction is saved
+Error: Nothing to compact (session too small)
+ ❯ AgentSession.compact src/core/agent-session.ts:2064:11
+    2062|      throw new Error("Already compacted");
+    2063|     }
+    2064|     throw new Error("Nothing to compact (session too small)");
+       |           ^
+    2065|    }
+    2066|
+ ❯ test/compaction-extensions.test.ts:217:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/12]⎯
+
+ FAIL  test/compaction-extensions.test.ts > Compaction extensions > should continue with default compaction if extension throws error
+Error: Nothing to compact (session too small)
+ ❯ AgentSession.compact src/core/agent-session.ts:2064:11
+    2062|      throw new Error("Already compacted");
+    2063|     }
+    2064|     throw new Error("Nothing to compact (session too small)");
+       |           ^
+    2065|    }
+    2066|
+ ❯ test/compaction-extensions.test.ts:268:18
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[9/12]⎯
+
+ FAIL  test/compaction-extensions.test.ts > Compaction extensions > should call multiple extensions in order
+Error: Nothing to compact (session too small)
+ ❯ AgentSession.compact src/core/agent-session.ts:2064:11
+    2062|      throw new Error("Already compacted");
+    2063|     }
+    2064|     throw new Error("Nothing to compact (session too small)");
+       |           ^
+    2065|    }
+    2066|
+ ❯ test/compaction-extensions.test.ts:348:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[10/12]⎯
+
+ FAIL  test/compaction-extensions.test.ts > Compaction extensions > should pass correct data in before_compact event
+Error: Summarization failed: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJDq5wwS252GrHVAnnu"}
+ ❯ generateSummaryWithUsage src/core/compaction/compaction.ts:729:9
+    727|  const failure = getSummarizationFailure(response, "Summarization");
+    728|  if (failure) {
+    729|   throw new Error(failure);
+       |         ^
+    730|  }
+    731|  if (response.content.some((block) => block.type === "toolCall")) {
+ ❯ compact src/core/compaction/compaction.ts:941:18
+ ❯ AgentSession.compact src/core/agent-session.ts:2105:20
+ ❯ test/compaction-extensions.test.ts:368:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[11/12]⎯
+
+ FAIL  test/compaction-extensions.test.ts > Compaction extensions > should use extension compaction even with different values
+Error: Nothing to compact (session too small)
+ ❯ AgentSession.compact src/core/agent-session.ts:2064:11
+    2062|      throw new Error("Already compacted");
+    2063|     }
+    2064|     throw new Error("Nothing to compact (session too small)");
+       |           ^
+    2065|    }
+    2066|
+ ❯ test/compaction-extensions.test.ts:411:18
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[12/12]⎯
+
+
+ Test Files  2 failed | 6 passed (8)
+      Tests  12 failed | 87 passed | 2 skipped (101)
+   Start at  12:26:56
+   Duration  16.00s (transform 45.12s, setup 0ms, import 73.45s, tests 7.94s, environment 1ms)
+

@@ -1,0 +1,1392 @@
+#!/usr/bin/env node
+/**
+ * check-version-stamp.test.mjs — the suite that keeps `check-version-stamp.mjs` from going
+ * vacuously green (agent-infra#1760).
+ *
+ * THE POINT OF THIS FILE. A version-drift check that always says `in-sync` is worse than no
+ * check: it certifies a surface nobody verified. So every verdict is pinned by a MUTATION that
+ * removes the thing the verdict depends on — delete the stamp and the check must go red, edit
+ * one installed byte and it must go red, move the install off main's line and it must go red —
+ * and each mutation is preceded by a CONTROL assertion that the unmutated surface is green, so a
+ * suite that passed by refusing everything could not masquerade as correct.
+ *
+ * THE ONE ARM THAT MATTERS MOST is `mutation: an off-main-line commit is drift`: it builds a
+ * commit that `git rev-list --count` calls **1** away from main while
+ * `git merge-base --is-ancestor` says NO, and asserts the verdict is `drift`. That is the
+ * measured fact this check exists for (#1760: `e8d5ce29` vs `origin/main`), and pinning it is
+ * what stops a future "simplification" back to a commit count.
+ *
+ * Zero dependencies (node stdlib only), like the repo's other `scripts/check-*.test.mjs` suites.
+ * Run: node scripts/check-version-stamp.test.mjs
+ */
+
+import { execFileSync, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+// Unit-level import: the file-identity guard cannot be exercised end-to-end from a CLI run, because
+// a filesystem reporting `dev`/`ino` of 0 cannot be constructed here.
+import { identUsable } from "./check-version-stamp.mjs";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const CLI = path.join(REPO_ROOT, "scripts", "check-version-stamp.mjs");
+// The module's pure pieces, driven directly by the arms that need to call them rather than shell out.
+const mod = await import(CLI);
+
+let passed = 0;
+let failed = 0;
+const failures = [];
+
+function ok(label) {
+  passed += 1;
+  console.log(`   ✅ ${label}`);
+}
+function bad(label, detail) {
+  failed += 1;
+  failures.push(label);
+  console.log(`   ❌ ${label}`);
+  if (detail !== undefined) console.log(`      ${String(detail).split("\n").join("\n      ")}`);
+}
+function eq(label, actual, expected) {
+  if (actual === expected) ok(label);
+  else bad(label, `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+}
+function contains(label, haystack, needle, shouldContain = true) {
+  // `shouldContain=false` is the negative assertion the arms need ("the reason must NOT print a
+  // commit count"). It used to be silently ignored — the flag was passed but this signature did not
+  // accept it, so a "must not contain" silently became a "must contain" and asserted the opposite
+  // of its own label.
+  const has = String(haystack).includes(needle);
+  if (has === shouldContain) ok(label);
+  else bad(label, shouldContain
+    ? `expected to contain ${JSON.stringify(needle)}; got:\n${haystack}`
+    : `expected NOT to contain ${JSON.stringify(needle)}; got:\n${haystack}`);
+}
+
+/** Run the CLI. Never throws — the exit code IS the assertion target, and BOTH streams are kept. */
+function run(args, opts = {}) {
+  // spawnSync, not execFileSync: a SUCCESSFUL run's stderr (warnings) must be observable too, and
+  // `execFileSync` only surfaces stderr by throwing.
+  const r = spawnSync(process.execPath, [CLI, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    cwd: opts.cwd ?? REPO_ROOT,
+    // `opts.env` lets an arm drive $AGENT_INFRA_PI_HOME / $AGENT_INFRA_REPOS_ROOT / $HOME without
+    // mutating this process's own environment — the suite must stay hermetic.
+    env: { ...process.env, ...(opts.env ?? {}) },
+  });
+  return { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+function git(cwd, ...args) {
+  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+}
+
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "version-stamp-test-"));
+const ORIGIN = path.join(TMP, "agent-infra");
+const SURFACE = path.join(TMP, "surface");
+
+function write(rel, body, base) {
+  const abs = path.join(base, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, body);
+}
+
+/** The fixture agent-infra checkout: a real git repo so ancestry is genuinely exercised. */
+function makeOrigin() {
+  fs.mkdirSync(ORIGIN, { recursive: true });
+  git(ORIGIN, "init", "-q", "-b", "main");
+  git(ORIGIN, "config", "user.email", "t@example.invalid");
+  git(ORIGIN, "config", "user.name", "test");
+  write("manifest.json", JSON.stringify({ version: "0.1.0", files: {} }, null, 2) + "\n", ORIGIN);
+  write("extensions/alpha.ts", "export const alpha = 1;\n", ORIGIN);
+  write("skills/one/SKILL.md", "# one\n", ORIGIN);
+  write("scripts/one.sh", "#!/bin/bash\necho one\n", ORIGIN);
+  git(ORIGIN, "add", "-A");
+  git(ORIGIN, "commit", "-q", "-m", "base");
+}
+
+/** An installed surface: the payload as a real directory of copies, as a hand-install looks. */
+function makeSurface() {
+  for (const rel of ["extensions/alpha.ts", "skills/one/SKILL.md", "scripts/one.sh"]) {
+    write(rel, fs.readFileSync(path.join(ORIGIN, rel), "utf8"), SURFACE);
+  }
+  fs.writeFileSync(path.join(SURFACE, ".agent-infra-version"), "0.1.0\n");
+}
+
+function stamp(cur = SURFACE) {
+  return JSON.parse(fs.readFileSync(path.join(cur, ".agent-infra-stamp.json"), "utf8"));
+}
+function writeStampRaw(cur, obj) {
+  fs.writeFileSync(path.join(cur, ".agent-infra-stamp.json"), JSON.stringify(obj, null, 2) + "\n");
+}
+function clearStamp(cur = SURFACE) {
+  fs.rmSync(path.join(cur, ".agent-infra-stamp.json"), { force: true });
+}
+function verify(...extra) {
+  return run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet", ...extra]);
+}
+function stampNow() {
+  return run(["--write", "--surface", SURFACE, "--repo", ORIGIN]);
+}
+
+console.log("== check-version-stamp suite (agent-infra#1760) ==\n");
+
+try {
+  makeOrigin();
+  makeSurface();
+
+  // ── 1. the control: a stamped surface is green ────────────────────────────────────────────
+  console.log("1. control — a freshly stamped surface is in-sync");
+  {
+    const w = stampNow();
+    eq("--write exits 0", w.code, 0);
+    eq("stamp file exists", fs.existsSync(path.join(SURFACE, ".agent-infra-stamp.json")), true);
+    const s = stamp();
+    eq("stamp version is 1", s.version, 1);
+    eq("stamp records the install commit", s.agentInfra.commit, git(ORIGIN, "rev-parse", "HEAD"));
+    eq("stamp records a payload hash", /^[0-9a-f]{64}$/.test(s.payload.hash), true);
+    eq("stamp records the payload roots", JSON.stringify(s.payload.roots), JSON.stringify(["extensions", "skills", "scripts"]));
+    const v = verify();
+    eq("verify exits 0", v.code, 0);
+    contains("verdict is in-sync", v.stdout, "in-sync");
+  }
+
+  // ── 2. THE REQUIRED MUTATION: remove the stamp → the check goes red ───────────────────────
+  console.log("\n2. mutation — the stamp is REMOVED");
+  {
+    clearStamp();
+    const v = verify();
+    eq("verify exits 1 (not 0)", v.code, 1);
+    contains("verdict is unstamped", v.stdout, "unstamped");
+    contains("reason names the missing stamp", v.stdout, "no stamp file");
+    stampNow(); // restore the control for the next arm
+    eq("control restored (green again)", verify().code, 0);
+  }
+
+  // ── 3. an off-main-line commit is drift, and a commit COUNT would have said "1 behind" ────
+  console.log("\n3. mutation — the install sits OFF main's line (the measured e8d5ce29 shape)");
+  {
+    // `side` branches from the shared base and takes one commit; `main` takes one commit of its own.
+    // So `side` is 1 commit from `main` BY COUNT and is NOT an ancestor of it — the e8d5ce29 shape.
+    git(ORIGIN, "checkout", "-q", "-b", "side");
+    write("extensions/side.ts", "export const side = 1;\n", ORIGIN);
+    git(ORIGIN, "add", "-A");
+    git(ORIGIN, "commit", "-q", "-m", "side");
+    const side = git(ORIGIN, "rev-parse", "HEAD");
+    git(ORIGIN, "checkout", "-q", "main");
+    write("extensions/mainonly.ts", "export const m = 1;\n", ORIGIN);
+    git(ORIGIN, "add", "-A");
+    git(ORIGIN, "commit", "-q", "-m", "main moves on");
+    const mainSha = git(ORIGIN, "rev-parse", "HEAD");
+
+    // Assert the PRECONDITION: a count-based check would report a trivially small number.
+    eq("count-based distance is 1 (the lie)", git(ORIGIN, "rev-list", "--count", `${side}..main`), "1");
+    let ancestor = true;
+    try {
+      execFileSync("git", ["-C", ORIGIN, "merge-base", "--is-ancestor", side, mainSha]);
+    } catch {
+      ancestor = false;
+    }
+    eq("but it is NOT an ancestor (the truth)", ancestor, false);
+
+    // Now stamp the surface as if it had been installed from `side`.
+    const s = stamp();
+    writeStampRaw(SURFACE, { ...s, agentInfra: { ...s.agentInfra, commit: side } });
+    const v = verify();
+    eq("verify exits 1", v.code, 1);
+    contains("verdict is drift", v.stdout, "drift");
+    contains("reason says NOT an ancestor", v.stdout, "NOT an ancestor");
+    contains("reason never prints a commit count", v.stdout, "behind", false);
+
+    writeStampRaw(SURFACE, { ...s, agentInfra: { ...s.agentInfra, commit: mainSha } });
+    eq("control — same surface at main's own tip is green", verify().code, 0);
+  }
+
+  // ── 4. a hand-edited install is drift, even though the commit is still on main's line ─────
+  console.log("\n4. mutation — one installed byte changes (the +18.8 KB cmux-session.ts shape)");
+  {
+    stampNow();
+    eq("control is green before the edit", verify().code, 0);
+    const victim = path.join(SURFACE, "extensions", "alpha.ts");
+    fs.appendFileSync(victim, "// hand-edited after install\n");
+    const v = verify();
+    eq("verify exits 1", v.code, 1);
+    contains("verdict is drift", v.stdout, "drift");
+    contains("reason is the payload hash", v.stdout, "payload hash");
+    fs.writeFileSync(victim, "export const alpha = 1;\n");
+    eq("control — restoring the bytes is green again", verify().code, 0);
+  }
+
+  // ── 5. files ADDED or REMOVED after stamping are drift too ───────────────────────────────
+  console.log("\n5. mutation — a file is added to / removed from the installed payload");
+  {
+    stampNow();
+    const extra = path.join(SURFACE, "scripts", "local-only.sh");
+    fs.writeFileSync(extra, "#!/bin/bash\necho local\n");
+    eq("added file → exit 1", verify().code, 1);
+    contains("added file names the payload reason", verify().stdout, "payload hash");
+    fs.rmSync(extra);
+
+    const removed = path.join(SURFACE, "skills", "one", "SKILL.md");
+    const kept = fs.readFileSync(removed);
+    fs.rmSync(removed);
+    eq("removed file → exit 1", verify().code, 1);
+    fs.mkdirSync(path.dirname(removed), { recursive: true });
+    fs.writeFileSync(removed, kept);
+    eq("control — both restored is green", verify().code, 0);
+  }
+
+  // ── 5b. a whole payload ROOT that appears after stamping is drift (the fail-open arm) ─────
+  // Stamping used to record only the roots that EXISTED, and verification then hashed only those
+  // recorded roots — so a root absent at stamp time could never change the digest, and a surface
+  // could gain an entire `extensions/` tree and still verify `in-sync`. This arm is the one that
+  // fails if that narrowing ever comes back.
+  console.log("\n5b. mutation — a payload ROOT appears after stamping");
+  {
+    const ext = path.join(SURFACE, "extensions");
+    const savedAlpha = fs.readFileSync(path.join(ext, "alpha.ts"), "utf8");
+    fs.rmSync(ext, { recursive: true });
+    stampNow();
+    eq("control — stamped with extensions/ absent is green", verify().code, 0);
+
+    fs.mkdirSync(ext, { recursive: true });
+    fs.writeFileSync(path.join(ext, "sneaky.ts"), "export const sneaky = 1;\n");
+    const v = verify();
+    eq("a NEW payload root is drift, not in-sync", v.code, 1);
+    contains("new root names the payload reason", v.stdout, "payload hash");
+
+    fs.rmSync(path.join(ext, "sneaky.ts"));
+    fs.writeFileSync(path.join(ext, "alpha.ts"), savedAlpha);
+    stampNow();
+    eq("control — original root restored and re-stamped is green", verify().code, 0);
+  }
+
+  // ── 6. fail-CLOSED stamp shapes: every one of these is unstamped, never in-sync ──────────
+  console.log("\n6. fail-closed — a stamp that cannot answer the question is NOT a pass");
+  {
+    stampNow();
+    const good = stamp();
+
+    fs.writeFileSync(path.join(SURFACE, ".agent-infra-stamp.json"), "{ not json");
+    eq("unparseable stamp → exit 1", verify().code, 1);
+    contains("unparseable stamp is unstamped", verify().stdout, "unstamped");
+
+    writeStampRaw(SURFACE, { ...good, version: 999 });
+    eq("wrong stamp version → exit 1", verify().code, 1);
+    contains("wrong version names the version", verify().stdout, "version");
+
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: null } });
+    const v = verify();
+    eq("commit:null → exit 1", v.code, 1);
+    contains("commit:null is unstamped", v.stdout, "unstamped");
+    contains("commit:null reason names the unanswerable ancestry", v.stdout, "ancestry is unanswerable");
+
+    writeStampRaw(SURFACE, { ...good, payload: { ...good.payload, hash: "nope" } });
+    eq("malformed payload hash → exit 1", verify().code, 1);
+    contains("malformed hash is unstamped", verify().stdout, "unstamped");
+
+    writeStampRaw(SURFACE, { ...good, payload: { ...good.payload, algo: "md5" } });
+    eq("wrong payload algo → exit 1", verify().code, 1);
+
+    stampNow();
+    eq("control — a good stamp after all that is green", verify().code, 0);
+  }
+
+  // ── 7. an empty / unverifiable surface set is NOT a green set ────────────────────────────
+  console.log("\n7. an empty or unverifiable run exits 2, never 0");
+  {
+    const empty = run(["--surface", path.join(TMP, "does-not-exist"), "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+    // A --surface that does not exist is still a NAMED surface, so it is classified (unstamped),
+    // not silently dropped — dropping it would be the "missing surface reads as absent" hole.
+    eq("a named-but-absent surface is unstamped (exit 1)", empty.code, 1);
+    contains("named-but-absent surface is reported unstamped", empty.stdout, "unstamped");
+
+    const noSurfaces = run(["--surface", "", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], { cwd: TMP });
+    if (noSurfaces.code !== 0) ok("a blank surface argument never exits 0");
+    else bad("a blank surface argument never exits 0", noSurfaces.stdout);
+
+    const badRef = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "no-such-ref", "--no-fetch", "--quiet"]);
+    eq("an unresolvable ref exits 2", badRef.code, 2);
+    contains("unresolvable ref says cannot resolve", badRef.stderr + badRef.stdout, "cannot resolve ref");
+
+    const badRepo = run(["--surface", SURFACE, "--repo", TMP, "--ref", "main", "--no-fetch", "--quiet"]);
+    eq("a checkout with no manifest.json exits 2", badRepo.code, 2);
+  }
+
+  // ── 8. the machine-readable report ───────────────────────────────────────────────────────
+  console.log("\n8. --json carries the three verdicts and the resolved target");
+  {
+    clearStamp();
+    const v = verify("--json");
+    const report = JSON.parse(v.stdout);
+    eq("report names the target ref", report.ref, "main");
+    eq("report carries the resolved sha", /^[0-9a-f]{40}$/.test(report.sha), true);
+    eq("counts has in-sync/drift/unstamped", JSON.stringify(Object.keys(report.counts).sort()), JSON.stringify(["drift", "in-sync", "unstamped"]));
+    eq("one result per surface", report.results.length, 1);
+    eq("verdict is unstamped", report.results[0].verdict, "unstamped");
+    eq("exit 1 accompanies the report", v.code, 1);
+  }
+
+  // ── 9. the linked-repo discovery that makes `sync`'s linked set stampable ────────────────
+  console.log("\n9. default surface discovery finds a linked repo by its LEGACY pin too");
+  {
+    const root = path.join(TMP, "repos");
+    const linked = path.join(root, "a-linked-repo");
+    fs.mkdirSync(linked, { recursive: true });
+    fs.writeFileSync(path.join(linked, ".agent-infra-version"), "0.1.0\n");
+    const unlinked = path.join(root, "not-linked");
+    fs.mkdirSync(unlinked, { recursive: true });
+    const found = mod.linkedSurfaces(root);
+    eq("a repo carrying only .agent-infra-version is discovered", found.includes(linked), true);
+    eq("a directory that is not linked is not discovered", found.includes(unlinked), false);
+    eq("the unlinked directory is not silently counted as a surface", found.length, 1);
+  }
+
+  // ── 10. an option-shaped ref must be REFUSED, not handed to `git fetch` as an option ─────
+  // `--ref origin/--upload-pack=<cmd>` used to reach `git fetch origin --upload-pack=<cmd>` and
+  // execute <cmd>. The fix is two-layer: `--` terminates option parsing, and the branch name is
+  // validated (no leading '-', conservative charset).
+  console.log("\n10. security — an option-shaped ref is refused, not executed");
+  {
+    const marker = path.join(TMP, "f1-pwned");
+    fs.rmSync(marker, { force: true });
+
+    // CONTROL first: a real branch still fetches through the hardened path.
+    git(ORIGIN, "remote", "add", "origin", ORIGIN);
+    try {
+      const good = mod.refreshRef(ORIGIN, "origin/main");
+      eq("control — a real origin/<branch> still fetches", good.fetched, true);
+      eq("control — a good fetch carries no warning", good.warning, null);
+    } finally {
+      git(ORIGIN, "remote", "remove", "origin");
+    }
+
+    const evil = `origin/--upload-pack=touch ${marker};echo`;
+    const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", evil]);
+    eq("option-shaped ref → exit 2 (cannot verify)", v.code, 2);
+    eq("the injected command did NOT run", fs.existsSync(marker), false);
+    contains("the refusal names a bad ref", v.stderr + v.stdout, "bad ref");
+  }
+
+  // ── 11. an unreadable payload directory is cannot-verify, NEVER read as empty/in-sync ─────
+  // Stamped with `extensions/` absent, then `extensions/` appears and cannot be read. Treated as
+  // empty it contributes nothing, the digest equals the stamp, and a CHANGED surface goes green.
+  console.log("\n11. fail-closed — a payload directory that cannot be read");
+  {
+    const surface2 = path.join(TMP, "surface-unreadable");
+    fs.rmSync(surface2, { recursive: true, force: true });
+    fs.mkdirSync(path.join(surface2, "skills", "one"), { recursive: true });
+    fs.writeFileSync(path.join(surface2, "skills", "one", "SKILL.md"), "# one\n");
+    const w = run(["--write", "--surface", surface2, "--repo", ORIGIN]);
+    eq("control — stamped with extensions/ absent", w.code, 0);
+    eq("control — that surface is green", run(["--surface", surface2, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+
+    fs.mkdirSync(path.join(surface2, "extensions"), { recursive: true });
+    fs.writeFileSync(path.join(surface2, "extensions", "smuggled.ts"), "export const x = 1;\n");
+    const ext2 = path.join(surface2, "extensions");
+    fs.chmodSync(ext2, 0o000);
+    let revokeWorked = false;
+    try {
+      try {
+        fs.readdirSync(ext2);
+      } catch {
+        revokeWorked = true;
+      }
+      if (!revokeWorked) {
+        ok("skipped — chmod did not revoke read access (running as root?)");
+      } else {
+        const v = run(["--surface", surface2, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+        eq("unreadable dir → exit 1, never 0", v.code, 1);
+        contains("unreadable dir is unstamped (cannot verify)", v.stdout, "unstamped");
+        contains("the reason names the path", v.stdout, "extensions");
+        contains("the reason names the errno", v.stdout, "EACCES");
+      }
+    } finally {
+      fs.chmodSync(ext2, 0o755);
+    }
+  }
+
+  // ── 12. a failed stamp write must leave the PREVIOUS stamp intact (atomic temp+rename) ────
+  console.log("\n12. data-loss — a failed --write must not destroy the existing stamp");
+  {
+    stampNow();
+    const before = fs.readFileSync(path.join(SURFACE, ".agent-infra-stamp.json"), "utf8");
+    fs.chmodSync(SURFACE, 0o555); // no new file can be created in the directory
+    let failed;
+    try {
+      // A sibling temp write cannot be created here, so the write fails. In-place truncation would
+      // already have destroyed the stamp; temp+rename must leave it untouched.
+      failed = run(["--write", "--surface", SURFACE, "--repo", ORIGIN]);
+    } finally {
+      fs.chmodSync(SURFACE, 0o755);
+    }
+    const after = fs.readFileSync(path.join(SURFACE, ".agent-infra-stamp.json"), "utf8");
+    if (failed.code === 0) {
+      ok("skipped — the write succeeded anyway (read-only dir not enforced here)");
+    } else {
+      eq("the write FAILED (control)", failed.code, 2);
+      eq("the previous stamp is byte-identical", after, before);
+      eq("and it is still valid/green", verify().code, 0);
+    }
+  }
+
+  // ── 13. ancestry outcomes are THREE, not two ─────────────────────────────────────────────
+  // `merge-base --is-ancestor` exits 1 (not an ancestor) and 128 (no such object), and `git()`
+  // collapsed both to null — so a DESCENDANT of the target read as "off main's line" (false), and
+  // an absent stamped commit read as a definite divergence instead of cannot-verify.
+  console.log("\n13. ancestry — ahead-of-target and absent-commit differ from off-the-line");
+  {
+    stampNow();
+    const good = stamp();
+
+    // (a) the stamped commit is a DESCENDANT of the target.
+    git(ORIGIN, "checkout", "-q", "-b", "ahead");
+    write("extensions/ahead.ts", "export const ahead = 1;\n", ORIGIN);
+    git(ORIGIN, "add", "-A");
+    git(ORIGIN, "commit", "-q", "-m", "ahead");
+    const ahead = git(ORIGIN, "rev-parse", "HEAD");
+    git(ORIGIN, "checkout", "-q", "main");
+    const targetSha = git(ORIGIN, "rev-parse", "HEAD");
+    let targetIsAncestor = true;
+    try {
+      execFileSync("git", ["-C", ORIGIN, "merge-base", "--is-ancestor", targetSha, ahead]);
+    } catch {
+      targetIsAncestor = false;
+    }
+    eq("precondition — target IS an ancestor of the stamped commit", targetIsAncestor, true);
+
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: ahead } });
+    const va = verify();
+    eq("descendant of target → exit 1 (still drift)", va.code, 1);
+    contains("reason says AHEAD of the ref", va.stdout, "AHEAD of");
+    contains("reason is NOT the false 'off main's line'", va.stdout, "off main's line", false);
+
+    // (b) the stamped commit is not in this repo at all.
+    const ghost = "0".repeat(39) + "1";
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: ghost } });
+    const vb = verify();
+    eq("absent stamped commit → exit 1, never 0", vb.code, 1);
+    contains("absent commit is unstamped (cannot verify)", vb.stdout, "unstamped");
+    contains("reason names the missing object", vb.stdout, "not present");
+    contains("absent commit is NOT called a divergence", vb.stdout, "off main's line", false);
+
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the good stamp is green again", verify().code, 0);
+  }
+
+  // ── 14. payload.roots must be EXACTLY the fixed set (reader's universe == writer's) ───────
+  console.log("\n14. fail-closed — payload.roots cannot narrow the reader's universe");
+  {
+    stampNow();
+    const good = stamp();
+    eq("control — the untouched stamp is green", verify().code, 0);
+
+    for (const roots of [[], ["skills"]]) {
+      // The CORRECT hash is kept: a mismatched root list alone must be refused, so the arm cannot
+      // pass merely because the digests happened to differ.
+      writeStampRaw(SURFACE, { ...good, payload: { ...good.payload, roots } });
+      const v = verify();
+      eq(`roots=${JSON.stringify(roots)} → exit 1`, v.code, 1);
+      contains(`roots=${JSON.stringify(roots)} is unstamped, never in-sync`, v.stdout, "unstamped");
+      contains(`roots=${JSON.stringify(roots)} reason names the roots`, v.stdout, "payload.roots");
+    }
+
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — restored stamp is green", verify().code, 0);
+  }
+
+  // ── 15. `kind` at the repo root is agent-infra-checkout, not installed-surface ───────────
+  console.log("\n15. kind — the surface that IS the checkout");
+  {
+    eq("kind at the repo root is agent-infra-checkout", mod.buildStamp(ORIGIN, ORIGIN).kind, "agent-infra-checkout");
+    eq("kind inside the checkout is agent-infra-checkout", mod.buildStamp(path.join(ORIGIN, "scripts"), ORIGIN).kind, "agent-infra-checkout");
+    eq("kind away from the repo is installed-surface", mod.buildStamp(SURFACE, ORIGIN).kind, "installed-surface");
+  }
+
+  // ── 16. $AGENT_INFRA_REPOS_ROOT is honoured; an explicit argument wins over it ────────────
+  console.log("\n16. discovery — $AGENT_INFRA_REPOS_ROOT scopes the scan");
+  {
+    const envRoot = path.join(TMP, "env-repos");
+    const linked = path.join(envRoot, "linked-repo");
+    fs.mkdirSync(linked, { recursive: true });
+    fs.writeFileSync(path.join(linked, ".agent-infra-version"), "0.1.0\n");
+    const argRoot = path.join(TMP, "arg-repos");
+    const argLinked = path.join(argRoot, "arg-repo");
+    fs.mkdirSync(argLinked, { recursive: true });
+    fs.writeFileSync(path.join(argLinked, ".agent-infra-version"), "0.1.0\n");
+
+    const saved = process.env.AGENT_INFRA_REPOS_ROOT;
+    process.env.AGENT_INFRA_REPOS_ROOT = envRoot;
+    try {
+      const found = mod.linkedSurfaces(undefined);
+      eq("the env-var root is scanned", found.includes(linked), true);
+      const viaArg = mod.linkedSurfaces(argRoot);
+      eq("an explicit argument wins over the env var", viaArg.includes(argLinked) && !viaArg.includes(linked), true);
+    } finally {
+      if (saved === undefined) delete process.env.AGENT_INFRA_REPOS_ROOT;
+      else process.env.AGENT_INFRA_REPOS_ROOT = saved;
+    }
+  }
+
+  // ── 17. an empty --surface is refused (path.resolve("") is the CWD) ──────────────────────
+  console.log("\n17. safety — an empty --surface must not stamp the CWD");
+  {
+    const cwd = path.join(TMP, "empty-surface-cwd");
+    fs.mkdirSync(cwd, { recursive: true });
+    const v = run(["--surface", "", "--repo", ORIGIN, "--write"], { cwd });
+    eq("empty --surface → exit 2", v.code, 2);
+    eq("nothing was stamped in the CWD", fs.existsSync(path.join(cwd, ".agent-infra-stamp.json")), false);
+    contains("the refusal names the empty value", v.stderr + v.stdout, "non-empty");
+  }
+
+  // ── 18. a failed fetch warns on stderr even under --quiet, and never changes the exit code ─
+  console.log("\n18. staleness — the fetch warning survives --quiet");
+  {
+    stampNow();
+    eq("control — the surface is green", verify().code, 0);
+    git(ORIGIN, "update-ref", "refs/remotes/origin/main", git(ORIGIN, "rev-parse", "HEAD"));
+    git(ORIGIN, "remote", "add", "origin", path.join(TMP, "no-such-remote"));
+    try {
+      const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "origin/main", "--quiet"]);
+      contains("--quiet still shows the fetch warning on stderr", v.stderr, "could not fetch");
+      eq("--quiet exit is unchanged by the warning", v.code, 0);
+      const j = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "origin/main", "--quiet", "--json"]);
+      contains("--json records the warning field", JSON.stringify(JSON.parse(j.stdout).warning), "could not fetch");
+    } finally {
+      git(ORIGIN, "remote", "remove", "origin");
+    }
+  }
+
+  // ── 19. a symlink in the payload is digested as its TARGET STRING, not its content ────────
+  // Mutation-sensitive: a mutant that FOLLOWS the link digests identical CONTENT on both sides and
+  // cannot see the re-point; a mutant that ignores links cannot see it either. Only recording the
+  // target string makes a re-point visible.
+  console.log("\n19. mutation — a re-pointed symlink is drift, an unchanged one is in-sync");
+  {
+    const a = path.join(SURFACE, "scripts", "same-a.sh");
+    const b = path.join(SURFACE, "scripts", "same-b.sh");
+    fs.writeFileSync(a, "#!/bin/bash\necho identical\n");
+    fs.writeFileSync(b, "#!/bin/bash\necho identical\n");
+    const link = path.join(SURFACE, "scripts", "link.sh");
+    fs.rmSync(link, { force: true });
+    fs.symlinkSync("same-a.sh", link);
+    stampNow();
+    eq("control — an unchanged symlink is in-sync", verify().code, 0);
+
+    fs.rmSync(link);
+    fs.symlinkSync("same-b.sh", link); // identical CONTENT, different TARGET STRING
+    const v = verify();
+    eq("a re-pointed symlink is drift", v.code, 1);
+    contains("the re-pointed link names the payload reason", v.stdout, "payload hash");
+
+    fs.rmSync(link);
+    fs.symlinkSync("same-a.sh", link);
+    eq("control — re-pointing back is green", verify().code, 0);
+
+    fs.rmSync(link);
+    fs.rmSync(a, { force: true });
+    fs.rmSync(b, { force: true });
+    stampNow();
+  }
+
+  // ── 20. --no-repos disables ONLY the linked-repo scan; the pi surface remains ────────────
+  // The flag is documented in two places as "only the pi surface" (header CLI list + --help).
+  // Both ternaries used to test `opts.noRepos`, so the list came back EMPTY and the tool
+  // refused to check anything (exit 2) — the exact opposite of its documented meaning.
+  console.log("\n20. --no-repos still checks the pi surface");
+  {
+    const savedPi = process.env.AGENT_INFRA_PI_HOME;
+    stampNow();
+    process.env.AGENT_INFRA_PI_HOME = SURFACE;
+    try {
+      const v = run(["--no-repos", "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+      if (v.code === 2) bad("--no-repos does not hand back an empty set", v.stderr + v.stdout);
+      else ok("--no-repos does not hand back an empty set");
+      contains("the pi surface is still classified", v.stdout, SURFACE);
+      contains("and it is reported in-sync", v.stdout, "in-sync");
+    } finally {
+      if (savedPi === undefined) delete process.env.AGENT_INFRA_PI_HOME;
+      else process.env.AGENT_INFRA_PI_HOME = savedPi;
+    }
+  }
+
+  // ── 21. an EMPTY surface set is "nothing was verified" (exit 2) ─────────────────────────
+  // Deleting the `surfaces.length === 0` guard used to leave this whole suite GREEN (measured),
+  // because no arm ever built an empty set. Point the pi home at a path that does not exist and
+  // disable the linked scan, so `[piSurface()]` filters to [] — the state the guard exists for.
+  console.log("\n21. fail-closed — an empty surface set is 'nothing was verified' (exit 2)");
+  {
+    // Reach the empty set through the UNNAMED default: an absent `$HOME/.pi/agent` is legitimate,
+    // so the set is genuinely empty. (A surface the operator NAMED that cannot be read is a
+    // different, earlier refusal — arm 30.)
+    const emptyHome = path.join(TMP, "empty-home");
+    fs.mkdirSync(emptyHome, { recursive: true });
+    const v = run(["--no-repos", "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"], {
+      env: { HOME: emptyHome, AGENT_INFRA_PI_HOME: "", AGENT_INFRA_REPOS_ROOT: "" },
+    });
+    eq("an empty surface set exits 2, never 0", v.code, 2);
+    contains("the refusal says nothing was verified", v.stderr + v.stdout, "nothing was verified");
+  }
+
+  // ── 22. an empty --repo names nothing and must not fall through to a default ─────────────
+  // `resolveRepo` reads `""` as UNNAMED and falls through to $AGENT_INFRA_PATH / this module's
+  // root — the substitution the explicit-`--repo` fix removed for a named value, left open for a
+  // blank one. `--surface ""` is refused; `--repo ""` must be too.
+  console.log("\n22. safety — an empty --repo must not resolve to some other checkout");
+  {
+    const v = run(["--surface", SURFACE, "--repo", "", "--ref", "main", "--no-fetch", "--quiet"]);
+    eq("empty --repo → exit 2 (bad usage)", v.code, 2);
+    contains("the refusal names the empty value", v.stderr + v.stdout, "non-empty");
+  }
+
+  // ── 23. a stamp from a DIRTY source checkout cannot certify in-sync ──────────────────────
+  // The stamp records `agentInfra.dirty`; nothing read it, so an install copied from a checkout
+  // with an uncommitted payload edit verified `in-sync` — the false green this check exists for.
+  console.log("\n23. fail-closed — a dirty source checkout is drift, never in-sync");
+  {
+    stampNow();
+    eq("control — a clean source stamps green", verify().code, 0);
+    const alphaPath = path.join(ORIGIN, "extensions", "alpha.ts");
+    const original = fs.readFileSync(alphaPath, "utf8");
+    fs.writeFileSync(alphaPath, original + "export const uncommitted = 1;\n");
+    try {
+      const w = stampNow();
+      eq("--write still exits 0 (the state is recorded, not hidden)", w.code, 0);
+      contains("--write warns that the source is dirty", w.stderr, "DIRTY");
+      eq("the stamp records dirty=true", stamp().agentInfra.dirty, true);
+      const v = verify();
+      eq("a dirty-source stamp exits 1", v.code, 1);
+      contains("the verdict is drift", v.stdout, "drift");
+      contains("the reason names the dirty source", v.stdout, "DIRTY source checkout");
+      contains("the reason never reads in-sync", v.stdout, "in-sync", false);
+
+      // `dirty: null` (the status probe failed) or an ABSENT field is the same class of
+      // unanswerable as `commit: null` — it must be unstamped, never a pass.
+      const dirtyStamp = stamp();
+      for (const unknown of [null, undefined]) {
+        writeStampRaw(SURFACE, { ...dirtyStamp, agentInfra: { ...dirtyStamp.agentInfra, dirty: unknown } });
+        const vn = verify();
+        eq(`dirty=${String(unknown)} → exit 1`, vn.code, 1);
+        contains(`dirty=${String(unknown)} is unstamped, never in-sync`, vn.stdout, "unstamped");
+        contains(`dirty=${String(unknown)} reason names agentInfra.dirty`, vn.stdout, "agentInfra.dirty");
+      }
+    } finally {
+      fs.writeFileSync(alphaPath, original);
+    }
+    stampNow();
+    eq("control — re-stamped from a clean checkout is green", verify().code, 0);
+  }
+
+  // ── 24. a NAMED repos root that cannot be read is cannot-verify, not "no repos" ──────────────
+  console.log("\n24. a named-but-unreadable repos root must not yield a green over an unread scope");
+  {
+    const pi = path.join(TMP, "pi-surface2");
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", pi);
+    const env = { AGENT_INFRA_PI_HOME: pi };
+    run(["--write", "--surface", pi, "--repo", ORIGIN], { env });
+    const named = path.join(TMP, "no-such-root");
+    const v = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch", "--repos-root", named], { env });
+    eq("a named unreadable repos root → exit 2", v.code, 2);
+    contains("the refusal names the root", v.stderr + v.stdout, "no-such-root");
+    // CONTROL: the BUILT-IN default root may legitimately be absent, and must not be fatal.
+    const home = path.join(TMP, "fake-home");
+    fs.mkdirSync(home, { recursive: true });
+    const ok = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"], {
+      env: { ...env, HOME: home, AGENT_INFRA_REPOS_ROOT: "" },
+    });
+    eq("control — an ABSENT default root is not fatal", ok.code, 0);
+    fs.rmSync(pi, { recursive: true, force: true });
+  }
+
+  // ── 25. a root resolving to the containing directory must not digest the stamp ──────────────
+  console.log("\n25. `scripts -> .` must not fold the tool's own stamp into the digest");
+  {
+    const s2 = path.join(TMP, "selfref");
+    fs.mkdirSync(path.join(s2, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s2, "skills"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s2);
+    fs.symlinkSync(".", path.join(s2, "scripts"));
+    const w = run(["--write", "--surface", s2, "--repo", ORIGIN]);
+    eq("control — the self-referential surface stamps", w.code, 0);
+    const v = run(["--surface", s2, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+    eq("write then verify AGREE (no phantom drift)", v.code, 0);
+    contains("and it reads in-sync", v.stdout, "in-sync");
+    const s = JSON.parse(fs.readFileSync(path.join(s2, ".agent-infra-stamp.json"), "utf8"));
+    eq("the stamp is not counted as payload", s.payload.files > 0, true);
+    eq("its own artifact is not reported in the payload", String(s.payload.hash).length, 64);
+    eq("control — a second write converges", run(["--write", "--surface", s2, "--repo", ORIGIN]).code, 0);
+    fs.rmSync(s2, { recursive: true, force: true });
+  }
+
+  // ── 26. --write says so when it erases drift ─────────────────────────────────────────────
+  console.log("\n26. --write announces a re-baseline instead of silently laundering drift");
+  {
+    stampNow();
+    write("scripts/one.sh", "#!/bin/bash\necho drift\n", SURFACE);
+    eq("control — the edit is drift", verify().code, 1);
+    const w = stampNow();
+    eq("--write exits 0", w.code, 0);
+    contains("the write announces the re-baseline", w.stdout, "RE-BASELINED");
+    eq("control — the surface is green again", verify().code, 0);
+    clearStamp();
+    contains("a FIRST stamp is not called a re-baseline", stampNow().stdout, "RE-BASELINED", false);
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", SURFACE);
+    stampNow();
+  }
+
+  // ── 27. an annotated TAG object is not a commit ──────────────────────────────────────────
+  console.log("\n27. an annotated tag object must not satisfy the commit-presence gate");
+  {
+    git(ORIGIN, "tag", "-a", "v-test", "-m", "annotated");
+    const tagSha = git(ORIGIN, "rev-parse", "v-test");
+    eq("precondition — the object is a tag", git(ORIGIN, "cat-file", "-t", tagSha), "tag");
+    const good = stamp();
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: tagSha } });
+    const v = verify();
+    eq("a tag object → exit 1, never in-sync", v.code, 1);
+    contains("the reason reports it as not present", v.stdout, "not present");
+    git(ORIGIN, "tag", "-d", "v-test");
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the real commit is green again", verify().code, 0);
+  }
+
+  // ── 28. a DANGLING symlink root is not an absent root ────────────────────────────────────
+  console.log("\n28. a dangling symlink root is a cannot-verify, not an absent root");
+  {
+    const s3 = path.join(TMP, "dangling");
+    fs.mkdirSync(path.join(s3, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s3, "skills"), { recursive: true });
+    fs.symlinkSync("/nonexistent-AAA", path.join(s3, "scripts"));
+    const w = run(["--write", "--surface", s3, "--repo", ORIGIN]);
+    eq("a dangling root cannot be stamped → exit 2", w.code, 2);
+    contains("the refusal names the root", w.stderr + w.stdout, "scripts");
+    fs.rmSync(path.join(s3, "scripts"));
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", s3);
+    eq("control — a real root stamps", run(["--write", "--surface", s3, "--repo", ORIGIN]).code, 0);
+    eq(
+      "control — and verifies",
+      run(["--surface", s3, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      0
+    );
+    fs.rmSync(s3, { recursive: true, force: true });
+  }
+
+  // ── 29. a rejected-but-well-formed stamp still reports the commit it names ───────────────
+  console.log("\n29. a stamp rejected on one field must still report the commit it carries");
+  {
+    const good = stamp();
+    const commit = good.agentInfra.commit;
+    writeStampRaw(SURFACE, { ...good, payload: { ...good.payload, roots: ["skills"] } });
+    const v = verify();
+    eq("narrowed roots → exit 1", v.code, 1);
+    contains("the reason names the roots", v.stdout, "payload.roots");
+    const j = JSON.parse(
+      run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--json"]).stdout
+    );
+    eq("--json still carries the stamp's commit", j.results[0].stamp?.agentInfra?.commit, commit);
+    contains("the human line names the commit, not (no commit)", v.stdout, commit.slice(0, 9));
+    contains("the human line does not claim (no commit)", v.stdout, "(no commit)", false);
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the restored stamp is green", verify().code, 0);
+  }
+
+  // ── 30. a NAMED pi surface that cannot be read is cannot-verify, not a silent omission ────
+  console.log("\n30. a named pi surface that cannot be read must not be silently dropped");
+  {
+    const realPi = path.join(TMP, "real-pi");
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", realPi);
+    const repoRoot = path.join(TMP, "one-repo");
+    const linked = path.join(repoRoot, "linked");
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", linked);
+    fs.writeFileSync(path.join(linked, ".agent-infra-version"), "0.1.0\n");
+    const env = { AGENT_INFRA_REPOS_ROOT: repoRoot };
+    run(["--write", "--surface", realPi, "--repo", ORIGIN], { env });
+    run(["--write", "--surface", linked, "--repo", ORIGIN], { env });
+    const withReal = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"], {
+      env: { ...env, AGENT_INFRA_PI_HOME: realPi },
+    });
+    eq("control — a real pi surface is reported", withReal.code, 0);
+    // SUBJECT: same run, pi surface NAMED but dangling. Before the fix it was dropped and the
+    // linked repo alone carried a green — a pass over a scope nobody read.
+    const dangling = path.join(TMP, "dangling-pi");
+    fs.symlinkSync("/nonexistent-pi-target", dangling);
+    const v = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch"], {
+      env: { ...env, AGENT_INFRA_PI_HOME: dangling },
+    });
+    eq("a named dangling pi surface → exit 2", v.code, 2);
+    contains("the refusal names the pi surface", v.stderr + v.stdout, "dangling-pi");
+  }
+
+  // ── 31. --repos-root '' must not fall through to another scope ─────────────────────────────
+  console.log("\n31. --repos-root '' must not fall through to the env var or the default");
+  {
+    const v = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch", "--repos-root", ""]);
+    eq("--repos-root '' → exit 2", v.code, 2);
+    contains("the refusal names the empty value", v.stderr + v.stdout, "non-empty");
+  }
+
+  // ── 32. a hostile stamp must not crash the report ────────────────────────────────────────
+  console.log("\n32. a hostile stamp must not crash the report (bounded projection)");
+  {
+    stampNow();
+    const deep = '{"a":'.repeat(8000) + "1" + "}".repeat(8000);
+    fs.writeFileSync(path.join(SURFACE, ".agent-infra-stamp.json"), deep);
+    const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--json"]);
+    eq("a deeply nested stamp exits 1, not a crash", v.code, 1);
+    eq("--json still produces a report", v.stdout.length > 0, true);
+    eq("no stack overflow on stderr", v.stderr.includes("Maximum call stack"), false);
+
+    stampNow();
+    const good = stamp();
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: 12345 } });
+    const h = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch"]);
+    eq("a non-string commit does not throw the human line", h.code, 1);
+    contains("the human report still prints", h.stdout, "unstamped");
+    contains("and it does not claim a commit", h.stdout, "no commit");
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the restored stamp is green", verify().code, 0);
+  }
+
+  // ── 33. a payload file named like the stamp is still digested ───────────────────────────
+  console.log("\n33. a legitimately installed file named like the stamp must not be invisible");
+  {
+    stampNow();
+    const decoy = path.join(SURFACE, "skills", "s", ".agent-infra-stamp.json");
+    fs.mkdirSync(path.dirname(decoy), { recursive: true });
+    fs.writeFileSync(decoy, '{"legit":"payload"}\n');
+    eq("adding it is drift", verify().code, 1);
+    contains("the drift names the payload", verify().stdout, "payload hash");
+    stampNow();
+    eq("control — re-stamped is green", verify().code, 0);
+    fs.writeFileSync(decoy, '{"legit":"CHANGED"}\n');
+    eq("editing it is drift", verify().code, 1);
+    fs.rmSync(decoy);
+    stampNow();
+  }
+
+  // ── 34. --write must not conjure a surface ──────────────────────────────────────────────
+  console.log("\n34. --write must not create a surface that does not exist");
+  {
+    const ghost = path.join(TMP, "ghost", "deep", "surface");
+    const v = run(["--write", "--surface", ghost, "--repo", ORIGIN]);
+    eq("--write on a nonexistent surface → exit 2", v.code, 2);
+    eq("the path was NOT created", fs.existsSync(ghost), false);
+    contains("the refusal says it will not create one", v.stderr + v.stdout, "refusing to create");
+  }
+
+  // ── 35. --write announces COMMIT drift too, not only payload drift ─────────────────────
+  console.log("\n35. --write announces a re-baseline for commit drift as well");
+  {
+    stampNow();
+    const good = stamp();
+    const commitA = good.agentInfra.commit;
+    write("extensions/beta.ts", "export const beta = 2;\n", ORIGIN);
+    git(ORIGIN, "add", "-A");
+    git(ORIGIN, "commit", "-q", "-m", "second");
+    const commitB = git(ORIGIN, "rev-parse", "HEAD");
+    // a stamp naming the OLD commit, as an install made before the new commit would carry
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: commitA } });
+    const w = stampNow();
+    eq("--write exits 0", w.code, 0);
+    eq("the surface really did move to the new commit", stamp().agentInfra.commit, commitB);
+    contains("the commit move is announced", w.stdout, "RE-BASELINED");
+    contains("the note names the commit move", w.stdout, "commit ");
+    eq("control — green at the new commit", verify().code, 0);
+  }
+
+  // ── 36. a large report must survive a PIPE ────────────────────────────────────────────────
+  console.log("\n36. a large report must survive a PIPE, not only a file");
+  {
+    // `console.log` to a pipe is ASYNCHRONOUS in Node, and `process.exit()` after it discards
+    // whatever is still queued. `spawnSync` here gives the child a PIPE, which is exactly how every
+    // real consumer reads it (`--json | jq`). Before the fix this truncated at the 64 KiB pipe
+    // buffer on 10/10 runs, with the exit code still looking correct.
+    const args = [];
+    for (let i = 0; i < 600; i += 1) args.push("--surface", path.join(TMP, "bulk", `s${i}`));
+    const v = run([...args, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--json"]);
+    eq("the run exits 1 (unstamped surfaces)", v.code, 1);
+    eq("the report is larger than a pipe buffer", v.stdout.length > 65536, true);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(v.stdout);
+    } catch {
+      parsed = null;
+    }
+    eq("and the whole report arrived (valid, complete JSON)", parsed === null, false);
+    eq("every surface is in it", parsed === null ? -1 : parsed.results.length, 600);
+  }
+
+  // ── 37. a VALID stamp with an unexpected deep key must not crash --json either ───────────
+  console.log("\n37. a valid stamp carrying an unexpected deep key must not crash --json");
+  {
+    stampNow();
+    const good = stamp();
+    const base = JSON.stringify(good, null, 2);
+    const deep = '{"a":'.repeat(8000) + "1" + "}".repeat(8000);
+    const withExtra = base.replace(/\n\}\s*$/, `,\n  "extra": ${deep}\n}\n`);
+    eq("the fixture really does carry the extra key", withExtra.includes("\"extra\""), true);
+    fs.writeFileSync(path.join(SURFACE, ".agent-infra-stamp.json"), withExtra);
+    const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--json"]);
+    eq("a valid stamp with a deep extra key → exit 0", v.code, 0);
+    eq("--json still produces a report", v.stdout.length > 0, true);
+    eq("no stack overflow on stderr", v.stderr.includes("Maximum call stack"), false);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(v.stdout);
+    } catch {
+      parsed = null;
+    }
+    eq("and the verdict is in-sync", parsed === null ? null : parsed.results[0].verdict, "in-sync");
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the restored stamp is green", verify().code, 0);
+  }
+
+  // ── 38. a case-variant spelling of the stamp is still the stamp ───────────────────────────
+  console.log("\n38. a case-variant spelling of the stamp must not become payload");
+  {
+    const s4 = path.join(TMP, "casefold");
+    fs.mkdirSync(path.join(s4, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s4, "skills"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s4);
+    fs.symlinkSync(".", path.join(s4, "scripts"));
+    eq("control — the self-referential surface stamps", run(["--write", "--surface", s4, "--repo", ORIGIN]).code, 0);
+    eq(
+      "control — and verifies",
+      run(["--surface", s4, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      0
+    );
+    const upper = ".AGENT-INFRA-STAMP.JSON";
+    fs.renameSync(path.join(s4, ".agent-infra-stamp.json"), path.join(s4, upper));
+    // On a case-INSENSITIVE filesystem the same file is now reachable by either spelling.
+    if (fs.existsSync(path.join(s4, ".agent-infra-stamp.json"))) {
+      // It must still be recognised as the surface's own stamp — it was drift before the fix.
+      eq(
+        "a case-variant stamp is not digested",
+        run(["--surface", s4, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+    } else {
+      // Case-SENSITIVE filesystem: the differently-cased name is a genuinely different file and
+      // MUST stay payload — excluding it by name would be a hole. Create it BEFORE stamping so the
+      // stamp legitimately covers it, and assert tampering goes red. (The old form of this branch
+      // asserted `true === true`, a gate that cannot fire — and every CI runner here is Linux, so on
+      // CI the arm tested nothing at all.)
+      fs.writeFileSync(path.join(s4, upper), "not a stamp\n");
+      eq("control — stamps with a differently-cased sibling present", run(["--write", "--surface", s4, "--repo", ORIGIN]).code, 0);
+      eq(
+        "control — and is green",
+        run(["--surface", s4, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+      fs.writeFileSync(path.join(s4, upper), "tampered\n");
+      eq(
+        "a differently-cased SIBLING is payload — tampering with it goes red",
+        run(["--surface", s4, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        1
+      );
+      // ⛔ Do NOT delete it here: the stamp currently IS this file (it was renamed to this spelling
+      // above), and the shared cleanup renames it back — removing it crashed the whole suite with
+      // ENOENT on a case-SENSITIVE filesystem, i.e. on every CI runner. The temp dir is destroyed in
+      // `finally`, so leaving the content behind is harmless.
+    }
+    fs.renameSync(path.join(s4, upper), path.join(s4, ".agent-infra-stamp.json"));
+    fs.rmSync(s4, { recursive: true, force: true });
+  }
+
+  // ── 39. a file named like our temp sibling is PAYLOAD, not ours ────────────────────────
+  console.log("\n39. a file named like our temp sibling is PAYLOAD, not ours");
+  {
+    // The exclusion must be anchored to the surface's own directory. Matching `<stamp>.tmp-*` by
+    // NAME at any depth made an installed file — or a whole DIRECTORY — invisible to the digest, so
+    // a tampered payload still reported in-sync.
+    const s5 = path.join(TMP, "tmpname");
+    fs.mkdirSync(path.join(s5, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s5, "skills", "sub"), { recursive: true });
+    fs.symlinkSync(".", path.join(s5, "scripts"));
+    const evil = path.join(s5, "skills", "sub", ".agent-infra-stamp.json.tmp-evil.sh");
+    fs.writeFileSync(evil, "payload-v1\n");
+    eq("control — stamps with the oddly-named file present", run(["--write", "--surface", s5, "--repo", ORIGIN]).code, 0);
+    eq("control — green", run(["--surface", s5, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+    fs.writeFileSync(evil, "TAMPERED\n");
+    eq(
+      "tampering with a <stamp>.tmp-* file at depth is DRIFT",
+      run(["--surface", s5, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    fs.rmSync(evil);
+    const evilDir = path.join(s5, "extensions", ".agent-infra-stamp.json.tmp-d");
+    fs.mkdirSync(evilDir, { recursive: true });
+    fs.writeFileSync(path.join(evilDir, "evil.ts"), "export const evil = 1;\n");
+    eq("control — stamps with the oddly-named DIRECTORY present", run(["--write", "--surface", s5, "--repo", ORIGIN]).code, 0);
+    eq("control — green", run(["--surface", s5, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+    fs.writeFileSync(path.join(evilDir, "evil.ts"), "export const evil = 2;\n");
+    eq(
+      "tampering INSIDE a <stamp>.tmp-* directory is DRIFT",
+      run(["--surface", s5, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    fs.rmSync(s5, { recursive: true, force: true });
+  }
+
+  // ── 40. a hardlink to the stamp under a payload root must not break --write ─────────────
+  console.log("\n40. a hardlink to the stamp under a payload root must not break --write");
+  {
+    // Excluding by IDENTITY alone made `--write` non-idempotent here: it hashed with the link
+    // excluded, then the rename installed a NEW inode, so the link became a normal payload file and
+    // the surface sat in drift that no further --write could clear.
+    const s6 = path.join(TMP, "hardlink");
+    fs.mkdirSync(path.join(s6, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s6, "skills"), { recursive: true });
+    fs.symlinkSync(".", path.join(s6, "scripts"));
+    write("extensions/e.ts", "export const e = 1;\n", s6);
+    eq("control — stamps", run(["--write", "--surface", s6, "--repo", ORIGIN]).code, 0);
+    fs.linkSync(path.join(s6, ".agent-infra-stamp.json"), path.join(s6, "skills", ".agent-infra-stamp.json"));
+    eq(
+      "a hardlink has its own PATH, so it is payload and the surface drifts",
+      run(["--surface", s6, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    eq("control — --write converges", run(["--write", "--surface", s6, "--repo", ORIGIN]).code, 0);
+    const after = run(["--surface", s6, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+    eq("control — and verify AGREES after that write", after.code, 0);
+    eq("control — a second write then verifies too", run(["--write", "--surface", s6, "--repo", ORIGIN]).code, 0);
+    eq(
+      "control — still agreed",
+      run(["--surface", s6, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      0
+    );
+    fs.rmSync(s6, { recursive: true, force: true });
+  }
+
+  // ── 41. --json must mean JSON on the write and help paths too ─────────────────────────
+  console.log("\n41. --json means JSON on the write and help paths too");
+  {
+    const s7 = path.join(TMP, "jsonwrite");
+    fs.mkdirSync(path.join(s7, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s7, "skills"), { recursive: true });
+    fs.mkdirSync(path.join(s7, "scripts"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s7);
+    const w = run(["--write", "--json", "--surface", s7, "--repo", ORIGIN]);
+    eq("--write --json exits 0", w.code, 0);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(w.stdout);
+    } catch {
+      parsed = null;
+    }
+    eq("--write --json prints parseable JSON (not a human line)", parsed === null, false);
+    eq("and it names the surface it wrote", parsed === null ? null : parsed.written[0].surface, s7);
+    const h = run(["--json", "--help"]);
+    eq("--json --help exits 0", h.code, 0);
+    let hp = null;
+    try {
+      hp = JSON.parse(h.stdout);
+    } catch {
+      hp = null;
+    }
+    eq("--json --help prints parseable JSON", hp === null, false);
+    fs.rmSync(s7, { recursive: true, force: true });
+  }
+
+  // ── 42. an unreadable DEFAULT repos root must end the scan, not empty it ────────────────
+  console.log("\n42. an unreadable DEFAULT repos root must end the scan, not silently empty it");
+  {
+    // The default root is $HOME/Documents/GitHub. Absence there is legitimate (no linked repos);
+    // being UNABLE TO READ it is not — collapsing EACCES to [] reported a green over a scope nobody
+    // read, which on this box is every linked repo.
+    const h = path.join(TMP, "fakehome");
+    const defRoot = path.join(h, "Documents", "GitHub");
+    fs.mkdirSync(path.join(defRoot, "repoX", "scripts"), { recursive: true });
+    // A dir counts as a LINKED repo only when it carries a stamp or the legacy version file.
+    fs.writeFileSync(path.join(defRoot, "repoX", ".agent-infra-version"), "0.1.0\n");
+    // The pi surface must EXIST too, so the default set is non-empty without repoX. Otherwise the
+    // mutant that collapses EACCES to [] still exits 2 ("no surfaces found") and the arm cannot
+    // tell the two apart — a check that cannot fail, which is the defect this arm exists to guard.
+    fs.mkdirSync(path.join(h, ".pi", "agent", "scripts"), { recursive: true });
+    // Hermetic: `run()` merges `process.env`, so an AMBIENT $AGENT_INFRA_REPOS_ROOT or
+    // $AGENT_INFRA_PI_HOME (which BOTH take precedence over $HOME) would silently redirect the arm —
+    // and on a box that sets these documented variables the suite would go red on a healthy change.
+    const env = { HOME: h, AGENT_INFRA_REPOS_ROOT: "", AGENT_INFRA_PI_HOME: "" };
+    const c = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch"], { env });
+    eq("control — the default root IS scanned", c.stdout.includes("repoX"), true);
+    eq("control — and the pi surface is there too", c.stdout.includes(path.join(h, ".pi", "agent")), true);
+    fs.chmodSync(defRoot, 0o000);
+    try {
+      const u = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch"], { env });
+      eq("an unreadable default root is exit 2 (cannot verify)", u.code, 2);
+      eq("and it names the root it could not read", u.stderr.includes(defRoot), true);
+      eq("and says so rather than reporting an empty scope", u.stdout.includes("repoX"), false);
+    } finally {
+      fs.chmodSync(defRoot, 0o755);
+    }
+    fs.rmSync(h, { recursive: true, force: true });
+  }
+
+  // ── 43. in-sync prints WHY ──────────────────────────────────────────────────────────────
+  console.log("\n43. in-sync prints why, so a stale-but-faithful install is legible");
+  {
+    // HONEST SCOPE promises the commit and its relation are printed for the reader. Suppressing
+    // `reason` for in-sync withheld exactly that, from exactly the verdict the promise is about.
+    stampNow();
+    const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch"]);
+    eq("control — in-sync", v.code, 0);
+    eq("the reason line is printed for in-sync too", v.stdout.includes("payload matches its stamp"), true);
+  }
+
+  // ── 44. a payload root spelled in a different CASE is still the surface root ─────────────
+  console.log("\n44. a payload root spelled in a different CASE is still the surface root");
+  {
+    // `realpathSync` echoes the case it was ASKED about, so a symlink target reading `CASEANCHOR` for
+    // an on-disk `caseanchor` made a path-STRING anchor miss: the real stamp was digested as payload
+    // and write/verify diverged forever, reporting a false drift that no --write could clear. The
+    // parent is compared by IDENTITY now. Only meaningful where the filesystem lets one directory be
+    // reached by another spelling, so the whole arm is skipped where it cannot be exercised.
+    const s8 = path.join(TMP, "caseanchor");
+    fs.mkdirSync(path.join(s8, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s8, "skills"), { recursive: true });
+    fs.mkdirSync(path.join(s8, "scripts"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s8);
+    const spelledUpper = path.join(path.dirname(s8), "CASEANCHOR");
+    if (fs.existsSync(spelledUpper)) {
+      fs.rmSync(path.join(s8, "scripts"), { recursive: true });
+      fs.symlinkSync(spelledUpper, path.join(s8, "scripts"));
+      const ra = fs.statSync(fs.realpathSync(path.join(s8, "scripts")));
+      const rb = fs.statSync(s8);
+      eq(
+        "the case-variant root link really is the same directory",
+        `${ra.dev}:${ra.ino}`,
+        `${rb.dev}:${rb.ino}`
+      );
+      // ...and prove the SPELLING really differs, or the anchor is untested (the realpath above
+      // presents the case it was asked about, so this is the string a path comparison would see).
+      eq(
+        "...and it is spelled differently from the surface path",
+        fs.realpathSync(path.join(s8, "scripts")) === fs.realpathSync(s8),
+        false
+      );
+      eq("control — stamps through the case-variant root", run(["--write", "--surface", s8, "--repo", ORIGIN]).code, 0);
+      eq(
+        "control — and converges (the stamp is not digested)",
+        run(["--surface", s8, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+      eq("control — a second write still converges", run(["--write", "--surface", s8, "--repo", ORIGIN]).code, 0);
+      eq(
+        "control — and still agrees",
+        run(["--surface", s8, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+    } else {
+      // Case-SENSITIVE filesystem: `<T>/CASEANCHOR` is a genuinely DIFFERENT directory, so the
+      // odd-spelling case cannot arise here — but an inert `eq(label, true, true)` would mean the
+      // anchoring rule is untested on the platform that gates the PR (every CI runner is Linux).
+      // Assert the OTHER direction instead: a stamp-named file inside that OTHER directory is
+      // payload, not ours, so tampering with it must go red.
+      fs.rmSync(path.join(s8, "scripts"), { recursive: true });
+      fs.mkdirSync(spelledUpper, { recursive: true });
+      fs.writeFileSync(path.join(spelledUpper, ".agent-infra-stamp.json"), "not our stamp\n");
+      fs.symlinkSync(spelledUpper, path.join(s8, "scripts"));
+      eq(
+        "control — stamps with the other directory's stamp-named file present",
+        run(["--write", "--surface", s8, "--repo", ORIGIN]).code,
+        0
+      );
+      eq(
+        "control — and is green",
+        run(["--surface", s8, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+      fs.writeFileSync(path.join(spelledUpper, ".agent-infra-stamp.json"), "tampered\n");
+      eq(
+        "a stamp-named file in ANOTHER directory is payload — tampering goes red",
+        run(["--surface", s8, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        1
+      );
+      fs.rmSync(spelledUpper, { recursive: true, force: true });
+    }
+    fs.rmSync(s8, { recursive: true, force: true });
+  }
+
+  // ── 45. --write --json on a bad surface still prints JSON ────────────────────────────────
+  console.log("\n45. --write --json refuses with JSON, never empty stdout");
+  {
+    // The "never CONJURE a surface" refusal returned 2 with EMPTY stdout, so a consumer scanning a
+    // repo list could not tell which entries had already been written.
+    const bad = path.join(TMP, "nope-nope-not-here");
+    const w = run(["--write", "--json", "--surface", bad, "--repo", ORIGIN]);
+    eq("exit 2", w.code, 2);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(w.stdout);
+    } catch {
+      parsed = null;
+    }
+    eq("parseable JSON on stdout, not empty", parsed === null, false);
+    eq("the refusal is named", typeof parsed?.error === "string", true);
+    eq("and nothing was created", fs.existsSync(bad), false);
+  }
+
+  // ── 46. a DIRECTORY named like our temp is somebody else's data ──────────────────────────
+  console.log("\n46. a DIRECTORY named like our temp is somebody else's data");
+  {
+    // The temp this tool creates is a FILE. Excluding `.tmp-*` by name alone hid a DIRECTORY of that
+    // name — and its entire subtree — when a payload root resolves to the surface root.
+    const s9 = path.join(TMP, "tmpdir");
+    fs.mkdirSync(path.join(s9, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s9, "skills"), { recursive: true });
+    fs.symlinkSync(".", path.join(s9, "scripts"));
+    const d = path.join(s9, ".agent-infra-stamp.json.tmp-d");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "x.ts"), "v1\n");
+    eq("control — stamps with the directory present", run(["--write", "--surface", s9, "--repo", ORIGIN]).code, 0);
+    eq("control — green", run(["--surface", s9, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+    fs.writeFileSync(path.join(d, "x.ts"), "v2\n");
+    eq(
+      "tampering inside it is DRIFT",
+      run(["--surface", s9, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    fs.rmSync(s9, { recursive: true, force: true });
+  }
+
+  // ── 47. EVERY --json refusal puts JSON on stdout ─────────────────────────────────
+  console.log("\n47. EVERY --json refusal puts JSON on stdout");
+  {
+    // A refusal that exits 2 with EMPTY stdout is unparseable: a caller iterating ~20 repos cannot
+    // tell a clean refusal from a crash, nor which entry failed. An earlier version of this arm was
+    // NAMED for every refusal but exercised only two of them — so three sites stayed bare and the
+    // name asserted a coverage that did not exist. Hence one case per site below.
+    const checkJson = (label, args, env) => {
+      const v = run(args, env === undefined ? undefined : { env });
+      eq(`${label} → exit 2`, v.code, 2);
+      let parsed = null;
+      try {
+        parsed = JSON.parse(v.stdout);
+      } catch {
+        parsed = null;
+      }
+      eq(`${label} → parseable JSON naming the failure`, parsed !== null && typeof parsed.error === "string", true);
+    };
+
+    const noManifest = path.join(TMP, "arm47-norepo");
+    const manifestOnly = path.join(TMP, "arm47-nogit");
+    const emptyHome = path.join(TMP, "arm47-home");
+    for (const d of [noManifest, manifestOnly, emptyHome]) fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(manifestOnly, "manifest.json"), "{}\n");
+
+    checkJson("bad usage", ["--json", "--ref"]);
+    // The bad-ref refusal inside the fetch path — the eighth site. ⛔ `--surface` is REQUIRED here:
+    // without it `defaultSurfaces` runs first, and on a CI runner with no `~/.pi/agent` and no
+    // linked repos the run refuses at the "no surfaces found" site instead. `checkJson` asserts only
+    // exit 2 + a JSON error, so the case would PASS while never reaching the site it was added for —
+    // a gate that cannot fire, on exactly the platform that gates the PR. Without `--no-fetch`: the
+    // ref-name guard refuses before any network call, so this stays offline.
+    checkJson("bad ref", ["--json", "--surface", SURFACE, "--repo", ORIGIN, "--ref", "origin/--upload-pack=x"]);
+    checkJson("no manifest.json", ["--json", "--repo", noManifest, "--ref", "main", "--no-fetch"]);
+    checkJson("git unavailable", ["--json", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], { PATH: "/nonexistent" });
+    checkJson("not a git checkout", ["--json", "--repo", manifestOnly, "--ref", "main", "--no-fetch"]);
+    checkJson("unresolvable ref", ["--json", "--surface", SURFACE, "--repo", ORIGIN, "--ref", "no-such-ref-xyz", "--no-fetch"]);
+    checkJson("unreadable named repos root", [
+      "--json",
+      "--repos-root",
+      path.join(TMP, "arm47-absent"),
+      "--repo",
+      ORIGIN,
+      "--ref",
+      "main",
+      "--no-fetch",
+    ]);
+    checkJson("empty surface set", ["--no-repos", "--json", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], {
+      HOME: emptyHome,
+      AGENT_INFRA_PI_HOME: "",
+      AGENT_INFRA_REPOS_ROOT: "",
+    });
+
+    // CONTROL — the human path is unchanged: text on stderr, still exit 2, and its STDOUT is not
+    // JSON. The stdout half matters: asserting only stderr let a change that drops the `if
+    // (opts.json)` from `refuseJson` leak a JSON object into the human path and still pass.
+    const human = run(["--repo", noManifest, "--ref", "main", "--no-fetch"]);
+    eq("control — the human path exits 2", human.code, 2);
+    eq("control — and prints text on stderr", human.stderr.includes("no agent-infra checkout"), true);
+    eq("control — and its stdout is NOT JSON", human.stdout.trim() === "", true);
+    // And the argv-scan bug this replaced: `--json` consumed as a VALUE must not switch the format on.
+    const eaten = run(["--repo", "--json", "--bogus"]);
+    eq("control — a `--json` eaten as a value does not enable JSON", eaten.stdout.includes("{"), false);
+
+    for (const d of [noManifest, manifestOnly, emptyHome]) fs.rmSync(d, { recursive: true, force: true });
+  }
+
+  // ── 48. file identity is unavailable when dev/ino are 0 ───────────────────────────
+  console.log("\n48. file identity is unavailable when dev/ino are 0");
+  {
+    // Some SMB/FUSE mounts report 0/0 for everything, so `0 === 0` would match every pair and the
+    // exclusion would claim "this is the surface's own directory" EVERYWHERE — excluding every
+    // stamp-named file at any depth, a fail-open wider than the path compare it replaced.
+    eq("a real identity is usable", identUsable({ dev: 16777220, ino: 12345 }), true);
+    eq("dev 0 alone is not enough to declare it unusable", identUsable({ dev: 0, ino: 7 }), true);
+    eq("ino 0 alone is not enough either", identUsable({ dev: 7, ino: 0 }), true);
+    eq("0/0 means unusable", identUsable({ dev: 0, ino: 0 }), false);
+  }
+
+  // ── 49. a file named __proto__ is payload, not a hole in the digest ────────────────
+  console.log("\n49. a file named __proto__ is payload, not a hole in the digest");
+  {
+    // The entry map was `{}`, and assigning to `out["__proto__"]` goes through the prototype
+    // SETTER: a string value is silently ignored, no own key is created, `Object.keys()` omits the
+    // file, and the digest never covers it. A file named `__proto__` at the top of a payload root
+    // could then be added, edited or re-pointed on ANY surface with the check still reporting
+    // in-sync — a fail-open in the one thing this tool promises to notice.
+    const s10 = path.join(TMP, "proto");
+    fs.mkdirSync(path.join(s10, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s10, "skills"), { recursive: true });
+    fs.mkdirSync(path.join(s10, "scripts"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s10);
+    const evil = path.join(s10, "scripts", "__proto__");
+    fs.writeFileSync(evil, "payload-v1\n");
+    eq("control — stamps with the oddly-named file present", run(["--write", "--surface", s10, "--repo", ORIGIN]).code, 0);
+    const stamped = JSON.parse(fs.readFileSync(path.join(s10, ".agent-infra-stamp.json"), "utf8"));
+    eq("it is COUNTED in the stamp (extensions/e.ts + scripts/__proto__)", stamped.payload.files, 2);
+    eq("control — green", run(["--surface", s10, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+    fs.writeFileSync(evil, "TAMPERED\n");
+    eq(
+      "tampering with a file named __proto__ is DRIFT",
+      run(["--surface", s10, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    fs.rmSync(s10, { recursive: true, force: true });
+  }
+
+  // ── 50. --json AFTER the offending token still answers in JSON ─────────────────────
+  console.log("\n50. --json AFTER the offending token still answers in JSON");
+  {
+    // The flag was recorded only when `parseArgs` reached its case, so it threw before getting
+    // there and a caller who DID pass `--json` got exit 2 with EMPTY stdout — the exact unparseable
+    // state the helper exists to prevent. The scan must be value-aware in BOTH directions.
+    const late = run(["--repo", "", "--json"]);
+    eq("an empty --repo exits 2", late.code, 2);
+    let p = null;
+    try {
+      p = JSON.parse(late.stdout);
+    } catch {
+      p = null;
+    }
+    eq("and still prints parseable JSON", p === null, false);
+    // The other direction, again: `--json` eaten as a VALUE must not switch the format on.
+    const eaten = run(["--repo", "--json", "--bogus"]);
+    eq("control — a value that looks like --json does not enable JSON", eaten.stdout.includes("{"), false);
+  }
+
+} finally {
+  fs.rmSync(TMP, { recursive: true, force: true });
+}
+
+console.log("");
+if (failed === 0) {
+  console.log(`✅ check-version-stamp suite: ${passed} assertion(s) passed`);
+  process.exit(0);
+}
+console.log(`❌ check-version-stamp suite: ${failed} of ${passed + failed} assertion(s) FAILED`);
+for (const f of failures) console.log(`   - ${f}`);
+process.exit(1);

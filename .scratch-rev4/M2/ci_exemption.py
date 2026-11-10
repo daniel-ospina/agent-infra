@@ -1,0 +1,3311 @@
+"""ci_exemption.py — the rail's ONE module for #3756 (tortoise #3756).
+
+THIS FILE IS TWO HALVES, DELIBERATELY, IN ONE MODULE. The FAILED-id parser (the
+rail extractor, PR #1165) is the BASE; the rate/signature/decision engine (PR
+#1147) is built ON TOP of that parser — **never beside it**. Everything that needs
+to know which failures a run reported goes through :func:`parse_failed_ids`, so
+the shell rail and the decision can never disagree about the id universe.
+
+HALF 1 — THE CANONICAL FAILED-ID PARSER (``ids``)
+
+Two defects motivated it:
+
+* **DEFECT 1 — an unparseable token must not become a failure id.** The shell
+  rail used to print whatever token followed a bare ``FAILED`` field, so English
+  prose (``may``) entered the failure set as if it were a nodeid. A garbage id
+  matches nothing on main: it can never be subtracted or verified, so it reads as
+  "unique to this PR" on EVERY rail run for EVERY PR whose log contains that
+  fragment — a permanent false refusal. The remedy is split by position: the
+  payload of a **leading** ``FAILED``/``ERROR`` that is not a test id is
+  **DROPPED, COUNTED and REPORTED** as UNATTRIBUTABLE (fail-closed), while a
+  **non-leading** field whose payload is not a nodeid is PROSE and is SKIPPED —
+  counting the workflow's own echoed shell source as a drop marks every set
+  CLIPPED and blocks merges fleet-wide (#1396). See :func:`_failed_candidate`.
+* **DEFECT 2 — a MOVING identity is not an attribution.** Within one concluded
+  cycle the same head's failure ids can shift across the re-run boundary (one id
+  replaced by another). :func:`detect_rotating_identity` names the class that was
+  red across runs with a NON-CONSTANT id, so a decision sees UNATTRIBUTABLE
+  rather than a PR-unique failure (or a silent exemption) it cannot justify.
+
+HALF 1b — GUARD-STEP ATTRIBUTION (#4469)
+
+The id universe was pytest nodeids ONLY, so a failing run whose failure lives in a
+non-pytest **guard step** (an orphan-count assert, a packaging guard, a health
+gate) yielded NO id. ``examined=1 / extracted=0`` then tripped the rail's
+fail-closed refusal ("yielded NO parseable 'FAILED <nodeid>' line … This is a
+refusal") and the merge could not proceed through the sanctioned path — even
+though the failure was real, attributable, and often a flaky guard owned by
+another lane. That class is the one most likely to be flaky, and the rail could
+neither compare it against main nor certify it as new.
+
+A GitHub Actions error ANNOTATION in a failing step therefore becomes an identity
+in the set — keyed by the failing STEP plus the error shape — so it participates
+in the PR-vs-main comparison exactly like a test nodeid. The fail-closed refusal
+is PRESERVED, on THREE conditions that are the whole safety of this half:
+
+* the annotation is only an identity when it comes from a step the RUNNER ITSELF
+  marked failed (its non-zero ``Process completed with exit code <N>.``), because
+  an annotation printed by a step that did not fail the run is not evidence of a
+  failure — junk in the union is a zero-evidence pass;
+* the run's ROOT failing step — the FIRST one the runner marked, keyed by
+  **(job, step)** because matrix legs run same-NAMED steps — must YIELD an
+  identity (a ``FAILED`` nodeid on its lines, or a substantive annotation);
+  otherwise the run contributes NO guard identity even when a LATER step carries a
+  perfectly good annotation; and
+* a step that shows pytest's own failure output (``E   <exception>``) must yield a
+  NODEID. An annotation is not that classification, so the run is refused — the
+  cycle-3 ``ImportError: no module named y`` case, which prints ``E   ImportError``
+  and no ``FAILED`` line, and which would otherwise be LAUNDERED by a sibling — or
+  same-step — annotation, letting ``examined > extracted`` pass and ``decide``
+  certify a run whose real failure was never classified.
+
+A DECLARED RESIDUAL remains (agent-infra #1366): an unparseable failure that
+leaves NO pytest-shaped line AND whose step is not the root — e.g. a guard root
+attributed first, then a non-pytest step failing with bare prose. Closing it needs
+per-step conclusions from the run metadata. See :func:`guard_step_failures` and
+the measured capture this is grounded on.
+
+HALF 1c — PIPELINE-COMPLIANCE GATE ATTRIBUTION (#1185)
+
+`scripts/check-pipeline-compliance.sh` announces a failure in a THIRD shape —
+``❌ [<letter>] <reason> for/on <subject>`` — and neither half above could see it,
+so the DOMINANT red in the queue (measured 2026-10-24: ``pipeline-compliance (c)``
+over all 70 open agent-infra PRs) was reported as unattributable while the log
+named it in plain text. The check letter plus the message's first clause therefore
+become an identity (``pipeline-compliance::<letter>::<subject-slug>``), so the
+refusal says what the check says — ``blocked by check (c): …`` — instead of
+"we cannot say why". Attribution is still not exemption: see
+:func:`pipeline_check_failures`.
+
+HALF 2 — THE PRE-MERGE EXEMPTION DECISION (``signatures``, ``decide``)
+
+The pre-merge classifier used to decide ownership of a failure by MEMBERSHIP IN A
+SAMPLE OF MAIN::
+
+    unique-to-PR = (PR failing ids) - (union of main-failing ids over last N runs)
+
+That is unsound in BOTH directions, and both directions are a defect:
+
+* **face 1 (over-block, fail-closed).** A non-deterministic main-side failure whose
+  recent main runs happened to be green reads as novel -> a clean PR is blocked.
+  Costs a cycle. A COST, not a bypass.
+* **face 2 (fail-OPEN, category A).** Any id that appears even ONCE in main's window
+  is subtracted forever, so a PR that genuinely BREAKS that id is EXCUSED and the
+  gate reports green. Reachable today.
+
+The invariant this module exists to enforce:
+
+    A test that fails on ``origin/main`` WITHOUT the PR's diff is NEVER PR-unique --
+    and a test must never be labelled PR-unique FROM A SINGLE SAMPLE.
+
+The fix reasons about the EFFECT ("did this PR change the failure rate?") rather
+than about the sample, which makes the decision **signature-scoped**, **rate-
+compared** and **visible**:
+
+* **signature-scoped** -- an exemption covers the failure that was measured on main,
+  not the whole node id. A PR that holds the same RATE while breaking a DIFFERENT
+  assertion inside the same test is NOT exempt: same id, different signature.
+* **rate-compared** -- a declared ``K`` on the tree that has one; presence is never
+  sufficient. ``main 1/8`` vs ``PR 8/8`` is an eight-fold regression and must block; a
+  presence test ("it fails on main too") would excuse it. Where the PR sample is too
+  small to measure a rate that comparison is not made and the exemption rests on
+  attribution instead (#5250) — never on presence alone.
+* **visible** -- every exemption is RECORDED with the reason and the measurements it
+  rested on (both rates where a rate was measurable; main's rate and ``k_pr`` where it
+  was not). An exemption that exists only as an absence is the fail-open defect itself.
+
+And the parser is **fail-closed** (#3705's rule applied to the exemption parser):
+the union IS an allowlist, so junk in it is a zero-evidence pass. An unparseable or
+non-nodeid line must REFUSE the exemption and be COUNTED AND REPORTED -- never
+silently swallowed, never read as "no failures". The failure-key universe is a
+pytest nodeid, an attributable guard-step annotation (HALF 1b), OR — since #1185 —
+a `check-pipeline-compliance.sh` gate failure (HALF 1c); a line that is NONE of
+them is still refused, counted and reported.
+
+Pure functions only: no I/O, no network, no git — except :func:`_read`, the
+``ids`` CLI and the ``signatures`` CLI, which read the caller's own capture file.
+The caller supplies the observed numbers; this module decides, and explains.
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import re
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# Strict parsing — the union is an allowlist, so junk must not enter it
+# --------------------------------------------------------------------------
+
+#: A pytest nodeid: ``path/to/test_x.py::[Class::]name`` (params allowed).
+#: Deliberately anchored and narrow — anything else is REJECTED, not guessed.
+#:
+#: OVERRIDES: the ``_NODEID_LOOSE_RE`` rationale ("``_NODEID_RE`` stays narrow for
+#: the RATE/UNION parsers; widening it there would loosen their fail-closed check
+#: for no gain") — the ``/`` AND the SPACE in ``rest`` are ADMITTED, because that
+#: rationale's own premise, "for no gain", is measurably false. A pytest parameter
+#: legitimately carries a PATH (``::test_x[tools/cache_evict.py]``) and a SPACE
+#: (``::test_x[chromium-Claude Desktop]``), and the ``rest`` class already admitted
+#: ``[``/``]``/``.``/``:``/``-`` — the parameter-SYNTAX characters, NOT the whole
+#: parameter space (see the residual below) — so omitting them dropped main's rate
+#: row for EVERY such id. The consequence is not a formatting nicety, it is the
+#: exact failure mode :func:`is_failure_key`'s own docstring forbids: "a dropped
+#: main-side row makes the PR-side failure look unique, which BLOCKS".
+#: Measured on tortoise#11365: main's table carries all 10
+#: ``test_entry_point_python_guard.py`` rows — 3/25, 3/25, 1/25, 2/25, 2/25 PER ARM,
+#: five tools each, so ten rows across the two arms — and ``parse_rates`` rejected
+#: all 10, so a PR that touches none of those files was BLOCKed as "introduced"
+#: while the 11 non-path-parameterized main-reds on the same run were correctly
+#: EXEMPT. Measured on #3686: ``…[argv14-at the EDGE]`` was ``STRICT False |
+#: LOOSE True`` here even after ``/`` was added, and ``parse_rates`` rejected the
+#: row main's table carried.
+#:
+#: The narrowness that the overridden rationale still justifies is RETAINED: the
+#: ``path`` group stays anchored, and the tail admits only
+#: ``[A-Za-z0-9_\[\]\-.:/ ]`` — no tab, no empty tail, no missing ``::``.
+#:
+#: ⛔ THE SPACE TOOK THREE DOORS, NOT ONE, AND ALL THREE ARE CLOSED HERE. Besides
+#: this class, ``_RATES_RE``'s nodeid group was ``\S+`` (now ``[^\t]+``) and
+#: ``scripts/ci-failure-set.sh`` built the table with ``sort | uniq -c | awk
+#: '{ c=$1; $1=""; … }'`` — and ``$1 = ""`` REBUILDS ``$0`` joined by OFS, so a
+#: whitespace RUN collapsed to one space, under a key the PR side can never
+#: produce (now ``sub(/^ *[0-9]+ +/, "")``, which edits the record in place). A fix
+#: to one door alone would have left the id dropped. Pinned end to end by
+#: ``tests/test_ci_exemption.py`` (both doors) and
+#: ``tests/test_ci_exemption_producer.py`` (the producer/reader wire format).
+#:
+#: ⛔ KNOWN RESIDUAL — this is agent-infra#3691's, and it is no longer a whitespace
+#: class. `rest` is an ALLOWLIST (alnum, ``_``, ``[``, ``]``, ``.``, ``:``, ``-``,
+#: ``/``, space). Any real id outside it is dropped from MAIN's rate table and the
+#: silent-drop → "absent from main's failure set" → permanent BLOCK follows. The
+#: set is open-ended; every list written here was measurably short, so read the
+#: snapshot below as a MEASUREMENT and never as the class.
+#:
+#: MEASURED SNAPSHOT (review of agent-infra#3687, 2026-11-07). Collecting this
+#: repo's SHIPPED suites (``pytest tests/ scripts/test_pr_doctor.py
+#: --collect-only`` → 1891 ids) leaves 19 ids loose-accepted / strict-rejected: 10
+#: in shipped suites, 9 under ``tests/fixtures/`` (no CI job collects those).
+#: Three of the ten are in ``scripts/test_pr_doctor.py``, which ``ci.yml``'s
+#: ``test`` job runs — ``…test_capacity_rejects_a_bad_value_and_uses_the_default[+12]``,
+#: ``…[sleeps, then writes to stdout and stderr]``, ``…[writes at once, then
+#: sleeps]`` — and 7 are ``test_no_runner_or_hook_wrapper_is_ever_an_identity``'s
+#: wrapper annotations (``##[error]Bash exited with code '1'.`` …). Characters
+#: implicated in that snapshot: ``+ , ' # @``, plus ``( ) " \`` among the fixture
+#: ids. Each of those is ``\S``, so ``_RATES_RE`` matches the row today and the drop
+#: is ``rest`` ALONE — do not send a fixer to ``_RATES_RE`` for a comma.
+#: ``tests/test_ci_exemption.py::test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS``
+#: pins three of them and REDS on a widening, so a closure cannot ship as a claim
+#: without this comment being rewritten.
+#:
+#: WHICH CHARACTER TO ADMIT NEXT — pytest escapes PARAMS when needed (``[a\tb]``,
+#: ``[caf\xe9]``, ``[a\\b]`` — backslash sequences, no raw byte) but does NOT escape
+#: a test/class NAME (``def test_café`` emits the raw UTF-8 bytes ``c3 a9``). So the
+#: character to admit for the first is ``\``; the second needs a non-ASCII range,
+#: which ``\`` does not cover.
+#:
+#: Live, not hypothetical: the module's own
+#: ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id`` pins
+#: ``[chromium-Claude Desktop]`` as a REAL id the loose door must name. Tracked by
+#: agent-infra#3691.
+_NODEID_RE = re.compile(
+    r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
+    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/ ]+)$"
+)
+
+#: The tokens that open a failure record. One list, so the shell can never
+#: disagree with the module about which lines are records at all.
+_FAILED_FIELDS = ("FAILED", "ERROR")
+
+
+def _failed_candidate(line: str, *, recover_nodeid: bool = True) -> str | None:
+    """The failure token on ``line`` — leading RECORD or mid-line RECOVERY.
+
+    Two producers put a ``FAILED``/``ERROR`` field on a line, and the rule below
+    treats them differently on purpose — **drop accounting** and **id recovery**
+    are separate concerns:
+
+    * **A LEADING field opens a failure RECORD.** ``FAILED <payload>`` is the shape
+      pytest's ``-r fE`` summary emits. Its payload is returned as the candidate
+      for the caller to shape-check; a payload that is NOT a nodeid is a
+      malformed/truncated record and IS a DROP (:func:`parse_failed_ids` counts
+      it, which marks the set CLIPPED — fail-closed). The payload is taken the
+      SAME way the signature door takes it (``_SUMMARY_RE``: everything up to an
+      optional `` - <detail>``), NOT as the next whitespace field — a pytest
+      parameter id may contain spaces (``::test_x[chromium-Claude Desktop]``),
+      and splitting on whitespace would extract a TRUNCATED id that the signature
+      door does not produce, so ``main_signatures`` would miss and the rail would
+      block. Both doors must name the same id (module header, line 7).
+    * **A NON-LEADING field is prose UNLESS it introduces a nodeid.** A run log
+      ECHOES the workflow's own shell source, so a comment such as
+      ``# re-lists failures, so FAILED may double-count on the last tick;`` carries
+      a bare ``FAILED`` mid-sentence, and a tool's own message can too
+      (``[verification-gate] ❌ Verifier FAILED (unparseable verdict)``). Reading
+      the NEXT word there (``may``, ``lines``, ``(unparseable``) as a failed token
+      made the caller DROP it, and a dropped token marks the whole set CLIPPED /
+      NOT COMPARABLE to a measured zero — which in the vacuous branch blocks EVERY
+      merge repo-wide, green PRs with no failure included (agent-infra #1396,
+      tortoise #5194). Prose is not a record: it is SKIPPED, never counted. But a
+      non-leading field immediately followed by a **nodeid-shaped** token is an
+      authoritative identity and IS recovered — pytest-xdist's verbose progress
+      line has exactly that shape, status BEFORE nodeid
+      (``[gw0] [ 50%] FAILED tests/x.py::test_real``; pytest 9.x
+      ``_pytest/terminal.py``, the ``running_xdist`` branch). Recovering it keeps a
+      real failure in the set when the run's ``-r`` summary omits the failing
+      category. ⛔ Recovery is **raw-log only** (``recover_nodeid``); an id FILE
+      carries records, so a non-leading field there is a defect and is rejected,
+      never scanned (``raw_log=False``).
+      ⚠️ Recovery is NOT "fail-closed by construction": it ADDS an identity to
+      BOTH the PR set and main's union, and main's union is the exemption
+      ALLOWLIST — so a nodeid-shaped token that appears only in echoed prose would
+      buy a main-side id. That residue is pre-existing (the retired shell read had
+      the same reach and no nodeid requirement) and is bounded by the id's being
+      UNSIGNED in main's signature table — the subset rule then fails closed and
+      BLOCKS — but it is a declared residue, not a safety proof.
+
+    The return is deliberately three-valued:
+
+    * ``None`` — not a failure record and no recoverable nodeid (raw logs are
+      mostly prose): SKIPPED, and NOT a rejection either;
+    * ``''``  — a LEADING field was the last token: a truncated record, which IS a
+      rejection;
+    * ``<token>`` — the candidate (a nodeid, or a leading record's payload), which
+      the caller MUST shape-check before use.
+    """
+    fields = line.split()
+    if not fields:
+        return None
+    if fields[0] in _FAILED_FIELDS:
+        if len(fields) == 1:
+            return ""
+        # ⛔ A PROGRESS FRAGMENT IS NOT A FAILURE RECORD (#6917). A run log
+        # ECHOES pytest's progress output, and a leading `FAILED` can land in
+        # front of a bare percentage — `FAILED [  2%]`. That payload is not a
+        # malformed id: there is no id on the line AT ALL, it is progress output.
+        # Counting it as a DROP marks the whole set CLIPPED, and a CLIPPED set is
+        # NOT COMPARABLE to a measured zero (#1319) — so the PR cannot be
+        # certified however green it is, and every re-run RETRACTS the evidence
+        # and fails the same way. Measured on tortoise #6917: a PR with `PR=0`
+        # failing tests was refused, permanently, by `PR=2 | main=0` drops whose
+        # only named token was `[  2%]`.
+        #
+        # ⚠️ THIS TEST MUST RUN BEFORE `_SUMMARY_RE`. That pattern matches ANY
+        # `FAILED <payload>` (its nodeid group is `.+?`), so it accepts
+        # `[  2%]` as a nodeid and returns it — the check placed after it was
+        # unreachable, which is how the first attempt at this fix did nothing
+        # while looking correct.
+        #
+        # The test is deliberately NARROW — the ENTIRE payload must be a
+        # bracketed percentage, so a genuine malformed record still DROPS and
+        # still fails closed. This only stops a progress bar being read as one.
+        if _PROGRESS_FRAGMENT_RE.match(" ".join(fields[1:])):
+            return None
+        match = _SUMMARY_RE.match(line.strip())
+        if match:
+            return match.group("nodeid").strip()
+        return fields[1]
+    if not recover_nodeid:
+        # An id FILE holds records: a non-leading field is a defect, not a
+        # candidate. Recovery is a raw-log concern only.
+        return None
+    # Non-leading: recover only when the NEXT field is a nodeid (xdist progress).
+    for index, token in enumerate(fields[:-1]):
+        if token in _FAILED_FIELDS and _NODEID_LOOSE_RE.match(fields[index + 1]):
+            return fields[index + 1]
+    return None
+
+
+@dataclass
+class ParseResult:
+    """Parsed failure ids plus the lines that were REJECTED, and why.
+
+    ``rejected`` is not diagnostics — it is evidence. A non-zero count means the
+    union was filtered, and the reader is entitled to see it next to ``K`` and the
+    rates rather than take a silently-trimmed set on trust.
+    """
+
+    ids: list[str] = field(default_factory=list)
+    rejected: list[str] = field(default_factory=list)
+    #: The subset of ``ids`` derived from a non-pytest GUARD-STEP annotation
+    #: (#4469). Recorded separately so the caller REPORTS the attribution instead
+    #: of leaving it invisible among the nodeids.
+    guard_steps: list[str] = field(default_factory=list)
+    #: The subset of ``ids`` derived from NON-NODEID failure evidence (#6798) —
+    #: a pytest collection error or a watchdog kill. Recorded separately for the
+    #: same reason as ``guard_steps``: the operator must be able to see that the
+    #: run was attributed from a kill banner rather than from a test id, because
+    #: that is what decides whether the remedy is a re-run or a fix.
+    non_nodeid: list[str] = field(default_factory=list)
+    #: The subset of ``ids`` derived from a JS/TS RUNNER AGGREGATE — one per failing
+    #: test file. Reported separately for the same reason as the two above: it is
+    #: FILE-COARSE, and an operator must be able to see that the comparison happened
+    #: at file granularity rather than at test-id granularity.
+    runner: list[str] = field(default_factory=list)
+    #: The subset of ``ids`` derived from `run-bash-shards.sh`'s own attribution lines
+    #: (#2643/#2700) — the per-shard `❌ failed shard: <path>` and the recap
+    #: `❌ failing shard(s): <paths>` — one per failing bash shard, likewise FILE-COARSE.
+    bash_shard: list[str] = field(default_factory=list)
+    #: The `pipeline-compliance` gate ids that entered ``ids`` (#1185) — reported
+    #: separately for the same reason as the families above: this identity came
+    #: from a GATE CHECK, not from a test, so the remedy is the artifact the check
+    #: names (`record-review.sh` for (c), a scoping comment for (b)) rather than a
+    #: re-run.
+    pipeline_checks: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """False when the input yielded NO usable id at all.
+
+        Fail-closed: an unreadable failure set must never present as an empty one.
+        "I could not read main's failures" must not become "main has no failures",
+        because that would exempt every PR failure in the other direction and, used
+        as a PR set, would block nothing.
+        """
+        return bool(self.ids)
+
+
+def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
+    """Extract failure ids from a log — THE canonical id parser.
+
+    Two input shapes, ONE candidate rule (:func:`_failed_candidate`) and ONE
+    definition of "is this a test id" (``_NODEID_LOOSE_RE``), so the shell cannot
+    keep a second, weaker notion of a failure id:
+
+    * ``raw_log=False`` (default) — a file of ``FAILED <nodeid>`` / ``ERROR
+      <nodeid>`` records. A line whose FIRST field is not ``FAILED``/``ERROR`` is
+      **rejected**: in an id file, prose IS a defect (nothing else belongs there),
+      and the xdist id RECOVERY is deliberately NOT applied here — an id file
+      carries records, not a run log. No guard-step pass runs here — an id file IS
+      the set.
+    * ``raw_log=True`` — a raw ``gh run view --log-failed`` capture. ANSI SGR
+      escapes and the ``<job>\t<step>\t<ts>Z `` prefix are stripped, then the
+      leading record's payload — or a nodeid that directly follows a non-leading
+      ``FAILED``/``ERROR`` field (pytest-xdist's status-before-nodeid progress
+      line) — is shape-checked. A line with neither is not a failure record and is
+      skipped — a raw log is mostly prose, and rejecting every prose line would
+      drown the signal.
+      A second pass attributes non-pytest GUARD-STEP failures (#4469) from their
+      GitHub Actions error annotations, so a failure main can also be red on is
+      COMPARED rather than refused.
+
+    DROP ACCOUNTING IS LEADING-ONLY. The payload of a **leading**
+    ``FAILED``/``ERROR`` that is not a failure id is **DROPPED, COUNTED and
+    REPORTED** (``rejected``) and never enters ``ids`` — the #3756 ``may`` leak the
+    other way: an English word in the candidate position used to be emitted
+    verbatim as a failure id, and a garbage id matches nothing on main, so it reads
+    as "unique to this PR" on EVERY rail run for EVERY PR whose log contains that
+    fragment (a permanent false refusal). A **non-leading** field whose payload is
+    not a nodeid is PROSE: it is SKIPPED, never counted, because counting the
+    workflow's echoed shell source as a dropped token marks the whole set CLIPPED /
+    NOT COMPARABLE — which blocks EVERY merge repo-wide in the vacuous branch
+    (agent-infra #1396, tortoise #5194).
+
+    A leading record's payload is taken with :data:`_SUMMARY_RE` — the SAME match
+    the signature door uses — so both doors name the same id, including a
+    whitespace-bearing parameter id (``::test_x[chromium-Claude Desktop]``) that a
+    whitespace split would truncate.
+
+    This is the fail-closed rule: unknown resolves to *"not exempt"*, never to
+    *"exempt"*. Silent permissiveness here is a zero-evidence pass — and a
+    silently-CARRIED token is the permanent false refusal above.
+    """
+    ids: list[str] = []
+    rejected: list[str] = []
+    # The PREFIX-STRIPPED lines, kept so the passes below read the SAME text the
+    # record rule reads. Searching the RAW capture instead is a silent miss: every
+    # record line carries a `<job>\t<step>\t<ts>Z ` head, so an anchored pattern
+    # (`^={3,} WATCHDOG: …`) matches NOTHING — a fix that never fires, which is
+    # indistinguishable from an absent fix until a killed leg blocks the fleet
+    # again. It also lets the ANSI SGR escapes be stripped once, here, so the
+    # echoed-source discriminator the banner relies on is not defeated by colour.
+    # Bound BEFORE the loop because the id-file branch never enters the raw-log
+    # block below, and a name bound only there raises UnboundLocalError at the
+    # `return` — the `ids` CLI would crash on EVERY id-file input, not merely
+    # the new ones.
+    non_nodeid: list[str] = []
+    for raw in lines.splitlines():
+        if raw_log:
+            line = _strip_log_prefix(_ANSI_RE.sub("", raw)).strip()
+            if not line:
+                continue
+            candidate = _failed_candidate(line, recover_nodeid=raw_log)
+            if candidate is None:
+                # Not a failure record. Skipped, NOT rejected.
+                continue
+            unit = candidate
+        else:
+            line = raw.strip()
+            if not line:
+                continue
+            candidate = _failed_candidate(line, recover_nodeid=raw_log)
+            if candidate is None:
+                rejected.append(line)
+                continue
+            unit = line
+        if not _NODEID_LOOSE_RE.match(candidate):
+            # #6798: a COLLECTION ERROR is an ATTRIBUTION, not an unattributable
+            # token. pytest reports it as `ERROR <path> - <reason>` with no
+            # `::nodeid`, so the shape check above would DROP it — and a drop
+            # marks the set CLIPPED while the run yields nothing, which is the
+            # permanent refusal. Intercepted BEFORE the drop accounting so the
+            # identity is extracted, never counted as a defect in the capture.
+            # A `FAILED <path>.py` (no `::`) is NOT one of these: pytest emits
+            # collection errors under `ERROR` only.
+            if raw_log:
+                collect_id = _collection_error_id(line)
+                if collect_id is not None:
+                    ids.append(collect_id)
+                    non_nodeid.append(collect_id)
+                    continue
+            # The unit reported is the offending TOKEN in log mode (the line may
+            # be a whole megabyte of prose prefixed by a stray `FAILED`), and the
+            # offending LINE in id-file mode (where the line IS the record).
+            rejected.append(unit)
+            continue
+        ids.append(candidate)
+    guard_steps: list[str] = []
+    if raw_log:
+        # Pass 2 — GUARD-STEP failures (#4469). A non-pytest step announces its
+        # failure with a GitHub Actions error ANNOTATION, which the FAILED-field
+        # pass above cannot see. Those become ids too, so a guard-step failure is
+        # COMPARED instead of refused. Deliberately not done for an id-file
+        # (raw_log=False): there the file IS the id set already.
+        guard_steps, _guard_signatures = guard_step_failures(lines)
+        ids.extend(guard_steps)
+        # A guard key that IS a shard identity (#3105) is reported with the SHARD family, not
+        # the guard-step one: the operator's remedy for a red shard is the shard, and a
+        # `guard-steps=` count that included shard ids would name the wrong surface. The id is
+        # unchanged either way — only the label it is reported under moves.
+        shard_from_guard = [
+            key for key in guard_steps if key.startswith(_BASH_SHARD_KEY_PREFIX)
+        ]
+        guard_steps = [
+            key for key in guard_steps if not key.startswith(_BASH_SHARD_KEY_PREFIX)
+        ]
+        # Pass 3 — NON-NODEID failure evidence (#6798). A watchdog kill leaves no
+        # nodeid and no annotation: the capture's only evidence is the kill
+        # banner, so no shape-checking pass above can see it. Same treatment and
+        # the same reason — COMPARED instead of refused. Also raw-log only, and
+        # read through the SAME helper the `signatures` door uses, so the two
+        # doors cannot disagree about this universe.
+        non_nodeid, _non_nodeid_signatures = non_nodeid_failures(lines)
+        ids.extend(non_nodeid)
+        # Pass 5 — JS/TS RUNNER AGGREGATES. Same treatment, same reason: a failing
+        # extension test has no pytest nodeid, and refusing to attribute it stopped
+        # EVERY merge while main carried one (measured). ⚠️ "…and no annotation" is
+        # NO LONGER TRUE and was true only of the shape measured then: since
+        # #2188/#2194 the ci-main harness and `test-discard-gate.mjs` DO print
+        # guard-step annotations (pass 2), so a per-case failure in that suite now
+        # yields a `guard-step::…` id as well. This family is retained because it is
+        # the only one that survives a suite that prints nothing but its own
+        # aggregate, and because it is the FILE-COARSE id — the coarser of the two for
+        # the same file, i.e. the one a baseline can compare against (#3756). Neither
+        # family replaces the other; both are produced from the same capture.
+        runner_ids, _runner_signatures = runner_aggregate_failures(lines)
+        ids.extend(runner_ids)
+        # Pass 6 — PIPELINE-COMPLIANCE gate failures (#1185). Same treatment and
+        # the same reason: `check-pipeline-compliance.sh` prints `❌ [<letter>] …`
+        # and no shape-checking pass above can see it, so the dominant red in the
+        # queue was refused as unattributable. Raw-log only, and read through the
+        # SAME helper the `signatures` door uses, so the two doors cannot disagree
+        # about this universe.
+        pipeline_ids, _pipeline_signatures = pipeline_check_failures(lines)
+        ids.extend(pipeline_ids)
+        # Pass 7 — BASH SHARD attribution (#2643). `run-bash-shards.sh` names each failing
+        # shard now; without this pass a capture whose only failure evidence is those lines
+        # still reads as unattributable, so the rail's refusal would survive the fix.
+        shard_ids, _shard_signatures = bash_shard_failures(lines)
+        # ...plus the ids the guard pass redirected here (#3105), so ONE shard failure is
+        # reported ONCE, under the family whose token it now carries.
+        shard_ids = sorted(set(list(shard_ids) + shard_from_guard))
+        ids.extend(shard_ids)
+    return ParseResult(
+        ids=sorted(set(ids)), rejected=rejected, guard_steps=guard_steps,
+        non_nodeid=sorted(set(non_nodeid)),
+        runner=sorted(set(runner_ids)) if raw_log else [],
+        bash_shard=sorted(set(shard_ids)) if raw_log else [],
+        pipeline_checks=sorted(set(pipeline_ids)) if raw_log else [],
+    )
+
+
+# --------------------------------------------------------------------------
+# The decision — signature-scoped, rate-compared, visible
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Rate:
+    """Failures observed over ``runs`` runs on one tree (PR or main)."""
+
+    failures: int
+    runs: int
+
+    @property
+    def rate(self) -> float:
+        return (self.failures / self.runs) if self.runs > 0 else 0.0
+
+    def __str__(self) -> str:  # "4/8 (50%)"
+        return f"{self.failures}/{self.runs} ({self.rate:.0%})"
+
+    def __gt__(self, other: object) -> bool:
+        """Compare by RATE, so a Rate is never silently compared by identity."""
+        if isinstance(other, Rate):
+            return self.rate > other.rate
+        return NotImplemented
+
+
+@dataclass(frozen=True)
+class RatesResult:
+    """The rate table read from ``ci-failure-set.sh --main-union-rates``."""
+
+    rates: dict[str, Rate] = field(default_factory=dict)
+    rejected: list[str] = field(default_factory=list)
+
+    @property
+    def runs(self) -> int:
+        """The declared K, or 0 when nothing was usable."""
+        return max((r.runs for r in self.rates.values()), default=0)
+
+
+#: ``<nodeid>\t<failures>\t<runs>``. ⛔ THE NODEID IS DELIMITED BY THE TAB, NOT
+#: BY ``\S`` (#3686 second door). ``\S+`` cannot carry the space a pytest
+#: parameter legitimately contains, so ``…[argv14-at the EDGE]\t3\t26`` — a row
+#: ``ci-failure-set.sh`` EMITS correctly — never even reached
+#: :func:`is_failure_key`, and the id read as PR-unique forever.
+#:
+#: ``[^\t]+`` is the SAME delimiting :data:`_SIG_ROW_RE` already uses on the
+#: signature table, and it is what makes the shape agree across the two tables.
+#: It does NOT loosen the fail-closed field check: the class excludes the tab, so
+#: the line must still be EXACTLY three tab-separated fields with two numeric
+#: tails — a fourth field, or a nodeid carrying a tab, still fails to match and is
+#: rejected. What the row's nodeid is ALLOWED to be remains
+#: :func:`is_failure_key`'s single decision, below, which is what keeps the two
+#: doors from disagreeing again.
+_RATES_RE = re.compile(
+    r"^(?P<nodeid>[^\t]+)\t(?P<failures>[0-9]+)\t(?P<runs>[0-9]+)$"
+)
+
+
+def parse_rates(lines: str) -> RatesResult:
+    """Parse the ``<nodeid>\\t<failures>\\t<runs>`` rate table.
+
+    Fail-closed, for the same reason as :func:`parse_failed_ids`: this table feeds
+    the comparison that OVERRIDES a failure, so a line the reader does not fully
+    understand must never become evidence of main-side unhealth. Anything not
+    exactly three tab-separated fields -- a valid failure key (a pytest nodeid
+    OR a guard-step identity, #4469), a non-negative failure count, and a
+    **positive** run count -- is rejected, counted and reported.
+
+    ``runs`` must be positive: ``X\\t0\\t0`` would give a ``0/0`` rate of ``0.0``
+    and read as "main never fails this", which is the exemption-by-vacuity this
+    module exists to prevent. A rejected line simply contributes no rate, and an
+    id with no rate is **not exempt** (the existing default in :func:`decide`).
+
+    The **rate table -- and therefore the verdict -- is invariant to row order for
+    the same row multiset** (#3766); ``rejected`` records rows as they arrive, so
+    the evidence list keeps input order (only its length is invariant), and nothing
+    downstream reads it for the decision. A failure key with two or more VALID rows
+    is WITHDRAWN for the rest of THIS table -- agreeing or disagreeing, because the
+    slot holds one measurement per key and this module has no mandate to reconcile
+    two -- and the withdrawal is PERMANENT within the table: membership in the
+    withdrawn set is checked BEFORE the accept path, so no later row can put the id
+    back. (Not "permanently" across calls: nothing survives the return.) The
+    withdrawal must outlive the row that triggered it, because withdrawing only for
+    the row at hand let an ODD duplicate count (three concatenated shards: 8/8,
+    0/8, 1/8) re-establish the id on the next line -- Rate(1,8) forward, Rate(8,8)
+    reversed, a BLOCK against an EXEMPT from one unchanged multiset. A row the
+    guards ABOVE reject (malformed, not a failure key, ``runs <= 0``, ``failures >
+    runs``) contributes nothing and cannot withdraw the id: its position must not
+    change the outcome, or the table would be order-dependent again.
+    """
+    rates: dict[str, Rate] = {}
+    rejected: list[str] = []
+    #: Ids the table withdrew. Populating ``rates`` is a ONE-WAY door: a duplicate
+    #: withdraws the id and records it here, and membership here is checked BEFORE
+    #: the accept path, so no later row can put it back.
+    tainted: set[str] = set()
+    for raw in lines.splitlines():
+        line = raw.strip("\n")
+        if not line.strip():
+            continue
+        m = _RATES_RE.match(line)
+        if not m:
+            rejected.append(line)
+            continue
+        nodeid = m.group("nodeid")
+        failures = int(m.group("failures"))
+        runs = int(m.group("runs"))
+        if not is_failure_key(nodeid) or runs <= 0 or failures > runs:
+            rejected.append(line)
+            continue
+        if nodeid in tainted:
+            # A WITHDRAWN id stays withdrawn (#3766). The earlier guard withdrew the
+            # id by popping it, which expired the withdrawal for the rest of the
+            # table -- so a third row re-established it and the LAST row won again.
+            # Reporting the row is what makes the refusal visible; the id still
+            # contributes no rate, so it is not exempt.
+            rejected.append(line)
+            continue
+        if nodeid in rates:
+            # Duplicate rows (latent finding 2): the LAST row used to win, so row
+            # order decided whether the PR blocked -- an order-dependence inside
+            # the verdict-stability class. Reject rather than pick a winner: the id
+            # then has no rate at all (not exempt), which is the fail-closed
+            # direction. WITHDRAWING it (not merely popping it) is what keeps it
+            # from being re-established by a later row.
+            tainted.add(nodeid)
+            rejected.append(line)
+            rates.pop(nodeid, None)
+            continue
+        rates[nodeid] = Rate(failures=failures, runs=runs)
+    return RatesResult(rates=rates, rejected=rejected)
+
+
+@dataclass(frozen=True)
+class Failure:
+    """A PR-side failure: how often, and with which signatures."""
+
+    rate: Rate
+    signatures: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """One decision, with the reason stated so it can be audited."""
+
+    nodeid: str
+    blocked: bool
+    reason: str
+
+    @property
+    def line(self) -> str:
+        mark = "BLOCK " if self.blocked else "EXEMPT"
+        # #1185: a `pipeline-compliance` gate id says WHICH check blocked the PR
+        # and on what — `blocked by check (c): <subject>` — so the refusal is
+        # actionable instead of "unattributable". Presentation only: the note is
+        # derived from the id, never from a re-read of the log, and it can neither
+        # clear nor create a block (the family's own `blocked` flag is unchanged).
+        note = pipeline_check_note(self.nodeid) if self.blocked else ""
+        prefix = f"{note} — " if note else ""
+        return f"{mark}: {self.nodeid}  {prefix}{self.reason}"
+
+
+@dataclass
+class Decision:
+    blocked: list[Verdict] = field(default_factory=list)
+    unattributable: list[Verdict] = field(default_factory=list)
+    exempt: list[Verdict] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def any_blocked(self) -> bool:
+        return bool(self.blocked)
+
+    def visible_exemptions(self) -> list[str]:
+        """The EXEMPT lines that MUST be recorded — never a silent exemption."""
+        return [v.line for v in self.exempt]
+
+    def report(self) -> str:
+        out = [v.line for v in self.blocked] + self.visible_exemptions()
+        out.extend(f"NOTE  : {n}" for n in self.notes)
+        return "\n".join(out)
+
+
+
+def class_key(nodeid: str) -> str:
+    """The FILE/CLASS prefix — the unit that stays red while the IDENTITY moves."""
+    parts = nodeid.split("::")
+    return "::".join(parts[:2]) if len(parts) >= 2 else parts[0]
+
+
+def detect_rotating_identity(runs: list[frozenset[str]]) -> dict[str, frozenset[str]]:
+    """Keys whose failing IDENTITY changed between runs (required class E5).
+
+    **An identity that changes across runs is NOT novel.** The baseline observed the
+    CLASS; the id provably will not be the same next run. Measured on a real refusal
+    (B6 on #3577): the rail reported ONE unique failure in a class that was red in
+    three runs with THREE DIFFERENT ids inside it — run 1 two ids, runs 2-3 another.
+    The class stayed red; the identity moved.
+
+    The old re-run heuristic assumes a flake **passes** on retry and has no
+    representation for "the failure moved", so the verdict became a function of which
+    run you happened to sample. Both directions are in-surface:
+
+    * **false-block** — a changed id is labelled "a NEW failure this PR introduces";
+    * **false-PASS** — PR-minus-main compares SETS OF IDS from different samples, so an
+      order-dependent flake can move OUT of the PR's set and INTO main's between runs
+      and be exempted silently.
+
+    Returns ``{class_key: union of ids seen red in that key}`` for every key that was
+    red in >= 2 runs with a NON-CONSTANT id set. A class red in a single run is not
+    reported (one sample cannot distinguish "moved" from "not yet moved").
+    """
+    per_key: dict[str, list[frozenset[str]]] = {}
+    for r in runs:
+        keys = {class_key(n) for n in r}
+        for k in keys:
+            per_key.setdefault(k, []).append(frozenset(n for n in r if class_key(n) == k))
+    out: dict[str, frozenset[str]] = {}
+    for k, sets in per_key.items():
+        if len(sets) >= 2 and len({frozenset(x) for x in sets}) > 1:
+            out[k] = frozenset().union(*sets)
+    return out
+
+
+def _signatures_overlap(pr: frozenset[str], main: frozenset[str]) -> bool:
+    """True when the PR's failure matches a signature measured on main.
+
+    When either side carries no signature information we cannot establish a match,
+    and the fail-closed answer is to BLOCK rather than to exempt on an assumption.
+    """
+    if not pr or not main:
+        return False
+    # SUBSET, not intersection (review cycle 1, bypass 2). Intersection only asked
+    # "do the two sets share ANY failure", so a PR that keeps main's assertion and
+    # ADDS a new one was exempt — and the NEW failure, the one the PR introduced,
+    # was exactly what got masked. Every signature the PR failed with must have
+    # been measured on main; an extra one is a failure main never had.
+    return pr <= main
+
+
+def decide(
+    pr_failures: dict[str, Failure],
+    main_rates: dict[str, Rate],
+    *,
+    main_signatures: dict[str, frozenset[str]] | None = None,
+    rotating: dict[str, frozenset[str]] | None = None,
+    rotation: "RotationRuns | None" = None,
+    k_pr: int | None = None,
+    rotation_legacy: bool = False,
+
+    # THE RATE TOLERANCE — owner-authorized "Option B" on tortoise #3756, whose deferred
+    # residual is PARTLY CLOSED by the TOTAL-failure guard below.
+    #
+    # This parameter still carries an accepted fail-open, and its remaining shape is stated
+    # here so the next reader neither "fixes" it by surprise nor mistakes it for an
+    # undiscovered bug.
+    #
+    # THE FAILURE MODE it carried (kept, in the PAST tense, because the shape recurs and the
+    # next reader needs to know why this parameter stays suspicious): the tolerance is
+    # MULTIPLICATIVE, so the band that counts as "rates equivalent" WIDENS in absolute terms as
+    # main's rate rises. A PR that failed EVERY SINGLE RUN WAS therefore EXCUSED once main was
+    # broken enough — A DETERMINISTIC TOTAL FAILURE TREATED AS A RATE FLUCTUATION.
+    #
+    # Concretely, with the default 1.5, THE RATE CONDITION for exemption is
+    # `pr_rate <= mr.rate * 1.5` — and note that this is the NECESSARY rate test, not the whole
+    # rule: FIVE earlier gates BLOCK first and are checked in order ahead of it — an empty PR
+    # sample, a rotating/UNATTRIBUTABLE identity, an id absent from `main_rates`, non-overlapping
+    # signatures, and `mr.runs < min_runs`. Only if all five pass does the rate test decide.
+    # A PR failing every run has `pr_rate == 1.0`, so once `mr.rate >= 1/1.5` — once main was
+    # about two-thirds broken (~0.667) — the rate test did not stop it, and it was EXEMPTED
+    # provided those earlier gates held. THE TOTAL-FAILURE GUARD BELOW CLOSES THAT BAND FOR
+    # EVERY MAIN THAT IS NOT ITSELF SATURATED; the main-total point inside the band is left to
+    # the rate test, per #3756 §11 (see CLOSED below).
+    #
+    # Note the asymmetry, which is why this WAS a fail-open and not a tuning complaint: the input
+    # on the PR side is a TOTAL failure (every run failed) while the input on the main side is a
+    # SAMPLE over a finite `k`. The comparison therefore weighed a stronger signal against a
+    # weaker one, and the tolerance grew as the weaker side degraded. (`pr_rate` is still a rate
+    # over a finite sample, so "total" here means "every observed run", not an infinite certainty
+    # — the asymmetry is real but it is one of evidence strength, not of logical certainty.) The
+    # guard below closes this asymmetry FOR THE TOTAL CASE; its NON-total shadow survives and is
+    # stated under REMAINING RESIDUAL.
+    #
+    # CLOSED in this module by the total-failure guard below (the residual Option B deferred —
+    # agent-infra #1209/#1211; tortoise #3762 tracked the vendored tortoise copy, whose fix
+    # arrives by the vendor sync): a TOTAL PR failure is no longer excusable by this tolerance.
+    # The guard refuses a saturated PR rate WHEN THE PR SAMPLE IS MEASURABLE (`k_pr >= min_runs`)
+    # unless main's measured rate is ALSO saturated, because the one case where "as broken as
+    # main" is literally true is when main is total too. A thinner PR sample never reaches the
+    # guard at all — it is decided earlier on attribution (#5250) WHEN MAIN'S RATE IS NON-ZERO
+    # (`mr.rate > 0`; a zero main rate never satisfies that branch and is blocked on the rate
+    # comparison), where saturation is not evidence of determinism. Lowering `rate_tolerance`
+    # cannot make that separation without over-blocking: at `tol == 1.0` the band closes for
+    # every non-total main rate (so `6/8` vs `8/8` blocks) while saturated-on-saturated still
+    # exempts, but the authorized non-total residual `6/8` vs `7/8` is blocked too. So the
+    # distinction is expressed as a PREDICATE, not as a constant. The
+    # guard is deliberately NARROWER than a blanket "`pr_rate == 1.0` -> BLOCK": that would refuse
+    # `main 4/4` vs `PR 4/4`, which #3756 §11 PERMITS as an exemption (it requires the RECORDING,
+    # not the refusal), and total-on-total is the one case where the exemption is literally
+    # "no worse than main".
+    #
+    # REMAINING RESIDUAL (still accepted, unchanged): for a NON-total PR rate the tolerance still
+    # widens as main degrades — `main 6/8` vs `PR 7/8` is exempt. That is the authorized trade;
+    # only the deterministic-TOTAL case is closed, and it is the case the comparison has no
+    # information to decide. (A saturated PR whose sample is thinner than `min_runs` is likewise
+    # still exempt on attribution WHEN MAIN'S RATE IS NON-ZERO — the #5250 path above, not this
+    # tolerance; with a zero main rate it blocks on the rate comparison.)
+    rate_tolerance: float = 1.5,
+    min_runs: int = 3,
+) -> Decision:
+    """Decide every PR failure: block it, or exempt it **visibly**.
+
+    Rules, in order — each one closes a declared class:
+
+    * an id carrying WHITESPACE while ANY per-run line arrived in the TAB-FREE
+      (pre-#3686) form -> **UNATTRIBUTABLE** (#3686 review cycle 6). That form
+      cannot represent a space — the split shreds it — so E5 is structurally blind
+      to such an id; exempting it would be a silent EXEMPT for an identity that may
+      have MOVED, and the pre-#3686 code BLOCKED it. ⛔ THIS ARM RUNS AHEAD OF EVERY
+      ATTRIBUTION RULE — ahead of the E5 rotation test, ahead of absent-from-main,
+      and ahead of the signature and rate rules — because each of those is an
+      ATTRIBUTION, and evidence that cannot SEE the id supports no attribution at
+      all. The one guard that does precede it is the EMPTY-PR-SAMPLE refusal (a PR
+      failure with no measured sample is not an attribution question at all). It is
+      listed here, first, for that reason: a reader who placed it after the rate
+      comparison would re-open the cycle-6 fail-open. Pass ``rotation=`` (the parsed
+      ``RotationRuns``) rather than ``rotating=`` and this is DERIVED for you;
+      passing ``rotating=`` alone means ``rotation_legacy`` defaults to False, which
+      is the FAIL-OPEN value, so a caller doing that on tab-free evidence re-opens
+      the class — a DECLARED RESIDUAL of the explicit-flag surface, measured
+      (``rotating=detect_rotating_identity(<tab-free runs>)`` with no ``rotation=``
+      EXEMPTS the spacey id) and deliberately NOT pinned: the composition leg pins
+      the SAFE path (``rotation=``), and a test that asserted this fail-open would
+      have to be inverted the day someone closes it. Treat ``rotating=``-without-
+      ``rotation=`` as unsupported on tab-free evidence.
+    * id ABSENT from main's failure set -> **BLOCK** (nothing shows it pre-exists).
+      The baseline is FAILURE-ONLY, so a test main runs and passes leaves no row, which
+      makes this neither "known new" nor "unmeasured" — the reason must claim NEITHER.
+      Calling it "no main-side measurement" asserted main never ran the file, false
+      whenever main's shards cover it (tortoise #7734); claiming novelty asserts the
+      opposite of what the same baseline can know.
+    * signature disjoint from main's -> **BLOCK** (a DIFFERENT failure inside an id
+      main also failed; same id is not same failure).
+    * THIS id's MAIN row measured over fewer than ``min_runs`` runs -> **BLOCK**
+      (insufficient evidence; one observation cannot establish a rate). That floor is
+      PER-ID and has no table-wide or caller-declared form: a ``k_main`` knob was
+      removed because it was accepted and never read, which is the shape that
+      produced this whole family of defects.
+    * PR sample (``k_pr``) below ``min_runs`` -> the RATE dimension is
+      **NOT-MEASURABLE** and is used NEITHER to exempt nor to block (#5250), with two
+      exclusions: ``k_pr == 0`` is EMPTY, not thin (the caller is told "pr sample
+      empty", and an empty row is refused by the per-row guard), and a main rate of
+      exactly ``0`` is not "measured red" (it reaches the rate comparison, which
+      blocks). The exemption then rests on the attribution question the gates above
+      already answered — id measured red on main, overlapping signatures, main's own
+      row >= ``min_runs`` — and the verdict SAYS the rate was not measurable. ``k_pr``
+      is the PR's declared sample size: ``_cmd_decide`` derives it as
+      ``max(row.runs)`` over the PR table (the producer emits one uniform K per
+      file), so this second use of ``min_runs`` is caller-declared and table-wide,
+      UNLIKE the per-id MAIN floor above.
+    * PR rate materially above main's -> **BLOCK** (the PR made it worse).
+    * PR failure is TOTAL (every observed run failed) while main's measured rate is
+      NOT total -> **BLOCK** (a deterministic failure is not a rate fluctuation, and
+      no tolerance makes it equivalent to a sampled one — the residual Option B
+      deferred, tortoise #3762). Applies only to a MEASURABLE PR sample
+      (``k_pr >= min_runs``); a thinner one is decided earlier on attribution. Checked
+      AFTER the tolerance test, so a case the tolerance already refuses keeps its
+      "materially higher" reason; when main IS total this is skipped and the rate
+      test decides, so ``main 4/4`` vs ``PR 4/4`` stays exempt.
+    * otherwise (the rate comparison passed) -> **EXEMPT**, recorded with both rates.
+
+    ``main_rates`` is a RATE per id, not a set of ids: presence alone is never
+    sufficient, because presence is what excused ``main 1/8`` against ``PR 8/8``.
+
+    ``main_signatures`` is explicit rather than global-by-accident: an EMPTY map
+    means "no signature evidence", which makes every signature check fail CLOSED.
+    """
+    decision = Decision()
+    sig_main = main_signatures or {}
+
+    # ⛔ THE EVIDENCE FORM IS DERIVED, NOT TRUSTED TO THE CALLER (#3686 review cycle 7,
+    # P2). `rotation_legacy` defaults to False — the PERMISSIVE value — so a caller
+    # that passes `rotating=` (or composes `detect_rotating_identity(parse_rotation_runs(
+    # text))` by hand, which is the obvious thing to write) silently restores the
+    # cycle-6 fail-open. Accepting the parsed `RotationRuns` makes the form
+    # un-droppable at the boundary: the object that knows the form is the object that
+    # supplies it. The explicit flags stay for callers that already have the pieces.
+    # ⛔ AND A SUPPLIED MAP IS UNIONED, NOT SUBSTITUTED (review cycle 10, P2). Cycle 9
+    # made a FALSY map re-derive; a TRUTHY one still replaced the derivation wholesale,
+    # so an unrelated or incomplete map DROPPED the E5 signal from the evidence handed
+    # in beside it — measured: `rotation=runs, rotating={"Other::cls": …}` EXEMPTED an id
+    # `detect_rotating_identity(runs)` reports as having MOVED. The union below is what
+    # makes the earlier sentence ("can only narrow") TRUE instead of aspirational: it
+    # adds keys and per-class ids, never removes them, so no caller can subtract
+    # evidence, and the fail-closed direction is preserved whichever way it is called.
+    if rotation is not None:
+        derived = detect_rotating_identity(rotation)
+        if rotating:
+            rotating = {
+                cls: rotating.get(cls, frozenset()) | derived.get(cls, frozenset())
+                for cls in set(rotating) | set(derived)
+            }
+        else:
+            rotating = derived
+        rotation_legacy = rotation_legacy or rotation.has_legacy_lines
+
+    # The floor is PER-ID and has NO table-wide form (review cycle 2). A table-max
+    # derivation has no legitimate use: the question is always "does THIS id's row
+    # rest on enough runs?", and when the id has no row at all `mr` is None and the
+    # decision already BLOCKS. Keeping it per-id makes the bug class — a healthy
+    # NEIGHBOUR licensing a thin row's exemption — impossible to express at all,
+    # rather than merely un-triggered by the current call sites.
+    if k_pr is not None and k_pr < 1:
+        decision.notes.append("pr sample empty — treating every failure as PR-side")
+
+    for nodeid in sorted(pr_failures):
+        pr = pr_failures[nodeid]
+        mr = main_rates.get(nodeid)
+
+        # PR-side validity (latent finding 1). `Failure(rate=Rate(3, 0))` has
+        # `.rate == 0.0`, so it slipped past the comparison into EXEMPT while the
+        # code emitted "pr sample empty — treating every failure as PR-side", which
+        # claims the opposite. The runs>0 guard covered only the main-side parser.
+        if pr.rate.runs <= 0:
+            decision.notes.append(
+                f"PR sample for {nodeid} is empty ({pr.rate}) — a PR failure with no "
+                "measured sample cannot be exempted")
+            decision.blocked.append(Verdict(
+                nodeid, True,
+                f"PR rate is unmeasurable ({pr.rate}) — NOT exempt"))
+            continue
+
+        # ⛔ THE EVIDENCE-FORM ARM MUST PRECEDE THE E5 TEST ITSELF (#3686 review
+        # cycle 6, P1). A tab-free (pre-#3686) per-run line CANNOT represent an id
+        # containing a space — the space split shreds it, so the real id is in no
+        # run set and the test five lines below is structurally blind to it. That
+        # is a limit of the WIRE FORM, not of the id, and before #3686 it did not
+        # matter — NOT because "both doors rejected such an id" (they did not: the PR
+        # door admitted it and MAIN's rate door dropped the row, which is #3686
+        # itself) but because that ASYMMETRY meant `mr is None`, so the id came out
+        # BLOCKED. Now that the id is
+        # representable on the rate side, falling through to the rate comparison
+        # would EXEMPT an identity that may have MOVED — the fail-open direction.
+        # UNATTRIBUTABLE is the only correct verdict for evidence that cannot see
+        # the id: it gates, and it says why.
+        if rotation_legacy and any(ch.isspace() for ch in nodeid):
+            decision.unattributable.append(Verdict(
+                nodeid, True,
+                "UNATTRIBUTABLE: the per-run evidence is the pre-#3686 TAB-FREE "
+                "form, which cannot represent an id containing whitespace — the "
+                "space shreds it, so a MOVING identity is invisible to the "
+                "rotation guard and this id cannot be exempted on that evidence"))
+            continue
+
+        # Required class E5 — ROTATING IDENTITY, checked FIRST. An id whose class was
+        # red across runs with a MOVING id is UNATTRIBUTABLE: never "unique to this
+        # PR", never exempt-and-silent. This must precede every other rule because
+        # both of the other outcomes are attributions, and the evidence here supports
+        # neither.
+        if rotating and nodeid in rotating.get(class_key(nodeid), frozenset()):
+            decision.unattributable.append(Verdict(
+                nodeid, True,
+                f"UNATTRIBUTABLE: {class_key(nodeid)} was red across runs with a "
+                "DIFFERENT failing id each run — a changing identity is not novel "
+                "and cannot be attributed to this PR"))
+            continue
+
+        if mr is None:
+            # ABSENT-FROM-MAIN, not UNMEASURED (tortoise #7734). This reason used to
+            # read "no main-side measurement", which asserts main never ran the file.
+            # That is FALSE whenever main runs it and the test PASSES: the baseline is
+            # FAILURE-ONLY, so a passing test leaves no row — and main's own shard
+            # artifacts (`expected-nodeids.txt`) show it running the very files the old
+            # wording called unmeasured (98/41/23/12 of the blocked nodeids across four
+            # shards, for the four PRs #7734 names).
+            #
+            # It must NOT over-correct into the OPPOSITE claim either. "New here" is
+            # equally unsupported: this branch also fires for `guard-step::` /
+            # `collect-error::` / `watchdog-kill::` / `job-unreadable::` ids, for which a
+            # pytest nodeid manifest is no evidence at all, and the B1 case (main's
+            # docker lane vs a PR's embedded lane) reaches `mr is None` precisely because
+            # the two lanes run different files. So the reason asserts only what the
+            # baseline actually knows: main is not red for this id, and a failure-only
+            # baseline cannot tell "green on main" from "never run on main". THAT is
+            # why it blocks — not because novelty, nor measurement, was established.
+            decision.blocked.append(Verdict(
+                nodeid, True,
+                f"absent from main's failure set (PR {pr.rate}) — main is not red for "
+                "this id, and a FAILURE-ONLY baseline cannot tell 'green on main' from "
+                "'never run on main', so absence is NOT evidence of novelty — not exempt"))
+            continue
+
+        if not _signatures_overlap(pr.signatures, sig_main.get(nodeid, frozenset())):
+            decision.blocked.append(Verdict(
+                nodeid, True,
+                f"signature differs from main's ({pr.rate} vs {mr}) — same id, "
+                "a DIFFERENT failure is not exempt"))
+            continue
+
+        if mr.runs < min_runs:
+            # The NOTE is emitted alongside the block (review cycle 2): the reviewer's
+            # required observation is `BLOCK, with the note`, and a per-id block that
+            # left `notes` empty would report the refusal without the reason.
+            decision.notes.append(
+                f"insufficient evidence for {nodeid}: main {mr} rests on "
+                f"{mr.runs} run(s) < min_runs={min_runs} — one observation cannot "
+                "establish a rate"
+            )
+            decision.blocked.append(Verdict(
+                nodeid, True,
+                f"insufficient evidence (main {mr}, {mr.runs} run(s) < "
+                f"min_runs={min_runs}) — one observation cannot establish a rate"))
+            continue
+
+        # THE PR-SIDE SAMPLE FLOOR (#5250). A PR gets ONE run per push, so its
+        # rate is a single observation and `1/1` is `100%` BY CONSTRUCTION — the
+        # comparison below then blocks unconditionally (`1.00 > 0.60 * 1.5`)
+        # whenever main is red for a check the PR merely inherited, so the rail
+        # was unusable exactly when it was most needed. `min_runs` is required on
+        # BOTH sides: when the PR's sample is below it the RATE dimension is
+        # NOT-MEASURABLE and is used NEITHER to exempt NOR to block. The
+        # exemption that follows rests on the ATTRIBUTION evidence the gates
+        # above already established (id measured red on main, overlapping
+        # signatures, main's own row >= `min_runs`) and SAYS the rate was not
+        # measurable — never a silent exemption.
+        #
+        # `k_pr is None` = the caller declared no PR sample size: in production
+        # `_cmd_decide` always passes it, and it is `None` only when there are no
+        # PR failures at all, so this preserves the historical rate comparison for
+        # that caller. The lower bound `1 <=` keeps `k_pr == 0` out: a zero sample
+        # is EMPTY, not thin, and the caller is told so by the note above — it must
+        # not also be exempted here. `mr.rate == 0` is not "measured red", so it
+        # falls through to the rate comparison — which BLOCKS a PR failure main
+        # never had (the zero-main-rate guard, bypass 1a) rather than exempting it.
+        if k_pr is not None and 1 <= k_pr < min_runs and mr.rate > 0:
+            decision.exempt.append(Verdict(
+                nodeid, False,
+                f"PR rate NOT measurable ({k_pr} run(s) < min_runs={min_runs}) — "
+                f"exempt on signature + main presence: main {mr} measured over "
+                f"{mr.runs} run(s), k_pr={k_pr}"))
+            continue
+
+        # THE RATE COMPARISON — the heart of the fix. Compares the two RATES
+        # (floats), never the two presences.
+        #
+        # No `mr.rate > 0` guard (review cycle 1, bypass 1a). Guarding on it SKIPPED
+        # the comparison whenever main's rate was 0, so `main 0/8` vs `PR 8/8` — the
+        # weakest possible main evidence — printed as "rates equivalent" and the
+        # strongest exemption was bought with no evidence at all. A PR failure main
+        # never had is a NEW failure, and `pr_rate > 0` against a zero main rate
+        # blocks it.
+        # A TOTAL PR failure is NOT a rate fluctuation (the closed residual above,
+        # tortoise #3762). Saturation is tested on the MEASURED counts, not a float
+        # compare. The exemption survives only when main is saturated too — the one
+        # case where "no worse than main" is literally true.
+        #
+        # It sits AFTER the tolerance test deliberately: a failure the tolerance
+        # ALREADY refuses keeps its "materially higher" verdict, so this guard adds
+        # exactly the case the ratio cannot decide rather than re-labelling cases it
+        # can. Nothing in the tolerance's arithmetic can be trusted not to bridge a
+        # degenerate signal, which is why the case is carved out rather than tuned.
+        pr_rate = pr.rate.rate
+        if pr_rate > mr.rate * rate_tolerance:
+            decision.blocked.append(Verdict(
+                nodeid, True,
+                f"PR rate {pr.rate} materially higher than main {mr} "
+                f"(>{rate_tolerance}x) — the PR made it worse"))
+            continue
+
+        if pr.rate.failures == pr.rate.runs and mr.failures != mr.runs:
+            decision.blocked.append(Verdict(
+                nodeid, True,
+                f"PR failure is TOTAL ({pr.rate}) while main is {mr} — a "
+                "deterministic failure is not a rate fluctuation, and the "
+                f"{rate_tolerance}x tolerance does not bridge a saturated signal"))
+            continue
+
+        decision.exempt.append(Verdict(
+            nodeid, False,
+            f"main {mr} vs PR {pr.rate} — rates equivalent, main measured over "
+            f"{mr.runs} run(s) (min_runs={min_runs}), k_pr={k_pr}"))
+
+    return decision
+
+
+# ==========================================================================
+# Step A (#3756) — the PR-side SIGNATURE producer
+# ==========================================================================
+#
+# GROUNDED IN THE REAL ARTIFACT, not in an invented format. Measured on
+# tortoise run 35223536174 (python-ci.yml, 2026-09-17) via
+# ``gh run view <id> --log-failed``:
+#
+#   <job>\t<step>\t\ufeff2026-09-17T12:54:37.9171029Z ##[group]Run set +e
+#   test (a)\tRun fast test suite\t2026-09-17T12:54:37.9171442Z ^[[36;1mset +e^[[0m
+#   test (a)\tRun fast test suite\t2026-09-17T13:10:44.1728389Z ===== FAILURES =====
+#   test (a)\tRun fast test suite\t2026-09-17T13:10:44.1728829Z ____ test_name ____
+#   test (a)\tRun fast test suite\t2026-09-17T13:10:44.1735420Z E  +  where 200 = <Response [200 OK]>.status_code
+#   test (a)\tRun fast test suite\t2026-09-17T13:10:44.1735758Z tests/test_oauth_token_fault.py:779: AssertionError
+#   test (a)\tRun fast test suite\t2026-09-17T13:10:44.1763755Z FAILED tests/test_oauth_token_fault.py::test_capture... - assert (200 == 503)
+#
+# So the wire IS plain pytest text behind a GH Actions prefix. Two facts
+# follow, and they are why this parser is shaped this way:
+#
+#   * the ``FAILED <nodeid> [- <detail>]`` short-summary line is the ONLY place
+#     a nodeid appears in a failure record, and it already carries a one-line
+#     assertion payload. It is also exactly the line ``extract_failed_tests``
+#     consumes — so the id set cannot drift between the shell and this parser.
+#   * the FULL failure text (the ``E`` lines and the
+#     ``path.py:LINE: ExceptionType`` trailer) lives in the ``FAILURES`` block,
+#     which is keyed by test NAME, not by nodeid. Attribution is therefore a
+#     name join, and a name join can be ambiguous.
+#
+# Ambiguity is handled fail-closed: a block that joins to zero or to more than
+# one id is REJECTED AND REPORTED (``unattributed``), and the id it would have
+# described is left ``unsigned`` — which makes ``_signatures_overlap`` fail
+# closed (BLOCK). It is never resolved by guessing.
+
+# An ANSI SGR/CSI escape — the shell's own extractor strips these, so the
+# producer must too or the two disagree on what a line says.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+# ``<job>\t<step>\t\ufeff<ISO-8601>Z <content>`` — the gh ``--log-failed`` prefix.
+# ``.*`` is greedy up to the LAST tab before the timestamp so a tab inside a job
+# or step name cannot break the strip; a tab inside pytest CONTENT followed by a
+# timestamp-shaped token would, which is vanishingly unlikely and fails closed
+# (the content would not parse, so the id is unsigned).
+_LOG_PREFIX_RE = re.compile(
+    r"^.*\t\ufeff?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z[ \t]"
+)
+
+# The short-summary line. Split on the FIRST `` - `` so a nodeid whose params
+# contain a bare ``-`` (``[chromium-Claude Desktop]``) is not torn apart. The
+# shell's ``-r`` short summary uses exactly this separator.
+_SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<nodeid>.+?)(?:\s+-\s+(?P<detail>.*))?$")
+
+# A LOOSE nodeid: the file/class part stays strict, the ``::`` tail is allowed
+# to carry spaces/brackets because pytest parameter ids legitimately do
+# (``::test_x[chromium-Claude Desktop]``). ⛔ ``_NODEID_RE`` IS WIDER THAN IT USED
+# TO BE, ON PURPOSE, AND RE-NARROWING IT IS THE #3686 DEADLOCK. This comment used
+# to say the opposite — that `_NODEID_RE` "stays narrow for the RATE/UNION parsers"
+# and that widening it "would loosen their fail-closed check for no gain". The gain
+# turned out to be the whole point: the RATE table reads MAIN's rows, so a
+# character the strict form rejects is a rate row that never exists, and the PR-side
+# failure which the loose form admits then reads PR-unique FOREVER. The strict form
+# now admits the parameter characters the two reports were measured on — ``/``
+# (#3690) and space (#3686) — while staying deliberately NARROWER than ``[^\t]+``
+# — because a key wrongly ADMITTED enters the exemption allowlist — so neither
+# predicate is a synonym and neither may be silently swapped for the other.
+# Dropping a real id here would be fail-OPEN (an undecided id is an unblocked id),
+# which is why this path is deliberately the permissive one.
+#
+# ⛔ SEE ``_NODEID_RE`` ABOVE (its ``OVERRIDES:`` block). The "for no gain" this
+# paragraph used to state is measurably false — for a PATH parameter and for a
+# SPACE one — so the strict form admits both. The KNOWN RESIDUAL (``+ , ' # @``,
+# non-ASCII, raw whitespace runs) is agent-infra#3691's and is NOT a licence to
+# collapse the split either way.
+_NODEID_LOOSE_RE = re.compile(r"^[A-Za-z0-9_./\-]+\.py::[^\t]+$")
+
+# A bare pytest PROGRESS fragment — `[  2%]`, `[100%]`, `[ 47%]`. It is the
+# percentage pytest's progress line prints, and it is NOT an id of any kind.
+# Used to keep a progress bar from being read as a failure RECORD (#6917).
+_PROGRESS_FRAGMENT_RE = re.compile(r"^\[\s*\d{1,3}%\]$")
+
+# ── NON-NODEID failure identities (#6798) ────────────────────────────────
+# A failing run does not always name a `::nodeid`. Two measured shapes carry a
+# REAL failure and are not nodeids, so the shape check above drops them, the run
+# contributes nothing, and `admin-merge.sh` step 1c refuses it FOREVER:
+#
+#   `extracted < examined` -> “yielded NO parseable failure identity” -> exit 1
+#
+# That refusal has no exit — neither shape can ever produce a nodeid — so ONE
+# 15-minute watchdog kill on ONE shard becomes a fleet-wide merge block (8
+# landing lanes, ~45 min, 0 PRs converted; tortoise #6798, agent-infra #6145).
+#
+# Both become COMPARABLE identities, exactly as a guard-step annotation did
+# (#4469): main's union is the EXEMPTION ALLOWLIST, so a PR-side id only excuses
+# a failure main is ALSO red on. Correcting the INPUT to the comparison leaves
+# the comparison (§4.6, #1261) untouched.
+
+# pytest's COLLECTION-ERROR record, verbatim (measured, run 36809707842):
+#     ERROR tests/test_gmm_proofs.py - AttributeError: partially initialized
+#     module 'torch' has no attribute 'Tensor' (most likely due to a circular import)
+# Keyed on the FILE, never the message: the exception text varies run to run, and
+# an identity that tracks it can never match main's baseline (the #3756
+# rotating-identity class — it would read as "unique to this PR" forever).
+_COLLECT_ERROR_RE = re.compile(
+    r"^ERROR\s+(?P<path>[A-Za-z0-9_./\-]+\.py)(?:\s+-\s+.+)?$"
+)
+_COLLECT_ERROR_PREFIX = "collect-error::"
+
+# The three banner shapes the runner actually emits (tortoise python-ci.yml:761,
+# 1265, 1810): `WATCHDOG: pytest killed after <n>m`, the fixed 10m slow-leg
+# form, and `WATCHDOG: carve-out pytest killed after 35m`. The optional
+# `carve-out ` qualifier is load-bearing: it is a REACHABLE shape that a pattern
+# pinned to the bare form silently misses, so a carve-out kill would stay
+# zero-id — the same permanent refusal, one shape over.
+_WATCHDOG_KILL_RE = re.compile(
+    r"^={3,}\s*WATCHDOG: (?:carve-out )?pytest killed after \d+m\s*"
+    r"\(\d+ passed, 0 failed, 0 errored so far\)"
+)
+#: The one stable watchdog-kill identity. Deliberately NOT keyed on the shard:
+#: a watchdog overrun is an ENVIRONMENTAL property of the suite, so main's kill
+#: on shard `a` must exempt a PR's kill on shard `h`. Keying it per-shard would
+#: leave every cross-shard kill “unique to this PR” and block the same PRs the
+#: refusal did — the defect relocated, not fixed.
+_PYTEST_KILL_ID = "watchdog-kill::pytest"
+
+# The signatures the two doors must AGREE on. A non-nodeid identity is not a
+# pytest failure with an exception type, so its signature is its CLASS — and it
+# must be CONSTANT, because §4.6 compares signatures with a SUBSET rule
+# (`_signatures_overlap`: every PR signature must have been measured on main).
+# An empty signature on either side fails that rule closed, so an id with no
+# signature does not “compare” at all — it BLOCKS. That is the half of the input
+# the `ids` pass alone does not correct.
+_COLLECT_ERROR_SIG = "collect-error"
+_WATCHDOG_KILL_SIG = "watchdog-kill"
+
+# pytest's failure-block header: ``________ test_name[param] _________``.
+_BLOCK_HEADER_RE = re.compile(r"^_{3,}\s*(?P<name>.+?)\s*_{3,}$")
+# ``E       <assertion or exception>`` — the ``+  where …`` continuations are
+# not the primary failure and are skipped.
+_E_LINE_RE = re.compile(r"^E\s+(?P<rest>\S.*)$")
+# ``path/to/test_x.py:779: AssertionError`` — the authoritative exception TYPE.
+_TRAILER_RE = re.compile(
+    r"^(?P<path>[^\s:][^\s]*\.py):(?P<line>\d+):\s*(?P<exc>[A-Za-z_][\w.]*)\s*$"
+)
+# A section boundary that ends the current failure block.
+_BLOCK_END_RE = re.compile(r"^(?:={3,}|-{3,}|Captured\b).*$")
+
+# A MEASURED DURATION is substrate too — and it is the one substrate axis the
+# mask list was missing (tortoise #9331). An assertion message that interpolates
+# its own measurement (``elapsed < 1.2, f"local EP took {elapsed:.2f}s …"``) has
+# a DIFFERENT signature on every run, so `_signatures_overlap`'s SUBSET rule can
+# never hold for it: an id main measures red at 25% is BLOCKed forever as
+# "same id, a DIFFERENT failure" — and blocked randomly, depending on which run
+# sampled the timer. Measured on tortoise PR logs:
+#
+#   BLOCK : tests/test_ep_local_395.py::test_ac5_interactive_latency_zone
+#           signature differs from main's (1/1 (100%) vs 1/4 (25%))
+#
+# The mask is narrowed on THREE axes, and one BOUND axis is DELIBERATELY declared
+# as a residual. Each decision below is grounded in a measured phrasing, because
+# four review cycles each found a hole in the previous cut's shape:
+#
+#   1. A TIME UNIT must follow the number. A bare number stays SIGNAL —
+#      ``expected status 403, got 404``, ``orphaned servers: 16 (threshold: 12)``,
+#      ``91.2%`` and ``12/40`` are the DATA a failure is about.
+#   2. The value must be FRACTIONAL (``1.21``, ``0.12``): a perf-counter
+#      interpolation (``{elapsed:.1f}``/``:.2f``/``:.3f``) is fractional by
+#      construction, and an INTEGER bound — ``≤1s``, ``after 30s``, ``budget 300s``,
+#      the overwhelming majority of declared bounds in this repo — is untouched.
+#   3. The UNIT and the SLOT survive into the token (``<MEAS1:s>`` vs
+#      ``<MEAS1:ms>``), so a change of SCALE (``1.21ms`` vs ``1.21s``) and a
+#      message that gains or loses a duration both stay signal.
+#
+# A COMPARISON OPERATOR is the ONE bound marker honoured: ``≤1.5s``, ``<= 1.5s``,
+# ``<0.1s``, ``>= 2.5s`` is left RAW, because an operator-prefixed value is a
+# limit by construction and a PR that MOVES it is a different failure.
+#
+# WHY THERE IS NO BOUND-NOUN LIST (the four cycle-deep measurement). The tempting
+# next step — leave a duration raw when a word like bound/budget/limit/timeout is
+# nearby — was implemented, reviewed and REMOVED, because this repo uses the SAME
+# nouns for the MEASUREMENT side of the message:
+#
+#   tests/test_engine_probe.py:152      f"probe exceeded its bound: {elapsed:.2f}s"
+#   tests/test_markers.py:1370          f"probe overran its bound: {elapsed:.2f}s"
+#   tests/test_monitoring.py:1363       f"metrics() did not honour the count budget: {…}s"
+#   tests/test_bounded_raw_clients_3065 f"bound not consumed as a bound: {elapsed:.2f}s"
+#
+# A noun list therefore fails BOTH ways at once: it misses phrasings it does not
+# enumerate (``bounded at 0.05s``, ``at most 1.5s``, ``up to 1.5s``, ``worst case
+# 1.50s`` — measured in tests/test_monitoring.py:570, test_session_auth.py:1139,
+# test_ship_test_onboarding.py:5304) and it MISFIRES on the labels above, leaving
+# the #9331 signature volatile for 7 of 8 real duration messages. Every wording
+# added to the list moved the hole rather than closing it.
+#
+# DECLARED RESIDUALS (each PINNED by a test, not asserted in prose):
+#
+#   * a FRACTIONAL bound written as a noun phrase or a label — ``on a 0.1s bound``,
+#     ``budget 3.0s``, ``bounded at 0.05s`` — is masked, so a PR that moves such a
+#     bound alone compares equal. Accepted and declared rather than chased: the
+#     value IS what varies per run, so preserving values would defeat the mask
+#     entirely, and the exemption still has to clear the independent backstops
+#     (`min_runs` floor, main-present, and the rate comparison, #5250) — it is not
+#     a free pass on a PR-unique failure. Pinned by
+#     ``test_9331_a_fractional_noun_phrase_bound_is_a_declared_residual``.
+#   * pytest renders a message-less elapsed assertion as ``assert 1.47 < 1.2`` —
+#     unit-less, indistinguishable from the data a failure is about
+#     (``test_9331_the_unitless_assert_expansion_is_a_declared_residual``);
+#   * an integer-rendered measurement (``{elapsed:.0f}s``) stays volatile, by (2);
+#   * a duration used as DATA with no operator (``measured 10.36 s of the
+#     control's 10.85 s``) is masked in both slots
+#     (``test_9331_a_duration_used_as_data_is_a_declared_residual``);
+#   * units outside the list (``1.5m``, ``1.5h``, ``3 days``) and uppercase units
+#     (``1.2S``) are not masked — under-masking is the fail-CLOSED direction, so
+#     the list grows only on evidence
+#     (``test_9331_out_of_list_units_stay_volatile``).
+_MEASURED_DURATION_RE = re.compile(
+    # ``(?<![\d.])``: without a left anchor ``\d+`` is RETRIED at every offset
+    # inside a long digit run, so a 40 KB run of digits cost 3.47 s and the cost
+    # quadrupled per doubling (cycle 9). Every other number pattern in this list is
+    # left-bounded for the same reason; this one was not.
+    r"(?<![\d.])(?P<num>\d+\.\d+)\s?"
+    r"(?P<unit>ns|us|µs|μs|ms|seconds|second|secs|sec|minutes|minute|mins|min|s)"
+    # ``(?![A-Za-z_])`` rather than ``(?!\w)``: a unit followed by a DIGIT still
+    # masks, so normalisation is IDEMPOTENT for duration text (``1.5s1.7s``
+    # masked once == masked twice). The row readers re-normalise what the writer
+    # normalised, so a non-idempotent step would make writer≠reader and fail the
+    # subset rule closed.
+    #
+    # NON-IDEMPOTENT BY CONSTRUCTION, and declared rather than relied on: a mask
+    # anchored on a LEFT NON-WORD boundary becomes applicable only AFTER the
+    # duration mask replaces the unit letter with ``>`` — ``1.5s746b295c`` →
+    # ``<MEAS1:s>746b295c`` on pass 1, ``<MEAS1:s><HEX>`` on pass 2, and the same
+    # shape holds for ``1.5s0x1f`` → ``<MEAS1:s><ADDR>``. A host:port suffix is NOT
+    # in this class: its port must be NUMERIC, so ``1.5slocalhost:8080`` never masks
+    # (the unit lookahead rejects the letter that follows) while ``1.5s127.0.0.1:8080``
+    # does. This is reachable ONLY when a duration is emitted
+    # immediately before such an id, which pytest text does not do; the two-pass
+    # result is pinned by
+    # ``test_9331_a_duration_before_an_id_stays_a_declared_two_pass_residual`` so a
+    # future producer that reads a raw signature column sees the shape named instead
+    # of discovering it as a permanent block (review cycle 8).
+    r"(?![A-Za-z_])"
+)
+
+#: A comparison operator is the ONE bound marker honoured: a value prefixed by one
+#: is a LIMIT, so a PR that moves it is a different failure. A bare ``=`` is NOT
+#: one (``elapsed=1.21s`` is an interpolation), and the branch is ANCHORED to the
+#: window edge so an earlier ``<`` cannot free a later measurement.
+#: ``_BOUND_OPERATOR_RE``. The ``(?<![-=>])`` guards an ARROW: ``->`` and ``=>``
+#: end in ``>`` and ``=`` but are not comparisons, so without the guard
+#: ``phase collect -> 1.21s`` left the measurement RAW and stayed volatile — an
+#: undeclared residual that kept #9331 open for that phrasing (cycle 9).
+_BOUND_OPERATOR_RE = re.compile(r"(?<![-=>])(?:[<>≤≥]=?|==)\s*$")
+
+#: An ALREADY-MASKED token (``<ADDR>``, ``<HOSTPORT>``, ``<MEAS1:s>``, ``<N>``…).
+#: It is stripped from the left window before the operator test, because these
+#: tokens END IN ``>`` — and that ``>`` is the closing delimiter of a mask, not a
+#: comparison: without this, ``0x1f 1.21s`` read ``>`` as an operator and left the
+#: measurement RAW, re-creating the #9331 block for any message where a masked id
+#: precedes the timer (review cycle 6).
+#:
+#: EVERY token this module can emit is enumerated, because a SHAPE rule cannot
+#: tell a mask from ordinary comparison text. Cycle 8 narrowed the pattern to
+#: ``<[A-Za-z_][^<>]{0,23}>`` ("the inner text starts with a name") and cycle 9
+#: measured that still open: in ``assert a<b and p99 >= 2.5s`` the span
+#: ``<b and p99 >`` starts with a letter, so it was stripped, the operator with it,
+#: and a MOVED bound was masked into one signature — the fail-OPEN direction this
+#: strip exists to prevent. An explicit alternation of the masks actually emitted
+#: (``<ADDR>``, ``<UUID>``, ``<HEX>``, ``<HOSTPORT>``, ``<N>``, ``team_<X>``,
+#: ``<MEAS<n>:<unit>>``) is closed, so comparison text can never match it.
+_MASKED_TOKEN_RE = re.compile(
+    r"<(?:ADDR|UUID|HEX|HOSTPORT|N|X|MEAS\d+:[A-Za-zµμ]+)>"
+)
+
+
+def _mask_measured_duration(m: re.Match[str]) -> str:
+    """``<MEAS<slot>:<unit>>`` for a MEASUREMENT; an operator-prefixed bound stays RAW.
+
+    The slot is the index of the duration-SHAPED number in the message, so a
+    message that gains or loses a duration never collides with the shorter one.
+    See the ``_MEASURED_DURATION_RE`` block for the bound rule and every declared
+    residual (a noun-phrase bound is masked on purpose).
+    """
+    before = _MASKED_TOKEN_RE.sub(
+        " ", m.string[max(0, m.start() - 32):m.start()]
+    )
+    if _BOUND_OPERATOR_RE.search(before):
+        return m.group(0)
+    # The slot is the ordinal of this duration-SHAPED number in the message. It is
+    # read from ONE precomputed pass rather than recounted per match: the previous
+    # form re-scanned the whole prefix inside every match — O(n x k) — and a
+    # duration-dense line cost 4.9 s at 60 KB (review cycle 7, finding 1). The table
+    # is cached per string because the writer and the row readers normalise the SAME
+    # text, and it is keyed on that text, so no state outlives a call.
+    slot = _duration_slot_table(m.string)[m.start()]
+    return f"<MEAS{slot}:{m.group('unit')}>"
+
+
+@functools.lru_cache(maxsize=8)
+def _duration_slot_table(text: str) -> dict[int, int]:
+    """``{match start: ordinal}`` for every duration-shaped number in ``text``.
+
+    One left-to-right pass: a match's ordinal among its siblings IS its slot, which
+    is exactly what the per-match prefix recount computed, so this is a constant-
+    factor change (linear instead of quadratic), not a change of the mask's meaning.
+    ``maxsize`` is small on purpose: the only texts cached are the failure messages
+    of one decision.
+    """
+    return {
+        mm.start(): i
+        for i, mm in enumerate(_MEASURED_DURATION_RE.finditer(text), 1)
+    }
+
+
+# Volatile substrate IDENTIFIERS, each one named by measured evidence. The mask
+# list is deliberately CLOSED and documented: over-normalising is the fail-OPEN
+# direction (two different failures collapsing into one signature would make a
+# PR's signature set a subset of main's more easily), so nothing is masked that
+# the evidence does not demand. Ids/addresses/tenants/measurements only — never
+# data values.
+_VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = (
+    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<ADDR>"),
+    (
+        re.compile(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+            r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+        ),
+        "<UUID>",
+    ),
+    # The declared class's ``_drill_..._416bf7c5``: an 8+ hex suffix is a
+    # per-run subsystem id. ``(?<![0-9a-fA-F])`` (not ``\b``) so the underscore
+    # boundary in ``_416bf7c5`` still matches, while ``assert 3 == 2`` (single
+    # digits) is untouched.
+    (re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{8,}(?![0-9a-zA-Z])"), "<HEX>"),
+    # ``team-graph enumeration failed for team_x`` — the tenant name is the
+    # declared interpolation; the stable part is its shape.
+    (re.compile(r"\bteam_[A-Za-z0-9][A-Za-z0-9_]{0,63}\b"), "team_<X>"),
+    (re.compile(r"\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d{2,5}\b"), "<HOSTPORT>"),
+    # Last, and context-aware: a fractional duration that is a MEASUREMENT is the
+    # machine's, not the assertion's (#9331); an operator-prefixed bound is
+    # signal. The unit and the slot ride the token so SCALE and COUNT stay signal.
+    (_MEASURED_DURATION_RE, _mask_measured_duration),
+)
+
+
+@dataclass
+class SignatureParse:
+    """Signature extraction for one raw ``gh run view --log-failed`` capture.
+
+    ``unsigned`` and ``unattributed`` are EVIDENCE, not diagnostics: they are the
+    rejections that make an exemption unavailable, and the swap must be able to
+    see the count rather than take a silently-trimmed signature set on trust.
+    """
+
+    ids: list[str] = field(default_factory=list)
+    signatures: dict[str, frozenset[str]] = field(default_factory=dict)
+    rejected: list[str] = field(default_factory=list)
+    unsigned: list[str] = field(default_factory=list)
+    unattributed: list[str] = field(default_factory=list)
+    #: The guard-step ids that entered ``ids`` (#4469) — REPORTED, never silent.
+    guard_steps: list[str] = field(default_factory=list)
+    #: The NON-NODEID ids that entered ``ids`` (#6798) — same reason.
+    non_nodeid: list[str] = field(default_factory=list)
+    #: The RUNNER-AGGREGATE ids that entered ``ids`` — same reason (file-coarse).
+    runner: list[str] = field(default_factory=list)
+    #: The BASH-SHARD ids that entered ``ids`` (#2643) — same reason (file-coarse).
+    bash_shard: list[str] = field(default_factory=list)
+    #: The `pipeline-compliance` gate ids that entered ``ids`` (#1185) — same
+    #: reason: a gate check is not a test, and its remedy is named by the check.
+    pipeline_checks: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """False when no usable failure id was found — a capture that proves nothing."""
+        return bool(self.ids)
+
+
+def _strip_log_prefix(line: str) -> str:
+    """Remove the gh ``--log-failed`` ``<job>\\t<step>\\t<ts>Z `` prefix, if present."""
+    return _LOG_PREFIX_RE.sub("", line, count=1)
+
+
+def normalize_signature(text: str | None) -> str:
+    """Reduce raw failure text to the STABLE part, or ``''`` if nothing survives.
+
+    Whitespace is collapsed first (the same assertion is rendered at different
+    prefix widths between runs), then the closed volatile-identifier list above
+    is masked. A result of ``''`` is a REJECTION — callers must never store it as
+    a signature, because an empty signature makes the subset rule vacuous.
+    """
+    if not text:
+        return ""
+    out = " ".join(str(text).split())
+    for pattern, replacement in _VOLATILE_NORMALIZERS:
+        out = pattern.sub(replacement, out)
+    return out.strip()
+
+
+def _signature_from(e_line: str | None, exc: str | None) -> str:
+    """``<ExceptionType>: <assertion>`` — the exception type is always present.
+
+    The type is taken from pytest's ``path.py:LINE: ExceptionType`` trailer and
+    prefixed only when the primary ``E`` line does not already name it, so a
+    message that repeats the class (``AssertionError: family row drifted``) is
+    not doubled.
+    """
+    core = normalize_signature(e_line)
+    exc_n = normalize_signature(exc)
+    if not core:
+        return exc_n
+    if exc_n and not core.startswith(exc_n):
+        return f"{exc_n}: {core}"
+    return core
+
+
+# ==========================================================================
+# HALF 1b (#4469) — GUARD-STEP ATTRIBUTION
+# ==========================================================================
+#
+# THE DEFECT. The id universe was pytest nodeids ONLY, so a failing run whose
+# failure lived in a non-pytest GUARD STEP (an orphan-count assert, a packaging
+# guard, a health gate) yielded NO id. The rail then could not certify it:
+# `examined=1 extracted=0` tripped the fail-closed refusal in admin-merge.sh
+# ("yielded NO parseable 'FAILED <nodeid>' line … This is a refusal") and a green,
+# review-clean PR became unmergeable through the sanctioned path — even though
+# the failure was a real, attributable, and often FLAKY guard owned by another
+# lane. A genuinely new guard-step regression could never be CERTIFIED as new,
+# only refused.
+#
+# GROUNDED IN THE REAL CAPTURE, not an invented format. tortoise PR #4672, run
+# 35785085760 (python-ci.yml, 2026-09-23), `gh run view --log-failed`:
+#
+#   test (b)\tAssert no redislite orphans (issue\t<ts>Z orphaned redislite servers after suite: 16 (pytest rc: 0, threshold: 12)
+#   test (b)\tAssert no redislite orphans (issue\t<ts>Z ##[error]redislite server leak: 16 orphans after suite, threshold 12 (issue #1005 / epic #1647 E2E-7)
+#   test (b)\tAssert no redislite orphans (issue\t<ts>Z ##[error]Process completed with exit code 1.
+#   python-ci-gate\tAggregate matrix result\t<ts>Z ##[error]Process completed with exit code 1.
+#
+# Four facts from that capture shape this parser, and each is load-bearing:
+#
+#   * `pytest` exited rc 0; the failure is the POST-SUITE guard, not a test.
+#   * ANNOTATIONS ARE ANCHORED. The log also ECHOES the script source
+#     (line 40 of the capture: `echo "::error::redislite server leak: $COUNT …"`),
+#     so a mid-line search would manufacture a second, `$COUNT`-bearing identity
+#     for the SAME run and put a phantom failure in the set.
+#   * THE RUNNER'S OWN EXIT ANNOTATION IS NOT AN IDENTITY. `##[error]Process
+#     completed with exit code <N>.` is emitted for EVERY failing step — the
+#     pytest step included, and the aggregate gate step too. Attributing it
+#     would convert a genuinely unparseable run (log format moved; pytest rc≠0
+#     with no FAILED line) into a "guard-step" id, i.e. exactly the fail-closed
+#     refusal this change must PRESERVE. It is excluded, and a step carrying
+#     ONLY it stays unattributable.
+#   * THE IDENTITY IS (STEP, ERROR SHAPE) AND IS WHITESPACE-FREE — and ⛔ NOT
+#     because the rate table cannot carry a space. It CAN: the main rate table's
+#     nodeid is delimited by the TAB (`_RATES_RE`), and #3686's second door is
+#     exactly the bug that made a space unrepresentable there. The guard key
+#     stays whitespace-free because it is a SLUG over a step name and an error
+#     shape, and because the comparison needs the same identity on both trees
+#     despite an orphan COUNT that changes every run. So the step is slugged into
+#     the key and the error SHAPE rides the key tail AND the signature column the
+#     decision already carries.
+
+#: The one prefix no pytest nodeid can produce, so a guard key cannot collide
+#: with a test id.
+_GUARD_KEY_PREFIX = "guard-step::"
+
+#: The runner's OWN annotations for a failing step, emitted for EVERY failing
+#: step. They name no failure, so they are never an identity (see above).
+#: The RUNNER's and its container-hook's own WRAPPERS around a failed step — the
+#: generic messages the harness emits for a step that failed, not the step's own
+#: logic. They are emitted for EVERY failing step, so they name no failure: they
+#: are NEVER an identity, and (where they carry an exit code) they are the positive
+#: signal for "the runner marked this step failed". A closed, documented list
+#: because each entry is a measured harness string — the runner's
+#: `ScriptHandler.cs` form and the container hooks' `core.error` wrappers. A form
+#: MISSING from this list costs BOTH roles at once (the step is not marked failed,
+#: and its wrapper can become a phantom identity), so every form is pinned by a
+#: test: `test_no_runner_or_hook_wrapper_is_ever_an_identity`.
+_RUNNER_GENERIC_ANNOTATIONS = (
+    re.compile(r"^Process completed with exit code '?-?\d+'?\.?$"),
+    re.compile(r"^The process .+ failed with exit code '?-?\d+'?\.?$"),
+    re.compile(r"^Bash exited with code '?-?\d+'?\.?$"),
+    re.compile(r"^Docker failed with exit code '?-?\d+'?\.?$"),
+    re.compile(r"^Failed to run container step:?\b.*$"),
+    re.compile(r"^Failed to initialize containers,?\b.*$"),
+    re.compile(r"^The action .+ has timed out after .+$"),
+)
+
+#: A GitHub Actions error annotation, ANCHORED at the start of the line content.
+#: `gh run view` renders it as `##[error]<message>`; the workflow-command form is
+#: `::error[ props]::<message>`. The anchor is what keeps the echoed script
+#: source (`echo "::error::…"`) out of the id set.
+_ANNOTATION_RE = re.compile(r"^(?:##\[error\]|::error(?: [^:]*)?::)(?P<msg>.*)$")
+
+#: The `<job>\t<step>\t\ufeff<ISO>Z ` head, used to recover the STEP. Split on
+#: tabs (never a greedy `.*`) so the step is the real second column, and require
+#: the timestamp head so a content line that merely contains tabs is not mistaken
+#: for a prefix.
+_TS_HEAD_RE = re.compile(
+    r"^\ufeff?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z[ \t]"
+)
+
+#: The CLI's whitespace-free guard key — see the section header for WHY one token
+#: is mandatory. The charset is exactly what :func:`_slug` emits.
+_GUARD_KEY_RE = re.compile(r"^guard-step::[A-Za-z0-9_.\-]+::[A-Za-z0-9_.\-]+$")
+
+#: An integer RUN — the run-varying quantity in a guard message (an orphan COUNT,
+#: a measured value). Masked in the identity so the same guard on main and on the
+#: PR compares despite a different number, exactly as a test signature masks a
+#: per-run id. THE TRADE IS DECLARED: guard failures differing ONLY numerically
+#: collapse into one identity, and the attribution evidence (the per-id
+#: `min_runs` floor plus signature overlap) together with the rate comparison
+#: where the PR sample is measurable (#5250) is the backstop that still has to
+#: hold for an exemption.
+_GUARD_INT_RE = re.compile(r"\b\d+\b")
+
+
+#: A NON-NODEID failure key (#6798, #7131) — the families the rate/row doors must
+#: admit. ANCHORED and fully enumerated: this predicate is the gate on main's own
+#: rate table, so admitting a loose string here is a false-EXEMPTION vector, not
+#: a formatting nicety.
+#:
+#: `job-unreadable::<slug>` (#7131) is the JOB-LEVEL fallback the producer emits
+#: when GitHub has PRUNED a failing run's log — the test-level identity does not
+#: exist anywhere, so the run is attributed at job granularity instead of being
+#: refused as unknowable. It carries NO signature, which is what keeps it safe:
+#: the signature gate fails CLOSED on an empty overlap, so a job-level key can
+#: never buy an exemption — it converts an unreadable refusal into a named,
+#: attributable block. The slug charset is exactly `_slug`'s, so the key stays
+#: whitespace-free — for the SLUG identity's own sake, not because the rate table
+#: could not carry a space (#3686 retired that rationale: the rate table's nodeid is
+#: TAB-delimited, and a space in one is the second door this change fixed).
+#:
+#: `bash-shard::<path>` (#2643) is a bash SHARD's own identity, and
+#: `runner::<slug>` is a JS/TS aggregate's. Both are file-coarse and both are admitted on a
+#: nodeid's terms — an id buys nothing unless it is in main's rate table.
+#:
+#: ⛔ DECLARED RESIDUAL — THE SIGNATURE GATE CANNOT DISCRIMINATE FOR THESE TWO FAMILIES.
+#: `_BASH_SHARD_SIG = "bash-shard"` (and `runner-aggregate`) is ONE CONSTANT for every member,
+#: so `_signatures_overlap` reduces to "both sides carry this id" and adds nothing over the
+#: rate row. What that means in production: `k_pr = max(row.runs)` is 1 for a PR head, so the
+#: `1 <= k_pr < min_runs` attribution-only branch is the NORM, and a NEW breakage inside shard S
+#: — a bash-level assertion, a missing command, a timeout, i.e. exactly the failures that carry
+#: no pytest nodeid — is exempted whenever main also failed S once in its window. That is the
+#: price of FILE granularity, and it is the SAME trade `runner::` already carries; it is stated
+#: here rather than left implicit because this family is new and a reader comparing it to a
+#: nodeid would otherwise assume a discriminating signature. Per-`case` (or per-test-name)
+#: identities would restore the discrimination at the cost of the instability file granularity
+#: exists to avoid; that trade is the owner's to reopen, not a lane's to reverse.
+#:
+#: ⛔ EVERY PRODUCER IN THIS MODULE MUST APPEAR HERE, and omitting one is the
+#: #6798 failure mode, not a formatting bug: an id PRODUCED by a parser and
+#: REJECTED here is dropped by `parse_failure_rows` — so `decide` sees an EMPTY
+#: PR set and reports `CLEAN blocked=0` — and dropped by `parse_rates`, so main's
+#: row vanishes too. Measured in review of #2648: `bash-shard::…` was produced,
+#: printed by the CLI, and then silently discarded one layer down, which would
+#: have converted this change from a truthful refusal into a false PASS. The same
+#: measurement showed `runner::…` had been in exactly that state since it was
+#: introduced, because the vector below enumerated only two of the three families
+#: that existed when it was written. The pytest vector for this predicate now
+#: enumerates ALL of them, so the next producer reddens instead of vanishing.
+_NON_NODEID_KEY_RE = re.compile(
+    r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py"
+    r"|job-unreadable::[A-Za-z0-9_.\-]+|bash-shard::[A-Za-z0-9_./%\-]+"
+    r"|runner::[A-Za-z0-9_.\-]+)$"
+)
+
+
+def is_failure_key(key: str) -> bool:
+    """Is ``key`` in the universe the RATE table accepts (#4469)?
+
+    A pytest nodeid, a guard-step identity, a non-nodeid failure identity
+    (#6798) AND a `pipeline-compliance` gate identity (#1185) are all failure
+    keys; the same predicate must gate
+    :func:`parse_rates`, or main's rate row is dropped and every such failure
+    reads as PR-unique forever.
+
+    ⛔ THE STAKES ARE ASYMMETRIC, which is why this is enumerated rather than
+    pattern-loose. `parse_rates` reads MAIN's table: a key wrongly ADMITTED here
+    enters the exemption allowlist, while a key wrongly REJECTED is dropped — and
+    a dropped main-side row makes the PR-side failure look unique, which BLOCKS.
+    Both directions were measured: omitting the #6798 family from this pair of
+    predicates did not merely block, it made `parse_failure_rows` reject the PR's
+    own row, so `decide` saw NO failure and emitted a clean verdict for a red PR
+    (a silent false PASS — strictly worse than the refusal it replaced).
+    """
+    return bool(
+        _NODEID_RE.match(key)
+        or _GUARD_KEY_RE.match(key)
+        or _NON_NODEID_KEY_RE.match(key)
+        or _PIPELINE_KEY_RE.match(key)
+    )
+
+
+def is_failure_key_loose(key: str) -> bool:
+    """The LOOSE (parameter-space-permitting) form of :func:`is_failure_key`."""
+    return bool(
+        _NODEID_LOOSE_RE.match(key)
+        or _GUARD_KEY_RE.match(key)
+        or _NON_NODEID_KEY_RE.match(key)
+        or _PIPELINE_KEY_RE.match(key)
+    )
+
+
+def _split_log_line(line: str) -> tuple[str, str, str]:
+    """``(job, step, content)`` from a gh ``--log-failed`` line.
+
+    Returns ``('', '', line)`` when the line carries no ``<job>\t<step>\t<ts>Z ``
+    head — the caller then has no step and must not invent one. The guard pass
+    SKIPS such a line entirely (``guard_step_failures``), so a stripped capture
+    cannot manufacture a step nor an attribution.
+
+    A tab INSIDE the job or step name defeats the field split, so the same greedy
+    prefix the nodeid pass uses (:data:`_LOG_PREFIX_RE`) is the fallback — the two
+    passes must not disagree about one capture.
+    """
+    parts = line.split("\t", 2)
+    if len(parts) == 3:
+        head = _TS_HEAD_RE.match(parts[2])
+        if head:
+            return parts[0], parts[1], parts[2][head.end():]
+    m = _LOG_PREFIX_RE.match(line)
+    if m:
+        fields = m.group(0).split("\t")
+        if len(fields) >= 3:
+            return fields[0], "\t".join(fields[1:-1]), line[m.end():]
+    return "", "", line
+
+
+def _slug(text: str) -> str:
+    """A whitespace-free token for a guard key; never empty."""
+    slug = re.sub(r"[^A-Za-z0-9_.\-]+", "-", text).strip("-")
+    return slug or "unknown"
+
+
+def normalize_guard_error(message: str) -> str:
+    """The STABLE shape of a guard-step error message, or ``''``.
+
+    Whitespace is collapsed and the SAME closed volatile-identifier list as
+    :func:`normalize_signature` is applied, then integer runs are masked too (see
+    ``_GUARD_INT_RE`` for the declared trade).
+    """
+    shape = normalize_signature(message)
+    if not shape:
+        return ""
+    return _GUARD_INT_RE.sub("<N>", shape)
+
+
+def _collection_error_id(line: str) -> str | None:
+    """``collect-error::<path>`` for a pytest COLLECTION-ERROR record, else None.
+
+    pytest's collection-error record is ``ERROR <path>.py - <reason>`` (measured,
+    run 36809707842: ``ERROR tests/test_gmm_proofs.py - AttributeError: partially
+    initialized module 'torch' has no attribute 'Tensor'``). It names a FILE that
+    could not be collected and NO test id, so the nodeid shape check drops it and
+    the run contributes nothing — the #6798 permanent refusal.
+
+    THREE conditions, all required:
+
+    1. **The record is LEADING** — the line STARTS with ``ERROR``. A run log
+       echoes the workflow's own shell source, so a substring match would fire on
+       prose (the #1396/#5194 class). Anchoring is what makes the assertion sound.
+    2. **The payload is a bare ``.py`` path** — no ``::``, no spaces. This is the
+       ONLY reason the nodeid pass did not take it, and it is what distinguishes a
+       real file from the English words the drop accounting exists to catch
+       (``FAILED may``).
+    3. **A reason is optional but the path is not invented** — ``ERROR <path>``
+       alone is accepted because pytest prints the bare form when the reason is
+       elided; the path shape is the guarantee, not the detail.
+
+    ⛔ The ``ERROR`` keyword is REQUIRED and is not interchangeable with
+    ``FAILED``: pytest emits collection errors under ``ERROR`` only, so admitting
+    ``FAILED <path>.py`` would let any prose line that happens to end in ``.py``
+    buy an identity.
+
+    The returned id is keyed on the FILE and NOT on the reason: the reason is an
+    exception message that varies run to run, and an identity that tracks it can
+    never match main's baseline — the #3756 rotating-identity class, which reads
+    as "unique to this PR" on every run for as long as it exists.
+    """
+    m = _COLLECT_ERROR_RE.match(line)
+    if not m:
+        return None
+    return f"{_COLLECT_ERROR_PREFIX}{m.group('path')}"
+
+
+def _log_lines(text: str) -> list[str]:
+    """``text`` as PREFIX- and ANSI-stripped lines — the record rule's own view.
+
+    Both doors and both non-nodeid passes read the capture through this, so they
+    cannot disagree about what a line says. Reading the RAW capture instead is a
+    silent miss: every record line carries a ``<job>\t<step>\t<ts>Z `` head, so an
+    anchored pattern matches nothing — a fix that never fires, which is
+    indistinguishable from an absent fix until a killed leg blocks the fleet
+    again. Stripping ANSI here also keeps colour from defeating the
+    echoed-source discriminator.
+    """
+    return [
+        _strip_log_prefix(_ANSI_RE.sub("", raw)).strip()
+        for raw in text.splitlines()
+    ]
+
+
+def non_nodeid_failures(
+    text: str,
+) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(ids, {id: {signature}})`` for the NON-NODEID failure evidence (#6798).
+
+    ONE helper for BOTH doors, exactly as ``guard_step_failures`` is (#4469): the
+    ``ids`` CLI and the ``signatures`` CLI must not disagree about this universe.
+    They must not disagree about the SIGNATURE either — §4.6 compares signatures
+    with a subset rule, and an id signed by one door but not the other fails that
+    rule closed, so the identity would BLOCK instead of compare (the half of the
+    input a bare id extraction does not correct; found by the verifier, not by
+    the unit suite).
+
+    Two shapes, both measured, both raw-log only:
+
+    * a COLLECTION ERROR — ``ERROR <path>.py - <reason>``. Keyed on the FILE;
+      the reason is an exception message that varies run to run, and an identity
+      that tracks it can never match main's baseline (the #3756
+      rotating-identity class).
+    * a WATCHDOG KILL — the banner, at any budget and with or without the
+      ``carve-out`` qualifier. A BARE failure only at ``0 failed`` AND
+      ``0 errored``: those are the conditions under which nothing asserted
+      false. A kill after failures were reported has real nodeids, and those ARE
+      the PR's failures — emitting the bare kill identity there would let a
+      genuine assertion failure ride an environmental exemption.
+    """
+    lines = _log_lines(text)
+    ids: list[str] = []
+    signatures: dict[str, frozenset[str]] = {}
+    for line in lines:
+        collect_id = _collection_error_id(line)
+        if collect_id is not None:
+            ids.append(collect_id)
+            signatures[collect_id] = frozenset({_COLLECT_ERROR_SIG})
+    if any(_WATCHDOG_KILL_RE.match(line) for line in lines):
+        ids.append(_PYTEST_KILL_ID)
+        signatures[_PYTEST_KILL_ID] = frozenset({_WATCHDOG_KILL_SIG})
+    return sorted(set(ids)), signatures
+
+
+#: A JS/TS RUNNER's own aggregate line — the evidence a non-pytest harness prints when
+#: it finishes: ``❌ <label>: <N> passed, <M> failed, <K> skipped``. Measured shape
+#: (extensions/main-worktree-guard/test-discard-gate.mjs and its siblings).
+#:
+#: WHY THIS EXISTS: the rail's universe was pytest nodeids, guard-step annotations and
+#: the collection-error/kill evidence. A JS test file has none of those — its failures
+#: are individual ``❌ <case>: …`` lines and one aggregate line — so EVERY PR whose CI
+#: carried a failing extension test hit the "yielded NO parseable failure identity"
+#: refusal, which is not a comparison and cannot be argued with. Measured 2026-10-19:
+#: main's own tip was red on `test-discard-gate` and no PR could merge at all.
+#:
+#: ⛔ IT CAN ONLY ADD IDENTITIES, NEVER REMOVE ONE (the fail-closed direction): a parse
+#: pass that appends to the universe can make the failing set BIGGER (so a PR fails to
+#: certify as "not new") but can never make it smaller. The identity is keyed on the
+#: RUNNER LABEL, not on a case name or a count — a case label can be reworded and a
+#: count changes with the suite's size, and an identity that tracks either can never
+#: match main's baseline (the #3756 rotating-identity class). It is deliberately
+#: FILE-COARSE (one identity per runner, not per case): coarser than a nodeid means two
+#: distinct failures inside one file compare as one, which is a DECLARED residual — it
+#: under-counts the PR's failing set, in the direction that keeps a genuinely new
+#: failure attributable only at file granularity, never at case granularity.
+#: ⚠ THE LABEL MAY BE WRAPPED IN MARKDOWN BOLD (measured in the real Actions log:
+#: ``❌** **test-discard-gate**: 470 passed, 2 failed``). The capture is not plain text —
+#: the runner renders ``**`` around tokens — so a pattern anchored on a bare label
+#: matches NOTHING against the capture it exists for, which is the "fix that never
+#: fires" class this module's other patterns warn about. ``\*{0,2}`` on both sides of
+#: the label absorbs it; the identity itself is still the bare label.
+_RUNNER_AGG_RE = re.compile(
+    r"^(?:❌|✗)\s*\*{0,2}\s*(?P<label>[A-Za-z0-9_][A-Za-z0-9_.\-]*?)\s*\*{0,2}:\s*"
+    r"(?P<passed>\d+)\s+passed,\s+(?P<failed>\d+)\s+failed"
+)
+_RUNNER_KEY_PREFIX = "runner::"
+_RUNNER_AGG_SIG = "runner-aggregate"
+
+
+#: A BASH SHARD's own attribution line — `scripts/run-bash-shards.sh` prints one per listed shard
+#: whose run raised its error counter (#2643): ``❌ failed shard: <path>``.
+#:
+#: WHY THIS EXISTS: that runner's verdict used to carry a COUNT and nothing else (``❌ N bash
+#: shard(s) failed``), so on 2026-10-24 four shards were red on `main` and every PR slice printed
+#: ``❌ 1 bash shard(s) failed`` — the rail refused with "yielded NO parseable failure identity" and
+#: the only way to learn WHICH suite was red was to hand-bisect an 18,695-line job log against the
+#: runner's own timeline rows. A red the rail cannot name is a freeze with no owner.
+#:
+#: ⛔ KEYED ON THE PATH, and only on the explicit ``failed shard:`` prefix — NOT on the bare
+#: ``❌   <path>`` rows that follow it in the verdict, which a parser cannot tell from any other
+#: indented line, and NOT on the ``▸ <secs> <path>`` timeline rows, which are printed for PASSING
+#: shards too (so keying there would make every green shard a "failure identity" and inflate the
+#: PR's failing set until nothing could ever certify). File-coarse for the same reason the runner
+#: aggregate above is: the shard's internal case names are not stable.
+#:
+#: ⛔ THE TOKEN IS THE PATH, NOT A SLUG OF IT, and that is a CORRECTNESS property, not
+#: cosmetics. `_slug` maps `/` and `-` onto the SAME character, so slugging a path is not
+#: injective: `scripts/a-b.test.sh` and `scripts/a/b.test.sh` both became
+#: `bash-shard::scripts-a-b.test.sh` — two DIFFERENT shards sharing ONE identity. An identity
+#: is what the rail compares against main's baseline, so a shard nobody had ever run could be
+#: exempted on the strength of an unrelated shard's history (measured in #2648 review:
+#: `decide` returned ``exempt`` for the colliding key, and the constant signature cannot save
+#: it because every shard carries the same one). A path is already whitespace-free, so the
+#: slug bought nothing here. `test_bash_shard_identity_is_injective_over_the_listed_shards`
+#: pins it against the runner's real list (86 shards today).
+_BASH_SHARD_RE = re.compile(
+    r"^(?:❌|✗)(?:\s*\*\*)*\s*(?i:failed shard):\s*(?P<label>\S.*?)\s*$"
+)
+
+#: THE RUNNER'S RECAP LINE — `❌ failing shard(s): <a>, <b>` — the SAME failure set the
+#: per-shard line carries, printed once at the END of the step instead of once per shard.
+#:
+#: WHAT THIS ARM IS, HONESTLY: REDUNDANCY, not the thing that repaired #2534 — and the `ids=0`
+#: that motivated it belongs to the FIXTURE, not to the run. `tests/fixtures/rail/
+#: bash-suites-shard-recap.txt` is the 7-line tail of the step: it carries the runner's generic
+#: `##[error]Process completed with exit code 1.` (which is deliberately NEVER an identity, see
+#: `_RUNNER_GENERIC_ANNOTATIONS`) but neither the per-shard line nor the step-prefixed
+#: `##[error]bash shard failed:` annotation, so the shard pass's GUARD-STEP half has nothing to
+#: attribute. On the real run that annotation DOES name the shard on `main` — since #3105 it is
+#: re-homed onto the shard family by `_BASH_SHARD_ANNOTATION_RE`/`bash_shard_annotation_key`
+#: (before that, the guard-step pass slugged it into a `guard-step::` key), and #2648's per-shard
+#: family — the base of this commit — is a second read of the same set.
+#: Nothing in `scripts/ci-failure-set.sh` truncates a capture, so no capture of this run was
+#: unattributable by design; what read `ids=0` was the excerpt, on its own.
+#:
+#: So why read it at all? Because it is the runner's own COMPLETE summary of the same set, it is
+#: one line, and it is the shape that survives independently of the per-shard one: an emitter
+#: revision (past or future) that prints only the recap still names every failing shard, and a
+#: capture assembled from a partial log can carry the foot of the step without the middle. That is
+#: a cheap second read of a set the gate already trusts the first read of — and it can only ADD
+#: identities, never remove one.
+#:
+#: ⛔ THE LIST IS SPLIT ON THE EMITTER'S OWN SEPARATOR, `", "` — never on a bare `,`. The runner
+#: builds it as `${shard_failed_list}` joined by `, ` (scripts/run-bash-shards.sh). DECLARED
+#: RESIDUAL: a path that itself contains `, ` is therefore split, and its two halves become two
+#: identities that match nothing on main — a FALSE BLOCK on that shard, in the fail-closed
+#: direction. The per-shard line ADDS the true identity but removes nothing, so the phantom
+#: halves block even when both shapes are present. No listed shard carries `, ` today
+#: (`scripts/run-bash-shards.sh --list`). A bare-`,` split would be strictly worse: it cuts every
+#: comma-containing path whether or not a space follows.
+_BASH_SHARD_RECAP_RE = re.compile(
+    r"^(?:❌|✗)(?:\s*\*\*)*\s*(?i:failing shard\(s\)):\s*(?P<names>\S.*?)\s*$"
+)
+#: ⛔ THE BOLD PAIRS ARE STRIPPED IN THE BULLET POSITION ONLY, never on the whole line
+#: (see :func:`bash_shard_failures`). `line.replace("**", "")` — the sibling's rule — also rewrote
+#: the LABEL, so `scripts/a**b.sh` became `bash-shard::scripts/ab.sh`, identical to `scripts/ab.sh`:
+#: an injectivity break in the very identity this module exists to keep unique (#2648 cycle-6
+#: review). A swept filename CAN carry `**` through `for f in $pattern` literally, which is the only
+#: way it is reachable — narrow, and still a false attribution if it happens.
+#: Matched against ``line.replace("**", "")`` for the same reason `_RUNNER_AGG_RE` is
+#: (see :func:`bash_shard_failures`): ONE rendering rule for both `❌`-keyed parsers.
+_BASH_SHARD_KEY_PREFIX = "bash-shard::"
+_BASH_SHARD_SIG = "bash-shard"
+
+#: THE RUNNER'S OWN ANNOTATION FOR THE SAME EVENT — ``::error::bash shard failed: <path>``,
+#: emitted by `scripts/run-bash-shards.sh`'s `run_shard` the moment a listed shard fails.
+#:
+#: WHY THIS PATTERN EXISTS AT ALL (#3105). That annotation reached the GUARD-STEP pass, which
+#: builds `guard-step::<step>::<error shape>` and SLUGS the message into the shape. `_slug` is
+#: not injective — `/`, `-`, `:` and a space all become `-` — so the identity it produced was
+#: `guard-step::<step>::bash-shard-failed-scripts-a-b.test.sh` for BOTH `scripts/a-b.test.sh`
+#: and `scripts/a/b.test.sh`. That is #2648's exact defect, left open in the one family it was
+#: never closed for, and it is fail-OPEN rather than cosmetic: an identity is what the decision
+#: compares against the base's rate table, so a base red on ONE of the colliding paths could
+#: exempt a NEW red on the other. The same message ALSO carries the path verbatim, which the
+#: shard family above already turns into an injective `bash-shard::<token>` identity from the
+#: runner's own `❌ failed shard:` line — so the annotation is mapped onto THAT identity instead
+#: of a parallel, lossier one. One event, one identity, both doors.
+#:
+#: ⛔ THE POLARITY IS PRESERVED, and it is the whole safety of the mapping: the resulting id is
+#: an ordinary `bash-shard::<path>`, so it is exempt only when the BASE measured the same token.
+#: A shard the base has never run yields an id the base's rate table cannot carry, which BLOCKS
+#: — the same rule as before, now at a granularity that cannot be forged by a sibling path.
+_BASH_SHARD_ANNOTATION_RE = re.compile(
+    r"^(?i:bash shard failed):\s*(?P<label>\S.*?)\s*$"
+)
+
+#: ⛔ THE RUNNER'S **PARTIAL** RECAP — ``⚠️ RECAP INCOMPLETE (k/n shards ran)`` — is NOT a failure
+#: set, and this module must say so (agent-infra#3174).
+#:
+#: THE DEFECT. Until #3174 a KILLED shard step printed no recap at all, so a job that was terminated
+#: mid-list published a failure set that silently SHRANK as the job got slower — measured over three
+#: consecutive main runs: 13, then 11 (run `41217287437`, killed at 111 min), then 10 failing shards
+#: named, with nothing fixed in between. Every batch verdict in this fleet is
+#: ``batch_failures − main_failures``, so a shard genuinely red on main DROPS OUT of the reference
+#: set, reappears as "a new failure caused by the batch", and gets a constituent dropped or
+#: reverted on a false signal. Read as an improvement, it also HIDES the failures that were real.
+#:
+#: THE RUNNER NOW PRINTS THE PARTIAL RECAP (a TERM/INT trap) and prefixes it with this marker, so an
+#: interrupted run still NAMES what it saw while stating — in the same line — that it is incomplete.
+#: A partial recap that LOOKS FULL is worse than no recap, so the marker is load-bearing: this
+#: pattern is what turns "a shorter list" into "UNPROVEN", and the two readers below refuse rather
+#: than hand a truncated set to `decide()`.
+#:
+#: ⛔ WHY A REFUSAL AND NOT A FILTER. Dropping the missing shards is not available — they are missing,
+#: not absent-from-the-run — and keeping the ones that DID fail is exactly the "a partial set looks
+#: like a set" fold this exists to stop: the truncated capture would then be subtracted as if it
+#: were the whole baseline. So the capture yields NO ids at all and the caller fails closed, naming
+#: this cause (exit code :data:`_EXIT_TRUNCATED_CAPTURE`, the shell's `truncated:` state).
+#:
+#: The emoji is optional in the pattern because a capture's rendering is not the runner's: the
+#: variation selector (`\ufe0f`) can be dropped by whatever re-renders the log — a paste, a
+#: re-encoding, a terminal capture — and a capture that lost the glyph must still be recognised, since
+#: an unrecognised marker is a silent return to the #3174 failure mode. (⛔ NOT by this module's own
+#: ANSI stripping: `_ANSI_RE` removes ANSI CSI sequences — the final byte class `[A-Za-z]` covers
+#: `ESC[2K`/`ESC[1A` as well as SGR — and CANNOT consume U+FE0F, which is not `ESC` and not in that
+#: class. The tolerance is for renderings that happen OUTSIDE this parser, and being glyph-independent
+#: costs nothing.)
+_BASH_SHARD_INCOMPLETE_RE = re.compile(r"^[\u26a0\ufe0f\s]*(?i:RECAP INCOMPLETE)\b")
+
+#: The exit code meaning "this capture was READ and it says its own recap is INCOMPLETE". Distinct
+#: from 1 ("the input could not be read") on purpose: `scripts/ci-failure-set.sh` maps it onto the
+#: `truncated:` state, because the operator's remedy is not "fix the parser" — it is "this RUN is
+#: unproven, do not build a baseline from it" (#3174).
+_EXIT_TRUNCATED_CAPTURE = 4
+
+#: ⛔ THIS PASS MAY ONLY EVER ADD AN IDENTITY — never drop one (#2700 review, cycle 3, P1).
+#: A filter over the SHARED label list was tried and reverted: `$`, a backtick and `<`/`>` ARE
+#: legal in POSIX filenames, so dropping them also dropped the per-shard arm's REAL identity
+#: (`❌ FAILED SHARD: scripts/evil$a.sh`, which the parent commit attributed), and `sweep_file()`
+#: reaches `shard_named_failure` without the listed-shard gate. With any other id present the run
+#: still advances `extracted`, so `admin-merge.sh`'s `examined > extracted` refusal never fires and
+#: `decide` certifies the red PR with `blocked=[]` — the #6798/#2193 fail-open, reached from a
+#: normal repo file. So an unexpanded-looking label is NOT filtered; it becomes a `bash-shard::`
+#: token (`$shard_failed_list` -> `%24shard_failed_list`) that can never be in main's rate table.
+#:
+#: DECLARED RESIDUAL: that token BLOCKS on the shard it names, i.e. a permanent false block IF a
+#: capture ever carries this file's source verbatim. The runner prints the EXPANDED value, so no
+#: capture of a real run carries it; and it is the property the per-shard arm already had on
+#: `main` (`❌ FAILED SHARD: %s` -> `bash-shard::%25s`). Fail-closed by over-blocking, never by
+#: dropping — that asymmetry is the whole rule.
+
+#: What `_shard_token` leaves verbatim — a PATH, plus `.`/`-`/`_`. `/` is admissible because the
+#: key's constraint is WHITESPACE-FREE (a slug identity), not slash-free. (⛔ The rate table is
+#: TAB-delimited since #3686 — a space in a nodeid is exactly the second door that issue names —
+#: so "whitespace-free" is a property of this token, not of the table it travels through.)
+#:
+#: ⛔ THE TOKEN IS ENCODED HERE, NOT BY `quote()`, and that is deliberate. urllib's ALWAYS-safe set
+#: includes `~`, so `quote` never escapes it: a path containing `~` produced
+#: `bash-shard::a~b.sh` while the row door admitted only the chars below, so the identity was
+#: produced, printed by the CLI, and silently DROPPED (`decide` → `CLEAN blocked=0`) — measured in
+#: #2648 cycle-4 review. Patching that with a `~`→`%7E` post-pass left a per-character fallback
+#: that was itself NOT injective (`"%%%02X" % ord(c)` has no fixed width, so `\U0001F600` and
+#: `\x1f`+`600` collided) — cycle-5 review. So the encoder is local, fixed-width UTF-8
+#: percent-encoding: injective BY CONSTRUCTION, no `quote`, and NO fallback branch at all.
+_SHARD_VERBATIM = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/"
+)
+#: The charset :data:`_NON_NODEID_KEY_RE` admits for a shard key — the verbatim set plus `%`.
+#: `test_shard_token_is_in_the_row_doors_alphabet_for_every_hostile_path` pins
+#: `_shard_token(label)` ⊆ this for hostile labels, i.e. the producer cannot emit a key its own
+#: door rejects.
+_SHARD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./%\-]+$")
+
+
+def _shard_token(label: str) -> str:
+    r"""A whitespace-free, INJECTIVE token for a shard path.
+
+    See `_BASH_SHARD_RE` for why a slug is not injective, and `_SHARD_VERBATIM` for why this is
+    not `quote`. Each byte outside the verbatim set becomes `%XX` (fixed width, UTF-8), so two
+    different paths cannot produce one token, `%` itself is escaped (`%25`) and cannot forge an
+    escape, and there is NO fallback path that could be lossy. For every shard the runner lists
+    (`run-bash-shards.sh --list`, 86 today) the token IS the path, verbatim.
+
+    A LEADING `./` IS STRIPPED FIRST — repo-relative normalisation, and it is a CORRECTNESS rule
+    rather than tidiness: the two shapes this module reads (the per-shard line and the recap)
+    both come from the same shell variable, but a capture assembled from different sources can
+    spell one shard `./scripts/x.sh` and the same shard `scripts/x.sh`. Un-normalised those are
+    TWO identities for ONE file, and the second one can never match the baseline the other one
+    measured — which is a permanent false block. It cannot merge two DIFFERENT files: `./a` and
+    `a` name the same path.
+
+    ⛔ THE STRIP IS LOOKAHEAD-GUARDED AND MAY NOT EMPTY THE LABEL (#2648 review, cycle 1). Two
+    measured defects in the unguarded form `^(?:\./)+`:
+
+    * a label of exactly `./` stripped to `""`, so the key became `bash-shard::` —
+      which the `ids` door reports as an id (`ok=True`, so the rail's `examined > extracted`
+      refusal does NOT fire) while `parse_failure_rows`/`parse_rates` REJECT it, so `decide`
+      sees an EMPTY failure set and certifies a red PR. A produced-but-rejected id is the
+      #6798/#2193 fail-open; the caller now drops an empty token, and this strip cannot create
+      one.
+    * `.//x` (≡ relative `x`) stripped to `/x` (ABSOLUTE) — the same token as a genuinely
+      absolute `/x`, i.e. two different paths sharing one identity. The lookahead requires a
+      non-`/` after the last `./`, so `.//x` keeps its dots (a duplicate identity for one file,
+      fail-closed) instead of colliding with another one.
+    """
+    out: list[str] = []
+    for ch in re.sub(r"^(?:\./)+(?=[^/])", "", label.strip()):
+        if ch in _SHARD_VERBATIM:
+            out.append(ch)
+        else:
+            out.extend(f"%{b:02X}" for b in ch.encode("utf-8"))
+    return "".join(out)
+
+
+def bash_shard_annotation_key(message: str) -> str | None:
+    """The canonical shard id for the runner's `bash shard failed: <path>` annotation.
+
+    ``None`` when ``message`` is not that annotation, so the caller falls through to the
+    guard-step key it has always built — this function only ever REDIRECTS the shard event, it
+    never widens what counts as an attributable guard failure.
+
+    It builds the id with :func:`_shard_token` — the shard family's own injective encoder — so
+    the two producers of one shard failure (this annotation, and the runner's `❌ failed
+    shard:` line) yield the SAME token for the SAME path. Two encoders for one identity is how
+    a base red on `scripts/a/b.test.sh` came to look like a PR red on `scripts/a-b.test.sh`.
+    A label that encodes to nothing yields ``None``, never a `bash-shard::` half-key: the two
+    doors disagree about an empty token, and that disagreement is the #6798/#2193 fail-open
+    (see `bash_shard_failures`).
+    """
+    m = _BASH_SHARD_ANNOTATION_RE.match(message)
+    if m is None:
+        return None
+    label = m.group("label")
+    # ⛔ THE REDIRECT IS NARROW: the label must LOOK LIKE A SHARD PATH (#3105 review, cycle 1).
+    # Keyed on the phrase alone, any failed step's annotation that merely began with
+    # `bash shard failed:` became a shard identity — `bash shard failed: see logs` and
+    # `bash shard failed: none` included — which both LOSES that failure's step-scoped guard
+    # identity and moves the declared echoed-source residual onto an id that IS in the base's
+    # rate table when the base is red on that shard (i.e. turns a blocking phantom into an
+    # exemptable one). Every shard `run-bash-shards.sh --list` prints is repo-relative
+    # (`scripts/…`, `tests/…`, `pi-bootstrap/…`), so requiring a `/` cannot exclude a real
+    # shard, and anything path-less falls through to the guard key it has always had.
+    if "/" not in label:
+        return None
+    token = _shard_token(label)
+    if not token:
+        return None
+    return f"{_BASH_SHARD_KEY_PREFIX}{token}"
+
+
+def bash_shard_recap_incomplete(text: str) -> str | None:
+    """The runner's INCOMPLETE-RECAP marker line, or ``None`` when the capture recapped fully.
+
+    ONE reader for the marker (``_BASH_SHARD_INCOMPLETE_RE``), so both CLI doors — and any future
+    consumer — agree about whether a capture's failure set is a SET or a TRUNCATED sample
+    (agent-infra#3174).
+
+    Returns the marker LINE rather than a bool: the refusal has to quote what it saw, and a
+    truncation message that names neither the shard counts nor the signal is a claim the operator
+    cannot check. ``None`` means "no marker", which is the only state that may be folded into a set
+    difference — never "the marker was not found, therefore the run was fine": a killed run that
+    printed nothing at all is #3174's original shape, and it is not this function's to certify.
+    """
+    for line in _log_lines(text):
+        if _BASH_SHARD_INCOMPLETE_RE.match(line):
+            return line
+    return None
+
+
+def bash_shard_failures(
+    text: str,
+) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(ids, {id: {signature}})`` for `run-bash-shards.sh`'s attribution lines.
+
+    TWO shapes, one helper: the per-shard line (`_BASH_SHARD_RE`) and the runner's recap
+    (`_BASH_SHARD_RECAP_RE`).
+
+    ONE helper for BOTH doors, exactly as `non_nodeid_failures`, `guard_step_failures` and
+    `runner_aggregate_failures` are: the `ids` CLI and the `signatures` CLI must not disagree about
+    this universe OR its signature (an id signed by one door and not the other fails §4.6's subset
+    rule closed, so the identity would BLOCK instead of compare).
+    """
+    ids: list[str] = []
+    signatures: dict[str, frozenset[str]] = {}
+    for line in _log_lines(text):
+        # ⛔ MATCHED ON THE RAW LINE, NOT `line.replace("**", "")`. The bold pairs belong to the
+        # BULLET, and `_BASH_SHARD_RE` consumes them there (`(?:\s*\*\*)*`); stripping them from
+        # the whole line would also rewrite a path containing `**` and collapse two shards onto one
+        # identity (#2648 cycle-6). The two `❌`-keyed parsers still agree on the plain rendering,
+        # which is what both emit; this one additionally survives the bold shape.
+        m = _BASH_SHARD_RE.match(line)
+        if m is not None:
+            labels = [m.group("label")]
+        else:
+            # THE RECAP (#2700) — every shard it names is an identity, not only the first.
+            recap = _BASH_SHARD_RECAP_RE.match(line)
+            if recap is None:
+                continue
+            labels = [
+                one.strip() for one in recap.group("names").split(", ") if one.strip()
+            ]
+        for label in labels:
+            token = _shard_token(label)
+            if not token:
+                # ⛔ A LABEL THAT ENCODES TO NOTHING IS NOT AN IDENTITY (#2648 review, cycle 1).
+                # The two doors DISAGREE about an empty token, and that disagreement is the
+                # hazard: the `ids` door REPORTS `bash-shard::` (so the rail's per-run
+                # `examined > extracted` gate passes) while `is_failure_key_loose` says False, so
+                # `parse_failure_rows` drops the row — `decide` then sees an EMPTY set and returns
+                # `CLEAN blocked=0` on a red PR. That is the #6798/#2193 fail-open exactly.
+                # Fail closed: no token, no id, and the run stays unattributable, which is the
+                # refusal this module is built around. (Defence in depth — with the lookahead in
+                # `_shard_token` no non-blank label encodes to nothing today, so this arm is
+                # reachable only if that strip is ever loosened; its test pins the COMPOUND
+                # mutation, and says so.)
+                continue
+            key = f"{_BASH_SHARD_KEY_PREFIX}{token}"
+            ids.append(key)
+            signatures[key] = frozenset({_BASH_SHARD_SIG})
+    return sorted(set(ids)), signatures
+
+
+def runner_aggregate_failures(
+    text: str,
+) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(ids, {id: {signature}})`` for the JS/TS runner aggregates (see ``_RUNNER_AGG_RE``).
+
+    ONE helper for BOTH doors, exactly as ``non_nodeid_failures`` and
+    ``guard_step_failures`` are: the ``ids`` CLI and the ``signatures`` CLI must not
+    disagree about this universe OR its signature (an id signed by one door and not
+    the other fails §4.6's subset rule closed, so the identity would BLOCK instead of
+    compare).
+    """
+    ids: list[str] = []
+    signatures: dict[str, frozenset[str]] = {}
+    for line in _log_lines(text):
+        # ⛔ STRIP MARKDOWN BOLD FIRST, and not merely around the label: the real Actions
+        # capture renders the emoji + label as ``❌ ** **test-discard-gate**: 470 passed…``
+        # (measured in the 2026-10-19 `verify` log — every ``**`` pair is its own token, so
+        # a pattern allowing ONE optional pair matches NOTHING against the capture it
+        # exists for). Dropping the pairs first makes the match operate on the plain text
+        # the emitter actually prints, and leaves the identity untouched.
+        m = _RUNNER_AGG_RE.match(line.replace("**", ""))
+        if m is None:
+            continue
+        # 0 failed is a PASS line; only a failing aggregate is evidence.
+        if int(m.group("failed")) < 1:
+            continue
+        key = f"{_RUNNER_KEY_PREFIX}{_slug(m.group('label'))}"
+        ids.append(key)
+        signatures[key] = frozenset({_RUNNER_AGG_SIG})
+    return sorted(set(ids)), signatures
+
+
+# ==========================================================================
+# HALF 1c (#1185) — PIPELINE-COMPLIANCE GATE ATTRIBUTION
+# ==========================================================================
+#
+# THE DEFECT. `scripts/check-pipeline-compliance.sh` is the gate that BINDS the
+# review attestation to a head (check (c)), and it is the DOMINANT red in the
+# queue: `aiconsol`'s sweep of all 70 open agent-infra PRs (2026-10-24 04:42Z)
+# found `pipeline-compliance (c)` the top blocker. The gate announces a failure in
+# a THIRD shape, and the id universe knew only two — pytest's `FAILED <nodeid>`
+# and a guard step's `::error::` annotation (HALF 1b) — so a run whose ONLY
+# failing job was this gate yielded `examined=1 extracted=0` and the rail told the
+# operator, on three separate PRs (#2430, #2608, #2623):
+#
+#   yielded NO parseable failure identity … This is a refusal, not a comparison.
+#
+# …about a log that said, in plain text:
+#
+#   ❌ [c] no head-bound code-review record for daniel-ospina/agent-infra#2623 — check (c) accepts ONLY …
+#   ❌ PIPELINE COMPLIANCE: BLOCKED (1 failure(s)).
+#
+# MEASURED on agent-infra #2623, run 40066552772 (job `pipeline-compliance`, head
+# d1024c5d): `ci_exemption.py ids` on that exact capture returned `ids=0`, which
+# reproduces the refusal on real data — so a lane was told "we cannot say why"
+# when the answer was "run record-review.sh at this head".
+#
+# THE EMITTER'S SHAPE, from `fail()` in scripts/check-pipeline-compliance.sh (all
+# 13 call sites):
+#
+#   ❌ [<letter>] <short reason> — <long explanation>
+#   ❌ PIPELINE COMPLIANCE: BLOCKED (<N> failure(s)).   <- SUMMARY, never an identity
+#
+# Three facts shape this parser, and each is load-bearing:
+#
+#   * THE LETTER IS THE CHECK, and a letter names a STABLE artifact the operator
+#     acts on: (a) linked issue, (b) scoping comment, (c) head-bound review
+#     record, (d) plan evidence, (e) test coverage. The SUBJECT is what the check
+#     failed ON; every message is written `<reason> for/on <subject>`, so the
+#     FIRST CLAUSE carries it (check (c): "… for daniel-ospina/agent-infra#2623").
+#   * THE IDENTITY STOPS AT THE FIRST ` — `. Everything after it is the long
+#     explanation, and it carries VOLATILE text: check (c)'s own text embeds the
+#     head sha (`… at the CURRENT head (d1024c5def3e…)`), so an identity built
+#     from the whole line would be unique to ONE head, could never match any
+#     baseline, and would arrive as the #3756 rotating-identity class — which is
+#     never a merge, i.e. the permanent false refusal again in a new costume.
+#   * THE SUMMARY LINE IS NOT AN IDENTITY. `❌ PIPELINE COMPLIANCE: BLOCKED (N
+#     failure(s)).` carries a COUNT and no artifact, so keying on it would make
+#     the identity track the number of failures — the same volatility by another
+#     route. The pattern below requires the bracketed letter, so it cannot match;
+#     the property is pinned by a test rather than left to the reader.
+#
+# ⛔ IT CAN ONLY ADD IDENTITIES, NEVER REMOVE ONE (the fail-closed direction), and
+# it does NOT make the gate passable. The key enters the SAME comparison every
+# other family uses: main's baseline cannot carry `pipeline-compliance::c::…`
+# because the gate runs on `pull_request_target` only, so the id is ABSENT FROM
+# MAIN and the decision REFUSES it (the #7734 branch) — a genuinely failing check
+# on the PR's own tree still blocks. What changes is the REASON, not the verdict:
+# `blocked by check (c): <subject>` instead of "unattributable".
+_PIPELINE_KEY_PREFIX = "pipeline-compliance::"
+
+#: The gate's failure marker, ANCHORED at the start of the line's CONTENT — the
+#: same anchor discipline `_ANNOTATION_RE` uses, and for the same measured reason:
+#: `gh run view` echoes the workflow's own SOURCE, so a mid-line search would
+#: manufacture a phantom identity from an `echo "❌ …"` line. The emoji is pinned
+#: rather than a `[❌✗]` class: a NARROWER pattern can only MISS an identity (which
+#: blocks exactly as before), while a wider one can misattribute a line it never
+#: saw. `\s*` after the emoji absorbs the markdown-bold rendering some emitters
+#: apply; the letter is bounded because a longer token is not a check name.
+_PIPELINE_CHECK_RE = re.compile(
+    r"^❌\s*\[(?P<letter>[a-z]{1,4})\]\s+(?P<text>\S.*)$"
+)
+
+#: A commit-ish token inside a clause, masked so an identity that happens to name
+#: a sha cannot drift per head (see the section header). `\b` on both sides so a
+#: word is never eaten out of a longer token.
+_SHA_LIKE_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+#: The CLI's whitespace-free key, and the ONLY shape `is_failure_key` admits for
+#: this family. The charset is exactly `_slug`'s — a slug identity, which is why the
+#: key is whitespace-free — so the key survives the TAB-delimited rate table (#3686)
+#: and the provenance files.
+_PIPELINE_KEY_RE = re.compile(
+    r"^pipeline-compliance::(?P<letter>[a-z]{1,4})::(?P<subject>[A-Za-z0-9_.\-]+)$"
+)
+
+#: A subject slug is CAPPED so one pathological message cannot mint an unbounded
+#: key. Two messages sharing an 80-char prefix collapse into ONE identity —
+#: harmless and DECLARED: both are the same check failing, which is the
+#: granularity the key asserts (`job-unreadable::` records the same trade for its
+#: job slugs).
+_PIPELINE_SUBJECT_MAX = 80
+
+
+def _pipeline_subject(text: str) -> str:
+    """The SUBJECT slug of a gate failure message — stable across runs and heads.
+
+    The FIRST CLAUSE is the subject: the emitter writes every failure as
+    ``<reason> for/on <subject>``, and everything after the first `` — `` is the
+    long explanation, which carries the head sha for check (c) (see the section
+    header). With no separator (a reworded message) the first 12 WORDS are used —
+    by words, never by characters, so the fallback cannot cut a token in half.
+    """
+    clause, sep, _rest = text.partition(" — ")
+    if not sep:
+        clause = " ".join(text.split()[:12])
+    clause = " ".join(_SHA_LIKE_RE.sub("<sha>", clause).split())
+    return _slug(clause)[:_PIPELINE_SUBJECT_MAX].strip("-") or "unknown"
+
+
+def pipeline_check_key(letter: str, subject: str) -> str:
+    """``pipeline-compliance::<letter>::<subject>`` — one whitespace-free identity."""
+    return f"{_PIPELINE_KEY_PREFIX}{_slug(letter)}::{subject}"
+
+
+def pipeline_check_note(key: str) -> str:
+    """``blocked by check (<letter>): <subject>`` for a gate id, else ``''``.
+
+    THE ONE RENDERING of this family's identity, used by :attr:`Verdict.line` and
+    by the ``ids`` door's stderr note, so the operator reads the same sentence
+    wherever the id surfaces. Returning ``''`` for every other family is what
+    keeps the note off the ~5 other id shapes the rail compares.
+    """
+    m = _PIPELINE_KEY_RE.match(key)
+    if m is None:
+        return ""
+    return f"blocked by check ({m.group('letter')}): {m.group('subject')}"
+
+
+def pipeline_check_failures(
+    text: str,
+) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(ids, {id: {signature}})`` for ``check-pipeline-compliance.sh`` failures.
+
+    ONE helper for BOTH doors, exactly as ``guard_step_failures``,
+    ``non_nodeid_failures`` and ``runner_aggregate_failures`` are: the ``ids`` CLI
+    and the ``signatures`` CLI must not disagree about this universe OR its
+    signature (an id signed by one door and not the other fails §4.6's subset
+    rule closed, so the identity would BLOCK instead of compare).
+
+    The signature is the subject slug — the same text the key's tail carries, so
+    "same id" and "same failure" coincide for this family and the subset rule
+    compares like with like.
+    """
+    ids: list[str] = []
+    signatures: dict[str, frozenset[str]] = {}
+    for line in _log_lines(text):
+        if not line:
+            continue
+        # Markdown-bold is stripped BEFORE the match, the same way the
+        # runner-aggregate pass does: an emoji+marker wrapped in `**` pairs would
+        # otherwise match NOTHING against the capture it exists for.
+        m = _PIPELINE_CHECK_RE.match(line.replace("**", ""))
+        if m is None:
+            continue
+        subject = _pipeline_subject(m.group("text"))
+        key = pipeline_check_key(m.group("letter"), subject)
+        ids.append(key)
+        signatures[key] = frozenset({subject})
+    return sorted(set(ids)), signatures
+
+
+def guard_step_key(step: str, error_shape: str) -> str:
+    """``guard-step::<step>::<error shape>`` — one whitespace-free identity."""
+    return f"{_GUARD_KEY_PREFIX}{_slug(step)}::{_slug(error_shape)}"
+
+
+def _ann_raw_message(content: str) -> str:
+    """The annotation's message with its ORIGINAL internal spacing, or ``''``.
+
+    ``_attributable_annotation`` returns a whitespace-COLLAPSED message, which is right for the
+    guard-step shape (it is compared as prose) and wrong for a shard PATH: collapsing would make
+    `scripts/a  b.test.sh` and `scripts/a b.test.sh` one identity, and would disagree with the
+    prose door (`bash_shard_failures`), which matches the raw line. The SAME two wrapper rules
+    apply — the marker must be at the line start, and the runner's generic annotations are never
+    attribution — so this can never admit a message `_attributable_annotation` rejected.
+    """
+    m = _ANNOTATION_RE.match(content)
+    if not m:
+        return ""
+    message = m.group("msg").strip()
+    if not message:
+        return ""
+    if any(generic.match(" ".join(message.split())) for generic in _RUNNER_GENERIC_ANNOTATIONS):
+        return ""
+    return message
+
+
+def _attributable_annotation(content: str) -> str:
+    """The guard failure message on ``content``, or ``''`` when there is none.
+
+    The runner's generic exit annotations are deliberately NOT attribution — see
+    the section header. A step carrying only them stays unattributable, which is
+    what keeps the rail's refusal for a genuinely unparseable run.
+    """
+    m = _ANNOTATION_RE.match(content)
+    if not m:
+        return ""
+    message = " ".join(m.group("msg").split())
+    if not message:
+        return ""
+    if any(generic.match(message) for generic in _RUNNER_GENERIC_ANNOTATIONS):
+        return ""
+    return message
+
+
+def _runner_step_failure(content: str) -> int | None:
+    """The exit code in the runner's OWN step-failure annotation, else ``None``.
+
+    gh renders ``##[error]Process completed with exit code <N>.`` as the LAST
+    annotation of every step whose command failed. It names no failure — so it is
+    never an identity — but it is the ONLY signal a ``--log-failed`` capture
+    carries for *this step failed the run*, independent of what the step printed.
+    """
+    m = _ANNOTATION_RE.match(content)
+    if not m:
+        return None
+    message = " ".join(m.group("msg").split())
+    if not any(generic.match(message) for generic in _RUNNER_GENERIC_ANNOTATIONS):
+        return None
+    tail = re.search(r"(-?\d+)'?\.?$", message)
+    return int(tail.group(1)) if tail else None
+
+
+def guard_step_failures(text: str) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(keys, {key: signatures})`` for the guard-step failures in a capture.
+
+    THREE conditions, ALL required — and it is their conjunction that keeps the
+    rail's cycle-3 refusal intact while making a guard failure comparable:
+
+    1. **A guard identity comes only from a step the RUNNER marked failed** — one
+       that emitted its own non-zero ``Process completed with exit code <N>.``. An
+       annotation printed by a step that did NOT fail the run says nothing about a
+       failure, and ``_slug('')`` must never let a head-less line found one.
+    2. **The run's ROOT failing step must itself yield an identity.** The root is
+       the FIRST step the runner marked failed, keyed by **(job, step)** — a
+       matrix leg runs steps with the SAME NAME as its siblings, so a step NAME
+       alone would let leg ``b``'s annotation stand in for leg ``a``'s
+       unparseable failure. The root is attributed only when its own lines carry a
+       ``FAILED``/``ERROR`` nodeid or a substantive annotation. If it does not,
+       the run contributes NO guard identity AT ALL — even when a LATER step
+       carries a perfectly good annotation. This is what refuses the mixed run (an
+       unparseable pytest failure PLUS a sibling guard annotation) that the
+       refusal exists for; see the HALF 1b header.
+    3. **A step that shows pytest failure output must yield a NODEID.** An
+       ``E   <exception>`` line is pytest's own report of a failure, so a step
+       carrying one has a pytest failure the parser did not classify. An
+       ANNOTATION from that step is NOT that classification (it is a wrapper, at
+       best), so the run is refused — the cycle-3 ``ImportError: no module named
+       y`` case, which prints ``E   ImportError`` and no ``FAILED`` line.
+       This clause is STEP-scoped: it refuses when the whole step yielded no
+       nodeid. A pytest run that prints BOTH a classified nodeid and an
+       unclassified block in one step (``--continue-on-collection-errors``) is a
+       PRE-EXISTING gap in the per-run refusal — ``main``'s parser returns the
+       same single nodeid — so it is filed (agent-infra #1372), not claimed here.
+
+    A line with no ``<job>\t<step>\t<ts>Z `` head has NO step, so it can neither
+    found the failing-step set nor be attributed: the step is never invented.
+
+    DECLARED RESIDUAL (agent-infra #1366): clauses 2 and 3 are the strongest
+    guarantee a ``--log-failed`` capture ALONE can give. What survives is an
+    unparseable failure that leaves NO pytest-shaped line AND whose step is not
+    the root — e.g. a guard root attributed first, then a non-pytest step failing
+    with bare prose. A source line that ITSELF starts with the annotation marker
+    (an echoed heredoc, not the ``echo "::error::…"`` form) is likewise
+    indistinguishable from a real annotation. Both need data the capture does not
+    carry; the measured capture places the guard before its aggregate gate, carries
+    no ``E   `` line and no line-start marker, so the guard IS the root and IS
+    attributed.
+    """
+    failing: list[tuple[str, str]] = []   # (job, step) pairs the runner failed
+    evidence: set[tuple[str, str]] = set()  # pairs that yielded an identity
+    nodeid_steps: set[tuple[str, str]] = set()  # pairs that yielded a NODEID
+    e_line_steps: set[tuple[str, str]] = set()  # pairs showing pytest output
+    candidates: list[tuple[tuple[str, str], str, str, str]] = []  # (unit, step, msg, raw msg)
+    for raw in text.splitlines():
+        job, step, content = _split_log_line(_ANSI_RE.sub("", raw))
+        if not step:
+            continue
+        # The unit is the RAW pair, not a slug of it: `_slug` is lossy, so
+        # slugging both fields would let two DIFFERENT (job, step) pairs collapse
+        # (`test (py 3.12)`/`test (py-3.12)`, `Run-tests`/`Run tests`) and one
+        # leg's evidence attest another leg's unparseable failure. The slug is only
+        # ever the WIRE key's step component.
+        unit = (job, step)
+        payload = content.strip()
+        code = _runner_step_failure(payload)
+        if code is not None:
+            if code != 0 and unit not in failing:
+                failing.append(unit)
+            continue
+        if _E_LINE_RE.match(payload):
+            e_line_steps.add(unit)
+        message = _attributable_annotation(payload)
+        if message:
+            # ⛔ THE SHARD REDIRECT READS THE **RAW** MESSAGE, NOT THE COLLAPSED ONE (#3105
+            # review, cycle 1). `_attributable_annotation` collapses every whitespace run to
+            # one space before the guard shape sees it, and a shard path may legally contain
+            # spaces (`_shard_token` encodes them as `%20`). Routing the collapsed text into
+            # `_shard_token` made `scripts/a  b.test.sh` and `scripts/a b.test.sh` — two
+            # DIFFERENT files — share ONE identity, and made the SAME file disagree with the
+            # prose door, which matches the raw line. That is the collision this change exists
+            # to close, so the shard branch must see the bytes the prose door sees.
+            candidates.append((unit, step, message, _ann_raw_message(payload)))
+            evidence.add(unit)
+            continue
+        candidate = _failed_candidate(payload)
+        if candidate is not None and _NODEID_LOOSE_RE.match(candidate):
+            evidence.add(unit)
+            nodeid_steps.add(unit)
+
+    if not failing or failing[0] not in evidence:
+        # No step the runner failed, or the ROOT failing step carries nothing we
+        # can attribute: the run is NOT attributed (fail-closed). An annotation
+        # from a later step is NOT allowed to stand in for it.
+        return [], {}
+    if e_line_steps - nodeid_steps:
+        # A step reported a pytest failure that produced no nodeid, so the run
+        # carries an UNCLASSIFIED failure. An annotation elsewhere in the run — or
+        # in that very step — does not classify it.
+        return [], {}
+
+    keys: list[str] = []
+    signatures: dict[str, set[str]] = {}
+    failing_set = set(failing)
+    for unit, step, message, raw_message in candidates:
+        if unit not in failing_set:
+            # Clause 1: printed by a step the runner did NOT fail — a same-NAMED
+            # step in another leg is a different unit.
+            continue
+        # THE SHARD ANNOTATION IS ONE EVENT WITH ONE IDENTITY (#3105): redirect it onto the
+        # shard family's injective token instead of slugging the path into an error shape.
+        # Slugs collapse `/` and `-`, so the guard key gave TWO different shards ONE identity —
+        # a base red on either could exempt a new red on the other. See
+        # `_BASH_SHARD_ANNOTATION_RE` for the measurement and the polarity argument.
+        shard_key = bash_shard_annotation_key(raw_message)
+        if shard_key is not None:
+            keys.append(shard_key)
+            signatures.setdefault(shard_key, set()).add(_BASH_SHARD_SIG)
+            continue
+        shape = normalize_guard_error(message)
+        if not shape:
+            continue  # defensive: a future normalizer may void a message
+        key = guard_step_key(step, shape)
+        keys.append(key)
+        signatures.setdefault(key, set()).add(shape)
+    return sorted(set(keys)), {k: frozenset(v) for k, v in signatures.items()}
+
+
+def parse_pr_failure_text(text: str) -> SignatureParse:
+    """Extract ``{id: signature}`` from a raw ``--log-failed`` capture.
+
+    Three passes over the same normalized lines:
+
+    1. the ``FAILED <nodeid> [- <detail>]`` short-summary lines — the
+       authoritative id set, the same lines ``extract_failed_tests`` reads;
+    2. the ``FAILURES`` blocks — keyed by test NAME, joined to ids by the
+       nodeid's final ``::`` segment.
+
+    Per id the block-derived signature is preferred (it is the only source that
+    carries the exception TYPE); the summary's inline detail is used ONLY when no
+    block joined, so one id never contributes two competing forms. An id with
+    neither is ``unsigned`` and produces NO signature entry — never a blank one.
+    """
+    lines = [_strip_log_prefix(_ANSI_RE.sub("", raw)) for raw in text.splitlines()]
+
+    id_list: list[str] = []
+    details: dict[str, set[str]] = {}
+    rejected: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = _SUMMARY_RE.match(stripped)
+        if not m:
+            continue
+        nodeid = m.group("nodeid").strip()
+        if not _NODEID_LOOSE_RE.match(nodeid):
+            # #6798: a COLLECTION ERROR is an attribution here too, so the two
+            # doors agree. Confining the interception to the `ids` door left this
+            # one reporting `rejected=2` for a line the other door had already
+            # extracted — and a non-zero `rejected` marks the set CLIPPED, so the
+            # run stayed blocked with a DIFFERENT message. The identity/signature
+            # pair is added by `non_nodeid_failures` (Pass 4 below); here we only
+            # decline to call it a drop. A `FAILED <path>.py` is not one of these:
+            # `_collection_error_id` requires the `ERROR` keyword, which is the
+            # only form pytest emits for a collection error.
+            if _collection_error_id(stripped) is not None:
+                continue
+            # #6917: the SAME rule as `_failed_candidate`, in the SAME order — a
+            # pytest PROGRESS fragment is not a record, so it is not a drop here
+            # either. The module's header promises ONE candidate rule across both
+            # doors; `_SUMMARY_RE`'s nodeid group is `.+?` and accepts `[  2%]`,
+            # so without this the sibling door reported `rejected=1` for a line
+            # the `ids` door had already declined to count — the exact asymmetry
+            # the collection-error intercept above exists to avoid.
+            if _PROGRESS_FRAGMENT_RE.match(nodeid):
+                continue
+            rejected.append(stripped)
+            continue
+        id_list.append(nodeid)
+        detail = normalize_signature(m.group("detail"))
+        if detail:
+            details.setdefault(nodeid, set()).add(detail)
+
+    # Pass 2 — FAILURES blocks. A block whose name is carried by exactly one id
+    # is attributed; zero or several candidates is a rejection, never a guess.
+    block_sigs: dict[str, set[str]] = {}
+    cur_name: str | None = None
+    cur_e: str | None = None
+    cur_exc: str | None = None
+
+    def _flush() -> None:
+        nonlocal cur_name, cur_e, cur_exc
+        if cur_name is not None:
+            sig = _signature_from(cur_e, cur_exc)
+            if sig:
+                block_sigs.setdefault(cur_name, set()).add(sig)
+        cur_name, cur_e, cur_exc = None, None, None
+
+    for line in lines:
+        stripped = line.strip()
+        header = _BLOCK_HEADER_RE.match(stripped)
+        if header:
+            _flush()
+            cur_name = header.group("name").strip()
+            continue
+        if cur_name is None:
+            continue
+        if _BLOCK_END_RE.match(stripped):
+            _flush()
+            continue
+        trailer = _TRAILER_RE.match(stripped)
+        if trailer:
+            cur_exc = trailer.group("exc")
+            continue
+        e_line = _E_LINE_RE.match(line)
+        if e_line and cur_e is None:
+            rest = e_line.group("rest").strip()
+            if not rest.startswith("+"):
+                cur_e = rest
+    _flush()
+
+    by_name: dict[str, list[str]] = {}
+    for nodeid in sorted(set(id_list)):
+        by_name.setdefault(nodeid.split("::")[-1], []).append(nodeid)
+
+    signatures: dict[str, frozenset[str]] = {}
+    unsigned: list[str] = []
+    unattributed: list[str] = []
+    attributed: set[str] = set()
+    for name in sorted(block_sigs):
+        candidates = by_name.get(name, [])
+        if len(candidates) == 1:
+            attributed.add(candidates[0])
+            continue
+        unattributed.append(name)
+    for nodeid in sorted(set(id_list)):
+        if nodeid in attributed:
+            signatures[nodeid] = frozenset(block_sigs[nodeid.split("::")[-1]])
+        elif nodeid in details:
+            signatures[nodeid] = frozenset(details[nodeid])
+        else:
+            unsigned.append(nodeid)
+
+    # Pass 3 — GUARD-STEP failures (#4469). Their ids and signatures come from the
+    # SAME helper the `ids` CLI uses, so the two doors cannot disagree about the
+    # guard universe. Merged AFTER the nodeid attribution so a guard key can
+    # never be pulled into the `by_name` join above.
+    guard_keys, guard_signatures = guard_step_failures(text)
+    for key, sigs in guard_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(guard_keys)
+    # ⛔ THE SAME FAMILY PARTITION AS THE `ids` DOOR (#3105 review, cycle 1). A guard key that IS
+    # a shard identity must be reported with the SHARD family here too, or this door prints
+    # `guard-steps=1 … bash-shard=0` and then labels a `bash-shard::` id "guard-step failure
+    # ATTRIBUTED" — the wrong-surface reporting both doors exist to avoid.
+    shard_from_guard = [
+        key for key in guard_keys if key.startswith(_BASH_SHARD_KEY_PREFIX)
+    ]
+    guard_keys = [
+        key for key in guard_keys if not key.startswith(_BASH_SHARD_KEY_PREFIX)
+    ]
+
+    # Pass 4 — NON-NODEID failure evidence (#6798). Its ids AND signatures come
+    # from the SAME helper the `ids` CLI uses, so the two doors cannot disagree
+    # about either half. Merged after the nodeid attribution for the same reason
+    # the guard pass is: a non-nodeid key must never be pulled into the `by_name`
+    # join above. Without this pass the `signatures` CLI exits 1 on a
+    # kill-or-collection-only capture (`ok` is False when no id is found), and
+    # `ci-failure-set.sh` treats that as FATAL — so the per-run refusal would be
+    # RELOCATED here rather than removed.
+    non_nodeid_keys, non_nodeid_signatures = non_nodeid_failures(text)
+    for key, sigs in non_nodeid_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(non_nodeid_keys)
+
+    # Pass 5 — JS/TS RUNNER AGGREGATES. Same helper, same reason as Pass 4: without
+    # it the `signatures` door exits 1 on a runner-only capture and ci-failure-set.sh
+    # treats that as FATAL, which would RELOCATE the refusal instead of removing it.
+    runner_keys, runner_signatures = runner_aggregate_failures(text)
+    for key, sigs in runner_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(runner_keys)
+
+    # Pass 6 — PIPELINE-COMPLIANCE gate failures (#1185). Same helper, same
+    # reason as Pass 5: without it the `signatures` door exits 1 on a
+    # gate-only capture and ci-failure-set.sh treats that as FATAL, which would
+    # RELOCATE the refusal instead of removing it.
+    pipeline_keys, pipeline_signatures = pipeline_check_failures(text)
+    for key, sigs in pipeline_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(pipeline_keys)
+    # Pass 7 — BASH SHARD attribution (#2643). Same helper, same reason as Pass 6: without it the
+    # `signatures` door exits 1 on a capture whose only failure evidence is `run-bash-shards.sh`'s
+    # shard lines, and `ci-failure-set.sh` treats that as FATAL — so the rail's "no parseable failure
+    # identity" refusal would be RELOCATED here instead of removed.
+    shard_keys, shard_signatures = bash_shard_failures(text)
+    for key, sigs in shard_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(shard_keys)
+    shard_keys = sorted(set(list(shard_keys) + shard_from_guard))
+
+    return SignatureParse(
+        ids=sorted(set(id_list)),
+        signatures=signatures,
+        rejected=rejected,
+        unsigned=unsigned,
+        unattributed=unattributed,
+        guard_steps=guard_keys,
+        non_nodeid=non_nodeid_keys,
+        runner=runner_keys,
+        bash_shard=shard_keys,
+        pipeline_checks=pipeline_keys,
+    )
+
+
+# ==========================================================================
+# Step B (#3756) — the wire formats and the ``decide`` CLI
+# ==========================================================================
+#
+# ``<nodeid>\t<failures>\t<runs>\t<signature>`` — the PR-set row. One row per
+# (id, signature): an id that failed with two different signatures across runs
+# contributes two rows and their signatures union. This is the SAME shape as
+# ``--main-union-rates`` plus one column, so either side's producer can feed it.
+_ROW_RE = re.compile(
+    r"^(?P<nodeid>[^\t]+)\t(?P<failures>[0-9]+)\t(?P<runs>[0-9]+)\t(?P<sig>.*)$"
+)
+# ``<nodeid>\t<signature>`` — the main-side signature table. Kept separate from
+# the 3-column rate table because ``parse_rates`` REJECTS a 4th column (a
+# self-contradicting table is not evidence); main's rates and main's signatures
+# are therefore two files.
+_SIG_ROW_RE = re.compile(r"^(?P<nodeid>[^\t]+)\t(?P<sig>.*)$")
+
+
+@dataclass
+class FailureRowsResult:
+    """The PR failure set, parsed from its wire rows."""
+
+    failures: dict[str, Failure] = field(default_factory=dict)
+    rejected: list[str] = field(default_factory=list)
+    unsigned: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.failures)
+
+
+def parse_failure_rows(text: str) -> FailureRowsResult:
+    """Parse ``<nodeid>\\t<failures>\\t<runs>\\t<signature>`` rows.
+
+    Fail-closed at every corner:
+
+    * a malformed row (bad id, non-numeric fields, ``runs <= 0``,
+      ``failures > runs``) is rejected and contributes NOTHING;
+    * a BLANK signature is DROPPED, COUNTED and the id listed in ``unsigned`` —
+      the row's rate survives, and the id then has no signature, so
+      ``_signatures_overlap`` fails closed. It is never stored as ``''``;
+    * two rows for one id that agree on the rate union their signatures; two
+      rows that CONTRADICT each other set the id's rate to ``0/0``. That rate is
+      unmeasurable, so :func:`decide` BLOCKS it (``PR rate is unmeasurable``).
+      Rejecting such a row without leaving the id behind would let the id vanish
+      from ``pr_failures`` — and an id the decision never sees is an id the gate
+      never blocks, which is the fail-OPEN direction.
+    """
+    failures: dict[str, Failure] = {}
+    rejected: list[str] = []
+    unsigned: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip("\n")
+        if not line.strip():
+            continue
+        m = _ROW_RE.match(line)
+        if not m:
+            rejected.append(line)
+            continue
+        nodeid = m.group("nodeid")
+        failures_n = int(m.group("failures"))
+        runs_n = int(m.group("runs"))
+        if (
+            not is_failure_key_loose(nodeid)
+            or runs_n <= 0
+            or failures_n > runs_n
+        ):
+            rejected.append(line)
+            continue
+        sig = normalize_signature(m.group("sig"))
+        if not sig:
+            unsigned.add(nodeid)
+        existing = failures.get(nodeid)
+        if existing is None:
+            failures[nodeid] = Failure(
+                rate=Rate(failures_n, runs_n),
+                signatures=frozenset({sig}) if sig else frozenset(),
+            )
+            continue
+        if existing.rate != Rate(failures_n, runs_n):
+            # Contradictory evidence: keep the id (so it cannot vanish) but make
+            # its rate unmeasurable, which is the existing BLOCK path.
+            failures[nodeid] = Failure(rate=Rate(0, 0), signatures=frozenset())
+            rejected.append(line)
+            continue
+        failures[nodeid] = Failure(
+            rate=existing.rate,
+            signatures=existing.signatures | (frozenset({sig}) if sig else frozenset()),
+        )
+    return FailureRowsResult(
+        failures=failures, rejected=rejected, unsigned=sorted(unsigned)
+    )
+
+
+def parse_signature_rows(text: str) -> dict[str, frozenset[str]]:
+    """Parse ``<nodeid>\\t<signature>`` rows, dropping blanks (counted by caller)."""
+    out: dict[str, set[str]] = {}
+    for raw in text.splitlines():
+        line = raw.strip("\n")
+        if not line.strip():
+            continue
+        m = _SIG_ROW_RE.match(line)
+        if not m:
+            continue
+        nodeid = m.group("nodeid")
+        sig = normalize_signature(m.group("sig"))
+        if not sig or not is_failure_key_loose(nodeid):
+            continue
+        out.setdefault(nodeid, set()).add(sig)
+    return {k: frozenset(v) for k, v in out.items()}
+
+
+class RotationRuns(list):
+    """``list[frozenset[str]]`` PLUS the wire FORM that produced it.
+
+    ⛔ THE FORM IS PART OF THE EVIDENCE, NOT A TRANSPORT DETAIL (#3686 review
+    cycle 6, P1). The tab-free fallback in :func:`parse_rotation_runs` keeps a
+    pre-#3686 producer's line parsing the way it always did — but that form CANNOT
+    represent an id containing a space: space-splitting shreds
+    ``…[argv14-at the EDGE]`` into ``…[argv14-at`` + ``the`` + ``EDGE]``, so the
+    real id sits in NO run set and :func:`detect_rotating_identity` can never
+    report it.
+
+    Before #3686 that was harmless, because such an id could not be exempted either
+    way: the PR-side door ADMITTED it and MAIN's rate door DROPPED its row (which is
+    #3686 itself), so `mr is None` and the verdict was BLOCK — fail-CLOSED through an
+    asymmetry, not through agreement. After it, the id is representable on the
+    RATE side — so a shredded rotation line turns a previously fail-CLOSED
+    refusal (BLOCK, absent from main's set) into a silent EXEMPT for an identity
+    that provably MOVED, which is the one class the rail states may never merge.
+    ``legacy_lines`` is how :func:`decide` learns the evidence could not see the
+    id, so it refuses to exempt it.
+
+    A plain list was not enough: the caller cannot tell the two forms apart from
+    the parsed sets alone, which is exactly the ambiguity that made the failure
+    silent.
+    """
+
+    __slots__ = ("legacy_lines", "tab_lines")
+
+    def __init__(
+        self,
+        runs=(),
+        *,
+        legacy_lines: int = 0,
+        tab_lines: int = 0,
+    ) -> None:
+        super().__init__(runs)
+        self.legacy_lines = legacy_lines
+        self.tab_lines = tab_lines
+
+    @property
+    def has_legacy_lines(self) -> bool:
+        return self.legacy_lines > 0
+
+
+def parse_rotation_runs(text: str) -> RotationRuns:
+    """Per-run id sets, one run per non-blank line, ids TAB-separated.
+
+    ⛔ TAB, NOT WHITESPACE (#3686 second door). A pytest parameter legitimately
+    carries a SPACE — ``…[argv14-at the EDGE]`` is a real id from a shipped suite
+    — so a whitespace split SHREDS it into fragments. Measured before this
+    change: the real id is in NO run set, ``detect_rotating_identity`` therefore
+    cannot see it, and ``decide``'s E5 guard (the class that may never merge) is
+    INERT for exactly the ids #3686 un-blocked. That turns a permanent BLOCK into
+    a silent EXEMPT for a rotating identity, i.e. it is the fail-open direction
+    of the fix, not a cosmetic wire-format detail. A tab is the one delimiter an
+    id cannot contain — the same delimiting the rate and signature tables use.
+
+    The pre-#3686 producer space-joined the ids and emitted NO tab, so a line
+    carrying no tab is still read the old way. That is deliberate: an older
+    producer (or ``ADMIN_MERGE_FAILURE_SET_SH`` pointing at one) would otherwise
+    be re-parsed as ONE giant id per run, which is a second, quieter way to
+    blind E5.
+
+    ⛔ BUT THE FALLBACK DOES **NOT** KEEP OLD INPUT MEANING WHAT IT ALWAYS
+    MEANT (review cycle 6, P1 — that sentence stood here and was false). It
+    keeps the PARSE the same and flips the VERDICT: for a space-carrying id the
+    old world BLOCKED it — through the #3686 ASYMMETRY (the PR door admitted it,
+    MAIN's rate door dropped its row, so `mr is None`), not through both doors
+    agreeing — while this world, where the id IS representable on the rate side,
+    would EXEMPT it, because the shredded identity is invisible to E5. So the
+    counts ride back with the sets (see :class:`RotationRuns`) and ``decide``
+    refuses to exempt a whitespace-carrying id when any line took this branch.
+    """
+    runs: list[frozenset[str]] = []
+    legacy_lines = 0
+    tab_lines = 0
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        if "\t" in raw:
+            ids = raw.split("\t")
+            tab_lines += 1
+        else:
+            ids = raw.split()
+            legacy_lines += 1
+        runs.append(frozenset(i for i in ids if i))
+    return RotationRuns(runs, legacy_lines=legacy_lines, tab_lines=tab_lines)
+
+
+def render_signature_table(signatures: dict[str, frozenset[str]]) -> str:
+    """``<nodeid>\\t<signature>`` rows, sorted — the producer's stdout."""
+    return "".join(
+        f"{nodeid}\t{sig}\n"
+        for nodeid in sorted(signatures)
+        for sig in sorted(signatures[nodeid])
+    )
+
+
+def _read(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8", errors="replace")
+
+
+def _cmd_ids(args: argparse.Namespace) -> int:
+    """`ids --log <capture>` — the canonical FAILED-id extraction (the shell's door).
+
+    stdout: the failure ids — pytest nodeids AND attributable guard-step
+    identities (#4469) — sorted and unique, one per line (possibly empty).
+    stderr: every rejected candidate, tagged UNATTRIBUTABLE, plus counts.
+
+    Exits 0 whenever the capture was READ — an empty id set is a legitimate
+    answer (the caller's `examined > extracted` gate owns "a failing run that
+    yielded nothing"). A non-zero exit therefore means exactly one thing: the
+    input could not be read. Reading that as "no failures" is the vacuous pass.
+
+    ⛔ ONE EXCEPTION, AND IT IS NOT AN EMPTY SET (agent-infra#3174): a capture whose shard recap is
+    INCOMPLETE (`⚠️ RECAP INCOMPLETE (k/n shards ran)` — `run-bash-shards.sh` was killed mid-list)
+    is READ but does not hold a failure SET, so it exits `_EXIT_TRUNCATED_CAPTURE` (4) and prints
+    NO ids. Emitting the truncated list would be the fold this fix exists to stop: the caller would
+    subtract a partial set as though it were the baseline, which is exactly how a shard red on main
+    drops out of the reference set and comes back as "a new failure caused by the batch". The
+    caller's own `truncated:` state names the remedy (this RUN is unproven — do not re-run the
+    parser); see `scripts/ci-failure-set.sh`.
+    """
+    text = _read(args.log)
+    truncated = bash_shard_recap_incomplete(text)
+    parsed = parse_failed_ids(text, raw_log=True)
+    if truncated is not None:
+        # ⛔ NOTHING ON STDOUT. A consumer that ignores the exit code must not be handed a set that
+        # looks whole — the ids that WERE named go to stderr, as evidence, not as an answer.
+        print(
+            "ci-exemption: ⚠️ UNPROVEN: this capture's shard recap is INCOMPLETE — "
+            "scripts/run-bash-shards.sh was TERMINATED before the list finished, so the failure "
+            "set it names is a TRUNCATED SAMPLE, not a set. Refusing to emit ids for it: a set "
+            "difference computed from a partial recap reports real failures as new and hides the "
+            "ones the killed run never reached (agent-infra#3174). The marker it printed was: "
+            f"{truncated}",
+            file=sys.stderr,
+        )
+        for nodeid in parsed.ids:
+            print(
+                "ci-exemption: (TRUNCATED capture — named, NOT in the failure set) "
+                f"{nodeid}",
+                file=sys.stderr,
+            )
+        return _EXIT_TRUNCATED_CAPTURE
+    for nodeid in parsed.ids:
+        print(nodeid)
+    for token in parsed.rejected:
+        print(
+            "ci-exemption: UNATTRIBUTABLE: FAILED token is not a test id and was "
+            f"DROPPED (never in the failure set): {token}",
+            file=sys.stderr,
+        )
+    print(
+        f"ci-exemption: ids={len(parsed.ids)} "
+        f"unattributable={len(parsed.rejected)} "
+        f"guard-steps={len(parsed.guard_steps)} "
+        f"non-nodeid={len(parsed.non_nodeid)} "
+        f"runner={len(parsed.runner)} "
+        f"bash-shard={len(parsed.bash_shard)} "
+        f"pipeline-checks={len(parsed.pipeline_checks)}",
+        file=sys.stderr,
+    )
+    # A RUNNER-AGGREGATE identity is FILE-COARSE, and the operator must be able to see
+    # that the comparison happened at file granularity rather than at test-id
+    # granularity — otherwise a comparison that looks like-for-like is not.
+    for key in parsed.runner:
+        print(
+            f"ci-exemption: RUNNER-AGGREGATE failure ATTRIBUTED at FILE granularity "
+            f"(a JS/TS suite's own '❌ <label>: N passed, M failed' line): {key}",
+            file=sys.stderr,
+        )
+    # A BASH-SHARD identity is FILE-COARSE too (one per failing suite), and it is reported
+    # for the same reason: #2643 exists because this capture had NO identity at all and the
+    # rail refused it, so an operator must be able to see that a shard — not a nodeid — is
+    # what the comparison was made on.
+    for key in parsed.bash_shard:
+        print(
+            f"ci-exemption: BASH-SHARD failure ATTRIBUTED at FILE granularity "
+            f"(run-bash-shards.sh's own '❌ failed shard: <path>' or "
+            f"'❌ failing shard(s): <paths>' line): {key}",
+            file=sys.stderr,
+        )
+    for key in parsed.guard_steps:
+        print(
+            f"ci-exemption: guard-step failure ATTRIBUTED (no test nodeid): {key}",
+            file=sys.stderr,
+        )
+    # #6798: NAME the signal the identity came from. The rail's remedy differs by
+    # signal — a watchdog kill is re-runnable, a collection error is the PR's own
+    # breakage — so an identity that does not say which it is leaves the operator
+    # to guess, which is how a killed leg was read as an un-measured surface in
+    # the first place. Reported separately from the nodeids for the same reason.
+    for key in parsed.non_nodeid:
+        print(
+            f"ci-exemption: NON-NODEID failure ATTRIBUTED (comparison, not refusal): {key}",
+            file=sys.stderr,
+        )
+    # #1185: NAME the check, and what it is about. The rail's remedy for a gate
+    # failure is NOT a re-run — it is the artifact the check names
+    # (`record-review.sh` at this head for (c), a scoping comment for (b)) — so an
+    # id that did not say WHICH check failed left the operator to guess, which is
+    # the refusal this half removes.
+    for key in parsed.pipeline_checks:
+        print(
+            "ci-exemption: PIPELINE-COMPLIANCE gate failure ATTRIBUTED (a gate "
+            f"check, no test nodeid): {key} — {pipeline_check_note(key)}",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _cmd_signatures(args: argparse.Namespace) -> int:
+    text = _read(args.log)
+    # ⛔ THE SAME REFUSAL AS THE `ids` DOOR (agent-infra#3174). A truncated capture has no stable
+    # signature TABLE either — a signature read off the shards that happened to run would certify a
+    # set the run never finished. Both doors are refused so neither can be used to bypass the other.
+    truncated = bash_shard_recap_incomplete(text)
+    if truncated is not None:
+        print(
+            "ci-exemption: ⚠️ UNPROVEN: this capture's shard recap is INCOMPLETE "
+            "(scripts/run-bash-shards.sh was TERMINATED before the list finished) — refusing to "
+            "publish a signature table for a TRUNCATED failure set (agent-infra#3174). The "
+            f"marker it printed was: {truncated}",
+            file=sys.stderr,
+        )
+        return _EXIT_TRUNCATED_CAPTURE
+    parsed = parse_pr_failure_text(text)
+    sys.stdout.write(render_signature_table(parsed.signatures))
+    for line in parsed.rejected:
+        print(f"ci-exemption: rejected FAILED line: {line}", file=sys.stderr)
+    for name in parsed.unattributed:
+        print(
+            f"ci-exemption: unattributed FAILURES block: {name} (no unique id "
+            "match — its id is unsigned and will BLOCK)",
+            file=sys.stderr,
+        )
+    for nodeid in parsed.unsigned:
+        print(
+            f"ci-exemption: unsigned failure (no stable signature): {nodeid} — "
+            "the subset rule will fail closed and BLOCK it",
+            file=sys.stderr,
+        )
+    print(
+        f"ci-exemption: ids={len(parsed.ids)} signed={len(parsed.signatures)} "
+        f"unsigned={len(parsed.unsigned)} rejected={len(parsed.rejected)} "
+        f"unattributed={len(parsed.unattributed)} "
+        f"guard-steps={len(parsed.guard_steps)} "
+        f"non-nodeid={len(parsed.non_nodeid)} "
+        f"runner={len(parsed.runner)} "
+        f"bash-shard={len(parsed.bash_shard)} "
+        f"pipeline-checks={len(parsed.pipeline_checks)}",
+        file=sys.stderr,
+    )
+    for key in parsed.runner:
+        print(
+            f"ci-exemption: RUNNER-AGGREGATE failure ATTRIBUTED at FILE granularity: {key}",
+            file=sys.stderr,
+        )
+    for key in parsed.bash_shard:
+        print(
+            f"ci-exemption: BASH-SHARD failure ATTRIBUTED at FILE granularity: {key}",
+            file=sys.stderr,
+        )
+    for key in parsed.non_nodeid:
+        print(
+            f"ci-exemption: NON-NODEID failure ATTRIBUTED (comparison, not refusal): {key}",
+            file=sys.stderr,
+        )
+    for key in parsed.pipeline_checks:
+        print(
+            "ci-exemption: PIPELINE-COMPLIANCE gate failure ATTRIBUTED (a gate "
+            f"check, no test nodeid): {key} — {pipeline_check_note(key)}",
+            file=sys.stderr,
+        )
+    return 0 if parsed.ok else 1
+
+
+def _cmd_decide(args: argparse.Namespace) -> int:
+    pr = parse_failure_rows(_read(args.pr_failures))
+    main = parse_rates(_read(args.main_rates))
+    main_sigs = (
+        parse_signature_rows(_read(args.main_signatures))
+        if args.main_signatures
+        else {}
+    )
+    rotation = parse_rotation_runs(_read(args.rotation)) if args.rotation else None
+
+    decision = decide(
+        pr.failures,
+        main.rates,
+        main_signatures=main_sigs,
+        # ⛔ THE PARSED EVIDENCE, not `rotating=` + a separate flag: `decide` derives
+        # BOTH the rotating map and the TAB-FREE arm from it, so the form cannot be
+        # dropped in transit (#3686 review cycle 7).
+        rotation=rotation,
+        k_pr=max((f.rate.runs for f in pr.failures.values()), default=None),
+        rate_tolerance=args.rate_tolerance,
+        min_runs=args.min_runs,
+    )
+
+    lines = [v.line for v in decision.blocked]
+    lines += [v.line for v in decision.unattributable]
+    lines += decision.visible_exemptions()
+    notes = list(decision.notes)
+    if not args.main_signatures and any(f.signatures for f in pr.failures.values()):
+        notes.append(
+            "no --main-signatures supplied: every signature check fails CLOSED "
+            "(BLOCK) — this is the safe-but-wrong state, not a green"
+        )
+    lines += [f"NOTE  : {n}" for n in notes]
+
+    printed = list(lines)
+    for line in pr.rejected:
+        printed.append(f"NOTE  : rejected PR row: {line}")
+    for nodeid in pr.unsigned:
+        printed.append(f"NOTE  : unsigned PR failure (no signature): {nodeid}")
+    for line in main.rejected:
+        printed.append(f"NOTE  : rejected main rate row: {line}")
+    sys.stdout.write("\n".join(printed) + ("\n" if printed else ""))
+
+    gated = len(decision.blocked) + len(decision.unattributable)
+    verdict = (
+        f"VERDICT\t{'BLOCK' if gated else 'CLEAN'}"
+        f"\tblocked={len(decision.blocked)}"
+        f"\tunattributable={len(decision.unattributable)}"
+        f"\texempt={len(decision.exempt)}"
+        f"\trejected={len(pr.rejected) + len(main.rejected)}"
+        f"\tunsigned={len(pr.unsigned)}"
+    )
+    print(verdict)
+
+    if args.blocked_out:
+        Path(args.blocked_out).write_text(
+            "".join(f"{v.nodeid}\n" for v in decision.blocked), encoding="utf-8"
+        )
+    if args.unattributable_out:
+        Path(args.unattributable_out).write_text(
+            "".join(f"{v.nodeid}\n" for v in decision.unattributable),
+            encoding="utf-8",
+        )
+    if args.exempt_out:
+        Path(args.exempt_out).write_text(
+            "".join(f"{line}\n" for line in decision.visible_exemptions()),
+            encoding="utf-8",
+        )
+    if args.verdict_out:
+        Path(args.verdict_out).write_text(verdict + "\n", encoding="utf-8")
+
+    return 1 if gated else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python3 ci_exemption.py <ids|signatures|decide> …`` — the shell's door."""
+    parser = argparse.ArgumentParser(
+        prog="python3 ci_exemption.py",
+        description=(
+            "The #3756 rail module: THE canonical FAILED-id parser (the id universe "
+            "the rail and the exemption decision both read) plus the pre-merge "
+            "exemption decision and its signature producer."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sig = sub.add_parser(
+        "signatures",
+        help="extract stable signatures from a raw `gh run view --log-failed` capture "
+        "(pytest nodeids AND guard-step annotations, #4469)",
+    )
+    sig.add_argument("--log", required=True, help="raw --log-failed file")
+    sig.set_defaults(func=_cmd_signatures)
+
+    ids = sub.add_parser(
+        "ids",
+        help="THE canonical FAILED-id extraction from a raw `gh run view --log-failed` "
+        "capture — pytest nodeids plus attributable guard-step failures (#4469)",
+    )
+    ids.add_argument("--log", required=True, help="raw --log-failed file")
+    ids.set_defaults(func=_cmd_ids)
+
+    dec = sub.add_parser("decide", help="run the exemption decision over files")
+    dec.add_argument(
+        "--pr-failures",
+        required=True,
+        help="PR set, `<nodeid>\\t<failures>\\t<runs>\\t<signature>` rows",
+    )
+    dec.add_argument(
+        "--main-rates",
+        required=True,
+        help="main rate table, `<nodeid>\\t<failures>\\t<runs>` rows",
+    )
+    dec.add_argument(
+        "--main-signatures",
+        help="main signature table, `<nodeid>\\t<signature>` rows (absent => fail closed)",
+    )
+    dec.add_argument(
+        "--rotation",
+        help=("per-run id sets, one run per line, ids TAB-separated "
+              "(feeds detect_rotating_identity); a tab-free line is read as the "
+              "pre-#3686 whitespace-joined form"),
+    )
+    dec.add_argument("--rate-tolerance", type=float, default=1.5)
+    dec.add_argument("--min-runs", type=int, default=3)
+    dec.add_argument("--blocked-out", help="write blocked nodeids, one per line")
+    dec.add_argument("--unattributable-out", help="write unattributable nodeids")
+    dec.add_argument("--exempt-out", help="write the visible EXEMPT lines")
+    dec.add_argument("--verdict-out", help="write the machine-readable verdict line")
+    dec.set_defaults(func=_cmd_decide)
+
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":  # pragma: no cover — exercised via main() in tests
+    raise SystemExit(main())

@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# cron-quality-gates.sh — periodic quality gates for agent-infra.
+#
+# Dispatched by skills/test-routing (Skill Registry) as:
+#   scripts/cron-quality-gates.sh arch      # (#6463)
+#   scripts/cron-quality-gates.sh mutation  # (#6460)
+#
+# Subcommands:
+#   arch      — verify every script dispatched by pipeline skills exists in
+#               scripts/ (the symlinked canonical tree). Missing scripts are
+#               exactly the class of bug where a gate silently no-ops (issue
+#               #100): a skill runs `bash scripts/foo.sh` → "No such file",
+#               gate never runs, work ships unchecked. Explicitly known-planned
+#               scripts and product-repo scripts are reported, not failed.
+#   mutation  — run every extensions/*/test.mjs and reject tests that cannot
+#               fail: a test with zero assertion markers is a mutation that
+#               always survives — it proves nothing.
+#
+# Load gate (#209): entry preflight + bounded poll + mid-run re-check. Batch
+# work DEFERS under pre-existing load instead of compounding a storm.
+# Exit 3 = DEFERRED — the invoker MUST re-invoke (skills re-dispatch); a
+# defer is a promise to re-run, never a silent skip. Bypass: LOAD_GATE_FORCE=1
+# env (no script flag, scope-pinned). See docs/ops/load-policy.md.
+#
+# Exit codes: 0 = clean, 1 = violations found, 2 = usage/script error,
+# 3 = deferred — re-invoke (load gate).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+LOAD_GATE_MAX_WAIT_MIN="${LOAD_GATE_MAX_WAIT_MIN:-10}"
+
+# ── load gate (#209) ────────────────────────────────────────────────────────
+# Entry preflight: `check` (entry rule = shouldSuspend) → go → proceed;
+# suspended → bounded poll (`check --deferred` every 60s up to
+# LOAD_GATE_MAX_WAIT_MIN, default 10; `0` = no poll) → go → proceed; after the
+# cap → exit 3 with a loud defer log (accurate: nothing has run at entry).
+# The poll's --deferred mode gates on shouldResume (exit 0 only below resume),
+# so a single-sample dip between suspend and resume never thrash-resumes.
+load_gate_entry() {
+  if [ "${LOAD_GATE_FORCE:-}" = "1" ]; then return 0; fi
+  local rc=0 out load1 suspend waited
+  out="$(node "$ROOT/scripts/load-gate.mjs" check --json 2>/dev/null)" || rc=$?
+  [ $rc -eq 0 ] && return 0
+  if [ $rc -ne 3 ]; then
+    echo "[load-gate] ERROR: gate helper failed (exit $rc) — aborting loudly" >&2
+    exit 2
+  fi
+  load1="$(printf '%s' "$out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
+  suspend="$(printf '%s' "$out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"
+  waited=0
+  while [ "$waited" -lt "$LOAD_GATE_MAX_WAIT_MIN" ]; do
+    sleep 60
+    waited=$((waited + 1))
+    if node "$ROOT/scripts/load-gate.mjs" check --deferred >/dev/null 2>&1; then
+      echo "[load-gate] resumed after ${waited} min poll (load < resume threshold)" >&2
+      return 0
+    fi
+  done
+  echo "[load-gate] DEFERRED — batch did NOT run; re-invoke after load < ${suspend:-?} (was ${load1:-?})" >&2
+  exit 3
+}
+
+# Mid-run re-check (F7 — gating is not entry-only): time-gated at most once
+# per 60s per gate run (a node spawn per check is not free over ~100 files).
+# A suspend verdict aborts with exit 3 + loud defer log. Re-invoke is
+# idempotent for both subcommands (re-scan / re-run tests).
+LOAD_GATE_LAST_RECHECK_EPOCH=0
+load_gate_midrun_check() {
+  if [ "${LOAD_GATE_FORCE:-}" = "1" ]; then return 0; fi
+  local now
+  now="$(date +%s 2>/dev/null || echo 0)"
+  [ "$now" -lt $((LOAD_GATE_LAST_RECHECK_EPOCH + 60)) ] && return 0
+  LOAD_GATE_LAST_RECHECK_EPOCH="$now"
+  local out load1 suspend
+  out="$(node "$ROOT/scripts/load-gate.mjs" check --json 2>/dev/null)" || {
+    local rc=$?
+    # helper error mid-run: don't abort an otherwise-fine gate; entry already
+    # proved the helper runs — a transient failure is not a load verdict.
+    [ $rc -eq 3 ] || return 0
+    load1="$(printf '%s' "$out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
+    suspend="$(printf '%s' "$out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"
+    echo "[load-gate] DEFERRED — gate interrupted mid-run (load ${load1:-?} ≥ suspend ${suspend:-?}); re-invoke to complete" >&2
+    exit 3
+  }
+  return 0
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/cron-quality-gates.sh <arch|mutation|oracle>
+
+  arch      Verify every `scripts/<name>` reference in skills/**/SKILL.md
+            resolves to an existing file in scripts/. Fails on missing
+            core-workflow scripts; reports known-planned and product-repo
+            script references without failing.
+  mutation  Run every extensions/*/test.mjs; fail on non-running or vacuous
+            (assertion-free) tests.
+  oracle    Run the #254 dev-machine oracle: the frontmatter validator's
+            drift lock against pi's real bundle (fixture parity + live-corpus
+            parity + extraction parity + deterministic fuzz + version pin).
+            pi must be installed (dev machine / cron only). Writes a
+            last-oracle-run timestamp consumed by the arch/mutation staleness
+            warnings (Task 10 f).
+  fleet     #341 PR-B weekly visible-fleet cadence: session-postmortem's shared
+            parser over recent sessions (compaction records included) + the
+            fleet cost report + the truncation watch. Load-gated like the other
+            subcommands; the launchd plist (farmed fleet-cost-weekly.sh driver)
+            is the always-on schedule — this is the agent-invoked repo-tree
+            entry that surfaces the report + watch. Runs session-postmortem
+            over the last FLEET_DAYS (default 7) via the report/watch, which
+            share the parser (--summary). Exit 1 = report escalated or watch
+            triggered (the pre-committed rollback procedure is printed).
+  -h|--help Print this help.
+
+Exit: 0 clean, 1 violations/drift, 2 usage/environment error, 3 deferred —
+      re-invoke (load gate; LOAD_GATE_FORCE=1 bypasses).
+
+Exit: 0 clean, 1 violations, 2 usage error, 3 deferred — re-invoke (load gate;
+      LOAD_GATE_FORCE=1 bypasses).
+EOF
+}
+
+# ── arch — skill → script dispatch integrity ────────────────────────────────
+# Scripts referenced by pipeline skills that are intentionally NOT in the
+# agent-infra canonical tree:
+#   * Planned under a tracked issue (registry Status = "new (#NNNN)").
+#   * Product-repo scripts referenced only by product-pipeline skills
+#     (carousel/content pipeline) — they resolve in the product repo where
+#     those pipelines run.
+KNOWN_PLANNED="check-coverage-pruning.cjs:#6461 subjects-labels.cjs:superseded-by-swarm-Supabase-SOR(alignment-issue) subjects-labels.test.cjs:superseded-with-subjects-labels.cjs"
+PRODUCT_PIPELINE_SKILL_PATTERNS=(
+  '/carousel-' '/google-slides' '/art-director' '/carousel-designer' '/content-'
+)
+
+is_product_pipeline_skill() {
+  local path="$1"
+  local p
+  for p in "${PRODUCT_PIPELINE_SKILL_PATTERNS[@]}"; do
+    [[ "$path" == *"$p"* ]] && return 0
+  done
+  return 1
+}
+
+arch_gate() {
+  local violations=0 planned=0 external=0 ok=0
+  local -a violation_list=()
+  local -a planned_list=() external_list=()
+  local seen=()
+  local skill_file ref token refs
+
+  echo "=== cron-quality-gates arch ==="
+  echo "Scanning skills/**/SKILL.md for scripts/ references…"
+
+  while IFS= read -r skill_file; do
+    [[ "$skill_file" == *"ARCHIVE"* || "$skill_file" == *"_deprecated"* ]] && continue
+    load_gate_midrun_check
+    local skill_dir
+    skill_dir="$(dirname "$skill_file")"
+
+    refs=$(grep -oE '(^|[^A-Za-z0-9_.-])scripts/[A-Za-z0-9_.-]+' "$skill_file" 2>/dev/null | sed -E 's/^[^A-Za-z0-9_.-]//' || true)
+    [[ -n "$refs" ]] || continue
+
+    for ref in $refs; do
+      token="${ref#scripts/}"
+      # Skip globs / variables / dangling dashes (e.g. `scripts/check-*` → `check-`)
+      [[ "$token" == *"*"* || "$token" == *"\$"* || "$token" == *"-" ]] && continue
+      [[ "$token" == *.sh || "$token" == *.cjs || "$token" == *.mjs || "$token" == *.js || "$token" == *.py ]] || continue
+
+      local key="$token:$skill_dir"
+      local k
+      for k in "${seen[@]:-}"; do [[ "$k" == "$key" ]] && continue 2; done
+      seen+=("$key")
+
+      if [[ -f "scripts/$token" ]]; then
+        ok=$((ok + 1))
+        continue
+      fi
+
+      if [[ "$KNOWN_PLANNED" == *"$token:"* ]]; then
+        planned=$((planned + 1))
+        planned_list+=("$token ($skill_file) — known: ${KNOWN_PLANNED#*$token:}")
+        continue
+      fi
+
+      if is_product_pipeline_skill "$skill_file"; then
+        external=$((external + 1))
+        external_list+=("$token ($skill_file) — product-repo script, resolves in product repo")
+        continue
+      fi
+
+      violations=$((violations + 1))
+      violation_list+=("$token ($skill_file) — MISSING from scripts/; gate will silently no-op")
+    done
+  done < <(find "$ROOT/skills" -name 'SKILL.md' -type f 2>/dev/null || true)
+
+  echo ""
+  echo "✅ ${ok} script reference(s) resolved."
+  [[ $planned -gt 0 ]] && printf 'ℹ️  %d known-planned:\n' "$planned" && printf '   %s\n' "${planned_list[@]}"
+  [[ $external -gt 0 ]] && printf 'ℹ️  %d product-repo (non-failing):\n' "$external" && printf '   %s\n' "${external_list[@]}"
+
+  if [[ $violations -gt 0 ]]; then
+    echo ""
+    echo "❌ VIOLATIONS — pipeline skills dispatch missing scripts:"
+    printf '   ❌ %s\n' "${violation_list[@]}"
+    echo ""
+    echo "Fix: create the script in scripts/ (canonical tree) or remove the reference."
+    echo "A skill that dispatches a nonexistent script silently no-ops its gate."
+    exit 1
+  fi
+
+  echo ""
+  echo "✅ arch gate clean — every core-workflow script reference resolves."
+  exit 0
+}
+
+# ── mutation — vacuous-test detection ───────────────────────────────────────
+mutation_gate() {
+  local failures=0 passed=0 vacuous=0
+  local -a failure_list=() vacuous_list=()
+  local test_file
+
+  echo "=== cron-quality-gates mutation ==="
+  echo "Running extensions/*/test.mjs (mutation-survival detection)…"
+
+  while IFS= read -r test_file; do
+    local name
+    name="$(basename "$(dirname "$test_file")")"
+    load_gate_midrun_check
+
+    if node "$test_file" >/tmp/cron-mutation-out.$$ 2>&1; then
+      : # test ran — check assertions below
+    else
+      local rc=$?
+      failures=$((failures + 1))
+      failure_list+=("$name — test run FAILED (exit $rc)")
+      sed 's/^/     /' /tmp/cron-mutation-out.$$ | head -5
+      continue
+    fi
+
+    # A passing test with no assertion markers is vacuous — a mutation of the
+    # subject would survive it. It proves nothing.
+    if ! grep -qE '✅|❌|\b(assert|expect|ok|fail|equal|deepEqual|throws|rejects)\b' "$test_file"; then
+      vacuous=$((vacuous + 1))
+      vacuous_list+=("$name — test.mjs has no assertion markers; cannot fail, mutations survive")
+      continue
+    fi
+
+    passed=$((passed + 1))
+  done < <(find "$ROOT/extensions" -name 'test.mjs' -type f 2>/dev/null || true)
+  rm -f /tmp/cron-mutation-out.$$
+
+  echo ""
+  echo "✅ ${passed} test(s) ran with assertions."
+  [[ $vacuous -gt 0 ]] && printf '❌ %d vacuous test(s):\n' "$vacuous" && printf '   %s\n' "${vacuous_list[@]}"
+  [[ $failures -gt 0 ]] && printf '❌ %d failing test(s):\n' "$failures" && printf '   %s\n' "${failure_list[@]}"
+
+  if [[ $failures -gt 0 || $vacuous -gt 0 ]]; then
+    echo ""
+    echo "❌ mutation gate failed — a passing-but-assertion-free (or broken) test"
+    echo "   means mutations survive: coverage claims are meaningless."
+    exit 1
+  fi
+
+  echo ""
+  echo "✅ mutation gate clean — all extension tests can fail (real assertions)."
+  exit 0
+}
+
+# ── oracle — #254 frontmatter-validator drift lock ──────────────────────────
+LAST_ORACLE_RUN="$ROOT/.last-oracle-run"
+ORACLE_STALE_DAYS="${ORACLE_STALE_DAYS:-7}"
+
+oracle_staleness_warning() {
+  # Task 10 (f): arch/mutation warn (never fail) when the oracle hasn't run
+  # recently — a drifting validator is exactly what the oracle exists to catch.
+  if [ -f "$LAST_ORACLE_RUN" ]; then
+    local last_run stale_days
+    last_run="$(cat "$LAST_ORACLE_RUN")"
+    stale_days=$(( ($(date +%s) - last_run) / 86400 ))
+    if [ "$stale_days" -ge "$ORACLE_STALE_DAYS" ]; then
+      echo "⚠️  oracle drift-lock last ran ${stale_days}d ago (>=$ORACLE_STALE_DAYS) — run: scripts/cron-quality-gates.sh oracle"
+    fi
+  else
+    echo "⚠️  oracle drift-lock has never run — run: scripts/cron-quality-gates.sh oracle"
+  fi
+}
+
+oracle_gate() {
+  echo "=== cron-quality-gates oracle ==="
+  echo "Running scripts/check-skill-lint.oracle.test.mjs (pi bundle parity)…"
+
+  if ! command -v node >/dev/null 2>&1; then
+    echo "❌ node not found — oracle requires node" >&2
+    exit 2
+  fi
+
+  node scripts/check-skill-lint.oracle.test.mjs
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    date +%s > "$LAST_ORACLE_RUN"
+    echo "✅ oracle clean — timestamp written to $LAST_ORACLE_RUN"
+    exit 0
+  fi
+  # 1 = drift (incl. pi version mismatch), 2 = pi not found / environment
+  if [ "$rc" -eq 2 ]; then
+    echo "❌ oracle environment failure (pi not found?) — re-probe deliberately" >&2
+    exit 2
+  fi
+  echo "❌ oracle drift detected — linter verdicts diverged from pi's loader; re-probe + fix, never soft-skip" >&2
+  exit 1
+}
+
+# ── fleet — #341 PR-B weekly visible-fleet cadence ─────────────────────────
+FLEET_DAYS="${FLEET_DAYS:-7}"
+
+fleet_gate() {
+  echo "=== cron-quality-gates fleet (visible-fleet feedback loop, #341 PR-B) ==="
+  echo "Running session-postmortem shared parser + fleet cost report + truncation watch over the last ${FLEET_DAYS} day(s)…"
+
+  local report_rc=0 watch_rc=0 report watch
+  # The report + watch shell to the SHARED parser (session-postmortem.sh
+  # --summary), so per-session retros and the fleet report cannot drift.
+  # Run against the repo copy here (agent-invoked, repo tree readable); the
+  # farmed launchd driver (fleet-cost-weekly.sh) is the always-on schedule.
+  report="$(bash "$ROOT/scripts/fleet-cost-report.sh" --days "$FLEET_DAYS" 2>&1)" || report_rc=$?
+  echo "$report"
+  echo ""
+
+  watch="$(bash "$ROOT/scripts/watch-truncation.sh" --days "$FLEET_DAYS" 2>&1)" || watch_rc=$?
+  echo "$watch"
+
+  # Preserve the sub-tool exit contract: rc=2 (either tool) is an
+  # ENVIRONMENT/USAGE error (sessions dir missing, parser broken, data-absence
+  # gate) — exit 2, NOT a fleet escalation. Only an actual report/watch
+  # escalation (rc=1) exits 1.
+  if [ "$report_rc" -eq 2 ] || [ "$watch_rc" -eq 2 ]; then
+    echo ""
+    echo "❌ fleet gate ENV ERROR (report rc=$report_rc, watch rc=$watch_rc) — see above."
+    exit 2
+  fi
+  if [ "$report_rc" -ne 0 ] || [ "$watch_rc" -ne 0 ]; then
+    echo ""
+    echo "❌ fleet gate FAILED (report rc=$report_rc, watch rc=$watch_rc) — see the"
+    echo "   report/watch above. The truncation watch's pre-committed rollback"
+    echo "   procedure is printed there."
+    exit 1
+  fi
+  # ⛔ THE AGGREGATE MUST NOT RE-ASSERT A THRESHOLD THE REPORT DID NOT EVALUATE. `report_rc == 0`
+  # means "no escalation", NOT "every threshold was measured": fleet-cost-report.sh skips (b) when
+  # the clamp pool is undefined or fewer than 3 sessions carry cost data, and after the 2026-10-31
+  # geometry move that is the EXPECTED first-window reading (every 300K-era compaction is now
+  # sub-floor and excluded, so the pool is STARVED, not mixed). The flat "thresholds within" line
+  # printed that week would have been a false PASS at the aggregate level, in the one report whose
+  # job is to answer "did the clamp work?". The report publishes its own verdict as a machine
+  # marker (`# fleet-verdict: clean cache-share-evaluated=<yes|no>`); read THAT rather than its
+  # prose, and read it FAIL-SAFE: an absent/malformed marker (an older report) takes the qualified
+  # branch, because under-claiming is the only safe direction here.
+  # A here-string, not a pipe: `printf … | grep -q` under `set -o pipefail` takes the ELSE branch
+  # when the pattern IS present (grep exits at its first match, the producer takes SIGPIPE, and
+  # pipefail promotes 141 to the pipeline status) — the documented false-negative of this gate
+  # class (see MEMORY.md, [shell]).
+  echo ""
+  if grep -qxF '# fleet-verdict: clean cache-share-evaluated=yes' <<<"$report"; then
+    echo "✅ fleet gate clean — thresholds within the shipped 800K-clamp regime."
+  else
+    echo "✅ fleet gate clean — no escalation, BUT the cache-share threshold (b) was NOT evaluated this window"
+    echo "   (fewer than 3 cost-bearing clamp-regime sessions, so (b) never runs)."
+    echo "   This is the EXPECTED reading for the first window after the 2026-10-31 floor"
+    echo "   move — every 300K-era compaction is now sub-floor and excluded — so treat it"
+    echo "   as UNMEASURED (see the report's (b)), never as a clean week."
+  fi
+  exit 0
+}
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+case "${1:-}" in
+  arch)     load_gate_entry; oracle_staleness_warning; arch_gate ;;
+  mutation) load_gate_entry; oracle_staleness_warning; mutation_gate ;;
+  oracle)   load_gate_entry; oracle_gate ;;
+  fleet)    load_gate_entry; fleet_gate ;;
+  -h|--help) usage; exit 0 ;;
+  *)
+    echo "Error: unknown subcommand '${1:-}'" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

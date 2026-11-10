@@ -1,0 +1,17 @@
+### revert round trip on a pristine tree
+
+--- apply
+✅ applied to 5 file(s); backups in /Users/danielospina/.pi/agent/state/pi-patches/backup-0.85.1-71d9a97e
+--- revert
+✅ reverted 5 file(s) from /Users/danielospina/.pi/agent/state/pi-patches/backup-0.85.1-71d9a97e
+   ⚠ the clamp death fix is now ABSENT — re-apply before running long sessions.
+--- --check after revert (must be RED again, exit 1)
+❌ NOT APPLIED — the fix is not in effect:
+   - bundled runtime: available=0 maxTokens=8000 → 1, expected 1024 (no budget left -> must NOT be 1)
+   - bundled runtime: available=0 maxTokens=100 → 1, expected 100 (caller cap below the floor is honoured)
+EXIT=1
+
+--- diff against the pristine master: byte-identical means the revert is a TRUE restore
+IDENTICAL to pristine master
+--- re-apply
+✅ applied to 5 file(s); backups in /Users/danielospina/.pi/agent/state/pi-patches/backup-0.85.1-71d9a97e

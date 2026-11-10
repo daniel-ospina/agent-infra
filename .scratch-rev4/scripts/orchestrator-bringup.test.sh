@@ -1,0 +1,1591 @@
+#!/usr/bin/env bash
+# orchestrator-bringup.test.sh — the regression contract for agent-infra#1761.
+#
+# WHAT THIS SUITE IS FOR. Two behaviours, and BOTH directions of each: a guard that only refuses is
+# indistinguishable from one that always refuses, and a guard that only allows is no guard at all.
+#
+#   §1  ONE CONTROLLER PER (MACHINE, REPO) — a second `start` for the SAME repo is refused with a
+#       one-line message naming the live pid, and a controller for a DIFFERENT repo on the same
+#       machine is ALLOWED. The owner stated both halves in one sentence: "some sort of check so
+#       there are no accidental redundancies (note that we might want multiple orchestrators in the
+#       future ... at some point I might want in the same machine an orchestrator for repo A and an
+#       orchestrator for repo B, so that needs to be possible)". A guard keyed on the box, or on the
+#       state dir alone, fails the second half.
+#
+#   §2  A STALE ENTRY IS RECLAIMED, NOT A BLOCK — and the reclaim is SAID OUT LOUD. A registry that
+#       blocks on a dead pid turns one crash into a machine that can never start again; a reclaim
+#       nobody reports teaches nothing about the crash that caused it.
+#
+#   §3  A LIVE PID THAT IS NOT AN orch-loop.sh IS REPORTED, NEVER SIGNALLED. The pid may have been
+#       reused by an unrelated process; "we cannot tell" must not become a kill (measured reason: an
+#       unscoped process read matched four controllers on one box, only one of them ours).
+#
+#   §4  A CONFIGURED REPO PATH THAT DOES NOT EXIST ON THIS MACHINE IS A REFUSAL NAMING THE PATH —
+#       the measured cell defect (`cd: /Users/danielospina/Documents/GitHub/tortoise: No such file or
+#       directory`, refresh aborting every cycle while the controller kept a fresh heartbeat and
+#       dispatched nothing). §4b pins the repair: `--reseed` rewrites the machine-local lines from a
+#       real local clone, PRESERVES every other line (the secrets), and touches nothing that holds
+#       state.
+#
+#   §5  THE VERB CONTRACT — exit 0 ok / 1 refused / 2 cannot-determine — and `check` starts NOTHING.
+#       A gate that cannot answer says so (rc=2) rather than reporting green.
+#
+#   §6  `status` PUBLISHES THE DISPATCH READ — candidates.txt's line count and mtime — because that is
+#       the read that separates "running" from "running and doing nothing", the state every other
+#       observable reported as healthy.
+#
+#   §7  THE CELL PATH delegates to `cloud-cell-supervisor.sh apply` then `start`, reads the pid from
+#       the platform's OWN status verb, and records it — so a second start is refused naming that pid.
+#
+# Hermetic: every case builds its own temp HOME, temp clones, temp state dirs, and PATH stubs for
+# `gh`, `uname`, `launchctl` and the harness. No network, no real launchctl, no real tmux server, and
+# nothing is read from or written to the operator's ~/.local/state.
+# Run:  bash scripts/orchestrator-bringup.test.sh
+#       BRINGUP=path/to/other/copy bash scripts/orchestrator-bringup.test.sh   # non-vacuity runs
+# ⛔ COPY THE SCRIPTS INTO A GIT CHECKOUT (a throwaway `git init` + one commit is enough). One arm
+# resolves its own `$HERE` through `git worktree list` and reports cannot-determine when that copy has
+# no checkout around it, which reddens ~15 Mac arms that have nothing to do with the change —
+# measured in review of #1856: the recipe above produced 15 spurious reds plus the real ones, so a
+# reader could not attribute a red.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# BRINGUP is overridable so the suite can run against another copy — that is how a new arm is shown
+# to be NON-VACUOUS (point it at the pre-fix script and watch only the new arms go red).
+BRINGUP="${BRINGUP:-$HERE/orchestrator-bringup.sh}"
+
+PASS=0; FAIL=0
+ok()  { printf '  ✅ %s\n' "$*"; PASS=$((PASS + 1)); }
+bad() { printf '  ❌ %s\n' "$*"; FAIL=$((FAIL + 1)); }
+say_case() { printf '\n── %s ──\n' "$*"; }
+
+T="$(mktemp -d "${TMPDIR:-/tmp}/bringup-test.XXXXXXXX")" || exit 1
+CONTROLLER_PIDS=""
+cleanup() {
+  [ -n "$CONTROLLER_PIDS" ] && kill -9 $CONTROLLER_PIDS 2>/dev/null
+  pkill -9 -f "$T/" 2>/dev/null
+  rm -rf "$T"
+}
+trap cleanup EXIT
+
+# ── fixtures ────────────────────────────────────────────────────────────────────────────────────
+# A real repository clone (git init + an `origin` remote) for the given repo. The origin is what the
+# bringup DERIVES the repo identity from, so a fixture without one exercises the wrong refusal.
+mk_clone() { # <path> <owner/repo>
+  local p="$1" repo="$2"
+  mkdir -p "$p" || return 1
+  git init -q "$p" 2>/dev/null || return 1
+  git -C "$p" remote add origin "https://github.com/$repo.git" 2>/dev/null || return 1
+  printf 'x\n' > "$p/README" && git -C "$p" add README >/dev/null 2>&1
+  git -C "$p" -c user.email=t@t -c user.name=t commit -qm init >/dev/null 2>&1
+  return 0
+}
+
+# PATH bin dir with the stubs every case needs.
+#   gh        — answers `auth status`/`auth token`
+#   uname     — reports the PLATFORM this case is testing (mac | cell), so both branches of the
+#               entry point are exercised on whatever host runs the suite
+#   launchctl — answers nothing and logs. ⛔ A DEFAULT STUB, NOT A PER-ARM COURTESY: any arm that
+#               reaches a `launchctl load` without one registers a job in the operator's REAL gui
+#               domain, from a `$T` path that is deleted seconds later — the #446 temp-HOME hazard
+#               `launchd-cycle.sh`'s lc_guard_mutate exists to refuse. Measured while adding §12: an
+#               early `start` arm with no stub left `com.eldato.orchestrator-loop` loaded in the real
+#               domain, pointing at a deleted `bringup-test.*/jb/O/orch-loop.sh` (state = not running)
+#               — and the arm still PASSED, because nothing asserted otherwise. The arms that care
+#               about launchctl's ANSWER overwrite this file with their own (`mk_launchctl_pid`,
+#               `mk_launchctl_absent`, §8c's lying stub).
+mk_bin() { # <dir> <mac|cell>
+  mkdir -p "$1"
+  cat > "$1/gh" <<'GH'
+#!/bin/bash
+case "${1:-} ${2:-}" in
+  "auth status") exit 0 ;;
+  "auth token")  echo tok ;;
+  *) exit 0 ;;
+esac
+GH
+  chmod +x "$1/gh"
+  local sys=Darwin
+  [ "$2" = cell ] && sys=Linux
+  cat > "$1/uname" <<UNAME
+#!/bin/bash
+case "\${1:-}" in
+  -s|"") echo "$sys" ;;
+  *)  /usr/bin/uname "\$@" ;;
+esac
+UNAME
+  chmod +x "$1/uname"
+  cat > "$1/launchctl" <<LC
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$1/lc-called"
+case "\${1:-}" in
+  print) echo 'Bad request.' >&2; echo "Could not find service \${2#*/} in domain for user gui: 501" >&2; exit 113 ;;
+  *) exit 0 ;;
+esac
+LC
+  chmod +x "$1/launchctl"
+}
+
+# A stub harness: the two scripts the entry point consults, and a marker each so a case can assert
+# that a verb did (or did NOT) call one.
+# ⛔ THE rc=1 ARM SPEAKS THE PRODUCER'S OWN FORMAT, and that is load-bearing, not cosmetic. A fixture
+# that prints `DRIFT: …` re-implements a format the shipped checker no longer emits, so it agrees with
+# the consumer while the consumer disagrees with reality — the arm passed green over a count that read
+# `0 finding(s)` on a real box. Three lines, one of each shape the checker can produce: two LABELLED
+# (the question each failed) and one unlabelled (the record/surface remainders), so a consumer that
+# counts only one shape is caught here instead of on the box.
+mk_harness() { # <dir> <drift-rc>
+  mkdir -p "$1"
+  cat > "$1/check-deployed-drift.sh" <<EOF
+#!/bin/bash
+rc=$2
+case "\$rc" in
+  2) echo "UNKNOWN: no harness record at \$O/.agent-infra-stamp.json"; exit 2 ;;
+  1) echo "DRIFT(identity): the deployed harness is recorded from deadbeef, which is BEHIND origin/main"
+     echo "DRIFT(record): a.sh — UNCOMMITTED EDIT in \$O: the deployed copy differs from what the record says was deployed"
+     echo "DRIFT: MISSING b.sh — the record says the deploy wrote it, and it is not there now"
+     exit 1 ;;
+  *) echo "MATCH: deployed harness at \$O == the repo"; exit 0 ;;
+esac
+EOF
+  chmod +x "$1/check-deployed-drift.sh"
+  cat > "$1/install.sh" <<EOF
+#!/bin/bash
+: > "$1/install-called"
+echo "Installed com.eldato.orchestrator-loop"
+EOF
+  chmod +x "$1/install.sh"
+}
+
+# The controller STUB is invoked as `bash <path>/orch-loop.sh`, exactly like the real one — the
+# registry's liveness predicate matches the INVOCATION, so a `sleep 300` fixture would be classified
+# as a foreign process and every case would pass for the wrong reason.
+mk_controller() { # <state-dir>
+  mkdir -p "$1"
+  cat > "$1/orch-loop.sh" <<'STUB'
+#!/bin/bash
+trap 'exit 0' TERM INT
+while :; do sleep 1; done
+STUB
+  chmod +x "$1/orch-loop.sh"
+}
+start_controller() { # <state-dir>  → echoes pid
+  bash "$1/orch-loop.sh" >/dev/null 2>&1 &
+  local p=$!
+  CONTROLLER_PIDS="$CONTROLLER_PIDS $p"
+  printf '%s\n' "$p"
+}
+
+registry_dir() { printf '%s\n' "$1/.local/state/orchestrator"; }
+# lib_src — the library that belongs to the implementation UNDER TEST, never the checkout's copy.
+# `$HERE/lib` made a `BRINGUP=` mutation of the lib invisible to every cell case: those arms copied
+# the checkout's lib into the fixture, so they passed for the wrong reason (#1856 review).
+lib_src() { printf '%s/lib\n' "$(dirname "$BRINGUP")"; }
+# registry_lib — source the library directly, for the arms that test a PREDICATE (not a verb).
+registry_lib() { . "$(lib_src)/orchestrator-registry.sh"; }
+write_registry() { # <home> <file-name> <repo> <O> <pid> <state>
+  mkdir -p "$(registry_dir "$1")"
+  printf 'repo=%s\nO=%s\npid=%s\nstarted=%s\nstate=%s\n' "$3" "$4" "$5" "$(date +%s)" "$6" \
+    > "$(registry_dir "$1")/$2"
+}
+
+# bringup <home> <bin> <harness-dir> [args...]  → sets RC and OUT
+# `env -i` is deliberate: an operator's exported REPO/OR/O must not leak into a case.
+bringup() {
+  local home="$1" bin="$2" harness="$3"; shift 3
+  OUT="$(env -i \
+    HOME="$home" XDG_STATE_HOME="$home/.local/state" \
+    PATH="$bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    ${harness:+HARNESS_DIR="$harness"} \
+    "$@" bash "$BRINGUP" ${BRINGUP_ARGS:-} 2>&1)"
+  RC=$?
+}
+
+# ── §1 the registry: both directions ────────────────────────────────────────────────────────────
+say_case "§1 one controller per (machine, repo) — same repo REFUSED, different repo ALLOWED"
+A="$T/a"; mk_bin "$A/bin" mac; mk_harness "$A/harness" 0; mk_clone "$A/repo" "daniel-ospina/tortoise"
+mkdir -p "$A/home"; mk_controller "$A/O"
+A_PID="$(start_controller "$A/O")"; sleep 0.4
+# ⛔ The record names a DIFFERENT state dir from the one this `check` runs with: that is the measured
+# duplicate (two $O dirs on one machine running the same repo), and it is the case a state-dir-scoped
+# read cannot see. A record naming THIS $O is the "already running" case, asserted separately below.
+write_registry "$A/home" "daniel-ospina~tortoise" "daniel-ospina/tortoise" "$A/O-other" "$A_PID" running
+
+bringup "$A/home" "$A/bin" "$A/harness" REPO="$A/repo" O="$A/O" ENV_FILE="$A/home/keys.env"
+case "$OUT" in
+  *"ALREADY RUNNING"*"pid $A_PID"*) ok "check: refuses the SAME repo while its controller is live, naming pid $A_PID" ;;
+  *) bad "check did not refuse a live controller for the same repo — $OUT" ;;
+esac
+[ "$RC" = 1 ] && ok "check: rc=1 on the refusal (refused, not cannot-determine)" \
+              || bad "check: rc=$RC, want 1 for a refusal"
+case "$OUT" in
+  *"one controller per repo"*) ok "check: the refusal states the rule" ;;
+  *) bad "check: the refusal does not state the rule — $OUT" ;;
+esac
+
+# The OTHER shape of a live record — one naming THIS state dir — is not a duplicate and must be
+# reported as "already running" rather than refused: a refusal there would make `check` fail on a
+# machine that is working exactly as intended.
+write_registry "$A/home" "daniel-ospina~tortoise" "daniel-ospina/tortoise" "$A/O" "$A_PID" running
+bringup "$A/home" "$A/bin" "$A/harness" REPO="$A/repo" O="$A/O" ENV_FILE="$A/home/keys.env"
+[ "$RC" = 0 ] && ok "check: a controller recorded for THIS state dir is 'already running', not a duplicate" \
+             || bad "check refused a record that names its own state dir — rc=$RC $OUT"
+case "$OUT" in
+  *"at this state dir"*) ok "check: says the record belongs to this state dir" ;;
+  *) bad "check does not distinguish same-\$O from a duplicate — $OUT" ;;
+esac
+
+# ⛔ THE SECOND DIRECTION, and it is the half the owner called out: a DIFFERENT repo on the same
+# machine must not be blocked by the tortoise controller running right now.
+B="$T/b"; mk_bin "$B/bin" mac; mk_harness "$B/harness" 0; mk_clone "$B/repo" "daniel-ospina/agent-infra"
+mkdir -p "$B/home"
+bringup "$B/home" "$B/bin" "$B/harness" REPO="$B/repo" O="$B/O" ENV_FILE="$B/home/keys.env"
+[ "$RC" = 0 ] && ok "check: a DIFFERENT repo is ALLOWED on the same machine (the owner's second half)" \
+             || bad "check refused a different repo because another repo's controller is live — rc=$RC $OUT"
+case "$OUT" in
+  *"ALREADY RUNNING"*) bad "check reported the tortoise controller as a duplicate of the agent-infra repo" ;;
+  *) ok "check: the other repo's controller is not reported as a duplicate" ;;
+esac
+grep -q "repo=daniel-ospina/tortoise" "$(registry_dir "$A/home")/daniel-ospina~tortoise" 2>/dev/null \
+  && ok "the other repo's registry record is untouched" \
+  || bad "the other repo's registry record was modified by a run for a different repo"
+
+# ── §2 a stale entry is reclaimed, and the reclaim is reported ──────────────────────────────────
+say_case "§2 a stale registry entry is RECLAIMED (not a block), and the reclaim is reported"
+C="$T/c"; mk_bin "$C/bin" mac; mk_harness "$C/harness" 0; mk_clone "$C/repo" "daniel-ospina/agent-infra"
+mkdir -p "$C/home"
+write_registry "$C/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$C/O" 999999 running
+bringup "$C/home" "$C/bin" "$C/harness" REPO="$C/repo" O="$C/O" ENV_FILE="$C/home/keys.env"
+case "$OUT" in
+  *stale*|*STALE*) ok "check: a dead pid is reported as stale, not as a block" ;;
+  *) bad "check did not recognise the dead pid as stale — $OUT" ;;
+esac
+[ "$RC" = 0 ] && ok "check: rc=0 — a stale entry does not block this machine" \
+              || bad "check: rc=$RC — a stale entry blocked the machine (it must be reclaimed)"
+
+# ── §3 a live-but-foreign pid: reported, never signalled ────────────────────────────────────────
+say_case "§3 a live pid that is NOT an orch-loop.sh is reported as foreign — never signalled"
+D="$T/d"; mk_bin "$D/bin" mac; mk_harness "$D/harness" 0; mk_clone "$D/repo" "daniel-ospina/agent-infra"
+mkdir -p "$D/home"
+sleep 300 & FOREIGN=$!
+disown "$FOREIGN" 2>/dev/null || true   # keep the suite's output free of a "Killed" job notice
+CONTROLLER_PIDS="$CONTROLLER_PIDS $FOREIGN"
+write_registry "$D/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$D/O-other" "$FOREIGN" running
+bringup "$D/home" "$D/bin" "$D/harness" REPO="$D/repo" O="$D/O" ENV_FILE="$D/home/keys.env"
+case "$OUT" in
+  *"is NOT an orch-loop.sh"*) ok "check: a live-but-foreign owner is a refusal that names the pid and the record to remove, never a pass" ;;
+  *) bad "check passed (or refused vaguely) while a live-but-foreign pid holds the record — $OUT" ;;
+esac
+[ "$RC" = "1" ] && ok "check: foreign owner is rc=1 (a refusal), not rc=2 or 0" \
+                 || bad "check: foreign owner returned rc=$RC, expected 1"
+kill -0 "$FOREIGN" 2>/dev/null && ok "the foreign process was NOT signalled (it is not ours to kill)" \
+                               || bad "the foreign process was killed by the bringup"
+kill -9 "$FOREIGN" 2>/dev/null
+
+# ── §3b A REUSED PID IS RECLAIMED, NOT REFUSED FOREVER ──────────────────────────────────────────
+# Same read as §3 (alive + not an orch-loop.sh) under a different fact: the record was written a
+# minute BEFORE that process began, so the process cannot be the controller the record names. Without
+# this the record is a permanent false refusal — a pid recycled after a reboot blocks every future
+# start, and the only way through is a human hand-editing the registry (the #8175 class, measured).
+say_case "§3b a record whose pid was REUSED by an unrelated process is reclaimed (self-healing), not a permanent refusal"
+R="$T/reused"; mk_bin "$R/bin" mac; mk_harness "$R/harness" 0; mk_clone "$R/repo" "daniel-ospina/agent-infra"
+mkdir -p "$R/home"
+sleep 300 & REUSED=$!
+disown "$REUSED" 2>/dev/null || true   # keep the suite's output free of a "Killed" job notice
+CONTROLLER_PIDS="$CONTROLLER_PIDS $REUSED"
+mkdir -p "$(registry_dir "$R/home")"
+printf 'repo=%s\nO=%s\npid=%s\nstarted=%s\nstate=%s\n' "daniel-ospina/agent-infra" "$R/O-other" "$REUSED" \
+  "$(( $(date +%s) - 60 ))" running > "$(registry_dir "$R/home")/daniel-ospina~agent-infra"
+bringup "$R/home" "$R/bin" "$R/harness" REPO="$R/repo" O="$R/O" ENV_FILE="$R/home/keys.env"
+case "$OUT" in
+  *REUSED*) : ;;
+  *) bad "a pid that began AFTER the record was written was not identified as reused — $OUT" ;;
+esac
+case "$OUT" in
+  *"ALREADY RUNNING"*) bad "a REUSED pid still blocks the start forever — $OUT" ;;
+  *"BRINGUP CHECK OK"*) ok "check: a reused pid is reported as reused and does not block" ;;
+  *) bad "check neither passed nor explained the reused pid — $OUT" ;;
+esac
+kill -9 "$REUSED" 2>/dev/null
+
+# ── §4 the measured cell defect: a repo path that does not exist here ───────────────────────────
+say_case "§4 a configured repo path that does not exist on THIS machine is a refusal naming it"
+E="$T/e"; mk_bin "$E/bin" mac; mk_harness "$E/harness" 0; mk_clone "$E/repo" "daniel-ospina/tortoise"
+mkdir -p "$E/home"
+# ⛔ NOT the Mac's literal path: on a Mac that path EXISTS, so the arm would pass for the wrong
+# reason. The class under test is "a configured path that is not on this machine", whatever its
+# spelling — the measured value was another machine's home directory.
+FOREIGN_PATH="/Users/danielospina/Documents/GitHub/this-repo-does-not-exist-here"
+[ -e "$FOREIGN_PATH" ] && bad "fixture: $FOREIGN_PATH exists on this host — the case would be vacuous"
+bringup "$E/home" "$E/bin" "$E/harness" REPO="$FOREIGN_PATH" O="$E/O" ENV_FILE="$E/home/keys.env"
+case "$OUT" in
+  *"REFUSED"*"$FOREIGN_PATH"*) ok "check: refuses the foreign repo path and NAMES it (the measured cell failure)" ;;
+  *) bad "check did not refuse the foreign repo path — $OUT" ;;
+esac
+[ "$RC" = 1 ] && ok "check: rc=1 (a refusal, not a cannot-determine)" || bad "check: rc=$RC, want 1"
+
+# An UNSET repo is the same class, and its own case: the harness default is another machine's absolute
+# path, so "nobody set it" must not silently become "use the Mac's clone".
+bringup "$E/home" "$E/bin" "$E/harness" O="$E/O" ENV_FILE="$E/home/keys.env"
+case "$OUT" in
+  *"REFUSED"*"no repo is configured"*) ok "check: an UNSET repo is refused (the harness default is another machine's path)" ;;
+  *) bad "check did not refuse an unset repo — $OUT" ;;
+esac
+
+say_case "§4b --reseed rewrites the machine-local lines and PRESERVES the secrets and the state"
+mkdir -p "$E/home/.local/state"
+cat > "$E/home/keys.env" <<EOF
+DEEPSEEK_API_KEY=sk-secret-keep-me
+REPO=$FOREIGN_PATH
+OR=daniel-ospina/tortoise
+MAX_LANES=16
+O=$E/O
+EOF
+chmod 644 "$E/home/keys.env"
+mkdir -p "$E/O/state" && printf 'kept\n' > "$E/O/state/keepme"
+printf '%s\n' 4242 > "$E/O/.orch.lock"
+printf 'one\ntwo\n' > "$E/O/candidates.txt"
+mkdir -p "$E/home/.local/state/orchestrator"
+printf 'repo=x\nO=y\npid=999998\nstarted=1\nstate=running\n' > "$E/home/.local/state/orchestrator/daniel-ospina~tortoise"
+BRINGUP_ARGS=--reseed bringup "$E/home" "$E/bin" "$E/harness" REPO="$E/repo" O="$E/O" ENV_FILE="$E/home/keys.env"
+[ "$RC" = 0 ] && ok "--reseed: rc=0 on a repairable config" || bad "--reseed: rc=$RC — $OUT"
+grep -qx "REPO=$E/repo" "$E/home/keys.env" \
+  && ok "--reseed: REPO now names the real local clone" \
+  || bad "--reseed: REPO was not rewritten — $(grep '^REPO=' "$E/home/keys.env" | head -1)"
+grep -qx 'DEEPSEEK_API_KEY=sk-secret-keep-me' "$E/home/keys.env" \
+  && ok "--reseed: the provider key is PRESERVED byte for byte" \
+  || bad "--reseed: the reseed destroyed a secret line"
+grep -qx 'MAX_LANES=16' "$E/home/keys.env" \
+  && ok "--reseed: unrelated config lines are preserved" \
+  || bad "--reseed: an unrelated config line was dropped"
+ls "$E/home"/keys.env.bak-* >/dev/null 2>&1 \
+  && ok "--reseed: the previous config is backed up" \
+  || bad "--reseed: no backup of the previous config"
+[ -f "$E/O/state/keepme" ] && ok "--reseed: \$O/state is untouched" || bad "--reseed: \$O/state was destroyed"
+[ -f "$E/O/.orch.lock" ] && ok "--reseed: the lock file is untouched (it is state, not config)" \
+                         || bad "--reseed: the lock file was removed"
+[ "$(cat "$E/O/candidates.txt")" = "$(printf 'one\ntwo')" ] \
+  && ok "--reseed: the candidate file is untouched" || bad "--reseed: the candidate file was rewritten"
+
+# A reseed with no usable clone must fail closed rather than invent a path.
+G="$T/g"; mk_bin "$G/bin" mac; mk_harness "$G/harness" 0; mkdir -p "$G/home"
+BRINGUP_ARGS=--reseed bringup "$G/home" "$G/bin" "$G/harness" REPO="$T/does-not-exist" O="$G/O" ENV_FILE="$G/home/keys.env"
+[ "$RC" = 2 ] && ok "--reseed: rc=2 (cannot determine) when no local clone exists — never an invented path" \
+             || bad "--reseed: rc=$RC, want 2 when nothing is discoverable — $OUT"
+
+# ── §5 verb contract, and check starts NOTHING ─────────────────────────────────────────────────
+say_case "§5 verbs: exit codes, and 'check' launches nothing"
+H="$T/h"; mk_bin "$H/bin" mac; mk_clone "$H/repo" "daniel-ospina/agent-infra"; mkdir -p "$H/home"
+mk_harness "$H/harness" 0
+cat > "$H/bin/launchctl" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$H/launchctl-called"
+case "\$1" in
+  print) echo "	pid = 51234"; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$H/bin/launchctl"
+bringup "$H/home" "$H/bin" "$H/harness" REPO="$H/repo" O="$H/O" ENV_FILE="$H/home/keys.env"
+[ ! -f "$H/harness/install-called" ] && ok "check: install.sh was NOT invoked (check starts nothing)" \
+                                     || bad "check invoked install.sh — 'validate without starting' is broken"
+[ ! -f "$H/launchctl-called" ] && ok "check: launchctl was NOT invoked" || bad "check invoked launchctl"
+
+# ── §6 status publishes the dispatch read ──────────────────────────────────────────────────────
+say_case "§6 status publishes candidates line count + mtime — 'running' vs 'running and doing nothing'"
+J="$T/j"; mk_bin "$J/bin" mac; mk_harness "$J/harness" 0; mk_clone "$J/repo" "daniel-ospina/agent-infra"
+mkdir -p "$J/home" "$J/O/logs"; printf '1\n2\n3\n' > "$J/O/candidates.txt"
+BRINGUP_ARGS=status bringup "$J/home" "$J/bin" "$J/harness" REPO="$J/repo" O="$J/O" ENV_FILE="$J/home/keys.env"
+case "$OUT" in
+  *"candidates: 3 line(s)"*) ok "status: reports the candidate count" ;;
+  *) bad "status does not report the candidate count — $OUT" ;;
+esac
+case "$OUT" in
+  *mtime*) ok "status: reports the candidate mtime (the read that proves the refresh is moving)" ;;
+  *) bad "status does not report the candidate mtime — $OUT" ;;
+esac
+: > "$J/O/candidates.txt"
+BRINGUP_ARGS=status bringup "$J/home" "$J/bin" "$J/harness" REPO="$J/repo" O="$J/O" ENV_FILE="$J/home/keys.env"
+case "$OUT" in
+  *EMPTY*) ok "status: WARNS on an empty candidate file (running, but dispatching nothing)" ;;
+  *) bad "status did not warn about the empty candidate file — $OUT" ;;
+esac
+
+# §6b THE CONTROLLER RUNS FROM THE HARNESS PATH, NOT FROM $O. Measured 2026-10-17 on pi-cell-2: the
+# controller's argv is `bash <HARNESS>/orch-loop.sh` — $O is seeded for the WORKERS, and the loop
+# itself execs the harness it was started from. A read scoped to `$O/orch-loop.sh` alone therefore
+# found no controller on a cell that was busy spawning lanes, and `status` printed "no orch-loop.sh
+# pid observed yet" over a live loop (the false-STOPPED class #1761 is about, one path further in).
+M="$T/m"; mk_bin "$M/bin" cell; mk_clone "$M/repo" "daniel-ospina/agent-infra"; mkdir -p "$M/home" "$M/O"
+mkdir -p "$M/harness"; mk_controller "$M/harness"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$M/home/keys.env"
+printf '%s\n' "$M/harness" > "$M/home/.harness-path"
+M_PID="$(start_controller "$M/harness")"; sleep 0.4
+# NOTE: $M/O deliberately has NO orch-loop.sh — only the harness does.
+BRINGUP_ARGS=status bringup "$M/home" "$M/bin" "" CELL_HOME="$M/home" REPO="$M/repo" O="$M/O" \
+  HARNESS_PIN_DIR="$M/home/harness" HARNESS_PIN_FILE="$M/home/.harness-path"
+case "$OUT" in
+  *"controller: RUNNING  pid $M_PID"*) ok "status: finds a controller running from the HARNESS path (the measured cell argv), not just \$O" ;;
+  *) bad "status: missed a controller whose argv is the harness path — $OUT" ;;
+esac
+kill -9 "$M_PID" 2>/dev/null
+
+# ── §6c THE CONFIG FILE'S `O=` IS HONOURED, NOT SILENTLY IGNORED ────────────────────────────────
+# `cloud-cell-supervisor.sh` sources the same file, so `O=` in it moves the LOCK, the candidates and
+# the state dir. If this surface captures its provenance AFTER applying the platform default, the
+# config arm is dead and `check`/`status`/the registry all read a directory the controller never
+# touches — two surfaces disagreeing about where the lock is, which is the #1745 class. Found in
+# review of #1856; the arm asserts the state dir the config file names is the one reported.
+OQ="$T/oq"; mk_bin "$OQ/bin" mac; mk_harness "$OQ/harness" 0; mk_clone "$OQ/repo" "daniel-ospina/agent-infra"
+mkdir -p "$OQ/home" "$OQ/config-O"
+printf 'REPO=%s\nO=%s\nDEEPSEEK_API_KEY=sk-test\n' "$OQ/repo" "$OQ/config-O" > "$OQ/home/keys.env"
+bringup "$OQ/home" "$OQ/bin" "$OQ/harness" ENV_FILE="$OQ/home/keys.env"
+case "$OUT" in
+  *"state=$OQ/config-O"*) ok "config: the config file's O= is the state dir this surface reads (not the platform default)" ;;
+  *) bad "config: the config file's O= was IGNORED — $OUT" ;;
+esac
+# …and an EXPLICIT environment O still WINS: the config file is a fallback, never an override.
+bringup "$OQ/home" "$OQ/bin" "$OQ/harness" REPO="$OQ/repo" O="$OQ/env-O" ENV_FILE="$OQ/home/keys.env"
+case "$OUT" in
+  *"state=$OQ/env-O"*) ok "config: an explicit O in the environment OVERRIDES the config file" ;;
+  *"state=$OQ/config-O"*) bad "config: the config file overrode an explicit environment O" ;;
+  *) bad "config: neither the env O nor the config O was used — $OUT" ;;
+esac
+
+# ── §7 the cell path ───────────────────────────────────────────────────────────────────────────
+say_case "§7 the cell path: apply -> start via the supervisor, pid read from ITS status verb"
+K="$T/k"; mk_bin "$K/bin" cell; mk_clone "$K/repo" "daniel-ospina/agent-infra"; mkdir -p "$K/home"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$K/home/keys.env"   # a cell has no ambient provider key
+mkdir -p "$K/sup" "$K/pin/aaaaaaaaaaaa/scripts/orchestrator-harness" "$K/O"
+printf '#!/bin/bash\n' > "$K/pin/aaaaaaaaaaaa/scripts/orchestrator-harness/orch-loop.sh"
+# The supervisor STUB records each verb it is asked for, and `status` answers in the shipped wording
+# (the pid is parsed out of it — that is the whole point of reading the platform's own verb).
+cat > "$K/bin/cloud-cell-supervisor-stub.sh" <<EOF
+#!/bin/bash
+printf '%s\n' "\$1" >> "$K/sup/called"
+case "\$1" in
+  apply) exit 0 ;;
+  start) : > "$K/sup/started"; exit 0 ;;
+  status) echo "controller: RUNNING (pid 4242) — scope=own repo=daniel-ospina/agent-infra" ;;
+  stop)   exit 0 ;;
+esac
+EOF
+chmod +x "$K/bin/cloud-cell-supervisor-stub.sh"
+printf '%s\n' "$K/pin/aaaaaaaaaaaa/scripts/orchestrator-harness" > "$K/home/.harness-path"
+# The bringup resolves its sibling supervisor; give it one by running a copy from a scratch scripts/
+# dir that carries the stub under the expected name.
+mkdir -p "$K/scripts"; cp "$BRINGUP" "$K/scripts/orchestrator-bringup.sh"
+cp -r "$(lib_src)" "$K/scripts/lib"
+cp "$K/bin/cloud-cell-supervisor-stub.sh" "$K/scripts/cloud-cell-supervisor.sh"
+mkdir -p "$K/scripts/orchestrator-harness"
+CELL_BRINGUP="$K/scripts/orchestrator-bringup.sh"
+OUT="$(env -i HOME="$K/home" XDG_STATE_HOME="$K/home/.local/state" \
+  PATH="$K/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$K/home" \
+  REPO="$K/repo" O="$K/O" HARNESS_PIN_DIR="$K/pin" HARNESS_PIN_FILE="$K/home/.harness-path" \
+  bash "$CELL_BRINGUP" start 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "start (cell): rc=0" || bad "start (cell): rc=$RC — $OUT"
+grep -qx apply "$K/sup/called" 2>/dev/null && ok "start (cell): called 'apply' before starting (pins the harness)" \
+                                          || bad "start (cell): did not call the supervisor's apply"
+grep -qx start "$K/sup/called" 2>/dev/null && ok "start (cell): called the supervisor's 'start'" \
+                                          || bad "start (cell): did not call the supervisor's start"
+F="$(registry_dir "$K/home")/daniel-ospina~agent-infra"
+[ -f "$F" ] && ok "start (cell): a registry record was written" || bad "start (cell): no registry record"
+[ "$(sed -n 's/^pid=//p' "$F" 2>/dev/null)" = 4242 ] \
+  && ok "start (cell): the recorded pid is the one the platform's status verb named (4242)" \
+  || bad "start (cell): recorded pid is '$(sed -n 's/^pid=//p' "$F" 2>/dev/null)', want 4242"
+grep -qx 'state=running' "$F" 2>/dev/null && ok "start (cell): the record is marked running" \
+                                         || bad "start (cell): the record was left in the 'starting' state"
+
+# ── §7b A FAILING DELEGATED VERB MUST REFUSE IN ONE LINE, NOT DIE ON A BASH ERROR ───────────────
+# The apply-failure refusal expanded two variables this script never assigns. Under `set -u` that
+# kills the shell BEFORE the refusal prints, so the operator sees `HARNESS_REF: unbound variable`
+# instead of the one actionable line the contract promises — and the cause (a live controller that
+# apply refused to replace) is never stated. Review of #1856 found it; every `start` arm before this
+# one succeeded, so nothing could see it.
+FAILED="$T/failed"; mk_bin "$FAILED/bin" cell; mk_clone "$FAILED/repo" "daniel-ospina/agent-infra"
+mkdir -p "$FAILED/home" "$FAILED/O" "$FAILED/scripts" "$FAILED/scripts/orchestrator-harness"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$FAILED/home/keys.env"
+cp "$BRINGUP" "$FAILED/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$FAILED/scripts/lib"
+cat > "$FAILED/scripts/cloud-cell-supervisor.sh" <<'STUB'
+#!/bin/bash
+case "$1" in
+  apply) echo "FATAL: a controller is RUNNING (pid 999) and apply would replace the harness tree under it" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+STUB
+OUT="$(env -i HOME="$FAILED/home" XDG_STATE_HOME="$FAILED/home/.local/state" \
+  PATH="$FAILED/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$FAILED/home" \
+  REPO="$FAILED/repo" O="$FAILED/O" HARNESS_PIN_DIR="$FAILED/home/harness" \
+  HARNESS_PIN_FILE="$FAILED/home/.harness-path" \
+  bash "$FAILED/scripts/orchestrator-bringup.sh" start 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "start (cell): a failed 'apply' is rc=1 (a refusal)" \
+              || bad "start (cell): a failed apply returned rc=$RC, want 1 — $OUT"
+case "$OUT" in
+  *unbound*) bad "start (cell): the refusal DIED on an unset variable instead of printing — $OUT" ;;
+  *"REFUSED:"*"no controller was started"*) ok "start (cell): the apply failure prints ONE actionable refusal line" ;;
+  *) bad "start (cell): the apply failure printed no usable refusal — $OUT" ;;
+esac
+[ -f "$FAILED/home/.local/state/orchestrator/daniel-ospina~agent-infra" ] \
+  && bad "start (cell): a failed start left a phantom registry owner" \
+  || ok "start (cell): a failed start left no registry entry behind"
+
+# The mac arm of the same contract: install.sh is the delegated renderer, and its failure is a refusal.
+FAILEDM="$T/failedm"; mk_bin "$FAILEDM/bin" mac; mk_clone "$FAILEDM/repo" "daniel-ospina/agent-infra"
+mkdir -p "$FAILEDM/home" "$FAILEDM/O" "$FAILEDM/harness"
+cat > "$FAILEDM/harness/check-deployed-drift.sh" <<'STUB'
+#!/bin/bash
+echo "MATCH: deployed harness at $O == the repo"; exit 0
+STUB
+cat > "$FAILEDM/harness/install.sh" <<'STUB'
+#!/bin/bash
+echo "plutil: the rendered plist is invalid" >&2; exit 1
+STUB
+chmod +x "$FAILEDM/harness/install.sh" "$FAILEDM/harness/check-deployed-drift.sh"
+BRINGUP_ARGS=start bringup "$FAILEDM/home" "$FAILEDM/bin" "$FAILEDM/harness" \
+  REPO="$FAILEDM/repo" O="$FAILEDM/O" ENV_FILE="$FAILEDM/home/keys.env"
+[ "$RC" = 1 ] && ok "start (mac): a failed install.sh is rc=1 (a refusal)" \
+              || bad "start (mac): a failed install.sh returned rc=$RC, want 1 — $OUT"
+case "$OUT" in
+  *"install.sh failed"*) ok "start (mac): the install.sh failure is reported as such" ;;
+  *) bad "start (mac): the install.sh failure was not reported — $OUT" ;;
+esac
+
+# A FRESH cell (no pin recorded yet) must be reported as such, NOT refused: `start` is what applies
+# the pin. This arm exists because the other cell cases all carry a pin, so the "nothing recorded"
+# branch was unreached — and it carried an unbound variable that only a fresh cell could hit.
+FRESH="$T/fresh"; mk_bin "$FRESH/bin" cell; mk_clone "$FRESH/repo" "daniel-ospina/agent-infra"
+mkdir -p "$FRESH/home" "$FRESH/O" "$FRESH/scripts" "$FRESH/scripts/orchestrator-harness"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$FRESH/home/keys.env"
+cp "$BRINGUP" "$FRESH/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$FRESH/scripts/lib"
+cp "$K/bin/cloud-cell-supervisor-stub.sh" "$FRESH/scripts/cloud-cell-supervisor.sh"
+OUT="$(env -i HOME="$FRESH/home" XDG_STATE_HOME="$FRESH/home/.local/state" \
+  PATH="$FRESH/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$FRESH/home" \
+  REPO="$FRESH/repo" O="$FRESH/O" HARNESS_PIN_DIR="$FRESH/home/harness" \
+  HARNESS_PIN_FILE="$FRESH/home/.harness-path" HARNESS_REPO="$FRESH/repo" \
+  bash "$FRESH/scripts/orchestrator-bringup.sh" check 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "check (cell): a fresh cell with NO harness pin is reported, not refused ('start' applies one)" \
+             || bad "check (cell): a fresh cell was refused — rc=$RC $OUT"
+case "$OUT" in
+  *"no harness pin recorded yet"*) ok "check (cell): says the pin is not recorded yet" ;;
+  *) bad "check (cell): does not name the missing pin — $OUT" ;;
+esac
+
+# Now a SECOND start for the same repo must be refused on the record's own evidence.
+OUT="$(env -i HOME="$K/home" XDG_STATE_HOME="$K/home/.local/state" \
+  PATH="$K/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$K/home" \
+  REPO="$K/repo" O="$K/O" HARNESS_PIN_DIR="$K/pin" HARNESS_PIN_FILE="$K/home/.harness-path" \
+  bash "$CELL_BRINGUP" start 2>&1)"; RC=$?
+# pid 4242 is not a real process here, so this case proves the STALE arm (reclaim), not the live one —
+# the live direction is §1. Assert the reclaim is reported and that it did not block.
+# pid 4242 is not a live process here, so this arm proves the STALE path: reclaimed, and SAID SO.
+# The live direction (refuse, naming the pid) is §1 and the $L case below.
+case "$OUT" in
+  *"reclaiming a STALE registry entry"*) ok "start (cell): a dead recorded pid is reclaimed, and the reclaim is reported" ;;
+  *) bad "start (cell): the stale record was not reported as reclaimed — rc=$RC $OUT" ;;
+esac
+[ "$RC" = 0 ] && ok "start (cell): rc=0 — a stale record does not block a start" \
+             || bad "start (cell): rc=$RC after reclaiming a stale record"
+
+# A real live controller recorded for this repo in ANOTHER state dir is the duplicate case, on the
+# cell platform too.
+L="$T/l"; mk_bin "$L/bin" cell; mk_clone "$L/repo" "daniel-ospina/agent-infra"; mkdir -p "$L/home"
+mkdir -p "$L/pin/aaaaaaaaaaaa/scripts/orchestrator-harness" "$L/O1" "$L/O2" "$L/sup"; mk_controller "$L/O1"
+printf '#!/bin/bash\n' > "$L/pin/aaaaaaaaaaaa/scripts/orchestrator-harness/orch-loop.sh"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$L/home/keys.env"
+L_PID="$(start_controller "$L/O1")"; sleep 0.4
+printf '%s\n' "$L/pin/aaaaaaaaaaaa/scripts/orchestrator-harness" > "$L/home/.harness-path"
+write_registry "$L/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$L/O1" "$L_PID" running
+mkdir -p "$L/scripts"; cp "$BRINGUP" "$L/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$L/scripts/lib"
+# L gets its OWN stub, logging to L's dir. Reusing K's made every assertion on L's log vacuous: the
+# path is baked in at heredoc expansion, so only K's file could ever appear.
+cat > "$L/scripts/cloud-cell-supervisor.sh" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$1" >> "$L/sup/called"
+case "\$1" in
+  apply) exit 0 ;;
+  start) exit 0 ;;
+  status) echo "controller: STOPPED" ;;
+  stop)   exit 0 ;;
+esac
+EOF
+chmod +x "$L/scripts/cloud-cell-supervisor.sh"; : > "$L/sup/called"
+OUT="$(env -i HOME="$L/home" XDG_STATE_HOME="$L/home/.local/state" \
+  PATH="$L/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$L/home" \
+  REPO="$L/repo" O="$L/O2" HARNESS_PIN_DIR="$L/pin" HARNESS_PIN_FILE="$L/home/.harness-path" \
+  bash "$L/scripts/orchestrator-bringup.sh" start 2>&1)"; RC=$?
+case "$OUT" in
+  *"ALREADY RUNNING"*"pid $L_PID"*) ok "start (cell): a second controller for the SAME repo in a different \$O is REFUSED, naming pid $L_PID" ;;
+  *) bad "start (cell) did not refuse a duplicate of the same repo in a different state dir — rc=$RC $OUT" ;;
+esac
+[ "$RC" = 1 ] && ok "start (cell): rc=1 on the duplicate refusal" || bad "start (cell): rc=$RC, want 1"
+# ⛔ ASSERT ON THE STUB'S OWN CALL LOG. The previous arm tested `[ ! -f "$L/sup/started" ]`, and the L
+# case reused the K stub whose `start` branch writes `$K/sup/started` (baked in at heredoc expansion),
+# so nothing in the suite could ever create `$L/sup/started`: the arm passed whether or not a
+# controller launched — an assertion that cannot fail, guarding the PR's headline claim (#1856 review).
+grep -qx start "$L/sup/called" 2>/dev/null \
+  && bad "start (cell): launched a controller despite the refusal" \
+  || ok "start (cell): NO second controller was launched (the supervisor was never asked to 'start')"
+
+
+# ── §8 the refusal paths: a verb that cannot answer must SAY so, and must not act ───────────────
+# Every arm here pins a defect found in review of #1856 where the shipped code was silent, miscounted
+# or acted on a reading it could not justify. They are separate from §1-§7 because each one is a
+# FALSE-PASS or FALSE-FAIL path rather than a feature: a wrong answer from these verbs is what makes
+# an operator kill the wrong controller.
+say_case "§8 refusal paths: unresolved identity, unknown verb, unprovable pid, and shared harness"
+N="$T/n"; mk_bin "$N/bin" cell; mk_clone "$N/repo" "daniel-ospina/agent-infra"; mkdir -p "$N/home" "$N/O" "$N/sup"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$N/home/keys.env"
+mkdir -p "$N/scripts"; cp "$BRINGUP" "$N/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$N/scripts/lib"
+cat > "$N/scripts/cloud-cell-supervisor.sh" <<EOF
+#!/bin/bash
+printf '%s\n' "\$1" >> "$N/sup/called"
+case "\$1" in
+  apply) exit 0 ;;
+  start) exit 0 ;;
+  status) echo "controller: STOPPED" ;;
+  stop)   exit 0 ;;
+esac
+EOF
+chmod +x "$N/scripts/cloud-cell-supervisor.sh"
+N_BRINGUP="$N/scripts/orchestrator-bringup.sh"
+nrun() {
+  OUT="$(env -i HOME="$N/home" XDG_STATE_HOME="$N/home/.local/state" \
+    PATH="$N/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$N/home" \
+    HARNESS_PIN_DIR="$N/home/harness" HARNESS_PIN_FILE="$N/home/.harness-path" \
+    "$@" bash "$N_BRINGUP" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?
+}
+
+# An unknown argument must REFUSE, and must not reach a verb. It used to `exit 0` after printing
+# usage — so a typo'd flag read as success and started nothing, which is indistinguishable from
+# "started and did fine" to any caller that checks the exit code.
+: > "$N/sup/called"
+BRINGUP_ARGS="start --force" nrun REPO="$N/repo" O="$N/O"
+[ "$RC" = 1 ] && ok "unknown argument: rc=1 (was 0 — a typo read as success)" \
+              || bad "unknown argument: rc=$RC, want 1"
+case "$OUT" in
+  *"unknown argument"*) ok "unknown argument: names the offending token on stderr" ;;
+  *) bad "unknown argument: does not name it — $OUT" ;;
+esac
+grep -qx start "$N/sup/called" 2>/dev/null \
+  && bad "unknown argument: a verb ran anyway" \
+  || ok "unknown argument: no verb ran (start was never reached)"
+
+# An `OR` that is a bare repo name is NOT a resolvable identity: it would mint a SECOND registry key
+# for a repo that already has one, and the duplicate guard would then fail OPEN.
+BRINGUP_ARGS=start nrun REPO="$N/repo" O="$N/O" OR=agent-infra
+[ "$RC" = 1 ] && ok "identity: a bare 'OR=agent-infra' (no owner) is REFUSED, not keyed as a second repo" \
+              || bad "identity: a bare repo name was accepted (a second key → the guard fails open) — rc=$RC $OUT"
+
+# …and `status`/`stop` must stay ANSWERABLE on the same broken pair instead of dying silently. The
+# old form called `exit 1` deep inside `resolve_repo_identity` with its message on a stderr nobody
+# read: `status` printed nothing at all (0 bytes on both streams, reproduced in review).
+BRINGUP_ARGS=status nrun REPO="$N/repo" O="$N/O" OR="someone/else"
+# ⛔ rc CHANGED DELIBERATELY (fleet-inventory, 2026-10-18), and the property this arm exists for is
+# unchanged: `status` must stay ANSWERABLE on a broken pair — it prints the header, names the
+# unresolved identity, and still answers the controller question. Its exit code is now the FLEET
+# TABLE's verdict (worst row), so on this fixture it is 1 for rows that are absent, not the old
+# hard-coded 0. Asserting 0 here would have forced the table's verdict to be suppressed on exactly
+# the misconfigured machine an operator runs `status` to understand. "Answerable" is asserted from
+# the OUTPUT; a `cannot determine` (2) is asserted to be reserved for an unreadable read (§9).
+[ "$RC" = 1 ] && ok "status: rc=1 on a MISMATCHED OR — the TABLE's verdict, and the verb stays answerable" \
+              || bad "status: rc=$RC on a mismatched OR (want 1 = a non-OK fleet row, never 2/silent) — $OUT"
+case "$OUT" in
+  *"identity:"*UNRESOLVED*) ok "status: NAMES the unresolved identity (and still prints the rest)" ;;
+  *) bad "status: the identity problem is invisible — $OUT" ;;
+esac
+case "$OUT" in
+  *"controller:"*) ok "status: still answers the question it was asked (controller state printed)" ;;
+  *) bad "status: died before the controller line — $OUT" ;;
+esac
+BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O" OR="someone/else"
+[ "$RC" = 0 ] && ok "stop: rc=0 on a mismatched OR, and says what it is leaving behind" \
+              || bad "stop: rc=$RC on a mismatched OR — $OUT"
+case "$OUT" in
+  *"left in place"*) ok "stop: says the registry record is left in place (no silent release)" ;;
+  *) bad "stop: released (or claimed to release) a record it could not identify — $OUT" ;;
+esac
+
+# An `origin` the derivation cannot READ is not an identity either. `repo_of_checkout` used to accept
+# any URL whose last path components looked right, so `file:///srv/x/agent-infra` derived
+# `srv/agent-infra` while `queue_repo_from_url` refused the same form — two surfaces, two answers.
+F="$T/f"; mk_bin "$F/bin" cell; mkdir -p "$F/repo" "$F/home" "$F/O"
+git init -q "$F/repo" && git -C "$F/repo" remote add origin "file:///srv/elsewhere/agent-infra"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$F/home/keys.env"
+OUT="$(env -i HOME="$F/home" XDG_STATE_HOME="$F/home/.local/state" \
+  PATH="$F/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$F/home" \
+  REPO="$F/repo" O="$F/O" OR="daniel-ospina/agent-infra" bash "$N_BRINGUP" start 2>&1)"; RC=$?
+[ "$RC" = 1 ] && ok "identity: a scheme URL with no host is REFUSED rather than derived from its path" \
+              || bad "identity: derived a repo from an unreadable origin — rc=$RC $OUT"
+
+# The claim must be EXCLUSIVE: two starts racing must not both win. `registry_claim` is the noclobber
+# create; the fixture proves the loser cannot overwrite the winner's record.
+(
+  . "$(lib_src)/orchestrator-registry.sh"
+  d="$T/claim"; mkdir -p "$d"
+  registry_claim "$d/r" "daniel-ospina/agent-infra" "$d/O" 1111 starting >/dev/null 2>&1 && echo WIN > "$d/first"
+  registry_claim "$d/r" "daniel-ospina/agent-infra" "$d/O" 2222 starting >/dev/null 2>&1 || echo LOSE > "$d/second"
+)
+[ -f "$T/claim/first" ] && ok "claim: the first start wins the record" || bad "claim: the first start did not create the record"
+[ -f "$T/claim/second" ] && ok "claim: the SECOND start is refused (exclusive create, not last-writer-wins)" \
+                         || bad "claim: a second start overwrote the first record — the claim is not exclusive"
+grep -qx 'pid=1111' "$T/claim/r" 2>/dev/null \
+  && ok "claim: the winner's pid survives the losing attempt byte for byte" \
+  || bad "claim: the loser rewrote the record — $(tr '\n' ' ' < "$T/claim/r" 2>/dev/null)"
+
+# ── §8b TWO repos on ONE harness path ──────────────────────────────────────────────────────────
+# The cell home is per-MACHINE, so `$CELL_HOME/harness` is shared by every repo on it. A read scoped
+# to that path returns repo A's controller to repo B; the code now separates OWNED (this state dir
+# may signal) from SEEN (a report, never a claim). Every earlier fixture gave each repo its own
+# harness dir, so the shared-path case was untested by construction (#1856 review).
+say_case "§8b two repos share one harness path: A's controller is never B's"
+S="$T/s"; mk_bin "$S/bin" cell; mk_clone "$S/repoA" "daniel-ospina/agent-infra"; mk_clone "$S/repoB" "premise-labs/tortoise"
+mkdir -p "$S/home/harness/aaaaaaaaaaaa" "$S/OA" "$S/OB" "$S/scripts"
+S_HARNESS="$S/home/harness/aaaaaaaaaaaa"   # the pin dir is per-machine, so BOTH repos exec THIS path
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$S/home/keys.env"
+printf '%s\n' "$S_HARNESS" > "$S/home/.harness-path"
+mk_controller "$S_HARNESS"
+cp "$BRINGUP" "$S/scripts/orchestrator-bringup.sh"; cp -r "$(lib_src)" "$S/scripts/lib"
+cp "$N/scripts/cloud-cell-supervisor.sh" "$S/scripts/cloud-cell-supervisor.sh"
+S_PID="$(start_controller "$S_HARNESS")"; sleep 0.4
+printf '%s\n' "$S_PID" > "$S/OA/.orch.lock"
+srun() { OUT="$(env -i HOME="$S/home" XDG_STATE_HOME="$S/home/.local/state" \
+    PATH="$S/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$S/home" \
+    HARNESS_PIN_DIR="$S/home/harness" HARNESS_PIN_FILE="$S/home/.harness-path" \
+    "$@" bash "$S/scripts/orchestrator-bringup.sh" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?; }
+BRINGUP_ARGS=status srun REPO="$S/repoA" O="$S/OA"
+case "$OUT" in
+  *"controller: RUNNING  pid $S_PID"*) ok "shared harness: repo A owns the controller it started and locked" ;;
+  *) bad "shared harness: A lost its own controller — $OUT" ;;
+esac
+BRINGUP_ARGS=status srun REPO="$S/repoB" O="$S/OB"
+case "$OUT" in
+  *"NOT this state dir's"*) ok "shared harness: repo B is TOLD the controller it can see is not its own" ;;
+  *"controller: RUNNING  pid $S_PID"*"lock: none"*) bad "shared harness: repo B claimed repo A's controller as its own" ;;
+  *) bad "shared harness: B's answer is neither a claim nor a disclaimer — $OUT" ;;
+esac
+# …AND WHEN B IS RUNNING ITS OWN CONTROLLER TOO, it must still REPORT A's. The `elif` published the
+# foreign population only when this state dir owned nothing, so on a two-repo machine B's `status` —
+# the screen an operator reads — never mentioned A although the read had it (#1856 review).
+mk_controller "$S/OB"
+S_PID_B="$(start_controller "$S/OB")"; sleep 0.4
+printf '%s\n' "$S_PID_B" > "$S/OB/.orch.lock"
+BRINGUP_ARGS=status srun REPO="$S/repoB" O="$S/OB"
+case "$OUT" in
+  *"controller: RUNNING  pid $S_PID_B"*) ok "shared harness: B names its OWN controller" ;;
+  *) bad "shared harness: B lost its own controller — $OUT" ;;
+esac
+case "$OUT" in
+  *"also seen:"*"pid $S_PID"*) ok "shared harness: B ALSO reports A's controller while owning one (the population it can see is published)" ;;
+  *) bad "shared harness: B's status hides the other repo's live controller — $OUT" ;;
+esac
+kill -9 "$S_PID_B" 2>/dev/null; wait "$S_PID_B" 2>/dev/null
+
+BRINGUP_ARGS=check srun REPO="$S/repoB" O="$S/OB"
+case "$OUT" in
+  *"also seen (NOT this state dir's): pid $S_PID"*) ok "shared harness: check REPORTS A's controller as foreign, not as B's" ;;
+  *"controller running for this state dir: pid $S_PID"*) bad "shared harness: check blessed repo A's controller as repo B's" ;;
+  *) bad "shared harness: check said nothing useful about the visible controller — $OUT" ;;
+esac
+kill -9 "$S_PID" 2>/dev/null
+
+# ── §8c 'stop' on a Mac: the read after, never the exit code ───────────────────────────────────
+say_case "§8c stop (mac): never a false PASS over a live agent, never a silent record erase"
+P="$T/p"; mk_bin "$P/bin" mac; mk_clone "$P/repo" "daniel-ospina/agent-infra"; mkdir -p "$P/home" "$P/O"
+mk_controller "$P/O"   # the loop runs from $O on a Mac (launchd's ProgramArguments point at it)
+mkdir -p "$P/home/Library/LaunchAgents" "$P/home/.local/state/orchestrator"
+prun() { OUT="$(env -i HOME="$P/home" XDG_STATE_HOME="$P/home/.local/state" \
+    PATH="$P/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$@" bash "$BRINGUP" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?; }
+# A live controller with NO launchd agent — a plist removed by hand, or a loop started outside launchd
+# (#1761's contradiction 2). Reporting "not running" here is the false STOPPED, and releasing the
+# record would then let a second controller start over the live one.
+P_PID="$(start_controller "$P/O")"; sleep 0.4
+write_registry "$P/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$P/O" "$P_PID" running
+BRINGUP_ARGS=stop prun REPO="$P/repo" O="$P/O"
+[ "$RC" = 1 ] && ok "stop (mac): REFUSES to report 'stopped' over a live controller with no agent" \
+              || bad "stop (mac): rc=$RC over a live controller — $OUT"
+[ -f "$(registry_dir "$P/home")/daniel-ospina~agent-infra" ] \
+  && ok "stop (mac): the record is NOT erased when the controller is still live" \
+  || bad "stop (mac): erased the record of a controller it did not stop"
+# …and when the agent file IS there, `launchctl unload` exits 0 while printing "Unload failed" and
+# leaving the process running (measured on macOS). The verdict must come from the read AFTER.
+cat > "$P/bin/launchctl" <<EOF
+#!/bin/bash
+# LIES on purpose: unload returns 0 and does nothing, exactly like macOS on a never-loaded plist.
+case "\$1" in
+  print) echo "	pid = $P_PID"; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$P/bin/launchctl"
+printf 'x\n' > "$P/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+BRINGUP_ARGS=stop prun REPO="$P/repo" O="$P/O"
+[ "$RC" = 1 ] && ok "stop (mac): a launchctl that exits 0 without stopping does NOT read as success" \
+              || bad "stop (mac): trusted 'launchctl unload' rc=0 over a still-running controller — $OUT"
+case "$OUT" in
+  *"STILL RUNNING"*) ok "stop (mac): says the agent is STILL RUNNING, naming the pid" ;;
+  *) bad "stop (mac): does not name the surviving controller — $OUT" ;;
+esac
+kill -9 "$P_PID" 2>/dev/null
+
+# ── §8d 'stop' on a cell releases ONLY the record it owns ─────────────────────────────────────
+say_case "§8d stop (cell): releases this state dir's record, and no other"
+BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O"
+[ "$RC" = 0 ] && ok "stop (cell): rc=0 when the supervisor stops cleanly" || bad "stop (cell): rc=$RC — $OUT"
+grep -qx stop "$N/sup/called" 2>/dev/null && ok "stop (cell): asked the supervisor to stop" \
+                                          || bad "stop (cell): 'stop' exists but never reached the supervisor"
+write_registry "$N/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$N/some-other-O" 9999 running
+BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O"
+[ -f "$(registry_dir "$N/home")/daniel-ospina~agent-infra" ] \
+  && ok "stop (cell): a record naming ANOTHER state dir is left alone" \
+  || bad "stop (cell): released a record that belongs to another state dir"
+write_registry "$N/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$N/O" 9999 running
+BRINGUP_ARGS=stop nrun REPO="$N/repo" O="$N/O"
+[ ! -f "$(registry_dir "$N/home")/daniel-ospina~agent-infra" ] \
+  && ok "stop (cell): this state dir's own record IS released" \
+  || bad "stop (cell): the record for \$O survived its own stop"
+
+
+say_case "§10 two branches no fixture could reach: an empty-host origin, and an unparseable record"
+U="$T/u"; mk_bin "$U/bin" cell; mkdir -p "$U/home" "$U/O" "$U/repo"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$U/home/keys.env"
+urrun() { OUT="$(env -i HOME="$U/home" XDG_STATE_HOME="$U/home/.local/state" \
+    PATH="$U/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$U/home" \
+    REPO="$U/repo" O="$U/O" "$@" bash "$BRINGUP" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?; }
+# (a) `https:///srv/elsewhere/agent-infra` HAS a scheme and a path but NO host, so it reaches the host
+# check rather than the unknown-scheme branch. Deriving `srv/elsewhere` from it here while the
+# supervisor's queue parser refuses the same URL is the two-authorities fail-open (#1745 shape).
+git init -q "$U/repo" && git -C "$U/repo" remote add origin "https:///onyx/tortoise"
+BRINGUP_ARGS=check urrun OR="daniel-ospina/agent-infra"
+[ "$RC" -ne 0 ] && ok "identity: a scheme URL with an EMPTY HOST is refused, not derived from its path" \
+                || bad "identity: derived a repo from https:///onyx/tortoise — the empty-host refusal is not reached"
+case "$OUT" in
+  *onyx/tortoise*) bad "identity: the refusal still prints a derived 'onyx/tortoise' repo — $OUT" ;;
+  *) ok "identity: no repo is invented from the hostless URL" ;;
+esac
+# …and the plain `file://` form (no scheme this machine can read) is refused by its own branch.
+git -C "$U/repo" remote set-url origin "file:///onyx/tortoise"
+BRINGUP_ARGS=check urrun OR="daniel-ospina/agent-infra"
+[ "$RC" -ne 0 ] && ok "identity: an unreadable scheme (file://) is refused too" \
+                || bad "identity: accepted file:// as an origin — $OUT"
+# (b) a record whose pid cannot be parsed. `unreadable` must reach the callers' refusal (unknown, rc=2)
+# — reading it as `absent` would launch a second controller for a repo that may be running.
+git -C "$U/repo" remote set-url origin "https://github.com/daniel-ospina/agent-infra.git"
+mkdir -p "$(registry_dir "$U/home")"
+printf 'repo=daniel-ospina/agent-infra\nO=%s\npid=notanumber\nstarted=1\nstate=running\n' "$U/O" \
+  > "$(registry_dir "$U/home")/daniel-ospina~agent-infra"
+for verb in check start; do
+  BRINGUP_ARGS="$verb" urrun OR="daniel-ospina/agent-infra"
+  [ "$RC" = 2 ] && ok "$verb: an UNPARSEABLE record is rc=2 (cannot judge), never 'absent'" \
+                || bad "$verb: rc=$RC on a record whose pid cannot be parsed — a record that cannot be read must not read as 'no owner' — $OUT"
+done
+: > "$(registry_dir "$U/home")/daniel-ospina~agent-infra"
+BRINGUP_ARGS=check urrun OR="daniel-ospina/agent-infra"
+[ "$RC" = 0 ] && ok "check: an EMPTY record is reported as a reclaimable stale entry (not a refusal)" \
+              || bad "check: rc=$RC on an empty record — $OUT"
+case "$OUT" in
+  *"stale"*) ok "check: says the empty record is stale ('start' reclaims it)" ;;
+  *) bad "check: does not classify the empty record — $OUT" ;;
+esac
+
+# ── §9 an UNREADABLE read is cannot-determine — on every verb, for BOTH failure shapes ──────────
+# Two distinct shapes, and the second is the one that hides: `ps` failing outright (an empty table)
+# and `ps` answering the TABLE while failing the AGE of one pid (a PS_BIN shim, a ps without
+# `-o etime`). The second made `pid_began_after`'s "cannot tell" indistinguishable from "began
+# before" — i.e. an undatable pid became the STRONGEST claim of ownership, and `stop` signalled
+# whatever a stale lock named. Both shapes must end in rc=2 and act on nothing (#1856 review).
+say_case "§9 an unreadable process read never becomes a verdict: stop keeps the record, check refuses to answer"
+R="$T/r"; mk_bin "$R/bin" mac; mk_clone "$R/repo" "daniel-ospina/agent-infra"; mkdir -p "$R/home" "$R/O" "$R/home/.local/state/orchestrator"
+mk_controller "$R/O"
+rrun() { # <bin-dir> [VAR=value …]
+  local d="$1"; shift
+  OUT="$(env -i HOME="$R/home" XDG_STATE_HOME="$R/home/.local/state" \
+    PATH="$d:$R/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    ${PS_BIN:+PS_BIN="$PS_BIN"} "$@" bash "$BRINGUP" ${BRINGUP_ARGS:-} 2>&1)"; RC=$?; }
+R_PID="$(start_controller "$R/O")"; sleep 0.4
+write_registry "$R/home" "daniel-ospina~agent-infra" "daniel-ospina/agent-infra" "$R/O" "$R_PID" running
+REC="$(registry_dir "$R/home")/daniel-ospina~agent-infra"
+# (a) the table itself cannot be read
+mkdir -p "$R/no-ps"; printf '#!/bin/sh\nexit 1\n' > "$R/no-ps/ps"; chmod +x "$R/no-ps/ps"
+for verb in status check stop; do
+  BRINGUP_ARGS="$verb" rrun "$R/no-ps" REPO="$R/repo" O="$R/O"
+  [ "$RC" = 2 ] && ok "$verb: rc=2 when the process table cannot be read (never a verdict)" \
+                || bad "$verb: rc=$RC on an unreadable process table — $OUT"
+done
+[ -f "$REC" ] && ok "stop: the registry record SURVIVES an unreadable read (no release without proof)" \
+              || bad "stop: released the record of a controller it could not see — the next start is unguarded"
+kill -0 "$R_PID" 2>/dev/null && ok "stop: the live controller was NOT signalled on an unreadable read" \
+                              || bad "stop: signalled a controller from an unreadable read"
+# (b) the table answers; the AGE of the lock's pid does not
+mkdir -p "$R/etime-bin"
+cat > "$R/etime-bin/ps" <<'EOS'
+#!/bin/bash
+# Answers the table, refuses the age — the shape of a ps without -o etime, or a PS_BIN shim.
+case "$*" in *etime*) exit 1 ;; esac
+exec /bin/ps "$@"
+EOS
+chmod +x "$R/etime-bin/ps"
+printf '%s\n' "$R_PID" > "$R/O/.orch.lock"
+PS_BIN="$R/etime-bin/ps" BRINGUP_ARGS=status rrun "$R/etime-bin" REPO="$R/repo" O="$R/O"
+[ "$RC" = 2 ] && ok "status: rc=2 when the lock's pid cannot be DATED (the lock's owner is not asserted)" \
+              || bad "status: rc=$RC with an undatable lock owner — $OUT"
+PS_BIN="$R/etime-bin/ps" BRINGUP_ARGS=stop rrun "$R/etime-bin" REPO="$R/repo" O="$R/O"
+[ "$RC" = 2 ] && ok "stop: rc=2 when the lock's pid cannot be dated — it does not claim the pid" \
+              || bad "stop: rc=$RC with an undatable lock owner (it may have claimed the pid) — $OUT"
+kill -0 "$R_PID" 2>/dev/null && ok "stop: the undatable owner was NOT signalled" \
+                              || bad "stop: signalled an undatable pid"
+# (c) the registry key refuses anything that is not exactly <owner>/<repo> — `a/b/c` and `a//b`
+#     would create a DIRECTORY where another repo's record file belongs
+(
+  . "$(lib_src)/orchestrator-registry.sh"
+  bad_slugs=""
+  for r in a/b/c a//b agent-infra - a/b/ /a.b; do
+    registry_slug "$r" >/dev/null 2>&1 || bad_slugs="$bad_slugs $r"
+  done
+  printf '%s\n' "$bad_slugs" > "$T/bad-slugs"
+)
+[ "$(cat "$T/bad-slugs")" = " a/b/c a//b agent-infra - a/b/ /a.b" ] \
+  && ok "registry_slug: refuses every form that is not exactly <owner>/<repo> (a/b/c, a//b, bare, '-')" \
+  || bad "registry_slug accepted a non-owner/repo form — refused only:$(cat "$T/bad-slugs")"
+(
+  . "$(lib_src)/orchestrator-registry.sh"
+  export XDG_STATE_HOME="$T/xdg"
+  registry_slug "Daniel-Ospina/Agent-Infra" > "$T/slug1"; registry_slug "daniel-ospina/agent-infra" > "$T/slug2"
+  # The KEY is what the guard compares, but the FILE is what it reads: assert the path too, so a
+  # regression that folds only the printed slug reddens here (#1856 review).
+  registry_file "Daniel-Ospina/Agent-Infra" > "$T/file1"; registry_file "daniel-ospina/agent-infra" > "$T/file2"
+  # BOTH parts may contain `-`, so the separator must not be one: these two must stay TWO records.
+  registry_file "premise-labs/agent-infra" > "$T/file3"; registry_file "premise/labs-agent-infra" > "$T/file4"
+)
+[ "$(cat "$T/slug1")" = "$(cat "$T/slug2")" ] && [ "$(cat "$T/slug1")" = "daniel-ospina~agent-infra" ] \
+  && ok "registry_slug: one key for one repo regardless of case, joined with '~'" \
+  || bad "registry_slug: case-fold/separator wrong ($(cat "$T/slug1") vs $(cat "$T/slug2"))"
+[ "$(cat "$T/file1")" = "$(cat "$T/file2")" ] \
+  && ok "registry_file: one casing of one repo addresses ONE record (a second casing cannot read 'absent')" \
+  || bad "registry_file: the two casings address different records ($(cat "$T/file1") vs $(cat "$T/file2")) — the duplicate guard fails open"
+[ "$(cat "$T/file3")" != "$(cat "$T/file4")" ] \
+  && ok "registry_file: 'premise-labs/agent-infra' and 'premise/labs-agent-infra' are TWO records (the '-' collision)" \
+  || bad "registry_file: two distinct repos share one record — a '-' separator would do exactly this"
+kill -9 "$R_PID" 2>/dev/null; wait "$R_PID" 2>/dev/null
+# A harness fixture that lets a mac `start` COMPLETE: mk_harness's hooks, plus an installer that
+# renders the job the real one renders (so `start` has a plist to load) and a shipped worker file.
+# mk_harness's own install stub only marks its call — enough for `check`, not enough for `start`.
+mk_render_harness() { # <dir>
+  mk_harness "$1" 0
+  rm -f "$1/install.sh"
+  cat > "$1/install.sh" <<EOF
+#!/bin/bash
+: > "$1/install-called"
+mkdir -p "\$HOME/Library/LaunchAgents"
+P="\$HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+{
+  echo '<?xml version="1.0"?>'
+  echo '<plist version="1.0"><dict>'
+  echo '  <key>Label</key><string>com.eldato.orchestrator-loop</string>'
+  echo '  <key>ProgramArguments</key><array><string>/bin/bash</string>'
+  echo "  <string>\$O/orch-loop.sh</string></array>"
+  echo '</dict></plist>'
+} > "\$P"
+echo "Installed com.eldato.orchestrator-loop"
+EOF
+  chmod +x "$1/install.sh"
+  printf '#!/bin/bash\n# the shipped worker (harness copy)\n' > "$1/worker.sh"
+  # The controller the harness SHIPS. Without it a fixture's `$O/orch-loop.sh` reads as "unshipped"
+  # and a `--prune` arm would delete the running controller's own script for the wrong reason — the
+  # fixture has to ship the same surface the real harness does (content identical to mk_controller's,
+  # so a deploy over a running controller reports no spurious overwrite).
+  printf "#!/bin/bash\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n" > "$1/orch-loop.sh"
+}
+
+# A launchctl stub that answers `print` with a pid and logs every call.
+mk_launchctl_pid() { # <bin-dir> <pid>
+  cat > "$1/launchctl" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$1/lc-called"
+case "\${1:-}" in
+  print) printf '\\tpid = %s\\n' "$2" ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$1/launchctl"
+}
+
+# A launchctl stub with NOTHING loaded: the service-level "no such service" answer, which is the only
+# read that proves ABSENT (a domain-level rejection is `unknown`, and §12d asserts that distinction).
+mk_launchctl_absent() { # <bin-dir>
+  cat > "$1/launchctl" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$1/lc-called"
+case "\${1:-}" in
+  print) echo 'Bad request.' >&2; echo "Could not find service \${3:-?} in domain for user gui: 501" >&2; exit 113 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$1/launchctl"
+}
+
+# ── §11 a deploy is NOT a mirror unless asked, and never over the resolver set (#2059) ──────────
+# MEASURED 2026-10-18: `deploy` removed every `$O/*.sh` the checkout does not ship, and deleted all six
+# live disk reapers — they ship from `scripts/`, one directory over — breaking the armed hourly pass.
+# On THIS box the same loop's first victim is `supervisor.sh`, which ships from nowhere and IS the
+# ProgramArguments of the loaded job: `start` deleted its own entrypoint between `unload` and `load`.
+# These arms pin both halves. Without them a future editor can restore the `rm -f` and every other arm
+# stays green — no fixture ever carried a live-only file.
+say_case "§11 a deploy deletes NOTHING unless --prune, and NEVER a file the box resolves BY PATH"
+DL="$T/dl"; mk_bin "$DL/bin" mac
+mk_clone "$DL/repo" "daniel-ospina/agent-infra"; mkdir -p "$DL/home" "$DL/O" "$DL/harness"
+mk_render_harness "$DL/harness"
+mk_controller "$DL/O"
+DL_PID="$(start_controller "$DL/O")"; sleep 0.4; printf '%s\n' "$DL_PID" > "$DL/O/.orch.lock"
+mk_launchctl_pid "$DL/bin" "$DL_PID"
+# The box's live state: the resolver set, one unshipped file nothing resolves, and a SHIPPED worker
+# whose bytes differ (so the plan has an overwrite to report).
+RESOLVER_FILES="supervisor.sh orchestrator-heartbeat.sh disk-reaper.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh"
+for f in $RESOLVER_FILES autopilot.sh; do printf '#!/bin/bash\n# live %s\n' "$f" > "$DL/O/$f"; done
+printf '#!/bin/bash\n# a hand edit in $O\n' > "$DL/O/worker.sh"
+BRINGUP_ARGS=start bringup "$DL/home" "$DL/bin" "$DL/harness" REPO="$DL/repo" O="$DL/O" ENV_FILE="$DL/home/keys.env"
+[ "$RC" = 0 ] && ok "deploy: a plain start still completes (rc=0) with live-only files in \$O" \
+             || bad "deploy: rc=$RC on a box carrying live-only files — $OUT"
+for f in $RESOLVER_FILES; do
+  [ -f "$DL/O/$f" ] && ok "deploy: KEPT $f (something resolves it by path) — the #2059 incident, reversed" \
+                    || bad "deploy: DELETED $f — a file the box resolves by path, and nothing ships a replacement"
+done
+[ -f "$DL/O/autopilot.sh" ] && ok "deploy: an unshipped file nothing resolves is LEFT IN PLACE without --prune" \
+                           || bad "deploy: removed an unshipped file without --prune — a deploy still deletes from the live tree"
+case "$OUT" in
+  *"LEFT IN PLACE"*autopilot.sh*) ok "deploy: the plan names the file it would have removed, and the flag that removes it" ;;
+  *) bad "deploy: no plan printed for an unshipped file — nobody reads an rm inside a loop — $OUT" ;;
+esac
+case "$OUT" in
+  *"replacing 1 file(s)"*worker.sh*) ok "deploy: the plan names the file it is about to OVERWRITE" ;;
+  *) bad "deploy: an overwrite was not announced before it happened — $OUT" ;;
+esac
+cmp -s "$DL/O/worker.sh" "$DL/harness/worker.sh" \
+  && ok "deploy: the shipped worker's bytes were installed (a real deploy still deploys)" \
+  || bad "deploy: the shipped worker was not updated"
+# …and the flag that DOES remove is explicit, non-zero, and still refuses the resolver set.
+DL2="$T/dl2"; mkdir -p "$DL2/home"
+BRINGUP_ARGS="start --prune" bringup "$DL2/home" "$DL/bin" "$DL/harness" REPO="$DL/repo" O="$DL/O" ENV_FILE="$DL2/home/keys.env"
+[ "$RC" = 1 ] && ok "--prune: rc=1 — the mirror could not be honoured, and the exit code says so" \
+              || bad "--prune: rc=$RC, want 1 (a conflict is not a clean mirror) — $OUT"
+case "$OUT" in
+  *CONFLICT*supervisor.sh*|*supervisor.sh*CONFLICT*) ok "--prune: the CONFLICT names the resolver-set file it refused to delete" ;;
+  *CONFLICT*) ok "--prune: the conflict is reported (the per-file detail is above it)" ;;
+  *) bad "--prune: removed resolver-set files and said nothing — $OUT" ;;
+esac
+[ -f "$DL/O/autopilot.sh" ] && bad "--prune: did NOT remove the unshipped non-resolver file it was asked for" \
+                             || ok "--prune: removed the unshipped non-resolver file it was asked for"
+for f in $RESOLVER_FILES; do
+  [ -f "$DL/O/$f" ] || bad "--prune: deleted $f — resolver-set files are NEVER removed, even on request"
+done
+ok "--prune: every resolver-set file survived an explicit mirror request"
+kill -9 "$DL_PID" 2>/dev/null
+
+# ── §12 `start` operates the launchd job that is RUNNING, never a second one ────────────────────
+# MEASURED 2026-10-21 in a scratch \$O: `start` rendered `com.eldato.orchestrator-loop` → orch-loop.sh
+# and `launchctl load -w`'d it beside the box's real job, `com.eldato.orchestrator-stack` →
+# supervisor.sh. Two plists, two jobs, one state dir: the duplicate-controller class (#1761) reached by
+# running the canonical entry point. These arms pin the safe direction — operate what is here — and the
+# ambiguity refusal, because picking one of two jobs is how a second controller gets started.
+say_case "§12 start ADOPTS the job that owns \$O: no second plist, no second controller"
+JA="$T/ja"; mk_bin "$JA/bin" mac; mk_clone "$JA/repo" "daniel-ospina/agent-infra"
+mkdir -p "$JA/home/Library/LaunchAgents" "$JA/O" "$JA/harness"; mk_render_harness "$JA/harness"
+printf '#!/bin/bash\n# supervisor\n' > "$JA/O/supervisor.sh"
+mk_controller "$JA/O"
+JA_PID="$(start_controller "$JA/O")"; sleep 0.4; printf '%s\n' "$JA_PID" > "$JA/O/.orch.lock"
+mk_launchctl_pid "$JA/bin" "$JA_PID"
+# An auxiliary job that merely LIVES in $O — the shape this box really has (heartbeat, nightwatch and
+# pr-doctor all run programs under it). If the ownership predicate counted these, `start` would refuse
+# for ambiguity on the one box it has to work on, so this fixture is part of the arm's subject.
+cat > "$JA/home/Library/LaunchAgents/com.eldato.harness-heartbeat.plist" <<PLIST2
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.harness-heartbeat</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JA/O/orchestrator-heartbeat.sh</string></array>
+</dict></plist>
+PLIST2
+printf '#!/bin/bash\n# heartbeat\n' > "$JA/O/orchestrator-heartbeat.sh"
+cat > "$JA/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JA/O/supervisor.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JA/O</string></dict>
+</dict></plist>
+PLIST
+JAARGS="REPO=$JA/repo O=$JA/O ENV_FILE=$JA/home/keys.env"
+BRINGUP_ARGS=start bringup "$JA/home" "$JA/bin" "$JA/harness" $JAARGS
+[ "$RC" = 0 ] && ok "start (adopt): rc=0 with a job that already owns \$O" \
+              || bad "start (adopt): rc=$RC — $OUT"
+[ ! -f "$JA/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] \
+  && ok "start (adopt): rendered NO com.eldato.orchestrator-loop plist (a second job for one state dir)" \
+  || bad "start (adopt): rendered a SECOND launchd job beside the one that owns \$O"
+case "$OUT" in
+  *"already owns"*"NOT rendering com.eldato.orchestrator-loop"*) ok "start (adopt): says which job owns \$O and that it is not rendering another" ;;
+  *) bad "start (adopt): does not name the adopted job — $OUT" ;;
+esac
+[ ! -f "$JA/harness/install-called" ] \
+  && ok "start (adopt): did NOT invoke install.sh — the renderer is what writes the second job" \
+  || bad "start (adopt): invoked install.sh anyway (it renders \$LABEL regardless of what is running)"
+grep -q 'load -w.*com.eldato.orchestrator-loop' "$JA/bin/lc-called" 2>/dev/null \
+  && bad "start (adopt): loaded the loop label beside the running job" \
+  || ok "start (adopt): never loaded a second label"
+JA_REC="$(registry_dir "$JA/home")/daniel-ospina~agent-infra"
+[ "$(sed -n 's/^pid=//p' "$JA_REC" 2>/dev/null)" = "$JA_PID" ] \
+  && ok "start (adopt): recorded the CONTROLLER pid ($JA_PID), not the job's — the job's pid is the supervisor" \
+  || bad "start (adopt): recorded '$(sed -n 's/^pid=//p' "$JA_REC" 2>/dev/null)' as the controller, want $JA_PID"
+kill -9 "$JA_PID" 2>/dev/null
+
+say_case "§12b two jobs name one \$O → REFUSED (only a human can say which is stale)"
+JB="$T/jb"; mk_bin "$JB/bin" mac; mk_clone "$JB/repo" "daniel-ospina/agent-infra"
+mkdir -p "$JB/home/Library/LaunchAgents" "$JB/O" "$JB/harness"; mk_render_harness "$JB/harness"
+printf '#!/bin/bash\n# supervisor\n' > "$JB/O/supervisor.sh"
+for lbl in com.eldato.orchestrator-stack com.eldato.orchestrator-old; do
+  cat > "$JB/home/Library/LaunchAgents/$lbl.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>$lbl</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JB/O/supervisor.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JB/O</string></dict>
+</dict></plist>
+PLIST
+done
+BRINGUP_ARGS=start bringup "$JB/home" "$JB/bin" "$JB/harness" REPO="$JB/repo" O="$JB/O" ENV_FILE="$JB/home/keys.env"
+[ "$RC" = 1 ] && ok "start (ambiguous): rc=1 — a refusal, not a guess" || bad "start (ambiguous): rc=$RC, want 1 — $OUT"
+case "$OUT" in
+  *"TWO launchd jobs"*) ok "start (ambiguous): refuses, naming the conflict rather than picking a job" ;;
+  *) bad "start (ambiguous): does not say that two jobs own \$O — $OUT" ;;
+esac
+OK_OLD=0; OK_NEW=0
+case "$OUT" in *com.eldato.orchestrator-stack*) OK_NEW=1 ;; esac
+case "$OUT" in *com.eldato.orchestrator-old*) OK_OLD=1 ;; esac
+[ "$OK_OLD$OK_NEW" = 11 ] && ok "start (ambiguous): names BOTH labels, so the operator can pick the stale one" \
+                          || bad "start (ambiguous): does not name both labels (old=$OK_OLD stack=$OK_NEW) — $OUT"
+[ ! -f "$JB/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] \
+  && ok "start (ambiguous): rendered nothing while refusing" \
+  || bad "start (ambiguous): rendered a third job while refusing"
+
+say_case "§12b2 a job whose PROGRAM is the PINNED tree still OWNS \$O (agent-infra#2231)"
+# ⛔ THE PROGRAM MOVED OUT OF $O, SO THE OWNERSHIP SCAN MUST NOT KEY ON "$O"/* ANY MORE. With the pin
+# program, the scan's `case "$prog" in "$O"/*)` skipped the installer's own job, so on this box's measured
+# two-job shape only ONE row survived — and the ambiguity refusal below (the #1761 duplicate-controller
+# protection) never fired, letting `start` adopt the stack job and leave a SECOND controller loaded.
+JC2="$T/jc2"; mk_bin "$JC2/bin" mac; mk_clone "$JC2/repo" "daniel-ospina/agent-infra"
+mkdir -p "$JC2/home/Library/LaunchAgents" "$JC2/O" "$JC2/harness"; mk_render_harness "$JC2/harness"
+# job 1: the CONTROLLER, whose program is the PINNED tree (not under $O), declaring O.
+cat > "$JC2/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC2/harness/orch-loop.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC2/O</string></dict>
+</dict></plist>
+PLIST
+# job 2: the stack supervisor under $O, also declaring this state dir.
+printf '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$JC2/O/supervisor.sh"
+chmod +x "$JC2/O/supervisor.sh"
+cat > "$JC2/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC2/O/supervisor.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC2/O</string></dict>
+</dict></plist>
+PLIST
+BRINGUP_ARGS=start bringup "$JC2/home" "$JC2/bin" "$JC2/harness" REPO="$JC2/repo" O="$JC2/O" ENV_FILE="$JC2/home/keys.env"
+[ "$RC" = 1 ] && ok "start: TWO jobs naming one \$O are still REFUSED when one program is the pin (rc=1)" \
+              || bad "start: rc=$RC — the pin-programmed job was invisible to the ownership scan"
+case "$OUT" in
+  *"TWO launchd jobs"*) ok "…the refusal names the conflict (the duplicate-controller protection still fires)" ;;
+  *) bad "start: no ambiguity refusal — $OUT" ;;
+esac
+OK_LOOP=0; OK_STACK=0
+case "$OUT" in *com.eldato.orchestrator-loop*) OK_LOOP=1 ;; esac
+case "$OUT" in *com.eldato.orchestrator-stack*) OK_STACK=1 ;; esac
+[ "$OK_LOOP$OK_STACK" = 11 ] && ok "…and names BOTH jobs, so the operator can pick the stale one" \
+                            || bad "start: does not name both jobs (loop=$OK_LOOP stack=$OK_STACK) — $OUT"
+
+say_case "§12b3 the WATCHDOG declaring \$O is NOT a controller: pin loop + watchdog ADOPTS (#2231 review)"
+# ⛔ THE REAL SHIPPED WATCHDOG, RENDERED FROM THE TRACKED TEMPLATE — not a hand-written lookalike,
+# which is how the gap survived the first review. `templates/launchd/com.eldato.controller-watchdog.plist`
+# declares `O` = `{{HOME}}/orchestrator` — which IS the Mac's `$O` — while its program is
+# `{{AGENT_INFRA_PATH}}/scripts/orchestrator-harness/watchdog-loop.sh`, OUTSIDE `$O`. So this
+# fixture's `$O` IS `{{HOME}}/orchestrator`: with any other $O the rendered job would declare a
+# DIFFERENT state dir, the bug would not reproduce, and the arm would pass for the wrong reason.
+# The failure it prevents is a FALSE BLOCK on the one box the pin work exists for: before the fix the
+# scan counted the watchdog as a co-owner, so `start` — hence `harness-up up` — refused with
+# "TWO launchd jobs" on every box where `install-launchd.sh` (ACTIVATION-MATRIX row 8) had installed
+# the documented watchdog.
+JC3="$T/jc3"; mk_bin "$JC3/bin" mac; mk_clone "$JC3/repo" "daniel-ospina/agent-infra"
+JC3O="$JC3/home/orchestrator"
+mkdir -p "$JC3/home/Library/LaunchAgents" "$JC3O" "$JC3/harness"; mk_render_harness "$JC3/harness"
+# job 1: the CONTROLLER — its program is the PINNED tree (outside $O), declaring O.
+cat > "$JC3/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC3/harness/orch-loop.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC3O</string></dict>
+</dict></plist>
+PLIST
+# job 2: the REAL shipped watchdog, rendered from the template that ships — only the three tokens it
+# declares are substituted — so its program lives under AGENT_INFRA_PATH, never under $O.
+sed -e "s|{{HOME}}|$JC3/home|g" -e "s|{{AGENT_INFRA_PATH}}|$HERE/..|g" -e "s|{{PATH}}|/usr/bin:/bin|g" \
+    "$HERE/../templates/launchd/com.eldato.controller-watchdog.plist" \
+    > "$JC3/home/Library/LaunchAgents/com.eldato.controller-watchdog.plist"
+# The fixture only reproduces the bug if the rendered job really does declare THIS $O.
+grep -q "<key>O</key>" "$JC3/home/Library/LaunchAgents/com.eldato.controller-watchdog.plist" \
+  && grep -q "<string>$JC3O</string>" "$JC3/home/Library/LaunchAgents/com.eldato.controller-watchdog.plist" \
+  && ok "watchdog fixture: the rendered job DECLARES this \$O and its program is outside it (the bug's shape)" \
+  || bad "watchdog fixture does not declare $JC3O — the arm could not reproduce the bug it exists for"
+mk_controller "$JC3O"
+JC3_PID="$(start_controller "$JC3O")"; sleep 0.4; printf '%s\n' "$JC3_PID" > "$JC3O/.orch.lock"
+# A launchctl stub that answers BOTH jobs — `list` is what the fleet inventory reads, and an empty
+# answer there is UNREADABLE (not "absent"), which would fail this arm for a reason that has nothing
+# to do with ownership. `print` supplies the pid the adopt path records.
+cat > "$JC3/bin/launchctl" <<LAUNCHCTL
+#!/bin/bash
+printf '%s\n' "\$*" >> "$JC3/bin/lc-called"
+case "\${1:-}" in
+  list) printf '%s\t-\tcom.eldato.orchestrator-loop\n%s\t-\tcom.eldato.controller-watchdog\n' "$JC3_PID" "$JC3_PID" ;;
+  print) printf '\tpid = %s\n' "$JC3_PID" ;;
+  *) exit 0 ;;
+esac
+LAUNCHCTL
+chmod +x "$JC3/bin/launchctl"
+BRINGUP_ARGS=start bringup "$JC3/home" "$JC3/bin" "$JC3/harness" REPO="$JC3/repo" O="$JC3O" ENV_FILE="$JC3/home/keys.env"
+[ "$RC" = 0 ] && ok "start: pin-programmed loop + the WATCHDOG is ONE controller — adopted (rc=0)" \
+              || bad "start: rc=$RC — the watchdog declaring \$O was counted as a second controller (false block) — $OUT"
+case "$OUT" in
+  *"TWO launchd jobs"*) bad "start: refused with TWO launchd jobs — a watchdog is not a second controller — $OUT" ;;
+  *) ok "…and did not claim two jobs own \$O" ;;
+esac
+kill -9 "$JC3_PID" 2>/dev/null
+
+say_case "§12c adopt an INSTALLED-but-not-loaded job: load ITS plist, never \$LABEL"
+JC="$T/jc"; mk_bin "$JC/bin" mac; mk_launchctl_absent "$JC/bin"; mk_clone "$JC/repo" "daniel-ospina/agent-infra"
+mkdir -p "$JC/home/Library/LaunchAgents" "$JC/O" "$JC/harness"; mk_render_harness "$JC/harness"
+printf '#!/bin/bash\n# supervisor\n' > "$JC/O/supervisor.sh"
+mk_controller "$JC/O"
+JC_PID="$(start_controller "$JC/O")"; sleep 0.4; printf '%s\n' "$JC_PID" > "$JC/O/.orch.lock"
+cat > "$JC/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC/O/supervisor.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC/O</string></dict>
+</dict></plist>
+PLIST
+BRINGUP_ARGS=start bringup "$JC/home" "$JC/bin" "$JC/harness" REPO="$JC/repo" O="$JC/O" ENV_FILE="$JC/home/keys.env"
+[ "$RC" = 0 ] && ok "start (adopt, not loaded): rc=0 — it loaded the job that owns \$O" \
+              || bad "start (adopt, not loaded): rc=$RC — $OUT"
+grep -q "load -w $JC/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" "$JC/bin/lc-called" 2>/dev/null \
+  && ok "start (adopt, not loaded): loaded the STACK plist (the job that owns \$O)" \
+  || bad "start (adopt, not loaded): did not load the stack plist — $(cat "$JC/bin/lc-called" 2>/dev/null)"
+grep -q 'com.eldato.orchestrator-loop' "$JC/bin/lc-called" 2>/dev/null \
+  && bad "start (adopt, not loaded): touched the loop label as well" \
+  || ok "start (adopt, not loaded): never mentioned the loop label"
+kill -9 "$JC_PID" 2>/dev/null
+
+say_case "§12d the adopted job's program is MISSING from \$O → cannot determine, and nothing is loaded"
+JD="$T/jd"; mk_bin "$JD/bin" mac; mk_launchctl_pid "$JD/bin" 4242
+mk_clone "$JD/repo" "daniel-ospina/agent-infra"; mkdir -p "$JD/home/Library/LaunchAgents" "$JD/O" "$JD/harness"
+mk_render_harness "$JD/harness"
+cat > "$JD/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JD/O/ghost.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JD/O</string></dict>
+</dict></plist>
+PLIST
+BRINGUP_ARGS=start bringup "$JD/home" "$JD/bin" "$JD/harness" REPO="$JD/repo" O="$JD/O" ENV_FILE="$JD/home/keys.env"
+[ "$RC" = 2 ] && ok "start (adopt, missing program): rc=2 — cannot determine, never a launch over a missing program" \
+              || bad "start (adopt, missing program): rc=$RC — $OUT"
+case "$OUT" in
+  *ghost.sh*) ok "start (adopt, missing program): names the file the job would exec" ;;
+  *) bad "start (adopt, missing program): does not name the missing program — $OUT" ;;
+esac
+grep -q 'load -w' "$JD/bin/lc-called" 2>/dev/null \
+  && bad "start (adopt, missing program): loaded a job whose program does not exist" \
+  || ok "start (adopt, missing program): loaded nothing"
+
+say_case "§12e a box whose controller job IS \$LABEL: the renderer still runs (identify ≠ stop rendering)"
+JE="$T/je"; mk_bin "$JE/bin" mac
+mk_clone "$JE/repo" "daniel-ospina/agent-infra"; mkdir -p "$JE/home/Library/LaunchAgents" "$JE/O" "$JE/harness"
+mk_render_harness "$JE/harness"; mk_controller "$JE/O"
+JE_PID="$(start_controller "$JE/O")"; sleep 0.4; printf '%s\n' "$JE_PID" > "$JE/O/.orch.lock"
+mk_launchctl_pid "$JE/bin" "$JE_PID"
+# The job the shipped template renders, plus an auxiliary installed under the same \$O.
+cat > "$JE/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JE/O/orch-loop.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JE/O</string></dict>
+</dict></plist>
+PLIST
+cat > "$JE/home/Library/LaunchAgents/com.eldato.pr-doctor.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.pr-doctor</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>$JE/O/pr-doctor.py</string></array>
+</dict></plist>
+PLIST
+BRINGUP_ARGS=start bringup "$JE/home" "$JE/bin" "$JE/harness" REPO="$JE/repo" O="$JE/O" ENV_FILE="$JE/home/keys.env"
+[ "$RC" = 0 ] && ok "start (loop-job box): rc=0 — one controller job plus an auxiliary is not ambiguity" \
+              || bad "start (loop-job box): rc=$RC — $OUT"
+[ -f "$JE/harness/install-called" ] \
+  && ok "start (loop-job box): install.sh STILL renders (limits/PATH/env updates are not frozen by adoption)" \
+  || bad "start (loop-job box): skipped the renderer on a box whose job it renders — loop boxes would freeze"
+grep -q 'load -w' "$JE/bin/lc-called" 2>/dev/null \
+  && ok "start (loop-job box): loaded the job" || bad "start (loop-job box): never loaded anything"
+kill -9 "$JE_PID" 2>/dev/null
+
+# ── §13 a box that was NEVER stamped: the repair is not a refusal ──────────────────────────────
+# MEASURED on this box 2026-10-21: \$O carried no .agent-infra-stamp.json, so `start` exited 2 at
+# `check` and never reached its own deploy — the only documented repair was a bare `install.sh` run,
+# which is exactly what renders the second launchd job §12 exists to stop. ABSENT (never stamped) and
+# UNREADABLE (a record nobody can parse) are different facts: only the second is unrepairable here.
+say_case "§13 an ABSENT provenance record is the state start repairs; an UNREADABLE one is still rc=2"
+SA="$T/sa"; mk_bin "$SA/bin" mac; mk_launchctl_pid "$SA/bin" 4242
+mk_clone "$SA/repo" "daniel-ospina/agent-infra"; mkdir -p "$SA/home" "$SA/O" "$SA/harness"
+mk_render_harness "$SA/harness"
+# The real checker returns 2 for BOTH shapes (no record · unparseable record) — the ONE difference
+# the bringup may act on is whether a record FILE exists — so the stub returns 2 unconditionally.
+cat > "$SA/harness/check-deployed-drift.sh" <<'STUB'
+#!/bin/bash
+echo "UNKNOWN: no usable harness record at $O/.agent-infra-stamp.json"; exit 2
+STUB
+chmod +x "$SA/harness/check-deployed-drift.sh"
+BRINGUP_ARGS=check bringup "$SA/home" "$SA/bin" "$SA/harness" REPO="$SA/repo" O="$SA/O" ENV_FILE="$SA/home/keys.env"
+[ "$RC" = 0 ] && ok "check: an UNSTAMPED \$O is reported, not refused (start is the deploy that stamps it)" \
+              || bad "check: rc=$RC on a box that was never stamped — the repair is unreachable — $OUT"
+case "$OUT" in
+  *"carries NO identity record"*) ok "check: says the record is ABSENT, and that start is the repair" ;;
+  *) bad "check: does not report the absent identity record — $OUT" ;;
+esac
+# A record that EXISTS and cannot be parsed is a different answer: rc=2, still.
+printf '{ not json' > "$SA/O/.agent-infra-stamp.json"
+BRINGUP_ARGS=check bringup "$SA/home" "$SA/bin" "$SA/harness" REPO="$SA/repo" O="$SA/O" ENV_FILE="$SA/home/keys.env"
+[ "$RC" = 2 ] && ok "check: an UNREADABLE stamp is still rc=2 — cannot-verify is never a pass" \
+              || bad "check: rc=$RC over a stamp nobody can parse, want 2 — $OUT"
+
+
+# ── §14 the drift report's COUNT must count every drift, labelled included ──────────────────────
+# ⛔ The checker labels each finding with the QUESTION it failed (`DRIFT(identity|record|checkout):`) and
+# leaves the record/surface remainders bare (`DRIFT:`). The bringup's warning counted with `^DRIFT:`,
+# which matched only the bare shape — so on the box this verb exists for (the deployed copy DIFFERS,
+# the labelled case) it printed `0 finding(s)` beside a drift report it had just received. This arm
+# grades the count against the producer's real vocabulary: 3 lines in, 3 findings reported.
+say_case "§14 the drift warning counts LABELLED findings too — a count that contradicts its own report is a lie"
+DD="$T/dd"; mk_bin "$DD/bin" mac; mk_harness "$DD/harness" 1; mk_clone "$DD/repo" "daniel-ospina/agent-infra"
+mkdir -p "$DD/home"
+BRINGUP_ARGS=check bringup "$DD/home" "$DD/bin" "$DD/harness" REPO="$DD/repo" O="$DD/O" ENV_FILE="$DD/home/keys.env"
+[ "$RC" = 0 ] && ok "§14 check: drift is REPORTED, not refused (start is the verb that redeploys \$O)" \
+              || bad "§14 check: rc=$RC over a drifted \$O, want 0 — drift must not block the repair — $OUT"
+case "$OUT" in
+  *"3 finding(s)"*) ok "§14 the warning counts all 3 DRIFT lines — the two labelled ones included" ;;
+  *"finding(s)"*)   bad "§14 the warning MISCOUNTS the drift report (want 3) — $OUT" ;;
+  *)                bad "§14 the warning reported no finding count at all — $OUT" ;;
+esac
+# The behavioural arm above needs the fixture; this one is the SOURCE-level guard that survives a
+# fixture regression. Reverting the pattern to `^DRIFT:` reddens it on any checkout, which is the arm
+# a future lane editing the warning needs: the count is a reader of the checker's vocabulary, so it may
+# not hard-code one shape of it.
+if grep -q "grep -c '\^DRIFT:'" "$BRINGUP"; then
+  bad "§14 the finding count is anchored on '^DRIFT:' — it cannot match DRIFT(<question>): lines"
+else
+  ok "§14 the finding count does not anchor on the colon (it matches the labelled shape too)"
+fi
+
+
+# ── §15 the deploy REFUSES to overwrite an uncommitted edit in $O — and RECORDS what it wrote ────
+# ⛔ MEASURED 2026-10-28: a hand-applied fix to `$O/merge-one.sh` was reverted TWICE by redeploys. The
+# two deploy paths learned to refuse (exit 78) and to record `$O/.harness-provenance`; `start` — the Mac
+# verb operators actually run — is a THIRD writer of `$O/*.sh` and kept copying over the patch after a
+# warning. A refusal present in two of three writers is a gate with a door beside it, and a box written
+# by the ungated one carried bytes no record described. Both halves are pinned here, in order: the
+# record (so an edit is even distinguishable), the refusal, and the deliberate override.
+say_case "§15 a deploy REFUSES to overwrite an uncommitted edit in \$O, and RECORDS what it wrote"
+GS="$T/gs"; mk_bin "$GS/bin" mac; mk_clone "$GS/repo" "daniel-ospina/agent-infra"
+mkdir -p "$GS/home/Library/LaunchAgents" "$GS/O" "$GS/harness"; mk_render_harness "$GS/harness"
+# The source ships the real checker/writer, so the arm grades the shipped instrument, not a stub.
+cp "$HERE/orchestrator-harness/harness-provenance.sh" "$GS/harness/"
+printf '#!/bin/bash\necho SHIPPED-A\n' > "$GS/harness/worker-a.sh"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GS/home/keys.env"
+mk_controller "$GS/O"
+GS_PID="$(start_controller "$GS/O")"; sleep 0.4; printf '%s\n' "$GS_PID" > "$GS/O/.orch.lock"
+mk_launchctl_pid "$GS/bin" "$GS_PID"
+GS_SHIPPED="$(ls "$GS/harness"/*.sh | wc -l | tr -d ' ')"
+BRINGUP_ARGS=start bringup "$GS/home" "$GS/bin" "$GS/harness" REPO="$GS/repo" O="$GS/O" ENV_FILE="$GS/home/keys.env"
+# ⛔ NOT `[ $RC = 0 ]`. `start` ends with the FLEET table, which on a host whose components cannot be
+# read returns 2 for reasons that have nothing to do with this deploy (the same pre-existing arm colour
+# as `deploy:`/`start (adopt)` above). What this arm is about is that the deploy RAN and was not
+# refused, and that is asserted directly: the deploy line, the record, and the manifest.
+[ "$RC" != 1 ] && grep -q 'deployed [0-9]* harness script' <<<"$OUT" \
+  && ok "§15 start (mac): a clean deploy RUNS and is not refused" \
+  || bad "§15 start (mac): the clean deploy did not run / was refused — rc=$RC $OUT"
+[ -f "$GS/O/.harness-provenance" ] \
+  && ok "§15 the deploy RECORDED \$O's provenance (the box is attributable, not inferred)" \
+  || bad "§15 the deploy wrote NO .harness-provenance — the next deploy is blind again, which is the incident"
+if [ -f "$GS/O/.harness-provenance" ]; then
+  grep -q "^files=$GS_SHIPPED\$" "$GS/O/.harness-provenance" \
+    && ok "§15 the record's files= count matches the $GS_SHIPPED file(s) the source shipped" \
+    || bad "§15 the record does not describe what was shipped — $(grep '^files=' "$GS/O/.harness-provenance" 2>/dev/null)"
+  grep -q " worker-a.sh\$" "$GS/O/.harness-provenance" \
+    && ok "§15 the record carries a sha256 for the shipped worker" \
+    || bad "§15 the record has no manifest line for worker-a.sh"
+fi
+# THE INCIDENT: a hand patch to a file the deploy ships.
+printf '#!/bin/bash\necho HAND-PATCHED\n' > "$GS/O/worker-a.sh"
+G2="$T/gs2"; mkdir -p "$G2/home" "$G2/home/Library/LaunchAgents"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$G2/home/keys.env"
+BRINGUP_ARGS=start bringup "$G2/home" "$GS/bin" "$GS/harness" REPO="$GS/repo" O="$GS/O" ENV_FILE="$G2/home/keys.env"
+[ "$RC" = 1 ] && ok "§15 start: an uncommitted edit in \$O is a REFUSAL (rc=1), not a warning" \
+              || bad "§15 start: rc=$RC over a hand-patched \$O, want 1 — the patch is not protected — $OUT"
+case "$OUT" in
+  # ⛔ BOTH HALVES, because either alone is satisfiable without a refusal: the deploy's own plan line
+  # also names the file, and the `refuse` line is generic by contract. The DIAGNOSIS is the pair.
+  *"UNCOMMITTED-EDIT"*worker-a.sh*) case "$OUT" in
+      *"REFUSED"*) ok "§15 the refusal NAMES the file it would have overwritten, and refuses" ;;
+      *) bad "§15 the edit was diagnosed but nothing refused it — $OUT" ;;
+    esac ;;
+  *) bad "§15 the refusal named no file — an operator cannot act on that — $OUT" ;;
+esac
+grep -q 'HAND-PATCHED' "$GS/O/worker-a.sh" \
+  && ok "§15 the patched bytes are STILL THERE (a refusal copies nothing)" \
+  || bad "§15 the patch was OVERWRITTEN anyway — this is the 2026-10-28 incident, reproduced"
+# …and the override is opt-in BY NAME, on the command line.
+G3="$T/gs3"; mkdir -p "$G3/home" "$G3/home/Library/LaunchAgents"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$G3/home/keys.env"
+BRINGUP_ARGS="start --accept-discard" bringup "$G3/home" "$GS/bin" "$GS/harness" REPO="$GS/repo" O="$GS/O" ENV_FILE="$G3/home/keys.env"
+[ "$RC" != 1 ] && ok "§15 start --accept-discard: proceeds — the refusal is never the last word" \
+  || bad "§15 start --accept-discard: STILL refused (rc=1) after a deliberate override — $OUT"
+case "$OUT" in
+  *"--accept-discard"*) ok "§15 the override is announced, so the discard is never silent" ;;
+  *) bad "§15 the override discarded an edit and said nothing — $OUT" ;;
+esac
+grep -q 'SHIPPED-A' "$GS/O/worker-a.sh" && ! grep -q 'HAND-PATCHED' "$GS/O/worker-a.sh" \
+  && ok "§15 --accept-discard did deploy the shipped bytes (the flag means discard, not abort)" \
+  || bad "§15 --accept-discard left the patch in place — the flag is a no-op"
+kill -9 "$GS_PID" 2>/dev/null
+
+
+# ── §15b the record describes the WRITE SET, on a source that also ships non-.sh files ────────────
+# ⛔ MEASURED 2026-10-30 (review of PR #3053), reproduced with the shipped tool before the fix: `write`
+# inventories `--src` RECURSIVELY and calls a source file missing from `$O` a FAILED deploy, while `start`
+# copies only depth-1 `*.sh`. A real harness directory also ships `README.md`, `ARCHITECTURE.md`, `*.py`,
+# `retired/`, `gh-rest/gh` — so on every real box `write` refused ("the source ships README.md but `$O`
+# has no such file"), NO record was written by the verb operators actually run, and §15's own refusal
+# then sat on `drc=2` CANNOT-TELL forever: a gate with no witness, on the population it was added for.
+# Every fixture was `.sh`-only, which is exactly why §15 was green. This arm gives the source the shape
+# the real harness has, and pins BOTH halves: the record is written (files= counts what was written), and
+# an edit to a file this deploy does NOT write neither refuses the run nor enters the manifest.
+say_case "§15b the record covers what the deploy WROTE, on a source that also ships non-.sh files"
+GW="$T/gw"; mk_bin "$GW/bin" mac; mk_clone "$GW/repo" "daniel-ospina/agent-infra"
+mkdir -p "$GW/home/Library/LaunchAgents" "$GW/O" "$GW/harness"; mk_render_harness "$GW/harness"
+cp "$HERE/orchestrator-harness/harness-provenance.sh" "$GW/harness/"
+printf '# the docs a real harness ships beside its scripts\n' > "$GW/harness/README.md"
+mkdir -p "$GW/harness/retired"; printf '#!/bin/bash\ntrue\n' > "$GW/harness/retired/old.sh"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GW/home/keys.env"
+mk_controller "$GW/O"
+GW_PID="$(start_controller "$GW/O")"; sleep 0.4; printf '%s\n' "$GW_PID" > "$GW/O/.orch.lock"
+mk_launchctl_pid "$GW/bin" "$GW_PID"
+# The box already carries a `README.md` whose bytes no deploy wrote — `install.sh` seeds the whole tree, so
+# this is the ordinary state of a real Mac, not a contrived one. `start` does not write it, so it must not
+# refuse over it (and must not then claim it in the manifest).
+printf 'locally edited docs — not a file start writes\n' > "$GW/O/README.md"
+GW_SHIPPED="$(ls "$GW/harness"/*.sh | wc -l | tr -d ' ')"
+BRINGUP_ARGS=start bringup "$GW/home" "$GW/bin" "$GW/harness" REPO="$GW/repo" O="$GW/O" ENV_FILE="$GW/home/keys.env"
+[ "$RC" != 1 ] && ok "§15b an edit to a file this deploy does NOT write is not a refusal" \
+  || bad "§15b a non-.sh edit in \$O refused the run — the check is told the source tree, not the write set — rc=$RC $OUT"
+[ -f "$GW/O/.harness-provenance" ] \
+  && ok "§15b a source that ships non-.sh files still RECORDS the box" \
+  || bad "§15b NO record over a source that ships README.md — every real harness box stays unrecorded, and the §15 refusal is inert there — $OUT"
+if [ -f "$GW/O/.harness-provenance" ]; then
+  grep -q "^files=$GW_SHIPPED\$" "$GW/O/.harness-provenance" \
+    && ok "§15b the record's files= counts the $GW_SHIPPED file(s) this run WROTE" \
+    || bad "§15b the record's files= is not the write set — $(grep '^files=' "$GW/O/.harness-provenance" 2>/dev/null) (want $GW_SHIPPED)"
+  grep -q '  README.md$' "$GW/O/.harness-provenance" \
+    && bad "§15b the record claims a file this deploy never wrote — a manifest of the SOURCE TREE is not a record of the run" \
+    || ok "§15b the record does not claim the non-.sh file it never wrote"
+  grep -q 'retired/old.sh$' "$GW/O/.harness-provenance" \
+    && bad "§15b the record claims a NESTED file this deploy never wrote" \
+    || ok "§15b the record does not claim the nested file it never wrote"
+fi
+# …and the half that must still bite: an edit to a file it DOES write is still a refusal, with the record
+# present (so this arm cannot pass by the record being absent — the state that made §15 blind).
+printf '#!/bin/bash\necho HAND-PATCHED\n' > "$GW/O/worker.sh"
+BRINGUP_ARGS=start bringup "$GW/home" "$GW/bin" "$GW/harness" REPO="$GW/repo" O="$GW/O" ENV_FILE="$GW/home/keys.env"
+[ "$RC" = 1 ] && ok "§15b an edit to a file it DOES write is STILL a refusal" \
+  || bad "§15b rc=$RC over a hand-patched \$O/worker.sh with a record present, want 1 — the gate is blind — $OUT"
+grep -q 'HAND-PATCHED' "$GW/O/worker.sh" \
+  && ok "§15b …and the refusal preserved the patch" \
+  || bad "§15b the patch was overwritten — the 2026-10-28 incident, reproduced through the .sh path"
+kill -9 "$GW_PID" 2>/dev/null
+
+
+# ── §15c the CANNOT-VERIFY arm prints the CHECKER's verdict, and claims no cause ──────────────────
+# ⛔ THE THIRD DEPLOY PATH'S CANNOT-VERIFY ARM WAS GRADED BY NOTHING (review of #3090).
+# `deploy-harness.sh` and `deploy-mac-orchestrator.sh` each got a mutation-proven arm in that PR; this
+# one — the arm `start`, the verb operators actually run, reaches — was reached by no assertion, so
+# reverting it to the old sentence reddened nothing. The old sentence was "(no readable provenance
+# record there)", and it was FALSE on most of the branch: `*)` takes every code that is neither 0 nor 1,
+# and the state measured here (a record that EXISTS and is perfectly readable, with `files=0`) is one of
+# them. The checker printed "EMPTY manifest"; the arm discarded it and substituted a guess, handing the
+# operator the remedy for an ABSENT record when what they had was a CORRUPT one — on the path that
+# overwrites `$O`. Both halves are pinned: the checker's line is printed, and no cause is asserted.
+say_case "§15c an unreadable-but-present record names the CHECKER's verdict, not a fabricated cause"
+GU="$T/gu"; mk_bin "$GU/bin" mac; mk_clone "$GU/repo" "daniel-ospina/agent-infra"
+mkdir -p "$GU/home/Library/LaunchAgents" "$GU/O" "$GU/harness"; mk_render_harness "$GU/harness"
+cp "$HERE/orchestrator-harness/harness-provenance.sh" "$GU/harness/"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GU/home/keys.env"
+mk_controller "$GU/O"
+GU_PID="$(start_controller "$GU/O")"; sleep 0.4; printf '%s\n' "$GU_PID" > "$GU/O/.orch.lock"
+mk_launchctl_pid "$GU/bin" "$GU_PID"
+# ⛔ THE FIXTURE MUST EARN THE STATE BY DEPLOYING FIRST. Hand-writing a `files=0` record would test the
+# arm over a file no deploy ever wrote, and the arm's own message says "this run records the box" — the
+# measured state is a record a real run WROTE, whose count was later damaged (`files=` no longer matching
+# the manifest). Only then is "present and readable, but cannot describe any bytes" the real situation.
+BRINGUP_ARGS=start bringup "$GU/home" "$GU/bin" "$GU/harness" REPO="$GU/repo" O="$GU/O" ENV_FILE="$GU/home/keys.env"
+[ -f "$GU/O/.harness-provenance" ] \
+  && ok "§15c fixture: the first start RECORDED the box (the state under test is a record that exists)" \
+  || bad "§15c fixture: no record was written, so the arm would pass for the wrong reason — $OUT"
+grep -q '^files=[1-9]' "$GU/O/.harness-provenance" 2>/dev/null \
+  && ok "§15c fixture: the record's files= is a real count before it is damaged" \
+  || bad "§15c fixture: the record already had files=0 — the arm would not be reached by a damaged record"
+# Damage the count, leaving the manifest entries in place: present, readable, unable to describe bytes.
+sed 's/^files=.*/files=0/' "$GU/O/.harness-provenance" > "$T/gu-rec" && mv "$T/gu-rec" "$GU/O/.harness-provenance"
+# ⛔ A SECOND HOME, for the reason §15 uses `$G2`/`$G3`: the controller registry is keyed on $HOME, so a
+# second `start` from the SAME home is refused as "already running" before the deploy is reached at all,
+# and the arm would be graded by a refusal that has nothing to do with it (measured: 3 spurious reds).
+GU2="$T/gu2"; mkdir -p "$GU2/home/Library/LaunchAgents"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GU2/home/keys.env"
+BRINGUP_ARGS=start bringup "$GU2/home" "$GU/bin" "$GU/harness" REPO="$GU/repo" O="$GU/O" ENV_FILE="$GU2/home/keys.env"
+# The refusal cannot fire over an unanswerable record, and must not start firing here: the arm is about
+# what the operator is TOLD, not about turning a warning into a gate.
+[ "$RC" != 1 ] && ok "§15c an unanswerable record is a WARNING, not a refusal (the entry points are unchanged)" \
+  || bad "§15c the cannot-verify arm now refuses the run (rc=1) — this PR changes a message, not a gate — $OUT"
+case "$OUT" in
+  *"EMPTY manifest"*) ok "§15c the CHECKER'S verdict is printed, not discarded (“EMPTY manifest”)" ;;
+  *) bad "§15c the checker's own reason never reaches the operator — the arm guessed instead — $OUT" ;;
+esac
+case "$OUT" in
+  *"no readable provenance record"*) bad "§15c the arm still claims the record is UNREADABLE — it is present and readable, so that is a fabricated cause — $OUT" ;;
+  *) ok "§15c the arm does NOT claim the record is unreadable" ;;
+esac
+case "$OUT" in
+  *"could not be USED"*) ok "§15c it claims only what is known: the record could not be USED" ;;
+  *) bad "§15c the arm does not state the one fact every code in that branch shares — $OUT" ;;
+esac
+kill -9 "$GU_PID" 2>/dev/null
+
+
+echo
+echo "── Summary ───────────────────────────────────────────────────────"
+echo "  PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
+echo "  ✅ all checks passed"
+exit 0
