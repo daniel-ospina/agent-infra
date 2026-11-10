@@ -1067,6 +1067,75 @@ def test_T_box_exec_refuses_a_shell_string_and_a_non_allowlisted_argv(tmp_path, 
     assert is_err and payload["refused"] == "read-only"
 
 
+def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc(
+        tmp_path, monkeypatch):
+    """agent-infra#2345 — the peer never ran the command, so its rc is not the command's verdict.
+
+    MEASURED 2026-11-08 from `pi-cell-5`: `cmux vm ls --json` printed `"reachable":true` for all four
+    peers while `cmux vm exec <peer> -- hostname` failed against all four. Before this arm the payload
+    said `outcome: NONZERO, rc: 3` — indistinguishable from "the peer ran it and it failed", which
+    sends the operator to the command, or to the peer's state, when neither is what refused.
+    The three causes have three DIFFERENT remedies, so each is named. Every arm below FAILS on the
+    pre-fix code (which returned NONZERO/RAN and carried no `refused` key at all).
+    """
+    mod = server_mod(monkeypatch)
+
+    def refusal_stub(name, body, code):
+        return stub(tmp_path, name, body, code=code)
+
+    # (1) the common case: the client refuses the route before the peer is asked anything
+    monkeypatch.setenv("ORCH_MCP_CMUX", refusal_stub(
+        "cmux_link3.py",
+        "import sys\n"
+        "if 'exec' in sys.argv[1:]:\n"
+        "    sys.stderr.write(\"cmux: link to 'pi-cell-4' exited; see "
+        "/home/cmux/.cmux/peer-links/pi-cell-4.log\\n\")\n"
+        "    sys.exit(3)\n"
+        "print('pi-cell-4  vm-ce2c  running  reachable  linked')\n", 0))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-4", "argv": ["uname", "-s"]})
+    assert is_err is True, payload
+    assert payload["outcome"] == "CHANNEL-REFUSED", payload
+    assert payload["refused"] == "link-refused", payload
+    assert payload["peer"] == "pi-cell-4", payload
+    assert payload["peer_log"].endswith("peer-links/pi-cell-4.log"), payload
+    assert "never the command's verdict" in payload["channel_only"], payload
+    assert "carrier" in payload["refusal_detail"], payload
+    assert "fail_open" not in payload, "a non-zero rc is not the fail-open form"
+
+    # (2) THE FAIL-OPEN FORM: measured on `pi-cell-3` (2026-10-23 issue comment) — the transport
+    #     refuses the link AND exits 0, so a caller keying on `rc` alone reads a dead link as success.
+    monkeypatch.setenv("ORCH_MCP_CMUX", refusal_stub(
+        "cmux_link0.py",
+        "import sys\n"
+        "sys.stderr.write(\"cmux: link to 'pi-cell-3' exited; see /tmp/cell-home/.cmux/peer-links/"
+        "pi-cell-3.log\\n\")\n", 0))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-3", "argv": ["uname"]})
+    assert is_err is True, payload           # rc=0 must NOT read as RAN
+    assert payload["outcome"] == "CHANNEL-REFUSED", payload
+    assert payload["rc"] == 0 and "fail_open" in payload, payload
+    assert "only `rc` reads this as success" in payload["fail_open"], payload
+
+    # (3) the OTHER root: this CALLING box has no `cmux-tui` (#3195), so every peer refuses at once.
+    #     Its remedy is here, not on the peer — so it must not be reported as a peer-pairing problem.
+    monkeypatch.setenv("ORCH_MCP_CMUX", refusal_stub(
+        "cmux_nobin.py",
+        "import sys\n"
+        "sys.stderr.write('cmux: cmux-tui daemon binary not found at "
+        "/root/.cmux/bin/cmux-tui\\n')\n", 1))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname"]})
+    assert is_err is True and payload["refused"] == "daemon-binary-absent", payload
+    assert "calling box" in payload["refusal_detail"], payload
+    assert "peer" not in payload, "no peer refused — this box has no client"
+
+    # (4) AND A REAL RUN IS NOT CLASSIFIED. The classifier matches the TRANSPORT's refusal, so a peer
+    #     that answers must still be `RAN` with no `refused` key — otherwise the fix hides real output.
+    monkeypatch.setenv("ORCH_MCP_CMUX", stub(tmp_path, "cmux_ok.py", "print('Linux')", code=0))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname", "-s"]})
+    assert is_err is False, payload
+    assert payload["outcome"] == "RAN" and payload["stdout"].strip() == "Linux", payload
+    assert "refused" not in payload, payload
+
+
 def test_T_run_is_bounded_in_MEMORY_and_TIME_not_just_in_what_it_returns(monkeypatch):
     """⛔ `cap` USED TO BOUND THE RETURN VALUE AND NOT THE BUFFERED STREAM.
 

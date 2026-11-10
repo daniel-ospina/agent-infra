@@ -2243,6 +2243,81 @@ def _harden_argv(argv: List[str]) -> List[str]:
     out = head + [verb] + rest[1:]
     return out
 
+
+# ⛔ A LINK REFUSAL IS A CHANNEL FACT, NOT THE COMMAND'S OWN rc (agent-infra#2345).
+# MEASURED 2026-11-08 from `pi-cell-5`: `cmux vm ls --json` printed `"reachable":true` for all four
+# peers while `cmux vm exec <peer> -- hostname` failed against all four (`rc=3`, stderr
+# `cmux: link to '<peer>' exited; see ~/.cmux/peer-links/<peer>.log`). This surface then reported
+# `outcome: NONZERO, rc: 3`, which reads as "the peer RAN the command and it failed" and sends the
+# operator to the command — or to the peer's state — when the peer never ran anything at all.
+# The three causes have three DIFFERENT remedies, and each is visible in the stderr line this surface
+# already holds, so the class is named HERE instead of making every caller re-parse prose or open a log
+# behind a path:
+#   link-refused          the client's route/identity for the peer was refused. Measured 2026-11-03 (on
+#                         the issue): the vendor's `vm exec` link path never spends the `--carrier`
+#                         mode that DOES connect, so a perfectly healthy peer refuses too.
+#   no-known-daemon       the same refusal in the client's own words — what `~/.cmux/peer-links/
+#                         <peer>.log` holds, i.e. the line a caller is told to go read.
+#   daemon-binary-absent  THIS CALLING box has no usable `cmux-tui` (#3195), so EVERY peer fails at
+#                         once and the remedy is on this box — not on the peer, and not in the command.
+# ⛔ rc=0 IS STILL A REFUSAL. A refusal reported with exit status 0 was measured on `pi-cell-3`
+# (2026-10-23, on the issue): a caller that checks only `rc` read a dead link as success. The class is
+# reported whatever the rc, so the fail-open form cannot pass as a run here either.
+LINK_REFUSAL_CLASSES = (
+    ("daemon-binary-absent", re.compile(r"cmux-tui daemon binary not found at (?P<path>\S+)")),
+    ("link-refused", re.compile(r"^cmux: link to ['\"](?P<peer>[^'\"]+)['\"] exited", re.M)),
+    ("no-known-daemon", re.compile(r"no known daemon matches this route")),
+)
+LINK_REFUSAL_DETAIL = {
+    "link-refused":
+        "the client's route/identity for this peer was refused before the peer ran anything — the "
+        "peer's health is NOT what this line measured (agent-infra#2345: `vm exec` does not spend the "
+        "`--carrier` mode that does connect)",
+    "no-known-daemon":
+        "the client holds no daemon for this route: no pairing. Routing is what failed, not the peer "
+        "and not the command (agent-infra#2345)",
+    "daemon-binary-absent":
+        "THIS box has no usable cmux-tui, so every peer refuses — the remedy is on the calling box, "
+        "not on the peer (agent-infra#3195)",
+}
+PEER_LOG_RE = re.compile(r"(?P<path>(?:~|/)[^\s]*peer-links/[^\s]+)")
+
+
+def _link_refusal(ran: "Ran") -> Optional[Dict[str, Any]]:
+    """Classify a `cmux vm exec` LINK REFUSAL, or None when the transport ran something.
+
+    Consumes only what the transport itself answered (`stderr`/`stdout`) — never a re-probe and never
+    the peer's daemon state, neither of which this surface can measure (skill §3: `timed_out` and a
+    refusal are CHANNEL facts, never a box verdict).
+    """
+    text = "\n".join(part for part in (ran.stderr or "", ran.stdout or "") if part)
+    if not text:
+        return None
+    for klass, rx in LINK_REFUSAL_CLASSES:
+        match = rx.search(text)
+        if not match:
+            continue
+        out: Dict[str, Any] = {
+            "refused": klass,
+            "outcome": "CHANNEL-REFUSED",
+            "refusal": text.strip().splitlines()[0][:300],
+            "refusal_detail": LINK_REFUSAL_DETAIL[klass],
+            "channel_only": "a link refusal is a CHANNEL fact — the peer never ran the command, so "
+                            "this rc is the TRANSPORT's, never the command's verdict",
+        }
+        peer = match.groupdict().get("peer")
+        if peer:
+            out["peer"] = peer
+        log = PEER_LOG_RE.search(text)
+        if log:
+            out["peer_log"] = log.group("path")
+        if ran.rc == 0:
+            out["fail_open"] = ("the transport exited 0 while refusing the link — a caller that checks "
+                                "only `rc` reads this as success (agent-infra#2345)")
+        return out
+    return None
+
+
 def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[bool, Dict[str, Any]]:
     if read_only:
         return True, {"refused": "read-only",
@@ -2334,6 +2409,12 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
     })
     if ran.error:
         payload["unmeasured"] = ran.unmeasured()
+        return True, payload
+    refusal = _link_refusal(ran)
+    if refusal:
+        # ⛔ BEFORE `timed_out` ON PURPOSE: a refusal is an ANSWER the transport gave, not a slow
+        # channel, and reporting it as the command's own non-zero rc is what #2345 costs.
+        payload.update(refusal)
         return True, payload
     if ran.timed_out:
         payload["outcome"] = "CHANNEL-TIMEOUT"
