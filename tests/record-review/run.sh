@@ -2424,8 +2424,8 @@ if [ -d "$DELTA_REPO" ]; then
   # feature silently INERT — while this suite stayed green: (33a)/(33a2) never look at
   # `carry_arm`, and (33f2) only proves the reader agrees about a record nothing should produce.
   # It is the PAIR that is asserted, not the word: `--check-carry` requires `carry_arm` AND
-  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:4635-4644, the
-  # `case "${CC_MINT:-}" in` arm) BEFORE it head-binds at :4670, so a delta record missing
+  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:6075-6084, the
+  # `case "${CC_MINT:-}" in` arm) BEFORE it head-binds at :6110, so a delta record missing
   # either is a no-record for the gate. Each citation also carries its own ANCHOR string:
   # these numbers move whenever record-review.sh moves, and a re-derivation that was not
   # re-checked at the head has already landed here wrong twice. The anchor is what stays
@@ -2631,7 +2631,7 @@ INNERPY
   # at all), so deleting `|| [ "$DELTA" -eq 1 ]` from the one-verb guard — or dropping the
   # `[ "$DELTA" -eq 1 ] && [ "${#POSITIONAL[@]}" -gt 2 ]` arity guard, or the delta arm of the
   # `--evidence/--force-stale/--expect-head` refusal — reddened NOTHING while restoring exactly
-  # the false PASS the guard comment at `:2784-2788` (`--delta IS A MINTING VERB TOO` —
+  # the false PASS the guard comment at `:4540-4544` (`--delta IS A MINTING VERB TOO` —
   # `grep -n 'IS A MINTING VERB TOO' scripts/record-review.sh` re-derives it)
   # says was MEASURED (`--delta
   # --print-diff-hash` exited 0 with the record untouched; `--delta --check-carry` answered
