@@ -4154,6 +4154,19 @@ classify_one() {
             # are untouched. It only NAMES the class and the reason it cannot move.
             if [ "$REAP_WT_WIP" != 1 ] && is_lane_branch "$branch" \
                     && [ "$(commits_survive "$sha" "$branch")" = "merged" ]; then
+                # ⛔ AN UNREADABLE REGISTRY IS NEVER STALLED RESIDUE — NOT IN THIS ARM EITHER
+                # (review round 6, PR #3881). This was the ONE lane-residue arm that never consulted
+                # `claim`: on a pass whose registry probe failed (`CLAIMS_STATE=unavailable`, logged
+                # as `CLAIMS abstain this pass` by the run loop) `claim_verdict` answers `unknown` for
+                # every issue, so the `claim=live` early return above cannot fire and EVERY dirty
+                # 0-ahead lane record — including one a live lease actually holds — was published on
+                # the list with `why=opt-in-off`. The next pass re-reads the registry and those rows
+                # vanish, which is the flapping the header forbids. Same preserve the ARMED arm takes:
+                # the state is NAMED, and no token is emitted.
+                if [ "$claim" = "unknown" ]; then
+                    printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
+                    return 0
+                fi
                 _st_age="?"
                 if [ "$wt_ok" != 1 ]; then
                     # ⛔ A RECORD THAT CANNOT BE DATED CANNOT BE "PAST ITS FLOOR" (review round 2,

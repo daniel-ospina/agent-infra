@@ -2344,6 +2344,20 @@ assert_eq "$RC" "2" "A14g --repo that is not a directory => exit 2"
 OUT="$(REAP_WT_MERGED_AGE_DAYS_OVERRIDE=99999999 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "A14h a merged floor above REAP_WT_MAX_DAYS => exit 2 (never a silently different pass)"
 assert_contains "$OUT" "bad REAP_WT_MERGED_AGE_DAYS" "A14h ... and the refusal names the seam, not a generic usage error"
+# A14j — the three seams the STALLED list's floors depend on are validated like every other numeric
+# knob (finding 2(b), review round 6, PR #3881). Without the validation entries a malformed value
+# reaches `$(( … * 3600 ))` on EVERY pass: `REAP_WT_WIP_AGE_HOURS=abc` is arithmetic on a string, and
+# `REAP_WT_STALE_INIT_SECONDS=abc` disables the interrupted-add detector's threshold. Deleting any of
+# the three loop entries must redden this leg, not pass silently — A14h's shape, one name at a time.
+OUT="$(REAP_WT_GHOST_AGE_HOURS_OVERRIDE=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14j a non-numeric REAP_WT_GHOST_AGE_HOURS => exit 2 (never arithmetic on a string)"
+assert_contains "$OUT" "bad REAP_WT_GHOST_AGE_HOURS" "A14j ... and the refusal names the seam it refused"
+OUT="$(REAP_WT_WIP_AGE_HOURS_OVERRIDE=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14j a non-numeric REAP_WT_WIP_AGE_HOURS => exit 2 (the class floor cannot be a string)"
+assert_contains "$OUT" "bad REAP_WT_WIP_AGE_HOURS" "A14j ... and the refusal names the seam it refused"
+OUT="$(REAP_WT_STALE_INIT_SECONDS=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14j a non-numeric REAP_WT_STALE_INIT_SECONDS => exit 2 (the interrupted-add floor)"
+assert_contains "$OUT" "bad REAP_WT_STALE_INIT_SECONDS" "A14j ... and the refusal names the seam it refused"
 # A14i — the pass's SUMMARY must satisfy ITS OWN identities on a REAL pass: `examined = classified +
 # deferred` and `classified = remove + preserved`. Two identities over four counters is where a
 # deferral double-count (or a missing one) becomes readable instead of inferred; the doc states them,
@@ -3817,6 +3831,57 @@ assert_contains "$ROW" "reason=ignored-artifact" \
 assert_absent "$ROW" "stalled=1" \
     "A29l a record INSIDE its WIP floor is NOT listed — the next sweep resolves it"
 assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29l …so the tally is 0"
+
+# ── A29n: an UNREADABLE registry does NOT publish a dirty 0-ahead lane record as stalled ──
+# ⛔ THE UNARMED DIRTY ARM'S OWN FALSIFIER (review round 6, PR #3881). It was the only lane-residue arm
+# that never consulted `claim`, so ONE failed registry probe (a logged, transient condition — the
+# `claim=live` early return cannot fire while the registry is unreadable) published every dirty
+# 0-ahead lane record past the WIP floor, including the one a LIVE lease holds here, with
+# `why=opt-in-off`. The next pass re-reads the registry and the rows vanish: the list flapped on a
+# probe failure, which is the class rounds 2/3/5 removed from the sibling arms. Deleting the arm's
+# `claim=unknown` gate reddens every assertion below.
+ENV=A29n; REPO="$(mk_repo $ENV)"; add_origin "$REPO" $ENV
+add_claim "$REPO" 2953 "$((NOW_FUTURE + 86400))"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2953-tm)"
+printf 'edited\n' >"$WT/base.txt"           # tracked modification => the abandoned-wip class
+rm -f "$T/$ENV/reap.log"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-claim-fetch" \
+    REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=claim-unverified" \
+    "A29n an unevaluable registry abstains on the UNARMED dirty arm too (named, fail-closed)"
+assert_dir "$WT" "A29n nothing was removed on an unreadable probe"
+assert_absent "$ROW" "stalled=1" \
+    "A29n …and the record is NOT published as stalled residue (the registry is re-read next pass)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29n …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29n …and no list is printed at all"
+
+# ── A29o: the ignored-artifact arm's OWN claim gate — `[ "$claim" != "unknown" ]` ──────────
+# ⛔ FINDING 2(a) OF REVIEW ROUND 6: that disjunct is the fourth arm's copy of the same rule and NO leg
+# drove it. A29k/A29l run on a repo with NO origin, so `claims_load` answers `na` and `claim` is
+# constantly `absent` — delete the disjunct and both stayed green. So this is A29k's fixture (a
+# 0-ahead lane record whose only dirt is IGNORED, non-regenerable data) past the WIP floor, with the
+# registry probe FAILING: it must be preserved WITHOUT the token.
+ENV=A29o; REPO="$(mk_repo $ENV)"; add_origin "$REPO" $ENV
+printf 'data/\n' >"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm ignore
+add_claim "$REPO" 2954 "$((NOW_FUTURE + 86400))"
+WT="$(add_named_wt "$REPO" "$ENV-data" feat/2954-tm)"     # 0 ahead; only IGNORED data below
+mkdir -p "$WT/data"; printf 'z\n' >"$WT/data/notes.txt"
+rm -f "$T/$ENV/reap.log"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-claim-fetch" \
+    REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29o non-vacuity: the fixture still takes the ignored-artifact arm (an empty row passes on anything)"
+assert_dir "$WT" "A29o the data-holding record is preserved, as always"
+assert_absent "$ROW" "stalled=1" \
+    "A29o an UNREADABLE registry keeps the ignored-data class OFF the list — it self-resolves next pass"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29o …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29o …and no list is printed at all"
 
 # ── A29-MUT: the COLLECTOR is load-bearing (drop it and A29a goes red) ───────────────────
 # The token is emitted inside `classify_one`, which runs in a command substitution, so the parent's
