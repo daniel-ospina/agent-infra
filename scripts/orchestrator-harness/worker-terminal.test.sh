@@ -2932,11 +2932,18 @@ case "${5:-}" in
     grep -q 'workspace rm ws_foreign' "$CMUX_LOG" && printf 'foreign=removed\n' || printf 'foreign=kept\n' ;;
   emptyws)
     # a workspace with NO terminal at all is a create IN FLIGHT — spared, never treated as idle
+    # ⛔ AND THE CENSUS MUST COME FROM THE FIXTURE (mutation check, 2026-11-10). `s1.sh` exports
+    # `CMUX_WS_STATE` for the stateful arms, and the stub resolves `CMUX_WS_STATE` BEFORE
+    # `CMUX_TREE_JSON`, so an arm that sets only the JSON variable read the EMPTY registry instead of its
+    # fixture: nothing was ever parsed, nothing was ever removable, and all three such arms PASSED against
+    # a library that deletes on an unaccounted census. `unset` hands the read to the fixture it names.
+    unset CMUX_WS_STATE
     printf '%s\n' '{"workspaces":[{"id":"ws_none","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_none","layout":{"root":{}}}],"tabs":[],"terminals":[]}' > "$O/tree.json"
     CMUX_TREE_JSON="$(cat "$O/tree.json")" wt_sweep_idle_workspaces "lane-7"
     grep -q 'workspace rm ws_none' "$CMUX_LOG" && printf 'empty=removed\n' || printf 'empty=kept\n' ;;
   unreadable)
     # a census the program cannot read is NOT an instruction to delete: nothing is removed, nothing claimed
+    unset CMUX_WS_STATE
     CMUX_TREE_JSON='{"workspaces":[{"id":"ws_a","name":"wt-lane-7"}],"screens":[],"terminals":{}}' wt_sweep_idle_workspaces "lane-7"
     printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
   liar)
@@ -2948,6 +2955,43 @@ case "${5:-}" in
   offswitch)
     printf 'ws_old1\twt-lane-7\t0\n' > "$CMUX_WS_STATE"
     WT_IDLE_SWEEP=0 wt_sweep_idle_workspaces "lane-7"
+    printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  reread)
+    # ⛔ THE RE-READ MUST BE ABLE TO SAY IT DID NOT MEASURE (agent-infra#2312 review P1, reproduced). The
+    # daemon answers the FIRST read (one idle surface of this name) and then cannot be read at all — the
+    # unresponsive-daemon / fired-bound shape, i.e. the 99 %-full volume this change exists for. `awk`'s
+    # `END{print c+0}` prints a number even for NO input, and a pipeline reports its LAST element's
+    # status, so this used to print a CONFIRMED clearance ("still finds 0 idle workspace(s)") that was
+    # never measured — the exact false PASS the issue is about, in the sentence the docs forbid.
+    printf '%s\n' '{"workspaces":[{"id":"ws_r","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_r","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_r"}],"terminals":[{"id":"term_r","running":false}]}' > "$O/seq.1"
+    CMUX_TREE_SEQ="$O/seq" wt_sweep_idle_workspaces "lane-7"
+    printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  noaccount)
+    # ⛔ A CENSUS THAT DOES NOT ACCOUNT FOR ITS OWN TABS (agent-infra#2312 review P1, reproduced): a
+    # TYPE-VALID document with `terminals: []` beside a screen naming one tab. That tab resolves to NO
+    # terminal record, which `run.get(cid, False)` read as "not running" ⇒ `idle`, so `cmux workspace rm`
+    # ran on a workspace that may hold a LIVE lane — while the line asserted "their terminals had ALL
+    # exited" of a workspace the census held ZERO terminal records for. Absent is not exited.
+    unset CMUX_WS_STATE   # the stub prefers CMUX_WS_STATE; this arm's census is the fixture below
+    CMUX_TREE_JSON='{"workspaces":[{"id":"ws_live","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_live","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_A"}],"terminals":[]}' \
+      wt_sweep_idle_workspaces "lane-7"
+    printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  noaccountlive)
+    # …and the same document where the ONE resolvable record says running: a mixed accounting must never
+    # turn a running lane into a deletion either (the arm above proves absence is spared; this proves
+    # a resolved `running:true` still wins).
+    unset CMUX_WS_STATE
+    CMUX_TREE_JSON='{"workspaces":[{"id":"ws_live","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_live","layout":{"root":{"tab_ids":["t1","t2"]}}}],"tabs":[{"id":"t1","content_id":"term_A"},{"id":"t2","content_id":"term_B"}],"terminals":[{"id":"term_A","running":true}]}' \
+      wt_sweep_idle_workspaces "lane-7"
+    printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  partial)
+    # ⛔ THE RESIDUAL OF A PARTIAL ACCOUNTING, and the reason `idle` requires the FULL one: one tab of
+    # two resolves to an EXITED record and the other resolves to NOTHING. A bare `any(...)` reading makes
+    # that `idle` — it deletes the workspace and prints "their terminals had ALL exited" about a tab the
+    # census never mentioned. Two tabs, one lane: the unresolved half may be the running one.
+    unset CMUX_WS_STATE
+    CMUX_TREE_JSON='{"workspaces":[{"id":"ws_p","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_p","layout":{"root":{"tab_ids":["t1","t2"]}}}],"tabs":[{"id":"t1","content_id":"term_A"},{"id":"t2","content_id":"term_B"}],"terminals":[{"id":"term_A","running":false}]}' \
+      wt_sweep_idle_workspaces "lane-7"
     printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
 esac
 SH
@@ -2999,6 +3043,28 @@ ck "…naming what it ASKED the daemon to remove (2), never a verified clearance
 out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O26" "$TMP/cmux26.log" offswitch 2>&1)"
 case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "WT_IDLE_SWEEP=0 disables it (an operator can stop an actuator)" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s1" "$TMP/cmux2s1.log" reread 2>&1)"
+case "$out" in *"rm_calls=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "the sweep still acts on the read it CAN make, and removes the idle surface" $rc
+case "$out" in *"could NOT confirm"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "⛔ an UNREADABLE re-read is reported as 'could NOT confirm' — a fired bound is not an empty census" $rc
+case "$out" in *"still finds"*) rc=1 ;; *) rc=0 ;; esac
+ck "…and it does NOT print a remaining count it never measured (the false PASS this issue is about)" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s2" "$TMP/cmux2s2.log" noaccount 2>&1)"
+case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "⛔ a census whose tabs resolve to NO terminal record removes NOTHING (absent is not 'exited')" $rc
+case "$out" in *SWEPT*) rc=1 ;; *) rc=0 ;; esac
+ck "…and claims nothing at all — it never says terminals 'had ALL exited' when it read none" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s3" "$TMP/cmux2s3.log" noaccountlive 2>&1)"
+case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and a partially-accounted screen with a RUNNING record still spares the workspace" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s4" "$TMP/cmux2s4.log" partial 2>&1)"
+case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "⛔ a PARTIAL accounting (one tab exited, one resolving to nothing) removes NOTHING — 'idle' needs ALL of them" $rc
 
 # NON-VACUITY: the sweep must be REACHED from both ends of a worker's life, not merely defined.
 grep -q '^    wt_sweep_idle_workspaces "$name"$' "$LIB" && rc=0 || rc=1
