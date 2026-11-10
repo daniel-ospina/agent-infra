@@ -197,45 +197,53 @@ git_b() { # <git args…>
 # class and leaves literal garbage in the value (reproduced). The three trims are order-independent:
 # each takes the prefix before the first occurrence of its own character.
 field() { # <file> <name>
-  local f="$1" n="$2" l1="" l2="" l2_rc=0 rest
+  local f="$1" n="$2" l1="" l2="" l2_rc=0 rest tailp after
   [ -f "$f" ] || return 0
   { IFS= read -r l1 || :; IFS= read -r l2; l2_rc=$?; } < "$f" 2>/dev/null
   case "$l1" in
     '{'*'}')
-      # ⛔ EOF, NOT AN EMPTY LINE. `[ -z "$l2" ]` cannot tell the two apart, so a record of
-      # `{"…"}\n\nGARBAGE\n` took the fast path while `json.load` refuses the whole file — and push
-      # then PUBLISHED a record every other box refuses (measured). Only a second read that FAILED
-      # means "this file is one line".
-      if [ "$l2_rc" -ne 0 ]; then
+      # ⛔ EOF AT THE END OF LINE ONE — not merely "the second read failed". A second read fails BOTH at
+      # EOF and on an unterminated final line that still CARRIED data, so `{"…"}\nJUNK` (no trailing
+      # newline) took the fast path while `json.load` refuses the file: a corrupt local file then won
+      # rule 1/rule 4 at rc 0 with `unreadable=0`, REPLACED a usable peer record, and left the store
+      # holding bytes no box can read — the fleet's only copy for that PR (measured). BOTH conditions
+      # are required: the read must have failed AND brought back nothing.
+      if [ "$l2_rc" -ne 0 ] && [ -z "$l2" ]; then
         # ⛔ a `}` inside a `${var//…}` pattern TERMINATES the expansion (measured: it yields the
         # input followed by a literal `]/}`), so the natural `[^}]` class silently does nothing
         # here. `case` patterns have no such problem, and stripping the outer braces by hand is
-        # enough: any container character left in the INTERIOR means "not the flat shape".
+        # enough: any container character left in the INTERIOR means "not the flat shape" — and so
+        # does ANY BACKSLASH, because a JSON escape (`\"`, `\/`, `\u…`) cannot be decoded by a prefix
+        # trim (measured: `"repo":"a\/b"` read back as `a\`, a wrong rule-3 key).
         rest="${l1%\}}"; rest="${rest#*\{}"
         case "$rest" in
-          *'{'*|*'}'*|*'['*|*']'*) ;;
+          *'{'*|*'}'*|*'['*|*']'*|*\\*) ;;
           *)
             case "$l1" in *"\"$n\":"*) ;; *) return 0 ;; esac
             rest="${l1##*"\"$n\":"}"    # greedy-LAST occurrence — on a flat line, THE top level
             # ⛔ THE VALUE MUST START AT THE COLON with an actual JSON scalar. `json.dumps`'s DEFAULT
-            # separators emit `": "`, and the three trims below do NOT skip whitespace — so a spaced
-            # record read back as a single SPACE: non-empty (every unreadable guard passed) and sorting
-            # BELOW any timestamp (`' '` < `'2'`), so `pull` OVERWROTE a NEWER local record with an
-            # older peer one, silently, at rc 0 (measured — this file's own "unrecoverable" class).
-            # `null`/`true`/`false` diverge the same way (the strict parse reads ""/true), and they
-            # decide the very same rules. So anything but a string, a number or a negative number is
-            # the strict parse's to answer: a shape this scan is not sure about cannot fail OPEN,
-            # because `_field_json` is the READER.
+            # separators emit `": "`, and a prefix trim does NOT skip whitespace — so a spaced record
+            # read back as a single SPACE: non-empty (every unreadable guard passed) and sorting BELOW
+            # any timestamp (`' '` < `'2'`), so `pull` OVERWROTE a NEWER local record with an older
+            # peer one, silently, at rc 0 (measured — this file's own "unrecoverable" class).
+            # `null`/`true`/`false` diverge the same way, so anything but a string or a number is the
+            # READER's to answer: a shape this scan is not sure about cannot fail OPEN.
+            # ⛔ AND A STRING RUNS TO ITS CLOSING QUOTE, never to the first `,`: `"repo":"a,b/c"` read
+            # as `a` (measured), i.e. a wrong rule-3 key, and two same-stamp records differing only
+            # after a comma compared `same`, so rule 4's divergence was never reported.
             case "$rest" in
-              \"*|-*|[0-9]*) ;;
-              *) _field_json "$f" "$n"; return 0 ;;
+              \"*)
+                rest="${rest#\"}"
+                tailp="${rest%%\"*}"          # escape-free by the gate above
+                after="${rest#*\"}"           # whatever follows the closing quote
+                case "$after" in
+                  ,*|\}*) printf '%s' "$tailp"; return 0 ;;
+                esac ;;
+              -[0-9]*|[0-9]*)
+                rest="${rest%%[,]*}"; rest="${rest%%\}*}"
+                printf '%s' "$rest"; return 0 ;;
             esac
-            rest="${rest#\"}"               # the OPTIONAL opening quote
-            rest="${rest%%[,]*}"            # ┐
-            rest="${rest%%\}*}"             # ├ the value class, applied as three prefix trims
-            rest="${rest%%\"*}"             # ┘
-            printf '%s' "$rest"
-            return 0 ;;
+            _field_json "$f" "$n"; return 0 ;;
         esac
       fi ;;
   esac
@@ -532,8 +540,24 @@ claim_stale() { # <judged-pid> <message>
   return 1
 }
 
+# ⛔ A PROBE THAT CANNOT ANSWER IS NOT EVIDENCE. `ps -p <missing>` and `ps -p <live-but-invisible>`
+# are BYTE-IDENTICAL (exit 1, no output), so a `ps` that is absent — or that cannot SEE the pid (a
+# PID-namespaced view of a shared registry, fork pressure) — must not be read as "the holder is dead".
+# That is round 1's EPERM defect moved from permission to VISIBILITY, and it was measured stealing a
+# LIVE holder's lock on the first failed probe. Where /proc exists, absence there is PROOF; where it
+# does not (stock macOS) the answer is UNKNOWN, and only the elapsed-time ceiling may break the lock.
+pid_state() { # <pid> → alive | gone | unknown
+  local p="$1"
+  if command -v ps >/dev/null 2>&1 && ps -p "$p" >/dev/null 2>&1; then printf 'alive'; return 0; fi
+  if [ -d /proc/1 ]; then
+    if [ -d "/proc/$p" ]; then printf 'alive'; else printf 'gone'; fi
+    return 0
+  fi
+  printf 'unknown'
+}
+
 reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
-  local i=0 pidf pid age
+  local i=0 pidf pid age state
   [ -d "$REG_DIR" ] || mkdir -p "$REG_DIR" 2>/dev/null || return 1
   LOCKDIR="$REG_DIR/.registry-sync.lock"
   LOCK_OWNED=0
@@ -547,23 +571,22 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
     [ -f "$pidf" ] && pid="$(command cat "$pidf" 2>/dev/null)"
     case "$pid" in ''|*[!0-9]*) pid="" ;; esac
     age="$(lock_age "$LOCKDIR")"
-    # ⛔ WHICH AMBIGUITY EACH ARM MAY RESOLVE (#2510 review rounds 1-3, every one measured):
-    #  · a recorded pid the OS says is GONE is UNAMBIGUOUS, so a short grace is enough;
-    #  · every OTHER shape is AMBIGUOUS and only elapsed time may break it — a pid-less lock is a live
-    #    acquirer for the microseconds between `mkdir` and the write (a 2 s grace STOLE one that was
-    #    descheduled for 3 s), an unreadable pid names nothing provable, a pid that is ALIVE may be a
-    #    frozen holder or a pid the OS recycled, and `ps` may be unable to answer at all (an absent
-    #    `ps` read every live holder as dead — round 1's EPERM defect, moved from permission to tool
-    #    availability). Time must therefore outlive the run's own bound, which is why the ceiling is
-    #    derived from MAX_WAIT;
+    # ⛔ WHICH AMBIGUITY EACH ARM MAY RESOLVE (#2510 review rounds 1-4, every one measured):
+    #  · a recorded pid the OS proves GONE is UNAMBIGUOUS, so a short grace is enough;
+    #  · every OTHER shape is AMBIGUOUS and only elapsed time may break it — an absent pid (a live
+    #    acquirer is pid-less for the microseconds between `mkdir` and the write: a 2 s grace STOLE one
+    #    that was descheduled for 3 s), an unreadable pid, a pid that is ALIVE (a frozen holder, or a
+    #    pid the OS recycled onto an unrelated process), and a probe that cannot answer (`ps` absent
+    #    or blind, where /proc cannot corroborate). Time must outlive the run's own bound, which is
+    #    why the ceiling is derived from MAX_WAIT;
     #  · a lock we cannot DATE is never reclaimed: fail closed, wait out the bound, and let the caller
     #    refuse to write — the same doctrine as the strict-parse fallback in `_field_json`.
+    state="none"
+    [ -n "$pid" ] && state="$(pid_state "$pid")"
     if [ -z "$age" ]; then
       : # undateable ⇒ cannot prove abandoned ⇒ never steal it
-    elif [ -n "$pid" ] && command -v ps >/dev/null 2>&1 && ! ps -p "$pid" >/dev/null 2>&1; then
-      if [ "$age" -ge "$LOCK_PID_GRACE" ]; then
-        claim_stale "$pid" "  ⚠️ reclaiming $LOCKDIR — its holder (pid $pid) is gone (a killed run)." || :
-      fi
+    elif [ "$state" = "gone" ] && [ "$age" -ge "$LOCK_PID_GRACE" ]; then
+      claim_stale "$pid" "  ⚠️ reclaiming $LOCKDIR — its holder (pid $pid) is gone (a killed run)." || :
     elif [ "$age" -ge "$LOCK_STALE_MAX" ]; then
       if [ -n "$pid" ]; then
         claim_stale "$pid" "  ⚠️ reclaiming $LOCKDIR — still names pid $pid after ${age}s, longer than any sync run holds it." || :
@@ -590,7 +613,7 @@ reg_unlock() {
   return 0
 }
 
-PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0 UNCHANGED=0
+PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 LOCAL_UNUSABLE=0 FAILED=0 PUSH_FAILED=0 UNCHANGED=0
 LOCKDIR=""
 LOCK_OWNED=0
 # ── ONE listing per run (agent-infra#3180) ───────────────────────────────────────────────────────
@@ -845,7 +868,11 @@ pull_one_locked() { # <key>
         warn "  ⚠️ skip $key — this box's record is NEWER ($lat > $rat) but is NOT one its own rail can use"
         warn "     (no 40-hex head_sha, no verdict, or not strict JSON). It is NOT overwritten (#2374 rule 1)"
         warn "     and \`pull\` cannot repair it — remove or re-mint $lf, or the lane keeps reading the older one."
-        UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
+        # ⛔ ITS OWN COUNTER. The rc-4 summary (and `atomic-land.sh`'s rc-4 arm) says "the STORE holds
+        # records this box cannot use" — which is a FLEET-facing claim, and it is false here: the
+        # unusable bytes are on this box, in this box's own file. Sharing `UNREADABLE` sent the
+        # operator to the store side, which is the misdirection this arm was added to remove (round 4).
+        UNREADABLE=$((UNREADABLE + 1)); LOCAL_UNUSABLE=$((LOCAL_UNUSABLE + 1)); rm -f "$tmp"; return 0
       fi
       log_line "  · keep $key — this box is NEWER ($lat > $rat); an older record never overwrites a newer one (#2374 rule 1)"
       SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0
@@ -1330,8 +1357,14 @@ summary() { # <verb>
     return 3
   fi
   if [ "$UNREADABLE" -gt 0 ]; then
-    warn "registry-sync.sh: $UNREADABLE record(s) were SKIPPED because they could not be read or ordered — this is"
-    warn "  NOT a converged state (the store holds records this box cannot use). Nothing was overwritten."
+    if [ "$LOCAL_UNUSABLE" -gt 0 ] && [ "$LOCAL_UNUSABLE" -eq "$UNREADABLE" ]; then
+      warn "registry-sync.sh: $UNREADABLE record(s) were SKIPPED — but they are THIS BOX's OWN unusable"
+      warn "  record(s), NOT a store-side defect: no record in the store was refused. Remove or re-mint them"
+      warn "  here; nothing was overwritten."
+    else
+      warn "registry-sync.sh: $UNREADABLE record(s) were SKIPPED because they could not be read or ordered — this is"
+      warn "  NOT a converged state (the store holds records this box cannot use). Nothing was overwritten."
+    fi
     return 4
   fi
   return 0

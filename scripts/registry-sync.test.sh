@@ -971,6 +971,31 @@ assert_contains "$N5_OUT" "no repo field" "§29d a record with a BLANK second li
 # the store already holds this key from §29a; the point is that THIS record was never published as a
 # NEW one — it was refused outright rather than published under a key its payload cannot back.
 assert_not_contains "$N5_OUT" "pushed $NEST_KEY" "§29d ...so it is never published"
+# §29e — the other half of "one line": an UNTERMINATED second line still CARRIES data, so a test that
+# only asks whether the second read FAILED accepts `{"…"}\nJUNK` while `json.load` refuses the file
+# (round 4, measured end-to-end: a corrupt local file won rule 1/rule 4 at rc 0 with `unreadable=0`,
+# replaced a usable peer record, and left the store holding bytes no box can read).
+NEST6D="$MINI_ROOT/box6"; mkdir -p "$NEST6D"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-27T00:00:00Z"}\nJUNK' \
+  "$HEAD_C" > "$NEST6D/$NEST_KEY.json"
+N6_OUT="$(mini_rs "$NEST6D" push)"
+assert_contains "$N6_OUT" "no repo field" "§29e a record whose second line carries junk (no trailing newline) is NOT read by the fast path"
+assert_not_contains "$N6_OUT" "pushed $NEST_KEY" "§29e ...and a record the strict reader REFUSES is never published"
+# §29f — a LEGAL JSON escape must be read the way the reader reads it. `\/` is valid inside a string and
+# `read_record` accepts it; a prefix trim cannot decode it, so the fast path read `repo` as
+# `daniel-ospina\/agent-infra`, decided the key did not match, and refused a record the gate would use
+# (round 4). Escapes are now routed to the strict parse.
+NEST7D="$MINI_ROOT/box7"; mkdir -p "$NEST7D"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina\\/agent-infra","reviewed_at":"2026-10-28T00:00:00Z"}\n' \
+  "$HEAD_C" > "$NEST7D/$NEST_KEY.json"
+if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$NEST7D/$NEST_KEY.json" 2>/dev/null; then
+  ok "§29f (premise) the fixture is VALID JSON the reader accepts"
+else
+  bad "§29f (premise) the fixture is not valid JSON — the arm would prove nothing"
+fi
+N7_OUT="$(mini_rs "$NEST7D" push)"
+assert_contains "$N7_OUT" "pushed $NEST_KEY" "§29f a legal JSON escape is decoded, so its key is accepted (not mis-keyed)"
+assert_not_contains "$N7_OUT" "not this key" "§29f ...and the run did not report a key mismatch"
 
 # ═══ 30. the compare+write lock: reclaimed in every dead-holder shape, bounded in every arm ══
 # Review findings P2 (two of them) on PR #3894 — `git grep 'reg_lock' -- scripts/*.test.sh` had NO
@@ -1143,6 +1168,37 @@ else
 fi
 assert_eq "$I_RC" "1" "§30i ...and that run fails closed rather than writing without the lock"
 rm -rf "$LKD/.registry-sync.lock"; lock_reset
+# (j) A FRESH PID-LESS LOCK IS A LIVE ACQUIRER, NOT AN ABANDONED LOCK. §30c uses a 2020-dated lock, so on
+# its own it cannot tell "reclaim a STALE pid-less lock" from "reclaim a pid-less lock at ANY age" —
+# the latter is round 2's measured steal of an acquirer descheduled between `mkdir` and the pid write
+# (round 4: dropping the age gate left the suite green). Only elapsed time may break the ambiguous shape.
+lock_reset
+mkdir -p "$LKD/.registry-sync.lock"     # no pid file, and NO touch: this lock is seconds old
+J_OUT="$(mini_rs "$LKD" pull)"; J_RC=$?
+assert_eq "$J_RC" "1" "§30j a FRESH pid-less lock is NOT reclaimed (it is a live acquirer's mkdir-to-pid window)"
+assert_contains "$J_OUT" "could not serialise" "§30j ...and the run refuses instead of writing"
+if [ -d "$LKD/.registry-sync.lock" ]; then ok "§30j ...and the acquirer's lock dir is still there"; else bad "§30j ...the fresh pid-less lock was STOLEN"; fi
+assert_absent "$LKD" "$LKD/$LCK_KEY.json" "§30j ...and nothing was written without the lock"
+rm -rf "$LKD/.registry-sync.lock"
+# (k) A PROBE THAT CANNOT ANSWER IS NOT EVIDENCE. `ps -p <missing>` and `ps -p <live-but-invisible>` are
+# byte-identical, so a `ps` that cannot SEE the pid must not be read as "the holder is dead" — that is
+# round 1's EPERM defect moved from permission to visibility, and it was measured stealing a LIVE
+# holder's lock on the first failed probe (round 4). Pinned with a `ps` that can never answer; where
+# /proc exists it PROVES the holder is alive, and where it does not the answer is "unknown", which
+# routes to the ceiling instead of the 2 s grace. Either way the lock is kept.
+SHIM_K="$T/shim-k"; mkdir -p "$SHIM_K"
+printf '#!/bin/sh\nexit 1\n' > "$SHIM_K/ps"; chmod +x "$SHIM_K/ps"
+lock_reset
+mkdir -p "$LKD/.registry-sync.lock"; printf '1\n' > "$LKD/.registry-sync.lock/pid"
+# 60 s: past the 2 s grace (so a `gone` verdict WOULD reclaim it — that is the mutation) and far below the
+# 1200 s ceiling at `--timeout 600`, so the ceiling arm cannot explain a pass.
+AGE60="$(python3 -c 'import time;print(time.strftime("%Y%m%d%H%M.%S", time.localtime(time.time()-60)))')"
+touch -t "$AGE60" "$LKD/.registry-sync.lock"
+K_OUT="$(PATH="$SHIM_K:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 600 2>&1)"; K_RC=$?
+assert_eq "$K_RC" "1" "§30k a lock whose holder a BLIND ps cannot see is NOT reclaimed (the probe cannot answer)"
+if [ -d "$LKD/.registry-sync.lock" ]; then ok "§30k ...the live holder's lock is still there"; else bad "§30k ...the lock was STOLEN on an unanswered probe"; fi
+assert_contains "$K_OUT" "could not serialise" "§30k ...and the run fails closed rather than writing"
+rm -rf "$LKD/.registry-sync.lock"; lock_reset
 
 # ═══ 31. this box's record is NEWER but UNUSABLE — named, not silently kept for ever ══════
 # Review finding P2 on PR #3894: `git grep 'own rail can use' -- scripts/*.test.sh` → no match, and
@@ -1168,6 +1224,11 @@ assert_contains "$UN_OUT" "NOT one its own rail can use" "§31 ...and the run NA
 assert_contains "$UN_OUT" "cannot repair it" "§31 ...and names the REAL remedy instead of pointing at a verb that cannot help"
 assert_eq "$(digest "$UN_BOX")" "$UN_BEFORE" "§31 ...and the newer record is NOT overwritten (rule 1 is not relaxed)"
 assert_not_contains "$UN_OUT" "this box is NEWER" "§31 ...and the run does not report a converged-looking keep"
+# the rc-4 summary is a FLEET-facing claim, and for THIS arm it would be false: the unusable bytes are on
+# this box, not in the store. `atomic-land.sh`'s rc-4 arm repeats the summary's wording, so a wrong
+# sentence here sends the operator to the store side — the misdirection this arm exists to remove.
+assert_contains "$UN_OUT" "THIS BOX's OWN unusable" "§31 ...and the SUMMARY blames this box's own record, not the store"
+assert_not_contains "$UN_OUT" "the store holds records this box cannot use" "§31 ...and does not make the fleet-facing claim about the store"
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
