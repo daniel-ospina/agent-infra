@@ -1,0 +1,13 @@
+### RED — a faithful pristine 0.85.1 tree, --check (what an upgrade leaves behind)
+
+  pi root:  /tmp/pi-fake-full
+❌ NOT APPLIED — the fix is not in effect:
+   - bundled runtime: available=0 maxTokens=8000 → 1, expected 1024 (no budget left -> must NOT be 1)
+   - bundled runtime: available=-50000 maxTokens=8000 → 1, expected 1024 (estimate overran the window -> must NOT be 1)
+   - bundled runtime: available=1023 maxTokens=100000 → 1023, expected 1024 (just below the floor)
+   - bundled runtime: available=0 maxTokens=100 → 1, expected 100 (caller cap below the floor is honoured)
+   - pi-ai ESM: available=0 maxTokens=8000 → 1, expected 1024 (no budget left -> must NOT be 1)
+   - pi-ai ESM: available=-50000 maxTokens=8000 → 1, expected 1024 (estimate overran the window -> must NOT be 1)
+   - pi-ai ESM: available=1023 maxTokens=100000 → 1023, expected 1024 (just below the floor)
+   - pi-ai ESM: available=0 maxTokens=100 → 1, expected 100 (caller cap below the floor is honoured)
+EXIT=1

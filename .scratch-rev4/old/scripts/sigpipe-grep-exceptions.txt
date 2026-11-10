@@ -1,0 +1,26 @@
+# Declared exceptions for scripts/check-no-sigpipe-grep.sh (#841).
+#
+# Format:  <path> <expected-count> <content-hash> #<tracking-issue>
+#
+# An exception is NOT a mute. The guard prints every exception on every run, and FAILS if
+# either the COUNT or the CONTENT-HASH stops matching — so a stale exception must be deleted,
+# a count-preserving swap cannot hide behind one, and a new occurrence is never inherited.
+# An exception without a tracking issue is rejected outright. Shell metacharacters in a path
+# are accepted; the path must match the guard's own scan set.
+#
+# ---------------------------------------------------------------------------------------
+# NO EXCEPTIONS. The scan set is clean.
+# ---------------------------------------------------------------------------------------
+# The one exception this file ever carried was `scripts/record-review.sh 4 10cc3d4163d67aad
+# #860` — the honest record of a BLOCKED FIX, not a judgement that those 4 sites were safe.
+# It was deleted the moment its stated condition was met:
+#
+#   #860 ("no independent model is funded") was resolved on 2026-09-12 by funding the
+#   OpenRouter account: the second-model gate's probe resolved a reachable + solvent
+#   candidate classified INDEPENDENT of the primary, so a PR touching the guarded surface
+#   (which includes this script) could record `independent=yes` and merge on its merits.
+#
+# The 4 sites were fixed with the same here-string transform applied to the other 51 in #841.
+# This deletion is the debt-cannot-outlive-its-cause property working as designed: the moment
+# the fix became mergeable, the guard would have reported the line STALE and failed until the
+# sites were fixed.

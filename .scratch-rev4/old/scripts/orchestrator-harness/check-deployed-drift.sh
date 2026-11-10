@@ -1,0 +1,1414 @@
+#!/usr/bin/env bash
+# check-deployed-drift.sh — does the DEPLOYED harness at $O match the repo?
+#
+#   ./check-deployed-drift.sh [--o <dir>] [--repo <path>] [--ref <git-ref>] [--rel <path>]
+#                             [--surface] [--quiet] [--no-fetch]
+#
+# Exit: 0 = match, 1 = drift, 2 = UNKNOWN (cannot verify — NEVER a pass).
+#
+# ── `--surface`: EVERY PLACE A HARNESS SCRIPT LIVES ON THIS BOX (agent-infra#2231) ───────────────
+# The three halves below answer a question about ONE directory, `$O`. That is not where a box's
+# harness necessarily runs from, and #1790 measured up to FOUR `orch-loop.sh` trees on one cell. The
+# gap that cost real fixes: a copy in a HOME-DIR harness dir (`~/orchestrator`, `$CELL_HOME/harness`,
+# a stale pinned worktree) that the RUNNING controller executes, carrying local edits `main` never
+# received — three fixes existed only there, and every instrument said the box was fine, because no
+# instrument looked at that directory at all.
+#
+# `--surface` therefore compares, PER BOX, the set of harness scripts each candidate directory
+# carries against the same paths at $REF:
+#   • the dir(s) of the RUNNING `orch-loop.sh` (read from the process table, so it is what the box
+#     executes rather than what a record claims);
+#   • `$O` (the deployed dir above);
+#   • `$(dirname HARNESS)` — the path `HARNESS_PIN_FILE` / `$HARNESS` names, i.e. the pinned
+#     worktree the supervisor's `start` execs;
+#   • every child of the pin root (`$HARNESS_PIN_DIR/<sha12>`), one per pinned commit;
+#   • the HOME-DIR harness dirs (`$HOME/orchestrator`, `$CELL_HOME/harness`).
+# For each it prints which files DIFFER, which are MISSING, and which exist ONLY in that home dir —
+# the class that lost those fixes. A component whose own dir does not match $REF REFUSES the pass:
+# the box is running code main does not carry, and calling that OK is the false green this whole
+# script exists against.
+#
+# ── THE EXECUTING TREE, READ FROM THE PROCESS ITSELF (agent-infra#10114) ─────────────────────────
+# Every arm above answers a question about a DIRECTORY. None of them answered the one a fleet
+# operator actually asks: **is the code that is EXECUTING equal to $REF?** — and the difference is
+# not academic. Measured on a live cell: the controller ran `/…/harness/709dfb06eac2/…`, a directory
+# that NO LONGER EXISTED, while `HARNESS-PIN` named `6da181efd551` and every record agreed with
+# itself; this script printed `OK: every harness dir on this box matches origin/main` and exited 0.
+# The one directory that WAS executing was the one directory never compared, because the running
+# dir was pushed into the candidate list from inside a PIPELINE (a subshell, where `drift` cannot
+# reach the counters) and a candidate whose dir is ABSENT was then dropped by a bare `continue`.
+#
+# So `--surface` now reads the process's OWN argv — `ps -eo pid=,command=`, with `/proc/<pid>/cmdline`
+# where the kernel keeps the argv (so a path containing a space survives, and a RELATIVE one resolves
+# against the CONTROLLER's cwd, never ours) — scanning EVERY element rather than a fixed position, so
+# `bash <dir>/orch-loop.sh`, `env bash <dir>/orch-loop.sh` and `bash -c <dir>/orch-loop.sh` are the same
+# fact; keeping the PID; and answers three ways — only one of which may pass:
+#   dir           → compared against $REF by the candidate pass below, labelled RUNNING;
+#   absent        → DRIFT: a live controller executes a directory this box does not have, so nothing
+#                   it runs can be $REF's code. That is an ANSWER (compared, cannot match), not a
+#                   cannot-verify — and it is the #3194/#10114 shape, where the pin record, the unit
+#                   and the control plane all read green over a tree that was already gone;
+#   unexaminable  → BROKEN (exit 2): an unresolvable link or an unsearchable ancestor means we have
+#                   no answer about the only tree that is actually running.
+# The standard this implements is the one every deployment system converges on: reconcile the LIVE
+# artefact against the built one (a digest over the executing tree), never the manifest that claims
+# what was deployed. A pin record is a record ABOUT the box; `ps` is the box.
+# ⛔ FAIL-CLOSED: an UNREADABLE candidate dir or file is exit 2 (BROKEN), never "nothing to report".
+# Empty is not clean either: with no candidate dir at all the pass cannot answer, which is 2.
+#
+# With `--surface` and no `$O`, the identity/payload halves say SKIPPED and the surface pass is still
+# answered — that is what makes it runnable from ANY box (a controller host with no deployed copy).
+#
+# WHY THIS EXISTS (agent-infra#1745). check-port-drift.sh answers whether the TORTOISE source moved
+# past the pinned sync point. It cannot answer the question the deployed laptop box actually needed:
+#
+#     $ cd ~/orchestrator && git rev-parse --show-toplevel
+#     fatal: not a git repository
+#
+# The daemon executes `$O/<script>`, and `$O` (=~/orchestrator) is not a checkout at all — so
+# "which commit is this box running?" had NO answer. Not an old commit: no answer. On the cmux
+# cells the same class let `check` print `CELL CAN RUN A CONTROLLER` over a tree that was not on
+# main's line, because the copy whose BYTES matched main carried no git identity, so nothing could
+# be checked (#1790 measured up to FOUR `orch-loop.sh` trees per cell). The binding rule taken from
+# that incident: AN ABSENT, UNREADABLE OR UNKNOWN IDENTITY IS `UNKNOWN`, AND CANNOT-VERIFY IS NEVER
+# A PASS.
+#
+# WHAT IS COMPARED — TWO QUESTIONS, and conflating them is a defect of its own:
+#
+#   (a) IS $O THE TREE IT CLAIMS?        the bytes in $O against the RECORD's own manifest, and the
+#                                        recorded commit against the ref.
+#   (b) IS $O IDENTICAL TO THE CHECKOUT   every shipped blob at $REF against $O.
+#       RIGHT NOW?
+# A box deliberately one commit BEHIND is (a)-clean and (b)-behind — a KNOWN state that needs a
+# redeploy. A box carrying uncommitted edits is (a)-DIRTY — it runs bytes no deploy wrote, and a
+# redeploy DESTROYS them. Measured 2026-10-29 they printed the same word (`harness=diverged:…`), so a
+# diagnosis was made against a checkout describing code the box was not running; measured 2026-10-28 a
+# hand patch to `$O/merge-one.sh` was reverted twice by redeploys with nothing said.
+# The summary line therefore carries a `harness=` token: `current` / `behind:<sha12>` /
+# `diverged:<sha12>` / `uncommitted-edit:<file>`.
+#
+# THE RECORD: `$O/.harness-provenance` (written by the DEPLOY path — harness-provenance.sh, called
+# from deploy-harness.sh and deploy-mac-orchestrator.sh; a plain-text `key=value` header plus one
+# `<sha256>  <relpath>` line per file the deploy wrote) is PREFERRED. `$O/.agent-infra-stamp.json`
+# (install.sh's, the SAME cell-shaped stamp `cloud-cell-supervisor.sh` records on a cell) is the
+# fallback, so every box that was attributable before the manifest existed still is. A record that is
+# MISSING or UNREADABLE, or a `commit=UNKNOWN`, is exit 2 on either path — AN ABSENT, UNREADABLE OR
+# UNKNOWN IDENTITY IS `UNKNOWN`, AND CANNOT-VERIFY IS NEVER A PASS.
+#
+# The halves, in order:
+#
+#   1. IDENTITY. The record must name a commit that resolves in the repo. A stamp must also carry a
+#      payload hash and say whether its source was clean; a provenance record must carry a manifest
+#      whose entry count equals its own `files=` (a record that cannot describe itself is UNKNOWN).
+#   2. RELATION. The RECORDED commit is recomputed LIVE against the ref — hash equality or
+#      `merge-base --is-ancestor`, NEVER a commit count (measured 2026-10-14: `rev-list --count`
+#      printed 1 while `--is-ancestor` printed NO). current -> continue; behind / diverged -> drift;
+#      a recorded commit that is not an object in the repo -> exit 2.
+#   3. PAYLOAD (question (a)). Every manifest entry must be present in $O with the SAME sha256. A
+#      mismatch is an UNCOMMITTED EDIT, named, with which side is newer (the file's mtime vs the
+#      record's) — that is the shape that silently ate a fix. With only a stamp there is no manifest,
+#      so the aggregate `payloadSha256` fold is compared instead and the report SAYS it cannot name
+#      the file.
+#   4. BYTES (question (b)). Every `*.sh` the repo ships at the ref (depth 1 of the harness dir — what
+#      README §4 and `cp <harness>/*.sh $O/` put there) must be present in $O with the SAME git blob
+#      sha1, and $O must carry no `*.sh` the repo does not ship. This is check-port-drift.sh's
+#      primitive — blob shas read from the ref's tree — applied to the DEPLOYED copy, and it is what
+#      separates "behind" from "edited". A file already named by half 3 is not repeated here (one
+#      defect, one line).
+#
+# It answers ONE question and changes nothing: READ-ONLY, safe to run while the loop is working.
+# A `git fetch` of the ref is the only network call (skipped with --no-fetch), and a failed fetch
+# says so rather than silently comparing a stale ref.
+set -u
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ⛔ `O` is deliberately NOT pre-cleared here. Every sibling in this directory honours an env
+# `O=<dir>` (`install.sh`, `report.sh`, `orch-loop.sh` all assign `O="${O:-...}"`), and this
+# script's own printed remedy uses that form. Clearing it made the `${O:-...}` fallback below
+# unconditional, so `O=<dir> check-deployed-drift.sh --repo <r>` silently verified
+# `$HOME/orchestrator` instead: measured, a drifted surface named with `--o` exited 1 while the SAME
+# surface named by env printed `OK` and exited 0 — a false PASS asserted about a directory the
+# operator never named.
+# `REPO`/`REF`/`REL` are still cleared, because this script resolves them from `--repo`/`--ref`/
+# `--rel` (plus `HARNESS_REPO` and its own worktree). That is a deliberate choice about THIS script;
+# `REPO` in particular DOES have an env convention in `install.sh`/`report.sh`/`orch-loop.sh`, and
+# this comment previously claimed none existed. File/line citations are deliberately absent: an
+# earlier revision cited a sibling line that this same change had already shifted.
+REPO=""; REF=""; REL=""; QUIET=0; FETCH=1; SURFACE=0
+DEFAULT_REF="${HARNESS_REF:-origin/main}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --o)        [ $# -ge 2 ] || { echo "check-deployed-drift: --o needs a path" >&2; exit 2; }
+                O="$2"; shift 2 ;;
+    --repo)     [ $# -ge 2 ] || { echo "check-deployed-drift: --repo needs a path" >&2; exit 2; }
+                REPO="$2"; shift 2 ;;
+    --ref)      [ $# -ge 2 ] || { echo "check-deployed-drift: --ref needs a git ref" >&2; exit 2; }
+                REF="$2"; shift 2 ;;
+    --rel)      [ $# -ge 2 ] || { echo "check-deployed-drift: --rel needs a path" >&2; exit 2; }
+                REL="$2"; shift 2 ;;
+    --no-fetch) FETCH=0; shift ;;
+    --surface)  SURFACE=1; shift ;;
+    --quiet)    QUIET=1; shift ;;
+    -h|--help)  awk 'NR>=2 && /^set -u$/{exit} NR>=2{print}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)          echo "check-deployed-drift: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ⛔ `${O:-}` (not `$O`): `$O` may be unset, and this script is `set -u`, so a bare `$O` here would
+# abort with "O: unbound variable" instead of falling back to the default deploy dir.
+O="${O:-$HOME/orchestrator}"
+# ⛔ A TRAILING SLASH IS THE SAME DIRECTORY (and tab completion adds one): one spelling, not two.
+while [ "${#O}" -gt 1 ] && [ "${O%/}" != "$O" ]; do O="${O%/}"; done
+[ -n "$REF" ] || REF="$DEFAULT_REF"
+
+note() { [ "$QUIET" -eq 1 ] || echo "$@"; }
+bad()  { echo "$@" >&2; }
+unknown() {
+  bad "UNKNOWN: $*"
+  bad "  cannot verify the deployed harness — this is NOT a pass (agent-infra#1745)."
+  exit 2
+}
+problems=0
+broken=0
+# WHICH QUESTION failed, kept separately: conflating them is the defect this split exists to remove
+# (see the two-question note above the record resolution).
+Q_IDENT=0; Q_RECORD=0; Q_BYTES=0
+drift() { bad "DRIFT: $*"; problems=$((problems + 1)); }
+# ⛔ A LABELLED DRIFT IS STILL A DRIFT: it must reach `problems` (the exit code) — only its PREFIX
+# differs, so a reader can tell which of the two questions failed. Every labelled drift goes through
+# this one function; printing the line and counting it are never two statements at two call sites.
+drift_q() { # drift_q <identity|record|checkout> <message>
+  bad "DRIFT($1): $2"; problems=$((problems + 1));
+}
+# ⛔ `brk` AND `drift` ARE DIFFERENT VERDICTS, and conflating them is how a fail-closed rule decays.
+# DRIFT (exit 1) means "we compared it and it differs". BROKEN (exit 2) means "we could NOT read it,
+# so we have no answer" — an unreadable file or an unenterable directory. Exit 1 for an unreadable
+# path would report a measurable fact about a path nobody measured, so an unreadable candidate is
+# recorded as BROKEN and the run ends 2 (#2231).
+brk() { bad "UNKNOWN: $*"; broken=1; problems=$((problems + 1)); }
+
+command -v git >/dev/null 2>&1 || unknown "git is required"
+# ⛔ `-e`/`-d` CANNOT TELL "ABSENT" FROM "I AM NOT ALLOWED TO LOOK", and both answered "absent" here —
+# so an EXISTING directory behind an unsearchable ancestor (a `chmod 600` parent, measured: one and two
+# levels up) was reported as "no deployed harness", never compared, and the run printed OK over a copy
+# carrying a local edit. The walk below names the deepest EXISTING ancestor: if it is searchable the
+# child is provably absent, if it is not the child is UNEXAMINABLE — a third answer, and the only one
+# that may not be read as "nothing to report".
+#   hu_dir_state <path> -> dir | absent | unexaminable
+#   hu_path_state <path> -> path | absent | unexaminable   (existence, kind-agnostic)
+hu_path_state() {
+  local p="$1" q
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  if [ -L "$p" ] && [ ! -e "$p" ]; then printf 'unexaminable'; return 0; fi
+  if [ -e "$p" ]; then printf 'path'; return 0; fi
+  q="$(dirname "$p")"
+  while [ "$q" != "/" ] && [ "$q" != "." ] && [ -n "$q" ]; do
+    if [ -L "$q" ] && [ ! -e "$q" ]; then printf 'unexaminable'; return 0; fi
+    if [ -e "$q" ]; then
+      if [ -x "$q" ]; then printf 'absent'; else printf 'unexaminable'; fi
+      return 0
+    fi
+    q="$(dirname "$q")"
+  done
+  printf 'absent'
+}
+hu_dir_state() {
+  local p="$1" q
+  # ⛔ ONE TRAILING SLASH CHANGES THE ANSWER. `-L /x/link` is true and `-L /x/link/` is FALSE (a trailing
+  # slash forces directory resolution), so the link rule below missed `O=~/orchestrator/` — a spelling tab
+  # completion produces — and the run printed a clean pass over a path it never examined (round 6).
+  # Normalise the path ONCE, here, so every caller gets the same answer for the same directory.
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  # ⛔ A SYMLINK FAILS `-e` FOR THREE DIFFERENT REASONS — a dangling target (ENOENT), a loop (ELOOP),
+  # and a target this user may not stat (EACCES) — and only the first is "absent". Resolving them all to
+  # absent let a box NAMING a harness through a link into a home it cannot traverse be dropped, and the
+  # run printed OK over it (measured: `~/orchestrator -> /Volumes/…` with the volume gone). The link
+  # spelling is itself a claim about which tree this box reads, so an unexaminable link is BROKEN.
+  if [ -L "$p" ] && [ ! -e "$p" ]; then printf 'unexaminable'; return 0; fi
+  if [ -e "$p" ]; then if [ -d "$p" ]; then printf 'dir'; else printf 'absent'; fi; return 0; fi
+  q="$(dirname "$p")"
+  while [ "$q" != "/" ] && [ "$q" != "." ] && [ -n "$q" ]; do
+    # ⛔ THE SAME LINK RULE AT EVERY DEPTH. `[ -e ]` on a component that is an unresolvable symlink
+    # (ELOOP, a dangling target, a gone mount) is false, so the walk stepped over it and a HIGHER
+    # ancestor answered "absent" — exit 2 for the same spelling at depth 0 and exit 0 one level down
+    # (measured, round 5). A walk that cannot resolve a component has not established absence.
+    if [ -L "$q" ] && [ ! -e "$q" ]; then printf 'unexaminable'; return 0; fi
+    if [ -e "$q" ]; then
+      if [ -x "$q" ]; then printf 'absent'; else printf 'unexaminable'; fi
+      return 0
+    fi
+    q="$(dirname "$q")"
+  done
+  printf 'absent'
+}
+# ⛔ TWO VERDICTS, ONE EXIT CODE (#2231). `--surface` asks a question that does not need $O, so a box
+# with no deployed copy must be able to answer it. Without the flag the old contract is untouched:
+# no $O means there is nothing to compare, and that has always been UNKNOWN (never a pass).
+O_ABSENT=0
+case "$(hu_dir_state "$O")" in
+  dir) ;;
+  absent)
+    if [ "$SURFACE" -eq 0 ]; then unknown "no deployed harness at $O"; fi
+    O_ABSENT=1
+    note "identity: SKIPPED — no deployed harness at $O (the surface pass below still answers what applies)" ;;
+  *) # UNEXAMINABLE: it may be a full harness dir. Skipping it is the false green, so it is BROKEN —
+     # and the surface pass still runs, because the candidates that ARE examinable have answers.
+     brk "the deployed harness path $O cannot be examined (it or an ancestor is not searchable) — cannot verify it (never a pass)"
+     O_ABSENT=1 ;;
+esac
+STAMP="$O/.agent-infra-stamp.json"
+# ── THE TWO QUESTIONS, AND THE TWO RECORDS ────────────────────────────────────────────────────
+# This script answers two DIFFERENT things and must never print one as the other:
+#
+#   (a) IS $O THE TREE IT CLAIMS?        the bytes in $O against the RECORD's own manifest
+#                                        (`$O/.harness-provenance`, written by the deploy path).
+#                                        A mismatch here is an EDIT IN $O — the shape that silently
+#                                        reverted a live fix on 2026-10-28 and left the box running
+#                                        unpatched code while a production fix looked broken.
+#   (b) IS $O IDENTICAL TO THE CHECKOUT   every shipped blob at $REF against $O. A box deliberately
+#       RIGHT NOW?                       behind a KNOWN commit is (a)-clean and (b)-behind — a known
+#                                        state, not a defect. A box with uncommitted edits is
+#                                        (a)-DIRTY. Both used to print the same word, `diverged`
+#                                        (measured 2026-10-29: `harness=diverged:5712e52776c8` on a
+#                                        box whose diagnosis was then made against code it was not
+#                                        running).
+#
+# `$O/.harness-provenance` is preferred when present; `.agent-infra-stamp.json` (install.sh's) is the
+# fallback, so every box that was attributable before this record existed still is. A record that is
+# MISSING or UNREADABLE is exit 2 (UNKNOWN) on either path — never a pass.
+PROV="$O/.harness-provenance"
+RECORD=""; RECORD_KIND=""
+# ⛔ WITH `--surface`, A MISSING/UNREADABLE RECORD IS NOT A REASON TO SKIP THE SURFACE PASS — it is the
+# REASON IT EXISTS. The boxes this half was written for (a hand-placed copy, a farmed cell, a laptop on
+# an operator-synced `$O`) are exactly the boxes whose record is absent, so exiting 2 on the record would
+# answer nothing on the only population that needs the answer. The record-based halves then report
+# `SKIPPED` — never OK — and the surface pass answers for itself, with its own BROKEN arms intact.
+# WITHOUT the flag the old contract is untouched: an absent or unreadable record is still UNKNOWN.
+if [ "$SURFACE" -eq 1 ] && [ "$O_ABSENT" -eq 0 ]; then
+  if [ -f "$PROV" ] && [ -r "$PROV" ]; then
+    RECORD="$PROV"; RECORD_KIND=prov
+  elif [ -f "$STAMP" ] && [ -r "$STAMP" ]; then
+    RECORD="$STAMP"; RECORD_KIND=stamp
+    # ⛔ SAY SO. A record that exists and cannot be used is exactly what an operator needs to hear when the
+    # run falls back past it — silence here would read as "the preferred record was never written".
+    if [ -e "$PROV" ]; then
+      note "identity: the provenance record at $PROV exists but is not a readable regular file — falling back to the install.sh stamp at $STAMP for the record-based halves (the surface pass is unaffected)"
+    fi
+  else
+    O_ABSENT=1
+    note "identity: SKIPPED — no harness record at $PROV and none at $STAMP, readable or otherwise (the deploy path writes the first, install.sh the second); the surface pass below still answers what this box carries"
+  fi
+fi
+# ⛔ ONLY WHEN `--surface` DID NOT ALREADY RESOLVE ONE. This block used to run UNCONDITIONALLY, so an
+# unreadable `.harness-provenance` exited 2 here even in the one mode whose comment above promises that
+# "a missing/unreadable record is NOT a reason to skip the surface pass" — the fallback the block above had
+# just selected was discarded, and the surface pass never ran on the exact population it exists for.
+# WITHOUT `--surface` the old contract is untouched, because `$RECORD_KIND` is still empty here.
+# ⛔ Polarities kept: no flag + unreadable prov → UNKNOWN (unchanged); `--surface` + NOTHING usable → UNKNOWN
+# for the record halves and the surface pass still answers (unchanged).
+if [ "$O_ABSENT" -eq 0 ] && [ -z "$RECORD_KIND" ]; then
+# ⛔ AN UNREADABLE RECORD IS NOT AN ABSENT ONE, and both are UNKNOWN: `-f` alone cannot tell them
+# apart, and reading an unreadable record as "no record" is the same fail-open one line over.
+if [ -e "$PROV" ]; then
+  [ -r "$PROV" ] || unknown "the provenance record at $PROV exists but is NOT READABLE — cannot say which bytes it describes (and unknown is never a pass)"
+  RECORD="$PROV"; RECORD_KIND=prov
+elif [ -e "$STAMP" ]; then
+  [ -r "$STAMP" ] || unknown "the harness record at $STAMP exists but is NOT READABLE"
+  RECORD="$STAMP"; RECORD_KIND=stamp
+else
+  unknown "no harness record at $PROV (written by the deploy path: deploy-harness.sh / deploy-mac-orchestrator.sh) and none at $STAMP (written by install.sh) — without one 'which commit is this box running?' has no answer, and that is the measured #1745 laptop state"
+fi
+fi
+
+# One field out of a cell-shaped stamp, anchored on the quoted KEY so `commit` cannot match
+# `refCommit` (there is no quote before the `c` inside it). Same reader as cloud-cell-supervisor.sh.
+stamp_field() {
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$STAMP" | head -1
+}
+# The same, for an UNQUOTED JSON value (a boolean or null). `stamp_field` returns '' for a bare
+# `true`, which would read as "field absent".
+stamp_field_raw() {
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p" "$STAMP" | tr -d ' "' | head -1
+}
+# The provenance record is plain `key=value` + `<sha256>  <relpath>` lines (harness-provenance.sh
+# writes it; THIS reader is the second implementation of that format — change both together).
+# Anchored at the start of the line so `commit` cannot match `refCommit`.
+prov_field() {
+  sed -n "s/^$1=//p" "$PROV" 2>/dev/null | head -1
+}
+rec_field() { # rec_field <key> — from WHICHEVER record this run resolved
+  if [ "$RECORD_KIND" = prov ]; then prov_field "$1"; else stamp_field "$1"; fi
+}
+
+# ── 1. IDENTITY — the record must be complete before any comparison is meaningful ────────────────
+COMMIT=""; PAYLOAD=""; DIRTY=""; NMAN=0
+if [ "$O_ABSENT" -eq 0 ]; then
+COMMIT="$(rec_field commit)"
+case "$COMMIT" in
+  ''|UNKNOWN) unknown "the record at $RECORD names no harness commit (commit='${COMMIT:-<absent>}') — a hand-placed copy with no identity is the exact case #1790 measured on the cells" ;;
+esac
+case "$RECORD_KIND" in
+  prov)
+    # ⛔ THE MANIFEST IS THE RECORD'S OWN CLAIM ABOUT $O, so a record that has a file COUNT but no
+    # parseable entries cannot answer question (a) — that is UNKNOWN, never "no entries, so clean".
+    NMAN="$(sed -n '/^[0-9a-f]\{64\}  /p' "$PROV" 2>/dev/null | wc -l | tr -d ' ')"
+    case "$NMAN" in ''|*[!0-9]*) unknown "cannot count the manifest entries in $PROV" ;; esac
+    NF="$(prov_field files)"
+    # ⛔ `prov_field` TAKES THE KEY ONLY (it reads `$PROV`); passing the path first made the pattern
+    # `s/^<path>=//p`, which matched nothing — the arm was DEAD and a record from a dirty checkout read
+    # as a clean identity, masking the one signal the legacy stamp had carried.
+    _pd="$(prov_field sourceDirty)"
+    case "$_pd" in
+      true|false) ;;
+      *) unknown "the provenance record at $PROV does not say whether its source was clean (sourceDirty='${_pd:-<absent>}') — a record that cannot say this cannot answer whether its commit describes its payload" ;;
+    esac
+    DIRTY="$_pd"
+    case "$NF" in ''|*[!0-9]*) unknown "the provenance record at $PROV carries no usable file count (files='${NF:-<absent>}') — it cannot describe its own manifest" ;; esac
+    [ "$NF" = "$NMAN" ] || unknown "the provenance record at $PROV claims $NF file(s) but carries $NMAN manifest entr(ies) — the record does not describe itself, so nothing can be verified against it"
+    [ "$NMAN" -gt 0 ] || unknown "the provenance record at $PROV carries an EMPTY manifest — it cannot say which bytes were deployed"
+    ;;
+  stamp)
+    PAYLOAD="$(stamp_field payloadSha256)"
+    case "$PAYLOAD" in
+      ''|UNKNOWN) unknown "the record at $STAMP carries no payload hash — it cannot say which bytes were installed" ;;
+    esac
+    DIRTY="$(stamp_field_raw agentInfraDirty)"
+    case "$DIRTY" in
+      false|true) ;;
+      *) unknown "the record at $STAMP does not say whether its source was clean (agentInfraDirty='${DIRTY:-<absent>}') — a record that cannot say this cannot answer whether its commit describes its payload" ;;
+    esac
+    ;;
+esac
+fi
+
+# ── resolve the repo to compare against, and its harness subpath ─────────────────────────────────
+if [ -z "$REPO" ]; then
+  for cand in "${HARNESS_REPO:-}" "$(git -C "$HERE" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"; do
+    [ -n "$cand" ] && [ -d "$cand" ] && { REPO="$cand"; break; }
+  done
+fi
+[ -n "$REPO" ] && [ -d "$REPO" ] || unknown "no agent-infra checkout resolved — pass --repo <path> or set HARNESS_REPO"
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || unknown "$REPO is not a git checkout"
+if [ -z "$REL" ]; then
+  REL="$(git -C "$HERE" rev-parse --show-prefix 2>/dev/null || true)"; REL="${REL%/}"
+  [ -n "$REL" ] || REL="scripts/orchestrator-harness"
+fi
+
+if [ "$FETCH" -eq 1 ]; then
+  case "$REF" in
+    origin/*)
+      if git -C "$REPO" fetch --quiet origin "${REF#origin/}" 2>/dev/null; then :
+      else bad "check-deployed-drift: WARNING — could not fetch $REF; comparing the LOCAL ref, which may be stale"; fi ;;
+  esac
+fi
+TIP="$(git -C "$REPO" rev-parse --verify --quiet "$REF^{commit}" 2>/dev/null || true)"
+[ -n "$TIP" ] || unknown "cannot resolve '$REF' in $REPO"
+TIP_SHORT="$(git -C "$REPO" rev-parse --short "$TIP" 2>/dev/null || echo "${TIP:0:12}")"
+# ⛔ `--verify --quiet` is load-bearing: a bare `git rev-parse <unknown>` ECHOES its argument to
+# stdout while exiting non-zero, so a plain capture would read an unresolvable commit as resolved.
+HAS=""
+if [ "$O_ABSENT" -eq 0 ]; then
+# ⛔ `--verify --quiet` is load-bearing: a bare `git rev-parse <unknown>` ECHOES its argument to
+# stdout while exiting non-zero, so a plain capture would read an unresolvable commit as resolved.
+HAS="$(git -C "$REPO" rev-parse --verify --quiet "$COMMIT^{commit}" 2>/dev/null || true)"
+[ -n "$HAS" ] || unknown "the recorded commit '$COMMIT' is not an object in $REPO ($REF tip $TIP_SHORT) — cannot verify which commit the box runs"
+
+# ── 2. RELATION (question (a), part 1) — recomputed live from the RECORDED commit ────────────────
+# ⛔ NEVER a commit count: measured 2026-10-14 on the cells, `rev-list --count e8d5ce29..origin/main`
+# printed 1 while `--is-ancestor` printed NO — a tree off main's line read as "1 behind" to a counter.
+RELATION="unknown"
+# (the `$O_ABSENT` guard around the HAS read above is still open here — the closing `fi` below
+# closes it, so this block must not open a second one.)
+if [ "$HAS" = "$TIP" ]; then
+  RELATION=current
+  if [ "$DIRTY" = true ]; then
+    # The commit NAME is current; the bytes are not that commit's. Saying "identity: ok" here and the
+    # DIRTY line 200 lines later made the report contradict itself.
+    note "identity: commit ${HAS:0:12} == $REF ($TIP_SHORT), but its SOURCE WAS DIRTY — see the DRIFT(identity) line below"
+  else
+    note "identity: ok — recorded commit ${HAS:0:12} == $REF ($TIP_SHORT)"
+  fi
+elif git -C "$REPO" merge-base --is-ancestor "$HAS" "$TIP" 2>/dev/null; then
+  RELATION=behind; Q_IDENT=1
+  drift_q identity "the deployed harness is recorded from ${HAS:0:12}, which is BEHIND $REF ($TIP_SHORT) — on the line, but not this repo's harness"
+else
+  RELATION=diverged; Q_IDENT=1
+  drift_q identity "the deployed harness is recorded from ${HAS:0:12}, which is NOT an ancestor of $REF ($TIP_SHORT) — the measured #1745 divergence (this box runs code main does not carry)"
+fi
+fi
+
+# ── shared: the digest tools, the temp area, and every `*.sh` the repo ships at the ref ──────────
+PROV_SHA="sha256sum"
+command -v sha256sum >/dev/null 2>&1 || PROV_SHA="shasum -a 256"
+# sha256 over the `*.sh` in $O, folded exactly as install.sh's prov_payload_hash and the cell's
+# o_payload_hash do. ⛔ A non-zero return is CANNOT-VERIFY at the call site: an UNREADABLE `*.sh`
+# must not hash a PARTIAL file set and read as a post-install hand edit. An EMPTY $O is a different
+# case — it hashes to the empty-input digest and then fails the blob comparison as MISSING files,
+# which is the truthful DRIFT verdict (we CAN verify: the repo ships scripts, $O has none).
+o_payload_hash() {
+  [ -d "$O" ] || return 1
+  local out rc
+  # ⛔ `set -o pipefail` IS LOAD-BEARING HERE. This script is `set -u` only, so without it the
+  # pipeline's status is `awk`'s (0) and an inner `exit 3` is invisible — the caller would read a
+  # PARTIAL digest (or the empty-input digest) and call it a post-install edit. Measured: a
+  # chmod-000 $O/claims.sh produced `live e3b0c442…` and a false DRIFT. Scoped to this substitution
+  # so the `sed | head` readers elsewhere keep their pipefail-off semantics.
+  out="$( set -o pipefail
+    (
+      cd "$O" || exit 3
+      for f in *.sh; do [ -f "$f" ] || continue; $PROV_SHA "$f" || exit 3; done
+    ) | $PROV_SHA | awk '{print $1}' )"
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+# The digest of ONE file, or a non-zero status with no output. The caller MUST read the status: an
+# unreadable file that hashes to "" would compare against nothing and be called fine.
+sha256_of() { # sha256_of <path>
+  local out
+  out="$( $PROV_SHA "$1" 2>/dev/null )" || return 1
+  out="${out%% *}"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+TMPD="$(mktemp -d 2>/dev/null || true)"
+# ⛔ A FAILED mktemp MUST NOT SILENTLY SKIP THE BYTE COMPARISON. The script is `set -u` (no `set -e`),
+# so an empty TMPD made every redirect below fail, the `|| true`s swallowed it, both `while` loops
+# read a nonexistent file (zero iterations), `problems` stayed 0 and the script printed OK and
+# exited 0 — a false PASS on the one check #1745 exists to make fail-closed (measured: an
+# unwritable TMPDIR blessed a deployment with a MISSING script).
+[ -n "$TMPD" ] || unknown "could not create a temp directory (TMPDIR unset, full or read-only) — the byte comparison cannot run"
+trap 'rm -rf "$TMPD"' EXIT
+: > "$TMPD/edit-names"
+# Files the record names and $O does NOT have. A SEPARATE list, because it is a separate defect: no
+# bytes at $O differ from the record — the file is GONE. The writer's `check` already draws this line
+# ("a redeploy CREATES it … not a refusal"); two readers of one format must not tell an operator two
+# different stories about one truth state.
+: > "$TMPD/missing-names"
+MISSING_N=0
+: > "$TMPD/unrec-names"
+UNREC_N=0
+git -C "$REPO" ls-tree -r --name-only "$TIP" -- "$REL" 2>/dev/null | grep -E "^${REL}/[^/]+\.sh\$" > "$TMPD/repo-sh" || unknown "cannot read the harness tree at $TIP"
+
+# ── 3. QUESTION (a) — does $O still hold the bytes its OWN RECORD says were deployed? ────────────
+# THE SHAPE THAT SILENTLY ATE A FIX (2026-10-28): a hand patch to `$O/merge-one.sh` was overwritten by
+# a redeploy, the file's mtime moved twice, and NOTHING reported that $O had been carrying bytes no
+# record described. The manifest in `$O/.harness-provenance` is exactly what "the bytes the deploy
+# wrote" means, so a file that no longer matches it is a HAND EDIT — and it is NAMED, with which side
+# is newer, because "1 file differs" is not something an operator can act on at 3 a.m.
+# ⛔ WITH ONLY A STAMP there is no manifest, so the aggregate payload hash is the best available
+# answer: the run still FAILS, and it SAYS it cannot name the file (an unnameable alarm is weak, but
+# silence is what lost the fix).
+if [ "$O_ABSENT" -eq 0 ]; then
+case "$RECORD_KIND" in
+  prov)
+    while IFS= read -r line; do
+      case "$line" in ''|'#'*) continue ;; esac
+      # ⛔ THE DISCRIMINATOR IS THE FORMAT'S FIRST FIELD (`<64 hex>  <path>`), NOT "the line contains two
+      # spaces". A header VALUE can contain a two-space run — the deploy writes `source=<checkout path>`
+      # — and a checkout named with two consecutive spaces was then read as a manifest entry here: this
+      # reader fabricated a MISSING file from a path that never existed and emitted
+      # `harness=incomplete:<a path that never was>`. (The writer's own `check` refused the same record
+      # with "cannot parse", so the two readers disagreed about one record: both were wrong.)
+      H_REC="${line%%  *}"
+      case "$H_REC" in ''|*[!0-9a-f]*) continue ;; esac
+      [ "${#H_REC}" -eq 64 ] || continue
+      # ⛔ THE SEPARATOR IS ITS OWN TEST: `${line%%  *}` and `${line#*  }` both return the WHOLE line when the
+      # two-space run is absent, so a pathless `<64 hex>` line set `rel` to the DIGEST and this reader
+      # printed `MISSING <the hash>` — a file it fabricated from a field it could not actually parse.
+      # A record with a line this reader cannot read is CANNOT-VERIFY, never a drift named after a hash.
+      case "$line" in
+        *'  '*) ;;
+        *) unknown "the provenance record at $PROV has a manifest line with no path: '$line' — this reader cannot say which file it describes, and unknown is never a pass" ;;
+      esac
+      rel="${line#*  }"
+      [ -n "$rel" ] || unknown "the provenance record at $PROV has a manifest line with an EMPTY path: '$line' — this reader cannot say which file it describes"
+      if [ ! -f "$O/$rel" ]; then
+        # ⛔ NOT `Q_RECORD`. Nothing at $O differs from the record — there is nothing there. Reading
+        # this as "an UNCOMMITTED EDIT … RECOVER the edit before redeploying: a deploy OVERWRITES it"
+        # sends an operator to recover a patch that does not exist. It is still a defect of the
+        # deployed tree, so the run still fails.
+        MISSING_N=$((MISSING_N + 1))
+        drift "MISSING $rel — the record says the deploy wrote it, and it is not there now (deleted or moved since). A redeploy CREATES it"
+        printf '%s\n' "$rel" >> "$TMPD/missing-names"
+        continue
+      fi
+      H_LIVE="$(sha256_of "$O/$rel")" || unknown "cannot read $O/$rel (unreadable?) — the record names it and it cannot be hashed, so it is UNVERIFIED (never a pass)"
+      if [ "$H_LIVE" != "$H_REC" ]; then
+        # ⛔ THE STATE THE DESIGN DELIBERATELY CREATES. `deploy-mac-orchestrator.sh` with `PHASE=A` writes
+        # `$O` and, by design, writes NO record. So a routine phase-A deploy leaves bytes newer than the
+        # record without anyone editing anything — and this reader called that "an UNCOMMITTED EDIT …
+        # RECOVER the edit before redeploying: a deploy OVERWRITES it", which is a remedy for a patch that
+        # does not exist. The checkout answers it EXACTLY: bytes equal to the REF's blob are a deploy the
+        # record has not caught up with.
+        # ⛔ THE TWO HASHES MUST BE THE SAME KIND. The manifest stores a SHA256 and `git rev-parse` answers
+        # a blob SHA1, so comparing them directly is never equal and this arm would be dead code. Take
+        # the ref's bytes and hash them the way the manifest was hashed.
+        if git -C "$REPO" show "$TIP:$REL/$rel" > "$TMPD/want-blob" 2>/dev/null; then
+          WANT_SHA="$(sha256_of "$TMPD/want-blob" 2>/dev/null || true)"
+        else
+          WANT_SHA=""
+        fi
+        if [ -n "$WANT_SHA" ] && [ "$WANT_SHA" = "$H_LIVE" ]; then
+          UNREC_N=$((UNREC_N + 1))
+          drift "STALE-RECORD $rel — $O already holds $REF's bytes for this file; the record predates them (an unrecorded or partial deploy, not a hand edit)"
+          printf '%s\n' "$rel" >> "$TMPD/unrec-names"
+          continue
+        fi
+        Q_RECORD=1
+        # ⛔ THREE ANSWERS, NOT TWO: on a one-second-resolution filesystem an edit and its record land
+        # in the SAME second, where `-nt` is false — reading that as "older" invents which side moved.
+        if [ "$O/$rel" -nt "$PROV" ]; then SIDE="edited AFTER the record (its mtime is newer than the record's)"
+        elif [ "$O/$rel" -ot "$PROV" ]; then SIDE="OLDER than the record — the record was written after this file's last change"
+        else SIDE="same timestamp as the record (this filesystem cannot order the two)"; fi
+        drift_q record "$rel — UNCOMMITTED EDIT in \$O: the deployed copy differs from what the record says was deployed (recorded ${H_REC:0:12}, live ${H_LIVE:0:12}); $SIDE"
+        printf '%s\n' "$rel" >> "$TMPD/edit-names"
+      fi
+    done < "$PROV"
+    ;;
+  stamp)
+    LIVE="$(o_payload_hash)" || unknown "could not hash the deployed copy at $O (an unreadable *.sh, or $O is not a directory) — cannot verify"
+    [ -n "$LIVE" ] || unknown "could not hash the deployed copy at $O"
+    if [ "$PAYLOAD" != "$LIVE" ]; then
+      Q_RECORD=1
+      # ⛔ NO `write --o $O --src <checkout>` REMEDY HERE. That command used to be printed on this exact
+      # line, and on this exact population it MINTS A FALSE RECORD: `write` hashes what `$O` HOLDS, so run
+      # on the hand-edited box this line is reporting, it succeeded and recorded the hand-patched bytes
+      # under the checkout's commit — after which every later `check` read the edit as "deployed" (the
+      # alarm silenced) and the next deploy overwrote the patch believing it was its own bytes. Measured:
+      # exit 0, then `check --src` said clean while `cmp` said the two sides differ. `write` now refuses
+      # that (it compares against the source), but a remedy must not depend on a refusal to be safe: the
+      # record is written BY A DEPLOY, so the deploy is what is named.
+      drift_q record "the deployed copy at $O changed after it was recorded (recorded ${PAYLOAD:0:12} vs live ${LIVE:0:12}) — a post-install hand edit; this legacy record carries no per-file manifest, so the FILE cannot be named. Recover or land the change, then redeploy: the deploy is what writes a per-file record"
+    fi
+    ;;
+esac
+# The source's own cleanliness is an IDENTITY claim, not a payload one: a record whose source was
+# dirty names a commit that does not describe these bytes. (The stamp calls it `agentInfraDirty`, the
+# per-file record `sourceDirty`; either one means the same thing.)
+# ⛔ BOTH RECORD KINDS CARRY THIS, and it used to be consulted only on the stamp path — so the better
+# record MASKED the only dirtiness signal the codebase had: a deploy staged from a checkout with
+# uncommitted changes recorded `commit=<HEAD>` for bytes HEAD does not contain. (`DIRTY` is resolved
+# where the record is resolved, above.)
+if [ "$DIRTY" = true ]; then
+  Q_IDENT=1
+  drift_q identity "the record's source was DIRTY (agentInfraDirty/sourceDirty=true): ${HAS:0:12} does not describe the deployed bytes — they came from a checkout with uncommitted changes"
+fi
+fi
+
+# ── 4. QUESTION (b) — is $O byte-identical to the CHECKOUT right now? ────────────────────────────
+# This is the half that answers "behind" vs "diverged" vs "the box is fine". A file already named by
+# question (a) is SKIPPED here: one defect, one line — the (a) line is the more precise diagnosis (it
+# knows which side changed), and repeating it as a byte difference inflates the count a reader uses to
+# judge whether the box is one bad file or many.
+if [ "$O_ABSENT" -eq 0 ]; then
+( cd "$O" && ls -1 *.sh 2>/dev/null || true ) > "$TMPD/deployed-sh" || unknown "cannot list the deployed copy at $O"
+
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  d="${f#"$REL"/}"
+  if grep -qxF -- "$d" "$TMPD/edit-names" 2>/dev/null; then continue; fi
+  if grep -qxF -- "$d" "$TMPD/missing-names" 2>/dev/null; then continue; fi
+  if grep -qxF -- "$d" "$TMPD/unrec-names" 2>/dev/null; then continue; fi
+  if [ ! -f "$O/$d" ]; then
+    Q_BYTES=1
+    drift_q checkout "$d — shipped by the repo at $REF but MISSING from $O"
+    continue
+  fi
+  have="$(git hash-object -- "$O/$d" 2>/dev/null || true)"
+  want="$(git -C "$REPO" rev-parse --verify --quiet "$TIP:$f" 2>/dev/null || true)"
+  [ -n "$want" ] || unknown "cannot read $f at $TIP — cannot verify the deployed $d"
+  [ -n "$have" ] || unknown "cannot read $O/$d (unreadable?) — cannot verify it"
+  if [ "$have" != "$want" ]; then
+    Q_BYTES=1
+    # ⛔ WHICH SIDE IS NEWER is part of the answer, not decoration: "the deployed side is newer" is a
+    # hand edit or a live-only patch; "the checkout is newer" is a box that has not been redeployed.
+    if [ "$REPO/$f" -nt "$O/$d" ]; then SIDE="the CHECKOUT is newer than the deployed side (this box has not been redeployed)"
+    elif [ "$O/$d" -nt "$REPO/$f" ]; then SIDE="the DEPLOYED side is newer than the checkout"
+    else SIDE="the two sides share a timestamp (this filesystem cannot order them)"; fi
+    drift_q checkout "$d — the deployed copy DIFFERS from the repo at $REF ($want); $SIDE"
+  fi
+done < "$TMPD/repo-sh"
+
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
+  if grep -qxF -- "$d" "$TMPD/edit-names" 2>/dev/null; then continue; fi
+  if grep -qxF -- "$d" "$TMPD/missing-names" 2>/dev/null; then continue; fi
+  if grep -qxF -- "$d" "$TMPD/unrec-names" 2>/dev/null; then continue; fi
+  if ! grep -qxF "$REL/$d" "$TMPD/repo-sh"; then
+    Q_BYTES=1
+    drift_q checkout "$d — present in $O but NOT shipped by the repo at $REF (a hand-placed or retired script)"
+  fi
+done < "$TMPD/deployed-sh"
+fi
+
+# ── 4. SURFACE (--surface): every harness dir this BOX carries, not just $O (#2231) ──────────────
+# Read-only. Each candidate directory is compared file-by-file against `$TIP:$REL`, so the answer is
+# "what does THIS box carry that main does not, or carry differently" — per directory, named.
+# The surface arm reports through the same `drift`/`brk` counters, so a hit there bumps `problems`
+# without touching any of the four per-question flags. Snapshotting the counter here is how the
+# summary can tell "this $O is fine, ANOTHER dir on the box differs" from a byte difference in $O —
+# and without it a surface-only hit on a CURRENT box was labelled `harness=payload-differs`, whose
+# documented remedy (redeploy this $O) cannot clear it.
+SURF_BASE="$problems"
+# How many live controller processes execute a tree this box no longer has (#10114). Kept apart from
+# the surface counters because "a copy at rest differs" and "the tree that is RUNNING is gone" are
+# different facts with different remedies, and only the second one cannot be cleared by redeploying.
+EXEC_N=0; EXEC_FIRST=""
+if [ "$SURFACE" -eq 1 ]; then
+  : > "$TMPD/cand-raw"; : > "$TMPD/running-raw"
+  # The RUNNING controller's own directory, from the process table: `<interp> <path>/orch-loop.sh`.
+  # ⛔ `ps`, never `pgrep -f` (a bare pattern matches any shell whose TEXT mentions the script) and
+  # never `pgrep -c` (BSD pgrep has none). A read failure is reported, not read as "no controller".
+  # `DRIFT_PS` is a seam (the same one `lib/fleet-inventory.sh` carries as `FLEET_PS`): a test cannot
+  # make a box's live controller disappear, so a suite that asserts on "which dirs are compared" must
+  # be able to supply the table — otherwise the assertion is a statement about the developer's box.
+  # ⛔ THE EXIT STATUS DECIDES, NOT THE OUTPUT. An EMPTY table is a legitimate answer (a box running no
+  # controller right now); a FAILED read is no answer at all. Conflating the two either blesses an
+  # unverified box (the warning this replaces) or reds every idle box (emptiness read as failure).
+  _ps_failed=0
+  if ! _ps="$(${DRIFT_PS:-ps} -eo pid=,command= 2>/dev/null)"; then
+      # ⛔ NOT A WARNING. A warning leaves `problems`/`broken` untouched, so the run would print OK and
+      # exit 0 having never compared THE ONE DIRECTORY THAT IS ACTUALLY EXECUTING — a false green over
+      # the exact population `--surface` exists to check. Cannot-verify is BROKEN (exit 2).
+      brk "the process table could not be read, so the directory the RUNNING controller executes is not in this pass"
+      _ps=""; _ps_failed=1
+  fi
+  # ⛔ ONE PROCESS IS WRITTEN PER LINE AS `<pid><TAB><path>`, TO A FILE, and consumed in the PARENT
+  # shell below. The `| while read` form this replaces ran in a SUBSHELL, so a `drift`/`brk` raised
+  # inside it incremented a copy of the counters and vanished on return (#10114).
+  : > "$TMPD/ps-harness"
+  : > "$TMPD/running-real"
+  # ⛔ "no controller was found" IS AN ANSWER ONLY WHEN THE TABLE WAS READ (`_ps_failed`). Printed over a
+  # FAILED read it contradicted the BROKEN line directly above it, in one report (review of #3202).
+  [ "$_ps_failed" -eq 1 ] || [ -n "$_ps" ] || note "running: no controller was found in the process table (nothing is executing a harness on this box right now)"
+  # ── WHICH PROCESS IS EXECUTING A HARNESS (#10114): read from its OWN argv ──────────────────────
+  # ⛔ ONE PREDICATE PER FACT (#1178): this is `box-status.sh`'s argv reader (:236-277), ported rather than
+  # re-derived — with the one difference this script needs, that what box-status calls `UNREADABLE` is
+  # BROKEN here (exit 2), because this run's whole product is a verdict.
+  #   • ⛔ EVERY ELEMENT IS SCANNED, NOT A FIXED POSITION. The positional read this replaces took `t[1]` as
+  #     the interpreter and `t[2]` as the script, so `env bash <dir>/orch-loop.sh` (the `/usr/bin/env`
+  #     spelling launchd and wrapper scripts write), `bash -c <dir>/orch-loop.sh`, `sh -x …` and any path
+  #     containing a space were dropped with NO drift, NO note and NO counter — measured on this head: a
+  #     live controller on a GONE tree printed `OK: every harness dir on this box matches …`, rc 0. That is
+  #     the same false green this file exists against, narrowed to one argv spelling.
+  #   • ⛔ NUL-SEPARATED FIELDS WHERE THE KERNEL KEEPS THEM. `$PROC/<pid>/cmdline` is NUL-delimited so an
+  #     argument MAY contain a space; a whitespace split cut `~/Library/Application Support/…` into
+  #     fragments whose tail does not exist. `tr '\0' '\n'` keeps each element whole (and, unlike
+  #     `mapfile`, needs no bash 4). macOS has no `/proc`: there the flattened `ps` line is the fallback,
+  #     and a path with a space cannot be resolved — which is BROKEN below, never a guess.
+  #   • ⛔ A RELATIVE SCRIPT PATH RESOLVES AGAINST THE **CONTROLLER's** CWD, NOT OURS. Resolving it against
+  #     the CHECKER's cwd made the verdict a function of where the checker stood: the same process table
+  #     answered rc 0 from one cwd (comparing OUR tree) and a false `DOES NOT EXIST` from another.
+  #     `$PROC/<pid>/cwd` is the process's own directory; unreadable ⇒ BROKEN, never our cwd.
+  # STATED RESIDUAL, not hidden: a script path reached only through shell TEXT — `bash -c 'exec /x/orch-loop.sh'`
+  # or `bash -c 'cd /y && /x/orch-loop.sh'`, where the path is not the FIRST word of the `-c` string — is
+  # reported as a mention (`note`), not as a controller. No launcher this repo ships produces that shape
+  # (they pass the script as an argv element), and the alternative — treating any absolute-looking path in
+  # a `-c` string as the executing tree — reds the box for `bash -c 'grep -n foo /x/orch-loop.sh'`.
+  # ⛔ SECOND STATED RESIDUAL (review round 12, corrected in round 14): the predicate is "argv[0], or an
+  # interpreter reached through a command PREFIX" — an absolute path that appears with NO interpreter
+  # in front of it is a MENTION, not a controller. That is deliberate (it is what keeps
+  # `grep [-n] [sh] <abs>/orch-loop.sh` from fabricating a controller). The shape that is genuinely
+  # lost is a NON-WRAPPER word between the launcher and the interpreter — `xterm -e bash <path>`,
+  # `systemd-run -- bash <path>` — where the leading word is not in the wrapper list, so the prefix
+  # closes before a shell is ever seen. No launcher this repo ships does that.
+  # ⛔ (Round 12 named `sudo -u <user> -i bash <path>` here instead. It is CAUGHT — `-i` takes no
+  # operand and `bash` arrives with the prefix alive — so the residual named a hole that did not
+  # exist, while pointing away from the ones that did: a wrapper's OWN `-c` (`sudo -c <class>`) and a
+  # COMBINED cluster ending in a value letter (`sudo -iu <user>`). Both are closed in round 14 and
+  # pinned in `10a-3c`/`10a-3e`; a residual is only worth stating if it is the shape that is actually
+  # open.)
+  # `nice -n 5 /bin/bash <path>`, `timeout 300 bash <path>`, `sudo -u deploy bash <path>` and
+  # `sudo -iu <user> bash <path>` are measured shapes and all still count.
+  PROC="${DRIFT_PROC:-/proc}"
+  : > "$TMPD/ps-unres"
+  if [ -n "$_ps" ]; then
+    while IFS= read -r _line; do
+      [ -n "${_line//[[:space:]]/}" ] || continue
+      # `ps -eo pid=,command=` RIGHT-PADS the pid column: strip leading blanks before taking $1 (#2603).
+      _t="${_line#"${_line%%[![:space:]]*}"}"
+      _pid="${_t%%[[:space:]]*}"; _pid="${_pid//[[:space:]]/}"
+      _flat="${_t#"${_t%%[[:space:]]*}"}"; _flat="${_flat#"${_flat%%[![:space:]]*}"}"
+      [ -n "$_pid" ] || continue
+      case "$_flat" in *orch-loop.sh*) ;; *) continue ;; esac   # no mention ⇒ no question to answer here
+      _argv=()
+      if [ -r "$PROC/$_pid/cmdline" ]; then
+        while IFS= read -r _w; do [ -n "$_w" ] && _argv[${#_argv[@]}]="$_w"; done \
+          < <(tr '\0' '\n' < "$PROC/$_pid/cmdline" 2>/dev/null)
+      fi
+      if [ "${#_argv[@]}" -eq 0 ]; then read -r -a _argv <<< "$_flat"; fi   # flattened fallback (space path lost)
+      _script=""; _interp=0; _text=0; _i=0; _n=${#_argv[@]}
+      # ⛔ THREE FLAGS, NOT ONE (review round 13 — this closes TWO holes round 12 left open, both
+      # MEASURED). `_interp` only means "an interpreter was reached through the command prefix".
+      #   `_pfx`   — the command prefix is still alive (nothing has told us the command yet, or we are
+      #              inside that command's own options).
+      #   `_seen`  — the COMMAND has been identified (a shell name, or something that is not one).
+      #   `_optval`— the previous word was a bare short option that takes a VALUE (`-u <user>`, `-n 5`).
+      # ⛔ ROUND 12 GOT THIS WRONG IN TWO WAYS, both fabricating `executes:` on a healthy box:
+      #   (a) `env` was in the ARMING list. `env` is a WRAPPER, not an interpreter, so `env cat <abs>`
+      #       armed the latch with no shell word at all and nominated the path.
+      #   (b) the slot counter (`_warg += 2`) was consumed by the CHILD COMMAND and its arguments, not
+      #       just the wrapper's operands — so `timeout 300 grep -n sh <abs>`, `nice -n 5 grep -n sh
+      #       <abs>`, `sudo -u deploy grep -n sh <abs>`, `stdbuf -o0 …` and `nohup …` all armed on the
+      #       grep PATTERN `sh` and fabricated a controller. `timeout 300 grep -n sh <pin>/…/orch-loop.sh`
+      #       is literally the recon command an agent runs over the deployed tree.
+      # The model that holds is positional, not counted: skip wrapper words, their options and those
+      # options' VALUES, then the FIRST remaining word is the COMMAND. If the command is not a shell,
+      # the prefix is closed for good — nothing later can arm it.
+      _pfx=1; _seen=0; _optval=0; _wrap=""; _noexec=0; _optv=""
+      while [ "$_i" -lt "$_n" ]; do
+        _w="${_argv[$_i]}"
+        # ⛔ ARM ONLY ON A REAL INTERPRETER, IN COMMAND POSITION, AND NOT WHILE SWALLOWING AN OPTION'S
+        # VALUE (review round 14, findings 1-2). The `_optval` guard is load-bearing: without it,
+        # `sudo -n grep -n sh <abs>` armed on the grep PATTERN `sh` — the word was ABOUT to be consumed
+        # as `-n`'s value, but arming runs first and did not know that.
+        case "${_w##*/}" in
+          bash|sh|dash|zsh|ksh|ash|mksh|busybox)
+            if [ "$_pfx" -eq 1 ] && [ "$_optval" -eq 0 ]; then _interp=1; _seen=1; fi ;;
+        esac
+        case "$_w" in
+          # ⛔ AN ABSOLUTE PATH IS UNAMBIGUOUS; A BARE OR RELATIVE WORD IS NOT (review P1, #10114).
+          # `orch-loop.sh` as an argv element is produced by ROUTINE agent traffic — `grep -n x
+          # orch-loop.sh`, `vim orch-loop.sh`, `git log -- orch-loop.sh`, `python3 -c '…' orch-loop.sh` —
+          # and reading those as "this process EXECUTES orch-loop.sh" fabricates a controller, which
+          # under agent-infra#10114 is no longer cosmetic: the harness pass turns an `executes:` token
+          # into a red and `fleet-health` alarms, so a healthy box reds on a grep. Measured: an argv of
+          # `python3 -c 'time.sleep(20)' orch-loop.sh` produced
+          # `DRIFT(exec): pid … executes /tmp/nosh-dir` on a dir carrying no harness at all.
+          # So the bare/relative forms count ONLY when an interpreter precedes them (`bash ./orch-loop.sh`,
+          # `sh -x orch-loop.sh`), which is how every launcher in this repo actually spells it. A
+          # relative path with no interpreter is a MENTION and is reported as one, never as a controller.
+          # ⛔ `/*/` — ABSOLUTE ONLY. The earlier draft used `*/orch-loop.sh` for the first arm, and `*`
+          # matches `.` and `sub`, so `./orch-loop.sh` and `sub/orch-loop.sh` took THAT arm and were
+          # still read as invocations with no interpreter — the fabrication this fix exists to close,
+          # left open behind a comment that claimed it shut (review VGATE of this change).
+          /*/orch-loop.sh)
+            # ⛔ AN ABSOLUTE PATH IS UNAMBIGUOUS *AS A PATH*, NOT AS AN INVOCATION (review P1). Without
+            # this guard `grep -n x <pin>/…/orch-loop.sh` — the routine traffic named above — still set
+            # `_script` from the absolute spelling, and once #10114 makes an `executes:` token red a pass
+            # that is a healthy box reddened by a grep. Only argv[0] (a direct shebang exec) or an
+            # interpreter may nominate the script; the `-c` arm below already had exactly this rule.
+            # ⛔ A PARSE-ONLY RUN DOES NOT EXECUTE THE FILE (review round 17, P2). `bash -n <abs>`,
+            # `-D`, `-en` read the script without running it — the inverse of the fact an `executes:`
+            # token asserts — yet they nominated the path and reddened a healthy box with a durable
+            # `drift=drift:executes:…`. `bash -o noexec <abs>` was ALREADY a mention (the unused word
+            # closes the prefix), so the two spellings of one fact were graded differently. `_noexec`
+            # closes that split: the shell's own noexec option means nothing after it is executed.
+            if [ "$_noexec" -eq 0 ] && { [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; }; then _script="$_w"; else _text=1; fi ;;
+          orch-loop.sh|*/orch-loop.sh)
+            # ⛔ THE SAME RULE ON BOTH ARMS (review round 7, P1 — a REGRESSION this diff introduced).
+            # Gating only the absolute arm dropped `cd <dir> && ./orch-loop.sh`, a start shape this
+            # repo's own README names: `./orch-loop.sh` has `_i -eq 0` (a direct shebang exec) and no
+            # interpreter, so it fell to the MENTION note and a controller running a GONE tree exited
+            # rc 0 with NO `executes:` token — the silent green restored for that spelling, which the
+            # pre-change code caught. The `_i -eq 0` half is what keeps argv[0] working; the
+            # `_interp` half is what keeps `grep -n x orch-loop.sh` (the word at `_i > 0`) a mention.
+            if [ "$_noexec" -eq 0 ] && { [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; }; then _script="$_w"; else _text=1; fi ;;
+          -c|-[!-]*c)
+            # ⛔ ONLY AN INTERPRETER ALREADY IDENTIFIED OWNS A `-c` COMMAND STRING (review round 14,
+            # P2). `sudo` and `setsid` are both in the WRAPPER list and both have their own `-c`
+            # (`sudo -c <class>` on macOS, `setsid --ctty` shorthand), so this arm fired on the
+            # WRAPPER's option, consumed the real interpreter as if it were a command STRING, and
+            # closed the prefix — `sudo -c staff bash <gone>/orch-loop.sh` was ARMED on the reviewed
+            # head and became a mere mention here (reproduced). `_seen` is set by the shell-arming
+            # block above, so `bash -c` and `bash -lc` are untouched (verified still ARMED).
+            # ⛔ COMBINED SHORT OPTIONS COUNT (review round 9, P1). This arm used to match `-c` EXACTLY,
+            # so `bash -lc 'exec <path>/orch-loop.sh'` — and `-euc`, `-ic` — fell to the `-*` keep-arm,
+            # leaving `_interp=1` for the COMMAND STRING, which then matched `*/orch-loop.sh` and became
+            # a fabricated `executes:` naming `<cwd>/exec …`. `bash -lc '…'` is this repo's own operator
+            # idiom (docs/ops/fleet-harness-baseline.md, skills/cmux-cells/SKILL.md) and a live
+            # `/bin/bash -lc exec <path>/orch-loop.sh` is already recorded as a non-controller in
+            # tools/fleet/outcome_canary.test.py — so this is a measured population, not a hypothesis.
+            # ⛔ AND IT MASKS: `executes:` is FIRST in the token chain, so the fabricated token replaced
+            # a real `behind:`/`uncommitted-edit:` for the same box and went into the durable `drift=`
+            # field — a false DIAGNOSIS, not just a false red.
+            # ⛔ `bash -c <abs>/orch-loop.sh` IS the invocation; `bash -c 'echo-bash-<dir>/orch-loop.sh'` is a
+            # shell running TEXT — the self-match class the fleet inventory documents, and the arm that keeps
+            # a lane's echo from becoming a candidate dir. The FIRST word decides, and only an ABSOLUTE one
+            # counts, so a text mention can never be read as the executing tree.
+            if [ "$_seen" -ne 1 ]; then
+              # A WRAPPER's own `-c` is not a command string (review round 14, P2). `sudo -c <class>`
+              # (macOS) belongs to the wrapper, and consuming the next word as TEXT ate the real
+              # interpreter — `sudo -c staff bash <gone>/orch-loop.sh` was ARMED on the reviewed head
+              # and became a mention (reproduced). The operand is claimed by the OPTION TABLE below
+              # (`-c)`, gated on `_wrap`), which is the only decider: it runs later in this same
+              # iteration and overwrites whatever is assigned here (round 16, P2), so this arm assigns
+              # nothing and must not imply otherwise.
+              :
+            else
+            _i=$((_i + 1)); _c="${_argv[$_i]:-}"; _c1="${_c%%[[:space:]]*}"
+            case "$_c1" in
+              /*/orch-loop.sh) [ "$_noexec" -eq 1 ] || _script="$_c1" ;;
+              *orch-loop.sh*) _text=1 ;;
+            esac
+            # ⛔ CLOSE THE PREFIX HERE (review VGATE of round 8). This arm ADVANCES `_i` past the command
+            # string, so the ordinary-word clearing below never sees it and `_interp` stayed 1 for the
+            # rest of the argv — `bash -c 'sleep 30' <gone>/orch-loop.sh` therefore nominated the
+            # trailing path as the script and fabricated `executes:` on a healthy box (reproduced).
+            # Everything after a `-c` string is `$0`/arguments, never the script.
+            _interp=0
+            # …and the PREFIX is closed too, so a shell-name argument after the command string cannot
+            # re-arm it (review round 12).
+            _pfx=0
+            # ⛔ AND `_seen` GOES WITH THEM (review round 20, P2). This is the THIRD prefix-close site
+            # and the only one round 19 missed, so a second `-c` still believed an interpreter was the
+            # current command: `bash -c x -c <gone>/orch-loop.sh` nominated the trailing path and
+            # fabricated `executes:` — the same class, one spelling along. Everything after the FIRST
+            # command string is `$0`/arguments; no later `-c` belongs to the shell.
+            _seen=0
+            fi ;;
+        esac
+        # ⛔ `_interp` DESCRIBES THE COMMAND PREFIX, NOT "AN INTERPRETER APPEARED SOMEWHERE EARLIER"
+        # (review round 8, P2). It used to persist for the whole argv, so
+        # `bash -c 'sleep 30' <gone>/orch-loop.sh` — and `bash -x other.sh <abs>/orch-loop.sh` —
+        # nominated the trailing path as the script even though it is `$0`/an ordinary argument,
+        # fabricating `executes:` on a healthy box. `bash`/`sh`/`zsh` is how that traffic is usually
+        # spelled (the measured `python3 -c …` case was the minority), so the class was still open.
+        # Cleared only by an ORDINARY word: an interpreter and its options keep the prefix alive,
+        # which is what makes `bash <path>`, `bash -x <path>`, `env bash <path>` and `bash -c <path>`
+        # all still count.
+        # ⛔ A WRAPPER OPENS ARGUMENT SLOTS (review round 12). `nice -n 5 /bin/bash <path>`,
+        # `sudo -u <user> bash <path>`, `timeout 300 bash <path>` and `stdbuf -o0 bash <path>` are all
+        # real launchers; the words between the wrapper and the interpreter are its OPERANDS, not the
+        # command, so they must not end the prefix.
+        # ⛔ POSITIONAL RULE (review round 13): an OPTION keeps the prefix; a bare short option also
+        # claims the NEXT word as its value; a number or a `K=V` assignment is an operand; a WRAPPER is
+        # skipped and the command is still to come; a SHELL becomes the command; and any OTHER word is
+        # the command — so if it is not a shell, the prefix dies here and nothing later can arm it.
+        # ⛔ A COMBINED OPTION CARRIES ITS OWN VALUE (`-o0`, `-n5`), so it claims nothing — otherwise
+        # `stdbuf -o0 bash <path>` would eat `bash` as `-o0`'s value and lose a real launcher.
+        case "$_w" in
+          +o|+O)
+            # ⛔ THE `+`-FORM OF A SHELL OPTION (review round 19, P2). It is not `-`-prefixed, so it
+            # never reaches the option arm below and used to close the prefix — leaving
+            # `bash +o noexec <gone>/orch-loop.sh`, a REAL execution (because `+o` turns noexec
+            # OFF), reported as a mention. It claims its operand like `-o`, but is never a noexec
+            # claim: `_optv` records the actual option word so only `-o noexec` disables execution.
+            if [ "$_seen" -eq 1 ]; then _optval=1; _optv="$_w"; fi ;;
+          -*) # An OPTION never closes the prefix. It claims the NEXT word as its value ONLY while the
+              # command is still unknown — once the command is a shell, its options are flags and the
+              # next ordinary word is its SCRIPT operand (`bash -x other.sh <abs>` must stay a
+              # mention, not become an invocation).
+              # ⛔ WHICH OPTIONS TAKE A VALUE IS A TABLE, NOT A LENGTH TEST (review round 14). The
+              # length test (`${#_w} -eq 2`) treated every two-character option as value-taking — but
+              # `-n`, `-E`, `-H`, `-i`, `-v` are FLAGS — so the option ate the COMMAND word instead:
+              # `sudo -n grep -n sh <abs>` kept the prefix open through `grep`, and the later `sh` armed
+              # the latch and nominated the path. Nine measured forms did this, `sudo -n`, `sudo -E`,
+              # `sudo -H`, `env -i`, `env -v`, `nice -5`, `command -v`, `timeout 300 --`, `sudo --`.
+              # ⛔ AND THE DEFAULT FOR AN UNRECOGNISED OPTION IS "CLAIMS NOTHING", which is the SAFE
+              # direction: a missed operand costs a MENTION (declared residual below), while a wrong
+              # claim costs a FABRICATED `executes:` — a red on a healthy box. Long options that carry
+              # their value in the same word (`--opt=value`) claim nothing, and `--` claims nothing.
+              if [ "$_seen" -eq 1 ]; then
+                # ⛔ A SHELL'S OWN NOEXEC OPTION (review round 17, P2) — recognised HERE, in the
+                # branch for a shell's options, because the same letters mean the opposite for a
+                # wrapper: `sudo -n` is ordinary sudo, not "do not execute". Putting this in the
+                # table's branch made `sudo -n bash <gone>/orch-loop.sh` a mention — the silent green
+                # round 16 had just closed. `-n`, `-D`, `--noexec` and any short cluster containing
+                # `n` (`-en`, `-xn`, `-ln`) all mean "read the script, do not run it".
+                _optval=0
+                case "$_w" in
+                  -D|--noexec|-n) _noexec=1 ;;
+                  -[!-]*n*) _noexec=1 ;;
+                  # ⛔ A CLUSTER THAT ENDS IN `o`/`O` CLAIMS ITS OPERAND (review round 21, P1 — a
+                  # REGRESSION this change introduced). Only the EXACT words `-o|-O` were listed, so
+                  # `bash -euo pipefail <gone>/orch-loop.sh` — the canonical bash launcher spelling —
+                  # left `pipefail` to the ordinary-word arm, which closed the prefix; the script path
+                  # then arrived with `_interp=0` and was graded a MENTION, so a live controller on a
+                  # GONE tree produced NO `harness=` token, the pass recorded `drift=clean:rc=0` and
+                  # `fleet-health` certified the box. MEASURED against origin/main's checker on one
+                  # fixture: `-euo pipefail`, `-eo pipefail`, `-euxo pipefail` were ARMED there and
+                  # are mentions here; `-eu -o pipefail` and `-o pipefail` stayed ARMED on both,
+                  # which isolates the CLUSTER as the trigger. Ordering is load-bearing: the `n` rule
+                  # above runs first so `bash -eun` stays parse-only, and the trailing letter is what
+                  # decides — `-o0` (a digit) still claims nothing.
+                  -[!-]*o) _optval=1 ; _optv="-o" ;;
+                  -[!-]*O) _optval=1 ; _optv="-O" ;;
+                  # ⛔ A SHELL'S VALUE OPTIONS ARE NOT FLAGS (review round 18, P2). bash/zsh accept
+                  # their value as the NEXT word (`-o pipefail`, `-O extglob`, `--rcfile F`), so
+                  # treating every shell option as a flag let that word close the prefix —
+                  # `bash -o pipefail <gone>/orch-loop.sh` was a MENTION, i.e. a real execution of a
+                  # GONE tree reported as nothing: the #10114 silent green, restored for that spelling.
+                  # ⛔ `+o`/`+O` ARE NOT `-`-PREFIXED, SO THEY LIVE IN THE OUTER ARM (review round 19,
+                  # P2). Listing them here was DEAD CODE: a `+o noexec` word never reaches this `-*`
+                  # arm, so it fell to the ordinary-word arm, closed the prefix, and
+                  # `bash +o noexec <gone>/orch-loop.sh` — a real execution, since `+o` turns noexec
+                  # OFF — stayed a mention. They are handled in the outer case, with the same claim.
+                  -o|-O|--rcfile|--init-file) _optval=1 ; _optv="$_w" ;;
+                esac
+              else
+                case "$_w" in
+                  --) _optval=0 ;;
+                  --*=*) _optval=0 ;;
+                  --user|--group|--prompt|--chdir|--chroot|--host|--role|--type|--other-user) _optval=1 ;;
+                  --command-timeout|--signal|--kill-after|--input|--output|--error) _optval=1 ;;
+                  --unset|--adjustment|--split-string) _optval=1 ;;
+                  --*) _optval=0 ;;
+                  -u|-g|-C|-D|-r|-t|-U|-T|-R|-o|-a) _optval=1 ;;
+                  # ⛔ THE SINGLE-LETTER ARM IS A UNION OVER TEN WRAPPERS, SO THE LETTERS THAT ARE
+                  # FLAGS FOR ONE OF THEM MUST BE GATED ON WHICH WRAPPER IT IS (review round 16, P1).
+                  # `n s k e S` are sudo FLAGS (`-n` non-interactive, `-s` shell, `-k` reset-timestamp,
+                  # `-e` edit, `-S` stdin) — round 15 removed them from the CLUSTER class for exactly
+                  # this reason and left them here, in the same block, still claiming the interpreter:
+                  # `sudo -n bash <gone>/orch-loop.sh` was a MENTION at 6fb6a5b50, i.e. a live
+                  # controller reported as nothing, rc 0, fleet-health certifying the box. `sudo -n`
+                  # is this repo's DEFAULT privilege prefix in four installers, so that is not an edge
+                  # shape. Gating restores it (`-n` claims nothing → `bash` is the COMMAND and arms)
+                  # while `nice -n 5 /bin/bash` and `timeout -s KILL 300 bash` keep their operands.
+                  # `-p` is sudo's prompt (a value) but `command -p` is a flag; `-h` is a value for
+                  # sudo elsewhere, absent from this fleet's launchers, and safe to leave unclaimed.
+                  -h|-n|-s|-k) case "$_wrap" in sudo|doas) _optval=0 ;; *) _optval=1 ;; esac ;;
+                  -e|-S) case "$_wrap" in sudo) _optval=0 ;; *) _optval=1 ;; esac ;;
+                  -p) case "$_wrap" in command) _optval=0 ;; *) _optval=1 ;; esac ;;
+                  # ⛔ `-c` CLAIMS ITS OPERAND ONLY FOR THE WRAPPER WHOSE `-c` TAKES ONE (review rounds
+                  # 15-16). macOS `sudo -c <class>` consumes a value; `setsid -c` is `--ctty`, a flag,
+                  # and claiming it there swallowed the real interpreter and turned a live controller
+                  # into a mention. `doas` has NO `-c` at all (its synopsis is `-a style`, `-C config`,
+                  # `-L`, `-n`, `-s`, `-u user`), so it is deliberately not named here — this table's
+                  # job is recording which options take a value, and a phantom option would be
+                  # inherited by the next edit.
+                  # ⛔ THE TABLE IS THE ONLY DECIDER: the `-c|-[!-]*c)` arm above assigns NO
+                  # `_optval` (round 16, P2), so nothing is overwritten here — this entry is the sole
+                  # source of the claim, which is why it is gated on `_wrap`.
+                  -c) case "$_wrap" in sudo) _optval=1 ;; *) _optval=0 ;; esac ;;
+                  # ⛔ A COMBINED CLUSTER THAT ENDS IN A VALUE-TAKING LETTER CLAIMS ITS OPERAND (review
+                  # round 14, P1). `sudo -iu <user> bash` and `sudo -Eu <user> bash` are the canonical
+                  # login-shell-as-user spellings, and they are what this table's SAFE default gets
+                  # wrong: an unrecognised word claims nothing, so the USER NAME was read as the
+                  # COMMAND, the prefix died, and the launcher became a mere mention — a live controller
+                  # on a GONE tree reported as nothing at all, i.e. the silent green #10114 exists to
+                  # end. MEASURED: ARMED on d708e68ea, `text` on the round-13 head.
+                  # ⛔ THE CLASS EXCLUDES THE WRAPPER FLAGS (review round 15, P1). The first draft used
+                  # `ugpCDhrtUTRnsokeaS`, which includes `n s k e S` — sudo FLAGS, not value-taking
+                  # options. Both directions broke, measured against the lane's head:
+                  # `sudo -En bash`, `-Hn`, `-Sn`, `-kn`, `-ns`, `-kS`, `-Es` → ARMED there, MENTION here
+                  #   (a live controller reported as nothing — the #10114 harm), and
+                  # `sudo -Hn grep bash`, `sudo -En cat sh` → MENTION there, ARMED here (the very
+                  #   fabrication class the option table was added to close).
+                  # The TRAILING letter still decides, so `-o0` (stdbuf: a digit) claims nothing and a
+                  # GLUED value (`-n5`) is not a claim either.
+                  -[!-]*[ugpCDhrtUTRoa]) _optval=1 ;;
+                  *) _optval=0 ;;
+                esac
+              fi ;;
+          *) if [ "$_optval" -eq 1 ]; then
+               _optval=0                      # this word is the OPTION's value (e.g. `sudo -u <user>`)
+               # ⛔ …AND `bash -o noexec` SPELLS NOEXEC AS A VALUE (review round 18, P2). The value
+               # word is consumed before any option test, so without this a shell told not to execute
+               # anything would still nominate its script — flipping an accepted mention into a
+               # fabricated `executes:`. Every other consumed value is inert.
+               # ⛔ ONLY THE MINUS FORM, AND ONLY AS `-o`'s VALUE (review round 19, P2).
+               # `--rcfile noexec` / `--init-file noexec` do NOT disable execution, `+o noexec`
+               # turns noexec OFF, and a wrapper operand spelled `noexec` is unrelated — the
+               # first draft fired on the WORD alone and turned real executions into mentions.
+               if [ "$_w" = noexec ] && [ "$_optv" = "-o" ]; then _noexec=1; fi
+             else
+               case "${_w##*/}" in
+                 # ⛔ ONLY IN COMMAND POSITION (review round 18, P1). This branch used to set `_seen`
+                 # for ANY word spelled like a shell, at any position — so `echo sh -c <abs>`, `ssh box
+                 # sh -c <abs>` and `man sh -c <abs>` marked an interpreter as identified, and the
+                 # `-c` arm (which trusts `_seen`) then nominated the path: a fabricated `executes:`
+                 # on a healthy box, from a mention. The shell-arming block above already sets `_seen`
+                 # whenever a shell is actually in command position, so this asks the same question.
+                 bash|sh|dash|zsh|ksh|ash|mksh|busybox) [ "$_pfx" -eq 1 ] && _seen=1 ;;
+                 env|nice|sudo|timeout|stdbuf|command|exec|nohup|setsid|doas)
+                     # a wrapper while the command is still unknown is part of the prefix; seen AFTER a
+                     # command, it is an argument and the prefix ends
+                     # ⛔ REMEMBER WHICH WRAPPER (review rounds 15-16, P2): whether `-c` takes a value
+                     # is a property of the WRAPPER, not of the letter. macOS `sudo -c <class>`
+                     # consumes an operand; `setsid -c` is `--ctty`, a FLAG; and `doas` has no `-c` at
+                     # all. One union rule cannot be right for all three, and the `-c` claim is the
+                     # difference between `setsid -c bash <gone>/orch-loop.sh` being a mention (a live
+                     # controller reported as nothing) and being caught.
+                     if [ "$_seen" -eq 1 ]; then _pfx=0; _interp=0; _seen=0; else _wrap="${_w##*/}"; fi ;;
+                 *) case "$_w" in
+                      *=*) : ;;                       # an env assignment is an operand, not the command
+                      *[!0-9]*) _pfx=0; _interp=0; _seen=0 ;;   # the COMMAND (or the script operand): closed
+                    esac ;;
+               esac
+             fi ;;
+        esac
+        _i=$((_i + 1))
+      done
+      if [ -n "$_script" ]; then
+        case "$_script" in
+          /*) : ;;
+          *)  _pcwd="$(readlink "$PROC/$_pid/cwd" 2>/dev/null)"
+              case "$_pcwd" in
+                '') printf '%s\t%s\n' "$_pid" "$_flat" >> "$TMPD/ps-unres" ; continue ;;
+                *)  _script="$_pcwd/${_script#./}" ;;
+              esac ;;
+        esac
+        printf '%s\t%s\n' "$_pid" "$_script" >> "$TMPD/ps-harness"
+      elif [ "$_interp" -eq 1 ] && [ "$_text" -eq 0 ]; then
+        # An interpreter whose command line names orch-loop.sh and yields NO script path: the fact is held
+        # and cannot be read. BROKEN — never "no controller was found" over a process that is running one.
+        printf '%s\t%s\n' "$_pid" "$_flat" >> "$TMPD/ps-unres"
+      else
+        note "running: pid $_pid MENTIONS an orch-loop.sh but is not an invocation of one ($_flat) — not counted as a controller"
+      fi
+    done <<< "$_ps"
+  fi
+  while IFS="$(printf '\t')" read -r _pid _why; do
+    [ -n "${_pid:-}" ] || continue
+    brk "pid $_pid runs an orch-loop.sh whose script path could not be resolved ($_why) — the tree that is EXECUTING cannot be identified (a relative path resolves against the controller's own cwd, which this box will not read), and an unidentified executing tree is never a pass"
+  done < "$TMPD/ps-unres"
+  # ── THE EXECUTING TREE (#10114): the three answers, only one of which may pass ────────────────
+  # `HARNESS_PIN_FILE` is read ONLY to put the pin's name in the message. It never decides anything:
+  # the verdict is the process's own path, because a record that agrees with itself is exactly what
+  # the measured false green had.
+  _pin_dir=""
+  if [ -n "${HARNESS_PIN_FILE:-}" ] && [ -r "$HARNESS_PIN_FILE" ]; then
+    _pin_dir="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+  fi
+  while IFS="$(printf '\t')" read -r _pid _sp; do
+    [ -n "${_sp:-}" ] || continue
+    _sd="${_sp%/orch-loop.sh}"
+    case "$(hu_dir_state "$_sd")" in
+      dir)
+        printf '%s\n' "$_sd" >> "$TMPD/cand-raw"
+        printf '%s\n' "$_sd" >> "$TMPD/running-raw"
+        # The RESOLVED spelling, so the candidate filter below can tell an executing dir from any other
+        # one even when the box names it through a symlink or a trailing slash.
+        _sdr="$( ( cd "$_sd" 2>/dev/null && pwd -P ) )" || _sdr=""
+        [ -n "$_sdr" ] && printf '%s\n' "$_sdr" >> "$TMPD/running-real"
+        note "exec: pid ${_pid:-?} executes $_sd — compared against $REF below" ;;
+      absent)
+        # ⛔ NOT `continue`, AND NOT A NOTE. This is the whole defect: a live process whose tree is
+        # gone is the box running code nobody can identify, and skipping it is how "every harness dir
+        # on this box matches" was printed over exactly that state.
+        EXEC_N=$((EXEC_N + 1))
+        [ -n "$EXEC_FIRST" ] || EXEC_FIRST="$_sd"
+        drift_q exec "pid ${_pid:-?} is EXECUTING $_sp — and that directory DOES NOT EXIST. The box runs a harness tree it no longer has${_pin_dir:+ (the pin names $_pin_dir)}, so NOTHING it executes is this repo's code. This is the measured #3194/#10114 state: the pin record, the unit's active state and the control plane all read green over it" ;;
+      *)
+        brk "pid ${_pid:-?} is executing $_sp, and that path cannot be EXAMINED (a symlink whose target cannot be resolved, or an unsearchable ancestor) — cannot verify the one directory that is actually running (never a pass)" ;;
+    esac
+  done < "$TMPD/ps-harness"
+  # ⛔ `-d "$O"`, NOT `O_ABSENT`: `O_ABSENT` also becomes 1 when the RECORD is missing or the path is
+  # unexaminable (see the state split above), and the deployed directory still has to be compared when it
+  # EXISTS — it is the population a record-less box has. Only a $O that is provably absent is skipped.
+  [ "$(hu_dir_state "$O")" = dir ] && printf '%s\n' "$O" >> "$TMPD/cand-raw"
+  [ -n "${HARNESS:-}" ] && printf '%s\n' "${HARNESS%/}" >> "$TMPD/cand-raw"
+  # ⛔ THE PIN *FILE* IS THE ONLY RECORD THAT NAMES A READ DIR OUTSIDE THE PIN ROOT — the exact #2216
+  # shape — so "cannot read it" may never be read as "no pin record". `-f` is false behind an
+  # unsearchable ancestor and `head` fails silently on an unreadable file, so all three unexaminable
+  # states dropped the named tree and the run printed OK (round 8).
+  if [ -n "${HARNESS_PIN_FILE:-}" ]; then
+    case "$(hu_path_state "$HARNESS_PIN_FILE")" in
+      path)
+        if [ -r "$HARNESS_PIN_FILE" ]; then
+          _f="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"; [ -n "$_f" ] && printf '%s\n' "${_f%/}" >> "$TMPD/cand-raw"
+        else
+          brk "the pin DIR record $HARNESS_PIN_FILE is not readable, so the tree this box names as its harness cannot be identified — cannot verify it (never a pass)"
+        fi ;;
+      absent) : ;;
+      *) brk "the pin DIR record $HARNESS_PIN_FILE cannot be examined (a symlink with no resolvable target, or an unsearchable ancestor) — cannot verify the tree this box names (never a pass)" ;;
+    esac
+  fi
+  # The HOME-DIR harness dirs are the class that lost the fixes — included even when nothing points
+  # at them, because a stale copy there is exactly what a re-pin or a hand-`cp` leaves behind.
+  printf '%s\n' "$HOME/orchestrator" >> "$TMPD/cand-raw"
+  [ -n "${CELL_HOME:-}" ] && printf '%s\n' "$CELL_HOME/harness" "$CELL_HOME/orchestrator" >> "$TMPD/cand-raw"
+  [ -n "${HARNESS_PIN_DIR:-}" ] && printf '%s\n' "$HARNESS_PIN_DIR" >> "$TMPD/cand-raw"
+  # Pin-root children: one worktree per pinned commit (`<pin-dir>/<sha12>/scripts/orchestrator-harness`).
+  if [ -n "${HARNESS_PIN_DIR:-}" ] && [ -d "$HARNESS_PIN_DIR" ]; then
+    for _c in "$HARNESS_PIN_DIR"/*; do
+      # ⛔ SAME THREE-WAY QUESTION AS EVERY OTHER CANDIDATE, ASKED BEFORE ANY FILTER. `[ -d "$_c" ] ||
+      # continue` dropped a pin child whose path (or whose `scripts/orchestrator-harness`) is an
+      # unresolvable symlink — a pinned worktree on a mount that is gone — and the run printed OK having
+      # never examined the commit it is pinned to (round 7). The header names these children as a
+      # compared candidate set, so "cannot examine it" is BROKEN here exactly as it is elsewhere.
+      case "$(hu_dir_state "$_c")" in
+        absent) continue ;;
+        dir)
+          case "$(hu_dir_state "$_c/scripts/orchestrator-harness")" in
+            dir) printf '%s\n' "$_c/scripts/orchestrator-harness" >> "$TMPD/cand-raw" ;;
+            absent) printf '%s\n' "$_c" >> "$TMPD/cand-raw" ;;
+            *) brk "pin-root child $_c/scripts/orchestrator-harness cannot be examined (a symlink with no resolvable target, or an unsearchable ancestor) — cannot verify the pinned commit, and that is never 'nothing to report'" ;;
+          esac ;;
+        *) brk "pin-root child $_c cannot be examined (a symlink with no resolvable target, or an unsearchable ancestor) — cannot verify the pinned commit, and that is never 'nothing to report'" ;;
+      esac
+    done
+  fi
+  # Normalise: drop empties, dedupe, and require a REAL harness dir (a dir carrying orch-loop.sh or
+  # at least one shipped `.sh`) — a bare `ls` of an unrelated directory is not a surface.
+  : > "$TMPD/cand"
+  while IFS= read -r _d; do
+    [ -n "$_d" ] || continue
+    case "$(hu_dir_state "$_d")" in
+      dir) ;;
+      absent) continue ;;
+      *) brk "candidate harness dir $_d cannot be examined (it is a symlink whose target cannot be examined, or it or an ancestor is not searchable) — cannot verify it, and an unexaminable box dir is never 'nothing to report'"; continue ;;
+    esac
+    _r="$( ( cd "$_d" 2>/dev/null && pwd -P ) )" || _r=""
+    [ -n "$_r" ] || { brk "candidate harness dir $_d exists but cannot be entered — cannot verify it (never a pass)"; continue; }
+    [ -d "$_r" ] || continue
+    # ⛔ `$O` IS EXCLUDED HERE ON PURPOSE *when section 3 ran*: it already compares it in BOTH directions
+    # (bytes, missing, extra). Reporting it twice would double-count one defect, and a count is what a
+    # reader uses to judge whether the box is one bad file or many. When the RECORD is what is missing,
+    # section 3 was skipped and `$O` MUST be compared here — it is then the box's only measured copy.
+    if [ "$O_ABSENT" -eq 0 ]; then
+      _o_real="$( ( cd "$O" 2>/dev/null && pwd -P ) )" || _o_real=""
+      [ -n "$_o_real" ] && [ "$_r" = "$_o_real" ] && continue
+    fi
+    # ⛔ "THE GLOB MATCHED NOTHING" AND "THE DIRECTORY COULD NOT BE LISTED" HAVE THE SAME FAILED `ls`.
+    # Treating them alike DROPS an unlistable candidate, and the run then prints OK having compared
+    # nothing in it — the exact false green this pass exists to prevent (measured: a `chmod 111` harness
+    # copy, carrying a local edit, was silently skipped and the run exited 0). So the LISTABILITY test
+    # comes FIRST: an unlistable directory is cannot-verify, and cannot-verify is BROKEN.
+    if [ ! -r "$_r" ] || ! ls "$_r" >/dev/null 2>&1; then
+      brk "candidate harness dir $_r exists but cannot be LISTED (unreadable directory) — cannot verify it, and a dir this box carries is never 'nothing to report'"
+      continue
+    fi
+    ls "$_r"/*.sh >/dev/null 2>&1 || { [ -f "$_r/orch-loop.sh" ] || {
+      # ⛔ A RUNNING DIR IS NEVER DROPPED BY THE GENERIC "is this a harness dir?" FILTER (#10114, review
+      # finding 1). The measured sibling of the vanished-dir case: the process still executes
+      # `<dir>/orch-loop.sh` while the directory remains and its scripts are GONE (a deleted script is
+      # held open by the running interpreter, so the process outlives the file). This `continue` — the
+      # one below — then printed `OK: every harness dir on this box matches …` after line above already
+      # said it was "compared against $REF below". An executing dir with nothing to compare is DRIFT.
+      if grep -qxF "$_r" "$TMPD/running-real" 2>/dev/null; then
+        EXEC_N=$((EXEC_N + 1))
+        [ -n "$EXEC_FIRST" ] || EXEC_FIRST="$_r"
+        drift_q exec "the controller executes $_r, and it carries NO readable *.sh at all — the script the live process was started from is GONE. Nothing in the tree that is executing can be compared with $REF"
+      fi
+      continue; }; }
+    grep -qxF "$_r" "$TMPD/cand" 2>/dev/null || printf '%s\n' "$_r" >> "$TMPD/cand"
+  done < "$TMPD/cand-raw"
+  # Running dirs, normalised the same way so the report's RUNNING prefix cannot miss on a spelling
+  # difference (a symlink, a trailing slash).
+  : > "$TMPD/running"
+  while IFS= read -r _d; do
+    [ -n "$_d" ] || continue
+    _r="$( ( cd "$_d" 2>/dev/null && pwd -P ) )" || continue
+    [ -n "$_r" ] || continue
+    grep -qxF "$_r" "$TMPD/running" 2>/dev/null || printf '%s\n' "$_r" >> "$TMPD/running"
+  done < "$TMPD/running-raw"
+
+  if [ ! -s "$TMPD/cand" ]; then
+    # ⛔ THE REFUSAL STANDS — an unanswered surface question is never a pass — BUT IT IS NOT THE ONLY
+    # POSSIBLE ANSWER (#10114). When the EXECUTING-TREE arm already returned a DRIFT (a live
+    # controller runs a directory that is gone), the run HAS an answer and it is RED; exiting 2 here
+    # would replace that measured fact with "cannot verify" and drop the token that names it. So with
+    # EXEC_N>0 and nothing else broken the run carries on to the summary and exits 1 — never 0.
+    # ⛔ AND IT IS NOT AN ANSWER WHEN SOMETHING ELSE IS BROKEN (review of #3202, measured): a `brk`
+    # raised elsewhere (an unreadable pin record, an unexaminable pin-root child, an unlistable
+    # candidate) leaves `cand` empty too, and this note used to fire on it — printing "this run is RED,
+    # not unverified" one line above `BROKEN … the box's harness state is UNVERIFIED`, two opposite
+    # conclusions in one report, and the exit code is 2. Gate the sentence on the run that can honour
+    # it: `EXEC_N>0` AND nothing broken (`broken -eq 0`, the same counter the summary's exit-2 arm reads).
+    if [ "$EXEC_N" -eq 0 ]; then
+      unknown "no harness directory was found on this box (looked at the running controller's own dir, $O, the pin records and the home dirs) — the surface question cannot be answered, and an unanswered check is never a pass"
+    fi
+    if [ "$EXEC_N" -gt 0 ] && [ "$broken" -eq 0 ]; then
+      note "surface: no harness directory was compared (nothing on this box carries one), but the executing-tree arm DID answer — see the DRIFT(exec) line above; this run is RED, not unverified"
+    fi
+    # When something else IS broken the run is UNVERIFIED, so no claim about RED is made here — the
+    # DRIFT(exec) line still stands as a measured fact, and the summary below says the pass is
+    # unverified (exit 2). Silence is the honest report; the broken line already names what failed.
+  fi
+
+  while IFS= read -r _dir; do
+    [ -n "$_dir" ] || continue
+    # ⛔ "RUNNING" IS THE WHOLE POINT: a differing copy nobody executes is a stale artefact; a
+    # differing copy the CONTROLLER EXECUTES is the box running code main does not carry. Same file,
+    # two different severities — so the line says which one this is.
+    _who=""; _rtag=""
+    grep -qxF "$_dir" "$TMPD/running" 2>/dev/null && { _who="the RUNNING controller executes this dir: "; _rtag="  (RUNNING)"; }
+    note "surface: $_dir$_rtag"
+    if ! ls "$_dir"/*.sh >/dev/null 2>&1; then
+      brk "${_who}$_dir — a component directory with no readable *.sh (permission denied?) — cannot verify it"
+      continue
+    fi
+    for _p in "$_dir"/*.sh; do
+      [ -e "$_p" ] || continue
+      _b="$(basename "$_p")"
+      _have="$(git hash-object -- "$_p" 2>/dev/null || true)"
+      if [ -z "$_have" ]; then
+        brk "${_who}$_b — UNREADABLE in $_dir (cannot hash it) — cannot verify, so this is a failure, not an absence"
+        continue
+      fi
+      _want="$(git -C "$REPO" rev-parse --verify --quiet "$TIP:$REL/$_b" 2>/dev/null || true)"
+      if [ -z "$_want" ]; then
+        drift "${_who}$_b — exists ONLY in $_dir; $REF does not carry $REL/$_b (a hand-placed, renamed or retired script — the class that lost three fixes)"
+      elif [ "$_have" != "$_want" ]; then
+        drift "${_who}$_b — DIFFERS in $_dir from $REF ($_want) — this box carries bytes main does not"
+      fi
+    done
+    # The other direction: a harness script main ships that this component dir does NOT carry. A
+    # running controller on a partial tree calls a helper that is missing at the moment it needs it.
+    while IFS= read -r _f; do
+      [ -n "$_f" ] || continue
+      _b="${_f#"$REL"/}"
+      [ -f "$_dir/$_b" ] || drift "${_who}$_b — shipped at $REF but MISSING from $_dir"
+    done < "$TMPD/repo-sh"
+  done < "$TMPD/cand"
+fi
+
+# Did the SURFACE arm (and only it) add problems? Read after the arm, before the summary.
+# ⛔ AN EXEC-ONLY DRIFT IS NOT A SURFACE HIT (review of #3202). `drift_q exec` increments `problems` from
+# inside the surface block, so `problems > SURF_BASE` was true for a gone EXECUTING tree alone — and the
+# summary then printed `for a surface hit, reseed the copy the RUNNING component uses` directly ABOVE
+# `(c) … redeploying $O does not clear it`: a remedy for a copy at rest, offered for a tree that is not on
+# the box. Both `drift_q exec` call sites increment `EXEC_N` in the same iteration, so the surface delta is
+# what this arm added MINUS the exec ones.
+SURF_HIT=0
+if [ "$((problems - ${SURF_BASE:-0} - EXEC_N))" -gt 0 ]; then SURF_HIT=1; fi
+
+if [ "$problems" -gt 0 ]; then
+  bad ""
+  if [ "$broken" -eq 1 ]; then
+    bad "check-deployed-drift: BROKEN — at least one path could not be read, so this box's harness state is UNVERIFIED (never a pass; agent-infra#2231)"
+    [ "$O_ABSENT" -eq 0 ] && bad "  deployed dir: $O"
+    exit 2
+  fi
+  # ⛔ THE ONE-LINE ANSWER, and it is the token the loop already stamps on dispatch rows
+  # (`[harness=behind:<sha12>]` in orch-loop.sh / dispatch-merge.sh), so a reader can join the two.
+  # `uncommitted-edit:*` is NOT `behind`: it means $O carries bytes no deploy wrote.
+  HTOKEN=""
+  if [ "$EXEC_N" -gt 0 ]; then
+    # ⛔ FIRST IN THE CHAIN, AND BEFORE `O_ABSENT`. Every token below describes a copy AT REST; this
+    # one says the code that is RUNNING is not on the box at all. A redeploy of `$O` cannot clear it,
+    # so listing it under any of the others would print a remedy that does not fix the box.
+    HTOKEN="executes:$EXEC_FIRST"
+  elif [ "$O_ABSENT" -eq 1 ]; then
+    # A --surface-only run: no $O RECORD was read, so neither question was answered about its
+    # identity. Saying "payload-differs" here would name a question nothing asked.
+    # ⛔ "NO RECORD" IS NOT "NOT COMPARED" (review round 25, P1). `$O` IS added to the surface
+    # candidate list whenever it is a harness dir (`hu_dir_state "$O" = dir` above), and its exclusion
+    # is gated on `O_ABSENT = 0` — so it is skipped PRECISELY when it is absent. A record-less `$O`
+    # that drifted is therefore compared, is named in the `surface: <dir>` line, and lands here: the
+    # token is `surface` for ANY surface drift on this shape, `$O`'s included. The old comment said
+    # "no $O was compared", and that sentence was copied into `README` §4.3 where it told an operator
+    # the failing dir was always ANOTHER one (so "redeploying $O cannot clear it") while `$O` was in
+    # fact the dir that failed — a wrong remedy on the one shape where a redeploy does clear it.
+    HTOKEN="surface"
+  elif [ "$Q_RECORD" -eq 1 ]; then
+    EDIT1="$(head -1 "$TMPD/edit-names" 2>/dev/null)"
+    if [ -n "$EDIT1" ]; then HTOKEN="uncommitted-edit:$EDIT1"
+    else HTOKEN="uncommitted-edit:<unnamed: the record carries no manifest>"; fi
+  elif [ "$Q_IDENT" -eq 1 ] && [ "$RELATION" != "current" ]; then
+    HTOKEN="$RELATION:${HAS:0:12}"
+  elif [ "$MISSING_N" -gt 0 ]; then
+    # A THIRD STATE, NAMED. `payload-differs` would be false (the bytes that ARE there match the
+    # record) and `uncommitted-edit` would be false (nothing was edited) — it is an INCOMPLETE tree.
+    HTOKEN="incomplete:$(head -1 "$TMPD/missing-names" 2>/dev/null)"
+  elif [ "$DIRTY" = true ]; then
+    # ⛔ A DIRTY-SOURCE RECORD ON THE TIP IS NOT `payload-differs` (measured 2026-10-30, review of
+    # #3053/#3090). It fell through to the else below — but README §4.3 defines that token as "the
+    # bytes differ from the checkout but the record STILL DESCRIBES $O", which is precisely what a
+    # `sourceDirty=true` record does not do: it names a commit whose bytes are not on the box. A token
+    # that sends an operator to "redeploy to adopt" without saying the box was never identifiable is
+    # the same false reassurance the summary sentence below used to give.
+    # ⛔ AND IT IS PLACED BELOW `incomplete:` ON PURPOSE (review of #3090): a record can be dirty AND
+    # name a file `$O` no longer has, and the absent script — the runtime-breakage signal README gives
+    # its own row and its own remedy ("a redeploy CREATES it") — is the more actionable of the two.
+    # Measured: putting this arm first narrowed `incomplete:b.sh` to `source-dirty:<sha>` for a
+    # dirty-source record with a missing file. Precedence, stated rather than implied (and it must stay
+    # in step with the `if` chain BELOW, which is the one that decides):
+    # executes: > uncommitted-edit > behind/diverged > incomplete > source-dirty > (surface | payload-differs).
+    # ⛔ THE `O_ABSENT` ARM PRECEDES ALL OF THESE (review of #3090): no question about `$O` was
+    # answered, so there is nothing to order it against — and it is NOT the `Q_BYTES=0` surface arm
+    # below, where that flag is a real answer rather than the initialisation at the top of the script.
+    # It is reachable only when the SURFACE pass raised `problems` (`SURF_HIT`), so the token names a
+    # real drift in a copy this box carries — but ⛔ NOT necessarily "another dir": `$O` is a surface
+    # candidate whenever it is a harness dir (`hu_dir_state "$O" = dir`), and its exclusion is
+    # `O_ABSENT=0`-gated, so with no record `$O` has no exclusion and an `$O` that drifted is the dir
+    # this token is about. The NAME in the `surface: <dir>` line is what says which dir; the token
+    # alone does not. (An earlier version of this comment said "in another dir … never a statement
+    # about `$O`", and that sentence was copied into README §4.3, where it told an operator that
+    # redeploying `$O` cannot clear the hit — wrong on precisely the shape where it does.)
+    # ⛔ THE LAST TWO ARE ALTERNATIVES, NOT A CHAIN (review of #3090, on this PR's own comment) — and
+    # WHICH ONE YOU GET IS DECIDED BY WHETHER A RECORD EXISTS, not by where the drift is. With a
+    # record (`O_ABSENT=0`) the `surface` arm below requires `Q_BYTES=0`, so a surface hit that
+    # coincides with `$O`'s own bytes differing falls through to `payload-differs`. With NO record
+    # (`O_ABSENT=1`) this arm has already answered `surface` before that one is reached — measured:
+    # a record-less `$O` whose `merge-one.sh` differs from `$REF` reports `harness=surface`, never
+    # `payload-differs`. A stated chain ending `surface > payload-differs` described an order the
+    # `if` below does not implement — the exact class of claim this PR exists to remove.
+    HTOKEN="source-dirty:${HAS:0:12}"
+  elif [ "$SURF_HIT" -eq 1 ] && [ "$Q_RECORD" -eq 0 ] && [ "$Q_IDENT" -eq 0 ] && [ "$Q_BYTES" -eq 0 ]; then
+    # $O answered clean; the hit is in another harness dir this box carries. `payload-differs` would be
+    # a false statement about $O and would prescribe a redeploy that cannot clear it.
+    HTOKEN="surface"
+  else
+    # The record still describes $O (or only the checkout moved): a byte difference, not an edit.
+    HTOKEN="payload-differs"
+  fi
+  bad "check-deployed-drift: this box does NOT match $REPO@$REF ($TIP_SHORT)   harness=$HTOKEN"
+  [ "$O_ABSENT" -eq 0 ] && bad "  deployed dir: $O"
+  bad "  record: $RECORD"
+  # The two questions are ANSWERED separately in the summary, because they are different jobs: a
+  # box deliberately behind a known commit needs a redeploy; a box with an uncommitted edit needs
+  # the edit recovered FIRST, and a redeploy is what destroys it.
+  if [ "$Q_RECORD" -eq 1 ]; then
+    bad "  (a) record: \$O is NOT the tree its record describes — an UNCOMMITTED EDIT (the file(s) are named above, with which side is newer)."
+    bad "      RECOVER the edit before redeploying: a deploy OVERWRITES it. Review with:"
+    bad "      bash '$HERE/harness-provenance.sh' show --o '$O'   &&   bash '$HERE/harness-provenance.sh' check --o '$O'"
+  fi
+  if [ "$Q_IDENT" -eq 1 ]; then
+    # ⛔ THE ROUTINE-STATE SENTENCE IS ONLY TRUE FOR A CLEAN-SOURCE RECORD (measured 2026-10-30, review
+    # of #3053). Printed under a `sourceDirty=true` record it read "the box is recorded from <sha> —
+    # current main … a known state, not a defect" DIRECTLY BENEATH the line saying that commit does
+    # not describe the deployed bytes. Two sentences, opposite conclusions, one report.
+    if [ "$DIRTY" = true ]; then
+      bad "  (a) identity: the record names ${HAS:0:12} ($RELATION $REF, $TIP_SHORT) but its SOURCE WAS DIRTY, so that commit does not describe the bytes on this box — it was never identifiable. Redeploy from a CLEAN checkout; only then does a commit name these bytes."
+    else
+      bad "  (a) identity: the box is recorded from ${HAS:0:12} — $RELATION $REF ($TIP_SHORT). A box deliberately BEHIND a known commit is a known state, not a defect; DIVERGED means it runs code main does not carry."
+    fi
+  fi
+  if [ "$Q_BYTES" -eq 1 ]; then
+    bad "  (b) checkout: \$O's bytes differ from the checkout at $REF — redeploy to adopt it:"
+    bad "      bash '$REPO/$REL/deploy-harness.sh' --src '$REPO/$REL' --o '$O'   &&   O='$O' bash '$REPO/$REL/install.sh'"
+  fi
+  if [ "$UNREC_N" -gt 0 ]; then
+    bad "  (a) record: $UNREC_N file(s) at \$O already hold $REF's bytes and the record predates them — an UNRECORDED (partial) deploy, not an edit. Nothing you wrote is discarded; a completed deploy records it."
+  fi
+  if [ "$MISSING_N" -gt 0 ]; then
+    bad "  (a) record: $MISSING_N file(s) the record names are ABSENT from \$O — the deployed tree is INCOMPLETE (named above). A redeploy CREATES them; nothing you wrote is discarded."
+  fi
+  if [ "$SURF_HIT" -eq 1 ]; then
+    bad "  for a surface hit, reseed the copy the RUNNING component uses (or move the box onto the pin: scripts/harness-up)"
+  fi
+  if [ "$EXEC_N" -gt 0 ]; then
+    # ⛔ SHAPE-NEUTRAL (review of #3202): this arm fires for BOTH executing shapes — the directory is GONE
+    # (`absent`), and the directory still EXISTS carrying no readable `*.sh` (`dir` whose scripts the live
+    # interpreter holds open after deletion). Saying "NOT THERE" for both made the summary state a falsehood
+    # about the box for the second, and the `executes:` row is the doc a lane reads to decide whether the
+    # token applies. The DRIFT line above names which of the two it is.
+    bad "  (c) executing tree: $EXEC_N live controller process(es) execute a harness directory that cannot be matched to this repo — it is GONE, or it still exists with NO readable *.sh (named above, and the DRIFT line says which). The pin record and the deploy record can both be correct while this is true — they describe copies at rest, and the box is running a tree that is one of those two states. Restart the controller from the pinned tree (scripts/harness-up); redeploying \$O does not clear it"
+  fi
+  exit 1
+fi
+if [ "$O_ABSENT" -eq 0 ]; then
+  # ⛔ THE CLEAN PATH EMITS THE TOKEN TOO (review round 17, P2). It used to print `[current]` and no
+  # `harness=` at all, so `drift=clean:current` — the value `docs/ops/harness-apply.md` documents and
+  # BOTH fixtures model — was a shape production never emitted: a clean run fell through the reader's
+  # `sed -n 's/.*harness=//p'` to its `clean:rc=0` fallback instead. Anything keyed on the documented
+  # value (`grep 'drift=clean:current'`) could never fire, and because the fixtures asserted the
+  # unreachable shape, nothing in the suite could notice if this line changed. Same class as the
+  # `not-run:not-run` this change already fixed: a fixture must describe what production writes.
+  note "OK: deployed $O matches $REPO@$REF ($TIP_SHORT) — recorded commit ${HAS:0:12} [current] (record: $RECORD) harness=current"
+elif [ -d "$O" ]; then
+  # ⛔ `O_ABSENT` MEANS TWO THINGS AND THE SENTENCE BELOW MUST NOT. It is set both when there is no $O and
+  # when there IS one whose record is unusable (`--surface` keeps going in that case, by design). Reusing
+  # it for the wording made the run print `no deployed dir was present to check` about a dir it had just
+  # listed as `surface: $O` — a false statement about what was measured, on exactly the population the
+  # `--surface` fallback exists for (a hand-placed copy, a farmed cell, an operator-synced $O with no
+  # usable record). The identity half abstained; say that, and say the dir's own bytes were not verified.
+  # ⛔ THE TOKEN BELONGS ON EVERY CLEAN EXIT, NOT ONE OF THREE (review round 21, P2). Only the
+  # `O_ABSENT -eq 0` arm was given `harness=current`, so on the populations this `--surface` fallback
+  # exists for (a hand-placed copy, a farmed cell, an operator-synced `$O` with no usable record) a
+  # clean run fell through the reader's `sed -n 's/.*harness=//p'` to `clean:rc=0` and the documented
+  # `drift=clean:current` was unreachable again — the same defect the arm above records. The verdict is
+  # `current` in both arms: the claim is the DIRS' bytes matching `$REF`, which is what was measured;
+  # the sentence keeps the caveat about the record itself.
+  note "OK: every harness dir on this box matches $REPO@$REF ($TIP_SHORT) — but $O could NOT be identified (no usable harness record), so its own bytes were NOT verified against a record harness=current"
+else
+  note "OK: every harness dir on this box matches $REPO@$REF ($TIP_SHORT) — no deployed dir was present to check harness=current"
+fi
+exit 0

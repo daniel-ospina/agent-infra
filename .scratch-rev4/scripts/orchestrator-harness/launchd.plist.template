@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+  <!-- ⛔ THE PROGRAM IS A STABLE RESOLVER, NOT A PIN PATH (agent-infra#3309). It used to be
+       `__HARNESS__/__ENTRY__`, i.e. `<pin root>/<sha12>/scripts/orchestrator-harness/...` — a
+       HASH-NAMED snapshot that harness-refresh.sh garbage-collects as the pin advances. launchd reads
+       ProgramArguments ONCE at bootstrap, so that plist was correct at install time and DEAD after the
+       next pin move: every tick `No such file or directory`, exit 127, while `launchctl list` still
+       reported the job `loaded`. Measured 2026-11-02: the loop did not run for ~15 hours.
+
+       The program below is `$O/orch-pin-exec.sh` (__PROGRAM__): a fixed STUB at a path that never
+       moves, seeded from the pinned tree by install.sh, which reads the pin dir record
+       (HARNESS_PIN_FILE) on EVERY tick and execs the controller it names. A pin advance therefore
+       changes what runs without the plist moving. install.sh refuses to render unless the stub, run
+       at install time, resolves to the pin's own entrypoint.
+
+       ⛔ And it is not the #2231 defect coming back: the stub is seeded from the pin on every run
+       (never hand-written into $O), it carries no controller logic to diverge, and it fails LOUD
+       (`PIN-EXEC: DEAD-SUPERVISOR: …`, exit 127) when the pin cannot be resolved — a dead supervisor
+       is never silent again. `$O` (`__O__`) also stays the WORKER surface: lanes and fixers are
+       seeded there, exactly as on a cell. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__PROGRAM__</string>
+  </array>
+
+  <!-- ⛔ THE JOB'S CWD MUST NOT BE THE REPO. A launchd job started with a TCC-denied cwd cannot even
+       `getcwd()` (bash: `getcwd: cannot access parent directories: Operation not permitted`), which
+       breaks python3 (`PermissionError`) and therefore the refresh's reap pass — that is how one
+       candidate queue froze for six hours while reporting `queue=READ(237)(6h)`. `$O` is outside the
+       protected tree. -->
+  <key>WorkingDirectory</key>
+  <string>__O__</string>
+
+  <!-- RunAtLoad: start on login. KeepAlive: relaunch if the controller exits.
+       The loop is idempotent — .orch.lock makes a second instance exit immediately. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- ThrottleInterval: THE RETRY INTERVAL IS DECLARED, NOT INHERITED. 10 s is launchd's own
+       documented default (`man launchd.plist`: "by default, jobs will not be spawned more than once
+       every 10 seconds"), so this changes NO behaviour — it makes the value VISIBLE in the file an
+       operator reads, instead of one they have to know.
+       ⛔ IT DOES MOVE THE CRASH-LOOP WINDOW, AND SAYING OTHERWISE WAS WRONG (corrected 2026-10-22,
+       review round 3 — an earlier edit of this very comment had it backwards). `launchctl print`
+       reports this value as `minimum runtime = N`; that field IS this key (Apple's launchd
+       `j->min_run_time`, whose own default is 10). So `launchd-cycle.sh`'s `lc_min_runtime` reads
+       it, and `lc_assert_stable`'s window is `minimum runtime + 3` — raise this to 60 and that
+       window becomes 63 s. `launchd-cycle.sh:363-365` already states the equivalence. Declaring 10
+       here therefore keeps today's behaviour AND today's window exactly; it is not inert, it is
+       the same number written down.
+       10 is launchd's DEFAULT, not its floor: the key accepts any non-negative value, so a box may
+       legitimately declare more and must not be told "it is a floor".
+       With KeepAlive above, a transient spawn failure (fork exhaustion: `spawn /bin/bash EAGAIN`,
+       rc 128 — #2293) is retried on this interval, and `harness-up`'s launchd row names the job
+       DIED with launchd's own exit code rather than leaving it silent. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__O__/logs/launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>__O__/logs/launchd.err</string>
+
+  <!-- launchd gives no shell env, so EVERY binary the daemon shells out to must be on this
+       PATH. It is rendered by install.sh from the directories the binaries ACTUALLY resolve to
+       (__PATH__), not hardcoded, because a wrong PATH here does not fail loudly — see the
+       OPEN_N note in install.sh: the loop reads an empty queue and idles. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+
+    <!-- ── THE uv CACHE + LINK-MODE PIN (agent-infra#2159) ───────────────────────────────────────
+         Both values are rendered from the INSTALLER's environment where set (an operator pin always
+         wins) and from the repo's defaults where not: `UV_CACHE_DIR=$HOME/.cache/uv`,
+         `UV_LINK_MODE=hardlink`.
+
+         Why they belong in the DAEMON's environment rather than in each lane: a lane is the process
+         that runs `uv sync`, and `worker-terminal.sh` snapshots THIS process's environment into every
+         worker it spawns. So a pin placed here reaches every lane on the box — including a lane whose
+         own `keys.env` says nothing about uv — and a box that never pinned the cache leaves its lanes
+         at the filesystem's mercy. Measured (2026-10-30, three cmux cells): a box with a WARM cache
+         hardlinks each `.venv` to the cache and a 5.8 GB `du` costs ~0 distinct bytes, while a
+         COLD-cache box MATERIALISED 5.8 GB per worktree and went 17 GB free -> 257 MB in ~50 min.
+         `UV_LINK_MODE=hardlink` is pinned rather than left to uv's default so the sharing is positive
+         and measurable (`nlink > 1` on a `site-packages` file) instead of platform-dependent. -->
+    <key>UV_CACHE_DIR</key>
+    <string>__UV_CACHE_DIR__</string>
+    <key>UV_LINK_MODE</key>
+    <string>__UV_LINK_MODE__</string>
+
+    <!-- ⛔ THE ENTRYPOINT OVERRIDE REACHES THE DAEMON (#3243 review cycle-2, F3). `orch-pin-exec.sh`
+         selects the controller it execs from `ORCH_ENTRY` in ITS OWN environment; launchd supplies that
+         environment from this file. Rendered ONLY when the operator passed `HARNESS_ENTRY` to
+         install.sh — empty otherwise, so the stub's own preference applies and install-time validation
+         and runtime behaviour can never name different entrypoints. -->
+    <key>ORCH_ENTRY</key>
+    <string>__ORCH_ENTRY__</string>
+
+    <!-- target -->
+    <key>OR</key>
+    <string>__OR__</string>
+    <key>REPO</key>
+    <string>__REPO__</string>
+    <key>O</key>
+    <string>__O__</string>
+
+    <!-- ── THE PIN (agent-infra#2215 / #2231) ──────────────────────────────────────────────────────
+         The same three records the cells read, so this box answers "which harness am I on?" the same
+         way a cell does: HARNESS-PIN is the SHA, `.harness-path` the DIR the controller execs, and
+         HARNESS_PIN_DIR the root the per-commit worktrees live under. They are in the daemon's env
+         (not re-derived by the children) because `harness-refresh.sh` — which runs INSIDE the
+         controller's cycle — reads them to decide whether this box is current, and what to materialise
+         if it is behind. Without HARNESS_MATERIALISER a Mac can only ever report `behind ... pin NOT
+         advanced` (exit 25); with it, the Mac advances its pin exactly like a cell does. -->
+    <key>HARNESS_PIN</key>
+    <string>__HARNESS_PIN__</string>
+    <key>HARNESS_PIN_FILE</key>
+    <string>__HARNESS_PIN_FILE__</string>
+    <key>HARNESS_PIN_DIR</key>
+    <string>__HARNESS_PIN_DIR__</string>
+    <key>HARNESS_REPO</key>
+    <string>__HARNESS_REPO__</string>
+    <key>HARNESS_MATERIALISER</key>
+    <string>__HARNESS_MATERIALISER__</string>
+
+    <!-- drain scope: auto (count rule) | own (pin own-only) | broad (pin broad).
+         A fleet runs exactly ONE broad box; the rest pin own (README section 5). -->
+    <key>SCOPE</key>
+    <string>__SCOPE__</string>
+
+    <!-- concurrency limits; the swap gate, not MAX_LANES, is what throttles an 8 GB box
+         (README section 4). MAX_LANES is rendered from the installer's own core probe — 2.5x the
+         CPU count (25 on a 10-core box) — because capacity, not a lane count, is the ceiling;
+         pin it explicitly to override, and check swap headroom before raising it by hand. -->
+    <key>MAX_LOAD</key>
+    <string>__MAX_LOAD__</string>
+    <key>MAX_LANES</key>
+    <string>__MAX_LANES__</string>
+    <key>MAX_REVIEW</key>
+    <string>__MAX_REVIEW__</string>
+    <key>MERGE_PRIORITY_AT</key>
+    <string>__MERGE_PRIORITY_AT__</string>
+    <key>MERGE_PRIORITY_MAX_AGE_MIN</key>
+    <string>__MERGE_PRIORITY_MAX_AGE_MIN__</string>
+    <key>FUNNEL_MAX_AGE_MIN</key>
+    <string>__FUNNEL_MAX_AGE_MIN__</string>
+    <key>MAX_FIX</key>
+    <string>__MAX_FIX__</string>
+    <key>MAX_FIX_TRIES</key>
+    <string>__MAX_FIX_TRIES__</string>
+    <key>MAX_RED_FIX</key>
+    <string>__MAX_RED_FIX__</string>
+    <key>MAX_RED_FIX_TRIES</key>
+    <string>__MAX_RED_FIX_TRIES__</string>
+    <key>MIN_SWAP_FREE</key>
+    <string>__MIN_SWAP_FREE__</string>
+    <key>MIN_MEM_FREE_MB</key>
+    <string>__MIN_MEM_FREE_MB__</string>
+    <!-- the SPAWN gate's available-memory floor (agent-infra#2387) and the two factors it is derived
+         from. RENDERED, not README-only: the gate names MEM_MIN_AVAIL_MB in its own refusal line as the
+         operator's lever, and a plist-managed cell (the population the six dmesg OOM kills came from)
+         can only set what this template substitutes. The floor refuses a spawn when MemAvailable is
+         below it; it fails CLOSED, so an unreadable probe refuses too. -->
+    <key>MEM_MIN_AVAIL_MB</key>
+    <string>__MEM_MIN_AVAIL_MB__</string>
+    <key>MEM_LANE_RESERVE_MB</key>
+    <string>__MEM_LANE_RESERVE_MB__</string>
+    <key>MEM_SPAWN_RESERVE_LANES</key>
+    <string>__MEM_SPAWN_RESERVE_LANES__</string>
+    <key>BATCH</key>
+    <string>__BATCH__</string>
+    <key>PRODUCT_FLOOR</key>
+    <string>__PRODUCT_FLOOR__</string>
+    <key>CYC</key>
+    <string>__CYC__</string>
+  </dict>
+</dict>
+</plist>

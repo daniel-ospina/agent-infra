@@ -1,0 +1,457 @@
+#!/usr/bin/env bash
+# fleet-cost-report.sh — weekly visible-fleet cost/truncation report (#341 PR-B).
+#
+# Answers "did the clamp work?" for the fleet running under the shipped 800K
+# clamp (#341 PR-A; 400K→300K dialed by PR #511; 300K→800K by the owner
+# decision of 2026-10-31).
+# Aggregates per-session metrics from pi session JSONLs via the
+# SHARED parser (session-postmortem.sh --summary — ONE parser for the retro
+# summary, this report, and watch-truncation.sh; #373 parser-sharing contract).
+#
+# Three thresholds (#341 Task B7, calibrated against the real corpus at #373):
+#   (a) ceiling-compaction count = compaction records with tokensBefore ≥ 900K
+#       (= 0.9 × 1M absolute — the 1M-drift detector; NOT 0.9×300K, which sits
+#       at 270K — below the 283,616 trigger — and would classify every
+#       post-clamp compaction as ceiling). Expected post-clamp: 0.
+#       Escalate when > 0.
+#   (b) cache-share of spend over COMPACTING sessions in the clamp population
+#       (max compaction tokensBefore ≥ FLEET_REGIME_TB 783616 = the 800K-clamp
+#       compaction trigger, 800000 − 16384 — sessions compacting AT/ABOVE the
+#       trigger ARE post-clamp, not legacy; the floor only excludes the
+#       pre-clamp 200K-transient legacy sessions (~196–205K), whose smaller
+#       window has different cache economics and never belonged to the clamp).
+#       The population is regime-MIXED for one window after the 2026-09-21
+#       withdrawal — see REGIME HISTORY below:
+#       Σ cost.cacheRead+cacheWrite / Σ cost.total over MESSAGE usage, pooled
+#       over the whole window. Compaction summarizer calls (cacheRead≈0,
+#       distinct LLM call) are reported separately, excluded from (b) so the
+#       metric matches the pre-registered 65–70% band (measured message-only
+#       in a single-regime window: 85.9% pre-clamp / ~70% post-clamp — #373-era
+#       clamp-level independent; compaction-included would read ~62% and
+#       false-alarm). Escalate below the floor (FLEET_CACHE_FLOOR default
+#       0.65 = the pre-registered band low) — real drift below the 800K-clamp
+#       regime trips; small-n weeks (n<3 compacting sessions) are reported not
+#       escalated (a single-session share is noise).
+#
+# REGIME HISTORY (withdrawal, 2026-09-21): the #1213/#1226 300K→700K re-clamp
+# is WITHDRAWN (the deployed floor fix — `MIN_USABLE_MAX_TOKENS = 1024`,
+# pi-patch #1214(b) — closes the one-token silent death the wider window was
+# bought for, at a recurring ~+20% fleet spend), so (b)'s regime floor is back
+# at 283616 AT THAT DATE. THE FLOOR IS NOT REGIME-PURE FOR ONE WINDOW: sessions
+# that compacted 2026-09-18..21 ran the retired 700K clamp, and 3 compaction
+# records in that era's session files (measured 2026-09-21) sit at/above the
+# 650000 trigger (650,134–650,426), putting the 2 sessions carrying them into
+# n_clamp and into the cache-share pools of a run whose window still reaches
+# them. The number is still reported
+# (it is the same cache economics — cache-level independent); read n_clamp on
+# the first post-withdrawal run knowing it mixes regimes for that one window.
+# The TRUNCATION instrument is unaffected: it buckets only
+# stopReason:"length" records, and the retired era produced none — its bucket
+# is empty (watch-truncation.sh, header).
+#
+# SUPERSEDED 2026-10-31 (owner decision): the clamp moved 300K → 800K, so the
+# floor is 783616 and this paragraph's 283616 is history, kept because it dates
+# the era it describes.
+# THE TRANSIENT IS THE OPPOSITE OF MIXED — IT IS STARVED, and the direction
+# matters because it decides whether a CLEAN run is evidence. Every compaction
+# in 283,616–783,615 (i.e. EVERY 300K-clamp-era compaction) is now BELOW the
+# floor, so it lands in legacy_comps and is EXCLUDED from the cache-share pool:
+# for the first window after this change n_clamp UNDER-COUNTS, an n<3 reading is
+# the EXPECTED transient rather than a clean week, and (b)'s CLEAN line prints
+# its own `(b) not evaluated` qualifier whenever the pool never reached the
+# threshold. The inflation direction cannot happen — no 300K-clamp record can
+# sit at/above 783,616 — so nothing can be double-counted either.
+# The cache-share band (65–70%) below was
+# MEASURED under the 300K clamp and has NOT been re-measured at 800K: the
+# 0.65 floor is kept as a lower-bound alarm, not because 65–70% is the
+# expected reading at 800K (a larger window keeps more input cacheable, so the
+# expected share is plausibly higher — the instrument has no 800K anchor yet).
+#   (c) output+reasoning share over non-cache tokens — the #365 TREND
+#       instrument (recorded every run, never escalates). Formula matches the
+#       pre-registered "real median 58%": per-session (output+reasoning) /
+#       (input+output+reasoning), median over sessions with usage.
+#
+# Also reports: compaction records (count, max tokensBefore, ceiling class) +
+# per-compacting-session cost vs the regenerated Aug baseline (constants
+# regenerated with the fixed parser at #373: 8 pre-clamp compacting sessions,
+# 17 compaction records — cost/session $2.99 incl. compaction usage, calls
+# mean 1867, re-read volume mean 1,969,341). See the #341 plan Task B7.
+#
+# Usage:
+#   fleet-cost-report.sh [--days N] [--since YYYY-MM-DD] [--sessions-dir DIR]
+#   fleet-cost-report.sh --print-regime-floor   print the resolved floor and exit
+#   Exit 0 clean · 1 escalation (a or b tripped) · 2 usage/environment error
+#
+# Env seams (tests + tuning):
+#   PI_SESSIONS_DIR / --sessions-dir   session JSONL root (default ~/.pi/agent/sessions)
+#   FLEET_WINDOW_DAYS / --days         report window (default 7)
+#   FLEET_CACHE_FLOOR                  cache-share escalation floor (default 0.65)
+#   FLEET_REGIME_TB                    clamp-population floor (default 783616 =
+#                                       the 800K-clamp compaction trigger)
+#   SPM_SH                             shared-parser script path override (tests)
+# NOTE: the ceiling classification (tokensBefore ≥ 900000) lives in the SHARED
+# parser (session-postmortem.sh) — the single source of truth for report/watch/
+# retro. There is intentionally NO FLEET_CEILING_TB knob here: a display-only
+# seam would print one threshold while the parser applies another.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SPM_SH="${SPM_SH:-$SCRIPT_DIR/session-postmortem.sh}"
+SESSIONS_DIR="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
+WINDOW_DAYS="${FLEET_WINDOW_DAYS:-7}"
+CACHE_FLOOR="${FLEET_CACHE_FLOOR:-0.65}"
+REGIME_TB="${FLEET_REGIME_TB:-783616}"
+# Frozen ONCE, before anything reads it: `--print-regime-floor` reports this value
+# and the banding below interpolates this value, so freezing is what makes those
+# two the SAME by construction — a later assignment cannot make the answer
+# diverge from the behaviour (#1088's lesson, applied to this interface, #1342).
+readonly REGIME_TB
+SINCE=""
+PRINT_REGIME_FLOOR=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --days) WINDOW_DAYS="${2:-}"; shift 2 ;;
+        --since) SINCE="${2:-}"; shift 2 ;;
+        --sessions-dir) SESSIONS_DIR="${2:-}"; shift 2 ;;
+        --print-regime-floor) PRINT_REGIME_FLOOR=1; shift ;;
+        *) echo "usage: $0 [--days N] [--since YYYY-MM-DD] [--sessions-dir DIR] [--print-regime-floor]" >&2; exit 2 ;;
+    esac
+done
+
+# garbage --days/--since must be a USAGE error (rc=2), never a silent
+# false-CLEAN empty window (a monitor that reports PASS on bad config is a
+# silent no-op — the weekly driver would log PASS off it).
+case "$WINDOW_DAYS" in
+    ''|*[!0-9]*|0) echo "ERROR: --days must be a positive integer (got: '$WINDOW_DAYS')" >&2; exit 2 ;;
+esac
+if [ -n "$SINCE" ]; then
+    if ! grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' <<<"$SINCE" \
+       || ! python3 -c "import datetime,sys; datetime.date.fromisoformat('$SINCE')" 2>/dev/null; then
+        echo "ERROR: --since must be a real YYYY-MM-DD date (got: '$SINCE')" >&2
+        exit 2
+    fi
+fi
+
+# ── the regime floor must be a plain integer before ANY use ─────────────
+# A bad value used to reach the Python heredoc's `float()` and die with a
+# traceback; a clean usage error is the fail-closed shape.
+case "$REGIME_TB" in
+    ''|*[!0-9]*) echo "ERROR: FLEET_REGIME_TB must be a plain integer (got '$REGIME_TB')" >&2; exit 2 ;;
+esac
+
+# ── --print-regime-floor: report the RESOLVED floor and exit ─────────────
+# The cost-config guard calls this rather than parsing this file's assignment
+# text (#1342, repeating the #1088 review's rule for `$CAP_MS`). The floor is
+# frozen from FLEET_REGIME_TB at the top, so this prints the exact value the
+# banding below applies — an ambient override or a later assignment cannot make
+# the answer differ from the behaviour. Side-effect free and dependency-free by
+# construction: it runs BEFORE the shared-parser and sessions-dir checks, so it
+# works in a fixture root and in CI where neither exists.
+if [ "$PRINT_REGIME_FLOOR" -eq 1 ]; then
+    printf '%s\n' "$REGIME_TB"
+    exit 0
+fi
+
+[ -x "$SPM_SH" ] || { echo "ERROR: shared parser not found: $SPM_SH" >&2; exit 2; }
+[ -d "$SESSIONS_DIR" ] || { echo "ERROR: sessions dir not found: $SESSIONS_DIR" >&2; exit 2; }
+
+# ── resolve session files in window (filename date = deterministic) ─────────
+# Session files are YYYY-MM-DDTHH-...jsonl; the fleet window is by filename
+# date so copies/checkouts never shift the window (mtime would).
+FILES=()
+if [ -n "$SINCE" ]; then
+    while IFS= read -r f; do FILES+=("$f"); done < <(
+        find "$SESSIONS_DIR" -name '*.jsonl' 2>/dev/null | python3 -c "
+import sys
+since='$SINCE'
+for line in sys.stdin:
+    f=line.strip()
+    if not f: continue
+    d=f.rsplit('/',1)[-1][:10]
+    if d >= since: print(f)
+" | sort)
+else
+    while IFS= read -r f; do FILES+=("$f"); done < <(
+        find "$SESSIONS_DIR" -name '*.jsonl' 2>/dev/null | FLEET_WINDOW_DAYS="$WINDOW_DAYS" python3 -c "
+import sys, os, datetime
+win=int(os.environ['FLEET_WINDOW_DAYS'])
+cutoff=(datetime.date.today()-datetime.timedelta(days=win-1)).isoformat()
+for line in sys.stdin:
+    f=line.strip()
+    if not f: continue
+    d=f.rsplit('/',1)[-1][:10]
+    if d >= cutoff: print(f)
+" | sort)
+fi
+
+# ── aggregate via the shared parser (one process, JSONL on stdout) ─────────
+if [ "${#FILES[@]}" -eq 0 ]; then
+    echo "## Fleet cost report — no sessions in window (last ${WINDOW_DAYS} days)"
+    echo ""
+    echo "_Sessions dir: ${SESSIONS_DIR}_"
+    exit 0
+fi
+
+SUMMARY_JSONL="$(bash "$SPM_SH" --summary "${FILES[@]}" 2>/dev/null || true)"
+if [ -z "$SUMMARY_JSONL" ]; then
+    echo "ERROR: shared parser produced no output for ${#FILES[@]} session(s)" >&2
+    exit 2
+fi
+
+# P1 data-absence gate: the parser error-tags unreadable/corrupt session files
+# (one row per input, "error" key). Silently filtering them would let a
+# rollback-decision instrument report CLEAN on exactly the data-loss it exists
+# to catch (permission changes, crash-truncated JSONL dropping a session's
+# compaction record). Surface the failures loudly as an env/data error (rc=2)
+# — the weekly driver logs these without filing a misleading escalation issue.
+ERR_COUNT="$(printf '%s\n' "$SUMMARY_JSONL" | grep -c '"error"' || true)"
+# Fail-CLOSED gate: an empty/non-numeric count means the check itself broke —
+# trip loudly (exit 2) rather than silently skipping into a CLEAN pass.
+case "$ERR_COUNT" in
+    ''|*[!0-9]*) echo "ERROR: could not read parser error count for ${#FILES[@]} session(s)" >&2; exit 2 ;;
+esac
+if [ "$ERR_COUNT" -gt 0 ]; then
+    echo "ERROR: ${ERR_COUNT} session(s) failed to parse and were EXCLUDED:" >&2
+    printf '%s\n' "$SUMMARY_JSONL" | python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    m = json.loads(line)
+    if m.get("error"):
+        print("  " + (m.get("session") or "?") + ": " + m["error"])' >&2
+    exit 2
+fi
+
+python3 - "$SUMMARY_JSONL" "$CACHE_FLOOR" "$REGIME_TB" <<'PYEOF'
+import json, sys, statistics, math
+
+raw, floor, regime_tb = (sys.argv[1], float(sys.argv[2]), float(sys.argv[3]))
+rows = [json.loads(l) for l in raw.splitlines() if l.strip()]
+rows = [r for r in rows if not r.get("error")]
+
+comps = [r for r in rows if r["compacting"]]
+# clamp population: compactions at/above the 800K-clamp
+# compaction trigger (783,616 = 800,000 − 16,384) — incl. the band
+# a pre-dial sub-300K floor would have misclassified as legacy. Pre-clamp
+# 1M-drift sessions (≥900K) also belong here (they ARE the drift (a) detects);
+# only the sub-trigger legacy sessions are excluded from the cache-share
+# economics pool — at this floor that is the pre-clamp 200K transient
+# (~196–205K) PLUS the three retired eras (400K-era 383–406K, 300K-era
+# 283,616–300,000, withdrawn 700K-era 650–700K), which is what the printed
+# line enumerates: a 390K record is a retired clamp era, not a 200K transient.
+# NOT single-regime for one window after the 2026-09-21 withdrawal — see
+# REGIME HISTORY above.
+clamp_comps = [r for r in comps if r["max_tokensBefore"] >= regime_tb]
+legacy_comps = [r for r in comps if r["max_tokensBefore"] < regime_tb]
+n_comp_recs = sum(r["comp_count"] for r in comps)
+ceil_recs = sum(r["ceiling_compactions"] for r in comps)
+max_tb = max((r["max_tokensBefore"] for r in comps), default=0)
+
+# (b) cache-share over the clamp-regime compacting sessions — MESSAGE usage
+cache = sum(r["msg_cost_cache"] for r in clamp_comps)
+total = sum(r["msg_cost_total"] for r in clamp_comps)
+cache_share = cache / total if total > 0 else None
+comp_cost = sum(r["comp_cost_total"] for r in clamp_comps)
+# small-n guard must count COST-BEARING sessions, not all clamp sessions:
+# a clamp session with no cost dict contributes 0 to both cache and total and
+# must not pad n so that one session's economics can escalate on its own.
+n_with_cost = sum(1 for r in clamp_comps if r["msg_cost_total"] > 0)
+
+# per-session cost incl. compaction usage (comparison vs Aug baseline)
+sess_cost = [(r["msg_cost_total"] + r["comp_cost_total"]) for r in comps]
+total_cost = sum(sess_cost)
+n_clamp = len(clamp_comps)
+total_calls = sum(r["msg_calls"] for r in comps)
+total_reread = sum(r["reread_volume"] for r in comps)
+
+# (c) output+reasoning share — per-session median over non-cache tokens
+trend = []
+for r in rows:
+    denom = r["msg_input"] + r["msg_output"] + r["msg_reasoning"]
+    if denom > 0:
+        trend.append((r["msg_output"] + r["msg_reasoning"]) / denom)
+
+n_len = sum(r["genuine_len_stops"] for r in rows)
+n_len_sess = sum(1 for r in rows if r["genuine_len_stops"] > 0)
+
+# (d) peak/off-peak spend split (#634). DeepSeek bills 2x during 01:00-04:00
+# and 06:00-10:00 UTC, Mon-Fri; weekends are off-peak. The parser buckets
+# every costed call by its own timestamp, so the split is measured, not
+# modelled.
+#
+# THE RECORDED COST IS *NOT* WHAT WE WERE BILLED. models.json carries the
+# OFF-PEAK card and pi has no time-of-day cost logic (models.js calculateCost()
+# bills rates+tiers only), so a peak call logged at L was actually billed 2L.
+# Deferring that call to off-peak bills L — so the saving is the FULL logged
+# peak amount, NOT half of it. Evidence: the logged peak/off ratio per call is
+# ~0.98 (a real 2x would read ~2.0), i.e. every record is stamped at one flat
+# (off-peak) rate. NOTE that is a ratio of $ PER CALL, not of dollar totals —
+# the totals differ by call volume. (Whether the flash figure in models.json
+# and the research doc's rate card agree is a separate open question; the
+# structural premise here rests on the pro row, which matches off-peak exactly
+# and is half its documented peak.)
+peak_cost = sum(r.get("msg_cost_peak", 0) for r in rows)
+off_cost = sum(r.get("msg_cost_off", 0) for r in rows)
+undated_cost = sum(r.get("msg_cost_undated", 0) for r in rows)
+peak_calls = sum(r.get("msg_calls_peak", 0) for r in rows)
+off_calls = sum(r.get("msg_calls_off", 0) for r in rows)
+undated_calls = sum(r.get("msg_calls_undated", 0) for r in rows)
+if not all(math.isfinite(v) and v >= 0 for v in (peak_cost, off_cost, undated_cost)):
+    # An absurd aggregate (NaN, inf, or NEGATIVE) must not silently render as
+    # "no data" — this script fail-closes elsewhere on the same principle (a
+    # report that shows healthy absence while data exists is worse than a loud
+    # failure). Zero still flows to the genuine-absence path below.
+    print("ERROR: non-finite or negative cost aggregate (peak=%r off=%r) — "
+          "refusing to render a split that would read as data absence" % (peak_cost, off_cost),
+          file=sys.stderr)
+    sys.exit(2)
+split_total = peak_cost + off_cost
+peak_share = peak_cost / split_total if split_total > 0 else None
+# Billed view: peak dollars are doubled, off-peak are as logged.
+peak_billed = 2 * peak_cost
+billed_total = peak_billed + off_cost
+billed_share = peak_billed / billed_total if billed_total > 0 else None
+# Perfect deferral moves every peak call to off-peak: it saves the peak
+# premium, which is exactly the (doubled minus flat) difference = the logged
+# peak amount.
+premium_ceiling = peak_cost
+by_hour = {}
+for r in rows:
+    for h, v in (r.get("msg_cost_by_hour") or {}).items():
+        by_hour[h] = by_hour.get(h, 0.0) + v
+
+# ── render ──────────────────────────────────────────────────────────────────
+CEILING_TB = 900000   # must match session-postmortem.sh's parser constant.
+# At the 800K geometry this is only 116,384 above the 783,616 trigger, and
+# compaction is checked on agent_end — so a CLAMPED session's own mid-turn
+# overrun can reach this band too (`policy §7.1`: a session may overrun toward
+# the provider's real 1,000,000 before it is rejected). A record here is
+# therefore AMBIGUOUS: 1M-era drift (the clamp is not live) OR this geometry's
+# own overrun. Attribute it by the session's resolved window, never by
+# tokensBefore alone.
+print(f"# Fleet cost report — {len(rows)} session(s) in window "
+      f"({len(comps)} compacting, {n_clamp} in the shipped 800K-clamp regime)")
+print("")
+print(f"- sessions scanned: {len(rows)}   compacting sessions: {len(comps)}")
+if legacy_comps:
+    print(f"- legacy sub-{regime_tb/1000:.1f}K-window compacting sessions excluded "
+          f"from the cache-share pool: {len(legacy_comps)} (sub-trigger: the pre-clamp "
+          f"200K window (~196,000–205,000), plus the retired 400K-era 383,000–406,000, "
+          f"300K-era 283,616–300,000 and 700K-era 650,000–700,000 records this floor now "
+          f"excludes — same eras as watch-truncation.sh's triage note)")
+print(f"- compaction records: {n_comp_recs}   max tokensBefore: {max_tb:,}")
+
+print("")
+print("## (a) Ceiling-compaction count (1M-drift detector, tokensBefore "
+      f"≥ {CEILING_TB:,})")
+print(f"- records at ceiling: {ceil_recs}   (expected post-clamp: 0)")
+
+print("")
+print("## (b) Cache-share of spend over clamp-regime compacting sessions")
+if cache_share is None or n_with_cost < 3:
+    verdict = "(n<3 with cost data — reported, not escalated; single-session share is noise)"
+    print(f"- cache-share: {cache_share:.1%}   n={n_clamp} compacting sessions ({n_with_cost} with cost)  {verdict}"
+          if cache_share is not None else
+          f"- no message cost data (n={n_clamp}) — undefined, not escalated")
+else:
+    band = "✓ in 800K-clamp regime" if cache_share >= floor else "✗ BELOW FLOOR"
+    print(f"- cache-share: {cache_share:.1%}   floor: {floor:.0%}   {band}   "
+          f"(n={n_with_cost} cost-bearing of {n_clamp} clamp sessions)")
+    print(f"  (compaction-call spend ${comp_cost:.2f} excluded — cacheRead≈0 "
+          "summarizer calls; the 65–70% band was MEASURED under the 300K clamp "
+          "(#373-era anchors) and has NOT been re-measured at the 800K clamp — "
+          f"{floor:.0%} is a lower-bound alarm, not an expectation here)")
+
+print("")
+print("## (c) Output+reasoning share over non-cache tokens (#365 trend)")
+if trend:
+    print(f"- per-session median: {statistics.median(trend):.1%}   "
+          f"range: {min(trend):.1%}–{max(trend):.1%}   (n={len(trend)} sessions)")
+else:
+    print("- no usage data")
+
+print("")
+print("## (d) Peak/off-peak spend split (#634 — DeepSeek 2x windows)")
+if peak_share is None:
+    print("- no time-stamped cost data in this window")
+    if undated_calls:
+        print(f"- ALERT: {undated_calls:,} costed call(s) (${undated_cost:.2f}) carry no "
+              "usable timestamp, so the split is not merely empty — it is unmeasurable")
+else:
+    print("- recorded dollars are stamped at the OFF-PEAK card, so a peak call was")
+    print("  actually billed 2x what is logged here — both views are shown:")
+    print(f"- peak:     ${peak_cost:9.2f} logged  ${peak_billed:9.2f} billed   "
+          f"{peak_calls:,} calls")
+    print(f"- off-peak: ${off_cost:9.2f} logged                "
+          f"{off_calls:,} calls")
+    print(f"- share of logged spend: {peak_share:.1%}      "
+          f"share of BILLED spend: {billed_share:.1%}")
+    if undated_calls:
+        print(f"- undated calls excluded from the split: {undated_calls:,} (${undated_cost:.2f})")
+    print(f"- deferrable premium ceiling: ${premium_ceiling:.2f}   "
+          "(moving every peak call off-peak saves its full logged amount)")
+    print("  windows: 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri")
+    top = sorted(by_hour.items(), key=lambda kv: -kv[1])[:5]
+    if top:
+        print("  busiest UTC hours: " + "   ".join(f"{h}Z ${v:.2f}" for h, v in top))
+
+print("")
+print("## Compaction + cost vs regenerated Aug baseline")
+if comps:
+    print(f"- fleet-total cost (compacting sessions, incl. compaction usage): "
+          f"${total_cost:.2f}")
+    print(f"- per-compacting-session cost: ${total_cost/len(comps):.2f} "
+          f"(Aug baseline $2.99/session incl. compaction usage)")
+    print(f"- per-compacting-session calls: {total_calls/len(comps):.0f} "
+          f"(Aug baseline mean 1867)   re-read volume/session: "
+          f"{total_reread/len(comps):,.0f} (Aug baseline mean 1,969,341)")
+print(f"- genuine stopReason:length (ceiling-truncation) records: {n_len} "
+      f"across {n_len_sess} session(s)")
+
+# ── escalation ──────────────────────────────────────────────────────────────
+esc = []
+if ceil_recs > 0:
+    esc.append(
+        f"ceiling-compaction count {ceil_recs} > 0 (records at/above {CEILING_TB:,} — "
+        f"either 1M-era drift (clamp not live) OR a clamped session's own mid-turn "
+        f"overrun, which at this geometry is reachable: {CEILING_TB - int(regime_tb):,} "
+        f"tokens past the {int(regime_tb):,} trigger, inside the provider's real 1M. "
+        f"Attribute the record by its session's RESOLVED window before concluding the "
+        f"clamp is not live)")
+if cache_share is not None and n_with_cost >= 3 and cache_share < floor:
+    esc.append(f"cache-share {cache_share:.1%} < floor {floor:.0%} "
+               "(below the expected 800K-clamp regime)")
+print("")
+if esc:
+    print("## ❌ ESCALATION")
+    for e in esc:
+        print(f"- {e}")
+    print("")
+    print("_The store-drift WARN class (#341) gains its escalation recipient here:")
+    print("the weekly report reader is the owner. Run scripts/watch-truncation.sh")
+    print("for the pre-committed rollback procedure._")
+    sys.exit(1)
+# A CLEAN verdict must not claim a threshold it never evaluated: (b) is SKIPPED
+# when the pooled share is undefined or fewer than 3 clamp sessions carry cost
+# data, and after the 2026-10-31 geometry move that is the EXPECTED reading for
+# the first window (every 300K-era compaction is now sub-floor and excluded).
+# Printing an unqualified CLEAN over a starved pool is a false PASS in the one
+# report whose job is to answer "did the clamp work?".
+cache_evaluated = cache_share is not None and n_with_cost >= 3
+# ⛔ A MACHINE-READABLE VERDICT BESIDE THE PROSE, because the WRAPPER (cron-quality-gates.sh
+# `fleet`) restates this conclusion at the aggregate level and must not have to parse wording to
+# know whether (b) ran. Grepping the human line is exactly the coupling that let the wrapper keep
+# printing "thresholds within" over a pool it never measured; a stable marker makes the two
+# readers the SAME fact. Read by cron-quality-gates.sh:351.
+print(f"# fleet-verdict: clean cache-share-evaluated={'yes' if cache_evaluated else 'no'}")
+if cache_evaluated:
+    print("## ✅ CLEAN — thresholds within the shipped 800K-clamp regime")
+else:
+    print(f"## ✅ CLEAN — but the cache-share threshold was NOT evaluated "
+          f"(n_clamp={n_clamp}, n_with_cost={n_with_cost}; see (b)) — (a) is within "
+          f"thresholds, (b) is unmeasured this window")
+sys.exit(0)
+PYEOF

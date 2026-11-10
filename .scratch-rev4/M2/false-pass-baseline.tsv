@@ -1,0 +1,14 @@
+# scripts/false-pass-baseline.tsv — grandfathered false-PASS findings (agent-infra#2121)
+#
+# WHY A BASELINE AND NOT A FIX: each group below is a KNOWN instance that belongs to its own
+# open issue (named per line). The check still reports it, and a NEW instance of the same rule
+# in the same file raises that (file, rule) count and FAILS — this file cannot swallow a
+# regression. Keyed by (path, rule, COUNT), never by line number: an unrelated edit above a
+# finding must not red a peer lane's CI.
+#
+# FORMAT: <path>	<rule>	<count>	<tracking issue + why this is still open>
+# Rewrite with: bash scripts/check-false-pass-shapes.sh --update-baseline
+# The 4th column is REQUIRED: an entry with no justification is reported as a finding.
+scripts/install-launchd.sh	empty-as-pass	1	#1743 — retire_pass() returns a success-default flag over a loop fed by retired_labels(), so a feeder that emitted nothing is a PASS here. The COUNT WAS 2 AND IS NOW 1: the verify_targets() half of this entry is FIXED (agent-infra#3413 review P2-E) — plist_program_args now returns non-zero when the plist cannot be parsed or carries no ProgramArguments and verify_targets refuses on an empty scan, so "could not parse" is no longer the same observable as "everything checks out". The remaining instance belongs to #1743's own fix.
+scripts/cloud-cell-quiesce.sh	pre-existing-as-evidence	1	#2346 — `step "seeded $O with $(ls "$O"/*.sh | wc -l ...)"` counts the RUNTIME directory, which already held the previous seed, so the number is not evidence this run copied anything; the `cp` above it discards its status (`|| true`), so a wholly failed seed still prints `seeded ... N scripts`. The rest of #2041's class (bg/finish.sh was fixed there; these are the unswept siblings).
+scripts/deploy-crossbox.sh	pre-existing-as-evidence	1	#2346 — `say "seeded $O with $(ls "$O"/*.sh | wc -l ...)"` counts the TARGET directory, which may already hold files from an earlier deploy, so the count proves the directory is populated rather than that this run seeded it. Same root as #2041, which fixed only bg/finish.sh.

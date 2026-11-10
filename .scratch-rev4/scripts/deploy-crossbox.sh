@@ -1,0 +1,245 @@
+#!/bin/bash
+# deploy-crossbox.sh — put the reviewed harness (with the cross-box claim registry) onto a cell.
+#
+# Runs ON THE CELL (Linux). Pushed and invoked by the orchestrator.
+#
+# WHY THE PATH-SCOPED CHECKOUT. The cell's clone of agent-infra is also the repo the
+# controller operates on, so it must stay on main. `git checkout <ref> -- <path>` moves
+# ONLY the harness subtree, leaving the rest of the tree (and HEAD) alone.
+#
+# WHY ALL *.sh ARE RE-SEEDED. The registry lives in a NEW file (claims.sh). `orch-loop.sh`
+# and `merge-one.sh` source it from $O and gate on `[ -f "$O/claims.sh" ]`, so a partial
+# deploy would silently leave the registry OFF (fail-open) rather than error. README §4.
+#
+# WHY THE CONTROLLER IS STOPPED FIRST. `cp` over a script that bash is mid-read from can
+# execute mixed content — the running loop holds orch-loop.sh open.
+set -uo pipefail
+
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never re-spelled ──────────────────────────────────
+# The default here used to be `/tmp/cell-home`, the legacy volatile home. This script exports
+# `HOME="$CELL_HOME"` for the controller session it builds, so a default pointing at the legacy home
+# handed every lane a home the spawning unit did not use — the measured 403-contents=write split.
+# The rule and its precedence live in `scripts/lib/cell-home.sh`.
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+CROSSBOX_SELF_DIR=""
+if [ -n "$_SELF" ]; then CROSSBOX_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB="${CROSSBOX_SELF_DIR:+$CROSSBOX_SELF_DIR/lib/cell-home.sh}"
+if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
+  . "$CELL_HOME_LIB"
+  CELL_HOME="$(cell_home_resolve)"
+elif [ -n "${CELL_HOME:-}" ]; then
+  :   # an explicit CELL_HOME is a complete answer; the resolver only supplies the DEFAULT
+elif [ -n "${HOME:-}" ]; then
+  CELL_HOME="$HOME"
+  printf '%s: warn: %s is not readable — using HOME (%s) as the cell home; the durable-home default is unavailable on this copy (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+else
+  printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home to the legacy /tmp/cell-home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2
+  exit 78
+fi
+BR="${BR:-}"   # unused now the deploy fast-forwards main; kept for callers
+AI="${AI:-/tmp/cell-ai}"
+O="${O:-$CELL_HOME/orchestrator}"
+H="$AI/scripts/orchestrator-harness"
+# ⛔ `REPO` HAS NO DEFAULT HERE, AND THAT IS THE FIX. This line used to read
+# `REPO="${REPO:-/tmp/cell-ai}"` — a CELL path. This script is pushed to and run ON a cell, but it is
+# also run on a LAPTOP against a cell-shaped AI, and on any such box the default names a directory that
+# is not there; the controller then starts with `REPO=/tmp/cell-ai` (line 106 passes it through to the
+# tmux command below), and the failure arrives one generation later as a dispatch path that resolves
+# nothing. `REPO` is the operator's, set ONCE per box, and `repo-slug.sh`'s `resolve_repo` is the ONE
+# place that reads it — it refuses by name rather than guessing. Resolved below in TWO passes: a
+# pre-flight when `$H` can already answer, and again once the fast-forward has put `$AI` on main.
+OR="${OR:-daniel-ospina/agent-infra}"
+SCOPE="${SCOPE:-broad}"
+MAX_LANES="${MAX_LANES:-3}"
+
+log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+die() { log_line "FATAL: $*" >&2; exit 1; }
+
+# ── how REPO arrives ──────────────────────────────────────────────────────
+# `--repo PATH` is the ONE explicit way an ssh caller can hand this box its repo. On a cell the two
+# documented surfaces (the launchd plist, the cell's keys.env) reach the CONTROLLER — cloud-cell-
+# supervisor.sh sources keys.env with `set -a` before starting the loop — NOT the shell that pushes and
+# runs this script, so without an argument a cell had no way in at all and the value the removed
+# `/tmp/cell-ai` default used to supply could not be supplied explicitly either (#3054 review, P1-2).
+# An argument is still PROVEN by `resolve_repo`: this adds an INPUT, never a default. Any other
+# argument is ignored, exactly as every argument was before this option existed — automation invokes
+# this script and a stricter parser would be a behaviour change nobody asked for.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo)   [ "$#" -ge 2 ] || die "--repo needs a PATH"; REPO="$2"; shift 2 ;;
+    --repo=*) REPO="${1#--repo=}"; shift ;;
+    --)       shift; break ;;
+    *)        shift ;;
+  esac
+done
+
+# ⛔ SOURCED FROM `$H`, THE CELL'S OWN CHECKOUT: that copy is on main (keeping it there is this
+# deploy's job), so the resolver that runs is the shipped one. A `$H` predating `resolve_repo` is
+# REFUSED BY NAME rather than silently falling back to a path default — that fallback is the defect.
+#
+# ⛔ BUT THAT REFUSAL MUST NOT COME BEFORE THE STEP THAT CAN SUPPLY IT (#3054 review, P1-2). `$H` is
+# `$AI/scripts/orchestrator-harness` — INSIDE the clone that step 2 fast-forwards — so on every
+# existing cell (whose `/tmp/cell-ai` predates this change) a stale `$H` died HERE, before the
+# `git merge --ff-only` that brings `resolve_repo` in; and the remedy the old message printed could not
+# break it either, because `deploy-harness.sh --o $O` re-seeds `$O` FROM `$H` and so cannot put the
+# resolver INTO `$H`. The only real unblock was a hand-run fast-forward of `$AI` — i.e. step 2.
+# So the resolver is PRE-FLIGHTED here and PERFORMED once `$AI` is on main:
+#   * a MISSING `repo-slug.sh` still dies here — it is not the stale shape, and no fast-forward is
+#     needed for a file every current checkout already ships;
+#   * a stale one (present, no `resolve_repo`) is DEFERRED, not refused;
+#   * a usable one resolves here, so a WRONG REPO still refuses BEFORE the controller is stopped —
+#     the property that makes this script safe to run while the loop is working.
+#
+# ⛔ THE PROPERTY IS CONDITIONAL, AND THE CONDITION IS NAMED HERE (#3054 review, P2). On a cell whose
+# harness predates `resolve_repo` the check CANNOT run yet, so a wrong-but-non-empty `$REPO` is judged
+# only AFTER step 2 — and by then step 1 has stopped the controller, leaving the cell with no loop
+# until an operator fixes REPO and re-runs. That residual is the price of not duplicating the resolver
+# (a private copy of the rule here is the defect this whole PR removes), so it is disclosed rather
+# than hidden. What CAN be refused early is refused early: an UNSET `$REPO` can never succeed on a
+# stale harness — the fast-forward supplies the resolver and the resolver then refuses it — so it is
+# stopped HERE, before anything is killed.
+[ -f "$H/repo-slug.sh" ] || die "repo-slug.sh missing from $H — cannot resolve REPO, and this script will not guess one"
+if grep -q '^resolve_repo()' "$H/repo-slug.sh" 2>/dev/null; then
+  # shellcheck source=scripts/orchestrator-harness/repo-slug.sh
+  . "$H/repo-slug.sh" || die "cannot source $H/repo-slug.sh — cannot resolve REPO"
+  # Subshell: this pass only needs the VERDICT (a refusal already went to stderr), and discarding stdout
+  # means no message can be mistaken for a path. The value the controller gets comes from the pass below.
+  ( resolve_repo >/dev/null ) || exit $?
+else
+  # Not a guess about what REPO should be: a statement that NO value can work on this harness, so the
+  # controller must not be stopped for a run that is guaranteed to abandon it.
+  [ -n "${REPO:-}" ] || die "REPO is unset and $H/repo-slug.sh predates resolve_repo — the fast-forward would supply the resolver and the resolver would then REFUSE an unset REPO, so nothing has been stopped. Set REPO the ONE way this box has for it (the launchd plist's EnvironmentVariables on a Mac, the cell's keys.env), or pass --repo PATH"
+fi
+
+export HOME="$CELL_HOME"
+cd "$AI" || die "no $AI"
+
+log_line "repo HEAD=$(git rev-parse --short HEAD)  branch=$(git rev-parse --abbrev-ref HEAD)"
+
+# ── 1. stop the controller before touching the files it is reading ────────────
+if tmux has-session -t orch 2>/dev/null; then
+  log_line "stopping controller (tmux orch)"
+  tmux kill-session -t orch 2>/dev/null
+  sleep 2
+fi
+
+# ── 2. fast-forward the whole clone to main ───────────────────────────────────
+# NOT a path-scoped checkout: for a cell whose REPO is this clone, `git checkout <ref> --
+# <path>` leaves the index dirty, which the controller then sees. Once the registry is on
+# main, a plain fast-forward updates BOTH the harness and the operator's repo, cleanly.
+log_line "fetching origin/main"
+git fetch -q origin main || die "git fetch failed"
+BEFORE="$(git rev-parse --short HEAD)"
+git merge --ff-only origin/main >/dev/null 2>&1 || die "cannot fast-forward to main (local changes in $AI?)"
+log_line "clone -> $(git rev-parse --short HEAD) (was $BEFORE)"
+
+# ── REPO is resolved HERE, from main's resolver (#3054 review, P1-2) ──────
+# This is the pass whose value the controller gets, and it runs AFTER the fast-forward on purpose: it
+# is what repairs a cell whose `$H` predated `resolve_repo`. A resolver that is STILL missing now is a
+# genuine refusal — the clone did not end up on main — and it names that, instead of the old dead end.
+[ -f "$H/repo-slug.sh" ] || die "repo-slug.sh missing from $H even after fast-forwarding $AI to main — $AI is not a usable agent-infra checkout"
+# shellcheck source=scripts/orchestrator-harness/repo-slug.sh
+. "$H/repo-slug.sh" || die "cannot source $H/repo-slug.sh — cannot resolve REPO"
+command -v resolve_repo >/dev/null 2>&1 || die "$H/repo-slug.sh still has no resolve_repo after fast-forwarding $AI to main — $AI is not ON main (a local commit, or a tree that cannot fast-forward); fix the clone, then re-run"
+REPO="$(resolve_repo)" || exit $?
+
+[ -f "$H/claims.sh" ]               || die "claims.sh missing on main — is the registry merged?"
+[ -f "$H/test-claims.sh" ]          || die "test-claims.sh missing on main"
+log_line "claims.sh present: $(wc -c < "$H/claims.sh" | tr -d ' ') bytes"
+
+# ── 3. re-seed the runtime dir with EVERY harness script ──────────────────────
+mkdir -p "$O" || die "cannot create $O"
+cp -p "$H"/*.sh "$O"/ || die "seed failed"
+[ -f "$O/claims.sh" ] || die "claims.sh did NOT land in $O — the registry would be silently OFF"
+# ── the gh-limit layer (#1988) ────────────────────────────────────────────────
+# Seeded with the same mirror rule as the *.sh files, because a cell without it spends the SHARED
+# account's quota unserialised: four boxes, one bucket. Not fatal — a cell that cannot find the
+# layer still merges (the wrapper fails open with a warning); what is lost is the serialisation.
+# ⛔ STAGE-THEN-RENAME. Both files are EXECUTED by every gh call on the live cell, and a plain `cp`
+# truncates before it writes — a call in that window would run `python3` on half a file. The
+# supervisor seeds the same pair this way for the same reason.
+# ⛔ AND THE HELPER IS DEFINED **OUTSIDE** THE BRANCH — review finding, P2, and it was a real hole: as
+# written below inside the `if`, bash defines the function only when its command RUNS, so a harness
+# that ships `gh-rest/gh` while the limit PAIR is missing (a state `install.sh:806-821` calls
+# legitimate and survivable — the adapter fails open with a warning) reached the adapter block with
+# `_seed_one: command not found`; `set -uo pipefail` has no `-e`, so the deploy did not die, printed
+# "seeded the gh REST adapter" over an EMPTY `$O/gh-rest`, and started the controller with a
+# non-existent dir leading its PATH — i.e. the #2039 defect this seed exists to remove, plus a false
+# success line over it (#2041's shape). Same hoist as `cloud-cell-supervisor.sh:2390`.
+_seed_one() {  # <src> <dest>
+  local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
+  cp -p "$_src" "$_tmp" || { rm -f "$_tmp"; die "cannot stage $(basename "$_dst") into $O"; }
+  chmod +x "$_tmp"      || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
+  mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst"; }
+}
+if [ -f "$H/gh-limit/gh" ] && [ -f "$H/gh-limit.py" ]; then
+  mkdir -p "$O/gh-limit" || die "cannot create $O/gh-limit"
+  _seed_one "$H/gh-limit/gh" "$O/gh-limit/gh"
+  _seed_one "$H/gh-limit.py" "$O/gh-limit.py"
+  log_line "seeded the gh-limit layer (serialised gh; path=$O/gh-limit)"
+else
+  # ⛔ MIRROR, not merely overlay — the same rule the *.sh loop above states. A stale `$O/gh-limit/gh`
+  # left by an earlier harness stays on the controller PATH (orch-loop.sh re-asserts it on `[ -d ]`)
+  # with its helper gone: a shim that cannot serialise anything, and before #1988's sentinel line the
+  # pair could even resolve into itself. A cell without the layer falls back to PATH's real gh with a
+  # warning, which is the documented fail-open.
+  if [ -e "$O/gh-limit/gh" ] || [ -e "$O/gh-limit.py" ]; then
+    rm -f "$O/gh-limit/gh" "$O/gh-limit.py" || die "cannot remove the stale gh-limit layer from $O"
+    rmdir "$O/gh-limit" 2>/dev/null || true
+    log_line "seed: removed the stale gh-limit layer — the harness no longer ships it"
+  fi
+  log_line "WARN: this harness ships no gh-limit layer — gh calls on this cell will NOT be serialised (#1988)"
+fi
+log_line "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present)"
+# ── the gh REST adapter (#2039) ──────────────────────────────────────────────
+# ⛔ THE SAME PAIR THE LIMIT LAYER IS: an adapter without it is unbacked-off, and the LIMIT LAYER
+# WITHOUT THE ADAPTER is what this box had — the per-candidate pre-flight stays on GraphQL, so a
+# GraphQL exhaustion ABORTs the refresh and the cell dispatches nothing (measured 2026-10-18 on
+# `pi-cell-2`, REST at 1952/5000). This script is a THIRD cell install path (besides
+# `cloud-cell-supervisor.sh start` and `install.sh`), so it carries the same seed and the same
+# mirror rule; `cloud-cell-supervisor.test.sh` sweeps every installer for the pair rather than
+# naming them, so a fourth cannot be forgotten.
+if [ -f "$H/gh-rest/gh" ]; then
+  mkdir -p "$O/gh-rest" || die "cannot create $O/gh-rest"
+  _seed_one "$H/gh-rest/gh" "$O/gh-rest/gh"
+  # ⛔ THE LIMIT CLAUSE IS CONDITIONAL (review finding, same block): on the path where the `gh-limit`
+  # `else` above just REMOVED `$O/gh-limit.py`, "its limit layer is $O/gh-limit.py" was a false
+  # sentence in the one log an operator has. Same shape as `cloud-cell-supervisor.sh`'s check line.
+  if [ -f "$O/gh-limit.py" ]; then
+    log_line "seeded the gh REST adapter (path=$O/gh-rest; its limit layer is $O/gh-limit.py)"
+  else
+    log_line "seeded the gh REST adapter (path=$O/gh-rest) — but $O/gh-limit.py is ABSENT, so its calls are NOT serialised or backed off (#1988)"
+  fi
+else
+  if [ -e "$O/gh-rest/gh" ]; then
+    rm -f "$O/gh-rest/gh" || die "cannot remove the stale gh-rest adapter from $O"
+    rmdir "$O/gh-rest" 2>/dev/null || true
+    log_line "seed: removed the stale gh-rest adapter — this harness no longer ships it"
+  fi
+  log_line "WARN: this harness ships no gh-rest adapter — the pre-flight stays on GraphQL, so a GraphQL exhaustion stops dispatch (#2039)"
+fi
+
+# ── 4. restart the controller, cold, with HOME carried into tmux ──────────────
+# ⛔ `unset GH_REPO` AFTER `set +a` (#2235). `keys.env` is re-sourced INSIDE the session, so a
+# global `export GH_REPO=…` in it answers every `gh` call that omits `--repo` from this controller
+# onward — the fail-open that made `admin-merge.sh 2232` print '✅ PR #2232 is ALREADY MERGED' for a
+# September TORTOISE PR over an open agent-infra one, exit 0. This is the fourth place that creates
+# a session (with the supervisor's two and cloud-cell-quiesce.sh's one), so it carries the same
+# strip; `cloud-cell-supervisor.test.sh` sweeps every session creator for it rather than naming
+# files, so a fifth cannot be forgotten.
+log_line "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
+tmux new-session -d -s orch -c "$H" \
+  "set -a; [ ! -f '$CELL_HOME/keys.env' ] || . '$CELL_HOME/keys.env'; set +a; unset GH_REPO; \
+   PATH='$O/gh-rest':'$O/gh-limit':\"\$PATH\" \
+   HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' MAX_LANES='$MAX_LANES' \
+   bash '$H/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+sleep 8
+
+tmux has-session -t orch 2>/dev/null && log_line "controller UP" || die "controller did not start"
+if [ -f "$O/claims.sh" ] && grep -q 'refs/claims' "$O/orch-loop.sh"; then
+  log_line "VERIFIED: $O/orch-loop.sh references refs/claims and $O/claims.sh is present"
+else
+  log_line "WARN: registry wiring not visible in $O — check"
+fi
+log_line "DONE"
