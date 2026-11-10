@@ -22,11 +22,15 @@
 #     [land-backlog] REFUSED bg issue-11086: UNREADABLE open-PR count for daniel-ospina/tortoise
 #       (the gh read failed) … Remedy: land/fix the open PRs (this is the drain) …
 #
-# Two wrongs on one line: nothing ever provided the config dir (`rg -n 'GH_CONFIG_DIR' scripts/` found
-# only test files), and the remedy names the wrong cause — acting on it means landing PRs to fix a
-# `hosts.yml` problem. #2509's finding 1 covers the OPPOSITE arm (`wt_spawn` REFUSING a
-# `keys.env`-provided `GH_CONFIG_DIR`); this module is the arm where nothing provides it at all, on the
-# `nonblocking-dispatch.sh` → `spawn-gate.sh` path.
+# Two wrongs on one line: nothing on the `nonblocking-dispatch.sh` → `spawn-gate.sh` path ever SET the
+# config dir, and the remedy names the wrong cause — acting on it means landing PRs to fix a `hosts.yml`
+# problem. ⛔ "NOTHING EVER SET IT" IS A CLAIM ABOUT *THIS PATH*, NOT ABOUT THE TREE, and the honest
+# evidence says so: `git grep -n 'GH_CONFIG_DIR' origin/main -- scripts/` returns READERS all over it —
+# `worker-terminal.sh:500,1074-1081`, `objective.py:2273-2285`, `beta-progress.py:398-401`,
+# `record-review.sh` — and not one provider on the dispatch path was among them, so the lane's `gh` had
+# no store while every one of those readers was pointed at the wrong place. #2509's finding 1 covers the
+# OPPOSITE arm (`wt_spawn` REFUSING a `keys.env`-provided `GH_CONFIG_DIR`); this module is the arm where
+# nothing provides it at all, on the `nonblocking-dispatch.sh` → `spawn-gate.sh` path.
 #
 # ⛔ gh's OWN PRECEDENCE, CITED RATHER THAN INFERRED (gh manual, "Environment", §GH_CONFIG_DIR —
 # https://cli.github.com/manual/gh_help_environment):
@@ -41,6 +45,20 @@
 # credentials". This module implements exactly that order, plus ONE source gh does not have: the FILE
 # the lane's credentials come from. (Windows' `$AppData` arm is not implemented — no caller of this
 # module runs on Windows, and a branch nothing can reach is a branch nothing can test.)
+#
+# ⛔ AND "SET" IS NOT THE SAME AS "USABLE", WHICH IS WHY `token-blank` IS ITS OWN STATE. Measured on
+# this box (gh 2.103.3) against a fixture store holding a real token:
+#
+#     $ GH_TOKEN='   ' GH_CONFIG_DIR=<store> gh auth token
+#          [three spaces]     <- gh resolved the WHITESPACE as the token (rc 0); the store is NEVER read
+#     $ GH_TOKEN=''    GH_CONFIG_DIR=<store> gh auth token
+#     gho_fixture           <- a ZERO-LENGTH value is not a token, so gh falls through to the store
+#
+# so a blank-but-SET token name shadows every config dir this module could export, and reporting
+# `ambient`/`keys`/`account` for it claims a credential gh will never use — the exact false statement
+# #2509 exists to remove (`spawn-gate.sh` printed "the lane's gh IS credentialed" over it). Hence
+# `token-blank`, which names the shadowing value instead, and NO export for it: an export gh ignores is
+# worse than no export, because it reads as a fix.
 #
 # ⛔ THE FILE IS PARSED STATICALLY, NEVER EXECUTED. `lane-env.sh` sources `keys.env` at top level for
 # the LANE's own credentials, and this module deliberately does NOT copy that: the dispatcher has
@@ -62,6 +80,23 @@
 gh_auth_token_present() {
   case "${GH_TOKEN:-}" in *[![:space:]]*) return 0 ;; esac
   case "${GITHUB_TOKEN:-}" in *[![:space:]]*) return 0 ;; esac
+  return 1
+}
+
+# gh_auth_blank_token_name — 0 + the NAME on stdout iff a token name is SET but holds no credential.
+# ⛔ THIS IS NOT THE NEGATION OF `gh_auth_token_present`, and the difference is the whole finding: an
+# UNSET name and a ZERO-LENGTH value are cases gh falls straight through (the store IS read), while a
+# non-empty all-blank value is what gh resolves INSTEAD of the store (measured; see the header). Only the
+# last one shadows, so only the last one is `token-blank` — calling an empty value a shadow would refuse
+# nothing and mis-describe a lane whose store works.
+gh_auth_blank_token_name() {
+  local v
+  # `''` and `*[![:space:]]*` are the two shapes gh falls THROUGH (unset/zero-length, and a real value);
+  # what is left is a non-empty all-blank value — the one gh resolves instead of the store.
+  v="${GH_TOKEN-}"
+  case "$v" in ''|*[![:space:]]*) ;; *) printf '%s\n' GH_TOKEN; return 0 ;; esac
+  v="${GITHUB_TOKEN-}"
+  case "$v" in ''|*[![:space:]]*) ;; *) printf '%s\n' GITHUB_TOKEN; return 0 ;; esac
   return 1
 }
 
@@ -125,6 +160,9 @@ _gh_auth_file_value() {
 
 # gh_auth_resolve <lane-home> [env-file] [account-home] — ONE line: `<state>|<config-dir>`.
 #   token            a token NAME holds a value; gh authenticates without any config dir
+#   token-blank      a token NAME is set but BLANK, so gh resolves THAT instead of any store: every gh
+#                    call in this lane fails, and NO config dir may be claimed or exported for it
+#                    (`|<name>` carries which name shadowed)
 #   ambient          GH_CONFIG_DIR is set and holds hosts.yml
 #   ambient-missing  GH_CONFIG_DIR is set and holds NO hosts.yml (an explicit setting is NOT overridden)
 #   xdg              $XDG_CONFIG_HOME/gh holds hosts.yml
@@ -140,6 +178,9 @@ gh_auth_resolve() {
   local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" d v
   [ -n "$ef" ] || ef="${ENV_FILE:-${home}/keys.env}"
   if gh_auth_token_present; then printf 'token|\n'; return 0; fi
+  # ⛔ BEFORE EVERY STORE ARM: a blank-but-set token outranks them in gh's own order, so resolving a
+  # store here would hand the caller a directory gh never consults (the header's measurement).
+  if d="$(gh_auth_blank_token_name)"; then printf 'token-blank|%s\n' "$d"; return 0; fi
   if [ -n "${GH_CONFIG_DIR:-}" ]; then
     if [ -f "${GH_CONFIG_DIR}/hosts.yml" ]; then printf 'ambient|%s\n' "$GH_CONFIG_DIR"
     else printf 'ambient-missing|%s\n' "$GH_CONFIG_DIR"; fi
@@ -182,6 +223,8 @@ gh_auth_ensure() {
   local r
   r="$(gh_auth_resolve "$@")"
   GH_AUTH_STATE="${r%%|*}"; GH_AUTH_DIR="${r#*|}"
+  # `token-blank` is deliberately ABSENT: gh resolves the blank token instead of any store, so exporting
+  # a config dir for it would be an inert export that reads as a fix.
   case "$GH_AUTH_STATE" in
     keys|keys-xdg|account) [ "${GH_CONFIG_DIR:-}" = "$GH_AUTH_DIR" ] || export GH_CONFIG_DIR="$GH_AUTH_DIR" ;;
   esac
@@ -200,6 +243,7 @@ gh_auth_log() {
   st="$GH_AUTH_STATE"; d="$GH_AUTH_DIR"
   case "$st" in
     token)           why='a token NAME holds a value, so gh authenticates without any config dir' ;;
+    token-blank)     why="${d} is set but BLANK, and gh resolves a SET value instead of any store — so every gh call in this lane WILL fail until it is unset or given a real value (no config dir is exported for it: gh would not read one)" ;;
     ambient)         why='GH_CONFIG_DIR is already set and holds a hosts.yml — left as the caller set it' ;;
     ambient-missing) why='GH_CONFIG_DIR is set but holds NO hosts.yml — an explicit setting is NOT overridden, so gh in this lane WILL be unauthenticated' ;;
     xdg)             why='$XDG_CONFIG_HOME/gh holds a hosts.yml — gh resolves it without an export' ;;
@@ -209,9 +253,13 @@ gh_auth_log() {
     account)         why="the lane HOME holds no store and the ACCOUNT home does — GH_CONFIG_DIR exported so the gate, the lane and every worker it starts read the same hosts.yml" ;;
     *)               why='NO gh credential: no GH_TOKEN/GITHUB_TOKEN value and no hosts.yml in any directory gh would read — every gh call in this lane will fail' ;;
   esac
-  printf '[gh-auth] state=%s dir=%s lane_home=%s — %s\n' "$st" "${d:--}" "${home:--}" "$why"
+  # ⛔ `dir=` is a CONFIG DIR on every state but `token-blank`, where the second field is the token NAME
+  # that shadowed — printing `dir=GH_TOKEN` beside `state=token-blank` reads as a directory, and a log line
+  # whose field means two things is the kind of ambiguity this module exists to remove.
+  local dshow="${d:--}"
+  [ "$st" = token-blank ] && dshow='-'
+  printf '[gh-auth] state=%s dir=%s lane_home=%s — %s\n' "$st" "$dshow" "${home:--}" "$why"
 }
-
 # gh_auth_cause <lane-home> [env-file] [account-home] — the CAUSE + REMEDY, or EMPTY when a credential
 # resolves (in which case the caller must NOT blame the credential).
 # ⛔ IT SPEAKS ONLY ON A POSITIVE READING (see POLARITY above): `none` means every directory gh would
@@ -222,6 +270,10 @@ gh_auth_cause() {
   r="$(gh_auth_resolve "$home" "$ef" "$acct")"
   st="${r%%|*}"; d="${r#*|}"
   case "$st" in
+    token-blank)
+      printf '%s is set but BLANK in the lane environment, and gh resolves a SET token value INSTEAD of any config dir (measured on gh 2.103.3: a GH_TOKEN of three spaces makes `gh auth token` print those three spaces with rc 0, and the store is never read) — so every gh call fails whatever store the module could point at. Unset %s (or give it a real value) and re-dispatch' \
+        "$d" "$d"
+      ;;
     none)
       [ -n "$acct" ] || acct="$(gh_auth_account_home)"
       printf 'no gh credential for the lane: no GH_TOKEN/GITHUB_TOKEN value in its environment, and no hosts.yml under %s or %s' \
