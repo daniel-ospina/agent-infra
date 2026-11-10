@@ -3408,10 +3408,39 @@ $m"
       if [ -n "$_olword" ]; then
         _olw="$(_tipvariant "$_olword")"
         _olwsha="$(delta_git "$root" rev-parse --verify "${_olw}^{commit}" 2>/dev/null || true)"
+        # ⛔ THE SENTENCE'S OWN PUNCTUATION IS NOT PART OF THE REVISION (thirtieth review cycle, round 5 —
+        # MEASURED, a FALSE BLOCK in the round-2/round-3 guard). `_olword` is everything up to the next
+        # WHITESPACE, so it carries the prose's punctuation and `rev-parse --verify 'main,^{commit}'`
+        # answers `fatal: Needed a single revision` — so a claim that WROTE its right end and PUNCTUATED
+        # it (`HEAD .. main,`) resolved to nothing, the guard could not answer "this endpoint was
+        # WRITTEN", and control fell to the refusal below telling the author their endpoint (which they
+        # had written, in the spaced spelling this arm was widened to tolerate) was OMITTED. The
+        # discriminator is the one the two sibling arms already use: what git would parse as the
+        # REVISION, not how the sentence spaced and punctuated it. The exact spelling is tried FIRST, so
+        # no token that already resolves changes meaning; the decorated reading is only a FALLBACK.
+        # ⛔ `.` IS TRIMMED TOO, and it is the commonest sentence-final mark: git refuses a ref that ENDS
+        # in `.` (`git check-ref-format refs/heads/main.` → rc 1), so a trailing dot can only be the
+        # sentence's, never the revision's. `.` stays a NAME character everywhere before the end.
+        # ⛔ THIS TIGHTENS THE GUARD, it does not loosen it: a decorated spelling that now resolves feeds
+        # the SAME gated test below, so `HEAD .. anc,` is refused as the empty range it is, and
+        # `HEAD .. <descendant>,` is the written two-endpoint claim it already was (20h99b's population).
+        if [ -z "$_olwsha" ]; then
+          # ⛔ THE KEEP CLASS LIVES IN A VARIABLE BECAUSE ITS `}` CANNOT SIT IN A NESTED EXPANSION:
+          # `${w%"${w##*[0-9A-Za-z_^~@*}]}"}` ends the INNER `${…}` at the `}` inside the bracket and
+          # trims nothing (MEASURED: `HEAD^{commit},` came back unchanged, and the fallback silently did
+          # nought for every decorated tip-selector spelling). The value is the same class either way.
+          _olkeep='0-9A-Za-z_^~@*}'
+          _olbare="${_olw%"${_olw##*[$_olkeep]}"}"
+          if [ -n "$_olbare" ] && [ "$_olbare" != "$_olw" ]; then
+            _olbare="$(_tipvariant "$_olbare")"
+            _olbsha="$(delta_git "$root" rev-parse --verify "${_olbare}^{commit}" 2>/dev/null || true)"
+            if [ -n "$_olbsha" ]; then _olw="$_olbare"; _olwsha="$_olbsha"; fi
+          fi
+        fi
         if [ -n "$_olwsha" ]; then
           if [ "$_osha" = "$to" ]; then
             if [ "$_olwsha" = "$to" ] || delta_git "$root" merge-base --is-ancestor "$_olwsha" "$to" 2>/dev/null; then
-              _emptyrange=1; _emptystated="$_olhs..$_olword (both endpoints are written and the left one is the attested head, so the claim is HEAD..$_olword — an EMPTY range)"; break
+              _emptyrange=1; _emptystated="$_olhs..$_olw (both endpoints are written and the left one is the attested head, so the claim is HEAD..$_olw — an EMPTY range)"; break
             fi
           fi
           continue

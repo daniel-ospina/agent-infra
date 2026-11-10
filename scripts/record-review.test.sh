@@ -5782,13 +5782,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :3866 :5592 :7962 :8136, plus a comment mention at :3735; `14.1c-CITE` below
+#     CITE-CHECK: :3895 :5621 :7991 :8165, plus a comment mention at :3764; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:3725) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :3866) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :3895) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :7962). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :7991). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5814,7 +5814,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:7962` / `:8136` — CITE-CHECK: :7962 :8136 — re-derived by the
+#     this head the predicates are `:7991` / `:8165` — CITE-CHECK: :7991 :8165 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6718,12 +6718,12 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
 #       and in #3168's diff the only hunk at `post_marker()` (head :3725) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :3866) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :3895) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :5592 :7962 :8136 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :5621 :7991 :8165 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -11238,6 +11238,40 @@ run_record_delta $EH194 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42560701" \
 I compared HEAD .. afterhead and it is not part of this range."
 assert_eq "$RECORD_RC" "0" "20h99b …and so is the same shape with a REF NAME after the dots (HEAD .. afterhead) — ACCEPTED (rc 0)"
 [ -f "$(Q2 $EH194)" ] || bad "20h99b FALSE BLOCK: a descendant NAMED after the dots was refused as a nought-commit claim"
+# ⛔ 20h99c/20h99d/20h99e — THE SENTENCE'S OWN PUNCTUATION IS NOT PART OF THE REVISION (thirtieth review
+#       cycle, round 5, finding 1 — MEASURED, a FALSE BLOCK the round-2/round-3 guard introduced and the
+#       round-4 review found unpinned). `_olword` is "everything up to the next whitespace", so a
+#       PUNCTUATED right end (`HEAD .. afterhead,` / `HEAD .. afterhead.`) reached `rev-parse` with the
+#       prose's comma or full stop attached, failed to resolve, and the claim an artifact WROTE was
+#       refused as an OMITTED endpoint — with a sentence false about the author's own text. The suite
+#       could not see it: no vector anywhere wrote a punctuated right end, so every cell stayed green.
+#       These three rows are the population and BOTH directions of the fix: the two acceptance rows go
+#       red on the pre-fix code (that is the finding), and 20h99e pins the TIGHTENING — a punctuated
+#       ANCESTOR now resolves and is refused as the empty range it is, rather than being waved through.
+EH198=425614; rm -f "$(Q2 $EH198)"
+run_record_delta $EH198 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42561501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I compared HEAD .. afterhead, and it is not part of this range."
+assert_eq "$RECORD_RC" "0" "20h99c a punctuated written right end (HEAD .. afterhead,) is not an omitted endpoint — ACCEPTED (rc 0)"
+[ -f "$(Q2 $EH198)" ] || bad "20h99c FALSE BLOCK: the guard handed the prose's comma to rev-parse, so a WRITTEN endpoint was refused as omitted"
+EH199=425616; rm -f "$(Q2 $EH199)"
+run_record_delta $EH199 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42561701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I compared HEAD .. afterhead. It is not part of this range."
+assert_eq "$RECORD_RC" "0" "20h99d …and so is the sentence-final full stop (HEAD .. afterhead.) — ACCEPTED (rc 0)"
+[ -f "$(Q2 $EH199)" ] || bad "20h99d FALSE BLOCK: a ref name that cannot end in '.' was still refused because the sentence's dot was attached"
+EH200=425618; rm -f "$(Q2 $EH200)"
+run_record_delta $EH200 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42561901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD .. anc, and nothing else."
+assert_eq "$RECORD_RC" "3" "20h99e …and a PUNCTUATED ancestor is still an EMPTY range (HEAD .. anc,) — REFUSED (rc 3), so the trim tightens the guard rather than loosening it"
+assert_contains "$RECORD_ERR" "states an EMPTY range" "20h99e …through the empty-range arm, quoting the revision it resolved, not the sentence's comma"
+assert_contains "$RECORD_ERR" "..anc" "20h99e …and the claim is quoted as the revision the author wrote"
+assert_not_contains "$RECORD_ERR" "..anc," "20h99e …with no punctuation inside the quoted claim"
+[ -f "$(Q2 $EH200)" ] && bad "20h99e FAIL-OPEN: a punctuated nought-commit claim was accepted instead of refused" || ok "20h99e no record was written"
 # ⛔ 20h100 — `HEAD..<right>` IS EMPTY WHEN <right> IS AN ANCESTOR (thirtieth review cycle, round 3 —
 #       MEASURED, a FAIL-OPEN the round-2 operand guard left open, and a REGRESSION against the parent
 #       for six spellings). `HEAD..` is `HEAD..HEAD`; the guard above skips the arm whenever the word
@@ -12489,6 +12523,16 @@ I compared HEAD .. ${_dg_orphan:0:12} and it is an unrelated lineage, not part o
 MUT="$(mk_mutant notipancestry '            if [ "$_olwsha" = "$to" ] || delta_git "$root" merge-base --is-ancestor "$_olwsha" "$to" 2>/dev/null; then' '            if [ "$_olwsha" = "$to" ]; then')"
 mut_check "M96 a right end an ANCESTOR of the tip makes the claim empty even though the dots DO sit between two operands" 425588 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42558901" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD.. anc and nothing else."
+# M97 — THE GUARD READS THE REVISION, NOT THE WHITESPACE WORD (thirtieth cycle, round 5, finding 1).
+#       Dropping the decoration FALLBACK restores the false block: `HEAD .. afterhead,` reaches
+#       `rev-parse` with the prose's comma attached, resolves to nothing, and is refused as an OMITTED
+#       endpoint. 20h99c/20h99d accept it on the shipped code, so the cell measures exactly the trim.
+#       ⛔ THIS CELL IS THE ONE THE ROUND-4 REVIEW SAID DID NOT EXIST: "the punctuated population has NO
+#       vector", i.e. `MUTATION-MATRIX(n/n)` and the finding were both true because nothing pinned the
+#       guard's answer for a punctuated endpoint in either direction.
+MUT="$(mk_mutant nooperandtrim '        if [ -z "$_olwsha" ]; then' '        if false; then')"
+mut_check "M97 a punctuated written right end is resolved as the revision git would parse, not refused as an omitted endpoint" 425620 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42562101" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I compared HEAD .. afterhead, and it is not part of this range."
 # M90 — THE SYMBOLIC EXEMPTION ON THE TIP-ANCHORED SPELLING (P2, thirtieth cycle). Removing it restores
 #       the false block: `HEAD@{upstream}` named in prose is refused with a sentence saying the author
 #       wrote `HEAD~N`. 20h96's body is ACCEPTED by the shipped code and REFUSED under the mutant — an
