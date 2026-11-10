@@ -1233,7 +1233,8 @@ pass did NOT release and no later pass will release on its own. It is an exact S
 `preserved=` — a selected removal that failed is counted under `remove=` and reported by
 `failed=`/exit 4 instead, so `preserved - stalled` can never underflow. A non-zero tally is PRECEDED
 by the list itself — the rows print above the SUMMARY line, not below it, each row naming the ISSUE
-its branch holds out of dispatch with its age (whole
+its branch holds out of dispatch (? when the branch carries no issue number, which a
+`REAP_WT_LANE_BRANCH_RE` override can produce) with its age (whole
 hours, rounded UP, so an hour-floored row never reads as inside the floor it is past; stated in
 SECONDS for the one sub-hour floor, so the age and the floor it is being read against are always in
 the same unit — and that floor's gate is `-ge`, so a record exactly AT it is listed as

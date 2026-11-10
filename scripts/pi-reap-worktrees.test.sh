@@ -4216,6 +4216,13 @@ assert_absent "$HELP" "The two floors a listed row can name" \
     "A29u …and the two-floor sentence is gone (it contradicted the row it describes)"
 assert_contains "$HELP" "CANNOT release this one" \
     "A29u …and the release paths are class-aware, so a stash-withheld row names a remedy that works"
+# ⛔ AND `--help` NO LONGER PROMISES AN ISSUE ON EVERY ROW (review round 11, PR #3881). The legend was
+# qualified for `issue=?` in round 10 but `--help` and the doc were not, so the artifact said three
+# different things about one field. The `?` is reachable on a GENUINE lane row whenever
+# `REAP_WT_LANE_BRANCH_RE` (a documented override) names lanes without digits, because the gate is a
+# regex and the issue is leading digits. Pinned here so the qualification cannot be dropped again.
+assert_contains "$HELP" "? when the branch carries no issue number" \
+    "A29u …and --help qualifies the ISSUE field, as the legend does"
 
 # ── A29-MUT: the COLLECTOR is load-bearing (drop it and A29a goes red) ───────────────────
 # The token is emitted inside `classify_one`, which runs in a command substitution, so the parent's

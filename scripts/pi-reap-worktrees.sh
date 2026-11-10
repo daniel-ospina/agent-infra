@@ -1082,7 +1082,8 @@ fail-closed abort) neither writes nor deletes it.
 \`stalled=\` is the STALLED REVIEW LIST's tally (#2179): 0-commits-ahead lane
 residue this pass did NOT release and no later pass will release on its own. It is
 a SUBSET of \`preserved=\`. A non-zero tally prints the list itself, each row
-naming the ISSUE its branch holds out of dispatch, with the reason and the floor
+naming the ISSUE its branch holds out of dispatch (? when the branch carries no issue number — a
+\`REAP_WT_LANE_BRANCH_RE\` override can name lanes without digits), with the reason and the floor
 in force, in the unit THAT CLASS'S floor is stated in — whole hours for the two hour floors below,
 SECONDS for the one sub-hour floor — because a record that cannot be dated is not listed. A selected
 removal that FAILED (unverified backup, removal-time re-check) is deliberately NOT listed either: it
