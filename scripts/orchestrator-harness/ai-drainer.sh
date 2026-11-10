@@ -739,7 +739,7 @@ _census_dispatcher() { # prints "<alive> <overlap>" — dispatcher lanes, then h
     # unit's PATH, `hidepid`, another uid) must never read as "no lanes".
     if [ -z "$c" ]; then n=$((n + 1)); elif _counts_as_lane "$c"; then n=$((n + 1)); fi
     # ⛔ THE OVERLAP, measured on the SAME argv read above (no second `ps`). `_live_lane_processes`
-    # counts EVERY lane-shaped process on the box, so a dispatcher lane's own
+    # counts every lane ROOT on the box, so a dispatcher lane's own
     # `bash …/nonblocking-dispatch.sh …` subshell sits inside `procs` too — subtracting the dispatcher
     # count from `procs` without this would remove a process `procs` may never have held (an unreadable
     # argv: `n` counts it, the launcher predicate cannot) and under-read the launcher's share. An
@@ -775,7 +775,8 @@ if [ -n "$WT_MOD" ] && [ -f "$WT_MOD" ]; then
     CENSUS_LAUNCHER_WHY="worker-terminal.sh at $WT_MOD is stale (no wt_table/wt_count, or its embedded python is empty)"
   fi
 fi
-# ⛔ THE LAUNCHER CENSUS IS AN UPPER BOUND, NOT A COUNT — clamp it to the lane processes present.
+# ⛔ THE LAUNCHER CENSUS IS AN UPPER BOUND, NOT A COUNT — clamp it to the lane ROOTS present (a lane's
+# `pi` child is the same lane, so the count is lanes, not processes).
 # MEASURED 2026-11-10 on pi-cell-3: `alive=36 (dispatcher=2 launcher=34)` with **9** live `pi`
 # processes on the same box, 25 GB RAM free, 0 OOM kills — so the tick printed `SKIP: nothing to add`
 # and exited 0 on a box with idle capacity, and the starved queue had no error to point at.
@@ -793,7 +794,7 @@ fi
 # visible in the log instead of silently suppressing dispatch.
 #
 # ⛔ THE TWO HALVES ARE DISJOINT, AND THAT IS THE ARGUMENT OF THIS BLOCK (#3886 review, P2-1). `procs`
-# counts EVERY lane-shaped process on the box, so a live dispatcher lane is already in it; summing
+# counts every lane ROOT on the box, so a live dispatcher lane is already in it; summing
 # `disp_alive + min(wt_count, procs)` therefore counted each live dispatcher lane TWICE and over-stated
 # the total by `disp_alive`. Harmless against a big target, fatal on a cell (MAX_LANES = 2.5 × 4 = 10):
 # `disp_alive=2` + `procs=9` ⇒ `alive=11 > 10` ⇒ the tick dispatched nothing with a slot free — the
@@ -865,13 +866,38 @@ _is_lane_process() { # <command-line> → true when THIS argv IS a lane, not whe
   [ "$had_f" = "1" ] || set +f
   return "$rc"
 }
-_live_lane_processes() { # prints the count of live lane processes, or nothing when `ps` cannot answer
-  local out c n=0
-  out="$("$PS" -A -o command= 2>/dev/null)" || return 1
+_live_lane_processes() { # prints the count of live lane ROOTS, or nothing when `ps` cannot answer
+  local out c pid ppid rest own=" " pairs=" " n=0 rows=0
+  # ⛔ `pid=,ppid=,command=` BECAUSE A LANE IS NOT A PROCESS (#3886 review round 4, P2). Every lane this
+  # box runs contributes MORE than one lane-shaped process — the `bash …/lane.sh` wrapper AND the `pi` it
+  # execs (a `dispatch-merge.sh` ladder is three) — so counting processes read ~2× the lane count, and
+  # `share = procs − overlap` then landed at ~2× the launcher's lanes. The consequence is the one the
+  # overlap fix above was made for, at twice the size: MEASURED on a 9-lane table in that shape at
+  # `MAX_LANES`-style target 10, `alive=18` and the tick STAND DOWN with a slot free — #3882's own
+  # symptom, and `census-mismatch` reports it truthfully (`pi=18`) while the reading is wrong. So the
+  # count is the number of lane processes whose PARENT is not itself a lane process: one per lane, and a
+  # lane's `pi` child (or a `pi` sub-agent child) is the SAME lane, not a second one.
+  # The ppid column also keeps this cheap: ONE `ps -A` per tick, no per-lane walk (option 2 of #3882).
+  out="$("$PS" -A -o pid=,ppid=,command= 2>/dev/null)" || return 1
   [ -n "$out" ] || return 1        # a `ps` with no output at all did NOT answer (see above)
   while IFS= read -r c; do
-    _is_lane_process "$c" && n=$((n + 1))
+    c="${c#"${c%%[![:blank:]]*}"}"      # ltrim: BSD/Linux `ps -o pid=` right-aligns the pid
+    pid="${c%% *}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac   # not a process row — never read it as "no lanes"
+    rows=$((rows + 1))
+    rest="${c#* }"; rest="${rest#"${rest%%[![:blank:]]*}"}"      # drop the pid
+    ppid="${rest%% *}"
+    rest="${rest#* }"; rest="${rest#"${rest%%[![:blank:]]*}"}"    # drop the ppid → the command line
+    _is_lane_process "$rest" || continue
+    own="$own$pid "                       # every lane-shaped pid, for the parent test below
+    pairs="$pairs$pid:$ppid "
   done <<<"$out"
+  [ "$rows" -ge 1 ] || return 1        # a table of no process rows did not come from `ps -A`
+  for c in $pairs; do
+    pid="${c%%:*}"; ppid="${c#*:}"
+    case "$own" in *" $ppid "*) continue ;; esac   # its parent IS a lane — the same lane, not a new one
+    n=$((n + 1))
+  done
   printf '%s' "$n"
 }
 _census_launcher() { # <dispatcher-overlap> — prints the count, or nothing when unreadable
@@ -894,10 +920,11 @@ _census_launcher() { # <dispatcher-overlap> — prints the count, or nothing whe
        # it (`pi=` was truthful; the SUM was not).
        # The overlap SUBTRACTED is the intersection, not `disp_alive`: only a pidfile process whose argv
        # the launcher predicate actually counts is known to be inside `procs`.
-       # ⛔ STILL OVER-INCLUSIVE, stated rather than implied: a dispatcher lane's CHILD processes (the
-       # `pi` a `nonblocking-dispatch.sh` subshell spawns) are not named by its pidfile, so they remain in
-       # this half — just as any launcher lane's own children do. The count is a process bound, never a
-       # lane count.
+       # ⛔ THE CHILD QUESTION, stated rather than implied: a dispatcher lane's CHILD processes (the `pi` a
+       # `nonblocking-dispatch.sh` subshell spawns) are NOT in this half — `_live_lane_processes` counts
+       # lane roots, so that `pi` is the same lane as its wrapper and is skipped by the parent test. What
+       # is left here is the dispatcher's ROOT (the process its pidfile names), which is exactly what the
+       # overlap removes; every other root is a launcher lane.
        share="$procs"
        [ "$ov" -le "$share" ] || ov="$share"          # cannot subtract more processes than were counted
        share=$((share - ov))

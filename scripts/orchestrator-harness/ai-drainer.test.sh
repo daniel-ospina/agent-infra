@@ -185,15 +185,18 @@ plant_lane() { # <tag> <slot> → echoes the pid
 # so it is a PROBE like memory or load and must be INJECTED — a suite that read the host's process table
 # would report the host's fleet (39 lane-shaped processes on the operator's Mac) and the arms would
 # assert different things on a Mac than on a quiet cell.
-#   `-A`        → a FIXED population: <n> lane-shaped command lines, plus one shell whose argv NAMES a
+#   `-A`        → a FIXED population: <n> lane-shaped rows, plus one shell whose argv NAMES a
 #                 lane script without being one (inside a `case` pattern, so the token is
 #                 `*nonblocking-dispatch.sh*)` — the exact shape a substring predicate counts and this
-#                 one must not), plus one plain shell that is not a lane at all;
+#                 one must not), plus one plain shell that is not a lane at all. Every row is `<pid>
+#                 <ppid> <command>` because the probe counts lane ROOTS (a lane's `pi` child is the same
+#                 lane); `pair` makes each lane TWO rows — the `bash …/lane.sh` wrapper and its `pi`
+#                 child — which is what the box actually runs;
 #   `-p <pid>`  → delegates to the REAL ps, because `_census_dispatcher` reads a live lane's argv that
 #                 way and every other arm in this suite depends on it answering.
 # <n> may also be `empty` (a `ps` that "succeeds" and prints nothing — the UNREADABLE case) or `fail`.
-fake_ps() { # <path> <n|empty|fail>
-  local p="$1" n="$2"
+fake_ps() { # <path> <n|empty|fail> [pair]
+  local p="$1" n="$2" shape="${3:-flat}"
   cat >"$p" <<PS_EOF
 #!/usr/bin/env bash
 case "\$*" in *"-p "*) exec ps "\$@" ;; esac
@@ -203,11 +206,16 @@ case "$n" in
 esac
 i=0
 while [ "\$i" -lt $n ]; do
-  printf '/usr/local/bin/pi -p --provider deepseek --model deepseek-flash brief-%s\n' "\$i"
+  if [ "$shape" = "pair" ]; then
+    printf '%s 1 /bin/bash /opt/orch/lane.sh %s\n' "\$((100000 + 2*i))" "\$i"
+    printf '%s %s /usr/local/bin/pi -p --provider deepseek brief-%s\n' "\$((100001 + 2*i))" "\$((100000 + 2*i))" "\$i"
+  else
+    printf '%s 1 /usr/local/bin/pi -p --provider deepseek --model deepseek-flash brief-%s\n' "\$((100000 + i))" "\$i"
+  fi
   i=\$((i + 1))
 done
-printf '%s\n' "/bin/zsh -c 'case x in *nonblocking-dispatch.sh*) : ;; esac'"
-printf '%s\n' "/bin/zsh -l"
+printf '%s\n' "100998 1 /bin/zsh -c 'case x in *nonblocking-dispatch.sh*) : ;; esac'"
+printf '%s\n' "100999 1 /bin/zsh -l"
 PS_EOF
   chmod +x "$p"
 }
@@ -636,7 +644,7 @@ mkdir -p "$ROOT/globby"
 cat >"$ROOT/ps-glob" <<'PSG_EOF'
 #!/usr/bin/env bash
 case "$*" in *"-p "*) exec ps "$@" ;; esac
-printf '%s\n' "/bin/bash -c echo *"
+printf '%s\n' "1000 1 /bin/bash -c echo *"
 PSG_EOF
 chmod +x "$ROOT/ps-glob"
 RUN_WT_MOD="$STUB/worker-terminal.sh" RUN_PS="$ROOT/ps-glob" RUN_CWD="$ROOT/globby" RUN_TARGET=2
@@ -701,9 +709,9 @@ WT_EOF
 cat >"$ROOT/ps-composed" <<PSC_EOF
 #!/usr/bin/env bash
 case "\$*" in *"-p "*) exec ps "\$@" ;; esac
-printf '%s\n' "bash $ROOT/nonblocking-dispatch.sh 60 0 /dev/null"
-printf '%s\n' "/usr/local/bin/pi -p --provider deepseek --model deepseek-flash brief-0"
-printf '%s\n' "/usr/local/bin/pi -p --provider deepseek --model deepseek-flash brief-1"
+printf '%s\n' "1000 1 bash $ROOT/nonblocking-dispatch.sh 60 0 /dev/null"
+printf '%s\n' "1001 1 /usr/local/bin/pi -p --provider deepseek --model deepseek-flash brief-0"
+printf '%s\n' "1002 1 /usr/local/bin/pi -p --provider deepseek --model deepseek-flash brief-1"
 PSC_EOF
 chmod +x "$ROOT/ps-composed"
 RUN_WT_MOD="$STUB/worker-terminal.sh" RUN_PS="$ROOT/ps-composed" RUN_TARGET=4
@@ -741,6 +749,59 @@ run_drainer_fg s7b
 check "(s7b) two pidfiles naming ONE pid count as ONE dispatcher lane" \
   'grep -q "alive=1 (dispatcher=1 launcher=0)" "$LAST_AI/logs/ai-drainer.log"' \
   "$(grep "START:" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (s8b) ⛔ "ps PRODUCED OUTPUT" IS NOT "ps ANSWERED" (#3886 review round 4) ────────────────
+# The root rule reads `ps -A -o pid=,ppid=,command=` and requires pid-prefixed rows, so a `ps` that
+# prints its USAGE TEXT to stdout and exits 0 is UNREADABLE, not "a table with no lane in it" — the
+# difference between `wt_count` standing and the census clamping to 0, i.e. the over-dispatch direction.
+# `(s8)` covers the parent test and nothing covered this guard: deleting it left the suite green
+# (MEASURED), which is why the doc and the code disagreed about this exact shape until now.
+cat >"$STUB/worker-terminal.sh" <<'WT_EOF'
+WT_TREE_PY="stub"; WT_WS_PY="stub"
+wt_table() { printf 'lane-1\talive\n'; }
+wt_count() { printf '34\n'; }
+WT_EOF
+cat >"$ROOT/ps-usage" <<'PSU_EOF'
+#!/usr/bin/env bash
+case "$*" in *"-p "*) exec ps "$@" ;; esac
+printf 'ps: illegal option -- A\nusage: ps [-AaCcEefhjlMmrSTvwXx]\n'
+exit 0
+PSU_EOF
+chmod +x "$ROOT/ps-usage"
+RUN_WT_MOD="$STUB/worker-terminal.sh" RUN_PS="$ROOT/ps-usage" RUN_TARGET=10
+run_drainer_fg s8b
+check "(s8b) a ps printing USAGE TEXT and exiting 0 is UNREADABLE — the census stays 34, not 0" \
+  'grep -q "alive=34 (dispatcher=0 launcher=34)" "$LAST_AI/logs/ai-drainer.log" && ! grep -q "census-mismatch" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E "alive=|census-mismatch" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(s8b) …so a phantom-full box dispatches NOTHING rather than clamping on a reading that never happened" \
+  '[ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && [ "$LAST_RC" -eq 0 ]' \
+  "rc=$LAST_RC dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+
+reset_run
+# ── (s8) ⛔ A LANE IS NOT A PROCESS (#3886 review round 4, P2) ────────────────────────────────
+# Every lane this box runs contributes more than one lane-shaped process: the `bash …/lane.sh` wrapper
+# AND the `pi` it execs. Counting processes therefore read ~2× the lane count, so
+# `share = procs − overlap` landed at ~2× the launcher's lanes — and an over-count STANDS THE TICK DOWN,
+# which is precisely the argument (s7) was fixed with, at twice the size. MEASURED on a 9-lane table in
+# that shape at target 10: `alive=18`, `SKIP: nothing to add`, one slot free — #3882's own symptom, with
+# a `census-mismatch` line reporting `pi=18` truthfully while the reading was wrong.
+# Here: 9 lanes, each as TWO lane-shaped rows (wrapper + its `pi` child, child's ppid = wrapper pid),
+# 34 terminal rows, target 10. Roots ⇒ procs=9 ⇒ launcher=9 ⇒ one slot, and the tick dispatches it.
+fake_ps "$ROOT/ps-pair" 9 pair
+cat >"$STUB/worker-terminal.sh" <<'WT_EOF'
+WT_TREE_PY="stub"; WT_WS_PY="stub"
+wt_table() { printf 'lane-1\talive\n'; }
+wt_count() { printf '34\n'; }
+WT_EOF
+RUN_WT_MOD="$STUB/worker-terminal.sh" RUN_PS="$ROOT/ps-pair" RUN_TARGET=10
+run_drainer_fg s8
+check "(s8) 9 lanes × 2 lane-shaped processes each → the census counts 9 LANES, not 18 processes" \
+  'grep -q "census-mismatch launcher=34 pi=9 clamped=9 disp=0" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep "census-mismatch" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(s8) …so the tick DISPATCHES into the slot the doubled count was hiding" \
+  'grep -q "alive=9 (dispatcher=0 launcher=9)" "$LAST_AI/logs/ai-drainer.log" && [ "$(dispatched  "$LAST_AI/logs/ai-drainer.log")" -eq 1 ]' \
+  "$(grep "START:" "$LAST_AI/logs/ai-drainer.log" | head -1) dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
 
 reset_run
 # ── ARM (g): THE VERDICT — a lane's own exit status, settled by the NEXT tick ────────────────

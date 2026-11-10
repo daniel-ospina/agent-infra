@@ -92,29 +92,33 @@ nothing, and it exits 0):
    **zero**) **plus** the launcher's workers (`wt_table`/`wt_count` in `worker-terminal.sh`, which is
    the only census that sees **durable-terminal** lanes — no pidfile names them and `pgrep` cannot see
    them). A stale module is named (`launcher census unavailable: …`) rather than read as "no workers".
-   ⛔ The launcher half is an **upper bound**, clamped to the lane processes actually present
-   (`launcher = min(wt_count, live lane processes − the dispatcher's share of them)`), because `wt_count`
+   ⛔ The launcher half is an **upper bound**, clamped to the lanes actually present
+   (`launcher = min(wt_count, lane roots − the dispatcher's share of them)`), because `wt_count`
    counts the cmux daemon's
    `terminals[].running` — *a shell is running in that terminal*, i.e. UI liveness — so a `wt-*`
    terminal whose `pi` has exited counted as a live lane **for ever** and the tick stood down with exit
    0 on a box with idle capacity (measured 2026-11-10 on pi-cell-3: `alive=36 (dispatcher=2
    launcher=34)` against **9** live `pi` processes — agent-infra#3882). When the clamp fires it is its
    own line, `census-mismatch launcher=34 pi=9 clamped=9 disp=0`, so the drift is visible without reading
-   code (`pi=` is the whole box's lane-shaped PROCESSES, not the launcher's share; `disp=` is the overlap
-   removed). ⛔ The two halves are **disjoint**: the process count covers the dispatcher's own
+   code (`pi=` is the whole box's lane **roots**, not the launcher's share; `disp=` is the overlap
+   removed). ⛔ `pi=` counts lane ROOTS, not lane-shaped processes: every lane this box runs contributes
+   the `bash …/lane.sh` wrapper **and** the `pi` it execs, so only a lane process whose PARENT is not
+   itself a lane process is counted — otherwise the reading is ~2× the lane count and the tick stands a
+   10-lane cell down at 18 with a slot free (agent-infra#3886 review round 4; the same over-count
+   direction the overlap subtraction below exists to remove, at twice the size). ⛔ The two halves are **disjoint**: the process count covers the dispatcher's own
    `bash …/nonblocking-dispatch.sh` subshells too, so `alive = dispatcher + launcher` is only a lane
    count because the launcher clamp subtracts the overlap — an unsubtracted sum counted every live
    dispatcher lane twice and stood a 10-lane cell down at 11 with a slot free (agent-infra#3886). A
-   dispatcher lane's CHILD `pi` is still in the launcher half (no pidfile names it), exactly as any
-   lane's own children are: this is a process bound, not a lane census. ⛔ When the **process** count is unreadable the clamp does **not** apply and `wt_count` stands
+   dispatcher lane's own root is the dispatcher's half, so it is removed from the launcher's via that
+   overlap; the child rule above is what keeps a lane's `pi` from adding a second lane anywhere. ⛔ When the **process** count is unreadable the clamp does **not** apply and `wt_count` stands
    unchanged: the fleet's polarity is *unknown is alive*, and the census is the only thing bounding the
    lane total, so an unreadable probe must never read as "no lanes" (that is the over-dispatch
    direction; it dispatched 7 lanes in the suite's mutant of exactly that change). "Unreadable" means
-   `ps` **failed**, or exited 0 having printed **no output at all** — a probe that answered with a
-   process table containing no lane in it reads **0**, which is the direction this fix exists for.
-   (The derived COUNT can never be non-numeric: `_live_lane_processes` prints a number on success and
-   nothing on failure. A probe that answers with non-numeric TEXT is just a table with no lane in it,
-   so it reads 0 and DOES clamp.)
+   `ps` **failed**, exited 0 having printed **no output at all**, or answered with something that is not
+   a process table — the probe reads `ps -A -o pid=,ppid=,command=` and requires pid-prefixed rows, so
+   usage/error text written to stdout (a real `ps` failure shape) reads UNREADABLE, not "no lanes". A
+   table that IS a process table and contains no lane in it reads **0**, which is the direction this fix
+   exists for.
    ⛔ The clamp is one-sided in the sense that it cannot **invent** a lane, but it **can lower a real
    count**, and that is the deliberate price of the fix: a probe that answers with a view omitting the
    lanes (`hidepid=2` for another uid, a PID namespace, a filtered `$PS` wrapper) reads 0 and the clamp
