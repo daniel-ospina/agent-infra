@@ -9629,12 +9629,35 @@ PY
     # `stg_mark l5_issue` measures ~0 and drops the preparation from the tiled partition entirely.
     stg_mark record
     stg_field STG_FIELD
+    # ── THE RUNG, IN THE DURABLE RECORD (agent-infra#3009, its requirement 1) ────────────────────
+    # ⛔ THE RECORD COULD NOT NAME THE RUNG IT IDLED ON, AND THAT COST A WHOLE LANE ITS DIAGNOSIS.
+    # `nothing=` carries `GATE_WHY`, which is the FIRST capacity arm that fired — and on a box whose
+    # PR path was refused by the load gate it read `gate:merge-priority_(8_un-owned_of_8_open_PR(s)…)`
+    # for 120 consecutive cycles, because a pre-cascade build set that string and nothing else. A lane
+    # briefed from those records concluded the merge-priority threshold was "the only thing blocking
+    # dispatch" and set out to implement the ladder — which had ALREADY landed (`9047814a6`, #3594)
+    # and could not have been executing. The three fields below separate the states that one `nothing=`
+    # could not, and they are what requirement 1 of #3009 actually asks for:
+    #   level=MERGE      slots=0 can_spawn=1  → a HIGHER LEVEL holds the room (the ladder working)
+    #   level=NOT-MEASURED slots=0 can_spawn=0 → capacity refused, so the cascade never ran AT ALL
+    #   level=ISSUES     slots=2 can_spawn=1  → the issue rung was granted two slots
+    # ⛔ THEY ARE RECORDED, NOT RE-DERIVED, and they add no measurement: every value was computed by
+    # the cascade block ~1,200 lines above this emit. That is why this is a field addition and not a
+    # scope change — and it is precisely what the OPEN OWNER DECISION in docs/ops/self-healing-contract.md
+    # §6 does NOT cover: making the levels actionability-bounded is still the owner's call, and
+    # `level=` merely makes the current behaviour visible instead of inferred.
+    # ⛔ `${VAR-absent}`, NEVER `${VAR:-absent}`: `slots=0` is a MEASUREMENT (the room was withheld) and
+    # must not be rewritten as an absence — the same polarity the batch's own `${CASCADE_ISSUE_SLOTS-1}`
+    # guards take. `absent` is then reserved for "this emit ran on a path the cascade block never
+    # reached", which is a different fact from both `0` and `NOT-MEASURED`.
     cycle_record_write "$O" \
       start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
       selected="$_cr_sel" selected_n="${SEL_TOTAL:-0}" dispatched="${K:-0}" ids="${_cr_ids:--}" \
       nothing="$_cr_nothing" placement="${CAP_STATE:-unavailable}" placed_on="${CAP_PLACE:-none}" \
       bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
       spawned_pr="${PRDISP_SPAWNS:-UNMEASURED}" spawn_tags="$_cr_tags" \
+      level="${CASCADE_LEVEL_NAME:-NOT-MEASURED}" slots="${CASCADE_ISSUE_SLOTS-absent}" \
+      can_spawn="${CASCADE_CAN-absent}" \
       stages="${STG_FIELD:-}" \
       drain="$_cr_drain" \
       || echo "[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable or the module is absent) — an absent record is NOT a healthy box: harness status reads it ABSENT/DEGRADED" >> "$LOG"
