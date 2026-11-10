@@ -4947,8 +4947,28 @@ test("an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)",
       'test("pinFindings flags a drifted pin (positive control for (h))"',
     ],
     ["the TOP of the module body (the earliest catchable point)", "const REPO_ROOT = path.resolve("],
+    // agent-infra#2723 review (head 2da6553b3), P1: THE FLOOR/ROSTER-ONLY EXIT
+    // PATH. `finalize()` counts the floor and the roster BEFORE it emits the
+    // aggregate, because the reverse order printed `… N passed, 0 failed` and
+    // exited 1 — and `0 failed` is a PASS line to the rail's parser
+    // (`ci_exemption.py:2243` — `if failed < 1: continue`). That reordering is
+    // the whole fix for this harness's false-PASS identity, and NOTHING pinned
+    // it: reverting it left this suite at `132 passed, 0 failed`, rc 0, while
+    // the floor-only path printed a green `0 passed, 0 failed` line.
+    //
+    // This anchor sits after `finalize()` is defined and before the first test
+    // runs, so `failed` is 0 at emit time on the reverted ordering and the
+    // mutation is observable in the ONE place the two orderings differ. The two
+    // anchors above cannot serve: the TOP one dies in the TDZ catch with no
+    // aggregate at all, and the mid-suite one already has an unrelated failure
+    // counted, so both print a non-zero `failed` in either order.
+    [
+      "the floor/roster-only exit path (after `finalize`, before any test runs)",
+      "// NOTE: the `exit` listener is registered at the TOP of this module (see the",
+      /❌ check-pi-pin-lockstep\.mjs: \d+ passed, [1-9]\d* failed/,
+    ],
   ];
-  for (const [label, anchor] of injections) {
+  for (const [label, anchor, aggregate] of injections) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pin-suite-exit-"));
     const dir = path.join(root, "scripts");
     try {
@@ -4990,6 +5010,21 @@ test("an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)",
         /only 0 passing tests|required test\(s\) did not run|exited before its floor and roster/,
         `the exit handler must name why it failed; stderr=${JSON.stringify(res.stderr)}`
       );
+      if (aggregate) {
+        // The aggregate must be TRUE of the exit code: a `0 failed` line is a
+        // PASS line to the rail (`ci_exemption.py:2243`), so emitting it beside
+        // a red run makes the identity vanish exactly when the floor/roster
+        // fires — the #2723 defect this suite migrated for. Only the floor/roster-only
+        // anchor can observe this; it is the only path where `failed === 0` at
+        // emit time under the reverted ordering.
+        assert.match(
+          res.stdout,
+          aggregate,
+          `the floor/roster-only red must emit a FAILING aggregate at ${label} — a ` +
+            "`0 failed` line is a PASS line to the rail (ci_exemption.py:2243), so the " +
+            `identity would vanish exactly when the floor fires; stdout=${JSON.stringify(res.stdout)}`
+        );
+      }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
