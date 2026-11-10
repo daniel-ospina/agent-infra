@@ -8,8 +8,9 @@
 #   `record-review.sh`, the gh shim and the extensions live under `$CELL_HOME/.pi/agent`. `gh`'s
 #   `hosts.yml` lives in the ACCOUNT home. Nothing SET `GH_CONFIG_DIR` on the
 #   `nonblocking-dispatch.sh` → `spawn-gate.sh` path — ⛔ not "nothing in the tree": `git grep -n
-#   'GH_CONFIG_DIR' origin/main -- scripts/` returns `worker-terminal.sh:500,1074-1081`,
-#   `objective.py:2273-2285`, `beta-progress.py:398-401` and `record-review.sh` as READERS, and not one
+#   'GH_CONFIG_DIR' origin/main -- scripts/` returns `worker-terminal.sh`, `objective.py` and
+#   `beta-progress.py` as READERS (cited by SYMBOL — the line numbers a prior draft carried were rotted by
+#   a rebase; re-derive with that grep), and not one
 #   provider on the dispatch path — so `gh` inside the lane was unauthenticated, and the land-backlog gate
 #   reported a MISSING CREDENTIAL as a PR-RATIO problem:
 #
@@ -271,8 +272,9 @@ c="$(u ". '$GH_AUTH'; GH_TOKEN='   ' GITHUB_TOKEN=fixture-token gh_auth_cause '$
 # mutants below kept this suite at 61/61 before A7i-A7k existed (measured at `f3adab923`, the head that
 # introduced the ordered read and where this file had 61 arms; the same two mutants were re-run at 75 arms
 # and are reported with the arms that kill them):
-#   M4 — "ANY set-but-all-blank name shadows the other" (the model `worker-terminal.sh:1087` states verbatim,
-#        "a blank one in either hides a valid one") answers `token-blank|GITHUB_TOKEN` where gh answers `realtok`;
+#   M4 — "ANY set-but-all-blank name shadows the other" (the model `worker-terminal.sh`'s blank-token clear
+#        states verbatim, "a blank one in either hides a valid one") answers `token-blank|GITHUB_TOKEN` where
+#        gh answers `realtok`;
 #   M6 — the token block moved AFTER the `ambient` arm answers `ambient|<dir>` where gh reads the whitespace.
 # A6 could not see M4 (it leaves `GITHUB_TOKEN` unset) and no arm could see M6 (every token arm runs through
 # `u()`, which unsets `GH_CONFIG_DIR`). Each mutant restores the exact false claim this PR removes: the gate
@@ -547,9 +549,10 @@ ck "B6d …and nothing claims the exemption was granted" $rc
 
 # B7: the same failed evidence read UNDER the ceiling — the lane runs (the ratio allows it), and the log
 # STILL says the evidence read failed. ⛔ PRE-CHANGE SOMETHING *WAS* SAID, and saying otherwise is the
-# false premise review round 12 caught: `origin/main` appended a bracketed clause to the VERDICT line
-# (append `:4266`/`:4279`; the OK echoes that carry it are `:4272`/`:4285` — `:4282` is the refusal's),
-# so under the ceiling it read
+# false premise review round 12 caught: `origin/main` appended a bracketed clause to the VERDICT line —
+# its two `land_backlog_verdict` call sites appended it to `lb_line` and echoed `[land-backlog] $lb_line`
+# on both the OK and the REFUSED paths (CITED BY SYMBOL: the line numbers a prior draft carried were rotted
+# by a rebase — review round 19) — so under the ceiling it read
 # `[land-backlog] OK … [the <TAG> exemption read ALSO failed: …]`. The gain this suite pins is the
 # DEDICATED line — greppable by its own token, printed whatever the verdict said, naming WHICH fault —
 # not the invention of a trace that existed.
@@ -762,6 +765,23 @@ ck "B13f …and a set-but-unreadable ambient GH_CONFIG_DIR stays ambient-missing
 _ah="$(u "HOME='$TMP/redirected-home'; . '$GH_AUTH' >/dev/null 2>&1; gh_auth_account_home")"
 { [ -n "$_ah" ] && [ "$_ah" != "$TMP/redirected-home" ]; } && case "$_ah" in /*) rc=0 ;; *) rc=1 ;; esac || rc=1
 ck "B14 gh_auth_account_home answers the PASSWD home, not the redirected HOME ('$_ah')" $rc
+# ⛔ THE OTHER TWO ARMS OF THE LOOKUP (review round 19, P3): B14 pins only the `getent` path, so deleting
+# the `~user` fallback (or the `dscl` parse) left the suite green — a silent false BLOCK on a getent-less
+# host, where the lane resolves `none` and is HELD. Both are exercised with a `getent` that FAILS, which
+# is the shape that makes them reachable on any host.
+mkdir -p "$TMP/bin-nogetent"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/bin-nogetent/getent"; chmod +x "$TMP/bin-nogetent/getent"
+_ahf="$(u "PATH='$TMP/bin-nogetent':\$PATH; HOME='$TMP/redirected-home'; . '$GH_AUTH' >/dev/null 2>&1; gh_auth_account_home")"
+{ [ -n "$_ahf" ] && [ "$_ahf" != "$TMP/redirected-home" ]; } && case "$_ahf" in /*) rc=0 ;; *) rc=1 ;; esac || rc=1
+ck "B15 …and with \`getent\` failing the \`~user\` fallback still answers a PASSWD home, not \$HOME ('$_ahf')" $rc
+# ⛔ THE STUB IS BUILT WITH THE PATH BAKED IN (review round 19): the first cut passed a `%s` through the
+# OUTER printf with no argument, so the stub on disk printed `NFSHomeDirectory: ` with no path at all — an
+# arm that could not see its own mutant — and it also referenced `$TMP`, which is never exported to a child.
+printf '#!/bin/sh\necho "NFSHomeDirectory: %s"\n' "$TMP/dscl-acct" > "$TMP/bin-nogetent/dscl"
+chmod +x "$TMP/bin-nogetent/dscl"
+_ahd="$(u "PATH='$TMP/bin-nogetent':\$PATH; HOME='$TMP/redirected-home'; . '$GH_AUTH' >/dev/null 2>&1; gh_auth_account_home")"
+[ "$_ahd" = "$TMP/dscl-acct" ]; rc=$?
+ck "B15b …and the \`dscl\` arm parses NFSHomeDirectory when that is the only source (got '$_ahd')" $rc
 _uc="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_account_home() { :; }; gh_auth_cause '$LANE_HOME' '$TMP/none.env' ''")"
 case "$_uc" in *"<unresolved account home>/.config/gh"*) rc=0 ;; *) rc=1 ;; esac
 ck "B14b …and when the lookup answers nothing the cause discloses <unresolved account home> instead of naming /.config/gh" $rc

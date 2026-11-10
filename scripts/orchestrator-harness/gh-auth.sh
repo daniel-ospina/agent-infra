@@ -26,13 +26,15 @@
 # config dir, and the remedy names the wrong cause — acting on it means landing PRs to fix a `hosts.yml`
 # problem. ⛔ "NOTHING EVER SET IT" IS A CLAIM ABOUT *THIS PATH*, NOT ABOUT THE TREE, and the honest
 # evidence says so: `git grep -n 'GH_CONFIG_DIR' origin/main -- scripts/` returns READERS all over it —
-# `worker-terminal.sh:500,1074-1081`, `objective.py:2273-2285`, `beta-progress.py:398-401` — and not one
-# provider on the dispatch path was among them, so the lane's `gh` had
-# no store while every one of those readers was pointed at the wrong place. ⛔ `record-review.sh` IS NOT
-# IN THAT LIST, though an earlier draft of this paragraph named it: its single `GH_CONFIG_DIR` hit
-# (`:5173`) is a COMMENT in a residual list — it resolves no config dir and only invokes `command gh`, so
-# it is not a reader of this variable at all. The three cited above are in-process resolvers, and a
-# reader who checks the citations must find that every one of them supports the sentence.
+# `worker-terminal.sh` (its `wt_gh_hosts`/`wt_launcher_env` pair), `objective.py` (its `_gh_hosts_path`
+# and the env read beside it) and `beta-progress.py` (its `os.environ` read) — and not one provider on
+# the dispatch path was among them, so the lane's `gh` had no store while every one of those readers was
+# pointed at the wrong place. ⛔ `record-review.sh` IS NOT IN THAT LIST, though an earlier draft of this
+# paragraph named it: its single `GH_CONFIG_DIR` hit is a COMMENT inside its own residual list — it
+# resolves no config dir and only invokes `command gh`, so it is not a reader of this variable at all.
+# ⛔ CITED BY SYMBOL, AND THAT IS DELIBERATE: line numbers were tried here first and the rebase onto a
+# moved `main` rotted every one of them (review round 19, P2) — a citation a reader cannot check is worse
+# than none, and `git grep` above re-derives the set for anyone who wants the current numbers.
 # #2509's finding 1 covers the
 # OPPOSITE arm (`wt_spawn` REFUSING a `keys.env`-provided `GH_CONFIG_DIR`); this module is the arm where
 # nothing provides it at all, on the `nonblocking-dispatch.sh` → `spawn-gate.sh` path.
@@ -55,7 +57,7 @@
 #
 #     1. the TOKEN NAMES        (gh's rule, and it outranks every directory)
 #     2. ambient `GH_CONFIG_DIR`   — honoured as set, even when it holds no store (`ambient-missing`)
-#     3. ambient `XDG_CONFIG_HOME` — only when `<xdg>/gh/hosts.yml` exists (`xdg`)
+#     3. ambient `XDG_CONFIG_HOME` — only when `<xdg>/gh/hosts.yml` is a store this read can READ (`xdg`)
 #     4. the LANE ENV FILE's `GH_CONFIG_DIR=`   (`keys`)      <- a source gh does not have, and it comes
 #     5. the LANE ENV FILE's `XDG_CONFIG_HOME=`  (`keys-xdg`)     BEFORE the lane-HOME default below
 #     6. the LANE HOME's `$HOME/.config/gh`      (`home`, or `home-xdg` when XDG is set and gh would
@@ -150,7 +152,8 @@ gh_auth_token_state() {
 # they documented is pinned where it is DECIDED: `gh_auth_token_state`'s three arms and A7/A7b/A7c.
 # ⛔ AND THE ORDER ITSELF IS PINNED IN ALL FOUR AXES, not only the one the bug was found in (review
 # round 4, P2): a blank `GITHUB_TOKEN` behind a REAL `GH_TOKEN` shadows NOTHING where the mirror rule
-# (`worker-terminal.sh:1087`'s "a blank one in either hides a valid one") would answer `token-blank`, and a
+# (`worker-terminal.sh`'s blank-token clear: "a blank one in either hides a valid one") would answer
+# `token-blank`, and a
 # blank token still outranks an AMBIENT store. A7i-A7k pin that at the resolver, and B2i2-B2i4 pin it in the
 # refusal's text; `B2i` itself (the rc/no-session assertion) is deliberately NOT counted as a witness — a
 # blank-token lane is HELD with 74 under either ordering, so only its detail arms can see the difference.
@@ -167,10 +170,18 @@ gh_auth_account_home() {
     h="$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1)"
   fi
   if [ -z "$h" ] && [ -n "$u" ]; then
-    # ⛔ `~user` IS THE PASSWD RECORD, NOT `$HOME` — bash expands the CURRENT user's `~` from `$HOME`,
-    # but a NAMED user's from passwd, which is exactly the answer wanted here (verified: with
-    # `HOME=/tmp/cell-home`, `eval echo ~$(id -un)` still prints the account home).
-    h="$(cd ~"$u" 2>/dev/null && pwd -P)" || h=""
+    # ⛔ `~user` IS THE PASSWD RECORD, NOT `$HOME` — bash expands the CURRENT user's `~` from `$HOME`, but
+    # a NAMED user's from passwd, which is exactly the answer wanted here.
+    # ⛔ BUT THIS ARM WAS DEAD CODE AND ITS COMMENT CLAIMED IT HAD BEEN VERIFIED (measured, bash 5.2, review
+    # round 19): tilde expansion runs BEFORE parameter expansion, so `cd ~"$u"` leaves the `~` LITERAL — the
+    # cd fails "No such file or directory" on EVERY host, and a getent-less box answered an empty home,
+    # i.e. `none`, i.e. every lane HELD, with nothing reddening (B14 pinned only the getent path). Two
+    # things were wrong: the arm needs the SECOND expansion pass `eval` supplies, and the comment recorded
+    # a probe (`eval echo ~$(id -un)`) that carries the eval the code did not. `u` is screened to a plain
+    # login-name shape first, so the evaluated string cannot be fed shell syntax by a hostile passwd name.
+    case "$u" in *[!A-Za-z0-9._-]*) u="" ;; esac
+    [ -n "$u" ] && h="$(eval "cd ~$u && pwd -P" 2>/dev/null)"
+    h="${h:-}"
   fi
   case "$h" in /*) printf '%s\n' "$h" ;; *) printf '\n' ;; esac
 }

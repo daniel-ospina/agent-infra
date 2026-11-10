@@ -1296,9 +1296,12 @@ land_backlog_exempt() { # <issue> <owner/repo> -> prints the reason + ". ", rc 0
 # ⛔ THE DEFECT THIS NAMES: when the label/title read failed, the ONLY trace was a bracketed clause
 # APPENDED to the verdict line, so the failure inherited that verdict's shape and said nothing about
 # WHICH fault it was. On an UNDER-ceiling repo the pre-change log therefore read
-# `[land-backlog] OK <n> open / <r> landings per hour … [the <TAG> exemption read ALSO failed: …]` (on
-# `origin/main` the append is at `:4266`/`:4279`, and the OK echoes that carry it are `:4272`/`:4285`;
-# `:4282` is the refusal's echo, not the under-ceiling one): an OK line carrying a failed read. Measured 2026-11-09, the same cause — no gh credential in the lane's redirected HOME —
+# `[land-backlog] OK <n> open / <r> landings per hour … [the <TAG> exemption read ALSO failed: …]`: an OK
+# line carrying a failed read. Pre-change that clause was built by `land_backlog_verdict`'s two callers
+# (they appended it to `lb_line` and echoed `[land-backlog] $lb_line` on the way out, on both the OK and
+# the REFUSED paths) — CITED BY SYMBOL, because the line numbers this sentence first carried were rotted
+# by a rebase (review round 19, P2). Measured 2026-11-09, the same cause — no gh credential in the
+# lane's redirected HOME —
 # failed BOTH reads, and a P0-blocker held by a broken gh chain was distinguishable from one judged
 # non-urgent only by a trailing bracket nobody would grep for. This line is printed whenever the
 # evidence read failed, whatever the ratio read then said, and it names which fault it is.
@@ -4348,14 +4351,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # to the operational home while gh's `hosts.yml` lives in the ACCOUNT home — so without this the lane's
   # `gh` is simply unauthenticated, the ratio reads UNREADABLE, and (measured 2026-11-09, two cells) the
   # refusal blamed the PR queue.
-  # SCOPE, STATED — THESE THREE ARE THIS `run_agent`'S ONLY CALLERS. Resolving here covers `lane.sh:895`,
-  # `fix-one.sh:838` and `nonblocking-dispatch.sh:346`, and the export is INHERITED by the `pi` this
+  # SCOPE, STATED — THESE THREE ARE THIS `run_agent`'S ONLY CALLERS: `lane.sh`, `fix-one.sh` and
+  # `nonblocking-dispatch.sh` (re-derive with `grep -rn 'run_agent "' scripts/`; the line numbers a prior
+  # draft carried here were rotted by the rebase — review round 19, P2), and the export is INHERITED by the `pi` this
   # function starts — so, for those three dispatches, the store the gate read and the store the lane
   # reads are the same one by construction.
   # ⛔ `wt_spawn`'S LAUNCH LINE IS A DIFFERENT MECHANISM, AND THE INHERITANCE RUNS THE OTHER WAY (review
   # round 10, P3 — this block used to claim the export reached it, which no path can satisfy). `wt_spawn`
-  # (`worker-terminal.sh:1868`) COMPOSES the pane's environment through `wt_launcher_env` (`:817`) in the
-  # CONTROLLER's process, BEFORE this function has run, and `:1074-1081` composes it from the CALLER's
+  # (`worker-terminal.sh`) COMPOSES the pane's environment through `wt_launcher_env` in the CONTROLLER's
+  # process, BEFORE this function has run, and that function composes it from the CALLER's
   # `GH_CONFIG_DIR`/`XDG_CONFIG_HOME` — which, in the shape this module resolves (`run_agent`'s own export,
   # so the controller's env carries neither), emits an ACTIVE CLEAR: `; unset GH_CONFIG_DIR XDG_CONFIG_HOME`.
   # Nothing downstream of this function calls `wt_spawn` at all (`grep -n wt_spawn` over `spawn-gate.sh`,
@@ -4363,15 +4367,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # own mentions included — and no invocation), so `wt_spawn → lane.sh → run_agent → pi` is the only order
   # that exists and the export cannot travel up it.
   # ⛔ SO #2509'S FINDING-1 ARM IS UNTOUCHED BY THIS CHANGE: `wt_spawn` REFUSING a `keys.env`-provided
-  # `GH_CONFIG_DIR` is `worker-terminal.sh`'s own `_guard` (`:1127-1140` — `gh auth token` with the
-  # 93/96/97/98 vocabulary) built from the LAUNCH-TIME environment. That is the opposite arm, on the other
+  # `GH_CONFIG_DIR` is `worker-terminal.sh`'s own `_guard` (a built `gh auth token` with the 93/96/97/98
+  # vocabulary) built from the LAUNCH-TIME environment. That is the opposite arm, on the other
   # side of a boundary this resolution never crosses, and it is stated rather than implied because a
   # comment claiming a guard it does not have reads exactly like one that has it — `gh-auth.test.sh`'s
   # B9e-B9h pin this boundary against BOTH the text and the tree.
   # ⛔ THE SENTENCE THAT STOOD HERE CLAIMED THIS `run_agent` WAS THE ONE INVOCATION EVERY WORKER GOES
   # THROUGH, AND THE TREE FALSIFIES IT (review round 9, P3): `merge-one.sh` carries its OWN `run_agent()`
-  # — the declared #2208 residual, `:512` — and its chain-reviewer spawn (`:1961`), the one whose record
-  # the merge gate reads, resolves NO gh credential: `grep -c gh_auth merge-one.sh` is 0 and that file
+  # — the declared #2208 residual — and its chain-reviewer spawn, the one whose record the merge gate
+  # reads, resolves NO gh credential: `grep -c gh_auth merge-one.sh` is 0 and that file
   # does not even source this one. The same cause, at a site this resolution does NOT reach — not this
   # diff's scope, and not covered by the sentence above. Whether that reviewer's `gh` is ACTUALLY
   # unauthenticated depends on the environment it is spawned in, which nobody has measured (UNVERIFIED),
