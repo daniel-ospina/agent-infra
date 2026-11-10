@@ -4886,92 +4886,92 @@ $VACUITY_BLOCK"
 # green for the NON-VACUITY arm's reason, not for the escape's — the unrelated-row trap #3442 names.
 # The VETO vectors carry it too, so a red is attributable to (1c) and not to a second contract.
 N9859_BODY="$(cat <<'N9859_REAL_BODY_EOF'
-## Code review — PR #9859 (`fix/5006-near-dup-merge`, head `3e669aa6a`)
+## Code review — PR #9859 (@@BT@@fix/5006-near-dup-merge@@BT@@, head @@BT@@3e669aa6a@@BT@@)
 
 **Outcome: 3 findings — 2 blocking (P1), 1 documentation (P2).** Everything else I traced
 is sound; the specifics are in "Verified clean" below so the fixer does not re-derive them.
 
-Reviewed at the PR head, full files (not hunks): `tortoise/near_dup_merge.py` (new, 424 lines),
-`tortoise/extractor_v2.py`, `tortoise/sdk.py` (the `_extract_session_v2` capture path),
-`tortoise/vet_gate.py`, `tests/test_near_dup_merge_5006.py`, `config/ci-surfaces.yml`,
-`config/v4-mechanisms.yml`, and the two architecture docs.
+Reviewed at the PR head, full files (not hunks): @@BT@@tortoise/near_dup_merge.py@@BT@@ (new, 424 lines),
+@@BT@@tortoise/extractor_v2.py@@BT@@, @@BT@@tortoise/sdk.py@@BT@@ (the @@BT@@_extract_session_v2@@BT@@ capture path),
+@@BT@@tortoise/vet_gate.py@@BT@@, @@BT@@tests/test_near_dup_merge_5006.py@@BT@@, @@BT@@config/ci-surfaces.yml@@BT@@,
+@@BT@@config/v4-mechanisms.yml@@BT@@, and the two architecture docs.
 
 ---
 
-### F1 — BLOCKING (P1): the verdict→fusion routing key is clipped differently on each side, so a `MERGE` verdict is silently ignored for any candidate over 1000 characters — and a duplicate Point is minted
+### F1 — BLOCKING (P1): the verdict→fusion routing key is clipped differently on each side, so a @@BT@@MERGE@@BT@@ verdict is silently ignored for any candidate over 1000 characters — and a duplicate Point is minted
 
-`tortoise/extractor_v2.py:7895` `_merge_flagged_contents` builds the key as
+@@BT@@tortoise/extractor_v2.py:7895@@BT@@ @@BT@@_merge_flagged_contents@@BT@@ builds the key as
 
-```python
+@@BT@@@@BT@@@@BT@@python
 text = str(d.get("text") or "").strip()
 if text:
     flagged.add(_norm(text))          # ← no [:_MAX_CONTENT] clip
-```
+@@BT@@@@BT@@@@BT@@
 
-`execute_embed` looks the flag up with a **clipped** content (`extractor_v2.py:7030`):
+@@BT@@execute_embed@@BT@@ looks the flag up with a **clipped** content (@@BT@@extractor_v2.py:7030@@BT@@):
 
-```python
+@@BT@@@@BT@@@@BT@@python
 content = str(p.get("content", "")).strip()[:_MAX_CONTENT]   # _MAX_CONTENT = 1000 (line 3287)
 ...
 merge_flagged=n in merge_flagged                              # line 7077
-```
+@@BT@@@@BT@@@@BT@@
 
-`_norm` (line 3248) does **no** truncation — it only lower-cases and collapses whitespace. So for a
+@@BT@@_norm@@BT@@ (line 3248) does **no** truncation — it only lower-cases and collapses whitespace. So for a
 candidate whose content exceeds 1000 characters the two sides normalise **different strings** and
-`n in merge_flagged` is `False`.
+@@BT@@n in merge_flagged@@BT@@ is @@BT@@False@@BT@@.
 
-Consequence, traced through `classify_consolidation`: `merge_flagged=False` ⇒ the `#9424` guard
-`if not _attachments_preserved(p, point): … continue` refuses the fold ⇒ the claim falls to **`ADD`**
-⇒ a second Point is minted for a pair the arbiter marked `MERGE`. That is exactly the pre-#5006
-defect (de-facto duplicate) and it is **silent** — no warning, `stats["merges"]` stays 0, and the
-registry row reads `implemented`.
+Consequence, traced through @@BT@@classify_consolidation@@BT@@: @@BT@@merge_flagged=False@@BT@@ ⇒ the @@BT@@#9424@@BT@@ guard
+@@BT@@if not _attachments_preserved(p, point): … continue@@BT@@ refuses the fold ⇒ the claim falls to **@@BT@@ADD@@BT@@**
+⇒ a second Point is minted for a pair the arbiter marked @@BT@@MERGE@@BT@@. That is exactly the pre-#5006
+defect (de-facto duplicate) and it is **silent** — no warning, @@BT@@stats["merges"]@@BT@@ stays 0, and the
+registry row reads @@BT@@implemented@@BT@@.
 
-This is not a new convention question: `vet_gate._normalised_text_variants` (`vet_gate.py:290`) already
-keeps **both** `_norm(raw)` and `_norm(raw[:_MAX_CONTENT])` precisely because the write path caps at
+This is not a new convention question: @@BT@@vet_gate._normalised_text_variants@@BT@@ (@@BT@@vet_gate.py:290@@BT@@) already
+keeps **both** @@BT@@_norm(raw)@@BT@@ and @@BT@@_norm(raw[:_MAX_CONTENT])@@BT@@ precisely because the write path caps at
 1000 — the new routing function skips the mirror of that and is the only consumer of a VET decision
 that does.
 
-Same class, one line up: VET's `text` is `_item_text` = `name or content` (`vet_gate.py:289`), so a
-`points` item that carries a `name` key keys the verdict on the **name** while `execute_embed` keys on
-the **content**. `vet_gate`'s own docstring calls out that items can carry both keys.
+Same class, one line up: VET's @@BT@@text@@BT@@ is @@BT@@_item_text@@BT@@ = @@BT@@name or content@@BT@@ (@@BT@@vet_gate.py:289@@BT@@), so a
+@@BT@@points@@BT@@ item that carries a @@BT@@name@@BT@@ key keys the verdict on the **name** while @@BT@@execute_embed@@BT@@ keys on
+the **content**. @@BT@@vet_gate@@BT@@'s own docstring calls out that items can carry both keys.
 
-**Fix:** clip at the routing site (accept both variants, mirroring `_normalised_text_variants`), or key
+**Fix:** clip at the routing site (accept both variants, mirroring @@BT@@_normalised_text_variants@@BT@@), or key
 on the field the write path actually keys on.
 
 **Settlement (fixer runs this, not me):**
-```bash
+@@BT@@@@BT@@@@BT@@bash
 TORTOISE_TEST_CARVE_OUT=1 uv run pytest tests/test_near_dup_merge_5006.py -q -k flagged
 # add: assert v2._merge_flagged_contents({"decisions": {"p": {"section": "points", "outcome": "MERGE",
 #        "text": "x" * 1200}}}) == frozenset({v2._norm(("x" * 1200)[:v2._MAX_CONTENT])})
-```
+@@BT@@@@BT@@@@BT@@
 
 ---
 
-### F2 — BLOCKING (P1): the fusion write applies **no** subject-channel skip, so a union name that is a subject-kind name also naming an existing `:Object` gets an un-gated `aboutObject` edge that capture deliberately refuses
+### F2 — BLOCKING (P1): the fusion write applies **no** subject-channel skip, so a union name that is a subject-kind name also naming an existing @@BT@@:Object@@BT@@ gets an un-gated @@BT@@aboutObject@@BT@@ edge that capture deliberately refuses
 
-Capture's attachment pass, `tortoise/sdk.py:12118-12131`:
+Capture's attachment pass, @@BT@@tortoise/sdk.py:12118-12131@@BT@@:
 
-```python
+@@BT@@@@BT@@@@BT@@python
 _n = name.strip()
 if _n in subject_entity_names:
-    # #1370: the binder owns the gated `aboutSubject` edge; the topic channel must
+    # #1370: the binder owns the gated @@BT@@aboutSubject@@BT@@ edge; the topic channel must
     # not produce an un-gated one, nor an id-less Object stub for a subject-kind name
     continue
 _oid_rows = proj.g.query("MATCH (o:Object {name:$n}) RETURN o.id", …)
-```
+@@BT@@@@BT@@@@BT@@
 
-`apply_merge_union` (`tortoise/near_dup_merge.py`, attachment loop) has **no equivalent guard**: every
-union name is resolved with `MATCH (o:Object {name:$n})` and linked via `link_entity`. The module's own
-docstring states the premise that makes this reachable — *"`about_entities` is not object-only — the
-SUBJECT channel (team/role/person, the gated `aboutSubject` edge) also contributes names to it"* — and
-then bounds the consequence to *"a subject-kind attachment … lands in `unresolved` instead of being
-bound"*. **That bound is false in the coincidence case**: `sdk.py:11849-11857` (F6) records explicitly
-that an `:Object` may legitimately share a subject's name (that is why the skip is exact-name, not
-case-folded), and in exactly that case the fusion mints the un-gated `aboutObject` edge capture's `if
-_n in subject_entity_names: continue` exists to prevent (#4934 label leak).
+@@BT@@apply_merge_union@@BT@@ (@@BT@@tortoise/near_dup_merge.py@@BT@@, attachment loop) has **no equivalent guard**: every
+union name is resolved with @@BT@@MATCH (o:Object {name:$n})@@BT@@ and linked via @@BT@@link_entity@@BT@@. The module's own
+docstring states the premise that makes this reachable — *"@@BT@@about_entities@@BT@@ is not object-only — the
+SUBJECT channel (team/role/person, the gated @@BT@@aboutSubject@@BT@@ edge) also contributes names to it"* — and
+then bounds the consequence to *"a subject-kind attachment … lands in @@BT@@unresolved@@BT@@ instead of being
+bound"*. **That bound is false in the coincidence case**: @@BT@@sdk.py:11849-11857@@BT@@ (F6) records explicitly
+that an @@BT@@:Object@@BT@@ may legitimately share a subject's name (that is why the skip is exact-name, not
+case-folded), and in exactly that case the fusion mints the un-gated @@BT@@aboutObject@@BT@@ edge capture's @@BT@@if
+_n in subject_entity_names: continue@@BT@@ exists to prevent (#4934 label leak).
 
-The guard is available at the call site — the merge block is `sdk.py:12327-12332`, inside
-`_extract_session_v2`, and `subject_entity_names` is built at `sdk.py:11857` in the same function — so
+The guard is available at the call site — the merge block is @@BT@@sdk.py:12327-12332@@BT@@, inside
+@@BT@@_extract_session_v2@@BT@@, and @@BT@@subject_entity_names@@BT@@ is built at @@BT@@sdk.py:11857@@BT@@ in the same function — so
 this is a filter at the call site or a new argument, not a redesign.
 
 **Wrong outcome:** a Point gains an attachment to an Object under a subject's name — an edge the same
@@ -4980,23 +4980,23 @@ attachments, not add forbidden ones.
 
 ---
 
-### F3 — P2 (documentation, same file this PR edits): `vet_gate.py`'s docstring now contradicts itself, and the axis list is one token short
+### F3 — P2 (documentation, same file this PR edits): @@BT@@vet_gate.py@@BT@@'s docstring now contradicts itself, and the axis list is one token short
 
-`tortoise/vet_gate.py:85-88` still says:
+@@BT@@tortoise/vet_gate.py:85-88@@BT@@ still says:
 
-> A merge candidate is flagged `MERGE` and **recorded in the VET evidence surface only — nothing
-> consumes it yet**: no code routes a `MERGE` verdict to S3, and the merge *itself* is #5006's
+> A merge candidate is flagged @@BT@@MERGE@@BT@@ and **recorded in the VET evidence surface only — nothing
+> consumes it yet**: no code routes a @@BT@@MERGE@@BT@@ verdict to S3, and the merge *itself* is #5006's
 
-and `vet_gate.py:89-96`, added by this PR, says:
+and @@BT@@vet_gate.py:89-96@@BT@@, added by this PR, says:
 
 > ✅ **Updated (#5006) — the verdict HAS a consumer now.**
 
 Both statements are in the same docstring, six lines apart, and the stale one was left in place. Also
-`vet_gate.py:82-84` still lists `extractor_v2.DecisionRecord`'s consolidation axis as
-`ADD/UPDATE/NOOP/DELETE` — it is five tokens now.
+@@BT@@vet_gate.py:82-84@@BT@@ still lists @@BT@@extractor_v2.DecisionRecord@@BT@@'s consolidation axis as
+@@BT@@ADD/UPDATE/NOOP/DELETE@@BT@@ — it is five tokens now.
 
 **Why it matters here rather than as a nit:** this repo treats a record that cannot distinguish a
-deliberate ruling from an accident of history as the failure mode (`OVERRIDES:`/contradiction-test
+deliberate ruling from an accident of history as the failure mode (@@BT@@OVERRIDES:@@BT@@/contradiction-test
 rules) — and a lane reading the first paragraph concludes the mechanism is unimplemented, which is the
 state #5006 exists to end. The fix is to delete the superseded sentence (and extend the axis list), not
 to append a third note.
@@ -5005,52 +5005,64 @@ to append a third note.
 
 ### Verified clean (so the fixer does not re-open these)
 
-- **Manifest integrity** — `config/ci-surfaces.yml` registers `test_near_dup_merge_5006.py` exactly
-  once on the `core` surface (line 3837), with the correct rationale for this repo's selector
-  (`extractor_v2.py` is not a `SHARED_MODULE` ⇒ a diff touching only it selects `core`), and a
-  `durations` row (line 8076) so the #3400 coverage floor is not dropped. No duplicate entry, no
-  `carve_out`/`TEST_NO_REDIRECT_STEMS` mirror needed: `tests/test_embedded_lifecycle.py` explicitly
-  allows `TortoiseSDK(` everywhere, and the redirect derives a per-path graph from `tmp_path`, so the
+- **Manifest integrity** — @@BT@@config/ci-surfaces.yml@@BT@@ registers @@BT@@test_near_dup_merge_5006.py@@BT@@ exactly
+  once on the @@BT@@core@@BT@@ surface (line 3837), with the correct rationale for this repo's selector
+  (@@BT@@extractor_v2.py@@BT@@ is not a @@BT@@SHARED_MODULE@@BT@@ ⇒ a diff touching only it selects @@BT@@core@@BT@@), and a
+  @@BT@@durations@@BT@@ row (line 8076) so the #3400 coverage floor is not dropped. No duplicate entry, no
+  @@BT@@carve_out@@BT@@/@@BT@@TEST_NO_REDIRECT_STEMS@@BT@@ mirror needed: @@BT@@tests/test_embedded_lifecycle.py@@BT@@ explicitly
+  allows @@BT@@TortoiseSDK(@@BT@@ everywhere, and the redirect derives a per-path graph from @@BT@@tmp_path@@BT@@, so the
   two graph fixtures are isolated in both the docker and embedded lanes.
-- **`merge_flagged=False` really is byte-identical** to pre-#5006: both new refusal branches are
-  guarded by `merge_flagged`, and the final `if best_noop is not None and (best_merge is None or …)`
-  short-circuits on `best_merge is None`. The only production caller of `classify_consolidation` is
-  `execute_embed`, so no other consumer had to learn a fifth outcome.
-- **The verdict is genuinely necessary, never sufficient**: `near_dup_merge`'s ladder refuses on
-  `not flagged` → non-empty `identity` → `difference is not None` → `below_bar` → `unreadable_attachments`
-  → `nothing_to_union`, and `_boundary` is called once per pair in `classify_consolidation` (so
-  `difference is not None` already subsumes a non-empty identity set — the ladder cannot disagree with
+- **@@BT@@merge_flagged=False@@BT@@ really is byte-identical** to pre-#5006: both new refusal branches are
+  guarded by @@BT@@merge_flagged@@BT@@, and the final @@BT@@if best_noop is not None and (best_merge is None or …)@@BT@@
+  short-circuits on @@BT@@best_merge is None@@BT@@. The only production caller of @@BT@@classify_consolidation@@BT@@ is
+  @@BT@@execute_embed@@BT@@, so no other consumer had to learn a fifth outcome.
+- **The verdict is genuinely necessary, never sufficient**: @@BT@@near_dup_merge@@BT@@'s ladder refuses on
+  @@BT@@not flagged@@BT@@ → non-empty @@BT@@identity@@BT@@ → @@BT@@difference is not None@@BT@@ → @@BT@@below_bar@@BT@@ → @@BT@@unreadable_attachments@@BT@@
+  → @@BT@@nothing_to_union@@BT@@, and @@BT@@_boundary@@BT@@ is called once per pair in @@BT@@classify_consolidation@@BT@@ (so
+  @@BT@@difference is not None@@BT@@ already subsumes a non-empty identity set — the ladder cannot disagree with
   the classifier).
-- **Both false-PASS fixes hold**: `contained` and the id-less `linked` both read `RETURN count(*)`, and
-  a `MATCH` that resolves nothing returns 0 rather than counting the attempt. `link_entity` returns
-  only 0/1 by its own contract, so `linked` stays a measurement on both branches.
-- **The union's case contract is right and is pinned**: comparison case-folds (`_entity_names`), the
-  emitted spelling is the prior's/original, and `apply_merge_union` resolves with an exact
-  `Object {name:$n}` — matching `sdk.py:12136`. The test fixtures are capitalised so the
+- **Both false-PASS fixes hold**: @@BT@@contained@@BT@@ and the id-less @@BT@@linked@@BT@@ both read @@BT@@RETURN count(*)@@BT@@, and
+  a @@BT@@MATCH@@BT@@ that resolves nothing returns 0 rather than counting the attempt. @@BT@@link_entity@@BT@@ returns
+  only 0/1 by its own contract, so @@BT@@linked@@BT@@ stays a measurement on both branches.
+- **The union's case contract is right and is pinned**: comparison case-folds (@@BT@@_entity_names@@BT@@), the
+  emitted spelling is the prior's/original, and @@BT@@apply_merge_union@@BT@@ resolves with an exact
+  @@BT@@Object {name:$n}@@BT@@ — matching @@BT@@sdk.py:12136@@BT@@. The test fixtures are capitalised so the
   lowered-union mutation is discriminating.
 - **No vacuous test** that would pass on pre-fix code: every behavioural test either imports the new
-  module, passes `merge_flagged=` (a `TypeError` pre-fix), or reads `result["merges"]` (a `KeyError`
-  pre-fix). `TestTheCapturePathExecutesTheFusion` genuinely covers the one production invocation — the
-  merge block sits after `_write_session_and_turns` (`sdk.py:10565` before `10746`), so the Session
-  node exists, and a deleted block loses both the `aboutObject` edges and the
-  `(Session)-[:CONTAINS]->(Point)` edge the test asserts on.
-- **No injection surface**: every Cypher statement in `near_dup_merge.py` is parameterised; the only
-  interpolated identifiers are literals; no `eval`, no file writes, no secrets.
-- **Registry/docs consistency**: `<!-- v4-mechanism: near_dup_merge -->` is present in both
-  `declared_in:` documents (`EXTRACTOR-V4-ARCHITECTURE.md:1740`, `STORAGE-ARCHITECTURE.md:1448`), the
-  registry row carries `code`/`tests`/`symbols`, and no test pins a literal implemented/absent count.
+  module, passes @@BT@@merge_flagged=@@BT@@ (a @@BT@@TypeError@@BT@@ pre-fix), or reads @@BT@@result["merges"]@@BT@@ (a @@BT@@KeyError@@BT@@
+  pre-fix). @@BT@@TestTheCapturePathExecutesTheFusion@@BT@@ genuinely covers the one production invocation — the
+  merge block sits after @@BT@@_write_session_and_turns@@BT@@ (@@BT@@sdk.py:10565@@BT@@ before @@BT@@10746@@BT@@), so the Session
+  node exists, and a deleted block loses both the @@BT@@aboutObject@@BT@@ edges and the
+  @@BT@@(Session)-[:CONTAINS]->(Point)@@BT@@ edge the test asserts on.
+- **No injection surface**: every Cypher statement in @@BT@@near_dup_merge.py@@BT@@ is parameterised; the only
+  interpolated identifiers are literals; no @@BT@@eval@@BT@@, no file writes, no secrets.
+- **Registry/docs consistency**: @@BT@@<!-- v4-mechanism: near_dup_merge -->@@BT@@ is present in both
+  @@BT@@declared_in:@@BT@@ documents (@@BT@@EXTRACTOR-V4-ARCHITECTURE.md:1740@@BT@@, @@BT@@STORAGE-ARCHITECTURE.md:1448@@BT@@), the
+  registry row carries @@BT@@code@@BT@@/@@BT@@tests@@BT@@/@@BT@@symbols@@BT@@, and no test pins a literal implemented/absent count.
   The stale *"The flagged verdict has no consumer yet"* sentence at
-  `EXTRACTOR-V4-ARCHITECTURE.md:774` **is** updated by this PR.
-- **Inertness is declared, not hidden** — `implemented` + "with no arbiter injected it is INERT" is
+  @@BT@@EXTRACTOR-V4-ARCHITECTURE.md:774@@BT@@ **is** updated by this PR.
+- **Inertness is declared, not hidden** — @@BT@@implemented@@BT@@ + "with no arbiter injected it is INERT" is
   stated in the registry note, the design doc, both changelogs and the test docstring, and no
-  production caller injects `vet_arbiter`. Same posture VET (already `implemented`) ships with, so it
+  production caller injects @@BT@@vet_arbiter@@BT@@. Same posture VET (already @@BT@@implemented@@BT@@) ships with, so it
   is consistent rather than a new claim.
 
-**Not run (no `.venv` in this checkout; execution is the fixer's step):** `uv run pytest` for the
-listed batteries, `uv run ruff check`, and `tools/ci_selection.py --integrity`. The manifest reasoning
+**Not run (no @@BT@@.venv@@BT@@ in this checkout; execution is the fixer's step):** @@BT@@uv run pytest@@BT@@ for the
+listed batteries, @@BT@@uv run ruff check@@BT@@, and @@BT@@tools/ci_selection.py --integrity@@BT@@. The manifest reasoning
 above is from the selector source, not from a run.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| 13n6 the guard refuses a review that DECLARES a blocking count | sed s/outcome_declares_blocking/false/ x.sh | 13n6 | rc=0, wanted 3 |
 N9859_REAL_BODY_EOF
 )"
+# ⛔ 20h48b FORBIDS A LIVE BACKTICK ON ANY NON-COMMENT LINE OF THIS FILE (a label once EXECUTED its
+# own backticks), and the real review body is full of them. They therefore travel as `@@BT@@` and
+# are materialised here — `printf '\140'` is the same no-live-backtick trick 20h48b's own control
+# uses, and the substitution keeps the body BYTE-IDENTICAL to the artifact.
+N9859_BT="$(printf '\140')"
+N9859_BODY="${N9859_BODY//@@BT@@/$N9859_BT}"
 rm -f "$(Q2 425010)"
 EV_REF="comment:42501001" run_record_ev 425010 STUB_EVIDENCE_BODY="$N9859_BODY"
 assert_eq "$RECORD_RC" "3" "13n6 the REAL tortoise#9859 artifact — 'Outcome: 3 findings — 2 blocking (P1)' — is REFUSED (rc 3)"
@@ -6177,13 +6189,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4181 :5907 :8281 :8455, plus a comment mention at :4050; `14.1c-CITE` below
+#     CITE-CHECK: :4277 :6003 :8377 :8551, plus a comment mention at :4146; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4159) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4181) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4277) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8281). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8377). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -6209,7 +6221,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8281` / `:8455` — CITE-CHECK: :8281 :8455 — re-derived by the
+#     this head the predicates are `:8377` / `:8551` — CITE-CHECK: :8377 :8551 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -7113,12 +7125,12 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
 #       and in #3168's diff the only hunk at `post_marker()` (head :4159) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4181) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :4277) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :5907 :8281 :8455 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6003 :8377 :8551 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
