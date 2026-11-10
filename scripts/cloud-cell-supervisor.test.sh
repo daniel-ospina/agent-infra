@@ -6719,6 +6719,62 @@ grep -qE 'cp "\$HERE/gh-rest/gh"' "$HERE/orchestrator-harness/install.sh" \
   || bad "install.sh no longer copies the adapter — the Mac half of the parity is gone"
 
 
+# ── §DECISION-GATE: `status` reports the owner-question gate, read-only (agent-infra#2642) ────────
+# MEASURED 2026-10-24 on agent-infra cell-1: `ask-owner.py` exited 2 on all nine owner questions it
+# was handed (no TypeSafe key on the box), so NOTHING reached the `owner-decision` queue while every
+# lane's own report said "asked". `status` is the verb an operator runs to discover a cell's state, so
+# it must answer this one — and it must READ: the WRITER is the bring-up's `check_decision_gate`, and a
+# second writer of one secret is how a repaired box and a certified box drift apart.
+say_case "§DECISION-GATE: status reports the owner-question gate, read-only"
+DG="$T/dgate"
+mkdir -p "$DG/home/.pi/agent" "$DG/bin" "$DG/o" "$DG/repo"
+printf '#!/bin/sh\nexit 1\n' > "$DG/bin/tmux"      # no session on the OPERATOR's tmux server
+chmod +x "$DG/bin/tmux"
+: > "$DG/keys.env"
+dg_sup() { PATH="$DG/bin:$PATH" CELL_HOME="$DG/home" ENV_FILE="$DG/keys.env" O="$DG/o" \
+             REPO="$DG/repo" OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" \
+             bash "$SUP" status 2>&1; }
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: MISSING"*) ok "status prints the decision-gate state when no credential exists (jev: MISSING)" ;;
+  *) bad "status does not report the missing decision-gate credential — a box that cannot queue a question still reads healthy: $OUT" ;;
+esac
+case "$OUT" in
+  *"owner queue"*) ok "…and says what it costs (questions never reach the owner queue), not just 'jev' with no meaning" ;;
+  *) bad "the MISSING line does not say what it costs: $OUT" ;;
+esac
+case "$OUT" in
+  *"cloud-cell-bringup.sh --check"*) ok "…and names the ONE command that repairs it" ;;
+  *) bad "the MISSING line does not name the repairer: $OUT" ;;
+esac
+[ ! -e "$DG/home/.pi/agent/jev-config.json" ] \
+  && ok "…and status WROTE NOTHING (the bring-up is the only writer of that credential)" \
+  || bad "status MINTED a decision-gate credential — two writers of one secret is the drift this gate prevents"
+# The store path: one hand-written 0600 store is enough, and it is read as configured.
+printf '{"apiKey":"sk_store_only","model":"jev-latest"}\n' > "$DG/home/.pi/agent/jev-config.json"
+chmod 600 "$DG/home/.pi/agent/jev-config.json"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*"jev-config.json"*) ok "status reads an existing 0600 store as configured, naming the file it read" ;;
+  *) bad "status did not read the provisioned store as configured: $OUT" ;;
+esac
+# The FILE is the contract: an ambient export reaches no worker (tmux serves the session the SERVER's
+# environment), so it must be reported as the near-miss it is rather than as configured.
+rm -f "$DG/home/.pi/agent/jev-config.json"
+OUT="$(TYPESAFE_API_KEY=sk_ambient dg_sup)"
+case "$OUT" in
+  *"NOT in"*) ok "an AMBIENT-only key is reported as a near-miss, not as configured (a lane sources the file)" ;;
+  *"jev: configured"*) bad "status called an ambient-only key configured — that is the state a worker has no key in: $OUT" ;;
+  *) bad "an ambient-only key is reported with no explanation: $OUT" ;;
+esac
+# …and the FILE does count, because a lane sources it.
+printf 'TYPESAFE_API_KEY=sk_in_file\n' > "$DG/keys.env"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*"keys.env"*) ok "a key the keys.env FILE carries IS configured (a lane sources that file itself)" ;;
+  *) bad "a keys.env-delivered key was not read as configured: $OUT" ;;
+esac
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
