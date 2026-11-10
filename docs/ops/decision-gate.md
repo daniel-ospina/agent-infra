@@ -50,8 +50,12 @@ The store is durable on purpose: a reader that sources nothing (a systemd unit, 
 |---|---|
 | `cloud-cell-bringup.sh --check` | **REFUSES** the box, by name (`CHECK FAILED [decision gate]: …`), before `CELL READY` and before the paid provider probe. A store that exists but cannot be parsed is refused too — the script will not replace a credential file it cannot read. |
 | `cloud-cell-supervisor.sh status` | one **read-only** line: `jev: configured (…)` / `⛔ jev: MISSING …` / `⛔ jev: a TypeSafe key is set in THIS shell but NOT in keys.env …`. It names the one command that repairs; it never writes. |
-| `ask-owner.py <repo> <n>` | exit 2 prints `UNSCORED — the owner queue did not receive this`. |
-| `ask-owner.py --scan` | the summary line carries `unscored=N` on both arms, and the questions are named above it. `orchestrator-heartbeat.sh` sums that field into `N_ASK` (so the naming lines reach the log) and logs `ALERT ask-gate UNSCORED …`. |
+| `ask-owner.py <repo> <n>` | exit 2 is honest, and its REASON is named: a scoring failure from `jev()` (no key, a rejected key, a failed call) prints the cause line and then `UNSCORED — the owner queue did not receive this`. The other exit-2 causes name themselves without that sentence (`could not read <repo>#<n>`, `could not read the answer state … UNKNOWN`, `jev returned no answer for …`). |
+| `ask-owner.py --scan` | the summary line carries `unscored=N` on both arms, and every unscored question is NAMED above it as `UNSCORED <repo>#<n> — …`, one line per question, with the cause on the line above. `orchestrator-heartbeat.sh` sums that field into `N_ASK` (so the naming lines reach the log) and logs one `ALERT ask-gate UNSCORED …` per tick. |
+
+The alert is deliberately **cause-neutral**: `unscored` counts every exit 2, and only one of them is
+"no key on this box". On a box whose key is present but wrong the per-question line reads `jev http
+401: …` and the alert does not tell the operator to provision a key that is already there.
 
 **OVERRIDES:** a missing credential warns rather than fails in the sibling case
 (`docs/plans/2026-11-04-issue-3275-hosted-mcp-cell-provision.md` D6) — that decision covers a
