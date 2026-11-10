@@ -9830,48 +9830,60 @@ test("#2823: childNeverBeganTurn — both proofs of absence, and every negative 
   // carrying text with no turn behind it. Print mode writes the final message only AFTER a turn,
   // so this text cannot be the reply — on a CLEAN exit too, which is the case nobody caught.
   equal(
-    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: true, markerCount: 3, everSawWork: false, exitCode: 0 }),
+    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: true, markerCount: 3, everSawWork: false, exitCode: 0, positiveMessageEvidence: false}),
     true,
     "ready + no turn_start is 'no turn', even on exit 0 (the false PASS)",
   );
   equal(
-    childNeverBeganTurn({ killed: false, heartbeatArmed: false, sawReady: false, markerCount: 5, everSawWork: false, exitCode: 2 }),
+    childNeverBeganTurn({ killed: false, heartbeatArmed: false, sawReady: false, markerCount: 5, everSawWork: false, exitCode: 2, positiveMessageEvidence: false}),
     true,
     "ticks but no turn_start is the same proof — it does not depend on who armed the emitter",
   );
   // ── PROOF B — the parent ARMED the emitter and NOT ONE marker arrived on a FAILING exit: the
   // child never completed session_start. This is the MEASURED #2823 payload.
   equal(
-    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: false, markerCount: 0, everSawWork: false, exitCode: 2 }),
+    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: false, markerCount: 0, everSawWork: false, exitCode: 2, positiveMessageEvidence: false}),
     true,
     "armed + zero markers + exit 2 ⇒ it died at setup, before session_start",
   );
   // ── THE NEGATIVES. A false failure over a REAL answer is the worse error, so every way of
   // knowing nothing — or of knowing the child worked — must answer false.
   equal(
-    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: true, markerCount: 2, everSawWork: true, exitCode: 0 }),
+    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: true, markerCount: 2, everSawWork: true, exitCode: 0, positiveMessageEvidence: false}),
     false,
     "a latched turn_start/tool_start is never 'no turn' — the answer is the answer",
   );
   equal(
-    childNeverBeganTurn({ killed: false, heartbeatArmed: false, sawReady: false, markerCount: 0, everSawWork: false, exitCode: 2 }),
+    childNeverBeganTurn({ killed: false, heartbeatArmed: false, sawReady: false, markerCount: 0, everSawWork: false, exitCode: 2, positiveMessageEvidence: false}),
     false,
     "NOT armed ⇒ zero markers prove nothing (a heartbeat-disabled child emits none and still answers)",
   );
   equal(
-    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: false, markerCount: 0, everSawWork: false, exitCode: 0 }),
+    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: false, markerCount: 0, everSawWork: false, exitCode: 0, positiveMessageEvidence: false}),
     false,
     "armed-but-silent on a CLEAN exit is not a death claim",
   );
   equal(
-    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: false, markerCount: 0, everSawWork: false, exitCode: null }),
+    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: false, markerCount: 0, everSawWork: false, exitCode: null, positiveMessageEvidence: false}),
     false,
     "no exit code and no markers ⇒ nothing is claimed",
   );
   equal(
-    childNeverBeganTurn({ killed: true, heartbeatArmed: true, sawReady: true, markerCount: 2, everSawWork: false, exitCode: null }),
+    childNeverBeganTurn({ killed: true, heartbeatArmed: true, sawReady: true, markerCount: 2, everSawWork: false, exitCode: null, positiveMessageEvidence: false}),
     false,
     "a KILL outranks: the parent ended it, and `killed` already documents the partial output as no verdict",
+  );
+  // ⛔ THE POSITIVE-EVIDENCE CLAUSE (review cycle 1, ISSUE 2). `everSawWork` is latched by
+  // `turn_start`/`tool_start` ONLY, and a lost marker must never turn real work into a "no turn" claim.
+  equal(
+    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: true, markerCount: 3, everSawWork: false, exitCode: 0, positiveMessageEvidence: true }),
+    false,
+    "a completed turn / a finished tool / a counted message OUTRANKS a missing turn_start",
+  );
+  equal(
+    childNeverBeganTurn({ killed: false, heartbeatArmed: true, sawReady: false, markerCount: 0, everSawWork: false, exitCode: 2, positiveMessageEvidence: true }),
+    false,
+    "…on the armed-but-silent arm too — the clause is not Proof-A-only",
   );
 });
 
@@ -9928,6 +9940,39 @@ test("#2823: childLivenessFor — the pre-turn death is its own state, and the s
     "killed",
     "a kill is never relabelled as a pre-turn death",
   );
+
+  // ⛔ THE CONTRADICTION A MISSING MARKER COULD MANUFACTURE (review cycle 1, ISSUE 2 — the round-1
+  // diff's own comment claimed this pairing impossible; it was reachable). `turn_start`/`tool_start`
+  // are LOST, but a `turn_end` and a `tool_end`/`progress=1` tick arrived — so the parent holds
+  // POSITIVE proof of work. Labelling that `died-before-first-turn` would deliver a real answer as a
+  // setup failure AND stamp `childMessagesSent: 1` beside "no turn".
+  const lostTurnStart = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", lostTurnStart, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1 content=1", lostTurnStart, 1001);
+  equal(lostTurnStart.everSawWork, false, "the premise: the turn_start/tool_start latch never fired");
+  equal(lostTurnStart.turnsCompleted, 1, "…yet a turn completed");
+  const withEvidence = childLivenessFor({ details: { exitCode: 0 }, hbState: lostTurnStart, pid: 18, stdout: "the answer", exited: true, heartbeatArmed: true });
+  equal(withEvidence.childState, "completed", "positive message evidence outranks the missing latch — the answer IS an answer");
+  equal(withEvidence.childMessagesSent, 1, "…and the count agrees with the state");
+  // The second independent proof, on its own: a finished tool with no turn_end at all.
+  const lostTurnTool = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", lostTurnTool, 1000);
+  parseHeartbeatLine("[task-heartbeat] tool_start nonce=nn c1 bash", lostTurnTool, 1001);
+  parseHeartbeatLine("[task-heartbeat] tool_end nonce=nn c1", lostTurnTool, 1002);
+  equal(lostTurnTool.turnsCompleted, 0, "no turn ended in this fixture");
+  equal(
+    childLivenessFor({ details: { exitCode: 0 }, hbState: lostTurnTool, pid: 19, stdout: "the answer", exited: true, heartbeatArmed: true }).childState,
+    "completed",
+    "a completed tool is its own proof of work (it also latches everSawWork — asserted here as the invariant)",
+  );
+  // THE INVARIANT, stated directly: no `died-before-first-turn` snapshot may carry a message count.
+  for (const st of [readyNoTurn, createHeartbeatState(), lostTurnStart, lostTurnTool]) {
+    const snap = childLivenessFor({ details: { exitCode: 2 }, hbState: st, pid: 20, stdout: "x", exited: true, heartbeatArmed: true });
+    ok(
+      snap.childState !== "died-before-first-turn" || snap.childMessagesSent !== 1,
+      `the field set cannot contradict itself: ${snap.childState} beside childMessagesSent=${String(snap.childMessagesSent)}`,
+    );
+  }
 });
 
 test("#2823: the dispatch record names the pre-turn death instead of a generic failure", () => {

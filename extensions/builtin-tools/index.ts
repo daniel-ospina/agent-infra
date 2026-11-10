@@ -2254,9 +2254,19 @@ export function childNeverBeganTurn(i: {
   markerCount: number;
   /** Latched on `turn_start`/`tool_start` — the child provably began work. */
   everSawWork: boolean;
+  /** ⛔ THE OTHER DIRECTION, AND THE WORSE ERROR (#2823 review cycle 1, ISSUE 2). A LOST
+   * `turn_start`/`tool_start` marker (`everSawWork === false`) must never turn positive evidence that the
+   * child DID produce work into a "no turn" claim — the parser keeps several independent proofs
+   * (`turn_end` → `turnsCompleted`, a completed tool or a `progress=1` tick → `lastProgressAt`, a
+   * content-bearing turn → `messagesSent`), and #1208's whole hardening exists because a single lost
+   * event is normal. `true` here means the parent holds at least one of them, so the answer is `false`
+   * whatever `everSawWork` says: relabelling a real answer as "not the child's message" is the false
+   * failure four of the five call-site kinds cannot recover from. */
+  positiveMessageEvidence: boolean;
   exitCode: number | null;
 }): boolean {
   if (i.killed) return false;
+  if (i.positiveMessageEvidence) return false;
   const emitterRan = i.sawReady || i.markerCount > 0;
   if (emitterRan) return !i.everSawWork;
   return i.heartbeatArmed && i.exitCode !== null && i.exitCode !== 0;
@@ -2288,12 +2298,23 @@ export function childLivenessFor(i: {
   const killed = i.details.killed === true || i.killedByReason === true;
   const measured = childMessagesSent(i.hbState);
   // #2823: measured FIRST, because it overrides the stdout floor below.
+  // ⛔ ONE POSITIVE PIECE OF EVIDENCE, FOUR INDEPENDENT PROOFS (review cycle 1, ISSUE 2). `everSawWork`
+  // is latched by `turn_start`/`tool_start` ONLY, and those markers can be lost. Any of the following
+  // is proof the child produced work, and each outranks a missing `turn_start`:
+  //   · `turnsCompleted > 0`   — a turn ENDED (so one began, and its content was measured);
+  //   · `lastProgressAt > 0`   — a completed tool, or a `progress=1` tick (NOT the content-blind
+  //                              `everSawMsg` latch, which is exactly what #1208 forbade as a floor);
+  //   · `(measured ?? 0) > 0`  — a content-bearing turn is already counted;
+  //   · `everSawMsg` with any turn activity is deliberately NOT used: it is content-blind.
+  const positiveMessageEvidence =
+    i.hbState.turnsCompleted > 0 || i.hbState.lastProgressAt > 0 || (measured ?? 0) > 0;
   const noTurn = childNeverBeganTurn({
     killed,
     heartbeatArmed: i.heartbeatArmed === true,
     sawReady: i.hbState.sawReady,
     markerCount: i.hbState.markerCount,
     everSawWork: i.hbState.everSawWork,
+    positiveMessageEvidence,
     exitCode: typeof i.details.exitCode === "number" ? i.details.exitCode : null,
   });
   // ⛔ THE FIELD SET MUST NOT CONTRADICT ITSELF (review round 4, P3). stdout content IS a message the

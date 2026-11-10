@@ -132,6 +132,14 @@ case "$SCENARIO" in
   exit0-silent)
     exit 0
     ;;
+  exit2-no-marker)
+    #2823: the MEASURED setup-failure shape — the emitter was ARMED (the parent exports
+    # TASK_HEARTBEAT_NONCE) and NOT ONE marker arrived, the diagnostic goes to STDERR and the exit is
+    # non-zero. The child never completed session_start, so it never began a turn and its stderr is
+    # not the reply. Without the #2823 arm this settle is recorded as an ordinary 'failed'.
+    echo "=== Results: 50 passed, 9 failed ===" >&2
+    exit 2
+    ;;
   exit0-e-shape)
     # #5195 E shape: a child cycling turns that CARRY NO CONTENT, then exiting 0 with empty
     # stdout. Proves zero messages, so it is reclassified died-before-first-message and IS
@@ -603,6 +611,32 @@ test("#1208: a PROVEN zero-message death is recorded as such, not as the 'clean-
 		"the DURABLE surface names the death — `clean-empty` is this module's word for a success settle",
 	);
 	equal(rows[0].exitCode, 0, "the measured exit code still rides the row");
+});
+
+// ⛔ #2823: THE SECOND SURFACE OF THE SAME CLAIM. The payload says "this text was never the child's
+// message" and `spawn-capacity` refuses to count it as a review verdict, so the append-only ledger —
+// which outlives the report and is read by every ledger consumer — must NOT record an ordinary
+// `failed` for the same settle. Reverting the `rowReason` arm leaves every other suite green, which is
+// why this row exists: it reddens BY NAME when the arm is deleted (review cycle 1, ISSUE 1).
+test("#2823: a child that died before its first turn is recorded as such, not as an ordinary failure", async () => {
+	const d = await dispatch("exit2-no-marker", {});
+	ok(d.value !== undefined, "the non-clean arm composes a payload");
+	const details = d.value!.details as Record<string, unknown>;
+	// The payload's half first, so the row assertion cannot pass by the death no longer being detected.
+	equal(details.childState, "died-before-first-turn", "armed + zero markers + exit 2 ⇒ it never began a turn");
+	equal(details.status, "died-before-first-turn", "the machine status names it");
+	equal(details.isError, true, "…and it is an error, so a parent stops");
+	equal(details.childMessagesSent, null, "no emitter evidence is UNKNOWN — never a floored 1");
+	equal(details.sawToolsUnknown, true, "the missing marker stream is stated, not hidden");
+	const rows = outcomeRows(d.nonce);
+	equal(rows.length, 1, `exactly one row (got ${rows.length})`);
+	equal(
+		rows[0].reason,
+		"died-before-first-turn",
+		"the DURABLE surface names the same cause the payload does — `failed` here would outlive the report and misname it",
+	);
+	equal(rows[0].reason, details.status, "one settle, two surfaces, ONE claim");
+	equal(rows[0].exitCode, 2, "the measured exit code still rides the row");
 });
 
 test("silent child at the HARD CAP writes exactly ONE row — even though the close path re-settles as 'cut'", async () => {
