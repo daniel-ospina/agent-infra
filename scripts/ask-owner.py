@@ -26,7 +26,8 @@ Usage:
                                              # no comments, no gh calls
 
 Exit: 0 = passed and labelled · 1 = bounced (posted back to the lane) ·
-      2 = could not check (no key / network) — NOT a pass.
+      2 = could not check (no key / network) — NOT a pass, and NOT in the owner's queue: the
+          call prints `UNSCORED — the owner queue did not receive this` (agent-infra#2642).
 """
 
 import json
@@ -743,12 +744,26 @@ def _key():
         return None
 
 
+# ⛔ THE UNSCORED LINE IS PART OF THE GATE'S VOCABULARY, NOT A DECORATION (#2642). Exit 2 is honest
+# — the script refuses to label a question it could not score — but on a CELL it was SILENT in the one
+# place it mattered: the comment is posted and readable, the lane's own report says "asked", and the
+# question is absent from the gate-fed queue the owner actually reads. "Posted" and "queued" are
+# different states (the same distinction as "sent" vs "delivered" in the dispatch path), so the
+# call site is told WHICH one it is in, in the words the rest of the fleet greps for. Measured
+# 2026-10-24 on a cell: nine owner questions were posted and none reached the queue.
+UNSCORED = ("UNSCORED — the owner queue did not receive this: the gate could not score it, "
+            "so it was neither labelled `owner-decision` nor bounced. `posted` is not `queued`; "
+            "record it in your own report as UNROUTED (and see docs/ops/decision-gate.md for the "
+            "one-time provisioning the box needs).")
+
+
 def jev(state):
     key = _key()
     if not key:
         print("no TypeSafe key (env TYPESAFE_API_KEY or JEV_API_KEY, or "
               "~/.pi/agent/jev-config.json)"
               " — cannot check (this is NOT a pass)")
+        print(UNSCORED)
         return None
     req = urllib.request.Request(
         JEV_URL,
@@ -1276,7 +1291,7 @@ def scan(dry):
         pending.extend(extra)
     print(f"pending questions: {len(pending)}")
     rc = 0
-    npass = nbounce = nans = 0
+    npass = nbounce = nans = nunscored = 0
     for repo, n in pending[:MAX_SCAN]:
         # ── the other half of the handshake, checked BEFORE scoring ──────────
         # The owner answers by commenting and REMOVING `owner-decision`. Removing it
@@ -1332,6 +1347,12 @@ def scan(dry):
             npass += 1
         elif r == 1:
             nbounce += 1
+        elif r == 2:
+            # ⛔ COUNTED, AND NAMED (#2642). An exit 2 used to leave pass/bounce/answered summing to
+            # LESS than pending with nothing saying why — so a box that could not score anything (no
+            # key: every cell, measured 2026-10-24) read exactly like a quiet tick. The count alone
+            # is not enough: the sentence is what an operator acts on.
+            nunscored += 1
         rc = rc or r
     if len(pending) > MAX_SCAN:
         print(f"(capped at {MAX_SCAN} this tick; {len(pending) - MAX_SCAN} left "
@@ -1344,12 +1365,19 @@ def scan(dry):
     # repo could not be read, the count is UNKNOWN and says so. Measured
     # 2026-09-25: gh exit 127 from the loop (PATH) made this line read
     # `pending=0` for every tick while the scan was dead.
+    if nunscored:
+        print(f"{UNSCORED}")
+    # ⛔ `unscored=` IS APPENDED, NEVER SUBSTITUTED: the heartbeat parses this line by NAME
+    # (`orchestrator-heartbeat.sh` sums `pass`/`bounce`/`answered`/`scan_failed`), so a new field is
+    # additive and an existing reader cannot be broken by it. It is emitted on BOTH arms — a scan that
+    # could not read a repo AND could not score what it did read are two different failures, and
+    # dropping the field on the `pending=?` arm would make the quieter one look resolved.
     if scan_failed:
         print(f"ASK pending=? pass={npass} bounce={nbounce} answered={nans}"
-              f" scan_failed={scan_failed}")
+              f" unscored={nunscored} scan_failed={scan_failed}")
     else:
         print(f"ASK pending={len(pending)} pass={npass} bounce={nbounce}"
-              f" answered={nans}")
+              f" answered={nans} unscored={nunscored}")
     return rc
 
 

@@ -244,6 +244,15 @@ warn() { log_line "warn: $*"; }
 #     `gh auth status`. Not a leftover, so not removed.
 #   * $CELL_HOME/.pi/agent/.ai-review-gate-key — written by the operator/harness, never by this
 #     script; not touched.
+#   * $CELL_HOME/.pi/agent/jev-config.json — the TypeSafe/JEV key `ask-owner.py` scores owner
+#     questions with (agent-infra#2642). WRITTEN by `check_decision_gate` from $ENV_FILE when it is
+#     absent, mode 600, and deliberately DURABLE — a clean-shell reader (a systemd unit, a hand-run
+#     `ask-owner.py --scan`) sources nothing, so this store is what lets the decision gate work at all.
+#     Never removed, and never overwritten when it already holds a DIFFERENT key (a rotated credential
+#     is a decision, not a repair). Its atomic temp file is swept by AGE, never registered with the
+#     removal trap, for the same reason.
+#   * $HOME/.pi/agent/auth.json — pi's provider credential store, repaired by
+#     `check_provider_store` from $ENV_FILE; durable for the identical reason.
 # Register below the moment this script starts handling another secret.
 SECRET_FILES=()
 
@@ -981,6 +990,155 @@ check_provider_store() {
       || warn "the ACCOUNT home's provider store at $(auth_store_path "$other") was NOT repaired (rc=$st) — lanes are unaffected (they run under $CELL_HOME), but a hand-run 'pi' with HOME=$other may still answer with 'No API key found'"
   fi
 }
+
+# ── (2·gate) the DECISION GATE's credential: the owner-question queue (agent-infra#2642) ────────
+# MEASURED 2026-10-24, agent-infra cell-1, immediately after a lane posted nine owner questions:
+# `ask-owner.py` returned exit 2 ("could not check") for EVERY one of them, because
+# `~/.pi/agent/jev-config.json` — the 0600 store that module calls "the only source on this box" —
+# existed on the laptop and on NO cell. Exit 2 is honest (it refuses to label a question it could not
+# score), but the consequence is silent: the comment is posted and readable, the lane's report says
+# "asked", and the question is absent from the `owner-decision` queue the owner actually reads. Nine
+# issues — the largest owner-blocked class in tortoise's P0/P1 set — sat in exactly that state.
+#
+# ⛔ WHY THIS REFUSES RATHER THAN WARNS, WHEN THE PROVIDER STORE'S SIBLING PROBLEM (#3275 D6) WARNS.
+# That decision covers a DIFFERENT credential (the hosted-MCP token) and a DIFFERENT verifier (the
+# layer's own `--verify`), so it does not reach this work; THIS issue carries the decision that does —
+# its own OVERRIDES line: "the general 'credentials are per-box and live outside the fleet's
+# provisioning' practice — a decision gate that only works on the laptop cannot gate fleet work; the
+# credential must be provisioned by the harness like the harness pin itself." A cell that prints
+# `CELL READY` while its decision gate cannot fire is the inert-enforcer shape this repo files as a
+# defect (the schedule check is fatal for the same reason, docs/ops/fleet-schedule.md:114).
+#
+# ⛔ WHAT COUNTS AS A SOURCE, AND WHY AN AMBIENT EXPORT DOES NOT. The box's OWN `$ENV_FILE` and the
+# 0600 store are sources; an export that lives only in an operator's shell is not — a lane sources
+# `$ENV_FILE` itself and tmux serves the CLIENT's environment, so an ambient export reaches no worker
+# (the rule `cloud-cell-supervisor.sh`'s provider-store section already applies, and the reason this
+# script's provider repair refuses ambient keys too).
+#
+# ⛔ THE WRITER IS HERE AND THE READER IS NOT, BY DESIGN. `ask-owner.py` resolves the key env-first and
+# then from the store; this check MATERIALISES the store from `$ENV_FILE` (the same repair shape, and
+# the same reason, as the provider store: a clean-shell reader — a systemd unit, a hand-run scan —
+# sources nothing, and the store is the only source that survives that). It never overwrites a store
+# holding a DIFFERENT key; a rotated credential is a decision, not a repair, so that is REPORTED.
+jev_config_path() { printf '%s/.pi/agent/jev-config.json\n' "${1%/}"; }
+
+# jev_store_state <cfg> — one word: present | empty | unreadable | absent.
+# The three non-present arms are different questions (a missing file is provisionable, a file that
+# cannot be parsed is a credential this script must not replace), and collapsing them is how the
+# provider store's writer once destroyed a store full of entries it never read.
+jev_store_state() {
+  local cfg="${1:-}" k
+  [ -f "$cfg" ] || { printf 'absent\n'; return 0; }
+  jq -e 'type == "object"' "$cfg" >/dev/null 2>&1 || { printf 'unreadable\n'; return 0; }
+  k="$(jq -r '(.["apiKey"] // "") | tostring' "$cfg" 2>/dev/null)" || { printf 'unreadable\n'; return 0; }
+  [ -n "$(printf '%s' "$k" | tr -d '[:space:]')" ] || { printf 'empty\n'; return 0; }
+  printf 'present\n'
+}
+
+# jev_trim <value> — leading/trailing whitespace off, one line out.
+jev_trim() { printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+# jev_key_var — the VARIABLE NAME `$ENV_FILE` delivers a usable key in (TYPESAFE_API_KEY first, then
+# the older JEV_API_KEY, the same order `ask-owner.py`'s `_key()` uses); rc 1 when it delivers none.
+# ⛔ TRIMMED, because a whitespace-only value is not a key: `ask-owner.py` sends it as `Bearer ` and
+# the 401 that comes back looks like a provisioned box.
+jev_key_var() {
+  local var
+  for var in TYPESAFE_API_KEY JEV_API_KEY; do
+    keys_env_has_value "$var" || continue
+    [ -n "$(jev_trim "$(printenv "$var" 2>/dev/null)")" ] && { printf '%s\n' "$var"; return 0; }
+  done
+  return 1
+}
+
+# jev_key_env — the key itself, trimmed; rc 1 when `$ENV_FILE` delivers none.
+jev_key_env() {
+  local var
+  var="$(jev_key_var)" || return 1
+  jev_trim "$(printenv "$var" 2>/dev/null)"
+}
+
+# write_jev_store <cfg> <VAR> — write ONE literal `apiKey` from the environment, preserving every
+# other field (the laptop's store also carries `model`, and a repair that dropped a field it did not
+# understand would be the destructive shape this repo refuses).
+# ⛔ THE SECRET NEVER REACHES AN ARGV: `/proc/<pid>/cmdline` is world-readable on Linux, so the value
+# is read from the environment inside jq (`$ENV[$var]`), never passed as `--arg`. The temp file is
+# created under `umask 077` and renamed into place only after it parses and carries the key, so a
+# failed write can neither truncate nor half-write the store.
+# ⛔ NOT registered with the secret-lifetime trap, deliberately: this is a DURABLE credential (that is
+# the point of the issue), not a pushed file that must not outlive the bring-up. A stale temp from a
+# killed run IS a credential on disk, so temps are swept by AGE, never blindly (an unconditional
+# `rm -f` would delete the in-flight file of a CONCURRENT run).
+write_jev_store() {
+  local cfg="$1" var="$2" tmp
+  mkdir -p "$(dirname "$cfg")" 2>/dev/null || return 1
+  find "$(dirname "$cfg")" -maxdepth 1 -name "$(basename "$cfg").bringup.*" -mmin +60 \
+       -exec rm -f {} + 2>/dev/null
+  tmp="$(umask 077; mktemp "$cfg.bringup.XXXXXX" 2>/dev/null)" \
+    || { tmp="$cfg.bringup.$$"; ( umask 077; : > "$tmp" ) 2>/dev/null || return 1; }
+  ( umask 077
+    if [ -s "$cfg" ]; then
+      jq --arg v "$var" '.apiKey = (($ENV[$v] // "") | gsub("^\\s+|\\s+$"; ""))' "$cfg"
+    else
+      jq -n --arg v "$var" '{apiKey: (($ENV[$v] // "") | gsub("^\\s+|\\s+$"; ""))}'
+    fi > "$tmp" ) || { rm -f "$tmp" 2>/dev/null; return 1; }
+  if ! { [ -s "$tmp" ] && jq -e '(.["apiKey"] // "") | (type == "string") and ((gsub("^\\s+|\\s+$"; "")) | length) > 0' \
+           "$tmp" >/dev/null 2>&1; }; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$cfg" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  chmod 600 "$cfg" 2>/dev/null
+  return 0
+}
+
+# check_decision_gate — can this cell's OWNER QUEUE receive a question?
+# Called from main() AFTER `check_provider_store`, and before the paid provider probe: a box with no
+# decision gate is refused cheaply, and it is refused AFTER the home layout has been accepted (a run
+# about to be refused for its home must not first write a credential into a home nobody will use).
+# ⛔ THE RE-READ IS THE VERDICT. A write attempt is not a materialisation (the provider store's own
+# rule): the store is asked again, with the same reader the gate uses.
+check_decision_gate() {
+  local cfg st key
+  cfg="$(jev_config_path "$CELL_HOME")"
+  st="$(jev_store_state "$cfg")"
+  case "$st" in
+    unreadable)
+      die "CHECK FAILED [decision gate]: $cfg exists but is not a JSON object this script can parse — refusing to replace a credential file it cannot read (it may hold fields this script does not know). Inspect it by hand (it should look like {\"apiKey\":\"…\"}), or move it aside deliberately and re-run. Until it is repaired, every question a lane asks exits 2 and never reaches the owner queue (agent-infra#2642)." ;;
+    present)
+      # Either the store was already provisioned, or a previous key was rotated. A store that DISAGREES
+      # with what $ENV_FILE delivers is reported, never overwritten: which one is current is not this
+      # script's call (the same rule the provider store follows).
+      if key="$(jev_key_env)" && [ "$key" != "$(jq -r '(.["apiKey"] // "") | tostring' "$cfg" 2>/dev/null)" ]; then
+        log_line "jev: $cfg holds a DIFFERENT key than $ENV_FILE delivers — ask-owner.py reads the STORE, so the stored value is the one used. If the key was rotated, update or remove $(printf '%s' "$cfg") by hand (this script will not overwrite an existing credential)."
+      fi
+      chmod 600 "$cfg" 2>/dev/null
+      ok "jev: configured (store $(printf '%s' "$cfg") — ask-owner.py can score a question, so it can reach the owner queue)"
+      return 0 ;;
+  esac
+
+  # The store holds no usable key: the box's own keys.env is the only source that may fill it.
+  key="$(jev_key_env)" || key=""
+  if [ -n "$key" ]; then
+    # ⛔ THE VARIABLE NAME COMES FROM THE SAME RESOLVER that produced the key, so the value written
+    # is the one that was judged usable — never a second guess at which of the two names it came from.
+    write_jev_store "$cfg" "$(jev_key_var)" \
+      || die "CHECK FAILED [decision gate]: could not write $cfg from the key $ENV_FILE delivers (a full disk, or a directory that cannot be written). Until it is repaired every question a lane asks exits 2 and never reaches the owner queue (agent-infra#2642)."
+    [ "$(jev_store_state "$cfg")" = present ] \
+      || die "CHECK FAILED [decision gate]: the write to $cfg did not produce a store the gate can read — a write attempt is not a credential. Inspect $cfg by hand."
+    log_line "REPAIRED decision gate: $cfg — wrote the TypeSafe key from $ENV_FILE, mode 600. This is a REPAIR of the store ask-owner.py READS, not a new credential: the key was already on this box."
+    ok "jev: configured (store $cfg, written from $ENV_FILE — ask-owner.py can score a question, so it can reach the owner queue)"
+    return 0
+  fi
+
+  # Nothing usable. Name which of the two near-misses this is, because the remedy differs.
+  if [ -n "$(printenv TYPESAFE_API_KEY 2>/dev/null)$(printenv JEV_API_KEY 2>/dev/null)" ]; then
+    die "CHECK FAILED [decision gate]: a TypeSafe key is set in THIS shell but NOT in $ENV_FILE — an ambient export reaches no lane (a lane sources $ENV_FILE itself, and a tmux worker is served the server's environment), so ask-owner.py would still exit 2 for every question. FIX: put TYPESAFE_API_KEY=<the key> in $ENV_FILE (cmux vm push --secret … --mode 600) and re-run; this script materialises $cfg from it."
+  fi
+  die "CHECK FAILED [decision gate]: this cell cannot reach the owner's decision queue. $cfg does not exist (or holds no apiKey) and $ENV_FILE delivers neither TYPESAFE_API_KEY nor JEV_API_KEY, so ask-owner.py exits 2 on EVERY question: the comment is posted and readable, the lane's report says 'asked', and the question is absent from the queue the owner reads (measured 2026-10-24: nine questions on agent-infra cell-1, none queued). FIX: put TYPESAFE_API_KEY=<the key> in $ENV_FILE (cmux vm push --secret … --mode 600) and re-run; this script materialises $(jev_config_path "$CELL_HOME") from it, mode 600. This is a refusal, not a warning, by this issue's OWNER DECISION (its OVERRIDES line): an autonomy layer that cannot reach its decision gate is not autonomous."
+}
+
 
 # ── (2·env) source the cell's environment, under the cell's home ────────────────────────────────
 # Split out of `check_provider` because the steps that follow it are ORDERED requirements, not
@@ -2631,6 +2789,10 @@ main() {
       # check placed after it would grade the tree this run just created.
       check_repo_identity
       check_provider_store "${PI_LANE_PROVIDER:-deepseek}"
+      # ⛔ BEFORE check_provider, WHICH SPENDS A PAID MODEL CALL: a box that cannot gate a question is
+      # refused cheaply. AFTER check_provider_store/check_one_home, because the key this check
+      # materialises must not be written into a home the run is about to refuse.
+      check_decision_gate
       check_provider
       check_gh
       check_repo
@@ -2693,7 +2855,7 @@ main() {
         "repo identity") READY_HEADLINE="all links verified" ;;
         *)                 READY_HEADLINE="links checked — one or more NOT fully verified (see the lines above)" ;;
       esac
-      log_line "CELL READY — $READY_HEADLINE (one home, $REPO_IDENTITY_TOKEN, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
+      log_line "CELL READY — $READY_HEADLINE (one home, $REPO_IDENTITY_TOKEN, tools, network, provider, decision gate, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
       ;;
     *)
       log_line "unknown mode: $MODE (use --check)"; exit 2 ;;
