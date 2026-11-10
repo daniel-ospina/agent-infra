@@ -472,8 +472,22 @@ drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <o
     . "$FNS"; . "$STUB"
     OWN_SET="${8:-}"
     pr_owned() { [ -n "${OWN_SET:-}" ] && pr_in_set " $OWN_SET " "$1" && return 0; return 1; }
+    # ⛔ THE OPTIONAL `<extra>` ARG EXISTS SO THE NEW RECORD FIELDS CAN BE PINNED WITHOUT RESTATING
+    # (and thereby churning) every `slots prw wait level` expectation above: callers that do not ask
+    # for it get the exact four-field answer they always got.
+    # ⛔ `<nolisting>` models the UNREADABLE PR LISTING — the file `open_pr_count` deletes on its
+    # failure path — which is one of the three causes `slots_why=` has to be able to name. It is
+    # removed BEFORE the block is sourced, never after: sourcing the block twice would run
+    # `cascade_main_probe` twice, and a rig that calls the shipped probe a second time to fix its own
+    # fixture is measuring its own mistake.
+    [ "${12:-}" = "1" ] && rm -f "$w/state/last-open-prs"
     . "$TMP/cascade-block.sh"
-    printf '%s %s %s %s\n' "$CASCADE_ISSUE_SLOTS" "$CASCADE_PR_WAITING" "$CASCADE_WAIT" "${CASCADE_LEVEL:--}" ) 2>/dev/null
+    if [ -n "${11:-}" ]; then
+      printf '%s %s %s %s %s %s\n' "$CASCADE_ISSUE_SLOTS" "$CASCADE_PR_WAITING" "$CASCADE_WAIT" "${CASCADE_LEVEL:--}" \
+        "${CASCADE_RUNG_SLOTS-absent}" "${CASCADE_SLOTS_WHY-absent}"
+    else
+      printf '%s %s %s %s\n' "$CASCADE_ISSUE_SLOTS" "$CASCADE_PR_WAITING" "$CASCADE_WAIT" "${CASCADE_LEVEL:--}"
+    fi ) 2>/dev/null
 }
 ck "a MERGEABLE PR waiting takes the room: 11 slots -> 0 (an issue must NOT be dispatched)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
@@ -558,6 +572,32 @@ ck "a RED MAIN on a box with FREE ROOM is level 1 and CLOSES the issue path (an 
 ck "…and it is the LEVEL holding it, not a FULL box (23 lanes are free, so the poll is not armed)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
 ' - 'RED:verify' | cut -d' ' -f3)" "0"
+
+# ── 11b. THE RUNG'S GRANT, FROZEN WHERE IT IS RESOLVED (agent-infra#3909 review P1) ─────────────
+# ⛔ THE DEFECT THESE ARMS PIN. The cycle record read `CASCADE_ISSUE_SLOTS` AT EMIT TIME, but the drain
+# escape RE-ASSIGNS that global after the cascade block — and its guard (`CASCADE_ISSUE_SLOTS <= 0`)
+# means it can ONLY fire on a level-HOLDS pass. So every record the valve produced carried
+# `level=MERGE slots=N≥1`, a pair the field's own documentation calls impossible, and a reader could
+# not tell the ISSUES rung's grant from the escape's override. `CASCADE_RUNG_SLOTS` is the rung's own
+# answer, captured inside the driven block; `CASCADE_ESCAPE_SLOTS` (asserted in 14e) is the valve's.
+echo
+echo "=== 11b. the record names the RUNG's grant, and WHY a zero is a zero ==="
+ck "a level HOLDING the room: the rung granted 0 and the record can say WHY (not 'capacity refused')" \
+   "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
+' - - 1 x | cut -d' ' -f5,6)" "0 level"
+ck "…while the SAME zero with the capacity probe REFUSED is named as the probe, not as a level" \
+   "$(drive_block 5 2 25 10 0 '9001:shaA:fix/a' '9001	shaA	GREEN
+' - - 1 x | cut -d' ' -f5,6)" "0 capacity"
+ck "a FULL box (lanes == max) names the ROOM as the cause — it is not a capacity refusal" \
+   "$(drive_block 0 25 25 10 1 '' '' - - 0 x | cut -d' ' -f5,6)" "0 no_room"
+ck "an EMPTY candidate backlog names the BACKLOG as the cause (the grant is ceilinged by it)" \
+   "$(drive_block 0 2 25 0 1 '' '' - - 0 x | cut -d' ' -f5,6)" "0 empty_backlog"
+ck "an UNREADABLE PR listing names the LISTING as the cause (the fail-closed arm above it)" \
+   "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
+' - - 1 x 1 | cut -d' ' -f5,6)" "0 listing_unreadable"
+ck "a rung that WAS granted states it, rather than leaving it to be inferred from a non-zero count" \
+   "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
+' 9001 - 1 x | cut -d' ' -f5,6)" "10 granted"
 
 # ── 12. LEVEL 1 IS FED BY MAIN'S OWN CHECK-RUNS ─────────────────────────────────────────────────
 # ⛔ AN UNFED LEVEL IS DECORATION. These arms drive `cascade_main_probe` against a stub `gh` and pin
@@ -853,7 +893,7 @@ ck "…and it carries the SLOT GRANT (the fix; without it the escape records wha
 # grade GREEN — the same false PASS `pr-owner-liveness.test.sh` records for its own drive.
 bash -n "$ESCBLK" 2>/dev/null || bad "the extracted [drain-escape] block is not valid shell — the drive would abort midway"
 
-esc_pair() { # <id> <room> <slots> <unread> [<backlog>] [<batch>] [<can>] -> "<slots> <record|none>"
+esc_pair() { # <id> <room> <slots> <unread> [<backlog>] [<batch>] [<can>] [<extra>] -> "<slots> <record|none>[ <published grant>]"
   # ⛔ THE FIXTURE DIRECTORY IS DERIVED FROM `$TMP`, NOT FROM A POSITIONAL ARG. The main-worktree-guard
   # refuses any `rm -rf` whose target it cannot resolve statically (a `$1`-derived path reads as a
   # possible WHOLE-TREE discard and fails closed, #709), and that refusal lands on the SUITE, not on the
@@ -879,13 +919,35 @@ esc_pair() { # <id> <room> <slots> <unread> [<backlog>] [<batch>] [<can>] -> "<s
     CASCADE_QUEUE_DEPTH="$blg"; BATCH="$btch"
     if [ -n "$can" ]; then CASCADE_CAN="$can"; fi
     . "$ESCBLK"
-    printf '%s %s\n' "${CASCADE_ISSUE_SLOTS:-unset}" \
-      "$( [ -s "$d/state/drain-escape" ] && echo record || echo none )" ) 2>/dev/null
+    # ⛔ THE ESCAPE MUST PUBLISH ITS GRANT, NOT OVERWRITE THE RUNG'S (agent-infra#3909 review P1).
+    # It re-assigns `CASCADE_ISSUE_SLOTS`; the cycle record used to read that global at emit time, so
+    # every escape cycle recorded the valve's number as the rung's — and the valve can only fire when
+    # a level HOLDS, so the pair was guaranteed to be the one the record's own docs call impossible.
+    # `<extra>` prints the published token so the arms below grade it; the two-field form every
+    # existing expectation uses is untouched.
+    if [ -n "${8:-}" ]; then
+      printf '%s %s %s\n' "${CASCADE_ISSUE_SLOTS:-unset}" \
+        "$( [ -s "$d/state/drain-escape" ] && echo record || echo none )" \
+        "${CASCADE_ESCAPE_SLOTS-absent}"
+    else
+      printf '%s %s\n' "${CASCADE_ISSUE_SLOTS:-unset}" \
+        "$( [ -s "$d/state/drain-escape" ] && echo record || echo none )"
+    fi ) 2>/dev/null
 }
 ck "level HOLDS the room (room=5, slots=0, backlog loose) -> the escape GRANTS room/2 and RECORDS" \
    "$(esc_pair 1 5 0 0 10)" "2 record"
 ck "…and the grant is LOGGED, naming the slots it spends" \
    "$(grep -q 'DRAIN ESCAPE GRANTS 2 issue slot' "$TMP/ep-1/state/log" 2>/dev/null && echo yes || echo no)" "yes"
+# ⛔ THE PUBLISHED GRANT (agent-infra#3909 review P1): the record's `escape=` reads THIS, and the
+# record's `slots=` reads the rung's own capture — never this re-assigned global. Driven in both
+# directions so a token that is merely set-and-ignored cannot pass: the firing case must report the
+# number it spent, and every non-firing case must report a MEASURED 0 rather than an absence.
+ck "…and the escape PUBLISHES the grant it spent (the record's escape= reads this, not the rung's slots=)" \
+   "$(esc_pair 13 5 0 0 10 2 1 1 | cut -d' ' -f3)" "2"
+ck "…a cascade that already granted 3 publishes escape=0 (the valve did not fire, and 0 is a measurement)" \
+   "$(esc_pair 14 5 3 0 10 2 1 1 | cut -d' ' -f3)" "0"
+ck "…and an EMPTY backlog publishes escape=0 (the grant produced nothing, so nothing was spent)" \
+   "$(esc_pair 15 5 0 0 '' 2 1 1 | cut -d' ' -f3)" "0"
 ck "…HALVED, not min(room,BATCH): room=9 grants 4, because one issue costs two worker records" \
    "$(esc_pair 2 9 0 0 99)" "4 record"
 ck "…with a FLOOR of 1 when the box has room (a lane that parks early never attaches its chain)" \
@@ -1321,6 +1383,18 @@ echo "=== 10. the departure from the recorded ruling is NAMED where a reader mee
 ckin "the cascade names what it overrides (a future reader must not read this as accidental)" "$SRC" 'OVERRIDES: the 2026-10-18 owner ruling "while ANY un-owned PR remains'
 ckin "the WIP-floor ruling is explicitly NOT reversed" "$SRC" 'is NOT reversed and NOT touched'
 ckin "…and it is the LANDING_FLOOR arm that still gates" "$SRC" 'GATE_WHY="${GATE_WHY:-landing-floor('
+
+# ── 10b. WHAT THE RECORD EMITS, PINNED AT THE EMIT (agent-infra#3909 review P1/P2) ─────────────
+# ⛔ THE SOURCE HALF OF 11b/14e. The two driven sections prove the VARIABLES carry the right answers;
+# these arms prove the EMIT reads them — because a record that computes `CASCADE_RUNG_SLOTS` and then
+# emits `CASCADE_ISSUE_SLOTS` instead reds nothing in a driven block that never reaches the emit site.
+echo
+echo "=== 10b. the emit reads the rung's capture and the escape's own token ==="
+ckin "the record's slots= is the RUNG's grant, frozen where the cascade resolved it" "$SRC_CODE" 'slots="${CASCADE_RUNG_SLOTS-absent}"'
+ckni "…and NOT the global the drain escape re-assigns later in the same pass (the P1 defect)" "$SRC_CODE" 'slots="${CASCADE_ISSUE_SLOTS-absent}"'
+ckin "the escape's grant rides its own field, so level+slots stay a pair from ONE moment" "$SRC_CODE" 'escape="${CASCADE_ESCAPE_SLOTS-absent}"'
+ckin "…and a zero slot count names WHICH of the four causes produced it" "$SRC_CODE" 'slots_why="${CASCADE_SLOTS_WHY-absent}"'
+ckin "…with the cause computed where each gate is decided, not re-derived at emit time" "$SRC_CODE" 'elif [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; then CASCADE_SLOTS_WHY="listing_unreadable"'
 
 printf '\n%s\n' "──────────────────────────────────────────────"
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"

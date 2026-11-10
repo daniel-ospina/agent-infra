@@ -8331,6 +8331,37 @@ PY
   elif [ -n "${MP_PRIORITY:-}" ]; then CASCADE_PRW=1; CASCADE_PRW_WHY="priority"
   fi
   if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] && [ "${CASCADE_PRW:-0}" = "1" ]; then CASCADE_PR_WAITING=1; fi
+  # ── THE RUNG'S OWN GRANT, FROZEN HERE (agent-infra#3909 review P1) ────────────────────────────
+  # ⛔ `CASCADE_ISSUE_SLOTS` IS NOT THE RUNG'S ANSWER BY THE TIME THE CYCLE RECORD IS WRITTEN. The
+  # drain escape (see the [drain-escape] block ~600 lines below) RE-ASSIGNS it after this block when a
+  # level held the room: `_egrant` is granted and `CASCADE_ISSUE_SLOTS="$_egrant"`. Its guard requires
+  # `CASCADE_ISSUE_SLOTS <= 0`, so the ONLY state the escape can fire in is exactly a level-HOLDS pass
+  # — meaning a record that reads `CASCADE_ISSUE_SLOTS` at emit time prints
+  # `level=MERGE slots=2`, a pair whose own documentation says cannot exist ("a level holds ⇒ slots=0"),
+  # on EVERY cycle the valve exists for. A reader then cannot tell "the ISSUES rung was granted two"
+  # from "a higher level held the room and the escape overrode it" — the same "the record could not
+  # distinguish" class this field addition exists to end. So the rung's answer is captured HERE, where
+  # it is resolved, and the escape reports its own grant under its own token (`CASCADE_ESCAPE_SLOTS`).
+  CASCADE_RUNG_SLOTS="${CASCADE_ISSUE_SLOTS:-0}"
+  # ⛔ AND A ZERO NEEDS ITS CAUSE, OR THE FIELD IS A RORSCHACH TEST (review P2). `slots=0` with the
+  # capacity probe GRANTING is reached by FOUR different states, and before this token the record named
+  # NONE of them: `level=NOT-MEASURED slots=0 can_spawn=1` was documented as "capacity refused", but
+  # with `can_spawn=1` that is equally a full box (`cascade_issue_slots`: `room > 0 || 0`), an EMPTY
+  # candidate backlog (the grant is ceilinged by it) or an UNREADABLE PR listing (`CASCADE_UPN_UNREADABLE`).
+  # A cycle idling with an empty pool therefore read as a capacity refusal — a wrong cause on the very
+  # artifact a lane is briefed from. The arms are ordered CAUSE-FIRST (the earliest gate that decided
+  # the outcome wins), and `granted` is stated rather than left to inference from a non-zero `slots=`.
+  # ⛔ `level` can only be the cause when the rung HAD slots and a higher level took them (`slots > 0`
+  # reaches `cascade_level`; the zeroing arm sets `CASCADE_LEVEL_HOLDS`), never when the cascade never
+  # ran — so it is tested after the arms that stop it from running at all.
+  CASCADE_SLOTS_WHY=""
+  if [ "${CASCADE_RUNG_SLOTS:-0}" -gt 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="granted"
+  elif [ "${CASCADE_CAN:-1}" = "0" ]; then CASCADE_SLOTS_WHY="capacity"
+  elif [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; then CASCADE_SLOTS_WHY="listing_unreadable"
+  elif [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ]; then CASCADE_SLOTS_WHY="level"
+  elif [ "${CASCADE_ROOM:-0}" -le 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="no_room"
+  elif [ "${CASCADE_QUEUE_DEPTH:-0}" -le 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="empty_backlog"
+  else CASCADE_SLOTS_WHY="unknown"; fi
   # [cascade:end]
   echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) list=${CASCADE_LIST:-?} level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_QUEUE_DEPTH:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
   # ── THE GATE VECTOR, AND WHY THE ARMS STOPPED BEING ONE `elif` CHAIN (#2924, #2927) ──────────────
@@ -8954,6 +8985,12 @@ PY
       # not see it: its grep matched the prefix BEFORE the backtick.
       [ "${_egrant:-0}" -ge 1 ] && echo "[dispatch] DRAIN ESCAPE GRANTS ${_egrant} issue slot(s) — the issue path was granted none while ${CASCADE_ROOM} lane(s) were free, so the escape spends the room the allocator would have granted (room/2, backlog ${CASCADE_QUEUE_DEPTH:-?}) instead of opening a path with nothing to queue into" >> "$LOG"
     fi
+    # ⛔ THE ESCAPE PUBLISHES ITS OWN GRANT, SEPARATELY FROM THE RUNG'S (agent-infra#3909 review P1).
+    # It RE-ASSIGNS `CASCADE_ISSUE_SLOTS` above, so a record that reads that global at emit time carries
+    # the escape's number under the rung's name — guaranteed, because the escape can only fire on a
+    # level-HOLDS pass. Set unconditionally (0 = the escape granted nothing), so the record's `escape=`
+    # is a measurement on every path the block runs, not an absence that has to be read as a zero.
+    CASCADE_ESCAPE_SLOTS="${_egrant:-0}"
     # DOES THIS PASS ACTUALLY HAVE A SLOT TO SPEND? UNSET is the driver-rig/older-caller contract (the
     # escape keeps its pre-change behaviour); an explicit 0, or a grant that produced 0 because the
     # backlog is empty, means the batch WILL break and nothing may be recorded.
@@ -9602,16 +9639,30 @@ PY
     # for 120 consecutive cycles, because a pre-cascade build set that string and nothing else. A lane
     # briefed from those records concluded the merge-priority threshold was "the only thing blocking
     # dispatch" and set out to implement the ladder — which had ALREADY landed (`9047814a6`, #3594)
-    # and could not have been executing. The three fields below separate the states that one `nothing=`
+    # and could not have been executing. The fields below separate the states that one `nothing=`
     # could not, and they are what requirement 1 of #3009 actually asks for:
-    #   level=MERGE      slots=0 can_spawn=1  → a HIGHER LEVEL holds the room (the ladder working)
-    #   level=NOT-MEASURED slots=0 can_spawn=0 → capacity refused, so the cascade never ran AT ALL
-    #   level=ISSUES     slots=2 can_spawn=1  → the issue rung was granted two slots
+    #   level=MERGE          slots=0 slots_why=level        can_spawn=1 → a HIGHER LEVEL holds the room (the ladder working)
+    #   level=NOT-MEASURED   slots=0 slots_why=capacity     can_spawn=0 → capacity refused, so the cascade never ran AT ALL
+    #   level=NOT-MEASURED   slots=0 slots_why=no_room|empty_backlog|listing_unreadable
+    #                                                                  → nothing above holds the room; the GRANT itself was 0
+    #   level=ISSUES         slots=2 slots_why=granted      can_spawn=1 → the issue rung was granted two slots
+    #   …plus escape=N on any of them → the drain escape re-granted N after the cascade withheld the room
+    # ⛔ `slots_why=` EXISTS BECAUSE `slots=0` ALONE IS AMBIGUOUS (review P2). With the capacity probe
+    # GRANTING, a zero is equally a full box, an empty candidate backlog or an unreadable PR listing —
+    # and glossing all of those as "capacity refused" put a WRONG CAUSE on the artifact a lane is
+    # briefed from (an empty pool idling read as a throttle). The token is computed where each of those
+    # conditions is decided, in the cascade block above; this emit only carries it.
+    # ⛔ `slots=` IS THE RUNG'S OWN GRANT, CAPTURED IN THE CASCADE BLOCK — NOT `CASCADE_ISSUE_SLOTS`,
+    # WHICH THE DRAIN ESCAPE RE-ASSIGNS ~600 LINES BELOW THIS BLOCK (review P1). The escape's guard
+    # requires `CASCADE_ISSUE_SLOTS <= 0`, so it can ONLY fire on a level-HOLDS pass; reading the global
+    # here therefore printed `level=MERGE slots=N≥1` on exactly those cycles — a pair these comments
+    # call impossible — and a reader could not tell a rung's grant from the escape's override. The two
+    # are now separate fields: `slots=` is what the cascade resolved, `escape=` is what the valve spent.
     # ⛔ THEY ARE RECORDED, NOT RE-DERIVED, and they add no measurement: every value was computed by
-    # the cascade block ~1,200 lines above this emit. That is why this is a field addition and not a
-    # scope change — and it is precisely what the OPEN OWNER DECISION in docs/ops/self-healing-contract.md
-    # §6 does NOT cover: making the levels actionability-bounded is still the owner's call, and
-    # `level=` merely makes the current behaviour visible instead of inferred.
+    # the cascade block ~1,200 lines above this emit (and the escape block between them). That is why
+    # this is a field addition and not a scope change — and it is precisely what the OPEN OWNER DECISION
+    # in docs/ops/self-healing-contract.md §6 does NOT cover: making the levels actionability-bounded is
+    # still the owner's call, and `level=` merely makes the current behaviour visible instead of inferred.
     # ⛔ `${VAR-absent}`, NEVER `${VAR:-absent}`: `slots=0` is a MEASUREMENT (the room was withheld) and
     # must not be rewritten as an absence — the same polarity the batch's own `${CASCADE_ISSUE_SLOTS-1}`
     # guards take. `absent` is then reserved for "this emit ran on a path the cascade block never
@@ -9622,7 +9673,8 @@ PY
       nothing="$_cr_nothing" placement="${CAP_STATE:-unavailable}" placed_on="${CAP_PLACE:-none}" \
       bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
       spawned_pr="${PRDISP_SPAWNS:-UNMEASURED}" spawn_tags="$_cr_tags" \
-      level="${CASCADE_LEVEL_NAME:-NOT-MEASURED}" slots="${CASCADE_ISSUE_SLOTS-absent}" \
+      level="${CASCADE_LEVEL_NAME:-NOT-MEASURED}" slots="${CASCADE_RUNG_SLOTS-absent}" \
+      slots_why="${CASCADE_SLOTS_WHY-absent}" escape="${CASCADE_ESCAPE_SLOTS-absent}" \
       can_spawn="${CASCADE_CAN-absent}" \
       stages="${STG_FIELD:-}" \
       drain="$_cr_drain" \
