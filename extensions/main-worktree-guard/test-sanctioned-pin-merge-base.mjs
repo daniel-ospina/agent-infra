@@ -27,7 +27,7 @@
 // Zero-dep: `node:*` + the `git` binary, hermetic repos under `os.tmpdir()`.
 // Run: node extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,6 +40,7 @@ const INDEX_REL = "extensions/main-worktree-guard/index.ts";
 const RAIL = "scripts/admin-merge.sh"; // the leaf `main` moves in these fixtures
 const REVIEW = "scripts/record-review.sh"; // the leaf a PR moves in case (a)
 const HELPER = "scripts/lib/diff-normalize.py"; // part of the delegation closure
+const MOVED = "scripts/scratch-worktree.sh"; // a shipped sanctioned leaf (the (a″) fixture moves it on `main`)
 
 const INDEX_SRC = [
   "// fixture: the sanctioned leaf set, in the shipped format",
@@ -135,6 +136,40 @@ function scenario(name, { branch = null, mainMoves = false }) {
   return { root, headSha, head: gitTree(root, headSha), merged: diskTree(root) };
 }
 
+/** A hermetic framework checkout carrying the REAL guard module and the REAL sanctioned
+ *  surface, so the shipped identity suite can be DRIVEN inside it (its behavioural arms
+ *  need the module, not a stub `index.ts`). Zero-dep: `node:*` + the `git` binary. */
+function makeModuleRepo() {
+  const root = mkdtempSync(join(tmpdir(), "sanctioned-module-"));
+  git(root, "init", "-q", "-b", "main");
+  git(root, "config", "user.email", "t@t");
+  git(root, "config", "user.name", "t");
+  write(root, "manifest.json", "{}\n");
+  write(root, "pi-bootstrap/setup.sh", "#!/bin/bash\ntrue\n");
+  const mod = join(REPO, "extensions", "main-worktree-guard");
+  mkdirSync(join(root, "extensions", "main-worktree-guard"), { recursive: true });
+  for (const f of readdirSync(mod)) {
+    if (/\.(ts|mjs|json)$/.test(f) && !f.startsWith("test")) {
+      writeFileSync(join(root, "extensions", "main-worktree-guard", f), readFileSync(join(mod, f)));
+    }
+  }
+  // ⛔ THE SUITE ITSELF TRAVELS WITH THE MODULE (`deploy()` skips `test*`, so the copy loop above does
+  // not carry it): the arm DRIVES this file inside the fixture, and a rig that runs the REPO's copy
+  // would judge the repo's working tree instead of the fixture — the very mixing under test.
+  writeFileSync(join(root, "extensions", "main-worktree-guard", "test-sanctioned-identity.mjs"),
+    readFileSync(join(mod, "test-sanctioned-identity.mjs")));
+  cpSync(join(REPO, "extensions", "shared"), join(root, "extensions", "shared"), { recursive: true });
+  // Every file the SHIPPED pin names, byte-identical — so `cutAndCommit` pins real bytes and the
+  // fixture starts from a surface the module recognises (a hand-written digest would prove nothing).
+  const shipped = JSON.parse(readFileSync(join(mod, "sanctioned-scripts.pin.json"), "utf-8"));
+  for (const rel of new Set([...Object.keys(shipped.sha256 ?? {}), ...Object.keys(shipped.delegates ?? {})])) {
+    write(root, rel, readFileSync(join(REPO, rel)));
+  }
+  git(root, "add", "-A");
+  git(root, "commit", "-qm", "fixture: the real module + the real sanctioned surface");
+  return root;
+}
+
 const staleOf = (tree) => pinReport(tree).stale;
 
 try {
@@ -184,6 +219,62 @@ try {
     // fixture has stopped reproducing the treadmill) and this suite is lying.
     expect("(a′) NON-VACUITY: the SAME change judged on the MERGED tree FAILS (the pre-#2818 reading; reverting `--ref` reds this)",
       staleOf(merged).length > 0, true);
+    rmSync(root, { recursive: true, force: true });
+  }
+
+  // ── (a″) THE SAME RULE, ONE LAYER DOWN: the BEHAVIOURAL arms must judge that tree too ────────
+  // ⛔ MEASURED DEFECT (agent-infra#3909). `--ref` moved only the FRESHNESS reading. The suite's
+  // behavioural fixtures still took the PIN (`deploy`) and the pinned SCRIPT BYTES (`installClosure`,
+  // and the rail they execute) out of the WORKING TREE — which in a PR job is GitHub's synthetic MERGE
+  // of the head onto the base TIP. So `(f)` graded the change's commit while `(a)`/`(d3)` graded the
+  // merge: on PR #3909's own `sanctioned-pin` job every `(f)` arm was green, the head's tree was
+  // internally consistent, and the run still went red `22 passed, 2 failed` on exactly the two arms
+  // that GRANT the exemption — because the base tip happened to carry a stale pin for one script, and a
+  // merge glues the base's pin to the base's scripts. Every PR open in that window inherited the red
+  // for a reason no commit of its own contained (the treadmill, one layer below where #2818 fixed it).
+  // THE FIX: `treeBytes()` is the ONLY source for both sides, so the whole suite is a property of the
+  // commit named by `--ref`. NON-VACUITY: this arm DRIVES the shipped identity suite against the merged
+  // tree and a `--ref` head; reverting `treeBytes` reds `(a)` and `(d3)` here (measured: 22 passed,
+  // 2 failed — byte-for-byte the CI output this change explains).
+  {
+    const root = makeModuleRepo();
+    cutAndCommit(root, "base: cut the pin");
+    git(root, "checkout", "-q", "-b", "pr");
+    // The branch legitimately edits ONE sanctioned script and re-cuts its pin.
+    write(root, REVIEW, reviewV2);
+    cutAndCommit(root, "pr: edit the review script + re-cut");
+    const prHead = git(root, "rev-parse", "pr");
+    // An UNRELATED merge moves a DIFFERENT sanctioned script on main, and re-cuts there.
+    git(root, "checkout", "-q", "main");
+    // A DIFFERENT sanctioned leaf (the real surface's own — the fixture carries the shipped scripts, so
+    // `HELPER` above is not in its closure). Only its BYTES matter: these arms never execute it.
+    write(root, MOVED, `${readFileSync(join(REPO, MOVED), "utf-8")}# main moved this script\n`);
+    cutAndCommit(root, "main: moves another sanctioned script and re-cuts");
+    // The merge GitHub would build: both sides re-cut the pin, so it conflicts, and a lane resolves it
+    // by keeping ITS OWN pin — leaving the branch's pin beside main's scripts. THAT is the artifact the
+    // behavioural arms used to grade.
+    try {
+      git(root, "merge", "-q", "--no-ff", "-m", "merge pr", prHead);
+    } catch {
+      git(root, "checkout", "--theirs", "--", PIN_REL);
+      git(root, "add", "--", PIN_REL);
+      git(root, "commit", "-qm", "merge pr (pin conflict kept from the branch)");
+    }
+    expect("(a″) the fixture reproduces the measured shape: the MERGED tree is STALE where the change's own commit is fresh",
+      [staleOf(diskTree(root)).length > 0, staleOf(gitTree(root, prHead)).length], [true, 0]);
+    const suite = join(root, "extensions", "main-worktree-guard", "test-sanctioned-identity.mjs");
+    let out = "", ok = true;
+    try {
+      out = execFileSync("node", [suite, "--ref", prHead], { cwd: root, stdio: ["ignore", "pipe", "pipe"] }).toString();
+    } catch (e) {
+      ok = false;
+      out = `${e.stdout ?? ""}${e.stderr ?? ""}`;
+    }
+    expect("(a″) …and the WHOLE identity suite PASSES on the change's own commit (its behavioural arms read that tree)", ok, true);
+    // ⛔ THE ARM THAT KEEPS THIS HONEST: the exemption must have been GRANTED, not skipped. A node too
+    // old to strip TypeScript SKIPS the behavioural half, and a suite that never ran cannot red anything.
+    expect("(a″) NON-VACUITY: …with the exemption-granting arm actually RUN and green (a skipped behavioural half cannot pass this)",
+      /^✅ \(a\) sanctioned rail via a DIFFERENT root/m.test(out), true);
     rmSync(root, { recursive: true, force: true });
   }
 

@@ -69,7 +69,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
-import { closureOf, computePin, diskTree, gitTree, parseRefArg, pinReport, sanctionedPaths } from "./sanctioned-pin-tree.mjs";
+import { closureOf, computePin, diskTree, gitTree, parseRefArg, pinReport, PIN_REL, sanctionedPaths } from "./sanctioned-pin-tree.mjs";
 
 const HERE = realpathSync(fileURLToPath(new URL(".", import.meta.url)));
 const REPO = realpathSync(join(HERE, "..", ".."));
@@ -133,6 +133,28 @@ const SANCTIONED = TREE_ERROR ? [] : sanctionedPaths(TREE);
 // LOCATION is part of the program that runs, so it is part of the identity
 // (`sanctioned-pin-tree.mjs` carries the pattern and the reasoning).
 const closure = () => closureOf(TREE, SANCTIONED);
+
+/** The AUDITED bytes of `rel`, from the SAME tree the freshness arms judge.
+ *
+ * ⛔ ONE TREE, AND IT IS NOT ONLY FOR THE FRESHNESS ARMS (agent-infra#3909 review).
+ * The behavioural fixtures below used to read the pin (`deploy`) and the pinned
+ * scripts (`installClosure`, and the rail the fixtures execute) out of the WORKING
+ * TREE, while `--ref` moved only the freshness reading. In a PR job the working tree
+ * is GitHub's synthetic MERGE of the head onto the base tip, so those arms graded
+ * the merge result — precisely the artifact #2818 exists to stop judging. MEASURED
+ * on PR #3909's own `sanctioned-pin` job: the base tip carried a STALE pin for
+ * `scripts/gh-shim/gh` (the script had changed, the pin had not been re-cut yet),
+ * the head's tree was internally consistent and fresh on every `(f)` arm, and the
+ * run still went red on `(a)` and `(d3)` — the two arms that GRANT the exemption —
+ * because the merge glued the base's stale pin to the base's own scripts. Every PR
+ * built on that base was red for a reason no commit of its own contained. Reading
+ * both sides from `TREE` makes the WHOLE suite a property of the commit named by
+ * `--ref`, so the verdict tracks the change and nothing else. */
+function treeBytes(rel) {
+  const bytes = TREE_ERROR ? null : TREE.read(rel);
+  if (bytes === null) throw new Error(`${rel} is not present in ${TREE ? TREE.label : "<unreadable tree>"} — the fixture cannot be built from the tree under test`);
+  return bytes;
+}
 
 // ── --cut: regenerate the pin from THIS checkout ──────────────────────────
 function cut() {
@@ -218,6 +240,12 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     for (const f of readdirSync(HERE)) {
       if (/\.(ts|mjs|json)$/.test(f) && !f.startsWith("test")) copyFileSync(join(HERE, f), join(dir, f));
     }
+    // ⛔ THE PIN COMES FROM THE TREE UNDER TEST, NOT FROM THE CHECKOUT'S COPY OF IT (agent-infra#3909).
+    // The module CODE is the working tree's (it is what would actually run, and the mutations below
+    // are anchored in it), but the PIN is the artifact whose agreement with the bytes IS the verdict —
+    // so it has to come from the same tree those bytes come from. Without this, a merge result whose
+    // pin came from one commit and whose scripts came from another graded the MERGE, not the change.
+    if (TREE && TREE.ref && TREE.has(PIN_REL)) writeFileSync(join(dir, "sanctioned-scripts.pin.json"), treeBytes(PIN_REL));
     const mutations = mutate === null ? [] : (Array.isArray(mutate) ? mutate : [mutate]);
     if (mutations.length) {
       let src = readFileSync(join(dir, "index.ts"), "utf-8");
@@ -248,15 +276,18 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
 
   /** Copy the audited DELEGATION CLOSURE (every file a sanctioned script runs by
    *  its own location) into a fixture root — arm 2 verifies the whole program,
-   *  so a root with only the leaf is (correctly) not exempt. */
+   *  so a root with only the leaf is (correctly) not exempt.
+   *
+   *  ⛔ THE BYTES COME FROM `TREE` (see `treeBytes`), so the closure these fixtures
+   *  provision and the digests the deployed pin asserts are two halves of ONE commit. */
   function installClosure(root, override = {}) {
     let pin = {};
-    try { pin = JSON.parse(readFileSync(PIN_JSON, "utf-8")).delegates ?? {}; } catch { pin = {}; }
+    try { pin = JSON.parse(treeBytes(PIN_REL).toString("utf8")).delegates ?? {}; } catch { pin = {}; }
     for (const rel of Object.keys(pin)) {
       const dest = join(root, rel);
       mkdirSync(dirname(dest), { recursive: true });
       if (override[rel] !== undefined) writeFileSync(dest, override[rel]);
-      else copyFileSync(join(REPO, rel), dest);
+      else writeFileSync(dest, treeBytes(rel));
     }
     return Object.keys(pin);
   }
@@ -290,7 +321,7 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     const fw = join(work, "framework");
     framework(fw);
     mkdirSync(join(fw, "scripts"), { recursive: true });
-    copyFileSync(join(REPO, "scripts", "admin-merge.sh"), join(fw, "scripts", "admin-merge.sh"));
+    writeFileSync(join(fw, "scripts", "admin-merge.sh"), treeBytes("scripts/admin-merge.sh"));
     installClosure(fw);
 
     const bash = async (toolCall, command, cwd) => {
