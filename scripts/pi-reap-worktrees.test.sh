@@ -1801,6 +1801,15 @@ assert_contains "$(row_for "$OUT" "$WT_RECENT")" "proof=disposable-floor(" \
 OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=4320 run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
     "G6a2 a floor ABOVE the row's age (3d > 2d) preserves it — RULE D only ever LOWERS a floor, never removes one"
+# ⛔ AND THE UNITS ON THAT ROW ARE PART OF ITS CLAIM. `age:<n>s≤<n>m` states the age in SECONDS and
+# the floor in MINUTES; the `%sms` literal that used to be here expanded a 2-day row to
+# `age:172800ms` — 2.9 minutes to any reader — in the one field this change exists to make legible.
+# The `assert_contains` is the PRECONDITION (an absent row would otherwise satisfy assert_absent
+# vacuously), the `assert_absent` is the measurement (#3888 review 2, finding 3).
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "proof=age:" \
+    "G6a2 precondition: the preserved row carries its age/floor proof at all"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "ms≤" \
+    "G6a2 …and it never labels a SECONDS value as ms (a 2d row would read age:172800ms = 2.9 minutes)"
 # ── G6a3: 0 DISABLES it and restores the pre-rule behaviour EXACTLY, which is what makes the change
 # reversible on a box without a code change.
 OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=0 run_reaper $ENV --dry-run --repo "$REPO")"
@@ -4534,6 +4543,17 @@ assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "reason=reclaimable" \
     "N6 a dead lane's wt-* scratch dir 2d old is reclaimed (REAP_WT_SCRATCH_AGE_DAYS)"
 assert_contains "$(row_for "$OUT" "$WT_NAMED")" "reason=no-pr" \
     "N6 the SAME row under a non-scratch path keeps the 7d floor (the rule is path-scoped)"
+# ⛔ AND WITH RULE D ARMED. `floor_src=scratch` (:4217) is the SECOND arm of RULE D's gate (:4230),
+# and the F3 fix pinned only the MERGED arm (G6d2/N5a): no armed run in this suite ran over a scratch
+# fixture, so deleting that assignment left the WHOLE suite green while an armed box silently capped a
+# lane-scratch checkout at the 12 h cooldown instead of REAP_WT_SCRATCH_AGE_DAYS — re-deciding the
+# recorded #2354 floor that the header (:64-70) and the registry note both state as a guarantee ("a
+# LANE SCRATCH checkout … is EXEMPT ENTIRELY"). (#3888 review 2, finding 2.)
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "floor=1440m(scratch)" \
+    "N6a armed RULE D leaves a wt-* scratch dir on its OWN floor (REAP_WT_SCRATCH_AGE_DAYS=1d), not on the cooldown"
+assert_absent "$(row_for "$OUT" "$WT_SCRATCH")" "ruleD" \
+    "N6a …and never claims the cooldown decided it"
 # The pattern is narrow IN TWO DIRECTIONS, and both halves need a fixture: `wt-*` must not read as a
 # PREFIX (a checkout named `wtfoo` is not a lane scratch dir), and the second alternative of the
 # default glob (`cell-wt-*`) must actually match. Asserting both against $WT_NAMED pinned neither —
