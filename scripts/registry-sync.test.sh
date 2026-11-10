@@ -948,6 +948,29 @@ else
   bad "§29 ...the local record was kept — the ordering used the NESTED reviewed_at"
 fi
 assert_not_contains "$N3_OUT" "this box is NEWER" "§29 ...and the run did not claim this box was newer"
+# §29c — a record written by a STANDARD JSON serialiser. `json.dumps`'s default separators emit
+# `": "`, and `field()`'s trims never skipped that whitespace, so the stamp came back as a single
+# SPACE: non-empty, so every unreadable guard passed, and `' '` sorts below `'2'` — so `pull` decided
+# the local record was OLDER and OVERWROTE a NEWER one with an older peer, silently, at rc 0. The
+# shape gate is exactly where such a record must fall through to the reader's parse (review round 3).
+NEST4D="$MINI_ROOT/box4"; mkdir -p "$NEST4D"
+printf '{"pr": 2374, "head_sha": "%s", "mint": "fresh", "verdict": "clean", "repo": "daniel-ospina/agent-infra", "reviewed_at": "2026-10-25T00:00:00Z"}\n' \
+  "$HEAD_C" > "$NEST4D/$NEST_KEY.json"
+SPACED_BEFORE="$(digest "$NEST4D")"
+N4_OUT="$(mini_rs "$NEST4D" pull)"
+assert_eq "$(digest "$NEST4D")" "$SPACED_BEFORE" "§29c a spaced record (\": \") is READ, so its NEWER stamp is not overwritten by an older peer"
+assert_contains "$N4_OUT" "this box is NEWER" "§29c ...and the run says so instead of reporting a write"
+# §29d — ONE LINE means the second READ hit EOF. `[ -z "$l2" ]` cannot tell EOF from an EMPTY line, so
+# `{"…"}\n\nGARBAGE\n` took the fast path while `json.load` refuses the whole file — and push then
+# PUBLISHED a record every other box refuses. It must be unreadable here instead.
+NEST5D="$MINI_ROOT/box5"; mkdir -p "$NEST5D"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-26T00:00:00Z"}\n\nGARBAGE\n' \
+  "$HEAD_C" > "$NEST5D/$NEST_KEY.json"
+N5_OUT="$(mini_rs "$NEST5D" push)"
+assert_contains "$N5_OUT" "no repo field" "§29d a record with a BLANK second line is not read by the fast path (it is not one line)"
+# the store already holds this key from §29a; the point is that THIS record was never published as a
+# NEW one — it was refused outright rather than published under a key its payload cannot back.
+assert_not_contains "$N5_OUT" "pushed $NEST_KEY" "§29d ...so it is never published"
 
 # ═══ 30. the compare+write lock: reclaimed in every dead-holder shape, bounded in every arm ══
 # Review findings P2 (two of them) on PR #3894 — `git grep 'reg_lock' -- scripts/*.test.sh` had NO
@@ -1038,6 +1061,88 @@ case "$(command ls -d "$LKD"/.registry-sync.lock.stale.* 2>/dev/null)" in
   '') ok "§30f ...and left no .stale.<pid> debris when the claim could delete what it claimed" ;;
   *) bad "§30f ...left reclaim debris behind: $(command ls -d "$LKD"/.registry-sync.lock.stale.* 2>/dev/null)" ;;
 esac
+# (g) RELEASE ONLY WHAT WE STILL OWN. The ceiling arm can reclaim a lock that still names a LIVE pid (a
+# frozen holder), so that holder reaches `reg_unlock` after losing it — and an unconditional removal
+# then deletes the NEW holder's lock, letting a third run in. Pinned by interposing a PEER RECLAIM at
+# the exact moment of release: a `cat` shim on PATH swaps in a foreign lock the first time the script
+# reads its own pid file, so the release finds a pid that is not its own.
+lock_reset
+SHIM_G="$T/shim-g"; mkdir -p "$SHIM_G"; : > "$T/g.fired"
+REAL_CAT="$(command -v cat)"
+cat > "$SHIM_G/cat" <<EOS
+#!/bin/sh
+case "\$1" in
+  */.registry-sync.lock/pid)
+    if [ ! -s "$T/g.fired" ]; then
+      printf 'x' > "$T/g.fired"
+      lockdir="\$(dirname "\$1")"
+      rm -rf "\$lockdir"                       # a peer reclaimed our lock...
+      mkdir -p "\$lockdir"                     # ...and a NEW holder owns the same name
+      printf '999999\\n' > "\$lockdir/pid"
+      printf '999999\\n'; exit 0
+    fi ;;
+esac
+exec "$REAL_CAT" "\$@"
+EOS
+chmod +x "$SHIM_G/cat"
+G_OUT="$(PATH="$SHIM_G:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 30 2>&1)"
+if [ -f "$LKD/.registry-sync.lock/pid" ] && [ "$(command cat "$LKD/.registry-sync.lock/pid")" = "999999" ]; then
+  ok "§30g a release DELETED only its own lock — the new holder's lock survived"
+else
+  bad "§30g the release deleted a lock it no longer owned (the new holder's lock is gone)"
+fi
+if [ -s "$T/g.fired" ]; then ok "§30g (premise) the foreign reclaim WAS interposed at release"; else bad "§30g (premise) the shim never fired — the arm proves nothing"; fi
+rm -rf "$LKD/.registry-sync.lock"; lock_reset
+# (h) THE CEILING MUST OUTLIVE THE RUN'S OWN BOUND. `--timeout` is an operator knob, so a fixed 300 s
+# would reclaim a legitimate `--timeout 600` run inside its own critical section. Same lock, same age
+# (400 s), two bounds: it must be KEPT at 600 (ceiling 1200) and RECLAIMED at 30 (ceiling 300).
+OLD400="$(python3 -c 'import time;print(time.strftime("%Y%m%d%H%M.%S", time.localtime(time.time()-400)))')"
+lock_reset
+mkdir -p "$LKD/.registry-sync.lock"; printf '%s\n' "$$" > "$LKD/.registry-sync.lock/pid"
+touch -t "$OLD400" "$LKD/.registry-sync.lock"
+H60_OUT="$(bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 600 2>&1)"; H60_RC=$?
+assert_eq "$H60_RC" "1" "§30h a 400s-old lock naming a LIVE pid is KEPT at --timeout 600 (ceiling 1200)"
+assert_contains "$H60_OUT" "could not serialise" "§30h ...and the refusal names the lock"
+H30_OUT="$(bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 30 2>&1)"; H30_RC=$?
+assert_eq "$H30_RC" "0" "§30h ...and the SAME lock is reclaimed at --timeout 30 (ceiling 300), so the arm is not a no-op"
+assert_contains "$H30_OUT" "longer than any sync run holds it" "§30h ...named as past the ceiling"
+lock_reset
+# (i) THE CLAIM IS ATOMIC, AND A LOCK WE DID NOT JUDGE IS NEVER DELETED. A peer can re-create the lock
+# between the decision and the claim (review round 2, measured: two holders overlapped 2.1 s, and the
+# second reclaimer's `rm -rf` deleted the first one's LIVE lock). Pinned by re-creating the lock
+# underneath the claim: a `mv` shim puts a FOREIGN lock at the lock name just before the real rename,
+# so the claim moves a lock it did not judge. It must be put BACK, not deleted.
+SHIM_I="$T/shim-i"; mkdir -p "$SHIM_I"; : > "$T/i.fired"
+REAL_MV="$(command -v mv)"
+IPID="$$"   # a pid that IS alive (this suite), so the re-created lock is never legitimately reclaimable
+cat > "$SHIM_I/mv" <<EOS
+#!/bin/sh
+case "\$1" in
+  */.registry-sync.lock)
+    case "\$2" in
+      */.registry-sync.lock.stale.*)
+        if [ ! -s "$T/i.fired" ]; then
+          printf 'x' > "$T/i.fired"
+          rm -rf "\$1"                                    # a peer won a reclaim...
+          mkdir -p "\$1"; printf '%s\\n' $IPID > "\$1/pid"  # ...and a LIVE holder re-created it
+        fi ;;
+    esac ;;
+esac
+exec "$REAL_MV" "\$@"
+EOS
+chmod +x "$SHIM_I/mv"
+lock_reset
+mkdir -p "$LKD/.registry-sync.lock"
+touch -t 202001010000 "$LKD/.registry-sync.lock"
+I_OUT="$(PATH="$SHIM_I:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 30 2>&1)"; I_RC=$?
+if [ -s "$T/i.fired" ]; then ok "§30i (premise) the re-create-under-the-claim WAS interposed"; else bad "§30i (premise) the claim never renamed the lock, so atomicity is unproven (a decide-then-rm reclaim has no claim to interpose on)"; fi
+if [ -f "$LKD/.registry-sync.lock/pid" ] && [ "$(command cat "$LKD/.registry-sync.lock/pid")" = "$IPID" ]; then
+  ok "§30i a claim that moved a lock it did NOT judge put it back instead of deleting a live lock"
+else
+  bad "§30i the claim DELETED a lock it never judged (the live holder's lock is gone)"
+fi
+assert_eq "$I_RC" "1" "§30i ...and that run fails closed rather than writing without the lock"
+rm -rf "$LKD/.registry-sync.lock"; lock_reset
 
 # ═══ 31. this box's record is NEWER but UNUSABLE — named, not silently kept for ever ══════
 # Review finding P2 on PR #3894: `git grep 'own rail can use' -- scripts/*.test.sh` → no match, and

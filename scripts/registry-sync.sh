@@ -197,12 +197,16 @@ git_b() { # <git args…>
 # class and leaves literal garbage in the value (reproduced). The three trims are order-independent:
 # each takes the prefix before the first occurrence of its own character.
 field() { # <file> <name>
-  local f="$1" n="$2" l1="" l2="" rest
+  local f="$1" n="$2" l1="" l2="" l2_rc=0 rest
   [ -f "$f" ] || return 0
-  { IFS= read -r l1 || :; IFS= read -r l2 || :; } < "$f" 2>/dev/null
+  { IFS= read -r l1 || :; IFS= read -r l2; l2_rc=$?; } < "$f" 2>/dev/null
   case "$l1" in
     '{'*'}')
-      if [ -z "$l2" ]; then
+      # ⛔ EOF, NOT AN EMPTY LINE. `[ -z "$l2" ]` cannot tell the two apart, so a record of
+      # `{"…"}\n\nGARBAGE\n` took the fast path while `json.load` refuses the whole file — and push
+      # then PUBLISHED a record every other box refuses (measured). Only a second read that FAILED
+      # means "this file is one line".
+      if [ "$l2_rc" -ne 0 ]; then
         # ⛔ a `}` inside a `${var//…}` pattern TERMINATES the expansion (measured: it yields the
         # input followed by a literal `]/}`), so the natural `[^}]` class silently does nothing
         # here. `case` patterns have no such problem, and stripping the outer braces by hand is
@@ -213,6 +217,19 @@ field() { # <file> <name>
           *)
             case "$l1" in *"\"$n\":"*) ;; *) return 0 ;; esac
             rest="${l1##*"\"$n\":"}"    # greedy-LAST occurrence — on a flat line, THE top level
+            # ⛔ THE VALUE MUST START AT THE COLON with an actual JSON scalar. `json.dumps`'s DEFAULT
+            # separators emit `": "`, and the three trims below do NOT skip whitespace — so a spaced
+            # record read back as a single SPACE: non-empty (every unreadable guard passed) and sorting
+            # BELOW any timestamp (`' '` < `'2'`), so `pull` OVERWROTE a NEWER local record with an
+            # older peer one, silently, at rc 0 (measured — this file's own "unrecoverable" class).
+            # `null`/`true`/`false` diverge the same way (the strict parse reads ""/true), and they
+            # decide the very same rules. So anything but a string, a number or a negative number is
+            # the strict parse's to answer: a shape this scan is not sure about cannot fail OPEN,
+            # because `_field_json` is the READER.
+            case "$rest" in
+              \"*|-*|[0-9]*) ;;
+              *) _field_json "$f" "$n"; return 0 ;;
+            esac
             rest="${rest#\"}"               # the OPTIONAL opening quote
             rest="${rest%%[,]*}"            # ┐
             rest="${rest%%\}*}"             # ├ the value class, applied as three prefix trims
@@ -530,22 +547,29 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
     [ -f "$pidf" ] && pid="$(command cat "$pidf" 2>/dev/null)"
     case "$pid" in ''|*[!0-9]*) pid="" ;; esac
     age="$(lock_age "$LOCKDIR")"
-    # ⛔ ORDER MATTERS: the "no usable holder" arm is the PRECISE cause and is checked FIRST, so a
-    # pid-less or gone-pid lock is named as such; the staleness ceiling is only the fallback for a lock
-    # that still shows a LIVE pid (the recycled case). Checking the ceiling first relabels every
-    # pid-less lock as "untouched", which is true but points an operator at the wrong cause.
-    if [ -n "$age" ] && [ "$age" -ge "$LOCK_PID_GRACE" ] \
-       && { [ -z "$pid" ] || ! ps -p "$pid" >/dev/null 2>&1; }; then
-      # an ABSENT/EMPTY pid is a no-holder state BY CONSTRUCTION — never left to `ps -p ''`'s
-      # platform-dependent exit status (`kill -0` never could see this state at all, which is the bug).
-      if [ -n "$pid" ]; then
+    # ⛔ WHICH AMBIGUITY EACH ARM MAY RESOLVE (#2510 review rounds 1-3, every one measured):
+    #  · a recorded pid the OS says is GONE is UNAMBIGUOUS, so a short grace is enough;
+    #  · every OTHER shape is AMBIGUOUS and only elapsed time may break it — a pid-less lock is a live
+    #    acquirer for the microseconds between `mkdir` and the write (a 2 s grace STOLE one that was
+    #    descheduled for 3 s), an unreadable pid names nothing provable, a pid that is ALIVE may be a
+    #    frozen holder or a pid the OS recycled, and `ps` may be unable to answer at all (an absent
+    #    `ps` read every live holder as dead — round 1's EPERM defect, moved from permission to tool
+    #    availability). Time must therefore outlive the run's own bound, which is why the ceiling is
+    #    derived from MAX_WAIT;
+    #  · a lock we cannot DATE is never reclaimed: fail closed, wait out the bound, and let the caller
+    #    refuse to write — the same doctrine as the strict-parse fallback in `_field_json`.
+    if [ -z "$age" ]; then
+      : # undateable ⇒ cannot prove abandoned ⇒ never steal it
+    elif [ -n "$pid" ] && command -v ps >/dev/null 2>&1 && ! ps -p "$pid" >/dev/null 2>&1; then
+      if [ "$age" -ge "$LOCK_PID_GRACE" ]; then
         claim_stale "$pid" "  ⚠️ reclaiming $LOCKDIR — its holder (pid $pid) is gone (a killed run)." || :
+      fi
+    elif [ "$age" -ge "$LOCK_STALE_MAX" ]; then
+      if [ -n "$pid" ]; then
+        claim_stale "$pid" "  ⚠️ reclaiming $LOCKDIR — still names pid $pid after ${age}s, longer than any sync run holds it." || :
       else
         claim_stale "" "  ⚠️ reclaiming $LOCKDIR — no usable pid after ${age}s (its holder died before it could record itself)." || :
       fi
-    elif [ -n "$age" ] && [ "$age" -ge "$LOCK_STALE_MAX" ]; then
-      # Older than any sync run can hold it: whatever pid claims it, this lock is abandoned.
-      claim_stale "$pid" "  ⚠️ reclaiming $LOCKDIR — untouched for ${age}s, longer than any sync run holds it." || :
     fi
     sleep 0.1; i=$((i + 1))
   done
@@ -1249,12 +1273,19 @@ registry_hash() {
 # store" (an error, exit 1 from fetch_refs). Conflating the two made exit 1 mean both.
 do_status() {
   fetch_refs || return 1
-  local key name at list lnew="" rnew="" local_n=0 remote_n=0 missing=0
+  local key name at list atfile lnew="" rnew="" local_n=0 remote_n=0 missing=0
   list="$(mktemp "${TMPDIR:-/tmp}/registry-sync-status.XXXXXX")" || return 1
+  atfile="$(mktemp "${TMPDIR:-/tmp}/registry-sync-status-at.XXXXXX")" || { rm -f "$list"; return 1; }
   while IFS= read -r key; do
     [ -n "$key" ] || continue
     remote_n=$((remote_n + 1))
-    at="$(remote_record "$key" 2>/dev/null | sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p' | command head -1)"
+    # ⛔ THE SAME PARSE AS EVERY OTHER VERB. This was the THIRD one — a greedy `sed`, i.e. exactly the
+    # last-match read this file exists to delete — so `status` reported the NESTED `reviewed_at` of a
+    # record carrying an object (`origin newest_reviewed_at=2000-…` for a record whose top level says
+    # `2026-…`, measured). `field()` is the reader's parse; `remote_record` goes through a file so it
+    # can be read by the same function the compare uses.
+    remote_record "$key" > "$atfile" 2>/dev/null
+    at="$(field "$atfile" reviewed_at)"
     if [ -n "$at" ] && { [ -z "$rnew" ] || [[ "$at" > "$rnew" ]]; }; then rnew="$at"; fi
     # "Missing here" means the READER would find nothing — the qualified file OR the legacy
     # `<pr>.json` it falls back to. Counting only the qualified name reported a record as absent
@@ -1272,7 +1303,7 @@ do_status() {
     at="$(field "$REG_DIR/$name" reviewed_at)"
     if [ -n "$at" ] && { [ -z "$lnew" ] || [[ "$at" > "$lnew" ]]; }; then lnew="$at"; fi
   done < "$list"
-  rm -f "$list"
+  rm -f "$list" "$atfile"
   printf 'local  records=%s newest_reviewed_at=%s hash=%s\n' "$local_n" "${lnew:-none}" "$(registry_hash)"
   printf 'origin records=%s newest_reviewed_at=%s\n' "$remote_n" "${rnew:-none}"
   printf 'missing_here=%s\n' "$missing"
