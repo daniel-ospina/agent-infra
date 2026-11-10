@@ -307,7 +307,14 @@ TOOLS: List[Dict[str, Any]] = [
             "A command that is not on the allowlist is a TYPED REFUSAL (`command-not-allowlisted`), never "
             "a pass-through. ⛔ `timed_out` / `truncated` are CHANNEL facts: they are never evidence about "
             "the box, and a timeout is never reported as `box-unreachable` (a disk-full guest answers "
-            "`running` while every exec times out). MUTATING."
+            "`running` while every exec times out). "
+            # ⛔ THE SHAPE A CALLER ACTUALLY READS. The inventory rows carry this, but the whole point of
+            # #2345 is that a caller keying on `rc` reads a dead link as success — so the description the
+            # caller is handed must say to branch on `outcome`, or the surface documents the defect.
+            "⛔ A LINK REFUSAL is a CHANNEL fact too: `outcome: CHANNEL-REFUSED` + `channel_refused` "
+            "(`link-refused` / `no-known-daemon` / `daemon-binary-absent`, three different remedies — the "
+            "last is on the CALLING box), plus `fail_open` when the transport exited 0 while refusing. "
+            "Branch on `outcome`, NEVER on `rc` alone. MUTATING."
         ),
         "inputSchema": {
             "type": "object",
@@ -2263,10 +2270,29 @@ def _harden_argv(argv: List[str]) -> List[str]:
 # ⛔ rc=0 IS STILL A REFUSAL. A refusal reported with exit status 0 was measured on `pi-cell-3`
 # (2026-10-23, on the issue): a caller that checks only `rc` read a dead link as success. The class is
 # reported whatever the rc, so the fail-open form cannot pass as a run here either.
+# ⛔ EVERY PATTERN IS ANCHORED TO ITS LINE START, because these two streams are SHARED: `cmux vm exec`
+# relays the remote command's stdout/stderr into the same `ran.stdout`/`ran.stderr` this classifier reads
+# (`payload["stderr"]` below is exactly that relay), so a bare phrase match would re-label a peer that
+# merely PRINTED one of these sentences — the symmetric mis-verdict to the one this change removes
+# ("the peer ran it and failed" → "the peer never ran it").
+# WHERE a prefix bounds the class, it is required — and it is required only where the transport has been
+# MEASURED emitting the line with it:
+#   link-refused         always `cmux: link to '<peer>' exited` (every measurement on #2345)
+#   no-known-daemon      `cmux-tui: no known daemon matches this route` — the client's own words; the
+#                        un-prefixed form is what `~/.cmux/peer-links/<peer>.log` CONTAINS, i.e. it
+#                        reaches these streams only if a peer echoes the log, which the allowlist makes
+#                        impossible (`cat`/`tail` are not on it)
+# ⛔ BUT `daemon-binary-absent` HAS BEEN MEASURED IN BOTH SHAPES — `cmux: cmux-tui daemon binary not
+# found at …` (pi-lane-1, 2026-10-23) AND un-prefixed `cmux-tui daemon binary not found at …` (pi-cell-2,
+# issue #2345) — so its prefix is OPTIONAL: requiring one silently disabled the whole #3195 class on the
+# boxes that print the bare form. Its bound is the line anchor + the `cmux-tui ` token, not the prefix,
+# and the residual is DISCLOSED rather than implied: a peer that echoes that exact sentence is still
+# indistinguishable from the transport, because the streams offer no structural separator.
 LINK_REFUSAL_CLASSES = (
-    ("daemon-binary-absent", re.compile(r"cmux-tui daemon binary not found at (?P<path>\S+)")),
+    ("daemon-binary-absent",
+     re.compile(r"^(?:cmux: )?cmux-tui daemon binary not found at (?P<path>\S+)", re.M)),
     ("link-refused", re.compile(r"^cmux: link to ['\"](?P<peer>[^'\"]+)['\"] exited", re.M)),
-    ("no-known-daemon", re.compile(r"no known daemon matches this route")),
+    ("no-known-daemon", re.compile(r"^cmux-tui: no known daemon matches this route", re.M)),
 )
 LINK_REFUSAL_DETAIL = {
     "link-refused":
@@ -2286,8 +2312,11 @@ PEER_LOG_RE = re.compile(r"(?P<path>(?:~|/)[^\s]*peer-links/[^\s]+)")
 def _link_refusal(ran: "Ran") -> Optional[Dict[str, Any]]:
     """Classify a `cmux vm exec` LINK REFUSAL, or None when the transport ran something.
 
-    Consumes only what the transport itself answered (`stderr`/`stdout`) — never a re-probe and never
-    the peer's daemon state, neither of which this surface can measure (skill §3: `timed_out` and a
+    ⛔ IT CANNOT CONSUME *ONLY* WHAT THE TRANSPORT ANSWERED: `stderr`/`stdout` here are the same two
+    streams the peer's own output arrives on, so "the transport said this" and "the peer printed
+    this" are not separable by content. What bounds the class is therefore the ANCHOR (line start +
+    the transport's prefix — see LINK_REFUSAL_CLASSES), not the stream. Never a re-probe and never the
+    peer's daemon state, neither of which this surface can measure (skill §3: `timed_out` and a
     refusal are CHANNEL facts, never a box verdict).
     """
     text = "\n".join(part for part in (ran.stderr or "", ran.stdout or "") if part)
@@ -2297,17 +2326,36 @@ def _link_refusal(ran: "Ran") -> Optional[Dict[str, Any]]:
         match = rx.search(text)
         if not match:
             continue
+        # ⛔ NOT `refused`. That key already means "this surface ran NOTHING" in this file —
+        # `argv-must-be-a-list-of-strings`, `command-not-allowlisted`, `repo-config-names-a-program`,
+        # `read-only` all return BEFORE the transport is invoked, and the inventory row calls it "a
+        # fail-closed allowlist with a typed refusal". These classes DID invoke the transport and are
+        # reporting the CHANNEL's answer, so a caller switching on `refused` to mean "amend my request,
+        # nothing executed" must not also match "the channel refused; the remedy is elsewhere".
         out: Dict[str, Any] = {
-            "refused": klass,
+            "channel_refused": klass,
             "outcome": "CHANNEL-REFUSED",
-            "refusal": text.strip().splitlines()[0][:300],
+            # ⛔ THE MATCHED LINE, NOT THE FIRST LINE OF THE BUFFER. `text` is `stderr` + `\n` +
+            # `stdout`, so a transport that printed anything before the refusal (a warning, a probe
+            # line) put THAT sentence in the field named for the refusal, and the diagnostic the caller
+            # needs was dropped. Every pattern is `^`-anchored with re.M, so `match.start()` is always a
+            # line start.
+            "refusal": text[match.start():].splitlines()[0].strip()[:300],
             "refusal_detail": LINK_REFUSAL_DETAIL[klass],
-            "channel_only": "a link refusal is a CHANNEL fact — the peer never ran the command, so "
+            "channel_note": "a link refusal is a CHANNEL fact — the peer never ran the command, so "
                             "this rc is the TRANSPORT's, never the command's verdict",
         }
-        peer = match.groupdict().get("peer")
+        groups = match.groupdict()
+        peer = groups.get("peer")
         if peer:
             out["peer"] = peer
+        # ⛔ THE PATH GROUP IS READ, NOT DECLARED-AND-DROPPED. For `daemon-binary-absent` it is the one
+        # datum the CALLING-box remedy needs (which path `cmux-tui` was looked for at), and this file
+        # has already deleted one declared-but-unreferenced constant (`DISK_OK_VERBS`) rather than let
+        # a named group read as wired-in.
+        binary_path = groups.get("path")
+        if binary_path:
+            out["binary_path"] = binary_path
         log = PEER_LOG_RE.search(text)
         if log:
             out["peer_log"] = log.group("path")
@@ -2414,7 +2462,15 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
     if refusal:
         # ⛔ BEFORE `timed_out` ON PURPOSE: a refusal is an ANSWER the transport gave, not a slow
         # channel, and reporting it as the command's own non-zero rc is what #2345 costs.
+        # ⛔ AND THE CHANNEL NOTE IS **APPENDED**, NEVER REPLACED. `channel_only` above already explains
+        # `timed_out`/`truncated`, both of which stay in this very payload — a bare `payload.update()`
+        # replaced that sentence with the refusal's, so a transport that BOTH printed a refusal line
+        # AND timed out carried `timed_out: true` with nothing left saying it is a channel reading.
+        note = refusal.pop("channel_note", "")
         payload.update(refusal)
+        if note:
+            base = payload.get("channel_only") or ""
+            payload["channel_only"] = (base + " | " + note) if base else note
         return True, payload
     if ran.timed_out:
         payload["outcome"] = "CHANNEL-TIMEOUT"

@@ -1075,8 +1075,13 @@ def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc
     peers while `cmux vm exec <peer> -- hostname` failed against all four. Before this arm the payload
     said `outcome: NONZERO, rc: 3` — indistinguishable from "the peer ran it and it failed", which
     sends the operator to the command, or to the peer's state, when neither is what refused.
-    The three causes have three DIFFERENT remedies, so each is named. Every arm below FAILS on the
-    pre-fix code (which returned NONZERO/RAN and carried no `refused` key at all).
+    The three causes have three DIFFERENT remedies, so each is named. Arms 1–3 FAIL on the
+    pre-fix code (which returned NONZERO/RAN and carried no `refused` key at all); arm 4 is a
+    REGRESSION PIN, not a failing-first arm — it asserts the same `RAN` shape the pre-fix code
+    returned, which is exactly what a pin must do. Arms 5–6 bound the CLASS rather than an instance
+    (`ps`/`pgrep` precedent at ALLOWLIST): 5 is a peer that PRINTS a refusal phrase (the streams are
+    shared with the relay, so an unanchored pattern re-labelled it), and 6 is a transport that both
+    refused and timed out (whose `channel_only` note the refusal used to replace).
     """
     mod = server_mod(monkeypatch)
 
@@ -1095,10 +1100,16 @@ def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-4", "argv": ["uname", "-s"]})
     assert is_err is True, payload
     assert payload["outcome"] == "CHANNEL-REFUSED", payload
-    assert payload["refused"] == "link-refused", payload
+    assert payload["channel_refused"] == "link-refused", payload
     assert payload["peer"] == "pi-cell-4", payload
     assert payload["peer_log"].endswith("peer-links/pi-cell-4.log"), payload
+    # ⛔ `refused` KEEPS ITS FAIL-CLOSED MEANING. In this file it already means "this surface ran
+    # NOTHING" (`read-only`, `argv-must-be-a-list-of-strings`, `command-not-allowlisted`, …) — all of
+    # which return before the transport is invoked. A link refusal DID invoke it and is reporting the
+    # CHANNEL, so it must not land in the key a caller switches on to mean "amend my request".
+    assert "refused" not in payload, payload
     assert "never the command's verdict" in payload["channel_only"], payload
+    assert "timed_out and truncated are CHANNEL facts" in payload["channel_only"], payload
     assert "carrier" in payload["refusal_detail"], payload
     assert "fail_open" not in payload, "a non-zero rc is not the fail-open form"
 
@@ -1123,17 +1134,79 @@ def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc
         "sys.stderr.write('cmux: cmux-tui daemon binary not found at "
         "/root/.cmux/bin/cmux-tui\\n')\n", 1))
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname"]})
-    assert is_err is True and payload["refused"] == "daemon-binary-absent", payload
+    assert is_err is True and payload["channel_refused"] == "daemon-binary-absent", payload
     assert "calling box" in payload["refusal_detail"], payload
+    # ⛔ THE PATH GROUP IS CARRIED, NOT DECLARED AND DROPPED — it is the datum the CALLING-box remedy
+    # needs (where `cmux-tui` was looked for), and a named group nothing reads is how the next reader
+    # concludes the regex is decorative.
+    assert payload["binary_path"] == "/root/.cmux/bin/cmux-tui", payload
     assert "peer" not in payload, "no peer refused — this box has no client"
+    # (3b) THE BARE FORM OF THE SAME DIAGNOSTIC — the transport does NOT always prefix it. Measured on
+    #      `pi-cell-2` (`cmux vm exec pi-cell-2 -- true`); #2345 carries it. Requiring `^cmux: ` silently
+    #      disabled this whole class on exactly the boxes #3195 is about, so the prefix is optional here.
+    monkeypatch.setenv("ORCH_MCP_CMUX", refusal_stub(
+        "cmux_nobin_bare.py",
+        "import sys\n"
+        "sys.stderr.write('cmux-tui daemon binary not found at "
+        "/home/cmux/.cmux/bin/cmux-tui\\n')\n", 1))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-2", "argv": ["uname"]})
+    assert is_err is True and payload["channel_refused"] == "daemon-binary-absent", payload
+    assert payload["binary_path"] == "/home/cmux/.cmux/bin/cmux-tui", payload
+    assert payload["refusal"].startswith("cmux-tui daemon binary not found at"), payload
 
     # (4) AND A REAL RUN IS NOT CLASSIFIED. The classifier matches the TRANSPORT's refusal, so a peer
-    #     that answers must still be `RAN` with no `refused` key — otherwise the fix hides real output.
+    #     that answers must still be `RAN` with no refusal key — otherwise the fix hides real output.
     monkeypatch.setenv("ORCH_MCP_CMUX", stub(tmp_path, "cmux_ok.py", "print('Linux')", code=0))
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname", "-s"]})
     assert is_err is False, payload
     assert payload["outcome"] == "RAN" and payload["stdout"].strip() == "Linux", payload
-    assert "refused" not in payload, payload
+    assert "refused" not in payload and "channel_refused" not in payload, payload
+
+    # (5) ⛔ THE CLASS BOUND, NOT ONE BENIGN ARGV: a peer's RELAYED output carrying the refusal PHRASE
+    #     (un-prefixed) is a run. `cmux vm exec` relays the remote command's streams into the very two
+    #     the classifier reads, so an unanchored pattern re-labelled this `CHANNEL-REFUSED` + `fail_open`
+    #     — the symmetric mis-verdict to #2345 ("the peer ran it and failed" → "the peer never ran it").
+    #     ⛔ THE FIXTURE IS ONLY THE LINE THE PREFIX ACTUALLY BOUNDS. `no known daemon matches this route`
+    #     is measured as transport output ONLY with the `cmux-tui: ` prefix (it is what the peer log
+    #     CONTAINS), so un-prefixed it is a peer echo by construction. The daemon-binary line is NOT a
+    #     valid echo fixture — the transport has been measured emitting it BOTH ways (#2345, `pi-cell-2`),
+    #     so that arm lives in (3b) instead; pinning these exact bytes as "a peer printed this" would have
+    #     asserted a false belief and false-redded the correct fix.
+    monkeypatch.setenv("ORCH_MCP_CMUX", stub(
+        tmp_path, "cmux_relay.py",
+        "import sys\n"
+        "sys.stdout.write('no known daemon matches this route; connect with an invitation\\n')\n"
+        "sys.stdout.write('peer log pid=1 nmode=owner\\n')\n", 0))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname"]})
+    assert is_err is False and payload["outcome"] == "RAN", payload
+    assert "channel_refused" not in payload and "fail_open" not in payload, payload
+
+    # (6) ⛔ A REFUSAL **AND** A TIMEOUT: both facts stay in the payload, and `channel_only` keeps the
+    #     sentence that says `timed_out`/`truncated` are channel readings. The pre-fix ordering returned
+    #     the refusal FIRST and `payload.update(refusal)` REPLACED that sentence, so `timed_out: true`
+    #     arrived with nothing left saying it was not evidence about the box.
+    #     ⛔ AND A NOISE LINE COMES FIRST, so `refusal` is pinned to the MATCHED line rather than to the
+    #     first line of the buffer (the pre-fix field was `text.strip().splitlines()[0]`).
+    refusal_text = ("cmux: warning: peer cache stale\n"
+                    "cmux: link to 'pi-cell-4' exited; see "
+                    "/home/cmux/.cmux/peer-links/pi-cell-4.log\n")
+
+    def both(argv, timeout=None, cap=0):
+        if "ls" in argv:
+            return mod.Ran(argv, rc=0, stdout="pi-cell-4  vm-ce2c  running  reachable\n")
+        return mod.Ran(argv, rc=124, stderr=refusal_text, timed_out=True)
+
+    monkeypatch.setenv("ORCH_MCP_CMUX", "/usr/bin/true")
+    monkeypatch.setattr(mod, "run", both)
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-4", "argv": ["uname"]})
+    assert is_err is True and payload["outcome"] == "CHANNEL-REFUSED", payload
+    assert payload["channel_refused"] == "link-refused" and payload["timed_out"] is True, payload
+    assert "timed_out and truncated are CHANNEL facts" in payload["channel_only"], payload
+    assert "never the command's verdict" in payload["channel_only"], payload
+    # (6b) …AND `refusal` CARRIES THE MATCHED LINE, not the first line of the buffer. The pre-fix field
+    #      was `text.strip().splitlines()[0]`, so any warning the transport printed first occupied the
+    #      field named for the refusal while the refusal sentence was dropped.
+    assert payload["refusal"].startswith("cmux: link to 'pi-cell-4' exited"), payload
 
 
 def test_T_run_is_bounded_in_MEMORY_and_TIME_not_just_in_what_it_returns(monkeypatch):
