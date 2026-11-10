@@ -284,7 +284,8 @@ _TRAP_SIGS_AWK='
         # the splice spells close-quote, escaped apostrophe, open-quote, and counting all three inverts
         # the parity for good (fresh review of #3865 at 8952f89c8, P2 — MEASURED both ways: an action
         # containing a splice parsed to TERM and left every replaced-releaser arm GREEN, and a CORRECT
-        # releaser containing a splice parsed UNKNOWN and red three arms. Both were regressions from the
+        # releaser containing a splice parsed UNKNOWN and red FOUR arms (the UNKNOWN arm is one of them
+        # because _TERM_AWK passes an UNKNOWN registration straight through). Both were regressions from the
         # skip this commit introduced, and the earlier note claiming a splice "keeps the parity right"
         # was the false claim that hid them). Inside the span a backslash is literal for single quotes
         # and an escape for double ones, so quotes are counted the way the shell reads them. No quote
@@ -294,7 +295,8 @@ _TRAP_SIGS_AWK='
           fld = $i; k = 0
           for (p = 1; p <= length(fld); p++) {
             if (substr(fld, p, 1) != qq) continue
-            esc = (p > 1 && substr(fld, p - 1, 1) == "\\")
+            esc = 0; q2 = p - 1
+            while (q2 >= 1 && substr(fld, q2, 1) == "\\") { esc = 1 - esc; q2-- }
             if (qq == "\"") { if (esc) continue }
             else { if (esc && (cnt + k) % 2 == 0) continue }
             k++
@@ -528,7 +530,14 @@ ck "every trap registration's SIGNAL LIST is readable (an unparseable one is UNK
 # `exit` must sit at a command position (after `;`/`&`/`|`/`(`/the action's opening quote) or open one.
 # ONE implementation, used by both the whole-file arm and §9d, so the two cannot disagree.
 # ⏳ STATED LIMITS, not coverage. This judges the TEXT, not the behaviour, and it is not complete in
-# either direction:
+# either direction. Besides the INT/TERM limits below, the ACTION SPAN is only recognised when it OPENS
+# with a quote, so an action with an UNQUOTED PREFIX glued to a quoted tail (`trap cleanup' TERM; exit'
+# EXIT`) is not skipped: the parse starts inside the action and reports its own `TERM` as the list, which
+# leaves the ONLY-EXIT arm GREEN for that spelling (fresh review of #3865 at 593ca0c85, P3 — MEASURED
+# `PASS=188 FAIL=1`). It is not a suite-level false PASS — the INT/TERM word arm still reds it — but it is
+# a defence-in-depth gap of exactly the class this PR exists to close, so it is NAMED rather than implied.
+# Telling an unquoted action from the signal list would need real shell word-splitting, which is the same
+# boundary the `eval`/variable-built command-word limit below states.
 #   * FALSE RED, measured: a handler that stops the shell another way (`trap 'kill -TERM $$' TERM`,
 #     `trap 'exec /bin/false' TERM`) REDS. Pre-existing, not introduced here.
 #   * FALSE RED, measured: an `exit` reached through a KEYWORD-opened command
@@ -681,7 +690,8 @@ trap 'case \"\$1\" in HUP) log ;; esac; cleanup' EXIT" \
 # 8952f89c8, P2 — MEASURED both ways). A splice spells close-quote, backslash, apostrophe, open-quote;
 # counting its three apostrophes as three quotes left the parity odd for the rest of the line, so the span
 # never closed: with a signal word after it the parse returned TERM and EVERY replaced-releaser arm stayed
-# green, and a CORRECT releaser that merely contained a splice parsed UNKNOWN and red three arms. An
+# green, and a CORRECT releaser that merely contained a splice parsed UNKNOWN and red FOUR arms (the
+# UNKNOWN arm always reds on an UNKNOWN registration: _TERM_AWK passes it through). An
 # escaped quote met OUTSIDE the span is literal and does not count.)
 _exitrow 2 "$_REL
 trap 'log \"it'\\''s\"; TERM; cleanup; exit 0' EXIT" \
