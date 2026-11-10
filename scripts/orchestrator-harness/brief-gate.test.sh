@@ -1862,7 +1862,8 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 #   * ⛔ `scripts/orchestrator-harness/gh-auth.test.sh` (#2509) is the SAME class as
 #     `capacity-transfer.test.sh` and `nonblocking-dispatch.test.sh`, one level higher: its `run_lane`
 #     arms drive the REAL `spawn-gate.sh` `run_agent`, and the gate refuses a non-compliant brief with
-#     74 BEFORE the code under test is reached — so the suite renders its brief fixture by CALLING
+#     80 (`AGENT_BRIEF_REFUSED`, `spawn-gate.sh:3758` — NOT 74, which is `AGENT_LAND_BACKLOG`) BEFORE the
+#     code under test is reached — so the suite renders its brief fixture by CALLING
 #     `$HERE/brief-gate.sh --section lane` (`gh-auth.test.sh:163`) rather than hard-coding a block that would drift
 #     from the gate. It dispatches no writer of its own (the `pi` it starts is a stub), so it is a
 #     REFERENCER: it joins this equality without joining the dispatch population. Undeclared it

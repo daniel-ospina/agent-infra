@@ -367,6 +367,16 @@ _gh_auth_store_in() {
 # and both are DISCLOSED in the text rather than asserted away: an unresolvable passwd record prints
 # `<unresolved account home>` in place of the account path, and a directory this read cannot OPEN prints
 # `<unreadable: …>` in place of its path — see `_gh_auth_store_in`.
+# ⛔ THAT DISCRIMINATION IS IMPLEMENTED FOR THE THREE DIRECTORIES THE `none`/`ambient-missing` CAUSES
+# NAME (the lane HOME's store, the account HOME's, and an ambient `GH_CONFIG_DIR`) and NOT for the two
+# ACCEPTED-BUT-UNPROBED sources: an env file's `GH_CONFIG_DIR=` and an ambient `XDG_CONFIG_HOME`. Those
+# are read for a store that IS there; when the store they point at sits behind a directory this read
+# cannot open, the read falls through exactly as `gh` would and the cause reports the two directories it
+# DID probe. So the residual is DISCLOSURE, not resolution: a `keys.env`-declared store behind an
+# unreadable directory still yields `none` (such a lane genuinely has no usable credential and is still
+# HELD), but the text names the probed directories rather than the third one. ⛔ Named here because this
+# block is where a reader decides how much to trust the marker; teaching `gh_auth_resolve` to probe those
+# two sources is a change to THIS function's own coverage, deliberately not smuggled in behind a comment.
 gh_auth_cause() {
   local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" r st d hd ad
   [ -n "$ef" ] || ef="${ENV_FILE:-${home}/keys.env}"

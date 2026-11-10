@@ -1293,13 +1293,15 @@ land_backlog_exempt() { # <issue> <owner/repo> -> prints the reason + ". ", rc 0
 }
 
 # ── THE EVIDENCE READ'S OWN VERDICT, IN THE LOG (agent-infra#2509) ───────────────────────────────
-# ⛔ THE DEFECT THIS NAMES: when the label/title read failed, the ONLY trace was an appended clause on
-# the verdict line — and on an UNDER-ceiling repo the log printed `[land-backlog] OK …` and nothing
-# else, so an unreadable exemption was indistinguishable from "this issue is not urgent". Measured
-# 2026-11-09: the same cause (no gh credential in the lane's redirected HOME) failed BOTH reads, and an
-# operator reading the lane log could not tell a P0-blocker held by a broken gh chain from one that was
-# judged non-urgent. This line is printed whenever the evidence read failed, whatever the ratio read
-# then said.
+# ⛔ THE DEFECT THIS NAMES: when the label/title read failed, the ONLY trace was a bracketed clause
+# APPENDED to the verdict line, so the failure inherited that verdict's shape and said nothing about
+# WHICH fault it was. On an UNDER-ceiling repo the pre-change log therefore read
+# `[land-backlog] OK <n> open / <r> landings per hour … [the <TAG> exemption read ALSO failed: …]` (the
+# append is at `origin/main:4266/4279`, echoed with `$lb_line` at `:4282/:4285`): an OK line carrying a
+# failed read. Measured 2026-11-09, the same cause — no gh credential in the lane's redirected HOME —
+# failed BOTH reads, and a P0-blocker held by a broken gh chain was distinguishable from one judged
+# non-urgent only by a trailing bracket nobody would grep for. This line is printed whenever the
+# evidence read failed, whatever the ratio read then said, and it names which fault it is.
 # ⛔ AND IT SEPARATES THE TWO CAUSES IT CAN SEE, because their remedies differ: a missing credential
 # (fix the lane's env) versus a read that failed WITH a credential resolved (fix permissions/the
 # chain). It never claims a cause it cannot read (`gh_auth_cause` is silent on anything but a positive
@@ -1335,8 +1337,12 @@ land_backlog_exempt_note() { # <label> <exempt-why>
 # byte-identical copies of a refusal whose remedy was the RATIO one — "land/fix the open PRs (this is
 # the drain), or dispatch a P0/base-red item" — printed on the `UNREADABLE` arm as well. Measured
 # 2026-11-09: the cause was a lane whose `gh` had NO credential at all, so acting on the printed remedy
-# meant landing PRs to fix a `hosts.yml` problem. The ratio remedy is now printed only when the read
-# actually RESOLVED (the `LAND-BACKLOG` state), and the credential remedy when it did not.
+# meant landing PRs to fix a `hosts.yml` problem. ⛔ THE CREDENTIAL REMEDY REPLACES THE RATIO ONE ONLY
+# WHERE THE CAUSE CAN BE NAMED (`gh_auth_cause` speaks). Every other `UNREADABLE` arm keeps the ratio
+# remedy WITH a caveat naming what could NOT be measured — `⛔ BUT FIRST … could NOT be resolved`
+# (state `none`/`ambient-missing`/`token-blank`, or an empty state when the module is absent) or
+# `IS credentialed (state=…) … check the gh/network chain` — because a refusal that names no remedy is
+# the silence #2210 forbids, and on those arms the ratio may well be the true cause.
 # ⛔ STILL A REFUSAL: no agent started, nothing consumed, and the item stays eligible on another box —
 # #2210's contract is that the refusal is READABLE, not that it is quiet.
 land_backlog_refuse() { # <label> <verdict-line> <exempt-why>

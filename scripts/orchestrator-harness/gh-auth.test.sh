@@ -528,13 +528,17 @@ ck "B6 an UNREADABLE exemption does NOT exempt: the P0 is held over the ceiling 
 grep -q 'EXEMPTION-UNREADABLE' "$TMP/b6.log"; rc=$?
 ck "B6b …the log names the EVIDENCE read as the failure, not the ratio (the documented token)" $rc
 grep -q 'HELD, not judged non-urgent' "$TMP/b6.log"; rc=$?
-ck "B6c …and says the P0 is HELD rather than judged non-urgent (the sentence the pre-change line lacked)" $rc
+ck "B6c …and says the P0 is HELD rather than judged non-urgent (the refusal's own clause, distinct from the NOTE line B6b pins)" $rc
 grep -q 'EXEMPT .*P0 work' "$TMP/b6.log" && rc=1 || rc=0
 ck "B6d …and nothing claims the exemption was granted" $rc
 
 # B7: the same failed evidence read UNDER the ceiling — the lane runs (the ratio allows it), and the log
-# STILL says the evidence read failed. Pre-change nothing was said at all on this path, which is how an
-# unreadable exemption came to read as "this issue is not urgent".
+# STILL says the evidence read failed. ⛔ PRE-CHANGE SOMETHING *WAS* SAID, and saying otherwise is the
+# false premise review round 12 caught: `origin/main` appended a bracketed clause to the VERDICT line
+# (`:4266/4279`, echoed with `$lb_line` at `:4282/:4285`), so under the ceiling it read
+# `[land-backlog] OK … [the <TAG> exemption read ALSO failed: …]`. The gain this suite pins is the
+# DEDICATED line — greppable by its own token, printed whatever the verdict said, naming WHICH fault —
+# not the invention of a trace that existed.
 run_lane 3 40 "P0-blocker,harness" "crash on boot" evidence-fail 2516 b7 "$ACCT"
 { [ "$LANE_RC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
 ck "B7 under the ceiling an unreadable exemption still starts the lane (rc=$LANE_RC) — it is measured, not held" $rc
@@ -612,11 +616,20 @@ ck "B9h …and gh-auth.sh's own export rationale does not repeat the overreach (
 # stand — so pin each half where it is produced: the NOTE carries the token, and the refusal carries its
 # own "HELD, not judged non-urgent" clause. Either half changing reddens this rather than silently
 # re-blurring the two lines a reader is told to distinguish.
+# ⛔ B12'S TITLE USED TO CLAIM BOTH DIRECTIONS WHILE MEASURING ONE (review round 12, P3): a count over
+# the NOTE producers cannot see the refusal, so appending the token to the refusal's HELD clause left B12
+# at 3 AND B12b green — the exact re-blurring this family exists to stop. Each half now has its own arm.
 _notes="$(grep -c '\[land-backlog\] NOTE .*EXEMPTION-UNREADABLE' "$SG")"
 [ "$_notes" -eq 3 ]; rc=$?
-ck "B12 the EXEMPTION-UNREADABLE token is printed by the three NOTE arms ($_notes), not by the refusal" $rc
+ck "B12 the EXEMPTION-UNREADABLE token is printed by the three NOTE arms ($_notes), one per credential outcome" $rc
 grep -q 'is HELD, not judged non-urgent' "$SG"; rc=$?
 ck "B12b …and the refusal says the exemption was HELD, not that the issue was judged non-urgent" $rc
+# The OTHER direction, and it needs its own producer: the refusal must not start printing that token.
+# Measured shape this prevents — add `EXEMPTION-UNREADABLE` to the refusal's HELD clause and B12 stays 3
+# while B12b stays green, i.e. the two lines a reader is told to distinguish become one again.
+_refuse_tok="$(sed -n '/^land_backlog_refuse()/,/^}/p' "$SG" | grep -c 'printf.*EXEMPTION-UNREADABLE')"
+[ "${_refuse_tok:-0}" -eq 0 ]; rc=$?
+ck "B12c …and the REFUSAL prints no EXEMPTION-UNREADABLE token of its own ($_refuse_tok), so the two producers stay separable" $rc
 # B11: THE THIRD OUTCOME OF THE REFUSAL HAS AN ARM — the state where the lane's gh IS credentialed and the
 # read failed for some other reason (`state=ambient` here). ⛔ MEASURED at 47ec2e2d7 before this arm: deleting
 # that outcome's `printf` entirely (its words, arity kept) left the suite at `passed: 82 failed: 0` — five
