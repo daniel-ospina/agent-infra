@@ -126,7 +126,7 @@ orc_state_pick() {
 # to say "six": a list goes stale the moment a reader is added, and the reader written against it
 # updates the list instead of the code. What holds is the SHAPE. Shipped readers take the pid out of
 # the record with `tr -dc '0-9'` — deploy-mac-orchestrator.sh, install-controller-service.sh,
-# orchestrator-bringup.sh, cloud-cell-supervisor.sh (:918, :4597), lib/fleet-inventory.sh,
+# orchestrator-bringup.sh, cloud-cell-supervisor.sh (:942, :4660), lib/fleet-inventory.sh,
 # cloud-cell-doctor.sh, harness-refresh.sh (:325, :1401), launchd-cycle.sh, watchdog-loop.sh, and this
 # module's own `orc_lock_pid` — while ONE reads it with a Bash glob (`harness-refresh.sh:569-570`:
 # `head -1`, then `${_ctrl_pid//[!0-9]/}`, the same digit-concatenation hazard) and TWO read the WHOLE
