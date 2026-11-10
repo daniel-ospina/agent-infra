@@ -2993,6 +2993,25 @@ case "${5:-}" in
     CMUX_TREE_JSON='{"workspaces":[{"id":"ws_p","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_p","layout":{"root":{"tab_ids":["t1","t2"]}}}],"tabs":[{"id":"t1","content_id":"term_A"},{"id":"t2","content_id":"term_B"}],"terminals":[{"id":"term_A","running":false}]}' \
       wt_sweep_idle_workspaces "lane-7"
     printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  multiscreen)
+    # ⛔ A WORKSPACE IS NOT A SCREEN (agent-infra#2312 fix-round review, reproduced). `screens` is
+    # MANY-TO-ONE on `workspace_id` — a workspace holds panes/tabs, each with its own `screen_id` in the
+    # upstream model, which is why the DEFAULT shape dedupes a workspace through `seen`. Emitting one
+    # verdict PER SCREEN let a workspace whose s2 held an EXITED terminal hand the sweep an `idle` row
+    # while its s1 held a RUNNING one, so `cmux workspace rm` ran on a LIVE lane and the line claimed
+    # "their terminals had ALL exited". The delete polarity dedupes for the same reason the census does,
+    # and the most protective verdict over a workspace has to win.
+    unset CMUX_WS_STATE   # the stub prefers CMUX_WS_STATE; this arm's census is the fixture below
+    CMUX_TREE_JSON='{"workspaces":[{"id":"ws_a","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_a","layout":{"root":{"tab_ids":["t1"]}}},{"id":"s2","workspace_id":"ws_a","layout":{"root":{"tab_ids":["t2"]}}}],"tabs":[{"id":"t1","content_id":"term_LIVE"},{"id":"t2","content_id":"term_EXITED"}],"terminals":[{"id":"term_LIVE","running":true},{"id":"term_EXITED","running":false}]}' \
+      wt_sweep_idle_workspaces "lane-7"
+    printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  multiscreenidle)
+    # …and a wholly idle workspace is ONE deletion, not one per screen: the line reports what was ASKED
+    # for, and two screens of one workspace used to ask the daemon to remove the same id twice.
+    unset CMUX_WS_STATE
+    CMUX_TREE_JSON='{"workspaces":[{"id":"ws_b","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_b","layout":{"root":{"tab_ids":["t1"]}}},{"id":"s2","workspace_id":"ws_b","layout":{"root":{"tab_ids":["t2"]}}}],"tabs":[{"id":"t1","content_id":"term_A"},{"id":"t2","content_id":"term_B"}],"terminals":[{"id":"term_A","running":false},{"id":"term_B","running":false}]}' \
+      wt_sweep_idle_workspaces "lane-7"
+    printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
 esac
 SH
 
@@ -3065,6 +3084,18 @@ ck "…and a partially-accounted screen with a RUNNING record still spares the w
 out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s4" "$TMP/cmux2s4.log" partial 2>&1)"
 case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "⛔ a PARTIAL accounting (one tab exited, one resolving to nothing) removes NOTHING — 'idle' needs ALL of them" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s5" "$TMP/cmux2s5.log" multiscreen 2>&1)"
+case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "⛔ one workspace whose s1 is LIVE and s2 EXITED is NEVER swept (a screen row is not a workspace)" $rc
+case "$out" in *SWEPT*) rc=1 ;; *) rc=0 ;; esac
+ck "…and it claims nothing — never 'terminals had ALL exited' over a LIVE one" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s6" "$TMP/cmux2s6.log" multiscreenidle 2>&1)"
+case "$out" in *"rm_calls=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…while a wholly idle workspace is removed ONCE, not once per screen" $rc
+case "$out" in *"remove 1 idle workspace"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and the count says 1 workspace, never 2, for one address" $rc
 
 # NON-VACUITY: the sweep must be REACHED from both ends of a worker's life, not merely defined.
 grep -q '^    wt_sweep_idle_workspaces "$name"$' "$LIB" && rc=0 || rc=1

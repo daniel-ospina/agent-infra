@@ -1342,6 +1342,19 @@ ws={w.get("id"):(w.get("name") or "") for w in d.get("workspaces",[]) or []}
 tabs={t.get("id"):t.get("content_id") for t in d.get("tabs",[]) or []}
 run={t.get("id"):bool(t.get("running")) for t in d.get("terminals",[]) or []}
 seen=[]
+# ⛔ LIVENESS MODE IS PER WORKSPACE, NOT PER SCREEN (agent-infra#2312 fix-round review, reproduced).
+# `screens` is MANY-TO-ONE on `workspace_id` — a workspace holds panes/tabs, each carrying its own
+# `screen_id` in the upstream model, and this module's own default shape already dedupes a workspace
+# through `seen` for exactly that reason. Printing one verdict PER SCREEN made the sweep act on a row
+# that is not a workspace: a workspace whose s1 held a RUNNING terminal and whose s2 held an EXITED one
+# emitted `ws <id> idle`, and `wt_sweep_idle_workspaces` ran `cmux workspace rm` on a LIVE lane — the one
+# thing this file says it never does, printed as "their terminals had ALL exited". It also double-counted
+# a purely idle workspace (two screens ⇒ two `rm` calls and "asked the daemon to remove 2" for one).
+# So: the MOST PROTECTIVE verdict over a workspace's screens wins (`live` > `empty` > `idle`, and any
+# unreadable screen exits 3 before anything is printed), and ONE row per workspace is emitted.
+lv={}
+LV_ORDER=["idle","empty","live"]   # index = strength; a workspace keeps the STRONGEST one
+
 def add(k,v):
     if v and (k,v) not in seen: seen.append((k,v))
 for s in d.get("screens",[]) or []:
@@ -1394,12 +1407,16 @@ for s in d.get("screens",[]) or []:
                 sys.exit(3)
             else:
                 st="idle"
-        print("ws\t%s\t%s" % (wid,st))
+        keep=lv.get(wid)
+        if keep is None or LV_ORDER.index(st) > LV_ORDER.index(keep):
+            lv[wid]=st
         continue
     add("ws",wid)
     for t in ids:
         add("term",tabs.get(t))
 if mode=="liveness":
+    for wid_ in sorted(lv):
+        print("ws\t%s\t%s" % (wid_,lv[wid_]))
     sys.exit(0)
 for k,v in seen:
     print("%s\t%s" % (k,v))

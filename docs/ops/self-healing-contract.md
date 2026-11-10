@@ -558,7 +558,10 @@ frees the idle surfaces of a name before a create and after a close, so the regi
 number of NAMES in use, not by the number of spawns. **What it may destroy:** an EXITED terminal's
 scrollback, and nothing else — it spares `live` (a running terminal), `empty` (a create in flight) and
 any unreadable census, it never runs `cmux server stop --force`, and a worker's durable evidence
-(`$O/logs/<worker>.log`, the run script, the env snapshot) is on disk. **Knobs:** `WT_IDLE_SWEEP_MAX`
+(`$O/logs/<worker>.log`, the run script, the env snapshot) is on disk. The decision is made per
+**WORKSPACE**, never per screen row: a census that lists several screens of one workspace is one
+address, and the MOST PROTECTIVE verdict over its screens wins, so a workspace with one running
+terminal is `live` however many exited ones sit beside it. **Knobs:** `WT_IDLE_SWEEP_MAX`
 (50 per call) and `WT_IDLE_SWEEP=0` to disable it. It re-reads the census after removing and states
 what is STILL there (`could NOT confirm` when the census cannot be read) — it never reports a clearance
 it did not measure, because on the full volume this exists for, `cmux` refuses the mutation and exits 0.
