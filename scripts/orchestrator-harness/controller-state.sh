@@ -122,12 +122,18 @@ orc_state_pick() {
 
 # ── 2. THE SINGLETON ─────────────────────────────────────────────────────────────────────────────
 # The record file stays exactly what it has always been — a bare pid on one line in `$O/.orch.lock` —
-# and that is not laziness. Six shipped readers read it: FOUR with `tr -dc '0-9'`
+# and that is not laziness. ⛔ THE ROSTER IS NOT AN ENUMERATION, and a previous attempt to write one
+# here is how this comment came to say "six": a list goes stale the moment a reader is added, and the
+# reader written against it updates the list instead of the code. What holds is the SHAPE: shipped
+# readers parse the record with `tr -dc '0-9'` — at least eleven call sites across nine files
 # (deploy-mac-orchestrator.sh, install-controller-service.sh, orchestrator-bringup.sh,
-# cloud-cell-supervisor.sh) and TWO by comparing the whole record to a pid with
-# `[ "$(cat …)" = "$pid" ]` (install.sh, selftest.sh). A richer format would
-# make `tr -dc '0-9'` concatenate every digit in the record into a pid that never existed, on the
-# stop path of four tools. So the format is untouched and the IDENTITY lives in the two things the
+# cloud-cell-supervisor.sh, lib/fleet-inventory.sh, cloud-cell-doctor.sh, harness-refresh.sh,
+# launchd-cycle.sh, watchdog-loop.sh; find them all with `git grep -nE "tr -dc ['\"]?0-9" scripts/`,
+# which is the only count that cannot go stale) — and two read the WHOLE record instead: install.sh
+# (`cat`, a non-digit sanitise, then `kill -0`) and selftest.sh (`[ "$(cat …)" = "$pid" ]`, on a
+# fixture it created itself). A richer format would make `tr -dc '0-9'` concatenate every digit in the
+# record into a pid that never existed, on the stop path of every one of those tools. So the format is
+# untouched and the IDENTITY lives in the two things the
 # file already has: its pid, and its mtime.
 
 # _orc_record_path_ok <path> — 0 when opening this path as the lock record CANNOT BLOCK: absent, or a
