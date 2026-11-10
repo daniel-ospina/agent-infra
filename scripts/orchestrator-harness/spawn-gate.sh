@@ -4329,8 +4329,23 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # refusal blamed the PR queue.
   # SCOPE, STATED — THESE THREE ARE THIS `run_agent`'S ONLY CALLERS. Resolving here covers `lane.sh:895`,
   # `fix-one.sh:838` and `nonblocking-dispatch.sh:346`, and the export is INHERITED by the `pi` this
-  # function starts and by `wt_spawn`'s launch line — so the store the gate read and the store the lane
+  # function starts — so, for those three dispatches, the store the gate read and the store the lane
   # reads are the same one by construction.
+  # ⛔ `wt_spawn`'S LAUNCH LINE IS A DIFFERENT MECHANISM, AND THE INHERITANCE RUNS THE OTHER WAY (review
+  # round 10, P3 — this block used to claim the export reached it, which no path can satisfy). `wt_spawn`
+  # (`worker-terminal.sh:1868`) COMPOSES the pane's environment through `wt_launcher_env` (`:817`) in the
+  # CONTROLLER's process, BEFORE this function has run, and `:1074-1081` composes it from the CALLER's
+  # `GH_CONFIG_DIR`/`XDG_CONFIG_HOME` — which, in the shape this module resolves (`run_agent`'s own export,
+  # so the controller's env carries neither), emits an ACTIVE CLEAR: `; unset GH_CONFIG_DIR XDG_CONFIG_HOME`.
+  # Nothing downstream of this function calls `wt_spawn` at all (`grep -n wt_spawn` over `spawn-gate.sh`,
+  # `lane.sh`, `fix-one.sh` and `nonblocking-dispatch.sh` returns two COMMENT lines and no invocation), so
+  # `wt_spawn → lane.sh → run_agent → pi` is the only order that exists and the export cannot travel up it.
+  # ⛔ SO #2509'S FINDING-1 ARM IS UNTOUCHED BY THIS CHANGE: `wt_spawn` REFUSING a `keys.env`-provided
+  # `GH_CONFIG_DIR` is `worker-terminal.sh`'s own `_guard` (`:1127-1140` — `gh auth token` with the
+  # 93/96/97/98 vocabulary) built from the LAUNCH-TIME environment. That is the opposite arm, on the other
+  # side of a boundary this resolution never crosses, and it is stated rather than implied because a
+  # comment claiming a guard it does not have reads exactly like one that has it — `gh-auth.test.sh`'s
+  # B9e-B9h pin this boundary against BOTH the text and the tree.
   # ⛔ THE SENTENCE THAT STOOD HERE CLAIMED THIS `run_agent` WAS THE ONE INVOCATION EVERY WORKER GOES
   # THROUGH, AND THE TREE FALSIFIES IT (review round 9, P3): `merge-one.sh` carries its OWN `run_agent()`
   # — the declared #2208 residual, `:512` — and its chain-reviewer spawn (`:1961`), the one whose record

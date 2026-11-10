@@ -580,6 +580,31 @@ printf '%s\n' "$_place" | grep -q 'merge-one\.sh'; rc=$?
 ck "B9c …so the block NAMES merge-one.sh as a path this resolution does not reach" $rc
 printf '%s\n' "$_place" | grep -q 'single invocation every worker goes through' && rc=1 || rc=0
 ck "B9d …and no longer calls this run_agent the single invocation every worker goes through" $rc
+# B9e-B9h: THE OTHER HALF OF THE SAME BOUNDARY (review round 10, P3). The block ALSO claimed the export was
+# "INHERITED … by `wt_spawn`'s launch line", and the tree falsifies it in the STRONGEST direction: that
+# launch line is composed in the CONTROLLER's process before `run_agent` exists, and its default arm
+# ACTIVELY UNSETS both variables. Every B9 arm above stayed GREEN while that sentence was false — which is
+# why the round that rewrote the sentence beside it did not catch this one. So the boundary gets its own
+# arms: one on the TEXT, one on the FALSE clause's absence, one on the TREE fact the text rests on, and one
+# on the second place the same overreach was written (`gh-auth.sh`'s export rationale).
+# ⛔ THE BLOCK IS WRAPPED, SO LINE-ANCHORED GREPS CANNOT SEE A CLAUSE. Flatten it first (`#` markers
+# stripped, newlines folded) — a per-line grep here would be an arm that cannot fail on the very sentence
+# it is written to pin, which is the class A12 and B10d are on this suite's record for.
+_place_flat="$(printf '%s\n' "$_place" | sed -e 's/^[[:space:]]*#[[:space:]]*//' | tr '\n' ' ' | tr -s ' ')"
+printf '%s' "$_place_flat" | grep -q 'DIFFERENT MECHANISM'; rc=$?
+ck "B9e …and NAMES wt_spawn's launch line as a DIFFERENT mechanism, not one this export can reach" $rc
+printf '%s' "$_place_flat" | grep -q 'INHERITED by the `pi` this function starts and by' && rc=1 || rc=0
+ck "B9f …and no longer claims the export is INHERITED by that launch line (the round-10 false clause)" $rc
+# The tree fact the paragraph rests on, asserted in BOTH halves: nothing in spawn-gate.sh CALLS wt_spawn (so
+# the export cannot travel up into a launch line), and `wt_launcher_env`'s default arm still CLEARS both
+# variables (so a reader can verify the "different mechanism" claim without leaving the repo). If either
+# changes, this reddens until the comment stops saying it.
+{ [ -z "$(grep -nE '^[[:space:]]*wt_spawn[[:space:]]' "$SG")" ] \
+  && grep -q '; unset GH_CONFIG_DIR XDG_CONFIG_HOME' "$HERE/worker-terminal.sh"; }; rc=$?
+ck "B9g …because the tree agrees: spawn-gate.sh makes no wt_spawn CALL, and wt_launcher_env's default arm still CLEARS both variables" $rc
+_gha_flat="$(sed -e 's/^[[:space:]]*#[[:space:]]*//' "$GH_AUTH" | tr '\n' ' ' | tr -s ' ')"
+printf '%s' "$_gha_flat" | grep -q 'launch line reads `GH_CONFIG_DIR`' && rc=1 || rc=0
+ck "B9h …and gh-auth.sh's own export rationale does not repeat the overreach (its chain is run_agent → pi, not wt_spawn)" $rc
 # B11: THE THIRD OUTCOME OF THE REFUSAL HAS AN ARM — the state where the lane's gh IS credentialed and the
 # read failed for some other reason (`state=ambient` here). ⛔ MEASURED at 47ec2e2d7 before this arm: deleting
 # that outcome's `printf` entirely (its words, arity kept) left the suite at `passed: 82 failed: 0` — five

@@ -295,10 +295,12 @@ gh_auth_resolve() {
 # and hide a later `HOME` change), `home-xdg` is NOT gh's default — a set `XDG_CONFIG_HOME` outranks
 # `$HOME/.config/gh` — so it is one of the exporting arms, and `ambient*`/`token` are the caller's own
 # settings.
-# ⛔ AND THE EXPORT IS WHAT MAKES THE PROBE AND THE WORKER AGREE: `run_agent` inherits this process's
-# environment into the lane it starts, and `wt_spawn`'s launch line reads `GH_CONFIG_DIR`/`XDG_CONFIG_HOME`
-# from ITS env — so resolving here without exporting would let the gate read one store and the lane
-# another (the half-pinned shape `worker-terminal.sh` refuses one layer down).
+# ⛔ AND THE EXPORT IS WHAT MAKES THE PROBE AND THE WORKER AGREE: `run_agent` starts `pi` as its CHILD, so
+# the export lands in the environment the agent itself runs in — resolving here without exporting would
+# let the gate read one store and the lane another (the half-pinned shape `worker-terminal.sh` refuses one
+# layer down). ⛔ `wt_spawn`'S LAUNCH LINE IS NOT PART OF THIS CHAIN AND CANNOT BE: it composes the pane's
+# environment in the CONTROLLER's process, before this module runs at all (the placement block in
+# `spawn-gate.sh` states that boundary and names the mechanism; B9e-B9h of the suite pin it).
 GH_AUTH_STATE=""; GH_AUTH_DIR=""
 gh_auth_ensure() {
   local r
