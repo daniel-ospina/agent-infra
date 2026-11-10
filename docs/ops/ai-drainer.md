@@ -93,13 +93,20 @@ nothing, and it exits 0):
    the only census that sees **durable-terminal** lanes — no pidfile names them and `pgrep` cannot see
    them). A stale module is named (`launcher census unavailable: …`) rather than read as "no workers".
    ⛔ The launcher half is an **upper bound**, clamped to the lane processes actually present
-   (`launcher = min(wt_count, live lane processes)`), because `wt_count` counts the cmux daemon's
+   (`launcher = min(wt_count, live lane processes − the dispatcher's share of them)`), because `wt_count`
+   counts the cmux daemon's
    `terminals[].running` — *a shell is running in that terminal*, i.e. UI liveness — so a `wt-*`
    terminal whose `pi` has exited counted as a live lane **for ever** and the tick stood down with exit
    0 on a box with idle capacity (measured 2026-11-10 on pi-cell-3: `alive=36 (dispatcher=2
    launcher=34)` against **9** live `pi` processes — agent-infra#3882). When the clamp fires it is its
-   own line, `census-mismatch launcher=34 pi=9 clamped=9`, so the drift is visible without reading
-   code. ⛔ When the **process** count is unreadable the clamp does **not** apply and `wt_count` stands
+   own line, `census-mismatch launcher=34 pi=9 clamped=9 disp=0`, so the drift is visible without reading
+   code (`pi=` is the whole box's lane-shaped PROCESSES, not the launcher's share; `disp=` is the overlap
+   removed). ⛔ The two halves are **disjoint**: the process count covers the dispatcher's own
+   `bash …/nonblocking-dispatch.sh` subshells too, so `alive = dispatcher + launcher` is only a lane
+   count because the launcher clamp subtracts the overlap — an unsubtracted sum counted every live
+   dispatcher lane twice and stood a 10-lane cell down at 11 with a slot free (agent-infra#3886). A
+   dispatcher lane's CHILD `pi` is still in the launcher half (no pidfile names it), exactly as any
+   lane's own children are: this is a process bound, not a lane census. ⛔ When the **process** count is unreadable the clamp does **not** apply and `wt_count` stands
    unchanged: the fleet's polarity is *unknown is alive*, and the census is the only thing bounding the
    lane total, so an unreadable probe must never read as "no lanes" (that is the over-dispatch
    direction; it dispatched 7 lanes in the suite's mutant of exactly that change). "Unreadable" means

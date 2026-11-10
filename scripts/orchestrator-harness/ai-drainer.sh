@@ -719,21 +719,35 @@ _counts_as_lane() { # <command-line>
   [ "$had_f" = "1" ] || set +f
   return "$rc"
 }
-_census_dispatcher() { # prints the count of live dispatcher lanes
-  local f p c n=0
+_census_dispatcher() { # prints "<alive> <overlap>" — dispatcher lanes, then how many of them the
+  #                        LAUNCHER predicate also counts (the intersection `_census_launcher` removes)
+  local f p c n=0 ov=0 seen=" "
   for f in "$O"/bg/*.pid; do
     [ -f "$f" ] || continue
     p="$(tr -dc '0-9' 2>/dev/null <"$f")"
     [ -n "$p" ] || continue
     kill -0 "$p" 2>/dev/null || continue          # a dead pidfile is not a lane
+    # ⛔ A PID NAMED BY TWO PIDFILES IS ONE PROCESS. The overlap below is SUBTRACTED from the
+    # launcher's process count, so counting one process twice here would under-read the launcher's
+    # share — the over-dispatch direction, which is the expensive one (#3886 review, P2-1).
+    case "$seen" in *" $p "*) continue ;; esac
+    seen="$seen$p "
     c="$("$PS" -p "$p" -o command= 2>/dev/null | head -1)"
     # ⛔ AN UNREADABLE COMMAND LINE IS ALIVE (the fleet's own liveness polarity: unknown is alive).
     # Counting it as absent was the over-dispatch direction, and the census is now the ONLY thing
     # bounding the lane total (the lock no longer is) — so a `ps` that cannot answer (absent under the
     # unit's PATH, `hidepid`, another uid) must never read as "no lanes".
     if [ -z "$c" ]; then n=$((n + 1)); elif _counts_as_lane "$c"; then n=$((n + 1)); fi
+    # ⛔ THE OVERLAP, measured on the SAME argv read above (no second `ps`). `_live_lane_processes`
+    # counts EVERY lane-shaped process on the box, so a dispatcher lane's own
+    # `bash …/nonblocking-dispatch.sh …` subshell sits inside `procs` too — subtracting the dispatcher
+    # count from `procs` without this would remove a process `procs` may never have held (an unreadable
+    # argv: `n` counts it, the launcher predicate cannot) and under-read the launcher's share. An
+    # UNREADABLE argv is therefore NOT part of the overlap: unknown stays counted on the dispatcher's
+    # side only, which is the safe direction.
+    if [ -n "$c" ] && _is_lane_process "$c"; then ov=$((ov + 1)); fi
   done
-  printf '%s' "$n"
+  printf '%s %s' "$n" "$ov"
 }
 # ⛔ THE LAUNCHER MODULE IS SOURCED THE WAY THE CONTROLLER SOURCES IT (orch-loop.sh): from `$O` first,
 # then beside this script, then the verbs AND the embedded-python data are checked. A module that
@@ -775,8 +789,20 @@ fi
 # wrapper — reads 0 and the clamp then lowers a real count, which is the OVER-DISPATCH direction. The
 # alternative (treating an answered probe as unreadable) restores the original bug, so the trade is
 # deliberate; it is stated here and in docs/ops/ai-drainer.md rather than left implied.
-# When it fires it is LOUD — `census-mismatch launcher=34 pi=9 clamped=9` — so the drift is visible in
-# the log instead of silently suppressing dispatch.
+# When it fires it is LOUD — `census-mismatch launcher=34 pi=9 clamped=9 disp=0` — so the drift is
+# visible in the log instead of silently suppressing dispatch.
+#
+# ⛔ THE TWO HALVES ARE DISJOINT, AND THAT IS THE ARGUMENT OF THIS BLOCK (#3886 review, P2-1). `procs`
+# counts EVERY lane-shaped process on the box, so a live dispatcher lane is already in it; summing
+# `disp_alive + min(wt_count, procs)` therefore counted each live dispatcher lane TWICE and over-stated
+# the total by `disp_alive`. Harmless against a big target, fatal on a cell (MAX_LANES = 2.5 × 4 = 10):
+# `disp_alive=2` + `procs=9` ⇒ `alive=11 > 10` ⇒ the tick dispatched nothing with a slot free — the
+# stand-down #3882 exists to end, one term smaller. So the clamp bounds the LAUNCHER's share only:
+#   launcher = min(wt_count, procs − overlap)      # overlap = pidfile processes `procs` also counts
+#   alive    = disp_alive + launcher               # disjoint by construction
+# The subtraction is the INTERSECTION (inclusion–exclusion), never `disp_alive`: a pidfile whose argv
+# the launcher predicate cannot read is counted as a dispatcher lane and NOT subtracted, which is the
+# safe direction (over-count → fewer dispatches) rather than an under-read (`_census_dispatcher`).
 #
 # ⛔ UNKNOWN IS ALIVE (the polarity the dispatcher census above states, and the reason this is safe):
 # when the PROCESS count cannot be measured the clamp does NOT apply and `wt_count` is returned
@@ -846,8 +872,10 @@ _live_lane_processes() { # prints the count of live lane processes, or nothing w
   done <<<"$out"
   printf '%s' "$n"
 }
-_census_launcher() { # prints the count, or nothing when unreadable
-  local n wtn procs
+_census_launcher() { # <dispatcher-overlap> — prints the count, or nothing when unreadable
+  local n wtn procs share ov
+  ov="${1:-0}"
+  case "$ov" in ''|*[!0-9]*) ov=0 ;; esac
   wtn="$(wt_count lane- fix- merge- chain- 2>/dev/null)"
   case "$wtn" in ''|*[!0-9]*) return 1 ;; esac
   n="$wtn"
@@ -855,13 +883,30 @@ _census_launcher() { # prints the count, or nothing when unreadable
   procs="$(_live_lane_processes)" || procs=""
   case "$procs" in
     ''|*[!0-9]*) : ;;
-    *) if [ "$procs" -lt "$wtn" ]; then
-         n="$procs"
+    *) # ⛔ INCLUSION–EXCLUSION, NOT A SUM (#3886 review, P2-1). `procs` counts BOTH populations, so the
+       # dispatcher's share of it is removed before it bounds the LAUNCHER's: a live dispatcher lane is
+       # in `disp_alive` AND in `procs`, and clamping against the un-subtracted `procs` over-stated the
+       # launcher half by exactly that share. MEASURED shape on the issue's own cell (MAX_LANES = 2.5 × 4
+       # = 10): disp_alive=2 + min(34, 9) ⇒ alive=11 > 10 ⇒ the tick dispatched NOTHING with a slot free
+       # — the same stand-down #3882 exists to end, one term smaller, and `census-mismatch` could not show
+       # it (`pi=` was truthful; the SUM was not).
+       # The overlap SUBTRACTED is the intersection, not `disp_alive`: only a pidfile process whose argv
+       # the launcher predicate actually counts is known to be inside `procs`.
+       # ⛔ STILL OVER-INCLUSIVE, stated rather than implied: a dispatcher lane's CHILD processes (the
+       # `pi` a `nonblocking-dispatch.sh` subshell spawns) are not named by its pidfile, so they remain in
+       # this half — just as any launcher lane's own children do. The count is a process bound, never a
+       # lane count.
+       share="$procs"
+       [ "$ov" -le "$share" ] || ov="$share"          # cannot subtract more processes than were counted
+       share=$((share - ov))
+       if [ "$share" -lt "$wtn" ]; then
+         n="$share"
          # ⛔ LOGGED HERE, not by the caller, because the caller reads this function through a COMMAND
          # SUBSTITUTION (a subshell) — a value returned that way would never be seen by it, so a caller
          # that logged the drift would log nothing and the clamp would apply silently. `log_line`
          # appends to `$LOG`, which the subshell can write.
-         log_line "census-mismatch launcher=$wtn pi=$procs clamped=$procs"
+         # `disp=` is the overlap removed, so `pi=` is not read as the launcher's share (it is the BOX's).
+         log_line "census-mismatch launcher=$wtn pi=$procs clamped=$n disp=$ov"
        fi ;;
   esac
   printf '%s' "$n"
@@ -1011,10 +1056,14 @@ trap _on_signal INT TERM
 
 # The census runs INSIDE the lock (it is part of the decision the lock protects) and AFTER settle, so a
 # lane that just died is no longer counted.
-disp_alive="$(_census_dispatcher)"
+# `disp_shared` is the part of `procs` the dispatcher already accounts for; `_census_launcher` removes it
+# so the two halves are disjoint and `alive` below is a sum of DISJOINT populations (#3886 review, P2-1).
+read -r disp_alive disp_shared <<<"$(_census_dispatcher)"
+case "${disp_alive:-}" in ''|*[!0-9]*) disp_alive=0 ;; esac
+case "${disp_shared:-}" in ''|*[!0-9]*) disp_shared=0 ;; esac
 lau_alive=""; lau_note=""
 if [ "$CENSUS_LAUNCHER" = "1" ]; then
-  lau_alive="$(_census_launcher)" || lau_alive=""
+  lau_alive="$(_census_launcher "$disp_shared")" || lau_alive=""
   case "$lau_alive" in
     ''|*[!0-9]*) lau_note="launcher census UNREADABLE (wt_count gave '${lau_alive}') — counted dispatcher lanes only"; lau_alive="" ;;
   esac
@@ -1036,6 +1085,8 @@ if [ "$CENSUS_LAUNCHER" = "1" ] && [ "${lau_alive:-0}" -eq 0 ]; then
     finish 1
   fi
 fi
+# ⛔ `disp_alive` and `lau_alive` are DISJOINT (the launcher clamp removed the dispatcher's share of the
+# process count — see `_census_launcher`), which is the only reason a plain sum is the live-lane count.
 lanes=$((disp_alive + ${lau_alive:-0}))
 alive_src="dispatcher=$disp_alive"
 [ -n "$lau_alive" ] && alive_src="$alive_src launcher=$lau_alive"

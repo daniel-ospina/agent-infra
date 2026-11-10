@@ -548,10 +548,13 @@ check "(s) 34 terminal rows + 9 lane processes → the census is CLAMPED to 9" \
 check "(s) …and it DISPATCHES into the capacity the phantom terminals were hiding" \
   '[ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 1 ]' "dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
 check "(s) …and the drift is LOUD, on its OWN line (the issue's indicator 3)" \
-  'grep -q "census-mismatch launcher=34 pi=9 clamped=9" "$LAST_AI/logs/ai-drainer.log"' \
+  'grep -q "census-mismatch launcher=34 pi=9 clamped=9 disp=0" "$LAST_AI/logs/ai-drainer.log"' \
   "$(grep -c "census-mismatch" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null) mismatch line(s)"
-check "(s) …and that line is SEPARATE from the alive= summary (not folded into it)" \
-  '! grep -q "alive=[0-9]* .*census-mismatch" "$LAST_AI/logs/ai-drainer.log"'
+# ⛔ THE "SEPARATE FROM alive=" ASSERTION THAT LIVED HERE IS DELETED (#3886 review, P2-2), not reworded:
+# `! grep -q "alive=[0-9]* .*census-mismatch"` PASSED on the PRE-FIX code and no mutation of this diff
+# could redden it — `log_line` writes its own timestamped line and the `alive=` builder is unchanged, so
+# the two can never merge. The positive assertion directly above is the whole claim (if the line is
+# missing, it fails), so the dead one only told the next reader indicator 3 was covered twice.
 
 reset_run
 # ── (s2) A CENSUS THAT IS RIGHT SAYS NOTHING (no noise on the healthy path) ────────────────────
@@ -672,6 +675,47 @@ run_drainer_fg s6
 check "(s6) the DISPATCHER census does not expand a wildcard into a lane either" \
   'grep -q "alive=0 (dispatcher=0 launcher=0)" "$LAST_AI/logs/ai-drainer.log"' \
   "$(grep -E "alive=" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
+# ── (s7) ⛔ THE TWO POPULATIONS COMPOSED: NO LANE IS COUNTED TWICE (#3886 review, P2-1) ─────────
+# Every arm above runs with `dispatcher=0` (no live pidfile), and the only one WITH a live pidfile —
+# `(s6)` — has `wt_count=0`. So the shipped arithmetic `alive = disp_alive + min(wt_count, procs)` was
+# never exercised with both terms non-zero, and it counted each live dispatcher lane TWICE: once in
+# `disp_alive`, and again in `procs` (the SAME `bash …/nonblocking-dispatch.sh` subshell). The safe
+# direction is over-count, but over-count STANDS THE TICK DOWN — on a cell (MAX_LANES = 2.5 × 4 = 10)
+# `disp_alive=2` + `procs=9` ⇒ `alive=11 > 10` with a slot free, which is the exact failure #3882 exists
+# to end, one term smaller. `census-mismatch` could not reveal it: its `pi=` was truthful, the SUM was not.
+# Here: 1 live dispatcher lane, 34 terminal rows, 3 lane-shaped processes (the planted lane's own argv +
+# 2 real launcher lanes). Disjoint arithmetic ⇒ launcher = min(34, 3 − 1) = 2, alive = 1 + 2 = 3 ⇒ one
+# of a 4-target dispatched. The pre-fix code reads alive = 1 + min(34, 3) = 4 ⇒ dispatched 0: the mutant
+# of this fix reddens exactly these rows.
+o="$ROOT/o-s7"; ai="$ROOT/ai-s7"; mkdir -p "$o/bg" "$ai"
+plant_lane s7 1 >/dev/null
+cat >"$STUB/worker-terminal.sh" <<'WT_EOF'
+WT_TREE_PY="stub"; WT_WS_PY="stub"
+wt_table() { printf 'lane-1\talive\n'; }
+wt_count() { printf '34\n'; }
+WT_EOF
+# `-p` delegates to the REAL ps (the planted lane is a real process, and the dispatcher census reads its
+# argv); `-A` is the injected population, and it CONTAINS that lane's argv — which is the whole point.
+cat >"$ROOT/ps-composed" <<PSC_EOF
+#!/usr/bin/env bash
+case "\$*" in *"-p "*) exec ps "\$@" ;; esac
+printf '%s\n' "bash $ROOT/nonblocking-dispatch.sh 60 0 /dev/null"
+printf '%s\n' "/usr/local/bin/pi -p --provider deepseek --model deepseek-flash brief-0"
+printf '%s\n' "/usr/local/bin/pi -p --provider deepseek --model deepseek-flash brief-1"
+PSC_EOF
+chmod +x "$ROOT/ps-composed"
+RUN_WT_MOD="$STUB/worker-terminal.sh" RUN_PS="$ROOT/ps-composed" RUN_TARGET=4
+run_drainer_fg s7
+check "(s7) a live dispatcher lane is NOT counted twice: alive=3, not 4" \
+  'grep -q "alive=3 (dispatcher=1 launcher=2)" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep "START:" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(s7) …so the tick DISPATCHES into the slot the double count was hiding" \
+  '[ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 1 ]' "dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+check "(s7) …and the mismatch line carries the overlap, so pi= is not read as the launcher's share" \
+  'grep -q "census-mismatch launcher=34 pi=3 clamped=2 disp=1" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep "census-mismatch" "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
 # ── ARM (g): THE VERDICT — a lane's own exit status, settled by the NEXT tick ────────────────
