@@ -34,6 +34,13 @@
 #   §27 the spawn budget is O(1) in the record count (#3180)
 #   §28 the pre-pass's `join` is pinned to the collation its inputs were sorted with, and a
 #       pre-pass that cannot be computed is NAMED rather than reported as converged (#3249 P1)
+#   §29 field() is the READER's parse (top level), not a last-match string scan — the fix for
+#       the two-parsers defect that let a nested value decide rule 1 and rule 3 (#2510)
+#   §30/31 rule 1 on push and on pull: a nested stamp cannot make a record look newer than the
+#       reader sees it (the direction that loses a newer record, unrecoverably)
+#   §32 a newer-but-UNUSABLE local record is named with the real remedy, not reported as a
+#       converged `keep` (pull can never repair it — #2510 P2)
+#   §33 compare+write is serialised by a bounded, reclaimable lock (#2510 P2)
 
 set -uo pipefail
 
@@ -805,6 +812,132 @@ assert_eq "$LC_RC" "0" "§28b a pre-pass that cannot be computed STILL converges
 assert_contains "$LC_LAST" "the converged pre-pass could not run" "§28b ...and the fallback is NAMED instead of silently reported as converged"
 assert_contains "$LC_LAST" "unchanged=0" "§28b ...reporting ZERO skipped rather than a count it did not compute"
 assert_contains "$LC_LAST" "same=12" "§28b ...and every record still converges through the per-record path"
+
+# ═══ 29. `field()` IS the reader's parse (#2510, #2374) ═════════════════════════════════
+# Every rule in this file is decided through `field`, while the gate that CONSUMES the same record
+# (`read_record` in atomic-land.sh, `review-enforcer`) parses it as STRICT JSON and takes the
+# TOP-LEVEL value. Two definitions of one artifact let a NESTED value answer for the top level:
+# measured pre-fix on this box, a record carrying an `evidence` object read back `reviewed_at`,
+# `repo` and `pr` from INSIDE it — so rule 3's key check passed a record belonging to another repo
+# and rule 1 ranked the store's newer record as older. These arms pin the CONTRACT directly, by
+# EXTRACTING the two functions from the source (never executing the script).
+echo "── §29 field() is the reader's own parse (top level), not a last-match string scan"
+FIELD_FN="$(sed -n '/^field() {/,/^}/p;/^_field_json() {/,/^}/p' "$SYNC")"
+if [ -n "$FIELD_FN" ]; then ok "§29 (premise) field()/_field_json() are extractable from $SYNC"
+else bad "§29 could not extract field() — every arm below would assert nothing"; fi
+# shellcheck disable=SC1090
+eval "$FIELD_FN"
+NESTED="$T/nested-record.json"
+printf '{"pr":999,"head_sha":"%s","verdict":"clean","repo":"other/repo","reviewed_at":"2099-01-01T00:00:00Z","evidence":{"repo":"daniel-ospina/agent-infra","pr":2374,"reviewed_at":"2000-01-01T00:00:00Z"}}\n' \
+  "$HEAD_A" > "$NESTED"
+assert_eq "$(field "$NESTED" reviewed_at)" "2099-01-01T00:00:00Z" \
+  "§29 a nested reviewed_at cannot answer for the top level (rule 1 reads this)"
+assert_eq "$(field "$NESTED" repo)" "other/repo" \
+  "§29 ...nor a nested repo (rule 3's key check reads this)"
+assert_eq "$(field "$NESTED" pr)" "999" "§29 ...nor a nested pr"
+# AGREEMENT, DERIVED FROM THE READER rather than hardcoded: for every field this file reads, `field`
+# must equal what `json.load` returns at the TOP level. This is the property, not a value list.
+if command -v python3 >/dev/null 2>&1; then
+  for f in reviewed_at repo pr head_sha verdict; do
+    WANT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$NESTED" "$f")"
+    assert_eq "$(field "$NESTED" "$f")" "$WANT" "§29 field() agrees with json.load on the top-level $f"
+  done
+else
+  ok "§29 (skipped) no python3 on this box — the reader cannot exist here, so there is nothing to agree with"
+fi
+# A FLAT record (the shape record-review.sh writes) must not pay for any of this: it is read
+# spawn-free, and a repeated key still resolves the way json.load resolves it (LAST wins).
+DUP="$T/dup-record.json"; printf '{"pr":1,"pr":2,"verdict":"clean"}' > "$DUP"
+assert_eq "$(field "$DUP" pr)" "2" "§29 a flat record's repeated key resolves to the LAST occurrence"
+assert_eq "$(field "$DUP" verdict)" "clean" "§29 ...and a neighbouring field is still read"
+# MULTI-LINE JSON: a per-LINE scan cannot see the top level at all, so this shape must take the
+# reader's parse too. Pre-fix this answered `nested/repo`; the top level says `top/repo`.
+MULTI="$T/multi-record.json"
+printf '{\n  "pr": 7,\n  "e": {"repo": "nested/repo"},\n  "repo": "top/repo"\n}\n' > "$MULTI"
+assert_eq "$(field "$MULTI" repo)" "top/repo" "§29 a multi-line record is read at its TOP level, not line-wise"
+
+# ═══ 30. rule 1 on PUSH: a nested stamp cannot make the store's NEWER record look older ══
+# The direction the issue measured: the STORE's record is the reader's NEWEST (top-level 2027) while
+# a nested object says 2020. Pre-fix `field` read the nested 2020, so this box's OLDER record won the
+# comparison and FORCE-REPLACED the store's newer one — unrecoverable (one record per PR, no delete
+# path, no history).
+echo "── §30 rule 1 (push) does not lose the store's newer record to a nested stamp"
+KEYE="daniel-ospina-agent-infra-1515"
+ORIGIN6="$T/origin6.git"; STORE6="$T/store6"; BOX8="$T/box8"
+git init -q --bare "$ORIGIN6"
+mkdir -p "$STORE6" "$BOX8"
+git -C "$STORE6" init -q
+git -C "$STORE6" remote add origin "$ORIGIN6"
+git -C "$STORE6" config user.email sync@test.invalid
+git -C "$STORE6" config user.name  sync-test
+git -C "$STORE6" commit -q --allow-empty -m seed
+git -C "$STORE6" push -q origin HEAD:refs/heads/main
+seed_payload "$STORE6" "$KEYE" \
+  "{\"pr\":1515,\"head_sha\":\"$HEAD_C\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2027-01-01T00:00:00Z\",\"evidence\":{\"pr\":1515,\"reviewed_at\":\"2020-01-01T00:00:00Z\"}}"
+mint "$BOX8" "$KEYE" "2026-01-01T00:00:00Z" "$HEAD_A" "daniel-ospina/agent-infra" 1515
+PUSH6="$(rsx "$STORE6" "$BOX8" push 2>&1)"; PUSH6_RC=$?
+assert_eq "$PUSH6_RC" "0" "§30 the push run itself exits 0"
+assert_contains "$PUSH6" "the peer is NEWER" "§30 ...the store's record reads as NEWER (its TOP-LEVEL stamp)"
+STORE6_REF="$(git -C "$STORE6" ls-remote --refs origin "refs/reviews/$KEYE")"
+if [ -n "$STORE6_REF" ]; then ok "§30 (premise) the store still holds the ref"; else bad "§30 (premise) the store lost the ref — the arm below would pass vacuously"; fi
+STORE6_REC="$(git -C "$STORE6" show "refs/reviews/$KEYE:record.json" 2>/dev/null)"
+assert_contains "$STORE6_REC" "2027-01-01T00:00:00Z" \
+  "§30 the store's reader-visible NEWER record SURVIVED the push"
+
+# ═══ 31. rule 1 on PULL: a nested stamp cannot install a record whose TOP level is older ══
+echo "── §31 rule 1 (pull) does not install a record whose TOP-LEVEL stamp is older"
+seed_payload "$STORE6" "$KEYE" \
+  "{\"pr\":1515,\"head_sha\":\"$HEAD_B\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2020-01-01T00:00:00Z\",\"evidence\":{\"pr\":1515,\"reviewed_at\":\"2030-01-01T00:00:00Z\"}}"
+mint "$BOX8" "$KEYE" "2026-01-01T00:00:00Z" "$HEAD_A" "daniel-ospina/agent-infra" 1515
+LOCAL31="$(command cat "$BOX8/$KEYE.json")"
+PULL6="$(rsx "$STORE6" "$BOX8" pull 2>&1)"; PULL6_RC=$?
+assert_eq "$PULL6_RC" "0" "§31 the pull run itself exits 0"
+assert_contains "$PULL6" "this box is NEWER" "§31 ...and this box's record is the NEWER one to the READER"
+assert_eq "$(command cat "$BOX8/$KEYE.json")" "$LOCAL31" \
+  "§31 this box's NEWER record SURVIVED (a nested 2030 did not let an older peer win)"
+
+# ═══ 32. a NEWER but UNUSABLE local record NAMES the real defect and the real remedy ═══
+# Rule 1 keeps the newer bytes, so an unusable-but-newer local record wins for ever — while
+# atomic-land.sh's refusal for exactly that state tells the lane to run `pull`, a verb that can never
+# help it. Pre-fix the run reported `keep … this box is NEWER` and exited 0: a converged-looking pass
+# over a record the rail cannot read (#2510 P2).
+echo "── §32 a newer-but-unusable LOCAL record is named, not reported as a converged keep"
+printf '{"pr":1515,"verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2027-06-01T00:00:00Z"}\n' \
+  > "$BOX8/$KEYE.json"                        # newer, but no head_sha ⇒ `read_record` refuses it
+UNUSABLE32="$(command cat "$BOX8/$KEYE.json")"
+seed_payload "$STORE6" "$KEYE" \
+  "{\"pr\":1515,\"head_sha\":\"$HEAD_B\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2026-12-01T00:00:00Z\"}"
+U32="$(rsx "$STORE6" "$BOX8" pull 2>&1)"; U32_RC=$?
+assert_eq "$U32_RC" "4" "§32 a newer-but-unusable LOCAL record is exit 4, not a converged rc 0"
+assert_contains "$U32" "NOT one its own rail can use" "§32 ...and the run NAMES the real defect"
+assert_contains "$U32" "cannot repair it" "§32 ...and says \`pull\` cannot be the remedy"
+assert_eq "$(command cat "$BOX8/$KEYE.json")" "$UNUSABLE32" \
+  "§32 ...and rule 1 still holds: the newer bytes are NOT overwritten"
+
+# ═══ 33. the compare+write is serialised ════════════════════════════════════════════════
+# A record minted between the comparison and the rename was silently replaced by the peer's older
+# bytes — rule 1 lost to a race, unrecoverably. The lock is per key, bounded, and reclaimable, and a
+# run that cannot take it must FAIL rather than write on a comparison it could not serialise.
+echo "── §33 compare+write is serialised (bounded, reclaimable, and never a silent write)"
+mint "$BOX8" "$KEYE" "2026-01-01T00:00:00Z" "$HEAD_A" "daniel-ospina/agent-infra" 1515
+seed_payload "$STORE6" "$KEYE" \
+  "{\"pr\":1515,\"head_sha\":\"$HEAD_C\",\"verdict\":\"clean\",\"repo\":\"daniel-ospina/agent-infra\",\"reviewed_at\":\"2027-01-01T00:00:00Z\"}"
+mkdir -p "$BOX8/.registry-sync.lock"
+printf '%s\n' "$$" > "$BOX8/.registry-sync.lock/pid"   # a LIVE holder
+LOCKED33="$(command cat "$BOX8/$KEYE.json")"
+L33="$(rsx "$STORE6" "$BOX8" pull 2>&1)"; L33_RC=$?
+assert_eq "$L33_RC" "1" "§33 a held lock is a FAILED run (rc 1), never a silent success"
+assert_contains "$L33" "could not serialise" "§33 ...and the skip is NAMED"
+assert_contains "$L33" "NOTHING was written" "§33 ...and says nothing was written"
+assert_eq "$(command cat "$BOX8/$KEYE.json")" "$LOCKED33" "§33 ...and the record is untouched"
+# A lock left behind by a KILLED run must not wedge the registry for ever.
+( : ) & DEADPID=$!; wait "$DEADPID" 2>/dev/null
+printf '%s\n' "$DEADPID" > "$BOX8/.registry-sync.lock/pid"
+L33B="$(rsx "$STORE6" "$BOX8" pull 2>&1)"; L33B_RC=$?
+assert_eq "$L33B_RC" "0" "§33 a lock whose holder is GONE is reclaimed (the registry is not wedged)"
+assert_contains "$L33B" "reclaiming" "§33 ...and the reclaim is NAMED rather than silent"
+assert_contains "$L33B" "pulled $KEYE" "§33 ...and the pull completes once the lock is reclaimed"
+if [ -e "$BOX8/.registry-sync.lock" ]; then bad "§33 the lock outlived the run"; else ok "§33 the lock is released at the end of the run"; fi
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
