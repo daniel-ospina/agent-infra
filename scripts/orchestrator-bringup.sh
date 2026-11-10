@@ -1287,7 +1287,7 @@ cmd_stop() {
   case "$PLATFORM" in
     cell)
       [ -f "$SUPERVISOR" ] || unknown "no cloud-cell-supervisor.sh at $SUPERVISOR — cannot stop a cell controller from here"
-      bash "$SUPERVISOR" stop || refuse "cloud-cell-supervisor.sh stop failed (see its output above) — the controller may still be running"
+      bash "$SUPERVISOR" stop || refuse "cloud-cell-supervisor.sh stop failed (see its output above — where the QUEUE gate refused, that output names the repair or the '$SUPERVISOR stop --force' escape; other refusals state their own cause, e.g. a session whose owner cannot be proven) — the controller may still be running"
       ;;
     mac)
       # ⛔ SAME QUESTION, SAME ANSWER AS `start`. This branch used to unload `com.eldato.orchestrator-loop`
