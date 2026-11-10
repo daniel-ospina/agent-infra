@@ -122,11 +122,12 @@ orc_state_pick() {
 
 # ── 2. THE SINGLETON ─────────────────────────────────────────────────────────────────────────────
 # The record file stays exactly what it has always been — a bare pid on one line in `$O/.orch.lock` —
-# and that is not laziness. Six shipped readers parse it with `tr -dc '0-9'` and two compare it to a
-# pid with `[ "$(cat …)" = "$pid" ]` (deploy-mac-orchestrator.sh, install-controller-service.sh,
-# orchestrator-bringup.sh, cloud-cell-supervisor.sh, install.sh, selftest.sh). A richer format would
+# and that is not laziness. Six shipped readers read it: FOUR with `tr -dc '0-9'`
+# (deploy-mac-orchestrator.sh, install-controller-service.sh, orchestrator-bringup.sh,
+# cloud-cell-supervisor.sh) and TWO by comparing the whole record to a pid with
+# `[ "$(cat …)" = "$pid" ]` (install.sh, selftest.sh). A richer format would
 # make `tr -dc '0-9'` concatenate every digit in the record into a pid that never existed, on the
-# stop path of six tools. So the format is untouched and the IDENTITY lives in the two things the
+# stop path of four tools. So the format is untouched and the IDENTITY lives in the two things the
 # file already has: its pid, and its mtime.
 
 # _orc_record_path_ok <path> — 0 when opening this path as the lock record CANNOT BLOCK: absent, or a
