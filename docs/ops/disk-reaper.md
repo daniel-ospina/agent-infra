@@ -1006,6 +1006,22 @@ merged/patch-equivalent scratch row keeps `REAP_WT_MERGED_AGE_DAYS`. Every other
 gate still applies, and the pattern is anchored (`wtfoo/` is not `wt-*`), so a
 named checkout is unaffected.
 
+**`REAP_WT_DISPOSABLE_AGE_MINUTES` (default `0` = OFF) trades the 7-day
+abandonment proxy for a short cooldown on a row that is provably disposable.** A
+checkout that is **clean**, **holder-free** and **not an open PR head** can be
+reclaimed after this many minutes instead of waiting out `REAP_WT_AGED_DAYS`,
+because cleanliness plus the census plus the open-PR veto plus `refs=` *are* the
+safety property, and the age floor is only a proxy for work that may still be in
+progress. It is **not armed by default**: rule 6's 7-day window is a recorded
+decision, so arming it is a deliberate per-box act. It only ever **lowers** a
+floor — a floor already at `0` ("no floor") stays `0` — and it never re-decides a
+floor another rule set, so a **merged / patch-equivalent** head keeps its own
+`REAP_WT_MERGED_AGE_DAYS` and a **scratch** row keeps its own cap. ⛔ It never
+reaches a **dirty** checkout: the clean gate outranks the floor, because
+uncommitted work is the only loss removal cannot recover. Bounded by
+`REAP_WT_MAX_DAYS × 1440`, so an unbounded value is refused at the door rather
+than overflowing the arithmetic into a silently deleted floor.
+
 ## Scheduling — installed by the bring-up, armed by owner instruction
 
 **Cadence, derived from the measured growth rate rather than chosen.** On cell-3 (2026-11-03) the
