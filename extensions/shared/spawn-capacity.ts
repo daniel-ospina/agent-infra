@@ -94,9 +94,11 @@ export const REFUSED_STATUS = new Set(["invalid-cwd", "invalid-session-id", "cir
 // satisfy the >=1-dispatch floor for an UNREVIEWED push).
 // `died-before-first-message` (#1208) is a FAILURE, not a refusal: a child WAS spawned and ran, it
 // just never emitted a message — so the payload is never a reviewer verdict, and the remedy is a
-// re-dispatch rather than a fix to the arguments. It also deliberately does NOT join
-// REFUSED_STATUS, whose members all mean "no child ever existed".
-const FAILED_STATUS = new Set(["failed", "died-before-first-message"]);
+// re-dispatch rather than a fix to the arguments. `died-before-first-turn` (#2823) is the same class
+// with one more fact: the child never began a turn at all, so the text riding the result is a setup
+// diagnostic rather than anything the assistant said. Both deliberately do NOT join REFUSED_STATUS,
+// whose members all mean "no child ever existed".
+const FAILED_STATUS = new Set(["failed", "died-before-first-message", "died-before-first-turn"]);
 const CUT_STATUS = new Set(["cut"]);
 
 /**

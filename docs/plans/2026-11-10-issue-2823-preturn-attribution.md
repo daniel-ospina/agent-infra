@@ -1,0 +1,74 @@
+<!-- research-path: https://github.com/daniel-ospina/agent-infra/issues/2823#issuecomment-6780970579 -->
+<!-- plan-review: cycles=0, status=deferred-to-harness-reviewer, version=2.3.0 -->
+# #2823 — attribute a child that died before its first turn
+
+## Problem
+
+`task`/`subagent` present pre-turn output as the child's message. Re-measured on today's main, the
+production defect is narrower than the issue body says and its producer is already fixed:
+
+- The producer — test files farmed into `~/.pi/agent/extensions` and executed as extensions at
+  session start — is fixed (`38d4ed70c`, #1509/#2841) and the farm on this box is clean
+  (no `*.test.ts|*.spec.ts|*.test.js|*.spec.js` under `~/.pi/agent/extensions`). So ask 3 ("why does
+  `auto-sync.test.ts` fail only under a child?") is ANSWERED: the child *was* running the suite.
+- What is NOT fixed is attribution. Measured: a child that dies at extension load produces
+  **empty stdout**, the suite text on **stderr**, exit **2**, and **zero** heartbeat markers. The task
+  tool then composes that stderr text as `content` (the "message") and stamps
+  `childState: "exited-no-result"` — a value whose docstring means "it ran, produced nothing
+  readable". Nothing in the payload says the text was never the child's. That is the #2823 complaint
+  ("invisible as a failure": the text is plausible test output).
+- `classifyChildLiveness` treats ANY stdout as `completed` (`index.ts:2380`) and `childLivenessFor`
+  floors `childMessagesSent` to 1 whenever stdout exists — so the one channel that could prove
+  "no turn began" is explicitly overridden.
+
+## Fix (one measurement, one new state, one composition arm)
+
+1. `childNeverBeganTurn()` — a pure, exported predicate over evidence the parent ALREADY holds:
+   - **Proof A:** the emitter ran (`sawReady || markerCount > 0`) and `everSawWork` (latched on
+     `turn_start`/`tool_start`) is false ⇒ no turn began. Covers the false-PASS case where stdout
+     carries text but pi never wrote a final message.
+   - **Proof B:** the parent ARMED the emitter (`hbEnabled`) and got ZERO markers back on a
+     **non-zero** exit ⇒ the child never completed `session_start` ⇒ no turn began. This is the
+     measured #2823 payload. Gated on a non-zero exit so a `TASK_HEARTBEAT_DISABLE=1` child that
+     succeeded is never relabelled.
+2. New `TaskChildState` member `died-before-first-turn` (subsumes nothing: the existing
+   `died-before-first-message` arm keeps its population — `!hasStdout && childMessagesSent === 0`).
+   The `childMessagesSent` floor is skipped when a turn is DISPROVED, so the field set cannot
+   contradict itself (`0`/`null` beside "no turn", never a floored `1`).
+3. `doResolve` gains an arm beside the `died-before-first-message` one: a loud header that names the
+   cause ("SETUP failure — an extension/session_start hook, or pi before the prompt"), states the text
+   is NOT the reply, quarantines it under `--- what the child left behind (NOT its message) ---`, sets
+   `details.status = "died-before-first-turn"` + `isError: true`, and derives the **same** string for
+   the durable ledger row (one settle, two surfaces, one claim).
+4. `FAILED_TASK_STATUS` gains the member, and its MIRROR `extensions/shared/spawn-capacity.ts:99`
+   (`FAILED_STATUS`) is updated in the same commit — pinned by the existing drift row.
+
+## Alternatives considered
+
+- **Re-plumb the transport (`--mode json` / a side-channel file for the final message).** Canonical per
+  the external finding, but it changes the transport every consumer of `task` depends on, and it fixes
+  a stream the measurement shows is ALREADY clean (extension `console.log` goes to stderr). Rejected as
+  disproportionate.
+- **Treat any stdout as suspect unless a turn marker exists, with no exit-code gate (drop Proof B's
+  gate).** Simpler, but it relabels a genuine answer from a heartbeat-less child — a false failure on a
+  success, the worst direction. Rejected.
+- **Retry on this state.** Retrying a setup failure re-runs the same broken setup and pays a model call;
+  the existing `died-before-first-message` arm does not retry either. The caller decides.
+
+## Wiring
+
+| Call site / consumer | What it does there |
+|---|---|
+| `extensions/builtin-tools/index.ts` `childLivenessFor` | sole producer of `TaskChildLivenessSnapshot`; now passes `everSawWork` + `heartbeatArmed` |
+| `doResolve` (`spawnSubAgent`) — `livenessSnapshot`, `rowReason`, payload arm | stamps `childState`/`status`/`isError`, writes the outcome row, composes the message |
+| `classifyBackgroundOutcome` → `FAILED_TASK_STATUS` | `task({background:true})` settle: `status: failed`, `reason: died-before-first-turn` |
+| `extensions/shared/spawn-capacity.ts` `FAILED_STATUS` | mirror, so the review floor never counts the payload as a dispatch verdict (drift row `spawn-capacity.test.ts:91`) |
+| `exhaustionStatusFor` / `UNCONFIRMED_END_STATES` | kill precedence unchanged; the new state joins the terminal set so an un-exited child reads `running` |
+| `builtin-tools.test.ts`, `dispatch-record.test.ts` | the tests that must go red without the change |
+
+## Steps
+
+1. Predicate + classifier + state member; unit tests incl. the false-attribution legs. (test must fail first)
+2. Payload arm + ledger reason; `dispatch-record` test asserting row reason == payload status.
+3. `FAILED_TASK_STATUS` + spawn-capacity mirror; drift row stays green.
+4. Mutation proof: delete the new classification arm, show the guarding tests red; restore.
