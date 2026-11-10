@@ -558,6 +558,29 @@ ck "B8c …and the P0 evidence was READ, not assumed" $rc
 grep -q 'IS credentialed' "$TMP/b8.log" && rc=1 || rc=0
 ck "B8d …and nothing claims a credential the module never provided" $rc
 
+# ── B9: THE PLACEMENT COMMENT MUST NOT CLAIM COVERAGE THE TREE DOES NOT HAVE (review round 9, P3) ─────
+# The block in `run_agent` that says WHY the credential is resolved there used to call this `run_agent`
+# "the single invocation every worker goes through". The tree falsifies it: `merge-one.sh` carries its OWN
+# `run_agent()` (#2208's declared residual) and its chain-reviewer spawn — the one whose record the merge
+# gate reads — resolves NO credential at all (`grep -c gh_auth merge-one.sh` = 0). That is the same defect
+# class as A12 and the B2f2 arm: a comment claiming a guard it does not have reads exactly like one that
+# has it. It is worse than an ordinary stale comment because it sits on the block a lane reads to learn why
+# the resolution is here AND a previous review round concluded "no claim here overreaches it", so a reader
+# got two independent-sounding confirmations that the review path was covered.
+# Each arm measures the TREE against the TEXT, so a red here means the two have diverged — in EITHER
+# direction, which is the point: if `merge-one.sh` ever GAINS the resolution, B9b reddens until the comment
+# stops calling it un-fixed. Pre-fix, B9c and B9d are RED (the block names no second implementation and
+# carries the false universal claim), so the fix cannot buy its green by deleting the block.
+_place="$(sed -n '/LANE.S gh CREDENTIAL (agent-infra#2509)/,/⛔ A MISSING MODULE/p' "$SG")"
+[ -n "$_place" ]; rc=$?
+ck "B9 the placement block is still extractable from the shipped spawn-gate.sh (a rename must redden this, never silently empty the arms below)" $rc
+{ [ -n "$(sed -n '/^run_agent() {/p' "$HERE/merge-one.sh")" ] && [ "$(grep -c 'gh_auth' "$HERE/merge-one.sh")" -eq 0 ]; }; rc=$?
+ck "B9b merge-one.sh carries its OWN run_agent() and resolves NO gh credential — the fact the block has to disclose" $rc
+printf '%s\n' "$_place" | grep -q 'merge-one\.sh'; rc=$?
+ck "B9c …so the block NAMES merge-one.sh as a path this resolution does not reach" $rc
+printf '%s\n' "$_place" | grep -q 'single invocation every worker goes through' && rc=1 || rc=0
+ck "B9d …and no longer calls this run_agent the single invocation every worker goes through" $rc
+
 echo
 echo "───────────────────────────────────────"
 echo "  passed: $PASS   failed: $FAIL"

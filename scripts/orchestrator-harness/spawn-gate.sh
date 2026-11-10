@@ -4326,10 +4326,22 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # issue's evidence (labels/title) with `gh`, in THIS process, and a lane runs with `HOME` redirected
   # to the operational home while gh's `hosts.yml` lives in the ACCOUNT home — so without this the lane's
   # `gh` is simply unauthenticated, the ratio reads UNREADABLE, and (measured 2026-11-09, two cells) the
-  # refusal blamed the PR queue. `run_agent` is the single invocation every worker goes through, so
-  # resolving here covers `lane.sh`, `fix-one.sh` and `nonblocking-dispatch.sh` at once, and the export
-  # is INHERITED by the `pi` this function starts and by `wt_spawn`'s launch line — so the store the gate
-  # read and the store the lane reads are the same one by construction.
+  # refusal blamed the PR queue.
+  # SCOPE, STATED — THESE THREE ARE THIS `run_agent`'S ONLY CALLERS. Resolving here covers `lane.sh:895`,
+  # `fix-one.sh:838` and `nonblocking-dispatch.sh:346`, and the export is INHERITED by the `pi` this
+  # function starts and by `wt_spawn`'s launch line — so the store the gate read and the store the lane
+  # reads are the same one by construction.
+  # ⛔ THE SENTENCE THAT STOOD HERE CLAIMED THIS `run_agent` WAS THE ONE INVOCATION EVERY WORKER GOES
+  # THROUGH, AND THE TREE FALSIFIES IT (review round 9, P3): `merge-one.sh` carries its OWN `run_agent()`
+  # — the declared #2208 residual, `:512` — and its chain-reviewer spawn (`:1961`), the one whose record
+  # the merge gate reads, resolves NO gh credential: `grep -c gh_auth merge-one.sh` is 0 and that file
+  # does not even source this one. The same cause, at a site this resolution does NOT reach — not this
+  # diff's scope, and not covered by the sentence above. Whether that reviewer's `gh` is ACTUALLY
+  # unauthenticated depends on the environment it is spawned in, which nobody has measured (UNVERIFIED),
+  # so it is named as UN-FIXED rather than as broken. ⛔ A prior review round concluded "no claim here
+  # overreaches it"; that conclusion was wrong and is corrected here, because a comment claiming a guard
+  # it does not have reads exactly like one that has it — which is why this boundary is stated, not
+  # implied, on the block a lane reads to learn WHY the resolution is here.
   # ⛔ A MISSING MODULE (a `$O` that predates it) is reported and changes NOTHING else: this gate must
   # never be the reason a lane cannot start.
   if command -v gh_auth_log >/dev/null 2>&1; then
