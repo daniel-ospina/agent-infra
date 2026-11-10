@@ -2424,8 +2424,8 @@ if [ -d "$DELTA_REPO" ]; then
   # feature silently INERT — while this suite stayed green: (33a)/(33a2) never look at
   # `carry_arm`, and (33f2) only proves the reader agrees about a record nothing should produce.
   # It is the PAIR that is asserted, not the word: `--check-carry` requires `carry_arm` AND
-  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:4319-4328, the
-  # `case "${CC_MINT:-}" in` arm) BEFORE it head-binds at :4354, so a delta record missing
+  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:4616-4625, the
+  # `case "${CC_MINT:-}" in` arm) BEFORE it head-binds at :4651, so a delta record missing
   # either is a no-record for the gate. Each citation also carries its own ANCHOR string:
   # these numbers move whenever record-review.sh moves, and a re-derivation that was not
   # re-checked at the head has already landed here wrong twice. The anchor is what stays
