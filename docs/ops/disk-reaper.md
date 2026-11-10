@@ -1231,8 +1231,9 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferr
 `stalled=` is the STALLED REVIEW LIST's tally (agent-infra#2179): 0-commits-ahead lane residue this
 pass did NOT release and no later pass will release on its own. It is an exact SUBSET of
 `preserved=` — a selected removal that failed is counted under `remove=` and reported by
-`failed=`/exit 4 instead, so `preserved - stalled` can never underflow. A non-zero tally is followed
-by the list itself, each row naming the ISSUE its branch holds out of dispatch with its age (whole
+`failed=`/exit 4 instead, so `preserved - stalled` can never underflow. A non-zero tally is PRECEDED
+by the list itself — the rows print above the SUMMARY line, not below it, each row naming the ISSUE
+its branch holds out of dispatch with its age (whole
 hours, rounded UP, so an hour-floored row never reads as inside the floor it is past; stated in
 SECONDS for the one sub-hour floor, so the age and the floor it is being read against are always in
 the same unit — and that floor's gate is `-ge`, so a record exactly AT it is listed as
@@ -1252,7 +1253,7 @@ bucket measured in a real pass, `reasons=ignored-artifact:70`, 20,557 MB, so it 
 dirty and non-regenerable-ignored-data classes) and `REAP_WT_STALE_INIT_SECONDS` (1800, the
 `interrupted-add` class, the one floor stated in seconds because it is sub-hour); all three appear in
 `--help`, and their unit is the row's own (`<n>h`, or `<n>s`
-for the sub-hour floor) — the row and the legend printed under it are ONE contract, read together
+for the sub-hour floor) — the row and the legend printed above it are ONE contract, read together
 (the legend states the UNIT and the per-`why=` release path; the three floor NAMES live in `--help`,
 which is where an operator looks them up).
 

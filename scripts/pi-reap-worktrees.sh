@@ -2946,13 +2946,17 @@ age_h_ceil() { local d=$(( $1 - $2 )); [ "$d" -gt 0 ] || d=0; printf '%s\n' "$((
 
 stalled_tok() {
     # ⛔ AN EMPTY ISSUE PRINTS `?`, NEVER A BARE `#` (review, PR #3881): `issue=#` is a field an
-    # operator cannot read and a test cannot match, and EVERY caller is lane-gated (`is_lane_branch`,
-    # which is what makes a branch name `feat/<N>-tm` and so always carries an issue), so an empty one
-    # can only mean the branch parser was handed something else. ⛔ THAT SENTENCE WAS FALSE FOR ONE
-    # RELEASE (review, PR #3881 round 9): the interrupted-add arm emitted the token without a
-    # `is_lane_branch` gate, so `issue=?` was REACHABLE there — the row it printed claimed a lane
-    # class for a branch `is_lane_branch` rejects. The gate is on all four emitters now; if a fifth is
-    # added, it needs the gate too, or this comment becomes the lie it just was.
+    # operator cannot read and a test cannot match. ⛔ ALL FIVE EMITTERS ARE LANE-GATED, BUT THAT DOES
+    # NOT MAKE AN ISSUE GUARANTEED: `is_lane_branch` is a REGEX MEMBERSHIP test over
+    # `REAP_WT_LANE_BRANCH_RE` while the issue is LEADING DIGITS in the branch tail (`lane_issue_of`),
+    # and the two coincide only at the DEFAULT pattern (`feat/<N>-tm`). A fork that overrides the
+    # pattern (`:816`, "overridable so a fork that names its lanes differently is a config change") to
+    # something like `^refs/heads/lane/` gets `issue=?` on a genuine lane row — honestly so: the record
+    # IS residue, the issue just cannot be named. The legend says that out loud. (An earlier revision
+    # of this comment claimed an empty issue could "only mean the branch parser was handed something
+    # else"; the override makes that false — review round 10, PR #3881.) The interrupted-add arm was
+    # ALSO the one emitter missing the lane gate entirely until round 9; if a sixth is added, it needs
+    # the gate too.
     local iss="${2:-}"
     [ -n "$iss" ] && iss="#$iss" || iss="?"
     printf 'stalled=1 class=%s issue=%s age=%s floor=%s why=%s' \
@@ -4141,8 +4145,9 @@ classify_one() {
         # `init_lock_age` alone (no branch-shape test above it). Without the gate an interrupted
         # `worktree add` on any branch at all — a `topic/foo` checkout whose register holds a stash
         # naming it — was published as `stalled=1 class=interrupted-add issue=? …` under a header
-        # reading "the 0-commits-ahead lane class". The three sibling emitters all gate (unarmed
-        # dirty, armed abandoned-wip, ignored-artifact, ghost-zero-ahead), so this was the one gap.
+        # reading "the 0-commits-ahead lane class". The FOUR sibling emitters all gate (unarmed dirty,
+        # armed abandoned-wip, ignored-artifact, ghost-zero-ahead), so this was the one gap — five
+        # emitters in total once this one is counted.
         # No verdict changes: the record is preserved either way, it is simply no longer NAMED as a
         # lane's residue when it is not a lane branch.
         if [ "$refs" = merged ] && is_lane_branch "$branch"; then
@@ -5961,7 +5966,8 @@ run() {
             log_line "  $_sp"
             log_line "      reason=$_sr  $_sd"
         done <<<"$STALLED_LIST"
-        log_line "  each row names the ISSUE its branch holds out of dispatch, and its why= names the ONLY"
+        log_line "  each row names the ISSUE its branch holds out of dispatch (? when the branch carries"
+        log_line "  no issue number), and its why= names the ONLY"
         log_line "  release path:  opt-in-off             -> --reap-abandoned-wip (backup verified FIRST)"
         log_line "                 ignored-data-held      -> move or accept the non-regenerable ignored data"
         log_line "                 withheld-by-abstention -> drop the stash ENTRY the work is parked in;"

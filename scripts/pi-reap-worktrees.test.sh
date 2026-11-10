@@ -3518,8 +3518,11 @@ assert_contains "$SUM" "stalled=0" \
 sum_field() { sed -n "s/.*[ ]$1=\([0-9][0-9]*\).*/\1/p" <<<"$2" | head -1; }
 # preserved=1 is the MAIN CHECKOUT, and 1 is exactly what this pins: the failed removal adds NOTHING
 # to preserved (it is under remove=), which is the half that could make `preserved - stalled` underflow.
+# ⛔ IT IS A REGRESSION PIN ON THE ACCOUNTING, NOT A GUARD THIS DIFF'S MUTATION CAN MOVE (review round
+# 10, PR #3881): the collector increments `STALLED_N` only, so no edit to this PR changes `preserved`
+# here. Stated as a precondition rather than sold as a kill-switch for the change.
 assert_eq "$(sum_field preserved "$SUM")" "1" \
-    "A28d the failed removal is NOT counted as preserved (only the main checkout is)"
+    "A28d precondition: the failed removal is NOT counted as preserved (only the main checkout is)"
 assert_eq "$(sum_field remove "$SUM")" "1" "A28d precondition: remove=1 — the failed record is a selected removal"
 
 # ── A28e: the ref MOVES between classification and deletion => branch KEPT ───────────
@@ -3963,6 +3966,8 @@ assert_contains "$OUT" "in that class's own unit" \
     "A29p …and the UNIT, so a floor=1800s row is not contradicted two lines further down"
 assert_contains "$OUT" "CANNOT release that one" \
     "A29p …and a class-aware remedy, because --reap-abandoned-wip cannot release a stash-withheld record"
+assert_contains "$OUT" "? when the branch carries" \
+    "A29p …and says what an unnamed ISSUE looks like, which a lane-pattern override makes reachable"
 assert_dir "$WT" "A29p nothing was removed — the stash entry still parks lane work"
 
 # A29p-MUT: the token is what makes the leg above able to fail. This mutation IS the pre-fix code —
@@ -4115,8 +4120,10 @@ assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" "A29v-MU
 # gets the fixture that reds it:
 #   A29x non-lane branch        => deleting `is_lane_branch` from the arm reds it
 #   A29y branch holds a commit  => deleting `commits_survive = merged` reds it
-#   A29z undatable record       => deleting `wt_ok = 1` reds it (a FUTURE record stamp is the seam
-#                                  `wt_created_ts` refuses by design, so no stat shim is needed)
+#   A29z undatable record       => deleting `wt_ok = 1` reds it. ⛔ NOT via a future record stamp: rung 1
+#                                  of `wt_created_ts` returns the BIRTH time, which `touch` cannot move,
+#                                  so that fixture would pass on the class floor instead of on `wt_ok`.
+#                                  The seam is a surgical `stat` shim (see A29z below).
 mk_ignored() { # <env> <wt-name> <branch> -> repo with `data/` ignored and a data-holding checkout
     local envname="$1" name="$2" branch="$3" repo wt
     repo="$(mk_repo "$envname")"
