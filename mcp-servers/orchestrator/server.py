@@ -18,7 +18,10 @@ another module's answer**, and where a module cannot answer the tool's own signa
     pr.queue              per-PR actions (15 answers), mapped to the issue's 6 classes as a VIEW
     claim.check           the ref-claim registry: abstention vocabulary ONLY, never freedom
     lane.dispatch         launch one lane; typed refusals, never stderr prose
-    box.exec              {rc, stdout, timed_out, truncated} over `cmux vm exec`, argv-only, allowlisted
+    box.exec              {rc, stdout, stderr, timed_out, truncated, outcome} over `cmux vm exec`,
+                          argv-only, allowlisted — and a LINK REFUSAL is `CHANNEL-REFUSED` +
+                          `channel_refused` (`link-refused` / `no-known-daemon` /
+                          `daemon-binary-absent`), never the command's verdict (#2345)
     pr.review_record      current | stale | absent + the head the record is bound to
     pr.closure_audit      what a merge ACTUALLY closed, vs what it merely mentioned
     fleet.reminder        set/list/cancel a durable reminder (file-backed queue + timer lifecycle)
@@ -2278,10 +2281,13 @@ def _harden_argv(argv: List[str]) -> List[str]:
 # WHERE a prefix bounds the class, it is required — and it is required only where the transport has been
 # MEASURED emitting the line with it:
 #   link-refused         always `cmux: link to '<peer>' exited` (every measurement on #2345)
-#   no-known-daemon      `cmux-tui: no known daemon matches this route` — the client's own words; the
-#                        un-prefixed form is what `~/.cmux/peer-links/<peer>.log` CONTAINS, i.e. it
-#                        reaches these streams only if a peer echoes the log, which the allowlist makes
-#                        impossible (`cat`/`tail` are not on it)
+#   no-known-daemon      always `cmux-tui: no known daemon matches this route` — measured BOTH as direct
+#                        `cmux vm exec` output (`pi-cell-1`, #2345) and as the peer log's own last line.
+# ⛔ WHAT BOUNDS A PEER FROM PRINTING ONE OF THESE ITSELF IS THE ALLOWLIST, NOT THE PREFIX — a prefix does
+# not separate transport from log-echo (the log carries the PREFIXED form too). `cat`/`tail` are absent
+# from ALLOWLIST (`_allowlisted`), so a peer cannot be asked to dump a log through this surface; a peer
+# that prints the prefixed line for some other reason stays indistinguishable, and that residual is
+# DISCLOSED rather than implied.
 # ⛔ BUT `daemon-binary-absent` HAS BEEN MEASURED IN BOTH SHAPES — `cmux: cmux-tui daemon binary not
 # found at …` (pi-lane-1, 2026-10-23) AND un-prefixed `cmux-tui daemon binary not found at …` (pi-cell-2,
 # issue #2345) — so its prefix is OPTIONAL: requiring one silently disabled the whole #3195 class on the
@@ -2356,7 +2362,11 @@ def _link_refusal(ran: "Ran") -> Optional[Dict[str, Any]]:
         binary_path = groups.get("path")
         if binary_path:
             out["binary_path"] = binary_path
-        log = PEER_LOG_RE.search(text)
+        log = PEER_LOG_RE.search(text[match.start():].splitlines()[0])
+        # ⛔ ONLY THE MATCHED LINE, for the same reason as `refusal` below: `PEER_LOG_RE` over the whole
+        # buffer attached a path scraped from ANY line — e.g. a peer's own `sha256sum` output naming a
+        # `.cmux/peer-links/…` file — to a class the inventory rows say never carries one. Every measured
+        # refusal line names its log ON THE SAME LINE (`cmux: link to '<peer>' exited; see <path>`).
         if log:
             out["peer_log"] = log.group("path")
         if ran.rc == 0:

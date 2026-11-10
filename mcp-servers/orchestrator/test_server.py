@@ -1126,6 +1126,26 @@ def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc
     assert payload["rc"] == 0 and "fail_open" in payload, payload
     assert "only `rc` reads this as success" in payload["fail_open"], payload
 
+    # (2b) THE THIRD CLASS, WHICH HAD NO ARM AT ALL: deleting its pattern left the suite green, so the one
+    #      remedy the tool description and both inventory rows sell to callers (pairing/registry on THIS
+    #      box) was unpinned — a class advertised but untested. Measured STANDING ALONE as exec output
+    #      (`cmux vm exec pi-cell-1 -- hostname`, #2345, 2026-11-02), not only as the peer log's tail.
+    #      ⛔ AND A `peer-links/…` PATH SITS ON ANOTHER LINE, so this arm also pins that `peer_log` is read
+    #      from the MATCHED line — whole-buffer `PEER_LOG_RE` attached a peer's own sha256sum output to a
+    #      class the inventory rows say never carries one.
+    monkeypatch.setenv("ORCH_MCP_CMUX", refusal_stub(
+        "cmux_nodaemon.py",
+        "import sys\n"
+        "sys.stdout.write('9f2c  /home/cmux/.cmux/peer-links/pi-cell-4.log\\n')\n"
+        "sys.stderr.write('cmux-tui: no known daemon matches this route; connect with an "
+        "invitation\\n')\n", 1))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-4", "argv": ["uname"]})
+    assert is_err is True and payload["channel_refused"] == "no-known-daemon", payload
+    assert "no pairing" in payload["refusal_detail"], payload
+    assert "peer" not in payload, payload
+    assert "peer_log" not in payload, "a peer-links path from another line is not this class's peer log"
+    assert payload["refusal"].startswith("cmux-tui: no known daemon"), payload
+
     # (3) the OTHER root: this CALLING box has no `cmux-tui` (#3195), so every peer refuses at once.
     #     Its remedy is here, not on the peer — so it must not be reported as a peer-pairing problem.
     monkeypatch.setenv("ORCH_MCP_CMUX", refusal_stub(
@@ -1166,12 +1186,12 @@ def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc
     #     (un-prefixed) is a run. `cmux vm exec` relays the remote command's streams into the very two
     #     the classifier reads, so an unanchored pattern re-labelled this `CHANNEL-REFUSED` + `fail_open`
     #     — the symmetric mis-verdict to #2345 ("the peer ran it and failed" → "the peer never ran it").
-    #     ⛔ THE FIXTURE IS ONLY THE LINE THE PREFIX ACTUALLY BOUNDS. `no known daemon matches this route`
-    #     is measured as transport output ONLY with the `cmux-tui: ` prefix (it is what the peer log
-    #     CONTAINS), so un-prefixed it is a peer echo by construction. The daemon-binary line is NOT a
-    #     valid echo fixture — the transport has been measured emitting it BOTH ways (#2345, `pi-cell-2`),
-    #     so that arm lives in (3b) instead; pinning these exact bytes as "a peer printed this" would have
-    #     asserted a false belief and false-redded the correct fix.
+    #     ⛔ THE FIXTURE IS A SYNTHETIC BARE PHRASE, AND THAT IS ALL IT CLAIMS: the pattern requires the
+    #     measured `cmux-tui: ` prefix, so an un-prefixed occurrence — which #2345 has measured NEITHER as
+    #     transport output NOR as log content (both carry the prefix) — must never classify. What bounds a
+    #     peer from printing the PREFIXED line is the allowlist, not the anchor (see LINK_REFUSAL_CLASSES).
+    #     The daemon-binary line is NOT a valid echo fixture: the transport has been measured emitting it
+    #     BOTH ways (#2345, `pi-cell-2`), so that arm lives in (3b) instead.
     monkeypatch.setenv("ORCH_MCP_CMUX", stub(
         tmp_path, "cmux_relay.py",
         "import sys\n"
