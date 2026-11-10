@@ -1785,6 +1785,18 @@ assert_contains "$(row_for "$OUT" "$WT_H2")" "reason=reclaimable" \
     "G6a4 armed RULE D does NOT raise a 12h floor onto REAP_WT_AGED_DAYS=0 (it only ever LOWERS one)"
 assert_absent "$(row_for "$OUT" "$WT_H2")" "reason=too-recent" \
     "G6a4 …the pre-fix zero-disjunct made this same 2h row too-recent (floor raised 0 -> 720m)"
+# ⛔ THE OTHER HALF OF THE MIN: when the armed cooldown does NOT lower the floor, it must not CLAIM it
+# did. This is the one configuration in the whole suite where `disp_s >= floor_s`, so it is the only
+# row that can observe the `else disp_s=0` disarm — drop that arm and every other armed row takes the
+# lowering branch, so nothing reds while this row's marker starts lying (`floor=<n>m(ruleD)` /
+# `proof=disposable-floor(…)` on a removal the AGED floor decided). A reader then re-tunes the dial
+# that did nothing — the "reclaims the wrong thing with no legible cause" loop this change answers.
+assert_absent "$(row_for "$OUT" "$WT_H2")" "ruleD" \
+    "G6a4 …an armed cooldown that does NOT lower the floor must not CLAIM it did (the else disp_s=0 disarm)"
+assert_contains "$(row_for "$OUT" "$WT_H2")" "floor=0m(aged)" \
+    "G6a4 …so the marker still names the AGED floor that actually decided it (0m, i.e. no floor)"
+assert_absent "$(row_for "$OUT" "$WT_H2")" "proof=disposable-floor(" \
+    "G6a4 …and the removal's proof label agrees with its marker (never disposable-floor while the floor stayed 0)"
 # strict-> boundary: exactly 7d survives; 7d+1s and 7d+2s are reaped.
 # ⛔ PINNED WITH RULE D OFF. This group's subject is the AGED floor's `>` boundary, and RULE D caps that
 # floor at 12 h by default — so leaving it on would measure the disposable floor while claiming to
