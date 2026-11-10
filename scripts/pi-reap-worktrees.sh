@@ -55,6 +55,37 @@
 #                    surface. The cap only ever LOWERS — a value above the floor in
 #                    force has no effect (so 14 does not mean "keep longer"), and a
 #                    merged/patch-equivalent scratch row keeps the merged floor.
+#   * DISPOSABLE-CLEAN (RULE D, ARMED BY ENV, DEFAULT OFF) — the 7-day dial is an
+#                    abandonment PROXY, and on a CLEAN checkout the property it stands in for is
+#                    already proved:
+#                    rule 2 refuses uncommitted work, rule 1 / rule 7 / live-cwd /
+#                    live-claim refuse a live holder, rule=P refuses an open PR, and
+#                    `refs=` proves the commits survive the checkout. So a clean,
+#                    holder-free, non-open-PR checkout has its floor CAPPED at
+#                    REAP_WT_DISPOSABLE_AGE_MINUTES when that is armed (0 = off, the
+#                    default; 720 = 12 h is the recommended arm). ⛔ ITS SCOPE IS NARROWER
+#                    THAN "A CLEAN CHECKOUT": it applies only where the AGED floor is the
+#                    one in force. A MERGED or PATCH-EQUIVALENT head keeps its own
+#                    (0-day) floor — a separate, deliberate decision this rule does not
+#                    revisit — and a LANE SCRATCH checkout (`wt-*` / `cell-wt-*`, #2354)
+#                    keeps REAP_WT_SCRATCH_AGE_DAYS (1 d), because that cap already
+#                    lowered its floor and this rule never RE-decides a floor another rule
+#                    set. ⛔ THAT EXEMPTION CARRIES A CONDITION, and it is the code's, not
+#                    this paragraph's: `floor_src=scratch` is set only where the scratch cap
+#                    actually LOWERED the floor, i.e. `REAP_WT_SCRATCH_AGE_DAYS` <
+#                    `REAP_WT_AGED_DAYS`. With the two dials EQUAL — a legal pairing, e.g.
+#                    `--aged-days 1` against the 1-day default — no cap was applied, the
+#                    row's floor came from the AGED dial, and an armed RULE D lowers it like
+#                    any other aged row (still clean-gated, still marked `floor=…m(ruleD)`).
+#                    It only ever LOWERS a floor —
+#                    and a floor already at 0 (`REAP_WT_AGED_DAYS=0`, a box that reaps
+#                    clean rows immediately) STAYS 0, so the rule is INERT there rather
+#                    than quietly raising a 12 h cooldown onto the most aggressive age
+#                    setting. `0` disables it and restores the pre-rule behaviour exactly.
+#                    Every row DECIDED BY THE AGE FLOOR prints `floor=<n>m(<rule>)` so the
+#                    policy that decided it is legible after the fact (a row that never
+#                    consulted a floor — an open PR, a dirty tree, a live holder — prints
+#                    none).
 #
 # LANE RESIDUE (agent-infra#2033) — THE CLASS THIS REAPER USED TO KEEP FOR EVER
 # ---------------------------------------------------------------------------
@@ -127,6 +158,76 @@
 # are proven to survive on the main ref.
 # Anything failing clean / reachable / unreferenced is SURFACED with its
 # deciding reason and NEVER auto-removed.
+#
+# ── STALLED REVIEW LIST AND THE BOUND (agent-infra#2179) ──────────────────────────────────────
+# A release that never happens is not a preserve, it is a BLOCK: a lane-residue record that holds a
+# branch naming an issue keeps that issue un-dispatchable on every box, and the pass that leaves it
+# in place must say so. #2179 fixes both halves — a short, per-class floor for the 0-commits class
+# (done by #2033's ghost/abandoned-wip classes above) and a REVIEW LIST for what the floors do not
+# reach.
+#
+# THE BOUND, STATED: a lane-residue record must resolve — completed, released, or explicitly parked
+# with an owner — within ITS CLASS FLOOR PLUS ONE SWEEP. The pass ASSERTS it in the only direction it
+# can be asserted from here: a record it RELEASES is removed AND its 0-ahead lane ref deleted, so the
+# issue it named is dispatchable again on the next pre-flight; a record it does NOT release is either
+# inside its floor (nothing to assert yet — the next sweep acts) or on the STALLED list, NAMED with
+# its class, its age, the class floor it is at or past, and the reason no later pass will move it —
+# plus the ISSUE whose branch it holds, except where the branch carries no issue number at all
+# (`issue=?`; reachable under a `REAP_WT_LANE_BRANCH_RE` override, stated at the token and in the
+# legend, so this sentence must not promise more than the row prints).
+#
+# WHAT PUTS A RECORD ON THE LIST — only 0-commits-ahead lane residue (`refs=merged`, i.e. the branch
+# holds no commit the main ref does not), PAST its class floor, and only when this pass could not
+# release it:
+#   * `--reap-abandoned-wip` unarmed and a dirty tree past the WIP floor => why=opt-in-off
+#   * the STASH abstention withheld it, past the floor                      => why=withheld-by-abstention
+#     ⛔ ONLY THE STASH ARM EARNS THAT TOKEN, and the header said "stash / unpushed" for ten rounds
+#     (review round 12, PR #3881). `abstain_gate` appends the token in its stash arm alone (`:3493`);
+#     its unpushed arms deliberately carry none — `unpushed-unverifiable` abstains without one, and the
+#     readable `unpushed=N` arm "decides nothing" and returns 1, so the row is released. Naming the
+#     unpushed arm here described a `why=` value no code path can produce.
+#   * the tree holds NON-REGENERABLE IGNORED data, past the WIP floor    => why=ignored-data-held
+#     (no flag moves that class at all — `--reap-abandoned-wip` only enters the DIRTY case — so it is
+#     the same "blocked for ever" shape, and `ignored-artifact` was measured as the largest preserve
+#     bucket in a real pass: `reasons=ignored-artifact:70`, 20,557 MB, `:876-880`)
+#   * an INTERRUPTED ADD whose stash entry outlived it — class `interrupted-add`, and the same
+#     `why=withheld-by-abstention` (review round 7, PR #3881). ⛔ ONLY ITS `refs=merged` HALF: that
+#     arm also admits `branch-retained:*`, whose branch still HOLDS commits and is therefore not
+#     0-ahead residue at all. A stash entry is released by nothing (`stranded_stash_for` re-reads the
+#     same register on every later pass), so a `merged` interrupted add withheld by it blocked its
+#     issue for ever while the pass printed `stalled=0`.
+# `floor=` is the class floor that record is AT OR PAST, so every emitted value is a real, APPLIED
+# floor from `--help`'s operator-settable vocabulary — all three of them, which is why the third had
+# to be added there — never a bound that could not be applied (review round 2, PR #3881: an earlier
+# revision printed hour floors for records whose age could not be read).
+# ⛔ "AT OR PAST", NOT "PAST" (review round 8, PR #3881): the hour floors are compared strictly
+# (`> floor`, `<= floor` returns early) and printed CEILINGED, so a row there is always past its
+# floor; the interrupted-add arm's own gate is `-ge` on the class's seconds, so a record at exactly
+# 1800 s IS listed and reads `age=1800s floor=1800s` — a header that said "past" would deny a row
+# this file prints. The distinction is invisible to an operator and load-bearing to a reader.
+# ⛔ THE ONE SUB-HOUR FLOOR IS STATED IN SECONDS (`floor=1800s`): the interrupted-add floor is
+# `REAP_WT_STALE_INIT_SECONDS` (1800), and rounding it into hours would print `age=1h floor=1h` for
+# every record in (1800s, 3600s] — the exact "at its floor" ambiguity `age_h_ceil` exists to remove.
+# `age=` always carries the unit its own row's floor is stated in, so the two are comparable — and
+# the legend printed directly UNDER the rows states that unit too, because the row and its legend are
+# ONE contract read together (round 8: the legend said `floor=<n>h` under a `floor=1800s` row).
+#
+# ⛔ FOUR STATES ARE DELIBERATELY NOT STALLED, each for a stated reason:
+#   * a LIVE CLAIM — the issue is held by a lease, and leases expire;
+#   * a record INSIDE its floor — the next sweep resolves it, i.e. the bound is holding;
+#   * `claim-unverified` / `unreadable-worktree-age` — both are evaluated BEFORE the class-floor test,
+#     and `claims_load` re-reads the registry at the TOP OF EVERY PASS, so neither is a state "no
+#     later pass can resolve". Listing them published records that were inside their floor (round 2);
+#   * a SELECTED REMOVAL THAT FAILED — see below.
+#
+# ⛔ AND A SELECTED REMOVAL THAT FAILED IS NOT ON IT EITHER (`backup-unverified`,
+# `removal-time-recheck`). It is past its floor and unremoved, so it belongs in spirit; it is kept off
+# because those records are counted in `remove=`, and folding them in would make `stalled` NOT a
+# subset of `preserved` — a tally whose meaning silently depended on `failed=`/`late_preserved=` (review,
+# PR #3881). Those failures are already unmissable: `FAILED=` + exit 4, and `BACKUP-UNVERIFIED-KEEP` /
+# `PRESERVED-LATE` on the pass log. So the invariant stays exact: `stalled` ⊆ `preserved`.
+# The list is `log_line` output on stdout, so it reaches whoever ran the pass; the tally travels as
+# `stalled=<n>` on the SUMMARY line and `STALLED=<n>` on the footer.
 #
 # ── SEVEN-RULE DECISION TABLE (#2721) — every row PRINTS the rule and its proof.
 # A KEEP whose reason does not name the evidence it used is indistinguishable from
@@ -622,6 +723,15 @@
 #
 # Env seams: GIT_BIN GH_BIN PS_BIN LSOF_BIN RM_BIN DF_BIN REAP_WT_LOG REAP_WT_DRY_RUN
 #   REAP_WT_AGED_DAYS REAP_WT_MERGED_AGE_DAYS REAP_WT_MIN_AGE_MINUTES REAP_WT_MAX_DAYS
+#   REAP_WT_DISPOSABLE_AGE_MINUTES (RULE D: the cooldown floor for a clean, holder-free, non-open-PR
+#     checkout — the 7-day dial is an abandonment PROXY and the clean gate + census are the safety
+#     property. DEFAULT 0 = OFF, because rule 6's 7-day window is a recorded+tested decision; a box
+#     ARMS this deliberately (#1678 shape). 720 = 12 h is the recommended value and the one cell-3
+#     was measured with. It only lowers an AGED floor: a merged/patch-equivalent head and a lane
+#     SCRATCH checkout keep their own, and `REAP_WT_AGED_DAYS=0` keeps NO floor rather than gaining
+#     one. Validated as 0..REAP_WT_MAX_DAYS*1440 minutes — an unbounded digit string overflows
+#     `minutes * 60`, and a NEGATIVE floor makes every `-gt 0` gate false, i.e. the floor silently
+#     disappears)
 #   REAP_WT_MAIN_REF REAP_WT_NOW_EPOCH
 #   REAP_WT_LIST_TIMEOUT REAP_WT_STATUS_TIMEOUT REAP_WT_PS_TIMEOUT
 #   REAP_WT_CWD_TIMEOUT REAP_WT_GH_TIMEOUT REAP_WT_REMOVE_TIMEOUT
@@ -685,6 +795,48 @@ REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES:-45}"
 # scratch dir is not the 7-day review surface a named issue branch is: it exists to be thrown away.
 # It still keeps every safety gate (clean / no live holder / no open PR); only the AGE differs.
 REAP_WT_SCRATCH_AGE_DAYS="${REAP_WT_SCRATCH_AGE_DAYS:-1}"
+# ── RULE D — THE DISPOSABLE-CLEAN FLOOR (the measured fix for `worktree=0`) ───────────────────────
+# THE DEFECT THIS EXISTS FOR. `REAP_WT_AGED_DAYS=7` was the ONLY lever left on a CLEAN checkout
+# whose head matches no PR (rule 6). Measured on cell-3, 2026-11-10, with the current delegate over
+# the three repos that box holds: `examined=289 remove=95 preserved=194`, and of the preserved
+# `no-pr:60`, `dirty:41`, `ignored-artifact:6`, `live-process:11` — so 60 of the preserved rows were
+# clean, holder-free, non-open-PR checkouts held ONLY by the 7-day clock, and rule 6 preserves them
+# for the whole of that window. The same box reaped ZERO worktrees per hourly pass while holding
+# ~230, which is why an operator hand-cleared it six times in a day.
+#
+# WHY AGE IS THE WRONG GATE. The 7-day floor is a PROXY for "this is abandoned". The property that
+# actually makes a removal safe is already computed, per row, before any floor is consulted:
+#   * CLEAN — the clean gate (rule 2, plus the #3405 archive of lane evidence) is the ONLY case where
+#     removal destroys something unrecoverable; a dirty tree is refused there, unconditionally.
+#   * NO LIVE HOLDER — rule 1 / rule 7 / `live-cwd` / `live-claim` refuse a tree a lane holds.
+#   * NOT AN OPEN PR — rule=P vetoes in-flight work whatever the clock says.
+#   * COMMITS SURVIVE — `refs=` proves it (`git worktree remove` takes the CHECKOUT, never the
+#     branch), and a head on no ref is refused as `detached-unreachable`.
+# What the 7 days adds on top of those is "a lane that was dispatched and has not written yet".
+# Rule 7 already bounds that at 45 minutes; a floor measured in DAYS does not protect it any better,
+# it just keeps every checkout the fleet creates for a week.
+#
+# SO: a clean, holder-free, non-open-PR checkout is DISPOSABLE, and its floor is a COOLDOWN (hours),
+# not a proof of abandonment (days). It only ever LOWERS a floor — it can never widen a removal past
+# a gate that already refused, and it never touches a MERGED/patch-equivalent head, whose own floor
+# (REAP_WT_MERGED_AGE_DAYS=0) is a deliberate decision this rule does not revisit.
+# ⛔ DEFAULT 0 — OFF — AND THAT IS THE POINT, NOT TIMIDITY. Rule 6's 7-day window is a RECORDED,
+# TESTED decision, pinned by A2/A3/A14a/A26c2/E3b/E4/G6a/G6c/G14d: "a measured 3-day-old clean
+# checkout holding 5.7 GB was merged, clean and holder-free, and the 7-day floor kept it while the box
+# sat at 87% used. An unmerged head is NOT exempt: there the age floor still governs." Turning that
+# off by default would be a QUIET REVERSAL of a deliberate choice — every one of those ten assertions
+# measures it — so this rule ships as a CAPABILITY that a box ARMS, in the same shape #1678 already
+# uses for the reaper itself: the template ships `--dry-run`, and enabling it is a dated, reversible,
+# per-machine operator decision.
+#
+# SO THE ARMS ARE: `REAP_WT_DISPOSABLE_AGE_MINUTES=720` (12 h) is the recommended value and is what
+# cell-3 was measured with (2026-11-10: 148 rows became removable across the three repos that box
+# holds, 94 of them on-disk and every one verified clean, holder-free and non-open-PR before removal);
+# `0` — the default — restores the pre-rule behaviour EXACTLY (no cap, so rule 6's 7-day window is the
+# whole gate again). The value is a COOLDOWN, not a policy: a lane that is genuinely working is
+# protected by the CENSUS, and a lane that is dispatched-but-idle is protected by its claim, so the
+# cooldown only has to cover a lane whose process is gone and whose claim was never written.
+REAP_WT_DISPOSABLE_AGE_MINUTES="${REAP_WT_DISPOSABLE_AGE_MINUTES:-0}"
 # Path patterns that mark a lane scratch checkout. Basename match, deliberately narrow: `wt-4212`,
 # `cell-wt-diskhyg2` — NOT `wt` or a repo whose name merely starts with `wt`.
 REAP_WT_SCRATCH_GLOB="${REAP_WT_SCRATCH_GLOB:-wt-*|cell-wt-*}"
@@ -909,6 +1061,16 @@ DEFERRED_REMOVE=0
 WT_TOTAL=0
 REMOVE_C=0
 PRESERVE_C=0
+# ── THE STALLED REVIEW LIST (agent-infra#2179) ─────────────────────────────────────────────────────
+# A record that is 0 commits ahead (lane residue by construction), is NOT released by this pass, and
+# has no releasing floor in force or was withheld by a gate past it, is residue that holds its issue
+# out of dispatch for EVER — which is the defect #2179 exists to remove. It is counted and NAMED below
+# instead of reading as a routine `preserve`. ⛔ STALLED_N IS A SUBSET OF `preserved`, never a fourth
+# verdict: the SUMMARY identities (`examined = classified + deferred`, `classified = remove +
+# preserved`) are unchanged, and `stalled=` answers a DIFFERENT question — "how much residue can no
+# later pass release on its own" — so folding it into either side of those identities would break them.
+STALLED_N=0
+STALLED_LIST=""
 # Records the pass actually DECIDED (a deferred record never reached classify_one).
 CLASSIFIED_C=0
 # Every preserved reason, space-separated, folded into the SUMMARY line by summary_reasons().
@@ -973,6 +1135,8 @@ Usage:
                   ahead (a lane that never committed; #2033). OFF by default, and even when given
                   the removal happens only after a VERIFIED backup under REAP_WT_BACKUP_DIR
                   (default \$O/state/reaped-patches/<date>). Age floor: REAP_WT_WIP_AGE_HOURS (24).
+                  While it is OFF, a dirty 0-commits-ahead lane record PAST this floor is PRESERVEd
+                  and named on the STALLED review list with why=opt-in-off (#2179) — never a silent block.
   --list          print worktrees and exit
   --help          this text
 
@@ -995,7 +1159,7 @@ remote's advertised default branch and its oid, with the local ref chain as
 the fallback. REAP_WT_MAIN_PROOF=local forces the local chain (no network).
 
 The pass ends with ONE machine-readable SUMMARY line (examined/classified/
-remove/preserved/deferred/removed/reasons/main_proof/pr_merged/verdict).
+remove/preserved/deferred/removed/reasons/main_proof/pr_merged/stalled/verdict).
 \`verdict=\` is the PASS's own answer, not a counter: \`reclaimed\` (it removed
 something), \`idle\` (nothing to do), \`dry-run\`, \`unmeasured\` (it decided work
 and removed none, but free space could not be read), or \`reap-ineffective\` —
@@ -1004,6 +1168,39 @@ space is below REAP_WT_DISK_FLOOR_MB. The last one is also RECORDED in
 \$STATE_DIR/reap-ineffective; any pass that EVALUATES the condition removes that
 file when it does not hold, and a pass that never reached the verdict (a
 fail-closed abort) neither writes nor deletes it.
+
+\`stalled=\` is the STALLED REVIEW LIST's tally (#2179): 0-commits-ahead lane
+residue this pass did NOT release and no later pass will release on its own. It is
+a SUBSET of \`preserved=\`. A non-zero tally prints the list itself, each row
+naming the ISSUE its branch holds out of dispatch (? when the branch carries no issue number — a
+\`REAP_WT_LANE_BRANCH_RE\` override can name lanes without digits), with the reason and the floor
+in force, in the unit THAT CLASS'S floor is stated in — whole hours for the two hour floors below,
+SECONDS for the one sub-hour floor — because a record that cannot be dated is not listed. A selected
+removal that FAILED (unverified backup, removal-time re-check) is deliberately NOT listed either: it
+is counted under \`remove=\` and reported by \`failed=\`/exit 4, and keeping it out is what makes
+\`stalled=\` an exact SUBSET of \`preserved=\`. The bound is the class floor plus one sweep.
+
+A record is NAMED on that list for one of three reasons (the row's \`why=\`):
+  why=opt-in-off            dirty tree past its floor, \`--reap-abandoned-wip\` unarmed
+  why=withheld-by-abstention a STASH ENTRY names the branch, past its floor (durable parked work)
+  why=ignored-data-held     the tree holds NON-REGENERABLE IGNORED data past its floor — no flag
+                            moves that class at all, so only an operator can release it
+The three floors a listed row can name, all operator-settable:
+  REAP_WT_GHOST_AGE_HOURS     (2)    the clean 0-commits-ahead lane class (ghost-zero-ahead)
+  REAP_WT_WIP_AGE_HOURS       (24)   the dirty and non-regenerable-ignored-data classes
+  REAP_WT_STALE_INIT_SECONDS  (1800) the interrupted-add class: an \`initializing\` lock older than
+                                     this is an add that never returned. THE ONE FLOOR STATED IN
+                                     SECONDS, because it is sub-hour — rounding it into hours would
+                                     print \`age=1h floor=1h\` for a record that is past it.
+A record INSIDE its floor is never listed: the next sweep resolves it (for the interrupted-add
+class, exactly AT the floor counts as inside-or-past — it IS listed, as \`age=1800s floor=1800s\`).
+
+Each \`why=\` names the ONLY release path, and they are NOT interchangeable:
+  opt-in-off             \`--reap-abandoned-wip\` (backup verified FIRST)
+  ignored-data-held      move or accept the NON-REGENERABLE ignored data, then the class releases
+  withheld-by-abstention drop the STASH ENTRY the branch's work is parked in (\`git stash drop\`).
+                         \`--reap-abandoned-wip\` CANNOT release this one: the stash entry withholds
+                         the record BEFORE that arm is reached, so arming the flag changes nothing.
 
 `git worktree remove` deletes the CHECKOUT, never the branch — named-branch
 worktrees lose no commits, and this script never runs \`git branch -D\`.
@@ -2817,6 +3014,46 @@ is_lane_branch() { # <branch-ref> -> 0 when the harness itself created this bran
     grep -Eq -- "$REAP_WT_LANE_BRANCH_RE" <<<"$1"
 }
 
+# stalled_tok <class> <issue> <age-with-unit|?> <floor-with-unit> <why> — the STALLED LIST's token (#2179).
+# ⛔ IT RIDES ON THE ROW'S DETAIL FIELD, not on a shell global, and that is forced by the caller's
+# shape: `classify_one` runs inside `crumb="$(classify_one …)"`, i.e. a COMMAND SUBSTITUTION, so every
+# variable it sets dies with that subshell. A token in the row is the only channel that survives, and
+# it is the same channel the parent already reads for `refs=remote-holds:`. `<floor>` is the class
+# floor the record is PAST — every caller applies that floor before emitting (review round 2,
+# PR #3881: a floor quoted for a record that cannot be dated states a bound that was never applied).
+# ⛔ `<age>` ARRIVES ALREADY SUFFIXED (`26h`, `5430s`) BECAUSE THE UNIT IS THE CLASS'S floor unit
+# (review round 7, PR #3881): an age printed in hours cannot be compared with a sub-hour floor, and
+# rounding that floor UP to an hour would hide the fact that the record is past it. A caller whose
+# floor is in hours passes `"${_st_age}h"`; the interrupted-add arm passes its own seconds, which it
+# already has (`init_age`) and its floor is stated in.
+# age_h_ceil <now> <ts> — whole hours PAST-ROUNDED. ⛔ EVERY stalled row whose floor is in HOURS uses
+# it, because the floor tests in `classify_one` compare SECONDS while the row prints HOURS: truncated, a
+# record 24h30m old
+# printed `age=24h floor=24h` — indistinguishable from a record AT its floor, which is NOT listed, so
+# the row could not show the one thing it exists to state (that it is PAST the floor). Review rounds
+# 3 and 4 (#3881) each found an emitter still truncating; one helper is what stops a fourth site
+# being written by hand.
+age_h_ceil() { local d=$(( $1 - $2 )); [ "$d" -gt 0 ] || d=0; printf '%s\n' "$(( (d + 3599) / 3600 ))"; }
+
+stalled_tok() {
+    # ⛔ AN EMPTY ISSUE PRINTS `?`, NEVER A BARE `#` (review, PR #3881): `issue=#` is a field an
+    # operator cannot read and a test cannot match. ⛔ ALL FIVE EMITTERS ARE LANE-GATED, BUT THAT DOES
+    # NOT MAKE AN ISSUE GUARANTEED: `is_lane_branch` is a REGEX MEMBERSHIP test over
+    # `REAP_WT_LANE_BRANCH_RE` while the issue is LEADING DIGITS in the branch tail (`lane_issue_of`),
+    # and the two coincide only at the DEFAULT pattern (`feat/<N>-tm`). A fork that overrides the
+    # pattern (`:816`, "overridable so a fork that names its lanes differently is a config change") to
+    # something like `^refs/heads/lane/` gets `issue=?` on a genuine lane row — honestly so: the record
+    # IS residue, the issue just cannot be named. The legend says that out loud. (An earlier revision
+    # of this comment claimed an empty issue could "only mean the branch parser was handed something
+    # else"; the override makes that false — review round 10, PR #3881.) The interrupted-add arm was
+    # ALSO the one emitter missing the lane gate entirely until round 9; if a sixth is added, it needs
+    # the gate too.
+    local iss="${2:-}"
+    [ -n "$iss" ] && iss="#$iss" || iss="?"
+    printf 'stalled=1 class=%s issue=%s age=%s floor=%s why=%s' \
+        "$1" "$iss" "${3:-?}" "$4" "$5"
+}
+
 # claims_load — ONE bounded fetch of the registry into this pass's own namespace.
 # The destination is `refs/pireap-claims/*`, never `refs/claims/*`: a fetch INTO the registry's
 # namespace would look like an acquisition to every reader on every box. `--prune` is scoped to
@@ -3327,19 +3564,36 @@ rotate_records() {
 # provably landed) would be frozen forever.
 abstain_gate() {
     local path="$1" branch="$2" refs="$3" proved="${4:-0}" hit unp
+    # <5>: the STALLED token (#2179) the CALLER supplies when the record it is deciding is 0-commits
+    # lane residue — the caller is the only frame that knows the class and its floor. It is appended to
+    # each preserve row, so a withholding gate on that class is NAMED on the review list rather than
+    # reading as a routine preserve. `${st:+ $st}` emits NOTHING when the argument is absent, so every
+    # other call site's row text is byte-identical to before this change.
+    local st="${5:-}"
     # A stash register entry naming this branch is the most specific evidence of
     # parked work there is, and an UNREADABLE register fails closed.
     case "$STASH_STATE" in
         unreadable)
+            # ⛔ NO STALLED TOKEN HERE (review round 3, PR #3881): `STASH_STATE=unreadable` is a
+            # TRANSIENT probe failure (a `mktemp` failure or a bounded-read timeout) and
+            # `stash_index_load` re-reads the register at the top of every pass — exactly the shape
+            # round 2 removed `claim-unverified` for. A stalled entry must be a state NO later pass
+            # resolves; this one resolves itself.
             printf 'preserve\tstranded-stash-unverifiable\t\trule=P proof=stash-register:unreadable cannot read the stash register — a register we cannot read is not a clear register\n'
             return 0 ;;
     esac
     if hit="$(stranded_stash_for "$branch")"; then
-        printf 'preserve\tstranded-stash\t\trule=P proof=stash-register:%s the stash register holds work for %s\n' "${hit%%$'\t'*}" "${branch#refs/heads/}"
+        # ⛔ THIS IS THE ONLY ABSTENTION THAT EARNS THE TOKEN (#3881 review round 3): a stash ENTRY
+        # naming this branch is DURABLE parked work — a later pass re-reads the same register and
+        # finds the same entry, so nothing releases it without an operator. The probe-failure arms
+        # around it are transient and self-resolving, so they carry nothing.
+        printf 'preserve\tstranded-stash\t\trule=P proof=stash-register:%s the stash register holds work for %s%s\n' "${hit%%$'\t'*}" "${branch#refs/heads/}" "${st:+ $st}"
         return 0
     fi
     [ "$proved" = 1 ] && { UNPUSHED_NOTE=""; return 1; }
     if ! unp="$(unpushed_ahead "$path")"; then
+        # ⛔ NO TOKEN HERE EITHER, for the same reason as the unreadable register above: an
+        # unanswerable `rev-list` is a probe failure the next pass re-takes.
         printf 'preserve\tunpushed-unverifiable\t\trule=P proof=git rev-list --count HEAD --not --remotes:unreadable cannot evaluate whether this head is pushed — abstaining\n'
         return 0
     fi
@@ -3820,10 +4074,10 @@ holders_live() {
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
     local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf proof_txt=""
-    local head_ts tree_ts witness wname age_s young age_floor aged_note
+    local head_ts tree_ts witness wname age_s young age_floor aged_note floor_s floor_src disp_s floor_note floor_label
     local pr pr_state pr_num pr_oid pr_key pr_other subj prnum_note pr_floor no_pr_proof
     local issue="" claim="absent" init_age="" wt_ts="" wt_ok=0
-    local unp stash_hit
+    local unp stash_hit _ia_st=""
     UNPUSHED_NOTE=""
     case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trule=P proof=worktree-list --porcelain record had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
     if [ "$branch" = "BARE" ]; then printf 'preserve\tbare\t\trule=P proof=worktree-list bare repository\n'; return 0; fi
@@ -3961,7 +4215,37 @@ classify_one() {
         # value: the surviving refs above only promise the commits are RETAINED on a branch, which is
         # not the same claim as "landed on main" — so the unpushed arm is allowed to fail closed here.
         # A stash the register names for this branch is parked lane work, and it outranks the class.
-        abstain_gate "$path" "$branch" "$refs" 0 && return 0
+        # ⛔ THE `refs=merged` HALF IS NAMED ON THE LIST (review round 7, PR #3881). The rule stated at
+        # the top of this file is "0-commits-ahead lane residue, past its class floor, that this pass
+        # could not release is ON THE LIST", and an interrupted add is not released by anything: the
+        # stash entry that withheld it is re-read by `stranded_stash_for` on every later pass. It was
+        # the ONE lane-residue arm that neither released nor listed a withheld record, so a pass that
+        # left the issue un-dispatchable printed `stalled=0` — the false "all clear" the list exists
+        # to prevent. ⛔ ROUND 3's JUDGEMENT IS NOT REVERSED: `branch-retained:*` still holds commits,
+        # so it is not 0-ahead residue and gets no token; only `merged` (the tip is an ancestor of
+        # main) is named. Both fields are SECONDS here because `init_age` already is and so is this
+        # class's floor (`REAP_WT_STALE_INIT_SECONDS`) — see `stalled_tok` for why the unit is not
+        # rounded into hours.
+        #
+        # `_ia_st` is DECLARED (and emptied) with the other locals at the top of this function, because
+        # `abstain_gate` is called with it UNCONDITIONALLY below — a `set -u` bang there is what a local
+        # declaration prevents. It is assigned exactly once, on the `refs=merged` half only.
+        # ⛔ LANE-GATED, LIKE EVERY SIBLING (review, PR #3881 round 9). `refs=merged` alone is NOT the
+        # list's class: the header scopes it to "0-commits-ahead LANE residue" and the legend says each
+        # row "names the ISSUE its branch holds out of dispatch", while this arm is entered from
+        # `init_lock_age` alone (no branch-shape test above it). Without the gate an interrupted
+        # `worktree add` on any branch at all — a `topic/foo` checkout whose register holds a stash
+        # naming it — was published as `stalled=1 class=interrupted-add issue=? …` under a header
+        # reading "the 0-commits-ahead lane class". The FOUR sibling emitters all gate (unarmed dirty,
+        # armed abandoned-wip, ignored-artifact, ghost-zero-ahead), so this was the one gap — five
+        # emitters in total once this one is counted.
+        # No verdict changes: the record is preserved either way, it is simply no longer NAMED as a
+        # lane's residue when it is not a lane branch.
+        if [ "$refs" = merged ] && is_lane_branch "$branch"; then
+            _ia_st="$(stalled_tok interrupted-add "$issue" "${init_age}s" \
+                "${REAP_WT_STALE_INIT_SECONDS}s" withheld-by-abstention)"
+        fi
+        abstain_gate "$path" "$branch" "$refs" 0 "$_ia_st" && return 0
         printf 'remove\tinterrupted-add\t%s\trule=L lock=initializing age=%ss refs=%s claim=%s — an add that never returned; nothing was materialised into it\n' \
             "" "$init_age" "$refs" "$claim"
         return 0
@@ -4025,6 +4309,62 @@ classify_one() {
     case "$cverdict" in
         clean) eph="$cpay" ;;
         dirty)
+            # ── STALLED (#2179): 0-commits-ahead LANE residue this pass cannot release ───────────
+            # This arm exists because the class was INVISIBLE: with `--reap-abandoned-wip` unarmed
+            # (the shipped default, and what the sweep wrapper runs) a dirty, 0-commits-ahead,
+            # lane-owned record fell through to the generic rule-2 preserve below, which carries no
+            # AGE, no CLASS and no ISSUE — so the record held its issue out of dispatch for ever and
+            # the pass reported nothing an operator could act on. `refs=merged` IS the 0-ahead test
+            # (the tip is an ancestor of the main ref), i.e. the branch holds no commit main does not.
+            # ⛔ IT CHANGES NO VERDICT — the row is `preserve` before and after, and it is placed
+            # BEFORE the opt-in arm so the armed path's own rows (removal, its floors, its abstentions)
+            # are untouched. It only NAMES the class and the reason it cannot move.
+            if [ "$REAP_WT_WIP" != 1 ] && is_lane_branch "$branch" \
+                    && [ "$(commits_survive "$sha" "$branch")" = "merged" ]; then
+                # ⛔ AN UNREADABLE REGISTRY IS NEVER STALLED RESIDUE — NOT IN THIS ARM EITHER
+                # (review round 6, PR #3881). This was the ONE lane-residue arm that never consulted
+                # `claim`: on a pass whose registry probe failed (`CLAIMS_STATE=unavailable`, logged
+                # as `CLAIMS abstain this pass` by the run loop) `claim_verdict` answers `unknown` for
+                # every issue, so the `claim=live` early return above cannot fire and EVERY dirty
+                # 0-ahead lane record — including one a live lease actually holds — was published on
+                # the list with `why=opt-in-off`. The next pass re-reads the registry and those rows
+                # vanish, which is the flapping the header forbids. Same preserve the ARMED arm takes:
+                # the state is NAMED, and no token is emitted.
+                if [ "$claim" = "unknown" ]; then
+                    printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
+                    return 0
+                fi
+                # ⛔ A RECORD THAT CANNOT BE DATED CANNOT BE "PAST ITS FLOOR" (review round 2,
+                # PR #3881): listing it would state a floor that was never applied. The row names
+                # the state; the class is preserved exactly as before.
+                # ⟳ The `_st_age="?"` assignment that used to sit ABOVE this guard was DEAD (review
+                # round 7, PR #3881): every path that reaches the emitter reassigns it below, so it
+                # was an initialiser that read like a guard.
+                if [ "$wt_ok" != 1 ]; then
+                    printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s (cannot date the checkout, so the %sh abandoned-wip floor cannot be applied)\n' \
+                        "$cpay" "$REAP_WT_WIP_AGE_HOURS"
+                    return 0
+                fi
+                # ⛔ `wt_ok` IS PROVEN HERE — the `!= 1` early return above is the only path that
+                # reaches this line with an undated checkout, so there is no second guard to write
+                # and none to leave behind: an `if [ "$wt_ok" = 1 ]` (or a bare `if :`) wrapper here
+                # reads as a floor guard while testing nothing (review round 3, PR #3881).
+                _st_age="$(age_h_ceil "$now" "$wt_ts")"
+                # ⛔ THE CLASS FLOOR STILL APPLIES WITH THE SWITCH OFF (review, PR #3881). It is
+                # what covers `worktree add` -> first commit: without it a lane's FIRST uncommitted
+                # edit (0 commits, dirty, no live claim) was published as stale residue on the very
+                # next sweep, and #2179 §Required 2 scopes the list to records PAST their floor for
+                # exactly that reason. What the switch changes is the CONSEQUENCE of reaching the
+                # floor — releasable (armed) vs REVIEWABLE (unarmed), which `why=opt-in-off` says.
+                if [ "$((now - wt_ts))" -le "$((REAP_WT_WIP_AGE_HOURS * 3600))" ]; then
+                    printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s (inside the %sh abandoned-wip floor; nothing to review yet)\n' \
+                        "$cpay" "$REAP_WT_WIP_AGE_HOURS"
+                    return 0
+                fi
+                printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s %s\n' "$cpay" \
+                    "$(stalled_tok abandoned-wip "$issue" "${_st_age}h" "${REAP_WT_WIP_AGE_HOURS}h" opt-in-off)"
+                return 0
+            fi
             # ── abandoned WIP, OPT-IN (#2033): 0 commits ahead, dirty, lane-owned ──────────────
             # 24 of these were measured in one repo: a lane that never made its first commit, so the
             # ONLY copy of its work is this working tree. A normal pass PRESERVES it (`dirty` is rule
@@ -4033,6 +4373,10 @@ classify_one() {
             # the run loop runs BEFORE `remove_one_forced`). Nothing here is default behaviour.
             if [ "$REAP_WT_WIP" = 1 ] && is_lane_branch "$branch"; then
                 if [ "$claim" = "unknown" ]; then
+                    # ⛔ NOT ON THE STALLED LIST (review round 2, PR #3881): this gate runs before the
+                    # class-floor test below, and `claims_load` re-reads the registry every pass — so
+                    # both the "past its floor" qualifier and the "no later pass can resolve it" test
+                    # fail here. Nothing is emitted but the abstention itself.
                     printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
                     return 0
                 fi
@@ -4049,6 +4393,8 @@ classify_one() {
                     # The floor exists to protect a checkout someone may still be working in. If the
                     # CHECKOUT's age cannot be read, that floor cannot be applied — abstain rather than
                     # reap on the base commit's date, which is what made the floor decorative.
+                    # ⛔ NOT LISTED (review round 2, PR #3881): the token would print a floor for a
+                    # record whose age could not be read, i.e. a bound that cannot be applied to it.
                     printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_WIP_AGE_HOURS cannot be applied)\n' "$path"
                     return 0
                 fi
@@ -4061,13 +4407,33 @@ classify_one() {
                 # 0 ahead, lane-owned, old", and a stash naming this branch is exactly the parked work
                 # the dirty tree cannot show. `landing-proved=1` — the `refs=merged` case above is an
                 # ancestry proof for THIS head, the same exemption rule 3 takes on the same datum.
-                abstain_gate "$path" "$branch" "$refs" 1 && return 0
+                abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok abandoned-wip "$issue" "$(age_h_ceil "$now" "$wt_ts")h" "${REAP_WT_WIP_AGE_HOURS}h" withheld-by-abstention)" && return 0
                 printf 'remove\tabandoned-wip\t%s\trule=L refs=merged dirty=%s age=%sh claim=%s witness=worktree-record backup=required\n' \
                     "$cpay" "$(((now - wt_ts) / 3600))" "$claim"
                 return 0
             fi
             printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s\n' "$cpay"; return 0 ;;
-        ignored-artifact) printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s\n' "$cpay"; return 0 ;;
+        ignored-artifact)
+            # ⛔ THIS ARM IS THE OTHER WAY A RECORD IS BLOCKED FOR EVER, SO IT IS NAMED TOO (review
+            # round 5, PR #3881). `rule=2` preserves this class on EVERY pass and NO flag moves it
+            # (`--reap-abandoned-wip` only enters the DIRTY case above), so a 0-commits-ahead lane
+            # record whose tree holds non-regenerable ignored data blocks its issue indefinitely while
+            # the row reads as routine — and `clean_gate`'s own measurement records
+            # `ignored-artifact` as the largest preserve bucket in a real pass (`:876-880`).
+            # ⛔ IT CHANGES NO VERDICT: the row is `preserve` on both paths; only the detail gains the
+            # token. The gates ARE the abandoned-wip arm's — 0 commits ahead (`refs=merged` is the
+            # test), lane-owned, past a floor — plus round 2's rule that a TRANSIENT unreadable probe
+            # (`claim=unknown`) is resolved by the next pass and so is never listed. The floor is the
+            # WIP one, not the 2 h ghost floor: the files this class holds are NOT regenerable, so it
+            # is the data-holding class, and it is never auto-released (owner decision, #2179).
+            if [ "$claim" != "unknown" ] && is_lane_branch "$branch" && [ "$wt_ok" = 1 ] \
+                    && [ "$((now - wt_ts))" -gt "$((REAP_WT_WIP_AGE_HOURS * 3600))" ] \
+                    && [ "$(commits_survive "$sha" "$branch")" = "merged" ]; then
+                printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s %s\n' "$cpay" \
+                    "$(stalled_tok ignored-artifact "$issue" "$(age_h_ceil "$now" "$wt_ts")h" "${REAP_WT_WIP_AGE_HOURS}h" ignored-data-held)"
+                return 0
+            fi
+            printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s\n' "$cpay"; return 0 ;;
         status-timeout)   printf 'preserve\tstatus-timeout\t\trule=2 proof=git-status:timeout %s\n' "$cpay"; return 0 ;;
         *)                printf 'preserve\tstatus-error\t\trule=2 proof=git-status:error %s\n' "$cpay"; return 0 ;;
     esac
@@ -4121,19 +4487,50 @@ classify_one() {
     #      see the ⛔ block in the header — so it never appears in `refs=`;
     #   3. a LANE SCRATCH checkout (`wt-*` / `cell-wt-*`) is a throwaway dir, so its
     #      floor is CAPPED at REAP_WT_SCRATCH_AGE_DAYS. The cap only ever LOWERS.
+    #   4. RULE D — a CLEAN, holder-free, non-open-PR checkout is DISPOSABLE, so its floor is the
+    #      short cooldown REAP_WT_DISPOSABLE_AGE_MINUTES instead of the 7-day abandonment proxy.
+    #      It applies ONLY where input 1/2 did not already decide the floor: a MERGED or
+    #      patch-equivalent head keeps its own (deliberate, 0-day) floor untouched.
     # `too-young` (rule 7) is a separate, harder minimum applied on top.
     age_floor="$REAP_WT_AGED_DAYS"
+    floor_src=aged
     case "$refs" in
-        merged) age_floor="$REAP_WT_MERGED_AGE_DAYS" ;;
+        merged) age_floor="$REAP_WT_MERGED_AGE_DAYS"; floor_src=merged ;;
         *)
             if patch_equivalent "$sha"; then
                 age_floor="$REAP_WT_MERGED_AGE_DAYS"
+                floor_src=merged
                 log "CLASSIFY patch-equivalent $path head=$sha"
             fi ;;
     esac
     if [ "$REAP_WT_SCRATCH_AGE_DAYS" -lt "$age_floor" ] && is_scratch_path "$path"; then
         age_floor="$REAP_WT_SCRATCH_AGE_DAYS"
+        floor_src=scratch
     fi
+    # ── RULE D, applied as a FLOOR in SECONDS so the day-dials and the minute-dial compare in one
+    # unit. `floor_s=0` still means "no floor", exactly as `age_floor=0` did — and a floor of 0
+    # CANNOT BE LOWERED, so an armed RULE D is INERT on a `REAP_WT_AGED_DAYS=0` box rather than
+    # RAISING a 12 h cooldown onto it. (The `-eq 0` disjunct that used to open this test did exactly
+    # that: on the box that chose the MOST aggressive age setting it silently produced the opposite
+    # policy for eleven hours of every day — the "reaper reclaims nothing" class this rule exists to
+    # end. #3888 review F2.)
+    # `floor_src` is the gate that keeps RULE D off a MERGED / PATCH-EQUIVALENT head and off a LANE
+    # SCRATCH checkout: both already set a floor of their own, and this rule never RE-decides one.
+    floor_s=$((age_floor * 86400))
+    disp_s=0
+    if [ "$floor_src" = aged ] && [ "$REAP_WT_DISPOSABLE_AGE_MINUTES" -gt 0 ]; then
+        disp_s=$((REAP_WT_DISPOSABLE_AGE_MINUTES * 60))
+        if [ "$disp_s" -lt "$floor_s" ]; then floor_s="$disp_s"; else disp_s=0; fi
+    fi
+    # The row marker that makes the policy LEGIBLE after the fact: which floor decided this row, and
+    # which rule set it. A removal that cites a floor the operator did not expect is the whole
+    # complaint this change answers, so the number is on the row, not only in this comment.
+    floor_note=" floor=$((floor_s / 60))m($( [ "$disp_s" -gt 0 ] && printf 'ruleD' || printf "$floor_src" ))"
+    # The removal row's `proof=` label follows the marker. A row the cooldown decided must not label
+    # itself `aged-floor(…)` while its own marker says `ruleD` — two names for one decision is how a
+    # reader stops trusting either.
+    floor_label=aged-floor
+    [ "$disp_s" -gt 0 ] && floor_label=disposable-floor
 
     # ── rule=P: an OPEN PR outranks every removal rule. Unchanged, and it is
     # still a VETO rather than a vote: an open PR means the branch is live work
@@ -4183,6 +4580,12 @@ classify_one() {
         # a non-lane branch keeps the operator's full cooldown, so this widens nothing else.
         if is_lane_branch "$branch"; then
             if [ "$claim" = "unknown" ]; then
+                # ⛔ NOT ON THE STALLED LIST (review round 2, PR #3881), and two reasons that both
+                # matter: (a) this gate runs BEFORE the class-floor test below, so listing here would
+                # publish a record that is INSIDE its floor — the qualifier the list is built on; and
+                # (b) `claims_load` re-reads the registry at the TOP OF EVERY PASS, so an unreadable
+                # registry is resolved by the next sweep with no operator action. A stalled entry is
+                # by definition a state no later pass can resolve, and this is not one.
                 printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
                 return 0
             fi
@@ -4190,6 +4593,9 @@ classify_one() {
                 # Same fail-closed rule as abandoned-wip: the ghost floor is the ONLY thing separating a
                 # dispatch that started seconds ago from residue, so it must be applied on the
                 # checkout's own age or not at all.
+                # ⛔ NOT LISTED, and the same two reasons as the claim gate above: it runs before the
+                # floor test, and it prints a floor for a record whose age could not be read — i.e. a
+                # bound that cannot be applied to it. The row already NAMES the state.
                 printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_GHOST_AGE_HOURS cannot be applied)\n' "$path"
                 return 0
             fi
@@ -4206,7 +4612,7 @@ classify_one() {
             # order matters: the ghost class deletes the CHECKOUT **and** its 0-ahead branch ref, so a
             # stash the register names for that branch must be able to stop it. `landing-proved=1` is
             # exactly rule 3's exemption — `refs=merged` above is an ancestry proof for this head.
-            abstain_gate "$path" "$branch" "$refs" 1 && return 0
+            abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok ghost-zero-ahead "$issue" "$(age_h_ceil "$now" "$wt_ts")h" "${REAP_WT_GHOST_AGE_HOURS}h" withheld-by-abstention)" && return 0
             log "CLASSIFY ghost $path issue=${issue:-?} claim=$claim age=$(((now - wt_ts) / 3600))h ghost_floor=${REAP_WT_GHOST_AGE_HOURS}h"
             printf 'remove\tghost-zero-ahead\t%s\trule=L refs=merged proof=%s ghost=lane-branch:%s claim=%s age=%sh witness=worktree-record clean=disposable-only unref=%s,no-open-pr delete_lane_branch=yes\n' \
                 "$eph" "$proof_txt" "${issue:-?}" "$claim" "$(((now - wt_ts) / 3600))" "${stale_txt:-no-proc}"
@@ -4216,8 +4622,8 @@ classify_one() {
         # A floor of 0 means "no floor", not "younger than one second": with the
         # ctime witness a checkout can be 0 seconds old, and `age <= 0` would
         # then report the degenerate floor instead of rule 7.
-        if [ "$age_floor" -gt 0 ] && [ "$age_s" -le "$((age_floor * 86400))" ]; then
-            printf 'preserve\ttoo-recent\t\trule=P age %sd ≤ %sd (merged floor) proof=%s\n' "$((age_s / 86400))" "$age_floor" "$proof_txt"
+        if [ "$floor_s" -gt 0 ] && [ "$age_s" -le "$floor_s" ]; then
+            printf 'preserve\ttoo-recent\t\trule=P age %sd ≤ %sd (merged floor) proof=%s%s\n' "$((age_s / 86400))" "$age_floor" "$proof_txt" "$floor_note"
             return 0
         fi
         if [ "$young" = 1 ]; then
@@ -4228,8 +4634,8 @@ classify_one() {
         # #2541: the two abstention gates outrank the REMOVAL, never the rule row.
         # landing-proved=1 here: ancestry to MAIN_REF is proof for this exact head.
         abstain_gate "$path" "$branch" "$refs" 1 && return 0
-        printf 'remove\treclaimable\t%s\trule=3 refs=merged proof=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s\n' \
-            "$eph" "$proof_txt" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}"
+        printf 'remove\treclaimable\t%s\trule=3 refs=merged proof=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s%s\n' \
+            "$eph" "$proof_txt" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}" "$floor_note"
         return 0
     fi
 
@@ -4299,9 +4705,9 @@ classify_one() {
         else
             no_pr_proof="gh-state:no-PR-matches-this-head($subj)"
         fi
-        if [ "$age_floor" -gt 0 ] && [ "$age_s" -le "$((age_floor * 86400))" ]; then
-            printf 'preserve\tno-pr\t\trule=6 proof=%s (no PR matches this head — cannot prove it is landed)%s refs=%s age=%sm\n' \
-                "$no_pr_proof" "${pr_other:+ pr-merged-other-head=$pr_other}" "$refs" "$((age_s / 60))"
+        if [ "$floor_s" -gt 0 ] && [ "$age_s" -le "$floor_s" ]; then
+            printf 'preserve\tno-pr\t\trule=6 proof=%s (no PR matches this head — cannot prove it is landed)%s refs=%s age=%sm%s\n' \
+                "$no_pr_proof" "${pr_other:+ pr-merged-other-head=$pr_other}" "$refs" "$((age_s / 60))" "$floor_note"
             return 0
         fi
         if [ -n "$pr_other" ]; then
@@ -4321,8 +4727,11 @@ classify_one() {
     fi
 
     # ── the age floor in force (already merged / patch-equivalent / scratch aware)
-    if [ "$age_floor" -gt 0 ] && [ "$age_s" -le "$((age_floor * 86400))" ]; then
-        printf 'preserve\ttoo-recent\t\trule=P proof=age:%sd≤%sd(witness=%s) refs=%s\n' "$((age_s / 86400))" "$age_floor" "$wname" "$refs"
+    # ⛔ `%ss`, NOT `%sms`: the first argument is `$age_s`, i.e. SECONDS. A `ms` literal here
+    # mislabels a 2-day-old row as `age:172800ms` — 2.9 minutes to any reader — inside the very field
+    # this change exists to make legible (#3888 review 2, finding 3).
+    if [ "$floor_s" -gt 0 ] && [ "$age_s" -le "$floor_s" ]; then
+        printf 'preserve\ttoo-recent\t\trule=P proof=age:%ss≤%sm(witness=%s) refs=%s%s\n' "$age_s" "$((floor_s / 60))" "$wname" "$refs" "$floor_note"
         return 0
     fi
     if [ "$young" = 1 ]; then
@@ -4344,8 +4753,8 @@ classify_one() {
     # `prunable` reclaim path, i.e. F7) and is pinned from BOTH sides by A26c/A26c2. (#3058 review)
     local rm_reason="reclaimable"
     case "$refs" in remote-holds:*) rm_reason="$refs" ;; esac
-    printf 'remove\t%s\t%s\trule=P proof=aged-floor(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s\n' \
-        "$rm_reason" "$eph" "$aged_note" "$refs" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}"
+    printf 'remove\t%s\t%s\trule=P proof=%s(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s%s\n' \
+        "$rm_reason" "$eph" "$floor_label" "$aged_note" "$refs" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}" "${floor_note:-}"
     return 0
 }
 
@@ -4741,7 +5150,7 @@ report_row() { # <verdict> <path> <reason> <detail>
 }
 
 print_footer() {
-    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED DEFERRED_REMOVE=$DEFERRED_REMOVE CLASSIFIED=$CLASSIFIED_C BRANCH_DELETED=$BRANCH_DELETED BRANCH_KEPT=$BRANCH_KEPT CLAIMS=$CLAIMS_STATE GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED MAIN_PROOF=$MAIN_PROOF PR_MERGED=$PR_MERGED_STATE VERDICT=${PASS_VERDICT:-?} FREE_MB=${FREE_MB:-?}"
+    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED DEFERRED_REMOVE=$DEFERRED_REMOVE CLASSIFIED=$CLASSIFIED_C BRANCH_DELETED=$BRANCH_DELETED BRANCH_KEPT=$BRANCH_KEPT CLAIMS=$CLAIMS_STATE GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED MAIN_PROOF=$MAIN_PROOF PR_MERGED=$PR_MERGED_STATE STALLED=$STALLED_N VERDICT=${PASS_VERDICT:-?} FREE_MB=${FREE_MB:-?}"
 }
 
 # ── THE PASS VERDICT (#3041) ───────────────────────────────────────────────────────────────────
@@ -4918,9 +5327,9 @@ summary_reasons() {
 # what `verdict=` and $STATE_DIR/reap-ineffective add (#3041): a pass can be perfectly self-consistent
 # and still be wrong (52 records, 0 removals, 0 bytes free).
 summary_line() {
-    printf 'SUMMARY examined=%s classified=%s remove=%s preserved=%s deferred=%s deferred_remove=%s removed=%s failed=%s late_preserved=%s prune_blocked=%s reasons=%s main_proof=%s main_ref=%s pr_merged=%s verdict=%s\n' \
+    printf 'SUMMARY examined=%s classified=%s remove=%s preserved=%s deferred=%s deferred_remove=%s removed=%s failed=%s late_preserved=%s prune_blocked=%s reasons=%s main_proof=%s main_ref=%s pr_merged=%s stalled=%s verdict=%s\n' \
         "$WT_TOTAL" "$CLASSIFIED_C" "$REMOVE_C" "$((PRESERVE_C - DEFERRED))" "$DEFERRED" "$DEFERRED_REMOVE" \
-        "$REMOVED" "$FAILED" "$LATE_PRESERVE" "$PRUNE_BLOCKED" "$(summary_reasons)" "$MAIN_PROOF" "${MAIN_REF_NAME:-${MAIN_REF:-?}}" "$PR_MERGED_STATE" "${PASS_VERDICT:-?}"
+        "$REMOVED" "$FAILED" "$LATE_PRESERVE" "$PRUNE_BLOCKED" "$(summary_reasons)" "$MAIN_PROOF" "${MAIN_REF_NAME:-${MAIN_REF:-?}}" "$PR_MERGED_STATE" "$STALLED_N" "${PASS_VERDICT:-?}"
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -4986,7 +5395,10 @@ run() {
              REAP_WT_INEFFECTIVE_MIN_EXAMINED:"$REAP_WT_INEFFECTIVE_MIN_EXAMINED" \
              REAP_WT_DISK_FLOOR_MB:"$REAP_WT_DISK_FLOOR_MB" \
              REAP_WT_SCRATCH_AGE_DAYS:"$REAP_WT_SCRATCH_AGE_DAYS" \
-             REAP_WT_PRESERVE_KEEP_DAYS:"$REAP_WT_PRESERVE_KEEP_DAYS"; do
+             REAP_WT_PRESERVE_KEEP_DAYS:"$REAP_WT_PRESERVE_KEEP_DAYS" \
+             REAP_WT_GHOST_AGE_HOURS:"$REAP_WT_GHOST_AGE_HOURS" \
+             REAP_WT_WIP_AGE_HOURS:"$REAP_WT_WIP_AGE_HOURS" \
+             REAP_WT_STALE_INIT_SECONDS:"$REAP_WT_STALE_INIT_SECONDS"; do
         is_pos_int "${v#*:}" || { echo "bad ${v%%:*}: ${v#*:} (want a non-negative integer)" >&2; exit 2; }
     done
     # An explicit free-space witness is a NUMBER or it is a refusal, for the same reason
@@ -5004,6 +5416,26 @@ run() {
     # rather than silently changing every verdict in the pass.
     awk -v m="$REAP_WT_MERGED_AGE_DAYS" -v x="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(m >= 0 && m <= x)}' \
         || { echo "bad REAP_WT_MERGED_AGE_DAYS: $REAP_WT_MERGED_AGE_DAYS (want 0..$REAP_WT_MAX_DAYS)" >&2; exit 2; }
+    # RULE D's cooldown: a non-negative integer of minutes, or a refusal. 0 is MEANINGFUL here (it
+    # disables the cap and restores the pre-rule behaviour), so it is `is_pos_int`, not a >0 test —
+    # and a value that cannot be COMPARED must die at the door rather than silently removing the cap
+    # (the `REAP_AW_GITLESS_MAX` shape: `[ "$X" -gt 0 ]` on a non-numeric is a usage error at worst,
+    # but an empty value compares as 0 and would read as "the operator disabled it").
+    is_pos_int "$REAP_WT_DISPOSABLE_AGE_MINUTES" \
+        || { echo "bad REAP_WT_DISPOSABLE_AGE_MINUTES: $REAP_WT_DISPOSABLE_AGE_MINUTES (want minutes, a non-negative integer; 0 disables the disposable-clean floor)" >&2; exit 2; }
+    # ⛔ AND IT IS BOUNDED ABOVE, not merely digit-checked. The floor is computed as
+    # `minutes * 60` in shell ARITHMETIC, so a digit string big enough to overflow makes `disp_s`
+    # NEGATIVE — `disp_s < floor_s` is then true, `floor_s` becomes negative, and every
+    # `[ "$floor_s" -gt 0 ]` gate is false. The floor silently DISAPPEARS and the pass reaps clean
+    # non-merged checkouts at any age, while the row prints `floor=0m(…)` as if that were ordinary.
+    # That is the `seam_too_large` fail-open recorded at scripts/disk-reaper.sh:697-704 ("a digit
+    # string above intmax_t passes the case below and then makes the comparison itself error, which
+    # is the SAME fail-open one size class up"), one seam over. The ceiling is the SAME bound the day
+    # dials carry, expressed in this dial's unit (REAP_WT_MAX_DAYS days = REAP_WT_MAX_DAYS*1440
+    # minutes) — a REAP_WT_MAX_DAYS large enough for the DAY arithmetic itself to overflow is already
+    # outside what the day dials survive, and is what A14h/A14k refuse.
+    awk -v d="$REAP_WT_DISPOSABLE_AGE_MINUTES" -v x="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(d >= 0 && d <= x * 1440)}' \
+        || { echo "bad REAP_WT_DISPOSABLE_AGE_MINUTES: $REAP_WT_DISPOSABLE_AGE_MINUTES (want 0..REAP_WT_MAX_DAYS*1440 minutes)" >&2; exit 2; }
     # An unrecognised proof mode must not silently become "local" OR "auto": one skips the remote
     # read, the other opens a network call, and neither is what the operator asked for.
     case "$REAP_WT_MAIN_PROOF" in
@@ -5051,8 +5483,10 @@ run() {
     # leave this consolidation silently inert — measured: with `AGENT_INFRA_PATH` naming a checkout that
     # predates `resolve_repo`, sourcing the first existing candidate left the resolver undefined and the
     # reaper answered with the OLD refusal.
-    # The FARM copy (`~/.pi/agent/scripts/`, no orchestrator-harness subtree) legitimately finds none,
-    # and it always arrives with `--repo` from its launchd template — so an UNRESOLVED REPO is the only
+    # The FARM copy (`~/.pi/agent/scripts/`) is a flat tree with no `orchestrator-harness` subtree, so
+    # only the SECOND candidate can match there — and it does: since ai#1552 the farm delivers
+    # `repo-slug.sh` beside this script, so that box resolves like any other. It also always arrives with
+    # `--repo` from its launchd template — so an UNRESOLVED REPO is the only
     # case that may not proceed, and an already-named one keeps the validation four lines below
     # (`rev-parse --git-common-dir`, which proves strictly more than resolve_repo's toplevel probe).
     _repo_lib_stale=""
@@ -5489,6 +5923,16 @@ run() {
             PRESERVE_C=$((PRESERVE_C + 1))
             PRESERVE_REASONS="$PRESERVE_REASONS$reason "
             log "CLASSIFY preserve $p reason=$reason $detail"
+            # ── THE STALLED REVIEW LIST (#2179) ───────────────────────────────────────────────────
+            # `classify_one` cannot set a global (it runs in a command substitution), so a record that
+            # is 0-commits-ahead lane residue with no releasing floor in force — or withheld past it —
+            # carries the token on its own detail and is collected HERE. The token is emitted only by
+            # the lane-residue arms, so this cannot pick up a generic preserve.
+            case "$detail" in
+                *"stalled=1 class="*)
+                    STALLED_N=$((STALLED_N + 1))
+                    STALLED_LIST="${STALLED_LIST}${p}"$'\t'"${reason}"$'\t'"${detail}"$'\n' ;;
+            esac
             # A preserved record that git may ALSO deem prunable must not be
             # swept up by the global, path-filterless prune. The AUTHORITATIVE
             # predicate is git's OWN `prunable` flag: as of the pass-start
@@ -5651,6 +6095,34 @@ run() {
     # ── the pass's own verdict (#3041), computed BEFORE the summary so the one machine-readable
     # line carries it. It also writes/clears $STATE_DIR/reap-ineffective.
     reap_verdict
+
+    # ── THE STALLED REVIEW LIST (agent-infra#2179) ────────────────────────────────────────────────
+    # #2179's other half: a residue that this pass does NOT release must be REVIEWED, not silently
+    # preserved. The bound is the class floor plus one sweep — a record inside its floor is not
+    # listed (the next sweep resolves it), and a record that can no longer cross any floor is
+    # listed with the ISSUE its branch holds out of dispatch, so a human or a lane can complete or
+    # release it. Printed only when non-empty: a header with no rows under it is noise an operator
+    # learns to skip.
+    if [ "$STALLED_N" -gt 0 ]; then
+        log_line ""
+        log_line "STALLED REVIEW LIST (#2179) — ${STALLED_N} record(s) in the 0-commits-ahead lane class that"
+        log_line "this pass did NOT release and cannot release on its own. The bound is the class floor plus"
+        log_line "one sweep: a record inside its floor is not listed here (the next sweep resolves it)."
+        while IFS=$'\t' read -r _sp _sr _sd; do
+            [ -n "$_sp" ] || continue
+            log_line "  $_sp"
+            log_line "      reason=$_sr  $_sd"
+        done <<<"$STALLED_LIST"
+        log_line "  each row names the ISSUE its branch holds out of dispatch (? when the branch carries"
+        log_line "  no issue number), and its why= names the ONLY"
+        log_line "  release path:  opt-in-off             -> --reap-abandoned-wip (backup verified FIRST)"
+        log_line "                 ignored-data-held      -> move or accept the non-regenerable ignored data"
+        log_line "                 withheld-by-abstention -> drop the stash ENTRY the work is parked in;"
+        log_line "                                           --reap-abandoned-wip CANNOT release that one"
+        log_line "  …or land/complete the work. A record that stays here past its bound IS the #2179 defect."
+        log_line "  floor= is the class floor the record is AT OR PAST, in that class's own unit:"
+        log_line "  <n>h for the hour floors, <n>s for the sub-hour interrupted-add floor."
+    fi
 
     log_line ""
     if [ "$MODE" = dry-run ]; then

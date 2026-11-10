@@ -284,9 +284,26 @@ ck "P6 (setup) the report→dispatch window is non-empty, so the scan below is n
 # re-adding the term costs nothing and re-arms the arm), and it gains a STRICTER rule: a reset there is
 # admissible only inside the exit-code contract's arm, which is asserted to EXIST (deleting the arm
 # leaves `dispatch-merge.sh`'s exit 3 unhandled, and that now reds instead of passing silently).
-_dcall="$(grep -n '^[[:space:]]*bash "\$O/dispatch-merge.sh"' "$LOOP" | head -1 | cut -d: -f1)"
+# ⛔ ANCHORED ON THE PROGRAM NAME, NOT ON THE CALL'S SPELLING (fresh review of #3846, P1). The `O` /
+# `O_WORK` split respelled this call `$O/dispatch-merge.sh` -> `${O_WORK:-$O}/dispatch-merge.sh`, and the
+# exact-spelling anchor above matched NOTHING: `_dcall` was empty, so all three windows below fell back
+# to `${_dcall:-0}` and collapsed. Measured at that head: `product-floor.test.sh` 211 passed, 4 failed
+# on a branch whose base is 214 passed, 1 failed — and the pre-call arm below PASSED while scanning
+# ZERO lines, printing output byte-identical to the base's genuine pass. The directory part is matched
+# as "anything", so a future respelling cannot silence these scans. What catches an anchor latching onto
+# a WRONG call site is the non-vacuity arm immediately below — but ONLY when the wrong site falls OUTSIDE
+# `(repend, dend)`: an earlier matching call INSIDE that window would satisfy the arm while TRUNCATING the
+# pre-call scan, which is why this anchor takes `head -1` of a pattern measured to match exactly once here.
+_dcall="$(grep -nE '^[[:space:]]*bash "[^"]*/dispatch-merge\.sh"' "$LOOP" | head -1 | cut -d: -f1)"
 case "$_dcall" in ''|*[!0-9]*) P6C=1 ;; *) P6C=0 ;; esac
 ck "P6 (setup) the dispatch CALL is locatable (call=${_dcall:-?})" $P6C
+# ⛔ AND THE CALL MUST SIT STRICTLY INSIDE THE WINDOW IT SPLITS. Every scan below uses `${_dcall:-0}`
+# as a BOUND, and `NR>s && NR<0` is never true — so an unlocatable call did not red a scan, it turned
+# one into a PASS (`[ -z "$_body" ]` is unconditionally true on an empty window) while its label still
+# claimed the window had been scanned. A window bounded by 0 is not a window: this arm reds by NAME
+# instead of relying on the setup arm above, and it also catches an anchor that matched the wrong call.
+[ "${_dcall:-0}" -gt "${_repend:-0}" ] && [ "${_dcall:-0}" -lt "${_dend:-0}" ]
+ck "P6 (setup) the dispatch CALL sits strictly INSIDE the report→dispatch window, so neither scan is vacuous (repend=${_repend:-?} call=${_dcall:-?} dend=${_dend:-?})" $?
 _body="$(awk -v s="${_repend:-1}" -v e="${_dcall:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit([[:space:];]|$)/ || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
 [ -z "$_body" ]
 ck "P6 [RED→GREEN] from the end of the report to the DISPATCH CALL nothing gates on the floor, empties the batch, resets K or exits (got '${_body:-'<none>'}')" $?
@@ -1228,7 +1245,14 @@ ck "P12 [RED→GREEN] ... and that line really is printed below it (warn line $_
 # README's knob table with no `__NAME__` placeholder must be named in that paragraph — it was hand-kept and
 # had drifted by one (`MERGE_STALL_MIN` was missing while being exactly the silent no-effect it warns about).
 # Computed here rather than eyeballed: a knob added to the table without a placeholder reddens this.
-_tbl="$(awk '/^\| `[A-Z_]+` \|/{gsub(/^\| `/,"");gsub(/`.*/,"");print}' "$HERE/README.md" 2>/dev/null | sort -u)"
+# ⛔ SCOPED TO THE TUNING TABLE — the one this paragraph calls "the table above" (base defect, measured on
+# `origin/main` `74ab1ed18`: 214 passed, 1 failed). The sweep used to walk the WHOLE file, so it also
+# collected the first column of every other `| \`NAME\` | …` table — and §5.4's lane-merge comparison table
+# (`| | origin/main | this tree |`, row `| \`WAIT_S\` | 1500 | 5400 |`, #3850) is not a knob row at all: its
+# first column is a CONSTANT on both sides of a before/after, not a name an operator can set. It landed in
+# `missing` and reddened this arm on main for every PR. Bounded by the section, not by line numbers (a
+# number beside a list goes stale by being incremented).
+_tbl="$(awk '/^### Tuning/{f=1; next} f && /^### /{f=0} f && /^\| `[A-Z_]+` \|/{gsub(/^\| `/,"");gsub(/`.*/,"");print}' "$HERE/README.md" 2>/dev/null | sort -u)"
 _ren="$(grep -o '__[A-Z_]*__' "$HERE/launchd.plist.template" 2>/dev/null | sed 's/__//g' | sort -u)"
 _missing=""
 # Scoped to the PARAGRAPH, not the file: the table immediately above names every one of these knobs, so a

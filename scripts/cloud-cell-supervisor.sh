@@ -18,7 +18,7 @@
 # because a gate an agent can defeat with an export is not a gate.
 #
 # Runs ON THE CELL (Linux). Usage:
-#   bash cloud-cell-supervisor.sh check|start|stop|status|capacity|logs|apply|prune
+#   bash cloud-cell-supervisor.sh check|start|stop [--force]|status|capacity|logs|apply|prune
 #                                  |doctor|merge|reap|hygiene
 #
 #   capacity   print the box's ONE lane-ceiling line — `cpus=N MAX_LANES=M mem_ceiling=K`,
@@ -77,6 +77,31 @@
 # cannot be read is never blessed (cannot-verify is not a pass). `start`/`check` REFUSE with both
 # values, the remote, and the repo the machine needs; `status` prints the pair on one line.
 # ⛔ The refresh loop's own retry/starvation behaviour is #1729 and is NOT changed here.
+#
+# ── THE DEPLOY SEQUENCE IS PRE-FLIGHTED, NOT JUST ITS LAST STEP (agent-infra#2093) ───────────────
+# The gate above refuses the wrong pair in `start` and `check` — but the documented deploy for a cell
+# is `stop` → `start` (`apply` refuses while a controller runs, so `stop` has to come first). That
+# made the refusal land AFTER the one irreversible step: on the measured lane-1 the sequence would
+# have stopped the controller and then refused to start, leaving the box STOPPED with its harness
+# unrefreshed — strictly worse than the stale sha it was found on, which is exactly why it was left
+# running on an 8-day-old commit instead of repaired (§3.2 of docs/ops/fleet-harness-baseline.md).
+# So `stop` runs the SAME gates before its first irreversible act, and says so. The predicates are not
+# re-implemented: `stop` calls `assert_queue_target` and `assert_gh_repo_conformance` themselves, so the
+# verbs cannot drift into the #1745 shape (one verb blesses what the next refuses). ⛔ BOTH, because
+# `start` refuses on TWO wrong-pair configs — the queue/checkout mismatch (#1901) and a global `GH_REPO`
+# that names another repo (#2235) — and a pre-flight that ran only the first stopped a box the second
+# then refused to start (review P2).
+# ⛔ `stop` STAYS ANSWERABLE, which is the whole reason the refusal is narrow. It refuses only when
+# (a) a wrong-pair config exists — either gate, so "not usable" is NOT the whole condition: a usable
+# pair with a wrong `GH_REPO` refuses too — AND (b) this state dir has something a stop would actually
+# END **or the
+# process-table read cannot be made** (the fail-closed branch: a read that fails counts as running).
+# Stopping a cell with NONE of those legs loses nothing; ⛔ a cell that is already DOWN but still carries
+# `state/roles/.desired` is not that case — the marker IS one of the legs, so it needs `--force` too.
+# An operator who means to stop a misconfigured box anyway types `stop --force` — the refusal names that
+# flag. `status` never refuses and is unchanged in that sense; its pair lines were only reworded to say
+# what `stop` does with each state.
+# ⛔ The gate is NOT weakened by any of this: `check`/`start` still refuse the pair outright.
 #
 # Prereqs on the cell (see cloud-cell-bringup.sh --check):
 #   HOME writable · repo cloned · gh authenticated with push · provider key valid
@@ -213,6 +238,30 @@ recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
 # the same paid-loop class as the missing recorder itself. Resolved from the harness checkout.
 recorder_lib_path() { printf '%s\n' "$(dirname "$(recorder_path)")/lib/diff-normalize.py"; }
 recorder_lib_src()  { printf '%s\n' "$HARNESS/../lib/diff-normalize.py"; }
+# ── THE LANDING RAIL (#2176) ─────────────────────────────────────────────────────────────────────
+# The record step is only HALF the landing contract. Step 4 is `record-review.sh`; step 5 is the
+# RAIL, `admin-merge.sh` — and a cell that carries the recorder without the rail completes a PAID
+# review, mints a clean record, and then has nothing runnable left to land with. That is the state
+# agent-infra#2176 measured on every Linux cell, and `start` was one of the two ways to reach it:
+# it provisioned `record-review.sh` (and its declared sibling) and NO part of the rail, so a cell
+# whose `$CELL_HOME/.pi/agent/scripts/` came from `start` — rather than from a fresh
+# `pi-bootstrap`/`cell-install` farm pass — could never land, forever, while `cmd_check` certified
+# it "CELL CAN RUN A CONTROLLER".
+#
+# ⛔ THE LIST IS THE RAIL'S OWN CLOSURE, and it is not a guess: `admin-merge.sh` resolves three
+# helpers from `$SELF_DIR` and REFUSES when one is missing (`CFS="$SELF_DIR/ci-failure-set.sh"`,
+# `EXEMPTION_PY="$SELF_DIR/ci_exemption.py"`, `bash "$SELF_DIR/ci-workflow-pr-evaluable.sh"` at its
+# three evaluator call sites), and `ci-failure-set.sh` resolves `ci_exemption.py` beside itself.
+# Delivering `admin-merge.sh` alone ships an executable whose own executables are absent, i.e. a
+# rail that exits 1 on every invocation — the #1552 class, one delivery mechanism over
+# (`pi-bootstrap/setup.sh`'s `merge_gate_srcs` carries the same four for the same reason).
+# ⛔ THE DESTINATION IS FLAT, beside the recorder, matching the farm — the rail resolves its helpers
+# from its OWN directory, so a nested layout would deliver four files and still satisfy nothing.
+# Sources are read from `$HARNESS/..` — the same tree `recorder_src()` reads the recorder from, so
+# the recorder and the rail can never come from two different checkouts.
+rail_names()    { printf '%s\n' admin-merge.sh ci-failure-set.sh ci_exemption.py ci-workflow-pr-evaluable.sh; }
+rail_dest_dir() { printf '%s\n' "$(dirname "$(recorder_path)")"; }
+rail_src_dir()  { printf '%s\n' "$HARNESS/.."; }
 SESSION="${SESSION:-orch}"
 # The doctor loop's tmux session (agent-infra#1989). A NAME of its own, never a prefix of `$SESSION`.
 # ⛔ Every tmux target that names the DOCTOR uses `=name` exact matching, for the reason orch-loop's
@@ -326,9 +375,18 @@ workers_maybe_live() {
 #                        Without it only the controller would be served. ORDER MATTERS: the adapter
 #                        routes every call through the same `$O/gh-limit.py`, so it must resolve first
 #                        or the adapter is never reached (this file's `start` builds exactly that order
-#                        in both carriers — :4103 for the service-mode export, :4131 for the tmux
-#                        string; `lane.sh:83-84` re-asserts it for lanes).
-WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
+#                        in both carriers — the service-mode pair of `export PATH=…:$PATH` lines, gh-limit
+#                        first and gh-rest prepended AFTER it so the later prepend wins, and the tmux
+#                        `new-session` string's `PATH='$O/gh-rest':'$O/gh-limit':`; `lane.sh` re-asserts
+#                        it for lanes). The carriers are named, not line-numbered, because the #2095
+#                        `O`/`O_WORK` merge moved both — the same positional-claim class #2095 retired.
+#   O_WORK             — the HARNESS ROOT, which is a SEPARATE name from `O` (the state dir) since
+#                        #2095. Every worker resolves its own modules (`claims.sh`, `repo-authority.sh`,
+#                        `merge-one.sh`) from it, so a worker that crosses this second tmux boundary
+#                        without it falls back to `$O` — where those files do not exist — and loses
+#                        the landing/head claims SILENTLY (the duplicate-merge exclusion) while the
+#                        cell keeps reporting RUNNING.
+WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O O_WORK DEEPSEEK_API_KEY PATH"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
@@ -541,9 +599,19 @@ resolve_repo() {
 
 # ONE actionable line, on the verbs that cannot work without a checkout. `status` deliberately does
 # not call it: it is the verb an operator runs to DISCOVER this, so it must still answer.
-assert_repo() {
+# ⛔ $1 IS THE ASKING VERB, AND ONLY `stop` NEEDS IT (review P3, #2093). Every other verb that runs
+# this gate (`start`, `check`, `doctor`, `merge`) declines to START or to RUN a pass, so its refusal is
+# the whole story; `stop` declined to END something, and an
+# operator reading that must be told nothing was stopped and how to stop anyway. This leg was the ONE
+# queue-unusable path that reached `die` without the suffix — so on a cell whose `keys.env` is missing
+# (a plausible reason to be stopping it) the new pre-flight refused with no way past it.
+# ⛔ AND IT PASSES ITS OWN REPAIR CLAUSE: this `die` fires BEFORE any ONE-LINE FIX exists, so the generic
+# tail's "repair the pair with the fix above" would send the operator hunting for a line that was never
+# printed. One tail, one `--force` escape, a per-branch repair clause.
+assert_repo() { # [$1 = the asking verb, so a `stop` refusal carries its own tail]
+  local verb="${1:-}"
   if ! resolve_repo; then
-    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell"
+    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell.${verb:+ $(queue_refusal_suffix "$verb" "Set REPO to a checkout of the repo this cell should work (the message above says how)")}"
   fi
   # ⛔ THE GUARD MUST SEE THE VALUE THAT IS INTERPOLATED, not only the one the OPERATOR passed
   # (agent-infra#1935 review). `cmd_start` validates REPO before this derives it — and skips an
@@ -551,7 +619,7 @@ assert_repo() {
   # string unvalidated: a checkout directory named with a quote would close the quote in
   # `REPO='$REPO'` and the rest would be parsed as shell. This is the same class as the `$HARNESS`
   # re-check below, which exists for exactly this reason (a value that changes after the guard).
-  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO"
+  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO.${verb:+ $(queue_refusal_suffix "$verb" "Set REPO to a checkout path with no quote or shell metacharacter")}"
   # A DERIVED checkout changes the queue target (resolve_queue_target reads its origin), so re-derive
   # OR before anything asserts the pair.
   resolve_queue_target || true; OR="$QUEUE_REPO"
@@ -1662,10 +1730,16 @@ OR="$QUEUE_REPO"
 #      export buys nothing and only arms the next leak.
 assert_gh_repo_conformance() {
   [ -n "${GH_REPO:-}" ] || return 0
+  # ⛔ $1 IS THE VERB ASKING, exactly as `assert_queue_target` takes it (agent-infra#2093 review, P2):
+  # `stop`'s pre-flight runs this gate too, so its refusal must say NOTHING WAS STOPPED and name the
+  # `--force` escape — the same shape the queue gate's tail provides. A GH_REPO that names another repo
+  # is a wrong-PAIR config of that same class, and until this gate joined the pre-flight `stop` walked
+  # past it and stopped a box `start` then refused, which is the lane-1 shape (#1901) over again.
+  local verb="${1:-}"
   local want="${QUEUE_DERIVED:-$QUEUE_REPO}" have got got_src _h="" _whost=""
   got_src="the checkout's origin remote"
   if [ -z "$want" ]; then
-    die "GH_REPO is set ($GH_REPO) but this cell's CHECKOUT repo could not be read, so it cannot be verified against the tree the controller would grade ('git -C $REPO remote get-url origin' => '${QUEUE_REMOTE:-<none>}'). A global GH_REPO is what produced the #2235 fail-open — gh gives it precedence over the checkout for every call that does not pass --repo, so the rail graded daniel-ospina/tortoise PRs while reporting on agent-infra ones. Remove the GH_REPO line from $ENV_FILE (it is per-invocation state, not cell state); the controller resolves its repo from the checkout."
+    die "GH_REPO is set ($GH_REPO) but this cell's CHECKOUT repo could not be read, so it cannot be verified against the tree the controller would grade ('git -C $REPO remote get-url origin' => '${QUEUE_REMOTE:-<none>}'). A global GH_REPO is what produced the #2235 fail-open — gh gives it precedence over the checkout for every call that does not pass --repo, so the rail graded daniel-ospina/tortoise PRs while reporting on agent-infra ones. Remove the GH_REPO line from $ENV_FILE (it is per-invocation state, not cell state); the controller resolves its repo from the checkout.${verb:+ $(queue_refusal_suffix "$verb" "Remove the GH_REPO line from \`$ENV_FILE\`, or drop an ambient \`export GH_REPO\` if that is where yours is set")}"
   fi
   [ "$want" = "$QUEUE_REPO" ] || got_src="the queue target"
   have="$(printf '%s' "$GH_REPO" | tr '[:upper:]' '[:lower:]')"
@@ -1699,7 +1773,7 @@ assert_gh_repo_conformance() {
   esac
   got="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
   if [ "$have" != "$got" ]; then
-    die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering: this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)"
+    die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering ON THE 'start' PATH: there this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)${verb:+ $(queue_refusal_suffix "$verb" "Remove the GH_REPO line from \`$ENV_FILE\`, or drop an ambient \`export GH_REPO\` if that is where yours is set")}"
   fi
   log_line "ok: GH_REPO ('$GH_REPO', from $ENV_FILE or the ambient shell) names this checkout's repo ($want, case-insensitively) — it is stripped from the controller session anyway (#2235)"
   return 0
@@ -1709,31 +1783,88 @@ assert_gh_repo_conformance() {
 # a warning. A wrong pair must not be a cell that starts and looks healthy; it must be a cell that
 # does not start, with an error naming BOTH values, the remote that was read, and the repo this
 # machine needs so provisioning is unambiguous.
+#
+# $1 is the VERB asking. It changes nothing about the verdict — the predicate is single-sourced so no
+# verb can bless what the next one refuses (#1745's shape) — it only appends the sentence that verb's
+# caller needs. `stop` (agent-infra#2093) is the case that exists: it refuses here as the PRE-FLIGHT
+# for the `stop` → `start` deploy, so its refusal must say that NOTHING WAS STOPPED and how to stop
+# anyway, or an operator who meant to stop a misconfigured box has no way past a verb that has just
+# declined to act.
 assert_queue_target() {
+  local verb="${1:-}"
   # ⛔ REPO first: with no checkout, every QUEUE_STATE below is a SYMPTOM, and the old message read
   # `cannot read the QUEUE … 'git -C  remote get-url origin' returned no URL` — an error about an
   # empty path. The cause is the missing checkout, so name it.
-  [ -n "$REPO" ] || assert_repo
+  [ -n "$REPO" ] || assert_repo "$verb"
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
   esac
   local needs="the queue's repo is READ from \$REPO's 'origin' remote, so $REPO MUST BE a checkout of the repo whose pull requests this cell is supposed to work — 'git -C $REPO remote get-url origin' => <host>/<owner>/<repo>.git"
+  # The ONE-LINE fix, spelled as a command an operator can paste, because Required #3 of #2093 is a
+  # repair path that does not require reading this source. Removing the `OR` line lets the queue
+  # follow the checkout, which is the repair that cannot be wrong about which side is stale — the
+  # other direction (repointing $REPO) is a different repo on disk and is named as prose only.
+  # ⛔ THE ANCHOR IS THE WHOLE FIX, AND A BARE `^OR=` WAS A SILENT NO-OP (review P1). A cell's
+  # `keys.env` is operator-pushed, and the EXPORTED form is the normal one: `export OR=<owner/name>` is
+  # what orchestrator-harness/lane.sh records as a MEASURED fact about a cell's keys.env, and
+  # `export -p > keys.env` writes `declare -x OR=…` (lane-env.sh names that shape). `^OR=` matches
+  # NEITHER, and GNU sed exits 0 having edited nothing — so the operator re-ran `check` into the
+  # IDENTICAL refusal, which is the dead end this whole string exists to avoid. The prefix is therefore
+  # optional in exactly the forms this repo already accepts for "the env file carries KEY": this file's
+  # own `sup_env_file_carries` reads `^[[:space:]]*(export[[:space:]]+)?KEY[[:space:]]*=`, so the repair
+  # now covers what the reader reads (the #1745 two-authorities class, in the repair path), plus the
+  # `declare -x` form the WRITER emits.
+  # ⛔ The value may also arrive as an AMBIENT export rather than a line in $ENV_FILE (both reach this
+  # shell: $ENV_FILE is sourced, and an ambient export is inherited). The message names that case too,
+  # because the `sed` cannot touch it and would otherwise send the operator straight back to the same
+  # refusal with no new information.
+  local onefix_cmd="sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' '$ENV_FILE'"
+  local onefix="ONE-LINE FIX: let the queue follow the checkout — $onefix_cmd (this matches the column-0, indented, 'export OR=' and 'declare -x OR=' shapes alike; drop an ambient OR export yourself if that is where yours is set) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
   case "$QUEUE_STATE" in
     mismatch)
-      die "the QUEUE and the CHECKOUT name DIFFERENT repos: the queue targets '$QUEUE_DECLARED' (OR) but $REPO is a checkout of '$QUEUE_DERIVED' (origin $QUEUE_REMOTE). A controller on this pair dispatches $QUEUE_DECLARED PRs from a $QUEUE_DERIVED tree: its candidate pre-flight cannot run there, every candidate comes back unqueryable, and the queue never advances while every other observable reads green (agent-infra#1901). Fix ONE of them — $needs — or remove the OR line from $ENV_FILE so it derives from the checkout, which would target $QUEUE_DERIVED."
+      die "the QUEUE and the CHECKOUT name DIFFERENT repos — this box is MERGE-INERT: the queue targets '$QUEUE_DECLARED' (OR) but $REPO is a checkout of '$QUEUE_DERIVED' (origin $QUEUE_REMOTE). A controller on this pair dispatches $QUEUE_DECLARED PRs from a $QUEUE_DERIVED tree: its candidate pre-flight cannot run there, every candidate comes back unqueryable, and every '$QUEUE_DECLARED' merge looks for that repo's merge rail inside a '$QUEUE_DERIVED' checkout and refuses — so the queue never advances while every other observable reads green (agent-infra#1901, #1764). $onefix.${verb:+ $(queue_refusal_suffix "$verb")}"
       ;;
     invalid)
-      die "OR='$QUEUE_DECLARED' is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise) — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing. $needs."
+      # ⛔ THIS BRANCH PRINTS NO `$onefix` — the full one names '$QUEUE_DERIVED'/`$needs`, which are
+      # about a PAIR this state does not have (the queue target itself is malformed) — so its tail must
+      # name ITS OWN repair. It reaches `die` through the same `queue_refusal_suffix` as the others, and
+      # the generic tail would say "with the fix above" over a fix that was never printed (review P3).
+      # The clause reuses the SAME `$onefix_cmd` (deleting OR does repair this state: the queue then
+      # follows the checkout) rather than restating the sed — one command, one place.
+      die "OR='$QUEUE_DECLARED' is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise) — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Fix OR to name an <owner>/<repo>, or let the queue follow the checkout with: $onefix_cmd (that sed edits $ENV_FILE, so drop an ambient OR export yourself if that is where yours is set)")}"
       ;;
     unreadable)
-      die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs."
+      die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Give $REPO a readable 'origin' remote — clone the repo, or point REPO at a checkout of it, because the queue is READ from that remote (deleting OR does NOT help here)")}"
       ;;
     underivable)
-      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git, with no empty path segment: 'git@host:/owner/repo.git' is refused), so there is no repo on a git host to target. $needs."
+      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git, with no empty path segment: 'git@host:/owner/repo.git' is refused), so there is no repo on a git host to target. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Point $REPO's 'origin' at a URL in one of those forms (git -C '$REPO' remote set-url origin <url>); deleting OR does NOT help here, because the queue is derived from the remote before OR is read")}"
       ;;
     *)
-      die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs."
+      die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Run '$0 status' to see this cell's REPO and ENV_FILE, then repair the pair")}"
       ;;
+  esac
+}
+
+# The verb-specific tail of a queue-target refusal. Only `stop` needs one: every other verb that runs
+# this gate (`start`, `check`, `doctor`, `merge`) declines to START or to RUN a pass, so "refused" is the
+# whole story and its message carries the repair in its body; `stop` declined to END something, and
+# an operator reading that must be told, in the message, both that nothing was stopped and how to
+# stop anyway (agent-infra#2093).
+# $1 = the asking verb. $2 = THIS refusal's repair clause, phrased as an imperative WITHOUT the
+# `stop` → `start` sequence (this function owns that).
+# ⛔ $2 IS REQUIRED ON EVERY BRANCH THAT PRINTS NO ONE-LINE FIX, AND ITS ABSENCE WAS A REAL DEFECT
+# (review P3, #2093): the default says "with the fix above", but `$onefix` is interpolated only by the
+# branches that print it, so on `unreadable`/`underivable`/`nocheckout` the operator was told to apply
+# a fix that had never been shown. The default is therefore valid ONLY for a branch that prints the
+# ONE-LINE FIX; every other caller passes its own sentence. One tail, one `--force` escape, no second
+# copy of the prose, and no pointer to a line that does not exist.
+queue_refusal_suffix() {
+  local verb="${1:-}" repair="${2-Repair the pair with the ONE-LINE FIX above}"
+  case "$verb" in
+    stop)
+      printf '%s' "NOTHING WAS STOPPED: this is the pre-flight for the deploy sequence, because 'start' refuses this same pair and a box stopped under it cannot be refreshed — that is how lane-1 was left on an 8-day-old sha with no way forward (agent-infra#2093). $repair, then run 'stop' → 'start'. To stop this box anyway (it will not be startable until the pair is repaired): $0 stop --force"
+      ;;
+    *) printf '' ;;
   esac
 }
 
@@ -1742,11 +1873,22 @@ queue_state_text() {
   case "$QUEUE_STATE" in
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
-    mismatch)    printf 'MISMATCH — start/check refuse (agent-infra#1901)' ;;
-    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
-    unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
-    underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
-    invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse' ;;
+    # ⛔ NAME THE CONDITION THE CODE APPLIES, NOT ONE OF ITS LEGS (review P3, both lanes). The old text said
+    # "while a controller is live", but `stop_would_end_something` refuses on more than that: the FIRST leg
+    # is `$ROLES_DIR/.desired`, which a box that is DOWN (OOM, reboot, an earlier partial stop) still
+    # carries — exactly the state this PR's own doc §3.2 names. ⛔ AND THE ENUMERATION MUST INCLUDE THE
+    # FAIL-CLOSED BRANCH: `owned_controller_pids || return 0` counts an UNREADABLE process table as
+    # "something is running", so a reader on a box where `ps` fails is refused too — the doc carries that
+    # branch and this line did not, which gave one gate two answers (review P3).
+    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (marker, provable own session, doctor loop, controller pid, or a controller leaked from another harness root — or the process table cannot be read) — MERGE-INERT, agent-infra#1901' ;;
+    # ⛔ STOP REFUSES THESE FOUR TOO, so their one-liners must not read as "start/check only" (review P3):
+    # each is refused by `assert_queue_target stop` whenever the state dir has something a stop would end,
+    # and an operator told only "start/check refuse" reaches for `stop` and is refused — the same
+    # experience the line above was rewritten to prevent.
+    nocheckout)  printf 'NO CHECKOUT — REPO is not set; the pre-flight (start/check always, stop while there is something to end) derives one from the single candidate checkout and refuses only when that derivation fails (agent-infra#1935)' ;;
+    unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse, and stop refuses while there is something to end (or the process table cannot be read)' ;;
+    underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse, and stop refuses while there is something to end (or the process table cannot be read)' ;;
+    invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse, and stop refuses while there is something to end (or the process table cannot be read)' ;;
     *)           printf 'unknown' ;;
   esac
 }
@@ -3138,9 +3280,12 @@ cmd_check() {
   # `. "$SELF/<f>" || { …; exit 78; }`, so a $O missing one makes EVERY dispatch on the box die at
   # startup — while this list, whose own comment says it exists to prevent exactly that false PASS,
   # certified the box runnable. `key-gate.sh` (#3331) and `lane-env.sh` (#3060) are the two newest;
+  # `controller-state.sh` (#2095) is the SAME class one degree sharper: `orch-loop.sh` sources it before
+  # its first cycle and `exit 78`s without it, so a $O that predates the change — or is half-synced —
+  # has the CONTROLLER stop on every tick while this check certifies "CELL CAN RUN A CONTROLLER".
   # `brief-gate.sh` (#2258) and `wt-lifecycle.sh` (#2033) are older instances of the same class and were
   # equally absent, so they are added with it rather than left as the next thing to be found by hand.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh controller-state.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
@@ -3355,6 +3500,22 @@ cmd_check() {
     die "diff-normalize.py MISSING (or not a regular file, or empty) at $reclib — record-review.sh resolves it as its own sibling, and without it every base-only update re-pays for a fresh review. 'start' provisions it from $(recorder_lib_src), or: mkdir -p '$(dirname "$reclib")' && cp '$(recorder_lib_src)' '$reclib' && chmod +x '$reclib'"
   fi
   log_line "ok: record step present and executable ($rec, with $(recorder_lib_path))"
+
+  # …and step 5 (#2176). Judged as a CLOSURE, not as one file: a rail missing any helper it execs
+  # is a rail that exits 1 on every invocation, so "admin-merge.sh exists" is not the property this
+  # certification needs — "the rail can run" is. Regular, non-empty and EXECUTABLE for each, for the
+  # same reasons the recorder is judged that way one paragraph up: `[ -x ]` is true for a directory,
+  # and a zero-byte file is executable and silently does nothing.
+  local rdir rname rpath rmissing=""
+  rdir="$(rail_dest_dir)"
+  for rname in $(rail_names); do
+    rpath="$rdir/$rname"
+    if [ ! -f "$rpath" ] || [ ! -s "$rpath" ] || [ ! -x "$rpath" ]; then rmissing="$rmissing $rname"; fi
+  done
+  if [ -n "$rmissing" ]; then
+    die "the LANDING RAIL is incomplete under $rdir — missing, empty or non-executable:$rmissing. Step 4 (record-review.sh) can mint a clean record but step 5 (admin-merge.sh) has no runnable path, so every lane on this cell would finish its review and stall at the last step (agent-infra#2176). 'start' provisions all four from $(rail_src_dir), or: for f in $(rail_names); do cp '$(rail_src_dir)/'\"\$f\" '$rdir/'; chmod +x '$rdir'/\"\$f\"; done"
+  fi
+  log_line "ok: landing rail present and executable (admin-merge.sh + ci-failure-set.sh + ci_exemption.py + ci-workflow-pr-evaluable.sh under $rdir)"
 
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
@@ -4034,6 +4195,29 @@ cmd_start() {
     mv -f "$ltmp" "$rlib" || { rm -f "$ltmp"; die "cannot install the provisioned normalizer at $rlib"; }
     log_line "provisioned record-step library: $rlibsrc -> $rlib"
   fi
+  # ── the LANDING RAIL (#2176) ─────────────────────────────────────────────────────────────────────
+  # Provisioned here for the same reason, on the same rule, as the recorder above: it is a hard
+  # dependency of the ONLY landing path, and `start` is the one verb that runs on every cell launch,
+  # so it is the only delivery that reaches a cell that was INSTALLED before the farm carried the
+  # rail (a cell-install pass is not re-run by `apply`). Absent-or-empty only — a complete operator
+  # copy is never clobbered — atomic tmp+mv so a concurrent reader cannot observe a half-written
+  # rail, and `chmod +x` because the lane TYPES `admin-merge.sh <PR>`.
+  # ⛔ NOT optional and not best-effort: a rail source that is missing means the harness checkout is
+  # not a full agent-infra checkout, and a cell certified in that state lands nothing (see cmd_check).
+  local rdir rsrc_f_dir rname rdest rtmp2
+  rdir="$(rail_dest_dir)"; rsrc_f_dir="$(rail_src_dir)"
+  for rname in $(rail_names); do
+    rdest="$rdir/$rname"
+    [ -f "$rdest" ] && [ -s "$rdest" ] && [ -x "$rdest" ] && continue
+    [ -e "$rdest" ] && [ ! -f "$rdest" ] && die "$rdest exists but is not a regular file — remove it, then re-run 'start'"
+    mkdir -p "$rdir" || die "cannot create $rdir"
+    rtmp2="${rdest}.tmp.$$"
+    cp -p "$rsrc_f_dir/$rname" "$rtmp2" 2>/dev/null \
+      || { rm -f "$rtmp2"; die "$rname missing at $rsrc_f_dir and cannot provision the landing rail to $rdest — the harness checkout must be a full agent-infra checkout (agent-infra#2176: without the rail a lane can review and record but never land)"; }
+    chmod +x "$rtmp2" || { rm -f "$rtmp2"; die "cannot make $rdest executable"; }
+    mv -f "$rtmp2" "$rdest" || { rm -f "$rtmp2"; die "cannot install the provisioned rail file at $rdest"; }
+    log_line "provisioned landing rail: $rsrc_f_dir/$rname -> $rdest"
+  done
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
   # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.
@@ -4249,8 +4433,83 @@ unit_stop_effect_verdict() { # <unit>
   log_line "warn: $1 was stopped but a controller of this state dir (pid $(_pids_join "$own")) is STILL running ${w}s AFTER the teardown — either it is the OTHER scope's unit under Restart=always, or something restarted it; not reporting a stop"
   return 1
 }
+
+# Would this `stop` actually END something? Read-only, and used ONLY by the pre-flight below.
+#
+# ⛔ WHY THIS EXISTS AT ALL (agent-infra#2093). `stop` is the verb an operator reaches for on a box
+# that is wrong — that is the doctrine this file already applies to `status` and to
+# orchestrator-bringup.sh's stop ("REPORT, never die"). So the new pre-flight is deliberately NARROW:
+# it refuses only when there is something to lose. Stopping a cell with NONE of the legs below loses
+# nothing and must stay answerable (⛔ a DOWN cell that still carries `.desired` is NOT such a cell —
+# the marker is the first leg), while stopping a LIVE one on an unusable pair is the exact action that
+# left lane-1 un-deployable.
+# ⛔ Conservative in the REFUSAL direction: a read that cannot be made counts as "something is
+# running". The two errors are not symmetric — a refused stop on an idle box costs one flag, a stop
+# that could not be redone costs the cell and its claim leases.
+# ⛔ AND THE SESSION LEG NEEDS THE OWNERSHIP PROOF THE KILL PATH ALREADY INSISTS ON (review P2).
+# `SESSION` is MACHINE-SCOPED (`orch` by default) — one name for every state dir on the box — so
+# "a session with this name exists" is NOT evidence that it holds THIS state dir's controller. That is
+# #1856's recorded decision, carried 200 lines below at the kill (`session_names_own_state_dir` before
+# any `kill-session`, and the measured reproduction with a tmux stub: repo B's stop TERMed repo A's
+# live loop and reported success). A bare `has-session` here would therefore refuse `stop` on a cell
+# that is already down for ITSELF merely because a PEER state dir's `orch` session is up, and the
+# refusal would point at a session this state dir does not own — contradicting this gate's own declared
+# narrowness ("it refuses only when there is something to lose"). Semantically the proof is required,
+# not merely conservative: a session this state dir cannot prove it owns is one `stop` will REFUSE to
+# kill, so it is not something a stop would end. The conservative direction is kept where it belongs —
+# an unreadable process table still counts as "something is running" on the pid legs below, and a
+# controller LEAKED from a foreign harness root — invisible to every ownership read here — is counted by
+# its own leg, because the leak reap would otherwise signal it a few lines later.
+stop_would_end_something() {
+  local p leak
+  [ -f "$ROLES_DIR/.desired" ] && return 0        # the marker `stop` removes FIRST
+  tmux has-session -t "$SESSION" 2>/dev/null && session_names_own_state_dir "$SESSION" && return 0
+  # Doctor loop. ⛔ NOT its restart child: `sup_loop_alive` reads loop.pid/loop.ident only, and the
+  # restart record (`$ROLES_DIR/restart.ident`) is read by the teardown far below, not here. That child
+  # is still covered by leg 1 — the doctor launches a restart ONLY for a STARTED cell, which by
+  # definition carries `.desired` — so naming it in this leg would describe a read this leg never makes.
+  sup_loop_alive && return 0
+  p="$(owned_controller_pids 2>/dev/null)" || return 0   # unreadable table: assume yes
+  [ -n "$p" ] && return 0
+  # ⛔ THE REAP IS AN IRREVERSIBLE ACT, AND ITS TARGETS ARE INVISIBLE TO EVERY READ ABOVE (review P2).
+  # A controller leaked from a FOREIGN harness root serves this $O but is neither a provable session nor
+  # an owned/lock pid — that is the whole definition of the leak — so `reap_own_foreign_root_leaks "$O"`,
+  # six lines after this gate, would TERM/KILL a live controller on a pair the gate never judged, leaving
+  # the box stopped with `start` refusing: the exact lane-1 outcome this pre-flight exists to prevent.
+  # The test is EXACTLY the condition the reap itself applies (`cell_own_foreign_root_pids` succeeding
+  # non-empty): where that listing cannot be determined the reap signals NOTHING (it returns 2 and says
+  # so), so there is no irreversible act to guard and this leg must not fire — which is also why the leg
+  # is inert on macOS, where `_proc_root` is absent and the reap never reaps.
+  leak="$(cell_own_foreign_root_pids "$O" "${HARNESS:-}" 2>/dev/null)" || leak=""
+  [ -n "$leak" ] && return 0
+  return 1
+}
+
 cmd_stop() {
-  local rc=0 lpid lident rpid rident i reap_rc=0
+  local rc=0 lpid lident rpid rident i reap_rc=0 force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      *) die "usage: $0 stop [--force]" ;;
+    esac
+  done
+  # ── PRE-FLIGHT, ahead of the FIRST irreversible act (agent-infra#2093) ──────────────────────────
+  # `stop` is step one of the documented deploy (`stop` → `start`, because `apply` refuses while a
+  # controller runs), and `start` asserts the queue target before it does anything — so on an
+  # unusable pair this verb used to be the only step that SUCCEEDED: the controller was killed, the
+  # marker dropped, the generation bumped, and only then did `start` refuse. The box was left
+  # stopped with its harness unrefreshed, which is why the measured lane-1 was left running a stale
+  # sha rather than repaired. The gate below runs the SAME predicate `start`/`check` run, before the
+  # leak reap on the next line, before the `.desired` removal, and before anything is signalled. ⛔ TWO
+  # gates, because `start` refuses on TWO wrong-pair configs — the queue/checkout pair AND a global
+  # `GH_REPO` that names another repo (#2235) — and a pre-flight that ran only the first left the second
+  # reachable: a matched queue on a box whose GH_REPO named another repo was STOPPED, and `start` then
+  # refused `GH_REPO names a DIFFERENT repository`, which is the lane-1 shape one refusal later (review P2).
+  # ⛔ Only for a stop that would end something, and only without --force: see stop_would_end_something.
+  if [ "$force" != 1 ] && stop_would_end_something; then
+    assert_queue_target stop
+    assert_gh_repo_conformance stop
+  fi
   # ⛔ #2315 NAMES `stop` EXPLICITLY ("neither start nor stop can clear"). A leaked controller from
   # another harness root is invisible to the ownership reads below (foreign path, no lock), so `stop`
   # walked past it and the refusal further down blamed the session. Reap first, same peer-safe scope.
@@ -5593,12 +5852,12 @@ case "${1:-status}" in
   start)   cmd_start ;;
   apply)   shift; cmd_apply "$@" ;;
   prune)   shift; cmd_prune "$@" ;;
-  stop)    cmd_stop ;;
+  stop)    shift; cmd_stop "$@" ;;
   status)  cmd_status ;;
   logs)    cmd_logs ;;
   doctor)  shift; cmd_doctor "$@" ;;
   merge)   shift; cmd_merge "$@" ;;
   reap)    shift; cmd_reap "$@" ;;
   hygiene) shift; cmd_hygiene "$@" ;;
-  *) log_line "usage: $0 check|start|stop|status|capacity|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
+  *) log_line "usage: $0 check|start|stop [--force]|status|capacity|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
 esac

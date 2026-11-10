@@ -502,9 +502,12 @@ looked like a quiet queue. `resolve_repo()` applies the rule the SUPERVISOR alre
   line so it can never be silent again. The segment is APPENDED, not prepended: the fleet reads this
   line through a fixed cut and the `| PR-DOCTOR …` fact is deliberately early.
 ⚠️ **Remaining gap, stated narrowly.** The default is made loud, not removed: the Mac's beat runs the
-FARM copy (`~/.pi/agent/scripts/`), which is not a git checkout and carries no `repo-slug.sh`, so on
-that box `repo_src=default` is the expected reading until the farm carries the deriver (named on
-`#2518`). And the module-level `REPO` is still `env or default` for the two importers that supply the
+FARM copy (`~/.pi/agent/scripts/`), which is not a git checkout — so nothing is *derivable* there, and
+`repo_src=default` is the expected reading. ⛔ **NOT a missing file any more**: the farm delivers
+`repo-slug.sh` beside `objective.py` (ai#1552), so the remaining cause on that box is the CWD, reported
+as `underivable` / `cwd-unreadable` — **not** `deriver-missing`, whose remedy (deploy the deriver) is
+already satisfied there. An earlier revision of this paragraph sent an operator down that satisfied
+remedy. And the module-level `REPO` is still `env or default` for the two importers that supply the
 variable themselves (`pr-doctor.py`, `pr-loop.py`); the CLI is where the contract is enforced.
 
 **What repairs it.** `UNKNOWN error=repo_mismatch(…)` ⇒ unset `OBJECTIVE_REPO` or run from the checkout
@@ -548,6 +551,23 @@ refusal it could not clear says so. **Operator knobs:** `WT_STATE_FREE_FLOOR_MB`
 `WT_STATE_INODE_PCT_FLOOR` (95), `WT_CMUX_SESSION` (`cloud`), `WT_SERVER_TIMEOUT` (10 s),
 `WT_SERVER_ENSURE_ATTEMPTS` (2 — the one recovery bound worth reaching for first),
 `WT_SERVER_ENSURE_SLEEP` (2 s), and `WT_SESSION_RECOVER=0` to disable probing and recovery entirely.
+⛔ **The launcher also frees its own dead surfaces (agent-infra#2312), and that is what keeps the
+registry from filling the volume the refusal above diagnoses.** A worker's record is PER NAME and holds
+ONE workspace id, so a re-spawn of a recycled name overwrote its predecessor's id and a close freed
+only that one; the census AGGREGATES by name, so a name with 29 workspaces printed one row and read
+`dead`. Measured on one cell 2026-11-10: 134 workspaces over 26 distinct names, exactly one terminal
+each, **124 idle**, `workspace-registry.sqlite3` 8.26 GB on a 7.9 GB volume at 99 %. `wt_sweep_idle_workspaces`
+frees the idle surfaces of a name before a create and after a close, so the registry is bounded by the
+number of NAMES in use, not by the number of spawns. **What it may destroy:** an EXITED terminal's
+scrollback, and nothing else — it spares `live` (a running terminal), `empty` (a create in flight) and
+any unreadable census, it never runs `cmux server stop --force`, and a worker's durable evidence
+(`$O/logs/<worker>.log`, the run script, the env snapshot) is on disk. The decision is made per
+**WORKSPACE**, never per screen row: a census that lists several screens of one workspace is one
+address, and the MOST PROTECTIVE verdict over its screens wins, so a workspace with one running
+terminal is `live` however many exited ones sit beside it. **Knobs:** `WT_IDLE_SWEEP_MAX`
+(50 per call) and `WT_IDLE_SWEEP=0` to disable it. It re-reads the census after removing and states
+what is STILL there (`could NOT confirm` when the census cannot be read) — it never reports a clearance
+it did not measure, because on the full volume this exists for, `cmux` refuses the mutation and exits 0.
 ⛔ `WT_CMUX_SESSION` is a **fixture seam, not a deployment knob**, and the CLI is why: the `server`
 verbs take `--session` but **`cmux layout apply` takes none** (measured on cell-4 2026-10-29 —
 `cmux layout apply --help` lists `--workspace/--name/--cwd/--json` and the create always dials

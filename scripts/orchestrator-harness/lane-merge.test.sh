@@ -592,7 +592,12 @@ ck "a live merge lock is adopted: the record carries the LIVE pid and the RECORD
 _mw_poll="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 _mw_wait="$(sed -n 's/.*LANE_MERGE_WAIT:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 _mw_res="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
-_mw_wall="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
+# ⛔ THE EXPRESSION TRACKS THE SCRIPT, INCLUDING THE OPERAND NAME (verified the hard way): when the backstop
+# normalisation moved into a local (`LANE_BACKSTOP_S_N`) to stop `lane-merge.sh` becoming a second OWNER of a
+# registered term, this pattern silently stopped matching — `MAXW` went EMPTY and 12 arms downstream of the
+# `.watch` seed regressed while every static gate (bash -n, diff --check, the registry scan) stayed green. A
+# text extractor is a CONTRACT with the shipped text; when that text moves, the extractor reds or it lies.
+_mw_wall="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
 MAXW=""
 if [ -n "$_mw_poll" ] && [ -n "$_mw_wait" ] && [ -n "$_mw_res" ] && [ -n "$_mw_wall" ] \
    && [ "$_mw_poll" -ge 1 ] && [ "$(( _mw_wall - _mw_wait - _mw_res ))" -gt 0 ]; then
@@ -1122,6 +1127,85 @@ LM_GOT2="$(head -n 1 "$T/chain-repo.txt" 2>/dev/null)"
 ck "a PATH-shimmed 'awk' cannot hand the chain the lane's own checkout (got: ${LM_GOT2:-<nothing>})" \
    $([ -n "$LM_GOT2" ] && [ "$(cd "$LM_GOT2" && pwd -P)" = "$(cd "$LMFR" && pwd -P)" ] && echo 0 || echo 1)
 
+# ── 11c-nonies-b. THE MERGE AUTHORITY IS FOUND WHEN THE STATE DIR IS NOT THE HARNESS ROOT (#2095) ──
+# ⛔ THE FINDING (fresh-context review of #3846, P1). `orch-loop.sh` now exports `O` = the controller's
+# STATE dir and `O_WORK` = the harness root. `launch_chain` started from `chain="$O/merge-one.sh"` and
+# accepted the beside-file copy ONLY when `_d` equalled `$O` — so on the documented `ORC_STATE_DIR`
+# arrangement, and on every `derived:isolated(<copy>)` instance, `$O/merge-one.sh` could not exist, `_d`
+# was the harness root, and EVERY lane exited 2 before any merge work, with a code `lane.sh`'s table does
+# not map and a remedy (`deploy-harness --o $O`) that installs a harness INTO the state dir.
+# ⛔ AND HALF A FIX WOULD RE-OPEN #3789. "Trust `O_WORK`" is not available: a lane can set `O_WORK`
+# itself. So the fallback needs BOTH that the copy beside the running script IS the declared harness root
+# AND that the root is a MAIN worktree — a lane's own `.worktrees/<lane>` checkout is a LINKED one. Both
+# arms below are driven from real git trees, because the distinction under test IS a git property.
+HAR_ROOT="$T/harness-root"; HAR_WT="$T/harness-lane-wt"
+rm -rf "$HAR_ROOT" "$HAR_WT" "$T/harness-chain.txt" "$T/tampered-chain.txt"
+mkdir -p "$HAR_ROOT"
+git -C "$HAR_ROOT" init -q
+cp "$SCRIPT" "$HAR_ROOT/lane-merge.sh"
+[ -f "$HERE/pr-state.sh" ] && cp "$HERE/pr-state.sh" "$HAR_ROOT/" >/dev/null 2>&1 || true
+printf '#!/usr/bin/env bash\nprintf "HARNESS-CHAIN\\n" >> "%s/harness-chain.txt"\nexit 0\n' "$T" > "$HAR_ROOT/merge-one.sh"
+chmod +x "$HAR_ROOT/merge-one.sh" "$HAR_ROOT/lane-merge.sh"
+git -C "$HAR_ROOT" add -A
+git -C "$HAR_ROOT" -c user.email=t@t -c user.name=t commit -qm "seeded harness root"
+# The state dir a split box keeps its state in: NO merge-one.sh, which is the whole point.
+SD_SPLIT="$T/state-dir-split"; rm -rf "$SD_SPLIT"; mkdir -p "$SD_SPLIT/state" "$SD_SPLIT/logs"
+new_o "$T/junk-q56.tsv"          # a throwaway $OT so mk_chain's fixture does not run for this case
+printf 'open||spl56|clean\n' > "$T/pr-open56.tsv"
+OUT="$(REPO_PATH="$RUN_REPO" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$SD_SPLIT" O_WORK="$HAR_ROOT" HOME="$T/home" T="$T" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$HAR_ROOT/lane-merge.sh" 56 --repo o/r --pr-tsv "$T/pr-open56.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+sleep 1
+ck "a split state dir finds the merge authority in the controller-declared harness root (rc=$RC, not the unmapped 2)" \
+   $([ "$RC" != "2" ] && [ -s "$T/harness-chain.txt" ] && echo 0 || echo 1)
+ck "…and the chain that runs is the harness root's own merge-one.sh" \
+   $(grep -qx 'HARNESS-CHAIN' "$T/harness-chain.txt" 2>/dev/null && echo 0 || echo 1)
+# NEGATIVE (the #3789 half): the lane edits `merge-one.sh` in ITS OWN linked worktree, copies the script
+# there too, and points `O_WORK` at it. `_d` and `O_WORK` then AGREE — value equality alone would accept
+# it — so the main-worktree test is the only thing standing between the lane and its own merge gate.
+printf '#!/usr/bin/env bash\nprintf "TAMPERED-CHAIN\\n" >> "%s/tampered-chain.txt"\nexit 0\n' "$T" > "$T/tampered-merge-one.sh"
+chmod +x "$T/tampered-merge-one.sh"
+git -C "$HAR_ROOT" worktree add -q "$HAR_WT" -b feat/56-tm
+cp "$T/tampered-merge-one.sh" "$HAR_WT/merge-one.sh"
+cp "$HAR_ROOT/lane-merge.sh" "$HAR_WT/lane-merge.sh"
+chmod +x "$HAR_WT/lane-merge.sh" "$HAR_WT/merge-one.sh"
+printf 'open||spl57|clean\n' > "$T/pr-open57.tsv"
+OUT="$(REPO_PATH="$RUN_REPO" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$SD_SPLIT" O_WORK="$HAR_WT" HOME="$T/home" T="$T" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$HAR_WT/lane-merge.sh" 57 --repo o/r --pr-tsv "$T/pr-open57.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+sleep 1
+ck "a lane that points O_WORK at its OWN linked worktree is still refused (exit 2, rc=$RC) — #3789 intact" \
+   $([ "$RC" = "2" ] && echo 0 || echo 1)
+ck "…and the TAMPERED merge gate never ran" \
+   $([ ! -e "$T/tampered-chain.txt" ] && echo 0 || echo 1)
+
+# ⛔ AND THE POSITIVE ARM ABOVE WAS THE WRONG SHAPE FROM PRODUCTION (fresh-context review of #3846, P1-2;
+# MEASURED). It `git init`s its fixture root, so it proved the split-state arm works for a GIT tree — while
+# the tree `deploy-harness.sh` actually produces (and this box's real `/home/cmux/orchestrator`) is a FLAT
+# `cp -p` copy with no `.git` at all. The old predicate asked "is it a MAIN worktree", so `rev-parse`
+# failed, the else arm fired, and EVERY lane on such a box exited 2 before any merge work — the exit code
+# `lane.sh`'s table does not map. The property #3789 needs is "is it a LINKED worktree" (a lane's own
+# checkout), not "is it a main worktree", so this arm drives the same split arrangement over a FLAT root.
+HAR_FLAT="$T/harness-flat"; rm -rf "$HAR_FLAT" "$T/flat-chain.txt"
+mkdir -p "$HAR_FLAT"
+cp "$SCRIPT" "$HAR_FLAT/lane-merge.sh"
+[ -f "$HERE/pr-state.sh" ] && cp "$HERE/pr-state.sh" "$HAR_FLAT/" >/dev/null 2>&1 || true
+printf '#!/usr/bin/env bash\nprintf "FLAT-CHAIN\\n" >> "%s/flat-chain.txt"\nexit 0\n' "$T" > "$HAR_FLAT/merge-one.sh"
+chmod +x "$HAR_FLAT/merge-one.sh" "$HAR_FLAT/lane-merge.sh"
+# Non-vacuity: the fixture must really be the production shape — a harness root with NO git repo in it.
+ck "(fixture) the flat harness root is NOT a git tree, which is the shape deploy-harness.sh produces" \
+   $([ ! -e "$HAR_FLAT/.git" ] && ! git -C "$HAR_FLAT" rev-parse --git-dir >/dev/null 2>&1 && echo 0 || echo 1)
+new_o "$T/junk-q58.tsv"
+printf 'open||flt58|clean\n' > "$T/pr-open58.tsv"
+OUT="$(REPO_PATH="$RUN_REPO" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$SD_SPLIT" O_WORK="$HAR_FLAT" HOME="$T/home" T="$T" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$HAR_FLAT/lane-merge.sh" 58 --repo o/r --pr-tsv "$T/pr-open58.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+sleep 1
+ck "a SEEDED (flat, non-git) harness root is accepted when the state dir is split (rc=$RC, not the unmapped 2)" \
+   $([ "$RC" != "2" ] && [ -s "$T/flat-chain.txt" ] && echo 0 || echo 1)
+ck "…and the chain that runs is the flat root's own merge-one.sh" \
+   $(grep -qx 'FLAT-CHAIN' "$T/flat-chain.txt" 2>/dev/null && echo 0 || echo 1)
+
 # ── 11c-nonies-a. THE HAND-OFF'S PRINTED REMEDY NAMES THE SAME TREE (landing review F1, P1) ──────────
 # ⛔ F1 WAS REINTRODUCED AS DOCUMENTATION. `launch_chain` refuses to run the chain from a lane worktree —
 # merge-one.sh resolves the merge authority as `$REPO/scripts/admin-merge.sh` and that rail resolves its
@@ -1335,7 +1419,7 @@ _ps="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 # literal — so the check passed on a wider margin and would ALSO have passed if that default drifted,
 # which is exactly the property it exists to protect. Now `_lt` is lane-merge.sh's OWN resolved
 # default, and a second assertion requires the two files to name the SAME bound.
-_lt="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
+_lt="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
 [ -n "$_lt" ] || _lt="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
 _LANE_SIDE="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
 [ -n "$_LANE_SIDE" ] || _LANE_SIDE="$(grep -o 'LANE_BACKSTOP_S:-[0-9]*' "$HERE/spawn-gate.sh" | head -1 | tr -dc '0-9')"
@@ -1365,7 +1449,8 @@ ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( $
 # clock a lane sits through) min 1931 s, p50 4062 s, p90 9825 s, p95 17185 s, max 32157 s;
 # RUN DURATION
 # (`run_started_at` -> `updated_at`, excluding the pre-start queue) min 1623 s, p50 3836 s, p90 4928 s,
-# p95 5612 s, max 7968 s. 4800 s sits above the fast day's run-duration p95 (4565 s) and is 3.2x the bound
+# p95 5612 s, max 7968 s. 4800 s sits above the fast day's run-duration p95 (~4565 s on the first read,
+# 4708 s later — it is quoted as a bound, not a measurement) and is 3.2x the bound
 # this arm exists to keep out, and the shipped 5400 s covers 79.9 % of the lane-visible population
 # (167/209) / 94.3 % of the run-duration one (197/209) — both stated in the script.
 # ⛔ THE CLAIM IS STATED NO STRONGER THAN THE DATA SUPPORTS, TWICE OVER.
@@ -1544,6 +1629,126 @@ new_o "$T/pr4.tsv"
 WAIT_S=60 POLL_S=5 LANE_MERGE_ELAPSED_S=7180 run 35 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
 ck "a lane that has already spent 7180 s of its 7200 s clock CAPS the check wait to the 10 s that is left (still WAITING_CHECKS, still a verdict) instead of waiting to be WALL-TERMed with none" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 35 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 7180s' <<<"$OUT" && echo 0 || echo 1)
+# …and the clock it clamps against is the ARMED one, including the ceiling-reducer seam (review, P3 —
+# verified against spawn-gate.sh's `lane_wall_bound`, which arms `min(caller, LANE_BOUND_WALL_S)` for a
+# POSITIVE value and REFUSES to reduce to a `0`). Mirroring only LANE_TIMEOUT/LANE_BACKSTOP_S clamped
+# against a clock the lane does not have: with `LANE_BOUND_WALL_S=3630` and 3600 s spent, the wait was cut to
+# 4190 s (7200 − 3600 − 10) — 570 s PAST a clock that ends at 3630 s, i.e. TERMed mid-wait with no verdict,
+# the unlabelled kill the clamp exists to prevent.
+# ⛔ THIS FIXTURE IS SIZED SO THE CLAMP IS SMALL (P2, MEASURED): the wait is `wall − elapsed − margin`, so the
+# arm only has to spend what the clamp leaves. The first cut of this arm used `elapsed=3000` against a 3600 s
+# wall, which leaves 590 s — and because the fixture's checks are in flight the loop SLEEPS that whole cap
+# (`sleep "$INTERVAL"` is its last statement), adding ~10 min of real wall clock to a DERIVED CI shard
+# (`run-bash-shards.sh` globs `scripts/*/*.test.sh`; `SHARD_BOUND` default 1800 s) for an assertion whose
+# subject is arithmetic. Elapsed at 3600 against a 3630 s wall leaves 20 s and asserts the SAME relation.
+# ⛔ THIS ARM MUST READ THE *WALL* CLAMP, NOT "THE FIRST CAPPED LINE" (verified by mutation — the first
+# draft of this arm read `head -1` and was both WRONG and VACUOUS: this fixture emits the WATCHDOG cap
+# first (2690 s, because WAIT_S 5400 ≥ the 2700 s allowance) and the wall clamp second (20 s), so `head -1`
+# measured the watchdog cap, produced the same number with the new block disabled, and could never have
+# caught the regression it exists for). The wall clamp's message is the one carrying the spent/clock
+# sentence, so it is matched specifically — and the assertion is the RELATION, not a stamped integer.
+new_o "$T/pr4.tsv"
+WAIT_S=5400 POLL_S=5 LANE_BOUND_WALL_S=3630 LANE_MERGE_ELAPSED_S=3600 run 39 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+_cap39="$(sed -n 's/.*CAPPED at \([0-9][0-9]*\)s (this lane had already spent.*/\1/p' <<<"$OUT" | head -1)"
+ck "LANE_BOUND_WALL_S=3630 (the documented CEILING REDUCER) is the clock the wait is clamped against, not the 7200 s caller bound — the WALL clamp reads ${_cap39:-?}s, and cap + 3600 spent + 10 margin = $(( ${_cap39:-0} + 3610 )) = the armed wall" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 39 | cut -d' ' -f1)" = WAITING_CHECKS ] && [ -n "${_cap39:-}" ] && [ $(( ${_cap39:-0} + 3610 )) = 3630 ] && echo 0 || echo 1)
+# ⛔ AND THE LINE NAMES THE KNOB THAT PRODUCED THE NUMBER (P3, verified by running it): once `LANE_WALL_S`
+# can come from `LANE_BOUND_WALL_S`, a message hard-coding "LANE_TIMEOUT=<n>" tells an operator to change a
+# variable that was never set — on the one line whose whole job is to name the operand. Same arm, same run,
+# so this costs no extra invocation: the WALL clamp must attribute its armed wall to `LANE_BOUND_WALL_S`, and
+# must NOT still call it `LANE_TIMEOUT`.
+ck "the WALL clamp ATTRIBUTES its armed wall to LANE_BOUND_WALL_S (the knob that armed it) instead of hard-coding 'LANE_TIMEOUT=<n>s', which this run never set" \
+   $(grep -q "the $(( ${_cap39:-0} + 3610 ))s wall this lane is armed with (from LANE_BOUND_WALL_S" <<<"$OUT" && ! grep -q 'lane-bound.sh.s .*wall ceiling' <<<"$OUT" && echo 0 || echo 1)
+# …and the same misattribution in the MAX_WATCH invariant warning, which is the OTHER line that renders
+# `LANE_WALL_S` as an operator instruction. Reachable with no elapsed clock at all: the armed wall is 3600 s,
+# which is below `WAIT_S_DESIGN + IMPL_RESERVE_S` (5400 + 900), so `MAX_WATCH_FIT` floors at 1 chunk and any
+# override above it warns.
+new_o "$T/pr4.tsv"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_MAX_WATCH=15 LANE_BOUND_WALL_S=3600 LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=3590 \
+      bash "$SCRIPT" 40 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "the LANE_MERGE_MAX_WATCH warning names the lane's ARMED wall and its source (LANE_BOUND_WALL_S), not a LANE_TIMEOUT this run never set — an operator line must never send you to the wrong knob" \
+   $(grep -q 'but the lane.s 3600s wall clock (from LANE_BOUND_WALL_S' <<<"$OUT" && ! grep -q 'exceeds what LANE_TIMEOUT=' <<<"$OUT" && echo 0 || echo 1)
+# …and with no ceiling reducer in play the source is still named correctly, so the fix cannot decay into
+# "always says LANE_BOUND_WALL_S".
+new_o "$T/pr4.tsv"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_MAX_WATCH=15 LANE_TIMEOUT=3600 LANE_BACKSTOP_S= LANE_BOUND_WALL_S= LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=3590 \
+      bash "$SCRIPT" 41 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "with LANE_TIMEOUT=3600 (and no LANE_BOUND_WALL_S) the same warning attributes it to LANE_TIMEOUT — the source is resolved, not hard-coded the other way" \
+   $(grep -q 'but the lane.s 3600s wall clock (from LANE_TIMEOUT)' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ THE SAME OPERAND IN ITS LEADING-ZERO FORM MUST BE HONOURED IDENTICALLY (P3, MEASURED). `lane_wall_bound`
+# ACCEPTS `03630` — its test is `''|*[!0-9]*` and POSIX `test` reads the operand as DECIMAL 3630 — so the lane
+# IS armed at 3630 s. This file's `is_limit` deliberately rejects the `0*` form, so the clamp was SKIPPED and
+# the wait clamped against the 7200 s caller bound instead: the past-the-wall TERM, silently, on an input the
+# sibling honours. Measured on this box: `is_limit 03600` REJECTS · `lane_wall_bound 7200` -> "03600 applied".
+# ⛔ THE WAIT IS DELIBERATELY CHEAP (360 s unclamped, 20 s clamped) SO THE MUTANT FAILS INSTEAD OF HANGING:
+# with the wall clamp skipped the arm reddens in six minutes, not the ~1 h the 5400 s design wait would cost.
+# It reddens on EITHER bad shape — "no wall CAPPED line at all" (clamp skipped) and a clamp that kept the raw
+# `03630` and let `$(( ))` read it as OCTAL 1920 (which floors `_wall_left` at 0, so `_cap42` is `0`).
+new_o "$T/pr4.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=360 LANE_MERGE_POLL=5 LANE_MERGE_ELAPSED_S=3600 \
+      LANE_TIMEOUT= LANE_BACKSTOP_S= LANE_BOUND_WALL_S=03630 \
+      bash "$SCRIPT" 42 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+_cap42="$(sed -n 's/.*CAPPED at \([0-9][0-9]*\)s (this lane had already spent.*/\1/p' <<<"$OUT" | head -1)"
+ck "LANE_BOUND_WALL_S=03630 (leading zero — the form lane_wall_bound ACCEPTS) arms the lane at 3630 s and the wait is clamped to it: pre-fix there is NO wall CAPPED line at all, and a fix that kept the octal reading clamps to 1920 s and prints 0 s" \
+   $([ "$RC" = 11 ] && [ -n "${_cap42:-}" ] && [ $(( ${_cap42:-0} + 3610 )) = 3630 ] && grep -q 'the 3630s wall this lane is armed with (from LANE_BOUND_WALL_S' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ AND THE OTHER TWO DIRECTIONS, WITHOUT WHICH THE CLAMP PINS ONLY ONE PROPERTY (review, P3 — verified by
+# mutation: making the block UNCONDITIONAL — dropping the strict `<` — kept every check green, because no other
+# arm fed it a reducer LARGER than the caller bound. That mutation lets the wait be clamped against a clock
+# larger than the lane has: the unlabelled kill from the other side).
+# A reducer LARGER than the caller bound must not be applied: the armed wall stays the caller's 7200.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=5 LANE_BOUND_WALL_S=99999 LANE_MERGE_ELAPSED_S=7180 run 71 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a LANE_BOUND_WALL_S LARGER than the caller bound (99999 > 7200) is NOT applied — the clamp still sizes itself off 7200, so 7180 spent leaves 10 s" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'of its 7200s clock' <<<"$OUT" && echo 0 || echo 1)
+# A reducer of 0 is "wall axis OFF", which `lane_wall_bound` refuses to reduce to — so it must not be applied either.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=5 LANE_BOUND_WALL_S=0 LANE_MERGE_ELAPSED_S=7180 run 72 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "LANE_BOUND_WALL_S=0 is 'wall axis OFF', not a zero-second clock — it is NOT applied, so the caller's 7200 s clock still caps the wait at 10 s (a zero clock would take the unbounded branch)" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'of its 7200s clock' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ THE CEILING REDUCER MUST NOT RESIZE THE *DESIGN* ALLOWANCE (review, P2 — verified by mutation: pointing
+# `MAX_WATCH_FIT` back at the ARMED `LANE_WALL_S` reddened NOTHING, 164/164 still green, so the fix was
+# unguarded and only prose held it). That mutant is a live false block, not a theory: with a 3600 s ceiling and
+# NO resolvable lane clock — the documented controller-resume path — the design allowance falls 7 chunks → 1,
+# i.e. ONE 120 s chunk for a chain whose median reviewer run is 316 s, and `--watch` then declares
+# BLOCKED_ATTEMPTS over work that is still legitimately running. The observation point is the override
+# warning, which prints the design fit whenever an explicit LANE_MERGE_MAX_WATCH exceeds it and does so BEFORE
+# any wait.
+# ⛔ THE OPERANDS MUST BE THE SHIPPED ONES (verified by mutation — the first draft set WAIT_S=60 POLL_S=5,
+# which makes `_fit_poll` 5 and the fit (7200-60-900)/5 = 1248, so MAX_WATCH=50 never EXCEEDED it, the warning
+# never printed, and the arm reddened the FIXED tree while staying identical on the mutant: vacuous AND a false
+# red). The fit is only the shipped 7 at WAIT_S_DESIGN=5400 with POLL_S=120. The positive pattern is anchored on
+# the message's own em-dash so `— 7 chunk(s) fit` cannot match `— 17 chunk(s) fit`.
+new_o "$T/pr4.tsv"
+WAIT_S=5400 POLL_S=120 LANE_BOUND_WALL_S=3600 LANE_MERGE_ELAPSED_S=7180 LANE_MERGE_MAX_WATCH=50 run 73 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a CEILING REDUCER does not shrink the DESIGN supervision allowance: with LANE_BOUND_WALL_S=3600 the fit is still the shipped 7 chunks off the 7200 s caller bound (computing it from the armed 3600 s would floor to 1, which is one 120 s chunk for a chain whose median reviewer run is 316 s)" \
+   $(grep -q "the 7200s DESIGN allowance" <<<"$OUT" && grep -q -- '— 7 chunk(s) fit' <<<"$OUT" && ! grep -q -- '— 1 chunk(s) fit' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ THE BACKSTOP'S LEADING-ZERO FORM IS NORMALISED, AND NOTHING ELSE PINNED IT (review, P3 — verified by
+# mutation: deleting the normalisation left the suite red the SAME way, delta = zero arms).
+# `lane_wall_bound` ACCEPTS `03600`, and POSIX `test` reads it as DECIMAL 3600, so the lane IS armed at
+# 3600 s — but bash's ARITHMETIC reads a leading-zero integer as OCTAL (`$(( 03600 ))` = 1920), so a raw
+# value reaching `$(( LANE_BACKSTOP_S_N - _hb_margin ))` would size supervision off 1920 s.
+# This arm is the PASSING sibling above (`.watch` seeded 28, `LANE_TIMEOUT=0`, `--watch`) with ONE change:
+# the knob is written in the leading-zero form. Its expectation is the sibling's own numbers, so the arm
+# discriminates all three wrong shapes at once — a skipped clamp (allowance falls to the octal 15, so the
+# 28th chunk is refused and part 1 reds), an unnormalised fall-through to the 7200 s default (allowance 59,
+# so the 29th chunk is admitted and part 2 reds), and the correct 29 (both parts pass).
+new_o "$T/pr-fit.tsv"
+printf 'open||fithead|clean\n' > "$T/pr-fit.tsv"
+printf '28\n' > "$OT/state/lanemerge-74.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=03600 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 74 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "LANE_BACKSTOP_S=03600 (leading zero — the form lane_wall_bound ACCEPTS) is normalised before it reaches ARITHMETIC: supervision is still sized off 3600 s, so the 28th chunk is ADMITTED (an octal 1920 s reading would cap at 15 and refuse it)" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 74 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+printf '29\n' > "$OT/state/lanemerge-74.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=03600 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 74 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "…and the NEXT one is refused at the SAME 29-chunk bound (counter 29 → chunk 30), so the leading-zero backstop is normalised rather than read as octal 1920 s (which would refuse chunk 16) or left at the 7200 s default (which would admit chunk 30)" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 74 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && grep -q '29 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
 # …and a lane's elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
 new_o "$T/pr4.tsv"
 WAIT_S=0 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
@@ -1681,8 +1886,16 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O=
 ck "…and the NEXT one is refused (counter 29 → chunk 30) and the hand-off SAYS 29, so the backstop-derived bound is pinned by its own number (pre-fix prints 1 and reds here)" \
    $([ "$RC" = 13 ] && [ "$(verdict_of 50 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && grep -q '29 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
 printf '999\n' > "$OT/state/lanemerge-51.watch"
+# ⛔ THE ARM'S OWN TITLE IS A CLAIM ABOUT THE ENVIRONMENT, SO IT MUST PIN THAT ENVIRONMENT (P3, MEASURED:
+# 161 passed / 1 FAILED on this box with the PRISTINE script, and 164/1 with this branch's — the arm failed
+# identically before and after, so it was never this diff's red). The fleet box exports `LANE_BACKSTOP_S=7200`
+# (`env | grep ^LANE_`), and this invocation named only the FOUR knobs it wanted, so the arm's "NO
+# LANE_BACKSTOP_S" was false on every box that exports it: supervision derived 29 chunks instead of none,
+# the 1000th admission was refused with exit 13, and the arm reported a FALSE RED against correct code on
+# the one host the lanes actually run on. An absent-by-assertion knob is set to EMPTY here — `is_limit ''`
+# is false, which is exactly "no backstop" — so the arm tests what its title says on any host.
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
-      LANE_TIMEOUT=0 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S= LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
       bash "$SCRIPT" 51 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
 ck "LANE_TIMEOUT=0 with NO LANE_BACKSTOP_S is UNBOUNDED supervision: the 1000th chunk is NOT refused (a zero allowance means there is no counter, not that it is spent)" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 51 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
@@ -1727,7 +1940,7 @@ printf '1\n' > "$OT/state/lanemerge-54.watch"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
       LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_ELAPSED_S=3400 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
       bash "$SCRIPT" 54 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
-ck "the backstop-derived allowance counts only what is LEFT of the backstop: (3600-3400-10)/120 = 1 chunk, so the 2nd is refused (the un-subtracted branch would admit 29)" \
+ck "the backstop-derived allowance counts only what is LEFT of the backstop: (3600-3400-40)/120 = 1 chunk, so the 2nd is refused (the un-subtracted branch would admit 29)" \
    $([ "$RC" = 13 ] && grep -q '1 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
 
 # ⛔ THE RE-INVOCATION PATH (review round 3, P2 — verified): the documented resume omits `--issue` and

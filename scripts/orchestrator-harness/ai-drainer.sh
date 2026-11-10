@@ -694,35 +694,62 @@ _reap_leftovers() {
 #     daemon read failure must never RAISE a ceiling).
 # A worker is NEVER `pgrep`-ed for: `pgrep` answers a different population than the launcher's.
 _counts_as_lane() { # <command-line>
-  local c="$1" t b
+  local c="$1" t b rc=1 had_f=0
   [ -n "$c" ] || return 1
+  # ⛔ GLOB-FREE, for the SAME reason `_is_lane_process` below is (see its comment): the split is
+  # UNQUOTED, so `for t in $c` pathname-expands as well as word-splits, and an argv token holding a
+  # wildcard would expand against the CWD. MEASURED with a file literally named `pi` in the CWD:
+  # `_counts_as_lane "bash -c echo *"` matched it and COUNTED. That inflates `disp_alive`, which stands
+  # the tick down — the same inertness #3882's clamp exists to end, one census over (#3886 review).
+  # Restored on the single exit path, and the only call site (`_census_dispatcher`) is itself read
+  # through a `$(…)`, so a leak is not reachable either way.
+  case $- in *f*) had_f=1 ;; *) set -f ;; esac
   for t in $c; do
     case "$t" in
-      /*) b="${t##*/}"; [ "$b" = "pi" ] && return 0 ;;
-      pi) return 0 ;;                        # argv[0] literally `pi` (no shebang rewrite)
+      /*) b="${t##*/}"; if [ "$b" = "pi" ]; then rc=0; break; fi ;;
+      pi) rc=0; break ;;                     # argv[0] literally `pi` (no shebang rewrite)
     esac
   done
-  for b in nonblocking-dispatch.sh bg-dispatch.sh lane.sh fix-one.sh merge-one.sh \
-           chain-merge.sh dispatch-merge.sh; do
-    case "$c" in *"$b"*) return 0 ;; esac
-  done
-  return 1
+  if [ "$rc" -ne 0 ]; then
+    for b in nonblocking-dispatch.sh bg-dispatch.sh lane.sh fix-one.sh merge-one.sh \
+             chain-merge.sh dispatch-merge.sh; do
+      case "$c" in *"$b"*) rc=0; break ;; esac
+    done
+  fi
+  [ "$had_f" = "1" ] || set +f
+  return "$rc"
 }
-_census_dispatcher() { # prints the count of live dispatcher lanes
-  local f p c n=0
+_census_dispatcher() { # prints "<alive> <overlap>" — dispatcher lanes, then how many of them the
+  #                        LAUNCHER predicate also counts (the intersection `_census_launcher` removes)
+  local f p c n=0 ov=0 seen=" "
   for f in "$O"/bg/*.pid; do
     [ -f "$f" ] || continue
     p="$(tr -dc '0-9' 2>/dev/null <"$f")"
     [ -n "$p" ] || continue
     kill -0 "$p" 2>/dev/null || continue          # a dead pidfile is not a lane
+    # ⛔ A PID NAMED BY TWO PIDFILES IS ONE PROCESS. The overlap below is SUBTRACTED from the
+    # launcher's process count, so counting one process twice here would under-read the launcher's
+    # share — the over-dispatch direction, which is the expensive one (#3886 review, P2-1).
+    case "$seen" in *" $p "*) continue ;; esac
+    seen="$seen$p "
     c="$("$PS" -p "$p" -o command= 2>/dev/null | head -1)"
     # ⛔ AN UNREADABLE COMMAND LINE IS ALIVE (the fleet's own liveness polarity: unknown is alive).
     # Counting it as absent was the over-dispatch direction, and the census is now the ONLY thing
     # bounding the lane total (the lock no longer is) — so a `ps` that cannot answer (absent under the
     # unit's PATH, `hidepid`, another uid) must never read as "no lanes".
     if [ -z "$c" ]; then n=$((n + 1)); elif _counts_as_lane "$c"; then n=$((n + 1)); fi
+    # ⛔ THE PREDICATE MUST BE THE ONE THAT COUNTED THE LANE (#3886 review round 5, P2). The overlap is
+    # the INTERSECTION of "in `n`" and "inside `procs`", so it is measured with `_counts_as_lane` — the
+    # NARROWER predicate, the one that actually added this lane to `n`. Measuring it with the broader
+    # `_is_lane_process` counted a lane the dispatcher half never accepted (an argv like `./pi -p x`, which
+    # only the broad rule matches) and SUBTRACTED it from `procs` while adding it to nothing: that lane was
+    # in NEITHER half, so one live lane on the box read as `alive=0` and a full target's worth of new lanes
+    # was dispatched into it. Broad is the safe direction for a BOUND; for a SUBTRACTION it is the
+    # over-dispatch direction. A lane that is in `procs` but not in `n` now stays in the launcher's share —
+    # over-counted, which is the direction this file accepts everywhere else.
+    if [ -n "$c" ] && _counts_as_lane "$c"; then ov=$((ov + 1)); fi
   done
-  printf '%s' "$n"
+  printf '%s %s' "$n" "$ov"
 }
 # ⛔ THE LAUNCHER MODULE IS SOURCED THE WAY THE CONTROLLER SOURCES IT (orch-loop.sh): from `$O` first,
 # then beside this script, then the verbs AND the embedded-python data are checked. A module that
@@ -750,10 +777,169 @@ if [ -n "$WT_MOD" ] && [ -f "$WT_MOD" ]; then
     CENSUS_LAUNCHER_WHY="worker-terminal.sh at $WT_MOD is stale (no wt_table/wt_count, or its embedded python is empty)"
   fi
 fi
-_census_launcher() { # prints the count, or nothing when unreadable
-  local n
-  n="$(wt_count lane- fix- merge- chain- 2>/dev/null)"
-  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+# ⛔ THE LAUNCHER CENSUS IS AN UPPER BOUND, NOT A COUNT — clamp it to the lane ROOTS present (a lane's
+# `pi` child is the same lane, so the count is lanes, not processes).
+# MEASURED 2026-11-10 on pi-cell-3: `alive=36 (dispatcher=2 launcher=34)` with **9** live `pi`
+# processes on the same box, 25 GB RAM free, 0 OOM kills — so the tick printed `SKIP: nothing to add`
+# and exited 0 on a box with idle capacity, and the starved queue had no error to point at.
+# The reason is in `wt_count`'s own signal: it counts `wt_table` rows that are not `dead`, and `dead`
+# comes from the cmux daemon document's `terminals[].running` flag (worker-terminal.sh:1287-1305) —
+# **"a shell is running in that terminal"**, i.e. UI liveness. A `wt-*` terminal whose `pi` has exited
+# still reports `running=true`, so it is a live lane forever and `target − alive ≈ 0` for ever.
+# The clamp is one-sided (`min`): it can only REMOVE phantom lanes, never invent one. ⛔ It CAN lower a
+# real count, and that is the price of the fix, not an oversight (#3886 review): a probe that ANSWERS
+# with a view that omits the lanes — `hidepid=2` for another uid, a PID namespace, a filtered `$PS`
+# wrapper — reads 0 and the clamp then lowers a real count, which is the OVER-DISPATCH direction. The
+# alternative (treating an answered probe as unreadable) restores the original bug, so the trade is
+# deliberate; it is stated here and in docs/ops/ai-drainer.md rather than left implied.
+# When it fires it is LOUD — `census-mismatch launcher=34 pi=9 clamped=9 disp=0` — so the drift is
+# visible in the log instead of silently suppressing dispatch.
+#
+# ⛔ THE TWO HALVES ARE DISJOINT, AND THAT IS THE ARGUMENT OF THIS BLOCK (#3886 review, P2-1). `procs`
+# counts every lane ROOT on the box, so a live dispatcher lane is already in it; summing
+# `disp_alive + min(wt_count, procs)` therefore counted each live dispatcher lane TWICE and over-stated
+# the total by `disp_alive`. Harmless against a big target, fatal on a cell (MAX_LANES = 2.5 × 4 = 10):
+# `disp_alive=2` + `procs=9` ⇒ `alive=11 > 10` ⇒ the tick dispatched nothing with a slot free — the
+# stand-down #3882 exists to end, one term smaller. So the clamp bounds the LAUNCHER's share only:
+#   launcher = min(wt_count, procs − overlap)      # overlap = pidfile processes `procs` also counts
+#   alive    = disp_alive + launcher               # disjoint by construction
+# The subtraction is the INTERSECTION (inclusion–exclusion), never `disp_alive`: a pidfile whose argv
+# the launcher predicate cannot read is counted as a dispatcher lane and NOT subtracted, which is the
+# safe direction (over-count → fewer dispatches) rather than an under-read (`_census_dispatcher`).
+#
+# ⛔ UNKNOWN IS ALIVE (the polarity the dispatcher census above states, and the reason this is safe):
+# when the PROCESS count cannot be measured the clamp does NOT apply and `wt_count` is returned
+# unchanged. Clamping on an unreadable reading would be the OVER-DISPATCH direction — the census is
+# now the only thing bounding the lane total — so the fail-safe answer is the LARGER (terminal) number.
+# A `ps` that prints NOTHING did not answer (every live box has at least a shell and this tick); a
+# `ps` that answered with no lane in it counts as 0 — a genuinely idle box **as seen by that probe**
+# (a partial view reads 0 too: see the one-sidedness note above).
+# ⛔ THE PREDICATE IS TOKEN-STRICT, AND THAT IS A MEASURED CHOICE, NOT A STYLE ONE.
+# A lane process is one whose OWN argv names it as a lane: a token whose basename is `pi` (pi sets its
+# process title, so a live lane reads as `pi` or `pi -p --provider …` in `ps`), or a token naming one of
+# the lane scripts the launcher runs. It covers BOTH shapes this box runs — the durable-terminal `pi` and
+# the `bash …/nonblocking-dispatch.sh …` subshell the drainer records.
+# ⛔ IT IS A SUPERSET OF `_counts_as_lane`'s FIRST LOOP, NOT THE SAME RULE (#3882 review). That loop
+# accepts a bare `pi` or a token whose ABSOLUTE-PATH basename is `pi` (`case "$t" in /*) b="${t##*/}" ;;`),
+# so `./pi` and `bin/pi` do NOT match there — while `pi` here comes from `${t##*/}` on EVERY token
+# (MEASURED: `./pi -p x` → `_counts_as_lane`=N, `_is_lane_process`=Y; `node /usr/local/bin/pi` → Y in
+# both). Broader is the safe direction for a bound, but it is a DIFFERENT rule and must not be cited as
+# the same one.
+# ⛔ IT IS DELIBERATELY STRICTER THAN `_counts_as_lane`'s SECOND LOOP, which matches those script names as
+# a SUBSTRING of the whole command line. Measured on the operator's Mac 2026-11-11: that form returned
+# **43** matches, four of which were the diagnostic's own `bash -c '… nonblocking-dispatch.sh …'` text —
+# the same self-match lane.sh:88 records for `pgrep -f "pi -p"`. A predicate that counts the shells which
+# merely MENTION a lane script cannot bound anything: on a box whose agents quote these names it reads
+# high enough that the clamp never fires, i.e. the fix would be INERT and the log would look clean.
+# Token-strict returned 39 on that same box: the same real lanes, none of the quoted diagnostic text.
+# ⛔ BUT STRICTER IS NOT IMMUNE, and the residual is stated rather than implied (#3882 review). A mention
+# that is a BARE TOKEN still counts: `bash -c sleep 1; nonblocking-dispatch.sh --flag` → counted. So does
+# any diagnostic whose own argv carries a bare lane token — `ps -A -o command= | grep -c pi` matches on
+# `pi` (MEASURED), which is exactly the shape an operator types on the affected box. The consequence is
+# therefore REDUCED, not eliminated: such a process raises the bound and keeps the clamp inert for that
+# tick. That is still the safe direction (over-count → fewer dispatches), and it is why this is a bound
+# and never a census.
+# WHAT IT OVER-INCLUDES, stated so nobody reads it as a true lane count: an INTERACTIVE `pi` session on
+# the operator's Mac matches too, as does the `grep -c pi` shape above. That is the safe direction — it
+# can only raise the bound, never lower it — and it is why this is a bound and not a census.
+# ⛔ ONE `ps` PER TICK, not one per lane: the census runs inside the lock on a 20-minute cadence, and a
+# per-lane process walk is the cost option 2 of #3882 declines.
+_is_lane_process() { # <command-line> → true when THIS argv IS a lane, not when it merely names one
+  local c="$1" t b rc=1 had_f=0
+  [ -n "$c" ] || return 1
+  # ⛔ GLOB-FREE, and that is the point of this line (#3882 review, MEASURED). The split below is
+  # UNQUOTED, so `for t in $c` does pathname expansion as well as word-splitting: an argv token holding a
+  # wildcard (`bash -c 'rm -f *.log'`) expands against the CWD, and this script's CWD holds `lane.sh` /
+  # `fix-one.sh` on the launchd path (`$O`). Measured with `lane.sh` and `pi` in the CWD:
+  # `_is_lane_process "bash -c echo *"` matched `lane.sh` and COUNTED. `set -f` makes the split a pure
+  # word-split, so a token can only match by its own text. The prior option is preserved and restored on
+  # the single exit path; the blast radius is a subshell anyway — BOTH callers are read through a `$(…)`:
+  # `_census_launcher` → `_live_lane_processes` → here (the clamp), and `_census_dispatcher` → here (the
+  # OVERLAP that clamp removes, #3886 P2-1; the same read must use the same predicate, which is why that
+  # is this function and not a second copy of the rule).
+  case $- in *f*) had_f=1 ;; *) set -f ;; esac
+  for t in $c; do
+    b="${t##*/}"
+    if [ "$b" = "pi" ]; then rc=0; break; fi
+    case "$b" in
+      nonblocking-dispatch.sh|bg-dispatch.sh|lane.sh|fix-one.sh|merge-one.sh|chain-merge.sh|dispatch-merge.sh) rc=0; break ;;
+    esac
+  done
+  [ "$had_f" = "1" ] || set +f
+  return "$rc"
+}
+_live_lane_processes() { # prints the count of live lane ROOTS, or nothing when `ps` cannot answer
+  local out c pid ppid rest own=" " pairs=" " n=0 rows=0
+  # ⛔ `pid=,ppid=,command=` BECAUSE A LANE IS NOT A PROCESS (#3886 review round 4, P2). Every lane this
+  # box runs contributes MORE than one lane-shaped process — the `bash …/lane.sh` wrapper AND the `pi` it
+  # execs (a `dispatch-merge.sh` ladder is three) — so counting processes read ~2× the lane count, and
+  # `share = procs − overlap` then landed at ~2× the launcher's lanes. The consequence is the one the
+  # overlap fix above was made for, at twice the size: MEASURED on a 9-lane table in that shape at
+  # `MAX_LANES`-style target 10, `alive=18` and the tick STAND DOWN with a slot free — #3882's own
+  # symptom, and `census-mismatch` reports it truthfully (`pi=18`) while the reading is wrong. So the
+  # count is the number of lane processes whose PARENT is not itself a lane process: one per lane, and a
+  # lane's `pi` child (or a `pi` sub-agent child) is the SAME lane, not a second one.
+  # The ppid column also keeps this cheap: ONE `ps -A` per tick, no per-lane walk (option 2 of #3882).
+  out="$("$PS" -A -o pid=,ppid=,command= 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1        # a `ps` with no output at all did NOT answer (see above)
+  while IFS= read -r c; do
+    c="${c#"${c%%[![:blank:]]*}"}"      # ltrim: BSD/Linux `ps -o pid=` right-aligns the pid
+    pid="${c%% *}"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac   # not a process row — never read it as "no lanes"
+    rows=$((rows + 1))
+    rest="${c#* }"; rest="${rest#"${rest%%[![:blank:]]*}"}"      # drop the pid
+    ppid="${rest%% *}"
+    rest="${rest#* }"; rest="${rest#"${rest%%[![:blank:]]*}"}"    # drop the ppid → the command line
+    _is_lane_process "$rest" || continue
+    own="$own$pid "                       # every lane-shaped pid, for the parent test below
+    pairs="$pairs$pid:$ppid "
+  done <<<"$out"
+  [ "$rows" -ge 1 ] || return 1        # a table of no process rows did not come from `ps -A`
+  for c in $pairs; do
+    pid="${c%%:*}"; ppid="${c#*:}"
+    case "$own" in *" $ppid "*) continue ;; esac   # its parent IS a lane — the same lane, not a new one
+    n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+_census_launcher() { # <dispatcher-overlap> — prints the count, or nothing when unreadable
+  local n wtn procs share ov
+  ov="${1:-0}"
+  case "$ov" in ''|*[!0-9]*) ov=0 ;; esac
+  wtn="$(wt_count lane- fix- merge- chain- 2>/dev/null)"
+  case "$wtn" in ''|*[!0-9]*) return 1 ;; esac
+  n="$wtn"
+  # The clamp (see the block above). An unreadable process count leaves `n` EXACTLY as today.
+  procs="$(_live_lane_processes)" || procs=""
+  case "$procs" in
+    ''|*[!0-9]*) : ;;
+    *) # ⛔ INCLUSION–EXCLUSION, NOT A SUM (#3886 review, P2-1). `procs` counts BOTH populations, so the
+       # dispatcher's share of it is removed before it bounds the LAUNCHER's: a live dispatcher lane is
+       # in `disp_alive` AND in `procs`, and clamping against the un-subtracted `procs` over-stated the
+       # launcher half by exactly that share. MEASURED shape on the issue's own cell (MAX_LANES = 2.5 × 4
+       # = 10): disp_alive=2 + min(34, 9) ⇒ alive=11 > 10 ⇒ the tick dispatched NOTHING with a slot free
+       # — the same stand-down #3882 exists to end, one term smaller, and `census-mismatch` could not show
+       # it (`pi=` was truthful; the SUM was not).
+       # The overlap SUBTRACTED is the intersection, not `disp_alive`: only a pidfile process whose argv
+       # the launcher predicate actually counts is known to be inside `procs`.
+       # ⛔ THE CHILD QUESTION, stated rather than implied: a dispatcher lane's CHILD processes (the `pi` a
+       # `nonblocking-dispatch.sh` subshell spawns) are NOT in this half — `_live_lane_processes` counts
+       # lane roots, so that `pi` is the same lane as its wrapper and is skipped by the parent test. What
+       # is left here is the dispatcher's ROOT (the process its pidfile names), which is exactly what the
+       # overlap removes; every other root is a launcher lane.
+       share="$procs"
+       [ "$ov" -le "$share" ] || ov="$share"          # cannot subtract more processes than were counted
+       share=$((share - ov))
+       if [ "$share" -lt "$wtn" ]; then
+         n="$share"
+         # ⛔ LOGGED HERE, not by the caller, because the caller reads this function through a COMMAND
+         # SUBSTITUTION (a subshell) — a value returned that way would never be seen by it, so a caller
+         # that logged the drift would log nothing and the clamp would apply silently. `log_line`
+         # appends to `$LOG`, which the subshell can write.
+         # `disp=` is the overlap removed, so `pi=` is not read as the launcher's share (it is the BOX's).
+         log_line "census-mismatch launcher=$wtn pi=$procs clamped=$n disp=$ov"
+       fi ;;
+  esac
   printf '%s' "$n"
 }
 
@@ -901,10 +1087,14 @@ trap _on_signal INT TERM
 
 # The census runs INSIDE the lock (it is part of the decision the lock protects) and AFTER settle, so a
 # lane that just died is no longer counted.
-disp_alive="$(_census_dispatcher)"
+# `disp_shared` is the part of `procs` the dispatcher already accounts for; `_census_launcher` removes it
+# so the two halves are disjoint and `alive` below is a sum of DISJOINT populations (#3886 review, P2-1).
+read -r disp_alive disp_shared <<<"$(_census_dispatcher)"
+case "${disp_alive:-}" in ''|*[!0-9]*) disp_alive=0 ;; esac
+case "${disp_shared:-}" in ''|*[!0-9]*) disp_shared=0 ;; esac
 lau_alive=""; lau_note=""
 if [ "$CENSUS_LAUNCHER" = "1" ]; then
-  lau_alive="$(_census_launcher)" || lau_alive=""
+  lau_alive="$(_census_launcher "$disp_shared")" || lau_alive=""
   case "$lau_alive" in
     ''|*[!0-9]*) lau_note="launcher census UNREADABLE (wt_count gave '${lau_alive}') — counted dispatcher lanes only"; lau_alive="" ;;
   esac
@@ -926,6 +1116,8 @@ if [ "$CENSUS_LAUNCHER" = "1" ] && [ "${lau_alive:-0}" -eq 0 ]; then
     finish 1
   fi
 fi
+# ⛔ `disp_alive` and `lau_alive` are DISJOINT (the launcher clamp removed the dispatcher's share of the
+# process count — see `_census_launcher`), which is the only reason a plain sum is the live-lane count.
 lanes=$((disp_alive + ${lau_alive:-0}))
 alive_src="dispatcher=$disp_alive"
 [ -n "$lau_alive" ] && alive_src="$alive_src launcher=$lau_alive"

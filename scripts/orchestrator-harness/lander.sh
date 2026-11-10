@@ -98,8 +98,8 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # the two lines above prepend the tool dirs, so a REAL gh outranks the seeded REST adapter
 # (`$O/gh-rest`) / cell serialiser (`$O/gh-limit`) and the layer is INERT — it reports protection
 # and provides none. Adapter LAST so `$O/gh-rest` (which calls the same helper) wins where it exists.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-limit" ]; then PATH="${O_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 export PATH
 
 # --repo-path is a convenience: the same repo a lane works in, named by its origin remote.
