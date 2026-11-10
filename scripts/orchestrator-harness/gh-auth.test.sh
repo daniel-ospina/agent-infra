@@ -327,9 +327,29 @@ r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 ck "A12 the env file is PARSED, not executed (a shebang-less 'touch' line never ran)" $rc
 rm -f "$TMP/PWNED"   # so no later arm can inherit the marker
 printf 'export GH_CONFIG_DIR=relative/dir\n' > "$ENVF"
-r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+# ⛔ THE FIXTURE HAS TO MAKE THE RELATIVE PATH RESOLVE, OR THE ARM CANNOT FAIL (review round 20, P3):
+# measured, `case "$val" in *)` (accept ANY value) left the suite at 122/0, because the suite's cwd holds
+# no `relative/dir` and BOTH parsers therefore fell through to `account`. It is not cosmetic: in a cwd
+# that DOES hold one, the shipped parser answers `none` while such a mutant answers `keys|relative/dir`
+# and `gh_auth_ensure` exports it — a repo-relative store becoming the lane's credential, which is the
+# reason the absolute-only rule exists. So the resolve runs from a cwd built to contain exactly that path.
+RELCWD="$TMP/relcwd"; mkdir -p "$RELCWD/relative/dir"; cp "$ACCT/.config/gh/hosts.yml" "$RELCWD/relative/dir/hosts.yml"
+r="$(u "cd '$RELCWD' && . '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "account|$ACCT/.config/gh" ]; rc=$?
-ck "A13 a non-absolute value is treated as ABSENT rather than used as a relative path ('$r')" $rc
+ck "A13 a non-absolute value is treated as ABSENT rather than used as a relative path — even when it RESOLVES from the cwd ('$r')" $rc
+rm -f "$ENVF"
+
+# ⛔ THE OTHER TWO DOCUMENTED SHAPES (review round 20, P3): `gh_auth.sh`'s parser doc lists single-quoting
+# and `readonly`/`typeset`, and neither had an arm that could fail — deleting the single-quote arm left
+# 122/0, and dropping `readonly` from the keyword alternation left 122/0. Both are one fixture each.
+printf "export GH_CONFIG_DIR='%s'\n" "$TMP/cfg-a" > "$ENVF"
+r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ "$r" = "keys|$TMP/cfg-a" ]; rc=$?
+ck "A11b …and a SINGLE-quoted value is unquoted, not swallowed ('$r')" $rc
+printf 'readonly GH_CONFIG_DIR=%s\n' "$TMP/cfg-a" > "$ENVF"
+r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ "$r" = "keys|$TMP/cfg-a" ]; rc=$?
+ck "A11c …and the \`readonly\` keyword is honoured, not only \`declare -x\`/\`export\` ('$r')" $rc
 rm -f "$ENVF"
 
 # The cause text is what the refusal prints, so it must speak only on a POSITIVE absence.
@@ -771,6 +791,11 @@ ck "B14 gh_auth_account_home answers the PASSWD home, not the redirected HOME ('
 # is the shape that makes them reachable on any host.
 mkdir -p "$TMP/bin-nogetent"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/bin-nogetent/getent"; chmod +x "$TMP/bin-nogetent/getent"
+# ⛔ AND THE SAME CLIFF FOR `dscl`, OR THIS ARM IS HOST-DEPENDENT (review round 20, P3): on a macOS host a
+# real `dscl` answers first, so deleting the `~user` block would leave the suite green — the "reachable on
+# any host" claim in the comment above was false there. A FAILING `dscl` is written beside the failing
+# `getent`; B15b then overwrites that same path with its own working stub.
+printf '#!/bin/sh\nexit 1\n' > "$TMP/bin-nogetent/dscl"; chmod +x "$TMP/bin-nogetent/dscl"
 _ahf="$(u "PATH='$TMP/bin-nogetent':\$PATH; HOME='$TMP/redirected-home'; . '$GH_AUTH' >/dev/null 2>&1; gh_auth_account_home")"
 { [ -n "$_ahf" ] && [ "$_ahf" != "$TMP/redirected-home" ]; } && case "$_ahf" in /*) rc=0 ;; *) rc=1 ;; esac || rc=1
 ck "B15 …and with \`getent\` failing the \`~user\` fallback still answers a PASSWD home, not \$HOME ('$_ahf')" $rc

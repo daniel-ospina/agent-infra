@@ -333,8 +333,11 @@ gh_auth_ensure() {
 
 # gh_auth_log <lane-home> [env-file] [account-home] — resolve, export when needed, and print ONE line
 # for the lane log (`[gh-auth] state=… dir=… lane_home=… — …`). The caller appends it to its log.
-# ⛔ EVERY LANE GETS THIS LINE, healthy or not: "which store did the gate read, and did the lane get the
-# same one" is the question #2509 took two boxes and a manual `gh` session to answer.
+# ⛔ EVERY LANE THAT REACHES THE CREATION GATE GETS THIS LINE, healthy or not — the contrast is about
+# CREDENTIAL health, not about lanes refused earlier: `run_agent` returns before this call on the disk,
+# memory and load gates, so such a lane logs no `[gh-auth]` line at all, and a reader must not read its
+# absence as "the module was missing". "Which store did the gate read, and did the lane get the same one"
+# is the question #2509 took two boxes and a manual `gh` session to answer.
 gh_auth_log() {
   local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" st d why dshow
   [ -n "$ef" ] || ef="${ENV_FILE:-${home}/keys.env}"
