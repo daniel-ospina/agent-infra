@@ -3415,16 +3415,27 @@ abstain_gate() {
     # parked work there is, and an UNREADABLE register fails closed.
     case "$STASH_STATE" in
         unreadable)
-            printf 'preserve\tstranded-stash-unverifiable\t\trule=P proof=stash-register:unreadable cannot read the stash register — a register we cannot read is not a clear register%s\n' "${st:+ $st}"
+            # ⛔ NO STALLED TOKEN HERE (review round 3, PR #3881): `STASH_STATE=unreadable` is a
+            # TRANSIENT probe failure (a `mktemp` failure or a bounded-read timeout) and
+            # `stash_index_load` re-reads the register at the top of every pass — exactly the shape
+            # round 2 removed `claim-unverified` for. A stalled entry must be a state NO later pass
+            # resolves; this one resolves itself.
+            printf 'preserve\tstranded-stash-unverifiable\t\trule=P proof=stash-register:unreadable cannot read the stash register — a register we cannot read is not a clear register\n'
             return 0 ;;
     esac
     if hit="$(stranded_stash_for "$branch")"; then
+        # ⛔ THIS IS THE ONLY ABSTENTION THAT EARNS THE TOKEN (#3881 review round 3): a stash ENTRY
+        # naming this branch is DURABLE parked work — a later pass re-reads the same register and
+        # finds the same entry, so nothing releases it without an operator. The probe-failure arms
+        # around it are transient and self-resolving, so they carry nothing.
         printf 'preserve\tstranded-stash\t\trule=P proof=stash-register:%s the stash register holds work for %s%s\n' "${hit%%$'\t'*}" "${branch#refs/heads/}" "${st:+ $st}"
         return 0
     fi
     [ "$proved" = 1 ] && { UNPUSHED_NOTE=""; return 1; }
     if ! unp="$(unpushed_ahead "$path")"; then
-        printf 'preserve\tunpushed-unverifiable\t\trule=P proof=git rev-list --count HEAD --not --remotes:unreadable cannot evaluate whether this head is pushed — abstaining%s\n' "${st:+ $st}"
+        # ⛔ NO TOKEN HERE EITHER, for the same reason as the unreadable register above: an
+        # unanswerable `rev-list` is a probe failure the next pass re-takes.
+        printf 'preserve\tunpushed-unverifiable\t\trule=P proof=git rev-list --count HEAD --not --remotes:unreadable cannot evaluate whether this head is pushed — abstaining\n'
         return 0
     fi
     # ⛔ IT DOES NOT VETO AN UNPUSHED HEAD, AND THAT IS A RECORDED DECISION, not an
@@ -4130,8 +4141,12 @@ classify_one() {
                         "$cpay" "$REAP_WT_WIP_AGE_HOURS"
                     return 0
                 fi
-                if [ "$wt_ok" = 1 ]; then
-                    _st_age=$(((now - wt_ts) / 3600))
+                if :; then
+                    # ⛔ CEILING, NOT TRUNCATION (#3881 review round 3): the floor test compares
+                    # SECONDS, so a record 24h30m old truncated to `age=24h floor=24h` could not be
+                    # SEEN to be past it — and "past its floor" is the one thing this row exists to
+                    # state. Rounding up makes `age > floor` visible by construction.
+                    _st_age=$(( ((now - wt_ts) + 3599) / 3600 ))
                     # ⛔ THE CLASS FLOOR STILL APPLIES WITH THE SWITCH OFF (review, PR #3881). It is
                     # what covers `worktree add` -> first commit: without it a lane's FIRST uncommitted
                     # edit (0 commits, dirty, no live claim) was published as stale residue on the very
@@ -5124,7 +5139,10 @@ run() {
              REAP_WT_INEFFECTIVE_MIN_EXAMINED:"$REAP_WT_INEFFECTIVE_MIN_EXAMINED" \
              REAP_WT_DISK_FLOOR_MB:"$REAP_WT_DISK_FLOOR_MB" \
              REAP_WT_SCRATCH_AGE_DAYS:"$REAP_WT_SCRATCH_AGE_DAYS" \
-             REAP_WT_PRESERVE_KEEP_DAYS:"$REAP_WT_PRESERVE_KEEP_DAYS"; do
+             REAP_WT_PRESERVE_KEEP_DAYS:"$REAP_WT_PRESERVE_KEEP_DAYS" \
+             REAP_WT_GHOST_AGE_HOURS:"$REAP_WT_GHOST_AGE_HOURS" \
+             REAP_WT_WIP_AGE_HOURS:"$REAP_WT_WIP_AGE_HOURS" \
+             REAP_WT_STALE_INIT_SECONDS:"$REAP_WT_STALE_INIT_SECONDS"; do
         is_pos_int "${v#*:}" || { echo "bad ${v%%:*}: ${v#*:} (want a non-negative integer)" >&2; exit 2; }
     done
     # An explicit free-space witness is a NUMBER or it is a refusal, for the same reason
