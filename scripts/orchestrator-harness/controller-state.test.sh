@@ -579,7 +579,7 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
   # the STATE dir, so a script path built from it cannot exist on the documented `ORC_STATE_DIR`
   # arrangement. Each file carries ONE `_X_WORK="${O_WORK:-$O}"` line, DRIVEN here rather than grepped
   # for by name — so a revert to `_X_WORK="$O"` reddens instead of still matching a variable name.
-  for _w in chain-merge.sh dispatch-merge.sh stall-fix.sh refresh-candidates.sh nonblocking-dispatch.sh; do
+  for _w in chain-merge.sh dispatch-merge.sh stall-fix.sh refresh-candidates.sh nonblocking-dispatch.sh adopt-fix.sh report.sh; do
     _wkline="$(grep -m1 -E '^_[A-Z][A-Z_]*_WORK="\$\{O_WORK:-\$O\}"' "$HERE/$_w" 2>/dev/null)"
     if [ -z "$_wkline" ]; then
       ck "§7 $_w declares a work root (\${O_WORK:-\$O})" 1
@@ -604,6 +604,12 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
   # `wt_spawn` answers 0 (worker-terminal.sh's pre-check runs `$envpfx`, not `$cmd`), so the dispatch
   # BOOKS `chain-<N>` as spawned, no review/record/merge ever runs, and the issue claim is held for its
   # 4h lease because `chain-merge.sh`'s EXIT trap never fires.
+  # ⛔ THE LAST TWO LAUNCHERS WERE RECORDED AS FOLLOW-UP NOTES BY THE REVIEW, AND ARE PINNED IN THE
+  # TABLE BELOW SO THEY CANNOT BE RE-DERIVED NEXT ROUND. Both are reached only on a split box, which is
+  # why neither blocked — and both fail there in the wrong place: `adopt-fix.sh` 127'd the fixer into its
+  # own log (an operator surface no fleet caller uses), and `report.sh` answered the worker census from
+  # a module it could not find, which stays `UNKNOWN` rather than a confident 0. STATE paths are
+  # deliberately NOT converted: `$O/logs`, `$O/state`, `$O/heartbeat` are the state dir on a split box.
   while IFS='|' read -r _f _bad _good; do
     [ -n "$_f" ] || continue
     if grep -qF -- "$_bad" "$HERE/$_f" 2>/dev/null; then
@@ -619,6 +625,8 @@ chain-merge.sh|bash "$O/merge-one.sh"|bash "${_CM_WORK:-$O}/merge-one.sh"
 dispatch-merge.sh|bash '$O/lane.sh'|bash '${_DM_WORK:-$O}/lane.sh'
 dispatch-merge.sh|bash '$O/chain-merge.sh'|bash '${_DM_WORK:-$O}/chain-merge.sh'
 stall-fix.sh|DISP="$O/nonblocking-dispatch.sh"|DISP="${_SF_WORK:-$O}/nonblocking-dispatch.sh"
+adopt-fix.sh|bash "$O/fix-one.sh"|bash "${_AF_WORK:-$O}/fix-one.sh"
+report.sh|"$O/worker-terminal.sh"|"$_RP_WORK/worker-terminal.sh"
 merge-one.sh|if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then|if [ -n "${HEAD:-}" ] && [ -f "$_M1_MOD/claims.sh" ]; then
 PAIRS
   # ⛔ AND THE DISPATCH ARM MUST RESOLVE THE REGISTRY ITSELF, IN TWO HOMES. It tested `$O/claims.sh`

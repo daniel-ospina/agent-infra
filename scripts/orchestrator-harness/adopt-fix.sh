@@ -4,6 +4,12 @@
 set -u
 REPO="$1"; OR="$2"; PR="$3"; BR="$4"
 O="${O:-$HOME/orchestrator}"
+# ⛔ THE WORK ROOT (#2095, review of #3846 — follow-up P3). The controller exports `O` = its STATE dir
+# and `O_WORK` = the harness root, where the fixer this file execs actually lives. This was the LAST
+# launcher still building a SCRIPT path from `$O`, so on the exactly-split box this PR introduces the
+# spawn 127'd into `logs/adopt-$PR.log` (and `$rc` reported that as the fixer's status) while every
+# sibling was converted. `$O/logs` above and below is CORRECT as it stands — logs are state.
+_AF_WORK="${O_WORK:-$O}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 mkdir -p "$O/logs"
 cd "$REPO" || exit 1
@@ -61,7 +67,7 @@ if [ "$_wt_rc" != 0 ]; then
   exit 1
 fi
 echo "[adopt-fix $PR] worktree=$WT branch=$BR ($WT_RESULT) $(date)" >> "$O/logs/adopt-$PR.log"
-bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
+bash "${_AF_WORK:-$O}/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
 rc=$?
 # ⛔ THE DEFERRAL CODE IS ONE NAMED CONSTANT, NOT A LITERAL REPEATED FOUR TIMES (review of PR #3237,
 # finding 2). `spawn-gate.test.sh` now proves that no two gates in this deploy unit claim one code —
@@ -188,7 +194,7 @@ elif [ "$rc" = "0" ] && grep -q 'cross-box fixer claim REFUSED' "$O/logs/fix-$PR
   echo "[adopt-fix $PR] fixer NOT started (CROSS-BOX claim) — another box is already fixing this head, so nothing was pushed and no attempt was consumed; re-run once that worker finishes or its lease expires. The holder and the head are in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
   exit "$ADOPT_DEFERRED"
 fi
-# ⛔ Exit with the FIXER's status, EXPLICITLY. `origin/main` ended on `bash "$O/fix-one.sh"`, so
+# ⛔ Exit with the FIXER's status, EXPLICITLY. `origin/main` ended on the fixer invocation above, so
 # `$?` was already the fixer's. The reporting block ABOVE was added by this change, and an `if` with
 # a false condition and no `else` returns 0 — measured: `if [ "$rc" = "75" ]; then echo x; fi`
 # returns 0 for BOTH `rc=0` and `rc=75`. So the reporting line, made the last command, would have
