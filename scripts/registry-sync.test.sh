@@ -1115,6 +1115,43 @@ fi
 RC_OUT="$(mini_rs "$RC_BOX" push)"; RC_RC=$?
 assert_not_contains "$RC_OUT" "pushed " "§29t a record whose repo the GATE refuses is never published"
 assert_contains "$RC_OUT" "not one the fleet's rail can USE" "§29t ...and the refusal names usability"
+# §29u — A BOOLEAN STAMP IS NOT A STAMP. `true`/`false` stringified to text that sorts ABOVE every real ISO
+# stamp (`'t'`/`'f'` > `'2'`), so a record with `"reviewed_at":true` won rule 1 on BOTH verbs: it survived
+# as "this box is NEWER" against a newer peer, and when it was the PEER it OVERWROTE a newer usable local
+# record, then became its key's ordering authority for ever (round 11). `null`/containers were already
+# empty in `_field_json`; the boolean was the one member of the family left returning text.
+mini_fixture boolstamp
+BS_BOX="$T/boolstamp.box"; mkdir -p "$BS_BOX"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":true}\n' \
+  "$HEAD_A" > "$BS_BOX/$NEST_KEY.json"
+if python3 -c 'import json,sys;print(type(json.load(open(sys.argv[1]))["reviewed_at"]).__name__)' "$BS_BOX/$NEST_KEY.json" 2>/dev/null | grep -qx bool; then
+  ok "§29u (premise) the reader parses the fixture's stamp as a BOOLEAN"
+else
+  bad "§29u (premise) the fixture does not carry a boolean stamp"
+fi
+BS_OUT="$(mini_rs "$BS_BOX" push)"
+assert_not_contains "$BS_OUT" "pushed $NEST_KEY" "§29u a BOOLEAN stamp is unreadable — never published"
+assert_contains "$BS_OUT" "no readable reviewed_at" "§29u ...and the run names the missing stamp"
+# §29v — THE PUSH PRE-PASS MUST NOT REPORT CONVERGED OVER A RECORD THE READER REFUSES. It skipped a
+# byte-identical pair on `field reviewed_at` alone, so an unusable record that happened to match the store
+# byte-for-byte was counted `unchanged`, `unreadable=0`, exit 0 — "every local record is already in the
+# store" over a record this box cannot use, contradicting the rc-4 contract the header documents
+# (round 11). The same batched rule set as `record_usable` now filters the skip list.
+mini_fixture convbad
+CB_BOX="$T/convbad.box"; mkdir -p "$CB_BOX"
+CB_BAD="$T/convbad.peer"
+printf '{"pr":2374,"head_sha":"nope","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-10T00:00:00Z"}\n' \
+  > "$CB_BAD"
+cp "$CB_BAD" "$CB_BOX/$NEST_KEY.json"     # BYTE-IDENTICAL on both sides
+CB_BLOB="$(git -C "$MINI_STORE" hash-object -w "$CB_BAD")"
+CB_TREE="$(printf '100644 blob %s\trecord.json\n' "$CB_BLOB" | git -C "$MINI_STORE" mktree)"
+CB_COMMIT="$(git -C "$MINI_STORE" -c user.name=sync -c user.email=sync@test.invalid commit-tree "$CB_TREE" -m "$NEST_KEY")"
+git -C "$MINI_STORE" push -q origin "$CB_COMMIT:refs/reviews/$NEST_KEY" 2>/dev/null || :
+if cmp -s "$CB_BAD" "$CB_BOX/$NEST_KEY.json"; then ok "§29v (premise) the pair is BYTE-IDENTICAL on both sides"; else bad "§29v (premise) the fixture is not the converged shape"; fi
+CB_OUT="$(mini_rs "$CB_BOX" push)"; CB_RC=$?
+assert_eq "$CB_RC" "4" "§29v an unusable CONVERGED pair is exit 4, not a converged-looking 0"
+assert_not_contains "$CB_OUT" "already in the store" "§29v ...and the run does not claim everything is already there"
+assert_contains "$CB_OUT" "unreadable=1" "§29v ...and counts it"
 # §29i — `null` is not a timestamp. The literal text sorts ABOVE every real stamp (`'n' > '2'`), so reading
 # it as `null` made a record with no stamp win the ordering instead of being unreadable.
 NEST9D="$MINI_ROOT/box9"; mkdir -p "$NEST9D"
@@ -1457,6 +1494,47 @@ else
   bad "§30o ...the lock wait was paid per key (${O_SECS}s for 3 keys), so the run is O(keys) x 5s"
 fi
 rm -rf "$LM_BOX/.registry-sync.lock"
+# (r) THE "RECORDED PID IS GONE" ARM. It is the FIRST shape the §30 doc block names (a killed run), and
+# nothing pinned it: §30a/§30b plant a LIVE pid, §30c a pid-LESS lock, §30d/§30h a live pid past the
+# ceiling — so deleting this arm left the suite green, and a regression would silently turn one killed run
+# into a full run of the ~300 s ceiling wait inside atomic-land.sh's pre-sync (round 11).
+mini_fixture deadpid
+DP_SEED="$MINI_ROOT/seed"; mkdir -p "$DP_SEED"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+  "$HEAD_A" > "$DP_SEED/$LCK_KEY.json"
+mini_rs "$DP_SEED" push >/dev/null 2>&1
+DP_BOX="$MINI_ROOT/box"; mkdir -p "$DP_BOX"
+DP_DEAD="$(sh -c 'echo $$')"          # a pid that has certainly exited by the time the run starts
+mkdir -p "$DP_BOX/.registry-sync.lock"; printf '%s\n' "$DP_DEAD" > "$DP_BOX/.registry-sync.lock/pid"
+DP_OLD="$(python3 -c 'import time;print(time.strftime("%Y%m%d%H%M.%S", time.localtime(time.time()-30)))')"
+touch -t "$DP_OLD" "$DP_BOX/.registry-sync.lock"   # past the 2 s grace, far below the ceiling
+if ps -p "$DP_DEAD" >/dev/null 2>&1; then
+  bad "§30r (premise) the 'dead' pid $DP_DEAD is still alive — the arm would prove nothing"
+else
+  ok "§30r (premise) the recorded pid is GONE"
+fi
+DP_OUT="$(bash "$SYNC" pull --repo "$MINI_STORE" --dir "$DP_BOX" --remote origin --timeout 30 2>&1)"; DP_RC=$?
+assert_eq "$DP_RC" "0" "§30r a lock whose recorded pid is GONE is reclaimed promptly (not at the ceiling)"
+assert_contains "$DP_OUT" "is gone (a killed run)" "§30r ...and the reclaim names the killed run"
+if [ -f "$DP_BOX/$LCK_KEY.json" ]; then ok "§30r ...and the pull then did its work"; else bad "§30r ...the pull skipped the record"; fi
+rm -rf "$DP_BOX/.registry-sync.lock"
+# (s) NO AMBIENT KNOB CAN WEAKEN THE LOCK. `LOCK_STALE_MAX` was `${REGISTRY_SYNC_LOCK_STALE_MAX:-…}` with a
+# floor of 1 s, so an exported value of 1 let the CEILING arm steal a LIVE lock inside its own critical
+# section — the "disable a gate by ambient env" class, and nothing on this box ever read the variable
+# (round 11). Both bounds are derived now; this arm pins that an export cannot change the verdict.
+mini_fixture noenv
+NE_SEED="$MINI_ROOT/seed"; mkdir -p "$NE_SEED"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+  "$HEAD_A" > "$NE_SEED/$LCK_KEY.json"
+mini_rs "$NE_SEED" push >/dev/null 2>&1
+NE_BOX="$MINI_ROOT/box"; mkdir -p "$NE_BOX"
+mkdir -p "$NE_BOX/.registry-sync.lock"; printf '%s\n' "$$" > "$NE_BOX/.registry-sync.lock/pid"
+NE_OLD="$(python3 -c 'import time;print(time.strftime("%Y%m%d%H%M.%S", time.localtime(time.time()-30)))')"
+touch -t "$NE_OLD" "$NE_BOX/.registry-sync.lock"
+NE_OUT="$(REGISTRY_SYNC_LOCK_STALE_MAX=1 REGISTRY_SYNC_LOCK_PID_GRACE=1 bash "$SYNC" pull --repo "$MINI_STORE" --dir "$NE_BOX" --remote origin --timeout 30 2>&1)"; NE_RC=$?
+assert_eq "$NE_RC" "1" "§30s an exported ceiling of 1 s does NOT let the lock be stolen from a LIVE holder"
+if [ -d "$NE_BOX/.registry-sync.lock" ]; then ok "§30s ...the live holder's lock is still there"; else bad "§30s ...the ambient env overrode the ceiling and the lock was STOLEN"; fi
+rm -rf "$NE_BOX/.registry-sync.lock"
 
 # §30p — AND THE MESSAGE MUST BE TRUE. §30o fixes the COST of a permanently unacquirable lock; it left the
 # DIAGNOSIS wrong, and the diagnosis is what the operator acts on: every key reported "another run holds"

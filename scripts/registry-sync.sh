@@ -293,10 +293,14 @@ try:
 except Exception:
     sys.exit(0)
 v = d.get(sys.argv[2], "") if isinstance(d, dict) else ""
-if v is None or isinstance(v, (dict, list)):
+# ⛔ EVERY NON-STRING SCALAR IS UNREADABLE, INCLUDING A BOOLEAN. `true`/`false` stringified to text that
+# sorts ABOVE every real ISO stamp (`'t'`/`'f'` > `'2'`), so a record with `"reviewed_at":true` won rule 1
+# on BOTH verbs: it survived as "this box is NEWER" against a newer peer, and it OVERWROTE a newer usable
+# local record when it was the peer — published, then the ordering authority for its key for ever
+# (measured). `null`/containers were already empty here; the boolean was the one member of the family
+# left returning text. No caller wants "true" for `pr`/`repo`/`mint`/`carried_from` either.
+if v is None or isinstance(v, (dict, list, bool)):
     v = ""
-elif isinstance(v, bool):
-    v = "true" if v else "false"
 elif isinstance(v, float):
     # `1e999` parses to `inf` WITHOUT a constant token, so the constant hook above does not catch it
     v = str(v) if math.isfinite(v) else ""
@@ -537,16 +541,13 @@ same_bytes() { [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; }
 # without either, so a lock it could not remove — a root-owned lock left in a shared registry by a
 # `sudo` run — HOT-SPUN with no bound at all (measured: 410 reclaim warnings in 4 s, never exits),
 # inside atomic-land.sh's pre-sync. The ~5 s bound must hold in EVERY arm, not just the waiting one.
-LOCK_PID_GRACE="${REGISTRY_SYNC_LOCK_PID_GRACE:-2}"    # s a pid-less lock must survive before reclaim
-LOCK_STALE_MAX="${REGISTRY_SYNC_LOCK_STALE_MAX:-}"    # empty ⇒ derive: max(300, 2 × MAX_WAIT)
-# A non-numeric tunable would make `[ -ge ]` ERROR (rc 2, so the arm silently flips) — sanitise, because
-# a silently-flipped reclaim arm is either a stolen live lock or a restored permanent wedge. A
-# DEGENERATE value (0) disables the lock just as effectively, so both arms carry a real floor.
-case "$LOCK_PID_GRACE" in ''|*[!0-9]*) LOCK_PID_GRACE=2 ;; esac
-[ "$LOCK_PID_GRACE" -ge 1 ] || LOCK_PID_GRACE=1
-if [ -z "$LOCK_STALE_MAX" ]; then LOCK_STALE_MAX=$((MAX_WAIT * 2)); [ "$LOCK_STALE_MAX" -ge 300 ] || LOCK_STALE_MAX=300; fi
-case "$LOCK_STALE_MAX" in ''|*[!0-9]*) LOCK_STALE_MAX=300 ;; esac
-[ "$LOCK_STALE_MAX" -ge 1 ] || LOCK_STALE_MAX=300
+# ⛔ NOT AMBIENT-OVERRIDABLE. These were `REGISTRY_SYNC_LOCK_*` env knobs with a floor of 1 s, so an
+# exported `REGISTRY_SYNC_LOCK_STALE_MAX=1` let the CEILING arm steal a LIVE lock inside its own critical
+# section — T2's "disable a gate by ambient env" class, and nothing on this box or in this suite ever read
+# them. The operator knob that DOES exist is `--timeout`, and the ceiling is derived from it.
+LOCK_PID_GRACE=2                                              # s before a pid the OS proves GONE is reclaimed
+LOCK_STALE_MAX=$((MAX_WAIT * 2)); [ "$LOCK_STALE_MAX" -ge 300 ] || LOCK_STALE_MAX=300   # s past which no
+                                                              # sync run can still hold it
 
 lock_age() { # <path> → SECONDS since its mtime, "" when no `stat`/`date` can answer
   # ⛔ the AGE, not the MTIME: comparing an absolute epoch against a 300 s threshold is true for every
@@ -1417,13 +1418,19 @@ do_push() {
       progress "registry-sync: push — the converged pre-pass could not run; examining all $total records"
       : > "$TMPD/push.ident"
     fi
-    # `push_one` refuses a record with no readable `reviewed_at` BEFORE any comparison, so a
-    # byte-identical record may NOT be skipped when that field is empty.
+    # ⛔ `usable_pairs` RETURNS KEYS, so the pairs file is INTERSECTED against them rather than replaced
+    # (replacing it made `push.stamp` empty, which sent every record down the per-record path and
+    # regressed the #3180 budget: measured N=10 → 128 spawns, N=25 → 233 — the delta §27 exists to
+    # catch). On failure the key list is EMPTY, which skips nothing: the conservative, pre-existing
+    # behaviour.
+    : > "$TMPD/push.ok"
+    usable_pairs "$TMPD/push.ident" "$TMPD/push.ok" || : > "$TMPD/push.ok"
+    awk -F'\t' 'NR == FNR { ok[$1] = 1; next } ($1 in ok)' "$TMPD/push.ok" "$TMPD/push.ident" > "$TMPD/push.cand"
     : > "$TMPD/push.stamp"
     while IFS=$'\t' read -r key name; do
       [ -n "$key" ] || continue
       [ -n "$(field "$name" reviewed_at)" ] && printf '%s\t%s\n' "$key" "$name" >> "$TMPD/push.stamp"
-    done < "$TMPD/push.ident"
+    done < "$TMPD/push.cand"
     conv="$(command wc -l < "$TMPD/push.stamp" | tr -d ' ')"
     SAME=$((SAME + conv))
     UNCHANGED=$((UNCHANGED + conv))
