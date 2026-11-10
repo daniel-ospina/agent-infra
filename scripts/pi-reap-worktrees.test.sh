@@ -40,7 +40,11 @@
 #   open-pr                 G5a  (branch is an open PR head => PRESERVE)
 #   gh-unavailable          G5c  (=> exit 3, dry AND armed)
 #   no-github-remote        G5d  (PR gate N/A => still reclaims)
-#   too-recent              G6a  (HEAD < aged-days => PRESERVE)
+#   too-recent              G6a  (RULE D: a clean, holder-free, no-open-PR checkout is DISPOSABLE —
+#                                floor REAP_WT_DISPOSABLE_AGE_MINUTES, 12 h; G6a2/G6a3 pin the
+#                                cooldown direction and the `=0` restore)
+#   ⛔ dirty is never collected G6w  (76d old, past every floor, held by the clean gate alone, with a
+#                                mutant that drops the gate and makes the same row reclaimable)
 #   aged / branch-retained  G6b  (unmerged named branch => REMOVE,
 #                                refs=branch-retained, ref survives)
 #   aged boundary           G6c  (strict > at 7d, 7d+1s, 7d+2s)
@@ -1769,26 +1773,86 @@ WT_RECENT="$(add_named_wt "$REPO" "$ENV-recent" feat/g6-recent)"
 commit_in_wt "$WT_RECENT" "$RECENT_DATE" recent
 WT_AGED="$(add_named_wt "$REPO" "$ENV-aged" feat/g6-aged)"
 commit_in_wt "$WT_AGED" "$OLD_DATE" aged          # UNMERGED, aged, owns its commit
+# ── G6a: RULE D — THE DISPOSABLE-CLEAN FLOOR, and it is OFF unless it is ARMED ────────────────────
+# The capability that answers `worktree=0`. A CLEAN, holder-free, no-open-PR checkout was held by the
+# 7-day abandonment PROXY alone; measured on cell-3 (2026-11-10) that was 60 of 194 preserved rows
+# while the box reaped ZERO worktrees per hourly pass. Cleanliness + the census + the open-PR veto +
+# `refs=` ARE the safety property, so the floor for such a row can be a COOLDOWN (12 h), not a week.
+# ⛔ IT IS NOT THE DEFAULT, and G6a0 pins that: rule 6's 7-day window is a recorded, tested decision
+# (A2/A3/A14a/E3b/E4/G14d all measure it), so shipping it ON would reverse that decision silently.
+# Arming it is a deliberate per-box act, the same shape #1678 already uses for the reaper itself.
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" "G6a HEAD 2d old => preserve too-recent"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
+    "G6a0 DEFAULT (unarmed) still keeps a 2d clean row behind rule 6's 7-day window — the recorded decision is not reversed"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "ruleD" "G6a0 …and no row cites a ruleD floor while the rule is unarmed"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=reclaimable" \
+    "G6a ARMED (720m) a clean+holder-free+no-open-PR row at 2d => REMOVED under RULE D (not held by the 7d proxy)"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "floor=720m(ruleD)" \
+    "G6a the row NAMES the floor that decided it — a removal citing an unexpected floor is the complaint this change answers"
+# ── G6a2: the floor is still a COOLDOWN — raise it above the row's age and the row is preserved.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES=4320 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
+    "G6a2 a floor ABOVE the row's age (3d > 2d) preserves it — RULE D only ever LOWERS a floor, never removes one"
+# ── G6a3: 0 DISABLES it and restores the pre-rule behaviour EXACTLY, which is what makes the change
+# reversible on a box without a code change.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES=0 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
+    "G6a3 REAP_WT_DISPOSABLE_AGE_MINUTES=0 restores the 7d floor exactly"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "ruleD" \
+    "G6a3 … and the row no longer cites the ruleD floor (the disable is visible, not implied)"
 assert_contains "$(row_for "$OUT" "$WT_AGED")" "reason=reclaimable" "G6b aged HEAD => remove"
 assert_contains "$(row_for "$OUT" "$WT_AGED")" "refs=branch-retained:feat/g6-aged" \
     "G6b UNMERGED named branch reported as branch-retained (the 48-row class)"
-run_reaper $ENV --apply --repo "$REPO" >/dev/null
+# ARMED for the apply leg: WT_RECENT is only removable because RULE D was armed above, so the two
+# rows below measure the armed policy end-to-end rather than the default window.
+REAP_WT_DISPOSABLE_AGE_MINUTES=720 run_reaper $ENV --apply --repo "$REPO" >/dev/null
 assert_nodir "$WT_AGED" "G6b --apply removed the unmerged branch-retained worktree"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/g6-aged | wc -l | tr -d ' ')" "1" \
     "G6b the unmerged branch ref still resolves after removal"
-assert_dir "$WT_RECENT" "G6b --apply kept the too-recent worktree"
-# strict-> boundary: exactly 7d survives; 7d+1s and 7d+2s are reaped
+assert_nodir "$WT_RECENT" "G6b --apply removed the 2d clean row (RULE D)"
+# strict-> boundary: exactly 7d survives; 7d+1s and 7d+2s are reaped.
+# ⛔ PINNED WITH RULE D OFF. This group's subject is the AGED floor's `>` boundary, and RULE D caps that
+# floor at 12 h by default — so leaving it on would measure the disposable floor while claiming to
+# measure the 7-day one. `=0` is exactly the "pre-rule behaviour" the contract promises to restore.
 ENV=G6c; REPO="$(mk_repo $ENV)"
 WT_EDGE="$(add_named_wt "$REPO" "$ENV-edge" feat/g6-edge)"
 commit_in_wt "$WT_EDGE" "$(python3 -c 'import datetime;print((datetime.datetime.fromisoformat("2026-09-15T20:00:00+00:00")-datetime.timedelta(days=7)).isoformat())')" edge
-OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES=0 run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=too-recent" "G6c exactly 7d survives (strict >)"
-OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 1)) run_reaper $ENV --dry-run --repo "$REPO")"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES=0 REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 1)) run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=reclaimable" "G6c 7d+1s is reaped (strict >)"
-OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 2)) run_reaper $ENV --dry-run --repo "$REPO")"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES=0 REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 2)) run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=reclaimable" "G6c 7d+2s is reaped (strict >)"
+
+# ── G6w: ⛔ A DIRTY CHECKOUT IS NEVER COLLECTED — the ONE case removal destroys work ────────────
+# RULE D lowers an AGE floor; it must never reach the CLEAN gate, because uncommitted work is the only
+# loss `git worktree remove` can inflict that nothing recovers (the branch and every commit survive the
+# removal). The fixture is therefore deliberately OUTSIDE every other protection — 76 days old, i.e.
+# past the disposable floor, past rule 7, and (through the harness's PR shim) not an open PR — which
+# leaves the clean gate as the ONLY thing between it and removal. If any future change lets a dirty
+# tree through, THIS case goes red. The mutant below proves the case is not vacuous: with the clean
+# gate dropped, the SAME fixture is classified for removal.
+ENV=G6w; REPO="$(mk_repo $ENV)"
+WT_DIRTW="$(add_named_wt "$REPO" "$ENV-dirty" feat/g6w-dirty)"
+commit_in_wt "$WT_DIRTW" "$OLD_DATE" dirty
+printf 'uncommitted-work-that-nothing-can-recover\n' >>"$WT_DIRTW/base.txt"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW")" "reason=dirty" \
+    "G6w a DIRTY checkout 76d old is preserved — past EVERY floor, held by the clean gate alone"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW")" "reason=reclaimable" \
+    "G6w … and is never classified for removal at all (so 'preserved' cannot be a near-miss)"
+run_reaper $ENV --apply --repo "$REPO" >/dev/null
+assert_dir "$WT_DIRTW" "G6w --apply left the dirty checkout in place"
+assert_contains "$(cat "$WT_DIRTW/base.txt" 2>/dev/null)" "uncommitted-work-that-nothing-can-recover" \
+    "G6w the uncommitted line SURVIVED — the only property the whole rule table exists to protect"
+MUTW="$T/mutant-no-clean-gate-g6w.sh"
+mutate_reaper_anchored "$MUTW" no-clean-gate
+OUT="$(REAPER="$MUTW" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW")" "reason=dirty" \
+    "G6w MUTANT really dropped the clean gate (otherwise the assertion below proves nothing)"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW")" "reason=reclaimable" \
+    "G6w WITHOUT the clean gate the dirty checkout becomes reclaimable — so G6w MEASURES the gate"
 
 # ── G6d: a MERGED head is exempt from the age floor (agent-infra#2032) ──
 # The floor's job is "work may still be in progress"; a merge is the proof it is not.
