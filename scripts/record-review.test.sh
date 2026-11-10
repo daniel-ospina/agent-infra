@@ -12081,16 +12081,16 @@ MUT="$(mk_mutant nopeelfull '        _scand="${_straw}${_srun}"' '        _scand
 mut_check "M72 a tip-word base whose continuation IS a ref is resolved WHOLE, not read as the tip" 425436 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42543701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="I only actually reviewed delta:${DG_BASE}..hEaD+1; the rest was not read."
 MUT="$(mk_mutant norunboundary '[^0-9A-Za-z_/+=$%&@~^{}-]|$|[0-9A-Za-z_/+=%$&@~^{}-]+) ]]; do' '[^0-9A-Za-z_/+=$%&@~^{}-]|$) ]]; do')"
 mut_check "M74 a name-legal run after the range is ADMITTED, so an artifact quoting its own evidence ref is not refused" 425438 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42543901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}+comment:42543901; no issues found."
-# M80 — THE MIRROR OMISSION IS REFUSED (P1, twenty-eighth cycle). Disabling the arm restores the
-#       fail-open: `..<head>` beside the honest range mints a signed clean over the whole range while
+# M83 — THE MIRROR OMISSION IS REFUSED (P1, twenty-eighth cycle). NUMBERED M80.
+#       Disabling the arm restores the fail-open: `..<head>` beside the honest range mints a signed clean over the whole range while
 #       its narrowing sentence names nought commits. 20h90's body.
-# ⛔ M80'S ANCHOR WAS NOT UNIQUE AT FIRST (MEASURED, and the cell certified nothing): the guard text
+# ⛔ M83'S ANCHOR WAS NOT UNIQUE AT FIRST (MEASURED, and the cell certified nothing): the guard text
 #       `if [ "$_osha" = "$to" ]; then` occurs in BOTH the older `<tip>..` arm and this mirror arm, and
 #       `mk_mutant` replaces the FIRST occurrence — so the mutant neutered the WRONG arm, the shipped
 #       mirror arm still refused, and the cell reported "mutant still refused". Anchor on this arm's
 #       own sentence instead.
 MUT="$(mk_mutant nomirror '_emptyrange=1; _emptystated="..${_orhs} (the left endpoint is omitted' '_emptystated="..${_orhs} (the left endpoint is omitted')"
-mut_check "M80 an omitted LEFT endpoint that resolves to the head is an EMPTY range, not prose" 425476 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+mut_check "M83 an omitted LEFT endpoint that resolves to the head is an EMPTY range, not prose" 425476 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed ..${DG_HEAD} and nothing else."
 # M73 RETIRED (twenty-seventh cycle) — SUBSUMED by the OPERAND test, and the geometry is why: a chain
 #       only moves BACKWARD (`~N`, `^N` select ancestors), so a commit AFTER the head can never be
@@ -12134,16 +12134,19 @@ git -C "$DG" branch -D ce41c945 >/dev/null 2>&1 || true
 MUT="$(mk_mutant nopercentrun '|$|[0-9A-Za-z_/+=%$&@~^{}-]+) ]]; do' '|$|[0-9A-Za-z_/+=$&@~^{}-]+) ]]; do')"
 mut_check "M80 a name-legal punctuation run ('%') continues the token, so the honest range parses" 425462 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42546301" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD%3 of it; no issues found."
 
-# M78 — A SELECTOR IS PART OF THE TOKEN (P1, twenty-seventh cycle). Taking `~ ^ { }` back out of the run
+# M81 — A SELECTOR IS PART OF THE TOKEN (P1, twenty-seventh cycle). NUMBERED M78 WHEN WRITTEN: a
+#       concurrent sibling push published its own M78/M80 for an unrelated guard, and a label must be
+#       unique in the corpus, so this cell moved rather than the one whose commit message names it.
+#       Taking `~ ^ { }` back out of the run
 #       class restores the one-character cut, so `..<B>^{commit}` peels onto `<B>^` — the PARENT — and
 #       the honest identity spelling is refused. 20h87's body.
 MUT="$(mk_mutant noselrun '[^0-9A-Za-z_/+=$%&@~^{}-]|$|[0-9A-Za-z_/+=%$&@~^{}-]+) ]]' '[^0-9A-Za-z_/+=$%&@-]|$|[0-9A-Za-z_/+=%$&@-]+) ]]')"
-mut_check "M78 an identity selector on the endpoint is part of the token, not a one-character run" 425470 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547101" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}^{commit}; no issues found."
-# M79 — THE OPERAND IS RESOLVED BEFORE THE IDENTITY SKIPS (P1, twenty-seventh cycle). Disabling that
-#       resolution restores the fail-open: `afterhead^{commit}..HEAD` is an EMPTY range the arm never
+mut_check "M81 an identity selector on the endpoint is part of the token, not a one-character run" 425470 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547101" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}^{commit}; no issues found."
+# M82 — THE OPERAND IS RESOLVED BEFORE THE IDENTITY SKIPS (P1, twenty-seventh cycle). NUMBERED M79.
+#       Disabling that resolution restores the fail-open: `afterhead^{commit}..HEAD` is an EMPTY range the arm never
 #       classifies, and the record is minted. 20h88's body.
 MUT="$(mk_mutant noopresolve '          if [ -n "$_tbase" ] && [ "$_tbase" != "$_tosha" ]; then' '          if false; then')"
-mut_check "M79 the OPERAND is resolved before the identity skips, so an empty range cannot hide in it" 425472 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+mut_check "M82 the OPERAND is resolved before the identity skips, so an empty range cannot hide in it" 425472 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed afterhead^{commit}..HEAD; the rest was not read."
 git -C "$DG" branch -D ce41c945 >/dev/null 2>&1 || true
 # (The M73 cell carries this guard's history: it was retired in the twenty-fifth cycle because a
