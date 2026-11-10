@@ -1087,12 +1087,16 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 #       a negated follow-up clause, not a clean review, and `... all 4 findings non-blocking` (no
 #       count) still escapes.
 #   (b) RESOLVED — the count is declared CLOSED: "3 blocking findings were fixed and re-verified".
-#       Three predicates, each of which a measured F1 vector defeated when it was missing:
+#       Four predicates, each of which a MEASURED vector defeated when it was missing:
 #         * a POSITIVE COUNT precedes the noun;
 #         * a COPULA/AUXILIARY (`were|was|are|is|being|been|now|all|both`) sits between the noun and
 #           the verb, because "closed the socket too early" is a description, not a resolution;
 #         * the verb is LEFT word-anchored (`[^[:alpha:]]`, so `unclosed` is not `closed`) and its
-#           RIGHT boundary excludes `-` (so `fixed-width` is not `fixed`).
+#           RIGHT boundary excludes `-` (so `fixed-width` is not `fixed`);
+#         * NO NEGATION qualifier between the count's copula and the verb, because "were NOT fixed"
+#           is the same count with the OPPOSITE TRUTH VALUE — `were not fixed`, `are not yet
+#           resolved`, `were being addressed` and `were never resolved` were all MEASURED admitted at
+#           c33ae248b (review F1), where this window spanned the `not` and never read it.
 #       The window is bounded and `;`/`.`/`:`-terminated so an unrelated later clause cannot supply
 #       the verb.
 #   (c) NOT RESOLVED — a persistence qualifier inside the SAME window cancels (b):
@@ -1116,8 +1120,10 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
        && grep -qiE '(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)' <<<"$line"; then
       continue
     fi
-    # (b) resolved — count, then copula, then a word-anchored verb — and (c) not a live blocker.
+    # (b) resolved — count, then copula, then a word-anchored verb, with NO negation qualifier
+    # between the copula and the verb, and (c) not a live blocker.
     if grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)[^.;:]{0,40}(were|was|are|is|being|been|now|all|both)[^.;:]{0,15}[^[:alpha:]](fixed|resolved|closed|addressed|re-verified)([[:space:],.;:!?)]|$)' <<<"$line" \
+       && ! grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)[^.;:]{0,40}(were|was|are|is|being|been|now|all|both)[^.;:]{0,15}[^[:alpha:]](not|never|yet|still|partially|pending|being)([^[:alpha:]]|$)' <<<"$line" \
        && ! grep -qiE 'block(ing|ers?)[^.;:]{0,60}(remain|remaining|open|outstanding|unresolved|unfixed|unaddressed)' <<<"$line"; then
       continue
     fi
