@@ -163,6 +163,41 @@ assert_contains "$out" 'RECOMMEND: 42 LANDED' "landed → RECOMMEND LANDED"
 assert_contains "$out" 'CONFIRMED merged=true' "landed → CONFIRMED merged=true from the recorded read"
 assert_contains "$out" 'landed pr=42' "the rail-run row is printed verbatim (evidence, not a summary)"
 
+# ── 4b. the transcription must be TRANSCRIBED (fresh-review findings F1/F2 on #3923) ─────────
+# The recommendation's merged= is not a hardcoded literal: it carries the SAME value the CONFIRMED
+# line resolved, so a row whose merged read failed can never be reported as `LANDED "merged=true"`.
+confirm_val() { printf '%s\n' "$1" | awk '/^CONFIRMED merged=/{sub(/^CONFIRMED merged=/,""); sub(/ .*/,""); print; exit}' ; }
+recommend_val() { printf '%s\n' "$1" | sed -n 's/.*RECOMMEND: [0-9]* LANDED "merged=\([^"]*\)".*/\1/p' | head -1; }
+assert_agree() { # <output> <label>
+  local c r; c="$(confirm_val "$1")"; r="$(recommend_val "$1")"
+  if [ -n "$r" ] && [ "$c" != "$r" ]; then bad "$2 (CONFIRMED merged=$c but RECOMMEND merged=$r)"
+  else ok "$2"; fi
+}
+
+out="$(wait_arm 42 0 'landed pr=42 run=run-1 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state=MERGED merged=2026-11-01T00:00:00Z started=x log_bytes=10 log_age_s=1') "; rc=$?
+assert_contains "$out" 'RECOMMEND: 42 LANDED "merged=true"' "landed with an observed merge → LANDED merged=true"
+assert_agree "$out" "…and the LANDED value equals the CONFIRMED value (they cannot disagree)"
+
+# F2: pr_state=MERGED with merged=- is a merge (mergedAt is nullable) — never `merged=false`
+out="$(wait_arm 42 0 'landed pr=42 run=run-1 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state=MERGED merged=- started=x log_bytes=10 log_age_s=1') "; rc=$?
+assert_contains "$out" 'CONFIRMED merged=true' "pr_state=MERGED with merged=- reads merged=true (mergedAt is nullable)"
+assert_not_contains "$out" 'CONFIRMED merged=false' "…and never merged=false for a MERGED PR state"
+assert_contains "$out" 'RECOMMEND: 42 LANDED "merged=true"' "…and the LANDED line agrees with it"
+
+# F1: a landed row whose merged= field is ABSENT must not produce a `merged=true` claim
+out="$(wait_arm 42 0 'landed pr=42 run=run-1 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state=MERGED started=x log_bytes=10 log_age_s=1') "; rc=$?
+assert_rc 0 "$rc" "landed with no merged= field still exits 0 (rail-run's verdict)"
+assert_contains "$out" 'CONFIRMED merged=UNREADABLE reason=no-read' "a row with no merged= field is UNREADABLE, never false"
+assert_not_contains "$out" 'LANDED "merged=true"' "…and the LANDED line does not claim merged=true (the F1 false-PASS arm)"
+assert_not_contains "$out" 'CONFIRMED merged=true' "…nor does the CONFIRMED line"
+assert_contains "$out" 'RECOMMEND: 42 LANDED "merged=UNREADABLE"' "…the LANDED line carries the value actually read"
+assert_contains "$out" 'count a landing only on an observed merged=true' "…and the reader is told which value to count on"
+
+out="$(wait_arm 42 0 'landed pr=42 run=run-1 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state=MERGED merged=bogus-field started=x log_bytes=10 log_age_s=1') "; rc=$?
+assert_contains "$out" 'CONFIRMED merged=UNREADABLE reason=unexpected-field' "an unparseable merged= value abstains"
+assert_not_contains "$out" 'LANDED "merged=true"' "…and never becomes a merged=true claim"
+assert_not_contains "$out" 'CONFIRMED merged=true' "…in either transcribed line"
+
 out="$(wait_arm 42 10 'running pr=42 run=run-1 repo=fake/repo pid=1 rail_pid=2 rc=- pr_state=OPEN merged=- started=x log_bytes=10 log_age_s=1')"; rc=$?
 assert_rc 10 "$rc" "still running at the bound → exit 10"
 assert_contains "$out" 'RECOMMEND: 42 PENDING' "still running at the bound → PENDING"

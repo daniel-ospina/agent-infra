@@ -210,9 +210,12 @@ Extra `start` args pass straight through to `atomic-land.sh` (`--dry-run`, `--no
 PR's state and merge timestamp) followed by two transcribed lines:
 
 - **`CONFIRMED merged=true|false|UNREADABLE`** — read from that row's `merged=`/`pr_state=` fields,
-  which are rail-run's recorded API read. `true` only for an observed merge, `false` only when the
-  read returned a PR state, and **`UNREADABLE reason=…`** otherwise: never an empty field, because an
-  empty field is read as whatever the parser wants, and `false` would be a claim the tool cannot make.
+  which are rail-run's recorded API read. `true` for an observed merge (a `merged=` timestamp, **or**
+  `pr_state=MERGED` — `mergedAt` is schema-nullable, so `MERGED` with `merged=-` is a real pair and it
+  is a merge, never a `false`), `false` only when the read returned `OPEN`/`CLOSED`, and
+  **`UNREADABLE reason=…`** otherwise: never an empty field, because an empty field is read as
+  whatever the parser wants, and `false` would be a claim the tool cannot make. **The same value feeds
+  the `LANDED` recommendation's `merged=`, so the two lines cannot contradict each other.**
 - **`RECOMMEND: <pr> LANDED|PENDING|REFUSED|KILLED|NO-VERDICT|EXITED-ZERO-NOT-LANDED|NO-RUN|UNKNOWN`**
   — a RENAME of rail-run's exit code, nothing more. A code outside rail-run's table, or a code and a
   row that disagree, prints **`UNKNOWN (rc=… state=… )`** — it is never resolved in favour of
@@ -227,10 +230,6 @@ The exit code is **rail-run's, unmodified**: `0` landed · `10` running · `20` 
 **One rail per PR.** rail-run refuses a second live run for the same PR (exit 3) and its claim has a
 stale bound, so the README's own advice (fact 3 below) — re-run the rail after a base-side fix — is
 safe: wait for the first run, or let its claim age out. This CLI adds no second guard of its own.
-
-### The contract that matters
-
-(see above — rail-run's state row plus the transcribed `CONFIRMED`/`RECOMMEND` lines.)
 
 ---
 

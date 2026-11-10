@@ -131,7 +131,7 @@ state_for_rc() {
 
 # report <pr> <rail-run rc> <rail-run output> — the row verbatim, then two transcribed lines.
 report() {
-  local pr="$1" rc="$2" out="$3" state want merged prstate
+  local pr="$1" rc="$2" out="$3" state want merged prstate confirmed reason
   state="$(row_state "$out")"
   merged="$(row_field "$out" merged)"
   prstate="$(row_field "$out" pr_state)"
@@ -139,18 +139,31 @@ report() {
 
   printf '%s\n' "$out"
 
-  # ⛔ THE API-CONFIRMED MERGED VALUE, FROM RAIL-RUN'S RECORDED READ. `true` only for a merge the
-  # artifact read observed; `false` only when the read returned a PR state; anything else is
-  # UNREADABLE, because an empty field would read as whatever the caller's parser wants (#1549).
+  # ⛔ ONE TRANSCRIPTION, ONE VALUE, USED BY BOTH LINES BELOW — so `CONFIRMED` and `RECOMMEND`
+  # cannot disagree. An earlier version hardcoded the recommendation's `merged=true`, which meant a
+  # row whose `merged=` field was absent or unreadable printed `CONFIRMED merged=UNREADABLE` directly
+  # above `RECOMMEND: … LANDED "merged=true"`: the one value a merge-duty lane is told to count on was
+  # the one value never read (fresh-review finding F1 on #3923, the false-PASS direction #1549 exists
+  # to prevent).
+  # ⛔ AND `MERGED` AS A *PR STATE* IS AN OBSERVED MERGE. `merged=` is `.mergedAt // "-"`, which is
+  # schema-nullable, so `pr_state=MERGED` with `merged=-` is legal — and reading that pair as
+  # `merged=false` inverted the answer (finding F2). A state that says MERGED is `true`, never `false`.
+  confirmed=""; reason=""
   case "$merged" in
-    [0-9][0-9][0-9][0-9]-*) printf 'CONFIRMED merged=true\n' ;;
+    [0-9][0-9][0-9][0-9]-*) confirmed=true ;;
     -) case "$prstate" in
-         MERGED|OPEN|CLOSED) printf 'CONFIRMED merged=false\n' ;;
-         *) printf 'CONFIRMED merged=UNREADABLE reason=pr-state-unread\n' ;;
+         MERGED) confirmed=true ;;
+         OPEN|CLOSED) confirmed=false ;;
+         *) confirmed=UNREADABLE; reason=pr-state-unread ;;
        esac ;;
-    '') printf 'CONFIRMED merged=UNREADABLE reason=no-read\n' ;;
-    *) printf 'CONFIRMED merged=UNREADABLE reason=unexpected-field merged=%s\n' "$merged" ;;
+    '') confirmed=UNREADABLE; reason=no-read ;;
+    *) confirmed=UNREADABLE; reason=unexpected-field ;;
   esac
+  if [ "$confirmed" = UNREADABLE ]; then
+    printf 'CONFIRMED merged=UNREADABLE reason=%s\n' "$reason"
+  else
+    printf 'CONFIRMED merged=%s\n' "$confirmed"
+  fi
 
   # ⛔ THE RECOMMENDATION IS A RENAME OF RAIL-RUN'S VERDICT, NEVER A SECOND OPINION. A code and a row
   # that disagree, or a code that is not in rail-run's table, is UNKNOWN — it can never land here as
@@ -161,7 +174,7 @@ report() {
     return 0
   fi
   case "$want" in
-    landed)  printf 'RECOMMEND: %s LANDED "merged=true"\n' "$pr" ;;
+    landed)  printf 'RECOMMEND: %s LANDED "merged=%s"\n' "$pr" "$confirmed" ;;
     running) printf 'RECOMMEND: %s PENDING (rail still running — no outcome yet, NOT a refusal)\n' "$pr" ;;
     refused) printf 'RECOMMEND: %s REFUSED\n' "$pr" ;;
     killed)  printf 'RECOMMEND: %s KILLED (signal death — never a refusal; read the row'"'"'s rc)\n' "$pr" ;;
@@ -170,6 +183,12 @@ report() {
     no-run)  printf 'RECOMMEND: %s NO-RUN (nothing was started for this PR)\n' "$pr" ;;
     *)       printf 'RECOMMEND: %s UNKNOWN (an evidence read abstained — read the reason lines above, then re-poll)\n' "$pr" ;;
   esac
+  # A landing whose own recorded read does not confirm it is reported, not smoothed over: the state
+  # word is rail-run's, the `merged=` value is what the artifact read actually said, and the lane is
+  # told which one to count on.
+  if [ "$want" = landed ] && [ "$confirmed" != true ]; then
+    printf 'NOTE: rail-run reports `landed` but its recorded merged= field does not read true (%s) — count a landing only on an observed merged=true\n' "$confirmed"
+  fi
 }
 
 cmd_start() {
@@ -186,12 +205,15 @@ cmd_start() {
   # forwards every pair). RAIL_RUN_RAIL points rail-run at the FULL landing unit #1549 asks for.
   out="$(RAIL_RUN_RAIL="$RAIL" bash "$RAIL_RUN" start "$pr" --repo "$REPO" "$@" 2>&1)"; rc=$?
   printf '%s\n' "$out"
+  # A launch that did not happen must not leave an EARLIER run's id bound to this PR: `wait` would
+  # then poll that run and report it under this call's name. Clear it first, write it only on success
+  # (fresh-review note 3 on #3923).
+  rm -f "$(run_file "$pr")"
   [ "$rc" -eq 0 ] || return "$rc"
   runid="$(parse_run_id "$out")"
   if [ -n "$runid" ]; then
     printf '%s\n' "$runid" > "$(run_file "$pr")"
   else
-    rm -f "$(run_file "$pr")"
     printf 'NOTE: rail-run printed no run id, so `wait`/`poll` will read its NEWEST run for %s.\n' "$pr" >&2
   fi
   return 0
