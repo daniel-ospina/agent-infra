@@ -2538,13 +2538,14 @@ OUT="$(REAP_WT_STALE_INIT_SECONDS=abc run_reaper $ENV --dry-run --repo "$REPO" 2
 assert_eq "$RC" "2" "A14j a non-numeric REAP_WT_STALE_INIT_SECONDS => exit 2 (the interrupted-add floor)"
 assert_contains "$OUT" "bad REAP_WT_STALE_INIT_SECONDS" "A14j ... and the refusal names the seam it refused"
 # A14k — RULE D's cooldown is BOUNDED, not merely digit-checked. (#3881 took `A14j` for the three
-# STALLED seams while this branch was open, so the id below is `A14k` — the registry's `guardedBy`
-# cites it, and a duplicate id would make that citation name four unrelated assertions.) The floor is computed as
-# `minutes * 60` in shell ARITHMETIC, so a digit string big enough to overflow makes it NEGATIVE — and a
-# negative floor makes every `[ "$floor_s" -gt 0 ]` gate false, i.e. the floor silently DISAPPEARS and
-# the pass reaps clean non-merged checkouts at any age while printing a `floor=0m(…)` marker as if that
-# were ordinary. That is the `seam_too_large` fail-open recorded at scripts/disk-reaper.sh:697-704, one
-# seam over. The ceiling is the day dials' own bound, expressed in this dial's unit.
+# STALLED seams while this branch was open, so the id here is `A14k` — the registry's `guardedBy`
+# cites it, and reusing `A14j` would leave that citation naming four unrelated assertions.)
+# The floor is computed as `minutes * 60` in shell ARITHMETIC, so a digit string big enough to
+# overflow makes it NEGATIVE — and a negative floor makes every `[ "$floor_s" -gt 0 ]` gate false,
+# i.e. the floor silently DISAPPEARS and the pass reaps clean non-merged checkouts at any age while
+# printing a `floor=0m(…)` marker as if that were ordinary. That is the `seam_too_large` fail-open
+# recorded at scripts/disk-reaper.sh:697-704, one seam over. The ceiling is the day dials' own bound,
+# expressed in this dial's unit.
 OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=200000000000000000 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "A14k an overflowing REAP_WT_DISPOSABLE_AGE_MINUTES => exit 2 (never a silently deleted floor)"
 assert_contains "$OUT" "bad REAP_WT_DISPOSABLE_AGE_MINUTES" "A14k … and the refusal names the seam"

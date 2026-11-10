@@ -5426,7 +5426,7 @@ run() {
     # is the SAME fail-open one size class up"), one seam over. The ceiling is the SAME bound the day
     # dials carry, expressed in this dial's unit (REAP_WT_MAX_DAYS days = REAP_WT_MAX_DAYS*1440
     # minutes) — a REAP_WT_MAX_DAYS large enough for the DAY arithmetic itself to overflow is already
-    # outside what the day dials survive, and is what A14h/A14j refuse.
+    # outside what the day dials survive, and is what A14h/A14k refuse.
     awk -v d="$REAP_WT_DISPOSABLE_AGE_MINUTES" -v x="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(d >= 0 && d <= x * 1440)}' \
         || { echo "bad REAP_WT_DISPOSABLE_AGE_MINUTES: $REAP_WT_DISPOSABLE_AGE_MINUTES (want 0..REAP_WT_MAX_DAYS*1440 minutes)" >&2; exit 2; }
     # An unrecognised proof mode must not silently become "local" OR "auto": one skips the remote
