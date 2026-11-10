@@ -68,9 +68,16 @@
 #                    one in force. A MERGED or PATCH-EQUIVALENT head keeps its own
 #                    (0-day) floor — a separate, deliberate decision this rule does not
 #                    revisit — and a LANE SCRATCH checkout (`wt-*` / `cell-wt-*`, #2354)
-#                    is EXEMPT ENTIRELY: it keeps REAP_WT_SCRATCH_AGE_DAYS (1 d),
-#                    because that cap already lowered its floor and this rule never
-#                    RE-decides a floor another rule set. It only ever LOWERS a floor —
+#                    keeps REAP_WT_SCRATCH_AGE_DAYS (1 d), because that cap already
+#                    lowered its floor and this rule never RE-decides a floor another rule
+#                    set. ⛔ THAT EXEMPTION CARRIES A CONDITION, and it is the code's, not
+#                    this paragraph's: `floor_src=scratch` is set only where the scratch cap
+#                    actually LOWERED the floor, i.e. `REAP_WT_SCRATCH_AGE_DAYS` <
+#                    `REAP_WT_AGED_DAYS`. With the two dials EQUAL — a legal pairing, e.g.
+#                    `--aged-days 1` against the 1-day default — no cap was applied, the
+#                    row's floor came from the AGED dial, and an armed RULE D lowers it like
+#                    any other aged row (still clean-gated, still marked `floor=…m(ruleD)`).
+#                    It only ever LOWERS a floor —
 #                    and a floor already at 0 (`REAP_WT_AGED_DAYS=0`, a box that reaps
 #                    clean rows immediately) STAYS 0, so the rule is INERT there rather
 #                    than quietly raising a 12 h cooldown onto the most aggressive age

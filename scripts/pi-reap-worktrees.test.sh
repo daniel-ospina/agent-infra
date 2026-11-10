@@ -2539,7 +2539,8 @@ assert_eq "$RC" "2" "A14j a non-numeric REAP_WT_STALE_INIT_SECONDS => exit 2 (th
 assert_contains "$OUT" "bad REAP_WT_STALE_INIT_SECONDS" "A14j ... and the refusal names the seam it refused"
 # A14k — RULE D's cooldown is BOUNDED, not merely digit-checked. (#3881 took `A14j` for the three
 # STALLED seams while this branch was open, so the id here is `A14k` — the registry's `guardedBy`
-# cites it, and reusing `A14j` would leave that citation naming four unrelated assertions.)
+# cites it, and reusing `A14j` would leave that one id on main's six assertions plus this leg's
+# five, so the citation would stop identifying a guard.)
 # The floor is computed as `minutes * 60` in shell ARITHMETIC, so a digit string big enough to
 # overflow makes it NEGATIVE — and a negative floor makes every `[ "$floor_s" -gt 0 ]` gate false,
 # i.e. the floor silently DISAPPEARS and the pass reaps clean non-merged checkouts at any age while
@@ -4544,12 +4545,16 @@ assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "reason=reclaimable" \
     "N6 a dead lane's wt-* scratch dir 2d old is reclaimed (REAP_WT_SCRATCH_AGE_DAYS)"
 assert_contains "$(row_for "$OUT" "$WT_NAMED")" "reason=no-pr" \
     "N6 the SAME row under a non-scratch path keeps the 7d floor (the rule is path-scoped)"
-# ⛔ AND WITH RULE D ARMED. `floor_src=scratch` (:4217) is the SECOND arm of RULE D's gate (:4230),
-# and the F3 fix pinned only the MERGED arm (G6d2/N5a): no armed run in this suite ran over a scratch
-# fixture, so deleting that assignment left the WHOLE suite green while an armed box silently capped a
-# lane-scratch checkout at the 12 h cooldown instead of REAP_WT_SCRATCH_AGE_DAYS — re-deciding the
-# recorded #2354 floor that the header (:64-70) and the registry note both state as a guarantee ("a
-# LANE SCRATCH checkout … is EXEMPT ENTIRELY"). (#3888 review 2, finding 2.)
+# ⛔ AND WITH RULE D ARMED. `floor_src=scratch` is the SECOND arm of RULE D's gate (the `floor_src =
+# aged` test), and the F3 fix pinned only the MERGED arm (G6d2/N5a): no armed run in this suite ran
+# over a scratch fixture, so deleting that assignment left the WHOLE suite green while an armed box
+# silently capped a lane-scratch checkout at the 12 h cooldown instead of REAP_WT_SCRATCH_AGE_DAYS —
+# re-deciding the recorded #2354 floor that the reaper's RULE D header block and the registry note
+# both state as a guarantee. ⛔ THE GUARANTEE IS CONDITIONAL AND THIS FIXTURE IS THE CONDITION'S
+# FAVOURABLE SIDE: the scratch arm fires where `REAP_WT_SCRATCH_AGE_DAYS` is BELOW the aged floor,
+# which holds here (1 d < the 7 d default). With the two dials EQUAL nothing is capped, the floor came
+# from the AGED dial, and an armed cooldown lowers that row like any other — the header states that
+# boundary rather than claiming an unconditional exemption. (#3888 review 2, finding 2.)
 OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "floor=1440m(scratch)" \
     "N6a armed RULE D leaves a wt-* scratch dir on its OWN floor (REAP_WT_SCRATCH_AGE_DAYS=1d), not on the cooldown"
