@@ -90,7 +90,7 @@ MH_V4L_GLOB="${MH_V4L_GLOB:-/dev/video*}"
 MH_ASOUND_PCM="${MH_ASOUND_PCM:-/proc/asound/pcm}"
 
 die3() { printf '%s\n' "$PROG: $*" >&2; exit 3; }
-say() { printf '%s\n' "$*"; }
+emit() { printf '%s\n' "$*"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -151,7 +151,7 @@ emit_device() {
     [ -n "$JSON_DEVICES" ] && JSON_DEVICES="$JSON_DEVICES,"
     JSON_DEVICES="$JSON_DEVICES{\"device\":$(json_str "$device"),\"verdict\":$(json_str "$verdict"),\"detail\":$(json_str "$detail")}"
   else
-    if [ -n "$detail" ]; then say "$device: $verdict($detail)"; else say "$device: $verdict"; fi
+    if [ -n "$detail" ]; then emit "$device: $verdict($detail)"; else emit "$device: $verdict"; fi
   fi
 }
 
@@ -564,7 +564,7 @@ ancestry() {
         [ -n "$chain_json" ] && chain_json="$chain_json,"
         chain_json="$chain_json{\"pid\":$pid,\"unreadable\":true,\"why\":$(json_str "unreadable in $MH_PROC — the chain stops here")}"
       else
-        say "pid=$pid (unreadable in $MH_PROC — the chain stops here)"
+        emit "pid=$pid (unreadable in $MH_PROC — the chain stops here)"
       fi
       pid=""
       break
@@ -578,16 +578,16 @@ ancestry() {
       [ -n "$chain_json" ] && chain_json="$chain_json,"
       chain_json="$chain_json{\"pid\":$pid,\"ppid\":${ppid:-0},\"comm\":$(json_str "$comm"),\"cmdline\":$(json_str "$cmd")}"
     else
-      say "pid=$pid ppid=${ppid:-?} comm=$comm cmd=$cmd"
+      emit "pid=$pid ppid=${ppid:-?} comm=$comm cmd=$cmd"
     fi
     [ "$ppid" = "$prev" ] && break     # cycle guard
     prev="$pid"
     pid="$ppid"
     hops=$((hops + 1))
   done
-  [ "$hops" -lt 24 ] || say "$PROG: ancestry truncated at 24 hops (a cycle, or a very deep tree)" >&2
+  [ "$hops" -lt 24 ] || emit "$PROG: ancestry truncated at 24 hops (a cycle, or a very deep tree)" >&2
   if [ "$JSON" -eq 1 ]; then
-    say "{\"platform\":$(json_str "$MH_PLATFORM"),\"chain\":[$chain_json]}"
+    emit "{\"platform\":$(json_str "$MH_PLATFORM"),\"chain\":[$chain_json]}"
   fi
   return 0
 }
@@ -610,16 +610,16 @@ if [ "$APPS_ONLY" -eq 1 ]; then
       done <<EOF
 $APPS
 EOF
-      say "{\"platform\":$(json_str "$MH_PLATFORM"),\"apps\":[$APPS_JSON]}"
+      emit "{\"platform\":$(json_str "$MH_PLATFORM"),\"apps\":[$APPS_JSON]}"
     else
       printf '%s\n' "$APPS"
     fi
     exit 0
   fi
   if [ "$JSON" -eq 1 ]; then
-    say "{\"platform\":$(json_str "$MH_PLATFORM"),\"apps\":null,\"why\":$(json_str "$APPS_ERR")}"
+    emit "{\"platform\":$(json_str "$MH_PLATFORM"),\"apps\":null,\"why\":$(json_str "$APPS_ERR")}"
   else
-    say "apps: UNVERIFIABLE($APPS_ERR)"
+    emit "apps: UNVERIFIABLE($APPS_ERR)"
   fi
   exit 2
 fi
@@ -634,7 +634,7 @@ case "$MH_PLATFORM" in
 esac
 
 if [ "$JSON" -eq 1 ]; then
-  say "{\"platform\":$(json_str "$MH_PLATFORM"),\"devices\":[$JSON_DEVICES]}"
+  emit "{\"platform\":$(json_str "$MH_PLATFORM"),\"devices\":[$JSON_DEVICES]}"
 fi
 
 # The exit code is part of the answer: 2 = CANNOT VERIFY, never "free". Read from

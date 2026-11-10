@@ -135,9 +135,13 @@ from datetime import datetime, timedelta, timezone
 #                                                      about the repo it is standing in. (Removing it
 #                                                      outright would blind `heartbeat-loop.sh` on the
 #                                                      Mac, whose farm copy `~/.pi/agent/scripts/` is
-#                                                      not a git checkout and carries no deriver --
-#                                                      named as a gap in the contract, not papered over
-#                                                      with a refusal that breaks the primary box.)
+#                                                      not a git checkout, so nothing is DERIVABLE
+#                                                      there. (That copy DOES carry the deriver since
+#                                                      ai#1552 -- the farm delivers `repo-slug.sh`
+#                                                      beside this script -- so the missing half on
+#                                                      that box is the CHECKOUT, not the file.) Not
+#                                                      papered over with a refusal that would break
+#                                                      the primary box.)
 # ⛔ AND `OR` IS A DECLARATION TOO (review round 1, P2). `orch-loop.sh` EXPORTS `OR` -- the repo the
 # controller GRADES and dispatches for -- into every child it starts. Taking the cwd as authoritative
 # when nothing else is set would let a controller bound to tortoise, whose pass happens to run with a
@@ -176,9 +180,11 @@ def _checkout_repo(path=None):
     `refresh-candidates.sh` and `pr-loop.py`). A python copy of the parse would be a THIRD
     derivation -- the drift that file exists to end -- so the slug is obtained by sourcing it, with
     the same 10-line shim `pr-loop.py::_checkout_repo` uses (a shim, not a parser: the rules live in
-    the shell file). `why` is "deriver-missing" when this script was deployed without it (the farm
-    copy `~/.pi/agent/scripts/` is such a box today) and "underivable" otherwise -- two causes, two
-    remedies, and the difference is reported rather than collapsed.
+    the shell file). `why` is "deriver-missing" when this script was deployed WITHOUT it -- a
+    hand-deployed copy; ⛔ the FARM copy `~/.pi/agent/scripts/` is no longer such a box, because the
+    farm delivers `repo-slug.sh` beside this script (ai#1552), so there the cause is a cwd that is not
+    a checkout -- and "underivable" otherwise: two causes, two remedies, and the difference is
+    reported rather than collapsed.
 
     ⛔ THREE CAUSES NOW, AND THE THIRD IS THE CWD (ai#2922). "cwd-unreadable" is the launcher's
     working directory being unreadable to the OS -- under launchd, TCC denying a `WorkingDirectory`

@@ -145,10 +145,92 @@ fi
 # sourcing that file would EXECUTE the controller, which is the thing this file is here to launch.
 _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 
+# ⛔ THE WITNESS MUST BE BOUND TO THIS ATTEMPT (fresh-context review of #3846, P1 — reproduced by
+# reading the writers). `orch-loop.log` is APPEND-ONLY and never rotated or truncated (every writer
+# uses `>>`; nothing under `scripts/` truncates it), so a `[singleton]` line from an EARLIER refusal
+# stays in the file for the life of the state dir. An unbounded `grep` therefore reported "refused"
+# for every later early death — a half-synced `$O` (exit 78), missing worker scripts (78), `REPO`
+# unset (78) — i.e. a DEAD controller described as a correct refusal, with the instruction not to
+# touch the lock. That is the same false-PASS class as the silent `exit 0` this PR removes, mirrored.
+# So the byte offset is captured IMMEDIATELY BEFORE `new-session` and only the bytes THIS attempt
+# appended are searched. No marker file to leak, no `#{pane_dead_status}` tmux-version dependency.
+# ⛔ THE WITNESS LIVES IN THE STATE DIR, AND THE STATE DIR IS NOT ALWAYS `O` (fresh-context review of
+# #3846, P2). `orch-loop.sh` ranks `ORC_STATE_DIR` ABOVE `O` (`controller-state.sh:95-97`), so on an
+# instance that names one the loop appends `[singleton]` to `<ORC_STATE_DIR>/logs/orch-loop.log` —
+# while `$O` stays the SEEDED HARNESS ROOT this wrapper execs `$O/orch-loop.sh` from. Watching
+# `$O/logs/…` then finds nothing, and every CORRECT refusal reads as `did not come up within 10s` /
+# `died within 2s` → exit 69: precisely the false-crash framing the `[singleton]` witness exists to
+# remove (`harness-up`'s REFUSED-SINGLETON row could then never fire). This is reachable TODAY for a
+# hand-run (`ORC_STATE_DIR=/x bash launchd-controller.sh`), not only once the knob is plist-rendered.
+# ⛔ `_LC_STATE` IS NOT A SECOND COPY OF `orc_state_pick` — it cannot disagree with it here. Ranks 3
+# and 4 of that function are unreachable from this file: the wrapper ALWAYS hands the pane a non-empty
+# `O` (line 117 defaults it, and `CONTROLLER_ENV` forwards it), so the loop always resolves at rank 2,
+# `env:O`. The one way the wrapper's answer can differ is rank 1 — `ORC_STATE_DIR` — which is exactly
+# the name compared here. `O` itself stays the LOOP's home: `[ -r "$O/orch-loop.sh" ]` below is
+# deliberately unchanged, because that file lives in the harness root, not in the state dir.
+_LC_STATE="${ORC_STATE_DIR:-$O}"
+_LC_LOG="$_LC_STATE/logs/orch-loop.log"
+_LC_OFFSET=0
+# ⛔ WHETHER THE OFFSET ABOVE BELONGS TO **THIS** ATTEMPT. `_lc_mark_baseline` runs only where this
+# process CREATES the session; when the session already existed (the guard attaches to nothing and goes
+# straight to the supervisor) no baseline was taken, `_LC_OFFSET` is 0, and `_lc_refused` would then
+# search the WHOLE append-only log — reading a refusal from some earlier attempt as this run's verdict.
+# The post-supervisor arm below needs the same scoping the two early arms have, so the flag is set in
+# exactly one place, beside the offset it describes.
+_LC_WITNESS_SCOPED=0
+_lc_mark_baseline() {
+  _LC_OFFSET=0
+  [ -f "$_LC_LOG" ] && _LC_OFFSET="$(wc -c < "$_LC_LOG" 2>/dev/null | tr -d '[:space:]')"
+  case "${_LC_OFFSET:-}" in ''|*[!0-9]*) _LC_OFFSET=0 ;; esac
+  _LC_WITNESS_SCOPED=1
+  return 0
+}
+_lc_refused() {
+  local _lc_tail=""
+  [ -f "$_LC_LOG" ] || return 1
+  _lc_tail="$(tail -c "+$(( _LC_OFFSET + 1 ))" "$_LC_LOG" 2>/dev/null)"
+  grep -q '\[singleton\]' <<<"$_lc_tail"
+}
+# _lc_refusal_exit — say the refusal and exit 75. One copy, so the two early-death arms cannot drift
+# into one that reports a refusal as a crash and one that does not.
+_lc_refusal_exit() {
+  # ⛔ THE REFUSAL'S OWN CODE IS PROPAGATED (74 UNJUDGED / 75 HELD). Opposite remedies: 75 says the
+  # holder is the authority and the lock must be left alone; 74 says somebody has to look — either the
+  # record could not be read or DATED (removing it is the remedy when nothing holds it), or a displaced
+  # record could NOT be put back and is KEPT at a `.orch.lock.reclaim.<pid>` path beside an absent or
+  # 0-byte lock, where `rm -f` is a no-op and the remedy is to `mv` it back. `orch-loop.sh` writes
+  # `[singleton] rc=<n>` for exactly this reason — and names WHICH 74 shape it is, so this wrapper
+  # does not have to guess. Collapsing the two here would undo the distinction the loop just made, and
+  # `harness-up` would assert the 75 story on a 74 state.
+  local _rc="" _tail=""
+  [ -f "$_LC_LOG" ] && _tail="$(tail -c "+$(( _LC_OFFSET + 1 ))" "$_LC_LOG" 2>/dev/null)"
+  _rc="$(printf '%s\n' "$_tail" | sed -n 's/.*\[singleton\] rc=\([0-9][0-9]*\).*/\1/p' | head -1)"
+  _lc_err "'$S' controller REFUSED to start: this state dir already has a controller, or has a lock record that cannot be judged ([singleton] in $_LC_LOG names the holder and the reason) — propagating the loop's own refusal code so launchd and harness-up report a REFUSAL, not a crash"
+  if [ "${_rc:-}" = "2" ]; then exit 74; fi
+  exit 75
+}
+
 # THE PLIST'S KEY SET, VERBATIM. Keep it equal to `EnvironmentVariables` in launchd.plist.template —
 # `launchd-controller.test.sh` asserts that equality in both directions, so a key added to the
 # template cannot silently fail to reach the controller.
-CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY"
+CONTROLLER_ENV="PATH HOME OR REPO O ORC_STATE_DIR HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY ORC_CONTROLLER_ORIGIN"
+# ⛔ `ORC_STATE_DIR` IS FORWARDED BECAUSE THE WRAPPER ALREADY READS IT (fresh-context review of #3846,
+# P2). `_LC_STATE` above resolves the singleton witness from it, and `README.md`'s row calls it
+# "the way a launcher can name a state dir without impersonating the legacy variable" — so on the one
+# surface the #2095 incident happened on, a value the operator renders into the plist was STRIPPED
+# here before the pane saw it. That is the same presence-only-parity defect `ORC_CONTROLLER_ORIGIN` had
+# one line up, and `launchd-controller.test.sh` case E is what made both visible. Omitting it here is
+# strictly worse than omitting a ceiling: a MAX_LOAD that does not arrive is labelled `env` on `[cap]`,
+# while a state dir that does not arrive is a controller writing production's queue (the incident).
+# `launchd.plist.template` renders the key EMPTY, and an empty value is a MEANING: `orc_state_pick`
+# tests `[ -n "${ORC_STATE_DIR:-}" ]`, so empty resolves at rank 2 exactly like today.
+# ⛔ `ORC_CONTROLLER_ORIGIN` (#2095) is the same parity one line over, and it was added to the plist
+# WITHOUT being added here — which `launchd-controller.test.sh` case E caught at the exact moment it
+# would have shipped (a red in a file the change never opened). The key is what makes a `[cap]` line
+# able to say `max_load_src=plist(launchd)` instead of `env`: the pane is started as
+# `tmux new-session … /usr/bin/env $ENV_PREFIX /bin/bash <loop>`, so it sees the tmux SERVER's
+# environment plus this whitelist — not the plist's. Absent here, the one datum the change exists to
+# add was non-deterministic on the Mac (present on a cold server, absent on a long-lived one).
 # ⛔ THE THREE MEM_* KEYS ARE FORWARDED, AND THEY WERE NOT (#2387). `launchd.plist.template` renders
 # `MEM_MIN_AVAIL_MB`, `MEM_LANE_RESERVE_MB` and `MEM_SPAWN_RESERVE_LANES` — the spawn gate's memory floor
 # and the two factors it is derived from — and this list did not carry them, so the pane never received
@@ -217,6 +299,8 @@ if ! "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; then
     exit 78
   fi
   # /usr/bin/env is absolute: the pane's shell resolves it BEFORE the forwarded PATH is in effect.
+  # The refusal witness is scoped to what THIS launch writes (see `_lc_refused`).
+  _lc_mark_baseline
   "$TMUX_BIN" new-session -d -s "$S" \
     "exec /usr/bin/env$ENV_PREFIX /bin/bash $(_shq "$O/orch-loop.sh")" || exit $?
   # ⛔ A CREATE THAT "SUCCEEDED" IS NOT A CONTROLLER, AND THE TWO WAYS THIS LIES ARE OPPOSITE.
@@ -236,11 +320,22 @@ if ! "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; then
     _w=$(( _w + 1 ))
   done
   if ! "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; then
+    _lc_refused && _lc_refusal_exit
     _lc_err "'$S' did not come up within 10s of new-session — see the pane output above"
     exit 69
   fi
   sleep 2
   if ! "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; then
+    # ⛔ A SINGLETON REFUSAL IS NOT A DEATH, AND launchd CANNOT SEE THE DIFFERENCE WITHOUT THIS (P1,
+    # fresh-context review of #3846). The plist's program is `orch-pin-exec.sh`, which runs THIS wrapper,
+    # so the job's `last exit code` is the WRAPPER's — and the wrapper used to answer 69 for anything
+    # that died inside 2 s, which is exactly what a refusal looks like (`orch-loop.sh` now exits 75
+    # before any cycle work). The loop's own 75 was therefore discarded, and the shipped
+    # `harness-up` row for it could never fire: a correct refusal still read as `DIED … every attempt is
+    # failing`, for ever, on a healthy box. The witness is the artifact the loop already writes — a
+    # `[singleton]` line in its log — rather than `#{pane_dead_status}`, which is a tmux-version
+    # dependency this launcher does not otherwise carry.
+    _lc_refused && _lc_refusal_exit
     _lc_err "'$S' died within 2s of starting — see the pane output above"
     exit 69
   fi
@@ -254,8 +349,31 @@ _STARTED="$(date +%s)"
 while "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; do sleep 5; done
 _LIVED=$(( $(date +%s) - _STARTED ))
 
-# ⛔ FLOOR THE RESTART RATE. `orch-loop.sh` exits 0 at once when another controller holds
-# `.orch.lock`, and a session whose loop refuses to start dies in milliseconds. launchd already
+# ⛔ A REFUSAL THAT LANDS AFTER THE CREATE BRANCH'S TWO PROBES IS STILL A REFUSAL (P1-1, fresh-context
+# review of #3846; MEASURED). Those probes cover ~2.1 s: the appearance check, then `sleep 2`. A refusal
+# slower than that fell through to the supervisor above and ended here on an UNCONDITIONAL `exit 0` —
+# so launchd recorded `last exit code 0`, `harness-up` printed its `EXITED-CLEAN` row (whose text
+# asserts the opposite, "a 0 is never a refusal"), the REFUSED-SINGLETON/REFUSED-UNJUDGED rows could
+# never fire, and under `KeepAlive` it repeated every `ThrottleInterval` on a healthy box. The trigger
+# is a SLOW START, which is the incident box's own condition: `orch-loop.sh` takes the lock at
+# `:2425`, after sourcing, `derive_or` (a `git` spawn) and the MAX_LOAD block, so 2 s is a warm-cache
+# number, not a bound. Measured at the round-10 head with the shipped wrapper: a refusal at 0.5 s and
+# 2.0 s -> rc 75; at 2.2 s / 2.5 s / 3.0 s -> rc 0.
+# ⛔ AND IT IS SCOPED TO THIS ATTEMPT OR IT IS THE FALSE-PASS MIRROR. `_lc_refused` reads only the bytes
+# this launch appended (`_LC_OFFSET`), and only when THIS process created the session: without that
+# flag, a supervisor that attached to an existing session would read a historical `[singleton]` line as
+# its own refusal and label a later, unrelated end a REFUSAL. That is the same defect as the stale-'O'
+# arm in `case I stale`, moved one branch over.
+# ⛔ NO LIFETIME BOUND IS NEEDED, AND ADDING ONE WOULD BE A GUESS: `[singleton]` has exactly ONE writer
+# in this repo (`orch-loop.sh:2425`, the startup refusal), so a scoped witness that holds IS a refusal.
+if [ "${_LC_WITNESS_SCOPED:-0}" = "1" ] && _lc_refused; then
+  _lc_refusal_exit
+fi
+
+# ⛔ FLOOR THE RESTART RATE. `orch-loop.sh` REFUSES (exit 75, `[singleton]` in the log) at once when
+# another controller holds `.orch.lock` — it used to print "already running" and exit 0 — and a
+# session whose loop refuses to start dies in milliseconds either way, so the floor is unchanged and
+# its reason is not. launchd already
 # throttles KeepAlive to `ThrottleInterval` (10 s, rendered in the plist); this keeps the wrapper's
 # own restart interval from ever being shorter than that, so a genuinely broken controller produces
 # ONE line per window instead of a wall of them. It is a floor, not a fixed delay: a controller that
@@ -264,7 +382,9 @@ if [ "$_LIVED" -lt "$RESTART_FLOOR" ]; then sleep $(( RESTART_FLOOR - _LIVED ));
 
 # ⛔ SAY HOW LONG IT RAN. Exiting 0 after a controller that died in two seconds is indistinguishable
 # in launchd.err from an idle box; the lifetime is the one datum that separates them. It stays exit 0
-# because a controller that exits AT ONCE is a legitimate state (`orch-loop.sh` exits 0 when another
-# controller holds the lock), so this is a diagnostic, not a verdict.
+# because a controller that ends normally is a legitimate state, so this is a diagnostic, not a
+# verdict. ⛔ THE REFUSAL IS NO LONGER ONE OF THOSE STATES (agent-infra#2095): `orch-loop.sh` exits 75
+# when another controller holds the lock and this wrapper PROPAGATES it — the two early arms above, and
+# the post-supervisor arm above them, because a refusal slower than ~2.1 s used to reach launchd as 0.
 _lc_err "the '$S' controller session ended after ${_LIVED}s (exit 0)"
 exit 0

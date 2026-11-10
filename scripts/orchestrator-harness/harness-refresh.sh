@@ -747,21 +747,47 @@ fi
 # ⛔ MATCH THE TOKEN, NOT A SUBSTRING OF THE LINE: the tmux launcher's own argv names
 # `$O/logs/orch-loop.log`, and a substring match counts it as a lane on every cycle. The controller and
 # this script are excluded by name because both live in $O when it is seeded.
+# ⛔ TWO ROOTS, BECAUSE THE PREFIX IS NO LONGER ONLY `$O/` (fresh review of #3846, P3). Since
+# agent-infra#2095 a lane's code comes from the WORK root — every spawn is `${O_WORK:-$O}/…`
+# (`dispatch-merge.sh:483`/`:520`, `orch-loop.sh:6731`/`:6941`/`:7181`/`:7435`) — because `$O` is the
+# STATE dir on an `ORC_STATE_DIR` instance and on the isolated arm. So on exactly the boxes this PR
+# introduces, `O_WORK != O` and a single `$O/` prefix matches NOTHING: `lanes=` reads 0 while lanes
+# really run, which is the DESTRUCTIVE direction for the `--re-seed` gate and a blind deferral for the
+# `GATE_CODE=lanes` arm. Matching both roots is safe because a root is only a PREFIX; the tail rules
+# below (no further slash, ends `.sh`, not either exclusion) still decide what a lane is. On every
+# existing box `O_WORK == O`, so the second arm is the same string and changes nothing there.
+# ⛔ NOT a `lanes_src=` token: the record's shape is read positionally elsewhere, and a new field would
+# be a second problem. What matters is that the reading is TRUE — `lanes=0` must MEAN no lanes.
 in_flight_pids() {
-  local t
+  local t o="$O/" ow=""
+  [ -n "${O_WORK:-}" ] && [ "${O_WORK:-}" != "$O" ] && ow="$O_WORK/"
   # ⛔ `-ww` FOR THE SAME REASON AS THE `_argv` READ ABOVE (#2926): an ambient `COLUMNS` truncates the
   # command column, and a LANE whose `$O/<name>.sh` token was cut is read as absent — which is `lanes=0`,
   # which is what lets `--re-seed` swap `$O` under a running lane. That direction is DESTRUCTIVE, so this
   # read may not depend on an environment variable. Witnessed by A22b.
   t="$(ps -eww -o pid=,ppid=,command= 2>/dev/null)" || return 1
   case "$t" in *[![:space:]]*) ;; *) return 1 ;; esac
-  printf '%s\n' "$t" | awk -v o="$O/" -v me="$$" '
+  printf '%s\n' "$t" | awk -v o="$o" -v ow="$ow" -v me="$$" '
     {
       if ($1 == me) next
       for (i = 3; i <= NF; i++) {
         f = $i
-        if (index(f, o) != 1) continue
-        n = substr(f, length(o) + 1)
+        # ⛔ THE DEEPEST MATCHING ROOT WINS, NOT THE FIRST ONE TESTED (fresh review of #3846, P3).
+        # The first-match form made the second prefix UNREACHABLE whenever `$O` is a prefix of
+        # `$O_WORK` — i.e. a state dir ABOVE the harness root (`O=/x`, `O_WORK=/x/harness`): a live
+        # lane token `/x/harness/lane.sh` matched `$O/` first and yielded `harness/lane.sh`, the
+        # subdirectory guard below dropped it, and `$O_WORK` was never tried. Reproduced by driving
+        # this awk with a fake ps row: `O=/x O_WORK=/x/harness` -> no lane counted; `O=/x/harness/state
+        # O_WORK=/x/harness` (state INSIDE the work root) -> COUNTED. `lanes=0` while lanes run is the
+        # DESTRUCTIVE direction (it is what lets `--re-seed` swap a tree under a running lane) and it
+        # blinds the `GATE_CODE=lanes` arm.
+        # Taking the LONGEST matching prefix is the same answer on every arrangement that works today
+        # (flat: `o == ow`; state inside the work root: `o` is longer), and it is the only answer that
+        # works when the state dir is an ancestor of the work root. Exactly one tail, never two.
+        n = ""; ln = 0
+        if (index(f, o) == 1)            { n = substr(f, length(o) + 1);  ln = length(o) }
+        if (ow != "" && length(ow) > ln && index(f, ow) == 1) { n = substr(f, length(ow) + 1); ln = length(ow) }
+        if (ln == 0) continue
         if (index(n, "/") != 0) continue      # a subdirectory ($O/logs/…) is not a lane script
         if (n !~ /\.sh$/) continue
         if (n == "orch-loop.sh" || n == "harness-refresh.sh") continue
