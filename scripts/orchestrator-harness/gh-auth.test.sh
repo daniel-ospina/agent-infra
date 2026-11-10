@@ -558,6 +558,41 @@ ck "B8c …and the P0 evidence was READ, not assumed" $rc
 grep -q 'IS credentialed' "$TMP/b8.log" && rc=1 || rc=0
 ck "B8d …and nothing claims a credential the module never provided" $rc
 
+# B9: THE THIRD OUTCOME OF THE REFUSAL HAS AN ARM — the state where the lane's gh IS credentialed and the
+# read failed for some other reason (`state=ambient` here). ⛔ MEASURED at 47ec2e2d7 before this arm: deleting
+# that outcome's `printf` entirely (its words, arity kept) left the suite at `passed: 78 failed: 0` — five
+# arms (`B2g3 B2h3 B2i3 B3c2 B8d`) pin only its ABSENCE, so the documented shape was asserted in one
+# direction only, and `skills/cmux-cells/SKILL.md` calls it outcome "(a)" with a remedy of its own.
+run_lane 81 15 "bug" "a normal issue" all-fail 2522 b9 "$ACCT" GH_CONFIG_DIR="$ACCT/.config/gh"
+{ [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "B9 a credentialed lane whose read failed is HELD for the read, not the credential (rc=$LANE_RC)" $rc
+grep -q 'IS credentialed (state=ambient' "$TMP/b9.log"; rc=$?
+ck "B9b …and the refusal SAYS the credential resolved, naming the state, instead of blaming the queue" $rc
+grep -q 'check the gh/network chain' "$TMP/b9.log"; rc=$?
+ck "B9c …and points the operator at the READ (the gh/network chain), which is the actual cause here" $rc
+grep -q '⛔ BUT FIRST' "$TMP/b9.log" && rc=1 || rc=0
+ck "B9d …and does NOT carry the credential caveat, which on this state would be the wrong cause" $rc
+
+# B10: A DIRECTORY THIS READ CANNOT OPEN IS NOT AN EMPTY ONE. ⛔ `[ -f dir/hosts.yml ]` answers FALSE for
+# both facts, so a store directory at `chmod 000` used to be reported as "holds no hosts.yml" — a
+# directory the read had never opened. `_gh_auth_store_in` separates them and the cause discloses.
+UNREAD="$TMP/unread"; mkdir -p "$UNREAD/.config/gh"; : > "$UNREAD/.config/gh/hosts.yml"; chmod 000 "$UNREAD/.config/gh"
+( . "$GH_AUTH" >/dev/null 2>&1; [ "$(_gh_auth_store_in "$UNREAD/.config/gh")" = unreadable ] ); rc=$?
+ck "B10 _gh_auth_store_in calls a store directory it cannot open UNREADABLE, not empty" $rc
+( . "$GH_AUTH" >/dev/null 2>&1; case "$(_gh_auth_store_in "$ACCT_EMPTY")" in empty) exit 0 ;; *) exit 1 ;; esac ); rc=$?
+ck "B10b …and a readable directory with no hosts.yml is still EMPTY (the discrimination is real, not blanket)" $rc
+CAN_NONE="$( . "$GH_AUTH" >/dev/null 2>&1; gh_auth_cause "$UNREAD" "$TMP/none.env" "$ACCT_EMPTY" )"
+case "$CAN_NONE" in *"<unreadable: $UNREAD/.config/gh>"*) rc=0 ;; *) rc=1 ;; esac
+ck "B10c …and on the \`none\` outcome the cause prints <unreadable: …> for it rather than naming it as empty" $rc
+case "$CAN_NONE" in *"holds no hosts.yml under $UNREAD/.config/gh or"*) rc=1 ;; *) rc=0 ;; esac
+ck "B10d …so it never asserts a directory it could not open holds no hosts.yml" $rc
+chmod 755 "$UNREAD/.config/gh"
+CAN_AMB="$( . "$GH_AUTH" >/dev/null 2>&1; chmod 000 "$UNREAD/.config/gh"; GH_CONFIG_DIR="$UNREAD/.config/gh" gh_auth_cause "$ACCT_EMPTY" "$TMP/none.env" "$ACCT_EMPTY"; chmod 755 "$UNREAD/.config/gh" )"
+case "$CAN_AMB" in *"is set but this read could not OPEN it"*) rc=0 ;; *) rc=1 ;; esac
+ck "B10e …and an unreadable ambient GH_CONFIG_DIR is refused as unopenable, not as 'holds no hosts.yml'" $rc
+case "$CAN_AMB" in *"is set but holds no hosts.yml"*) rc=1 ;; *) rc=0 ;; esac
+ck "B10f …which is the exact sentence that was false about a store that was right there" $rc
+
 echo
 echo "───────────────────────────────────────"
 echo "  passed: $PASS   failed: $FAIL"
