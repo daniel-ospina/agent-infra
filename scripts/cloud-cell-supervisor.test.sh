@@ -39,6 +39,16 @@ set -uo pipefail
 # cell's keys.env) would be compared against every fixture checkout's origin and redden unrelated arms
 # — and would let this harness carry the very defect the new conformance arm exists to catch.
 unset GH_REPO
+# ⛔ THE SAME RULE FOR `ORCH_FOREGROUND`, AND IT IS NOT COSMETIC (#2093). The fleet's own controller
+# exports `ORCH_FOREGROUND=1` to every lane it spawns, so a suite run from a lane — the normal place
+# this contract is run — inherited =1 and every `start` arm took the SERVICE-MANAGER path
+# (`foreground_handover`) instead of the operator path these arms are about. Measured 2026-11-09 on
+# this box: with the ambient value left in place, `start` hung on a fixture session for the whole
+# orphan bound and the suite never finished (killed at 1800 s), and four unrelated arms reddened with
+# "never reached the launch" / "could not recover the command string" — none of them about the code
+# under test. A contract that cannot be run where the work happens grades nothing, so the caller
+# variable is pinned to the OPERATOR shape here, exactly as GH_REPO is stripped above.
+unset ORCH_FOREGROUND
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # SUP may be OVERRIDDEN so the suite can be run against another copy of the supervisor — that is how
@@ -2460,17 +2470,27 @@ printf '#!/bin/bash\nexit 0\n' > "$Q/bin/gh"; chmod +x "$Q/bin/gh"
 stub_missing "$Q/bin" pi
 # A tmux double: `has-session` is false until `new-session` records one, and the session COMMAND is
 # kept so the suite can assert WHICH queue the controller was actually handed — the delivery half.
+# ⛔ `kill-session` AND `list-panes` ARE LOAD-BEARING, not decoration (review P2). Pre-fix this double
+# fell through to `*) exit 0`, so `kill-session` was a NO-OP and `$S/up` survived ANY stop — which made
+# the \"NOTHING LOST: the controller session was not killed\" rows pass on the pre-fix supervisor AND on
+# every mutant of the diff, i.e. an assertion whose value could not vary. Every other tmux double in
+# this suite implements `kill-session` statefully; this one now does too. `list-panes` prints the
+# session's own pane command when the arm supplies one (`$S/pane`), which is what
+# `session_names_own_state_dir` reads to PROVE a machine-scoped session name belongs to this state dir
+# (#1856) — without it the peer-session arms below could not exist at all.
 cat > "$Q/bin/tmux" <<'SH'
 #!/bin/bash
 S="${Q_STATE:?}"
 printf '%s\n' "$*" >> "$S/argv"
 case "${1:-}" in
   has-session) [ -f "$S/up" ] && exit 0; exit 1 ;;
+  list-panes) [ -f "$S/pane" ] && cat "$S/pane"; exit 0 ;;
   new-session)
     sess=""; cmd=""
     while [ $# -gt 0 ]; do case "$1" in -d) shift ;; -s) sess="$2"; shift 2 ;; -c) shift 2 ;; *) cmd="$1"; shift ;; esac; done
     : > "$S/up"; printf '%s\n' "$cmd" > "$S/cmd"
     exit 0 ;;
+  kill-session) rm -f "$S/up" "$S/pane"; exit 0 ;;
   ls) exit 0 ;;
   *) exit 0 ;;
 esac
@@ -2485,6 +2505,13 @@ ai_init_repo "$Q/no-origin-repo"
 git -C "$Q/no-origin-repo" remote remove origin
 
 Q_OUT=''; Q_RC=0
+# The ONE-LINE FIX the supervisor prints, spelled ONCE here so the assertion pins the exact command an
+# operator is told to paste and the behavioural arm below runs it verbatim. ⛔ The prefix group is the
+# point (review P1): a cell's `keys.env` carries the EXPORTED form (`export OR=…` per lane.sh, and
+# `declare -x OR=…` is what `export -p > keys.env` writes per lane-env.sh), which a bare `^OR=` anchor
+# matches NEITHER of — GNU sed then exits 0 having edited nothing and the operator loops back to the
+# same refusal. Pinning this literal means a revert to `^OR=` reddens BOTH rows that read it.
+Q_FIX_SED="sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d'"
 qsup() { # <verb> <repo> <state dir> [VAR=value …]  ($OR is cleared unless the case sets it)
   local sub="$1" repo="$2" st="$3"; shift 3
   rm -rf "$st"; mkdir -p "$st"
@@ -2741,6 +2768,74 @@ case "$Q_OUT" in
   *"CELL CAN RUN A CONTROLLER"*) bad "check printed the CELL CAN RUN banner for a mismatched pair" ;;
   *) ok "check: no CELL CAN RUN banner on a mismatched pair" ;;
 esac
+# (8b) agent-infra#2093 indicator (c): the VERDICT `check` prints for this pair is named. "Lane-1 is
+# merge-inert" was discovered by reading merge logs; a preflight whose whole job is to answer before
+# the harm must use the word, so an operator greps ONE term across box, doc and issue.
+case "$Q_OUT" in
+  *"MERGE-INERT"*) ok "check's refusal names the state: MERGE-INERT (indicator c, agent-infra#2093)" ;;
+  *) bad "check refused the mismatch without naming MERGE-INERT — $Q_OUT" ;;
+esac
+# …and it hands over the ONE-LINE fix as a command, not a description: Required #3 of #2093 is a repair
+# path that does not require reading the supervisor's source.
+case "$Q_OUT" in
+  *"$Q_FIX_SED '$Q/keys.env'"*) ok "check's refusal carries a copy-pasteable one-line fix (the exact ENV_FILE, not a placeholder, and anchored to ALL the shapes keys.env carries)" ;;
+  *) bad "check's refusal does not carry the one-line fix, or carries the '^OR=' form that no-ops on an 'export OR=' line — $Q_OUT" ;;
+esac
+# ⛔ THE REPAIR PATH IS THE PRODUCT HERE (Required #3 of #2093: an operator must be able to fix the box
+# WITHOUT reading this source), so it is asserted BEHAVIOURALLY on the shape a real cell carries rather
+# than as a printed string: the command is EXTRACTED FROM THE REFUSAL ITSELF and run on an export-shaped
+# `keys.env`, so the row is tied to the supervisor's own bytes and not to a copy of them here. It reddens
+# on a revert to `^OR=`: the extracted command then matches no line, `sed` exits 0 having edited nothing,
+# and the operator returns to the identical refusal — the dead end the string says it exists to avoid.
+# ⛔ Only the SUPERVISOR-DRIVEN rows are kept. An earlier version also ran a widened `sed` held in this
+# file and asserted the line was gone; that row could not vary under any mutation of the diff (it tested a
+# string literal in the test), which is the inert-assertion class this PR's own review flags. The
+# extracted-command row below covers the same behaviour and DOES vary.
+Q_EXP="$Q/keys-export.env"; printf 'export OR=daniel-ospina/tortoise\n' > "$Q_EXP"
+# `qsup`/`qverb` pass ENV_FILE="$Q/keys.env" unconditionally, so this arm spells its invocation out: the
+# subject IS a different ENV_FILE.
+Q_OUT2=''; Q_RC2=0
+Q_OUT2="$(env -u OR Q_STATE="$Q/st-export-shape" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
+          ENV_FILE="$Q_EXP" SESSION="ai2093exp-$$" O="$Q/st-export-shape/o" REPO="$Q/agent-repo" \
+          HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" \
+          bash "$SUP" check 2>&1)"; Q_RC2=$?
+case "$Q_OUT2" in
+  *"MERGE-INERT"*) ok "fixture: an 'export OR=' keys.env reproduces the refusal (the shape a real cell carries)" ;;
+  *) bad "fixture: the 'export OR=' keys.env did not reach the refusal — $Q_OUT2" ;;
+esac
+Q_PRT=''; Q_PRT="$(printf '%s\n' "$Q_OUT2" | sed -n "s/.*sed -i -E '\([^']*\)'.*/\\1/p" | head -1)"
+[ -n "$Q_PRT" ] \
+  && ok "the refusal prints a runnable command for the operator to paste (extracted its sed pattern from the output)" \
+  || bad "could not extract a runnable 'sed -i -E …' command from the refusal — the operator has nothing to paste: $Q_OUT2"
+# ⛔ THE EXTRACTION IS RE-EXECUTED HERE, SO IT MUST NOT DEPEND ON GNU sed: `sed -i -E` on BSD/macOS takes
+# `-E` as `-i`'s suffix, so ERE never turns on, the pattern runs as BRE (where `(|)`, `+`, `?`, `{}` are
+# literal), matches nothing, and exits 0 having edited NOTHING — the very silent no-op this row exists to
+# catch, manufactured by the test on the one host that runs it (`-E` + a temp file is flavour-agnostic).
+[ -n "$Q_PRT" ] && { sed -E "$Q_PRT" "$Q_EXP" > "$Q_EXP.t" && mv "$Q_EXP.t" "$Q_EXP"; }
+grep -q 'OR=' "$Q_EXP" \
+  && bad "the command the refusal PRINTS leaves an 'export OR=' line intact — it exits 0 having edited nothing, so the operator returns to the identical refusal" \
+  || ok "the command the refusal PRINTS really removes an 'export OR=' line (the repair path works on the shape a cell carries)"
+# …and the repair is worth something: the SAME box, with the line now gone, is no longer refused on the pair.
+Q_OUT3=''; Q_OUT3="$(env -u OR Q_STATE="$Q/st-export-shape3" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
+          ENV_FILE="$Q_EXP" SESSION="ai2093exp3-$$" O="$Q/st-export-shape3/o" REPO="$Q/agent-repo" \
+          HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" \
+          bash "$SUP" check 2>&1)"; Q_RC3=$?
+# ⛔ ABSENCE OF THE REFUSAL IS NOT PROOF OF A REPAIR (review P3): any OTHER non-zero exit, or an
+# unrelated `die`, also fails to print `MERGE-INERT`, so an absence-only assertion passes for the wrong
+# reason. The positive claim is that `check` now reaches its ACCEPTING path and SAYS SO — the same
+# `ok: queue … == checkout …` line the recipe's step 3 tells the operator to expect.
+# ⛔ AND `rc` IS NOT THE SIGNAL HERE: this fixture is a bare state dir with no worker scripts in `o/`, so
+# `check` always exits non-zero on 'worker scripts missing …' (pre-existing, unrelated to the pair, and
+# present on the unmutated tree) — asserting rc=0 would test the fixture, not the repair. The state may
+# also read `— explicit` rather than `— derived`: the load-time OR="$QUEUE_REPO" re-feeds the derived
+# value, and both are ACCEPTING states. So assert exactly the fact this row exists for: the pair is
+# ACCEPTED, on one of the two accepting states, and the refusal is gone.
+case "$Q_OUT3" in
+  *"MERGE-INERT"*|*"DIFFERENT repos"*) bad "after the repair the box is STILL MERGE-INERT — the one-line fix did not repair the pair: $Q_OUT3" ;;
+  *"ok: queue daniel-ospina/agent-infra == checkout "*" — derived"*|*"ok: queue daniel-ospina/agent-infra == checkout "*" — explicit"*)
+    ok "…and after the repair \`check\` ACCEPTS the pair on its accepting path ('ok: queue … == checkout … — derived|explicit'), not merely silent about the refusal" ;;
+  *) bad "the refusal is gone, but \`check\` never reached its ACCEPTING path — it failed for an UNRELATED reason (rc=$Q_RC3), so the repair is unproven: $Q_OUT3" ;;
+esac
 
 # (9) `status` answers "is this cell pointed at what it is standing in?" on ONE line, and REPORTS a
 # mismatch rather than refusing: it is the verb an operator runs to discover the pair is wrong.
@@ -2757,6 +2852,14 @@ esac
 qsup status "$Q/agent-repo" "$Q/st-status-bad" OR=daniel-ospina/tortoise
 [ "$Q_RC" -eq 0 ] && ok "status: a MISMATCH is reported, not refused (it must stay answerable)" \
                   || bad "status exited $Q_RC on a mismatch — the operator loses the diagnostic"
+# ⛔ …AND THE VERDICT MUST DESCRIBE THE CODE, NOT ONE OF ITS FOUR LEGS (review P3): a box that is DOWN
+# but still carries `.desired` refuses `stop` with no controller live, so "while a controller is live"
+# told an operator the opposite of what `stop` does. Pin the wider condition so the overstatement
+# cannot drift back.
+case "$Q_OUT" in
+  *"MISMATCH"*"anything a stop would end"*) ok "status: the mismatch line names the condition stop actually applies (not 'while a controller is live')" ;;
+  *) bad "(9b) status's mismatch line does not name the condition 'stop' applies, so an operator on a down-but-.desired box is told 'stop' will work and is then refused: $Q_OUT" ;;
+esac
 case "$Q_OUT" in
   *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
@@ -2801,6 +2904,11 @@ say_case "the session env lives INSIDE the command string, and GH_REPO is neutra
 # recorded argv all reported 'could not recover' as knock-ons. The value here is $Q/agent-repo's OWN
 # repo, which is the only shape that reaches the launch; what is still asserted (and is the point of the
 # #2216/#2235 leak) is that an AGREEING export is not a licence to deliver the value into the session.
+# ⛔ SNAPSHOT THE SHARED keys.env: this arm's whole point is an AGREEING global export, and arms below
+# drive `stop` against a TORTOISE checkout through the SAME file. Leaving it in place made this arm a
+# latent fixture leak: `stop`'s #2235 pre-flight then correctly refused six later arms ("GH_REPO names a
+# DIFFERENT repository"), which is a behaviour of the new gate, not a defect in it (measured).
+_KEYS_SNAPSHOT="$(cat "$Q/keys.env" 2>/dev/null)"; _KEYS_EXISTED=0; [ -f "$Q/keys.env" ] && _KEYS_EXISTED=1
 printf 'export GH_REPO=daniel-ospina/agent-infra\n' > "$Q/keys.env"
 qsup start "$Q/agent-repo" "$Q/st-env"
 [ "$Q_RC" -eq 0 ] && ok "start proceeds with a keys.env that exports a GLOBAL GH_REPO naming THIS checkout (agreeing is neutralised, not refused)" \
@@ -2852,6 +2960,8 @@ if [ -n "$_PROBE_CMD" ] && [ "$_PROBE_CMD" != "$_COMMAND" ]; then
 else
   bad "could not build the runtime probe from the recorded command string — the env-in-session claim is unproven (tail: '${_COMMAND: -160}')"
 fi
+# RESTORE the shared keys.env — everything below must not inherit this arm's agreeing export.
+if [ "$_KEYS_EXISTED" = 1 ]; then printf '%s\n' "$_KEYS_SNAPSHOT" > "$Q/keys.env"; else rm -f "$Q/keys.env"; fi
 # (3) The bring-up half: it must not WRITE a global GH_REPO, and it must drop one that is pushed.
 grep -nE '^[[:space:]]*(export[[:space:]]+)?GH_REPO=' "$BRINGUP" >/dev/null 2>&1 \
   && bad "cloud-cell-bringup.sh WRITES/EXPORTS a global GH_REPO — the repo must be per-invocation state" \
@@ -2859,6 +2969,525 @@ grep -nE '^[[:space:]]*(export[[:space:]]+)?GH_REPO=' "$BRINGUP" >/dev/null 2>&1
 grep -qF 'unset GH_REPO' "$BRINGUP" \
   && ok "cloud-cell-bringup.sh DROPS a GH_REPO pushed through keys.env (the measured wrong-repo defect)" \
   || bad "cloud-cell-bringup.sh does not neutralise a pushed GH_REPO"
+# ── §12b) THE DEPLOY SEQUENCE IS PRE-FLIGHTED, NOT JUST ITS LAST STEP (agent-infra#2093) ────────
+# MEASURED, lane-1 (`docs/ops/fleet-harness-baseline.md` §3.2): `keys.env` carried
+# `OR=daniel-ospina/agent-infra` with `REPO=/tmp/cell-t3`, whose origin is tortoise — so every
+# agent-infra merge looked for the agent-infra rail inside a tortoise checkout and refused (#1764).
+# The pair gate (#1901) was CORRECT and already in `check`/`start`; the defect was ORDERING. The
+# documented deploy is `stop` → `start` (because `apply` refuses while a controller runs), so on this
+# box the only step that SUCCEEDED was the irreversible one: the controller was killed and then
+# `start` refused, leaving the box stopped with its harness unrefreshed — strictly worse than the
+# 8-day-old sha it was found on. That is why it was left running instead of repaired.
+#
+# These arms drive the SHIPPED `stop` against a seeded "started cell" and assert the fix's whole
+# point: the operator learns "not deployable" WITHOUT having lost the running controller. The
+# non-vacuity check is the suite's documented method — run with
+# `SUP=<origin/main copy> bash scripts/cloud-cell-supervisor.test.sh` and watch THESE arms, and only
+# these, go red (pre-fix `stop` kills the session and drops the marker on a mismatched pair).
+say_case "the deploy sequence is pre-flight-gated, not only its last step (agent-infra#2093)"
+
+# A state dir shaped like a STARTED cell: the desired-state marker (`stop`'s first removal), a stop
+# generation (`stop`'s second write), and a session the tmux double reports as up. ⛔ No `orch-loop.sh`
+# process exists for it, so `stop`'s OWNERSHIP checks are what a `--force` arm reaches after the gate —
+# which is exactly the proof `--force` got PAST the gate.
+# ⛔ THE PANE PROOF IS LOAD-BEARING, NOT DECORATION (review P2 at the end of #2093). `cmd_stop`'s kill
+# path refuses to signal a machine-scoped session name it cannot prove it owns (#1856, the kill-path
+# `die` "session … nothing in it can be proven to be this state dir's controller" — ⛔ cited by its
+# TEXT, not a line number: a number here went stale the moment this PR grew the file, which is the
+# failure mode the comment it describes was written about), and
+# the proof it reads is the session's own pane command naming `$O`. Without `$1/pane` that proof FAILS
+# on the PRE-FIX supervisor too — it dies at the ownership check before `tmux kill-session` is ever
+# reached, so `$S1/up` survived the mutant AND the fix, and "NOTHING LOST: the controller session was
+# not killed" could not vary (measured: it printed ✅ on `origin/main`'s supervisor). Seeding the pane is
+# what makes main's `stop` actually reach `tmux kill-session`, which removes `$S/up` in the double, so
+# the row now reddens on exactly the code the change removes.
+seed_started_cell() { # <state dir>
+  mkdir -p "$1/o/state/roles" || return 1
+  : > "$1/o/state/roles/.desired" || return 1
+  printf '3\n' > "$1/o/state/roles/.stop-generation" || return 1
+  : > "$1/up" || return 1
+  printf "bash -lc O='%s' orch-loop.sh\n" "$1/o" > "$1/pane" || return 1
+}
+sgen() { cat "$1/o/state/roles/.stop-generation" 2>/dev/null; }
+
+# qverb — run any verb against a state dir that is NOT wiped, so a SEQUENCE can be observed. `qsup`
+# wipes by design (each of §12's arms is independent); the arms below are about what survives a step.
+qverb() { # <verb> <repo> <state dir> <or|''> [supervisor args…]
+  local sub="$1" repo="$2" st="$3" orv="$4"; shift 4
+  Q_OUT="$(env -u OR ${orv:+OR="$orv"} Q_STATE="$st" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
+           ENV_FILE="$Q/keys.env" SESSION="ai2093-$$" O="$st/o" REPO="$repo" HARNESS="$Q/harness" \
+           HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" "$sub" "$@" 2>&1)"
+  Q_RC=$?
+}
+
+branch_repair_rows() { # <arm label> <case pattern for THIS branch's own clause>
+  case "$Q_OUT" in
+    $2) ok "(R$1) the refusal names ITS OWN repair, not the shared default tail" ;;
+    *) bad "(R$1) the refusal does not carry this branch's repair clause — the operator is pointed at a repair this branch never showed: $Q_OUT" ;;
+  esac
+  case "$Q_OUT" in
+    *"with the ONE-LINE FIX above"*) bad "(R$1) the refusal points at 'the ONE-LINE FIX above', which this branch NEVER PRINTS — the operator's next step is a line that does not exist" ;;
+    *) ok "(R$1) …and it does NOT point at a ONE-LINE FIX this branch never printed" ;;
+  esac
+}
+
+# (1) `stop` on a LIVE mismatched cell REFUSES, and loses nothing. This is indicator (a)'s first half.
+S1="$Q/st2093-stop"; rm -rf "$S1"; mkdir -p "$S1"; seed_started_cell "$S1" \
+  || bad "fixture: could not seed a started-cell state dir"
+qverb stop "$Q/agent-repo" "$S1" daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] && ok "stop: REFUSES the mismatched pair instead of stopping the box (#2093)" \
+                  || bad "stop returned 0 on a mismatched pair — it stopped a box it cannot restart: $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "stop's refusal IS the queue gate (not an unrelated precondition)" ;;
+  *) bad "stop refused/failed for an UNRELATED reason, so the pre-flight is unproven: $Q_OUT" ;;
+esac
+# Required #2: name BOTH sides, the checkout's ACTUAL origin, and the one-line fix.
+case "$Q_OUT" in
+  *"daniel-ospina/tortoise"*) ok "stop's refusal names the QUEUE target (OR)" ;;
+  *) bad "stop's refusal does not name the queue target — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"$Q/agent-repo"*"daniel-ospina/agent-infra"*) ok "stop's refusal names the CHECKOUT and its actual repo" ;;
+  *) bad "stop's refusal does not name the checkout and its repo — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"https://github.com/daniel-ospina/agent-infra.git"*) ok "stop's refusal names the ORIGIN URL it read" ;;
+  *) bad "stop's refusal does not name the origin it read — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"MERGE-INERT"*) ok "stop's refusal names the state: MERGE-INERT" ;;
+  *) bad "stop's refusal does not name MERGE-INERT — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"$Q_FIX_SED '$Q/keys.env'"*) ok "stop's refusal carries the one-line fix, with this cell's real ENV_FILE" ;;
+  *) bad "stop's refusal does not carry a copy-pasteable fix — $Q_OUT" ;;
+esac
+# …and it says, in the message, that the refusal is a pre-flight and how to override it. A stop that
+# declines to stop and does not say so is its own trap.
+case "$Q_OUT" in
+  *"NOTHING WAS STOPPED"*) ok "stop says NOTHING WAS STOPPED (the operator is not left guessing)" ;;
+  *) bad "stop does not say that nothing was stopped — $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"stop --force"*) ok "stop names the escape hatch (--force) for an operator who means to stop anyway" ;;
+  *) bad "stop's refusal names no way past it — $Q_OUT" ;;
+esac
+# ⛔ NOTHING IRREVERSIBLE HAPPENED: this is the assertion the whole change exists for. The marker
+# `stop` drops first is intact, the stop generation is unchanged (an in-flight start's fence is
+# untouched), the controller session was never killed, and no stop/doctor verb claimed success.
+[ -f "$S1/o/state/roles/.desired" ] \
+  && ok "NOTHING LOST: the desired-state marker is still there (the cell is still started)" \
+  || bad "stop REMOVED .desired on a refused stop — the cell is now half-stopped"
+[ "$(sgen "$S1")" = 3 ] \
+  && ok "NOTHING LOST: the stop generation was not bumped (no in-flight start was superseded)" \
+  || bad "stop bumped the stop generation on a refused stop (got '$(sgen "$S1")')"
+[ -f "$S1/up" ] \
+  && ok "NOTHING LOST: the controller session was not killed" \
+  || bad "stop killed the controller session on a refused stop"
+# ⛔ "NOTHING WAS STOPPED" MUST ALSO COVER THE SESSION CLAIM (review P2, second half). The refusal
+# says nothing was stopped, so ANY line asserting the controller session was cleared is the same false
+# claim — and on the pre-fix supervisor it is exactly what the refused stop prints before dying at
+# `start`, having already killed the session (measured on `origin/main`: "cleared this state dir's
+# leftover session …"). Left out of the bad set, this row could not vary; with it, the row reddens on
+# the code the change removes instead of confirming it.
+case "$Q_OUT" in
+  *"controller stopped"*|*"doctor loop stopped"*|*"not running"*|*"cleared this state dir's leftover session"*) bad "stop reported a stopped/cleared cell although it refused: $Q_OUT" ;;
+  *) ok "stop never claims the cell was stopped (or its session cleared)" ;;
+esac
+
+# (2) INDICATOR (a): the DOCUMENTED deploy (`stop` -> `start`) on this box leaves it exactly as found —
+# running its old harness — and never "stopped and unrefreshed". `start` runs in the SAME state dir.
+qverb start "$Q/agent-repo" "$S1" daniel-ospina/tortoise
+[ -f "$S1/o/state/roles/.desired" ] && [ "$(sgen "$S1")" = 3 ] && [ -f "$S1/up" ] \
+  && ok "stop→start on a mismatch leaves the box RUNNING its old harness (indicator a)" \
+  || bad "after stop→start the box is not as it was found (marker=$([ -f "$S1/o/state/roles/.desired" ] && echo present || echo GONE) gen=$(sgen "$S1") session=$([ -f "$S1/up" ] && echo up || echo GONE))"
+# ⛔ NO `start`-SIDE ASSERTION ROWS ABOVE, DELIBERATELY — AND NOT AS COVERAGE (agent-infra#3442 rule 3:
+# "Either make it reachable or delete it. A comment explaining why it cannot fail is not a fix").
+# `qverb start` above is FIXTURE for the box-as-found row, which is indicator (a)'s assertion — and
+# that row reddens when the gate is deleted. The three rows that used to grade `start`'s own refusal
+# (rc≠0, "start's refusal IS the queue gate", and "never claims 'controller started'"), plus the
+# earlier "the refused start seeded nothing into $O" row, were all DELETED as INERT per that rule: they
+# could not discriminate this change. ⛔ THE GROUND IS DISCRIMINATION, NOT REACHABILITY — `start` DOES run
+# code this diff touches (`assert_queue_target`, which now carries a stop tail), so what this diff
+# changes for `start` is the WORDS of its refusal (the MERGE-INERT label, the one-line fix), never its
+# verdict. A row pinning the verdict therefore cannot redden on any mutation of this diff, and a row
+# pinning the OLD words would redden on the fix ITSELF — neither separates a mutant from the fix.
+# `start` calls `assert_queue_target` with NO argument, so `local verb=""` appends nothing; it still
+# refuses at its own #1901 gate before `harness_apply`; and even with `stop`'s gate deleted it dies in
+# the leftover-session branch, never at the launch. MEASURED, not reasoned: the suite run against
+# `origin/main`'s supervisor prints these rows ✅ while the box-as-found row goes ❌. Pinning `start`'s own ordering is a real property, but it
+# needs its own `start`-side arm whose mutant reaches `harness_apply` — a different diff.
+
+# (3) NON-VACUITY, the other direction: `stop` must NOT refuse a cell it has nothing to lose on, and
+# must not refuse a MATCHED pair. Two arms, because both are ways the new gate could false-block:
+#  (3a) matched pair, started cell -> stop proceeds (the gate stays silent).
+S3="$Q/st2093-ok"; rm -rf "$S3"; mkdir -p "$S3"; seed_started_cell "$S3"
+rm -f "$S3/up" "$S3/pane"   # a cell that is started-but-down: stop has a target (the marker) and no session to kill
+qverb stop "$Q/tortoise-repo" "$S3" ''
+[ "$Q_RC" -eq 0 ] && ok "stop: a MATCHED pair still stops normally (rc=0 — no false block)" \
+                  || bad "stop FALSE-BLOCKED a matched pair (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*|*"MERGE-INERT"*) bad "the queue gate fired on a matched pair: $Q_OUT" ;;
+  *) ok "stop: the queue gate is silent on a matched pair" ;;
+esac
+[ ! -e "$S3/o/state/roles/.desired" ] \
+  && ok "stop: the matched cell is really stopped (the marker is gone)" \
+  || bad "stop did not carry out the stop on a matched pair"
+[ "$(sgen "$S3")" = 4 ] \
+  && ok "stop: the stop generation was bumped (an in-flight start is fenced, as before)" \
+  || bad "stop did not bump the generation on a matched pair (got '$(sgen "$S3")')"
+#  (3b) mismatched pair but NOTHING RUNNING -> stop answers. This fixture is an EMPTY state dir (no
+#  `.desired`, no session, no doctor loop, no controller pid, and no process carrying `O=<this state
+#  dir>` from anywhere) — a cell with NONE of those five legs loses nothing, and `stop` is the verb an
+#  operator reaches for on a box that is wrong (the same doctrine `status` and orchestrator-bringup.sh's
+#  stop already carry). The sixth condition, a process table that cannot be read, is also absent here
+#  (the read succeeds on this host), so this fixture is exactly "nothing to end". ⛔ A cell that is
+#  already DOWN but still carries `.desired` is NOT this fixture: the marker is the first leg, so that
+#  one refuses and needs
+#  `--force` (see the comment above `stop_would_end_something`).
+S4="$Q/st2093-idle"; rm -rf "$S4"; mkdir -p "$S4/o"
+qverb stop "$Q/agent-repo" "$S4" daniel-ospina/tortoise
+[ "$Q_RC" -eq 0 ] && ok "stop: an IDLE mismatched box still answers (nothing to lose; no false block)" \
+                  || bad "stop refused an idle box on a broken pair (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) bad "the pre-flight fired with nothing to stop: $Q_OUT" ;;
+  *) ok "stop: the pre-flight is narrow — this idle box has nothing a stop would end, so it is not refused" ;;
+esac
+
+#  (3c) A PEER SESSION IS NOT EVIDENCE OF OURS (review P2, #1856's recorded decision). `SESSION` is
+#  MACHINE-SCOPED (`orch` by default) — one name for every state dir on the box — so "a session with
+#  this name exists" says nothing about who owns it. `stop`'s KILL path already proves ownership by the
+#  session's own pane command before signalling anything; the PRE-FLIGHT must apply the same proof, or
+#  a cell that is down for ITSELF is refused because a neighbour's `orch` is up, and the refusal points
+#  at a session this state dir does not own. Semantically this is the same test, not a weaker one: a
+#  session we cannot prove we own is one `stop` will REFUSE to kill, so it is not something a stop would
+#  end. Without the `list-panes` case in the double this arm cannot even be expressed — which is exactly
+#  why the double gained one.
+S4B="$Q/st2093-peer"; rm -rf "$S4B"; mkdir -p "$S4B/o"
+: > "$S4B/up"                                                     # a session with THIS name is up…
+printf "bash -lc O='%s' orch-loop.sh\n" "$Q/peer-repo/o" > "$S4B/pane"   # …and its pane names a PEER dir
+qverb stop "$Q/agent-repo" "$S4B" daniel-ospina/tortoise
+# The discriminating row: the QUEUE PRE-FLIGHT must not have fired. (rc may still be non-zero — see the
+# next row — because the KILL path applies the same #1856 proof and refuses to signal a session it cannot
+# prove. That is the point: one proof, so the pre-flight and the kill give the same answer about who owns
+# a machine-scoped name.)
+case "$Q_OUT" in
+  *"DIFFERENT repos"*|*"MERGE-INERT"*) bad "the queue pre-flight fired because a PEER session shares the machine-scoped name — it counted a session this state dir does not own (rc=$Q_RC): $Q_OUT" ;;
+  *) ok "stop: a PEER cell's session under the same machine-scoped name does NOT trip the queue pre-flight (#1856 ownership proof)" ;;
+esac
+# ⛔ ONE REFUSAL, TWO INDEPENDENT FACTS — BOTH ASSERTED, BOTH LIVE (review P3). The message arm below
+# used to test `cannot be proven`, a substring this refusal NEVER contains (the kill path says "nothing in
+# it can be proven to be this state dir's controller"), so it could not fire and the run silently fell
+# through to the marker arm. Each is now its own row: the MESSAGE (the kill path told the operator it would
+# not signal a session it cannot prove) and the EFFECT (the peer's `up` marker is still there). Deleting the
+# kill path's proof reddens BOTH.
+case "$Q_OUT" in
+  *"proven to be this state dir"*|*"does NOT belong to this state dir"*)
+    ok "…and when stop does proceed, the KILL path applies the SAME ownership proof (pre-flight and kill agree about ownership, one rule)" ;;
+  *) bad "(3c) the kill path did not report an ownership failure — it either signalled a session it cannot prove, or refused for an UNRELATED reason (rc=$Q_RC): $Q_OUT" ;;
+esac
+[ -f "$S4B/up" ] \
+  && ok "…and the KILL path left the PEER session ALONE (rc=$Q_RC, its 'up' marker survives) — a machine-scoped name it cannot prove was never signalled" \
+  || bad "stop KILLED a session it cannot prove it owns (the peer's 'up' marker is gone) — the #1856 ownership proof is missing from the kill path (rc=$Q_RC): $Q_OUT"
+#  (3d) THE POSITIVE CONTROL for (3c): the same live-session shape whose pane DOES name this state dir
+#  must still refuse — otherwise (3c) could be satisfied by deleting the session leg entirely, which
+#  would quietly drop the one signal that catches a controller whose pid reads are blind.
+S4C="$Q/st2093-owned"; rm -rf "$S4C"; mkdir -p "$S4C/o"
+: > "$S4C/up"
+printf "bash -lc O='%s' orch-loop.sh\n" "$S4C/o" > "$S4C/pane"
+qverb stop "$Q/agent-repo" "$S4C" daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] && ok "stop: a session whose OWN pane command names this state dir still counts as live (3c is not a deleted leg)" \
+                  || bad "stop ignored a live session that provably belongs to this state dir — the pre-flight lost its session leg (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "…and it refuses through the queue gate, before anything is signalled" ;;
+  *) bad "(3d) refused for an unrelated reason, so the ownership control proves nothing: $Q_OUT" ;;
+esac
+[ -f "$S4C/up" ] \
+  && ok "(3d) NOTHING LOST: the provably-ours session survived the refused stop (the double now honours kill-session)" \
+  || bad "(3d) the session was killed on a refused stop"
+
+#  (3f) A LEAKED FOREIGN-ROOT CONTROLLER IS SOMETHING A STOP WOULD END (review P2). It is invisible to
+#  EVERY ownership read — its script path is outside this $O and outside $HARNESS, and no lock names it —
+#  yet `reap_own_foreign_root_leaks "$O"`, the statement right after the gate, TERM/KILLs it. Without
+#  its own leg, `stop` skipped the gate on a pair it cannot use and then killed that live controller,
+#  leaving the box stopped with `start` refusing: the lane-1 outcome this pre-flight exists to prevent.
+#  The fixture is exactly a leak by that definition: a real `.../orch-loop.sh` process carrying
+#  `O=<this state dir>`, from a foreign root, with no lock naming it.
+if [ -d "$(printf '/proc')" ]; then
+  S4F="$Q/st2093-leak"; rm -rf "$S4F"; mkdir -p "$S4F/o/state/roles" "$Q/foreign-root/scripts"
+  printf '#!/bin/sh\nsleep 300\n' > "$Q/foreign-root/scripts/orch-loop.sh"
+  chmod +x "$Q/foreign-root/scripts/orch-loop.sh"
+  # NOTE: $O is passed by `env`, which is what `_controller_env_state_dir` reads out of /proc/<pid>/environ.
+  env O="$S4F/o" bash "$Q/foreign-root/scripts/orch-loop.sh" >/dev/null 2>&1 &
+  Q_LEAK_PID=$!
+  sleep 0.3
+  qverb stop "$Q/agent-repo" "$S4F" daniel-ospina/tortoise
+  [ "$Q_RC" -ne 0 ] \
+    && ok "(3f) stop REFUSES while a controller leaked from a foreign harness root is live (the reap would signal it)" \
+    || bad "(3f) stop skipped the gate with a leaked foreign-root controller present — the reap that follows kills it and strands the box (rc=$Q_RC): $Q_OUT"
+  case "$Q_OUT" in
+    *"DIFFERENT repos"*) ok "(3f) …and it refuses through the QUEUE gate, before the reap can signal anything" ;;
+    *) bad "(3f) refused for an unrelated reason, so the leak leg proves nothing: $Q_OUT" ;;
+  esac
+  kill -9 "$Q_LEAK_PID" 2>/dev/null; wait "$Q_LEAK_PID" 2>/dev/null
+  #  The paired control: the SAME shape with the marker present is refused by the marker leg, so (3f)'s
+  #  refusals cannot be satisfied by a fixture that is simply always refused.
+  S4G="$Q/st2093-leak-marked"; rm -rf "$S4G"; mkdir -p "$S4G/o/state/roles"; : > "$S4G/o/state/roles/.desired"
+  qverb stop "$Q/tortoise-repo" "$S4G" ''
+  [ "$Q_RC" -eq 0 ] \
+    && ok "(3f) …and a MATCHED pair with only the marker still stops normally (the leak leg adds no false block)" \
+    || bad "(3f) the leak leg false-blocked a matched pair (rc=$Q_RC): $Q_OUT"
+else
+  # Not a PASS and not a FAIL: the leg is inert here BY DESIGN (the reap signals nothing without /proc),
+  # and counting it as green would be the inert-row defect this suite keeps removing.
+  echo "  ⊘ (3f) SKIPPED — no /proc on this host, so the leak reap never signals and the leg is inert by design"
+fi
+
+#  ⛔ THE OTHER FOUR LEGS NEED THEIR OWN FIXTURES (review P3). Until (3g)-(3i) existed, every mismatched
+#  fixture in this suite ALSO satisfied the provably-own-session leg (`seed_started_cell` seeds `.desired`
+#  and a session whose pane names $1/o), and the only marker-only fixtures were MATCHED pairs asserting
+#  that the gate stays SILENT. So deleting the marker leg — the one the doc calls the strictest, and the
+#  only leg that can see a box that is already DOWN — left this suite green. Each arm below seeds ONE
+#  leg on a mismatched pair and asserts the refusal comes from the QUEUE gate, followed by a control
+#  that removes that one thing and asserts the SAME state dir then stops: so the arm reddens if the leg
+#  is deleted, AND reddens if the fixture is refused for an unrelated reason.
+
+#  (3g) THE MARKER ALONE. A DOWN box that still carries `.desired` is the state the doc singles out: no
+#  session, no loop, no controller, and yet a `stop` would clear the marker that makes `start` safe.
+S4H="$Q/st2093-marker"; rm -rf "$S4H"; mkdir -p "$S4H/o/state/roles"; : > "$S4H/o/state/roles/.desired"
+qverb stop "$Q/agent-repo" "$S4H" daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] \
+  && ok "(3g) stop REFUSES on the MARKER alone — a down box that still carries \`.desired\` is something a stop would end" \
+  || bad "(3g) stop skipped the gate on a \`.desired\`-only state dir — the marker leg is unpinned (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "(3g) …and it refuses through the QUEUE gate (not an unrelated precondition)" ;;
+  *) bad "(3g) refused for an unrelated reason, so the marker leg proves nothing: $Q_OUT" ;;
+esac
+#  The paired control: the SAME state dir with the marker removed has nothing to end, so it stops. If
+#  this row reddens, the fixture was refused by something other than the marker and (3g) is vacuous.
+rm -f "$S4H/o/state/roles/.desired"
+qverb stop "$Q/agent-repo" "$S4H" daniel-ospina/tortoise
+[ "$Q_RC" -eq 0 ] \
+  && ok "(3g) …and with the marker removed the SAME state dir stops (so the marker is what refused, and the gate does not false-block an empty dir)" \
+  || bad "(3g) the empty-dir control was refused too (rc=$Q_RC), so (3g) cannot show the marker is what refused: $Q_OUT"
+
+#  (3h) THE DOCTOR LOOP ALONE — the in-flight pass a `stop` would interrupt mid-write.
+S4I="$Q/st2093-loop"; rm -rf "$S4I"; mkdir -p "$S4I/o/state/roles"
+bash -c 'trap "" TERM; while :; do sleep 1; done' & Q_LOOP_PID=$!
+sleep 0.3
+q_ident="$(sed 's/.*) //' "/proc/$Q_LOOP_PID/stat" 2>/dev/null | awk '{print $20}')"
+case "$q_ident" in ''|*[!0-9]*) q_ident="$(ps -p "$Q_LOOP_PID" -o lstart= 2>/dev/null)" ;; *) q_ident="proc:$q_ident" ;; esac
+printf '%s\n' "$Q_LOOP_PID" > "$S4I/o/state/roles/loop.pid"
+printf '%s|%s\n' "$Q_LOOP_PID" "$q_ident" > "$S4I/o/state/roles/loop.ident"
+qverb stop "$Q/agent-repo" "$S4I" daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] \
+  && ok "(3h) stop REFUSES while the doctor loop is live (no marker, no session: the loop leg alone)" \
+  || bad "(3h) stop skipped the gate with a live doctor loop recorded — the loop leg is unpinned (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "(3h) …and it refuses through the QUEUE gate" ;;
+  *) bad "(3h) refused for an unrelated reason, so the loop leg proves nothing: $Q_OUT" ;;
+esac
+#  Control: end the recorded loop and the same state dir stops (it is the loop, not the record's shape).
+kill -KILL "$Q_LOOP_PID" 2>/dev/null; wait "$Q_LOOP_PID" 2>/dev/null
+qverb stop "$Q/agent-repo" "$S4I" daniel-ospina/tortoise
+[ "$Q_RC" -eq 0 ] \
+  && ok "(3h) …and with the loop ended the SAME state dir stops (a dead loop.pid is not something to end)" \
+  || bad "(3h) a state dir whose loop is dead was refused (rc=$Q_RC), so (3h) cannot show the loop is what refused: $Q_OUT"
+
+#  (3i) THE OWNED CONTROLLER PID ALONE — a controller running from $O/orch-loop.sh, which is neither a
+#  provable session nor the doctor loop nor a marker. This is the leg that makes `stop` safe on a cell
+#  whose tmux session was lost: the controller is live, so tearing down is an irreversible act.
+S4J="$Q/st2093-pid"; rm -rf "$S4J"; mkdir -p "$S4J/o/state/roles"
+printf '#!/bin/sh\nsleep 300\n' > "$S4J/o/orch-loop.sh"; chmod +x "$S4J/o/orch-loop.sh"
+bash "$S4J/o/orch-loop.sh" >/dev/null 2>&1 & Q_OWN_PID=$!
+sleep 0.3
+qverb stop "$Q/agent-repo" "$S4J" daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] \
+  && ok "(3i) stop REFUSES while a controller runs from this state dir (no marker, no session: the controller-pid leg alone)" \
+  || bad "(3i) stop skipped the gate with an owned controller live — the pid leg is unpinned (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "(3i) …and it refuses through the QUEUE gate" ;;
+  *) bad "(3i) refused for an unrelated reason, so the pid leg proves nothing: $Q_OUT" ;;
+esac
+kill -KILL "$Q_OWN_PID" 2>/dev/null; wait "$Q_OWN_PID" 2>/dev/null
+qverb stop "$Q/agent-repo" "$S4J" daniel-ospina/tortoise
+[ "$Q_RC" -eq 0 ] \
+  && ok "(3i) …and once that controller is gone the SAME state dir stops (the ownership read is what refused)" \
+  || bad "(3i) a state dir with no live controller was refused (rc=$Q_RC), so (3i) cannot show the pid is what refused: $Q_OUT"
+
+#  (3j) A GLOBAL `GH_REPO` IS THE SECOND WRONG-PAIR CONFIG `start` REFUSES (#2235), and until the
+#  pre-flight ran that gate too, `stop` walked past it: a matched queue on a box whose GH_REPO named
+#  another repo was STOPPED, and `start` then refused `GH_REPO names a DIFFERENT repository` — the lane-1
+#  shape one refusal later. Pinned on the positive facts: the refusal names GH_REPO, it says NOTHING WAS
+#  STOPPED (the verb-aware tail), and the marker survives; the control removes GH_REPO and the same state
+#  dir then stops. ⛔ ITS OWN ENV FILE, DELIBERATELY: the shared `$Q/keys.env` is written by earlier arms,
+#  so a control that merely stopped exporting GH_REPO could still inherit one from the file — measured as a
+#  "control" that refused for the very reason it was meant to exclude. The file is also NEVER CREATED,
+#  which makes this fixture the AMBIENT shape the refusal's own caveat covers (an `export GH_REPO` in the
+#  shell, not a line in keys.env): if the tail only said "remove the line from $ENV_FILE", the operator here
+#  would be sent to edit a file that does not exist, which is the dead end the OR clauses already avoid.
+S4K="$Q/st2093-ghrepo"; rm -rf "$S4K"; mkdir -p "$S4K/o/state/roles"; : > "$S4K/o/state/roles/.desired"
+ghstop() { env -u OR Q_STATE="$S4K" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys-3j.env" \
+             SESSION="ai2093gh-$$" O="$S4K/o" REPO="$Q/tortoise-repo" HARNESS="$Q/harness" HARNESS_REPO="$AI" \
+             HARNESS_FETCH=0 HARNESS_REF="$Q_REF" "$@" bash "$SUP" stop 2>&1; }
+Q_OUT="$(ghstop env GH_REPO=daniel-ospina/agent-infra)"; Q_RC=$?
+[ "$Q_RC" -ne 0 ] \
+  && ok "(3j) stop REFUSES when a global GH_REPO names another repo (the #2235 gate is in the pre-flight)" \
+  || bad "(3j) stop proceeded with GH_REPO naming another repo, so 'start' will refuse what 'stop' just did (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"GH_REPO names a DIFFERENT repository"*) ok "(3j) …and the refusal is the GH_REPO gate, not the queue gate" ;;
+  *) bad "(3j) refused for an unrelated reason, so the #2235 pre-flight proves nothing: $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"NOTHING WAS STOPPED"*) ok "(3j) …and the refusal says NOTHING WAS STOPPED and names the --force escape (the stop tail reaches this gate too)" ;;
+  *) bad "(3j) the GH_REPO refusal carries no stop tail, so an operator who meant to stop cannot tell nothing was stopped or how to force it: $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"drop an ambient"*) ok "(3j) …and the tail names the ambient case too (this fixture's export is in the environment, and its keys file does not exist)" ;;
+  *) bad "(3j) the tail says only 'remove the line from \`\$ENV_FILE\`', which for an ambient export sends the operator to a file that does not carry it: $Q_OUT" ;;
+esac
+[ -f "$S4K/o/state/roles/.desired" ] \
+  && ok "(3j) …and the marker is still there (the refusal was ahead of the first irreversible act)" \
+  || bad "(3j) the marker was removed despite the refusal — the gate ran too late"
+Q_OUT="$(ghstop)"; Q_RC=$?
+[ "$Q_RC" -eq 0 ] \
+  && ok "(3j) …and with GH_REPO unset the SAME state dir stops (so GH_REPO is what refused)" \
+  || bad "(3j) the control was refused too (rc=$Q_RC), so (3j) cannot show GH_REPO is what refused: $Q_OUT"
+
+# (4) The escape hatch is REAL: `stop --force` on a live mismatched box gets past the gate and stops
+# it. Without this arm, "refuses" could be satisfied by a wall no flag can pass.
+S5="$Q/st2093-force"; rm -rf "$S5"; mkdir -p "$S5"; seed_started_cell "$S5"
+qverb stop "$Q/agent-repo" "$S5" daniel-ospina/tortoise --force
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) bad "--force did not get past the queue gate: $Q_OUT" ;;
+  *) ok "stop --force gets PAST the queue gate (the refusal is not a wall)" ;;
+esac
+[ ! -e "$S5/o/state/roles/.desired" ] \
+  && ok "stop --force really stops the box (the marker is dropped)" \
+  || bad "stop --force still refused to act"
+[ "$(sgen "$S5")" = 4 ] \
+  && ok "stop --force bumps the generation (an in-flight start is still fenced)" \
+  || bad "stop --force did not bump the generation (got '$(sgen "$S5")')"
+
+# (5) A malformed command line is refused, not silently treated as a plain `stop`: a typo'd flag must
+# not become "stop the box" on the one verb whose default is destructive.
+S6="$Q/st2093-badflag"; rm -rf "$S6"; mkdir -p "$S6"; seed_started_cell "$S6"
+qverb stop "$Q/tortoise-repo" "$S6" '' --forse
+[ "$Q_RC" -ne 0 ] && ok "stop: an unknown flag is refused (not read as a plain stop)" \
+                  || bad "stop accepted --forse and acted anyway"
+[ -f "$S6/o/state/roles/.desired" ] \
+  && ok "stop: a refused usage did not stop the cell" \
+  || bad "a refused usage still dropped the marker"
+
+# (6) THE ONE UNUSABLE STATE THAT REACHED `die` WITHOUT THE VERB'S TAIL (review P3). `assert_queue_target`
+# begins `[ -n "$REPO" ] || assert_repo`, and `assert_repo` dies on ITS OWN line — so a cell with no
+# derivable checkout was refused by `stop` with no "NOTHING WAS STOPPED" and no `--force`, on the verb an
+# operator reaches for exactly when a box is wrong (a missing/moved keys.env is a plausible reason). Every
+# other unusable state already carried the suffix. The fixture makes the derivation AMBIGUOUS (two
+# candidate checkouts that both carry `origin`), because that is the deterministic way to reach the die
+# without depending on whether /tmp/cell exists on the host — and `stop` must still refuse as a pre-flight.
+# Reddens on the pre-fix supervisor (no pre-flight at all: `stop` proceeds, so the strings are absent).
+S7="$Q/st2093-norepo"; rm -rf "$S7"; mkdir -p "$S7"; seed_started_cell "$S7"
+rm -rf "$Q/home2"; mkdir -p "$Q/home2"; ai_init_repo "$Q/home2/cell"
+git -C "$Q/home2/cell" remote set-url origin https://github.com/daniel-ospina/tortoise.git
+Q_OUT=''; Q_RC=0
+Q_OUT="$(env -u REPO -u OR Q_STATE="$S7" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home2" \
+         ENV_FILE="$Q/keys.env" SESSION="ai2093nr-$$" O="$S7/o" WORKDIR="$Q/tortoise-repo" \
+         HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" \
+         bash "$SUP" stop 2>&1)"; Q_RC=$?
+[ "$Q_RC" -ne 0 ] && ok "stop: refuses when no checkout can be derived (the box is not stopped blind)" \
+                 || bad "stop proceeded with no derivable checkout (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"could be derived"*) ok "…and the refusal IS the missing-checkout path (not an unrelated precondition)" ;;
+  *) bad "(6) refused for an unrelated reason, so the suffix check below proves nothing: $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"NOTHING WAS STOPPED"*) ok "…and it says NOTHING WAS STOPPED — the missing-checkout leg carries the stop tail too (review P3)" ;;
+  *) bad "stop's missing-checkout refusal does NOT say that nothing was stopped — an operator cannot tell a pre-flight from a stop that failed halfway: $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"stop --force"*) ok "…and it names the escape hatch (--force), as every other unusable state does" ;;
+  *) bad "stop's missing-checkout refusal names no way past it — the one path that still strands the operator: $Q_OUT" ;;
+esac
+[ -f "$S7/o/state/roles/.desired" ] && [ "$(sgen "$S7")" = 3 ] \
+  && ok "…and nothing was lost (marker intact, generation un-bumped)" \
+  || bad "the missing-checkout refusal stopped the box (marker=$( [ -f "$S7/o/state/roles/.desired" ] && echo present || echo GONE) gen=$(sgen "$S7"))"
+# …and the ONE-LINE FIX it must NOT name: this `die` (`assert_repo`'s own, the `safe_argv` refusal) fires BEFORE any
+# `$onefix` exists, so the shared default tail sent the operator hunting for a line that had never been
+# printed. Both rows use THIS arm's `$Q_OUT`, which is why they live here and not in block (7).
+branch_repair_rows e '*Set REPO to a checkout of the repo this cell should work*'
+
+# (7) EVERY BRANCH THAT PRINTS NO ONE-LINE FIX CARRIES ITS OWN REPAIR CLAUSE (review F1/P2, #3442
+# rule 1). `queue_refusal_suffix` takes the branch's OWN repair sentence as `$2`, and its DEFAULT —
+# "Repair the pair with the ONE-LINE FIX above" — is valid ONLY for the branch that prints that fix
+# (`mismatch`, the one branch that passes no `$2`). The other five branches (`invalid`, `unreadable`,
+# `underivable`, and the two `assert_repo` dies) print no such line, so the default there told the
+# operator to apply a fix that had never been shown — the P3 defect the clause exists to remove.
+# ⛔ WHY THESE ROWS EXIST AT ALL: before them NOTHING in this suite graded `$2`. Passing ONE argument
+# at all six call sites (i.e. restoring the default everywhere) left the suite PASS=750 FAIL=0, because
+# every earlier refusal row reads either the SHARED tail (`NOTHING WAS STOPPED`, `stop --force`) or the
+# `mismatch` branch — which passes no `$2`, so its output is byte-identical either way. Absence is
+# invisible to every other kind of review.
+# ⛔ AND THE ABSENCE ROW IS THE ONE THAT ENCODES THE FIX: asserting the own clause is PRESENT could be
+# satisfied by a message that carries it AND still ends by pointing at a fix it never printed.
+# `sup:`'s sixth site (`*`, unknown state) is defensively unreachable — `QUEUE_STATE` is always set by
+# `resolve_queue_target` — so it is not pinned here rather than pinned vacuously.
+# (the helper itself is defined above arm (1), because arm (6) grades a `$2` site too)
+
+# (Ra) `invalid` — OR is not `<owner>/<repo>`. Its clause reuses the SAME `$onefix_cmd` inline (one
+# command, one place) instead of naming a fix above.
+S8="$Q/st2093-invalid"; rm -rf "$S8"; mkdir -p "$S8"; seed_started_cell "$S8" \
+  || bad "fixture (Ra): could not seed a started-cell state dir"
+qverb stop "$Q/tortoise-repo" "$S8" tortoise
+[ "$Q_RC" -ne 0 ] && ok "(Ra) stop: refuses a malformed OR (the branch is reached, so the rows below grade it)" \
+                  || bad "(Ra) stop proceeded on a malformed OR — the branch is unreached and the rows below prove nothing: $Q_OUT"
+branch_repair_rows a "*Fix OR to name an <owner>/<repo>*"
+
+# (Rb) `unreadable` — the checkout has no origin remote. This is the branch where the generic advice is
+# actively WRONG: there is no OR line to delete (none was read), so the clause must say so.
+S9="$Q/st2093-unreadable"; rm -rf "$S9"; mkdir -p "$S9"; seed_started_cell "$S9" \
+  || bad "fixture (Rb): could not seed a started-cell state dir"
+qverb stop "$Q/no-origin-repo" "$S9" ''
+[ "$Q_RC" -ne 0 ] && ok "(Rb) stop: refuses a checkout whose origin cannot be read (the branch is reached)" \
+                  || bad "(Rb) stop proceeded on an unreadable queue — the branch is unreached: $Q_OUT"
+branch_repair_rows b '*readable '\''origin'\'' remote*'
+
+# (Rc) `underivable` — the origin exists but is not a URL form this parser accepts. Its clause names
+# the `remote set-url` repair, and says deleting OR does NOT help (the queue is derived first).
+S10="$Q/st2093-underivable"; rm -rf "$S10"; mkdir -p "$S10"; seed_started_cell "$S10" \
+  || bad "fixture (Rc): could not seed a started-cell state dir"
+rm -rf "$Q/underivable-repo"; ai_init_repo "$Q/underivable-repo" \
+  || bad "fixture (Rc): cannot git init the underivable fixture"
+git -C "$Q/underivable-repo" remote set-url origin file://localhost/daniel-ospina/tortoise.git \
+  || bad "fixture (Rc): cannot set the underivable origin"
+qverb stop "$Q/underivable-repo" "$S10" ''
+[ "$Q_RC" -ne 0 ] && ok "(Rc) stop: refuses an underivable origin (the branch is reached)" \
+                  || bad "(Rc) stop proceeded on an underivable origin — the branch is unreached: $Q_OUT"
+branch_repair_rows c '*at a URL in one of those forms*'
+
+# (Rd) the SECOND `assert_repo` die — a DERIVED checkout whose path carries a shell metacharacter.
+# `cmd_stop` validates no `$REPO` of its own, so the derivation is the path that reaches it: `REPO` is
+# unset, exactly one candidate matches the declared OR, and its path has a space (a quote, backtick or
+# `$` would do as well — `safe_argv` refuses all of them). The clause must name a REPAIRABLE action;
+# the shared default would send the operator to a ONE-LINE FIX about `OR` for a broken `REPO`.
+S11="$Q/st2093-badpath"; rm -rf "$S11"; mkdir -p "$S11"; seed_started_cell "$S11" \
+  || bad "fixture (Rd): could not seed a started-cell state dir"
+rm -rf "$Q/badhome"; mkdir -p "$Q/badhome"
+Q_BADREPO="$Q/bad repo"; rm -rf "$Q_BADREPO"; ai_init_repo "$Q_BADREPO" \
+  || bad "fixture (Rd): cannot git init the metacharacter fixture"
+git -C "$Q_BADREPO" remote set-url origin https://github.com/daniel-ospina/badpath-2093.git \
+  || bad "fixture (Rd): cannot set the fixture origin"
+Q_OUT=''; Q_RC=0
+Q_OUT="$(env -u REPO Q_STATE="$S11" PATH="$Q/bin:$PATH" CELL_HOME="$Q/badhome" \
+         ENV_FILE="$Q/keys.env" SESSION="ai2093bp-$$" O="$S11/o" WORKDIR="$Q_BADREPO" \
+         OR=daniel-ospina/badpath-2093 HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
+         HARNESS_REF="$Q_REF" bash "$SUP" stop 2>&1)"; Q_RC=$?
+[ "$Q_RC" -ne 0 ] && ok "(Rd) stop: refuses a derived checkout whose path carries a metacharacter (the branch is reached)" \
+                  || bad "(Rd) stop proceeded with a metacharacter in \$REPO — the branch is unreached: $Q_OUT"
+branch_repair_rows d '*Set REPO to a checkout path with no quote or shell metacharacter*'
+
+# (7e) moved: the FIRST `assert_repo` die (no derivable checkout) is driven by arm (6) above, and its
+# own-clause/absence rows sit there — after arm (Rd) `$Q_OUT` carries (Rd)'s output, not (6)'s.
 
 # ── (l) one owner per controller (agent-infra#1761) ───────────────────────────────────────────────
 # The cell's controller answer must come from the harness's own AUTHORITY (the pid $O/.orch.lock
@@ -3020,6 +3649,17 @@ esac
 #       skipping the check whenever the addressed unit is disabled hides exactly this case.
 say_case "stop on a service-managed box: the unit's effect is read AFTER the teardown"
 S2="$T/svc2"; rm -rf "$S2"; mkdir -p "$S2/units" "$S2/o" "$S2/home" "$S2/repo" "$S2/bin"
+# ⛔ THE FIXTURE CHECKOUT NEEDS ITS ORIGIN (#2093). `stop` now runs the queue-target pre-flight, so it
+# reads `git -C $REPO remote get-url origin` the way `start`/`check` always have — and a fixture `repo`
+# with no origin is the ONE shape a real cell never has. Without it every teardown arm below reddened
+# on the #1901 gate instead of on the behaviour it pins (a false red that would hide a real regression
+# in the unit stop). A real cell's checkout has an origin, so the fixture now has the one `OR` names.
+cell_repo() { # <dir> <owner/repo> — a checkout that answers `remote get-url origin` like a real cell's
+  git -C "$1" init -q 2>/dev/null || return 1
+  git -C "$1" remote remove origin >/dev/null 2>&1 || true
+  git -C "$1" remote add origin "https://github.com/$2.git" || return 1
+}
+cell_repo "$S2/repo" daniel-ospina/agent-infra || bad "fixture: could not give the svc2 checkout an origin"
 : > "$S2/units/eldato-orchestrator.service"
 cat > "$S2/bin/systemctl" <<'SH'
 #!/bin/bash
@@ -3078,6 +3718,7 @@ S2C="$(cat "$S2/o/.orch.lock" 2>/dev/null)"; { [ -n "$S2C" ] && kill -9 "$S2C"; 
 # remove — while `status` printed "nothing will restart it" over a supervised cell.
 say_case "unit ownership survives a keys.env that repoints \$O, and a genuinely foreign unit is still foreign"
 S3="$T/svc3"; rm -rf "$S3"; mkdir -p "$S3/units" "$S3/o" "$S3/home" "$S3/repo" "$S3/bin" "$T/no-user-units"
+cell_repo "$S3/repo" daniel-ospina/agent-infra || bad "fixture: could not give the svc3 checkout an origin"
 printf 'O=%s/o\n' "$S3" > "$S3/home/keys.env"
 # the installer rendered ITS OWN $O — a different path from the one keys.env resolves the controller to
 cat > "$S3/units/eldato-orchestrator.service" <<SH
@@ -3529,7 +4170,7 @@ if [ -f "$PINLIB" ] && [ -f "$PINSH" ]; then
     pd_run_c() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD" "$PD_TREE" .; }
     pd_run_c >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a clean pin is CLEAN" ;; *) bad "pin_dirty (supervisor copy): a clean pin was not CLEAN" ;; esac
     mkdir -p "$PD_TREE/tmp"; printf 'hotfix\n' > "$PD_TREE/tmp/x.sh"
-    pd_run_c >/dev/null 2>&1; case $? in 1) ok "pin_dirty (supervisor copy): a GITIGNORED hotfix is DIRTY (the state `apply` used to call unchanged)" ;; *) bad "pin_dirty (supervisor copy): a gitignored hotfix did not read as DIRTY" ;; esac
+    pd_run_c >/dev/null 2>&1; case $? in 1) ok "pin_dirty (supervisor copy): a GITIGNORED hotfix is DIRTY (the state \`apply\` used to call unchanged)" ;; *) bad "pin_dirty (supervisor copy): a gitignored hotfix did not read as DIRTY" ;; esac
     rm -rf "$PD_TREE/tmp"; printf 'x\n' > "$PD_TREE/.DS_Store"
     pd_run_c >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a .DS_Store dropping is TOLERATED (one Finder visit must not brick a cell)" ;; *) bad "pin_dirty (supervisor copy): a .DS_Store refused the pin" ;; esac
     rm -f "$PD_TREE/.DS_Store"
@@ -5450,6 +6091,10 @@ fi
 #      controller)". Driven against the SHIPPED script (not the extracted functions): the decision
 #      lives in cmd_stop's refusal path, and a re-implementation of it would pass on the broken copy.
 C2="$T/own-session"; mkdir -p "$C2/bin" "$C2/o" "$C2/home"
+# ⛔ `REPO` HERE IS `$C2/home`, SO IT NEEDS AN ORIGIN TOO (#2093). `stop`'s queue pre-flight reads it,
+# and a checkout with no origin is a state the verb refuses — which would turn every #2315 arm below
+# into a red on the gate rather than on the leftover sweep it pins. See `cell_repo` in §2402.
+cell_repo "$C2/home" daniel-ospina/agent-infra || bad "fixture: could not give the own-session checkout an origin"
 : > "$C2/home/keys.env"
 # The tmux double is STATEFUL: a session exists while $C2/session does, and kill-session removes it —
 # so "did stop clear it" is answered by the next has-session, exactly as the real verb reads it.
