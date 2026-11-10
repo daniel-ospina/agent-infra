@@ -956,6 +956,13 @@ _i2_run() { # <tag> <drainer> [extra env...] → sets LAST_RC; TARGET 1 so the t
   LAST_AI="$ROOT/ai-$tag"
 }
 _i2_plant i2
+# ⛔ THE HELD RECORD CARRIES A NON-ZERO STATUS FOR THIS FIRST TICK, so the row that says "the tick does
+# not report a FAILED lane for a lane that is still running" can actually FAIL (review finding, PR
+# #3918). With the plant's default `rc=0` a mis-settle logs `DONE:` and exits 0 — so that row stayed
+# GREEN with the holder gate deleted, asserting a behaviour it could not observe. A non-zero status
+# makes the pre-fix behaviour loud: the settle reports `FAIL: lane …` and the tick exits 1. The zero-rc
+# fixture is restored below, because the "settles DONE exactly once" leg asserts the clean-status path.
+printf '3' >"$I2_O/bg/$I2_NAME.rc"
 _i2_run i2 "$DRAINER"
 check "(i2) ★ the #2787 shape: a LIVE worker under a DEAD recorded pid keeps its checkout" \
   '[ -d "$I2_WT" ]' "the checkout was removed under a live worker — this is the P0 the arm exists for"
@@ -982,6 +989,7 @@ check "(i2) …and it is NOT counted as a REAPED leftover (nothing was reaped)" 
 # …and the reaper is NOT INERT: once the holder is gone the same record settles, exactly once, and the
 # checkout is reclaimed. A gate that keeps every tree for ever passes every assertion above.
 kill "$I2_HOLD" 2>/dev/null; wait "$I2_HOLD" 2>/dev/null; sleep 0.4
+printf '0' >"$I2_O/bg/$I2_NAME.rc"          # the lane's real status, now that it is allowed to end
 _i2_run i2 "$DRAINER"
 check "(i2) once the holder exits, the SAME record settles as DONE (exactly once)" \
   '[ ! -f "$I2_AI/state/lanes/$I2_NAME.pid" ] && [ "$(grep -c "DONE: lane $I2_NAME" "$LAST_AI/logs/ai-drainer.log")" -eq 1 ]' \
@@ -1077,9 +1085,9 @@ run_drainer_fg i4
 check "(i4) a MISSING seed refuses the tick, by name" \
   '[ "$LAST_RC" -ne 0 ] && grep -q "FAIL: SEED_REPO=.*is not a git checkout" "$LAST_AI/logs/ai-drainer.log"' \
   "rc=$LAST_RC $(grep -E 'FAIL' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
-check "(i4) …BEFORE any lane: no worktree, no record, no dispatch" \
-  '[ "$(ls -d "$LAST_AI"/wt-drainer-* 2>/dev/null | wc -l | tr -d " ")" -eq 0 ] && [ "$(ls "$LAST_AI/state/lanes" 2>/dev/null | wc -l | tr -d " ")" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ]' \
-  "trees=$(ls -d "$LAST_AI"/wt-drainer-* 2>/dev/null | wc -l | tr -d " ") records=$(ls "$LAST_AI/state/lanes" 2>/dev/null | wc -l | tr -d " ") dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
+check "(i4) …BEFORE any lane: no brief, no worktree, no record, no dispatch" \
+  '[ "$(ls -d "$LAST_AI"/wt-drainer-* 2>/dev/null | wc -l | tr -d " ")" -eq 0 ] && [ "$(ls "$LAST_AI/state/lanes" 2>/dev/null | wc -l | tr -d " ")" -eq 0 ] && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 0 ] && [ ! -e "$LAST_AI/state/drainer-brief.md" ] && [ -z "$(ls "$LAST_AI"/state/drainer-brief-* 2>/dev/null)" ]' \
+  "trees=$(ls -d "$LAST_AI"/wt-drainer-* 2>/dev/null | wc -l | tr -d " ") briefs=$(ls "$LAST_AI"/state/drainer-brief* 2>/dev/null | wc -l | tr -d " ") records=$(ls "$LAST_AI/state/lanes" 2>/dev/null | wc -l | tr -d " ") dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
 reset_run
 RUN_TARGET=1 RUN_SEED_REF="origin/no-such-ref"
 run_drainer_fg i4b
@@ -1108,6 +1116,12 @@ else
   check "(i5) …the refusal is still NAMED (the WARN is kept, not swallowed)" \
     'grep -q "WARN: could not remove the worktree" "$LAST_AI/logs/ai-drainer.log"' \
     "$(grep -E 'WARN: could not remove' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+  # ⛔ …AND NAMED ONCE. The settle probes it, and `_reap_leftovers` runs later in the SAME tick; a second
+  # probe logged the identical WARN twice, which reads like two different failures (review note, PR
+  # #3918). One probe per tree per tick — a later tick retries, as the WARN says.
+  check "(i5) …and it is probed ONCE per tick (the same WARN is not logged twice)" \
+    '[ "$(grep -c "WARN: could not remove the worktree" "$LAST_AI/logs/ai-drainer.log")" -eq 1 ]' \
+    "warn-lines=$(grep -c "WARN: could not remove the worktree" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
   check "(i5) …and it is NOT counted as a live lane (it never appears as held)" \
     '! grep -q "held=1(pid-gone-checkout-held)" "$LAST_AI/logs/ai-drainer.log"' \
     "$(grep -E 'SKIP:|START:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
@@ -1125,9 +1139,17 @@ check "mutation: the holder gate was removed from the copy (and _rm_wt survived 
   '[ -s "$MUTG" ] && ! grep -q "holder=\"\$(_drain_holder" "$MUTG" && grep -q "^_rm_wt() {" "$MUTG"' \
   "gated=$(grep -c 'holder="\$(_drain_holder' "$MUTG" 2>/dev/null) rmwt=$(grep -c '^_rm_wt() {' "$MUTG" 2>/dev/null)"
 _i2_plant mv
+# ⛔ THE MUTANT RUN CARRIES THE SAME NON-ZERO STATUS ARM (i2) PLANTS, so this block PROVES the row above
+# can redden: with the gate deleted the record settles, the tick reports `FAIL: lane …` and exits 1 —
+# exactly what "…does not report a FAILED lane for a lane that is still running" asserts is absent
+# (review finding, PR #3918). Without this pair the row was green under every revert of the diff.
+printf '3' >"$I2_O/bg/$I2_NAME.rc"
 _i2_run mv "$MUTG"
 check "non-vacuity: without the holder gate the live worker's checkout IS removed (so (i2) can fail)" \
   '[ ! -d "$I2_WT" ]' "tree survived — the gate is not what makes (i2) pass"
+check "non-vacuity: …and the mis-settle IS reported as a FAILED lane (so the (i2) no-FAIL row can fail)" \
+  'grep -q "FAIL: lane $I2_NAME" "$LAST_AI/logs/ai-drainer.log" && [ "$LAST_RC" -ne 0 ]' \
+  "rc=$LAST_RC $(grep -E 'FAIL: lane|DONE: lane' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
 kill "$I2_HOLD" 2>/dev/null; wait "$I2_HOLD" 2>/dev/null
 
 reset_run

@@ -613,6 +613,11 @@ SETTLED_FAIL=0
 # is filled by `_settle_lanes` (which is what probes) and read by `_held_offsets` and the census.
 SETTLE_HELD=0
 SETTLE_HELD_NAMES=" "
+# ⛔ TREES THIS TICK ALREADY PROBED AND COULD NOT DELETE (rc 1). They are NOT held — they settle — but
+# `_reap_leftovers` runs later in the same tick and used to probe them a second time, logging the same
+# `WARN: could not remove` twice, which reads like two different failures (review note, PR #3918). One
+# probe per tree per tick; a later tick retries the removal, exactly as the WARN says.
+SETTLE_WARN_NAMES=" "
 # ⛔ EVERY PATH AFTER THE SETTLE GOES THROUGH `finish`. `_settle_lanes` can report a lane that died
 # without a clean status, and three early `exit 0`s (swap floor / load ceiling / at target) used to
 # bypass that report: on a healthy box at target — the normal steady state — a lane that exited 3 was
@@ -687,20 +692,41 @@ fi
 # removal for ever. This tick never cds into a lane checkout, so the only requirement here is not to
 # start doing so.
 _proc_cwd_holder() { # <canon path> → 0 + "<pid>\t<cwd-inside-the-worktree>" · 1 none · 2 not evaluable
-  local d tgt root="${PROC_ROOT:-/proc}" n
+  local root="${PROC_ROOT:-/proc}" raw out
   [ -d "$root" ] || return 2
-  for d in "$root"/[0-9]*; do
-    tgt="$(readlink "$d/cwd" 2>/dev/null)" || continue
-    [ -n "$tgt" ] || continue
-    n="${d##*/}"
-    case "$tgt" in
-      "$1"|"$1"/*) printf '%s\t%s\n' "$n" "cwd-inside-the-worktree"; return 0 ;;
-    esac
-  done
-  return 1
+  # ⛔ ONE TABLE READ, NOT ONE FORK PER PID (review finding, PR #3918). A `readlink` per pid measured
+  # 1.3 s over ~600 pids on the fleet box against 20 ms for the single `ls` below (65×) — and this runs
+  # on the COMMON path (witness A answering "none", i.e. every ordinary reclaim), from inside the
+  # tick's lock, once per dead record per tick. The shape is the repo's recorded one
+  # (`scripts/lib/live-paths.sh`: "one `ls` over /proc … one BUILTIN read per pid"), reimplemented here
+  # rather than sourced for the same reason `live-ownership.sh::lo_cwd_rows` reimplements it:
+  # `orchestrator-harness/` is not a farmed tree, so a farmed reaper cannot resolve that file.
+  # ⛔ CAPTURE FIRST: in `ls | awk` the pipeline reports AWK's status, so a broken or absent `ls` would
+  # read exactly like a table with nobody in it — the one reading a reaper must never invent. A PARTIAL
+  # table (another uid's `/proc` entries are unreadable, `ls` exits non-zero while listing what it
+  # could) is still a real census, and a cwd that was unlinked still NAMES its path, so the kernel's
+  # ` (deleted)` suffix is stripped rather than matched.
+  raw="$(ls -l "$root"/[0-9]*/cwd 2>/dev/null)"
+  [ -n "$raw" ] || return 2                  # read nothing at all → UNKNOWN, never "no holder"
+  out="$(printf '%s\n' "$raw" | awk -v wt="$1" '
+    !found {
+      i = index($0, " -> "); if (i == 0) next          # not a readable symlink row
+      left = substr($0, 1, i - 1); tgt = substr($0, i + 4)
+      sub(/ \(deleted\)$/, "", tgt)
+      n = split(left, seg, "/"); pid = seg[n - 1]      # "<root>/<pid>/cwd"
+      if (pid !~ /^[0-9]+$/ || tgt !~ /^\//) next
+      if (tgt == wt || substr(tgt, 1, length(wt) + 1) == wt "/") {
+        printf "%s\t%s\n", pid, "cwd-inside-the-worktree"; found = 1
+      }
+    }')"
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+  return 0
 }
 _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none · 2 could not be evaluated
-  local path out rc=0 proc_rc=0
+  #   (a 2 also prints the CALL-TIME reason as one line, so the KEEP message cannot report a load-time
+  #    status as if it were this call's failure — review note, PR #3918)
+  local path out rc=0 proc_rc=0 why="$HOLDER_PROBE_WHY"
   # Canonical, because `/proc/<pid>/cwd` and `lsof` both answer with RESOLVED paths: a `$AI` reached
   # through a symlink (`/tmp` → `/private/tmp` on Darwin, a linked state dir on a cell) would otherwise
   # never match, and a holder would read as absent — the direction that destroys work.
@@ -711,7 +737,11 @@ _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none
     case "$rc" in
       0) printf '%s\n' "$out"; return 0 ;;
       1) rc=1 ;;
-      *) rc=2 ;;
+      # ⛔ THE MODULE LOADED BUT COULD NOT ANSWER (its own rc 2: `/proc` absent, its ignore-file guard
+      # unwritable — a full disk, the very state this gate exists for). Reporting the LOAD-TIME "ok
+      # (/…/wt-lifecycle.sh)" here read as "the probe could not be evaluated (ok (…))", which names
+      # nothing (review note, PR #3918). Say what actually happened, at call time.
+      *) rc=2; why="wt_live_holders returned $rc at CALL time — the module at ${WTL:-$HOLDER_PROBE_WHY} could not read what it needs (no `/proc`, or an unwritable ignore file on a full disk), so it could not answer" ;;
     esac
   else
     rc=2                                   # witness A cannot be evaluated on this box
@@ -727,6 +757,7 @@ _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none
     1) [ "$rc" = "2" ] || rc=1 ;;
     *) : ;;                                # witness B absent (no /proc): keep witness A's verdict
   esac
+  [ "$rc" = "2" ] && printf '%s\n' "$why"
   return "$rc"
 }
 _rm_wt() { # <worktree path> — only ever called for a lane whose pid is PROVABLY DEAD
@@ -742,7 +773,7 @@ _rm_wt() { # <worktree path> — only ever called for a lane whose pid is PROVAB
       log_line "KEEP: not removing $1 — ${hwhy:-a live process} (pid ${hpid:-?}) still holds it, so the lane is STILL RUNNING whatever its pidfile says (agent-infra#2787); its record stands and a later tick retries"
       return 3 ;;
     2)
-      log_line "KEEP: not removing $1 — the live-holder probe could not be evaluated ($HOLDER_PROBE_WHY), and an unproven removal is the one thing this pass may not do (agent-infra#2787); a later tick retries"
+      log_line "KEEP: not removing $1 — the live-holder probe could not be evaluated (${holder:-$HOLDER_PROBE_WHY}), and an unproven removal is the one thing this pass may not do (agent-infra#2787); a later tick retries"
       return 2 ;;
   esac
   # ──8<── /holder-gate ──────────────────────────────────────────────────────────────────────
@@ -778,6 +809,9 @@ _settle_lanes() {
       case $? in
         2|3) SETTLE_HELD=$((SETTLE_HELD + 1)); SETTLE_HELD_NAMES="$SETTLE_HELD_NAMES$name "
              continue ;;
+        # rc 1 (removal refused, nothing holds it) settles as before — and is recorded as PROBED so
+        # `_reap_leftovers` does not ask the same question again this tick.
+        1) SETTLE_WARN_NAMES="$SETTLE_WARN_NAMES$name " ;;
       esac
     fi
     rc_file="$O/bg/$name.rc"
@@ -818,11 +852,12 @@ _reap_leftovers() {
   for w in "$AI"/wt-drainer-*; do
     case "$w" in *.lane-pid) continue ;; esac       # the sidecar is not a worktree
     [ -d "$w" ] || continue
-    # ⛔ A TREE THIS TICK'S SETTLE ALREADY KEPT IS NOT PROBED A SECOND TIME. `_settle_lanes` runs first
-    # and holds the same verdict; re-probing it here cost a second probe per kept tree per tick and
-    # logged the identical `KEEP:` line twice, which reads like two different refusals.
+    # ⛔ A TREE THIS TICK'S SETTLE ALREADY KEPT (holder gate / unevaluable probe) OR ALREADY FAILED TO
+    # REMOVE is not probed a second time. `_settle_lanes` runs first and holds the same verdict;
+    # re-probing it here cost a second probe per kept tree per tick and logged the identical `KEEP:` /
+    # `WARN: could not remove` line twice, which reads like two different refusals.
     nm="${w##*/wt-drainer-}"
-    case "$SETTLE_HELD_NAMES" in *" $nm "*) continue ;; esac
+    case "$SETTLE_HELD_NAMES$SETTLE_WARN_NAMES" in *" $nm "*) continue ;; esac
     lane=""
     [ -f "$w.lane-pid" ] && lane="$(tr -dc '0-9' 2>/dev/null <"$w.lane-pid")"
     [ -n "$lane" ] || continue

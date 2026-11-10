@@ -177,7 +177,12 @@ while nothing happened:
     module that cannot answer at all is *named*, never read as "no holders");
   * plus a `/proc/<pid>/cwd` witness where `/proc` exists. This is not redundant: a real holder is a
     `pi -p … <brief>` lane whose argv never names the checkout, which only the cwd witness sees — and a
-    cell without `lsof` installs one witness fewer.
+    cell without `lsof` installs one witness fewer. It reads the **whole table once** (`ls -l
+    /proc/[0-9]*/cwd`, one `awk` pass) rather than forking a `readlink` per pid: measured 20 ms against
+    1.3 s over ~600 pids, and this probe runs on the common path — every ordinary reclaim, inside the
+    tick's lock. A table it could not read at all is `UNKNOWN`, never "no holder"; a partial table and
+    a cwd whose directory was already unlinked (` (deleted)` in the kernel's own link) are read, never
+    invented.
 
   A tree that is still held is **kept**, and the lane is **not settled**: the tick logs
   `KEEP: … (pid N) still holds it`, the record stands (so the verdict is still reported exactly once,
@@ -223,7 +228,12 @@ record is reclaimed once the module answers again (the gate is fail-closed, not 
 runs the **argv** witness on its own (`/proc` unavailable, holder's cwd elsewhere), the shape only that
 witness can see. Arm (i5) pins the opposite polarity — a lane whose checkout **cannot be deleted**
 (a permission, a half-broken `$SEED_REPO`) has still ENDED: it is settled, its verdict is reported, and
-it is not counted as alive. `_rm_wt`'s rc 2/3 mean "not finished"; rc 1 is a WARN and does not.
+it is not counted as alive. `_rm_wt`'s rc 2/3 mean "not finished"; rc 1 is a WARN and does not — and
+that tree is **probed once per tick**, not again by the leftover reaper in the same tick, so the WARN is
+logged once. Arm (i2)'s fixture records a **non-zero** status, so the row asserting "no FAILED lane for a
+lane that is still running" can actually redden; the non-vacuity twin proves it does (gate deleted ⇒ the
+tick reports `FAIL: lane …` and exits 1). Arm (i4) asserts the brief as well as the tree, the lane record
+and the dispatch, because the brief is the first artifact a mis-ordered preflight would leave behind.
 
 ## Activate on macOS
 
