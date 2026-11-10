@@ -308,6 +308,15 @@ wait_bounded() {
 # ═══ §1 THE WRITER — `lane.sh` records the refusal, with the yield and the gate that fired ═══════
 echo
 echo "=== §1 the refusal becomes a durable record (state/capacity-refused-<N>) ==="
+# ⛔ THE CREATION GATE READS THE REPO'S LIVE LANDING RATIO, AND IT IS EVALUATED BEFORE THE LOAD/DISK/FORK
+# GATES (#2409). Every arm below that lets a lane actually START therefore has to SUPPLY that reading —
+# the rule §LB states at its own fixtures ("every arm that lets a lane actually start must SUPPLY the
+# reading"). §1 and the fork/disk arms predate #2409 and did not, so they measured the box's real repo:
+# once `agent-infra` crossed its ceiling they all refused with `rc=74, gate='land'` BEFORE the gate under
+# test could fire — a shard red that named a `load`/`fork` failure that never happened (measured
+# 2026-11-10, PR #3896 `bash-suites (5)`, and locally the same `gate='land'` on lane 7 and lane 17).
+# The reading is installed here, once, as a healthy box supplies it; §LB installs its own shapes later.
+lbgh_install "$TMP/lbgh-ok"
 # The yield length is pinned to a non-default value so the check is not satisfied by the default.
 LANE_YIELD=120
 BEFORE="$(date +%s)"
@@ -357,8 +366,24 @@ ck "  …and the exported df stub answered (not a real filesystem reading — a 
 # writer folded every code except disk into `load`, so a fork refusal published the LOAD remedy and
 # its remedy line said "load gate" — the two failures the issue names.
 # Driven through the SHIPPED lane.sh: only the headroom SOURCE is faked (10 spare pids against the
-# shipped 200 margin), by exporting the two capacity functions the gate consumes, so the gate, the
-# refusal code, the record and the log line are all the real ones.
+# shipped 200 margin), by exporting the capacity functions the gate consumes, so the gate, the refusal
+# code, the record and the log line are all the real ones.
+#
+# ⛔ THE STUB SET MUST COVER `SPAWN_GATE_CAP_NEEDS` — ALL OF IT (#3231 drift, measured 2026-11-10).
+# When the gate's needs gained `cap_fork_probe`, this arm's two-function set stopped reading as
+# "preloaded": the gate then SOURCED the real `capacity.sh` beside it, which REDEFINED both stubs with
+# the box's own live readings — headroom plentiful, state `ok` — and the fork refusal never fired. The
+# arm then reddened with `rc=74, gate='land'` on every box and on CI, for a reason that names no defect.
+# The coverage check below makes the next addition red HERE, naming the missing function, instead of
+# silently turning this arm back into a test of the box. It reads this file's OWN source, because the
+# stub set is a property of the fixture — a runtime `declare -F` would need the functions declared in
+# the PARENT shell, and an exported stub then outlives its own arm: measured, lane 7 stopped refusing
+# and lane 9 refused with the fork code 73, because `unset -f` is not what the subshell was doing.
+missing_cap=""
+for _cap_fn in $(sed -n 's/^SPAWN_GATE_CAP_NEEDS="\(.*\)"$/\1/p' "$HERE/spawn-gate.sh"); do
+  grep -qE "^ *${_cap_fn}\\(\\)" "$0" || missing_cap="$missing_cap $_cap_fn"
+done
+ck "the fork arm declares EVERY function spawn-gate.sh's SPAWN_GATE_CAP_NEEDS lists${missing_cap:+ (missing:$missing_cap)}" "$([ -z "$missing_cap" ]; echo $?)"
 rm -f "$O/state/capacity-refused-17"
 ( cd "$LANECWD"
   # shellcheck shell=bash
@@ -368,7 +393,10 @@ rm -f "$O/state/capacity-refused-17"
     case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
     printf -v "$3" '%s' "$(( $2 - $1 ))"
   }
-  export -f cap_procs_pair_vars cap_h_for_vars
+  # The two-fork probe answers `ok` by construction: this arm isolates the HEADROOM arithmetic, and a
+  # real probe would answer for the box rather than for the fixture.
+  cap_fork_probe() { return 0; }
+  export -f cap_procs_pair_vars cap_h_for_vars cap_fork_probe
   O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" CAPACITY_YIELD_SECS=$LANE_YIELD \
     bash "$LANE" --key-gate-off 17 feat/17-tm daniel-ospina/agent-infra
 ) > "$TMP/lane17.out" 2>&1
