@@ -150,7 +150,7 @@
 #   * the tree holds NON-REGENERABLE IGNORED data, past the WIP floor    => why=ignored-data-held
 #     (no flag moves that class at all — `--reap-abandoned-wip` only enters the DIRTY case — so it is
 #     the same "blocked for ever" shape, and `ignored-artifact` was measured as the largest preserve
-#     bucket in a real pass: `reasons=ignored-artifact:70`, 20,557 MB, `:855-857`)
+#     bucket in a real pass: `reasons=ignored-artifact:70`, 20,557 MB, `:876-880`)
 #   * an INTERRUPTED ADD whose stash entry outlived it — class `interrupted-add`, and the same
 #     `why=withheld-by-abstention` (review round 7, PR #3881). ⛔ ONLY ITS `refs=merged` HALF: that
 #     arm also admits `branch-retained:*`, whose branch still HOLDS commits and is therefore not
@@ -2946,8 +2946,13 @@ age_h_ceil() { local d=$(( $1 - $2 )); [ "$d" -gt 0 ] || d=0; printf '%s\n' "$((
 
 stalled_tok() {
     # ⛔ AN EMPTY ISSUE PRINTS `?`, NEVER A BARE `#` (review, PR #3881): `issue=#` is a field an
-    # operator cannot read and a test cannot match, and both classes that call this are lane-owned
-    # (`feat/<N>-tm`), so an empty one can only mean the branch parser was handed something else.
+    # operator cannot read and a test cannot match, and EVERY caller is lane-gated (`is_lane_branch`,
+    # which is what makes a branch name `feat/<N>-tm` and so always carries an issue), so an empty one
+    # can only mean the branch parser was handed something else. ⛔ THAT SENTENCE WAS FALSE FOR ONE
+    # RELEASE (review, PR #3881 round 9): the interrupted-add arm emitted the token without a
+    # `is_lane_branch` gate, so `issue=?` was REACHABLE there — the row it printed claimed a lane
+    # class for a branch `is_lane_branch` rejects. The gate is on all four emitters now; if a fifth is
+    # added, it needs the gate too, or this comment becomes the lie it just was.
     local iss="${2:-}"
     [ -n "$iss" ] && iss="#$iss" || iss="?"
     printf 'stalled=1 class=%s issue=%s age=%s floor=%s why=%s' \
@@ -4130,7 +4135,17 @@ classify_one() {
         # `_ia_st` is DECLARED (and emptied) with the other locals at the top of this function, because
         # `abstain_gate` is called with it UNCONDITIONALLY below — a `set -u` bang there is what a local
         # declaration prevents. It is assigned exactly once, on the `refs=merged` half only.
-        if [ "$refs" = merged ]; then
+        # ⛔ LANE-GATED, LIKE EVERY SIBLING (review, PR #3881 round 9). `refs=merged` alone is NOT the
+        # list's class: the header scopes it to "0-commits-ahead LANE residue" and the legend says each
+        # row "names the ISSUE its branch holds out of dispatch", while this arm is entered from
+        # `init_lock_age` alone (no branch-shape test above it). Without the gate an interrupted
+        # `worktree add` on any branch at all — a `topic/foo` checkout whose register holds a stash
+        # naming it — was published as `stalled=1 class=interrupted-add issue=? …` under a header
+        # reading "the 0-commits-ahead lane class". The three sibling emitters all gate (unarmed
+        # dirty, armed abandoned-wip, ignored-artifact, ghost-zero-ahead), so this was the one gap.
+        # No verdict changes: the record is preserved either way, it is simply no longer NAMED as a
+        # lane's residue when it is not a lane branch.
+        if [ "$refs" = merged ] && is_lane_branch "$branch"; then
             _ia_st="$(stalled_tok interrupted-add "$issue" "${init_age}s" \
                 "${REAP_WT_STALE_INIT_SECONDS}s" withheld-by-abstention)"
         fi
@@ -4308,7 +4323,7 @@ classify_one() {
             # (`--reap-abandoned-wip` only enters the DIRTY case above), so a 0-commits-ahead lane
             # record whose tree holds non-regenerable ignored data blocks its issue indefinitely while
             # the row reads as routine — and `clean_gate`'s own measurement records
-            # `ignored-artifact` as the largest preserve bucket in a real pass (`:855-857`).
+            # `ignored-artifact` as the largest preserve bucket in a real pass (`:876-880`).
             # ⛔ IT CHANGES NO VERDICT: the row is `preserve` on both paths; only the detail gains the
             # token. The gates ARE the abandoned-wip arm's — 0 commits ahead (`refs=merged` is the
             # test), lane-owned, past a floor — plus round 2's rule that a TRANSIENT unreadable probe

@@ -1239,8 +1239,9 @@ the same unit — and that floor's gate is `-ge`, so a record exactly AT it is l
 `age=1800s floor=1800s`), the class floor it is at or past (`<n>h`, or `<n>s` for the
 `interrupted-add` class's 1800 s floor — a record that cannot be dated is never listed) and the reason.
 
-A record is named for one of three reasons (`why=`), and the third is the class that has no releasing
-flag at all: `opt-in-off` (a dirty tree past `REAP_WT_WIP_AGE_HOURS`, `--reap-abandoned-wip` unarmed),
+A record is named for one of three reasons (`why=`) — **two** of them have no releasing flag, which
+is why the legend gives each one its own remedy: `opt-in-off` (a dirty tree past `REAP_WT_WIP_AGE_HOURS`,
+`--reap-abandoned-wip` unarmed),
 `withheld-by-abstention` (a stash ENTRY names the branch — a stash entry is released by nothing, so
 this reason covers BOTH the dirty-tree class and an `interrupted-add` record, whose add never returned
 but whose parked work survived it), and `ignored-data-held` (the tree holds
@@ -1250,8 +1251,10 @@ bucket measured in a real pass, `reasons=ignored-artifact:70`, 20,557 MB, so it 
 `REAP_WT_GHOST_AGE_HOURS` (2, the clean `ghost-zero-ahead` class), `REAP_WT_WIP_AGE_HOURS` (24, the
 dirty and non-regenerable-ignored-data classes) and `REAP_WT_STALE_INIT_SECONDS` (1800, the
 `interrupted-add` class, the one floor stated in seconds because it is sub-hour); all three appear in
-`--help` and in the legend printed under the list, and their unit is the row's own (`<n>h`, or `<n>s`
-for the sub-hour floor) — the row and its legend are ONE contract, read together.
+`--help`, and their unit is the row's own (`<n>h`, or `<n>s`
+for the sub-hour floor) — the row and the legend printed under it are ONE contract, read together
+(the legend states the UNIT and the per-`why=` release path; the three floor NAMES live in `--help`,
+which is where an operator looks them up).
 
 ⛔ **Each `why=` names the ONLY release path, and they are NOT interchangeable.** `opt-in-off` is
 released by `--reap-abandoned-wip` (backup verified FIRST). `ignored-data-held` is released only by

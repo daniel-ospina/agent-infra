@@ -1141,8 +1141,19 @@ ANCHORS = {
     # A29r-MUT drives this anchor. ⛔ THE ANCHOR IS THE COMPARISON LINE, which occurs exactly once
     # (the bare `abstain_gate` form at the aged rule site does not contain it).
     "branch-retained-no-token": (
-        "        if [ \"$refs\" = merged ]; then",
-        "        if [ \"$refs\" != \"\" ]; then   # MUTANT: the 0-ahead carve-out is loosened",
+        "[ \"$refs\" = merged ] && is_lane_branch \"$branch\"; then",
+        "[ \"$refs\" != \"\" ] && is_lane_branch \"$branch\"; then   # MUTANT: the 0-ahead carve-out is loosened",
+    ),
+    # (12) DROP THE INTERRUPTED-ADD ARM LANE GATE (#2179 review round 9). That arm is entered from
+    # `init_lock_age` alone, so it was the ONE emitter with no `is_lane_branch` test — while the list
+    # header scopes itself to "0-commits-ahead LANE residue" and the legend says each row names "the
+    # ISSUE its branch holds out of dispatch". Without the gate any `topic/…` checkout whose stash
+    # register names it was published as lane residue. A29v is the non-lane fixture; this mutant
+    # is the pre-fix spelling. ⛔ THE ANCHOR IS THE WHOLE CONDITION (it occurs exactly once, and the
+    # bare `refs = merged` fragment does not).
+    "interrupted-add-no-lane-gate": (
+        "        if [ \"$refs\" = merged ] && is_lane_branch \"$branch\"; then",
+        "        if [ \"$refs\" = merged ]; then   # MUTANT: the lane gate is dropped",
     ),
 }
 s = open(src).read()
@@ -4030,6 +4041,156 @@ assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" \
 assert_contains "$OUT" "STALLED REVIEW LIST" \
     "A29r-MUT …and a record that HOLDS a commit is printed on the review list"
 assert_dir "$WT" "A29r-MUT the mutation changes the REPORT only — nothing is removed either way"
+
+# ── A29v: the interrupted-add token is LANE-GATED, like every sibling emitter ────────────
+# ⛔ REVIEW ROUND 9, PR #3881. That arm is entered from `init_lock_age` alone — no branch-shape test
+# anywhere above it — so it was the ONE emitter with no `is_lane_branch`, while the list header scopes
+# itself to "0-commits-ahead LANE residue" and its legend says each row names "the ISSUE its branch
+# holds out of dispatch". Two non-lane shapes must therefore stay OFF the list, and both are built
+# here because they fail differently: `topic/2966-parked` still parses to an ISSUE number (so the
+# pre-fix row claimed a real issue was held out of dispatch), while `topic/parked` has none at all
+# and printed `issue=?` — the value `stalled_tok`'s own comment says can only mean a parser bug.
+ENV=A29v; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-num" topic/2966-parked)"
+printf 'partial\n' >"$WT/base.txt"
+printf 'initializing' >"$REPO/.git/worktrees/$ENV-num/locked"
+touch -t 202001010000 "$REPO/.git/worktrees/$ENV-num/locked"
+register_stash "$REPO" topic/2966-parked
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=stranded-stash" \
+    "A29v non-vacuity: the stash entry withheld the non-lane record too (an empty row passes on anything)"
+assert_absent "$(row_for "$OUT" "$WT")" "stalled=1" \
+    "A29v an interrupted add on a NON-LANE branch is not lane residue — so it is not listed"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29v …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29v …and no list is printed at all"
+assert_dir "$WT" "A29v the non-lane checkout survives — the gate changes the REPORT only"
+
+# A29v2 — the SAME shape on a branch with NO issue number at all, in its OWN repo. ⛔ ITS OWN REPO IS
+# LOAD-BEARING (first draft shared one and this half went missing): `register_stash` re-points the
+# single `refs/stash`, and when the second branch is 0-ahead its stash commit is the SAME sha, so
+# `update-ref` records no reflog entry and the second branch never has a stash entry at all. The
+# record was then legitimately removed by the interrupted-add arm — a fixture bug, not a code one.
+ENV=A29v2; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-plain" topic/parked)"
+printf 'partial\n' >"$WT/base.txt"
+printf 'initializing' >"$REPO/.git/worktrees/$ENV-plain/locked"
+touch -t 202001010000 "$REPO/.git/worktrees/$ENV-plain/locked"
+register_stash "$REPO" topic/parked
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29v2 non-vacuity: the stash entry withheld this record too"
+assert_absent "$ROW" "stalled=1" \
+    "A29v2 an interrupted add on a branch with NO issue number is not listed (never an unknown-issue row)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29v2 …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29v2 …and no list is printed at all"
+assert_dir "$WT" "A29v2 the checkout survives — the gate changes the REPORT only"
+
+# A29v-MUT: the registered `interrupted-add-no-lane-gate` mutant IS the pre-fix code (the gate the
+# diff added is deleted), so a leg that passed before the gate would pass here too.
+ENV=A29w; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-num" topic/2967-parked)"
+printf 'partial\n' >"$WT/base.txt"
+printf 'initializing' >"$REPO/.git/worktrees/$ENV-num/locked"
+touch -t 202001010000 "$REPO/.git/worktrees/$ENV-num/locked"
+register_stash "$REPO" topic/2967-parked
+MUT29V="$T/mutant-interrupted-add-no-lane-gate.sh"
+mutate_reaper_anchored "$MUT29V" interrupted-add-no-lane-gate
+OUT="$(REAPER="$MUT29V" REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "stalled=1 class=interrupted-add" \
+    "A29v-MUT WITHOUT the lane gate a non-lane record IS published as a lane's residue — so A29v MEASURES it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" "A29v-MUT …and the tally inflates"
+
+# ── A29x/A29y/A29z: the ignored-artifact arm's OTHER three conjuncts can each go red ─────
+# ⛔ REVIEW ROUND 9 (finding 3), PR #3881. That arm gates on five conditions and only two were
+# falsifiable: `claim != unknown` (A29o) and the class floor (A29k past / A29l inside). `is_lane_branch`,
+# `wt_ok = 1` and `commits_survive = merged` could ALL be deleted with the suite still green, because
+# every ignored-artifact fixture in the file is a lane branch, 0-ahead, and freshly dated. A guard the
+# diff added that no leg can see is the class rounds 6 and 8 each turned into a finding, so each one
+# gets the fixture that reds it:
+#   A29x non-lane branch        => deleting `is_lane_branch` from the arm reds it
+#   A29y branch holds a commit  => deleting `commits_survive = merged` reds it
+#   A29z undatable record       => deleting `wt_ok = 1` reds it (a FUTURE record stamp is the seam
+#                                  `wt_created_ts` refuses by design, so no stat shim is needed)
+mk_ignored() { # <env> <wt-name> <branch> -> repo with `data/` ignored and a data-holding checkout
+    local envname="$1" name="$2" branch="$3" repo wt
+    repo="$(mk_repo "$envname")"
+    printf 'data/\n' >"$repo/.gitignore"
+    "$REAL_GIT" -C "$repo" add .gitignore
+    GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$repo" commit -qm ignore
+    wt="$(add_named_wt "$repo" "$name" "$branch")"
+    mkdir -p "$wt/data"; printf 'z\n' >"$wt/data/notes.txt"
+    printf '%s\n' "$repo"
+}
+
+# A29x — a NON-LANE branch holding non-regenerable ignored data past the floor. `add_named_wt`
+# places the checkout at `$T/<name>`, so the caller knows the path without a helper returning two values.
+ENV=A29x; REPO="$(mk_ignored $ENV "$ENV-data" topic/2968-parked)"
+WT="$T/$ENV-data"
+rm -f "$T/$ENV/reap.log"
+NOW_X="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 24 * 3600 + 1800 ))"   # 24h30m => age=25h
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_X" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29x non-vacuity: a non-lane data-holding record still takes the ignored-artifact arm"
+assert_absent "$ROW" "stalled=1" \
+    "A29x a NON-LANE record is not lane residue — so the ignored-data class is not named for it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29x …so the tally stays 0"
+assert_dir "$WT" "A29x the data-holding checkout is preserved, as always"
+
+# A29y — a LANE record whose branch HOLDS a commit (so `commits_survive` is branch-retained, not merged).
+ENV=A29y; REPO="$(mk_ignored $ENV "$ENV-data" feat/2969-tm)"
+WT="$T/$ENV-data"
+commit_in_wt "$WT" "$OLD_DATE" a29y
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count main..feat/2969-tm)" "1" \
+    "A29y precondition: the branch HOLDS a commit, so it is not the 0-ahead class"
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_X" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29y non-vacuity: still the ignored-artifact arm"
+assert_absent "$ROW" "stalled=1" \
+    "A29y a lane record that HOLDS a commit is work in flight, not residue — so it is not named"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29y …so the tally stays 0"
+
+# A29z — a LANE, 0-ahead, data-holding record whose OWN RECORD STAMP is unreadable. `wt_created_ts`
+# walks four `stat` rungs (GNU birth, GNU ctime, BSD birth, BSD ctime) and needs a strictly positive
+# integer from one; with none it returns no age, which is `wt_ok=0`. ⛔ A FUTURE stamp is NOT the way to
+# build this (the first tried): rung 1 returns the BIRTH time, which `touch` cannot move, so the record
+# still resolved to a real age and the leg would have passed on the floor, not on `wt_ok`. So the seam
+# is a surgical `stat` shim: it fails ONLY for this record's admin path and delegates every other call,
+# and it is reached by prefixing PATH ahead of the suite's own `$T/bin`.
+ENV=A29z; REPO="$(mk_ignored $ENV "$ENV-data" feat/2970-tm)"
+WT="$T/$ENV-data"
+mkdir -p "$T/statbin"
+REAL_STAT="$(command -v stat)"
+cat >"$T/statbin/stat" <<SHIM
+#!/usr/bin/env bash
+case " \$* " in *"worktrees/A29z-data"*) exit 1 ;; esac
+exec "$REAL_STAT" "\$@"
+SHIM
+chmod +x "$T/statbin/stat"
+assert_eq "$(PATH="$T/statbin:$PATH" stat -c %Y "$REPO/.git/worktrees/$ENV-data" 2>/dev/null; echo rc=$?)" "rc=1" \
+    "A29z precondition: the shim makes exactly this record's stamp unreadable"
+assert_eq "$(PATH="$T/statbin:$PATH" stat -c %Y "$REPO" 2>/dev/null | grep -c '^[0-9][0-9]*$')" "1" \
+    "A29z …and delegates every OTHER path to the real stat (only that one record is blinded)"
+rm -f "$T/$ENV/reap.log"
+OUT="$(PATH="$T/statbin:$PATH" REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_X" \
+    REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29z non-vacuity: the undatable record still takes the ignored-artifact arm"
+assert_absent "$ROW" "stalled=1" \
+    "A29z a record whose age cannot be read is NOT named (the floor could not be applied)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29z …so the tally stays 0"
+assert_dir "$WT" "A29z the record is preserved — an undatable age never reaps, never lists"
 
 # ── A29u: the ARTIFACT'S OWN --help NAMES THE THIRD FLOOR, ITS UNIT, AND ITS RELEASE PATH ──────
 # ⛔ REVIEW ROUND 8, PR #3881. The interrupted-add row prints `age=<n>s floor=1800s`, while `--help`
