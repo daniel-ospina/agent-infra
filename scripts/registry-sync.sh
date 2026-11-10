@@ -419,36 +419,156 @@ same_bytes() { [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; }
 # that writes this directory takes a lock of its own (a `record-review.sh` mint, an operator's
 # `registry-sync.sh pull`, and `cloud-cell-bringup.sh`'s union all land here), so the most a lock can
 # do is exclude a CONCURRENT SYNC RUN — which is the interleaving that actually loses bytes on one
-# box, and it is taken per KEY rather than per run so a long network-bound pull cannot block a
-# second one for minutes (#2510 P2).
+# box. There is ONE lock path (not one per key), so it DOES serialise keys across runs: a pull on
+# `a-b-1` and a push on `c-d-2` in two concurrent runs wait for each other. That is a deliberate
+# trade — the critical section is a compare plus one local rename (microseconds), and the network
+# fetch that could take minutes is OUTSIDE it, in `remote_record`/`fetch_once`. The lock costs a
+# second run a few hundred ms at worst, never the network bound.
 #
 # mkdir, not flock: flock is absent on stock macOS (this file already avoids `timeout` for the same
-# reason). Bounded (~5 s) so a landing can never hang on it, and reclaimable: a lock whose recorded
-# holder pid is GONE is a killed run, and is reclaimed rather than allowed to wedge every future pull.
+# reason). Bounded (~5 s) so a landing can never hang on it.
+#
+# ⛔ THE RECLAIM PREDICATE HAS TO BE RIGHT IN BOTH DIRECTIONS (#2510 review P2, both measured). The
+# first cut tested `[ -n "$pid" ] && ! kill -0 "$pid"`, which is wrong twice:
+#   · a lock directory with NO pid file — the holder killed between `mkdir` and the pid write, or a
+#     truncated/empty one — NEVER satisfied it, so it was never reclaimed and every later pull skipped
+#     EVERY changed record, for ever, until a human removed the directory. One kill = a permanent
+#     wedge in the landing path, which is worse than the rare race the lock exists to prevent.
+#   · `kill -0` reports EPERM as FAILURE, so a LIVE holder this process may not signal (another
+#     user's run) read as GONE and its lock was STOLEN — reopening the very compare+write race the
+#     lock closes. Liveness is therefore `ps -p`, which is permission-insensitive.
+# So a lock is reclaimed when it has no usable holder AND is past LOCK_PID_GRACE (a live acquirer is
+# legitimately pid-less for the microseconds between `mkdir` and the write — too short to matter, too
+# long to ignore), or when it is past LOCK_STALE_MAX while showing a live pid (the pid was RECYCLED
+# onto an unrelated process, which liveness alone cannot distinguish). No `stat` ⇒ no age ⇒ FAIL
+# CLOSED (wait out the bound and let the caller refuse to write) rather than steal a lock we cannot
+# date.
+#
+# ⛔ THE CEILING MUST OUTLIVE THE RUN'S OWN BOUND. `--timeout` is an operator knob (any positive
+# integer), and the lock is held across a local compare+write — but a holder can be FROZEN, not dead
+# (laptop lid-sleep mid-land, a SIGSTOPped lane, a hung filesystem): `ps -p` still succeeds, so only
+# the ceiling can break it. A fixed 300 s would therefore reclaim a legitimate `--timeout 600` run in
+# its own critical section, so the floor is `max(300, 2 × MAX_WAIT)`.
+#
+# ⛔ RECLAIM ATOMICALLY, AND RELEASE ONLY WHAT YOU STILL OWN. Two window races the first cut had:
+#   · DECIDE-THEN-`rm -rf` IS NOT A CLAIM. Between the decision and the removal another run can
+#     reclaim the same stale dir, acquire it, and have its LIVE lock deleted by this one (measured:
+#     the pid flipped mid-critical-section and two holders overlapped 2.1 s). `mv` is the claim —
+#     exactly ONE reclaimer can win a rename — and the claimed directory carries the pid the decision
+#     was based on, so re-reading it afterwards tells us whether we removed the lock we judged.
+#   · `reg_unlock` removed `$LOCKDIR` unconditionally. The ceiling arm can reclaim a lock that still
+#     names a LIVE pid, so that holder reaches `reg_unlock` long after losing it and deletes the NEW
+#     holder's lock, letting a third run into the critical section (measured). Release therefore
+#     checks that the pid inside is still ours.
+#
+# ⛔ EVERY non-acquiring pass SLEEPS and INCREMENTS. The first cut `continue`d on the reclaim path
+# without either, so a lock it could not remove — a root-owned lock left in a shared registry by a
+# `sudo` run — HOT-SPUN with no bound at all (measured: 410 reclaim warnings in 4 s, never exits),
+# inside atomic-land.sh's pre-sync. The ~5 s bound must hold in EVERY arm, not just the waiting one.
+LOCK_PID_GRACE="${REGISTRY_SYNC_LOCK_PID_GRACE:-2}"    # s a pid-less lock must survive before reclaim
+LOCK_STALE_MAX="${REGISTRY_SYNC_LOCK_STALE_MAX:-}"    # empty ⇒ derive: max(300, 2 × MAX_WAIT)
+# A non-numeric tunable would make `[ -ge ]` ERROR (rc 2, so the arm silently flips) — sanitise, because
+# a silently-flipped reclaim arm is either a stolen live lock or a restored permanent wedge. A
+# DEGENERATE value (0) disables the lock just as effectively, so both arms carry a real floor.
+case "$LOCK_PID_GRACE" in ''|*[!0-9]*) LOCK_PID_GRACE=2 ;; esac
+[ "$LOCK_PID_GRACE" -ge 1 ] || LOCK_PID_GRACE=1
+if [ -z "$LOCK_STALE_MAX" ]; then LOCK_STALE_MAX=$((MAX_WAIT * 2)); [ "$LOCK_STALE_MAX" -ge 300 ] || LOCK_STALE_MAX=300; fi
+case "$LOCK_STALE_MAX" in ''|*[!0-9]*) LOCK_STALE_MAX=300 ;; esac
+[ "$LOCK_STALE_MAX" -ge 1 ] || LOCK_STALE_MAX=300
+
+lock_age() { # <path> → SECONDS since its mtime, "" when no `stat`/`date` can answer
+  # ⛔ the AGE, not the MTIME: comparing an absolute epoch against a 300 s threshold is true for every
+  # lock ever created, which reclaims LIVE locks on sight (reproduced in this file's own §30a/§30b).
+  local m now
+  m="$(stat -c %Y "$1" 2>/dev/null || true)"
+  case "$m" in ''|*[!0-9]*) m="$(stat -f %m "$1" 2>/dev/null || true)" ;; esac
+  case "$m" in ''|*[!0-9]*) printf ''; return 0 ;; esac
+  now="$(date +%s 2>/dev/null || true)"
+  case "$now" in ''|*[!0-9]*) printf ''; return 0 ;; esac
+  # a FUTURE mtime (clock skew) is 0s old, never a negative age
+  if [ "$now" -ge "$m" ]; then printf '%s' "$((now - m))"; else printf '0'; fi
+}
+
+# claim_stale <pid-when-judged> <message> → 0 = the lock this run judged is gone
+# `mv` is the atomic claim; exactly one reclaimer can win it. If the directory that landed under the
+# scratch name does not carry the pid the decision was made on, it is NOT the lock we judged — either
+# a peer reclaimed it and re-created it, or it is brand new — so it is PUT BACK and this run waits,
+# never deleted. A claimed directory that cannot be deleted is left as `.stale.<pid>` debris: the LOCK
+# NAME is free either way, which is the only thing that matters for correctness.
+claim_stale() { # <judged-pid> <message>
+  # a UNIQUE scratch name per attempt: a repeated reclaim inside one loop would otherwise `mv` the
+  # second lock INTO the debris the first left behind (mv-into-existing-dir), silently disarming a peer.
+  local judged="$1" gone="$LOCKDIR.stale.$$.$RANDOM" got=""
+  [ -n "$2" ] && warn "$2"
+  mv "$LOCKDIR" "$gone" 2>/dev/null || return 1
+  [ -f "$gone/pid" ] && got="$(command cat "$gone/pid" 2>/dev/null)"
+  case "$got" in ''|*[!0-9]*) got="" ;; esac
+  if [ "$got" = "$judged" ]; then
+    rm -rf "$gone" 2>/dev/null || :
+    return 0
+  fi
+  if [ ! -e "$LOCKDIR" ] && mv "$gone" "$LOCKDIR" 2>/dev/null; then
+    warn "  · $LOCKDIR was re-created while being reclaimed — restored, not removed."
+  else
+    warn "  · $LOCKDIR was re-created while being reclaimed — leaving $gone in place rather than deleting a live lock."
+  fi
+  return 1
+}
+
 reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
-  local i=0 pidf pid
+  local i=0 pidf pid age
   [ -d "$REG_DIR" ] || mkdir -p "$REG_DIR" 2>/dev/null || return 1
   LOCKDIR="$REG_DIR/.registry-sync.lock"
+  LOCK_OWNED=0
   while [ "$i" -lt 50 ]; do
     if mkdir "$LOCKDIR" 2>/dev/null; then
       printf '%s\n' "$$" > "$LOCKDIR/pid" 2>/dev/null || :
+      LOCK_OWNED=1
       return 0
     fi
     pidf="$LOCKDIR/pid"; pid=""
     [ -f "$pidf" ] && pid="$(command cat "$pidf" 2>/dev/null)"
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-      warn "  ⚠️ reclaiming $LOCKDIR — its holder (pid $pid) is gone (a killed run)."
-      rm -rf "$LOCKDIR" 2>/dev/null || :
-      continue
+    case "$pid" in ''|*[!0-9]*) pid="" ;; esac
+    age="$(lock_age "$LOCKDIR")"
+    # ⛔ ORDER MATTERS: the "no usable holder" arm is the PRECISE cause and is checked FIRST, so a
+    # pid-less or gone-pid lock is named as such; the staleness ceiling is only the fallback for a lock
+    # that still shows a LIVE pid (the recycled case). Checking the ceiling first relabels every
+    # pid-less lock as "untouched", which is true but points an operator at the wrong cause.
+    if [ -n "$age" ] && [ "$age" -ge "$LOCK_PID_GRACE" ] \
+       && { [ -z "$pid" ] || ! ps -p "$pid" >/dev/null 2>&1; }; then
+      # an ABSENT/EMPTY pid is a no-holder state BY CONSTRUCTION — never left to `ps -p ''`'s
+      # platform-dependent exit status (`kill -0` never could see this state at all, which is the bug).
+      if [ -n "$pid" ]; then
+        claim_stale "$pid" "  ⚠️ reclaiming $LOCKDIR — its holder (pid $pid) is gone (a killed run)." || :
+      else
+        claim_stale "" "  ⚠️ reclaiming $LOCKDIR — no usable pid after ${age}s (its holder died before it could record itself)." || :
+      fi
+    elif [ -n "$age" ] && [ "$age" -ge "$LOCK_STALE_MAX" ]; then
+      # Older than any sync run can hold it: whatever pid claims it, this lock is abandoned.
+      claim_stale "$pid" "  ⚠️ reclaiming $LOCKDIR — untouched for ${age}s, longer than any sync run holds it." || :
     fi
     sleep 0.1; i=$((i + 1))
   done
   return 1
 }
-reg_unlock() { [ -n "${LOCKDIR:-}" ] && rm -rf "$LOCKDIR" 2>/dev/null; LOCKDIR=""; return 0; }
+reg_unlock() {
+  # ⛔ RELEASE ONLY WHAT WE STILL OWN. The ceiling arm can reclaim a lock that still names a LIVE pid,
+  # so this process may reach here long after it lost the lock; removing unconditionally then deletes
+  # the NEW holder's lock and lets a third run in mid-critical-section (measured). An unreadable pid is
+  # NOT a licence to remove either — it cannot prove ownership, and the 2 s grace reclaims it anyway.
+  local mine=""
+  if [ "${LOCK_OWNED:-0}" = "1" ] && [ -n "${LOCKDIR:-}" ] && [ -f "$LOCKDIR/pid" ]; then
+    mine="$(command cat "$LOCKDIR/pid" 2>/dev/null)"
+    case "$mine" in ''|*[!0-9]*) mine="" ;; esac
+    [ "$mine" = "$$" ] && rm -rf "$LOCKDIR" 2>/dev/null
+  fi
+  LOCK_OWNED=0; LOCKDIR=""
+  return 0
+}
 
 PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0 UNCHANGED=0
 LOCKDIR=""
+LOCK_OWNED=0
 # ── ONE listing per run (agent-infra#3180) ───────────────────────────────────────────────────────
 # `union` = `do_pull` then `do_push`, and both called `fetch_refs` — 4 git network calls to read the
 # SAME namespace twice (measured: ls-remote 2.4-3.9 s + fetch 3.7 s, so ~10-15 s of a land bought

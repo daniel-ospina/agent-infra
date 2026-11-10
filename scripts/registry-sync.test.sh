@@ -31,9 +31,16 @@
 #   §22 a legacy <pr>.json whose own `pr` field denies its filename is never published
 #   §23 `status` counts the STORE's records, not this box's cache
 #   §24 every network op is BOUNDED and cannot block on an invisible prompt
-#   §27 the spawn budget is O(1) in the record count (#3180)
+#   §27 the spawn budget is O(1) in the record count (#3180), and §27b prices the NESTED shape the
+#       fast path excludes (`mint:"delta"`), which the flat fixtures could not
 #   §28 the pre-pass's `join` is pinned to the collation its inputs were sorted with, and a
 #       pre-pass that cannot be computed is NAMED rather than reported as converged (#3249 P1)
+#   §29 ⭐ THE FIELD READ IS THE READER'S PARSE (#2510): a record carrying a NESTED object is keyed
+#       and ORDERED by its TOP level, exactly as `read_record`/`review-enforcer` read it
+#   §30 the compare+write lock: a live holder is never stolen (including EPERM), a dead/pid-less or
+#       pid-recycled lock IS reclaimed, and a lock that cannot be removed still exits within the bound
+#   §31 a local record that is NEWER but unusable is NAMED (and `pull` is not sold as its remedy),
+#       never reported as a converged-looking `keep`
 
 set -uo pipefail
 
@@ -105,6 +112,47 @@ rs()  { local dir="$1"; shift; rsx "$STORE" "$dir" "$@"; }
 # `--dir` and `--timeout` are pinned for the same reason.
 RS_LAST=""; RS_RC=0
 rs_rc() { local dir="$1"; shift; RS_LAST="$(rs "$dir" "$@" 2>&1)"; RS_RC=$?; }
+
+# ── helpers for the #3894 review round (§29-§31) ──────────────────────────────────────
+assert_not_contains() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpectedly present: $2)"; else ok "$3"; fi; }
+
+# run_bounded <secs> <cmd…> → RB_OUT / RB_RC / RB_TIMED_OUT. Stock macOS has no GNU `timeout`, and
+# the property under test (§30e) IS "it terminates" — so the bound has to be imposed from outside and
+# a hang has to be OBSERVED, never waited out.
+run_bounded() { # <secs> <cmd…>
+  local secs="$1"; shift
+  local log rcfile pid n
+  log="$(mktemp "$T/bounded.XXXXXX")"; rcfile="$log.rc"
+  ( "$@" >"$log" 2>&1; printf '%s' "$?" > "$rcfile" ) &
+  pid=$!
+  n=0
+  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt $((secs * 10)) ]; do sleep 0.1; n=$((n + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    RB_TIMED_OUT=1
+    kill -9 "$pid" 2>/dev/null || :
+    pkill -P "$pid" 2>/dev/null || :
+    wait "$pid" 2>/dev/null || :
+  else
+    RB_TIMED_OUT=0
+  fi
+  RB_RC="$(command cat "$rcfile" 2>/dev/null || printf '?')"
+  RB_OUT="$(command cat "$log" 2>/dev/null || :)"
+  rm -f "$log" "$rcfile"
+}
+
+# mini_fixture <name> → a SELF-CONTAINED bare origin + store under $T/<name>, and MINI (a box's
+# registry dir). §29-§31 each need a store holding ONE key: the lock arms cost the ~5 s serialisation
+# bound per KEY, so a suite store with a dozen keys would make them cost a minute each, and the
+# ordering/oracle arms must not be perturbed by the records §1-§28 put on the main store.
+mini_fixture() { # <name>
+  local d="$T/$1"
+  mkdir -p "$d/reg"
+  git init -q --bare "$d/origin.git"
+  git init -q "$d/store"
+  git -C "$d/store" remote add origin "$d/origin.git"
+  MINI_ROOT="$d"; MINI="$d/reg"; MINI_STORE="$d/store"
+}
+mini_rs() { local dir="$1"; shift; bash "$SYNC" "$@" --repo "$MINI_STORE" --dir "$dir" --remote origin --timeout 30 2>&1; }
 
 HEAD_A="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 HEAD_B="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -732,6 +780,55 @@ ONE_CHANGED="$(bash "$SYNC" union --repo "$T/n10/store" --dir "$T/n10/reg" --rem
 assert_contains "$ONE_CHANGED" "unchanged=18" "§27 a ONE-BYTE change drops the pre-pass count (9 per half)"
 assert_contains "$ONE_CHANGED" "pushed acme-widget-105" "§27 ...and the changed record is published"
 
+# §27b — THE SHAPE THE FAST PATH EXCLUDES. Every fixture above is ONE FLAT LINE, so §27 prices the
+# budget only for the shape `record-review.sh` writes for a `mint:"fresh"` record. It emits a NESTED
+# `"delta":{…}` for `mint:"delta"` (record-review.sh:6483), and a nested record takes the `python3`
+# path — so §27's "flat in N" claim said NOTHING about the shape that actually costs (review finding
+# P2, PR #3894). Priced here instead, with the assertion each direction needs: the cost is a bounded
+# constant PER RECORD (a nested record is anomalous by construction — 2 of 4,645 in the live
+# registry, so a handful of spawns each is the intended trade), and it is NOT ZERO — a nested record
+# that spawned nothing would mean the fast path READ it, which is §29's failure mode, not a win.
+spawns_for_nested_pull() { # <root> <n> → "<spawns>\n<summary+stderr>"
+  local rt="$1" n="$2" i pr out
+  mkdir -p "$rt/reg" "$rt/fresh"
+  git init -q --bare "$rt/origin.git"
+  git init -q "$rt/store"
+  git -C "$rt/store" remote add origin "$rt/origin.git"
+  i=1
+  while [ "$i" -le "$n" ]; do
+    pr=$((100 + i))
+    printf '{"pr":%s,"head_sha":"%s","mint":"delta","verdict":"clean","repo":"acme/widget","reviewed_at":"2026-01-01T00:%02d:00Z","delta":{"arm":"docs","from":"aaaaaaa","reviewed_at":"2000-01-01T00:00:00Z"}}\n' \
+      "$pr" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$i" > "$rt/reg/acme-widget-$pr.json"
+    i=$((i + 1))
+  done
+  # publish from the seed box, then measure a PULL into an empty box — the per-record path, not the
+  # converged pre-pass (a converged nested registry would spawn nothing and prove nothing).
+  bash "$SYNC" union --repo "$rt/store" --dir "$rt/reg" --remote origin --timeout 30 >/dev/null 2>&1
+  : > "$T/spawns.log"
+  out="$(PATH="$SPAWN_SHIM:$PATH" SPAWN_LOG="$T/spawns.log" bash "$SYNC" pull --repo "$rt/store" --dir "$rt/fresh" --remote origin --timeout 30 2>&1)"
+  printf '%s\n%s\n' "$(wc -l < "$T/spawns.log" | tr -d ' ')" "$out"
+}
+NP4="$(spawns_for_nested_pull "$T/nest4" 4)"
+NP10="$(spawns_for_nested_pull "$T/nest10" 10)"
+NS4="$(head -1 <<<"$NP4" | tr -d ' ')"
+NS10="$(head -1 <<<"$NP10" | tr -d ' ')"
+NO10="$(tail -n +2 <<<"$NP10")"
+echo "     nested-shape spawns: N=4 → $NS4   N=10 → $NS10"
+assert_contains "$NO10" "pulled acme-widget-105" "§27b every NESTED record still CONVERGES (the shape gate is about cost, never semantics)"
+case "$NS4$NS10" in
+  ''|*[!0-9]*) bad "§27b could not count spawns (N=4='$NS4', N=10='$NS10')" ;;
+  *)
+    PDELTA=$((NS10 - NS4))
+    # measured: the python path costs ~7 spawns per nested record (the reader-strict parse plus the
+    # field reads it serves). The bound is 10/record — it must stay a SMALL CONSTANT, and it must
+    # stay > 0 (see above): both directions are the assertion.
+    if [ "$PDELTA" -gt 0 ] && [ "$PDELTA" -le $((10 * 6)) ]; then
+      ok "§27b a nested record costs a BOUNDED constant ($((PDELTA / 6)) spawns/record, not O(N))"
+    else
+      bad "§27b a nested record's per-record cost is out of bounds (delta $PDELTA over 6 more records; want 1..60)"
+    fi ;;
+esac
+
 # ═══ 28. the pre-pass's join is pinned to the collation its inputs were sorted with ══════
 # Review finding P1 on PR #3249: `identical_pairs` sorted BOTH inputs `LC_ALL=C` and then ran an
 # UNQUALIFIED `join`, so the merge was evaluated under the ambient locale over data ordered by C.
@@ -805,6 +902,167 @@ assert_eq "$LC_RC" "0" "§28b a pre-pass that cannot be computed STILL converges
 assert_contains "$LC_LAST" "the converged pre-pass could not run" "§28b ...and the fallback is NAMED instead of silently reported as converged"
 assert_contains "$LC_LAST" "unchanged=0" "§28b ...reporting ZERO skipped rather than a count it did not compute"
 assert_contains "$LC_LAST" "same=12" "§28b ...and every record still converges through the per-record path"
+
+# ═══ 29. the field read IS the reader's parse ═══════════════════════════════════════
+# Review finding P2 on PR #3894 — the PR's OWN subject, and nothing pinned it: reverting `field()` to
+# the last-match implementation left this suite at 137/0 (measured, mutation run). The last-match scan
+# took a NESTED value, while `read_record` (scripts/atomic-land.sh) and `extensions/review-enforcer`
+# parse strict JSON and take the TOP-LEVEL one — two parsers, one artifact, opposite answers. The two
+# decisions that depended on it are the two asserted here: rule 3's KEY check (`repo`/`pr`) and rule
+# 1's ORDERING (`reviewed_at`).
+# The fixture is the shape `record-review.sh` really emits for `mint:"delta"`: ONE line, one outer
+# object, a NESTED `delta` object that DENIES the key and ranks the record older.
+echo "── §29 field() reads the record's TOP level, exactly as the gate does"
+mini_fixture nest
+NEST_KEY="$KEY"
+printf '{"pr":2374,"head_sha":"%s","mint":"delta","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T10:00:00Z","delta":{"arm":"docs","repo":"other/repo","pr":999,"reviewed_at":"2000-01-01T00:00:00Z"}}\n' \
+  "$HEAD_A" > "$MINI/$NEST_KEY.json"
+N_OUT="$(mini_rs "$MINI" union)"; N_RC=$?
+assert_eq "$N_RC" "0" "§29 a nested-shape record PUBLISHES (its TOP level is its key)"
+if [ -n "$(git -C "$MINI_STORE" ls-remote --refs origin "refs/reviews/$NEST_KEY")" ]; then
+  ok "§29 ...under the key its TOP level names"
+else
+  bad "§29 ...NOT published — the read took the NESTED repo/pr, so rule 3 acted on the wrong value"
+fi
+assert_not_contains "$N_OUT" "name disagrees with the record's own repo/pr fields" "§29 ...and the run did not claim the name disagrees with the record"
+NEST2D="$MINI_ROOT/box2"; mkdir -p "$NEST2D"
+N2_OUT="$(mini_rs "$NEST2D" pull)"; N2_RC=$?
+assert_eq "$N2_RC" "0" "§29 a fresh box pulls the nested record (exit 0, not 4)"
+if [ -f "$NEST2D/$NEST_KEY.json" ] && cmp -s "$MINI/$NEST_KEY.json" "$NEST2D/$NEST_KEY.json"; then
+  ok "§29 ...BYTE-IDENTICALLY — the nested object did not re-key it into another repo's slot"
+else
+  bad "§29 ...not materialised (the reader took the nested repo/pr)"
+fi
+assert_not_contains "$N2_OUT" "NOT this key" "§29 ...and the run did not report it as another repo's key"
+# rule 1: the peer's TOP stamp (2026-10-20) outranks a local 2026-10-19, even though the peer's NESTED
+# stamp (2000-01-01) is ancient. The old parse kept the local record and reported a converged-looking
+# `keep` — a newer record silently lost, in the pull direction.
+NEST3D="$MINI_ROOT/box3"; mkdir -p "$NEST3D"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-19T00:00:00Z"}\n' \
+  "$HEAD_B" > "$NEST3D/$NEST_KEY.json"
+N3_OUT="$(mini_rs "$NEST3D" pull)"
+assert_contains "$N3_OUT" "pulled $NEST_KEY" "§29 the peer's TOP stamp outranks a local 2026-10-19 (rule 1 reads the top level)"
+if cmp -s "$MINI/$NEST_KEY.json" "$NEST3D/$NEST_KEY.json"; then
+  ok "§29 ...and the wall-clock-newer record REPLACED the local one"
+else
+  bad "§29 ...the local record was kept — the ordering used the NESTED reviewed_at"
+fi
+assert_not_contains "$N3_OUT" "this box is NEWER" "§29 ...and the run did not claim this box was newer"
+
+# ═══ 30. the compare+write lock: reclaimed in every dead-holder shape, bounded in every arm ══
+# Review findings P2 (two of them) on PR #3894 — `git grep 'reg_lock' -- scripts/*.test.sh` had NO
+# match, so `reg_lock()` could be replaced with `return 0` and the suite stayed green (measured,
+# mutation run), and neither measured defect was caught. Each arm below is one measured shape:
+#   (a) a LIVE holder is never stolen          (b) a LIVE-but-EPERM holder is not "dead"
+#   (c) no pid file at all                     (d) a pid RECYCLED by an unrelated process
+#   (e) a lock that cannot be REMOVED must still EXIT (the first cut hot-spun for ever)
+# The store holds exactly ONE key: each armed run pays the ~5 s serialisation bound per key.
+echo "── §30 the compare+write lock is reclaimed in every dead-holder shape, and bounded in every arm"
+mini_fixture lock
+LCK_KEY="$KEY"
+LOCK_SEED="$MINI_ROOT/seed"; mkdir -p "$LOCK_SEED"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T10:00:00Z"}\n' \
+  "$HEAD_A" > "$LOCK_SEED/$LCK_KEY.json"
+mini_rs "$LOCK_SEED" push >/dev/null 2>&1
+LKD="$MINI_ROOT/box"; mkdir -p "$LKD"
+lock_reset() { rm -rf "$LKD/.registry-sync.lock"; rm -f "$LKD/$LCK_KEY.json"; }
+# (a) a live holder
+lock_reset
+mkdir -p "$LKD/.registry-sync.lock"; printf '%s\n' "$$" > "$LKD/.registry-sync.lock/pid"
+LA_OUT="$(mini_rs "$LKD" pull)"; LA_RC=$?
+assert_eq "$LA_RC" "1" "§30a a lock held by a LIVE pid REFUSES the pull (exit 1, nothing written)"
+assert_contains "$LA_OUT" "could not serialise" "§30a ...and NAMES the lock as the reason"
+assert_absent "$LKD" "$LKD/$LCK_KEY.json" "§30a ...and wrote no record without it"
+# (b) a live holder this user cannot signal — `kill -0` reports EPERM as FAILURE, so the first cut
+# read it as dead and STOLE the lock, reopening the very race the lock exists to close.
+lock_reset
+if kill -0 1 2>/dev/null; then
+  ok "§30b (premise NOT reachable) this suite runs as root, where no pid is unsignalable — recorded as an explicit skip, not a silent pass"
+else
+  mkdir -p "$LKD/.registry-sync.lock"; printf '1\n' > "$LKD/.registry-sync.lock/pid"
+  LB_OUT="$(mini_rs "$LKD" pull)"; LB_RC=$?
+  assert_eq "$LB_RC" "1" "§30b a lock whose LIVE holder is unsignalable (EPERM) is NOT stolen (exit 1)"
+  if [ -d "$LKD/.registry-sync.lock" ]; then ok "§30b ...the live holder's lock dir is still there"; else bad "§30b ...the live holder's lock was STOLEN (EPERM read as dead)"; fi
+  assert_contains "$LB_OUT" "could not serialise" "§30b ...and the run says it could not serialise rather than writing"
+  assert_absent "$LKD" "$LKD/$LCK_KEY.json" "§30b ...and no record was written under a stolen lock"
+fi
+# (c) NO pid file — the process killed between `mkdir` and the pid write. The first cut's predicate
+# (`[ -n "$pid" ] && ! kill -0 …`) could never match this, so ONE kill wedged every later pull for
+# ever: every changed record skipped, `union` exit 1, until a human removed the directory.
+lock_reset
+mkdir -p "$LKD/.registry-sync.lock"
+touch -t 202001010000 "$LKD/.registry-sync.lock"
+LC_OUT="$(mini_rs "$LKD" pull)"; LC_RC=$?
+assert_eq "$LC_RC" "0" "§30c a lock dir with NO pid file is RECLAIMED (one kill must not wedge the pull for ever)"
+assert_contains "$LC_OUT" "no usable pid" "§30c ...and the reclaim is NAMED after the real cause"
+if [ -f "$LKD/$LCK_KEY.json" ]; then ok "§30c ...and the pull then did its work"; else bad "§30c ...the pull skipped the record after reclaiming"; fi
+# (d) a pid the OS RECYCLED onto an unrelated live process: liveness cannot tell, so the lock is also
+# reclaimed past LOCK_STALE_MAX — no sync run can hold it that long (every network op is bounded).
+lock_reset
+mkdir -p "$LKD/.registry-sync.lock"; printf '%s\n' "$$" > "$LKD/.registry-sync.lock/pid"
+touch -t 202001010000 "$LKD/.registry-sync.lock"
+LD_OUT="$(mini_rs "$LKD" pull)"; LD_RC=$?
+assert_eq "$LD_RC" "0" "§30d a lock whose pid was RECYCLED onto a live process is reclaimed past LOCK_STALE_MAX"
+assert_contains "$LD_OUT" "longer than any sync run holds it" "§30d ...named as a stale lock, not as a live holder"
+if [ -f "$LKD/$LCK_KEY.json" ]; then ok "§30d ...and the pull then did its work"; else bad "§30d ...the pull skipped the record after reclaiming"; fi
+# (e) a registry this user can neither write nor rename inside (a root-owned registry dir in a shared
+# install). Every acquisition attempt fails, so the bound — not the filesystem — has to end the run: the
+# first cut `continue`d on a failed reclaim without sleeping or incrementing and hot-spun with NO bound
+# inside atomic-land.sh's pre-sync (measured: 410 reclaim warnings in 4 s, never exits).
+# NOTE the shape: a stale lock dir in a registry we CAN write is no longer a wedge at all — the reclaim
+# claims it by `mv` (atomic, and it frees the LOCK NAME) and only the debris may be undeletable. The
+# arm that still has to be bounded is the one where even `mkdir`/`mv` are refused.
+lock_reset
+if [ "$(id -u 2>/dev/null || echo 0)" -eq 0 ] || { chmod 500 "$LKD" 2>/dev/null; mkdir "$LKD/.lockprobe" 2>/dev/null; }; then
+  # premise NOT established: root ignores the mode bits (and the probe just proved it)
+  rmdir "$LKD/.lockprobe" 2>/dev/null || :; chmod 700 "$LKD" 2>/dev/null || :
+  ok "§30e (premise NOT reachable) this suite runs as root, where a mode-500 registry is still writable — recorded as an explicit skip, not a silent pass"
+else
+  run_bounded 60 bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 30
+  EE_OUT="$RB_OUT"; EE_RC="$RB_RC"; EE_TO="$RB_TIMED_OUT"
+  assert_eq "$EE_TO" "0" "§30e a registry that cannot be written still EXITS within the bound (no unbounded hot spin)"
+  assert_eq "$EE_RC" "1" "§30e ...and it exits 1 (fail closed) instead of writing without the lock"
+  assert_contains "$EE_OUT" "could not serialise" "§30e ...naming the lock rather than blaming the store"
+  chmod 700 "$LKD" 2>/dev/null || :
+fi
+# (f) the counterpart the ownership-checked release needs: a run that DID take the lock must still free
+# it. `reg_unlock` now removes only a lock whose `pid` is its own, so a wrong comparison (or a release
+# that skips removal) would leave the lock behind on every pull — and the next run would then see a
+# dead-pid lock. Asserted on the run that just reclaimed and pulled.
+if [ -d "$LKD/.registry-sync.lock" ]; then
+  bad "§30f a successful pull RELEASED its lock (a leftover would make the next run wait 2 s for a dead holder)"
+else
+  ok "§30f a successful pull RELEASED its lock (the ownership check still matches our own pid)"
+fi
+case "$(command ls -d "$LKD"/.registry-sync.lock.stale.* 2>/dev/null)" in
+  '') ok "§30f ...and left no .stale.<pid> debris when the claim could delete what it claimed" ;;
+  *) bad "§30f ...left reclaim debris behind: $(command ls -d "$LKD"/.registry-sync.lock.stale.* 2>/dev/null)" ;;
+esac
+
+# ═══ 31. this box's record is NEWER but UNUSABLE — named, not silently kept for ever ══════
+# Review finding P2 on PR #3894: `git grep 'own rail can use' -- scripts/*.test.sh` → no match, and
+# deleting the whole arm left the suite at 137/0 (measured, mutation run). The state it names is a
+# real dead end — `atomic-land.sh` advertises `pull` as the REMEDY for the refusal a newer-but-unusable
+# record causes, and `pull` can never fix it (rule 1 says the newer bytes are not overwritten).
+echo '── §31 a newer-but-UNUSABLE local record is NAMED, and pull is not advertised as its cure'
+mini_fixture unusable
+UN_KEY="$KEY"
+UN_SEED="$MINI_ROOT/seed"; mkdir -p "$UN_SEED"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+  "$HEAD_A" > "$UN_SEED/$UN_KEY.json"
+mini_rs "$UN_SEED" push >/dev/null 2>&1
+UN_BOX="$MINI_ROOT/box"; mkdir -p "$UN_BOX"
+# NEWER stamp, but a head_sha this box's own rail cannot use (not 40 hex) — the shape `read_record`
+# refuses with "carries no usable head_sha".
+printf '{"pr":2374,"head_sha":"not-a-40-hex-sha","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-25T00:00:00Z"}\n' \
+  > "$UN_BOX/$UN_KEY.json"
+UN_BEFORE="$(digest "$UN_BOX")"
+UN_OUT="$(mini_rs "$UN_BOX" pull)"; UN_RC=$?
+assert_eq "$UN_RC" "4" "§31 a newer-but-unusable local record is exit 4, NOT a converged-looking 0"
+assert_contains "$UN_OUT" "NOT one its own rail can use" "§31 ...and the run NAMES the state"
+assert_contains "$UN_OUT" "cannot repair it" "§31 ...and names the REAL remedy instead of pointing at a verb that cannot help"
+assert_eq "$(digest "$UN_BOX")" "$UN_BEFORE" "§31 ...and the newer record is NOT overwritten (rule 1 is not relaxed)"
+assert_not_contains "$UN_OUT" "this box is NEWER" "§31 ...and the run does not report a converged-looking keep"
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
