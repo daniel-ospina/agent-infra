@@ -4338,8 +4338,9 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # `GH_CONFIG_DIR`/`XDG_CONFIG_HOME` — which, in the shape this module resolves (`run_agent`'s own export,
   # so the controller's env carries neither), emits an ACTIVE CLEAR: `; unset GH_CONFIG_DIR XDG_CONFIG_HOME`.
   # Nothing downstream of this function calls `wt_spawn` at all (`grep -n wt_spawn` over `spawn-gate.sh`,
-  # `lane.sh`, `fix-one.sh` and `nonblocking-dispatch.sh` returns two COMMENT lines and no invocation), so
-  # `wt_spawn → lane.sh → run_agent → pi` is the only order that exists and the export cannot travel up it.
+  # `lane.sh`, `fix-one.sh` and `nonblocking-dispatch.sh` returns ONLY COMMENT lines — this paragraph's
+  # own mentions included — and no invocation), so `wt_spawn → lane.sh → run_agent → pi` is the only order
+  # that exists and the export cannot travel up it.
   # ⛔ SO #2509'S FINDING-1 ARM IS UNTOUCHED BY THIS CHANGE: `wt_spawn` REFUSING a `keys.env`-provided
   # `GH_CONFIG_DIR` is `worker-terminal.sh`'s own `_guard` (`:1127-1140` — `gh auth token` with the
   # 93/96/97/98 vocabulary) built from the LAUNCH-TIME environment. That is the opposite arm, on the other

@@ -605,6 +605,18 @@ ck "B9g …because the tree agrees: spawn-gate.sh makes no wt_spawn CALL, and wt
 _gha_flat="$(sed -e 's/^[[:space:]]*#[[:space:]]*//' "$GH_AUTH" | tr '\n' ' ' | tr -s ' ')"
 printf '%s' "$_gha_flat" | grep -q 'launch line reads `GH_CONFIG_DIR`' && rc=1 || rc=0
 ck "B9h …and gh-auth.sh's own export rationale does not repeat the overreach (its chain is run_agent → pi, not wt_spawn)" $rc
+# B12: WHERE THE `EXEMPTION-UNREADABLE` TOKEN ACTUALLY LANDS (review round 11, P3). `README.md` §7.2g said
+# "the refusal line says `EXEMPTION-UNREADABLE`"; at this head the token is printed by the separate
+# `[land-backlog] NOTE` line (three arms, one per credential outcome) and the REFUSAL prints a different
+# sentence. A whole-file grep cannot tell the two producers apart — which is exactly what let the sentence
+# stand — so pin each half where it is produced: the NOTE carries the token, and the refusal carries its
+# own "HELD, not judged non-urgent" clause. Either half changing reddens this rather than silently
+# re-blurring the two lines a reader is told to distinguish.
+_notes="$(grep -c '\[land-backlog\] NOTE .*EXEMPTION-UNREADABLE' "$SG")"
+[ "$_notes" -eq 3 ]; rc=$?
+ck "B12 the EXEMPTION-UNREADABLE token is printed by the three NOTE arms ($_notes), not by the refusal" $rc
+grep -q 'is HELD, not judged non-urgent' "$SG"; rc=$?
+ck "B12b …and the refusal says the exemption was HELD, not that the issue was judged non-urgent" $rc
 # B11: THE THIRD OUTCOME OF THE REFUSAL HAS AN ARM — the state where the lane's gh IS credentialed and the
 # read failed for some other reason (`state=ambient` here). ⛔ MEASURED at 47ec2e2d7 before this arm: deleting
 # that outcome's `printf` entirely (its words, arity kept) left the suite at `passed: 82 failed: 0` — five
