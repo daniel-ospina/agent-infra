@@ -2434,7 +2434,15 @@ LOCKF="$O/.orch.lock"
 # loop, the suites and any future caller cannot form different opinions about who owns this state dir.
 orc_singleton_acquire "$LOCKF"; ORC_SINGLETON_RC=$?
 case "$ORC_SINGLETON_RC" in
-  0) : ;;
+  0)
+    # ⛔ A RECLAIM IS LOGGED (agent-infra#1985's rule, kept across the #2095 rewrite). A silent reclaim is
+    # the other half of the #1715 class: two starters judging the same stale pid, one reclaiming while
+    # the other is still deciding, is invisible unless the pass says which record it displaced and why.
+    # `orc_singleton_acquire` already carries the evidence in `ORC_SINGLETON_WHY` for exactly this use;
+    # only the reclaim arms are logged, because "acquired" on a free path is not news and would bury it.
+    case "${ORC_SINGLETON_WHY:-}" in
+      reclaimed*) echo "[lock] $ORC_SINGLETON_WHY (agent-infra#2095; record $LOCKF)" >> "$LOG" 2>/dev/null || true ;;
+    esac ;;
   *)
     # ⛔ `rc=` IS IN THE LINE ON PURPOSE: it is the only durable record of WHICH refusal this was, and
     # the launchd wrapper propagates that distinction (74 UNJUDGED / 75 HELD) to launchd and to
@@ -2470,6 +2478,7 @@ case "$ORC_SINGLETON_RC" in
     fi
     exit 75 ;;
 esac
+# [orchlock:end]
 # ⛔ THE SIGNAL HANDLERS ONLY TERMINATE — THE LOCK IS RELEASED BY THE `EXIT` TRAP ALONE.
 # Was `trap 'rm -f "$LOCKF"' EXIT INT TERM`, and for INT/TERM a handler that RETURNS does NOT
 # terminate: bash RESUMES the interrupted command loop, so the documented stop path
