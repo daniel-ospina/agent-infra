@@ -836,6 +836,22 @@ ck "B13k …and a hosts.yml symlinked to something that is not mounted is UNREAD
 _sc="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_cause '$SUNREAD' '$TMP/none.env' '$ACCT_EMPTY'")"
 case "$_sc" in *"<unreadable: $SUNREAD/.config/gh>"*) rc=0 ;; *) rc=1 ;; esac
 ck "B13l …and the cause discloses it rather than saying 'no hosts.yml under' a path the operator can see" $rc
+# ⛔ AND THE STORE DIRECTORY ITSELF CAN BE THE UNREACHABLE PART (review round 22, P2): when `$d` is a
+# DANGLING SYMLINK — a store pointed at a volume that is not mounted — or is not a directory this read can
+# SEARCH, every test on `$d/hosts.yml` is false and the helper used to answer `empty`, i.e. "absent", over
+# a store that is there. Both shapes below are constructible at ANY uid (unlike a `chmod` shape), so these
+# arms also run as root.
+DLINK="$TMP/store-dangling"; mkdir -p "$DLINK/.config"; ln -sfn /nonexistent-volume/gh "$DLINK/.config/gh"
+_dl="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$DLINK/.config/gh'")"
+[ "$_dl" = unreadable ]; rc=$?
+ck "B13r …and a store DIRECTORY that is a dangling symlink is UNREADABLE, not empty ('$_dl')" $rc
+_dc="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_cause '$DLINK' '$TMP/none.env' '$ACCT_EMPTY'")"
+case "$_dc" in *"<unreadable: $DLINK/.config/gh>"*) rc=0 ;; *) rc=1 ;; esac
+ck "B13s …and the cause discloses it rather than telling the operator to create a store that exists" $rc
+_FDIR="$TMP/store-as-file"; mkdir -p "$_FDIR/.config"; : > "$_FDIR/.config/gh"
+_ff="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$_FDIR/.config/gh'")"
+[ "$_ff" = unreadable ]; rc=$?
+ck "B13t …and a store path that is a regular FILE is UNREADABLE, not empty ('$_ff')" $rc
 
 # ⛔ READABILITY IS PINNED ON **EVERY** STORE ARM, NOT JUST `home` AND `ambient` (review round 17, P2):
 # flipping the predicate back to `[ -f ]` in the `keys` arm ALONE left the suite green, and on a

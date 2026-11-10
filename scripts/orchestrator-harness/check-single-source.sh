@@ -100,8 +100,8 @@ EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-ga
 # a MISSING copy would surface only as a box-wide refusal with no instrument naming the cause.
 # …`gh-auth.sh` (#2509) is presence-required on the SOURCED half: `spawn-gate.sh` sources it at load
 # time and `run_agent` resolves the lane's gh credential with it. It fails SOFT on purpose (a missing
-# module reports `[gh-auth] UNAVAILABLE` and the lane still starts), which is exactly why the absence
-# must be caught HERE — nothing else would ever say a lane's gh was resolving nothing.
+# module reports `[gh-auth] UNAVAILABLE` and the lane still starts), so this list is the only place the
+# absence is caught BEFORE a lane runs — the runtime line says so in that lane's own log, one lane late.
 # …`harness-provenance.sh` joins the OPERATOR-SURFACE half of this list on the same test as
 # `check-deployed-drift.sh`: nothing on the daemon runs it, and the operator is told to run it from the
 # DEPLOYED tree — `bash ~/orchestrator/harness-provenance.sh show --o ~/orchestrator` is README §4.3's

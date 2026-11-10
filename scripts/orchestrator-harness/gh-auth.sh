@@ -397,7 +397,15 @@ _gh_auth_store_in() {
   # mounted. `-e` follows symlinks and `-L` does not, so the pair catches every dirent; the readable
   # predicate above has already handled the regular-and-readable case.
   if [ -e "$d/hosts.yml" ] || [ -L "$d/hosts.yml" ]; then printf 'unreadable\n'; return 0; fi
-  if [ -d "$d" ] && { [ ! -r "$d" ] || [ ! -x "$d" ]; }; then printf 'unreadable\n'; return 0; fi
+  # ⛔ AND THE DIRECTORY ITSELF CAN BE THE UNREACHABLE PART (review round 22, P2): a `$d` that is a DANGLING
+  # SYMLINK — a store pointed at a volume that is not mounted, the shape this file's own round-17 note names
+  # as realistic — or that sits behind an UNSEARCHABLE ancestor, is neither `-d` nor searchable, so every
+  # test above is false and it answered `empty`: IDENTICAL to a genuinely absent path, after which the cause
+  # said "GH_CONFIG_DIR=… is set but holds no hosts.yml" over a store that IS there and told the operator to
+  # create one. A dirent that exists but is not a directory this read can SEARCH is `unreadable`, not absent.
+  if [ -L "$d" ] || { [ -e "$d" ] && { [ ! -d "$d" ] || [ ! -r "$d" ] || [ ! -x "$d" ]; }; }; then
+    printf 'unreadable\n'; return 0
+  fi
   printf 'empty\n'
 }
 
