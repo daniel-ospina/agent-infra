@@ -438,8 +438,10 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
     [ -f "$pidf" ] && pid="$(command cat "$pidf" 2>/dev/null)"
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
       warn "  ⚠️ reclaiming $LOCKDIR — its holder (pid $pid) is gone (a killed run)."
+      # ⛔ NOT `continue`: the reclaim takes the same iteration budget as a contended attempt, so a
+      # lock that cannot be REMOVED (an EPERM directory) still exhausts the bound instead of
+      # spinning here for ever — a hang on the landing path is the failure this bound exists for.
       rm -rf "$LOCKDIR" 2>/dev/null || :
-      continue
     fi
     sleep 0.1; i=$((i + 1))
   done
