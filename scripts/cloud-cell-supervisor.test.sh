@@ -3008,12 +3008,12 @@ qverb() { # <verb> <repo> <state dir> <or|''> [supervisor args…]
 
 branch_repair_rows() { # <arm label> <case pattern for THIS branch's own clause>
   case "$Q_OUT" in
-    $2) ok "(7$1) the refusal names ITS OWN repair, not the shared default tail" ;;
-    *) bad "(7$1) the refusal does not carry this branch's repair clause — the operator is pointed at a repair this branch never showed: $Q_OUT" ;;
+    $2) ok "(R$1) the refusal names ITS OWN repair, not the shared default tail" ;;
+    *) bad "(R$1) the refusal does not carry this branch's repair clause — the operator is pointed at a repair this branch never showed: $Q_OUT" ;;
   esac
   case "$Q_OUT" in
-    *"with the ONE-LINE FIX above"*) bad "(7$1) the refusal points at 'the ONE-LINE FIX above', which this branch NEVER PRINTS — the operator's next step is a line that does not exist" ;;
-    *) ok "(7$1) …and it does NOT point at a ONE-LINE FIX this branch never printed" ;;
+    *"with the ONE-LINE FIX above"*) bad "(R$1) the refusal points at 'the ONE-LINE FIX above', which this branch NEVER PRINTS — the operator's next step is a line that does not exist" ;;
+    *) ok "(R$1) …and it does NOT point at a ONE-LINE FIX this branch never printed" ;;
   esac
 }
 
@@ -3120,10 +3120,13 @@ esac
   && ok "stop: the stop generation was bumped (an in-flight start is fenced, as before)" \
   || bad "stop did not bump the generation on a matched pair (got '$(sgen "$S3")')"
 #  (3b) mismatched pair but NOTHING RUNNING -> stop answers. This fixture is an EMPTY state dir (no
-#  `.desired`, no session, no doctor loop, no controller pid) — a cell with NONE of those legs loses
-#  nothing, and `stop` is the verb an operator reaches for on a box that is wrong (the same doctrine
-#  `status` and orchestrator-bringup.sh's stop already carry). ⛔ A cell that is already DOWN but still
-#  carries `.desired` is NOT this fixture: the marker is the first leg, so that one refuses and needs
+#  `.desired`, no session, no doctor loop, no controller pid, and no process carrying `O=<this state
+#  dir>` from anywhere) — a cell with NONE of those five legs loses nothing, and `stop` is the verb an
+#  operator reaches for on a box that is wrong (the same doctrine `status` and orchestrator-bringup.sh's
+#  stop already carry). The sixth condition, a process table that cannot be read, is also absent here
+#  (the read succeeds on this host), so this fixture is exactly "nothing to end". ⛔ A cell that is
+#  already DOWN but still carries `.desired` is NOT this fixture: the marker is the first leg, so that
+#  one refuses and needs
 #  `--force` (see the comment above `stop_would_end_something`).
 S4="$Q/st2093-idle"; rm -rf "$S4"; mkdir -p "$S4/o"
 qverb stop "$Q/agent-repo" "$S4" daniel-ospina/tortoise
@@ -3303,60 +3306,60 @@ branch_repair_rows e '*Set REPO to a checkout of the repo this cell should work*
 # `resolve_queue_target` — so it is not pinned here rather than pinned vacuously.
 # (the helper itself is defined above arm (1), because arm (6) grades a `$2` site too)
 
-# (7a) `invalid` — OR is not `<owner>/<repo>`. Its clause reuses the SAME `$onefix_cmd` inline (one
+# (Ra) `invalid` — OR is not `<owner>/<repo>`. Its clause reuses the SAME `$onefix_cmd` inline (one
 # command, one place) instead of naming a fix above.
 S8="$Q/st2093-invalid"; rm -rf "$S8"; mkdir -p "$S8"; seed_started_cell "$S8" \
-  || bad "fixture (7a): could not seed a started-cell state dir"
+  || bad "fixture (Ra): could not seed a started-cell state dir"
 qverb stop "$Q/tortoise-repo" "$S8" tortoise
-[ "$Q_RC" -ne 0 ] && ok "(7a) stop: refuses a malformed OR (the branch is reached, so the rows below grade it)" \
-                  || bad "(7a) stop proceeded on a malformed OR — the branch is unreached and the rows below prove nothing: $Q_OUT"
+[ "$Q_RC" -ne 0 ] && ok "(Ra) stop: refuses a malformed OR (the branch is reached, so the rows below grade it)" \
+                  || bad "(Ra) stop proceeded on a malformed OR — the branch is unreached and the rows below prove nothing: $Q_OUT"
 branch_repair_rows a "*Fix OR to name an <owner>/<repo>*"
 
-# (7b) `unreadable` — the checkout has no origin remote. This is the branch where the generic advice is
+# (Rb) `unreadable` — the checkout has no origin remote. This is the branch where the generic advice is
 # actively WRONG: there is no OR line to delete (none was read), so the clause must say so.
 S9="$Q/st2093-unreadable"; rm -rf "$S9"; mkdir -p "$S9"; seed_started_cell "$S9" \
-  || bad "fixture (7b): could not seed a started-cell state dir"
+  || bad "fixture (Rb): could not seed a started-cell state dir"
 qverb stop "$Q/no-origin-repo" "$S9" ''
-[ "$Q_RC" -ne 0 ] && ok "(7b) stop: refuses a checkout whose origin cannot be read (the branch is reached)" \
-                  || bad "(7b) stop proceeded on an unreadable queue — the branch is unreached: $Q_OUT"
+[ "$Q_RC" -ne 0 ] && ok "(Rb) stop: refuses a checkout whose origin cannot be read (the branch is reached)" \
+                  || bad "(Rb) stop proceeded on an unreadable queue — the branch is unreached: $Q_OUT"
 branch_repair_rows b '*readable '\''origin'\'' remote*'
 
-# (7c) `underivable` — the origin exists but is not a URL form this parser accepts. Its clause names
+# (Rc) `underivable` — the origin exists but is not a URL form this parser accepts. Its clause names
 # the `remote set-url` repair, and says deleting OR does NOT help (the queue is derived first).
 S10="$Q/st2093-underivable"; rm -rf "$S10"; mkdir -p "$S10"; seed_started_cell "$S10" \
-  || bad "fixture (7c): could not seed a started-cell state dir"
+  || bad "fixture (Rc): could not seed a started-cell state dir"
 rm -rf "$Q/underivable-repo"; ai_init_repo "$Q/underivable-repo" \
-  || bad "fixture (7c): cannot git init the underivable fixture"
+  || bad "fixture (Rc): cannot git init the underivable fixture"
 git -C "$Q/underivable-repo" remote set-url origin file://localhost/daniel-ospina/tortoise.git \
-  || bad "fixture (7c): cannot set the underivable origin"
+  || bad "fixture (Rc): cannot set the underivable origin"
 qverb stop "$Q/underivable-repo" "$S10" ''
-[ "$Q_RC" -ne 0 ] && ok "(7c) stop: refuses an underivable origin (the branch is reached)" \
-                  || bad "(7c) stop proceeded on an underivable origin — the branch is unreached: $Q_OUT"
+[ "$Q_RC" -ne 0 ] && ok "(Rc) stop: refuses an underivable origin (the branch is reached)" \
+                  || bad "(Rc) stop proceeded on an underivable origin — the branch is unreached: $Q_OUT"
 branch_repair_rows c '*at a URL in one of those forms*'
 
-# (7d) the SECOND `assert_repo` die — a DERIVED checkout whose path carries a shell metacharacter.
+# (Rd) the SECOND `assert_repo` die — a DERIVED checkout whose path carries a shell metacharacter.
 # `cmd_stop` validates no `$REPO` of its own, so the derivation is the path that reaches it: `REPO` is
 # unset, exactly one candidate matches the declared OR, and its path has a space (a quote, backtick or
 # `$` would do as well — `safe_argv` refuses all of them). The clause must name a REPAIRABLE action;
 # the shared default would send the operator to a ONE-LINE FIX about `OR` for a broken `REPO`.
 S11="$Q/st2093-badpath"; rm -rf "$S11"; mkdir -p "$S11"; seed_started_cell "$S11" \
-  || bad "fixture (7d): could not seed a started-cell state dir"
+  || bad "fixture (Rd): could not seed a started-cell state dir"
 rm -rf "$Q/badhome"; mkdir -p "$Q/badhome"
 Q_BADREPO="$Q/bad repo"; rm -rf "$Q_BADREPO"; ai_init_repo "$Q_BADREPO" \
-  || bad "fixture (7d): cannot git init the metacharacter fixture"
+  || bad "fixture (Rd): cannot git init the metacharacter fixture"
 git -C "$Q_BADREPO" remote set-url origin https://github.com/daniel-ospina/badpath-2093.git \
-  || bad "fixture (7d): cannot set the fixture origin"
+  || bad "fixture (Rd): cannot set the fixture origin"
 Q_OUT=''; Q_RC=0
 Q_OUT="$(env -u REPO Q_STATE="$S11" PATH="$Q/bin:$PATH" CELL_HOME="$Q/badhome" \
          ENV_FILE="$Q/keys.env" SESSION="ai2093bp-$$" O="$S11/o" WORKDIR="$Q_BADREPO" \
          OR=daniel-ospina/badpath-2093 HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
          HARNESS_REF="$Q_REF" bash "$SUP" stop 2>&1)"; Q_RC=$?
-[ "$Q_RC" -ne 0 ] && ok "(7d) stop: refuses a derived checkout whose path carries a metacharacter (the branch is reached)" \
-                  || bad "(7d) stop proceeded with a metacharacter in \$REPO — the branch is unreached: $Q_OUT"
+[ "$Q_RC" -ne 0 ] && ok "(Rd) stop: refuses a derived checkout whose path carries a metacharacter (the branch is reached)" \
+                  || bad "(Rd) stop proceeded with a metacharacter in \$REPO — the branch is unreached: $Q_OUT"
 branch_repair_rows d '*Set REPO to a checkout path with no quote or shell metacharacter*'
 
 # (7e) moved: the FIRST `assert_repo` die (no derivable checkout) is driven by arm (6) above, and its
-# own-clause/absence rows sit there — after arm (7d) `$Q_OUT` carries (7d)'s output, not (6)'s.
+# own-clause/absence rows sit there — after arm (Rd) `$Q_OUT` carries (Rd)'s output, not (6)'s.
 
 # ── (l) one owner per controller (agent-infra#1761) ───────────────────────────────────────────────
 # The cell's controller answer must come from the harness's own AUTHORITY (the pid $O/.orch.lock

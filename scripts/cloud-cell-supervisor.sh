@@ -1786,7 +1786,7 @@ assert_queue_target() {
       # the generic tail would say "with the fix above" over a fix that was never printed (review P3).
       # The clause reuses the SAME `$onefix_cmd` (deleting OR does repair this state: the queue then
       # follows the checkout) rather than restating the sed — one command, one place.
-      die "OR='$QUEUE_DECLARED' is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise) — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Fix OR to name an <owner>/<repo>, or let the queue follow the checkout with: $onefix_cmd")}"
+      die "OR='$QUEUE_DECLARED' is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise) — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Fix OR to name an <owner>/<repo>, or let the queue follow the checkout with: $onefix_cmd (that sed edits $ENV_FILE, so drop an ambient OR export yourself if that is where yours is set)")}"
       ;;
     unreadable)
       die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Give $REPO a readable 'origin' remote — clone the repo, or point REPO at a checkout of it, because the queue is READ from that remote (deleting OR does NOT help here)")}"
@@ -4377,7 +4377,11 @@ stop_would_end_something() {
   local p leak
   [ -f "$ROLES_DIR/.desired" ] && return 0        # the marker `stop` removes FIRST
   tmux has-session -t "$SESSION" 2>/dev/null && session_names_own_state_dir "$SESSION" && return 0
-  sup_loop_alive && return 0                       # doctor loop, or its in-flight restart child
+  # Doctor loop. ⛔ NOT its restart child: `sup_loop_alive` reads loop.pid/loop.ident only, and the
+  # restart record (`$ROLES_DIR/restart.ident`) is read by the teardown far below, not here. That child
+  # is still covered by leg 1 — the doctor launches a restart ONLY for a STARTED cell, which by
+  # definition carries `.desired` — so naming it in this leg would describe a read this leg never makes.
+  sup_loop_alive && return 0
   p="$(owned_controller_pids 2>/dev/null)" || return 0   # unreadable table: assume yes
   [ -n "$p" ] && return 0
   # ⛔ THE REAP IS AN IRREVERSIBLE ACT, AND ITS TARGETS ARE INVISIBLE TO EVERY READ ABOVE (review P2).

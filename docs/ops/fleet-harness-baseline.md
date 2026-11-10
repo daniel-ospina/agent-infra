@@ -312,9 +312,13 @@ SUP=$SNAP/scripts/cloud-cell-supervisor.sh
 #    step. ⛔ WHICH refusal depends on the snapshot you are running, and this recipe names a PRE-#2093
 #    one on purpose: `bed278f4` predates the fix, so its `check` prints the #1901 wording ("the QUEUE
 #    and the CHECKOUT name DIFFERENT repos: …") with no `MERGE-INERT` label and no one-line fix. The
-#    `MERGE-INERT` label and the copy-pasteable repair appear on a snapshot that INCLUDES #2093 — i.e.
-#    on the re-run in step 3, after step 4 has moved the pin. Expecting a token the box cannot print is
-#    how an operator reads "fix absent" as "nothing to fix".
+#    `MERGE-INERT` label and the copy-pasteable repair exist only on a snapshot that INCLUDES #2093, and
+#    THIS RECIPE RUNS `bed278f4` THROUGHOUT — steps 1, 3 and 4 all invoke the same `$SUP`, and nothing
+#    below reassigns `SNAP` — so against `bed278f4` expect the #1901 wording at step 1 AND to have to
+#    read the repair out of §2 rather than copy it from the refusal. (Point `SNAP` at a version that
+#    carries the fix and step 1 prints the label and the `sed` instead; nothing else in the recipe
+#    changes.) Expecting a token the box cannot print is how an operator reads "fix absent" as "nothing
+#    to fix".
 bash $SUP check
 
 # 2. REPAIR the pair — pick ONE. On a post-#2093 snapshot the refusal PRINTS (a) with the values filled in, and
