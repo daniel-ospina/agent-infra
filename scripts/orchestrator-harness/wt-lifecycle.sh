@@ -854,7 +854,15 @@ wt_cwd_rows() {
     if command -v "${WT_LSOF:-lsof}" >/dev/null 2>&1; then
         saw=1
         wt_run_bounded "$WT_PROBE_SECONDS" "$raw" "${WT_LSOF:-lsof}" -nP -d cwd -Fpn; rc=$?
-        if [ "$rc" = 124 ]; then rm -f "$raw" "$out" "$bad"; return 2; fi
+        # ⛔ NO `rc = 124` ARM HERE, AND THAT IS A REMOVAL RATHER THAN AN OVERSIGHT (#2744 review,
+        # finding 2, VERIFIED against the shipped code). On a lsof timeout `wt_run_bounded` ALREADY
+        # deleted `$raw`, so `[ -s "$raw" ]` and the awk below are no-ops, `$out` is empty (the /proc
+        # arm either never ran or reset it), and the flow reaches the single `[ "$saw" = 1 ]` arm at the
+        # bottom of this function, which removes the same files and returns the same 2. The explicit
+        # check returned the identical code with the identical cleanup, so no fixture and no verdict
+        # could ever distinguish it — an inert branch is worse than no branch, because a reader counts
+        # it as a guard. The `saw` arm is now the ONE place "a witness ran and produced nothing usable"
+        # is decided, for both arms.
         [ -s "$raw" ] && awk '/^p/ { p = substr($0, 2); next }
              /^n/ { t = substr($0, 2); if (p ~ /^[0-9]+$/ && t ~ /^\//) printf "%s\t%s\n", p, t }' \
             "$raw" >>"$out" 2>/dev/null
@@ -990,7 +998,11 @@ wt_reap_if_empty() {
     elif [ "$holder_rc" != 1 ]; then
         # rc 2: a witness ran and produced nothing usable. Fail-closed, and say WHICH probes could be
         # at fault — an operator reading a refused reap needs the arm, not a generic phrase.
-        WT_RESULT="the live-holder probe could not be evaluated (an argv probe failed, or the cwd census produced nothing usable — unparsable, quoted, or timed out) — kept (fail-closed)$degraded"
+        # ⛔ `$degraded` IS DELIBERATELY NOT APPENDED (and it is provably empty here anyway): it is set
+        # only inside the `holder_rc = 3` arm above, which RETURNS. Appending it implied the disclosure
+        # rides the fail-closed verdict, which it never can — a fail-closed veto needs no disclosure
+        # about a witness it refused to trust.
+        WT_RESULT="the live-holder probe could not be evaluated (an argv probe failed, or the cwd census produced nothing usable — unparsable, quoted, or timed out) — kept (fail-closed)"
         return 1
     fi
 

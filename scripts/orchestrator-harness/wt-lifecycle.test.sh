@@ -577,14 +577,23 @@ assert_branch "$REPO" feat/21-tm "L5h …and so does its branch"
 # ⛔ THE DEFECT (P2 MEASURED). `wt_run_bounded` DELETES the partial table on timeout, so an unchecked
 # rc read exactly like a successful scan that found nobody: measured rc 3 ("unavailable") and the
 # checkout was deleted while its holder was alive. A probe that never finished decided a deletion.
+# ⛔ AND THE lsof ARM MUST BE ABLE TO ANSWER, OR THIS ARM IS A SECOND ROUTE TO L5h (agent-infra#3442
+# rule 2 — a finding a fresh reviewer measured: with `WT_LSOF=/nonexistent-lsof` the fall-through
+# reaches the `saw` arm and returns the SAME 2 with the SAME verdict, so deleting the timeout check
+# left all three assertions GREEN). The fake lsof below answers with a valid table naming a path that
+# is NOT this checkout: now the timeout check is the ONLY thing between preserve and reap, so
+#   shipped -> wt_cwd_rows rc=2 (fail-closed veto) -> rc=1, checkout kept
+#   mutant  -> the lsof arm decides         -> rc=0 reaped, and `rc=1` + `assert_dir` both go RED
 ENV=L5i; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"; WTP="$REPO/.worktrees/tm-22"
-SLOWLS="$T/$ENV/slow-ls"
+SLOWLS="$T/$ENV/slow-ls"; FAKELSOF="$T/$ENV/fake-lsof"
 in_wt "wt_provision '$REPO' .worktrees/tm-22 feat/22-tm origin/main" "$REPO" >/dev/null
 mkdir -p "$FAKE/4242" "$FAKE/self"
 ln -sfn "$WTP" "$FAKE/4242/cwd"
 ln -sfn "$FAKE" "$FAKE/self/cwd"
 printf '#!/bin/sh\nsleep 5\nexec /bin/ls "$@"\n' >"$SLOWLS"; chmod +x "$SLOWLS"
-OUT="$(in_wt "WT_PROC_ROOT='$FAKE' WT_LS='$SLOWLS' WT_LSOF=/nonexistent-lsof WT_PROBE_SECONDS=1; wt_reap_if_empty '$REPO' '$WTP' feat/22-tm 'lane 22'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+# A census that RUNS and SUCCEEDS, and names somebody else's tree — never this checkout.
+printf '#!/bin/sh\nprintf "p4242\\nn/somewhere/else\\n"\n' >"$FAKELSOF"; chmod +x "$FAKELSOF"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE' WT_LS='$SLOWLS' WT_LSOF='$FAKELSOF' WT_PROBE_SECONDS=1; wt_reap_if_empty '$REPO' '$WTP' feat/22-tm 'lane 22'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
 assert_contains "$OUT" "rc=1" "L5i a census the watchdog killed PRESERVES the checkout"
 assert_contains "$OUT" "could not be evaluated" "L5i …and says the probe could not be evaluated"
 assert_dir "$WTP" "L5i the live checkout survives a timed-out census (#2744 review)"
