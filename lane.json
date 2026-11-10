@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "exit_code": null,
+  "heartbeat_at": 1794350545,
+  "host": "cmux",
+  "issue": 3913,
+  "kind": "reviewer",
+  "lane_id": "cmux.kreviewer-3913-1794350545-p2688451-863921c7",
+  "lease_until": 1794351150,
+  "pid": 2688451,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794350545,
+  "state": "RUNNING",
+  "tag": "3913",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-2744"
+}
