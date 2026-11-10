@@ -89,9 +89,12 @@ _valid_max_age() {
     [ "$HEARTBEAT_CHECK_MAX_AGE" -gt 0 ]
 }
 
-# Prefer the FARMED copy: that is what a launched loop must run in production (the farm is the
-# deployed layout, and a launcher pinned to a checkout dies when a worktree is reaped). Fall back to
-# this script's sibling so the launch path works from a plain checkout before a farm lands.
+# ⛔ THIS PREFERENCE IS DORMANT TODAY, and the comment must not say otherwise. `heartbeat-loop.sh` is
+# NOT farmed: `pi-bootstrap/setup.sh` withholds it from `fleet_srcs` and the array that would carry it
+# (`lane_root_srcs`) is #1553 and does not exist yet. So `$PI_AGENT_DIR/scripts/heartbeat-loop.sh` is
+# normally ABSENT, the sibling below is the copy that actually runs, and a box driven entirely from
+# `$HOME/.pi/agent` has neither. The order is still right for the day the farm catches up (a launcher
+# pinned to a checkout dies when a worktree is reaped), and the fallback is what makes it work now.
 LOOP="$PI_AGENT_DIR/scripts/heartbeat-loop.sh"
 [ -f "$LOOP" ] || LOOP="$SELF_DIR/heartbeat-loop.sh"
 

@@ -3668,6 +3668,16 @@ def cmd_darwin(mode):
         bad = [line for line in text.splitlines() if any(m in line for m in JOB_MARKERS)]
         for line in bad:
             print("  FAIL   %s" % line.strip(), file=sys.stderr)
+        # ⛔ AND A DISCLOSURE IS NOT AN "IN SYNC" (#1867 review, round 11). One row class is
+        # deliberately NOT a failure — `⚠️ INSTALLED-SKIPPED`: a job installed here whose template the
+        # installer would now SKIP (a placeholder stopped resolving, e.g. SWARM_ROOT unset). An install
+        # cannot clear it while the environment stays as it is, so making it a hard failure would
+        # re-create the permanent red round 10 removed. But the copy on disk is NOT what the template
+        # describes and will never be refreshed — so the verdict must not say the job set MATCHES.
+        # MEASURED pre-fix with a delegate emitting that row plus one `in sync` job: rc 0 and
+        # `SCHEDULE VERIFIED — launchd job set matches templates/launchd`, a claim about content
+        # agreement that nothing in this scan had checked.
+        skipped = [line for line in text.splitlines() if "⚠️ INSTALLED-SKIPPED" in line]
         # ⛔ THE DELEGATE'S EXIT STATUS IS THE SECOND HALF OF THE GATE, not an implementation
         # detail: the substring scan catches only three wordings, so any OTHER failure of
         # install-launchd.sh --status (a missing template dir, an unset HOME, a syntax death)
@@ -3678,6 +3688,19 @@ def cmd_darwin(mode):
                 "launchd job set did not report a clean status" % out.returncode,
                 file=sys.stderr,
             )
+        if skipped and not bad and out.returncode == 0:
+            for line in skipped:
+                print("  CAVEAT %s" % line.strip(), file=sys.stderr)
+            print(
+                "SCHEDULE VERIFIED WITH CAVEATS — every job that is counted here is in sync with "
+                "templates/launchd, but %d installed job(s) are SKIPPED by their template now "
+                "(the placeholder stopped resolving on this box): they are neither refreshed nor "
+                "removed, so the copies on disk are not what their templates describe. Restore the "
+                "environment and re-install to refresh them, or --uninstall to remove them."
+                % len(skipped),
+                file=sys.stderr,
+            )
+            return 0
         if bad or out.returncode != 0:
             print(
                 "SCHEDULE NOT VERIFIED — %d launchd job(s) not installed/loaded/in sync/declared "

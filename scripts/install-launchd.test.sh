@@ -3384,6 +3384,11 @@ set -e
 assert_eq "$RC" "0" "§18c2 an INSTALLED job that stops qualifying is NOT a permanent red (rc 0)"
 assert_contains "$OUT" "com.eldato.corruption-canary: INSTALLED, but SKIPPED now" \
     "§18c2 ... it is named as installed-and-skipped, not silently clean"
+# ⛔ AND IT CARRIES A MARKER, NOT JUST PROSE (#1867 review, round 11). The only consumer that gates on
+# this verb — `fleet-schedule.py --verify` — counts MARKERS, so a row of plain words reached it as no
+# row at all and its verdict said the job set MATCHES while this copy is provably stale.
+assert_contains "$OUT" "⚠️ INSTALLED-SKIPPED   com.eldato.corruption-canary" \
+    "§18c2 ... with the ⚠️ INSTALLED-SKIPPED marker the verdict consumer counts"
 assert_not_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (DRIFTED" \
     "§18c2 ... and NOT as DRIFTED with a 're-run installer' remedy that cannot clear it"
 rm -f "$SWARM_INSTALL_HOME/Library/LaunchAgents/com.eldato.corruption-canary.plist"

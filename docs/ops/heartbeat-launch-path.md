@@ -53,11 +53,19 @@ activity**. That is the false PASS this change exists to make impossible.
 ⛔ **WHICH COPY THE OPERATOR RUNS.** `scripts/heartbeat-launch.sh` is **not** in
 `pi-bootstrap/setup.sh`'s farm set, so the launcher you invoke is the **checkout-relative** one
 (`bash <checkout>/scripts/heartbeat-launch.sh start`) — that is the versioned entry point, and it is
-what this doc's table means everywhere else. The **loop** exists in two places: the same checkout
-(`<checkout>/scripts/heartbeat-loop.sh`) and the farmed copy at
-`$HOME/.pi/agent/scripts/heartbeat-loop.sh`. The launcher prefers the farmed loop when it is there,
-so a box driven entirely from `$HOME/.pi/agent` has the loop and **not** the launcher; whatever
-starts it must therefore name a checkout (`#1553` owns whether the loop should keep two homes).
+what this doc's table means everywhere else.
+
+⛔ **AND NEITHER IS THE LOOP — it has never been farmed either.** `heartbeat-loop.sh` is one of the
+two files `pi-bootstrap/setup.sh` **deliberately withholds**: it is absent from `fleet_srcs`, and the
+array meant to carry it (`lane_root_srcs`) is #1553 and **does not exist yet** (measured:
+`grep -c heartbeat` over `fleet_srcs` → 0; `rg 'lane_root_srcs='` → only the comment naming it). So
+the launcher's **farmed-copy preference is dormant**, the checkout sibling is the copy that actually
+runs today, and a box driven entirely from `$HOME/.pi/agent` has **neither** the loop nor the
+launcher and cannot launch anything. This paragraph used to assert the reverse — that the farm
+places the loop, so such a box "has the loop" — which is the same false-delivery claim corrected one
+file over in `templates/launchd/LAUNCHD-INCOMPATIBLE`; the fix is to state the farm as it is, since
+the farm is what an operator checks to decide which copy is live. `#1553` owns whether the loop
+should keep two homes at all.
 
 `check` answers the question a content comparison cannot: **is the scheduled thing live *and fed*?**
 
@@ -171,6 +179,24 @@ section intro too, so three undeclared jobs and one both read as `1`. A run that
 the classes that arrived with this change (`UNMANAGED`, `RETIRED-INSTALLED`, `UNKNOWN`) prints
 `SCHEDULE NOT VERIFIED — N launchd job(s) …` with a truthful N instead of `0`, and the delegate's own
 exit code now agrees with those rows (`--status` is non-zero whenever any job row is a failure).
+
+⛔ **One marker is counted for the SENTENCE, not the exit code: `⚠️ INSTALLED-SKIPPED`.** A job that is
+installed here but whose template the installer would now SKIP — a placeholder stopped resolving, e.g.
+`SWARM_ROOT` unset in this shell — is a stale copy that will never be refreshed. It is **not** a
+failure, because nothing an install does can clear it while the environment stays as it is, and a
+permanent red is the defect this whole section exists to avoid. So `--status` keeps rc 0, and
+`--verify` prints `SCHEDULE VERIFIED WITH CAVEATS — … %d installed job(s) are SKIPPED by their template
+now …`, naming them, instead of asserting that the job set **matches** `templates/launchd`. That
+sentence used to be the plain `matches` verdict: the row was prose, the marker scan could not see it,
+and the one answer an operator reads to "is my scheduled layer in sync?" was false about the box.
+
+`--status` has a second rc-0 verdict class, `NOT APPLICABLE`: the template is **absent** and the
+installer would skip it, so its absence is not a failure. The two are the same predicate, split by
+whether a copy exists — `NOT APPLICABLE` (nothing installed, rc 0), `⚠️ INSTALLED-SKIPPED` (a copy is
+installed, rc 0, named in `--verify`'s sentence). Before this the predicate was tested only in the
+absent branch, so a job that had been installed while the placeholder still resolved fell through to
+the drift comparison and was reported `DRIFTED` — with a "re-run the installer" remedy the installer
+itself would not carry out, i.e. a red no command could clear.
 
 ## ⛔ What is NOT the fix
 

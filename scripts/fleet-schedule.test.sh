@@ -1164,6 +1164,51 @@ out="$(darwin_run --verify)"; rc=$?
 grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
   && ok "an UNKNOWN-only failure is COUNTED too (the enumeration answer is a failure, not a caveat)" \
   || bad "an UNKNOWN-only failure printed a 0-job verdict: $out"
+# ⛔ AN INSTALLED-BUT-SKIPPED JOB IS A CAVEAT, NOT A MATCH (#1867 review, round 11). `--status` reports
+# a job installed here whose template the installer would now SKIP (a placeholder stopped resolving) as
+# `⚠️ INSTALLED-SKIPPED`, deliberately rc 0: an install cannot clear it while the environment stays as
+# it is, so a hard failure would re-create the permanent red round 10 removed. But the copy on disk is
+# NOT what its template describes and will never be refreshed — so the verdict must not claim they
+# MATCH. MEASURED pre-fix (delegate: this row + one `in sync` job): rc 0 and
+# `SCHEDULE VERIFIED — launchd job set matches templates/launchd`, a content claim nothing had checked.
+# The assertion is on the WHOLE plain verdict, not on a phrase inside it: the narrowed sentence also
+# mentions templates/launchd, so a substring grep cannot tell "says they match" from "says what it
+# checked" — the first version of this row failed on its own fix for exactly that reason.
+PLAIN_VERDICT='SCHEDULE VERIFIED — launchd job set matches templates/launchd'
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⚠️ INSTALLED-SKIPPED   com.eldato.corruption-canary: INSTALLED, but SKIPPED now (needs {{SWARM_ROOT}}, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)" >&2
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -qF "$PLAIN_VERDICT" <<<"$out" \
+  && bad "it certified that the job set MATCHES while an installed job is SKIPPED by its template: $out" \
+  || ok "an INSTALLED-SKIPPED row stops the verdict claiming the job set matches"
+grep -q 'SCHEDULE VERIFIED WITH CAVEATS' <<<"$out" \
+  && ok "...the verdict is narrowed to what was actually checked, and names 1 job" \
+  || bad "no narrowed verdict for the skipped-but-installed class: $out"
+grep -q 'CAVEAT.*corruption-canary' <<<"$out" \
+  && ok "...naming the job, so the operator can act" \
+  || bad "the narrowed verdict did not name the job: $out"
+[ "$rc" -eq 0 ] && ok "...and it is NOT a failure code (an install cannot clear it; a permanent red is the round-10 defect)" \
+  || bad "the skipped-but-installed class returned $rc — that is the permanent red round 10 removed"
+# The CONTROL: the same delegate without that row must still print the plain MATCH verdict, so the arm
+# above cannot pass by a verdict that never claims a match.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -qF "$PLAIN_VERDICT" <<<"$out" \
+  && ok "control: a fully in-sync delegate still gets the plain MATCH verdict (rc=0)" \
+  || bad "the control lost the plain verdict: $out"
+[ "$rc" -eq 0 ] && ok "control: ...and rc 0" || bad "the control returned $rc"
 
 
 # ── 11. a Label is a PATH COMPONENT, so it is validated before it is used as one ─────────────

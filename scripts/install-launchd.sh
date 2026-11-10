@@ -61,7 +61,11 @@
 # could NOT be answered (the installed set, or the declared set, could not be read: UNKNOWN, never a
 # pass — #1867 review P2). A template the installer would SKIP for an unset placeholder prints
 # `NOT APPLICABLE` and is NOT a failure: a Mac with no tortoise checkout is a legitimate box, not a
-# broken one. `2` is ALSO the global usage code; see the second Exit-codes line below the env list.
+# broken one. If such a template is ALREADY INSTALLED it prints `⚠️ INSTALLED-SKIPPED` instead (rc 0
+# as well): the copy on disk is stale — no install will refresh it while the placeholder stays
+# unresolved — but it usually still runs, so it is a disclosure, not a failure. That marker is counted
+# by `scripts/fleet-schedule.py --verify` to narrow its verdict; it never makes this verb exit non-zero.
+# `2` is ALSO the global usage code; see the second Exit-codes line below the env list.
 #
 # Usage:
 #   install-launchd.sh               install/refresh all templates (idempotent)
@@ -1662,7 +1666,17 @@ status_job() {
             # rc 0 because the box did not break: it stopped qualifying, which is the documented
             # SKIP arm of the install path. The row is the disclosure; the exit code is not the place
             # to keep a red that no install can clear.
-            echo "  $label: INSTALLED, but SKIPPED now (needs$unset_ph, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)"
+            # ⛔ AND THE ROW NEEDS A MARKER, NOT JUST WORDS (#1867 review, round 11). The ONLY
+            # consumer that gates on this verb is `scripts/fleet-schedule.py --verify`, and it decides
+            # its sentence by COUNTING MARKERS — so a row of plain prose reached it as no row at all
+            # and the verdict said `SCHEDULE VERIFIED — launchd job set matches templates/launchd` over
+            # a box whose installed copy is provably not what the template describes. MEASURED with a
+            # delegate emitting this row plus one `in sync` job: rc 0, `SCHEDULE VERIFIED … matches`.
+            # The state is NOT disarmed on purpose: unlike the TCC arm, the plist on disk still holds
+            # the value it was installed with, so it usually still WORKS — removing it because a
+            # shell forgot a variable would break a healthy job. It is a disclosure, so the marker is
+            # counted for the VERDICT SENTENCE, never for the exit code.
+            echo "  ⚠️ INSTALLED-SKIPPED   $label: INSTALLED, but SKIPPED now (needs$unset_ph, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)"
             return 0
         fi
         echo "  $label: NOT APPLICABLE (needs$unset_ph, unset on this box — the installer SKIPs it)"
