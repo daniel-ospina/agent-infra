@@ -406,7 +406,10 @@ ck "every trap registration's SIGNAL LIST is readable (an unparseable one is UNK
 # review of #3865 at 062ff3ca, P3 — MEASURED: `release_lock() { rm -f "$LOCKF"; }; trap 'release_lock'
 # INT` is dropped by every `grep … LOCKF` above, so trap_pin answered GREEN while a RETURNING INT handler
 # deleted the lock and left the loop alive — the exact regression #1715 is named after). The subject's own
-# handlers TERMINATE (`trap 'exit 143' TERM`, `trap 'exit 130' INT`, orch-loop.sh:2592-2593), so assert it
+# handlers TERMINATE (`trap 'exit 143' TERM`, `trap 'exit 130' INT` — `orch-loop.sh` ~2603-2604, cited by
+# CONTENT rather than by line: a hard-coded number here had already drifted to the comment that
+# documents the forbidden `EXIT INT TERM` form, and a pin's own citation must not be a second thing to
+# maintain), so assert it
 # over every registration whose signal list carries INT or TERM, wherever the command word lives.
 _BAD_TERM="$(printf '%s\n' "$ALL_TRAPS" | awk -F' :: ' '
   { if ($1 == "UNKNOWN") { print; next }
