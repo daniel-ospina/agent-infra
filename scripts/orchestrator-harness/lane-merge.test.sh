@@ -1564,6 +1564,31 @@ WAIT_S=5400 POLL_S=5 LANE_BOUND_WALL_S=3600 LANE_MERGE_ELAPSED_S=3000 run 39 --r
 _cap39="$(sed -n 's/.*CAPPED at \([0-9][0-9]*\)s (this lane had already spent.*/\1/p' <<<"$OUT" | head -1)"
 ck "LANE_BOUND_WALL_S=3600 (the documented CEILING REDUCER) is the clock the wait is clamped against, not the 7200 s caller bound — the WALL clamp reads ${_cap39:-?}s, and cap + 3000 spent + 10 margin = $(( ${_cap39:-0} + 3010 )) = the armed wall" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 39 | cut -d' ' -f1)" = WAITING_CHECKS ] && [ -n "${_cap39:-}" ] && [ $(( ${_cap39:-0} + 3010 )) = 3600 ] && echo 0 || echo 1)
+# ⛔ AND THE LINE NAMES THE KNOB THAT PRODUCED THE NUMBER (P3, verified by running it): once `LANE_WALL_S`
+# can come from `LANE_BOUND_WALL_S`, a message hard-coding "LANE_TIMEOUT=<n>" tells an operator to change a
+# variable that was never set — on the one line whose whole job is to name the operand. Same arm, same run,
+# so this costs no extra invocation: the WALL clamp must attribute the 3600 s to `LANE_BOUND_WALL_S`, and
+# must NOT still call it `LANE_TIMEOUT`.
+ck "the WALL clamp ATTRIBUTES its 3600 s to LANE_BOUND_WALL_S (the knob that armed it) instead of hard-coding 'LANE_TIMEOUT=3600s', which this run never set" \
+   $(grep -q 'the 3600s wall this lane is armed with (from LANE_BOUND_WALL_S' <<<"$OUT" && ! grep -q 'lane-bound.sh.s 3600s wall ceiling' <<<"$OUT" && echo 0 || echo 1)
+# …and the same misattribution in the MAX_WATCH invariant warning, which is the OTHER line that renders
+# `LANE_WALL_S` as an operator instruction. Reachable with no elapsed clock at all: the armed wall is 3600 s,
+# which is below `WAIT_S_DESIGN + IMPL_RESERVE_S` (5400 + 900), so `MAX_WATCH_FIT` floors at 1 chunk and any
+# override above it warns.
+new_o "$T/pr4.tsv"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_MAX_WATCH=15 LANE_BOUND_WALL_S=3600 LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=3590 \
+      bash "$SCRIPT" 40 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "the LANE_MERGE_MAX_WATCH warning names the lane's ARMED wall and its source (LANE_BOUND_WALL_S), not a LANE_TIMEOUT this run never set — an operator line must never send you to the wrong knob" \
+   $(grep -q 'exceeds what the lane.s 3600s wall clock (from LANE_BOUND_WALL_S' <<<"$OUT" && ! grep -q 'exceeds what LANE_TIMEOUT=' <<<"$OUT" && echo 0 || echo 1)
+# …and with no ceiling reducer in play the source is still named correctly, so the fix cannot decay into
+# "always says LANE_BOUND_WALL_S".
+new_o "$T/pr4.tsv"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_MAX_WATCH=15 LANE_TIMEOUT=3600 LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=3590 \
+      bash "$SCRIPT" 41 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "with LANE_TIMEOUT=3600 (and no LANE_BOUND_WALL_S) the same warning attributes it to LANE_TIMEOUT — the source is resolved, not hard-coded the other way" \
+   $(grep -q 'exceeds what the lane.s 3600s wall clock (from LANE_TIMEOUT)' <<<"$OUT" && echo 0 || echo 1)
 # …and a lane's elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
 new_o "$T/pr4.tsv"
 WAIT_S=0 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
@@ -1701,8 +1726,16 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O=
 ck "…and the NEXT one is refused (counter 29 → chunk 30) and the hand-off SAYS 29, so the backstop-derived bound is pinned by its own number (pre-fix prints 1 and reds here)" \
    $([ "$RC" = 13 ] && [ "$(verdict_of 50 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && grep -q '29 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
 printf '999\n' > "$OT/state/lanemerge-51.watch"
+# ⛔ THE ARM'S OWN TITLE IS A CLAIM ABOUT THE ENVIRONMENT, SO IT MUST PIN THAT ENVIRONMENT (P3, MEASURED:
+# 161 passed / 1 FAILED on this box with the PRISTINE script, and 164/1 with this branch's — the arm failed
+# identically before and after, so it was never this diff's red). The fleet box exports `LANE_BACKSTOP_S=7200`
+# (`env | grep ^LANE_`), and this invocation named only the FOUR knobs it wanted, so the arm's "NO
+# LANE_BACKSTOP_S" was false on every box that exports it: supervision derived 29 chunks instead of none,
+# the 1000th admission was refused with exit 13, and the arm reported a FALSE RED against correct code on
+# the one host the lanes actually run on. An absent-by-assertion knob is set to EMPTY here — `is_limit ''`
+# is false, which is exactly "no backstop" — so the arm tests what its title says on any host.
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
-      LANE_TIMEOUT=0 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S= LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
       bash "$SCRIPT" 51 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
 ck "LANE_TIMEOUT=0 with NO LANE_BACKSTOP_S is UNBOUNDED supervision: the 1000th chunk is NOT refused (a zero allowance means there is no counter, not that it is spent)" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 51 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)

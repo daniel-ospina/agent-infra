@@ -306,6 +306,19 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # gate repo instead of from the leftover clock.
 IMPL_RESERVE_S="${LANE_MERGE_IMPL_RESERVE:-900}"; is_limit "$IMPL_RESERVE_S" || IMPL_RESERVE_S=900
 LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
+# ⛔ THE NUMBER NOW HAS THREE POSSIBLE SOURCES, SO IT CARRIES THE ONE IT GOT (P3, verified by running the
+# message): `LANE_WALL_S` is no longer necessarily `LANE_TIMEOUT`. An operator who set only
+# `LANE_BOUND_WALL_S` was told "LANE_MERGE_MAX_WATCH exceeds what LANE_TIMEOUT=3600s affords" — naming a
+# variable that was NEVER SET, on a line whose whole job is to say which knob to change. That is this
+# file's own "quote the operand you measured" rule (see the review-cycle P3s above), so the source is
+# resolved once, here, and every message that renders `LANE_WALL_S` names it.
+if is_limit "${LANE_TIMEOUT:-}" && [ "${LANE_TIMEOUT}" = "${LANE_WALL_S}" ]; then
+  LANE_WALL_SRC="LANE_TIMEOUT"
+elif is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S}" = "${LANE_WALL_S}" ]; then
+  LANE_WALL_SRC="LANE_BACKSTOP_S"
+else
+  LANE_WALL_SRC="the shipped ${LANE_WALL_S}s default (neither LANE_TIMEOUT nor LANE_BACKSTOP_S was a usable bound)"
+fi
 # ⛔ THE ARMED CEILING IS NOT NECESSARILY THIS FILE'S OPERAND (review, P3 — verified against
 # `spawn-gate.sh`'s `lane_wall_bound`): `run_agent` arms `min(caller_bound, LANE_BOUND_WALL_S)` for every
 # POSITIVE `LANE_BOUND_WALL_S`, and that knob is documented as a CEILING REDUCER. Mirroring only
@@ -315,6 +328,7 @@ LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S"
 # is "wall axis OFF", which `lane_wall_bound` REFUSES to reduce to, so it is not applied either.
 if is_limit "${LANE_BOUND_WALL_S:-}" && [ "${LANE_BOUND_WALL_S:-0}" -gt 0 ] && [ "$LANE_BOUND_WALL_S" -lt "$LANE_WALL_S" ]; then
   LANE_WALL_S="$LANE_BOUND_WALL_S"
+  LANE_WALL_SRC="LANE_BOUND_WALL_S (spawn-gate.sh's ceiling reducer, min(caller bound, LANE_BOUND_WALL_S))"
 fi
 INTERVAL="${LANE_MERGE_INTERVAL:-20}"; is_limit "$INTERVAL" || INTERVAL=20
 [ "$INTERVAL" -ge 5 ] || INTERVAL=20
@@ -460,7 +474,7 @@ if [ -n "${LANE_MERGE_MAX_WATCH:-}" ] && is_limit "${LANE_MERGE_MAX_WATCH:-}"; t
   # ⛔ NOT ON A LANE WITH NO WALL CLOCK: the sentence below says "the lane's wall clock ends the phase
   # first", which is FALSE when `LANE_TIMEOUT=0` (review cycle 15, P3 — measured: a pinned lane printed that
   # warning and, two lines later, "no wall ceiling is enforced for this lane").
-  [ "$LANE_WALL_S" -eq 0 ] || [ "$MAX_WATCH" -le "$MAX_WATCH_FIT" ] || say_err "lane-merge: LANE_MERGE_MAX_WATCH=$MAX_WATCH exceeds what LANE_TIMEOUT=${LANE_WALL_S}s affords after the check wait (${WAIT_S_DESIGN}s) and the implementation reserve (${IMPL_RESERVE_S}s) — $MAX_WATCH_FIT chunk(s) fit; honouring the override, but the lane's wall clock ends the phase first."
+  [ "$LANE_WALL_S" -eq 0 ] || [ "$MAX_WATCH" -le "$MAX_WATCH_FIT" ] || say_err "lane-merge: LANE_MERGE_MAX_WATCH=$MAX_WATCH exceeds what the lane's ${LANE_WALL_S}s wall clock (from ${LANE_WALL_SRC}) affords after the check wait (${WAIT_S_DESIGN}s) and the implementation reserve (${IMPL_RESERVE_S}s) — $MAX_WATCH_FIT chunk(s) fit; honouring the override, but the lane's wall clock ends the phase first."
 fi
 PHASE_F="$O/state/lanemerge-$PR.phase"   # "this lane IS in its merge phase" (chain-merge waits on it)
 ROUND_F="$O/state/lanemerge-$PR.round"
@@ -1718,7 +1732,7 @@ elif [ -n "$_lane_elapsed" ]; then
   if [ "$WAIT_S" -gt "$_wall_left" ]; then
     WAIT_S="$_wall_left"
     _wait_elapsed_note=" (this lane had already spent ${_lane_elapsed}s of its ${LANE_WALL_S}s clock, so the wait is what was left after a ${_hb_margin}s margin to write the hand-off)"
-    say_err "lane-merge: the check wait is CAPPED at ${WAIT_S}s${_wait_elapsed_note}. Uncapped it would out-live lane-bound.sh's ${LANE_WALL_S}s wall ceiling, which TERMs the lane with NO verdict file and no WAITING_CHECKS hand-off (#3584 review, P1)."
+    say_err "lane-merge: the check wait is CAPPED at ${WAIT_S}s${_wait_elapsed_note}. Uncapped it would out-live the ${LANE_WALL_S}s wall this lane is armed with (from ${LANE_WALL_SRC}), which TERMs the lane with NO verdict file and no WAITING_CHECKS hand-off (#3584 review, P1)."
   fi
 else
   # ⛔ THIS MESSAGE IS THE ONE AN OPERATOR ACTUALLY READS, SO IT GETS THE SAME CORRECTION THE CODE GOT
