@@ -238,6 +238,30 @@ recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
 # the same paid-loop class as the missing recorder itself. Resolved from the harness checkout.
 recorder_lib_path() { printf '%s\n' "$(dirname "$(recorder_path)")/lib/diff-normalize.py"; }
 recorder_lib_src()  { printf '%s\n' "$HARNESS/../lib/diff-normalize.py"; }
+# ── THE LANDING RAIL (#2176) ─────────────────────────────────────────────────────────────────────
+# The record step is only HALF the landing contract. Step 4 is `record-review.sh`; step 5 is the
+# RAIL, `admin-merge.sh` — and a cell that carries the recorder without the rail completes a PAID
+# review, mints a clean record, and then has nothing runnable left to land with. That is the state
+# agent-infra#2176 measured on every Linux cell, and `start` was one of the two ways to reach it:
+# it provisioned `record-review.sh` (and its declared sibling) and NO part of the rail, so a cell
+# whose `$CELL_HOME/.pi/agent/scripts/` came from `start` — rather than from a fresh
+# `pi-bootstrap`/`cell-install` farm pass — could never land, forever, while `cmd_check` certified
+# it "CELL CAN RUN A CONTROLLER".
+#
+# ⛔ THE LIST IS THE RAIL'S OWN CLOSURE, and it is not a guess: `admin-merge.sh` resolves three
+# helpers from `$SELF_DIR` and REFUSES when one is missing (`CFS="$SELF_DIR/ci-failure-set.sh"`,
+# `EXEMPTION_PY="$SELF_DIR/ci_exemption.py"`, `bash "$SELF_DIR/ci-workflow-pr-evaluable.sh"` at its
+# three evaluator call sites), and `ci-failure-set.sh` resolves `ci_exemption.py` beside itself.
+# Delivering `admin-merge.sh` alone ships an executable whose own executables are absent, i.e. a
+# rail that exits 1 on every invocation — the #1552 class, one delivery mechanism over
+# (`pi-bootstrap/setup.sh`'s `merge_gate_srcs` carries the same four for the same reason).
+# ⛔ THE DESTINATION IS FLAT, beside the recorder, matching the farm — the rail resolves its helpers
+# from its OWN directory, so a nested layout would deliver four files and still satisfy nothing.
+# Sources are read from `$HARNESS/..` — the same tree `recorder_src()` reads the recorder from, so
+# the recorder and the rail can never come from two different checkouts.
+rail_names()    { printf '%s\n' admin-merge.sh ci-failure-set.sh ci_exemption.py ci-workflow-pr-evaluable.sh; }
+rail_dest_dir() { printf '%s\n' "$(dirname "$(recorder_path)")"; }
+rail_src_dir()  { printf '%s\n' "$HARNESS/.."; }
 SESSION="${SESSION:-orch}"
 # The doctor loop's tmux session (agent-infra#1989). A NAME of its own, never a prefix of `$SESSION`.
 # ⛔ Every tmux target that names the DOCTOR uses `=name` exact matching, for the reason orch-loop's
@@ -3465,6 +3489,22 @@ cmd_check() {
   fi
   log_line "ok: record step present and executable ($rec, with $(recorder_lib_path))"
 
+  # …and step 5 (#2176). Judged as a CLOSURE, not as one file: a rail missing any helper it execs
+  # is a rail that exits 1 on every invocation, so "admin-merge.sh exists" is not the property this
+  # certification needs — "the rail can run" is. Regular, non-empty and EXECUTABLE for each, for the
+  # same reasons the recorder is judged that way one paragraph up: `[ -x ]` is true for a directory,
+  # and a zero-byte file is executable and silently does nothing.
+  local rdir rname rpath rmissing=""
+  rdir="$(rail_dest_dir)"
+  for rname in $(rail_names); do
+    rpath="$rdir/$rname"
+    if [ ! -f "$rpath" ] || [ ! -s "$rpath" ] || [ ! -x "$rpath" ]; then rmissing="$rmissing $rname"; fi
+  done
+  if [ -n "$rmissing" ]; then
+    die "the LANDING RAIL is incomplete under $rdir — missing, empty or non-executable:$rmissing. Step 4 (record-review.sh) can mint a clean record but step 5 (admin-merge.sh) has no runnable path, so every lane on this cell would finish its review and stall at the last step (agent-infra#2176). 'start' provisions all four from $(rail_src_dir), or: for f in $(rail_names); do cp '$(rail_src_dir)/'\"\$f\" '$rdir/'; chmod +x '$rdir'/\"\$f\"; done"
+  fi
+  log_line "ok: landing rail present and executable (admin-merge.sh + ci-failure-set.sh + ci_exemption.py + ci-workflow-pr-evaluable.sh under $rdir)"
+
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
   # it. An ambient-only export does NOT — tmux serves a new session from the server's environment —
@@ -4143,6 +4183,29 @@ cmd_start() {
     mv -f "$ltmp" "$rlib" || { rm -f "$ltmp"; die "cannot install the provisioned normalizer at $rlib"; }
     log_line "provisioned record-step library: $rlibsrc -> $rlib"
   fi
+  # ── the LANDING RAIL (#2176) ─────────────────────────────────────────────────────────────────────
+  # Provisioned here for the same reason, on the same rule, as the recorder above: it is a hard
+  # dependency of the ONLY landing path, and `start` is the one verb that runs on every cell launch,
+  # so it is the only delivery that reaches a cell that was INSTALLED before the farm carried the
+  # rail (a cell-install pass is not re-run by `apply`). Absent-or-empty only — a complete operator
+  # copy is never clobbered — atomic tmp+mv so a concurrent reader cannot observe a half-written
+  # rail, and `chmod +x` because the lane TYPES `admin-merge.sh <PR>`.
+  # ⛔ NOT optional and not best-effort: a rail source that is missing means the harness checkout is
+  # not a full agent-infra checkout, and a cell certified in that state lands nothing (see cmd_check).
+  local rdir rsrc_f_dir rname rdest rtmp2
+  rdir="$(rail_dest_dir)"; rsrc_f_dir="$(rail_src_dir)"
+  for rname in $(rail_names); do
+    rdest="$rdir/$rname"
+    [ -f "$rdest" ] && [ -s "$rdest" ] && [ -x "$rdest" ] && continue
+    [ -e "$rdest" ] && [ ! -f "$rdest" ] && die "$rdest exists but is not a regular file — remove it, then re-run 'start'"
+    mkdir -p "$rdir" || die "cannot create $rdir"
+    rtmp2="${rdest}.tmp.$$"
+    cp -p "$rsrc_f_dir/$rname" "$rtmp2" 2>/dev/null \
+      || { rm -f "$rtmp2"; die "$rname missing at $rsrc_f_dir and cannot provision the landing rail to $rdest — the harness checkout must be a full agent-infra checkout (agent-infra#2176: without the rail a lane can review and record but never land)"; }
+    chmod +x "$rtmp2" || { rm -f "$rtmp2"; die "cannot make $rdest executable"; }
+    mv -f "$rtmp2" "$rdest" || { rm -f "$rtmp2"; die "cannot install the provisioned rail file at $rdest"; }
+    log_line "provisioned landing rail: $rsrc_f_dir/$rname -> $rdest"
+  done
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
   # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.

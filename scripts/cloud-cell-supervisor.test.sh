@@ -67,6 +67,24 @@ if [ -z "$SEED_WORKERS" ]; then
   echo "       seed NOTHING and every start arm would pass vacuously."
   exit 1
 fi
+# ⛔ THE LANDING-RAIL SET IS DERIVED FROM THE SHIPPED SUPERVISOR TOO (#2176), for the same reason and
+# by the same rule: a hand-written copy of the rail's closure in a fixture would let the supervisor
+# grow a fifth rail file while every fixture kept seeding four — and the arms would then exercise an
+# INCOMPLETE rail refusal instead of the delivery they describe. `rail_names()` is one printf line on
+# purpose (its own comment says so: the list IS the closure), so it parses the same way SEED_WORKERS
+# does. A parse that yields nothing is FATAL, not empty: an empty set makes every rail assertion
+# below vacuous while the suite reports green.
+RAIL_FILES="$(awk '/^rail_names\(\)/ {
+    i = index($0, "printf"); if (!i) next
+    rest = substr($0, i)
+    sub(/^printf[^ ]* +'"'"'[^'"'"']*'"'"' +/, "", rest)
+    sub(/;[[:space:]]*}[[:space:]]*$/, "", rest)
+    print rest; exit }' "$SUP")"
+if [ -z "$RAIL_FILES" ]; then
+  echo "FATAL: cannot parse rail_names() out of $SUP — the landing-rail assertions below would test"
+  echo "       NOTHING and every fixture would seed an empty rail."
+  exit 1
+fi
 # Each seed site calls this; it records the SITE (not a counter) because several sites run inside a
 # `( … )` subshell — the #1989 arms — where an incremented variable would be discarded on exit.
 seed_site() { printf '%s\n' "${BASH_SOURCE[0]}:$1" >> "$SEED_LOG" 2>/dev/null || true; }
@@ -222,6 +240,9 @@ make_ai_repo() {
   printf '#!/bin/bash\nexit 0\n' > "$AI/scripts/record-review.sh"
   mkdir -p "$AI/scripts/lib"
   printf '#!/usr/bin/env python3\n' > "$AI/scripts/lib/diff-normalize.py"
+  # …and the LANDING RAIL `start` provisions beside it (#2176). `rail_src_dir()` is `$HARNESS/..`, so
+  # it reads the same `$AI/scripts/` the recorder comes from.
+  stub_rail "$AI/scripts"
   # #1932: `prune` delegates a worktree `.venv` to this reaper, so the fixture checkout carries the
   # REAL script — a fixture without it would make every prune arm pass for the wrong reason ("reaper
   # not found, so nothing was removed"), which is exactly the vacuous shape this suite avoids.
@@ -241,6 +262,23 @@ write_doctor_stub() { # <dir>
   mkdir -p "$1" || return 1
   printf '#!/bin/bash\n[ "${1:-}" = loop ] && exec sleep 20\nexit 0\n' > "$1/cloud-cell-doctor.sh" || return 1
   chmod +x "$1/cloud-cell-doctor.sh"
+}
+
+# The LANDING RAIL (#2176). `start` provisions it into $CELL_HOME/.pi/agent/scripts/ and `cmd_check`
+# certifies a cell only when the CLOSURE is present and executable — `admin-merge.sh` PLUS the three
+# helpers it execs from its own directory (`ci-failure-set.sh`, `ci_exemption.py`,
+# `ci-workflow-pr-evaluable.sh`), because the rail refuses to run when any is missing. So a fixture
+# that stubs the rail with one file exercises the incomplete-rail refusal instead of the arm it says
+# it exercises, and a fixture that stubs none of it dies there instead. This is the same rule the
+# `$SEED_WORKERS`/record-step fixtures already follow: every fixture must be a CELL, not a partial
+# copy that only the newest refusal can reach.
+stub_rail() { # <dir>
+  local _n
+  mkdir -p "$1" || return 1
+  for _n in $RAIL_FILES; do
+    printf '#!/bin/bash\nexit 0\n' > "$1/$_n" || return 1
+    chmod +x "$1/$_n" || return 1
+  done
 }
 
 make_ai_repo
@@ -471,6 +509,7 @@ printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # … cannot pin a harness to verify against" instead of exercising key delivery.
 printf '#!/bin/bash\nexit 0\n' > "$W/record-review.sh"; chmod +x "$W/record-review.sh"
 mkdir -p "$W/lib"; printf '#!/usr/bin/env python3\n' > "$W/lib/diff-normalize.py"
+stub_rail "$W"   # #2176: the rail `start` provisions beside the recorder, one above the harness
 stub_missing "$W/bin" pi
 # The controller's ONLY relevant act: the second tmux boundary. `sleep 4` keeps the session alive
 # past cmd_start's own `sleep 3` has-session check.
@@ -638,6 +677,24 @@ wk_case() {
     bad "$tag: start failed (rc=$rc): $(tail -2 "$W/start.$kind.$route.$server.out" | tr '\n' ' ')"
     return
   fi
+  # #2176 — THE LANDING RAIL. Step 4 (the recorder, provisioned above by the shipped `start`) is
+  # only half the landing contract; step 5 is `admin-merge.sh`. A cell that receives the recorder and
+  # not the rail completes a PAID review, mints a clean record, and then has nothing runnable — the
+  # state agent-infra#2176 measured on every Linux cell, reached here because `start` provisioned the
+  # recorder only. Asserted as the CLOSURE the rail actually execs, and ONCE: the delivery is
+  # idempotent and this function runs per route/server combination.
+  if [ "${RAIL_ASSERTED:-0}" = 0 ]; then
+    RAIL_ASSERTED=1
+    for _rf in $RAIL_FILES; do
+      [ -f "$W/cellhome/.pi/agent/scripts/$_rf" ] && [ -x "$W/cellhome/.pi/agent/scripts/$_rf" ] \
+        && ok "start: provisioned landing-rail file $_rf into \$CELL_HOME/.pi/agent/scripts/ (#2176)" \
+        || bad "start: did NOT provision $_rf — a cell holding only the recorder can review, record and then NEVER LAND (#2176)"
+    done
+    grep -q "provisioned landing rail: $W/harness/../admin-merge.sh -> $W/cellhome/.pi/agent/scripts/admin-merge.sh" \
+        "$W/start.$kind.$route.$server.out" \
+      && ok "start: says WHICH tree the rail came from (a wrong checkout is visible, not silent)" \
+      || bad "start: never reported provisioning the rail — $(grep -i 'rail' "$W/start.$kind.$route.$server.out" | head -2 | tr '\n' ' ')"
+  fi
   got="$(cat "$W/worker-key" 2>/dev/null || true)"
   [ "$got" = "$want" ] \
     && ok "$tag: the WORKER resolved the merge key across the second tmux boundary" \
@@ -756,6 +813,7 @@ chmod +x "$F/home/.pi/agent/scripts/record-review.sh"
 printf '#!/usr/bin/env python3\n' > "$F/home/.pi/agent/scripts/lib/diff-normalize.py"
 printf '#!/bin/bash\nexit 0\n' > "$F/record-review.sh"; chmod +x "$F/record-review.sh"
 mkdir -p "$F/lib"; printf '#!/usr/bin/env python3\n' > "$F/lib/diff-normalize.py"
+stub_rail "$F"; stub_rail "$F/home/.pi/agent/scripts"   # #2176: rail source + already-provisioned cell
 stub_missing "$F/bin" pi
 # Stand-in for refresh-candidates.sh --check: echoes the REPO/O it was handed (so a probe run
 # against the wrong repo cannot pass silently) and exits with $PROBE_RC.
@@ -815,6 +873,56 @@ case "$CC_OUT" in
   *"CELL CAN RUN A CONTROLLER"*) ok "check: reaches the CELL CAN RUN banner when the repo is fine" ;;
   *) bad "check: did not reach the banner on a healthy repo — output: $CC_OUT" ;;
 esac
+
+# ── THE LANDING RAIL (#2176) ────────────────────────────────────────────────────────────────────
+# Step 4 of the landing contract is `record-review.sh`; step 5 is the RAIL, `admin-merge.sh`. The
+# recorder is provisioned and refused above (a cell without it can never mint a record); the rail is
+# the same hard dependency one step later, and certifying a cell that holds the recorder but not the
+# rail is the false PASS this issue measured — the lane reviews, records, and then has nothing
+# runnable. Judged as the CLOSURE the rail execs from its OWN directory, because `admin-merge.sh`
+# refuses to run when any helper is missing: "the file exists" is not "the rail can run".
+say_case "check certifies the landing rail only when it can actually RUN (#2176)"
+cellcheck 0
+case "$CC_OUT" in
+  *"the LANDING RAIL is incomplete"*) bad "check: refused a cell carrying the whole rail — output: $CC_OUT" ;;
+  *) ok "check: a cell carrying the full rail closure is not refused" ;;
+esac
+case "$CC_OUT" in
+  *"landing rail present and executable"*) ok "check: reports the rail it verified (a positive reading, not an absence)" ;;
+  *) bad "check: never reported the rail — output: $CC_OUT" ;;
+esac
+# (a) ONE helper short: the rail still EXISTS and is executable, and would exit 1 on EVERY run.
+# Renaming (not deleting) keeps the mutation reversible and keeps `admin-merge.sh` present, so the
+# arm cannot pass by taking a "no rail at all" path.
+mv -f "$F/home/.pi/agent/scripts/ci_exemption.py" "$F/home/.pi/agent/scripts/ci_exemption.py.off"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check: a rail missing one helper it EXECS is refused (non-zero)" \
+                   || bad "check: certified a cell whose admin-merge.sh would exit 1 on every run"
+case "$CC_OUT" in
+  *"ci_exemption.py"*) ok "check: names the missing rail file" ;;
+  *) bad "check: the refusal does not name ci_exemption.py — output: $CC_OUT" ;;
+esac
+case "$CC_OUT" in
+  *"agent-infra#2176"*) ok "check: the refusal carries its issue, so the remedy is findable" ;;
+  *) bad "check: the refusal does not cite agent-infra#2176" ;;
+esac
+mv -f "$F/home/.pi/agent/scripts/ci_exemption.py.off" "$F/home/.pi/agent/scripts/ci_exemption.py"
+# (b) Present but NOT executable. The lane TYPES this path, so an x-less copy is a seam nobody can
+# run — and it must not be certifiable, or the failure surfaces at step 5 instead of at the gate.
+chmod -x "$F/home/.pi/agent/scripts/admin-merge.sh"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check: a non-executable admin-merge.sh is refused (the lane types this path)" \
+                   || bad "check: certified a cell whose rail is not executable"
+case "$CC_OUT" in
+  *"admin-merge.sh"*) ok "check: names the non-executable rail file" ;;
+  *) bad "check: the refusal does not name admin-merge.sh — output: $CC_OUT" ;;
+esac
+chmod +x "$F/home/.pi/agent/scripts/admin-merge.sh"
+# (c) The fixture is WHOLE again — asserted, so neither mutation above can leave a later section
+# reddening for a reason this one created.
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check: the restored fixture passes again (the two mutations were the only delta)" \
+                   || bad "check: fixture not restored — rc=$CC_RC: $CC_OUT"
 
 # ── the provider CREDENTIAL STORE (agent-infra#2024) ───────────────────────────────────────────
 # MEASURED 2026-11-05 on all five cells: `~/.pi/agent/auth.json` was `{}` (2 bytes). pi consults the
@@ -1050,6 +1158,7 @@ mkdir -p "$P/home/.pi/agent/scripts/lib"
 printf '#!/bin/bash\nexit 0\n' > "$P/home/.pi/agent/scripts/record-review.sh"
 chmod +x "$P/home/.pi/agent/scripts/record-review.sh"
 printf '#!/usr/bin/env python3\n' > "$P/home/.pi/agent/scripts/lib/diff-normalize.py"
+stub_rail "$P"; stub_rail "$P/home/.pi/agent/scripts"   # #2176: rail source + the cell's provisioned copy
 # …and the runtime-dependency probe needs `pi`, which the ubuntu CI runner does not install. GAPS
 # ONLY (see `stub_missing`): `git` must stay REAL here — the provenance arms below read its output.
 stub_missing "$P/bin" pi
@@ -2463,6 +2572,7 @@ chmod +x "$Q/harness/refresh-candidates.sh"
 # without it (and its declared sibling), one directory up from the harness.
 printf '#!/bin/bash\nexit 0\n' > "$Q/record-review.sh"; chmod +x "$Q/record-review.sh"
 mkdir -p "$Q/lib"; printf '#!/usr/bin/env python3\n' > "$Q/lib/diff-normalize.py"
+stub_rail "$Q"   # #2176: the rail `start` provisions beside the recorder
 git -C "$Q/harness" add -A
 git -C "$Q/harness" commit -q -m "section 12 fixture harness"
 Q_REF="$(git -C "$Q/harness" rev-parse HEAD)"
@@ -4667,6 +4777,7 @@ chmod +x "$Q/bin/tmux"
 printf '#!/bin/bash\nexit 0\n' > "$Q/home/.pi/agent/scripts/record-review.sh"
 chmod +x "$Q/home/.pi/agent/scripts/record-review.sh"
 printf '#!/usr/bin/env python3\n' > "$Q/home/.pi/agent/scripts/lib/diff-normalize.py"
+stub_rail "$Q"; stub_rail "$Q/home/.pi/agent/scripts"   # #2176: rail source + the cell's provisioned copy
 printf '#!/bin/bash\nexit 0\n' > "$Q/record-review.sh"; chmod +x "$Q/record-review.sh"
 mkdir -p "$Q/lib"; printf '#!/usr/bin/env python3\n' > "$Q/lib/diff-normalize.py"
 # GAPS ONLY (see stub_missing): git/python3 stay REAL — the provenance gate reads their output.
@@ -5237,6 +5348,7 @@ exit 0
 SH
 mkdir -p "$W2/lib"; printf '#!/usr/bin/env python3\n' > "$W2/lib/diff-normalize.py"
 chmod +x "$W2/record-review.sh"
+stub_rail "$W2"   # #2176: the rail `start` provisions beside the recorder, one above the harness
 git -C "$W2/harness" add -A >/dev/null 2>&1 || true
 git -C "$W2/harness" -c user.email=t@t -c user.name=t commit -q -m "1989 fixture harness" >/dev/null 2>&1 || true
 W2_REF="$(git -C "$W2/harness" rev-parse HEAD 2>/dev/null || echo origin/main)"
@@ -5382,7 +5494,7 @@ seed_provider_store "$LA/home"
 # loop record, so the harness path it is scanned against must be private to it.
 cp -a "$W2/harness/." "$LA/h/"
 # …plus the record step, which `start` provisions from ONE LEVEL ABOVE the harness (`$HARNESS/../`).
-cp -a "$W2/record-review.sh" "$LA/record-review.sh"; cp -a "$W2/lib" "$LA/lib"
+cp -a "$W2/record-review.sh" "$LA/record-review.sh"; cp -a "$W2/lib" "$LA/lib"; stub_rail "$LA"   # #2176
 cat > "$LA/o/cloud-cell-doctor.sh" <<'SH'
 #!/bin/bash
 [ "${1:-}" = loop ] && exec sleep 30
@@ -6313,6 +6425,7 @@ mkdir -p "$QT/home/.pi/agent/scripts/lib"
 printf '#!/bin/bash\nexit 0\n' > "$QT/home/.pi/agent/scripts/record-review.sh"
 chmod +x "$QT/home/.pi/agent/scripts/record-review.sh"
 printf '#!/usr/bin/env python3\n' > "$QT/home/.pi/agent/scripts/lib/diff-normalize.py"
+stub_rail "$QT/home/.pi/agent/scripts"   # #2176: `check` certifies a cell only with the rail closure
 printf '#!/bin/bash\nexit 0\n' > "$QT/bin/gh"; chmod +x "$QT/bin/gh"
 stub_missing "$QT/bin" pi
 # A RECORDING tmux double: the controller's own command line is the surface the issue is about, so it is
