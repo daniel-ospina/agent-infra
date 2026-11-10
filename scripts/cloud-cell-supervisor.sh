@@ -375,8 +375,11 @@ workers_maybe_live() {
 #                        Without it only the controller would be served. ORDER MATTERS: the adapter
 #                        routes every call through the same `$O/gh-limit.py`, so it must resolve first
 #                        or the adapter is never reached (this file's `start` builds exactly that order
-#                        in both carriers — :4103 for the service-mode export, :4131 for the tmux
-#                        string; `lane.sh:83-84` re-asserts it for lanes).
+#                        in both carriers — the service-mode pair of `export PATH=…:$PATH` lines, gh-limit
+#                        first and gh-rest prepended AFTER it so the later prepend wins, and the tmux
+#                        `new-session` string's `PATH='$O/gh-rest':'$O/gh-limit':`; `lane.sh` re-asserts
+#                        it for lanes). The carriers are named, not line-numbered, because the #2095
+#                        `O`/`O_WORK` merge moved both — the same positional-claim class #2095 retired.
 #   O_WORK             — the HARNESS ROOT, which is a SEPARATE name from `O` (the state dir) since
 #                        #2095. Every worker resolves its own modules (`claims.sh`, `repo-authority.sh`,
 #                        `merge-one.sh`) from it, so a worker that crosses this second tmux boundary
