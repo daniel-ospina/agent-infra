@@ -49,6 +49,7 @@ import {
   undiciGateOutcome,
 } from "./pool-hygiene.mjs";
 import { postJson, startLoadBalancer, startUpstream, sleep } from "./lb-harness.mjs";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 let pass = 0, fail = 0, skip = 0;
@@ -867,5 +868,7 @@ console.log("\n── Part 5: undici resolver ──");
 }
 
 globalThis.fetch = SAVED_FETCH;
-console.log(`\n${fail === 0 ? "✅" : "❌"} test-pool-hygiene: ${pass} passed, ${fail} failed, ${skip} skipped`);
+// agent-infra#2723 — one attributable emitter so a failing run always carries the
+// `runner::test-pool-hygiene` identity the merge rail reads.
+reportVerdict("test-pool-hygiene", pass, fail, { skip });
 process.exit(fail === 0 ? 0 : 1);

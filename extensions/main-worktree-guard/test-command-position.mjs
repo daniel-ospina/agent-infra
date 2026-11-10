@@ -54,6 +54,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -487,5 +488,9 @@ try {
   fail++;
 }
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ""}`);
+// agent-infra#2723 — the aggregate carried COUNTS and no label, so the merge rail
+// (`scripts/ci_exemption.py`'s `runner::<label>` family) could not name this suite
+// and refused the whole PR blind. `reportVerdict` always prints the attributable
+// `❌ <label>: <N> passed, <M> failed` form.
+reportVerdict("command-position", pass, fail, { skip });
 process.exit(fail === 0 ? 0 : 1);

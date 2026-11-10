@@ -32,6 +32,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -537,5 +538,8 @@ try {
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
-console.log(`\ntest-nested-worktree: ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ""}`);
+// agent-infra#2723 — the aggregate carried the label but NO `❌` marker, so the
+// merge rail's `runner::<label>` family (anchored on the marker) could not read a
+// failing run of this suite at all, and refused the whole PR blind.
+reportVerdict("test-nested-worktree", pass, fail, { skip });
 process.exit(fail === 0 ? 0 : 1);

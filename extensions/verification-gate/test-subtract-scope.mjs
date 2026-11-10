@@ -18,13 +18,16 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..", "..");
 
+let passed = 0;
 let failed = 0;
 function check(label, ok, detail = "") {
   if (ok) {
+    passed++;
     console.log(`  ✅ ${label}`);
   } else {
     failed++;
@@ -162,5 +165,9 @@ check(
   !(read(join(HERE, "subtract-scope.ts")) ?? "").includes("@earendil-works/pi-coding-agent")
 );
 
-console.log(failed === 0 ? "\n✅ #755 tripwire: all checks passed" : `\n❌ #755 tripwire: ${failed} check(s) failed`);
+// agent-infra#2723 — this aggregate printed `❌ #755 tripwire: N check(s) failed`:
+// a LABEL and a COUNT but no `passed`, so the merge rail's `runner::<label>`
+// family (anchored on `<N> passed, <M> failed`) could not read it and refused the
+// whole PR blind.
+reportVerdict("test-subtract-scope", passed, failed);
 process.exit(failed === 0 ? 0 : 1);

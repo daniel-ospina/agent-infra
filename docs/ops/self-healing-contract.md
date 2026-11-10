@@ -502,9 +502,12 @@ looked like a quiet queue. `resolve_repo()` applies the rule the SUPERVISOR alre
   line so it can never be silent again. The segment is APPENDED, not prepended: the fleet reads this
   line through a fixed cut and the `| PR-DOCTOR …` fact is deliberately early.
 ⚠️ **Remaining gap, stated narrowly.** The default is made loud, not removed: the Mac's beat runs the
-FARM copy (`~/.pi/agent/scripts/`), which is not a git checkout and carries no `repo-slug.sh`, so on
-that box `repo_src=default` is the expected reading until the farm carries the deriver (named on
-`#2518`). And the module-level `REPO` is still `env or default` for the two importers that supply the
+FARM copy (`~/.pi/agent/scripts/`), which is not a git checkout — so nothing is *derivable* there, and
+`repo_src=default` is the expected reading. ⛔ **NOT a missing file any more**: the farm delivers
+`repo-slug.sh` beside `objective.py` (ai#1552), so the remaining cause on that box is the CWD, reported
+as `underivable` / `cwd-unreadable` — **not** `deriver-missing`, whose remedy (deploy the deriver) is
+already satisfied there. An earlier revision of this paragraph sent an operator down that satisfied
+remedy. And the module-level `REPO` is still `env or default` for the two importers that supply the
 variable themselves (`pr-doctor.py`, `pr-loop.py`); the CLI is where the contract is enforced.
 
 **What repairs it.** `UNKNOWN error=repo_mismatch(…)` ⇒ unset `OBJECTIVE_REPO` or run from the checkout

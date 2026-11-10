@@ -46,6 +46,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -350,6 +351,10 @@ await main();
 // passed, 0 failed, 1 skipped` exit 0 (green over nothing), POST-FIX `❌ …` exit 1.
 // Partial skips elsewhere in this directory are unaffected (they still assert).
 const vacuous = skip > 0 && pass === 0;
-console.log(`\n${fail === 0 && !vacuous ? "✅" : "❌"} test-unborn-head: ${pass} passed, ${fail} failed, ${skip} skipped`);
+// agent-infra#2723 — the aggregate carried NO `❌` marker on the vacuous branch and
+// `failed: 0` on both (the parser ignores a 0-failed aggregate), so a red here
+// yielded no identity at all. `red` reports the vacuity as the failure it is, which
+// keeps the line attributable AND keeps the exit code below.
+reportVerdict("test-unborn-head", pass, fail, { skip, red: vacuous });
 if (vacuous) console.log("❌ the whole suite was SKIPPED — zero assertions ran, so this is not a pass");
 process.exit(fail === 0 && !vacuous ? 0 : 1);

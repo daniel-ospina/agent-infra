@@ -24,6 +24,7 @@ import {
   checkInlineGenericJobs,
   remediationFor,
 } from "./ci-ref-check.cjs";
+import { reportVerdict } from "../extensions/shared/verdict.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -654,9 +655,10 @@ test("#403 checkInlineGenericJobs dir-level finding carries remediationRef", () 
 // ── Summary ────────────────────────────────────────────────────────────────
 
 console.log(`\n${"-".repeat(60)}`);
-if (failed === 0) {
-  console.log(`✅ ci-ref-check: ${passed} passed, 0 failed`);
-} else {
-  console.log(`❌ ci-ref-check: ${passed} passed, ${failed} failed`);
-  process.exit(1);
-}
+// agent-infra#2723 — through the shared emitter, so the identity is the same
+// `❌ <label>: N passed, M failed` the merge rail's `runner::` family reads. This
+// suite already hand-rolled exactly that shape (its label is unchanged), so this
+// is the migration that keeps it OUT of a hand-rolled-aggregate arm once the
+// drift pin can see it: `ci-main.yml` runs it from a `run: |` body.
+reportVerdict("ci-ref-check", passed, failed);
+if (failed > 0) process.exit(1);

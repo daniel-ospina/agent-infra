@@ -26,12 +26,13 @@
 //
 // Zero-dep: `node:*` + the `git` binary, hermetic repos under `os.tmpdir()`.
 // Run: node extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { computePin, diskTree, gitTree, parseRefArg, pinReport, PIN_REL } from "./sanctioned-pin-tree.mjs";
+import { closureOf, computePin, diskTree, gitTree, parseRefArg, pinReport, PIN_REL, sanctionedPaths } from "./sanctioned-pin-tree.mjs";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..", "..");
@@ -322,9 +323,79 @@ try {
     expect("(w4) the post-merge lane collects this suite by the extensions/*/test*.mjs glob",
       /(^|\/)test[^/]*\.mjs$/.test("extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs"), true);
   }
+  // ── (d) the BEHAVIOURAL arm judges the SAME tree as `--ref` (agent-infra#2723) ──
+  // The identity suite's FRESHNESS arm reads `--ref`'s tree; its BEHAVIOURAL arm
+  // read the CHECKOUT. In a PR job the checkout is GitHub's synthetic MERGE of head
+  // onto the base tip, so a PR that touches nothing sanctioned inherited `main`'s
+  // drift and reddened: measured 2026-11-10 at PR #3896 head `09f23b263` — main's
+  // `scripts/gh-shim/gh` had been re-written by #3890 WITHOUT a pin re-cut, so the
+  // merge result carried main's bytes beside the branch's pin, the delegation
+  // closure declined, and the suite reported `22 passed, 2 failed` (arms (a) and
+  // (d3)) on a PR that touches nothing sanctioned. Reproduced byte-for-byte by
+  // materialising that merge tree. This arm is the reproduction and the pin: a
+  // STALE `main`, a CLEAN PR head, and the suite must judge the HEAD.
+  {
+    const root = makeRepo();
+    // The behavioural arm deploys the REAL guard, so the fixture carries it plus the
+    // SHIPPED sanctioned surface and its delegation closure — every relpath the real
+    // `SANCTIONED_SCRIPT_RELPATHS` names has to exist here, because a missing member
+    // is correctly STALE and that would red the freshness arm instead of exercising
+    // the behaviour. Read from the repo's own helpers, so a new sanctioned script
+    // is materialised here the day it is added (a hand-kept list would rot).
+    cpSync(HERE, join(root, "extensions", "main-worktree-guard"), { recursive: true });
+    cpSync(join(HERE, "..", "shared"), join(root, "extensions", "shared"), { recursive: true });
+    const realSurface = sanctionedPaths(diskTree(REPO));
+    const surface = [...new Set([...realSurface, ...Object.keys(closureOf(diskTree(REPO), realSurface))])];
+    for (const rel of surface) {
+      const dest = join(root, rel);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, readFileSync(join(REPO, rel)));
+    }
+    expect("(d0) the fixture materialised the SHIPPED sanctioned surface + closure (an incomplete copy would make this arm a freshness test instead)",
+      [surface.includes(RAIL), surface.includes(HELPER), surface.length >= realSurface.length + 2], [true, true, true]);
+    cutAndCommit(root, "fixture: the shipped sanctioned surface + its closure");
+
+    git(root, "checkout", "-q", "-b", "pr");
+    write(root, "README.md", "fixture + an unrelated edit\n");
+    git(root, "add", "-A");
+    git(root, "commit", "-qm", "pr: touches nothing sanctioned");
+    const prHead = git(root, "rev-parse", "pr");
+
+    // `main` moves a DELEGATE and does NOT re-cut — the #3890 shape, which is what
+    // makes the MERGE result (main's bytes + main's stale pin) disagree.
+    git(root, "checkout", "-q", "main");
+    write(root, HELPER, "# helper v2\n");
+    git(root, "add", "-A");
+    git(root, "commit", "-qm", "main: a delegate moves, no re-cut");
+    try {
+      git(root, "merge", "-q", "--no-ff", "-m", "merge pr", prHead);
+    } catch {
+      git(root, "checkout", "--theirs", "--", PIN_REL);
+      git(root, "add", "--", PIN_REL);
+      git(root, "commit", "-qm", "merge pr");
+    }
+
+    const suite = join(root, "extensions", "main-worktree-guard", "test-sanctioned-identity.mjs");
+    const runAt = (args) => spawnSync(process.execPath, [suite, ...args], {
+      encoding: "utf8",
+      cwd: root,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    const summary = (r) => (/sanctioned-identity: \d+ passed, \d+ failed/.exec(r.stdout ?? "") ?? ["<no aggregate>"])[0];
+
+    const atHead = runAt(["--ref", prHead]);
+    expect(`(d1) the identity suite judged on the merge-base tree is GREEN (\`${summary(atHead)}\`) — the #2818 contract applies to its behavioural arm too`,
+      [atHead.status, summary(atHead).endsWith("0 failed")], [0, true]);
+    const onMerged = runAt([]);
+    expect(`(d2) NON-VACUITY: the same suite on the STALE merged tree is RED (rc=${onMerged.status}, \`${summary(onMerged)}\`) — the fixture really is a drift`,
+      [onMerged.status === 0, summary(onMerged).endsWith("0 failed")], [false, false]);
+    rmSync(root, { recursive: true, force: true });
+  }
 } finally {
   // every fixture repo is removed by its arm; nothing global to clean up
 }
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} ${pass} passed, ${fail} failed`);
+// agent-infra#2723 — the aggregate carried COUNTS and no label, so the merge rail
+// could not name this suite and refused the whole PR blind.
+reportVerdict("sanctioned-pin-merge-base", pass, fail);
 process.exit(fail === 0 ? 0 : 1);
