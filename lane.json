@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 900,
+  "exit_code": null,
+  "heartbeat_at": 1794340296,
+  "host": "cmux",
+  "issue": 2834,
+  "kind": "lane",
+  "lane_id": "cmux.klane-2834-1794340296-p1359564-754dbae7",
+  "lease_until": 1794341196,
+  "pid": 1359564,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1794340296,
+  "state": "RUNNING",
+  "tag": "2834",
+  "worktree": "/tmp/tmp.4Sre3TMl1F/wt5"
+}
