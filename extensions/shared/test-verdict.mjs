@@ -18,14 +18,22 @@
  *      a new harness cannot reintroduce an unattributable aggregate. This is the
  *      drift pin, and it reads the SAME workflow files the runner reads rather
  *      than a list kept here (a hand-kept list IS the drift it would be pinning).
- *      ⛔ IT READS EVERY WAY THIS REPO INVOKES A HARNESS, not just `run: node x`
- *      on one line — see `commandTokens()`. Scoping the scan to a single line was
- *      a false PASS over an incomplete corpus (#2723 review, 2026-11-10): the
- *      PR-lane invocation lives in `ci.yml`'s `test-command:` VALUE (executed by
- *      `node-ci.yml`'s `run: ${{ inputs.test-command }}`) and the post-merge ones
- *      live INSIDE `run: |` bodies, so `scripts/check-skill-lint.test.mjs` — the
- *      harness on the job a PR actually sees — was never in the corpus while this
- *      pin reported `78 passed, 0 failed`.
+ *      ⛔ IT READS EVERY WAY THIS REPO INVOKES A HARNESS **BY NAME**, not just
+ *      `run: node x` on one line — see `commandTokens()`. Scoping the scan to a
+ *      single line was a false PASS over an incomplete corpus (#2723 review,
+ *      2026-11-10): the PR-lane invocation lives in `ci.yml`'s `test-command:`
+ *      VALUE (executed by `node-ci.yml`'s `run: ${{ inputs.test-command }}`) and
+ *      the post-merge ones live INSIDE `run: |` bodies, so
+ *      `scripts/check-skill-lint.test.mjs` — the harness on the job a PR actually
+ *      sees — was never in the corpus while this pin reported `78 passed, 0
+ *      failed`.
+ *      ⚠️ THE ONE SHAPE IT DOES NOT READ, declared so that "every way" is true:
+ *      `ci-main.yml` runs a `for` loop over the glob `extensions/<ext>/test*.mjs`, a
+ *      shape no token scan expands — `extensions/main-worktree-guard/test.mjs`
+ *      is outside the corpus for exactly that reason. No PR is left blind by it:
+ *      that leg runs on the PUSH lane only (`ci-main.yml:17-24`) and carries the
+ *      `mark` → `::error title=extension-tests::FAILED <label>` wrapper
+ *      (`ci-main.yml:110-125`), which is attributable for every member.
  *
  * ZERO-DEPENDENCY: `node:*` + the repo's own `extensions/shared/verdict.mjs`.
  * Usable in the `verify` job with no `npm ci`. It shells out to
@@ -260,6 +268,11 @@ function commandTokens(body) {
         const line = lines[j];
         if (line.trim() === "") continue;
         if (line.length - line.trimStart().length <= keyCol) break; // dedent ends the block
+        // A shell COMMENT is not an invocation. Without this, a commented-out
+        // `# node scripts/x.mjs` inside a `run: |` body enters the corpus and the
+        // pin demands a migration for a file nothing runs — the false RED that
+        // COMMAND_KEY already guards against for prose, in the other direction.
+        if (/^\s*#/.test(line)) continue;
         if (!/\bnode\b/.test(line)) continue;
         out.push(line);
       }
@@ -291,6 +304,102 @@ const harnesses = workflowNodeHarnesses();
 // pass over an empty set — the false-PASS shape this whole issue is about.
 if (harnesses.size >= 10) ok(`#3 the enumeration found ${harnesses.size} workflow-run node harnesses (a non-empty corpus)`);
 else bad("#3 the enumeration found a non-empty corpus", `only ${harnesses.size} — the scan itself is broken`);
+
+// ⛔ THE SCANNER IS THE HALF THAT GENERALISES, SO THE SCANNER IS ASSERTED HERE.
+// In-file because `commandTokens()` is not exported and this suite is its only
+// consumer; on SYNTHETIC YAML because three file names cannot pin a grammar.
+//
+// WHY THIS EXISTS (#2723 review, 2026-11-10 — measured): the corpus floor above
+// cannot protect the widening. Reverted to the pre-fix single-line `run:` scan,
+// the corpus goes 25 → 21, eleven rows simply VANISH, and the pin still reported
+// `83 passed, 0 failed` (rc 0) — the floor is 10, so it never fires. A pin whose
+// own header promises it "pins nothing about tomorrow's seventeenth" has to go
+// RED when the grammar it reads shrinks, or a future harness wired into a block
+// body or a `test-command:` value is invisible again and the #2723 blind refusal
+// is back with a green pin.
+const TOKEN_SHAPES = [
+  {
+    label: "a one-line `run:` value",
+    yaml: [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - run: node scripts/one.test.mjs",
+    ].join("\n"),
+    want: ["node scripts/one.test.mjs"],
+  },
+  {
+    label: "a `run: |` block body (its key line carries no `node`)",
+    yaml: [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - name: block",
+      "        run: |",
+      '          mark "scripts/two.test.mjs"',
+      "          node scripts/two.test.mjs || failures=$((failures+1))",
+      "        continue-on-error: false",
+    ].join("\n"),
+    want: ["node scripts/two.test.mjs || failures=$((failures+1))"],
+  },
+  {
+    label: "a `<key>: … node <x>.mjs` VALUE (a reusable workflow's input)",
+    yaml: [
+      "jobs:",
+      "  a:",
+      "    with:",
+      "      test-command: a=0; node scripts/three.test.mjs || a=$?; [ $a -eq 0 ]",
+    ].join("\n"),
+    want: ["a=0; node scripts/three.test.mjs || a=$?; [ $a -eq 0 ]"],
+  },
+  {
+    label: "a shell comment in a block body (names `node`, runs nothing)",
+    yaml: [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - run: |",
+      "          # node scripts/commented-out.test.mjs",
+      "          node scripts/four.test.mjs",
+    ].join("\n"),
+    want: ["node scripts/four.test.mjs"],
+  },
+  {
+    label: "a `description: |` paragraph (PROSE must not enter the corpus)",
+    yaml: [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - name: prose",
+      "        description: |",
+      "          node scripts/not-a-harness.test.mjs is documented here, not run",
+    ].join("\n"),
+    want: [],
+  },
+];
+for (const shape of TOKEN_SHAPES) {
+  eq(`#3 commandTokens() reads ${shape.label}`,
+    commandTokens(shape.yaml).map((t) => t.trim()), shape.want);
+}
+
+// CORPUS MEMBERSHIP — BY NAME, for the call sites that motivated the widening.
+// The floor above cannot see 25 → 21 either, so the three names the widening was
+// FOR are asserted individually: losing one is the regression, and it must be a
+// RED with the call site named, not a smaller pass count.
+for (const [required, why] of [
+  ["scripts/check-skill-lint.test.mjs",
+    "`ci.yml`'s `test-command:` VALUE — the harness on the job a PR actually sees (`node-ci.yml:230`)"],
+  ["scripts/check-pi-pin-lockstep.mjs",
+    "the same `test-command:` value, and `ci-main.yml`'s `run: |` body"],
+  ["scripts/ci-ref-check.test.mjs",
+    "`ci-main.yml`'s `run: |` body"],
+]) {
+  if (harnesses.has(required)) ok(`#3 the corpus holds ${required} — ${why}`);
+  else
+    bad(`#3 the corpus holds ${required}`,
+      "it is missing, so a call site the scan was widened for is invisible again and a failing " +
+      `run of it yields NO identity (#2723) — ${why}`);
+}
 
 const EMITTER_IMPORT = String.raw`(?:^|\n)\s*import\s+\{[^}]*\breportVerdict\b[^}]*\}\s+from\s+["'][./][^"']*verdict\.mjs["']`;
 
