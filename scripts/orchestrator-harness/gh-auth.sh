@@ -42,9 +42,24 @@
 #         $HOME/.config/gh.
 #
 # and, for auth, `GH_TOKEN` / `GITHUB_TOKEN` "will be used … takes precedence over previously stored
-# credentials". This module implements exactly that order, plus ONE source gh does not have: the FILE
-# the lane's credentials come from. (Windows' `$AppData` arm is not implemented — no caller of this
-# module runs on Windows, and a branch nothing can reach is a branch nothing can test.)
+# credentials". (Windows' `$AppData` arm is not implemented — no caller of this module runs on Windows,
+# and a branch nothing can reach is a branch nothing can test.)
+#
+# ⛔ BUT "EXACTLY THAT ORDER" WOULD BE A FALSE CLAIM ABOUT THIS FILE, so here is the order the CODE takes,
+# in the order it takes it (`gh_auth_resolve`), which is NOT the order of gh's own list above:
+#
+#     1. the TOKEN NAMES        (gh's rule, and it outranks every directory)
+#     2. ambient `GH_CONFIG_DIR`   — honoured as set, even when it holds no store (`ambient-missing`)
+#     3. ambient `XDG_CONFIG_HOME` — only when `<xdg>/gh/hosts.yml` exists (`xdg`)
+#     4. the LANE ENV FILE's `GH_CONFIG_DIR=`   (`keys`)      <- a source gh does not have, and it comes
+#     5. the LANE ENV FILE's `XDG_CONFIG_HOME=`  (`keys-xdg`)     BEFORE the lane-HOME default below
+#     6. the LANE HOME's `$HOME/.config/gh`      (`home`, or `home-xdg` when XDG is set and gh would
+#                                                 therefore not read it — see the arm's own note)
+#     7. the ACCOUNT HOME's `.config/gh`         (`account`)  <- the second source gh does not have
+#
+# Steps 4-5 before step 6 is deliberate: the lane's own declared store is a statement about THAT lane, while
+# `$HOME/.config/gh` under a redirected `HOME` is a fact about the box. Step 7 exists because a cell's lane
+# HOME is redirected away from the account home that actually holds the credential.
 #
 # ⛔ AND "SET" IS NOT THE SAME AS "USABLE", WHICH IS WHY `token-blank` IS ITS OWN STATE. Measured on
 # this box (gh 2.103.3) against a fixture store holding a real token:
