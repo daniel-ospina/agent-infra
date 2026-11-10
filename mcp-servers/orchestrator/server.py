@@ -2280,9 +2280,11 @@ def _harden_argv(argv: List[str]) -> List[str]:
 # reported whatever the rc. ⛔ RESIDUALS, NOT COVERED — both are TRUNCATION, and both are disclosed rather
 # than claimed closed: (a) `_drain_into` keeps each stream's HEAD, so a refusal printed after `cap` bytes is
 # dropped; (b) `cap` is the CALLER's `max_output`, so too small a cap cuts the line before the pattern can
-# match. ⛔ (b) IS BOUNDED BY THE PATTERN'S OWN MATCH LENGTH, NOT BY THE LINE'S: 32 B for `link-refused`,
-# 44 B for `no-known-daemon`, 65 B for the measured `daemon-binary-absent` line (37 B is that pattern's
-# floor). Below that the class is simply unmatched and the caller gets `RAN` at rc=0 — or, at the measured
+# match. ⛔ (b) IS BOUNDED BY THE PATTERN'S OWN MATCH LENGTH, NOT BY THE LINE'S — and for `link-refused`
+# that length GROWS WITH THE PEER NAME (23 + len(peer)): 24 B floor, 32 B for the measured `pi-cell-4`,
+# 39 B for `early-ivory-moth`, 40 B for `smart-sage-cougar` — both display-name spellings are measured in
+# #2345, and `vm exec` echoes either. 44 B for `no-known-daemon`; 65 B for the measured
+# `daemon-binary-absent` line (37 B is that pattern's floor). Below the match the class is simply unmatched and the caller gets `RAN` at rc=0 — or, at the measured
 # rc=3, plain `NONZERO`, i.e. THE PRE-FIX MIS-VERDICT — with only `truncated: true` to tell them apart.
 # (a) needs a refusal after 20 KB of relayed output; every measured refusal is the transport's FIRST line,
 # far inside the default 20 000, so neither residual is reachable by a default call.
