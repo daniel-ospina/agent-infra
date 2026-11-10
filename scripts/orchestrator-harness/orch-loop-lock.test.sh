@@ -300,8 +300,21 @@ trap_regs() {
     | awk "$_TRAP_SIGS_AWK"
 }
 # exit_trap_count <text> — how many EXIT-family trap REGISTRATIONS the text contains.
+# ⛔ "EXIT-FAMILY" MEANS MEMBERSHIP OF THE EXIT TOKEN, NOT A LIST THAT IS NOTHING BUT IT (fresh review of
+# #3865 at feb87a415, P2 — false PASS, MEASURED). A registration whose list NAMES EXIT beside another
+# signal is still an EXIT registration, and bash REPLACES the installed handler either way — `bash -c
+# 'trap "rm -f "\$LOCKF"" EXIT; trap "exit 0" EXIT INT'` leaves the lock on disk, MEASURED. The old
+# `grep -c '^EXIT :: '` matched only a list that WAS the whole list, so the parse READ each of these and
+# the count DISCARDED it, leaving this arm GREEN at `PASS=164 FAIL=0`: `trap 'exit 0' EXIT INT`, `INT
+# EXIT`, `0 INT`, `HUP EXIT`, and `trap 'gh_bound_cleanup >/dev/null 2>&1; exit 0' EXIT INT`. The arm's own
+# label says "a second EXIT-family registration REPLACES the first", so the count is what the label means.
+# EXACTLY-EXIT is a DIFFERENT invariant — the #1715 revert — and it stays where it belongs, in
+# `trap_pin`'s ONE-trap arm; do not fold the two back together.
 exit_trap_count() {
-  trap_regs "$1" | grep -c '^EXIT :: ' || true
+  trap_regs "$1" | awk -F' :: ' '
+    { n = split($1, a, " ")
+      for (i = 1; i <= n; i++) if (a[i] == "EXIT") { c++; break } }
+    END { print c + 0 }'
 }
 # trap_reg_total <text> — how many trap registrations sit at a COMMAND POSITION anywhere in the text:
 # line start, after `;`/`&&`/`||`/`(`/`{`/`)`, or after a keyword that OPENS a command (`then`,
@@ -507,6 +520,23 @@ trap 'true' 0" \
 _exitrow 2 "$_REL
 trap 'true' exit" \
   "a LOWERCASE exit second registration REPLACES the releaser — was a false PASS"
+# ⛔ AND EXIT AMONG OTHER SIGNALS IS STILL AN EXIT REGISTRATION (fresh review of #3865 at feb87a415, P2 —
+# false PASS, MEASURED: each spelling below left the suite at `PASS=164 FAIL=0` while bash REPLACED the
+# releaser and the lock stayed on disk — the parse READ the registration and the count DISCARDED it,
+# because a list spelled `EXIT INT` is not the string `EXIT`. The INT/TERM arm does not cover this, since
+# `trap 'exit 0' …` contains the word `exit`.)
+_exitrow 2 "$_REL
+trap 'exit 0' EXIT INT" \
+  "a second registration naming EXIT AMONG other signals REPLACES the releaser — was a false PASS"
+_exitrow 2 "$_REL
+trap 'exit 0' INT EXIT" \
+  "…and the ORDER of the signal list does not hide it — was a false PASS"
+_exitrow 2 "$_REL
+trap 'exit 0' 0 INT" \
+  "…and a ZERO signal inside a longer list is the EXIT signal too — was a false PASS"
+_exitrow 2 "$_REL
+trap 'exit 0' HUP EXIT" \
+  "…and an unrelated signal merely SHARING the list does not hide it — was a false PASS"
 _exitrow 1 "$_REL
 # trap 'true' EXIT" \
   "a COMMENTED-OUT registration is not a registration (no false RED on a correct tree)"
@@ -1299,6 +1329,12 @@ printf '#!/bin/bash\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$C/peer/notalo
 chmod +x "$C/peer/notalock.sh"
 bash -x "$C/peer/notalock.sh" >/dev/null 2>&1 &
 XP=$!; KIDS="$KIDS $XP"; sleep 0.4
+# ⛔ THE SAME DEAD-FIXTURE PRECONDITION AS §16d/§17/§17b/§17c (fresh review of #3865 at feb87a415, P3) —
+# this control has it too, and the reviewer's list of four stopped one arm short: `ran && RC -eq 0` is
+# satisfied by a POSITIVELY ABSENT pid, so a fixture that exits on the spot satisfies this row without
+# the option rule ever being consulted. MEASURED: shortening `notalock.sh` to `true` left this row GREEN.
+ck "16b: the fixture is ALIVE when the driver decides (a dead pid would satisfy the control below vacuously)" \
+   "$(kill -0 "$XP" 2>/dev/null && echo 0 || echo 1)"
 printf '%s\n' "$XP" > "$C/o/.orch.lock"
 run_drv O="$C/o"
 ck "16b: the same OPTION form over a NON-loop script is still RECLAIMED (§16 is not a blanket refusal)" \
@@ -1343,6 +1379,17 @@ printf '#!/bin/bash\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$C/peer/notalo
 chmod +x "$C/peer/notalock.sh"
 bash +o errexit "$C/peer/notalock.sh" >/dev/null 2>&1 &
 YP=$!; KIDS="$KIDS $YP"; sleep 0.4
+# ⛔ THE FIXTURE MUST BE ALIVE WHEN THE DRIVER DECIDES, OR THIS ARM PROVES NOTHING (fresh review of
+# #3865 at feb87a415, P3 — MEASURED: replacing every RECLAIM arm's wrapper command string with `true`,
+# i.e. making the fixture die on the spot, left the WHOLE suite at `PASS=164 FAIL=0`. The arm asserts
+# `ran && RC -eq 0`, and the driver answers rc 1 for a POSITIVELY ABSENT pid too — so a dead fixture is
+# reclaimed by the absent-pid rule with the argv rule never consulted, and on a host whose shell does not
+# take `+c`/`+cx` as a command string (the CI pins bash 3.2 for PARSING only) these arms would report ✅
+# vacuously. This row is NOT the `kill -0` row deleted earlier: that one ran AFTER the drive and could
+# not vary (no branch of the lock decision signals the named pid). This one runs BEFORE it and goes RED
+# exactly when the fixture is dead — the condition that makes the arm below meaningless.)
+ck "16d: the fixture is ALIVE when the driver decides (a dead pid is reclaimed by the absent-pid rule, so the arm below would pass without the argv rule)" \
+   "$(kill -0 "$YP" 2>/dev/null && echo 0 || echo 1)"
 printf '%s\n' "$YP" > "$C/o/.orch.lock"
 run_drv O="$C/o"
 ck "16d: the same '+'-form option over a NON-loop script is still RECLAIMED (§16c is not a blanket refusal)" \
@@ -1360,6 +1407,8 @@ echo "── 17. a '-c' wrapper is a non-controller even with another option in 
 mkcase; CASE_DIR="$C"
 bash -x -c "for _ in \$(seq 1 60); do sleep 1; done; $C/peer/orch-loop.sh" >/dev/null 2>&1 &
 WP=$!; KIDS="$KIDS $WP"; sleep 0.4
+ck "17: the fixture is ALIVE when the driver decides (same precondition as §16d — a dead pid would satisfy the arm below)" \
+   "$(kill -0 "$WP" 2>/dev/null && echo 0 || echo 1)"
 printf '%s\n' "$WP" > "$C/o/.orch.lock"
 run_drv O="$C/o"
 ck "17: a '-c' wrapper with an OPTION in front of it is still RECLAIMED (not refused as ambiguous)" \
@@ -1372,6 +1421,8 @@ kill -9 "$WP" 2>/dev/null
 mkcase; CASE_DIR="$C"
 bash +c "for _ in \$(seq 1 60); do sleep 1; done; $C/peer/orch-loop.sh" >/dev/null 2>&1 &
 ZP=$!; KIDS="$KIDS $ZP"; sleep 0.4
+ck "17b: the fixture is ALIVE when the driver decides (a dead pid would satisfy the arm below vacuously)" \
+   "$(kill -0 "$ZP" 2>/dev/null && echo 0 || echo 1)"
 printf '%s\n' "$ZP" > "$C/o/.orch.lock"
 run_drv O="$C/o"
 ck "17b: a '+c' wrapper is RECLAIMED too (the exemption holds for BOTH polarities)" \
@@ -1386,6 +1437,8 @@ for _cf in '+cx' '-ce'; do
   mkcase; CASE_DIR="$C"
   bash "$_cf" "for _ in \$(seq 1 60); do sleep 1; done; $C/peer/orch-loop.sh" >/dev/null 2>&1 &
   TP=$!; KIDS="$KIDS $TP"; sleep 0.4
+  ck "17c/$_cf: the fixture is ALIVE when the driver decides (a dead pid would satisfy the arm below vacuously)" \
+     "$(kill -0 "$TP" 2>/dev/null && echo 0 || echo 1)"
   printf '%s\n' "$TP" > "$C/o/.orch.lock"
   run_drv O="$C/o"
   ck "17c: a '$_cf' cluster wrapper is RECLAIMED (c inside a short-option cluster is the -c family)" \
