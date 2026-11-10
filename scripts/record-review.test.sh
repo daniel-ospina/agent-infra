@@ -1470,6 +1470,42 @@ STUB_META_HTTP=401 STUB_BODY="Fixes #424374" STUB_LABELS="complexity:micro" run_
 assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 401-meta warning names the READ failure"
 assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 401 meta read is NOT reported as an uncertifiable payload"
 
+# DEGRADED-ONLY (the a3ceaae2f review's Finding 1) — when `mktemp` is unavailable
+# `review_surface_rows` falls back to the PRE-#2628 `pulls` read, and the warning
+# about that degradation must RIDE THE FAILURE. The fallback read is otherwise
+# identical: on a healthy run it certifies head/base/count exactly as the
+# temp-file arm does, so announcing "the surface cap is UNVERIFIED" there told the
+# operator the cap was unverified on a run where it was fully verified — the
+# signal-that-stops-distinguishing-anything problem `record-review.sh:861-868`
+# describes, inverted, and it fired for both callers including the
+# machine-consumed `--print-tier` seam. Nothing else pinned the move: NO vector
+# entered the `mktemp`-unavailable branch, so reverting the announcement to fire
+# BEFORE the read (the pre-fix shape) left this suite green. Measured: the mutant
+# `move the echo back above the read` reds ONLY the first vector below, and
+# deleting the echo reds only the second.
+#
+# A PATH shim ahead of the real `mktemp` — not `TMPDIR=/nonexistent`, which also
+# kills the compare arm's `CMP_ERR` (`:907`) and so degrades two arms at once
+# instead of the one under test.
+NOMKT="$T/nomktemp"; mkdir -p "$NOMKT"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$NOMKT/mktemp"; chmod +x "$NOMKT/mktemp"
+
+# (1) the read SUCCEEDS: the run certifies, records, and stays SILENT about a
+# degradation it did not suffer.
+PATH="$NOMKT:$PATH" STUB_BODY="Fixes #424375" STUB_LABELS="complexity:micro" run_micro_verdict 424375
+[ "$RECORD_RC" = "0" ] && ok "8.16 degrade: a mktemp-less run whose pulls read SUCCEEDS still certifies and records (rc 0)" || bad "8.16 degrade: a healthy fallback read must still record (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424375.json" ] && ok "8.16 degrade: the record IS written on the fallback arm — the degradation is not a refusal" || bad "8.16 degrade: the healthy fallback arm stranded a legitimate record"
+assert_not_contains "$RECORD_ERR" "no temp file for the pulls-read status" "8.16 degrade: a HEALTHY fallback read does NOT announce a degradation — the warning rides the failure, not the branch"
+assert_not_contains "$RECORD_ERR" "the surface cap is UNVERIFIED" "8.16 degrade: a healthy fallback read never claims an unverified cap it in fact certified"
+
+# (2) the read FAILS: same posture as any transport failure (warn, proceed) — but
+# HERE the announcement is owed, and it must name the degradation so the next
+# operator restores the refusal arm instead of re-diagnosing a silent one.
+PATH="$NOMKT:$PATH" STUB_META_FAIL=1 STUB_BODY="Fixes #424376" STUB_LABELS="complexity:micro" run_micro_verdict 424376
+[ "$RECORD_RC" = "0" ] && ok "8.16 degrade: a mktemp-less run whose pulls read FAILS still proceeds (transport, rc 0)" || bad "8.16 degrade: a failed fallback read must proceed as transport (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "no temp file for the pulls-read status" "8.16 degrade: the FAILED fallback read DOES announce the degradation (this is the only assertion that reds if the announcement is deleted)"
+assert_contains "$RECORD_ERR" "Fix mktemp/TMPDIR to restore the refusal arm" "8.16 degrade: the announcement names the remedy, so the degraded run is actionable rather than merely alarming"
+
 # REFUSED (pulls 404) — THE #2628 FINDING ITSELF. The API ANSWERED and refused to
 # describe this PR (a nonexistent PR, a PR this token cannot see, a deleted or
 # transferred one). POSITIVE evidence: the surface of this PR is knowable and was

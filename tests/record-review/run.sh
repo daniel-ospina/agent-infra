@@ -1939,6 +1939,31 @@ for _merr in 'gh: API rate limit exceeded for 1.2.3.4. (HTTP 403)' 'gh: Server E
     || fail "(30xvii-d) a non-refusal pulls-read failure was classified as a refusal (got '$T30_META_TRANS')"
 done
 
+# #2628 (the a3ceaae2f review's Finding 1) — THE DEGRADED-MODE ANNOUNCEMENT ON THE
+# MACHINE-CONSUMED SEAM. When `mktemp` is unavailable `review_surface_rows` falls
+# back to the pre-#2628 `pulls` read; that read is otherwise identical, so on a
+# healthy run it certifies head/base/count exactly like the temp-file arm. The
+# warning about the degradation therefore has to RIDE THE FAILURE: emitted before
+# the read it printed "the surface cap is UNVERIFIED" on runs where the cap WAS
+# fully verified — including here, on `--print-tier`, where a lane is told to go
+# fix mktemp/TMPDIR over a tier that was already selected and certified. A PATH
+# shim ahead of the real `mktemp` (not `TMPDIR=/nonexistent`, which also kills the
+# compare arm's `CMP_ERR` at record-review.sh:907 and so degrades two arms at
+# once). Measured: restoring the pre-fix echo-before-the-read shape reds ONLY this
+# pair, in this suite.
+T30_NOMKT="$T30/nomktemp"; rm -rf "$T30_NOMKT"; mkdir -p "$T30_NOMKT"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$T30_NOMKT/mktemp"; chmod +x "$T30_NOMKT/mktemp"
+T30_DEG_ERR="$T30/deg.err"
+T30_DEG="$(PATH="$T30_NOMKT:$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" FIX_COUNT=1 \
+  FIX_ROWS="$(printf 'modified\tdocs/ops/x.md\t')" \
+  HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>"$T30_DEG_ERR")"
+[ "$T30_DEG" = "$(printf 'ok\tlow')" ] \
+  && pass "(30xvii-e) a mktemp-less --print-tier run whose pulls read SUCCEEDS still certifies the tier (ok/low) — the degraded arm is not a refusal" \
+  || fail "(30xvii-e) the healthy fallback arm did not certify the tier (got '$T30_DEG')"
+! grep -qF 'no temp file for the pulls-read status' "$T30_DEG_ERR" 2>/dev/null \
+  && pass "(30xvii-e) ...and it stays SILENT about a degradation it did not suffer — the warning rides the failure, never the branch" \
+  || fail "(30xvii-e) a HEALTHY fallback read announced a degradation on the --print-tier seam — the cap was verified and the lane is being told it was not"
+
 # ...and on the RECORD path the same response must refuse, like its clean-low
 # sibling does 60 lines later.
 rm -rf "$T30H/.pi/agent/reviews"
@@ -2866,12 +2891,19 @@ fi
 # `"delta_range":"30219358085b…0d.."` with an empty base, kind and digest beside a
 # `mint:"delta"` — a signed artifact claiming a reviewed range from the one verb whose
 # contract is that no reviewer ran.
-MIN_ASSERTIONS=219
-# #2628: 214 -> 218. The ``pulls`` read stopped discarding its HTTP status, so
+MIN_ASSERTIONS=221
+# #2628: 214 -> 219. The ``pulls`` read stopped discarding its HTTP status, so
 # the print-tier seam gained the (30xvii-c)/(30xvii-d) pair: a 404 on the PR read
 # is now `unclassified` (the API REFUSED this PR → positive evidence) and a
-# 403/5xx/network failure is still `unavailable` (transport). Four assertions: one
-# refusal, three transport shapes. MEASURED 218 on this tree.
+# 403/401/5xx/network failure is still `unavailable` (transport). FIVE assertions:
+# one refusal (30xvii-c) plus the four shapes in (30xvii-d)'s list — 403, 502,
+# 401 and connection-refused. MEASURED 219 on this tree.
+# #2628 (the a3ceaae2f review's Finding 2 corrected the arithmetic above, and its
+# Finding 1 added the pair below): 219 -> 221 for (30xvii-e), the degraded-mode
+# announcement — a mktemp-less `--print-tier` run that CERTIFIES and stays silent
+# about a degradation it did not suffer. Without it the pre-fix shape (the warning
+# emitted before the fallback read, so it fires on healthy runs too) leaves both
+# suites green. MEASURED 221 on this tree.
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
