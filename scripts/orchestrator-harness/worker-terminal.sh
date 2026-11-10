@@ -1316,24 +1316,46 @@ wt_tree_probe() { # stdin: `cmux tree --json`; stdout: "w:<worker>"|"t:<terminal
 # `term<TAB><terminal-id>` for its `wt-<name>` workspace. Needed because the census counts a worker
 # whose RECORD is gone (a wiped $O/state, a lane from an older harness) — and a reap that cannot
 # resolve that worker leaves it holding a slot forever while logging "could NOT be proven gone".
+# ⛔ AND ITS `liveness` MODE IS WHAT THE SWEEP READS (agent-infra#2312). The default shape answers
+# "which surfaces belong to this worker"; the daemon happily offers SEVERAL workspaces for one name,
+# and a close that resolves only the recorded one leaves the rest unreachable for ever. So the sweep
+# needs the same parse with the ONE fact the default shape drops — whether each workspace still holds
+# a RUNNING terminal — as `ws<TAB><id><TAB>live|idle|empty`. THREE values, not two: a workspace with
+# no terminal at all is a create IN FLIGHT (or a create that failed before its surface existed), and
+# folding it into `idle` would let a sweep delete the workspace another spawn is about to fill.
 # ⛔ FUNCTION BODY, NOT AN INLINE HEREDOC IN THE SUBSTITUTION — see the bash 3.2 note above (#2248).
+# ⛔ AND IT STAYS ONE PROGRAM: a second module-level `WT_*_PY` variable has to be added to
+# orch-loop.sh's startup guard (and to the test that pins that guard's exact text) or a macOS 3.2
+# mis-parse that empties it turns the sweep into a silent no-op — an enforcer that never fires.
 _wt_ws_py_body() { cat <<'PY'
 import json,sys
 name=sys.argv[1]
+mode=sys.argv[2] if len(sys.argv)>2 else ""
 try:
     d=json.load(sys.stdin)
 except Exception:
     sys.exit(3)
+if mode=="liveness" and not isinstance(d.get("terminals"),list):
+    # A DELETION DECISION IS NOT TAKEN ON A SHAPE THIS PROGRAM CANNOT READ.
+    sys.exit(3)
 ws={w.get("id"):(w.get("name") or "") for w in d.get("workspaces",[]) or []}
 tabs={t.get("id"):t.get("content_id") for t in d.get("tabs",[]) or []}
+run={t.get("id"):bool(t.get("running")) for t in d.get("terminals",[]) or []}
 seen=[]
 def add(k,v):
     if v and (k,v) not in seen: seen.append((k,v))
 for s in d.get("screens",[]) or []:
     wid=s.get("workspace_id") or ""
-    if ws.get(wid,"") != name:
+    wname=ws.get(wid,"")
+    # ⛔ THE PREFIX IS REQUIRED, AND AN EMPTY NAME MEANS "EVERY `wt-*`" (the sweep's whole-registry
+    # form). Without both, an empty name matched only workspaces with NO name — a guaranteed no-op that
+    # reads exactly like "nothing to free". Every caller passes a real `wt-<name>` today, so the
+    # prefix test changes no existing answer; it only stops a future caller's typo from addressing a
+    # workspace this launcher never made.
+    if not wname.startswith("wt-"):
         continue
-    add("ws",wid)
+    if name and wname != name:
+        continue
     ids=[]
     stack=[((s.get("layout") or {}).get("root") or {})]
     while stack:
@@ -1341,8 +1363,20 @@ for s in d.get("screens",[]) or []:
         if not isinstance(n,dict): continue
         ids.extend(n.get("tab_ids") or [])
         stack.extend(n.get("children") or [])
+    if mode=="liveness":
+        if not ids:
+            st="empty"
+        elif any(run.get(tabs.get(t) or "",False) for t in ids):
+            st="live"
+        else:
+            st="idle"
+        print("ws\t%s\t%s" % (wid,st))
+        continue
+    add("ws",wid)
     for t in ids:
         add("term",tabs.get(t))
+if mode=="liveness":
+    sys.exit(0)
 for k,v in seen:
     print("%s\t%s" % (k,v))
 PY
@@ -2092,6 +2126,16 @@ PY
     # successful re-attempt. Closing it here is deliberately NOT done: this path is reached without a
     # liveness re-check, so an unconditional reap of `wt-<name>` could end a LIVE lane holding that name —
     # the one thing this file never does. Recorded as a residual on #2404.
+    # ⛔ A SPAWN DOES NOT ADD A FOURTH `wt-<name>` WORKSPACE (agent-infra#2312, measured above).
+    # Every dispatch of an issue whose previous lane's surface was never closed used to create ONE MORE
+    # workspace under the SAME name, and the reap frees only the id in the record — so the registry grew
+    # without bound (134 workspaces over 26 names, 124 of them idle, on one cell; the incident at 981
+    # workspaces / 0 bytes free). Clearing the name's IDLE surfaces first makes the registry bounded by
+    # the number of NAMES in use rather than by the number of spawns: "a reused workspace is the
+    # default", and the workspace itself is recycled rather than leaked. It cannot touch a live lane —
+    # the sweep skips any workspace holding a running terminal, and an `empty` one (a create in flight)
+    # — and it is bounded (`WT_IDLE_SWEEP_MAX`).
+    wt_sweep_idle_workspaces "$name"
     _larc=0
     out="$(printf '%s\n' "$doc" | cmux layout apply --name "wt-$name" --cwd "$cwd" --json - 2>&1)" || _larc=$?
     if [ "$_larc" -ne 0 ]; then
@@ -2244,6 +2288,74 @@ EOF
   return 0
 }
 
+# wt_sweep_idle_workspaces [<name>] — free every `wt-<name>` workspace (or every `wt-*` when the
+# name is empty) whose terminals have ALL exited. Prints nothing when there was nothing to free; says
+# what it did, verified, when there was.
+#
+# ⛔ WHY THIS EXISTS (agent-infra#2312). The workspace registry is the durable trace of every spawn, and
+# nothing ever removed the ones whose lane had ENDED. The mechanism is in this file: the worker record
+# is PER NAME (`worker-<name>`, holding one workspace id), so each spawn of a recycled name overwrites
+# its predecessor's id, and `wt_close` addressed only the id in the record. Every older surface of that
+# name then belonged to nobody: no record named it, so the record-driven reaper never looked at it, and
+# the census deliberately AGGREGATES by name (`wt_tree_probe`), so a name with 29 workspaces still
+# printed one row and read "dead" — the multiplicity was invisible on every surface an operator reads.
+# Measured 2026-11-10 on one cell: 134 workspaces over 26 distinct names, exactly one terminal each,
+# **124 idle**, `workspace-registry.sqlite3` at 8.26 GB on a 7.9 GB volume at 99 % (128 MB free); the
+# incident this issue records reached 981 workspaces / 0 bytes free, at which point EVERY `cmux`
+# mutation fails — including the close that would drain it — and no lane can start on that box again.
+#
+# ⛔ WHAT IT MAY DESTROY, SAID OUT LOUD. Removing a workspace discards that terminal's SCROLLBACK. It
+# is done only when the terminal has already EXITED, so no lane, process or uncommitted edit can be
+# behind it (the polarity rule this file states for liveness is the same one here: a workspace is
+# swept only on a POSITIVE "no running terminal" reading, and `live`/`empty`/unreadable all spare it).
+# A worker's durable evidence does not live in its scrollback: `$O/logs/<worker>.log`, the run script
+# and the env snapshot are on disk and are untouched. It never runs `cmux server stop --force`, which
+# is the lever that ends LIVE terminals — the one the self-healing contract keeps an operator action
+# (`docs/ops/self-healing-contract.md` §3.8).
+#
+# ⛔ AND IT VERIFIES ITS OWN RESULT. A sweep that reports "freed N" on the strength of `cmux workspace
+# rm` exit status would be a FALSE PASS of exactly the shape this issue is about (`cmux` refuses a
+# mutation and exits 0 on a full volume); so the count is the number the daemon was ASKED to remove and
+# the line states what the RE-READ still finds, including `could NOT confirm` when the census cannot be
+# read at all.
+wt_sweep_idle_workspaces() {
+  local name="" tree rows k id st n=0 max left
+  [ "${WT_IDLE_SWEEP:-1}" = "0" ] && return 0
+  command -v cmux >/dev/null 2>&1 || return 0
+  # The name rule is `wt_name_ok`'s: anything else is not a workspace this launcher could have made.
+  if [ -n "${1:-}" ]; then wt_name_ok "$1" || return 0; name="wt-$1"; fi
+  max="${WT_IDLE_SWEEP_MAX:-50}"; case "$max" in ''|*[!0-9]*|0*) max=50 ;; esac
+  tree="$(wt_bounded "${WT_TREE_TIMEOUT:-15}" cmux tree --json 2>/dev/null)" || return 0
+  [ -n "$tree" ] || return 0
+  rows="$(printf '%s\n' "$tree" | python3 -c "$WT_WS_PY" "$name" liveness 2>/dev/null)" || rows=""
+  [ -n "$rows" ] || return 0
+  while IFS="$(printf '\t')" read -r k id st; do
+    [ "$k" = "ws" ] || continue
+    [ "$st" = "idle" ] || continue      # live | empty | anything else: spared, never guessed at
+    [ -n "$id" ] || continue
+    [ "$n" -lt "$max" ] || break
+    cmux workspace rm "$id" >/dev/null 2>&1
+    n=$(( n + 1 ))
+  done <<EOF
+$rows
+EOF
+  [ "$n" -gt 0 ] || return 0
+  # The census is now WRONG about this box, and `wt_table` memoises it in a file.
+  wt_forget
+  left="$(
+    wt_bounded "${WT_TREE_TIMEOUT:-15}" cmux tree --json 2>/dev/null \
+      | python3 -c "$WT_WS_PY" "$name" liveness 2>/dev/null \
+      | awk -F'\t' '$1=="ws" && $3=="idle" {c++} END {print c+0}'
+  )"
+  case "${left:-}" in
+    ''|*[!0-9]*)
+      wt_warn "SWEPT ${name:-<all wt-*>}: asked the daemon to remove $n idle workspace(s) (their terminals had ALL exited), and the re-read could NOT confirm the result — the remaining count is UNVERIFIED" ;;
+    *)
+      wt_warn "SWEPT ${name:-<all wt-*>}: asked the daemon to remove $n idle workspace(s) (their terminals had ALL exited); the re-read still finds $left idle workspace(s) of that name" ;;
+  esac
+  return 0
+}
+
 # wt_close <name> — kill the worker and PROVE it is gone. Returns 1 when it cannot prove that, and
 # then it KEEPS the record so a later cycle retries: "closed" is a claim about reality, and a reaper
 # that reports a kill it did not verify is the same class of lie as a spawn that never happened.
@@ -2262,6 +2374,15 @@ wt_close() {
       # A record with neither field (an older harness) has nothing to address by id: fall back to
       # the workspace name, the same handle the census uses.
       [ -z "$id" ] && [ -z "$ws" ] && wt_close_named_surface "$name"
+      # ⛔ AND EVERY OTHER `wt-<name>` WORKSPACE, NOT ONLY THE RECORDED ONE (agent-infra#2312). The
+      # record is PER NAME, so each spawn OVERWRITES the previous one's workspace id: the closed id is
+      # the newest, and every older surface of that name became unreachable for ever — no record names
+      # it, and `wt_close_named_surface` (which exists precisely for a surface no record names) was
+      # reached only from the tmux arm and the no-handle arm, never from here. Measured on one cell,
+      # 2026-11-10: `wt-chain-9` × 29, `wt-lane-9` × 28, `wt-lane-7`/`wt-chain-7`/`wt-lane-8`/`wt-chain-8`
+      # × 14 each — 124 of 134 workspaces idle, i.e. 124 terminated lanes still occupying the registry.
+      # The tmux arm has always swept by name here; a durable terminal is the one surface that did not.
+      wt_sweep_idle_workspaces "$name"
       ;;
     *)
       # tmux: resolve the pane pid BEFORE killing the session (the session is what holds it), kill the
