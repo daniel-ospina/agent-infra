@@ -751,10 +751,16 @@ def _key():
 # different states (the same distinction as "sent" vs "delivered" in the dispatch path), so the
 # call site is told WHICH one it is in, in the words the rest of the fleet greps for. Measured
 # 2026-10-24 on a cell: nine owner questions were posted and none reached the queue.
+# ⛔ AND IT NAMES NO CAUSE, ON PURPOSE (#2642 review). Exit 2 covers FIVE outcomes (an unreadable
+# issue, an unreadable answer state, a partial 200 body, and `jev()`'s three scoring failures: no key,
+# a rejected key, a failed call), so a sentence that said "no TypeSafe key" would be FALSE on a box
+# whose key is present and wrong — the state this file's own doc calls out, where the first real
+# question returns `jev http 401`. The cause is printed by whoever KNOWS it, on the line above; this
+# sentence states only the consequence, which is the same for all five.
 UNSCORED = ("UNSCORED — the owner queue did not receive this: the gate could not score it, "
             "so it was neither labelled `owner-decision` nor bounced. `posted` is not `queued`; "
-            "record it in your own report as UNROUTED (and see docs/ops/decision-gate.md for the "
-            "one-time provisioning the box needs).")
+            "record it in your own report as UNROUTED (see the line above for the cause, and "
+            "docs/ops/decision-gate.md for the provisioning that fixes a missing credential).")
 
 
 def jev(state):
@@ -780,9 +786,18 @@ def jev(state):
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         print(f"jev http {e.code}: {e.read().decode()[:300]}")
+        # ⛔ A REJECTED KEY AND A FAILED CALL ARE SCORING FAILURES TOO (#2642 review). `UNSCORED`
+        # used to be printed ONLY on the no-key arm, so on a box whose key is present-but-wrong the
+        # `unscored` count in `--scan`'s summary incremented while not one `UNSCORED` sentence
+        # appeared — the count and the vocabulary disagreed about the same event, and the heartbeat's
+        # alert (which read the count) told the operator to provision a key that was already there.
+        # Every arm that returns None from here is "the gate could not score it", which is exactly
+        # what the sentence says; the arm-specific cause is the line printed just above it.
+        print(UNSCORED)
         return None
     except Exception as e:  # noqa: BLE001
         print(f"jev call failed: {e}")
+        print(UNSCORED)
         return None
 
 
@@ -1352,7 +1367,17 @@ def scan(dry):
             # LESS than pending with nothing saying why — so a box that could not score anything (no
             # key: every cell, measured 2026-10-24) read exactly like a quiet tick. The count alone
             # is not enough: the sentence is what an operator acts on.
+            # ⛔ AND NAMED PER QUESTION, WHICH A COUNT IS NOT (#2642 review). `main()` returns 2 from
+            # FIVE sites and only `jev()`'s arms print a sentence — so on the no-key path every
+            # question emitted the SAME two lines and NOTHING in the log carried `repo#number`. The
+            # count arrived; the LIST did not, and assembling it by hand is what #2642's own body had
+            # to do. This branch cannot know the cause (`2` also covers an unreadable issue, an
+            # unreadable answer state and a partial body), so it carries the IDENTITY and leaves the
+            # cause to the line above it — which is the only place that knows.
             nunscored += 1
+            print(f"UNSCORED {repo}#{n} — the owner queue did not receive this: the gate"
+                  f" could not score it (the cause is on the lines above), so it was neither"
+                  f" labelled `owner-decision` nor bounced")
         rc = rc or r
     if len(pending) > MAX_SCAN:
         print(f"(capped at {MAX_SCAN} this tick; {len(pending) - MAX_SCAN} left "
