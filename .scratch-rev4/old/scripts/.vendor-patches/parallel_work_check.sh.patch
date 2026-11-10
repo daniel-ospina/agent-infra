@@ -1,0 +1,159 @@
+--- a/scripts/parallel_work_check.sh
++++ b/scripts/parallel_work_check.sh
+@@ -23,7 +23,9 @@
+ #                checkpoint_pass + overlap_decision events, advance_phase
+ #
+ # UNKNOWN = infra/timeout. The PASS token (default
+-# /tmp/parallel-check-token.json) is written ONLY on a CLEAR verdict —
++# /tmp/parallel-check-token.json, PER-SESSION scoped to
++# /tmp/parallel-check-token.<session-id>.json when run inside a pi session —
++# PI_SESSION_ID is set; #378) is written ONLY on a CLEAR verdict —
+ # UNKNOWN at a gated checkpoint means NO token and the enforcer gate
+ # (issue #5039) blocks with retry(2)+override. Phase gates never silently
+ # pass; advisory reads fail open to CLEAR.
+@@ -36,7 +38,9 @@
+ #   SWARM_CARD_ID|CARD_ID  AGENT_ID|SWARM_AGENT_ID
+ #   SWARM_TOUCHED_PATHS|TOUCHED_PATHS  PARALLEL_CHECK_SYMBOL
+ #   PARALLEL_CHECK_TIMEOUT_SECS (budget, default 2 — overrun → UNKNOWN)
+-#   PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json)
++#   PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json —
++#     per-session scoped to parallel-check-token.<PI_SESSION_ID>.json inside
++#     a pi session, #378)
+ #   PARALLEL_CHECK_REPO (repo fallback for --repo)
+ #   CHECKOUT_GUARD_* passthrough (checkout_guard.sh config)
+ set -uo pipefail
+@@ -85,10 +89,78 @@
+ # Budget: python enforces PARALLEL_CHECK_TIMEOUT_SECS internally and emits
+ # UNKNOWN on overrun; this shell watchdog is the hard backstop for a hung
+ # subprocess (bounded, env-overridable — swarm #196 pattern).
++# #383 patch: the watchdog budget is CLAMPED to PARALLEL_CHECK_BUDGET_MAX
++# (env, default 60) so an unbounded or non-finite value (inf/nan/1e309)
++# cannot stall the watchdog indefinitely (GNU `sleep inf` sleeps forever).
++# This .sh clamp is the HARD BACKSTOP and deliberately DIVERGES from the
++# python side (which clamps python's OWN deadline — min(float(raw),
++# BUDGET_MAX), except (ValueError, OverflowError) → default 60): the regex
++# gate maps non-finite raw strings to the default 2.0 (python: inf → 60.0,
++# nan → immediate UNKNOWN), the min clamp floors "0" at 0.05 (python: 0.0),
++# and a cap > 86400 resets to 60 (python accepts it verbatim). Every
++# divergence is fail-closed: the watchdog always fires within a bounded
++# window (≤ cap+2s), so a HUNG python is SIGKILLed → fail-closed UNKNOWN,
++# never a stall and never a wrongly-passing gate.
+ budget="${PARALLEL_CHECK_TIMEOUT_SECS:-2}"
++budget_max="${PARALLEL_CHECK_BUDGET_MAX:-60}"
++budget="$(awk -v b="$budget" -v m="$budget_max" 'BEGIN {
++    # Regex-gate the raw strings first: one-true-awk (macOS) leaves "nan"/
++    # "inf" as STRINGS that compare lexically ("nan" >= "0" is true), so
++    # the numeric NaN test (x != x) is unreliable across awk impls. Only a
++    # plain finite decimal literal is accepted; anything else → default.
++    # The max cap (m) gets the same gate + a hard ceiling: a non-finite or
++    # absurd cap would otherwise let x escape as inf through the compare
++    # and re-open the indefinite-stall class.
++    if (b ~ /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/) x = b + 0;
++    else x = -1;                       # non-numeric → default below
++    if (m ~ /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/) m = m + 0;
++    else m = 60;                       # non-numeric cap → default
++    if (!(m > 0) || m > 86400) m = 60; # inf/overflow/negative/absurd cap → default
++    if (!(x >= 0) || x > m) x = (x > 0) ? m : 2;  # NaN/negative → default; overflow → max
++    if (x < 0.05) x = 0.05;            # min clamp ("0" → fast watchdog)
++    printf "%.1f", x }' 2>/dev/null || echo "2.0")"
+ watchdog_s="$(awk -v b="$budget" 'BEGIN { printf "%.1f", b + 2.0 }' 2>/dev/null \
+     || echo "4.0")"
+ 
++# #383 patch: the token path must be resolved here too — the error branch
++# unlinks it (see below).
++# #378 patch: the DEFAULT is now PER-SESSION scoped — pi injects PI_SESSION_ID
++# (== ctx.sessionManager.getSessionId()) into bash-tool child envs, so a
++# checker run inside a pi session writes /tmp/parallel-check-token.<sid>.json
++# and the enforcer of THAT SAME session reads it (concurrent sessions no
++# longer share/clobber one machine-global file). This wrapper MUST derive the
++# identical path for its error-branch unlink (a watchdog SIGKILL skips
++# python's own cleanup). Sanitization mirrors the python side (utf-8 bytes)
++# and the enforcer (Node Buffer) BYTE-wise via `tr -c` — every byte outside
++# [A-Za-z0-9._-] becomes '_', so the three implementations can never drift
++# (session ids are ASCII UUIDs in practice; byte-wise keeps parity even then).
++# No PI_SESSION_ID (operator shell run) or an explicit PARALLEL_CHECK_TOKEN_FILE
++# → the legacy unscoped path / verbatim override, matching python + enforcer.
++# LC_ALL=C pins `tr` to BYTE-wise semantics on every platform (a UTF-8-locale
++# BSD tr maps one multibyte char → one '_' while GNU/Linux tr and python map
++# each byte → a divergent filename; ids are ASCII in practice, but the C-locale
++# pin keeps the three implementations byte-identical even for exotic input).
++# The id is whitespace-trimmed first (python `.strip()` / TS `.trim()` parity)
++# so a padded or ALL-whitespace id falls back unscoped on every side.
++token_file="${PARALLEL_CHECK_TOKEN_FILE:-}"
++if [ -z "$token_file" ]; then
++    # Trim leading+trailing ASCII whitespace so a padded / ALL-whitespace id
++    # behaves like the python (strip " \t\n\r\v\f") and TS (same set) sides —
++    # all-whitespace MUST fall back to the UNSCOPED path on EVERY side (the
++    # #378 parity invariant). The trim is WHOLE-STRING via parameter expansion
++    # (a sed line-record trim would diverge from python/TS on an embedded or
++    # leading newline) and locale-independent (no [:space:] class lookup).
++    token_sid_raw="${PI_SESSION_ID:-}"
++    while [[ "$token_sid_raw" == [$' \t\n\r\v\f']* ]]; do token_sid_raw="${token_sid_raw#?}"; done
++    while [[ "$token_sid_raw" == *[$' \t\n\r\v\f'] ]]; do token_sid_raw="${token_sid_raw%?}"; done
++    token_sid="$(printf '%s' "$token_sid_raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
++    if [ -n "$token_sid" ]; then
++        token_file="/tmp/parallel-check-token.${token_sid}.json"
++    else
++        token_file="/tmp/parallel-check-token.json"
++    fi
++fi
++
+ tmp_out="$(mktemp "${TMPDIR:-/tmp}/parallel-check-out.XXXXXX")"
+ 
+ args=("$phase")
+@@ -96,10 +168,28 @@
+ [ -n "$symbol" ] && args+=(--symbol "$symbol")
+ 
+ set +e
+-"$PYTHON_BIN" "$SCRIPT_DIR/parallel_work_check.py" "${args[@]}" \
+-    >"$tmp_out" 2>/dev/null &
+-pid=$!
+-( sleep "$watchdog_s"; kill -9 "$pid" 2>/dev/null ) &
++# #383 patch: run python in its own process group (setsid, Linux/CI) so the
++# watchdog can kill the WHOLE tree — a hung `git fetch` subprocess must die
++# with python instead of orphaning (macOS lacks setsid → plain kill; the
++# orphan corner is documented in VENDOR.md).
++# #391: each watchdog subshell redirects its stdio to /dev/null — on macOS
++# bash 3.2 `kill "$watchdog_pid"` below kills the subshell but ORPHANS its
++# `sleep` child, which would otherwise hold the caller's stdout/stderr pipe
++# open until the full watchdog timer (budget+2.0s) elapses, so every
++# invocation under pipe capture blocked for budget+2.0s. Redirecting the
++# subshell's fds means the orphaned `sleep` holds /dev/null instead, and the
++# caller's pipe closes as soon as the script exits.
++if command -v setsid >/dev/null 2>&1; then
++    setsid "$PYTHON_BIN" "$SCRIPT_DIR/parallel_work_check.py" "${args[@]}" \
++        >"$tmp_out" 2>/dev/null &
++    pid=$!
++    ( sleep "$watchdog_s"; kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
++else
++    "$PYTHON_BIN" "$SCRIPT_DIR/parallel_work_check.py" "${args[@]}" \
++        >"$tmp_out" 2>/dev/null &
++    pid=$!
++    ( sleep "$watchdog_s"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
++fi
+ watchdog_pid=$!
+ wait "$pid"
+ rc=$?
+@@ -110,8 +200,22 @@
+ rm -f "$tmp_out"
+ 
+ if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
++    # #383 patch: a watchdog SIGKILL skips python's own cleanup — a stale
++    # CLEAR token would otherwise survive and the enforcer's marker advance
++    # would pass a check the operator just saw fail. Unlink the token AND
++    # the checker's own tmp files, scoped to the token's prefix — an
++    # unscoped `*.tmp.*` glob in /tmp would delete unrelated same-user tmp
++    # files and a concurrent invocation's in-flight unique tmp.
++    rm -f "$token_file" "$(dirname "$token_file")/$(basename "$token_file")"*.tmp.* 2>/dev/null || true
+     echo "$code: UNKNOWN  check-timeout-or-error rc=$rc  options="
+ else
++    # #383 patch: UNKNOWN verdicts exit 0 by design — the token must not
++    # survive a non-CLEAR verdict either (the enforcer marker advance reads
++    # only the token file, never the verdict line).
++    case "$out" in
++        *": CLEAR"*) ;;
++        *) rm -f "$token_file" 2>/dev/null || true ;;
++    esac
+     echo "$out"
+ fi
+ 

@@ -1,0 +1,2292 @@
+#!/usr/bin/env bash
+# atomic-land.sh — the atomic land unit: update → verify → record → land (#1367).
+#
+# WHY THIS EXISTS. Two required conditions on `main` are jointly unsatisfiable
+# while `main` moves: `strict: true` requires an up-to-date head, and the
+# head-bound review evidence (`ai-review-gate`, and the local review-enforcer
+# merge gate) must be bound to the head sha. Satisfying the first MOVES the head
+# and stales the record; `main` advances every ~20-40 min while a full CI cycle
+# is ~50 min, so the four steps performed as separate agent turns lose the
+# window and the attestation dies for nothing. The measured shape is tortoise
+# #4764 (48/69 open PRs with no valid attestation) and the O3 rebase sweep
+# (22 updated, 17 fresh attestations invalidated, 0 landed).
+#
+# The owner's ruling on the order (tortoise #4764, comment 2026-09-22) is:
+#
+#   1. update      — bring the branch up to date with the base   (moves the head)
+#   2. VERIFY      — the checks at the NEW head                  (step 2 is mandatory:
+#                                                                  a base move can change
+#                                                                  the code AROUND the
+#                                                                  reviewed lines)
+#   3. RECORD      — record-review.sh, given the PRIOR head as the equivalence
+#                    input; its carry-forward arm (#767) re-binds the record to
+#                    the NEW head iff the reviewed diff is content-unchanged
+#                    (sha256 over the NORMALIZED diff, #1362 D1 — the rendering
+#                    may re-flow across a base move; the change may not)
+#   4. land        — the repo's mandated rail, never a hand-rolled merge
+#
+# Steps 1-3 are atomic per PR: an update that ends without a record at the new
+# head has consumed the previous attestation and produced nothing landable. The
+# RECORD step is therefore also a PRECONDITION of the update, not only its
+# consequence: when the record is ALREADY stale, step 1 asks the record step about
+# the CURRENT head FIRST and refuses the update if that step refuses on CONTENT
+# (#2369) — a head move whose record step cannot follow it buys nothing and costs a
+# full CI cycle at the new head. A refusal on the CURRENT head's HEALTH (the #1575
+# clause (E) red-head veto) does NOT block the update: refreshing is the only
+# remedy the RAIL has for a drift-caused red, and step 3 re-runs that veto at the
+# new head. A red the head itself owns is still refused there — that residual (one
+# head move plus a CI cycle) is accepted, not fixed, by this guard.
+#
+# WHAT THIS SCRIPT IS NOT. It CANNOT review. It carries an EXISTING signed
+# verdict across a base-only update — `record-review.sh`'s carry-forward arm
+# (agent-infra #767) fires iff the PR already carries an AUTHENTIC marker whose
+# `diff=` equals the live three-dot diff, so the head move is provably a no-op
+# to the reviewed artifact. When the diff changed, or no such evidence exists,
+# the record step exits 3 and this rail STOPS and names the fresh review
+# required. It never writes a record itself, and it never merges directly.
+#
+# FAIL-CLOSED INVARIANTS (this is gate/enforcement code):
+#   * THE REFRESH DOES NOT DEPEND ON A PROTECTION SETTING — WITH ONE DECLARED,
+#     LIVE, NARROW EXCEPTION (#1565). The rail's inputs are the PR's own state
+#     (head, base, base MERGE BASE, checks) and the two scripts that own the
+#     review and the merge. `BEHIND` is used only as a head/base DIVERGENCE
+#     signal ("the head is out of date"), never as a proxy for a protection
+#     setting: the documented enum semantics say BEHIND can occur with or without
+#     strict, and strict is only what makes it block.
+#     OVERRIDES: the former "the rail never reads a protection setting, and is
+#     correct with strict ON or OFF" invariant — narrowed to ONE positive read of
+#     `strict` per invocation (strict_of()), at the step-1 decision point ONLY, in
+#     BOTH step-1 arms: the BEHIND enum arm, AND the base-drift arm for the
+#     landable states `CLEAN|UNSTABLE` only. #1565's ruling that the drift arm must
+#     stay ungated ("a BLOCKED PR is still mergeable: true", so gating it would
+#     skip the refresh #1533 needed) is NARROWED, not reversed — `BLOCKED`, every
+#     other or unknown state, and any unreadable read still refresh. The record
+#     lives on agent-infra#1565, whose own text carries the matching marker.
+#     Rationale, measured (#1565): the refresh's cost is a head move, which
+#     invalidates the head-bound review record (clause B5), forces a full CI run at
+#     the new head (critical path 17.1m median / 19.8m max), and then makes the rail
+#     wait up to 5400s for those checks to go terminal — while `strict: false` means
+#     the pin buys no mergeability at all (nine PRs sat OPEN+MERGEABLE unlanded for
+#     ~2h paying it). The read is LIVE and per-invocation (never cached: a stored
+#     belief about branch protection cannot disagree with GitHub, it can only be
+#     silently wrong) and it FAILS CLOSED — anything but a positive `false`
+#     (404/403/`null`/empty: protection unconfigured, or a token without admin on
+#     the repo) keeps the refresh exactly as it was. The merge and the record never
+#     consult it. ATOMIC_LAND_REFRESH_ALWAYS=1 restores the unconditional refresh
+#     in BOTH arms.
+#     The gate applies to the BEHIND arm AND to the base-drift arm below, for the
+#     states that are ALREADY LANDABLE — `CLEAN` (every check passed) and `UNSTABLE`
+#     (the REQUIRED checks passed; only non-required ones fail or pend), both
+#     landable under `strict: false`, which is the #7230 non-termination. The drift
+#     arm stays conditional on `behind_by > 0` and is NOT gated for `BLOCKED`,
+#     because it exists for the #1533 case — a BLOCKED branch whose drift red could
+#     never resolve without an update — and a BLOCKED PR is still `mergeable: true`
+#     (no conflicts; it has a red required leg). Gating that state would skip exactly
+#     the refresh #1533 needed.
+#   * No accepted-verdict review record → refuse before any mutation.
+#   * A draft → refuse before any CI work (`gh` refuses to merge a draft).
+#   * A changed/unprovable diff → the record step refuses (exit 3) → STOP.
+#   * The merge is `admin-merge.sh`, whose own evidence + decision own the
+#     merge; this script adds no merge path — except `--queue` below, which adds
+#     no merge either: it HANDS the PR to the Mergify merge queue and observes.
+#   * On the DIRECT path the merge is CONFIRMED by polling the PR's merged state
+#     — never inferred from the rail's exit status alone (#1359: the rail once
+#     printed "merged" while the PR was still open). `--queue` cannot confirm a
+#     merge and does not claim one: it reports what the QUEUE published, and exit
+#     0 there means the queue TOOK the PR (see `Exit:`), which is a different
+#     event from a merge.
+#   * `--dry-run` mutates nothing: no update, no record, no comment, no merge.
+#
+# --queue (opt-in, and the reason it exists)
+#   The default land step admin-merges THIS PR immediately, which costs one full CI
+#   cycle per PR — a head is certified on its own, and nothing re-uses that work for
+#   the next PR. `.mergify.yml` declares a merge queue whose `batch_size: 4` validates
+#   up to four PRs in ONE CI run on the composition that will actually land, which is
+#   the throughput the owner asked about.
+#
+#   MEASURED 2026-10-23, so the claim is a number and not an impression: 41 PRs landed
+#   in ~12h and NONE reports a Mergify/bot identity — every one is attributed to the
+#   fleet's own account, which is what a direct land looks like from the outside. (That
+#   field cannot attribute a MECHANISM: every session in the fleet authenticates as that
+#   same account, so it says "no bot merged these", NOT "this rail merged these".) The
+#   repo's auto-queue setting is not carrying the work either: the queue announced TWO
+#   enqueues in that span (#9528 on 10-22, #9604 on 10-23). So the queue is not starved
+#   of a CONFIG, it is starved of hand-offs, and this flag is the hand-off.
+#
+#   ⛔ Do not read that as "auto-queue is broken": it is a config the target repo owns
+#   and this rail does not touch. The number says the direct step is what lands.
+#
+#   `--queue` replaces the LAND step only, and in that path the rail also stops
+#   doing the two things the queue does better: it does NOT update the branch (Mergify
+#   merges it onto the current base inside `mergify/merge-queue/main` — #3016 Option 1)
+#   and it does NOT wait for the head's checks to go terminal (entry gates on the cheap
+#   `queue_conditions`; the heavy `python-ci-gate` is re-run on the composition). What
+#   still binds, unchanged: the accepted-verdict record at the CURRENT head, and a
+#   re-read of the head immediately before the hand-off — the record remains the gate.
+#
+#   ⛔ It touches NO check, NO branch protection and NO `strict`. Entry is
+#   `queue_conditions` in the target repo's `.mergify.yml`, which already includes
+#   `check-success=ai-review-gate` — the server-side enforcement of the very record
+#   this rail verified locally (#5433). `strict: true` is an OPEN DECISION (#3016)
+#   and this flag does not depend on it.
+#
+#   The fallback trigger is the target repo's DECLARATION, never a missing check-run:
+#   if its `.mergify.yml` declares no `queue_rules:` (or has no such file at all) the
+#   rail prints `QUEUE-NOT-ARMED` and falls back to the EXISTING land path — the whole
+#   path, its guards included — naming that it did. Do NOT "improve" this to trigger on
+#   an absent check-run: measured 2026-10-23, 3 of 12 open tortoise PRs had no Mergify
+#   run at their head while the queue was armed, so that test reports live work as
+#   unqueued. An UNREADABLE declaration stops instead of falling back.
+#   If the queue reports unmet entry conditions, the rail prints them verbatim and
+#   refuses — an entry refusal is a reported result, never a merge by another door.
+#
+# Usage:
+#   scripts/atomic-land.sh <PR> [--repo owner/repo] [--dry-run] [--no-wait]
+#                              [--wait-timeout S] [--poll S] [--max-rounds N]
+#                              [--no-cite] [--queue] [-- <extra admin-merge flags>]
+#
+#   --repo owner/repo   repo for the gh calls (default: gh's own resolution)
+#   --dry-run           compute + print the plan; mutate NOTHING. The land step
+#                       is invoked with `--dry-run` appended, so its verdict is
+#                       a read-only inspection.
+#   --no-wait           do not wait for the head's checks to become terminal;
+#                       hand the head to the rail as-is (its own "the head must
+#                       have been tested" precondition then decides).
+#   --wait-timeout S    bound on the terminal-CI wait (default 5400)
+#   --poll S            poll interval for the waits (default 30)
+#   --max-rounds N      rounds of update→verify→record→land (default 2, max 5):
+#                       a base advance mid-unit can return the PR to BEHIND, and
+#                       the carry-forward makes one more round safe.
+#   --no-cite           do not post the reuse citation comment after a carry-forward
+#   --queue             hand the PR to the Mergify merge queue instead of
+#                       admin-merging it now (see `--queue` above). Exits 0 once
+#                       the queue has TAKEN the PR; the merge itself lands later
+#                       and is the queue's artifact to prove, not this rail's.
+#   -- <flags>          passed through to admin-merge.sh (e.g. -- --merge)
+#
+# Exit: 0 = landed (or a --dry-run inspection completed) — EXCEPT under `--queue`,
+#       where 0 means the merge queue has TAKEN the PR: it is queued, NOT merged,
+#       and the PR is still OPEN. Read the queue's state, not this code, for the
+#       merge. A caller must never record a PR as landed on exit 0 with `--queue`
+#       (#1359's false success, moved from the output into the documented
+#       interface);
+#       1 = STOP (a named refusal — fresh review required, base red, checks not
+#       terminal, merge failed or unconfirmed, queue paused or unreadable);
+#       2 = usage/config error.
+#
+# Env seams (tests):
+#   ATOMIC_LAND_GH          the gh command (default: gh)
+#   ATOMIC_LAND_RECORD_SH   record-review.sh (default: sibling record-review.sh,
+#                           else $HOME/.pi/agent/scripts/record-review.sh)
+#   ATOMIC_LAND_ADMIN_MERGE admin-merge.sh (default: sibling admin-merge.sh)
+#   ATOMIC_LAND_DRIFT_GUARD the drift predicate's argv (default: `uv run python
+#                           <cwd repo root>/tools/drift-guard.py` — see
+#                           drift_safe_of(); #7727)
+#   ATOMIC_LAND_CONFIRM_MAX how many times to confirm the merge via the API
+#                           (default: 60) — a non-zero admin-merge exit is never
+#                           read as success; the .merged poll is the only proof.
+#   ATOMIC_LAND_LOCK_DIR    the per-PR lock directory (default: $HOME/.pi/agent/locks).
+#                           Deliberately NOT under $TMPDIR, which is caller-controlled.
+#   ATOMIC_LAND_LOCK_GRACE  seconds a pid-less lock is treated as LIVE, not stale
+#                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
+#   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
+#                           before failing closed (default: 5).
+#   ATOMIC_LAND_TRANSIENT_POLLS  re-polls EVERY GitHub value this rail captures
+#                           when the read comes back EMPTY, before the caller's
+#                           fail-closed test sees it (default: 5, capped at 20;
+#                           spaced at min(--poll, 2)s). See `gh_read()` — the
+#                           shared helper #1558 moved the re-poll into.
+#   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a drifting head (a BEHIND enum, or
+#                               base drift on a landable state), ignoring the live
+#                               `strict` read (the #1565 fail-safe restore)
+#   ATOMIC_LAND_QUEUE_POLLS     with --queue, how many `--poll`-spaced reads to take
+#                               of the queue state while waiting for the queue to
+#                               take the PR (default: 20; 0 = read once, do not wait)
+#
+# The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
+# extensions/review-enforcer/index.ts. If that list widens, widen this one too.
+
+set -uo pipefail
+
+# ⛔ THE RESERVE IS SPENT BY LANDINGS ONLY — AND "THE RESERVE" IS NOT THIS SCRIPT (#2342 review, P1).
+# `gh-limit.py` keeps a reserve below `GH_LIMIT_CORE_FLOOR` (default 800) and refuses a core-only read
+# that could not be served from GraphQL. This file used to carry a file-scope
+# `export GH_LIMIT_ESSENTIAL=1` here, which made EVERY `gh` in this script — and in every child it
+# spawns — exempt from that floor. That is the opposite of the policy the layer states
+# (`gh-limit.py::essential()`: "A poll is never essential"; docs/ops/gh-rate-limits.md:454): the
+# floor's reason to exist is the spend measured on THIS rail's own poll loops, so exempting them left
+# the guard unable to fire on its target. ⛔ AND IT BOUGHT THE LANDING'S WRITE NOTHING: `essential()`
+# has exactly one call site, on the NON-mutating arm — a write is refused only by the dated-empty
+# guard, which never consults it. The one in-tree declaration is therefore per call, on the read a
+# landing genuinely cannot do without: `repo-authority.sh::required_checks`
+# (`GH_LIMIT_ESSENTIAL=1 "$gh" api …/protection/required_status_checks`).
+
+PR=""
+REPO=""
+# The cwd checkout's repo slug AND root, resolved alongside $REPO in resolve_repo().
+# Kept separate so drift_safe_of() can tell "this repo has no drift gate" from "we are
+# pointed at a different repo" (#7727). The ROOT is needed because `gh repo view`
+# walks up (so the slug matches from any subdirectory) while a relative
+# `tools/drift-guard.py` test does NOT — mixing the two let a subdirectory read a
+# present tool as absent. Declared here because `set -u` is on.
+CWD_REPO=""
+CWD_ROOT=""
+# The cwd repo's canonical https URL, as gh reports it. The drift predicate fetches
+# the checkout's `origin` remote, and a remote is (host, owner, name): the slug check
+# pins owner/name, and this pins the host — a same-slug remote on ANOTHER host (a
+# mirror, a GHE/GitLab path) is a different repository (#7727).
+CWD_URL=""
+DRY_RUN=0
+NO_WAIT=0
+NO_CITE=0
+QUEUE_MODE=0
+# Set when the PR was actually handed to the queue (so the merge is the queue's to
+# complete: `confirm_merged` would otherwise read "queued" as "not merged").
+QUEUE_HANDED=0
+WOULD_UPDATE=0
+WAIT_TIMEOUT=5400
+POLL=30
+MAX_ROUNDS=2
+QUEUE_POLLS="${ATOMIC_LAND_QUEUE_POLLS:-20}"
+MERGE_FLAGS=()
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GH="${ATOMIC_LAND_GH:-gh}"
+RECORD_SH="${ATOMIC_LAND_RECORD_SH:-}"
+ADMIN_MERGE="${ATOMIC_LAND_ADMIN_MERGE:-$SELF_DIR/admin-merge.sh}"
+# The drift predicate's argv (#7727). Repo-local BY DESIGN: the tool lives beside
+# the CI job that runs it (`tools/drift-guard.py` in the target repository), not in
+# this shared rail, so the default resolves it against the cwd checkout's ROOT —
+# see drift_safe_of(). Overridable as a whole, exactly like $GH/$RECORD_SH/
+# $ADMIN_MERGE, so the suite can serve it hermetically. The override is read at the
+# two sites inside drift_safe_of() (the missing-tool test and the argv) rather than
+# cached here, because the default depends on $CWD_ROOT, which is only known after
+# resolve_repo().
+#
+# The "is there a drift gate?" question is answered from the TARGET'S BASE REF —
+# `origin/$BASE`, the same ref the predicate itself measures against, read locally.
+# A stale checkout or a locally deleted file used to read "no gate" for a repo that
+# HAS one and take the skip unmeasured; the skip now requires the positive pair (the
+# ref is readable here AND does not contain `tools/drift-guard.py`), so anything
+# short of that refreshes. Separately, a cwd repo that is not the target is never
+# read as "no gate", and a `origin` remote that is not the target's — a fork, a
+# mirror, another host, an unreadable authority — is refused by the assertions below
+# rather than skipped. What remains deliberately unchecked is that this checkout is on
+# a branch whose BASE REF is the reviewed one: `origin/$BASE` is by construction the
+# ref the predicate compares the head against, so the question does not arise.
+
+if [ -z "$RECORD_SH" ]; then
+  if [ -x "$SELF_DIR/record-review.sh" ]; then
+    RECORD_SH="$SELF_DIR/record-review.sh"
+  else
+    RECORD_SH="$HOME/.pi/agent/scripts/record-review.sh"
+  fi
+fi
+
+# Mirror of extensions/review-enforcer/index.ts ACCEPTED_VERDICTS.
+ACCEPTED_VERDICTS="clean clean-micro clean-low"
+
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
+log_line()  { printf '%s\n' "$*"; }
+err()  { printf '%s\n' "$*" >&2; }
+stop() { err "⛔ atomic-land: STOP — $*"; exit 1; }
+
+# ── argv ─────────────────────────────────────────────────────────────────
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)         REPO="${2:-}"; shift 2 ;;
+    --dry-run)      DRY_RUN=1; shift ;;
+    --no-wait)      NO_WAIT=1; shift ;;
+    --no-cite)      NO_CITE=1; shift ;;
+    --queue)        QUEUE_MODE=1; shift ;;
+    --wait-timeout) WAIT_TIMEOUT="${2:-}"; shift 2 ;;
+    --poll)         POLL="${2:-}"; shift 2 ;;
+    --max-rounds)   MAX_ROUNDS="${2:-}"; shift 2 ;;
+    --help|-h)      usage; exit 0 ;;
+    --)             shift; MERGE_FLAGS=("$@"); break ;;
+    -*)             err "atomic-land: unknown option $1"; usage >&2; exit 2 ;;
+    *)              PR="$1"; shift ;;
+  esac
+done
+
+[ -n "$PR" ] || { err "atomic-land: a PR number is required"; usage >&2; exit 2; }
+case "$PR" in *[!0-9]*) err "atomic-land: PR must be numeric (got $PR)"; exit 2 ;; esac
+case "$WAIT_TIMEOUT" in ''|*[!0-9]*) err "atomic-land: --wait-timeout must be a non-negative integer"; exit 2 ;; esac
+# A CAP, not just a shape check. `[ "$elapsed" -ge "$WAIT_TIMEOUT" ]` compares as
+# a machine integer, and a literal too wide for that comparison ERRORS — and a
+# failing `[` is FALSE, so an oversized value silently DISABLES the bound and the
+# rail loops forever while holding the PR's lock. That is the #1395 item-1 defect
+# arriving by a second door, and it is the same class B12b pins (a guard a failed
+# comparison turns OFF). Capping it also rejects an oversized literal HERE, via
+# that very error, so this line fails closed by construction. `2>/dev/null` hides
+# that raw `[: integer expression expected`, which is bash's, not our diagnostic.
+# 86400 = 24h.
+[ "$WAIT_TIMEOUT" -le 86400 ] 2>/dev/null || { err "atomic-land: --wait-timeout must be at most 86400s (24h)"; exit 2; }
+case "$POLL" in ''|*[!0-9]*) err "atomic-land: --poll must be a non-negative integer"; exit 2 ;; esac
+# `--poll` is capped for the same reason, and it is the fix for the OTHER waits:
+# two loops in this rail are bounded by an ITERATION COUNT (5 polls for a lazy
+# merge state, 20 for the async ref update), so an unbounded interval multiplies
+# their bound instead of honouring it — `/bin/sleep` takes up to ~68 years, i.e.
+# a "bounded" poll that outlives the run while holding the per-PR lock. The
+# default is 30; 300 is well past any sane re-check cadence, and it keeps those
+# two loops to 25 min and 100 min instead of 68 years. Fails closed on an
+# oversized literal via the same comparison error as the cap above.
+[ "$POLL" -le 300 ] 2>/dev/null || { err "atomic-land: --poll must be at most 300s"; exit 2; }
+case "$MAX_ROUNDS" in ''|*[!0-9]*) err "atomic-land: --max-rounds must be a positive integer"; exit 2 ;; esac
+[ "$MAX_ROUNDS" -ge 1 ] || { err "atomic-land: --max-rounds must be >= 1"; exit 2; }
+[ "$MAX_ROUNDS" -le 5 ] || { err "atomic-land: --max-rounds is bounded at 5"; exit 2; }
+case "$QUEUE_POLLS" in ''|*[!0-9]*) err "atomic-land: ATOMIC_LAND_QUEUE_POLLS must be a non-negative integer"; exit 2 ;; esac
+# Capped for the same reason as --poll: an unbounded multiplier turns a bounded
+# wait into a lock-holding loop.
+[ "$QUEUE_POLLS" -le 300 ] 2>/dev/null || { err "atomic-land: ATOMIC_LAND_QUEUE_POLLS is bounded at 300"; exit 2; }
+[ -x "$ADMIN_MERGE" ] || [ -f "$ADMIN_MERGE" ] || stop "no admin-merge.sh at $ADMIN_MERGE"
+[ -f "$RECORD_SH" ] || stop "no record-review.sh at $RECORD_SH"
+
+repo_args=()
+[ -n "$REPO" ] && repo_args=(--repo "$REPO")
+
+gh_() { "$GH" "$@"; }
+
+# ── a TRANSIENT empty read is RE-POLLED; a persistent one still fails closed ──
+# #1558 — the class, one level up from #1404. Every GitHub value this rail
+# CAPTURES used to be read ONCE and treated as authoritative, so a single
+# transiently-empty reply (a spent REST budget window, a 5xx, a truncated body)
+# was indistinguishable from a permanently unreadable value. At `base_tip()`
+# that was fatal on the FIRST attempt, and it aborted at B12 AFTER `[1/4]
+# update` had already force-pushed a refreshed head — so the unit left the PR
+# strictly worse than it found it (the record stayed at the old head). MEASURED
+# (tortoise#6168): the same command aborted, then succeeded seconds later with
+# no intervening change, and the failing read itself returned the base tip
+# before, during and after the abort from the same box (`gh api rate_limit`
+# 5000/5000). A false abort on a transient.
+#
+# ONE HELPER, EVERY CAPTURE — this is the half that stops the class recurring.
+# #1404 fixed the instance it named (`mergeStateStatus=UNKNOWN`, re-polled in
+# do_update below); the class then recurred at the next read, because the
+# remedy was written per-instance. So the re-poll lives HERE, in the shape
+# every capture already goes through, and each capture inherits it instead of
+# carrying its own loop.
+#
+# ⛔ FAIL-CLOSED IS UNCHANGED, and that is the load-bearing half: an empty
+# result still comes back EMPTY after the bound, so every caller's existing
+# `-z` / `!=` refusal fires exactly as before. The bound converts a TRANSIENT
+# into a settled read; it never converts a genuine failure into a value.
+#
+# ⛔ WHERE IT APPLIES — and the line is not "every `gh` call". The re-poll is for
+# the reads whose EMPTY answer makes a VERDICT: it ABORTS the unit (`base_tip`,
+# `merge_base_of`, `resolve_state`, the pre-land head/base re-read), refuses an
+# update (`pr_has_carry_evidence`), or SELECTS the refresh decision (#1533's
+# `behind_by_of`, whose empty result reaches the B13 stop). It deliberately does
+# NOT wrap the two reads whose empty answer already routes to the SAFE default —
+# `strict_of` and `mergeable_of` both read as "unreadable ⇒ refresh" and never as
+# "current". Retrying those would change no verdict and would multiply a read
+# that is PINNED at one per invocation (the #1565 declaration the suite asserts:
+# "ONE positive read of `strict` per invocation"), i.e. it would weaken a
+# recorded contract to buy nothing.
+#
+# The ceiling matters as much as the retry: a bound that cannot be reached is
+# not a bound, and an unbounded retry here would turn one unreadable value into
+# a lock-holding spin (the B11 lock is held for the whole unit).
+#
+# stdout = the value. rc 0 = non-empty; rc 1 = still empty after the bound.
+# Callers keep their own emptiness test: the rc is reported, never required.
+gh_read() { # <gh argv...>
+  local tries="${ATOMIC_LAND_TRANSIENT_POLLS:-5}" out="" t=0 nap="$POLL"
+  case "$tries" in ''|*[!0-9]*) tries=5 ;; esac
+  [ "$tries" -le 20 ] 2>/dev/null || tries=20
+  # Spaced like the UNKNOWN re-poll, but NIPPED at 2 s: this read sits on the
+  # critical path of every capture (a landing makes a handful), so a 30 s
+  # `--poll` must not turn one transient into minutes of stall. `--poll 0`
+  # stays instant, which is what keeps the hermetic suite fast.
+  [ "$nap" -gt 2 ] 2>/dev/null && nap=2
+  while :; do
+    out="$(gh_ "$@" 2>/dev/null || true)"
+    if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+    t=$((t + 1))
+    [ "$t" -gt "$tries" ] && return 1
+    sleep "$nap" 2>/dev/null || true
+  done
+}
+
+# ── B11 — one rail per PR ─────────────────────────────────────────────────
+# Two concurrent rails on the SAME PR interleave update/record/land: each can
+# move the head the other verified, and each can re-record on the other's head.
+# B9/B10 catch the RESULTING move, but a check is not a mutual exclusion — the
+# interleaving can still produce two records and two merges. A per-(repo,PR)
+# lock makes the unit exclusive. `mkdir` is the atomic primitive (macOS has no
+# flock); a crashed holder is reclaimed by PID liveness, bounded to one reclaim.
+LOCKDIR=""
+acquire_lock() {
+  # B11 — the lock base is NOT derived from TMPDIR. TMPDIR is caller-controlled,
+  # so a second rail with a different TMPDIR would use a different lock path and
+  # both would land (reproduced). Keep it in a per-user fixed location instead.
+  local dir="${ATOMIC_LAND_LOCK_DIR:-$HOME/.pi/agent/locks}"
+  mkdir -p "$dir" 2>/dev/null || true
+  LOCKDIR="$dir/atomic-land-$(printf '%s' "$REPO" | tr '/' '-')-$PR.lock"
+  # B11 — the RECLAIM is the hard part. Deciding "stale" and then `rm -rf` + `mkdir`
+  # is check-then-act: two rails can both decide stale, and the second's `rm -rf`
+  # deletes the first's freshly-created lock — both then land (reproduced at
+  # ~25-38% naturally against a stale lock). The steal is therefore an ATOMIC
+  # RENAME: `mv` of the lock directory succeeds for exactly ONE contender, so the
+  # others fall through to the loop and re-read the lock that now exists.
+  local tries=0 other age now_s mt stolen
+  while :; do
+    tries=$((tries + 1))
+    if mkdir "$LOCKDIR" 2>/dev/null; then break; fi
+    other="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+    if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
+      stop "another atomic-land is already running for $REPO#$PR (pid $other) — refusing to interleave"
+    fi
+    # An ABSENT pid is not proof of a dead holder (the directory exists before the
+    # pid is written), so a young pid-less lock is LIVE and refuses; only one older
+    # than the grace is a reclaim candidate.
+    if [ -z "$other" ]; then
+      now_s="$(date +%s)"
+      # Portable mtime read: GNU first, BSD second. A missing/unreadable mtime is
+      # treated as age 0 (i.e. LIVE) so the failure direction stays fail-closed.
+      mt="$({ stat -c %Y "$LOCKDIR" 2>/dev/null || stat -f %m "$LOCKDIR" 2>/dev/null; } || true)"
+      case "$mt" in ''|*[!0-9]*) age=0 ;; *) age=$(( now_s - mt )) ;; esac
+      if [ "$age" -lt "${ATOMIC_LAND_LOCK_GRACE:-60}" ]; then
+        stop "another atomic-land holds the lock for $REPO#$PR (no pid yet — still starting) — refusing to interleave"
+      fi
+    fi
+    # Stale: claim it by rename (atomic; at most one rail can win), then retry mkdir.
+    stolen="$LOCKDIR.reclaim.$$"
+    mv "$LOCKDIR" "$stolen" 2>/dev/null && rm -rf "$stolen"
+    if [ "$tries" -ge 5 ]; then
+      stop "could not acquire the per-PR lock ($LOCKDIR) — refusing to race"
+    fi
+  done
+  printf '%s\n' "$$" > "$LOCKDIR/pid"
+  trap 'rm -rf "$LOCKDIR"' EXIT INT TERM HUP
+}
+
+# ── state ────────────────────────────────────────────────────────────────
+HEAD=""; BASE=""; MERGE_STATE=""; IS_DRAFT="false"
+RECORD_FILE=""; RECORD_HEAD=""; RECORD_VERDICT=""; RECORD_MB=""
+CERT_BASE=""; CERT_MB=""; CERT_BASE_TIP=""
+
+# The merge base of `compare/<base>...<head>` — the commit that identifies the
+# certified content. It is INVARIANT under a base branch that merely ADVANCES
+# (main's new commits are not ancestors of the head) and MOVES exactly when the
+# base is repointed or rewritten (#1348). B10 binds to THIS, not to the base tip
+# and not to `mergeStateStatus`.
+#
+# WHY `mergeStateStatus` CANNOT CARRY THIS (evidence, 2026-09-23). `BEHIND` is a
+# HEAD/BASE DIVERGENCE signal — GitHub's `PullRequestMergeStateStatus.BEHIND`
+# means only "the head ref is out of date"; it is NOT produced by `strict: true`
+# and can occur with or without the "require branches up to date" protection
+# (strict is what makes BEHIND *block* a merge). It says nothing about the base's
+# IDENTITY: `gh pr edit --base` can repoint the PR while the head is `CLEAN`, so
+# the certified diff (`compare/<base>...<head>`) changes while every
+# head-bound check still passes. Verified against the documented enum semantics,
+# not assumed — an untested assumption about a protection setting is exactly the
+# class this rail exists to catch.
+merge_base_of() { # <base> <head>
+  gh_read api "repos/$REPO/compare/$1...$2" --jq .merge_base_commit.sha
+}
+# How many commits the HEAD is behind the BASE. Same compare call merge_base_of()
+# already makes — the response carries `behind_by`, so this is a second read of an
+# existing response, not new machinery and not a new API.
+#
+# ⛔ Why the rail must not route on `mergeStateStatus` alone: a red REQUIRED check
+# makes GitHub report BLOCKED, not BEHIND. Measured live over the non-draft PRs:
+# 90 BLOCKED / 10 UNSTABLE / 6 DIRTY / 0 BEHIND. So a head that predates a base
+# commit which is itself required for a gate leg (e.g. `9c432c6a4`, which CLASSIFIES
+# `test_pack_extraction_slots_v31.py` for `manifest-integrity` — a leg of the
+# required `python-ci-gate`) reads as BLOCKED, do_update did not fire, and the
+# failure was self-sustaining: the stale head keeps failing the leg, the red keeps
+# reading as BLOCKED, and nothing ever refreshes it. `behind_by` is the condition
+# we actually want; the enum is a coarse proxy that NEVER says it for these PRs.
+behind_by_of() { # <base> <head> -> N (empty on any unreadable/non-numeric reply)
+  local n
+  n="$(gh_read api "repos/$REPO/compare/$1...$2" --jq '.behind_by // 0')"
+  case "$n" in ''|*[!0-9]*) echo ""; return 0 ;; esac
+  echo "$n"
+}
+# ── the refresh gate: is the base pin worth its cost? (#1565) ─────────────
+# THE ONE PLACE THIS RAIL READS A PROTECTION SETTING. Declared, LIVE (read at the
+# decision point, never cached at startup), and NARROW: it gates ONLY the step-1
+# refresh — never the merge, the record, the wait, or the check verdict.
+#
+# FAIL-CLOSED DIRECTION (this is gate code): the skip fires only on a POSITIVE
+# `false` read of `required_status_checks.strict` AND a POSITIVE `true` mergeable.
+# Every other outcome — an unreadable protection (404 when protection is not
+# configured, or when the token lacks admin on the repo; 403; a rate-limited or
+# empty reply), a null `required_status_checks`, or an unreadable `mergeable` —
+# keeps the refresh exactly as it was before this gate existed.
+strict_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refreshes)
+  local v
+  v="$(gh_ api "repos/$REPO/branches/$BASE/protection" --jq '.required_status_checks.strict' 2>/dev/null || true)"
+  case "$v" in true|false) printf '%s' "$v" ;; *) printf '' ;; esac
+}
+mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refreshes)
+  # ⛔ `gh pr view --json mergeable` IS NOT A BOOLEAN — it is the GraphQL enum STRING
+  # (api/queries_pr.go: PullRequestMergeable = "MERGEABLE" | "CONFLICTING" |
+  # "UNKNOWN"). MEASURED on PR #1566: `gh pr view 1566 --json mergeable --jq
+  # .mergeable` prints `MERGEABLE`, while `gh api repos/…/pulls/1566 --jq .mergeable`
+  # prints `true` for the SAME PR. A predicate that accepts only `true|false`
+  # therefore NEVER matches the real CLI, which silently turns this gate INERT — and
+  # the suite keeps passing as long as its fixture speaks the REST shape. Both the
+  # predicate and the fixture were wrong in the first cut of #1565; a review caught
+  # it. Do not "simplify" this back to a boolean test.
+  local v
+  v="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json mergeable --jq .mergeable 2>/dev/null || true)"
+  case "$v" in
+    MERGEABLE)   printf 'true'  ;;
+    CONFLICTING) printf 'false' ;;
+    *)           printf ''      ;;
+  esac
+}
+
+# ── the drift predicate: would merging this head KEEP the base's content? ───
+# #7727. `mergeable` above answers "does this branch merge without a TEXT
+# CONFLICT" — a DIFFERENT question from "would the merge KEEP $BASE's content".
+# The target repo's `tools/drift-guard.py` owns the second (#4174, predicate
+# corrected by #7455) and is already run as a CI gate on every PR; the rail CALLS
+# it and never re-derives the rule, so the two cannot drift apart.
+#
+# WHY THIS EXISTS. The #1565/#7230 skip below assumes a landable head's drift is
+# harmless — "the only thing left between that PR and a merge is the drift, which
+# nothing requires it to close". That holds only while the drift is SAFE. For a
+# head whose merge would silently REVERT a path the base moved, the drift IS what
+# blocks the merge (the drift gate goes red), and the refresh the skip avoids is
+# the ONLY repair: while the skip keeps firing, the head can never become
+# landable, and the refusal is attributed to something else. So the skip is taken
+# on a POSITIVELY green predicate only.
+#
+# ⛔ TWO TRAPS, BOTH MEASURED — do not "simplify" either away:
+#  1. KEY ON THE JSON, NOT THE EXIT CODE. `tools/drift-guard.py` is >=3.12
+#     (#5128) and refuses an older interpreter with `raise SystemExit(msg)`, which
+#     exits **1** — the SAME code the revert arm uses. Measured on the authoring
+#     box (`python3` = 3.9.6): `python3 tools/drift-guard.py` exits 1 having
+#     measured nothing, so a bare exit-code test would read every head as unsafe
+#     and silently reinstate the unconditional refresh this arm exists to prevent.
+#     `--json` separates the two: only a real measurement prints `"status": "ok"`
+#     (green), `"status": "drift"` (a revert) or `"status": "error"`.
+#  2. THE BASE MUST BE A FETCHABLE REMOTE-TRACKING REF. MEASURED: `--base main`
+#     exits 2 with `status: error` (the gate cannot prove a local ref's
+#     freshness), while `--base origin/main` measures. The rail's $BASE is the
+#     bare branch name, so the invocation below passes `origin/$BASE`; passing
+#     $BASE would make every read an error and disable the skip entirely.
+#
+# FAIL-CLOSED DIRECTION, matching strict_of()/mergeable_of(): green is printed ONLY
+# for a POSITIVE green measurement, or for the one no-gate exception named below.
+# A revert, an environment error, a version guard, a checkout that cannot be
+# identified as the target, or a missing tool in a checkout that is NOT the target
+# — all print empty, and the caller REFRESHES on empty. Unmeasurable must never
+# stand in for green.
+#
+# THE ONE DELIBERATE EXCEPTION is a repo with NO drift gate at all: if the target
+# repo has no `tools/drift-guard.py` there is no gate that could leave the head
+# unlandable, so the drift is harmless by construction and the skip stands — but
+# ONLY when the cwd is demonstrably the target repo (see the body below); a missing
+# tool in some OTHER checkout proves nothing. That reads the ARTIFACT (the tool's
+# existence), never a setting.
+# The HOST of a git remote authority. It must cut at the CLOSING BRACKET of an IPv6
+# literal, never at the first colon: `[2001:db8::1]` and `[2001:dead::9]` both reduce
+# to `[2001` under a first-colon cut, so two DIFFERENT hosts would compare equal —
+# exactly the silent wrong-repo fail-open drift_safe_of() exists to refuse (#7727).
+remote_host_of() { # <[host][:port] | host[:port]> -> host, verbatim
+  # THE PORT IS STRIPPED ONLY WHEN IT **IS** A PORT. `connect.c: get_host_and_port()`
+  # takes the suffix as a port only when `strtol` consumes the WHOLE remainder and it is
+  # below 65536 (six digits, or any non-digit, is not a port). Measured:
+  # `ssh://github.com:evil/<slug>` and `git://github.com:evil/<slug>` both look up host
+  # `github.com:evil`, while a first-colon cut names `github.com` — the TARGET, and
+  # reachable to a different machine through an `ssh_config` `Host github.com:evil` alias
+  # (review round 17).
+  local a="$1" h p
+  case "$a" in
+    \[*) case "$a" in *\]*) : ;; *) printf '' ; return 0 ;; esac
+         h="${a#\[}"; printf "[%s]" "${h%%]*}" ;;
+    *)   p="${a#*:}"
+         if [ "$p" = "$a" ]; then printf '%s' "$a"; return 0; fi
+         case "$p" in *[!0-9]*|??????*|'') printf '%s' "$a" ;; *) if [ "$p" -lt 65536 ]; then printf '%s' "${a%%:*}"; else printf '%s' "$a"; fi ;; esac ;;
+  esac
+}
+
+# GIT'S HOST IS NOT "THE TEXT AFTER THE FIRST `@`". An authority that STARTS with `[` is
+# a bracketed LITERAL whose host ends at `]`, and everything after the `]` — userinfo
+# included — is DISCARDED (`connect.c: host_end()` searches for `@[` FIRST for exactly
+# this reason). Cutting at the first `@` therefore names the host git throws away:
+# `ssh://[evil.invalid]@github.com/<slug>` is fetched FROM `evil.invalid` (measured:
+# `git-upload-pack evil.invalid '/<slug>'`) while the cut names `github.com`, i.e. the
+# TARGET — the same wrong-subject MATCH as the fragment and the slash-before-the-colon,
+# one grammar rule further in (review round 16). `remote_host_of` already reads a
+# leading bracket correctly, so the cut must simply not be applied there; a bracket
+# anywhere else is a shape we cannot place, and it fails closed like every other
+# unreadable authority. USERINFO BELONGS TO THE TRANSPORT, THOUGH: `git://` and
+# `file://` have none, so an `@` there is part of the HOSTNAME (measured:
+# `git://evil.invalid@github.com/<slug>` is looked up as host
+# `evil.invalid@github.com`) and a last-`@` cut would name the TARGET — the same
+# fail-OPEN, one transport over. Every other scheme cuts at the LAST `@`, which is what
+# curl and git both use.
+strip_userinfo() { # <scheme> <authority> -> authority with any userinfo removed
+  case "$2" in
+    \[*) case "$2" in *\]*) printf '%s' "$2" ;; *) printf '' ;; esac ;;   # the literal IS the host
+    *\[*|*\]*) printf '' ;;                                              # a bracket we cannot place
+    *) case "$1" in
+         git|file) printf '%s' "$2" ;;                                # these transports have no userinfo
+         *) printf '%s' "${2##*@}" ;;                                 # curl and git both use the LAST '@'
+       esac ;;
+  esac
+}
+
+drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refreshes)
+  # The tool is resolved against the cwd checkout's ROOT, never the process cwd:
+  # `gh repo view` walks up, so from a subdirectory the identity check passes while a
+  # bare `tools/drift-guard.py` test would miss a tool that IS there — reading a
+  # present gate as absent and skipping a drift-red head (measured; review round 2).
+  local tool="${CWD_ROOT:-.}/tools/drift-guard.py"
+  # IDENTITY GATES *EVERY* PATH, not only the missing-tool one. The tool measures the
+  # repo of ITS OWN checkout (`git rev-parse --show-toplevel` + `origin/<base>` — see
+  # tortoise tools/drift-guard.py), so a green from it is a statement about the CWD
+  # repo, whatever `--repo` says. `--repo owner/name` is a supported way to name a
+  # DIFFERENT repo, so a measurement taken here can be of the WRONG repo and a missing
+  # tool can belong to the WRONG one — and BOTH are unmeasurable. Attaching either to
+  # $REPO is the fail-OPEN that re-creates the unlandable head this function exists to
+  # prevent. (Review round 4: the identity test used to cover ONLY the missing-tool
+  # branch, so a PRESENT tool in a non-target checkout ran and its green was
+  # returned.) The override is exempt — the caller injects it and owns what it
+  # measures. Unmeasurable refreshes.
+  if [ -z "${ATOMIC_LAND_DRIFT_GUARD:-}" ]; then
+    local cwd_l target_l
+    cwd_l="$(printf '%s' "$CWD_REPO" | tr 'A-Z' 'a-z')"
+    target_l="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
+    if [ -z "$cwd_l" ] || [ "$cwd_l" != "$target_l" ]; then
+      return 0
+    fi
+    # AND A THIRD SUBJECT: THE REMOTE THE TOOL ACTUALLY FETCHES. It fetches the
+    # checkout's `origin` remote, while `gh repo view` resolves the "base repo" and
+    # PREFERS a remote named `upstream`. MEASURED: with origin=<fork> and
+    # upstream=<target>, `gh repo view --json nameWithOwner` prints the UPSTREAM — so
+    # the check above can pass while the measurement is of the FORK, whose green is
+    # then attributed to the target (review round 7: the round-4 fail-OPEN one layer
+    # down). Assert the remote the tool will fetch: its HOST and its PATH must both be
+    # the target's — a differently named remote, a missing remote, an unreadable URL,
+    # another host, another owner, or another repository name refreshes, the same
+    # direction every other unreadable case takes. The PORT is deliberately dropped on
+    # both sides (an explicit :443 or :22 must not turn a correct remote into a
+    # refresh); a same-host different-port remote is out of scope, not asserted.
+    local origin_l
+    origin_l="$(git -C "${CWD_ROOT:-.}" remote get-url origin 2>/dev/null | tr A-Z a-z || true)"
+    origin_l="${origin_l%.git}"; origin_l="${origin_l%/}"
+    if [ -z "$target_l" ] || [ -z "$origin_l" ]; then
+      return 0
+    fi
+    # The remote's AUTHORITY (host; userinfo and port stripped) and its PATH. The path
+    # must be the target's EXACTLY. A suffix test — the obvious `*/owner/name` — also
+    # accepts `.../evil/owner/name`, reading a foreign owner's repository as ours, and
+    # a fork named `owner/name-fork` contains the slug too. Both are the same
+    # wrong-repo fail-OPEN, one leading path segment and one character wide.
+    #
+    # A scheme-less remote is git's scp-like `[user@]host:path`, whose host ends at the
+    # FIRST colon — and git only takes that form when NO slash precedes it. So
+    # `user:pw@github.com/o/n` is host `user`, path `pw@github.com/o/n`; reading the
+    # authority as everything after the first `@` would name the TARGET's host and take
+    # the skip on a fetch that goes somewhere else.
+    #
+    # WHICH FORM IS THIS? Git's own rule (`url.c: url_is_local_not_ssh`), not a guess at
+    # the SHAPE of the string — because the arm chosen decides which SUBJECT is
+    # compared, and an arm that matches a string git would treat as a local path names
+    # the target from it. (Review round 15: `foo/bar@github.com:o/n` has a slash BEFORE
+    # the colon, so git runs `git-upload-pack` on a directory, yet the `*@*:*` arm read
+    # host `github.com` and path `o/n` out of it; `./weird://github.com/o/n` is not a
+    # URL at all — `.` cannot start a scheme — yet the `*://*` arm read the same pair.
+    # Both are the round-7 fail-OPEN, keyed on the string instead of on the grammar.)
+    # The rule is:
+    #   * a VALID scheme — `[A-Za-z][A-Za-z0-9+.-]*` — followed by `://` is a URL, and
+    #     its authority runs to the first `/`;
+    #   * else, if there is a colon and NO SLASH BEFORE IT, it is scp-like and the host
+    #     ends at that colon;
+    #   * else it is a LOCAL PATH, which has no host to compare and cannot be read as
+    #     the target's remote;
+    #   * a `file://` URL with a host other than `localhost` is refused. git does NOT
+    #     reject it as malformed — it IGNORES the host and resolves the URL to a local
+    #     path (measured: `file://github.com/<slug>` runs `git-upload-pack '/<slug>'`).
+    #     So the refusal is not "unfetchable": it is that git's SUBJECT here is a local
+    #     directory, which is not the target's remote, and a repository that happened to
+    #     exist at that path would be a wrong subject rather than an error.
+    #   * a pre-`://` part that is not a legal scheme makes git split at `://` anyway and
+    #     die on the unknown protocol (measured: `./weird://host/<slug>` ⇒ `fatal:
+    #     protocol './weird' is not supported`). Classifying it as a local path is this
+    #     code's own conservative simplification, NOT what git does — do not "correct" it
+    #     back toward a `://`-means-URL test, which is the fail-open direction.
+    #
+    # A `#` FRAGMENT is transport-dependent, and NOT cutting it where git does cut it
+    # was a wrong-repo MATCH: `https://evil.invalid#@tgt` reads its userinfo as
+    # `evil.invalid#` and names the TARGET, while curl — and so git over http(s) — stops
+    # at `#` and fetches `evil.invalid`. The transports are the CURL-BASED ones, not just
+    # http(s): `ftp://evil.invalid#@tgt` resolves to `evil.invalid` too (measured:
+    # `Could not resolve host: evil.invalid`), while git's own error line prints the
+    # post-fragment URL — so the failure is invisible in the message git emits. ssh does
+    # not end the URL there: git passes the fragment as part of the repository PATH, so
+    # cutting it would read `ssh://host/o/n#x` as the target while the fetch goes to
+    # `o/n#x`. Leaving it makes the path differ from the slug, which refreshes.
+    local target_host_l origin_host_l origin_authority_l origin_path_l origin_scheme_l pre_colon_l
+    target_host_l="$(printf '%s' "$CWD_URL" | tr A-Z a-z)"
+    target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"; target_host_l="${target_host_l#*@}"
+    target_host_l="$(remote_host_of "$target_host_l")"
+    case "$origin_l" in
+      http://*|https://*|ftp://*|ftps://*) origin_l="${origin_l%%#*}" ;;   # curl ends the URL at '#'
+      *) : ;;                                             # ssh and git:// keep it in the path
+    esac
+    origin_authority_l=""; origin_path_l=""; origin_scheme_l=""
+    case "$origin_l" in
+      *://*) origin_scheme_l="${origin_l%%://*}"
+             case "$origin_scheme_l" in
+               ''|[!A-Za-z]*|*[!A-Za-z0-9+.-]*) origin_scheme_l="" ;;   # not a scheme ⇒ not a URL
+             esac ;;
+    esac
+    # A QUERY IS NOT REASONABLE FROM HERE, so a remote that carries one fails closed.
+    # The two directions disagree and BOTH are wrong for us: for curl transports git
+    # keeps the query INSIDE the request path (measured: `https://github.com/o/n?x=1`
+    # ⇒ `GET /o/n?x=1/info/refs`), so the repository fetched is not the one the slug
+    # names; and an authority-shaped `?` (`https://evil.invalid?@github.com/o/n`) makes
+    # curl contact `evil.invalid` while the text after the `@` names the TARGET —
+    # measured, the same fail-OPEN as the fragment, one delimiter over. For ssh the
+    # authority boundary at `?` is git's own parser's business, so there is nothing
+    # here to verify. Both are unmeasurable, and unmeasurable refreshes.
+    case "$origin_l" in
+      *\?*) return 0 ;;
+    esac
+    if [ -n "$origin_scheme_l" ]; then
+      origin_authority_l="${origin_l#*://}"
+      origin_path_l="${origin_authority_l#*/}"
+      origin_authority_l="$(strip_userinfo "$origin_scheme_l" "${origin_authority_l%%/*}")"
+      if [ "$origin_scheme_l" = "file" ]; then
+        case "$origin_authority_l" in
+          ''|localhost) : ;;
+          *) return 0 ;;          # git ignores the host: the subject is a LOCAL PATH, not this remote
+        esac
+      fi
+    else
+      case "$origin_l" in
+        *:*)
+          # scp-like ONLY when no slash precedes the first colon (git's rule, exactly).
+          pre_colon_l="${origin_l%%:*}"
+          case "$pre_colon_l" in
+            */*) : ;;             # a slash first ⇒ a LOCAL PATH, not a remote
+            *) origin_authority_l="$(strip_userinfo '' "$pre_colon_l")"; origin_path_l="${origin_l#*:}" ;;
+          esac ;;
+      esac
+    fi
+    origin_host_l="$(remote_host_of "$origin_authority_l")"
+    if [ -z "$target_host_l" ] || [ "$origin_host_l" != "$target_host_l" ]; then
+      return 0
+    fi
+    if [ "$origin_path_l" != "$target_l" ]; then
+      return 0
+    fi
+    # The cwd IS the target and it has no LOCAL tool. That is a skip with no
+    # measurement, so it must rest on the right SUBJECT: "the TARGET has no drift
+    # gate", not "this working tree has no such file". A stale checkout, or a
+    # locally deleted file, would otherwise read "no gate" for a repo that HAS one
+    # and take the skip unmeasured.
+    #
+    # The primitive must separate ABSENCE from UNREADABILITY, and two obvious ones do
+    # not. `git cat-file -e` exits 128 BOTH for a path that is absent AND for an object
+    # that cannot be READ (a corrupt object; a partial clone whose promisor is
+    # unreachable), so `! cat-file` reads "unmeasurable" as "no gate". `git rev-parse
+    # --verify --quiet <rev>:<path>` is no better — 1 for a missing tree and for a
+    # missing path alike — and the bare `git rev-parse <rev>:<path>` is 128 for both.
+    # `git ls-tree` READS the tree and reports the three outcomes apart: an entry at
+    # rc 0, no output at rc 0, and a NON-ZERO rc for an unreadable ref or tree. Only
+    # the middle one may take the skip.
+    #
+    # And the ref must be one we can PLACE IN TIME. The predicate this skip bypasses
+    # FETCHES the base — its own guard is explicit that a worktree which never fetched
+    # holds a STALE origin/<base> and that "a local ref cannot be proven fresh"
+    # (#4174) — while a local `origin/$BASE` is exactly that ref. So the local tip must
+    # equal the base tip the API reports; otherwise we are reading a revision we cannot
+    # date, which is not a measurement and must refresh.
+    #
+    # And the read must be of THAT object. Replace refs are the trap: `git rev-parse`
+    # ignores them and `git ls-tree` honours them, so a `git replace` redirecting the
+    # base sha to an empty tree would pass the tip check above and then report "no
+    # gate" — the two reads naming DIFFERENT objects for the same ref. `ls-tree` is
+    # therefore called with `--no-replace-objects`, on the sha the tip check just
+    # verified rather than on the ref again.
+    if [ ! -f "$tool" ]; then
+      local live_tip local_tip tree_out="" tree_rc=0
+      live_tip="$(base_tip)"
+      local_tip="$(git -C "${CWD_ROOT:-.}" rev-parse --verify --quiet "origin/$BASE" 2>/dev/null || true)"
+      if [ -n "$live_tip" ] && [ "$local_tip" = "$live_tip" ]; then
+        tree_out="$(git --no-replace-objects -C "${CWD_ROOT:-.}" ls-tree "$local_tip" -- tools/drift-guard.py 2>/dev/null)" || tree_rc=$?
+        if [ "$tree_rc" -eq 0 ] && [ -z "$tree_out" ]; then
+          printf '1'
+        fi
+      fi
+      return 0
+    fi
+  fi
+  # The default argv is anchored to the same root; the override is used verbatim.
+  local cmd="${ATOMIC_LAND_DRIFT_GUARD:-uv run python $tool}"
+  local out
+  out="$( $cmd --json --base "origin/$BASE" --head "$HEAD" 2>/dev/null || true )"
+  case "$out" in
+    *'"status": "ok"'*|*'"status":"ok"'*) printf '1' ;;
+  esac
+}
+
+# The base branch's TIP at a moment in time. A concurrent merge ADVANCES it while
+# leaving the merge base unchanged, so it is the signal for B12: the checks were
+# verified against the old tip and did not cover the new one. `--admin` bypasses
+# `strict`, so the rail must re-establish the up-to-date guarantee itself rather
+# than depend on the protection setting.
+base_tip() {
+  # The #1558 site. `gh_read` re-polls a transient empty reply and still returns
+  # EMPTY after the bound, so the B12 capture below keeps its fail-closed verdict
+  # while a transient settles instead of aborting the unit after `[1/4] update`
+  # has already moved the head.
+  gh_read api "repos/$REPO/pulls/$PR" --jq .base.sha
+}
+
+# The review gate key — the SAME source and normalisation as the producer
+# (scripts/record-review.sh: AI_REVIEW_GATE_KEY, else ~/.pi/agent/.ai-review-gate-key).
+# The PR body is attacker-writable, so a matching marker SHAPE is not evidence that
+# the record can be carried: the producer carries a prior marker only after
+# verifying its HMAC (#784/#2982), and refuses when no key is available. The rail
+# therefore VERIFIES the attestation — presence of a diff= identity AND a valid
+# signature — instead of trusting its shape.
+GATE_KEY_RAW="${AI_REVIEW_GATE_KEY:-}"
+if [ -z "$GATE_KEY_RAW" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+  GATE_KEY_RAW="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+fi
+GATE_KEY="$(printf '%s' "$GATE_KEY_RAW" | tr -d '[:space:]')"
+
+# Can the record at the current head be RESTORED by the producer's carry-forward
+# after an update? Requires a marker that is (a) shape-valid WITH a diff= identity
+# and (b) authentically signed by the gate key. Mirrors the producer's own carry
+# regex and signature check (record-review.sh, the carry-forward arm) — keep both in sync.
+# This is a presence + authenticity test, NOT an equivalence computation: whether
+# the marker's diff= still matches the live diff is the producer's decision alone.
+#
+# THE EQUIVALENCE PRIMITIVE IS SHARED, AND THE RAIL MUST NOT RE-IMPLEMENT IT.
+# The digest the marker carries is sha256 over the NORMALIZED diff — the ONE
+# implementation is `scripts/lib/diff-normalize.py` (agent-infra #1362 D1),
+# used by the producer (record-review.sh) and mirrored by the consumer
+# (`tortoise` .github/workflows/ai-review-gate.yml). The rail deliberately does
+# NOT re-derive it: `record-review.sh` owns the equivalence decision (see the
+# WHY below), and a second implementation here would be a second definition of
+# "unchanged" for one cross-repo contract. The rail reads the diff= value as an
+# opaque identity and cites it verbatim.
+pr_has_carry_evidence() {
+  local line="" text="" sig="" expect=""
+  line="$(gh_read api "repos/$REPO/pulls/$PR" --jq .body \
+    | grep -m1 -E "^review recorded: reviews/${PR}\\.json verdict=${RECORD_VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(.*\\) sig=[0-9a-f]{64}$" || true)"
+  [ -n "$line" ] || return 1
+  [ -n "$GATE_KEY" ] || return 1
+  text="${line% sig=*}"; sig="${line##* sig=}"
+  expect="$(printf '%s' "$text" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+  [ -n "$expect" ] || return 1
+  [ "$sig" = "$expect" ]
+}
+# WHY the FIRST matching line: this guard is a PRESENCE test, not a freshness
+# test. It checks only that the body carries a shape-valid marker whose HMAC
+# verifies — it never reads or compares `diff=`. (The rail computes no live diff
+# by design: the equivalence primitive is shared, and re-implementing it here
+# would be a second definition of "unchanged" for one cross-repo contract — see
+# the note above.) So a stale first matching line SATISFIES this guard rather
+# than blocking it: the "over-block" reading of a previous version of this
+# comment was wrong.
+#
+# The residual is therefore the OTHER direction: a head move that changed the
+# diff can leave the first matching line stale, and this guard still passes. The
+# other two consumers are STRICTER, in different ways:
+#   - the CI gate (`ai-review-gate.yml`) enumerates ALL markers and keeps a
+#     candidate only when it is bound to the head OR its `diff=` matches the
+#     live diff — so a body whose ONLY marker is stale is REJECTED;
+#   - the producer (`record-review.sh`) greps for the LIVE diff and APPENDS when
+#     it does not match, so stale older markers accumulate.
+# What none of them does is reject a body *merely because its first matching
+# line is stale* — which is why the over-block claimed here never occurred.
+#
+# Owner of the remaining work: #1397. (The content identity itself already
+# landed — `record-review.sh` writes `diff_sha256` into the signed evidence,
+# #2982/#767; #1397 tracks what remains.)
+
+resolve_repo() {
+  # The repo the GitHub CLI resolves for the cwd. NOT necessarily the cwd's `origin`:
+  # the CLI prefers a remote named `upstream`, so a fork checkout resolves to its
+  # UPSTREAM. drift_safe_of() treats this as one half of the identity and asserts the
+  # remote the predicate actually FETCHES separately — do not delete that assertion
+  # on the assumption that this one already names the cwd's own repo.
+  # Empty when the cwd is not a git repo with a GitHub remote, which is the
+  # fail-closed direction: the exception simply does not apply.
+  CWD_REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  CWD_URL="$(gh_ repo view --json url -q .url 2>/dev/null || true)"
+  CWD_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -z "$REPO" ]; then
+    REPO="$CWD_REPO"
+  fi
+  case "$REPO" in
+    */*) ;;
+    *) stop "could not resolve the repo (pass --repo owner/repo)" ;;
+  esac
+}
+
+resolve_state() {
+  local line
+  line="$(gh_read pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} \
+            --json headRefOid,baseRefName,mergeStateStatus,isDraft \
+            --jq '"\(.headRefOid)\t\(.baseRefName)\t\(.mergeStateStatus)\t\(.isDraft)"')"
+  if [ -z "$line" ]; then stop "could not read PR #$PR state (gh/API failure?)"; fi
+  HEAD="$(printf '%s' "$line" | cut -f1)"
+  BASE="$(printf '%s' "$line" | cut -f2)"
+  MERGE_STATE="$(printf '%s' "$line" | cut -f3)"
+  IS_DRAFT="$(printf '%s' "$line" | cut -f4)"
+  case "$HEAD" in
+    ""|*[!0-9a-fA-F]*) stop "PR #$PR head is not a plain sha (got '${HEAD:-<empty>}')" ;;
+  esac
+}
+
+# ── the cross-box review-record registry (agent-infra#2374) ──────────────────
+# `read_record` below reads THIS BOX's registry (~/.pi/agent/reviews), and until #2374 nothing
+# replicated that directory. So a PR that WAS reviewed merely failed on a machine that had not
+# minted the record, and the rail said "no review record" — a claim about the fleet made from
+# one box's disk. (Measured: of 104 open PRs only 55 were visible from any single box, and 134
+# records existed nowhere but the box that minted them.)
+#
+# ONE `union` BEFORE THE RECORD IS READ fixes BOTH directions at the point every landing already
+# passes through: it PULLS the records other boxes minted and PUSHES this box's, so a record
+# minted here reaches every box the next time any box lands. Doing it at the rail (rather than
+# at mint time in record-review.sh) is deliberate: the rail is the only moment a record is
+# actually NEEDED, and hooking the mint path would put a network call inside a script a dozen
+# hermetic suites execute.
+#
+# NOT FATAL, and that is a design choice rather than leniency. Refusing here would trade a blind
+# box for a DEAD rail: a box that cannot reach the store must still land a PR whose record is
+# already local. The one thing that must not happen is SILENCE, so every non-zero outcome is
+# named — and the "no review record" refusal below now names the sync as its remedy, so a lane
+# that hits it has a correct next action instead of an unexplained refusal (#2349).
+sync_review_registry() {
+  # `ATOMIC_LAND_REGISTRY_SYNC` is the suite's seam, in the same family as ATOMIC_LAND_GH /
+  # ATOMIC_LAND_RECORD_SH / ATOMIC_LAND_ADMIN_MERGE: `off` skips the union, and a PATH replaces the
+  # script so a test can drive the ORDERING without a network. PRODUCTION DEFAULTS TO ON (unset =
+  # the script beside this rail); tests/atomic-land/run.sh sets it because that suite executes THIS
+  # rail ~85 times and must stay hermetic — without the seam it made two real round trips to
+  # github.com per invocation, pulled the fleet's LIVE records into each scenario's fixture HOME,
+  # and on a box with blackholed egress would have blown the suite's own 30s watchdog per scenario.
+  local sync="${ATOMIC_LAND_REGISTRY_SYNC:-$SELF_DIR/registry-sync.sh}" out="" rc=0
+  case "$sync" in
+    off|none|0)
+      log_line "atomic-land: review-record registry union SKIPPED by request (ATOMIC_LAND_REGISTRY_SYNC=$sync)"
+      return 0 ;;
+  esac
+  if [ ! -f "$sync" ]; then
+    err "atomic-land: ⚠️ registry-sync.sh is not deployed beside this rail — the review-record registry on"
+    err "   this box is LOCAL-ONLY, so a PR reviewed on another machine will still read as unreviewed (#2374)."
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log_line "atomic-land: DRY RUN — skipping the cross-box registry union (it writes to the local registry)"
+    return 0
+  fi
+  # ⛔ THE RUN MUST NOT BE SILENT (agent-infra#3180), AND THE EXIT MUST BE THE SYNC'S.
+  # `out="$(…)"` swallowed every byte the sync wrote until it finished: on a loaded box a run that
+  # spent 26 minutes in the per-record loop showed a 0-byte log, and an operator could not tell
+  # "syncing" from "hung". `tee /dev/stderr` inside the substitution shows it LIVE while `out` keeps
+  # exactly what it held before (both streams, as `2>&1` already folded them in).
+  # ⛔ AND THE EXIT IS TAKEN INSIDE THE SUBSTITUTION: `${PIPESTATUS[0]}` read AFTER the assignment
+  # names the ASSIGNMENT's status, not the pipeline's (measured: a sync exiting 4 was reported rc=0,
+  # i.e. CONVERGED — a false PASS on the one signal that says the fleet's records are UNKNOWN).
+  out="$( bash "$sync" union 2>&1 | tee /dev/stderr; exit "${PIPESTATUS[0]}" )" || rc=$?
+  case "$rc" in
+    0) log_line "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
+       # A converged run can still carry per-record notices, and this arm used to drop every one of
+       # them: a store holding a record this box could not use printed `ok … synced` with the warning
+       # discarded, which is the SILENCE the #2349 ruling forbids. Say what the run flagged.
+       printf '%s\n' "$out" | grep -E '⚠️|DIVERGES' | sed 's/^/   /' >&2 || true ;;
+    3) printf '%s\n' "$out" >&2
+       err "atomic-land: ⚠️ the review-record registry DIVERGES between boxes at the same reviewed_at (above)."
+       err "   Neither side was overwritten (#2374 rule 4). Any record this box holds locally is still used below." ;;
+    4) printf '%s\n' "$out" | sed 's/^/   /' >&2
+       err "atomic-land: ⚠️ the fleet's registry holds records this box could NOT use (unreadable ref or stamp,"
+       err "   or a mis-keyed record) — skipped, nothing overwritten, but that is NOT a converged state."
+       err "   A record already present locally is still used below." ;;
+    *) err "atomic-land: ⚠️ could not sync the cross-box review-record registry — the fleet's records are"
+       err "   UNKNOWN on this box, not empty. A record already present locally is still used below."
+       printf '%s\n' "$out" | sed 's/^/   /' >&2 ;;
+  esac
+  return 0
+}
+
+# The review record file. Repo-qualified first (#426), legacy `<PR>.json` next
+# (accepted only when it names no repo, or names THIS one).
+read_record() {
+  local qualified="$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$PR.json"
+  local legacy="$HOME/.pi/agent/reviews/$PR.json"
+  local candidate="" out=""
+  if [ -f "$qualified" ]; then
+    candidate="$qualified"
+  elif [ -f "$legacy" ]; then
+    local legacy_repo
+    legacy_repo="$(python3 - "$legacy" <<'PY' 2>/dev/null || true
+import json,sys
+try: print(json.load(open(sys.argv[1])).get("repo",""))
+except Exception: pass
+PY
+)"
+    if [ -z "$legacy_repo" ] || [ "$legacy_repo" = "$REPO" ]; then candidate="$legacy"; fi
+  fi
+  [ -n "$candidate" ] || return 1
+  out="$(python3 - "$candidate" <<'PY' 2>/dev/null
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(1)
+print(d.get("head_sha",""))
+print(d.get("verdict",""))
+print(d.get("merge_base_sha",""))
+PY
+)" || return 1
+  RECORD_FILE="$candidate"
+  RECORD_HEAD="$(printf '%s' "$out" | sed -n '1p')"
+  RECORD_VERDICT="$(printf '%s' "$out" | sed -n '2p')"
+  RECORD_MB="$(printf '%s' "$out" | sed -n '3p')"
+  return 0
+}
+
+verdict_accepted() {
+  local v
+  for v in $ACCEPTED_VERDICTS; do [ "$v" = "$1" ] && return 0; done
+  return 1
+}
+
+# ── step 1: update ───────────────────────────────────────────────────────
+do_update() { # 0 = updated, 3 = not behind (no-op)
+  if [ "$QUEUE_MODE" -eq 1 ]; then
+    # The queue updates the branch ITSELF, inside `mergify/merge-queue/main`, and
+    # validates that tree. Doing it here would move the head (staling the record we
+    # just verified), spend a full CI cycle at the head, and buy no mergeability the
+    # queue does not re-establish — the #7230 non-termination the direct path already
+    # records. 3 is the "nothing to do" code. This is #3016 Option 1, recorded in
+    # `.mergify.yml`: the queue replaces the update-lock, so the author does nothing.
+    log_line "atomic-land: [1/4] update — the queue performs the update itself (#3016); the head is left exactly as reviewed"
+    return 3
+  fi
+  local before="$HEAD" after="" i t=0 behind="" stale_record=0 rec_rc=0
+  case "$MERGE_STATE" in
+    UNKNOWN|""|null)
+      # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
+      # determine the merge state. Reading it as "nothing to update" would certify
+      # the head against a base relation nobody established, then land on it.
+      # But UNKNOWN is TRANSIENT — GitHub computes mergeability lazily — so re-poll
+      # a bounded number of times before refusing: a state that is merely still
+      # being computed must not false-block the unit, while a genuinely
+      # undetermined state still fails CLOSED.
+      while [ "$t" -lt "${ATOMIC_LAND_UNKNOWN_POLLS:-5}" ]; do
+        t=$((t + 1))
+        sleep "$POLL"
+        resolve_state
+        case "$MERGE_STATE" in UNKNOWN|""|null) : ;; *) break ;; esac
+      done
+      case "$MERGE_STATE" in
+        UNKNOWN|""|null)
+          stop "the merge state of $REPO#$PR is still undetermined after $t re-poll(s) (mergeStateStatus=${MERGE_STATE:-<none>}) — refusing to certify a head whose base relation is unknown (B6/B12)" ;;
+      esac ;;
+  esac
+  # ── the update trigger: the ENUM, OR the base-drift condition ──────────────
+  # #6424's ruling applied to the TRIGGER (route, do not exempt): the rail already
+  # has the signal it needs in a response it already fetches, so it fires on
+  # behind_by > 0 as well as on BEHIND. A PR whose head predates a base commit that
+  # a required gate leg depends on is BLOCKED (not BEHIND) and could otherwise never
+  # be refreshed — see behind_by_of(). The threshold is 0 by default: any real base
+  # drift is a reason to refresh, and an already-current head reports 0, which is
+  # the pre-existing no-op. ATOMIC_LAND_DRIFT_TRIGGER exists only to make the
+  # boundary testable; it is not a tuning knob.
+  case "$MERGE_STATE" in
+    BEHIND)
+      # #1565 — a BEHIND head is not by itself a reason to refresh. Refresh only
+      # when something REQUIRES an up-to-date branch: read that live rather than
+      # assume it (see strict_of()). A PR that is positively mergeable under
+      # strict=false is already landable, so moving its head buys no mergeability
+      # and costs a record invalidation + a full CI run + up to 5400s of waiting.
+      #
+      # WHY THIS ARM AND NOT THE BASE-DRIFT ARM BELOW: the drift arm is already
+      # conditional (behind_by > 0) and exists for #1533 — a BLOCKED branch whose
+      # drift red could never resolve without an update. A BLOCKED PR is still
+      # `mergeable: true` (no conflicts, but a red required leg), so applying this
+      # predicate there would skip precisely the refresh #1533 needed. This arm is
+      # where the update is UNCONDITIONAL — it fires on the enum alone — and that is
+      # the blast radius measured in #1565.
+      #
+      # ⚠️ THE DRIFT ARM NEEDS THE SAME PREDICATE — FOR EVERY LANDABLE STATE (#7230).
+      # For `CLEAN` and `UNSTABLE` every REQUIRED leg is satisfied, and `strict: false`
+      # means the distance to the base is not one of them: the only thing left between
+      # that PR and a merge is the drift, which nothing requires it to close. That
+      # inference holds only for a drift that is SAFE — a head whose merge would
+      # silently revert a path the base moved is NOT landable, and drift_safe_of()
+      # below is what separates the two (#7727). (Do NOT
+      # widen this to "anything but BLOCKED" — that set carries states that are not
+      # landable, which is what the fail-closed enumeration below and mutation B22
+      # exist to keep out.) The drift arm refreshed there anyway, so a green,
+      # correctly-attested
+      # PR had its head moved for nothing — the record then died at step 3 (#1575
+      # clause E, correctly) and the rail could never land it. That is the O3 shape
+      # (22 updated, 17 attestations invalidated, 0 landed) and the live repro is
+      # #7462 / tortoise #7230. So the landable states are held below under the same
+      # positive-false `strict` + positive-`mergeable` read as the BEHIND arm.
+      #
+      # TWO states are landable and both are named EXPLICITLY (fail-closed: any other
+      # state refreshes): `CLEAN` — every check passed — and `UNSTABLE` — the REQUIRED
+      # checks passed while only NON-required ones fail or pend, which GitHub defines
+      # as mergeable and which this file's own drift sweep measures at 10 of its
+      # population. Holding `CLEAN` alone would have left those 10 with the same
+      # non-termination. `BLOCKED` is deliberately NOT held: that is #1533, and its
+      # refresh still fires — as does a conflicting (unmergeable) head, on the
+      # fail-closed `mergeable` read rather than on its state name.
+      #
+      # ⛔ THE FAIL-SAFE GOVERNS HERE TOO. `ATOMIC_LAND_REFRESH_ALWAYS=1` restores the
+      # unconditional refresh and must be checked in THIS arm as well as the BEHIND
+      # one; a state-gated skip it could not override would be an un-disableable
+      # misfire.
+      if [ "${ATOMIC_LAND_REFRESH_ALWAYS:-0}" = 1 ]; then
+        log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
+      else
+        local strict mergeable
+        strict="$(strict_of)"
+        if [ "$strict" = false ]; then
+          mergeable="$(mergeable_of)"
+          if [ "$mergeable" = true ]; then
+            # #7727 — the SAME inference the drift arm above was fixed for. A
+            # `BEHIND` head routed here is skipped on `mergeable` alone, and
+            # `mergeable` answers "no text conflict", not "the merge KEEPS the
+            # base's content". Measured: this arm and the drift arm are the two
+            # places the rail decides a landable head needs no refresh, and a
+            # drift-red head is not landable in either.
+            if [ "$(drift_safe_of)" = 1 ]; then
+              log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (step 3 re-records here if the record is stale; the verify step below still waits for whatever is not yet terminal) (#1565)"
+              return 3
+            fi
+            log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #1565 skip would leave it unlandable with a misattributed refusal"
+          else
+            log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
+          fi
+        else
+          log_line "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=${strict:-unreadable} (read live) — refreshing"
+        fi
+      fi ;;
+    *)
+      behind="$(behind_by_of "$BASE" "$HEAD")"
+      local drift_landable=0
+      case "$MERGE_STATE" in CLEAN|UNSTABLE) drift_landable=1 ;; esac
+      if [ "$drift_landable" = 1 ] && [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
+        # #7230 — A LANDABLE HEAD MUST NOT BE PRE-EMPTED BY THE DRIFT TRIGGER.
+        # Without this arm the `elif CLEAN` no-op below is UNREACHABLE whenever the
+        # head is behind, so the state that is already landable is the one state
+        # guaranteed to be refreshed. Same predicate, same fail-closed direction as
+        # the BEHIND arm: skip only on a POSITIVE `false` strict AND a POSITIVE
+        # `true` mergeable.
+        if [ "${ATOMIC_LAND_REFRESH_ALWAYS:-0}" = 1 ]; then
+          log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
+        else
+          local strict mergeable
+          strict="$(strict_of)"
+          if [ "$strict" = false ]; then
+            mergeable="$(mergeable_of)"
+            if [ "$mergeable" = true ]; then
+              # #7727 — a mergeable head is not automatically a LANDABLE one: the merge
+              # can still fail to keep the base's content, which is exactly what the
+              # drift gate measures and what this skip would leave in place forever.
+              # Green predicate only.
+              if [ "$(drift_safe_of)" = 1 ]; then
+                log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (#7230)"
+                return 3
+              fi
+              # This is the ELSE of the drift check, not a fall-through: every path
+              # through the arm must emit EXACTLY ONE line, because the stdout is the
+              # human's evidence for why the head moved. A fall-through here printed
+              # the "not positively mergeable" line below as well — true of the OTHER
+              # arm, false here (mergeable IS true), and so a fresh misattribution in
+              # the fix for a misattribution.
+              log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #7230 skip would leave it unlandable with a misattributed refusal"
+            else
+              log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
+            fi
+          else
+            log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE and strict=${strict:-unreadable} (read live) — refreshing"
+          fi
+        fi
+      elif [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
+        log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE (not BEHIND) but the head is $behind commit(s) behind $BASE — refreshing on BASE DRIFT"
+      elif [ "$MERGE_STATE" = "CLEAN" ]; then
+        # #7727 — CLEAN IS NOT A STATEMENT ABOUT CONTENT, so this no-op may not be
+        # taken on the state name. `behind` reaches this arm whenever the drift arm
+        # above did NOT fire, which under the default trigger means it is 0 — but
+        # the safety must not REST on that: an unrelated arm's threshold is not
+        # this arm's invariant. With a non-zero ATOMIC_LAND_DRIFT_TRIGGER a real
+        # distance lands here, and a `-n "$behind"` test ("non-empty") skipped it
+        # while printing "measured current (0 behind)" — a false statement AND a
+        # drift-red skip (review round 3, measured). So the test is against the
+        # VALUE, and it is a STRING test, never arithmetic: `behind` is EMPTY on the
+        # very path this arm exists for (the compare read failed — the `-z` arm is
+        # BELOW this one and does not catch it first), and `[ "" -eq 0 ]` is not
+        # false — it is a bash diagnostic plus rc 2. The `if` still took the false
+        # branch, so the direction held, but on an ERROR, and it printed
+        # `[: : integer expression expected` on every such landing (round 4,
+        # measured). An exact string test can do neither.
+        if [ "${behind:-}" = "0" ]; then
+          log_line "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the head is measured current (0 behind) — nothing to update"
+          return 3
+        fi
+        # Either an UNREADABLE distance (the compare read failed) or a MEASURED
+        # one below the drift threshold: both are a distance this skip must not
+        # assume away. Under `strict: false` a genuinely-behind head reports CLEAN,
+        # so refusing to measure here is PR #7703's shape one unreadable read away.
+        if [ "$(drift_safe_of)" = 1 ]; then
+          log_line "atomic-land: [1/4] update — mergeStateStatus=CLEAN with the head/base distance ${behind:-unreadable}, but merging this head would keep $BASE's content — nothing to update"
+          return 3
+        fi
+        log_line "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING (the state name is not evidence about content)"
+      elif [ -z "$behind" ]; then
+        # B13 (fail-closed) — an UNREADABLE distance is not proof that the head is
+        # current, and the silent "up to date" read is the exact defect this arm
+        # exists to close.
+        #
+        # ⚠️ The reason once given here — "`CLEAN` was checked above and already
+        # asserts there is no divergence" — is FALSE, and #7230 is the proof: under
+        # `strict: false` a head that is genuinely behind reports `CLEAN`, which is
+        # the very state the drift arm above exists to catch. `CLEAN` is a statement
+        # about checks and conflicts, never about distance to the base. (Pre-fix,
+        # that false premise hid the drift arm entirely: `CLEAN`+`behind>0` fell
+        # through to it and had its head moved for nothing.) `CLEAN` keeps its no-op
+        # for the CORRECT reason, not that one: the drift arm has already decided
+        # the distance for every landable state whose compare read succeeded, and
+        # where it did NOT succeed the CLEAN arm ABOVE decides that head with the
+        # drift predicate — unmeasured means refresh — so this arm's no-op covers
+        # only a head whose distance was both READ and zero. (An earlier version of
+        # this sentence said a landable head with an unreadable distance "still needs
+        # no refresh"; the CLEAN arm's predicate call is exactly what makes that
+        # false, and it is the sentence a maintainer would cite to delete it.)
+        #
+        # (Do NOT name `BEHIND` or `BLOCKED` as what strict produces here — this file
+        # already records at :45-47 and :282-285 that `BEHIND` occurs WITH OR WITHOUT
+        # strict and that strict is only what makes it BLOCK a merge, so which of the two
+        # a stale head reports is not this comment's subject. An earlier draft of this
+        # parenthetical asserted `BLOCKED` and contradicted those lines.)
+        #
+        # Any OTHER state means GitHub has told
+        # us something is wrong with this head and the compare API could not tell us
+        # how stale it is. Stop and name it rather than proceeding on an unmeasured
+        # base relation (tortoise #6210 / #6169 are the measured population).
+        stop "could not measure the head/base divergence of $REPO#$PR (mergeStateStatus=$MERGE_STATE, compare API read failed) — refusing to treat a blocked head as up to date (B13)"
+      else
+        # #7727 — the same `-eq 0` question as the CLEAN arm above, and for the
+        # same reason: a MEASURED distance below the drift threshold is still a
+        # distance. Under the default trigger only 0 reaches this line; with a
+        # non-zero trigger the `-n` form skipped a real distance without ever
+        # consulting the predicate. A 0 distance is a genuine no-op (the head
+        # contains the base, so nothing can revert); anything else is decided by
+        # the predicate, like every other skip in this step. The non-zero case is
+        # nested one level deeper ON PURPOSE: it keeps this arm's predicate at a
+        # different indent from the CLEAN arm's, so each has its OWN anchored
+        # mutation (B26 at 8 spaces, B27 at 10). Two same-indent sites would make
+        # one unanchored pattern silently cover only the first — the B19b/B20b trap.
+        # A STRING comparison, like the CLEAN arm above: the test cannot ERROR, so
+        # the branch taken is a decision about the distance rather than about the
+        # shell. Anything that is not exactly "0" goes to the predicate.
+        if [ "${behind:-}" != "0" ]; then
+          if [ "$(drift_safe_of)" = 1 ]; then
+            log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, but merging this head would keep $BASE's content — nothing to update"
+            return 3
+          fi
+          log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, and the drift predicate is NOT positively green — REFRESHING on BASE DRIFT (#4174/#7727)"
+        else
+          log_line "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured 0 commit(s) behind $BASE — nothing to update"
+          return 3
+        fi
+      fi ;;
+  esac
+  # B5 — never SPEND an attestation the unit cannot restore. A branch update moves
+  # the head and invalidates the record; the #767 carry-forward can re-bind it only
+  # if the PR body carries a SIGNED marker whose `diff=` equals the live diff. With
+  # no such marker (every pre-#767 record) the update is destructive with certainty,
+  # and the cost is measured: a 22-PR sweep invalidated 17 fresh attestations and
+  # landed 0. This is a PRESENCE test — does an identity-bearing marker exist at all
+  # — NOT an equivalence computation: the producer owns the equivalence decision.
+  if [ "$RECORD_HEAD" = "$HEAD" ] && ! pr_has_carry_evidence; then
+    if [ -z "$GATE_KEY" ]; then
+      stop "updating $REPO#$PR would invalidate the only record (${RECORD_HEAD:0:12}…) and nothing could re-mint it — no review gate key is available (AI_REVIEW_GATE_KEY or ~/.pi/agent/.ai-review-gate-key), so the carry-forward could never verify a prior marker. Nothing was merged."
+    fi
+    stop "updating $REPO#$PR would invalidate the only record (${RECORD_HEAD:0:12}…) and this rail could not show it would be restored — the PR carries no VERIFIABLE signed marker with a diff= identity for verdict '$RECORD_VERDICT' (a pre-#767 marker, one signed with a different key, or a line whose signature does not verify; the PR body is attacker-writable, so a matching shape is not evidence). Record the review in the current format first; then the update carries it. Nothing was merged."
+  fi
+  # ── #2369 — the RECORD step is a PRECONDITION of the head move ────────────
+  # B5 above stops when the ONLY record is bound to this head and no marker could
+  # restore it. The STALE case was left to the record step, and that is the defect:
+  # when the record is already behind the head, `[1/4] update` moved the head
+  # ANYWAY, `[3/4] record` then refused, and the unit had spent a full CI cycle at
+  # the new head for a PR no record could name. MEASURED (#9639): the rail refreshed
+  # d35d37a2… → d34da3c7… on BASE DRIFT and then refused at step 3 — the record was
+  # already at 11a2ac6f…, stale BEFORE the run, so the update bought nothing. (Not
+  # this defect, in the same batch: #9635/#9651/#9545 refused at step 1 on
+  # CONFLICTED, and #9658 reached step 4 on runner capacity.)
+  # The stale population has TWO causes and only one is hopeless: a lane that PUSHED
+  # after recording (a new non-base commit, so no carry arm can re-bind it — the
+  # fresh review this guard demands), and a BASE-ONLY move whose record was never
+  # re-bound (the lane arm's own population, where the probe SUCCEEDS — test 2b-ii).
+  # The guard stops only the first, because it asks the producer instead of guessing.
+  #
+  # The precondition is DELEGATED, never re-derived. The rail still computes no
+  # diff (see pr_has_carry_evidence): the probe IS `record-review.sh`, asked about
+  # the CURRENT head with the recorded prior head — the same script and the same two
+  # carry arms step 3 uses, run before the mutation instead of after it. That
+  # delegation is load-bearing, not tidiness: the carry has a DIFF arm (a marker
+  # whose `diff=` equals the live diff) and a LANE arm (#2982, a base-only move)
+  # which needs no marker at all, and a diff-only pre-check here could therefore
+  # refuse a head the lane arm would have carried — a false block on the rail's own
+  # recovery path, since a lane that updated and then died at verify leaves exactly
+  # that state (record stale, head a clean re-merge of the reviewed commit).
+  #
+  # WHAT THE PROBE CANNOT ANSWER, stated so no reader over-reads it. It answers
+  # "can the reviewed artifact be re-bound AT THE CURRENT HEAD" — content, not
+  # health. It cannot answer the NEW head's health, because that head does not exist
+  # yet: the #1575 clause (E) veto is measured by `record-review.sh` against the live
+  # head, so at the probe it measures a head whose checks may be red only because its
+  # base is stale (a >20-behind head's drift leg FAILS, #1533/#7727). That is why a
+  # clause (E) refusal returns 4 and is NOT a precondition failure: refreshing is the
+  # only remedy available to the RAIL for a drift-caused red, and step 3 re-runs the
+  # same veto at the new head, where the surface is fresh. ⚠️ ACCEPTED RESIDUAL, not a
+  # claim the code can support: clause (E) fires before anything diagnoses WHY a head
+  # is red, so a head that is red for its OWN reasons is not repaired by a refresh —
+  # step 3 refuses again and the unit dies after the head move plus the CI cycle this
+  # issue exists to remove. The rail cannot tell the two apart without diagnosing the
+  # failing check, which would be a second definition of a verdict it is not the owner
+  # of; so it proceeds and says so, rather than blocking the whole drift-red population
+  # to save one self-red PR the cost it already paid before this change. Its lane-arm
+  # call is also (RECORD_HEAD → HEAD), not the
+  # (HEAD → new-head) call step 3 will make; success here establishes the premise for
+  # that one rather than pre-computing it — the record it writes carries the live
+  # diff=, which is what the post-update DIFF arm matches on a clean base merge.
+  #
+  # What this buys: on SUCCESS the record names HEAD, so the update is one the carry
+  # can restore — B5's condition ESTABLISHED rather than assumed. On a CONTENT
+  # refusal nothing has been mutated and the refusal names the head a review must
+  # cover. A DRY RUN reaches do_record's own dry-run arm, so it prints the record
+  # step it would take and still writes nothing.
+  #
+  # ⚠️ ONE MUTATION CAN OUTLIVE A STOPPED UNIT — stated, because "nothing has been
+  # mutated" above is scoped to the CONTENT refusal (review, cycle 5). A SUCCESSFUL
+  # probe WRITES: `do_record` runs the producer, which re-binds the signed record —
+  # and its PR-body marker — to the CURRENT head before any update is attempted. If
+  # `gh pr update-branch` then fails, or the ref poll never observes a new head, the
+  # unit stops with the record naming the CURRENT head. That binding is materially
+  # TRUE (the carry arms proved the reviewed artifact unchanged) and it is the same
+  # posture every step-[3/4] carry already has: the rail stamps a head whose checks
+  # are still in flight, and the producer's clause (E) reads an in-flight or
+  # unreadable surface as "not shown red" by its own documented contract. It is NOT
+  # a fail-open on a red head: clause (E) "can only ADD a refusal, it can never
+  # authorise one", and the land-time red classification is `admin-merge.sh`'s
+  # (#930), which reads the head's own surface and refuses a failure the PR carries
+  # whether or not any record names it. Rolling the write back is not the remedy it
+  # looks like either: the PR-body marker cannot be un-posted (editing the body wipes
+  # the attestation, #1224), so a restored record file would contradict the signed
+  # marker left behind. Named here so the next reader cannot take "nothing has been
+  # mutated" as covering the success-then-update-failure path.
+  stale_record=0
+  [ "$RECORD_HEAD" = "$HEAD" ] || stale_record=1
+  if [ "$stale_record" -eq 1 ]; then
+    log_line "atomic-land: [1/4] update — the record is STALE (${RECORD_HEAD:0:12}… at ${HEAD:0:12}…) — asking the record step about the CURRENT head BEFORE moving it, so the update is one the carry can restore (#2369)"
+    do_record preflight
+    rec_rc=$?
+    if [ "$rec_rc" -eq 4 ]; then
+      log_line "atomic-land: [1/4] update — the record step refused on the CURRENT head's HEALTH (#1575 clause (E)), not on content: the artifact WAS proven unchanged and the head is measurably red. The refresh is the only remedy this rail has for a drift-caused red (#1533), so the update PROCEEDS; step [3/4] re-runs the same veto at the new head, and a red the head itself owns will be refused THERE."
+    elif [ "$rec_rc" -eq 5 ]; then
+      # #1362 D1, the other half. `do_record` reaches its B8 binding arms whenever the
+      # producer EXITED 0 but left no record naming this head — `record-review.sh` fails
+      # OPEN on a transient head read, which is exactly why B8 exists. That is not a
+      # refusal of the artifact and not a demand for a fresh review: the reviewed content
+      # may be unchanged and the recorded verdict may be intact. Calling it "REFUSED"
+      # here would send the lane to re-review an unchanged artifact — the false
+      # obligation this whole block exists to remove.
+      stop "the record step exited WITHOUT binding the CURRENT head ${HEAD:0:12}… (reason above) — the branch was NOT updated and nothing was merged. This is not a review refusal: the reviewed artifact may be unchanged, so do NOT re-review on this message alone. Re-run the rail; if it repeats, re-record at ${HEAD:0:12}…"
+    elif [ "$rec_rc" -ne 0 ]; then
+      stop "a FRESH review is required at ${HEAD} before $REPO#$PR can be updated — the record is stale (${RECORD_HEAD:0:12}…) and the record step REFUSED that artifact at the CURRENT head (reason above). The branch was NOT updated and nothing was merged: a head move would only spend a full CI cycle on a PR whose record could not be carried (#2369). Review ${HEAD:0:12}… and record it, then re-run."
+    fi
+    # On rc=0 do_record RE-READ the record, so RECORD_HEAD is now HEAD. That is the
+    # success arm ONLY. On rc=4 (head-health) the producer vetoed BEFORE its record
+    # write, so NOTHING was written and RECORD_HEAD is STILL the stale reviewed head:
+    # step [3/4] must hand that prior to the producer itself, and a reader must not
+    # take this line as "after a proceed the record already names HEAD". Tightening
+    # step 3 on that reading would break the carry this proceed depends on.
+  fi
+  log_line "atomic-land: [1/4] update — PR #$PR is BEHIND; updating the branch (head ${before:0:12}…)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log_line "atomic-land:     (dry-run) would run: gh pr update-branch $PR"
+    WOULD_UPDATE=1
+    return 3
+  fi
+  gh_ pr update-branch "$PR" ${repo_args[@]+"${repo_args[@]}"} >/dev/null 2>&1 \
+    || stop "gh pr update-branch failed for #$PR (conflict, or not updatable)"
+  # The new head must appear; a bounded poll, because the ref update is async.
+  i=0
+  while [ "$i" -lt 20 ]; do
+    after="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json headRefOid --jq .headRefOid 2>/dev/null || true)"
+    if [ -n "$after" ] && [ "$after" != "$before" ]; then HEAD="$after"; break; fi
+    i=$((i + 1)); sleep "$POLL"
+  done
+  [ -n "$after" ] && [ "$after" != "$before" ] \
+    || stop "the update did not move the head (still ${before:0:12}…) — nothing to carry a record onto"
+  log_line "atomic-land:     updated: ${before:0:12}… → ${HEAD:0:12}…"
+  return 0
+}
+
+# ── step 2: verify (the head's checks must be terminal) ──────────────────
+# check-runs defaults to 30 per page (measured: 30 of 47 at a real head), so a
+# count read from one page is not a verdict — a partial surface is never CLEAN.
+# --paginate emits ONE result per page, so the pages are SUMMED here; a FAILED
+# read stays "?" so the caller keeps waiting instead of reading an error as zero
+# pending (a false terminal hands in-flight checks to the land step).
+check_count() { # $1 = jq program applied to one page of check-runs
+  local raw
+  if ! raw="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs?per_page=100" --paginate \
+                        --jq "$1" 2>/dev/null)"; then
+    echo "?"
+    return
+  fi
+  printf '%s\n' "$raw" | awk '{n+=$1} END {print n+0}'
+}
+
+wait_terminal() {
+  if [ "$NO_WAIT" -eq 1 ]; then
+    log_line "atomic-land: [2/4] verify — --no-wait: admin-merge.sh's tested-head precondition decides"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log_line "atomic-land: [2/4] verify — (dry-run) would wait up to ${WAIT_TIMEOUT}s for terminal checks"
+    return 0
+  fi
+  log_line "atomic-land: [2/4] verify — waiting (≤${WAIT_TIMEOUT}s) for the checks at ${HEAD:0:12}… to be terminal"
+  # B14 (#1395 item 1): the bound is WALL-CLOCK, not a poll count. The old
+  # `elapsed=$((elapsed + POLL))` credited $POLL per iteration while each
+  # iteration first spends TWO `gh api` round trips, so the rail outlived its own
+  # documented bound (MEASURED: #5797 sat at [2/4] verify for 93 min against a
+  # nominal 90) — and `--poll 0` advanced the counter by ZERO, so the bound could
+  # never be reached at all and the rail looped forever while holding the PR's
+  # lock and a landing slot. Both are one defect: a counter that is not a clock.
+  # $SECONDS is bash's own elapsed-time counter: it removes the CLOCK's fork (the
+  # `$(date +%s)` that the first cut of this fix ran every iteration) and it
+  # cannot be affected by the poll interval. It does NOT remove the loop's own
+  # fork: with `--poll 0`, `sleep 0` is still /bin/sleep and forks (measured ~143
+  # iterations/s, against ~98k for a pure builtin loop) — that is just a busy
+  # loop, bounded by the clock above, not a second way to defeat the bound.
+  # Residual: like any wall clock it can step BACKWARDS on an NTP adjustment,
+  # which would delay the stop rather than defeat it permanently.
+  local started elapsed remaining pending completed
+  started="$SECONDS"
+  while :; do
+    pending="$(check_count '[.check_runs[] | select(.status != "completed")] | length')"
+    completed="$(check_count '[.check_runs[] | select(.status == "completed")] | length')"
+    if [ "$pending" = "0" ] && [ "$completed" != "0" ] && [ "$completed" != "?" ]; then
+      log_line "atomic-land:     checks terminal — $completed completed, 0 pending"
+      return 0
+    fi
+    elapsed=$(( SECONDS - started ))
+    if [ "$elapsed" -ge "$WAIT_TIMEOUT" ]; then
+      stop "the checks at ${HEAD:0:12}… were not terminal within ${WAIT_TIMEOUT}s (pending=${pending}, completed=${completed}) — re-run the rail later; nothing was recorded or merged"
+    fi
+    # The bound was checked JUST ABOVE, so an unclamped `sleep "$POLL"` lets the
+    # rail overshoot its own bound by up to a whole poll interval — MEASURED on the
+    # revision before this line: `--wait-timeout 2 --poll 8` ran 10 s wall while
+    # printing "waiting (≤2s)". That is the #1395 symptom again (a rail outliving
+    # the bound it reports, holding the per-PR lock), so clamp the final sleep to
+    # what is actually left. min(remaining, POLL) keeps polling at the requested
+    # cadence while making the bound exact to within one poll of the remainder.
+    # `10#` forces BASE 10. The validator and the `-ge` test above read the argument
+    # as DECIMAL, while bare arithmetic reads a leading zero as OCTAL — so
+    # `--wait-timeout 010` would compare as 10 but subtract as 8, and `08` is not a
+    # valid octal literal AT ALL: the arithmetic error unwinds this loop SILENTLY
+    # (bash 3.2), after step [1/4] has already moved the head. Same base everywhere.
+    remaining=$(( 10#$WAIT_TIMEOUT - elapsed ))
+    if [ "$remaining" -gt "$POLL" ]; then remaining="$POLL"; fi
+    sleep "$remaining"
+  done
+}
+
+# ── step 3: record (carry the existing verdict forward, or STOP) ─────────
+do_record() { # [preflight] 0 = fresh/at head, 1 = content refusal, 4 = head-health refusal,
+              # 5 = the producer exited 0 without binding the head (preflight only)
+  # The STEP LABEL is the caller's, not this function's: the same code runs as step
+  # [3/4] after the update and as the [1/4] precondition BEFORE it (#2369), and a log
+  # that says [3/4] during step 1 — or names a "new head" that does not exist yet —
+  # sends the operator after the wrong artifact. That is the same misdiagnosis class
+  # #1362 D1 and this issue exist to remove.
+  local label="[3/4] record" headword="new head"
+  if [ "${1:-}" = "preflight" ]; then label="[1/4] record-precheck"; headword="CURRENT head"; fi
+  if [ "$RECORD_HEAD" = "$HEAD" ]; then
+    if [ "$WOULD_UPDATE" -eq 1 ]; then
+      log_line "atomic-land: $label — (dry-run) the pending update moves the head, so the record would be re-derived there (carry-forward iff the reviewed diff is unchanged)"
+    else
+      log_line "atomic-land: $label — the record is already at ${HEAD:0:12}… (verdict=$RECORD_VERDICT); no re-record"
+    fi
+    return 0
+  fi
+  log_line "atomic-land: $label — record is at ${RECORD_HEAD:0:12}…, head is ${HEAD:0:12}…"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log_line "atomic-land:     (dry-run) would run: record-review.sh $PR ${RECORD_HEAD:0:12}… $RECORD_VERDICT $REPO (carry-forward)"
+    return 0
+  fi
+  local log rc prior="$RECORD_HEAD"
+  log="$(mktemp "${TMPDIR:-/tmp}/atomic-land-record.XXXXXX")"
+  # ⛔ #2572 DELIBERATELY DOES NOT PASS `--expect-head` HERE, AND THAT IS NOT AN OVERSIGHT. The flag
+  # means "the PR head must be exactly this sha" — the rule that pins a FRESH review mint to the
+  # revision a reviewer read, which is what #2572 added at the seams that mint one (review-pr.sh,
+  # merge-one.sh). This call is the OTHER shape: a CARRY. Its positional head is `$prior`, the REVIEWED
+  # head, while the live PR head is deliberately `$HEAD` — the base-only update this rail just pushed
+  # and then OBSERVED at the [2/4] re-read. So `--expect-head "$prior"` would refuse every base-only
+  # update by construction (that is precisely the situation the carry exists for), and
+  # `--expect-head "$HEAD"` would import a new exit-3 cause into the arm below, which reads EVERY
+  # exit 3 as a CONTENT refusal — reclassifying "the head moved under the rail" as "the reviewed diff
+  # changed", the misdiagnosis class #1362 D1 removed. The carry's own semantics (#2302: a carry
+  # across a merge-only head move; #2358: the LANE carry re-binds any verdict) are OUT OF SCOPE for
+  # #2572 and are not changed here. What this rail does instead of a pin: it RE-READS the record from
+  # disk after the call and refuses to proceed unless the recorded head IS `$HEAD` (the B8 check
+  # below) — so a carry that landed anywhere other than the intended head cannot be landed.
+  bash "$RECORD_SH" "$PR" "$prior" "$RECORD_VERDICT" "$REPO" >"$log" 2>&1
+  rc=$?
+  sed 's/^/atomic-land:     record-review: /' "$log" >&2
+  if [ "$rc" -eq 3 ]; then
+    # #1575 clause (E) is a DISTINCT cause of the SAME exit code: the artifact was
+    # PROVEN unchanged and the re-bind was refused because the target head is
+    # measurably red. Blaming a changed diff would send the operator hunting for a
+    # change that does not exist — the same misdiagnosis class #1362 D1 fixes below.
+    if grep -qF '(#1575 clause E)' "$log"; then
+      # ⛔ THE GREP IS A CONSUMER CONTRACT, not a convenience: exit 3 carries BOTH
+      # refusal causes, so this literal (emitted by scripts/record-review.sh at its
+      # clause (E) veto, which names this rail beside it) is the only discriminator
+      # between "the artifact changed" and "the head is red". Rewording it upstream
+      # would silently reclassify a head-health refusal as a content refusal and
+      # restore the #2369 defect for drift-red PRs. Scenario 2b-vi pins both ends.
+      err "atomic-land: the carry was REFUSED by (#1575 clause E) — the target head ${HEAD:0:12}… IS MEASURABLY RED. The lane artifact WAS proven unchanged; do NOT hunt for a diff change. Re-run the failing checks (or wait for them), then re-record."
+      # The step-[3/4] path must still say nothing was merged — it is the path that
+      # runs AFTER the head was moved and the CI cycle spent, and with no further
+      # output the transcript would leave that unsaid. The preflight neither lands
+      # nor merges, so it does not claim to withhold a merge.
+      if [ "${1:-}" != "preflight" ]; then
+        err "atomic-land: the landing path does NOT accept this refusal — nothing was merged."
+      fi
+      rm -f "$log"
+      # A DISTINCT return, so a caller can tell a CONTENT refusal from a HEAD-HEALTH
+      # one. The #2369 preflight proceeds on this one: refreshing is the only remedy
+      # the rail has for a red the stale base caused, and refusing it here would leave
+      # exactly that population unlandable by the rail's own hand (#1533/#7727). Step
+      # [3/4] re-runs the veto at the new head, where the check surface is fresh — a
+      # head that is red for its OWN reasons is refused THERE, and it is the caller's
+      # rejection of this code that does it (mutation B5g pins that, so a caller that
+      # accepted 4 could not land on a red head unnoticed).
+      return 4
+    fi
+    err "atomic-land: the recorded verdict cannot be carried to ${HEAD:0:12}… — the reviewed diff CHANGED (or no prior signed evidence for it exists)."
+    # #1362 D1 — a PARTIAL INSTALL is a distinct cause of the same exit code. The
+    # producer computes its digest with the sibling normalizer
+    # (scripts/lib/diff-normalize.py); if that file was not farmed, the producer
+    # degrades to the raw pre-#1362 digest and EVERY base-only update refuses —
+    # so the message above would blame a diff that did not change. Name the
+    # missing file so the remedy is an install, not a re-review. Diagnostic only:
+    # the rail never re-derives the digest itself (see pr_has_carry_evidence).
+    DIFF_NORMALIZER_SH="$(dirname -- "$RECORD_SH")/lib/diff-normalize.py"
+    if [ ! -f "$DIFF_NORMALIZER_SH" ]; then
+      err "atomic-land: ⚠️ #1362: the producer's diff normalizer ($DIFF_NORMALIZER_SH) is NOT installed — the refusal above may be a partial install, not a changed artifact. Re-run pi-bootstrap/setup.sh (which farms scripts/lib/diff-normalize.py) before re-reviewing."
+    fi
+    err "atomic-land: a FRESH review of the $headword is required; this rail cannot author one. Nothing was merged."
+    rm -f "$log"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$log"
+    # The step label again (#1362 D1): a producer failure reachable from the [1/4]
+    # precondition (any exit the two branches above do not own — a usage error, the
+    # clean-micro tier refusal) must not claim a LANDING was refused when no head
+    # has moved and no landing was ever in question.
+    if [ "${1:-}" = "preflight" ]; then
+      stop "record-review.sh exited $rc — refusing to move the head without a record: the branch was NOT updated and nothing was merged"
+    fi
+    stop "record-review.sh exited $rc — refusing to land without a record"
+  fi
+  # B8 — the delegated record must ACTUALLY name THIS head. A zero exit is not
+  # proof: the carry-forward arm sets the recorded sha to the CURRENT head only
+  # when the reviewed diff is unchanged, and `record-review.sh` fails OPEN on a
+  # transient head-read failure. Re-read from disk and require the binding rather
+  # than assuming it. (This is the belt-and-braces catch for a delegate that lies;
+  # the decision itself stays with the script that owns the record — the rail is a
+  # sequencer, not the equivalence authority.)
+  read_record || {
+    if [ "${1:-}" = "preflight" ]; then
+      err "atomic-land: the record could not be RE-READ at the CURRENT head ${HEAD:0:12}… — the branch was NOT updated and nothing was merged. The record step exited 0, so this is not (necessarily) a refusal of the artifact: re-run the rail."
+      rm -f "$log"
+      return 5
+    fi
+    err "atomic-land: the record could not be re-read after the record step — refusing to land unrecorded"
+    rm -f "$log"
+    return 1
+  }
+  if [ "$RECORD_HEAD" != "$HEAD" ]; then
+    if [ "${1:-}" = "preflight" ]; then
+      # The FAIL-OPEN delegate at the [1/4] precondition. The landing wording below is
+      # false here — no head has moved, nothing was going to be landed, and the producer
+      # exited 0. Returned as 5 so the caller cannot turn it into "a FRESH review is
+      # required" (scenario 2b-ix pins the distinction).
+      err "atomic-land: the record step exited WITHOUT binding the CURRENT head (record names ${RECORD_HEAD:0:12}…, head is ${HEAD:0:12}…) — the branch was NOT updated and nothing was merged. The reviewed artifact may be unchanged; this is not a demand for a fresh review."
+      rm -f "$log"
+      return 5
+    fi
+    err "atomic-land: the record names ${RECORD_HEAD:0:12}… but the head is ${HEAD:0:12}… — this unit has NO record for the head it would land."
+    err "atomic-land: a zero exit must leave a record naming the CURRENT head (carry-forward does that only when the reviewed diff is content-unchanged). Nothing was merged."
+    rm -f "$log"
+    return 1
+  fi
+  if ! verdict_accepted "$RECORD_VERDICT"; then
+    if [ "${1:-}" = "preflight" ]; then
+      err "atomic-land: the re-read record's verdict '${RECORD_VERDICT:-<none>}' is not accepted — the branch was NOT updated and nothing was merged (B2)"
+    else
+      err "atomic-land: the re-read record's verdict '${RECORD_VERDICT:-<none>}' is not accepted — refusing to land (B2)"
+    fi
+    rm -f "$log"
+    return 1
+  fi
+  # Cite ONLY after the binding is VERIFIED. Posting the citation before the
+  # re-read publishes a claim the rail has not yet established — a delegate that
+  # exits 0 without writing makes "reused verdict …" false, and a comment cannot
+  # be un-posted. The citation records a VERIFIED reuse.
+  # A PRE-FLIGHT record (#2369, the update precondition) is NOT the landing reuse:
+  # the post-update record step cites THAT one, so citing here would post the same
+  # reuse twice for one landing. The record itself is written either way — this
+  # suppresses the citation, never the evidence.
+  if [ "$NO_CITE" -eq 0 ] && [ "${1:-}" != "preflight" ]; then cite_reuse "$log" "$prior"; fi
+  rm -f "$log"
+  return 0
+}
+
+# The reuse citation (tortoise #4764 ruling): record the reuse AS REUSE, with
+# the equivalence evidence, rather than silently re-stamping the verdict. A
+# COMMENT, never a body edit — the body carries the attestation and editing it
+# wipes it (agent-infra #1224).
+#
+# ⛔ The citation carries NO marker segment. The review-marker format is a
+# CROSS-REPO CONTRACT: a new marker kind inherits a land order (the consumer
+# regex must accept it BEFORE any producer emits it), or every signed marker
+# reads malformed fleet-wide (#3076 shape). Marker WRITING therefore stays
+# where the fleet's regexes already know it — `record-review.sh`. This rail
+# writes prose only, and its one write is this comment; it never touches the
+# record and never edits the PR body.
+cite_reuse() { # <record-review log> <prior head>
+  local diff="" prior="$2"
+  diff="$(grep -oE 'diff=[0-9a-f]{64}' "$1" 2>/dev/null | head -1 | cut -d= -f2)"
+  local body="atomic-land: reused verdict \`$RECORD_VERDICT\` for ${HEAD:0:12}… from prior head ${prior:0:12}…
+The head moved by a base-only update, and \`record-review.sh\` re-recorded the prior signed verdict"
+  if [ -n "$diff" ]; then
+    body="$body for the content-identical (normalized) three-dot diff (\`diff=$diff\`)."
+  else
+    body="$body after its carry-forward guard proved the reviewed diff unchanged."
+  fi
+  gh_ pr comment "$PR" ${repo_args[@]+"${repo_args[@]}"} --body "$body" >/dev/null 2>&1 \
+    || err "atomic-land: ⚠️ could not post the reuse citation comment (non-fatal)"
+}
+
+# ── queue mode: hand the PR to the Mergify merge queue (#5215 owner question) ──
+#
+# WHY THIS EXISTS
+#   The land step below admin-merges ONE PR immediately. Its verdict is paid for
+#   with a full CI cycle at that PR's head, and none of that work is re-used for
+#   the next PR — so N landings cost N cycles. `.mergify.yml` declares a merge queue
+#   whose `batch_size: 4` validates up to four PRs in ONE CI run against the
+#   COMPOSITION that will actually land, which is exactly the mechanism the owner
+#   asked about. A queue helps only the PRs that are handed to it, and before this
+#   flag NOTHING handed one over: every landing THIS RAIL performs goes through its
+#   direct land step (`admin-merge.sh`), which is what `--queue` replaces.
+#   ⛔ Do not restate that as a claim about landings in general — see the measurement
+#   in the header: the data can say "no bot identity merged these", never "this
+#   mechanism merged them".
+#
+# WHAT IS READ, AND WHY IT IS THE AUTHORITY
+#   The queue publishes its own verdict on this head as a `Mergify Merge Queue`
+#   check-run carrying a machine-readable `itemprop` payload — `state`, `queued_at`,
+#   `queue_rule_name`, and the condition tree with each node's `match`. The rail
+#   reads THAT. It does not infer entry from `mergeStateStatus`, and it never treats
+#   "I posted the command" as "the PR is queued" (#1359: a send is not an artifact).
+#
+# WHAT IS NOT DONE HERE
+#   No check is bypassed, relaxed or edited; no branch protection is touched; no PR
+#   body is edited (a body edit wipes a review attestation recorded in it). Entry is
+#   `queue_conditions` in the TARGET repo's `.mergify.yml`, which already includes
+#   `check-success=ai-review-gate` — the server-side enforcement of the same record
+#   this rail verified locally (#5433). `strict: true` is an OPEN DECISION (#3016);
+#   nothing here reads or depends on it.
+#
+#   An entry REFUSAL is reported verbatim and the rail STOPS — it never falls back
+#   to admin-merging work the queue declined to take. The only fallback is the
+#   QUEUE-NOT-ARMED one, where the queue is ABSENT rather than unwilling.
+
+queue_check_run() { # -> line 1 "<id>\t<title>", then the summary VERBATIM.
+  #   "NONE" = the read SUCCEEDED and this head has no Mergify check-run.
+  #   "TRUNCATED" = the surface exceeded one page, so absence cannot be concluded.
+  # rc 1 = the read FAILED (never conflated with "no queue": a rate-limited or
+  # 403 read returns an empty body, and treating that as "Mergify is not installed"
+  # would route the PR to the admin path on a transient error).
+  #
+  # Two emitted values, not one tab-joined string: the summary is MARKDOWN (many
+  # lines), and a `cut -f3-` over it would keep only the field-3 column of the
+  # first line and would then suppress every following line that holds no tab —
+  # i.e. the body the state is decoded from.
+  #
+  # THE PAGE IS CHECKED, not re-paginated: `--jq` runs PER PAGE, so a paginated
+  # `sort_by(.id)|last` yields one "newest" row per page and the caller cannot tell
+  # which is newest. The surface is therefore read as ONE page and refused when
+  # `total_count` says it is not the whole surface — absence is a claim, and a
+  # partial read may not make it (#1261: a partial read is a failure to look).
+  local out
+  out="$(gh_ api "repos/$REPO/commits/$HEAD/check-runs?per_page=100&filter=all" \
+    --jq 'if .total_count > 100 then "TRUNCATED"
+          else ([.check_runs[]
+                 | select((.app.slug // "") == "mergify")
+                 # ⛔ BY NAME TOO, not by app alone: Mergify publishes more than the
+                 # merge-queue run under the same app (configuration-change summaries
+                 # among them). Taking "the newest mergify run" let a summary run win,
+                 # whose payload carries no `state` — so a PR the queue genuinely HELD
+                 # decoded as unreadable and was reported as not taken.
+                 | select((((.name // "") + " " + (.output.title // "")) | test("merge queue"; "i")))]
+                | sort_by(.id) | last) as $r
+          | if $r == null then "NONE"
+            else "\($r.id)\t\($r.output.title // "")", ($r.output.summary // "") end end' \
+    2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+# Does the TARGET repo declare a merge queue at all? 0 = yes · 1 = positively no ·
+# 2 = could not read. The distinction matters: "no check-run on this head" is NOT
+# "no queue" — measured 2026-10-23, 3 of 12 open tortoise PRs had no Mergify run at
+# their head while the queue was installed and armed. The queue's DECLARATION is the
+# evidence of absence, and only a positive "no declaration" may take the fallback.
+queue_declared() {
+  local out="" rc=0 cfg=""
+  # ⛔ NO PIPELINE ON THE POLARITY. `printf | grep -q` runs under `set -o pipefail`:
+  # grep exits on the first match, printf takes EPIPE once the config exceeds the pipe
+  # buffer, and the PIPELINE then returns 141 — so `&& return 0` is skipped and a repo
+  # that DOES declare a queue is reported as having none. That is the one verdict
+  # allowed to take the fallback, i.e. a silent reversal of the operator's --queue on a
+  # large config (reproduced by review with a 400 KB file whose line 1 is `queue_rules:`).
+  # `case` matching has no such failure mode.
+  out="$(gh_ api "repos/$REPO/contents/.mergify.yml" --jq '.content' 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # ABSENT is not UNREADABLE: a 404 means the repo has no Mergify config at all, which
+    # is the "Mergify is not installed" case the fallback exists for. Anything else (403,
+    # rate limit, network) is an instrument failure and must NOT choose a land path.
+    case "$out" in
+      *"Not Found"*|*"HTTP 404"*) return 1 ;;
+    esac
+    return 2
+  fi
+  [ -n "$out" ] || return 2
+  cfg="$(printf '%s' "$out" | base64 -d 2>/dev/null)" || return 2
+  [ -n "$cfg" ] || return 2
+  # "Does not CONTAIN queue_rules:" is not evidence of anything unless the bytes are a
+  # config at all. A decodable-but-unparseable body (the contents API returns the literal
+  # `null` for a submodule; a corrupt/truncated body decodes to noise; BSD `base64 -d`
+  # EXITS 0 on undecodable input, so its status cannot be the guard) would otherwise
+  # answer "positively no queue" and take the fallback — the one verdict that reverses
+  # the operator's --queue. Require a plausible top-level YAML key first.
+  [[ "$cfg" =~ (^|$'\n')[A-Za-z_]+: ]] || return 2
+  case "$cfg" in
+    "queue_rules:"*|*$'\n'"queue_rules:"*) return 0 ;;
+  esac
+  return 1
+}
+
+# <document> -> "<state>\t<queued_at>\t<rule>\t<unmet (;)>"
+#
+# The document arrives as an ARGUMENT, never on stdin: the script itself is read
+# from stdin by `python3 - <<'PY'` (the idiom every other python call in this rail
+# uses), so a piped document would be consumed as script text and every state would
+# silently decode as empty — the read would look like "no queue" while the queue was
+# answering. A scenario pins that (17h-A).
+#
+# The `match` flags are the QUEUE's own computation, so "ready" is not re-derived
+# here: a leaf whose `match` is false is a condition the queue says is unmet. The
+# walk descends only into false branches, which is what keeps the satisfied
+# "any of [configuration change requirements]" group from reporting its two
+# deliberately-unmet leaves as blockers.
+queue_state_decode() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import base64, json, re, sys
+
+doc = sys.argv[1] if len(sys.argv) > 1 else ""
+state = queued = rule = ""
+# ⛔ base64URL, not base64: Mergify's real payload contains `-` and `_` (MEASURED
+# 2026-10-23 on tortoise#9604's paused run — the first cut of this decoder accepted
+# only `+/=` and so reported `unreadable` for a head whose queue verdict was
+# perfectly readable). The alphabet must accept both, and the decode must
+# translate: `b64decode` rejects a `-` even when the regex let it through.
+m = re.search(r'itemprop="mergify\.v1\.([A-Za-z0-9_+/=-]+)"', doc)
+meta = None
+if m:
+    raw = m.group(1).replace("-", "+").replace("_", "/")
+    raw += "=" * (-len(raw) % 4)
+    try:
+        meta = json.loads(base64.b64decode(raw).decode("utf-8", "replace"))
+    except Exception:
+        meta = None
+if meta:
+    state = str(meta.get("state") or "")
+    queued = str(meta.get("queued_at") or "")
+    rule = str(meta.get("queue_rule_name") or "")
+
+unmet = []
+def walk(node):
+    if not isinstance(node, dict) or node.get("match"):
+        return
+    subs = node.get("subconditions") or []
+    if not subs:
+        desc = str(node.get("description") or "").strip()
+        if desc:
+            unmet.append(desc)
+        return
+    for sub in subs:
+        walk(sub)
+
+if meta:
+    for cond in (meta.get("required_conditions") or []):
+        walk(cond)
+
+print("%s\t%s\t%s\t%s" % (state, queued, rule, ";".join(unmet)))
+PY
+}
+
+# Report the queue state observed for this head. One line, always the same shape,
+# so a log reader does not have to guess which fields were read.
+queue_report() { # <pr> <state> <queued_at> <rule> <unmet>
+  log_line "atomic-land: QUEUE #$1 — state=${2:-unreadable} rule=${4:-none} queued_at=${3:-none}"
+  if [ -n "${5:-}" ]; then
+    log_line "atomic-land: QUEUE #$1 — unmet entry conditions, as the queue reports them:"
+    printf '%s\n' "${5}" | tr ';' '\n' | while IFS= read -r c; do
+      [ -n "$c" ] && log_line "atomic-land:   • $c"
+    done
+  fi
+}
+
+do_queue_land() {
+  local row meta decoded state queued rule unmet i last_state=""
+  # ⛔ THERE IS NO land-step FALLBACK IN THIS FUNCTION, deliberately. Reaching the queue
+  # path with the queue unusable would mean the direct path's guards (wait_terminal,
+  # B10/B12 base certification) were already SKIPPED for this round, so calling the
+  # mandatory rail from here would land with them inert — the precise unsafe land those
+  # guards exist to prevent. "Fall back to the existing path" is therefore implemented as
+  # QUEUE_MODE=0 at STARTUP (see the probe in main), which runs that path whole.
+  if ! row="$(queue_check_run)"; then
+    stop "could not READ the merge queue state for #$PR at ${HEAD:0:12}… — refusing to treat an unreadable queue as an absent or an idle one (an empty body from a rate-limited read is not evidence about the queue)"
+  fi
+  meta="$(printf '%s\n' "$row" | head -1)"
+  case "$meta" in
+    TRUNCATED)
+      stop "the check-run surface at ${HEAD:0:12}… exceeds one page, so the queue's verdict for this head cannot be isolated — refusing to guess (a partial read is a failure to look, #1261)"
+      ;;
+    NONE)
+      # The read succeeded and Mergify has published no verdict for THIS head. That is
+      # not "no queue" (the declaration probe at startup decided that); it is "not
+      # evaluated yet", and the enqueue command is exactly what makes Mergify evaluate.
+      meta=""
+      ;;
+  esac
+
+  decoded="$(queue_state_decode "$(printf '%s\n' "$row" | tail -n +2)")"
+  state="$(printf '%s' "$decoded" | cut -f1)"
+  queued="$(printf '%s' "$decoded" | cut -f2)"
+  rule="$(printf '%s' "$decoded" | cut -f3)"
+  unmet="$(printf '%s' "$decoded" | cut -f4)"
+
+  # ── A PAUSED QUEUE IS A DELIBERATE STOP, NOT AN IDLE ONE ─────────────────────
+  # Mergify pauses a repository's queue by itself after a storm it judges harmful
+  # (measured 2026-10-23: "Stopping a batch-restart storm: repeated Restarted-from-batch
+  # cycles were minting a new merge-queue branch every ~100 seconds"), and a human can
+  # pause it too. Detected on the DECODED state first (machine-readable) and only then on
+  # the human title — a title-worded detector alone misses a pause whose wording changes,
+  # which is the failure mode a string match invites.
+  case "$state" in
+    *paused*|*Paused*|*suspend*|*Suspend*)
+      log_line "atomic-land: QUEUE-PAUSED — the merge queue for $REPO reports state=$state."
+      log_line "atomic-land: the queue's own words: ${meta#*$'\t'}"
+      stop "the merge queue is PAUSED, so #$PR was NOT enqueued and nothing was merged. A pause is a deliberate stop and this rail will not route around it; re-run once the queue is resumed"
+      ;;
+  esac
+  case "$meta" in
+    *paused*|*Paused*|*suspend*|*Suspend*|*"⏸"*)
+      log_line "atomic-land: QUEUE-PAUSED — the merge queue for $REPO is not accepting work."
+      log_line "atomic-land: the queue's own words: ${meta#*$'\t'}"
+      stop "the merge queue is PAUSED, so #$PR was NOT enqueued and nothing was merged. A pause is a deliberate stop and this rail will not route around it; re-run once the queue is resumed"
+      ;;
+  esac
+
+  # ── VERDICT POLARITY IS AN ALLOW-LIST ───────────────────────────────────────
+  # Only the states that MEAN the queue holds the PR may report success. An exclude list
+  # ("anything that is not waiting is queued") would report `paused`, `dequeued`,
+  # `cancelled` and any state Mergify adds later as a successful hand-off — the #1359
+  # false-success class, and the same allow-list rule the rail's own check-run reader uses.
+  case "$state" in
+    queued|in_place|merged)
+      queue_report "$PR" "$state" "$queued" "$rule" "$unmet"
+      log_line "atomic-land: the queue already holds #$PR — nothing to enqueue"
+      QUEUE_HANDED=1
+      return 0 ;;
+  esac
+
+  # The published verdict is a CACHE of the last evaluation: a PR whose conditions have
+  # since gone green still shows the old "waiting" with the old unmet leaves (measured on
+  # tortoise#9718 — every entry context `success` on the head, the run still listing them
+  # unmet). It is QUOTED, never decisive: the queue re-evaluates on the command, and the
+  # command cannot merge a PR the queue refuses.
+  if [ -n "$unmet" ]; then
+    queue_report "$PR" "${state:-waiting}" "$queued" "$rule" "$unmet"
+    log_line "atomic-land: NOTE — the queue's PUBLISHED verdict above is its last evaluation; asking the queue is the only fresh read."
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    queue_report "$PR" "${state:-waiting}" "$queued" "$rule" ""
+    log_line "atomic-land: (dry-run) would post '@Mergifyio queue' on #$PR and observe the queue state; nothing mutated"
+    return 0
+  fi
+
+  # The documented enqueue command. A COMMENT is the whole action: no check is touched,
+  # and the queue re-evaluates its own entry conditions server-side.
+  log_line "atomic-land: [4/4] land — enqueue #$PR into the merge queue (verdict before asking: ${state:-none-published})"
+  gh_ pr comment "$PR" ${repo_args[@]+"${repo_args[@]}"} --body '@Mergifyio queue' >/dev/null \
+    || stop "could not post the queue command on #$PR — nothing was enqueued"
+
+  # Wait for the queue to TAKE it. The read is the artifact; the comment was a send.
+  i=0
+  while :; do
+    if ! row="$(queue_check_run)"; then
+      stop "the queue state for #$PR became UNREADABLE while waiting — an unreadable hand-off is not evidence that it entered (#1359)"
+    fi
+    meta="$(printf '%s\n' "$row" | head -1)"
+    decoded="$(queue_state_decode "$(printf '%s\n' "$row" | tail -n +2)")"
+    state="$(printf '%s' "$decoded" | cut -f1)"
+    queued="$(printf '%s' "$decoded" | cut -f2)"
+    rule="$(printf '%s' "$decoded" | cut -f3)"
+    unmet="$(printf '%s' "$decoded" | cut -f4)"
+    last_state="$state"
+    # The queue can PAUSE mid-wait (measured 2026-10-23: a pause landed three seconds
+    # after an enqueue was posted). Re-read it here — the difference between "the queue
+    # refused this PR" and "the whole queue was switched off" is the difference between
+    # two fixes, and the second is nobody's to work around in this rail.
+    case "$state" in
+      *paused*|*Paused*|*suspend*|*Suspend*)
+        log_line "atomic-land: QUEUE-PAUSED — the merge queue for $REPO paused while #$PR was waiting."
+        log_line "atomic-land: the queue's own words: ${meta#*$'\t'}"
+        stop "the merge queue PAUSED during the hand-off, so #$PR was NOT enqueued and nothing was merged. Re-run once the queue is resumed; this rail does not route around a pause"
+        ;;
+    esac
+    case "$meta" in
+      *paused*|*Paused*|*suspend*|*Suspend*|*"⏸"*)
+        log_line "atomic-land: QUEUE-PAUSED — the merge queue for $REPO paused while #$PR was waiting."
+        log_line "atomic-land: the queue's own words: ${meta#*$'\t'}"
+        stop "the merge queue PAUSED during the hand-off, so #$PR was NOT enqueued and nothing was merged. Re-run once the queue is resumed; this rail does not route around a pause"
+        ;;
+    esac
+    # ALLOW-LIST: only these three states mean the queue holds the PR.
+    case "$state" in
+      queued|in_place|merged)
+        queue_report "$PR" "$state" "$queued" "$rule" ""
+        log_line "atomic-land: ✅ #$PR handed to the merge queue at ${HEAD:0:12}… — the queue owns the merge from here (exit 0 means ENQUEUED, not merged; #1359)"
+        QUEUE_HANDED=1
+        return 0 ;;
+    esac
+    i=$((i + 1))
+    [ "$i" -gt "$QUEUE_POLLS" ] && break
+    [ "$POLL" -gt 0 ] && sleep "$POLL"
+  done
+
+  queue_report "$PR" "${last_state:-unreadable}" "$queued" "$rule" "$unmet"
+  # A queue that is still WAITING has not refused anything — the rail has merely stopped
+  # waiting. Saying "REFUSED" here would send the operator to fix a condition that is
+  # only in progress, which is a different and much more expensive mistake than saying
+  # nothing. Only a state the allow-list does not recognise, and that is not `waiting`,
+  # is reported as the queue having answered and declined.
+  case "$last_state" in
+    waiting|unreadable|"")
+      stop "the queue did NOT TAKE #$PR within $QUEUE_POLLS poll(s) of ${POLL}s — it is still WAITING (state=${last_state:-unreadable}), listed above. Nothing was enqueued and nothing was merged; re-run the rail, or wait for the named condition" ;;
+    *)
+      stop "the queue ANSWERED with state=${last_state} for #$PR — not a state that means it holds the PR, so nothing was enqueued and nothing was merged. The queue's conditions are listed above" ;;
+  esac
+}
+
+# ── step 4: land (the mandated rail) + confirm ───────────────────────────
+do_land() {
+  if [ "$QUEUE_MODE" -eq 1 ]; then
+    do_queue_land
+    return $?
+  fi
+  log_line "atomic-land: [4/4] land — admin-merge.sh $PR ${MERGE_FLAGS[*]:-}"
+  local flags=()
+  if [ "$DRY_RUN" -eq 1 ]; then flags+=(--dry-run); fi
+  if [ "${#MERGE_FLAGS[@]}" -gt 0 ]; then flags+=("${MERGE_FLAGS[@]}"); fi
+  bash "$ADMIN_MERGE" "$PR" ${repo_args[@]+"${repo_args[@]}"} ${flags[@]+"${flags[@]}"}
+  return $?
+}
+
+confirm_merged() { # <max polls: 1 = a single immediate check>
+  local max="${1:-${ATOMIC_LAND_CONFIRM_MAX:-60}}" i state="" read_failed=0 why="" errf
+  case "$max" in ''|*[!0-9]*) max=1 ;; esac
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  errf="$(mktemp "${TMPDIR:-/tmp}/atomic-land-confirm.XXXXXX" 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/atomic-land-confirm.$$")"
+  for i in $(seq 1 "$max"); do
+    # ⛔ A FAILED READ IS NOT A STATE (#2342). This used to be `... || echo OPEN`, so a spent REST
+    # budget answered the confirmation with the LITERAL STRING "OPEN" and the rail printed "the merge
+    # was NOT confirmed — PR #N is still OPEN" about a merge it had just issued: a confident diagnosis
+    # from a read that never happened (the 2026-10-23 incident, measured as `PR states={None: 23}` in
+    # a sibling tool that then cancelled nothing on the strength of it).
+    # ⛔ AND THE REASON IS KEPT, NOT INVENTED. `2>/dev/null` used to discard the ONE line that says
+    # WHICH failure this was — the budget (`gh-core-floor` / `gh-core-exhausted`), an auth problem, a
+    # 404 — and the replacement message then asserted "the box ran out of budget" for a cause this
+    # function never established. The layer's own words are carried through and quoted.
+    if state="$(gh_ api "repos/$REPO/pulls/$PR" --jq 'if .merged then "MERGED" else "OPEN" end' 2>"$errf")"; then
+      read_failed=0
+      [ "$state" = "MERGED" ] && { log_line "atomic-land: ✅ merged PR #$PR"; rm -f "$errf" 2>/dev/null || true; return 0; }
+    else
+      read_failed=1
+      state=""
+      why="$(tail -n 3 "$errf" 2>/dev/null | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/ $//')"
+    fi
+    [ "$max" -le 1 ] && break
+    sleep 10
+  done
+  rm -f "$errf" 2>/dev/null || true
+  if [ "$read_failed" -eq 1 ] && [ -z "$state" ]; then
+    err "atomic-land: ⛔ the merge was NOT confirmed — the CONFIRMATION READ FAILED (UNREADABLE: gh api repos/$REPO/pulls/$PR).${why:+ It said: $why} That is not evidence the PR is open: read its state before doing anything else."
+  else
+    err "atomic-land: ⛔ the merge was NOT confirmed — PR #$PR is still $state (the land step's exit status alone is not proof; #1359)"
+  fi
+  return 1
+}
+# ── main ─────────────────────────────────────────────────────────────────
+resolve_repo
+[ "$DRY_RUN" -eq 1 ] && log_line "atomic-land: DRY RUN — nothing will be mutated"
+# Exclusive per-PR unit (B11). A dry run mutates nothing, so it takes no lock.
+[ "$DRY_RUN" -eq 0 ] && acquire_lock
+
+resolve_state
+if [ "$IS_DRAFT" = "true" ]; then
+  stop "PR #$PR is a DRAFT — gh refuses to merge a draft; run \`gh pr ready $PR\` first"
+fi
+# BEFORE read_record, not on a miss: a miss-only call would never PUSH — the box that mints a
+# record is normally the box that lands (lane-owns-merge, #2035), so a sync that only runs when
+# the record is missing would leave every freshly minted record local forever.
+sync_review_registry
+if ! read_record; then
+  stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record. Before paying for that second review: if it ran on ANOTHER box, \`scripts/registry-sync.sh status\` names what this box is missing and \`scripts/registry-sync.sh pull\` MAY make it reachable once that box has LANDED or booted (#2374); and if the PR body carries a SIGNED marker, \`scripts/record-review.sh --recover-body $PR $REPO\` rebuilds this box's record from it, verifying the HMAC first so a body edit cannot mint one (#2872)."
+fi
+# ── DOES THE QUEUE PARTICIPATE AT ALL? (decided BEFORE anything is skipped) ──
+# This probe is what makes "fall back to the existing path" true rather than nominal.
+# Deciding it here, once, means the fallback sets QUEUE_MODE=0 and the WHOLE direct
+# path then runs — update, terminal wait, the B10/B12 base certification and only then
+# the mandatory rail. Deciding it inside the land step would call that rail with those
+# guards already skipped for the round, i.e. an unsafe land on the one path that is
+# supposed to be the safe, unchanged one.
+#
+# The evidence of absence is the target repo's OWN DECLARATION, never an empty
+# check-run read: measured 2026-10-23, 3 of 12 open tortoise PRs had no Mergify run at
+# their head while the queue was installed and armed, so "no run on this head" cannot
+# mean "no queue". An unreadable declaration is not a licence to fall back either —
+# an unreadable instrument must stop, not silently choose a different way to merge.
+if [ "$QUEUE_MODE" -eq 1 ]; then
+  queue_declared; qd=$?
+  case "$qd" in
+    0) log_line "atomic-land: --queue — $REPO declares a merge queue; the queue will own the merge" ;;
+    1) log_line "atomic-land: QUEUE-NOT-ARMED — $REPO declares NO merge queue in .mergify.yml"
+       log_line "atomic-land: falling back to the EXISTING land path (update → verify → record → the mandatory rail), unchanged; the queue does not participate"
+       QUEUE_MODE=0 ;;
+    *) stop "could not read $REPO's .mergify.yml, so whether a merge queue is armed is UNKNOWN — refusing to choose a land path on an unreadable instrument" ;;
+  esac
+fi
+if ! verdict_accepted "$RECORD_VERDICT"; then
+  stop "the record for $REPO#$PR has verdict '$RECORD_VERDICT' — only [$ACCEPTED_VERDICTS] unlocks a merge"
+fi
+case "$RECORD_HEAD" in
+  ""|*[!0-9a-fA-F]*) stop "the record for $REPO#$PR carries no usable head_sha" ;;
+esac
+# B10 (pre-unit) — a FRESH record that names its own base (clean-low, #1348) must
+# be bound to the SAME merge base the PR has now; otherwise the PR was repointed
+# before this unit and the certified diff is not the diff that would merge. A
+# STALE record is skipped here: it is re-derived by the record step, whose own
+# diff guard refuses a repointed diff. For clean/clean-micro the record carries
+# no base field, so this arm cannot fire — declared residual, agent-infra #1362.
+if [ "$RECORD_HEAD" = "$HEAD" ] && [ -n "$RECORD_MB" ]; then
+  live_mb="$(merge_base_of "$BASE" "$HEAD")"
+  if [ -z "$live_mb" ] || [ "$live_mb" != "$RECORD_MB" ]; then
+    stop "the record was certified against merge base ${RECORD_MB:0:12}… but this PR's base is ${live_mb:-unreadable} — the base was repointed BEFORE this unit (B10); re-review and re-record"
+  fi
+fi
+log_line "atomic-land: PR #$PR  head=${HEAD:0:12}…  base=$BASE  state=$MERGE_STATE  record=${RECORD_VERDICT}@${RECORD_HEAD:0:12}…"
+
+round=1
+while :; do
+  log_line "atomic-land: ── round $round/$MAX_ROUNDS ──"
+  do_update
+  # Capture the BASE the CHECKS are verified against, at the start of verification
+  # (B10): the base branch name and its MERGE BASE. A move between here and the
+  # land is refused, so the rail can never verify against base X and land against
+  # base Y. `mergeStateStatus` cannot carry this — BEHIND is a head/base divergence
+  # signal (head out of date), not a strict signal and not a base-identity signal;
+  # a repoint can happen while the head is CLEAN.
+  CERT_BASE="$BASE"
+  CERT_MB="$(merge_base_of "$BASE" "$HEAD")"
+  CERT_BASE_TIP="$(base_tip)"
+  # Under --queue the base relation is the QUEUE's to establish (it merges onto the
+  # current base and runs `merge_conditions` on that tree), so the two captures below
+  # are not a certification this path can make or needs. They are seeded rather than
+  # skipped because both reads are also used by the DIRECT path's pre-land arms, which
+  # are simply not reached in queue mode; seeding keeps those guards' fail-closed
+  # polarity untouched for the path that does use them.
+  if [ "$QUEUE_MODE" -eq 1 ]; then
+    CERT_MB="${CERT_MB:-queue-mode: the queue binds the composition, not this head}"
+    CERT_BASE_TIP="${CERT_BASE_TIP:-queue-mode}"
+  fi
+  if [ -z "$CERT_MB" ]; then
+    stop "could not read the merge base of $BASE...${HEAD:0:12}… — refusing to certify without a base binding (B10)"
+  fi
+  # B12 — the base TIP is captured here and compared before the land. The CAPTURE
+  # read must be fail-CLOSED exactly like CERT_MB above: a transient API error
+  # yielding empty would otherwise leave nothing to compare against, and the
+  # pre-land arm (which runs only when this is non-empty) would skip silently —
+  # landing on a base the checks never covered. An unreadable tip is not a
+  # licence to certify without a base binding.
+  #
+  # ⛔ AND IT IS NOT FATAL ON THE FIRST ATTEMPT (#1558). "Fail-closed" and
+  # "abort on one empty reply" are NOT the same requirement, and conflating them
+  # is what the issue measured: a transient empty read here aborted the unit
+  # AFTER `[1/4] update` had already pushed a refreshed head. `base_tip()` now
+  # re-polls through `gh_read()` (`ATOMIC_LAND_TRANSIENT_POLLS`), so a transient
+  # settles and this arm fires only on a PERSISTENTLY unreadable base — which is
+  # still a refusal, reached with evidence instead of on a coin flip.
+  # (The other half of #1404 problem 2 — an update spends an attestation it
+  # cannot restore — is B5's, guarded BEFORE the head moves: the rail refuses to
+  # update a head whose record no verifiable marker could re-bind.)
+  if [ -z "$CERT_BASE_TIP" ]; then
+    stop "could not read the base tip of $BASE — refusing to certify without a base binding (B12)"
+  fi
+  if [ "$QUEUE_MODE" -eq 1 ]; then
+    # ⛔ NO BACKTICKS in this string: it is double-quoted, so a backticked span would run
+    # as a command substitution and silently lose its text (measured live: the line
+    # printed "composition that lands ()" and emitted `merge_conditions: command not
+    # found`). Quoting a config key is not worth a subshell.
+    log_line "atomic-land: [2/4] verify — skipped under --queue: the queue re-runs the required checks (merge_conditions) on the composition that lands, and gates entry on its own cheap conditions"
+  else
+    wait_terminal
+  fi
+  if ! do_record; then exit 1; fi
+  # B9 UNDER --queue: the head must still not move between the RECORD and the
+  # HAND-OFF. The queue is asked about $HEAD specifically, so a push inside this
+  # window would enqueue bytes the record does not cover.
+  #
+  # The BASE ADVANCING is the queue's to re-establish (it merges onto the current base
+  # and re-runs the merge-time conditions on that tree), which is why the tip
+  # comparison is not repeated here. A base REPOINT is a different thing and IS
+  # checked even here: it makes the record's certified diff describe something other
+  # than what lands (agent-infra #1362 — every head-bound check still passes on an
+  # edit that changes the target branch), and the read is already being made.
+  if [ "$QUEUE_MODE" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    q_now_row="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json headRefOid,baseRefName --jq '"\(.headRefOid)\t\(.baseRefName)"' 2>/dev/null || true)"
+    q_now="$(printf '%s' "$q_now_row" | cut -f1)"
+    q_now_base="$(printf '%s' "$q_now_row" | cut -f2)"
+    if [ -z "$q_now" ] || [ -z "$q_now_base" ]; then
+      stop "could not re-resolve the head and base before the queue hand-off — refusing to enqueue unverified"
+    fi
+    if [ "$q_now_base" != "$CERT_BASE" ]; then
+      stop "the PR base was repointed ($CERT_BASE -> $q_now_base) after the record - the certified diff is no longer the diff that would be queued (B10); re-review and re-record against the new base"
+    fi
+    if [ "$q_now" != "$HEAD" ]; then
+      log_line "atomic-land: the head moved between the record (${HEAD:0:12}…) and the hand-off (${q_now:0:12}…) — the record no longer covers what would be queued"
+      resolve_state
+      if [ "$round" -lt "$MAX_ROUNDS" ]; then
+        HEAD="$q_now"
+        round=$((round + 1))
+        continue
+      fi
+      stop "the head moved between the record and the queue hand-off and no round remains — re-run the rail"
+    fi
+  fi
+  # B9 — the head must not move between the RECORD and the LAND. The record binds
+  # a sha and the land step uses `--admin` (bypassing the remote required check),
+  # so a push inside this window would land bytes the record does not cover.
+  # B10 — the BASE must not be repointed or rewritten after the checks were
+  # verified. Every head-bound check still passes on a `gh pr edit --base`, while
+  # what merges changes (agent-infra #1362). A base that merely ADVANCED does not
+  # move the merge base, so it is not a repoint and is not refused.
+  if [ "$DRY_RUN" -eq 0 ] && [ "$QUEUE_MODE" -eq 0 ]; then
+    pre="$(gh_read pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} \
+            --json headRefOid,baseRefName \
+            --jq '"\(.headRefOid)\t\(.baseRefName)"')"
+    now="$(printf '%s' "$pre" | cut -f1)"
+    now_base="$(printf '%s' "$pre" | cut -f2)"
+    if [ -z "$now" ] || [ -z "$now_base" ]; then
+      stop "could not re-resolve the head/base before landing — refusing to land unverified"
+    fi
+    if [ "$now" != "$HEAD" ]; then
+      log_line "atomic-land: the head moved between the record (${HEAD:0:12}…) and the land (${now:0:12}…) — the record no longer covers what would merge"
+      resolve_state
+      if [ "$round" -lt "$MAX_ROUNDS" ]; then
+        log_line "atomic-land: re-deriving the record at the new head — another round"
+        round=$((round + 1))
+        continue
+      fi
+      stop "the head moved between the record and the land and no round remains — re-run the rail"
+    fi
+    if [ "$now_base" != "$CERT_BASE" ]; then
+      stop "the PR base was repointed ($CERT_BASE → $now_base) after the record — the certified diff is no longer the diff that would merge (B10); re-review and re-record against the new base"
+    fi
+    now_mb="$(merge_base_of "$now_base" "$now")"
+    if [ -z "$now_mb" ] || [ "$now_mb" != "$CERT_MB" ]; then
+      stop "the base's merge base moved (${CERT_MB:0:12}… → ${now_mb:0:12}…) after the record — what merges is not what was certified (B10); re-review and re-record"
+    fi
+    # (A pre-unit repoint on a FRESH record is checked once at startup, below.)
+    # B12 — a concurrent merge ADVANCED the base (same branch, same merge base)
+    # after these checks were verified. `--admin` bypasses `strict`, so landing
+    # now would merge B onto a base its checks never covered (with 25+ lanes this
+    # is the common case, not an edge). The certified DIFF is unchanged (the
+    # merge base did not move), so the fix is to RE-VERIFY, not to re-review.
+    if [ -n "$CERT_BASE_TIP" ]; then
+      now_tip="$(base_tip)"
+      if [ -z "$now_tip" ]; then
+        stop "could not re-read the base tip before landing — refusing to land unverified (B12)"
+      fi
+      if [ "$now_tip" != "$CERT_BASE_TIP" ]; then
+        log_line "atomic-land: the base ADVANCED after verification (${CERT_BASE_TIP:0:12}… → ${now_tip:0:12}…) — the checks did not cover the new base"
+        resolve_state
+        if [ "$round" -lt "$MAX_ROUNDS" ]; then
+          # The next round re-enters the whole unit, but it does NOT necessarily
+          # re-run the CHECKS: round 2 goes back through do_update, and wherever the
+          # drift arm HOLDS the head (a landable state on a positive `strict` false
+          # — #7230) no `gh pr update-branch` happens, so the check surface is never
+          # re-evaluated. What IS re-established is the base BINDING: round 2
+          # re-captures CERT_BASE_TIP at the advanced tip and the pre-land re-read
+          # compares against THAT. Saying "the CHECK is re-run" here would assert a
+          # measurement nobody took.
+          log_line "atomic-land: re-verifying against the advanced base — another round (the reviewed diff is unchanged and the review is reused; the base BINDING is re-established — the checks are re-run only if the head is actually moved)"
+          round=$((round + 1))
+          continue
+        fi
+        stop "the base advanced after verification and no round remains to re-verify — re-run the rail (B12)"
+      fi
+    fi
+  fi
+  if do_land; then
+    # A merge the QUEUE owns is not this rail's to confirm: a queued PR is still
+    # OPEN by design, and polling for `merged` here would read a correct hand-off as
+    # a failure. The queue's own check-run is the artifact (reported above).
+    if [ "$QUEUE_HANDED" -eq 1 ]; then exit 0; fi
+    confirm_merged || exit 1
+    exit 0
+  fi
+  # The land step refused or failed. CONFIRM the merge before concluding failure:
+  # a merge can complete server-side while the command exits non-zero (#193), and
+  # a status line alone is not proof either way (#1359).
+  if confirm_merged 1; then exit 0; fi
+  # If the PR is BEHIND again (a base advance mid-unit), one more round is safe —
+  # the carry-forward carries the same verdict — else stop and relay the reason.
+  resolve_state
+  if [ "$MERGE_STATE" = "BEHIND" ] && [ "$round" -lt "$MAX_ROUNDS" ]; then
+    log_line "atomic-land: the base advanced mid-unit (BEHIND again) — another round"
+    round=$((round + 1))
+    continue
+  fi
+  stop "the land step did not merge and the PR is not BEHIND ($MERGE_STATE) — the reason is above; nothing was merged"
+done

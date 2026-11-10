@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# gh-app-token — the OPERATOR's handle on the fleet's GitHub App credential (#3429).
+#
+# The work is in `gh-cred.py` beside this file; this is the name the docs and the brief use, and it
+# exists so an operator does not have to remember a `--verb` on a `.py`. Everything it can do:
+#
+#   gh-app-token                 print a token (mints one if the cache is cold or near expiry)
+#   gh-app-token --status        the APP budget and the USER budget, side by side
+#   gh-app-token --refresh       force a new installation token (drops the cache first)
+#   gh-app-token --stats         which credential served what, plus the read-on-user regression count
+#   gh-app-token --which -- <gh argv…>   which credential WOULD serve that call, and why
+#
+# ⛔ `--stats` IS THE ONE AN OPERATOR SHOULD REACH FOR when "the fleet is spending the user bucket
+# again" is the question. `reads-on-user-unjustified` must be 0; any other number means the layer is
+# not wired, and `--stats` exits non-zero so a check can gate on it.
+#
+# Exit codes: 0 ok · 1 no token could be produced · 3 `--stats` found unjustified reads.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+HELPER="$SELF_DIR/gh-cred.py"
+
+if [ ! -f "$HELPER" ]; then
+  # Being loud here is the point: a missing helper means reads are on the user bucket, and an
+  # operator who sees silence assumes the opposite.
+  printf 'gh-app-token: the credential helper is missing (%s) — every gh read is falling back to the\n' "$HELPER" >&2
+  printf '              user credential (arm=no-helper). Re-run the harness install (#3429).\n' >&2
+  exit 127
+fi
+
+exec python3 "$HELPER" "$@"

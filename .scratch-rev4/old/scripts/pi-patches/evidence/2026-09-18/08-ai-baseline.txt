@@ -1,0 +1,1324 @@
+
+ RUN  v4.1.9 /private/tmp/pi-base/packages/ai
+
+····················································································································--·······························································································································································xstdout | test/context-overflow.test.ts > Context overflow error handling > Anthropic (API Key) > claude-haiku-4-5 - should detect overflow via isContextOverflow
+
+anthropic / claude-haiku-4-5:
+  contextWindow: 200000
+  stopReason: error
+  errorMessage: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJR9KsBHgBeNJWgpKfS"}
+  usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+  hasUsageData: false
+
+------···············x············x······xstdout | test/context-overflow.test.ts > Context overflow error handling > Google > gemini-2.5-flash - should detect overflow via isContextOverflow
+
+google / gemini-2.5-flash:
+  contextWindow: 1048576
+  stopReason: error
+  errorMessage: {"error":{"message":"{\n  \"error\": {\n    \"code\": 404,\n    \"message\": \"This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.6-flash for the latest features and improvements. We recommend you to use the Interactions API.\",\n    \"status\": \"NOT_FOUND\"\n  }\n}\n","code":404,"status":"Not Found"}}
+  usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+  hasUsageData: false
+
+-------········x········x·······················x···········-···x-----------···························································································------xstdout | test/context-overflow.test.ts > Context overflow error handling > Qwen Token Plan > qwen3.7-max - should detect overflow via isContextOverflow
+
+qwen-token-plan / qwen3.7-max:
+  contextWindow: 1000000
+  stopReason: error
+  errorMessage: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"fae27ef3-effa-4a9d-a6f4-d8037eda4363","type":"invalid_request_error","code":"invalid_api_key"}
+  usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+  hasUsageData: false
+
+··································xstdout | test/context-overflow.test.ts > Context overflow error handling > Qwen Token Plan Individual > qwen3.8-max - should detect overflow via isContextOverflow
+
+qwen-token-plan-individual / qwen3.8-max:
+  contextWindow: 1000000
+  stopReason: error
+  errorMessage: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"6c5e1742-f705-490f-afbd-65856c6f6363","type":"invalid_request_error","code":"invalid_api_key"}
+  usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+  hasUsageData: false
+
+---···········xstdout | test/context-overflow.test.ts > Context overflow error handling > OpenRouter > anthropic/claude-sonnet-4 via OpenRouter - should detect overflow via isContextOverflow
+
+openrouter / anthropic/claude-sonnet-4:
+  contextWindow: 200000
+  stopReason: error
+  errorMessage: 403 {"type":"error","error":{"type":"permission_error","message":"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76","error_type":"permission_denied"},"request_id":"gen-1789752596-M56vJIcAR4CcuqhL6itL"}
+  usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+  hasUsageData: false
+
+xstdout | test/context-overflow.test.ts > Context overflow error handling > OpenRouter > deepseek/deepseek-v3.2 via OpenRouter - should detect overflow via isContextOverflow
+
+openrouter / deepseek/deepseek-v3.2:
+  contextWindow: 163840
+  stopReason: error
+  errorMessage: 403: {"message":"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76","code":403}
+  usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+  hasUsageData: false
+
+xstdout | test/context-overflow.test.ts > Context overflow error handling > OpenRouter > mistralai/mistral-large-2512 via OpenRouter - should detect overflow via isContextOverflow
+
+openrouter / mistralai/mistral-large:
+  contextWindow: 128000
+  stopReason: error
+  errorMessage: 403: {"message":"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76","code":403}
+  usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+  hasUsageData: false
+
+·xstdout | test/context-overflow.test.ts > Context overflow error handling > OpenRouter > google/gemini-2.5-flash via OpenRouter - should detect overflow via isContextOverflow
+
+openrouter / google/gemini-2.5-flash:
+  contextWindow: 1048576
+  stopReason: error
+  errorMessage: 403: {"message":"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76","code":403}
+  usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+  hasUsageData: false
+
+xstdout | test/context-overflow.test.ts > Context overflow error handling > OpenRouter > meta-llama/llama-4-scout via OpenRouter - should detect overflow via isContextOverflow
+
+openrouter / meta-llama/llama-4-scout:
+  contextWindow: 327680
+  stopReason: error
+  errorMessage: 404: {"message":"No endpoints found for meta-llama/llama-4-scout.","code":404,"metadata":{"routing_funnel":[{"step":"Initial Endpoints","endpoint_count":3},{"step":"Filter by Context Length","endpoint_count":1},{"step":"Add BYOK Endpoints","endpoint_count":0}]}}
+  usage: {"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}
+  hasUsageData: false
+
+---············------·········x············xx··x·xx·x------------------------------------------------------------···················xxxxx·····x---------------············x······················xx····x····xx---····x··x·x·---------------------------------------xxxxxxxxxx------------------------------------------------------------
+
+⎯⎯⎯⎯⎯⎯ Failed Tests 47 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/anthropic-thinking-disable.test.ts > Anthropic thinking disable E2E > disables thinking for Claude reasoning models
+AssertionError: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJS9wbfsE1w9uSEReM4"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/anthropic-thinking-disable.test.ts:96:53
+     94|
+     95|  const response = await s.result();
+     96|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     97|
+     98|  const text = response.content
+ ❯ test/anthropic-thinking-disable.test.ts:165:18
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/153]⎯
+
+ FAIL  test/anthropic-thinking-disable.test.ts > Anthropic thinking disable E2E > disables thinking for Claude reasoning models
+AssertionError: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJSBHTrCN3Wwee7NXpT"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/anthropic-thinking-disable.test.ts:96:53
+     94|
+     95|  const response = await s.result();
+     96|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     97|
+     98|  const text = response.content
+ ❯ test/anthropic-thinking-disable.test.ts:165:18
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/153]⎯
+
+ FAIL  test/anthropic-thinking-disable.test.ts > Anthropic thinking disable E2E > disables thinking for Claude reasoning models
+AssertionError: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJSCAJKsoArqTV8RqJB"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/anthropic-thinking-disable.test.ts:96:53
+     94|
+     95|  const response = await s.result();
+     96|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     97|
+     98|  const text = response.content
+ ❯ test/anthropic-thinking-disable.test.ts:165:18
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/153]⎯
+
+ FAIL  test/context-overflow.test.ts > Context overflow error handling > Anthropic (API Key) > claude-haiku-4-5 - should detect overflow via isContextOverflow
+AssertionError: expected '400 {"type":"error","error":{"type":"…' to match /prompt is too long/i
+
+- Expected:
+/prompt is too long/i
+
++ Received:
+"400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.\"},\"request_id\":\"req_011CfBJR9KsBHgBeNJWgpKfS\"}"
+
+ ❯ test/context-overflow.test.ts:103:32
+    101|
+    102|    expect(result.stopReason).toBe("error");
+    103|    expect(result.errorMessage).toMatch(/prompt is too long/i);
+       |                                ^
+    104|    expect(isContextOverflow(result.response, model.contextWindow)).toB…
+    105|   }, 120000);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/153]⎯
+
+ FAIL  test/context-overflow.test.ts > Context overflow error handling > Google > gemini-2.5-flash - should detect overflow via isContextOverflow
+AssertionError: expected '{"error":{"message":"{\n  \"error\": …' to match /input token count.*exceeds the maxim…/i
+
+- Expected:
+/input token count.*exceeds the maximum/i
+
++ Received:
+"{\"error\":{\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"code\\\": 404,\\n    \\\"message\\\": \\\"This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.6-flash for the latest features and improvements. We recommend you to use the Interactions API.\\\",\\n    \\\"status\\\": \\\"NOT_FOUND\\\"\\n  }\\n}\\n\",\"code\":404,\"status\":\"Not Found\"}}"
+
+ ❯ test/context-overflow.test.ts:212:32
+    210|
+    211|    expect(result.stopReason).toBe("error");
+    212|    expect(result.errorMessage).toMatch(/input token count.*exceeds the…
+       |                                ^
+    213|    expect(isContextOverflow(result.response, model.contextWindow)).toB…
+    214|   }, 120000);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/153]⎯
+
+ FAIL  test/context-overflow.test.ts > Context overflow error handling > Qwen Token Plan > qwen3.7-max - should detect overflow via isContextOverflow
+AssertionError: expected '401: {"message":"Invalid API-key prov…' to match /input length/i
+
+- Expected:
+/input length/i
+
++ Received:
+"401: {\"message\":\"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error\",\"id\":\"fae27ef3-effa-4a9d-a6f4-d8037eda4363\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}"
+
+ ❯ test/context-overflow.test.ts:477:32
+    475|
+    476|    expect(result.stopReason).toBe("error");
+    477|    expect(result.errorMessage).toMatch(/input length/i);
+       |                                ^
+    478|    expect(isContextOverflow(result.response, model.contextWindow)).toB…
+    479|   }, 120000);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/153]⎯
+
+ FAIL  test/context-overflow.test.ts > Context overflow error handling > Qwen Token Plan Individual > qwen3.8-max - should detect overflow via isContextOverflow
+AssertionError: expected '401: {"message":"Invalid API-key prov…' to match /input length/i
+
+- Expected:
+/input length/i
+
++ Received:
+"401: {\"message\":\"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error\",\"id\":\"6c5e1742-f705-490f-afbd-65856c6f6363\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}"
+
+ ❯ test/context-overflow.test.ts:489:32
+    487|
+    488|    expect(result.stopReason).toBe("error");
+    489|    expect(result.errorMessage).toMatch(/input length/i);
+       |                                ^
+    490|    expect(isContextOverflow(result.response, model.contextWindow)).toB…
+    491|   }, 120000);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/153]⎯
+
+ FAIL  test/context-overflow.test.ts > Context overflow error handling > OpenRouter > anthropic/claude-sonnet-4 via OpenRouter - should detect overflow via isContextOverflow
+AssertionError: expected '403 {"type":"error","error":{"type":"…' to match /maximum context length is \d+ tokens/i
+
+- Expected:
+/maximum context length is \d+ tokens/i
+
++ Received:
+"403 {\"type\":\"error\",\"error\":{\"type\":\"permission_error\",\"message\":\"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76\",\"error_type\":\"permission_denied\"},\"request_id\":\"gen-1789752596-M56vJIcAR4CcuqhL6itL\"}"
+
+ ❯ test/context-overflow.test.ts:549:32
+    547|
+    548|    expect(result.stopReason).toBe("error");
+    549|    expect(result.errorMessage).toMatch(/maximum context length is \d+ …
+       |                                ^
+    550|    expect(isContextOverflow(result.response, model.contextWindow)).toB…
+    551|   }, 120000);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/153]⎯
+
+ FAIL  test/context-overflow.test.ts > Context overflow error handling > OpenRouter > deepseek/deepseek-v3.2 via OpenRouter - should detect overflow via isContextOverflow
+AssertionError: expected '403: {"message":"Key limit exceeded (…' to match /maximum context length is \d+ tokens/i
+
+- Expected:
+/maximum context length is \d+ tokens/i
+
++ Received:
+"403: {\"message\":\"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76\",\"code\":403}"
+
+ ❯ test/context-overflow.test.ts:560:32
+    558|
+    559|    expect(result.stopReason).toBe("error");
+    560|    expect(result.errorMessage).toMatch(/maximum context length is \d+ …
+       |                                ^
+    561|    expect(isContextOverflow(result.response, model.contextWindow)).toB…
+    562|   }, 120000);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[9/153]⎯
+
+ FAIL  test/context-overflow.test.ts > Context overflow error handling > OpenRouter > mistralai/mistral-large-2512 via OpenRouter - should detect overflow via isContextOverflow
+AssertionError: expected '403: {"message":"Key limit exceeded (…' to match /maximum context length is \d+ tokens/i
+
+- Expected:
+/maximum context length is \d+ tokens/i
+
++ Received:
+"403: {\"message\":\"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76\",\"code\":403}"
+
+ ❯ test/context-overflow.test.ts:571:32
+    569|
+    570|    expect(result.stopReason).toBe("error");
+    571|    expect(result.errorMessage).toMatch(/maximum context length is \d+ …
+       |                                ^
+    572|    expect(isContextOverflow(result.response, model.contextWindow)).toB…
+    573|   }, 120000);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[10/153]⎯
+
+ FAIL  test/context-overflow.test.ts > Context overflow error handling > OpenRouter > google/gemini-2.5-flash via OpenRouter - should detect overflow via isContextOverflow
+AssertionError: expected '403: {"message":"Key limit exceeded (…' to match /maximum context length is \d+ tokens/i
+
+- Expected:
+/maximum context length is \d+ tokens/i
+
++ Received:
+"403: {\"message\":\"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76\",\"code\":403}"
+
+ ❯ test/context-overflow.test.ts:582:32
+    580|
+    581|    expect(result.stopReason).toBe("error");
+    582|    expect(result.errorMessage).toMatch(/maximum context length is \d+ …
+       |                                ^
+    583|    expect(isContextOverflow(result.response, model.contextWindow)).toB…
+    584|   }, 120000);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[11/153]⎯
+
+ FAIL  test/context-overflow.test.ts > Context overflow error handling > OpenRouter > meta-llama/llama-4-scout via OpenRouter - should detect overflow via isContextOverflow
+AssertionError: expected '404: {"message":"No endpoints found f…' to match /maximum context length is \d+ tokens/i
+
+- Expected:
+/maximum context length is \d+ tokens/i
+
++ Received:
+"404: {\"message\":\"No endpoints found for meta-llama/llama-4-scout.\",\"code\":404,\"metadata\":{\"routing_funnel\":[{\"step\":\"Initial Endpoints\",\"endpoint_count\":3},{\"step\":\"Filter by Context Length\",\"endpoint_count\":1},{\"step\":\"Add BYOK Endpoints\",\"endpoint_count\":0}]}}"
+
+ ❯ test/context-overflow.test.ts:593:32
+    591|
+    592|    expect(result.stopReason).toBe("error");
+    593|    expect(result.errorMessage).toMatch(/maximum context length is \d+ …
+       |                                ^
+    594|    expect(isContextOverflow(result.response, model.contextWindow)).toB…
+    595|   }, 120000);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[12/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Anthropic thinking disable E2E > disables thinking for budget-based reasoning models
+AssertionError: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJS7zXBJcWrYgmXfavM"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:94:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[13/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Anthropic thinking disable E2E > disables thinking for budget-based reasoning models
+AssertionError: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJS96Vu9Jbe8KKR7pJw"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:94:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[14/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Anthropic thinking disable E2E > disables thinking for budget-based reasoning models
+AssertionError: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJS9mvxceqR1nkoM2bt"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:94:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[15/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Anthropic thinking disable E2E > disables thinking for adaptive reasoning models
+AssertionError: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJSAXKxDhySCwJmbURg"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:100:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[16/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Anthropic thinking disable E2E > disables thinking for adaptive reasoning models
+AssertionError: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJSBMgDrDbb3orwdiRQ"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:100:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[17/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Anthropic thinking disable E2E > disables thinking for adaptive reasoning models
+AssertionError: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."},"request_id":"req_011CfBJSCAJCx6owhLj6DWoW"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:100:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[18/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Google thinking disable E2E > disables thinking for Gemini 2.5
+ FAIL  test/google-thinking-disable.test.ts > Google thinking disable E2E > disables thinking for Gemini 2.5
+ FAIL  test/google-thinking-disable.test.ts > Google thinking disable E2E > disables thinking for Gemini 2.5
+AssertionError: {"error":{"message":"{\n  \"error\": {\n    \"code\": 404,\n    \"message\": \"This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.6-flash for the latest features and improvements. We recommend you to use the Interactions API.\",\n    \"status\": \"NOT_FOUND\"\n  }\n}\n","code":404,"status":"Not Found"}}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:108:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[19/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Google thinking disable E2E > does not error when thinking is off for Gemini 3.1 Pro
+AssertionError: {"error":{"message":"{\n  \"error\": {\n    \"code\": 429,\n    \"message\": \"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 0, model: gemini-3.1-pro\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-3.1-pro\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-3.1-pro\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 0, model: gemini-3.1-pro\\nPlease retry in 52.775923633s.\",\n    \"status\": \"RESOURCE_EXHAUSTED\",\n    \"details\": [\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.Help\",\n        \"links\": [\n          {\n            \"description\": \"Learn more about Gemini API quotas\",\n            \"url\": \"https://ai.google.dev/gemini-api/docs/rate-limits\"\n          }\n        ]\n      },\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.QuotaFailure\",\n        \"violations\": [\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_input_token_count\",\n            \"quotaId\": \"GenerateContentInputTokensPerModelPerDay-FreeTier\",\n            \"quotaDimensions\": {\n              \"location\": \"global\",\n              \"model\": \"gemini-3.1-pro\"\n            }\n          },\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_requests\",\n            \"quotaId\": \"GenerateRequestsPerDayPerProjectPerModel-FreeTier\",\n            \"quotaDimensions\": {\n              \"model\": \"gemini-3.1-pro\",\n              \"location\": \"global\"\n            }\n          },\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_requests\",\n            \"quotaId\": \"GenerateRequestsPerMinutePerProjectPerModel-FreeTier\",\n            \"quotaDimensions\": {\n              \"location\": \"global\",\n              \"model\": \"gemini-3.1-pro\"\n            }\n          },\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_input_token_count\",\n            \"quotaId\": \"GenerateContentInputTokensPerModelPerMinute-FreeTier\",\n            \"quotaDimensions\": {\n              \"location\": \"global\",\n              \"model\": \"gemini-3.1-pro\"\n            }\n          }\n        ]\n      },\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.RetryInfo\",\n        \"retryDelay\": \"52s\"\n      }\n    ]\n  }\n}\n","code":429,"status":"Too Many Requests"}}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:116:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[20/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Google thinking disable E2E > does not error when thinking is off for Gemini 3.1 Pro
+AssertionError: {"error":{"message":"{\n  \"error\": {\n    \"code\": 429,\n    \"message\": \"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-3.1-pro\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-3.1-pro\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 0, model: gemini-3.1-pro\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 0, model: gemini-3.1-pro\\nPlease retry in 52.594396171s.\",\n    \"status\": \"RESOURCE_EXHAUSTED\",\n    \"details\": [\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.Help\",\n        \"links\": [\n          {\n            \"description\": \"Learn more about Gemini API quotas\",\n            \"url\": \"https://ai.google.dev/gemini-api/docs/rate-limits\"\n          }\n        ]\n      },\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.QuotaFailure\",\n        \"violations\": [\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_requests\",\n            \"quotaId\": \"GenerateRequestsPerDayPerProjectPerModel-FreeTier\",\n            \"quotaDimensions\": {\n              \"model\": \"gemini-3.1-pro\",\n              \"location\": \"global\"\n            }\n          },\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_requests\",\n            \"quotaId\": \"GenerateRequestsPerMinutePerProjectPerModel-FreeTier\",\n            \"quotaDimensions\": {\n              \"location\": \"global\",\n              \"model\": \"gemini-3.1-pro\"\n            }\n          },\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_input_token_count\",\n            \"quotaId\": \"GenerateContentInputTokensPerModelPerMinute-FreeTier\",\n            \"quotaDimensions\": {\n              \"location\": \"global\",\n              \"model\": \"gemini-3.1-pro\"\n            }\n          },\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_input_token_count\",\n            \"quotaId\": \"GenerateContentInputTokensPerModelPerDay-FreeTier\",\n            \"quotaDimensions\": {\n              \"location\": \"global\",\n              \"model\": \"gemini-3.1-pro\"\n            }\n          }\n        ]\n      },\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.RetryInfo\",\n        \"retryDelay\": \"52s\"\n      }\n    ]\n  }\n}\n","code":429,"status":"Too Many Requests"}}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:116:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[21/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > Google thinking disable E2E > does not error when thinking is off for Gemini 3.1 Pro
+AssertionError: {"error":{"message":"{\n  \"error\": {\n    \"code\": 429,\n    \"message\": \"You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-3.1-pro\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 0, model: gemini-3.1-pro\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 0, model: gemini-3.1-pro\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 0, model: gemini-3.1-pro\\nPlease retry in 52.443736679s.\",\n    \"status\": \"RESOURCE_EXHAUSTED\",\n    \"details\": [\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.Help\",\n        \"links\": [\n          {\n            \"description\": \"Learn more about Gemini API quotas\",\n            \"url\": \"https://ai.google.dev/gemini-api/docs/rate-limits\"\n          }\n        ]\n      },\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.QuotaFailure\",\n        \"violations\": [\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_requests\",\n            \"quotaId\": \"GenerateRequestsPerDayPerProjectPerModel-FreeTier\",\n            \"quotaDimensions\": {\n              \"model\": \"gemini-3.1-pro\",\n              \"location\": \"global\"\n            }\n          },\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_requests\",\n            \"quotaId\": \"GenerateRequestsPerMinutePerProjectPerModel-FreeTier\",\n            \"quotaDimensions\": {\n              \"location\": \"global\",\n              \"model\": \"gemini-3.1-pro\"\n            }\n          },\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_input_token_count\",\n            \"quotaId\": \"GenerateContentInputTokensPerModelPerMinute-FreeTier\",\n            \"quotaDimensions\": {\n              \"location\": \"global\",\n              \"model\": \"gemini-3.1-pro\"\n            }\n          },\n          {\n            \"quotaMetric\": \"generativelanguage.googleapis.com/generate_content_free_tier_input_token_count\",\n            \"quotaId\": \"GenerateContentInputTokensPerModelPerDay-FreeTier\",\n            \"quotaDimensions\": {\n              \"location\": \"global\",\n              \"model\": \"gemini-3.1-pro\"\n            }\n          }\n        ]\n      },\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.RetryInfo\",\n        \"retryDelay\": \"52s\"\n      }\n    ]\n  }\n}\n","code":429,"status":"Too Many Requests"}}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:116:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[22/153]⎯
+
+ FAIL  test/google-thinking-disable.test.ts > OpenRouter thinking disable E2E > disables thinking for Qwen 3.5 reasoning models
+ FAIL  test/google-thinking-disable.test.ts > OpenRouter thinking disable E2E > disables thinking for Qwen 3.5 reasoning models
+ FAIL  test/google-thinking-disable.test.ts > OpenRouter thinking disable E2E > disables thinking for Qwen 3.5 reasoning models
+AssertionError: 403: {"message":"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76","code":403}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ runWithoutReasoning test/google-thinking-disable.test.ts:63:53
+     61|
+     62|  const response = await s.result();
+     63|  expect(response.stopReason, response.errorMessage).toBe("stop");
+       |                                                     ^
+     64|
+     65|  const text = response.content
+ ❯ expectThinkingDisabledE2E test/google-thinking-disable.test.ts:81:17
+ ❯ test/google-thinking-disable.test.ts:156:3
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[23/153]⎯
+
+ FAIL  test/openrouter-cache-write-repro.test.ts > OpenRouter cache_write repro E2E > regression: preserves cache_write_tokens on openai-completions stream path
+ FAIL  test/openrouter-cache-write-repro.test.ts > OpenRouter cache_write repro E2E > regression: preserves cache_write_tokens on openai-completions stream path
+ FAIL  test/openrouter-cache-write-repro.test.ts > OpenRouter cache_write repro E2E > regression: preserves cache_write_tokens on openai-completions stream path
+AssertionError: 403: {"message":"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76","code":403}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ test/openrouter-cache-write-repro.test.ts:66:49
+     64|
+     65|    const first = await completeSimple(model, context, options);
+     66|    expect(first.stopReason, first.errorMessage).toBe("stop");
+       |                                                 ^
+     67|
+     68|    const second = await completeSimple(model, context, options);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[24/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should complete basic text generation
+AssertionError: expected 0 to be greater than 0
+ ❯ basicTextGeneration test/stream.test.ts:55:58
+     53|  expect(response.role).toBe("assistant");
+     54|  expect(response.content).toBeTruthy();
+     55|  expect(response.usage.input + response.usage.cacheRead).toBeGreaterTh…
+       |                                                          ^
+     56|  expect(response.usage.output).toBeGreaterThan(0);
+     57|  expect(response.errorMessage).toBeFalsy();
+ ❯ test/stream.test.ts:355:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[25/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle tool calling
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleToolCall test/stream.test.ts:137:23
+    135|  }
+    136|
+    137|  expect(hasToolStart).toBe(true);
+       |                       ^
+    138|  expect(hasToolDelta).toBe(true);
+    139|  expect(hasToolEnd).toBe(true);
+ ❯ test/stream.test.ts:359:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[26/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle streaming
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleStreaming test/stream.test.ts:177:22
+    175|  const response = await s.result();
+    176|
+    177|  expect(textStarted).toBe(true);
+       |                      ^
+    178|  expect(textChunks.length).toBeGreaterThan(0);
+    179|  expect(textCompleted).toBe(true);
+ ❯ test/stream.test.ts:363:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[27/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle thinking
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle thinking
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle thinking
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle thinking
+AssertionError: Error: {"error":{"message":"{\n  \"error\": {\n    \"code\": 404,\n    \"message\": \"This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.6-flash for the latest features and improvements. We recommend you to use the Interactions API.\",\n    \"status\": \"NOT_FOUND\"\n  }\n}\n","code":404,"status":"Not Found"}}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:367:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[28/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle multi-turn with thinking and tools
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle multi-turn with thinking and tools
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle multi-turn with thinking and tools
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle multi-turn with thinking and tools
+AssertionError: Error: {"error":{"message":"{\n  \"error\": {\n    \"code\": 404,\n    \"message\": \"This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.6-flash for the latest features and improvements. We recommend you to use the Interactions API.\",\n    \"status\": \"NOT_FOUND\"\n  }\n}\n","code":404,"status":"Not Found"}}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:371:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[29/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle image input
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle image input
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle image input
+ FAIL  test/stream.test.ts > Generate E2E Tests > Gemini Provider (gemini-2.5-flash) > should handle image input
+AssertionError: expected false to be truthy
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleImage test/stream.test.ts:258:38
+    256|
+    257|  // Check the response mentions red and circle
+    258|  expect(response.content.length > 0).toBeTruthy();
+       |                                      ^
+    259|  const textContent = response.content.find((b) => b.type === "text");
+    260|  if (textContent && textContent.type === "text") {
+ ❯ test/stream.test.ts:375:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[30/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should complete basic text generation
+AssertionError: expected 0 to be greater than 0
+ ❯ basicTextGeneration test/stream.test.ts:55:58
+     53|  expect(response.role).toBe("assistant");
+     54|  expect(response.content).toBeTruthy();
+     55|  expect(response.usage.input + response.usage.cacheRead).toBeGreaterTh…
+       |                                                          ^
+     56|  expect(response.usage.output).toBeGreaterThan(0);
+     57|  expect(response.errorMessage).toBeFalsy();
+ ❯ test/stream.test.ts:505:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[31/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle tool calling
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleToolCall test/stream.test.ts:137:23
+    135|  }
+    136|
+    137|  expect(hasToolStart).toBe(true);
+       |                       ^
+    138|  expect(hasToolDelta).toBe(true);
+    139|  expect(hasToolEnd).toBe(true);
+ ❯ test/stream.test.ts:509:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[32/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle streaming
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleStreaming test/stream.test.ts:177:22
+    175|  const response = await s.result();
+    176|
+    177|  expect(textStarted).toBe(true);
+       |                      ^
+    178|  expect(textChunks.length).toBeGreaterThan(0);
+    179|  expect(textCompleted).toBe(true);
+ ❯ test/stream.test.ts:513:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[33/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle image input
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle image input
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle image input
+ FAIL  test/stream.test.ts > Generate E2E Tests > Anthropic Provider (claude-haiku-4-5) > should handle image input
+AssertionError: expected false to be truthy
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleImage test/stream.test.ts:258:38
+    256|
+    257|  // Check the response mentions red and circle
+    258|  expect(response.content.length > 0).toBeTruthy();
+       |                                      ^
+    259|  const textContent = response.content.find((b) => b.type === "text");
+    260|  if (textContent && textContent.type === "text") {
+ ❯ test/stream.test.ts:517:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[34/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should complete basic text generation
+AssertionError: expected 0 to be greater than 0
+ ❯ basicTextGeneration test/stream.test.ts:55:58
+     53|  expect(response.role).toBe("assistant");
+     54|  expect(response.content).toBeTruthy();
+     55|  expect(response.usage.input + response.usage.cacheRead).toBeGreaterTh…
+       |                                                          ^
+     56|  expect(response.usage.output).toBeGreaterThan(0);
+     57|  expect(response.errorMessage).toBeFalsy();
+ ❯ test/stream.test.ts:840:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[35/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle tool calling
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleToolCall test/stream.test.ts:137:23
+    135|  }
+    136|
+    137|  expect(hasToolStart).toBe(true);
+       |                       ^
+    138|  expect(hasToolDelta).toBe(true);
+    139|  expect(hasToolEnd).toBe(true);
+ ❯ test/stream.test.ts:844:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[36/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle streaming
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleStreaming test/stream.test.ts:177:22
+    175|  const response = await s.result();
+    176|
+    177|  expect(textStarted).toBe(true);
+       |                      ^
+    178|  expect(textChunks.length).toBeGreaterThan(0);
+    179|  expect(textCompleted).toBe(true);
+ ❯ test/stream.test.ts:848:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[37/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle thinking mode
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle thinking mode
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle thinking mode
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle thinking mode
+AssertionError: Error: 403: {"message":"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76","code":403}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:852:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[38/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle multi-turn with thinking and tools
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle multi-turn with thinking and tools
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle multi-turn with thinking and tools
+AssertionError: Error: 403: {"message":"Key limit exceeded (monthly limit). Manage it using https://openrouter.ai/workspaces/default/keys/0fe2935f3a6a2f9ea5957cb6bac48e4ba52457cf820854b934c1935543531c76","code":403}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:856:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[39/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle image input
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle image input
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle image input
+ FAIL  test/stream.test.ts > Generate E2E Tests > OpenRouter Provider (glm-4.5v via OpenAI Completions) > should handle image input
+AssertionError: expected false to be truthy
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleImage test/stream.test.ts:258:38
+    256|
+    257|  // Check the response mentions red and circle
+    258|  expect(response.content.length > 0).toBeTruthy();
+       |                                      ^
+    259|  const textContent = response.content.find((b) => b.type === "text");
+    260|  if (textContent && textContent.type === "text") {
+ ❯ test/stream.test.ts:860:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[40/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should complete basic text generation
+AssertionError: expected 0 to be greater than 0
+ ❯ basicTextGeneration test/stream.test.ts:55:58
+     53|  expect(response.role).toBe("assistant");
+     54|  expect(response.content).toBeTruthy();
+     55|  expect(response.usage.input + response.usage.cacheRead).toBeGreaterTh…
+       |                                                          ^
+     56|  expect(response.usage.output).toBeGreaterThan(0);
+     57|  expect(response.errorMessage).toBeFalsy();
+ ❯ test/stream.test.ts:949:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[41/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle tool calling
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleToolCall test/stream.test.ts:137:23
+    135|  }
+    136|
+    137|  expect(hasToolStart).toBe(true);
+       |                       ^
+    138|  expect(hasToolDelta).toBe(true);
+    139|  expect(hasToolEnd).toBe(true);
+ ❯ test/stream.test.ts:953:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[42/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle streaming
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleStreaming test/stream.test.ts:177:22
+    175|  const response = await s.result();
+    176|
+    177|  expect(textStarted).toBe(true);
+       |                      ^
+    178|  expect(textChunks.length).toBeGreaterThan(0);
+    179|  expect(textCompleted).toBe(true);
+ ❯ test/stream.test.ts:957:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[43/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle thinking mode
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle thinking mode
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle thinking mode
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle thinking mode
+AssertionError: Error: 429: {"code":"1113","message":"Insufficient balance or no resource package. Please recharge."}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:961:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[44/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle multi-turn with thinking and tools
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle multi-turn with thinking and tools
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle multi-turn with thinking and tools
+ FAIL  test/stream.test.ts > Generate E2E Tests > zAI Provider (glm-5.2 via OpenAI Completions) > should handle multi-turn with thinking and tools
+AssertionError: Error: 429: {"code":"1113","message":"Insufficient balance or no resource package. Please recharge."}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:965:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[45/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should complete basic text generation
+AssertionError: expected 0 to be greater than 0
+ ❯ basicTextGeneration test/stream.test.ts:55:58
+     53|  expect(response.role).toBe("assistant");
+     54|  expect(response.content).toBeTruthy();
+     55|  expect(response.usage.input + response.usage.cacheRead).toBeGreaterTh…
+       |                                                          ^
+     56|  expect(response.usage.output).toBeGreaterThan(0);
+     57|  expect(response.errorMessage).toBeFalsy();
+ ❯ test/stream.test.ts:1204:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[46/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle tool calling
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleToolCall test/stream.test.ts:137:23
+    135|  }
+    136|
+    137|  expect(hasToolStart).toBe(true);
+       |                       ^
+    138|  expect(hasToolDelta).toBe(true);
+    139|  expect(hasToolEnd).toBe(true);
+ ❯ test/stream.test.ts:1208:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[47/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle streaming
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleStreaming test/stream.test.ts:177:22
+    175|  const response = await s.result();
+    176|
+    177|  expect(textStarted).toBe(true);
+       |                      ^
+    178|  expect(textChunks.length).toBeGreaterThan(0);
+    179|  expect(textCompleted).toBe(true);
+ ❯ test/stream.test.ts:1212:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[48/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle thinking mode
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"7dca5839-f778-44fc-a90d-e57413b91882","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:1216:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[49/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle thinking mode
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"f3027e27-06cb-4f31-8af8-6373bfd7d686","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:1216:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[50/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle thinking mode
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"37467b0f-54f7-4c42-bf35-f10d01ddfd34","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:1216:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[51/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle thinking mode
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"c6164c99-9a86-45f5-9267-966c37bc49f8","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:1216:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[52/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle multi-turn with thinking and tools
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"91de2ed4-e73e-4e3a-a9e8-221a4ea88429","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:1220:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[53/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle multi-turn with thinking and tools
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"907f674a-5683-4a1f-b838-270233a54aa6","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:1220:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[54/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle multi-turn with thinking and tools
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"904a00e3-2d40-42eb-936a-7a91bcf359f0","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:1220:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[55/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Provider (Qwen3.7-Max, international) > should handle multi-turn with thinking and tools
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"40fcfb40-3766-4d56-badd-4df16573a538","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:1220:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[56/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should complete basic text generation
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should complete basic text generation
+AssertionError: expected 0 to be greater than 0
+ ❯ basicTextGeneration test/stream.test.ts:55:58
+     53|  expect(response.role).toBe("assistant");
+     54|  expect(response.content).toBeTruthy();
+     55|  expect(response.usage.input + response.usage.cacheRead).toBeGreaterTh…
+       |                                                          ^
+     56|  expect(response.usage.output).toBeGreaterThan(0);
+     57|  expect(response.errorMessage).toBeFalsy();
+ ❯ test/stream.test.ts:1235:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[57/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle tool calling
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle tool calling
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleToolCall test/stream.test.ts:137:23
+    135|  }
+    136|
+    137|  expect(hasToolStart).toBe(true);
+       |                       ^
+    138|  expect(hasToolDelta).toBe(true);
+    139|  expect(hasToolEnd).toBe(true);
+ ❯ test/stream.test.ts:1239:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[58/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle streaming
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle streaming
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ handleStreaming test/stream.test.ts:177:22
+    175|  const response = await s.result();
+    176|
+    177|  expect(textStarted).toBe(true);
+       |                      ^
+    178|  expect(textChunks.length).toBeGreaterThan(0);
+    179|  expect(textCompleted).toBe(true);
+ ❯ test/stream.test.ts:1243:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[59/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle thinking mode
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"c4af0039-c2c4-4685-900e-a67377e4a754","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:1247:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[60/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle thinking mode
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"f3ee02d9-a7ab-42c4-b787-417769703d3a","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:1247:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[61/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle thinking mode
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"36f52b59-f691-4bc0-8ea0-ed24cb127728","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:1247:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[62/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle thinking mode
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"6660d20a-57b6-49a8-af74-8142df3ce344","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' to be 'stop' // Object.is equality
+
+Expected: "stop"
+Received: "error"
+
+ ❯ handleThinking test/stream.test.ts:213:65
+    211|  const response = await s.result();
+    212|
+    213|  expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("…
+       |                                                                 ^
+    214|  expect(thinkingStarted).toBe(true);
+    215|  expect(thinkingChunks.length).toBeGreaterThan(0);
+ ❯ test/stream.test.ts:1247:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[63/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle multi-turn with thinking and tools
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"5ff424f1-baf3-441a-8dc3-3dd4f36cdf6b","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:1251:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[64/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle multi-turn with thinking and tools
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"ec313078-339d-4935-8dbe-c9f7482a4490","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:1251:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[65/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle multi-turn with thinking and tools
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"adcab635-863e-43f5-be46-545db172b56b","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:1251:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[66/153]⎯
+
+ FAIL  test/stream.test.ts > Generate E2E Tests > Qwen Token Plan Individual Provider (Qwen3.8-Max, international) > should handle multi-turn with thinking and tools
+AssertionError: Error: 401: {"message":"Invalid API-key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error","id":"ce1290fc-25f9-46a6-971b-4aef1789d8d7","type":"invalid_request_error","code":"invalid_api_key"}: expected 'error' not to be 'error' // Object.is equality
+ ❯ multiTurn test/stream.test.ts:335:70
+    333|
+    334|   // If we got a stop response with text content, we're likely done
+    335|   expect(response.stopReason, `Error: ${response.errorMessage}`).not.t…
+       |                                                                      ^
+    336|   if (response.stopReason === "stop") {
+    337|    break;
+ ❯ test/stream.test.ts:1251:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[67/153]⎯
+
+
+ Test Files  5 failed | 66 passed (71)
+      Tests  47 failed | 609 passed | 222 skipped (878)
+   Start at  12:29:37
+   Duration  58.52s (transform 29.08s, setup 0ms, import 134.04s, tests 109.94s, environment 37ms)
+

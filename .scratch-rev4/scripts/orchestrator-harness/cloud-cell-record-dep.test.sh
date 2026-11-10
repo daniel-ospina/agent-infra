@@ -1,0 +1,1170 @@
+#!/usr/bin/env bash
+# cloud-cell-record-dep.test.sh — #1717: the record step is a CHECKED dependency, and a record
+# failure reaches a TERMINAL state instead of re-paying for a review every cycle.
+#
+# The defect this pins has two halves, and they fail differently:
+#
+#   (1) FALSE GREEN + PAID LOOP. `cloud-cell-supervisor.sh cmd_check` printed
+#       "CELL CAN RUN A CONTROLLER" without testing $HOME/.pi/agent/scripts/record-review.sh — the
+#       file merge-one.sh EXECUTES to mint the signed marker ai-review-gate verifies. On a fresh
+#       cell it is absent, so the cell ran a full fresh-context review (up to REVIEW_TIMEOUT =
+#       1800 s, PAID), record-review.sh returned 127, and merge-one.sh aborted. Nothing was recorded
+#       and nothing was parked, so the next cycle saw an unmarked FAILED:ai-review-gate and spawned
+#       another review: one paid review per cycle, forever, with no terminal state.
+#
+#   (2) NO TERMINAL STATE. No state a cell could reach stopped the loop and said why.
+#
+# HOW THESE CHECKS ARE WRITTEN. Every one drives a SHIPPED script (`cloud-cell-supervisor.sh`,
+# `merge-one.sh`) — never a re-implementation, which would pass on the broken copy too. The
+# toolchain is stubbed and PATH is replaced, so the suite is hermetic (no network, no tmux server,
+# no real gh/pi) AND the "dependency is missing" cases are reachable at all: with /usr/bin on PATH,
+# git and python3 are present on every box and the negative cases could not exist.
+#
+# LABELLING RULE. A check labelled `RED→GREEN` is one that FAILS on the pre-PR tree
+# (`origin/main`) — it is evidence FOR the behaviour this change introduces. A check with no such
+# label is a REGRESSION PIN or a COVERAGE pin: it guards a behaviour that already worked (or a shape
+# no other case drives) and is NOT evidence for this change. Do not read a pin as a delta claim —
+# the suite header used to assert a fixed COUNT of RED→GREEN checks, which is exactly the kind of
+# figure that re-stales as cases are added, so it now states the rule instead.
+#
+#   bash scripts/orchestrator-harness/cloud-cell-record-dep.test.sh
+set -uo pipefail
+# ⛔ NEUTRALISE THE AMBIENT `GH_REPO` BEFORE ANYTHING RUNS (measured, and it is why this suite was red on
+# `origin/main` and on every CI run). `cmd_check` now refuses a cell whose `$ENV_FILE`/environment names a
+# GH_REPO that disagrees with the checkout's origin remote (agent-infra#2235 — gh gives GH_REPO precedence
+# over the checkout for every call that does not pass `--repo`). GitHub Actions exports
+# `GH_REPO=daniel-ospina/agent-infra` into every step, and a developer box that works on two repos usually
+# exports it too, so the fixture inherited a repo it never chose and DIED before the recorder probe — 17
+# assertions failing for a reason that was not their subject. This suite replaces PATH wholesale to stay
+# hermetic; the environment must be neutralised the same way, or the box decides the result.
+unset GH_REPO GH_HOST
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Absolute self-path, resolved BEFORE any PATH replacement: the executed floor at the bottom READS this file
+# to derive its expected count, so a relative $0 would make that read depend on the caller's cwd.
+SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
+SUP="$HERE/../cloud-cell-supervisor.sh"
+MERGE="$HERE/merge-one.sh"
+# Resolved BEFORE any PATH replacement — the supervisor is invoked through it.
+BASH_BIN="$(command -v bash)"
+[ -x "$SUP" ]   || { echo "❌ missing $SUP"; exit 1; }
+[ -x "$MERGE" ] || { echo "❌ missing $MERGE"; exit 1; }
+
+pass=0; fail=0
+# ⛔ THE WHOLE-`start` VERDICT IS COUNTED, NOT JUST CHECKED (#3774 review, P2 — the finding this suite's own
+# thesis demands be closed). The three `ck "… SUCCEEDED …" "$start_rc"` calls are the ONLY whole-`start`
+# success assertion KIND in this file, and #3760 DELETED them while nothing reddened: the file ends at
+# `[ "$fail" -eq 0 ]` and `run-bash-shards.sh` discovers by glob and reads only the exit code, so no count
+# pinned them. Restored lines are, on their own, exactly as deletable as they were the first time.
+# So the floor at the bottom checks them against THREE INDEPENDENT derivations from this file — what each arm
+# CAPTURES, what the suite EXECUTED, and how each assertion BINDS its argument — plus one BEHAVIOURAL row that
+# proves the captured value is a real exit status and not a pinned constant. Each is compared with the number
+# of arms that invoke `cell_start`. Deliberately the same shape as the guard suite's `optOutLegRan` floor
+# (`test-remote-context.mjs`): a DECLARED line is satisfied by a neutralised consumer; an EXECUTED count is
+# not. Precedent outside this repo: Jest's `expect.assertions(n)` / `hasAssertions()`, whose counter is bumped
+# by `expect()` itself.
+# ⛔ THE COUNTER IS BUMPED BY THE ASSERTION PRIMITIVE, NOT BY A WRAPPER (#3774 review, P2 — measured). Jest's
+# counter is bumped by `expect()` itself, and that detail is the whole guard: a wrapper that bumps on entry
+# counts WRAPPER INVOCATIONS, so emptying the helper's body (one line) left `117 passed, 0 failed`, exit 0 —
+# every whole-`start` assertion gone and the floor row printed ✅. The bump therefore lives in `ck`, keyed on
+# the label kind, so the datum exists only when the assertion really ran. There is deliberately NO wrapper
+# function here: an indirection whose only job is to forward two arguments is the neutralisable consumer.
+# ⛔ AND A COUNT OF LABELS IS NOT A BINDING (#3774 review round 2, P1 — measured). With only the executed
+# count, `ck "…SUCCEEDED…" 0` graded every arm against the constant 0 and the suite stayed GREEN, exit 0
+# (`120 passed, 0 failed` at the head that measured it) — the assertion present, the verdict gone. So the
+# floor ALSO derives, from this file's source, how many positive assertions bind `"$start_rc"`, and requires
+# the counts to agree. There is no fixed number of greps below; each was added against a MEASURED edit that
+# slipped past the ones before it, and none was added speculatively.
+start_rc_asserted=0
+ck() { # ck <name> <0|1>
+  case "$1" in *SUCCEEDED*) start_rc_asserted=$((start_rc_asserted + 1)) ;; esac
+  if [ "$2" -eq 0 ]; then printf '  \033[32mPASS\033[0m  %s\n' "$1"; pass=$((pass+1))
+  else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=$((fail+1)); fi
+}
+note() { printf '      %s\n' "$*"; }
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+echo "==> #1717 cloud-cell record dependency ($HERE)"
+
+# ── the stub toolchain ────────────────────────────────────────────────────────
+# PATH is set to this directory ALONE for every driven script, so what the host happens to have
+# installed cannot make a negative case pass — and cannot let a real `gh`/`pi` reach the network.
+# The coreutils are symlinked (they are the shells the driven scripts actually need); the tools
+# under test are trivial `exit 0` stubs.
+# ⛔ `ps` belongs here: `start`/`status`/`stop` read the process table to prove a controller is THIS
+# state dir's, and an ABSENT `ps` is indistinguishable from an UNREADABLE one — the supervisor then
+# refuses to start ("cannot read the process table"), which is correct behaviour and wrong subject
+# matter for this suite (it pins the recorder dependency). Every real cell has `ps`; the
+# unreadable-`ps` refusals are pinned in scripts/cloud-cell-supervisor.test.sh §(o) — `status`, `stop`,
+# both of `start`'s guards, and `apply` — each by its own message suffix, so a mutation of one guard
+# cannot be masked by another. The read is scoped to $O/orch-loop.sh and $HARNESS/orch-loop.sh under
+# this fixture's own mktemp tree, so no process on the host can match it and the fixture stays
+# hermetic.
+# ⛔ `mktemp` BELONGS HERE, and its absence was a FIXTURE DEFECT with a silent consequence: the worker
+# captures the recorder's output into a temp file and falls back to `/dev/null` when `mktemp` fails — so
+# with `mktemp` absent from this PATH every driven record call wrote the recorder's own stderr into
+# `/dev/null`, and the classification arms that grep that capture (`§8l`, `§8m`) read NOTHING. They
+# failed for a reason that named the sink rather than the subject. `mktemp` is a real coreutil (every
+# cell and runner has it) and the shipped worker depends on it, so the fixture must provide it; the
+# `/dev/null` fallback stays reachable only on a box that genuinely cannot make a temp file, which is
+# what the guarded `rec_out_cleanup` exists for.
+COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum ps mktemp"
+mkstubs() { # mkstubs <dir>
+  local d="$1" b p
+  mkdir -p "$d"
+  for b in $COREUTILS; do
+    p="$(command -v "$b" 2>/dev/null)" || continue
+    ln -sf "$p" "$d/$b"
+  done
+  ln -sf "$BASH_BIN" "$d/bash"
+  # openssl: the merge worker now VERIFIES the marker's HMAC, not just its shape (#784), so the
+  # fixtures that sign must exercise a REAL signer. Symlinked, deliberately not stubbed: a stub can
+  # never intercept the verifier anyway (merge-one.sh prepends /opt/homebrew/bin:/usr/local/bin to
+  # PATH itself), and a stub emitting a matching digest would silently make the fixture unfaithful.
+  # ⚠️ If the host has no openssl this line silently skips; see the §8k note for the consequence.
+  p="$(command -v openssl 2>/dev/null)" && ln -sf "$p" "$d/openssl"
+  # gh: `cmd_check` runs `gh auth status`; merge-one.sh runs `pr view`/`pr checks`/`pr merge`.
+  cat > "$d/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  *"pr view"*headRefOid*) printf '%s\n' "${FAKE_HEAD:-0123456789abcdef0123456789abcdef01234567}"; exit 0 ;;
+  *"pr checks"*) printf 'SUCCESS\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$d/gh"
+  # tmux: `start` must be able to CREATE a session and then SEE it, and a stub that always reports
+  # "running" would silently skip the whole start path (it did, before this was stateful).
+  cat > "$d/tmux" <<'SH'
+#!/bin/bash
+case "$1" in
+  has-session) [ -f "$TM_STATE/up" ] && exit 0 || exit 1 ;;
+  new-session) shift; printf '%s\n' "$*" > "$TM_STATE/cmd"; : > "$TM_STATE/up"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$d/tmux"
+  # ⛔ git is REAL and SYMLINKED, never an `exit 0` stub: `cmd_check`'s provenance probe and
+  # `harness_apply`'s ref resolution both READ its output, and a stub prints nothing — every healthy
+  # tree then reads as UNVERIFIABLE ("cannot resolve origin/main … cannot pin a harness to verify
+  # against"), so the whole cell is refused before the recorder probe this suite exists for is ever
+  # reached — and the recorder assertions pass for the wrong reason (or fail loudly).
+  # python3/pi stay `exit 0` stubs: nothing below reads their OUTPUT, only their presence, and §4
+  # removes each in turn to pin the "missing on PATH" refusal.
+  p="$(command -v git 2>/dev/null)" && ln -sf "$p" "$d/git"
+  # jq joined the toolchain with agent-infra#1962: `refresh-candidates.sh --check` now REFUSES to
+  # certify a box without it (every REST listing is assembled with it, so a jq-less cell would read
+  # `queue=UNREADABLE` for ever). It is a PRESENCE probe on this path — `--check` runs no listing, so
+  # a stub cannot mask a read here, and it keeps the fixture host-independent: without it every
+  # "a complete cell is certified" assertion below fails on any host whose PATH this suite replaced.
+  # ⛔ `python3` IS REAL AND SYMLINKED, for the same reason git is — it stopped being a pure presence
+  # probe with agent-infra#2024: `check_provider_store` runs its JSON parse through `python3 -c`, and an
+  # `exit 0` stub prints NOTHING, so every store read came back `unreadable`, `cmd_check` died before the
+  # recorder probe this suite exists for, and 17 assertions failed for a reason that was not their
+  # subject (measured identically on `origin/main`). `pi` and `jq` stay `exit 0` stubs: nothing below
+  # reads their output.
+  p="$(command -v python3 2>/dev/null)" && ln -sf "$p" "$d/python3"
+  for b in pi jq; do printf '#!/bin/bash\nexit 0\n' > "$d/$b"; chmod +x "$d/$b"; done
+  return 0
+}
+
+# ── a complete cell fixture, one missing dependency at a time ─────────────────
+CELL="$TMP/cell"
+CELL_HOME="$CELL/home"; CELL_REPO="$CELL/repo"; CELL_O="$CELL/o"; CELL_HARNESS="$CELL/harness"
+CELL_STUBS="$CELL/stubs"
+mkdir -p "$CELL_HOME" "$CELL_REPO" "$CELL_O/logs" "$CELL_O/state" "$CELL_HARNESS"
+# ⛔ THE CELL NEEDS A PROVIDER CREDENTIAL STORE (agent-infra#2024, landed after this fixture was
+# written). `cmd_check` now refuses a box whose `$CELL_HOME/.pi/agent/auth.json` holds no usable
+# credential — "CANNOT-VERIFY IS NOT A PASS" — and a `die` lands BEFORE the recorder probe this suite
+# exists to judge, so every assertion below read FAIL for a reason that was not its subject (17 of
+# them, identically on `origin/main`). A LITERAL `api_key` is the `present` shape that script accepts
+# (`state_for`), so the fixture is certified on the dependency under test and nothing else.
+mkdir -p "$CELL_HOME/.pi/agent"
+printf '{"deepseek":{"type":"api_key","key":"fixture-not-a-real-credential"}}\n' >"$CELL_HOME/.pi/agent/auth.json"
+# cmd_check also judges DISPATCH PROVISIONING (agent-infra#1736): the target repo must carry its
+# own tools/collision_preflight.py (or resolve a tortoise checkout), else the whole cell is refused
+# as MERGE-ONLY before the recorder assertions below are ever reached — which would make them pass
+# for the wrong reason. Give the fixture its own tool so every recorder assertion is decided by the
+# recorder probe it names, not by an earlier refusal.
+mkdir -p "$CELL_REPO/tools"; printf '#!/usr/bin/env python3\n' > "$CELL_REPO/tools/collision_preflight.py"
+# ⛔ With a REAL git on the stub PATH the two trees the supervisor interrogates must BE git trees:
+# `cmd_check` asks `git -C $REPO rev-parse --git-dir` (an empty `.git` DIRECTORY is not a checkout —
+# it dies "$REPO is not a git checkout" before the recorder probe), and the provenance half asks the
+# HARNESS for `HEAD^{commit}` plus `status --porcelain` (a plain directory answers neither, so the
+# harness reads as `untracked` and DRIFT refuses the cell). Both are built here, hermetically: a
+# commit each, and a LOCAL `refs/remotes/origin/main` on the harness so HARNESS_REL is `current` with
+# no network and no reference to the operator's checkout. HARNESS_REPO is a fixture path (set in
+# cell_check/cell_start) precisely so no probe can reach the real one.
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_REPO" init -q
+# ⛔ HOST-CONFIG-PROOF, not `-c commit.gpgsign=false` alone. A global `commit.gpgsign = true` **or** a
+# global `core.hooksPath` pointing at a hook that fails (or any `init.templateDir` injecting one) makes
+# these commits die, the `update-ref` below then fails (`HEAD: not a valid SHA1`), `classify_harness`
+# reads `unknown`, and EVERY `cell_check` is refused — the whole suite reddens on a dev box while
+# staying green on CI, the mirror of the #1348/#1369 runner-only class this fixture exists to close.
+# Measured on this fixture before this change: 78 passed / 17 failed under a `core.hooksPath` global
+# config, 95/0 after. (`gpgsign = true` does not reproduce that figure any more — the round-1 fix
+# `-c commit.gpgsign=false`, replaced here, already neutralised it; that is the point of moving to the
+# host-neutral prefix, which covers the whole config rather than the one key that was noticed first.)
+# Neutralising the HOST config closes the class; the fixture's identity travels in `-c`, so nothing
+# else is lost. Every git call the fixture makes is prefixed, `init` included: a host
+# `init.templateDir` injects hooks into the new repo, and an unprefixed `init` would leave the call
+# below failing and the cell repo with no commit while every assertion still passed.
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+# ⛔ agent-infra#1901: the queue's repo is DERIVED from $REPO's `origin` remote, and a pair that
+# cannot be READ is refused — so the fixture checkout must carry one, or every `cell_check` below is
+# decided by the queue refusal instead of the recorder probe it names. `acme/widget` is the OR
+# `cell_start` already passes, so the derived and the override paths see the SAME queue.
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_REPO" remote add origin https://github.com/acme/widget.git
+cp "$HERE"/*.sh "$CELL_HARNESS/"
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_HARNESS" init -q
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_HARNESS" add -A
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_HARNESS" -c user.email=t@t -c user.name=t commit -q -m "fixture harness"
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_HARNESS" update-ref refs/remotes/origin/main HEAD
+# `cmd_check` asserts the workers are in $O; production gets them from `start`'s seed of $HARNESS.
+# ⛔ THE `*.py` HELPERS ARE DELIBERATELY NOT SEEDED, AND THE REASON IS NOT A HANG (cycle-14, measured).
+# This block used to say that seeding `check-class.py` "turns the pre-flight into a REAL controller cycle
+# that never returns (measured: a 240 s timeout)", and on that premise three passing assertions were
+# deleted so that `start`'s rc was "reported, never asserted". The premise does NOT reproduce: the fixture's
+# tmux stub only RECORDS `new-session`'s argv (the `cat > "$d/tmux"` heredoc in `mkstubs` — grep the
+# `new-session)` case; this block's own rule is never to cite a line number) and never runs it, and service mode
+# (`cloud-cell-supervisor.sh` — the `exec bash "$HARNESS/orch-loop.sh"` arm) is not taken, so no loop can
+# hang. Measured on this fixture with the helper seeded: `start_rc=0` in ALL THREE arms and `118 passed /
+# 0 failed` either way IN THE FILE AS IT STOOD THEN — `121 passed / 0 failed` at this head, which adds the
+# executed floor's two rows, the behavioural non-zero row, and changes no arm's result.
+# ⛔ AND HERE IS THE REASON, IN ONE CLAUSE — because the paragraph above only REFUTES the old one and then
+# stops, which leaves a reader told that a justification exists and unable to find it (#3774 review, P2;
+# and “a premise stated without its reason” is precisely how the three deleted assertions happened):
+# NOTHING IN THIS FIXTURE READS `check-class.py`. The controller loop is the only consumer that would
+# import the classifier, and that loop is never entered — the same two facts as above (the tmux stub does
+# not RUN what it records, and service mode is not taken). So the seeding question is FIXTURE WEIGHT, not
+# pass/fail: a seeded helper would be a file no assertion in this suite ever touches. Measured again at this
+# head, seeding is also harmless (`121 passed / 0 failed` seeded, `121 passed / 0 failed` unseeded), so this
+# is a stated trade and not a premise the next cycle has to re-derive.
+# ⛔ SERVICE MODE IS PINNED OFF, NOT MERELY ABSENT (review P1 on #3774, measured). The sentence above used
+# to claim `ORCH_FOREGROUND` "is never set" — that was WRONG, and it mattered: the fixture does not set it
+# but did not NEUTRALISE it either, so it was INHERITED, and on a fleet cell it IS `1`
+# (`templates/systemd/eldato-orchestrator.service:62` `Environment=ORCH_FOREGROUND=1`, inherited by every
+# lane shell through the tmux server — `scripts/cloud-cell-quiesce.sh:279`). Under the inherited value the
+# foreground arm is taken, `orch-loop.sh` exits 78, and these very assertions go RED with `start_rc=78`
+# (measured: 115 passed / 3 failed here, against 115/0 for `origin/main` — the file this PR starts from,
+# i.e. POST-#3760). The PRE-#3760 file is 98/17, but those 17 are not ONE cause: #3760 closed THREE
+# co-located fixture gaps (`python3` stubbed as `exit 0`, a missing provider store at `auth.json`, and the
+# ambient-`GH_REPO` unset) — the bare pre-#3760 figure measures the first two, and deleting ONLY the `unset`
+# from `origin/main`'s otherwise-fixed file also gives 98/17. So the box would decide the result — the same
+# class this file already neutralises for `GH_REPO` at `:40`.
+# So `cell_start` now PINS `ORCH_FOREGROUND=0`, the idiom every other `start` caller already uses for exactly
+# this reason (`watchdog-loop.sh:1046`, `orchestrator-bringup.sh:1037`, `cloud-cell-quiesce.sh:286`, #2402),
+# and an inherited `=1` cannot ride in.
+# ⛔ AND THE THIRD INPUT OF THAT SAME CLASS IS PINNED TOO (#3774 review, P2): `MIN_FREE_MB`. The paragraph
+# above is a claim about inherited inputs generally, and this one could still decide the result — the
+# supervisor reads it with an AMBIENT DEFAULT (`cloud-cell-supervisor.sh`'s
+# `MIN_FREE_MB="${MIN_FREE_MB:-500}"`) and `die`s below the floor (the `below the ${MIN_FREE_MB}MB floor`
+# line in `cmd_check_disk`), which BOTH `start` and `check` reach through that one call. Measured without
+# the pin: `MIN_FREE_MB=99999999 bash <this file>` reddens the whole-start assertion with `start_rc=1` and
+# 15 of the suite's rows in total, including at least nine beyond it — a red for a reason that is not this
+# suite's subject. With `MIN_FREE_MB=1`
+# in both callers' `env` lines, an inherited floor cannot ride in, exactly as for `GH_REPO` at the top.
+# So the rc is ASSERTED again — the only whole-`start` success assertion KIND in this suite. There are three,
+# and they are the `ck "… SUCCEEDED …" "$start_rc"` calls: each passes the start's OWN rc, and each sits
+# directly BELOW a provision probe that asserts a DIFFERENT `$rc`. ⛔ That adjacency is why no line number is
+# given here: this block previously cited them as `:363`/`:377`/`:389` and then `:364`/`:378`/`:390`, and BOTH
+# were wrong inside one commit — the first named the probes, and the "fix" named the probe's `[ -x … ]`
+# guard, because editing the comment above had shifted every line it pointed at. Grep for the LABEL, never
+# the number. And without this assertion
+# a `start` that provisions the recorder and then `die`s (a failing `cmd_check` after the seed, a failing
+# `start_doctor_loop`) passes every arm here — a regression this suite exists to catch, hiding behind a
+# comment about a timeout that cannot happen.
+# ⛔ The BINDING is asserted too (#3774 review, P2-2): every capture is preceded by `unset start_rc`, so under
+# `set -u` a dropped `start_rc="$rc"` ABORTS instead of letting that arm's assertion grade the PREVIOUS arm's
+# `0`. Measured before the pin: deleting one arm's assignment left a `start` that dies only on the second
+# call green, with no failure anywhere.
+cp "$HERE"/*.sh "$CELL_O/"
+mkstubs "$CELL_STUBS"
+RECORDER="$CELL_HOME/.pi/agent/scripts/record-review.sh"
+mkdir -p "$(dirname "$RECORDER")"
+printf '#!/bin/bash\nexit 0\n' > "$RECORDER"; chmod +x "$RECORDER"
+# The recorder's DECLARED SIBLING (#1362): record-review.sh resolves its diff normalizer from its own
+# directory, so cmd_check refuses a cell that has the recorder without it — and `start` provisions the
+# pair together, exactly as pi-bootstrap/setup.sh's lib farm does.
+RECORDER_LIB="$CELL_HOME/.pi/agent/scripts/lib/diff-normalize.py"
+mkdir -p "$(dirname "$RECORDER_LIB")"
+printf '#!/usr/bin/env python3\n' > "$RECORDER_LIB"; chmod +x "$RECORDER_LIB"
+
+cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's stub PATH
+  # `MIN_FREE_MB=1`: same class as `-u OR` below and as `GH_REPO` at the top — `cmd_check_disk` enforces
+  # this floor with an ambient default, so it is PINNED rather than inherited (see the header).
+  # ⛔ `-u OR` is agent-infra#1901's hermeticity requirement, not an aesthetic: `OR` is now a
+  # VALIDATED input (the queue's repo, derived from the fixture checkout's remote unless declared),
+  # so a developer's ambient OR would be held against this fixture's `acme/widget` remote and every
+  # arm below would be decided by the queue refusal instead of the recorder probe it names.
+  env -u OR -u SCOPE -u AI_REVIEW_GATE_KEY MIN_FREE_MB=1 \
+    PATH="$CELL_STUBS" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" REPO="$CELL_REPO" \
+    O="$CELL_O" HARNESS="$CELL_HARNESS" ENV_FILE="$CELL/absent.env" \
+    HARNESS_REPO="$CELL_HARNESS" HARNESS_REF=origin/main HARNESS_FETCH=0 \
+    "$BASH_BIN" "$SUP" check 2>&1
+}
+cell_start() { # cell_start — drive the SHIPPED `start` with a tmux stub that records the session
+  mkdir -p "$CELL/tmstate"
+  # `ORCH_FOREGROUND=0` and `MIN_FREE_MB=1` are PINNED, not merely unset: both are inputs the shipped
+  # supervisor reads with an ambient default, so on a fleet cell (or a developer box) an inherited value
+  # would decide `start`'s rc and this suite would report a red about something that is not its subject.
+  env -u AI_REVIEW_GATE_KEY SCOPE=own ORCH_FOREGROUND=0 MIN_FREE_MB=1 \
+    PATH="$CELL_STUBS" TM_STATE="$CELL/tmstate" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" \
+    REPO="$CELL_REPO" O="$CELL_O" HARNESS="$CELL_HARNESS" OR="acme/widget" \
+    ENV_FILE="$CELL/absent.env" \
+    HARNESS_REPO="$CELL_HARNESS" HARNESS_REF=origin/main HARNESS_FETCH=0 \
+    "$BASH_BIN" "$SUP" start 2>&1
+}
+certified() { case "$1" in *'CELL CAN RUN A CONTROLLER'*) return 0 ;; *) return 1 ;; esac; }
+
+# 1) NON-VACUITY: the complete fixture really is certified, so every refusal below is attributable
+# to the one dependency that was removed and not to a fixture that never passed in the first place.
+out="$(cell_check)"; rc=$?
+[ "$rc" -eq 0 ] && certified "$out" && rc=0 || { rc=1; note "rc=$rc out=$(printf '%s' "$out" | tail -3)"; }
+ck "non-vacuity: a complete cell is certified (rc=0, verdict printed)" $rc
+case "$out" in *'ok: record step present and executable'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "non-vacuity: cmd_check reports the record step it probed" $rc
+# uv stays NON-FATAL (install.sh warns for it) — the two surfaces must agree, so the warn is pinned
+# rather than left to drift into a second, disagreeing verdict.
+case "$out" in *'warn: uv missing'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "uv is a WARNING, not a refusal (agreeing with install.sh)" $rc
+
+# 2) RED→GREEN — the issue's own acceptance criterion: with record-review.sh absent, cmd_check must
+# NOT report the cell can run a controller. The pre-fix build prints the verdict and exits 0 here.
+mv "$RECORDER" "$CELL/recorder.stash"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc certified=$([ -n "$out" ] && certified "$out" && echo yes || echo no)"; }
+ck "RED→GREEN: a cell without record-review.sh is NOT certified" $rc
+case "$out" in *'record-review.sh MISSING at'*"$RECORDER"*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names the missing record-review.sh path" $rc
+case "$out" in *'provisions it from'*"$CELL_HARNESS/../record-review.sh"*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names where the recorder can be provisioned from" $rc
+
+# 3) A present-but-NOT-EXECUTABLE recorder is a different fault with a different remedy:
+# merge-one.sh executes the file directly, so mode 644 fails (126) AFTER the paid review.
+mv "$CELL/recorder.stash" "$RECORDER"; chmod 644 "$RECORDER"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc"; }
+ck "a non-executable record-review.sh is not certified" $rc
+case "$out" in *'NOT EXECUTABLE'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names executability, not absence" $rc
+chmod +x "$RECORDER"
+
+# 3c) A ZERO-BYTE recorder is the P1 shape of this same class: it IS a regular file, IS executable
+# and runs — but it exits 0 WITHOUT minting the signed marker. So the gate could never go green,
+# merge-one.sh's `rc=0` would write no park, and the loop would re-pay for a fresh review every
+# cycle: the #1717 loop with one input shifted. Presence + executability are not enough.
+: > "$RECORDER"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc certified=$([ -n "$out" ] && certified "$out" && echo yes || echo no)"; }
+ck "RED→GREEN: a ZERO-BYTE record-review.sh is not certified" $rc
+case "$out" in *'EMPTY (0 bytes)'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names the zero-byte shape, not absence or executability" $rc
+chmod +x "$RECORDER"
+
+# 3d) A DIRECTORY at the recorder path: `[ -x dir ]` is true, so a presence+executability probe
+# blesses it, merge-one.sh buys the paid review, and the record step fails 126 — the exact
+# "paid to discover it cannot run" sequence this PR closes. Require a regular file.
+rm -f "$RECORDER"; mkdir -p "$RECORDER"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc certified=$([ -n "$out" ] && certified "$out" && echo yes || echo no)"; }
+ck "a DIRECTORY at the recorder path is not certified" $rc
+case "$out" in *'NOT A REGULAR FILE'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names the non-regular-file shape" $rc
+rmdir "$RECORDER"; printf '#!/bin/bash\nexit 0\n' > "$RECORDER"; chmod +x "$RECORDER"
+# A recorder WITHOUT its declared sibling: record-review.sh resolves
+# lib/diff-normalize.py from its OWN directory; without it it silently takes the RAW pre-#1362 digest
+# arm, so every base-only `gh pr update-branch` refuses carry-forward and buys a fresh PAID review.
+# A cell certified in that state is the same false-PASS/paid-loop class this PR exists to close — one
+# step down the cost ladder — so cmd_check must refuse it and name the sibling it probed.
+mv "$RECORDER_LIB" "$CELL/normalizer.stash"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc certified=$([ -n "$out" ] && certified "$out" && echo yes || echo no)"; }
+ck "RED→GREEN: a recorder WITHOUT its sibling diff-normalize.py is not certified" $rc
+case "$out" in *'diff-normalize.py MISSING'*"$RECORDER_LIB"*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names the missing normalizer path" $rc
+case "$out" in *'provisions it from'*"$CELL_HARNESS/../lib/diff-normalize.py"*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names where the normalizer can be provisioned from" $rc
+mv "$CELL/normalizer.stash" "$RECORDER_LIB"
+
+# 3e) The SIBLING check must require a regular file too: `[ -s dir ]` is true for a non-empty
+# directory, so a directory at the normalizer path would slip past a bare `-s`.
+mv "$RECORDER_LIB" "$CELL/normalizer.stash"
+mkdir -p "$RECORDER_LIB"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc certified=$([ -n "$out" ] && certified "$out" && echo yes || echo no)"; }
+ck "a DIRECTORY at the normalizer path is not certified" $rc
+rmdir "$RECORDER_LIB"; mv "$CELL/normalizer.stash" "$RECORDER_LIB"
+
+# 4) THE SIBLINGS THE ISSUE DID NOT NAME. Each of these, absent, turns a loop step into a silent
+# no-op (python3 → an empty check classification, so no case arm matches and every PR is skipped in
+# silence) or a dead worker (pi → 127 on every review and every fixer), so each is fatal.
+for dep in git python3 pi; do
+  mv "$CELL_STUBS/$dep" "$CELL/$dep.stub"
+  out="$(cell_check)"; rc=$?
+  [ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc"; }
+  ck "a cell with no $dep is not certified" $rc
+  case "$out" in *"$dep missing on PATH"*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+  ck "the refusal names $dep" $rc
+  mv "$CELL/$dep.stub" "$CELL_STUBS/$dep"
+done
+
+# 5) `start` PROVISIONS the dependency the issue says is "checked and provisioned": the canonical
+# copy ships one directory up from the harness, exactly where recorder_src()/recorder_lib_src() look.
+# The normalizer is the recorder's DECLARED SIBLING, so both must be provisioned, preserving the
+# relative position (scripts/record-review.sh <-> scripts/lib/diff-normalize.py).
+printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
+mkdir -p "$CELL/lib"; printf '#!/usr/bin/env python3\n' > "$CELL/lib/diff-normalize.py"
+rm -f "$RECORDER" "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+unset start_rc          # ⛔ asserted, not inherited: a dropped `start_rc="$rc"` below must ABORT under
+                        # `set -u` instead of letting the NEXT arm grade this arm's stale value (#3774 review, P2-2)
+out="$(cell_start)"; rc=$?
+start_rc="$rc"          # the controller launch's own verdict; asserted directly below — see the header
+[ -x "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -x "$RECORDER" ] && echo present || echo absent) start_rc=$start_rc out=$(printf '%s' "$out" | tail -3)"; }
+ck "start provisions record-review.sh from the checkout (start_rc=$start_rc)" $rc
+ck "start itself SUCCEEDED (the controller launch is not this suite's subject, but its exit status is the whole-start verdict; start_rc=$start_rc)" "$start_rc"
+[ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
+ck "RED→GREEN: start provisions the recorder's SIBLING diff-normalize.py in lib/" $rc
+[ -f "$CELL/tmstate/cmd" ] && rc=0 || rc=1
+ck "start then reached the session launch (the provision did not abort it)" $rc
+out="$(cell_check)"; rc=$?
+[ "$rc" -eq 0 ] && certified "$out" && rc=0 || { rc=1; note "$(printf '%s' "$out" | tail -3)"; }
+ck "the provisioned cell is then certified" $rc
+# …and the SIBLING alone is provisioned when an operator's recorder copy already exists (the
+# "present but degraded" cell the lib check exists for): remove ONLY the normalizer and re-start.
+rm -f "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+unset start_rc          # see above: each arm's binding is asserted, never inherited across arms
+out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
+[ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
+ck "start provisions ONLY the missing normalizer when the recorder already exists" $rc
+ck "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
+
+# 5b) A ZERO-BYTE recorder must be RE-provisioned by `start`, not left in place: the old provision
+# ran only when the path was ABSENT, so a `cp` killed mid-write (or a full disk) would persist
+# across every restart and then be blessed by `cmd_check`. The write is atomic (tmp + mv), so a
+# concurrent reader cannot observe a half-written recorder either.
+printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
+: > "$RECORDER"          # a truncated/zero-byte operator copy
+rm -f "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+unset start_rc          # see above: each arm's binding is asserted, never inherited across arms
+out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
+[ -s "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -s "$RECORDER" ] && echo nonempty || echo empty) out=$(printf '%s' "$out" | tail -3)"; }
+ck "RED→GREEN: start re-provisions a ZERO-BYTE recorder" $rc
+ck "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
+out="$(cell_check)"; rc=$?
+[ "$rc" -eq 0 ] && certified "$out" && rc=0 || { rc=1; note "$(printf '%s' "$out" | tail -3)"; }
+ck "the re-provisioned cell is then certified" $rc
+
+# 6) …and when there is nothing to provision FROM, `start` refuses rather than creating a cell that
+# can never merge. Non-vacuity: the same invocation WITHOUT the missing source succeeds above.
+rm -f "$RECORDER" "$CELL/record-review.sh" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+# `start_rc` is captured HERE TOO, and the exemption marker sits on the SAME LINE as the call site it
+# exempts (#3774 review round 3, P2). A marker anywhere in the file would subtract from the arm count
+# without being bound to the arm it claims, so one stale marker left above a POSITIVE arm un-grades it
+# (measured: 119 passed, 0 failed, exit 0, with a positive arm carrying no whole-start verdict).
+unset start_rc
+out="$(cell_start)"; rc=$?; start_rc="$rc"     # start-arm: negative — this arm asserts the REFUSAL, not a success
+[ "$rc" -ne 0 ] && [ ! -f "$CELL/tmstate/cmd" ] && rc=0 || { rc=1; note "rc=$rc session=$([ -f "$CELL/tmstate/cmd" ] && echo created || echo none)"; }
+ck "start refuses (and creates no session) when the recorder cannot be provisioned" $rc
+case "$out" in *'cannot provision it from'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names the provisioning failure" $rc
+# ⛔ THE BEHAVIOURAL HALF (#3774 review round 3, P2). The static binding grep proves the three success rows
+# NAME `"$start_rc"`; it cannot prove `start_rc` HOLDS a real rc. Measured: rewriting `start_rc="$rc"` to
+# `start_rc=0` (every argument left byte-identical) gave GREEN, exit 0, with all three
+# success rows grading a constant — the round-1 P1 defect reached from the ASSIGNMENT instead of the
+# argument. This row is the counter-price: it runs in the one arm where `start` MUST fail, and reads the
+# same captured `start_rc` the success rows read, so a pinned value cannot satisfy both.
+ck "the REFUSING start's rc is NON-ZERO (so a pinned start_rc cannot pass the success rows)" "$([ "$start_rc" -ne 0 ] && echo 0 || echo 1)"
+
+# ══ the merge worker: a record failure is TERMINAL, and it will not re-pay ══════════════════════
+HEAD="0123456789abcdef0123456789abcdef01234567"
+PR=7
+MRG="$TMP/mrg"
+# The gate key the fixtures SIGN with and that run_merge hands the worker as AI_REVIEW_GATE_KEY.
+# The worker verifies the HMAC as well as the shape (#784), so a fixture writing a shape-only
+# `sig=<64 zeros>` line is now (correctly) a FORGERY — §8g pins that — and the happy-path fixture
+# must sign for real, exactly as record-review.test.sh's TEST_GATE_KEY does.
+TEST_GATE_KEY="test-gate-key-1717"
+
+mkmrg() { # mkmrg — a fresh merge fixture: repo, HOME with a recorder, stubs, state dirs
+  rm -rf "$MRG"
+  mkdir -p "$MRG/home/.pi/agent/scripts" "$MRG/repo" "$MRG/o/logs" "$MRG/o/state"
+  mkstubs "$MRG/stubs"
+  # python3 must be the REAL interpreter here, overriding mkstubs' exit-0 stub. merge-one.sh's step 3
+  # parses `gh pr checks --json name,state` THROUGH python3 (agent-infra#1764: the gate name became an
+  # input selected in python rather than a literal spliced into a jq program). With the exit-0 stub,
+  # json.load never runs, the gate reads EMPTY, and the worker waits the full 30 x 30s loop before
+  # exiting 4 — a fixture defect that reads as a worker hang, not as a failure.
+  p="$(command -v python3 2>/dev/null)" && ln -sf "$p" "$MRG/stubs/python3"
+  : > "$MRG/pi-count"
+  : > "$MRG/pr-body"
+}
+# A recorder REPLICA that honours record-review.sh's ACTUAL contract: it SIGNS the marker text with
+# the gate key and posts it into the PR body — the artifact ai-review-gate reads. `rc=0` alone is
+# not that artifact (the fail-open §8f pins). It signs LIVE, over its own $1/$2, rather than baking a
+# fixed digest in: that is what makes §8g meaningful, because a faithful signer and a forger emit the
+# SAME shape and only the HMAC tells them apart. The gh stub above serves this file back for
+# `pr view --json body`.
+mkrecorder_posts() {
+  cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+txt="review recorded: reviews/\$1.json verdict=clean @ \$2 (acme/widget)"
+sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "\$sig" >> '$MRG/pr-body'
+exit 0
+EOF
+  chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+}
+# The SAME replica on a box that CANNOT SIGN: with no key (or no openssl) `record-review.sh` posts an
+# UNSIGNED marker — the ` sig=` field is simply ABSENT — and still exits 0. That is the shape the
+# guard's key/tool arms exist for, and the ONLY shape that can distinguish a candidate-first order
+# from a key-first one: when the line is signed-but-unverifiable the candidate list is non-empty, so
+# the candidate arm is skipped and the key arm fires under EITHER order. (Reviewer B, final pass:
+# §8i passed on the very revision it was written to pin until this replica replaced the signing one.)
+mkrecorder_unsigned() {
+  cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget)\n' "\$1" "\$2" >> '$MRG/pr-body'
+exit 0
+EOF
+  chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+}
+# Drive the SHIPPED merge-one.sh. `pi`, `gh` and `git` are EXPORTED SHELL FUNCTIONS, not file stubs:
+# merge-one.sh prepends /opt/homebrew/bin and /usr/local/bin to PATH itself, so a file stub could be
+# shadowed by a real binary on another box — and a real `pi` here would be a live, paid model call
+# against a real `gh`. A function wins over any PATH lookup, and the subshell keeps it out of the
+# rest of this suite.
+run_merge() { # run_merge [script] — default: the SHIPPED worker. An argument drives a MUTANT copy.
+  local script="${1:-$MERGE}"
+  (
+    # NB: the function bodies must NOT read $HEAD/$PR — bash imports an exported function into the
+    # driven script, so those names are the SCRIPT's globals, and an unset $HEAD would print an
+    # empty head (which makes every park assertion vacuous). Dedicated names only.
+    pi() { [ -n "${PI_COUNT:-}" ] && echo x >> "$PI_COUNT"; printf '%s\n' "${FAKE_VERDICT:-CLEAN https://github.com/acme/widget/pull/${FAKE_PR}#issuecomment-12345}"; }
+    gh() {
+      case "$*" in
+        *"pr view"*headRefOid*)
+          # FAKE_HEAD_SEQ (when set) is a space-separated WALK of successive head reads, the last
+          # value repeating. A CONSTANT cannot express the transition that matters below: the head
+          # moving BETWEEN the reviewed-head read ($HEAD, :188) and the LIVE_HEAD read the marker
+          # guard performs (:1211) — the one shape in which the record is minted for a head that is
+          # no longer the PR's.
+          if [ -n "${FAKE_HEAD_SEQ:-}" ]; then
+            fahead_n=0
+            [ -f "${FAKE_HEAD_SEQ_FILE:-}" ] && fahead_n="$(cat "$FAKE_HEAD_SEQ_FILE" 2>/dev/null || echo 0)"
+            fahead_n=$((fahead_n + 1))
+            printf '%s\n' "$fahead_n" > "${FAKE_HEAD_SEQ_FILE:-/dev/null}" 2>/dev/null || true
+            printf '%s\n' $FAKE_HEAD_SEQ | awk -v n="$fahead_n" 'NR <= n { v = $0 } END { print v }'
+            return 0
+          fi
+          printf '%s\n' "$FAKE_HEAD"; return 0 ;;
+        *"pr view"*body*) cat "$FAKE_BODY_FILE" 2>/dev/null; return 0 ;;
+        # Step 3 reads the gate as `gh pr checks --json name,state | python3`, and compares the
+        # STATE of the row whose name is the repo's gate (agent-infra#1764: the name is an input,
+        # not a literal). Plain text makes json.load fail, the gate reads EMPTY, and the worker then
+        # waits 30 x 30s before exiting 4 — so the mock must emit the row it parses.
+        *"pr checks"*) printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n'; return 0 ;;
+        # The repo's merge contract (agent-infra#1764): merge-one.sh now resolves the required checks
+        # from branch protection at runtime, and an UNREADABLE read is refused (exit 5) BEFORE the
+        # record step this suite drives — so the mock must ANSWER it or every check below passes for
+        # the wrong reason. This is the POST-jq shape (one bare context per line, as
+        # `--jq '.contexts[]'` prints) and it carries the gate, so the suite keeps exercising GATE
+        # mode; the same stub shape main's own test-crossbox.sh uses for the same reason.
+        *required_status_checks*)
+          case "$*" in
+            *'.contexts[]'*) printf 'ai-review-gate\n' ;;
+            *)               printf '{"contexts":["ai-review-gate"]}' ;;
+          esac; return 0 ;;
+        *) return 0 ;;
+      esac
+    }
+    git() { return 0; }
+    export -f pi gh git
+    env PATH="$MRG/stubs" HOME="$MRG/home" O="$MRG/o" AI_REVIEW_GATE_KEY="${FAKE_KEY_OVERRIDE-$TEST_GATE_KEY}" \
+      PI_COUNT="$MRG/pi-count" FAKE_HEAD="${FAKE_HEAD_OVERRIDE-$HEAD}" FAKE_HEAD_SEQ="${FAKE_HEAD_SEQ:-}" \
+      FAKE_HEAD_SEQ_FILE="$MRG/head-seq" FAKE_PR="$PR" FAKE_VERDICT="${FAKE_VERDICT:-}" \
+      FAKE_BODY_FILE="$MRG/pr-body" \
+      "$BASH_BIN" "$script" "$MRG/repo" acme/widget "$PR" fix/x
+  ) 2>&1
+}
+pi_calls() { # the number of times the stubbed worker runtime was executed
+  local n=0
+  [ -f "$MRG/pi-count" ] && n="$(grep -c x "$MRG/pi-count" 2>/dev/null | head -1)"
+  printf '%s' "${n:-0}"
+}
+
+# 7) RED→GREEN — a recorder that EXISTS but FAILS. This is the issue's exact sequence: the paid
+# review runs, the record step fails, and the pre-fix `exit 3` left no marker at all.
+mkmrg
+printf '#!/bin/bash\nexit 127\n' > "$MRG/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"
+[ -f "$MRG/o/state/parked-$PR" ] && rc=0 || { rc=1; note "no parked-$PR; log: $(tail -3 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
+ck "RED→GREEN: a record-step failure writes the terminal marker" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null) head=$HEAD"; }
+ck "the marker is keyed to the reviewed head (the controller's exact comparison)" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'rc=127'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the reason file says WHY (the failing rc), so the park is actionable" $rc
+grep -q 'PARKED' "$MRG/o/logs/merge-$PR.log" && rc=0 || rc=1
+ck "the worker's own log records the PARKED terminal state" $rc
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || rc=1
+ck "a failed record does not fall through to the merge" $rc
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls)"; }
+ck "the review that was already paid for is not abandoned mid-flight" $rc
+# …and the park holds at the WORKER, not only in the controller: chain-<N> and fix-one.sh invoke
+# merge-one.sh directly and never consult the controller's parked guard, so a second run at the
+# same head must re-review NOTHING. This is the "rather than retrying" half of the acceptance test.
+out="$(run_merge)"; rc2=$?
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a parked head was re-reviewed"; }
+ck "a second run at the parked head does not re-pay for a review" $rc
+[ "$rc2" -eq 5 ] && rc=0 || { rc=1; note "rc=$rc2"; }
+ck "the refusal to re-review exits with its own code (5), not a generic failure" $rc
+grep -q 'refusing to re-review' "$MRG/o/logs/merge-$PR.log" && rc=0 || rc=1
+ck "the refusal says it is refusing, and names the way out" $rc
+
+# 7b) A transient `gh` blip after a park must NOT overwrite the park's reason. The unresolvable-head
+# branch also calls park(), and it runs BEFORE the already-parked guard; with HEAD empty it writes no
+# `parked-<PR>` marker, but an unconditional `parkreason` write would replace the real cause with
+# "could not resolve head". When gh recovers the worker matches the park, exits 5, and the exit-5 log
+# — the only remedy surfaced on the chain-<N>/fix-one.sh paths — would name the wrong cause.
+out="$(FAKE_HEAD_OVERRIDE='' run_merge)"; rc=$?
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null) head=$HEAD"; }
+ck "a gh blip after a park does not move the park marker" $rc
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a blip paid for a review"; }
+ck "a gh blip after a park does not re-pay for a review" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'rc=127'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null) — the transient blip clobbered it";; esac
+ck "RED→GREEN: a gh blip does not clobber the original park reason" $rc
+# …and once gh recovers, the refusal still reports the ORIGINAL cause, not the transient blip.
+out="$(run_merge)"; rc2=$?
+[ "$rc2" -eq 5 ] && rc=0 || { rc=1; note "rc=$rc2"; }
+ck "the refusal after a recovered blip still exits 5" $rc
+grep -q 'reason: .*rc=127' "$MRG/o/logs/merge-$PR.log" && rc=0 || { rc=1; note "$(tail -1 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
+ck "the exit-5 refusal names the original reason, not the transient blip" $rc
+
+# 7c) A push MOVES the head, so the PR re-arms (the controller's guard compares only the head) and
+# the worker must park at the NEW head with a reason that describes THAT head's failure. Keeping the
+# previous head's reason beside a new head would tell the operator the wrong cause — the same
+# wrong-cause defect 7b closes on the blip path, reached the other way.
+HEAD2="89abcdef0123456789abcdef0123456789abcdef"
+out="$(FAKE_HEAD_OVERRIDE="$HEAD2" run_merge)"; rc=$?
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD2" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null) head2=$HEAD2"; }
+ck "a moved head re-parks at the NEW head" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *"head=$HEAD2"*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null) — stale reason from the previous head";; esac
+ck "RED→GREEN: the re-park's reason names the NEW head, not the stale one" $rc
+
+# 8) RED→GREEN — the recorder is MISSING entirely. This must be caught BEFORE the paid review, not
+# after it: that is what turns an unbounded paid loop into one cheap refusal per PR.
+mkmrg
+out="$(run_merge)"
+[ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a review was paid for with no recorder"; }
+ck "RED→GREEN: a missing recorder is caught BEFORE the paid review" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "a missing recorder still reaches the terminal state" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'MISSING at'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the reason names the missing path" $rc
+
+# 8d) RED→GREEN — a recorder that EXISTS but is EMPTY. It is executable and exits 0 without
+# minting the signed marker, so the pre-fix `[ ! -e ]`/`[ ! -x ]` probe admits it, the worker takes
+# `rc=0`, writes NO park, waits out the gate and exits 4 — one paid review per cycle forever. Refuse
+# it BEFORE the paid review, exactly like the missing case.
+mkmrg
+: > "$MRG/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a review was paid for with an empty recorder"; }
+ck "RED→GREEN: an EMPTY recorder is caught BEFORE the paid review" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "an empty recorder reaches the terminal state (no silent rc=0 fall-through)" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'EMPTY (0 bytes)'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the reason names the zero-byte shape, so the park is actionable" $rc
+
+# 8e) …and a DIRECTORY at the recorder path is refused the same way (`[ -x dir ]` is true).
+mkmrg
+mkdir -p "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a review was paid for with a directory at the recorder path"; }
+ck "a DIRECTORY at the recorder path is caught BEFORE the paid review" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'NOT A REGULAR FILE'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the reason names the non-regular-file shape" $rc
+
+# 8b) A CLEAN verdict with NO comment URL is the ONE terminal state a human reaches with no in-band
+# route out: the controller `continue`s past the PR at that head, and merge-one.sh's own `exit 5`
+# refusal (the log line that carries the remedy elsewhere) never runs on the controller path. So the
+# parkreason itself must name BOTH the manual re-record command (the reviewer usually posted the
+# comment; only the verdict line lacked the URL) and the unpark invocation — exactly like the
+# MISSING / NOT-EXECUTABLE / record-failed siblings do.
+mkmrg
+printf '#!/bin/bash\nexit 0\n' > "$MRG/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(FAKE_VERDICT='CLEAN (review posted above; URL unavailable)' run_merge)"
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *"record-review.sh $PR $HEAD clean"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the no-URL park names the manual re-record command" $rc
+case "$reason" in *"rm -f '$MRG/o/state/parked-$PR' '$MRG/o/state/parkreason-$PR'"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the no-URL park names the unpark invocation (the way out)" $rc
+
+# 8c) RED→GREEN — an UNRESOLVABLE HEAD is the same class of pre-review dependency as the recorder.
+# `gh pr view` swallows its failure, so a transient API/network blip leaves HEAD empty; the pre-fix
+# flow STILL paid for the whole review (and, with a recorder that exits 0, even reached the merge
+# with an empty head). record-review.sh refuses a non-40-hex sha, and park() cannot key a marker to
+# an empty head, so the controller re-paid every cycle — the paid loop #1717 removes. Refuse BEFORE
+# the review, and name the way out. Non-vacuity: the same fixture with a resolvable head runs one
+# review and merges (section 9).
+mkmrg
+printf '#!/bin/bash\nexit 0\n' > "$MRG/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(FAKE_HEAD_OVERRIDE='' run_merge)"; rc=$?
+[ "$rc" -ne 0 ] && rc=0 || { rc=1; note "rc=$rc out=$(printf '%s' "$out" | tail -3)"; }
+ck "RED→GREEN: an empty head is refused (non-zero exit)" $rc
+[ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a review was paid for with an unresolvable head"; }
+ck "RED→GREEN: an empty head is caught BEFORE the paid review" $rc
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "the empty-head run fell through to the merge"; }
+ck "an empty head does not fall through to the merge" $rc
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'could not resolve'*'head'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the refusal names the unresolvable head" $rc
+case "$reason" in *"rm -f '$MRG/o/state/parked-$PR' '$MRG/o/state/parkreason-$PR'"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the unresolvable-head reason names the way out" $rc
+# …and a head that is present but NOT a 40-char lower-hex sha is the same refusal (the
+# `head_sha must be a full 40-char hex sha` refusal in record-review.sh — cited by SYMBOL, not by
+# line: a line number in a comment re-stales on the next unrelated edit, and five of the citations
+# this test added had already drifted before they were committed), not a review that can never be
+# recorded.
+out="$(FAKE_HEAD_OVERRIDE='deadbeef' run_merge)"; rc=$?
+[ "$rc" -ne 0 ] && [ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "rc=$rc pi calls=$(pi_calls)"; }
+ck "a non-40-hex head is refused before the paid review" $rc
+out="$(FAKE_HEAD_OVERRIDE='0123456789ABCDEF0123456789ABCDEF01234567' run_merge)"; rc=$?
+[ "$rc" -ne 0 ] && [ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "rc=$rc pi calls=$(pi_calls)"; }
+ck "a non-lowercase head is refused before the paid review (record-review.sh's exact shape)" $rc
+
+# 8f) RED→GREEN — `rc=0` IS NOT PROOF THE SIGNED MARKER REACHED THE PR BODY. record-review.sh posts
+# the marker BEST-EFFORT and never fails the record, so it has reachable rc=0 paths with NO post
+# (the body GET/PATCH failed, or gh/repo is unavailable). The pre-fix worker trusted rc=0, saw
+# gate=SUCCESS (the stub), and MERGED — so this fails on the pre-fix tree. The signed marker is the
+# only artifact the gate reads, so its absence must be the same terminal failure as a non-zero rc.
+mkmrg
+printf '#!/bin/bash\nexit 0\n' > "$MRG/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls)"; }
+ck "a rc=0 record still pays for exactly one review" $rc
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "rc=0 with no marker fell through to the merge"; }
+ck "RED→GREEN: rc=0 with NO signed marker does not merge" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "RED→GREEN: rc=0 with NO signed marker writes the terminal park" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'NO signed marker'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the no-marker park names the missing signed marker" $rc
+# …and at an UNCHANGED head the hand re-record IS the remedy, so it must still be printed — with the
+# pin, which verifies there. This is the other direction of §8p: the discrimination that stops the
+# stale-mint park prescribing a refused command must not silence the command where it works.
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *"record it by hand (record-review.sh $PR $HEAD clean"*'--expect-head'*"$HEAD)"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the no-marker park at an UNCHANGED head still prints the PINNED hand re-record" $rc
+case "$reason" in *'the head MOVED after this run'*) rc=1; note "an unchanged head was reported as moved: $reason";; *) rc=0 ;; esac
+ck "an evidence-post failure at an unchanged head is NOT reported as a head move" $rc
+out="$(run_merge)"; rc2=$?
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a parked no-marker head was re-reviewed"; }
+ck "a parked no-marker head does not re-pay on the next run" $rc
+[ "$rc2" -eq 5 ] && rc=0 || { rc=1; note "rc=$rc2"; }
+ck "the no-marker park refuses re-review with exit 5" $rc
+
+# 8g) RED→GREEN — a marker with the RIGHT SHAPE but a FORGED SIGNATURE is NOT evidence (#784). The
+# PR body is attacker-WRITABLE, so a guard matching only `sig=[0-9a-f]{64}` reads green on this body,
+# never parks, and exits 4 at the gate — one paid review per cycle forever, reopened by the very
+# artifact the guard reads. Only the HMAC can tell a forged line from a signed one, and this case is
+# non-vacuous: on the shape-only worker (`8fcb3715`) the same body MERGES — §8g, §8i and §8k are
+# the cases that fail there, and these three checks are §8g's share. §9 — NOT this case — is what
+# fails when the signature is verified against the WRONG TEXT (e.g. the whole line including
+# ` sig=`), because there the honest marker is rejected too; here a forged line mismatches under
+# either text. (No total is embedded here on purpose: a count in the file re-stales the moment a
+# case is added. The measured figures belong in the PR body, which is a dated record.)
+mkmrg
+cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "0000000000000000000000000000000000000000000000000000000000000000" >> '$MRG/pr-body'
+exit 0
+EOF
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "a forged sig fell through to the merge"; }
+ck "RED→GREEN: a forged (shape-only) marker does not merge" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "RED→GREEN: a forged marker writes the terminal park" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'VERIFIES against its signature'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the forged-marker park says the SIGNATURE did not verify" $rc
+
+# 8h) COVERAGE — a GENUINELY signed marker for a DIFFERENT head is not evidence for THIS head. The
+# signature is valid, so HMAC verification alone accepts it; what rejects it is the head anchor in
+# the match (`@ $LIVE_HEAD`). A marker is a claim about ONE revision, and accepting a replayed one
+# would let evidence for an unreviewed tree satisfy the guard at the live head.
+# ⓘ NON-DISCRIMINATING REGRESSION PIN. Head anchoring PRE-DATES this change, so this case also
+# passes on the PR's previous head (`8fcb3715`, the shape-only guard) — it is NOT evidence for this
+# delta. (It does fail on `origin/main`, where no marker match existed at all.) It is kept because an
+# edit that dropped the anchor while adding the HMAC would otherwise go unnoticed.
+OTHER_HEAD="89abcdef0123456789abcdef0123456789abcdef"
+mkmrg
+cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+txt="review recorded: reviews/\$1.json verdict=clean @ $OTHER_HEAD (acme/widget)"
+sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "$OTHER_HEAD" "\$sig" >> '$MRG/pr-body'
+exit 0
+EOF
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "a marker signed for another head fell through to the merge"; }
+ck "a correctly-signed marker for a DIFFERENT head does not merge" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "a replayed (wrong-head) marker writes the terminal park" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *"NO signed marker for head=$HEAD"*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the wrong-head park names the head it could not find evidence for" $rc
+
+# 8i) RED→GREEN — a marker that is present but UNVERIFIABLE (no key on this box) is not evidence
+# either, and the park must name THAT cause rather than blame the post: with no key the post can
+# succeed, exit 0, and still be worthless, because an unsigned marker is one ai-review-gate rejects.
+# The recorder replica is the UNSIGNED one, deliberately — see its comment above. Measured against
+# the pre-PR worker: these checks FAIL there (the shape-only guard needed no key, so it merged).
+mkmrg
+mkrecorder_unsigned
+out="$(FAKE_KEY_OVERRIDE='' run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "an unverifiable marker fell through to the merge"; }
+ck "an unverifiable marker (no key) does not merge" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'NO AI_REVIEW_GATE_KEY'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the no-key park names the missing KEY, not a missing post" $rc
+# The remedy must match the cause. The recorder resolves the key exactly as this worker does, so
+# "record it by hand" re-posts an unsigned marker from the same box — the keyless park must prescribe
+# PROVISIONING, and must NOT carry the post-blame clause that belongs to the no-candidate arm.
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'Provision the key'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the no-key park prescribes provisioning the key" $rc
+case "$reason" in *'best-effort'*) rc=1; note "the keyless park blames the evidence post: $reason";; *) rc=0 ;; esac
+ck "the no-key park does not blame the evidence post" $rc
+
+# 8j) REGRESSION PIN — an EARLIER shape-matching line that does not verify must not VETO a later line
+# that does. record-review.sh APPENDS its marker, so after a gate-key rotation the body carries the
+# old-key marker for the CURRENT head FIRST and the valid one after it. Verifying only the first
+# match parked that head even though `ai-review-gate` itself reads it GREEN — a stranded merge whose
+# printed remedy (unpark, re-record, retry) parks identically, because the recorder appends rather
+# than replaces.
+# ⓘ NOT RED→GREEN against the pre-PR tree, and it must not be read as evidence for the HMAC
+# hardening: the shape-only guard accepted on ANY matching line, so it merges there too. What it is
+# is a REGRESSION PIN on the ANY-LINE width — it merges here and on the pre-PR guard, and it would
+# PARK a first-match-only form, which is also why the widening is well-founded: `ai-review-gate`
+# itself passes when ANY candidate verifies.
+mkmrg
+cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "$(printf '%064d' 0)" >> '$MRG/pr-body'
+txt="review recorded: reviews/\$1.json verdict=clean @ \$2 (acme/widget)"
+sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "\$sig" >> '$MRG/pr-body'
+exit 0
+EOF
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"
+[ -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "log: $(tail -3 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
+ck "a stale first marker does not veto a valid later one (no stranded merge)" $rc
+[ ! -f "$MRG/o/state/parked-$PR" ] && rc=0 || rc=1
+ck "the valid later marker writes no park" $rc
+
+# 8k) STRUCTURAL — a signature that cannot be VERIFIED must name the missing TOOL as its own cause
+# rather than blame the evidence post: the recorder uses the same `command openssl`, so on an
+# openssl-less box it posts an UNSIGNED marker and the candidate list is EMPTY — meaning a
+# candidate-first order would report "NO signed marker … the post failed" and prescribe a re-record
+# that re-posts another unsigned marker. merge-one.sh therefore tests the key and the tool BEFORE the
+# candidate list, and this pins both the probe and its reason.
+# ⚠️ STATED LIMITATION: this is a STRUCTURAL check, not a behavioural one. The branch cannot be staged
+# in this suite because merge-one.sh prepends `/opt/homebrew/bin:/usr/local/bin` to PATH itself, so
+# `openssl` resolves on any dev box however the fixture arranges its stub directory. It is reachable
+# on a cell that genuinely lacks the tool; this suite cannot create one.
+# (All three checks below also FAIL on the shape-only worker, where the probe and the ordering do not
+# exist — so they are non-vacuous pins, not mere text checks.)
+grep -q 'command -v openssl' "$MERGE" && rc=0 || { rc=1; note "$MERGE does not probe openssl"; }
+ck "the worker probes openssl before trusting a signature (its own cause, not 'post failed')" $rc
+grep -q 'openssl IS NOT INSTALLED' "$MERGE" && rc=0 || { rc=1; note "no park reason names a missing openssl"; }
+ck "a missing openssl has its own named park reason" $rc
+# ⛔ THE ORDER IS THE FINDING, not merely the presence of a probe. When the recorder has no openssl
+# it posts an UNSIGNED marker, so the candidate list is EMPTY — and a tool probe placed AFTER the
+# candidate arm is therefore unreachable on exactly the path its own rationale names, leaving the
+# park to report "NO signed marker … the post failed" and prescribe a re-record that re-posts
+# another unsigned marker. The key/tool arms must precede the candidate arm.
+ml="$(grep -n 'command -v openssl' "$MERGE" | head -1 | cut -d: -f1)"
+ca="$(grep -n -- '-z "$MARK_CAND"' "$MERGE" | head -1 | cut -d: -f1)"
+[ -n "$ml" ] && [ -n "$ca" ] && [ "$ml" -lt "$ca" ] && rc=0 \
+  || { rc=1; note "openssl probe at line '${ml:-none}', candidate arm at '${ca:-none}' — the probe must come FIRST"; }
+ck "the key/tool arms precede the candidate arm (wrong-cause ordering)" $rc
+
+# ══ the --expect-head pin's TWO rc=3 refusals, driven through the SHIPPED worker ═════════════
+# #2572 pins the mint; the CLASSIFICATION of the recorder's two pin refusals is implemented TWICE
+# (`scripts/review-pr.sh` and this worker, deliberately — each is shipped standalone) and until this
+# section only the first copy was executed. `tests/review-pr/run.sh` proves the two LITERALS still
+# match the producer's text, and `producer_names_literals` over this file does the same here; neither
+# runs a line of the worker. So a future edit that swapped the arms, dropped the `-eq 3` guards, or
+# re-keyed the split onto the FLAG's presence would ship with CI green and re-introduce the paid-review
+# defect this pin exists to stop: a gh/API transport blip classified as "a FRESH review is owed" is a
+# second PAID run (REVIEW_TIMEOUT = 1800 s) for a head nobody disputed.
+#
+# The two literals are the producer's OWN words, quoted from `scripts/record-review.sh` (the moved-head
+# refusal and the could-not-verify refusal), and `tests/review-pr/run.sh` §A3(5) greps the producer for
+# both — so a reword on either side turns CI RED instead of silently re-grading.
+PIN_MOVED_TEXT='--expect-head: the PR head is 89abcdef0123456789abcdef0123456789abcdef, NOT the 0123456789abcdef0123456789abcdef01234567 you named'
+PIN_UNCHECK_TEXT='--expect-head: could not verify the PR head against 0123456789abcdef0123456789abcdef01234567'
+# mkrecorder_refuses <exit-rc> <stderr text> — a recorder replica that refuses exactly like the
+# producer does: names the pin, writes nothing, exits non-zero.
+mkrecorder_refuses() {
+  { printf '#!/bin/bash\n'
+    printf 'printf "%%s\\n" %q >&2\n' "$2"
+    printf 'exit %s\n' "$1"
+  } > "$MRG/home/.pi/agent/scripts/record-review.sh"
+  chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+}
+
+# 8l) the head genuinely MOVED inside the review window: the recorder refuses the pin (rc=3), so the
+# verdict's SUBJECT moved and a FRESH review is owed. The opposite remedy here is not a typo — it is a
+# stale verdict carried onto a head nobody read, or (the shipped pre-fix behaviour) a hand re-record the
+# pin then refuses.
+mkmrg
+mkrecorder_refuses 3 "$PIN_MOVED_TEXT"
+out="$(run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "a moved-head refusal fell through to the merge"; }
+ck "RED→GREEN: a moved-head pin refusal does not merge" $rc
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'MOVED between the review and the record'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "RED→GREEN: the moved-head park NAMES the head move" $rc
+case "$reason" in *'a FRESH review at the new head is owed'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the moved-head park prescribes a FRESH REVIEW (the only remedy that can work)" $rc
+case "$reason" in *'Re-run the RECORD'*) rc=1; note "the moved-head park prescribes the TRANSPORT remedy: $reason";; *) rc=0 ;; esac
+ck "RED→GREEN: a head move is NOT answered with the transport remedy (the two arms are not merged)" $rc
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls)"; }
+ck "the moved-head refusal re-pays for NOTHING (the review already ran)" $rc
+
+# 8m) the pin could NOT be CHECKED: a gh/API transport failure left the PR's live head unreadable.
+# THE HEAD DID NOT MOVE and the artifact this lane paid for is still valid AT it, so the remedy is to
+# RE-RUN THE RECORD — never a second paid review (#1717).
+mkmrg
+mkrecorder_refuses 3 "$PIN_UNCHECK_TEXT"
+out="$(run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "an uncheckable-pin refusal fell through to the merge"; }
+ck "RED→GREEN: an uncheckable-pin refusal does not merge" $rc
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'could NOT CHECK the --expect-head pin'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "RED→GREEN: the uncheckable-pin park NAMES the transport cause" $rc
+case "$reason" in *'Re-run the RECORD'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "RED→GREEN: the uncheckable-pin park prescribes re-running the RECORD, not a review" $rc
+case "$reason" in *'MOVED between the review and the record'*) rc=1; note "an unreadable head was reported as a MOVE: $reason";; *) rc=0 ;; esac
+ck "RED→GREEN: a transport failure is NOT reported as a head move" $rc
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a transport blip bought a review"; }
+ck "an uncheckable pin re-pays for NOTHING (no second PAID run for an undisputed head)" $rc
+
+# 8n) MUTATION — the pre-fix classifier keyed on the FLAG's presence (`grep -q -- '--expect-head'`),
+# which merges the two arms because BOTH print the flag. Widen the moved literal to the flag name in a
+# COPY of the shipped worker: the UNCHECKABLE stub must then take the WRONG arm. §8m is what breaks, so
+# the split is proven to be the producer's words and not the flag's presence.
+mkmerge_mutant() { # mkmerge_mutant <sed-expression> — a copy of the shipped worker with ONE edit
+  rm -rf "$TMP/mut"; mkdir -p "$TMP/mut"
+  # ⛔ EVERY SIBLING MODULE THE WORKER RESOLVES FROM ITS OWN DIRECTORY MUST SIT BESIDE THE COPY.
+  # It sources `$SELF/gate-policy.sh` (fatal, exit 78) and `_M1_HERE/repo-authority.sh` (fatal, exit 1
+  # — written to the LOG, not stdout), so a copy alone dies at startup and reads as "the mutant
+  # produced no park", i.e. as a failed mutation rather than as a missing fixture file. SYMLINKED so
+  # the mutant differs from the shipped worker in EXACTLY the sed edit below and nothing else.
+  for f in "$HERE"/*.sh; do
+    case "$(basename "$f")" in merge-one.sh) continue ;; esac
+    ln -s "$f" "$TMP/mut/$(basename "$f")"
+  done
+  sed "$1" "$MERGE" > "$TMP/mut/merge-one.sh"
+  chmod +x "$TMP/mut/merge-one.sh"
+  ! cmp -s "$MERGE" "$TMP/mut/merge-one.sh"    # 0 = the edit LANDED (a no-op sed would pass vacuously)
+}
+mkmrg
+mkrecorder_refuses 3 "$PIN_UNCHECK_TEXT"
+if mkmerge_mutant "s/^      PIN_MOVED_LIT='--expect-head: the PR head is '$/      PIN_MOVED_LIT='--expect-head'/"
+then
+  out="$(run_merge "$TMP/mut/merge-one.sh")"
+  case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in
+    *'MOVED between the review and the record'*) rc=0 ;;
+    *) rc=1; note "the mutant did not take the moved arm: $(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" ;;
+  esac
+else
+  rc=1; note "the mutation did not land (the PIN_MOVED_LIT line did not match)"
+fi
+ck "MUTATION: keying the split on the flag name merges the two arms (§8m breaks) — the split is the producer's words" $rc
+
+# 8o) MUTATION — the `rc -eq 3` GUARD is load-bearing. A recorder that prints the moved words but exits
+# 1 is NOT the producer's content refusal (exit 3 is that code, uniquely — exit 8's "nothing was
+# posted" invariant is not available here and exit 1 is a generic fault), so the shipped worker must
+# fall to its named-rc arm. Delete the guard in a copy and it takes the moved arm instead: a real
+# fault is then re-graded as "a head move", whose remedy (a fresh PAID review) is the wrong one.
+mkmrg
+mkrecorder_refuses 1 "$PIN_MOVED_TEXT"
+out="$(run_merge)"; rc=$?
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'failed rc=1'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "an rc≠3 carrying the moved words falls to the named-rc arm (rc=3 is the content refusal)" $rc
+case "$reason" in *'MOVED between the review and the record'*) rc=1; note "a generic fault was re-graded as a head move: $reason";; *) rc=0 ;; esac
+ck "a generic recorder fault is not reported as a head move" $rc
+mkmrg
+mkrecorder_refuses 1 "$PIN_MOVED_TEXT"
+if mkmerge_mutant 's/if \[ \$rc -eq 3 \] && grep -qF -- "\$PIN_MOVED_LIT"/if grep -qF -- "$PIN_MOVED_LIT"/'
+then
+  out="$(run_merge "$TMP/mut/merge-one.sh")"
+  case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in
+    *'MOVED between the review and the record'*) rc=0 ;;
+    *) rc=1; note "the mutant did not take the moved arm: $(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" ;;
+  esac
+else
+  rc=1; note "the mutation did not land (the -eq 3 guard line did not match)"
+fi
+ck "MUTATION: dropping the rc=3 guard re-grades a generic fault as a head move" $rc
+
+# 8p) the marker arm has TWO causes too (#2988 P3): a MISSING marker at an UNCHANGED head is a failed
+# evidence post, whose remedy is a hand re-record — and the pin verifies there. A missing marker after
+# the head MOVED is not that: the record was minted for the reviewed head, so the printed re-record
+# names a sha the pinned recorder then REFUSES. The remedy would be a command that cannot work, in the
+# one file this PR exists to stop printing them from. Driven through the SHIPPED worker with the head
+# walking $HEAD → HEAD2 across its two reads (see FAKE_HEAD_SEQ).
+HEAD2F="89abcdef0123456789abcdef0123456789abcdef"
+mkmrg
+mkrecorder_posts
+out="$(FAKE_HEAD_SEQ="$HEAD $HEAD2F" run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "a record minted for a STALE head fell through to the merge"; }
+ck "RED→GREEN: a record minted for a head the PR has left does not merge" $rc
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'the head MOVED after this run'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "RED→GREEN: the stale-mint park says the head moved after the mint (not 'the post failed')" $rc
+case "$reason" in *"a FRESH review at head=$HEAD2F is owed"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the stale-mint park names the head the fresh review is owed at" $rc
+case "$reason" in *'record it by hand'*) rc=1; note "the stale-mint park prescribes a re-record the PIN refuses: $reason";; *) rc=0 ;; esac
+ck "RED→GREEN: the stale-mint park does NOT prescribe the unpinnable hand re-record" $rc
+
+# 9) NON-VACUITY for the whole park arm: with a recorder that SUCCEEDS the worker proceeds to the
+# merge, so the terminal state is a response to the failure and not a blanket refusal to merge.
+# The recorder must POST the signed marker (not merely exit 0) — that is now the precondition the
+# worker checks before the gate, so a `: > /dev/null` stub would park and this would be vacuous.
+mkmrg
+mkrecorder_posts
+out="$(run_merge)"
+[ -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "log: $(tail -3 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
+ck "non-vacuity: a successful record reaches MERGED" $rc
+[ ! -f "$MRG/o/state/parked-$PR" ] && rc=0 || rc=1
+ck "non-vacuity: a successful record writes no park" $rc
+[ "$(pi_calls)" = "1" ] && rc=0 || rc=1
+ck "non-vacuity: exactly one review is run on the happy path" $rc
+
+# 9b) COVERAGE — the marker the signer emits in PRODUCTION carries `diff=<64hex>`
+# (record-review.sh's `MARKER="review recorded: …"` construction — again cited by symbol, not by
+# line), and no other case drives that shape through the guard: `mkrecorder_posts`
+# posts the legacy no-`diff=` form. A later tightening of the pattern that breaks the diff-bearing
+# line would otherwise stay green here while every honest merge parked in production. It is the `.*`
+# between the head and `sig=` that admits both forms — this pins it.
+DIFFH="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+mkmrg
+cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+txt="review recorded: reviews/\$1.json verdict=clean @ \$2 diff=$DIFFH (acme/widget)"
+sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+printf 'review recorded: reviews/%s.json verdict=clean @ %s diff=$DIFFH (acme/widget) sig=%s\n' "\$1" "\$2" "\$sig" >> '$MRG/pr-body'
+exit 0
+EOF
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"
+[ -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "log: $(tail -3 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
+ck "a DIFF-BEARING marker (the production shape) merges" $rc
+[ ! -f "$MRG/o/state/parked-$PR" ] && rc=0 || rc=1
+ck "a diff-bearing marker writes no park" $rc
+
+# ══ the controller's own park: the reason must move with the marker ══════════════════════════
+# 10) `parkreason-<PR>` is the only in-band remedy a human sees (merge-one.sh's exit-5 refusal prints
+# it, and the chain-<N>/fix-one.sh paths read nothing else). The controller used to write
+# `parked-<PR>` at its three park sites and NEVER touch the reason, so a park at a NEW head (after a
+# push moved the old one) left the OLD head's reason beside it — the operator was told to
+# "re-provision the recorder" for a PR parked for an unrelated cause. Drive the shipped helper and
+# require the pair to move together, and require every controller site to use it.
+LOOP="$HERE/orch-loop.sh"
+[ -x "$LOOP" ] || { echo "❌ missing $LOOP"; exit 1; }
+sed -n '/^park_ctrl() {/,/^}/p' "$LOOP" > "$TMP/parkctrl.sh"
+[ -s "$TMP/parkctrl.sh" ] && rc=0 || { rc=1; note "park_ctrl() is not in the shipped orch-loop.sh"; }
+ck "RED→GREEN: the controller has a park helper that writes marker+reason together" $rc
+if [ -s "$TMP/parkctrl.sh" ]; then
+  (
+    set -u; PR=7; O="$TMP/ctrl"; mkdir -p "$O/state"
+    # a park from an EARLIER head, with its own (now stale) reason
+    printf '%s\n' "old-head" > "$O/state/parked-$PR"
+    printf '%s\n' "recorder MISSING at the old head" > "$O/state/parkreason-$PR"
+    # shellcheck disable=SC1090
+    . "$TMP/parkctrl.sh"
+    park_ctrl "$PR" "$HEAD" "still CONFLICTING after 3 fixes"
+  )
+  [ "$(cat "$TMP/ctrl/state/parked-7")" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$TMP/ctrl/state/parked-7" 2>/dev/null)"; }
+  ck "park_ctrl moves the marker to the new head" $rc
+  case "$(cat "$TMP/ctrl/state/parkreason-7" 2>/dev/null)" in *'still CONFLICTING'*) rc=0 ;; *) rc=1; note "reason=$(cat "$TMP/ctrl/state/parkreason-7" 2>/dev/null) — the stale reason survived";; esac
+  ck "RED→GREEN: park_ctrl REPLACES a stale reason from an earlier head" $rc
+  case "$(cat "$TMP/ctrl/state/parkreason-7" 2>/dev/null)" in *'recorder MISSING'*) rc=1 ;; *) rc=0 ;; esac
+  ck "the stale reason does not survive beside the new marker" $rc
+fi
+# …and every controller park site must go THROUGH that helper: a bare `> parked-$PR` write anywhere
+# would reintroduce the stale-reason defect at that site. (The guarded read at the top of the sweep
+# is a `cat`, not a write, so it does not match.)
+bare="$(grep -cE '>[[:space:]]*"\$O/state/parked-\$PR"' "$LOOP")"
+[ "$bare" = "0" ] && rc=0 || { rc=1; note "$bare controller site(s) still write parked-\$PR directly"; }
+ck "no controller park site writes parked-\$PR without its reason" $rc
+
+# ⛔ THE EXECUTED FLOOR FOR THE WHOLE-`start` ASSERTIONS (#3774 review, P2). This PR's own thesis is that
+# #3760 deleted these three assertions and NOTHING reddened, and the restored lines are on their own
+# exactly as deletable — measured BEFORE this floor existed, neutralising only the three
+# `ck "…SUCCEEDED…" "$start_rc"` calls returned `115 passed, 0 failed`, exit 0, the identical #3760 state.
+# With the floor, that same edit reddens one row: `117 passed, 1 failed`, exit 1. So the expectation is
+# DERIVED from this file, not declared as a figure, and it is derived THREE ways plus one behavioural row,
+# because no single derivation covers both failure modes (every figure below MEASURED on this head):
+#   1. EXPECTED, from the CALL SITES. Every `cell_start` invocation is either a POSITIVE arm (captures
+#      `start_rc` and asserts it SUCCEEDED) or a declared NEGATIVE arm (the `# start-arm: negative` marker,
+#      §6). Derived from the call sites and NOT from the `unset start_rc` idiom (#3774 review round 2, P2):
+#      an arm written in §6's shape (`out="$(cell_start)"; rc=$?`, no marker) moved NEITHER side of an
+#      idiom-derived count, so it landed green — the count tracked a convention, not the arms.
+#   2. EXECUTED + BOUND. The first half is the counter `ck` bumps, which proves the assertion RAN. The second
+#      is a SOURCE grep for assertions that grade `"$start_rc"`, which proves the verdict was not replaced
+#      by a constant — `ck "…SUCCEEDED…" 0` still executes and still counts, so the counter alone cannot see
+#      it (#3774 review round 2, P1).
+#      The BEHAVIOURAL row — `the REFUSING start's rc is NON-ZERO`, in §6 where `start` MUST fail — closes the
+#      one thing no grep can see: a pinned ASSIGNMENT. A grep sees the argument's spelling; the counter sees
+#      the call; neither sees `start_rc=0` replacing `start_rc="$rc"`. Reading the same captured value in the
+#      one arm that must produce non-zero makes a pin unsatisfiable in both directions at once.
+#   3. CAPTURED. A third source grep requires every `cell_start` call site to capture `start_rc="$rc"`
+#      (`#3774 review round 3, P2`). Without it, pinning ONE arm's capture to `start_rc=0` — arguments and
+#      labels untouched — still graded a constant (measured: `121 passed, 0 failed`: the behavioural row
+#      read §6's OWN capture, which the per-arm pin did not touch).
+#   4. THE MARKER IS BOUND TO ITS SITE. `# start-arm: negative` must sit on the SAME LINE as the call site it
+#      exempts (`#3774 review round 3, P2`). As a file-wide count it subtracted from the expectation without
+#      being tied to any arm, so one stale marker above a POSITIVE arm un-graded it (measured: `119 passed, 0
+#      failed`, exit 0, with a positive arm carrying no whole-start verdict).
+# Derived rather than hard-coded on purpose: this file's labelling rule already records that a stated COUNT
+# re-stales, and a hard-coded 3 would have to be bumped by hand on the next arm. Adding an arm moves the
+# call-site side; adding it WITHOUT an assertion (or with a constant) moves nothing else, which is the point.
+# The `^[[:space:]]*[^#]*` prefix keeps prose that merely MENTIONS the call out of the count, while still
+# matching a call in ANY statement position (`out=$(...)`, `if out=$(...)`, ...): the earlier
+# `^[[:space:]]*out=` form counted a TEXTUAL shape, so an arm written `if out="$(cell_start)"; then` landed
+# ungraded and green (#3774 review round 3, P2, measured: `121 passed, 0 failed`).
+start_sites="$(grep -cE '^[[:space:]]*[^#]*\$\(cell_start\)' "$SELF" 2>/dev/null || true)"
+start_neg="$(grep -cE '\$\(cell_start\).*# start-arm: negative' "$SELF" 2>/dev/null || true)"
+case "$start_sites" in ''|*[!0-9]*) start_sites=-1 ;; esac
+case "$start_neg" in ''|*[!0-9]*) start_neg=-1 ;; esac
+start_arms=$((start_sites - start_neg))
+[ "$start_sites" -gt 0 ] && [ "$start_arms" -gt 0 ] && rc=0 || { rc=1; note "could not read the arm count from $SELF (got '$start_sites' cell_start call site(s), '$start_neg' declared negative) — an unverifiable floor FAILS CLOSED, it is not a pass"; }
+ck "the executed floor's expected count is readable ($start_arms positive arm(s), $start_neg negative, of $start_sites cell_start call site(s))" $rc
+start_bound="$(grep -cE '^[[:space:]]*ck ".*SUCCEEDED.*" "\$start_rc"[[:space:]]*(#.*)?$' "$SELF" 2>/dev/null || true)"
+case "$start_bound" in ''|*[!0-9]*) start_bound=-1 ;; esac
+start_capture="$(grep -cE '^[[:space:]]*[^#]*start_rc="\$rc"' "$SELF" 2>/dev/null || true)"
+case "$start_capture" in ''|*[!0-9]*) start_capture=-1 ;; esac
+[ "$start_bound" -eq "$start_arms" ] && [ "$start_rc_asserted" -eq "$start_arms" ] && [ "$start_capture" -eq "$start_sites" ] && rc=0 || { rc=1; note "$start_rc_asserted whole-start assertion(s) RAN, $start_bound BIND \$start_rc, $start_capture of $start_sites call site(s) CAPTURE start_rc=\$rc, for $start_arms positive arm(s) — a deleted assertion, a CONSTANT argument (the label still counts), a CONSTANT capture (the argument and label still match), or an arm added without one, leaves this row red"; }
+ck "every arm's whole-start verdict is CAPTURED (from rc), ASSERTED (executed) AND BOUND (graded from \$start_rc, not a constant)" $rc
+
+echo
+echo "==> $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

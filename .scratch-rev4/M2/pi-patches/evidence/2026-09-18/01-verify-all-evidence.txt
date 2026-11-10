@@ -1,0 +1,143 @@
+
+[1m──── 1/4  patch state + clamp behaviour against the LIVE bundle (change b) ────[0m
+pi-patches check — pi-coding-agent 0.85.1 / pi-ai 0.85.1
+  manifest: /Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fix/1214-pi-clamp-output-floor/scripts/pi-patches/manifests/0.85.1/manifest.json
+  pi root:  /Users/danielospina/.local/share/pi-node/node-v22.23.2-darwin-arm64/lib/node_modules/@earendil-works/pi-coding-agent
+  = b1-clamp-floor-esm — already applied
+  = b2-clamp-floor-bundle-http — already applied
+  = b3-clamp-floor-bundle-bedrock — already applied
+  = c1-recovery-field-esm — already applied
+  = c2-recovery-reset-user-esm — already applied
+  = c3-recovery-reset-success-esm — already applied
+  = c4-recovery-cap-esm — already applied
+  = c5-recovery-increment-esm — already applied
+  = c6-recovery-field-bundle — already applied
+  = c7-recovery-reset-user-bundle — already applied
+  = c8-recovery-reset-success-bundle — already applied
+  = c9-recovery-cap-bundle — already applied
+  = c10-recovery-increment-bundle — already applied
+✅ all replacements present — the fix is in place
+
+[1m──── 2/4  a failed compaction leaves a DURABLE session-file entry (change a) ────[0m
+VERIFY (a) — a failed compaction leaves a DURABLE session-file entry
+  pi root:        /Users/danielospina/.local/share/pi-node/node-v22.23.2-darwin-arm64/lib/node_modules/@earendil-works/pi-coding-agent
+  session writer: dist/core/session-manager.js (installed)
+  extension:      ~/.pi/agent/extensions/compaction-watchdog.ts (shipped, #1215)
+
+  RAW SESSION-FILE LINE (read back off disk):
+  {"type":"custom","customType":"compaction-watchdog","data":{"kind":"compaction-failed","sessionId":"01a0b5a5-56f0-76e9-8e8a-7b0f33265243","sessionFile":"/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/pi-patch-a-hEXkB0/sessions/2026-09-18T17-51-46-928Z_01a0b5a5-56f0-76e9-8e8a-7b0f33265243.jsonl","cwd":"/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/pi-patch-a-hEXkB0","ts":1700000000000,"model":{"provider":"deepseek","id":"deepseek-flash","contextWindow":300000},"detail":{"reason":"overflow","errorMessage":"Context overflow recovery failed: Summarization failed: generation hit the token cap and the summary is incomplete","willRetry":false,"fromExtension":false}},"id":"a6135d3b","parentId":"6dd5d493","timestamp":"2026-09-18T17:51:46.931Z"}
+  RAW FILE ENTRY COUNT: 3 (header + 2)
+
+  ✅ FAILED COMPACTION: session file exists on disk  — <tmp>/sessions/2026-09-18T17-51-46-928Z_01a0b5a5-56f0-76e9-8e8a-7b0f33265243.jsonl
+  ✅ FAILED COMPACTION: a durable entry IS written  — custom[compaction-watchdog] count=1
+  ✅ FAILED COMPACTION: the entry is a session-level record with an id  — id=a6135d3b
+  ✅ FAILED COMPACTION: the entry names the failure kind  — kind=compaction-failed
+  ✅ FAILED COMPACTION: the entry carries the reason + error text a recovery script needs  — reason=overflow
+  ✅ ABORTED COMPACTION: session file exists on disk  — <tmp>/sessions/2026-09-18T17-51-46-932Z_01a0b5a5-56f4-76e9-8e8a-7b10620a0c3b.jsonl
+  ✅ ABORTED COMPACTION: NO entry is written  — custom[compaction-watchdog] count=0
+  ✅ COMPACTION WITHOUT ERROR TEXT: session file exists on disk  — <tmp>/sessions/2026-09-18T17-51-46-933Z_01a0b5a5-56f5-76e9-8e8a-7b123af6d1e8.jsonl
+  ✅ COMPACTION WITHOUT ERROR TEXT: NO entry is written  — custom[compaction-watchdog] count=0
+
+✅ (a) VERIFIED — the failure is durable, and the controls stay silent
+
+✅ change (a) holds
+
+[1m──── 3/4  the upgrade-proof extension guard (change b, extension layer) ────[0m
+
+planFloorRepair — the boundary
+  ✅ max_tokens: 1 → raised to the floor (the death case)
+  ✅ max_tokens: 16 → raised (the openai-responses floor)
+  ✅ max_tokens: 0 → raised
+  ✅ NEGATIVE CONTROL max_tokens: 17 → untouched
+  ✅ NEGATIVE CONTROL healthy max_tokens: 8192 → untouched
+  ✅ NEGATIVE CONTROL no known ceiling field → untouched
+  ✅ NEGATIVE CONTROL non-object payloads → untouched (fail closed)
+  ✅ NEGATIVE CONTROL a non-numeric ceiling → untouched
+
+field resolution
+  ✅ resolves the field the provider will actually send
+  ✅ resolves nested Bedrock / Google ceilings
+  ✅ fixed field order — max_tokens wins over max_completion_tokens
+  ✅ a low but usable caller cap is honoured when the floor is lowered
+
+applyFloorRepair
+  ✅ does not mutate the caller's payload
+  ✅ preserves every sibling field
+  ✅ repairs a nested ceiling without dropping siblings
+
+before_provider_request handler
+[clamp-output-floor] output ceiling was about to go out as 1 (max_tokens); raised to 1024 context=296000/300000. The provider will reject the request if the prompt is genuinely too long — that is loud and recoverable; asking for 1 token(s) is not.
+  ✅ THE FIX: a 1-token request leaves with a usable ceiling
+[clamp-output-floor] output ceiling was about to go out as 1 (max_tokens); raised to 1024 context=296000/300000. The provider will reject the request if the prompt is genuinely too long — that is loud and recoverable; asking for 1 token(s) is not.
+  ✅ the repair is recorded in the session file and the fleet log
+  ✅ loud ONCE per session — a repair loop does not spam the pane
+[clamp-output-floor] output ceiling was about to go out as 1 (max_tokens); raised to 1024 context=296000/300000. The provider will reject the request if the prompt is genuinely too long — that is loud and recoverable; asking for 1 token(s) is not.
+  ✅ a new session re-arms the announcement
+  ✅ NEGATIVE CONTROL a healthy turn returns undefined and records NOTHING
+  ✅ unreadable context usage does not stop the repair
+  ✅ gate: CLAMP_OUTPUT_FLOOR=0 registers nothing
+
+source-patch self-check
+  ✅ resolvePiRoot realpaths the pi SHIM before stripping dist/bundle
+  ✅ resolvePiRoot honors an explicit PI_ROOT
+  ✅ detectSourcePatch reports PRESENT on this install (the patch is applied)
+  ✅ NEGATIVE CONTROL detectSourcePatch reports ABSENT for an unpatched bundle
+
+✅ 26 passed, 0 failed
+
+✅ change (b) extension layer holds
+
+[1m──── 4/4  the shipped detector is still green (change a, #1215 — untouched by this patch) ────[0m
+TAP version 13
+
+# gate + pure classifiers
+  ✅ gate defaults ON; COMPACTION_WATCHDOG=0 is the only opt-out
+  ✅ contextTokensFromUsage uses totalTokens then the component sum
+  ✅ requestTokensFromUsage: request-side sum, then totalTokens - output, else 0
+  ✅ CONTEXT_SAFETY_TOKENS is pi's 4096 reserve
+  ✅ compactionFailureRecord: non-abort with errorMessage records; abort does not
+  ✅ classifyPayloadMaxTokens: every API's ceiling field, exact fire rules
+  ✅ classifyAssistantTurn: not length / unreadable usage → no verdict
+  ✅ classifyAssistantTurn: the request side decides (floor, Responses band, below-band)
+  ✅ FIX A — a LARGE non-clamped cap saturated by the turn is NOT a clamp death
+
+# signal 1 — session_compact_failed
+  ✅ non-abort failure writes session entry + fleet log + inbox + notify
+  ✅ FIX D — a null-identity session's notify omits the impossible recover command
+  ✅ aborted compaction records NOTHING (an abort is not a failure)
+
+# signal 2 — message_end clamp death
+  ✅ length + output 1 + total >= cw-4096 → clamp-death, clampFired true, exactly once
+  ✅ length + output BELOW the reserve → NOT a death verdict (no record at all)
+  ✅ T4: length + unreadable/absent usage writes ZERO entries and ZERO log/inbox lines
+  ✅ two DIFFERENT sessions each get their own clamp-death record (no cross-session collapse)
+  ✅ session_start clears the latch so a switch/fork cannot suppress a later death
+  ✅ FIX C — session_start reason 'reload' does NOT clear the latch; a real boundary does
+  ✅ a message from a DIFFERENT model is not graded against this session's window
+  ✅ a message from the session's OWN model is graded normally, and named in the detail
+  ✅ FIX B — message.model matches the session; a differing responseModel does NOT downgrade
+  ✅ missing positive contextWindow → clampFired 'unknown' (still recorded)
+  ✅ legitimate length stop with output above floor → NO record
+
+# signal 3 — before_provider_request pre-death alarm
+  ✅ max_tokens 1 → clamp-imminent, latched once per session
+  ✅ a DIFFERENT session still fires, via the alias field
+  ✅ max_output_tokens 16 (the Responses floor) → clamp-imminent
+  ✅ 0 / >ceiling / absent payload field → NO record
+
+# fail-loud independence
+[compaction-watchdog] appendEntry sink failed (compaction-failed): appendEntry exploded
+  ✅ a throwing appendEntry does NOT suppress log/inbox/notify
+[compaction-watchdog] notify sink failed (compaction-failed): no tui
+  ✅ a throwing notify does not suppress the durable sinks
+
+# T6 — gate controls registration
+  ✅ COMPACTION_WATCHDOG=0 registers NO handlers; unset registers exactly the expected set
+
+# tests 30
+# pass 30
+# fail 0
+
+✅ the #1215 watchdog suite still holds
+
+[1m✅ ALL EVIDENCE HOLDS[0m — the clamp death is fixed and the guard is armed.
