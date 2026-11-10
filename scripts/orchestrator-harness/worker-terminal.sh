@@ -1340,7 +1340,14 @@ if mode=="liveness" and not isinstance(d.get("terminals"),list):
     sys.exit(3)
 ws={w.get("id"):(w.get("name") or "") for w in d.get("workspaces",[]) or []}
 tabs={t.get("id"):t.get("content_id") for t in d.get("tabs",[]) or []}
-run={t.get("id"):bool(t.get("running")) for t in d.get("terminals",[]) or []}
+# ⛔ A RECORD THAT IS PRESENT BUT DOES NOT STATE LIVENESS IS NOT AN EXITED ONE (review P1).
+# `bool(t.get("running"))` mapped an ABSENT `running` key to `False`, i.e. to "this terminal exited",
+# so a build that renamed the field (`"state": "running"`, measured as the review's repro) made every
+# tab read as NOT RUNNING — the accounting below then passed (no `None`, no `True`) and `idle` — the one
+# value the sweep DELETES on — was assigned for a workspace that may be live. The census tolerates an
+# absent key in the SAFE direction elsewhere (`wt_tree_probe` reads it dead, which costs a re-spawn);
+# in this path it decides a deletion, so absence is `None` (UNREADABLE) and `exit(3)` is taken below.
+run={t.get("id"):(bool(t.get("running")) if "running" in t else None) for t in d.get("terminals",[]) or []}
 seen=[]
 # ⛔ LIVENESS MODE IS PER WORKSPACE, NOT PER SCREEN (agent-infra#2312 fix-round review, reproduced).
 # `screens` is MANY-TO-ONE on `workspace_id` — a workspace holds panes/tabs, each carrying its own

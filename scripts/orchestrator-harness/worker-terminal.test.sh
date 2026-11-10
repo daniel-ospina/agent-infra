@@ -3012,6 +3012,24 @@ case "${5:-}" in
     CMUX_TREE_JSON='{"workspaces":[{"id":"ws_b","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_b","layout":{"root":{"tab_ids":["t1"]}}},{"id":"s2","workspace_id":"ws_b","layout":{"root":{"tab_ids":["t2"]}}}],"tabs":[{"id":"t1","content_id":"term_A"},{"id":"t2","content_id":"term_B"}],"terminals":[{"id":"term_A","running":false},{"id":"term_B","running":false}]}' \
       wt_sweep_idle_workspaces "lane-7"
     printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  staterename)
+    # ⛔ A RECORD THAT IS PRESENT BUT DOES NOT STATE LIVENESS (review P1 of this round, reproduced):
+    # `bool(t.get("running"))` read an ABSENT `running` key as `False` = "this terminal EXITED", so a
+    # build that renamed the field (here `"state": "running"`) made the accounting PASS and `idle` — the
+    # one value the sweep deletes on — be assigned for a workspace that may be live.
+    unset CMUX_WS_STATE
+    CMUX_TREE_JSON='{"workspaces":[{"id":"ws_live","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_live","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_1"}],"terminals":[{"id":"term_1","state":"running"}]}' \
+      wt_sweep_idle_workspaces "lane-7"
+    printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  twoscreensempty)
+    # ⛔ `empty` MUST OUTRANK `idle` ACROSS SCREENS (mutation check, 2026-11-10): one screen whose terminal
+    # EXITED and one with NO tab at all (a create in flight on a second screen of the same workspace). The
+    # idle screen comes FIRST, so an aggregation that only lets `live` win leaves `idle` standing and the
+    # sweep deletes a workspace another spawn is filling. `emptyws` cannot see that: it is one screen.
+    unset CMUX_WS_STATE
+    CMUX_TREE_JSON='{"workspaces":[{"id":"ws_1","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_1","layout":{"root":{"tab_ids":["t1"]}}},{"id":"s2","workspace_id":"ws_1","layout":{"root":{}}}],"tabs":[{"id":"t1","content_id":"term_a"}],"terminals":[{"id":"term_a","running":false}]}' \
+      wt_sweep_idle_workspaces "lane-7"
+    printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
 esac
 SH
 
@@ -3096,6 +3114,14 @@ case "$out" in *"rm_calls=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…while a wholly idle workspace is removed ONCE, not once per screen" $rc
 case "$out" in *"remove 1 idle workspace"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…and the count says 1 workspace, never 2, for one address" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s5" "$TMP/cmux2s5.log" staterename 2>&1)"
+case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "⛔ a terminal record that does not STATE liveness is UNREADABLE, not exited — a renamed field removes nothing" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s9" "$TMP/cmux2s9.log" twoscreensempty 2>&1)"
+case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "⛔ 'empty' outranks 'idle' ACROSS screens: a create in flight on a second screen spares the workspace" $rc
 
 # NON-VACUITY: the sweep must be REACHED from both ends of a worker's life, not merely defined.
 grep -q '^    wt_sweep_idle_workspaces "$name"$' "$LIB" && rc=0 || rc=1
