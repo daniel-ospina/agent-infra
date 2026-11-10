@@ -358,8 +358,8 @@ run_lane 81 15 "P0-blocker,harness" "crash on boot" ok 2510 b2 "$ACCT" \
 ck "B2 a lane whose gh has no credential is HELD with 74 and NO session started (rc=$LANE_RC)" $rc
 grep -q 'UNREADABLE open-PR count' "$TMP/b2.log"; rc=$?
 ck "B2b …the verdict is still the three-state UNREADABLE, not a fake OK" $rc
-grep -q 'THIS IS NOT THE LANDING RATIO' "$TMP/b2.log"; rc=$?
-ck "B2c …and the refusal says so IN CAPITALS, naming the credential" $rc
+grep -q "THIS IS NOT THE LANDING RATIO: GH_CONFIG_DIR=$TMP/nothing-else is set but holds no hosts.yml" "$TMP/b2.log"; rc=$?
+ck "B2c …and the refusal says so IN CAPITALS, AND names the credential it checked (the ambient dir, which holds nothing)" $rc
 grep -q 'Remedy: land/fix the open PRs' "$TMP/b2.log" && rc=1 || rc=0
 ck "B2d …and does NOT print the ratio remedy (acting on that meant landing PRs to fix a hosts.yml)" $rc
 grep -q 'No agent started, nothing consumed' "$TMP/b2.log"; rc=$?
@@ -379,8 +379,13 @@ ck "B2e …and still leaves the refusal readable (#2210), rather than nothing co
 rc2f=$?
 { [ "$rc2f" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "B2f no store in EITHER home ⇒ HELD (rc=$rc2f), and the pi stub never ran" $rc
-grep -q 'no gh credential for the lane' "$TMP/b2f.log"; rc=$?
-ck "B2f2 …and the refusal names the credential with the dirs it checked" $rc
+# ⛔ THE `THIS IS NOT THE LANDING RATIO:` PREFIX IS LOAD-BEARING, exactly as in B2g2/B2h2/B2i2 — and here
+# it is the ONLY thing that separates the two producers: on this path `land_backlog_exempt_note` ALSO
+# interpolates `gh_auth_cause` (`spawn-gate.sh`'s NOTE arm prints "the … read FAILED (%s)"), so the bare
+# sentence is in the log whether or not the REFUSAL carried it. Measured: with the refusal's `%s` replaced
+# by a fixed phrase this arm stayed GREEN while the REFUSED line no longer named the cause at all.
+grep -q 'THIS IS NOT THE LANDING RATIO: no gh credential for the lane' "$TMP/b2f.log"; rc=$?
+ck "B2f2 …and the REFUSAL names the credential with the dirs it checked (the NOTE prints the same cause, so the prefix is what makes this the refusal's)" $rc
 grep -q '\[gh-auth\] state=none' "$TMP/b2f.log"; rc=$?
 ck "B2f3 …and the lane log carries state=none, so the land-backlog line is not the only evidence" $rc
 
@@ -388,12 +393,17 @@ ck "B2f3 …and the lane log carries state=none, so the land-backlog line is not
 # `state=account at …`, exported an inert config dir, and then asserted "the lane's gh IS credentialed" over
 # a lane whose every gh call fails (measured: gh resolves the whitespace INSTEAD of any store). The account
 # home is REALly populated here on purpose: the arm's job is that the store is NOT claimed.
-# ⛔ THE GREP MUST MATCH A STRING ONLY THE REFUSAL PRINTS. `gh_auth_log` emits `${d} is set but BLANK`
-# on EVERY lane (`gh-auth.sh:302`, printed at `:318`) and `gh_auth_cause` emits the same words, so a bare
-# `grep -q 'GH_TOKEN is set but BLANK'` matched the LOG LINE and could not see a refusal that dropped the
-# cause entirely — measured: replacing the refusal's `%s` with a fixed phrase in `spawn-gate.sh` left the
-# suite at 75/0 with no arm red. The `THIS IS NOT THE LANDING RATIO:` prefix exists only on the refusal,
-# so the arm now measures the sentence the operator reads. B2g2/B2h2/B2i2 carry it.
+# ⛔ THE GREP MUST MATCH A STRING ONLY THE REFUSAL PRINTS. TWO producers emit these words, and only one of
+# them is the refusal: `gh_auth_log`'s `token-blank)` arm builds `why="${d} is set but BLANK, …"` and prints
+# it on the `[gh-auth] state=…` line, and `gh_auth_cause`'s `token-blank)` arm prints the same opening
+# words — so a bare `grep -q 'GH_TOKEN is set but BLANK'` matched the LOG LINE and could not see a refusal
+# that dropped the cause entirely. Measured: replacing the refusal's `%s` with a fixed phrase in
+# `spawn-gate.sh` left the suite at 75/0 with no arm red. The `THIS IS NOT THE LANDING RATIO:` prefix
+# exists only on the refusal, so the arm now measures the sentence the operator reads.
+# ⛔ CITED BY SYMBOL, NOT BY LINE: the first cut of this comment cited `gh-auth.sh:302`/`:318`, and the
+# header edit in the SAME commit shifted them to 304/320 before the comment was even committed (caught at
+# review). A line number in a comment about claim-accuracy is itself a claim that rots; the arm names and
+# the quoting above do not. B2g2/B2h2/B2i2 (token-blank) and B2f2 (none) carry the prefix.
 run_lane 81 15 "P0-blocker,harness" "crash on boot" ok 2518 b2g "$ACCT" GH_TOKEN='   '
 { [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "B2g a blank-but-set GH_TOKEN is HELD (rc=$LANE_RC) even though the account home HAS a store, and no session ran" $rc
