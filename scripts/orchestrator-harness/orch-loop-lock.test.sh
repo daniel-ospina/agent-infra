@@ -284,8 +284,9 @@ _TRAP_SIGS_AWK='
         # the splice spells close-quote, escaped apostrophe, open-quote, and counting all three inverts
         # the parity for good (fresh review of #3865 at 8952f89c8, P2 — MEASURED both ways: an action
         # containing a splice parsed to TERM and left every replaced-releaser arm GREEN, and a CORRECT
-        # releaser containing a splice parsed UNKNOWN and red FOUR arms (the UNKNOWN arm is one of them
-        # because _TERM_AWK passes an UNKNOWN registration straight through). Both were regressions from the
+        # releaser containing a splice parsed UNKNOWN and red FOUR arms — the fourth is the INT/TERM
+        # TERMINATES arm, because _TERM_AWK passes an UNKNOWN registration straight through (MEASURED:
+        # removing that pass-through leaves the SIGNAL-LIST arm red and this one green). Both were regressions from the
         # skip this commit introduced, and the earlier note claiming a splice "keeps the parity right"
         # was the false claim that hid them). Inside the span a backslash is literal for single quotes
         # and an escape for double ones, so quotes are counted the way the shell reads them. No quote
@@ -369,6 +370,16 @@ _TRAP_SIGS_AWK='
 # (blank, `;`, `&`, `|`, `(`, `)`, `<`, `>`), and NEVER inside single or double quotes. One
 # implementation, shared by every scan (`trap_regs`, `trap_reg_total`, `trap_pin`), so the counts the
 # accounting arm compares cannot be stripped by two different rules.
+# ⛔ AND A BACKSLASH OUTSIDE QUOTES ESCAPES THE CHARACTER AFTER IT, SO `\ #` DOES NOT START A COMMENT
+# (measured by this lane, same class as the finding above — fail-OPEN false PASS). The metacharacter set
+# alone still cut at the `#` in `echo a\ #b; trap 'true' EXIT`: the space before it IS a textually
+# metacharacter, but an ESCAPED space is part of the WORD, so bash keeps reading the word and never sees
+# a comment — `bash -c 'trap "echo FIRST" EXIT; echo a\ #b; trap "echo SECOND" EXIT'` prints only
+# SECOND (MEASURED, bash 5.2.21), i.e. the registration REPLACES the releaser and the lock stays on disk.
+# Appending that line to the subject left the suite at `PASS=189 FAIL=0` (MEASURED at b696888eb), so the
+# pair AGREED beside a replaced releaser exactly as in the finding above. The escape is now consumed with
+# the character it escapes and `prev` is left as the BACKSLASH, which is not a metacharacter, so the `#`
+# that follows an escaped blank is KEPT.
 # ⏳ STATED LIMIT: this is a lexical strip, so an escaped quote inside a double-quoted string
 # (`"a \" #b"`) is tracked, but a `#` inside a `$( … )` command substitution is kept (bash would strip
 # a comment there) — fail-CLOSED, a false RED on a spelling no subject here uses.
@@ -383,6 +394,7 @@ _strip_comments() {
           if (c == q) q = ""
           out = out c; prev = c; continue
         }
+        if (c == "\\") { out = out c; if (i < n) { i++; out = out substr($0, i, 1) }; prev = c; continue }
         if (c == sq || c == "\"") { q = c; out = out c; prev = c; continue }
         if (c == "#" && (i == 1 || prev ~ /[ \t;&|()<>]/)) break
         out = out c; prev = c
@@ -690,8 +702,8 @@ trap 'case \"\$1\" in HUP) log ;; esac; cleanup' EXIT" \
 # 8952f89c8, P2 — MEASURED both ways). A splice spells close-quote, backslash, apostrophe, open-quote;
 # counting its three apostrophes as three quotes left the parity odd for the rest of the line, so the span
 # never closed: with a signal word after it the parse returned TERM and EVERY replaced-releaser arm stayed
-# green, and a CORRECT releaser that merely contained a splice parsed UNKNOWN and red FOUR arms (the
-# UNKNOWN arm always reds on an UNKNOWN registration: _TERM_AWK passes it through). An
+# green, and a CORRECT releaser that merely contained a splice parsed UNKNOWN and red FOUR arms — the
+# fourth is the INT/TERM TERMINATES arm, since _TERM_AWK passes an UNKNOWN registration through. An
 # escaped quote met OUTSIDE the span is literal and does not count.)
 _exitrow 2 "$_REL
 trap 'log \"it'\\''s\"; TERM; cleanup; exit 0' EXIT" \
@@ -780,6 +792,14 @@ _traprow 0 "x=\"a b\" trap 'rm -f \"\$LOCKF\"' EXIT" \
   "a QUOTED-ASSIGNMENT-PREFIXED releaser PASSES (a quoted value is a word too)"
 _traprow 0 "trap 'rm -f \"\$LOCKF\"; echo it'\\''s' EXIT" \
   "a releaser whose ACTION carries a SPLICE PASSES (a splice must not read as UNKNOWN — that was a false RED)"
+# ⛔ AND A LITERAL BACKSLASH BEFORE THE CLOSING QUOTE IS A BACKSLASH, NOT AN ESCAPE (fresh review of #3865 at
+# 593ca0c85, P3 — false RED, MEASURED). The escape test asked only whether the IMMEDIATELY preceding
+# character was a backslash, so it could not tell an escaped quote from a quote after a literal backslash:
+# a correct DOUBLE-QUOTED releaser ending in `\\` parsed UNKNOWN and red three arms. The test counts
+# backslash PARITY now, and this row is its WITNESS — reverting the parity loop to the one-character form
+# reds THIS row and nothing else, which is what makes the fix attributable rather than prose.
+_traprow 0 'trap "rm -f \"$LOCKF\"; echo a\\\\" EXIT' \
+  "a double-quoted releaser ending in a LITERAL backslash PASSES (backslash PARITY, not one character)"
 _exitrow 2 "$_REL
 x=\"a b\" trap 'true' EXIT" \
   "a QUOTED-ASSIGNMENT-PREFIXED second registration REPLACES the releaser — was a false PASS"
@@ -916,6 +936,13 @@ echo \"#tag\"; trap 'true' EXIT" \
 _acctrow disagree "$_REL
 [ \"\${#X}\" -gt 0 ] && trap 'true' EXIT" \
   "…and neither does a '#' inside a WORD (the \${#…} spelling a conditional tripwire takes)"
+# ⛔ AND NEITHER AN ESCAPED BLANK BEFORE IT (this lane — the same fail-OPEN class, one spelling past the
+# metacharacter set: an escaped space is part of the WORD, so the `#` continues that word instead of
+# starting a comment, and bash runs the registration that follows it. MEASURED pre-fix at b696888eb:
+# `total=1, per-line=1` = AGREE beside a replaced releaser; post-fix `total=2, per-line=1` = disagree.)
+_acctrow disagree "$_REL
+echo a\\ #b; trap 'true' EXIT" \
+  "…and an ESCAPED BLANK before a '#' does not truncate the line either (the '#' continues that word)"
 # ⛔ AND THE UNKNOWN ARM'S TEXT SOURCE IS A STATED LIMIT, NOT A ROW (fresh review of #3865 at
 # a2da4598b, note): this arm reads `$(cat "$SUBJECT")` while the scans above read `trap_join`'s output, so
 # a releaser split by a trailing `\` reads UNKNOWN here and parses fine above — one spelling, two answers,

@@ -2463,7 +2463,8 @@ _orch_argv_is_loop() { # shellcheck disable=SC2086
 # no plausible option form can miss the script), which means a non-controller whose argv merely NAMES the
 # script behind an option — `bash -x grep /abs/orch-loop.sh` — is refused as ambiguous instead of
 # reclaimed. `bash -- /abs/orch-loop.sh` is the same class and belongs in this list rather than in a
-# reviewer's notes (fresh review of #3865 at a2da4598b, note — MEASURED `flagged=0`): `--` ends option
+# reviewer's notes (fresh review of #3865 at a2da4598b, note — MEASURED `flagged=1` / rc 0, this file's
+# own reading of `flagged`, where rc 0 IS the refusal): `--` ends option
 # parsing and the script really runs, but it is not a `-c`-family token, so it is deferred to a human.
 # That is the SAFE direction: a refusal costs a human one `rm -f`, while a wrong reclaim puts
 # two controllers on one queue (#1715). Do not narrow the scan to the "first non-option token" to fix
