@@ -850,8 +850,10 @@ _is_lane_process() { # <command-line> → true when THIS argv IS a lane, not whe
   # `fix-one.sh` on the launchd path (`$O`). Measured with `lane.sh` and `pi` in the CWD:
   # `_is_lane_process "bash -c echo *"` matched `lane.sh` and COUNTED. `set -f` makes the split a pure
   # word-split, so a token can only match by its own text. The prior option is preserved and restored on
-  # the single exit path; the blast radius is a subshell anyway — the only caller chain is
-  # `_census_launcher` → `_live_lane_processes` → here, and `_census_launcher` is read through a `$(…)`.
+  # the single exit path; the blast radius is a subshell anyway — BOTH callers are read through a `$(…)`:
+  # `_census_launcher` → `_live_lane_processes` → here (the clamp), and `_census_dispatcher` → here (the
+  # OVERLAP that clamp removes, #3886 P2-1; the same read must use the same predicate, which is why that
+  # is this function and not a second copy of the rule).
   case $- in *f*) had_f=1 ;; *) set -f ;; esac
   for t in $c; do
     b="${t##*/}"

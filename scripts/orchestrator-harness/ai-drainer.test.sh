@@ -718,6 +718,31 @@ check "(s7) …and the mismatch line carries the overlap, so pi= is not read as 
   "$(grep "census-mismatch" "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
+# ── (s7b) ONE PROCESS NAMED BY TWO PIDFILES IS ONE LANE ────────────────────────────────────────
+# The overlap in `(s7)` is SUBTRACTED from the launcher's process count, so a process counted twice
+# under the dispatcher's name would remove two processes `procs` held once — an under-read of the
+# launcher's share, i.e. the over-dispatch direction. `(s7)` cannot see that (its overlap is 1 either
+# way and the totals coincidentally agree), so here is the arm that can: the SAME pid in two pidfiles,
+# `wt_count=0` so `alive` IS the dispatcher count. Deduped ⇒ 1. Without the dedupe ⇒ 2.
+o="$ROOT/o-s7b"; ai="$ROOT/ai-s7b"; mkdir -p "$o/bg" "$ai"
+# ⛔ `plant_lane` OUTSIDE a `$(…)` here. Called inside one, its backgrounded lane inherits the command
+# substitution's pipe and does not survive it — MEASURED: the pidfile was written but the pid was already
+# gone by the time the drainer censused (dispatcher=0, and the arm failed for a reason unrelated to itself).
+plant_lane s7b 1 >/dev/null
+p7="$(cat "$o/bg/seed-lane-1.pid")"
+printf '%s' "$p7" >"$o/bg/seed-lane-2.pid"
+cat >"$STUB/worker-terminal.sh" <<'WT_EOF'
+WT_TREE_PY="stub"; WT_WS_PY="stub"
+wt_table() { printf 'lane-1\talive\n'; }
+wt_count() { printf '0\n'; }
+WT_EOF
+RUN_WT_MOD="$STUB/worker-terminal.sh" RUN_PS="$ROOT/ps-composed" RUN_TARGET=2
+run_drainer_fg s7b
+check "(s7b) two pidfiles naming ONE pid count as ONE dispatcher lane" \
+  'grep -q "alive=1 (dispatcher=1 launcher=0)" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep "START:" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
 # ── ARM (g): THE VERDICT — a lane's own exit status, settled by the NEXT tick ────────────────
 FAKE_LANE_SECS=0 FAKE_RC=0 RUN_TARGET=1
 run_drainer_fg g
