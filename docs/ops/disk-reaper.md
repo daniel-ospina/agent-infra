@@ -1225,8 +1225,15 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferr
         removed=<n> failed=<n> late_preserved=<n> prune_blocked=<0|1> reasons=<reason>:<n>,…
         main_proof=<auto|local|unavailable|auto-unfetched|ambiguous>
         main_ref=<refs/heads/…|refs/remotes/…|?> pr_merged=<ok|na|unavailable>
-        verdict=<dry-run|reclaimed|idle|reap-ineffective|unmeasured>
+        stalled=<n> verdict=<dry-run|reclaimed|idle|reap-ineffective|unmeasured>
 ```
+
+`stalled=` is the STALLED REVIEW LIST's tally (agent-infra#2179): 0-commits-ahead lane residue this
+pass did NOT release and no later pass will release on its own. It is an exact SUBSET of
+`preserved=` — a selected removal that failed is counted under `remove=` and reported by
+`failed=`/exit 4 instead, so `preserved - stalled` can never underflow. A non-zero tally is followed
+by the list itself, each row naming the ISSUE its branch holds out of dispatch with its age, its
+class floor (`<n>h`, or `none` when no floor will move it) and the reason.
 
 ⛔ **`verdict=` is the pass's own ANSWER, and the counters alone cannot supply it (#3041).** A pass
 can be perfectly self-consistent (`examined=52 classified=52 remove=0 preserved=52`) while reclaiming

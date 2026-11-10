@@ -838,6 +838,8 @@ run_reaper() {
     FAKE_GH_PRS="${FAKE_GH_PRS:-}" \
     REAP_WT_MAIN_PROOF="local" \
     REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES_OVERRIDE:-45}" \
+    REAP_WT_GHOST_AGE_HOURS="${REAP_WT_GHOST_AGE_HOURS_OVERRIDE:-2}" \
+    REAP_WT_WIP_AGE_HOURS="${REAP_WT_WIP_AGE_HOURS_OVERRIDE:-24}" \
     REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-}" \
     CELL_HOME="${CELL_HOME_OVERRIDE:-}" \
     HARNESS_PIN_FILE="${HARNESS_PIN_FILE_OVERRIDE:-}" \
@@ -3448,6 +3450,14 @@ assert_dir "$WT" "A28d the checkout is STILL THERE"
 assert_eq "$(cat "$WT/loose.txt" 2>/dev/null)" "loose" "A28d the untracked file survived"
 assert_branch "$REPO" feat/2604-tm "A28d the branch was not deleted either"
 assert_absent "$(cat "$T/$ENV/reap.log")" "REMOVED-FORCED" "A28d the forced removal never ran"
+# ⛔ AND IT IS NOT ON THE STALLED LIST (review, PR #3881). A selected removal that failed is past its
+# floor and unremoved, so it looks like the list's subject — but it is counted under `remove=`, and
+# folding it in would make `stalled=` stop being a subset of `preserved=`. It is reported by
+# `failed=`/exit 4 instead, which this same arm already asserts.
+SUM="$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)"
+assert_contains "$SUM" "stalled=0" \
+    "A28d a FAILED removal is not on the stalled list (it is counted under remove= and failed=)"
+assert_contains "$SUM" "preserved=0" "A28d precondition: the record was counted as a selected removal"
 
 # ── A28e: the ref MOVES between classification and deletion => branch KEPT ───────────
 # The TOCTOU the re-proof exists for: the checkout is still residue (it is removed), but
@@ -3568,8 +3578,8 @@ assert_branch "$REPO" feat/2941-tm "A29a and its branch survives"
 assert_contains "$ROW" "stalled=1 class=abandoned-wip" \
     "A29a a 0-ahead lane record the pass cannot release is MARKED stalled"
 assert_contains "$ROW" "issue=#2941" "A29a …and names the ISSUE its branch holds out of dispatch"
-assert_contains "$ROW" "floor=none" \
-    "A29a …and says no floor is in force (the release switch is off, so 24h would name a bound that is not)"
+assert_contains "$ROW" "floor=${REAP_WT_WIP_AGE_HOURS_OVERRIDE:-24}h" \
+    "A29a …and names the class floor in force (24h; PAST it is what makes the record reviewable)"
 assert_contains "$ROW" "why=opt-in-off" "A29a …and names WHY it cannot move"
 assert_contains "$OUT" "STALLED REVIEW LIST" "A29a the list itself is PRINTED, not just counted"
 assert_contains "$OUT" "  $WT" "A29a …with the record's path on its own indented line"
@@ -3648,6 +3658,23 @@ assert_contains "$ROW" "stalled=1 class=ghost-zero-ahead" "A29e …and the withh
 assert_contains "$ROW" "why=claim-registry-unreadable" "A29e …with the reason no floor will move it"
 assert_contains "$ROW" "issue=#2945" "A29e …and the issue it holds"
 assert_dir "$WT" "A29e nothing was removed on a guess"
+
+# ── A29f: a dirty 0-ahead lane record INSIDE the WIP floor is NOT listed ──────────────────
+# The unarmed arm must still honour the class floor: it exists to cover `worktree add` -> first
+# commit, so a lane's FIRST uncommitted edit is not published as stale residue. (Found by the PR's own
+# fresh review: the first version of this arm bypassed both floors.)
+ENV=A29f; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2947-tm)"
+printf 'edited\n' >"$WT/base.txt"
+rm -f "$T/$ENV/reap.log"
+NOW_F="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 60 ))"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_F" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=dirty" "A29f the tree is preserved as before"
+assert_absent "$(row_for "$OUT" "$WT")" "stalled=1" \
+    "A29f a record INSIDE the 24h abandoned-wip floor is NOT stale residue"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
+    "A29f …so the tally is 0 (the class floor covers worktree-add -> first commit)"
 
 # ── A29-MUT: the COLLECTOR is load-bearing (drop it and A29a goes red) ───────────────────
 # The token is emitted inside `classify_one`, which runs in a command substitution, so the parent's
