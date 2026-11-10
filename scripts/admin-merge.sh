@@ -6505,12 +6505,43 @@ lane_applicable() {
   return 0
 }
 
+# lane_no_pr_trigger <reason> — TRUE (0) only when the MEASURED applicability
+# reason is the STRUCTURAL class: the lane's own `on:` block declares neither
+# `pull_request` nor `pull_request_target`, so no push to a PR head can START it (#2465).
+#
+# ⛔ WHY THIS CLASS NEEDS NO `lane_has_no_head_run` PROBE, AND WHY DROPPING THE LANE
+# FILTER FOR IT IS NOT A WIDENING. The probe asks "does a run exist RIGHT NOW", and
+# a run of a "mixed" lane can still appear later while the wait runs — which is why
+# `lane_has_no_head_run` gates the `paths-excluded` class (there, whether the lane ran
+# is real information). For this class the probe cannot decide anything the wait does
+# not: an unfiltered read is a strict SUPERSET of the filtered one, so
+#   * if no run of the lane ever attaches → the filtered wait is INERT and can never
+#     clear (the #2465 defect: 3900s per round, then "no run appeared for head"), while
+#     the unfiltered wait clears on the head's other runs; and
+#   * if one does attach (a PR-triggered CALLER, #1413) → the unfiltered wait sees it
+#     too, because it sees everything the filtered wait sees.
+# So for this class the probe carried no decision, while its SINGLE transient
+# gh-read failure (§0b's probe runs exactly once) silently pinned the filtered wait for
+# the whole window — a 65-minute burn decided by one unread REST response (#2465's
+# "either lane_applicable answers differently … or lane_has_no_head_run is answering").
+# The merge decision is NOT loosened: §4.5 grades the evaluated tree across EVERY
+# workflow and app, exactly as it does for `--any-workflow` and for the FIRST-CHECKS
+# wait's own #2862 re-derive, whose fixture pins that the dropped filter reaches the
+# SAME verdict as the operator's proven-safe escape.
+lane_no_pr_trigger() {
+  case "${1:-}" in
+    'lane-applicable: no-pr-trigger'*) return 0 ;;
+  esac
+  return 1
+}
+
 # lane_has_no_head_run <head> — TRUE (0) only when the watched lane PROVABLY has
 # NO run for <head>. This is what keeps the #1614 fallback a DEAD-END repair
 # rather than a trigger-shape repair: a lane that matched no trigger path but DID
 # run for the head is not a dead end (precondition 1 is satisfiable), and widening
 # there would be gratuitous. An UNREADABLE listing is NOT "no run" — fail closed,
 # no widening.
+# ⛔ IT NO LONGER GATES THE STRUCTURAL CLASS (#2465) — see `lane_no_pr_trigger`.
 lane_has_no_head_run() {
   local head="$1" args=() out rc=0
   [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
@@ -9830,7 +9861,23 @@ main() {
         # matched no trigger path but DID run for the head is not a dead end, and
         # widening there would be gratuitous — so the probe decides, and an
         # UNREADABLE probe fails closed (no widening).
-        if lane_has_no_head_run "$head"; then
+        #
+        # ⛔ EXCEPT THE STRUCTURAL CLASS (#2465). A lane whose `on:` block declares
+        # NO PR trigger cannot be STARTED by any push to a PR head, so the probe's
+        # "is there a run yet" answers no decision the wait does not: an unfiltered
+        # read is a superset of the filtered one (see `lane_no_pr_trigger`). Gating
+        # THIS class on the probe bought nothing and cost the whole
+        # `ADMIN_MERGE_FIRST_CHECKS_WAIT` window whenever the probe's one gh read
+        # failed or found nothing at t=0 — the inert wait #2465 reports. The lane is
+        # classified ONCE, here, and the FIRST-CHECKS wait consumes THAT decision
+        # (via ANY_WORKFLOW) instead of re-deriving it per poll.
+        local lane_dead_end=0
+        if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then
+          lane_dead_end=1
+        elif lane_has_no_head_run "$head"; then
+          lane_dead_end=1
+        fi
+        if [ "$lane_dead_end" -eq 1 ]; then
           LANE_FALLBACK_FROM="$WORKFLOW"
           # ⛔ NEVER embed the fallback text in a `${VAR:-word}` default here. An
           # apostrophe inside the `word` of a parameter expansion opens a QUOTE that
@@ -9843,6 +9890,18 @@ main() {
           say_err "admin-merge: ⚠️  LANE INAPPLICABLE — falling back to the evaluated surface (this is NOT a silent widening)."
           say_err "   watched lane: '$WORKFLOW'  (workflow file: .github/workflows/$WORKFLOW at head $head)"
           say_err "   $lane_reason"
+          # Name WHICH dead-end class fired: the structural one never consulted the
+          # run probe, so a reader can tell "this lane cannot run here" from "this
+          # lane has not run here yet" (#2465 — the two were indistinguishable, and
+          # the operator paid 65 minutes for the difference).
+          if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then
+            say_err "   dead-end class: STRUCTURAL — no pull_request / pull_request_target trigger exists,"
+            say_err "   so no push to head $head can start it; the run probe was NOT consulted (its answer could"
+            say_err "   not change the outcome, and its one transient read failure cost a whole wait window)."
+          else
+            say_err "   dead-end class: NOT-RUN — the lane declares a PR trigger this changed set does not match,"
+            say_err "   and it has NO run for head $head (measured; an unreadable probe would have failed closed)."
+          fi
           say_err "   Why: the lane's own 'on:' block cannot fire for THIS PR's changed set, and the"
           say_err "   lane has NO run for head $head — waiting for CI cannot clear it. The lane is"
           say_err "   INAPPLICABLE here, not missing."
@@ -9864,11 +9923,19 @@ main() {
         ;;
       unknown)
         # Fail closed: an applicability that could not be MEASURED is not an
-        # exemption. Keep the lane filter; §1b refuses exactly as before. Quiet by
-        # design: the refusal below is the loud part, and this fires on every
-        # unreadable map (including the common case where the lane simply has no
-        # PR-relevant trigger and the file could not be fetched).
-        :
+        # exemption. Keep the lane filter; §1b refuses exactly as before.
+        # ⛔ BUT NOT SILENTLY (#2465). A quiet `unknown` is indistinguishable at the
+        # operator's terminal from a lane that is merely slow: the wait then prints
+        # "no run has appeared for head …" for the whole window and the refusal
+        # blames CI, never the unmeasured classification. One line at the point the
+        # decision is made is the difference between a 65-minute burn and a 5-second
+        # fix (`--any-workflow`), and `LANE_APPLICABILITY_REASON` already says why.
+        # ⛔ The reason is expanded as an ASSIGNED variable, never as a `${VAR:-word}`
+        # default: an apostrophe inside that `word` opens a quote bash does not close
+        # on this line (the trap the §0b fallback documents above).
+        local lane_why_unmeasured="${LANE_APPLICABILITY_REASON:-}"
+        [ -n "$lane_why_unmeasured" ] || lane_why_unmeasured="the lane applicability could not be measured"
+        info "admin-merge: … LANE APPLICABILITY UNMEASURED — keeping the lane filter '$WORKFLOW' (fail closed: an unreadable exemption is not an exemption). Reason: $lane_why_unmeasured. If this lane can in fact never attach a run to a PR head (a reusable workflow_call-only lane is the common case), pass --any-workflow: the FIRST-CHECKS wait would otherwise burn its whole window on a run that cannot exist (#2465)."
         ;;
     esac
   fi

@@ -151,7 +151,14 @@
 #                       a read-only inspection.
 #   --no-wait           do not wait for the head's checks to become terminal;
 #                       hand the head to the rail as-is (its own "the head must
-#                       have been tested" precondition then decides).
+#                       have been tested" precondition then decides). ⛔ AND the
+#                       flag is CARRIED to the land step (#2465): it sets
+#                       ADMIN_MERGE_FIRST_CHECKS_WAIT=0 for that invocation, so the
+#                       rail's FIRST-CHECKS wait takes ONE observation and refuses by
+#                       name — instead of silently waiting its full 3900s window on a
+#                       head that a `--no-wait` caller explicitly declined to wait for.
+#                       An ADMIN_MERGE_FIRST_CHECKS_WAIT already in the environment is
+#                       never overridden.
 #   --wait-timeout S    bound on the terminal-CI wait (default 5400)
 #   --poll S            poll interval for the waits (default 30)
 #   --max-rounds N      rounds of update→verify→record→land (default 2, max 5):
@@ -2025,7 +2032,23 @@ do_land() {
   local flags=()
   if [ "$DRY_RUN" -eq 1 ]; then flags+=(--dry-run); fi
   if [ "${#MERGE_FLAGS[@]}" -gt 0 ]; then flags+=("${MERGE_FLAGS[@]}"); fi
-  bash "$ADMIN_MERGE" "$PR" ${repo_args[@]+"${repo_args[@]}"} ${flags[@]+"${flags[@]}"}
+  # ── --no-wait MUST REACH THE STEP THAT ACTUALLY WAITS (#2465) ─────────────
+  # `--no-wait` used to skip only THIS script's `[2/4] verify` and then hand the
+  # head to a land step that waits the rail's full FIRST-CHECKS window (3900s) —
+  # so a caller that explicitly asked NOT to wait still waited 65 minutes, once
+  # per round, and was told nothing. The rail has no `--no-wait` FLAG; its knob is
+  # `ADMIN_MERGE_FIRST_CHECKS_WAIT`, whose 0 seam means "one observation, no
+  # waiting" (the pre-#2090 instant refusal). Carry the caller's intent there, so
+  # `--no-wait` means the same thing at every step of the unit.
+  # ⛔ An ADMIN_MERGE_FIRST_CHECKS_WAIT ALREADY IN THE ENVIRONMENT WINS: the operator's
+  # explicit knob is a more specific instruction than a pass-through flag, and
+  # overriding it here would make the flag silently outrank the documentation.
+  local land_env=()
+  if [ "$NO_WAIT" -eq 1 ] && [ -z "${ADMIN_MERGE_FIRST_CHECKS_WAIT:-}" ]; then
+    land_env+=("ADMIN_MERGE_FIRST_CHECKS_WAIT=0")
+    log_line "atomic-land:     --no-wait carried to the rail: ADMIN_MERGE_FIRST_CHECKS_WAIT=0 (its FIRST-CHECKS wait takes ONE observation and refuses by name, instead of waiting up to 3900s on a head you declined to wait for)"
+  fi
+  env ${land_env[@]+"${land_env[@]}"} bash "$ADMIN_MERGE" "$PR" ${repo_args[@]+"${repo_args[@]}"} ${flags[@]+"${flags[@]}"}
   return $?
 }
 
