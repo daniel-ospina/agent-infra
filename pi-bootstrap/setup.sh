@@ -762,8 +762,10 @@ done
 # installer loop below is content-agnostic, and `cell-install.sh:FARM_LAYOUT` already maps this array
 # to `scripts/orchestrator-harness → scripts`, so a cell gets it too. Measured 2026-11-07.
 # ⚠️ What farming flat does NOT carry is the doctor's OPTIONAL harness siblings (`lane-reap.sh`,
-# `rail-refusal.sh`, `repo-slug.sh`, `live-ownership.sh`), which it resolves from `$SELF_DIR` — still
-# absent on a farm-only box, where they degrade rather than die.
+# `rail-refusal.sh`, `live-ownership.sh`), which it resolves from `$SELF_DIR` — still absent on a
+# farm-only box, where they degrade rather than die. ⛔ `repo-slug.sh` IS NO LONGER ONE OF THEM: it is
+# a PRODUCER the doctor actually execs, so degrading was a farm gap, not an accepted shape — see the
+# array below.
 # ⛔ THE CANDIDATE ORDER IS NOT "FARMED COPY LAST", and an earlier version of this comment said it
 # was. `doctor_path()`'s loop (`cloud-cell-supervisor.sh`) tries, in order: `$O/cloud-cell-doctor.sh`,
 # `$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh`,
@@ -781,7 +783,16 @@ done
 # all) and reordering it is a design change, not a comment fix.
 # Before this entry candidate 3 was simply ABSENT on a farm-only box, so nothing shadowed — and the
 # supervisor's every role `die`d.
-mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh)
+# ⛔ agent-infra#1899/#1552: `repo-slug.sh` IS A PRODUCER, NOT A SIBLING TO DEGRADE ON. The doctor
+# (`cloud-cell-doctor.sh`, farmed flat into `$DEST/scripts/`) resolves it at `:160` as
+# `${O%/}/repo-slug.sh $SELF_DIR/repo-slug.sh`, and `$SELF_DIR` IS `$DEST/scripts` for the farmed copy —
+# so a farm-only box had the consumer and not the executable it calls, which `test-setup-no-nesting.sh`
+# reports as `producer(s) exec'd by a farmed consumer and DELIVERED BY NOTHING: repo-slug.sh` (#1552).
+# Same src-one-down/dest-flat shape as the two above, and the same reason: `repo-slug.sh` lives in
+# `scripts/orchestrator-harness/`, and its destination is the FLAT `$DEST/scripts/` that the doctor
+# already searches. ⛔ It is also why the `cloud-cell-bringup.sh` walk warns "repo identity UNVERIFIED"
+# on a farm-only box — that warning is the degradation this entry removes.
+mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh repo-slug.sh)
 for base in "${mcp_harness_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
   f="$INFRA_ROOT/scripts/orchestrator-harness/$base"
