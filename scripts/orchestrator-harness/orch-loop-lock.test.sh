@@ -217,10 +217,17 @@ ck "the EXIT trap that releases the lock sits BELOW the section (the block runs 
 # now parses FORWARD from the `trap` word and accepts a run that ends at EOL, a separator, or a
 # redirection, so the suffix cannot hide the list; a list it still cannot recover emits `UNKNOWN` and
 # is RED here and in the arms below. This row PASSES now that it is READ.
-# ⚠️ STATED false RED, so it is not found as a bug: the ACTION's own text cannot be told apart from
-# the signal list without full shell word-splitting, so a trap ACTION containing a signal lookalike
-# terminated by `;`/`)` (`trap 'case $x in INT) …' EXIT`) reads as that signal. Fail-closed — a false
-# RED, never a false GREEN. The subject's actions name no signal.
+# ⛔ AND THE ACTION IS NOT THE SIGNAL LIST (fresh review of #3865 at 0fdd46dbc, P2 — false PASS, MEASURED,
+# and it INVERTED the direction the note that used to stand here claimed). Field splitting ignores quotes,
+# so "scan forward from the `trap` word for the first signal-looking token" found signal words INSIDE the
+# ACTION and reported them as the list: `trap 'log TERM; exit' EXIT` parsed to `TERM` and
+# `trap 'case "$1" in HUP) log ;; esac; cleanup' EXIT` to `HUP` — a VALID, non-EXIT, non-UNKNOWN list, so
+# ALL THREE arms that exist to catch a replaced releaser were blind AT ONCE and AGREED with each other,
+# leaving the accounting arm nothing to disagree with, while bash INSTALLED the registration and the lock
+# stayed on disk: `PASS=178 FAIL=0 SKIP=0`, MEASURED on the real subject. The old note called this a
+# fail-CLOSED false RED; it was the fail-OPEN direction, which is why it survived three reviews. The
+# ACTION is the first argument and is skipped to its CLOSING quote, so the scan starts where the list
+# really starts. (Skips a leading `--` too, the spelling that separates options from arguments.)
 # ⛔ AND THE REMOVAL IS MATCHED ON A BACKSLASH-NORMALISED COPY, so a DOUBLE-QUOTED trap (which spells it
 # `rm -f \"\$LOCKF\"`) PASSES instead of reding — that was the second half of the quoting blind spot.
 # ⛔ AND THE REMOVAL MUST BE THE TRAP'S FIRST COMMAND WORD, NOT A SUBSTRING (fresh review of #3865,
@@ -261,6 +268,14 @@ _TRAP_SIGS_AWK='
     for (i = 1; i <= NF; i++) if (tolower($i) == "trap") { start = i; break }
     out = ""
     i = start + 1
+    if (start > 0 && i <= NF) {
+      if ($i == "--") i++
+      if (i <= NF && (substr($i, 1, 1) == sprintf("%c", 39) || substr($i, 1, 1) == "\"")) {
+        qq = substr($i, 1, 1)
+        if (length($i) > 1 && substr($i, length($i), 1) == qq) i++
+        else { while (i <= NF && substr($i, length($i), 1) != qq) i++; i++ }
+      }
+    }
     while (out == "" && i <= NF) {
       w = $i
       if (w ~ /[;&|)]$/) sub(/[;&|)]+$/, "", w)
@@ -435,10 +450,33 @@ ck "every trap registration's SIGNAL LIST is readable (an unparseable one is UNK
 # documents the forbidden `EXIT INT TERM` form, and a pin's own citation must not be a second thing to
 # maintain), so assert it
 # over every registration whose signal list carries INT or TERM, wherever the command word lives.
-_BAD_TERM="$(printf '%s\n' "$ALL_TRAPS" | awk -F' :: ' '
+# EVERY INT/TERM HANDLER MUST TERMINATE, AND `exit` IS JUDGED AS A COMMAND — NOT AS A WORD OR A
+# SUBSTRING (fresh reviews of #3865 at bb46c6a13 and 0fdd46dbc, P3 — false PASS, MEASURED twice: the
+# original `$2 !~ /exit/` substring test was satisfied by `on_exit_cleanup() { rm -f "$LOCKF"; }; trap
+# 'on_exit_cleanup' INT`, and the WORD test that replaced it is satisfied by PROSE inside a double-quoted
+# argument — `trap 'release_lock; echo "exit requested"' INT` left the suite at `PASS=178 FAIL=0` while
+# the handler returned, deleted the lock and left the loop alive. Both are #1715 in a spelling the
+# `LOCKF` filter cannot see.) The test is: DOUBLE-QUOTED SPANS ARE PROSE, so they are removed first; then
+# `exit` must sit at a command position (after `;`/`&`/`|`/`(`/the action's opening quote) or open one.
+# ONE implementation, used by both the whole-file arm and §9d, so the two cannot disagree.
+# ⏳ STATED LIMIT, not coverage: this still judges the TEXT, not the behaviour. A handler that stops the
+# shell another way (`trap 'kill -TERM $$' TERM`, `trap 'exec /bin/false' TERM`) REDS — a FALSE RED,
+# MEASURED, and pre-existing rather than introduced here — and one that runs `exit` behind a CONDITION
+# (`[ -n "$X" ] && exit`) passes whether or not the condition holds. The property this pin can honestly
+# claim is "no INT/TERM handler ENDS in a returning cleanup", not "the handler provably terminates";
+# asserting the latter would mean spawning a shell, signalling it and reading its exit status, which no
+# arm here does.
+_TERM_AWK='
   { if ($1 == "UNKNOWN") { print; next }
-    n = split($1, a, " ")
-    for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /(^|[^[:alnum:]_])exit([^[:alnum:]_]|$)/) print; next } }')"
+    n = split($1, a, " "); hit = 0
+    for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") hit = 1
+    if (!hit) next
+    t = $2
+    gsub(/"[^"]*"/, "", t)
+    q = sprintf("%c", 39)
+    pat = "(^|[;&|(" q "])[[:space:]]*(builtin[[:space:]]+)?exit([[:space:]]|[;&|)]|$)"
+    if (t !~ pat) print }'
+_BAD_TERM="$(printf '%s\n' "$ALL_TRAPS" | awk -F' :: ' "$_TERM_AWK")"
 [ -z "$_BAD_TERM" ]
 ck "every INT/TERM trap handler TERMINATES (a RETURNING handler releases the lock while the loop lives — and one reached through a function is invisible to the LOCKF filter)" $?
 # ── 9d) THE PIN ITSELF, DRIVEN OVER THE SPELLINGS THAT DEFEATED IT ────────────────────────────────
@@ -548,6 +586,18 @@ trap 'exit 0' 0 INT" \
 _exitrow 2 "$_REL
 trap 'exit 0' HUP EXIT" \
   "…and an unrelated signal merely SHARING the list does not hide it — was a false PASS"
+# ⛔ AND A SIGNAL WORD INSIDE THE ACTION IS NOT THE LIST (fresh review of #3865 at 0fdd46dbc, P2 — false
+# PASS, MEASURED: the scan started a run at the first signal-looking token ANYWHERE on the line, so an
+# ACTION naming a signal truncated the list and DELETED the EXIT — `trap 'log TERM; exit' EXIT` parsed to
+# `TERM`, a VALID non-EXIT non-UNKNOWN list, so all three replaced-releaser arms were blind AT ONCE and
+# agreed with each other and the suite stayed at `PASS=178 FAIL=0` with the lock on disk. The ACTION is
+# skipped to its closing quote now.)
+_exitrow 2 "$_REL
+trap 'log TERM; exit' EXIT" \
+  "a second registration whose ACTION names a signal still reads EXIT — was a false PASS"
+_exitrow 2 "$_REL
+trap 'case \"\$1\" in HUP) log ;; esac; cleanup' EXIT" \
+  "…and a `case` arm inside the ACTION cannot hide it either — was a false PASS"
 _exitrow 1 "$_REL
 # trap 'true' EXIT" \
   "a COMMENTED-OUT registration is not a registration (no false RED on a correct tree)"
@@ -597,10 +647,7 @@ x=\"a b\" trap 'true' EXIT" \
 # LOCKF filter: a RETURNING INT handler that releases the lock through a FUNCTION removes the lock and
 # leaves the loop alive, which is #1715 spelled in code the `grep … LOCKF` cannot see.
 _term_bad() { # <text> -> non-empty when a registration with INT/TERM does not terminate
-  printf '%s\n' "$(trap_regs "$1")" | awk -F' :: ' '
-    { if ($1 == "UNKNOWN") { print; next }
-      n = split($1, a, " ")
-      for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /(^|[^[:alnum:]_])exit([^[:alnum:]_]|$)/) print; next } }'
+  printf '%s\n' "$(trap_regs "$1")" | awk -F' :: ' "$_TERM_AWK"
 }
 _TERMROW_OK="$_REL
 trap 'exit 143' TERM
@@ -631,6 +678,21 @@ ck "9d: a RETURNING INT handler whose FUNCTION NAME contains 'exit' is CAUGHT (t
 trap 'echo exiting' INT
 trap 'exit 143' TERM")" ]
 ck "9d: …and so is a handler that merely SAYS 'exiting' (the word test is not satisfied by prose either)" $?
+# ⛔ AND PROSE CONTAINING THE BARE WORD `exit` IS NOT A TERMINATION EITHER (fresh review of #3865 at
+# 0fdd46dbc, P3 — false PASS, MEASURED: `trap 'release_lock; echo "exit requested"' INT` is a RETURNING
+# handler that deletes the lock through a function, and it left the suite at `PASS=178 FAIL=0` because
+# the word `exit` sat inside a double-quoted argument. Double-quoted spans are prose and are stripped
+# before the command test.)
+[ -n "$(_term_bad "$_REL
+release_lock() { rm -f \"\$LOCKF\"; }
+trap 'release_lock; echo \"exit requested\"' INT
+trap 'exit 143' TERM")" ]
+ck "9d: a RETURNING INT handler that only TALKS about exiting is CAUGHT (prose in a double-quoted argument is not a command)" $?
+# and the other direction: a handler that really exits AFTER other work is a TERMINATING handler and must
+# NOT red — the command test is about `exit` at a command position, not about being the first word.
+[ -z "$(_term_bad "$_REL
+trap 'cleanup; exit 7' INT")" ]
+ck "9d: a handler that runs work and THEN exits is still a TERMINATING handler (the test is a command position, not a substring)" $?
 # ⏳ STATED LIMIT, not coverage: the test is "the handler mentions the `exit` command", which is neither
 # necessary nor sufficient for TERMINATION. A handler that stops the shell another way — `trap 'kill -TERM
 # $$' TERM` — REDS (a FALSE RED, MEASURED, and pre-existing rather than introduced here), and one that

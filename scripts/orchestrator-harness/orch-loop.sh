@@ -2472,10 +2472,16 @@ _orch_argv_is_loop() { # shellcheck disable=SC2086
 # ⚠️ AND ONE NAMED RESIDUAL IN THE OTHER DIRECTION (fresh review of #3865, P3 — MEASURED): a `-c`-family
 # token that is an OPTION'S VALUE is read as a command string. `bash --rcfile -c <abs>/orch-loop.sh` really
 # RUNS the script (its `ps` column is `bash --rcfile -c /abs/orch-loop.sh`), and it answers rc 1 = RECLAIM
-# over a running controller — the #1715 direction. It needs a file literally named `-c`, so it is exotic,
-# and skipping a value-taking option's operand would re-open the ambiguity this rule exists for. Named
-# here rather than left to be rediscovered; the fix, if it ever bites, is to skip the operand of the
-# known value-taking long options (`--rcfile`, `--init-file`) only.
+# over a running controller — the #1715 direction. ⛔ IT NEEDS ONLY THE LITERAL TOKEN `-c` IN ARGV, NOT A
+# FILE NAMED `-c` (fresh review of #3865 at 0fdd46dbc, P3 — this line claimed otherwise and was FALSE,
+# MEASURED: in a directory holding no `-c`, `cd /tmp/rcprobe && bash --rcfile -c ./s.sh` printed the
+# script's output and exited 0, because bash ignores `--rcfile` for a NON-INTERACTIVE shell — it consumes
+# `-c` as the option's operand and never looks for a file). So the precondition is a stranger argv than a
+# missing file, but it is NOT the filesystem exotica this comment used to claim, and the risk was
+# understated rather than overstated. Still not narrowed here: skipping a value-taking option's operand
+# would re-open the ambiguity this rule exists for. Named here rather than left to be rediscovered; the
+# fix, if it ever bites, is to skip the operand of the known value-taking long options (`--rcfile`,
+# `--init-file`) only.
 _orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
   local _t
   set -- $*
