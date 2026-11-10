@@ -790,8 +790,11 @@ done
 # reports as `producer(s) exec'd by a farmed consumer and DELIVERED BY NOTHING: repo-slug.sh` (#1552).
 # Same src-one-down/dest-flat shape as the two above, and the same reason: `repo-slug.sh` lives in
 # `scripts/orchestrator-harness/`, and its destination is the FLAT `$DEST/scripts/` that the doctor
-# already searches. ⛔ It is also why the `cloud-cell-bringup.sh` walk warns "repo identity UNVERIFIED"
-# on a farm-only box — that warning is the degradation this entry removes.
+# already searches. ⛔ NOT THE BRING-UP'S WARNING: `cloud-cell-bringup.sh` resolves its own copy from
+# `${BRINGUP_HERE}/orchestrator-harness/repo-slug.sh` or `${CELL_HOME}/orchestrator/repo-slug.sh`
+# (`:168-169`), neither of which is `$DEST/scripts` — so its "repo identity UNVERIFIED" walk is
+# untouched by this entry and needs its own fix. An earlier revision of this comment claimed the
+# warning was the degradation this entry removes; it is not, and the paths were measured.
 mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh repo-slug.sh)
 for base in "${mcp_harness_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
