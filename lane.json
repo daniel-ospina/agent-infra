@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794351745,
+  "host": "cmux",
+  "issue": 3918,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-3918-1794351745-p72679-5d762b2a",
+  "lease_until": 1794359545,
+  "pid": 72679,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794351745,
+  "state": "RUNNING",
+  "tag": "3918",
+  "worktree": "/home/cmux/agent-infra"
+}
