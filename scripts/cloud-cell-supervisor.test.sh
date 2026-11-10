@@ -2980,7 +2980,10 @@ say_case "the deploy sequence is pre-flight-gated, not only its last step (agent
 # process exists for it, so `stop`'s OWNERSHIP checks are what a `--force` arm reaches after the gate —
 # which is exactly the proof `--force` got PAST the gate.
 # ⛔ THE PANE PROOF IS LOAD-BEARING, NOT DECORATION (review P2 at the end of #2093). `cmd_stop`'s kill
-# path refuses to signal a machine-scoped session name it cannot prove it owns (#1856, `sup:4415`), and
+# path refuses to signal a machine-scoped session name it cannot prove it owns (#1856, the kill-path
+# `die` "session … nothing in it can be proven to be this state dir's controller" — ⛔ cited by its
+# TEXT, not a line number: a number here went stale the moment this PR grew the file, which is the
+# failure mode the comment it describes was written about), and
 # the proof it reads is the session's own pane command naming `$O`. Without `$1/pane` that proof FAILS
 # on the PRE-FIX supervisor too — it dies at the ownership check before `tmux kill-session` is ever
 # reached, so `$S1/up` survived the mutant AND the fix, and "NOTHING LOST: the controller session was
@@ -3226,6 +3229,78 @@ else
   echo "  ⊘ (3f) SKIPPED — no /proc on this host, so the leak reap never signals and the leg is inert by design"
 fi
 
+#  ⛔ THE OTHER FOUR LEGS NEED THEIR OWN FIXTURES (review P3). Until (3g)-(3i) existed, every mismatched
+#  fixture in this suite ALSO satisfied the provably-own-session leg (`seed_started_cell` seeds `.desired`
+#  and a session whose pane names $1/o), and the only marker-only fixtures were MATCHED pairs asserting
+#  that the gate stays SILENT. So deleting the marker leg — the one the doc calls the strictest, and the
+#  only leg that can see a box that is already DOWN — left this suite green. Each arm below seeds ONE
+#  leg on a mismatched pair and asserts the refusal comes from the QUEUE gate, followed by a control
+#  that removes that one thing and asserts the SAME state dir then stops: so the arm reddens if the leg
+#  is deleted, AND reddens if the fixture is refused for an unrelated reason.
+
+#  (3g) THE MARKER ALONE. A DOWN box that still carries `.desired` is the state the doc singles out: no
+#  session, no loop, no controller, and yet a `stop` would clear the marker that makes `start` safe.
+S4H="$Q/st2093-marker"; rm -rf "$S4H"; mkdir -p "$S4H/o/state/roles"; : > "$S4H/o/state/roles/.desired"
+qverb stop "$Q/agent-repo" "$S4H" daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] \
+  && ok "(3g) stop REFUSES on the MARKER alone — a down box that still carries \`.desired\` is something a stop would end" \
+  || bad "(3g) stop skipped the gate on a \`.desired\`-only state dir — the marker leg is unpinned (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "(3g) …and it refuses through the QUEUE gate (not an unrelated precondition)" ;;
+  *) bad "(3g) refused for an unrelated reason, so the marker leg proves nothing: $Q_OUT" ;;
+esac
+#  The paired control: the SAME state dir with the marker removed has nothing to end, so it stops. If
+#  this row reddens, the fixture was refused by something other than the marker and (3g) is vacuous.
+rm -f "$S4H/o/state/roles/.desired"
+qverb stop "$Q/agent-repo" "$S4H" daniel-ospina/tortoise
+[ "$Q_RC" -eq 0 ] \
+  && ok "(3g) …and with the marker removed the SAME state dir stops (so the marker is what refused, and the gate does not false-block an empty dir)" \
+  || bad "(3g) the empty-dir control was refused too (rc=$Q_RC), so (3g) cannot show the marker is what refused: $Q_OUT"
+
+#  (3h) THE DOCTOR LOOP ALONE — the in-flight pass a `stop` would interrupt mid-write.
+S4I="$Q/st2093-loop"; rm -rf "$S4I"; mkdir -p "$S4I/o/state/roles"
+bash -c 'trap "" TERM; while :; do sleep 1; done' & Q_LOOP_PID=$!
+sleep 0.3
+q_ident="$(sed 's/.*) //' "/proc/$Q_LOOP_PID/stat" 2>/dev/null | awk '{print $20}')"
+case "$q_ident" in ''|*[!0-9]*) q_ident="$(ps -p "$Q_LOOP_PID" -o lstart= 2>/dev/null)" ;; *) q_ident="proc:$q_ident" ;; esac
+printf '%s\n' "$Q_LOOP_PID" > "$S4I/o/state/roles/loop.pid"
+printf '%s|%s\n' "$Q_LOOP_PID" "$q_ident" > "$S4I/o/state/roles/loop.ident"
+qverb stop "$Q/agent-repo" "$S4I" daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] \
+  && ok "(3h) stop REFUSES while the doctor loop is live (no marker, no session: the loop leg alone)" \
+  || bad "(3h) stop skipped the gate with a live doctor loop recorded — the loop leg is unpinned (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "(3h) …and it refuses through the QUEUE gate" ;;
+  *) bad "(3h) refused for an unrelated reason, so the loop leg proves nothing: $Q_OUT" ;;
+esac
+#  Control: end the recorded loop and the same state dir stops (it is the loop, not the record's shape).
+kill -KILL "$Q_LOOP_PID" 2>/dev/null; wait "$Q_LOOP_PID" 2>/dev/null
+qverb stop "$Q/agent-repo" "$S4I" daniel-ospina/tortoise
+[ "$Q_RC" -eq 0 ] \
+  && ok "(3h) …and with the loop ended the SAME state dir stops (a dead loop.pid is not something to end)" \
+  || bad "(3h) a state dir whose loop is dead was refused (rc=$Q_RC), so (3h) cannot show the loop is what refused: $Q_OUT"
+
+#  (3i) THE OWNED CONTROLLER PID ALONE — a controller running from $O/orch-loop.sh, which is neither a
+#  provable session nor the doctor loop nor a marker. This is the leg that makes `stop` safe on a cell
+#  whose tmux session was lost: the controller is live, so tearing down is an irreversible act.
+S4J="$Q/st2093-pid"; rm -rf "$S4J"; mkdir -p "$S4J/o/state/roles"
+printf '#!/bin/sh\nsleep 300\n' > "$S4J/o/orch-loop.sh"; chmod +x "$S4J/o/orch-loop.sh"
+bash "$S4J/o/orch-loop.sh" >/dev/null 2>&1 & Q_OWN_PID=$!
+sleep 0.3
+qverb stop "$Q/agent-repo" "$S4J" daniel-ospina/tortoise
+[ "$Q_RC" -ne 0 ] \
+  && ok "(3i) stop REFUSES while a controller runs from this state dir (no marker, no session: the controller-pid leg alone)" \
+  || bad "(3i) stop skipped the gate with an owned controller live — the pid leg is unpinned (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"DIFFERENT repos"*) ok "(3i) …and it refuses through the QUEUE gate" ;;
+  *) bad "(3i) refused for an unrelated reason, so the pid leg proves nothing: $Q_OUT" ;;
+esac
+kill -KILL "$Q_OWN_PID" 2>/dev/null; wait "$Q_OWN_PID" 2>/dev/null
+qverb stop "$Q/agent-repo" "$S4J" daniel-ospina/tortoise
+[ "$Q_RC" -eq 0 ] \
+  && ok "(3i) …and once that controller is gone the SAME state dir stops (the ownership read is what refused)" \
+  || bad "(3i) a state dir with no live controller was refused (rc=$Q_RC), so (3i) cannot show the pid is what refused: $Q_OUT"
+
 # (4) The escape hatch is REAL: `stop --force` on a live mismatched box gets past the gate and stops
 # it. Without this arm, "refuses" could be satisfied by a wall no flag can pass.
 S5="$Q/st2093-force"; rm -rf "$S5"; mkdir -p "$S5"; seed_started_cell "$S5"
@@ -3284,7 +3359,7 @@ esac
 [ -f "$S7/o/state/roles/.desired" ] && [ "$(sgen "$S7")" = 3 ] \
   && ok "…and nothing was lost (marker intact, generation un-bumped)" \
   || bad "the missing-checkout refusal stopped the box (marker=$( [ -f "$S7/o/state/roles/.desired" ] && echo present || echo GONE) gen=$(sgen "$S7"))"
-# …and the ONE-LINE FIX it must NOT name: this `die` (`assert_repo`, sup:573) fires BEFORE any
+# …and the ONE-LINE FIX it must NOT name: this `die` (`assert_repo`'s own, the `safe_argv` refusal) fires BEFORE any
 # `$onefix` exists, so the shared default tail sent the operator hunting for a line that had never been
 # printed. Both rows use THIS arm's `$Q_OUT`, which is why they live here and not in block (7).
 branch_repair_rows e '*Set REPO to a checkout of the repo this cell should work*'

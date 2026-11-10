@@ -306,8 +306,10 @@ carries the `REPO`/`OR` pair) is sourced by the supervisor itself:
 SNAP=/tmp/cell-home/harness/bed278f4bbb1   # the versioned snapshot the cell is running
 SUP=$SNAP/scripts/cloud-cell-supervisor.sh
 
-# 1. PRE-FLIGHT. Read-only: stops nothing, starts nothing, and on a refusal writes nothing either (the
-#    state dirs are only created once it ACCEPTS the pair).
+# 1. PRE-FLIGHT. Stops nothing and starts nothing; on a refusal it writes nothing at all, and even
+#    when it ACCEPTS the pair its only effects are creating `$O/logs`+`$O/state` and re-applying the
+#    lane registry (`provision-lane-registry.py --apply`) — no signal, no unit action. Not "read-only":
+#    the accept path does write those two things, so do not run it expecting a no-op.
 #    Expect a QUEUE-vs-CHECKOUT refusal here, with the controller still up — that is the point of the
 #    step. ⛔ WHICH refusal depends on the snapshot you are running, and this recipe names a PRE-#2093
 #    one on purpose: `bed278f4` predates the fix, so its `check` prints the #1901 wording ("the QUEUE
@@ -399,8 +401,9 @@ was 14 working of 76 resident, and `zombie=` is in the same line so a box full o
 
 - **Cloud cell** — `check` → `stop` → `start`. `start` runs `apply` (fetch `origin/main`, write an
   immutable `<sha12>/` snapshot, move the pin, stamp) before launching. Never hand-edit a file inside a
-  snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the read-only
-  pre-flight, and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — it
+  snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the pre-flight
+  that stops and starts nothing (on acceptance it does write — the state dirs and the re-applied lane
+  registry (`provision-lane-registry.py --apply`) — so it is not a no-op), and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — it
   just also requires that the state dir has something a stop would end, or that the process table cannot
   be read (which counts as running) — so a
   wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. ⛔
