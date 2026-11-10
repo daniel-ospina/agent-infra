@@ -1316,7 +1316,9 @@ land_backlog_exempt_note() { # <label> <exempt-why>
     case "$st" in
       # ⛔ THE SAME FALSE-CLAIM GUARD AS THE REFUSAL: an unresolved state is not evidence of a credential, and the
       # advice "fix the READ, not the credential" is exactly wrong on the arm where the credential is the cause.
-      ''|none|ambient-missing)
+      # `token-blank` belongs here too: gh resolves the blank token INSTEAD of any store, so the credential is the
+      # cause even though a name is set (see `gh-auth.sh`'s header measurement).
+      ''|none|ambient-missing|token-blank)
         printf '[land-backlog] NOTE %s: EXEMPTION-UNREADABLE — the %s labels/title read FAILED, and this lane'"'"'s gh credential could NOT be resolved either (state=%s) — so the CAUSE MAY BE THE CREDENTIAL (check `gh auth status` under the lane'"'"'s HOME / the [gh-auth] line). A P0/base-red exemption cannot be proven, so the ratio decides below, and OVER the ceiling that means HELD.\n' \
           "$label" "${TAG:-issue}" "${st:-unresolved}"
         ;;
@@ -1351,7 +1353,9 @@ land_backlog_refuse() { # <label> <verdict-line> <exempt-why>
           # ⛔ AN EMPTY RESOLUTION IS NOT EVIDENCE OF A CREDENTIAL (fresh-eyes pass on this diff): with the module
           # absent (or silent) `gh_auth_cause` cannot speak, so claiming "the lane's gh IS credentialed" would be a
           # confident false statement about the exact thing this change exists to measure. Say what was NOT measured.
-          ''|none|ambient-missing)
+          # `token-blank` is the THIRD shape of that false claim (measured, gh 2.103.3): a blank-but-set GH_TOKEN
+          # outranks every config dir, so the lane has no usable credential and no store this module could point at.
+          ''|none|ambient-missing|token-blank)
             printf ' Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. ⛔ BUT FIRST: this lane'"'"'s gh credential could NOT be resolved either (state=%s), so the read may be a CREDENTIAL fault — check `gh auth status` under the lane'"'"'s HOME before acting on the ratio. The issue returns to the pool and is re-dispatched when the next read succeeds.\n' \
               "${st:-unresolved}"
             ;;

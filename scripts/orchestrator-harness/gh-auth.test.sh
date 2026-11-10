@@ -6,10 +6,12 @@
 #
 #   A lane runs with `HOME` redirected to the operational home (`/tmp/cell-home` on a cell) because
 #   `record-review.sh`, the gh shim and the extensions live under `$CELL_HOME/.pi/agent`. `gh`'s
-#   `hosts.yml` lives in the ACCOUNT home. Nothing set `GH_CONFIG_DIR` on the
-#   `nonblocking-dispatch.sh` → `spawn-gate.sh` path — `rg -n 'GH_CONFIG_DIR' scripts/` found only test
-#   files — so `gh` inside the lane was unauthenticated, and the land-backlog gate reported a MISSING
-#   CREDENTIAL as a PR-RATIO problem:
+#   `hosts.yml` lives in the ACCOUNT home. Nothing SET `GH_CONFIG_DIR` on the
+#   `nonblocking-dispatch.sh` → `spawn-gate.sh` path — ⛔ not "nothing in the tree": `git grep -n
+#   'GH_CONFIG_DIR' origin/main -- scripts/` returns `worker-terminal.sh:500,1074-1081`,
+#   `objective.py:2273-2285`, `beta-progress.py:398-401` and `record-review.sh` as READERS, and not one
+#   provider on the dispatch path — so `gh` inside the lane was unauthenticated, and the land-backlog gate
+#   reported a MISSING CREDENTIAL as a PR-RATIO problem:
 #
 #       [land-backlog] REFUSED bg issue-11086: UNREADABLE open-PR count for daniel-ospina/tortoise
 #         (the gh read failed) … Remedy: land/fix the open PRs (this is the drain) …
@@ -177,9 +179,24 @@ ck "A5 \$XDG_CONFIG_HOME/gh is next in gh's order ('$r')" $rc
 r="$(u ". '$GH_AUTH'; GH_TOKEN=fixture-token gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "token|" ]; rc=$?
 ck "A6 a non-blank token NAME outranks every config dir, so the read cannot be blamed on one ('$r')" $rc
+# ⛔ A BLANK-BUT-SET TOKEN NAME IS ITS OWN STATE, MEASURED (gh 2.103.3, fixture store):
+#     $ GH_TOKEN='   ' GH_CONFIG_DIR=<store> gh auth token   ->  [three spaces], rc 0 — the store is NEVER read
+#     $ GH_TOKEN=''    GH_CONFIG_DIR=<store> gh auth token   ->  the store's token
+# so reporting `account|<dir>` for a blank-but-set token claimed a store gh will not consult, and the gate
+# then printed "the lane's gh IS credentialed" over a lane whose every gh call fails. A7-A7d pin the state;
+# B2g pins what the REFUSAL says when it is the cause.
 r="$(u ". '$GH_AUTH'; GH_TOKEN='   ' gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ "$r" = "token-blank|GH_TOKEN" ]; rc=$?
+ck "A7 …and a BLANK-but-SET one is its own state, never papered over with a store gh will not read ('$r')" $rc
+r="$(u ". '$GH_AUTH'; GITHUB_TOKEN='  ' gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ "$r" = "token-blank|GITHUB_TOKEN" ]; rc=$?
+ck "A7b …the same for GITHUB_TOKEN, and the state names WHICH name is shadowing ('$r')" $rc
+r="$(u ". '$GH_AUTH'; GH_TOKEN='' gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "account|$ACCT/.config/gh" ]; rc=$?
-ck "A7 …and a BLANK one is not a credential (gh treats it as set-then-useless) ('$r')" $rc
+ck "A7c …while a ZERO-LENGTH value is NOT a shadow: gh falls through to the store (measured) and it must resolve ('$r')" $rc
+r="$(u ". '$GH_AUTH'; GH_TOKEN='   ' gh_auth_ensure '$LANE_HOME' '$ENVF' '$ACCT' >/dev/null; printf '%s' \"\${GH_CONFIG_DIR:-<unset>}\"")"
+[ "$r" = "<unset>" ]; rc=$?
+ck "A7d …and NOTHING is exported for it — an export gh ignores reads as a fix ('$r')" $rc
 
 # The env file, parsed STATICALLY. Both the plain and the `export -p`/`declare -x` shapes keys.env really
 # carries, and the arm that proves the file is never executed.
@@ -198,10 +215,17 @@ printf 'export GH_CONFIG_DIR=%s   # a trailing comment\n' "$TMP/cfg-a" > "$ENVF"
 r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "keys|$TMP/cfg-a" ]; rc=$?
 ck "A11 a trailing comment and quotes are stripped, not swallowed into the path ('$r')" $rc
-printf 'touch "$TMP/PWNED"\nexport GH_CONFIG_DIR=%s\n' "$TMP/cfg-a" > "$ENVF"
-u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT' >/dev/null"
-[ ! -e "$TMP/PWNED" ]; rc=$?
+# ⛔ THE PAYLOAD MUST BE OBSERVABLE FROM THE SHELL THAT WOULD EXECUTE IT. `u()` is `env -u … bash -c`, where
+# `TMP` is NOT set (the suite's `TMP` is an unexported shell variable), so a payload written with `\"$TMP/PWNED\"`
+# via single-quoted printf expanded to `/PWNED` — a path nothing could ever touch as non-root — while the
+# assertion below read `$TMP/PWNED` in the OUTER shell. The arm then passed whether the file was parsed or
+# executed (verified: the `. \"$f\"` mutant kept it green). Baking the ABSOLUTE path at fixture time makes the
+# same assertion bite, and the resolve is asserted too so the arm cannot pass by failing to parse the file.
+printf 'touch %s/PWNED\nexport GH_CONFIG_DIR=%s\n' "$TMP" "$TMP/cfg-a" > "$ENVF"
+r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+{ [ "$r" = "keys|$TMP/cfg-a" ] && [ ! -e "$TMP/PWNED" ]; }; rc=$?
 ck "A12 the env file is PARSED, not executed (a shebang-less 'touch' line never ran)" $rc
+rm -f "$TMP/PWNED"   # so no later arm can inherit the marker
 printf 'export GH_CONFIG_DIR=relative/dir\n' > "$ENVF"
 r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "account|$ACCT/.config/gh" ]; rc=$?
@@ -218,6 +242,14 @@ c="$(u ". '$GH_AUTH'; GH_CONFIG_DIR='$TMP/absent' gh_auth_cause '$LANE_HOME' /no
 c="$(u ". '$GH_AUTH'; gh_auth_cause '$LANE_HOME' /nonexistent '$ACCT'")"
 [ -z "$c" ]; rc=$?
 ck "A16 …and says NOTHING when a credential resolves (the caller must not blame it)" $rc
+# ⛔ THE CAUSE HAS TO SPEAK FOR `token-blank`, or the refusal falls through to the arm that asserts the lane
+# "IS credentialed" — a confident false statement about the exact datum this change exists to measure.
+c="$(u ". '$GH_AUTH'; GH_TOKEN='   ' gh_auth_cause '$LANE_HOME' '$ENVF' '$ACCT'")"
+{ case "$c" in *'GH_TOKEN is set but BLANK'*) ck "A17 …and a BLANK-but-SET token is named as the CREDENTIAL cause, by its own name ('$c')" 0 ;;
+             *) ck "A17 …and a BLANK-but-SET token is named as the CREDENTIAL cause (got '$c')" 1 ;; esac; }
+c="$(u ". '$GH_AUTH'; GH_TOKEN='   ' gh_auth_cause '$LANE_HOME' '$ENVF' '$ACCT_EMPTY'")"
+{ case "$c" in *'GH_TOKEN is set but BLANK'*) ck "A17b …and it stays the cause with no store anywhere: the shadow is not a directory question" 0 ;;
+             *) ck "A17b …and it stays the cause with no store anywhere (got '$c')" 1 ;; esac; }
 
 # ═══ §B THE GATE, END TO END ═════════════════════════════════════════════════════════════════════
 echo
@@ -266,6 +298,20 @@ grep -q 'no gh credential for the lane' "$TMP/b2f.log"; rc=$?
 ck "B2f2 …and the refusal names the credential with the dirs it checked" $rc
 grep -q '\[gh-auth\] state=none' "$TMP/b2f.log"; rc=$?
 ck "B2f3 …and the lane log carries state=none, so the land-backlog line is not the only evidence" $rc
+
+# B2g: a BLANK-BUT-SET GH_TOKEN, with the account home HOLDING a store — the exact shape pre-fix printed
+# `state=account at …`, exported an inert config dir, and then asserted "the lane's gh IS credentialed" over
+# a lane whose every gh call fails (measured: gh resolves the whitespace INSTEAD of any store). The account
+# home is REALly populated here on purpose: the arm's job is that the store is NOT claimed.
+run_lane 81 15 "P0-blocker,harness" "crash on boot" ok 2518 b2g "$ACCT" GH_TOKEN='   '
+{ [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "B2g a blank-but-set GH_TOKEN is HELD (rc=$LANE_RC) even though the account home HAS a store, and no session ran" $rc
+grep -q 'GH_TOKEN is set but BLANK' "$TMP/b2g.log"; rc=$?
+ck "B2g2 …and the refusal names the blank token as the credential cause" $rc
+grep -q 'IS credentialed' "$TMP/b2g.log" && rc=1 || rc=0
+ck "B2g3 …and never asserts the lane's gh IS credentialed (the false claim this arm exists to remove)" $rc
+grep -q '\[gh-auth\] state=token-blank dir=- ' "$TMP/b2g.log"; rc=$?
+ck "B2g4 …and the lane log says state=token-blank with NO dir=, so nothing reads as a store that was exported ('$(grep -o 'state=[^ ]* dir=[^ ]*' "$TMP/b2g.log" | head -1)')" $rc
 
 # B3: the module absent (a $O half-synced by a commit that predates it) changes NOTHING but the log.
 # ⛔ THE CREDENTIAL IS GIVEN AMBIENTLY HERE ON PURPOSE, so this arm tests the ONE thing it claims: an
