@@ -771,32 +771,54 @@ fi
 # ⛔ THE PREDICATE IS TOKEN-STRICT, AND THAT IS A MEASURED CHOICE, NOT A STYLE ONE.
 # A lane process is one whose OWN argv names it as a lane: a token whose basename is `pi` (pi sets its
 # process title, so a live lane reads as `pi` or `pi -p --provider …` in `ps`), or a token naming one of
-# the lane scripts the launcher runs. That is the same argv-shape rule `_counts_as_lane` (above) uses for
-# its first loop, and it covers BOTH shapes this box runs — the durable-terminal `pi` and the
-# `bash …/nonblocking-dispatch.sh …` subshell the drainer records.
+# the lane scripts the launcher runs. It covers BOTH shapes this box runs — the durable-terminal `pi` and
+# the `bash …/nonblocking-dispatch.sh …` subshell the drainer records.
+# ⛔ IT IS A SUPERSET OF `_counts_as_lane`'s FIRST LOOP, NOT THE SAME RULE (#3882 review). That loop
+# accepts a bare `pi` or a token whose ABSOLUTE-PATH basename is `pi` (`case "$t" in /*) b="${t##*/}" ;;`),
+# so `./pi` and `bin/pi` do NOT match there — while `pi` here comes from `${t##*/}` on EVERY token
+# (MEASURED: `./pi -p x` → `_counts_as_lane`=N, `_is_lane_process`=Y; `node /usr/local/bin/pi` → Y in
+# both). Broader is the safe direction for a bound, but it is a DIFFERENT rule and must not be cited as
+# the same one.
 # ⛔ IT IS DELIBERATELY STRICTER THAN `_counts_as_lane`'s SECOND LOOP, which matches those script names as
 # a SUBSTRING of the whole command line. Measured on the operator's Mac 2026-11-11: that form returned
 # **43** matches, four of which were the diagnostic's own `bash -c '… nonblocking-dispatch.sh …'` text —
 # the same self-match lane.sh:88 records for `pgrep -f "pi -p"`. A predicate that counts the shells which
 # merely MENTION a lane script cannot bound anything: on a box whose agents quote these names it reads
 # high enough that the clamp never fires, i.e. the fix would be INERT and the log would look clean.
-# Token-strict returned 39 on that same box: the same real lanes, none of the diagnostic text.
+# Token-strict returned 39 on that same box: the same real lanes, none of the quoted diagnostic text.
+# ⛔ BUT STRICTER IS NOT IMMUNE, and the residual is stated rather than implied (#3882 review). A mention
+# that is a BARE TOKEN still counts: `bash -c sleep 1; nonblocking-dispatch.sh --flag` → counted. So does
+# any diagnostic whose own argv carries a bare lane token — `ps -A -o command= | grep -c pi` matches on
+# `pi` (MEASURED), which is exactly the shape an operator types on the affected box. The consequence is
+# therefore REDUCED, not eliminated: such a process raises the bound and keeps the clamp inert for that
+# tick. That is still the safe direction (over-count → fewer dispatches), and it is why this is a bound
+# and never a census.
 # WHAT IT OVER-INCLUDES, stated so nobody reads it as a true lane count: an INTERACTIVE `pi` session on
-# the operator's Mac matches too. That is the safe direction — it can only raise the bound, never lower
-# it — and it is why this is a bound and not a census.
+# the operator's Mac matches too, as does the `grep -c pi` shape above. That is the safe direction — it
+# can only raise the bound, never lower it — and it is why this is a bound and not a census.
 # ⛔ ONE `ps` PER TICK, not one per lane: the census runs inside the lock on a 20-minute cadence, and a
 # per-lane process walk is the cost option 2 of #3882 declines.
 _is_lane_process() { # <command-line> → true when THIS argv IS a lane, not when it merely names one
-  local c="$1" t b
+  local c="$1" t b rc=1 had_f=0
   [ -n "$c" ] || return 1
+  # ⛔ GLOB-FREE, and that is the point of this line (#3882 review, MEASURED). The split below is
+  # UNQUOTED, so `for t in $c` does pathname expansion as well as word-splitting: an argv token holding a
+  # wildcard (`bash -c 'rm -f *.log'`) expands against the CWD, and this script's CWD holds `lane.sh` /
+  # `fix-one.sh` on the launchd path (`$O`). Measured with `lane.sh` and `pi` in the CWD:
+  # `_is_lane_process "bash -c echo *"` matched `lane.sh` and COUNTED. `set -f` makes the split a pure
+  # word-split, so a token can only match by its own text. The prior option is preserved and restored on
+  # the single exit path; the blast radius is a subshell anyway — the only caller chain is
+  # `_census_launcher` → `_live_lane_processes` → here, and `_census_launcher` is read through a `$(…)`.
+  case $- in *f*) had_f=1 ;; *) set -f ;; esac
   for t in $c; do
     b="${t##*/}"
-    [ "$b" = "pi" ] && return 0
+    if [ "$b" = "pi" ]; then rc=0; break; fi
     case "$b" in
-      nonblocking-dispatch.sh|bg-dispatch.sh|lane.sh|fix-one.sh|merge-one.sh|chain-merge.sh|dispatch-merge.sh) return 0 ;;
+      nonblocking-dispatch.sh|bg-dispatch.sh|lane.sh|fix-one.sh|merge-one.sh|chain-merge.sh|dispatch-merge.sh) rc=0; break ;;
     esac
   done
-  return 1
+  [ "$had_f" = "1" ] || set +f
+  return "$rc"
 }
 _live_lane_processes() { # prints the count of live lane processes, or nothing when `ps` cannot answer
   local out c n=0

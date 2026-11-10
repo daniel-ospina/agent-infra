@@ -103,6 +103,9 @@ chmod +x "$DISPATCH"
 #   RUN_PRESSURE    the Darwin `kern.memorystatus_vm_pressure_level` to assume (1|2|4|unreadable)
 #   RUN_MAX_PRESSURE  MAX_MEM_PRESSURE_LEVEL (the Darwin refuse-at threshold)
 #   RUN_WT_MOD      worker-terminal.sh for the launcher census     default: a path that does not exist
+#   RUN_CWD         the CWD one arm runs the drainer from          default: this suite's own CWD
+#                   (for the #3882 glob arm: the token split must not pathname-expand, and that can
+#                   only be OBSERVED from a CWD that holds lane-shaped filenames)
 _drainer_env() { # <tag> → echoes the env assignments, one per line (callers use `env`)
   local o="$ROOT/o-$1" ai="$ROOT/ai-$1"
   # The channel: the fixture seed by default, `RUN_FLEET_REPO` to name one, and `RUN_NO_FLEET_REPO=1` for
@@ -143,7 +146,7 @@ run_drainer_fg() { # <tag> [drainer-path] → sets LAST_RC
   # ⛔ THE OPERATOR'S `REPO` MUST NOT DECIDE THIS SUITE'S CHANNEL (fresh review round 7). The drainer's own
   # default chain is `FLEET_REPO -> REPO -> (refuse)`, and a lane shell routinely exports `REPO` for its
   # own work; inheriting it made (f3) read a REAL fleet channel instead of the fixture's originless seed.
-  env -u REPO -u SWAP_FREE_MB -u SWAP_TOTAL_MB "${envs[@]}" bash "$script" >/dev/null 2>&1
+  ( cd "${RUN_CWD:-.}" && env -u REPO -u SWAP_FREE_MB -u SWAP_TOTAL_MB "${envs[@]}" bash "$script" ) >/dev/null 2>&1
   LAST_RC=$?
   LAST_O="$ROOT/o-$tag"; LAST_AI="$ROOT/ai-$tag"
   return 0
@@ -163,7 +166,7 @@ dispatched() { # <log> → the number of DISPATCHED lines (0 when the log does n
 # asserts (measured during development: nine arms went red off one leaked seam).
 reset_run() {
   RUN_TARGET=; RUN_MAX_LANES=; RUN_NCPU=; RUN_MEM=; RUN_LOAD=; RUN_SWAP=; RUN_SWAP_TOTAL=
-  RUN_LANE_TIMEOUT=; RUN_SLICE_WIDTH=; RUN_SLICE_TOTAL=; RUN_RC_GRACE=; RUN_WT_MOD=; RUN_PS=
+  RUN_LANE_TIMEOUT=; RUN_SLICE_WIDTH=; RUN_SLICE_TOTAL=; RUN_RC_GRACE=; RUN_WT_MOD=; RUN_PS=; RUN_CWD=
   RUN_DRAINER_OS=; RUN_PRESSURE=; RUN_MAX_PRESSURE=
   RUN_FLEET_REPO=; RUN_NO_FLEET_REPO=0; RUN_SEED_REPO=; RUN_CAPACITY_MOD=; RUN_EXPECTED=
   FAKE_LANE_SECS=0; FAKE_RC=0; FAKE_NO_PIDFILE=0; FAKE_DISPATCH_SLEEP=0
@@ -610,6 +613,36 @@ check "(s4) …and a shell whose argv only NAMES a lane script is NOT counted as
   "$(grep "census-mismatch" "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
+# ── (s5) ⛔ THE TOKEN SPLIT MUST NOT PATHNAME-EXPAND (#3882 review, P3) ───────────────────────
+# The split in `_is_lane_process` is UNQUOTED, so `for t in $c` GLOBS as well as splits. A process whose
+# argv holds a wildcard (`bash -c 'rm -f *.log'`) had that token expanded against the drainer's CWD — and
+# on the launchd path that CWD is `$O`, which holds `lane.sh` / `fix-one.sh`. So a wildcard could MATCH a
+# lane script and inflate `procs`, holding the clamp inert exactly when someone is diagnosing the box.
+# MEASURED before the `set -f` fix — with lane.sh + fix-one.sh + pi in the CWD:
+#   _is_lane_process "bash -c echo *"   → COUNTED (the `*` expanded to lane.sh)
+# This arm is what goes red if the globbing ever returns: the population is ONE command line whose only
+# lane-ish text is a wildcard, from a CWD that holds three lane-shaped filenames, and the reading must
+# be pi=0.
+cat >"$STUB/worker-terminal.sh" <<'WT_EOF'
+WT_TREE_PY="stub"; WT_WS_PY="stub"
+wt_table() { printf 'lane-1\talive\n'; }
+wt_count() { printf '34\n'; }
+WT_EOF
+mkdir -p "$ROOT/globby"
+: >"$ROOT/globby/lane.sh"; : >"$ROOT/globby/fix-one.sh"; : >"$ROOT/globby/pi"
+cat >"$ROOT/ps-glob" <<'PSG_EOF'
+#!/usr/bin/env bash
+case "$*" in *"-p "*) exec ps "$@" ;; esac
+printf '%s\n' "/bin/bash -c echo *"
+PSG_EOF
+chmod +x "$ROOT/ps-glob"
+RUN_WT_MOD="$STUB/worker-terminal.sh" RUN_PS="$ROOT/ps-glob" RUN_CWD="$ROOT/globby" RUN_TARGET=2
+run_drainer_fg s5
+check "(s5) a WILDCARD in an argv is not expanded into a lane (CWD holds lane.sh, fix-one.sh, pi)" \
+  'grep -q "census-mismatch launcher=34 pi=0 clamped=0" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E "alive=|census-mismatch" "$LAST_AI/logs/ai-drainer.log" | head -2 | tr '\n' ' ')"
+
+reset_run
 # ── ARM (g): THE VERDICT — a lane's own exit status, settled by the NEXT tick ────────────────
 FAKE_LANE_SECS=0 FAKE_RC=0 RUN_TARGET=1
 run_drainer_fg g
@@ -843,7 +876,11 @@ for i in 1 2 3; do
     FAKE_LANE_SECS=90 RC_GRACE_S=1 bash "$DRAINER" >/dev/null 2>&1 & echo "$!" >>"$ROOT/pids-m" ) 2>/dev/null
 done
 i=0; while [ "$i" -lt 100 ]; do
-  [ "$(grep -c 'START:' "$ai/logs/ai-drainer.log" 2>/dev/null || echo 0)" -ge 1 ] && break
+  # ⛔ `grep -c` PRINTS `0` AND EXITS 1, so `|| echo 0` appended a SECOND `0` and the `[ … -ge 1 ]`
+  # below died with "integer expression expected" — the loop then polled to its bound instead of
+  # breaking early. Slow, not wrong, which is why it survived (#3882 review, pre-existing).
+  n="$(grep -c 'START:' "$ai/logs/ai-drainer.log" 2>/dev/null)" || n=0
+  [ "$n" -ge 1 ] && break
   sleep 0.2; i=$((i + 1))
 done
 # ⛔ WAIT FOR THE CONTENDERS TO EXIT, NOT FOR A FIXED WINDOW (review round 3). Each tick now also takes
@@ -855,7 +892,7 @@ for pid in $(cat "$ROOT/pids-m" 2>/dev/null); do
   i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 150 ]; do sleep 0.2; i=$((i + 1)); done
 done
 check "(m) three ticks racing over ONE stale lock dispatch from exactly ONE of them" \
-  '[ "$(grep -c "START:" "$ai/logs/ai-drainer.log" 2>/dev/null || echo 0)" -eq 1 ] && [ "$(dispatched "$ai/logs/ai-drainer.log")" -eq 2 ]' \
+  'n="$(grep -c "START:" "$ai/logs/ai-drainer.log" 2>/dev/null)" || n=0; [ "$n" -eq 1 ] && [ "$(dispatched "$ai/logs/ai-drainer.log")" -eq 2 ]' \
   "starts=$(grep -c 'START:' "$ai/logs/ai-drainer.log" 2>/dev/null) dispatched=$(dispatched "$ai/logs/ai-drainer.log")"
 
 reset_run
