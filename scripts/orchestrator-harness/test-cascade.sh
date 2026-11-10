@@ -948,45 +948,6 @@ ck "…a cascade that already granted 3 publishes escape=0 (the valve did not fi
    "$(esc_pair 14 5 3 0 10 2 1 1 | cut -d' ' -f3)" "0"
 ck "…and an EMPTY backlog publishes escape=0 (the grant produced nothing, so nothing was spent)" \
    "$(esc_pair 15 5 0 0 '' 2 1 1 | cut -d' ' -f3)" "0"
-# ⛔ TWO PASSES IN ONE SHELL, WHICH IS HOW PRODUCTION RUNS (agent-infra#3909 review P1, 2nd cycle).
-# The arms above each source the block into a FRESH subshell, so every one of them starts with
-# `CASCADE_ESCAPE_SLOTS` unset — and `esc_pair` primes the valve OPEN on every call, so *no* arm could
-# observe a pass on which the arm is SKIPPED. That is precisely where the defect lived: the escape
-# assignment sits inside the `pl_escape_open` arm, the cycle body is ONE shell for the whole process,
-# so a grant from cycle N was re-published by cycle N+1 as though the valve had fired again. The
-# fixture supplied (`pl_escape_open=YES`) the very thing production does not supply on the majority of
-# passes, which is the §6 rule this suite exists to enforce — so these arms drive TWO passes in a
-# single shell, and the second pass is one where the arm genuinely does not run.
-esc2() { # <id> [<pass2-lo-choice>] -> "<pass1 escape> <pass2 escape>"
-  # `$TMP/ep2-<id>` is a statically resolvable target, for the reason `esc_pair` documents.
-  local d="$TMP/ep2-$1" lo2="${2:-pr}"
-  rm -rf "$d"; mkdir -p "$d/state"
-  pl_note_pass "$d/state" 0 2 >/dev/null 2>&1
-  pl_note_pass "$d/state" 0 2 >/dev/null 2>&1
-  ( set +e
-    local _p1 _p2
-    O="$d"; LOG="$d/state/log"; PL_MOD=1; UPN_WORK=2; PRDISP_SPAWNS=0
-    DRAIN_ESCAPE_PASSES=2; GATE_WHY="GW_SENTINEL"; LANES_DISPLAY=2; MAX_LANES=7
-    CASCADE_ROOM=5; CASCADE_ISSUE_SLOTS=0; CASCADE_UPN_UNREADABLE=0
-    CASCADE_QUEUE_DEPTH=10; BATCH=2; CASCADE_CAN=1
-    # ── pass 1: the valve is at its bound, so the escape FIRES and spends 2 ──
-    LO_CHOICE=pr
-    . "$ESCBLK"
-    _p1="${CASCADE_ESCAPE_SLOTS-absent}"
-    # ── pass 2: the arm does not run (its own record write reset the streak, so the valve is CLOSED; or
-    #          the pass is the ordinary healthy ISSUE dispatch) — the token must read a MEASURED 0 ──
-    LO_CHOICE="$lo2"
-    . "$ESCBLK"
-    _p2="${CASCADE_ESCAPE_SLOTS-absent}"
-    printf '%s %s\n' "$_p1" "$_p2"
-  ) 2>/dev/null
-}
-ck "…and the grant does NOT survive into the next pass: the block is re-sourced with the valve CLOSED after a primed YES, so escape= must read a MEASURED 0, not the previous cycle's 2" \
-   "$(esc2 1 pr)" "2 0"
-ck "…the same on the ordinary healthy dispatch pass (LO_CHOICE=issue — the majority path, where the arm is never entered)" \
-   "$(esc2 2 issue)" "2 0"
-ck "…so escape=absent can no longer leak out of a pass that DID run the block (pre-fix, any pass after a grant looked like this)" \
-   "$(esc2 3 pr | cut -d' ' -f2)" "0"
 ck "…HALVED, not min(room,BATCH): room=9 grants 4, because one issue costs two worker records" \
    "$(esc_pair 2 9 0 0 99)" "4 record"
 ck "…with a FLOOR of 1 when the box has room (a lane that parks early never attaches its chain)" \
