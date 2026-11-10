@@ -147,6 +147,10 @@
 # release it:
 #   * `--reap-abandoned-wip` unarmed and a dirty tree past the WIP floor => why=opt-in-off
 #   * the stash / unpushed abstention withheld it, past the floor        => why=withheld-by-abstention
+#   * the tree holds NON-REGENERABLE IGNORED data, past the WIP floor    => why=ignored-data-held
+#     (no flag moves that class at all — `--reap-abandoned-wip` only enters the DIRTY case — so it is
+#     the same "blocked for ever" shape, and `ignored-artifact` was measured as the largest preserve
+#     bucket in a real pass: `reasons=ignored-artifact:70`, 20,557 MB, `:855-857`)
 # `floor=<n>h` is the class floor that record is PAST, so every emitted value is a real floor from
 # `--help`'s vocabulary — never a bound that could not be applied (review round 2, PR #3881: an
 # earlier revision printed hour floors for records whose age could not be read).
@@ -1065,6 +1069,16 @@ in force — always an hour count, because a record that cannot be dated is not 
 removal that FAILED (unverified backup, removal-time re-check) is deliberately NOT listed either: it
 is counted under \`remove=\` and reported by \`failed=\`/exit 4, and keeping it out is what makes
 \`stalled=\` an exact SUBSET of \`preserved=\`. The bound is the class floor plus one sweep.
+
+A record is NAMED on that list for one of three reasons (the row's \`why=\`):
+  why=opt-in-off            dirty tree past its floor, \`--reap-abandoned-wip\` unarmed
+  why=withheld-by-abstention a STASH ENTRY names the branch, past its floor (durable parked work)
+  why=ignored-data-held     the tree holds NON-REGENERABLE IGNORED data past its floor — no flag
+                            moves that class at all, so only an operator can release it
+The two floors a listed row can name, both operator-settable:
+  REAP_WT_GHOST_AGE_HOURS (2)   the clean 0-commits-ahead lane class (ghost-zero-ahead)
+  REAP_WT_WIP_AGE_HOURS   (24)  the dirty and non-regenerable-ignored-data classes
+A record INSIDE its floor is never listed: the next sweep resolves it.
 
 `git worktree remove` deletes the CHECKOUT, never the branch — named-branch
 worktrees lose no commits, and this script never runs \`git branch -D\`.
@@ -4217,7 +4231,27 @@ classify_one() {
                 return 0
             fi
             printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s\n' "$cpay"; return 0 ;;
-        ignored-artifact) printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s\n' "$cpay"; return 0 ;;
+        ignored-artifact)
+            # ⛔ THIS ARM IS THE OTHER WAY A RECORD IS BLOCKED FOR EVER, SO IT IS NAMED TOO (review
+            # round 5, PR #3881). `rule=2` preserves this class on EVERY pass and NO flag moves it
+            # (`--reap-abandoned-wip` only enters the DIRTY case above), so a 0-commits-ahead lane
+            # record whose tree holds non-regenerable ignored data blocks its issue indefinitely while
+            # the row reads as routine — and `clean_gate`'s own measurement records
+            # `ignored-artifact` as the largest preserve bucket in a real pass (`:855-857`).
+            # ⛔ IT CHANGES NO VERDICT: the row is `preserve` on both paths; only the detail gains the
+            # token. The gates ARE the abandoned-wip arm's — 0 commits ahead (`refs=merged` is the
+            # test), lane-owned, past a floor — plus round 2's rule that a TRANSIENT unreadable probe
+            # (`claim=unknown`) is resolved by the next pass and so is never listed. The floor is the
+            # WIP one, not the 2 h ghost floor: the files this class holds are NOT regenerable, so it
+            # is the data-holding class, and it is never auto-released (owner decision, #2179).
+            if [ "$claim" != "unknown" ] && is_lane_branch "$branch" && [ "$wt_ok" = 1 ] \
+                    && [ "$((now - wt_ts))" -gt "$((REAP_WT_WIP_AGE_HOURS * 3600))" ] \
+                    && [ "$(commits_survive "$sha" "$branch")" = "merged" ]; then
+                printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s %s\n' "$cpay" \
+                    "$(stalled_tok ignored-artifact "$issue" "$(age_h_ceil "$now" "$wt_ts")" "${REAP_WT_WIP_AGE_HOURS}h" ignored-data-held)"
+                return 0
+            fi
+            printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s\n' "$cpay"; return 0 ;;
         status-timeout)   printf 'preserve\tstatus-timeout\t\trule=2 proof=git-status:timeout %s\n' "$cpay"; return 0 ;;
         *)                printf 'preserve\tstatus-error\t\trule=2 proof=git-status:error %s\n' "$cpay"; return 0 ;;
     esac

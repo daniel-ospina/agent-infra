@@ -3774,6 +3774,50 @@ assert_contains "$ROW" "age=25h floor=${REAP_WT_WIP_AGE_HOURS_OVERRIDE:-24}h" \
     "A29j a 24h30m record reads age=25h, NOT age=24h — the row must SHOW it is past its 24h floor"
 assert_dir "$WT" "A29j the abstention still kept the checkout"
 
+# ── A29k/A29l: a 0-ahead record holding NON-REGENERABLE IGNORED data is named too ───────────
+# ⛔ THE OTHER WAY A RECORD IS BLOCKED FOR EVER (review round 5, PR #3881). `ignored-artifact` is a
+# `rule=2` PRESERVE with no flag behind it — `--reap-abandoned-wip` only enters the DIRTY case — so a
+# 0-commits-ahead lane record whose tree holds an ignored non-cache artifact blocks its issue on every
+# pass while its row reads as routine. It is the largest preserve bucket measured in a real pass
+# (`reasons=ignored-artifact:70`, 20,557 MB), which is why #2179 §Required 2 cannot be honoured for
+# this class by leaving it unnamed. A29k pins the listing (past the WIP floor); A29l pins the floor
+# itself (a fresh lane checkout holding node_modules/data must NOT be published as residue).
+ENV=A29k; REPO="$(mk_repo $ENV)"
+printf 'data/\n' >"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm ignore
+WT="$(add_named_wt "$REPO" "$ENV-data" feat/2952-tm)"     # 0 ahead; only IGNORED data below
+mkdir -p "$WT/data"; printf 'z\n' >"$WT/data/notes.txt"
+rm -f "$T/$ENV/reap.log"
+NOW_K="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 24 * 3600 + 1800 ))"   # 24h30m => age=25h
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_K" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29k non-vacuity: the fixture is classified by the ignored-artifact arm"
+assert_contains "$ROW" "stalled=1 class=ignored-artifact" \
+    "A29k a 0-ahead lane record holding ignored NON-regenerable data is NAMED, not silently preserved"
+assert_contains "$ROW" "age=25h floor=${REAP_WT_WIP_AGE_HOURS_OVERRIDE:-24}h" \
+    "A29k …with its real age past the WIP floor (the data-holding class, never the 2h ghost floor)"
+assert_contains "$ROW" "why=ignored-data-held" \
+    "A29k …and the reason no later pass moves it (no flag enters this class at all)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" \
+    "A29k the tally carries it (still a subset of preserved=)"
+assert_dir "$WT" "A29k nothing was removed — this class is NAMED for an operator, never reaped on age"
+
+# A29l: the same record INSIDE the floor must stay off the list. `worktree add` → the first build
+# artifact is exactly the window the floor covers, so listing a checkout assembled minutes ago would
+# publish a live lane as stale residue.
+NOW_L="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 60 ))"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_L" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29l non-vacuity: still the ignored-artifact arm (an empty row would pass on anything)"
+assert_absent "$ROW" "stalled=1" \
+    "A29l a record INSIDE its WIP floor is NOT listed — the next sweep resolves it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29l …so the tally is 0"
+
 # ── A29-MUT: the COLLECTOR is load-bearing (drop it and A29a goes red) ───────────────────
 # The token is emitted inside `classify_one`, which runs in a command substitution, so the parent's
 # `case` is the ONLY thing that turns it into a list. Neutering that pattern leaves every row
