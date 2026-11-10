@@ -140,27 +140,31 @@
 # can be asserted from here: a record it RELEASES is removed AND its 0-ahead lane ref deleted, so the
 # issue it named is dispatchable again on the next pre-flight; a record it does NOT release is either
 # inside its floor (nothing to assert yet — the next sweep acts) or on the STALLED list, NAMED with
-# the issue, its age and the reason no floor will move it. `floor=none` is the strongest of those: the
-# class's release switch is off, so no later pass releases it at all.
+# the issue, its age, the class floor it is past, and the reason no later pass will move it.
 #
 # WHAT PUTS A RECORD ON THE LIST — only 0-commits-ahead lane residue (`refs=merged`, i.e. the branch
-# holds no commit the main ref does not), past its class floor, and only when this pass could not
+# holds no commit the main ref does not), PAST its class floor, and only when this pass could not
 # release it:
 #   * `--reap-abandoned-wip` unarmed and a dirty tree past the WIP floor => why=opt-in-off
-#   * the stash / unpushed abstention withheld it         => why=withheld-by-abstention
-#   * the claim registry or the checkout age unreadable  => why=claim-registry-unreadable /
-#                                                           why=worktree-age-unreadable
-# The `floor=` field carries that class floor (`<n>h`) or `none`, which means NO floor will move the
-# record at all.
-# A LIVE CLAIM is NOT stalled (the issue is held by a lease, which expires) and a record inside its
-# floor is NOT stalled (the next sweep resolves it), so neither appears.
+#   * the stash / unpushed abstention withheld it, past the floor        => why=withheld-by-abstention
+# `floor=<n>h` is the class floor that record is PAST, so every emitted value is a real floor from
+# `--help`'s vocabulary — never a bound that could not be applied (review round 2, PR #3881: an
+# earlier revision printed hour floors for records whose age could not be read).
 #
-# ⛔ WHAT IS DELIBERATELY NOT ON THE LIST — a SELECTED REMOVAL THAT FAILED (`backup-unverified`,
+# ⛔ FOUR STATES ARE DELIBERATELY NOT STALLED, each for a stated reason:
+#   * a LIVE CLAIM — the issue is held by a lease, and leases expire;
+#   * a record INSIDE its floor — the next sweep resolves it, i.e. the bound is holding;
+#   * `claim-unverified` / `unreadable-worktree-age` — both are evaluated BEFORE the class-floor test,
+#     and `claims_load` re-reads the registry at the TOP OF EVERY PASS, so neither is a state "no
+#     later pass can resolve". Listing them published records that were inside their floor (round 2);
+#   * a SELECTED REMOVAL THAT FAILED — see below.
+#
+# ⛔ AND A SELECTED REMOVAL THAT FAILED IS NOT ON IT EITHER (`backup-unverified`,
 # `removal-time-recheck`). It is past its floor and unremoved, so it belongs in spirit; it is kept off
 # because those records are counted in `remove=`, and folding them in would make `stalled` NOT a
 # subset of `preserved` — a tally whose meaning silently depended on `failed=`/`late_preserved=` (review,
 # PR #3881). Those failures are already unmissable: `FAILED=` + exit 4, and `BACKUP-UNVERIFIED-KEEP` /
-# `PRESERVED-LATE` on the pass log. So the invariant below stays exact: `stalled` ⊆ `preserved`.
+# `PRESERVED-LATE` on the pass log. So the invariant stays exact: `stalled` ⊆ `preserved`.
 # The list is `log_line` output on stdout, so it reaches whoever ran the pass; the tally travels as
 # `stalled=<n>` on the SUMMARY line and `STALLED=<n>` on the footer.
 #
@@ -1057,9 +1061,10 @@ fail-closed abort) neither writes nor deletes it.
 residue this pass did NOT release and no later pass will release on its own. It is
 a SUBSET of \`preserved=\`. A non-zero tally prints the list itself, each row
 naming the ISSUE its branch holds out of dispatch, with the reason and the floor
-in force. A selected removal that FAILED (unverified backup, removal-time re-check) is deliberately
-NOT listed: it is counted under \`remove=\` and reported by \`failed=\`/exit 4, and keeping it out is
-what makes \`stalled=\` an exact SUBSET of \`preserved=\`. The bound is the class floor plus one sweep.
+in force — always an hour count, because a record that cannot be dated is not listed. A selected
+removal that FAILED (unverified backup, removal-time re-check) is deliberately NOT listed either: it
+is counted under \`remove=\` and reported by \`failed=\`/exit 4, and keeping it out is what makes
+\`stalled=\` an exact SUBSET of \`preserved=\`. The bound is the class floor plus one sweep.
 
 `git worktree remove` deletes the CHECKOUT, never the branch — named-branch
 worktrees lose no commits, and this script never runs \`git branch -D\`.
@@ -2877,9 +2882,9 @@ is_lane_branch() { # <branch-ref> -> 0 when the harness itself created this bran
 # ⛔ IT RIDES ON THE ROW'S DETAIL FIELD, not on a shell global, and that is forced by the caller's
 # shape: `classify_one` runs inside `crumb="$(classify_one …)"`, i.e. a COMMAND SUBSTITUTION, so every
 # variable it sets dies with that subshell. A token in the row is the only channel that survives, and
-# it is the same channel the parent already reads for `refs=remote-holds:`. `<floor>` is `none` when NO
-# releasing floor is in force (the class's release switch is off) — which is a STRONGER statement than
-# a floor that has merely not been reached, and the two must not read alike.
+# it is the same channel the parent already reads for `refs=remote-holds:`. `<floor>` is the class
+# floor (hours) the record is PAST — every caller applies that floor before emitting (review round 2,
+# PR #3881: a floor quoted for a record that cannot be dated states a bound that was never applied).
 stalled_tok() {
     # ⛔ AN EMPTY ISSUE PRINTS `?`, NEVER A BARE `#` (review, PR #3881): `issue=#` is a field an
     # operator cannot read and a test cannot match, and both classes that call this are lane-owned
@@ -4117,6 +4122,14 @@ classify_one() {
             if [ "$REAP_WT_WIP" != 1 ] && is_lane_branch "$branch" \
                     && [ "$(commits_survive "$sha" "$branch")" = "merged" ]; then
                 _st_age="?"
+                if [ "$wt_ok" != 1 ]; then
+                    # ⛔ A RECORD THAT CANNOT BE DATED CANNOT BE "PAST ITS FLOOR" (review round 2,
+                    # PR #3881): listing it would state a floor that was never applied. The row names
+                    # the state; the class is preserved exactly as before.
+                    printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s (cannot date the checkout, so the %sh abandoned-wip floor cannot be applied)\n' \
+                        "$cpay" "$REAP_WT_WIP_AGE_HOURS"
+                    return 0
+                fi
                 if [ "$wt_ok" = 1 ]; then
                     _st_age=$(((now - wt_ts) / 3600))
                     # ⛔ THE CLASS FLOOR STILL APPLIES WITH THE SWITCH OFF (review, PR #3881). It is
@@ -4142,18 +4155,15 @@ classify_one() {
             # and even then the removal is gated on a VERIFIED backup (`backup_before_removal`, which
             # the run loop runs BEFORE `remove_one_forced`). Nothing here is default behaviour.
             if [ "$REAP_WT_WIP" = 1 ] && is_lane_branch "$branch"; then
-                # ⛔ `refs` IS COMPUTED BEFORE THE CLAIM GATE (review, PR #3881). Main's order ran the
-                # claim check FIRST, so a token emitted there claimed the 0-ahead class before any
-                # 0-ahead probe had run — and a dirty `feat/<N>-tm` worktree HOLDING N unpushed commits
-                # would have been published as 0-commits-ahead residue. The probe moves up (it decides
-                # nothing on this path) and the token is emitted only on `refs=merged`.
-                refs="$(commits_survive "$sha" "$branch")"
                 if [ "$claim" = "unknown" ]; then
-                    _st=""
-                    [ "$refs" = "merged" ] && _st=" $(stalled_tok abandoned-wip "$issue" "$([ "$wt_ok" = 1 ] && echo $(((now - wt_ts) / 3600)) || echo '?')" "${REAP_WT_WIP_AGE_HOURS}h" claim-registry-unreadable)"
-                    printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)%s\n' "${issue:-?}" "$_st"
+                    # ⛔ NOT ON THE STALLED LIST (review round 2, PR #3881): this gate runs before the
+                    # class-floor test below, and `claims_load` re-reads the registry every pass — so
+                    # both the "past its floor" qualifier and the "no later pass can resolve it" test
+                    # fail here. Nothing is emitted but the abstention itself.
+                    printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
                     return 0
                 fi
+                refs="$(commits_survive "$sha" "$branch")"
                 case "$refs" in
                     merged) : ;;
                     *)
@@ -4166,9 +4176,9 @@ classify_one() {
                     # The floor exists to protect a checkout someone may still be working in. If the
                     # CHECKOUT's age cannot be read, that floor cannot be applied — abstain rather than
                     # reap on the base commit's date, which is what made the floor decorative.
-                    # #2179: an unreadable datum is not a transient that resolves itself either.
-                    printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_WIP_AGE_HOURS cannot be applied) %s\n' "$path" \
-                        "$(stalled_tok abandoned-wip "$issue" '?' "${REAP_WT_WIP_AGE_HOURS}h" worktree-age-unreadable)"
+                    # ⛔ NOT LISTED (review round 2, PR #3881): the token would print a floor for a
+                    # record whose age could not be read, i.e. a bound that cannot be applied to it.
+                    printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_WIP_AGE_HOURS cannot be applied)\n' "$path"
                     return 0
                 fi
                 if [ "$((now - wt_ts))" -le "$((REAP_WT_WIP_AGE_HOURS * 3600))" ]; then
@@ -4302,18 +4312,23 @@ classify_one() {
         # a non-lane branch keeps the operator's full cooldown, so this widens nothing else.
         if is_lane_branch "$branch"; then
             if [ "$claim" = "unknown" ]; then
-                # #2179: `refs=merged` (this arm's own precondition) is the 0-ahead test, so an
-                # unreadable registry leaves a lane record nothing in the fleet will ever retry.
-                printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed) %s\n' "${issue:-?}" \
-                    "$(stalled_tok ghost-zero-ahead "$issue" "$([ "$wt_ok" = 1 ] && echo $(((now - wt_ts) / 3600)) || echo '?')" "${REAP_WT_GHOST_AGE_HOURS}h" claim-registry-unreadable)"
+                # ⛔ NOT ON THE STALLED LIST (review round 2, PR #3881), and two reasons that both
+                # matter: (a) this gate runs BEFORE the class-floor test below, so listing here would
+                # publish a record that is INSIDE its floor — the qualifier the list is built on; and
+                # (b) `claims_load` re-reads the registry at the TOP OF EVERY PASS, so an unreadable
+                # registry is resolved by the next sweep with no operator action. A stalled entry is
+                # by definition a state no later pass can resolve, and this is not one.
+                printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
                 return 0
             fi
             if [ "$wt_ok" != 1 ]; then
                 # Same fail-closed rule as abandoned-wip: the ghost floor is the ONLY thing separating a
                 # dispatch that started seconds ago from residue, so it must be applied on the
                 # checkout's own age or not at all.
-                printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_GHOST_AGE_HOURS cannot be applied) %s\n' "$path" \
-                    "$(stalled_tok ghost-zero-ahead "$issue" '?' "${REAP_WT_GHOST_AGE_HOURS}h" worktree-age-unreadable)"
+                # ⛔ NOT LISTED, and the same two reasons as the claim gate above: it runs before the
+                # floor test, and it prints a floor for a record whose age could not be read — i.e. a
+                # bound that cannot be applied to it. The row already NAMES the state.
+                printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_GHOST_AGE_HOURS cannot be applied)\n' "$path"
                 return 0
             fi
             if [ "$((now - wt_ts))" -le "$((REAP_WT_GHOST_AGE_HOURS * 3600))" ]; then
@@ -5804,8 +5819,8 @@ run() {
         done <<<"$STALLED_LIST"
         log_line "  each row names the ISSUE its branch holds out of dispatch. Release a dirty record with"
         log_line "  \`--reap-abandoned-wip\` (backup verified FIRST), or land/complete the work; a record that"
-        log_line "  stays here past its bound IS the #2179 defect. floor=<n>h is the class floor in force;"
-        log_line "  floor=none means no floor will move the record at all."
+        log_line "  stays here past its bound IS the #2179 defect."
+        log_line "  floor=<n>h is the class floor it is past."
     fi
 
     log_line ""

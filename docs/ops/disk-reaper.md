@@ -1233,7 +1233,8 @@ pass did NOT release and no later pass will release on its own. It is an exact S
 `preserved=` — a selected removal that failed is counted under `remove=` and reported by
 `failed=`/exit 4 instead, so `preserved - stalled` can never underflow. A non-zero tally is followed
 by the list itself, each row naming the ISSUE its branch holds out of dispatch with its age, its
-class floor (`<n>h`, or `none` when no floor will move it) and the reason.
+class floor it is past (`<n>h` — always an hour count: a record that cannot be dated is never listed)
+and the reason.
 
 ⛔ **`verdict=` is the pass's own ANSWER, and the counters alone cannot supply it (#3041).** A pass
 can be perfectly self-consistent (`examined=52 classified=52 remove=0 preserved=52`) while reclaiming

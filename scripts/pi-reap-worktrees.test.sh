@@ -3642,9 +3642,13 @@ assert_absent "$(row_for "$OUT" "$WT")" "stalled=1" \
 assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29d …so the tally is 0"
 assert_dir "$WT" "A29d and its checkout is untouched"
 
-# ── A29e: an UNREADABLE claim registry on a 0-ahead record is NAMED, not silent ─────────
-# The fail-closed abstentions are the other shape no later pass resolves: nothing in the fleet retries
-# a claim read for one record, so a record preserved by `claim-unverified` sits there for ever.
+# ── A29e: an UNREADABLE claim registry is NOT stalled — it self-resolves next pass ───────
+# ⛔ THIS LEG IS THE FALSIFIER FOR A REVERT (review round 2, PR #3881). The first revision listed
+# `claim-unverified` here, on the premise that "nothing in the fleet retries a claim read for one
+# record". That premise is FALSE: `claims_load` re-reads the registry at the top of EVERY pass, so a
+# transient fetch failure is resolved by the next sweep with no operator action — and the gate runs
+# BEFORE the class-floor test, so the same revision could have listed a record created seconds ago.
+# A stalled entry must be a state NO LATER PASS can resolve. Re-adding a token to that arm reddens this.
 ENV=A29e; REPO="$(mk_repo $ENV)"; add_origin "$REPO" $ENV
 add_claim "$REPO" 2945 "$((NOW_FUTURE + 86400))"
 WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2945-tm)"
@@ -3654,10 +3658,11 @@ OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-claim-fetch" \
     run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 ROW="$(row_for "$OUT" "$WT")"
 assert_contains "$ROW" "reason=claim-unverified" "A29e the unevaluable registry still abstains (fail-closed, unchanged)"
-assert_contains "$ROW" "stalled=1 class=ghost-zero-ahead" "A29e …and the withheld record is NAMED on the list"
-assert_contains "$ROW" "why=claim-registry-unreadable" "A29e …with the reason no floor will move it"
-assert_contains "$ROW" "issue=#2945" "A29e …and the issue it holds"
 assert_dir "$WT" "A29e nothing was removed on a guess"
+assert_absent "$ROW" "stalled=1" \
+    "A29e …and the record is NOT published as stalled residue (the registry is re-read next pass)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29e …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29e …and no list is printed at all"
 
 # ── A29f: a dirty 0-ahead lane record INSIDE the WIP floor is NOT listed ──────────────────
 # The unarmed arm must still honour the class floor: it exists to cover `worktree add` -> first
