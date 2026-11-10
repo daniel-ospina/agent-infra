@@ -1120,6 +1120,18 @@ ANCHORS = {
         "*\"stalled=1 class=\"*)",
         "*\"stalled=1 class=-never\"*)",
     ),
+    # (10) DROP THE INTERRUPTED-ADD CLASS TOKEN (#2179 review round 7). That arm was the ONE
+    # 0-commits-ahead lane arm that neither released nor listed a withheld record, so this mutation IS
+    # the pre-fix code: the token argument the caller supplies is removed and a durable stash entry strands the
+    # record silently (`stalled=0` on a pass that kept the issue un-dispatchable). ⛔ THE ANCHOR IS THE
+    # CALL WITH ITS TOKEN ARGUMENT, never the bare call — the bare form ALSO appears at the aged
+    # rule site, so it matches 2 times and this registry exits 9 on anything but exactly 1 (which is
+    # the point: a re-spelling reddens A29p-MUT instead of silently skipping it). ⛔ NO APOSTROPHES IN
+    # THIS BLOCK (single-quoted `python3 -c` argument).
+    "no-interrupted-add-token": (
+        "        abstain_gate \"$path\" \"$branch\" \"$refs\" 0 \"$_ia_st\" && return 0",
+        "        abstain_gate \"$path\" \"$branch\" \"$refs\" 0 && return 0   # MUTANT: the class token is dropped",
+    ),
 }
 s = open(src).read()
 old, new = ANCHORS[name]
@@ -3882,6 +3894,66 @@ assert_absent "$ROW" "stalled=1" \
     "A29o an UNREADABLE registry keeps the ignored-data class OFF the list — it self-resolves next pass"
 assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29o …so the tally stays 0"
 assert_absent "$OUT" "STALLED REVIEW LIST" "A29o …and no list is printed at all"
+
+# ── A29p: an INTERRUPTED ADD withheld by a stash entry is NAMED, not silently stranded ───
+# ⛔ REVIEW ROUND 7, PR #3881. That arm was the ONE 0-commits-ahead lane arm that neither released nor
+# listed a withheld record: `abstain_gate` ran there with NO token, so a durable stash entry — which
+# no later pass releases, because `stranded_stash_for` re-reads the same register — left the record
+# blocked while the artifact reported `stalled=0`. That is the false "all clear" the list exists to
+# prevent, and the header states the opposite rule. Only the arm's `refs=merged` half is named:
+# `branch-retained:*` still HOLDS commits, so it is not 0-ahead residue (A29d's rule) and gets no
+# token. The fixture is A28h's interrupted add (a backdated `initializing` lock on a 0-ahead lane
+# branch) PLUS the stash-register entry A29g builds.
+ENV=A29p; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ia" feat/2961-tm)"
+printf 'partial\n' >"$WT/base.txt"            # an interrupted add reads dirty as well
+ADMIN="$REPO/.git/worktrees/$ENV-ia"
+printf 'initializing' >"$ADMIN/locked"         # git's own marker for an add that never returned
+touch -t 202001010000 "$ADMIN/locked"          # long past REAP_WT_STALE_INIT_SECONDS (1800s)
+register_stash "$REPO" feat/2961-tm            # parked lane work no later pass will release
+rm -f "$T/$ENV/reap.log"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count main..feat/2961-tm)" "0" \
+    "A29p precondition: the branch is 0 commits AHEAD — the 0-ahead residue class"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_eq "$RC" "0" "A29p a preserve-only pass is not a failed pass"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29p non-vacuity: the stash ENTRY withheld the removal (an empty row would pass on anything)"
+assert_contains "$ROW" "stalled=1 class=interrupted-add" \
+    "A29p the interrupted add IS named — 0-ahead residue this pass could not release"
+assert_contains "$ROW" "issue=#2961" "A29p …with the ISSUE it holds out of dispatch"
+assert_contains "$ROW" "floor=${REAP_WT_STALE_INIT_SECONDS:-1800}s" \
+    "A29p …and its OWN class floor, in the seconds it is actually applied in (never a rounded hour)"
+assert_contains "$ROW" "why=withheld-by-abstention" "A29p …and the reason no later pass moves it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" \
+    "A29p the tally carries it (still a subset of preserved=)"
+assert_contains "$OUT" "STALLED REVIEW LIST" "A29p the list itself is PRINTED"
+assert_contains "$OUT" "  $WT" "A29p …with the stranded record's path"
+assert_dir "$WT" "A29p nothing was removed — the stash entry still parks lane work"
+
+# A29p-MUT: the token is what makes the leg above able to fail. This mutation IS the pre-fix code —
+# the caller's token argument is dropped — so a leg that passed on the old spelling would pass here
+# too (which is why the review could say "no current leg can distinguish the two states").
+ENV=A29q; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ia" feat/2962-tm)"
+printf 'partial\n' >"$WT/base.txt"
+ADMIN="$REPO/.git/worktrees/$ENV-ia"
+printf 'initializing' >"$ADMIN/locked"
+touch -t 202001010000 "$ADMIN/locked"
+register_stash "$REPO" feat/2962-tm
+MUT29P="$T/mutant-no-interrupted-add-token.sh"
+mutate_reaper_anchored "$MUT29P" no-interrupted-add-token
+OUT="$(REAPER="$MUT29P" REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29p-MUT non-vacuity: the mutation leaves the preserve itself alone"
+assert_absent "$ROW" "stalled=1" \
+    "A29p-MUT WITHOUT the token the record is stranded SILENTLY — so A29p MEASURES the token"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
+    "A29p-MUT …and the tally falls with it"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29p-MUT …and no list is printed at all"
 
 # ── A29-MUT: the COLLECTOR is load-bearing (drop it and A29a goes red) ───────────────────
 # The token is emitted inside `classify_one`, which runs in a command substitution, so the parent's

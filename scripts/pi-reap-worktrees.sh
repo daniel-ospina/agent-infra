@@ -151,9 +151,19 @@
 #     (no flag moves that class at all — `--reap-abandoned-wip` only enters the DIRTY case — so it is
 #     the same "blocked for ever" shape, and `ignored-artifact` was measured as the largest preserve
 #     bucket in a real pass: `reasons=ignored-artifact:70`, 20,557 MB, `:855-857`)
+#   * an INTERRUPTED ADD whose stash entry outlived it — class `interrupted-add`, and the same
+#     `why=withheld-by-abstention` (review round 7, PR #3881). ⛔ ONLY ITS `refs=merged` HALF: that
+#     arm also admits `branch-retained:*`, whose branch still HOLDS commits and is therefore not
+#     0-ahead residue at all. A stash entry is released by nothing (`stranded_stash_for` re-reads the
+#     same register on every later pass), so a `merged` interrupted add withheld by it blocked its
+#     issue for ever while the pass printed `stalled=0`.
 # `floor=<n>h` is the class floor that record is PAST, so every emitted value is a real floor from
 # `--help`'s vocabulary — never a bound that could not be applied (review round 2, PR #3881: an
-# earlier revision printed hour floors for records whose age could not be read).
+# earlier revision printed hour floors for records whose age could not be read). ⛔ THE ONE SUB-HOUR
+# FLOOR IS STATED IN SECONDS (`floor=1800s`): the interrupted-add floor is
+# `REAP_WT_STALE_INIT_SECONDS` (1800), and rounding it into hours would print `age=1h floor=1h` for
+# every record in (1800s, 3600s] — the exact "at its floor" ambiguity `age_h_ceil` exists to remove.
+# `age=` always carries the unit its own row's floor is stated in, so the two are comparable.
 #
 # ⛔ FOUR STATES ARE DELIBERATELY NOT STALLED, each for a stated reason:
 #   * a LIVE CLAIM — the issue is held by a lease, and leases expire;
@@ -2892,15 +2902,21 @@ is_lane_branch() { # <branch-ref> -> 0 when the harness itself created this bran
     grep -Eq -- "$REAP_WT_LANE_BRANCH_RE" <<<"$1"
 }
 
-# stalled_tok <class> <issue> <age-h|?> <floor> <why> — the STALLED LIST's machine token (#2179).
+# stalled_tok <class> <issue> <age-with-unit|?> <floor-with-unit> <why> — the STALLED LIST's token (#2179).
 # ⛔ IT RIDES ON THE ROW'S DETAIL FIELD, not on a shell global, and that is forced by the caller's
 # shape: `classify_one` runs inside `crumb="$(classify_one …)"`, i.e. a COMMAND SUBSTITUTION, so every
 # variable it sets dies with that subshell. A token in the row is the only channel that survives, and
 # it is the same channel the parent already reads for `refs=remote-holds:`. `<floor>` is the class
-# floor (hours) the record is PAST — every caller applies that floor before emitting (review round 2,
+# floor the record is PAST — every caller applies that floor before emitting (review round 2,
 # PR #3881: a floor quoted for a record that cannot be dated states a bound that was never applied).
-# age_h_ceil <now> <ts> — whole hours PAST-ROUNDED. ⛔ EVERY stalled row uses it, because the floor
-# tests in `classify_one` compare SECONDS while the row prints HOURS: truncated, a record 24h30m old
+# ⛔ `<age>` ARRIVES ALREADY SUFFIXED (`26h`, `5430s`) BECAUSE THE UNIT IS THE CLASS'S floor unit
+# (review round 7, PR #3881): an age printed in hours cannot be compared with a sub-hour floor, and
+# rounding that floor UP to an hour would hide the fact that the record is past it. A caller whose
+# floor is in hours passes `"${_st_age}h"`; the interrupted-add arm passes its own seconds, which it
+# already has (`init_age`) and its floor is stated in.
+# age_h_ceil <now> <ts> — whole hours PAST-ROUNDED. ⛔ EVERY stalled row whose floor is in HOURS uses
+# it, because the floor tests in `classify_one` compare SECONDS while the row prints HOURS: truncated, a
+# record 24h30m old
 # printed `age=24h floor=24h` — indistinguishable from a record AT its floor, which is NOT listed, so
 # the row could not show the one thing it exists to state (that it is PAST the floor). Review rounds
 # 3 and 4 (#3881) each found an emitter still truncating; one helper is what stops a fourth site
@@ -2913,7 +2929,7 @@ stalled_tok() {
     # (`feat/<N>-tm`), so an empty one can only mean the branch parser was handed something else.
     local iss="${2:-}"
     [ -n "$iss" ] && iss="#$iss" || iss="?"
-    printf 'stalled=1 class=%s issue=%s age=%sh floor=%s why=%s' \
+    printf 'stalled=1 class=%s issue=%s age=%s floor=%s why=%s' \
         "$1" "$iss" "${3:-?}" "$4" "$5"
 }
 
@@ -3940,7 +3956,7 @@ classify_one() {
     local head_ts tree_ts witness wname age_s young age_floor aged_note
     local pr pr_state pr_num pr_oid pr_key pr_other subj prnum_note pr_floor no_pr_proof
     local issue="" claim="absent" init_age="" wt_ts="" wt_ok=0
-    local unp stash_hit
+    local unp stash_hit _ia_st=""
     UNPUSHED_NOTE=""
     case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trule=P proof=worktree-list --porcelain record had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
     if [ "$branch" = "BARE" ]; then printf 'preserve\tbare\t\trule=P proof=worktree-list bare repository\n'; return 0; fi
@@ -4078,7 +4094,26 @@ classify_one() {
         # value: the surviving refs above only promise the commits are RETAINED on a branch, which is
         # not the same claim as "landed on main" — so the unpushed arm is allowed to fail closed here.
         # A stash the register names for this branch is parked lane work, and it outranks the class.
-        abstain_gate "$path" "$branch" "$refs" 0 && return 0
+        # ⛔ THE `refs=merged` HALF IS NAMED ON THE LIST (review round 7, PR #3881). The rule stated at
+        # the top of this file is "0-commits-ahead lane residue, past its class floor, that this pass
+        # could not release is ON THE LIST", and an interrupted add is not released by anything: the
+        # stash entry that withheld it is re-read by `stranded_stash_for` on every later pass. It was
+        # the ONE lane-residue arm that neither released nor listed a withheld record, so a pass that
+        # left the issue un-dispatchable printed `stalled=0` — the false "all clear" the list exists
+        # to prevent. ⛔ ROUND 3's JUDGEMENT IS NOT REVERSED: `branch-retained:*` still holds commits,
+        # so it is not 0-ahead residue and gets no token; only `merged` (the tip is an ancestor of
+        # main) is named. Both fields are SECONDS here because `init_age` already is and so is this
+        # class's floor (`REAP_WT_STALE_INIT_SECONDS`) — see `stalled_tok` for why the unit is not
+        # rounded into hours.
+        #
+        # `_ia_st` is DECLARED (and emptied) with the other locals at the top of this function, because
+        # `abstain_gate` is called with it UNCONDITIONALLY below — a `set -u` bang there is what a local
+        # declaration prevents. It is assigned exactly once, on the `refs=merged` half only.
+        if [ "$refs" = merged ]; then
+            _ia_st="$(stalled_tok interrupted-add "$issue" "${init_age}s" \
+                "${REAP_WT_STALE_INIT_SECONDS}s" withheld-by-abstention)"
+        fi
+        abstain_gate "$path" "$branch" "$refs" 0 "$_ia_st" && return 0
         printf 'remove\tinterrupted-add\t%s\trule=L lock=initializing age=%ss refs=%s claim=%s — an add that never returned; nothing was materialised into it\n' \
             "" "$init_age" "$refs" "$claim"
         return 0
@@ -4167,11 +4202,13 @@ classify_one() {
                     printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
                     return 0
                 fi
-                _st_age="?"
+                # ⛔ A RECORD THAT CANNOT BE DATED CANNOT BE "PAST ITS FLOOR" (review round 2,
+                # PR #3881): listing it would state a floor that was never applied. The row names
+                # the state; the class is preserved exactly as before.
+                # ⟳ The `_st_age="?"` assignment that used to sit ABOVE this guard was DEAD (review
+                # round 7, PR #3881): every path that reaches the emitter reassigns it below, so it
+                # was an initialiser that read like a guard.
                 if [ "$wt_ok" != 1 ]; then
-                    # ⛔ A RECORD THAT CANNOT BE DATED CANNOT BE "PAST ITS FLOOR" (review round 2,
-                    # PR #3881): listing it would state a floor that was never applied. The row names
-                    # the state; the class is preserved exactly as before.
                     printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s (cannot date the checkout, so the %sh abandoned-wip floor cannot be applied)\n' \
                         "$cpay" "$REAP_WT_WIP_AGE_HOURS"
                     return 0
@@ -4193,7 +4230,7 @@ classify_one() {
                     return 0
                 fi
                 printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s %s\n' "$cpay" \
-                    "$(stalled_tok abandoned-wip "$issue" "$_st_age" "${REAP_WT_WIP_AGE_HOURS}h" opt-in-off)"
+                    "$(stalled_tok abandoned-wip "$issue" "${_st_age}h" "${REAP_WT_WIP_AGE_HOURS}h" opt-in-off)"
                 return 0
             fi
             # ── abandoned WIP, OPT-IN (#2033): 0 commits ahead, dirty, lane-owned ──────────────
@@ -4238,7 +4275,7 @@ classify_one() {
                 # 0 ahead, lane-owned, old", and a stash naming this branch is exactly the parked work
                 # the dirty tree cannot show. `landing-proved=1` — the `refs=merged` case above is an
                 # ancestry proof for THIS head, the same exemption rule 3 takes on the same datum.
-                abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok abandoned-wip "$issue" "$(age_h_ceil "$now" "$wt_ts")" "${REAP_WT_WIP_AGE_HOURS}h" withheld-by-abstention)" && return 0
+                abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok abandoned-wip "$issue" "$(age_h_ceil "$now" "$wt_ts")h" "${REAP_WT_WIP_AGE_HOURS}h" withheld-by-abstention)" && return 0
                 printf 'remove\tabandoned-wip\t%s\trule=L refs=merged dirty=%s age=%sh claim=%s witness=worktree-record backup=required\n' \
                     "$cpay" "$(((now - wt_ts) / 3600))" "$claim"
                 return 0
@@ -4261,7 +4298,7 @@ classify_one() {
                     && [ "$((now - wt_ts))" -gt "$((REAP_WT_WIP_AGE_HOURS * 3600))" ] \
                     && [ "$(commits_survive "$sha" "$branch")" = "merged" ]; then
                 printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s %s\n' "$cpay" \
-                    "$(stalled_tok ignored-artifact "$issue" "$(age_h_ceil "$now" "$wt_ts")" "${REAP_WT_WIP_AGE_HOURS}h" ignored-data-held)"
+                    "$(stalled_tok ignored-artifact "$issue" "$(age_h_ceil "$now" "$wt_ts")h" "${REAP_WT_WIP_AGE_HOURS}h" ignored-data-held)"
                 return 0
             fi
             printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s\n' "$cpay"; return 0 ;;
@@ -4412,7 +4449,7 @@ classify_one() {
             # order matters: the ghost class deletes the CHECKOUT **and** its 0-ahead branch ref, so a
             # stash the register names for that branch must be able to stop it. `landing-proved=1` is
             # exactly rule 3's exemption — `refs=merged` above is an ancestry proof for this head.
-            abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok ghost-zero-ahead "$issue" "$(age_h_ceil "$now" "$wt_ts")" "${REAP_WT_GHOST_AGE_HOURS}h" withheld-by-abstention)" && return 0
+            abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok ghost-zero-ahead "$issue" "$(age_h_ceil "$now" "$wt_ts")h" "${REAP_WT_GHOST_AGE_HOURS}h" withheld-by-abstention)" && return 0
             log "CLASSIFY ghost $path issue=${issue:-?} claim=$claim age=$(((now - wt_ts) / 3600))h ghost_floor=${REAP_WT_GHOST_AGE_HOURS}h"
             printf 'remove\tghost-zero-ahead\t%s\trule=L refs=merged proof=%s ghost=lane-branch:%s claim=%s age=%sh witness=worktree-record clean=disposable-only unref=%s,no-open-pr delete_lane_branch=yes\n' \
                 "$eph" "$proof_txt" "${issue:-?}" "$claim" "$(((now - wt_ts) / 3600))" "${stale_txt:-no-proc}"

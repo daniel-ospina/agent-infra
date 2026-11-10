@@ -1233,17 +1233,23 @@ pass did NOT release and no later pass will release on its own. It is an exact S
 `preserved=` — a selected removal that failed is counted under `remove=` and reported by
 `failed=`/exit 4 instead, so `preserved - stalled` can never underflow. A non-zero tally is followed
 by the list itself, each row naming the ISSUE its branch holds out of dispatch with its age (whole
-hours, rounded UP, so a listed row always reads PAST its floor), the class floor it is past (`<n>h` —
-always an hour count: a record that cannot be dated is never listed) and the reason.
+hours, rounded UP, so a listed row always reads PAST its floor — stated in SECONDS for the one
+sub-hour floor, so the age and the floor it is being read against are always in the same unit), the
+class floor it is past (`<n>h`, or `<n>s` for the `interrupted-add` class's 1800 s floor — a record
+that cannot be dated is never listed) and the reason.
 
 A record is named for one of three reasons (`why=`), and the third is the class that has no releasing
 flag at all: `opt-in-off` (a dirty tree past `REAP_WT_WIP_AGE_HOURS`, `--reap-abandoned-wip` unarmed),
-`withheld-by-abstention` (a stash ENTRY names the branch), and `ignored-data-held` (the tree holds
+`withheld-by-abstention` (a stash ENTRY names the branch — a stash entry is released by nothing, so
+this reason covers BOTH the dirty-tree class and an `interrupted-add` record, whose add never returned
+but whose parked work survived it), and `ignored-data-held` (the tree holds
 **non-regenerable ignored data** past the WIP floor — `ignored-artifact` is the largest preserve
 bucket measured in a real pass, `reasons=ignored-artifact:70`, 20,557 MB, so it is the same
-"blocked for ever" shape; it is named, never auto-released). The two floors a row can name are
-`REAP_WT_GHOST_AGE_HOURS` (2, the clean `ghost-zero-ahead` class) and `REAP_WT_WIP_AGE_HOURS` (24, the
-dirty and non-regenerable-ignored-data classes); both appear in `--help`.
+"blocked for ever" shape; it is named, never auto-released). The three floors a row can name are
+`REAP_WT_GHOST_AGE_HOURS` (2, the clean `ghost-zero-ahead` class), `REAP_WT_WIP_AGE_HOURS` (24, the
+dirty and non-regenerable-ignored-data classes) and `REAP_WT_STALE_INIT_SECONDS` (1800, the
+`interrupted-add` class, the one floor stated in seconds because it is sub-hour); all appear in
+`--help`.
 
 ⛔ `disk-reaper.sh` does NOT aggregate `stalled=` (its lifts are named fields at `:1894-1980`; there is
 no `stalled` there). The delegate's LIST still reaches the operator — the wrapper logs the whole
