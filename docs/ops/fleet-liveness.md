@@ -2045,3 +2045,39 @@ token reaching `dead`, an `rc=` swallowed from `log=`, the census asserting a lo
 verdict adopted from an earlier dispatch's line, an UNBOUND `--verdict-file`, a dropped file verdict
 blocking the lane's own log line, a drop reason clobbering the absence it should accompany, and a
 census that ignores `verdict_pid`.
+
+---
+
+## 14. What liveness does NOT answer — host media devices (#2249)
+
+Liveness answers *"is this lane alive?"*. It does **not** answer *"does this lane's
+child own the host's camera or microphone?"* — and those are different questions. A
+lane can be `running-quiet`, reporting progress, and still make the owner's machine
+unable to take a call. That happened on 2026-10-21: a lane's `npm exec electron .`
+held `AVCaptureDevice`, Meet said the camera was "in use", and the app **relaunched
+itself every time it was killed** because the lane behind it was still alive.
+
+**The rule: kill the LANE, not the app.** Killing the app frees the device for
+~15 seconds and then it is back. Only the lane's process tree stops it.
+
+**The fallback when no read can say who holds the device:** the macOS *privileged
+app list* —
+`osascript -e 'tell application "System Events" to get name of every process whose background only is false'`
+— because `ps | grep electron` does not match an Electron app's argv
+(`…/Electron.app/Contents/MacOS/Electron`). That was the only read that identified the
+holder. It needs Automation (TCC) permission, which a headless lane cannot grant, so
+the verb reports the denial rather than an empty list.
+
+Two artifacts, both shipped by #2249:
+
+| surface | answers |
+|---|---|
+| `scripts/orchestrator-harness/media-holders.sh` | *who holds the camera/mic now* — `HELD-BY` / `FREE` / `ABSENT` / `UNVERIFIABLE(<why>)`, exit `2` for cannot-verify. `--apps` is the fallback list; `--ancestry <pid>` walks to the LANE root (acquisition only — it pronounces no liveness verdict, deliberately) |
+| `extensions/gui-device-guard/` | records every host GUI-app launch by an unattended run (`~/.pi/agent/state/host-app-launches.jsonl`) and refuses a media-capturing launch that did not ask for a fake device |
+
+⛔ The abstention rule of §4 applies verbatim here: a partial `/proc` census is
+`UNVERIFIABLE`, never `FREE`. "I cannot tell you who holds the camera" is an
+acceptable answer; silence, and a guess, are not.
+
+Full runbook, evidence table and the six diagnostic rounds:
+[`media-devices.md`](media-devices.md).
