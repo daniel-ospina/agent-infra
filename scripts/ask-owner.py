@@ -26,8 +26,13 @@ Usage:
                                              # no comments, no gh calls
 
 Exit: 0 = passed and labelled · 1 = bounced (posted back to the lane) ·
-      2 = could not check (no key / network) — NOT a pass, and NOT in the owner's queue: the
-          call prints `UNSCORED — the owner queue did not receive this` (agent-infra#2642).
+      2 = could not check (no key / rejected key / failed call / unreadable input) — NOT a pass,
+          and NOT in the owner's queue. A SCORING failure from `jev()` prints
+          `UNSCORED — the owner queue did not receive this`; the other exit-2 causes name
+          themselves and print no `UNSCORED` line (`could not read <repo>#<n>`, `could not read
+          the answer state … UNKNOWN`, `jev returned no answer for …`) — agent-infra#2642. Do not
+          grep for `UNSCORED` to decide whether a question was routed: read the exit code, which
+          is 2 on every one of those paths.
 """
 
 import json

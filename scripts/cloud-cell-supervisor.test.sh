@@ -6803,6 +6803,33 @@ case "$OUT" in
   *"jev: configured"*"keys.env"*) ok "a key the keys.env FILE carries IS configured (a lane sources that file itself)" ;;
   *) bad "a keys.env-delivered key was not read as configured: $OUT" ;;
 esac
+# ⛔ A WHITESPACE-ONLY VALUE IS NOT A KEY ON THIS SURFACE EITHER (#2642 review). The `keys.env` arm
+# tested `-n` with no trim, so a blanked key printed `jev: configured … ask-owner.py can score a
+# question` — while `ask-owner.py::_key()` strips and REJECTS the same value, takes the unkeyed branch,
+# and exits 2 on every question. That is exactly the "status certifies a dead decision gate" failure
+# this gate exists to prevent, and it is the population `status` exists for: cells brought up before
+# the gate existed, where no bring-up has run to refuse the box. The bring-up's `jev_key_var` and this
+# function's own store arm already trim; this arm must apply the same rule.
+printf 'TYPESAFE_API_KEY="   "\n' > "$DG/keys.env"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*) bad "status called a WHITESPACE-ONLY keys.env value configured — ask-owner.py strips it and rejects it, so every question exits 2 and nothing reaches the queue: $OUT" ;;
+  *"jev: MISSING"*) ok "a WHITESPACE-ONLY keys.env value is NOT configured (ask-owner.py trims it and finds no key)" ;;
+  *"NOT in"*) ok "a WHITESPACE-ONLY keys.env value is NOT configured (reported as the near-miss it is)" ;;
+  *) bad "a whitespace-only keys.env value is reported as neither configured nor MISSING: $OUT" ;;
+esac
+[ ! -e "$DG/home/.pi/agent/jev-config.json" ] \
+  && ok "…and it still WROTE NOTHING for a blank value (the bring-up remains the only writer)" \
+  || bad "status MINTED a store while judging a blank keys.env value"
+# …and the SAME rule for the ambient arm: a blank export is not a key, so it is the MISSING line's
+# business. Reporting it as "a key is set in THIS shell but NOT in the FILE" would name a near-miss that
+# does not exist (`ask-owner.py` trims it and finds no key either).
+OUT="$(TYPESAFE_API_KEY='   ' dg_sup)"
+case "$OUT" in
+  *"NOT in"*) bad "a WHITESPACE-ONLY ambient export is reported as a key set in this shell — ask-owner.py trims it and finds no key, so that near-miss does not exist: $OUT" ;;
+  *"jev: MISSING"*) ok "…a whitespace-only AMBIENT export is MISSING, not a near-miss (one trimming rule on every arm)" ;;
+  *) bad "a whitespace-only ambient export is reported as neither MISSING nor a near-miss: $OUT" ;;
+esac
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

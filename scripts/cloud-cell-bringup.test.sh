@@ -2759,6 +2759,18 @@ case "$BR_OUT" in
   *"DIFFERENT key"*) ok "…and the shadow is reported, so a rotation is diagnosable" ;;
   *) bad "a stored key shadows keys.env silently — an operator would rotate the wrong half: $BR_OUT" ;;
 esac
+# ⛔ THE LINE MUST NOT INVERT THE GATE'S PRECEDENCE (#2642 review). The first wording was a transplant
+# of the provider-store line ("pi reads the STORE first", which is true there): it told the operator
+# that `ask-owner.py` reads the STORE and "the stored value is the one used". `_key()` is ENV-FIRST —
+# on the normal lane path, which sources `keys.env`, the FILE's value is the one used and the stored
+# value is not. The two readers are SPLIT (lanes: file; a systemd unit or a hand-run scan: store), so
+# "the stored value wins" cannot be the takeaway. The `DIFFERENT key` grep above passes on ANY
+# wording, so this row is what pins the claim.
+case "$BR_OUT" in
+  *"reads the STORE, so the stored value is the one used"*) bad "the rotation line INVERTS the gate's order — _key() is env-first, so a lane uses the keys.env value, not the stored one: $BR_OUT" ;;
+  *"a lane sources"*"the FILE's value is the one a lane uses"*) ok "…and it states the SPLIT readers instead of naming one winner (a lane reads the file, a clean-shell reader the store)" ;;
+  *) bad "the rotation line names no precedence at all, so an operator cannot tell which value a lane uses: $BR_OUT" ;;
+esac
 printf '{"apiKey":"   "}\n' > "$JEVCFG"
 printf '%s\n' "$TOK_BODY" > "$TOK"
 BR_ENV_FILE="$JEVKEYS" br ok normal --check
@@ -2785,7 +2797,7 @@ for wrong in '{"apiKey":{"a":1},"model":"jev-stored"}' '{"apiKey":0}' '{"apiKey"
   # whole bring-up run can complete on this host (a box missing its harness worktree fails later, for
   # reasons unrelated to the decision gate — the sibling cases above own that rc).
   [ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "fake-jev-key" ] \
-    && ok "…$wrong: the wrong-typed store is REPAIRED from keys.env, not read as `present`" \
+    && ok "…$wrong: the wrong-typed store is REPAIRED from keys.env, not read as 'present'" \
     || bad "…$wrong: the store still holds a value ask-owner.py cannot send, so it read as present: $(cat "$JEVCFG" 2>/dev/null)"
   case "$BR_OUT" in
     *"REPAIRED decision gate"*) ok "…$wrong: and the repair is REPORTED (not a silent rewrite)" ;;
@@ -2830,6 +2842,28 @@ case "$BR_OUT" in
 esac
 [ ! -e "$JEVCFG" ] && ok "…and the ambient value was NOT materialised into the store" \
                    || bad "the store was written from an ambient export — the image's stale-key class"
+
+# ⛔ A BLANK KEY IN keys.env IS NOT AN AMBIENT EXPORT (#2642 review, same root). keys.env is sourced
+# with `set -a`, so a blank value lands in this process — and the pre-fix ambient test took ANY
+# non-empty `printenv` as "set in THIS shell but NOT in $ENV_FILE", so the box was told to put the key
+# in the file it was already in. The box is correctly REFUSED either way; what this pins is that the
+# remedy is not a circle.
+rm -f "$JEVCFG"
+printf 'DEEPSEEK_API_KEY=fake\nTYPESAFE_API_KEY="   "\n' > "$T/keys-blankjev.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-blankjev.env" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "a BLANK TypeSafe key in keys.env does not certify the box (a whitespace value is not a credential)" \
+                   || bad "the bring-up certified a box whose only decision-gate value is whitespace"
+case "$BR_OUT" in
+  *"ambient export reaches no lane"*|*"but NOT in"*) bad "a BLANK value IN keys.env is reported as an AMBIENT export — the remedy it prints (put the key in the file) is what the operator already did: $BR_OUT" ;;
+  *) ok "…and the refusal does not misreport a blank keys.env value as an ambient-only key" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness over a blank decision-gate value" ;;
+  *) ok "…does not claim CELL READY over a blank decision-gate value" ;;
+esac
+[ ! -e "$JEVCFG" ] && ok "…and no store was minted from a blank value" \
+                   || bad "a store was written from a blank keys.env value: $(cat "$JEVCFG" 2>/dev/null)"
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIPPED=$SKIP"

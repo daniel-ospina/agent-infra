@@ -1122,7 +1122,13 @@ check_decision_gate() {
       # with what $ENV_FILE delivers is reported, never overwritten: which one is current is not this
       # script's call (the same rule the provider store follows).
       if key="$(jev_key_env)" && [ "$key" != "$(jq -r '.apiKey // ""' "$cfg" 2>/dev/null)" ]; then
-        log_line "jev: $cfg holds a DIFFERENT key than $ENV_FILE delivers — ask-owner.py reads the STORE, so the stored value is the one used. If the key was rotated, update or remove $(printf '%s' "$cfg") by hand (this script will not overwrite an existing credential)."
+        # ⛔ THE TWO READERS ARE SPLIT, SO THIS LINE STATES THE SPLIT — NOT ONE WINNER (#2642 review).
+        # The previous wording ("ask-owner.py reads the STORE, so the stored value is the one used")
+        # was a transplant of the provider-store line, where pi really is store-first. `_key()` is
+        # ENV-FIRST: it returns `$ENV_FILE`'s value for a lane, and reaches the store only for a reader
+        # that sources nothing (a systemd unit, a hand-run `--scan`). An operator told the stored value
+        # wins would rotate the wrong half on the normal lane path.
+        log_line "jev: $cfg holds a DIFFERENT key than $ENV_FILE delivers — the two READERS differ: a lane sources $ENV_FILE first, so the FILE's value is the one a lane uses; a clean-shell reader (systemd, a hand-run scan) reads the STORE, so the stored value is what that one uses. If the key was rotated, update or remove $(printf '%s' "$cfg") by hand to keep both consistent (this script will not overwrite an existing credential)."
       fi
       chmod 600 "$cfg" 2>/dev/null
       ok "jev: configured (store $(printf '%s' "$cfg") — ask-owner.py can score a question, so it can reach the owner queue)"
@@ -1144,7 +1150,19 @@ check_decision_gate() {
   fi
 
   # Nothing usable. Name which of the two near-misses this is, because the remedy differs.
-  if [ -n "$(printenv TYPESAFE_API_KEY 2>/dev/null)$(printenv JEV_API_KEY 2>/dev/null)" ]; then
+  # ⛔ A NEAR-MISS MUST BE A REAL ONE (#2642 review). The pre-fix test took ANY non-empty `printenv`
+  # as "set in THIS shell but NOT in $ENV_FILE" — so a variable that IS in $ENV_FILE with a BLANK value
+  # (`TYPESAFE_API_KEY="   "`, what an operator leaves behind after blanking a key; keys.env is sourced
+  # with `set -a`, so it lands in this process) got the ambient refusal and was told to put the key in
+  # the file it is already in. One rule, both surfaces: a value is a credential only if it survives
+  # trimming, and an ambient one only if $ENV_FILE does not carry that NAME.
+  local amb=0 v
+  for v in TYPESAFE_API_KEY JEV_API_KEY; do
+    [ -n "$(jev_trim "$(printenv "$v" 2>/dev/null)")" ] || continue
+    keys_env_names "$v" && continue
+    amb=1; break
+  done
+  if [ "$amb" = 1 ]; then
     die "CHECK FAILED [decision gate]: a TypeSafe key is set in THIS shell but NOT in $ENV_FILE — an ambient export reaches no lane (a lane sources $ENV_FILE itself, and a tmux worker is served the server's environment), so ask-owner.py would still exit 2 for every question. FIX: put TYPESAFE_API_KEY=<the key> in $ENV_FILE (cmux vm push --secret … --mode 600) and re-run; this script materialises $cfg from it."
   fi
   die "CHECK FAILED [decision gate]: this cell cannot reach the owner's decision queue. $cfg does not exist (or holds no apiKey) and $ENV_FILE delivers neither TYPESAFE_API_KEY nor JEV_API_KEY, so ask-owner.py exits 2 on EVERY question: the comment is posted and readable, the lane's report says 'asked', and the question is absent from the queue the owner reads (measured 2026-10-24: nine questions on agent-infra cell-1, none queued). FIX: put TYPESAFE_API_KEY=<the key> in $ENV_FILE (cmux vm push --secret … --mode 600) and re-run; this script materialises $(jev_config_path "$CELL_HOME") from it, mode 600. This is a refusal, not a warning, by this issue's OWNER DECISION (its OVERRIDES line): an autonomy layer that cannot reach its decision gate is not autonomous."

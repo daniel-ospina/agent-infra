@@ -38,12 +38,20 @@ On a cell, **`scripts/cloud-cell-bringup.sh::check_decision_gate` is the writer*
 `keys.env` is the only source it will read:
 
 - a key named **and valued** in `keys.env` (`TYPESAFE_API_KEY=…`, or `JEV_API_KEY=…`) is written into
-  the 0600 store, preserving every other field (`model` included);
+  the 0600 store, preserving every other field (`model` included). **Valued means non-blank**: a
+  whitespace-only value (`TYPESAFE_API_KEY="   "`, what an operator leaves behind after blanking a key)
+  is not a key on any surface — the bring-up refuses the box and `status` does not call it configured,
+  because `ask-owner.py::_key()` strips it and finds nothing;
 - a store that already holds a **different** key is never overwritten — which key is current is a
-  decision, not a repair — so the shadow is *reported* instead;
+  decision, not a repair — so the shadow is *reported* instead. That report names the **split readers**
+  rather than a single winner: a lane sources `keys.env`, so the *file's* value is the one a lane uses,
+  while a clean-shell reader (a systemd unit, a hand-run `--scan`) reads the *store*. Both values are
+  live, for different readers;
 - an **ambient export is not a source**. A lane sources `keys.env` itself, and a tmux worker is
   served the *server's* environment, so an export that lives only in an operator's shell reaches no
-  worker. That near-miss gets its own refusal rather than a false pass.
+  worker. That near-miss gets its own refusal rather than a false pass — and it is only claimed when
+  the value survives trimming **and** `keys.env` does not carry that name, so a blanked key is never
+  reported as "set in this shell but not in the file" (a remedy the operator has already applied).
 
 The store is durable on purpose: a reader that sources nothing (a systemd unit, a hand-run
 `ask-owner.py --scan`) has only the store, and the gate has to work from those too.
@@ -53,7 +61,7 @@ The store is durable on purpose: a reader that sources nothing (a systemd unit, 
 | surface | behaviour |
 |---|---|
 | `cloud-cell-bringup.sh --check` | **REFUSES** the box, by name (`CHECK FAILED [decision gate]: …`), before `CELL READY` and before the paid provider probe. A store that exists but cannot be parsed is refused too — the script will not replace a credential file it cannot read. A store whose `apiKey` is not a JSON **string** is not a credential the gate can send: it is treated as an empty store and REPAIRED from `keys.env` (other fields preserved), or refused when the box has no key to repair it from. |
-| `cloud-cell-supervisor.sh status` | one **read-only** line: `jev: configured (…)` / `⛔ jev: MISSING …` / `⛔ jev: a TypeSafe key is set in THIS shell but NOT in keys.env …`. `configured` is claimed only for a string-valued `apiKey` the gate can actually send (the same rule the bring-up applies). It names the one command that repairs; it never writes. |
+| `cloud-cell-supervisor.sh status` | one **read-only** line: `jev: configured (…)` / `⛔ jev: MISSING …` / `⛔ jev: a TypeSafe key is set in THIS shell but NOT in keys.env …`. `configured` is claimed only for a value the gate can actually send — a string-valued `apiKey`, or a `keys.env` value that survives trimming (a whitespace-only one reads as `MISSING`, because the gate strips it and finds nothing). It names the one command that repairs; it never writes. |
 | `ask-owner.py <repo> <n>` | exit 2 is honest, and its REASON is named: a scoring failure from `jev()` (no key, a rejected key, a failed call) prints the cause line and then `UNSCORED — the owner queue did not receive this`. The other exit-2 causes name themselves without that sentence (`could not read <repo>#<n>`, `could not read the answer state … UNKNOWN`, `jev returned no answer for …`). |
 | `ask-owner.py --scan` | the summary line carries `unscored=N` on both arms, and every unscored question is NAMED above it as `UNSCORED <repo>#<n> — …`, one line per question, with the cause on the line above. `orchestrator-heartbeat.sh` sums that field into `N_ASK` (so the naming lines reach the log) and logs one `ALERT ask-gate UNSCORED …` per tick. |
 

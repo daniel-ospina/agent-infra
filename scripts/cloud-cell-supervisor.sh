@@ -4796,7 +4796,13 @@ jev_state_line() {
   if [ -f "$ENV_FILE" ]; then
     # Probed in a SUBPROCESS, like KEY_IN_FILE/TORTOISE_IN_FILE above: `status` must not run an
     # operator's keys.env into its own shell.
-    [ "$(env -u TYPESAFE_API_KEY -u JEV_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; { [ -n "${TYPESAFE_API_KEY:-}" ] || [ -n "${JEV_API_KEY:-}" ]; } && printf x' _ "$ENV_FILE" 2>/dev/null)" = x ] && infile=1
+    # ⛔ TRIMMED, BECAUSE A WHITESPACE-ONLY VALUE IS NOT A KEY (#2642 review). The pre-fix probe tested
+    # `-n` alone, so `TYPESAFE_API_KEY="   "` in keys.env — what an operator leaves behind after
+    # blanking a key — printed `jev: configured … ask-owner.py can score a question` while
+    # `ask-owner.py::_key()` strips and REJECTS the same value, so every question exits 2 and NOTHING
+    # reaches the queue. This is the same acceptance rule the bring-up (`jev_key_var` /
+    # `keys_env_has_value`) and this function's own store arm already apply; only this arm was loose.
+    [ "$(env -u TYPESAFE_API_KEY -u JEV_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; { [ -n "${TYPESAFE_API_KEY//[[:space:]]/}" ] || [ -n "${JEV_API_KEY//[[:space:]]/}" ]; } && printf x' _ "$ENV_FILE" 2>/dev/null)" = x ] && infile=1
   fi
   if [ "$infile" = 1 ]; then
     printf 'jev: configured (%s carries the TypeSafe key) — ask-owner.py can score a question, so it reaches the owner queue\n' "$ENV_FILE"
@@ -4819,7 +4825,10 @@ jev_state_line() {
       return 0
     fi
   fi
-  if [ -n "$(printenv TYPESAFE_API_KEY 2>/dev/null)$(printenv JEV_API_KEY 2>/dev/null)" ]; then
+  # ⛔ TRIMMED FOR THE SAME REASON AS THE FILE PROBE ABOVE: a blank ambient export is not a key, so it
+  # is the MISSING line's business, not this near-miss's (the remedy here — "put it in the FILE" — is
+  # not what the operator needs to do with an empty variable).
+  if [ -n "$(printenv TYPESAFE_API_KEY 2>/dev/null | tr -d '[:space:]')$(printenv JEV_API_KEY 2>/dev/null | tr -d '[:space:]')" ]; then
     printf '⛔ jev: a TypeSafe key is set in THIS shell but NOT in %s — a lane sources the FILE, so a worker may have no key. Put TYPESAFE_API_KEY=<the key> in %s and re-run the bring-up.\n' "$ENV_FILE" "$ENV_FILE"
     return 0
   fi
