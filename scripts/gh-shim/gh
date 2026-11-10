@@ -155,9 +155,18 @@
 #     is the whole fix for a bounded caller that would otherwise lose the call to a dropped socket
 #     (see the transport bullet).
 #   - `AGENT_GH_GATE_SLOT` is FORGEABLE: any caller that can set its environment may point it at
-#     an existing directory and take no slot at all. It is an INTERNAL inheritance seam between
+#     an existing regular FILE and take no slot at all. It is an INTERNAL inheritance seam between
 #     this shim and the child it spawns, not a security boundary — the same class as
-#     `AGENT_GH_GATE_MAX_INFLIGHT`, which a caller can also set.
+#     `AGENT_GH_GATE_MAX_INFLIGHT`, which a caller can also set. The test is `-f` and not `-d`
+#     (#2304): the slot is created as a file, and `-d` never matched it, so every nested call took
+#     a SECOND slot — the failure was in the fail-OPEN direction, not the forgeable one. The
+#     polarity is deliberate: a DIRECTORY value is not a slot, so it grants no bypass (a forged
+#     value can skip pacing but must not skip the cap).
+#   - ⛔ A COPY OF THIS SHIM IS NOT REFUSED BY `-ef` (device+inode cannot see it), so two copies on
+#     one PATH ping-pong. That class is BOUNDED, not eliminated: a generation counter
+#     (`AGENT_GH_SHIM_DEPTH`) ends the ladder at its third hop with a named refusal (#2304). The
+#     cost of the residual is three processes and one broken gh call; the cost before it was a box
+#     at `fork: Resource temporarily unavailable` (measured: 3.4k processes, load 74 on 4 vCPU).
 #   - a slot whose recorded PID was later REUSED by an unrelated long-lived process is not
 #     reaped by the liveness probe, so admission waits out `AGENT_GH_GATE_ACQUIRE_TIMEOUT` and
 #     then runs the call ungated. That is a bounded per-call penalty, not a wedge — the fail-open
@@ -254,6 +263,10 @@
 #                                  healthy account
 #   AGENT_GH_GATE_LOCK_TIMEOUT_MS  ms to wait for the gate's own mutex (default 2000)
 #   AGENT_GH_GATE_SLOT             INTERNAL: the slot a nested call inherits (never counted twice)
+#   AGENT_GH_SHIM_DEPTH            INTERNAL: this shim's generation counter, exported to its child.
+#                                  Refuses a THIRD generation (#2304) — a wrapper that can call
+#                                  itself has no depth bound by construction, and `-ef` cannot see
+#                                  a COPY at a different inode. Never set it by hand.
 set -uo pipefail
 
 # Resolve THIS script's own directory through any symlinks. The harness injects a
@@ -273,6 +286,49 @@ SELF_DIR="$(cd "$(dirname "$self")" && pwd)"
 # seam was reachable in PRODUCTION — `AGENT_GH_SHIM_VERIFY=/dev/null` made the check
 # exit 0 and the admin merge proceeded unevidenced, with no announcement (VGATE).
 VERIFY="$SELF_DIR/../verify-admin-merge-evidence.sh"
+
+# ⛔ A HOP-DEPTH BACKSTOP (#2304). The `-ef` guards below refuse THIS file, and `-ef` is
+# device+inode — so a COPY of this script at a different inode is invisible to them, and two
+# copies reachable from each other resolve to EACH OTHER: one `exec` per generation, each
+# holding a gate slot, unbounded by construction. MEASURED (2026-10-22 → 11-06, cloud cells):
+# 3,456 bash processes and load 74 on 4 vCPU, then `fork: Resource temporarily unavailable`, so
+# nothing could be cleaned up from inside; later 146 shims with both slots held by hops 1 AND 2,
+# so every unrelated gh call on the box paid the full 300 s acquire timeout and then ran
+# UNGATED. The entry point needs no unusual caller — an install that puts `scripts/gh-shim` on
+# PATH while the harness's neutral entry points at a DIFFERENT copy (`extensions/review-enforcer`
+# falls back to `fs.copyFileSync` when symlinking fails) is enough, and a `git credential` helper
+# invocation is what starts it.
+#
+# THE BOUND IS A GENERATION COUNTER, exported to the child before the exec below — the same
+# shape the harness layers already carry (`HARNESS_GH_SHIM_DEPTH` in gh-rest/gh and gh-limit/gh),
+# because a counter a shim exports to itself cannot be forgotten by a call site. TWO GENERATIONS
+# IS THE LEGITIMATE MAXIMUM, which is why the refusal is on the THIRD:
+#   1. the call a session or daemon starts, and
+#   2. a NESTED call one of its children makes — the evidence verifier shelling out to `gh`, or
+#      real gh's own `git` credential helper invoking `gh auth git-credential`. That hop inherits
+#      AGENT_GH_REAL and so lands on the real gh, but it IS a shim process, and refusing it would
+#      break the verifier's own evidence read.
+# By generation 2 the shim has already resolved a real gh, so re-entering means the resolver chose
+# a COPY OF ITSELF. This clause ends that loudly at three processes: one broken gh call is the
+# price, and a fork storm that leaves the box unable to spawn is what it buys back.
+# ⛔ FAIL-CLOSED ON A NON-NUMERIC COUNTER. `[ -ge ]` on a non-number is FALSE, and a false test
+# here OPENS the gate it configures — one junk value in the environment would restore the
+# unbounded ladder (the #1910 lesson: coerce EVERY limit before its first arithmetic read).
+# Nothing but this shim ever sets this variable, so a non-numeric value is corruption or a
+# deliberate defeat, and both are refused loudly rather than silently disarming the bound.
+case "${AGENT_GH_SHIM_DEPTH:-0}" in
+  *[!0-9]*)
+    printf 'gh-shim: REFUSING to run — AGENT_GH_SHIM_DEPTH=%s is not a number (#2304).\n' "$AGENT_GH_SHIM_DEPTH" >&2
+    printf 'gh-shim: that variable is INTERNAL (the shim-generation counter this shim exports to itself); unset it.\n' >&2
+    exit 127 ;;
+esac
+if [ "${AGENT_GH_SHIM_DEPTH:-0}" -ge 2 ]; then
+  printf 'gh-shim: REFUSING a third gh-shim hop (AGENT_GH_SHIM_DEPTH=%s) — the shims are resolving to EACH OTHER, so no real gh is reachable (#2304).\n' "$AGENT_GH_SHIM_DEPTH" >&2
+  printf 'gh-shim: `-ef` refuses only THIS inode; two COPIES of this script on PATH ping-pong one hop per gate slot.\n' >&2
+  printf 'gh-shim: point every copy at ONE inode (or set AGENT_GH_REAL=/usr/bin/gh). Refusing to recurse: three processes, not a fork storm.\n' >&2
+  exit 127
+fi
+export AGENT_GH_SHIM_DEPTH=$(( ${AGENT_GH_SHIM_DEPTH:-0} + 1 ))
 
 # The real gh. `AGENT_GH_REAL` is set by an OUTER invocation so that a nested call
 # (the verifier shells out to gh itself) cannot recurse back into this shim.
@@ -388,9 +444,11 @@ REAL="$(find_real_gh)" || {
 # fails — so two copies on PATH can still ping-pong, one hop per gate slot. The marker scan does
 # not rescue a copy either: the sentinel sits outside the first 8 KiB by design (so that this shim is
 # never classified as a harness layer, which is what keeps gh-rest delegating mutations through us),
-# so `-ef` cannot see a copy and the marker test will not either. That class
-# needs a sentinel of its own inside that window plus a hop-depth backstop: the depth-bound half
-# tracked in #2304, deliberately NOT duplicated here, so this change stays the env-seam fix it is.
+# so `-ef` cannot see a copy and the marker test will not either. ⛔ SCOPE UPDATE (#2304): the
+# hop-depth backstop at the top of this file BOUNDS that class — a two-copy ping-pong now ends at
+# three processes with a named refusal instead of a fork storm. It does not make `-ef` see a copy
+# (nothing inode-based can), and the in-window sentinel named above is still unimplemented; it is
+# no longer needed for the bound, only for a faster/quieter one.
 # …and a value that is not a REGULAR FILE is refused here too, for the same reason: `-x`
 # is true for a directory, and exec-ing one turns every gh call into rc 126. Cheap, loud, and
 # in the same fail-closed direction as the self-recursion refusal below.
@@ -1804,7 +1862,20 @@ gate_init() {
   # A NESTED call (the evidence verifier shells out to `gh`) already runs inside the
   # parent's slot and must not take a second one — with a cap of 2, two parents each
   # nesting once would deadlock. It still honours the cooldown and the spacing.
-  if [ -n "${AGENT_GH_GATE_SLOT:-}" ] && [ -d "${AGENT_GH_GATE_SLOT}" ]; then NESTED=1; fi
+  # ⛔ THE SLOT IS A REGULAR FILE, SO THE TEST IS `-f` (#2304). `admit_slot` creates it with
+  # `printf … > "$MY_SLOT"`. This test was `-d`, so NO nested call was ever recognised as
+  # nested and every one took a SECOND slot — the exact doubling this seam exists to prevent,
+  # in the fail-OPEN direction. MEASURED with a valid inherited slot at MAX_INFLIGHT=1
+  # ACQUIRE_TIMEOUT=2: 2067 ms, then `no gh slot free within 2s — running this call UNGATED`;
+  # flipping only `-d`→`-f`: 34 ms, no note. Nothing pinned either behaviour
+  # (`rg AGENT_GH_GATE_SLOT tests/` → 0 hits), which is why it survived.
+  # ⛔ AND IT SHIPS WITH THE HOP-DEPTH BOUND, NEVER BEFORE IT — MEASURED, and this is the
+  # ordering hazard (#2304): slot reuse REMOVES the natural brake on a two-copy ladder. The
+  # same pair measured 3 hops then a 300 s slot stall with `-d`, and 9 processes in 2 s (~4/s)
+  # with `-f`. So `-f` alone converts a slow ladder into the #2266 fork loop; the depth bound
+  # at the top of this file is what makes that ladder terminate instead. `tests/gh-shim/run.sh`
+  # §17 pins both halves together for exactly this reason.
+  if [ -n "${AGENT_GH_GATE_SLOT:-}" ] && [ -f "${AGENT_GH_GATE_SLOT}" ]; then NESTED=1; fi
   return 0
 }
 

@@ -2520,6 +2520,198 @@ else
     || fail "the interactive branch can print before the child (contaminating a successful call)"
 fi
 
+# ── 17. THE HOP-DEPTH BOUND (#2304) ──────────────────────────────────────
+# The `-ef` guards refuse THIS file, and `-ef` is device+inode — so a COPY of the shim at another
+# inode is invisible to them, and two copies reachable from each other resolve to EACH OTHER, one
+# `exec` per generation, each taking a gate slot. MEASURED in production (2026-10-22 → 11-06):
+# 3,456 bash processes and load 74 on 4 vCPU, then `fork: Resource temporarily unavailable` so the
+# box could not be cleaned up from inside; later 146 shims with both slots held by hops 1 AND 2, so
+# every unrelated gh call paid the full 300 s acquire timeout and then ran UNGATED. The precondition
+# needs no unusual caller: `~/.pi/agent/shims/gh` (a COPY) and `scripts/gh-shim/gh` (a COPY) BOTH on
+# PATH, reachable from each other — `extensions/review-enforcer` falls back to `fs.copyFileSync` when
+# symlinking its neutral entry fails, which is exactly how the second copy appears.
+#
+# ⛔ EVERY ARM HERE IS MUTATION-SENSITIVE, and the shape is the reason: with the generation counter
+# removed (or its threshold raised), (a) never terminates and is graded HUNG by bound_then_reap,
+# while (b)/(c) cannot observe any counter at all. Nothing else in this suite runs a ladder, so
+# these are the only cases that can.
+echo "== 17. a COPY of this shim on PATH is bounded (#2304) =="
+
+# Two copies at two DIFFERENT inodes, both on PATH — the ping-pong precondition. `cp` (not `ln`)
+# is the point: `-ef` sees a symlink, never a copy.
+mkdir -p "$TMP/cpA" "$TMP/cpB"
+cp "$SHIM" "$TMP/cpA/gh"; cp "$SHIM" "$TMP/cpB/gh"
+chmod +x "$TMP/cpA/gh" "$TMP/cpB/gh"
+_cpa_inode="$(ls -i "$TMP/cpA/gh" | awk '{print $1}')"
+_cpb_inode="$(ls -i "$TMP/cpB/gh" | awk '{print $1}')"
+[ "$_cpa_inode" != "$_cpb_inode" ] \
+  && pass "the fixture is two COPIES (different inodes: $_cpa_inode / $_cpb_inode), which is what \`-ef\` cannot see" \
+  || fail "the fixture is ONE inode — this section would not test the copy class at all"
+
+# Real gh that records the GENERATION COUNTER it was handed. That counter is the process count of
+# the ladder that produced the call: every hop increments it and exports it before the exec, so a
+# value of 1 means exactly ONE shim process, 2 means a nested hop — no sampler, nothing to race.
+DEPTHSTUB="$TMP/cp-realdepth"
+cat > "$DEPTHSTUB" <<'GHEOF'
+#!/usr/bin/env bash
+printf 'REALGH-CALLED depth=%s argv=%s\n' "${AGENT_GH_SHIM_DEPTH:-unset}" "$*" >> "${DEPTHLOG:?}"
+exit 0
+GHEOF
+chmod +x "$DEPTHSTUB"
+DEPTHLOG="$TMP/cp-depth.log"; : > "$DEPTHLOG"
+
+# (a) THE LADDER. copy A resolves copy B as "the real gh"; B is handed its OWN path in
+#     AGENT_GH_REAL, refuses it (that is the #2266 half), and walks PATH to A — forever. All three
+#     processes append to a file rather than a pipe, and the whole tree is reaped by path: on the
+#     regression this arm exists to catch, a capture pipe would never see EOF and the arm could not
+#     fire (the §10/§15 lesson).
+: > "$TMP/a17a.out"; rm -f "$TMP/a17a.rc"
+_a17s=$(date +%s)
+( cd "$TMP" && env -u AGENT_GH_REAL -u AGENT_GH_SHIM_DEPTH -u SCEN -u AGENT_GH_GATE_SLOT \
+    DEPTHLOG="$DEPTHLOG" PATH="$TMP/cpA:$TMP/cpB:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/cpA/gh" pr view 1 >"$TMP/a17a.out" 2>&1; printf '%s' "$?" >"$TMP/a17a.rc" ) &
+_p=$!
+bound_then_reap "$_p" "$TMP/cp" "$TMP/a17a.out"
+_a17e=$(date +%s)
+_a17out="$(cat "$TMP/a17a.out")"
+_a17rc="$(cat "$TMP/a17a.rc" 2>/dev/null)"
+case "$_a17out" in
+  *HUNG*) fail "two COPIES of the shim on PATH did not terminate — unbounded recursion, the #2304 fork storm" ;;
+  *'REFUSING a third gh-shim hop'*'AGENT_GH_SHIM_DEPTH=2'*)
+          pass "two copies on PATH terminate at the THIRD hop with a named refusal (\`AGENT_GH_SHIM_DEPTH=2\`) — 3 processes, not 3.4k" ;;
+  *)      fail "the copy ladder ended without the hop-depth refusal: $_a17out" ;;
+esac
+[ "$_a17rc" = "127" ] \
+  && pass "  …and the refusal is a NON-ZERO status (rc=127), so no caller mistakes it for an answer" \
+  || fail "  …but the ladder's status was '${_a17rc:-<none>}' (expected 127)"
+case "$_a17out" in
+  *'no gh slot free'*) fail "  …and it reached the SLOT STALL before the depth bound: the two halves must ship together (#2304)" ;;
+  *) pass "  …and it never reached the slot stall (the depth bound ends it before a second slot is needed)" ;;
+esac
+[ "$(( _a17e - _a17s ))" -le 10 ] \
+  && pass "  …within $(( _a17e - _a17s ))s (bounded, not a 300 s-per-hop stall)" \
+  || fail "  …but the bounded ladder still took $(( _a17e - _a17s ))s"
+[ -s "$DEPTHLOG" ] \
+  && fail "  …but a real gh WAS reached during the ladder ($(head -1 "$DEPTHLOG")) — this fixture did not reproduce the copy class" \
+  || pass "  …and no real gh was reached at all (each copy accepted the other as 'the real gh')"
+
+# (b) ⛔ THE BOUND MUST NOT OVER-BLOCK A LEGITIMATE NESTED CALL. Two generations is the genuine
+#     maximum: the call a session starts, plus the one its verifier (or real gh's own
+#     `git` credential helper) makes. Refusing THAT would break the evidence read the admin-merge
+#     gate depends on — an over-block is a real defect, not a safe default.
+#     ⛔ THE EVIDENCE IS THE LOG, NOT STDOUT. The pacing notes are buffered and replayed only when a
+#     call FAILS, and a real gh on a `pr view` prints nothing anyway; so "did the stub run?" must be
+#     asked of the file the stub writes — asserting on stdout reads an EMPTY string and calls a
+#     working hop a failure (measured on the first run of this arm).
+: > "$DEPTHLOG"
+_a17bout="$( cd "$TMP" && env AGENT_GH_SHIM_DEPTH=1 AGENT_GH_REAL="$DEPTHSTUB" DEPTHLOG="$DEPTHLOG" \
+  PATH="$TMP/cpA:$TMP/bin:/usr/bin:/bin" bash "$SHIM" pr view 1 2>&1 )"; _a17brc=$?
+case "$(cat "$DEPTHLOG" 2>/dev/null)" in
+  *REALGH-CALLED*) pass "a NESTED call at generation 2 is still allowed (no over-block)" ;;
+  *) fail "a NESTED call at generation 2 did not reach the real gh (log: '$(cat "$DEPTHLOG" 2>/dev/null)' out: '$_a17bout')" ;;
+esac
+case "$_a17bout" in
+  *'REFUSING a third gh-shim hop'*) fail "  …and it was REFUSED — the bound over-blocks the verifier's own gh call" ;;
+  *) pass "  …and it was not refused by the hop-depth bound" ;;
+esac
+[ "$_a17brc" -eq 0 ] && pass "  …and it succeeded (rc=0)" || fail "  …but it exited rc=$_a17brc"
+grep -q 'depth=2' "$DEPTHLOG" 2>/dev/null \
+  && pass "  …carrying AGENT_GH_SHIM_DEPTH=2 into the real gh (the counter is exported per hop)" \
+  || fail "  …but the real gh saw $(sed -n 1p "$DEPTHLOG" 2>/dev/null) instead of depth=2"
+
+# (c) ⛔ THE PROCESS COUNT FOR ONE ORDINARY CALL IS 1 — the issue's own acceptance indicator, and
+#     the reason it is stated as a count: the failure mode was never a wrong ANSWER, it was a
+#     process tree. An unresolvable request must exit non-zero promptly, having spawned exactly one
+#     shim, with the request named by the real gh rather than by a downstream failure.
+UNRES="$TMP/cp-realunres"
+cat > "$UNRES" <<'GHEOF'
+#!/usr/bin/env bash
+printf 'REALGH-CALLED depth=%s argv=%s\n' "${AGENT_GH_SHIM_DEPTH:-unset}" "$*" >> "${DEPTHLOG:?}"
+printf 'Could not resolve to a PullRequest with the number of 99999997.\n' >&2
+exit 1
+GHEOF
+chmod +x "$UNRES"
+: > "$DEPTHLOG"
+_c17s=$(date +%s)
+_a17cout="$( cd "$TMP" && env -u AGENT_GH_SHIM_DEPTH AGENT_GH_REAL="$UNRES" DEPTHLOG="$DEPTHLOG" \
+  bash "$SHIM" pr view 99999997 2>&1 )"; _a17crc=$?
+_c17e=$(date +%s)
+[ "$_a17crc" -ne 0 ] \
+  && pass "an UNRESOLVABLE request exits non-zero (rc=$_a17crc) instead of recursing" \
+  || fail "an unresolvable request exited 0"
+case "$_a17cout" in
+  *'Could not resolve to a PullRequest with the number of 99999997'*) pass "  …and the error NAMES the request, not a downstream failure" ;;
+  *) fail "  …but the error did not name the request: $_a17cout" ;;
+esac
+_c17n="$(grep -c 'REALGH-CALLED' "$DEPTHLOG" 2>/dev/null || echo 0)"
+_c17d="$(sed -n '1s/.*depth=\([^ ]*\) .*/\1/p' "$DEPTHLOG" 2>/dev/null)"
+if [ "$_c17n" = "1" ] && [ "$_c17d" = "1" ]; then
+  pass "  …having spawned exactly ONE shim generation (1 real-gh call, depth=1) — the process count is 1"
+else
+  fail "  …but the call produced $_c17n real-gh call(s) at depth '${_c17d:-?}' — the process count is not 1"
+fi
+[ "$(( _c17e - _c17s ))" -le 5 ] \
+  && pass "  …within $(( _c17e - _c17s ))s" \
+  || fail "  …but it took $(( _c17e - _c17s ))s"
+
+# (d)/(e) THE NESTED-SLOT HALF, PINNED IN BOTH DIRECTIONS. `admit_slot` creates the slot as a regular
+#     FILE while the nested test was `-d`, so NO nested call was ever recognised and every one took a
+#     SECOND slot — the cap doubled in the fail-OPEN direction. Measured with a valid inherited slot
+#     at MAX_INFLIGHT=1 ACQUIRE_TIMEOUT=2: 2067 ms then `no gh slot free within 2s — running this
+#     call UNGATED`; with `-f`: 34 ms, no note. ⛔ And this MUST ship with the depth bound: slot
+#     reuse removes the natural brake on a two-copy ladder (the same pair measured 3 hops then a
+#     300 s stall with `-d`, and 9 processes in 2 s with `-f`), so `-f` alone is what turns a slow
+#     ladder into the #2266 fork loop that (a) is now bounded against.
+GDIR="$(gate_dir nested)"
+GREAL_N="$TMP/cp-realnested"
+printf '#!/usr/bin/env bash\nprintf \x27NESTED-REAL-RAN\\n\x27\nexit 0\n' > "$GREAL_N"; chmod +x "$GREAL_N"
+mkdir -p "$GDIR/slots"
+sleep 60 & _holder=$!
+printf '%s\n' "$_holder" > "$GDIR/slots/held.$$"
+_NS="$TMP/cp-nested-slot"; : > "$_NS"
+_d_s=$(date +%s)
+_d_out="$( cd "$TMP" && env AGENT_GH_REAL="$GREAL_N" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_MAX_INFLIGHT=1 AGENT_GH_GATE_ACQUIRE_TIMEOUT=1 AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_SLOT="$_NS" bash "$SHIM" api user 2>&1 )"; _d_rc=$?
+_d_e=$(date +%s)
+# ⛔ ASK THE GATE'S OWN LOG, NOT STDERR. Pacing notes are buffered and replayed only when the call
+# FAILS (`gh-rest/gh` parses a successful call's merged bytes as JSON), so on a SUCCESSFUL call the
+# note exists only in `$GATE_DIR/events.log` — grepping stderr reads nothing and grades a stall as a
+# pass (measured on the first run of this arm).
+case "$(cat "$GDIR/events.log" 2>/dev/null)" in
+  *'no gh slot free'*) fail "an inherited slot as a REGULAR FILE was not recognised as nested (waited out the cap) — the \`-d\` test on a file, the #2304 fail-open" ;;
+  *)                   : ;;
+esac
+case "$_d_out" in
+  *NESTED-REAL-RAN*) pass "an inherited slot FILE is recognised as nested: no second slot, no wait ($(( _d_e - _d_s ))s)" ;;
+  *)                 fail "the nested call did not reach the real gh: $_d_out" ;;
+esac
+[ "$_d_rc" -eq 0 ] && pass "  …and it succeeded (rc=0)" || fail "  …but it exited rc=$_d_rc"
+# (e) THE POLARITY: a DIRECTORY is not a slot, so a forged value cannot skip the CAP (only pacing).
+#     ⛔ ITS OWN GATE DIR, because the two arms of this pair ASSERT THE OPPOSITE THING about the same
+#     string, and (d)'s stall note would still be in a shared `events.log` — (e) would then read (d)'s
+#     evidence and pass whatever it did (measured: on the `-d` mutant (e) went green off (d)'s note).
+GDIR2="$(gate_dir nested2)"; mkdir -p "$GDIR2/slots"
+sleep 60 & _holder2=$!
+printf '%s\n' "$_holder2" > "$GDIR2/slots/held.$$"
+_d2_s=$(date +%s)
+_e_out="$( cd "$TMP" && env AGENT_GH_REAL="$GREAL_N" AGENT_GH_GATE_DIR="$GDIR2" \
+  AGENT_GH_GATE_MAX_INFLIGHT=1 AGENT_GH_GATE_ACQUIRE_TIMEOUT=1 AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_SLOT="$GDIR2" bash "$SHIM" api user 2>&1 )"; _e_rc=$?
+_d2_e=$(date +%s)
+kill "$_holder" "$_holder2" 2>/dev/null; wait "$_holder" "$_holder2" 2>/dev/null
+rm -f "$GDIR/slots/held.$$" "$GDIR2/slots/held.$$"
+case "$(cat "$GDIR2/events.log" 2>/dev/null)" in
+  *'no gh slot free'*) pass "a DIRECTORY value is NOT a slot: the call honours the cap and reports the wait (fail-closed)" ;;
+  *) fail "a DIRECTORY-valued AGENT_GH_GATE_SLOT bypassed the slot cap: '$_e_out'" ;;
+esac
+[ $(( _d2_e - _d2_s )) -ge 1 ] \
+  && pass "  …and it really waited out the occupied cap ($(( _d2_e - _d2_s ))s at ACQUIRE_TIMEOUT=1)" \
+  || fail "  …but it returned in $(( _d2_e - _d2_s ))s, so it never paid the admission wait"
+[ "$_e_rc" -eq 0 ] \
+  && pass "  …and it still runs (the gate fails OPEN after the wait, never onto the caller's timeout)" \
+  || fail "  …but the ungated fallback did not run the call (rc=$_e_rc)"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"
   exit 1
