@@ -3278,6 +3278,38 @@ run "$SRC" 2284
 no_record; ck $? "  ...nothing recorded"
 err_has "must sit on a line AFTER the accepted verdict line"; ck $? "  ...and the refusal names the position rule"
 
+# (5d) ⛔ THE P3 FINDING FROM THIS CHANGE'S FIRST REVIEW, pinned as a regression — a FAIL-OPEN in the
+# MARKER channel that the prose channel already guards against. `tail -1` over the marker shapes takes
+# the LAST pair, so a reviewer that reported two blockers and then revised in the marker records a
+# signed clean verdict over a transcript that reported two blockers in the PRIMARY channel. The prose
+# channel refuses exactly this (`refuse_counted_clean` reads EVERY surviving verdict-shaped line, not
+# only the last); the marker channel must read every marker-shaped line too.
+reset; FIXTURE_NO_MARKER=1
+printf 'CLEAN\n\nREVIEW_VERDICT: ISSUES\nFINDINGS_BLOCKING: 2\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 0\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a CLEAN over an EARLIER marker pair reporting 2 blockers is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+no_comment; ck $? "  ...and nothing posted as a review artifact"
+err_has "FINDINGS_BLOCKING: 2"; ck $? "  ...naming the contradicting count, not the last one"
+
+# (5e) the same hole WITHOUT the verdict-word half: a stray non-zero count line anywhere in the marker
+# channel is a reported blocker. Read as a class, not as "the pair": the last count alone decides, and
+# a reviewer that contradicts itself cannot have the contradiction resolved in its favour.
+reset; FIXTURE_NO_MARKER=1
+printf 'CLEAN\n\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 5\nFINDINGS_BLOCKING: 0\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a stray FINDINGS_BLOCKING: 5 above a zero is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+
+# (5f) ANTI-WALL for (5d)/(5e): the widening must not touch a transcript whose ONLY marker pair is a
+# clean one — the count channel reads the survivor region, and every clean review must still record.
+reset; FIXTURE_NO_MARKER=1
+printf 'Nothing blocks. Two notes, both P3.\nCLEAN\n\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 0\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a transcript with ONE clean marker pair still RECORDS (rc=$(rc_of))"
+grep -q '"verdict":"clean"' "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+ck $? "  ...verdict=clean, bound to the reviewed head"
+
 # (6) THE WIRE-FORMAT HALF — the harness reviewer's own `CLEAN <comment-url>` string (PR #3781).
 # Without a marker it is still NO VERDICT (the measured bug, pinned so a future widening is visible);
 # with the marker the same transcript RECORDS, which is what makes the fix a fix and not a re-prompt.

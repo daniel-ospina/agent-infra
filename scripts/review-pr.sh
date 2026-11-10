@@ -66,8 +66,11 @@
 #      harness's own producer string `CLEAN <comment-url>`, which this file could not
 #      parse at all (PR #3781: 382 paid seconds discarded as NO VERDICT). A CLEAN without
 #      the marker is refused (exit 6); a marker reporting `FINDINGS_BLOCKING: n > 0` contradicts
-#      a clean verdict and is refused (exit 7). `REVIEW_VERDICT: ISSUES` with a ZERO count is the
-#      same statement as `ISSUES 0` — clean — and is accepted as such.
+#      a clean verdict and is refused (exit 7) — ON THE LAST PAIR OR ON ANY EARLIER MARKER LINE,
+#      because a reported count anywhere in the accepted region is a finding. `REVIEW_VERDICT:
+#      ISSUES` carrying a ZERO count is the same statement as `ISSUES 0` — clean — and is accepted
+#      as such; the count is the operative field in both directions, so it is the count (never the
+#      WORD) that decides, and spelling `ISSUES` over a zero is not a wall.
 #      AND THE VERDICT MUST AGREE WITH ITS OWN SEVERITY LINES: `clean` means ZERO
 #      P0/P1/P2 (the code-review skill's convergence definition), so a `CLEAN` that
 #      carries a P0/P1/P2 line is refused (exit 7) — no blocking finding can ride in
@@ -1148,6 +1151,37 @@ require_verdict_marker() {
     err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
     die "$E_ISSUES" "a self-contradicting CLEAN verdict (marker reports $MK_COUNT blocking findings) is never recorded — re-run the review"
   fi
+  # ⛔ A NON-ZERO COUNT **ANYWHERE** IN THE MARKER CHANNEL CONTRADICTS A CLEAN VERDICT (P3, fresh
+  # review of #2670 — FAIL-OPEN class, MEASURED). The pair above is read with `tail -1`, so a
+  # transcript that reported blockers in the PRIMARY channel and then revised was read as its LAST
+  # pair only:
+  #     CLEAN / REVIEW_VERDICT: ISSUES / FINDINGS_BLOCKING: 2 / REVIEW_VERDICT: CLEAN / FINDINGS_BLOCKING: 0
+  # recorded a signed head-bound `clean` verdict over two reported blockers — the exact fail-open
+  # `refuse_counted_clean` already closes for the PROSE channel by reading EVERY surviving
+  # verdict-shaped line rather than only the last. The marker channel is the primary channel now, so
+  # it obeys the same rule: a reported count of findings anywhere in the accepted region is a
+  # finding, whatever line the reviewer put it on (the count channel's own declaration above).
+  # The count is the operative field in BOTH directions, which is why this reads counts and not the
+  # verdict WORD: `REVIEW_VERDICT: ISSUES` over `FINDINGS_BLOCKING: 0` is the same statement as
+  # `ISSUES 0` and still records (§AQ(4b)) — refusing the word would be a wall over a spelling.
+  MK_WORST_COUNT=0; MK_WORST_LINE=""
+  while IFS= read -r _mk_l || [ -n "${_mk_l:-}" ]; do
+    [ -n "${_mk_l:-}" ] || continue
+    _mk_n="$(marker_field_num "$_mk_l")"
+    case "${_mk_n:-}" in ''|*[!0-9]*) continue ;; esac
+    if [ "$_mk_n" -gt "$MK_WORST_COUNT" ] 2>/dev/null; then
+      MK_WORST_COUNT="$_mk_n"; MK_WORST_LINE="$_mk_l"
+    fi
+  done <<MK_COUNT_SCAN
+$(grep -aE "$VD_MK_COUNT" "$SURVIVORS_FILE" 2>/dev/null)
+MK_COUNT_SCAN
+  if [ "$MK_WORST_COUNT" -gt 0 ] 2>/dev/null; then
+    err "$PROG: the marker channel reports $MK_WORST_COUNT blocking finding(s) on a line OTHER than the last FINDINGS_BLOCKING line, while the verdict is CLEAN — a reviewer that reported blockers and then revised cannot have the revision read as the whole answer. Every marker-shaped count in the accepted region is a finding, the same way every surviving verdict-shaped line is."
+    err "  contradicting line: $MK_WORST_LINE"
+    err "  last count line:    ${MK_COUNT_LINE:-<none>}"
+    err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_ISSUES" "a self-contradicting CLEAN verdict (an earlier marker line reports $MK_WORST_COUNT blocking findings) is never recorded — re-run the review"
+  fi
 }
 # ⛔ A VERDICT INSIDE A CODE FENCE IS A QUOTATION, NOT A VERDICT (P1, fresh review of #2288).
 # The scan took the last verdict-SHAPED line anywhere in the transcript, so a transcript that
@@ -1372,8 +1406,13 @@ VERDICT_QUOTED=0
 # ── the STRUCTURED VERDICT MARKER (the primary channel, issue #2670) ──────────
 # Read from $SURVIVORS_FILE — the SAME fence/indent-filtered region the prose verdict is read from,
 # so a marker QUOTED inside a fenced block (the natural thing for a reviewer that is repeating
-# somebody else's clean artifact) is a quotation here too, and the last marker-shaped line wins for
-# the same reason the last verdict-shaped line wins.
+# somebody else's clean artifact) is a quotation here too, and the last marker-shaped pair is the one
+# the reviewer concluded with — the same `tail -1` the prose channel uses to find the last verdict
+# line. ⛔ BUT "THE LAST PAIR WINS" IS ONLY HALF THE PROSE CHANNEL'S RULE: the prose channel also
+# reads EVERY surviving verdict-shaped line (`refuse_counted_clean`) so a reported count cannot be
+# hidden behind a later bare `CLEAN`. `require_verdict_marker` carries the marker channel's mate to
+# that guard — a non-zero FINDINGS_BLOCKING anywhere in this region refuses the record — so the two
+# channels are symmetric in the direction that matters (both can only REFUSE).
 MARKER_LINES_FILE="$RUN_DIR/marker-lines.txt"
 grep -av $'^\001' "$SURVIVORS_FILE" 2>/dev/null | grep -aE "($VD_MK_VERDICT)|($VD_MK_COUNT)" > "$MARKER_LINES_FILE"
 # ⛔ A MISSING/UNREADABLE FILE IS NOT "NO MARKER" (the §count-guard invariant, same read site):
