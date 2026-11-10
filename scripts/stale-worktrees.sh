@@ -78,8 +78,10 @@ done
 # ⛔ AN UNRESOLVED REPO IS THE ONLY CASE THAT MAY NOT PROCEED (fresh-context review of #3833, F3 —
 # verified). This refusal used to fire whenever the LIBRARY was absent, even with a perfectly good
 # `--repo`, and told the operator to "pass --repo" — an action the absent library could not honour.
-# Same rule as pi-reap-worktrees.sh: the FARM copy (`~/.pi/agent/scripts/`, no orchestrator-harness
-# subtree) legitimately finds no library, and a DECLARED value keeps the local validation below.
+# Same rule as pi-reap-worktrees.sh: a FARM copy (`~/.pi/agent/scripts/`) has no orchestrator-harness
+# subtree, so only the flat second candidate can match there — and it DOES, since ai#1552 delivers
+# `repo-slug.sh` beside this script. A missing library is therefore a HAND-DEPLOYED copy, not the
+# farm; a DECLARED value keeps the local validation below either way.
 if command -v resolve_repo >/dev/null 2>&1; then
   REPO="$(resolve_repo)" || exit $?
 elif [ -z "$REPO" ]; then

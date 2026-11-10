@@ -241,11 +241,16 @@ else
   bad "D4 a declared-but-bogus --repo was not refused by value (rc=$_rc) — $_out"
 fi
 
-# D5-D6 THE FARM SHAPE: a copy with NO `repo-slug.sh` beside it (what `~/.pi/agent/scripts/` is — a flat
-# farm with no orchestrator-harness subtree). A DECLARED value must still work, and only an UNRESOLVED
+# D5-D6 THE FARM SHAPE: a copy with NO `repo-slug.sh` beside it — a flat tree with no
+# orchestrator-harness subtree. A DECLARED value must still work, and only an UNRESOLVED
 # REPO may refuse (fresh-context review of #3833, F3 — verified: two of the five scripts refused whenever
 # the LIBRARY was missing and then told the operator to `--repo`, an action the absent library could not
-# honour). Pinned with a copy, so it is not a claim about this host's layout.
+# honour). ⛔ THIS FIXTURE IS NOT `~/.pi/agent/scripts/` ANY MORE: the farm delivers
+# `repo-slug.sh` FLAT beside these scripts since ai#1552 (`pi-bootstrap/setup.sh`'s
+# `mcp_harness_srcs`), so on a real farm box the flat candidate IS present and this
+# absent-library shape models a HAND-DEPLOYED copy. The arms below are pinned with a
+# copy, so they are not a claim about this host's layout — and an earlier revision of
+# this comment made exactly that claim about the farm, wrongly.
 FARM="$T/farm"; mkdir -p "$FARM"
 cp "$HERE/../stale-worktrees.sh" "$HERE/../stale-main-triage.sh" "$FARM/" 2>/dev/null
 for _s in stale-worktrees.sh stale-main-triage.sh; do
