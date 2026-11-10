@@ -5782,13 +5782,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :3841 :5567 :7937 :8111, plus a comment mention at :3710; `14.1c-CITE` below
+#     CITE-CHECK: :3866 :5592 :7962 :8136, plus a comment mention at :3735; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:3725) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :3841) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :3866) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :7937). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :7962). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5814,7 +5814,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:7937` / `:8111` — CITE-CHECK: :7937 :8111 — re-derived by the
+#     this head the predicates are `:7962` / `:8136` — CITE-CHECK: :7962 :8136 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6718,12 +6718,12 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
 #       and in #3168's diff the only hunk at `post_marker()` (head :3725) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :3841) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :3866) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :5567 :7937 :8111 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :5592 :7962 :8136 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -10421,7 +10421,16 @@ run_record_delta $EH138 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42539301" \
 I only actually reviewed HEAD..HEAD~1; the rest was not read."
 assert_eq "$RECORD_RC" "3" "20h75 a right endpoint carrying a SELECTOR is a tip-relative NARROWING — REFUSED (rc 3)"
 assert_not_contains "$RECORD_ERR" "EMPTY range" "20h75 …and the author is NOT told they stated an empty range (their endpoint was an elder commit)"
-assert_not_contains "$RECORD_ERR" "both endpoints resolve to the attested head" "20h75 …nor that both endpoints are the attested head — a sentence the claim contradicts"
+# ⛔ THE ROW'S THIRD ASSERTION WAS DELETED, NOT RE-POINTED (thirtieth cycle, round 3, finding 3 — MEASURED).
+#    It read `assert_not_contains … "both endpoints resolve to the attested head"`, and THIS COMMIT
+#    removed that clause from the recorder's empty-range sentence (`:3524`), so the string can no longer
+#    be emitted by ANY code path: the assertion passed on the pre-fix code, on the head, and under every
+#    mutant in the matrix, while reading to the next reviewer as cover of the sentence. That is the
+#    `#3442` rule-3 shape — an assertion whose value cannot vary under any mutation of the diff is dead
+#    weight, and keeping it would be worse than the gap it pretends to close. What the row still pins is
+#    the verdict, the ABSENCE of the empty-range accusation, and the sentence actually printed (below);
+#    the claim-as-written quote that replaced the deleted clause is asserted by 20h75b, and the
+#    empty-range arm's own quote by 20h98/20h98b, where that arm is the one answering.
 assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h75 …it is told what it actually wrote, which is the class this file calls worse than the gap when wrong"
 [ -f "$(Q2 $EH138)" ] && bad "20h75 FAIL-OPEN: a narrowed right endpoint recorded over the wide range" || ok "20h75 no record was written"
 EH139=425394; rm -f "$(Q2 $EH139)"
@@ -11179,24 +11188,34 @@ assert_eq "$RECORD_RC" "0" "20h97c …and a three-dot ellipsis beside the range 
 #       head. The arm compared equality only, so `..<base>` and `..<head>~1` — nought commits — minted a
 #       signed `clean` over the whole range.
 assert_eq "$(git -C "$DG" rev-list --count "$DG_HEAD..$DG_A1" 2>/dev/null || true)" "0" "20h98 setup: the reviewed head's ANCESTOR states ZERO commits against it (the vector would measure nothing otherwise)"
+# ⛔ THE VECTORS NAME THE ANCESTOR BY A REF NAME, NOT BY ITS 40-HEX SHA (thirtieth review cycle, round 3,
+#    finding 2 — MEASURED). Both rows below used to write the bare sha, and the commit-token scan
+#    (`:2790–2836`) refuses a body that names a commit INSIDE the range — which `$DG_A1` is — BEFORE
+#    either omitted-endpoint arm is reached. So the rows were green at the PARENT, which has no
+#    ancestry test at all: they were refusal vectors that passed without the fix, and the fix shipped
+#    pinned by nothing (the `#3442` rule-3 shape). A ref name carries no hex run, so these bodies reach
+#    the mirror arm as the only layer — which is what makes M94 a dispatchable cell rather than a
+#    vacuous one.
+git -C "$DG" branch -f anc "$DG_A1" >/dev/null 2>&1 || true
+assert_eq "$(git -C "$DG" rev-parse --verify 'anc^{commit}' 2>/dev/null || true)" "$DG_A1" "20h98 setup: a REF NAME sits at the reviewed head's ancestor (the rows below name it instead of a 40-hex sha)"
+assert_eq "$(git -C "$DG" rev-list --count "$DG_HEAD..anc" 2>/dev/null || true)" "0" "20h98 setup: …and HEAD..anc states ZERO commits, so the claim below is an empty range"
 EH191=425600; rm -f "$(Q2 $EH191)"
 run_record_delta $EH191 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42560101" \
     STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
     STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
-I only actually reviewed ..$DG_A1 and nothing else."
-assert_eq "$RECORD_RC" "3" "20h98 an omitted-left endpoint that resolves to an ANCESTOR of the head (..<base>) is an EMPTY range — REFUSED (rc 3)"
-# ⛔ THE SENTENCE IS NOT PINNED FOR THE BARE FORM, because on this fixture another arm refuses it FIRST and
-#    its sentence is that arm's (MEASURED: `states an EMPTY range` is absent here while 20h98b's selector
-#    spelling carries it — so the empty-range ancestry test is measured by 20h98b/M94, not by this row).
-#    The rc is the assertion; inventing a sentence for a refusal this row cannot attribute would be the
-#    class this file keeps naming.
+I only actually reviewed ..anc and nothing else."
+assert_eq "$RECORD_RC" "3" "20h98 an omitted-left endpoint that resolves to an ANCESTOR of the head (..anc) is an EMPTY range — REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "states an EMPTY range" "20h98 …and the EMPTY-RANGE arm is the one answering (no hex run in the body, so the token scan cannot reach it first)"
+assert_contains "$RECORD_ERR" "..anc" "20h98 …quoting the claim as written"
 [ -f "$(Q2 $EH191)" ] && bad "20h98 FAIL-OPEN: the equality test saw only the head, so a nought-commit claim through an ancestor minted a signed clean" || ok "20h98 no record was written"
 EH192=425602; rm -f "$(Q2 $EH192)"
 run_record_delta $EH192 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42560301" \
     STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
     STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
-I only actually reviewed ..${DG_A1}~0 and nothing else."
-assert_eq "$RECORD_RC" "3" "20h98b …and the same ancestor spelled with an identity selector (..<base>~0) is the same empty range — REFUSED (rc 3)"
+I only actually reviewed ..anc~0 and nothing else."
+assert_eq "$RECORD_RC" "3" "20h98b …and the same ancestor spelled with an identity selector (..anc~0) is the same empty range — REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "states an EMPTY range" "20h98b …through the empty-range path, and NOT the token scan: this arm's own sentence is the one printed"
+assert_contains "$RECORD_ERR" "..anc~0" "20h98b …quoting the selector spelling as written"
 [ -f "$(Q2 $EH192)" ] && bad "20h98b FAIL-OPEN: the selector spelling slipped past the equality test" || ok "20h98b no record was written"
 # ⛔ 20h99 — THE DOTS MUST NOT SIT BETWEEN TWO OPERANDS (thirtieth review cycle, round 2 — MEASURED, a
 #       FALSE BLOCK the round-1 separator tolerance introduced). `HEAD .. <orphan>` WRITES its right
@@ -11219,6 +11238,37 @@ run_record_delta $EH194 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42560701" \
 I compared HEAD .. afterhead and it is not part of this range."
 assert_eq "$RECORD_RC" "0" "20h99b …and so is the same shape with a REF NAME after the dots (HEAD .. afterhead) — ACCEPTED (rc 0)"
 [ -f "$(Q2 $EH194)" ] || bad "20h99b FALSE BLOCK: a descendant NAMED after the dots was refused as a nought-commit claim"
+# ⛔ 20h100 — `HEAD..<right>` IS EMPTY WHEN <right> IS AN ANCESTOR (thirtieth review cycle, round 3 —
+#       MEASURED, a FAIL-OPEN the round-2 operand guard left open, and a REGRESSION against the parent
+#       for six spellings). `HEAD..` is `HEAD..HEAD`; the guard above skips the arm whenever the word
+#       after the dots RESOLVES, which is correct for a mention of another lineage (20h99) but not for
+#       a right end that is an ANCESTOR of the head: `HEAD..anc` selects NOTHING, and it minted a
+#       signed `clean` over the whole recorded range. The parent refused all three rows below. Only the
+#       LEFT operand's identity separates the two populations, which is why the guard is gated on it.
+assert_eq "$(git -C "$DG" rev-list --count "$DG_HEAD..anc" 2>/dev/null || true)" "0" "20h100 setup: HEAD..anc holds ZERO commits, so every claim below names nought commits"
+EH195=425608; rm -f "$(Q2 $EH195)"
+run_record_delta $EH195 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42560901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD.. anc and nothing else."
+assert_eq "$RECORD_RC" "3" "20h100 a written right end that is an ANCESTOR of the head, left operand the tip (HEAD.. anc) — REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "states an EMPTY range" "20h100 …refused as what it is: an empty range, not as an omitted endpoint"
+assert_not_contains "$RECORD_ERR" "left endpoint is omitted" "20h100 …and the author is not told they omitted an endpoint they WROTE"
+[ -f "$(Q2 $EH195)" ] && bad "20h100 FAIL-OPEN: the operand guard skipped ANY resolvable right end, so a nought-commit claim on the head minted a signed clean" || ok "20h100 no record was written"
+EH196=425610; rm -f "$(Q2 $EH196)"
+run_record_delta $EH196 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42561101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD .. anc and nothing else."
+assert_eq "$RECORD_RC" "3" "20h100b …and with the separator spaced (HEAD .. anc) — REFUSED (rc 3), the ordinary markdown spelling"
+[ -f "$(Q2 $EH196)" ] && bad "20h100b FAIL-OPEN: the spaced spelling was waved through by the same guard" || ok "20h100b no record was written"
+EH197=425612; rm -f "$(Q2 $EH197)"
+run_record_delta $EH197 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42561301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed pr .. anc and nothing else."
+assert_eq "$RECORD_RC" "3" "20h100c …and with the head's own name, not its spelling, as the left operand (pr .. anc where pr IS the head) — REFUSED (rc 3)"
+[ -f "$(Q2 $EH197)" ] && bad "20h100c FAIL-OPEN: the tip gate read only the tip's SPELLINGS, so a ref name at the head walked past" || ok "20h100c no record was written"
 
 # ⛔ THE FIXTURE MUST NOT LEAVE THE CHECKOUT WHERE THE FRAME VECTORS PUT IT: §20i below reads the
 #    worktree, and every later section assumes the branch choice this suite found on entry.
@@ -12407,22 +12457,38 @@ I only actually reviewed HEAD@1..HEAD; the rest was not read."
 #       refusal vectors and by M88, which measures the split half of the same defect; the cross-fixture
 #       disagreement is recorded rather than resolved away, because a cell that reports vacuity looks
 #       like cover and a note that claims a measurement it cannot reproduce is false.
-# M94 — NOT DISPATCHED, for the same MEASURED reason as M89 (thirtieth cycle, round 2): the ancestry test
-#       in the mirror arm is real and it SHIPS, but forcing it off (`if [ "$_osha" = "$to" ]` alone) leaves
-#       the mutant STILL refusing both `..<base>` and `..<base>~0` in this fixture — a second arm reaches
-#       the same claim first, so a dispatched cell reports vacuity. 20h98 / 20h98b are therefore REFUSAL
-#       vectors, and 20h98b's sentence assertion is what shows the empty-range path is the one answering
-#       (MEASURED: `states an EMPTY range` is present for the selector spelling and absent for the bare
-#       one). Recorded rather than papered over: a cell that reports vacuity looks like cover.
+# M94 — THE ANCESTRY TEST IN THE MIRROR ARM (thirtieth cycle, round 2; DISPATCHED in round 3). `..X` is
+#       `HEAD..X`, so it is EMPTY for an ANCESTOR of the head, not only for the head itself. Forcing the
+#       test off (`if [ "$_osha" = "$to" ]` alone) makes 20h98's body ACCEPT, which is what makes the
+#       cell non-vacuous. ⛔ ROUND 2 RECORDED THIS CELL AS UNDISPATCHABLE, and that note was WRONG in a
+#       way worth keeping: the rows it named wrote the ancestor as a 40-hex sha, and the commit-token
+#       scan refuses a body naming a commit INSIDE the range before any omitted-endpoint arm is
+#       reached — so the mutant still refused, for a reason the mutation never touched. Re-pointing the
+#       vectors at a REF NAME (`anc`, at the ancestor) removes the other layer; the cell now measures
+#       the ancestry test and nothing else.
+MUT="$(mk_mutant noancestry '
+      if [ "$_osha" = "$to" ] || delta_git "$root" merge-base --is-ancestor "$_osha" "$to" 2>/dev/null; then' '
+      if [ "$_osha" = "$to" ]; then')"
+mut_check "M94 an omitted-left endpoint is empty for an ANCESTOR of the head too, not just for the head" 425586 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42558701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed ..anc and nothing else."
 # M95 — THE DOTS MUST NOT SIT BETWEEN TWO OPERANDS (P2, thirtieth cycle round 2). Removing the guard makes
 #       the tolerant arm refuse `HEAD .. <orphan>` — a claim that WROTE its right endpoint — as an
 #       omitted-endpoint empty range. 20h99 accepts it; the mutant must refuse.
-MUT="$(mk_mutant nooperandafter '        if [ -n "$(delta_git "$root" rev-parse --verify "${_olw}^{commit}" 2>/dev/null || true)" ]; then
-          _opends="${_opends#*"${BASH_REMATCH[0]}"}"
-          continue
-        fi' '        :')"
+#       ⛔ THE ANCHOR MOVED IN ROUND 3 (the guard is now GATED on the left operand and resolves the right
+#       end once into `$_olwsha`), so the mutation disables the whole guard rather than re-reading the
+#       old inline `rev-parse`. Disabling it is the same behaviour M95 was written for.
+MUT="$(mk_mutant nooperandafter '        if [ -n "$_olwsha" ]; then' '        if false; then')"
 mut_check "M95 the dots must not sit between two operands, so a spaced two-endpoint claim is not refused as an omitted endpoint" 425584 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42558501" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I compared HEAD .. ${_dg_orphan:0:12} and it is an unrelated lineage, not part of this range."
+# M96 — THE GUARD IS GATED ON THE LEFT OPERAND, AND A TIP LEFT END EVALUATES ITS RIGHT END (P1, thirtieth
+#       cycle round 3). The round-2 guard skipped ANY resolvable right end, so `HEAD..<ancestor>` — nought
+#       commits — minted a signed `clean`. Dropping the ancestry test from the gated guard restores that
+#       fail-open; 20h100's body must be ACCEPTED under the mutant and REFUSED by the shipped code.
+#       M95 and M96 measure the two halves of ONE guard in OPPOSITE directions, which is the point: the
+#       skip is right for a mention and wrong for a narrowing, and neither cell can cover both.
+MUT="$(mk_mutant notipancestry '            if [ "$_olwsha" = "$to" ] || delta_git "$root" merge-base --is-ancestor "$_olwsha" "$to" 2>/dev/null; then' '            if [ "$_olwsha" = "$to" ]; then')"
+mut_check "M96 a right end an ANCESTOR of the tip makes the claim empty even though the dots DO sit between two operands" 425588 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42558901" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD.. anc and nothing else."
 # M90 — THE SYMBOLIC EXEMPTION ON THE TIP-ANCHORED SPELLING (P2, thirtieth cycle). Removing it restores
 #       the false block: `HEAD@{upstream}` named in prose is refused with a sentence saying the author
 #       wrote `HEAD~N`. 20h96's body is ACCEPTED by the shipped code and REFUSED under the mutant — an

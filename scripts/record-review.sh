@@ -1605,7 +1605,7 @@ _tiproot() { # <token> -> the token re-rooted on the attested head, or ""
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -3353,17 +3353,13 @@ $m"
       # `git rev-list --count HEAD..<orphan>` is 1). The omission is `<operand>..` with NOTHING after
       # it, so a RESOLVABLE token after the dots means the range has both ends and belongs to the arm
       # above. Resolution, not spelling: `and the rest was not read` does not resolve, `<orphan>` does.
+      # ⛔ UNLESS THE LEFT OPERAND IS THE HEAD (thirtieth review cycle, round 3): `HEAD..<right>` is
+      # still a TWO-endpoint claim, but its emptiness is THIS arm's to measure, not the arm above's —
+      # `<right>` an ancestor of the head means nought commits. See the gated guard below.
       _olpost="${_opends#*"${BASH_REMATCH[0]}"}"
+      _opends="$_olpost"
       _olpost="${_olpost#"${_olpost%%[![:space:]]*}"}"
       _olword="${_olpost%%[[:space:]]*}"
-      if [ -n "$_olword" ]; then
-        _olw="$(_tipvariant "$_olword")"
-        if [ -n "$(delta_git "$root" rev-parse --verify "${_olw}^{commit}" 2>/dev/null || true)" ]; then
-          _opends="${_opends#*"${BASH_REMATCH[0]}"}"
-          continue
-        fi
-      fi
-      _opends="${_opends#*"${BASH_REMATCH[0]}"}"
       # The same word-or-word-plus-selector rule as the two-endpoint arm above, and the same git-decided
       # case variant (`Head..` with a tag `Head` at another commit is not `HEAD..`): `_tipvariant`
       # normalises only when the repo has no ref of that exact name (twenty-third cycle, P2).
@@ -3391,7 +3387,36 @@ $m"
             _osha="$(delta_git "$root" rev-parse --verify "${_olhs}^{commit}" 2>/dev/null || true)" ;;
         esac
       fi
+      # ⛔ THE LEFT OPERAND IS RESOLVED HERE, BEFORE THE GUARD BELOW USES IT: whether a resolvable word
+      # after the dots is somebody else's range or the RIGHT END of a `HEAD..` claim is decided by
+      # whether the LEFT operand is the attested head, so the guard cannot ask its question first.
       [ -n "$_osha" ] || continue
+      # ⛔ A RESOLVABLE WORD AFTER THE DOTS IS THE RANGE'S OWN RIGHT END ONLY WHEN THE LEFT OPERAND IS
+      # NOT THE HEAD (thirtieth review cycle, round 3 — MEASURED, a FAIL-OPEN this round's guard left
+      # open, and a REGRESSION against the parent for six spellings). Round 2's guard skipped this arm
+      # whenever the word after the dots resolved, which is right for `HEAD .. <orphan>` (a mention of
+      # another lineage, 20h99) — but `HEAD..` is `HEAD..HEAD`, so for a LEFT operand that IS the head
+      # the same skip waves through `HEAD.. <ancestor>`, `HEAD .. <ancestor>` and `<head-sha> .. anc`:
+      # nought commits, minted as a signed `clean` over the whole recorded range, and refused by the
+      # parent before the guard existed. `X..` is empty when X CONTAINS the head (the asymmetry this
+      # arm's equality test below states); `HEAD..<right>` is empty when `<right>` is an ANCESTOR of
+      # it — the mirror arm's test, applied here for the population the guard routes around.
+      # So the skip is GATED ON THE LEFT OPERAND and, for the head, the emptiness is EVALUATED with
+      # the same `merge-base --is-ancestor` the sibling arm uses. Resolution, not spelling, both ways:
+      # `and the rest was not read` resolves to nothing and is prose; `<orphan>` is a descendant and
+      # is a real two-endpoint claim (20h99, accepted); `<ancestor>` is a nought-commit claim.
+      if [ -n "$_olword" ]; then
+        _olw="$(_tipvariant "$_olword")"
+        _olwsha="$(delta_git "$root" rev-parse --verify "${_olw}^{commit}" 2>/dev/null || true)"
+        if [ -n "$_olwsha" ]; then
+          if [ "$_osha" = "$to" ]; then
+            if [ "$_olwsha" = "$to" ] || delta_git "$root" merge-base --is-ancestor "$_olwsha" "$to" 2>/dev/null; then
+              _emptyrange=1; _emptystated="$_olhs..$_olword (both endpoints are written and the left one is the attested head, so the claim is HEAD..$_olword — an EMPTY range)"; break
+            fi
+          fi
+          continue
+        fi
+      fi
       # ⛔ THIS DIRECTION COMPARES EQUALITY ONLY, AND THE ASYMMETRY IS THE MEANING, NOT AN OVERSIGHT
       # (thirtieth review cycle, round 2 — MEASURED BOTH WAYS). `X..` is `X..HEAD`, so it is EMPTY when X
       # CONTAINS the head, not when X is an ancestor of it: an ANCESTRY test here refused `deltabase..`
