@@ -219,6 +219,14 @@ function resolveHarness(token) {
 /** A YAML mapping key, at any depth, with or without a `- ` sequence marker. */
 const KEY_LINE = /^(\s*)(?:-\s*)?([A-Za-z0-9_.-]+):\s*(.*)$/;
 const BLOCK_SCALAR = /^[|>][+-]?\d*$/;
+/** The keys whose BLOCK-SCALAR body is a command. A one-line value still counts
+ *  under any key (a `<key>: … node <x>.mjs` value IS the invocation, and the
+ *  review asked for it), but a block BODY has no such anchor: a `description: |`
+ *  paragraph that happens to name a harness would be pulled into the corpus and
+ *  the pin would then demand a migration for a file nothing runs — a false RED,
+ *  which is its own kind of damage. So a block body is read only where the key
+ *  says "this is a command". */
+const COMMAND_KEY = /^(?:run|[A-Za-z0-9_.-]*(?:command|script))$/;
 
 /** Every COMMAND string a workflow file carries, in the three shapes this repo
  *  actually uses. (§3's corpus bug, #2723 review 2026-11-10: the old scan matched
@@ -247,6 +255,7 @@ function commandTokens(body) {
     const keyCol = lines[i].indexOf(m[2]);
     const value = (m[3] ?? "").trim();
     if (BLOCK_SCALAR.test(value.replace(/\s+#.*$/, ""))) {
+      if (!COMMAND_KEY.test(m[2])) continue;
       for (let j = i + 1; j < lines.length; j++) {
         const line = lines[j];
         if (line.trim() === "") continue;
