@@ -485,8 +485,20 @@ rc3c=$?
 ck "B3c an absent resolver + a failed read is still HELD (rc=$rc3c), so the gate keeps its teeth" $rc
 grep -q 'IS credentialed' "$TMP/b3c.log" && rc=1 || rc=0
 ck "B3c2 …and the refusal does NOT claim a credential it never resolved (no 'IS credentialed')" $rc
-grep -q 'could NOT be resolved either' "$TMP/b3c.log"; rc=$?
-ck "B3c3 …it names the unresolved state and points at the lane's own gh, rather than guessing" $rc
+# ⛔ TWO PRODUCERS PRINT THIS SENTENCE ON THIS PATH, so the bare words cannot tell them apart — the same
+# class `B2f2`/`B2g2`/`B2h2`/`B2i2` were re-pointed for, left un-fixed here on the THIRD outcome. On B3c the
+# EVIDENCE read fails too (`all-fail` mode), so `land_backlog_exempt_note` fires as well and its unresolved
+# arm prints "this lane's gh credential could NOT be resolved either" — so the refusal's own clause could be
+# deleted and the arm stayed green. MEASURED at `364c3042d` before this fix: rewording ONLY the refusal's
+# clause (to "could not be READ either", printf arity kept) left the suite at `passed: 76 failed: 0`.
+# Each producer now greps a string only IT emits: the refusal's own `⛔ BUT FIRST:` marker (the NOTE never
+# prints it), and the NOTE's own "so the CAUSE MAY BE THE CREDENTIAL" (the refusal says "CREDENTIAL fault").
+grep -q '⛔ BUT FIRST: this lane' "$TMP/b3c.log"; rc=$?
+ck "B3c3 …the REFUSAL names the unresolved state and points at the lane's own gh, rather than guessing" $rc
+grep -q 'Remedy: land/fix the open PRs.*⛔ BUT FIRST: this lane' "$TMP/b3c.log"; rc=$?
+ck "B3c4 …and it still prints the RATIO remedy on that same line WITH the caveat — the documented third outcome, not the silence #2210 forbids" $rc
+grep -q 'so the CAUSE MAY BE THE CREDENTIAL' "$TMP/b3c.log"; rc=$?
+ck "B3c5 …while the NOTE's own unresolved arm says the cause MAY BE the credential (its words, not the refusal's)" $rc
 
 # B4: the falsifier in the ratio direction — a credential present and a genuine overshoot still HOLDS,
 # with the RATIO remedy (the pre-change tree printed that remedy on the wrong arm, so both arms are
