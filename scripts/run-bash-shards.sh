@@ -298,7 +298,24 @@ command -v fixture_guard_placement >/dev/null 2>&1 || {
   echo "❌ cannot load scripts/orchestrator-harness/fixture-hermetic.sh — refusing to run shards with the #3011 placement guard inert" >&2
   shard_exit 2
 }
+# ⛔ AND THE SAME FAIL-CLOSED PROBE FOR THE #2329 AMBIENT-CONFIG ARM. `shard_exec` calls these two on
+# every shard; a helper predating them (a farmed or stale copy of the file) would make them
+# `command not found` — a per-shard error storm, or, worse, a silently inert arm if the calls were
+# ever made `|| true`. Refuse up front, naming the file, exactly as the placement guard above does.
+command -v fixture_ambient_config_snapshot >/dev/null 2>&1 \
+  && command -v fixture_ambient_config_verify >/dev/null 2>&1 || {
+  echo "❌ scripts/orchestrator-harness/fixture-hermetic.sh has no ambient-config guard (#2329) — refusing to run shards with an inert arm" >&2
+  shard_exit 2
+}
 fixture_guard_placement "run-bash-shards.sh"
+
+# #2329 — an arm that COULD NOT ASK must never be mistaken for a clean run. The ambient-config guard
+# is per-shard (it reads the repo config before and after every suite); in a tree that is not a git
+# repo — a fixture copy, a scratch checkout — it can ask nothing, and this says so ONCE, here, rather
+# than 139 times or not at all.
+case "$(fixture_ambient_config_snapshot "$SHARD_ROOT")" in
+  '!nogit') echo "⚠️  ambient-config guard (#2329): SKIPPED — $SHARD_ROOT is not a git repo, so no shared remote config can be read in this tree" >&2 ;;
+esac
 
 # run_shard <path> — one shard. `shard_ran` is what makes the list SELF-CHECKING at runtime: the
 # counters are compared against the derived count at the end, so a neutered helper (executing
@@ -923,7 +940,24 @@ shard_kill_group() {
 # "cosmetic" because the rc was assumed intact; it is not on that path). Restoring exact pid identity
 # would mean inlining the `env -u` at the `&` site, which moves the string the three ci-lane-parity
 # mutants pin — the P0 this branch already had to repair once.
-shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$1"; }
+# ⛔ #2329 — THE AMBIENT GIT CONFIG IS READ BEFORE AND AFTER EVERY SHARD, and the suite that moved it
+# is NAMED and FAILS. `remote.origin.url` lives in the repo's SHARED config, so one suite that
+# repoints it at a /tmp bare repo (the measured incident) redirects the pushes of every worktree and
+# every concurrent lane in this checkout — and each of those pushes still prints `[new branch]` and
+# exits 0. Two incidents, and neither could name its producer; this attributes it to the suite.
+# The rc folds into the shard's own, so it travels through the existing failure arm (the named
+# `❌ SHARD FAILED (rc N): <path>` line and the `::error::` annotation) rather than a second list.
+# ⛔ THE `env -u …` CALL MUST KEEP ITS EXACT SPELLING: `tests/ci-lane-parity/run.sh` builds its
+# stdin-drain and skip mutants by `sed`-ing this very line, so a reworded call silently disarms those
+# arms (they `cmp` the mutant against the original and fail loudly — do not rely on it).
+shard_exec() { # <path>
+  local ambient_pre ambient_rc
+  ambient_pre="$(fixture_ambient_config_snapshot "$SHARD_ROOT")"
+  env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$1"
+  ambient_rc=$?
+  fixture_ambient_config_verify "$SHARD_ROOT" "$1" "$ambient_pre" || ambient_rc=1
+  return $ambient_rc
+}
 
 shard_run_bounded() {
   if [ "$shard_bound" -lt 1 ]; then shard_exec "$1" </dev/null; return $?; fi

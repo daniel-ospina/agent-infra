@@ -236,6 +236,88 @@ fixture_reap_all() { # -> 0 when every recorded group is gone; nonzero = number 
   fixture_survivors $list
 }
 
+# ── ambient git-config guard (agent-infra#2329) ────────────────────────────────────────────────
+# A suite's fixtures must not write to the AMBIENT repository's git config. Measured, twice: a test
+# process repointed `remote.origin.url` in a repo's SHARED config (the common dir — so it applies to
+# every worktree of that hub) at a throwaway bare repo under /tmp (`/tmp/vg-bare-claims.git`, then
+# `/tmp/rev3203/o-pyanchor.git`), and a lane's `git push` printed `[new branch] … ->` and exited 0
+# while the commits landed in /tmp — one temp cleanup from gone, and `git ls-remote origin` read the
+# fixture too, so the check-after-push corroborated the false success.
+#
+# The runner wraps EVERY shard with these two calls, which is the one thing the two incidents could
+# not answer ("the producer is not yet identified"): the mutation is attributed to the SUITE that
+# made it, by name, and the shard FAILS. A mutation is a failure and never a warning — after it, the
+# next push from ANY lane in this repo reports success against a remote that is not the repo.
+#
+# ⛔ IT RESTORES `remote.origin.url` TO THE VALUE IT MEASURED, and the narrowness is the point:
+# without it, one suite's mutation poisons every LATER shard in the same run (they inherit the same
+# hub config), so a single report would name every victim as a cause. It restores only that one key,
+# only to the value measured seconds earlier, and never invents a URL. A URL that was ALREADY
+# offsite when the shard started is restored as-is, not "repaired": that is a real state of the box,
+# and `scripts/checkout-hygiene/hub-state-check.sh` reports it as `remote_offsite` (it also composes
+# with that check rather than duplicating its grammar — this guard asks "did it MOVE", not "is it
+# right").
+#
+# STATED LIMITS. (1) Only the REPOSITORY config is read; a suite that mutates `--global`
+# (`~/.gitconfig`) is invisible here. (2) The "did it move" answer is an exact string compare of the
+# sorted `remote.*` lines; the `-`/`+` lines printed on a hit are a DISPLAY simplification (a
+# substring scan), so read them as an excerpt, never as the verdict. (3) A repo with NO `remote.*`
+# entries answers `!noremotes`, and a path that is not a git repo answers `!nogit` — both are
+# UNASKABLE and never a pass; the runner names the `!nogit` case once at startup.
+fixture_ambient_config_snapshot() { # <repo> → sorted `remote.*` lines (key SPACE value), or a `!`-sentinel
+  local repo="${1:-}" out=""
+  if [ -z "$repo" ] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+    printf '!nogit\n'; return 0
+  fi
+  out="$(LC_ALL=C git -C "$repo" config --local --get-regexp '^remote\.' 2>/dev/null || true)"
+  if [ -z "$out" ]; then printf '!noremotes\n'; return 0; fi
+  printf '%s\n' "$out" | LC_ALL=C sort
+}
+
+fixture_ambient_config_verify() { # <repo> <label> <pre-snapshot> → 1 (and a named report) when it moved
+  local repo="${1:-}" label="${2:-shard}" pre="${3:-}" post="" pre_origin="" post_origin=""
+  local pre_has_origin=0 line
+  case "$pre" in '!nogit'|'!noremotes'|'') return 0 ;; esac
+  post="$(fixture_ambient_config_snapshot "$repo")"
+  [ "$post" = "$pre" ] && return 0
+  case "$pre" in
+    *remote.origin.url\ *) pre_has_origin=1
+      pre_origin="$(printf '%s\n' "$pre" | sed -n 's/^remote\.origin\.url //p' | head -1)" ;;
+  esac
+  post_origin="$(printf '%s\n' "$post" | sed -n 's/^remote\.origin\.url //p' | head -1)"
+  {
+    printf '  ❌ AMBIENT GIT CONFIG MUTATED by %s (#2329)\n' "$label"
+    printf '     the repository config of %s — SHARED by every worktree of that repo\n' "$repo"
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      case "$post" in *"$line"*) continue ;; esac
+      printf '       - %s\n' "$line"
+    done <<<"$pre"
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      case "$pre" in *"$line"*) continue ;; esac
+      printf '       + %s\n' "$line"
+    done <<<"$post"
+  } >&2
+  if [ "$pre_origin" != "$post_origin" ]; then
+    if [ "$pre_has_origin" -eq 1 ]; then
+      git -C "$repo" config --local remote.origin.url "$pre_origin" 2>/dev/null || true
+    else
+      git -C "$repo" config --local --unset-all remote.origin.url 2>/dev/null || true
+    fi
+    printf '     restored remote.origin.url to %s (measured before this shard ran)\n' "${pre_origin:-<unset>}" >&2
+    # Read back: a restore that did not take must never read as repaired.
+    post_origin="$(git -C "$repo" config --local remote.origin.url 2>/dev/null || true)"
+    if [ "$post_origin" != "$pre_origin" ]; then
+      printf '     ❌ the restore DID NOT TAKE — remote.origin.url is still %s; repair it by hand:\n' "$post_origin" >&2
+      printf '        git -C %s remote set-url origin <the repo URL>\n' "$repo" >&2
+    fi
+  fi
+  printf '     Fix the suite: build ITS OWN remote, never the ambient repo —\n' >&2
+  printf '        git -C "$tmp" init --bare "$tmp/origin.git" && git -C "$work" remote add origin "$tmp/origin.git"\n' >&2
+  return 1
+}
+
 fixture_hermetic_init() { # <pgid-ledger-path> [temp-dir-to-remove]
   FIXTURE_PGID_FILE="$1"
   FIXTURE_TMP_TO_REMOVE="${2:-}"
