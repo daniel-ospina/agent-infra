@@ -72,7 +72,9 @@ check("#1051 Step 2 template-validity block extractable", !!tvBlock);
 check("#1051 Step 2 skill-lint block extractable", !!slBlock);
 if (!step1 || !tvBlock || !slBlock) {
   console.log("\ncannot run the behavioural cases without the blocks");
-  console.log(`${pass} passed, ${fail} failed`);
+  // Early exit, same attributable form — a step that dies here must still be
+  // nameable by the merge rail (agent-infra#2723).
+  reportVerdict("test-infra-verify-scan", pass, Math.max(fail, 1));
   process.exit(1);
 }
 

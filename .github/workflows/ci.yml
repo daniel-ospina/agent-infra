@@ -1418,6 +1418,39 @@ jobs:
         # vulnerable form (`find <dir>/`, `find -H`, `find -L`) is executed and
         # asserted to LEAK, then the fixed form is asserted not to.
         run: node extensions/shared/test-infra-verify-scan.mjs
+      - name: Verdict emitter + attribution drift pin (#2723, zero-dep)
+        timeout-minutes: 4
+        # agent-infra#2723 — a `verify` red yielded NO parseable failure identity, so
+        # the merge rail refused every PR whose only red was this job:
+        #
+        #   ⛔ admin-merge: BLOCKED — 1 of 1 failing PR run(s) yielded NO parseable
+        #      failure identity … This is a refusal, not a comparison.
+        #
+        # The rail reads a JS harness through its `runner::<label>` family, anchored
+        # on `❌ <label>: <N> passed, <M> failed` (scripts/ci_exemption.py,
+        # `_RUNNER_AGG_RE`). Sixteen harnesses hand-rolled that aggregate in five
+        # shapes — label-less counts, no marker at all, a count where the label goes
+        # — so the measured output of the failing step in run 40110626277 parsed to
+        # `ids=0`, and the rail could not name it.
+        #
+        # The fix is at the PRODUCER (#1185's precedent): `extensions/shared/verdict.mjs`
+        # prints the attributable form and every harness now goes through it. No
+        # parser change — the identity family and its refusal path are untouched.
+        #
+        # This step pins BOTH halves and is only a pin if it can FAIL, so it is
+        # bidirectionally measured: (a) the emitter's output is round-tripped through
+        # the rail's OWN parser (a test that re-states the format can only agree with
+        # itself), and (b) every zero-dep `node` harness a workflow runs must import
+        # the emitter — read from `.github/workflows/*.yml`, the same files the runner
+        # reads, not from a list kept here. Verified RED both ways: deleting one
+        # harness's import, and dropping the emitter's zero-count clamp, each turn
+        # their arms red (73 → 71 passed, 2 failed).
+        #
+        # Its own step (like #744/#708/#709/#1051 above) because the
+        # `extensions/*/test*.mjs` glob in ci-main.yml runs on the push lane only,
+        # never on a PR — and this is the guard for what a PR's log reads like.
+        # Zero-dep (`node:*` only), no `npm ci`, ~2s (one `python3.12` subprocess).
+        run: node extensions/shared/test-verdict.mjs
       - name: read-path failure contract — tortoise-memory.mjs (tortoise#3805 / #1182)
         timeout-minutes: 4
         # The skills' memory client used to exit 0 in every direction (never
