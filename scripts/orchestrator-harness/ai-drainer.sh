@@ -643,24 +643,32 @@ finish() { # [<rc>] — 1 when a lane from an earlier tick failed, whatever this
 # The module is resolved the way the launcher census resolves `worker-terminal.sh` ($O first, then beside
 # this script), because `$O` is seeded file by file and a STALE `wt-lifecycle.sh` would otherwise be read
 # as "no holders". A missing/stale module is NOT read as "no holder" — see `_drain_holder`'s rc 2.
-WTL="${WTL:-}"
-if [ -z "$WTL" ]; then
-  for _wtl_cand in "$O/wt-lifecycle.sh" "$SELF_DIR/wt-lifecycle.sh"; do
-    [ -f "$_wtl_cand" ] && { WTL="$_wtl_cand"; break; }
-  done
-fi
+# ⛔ THE FIRST CANDIDATE THAT CANNOT ANSWER IS NOT THE LAST ONE TRIED (review finding, PR #3918): the
+# resolution used to take the first file that EXISTS and then test it, so a stale `$O/wt-lifecycle.sh`
+# discarded a perfectly good copy beside the script (a hand-run tick from a checkout is exactly that
+# shape). Each candidate is sourced and asked whether it defines the verb; the first one that does wins.
+HOLDER_PROBE=0
 HOLDER_PROBE_WHY="wt-lifecycle.sh not found (looked in $O, $SELF_DIR)"
-if [ -n "$WTL" ] && [ -f "$WTL" ]; then
-  # shellcheck disable=SC1090
-  . "$WTL" 2>/dev/null
+if [ -n "${WTL:-}" ]; then
+  # ⛔ A PINNED `WTL` IS HONOURED VERBATIM AND NEVER REPLACED BY ANOTHER COPY — that is what makes the
+  # fail-closed arm driveable (a pinned path that cannot answer must produce HOLDER_PROBE=0, not a
+  # silent fallback to a copy that can). The resolution loop below is the UNPINNED path.
+  [ -f "$WTL" ] && . "$WTL" 2>/dev/null
   if command -v wt_live_holders >/dev/null 2>&1; then
-    HOLDER_PROBE="1"; HOLDER_PROBE_WHY="ok ($WTL)"
+    HOLDER_PROBE=1; HOLDER_PROBE_WHY="ok ($WTL)"
   else
-    HOLDER_PROBE="0"
-    HOLDER_PROBE_WHY="wt-lifecycle.sh at $WTL is stale (no wt_live_holders) — fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"
+    HOLDER_PROBE_WHY="WTL=$WTL is missing or stale (no wt_live_holders) — fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"
   fi
 else
-  HOLDER_PROBE="0"
+  for _wtl_cand in "$O/wt-lifecycle.sh" "$SELF_DIR/wt-lifecycle.sh"; do
+    [ -f "$_wtl_cand" ] || continue
+    # shellcheck disable=SC1090
+    . "$_wtl_cand" 2>/dev/null
+    if command -v wt_live_holders >/dev/null 2>&1; then
+      WTL="$_wtl_cand"; HOLDER_PROBE=1; HOLDER_PROBE_WHY="ok ($_wtl_cand)"; break
+    fi
+    HOLDER_PROBE_WHY="wt-lifecycle.sh at $_wtl_cand is stale (no wt_live_holders) — fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"
+  done
 fi
 # ⛔ WITNESS B RUNS WITH NO FORK THAT INHERITS A WORKTREE CWD. This is the measurement `wt-lifecycle.sh`
 # records for the same class (its `wt_run_bounded`): a subshell does not `exec`, so it inherits its
@@ -700,13 +708,20 @@ _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none
   out="$(_proc_cwd_holder "$path")"; proc_rc=$?
   case "$proc_rc" in
     0) printf '%s\n' "$out"; return 0 ;;
-    1) rc=1 ;;
+    # ⛔ WITNESS B'S "NONE" CLEARS ONLY WITNESS A'S "NONE", NEVER ITS "I COULD NOT TELL" (review
+    # finding, PR #3918). Overwriting rc=2 here made a STALE/MISSING `wt-lifecycle.sh` silently drop the
+    # ARGV witness on every Linux box — the header and `docs/ops/ai-drainer.md` both promise the
+    # opposite, and the loss is in the destructive direction (a `pytest <wt>/…` holder has a cwd
+    # elsewhere, so only the argv witness sees it). An unproven removal keeps the tree.
+    1) [ "$rc" = "2" ] || rc=1 ;;
     *) : ;;                                # witness B absent (no /proc): keep witness A's verdict
   esac
   return "$rc"
 }
 _rm_wt() { # <worktree path> — only ever called for a lane whose pid is PROVABLY DEAD
-  #                         → 0 removed · 2 kept (the probe could not be evaluated) · 3 kept (held)
+  #   → 0 removed · 1 removal FAILED (the WARN below) · 2 kept (the probe could not be evaluated) ·
+  #   3 kept (a live holder). ⛔ 2 and 3 mean "the lane has NOT ended"; 1 does not, and a caller that
+  #   treats them alike never settles a lane whose tree cannot be deleted (review finding, PR #3918).
   local holder="" hrc=0 hpid="" hwhy=""
   # ──8<── holder-gate ───────────────────────────────────────────────────────────────────────
   holder="$(_drain_holder "$1")"; hrc=$?
@@ -745,10 +760,14 @@ _settle_lanes() {
     w="$AI/wt-drainer-$name"
     if [ -d "$w" ]; then
       _rm_wt "$w"
-      if [ $? -ne 0 ]; then
-        SETTLE_HELD=$((SETTLE_HELD + 1)); SETTLE_HELD_NAMES="$SETTLE_HELD_NAMES$name "
-        continue
-      fi
+      # ⛔ ONLY "HELD" AND "UNPROVABLE" MEAN "NOT FINISHED" (review finding, PR #3918). Treating ANY
+      # non-zero as still-running made a lane whose tree cannot be deleted (a permission, a half-broken
+      # `$SEED_REPO`, `rm -rf` refused) un-settleable for ever: never reported, counted as live, its
+      # window held. rc 1 is the WARN path — the lane HAS ended, and it is reported as before.
+      case $? in
+        2|3) SETTLE_HELD=$((SETTLE_HELD + 1)); SETTLE_HELD_NAMES="$SETTLE_HELD_NAMES$name "
+             continue ;;
+      esac
     fi
     rc_file="$O/bg/$name.rc"
     rc="$(cat "$rc_file" 2>/dev/null || printf '')"

@@ -973,6 +973,12 @@ check "(i2) …and its SLICE WINDOW stays held (6 of 7 free, so a second lane ca
 check "(i2) …and the tick does not report a FAILED lane for a lane that is still running" \
   '! grep -q "FAIL: lane $I2_NAME" "$LAST_AI/logs/ai-drainer.log" && [ "$LAST_RC" -eq 0 ]' \
   "rc=$LAST_RC $(grep -E 'FAIL' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+check "(i2) …and the kept tree is probed ONCE per tick, so the log does not read as two refusals" \
+  '[ "$(grep -c "KEEP: not removing $I2_WT" "$LAST_AI/logs/ai-drainer.log")" -eq 1 ]' \
+  "keep-lines=$(grep -c "KEEP: not removing $I2_WT" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(i2) …and it is NOT counted as a REAPED leftover (nothing was reaped)" \
+  '! grep -q "REAPED:" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'REAPED' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
 # …and the reaper is NOT INERT: once the holder is gone the same record settles, exactly once, and the
 # checkout is reclaimed. A gate that keeps every tree for ever passes every assertion above.
 kill "$I2_HOLD" 2>/dev/null; wait "$I2_HOLD" 2>/dev/null; sleep 0.4
@@ -1010,7 +1016,54 @@ _i2_run i3c "$DRAINER" WTL="$ROOT/no-such-wt-lifecycle.sh"
 check "(i3) a stale/missing wt-lifecycle.sh does NOT disarm the gate — the /proc witness still sees the holder" \
   '[ -d "$I2_WT" ] && grep -q "cwd-inside-the-worktree" "$LAST_AI/logs/ai-drainer.log"' \
   "$(grep -E 'KEEP' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
-kill "$I2_HOLD" 2>/dev/null; wait "$I2_HOLD" 2>/dev/null
+# ⛔ …AND IT IS STILL FAIL-CLOSED, NOT "ONE WITNESS ANSWERED SO THE OTHER MAY BE DROPPED" (review finding,
+# PR #3918). With the module stale AND the holder gone, /proc answers "none" — and that must NOT be read
+# as proof of absence, because the ARGV witness is unevaluable and a `pytest <wt>/…` holder has a cwd
+# elsewhere. The old code let witness B's "none" overwrite witness A's "I could not tell" and deleted the
+# tree; the docs and the header both promised it would not.
+kill "$I2_HOLD" 2>/dev/null; wait "$I2_HOLD" 2>/dev/null; sleep 0.4
+_i2_run i3c "$DRAINER" WTL="$ROOT/no-such-wt-lifecycle.sh"
+check "(i3) ⛔ witness B's 'none' does NOT override witness A being unevaluable — the tree is KEPT" \
+  '[ -d "$I2_WT" ]' "a stale module silently dropped the argv witness and the tree was removed"
+check "(i3) …and the KEEP line names the stale module, with its remedy" \
+  'grep -q "live-holder probe could not be evaluated" "$LAST_AI/logs/ai-drainer.log" && grep -q "deploy-harness.sh" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'KEEP' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+_i2_run i3c "$DRAINER"          # unpinned: the module beside the script answers again
+check "(i3) …and with the module available again the SAME record is reclaimed" \
+  '[ ! -d "$I2_WT" ]' "tree still present"
+
+reset_run
+# ── ARM (i3b): THE ARGV WITNESS IS EXERCISED ON ITS OWN (witness A, no /proc) ─────────────────
+# Witness B's cwd match cannot see a holder whose cwd is ELSEWHERE and whose argv names the checkout
+# (`pytest <wt>/tests`, `rsync src <wt>`, a `bash -c "cd <wt> && …"` client). Only `wt_live_holders`' argv
+# witness can, and every other arm lets /proc answer first — so a mutation of the `wt_live_holders` leg
+# left the whole suite green (review finding, PR #3918). Here `/proc` is unavailable and the holder is
+# argv-only, so the ARGV witness is the only thing that can keep the tree.
+reset_run
+I3_O="$ROOT/o-i3b"; I3_AI="$ROOT/ai-i3b"
+mkdir -p "$I3_O/bg" "$I3_AI/state/lanes"
+I3_NAME="ai-drain-010234-999004-1"
+I3_WT="$I3_AI/wt-drainer-$I3_NAME"
+git -C "$SEED" worktree add -f "$I3_WT" "$SEED_REF" >/dev/null 2>&1
+# the holder: cwd is the SUITE's dir, not the tree; its argv names the tree
+( cd "$ROOT" && exec sh -c 'sleep 300' drainer-argv-holder "$I3_WT/brief.md" ) &
+I3_HOLD=$!
+echo "$I3_HOLD" >>"$ROOT/pids"
+sleep 0.3
+( exit 0 ) & p=$!; wait "$p" 2>/dev/null
+printf '%s' "$p" > "$I3_WT.lane-pid"
+printf '%s' "$p" > "$I3_AI/state/lanes/$I3_NAME.pid"
+printf '20' > "$I3_AI/state/lanes/$I3_NAME.slice"
+printf '0' > "$I3_O/bg/$I3_NAME.rc"
+I2_O="$I3_O"; I2_AI="$I3_AI"; I2_NAME="$I3_NAME"; I2_WT="$I3_WT"; I2_HOLD="$I3_HOLD"
+_i2_run i3b "$DRAINER" PROC_ROOT="$ROOT/no-such-proc"
+check "(i3b) ⛔ the ARGV witness alone keeps the tree (a holder whose cwd is elsewhere)" \
+  '[ -d "$I2_WT" ] && grep -q "argv-lists-the-worktree" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'KEEP' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+kill "$I2_HOLD" 2>/dev/null; wait "$I2_HOLD" 2>/dev/null; sleep 0.4
+_i2_run i3b "$DRAINER" PROC_ROOT="$ROOT/no-such-proc"
+check "(i3b) …and it is reclaimed once the argv-only holder is gone" \
+  '[ ! -d "$I2_WT" ]' "tree still present"
 
 reset_run
 # ── ARM (i4): THE SEED IS A TICK PRECONDITION, PROVEN BEFORE THE FIRST LANE (#2787) ────────────
@@ -1033,6 +1086,33 @@ run_drainer_fg i4b
 check "(i4) …and a seed that cannot reach SEED_REF refuses too, naming the ref and the remedy" \
   '[ "$LAST_RC" -ne 0 ] && grep -q "has no ref '\''origin/no-such-ref'\''" "$LAST_AI/logs/ai-drainer.log" && grep -q "git -C .* fetch origin" "$LAST_AI/logs/ai-drainer.log"' \
   "rc=$LAST_RC $(grep -E 'FAIL' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+
+reset_run
+# ── ARM (i5): "THE TREE COULD NOT BE DELETED" IS NOT "THE LANE IS STILL RUNNING" (#3918 review) ⛔
+# `_rm_wt` returns 1 on the WARN path (both removal routes refused). Treating ANY non-zero as "held"
+# made such a lane un-settleable for ever: never reported, counted as live, its window held. The lane
+# HAS ended — the tree is just not reclaimable yet — so it must settle exactly as before and keep the
+# WARN. Reproduced by making the checkout undeletable (mode 0555, so neither `git worktree remove` nor
+# `rm -rf` can empty it). Skipped only for root, which ignores the mode bit.
+if [ "$(id -u)" = "0" ]; then
+  echo "skip (i5) — running as root, an undeletable-by-mode checkout cannot be staged"
+else
+  reset_run
+  _i2_plant i5
+  kill "$I2_HOLD" 2>/dev/null; wait "$I2_HOLD" 2>/dev/null; sleep 0.3   # the lane is GONE; only the tree stands
+  chmod 0555 "$I2_WT" 2>/dev/null
+  _i2_run i5 "$DRAINER"
+  check "(i5) ⛔ a tree that cannot be deleted still SETTLES (the lane ended — the tree is just stuck)" \
+    '[ ! -f "$I2_AI/state/lanes/$I2_NAME.pid" ] && grep -q "DONE: lane $I2_NAME" "$LAST_AI/logs/ai-drainer.log"' \
+    "record=$([ -f "$I2_AI/state/lanes/$I2_NAME.pid" ] && echo present || echo settled) $(grep -E 'DONE|WARN: could not remove' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+  check "(i5) …the refusal is still NAMED (the WARN is kept, not swallowed)" \
+    'grep -q "WARN: could not remove the worktree" "$LAST_AI/logs/ai-drainer.log"' \
+    "$(grep -E 'WARN: could not remove' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+  check "(i5) …and it is NOT counted as a live lane (it never appears as held)" \
+    '! grep -q "held=1(pid-gone-checkout-held)" "$LAST_AI/logs/ai-drainer.log"' \
+    "$(grep -E 'SKIP:|START:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+  chmod 0755 "$I2_WT" 2>/dev/null; rm -rf "$I2_WT" 2>/dev/null
+fi
 
 # ── NON-VACUITY (HOLDER GATE): delete the gate and arm (i2) MUST fail ────────────────────────
 # The mutation is the DEFECT ITSELF — "a dead pidfile is a dead lane" — restored by deleting the gate
