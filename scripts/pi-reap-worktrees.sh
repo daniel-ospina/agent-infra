@@ -63,12 +63,22 @@
 #                    `refs=` proves the commits survive the checkout. So a clean,
 #                    holder-free, non-open-PR checkout has its floor CAPPED at
 #                    REAP_WT_DISPOSABLE_AGE_MINUTES when that is armed (0 = off, the
-#                    default; 720 = 12 h is the recommended arm). It only ever
-#                    LOWERS a floor, never raises one, and never touches a
-#                    merged/patch-equivalent head (whose 0-day floor is a separate,
-#                    deliberate decision). `0` disables it and restores the pre-rule
-#                    behaviour exactly. Every row prints `floor=<n>m(<rule>)` so the
-#                    policy that decided it is legible after the fact.
+#                    default; 720 = 12 h is the recommended arm). ⛔ ITS SCOPE IS NARROWER
+#                    THAN "A CLEAN CHECKOUT": it applies only where the AGED floor is the
+#                    one in force. A MERGED or PATCH-EQUIVALENT head keeps its own
+#                    (0-day) floor — a separate, deliberate decision this rule does not
+#                    revisit — and a LANE SCRATCH checkout (`wt-*` / `cell-wt-*`, #2354)
+#                    is EXEMPT ENTIRELY: it keeps REAP_WT_SCRATCH_AGE_DAYS (1 d),
+#                    because that cap already lowered its floor and this rule never
+#                    RE-decides a floor another rule set. It only ever LOWERS a floor —
+#                    and a floor already at 0 (`REAP_WT_AGED_DAYS=0`, a box that reaps
+#                    clean rows immediately) STAYS 0, so the rule is INERT there rather
+#                    than quietly raising a 12 h cooldown onto the most aggressive age
+#                    setting. `0` disables it and restores the pre-rule behaviour exactly.
+#                    Every row DECIDED BY THE AGE FLOOR prints `floor=<n>m(<rule>)` so the
+#                    policy that decided it is legible after the fact (a row that never
+#                    consulted a floor — an open PR, a dirty tree, a live holder — prints
+#                    none).
 #
 # LANE RESIDUE (agent-infra#2033) — THE CLASS THIS REAPER USED TO KEEP FOR EVER
 # ---------------------------------------------------------------------------
@@ -710,7 +720,11 @@
 #     checkout — the 7-day dial is an abandonment PROXY and the clean gate + census are the safety
 #     property. DEFAULT 0 = OFF, because rule 6's 7-day window is a recorded+tested decision; a box
 #     ARMS this deliberately (#1678 shape). 720 = 12 h is the recommended value and the one cell-3
-#     was measured with)
+#     was measured with. It only lowers an AGED floor: a merged/patch-equivalent head and a lane
+#     SCRATCH checkout keep their own, and `REAP_WT_AGED_DAYS=0` keeps NO floor rather than gaining
+#     one. Validated as 0..REAP_WT_MAX_DAYS*1440 minutes — an unbounded digit string overflows
+#     `minutes * 60`, and a NEGATIVE floor makes every `-gt 0` gate false, i.e. the floor silently
+#     disappears)
 #   REAP_WT_MAIN_REF REAP_WT_NOW_EPOCH
 #   REAP_WT_LIST_TIMEOUT REAP_WT_STATUS_TIMEOUT REAP_WT_PS_TIMEOUT
 #   REAP_WT_CWD_TIMEOUT REAP_WT_GH_TIMEOUT REAP_WT_REMOVE_TIMEOUT
@@ -4053,7 +4067,7 @@ holders_live() {
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
     local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf proof_txt=""
-    local head_ts tree_ts witness wname age_s young age_floor aged_note floor_s floor_src disp_s floor_note
+    local head_ts tree_ts witness wname age_s young age_floor aged_note floor_s floor_src disp_s floor_note floor_label
     local pr pr_state pr_num pr_oid pr_key pr_other subj prnum_note pr_floor no_pr_proof
     local issue="" claim="absent" init_age="" wt_ts="" wt_ok=0
     local unp stash_hit _ia_st=""
@@ -4487,17 +4501,29 @@ classify_one() {
         floor_src=scratch
     fi
     # ── RULE D, applied as a FLOOR in SECONDS so the day-dials and the minute-dial compare in one
-    # unit. `floor_s=0` still means "no floor", exactly as `age_floor=0` did.
+    # unit. `floor_s=0` still means "no floor", exactly as `age_floor=0` did — and a floor of 0
+    # CANNOT BE LOWERED, so an armed RULE D is INERT on a `REAP_WT_AGED_DAYS=0` box rather than
+    # RAISING a 12 h cooldown onto it. (The `-eq 0` disjunct that used to open this test did exactly
+    # that: on the box that chose the MOST aggressive age setting it silently produced the opposite
+    # policy for eleven hours of every day — the "reaper reclaims nothing" class this rule exists to
+    # end. #3888 review F2.)
+    # `floor_src` is the gate that keeps RULE D off a MERGED / PATCH-EQUIVALENT head and off a LANE
+    # SCRATCH checkout: both already set a floor of their own, and this rule never RE-decides one.
     floor_s=$((age_floor * 86400))
     disp_s=0
     if [ "$floor_src" = aged ] && [ "$REAP_WT_DISPOSABLE_AGE_MINUTES" -gt 0 ]; then
         disp_s=$((REAP_WT_DISPOSABLE_AGE_MINUTES * 60))
-        if [ "$floor_s" -eq 0 ] || [ "$disp_s" -lt "$floor_s" ]; then floor_s="$disp_s"; else disp_s=0; fi
+        if [ "$disp_s" -lt "$floor_s" ]; then floor_s="$disp_s"; else disp_s=0; fi
     fi
     # The row marker that makes the policy LEGIBLE after the fact: which floor decided this row, and
     # which rule set it. A removal that cites a floor the operator did not expect is the whole
     # complaint this change answers, so the number is on the row, not only in this comment.
     floor_note=" floor=$((floor_s / 60))m($( [ "$disp_s" -gt 0 ] && printf 'ruleD' || printf "$floor_src" ))"
+    # The removal row's `proof=` label follows the marker. A row the cooldown decided must not label
+    # itself `aged-floor(…)` while its own marker says `ruleD` — two names for one decision is how a
+    # reader stops trusting either.
+    floor_label=aged-floor
+    [ "$disp_s" -gt 0 ] && floor_label=disposable-floor
 
     # ── rule=P: an OPEN PR outranks every removal rule. Unchanged, and it is
     # still a VETO rather than a vote: an open PR means the branch is live work
@@ -4590,7 +4616,7 @@ classify_one() {
         # ctime witness a checkout can be 0 seconds old, and `age <= 0` would
         # then report the degenerate floor instead of rule 7.
         if [ "$floor_s" -gt 0 ] && [ "$age_s" -le "$floor_s" ]; then
-            printf 'preserve\ttoo-recent\t\trule=P age %sd ≤ %sd (merged floor) proof=%s\n' "$((age_s / 86400))" "$age_floor" "$proof_txt"
+            printf 'preserve\ttoo-recent\t\trule=P age %sd ≤ %sd (merged floor) proof=%s%s\n' "$((age_s / 86400))" "$age_floor" "$proof_txt" "$floor_note"
             return 0
         fi
         if [ "$young" = 1 ]; then
@@ -4601,8 +4627,8 @@ classify_one() {
         # #2541: the two abstention gates outrank the REMOVAL, never the rule row.
         # landing-proved=1 here: ancestry to MAIN_REF is proof for this exact head.
         abstain_gate "$path" "$branch" "$refs" 1 && return 0
-        printf 'remove\treclaimable\t%s\trule=3 refs=merged proof=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s\n' \
-            "$eph" "$proof_txt" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}"
+        printf 'remove\treclaimable\t%s\trule=3 refs=merged proof=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s%s\n' \
+            "$eph" "$proof_txt" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}" "$floor_note"
         return 0
     fi
 
@@ -4717,8 +4743,8 @@ classify_one() {
     # `prunable` reclaim path, i.e. F7) and is pinned from BOTH sides by A26c/A26c2. (#3058 review)
     local rm_reason="reclaimable"
     case "$refs" in remote-holds:*) rm_reason="$refs" ;; esac
-    printf 'remove\t%s\t%s\trule=P proof=aged-floor(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s%s\n' \
-        "$rm_reason" "$eph" "$aged_note" "$refs" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}" "${floor_note:-}"
+    printf 'remove\t%s\t%s\trule=P proof=%s(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=%s,no-open-pr%s%s\n' \
+        "$rm_reason" "$eph" "$floor_label" "$aged_note" "$refs" "$((age_s / 60))" "${stale_txt:-no-proc}" "${UNPUSHED_NOTE:-}" "${floor_note:-}"
     return 0
 }
 
@@ -5387,6 +5413,19 @@ run() {
     # but an empty value compares as 0 and would read as "the operator disabled it").
     is_pos_int "$REAP_WT_DISPOSABLE_AGE_MINUTES" \
         || { echo "bad REAP_WT_DISPOSABLE_AGE_MINUTES: $REAP_WT_DISPOSABLE_AGE_MINUTES (want minutes, a non-negative integer; 0 disables the disposable-clean floor)" >&2; exit 2; }
+    # ⛔ AND IT IS BOUNDED ABOVE, not merely digit-checked. The floor is computed as
+    # `minutes * 60` in shell ARITHMETIC, so a digit string big enough to overflow makes `disp_s`
+    # NEGATIVE — `disp_s < floor_s` is then true, `floor_s` becomes negative, and every
+    # `[ "$floor_s" -gt 0 ]` gate is false. The floor silently DISAPPEARS and the pass reaps clean
+    # non-merged checkouts at any age, while the row prints `floor=0m(…)` as if that were ordinary.
+    # That is the `seam_too_large` fail-open recorded at scripts/disk-reaper.sh:697-704 ("a digit
+    # string above intmax_t passes the case below and then makes the comparison itself error, which
+    # is the SAME fail-open one size class up"), one seam over. The ceiling is the SAME bound the day
+    # dials carry, expressed in this dial's unit (REAP_WT_MAX_DAYS days = REAP_WT_MAX_DAYS*1440
+    # minutes) — a REAP_WT_MAX_DAYS large enough for the DAY arithmetic itself to overflow is already
+    # outside what the day dials survive, and is what A14h/A14j refuse.
+    awk -v d="$REAP_WT_DISPOSABLE_AGE_MINUTES" -v x="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(d >= 0 && d <= x * 1440)}' \
+        || { echo "bad REAP_WT_DISPOSABLE_AGE_MINUTES: $REAP_WT_DISPOSABLE_AGE_MINUTES (want 0..REAP_WT_MAX_DAYS*1440 minutes)" >&2; exit 2; }
     # An unrecognised proof mode must not silently become "local" OR "auto": one skips the remote
     # read, the other opens a network call, and neither is what the operator asked for.
     case "$REAP_WT_MAIN_PROOF" in
