@@ -280,6 +280,17 @@ _TRAP_SIGS_AWK='
       nxt = (j <= NF) ? $j : ""
       boundary = (lastsep || nxt == "" || nxt ~ /^([0-9]*[<>]|[;&|)])/) ? 1 : 0
       if (boundary) { out = run; break }
+      # ⛔ A RUN THAT STARTED ON A SIGNAL AND THEN BROKE ON AN UNREADABLE TOKEN IS UNKNOWN, NOT
+      # "ADVANCE AND READ THE NEXT ONE" (fresh review of #3865 at bb46c6a13, P2 — false PASS, MEASURED).
+      # Skipping forward made the parse return a LATER run that happened to end at a boundary, so
+      # `EXIT CHLD INT` parsed to `INT`, `EXIT 1 INT` to `INT` and `EXIT CHLD TERM` to `TERM` — a valid
+      # looking list with the EXIT silently DELETED. `ok` is a PARTIAL signal set (no CHLD/ALRM/USR1/PIPE/
+      # …, no numerics), so the token that ends the run can be a REAL signal: bash installs all three of
+      # those registrations (MEASURED `trap 'true' EXIT CHLD INT` / `… EXIT 1 INT` accepted), REPLACING the
+      # releaser — and the suite stayed at `PASS=174 FAIL=0` with the lock on disk. UNKNOWN is what every
+      # consumer in this file already reads as RED, so an unreadable list can no longer read as
+      # "not this family".
+      if (run != "") { out = "UNKNOWN"; break }
       i = (j <= NF) ? j + 1 : j
     }
     if (out == "") out = "UNKNOWN"
@@ -427,7 +438,7 @@ ck "every trap registration's SIGNAL LIST is readable (an unparseable one is UNK
 _BAD_TERM="$(printf '%s\n' "$ALL_TRAPS" | awk -F' :: ' '
   { if ($1 == "UNKNOWN") { print; next }
     n = split($1, a, " ")
-    for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /exit/) print; next } }')"
+    for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /(^|[^[:alnum:]_])exit([^[:alnum:]_]|$)/) print; next } }')"
 [ -z "$_BAD_TERM" ]
 ck "every INT/TERM trap handler TERMINATES (a RETURNING handler releases the lock while the loop lives — and one reached through a function is invisible to the LOCKF filter)" $?
 # ── 9d) THE PIN ITSELF, DRIVEN OVER THE SPELLINGS THAT DEFEATED IT ────────────────────────────────
@@ -589,7 +600,7 @@ _term_bad() { # <text> -> non-empty when a registration with INT/TERM does not t
   printf '%s\n' "$(trap_regs "$1")" | awk -F' :: ' '
     { if ($1 == "UNKNOWN") { print; next }
       n = split($1, a, " ")
-      for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /exit/) print; next } }'
+      for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /(^|[^[:alnum:]_])exit([^[:alnum:]_]|$)/) print; next } }'
 }
 _TERMROW_OK="$_REL
 trap 'exit 143' TERM
@@ -605,6 +616,27 @@ ck "9d: a RETURNING INT handler that releases the lock through a FUNCTION is CAU
 [ -n "$(_term_bad "$_REL
 trap 'release_lock' INT 2>/dev/null")" ]
 ck "9d: a RETURNING INT handler with a TRAILING REDIRECTION is CAUGHT (the parse ended at the suffix, so this arm stayed green on a lock-deleting handler)" $?
+# ⛔ AND `exit` IS A WORD, NOT A SUBSTRING (fresh review of #3865 at bb46c6a13, P3 — false PASS,
+# MEASURED: the test was `$2 !~ /exit/`, so a RETURNING handler reached through a function NAMED for the
+# thing it undoes — `on_exit_cleanup() { rm -f "$LOCKF"; }; trap 'on_exit_cleanup' INT` — contains `exit`
+# inside the NAME, satisfied the test, and left the suite at `PASS=174 FAIL=0` while the handler returned,
+# deleted the lock and left the loop alive: #1715 in a spelling the pin could not see. `trap 'echo
+# exiting' INT` passed for the same reason. The test is the `exit` COMMAND WORD now.)
+[ -n "$(_term_bad "$_REL
+on_exit_cleanup() { rm -f \"\$LOCKF\"; }
+trap 'on_exit_cleanup' INT
+trap 'exit 143' TERM")" ]
+ck "9d: a RETURNING INT handler whose FUNCTION NAME contains 'exit' is CAUGHT (the test was a substring match, so the natural name for the handler satisfied it)" $?
+[ -n "$(_term_bad "$_REL
+trap 'echo exiting' INT
+trap 'exit 143' TERM")" ]
+ck "9d: …and so is a handler that merely SAYS 'exiting' (the word test is not satisfied by prose either)" $?
+# ⏳ STATED LIMIT, not coverage: the test is "the handler mentions the `exit` command", which is neither
+# necessary nor sufficient for TERMINATION. A handler that stops the shell another way — `trap 'kill -TERM
+# $$' TERM` — REDS (a FALSE RED, MEASURED, and pre-existing rather than introduced here), and one that
+# runs `exit` behind a conditional (`[ -n "$X" ] && exit`) passes whether or not it fires. Asserting the
+# installed handler's real behaviour would mean spawning a shell and signalling it, which no arm here does;
+# the property this pin can honestly claim is "no INT/TERM handler is a bare RETURNING cleanup".
 # ⛔ AND AN UNRECOVERABLE SIGNAL LIST IS `UNKNOWN`, WHICH EVERY CONSUMER READS AS RED (fresh review of
 # #3865 at 000d86dcd, P2). An empty list used to mean "not this family" to both consumers; it now means
 # "unreadable", and unreadable is a RED in the ONLY-EXIT arm, the UNKNOWN arm and this one.
@@ -616,6 +648,17 @@ _unkrow "trap 'true' SIGEXIT" \
   "an UNPARSEABLE signal list reads UNKNOWN (never silently 'not this family')"
 _unkrow "trap 'true' 2>/dev/null" \
   "a registration naming NO signal at all reads UNKNOWN"
+# ⛔ AND A RUN THAT BREAKS ON AN UNRECOGNISED SIGNAL IS UNKNOWN TOO, NOT TRUNCATED (fresh review of #3865
+# at bb46c6a13, P2 — false PASS, MEASURED: `ok` is a PARTIAL signal set, so the token that ended the run
+# could be a REAL signal — bash INSTALLS `trap 'true' EXIT CHLD INT` and `… EXIT 1 INT`, both REPLACING
+# the releaser — and the parse skipped past it to return a LATER run: `EXIT CHLD INT` became `INT`,
+# `EXIT CHLD TERM` became `TERM`, i.e. a valid-looking list with the EXIT DELETED, leaving the suite at
+# `PASS=174 FAIL=0` with the lock on disk. Both spellings are UNKNOWN now, which every consumer reads as
+# RED.)
+_unkrow "trap 'true' EXIT CHLD INT" \
+  "a run broken by an unrecognised SIGNAL NAME reads UNKNOWN (it used to truncate to INT, losing the EXIT)"
+_unkrow "trap 'true' EXIT 1 INT" \
+  "…and the same for a NUMERIC signal the table does not carry (it used to truncate to INT)"
 # ⛔ AND THE ACCOUNTING PREDICATE IS DRIVEN OVER ITS OWN POSITIONS (fresh review of #3865 at a2da4598b, P2
 # — the command-position class omitted `)` and NOTHING drove it, so the hole was invisible to the suite as
 # well as to the scan: `case "$X" in *) trap 'true' EXIT ;; esac` left BOTH counts at 1 (the releaser)
