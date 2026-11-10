@@ -2891,7 +2891,7 @@ is_lane_branch() { # <branch-ref> -> 0 when the harness itself created this bran
 # the row could not show the one thing it exists to state (that it is PAST the floor). Review rounds
 # 3 and 4 (#3881) each found an emitter still truncating; one helper is what stops a fourth site
 # being written by hand.
-age_h_ceil() { printf '%s\n' 99; }
+age_h_ceil() { local d=$(( $1 - $2 )); [ "$d" -gt 0 ] || d=0; printf '%s\n' "$(( (d + 3599) / 3600 ))"; }
 
 stalled_tok() {
     # ⛔ AN EMPTY ISSUE PRINTS `?`, NEVER A BARE `#` (review, PR #3881): `issue=#` is a field an

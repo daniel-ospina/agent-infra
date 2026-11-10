@@ -1232,9 +1232,14 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferr
 pass did NOT release and no later pass will release on its own. It is an exact SUBSET of
 `preserved=` — a selected removal that failed is counted under `remove=` and reported by
 `failed=`/exit 4 instead, so `preserved - stalled` can never underflow. A non-zero tally is followed
-by the list itself, each row naming the ISSUE its branch holds out of dispatch with its age, its
-class floor it is past (`<n>h` — always an hour count: a record that cannot be dated is never listed)
-and the reason.
+by the list itself, each row naming the ISSUE its branch holds out of dispatch with its age (whole
+hours, rounded UP, so a listed row always reads PAST its floor), the class floor it is past (`<n>h` —
+always an hour count: a record that cannot be dated is never listed) and the reason.
+
+⛔ `disk-reaper.sh` does NOT aggregate `stalled=` (its lifts are named fields at `:1894-1980`; there is
+no `stalled` there). The delegate's LIST still reaches the operator — the wrapper logs the whole
+delegate output — but a fleet-level pass record carries no stalled count, so read this field from the
+per-repo log, not from the aggregate summary.
 
 ⛔ **`verdict=` is the pass's own ANSWER, and the counters alone cannot supply it (#3041).** A pass
 can be perfectly self-consistent (`examined=52 classified=52 remove=0 preserved=52`) while reclaiming
