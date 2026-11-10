@@ -876,3 +876,84 @@ def test_the_scan_summary_still_shows_unscored_when_the_read_failed(monkeypatch)
     last = [ln for ln in text.splitlines() if ln.startswith("ASK ")][-1]
     assert last.startswith("ASK pending=? "), last
     assert "unscored=1" in last and "scan_failed=" in last, last
+
+
+def test_the_scan_NAMES_each_unscored_question_not_just_its_count(monkeypatch):
+    """⛔ THE COUNT IS NOT THE LIST (#2642 review). The summary's `unscored=N` says HOW MANY, and
+    the docs — plus this PR's own body — claimed the questions were "named above it". They were not:
+    `main()` returns 2 from five sites and only `jev()` prints a sentence, so on the no-key path every
+    question emitted the SAME two lines and NOTHING carried `repo#number`. Assembling that list by hand
+    is exactly what #2642's body had to do, nine times.
+
+    MEASURED pre-fix with the same stubs below: the scan's output contained no `daniel-ospina/
+    agent-infra#1903` anywhere above the summary line. The assertion names the identity, so a mutant
+    that keeps the count and drops the per-question line fails here.
+    """
+    monkeypatch.setattr(ao, "REPOS", ["daniel-ospina/agent-infra"])
+    monkeypatch.setattr(ao, "sh_status",
+                        lambda args, timeout=None: (0, "1903\t1", ""))
+    monkeypatch.setattr(ao, "answer_events", lambda repo: set())
+    monkeypatch.setattr(ao, "owner_answered_at", lambda repo, n: "")
+    monkeypatch.setattr(ao, "newest_decl_at", lambda repo, n: None)
+    monkeypatch.setattr(ao, "main", lambda argv: 2)          # the unkeyed gate's verdict
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.scan(dry=True)
+    text = out.getvalue()
+    assert rc == 2, text
+    named = [ln for ln in text.splitlines()
+             if ln.startswith("UNSCORED ") and "daniel-ospina/agent-infra#1903" in ln]
+    assert named, "the scan counted an unscored question but named none:\n" + text
+    # …and the naming line is ABOVE the machine-readable summary, which is what the docs promise.
+    lines = text.splitlines()
+    last_ask = max(i for i, ln in enumerate(lines) if ln.startswith("ASK "))
+    assert lines.index(named[0]) < last_ask, text
+    assert "unscored=1" in lines[last_ask], lines[last_ask]
+
+
+def test_a_rejected_key_is_a_SCORING_failure_and_says_UNSCORED(monkeypatch):
+    """⛔ `UNSCORED` USED TO EXIST ON ONE ARM ONLY (#2642 review). A box whose key is present and WRONG
+    is the state the doc itself calls out (`jev http 401`), and there the summary's `unscored` count
+    incremented while not one `UNSCORED` sentence appeared — so the heartbeat's alert, which reads the
+    count, asserted "no key on this box" over a key that was already in `keys.env`.
+
+    Pre-fix: this same call printed `jev http 401: …` and NO `UNSCORED` line, so the count and the
+    vocabulary disagreed about the same event.
+    """
+    monkeypatch.setenv("TYPESAFE_API_KEY", "a-key-that-was-rotated")
+    monkeypatch.setattr(ao, "fetch_question", lambda repo, n: V9)
+
+    def fake_urlopen(req, timeout=None):
+        raise ao.urllib.error.HTTPError(
+            ao.JEV_URL, 401, "Unauthorized", {},
+            io.BytesIO(b'{"error":"invalid api key"}'))
+
+    monkeypatch.setattr(ao.urllib.request, "urlopen", fake_urlopen)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["daniel-ospina/agent-infra", "1903", "--dry-run"])
+    text = out.getvalue()
+    assert rc == 2, text
+    assert "jev http 401" in text, text          # the CAUSE, named
+    assert "UNSCORED" in text, text              # the CONSEQUENCE, same event
+    assert "no TypeSafe key" not in text, (
+        "a rejected key was reported as a MISSING key — the misdirection the alert inherited: " + text)
+
+
+def test_a_failed_call_is_a_SCORING_failure_and_says_UNSCORED(monkeypatch):
+    """The third `jev()` arm: the call never got an answer. Same class as the 401 — a scoring failure
+    the summary counts, so it must carry the sentence the vocabulary is greppable by."""
+    monkeypatch.setenv("TYPESAFE_API_KEY", "a-key")
+    monkeypatch.setattr(ao, "fetch_question", lambda repo, n: V9)
+
+    def fake_urlopen(req, timeout=None):
+        raise ao.urllib.error.URLError("timed out")
+
+    monkeypatch.setattr(ao.urllib.request, "urlopen", fake_urlopen)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ao.main(["daniel-ospina/agent-infra", "1903", "--dry-run"])
+    text = out.getvalue()
+    assert rc == 2, text
+    assert "jev call failed" in text, text
+    assert "UNSCORED" in text, text
