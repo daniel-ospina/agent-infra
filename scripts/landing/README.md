@@ -3,7 +3,8 @@
 Three small tools for a **merge-duty lane** — a session whose job is to drive existing PRs
 through the sanctioned landing rail (`scripts/atomic-land.sh`) and report what actually happened.
 Two (`landability.py`, `bulk.py`) only read. One (`rail-bg.sh`) **drives the rail**, which updates
-the branch, posts to the PR and merges: its `start` subcommand is not read-only.
+the branch, posts to the PR and merges: its `start` subcommand is not read-only — it delegates to
+`scripts/rail-run.sh`, the fleet's one background-rail instrument (agent-infra#2905).
 
 They are **advisory**. Nothing here is wired into a gate: they answer questions, and their answers
 are inputs to a decision. The rail, the review record and the merge gate stay where they are.
@@ -14,7 +15,7 @@ for once already, in `/tmp`, and are about to be paid for again by the next lane
 | Instrument | Answers | Where it runs |
 |---|---|---|
 | `landability.py` | Does this PR's **recorded review still bind its head**, and are its checks clear? | one PR, ~3 GitHub API calls |
-| `rail-bg.sh` | Run the rail in the background, then read its **real** result from the API | one or many PRs |
+| `rail-bg.sh` | Run the rail in the background, then report `scripts/rail-run.sh`'s verdict for it | one or many PRs |
 | `bulk.py` | The same landability answer for **many PRs at once** (planning) | a list of PRs |
 
 ---
@@ -149,13 +150,23 @@ directory was exactly `preflight.py`; that is the name this section exists to pr
 
 ### What it answers
 
-Nothing by itself — it drives the rail and then **reads back what happened**, because the rail's own
-output cannot be trusted for that (see *Operational facts* below).
+**Nothing of its own — it delegates.** It drives the rail and then reports what `scripts/rail-run.sh`
+says happened. That separation is deliberate: rail-run is the fleet's ONE background-rail verdict
+function (eight states, distinct exit codes, liveness from `scripts/lib/pid-identity.sh`), and this
+file is the landing-lane CLI over it. It does not read liveness, does not call the API itself, and
+derives no verdict — `rail-bg.test.sh` fails if any of that comes back.
+
+Why it had to change (agent-infra#2905): this script used to be a *second* instrument, with its own
+pid file, its own `kill -0` liveness, its own `gh api … .merged` read and its own `REFUSED`/`LANDED`
+recommendations. Two verdict rules for one question is the shape AGENTS.md's recorded rule forbids
+(*"One verdict function, never a second."*). The capability #1549 introduced is preserved: this CLI
+still drives **`atomic-land.sh`** — the full landing unit (base update, CI wait, record
+carry-forward, then admin-merge) — through rail-run's `RAIL_RUN_RAIL` seam.
 
 ### Why one script with subcommands, not three
 
 The three operations are one lifecycle and share one set of variables: the checkout the rail runs in,
-the log/pid directory, and the repo for the merged-state read. The originals were three separate
+the log directory, and the repo identity. The originals were three separate
 files (`launch.sh`, `wait.sh`, `poll.sh`) that each **hardcoded all three** (`/private/tmp/land-lane-4`,
 `/tmp/land4`, `daniel-ospina/tortoise`) — that hardcoding is exactly what made them unusable from any
 other lane. Merging them puts the resolution in one place, makes `--help` one document, and makes the
@@ -164,22 +175,19 @@ instrument a single file to farm into a lane.
 ### Exact invocation
 
 ```bash
-scripts/landing/rail-bg.sh start <pr> [rail args...]   # nohup the rail; writes rail-<pr>.{log,pid}
-scripts/landing/rail-bg.sh wait  <pr> [max_s]          # wait, then print the log tail + merged=
-scripts/landing/rail-bg.sh poll  [--max s] <pr> [pr...]  # wait for several, then report each
+scripts/landing/rail-bg.sh start <pr> [rail args...]   # rail-run start; prints the run id + log
+scripts/landing/rail-bg.sh wait  <pr> [max_s]          # poll rail-run until it leaves `running`
+scripts/landing/rail-bg.sh poll  [--max s] <pr> [pr...]  # the same over several PRs
 ```
 
 ```bash
 # real run: a tortoise PR with no review record — the rail stops, and the report says so
-LAND_DIR=<agent-infra-checkout> \
-LAND_LOG_DIR=/tmp/pi-railbg-test LAND_REPO=daniel-ospina/tortoise \
+LAND_DIR=<agent-infra-checkout> LAND_REPO=daniel-ospina/tortoise \
   scripts/landing/rail-bg.sh start 6872
-LAND_DIR=... LAND_LOG_DIR=/tmp/pi-railbg-test LAND_REPO=daniel-ospina/tortoise \
-  scripts/landing/rail-bg.sh wait 6872 90
-# ── rail finished after 15s ──
-# ⛔ atomic-land: STOP — no review record for daniel-ospina/tortoise#6872 — there is no verdict to
-#    carry and this rail cannot review; run the review, then record
-# NOTE: the rail process ending (and its exit code) is NOT proof of a landing — the API read below is.
+LAND_DIR=... LAND_REPO=daniel-ospina/tortoise scripts/landing/rail-bg.sh wait 6872 90
+# ── rail-run state after 15s ──
+# refused pr=6872 run=<id> repo=daniel-ospina/tortoise pid=none rail_pid=none rc=1 pr_state=OPEN …
+#   the rail refused this head: admin-merge: ✗ … no review record …
 # CONFIRMED merged=false
 # RECOMMEND: 6872 REFUSED
 ```
@@ -187,33 +195,42 @@ LAND_DIR=... LAND_LOG_DIR=/tmp/pi-railbg-test LAND_REPO=daniel-ospina/tortoise \
 | Env | Default | What |
 |---|---|---|
 | `LAND_DIR` | git top level of this script's directory | the checkout the rail runs in; the rail is `$LAND_DIR/scripts/atomic-land.sh` — an **agent-infra** checkout, never the PR's repo (`tortoise` has no `scripts/atomic-land.sh`) |
-| `LAND_LOG_DIR` | `$TMPDIR/pi-landing-lane` | where `rail-<pr>.log` and `rail-<pr>.pid` live |
-| `LAND_REPO` | `gh repo view` **in `LAND_DIR`** | repo for the merged-state read |
+| `LAND_RAIL` | `$LAND_DIR/scripts/atomic-land.sh` | the rail executable, handed to rail-run as `RAIL_RUN_RAIL` |
+| `LAND_REPO` | `gh repo view` **in `LAND_DIR`** | the `[HOST/]owner/name` identity passed to rail-run as `--repo` — it also keys rail-run's run state, so `start` and `wait` name the same run. A failed resolve is an environment error, never a guess |
+| `LAND_LOG_DIR` | `$TMPDIR/pi-landing-lane` | where this CLI remembers **which** run it started (`rail-<pr>.run`), so `wait` polls its own run and never a newer one. Rail state and logs live in rail-run's `RAIL_RUN_DIR`, not here |
 | `LAND_POLL_MAX` | `1500` | default `max_s` for `wait`/`poll`; must be numeric, and a non-numeric value is refused (a bound that can never fire is not a bound) |
+| `RAIL_RUN_SH` | `scripts/rail-run.sh` in this repo | the delegate — a test seam, not a knob to point at a second instrument |
 
 Extra `start` args pass straight through to `atomic-land.sh` (`--dry-run`, `--no-wait`, or
 `-- --squash` for `admin-merge.sh`), which is how the tool was tested without mutating anything.
 
 ### The contract that matters
 
-`wait` and `poll` print **`CONFIRMED merged=true|false`** read from
-`gh api repos/<o>/<r>/pulls/<n> --jq .merged`. A failed API read prints
-**`CONFIRMED merged=UNREADABLE reason=…`** — never an empty field, because an empty field is read
-as whatever the parser wants, and `false` would be a claim the tool cannot make. `RECOMMEND: …
-LANDED` is printed only on a read that returned `true`, and `RECOMMEND: … REFUSED` only on a `false`
-read taken after the rail was observed to EXIT. A `false` read taken at a timeout — the rail is still
-running — prints `RECOMMEND: … PENDING` instead: the rail has no outcome yet, and a still-running
-rail frequently does land. Likewise `wait` on a PR whose pid/log files are left over from an earlier
-run says `no rail is running for <pr>` and labels the tail as an EARLIER run, rather than claiming
-it watched a finish.
+`wait` and `poll` print **rail-run's own state row verbatim** (its evidence: rc, pids, log size, the
+PR's state and merge timestamp) followed by two transcribed lines:
 
-Exit `0` means the wait/start completed. It is **not** a landing verdict. Read the printed value.
+- **`CONFIRMED merged=true|false|UNREADABLE`** — read from that row's `merged=`/`pr_state=` fields,
+  which are rail-run's recorded API read. `true` only for an observed merge, `false` only when the
+  read returned a PR state, and **`UNREADABLE reason=…`** otherwise: never an empty field, because an
+  empty field is read as whatever the parser wants, and `false` would be a claim the tool cannot make.
+- **`RECOMMEND: <pr> LANDED|PENDING|REFUSED|KILLED|NO-VERDICT|EXITED-ZERO-NOT-LANDED|NO-RUN|UNKNOWN`**
+  — a RENAME of rail-run's exit code, nothing more. A code outside rail-run's table, or a code and a
+  row that disagree, prints **`UNKNOWN (rc=… state=… )`** — it is never resolved in favour of
+  `LANDED`/`REFUSED`. A `running` run at the caller's bound prints **`PENDING`**: a still-running rail
+  has no outcome yet and frequently does land (#2412 is the shape where a lane was told "refused" and
+  the PR merged four minutes later).
 
-**One rail per PR.** `start` refuses when a rail for that PR is still alive. Without that refusal a
-second `start` truncates the first run's log and replaces its pid file, so `pid_alive` sees only the
-new pid, `wait` reports the PR finished, and the API read reports a rail that is still running —
-while the README's own advice (fact 3 below) is to re-run the rail after a base-side fix. `wait` for
-the first rail, or stop it and remove the pid file, before starting another.
+The exit code is **rail-run's, unmodified**: `0` landed · `10` running · `20` refused · `21` killed ·
+`22` gone-without-verdict · `23` exited-zero · `24` no-run · `25` unknown · `2` usage/environment ·
+`3` a live run already holds the PR. `0` on `start` means launched, not landed.
+
+**One rail per PR.** rail-run refuses a second live run for the same PR (exit 3) and its claim has a
+stale bound, so the README's own advice (fact 3 below) — re-run the rail after a base-side fix — is
+safe: wait for the first run, or let its claim age out. This CLI adds no second guard of its own.
+
+### The contract that matters
+
+(see above — rail-run's state row plus the transcribed `CONFIRMED`/`RECOMMEND` lines.)
 
 ---
 
@@ -256,8 +273,9 @@ claims still go through the queue tool.
 ### 1. A rail exit code is not proof that a landing happened
 
 `atomic-land.sh` once printed "merged" while the PR was still open (#1359), and a merge can complete
-server-side while the command exits non-zero (#193). That is why `rail-bg.sh` reads
-`gh api repos/<o>/<r>/pulls/<n> --jq .merged` and prints it, and why `wait` says so out loud. Count a
+server-side while the command exits non-zero (#193). That is why the verdict is not the exit code:
+`rail-run.sh` derives the state from the recorded status, both incarnations, the log and the PR's own
+`merged` field, and `rail-bg.sh` reports that read as `CONFIRMED merged=…`. Count a
 landing only on `merged=true` from the API.
 
 ### 2. A base-state refusal is usually about the **base**, not the PR
@@ -327,5 +345,6 @@ See `landability.py`'s section above. The name is taken by the mandated dispatch
   worked?").
 - `landability.py` / `bulk.py` need a checkout that carries `scripts/lib/diff-normalize.py`. A lane
   that only has the rail installed is a **partial install** and the tool says exactly that.
-- `rail-bg.sh`'s liveness test is `kill -0` on a pid file, so a pid recycled by an unrelated process
-  looks like a live rail — bounded by `max_s`, which is why every wait takes one.
+- `rail-bg.sh` derives no verdict of its own: liveness, the PR read and the state word all come from
+  `scripts/rail-run.sh` (agent-infra#2905). Its only local state is the run id it started, so a `wait`
+  polls that run rather than a newer one. `rail-bg.test.sh` fails if a second verdict rule returns.
