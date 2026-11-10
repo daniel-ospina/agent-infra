@@ -339,9 +339,12 @@ r="$(u "cd '$RELCWD' && . '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACC
 ck "A13 a non-absolute value is treated as ABSENT rather than used as a relative path — even when it RESOLVES from the cwd ('$r')" $rc
 rm -f "$ENVF"
 
-# ⛔ THE OTHER TWO DOCUMENTED SHAPES (review round 20, P3): `gh_auth.sh`'s parser doc lists single-quoting
-# and `readonly`/`typeset`, and neither had an arm that could fail — deleting the single-quote arm left
-# 122/0, and dropping `readonly` from the keyword alternation left 122/0. Both are one fixture each.
+# ⛔ THE OTHER DOCUMENTED SHAPES (review rounds 20-21, P3): `_gh_auth_file_value`'s doc lists `NAME=`,
+# `export NAME=`, `declare -x NAME=`, `readonly NAME=` and one layer of quotes, and NONE of the non-`export`
+# forms had an arm that could fail — deleting the single-quote arm left 122/0, dropping `readonly` from the
+# keyword alternation left 122/0, and `typeset` (in the same alternation, so a live branch) left 124/0
+# one round later. One fixture per shape, and the comment now names exactly what is pinned rather than
+# implying the family is covered.
 printf "export GH_CONFIG_DIR='%s'\n" "$TMP/cfg-a" > "$ENVF"
 r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "keys|$TMP/cfg-a" ]; rc=$?
@@ -350,6 +353,10 @@ printf 'readonly GH_CONFIG_DIR=%s\n' "$TMP/cfg-a" > "$ENVF"
 r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "keys|$TMP/cfg-a" ]; rc=$?
 ck "A11c …and the \`readonly\` keyword is honoured, not only \`declare -x\`/\`export\` ('$r')" $rc
+printf 'typeset GH_CONFIG_DIR=%s\n' "$TMP/cfg-a" > "$ENVF"
+r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ "$r" = "keys|$TMP/cfg-a" ]; rc=$?
+ck "A11d …and \`typeset\`, the third keyword in that alternation ('$r')" $rc
 rm -f "$ENVF"
 
 # The cause text is what the refusal prints, so it must speak only on a POSITIVE absence.

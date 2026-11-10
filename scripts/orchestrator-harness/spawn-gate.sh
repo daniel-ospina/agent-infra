@@ -4351,9 +4351,18 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # to the operational home while gh's `hosts.yml` lives in the ACCOUNT home — so without this the lane's
   # `gh` is simply unauthenticated, the ratio reads UNREADABLE, and (measured 2026-11-09, two cells) the
   # refusal blamed the PR queue.
-  # SCOPE, STATED — THESE THREE ARE THIS `run_agent`'S ONLY CALLERS: `lane.sh`, `fix-one.sh` and
-  # `nonblocking-dispatch.sh` (re-derive with `grep -rn 'run_agent "' scripts/`; the line numbers a prior
-  # draft carried here were rotted by the rebase — review round 19, P2), and the export is INHERITED by the `pi` this
+  # SCOPE, STATED — THESE THREE ARE THIS `run_agent`'S ONLY **PRODUCTION** CALLERS: `lane.sh`, `fix-one.sh`
+  # and `nonblocking-dispatch.sh`. ⛔ IT IS NOT THE ONLY SPELLING IN THE TREE, AND SAYING SO WOULD BE THE
+  # SAME OVERREACH THE SENTENCE BELOW FIXES: the shipped suites source this file and drive the SAME
+  # function (`spawn-gate.test.sh`, `brief-gate.test.sh` via `drive_run_agent`, `wip-rescue-exit.test.sh`,
+  # `lane-bound.test.sh`), and `merge-one.sh` has its own (disclosed below). The claim above is about the
+  # DISPATCH paths a lane is spawned from, and NOT about the string: a census that greps for it must
+  # anchor on the INVOCATION shape, because a bare `run_agent "` also matches those suites, one COMMENT
+  # and two `grep` search strings inside other suites, and this paragraph's own quotation of it — an
+  # instrument that over-matches in three directions cannot confirm an exclusivity claim (round 21, P3;
+  # no grep is promised here for that reason, and the line numbers a prior draft carried were rotted by
+  # the rebase — round 19).
+  # The export is INHERITED by the `pi` this
   # function starts — so, for those three dispatches, the store the gate read and the store the lane
   # reads are the same one by construction.
   # ⛔ `wt_spawn`'S LAUNCH LINE IS A DIFFERENT MECHANISM, AND THE INHERITANCE RUNS THE OTHER WAY (review
