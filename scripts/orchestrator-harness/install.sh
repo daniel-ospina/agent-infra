@@ -1726,9 +1726,10 @@ for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh har
 # gh-auth.sh (#2509) is the same class as `key-gate.sh`/`lane-env.sh` one gate earlier: `spawn-gate.sh`
 # SOURCES it and `run_agent` uses it to resolve the lane's gh credential before the land-backlog gate
 # reads GitHub with it. A $O without it does not crash — `run_agent` reports `[gh-auth] UNAVAILABLE` and
-# carries on — so nothing reports it BEFORE the first lane runs unless this list and
-# `check-single-source.sh` name it, and the lane's gh silently goes back to being unauthenticated under a
-# redirected HOME (the runtime `[gh-auth] UNAVAILABLE` line lands in that lane's own log, one lane late).
+# carries on — so the absence is reported BEFORE the first lane runs only by a PRESENCE check (this list,
+# `check-single-source.sh` and `cloud-cell-supervisor.sh check`), and the lane's gh silently goes back to
+# being unauthenticated under a redirected HOME (the runtime `[gh-auth] UNAVAILABLE` line lands in that
+# lane's own log, one lane late).
   # ⛔ A FILE THE PIN DOES NOT CARRY YET CANNOT BE "DRIFTED" FROM IT (#3243 review cycle-2, F2): on a box
   # installing ON the commit that introduces `orch-pin-exec.sh`, every run warned that the stub it had
   # just seeded "differs from the PINNED tree" — noise from a verdict about a file the pin does not have.
