@@ -639,8 +639,9 @@ wt_self_chain() { # pids of this process and its ancestors, space-prefixed/termi
 }
 
 # wt_live_holders <canon-path> -> prints "pid<TAB>reason" for a live holder.
-#   0 = a holder was found · 1 = no holder (both witnesses read) · 2 = the argv probe could not be
-#   evaluated · 3 = no holder by argv, and the cwd witness is UNAVAILABLE on this host
+#   0 = a holder was found · 1 = no holder (both witnesses read) · 2 = a witness ran and could not be
+#   evaluated (the argv probe failed, OR the cwd census produced nothing usable — unparsable, quoted,
+#   or timed out) · 3 = no holder by argv, and the cwd witness is UNAVAILABLE on this host
 # The caller must NOT read 3 as "nothing is here": it means the probe that would have caught a process
 # sitting in the checkout invisibly — the #2744 shape — did not run. Both witnesses are silent before
 # anything is removed:
@@ -668,7 +669,7 @@ wt_self_chain() { # pids of this process and its ancestors, space-prefixed/termi
 # Bounded: `lsof` over a loaded box is not free, and an unbounded probe on the exit path is the
 # "reaper that hangs the fleet" failure this whole family of scripts exists to avoid.
 wt_live_holders() {
-    local path="$1" chain out tmp ignore pid line cwd
+    local path="$1" chain out tmp ignore pid line cwd rows_rc=0
     local tmpbase
     chain="$(wt_self_chain)"
     tmpbase="${TMPDIR:-/tmp}/wt-lifecycle.$$"
@@ -715,13 +716,20 @@ wt_live_holders() {
     # `wt_cwd_rows` therefore reads the kernel's own table where it exists and lsof only where it does
     # not — the SAME two arms, in the SAME order, as `live-ownership.sh` in this directory.
     out="$tmpbase.cwd"
-    if ! wt_cwd_rows "$out"; then
-        rm -f "$ignore"
-        # ⛔ 3, NOT 1 — "the cwd witness could not be read" is a DIFFERENT fact from "read it, nobody
-        # was there", and the caller must be able to say which one it got. Returning 1 here is what
-        # made a slim Linux cell delete a live lane's checkout with no line anywhere recording that the
-        # half of the probe which would have caught it never ran.
-        return 3
+    wt_cwd_rows "$out" || rows_rc=$?
+    if [ "$rows_rc" != 0 ]; then
+        rm -f "$out" "$ignore"
+        # ⛔ 3 IS FOR THE TOLERATED STATE, 2 IS FOR "WE COULD NOT TELL" — never the same code (#2744
+        # review, measured). 3 means this box has NEITHER a /proc table nor lsof, the documented
+        # degrade-and-disclose state the caller reaps through. 2 means a census RAN and its output
+        # cannot be trusted, and the only safe reading of that is fail-closed: "we cannot say nobody
+        # is here". Returning 3 for the second case is exactly the fail-open #2744 is about, one level
+        # up — with `QUOTING_STYLE=c` in the environment every row was unparsable, this line called it
+        # "unavailable", and the caller deleted a live lane's checkout.
+        if [ "$rows_rc" = 1 ]; then
+            return 3
+        fi
+        return 2
     fi
     # ⛔ THE PROBE LISTS ITSELF, AND THAT IS THE MEASUREMENT THAT MADE THIS GATE REFUSE EVERY REAP
     # (found while verifying #2033, 2026-10-18). `lsof -d cwd` includes the `lsof` process in its own
@@ -752,6 +760,13 @@ wt_live_holders() {
 # ── the cwd table: the kernel's own links on Linux, `lsof` where there is no /proc ─────────────
 # wt_cwd_rows <outfile> -> writes "<pid>\t<cwd>" rows.
 #   0 = a real census was written   ·   1 = NO witness is available on this host
+#   2 = a witness RAN but produced nothing usable (unparsable, quoted/escaped, or timed out)
+# ⛔ 1 AND 2 ARE DIFFERENT FACTS AND THE CALLER MUST NOT COLLAPSE THEM (measured fail-open, 2026-11-10).
+# 1 is "this box has neither a /proc table nor lsof" — the tolerated state where the argv witness is
+# all there is and the reap DISCLOSES it. 2 is "the probe did run and its output cannot be trusted",
+# which must fail CLOSED. Returning 1 for 2 is how a live checkout got deleted: with
+# `QUOTING_STYLE=c` in the ambient environment every row was unparsable, the census read as "no
+# witness", and the reap proceeded — checkout GONE, holder pid still alive.
 # ⛔ ONE PROBE FOR THE WHOLE TABLE, NEVER ONE PER PID. A per-pid `readlink` is ~50 ms x N (this box:
 # 594 pids) and the caller is the lane's EXIT path — the "reaper that hangs the fleet" shape this
 # family exists to avoid. So: ONE `ls` over the table on Linux, ONE `lsof` elsewhere, both bounded by
@@ -766,19 +781,44 @@ wt_live_holders() {
 # invented. Every arm therefore CAPTURES FIRST and is judged on its own bytes.
 # Seams (tests set them; production never needs them): WT_PROC_ROOT, WT_LS, WT_LSOF.
 wt_cwd_rows() {
-    local out="$1" raw="$1.raw" proc="${WT_PROC_ROOT:-/proc}"
-    : >"$out" 2>/dev/null || return 1
+    local out="$1" raw="$1.raw" bad="$1.bad" proc="${WT_PROC_ROOT:-/proc}" rc=0 saw=0
+    : >"$out" 2>/dev/null || return 2
+    : >"$bad" 2>/dev/null || return 2
     # Linux, and anything else exposing the kernel's per-process links. `/proc/self/cwd` is a symlink
     # only where the link kind actually exists, so a bare `/proc` directory is not taken as evidence.
     if [ -L "$proc/self/cwd" ] && command -v "${WT_LS:-ls}" >/dev/null 2>&1; then
+        saw=1
         # ⛔ ITS EXIT STATUS IS NOT THE VERDICT (measured 2026-11-10). `ls -l /proc/[0-9]*/cwd` exits 2
         # on any shared box — another uid's links cannot be read — WHILE LISTING EVERY ONE IT COULD.
         # Requiring rc=0 here threw that partial-but-real census away and fell through to "no witness",
         # i.e. the very fail-open this function exists to close, reintroduced one line lower. So:
         # CAPTURE FIRST, JUDGE THE BYTES. (A watchdog timeout yields no file at all, so it is empty.)
-        wt_run_bounded "$WT_PROBE_SECONDS" "$raw" "${WT_LS:-ls}" -l "$proc"/[0-9]*/cwd
+        # ⛔ FORCE THE QUOTING STYLE (measured 2026-11-10). `ls` quotes names according to the AMBIENT
+        # `QUOTING_STYLE` environment variable, and BOTH useful styles destroyed this parse in the two
+        # ways that a safety probe can fail: `c` wrapped the link name AND the target (`"/proc/N/cwd"
+        # -> "/wt"`), so NO row was produced; `escape` produced a row whose target read `…/re\ po\ wt`,
+        # which can never equal the checkout path, so the row silently matched nothing. Reproduced on
+        # a fixture: rc=0 `WT_RESULT=reaped …`, the directory GONE, the holder pid still alive. The
+        # command-line option overrides the environment variable, so the census stops depending on how
+        # the caller's shell happens to be configured — an ambient env var must not be able to disarm
+        # a gate (the `bypass by ambient env` class).
+        wt_run_bounded "$WT_PROBE_SECONDS" "$raw" "${WT_LS:-ls}" -l --quoting-style=literal "$proc"/[0-9]*/cwd; rc=$?
+        if [ "$rc" != 124 ] && [ ! -s "$raw" ]; then
+            # An `ls` that does not know the option (busybox, BSD) produced NO bytes at all: retry
+            # WITHOUT it rather than declaring the census unusable. Neither of those builds quotes
+            # non-tty output, so the parse is sound there — and the judgement below is on the BYTES
+            # either way, so a retry cannot turn a bad census good.
+            wt_run_bounded "$WT_PROBE_SECONDS" "$raw" "${WT_LS:-ls}" -l "$proc"/[0-9]*/cwd; rc=$?
+        fi
+        if [ "$rc" = 124 ]; then
+            # ⛔ A PROBE THAT NEVER FINISHED IS NOT "NO WITNESS ON THIS BOX". The watchdog DELETES the
+            # partial table, so leaving this rc unchecked reads as "empty" → 1 → a reap licensed by a
+            # probe that never completed (reproduced with a slow `ls`: rc 3 "unavailable", and the
+            # checkout was deleted while its holder was alive).
+            rm -f "$raw" "$out" "$bad"; return 2
+        fi
         if [ -s "$raw" ]; then
-            awk -v proc="$proc" '
+            awk -v proc="$proc" -v bad="$bad" '
                 {
                   # the link NAME is the first `<proc>/<pid>/cwd` on the line; the TARGET is
                   # everything after the first " -> ", so a target containing " -> " or a space
@@ -794,25 +834,37 @@ wt_cwd_rows() {
                   # `ls` echoes a failed readlink INLINE on some builds (`<name> -> <name>
                   # (readlink: Permission denied)`); that is not a cwd and must not become a row.
                   if (t ~ / \(readlink: /) next
+                  # ⛔ A QUOTED OR ESCAPED TARGET IS NOT A PATH WE CAN COMPARE, AND IT MUST NOT BE
+                  # SILENTLY DROPPED. A row that is PRESENT but can never equal $path is the quietest
+                  # fail-open there is: no holder, no disclosure, and the reap proceeds. Mark the whole
+                  # census UNUSABLE instead (the caller turns that into a fail-closed preserve) — this
+                  # is the residue defence for an `ls` whose quoting cannot be switched off.
+                  if (t ~ /^["\047]/ || t ~ /\\ /) { print $0 >> bad; next }
                   sub(/ \(deleted\)$/, "", t)
                   if (t ~ /^\//) printf "%s\t%s\n", pid, t
                 }' "$raw" >>"$out" 2>/dev/null
         fi
         rm -f "$raw"
-        [ -s "$out" ] && return 0
-        : >"$out" 2>/dev/null || return 1
+        [ -s "$bad" ] && { rm -f "$out" "$bad"; return 2; }
+        [ -s "$out" ] && { rm -f "$bad"; return 0; }
+        : >"$out" 2>/dev/null || return 2
     fi
     # macOS / a container with no /proc: `lsof -F` emits "<field><value>" lines — p<pid>, then n<path>.
     # Same rule: a non-empty table is the answer whatever lsof's status says about the rows it skipped.
     if command -v "${WT_LSOF:-lsof}" >/dev/null 2>&1; then
-        wt_run_bounded "$WT_PROBE_SECONDS" "$raw" "${WT_LSOF:-lsof}" -nP -d cwd -Fpn
+        saw=1
+        wt_run_bounded "$WT_PROBE_SECONDS" "$raw" "${WT_LSOF:-lsof}" -nP -d cwd -Fpn; rc=$?
+        if [ "$rc" = 124 ]; then rm -f "$raw" "$out" "$bad"; return 2; fi
         [ -s "$raw" ] && awk '/^p/ { p = substr($0, 2); next }
              /^n/ { t = substr($0, 2); if (p ~ /^[0-9]+$/ && t ~ /^\//) printf "%s\t%s\n", p, t }' \
             "$raw" >>"$out" 2>/dev/null
         rm -f "$raw"
     fi
-    [ -s "$out" ] && return 0
+    [ -s "$out" ] && { rm -f "$bad"; return 0; }
     rm -f "$out"
+    # A witness was attempted and yielded nothing usable: fail CLOSED, never "unavailable".
+    [ "$saw" = 1 ] && { rm -f "$bad"; return 2; }
+    rm -f "$bad"
     return 1
 }
 
@@ -930,9 +982,15 @@ wt_reap_if_empty() {
     if [ "$holder_rc" = 3 ]; then
         # Both witnesses are still applied — this only records that ONE of them did not run, so a
         # reap that proceeds says so instead of reporting a clean bill of health it did not earn.
+        # ⛔ THIS TEXT IS NOW TRUE BY CONSTRUCTION: 3 is reachable ONLY when neither a /proc table nor
+        # lsof exists (an unusable census is 2, fail-closed). The previous version printed these same
+        # words on a box whose /proc worked and whose `ls` had just produced 573 rows, because the
+        # unparsable case was mislabelled as "unavailable".
         degraded=" (⚠️ the cwd witness is UNAVAILABLE on this host — no /proc and no lsof — so the live-holder probe rested on argv alone; a process whose cwd is this checkout and whose command line does not name it would not have been seen, agent-infra#2744)"
     elif [ "$holder_rc" != 1 ]; then
-        WT_RESULT="the live-holder probe could not be evaluated (fail-closed) — kept"
+        # rc 2: a witness ran and produced nothing usable. Fail-closed, and say WHICH probes could be
+        # at fault — an operator reading a refused reap needs the arm, not a generic phrase.
+        WT_RESULT="the live-holder probe could not be evaluated (an argv probe failed, or the cwd census produced nothing usable — unparsable, quoted, or timed out) — kept (fail-closed)$degraded"
         return 1
     fi
 
@@ -942,35 +1000,35 @@ wt_reap_if_empty() {
     case "$verdict" in
         clean) ;;   # `detail` holds the disposable ROOT entries, used by the pre-delete below
         dirty)
-            WT_RESULT="the tree is DIRTY ($detail) — the work is preserved for the reaper's backup-then-reap policy, not deleted here"
+            WT_RESULT="the tree is DIRTY ($detail) — the work is preserved for the reaper's backup-then-reap policy, not deleted here$degraded"
             return 1 ;;
         ignored)
-            WT_RESULT="the tree holds ignored, non-regenerable data ($detail) — preserved (git worktree remove would delete it silently)"
+            WT_RESULT="the tree holds ignored, non-regenerable data ($detail) — preserved (git worktree remove would delete it silently)$degraded"
             return 1 ;;
         *)
-            WT_RESULT="the clean gate could not be evaluated ($detail) — preserved (fail-closed)"
+            WT_RESULT="the clean gate could not be evaluated ($detail) — preserved (fail-closed)$degraded"
             return 1 ;;
     esac
 
     oid="$(wt_branch_oid "$repo" "$br")"
     if [ -z "$oid" ]; then
-        WT_RESULT="branch refs/heads/$br does not resolve — refusing to reap a checkout whose branch is already gone"
+        WT_RESULT="branch refs/heads/$br does not resolve — refusing to reap a checkout whose branch is already gone$degraded"
         return 2
     fi
     a="$(wt_ahead_count "$repo" "$base" "$oid")"
     if [ -z "$a" ]; then
-        WT_RESULT="cannot count commits ahead of $base — preserved (fail-closed)"
+        WT_RESULT="cannot count commits ahead of $base — preserved (fail-closed)$degraded"
         return 1
     fi
     if [ "$a" != "0" ]; then
-        WT_RESULT="the branch is $a commit(s) ahead of $base — that work is kept"
+        WT_RESULT="the branch is $a commit(s) ahead of $base — that work is kept$degraded"
         return 1
     fi
     # A pushed branch means a PR may exist (or be about to): the remote ref is the durable copy, so
     # the local one is not ours to delete while it is someone else's review anchor.
     if upstream="$(wt_git -C "$repo" rev-parse --verify -q "refs/remotes/origin/$br" 2>/dev/null)" \
         && [ -n "$upstream" ]; then
-        WT_RESULT="origin/$br exists — the branch was pushed, so it may back an open PR; kept"
+        WT_RESULT="origin/$br exists — the branch was pushed, so it may back an open PR; kept$degraded"
         return 1
     fi
 
@@ -987,11 +1045,11 @@ wt_reap_if_empty() {
     # deletion is not used at all: the ref is 0 commits ahead of <base>, so nothing can be lost, and
     # the CAS is what makes that claim checkable at the instant of deletion.
     if ! ( cd "$repo" && "${WT_GIT:-git}" worktree remove "$path" ) >/dev/null 2>&1; then
-        WT_RESULT="git worktree remove refused $path — left in place for the reaper (run: bash scripts/pi-reap-worktrees.sh --repo '$repo')"
+        WT_RESULT="git worktree remove refused $path — left in place for the reaper (run: bash scripts/pi-reap-worktrees.sh --repo '$repo')$degraded"
         return 2
     fi
     if ! wt_git -C "$repo" update-ref -d "refs/heads/$br" "$oid" >/dev/null 2>&1; then
-        WT_RESULT="worktree removed but refs/heads/$br could not be deleted (it moved, or git refused) — the reaper's next pass reports it"
+        WT_RESULT="worktree removed but refs/heads/$br could not be deleted (it moved, or git refused) — the reaper's next pass reports it$degraded"
         return 2
     fi
     wt_git -C "$repo" config --remove-section "branch.$br" >/dev/null 2>&1 || true
