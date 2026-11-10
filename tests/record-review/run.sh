@@ -1782,7 +1782,17 @@ cat > "$T30/bin/gh" <<'EOF'
 # rendered: `pulls/<n>` -> head/base/count, `compare/...` -> mb line + rows.
 for x in "$@"; do
   case "$x" in
-    *"/pulls/"*)    printf '%s\t%s\t%s\n' "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;
+    *"/pulls/"*)   if [ -n "${FIX_META_RC:-}" ] && [ "$FIX_META_RC" != "0" ]; then
+                       # #2628 — the pulls read now KEEPS its status, so a
+                       # fixture that only sets an exit code cannot model it: the
+                       # recorder classifies on the HTTP status `gh` prints on
+                       # STDERR (404/422 = the API refused this PR → rc 3;
+                       # 401/403/5xx/network = nothing was read → rc 1). Same
+                       # shape as FIX_COMPARE_RC/FIX_COMPARE_ERR below.
+                       printf '%s\n' "${FIX_META_ERR:-}" >&2
+                       exit "$FIX_META_RC"
+                     fi
+                     printf '%s\t%s\t%s\n' "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;
     *"/compare/"*)  if [ "${FIX_COMPARE_RC:-0}" != "0" ]; then
                        # The real `gh` prints its own diagnosis on STDERR, and the
                        # recorder now classifies a compare failure by the HTTP
@@ -1901,6 +1911,27 @@ T30_CMP_RC="$(FIX_COMPARE_RC=1 FIX_COMPARE_ERR='gh: Not Found (HTTP 404)' PATH="
 [ "$T30_CMP_RC" = "$(printf 'unclassified\t')" ] \
   && pass "(30xvii) a compare HTTP 404 (fork head / unreachable sha) is UNCLASSIFIED, not unavailable — the API REFUSED this revision" \
   || fail "(30xvii) a compare HTTP 404 was read as transport (got '$T30_CMP_RC')"
+
+# #2628 — THE SAME SPLIT ON THE `pulls` READ, which until #2628 DISCARDED its
+# status (`2>/dev/null … || return 1`) and so called a refused PR read transport.
+# The consequence was not cosmetic: the surface cap became UNVERIFIED and a
+# clean-micro record was written for a diff whose surface was never read, while
+# the micro tier dispatches NO reviewers (the #2511 review's P1). These two
+# vectors pin the split on the read that does the discarding.
+T30_META_404="$(FIX_META_RC=1 FIX_META_ERR='gh: Not Found (HTTP 404)' PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+  FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+  HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+[ "$T30_META_404" = "$(printf 'unclassified\t')" ] \
+  && pass "(30xvii-c) a pulls-read HTTP 404 is UNCLASSIFIED — the API ANSWERED and REFUSED this PR, so it is positive evidence, not transport" \
+  || fail "(30xvii-c) a pulls-read HTTP 404 was read as transport (got '$T30_META_404')"
+for _merr in 'gh: API rate limit exceeded for 1.2.3.4. (HTTP 403)' 'gh: Server Error (HTTP 502)' 'gh: Get "https://api.github.com/x": connection refused'; do
+  T30_META_TRANS="$(FIX_META_RC=1 FIX_META_ERR="$_merr" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+    FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+    HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+  [ "$T30_META_TRANS" = "$(printf 'unavailable\t')" ] \
+    && pass "(30xvii-d) a non-refusal pulls-read failure ('${_merr:0:38}…') is TRANSPORT (unavailable), not a refusal — a throttle must not strand a legitimate micro lane" \
+    || fail "(30xvii-d) a non-refusal pulls-read failure was classified as a refusal (got '$T30_META_TRANS')"
+done
 
 # ...and on the RECORD path the same response must refuse, like its clean-low
 # sibling does 60 lines later.
@@ -2829,7 +2860,12 @@ fi
 # `"delta_range":"30219358085b…0d.."` with an empty base, kind and digest beside a
 # `mint:"delta"` — a signed artifact claiming a reviewed range from the one verb whose
 # contract is that no reviewer ran.
-MIN_ASSERTIONS=214
+MIN_ASSERTIONS=218
+# #2628: 214 -> 218. The ``pulls`` read stopped discarding its HTTP status, so
+# the print-tier seam gained the (30xvii-c)/(30xvii-d) pair: a 404 on the PR read
+# is now `unclassified` (the API REFUSED this PR → positive evidence) and a
+# 403/5xx/network failure is still `unavailable` (transport). Four assertions: one
+# refusal, three transport shapes. MEASURED 218 on this tree.
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

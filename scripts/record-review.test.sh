@@ -418,6 +418,30 @@ if [ "$1" = "api" ]; then
     # #1348 clean-low: the head/base/changed_files meta read.
     if grep -qF -- "--jq [(.head.sha), (.base.sha)" <<<"$*"; then
         [ "${STUB_META_FAIL:-0}" = "1" ] && exit 1
+        # #2628 — this read is STATUS-AWARE, exactly as the compare read below is.
+        # `gh api` exits 1 for a 404, a 403, a 401, a 5xx and a dead socket alike,
+        # so the status on STDERR is the only thing that separates "the API
+        # REFUSED this PR" (positive evidence → rc 3, refuse) from "nothing was
+        # read" (transport → rc 1, warn and proceed). The two knobs model those
+        # two halves and are NOT interchangeable:
+        #   STUB_META_FAIL=1   exit 1 with EMPTY stderr — the no-status transport
+        #                      cause (a dead socket, a killed process).
+        #   STUB_META_HTTP=<n> exit 1 with the status `gh` prints — the
+        #                      status-bearing cause, which the classifier keys on.
+        # Before #2628 the arm below was `2>/dev/null … || return 1`, so a 404 on
+        # a PR this token cannot see recorded clean-micro for a surface that was
+        # never read (the #2511 review's P1).
+        if [ -n "${STUB_META_HTTP:-}" ]; then
+            case "$STUB_META_HTTP" in
+                404) _why="Not Found" ;;
+                422) _why="Unprocessable Entity" ;;
+                403) _why="API rate limit exceeded" ;;
+                5*)  _why="Server Error" ;;
+                *)   _why="Error" ;;
+            esac
+            printf 'gh: %s (HTTP %s)\n' "$_why" "$STUB_META_HTTP" >&2
+            exit 1
+        fi
         derived=0
         if [ -n "${STUB_COMPARE:-}" ]; then
             derived="$(printf '%s\n' "$STUB_COMPARE" | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -1348,9 +1372,19 @@ rm -rf "$T/labels"
 # `--print-tier` classification (`too_large`), never this record-path refusal.
 #
 #   EMPTY        the API ANSWERED: 0 changed files            → rc 2, exit 4
-#   UNREADABLE   transport, no status / status-bearing 403/5xx → rc 1, WARN + record
-#   REFUSED      the API answered and REFUSED this revision    → rc 3, exit 4
+#   UNREADABLE   transport, no status / status-bearing 401/403/5xx → rc 1, WARN + record
+#   REFUSED      the API answered and REFUSED this PR (the
+#                `pulls` read, HTTP 404/422) or this revision
+#                (the compare, HTTP 404/422)                   → rc 3, exit 4
 #   INCONSISTENT claims a surface and delivers no row          → rc 3, exit 4
+#
+# #2628 folded the `pulls` read into this split: until then it discarded its
+# status (`2>/dev/null … || return 1`), so BOTH halves of the REFUSED class were
+# reachable only through the compare, and a PR whose own read was refused
+# recorded clean-micro. Both endpoints now go through ONE classifier
+# (`http_refused`), so the vectors below pin the status list for both — and this
+# block pins each endpoint's REFUSED arm separately, because an arm that stops
+# CALLING the classifier is invisible to the other endpoint's vectors.
 #
 # The split is load-bearing, not cosmetic: a transport blip must not strand a
 # legitimate micro record (fail-open), while a payload that cannot certify a
@@ -1392,20 +1426,53 @@ STUB_COMPARE_HTTP=503 STUB_BODY="Fixes #424365" STUB_LABELS="complexity:micro" r
 assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 503 warning names the READ failure"
 assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 503 is NOT reported as an uncertifiable payload"
 
-# UNREADABLE (3/3) — the OTHER rc-1 cause: the `pulls` meta read itself failed,
-# so the cap never reaches the compare. Same posture (warn, record proceeds), and
-# pinned because `review_surface_rows`' contract names three rc-1 causes while a
-# compare-only vector exercises one.
-# ⚠️ PINNED AS-IS, NOT AS SHOULD (#2628). The pulls read does
-# `2>/dev/null ... || return 1`, so it cannot tell a dead socket from a 401/403/
-# 5xx/404 — the #2511 review's P1, still unfixed and was untracked until #2628.
-# This vector therefore pins the CURRENT behaviour deliberately; when #2628 makes
-# that read status-aware (404/422 → rc 3), THIS assertion must change with it.
-# Do not read it as an endorsement.
+# UNREADABLE (3/4) — the `pulls` meta read itself failed with NO status at all,
+# so the cap never reaches the compare. Same posture (warn, record proceeds).
+# This is the TRANSPORT half of that read's failure modes; the refusal half is
+# pinned by the two vectors below it.
+# (#2628 rewrote this pair. Until #2628 the `pulls` read discarded its status, so
+# a 404 on a PR this token cannot see was indistinguishable from this dead-socket
+# case and recorded clean-micro for a surface never read — the #2511 review's P1.
+# That vector used to say, deliberately, "PINNED AS-IS, NOT AS SHOULD"; the arm
+# it pinned is now correct, and this vector pins only the no-status cause.)
 STUB_META_FAIL=1 STUB_BODY="Fixes #424366" STUB_LABELS="complexity:micro" run_micro_verdict 424366
 [ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a failed meta read PROCEEDS (rc 0)" || bad "8.16 unreadable: a failed meta read must proceed (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424366.json" ] && ok "8.16 unreadable: the record IS written after a failed meta read" || bad "8.16 unreadable: a failed meta read stranded a legitimate record"
 assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the failed-meta warning names the READ failure"
+
+# UNREADABLE (4/4) — the `pulls` read failed WITH a status that is NOT a refusal
+# of this PR (403 rate-limit: the shape a lane actually hits). This is the
+# FALSE-REFUSAL half of #2628: if the classifier ever widened to "any non-2xx" a
+# throttled read would refuse and strand a legitimate micro record on a window
+# that passes in seconds. Measured: widening `HTTP (404|422)` to include 403 reds
+# this vector (and its compare sibling).
+STUB_META_HTTP=403 STUB_BODY="Fixes #424372" STUB_LABELS="complexity:micro" run_micro_verdict 424372
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a rate-limited meta read (403) PROCEEDS (rc 0)" || bad "8.16 unreadable: a 403 meta read must proceed, not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424372.json" ] && ok "8.16 unreadable: the 403-meta record IS written" || bad "8.16 unreadable: a 403 meta read stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 403-meta warning names the READ failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 403 meta read is NOT reported as an uncertifiable payload"
+
+# REFUSED (pulls 404) — THE #2628 FINDING ITSELF. The API ANSWERED and refused to
+# describe this PR (a nonexistent PR, a PR this token cannot see, a deleted or
+# transferred one). POSITIVE evidence: the surface of this PR is knowable and was
+# not read, and the micro tier dispatches NO reviewers — so nothing else would
+# ever look at the diff. Before the fix this vector produced rc 0 and WROTE A
+# RECORD (measured on origin/main at 8d81b5c5c: rc=0, record present), which is
+# the exact class the surface cap exists to close.
+STUB_META_HTTP=404 STUB_BODY="Fixes #424370" STUB_LABELS="complexity:micro" run_micro_verdict 424370
+[ "$RECORD_RC" = "4" ] && ok "8.16 refused: a pulls-read 404 REFUSES (exit 4)" || bad "8.16 refused: a pulls-read 404 must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424370.json" ] && ok "8.16 refused: no record written over a refused PR read" || bad "8.16 refused: recorded clean-micro for a PR whose own read was REFUSED"
+assert_contains "$RECORD_ERR" "cannot be certified" "8.16 refused: the pulls-404 refusal names the uncertifiable payload"
+assert_contains "$RECORD_ERR" "read REFUSED this PR" "8.16 refused: the cause list names the pulls read, not only the compare"
+assert_not_contains "$RECORD_ERR" "could not read the changed paths" "8.16 refused: a pulls API REFUSAL is NOT reported as a transport failure"
+
+# REFUSED (pulls 422) — the same class's other status. Pinned per ENDPOINT, not
+# only through the shared classifier: a regression that stops CALLING
+# `http_refused` from the pulls arm (e.g. reverting it to `|| return 1`) leaves a
+# shared-regex narrowing visible only on the compare side.
+STUB_META_HTTP=422 STUB_BODY="Fixes #424371" STUB_LABELS="complexity:micro" run_micro_verdict 424371
+[ "$RECORD_RC" = "4" ] && ok "8.16 refused: a pulls-read 422 REFUSES (exit 4)" || bad "8.16 refused: a pulls-read 422 must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424371.json" ] && ok "8.16 refused: no record written for a pulls-read 422" || bad "8.16 refused: recorded clean-micro over a 422-refused PR read"
 
 # UNREADABLE (4/4) — and a rate-limit window (403), which `gh` reports WITH a
 # status. Pinned separately from the 503 because it is the shape a lane actually
