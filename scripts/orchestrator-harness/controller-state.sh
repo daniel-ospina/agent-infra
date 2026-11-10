@@ -139,6 +139,33 @@ orc_lock_pid() { tr -dc '0-9' < "$1" 2>/dev/null; }
 # orc_mtime <file> — epoch seconds of the record's last write. `date -r` is BSD and GNU both.
 orc_mtime() { date -r "$1" +%s 2>/dev/null; }
 
+# orc_lock_fill <displaced record> <lockf> — put a record back into a FREE path, ATOMICALLY.
+# rc 0 restored · rc 1 the path was already taken (a newer holder owns it) · rc 2 no paths given
+# ⛔ ONE OPERATION, NOT A CHECK THEN A WRITE (fresh review of #3846, P2 — the check-then-act was real).
+# The shipped restore was `[ -e "$lockf" ] || mv -f "$tmp" "$lockf"`: two operations, and the second is
+# `rename(2)`, which REPLACES its target unconditionally. A third starter that noclobber-created its
+# record BETWEEN the test and the move was therefore still overwritten by the older pid — precisely the
+# interleaving that line's comment claimed to close. Measured on this box: `mv -f` onto an existing
+# path left the SECOND writer's pid there (it replaced); `ln` onto an existing path refused with
+# `File exists` and left the target untouched.
+# `ln` is the atomic create-if-absent, and it is the SAME class of guarantee `orc_lock_write` gets
+# from `noclobber` — the primitive this module already relies on everywhere else.
+# ⛔ NOT a noclobber WRITE of the captured pid, on purpose: that mints a NEW mtime, and the record's
+# mtime is the evidence the identity fence reads (`orc_began_after`, i.e. "did this process begin
+# after the record was written"). A fresh mtime would make a reclaimable stale record permanent
+# (every later starter reads "began before the record" → HELD), which is a self-inflicted lockout.
+# A hard link keeps the INODE, and so the displaced record's own mtime.
+# Both names are in the same directory by construction (`$lockf.reclaim.$$`), so there is no
+# cross-device case for `ln` to fail on and no "hard links unsupported" fallback to be tempted by
+# (a fallback would be the non-atomic path again, wearing a different name).
+orc_lock_fill() {
+  local tmp="${1:-}" lockf="${2:-}"
+  [ -n "$tmp" ] && [ -n "$lockf" ] || return 2
+  ln "$tmp" "$lockf" 2>/dev/null || return 1
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
 # orc_lock_reclaim <lockf> <the stale pid this caller judged> — replace a record whose holder is
 # PROVEN not to be the live owner.
 #
@@ -147,25 +174,47 @@ orc_mtime() { date -r "$1" +%s 2>/dev/null; }
 # LIVE holder's record — the singleton defeated by the very code that grants it. So the record is
 # MOVED aside atomically and re-read: if it no longer names the pid this caller judged stale, it
 # belongs to somebody who won the race and is put back untouched.
+#
+# ⛔ THREE OUTCOMES, AND 2 IS NOT 1. `orc_lock_reclaim` used to answer only 0/1, so its ONE failure
+# arm had to carry two unrelated states — "another starter took the record" and "the state dir is not
+# writable" — and the caller minted both into rc 2 UNJUDGED. That is a FALSE STATEMENT about the first
+# one: rc 2 makes `orch-loop.sh` print "the record … could not be judged (contents: '<winner pid>')"
+# and makes `harness-up`'s REFUSED-UNJUDGED row hand the operator `rm -f .orch.lock` as the remedy,
+# about a FRESH, perfectly readable record naming the LIVE winner (fresh review of #3846, P2).
+# So: 0 = we hold it · 1 = ANOTHER pid holds it, named in ORC_RECLAIM_HOLDER · 2 = cannot tell.
 orc_lock_reclaim() {
-  local lockf="${1:-}" expected="${2-}" tmp got=""
-  [ -n "$lockf" ] || return 1
+  local lockf="${1:-}" expected="${2-}" tmp got="" winner=""
+  ORC_RECLAIM_HOLDER=""
+  [ -n "$lockf" ] || return 2
   tmp="$lockf.reclaim.$$"
-  mv -f "$lockf" "$tmp" 2>/dev/null || return 1
+  mv -f "$lockf" "$tmp" 2>/dev/null || return 2
   got="$(orc_lock_pid "$tmp")"
   if [ "$got" != "$expected" ]; then
-    # Somebody took the lock while we were judging it. Restore theirs and report the refusal.
-    # ⛔ RESTORE ONLY INTO A FREE PATH (fresh-context review of #3846, P3). `mv -f` REPLACES, so a
-    # three-starter interleaving — our restore landing after a THIRD starter has already created its
-    # own record — overwrote that winner's record with the earlier pid. The winner then believed it
-    # held the lock, its ownership-scoped release left the record alone, and the surviving record
-    # named a pid nobody owned. `[ -e ] ||` is the same fail-closed direction as the rest of this
-    # module: a path that is already taken belongs to its newer holder.
-    if [ -e "$lockf" ]; then rm -f "$tmp" 2>/dev/null; else mv -f "$tmp" "$lockf" 2>/dev/null || rm -f "$tmp" 2>/dev/null; fi
-    return 1
+    # Somebody took the lock while we were judging it: this record is THEIRS, not the stale one this
+    # caller judged. Put it back into a FREE path — the fill is atomic, so a THIRD starter that
+    # created its own record first keeps it — and report who holds the state dir now.
+    orc_lock_fill "$tmp" "$lockf" || rm -f "$tmp" 2>/dev/null
+    winner="$(orc_lock_pid "$lockf")"
+    if [ -n "$winner" ] && [ "$winner" != "$expected" ]; then
+      ORC_RECLAIM_HOLDER="$winner"
+      return 1
+    fi
+    return 2
   fi
   rm -f "$tmp" 2>/dev/null
-  orc_lock_write "$lockf"
+  if orc_lock_write "$lockf"; then return 0; fi
+  # ⛔ THIS ARM IS NOT "UNJUDGED" (fresh review of #3846, P2; same root as the restore above).
+  # `orc_lock_write` is a noclobber create, so after our own stale record was moved aside the ONLY way
+  # it fails is that a THIRD starter created the record first — and that starter ACQUIRED, atomically.
+  # Reporting 2 asserted that a fresh, readable record naming the LIVE winner "could not be judged",
+  # and both operator rows that read 2 then invited `rm -f` of that winner's record. Positive evidence
+  # of a new holder is HELD: name it and refuse.
+  winner="$(orc_lock_pid "$lockf")"
+  if [ -n "$winner" ]; then
+    ORC_RECLAIM_HOLDER="$winner"
+    return 1
+  fi
+  return 2
 }
 
 # ── the slack seam, VALIDATED BEFORE IT REACHES ARITHMETIC (agent-infra#2095 review, P1) ─────────
@@ -259,6 +308,27 @@ orc_began_after() {
   [ "$ps" -gt "$((pe + slack))" ]
 }
 
+# _orc_reclaim <lockf> <expected> <acquired sentence> <what was judged> — map `orc_lock_reclaim`'s
+# three outcomes onto the singleton's: 0 ACQUIRED · 1 HELD by whoever won the race · 2 UNJUDGED.
+# ⛔ ONE MAPPING, THREE CALLERS, ON PURPOSE. The pre-fix code repeated "if orc_lock_reclaim ⇒ acquired
+# else ⇒ 2 UNJUDGED" in all three arms, so all three inherited the same false UNJUDGED for a race that
+# another starter had already won (fresh review of #3846, P2). A fourth copy in this file is how the
+# arms would drift apart again.
+_orc_reclaim() {
+  local lockf="${1:-}" expected="${2-}" ok="${3:-reclaimed the record}" judged="${4:-the record}" rc=0
+  orc_lock_reclaim "$lockf" "$expected"; rc=$?
+  case "$rc" in
+    0) ORC_SINGLETON_WHY="$ok"; return 0 ;;
+    1) # ⛔ NOT "could not be replaced": another instance created this record while we were judging
+       # it, and its create was atomic (noclobber), so IT holds the state dir and it is ALIVE enough
+       # to have just written. rc 2 here sent the operator to `rm -f` a live winner's record.
+       ORC_SINGLETON_WHY="HELD by pid ${ORC_RECLAIM_HOLDER:-?} — it CREATED $lockf while this instance was judging $judged, and that create was atomic, so it owns this state dir and this instance does not"
+       return 1 ;;
+    *) ORC_SINGLETON_WHY="the record at $lockf could not be judged and could not be replaced while judging $judged (is the state dir writable?); nothing was removed"
+       return 2 ;;
+  esac
+}
+
 # orc_singleton_acquire <lockf> — 0 ACQUIRED, 1 HELD by a live controller, 2 UNJUDGED.
 # Sets ORC_SINGLETON_WHY to a human sentence naming the evidence, for the refusal line.
 orc_singleton_acquire() {
@@ -271,15 +341,11 @@ orc_singleton_acquire() {
   # (`install-controller-service.sh:1330`, `cloud-cell-supervisor.sh:733`), so reclaiming it steals
   # nothing — there is no pid to displace.
   if [ -z "$holder" ]; then
-    if orc_lock_reclaim "$lockf" ""; then ORC_SINGLETON_WHY="reclaimed an EMPTY record"; return 0; fi
-    ORC_SINGLETON_WHY="the record at $lockf is EMPTY and could not be replaced (is the state dir writable?)"
-    return 2
+    _orc_reclaim "$lockf" "" "reclaimed an EMPTY record" "an EMPTY record"; return $?
   fi
   # Dead pid: the SIGKILL / OOM / reboot path the reclaim exists for.
   if ! kill -0 "$holder" 2>/dev/null; then
-    if orc_lock_reclaim "$lockf" "$holder"; then ORC_SINGLETON_WHY="reclaimed a DEAD holder (pid $holder is gone)"; return 0; fi
-    ORC_SINGLETON_WHY="dead holder pid $holder in $lockf could not be replaced"
-    return 2
+    _orc_reclaim "$lockf" "$holder" "reclaimed a DEAD holder (pid $holder is gone)" "dead holder pid $holder"; return $?
   fi
   # Alive. ⛔ A LIVE PID IS NOT OWNERSHIP — a recycled pid is alive too, and on this fleet the
   # recycled target is a PEER repo's controller running the same shared harness path, so shape alone
@@ -289,12 +355,10 @@ orc_singleton_acquire() {
   orc_began_after "$holder" "${lt:-}"; rc=$?
   case "$rc" in
     0)
-      if orc_lock_reclaim "$lockf" "$holder"; then
-        ORC_SINGLETON_WHY="reclaimed a RECYCLED pid ($holder began after the record was written, so it is not this state dir's controller)"
-        return 0
-      fi
-      ORC_SINGLETON_WHY="recycled pid $holder in $lockf could not be replaced"
-      return 2 ;;
+      _orc_reclaim "$lockf" "$holder" \
+        "reclaimed a RECYCLED pid ($holder began after the record was written, so it is not this state dir's controller)" \
+        "a RECYCLED pid $holder"
+      return $? ;;
     1)
       ORC_SINGLETON_WHY="HELD by live controller pid $holder (it began before the record was written, so it IS this state dir's controller)"
       return 1 ;;

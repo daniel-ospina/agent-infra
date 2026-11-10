@@ -772,9 +772,22 @@ in_flight_pids() {
       if ($1 == me) next
       for (i = 3; i <= NF; i++) {
         f = $i
-        if (index(f, o) == 1)            n = substr(f, length(o) + 1)
-        else if (ow != "" && index(f, ow) == 1) n = substr(f, length(ow) + 1)
-        else continue
+        # ⛔ THE DEEPEST MATCHING ROOT WINS, NOT THE FIRST ONE TESTED (fresh review of #3846, P3).
+        # The first-match form made the second prefix UNREACHABLE whenever `$O` is a prefix of
+        # `$O_WORK` — i.e. a state dir ABOVE the harness root (`O=/x`, `O_WORK=/x/harness`): a live
+        # lane token `/x/harness/lane.sh` matched `$O/` first and yielded `harness/lane.sh`, the
+        # subdirectory guard below dropped it, and `$O_WORK` was never tried. Reproduced by driving
+        # this awk with a fake ps row: `O=/x O_WORK=/x/harness` -> no lane counted; `O=/x/harness/state
+        # O_WORK=/x/harness` (state INSIDE the work root) -> COUNTED. `lanes=0` while lanes run is the
+        # DESTRUCTIVE direction (it is what lets `--re-seed` swap a tree under a running lane) and it
+        # blinds the `GATE_CODE=lanes` arm.
+        # Taking the LONGEST matching prefix is the same answer on every arrangement that works today
+        # (flat: `o == ow`; state inside the work root: `o` is longer), and it is the only answer that
+        # works when the state dir is an ancestor of the work root. Exactly one tail, never two.
+        n = ""; ln = 0
+        if (index(f, o) == 1)            { n = substr(f, length(o) + 1);  ln = length(o) }
+        if (ow != "" && length(ow) > ln && index(f, ow) == 1) { n = substr(f, length(ow) + 1); ln = length(ow) }
+        if (ln == 0) continue
         if (index(n, "/") != 0) continue      # a subdirectory ($O/logs/…) is not a lane script
         if (n !~ /\.sh$/) continue
         if (n == "orch-loop.sh" || n == "harness-refresh.sh") continue

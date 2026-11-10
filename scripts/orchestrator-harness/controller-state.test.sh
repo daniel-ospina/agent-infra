@@ -246,6 +246,85 @@ case "$(ls "$LKR"/.orch.lock.reclaim.* 2>/dev/null)" in
   *)  ck "§2 …and it left a reclaim temp file beside the record: $(ls "$LKR"/.orch.lock.reclaim.* 2>/dev/null | tr '\n' ' ')" 1 ;;
 esac
 
+# ⛔ THE CHECK-THEN-ACT WAS THE FINDING, AND THE ROW ABOVE CANNOT SEE IT (fresh review of #3846, P2).
+# That row proves the SEQUENTIAL case: the winner's record already exists when the restore runs, so a
+# `[ -e ]` test sees it. The defect is the window BETWEEN that test and the write — `mv -f` is
+# `rename(2)` and replaces unconditionally, so a third starter that noclobber-created its record in
+# that window was still overwritten by the older pid; the winner believed it held the lock, its
+# ownership-scoped release left the record alone, and the next starter reclaimed a record naming a
+# stale pid (two controllers on one state dir, #1715).
+# So this row injects the third starter AT THE FILL ITSELF. The `ln` shim below creates the winner's
+# record first and then runs the REAL `ln`, so the fill's own create-if-absent is what decides: `ln`
+# refuses an occupied path and the winner survives. The assertion is the SURVIVING RECORD, so it does
+# not care which primitive the fix chose — only that it cannot replace: a revert to `mv -f`, or to
+# `cp`/a plain `>`, never reaches the shim, finds a FREE path, and writes the DISPLACED record (111)
+# over nothing — which reddens the row below just as hard (measured: `rc=2, record=111` on the
+# pre-fix code).
+# ⛔ ONLY `ln` IS SHIMMED, AND `mv` DELIBERATELY IS NOT. Shimming `mv` as `command mv "$@"` makes this
+# FILE read as a discard whose target is a runtime expansion, and the repo's own `main-worktree-guard`
+# then refuses to run the suite at all (`script-indirection`, #709) — a test that cannot be executed is
+# a broken test, and buying this row's fidelity with the suite's runnability is not a trade worth making.
+LKQ="$T/lkq"; mkdir -p "$LKQ"
+printf '111\n' > "$LKQ/.orch.lock"     # the record this caller is judging
+( . "$MOD"
+  # The record CHANGED under us: the temp read answers a different pid than the one judged (so the
+  # take-it-back path is the one under test), while the real records stay readable.
+  orc_lock_pid() { case "${1:-}" in */.orch.lock.reclaim.*) printf '222\n' ;; *) command tr -dc '0-9' < "$1" 2>/dev/null ;; esac; }
+  # ⛔ THE THIRD STARTER LANDS AT THE FILL: the link's destination (its LAST non-option argument) is
+  # occupied first, and then the REAL `ln` runs and has to refuse it.
+  ln() { local _a _dst=""; for _a in "$@"; do case "$_a" in -*) ;; *) _dst="$_a" ;; esac; done
+         case "$_dst" in */.orch.lock) printf '333\n' > "$_dst" ;; esac
+         command ln "$@"; }
+  orc_lock_reclaim "$LKQ/.orch.lock" 111; printf 'rc=%s holder=%s\n' "$?" "$ORC_RECLAIM_HOLDER" ) > "$T/rcl-race" 2>&1
+[ "$(cat "$LKQ/.orch.lock" 2>/dev/null)" = "333" ] \
+  && ck "§2 a third starter that creates the record AT THE FILL keeps its record (the restore cannot replace it)" 0 \
+  || ck "§2 the restore OVERWROTE the record a third starter created in the check-then-act window — got '$(cat "$LKQ/.orch.lock" 2>/dev/null)', wanted 333" 1
+[ "$(cat "$T/rcl-race" | tr '\n' ' ')" = "rc=1 holder=333 " ] \
+  && ck "§2 …and the refusal is rc 1 naming the real winner (not UNJUDGED)" 0 \
+  || ck "§2 the raced reclaim returned '$(cat "$T/rcl-race" | tr '\n' ' ')' — wanted 'rc=1 holder=333 '" 1
+case "$(ls "$LKQ"/.orch.lock.reclaim.* 2>/dev/null)" in
+  '') ck "§2 …and the raced restore leaves no reclaim temp file" 0 ;;
+  *)  ck "§2 …and the raced restore left a reclaim temp file: $(ls "$LKQ"/.orch.lock.reclaim.* 2>/dev/null | tr '\n' ' ')" 1 ;;
+esac
+
+# ⛔ LOSING OUR OWN FINAL CREATE IS "HELD", NOT "UNJUDGED" (same finding, second half). `orc_lock_write`
+# is a noclobber create, so after the stale record was moved aside the only way it fails is that a
+# THIRD starter created the record first — and that starter ACQUIRED. Reporting 2 told `orch-loop.sh` to
+# print "the record … could not be judged (contents: '<winner>')" and told `harness-up`'s exit-74 row to
+# offer `rm -f .orch.lock` as the remedy, about a fresh readable record naming the LIVE winner.
+LKW="$T/lkw"; mkdir -p "$LKW"
+printf '999999\n' > "$LKW/.orch.lock"
+( . "$MOD"
+  orc_lock_write() { printf '333\n' > "$1"; ( set -o noclobber; printf '%s\n' "$$" > "$1" ) 2>/dev/null; }
+  orc_lock_reclaim "$LKW/.orch.lock" 999999; printf 'rc=%s holder=%s\n' "$?" "$ORC_RECLAIM_HOLDER" ) > "$T/rcl-lost" 2>&1
+[ "$(cat "$T/rcl-lost" | tr '\n' ' ')" = "rc=1 holder=333 " ] \
+  && ck "§2 losing our own create race reports HELD (rc 1) naming the winner — NOT UNJUDGED" 0 \
+  || ck "§2 losing our own create race returned '$(cat "$T/rcl-lost" | tr '\n' ' ')' — wanted 'rc=1 holder=333 ' (rc 2 turns a live winner into a `rm -f` remedy)" 1
+
+# …AND THE ACQUIRE ARM MUST PROPAGATE THAT, because the operator text is built from it: rc 2 is what
+# `orch-loop.sh` prints "could not be judged" for and what `harness-up` answers with "rm -f the record".
+LKA="$T/lka"; mkdir -p "$LKA"
+printf '999999\n' > "$LKA/.orch.lock"     # a DEAD holder, so this instance judges it reclaimable
+( . "$MOD"
+  _w=0
+  orc_lock_write() {
+    _w=$((_w+1))
+    # call 1 is the ACQUIRE attempt (the record exists, so it fails like the real one); call 2 is the
+    # reclaim's create, which now arrives AFTER a third starter has already taken the path.
+    if [ "$_w" -ge 2 ]; then printf '333\n' > "$1"; fi
+    ( set -o noclobber; printf '%s\n' "$$" > "$1" ) 2>/dev/null
+  }
+  orc_singleton_acquire "$LKA/.orch.lock"; printf 'rc=%s|%s\n' "$?" "$ORC_SINGLETON_WHY" ) > "$T/acq-raced" 2>&1
+case "$(cat "$T/acq-raced")" in
+  rc=1\|*333*) ck "§2 a reclaim that loses the create race makes the singleton HELD (rc 1), naming the winner" 0 ;;
+  *)           ck "§2 a reclaim that lost the create race returned '$(cat "$T/acq-raced" | tr '\n' ' ')' — wanted rc 1 naming 333" 1 ;;
+esac
+case "$(cat "$T/acq-raced")" in
+  *"could not be judged"*|*"could not be replaced"*)
+    ck "§2 …and its refusal does NOT assert an unjudgeable record (the destructive-advice text)" 1 ;;
+  *) ck "§2 …and its refusal does not assert an unjudgeable record" 0 ;;
+esac
+
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 hdr "§3 FAIL CLOSED — an unjudgeable record is a refusal, not a guess"
 # The age is unreadable when `ps` cannot answer. `PS_BIN` is the seam the fleet's own suites use

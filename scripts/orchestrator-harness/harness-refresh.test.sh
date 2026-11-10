@@ -392,6 +392,43 @@ case "$R2" in
 esac
 reap "$LANEPID2"
 
+# ⛔ A22d: A STATE DIR ABOVE THE HARNESS ROOT — THE PREFIX ORDER BUG (fresh review of #3846, P3).
+# A22c covers `$O_WORK` as a SIBLING. The arm that was broken is the NESTED arrangement: `$O` an ANCESTOR
+# of `$O_WORK` (`O=/x`, `O_WORK=/x/harness`), which is what an instance whose state dir sits above its
+# trees actually gets. `in_flight_pids` tested the `$O/` prefix FIRST, so a live lane token
+# `/x/harness/lane.sh` yielded `harness/lane.sh`, the "a subdirectory is not a lane script" rule dropped
+# it, and `$O_WORK` was never tried — `lanes=0` with lanes running. Reproduced with this file's own awk
+# at the reviewing head: `O=/x O_WORK=/x/harness` -> no lane counted, while the mirrored arrangement
+# (`O=/x/harness/state`) counted. The fix takes the DEEPEST matching root, so both work and every
+# arrangement that works today is unchanged.
+_CASE=$((_CASE+1)); echo "=== A22d: O is an ANCESTOR of O_WORK -> a work-root lane is still counted ==="
+D="$T/a38d"; mkdir -p "$D/pin" "$D/O/work"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+printf '%s\n' "$$" > "$D/O/.orch.lock"     # a live controller, as on a real cell
+LANEPID="$(mk_fake_lane "$D/O/work")"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" O_WORK="$D/O/work" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" \
+      --ref origin/main --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+case "$R" in
+  *lanes=1*) ok "a work-root lane under a state dir ABOVE it is COUNTED (lanes=1)" ;;
+  *lanes=0*) bad "a live WORK-root lane read as lanes=0 when \$O is an ANCESTOR of \$O_WORK — the first matching prefix wins, its tail carries a slash, and \$O_WORK is never tried, so \$O can be re-seeded under the lane" ;;
+  *)         bad "no lane count in the record: $R" ;;
+esac
+lane_alive "$LANEPID" && ok "…and the nested work-root lane was not signalled" || bad "the run killed the nested work-root lane $LANEPID"
+reap "$LANEPID"
+# NON-VACUITY: the SAME nested shape with `O_WORK` unset must NOT be counted, so the arm above really
+# resolves the deeper root rather than matching any `*.sh` token.
+D2="$T/a38d2"; mkdir -p "$D2/pin" "$D2/O/work"; PIN2="$D2/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN2"
+printf '%s\n' "$$" > "$D2/O/.orch.lock"
+LANEPID2="$(mk_fake_lane "$D2/O/work")"
+MAT2="$(mk_stub_mat "$D2")"
+R2="$(O="$D2/O" HARNESS_MATERIALISER="$MAT2" bash "$RR" --no-fetch --repo "$T/src" \
+       --ref origin/main --pin "$PIN2" --self "$(harness_at "$C1")" 2>&1)"
+case "$R2" in
+  *lanes=0*) ok "control: with O_WORK unset that nested lane is NOT counted — the arm above resolves the deeper root" ;;
+  *)         bad "control: a nested work-root lane was counted with O_WORK unset, so the arm above cannot discriminate: $R2" ;;
+esac
+reap "$LANEPID2"
+
 _CASE=$((_CASE+1)); echo "=== A23: the DESTRUCTIVE advance (--re-seed) under a mid-turn lane -> REFUSES 26, names what blocks it ==="
 D="$T/a23"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 printf '%s\n' "$$" > "$D/O/.orch.lock"
