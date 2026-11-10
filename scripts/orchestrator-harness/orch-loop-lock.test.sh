@@ -279,17 +279,24 @@ _TRAP_SIGS_AWK='
         # action, took TERM as the list, and left all three replaced-releaser arms GREEN at
         # PASS=182 FAIL=0 while the lock was never removed. The comment above claimed the span was
         # skipped to its CLOSING quote; it skipped to the first field ending with a quote. Count the
-        # quotes instead and stop when the count is EVEN, i.e. outside the span again: inside single
-        # quotes a backslash is literal, so a splice keeps the parity right, while inside double quotes
-        # a backslash-escaped quote does NOT close the span, so the two contexts are counted the way the
-        # shell reads them. No quote character appears in this comment: it sits inside the single-quoted
-        # awk program, and one apostrophe here silently ends it.)
+        # quotes instead and stop when the count is EVEN, i.e. outside the span again. A backslash-escaped
+        # quote is LITERAL when it is met OUTSIDE the span, which is what makes an apostrophe splice work:
+        # the splice spells close-quote, escaped apostrophe, open-quote, and counting all three inverts
+        # the parity for good (fresh review of #3865 at 8952f89c8, P2 — MEASURED both ways: an action
+        # containing a splice parsed to TERM and left every replaced-releaser arm GREEN, and a CORRECT
+        # releaser containing a splice parsed UNKNOWN and red three arms. Both were regressions from the
+        # skip this commit introduced, and the earlier note claiming a splice "keeps the parity right"
+        # was the false claim that hid them). Inside the span a backslash is literal for single quotes
+        # and an escape for double ones, so quotes are counted the way the shell reads them. No quote
+        # character appears in this comment: it sits inside the single-quoted awk program.)
         cnt = 0
         while (i <= NF) {
           fld = $i; k = 0
           for (p = 1; p <= length(fld); p++) {
             if (substr(fld, p, 1) != qq) continue
-            if (qq == "\"" && p > 1 && substr(fld, p - 1, 1) == "\\") continue
+            esc = (p > 1 && substr(fld, p - 1, 1) == "\\")
+            if (qq == "\"") { if (esc) continue }
+            else { if (esc && (cnt + k) % 2 == 0) continue }
             k++
           }
           cnt += k
@@ -670,6 +677,15 @@ trap 'log TERM; exit' EXIT" \
 _exitrow 2 "$_REL
 trap 'case \"\$1\" in HUP) log ;; esac; cleanup' EXIT" \
   "…and a 'case' arm inside the ACTION cannot hide it either — was a false PASS"
+# ⛔ AND AN APOSTROPHE SPLICE INSIDE THE ACTION MUST NOT INVERT THE QUOTE PARITY (fresh review of #3865 at
+# 8952f89c8, P2 — MEASURED both ways). A splice spells close-quote, backslash, apostrophe, open-quote;
+# counting its three apostrophes as three quotes left the parity odd for the rest of the line, so the span
+# never closed: with a signal word after it the parse returned TERM and EVERY replaced-releaser arm stayed
+# green, and a CORRECT releaser that merely contained a splice parsed UNKNOWN and red three arms. An
+# escaped quote met OUTSIDE the span is literal and does not count.)
+_exitrow 2 "$_REL
+trap 'log \"it'\\''s\"; TERM; cleanup; exit 0' EXIT" \
+  "a registration whose ACTION carries a SPLICE still reads EXIT — was a false PASS"
 _exitrow 1 "$_REL
 # trap 'true' EXIT" \
   "a COMMENTED-OUT registration is not a registration (no false RED on a correct tree)"
@@ -687,8 +703,15 @@ _exitrow 1 "$_REL
 # would have added a row that is red on a correct tree, which is the false-correction hazard the review
 # record exists to avoid. That spelling IS a real hole, and it is witnessed by the `_acctrow` rows below
 # (pre-fix `total=1, per-line=1` = AGREE beside a replaced releaser; post-fix `total=2, per-line=1` =
-# disagree = RED), which is the arm whose job it is. The control is the row above: a REAL comment is still
-# stripped, so neither new row can pass by the stripper merely being disabled.
+# disagree = RED), which is the arm whose job it is. ⛔ THE ROW ABOVE IS NOT THE STRIPPER CONTROL, AND
+# SAYING IT WAS WAS A FALSE CLAIM (fresh review of #3865 at 8952f89c8, P3 — MEASURED: with the comment
+# stripper disabled entirely (`_strip_comments` -> `cat`) the commented-out row stays GREEN and the single
+# row that reds is the `_traprow` "comment naming a SIGNAL" row, because THAT one needs the strip to stop
+# a trailing comment's signal word from reaching the pin. The commented-out row is answered by the
+# `^[[:space:]]*` LINE ANCHOR: `_TRAP_CMD_RE` starts with an optional assignment prefix and the literal
+# `trap`, so a line beginning with `#` can never match however the stripper behaves. It is kept for what
+# it actually guards — a future anchor change that let a `#` line through — and is labelled as the
+# anchor's row rather than as the stripper's control.
 _exitrow 2 "$_REL
 trap 'echo \"#tag\"' EXIT" \
   "a '#' inside a QUOTED STRING does not truncate the line — was a false PASS"
@@ -745,6 +768,8 @@ _exitrow 2 "$_REL
 # a second registration that way reds the ONLY-EXIT arm, and on ONE line the accounting scan sees it.)
 _traprow 0 "x=\"a b\" trap 'rm -f \"\$LOCKF\"' EXIT" \
   "a QUOTED-ASSIGNMENT-PREFIXED releaser PASSES (a quoted value is a word too)"
+_traprow 0 "trap 'rm -f \"\$LOCKF\"; echo it'\\''s' EXIT" \
+  "a releaser whose ACTION carries a SPLICE PASSES (a splice must not read as UNKNOWN — that was a false RED)"
 _exitrow 2 "$_REL
 x=\"a b\" trap 'true' EXIT" \
   "a QUOTED-ASSIGNMENT-PREFIXED second registration REPLACES the releaser — was a false PASS"
