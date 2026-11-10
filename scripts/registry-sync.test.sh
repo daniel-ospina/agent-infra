@@ -1556,6 +1556,13 @@ if [ -s "$T/t.claim" ] && [ -s "$T/t.nest" ]; then
 else
   bad "§30t (premise) the interleaving did not happen — the arm proves nothing"
 fi
+# ⛔ UNPINNED, declared: `claim_restore` carries the IDENTICAL nesting guard (registry-sync.sh
+# `claim_restore`), and deleting only THAT clause leaves the suite green — review round 14 measured it
+# (PASS=279/0) and built a discriminating construction (re-create the name immediately before
+# `claim_restore`'s `mv`, count `mkdir` attempts on the lock name: 1 with the guard, 50 without). It is
+# not pinned here because two attempts at a three-actor `mv` shim in this harness produced arms that were
+# themselves vacuous, and a flaky or vacuous arm is worse than a declared gap. The GUARD ITSELF is shipped
+# and reviewed; only this one test is missing. `claim_stale`'s copy of the same guard IS pinned (§30t).
 assert_not_contains "$NT_OUT" "restored, not removed" "§30t a NESTED put-back is not reported as a restore"
 assert_contains "$NT_OUT" "HELD for restore" "§30t ...it is HELD for restore instead"
 assert_absent "$NT_BOX" "$NT_BOX/$LCK_KEY.json" "§30t ...and the run does not write without the lock"
@@ -1688,10 +1695,12 @@ printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"dani
 mini_rs "$UR_SEED" push >/dev/null 2>&1
 UR_BOX="$MINI_ROOT/box"; mkdir -p "$UR_BOX"
 SHIM_M="$T/shim-m"; mkdir -p "$SHIM_M"; REAL_MKDIR="$(command -v mkdir)"
+: > "$T/m.called"
 cat > "$SHIM_M/mkdir" <<EOS
 #!/bin/sh
 case "\$1" in
   */.registry-sync.lock)
+    printf 'x' > "$T/m.called"          # so the premise cannot pass on a shim that failed outright
     "$REAL_MKDIR" "\$@" || exit \$?
     chmod 500 "\$1"
     exit 0 ;;
@@ -1700,8 +1709,10 @@ exec "$REAL_MKDIR" "\$@"
 EOS
 chmod +x "$SHIM_M/mkdir"
 UR_OUT="$(PATH="$SHIM_M:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$UR_BOX" --remote origin --timeout 30 2>&1)"; UR_RC=$?
-if [ ! -e "$UR_BOX/$LCK_KEY.json" ]; then
-  ok "§30m (premise) nothing was written, so the run really refused to enter"
+if [ ! -s "$T/m.called" ]; then
+  bad "§30m (premise) the mkdir shim never fired — the arm would be vacuously green in BOTH builds"
+elif [ ! -e "$UR_BOX/$LCK_KEY.json" ]; then
+  ok "§30m (premise) the shim fired (the pid write really was blocked) AND nothing was written"
 else
   bad "§30m (premise) the run wrote a record — the shim did not block the pid write"
 fi
