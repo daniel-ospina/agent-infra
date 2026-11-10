@@ -67,6 +67,14 @@ printf 'argv: %s\n' "$*" >> "$FIXTURE_ARGV"
 printf 'rail: %s\n' "${RAIL_RUN_RAIL:-<unset>}" >> "$FIXTURE_ARGV"
 case "${1:-}" in
   start)
+    # FIXTURE_PRELUDE=1 puts a stderr-ish line BEFORE the start line (the parse must not depend on NR==1)
+    [ "${FIXTURE_PRELUDE:-0}" = "1" ] && printf 'rail-run: ⚠ a warning printed before the start line\n'
+    # FIXTURE_START_RUN_THEN_FAIL=1 emits a run line and STILL fails — the arm that pins "write the run
+    # id only on success" (a failure path that prints no run line cannot exercise that gate at all).
+    if [ "${FIXTURE_START_RUN_THEN_FAIL:-0}" = "1" ]; then
+      printf 'started pr=%s run=run-ZZZ pid=4242 session=own repo=fake/repo\n' "${2:-}"
+      exit "${FIXTURE_START_RC:-5}"
+    fi
     [ "${FIXTURE_START_RC:-0}" = "0" ] || { printf 'rail-run: ✗ refused to start\n' >&2; exit "${FIXTURE_START_RC}"; }
     printf 'started pr=%s run=run-1 pid=4242 session=own repo=fake/repo\n' "${2:-}"
     printf '  log:    %s\n' "$FIXTURE_STATUS"
@@ -137,18 +145,48 @@ assert_contains "$ARGV" 'argv: start 42 --repo fake/repo --dry-run' "start forwa
 assert_contains "$ARGV" "rail: $LAND_DIR/scripts/atomic-land.sh" "start points rail-run at atomic-land.sh (the full landing unit)"
 assert_eq 'run-1' "$(cat "$LAND_LOG_DIR/rail-42.run" 2>/dev/null)" "start records WHICH run it created"
 
-# a caller-supplied --repo comes AFTER ours, so rail-run's left-to-right scan lets it win
+# ⛔ ONE IDENTITY: a caller-supplied --repo is REFUSED, not forwarded (fresh-review finding F2 on
+# #3923). Forwarded, it keys rail-run's run state under another slug while `wait`/`poll` — which take
+# no --repo — poll LAND_REPO, so a run this CLI started answered `no-run`. Refusal is also the
+# cheaper property to pin: there is no second spelling to keep in sync.
 : > "$FIXTURE_ARGV"
 out="$(rb start 7 --repo other/repo)"; rc=$?
-assert_rc 0 "$rc" "start accepts a caller-supplied --repo"
-assert_contains "$(cat "$FIXTURE_ARGV")" 'argv: start 7 --repo fake/repo --repo other/repo' \
-  "the caller's --repo is forwarded after the shim's (so it wins)"
+assert_rc 2 "$rc" "start REFUSES a caller-supplied --repo (identity is LAND_REPO alone)"
+assert_contains "$out" 'LAND_REPO' "…and the refusal names LAND_REPO as the knob"
+assert_eq '' "$(cat "$FIXTURE_ARGV")" "…and nothing was launched (the refusal precedes the spawn)"
+out="$(rb start 7 --repo=other/repo)"; rc=$?
+assert_rc 2 "$rc" "the --repo=VALUE spelling is refused too"
 
 # a failed launch propagates rail-run's code and records no run
 : > "$FIXTURE_ARGV"
 out="$(env FIXTURE_START_RC=3 bash "$RB" start 8 2>&1)"; rc=$?
 assert_rc 3 "$rc" "a refused launch propagates rail-run's exit code (3 = a live run holds the PR)"
 assert_eq '' "$(cat "$LAND_LOG_DIR/rail-8.run" 2>/dev/null)" "a failed launch records no run id"
+out="$(env FIXTURE_START_RC=5 bash "$RB" start 8 2>&1)"; rc=$?
+assert_rc 5 "$rc" "rail-run's 'launch did not start' (5) is propagated, not remapped"
+
+# ⛔ BOTH HALVES OF "a failed launch leaves no run id" ARE PINNED (fresh-review finding F1 on #3923:
+# the earlier arm asserted a file that could not have existed on either path, so no mutant reddened it).
+# Half 1 — a PREVIOUS run's id must be cleared, not merely not-overwritten.
+printf 'run-OLD\n' > "$LAND_LOG_DIR/rail-9.run"
+out="$(env FIXTURE_START_RC=3 bash "$RB" start 9 2>&1)"; rc=$?
+assert_rc 3 "$rc" "a refused start on a PR with a recorded run exits with rail-run's code"
+assert_eq '' "$(cat "$LAND_LOG_DIR/rail-9.run" 2>/dev/null)" \
+  "a refused start CLEARS the earlier run's id (so wait cannot report that run under this call)"
+# Half 2 — a failure path that DOES print a run line must still record nothing.
+out="$(env FIXTURE_START_RUN_THEN_FAIL=1 FIXTURE_START_RC=5 bash "$RB" start 10 2>&1)"; rc=$?
+assert_rc 5 "$rc" "a launch that printed a run line and still failed propagates its code"
+assert_contains "$out" 'started pr=10 run=run-ZZZ' "…the run line really was printed (the arm can discriminate)"
+assert_eq '' "$(cat "$LAND_LOG_DIR/rail-10.run" 2>/dev/null)" \
+  "…and its run id is NOT recorded (the rc gate is what pins it)"
+
+# parse_run_id does not depend on the start line being FIRST in the merged 2>&1 stream
+: > "$FIXTURE_ARGV"
+out="$(env FIXTURE_PRELUDE=1 bash "$RB" start 11 2>&1)"; rc=$?
+assert_rc 0 "$rc" "a prelude line before the start line does not break start"
+assert_eq 'run-1' "$(cat "$LAND_LOG_DIR/rail-11.run" 2>/dev/null)" \
+  "the run id is parsed from the start LINE, not from line 1 of the stream"
+
 
 # ── 4. wait: the recommendation is a RENAME of rail-run's verdict ─────────────
 # The arm helper: <pr> <rail-run rc> <state row>

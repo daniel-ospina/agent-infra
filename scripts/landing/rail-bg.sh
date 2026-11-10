@@ -47,10 +47,15 @@
 #                  `wait` polls its own run and never a newer one (default: $TMPDIR/pi-landing-lane)
 #   RAIL_RUN_SH    the rail-run.sh to delegate to (default: the one beside this script's repo)
 #
-# Exit: 0 = landed · 2 = usage or environment error · 3 = a live run already holds <pr> · otherwise
-#       rail-run's own state code (10 running · 20 refused · 21 killed · 22 gone-without-verdict ·
-#       23 exited-zero · 24 no-run · 25 unknown). Read the printed CONFIRMED/RECOMMEND lines; the
-#       exit code IS rail-run's, unmodified.
+# Exit: 0 = landed · 2 = usage or environment error · 3 = a live run already holds <pr> · 5 = the
+#       launch did not start (rail-run could not record a pid) · 78 = rail-run's identity library is
+#       missing (it refuses to guess liveness) · otherwise rail-run's own state code (10 running ·
+#       20 refused · 21 killed · 22 gone-without-verdict · 23 exited-zero · 24 no-run · 25 unknown).
+#       Read the printed CONFIRMED/RECOMMEND lines; the exit code IS rail-run's, unmodified.
+#
+#   The repo identity is LAND_REPO and nothing else: `start` refuses a `--repo` argument, because the
+#   identity keys rail-run's run state and `wait`/`poll` take no `--repo` — so two ways to spell it
+#   would let `start` and `wait` disagree about which run is being polled.
 set -uo pipefail
 
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,10 +97,12 @@ resolve_repo() {
 run_file() { printf '%s/rail-%s.run' "$LAND_LOG_DIR" "$1"; }
 recorded_run() { local f; f="$(run_file "$1")"; [ -s "$f" ] && tr -d '\r\n' < "$f" 2>/dev/null || true; }
 
-# The run id from rail-run's `started pr=<n> run=<id> …` line. Absent is ABSENT — an unparsed id
-# leaves `wait` on rail-run's documented "newest run" behaviour rather than inventing one.
+# The run id from rail-run's `started pr=<n> run=<id> …` line. Scanned over the WHOLE stream, not
+# `NR==1`: rail-run's output is merged with stderr, so a warning printed before the start line would
+# otherwise cost the id (fresh-review note on #3923). Absent stays ABSENT — an unparsed id leaves
+# `wait` on rail-run's documented "newest run" behaviour rather than inventing one.
 parse_run_id() {
-  printf '%s\n' "$1" | awk 'NR==1{for(i=1;i<=NF;i++){if(index($i,"run=")==1){print substr($i,5); exit}}}'
+  printf '%s\n' "$1" | awk '/^started pr=/{for(i=1;i<=NF;i++){if(index($i,"run=")==1){print substr($i,5); exit}}}'
 }
 
 # rr_status <pr> — one `rail-run.sh status` call. Prints rail-run's output verbatim on stdout; the
@@ -195,19 +202,32 @@ cmd_start() {
   local pr="${1:-}"; shift || true
   [ -n "$pr" ] || die_usage "start needs a PR number"
   is_numeric "$pr" || die_usage "PR must be numeric (got '$pr')"
+  # ⛔ ONE IDENTITY, AND THIS CLI OWNS IT. rail-run keys its run state on the `--repo` it is given, so
+  # a caller-supplied `--repo` here would key the run under THAT slug while `wait`/`poll` — which have
+  # no `--repo` argument — resolve `LAND_REPO` and poll a different key, answering `no-run` for a run
+  # this CLI just started (fresh-review finding F2 on #3923). Refusing the override keeps identity in
+  # one place instead of recording a second copy of it.
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --) break ;;
+      --repo|--repo=*)
+        die_usage "start does not take --repo: this CLI's identity comes from LAND_REPO (and keys the run state, so start and wait cannot disagree). Set LAND_REPO=<owner/repo> instead" ;;
+    esac
+  done
   [ -f "$RAIL" ] || die "no rail at $RAIL — set LAND_DIR to the checkout holding scripts/atomic-land.sh, or LAND_RAIL"
   [ -f "$RAIL_RUN" ] || die "no rail-run.sh at $RAIL_RUN — set RAIL_RUN_SH to the fleet's scripts/rail-run.sh"
   REPO="$(resolve_repo)" || die "cannot tell which repository PR $pr belongs to — set LAND_REPO owner/repo (gh repo view in $LAND_DIR returned nothing)"
   mkdir -p "$LAND_LOG_DIR" || die "cannot create $LAND_LOG_DIR"
 
   local out rc runid
-  # `--repo` FIRST, so a caller that passes its own later value wins (rail-run scans left to right and
-  # forwards every pair). RAIL_RUN_RAIL points rail-run at the FULL landing unit #1549 asks for.
+  # RAIL_RUN_RAIL points rail-run at the FULL landing unit #1549 asks for. `--repo "$REPO"` is the ONE
+  # identity (see the refusal above), so `start` and `wait` key the same run by construction.
   out="$(RAIL_RUN_RAIL="$RAIL" bash "$RAIL_RUN" start "$pr" --repo "$REPO" "$@" 2>&1)"; rc=$?
   printf '%s\n' "$out"
   # A launch that did not happen must not leave an EARLIER run's id bound to this PR: `wait` would
-  # then poll that run and report it under this call's name. Clear it first, write it only on success
-  # (fresh-review note 3 on #3923).
+  # then poll that run and report it under this call's name. Clear it FIRST, write it only on success
+  # (fresh-review findings on #3923; both halves are pinned by the suite).
   rm -f "$(run_file "$pr")"
   [ "$rc" -eq 0 ] || return "$rc"
   runid="$(parse_run_id "$out")"
