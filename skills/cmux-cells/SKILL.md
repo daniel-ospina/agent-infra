@@ -290,8 +290,11 @@ diagnose a 74 as a parse problem) — **env-local, NOT box-local, and the gate n
 lane's gh IS credentialed — fix that box's chain; (b) **no credential at all resolved for the lane**, because nothing set
 `GH_CONFIG_DIR` while `HOME` is redirected to the cell home (agent-infra#2509) — measured on `pi-cell-4` and `pi-cell-5`,
 **byte-identical refusals**, so **a re-dispatch to another healthy box does NOT clear it**: every cell redirects `HOME` the
-same way. Since #2509 `spawn-gate.sh` resolves the config dir BEFORE the gate (`gh-auth.sh`: `GH_CONFIG_DIR`, then
-`$XDG_CONFIG_HOME/gh`, then the lane's `keys.env`, then the ACCOUNT home's `~/.config/gh`, per gh's own documented order) and
+same way. Since #2509 `spawn-gate.sh` resolves the config dir BEFORE the gate, and `gh-auth.sh` takes ONE order — NOT gh's
+own, because two of its six stops are sources gh does not have: the TOKEN names first (they outrank every directory),
+then ambient `GH_CONFIG_DIR`, then ambient `$XDG_CONFIG_HOME/gh`, then the lane's `keys.env`, then the lane HOME's
+`~/.config/gh` (gh's own default — and `home-xdg`, exported, when XDG is set so gh would not read it), then the ACCOUNT
+home's `~/.config/gh` — and
 the refusal prints the CREDENTIAL remedy instead of the ratio one when that is the cause — do not act on `land/fix the open
 PRs` for it. If it still refuses, read the lane's `[gh-auth] state=…` line against `gh auth status` under the lane's `HOME`. A P0-blocker or a base-red repair is **exempt by evidence** and dispatches under the hold — **when the exemption read
 itself succeeds**; on the rc=2 arm it fails with the same gh chain, so a P0 *is* held until the chain is fixed (the

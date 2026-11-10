@@ -388,6 +388,14 @@ grep -q 'THIS IS NOT THE LANDING RATIO: no gh credential for the lane' "$TMP/b2f
 ck "B2f2 …and the REFUSAL names the credential with the dirs it checked (the NOTE prints the same cause, so the prefix is what makes this the refusal's)" $rc
 grep -q '\[gh-auth\] state=none' "$TMP/b2f.log"; rc=$?
 ck "B2f3 …and the lane log carries state=none, so the land-backlog line is not the only evidence" $rc
+# ⛔ AND THE NOTE'S OWN CREDENTIAL-CAUSE BRANCH NEEDS AN ARM OF ITS OWN, or its "⛔ AND IT SEPARATES THE
+# TWO CAUSES IT CAN SEE" is a claim with no assertion: `B6b`/`B7b` only assert the `EXEMPTION-UNREADABLE`
+# token, which BOTH NOTE arms print. Measured before this arm existed: deleting the NOTE's
+# `cause="$(gh_auth_cause …)"` (so the branch can never fire) left the suite at 75/0 with nothing red.
+# This is the shape that reaches it — the evidence read fails AND no credential resolves, so `gh_auth_cause`
+# is non-empty and the NOTE must carry it, while B2f2 pins the REFUSAL carrying the same cause.
+grep -q 'read FAILED (no gh credential for the lane' "$TMP/b2f.log"; rc=$?   # B2f4
+ck "B2f4 …and the NOTE interpolates the CAUSE it read, not just the verdict token (deleting the NOTE's gh_auth_cause call reddens exactly this)" $rc
 
 # B2g: a BLANK-BUT-SET GH_TOKEN, with the account home HOLDING a store — the exact shape pre-fix printed
 # `state=account at …`, exported an inert config dir, and then asserted "the lane's gh IS credentialed" over
