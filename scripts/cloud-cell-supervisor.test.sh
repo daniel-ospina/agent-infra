@@ -1443,13 +1443,25 @@ sleep 0.3
 printf '%s\n' "$_PIN_LIVE" > "$P/o/.orch.lock"
 # Point the box BACK at the pre-(e) pin and hand-edit $O, so "the pin advanced" and "$O was not re-seeded"
 # are both observable rather than implied.
-PH="$P/wtold/scripts/orchestrator-harness"
+# ⛔ ASSIGNING `PH` IS NOT ENOUGH — THE RECORD MUST BE MOVED TOO, OR THE ADVANCE ARM IS VACUOUS
+# (independent review of this PR, P1, and it was right). `prov` passes `HARNESS="$PH"` but the NEXT
+# `apply` re-resolves the harness from `$HARNESS_PIN_FILE`, which §(e)/(e2) left naming
+# `pin/<the tip>`: the post-call record would then already satisfy the "advanced" pattern and the arm
+# would pass over a `--pin-only` that did NOTHING. The value written here is also the exact pi-cell-3
+# shape — a record naming a pin directory that does NOT exist — so the arm exercises the repair, not a
+# no-op.
+PH="$P/pin/000000000000/scripts/orchestrator-harness"
+printf '%s\n' "$PH" > "$P/home/.harness-path"
+_REC_BEFORE="$(cat "$P/home/.harness-path" 2>/dev/null)"
 printf '\n# hand edit a pin-only would erase\n' >> "$P/o/orch-loop.sh"
 prov apply --pin-only
 [ "$PROV_RC" -eq 0 ] \
   && ok "apply --pin-only is ALLOWED on a cell whose controller is live (the no-skew advance is reachable)" \
   || bad "apply --pin-only was REFUSED with a live controller — the guard still gates the pin-only path (rc=$PROV_RC): $PROV_OUT"
 _PIN_AFTER="$(cat "$P/home/.harness-path" 2>/dev/null)"
+[ "$_PIN_AFTER" != "$_REC_BEFORE" ] \
+  && ok "…and it REWROTE the pin record (fixture check: it named a non-existent pin before the call)" \
+  || bad "the pin record still names '$_REC_BEFORE' — `--pin-only` exited 0 without advancing anything (the reachable-but-inert mutant)"
 case "$_PIN_AFTER" in
   "$P/pin/$(printf '%s' "$WANT" | cut -c1-12)"/*) ok "…and the pin really advanced to origin/main under the live controller (the measured pi-cell-3 repair)" ;;
   *) bad "--pin-only recorded '$_PIN_AFTER' instead of the pin for $WANT — the exempted path did nothing: $PROV_OUT" ;;
