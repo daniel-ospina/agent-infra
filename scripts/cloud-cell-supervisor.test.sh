@@ -3106,13 +3106,16 @@ qverb start "$Q/agent-repo" "$S1" daniel-ospina/tortoise
 # `qverb start` above is FIXTURE for the box-as-found row, which is indicator (a)'s assertion — and
 # that row reddens when the gate is deleted. The three rows that used to grade `start`'s own refusal
 # (rc≠0, "start's refusal IS the queue gate", and "never claims 'controller started'"), plus the
-# earlier "the refused start seeded nothing into $O" row, were all DELETED as INERT per that rule: no
-# mutation of this diff can redden any of them, because the diff changes no code `cmd_start` executes.
-# `start` calls `assert_queue_target` with NO argument, so `local verb=""` leaves its verdict and
-# every message byte-identical pre- and post-fix; it still refuses at its own #1901 gate before
-# `harness_apply`; and even with `stop`'s gate deleted it dies in the leftover-session branch, never
-# at the launch. MEASURED, not reasoned: the suite run against `origin/main`'s supervisor prints these
-# rows ✅ while the box-as-found row goes ❌. Pinning `start`'s own ordering is a real property, but it
+# earlier "the refused start seeded nothing into $O" row, were all DELETED as INERT per that rule: they
+# could not discriminate this change. ⛔ THE GROUND IS DISCRIMINATION, NOT REACHABILITY — `start` DOES run
+# code this diff touches (`assert_queue_target`, which now carries a stop tail), so what this diff
+# changes for `start` is the WORDS of its refusal (the MERGE-INERT label, the one-line fix), never its
+# verdict. A row pinning the verdict therefore cannot redden on any mutation of this diff, and a row
+# pinning the OLD words would redden on the fix ITSELF — neither separates a mutant from the fix.
+# `start` calls `assert_queue_target` with NO argument, so `local verb=""` appends nothing; it still
+# refuses at its own #1901 gate before `harness_apply`; and even with `stop`'s gate deleted it dies in
+# the leftover-session branch, never at the launch. MEASURED, not reasoned: the suite run against
+# `origin/main`'s supervisor prints these rows ✅ while the box-as-found row goes ❌. Pinning `start`'s own ordering is a real property, but it
 # needs its own `start`-side arm whose mutant reaches `harness_apply` — a different diff.
 
 # (3) NON-VACUITY, the other direction: `stop` must NOT refuse a cell it has nothing to lose on, and
@@ -3319,7 +3322,10 @@ qverb stop "$Q/agent-repo" "$S4J" daniel-ospina/tortoise
 #  STOPPED (the verb-aware tail), and the marker survives; the control removes GH_REPO and the same state
 #  dir then stops. ⛔ ITS OWN ENV FILE, DELIBERATELY: the shared `$Q/keys.env` is written by earlier arms,
 #  so a control that merely stopped exporting GH_REPO could still inherit one from the file — measured as a
-#  "control" that refused for the very reason it was meant to exclude.
+#  "control" that refused for the very reason it was meant to exclude. The file is also NEVER CREATED,
+#  which makes this fixture the AMBIENT shape the refusal's own caveat covers (an `export GH_REPO` in the
+#  shell, not a line in keys.env): if the tail only said "remove the line from $ENV_FILE", the operator here
+#  would be sent to edit a file that does not exist, which is the dead end the OR clauses already avoid.
 S4K="$Q/st2093-ghrepo"; rm -rf "$S4K"; mkdir -p "$S4K/o/state/roles"; : > "$S4K/o/state/roles/.desired"
 ghstop() { env -u OR Q_STATE="$S4K" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys-3j.env" \
              SESSION="ai2093gh-$$" O="$S4K/o" REPO="$Q/tortoise-repo" HARNESS="$Q/harness" HARNESS_REPO="$AI" \
@@ -3335,6 +3341,10 @@ esac
 case "$Q_OUT" in
   *"NOTHING WAS STOPPED"*) ok "(3j) …and the refusal says NOTHING WAS STOPPED and names the --force escape (the stop tail reaches this gate too)" ;;
   *) bad "(3j) the GH_REPO refusal carries no stop tail, so an operator who meant to stop cannot tell nothing was stopped or how to force it: $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"drop an ambient"*) ok "(3j) …and the tail names the ambient case too (this fixture's export is in the environment, and its keys file does not exist)" ;;
+  *) bad "(3j) the tail says only 'remove the line from \`\$ENV_FILE\`', which for an ambient export sends the operator to a file that does not carry it: $Q_OUT" ;;
 esac
 [ -f "$S4K/o/state/roles/.desired" ] \
   && ok "(3j) …and the marker is still there (the refusal was ahead of the first irreversible act)" \

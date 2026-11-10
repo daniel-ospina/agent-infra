@@ -85,16 +85,22 @@
 # have stopped the controller and then refused to start, leaving the box STOPPED with its harness
 # unrefreshed — strictly worse than the stale sha it was found on, which is exactly why it was left
 # running on an 8-day-old commit instead of repaired (§3.2 of docs/ops/fleet-harness-baseline.md).
-# So `stop` runs the SAME gate before its first irreversible act, and says so. The gate's predicate is
-# not re-implemented: `stop` calls `assert_queue_target` itself, so the verbs cannot drift into the
-# #1745 shape (one verb blesses what the next refuses).
+# So `stop` runs the SAME gates before its first irreversible act, and says so. The predicates are not
+# re-implemented: `stop` calls `assert_queue_target` and `assert_gh_repo_conformance` themselves, so the
+# verbs cannot drift into the #1745 shape (one verb blesses what the next refuses). ⛔ BOTH, because
+# `start` refuses on TWO wrong-pair configs — the queue/checkout mismatch (#1901) and a global `GH_REPO`
+# that names another repo (#2235) — and a pre-flight that ran only the first stopped a box the second
+# then refused to start (review P2).
 # ⛔ `stop` STAYS ANSWERABLE, which is the whole reason the refusal is narrow. It refuses only when
-# (a) the pair is not usable AND (b) this state dir has something a stop would actually END **or the
+# (a) a wrong-pair config exists — either gate, so "not usable" is NOT the whole condition: a usable
+# pair with a wrong `GH_REPO` refuses too — AND (b) this state dir has something a stop would actually
+# END **or the
 # process-table read cannot be made** (the fail-closed branch: a read that fails counts as running).
 # Stopping a cell with NONE of those legs loses nothing; ⛔ a cell that is already DOWN but still carries
 # `state/roles/.desired` is not that case — the marker IS one of the legs, so it needs `--force` too.
 # An operator who means to stop a misconfigured box anyway types `stop --force` — the refusal names that
-# flag. `status` is unchanged: it reports the pair and never refuses.
+# flag. `status` never refuses and is unchanged in that sense; its pair lines were only reworded to say
+# what `stop` does with each state.
 # ⛔ The gate is NOT weakened by any of this: `check`/`start` still refuse the pair outright.
 #
 # Prereqs on the cell (see cloud-cell-bringup.sh --check):
@@ -1700,7 +1706,7 @@ assert_gh_repo_conformance() {
   local want="${QUEUE_DERIVED:-$QUEUE_REPO}" have got got_src _h="" _whost=""
   got_src="the checkout's origin remote"
   if [ -z "$want" ]; then
-    die "GH_REPO is set ($GH_REPO) but this cell's CHECKOUT repo could not be read, so it cannot be verified against the tree the controller would grade ('git -C $REPO remote get-url origin' => '${QUEUE_REMOTE:-<none>}'). A global GH_REPO is what produced the #2235 fail-open — gh gives it precedence over the checkout for every call that does not pass --repo, so the rail graded daniel-ospina/tortoise PRs while reporting on agent-infra ones. Remove the GH_REPO line from $ENV_FILE (it is per-invocation state, not cell state); the controller resolves its repo from the checkout.${verb:+ $(queue_refusal_suffix "$verb" "Remove the GH_REPO line from \`$ENV_FILE\`")}"
+    die "GH_REPO is set ($GH_REPO) but this cell's CHECKOUT repo could not be read, so it cannot be verified against the tree the controller would grade ('git -C $REPO remote get-url origin' => '${QUEUE_REMOTE:-<none>}'). A global GH_REPO is what produced the #2235 fail-open — gh gives it precedence over the checkout for every call that does not pass --repo, so the rail graded daniel-ospina/tortoise PRs while reporting on agent-infra ones. Remove the GH_REPO line from $ENV_FILE (it is per-invocation state, not cell state); the controller resolves its repo from the checkout.${verb:+ $(queue_refusal_suffix "$verb" "Remove the GH_REPO line from \`$ENV_FILE\`, or drop an ambient \`export GH_REPO\` if that is where yours is set")}"
   fi
   [ "$want" = "$QUEUE_REPO" ] || got_src="the queue target"
   have="$(printf '%s' "$GH_REPO" | tr '[:upper:]' '[:lower:]')"
@@ -1734,7 +1740,7 @@ assert_gh_repo_conformance() {
   esac
   got="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
   if [ "$have" != "$got" ]; then
-    die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering ON THE 'start' PATH: there this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)${verb:+ $(queue_refusal_suffix "$verb" "Remove the GH_REPO line from \`$ENV_FILE\`")}"
+    die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering ON THE 'start' PATH: there this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)${verb:+ $(queue_refusal_suffix "$verb" "Remove the GH_REPO line from \`$ENV_FILE\`, or drop an ambient \`export GH_REPO\` if that is where yours is set")}"
   fi
   log_line "ok: GH_REPO ('$GH_REPO', from $ENV_FILE or the ambient shell) names this checkout's repo ($want, case-insensitively) — it is stripped from the controller session anyway (#2235)"
   return 0
@@ -1846,7 +1852,7 @@ queue_state_text() {
     # each is refused by `assert_queue_target stop` whenever the state dir has something a stop would end,
     # and an operator told only "start/check refuse" reaches for `stop` and is refused — the same
     # experience the line above was rewritten to prevent.
-    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse, and stop refuses while there is something to end (or the process table cannot be read) (agent-infra#1935)' ;;
+    nocheckout)  printf 'NO CHECKOUT — REPO is not set; the pre-flight (start/check always, stop while there is something to end) derives one from the single candidate checkout and refuses only when that derivation fails (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse, and stop refuses while there is something to end (or the process table cannot be read)' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse, and stop refuses while there is something to end (or the process table cannot be read)' ;;
     invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse, and stop refuses while there is something to end (or the process table cannot be read)' ;;

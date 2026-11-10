@@ -285,7 +285,9 @@ which is this same failure one refusal later. On this
 box the refusal therefore lands at step 1, with everything still running.
 The refusal names the queue target, the checkout, the checkout's **actual origin**, and the one-line fix,
 and it is labelled **MERGE-INERT** — the state `check` and `status` report too. It is deliberately narrow:
-`stop` refuses only when the pair is unusable **and** this state dir has something a stop would end. ⛔
+`stop` refuses only when a wrong-pair config exists (**either** of the two gates — so a *usable*
+queue/checkout pair on a box whose global `GH_REPO` names another repo refuses too) **and** this state dir
+has something a stop would end. ⛔
 What counts as "something" is the code's answer, not a slogan: a desired-state marker (`state/roles/.desired`),
 a **provably-own** controller session (proven by the session's own pane command, because `SESSION` is a
 machine-scoped name — a neighbour cell's `orch` session is not evidence, #1856), a doctor loop, a
