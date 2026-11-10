@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-42-1794279180-p1377562-374843e0",
+  "_sha": "b1ec7371468cb5f77614b5f58373c13017e4c073",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.kW8OSqTlFU/fix.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/2509-gh-config-dir-in-lane-env"
+    },
+    {
+      "kind": "sha",
+      "value": "ca18877366420b7e3fe62ade3573bfa04e879ef6"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/wt-2509"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 23,
+  "ended_at": 1794279203,
+  "exit_code": 0,
+  "heartbeat_at": 1794279203,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1794279180-p1377562-374843e0",
+  "lease_until": 1794279808,
+  "pid": 1377562,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794279180,
+  "state": "DONE",
+  "tag": "42",
+  "worktree": "/home/cmux/wt-2509"
+}
