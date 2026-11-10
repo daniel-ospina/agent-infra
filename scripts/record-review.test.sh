@@ -4885,7 +4885,13 @@ $VACUITY_BLOCK"
 # ⛔ THE ESCAPE VECTORS (13n7/13n10) CARRY THE #3442 BLOCK. Without it a green result would be a
 # green for the NON-VACUITY arm's reason, not for the escape's — the unrelated-row trap #3442 names.
 # The VETO vectors carry it too, so a red is attributable to (1c) and not to a second contract.
-N9859_BODY="$(cat <<'N9859_REAL_BODY_EOF'
+# ⛔ THE HEREDOC LIVES IN A FUNCTION BODY, NOT IN THE SUBSTITUTION — the remedy #2248 landed and
+# `scripts/check-bash32-parse.sh` documents: bash 3.2's `$( )` scanner walks a heredoc body as
+# if it were CODE, so the unbalanced parens and quotes inside a real review comment
+# desynchronise the parse for the rest of THIS file. macOS `/bin/bash` is 3.2, so the first
+# cut of this fixture broke the platform the harness actually runs on while parsing clean on
+# bash 5 — and the suite is a shipped script, so the parse gate is right to red it.
+_n9859_real_body() { cat <<'N9859_REAL_BODY_EOF'
 ## Code review — PR #9859 (@@BT@@fix/5006-near-dup-merge@@BT@@, head @@BT@@3e669aa6a@@BT@@)
 
 **Outcome: 3 findings — 2 blocking (P1), 1 documentation (P2).** Everything else I traced
@@ -5056,7 +5062,8 @@ above is from the selector source, not from a run.
 |---|---|---|---|
 | 13n6 the guard refuses a review that DECLARES a blocking count | sed s/outcome_declares_blocking/false/ x.sh | 13n6 | rc=0, wanted 3 |
 N9859_REAL_BODY_EOF
-)"
+}
+N9859_BODY="$(_n9859_real_body)"
 # ⛔ 20h48b FORBIDS A LIVE BACKTICK ON ANY NON-COMMENT LINE OF THIS FILE (a label once EXECUTED its
 # own backticks), and the real review body is full of them. They therefore travel as `@@BT@@` and
 # are materialised here — `printf '\140'` is the same no-live-backtick trick 20h48b's own control
