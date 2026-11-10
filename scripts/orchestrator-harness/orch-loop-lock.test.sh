@@ -348,7 +348,7 @@ _strip_comments() {
       for (i = 1; i <= n; i++) {
         c = substr($0, i, 1)
         if (q != "") {
-          if (c == "\\\\" && q == "\"") { out = out c; if (i < n) { i++; c = substr($0, i, 1); out = out c }; prev = c; continue }
+          if (c == "\\" && q == "\"") { out = out c; if (i < n) { i++; c = substr($0, i, 1); out = out c }; prev = c; continue }
           if (c == q) q = ""
           out = out c; prev = c; continue
         }
@@ -662,6 +662,17 @@ trap 'echo \"#tag\"' EXIT" \
 _exitrow 2 "$_REL
 trap 'log \${#X}' EXIT" \
   "…and a '#' inside a WORD (the \${#…} form a conditional tripwire takes) does not either — was a false PASS"
+# ⛔ AND AN ESCAPED QUOTE INSIDE A DOUBLE-QUOTED ACTION DOES NOT END THE QUOTED SPAN — a FALSE RED if it
+# does (the registration is real; bash installs it, and the `#` after the escaped quote is INSIDE the
+# action). This row pins the quote-state machine's ESCAPE tracking, and it is not defensive: MEASURED, the
+# first version of `_strip_comments` wrote the backslash as awk `"\\\\\\\\"` (two characters) so the
+# comparison never matched a one-character backslash, the escaped quote closed the span one character
+# early, and the rest of the line — including the `#` — was read as an unquoted comment. This row RED at
+# that spelling (`count=1`, want 2) and passes with `"\\\\"`. Fail-CLOSED, unlike the rows above: the
+# truncation makes the list UNKNOWN, which every consumer reads as RED rather than green.
+_exitrow 2 "$_REL
+trap \"a\\\" #x\" EXIT" \
+  "an ESCAPED quote inside a double-quoted ACTION does not end the span (else the '#' after it truncates the line — a false RED)"
 _exitrow 1 "$_REL
 trap 'exit 143' TERM
 trap 'exit 130' INT" \
