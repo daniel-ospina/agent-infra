@@ -272,8 +272,30 @@ _TRAP_SIGS_AWK='
       if ($i == "--") i++
       if (i <= NF && (substr($i, 1, 1) == sprintf("%c", 39) || substr($i, 1, 1) == "\"")) {
         qq = substr($i, 1, 1)
-        if (length($i) > 1 && substr($i, length($i), 1) == qq) i++
-        else { while (i <= NF && substr($i, length($i), 1) != qq) i++; i++ }
+        # ⛔ THE ACTION ENDS AT ITS CLOSING QUOTE, AND THAT IS A QUOTE PARITY — not the first field
+        # that happens merely to END with the quote character. (fresh review of #3865 at b83788d63, P2 —
+        # false PASS, MEASURED: an apostrophe splice leaves a mid-action field whose last character IS
+        # the quote, so an action containing a TERM word after the splice stopped the skip INSIDE the
+        # action, took TERM as the list, and left all three replaced-releaser arms GREEN at
+        # PASS=182 FAIL=0 while the lock was never removed. The comment above claimed the span was
+        # skipped to its CLOSING quote; it skipped to the first field ending with a quote. Count the
+        # quotes instead and stop when the count is EVEN, i.e. outside the span again: inside single
+        # quotes a backslash is literal, so a splice keeps the parity right, while inside double quotes
+        # a backslash-escaped quote does NOT close the span, so the two contexts are counted the way the
+        # shell reads them. No quote character appears in this comment: it sits inside the single-quoted
+        # awk program, and one apostrophe here silently ends it.)
+        cnt = 0
+        while (i <= NF) {
+          fld = $i; k = 0
+          for (p = 1; p <= length(fld); p++) {
+            if (substr(fld, p, 1) != qq) continue
+            if (qq == "\"" && p > 1 && substr(fld, p - 1, 1) == "\\") continue
+            k++
+          }
+          cnt += k
+          i++
+          if (cnt > 0 && cnt % 2 == 0) break
+        }
       }
     }
     while (out == "" && i <= NF) {
@@ -484,10 +506,10 @@ ck "every trap registration's SIGNAL LIST is readable (an unparseable one is UNK
 # review of #3865 at 062ff3ca, P3 — MEASURED: `release_lock() { rm -f "$LOCKF"; }; trap 'release_lock'
 # INT` is dropped by every `grep … LOCKF` above, so trap_pin answered GREEN while a RETURNING INT handler
 # deleted the lock and left the loop alive — the exact regression #1715 is named after). The subject's own
-# handlers TERMINATE (`trap 'exit 143' TERM`, `trap 'exit 130' INT` — `orch-loop.sh` ~2603-2604, cited by
-# CONTENT rather than by line: a hard-coded number here had already drifted to the comment that
-# documents the forbidden `EXIT INT TERM` form, and a pin's own citation must not be a second thing to
-# maintain), so assert it
+# handlers TERMINATE (`trap 'exit 143' TERM`, `trap 'exit 130' INT` — cited by CONTENT, never by line:
+# a hard-coded number here has been wrong TWICE, first onto the comment documenting the forbidden
+# `EXIT INT TERM` form and then onto a line six past the traps after an unrelated edit above them — and
+# a pin's own citation must not be a second thing to maintain), so assert it
 # over every registration whose signal list carries INT or TERM, wherever the command word lives.
 # EVERY INT/TERM HANDLER MUST TERMINATE, AND `exit` IS JUDGED AS A COMMAND — NOT AS A WORD OR A
 # SUBSTRING (fresh reviews of #3865 at bb46c6a13 and 0fdd46dbc, P3 — false PASS, MEASURED twice: the
@@ -498,13 +520,21 @@ ck "every trap registration's SIGNAL LIST is readable (an unparseable one is UNK
 # `LOCKF` filter cannot see.) The test is: DOUBLE-QUOTED SPANS ARE PROSE, so they are removed first; then
 # `exit` must sit at a command position (after `;`/`&`/`|`/`(`/the action's opening quote) or open one.
 # ONE implementation, used by both the whole-file arm and §9d, so the two cannot disagree.
-# ⏳ STATED LIMIT, not coverage: this still judges the TEXT, not the behaviour. A handler that stops the
-# shell another way (`trap 'kill -TERM $$' TERM`, `trap 'exec /bin/false' TERM`) REDS — a FALSE RED,
-# MEASURED, and pre-existing rather than introduced here — and one that runs `exit` behind a CONDITION
-# (`[ -n "$X" ] && exit`) passes whether or not the condition holds. The property this pin can honestly
-# claim is "no INT/TERM handler ENDS in a returning cleanup", not "the handler provably terminates";
-# asserting the latter would mean spawning a shell, signalling it and reading its exit status, which no
-# arm here does.
+# ⏳ STATED LIMITS, not coverage. This judges the TEXT, not the behaviour, and it is not complete in
+# either direction:
+#   * FALSE RED, measured: a handler that stops the shell another way (`trap 'kill -TERM $$' TERM`,
+#     `trap 'exec /bin/false' TERM`) REDS. Pre-existing, not introduced here.
+#   * FALSE RED, measured: an `exit` reached through a KEYWORD-opened command
+#     (`trap 'if [ -n x ]; then exit 1; fi' TERM`) REDS, because the left class carries the shell
+#     SEPARATORS and `{`/`!` but not `then`/`do`/`else`/`elif`/`while`/`until` — the class `trap_reg_total`
+#     uses. A `{ exit 1; }` brace group IS green (MEASURED); the keyword form is not, and an earlier draft
+#     of this comment attempted a keyword rewrite that changed no verdict, so it was deleted rather than
+#     kept as coverage (#3442 rule 3).
+#   * FALSE PASS, stated: one that runs `exit` behind a CONDITION (`[ -n "$X" ] && exit`) passes whether
+#     or not the condition holds.
+# The property this pin can honestly claim is "no INT/TERM handler ENDS in a returning cleanup", not "the
+# handler provably terminates". Asserting the latter would mean spawning a shell, signalling it and
+# reading its exit status, which no arm here does.
 _TERM_AWK='
   { if ($1 == "UNKNOWN") { print; next }
     n = split($1, a, " "); hit = 0
@@ -513,7 +543,10 @@ _TERM_AWK='
     t = $2
     gsub(/"[^"]*"/, "", t)
     q = sprintf("%c", 39)
-    pat = "(^|[;&|(" q "])[[:space:]]*(builtin[[:space:]]+)?exit([[:space:]]|[;&|)]|$)"
+    # the left class is a command position: line start, ; & | ( { } or !, or the action opening quote.
+    # It does NOT carry the keyword-opening forms (then/do/else/elif/while/until) that trap_reg_total
+    # uses, and that is a STATED FALSE RED below rather than a claim.
+    pat = "(^|[;&|(" q "{!])[[:space:]]*(builtin[[:space:]]+)?exit([[:space:]]|[;&|)}]|$)"
     if (t !~ pat) print }'
 _BAD_TERM="$(printf '%s\n' "$ALL_TRAPS" | awk -F' :: ' "$_TERM_AWK")"
 [ -z "$_BAD_TERM" ]
@@ -636,7 +669,7 @@ trap 'log TERM; exit' EXIT" \
   "a second registration whose ACTION names a signal still reads EXIT — was a false PASS"
 _exitrow 2 "$_REL
 trap 'case \"\$1\" in HUP) log ;; esac; cleanup' EXIT" \
-  "…and a `case` arm inside the ACTION cannot hide it either — was a false PASS"
+  "…and a 'case' arm inside the ACTION cannot hide it either — was a false PASS"
 _exitrow 1 "$_REL
 # trap 'true' EXIT" \
   "a COMMENTED-OUT registration is not a registration (no false RED on a correct tree)"
