@@ -264,8 +264,8 @@ FATAL: the QUEUE and the CHECKOUT name DIFFERENT repos … (agent-infra#1901)
 **Why it was left running and un-deployed — stated precisely.** `cmd_start` calls `assert_queue_target`
 **first** (before `harness_apply`), so `start` refuses *without touching the harness tree*. But the
 documented deploy is `stop` → `start` (because `cmd_apply` refuses while a controller runs), and the
-refusal then lands *after* the stop. So the sequence would leave the box **stopped, with the harness not
-refreshed** — strictly worse than leaving it on `bed278f4`. Fix the pair first, then `stop` → `start`.
+refusal then landed *after* the stop. So the sequence would leave the box **stopped, with the harness
+not refreshed** — strictly worse than leaving it on `bed278f4`, which is why it was left there.
 
 **The pair is `OR` + `REPO`** — set `OR` to the repo `$REPO`'s checkout actually is, or drop the `OR`
 line so it derives from that checkout (`resolve_repo_identity` in `scripts/orchestrator-bringup.sh`
@@ -274,6 +274,101 @@ comparison). `HARNESS_REPO` (or `--repo` on a `harness-up` run) names where the 
 different question that this refusal never asks: on cell-3 the harness already resolved, and pointing
 those at agent-infra leaves the FATAL intact. And `REPO` is the **work** repo the controller drains, so
 it must NOT name the harness.
+
+✅ **Fixed (agent-infra#2093).** `stop` now runs the SAME queue-target gate as `start`/`check`, before its
+first irreversible act (the leak reap of foreign-root controllers holding this `$O`, then dropping
+`state/roles/.desired`, bumping the stop generation, killing the doctor, killing the controller). ⛔ BOTH
+of `start`'s wrong-pair gates run here, not just the queue one: the queue/checkout mismatch
+(`agent-infra#1901`) and a global `GH_REPO` that names another repo (`agent-infra#2235`) — with only the
+first, a matched queue on a box whose `GH_REPO` named another repo was stopped and `start` then refused,
+which is this same failure one refusal later. On this
+box the refusal therefore lands at step 1, with everything still running.
+The refusal names the queue target, the checkout, the checkout's **actual origin**, and the one-line fix,
+and it is labelled **MERGE-INERT** — the state `check` and `status` report too. It is deliberately narrow:
+`stop` refuses only when a wrong-pair config exists (**either** of the two gates — so a *usable*
+queue/checkout pair on a box whose global `GH_REPO` names another repo refuses too) **and** this state dir
+has something a stop would end. ⛔
+What counts as "something" is the code's answer, not a slogan: a desired-state marker (`state/roles/.desired`),
+a **provably-own** controller session (proven by the session's own pane command, because `SESSION` is a
+machine-scoped name — a neighbour cell's `orch` session is not evidence, #1856), a doctor loop, a
+controller pid, or a controller **leaked from another harness root** (invisible to every ownership read,
+but the leak reap would signal it, so it counts); and a read that cannot be made (an unreadable process
+table) counts as "something is running" too, so the gate fails closed rather than stopping a box it cannot
+see into. So **a box with none
+of those legs can still be stopped** — that is the case this pre-flight is deliberately narrow about. The
+marker leg is read as-is and is the strictest: a box that is already down but still carries `.desired` is
+**not** "a box with none of those" — carrying the marker is itself one of them, so it needs `--force`; the
+leg is deliberate, since a stop that cannot be redone costs the cell and its leases while a refused stop
+costs one flag. `stop
+--force` exists for an operator who means to stop a misconfigured box anyway (`cloud-cell-quiesce.sh`
+passes it: its sweep stops everything regardless).
+
+**The repair sequence — no source reading required.** From “running `bed278f4`, cannot merge” to “current
+sha, can merge”, on the box. It is the deploy recipe of §5 with the pre-flight and the repair in front of
+it; nothing here is an extra script, and `$CELL_HOME/keys.env` (`/tmp/cell-home/keys.env` on lane-1, which
+carries the `REPO`/`OR` pair) is sourced by the supervisor itself:
+
+```bash
+SNAP=/tmp/cell-home/harness/bed278f4bbb1   # the versioned snapshot the cell is running
+SUP=$SNAP/scripts/cloud-cell-supervisor.sh
+
+# 1. PRE-FLIGHT. Stops nothing and starts nothing; on a refusal it writes nothing at all, and even
+#    when it ACCEPTS the pair its only effects are creating `$O/logs`+`$O/state` and re-applying the
+#    lane registry (`provision-lane-registry.py --apply`) — no signal, no unit action. Not "read-only":
+#    the accept path does write those two things, so do not run it expecting a no-op.
+#    Expect a QUEUE-vs-CHECKOUT refusal here, with the controller still up — that is the point of the
+#    step. ⛔ WHICH refusal depends on the snapshot you are running, and this recipe names a PRE-#2093
+#    one on purpose: `bed278f4` predates the fix, so its `check` prints the #1901 wording ("the QUEUE
+#    and the CHECKOUT name DIFFERENT repos: …") with no `MERGE-INERT` label and no one-line fix. The
+#    `MERGE-INERT` label and the copy-pasteable repair exist only on a snapshot that INCLUDES #2093, and
+#    THIS RECIPE RUNS `bed278f4` THROUGHOUT — steps 1, 3 and 4 all invoke the same `$SUP`, and nothing
+#    below reassigns `SNAP` — so against `bed278f4` expect the #1901 wording at step 1 AND to have to
+#    read the repair out of §2 rather than copy it from the refusal. (Point `SNAP` at a version that
+#    carries the fix and step 1 prints the label and the `sed` instead; nothing else in the recipe
+#    changes.) Expecting a token the box cannot print is how an operator reads "fix absent" as "nothing
+#    to fix".
+bash $SUP check
+
+# 2. REPAIR the pair — pick ONE. On a post-#2093 snapshot the refusal PRINTS (a) with the values filled in, and
+#    names (b) as prose — (b) repoints the checkout at a different repo on disk, so the supervisor will not
+#    spell the command out for you.
+cp /tmp/cell-home/keys.env /tmp/cell-home/keys.env.bak-$(date -u +%Y%m%dT%H%M%SZ)
+# (a) let the queue follow the checkout — the repair that cannot be wrong about WHICH side is stale.
+#     ⛔ THE PREFIX IS OPTIONAL ON PURPOSE: a cell's keys.env carries the EXPORTED form as often as the
+#     plain one (`export -p > keys.env` writes `declare -x OR=…`; `export OR=…` is what the harness's own
+#     lane notes describe), and a bare `^OR=` anchor matches NEITHER — it exits 0 having edited nothing
+#     and step 3 refuses again, which is the dead end this recipe exists to remove. ⛔ VERIFY WITH THE
+#     SAME ANCHORED PATTERN, not a loose `grep 'OR'` (which matches ORIGIN=/ORCH_*) and not a bare
+#     `grep 'OR='` (which still matches `ONLY_OR=` and a commented `# OR=` — lines the repair deliberately
+#     PRESERVES, so either loose check reports a leftover on a repair that worked):
+sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' /tmp/cell-home/keys.env
+grep -nE '^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=' /tmp/cell-home/keys.env \
+  || echo 'ok: no OR line left — the queue now derives from the checkout'
+# (b) …or point the CHECKOUT at the repo the queue names (a different repo on disk — here agent-infra).
+#     Same prefix rule, for the same reason. ⛔ THE DELIMITER IS `#`, NOT `|`: the PATTERN itself uses `|`
+#     as ERE alternation, so a `s|…|…|` form is truncated at the first inner `|` and sed exits 1 with
+#     "unknown option to 's'" having edited nothing — the same silent-no-op class this step exists to
+#     remove, one layer down (measured).
+#     sed -i -E 's#^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?REPO[[:space:]]*=.*#REPO=/tmp/cell-ai#' /tmp/cell-home/keys.env
+
+# 3. PRE-FLIGHT AGAIN. Must print: ok: queue <owner/repo> == checkout <path> (origin <url>) — derived
+bash $SUP check
+
+# 4. DEPLOY — the normal sequence, now safe because step 3 passed.
+bash $SUP stop
+bash $SUP start
+
+# 5. PROVE it moved: §4 — a real `[dispatch]` line, not just `[cap]`.
+```
+
+⛔ **Deleting the `OR` line is the repair for a box whose `OR` is the thing that is wrong** — lane-1's
+case: its `OR` names agent-infra while `REPO` is a tortoise tree, and that cell's work is whatever its
+checkout says. (The command is the `sed -E` in step 2 (a) above, not a bare `^OR=` anchor: a `keys.env`
+written `export OR=…` or `declare -x OR=…` is common enough that the narrow form silently edits nothing.)
+If the intent is the opposite — the box MUST work agent-infra PRs — use (b), because then the *checkout* is
+what is stale. Nothing in the supervisor can decide that for you, which is why the refusal prints (a) and
+names (b) in prose, and the repair is not automated: `stop` refusing is the guard, and picking the
+direction is the operator's call.
 
 ### 3.3 Not deployed for scheduling reasons, not for correctness
 
@@ -310,9 +405,20 @@ was 14 working of 76 resident, and `zombie=` is in the same line so a box full o
 
 ## 5. The deploy recipe each surface actually needs
 
-- **Cloud cell** — `bash <snapshot>/scripts/cloud-cell-supervisor.sh stop` → `start`. `start` runs
-  `apply` (fetch `origin/main`, write an immutable `<sha12>/` snapshot, move the pin, stamp) before
-  launching. Never hand-edit a file inside a snapshot: it destroys the per-file provenance proof.
+- **Cloud cell** — `check` → `stop` → `start`. `start` runs `apply` (fetch `origin/main`, write an
+  immutable `<sha12>/` snapshot, move the pin, stamp) before launching. Never hand-edit a file inside a
+  snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the pre-flight
+  that stops and starts nothing (on acceptance it does write — the state dirs and the re-applied lane
+  registry (`provision-lane-registry.py --apply`) — so it is not a no-op), and since agent-infra#2093 `stop`
+  refuses the same unusable pairs `start` refuses — both wrong-pair gates: the queue/checkout mismatch
+  (`agent-infra#1901`) and a global `GH_REPO` that names another repo (`agent-infra#2235`) — it
+  just also requires that the state dir has something a stop would end, or that the process table cannot
+  be read (which counts as running) — so a
+  wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. ⛔
+  **On a snapshot that includes #2093.** On an older snapshot this claim does not hold as written: there
+  `stop` has no gate, and the safety is `check`'s alone — which has always refused, so the sequence is
+  still safe, but the refusal comes from step 1 rather than from `stop`. The repair sequence for a
+  mismatch box is in §3.2.
 - **Mac** — do **not** use `deploy-mac-orchestrator.sh` phase B on a launchd-loaded box. Two measured
   consequences: its `nohup bash "$O/orch-loop.sh"` child **inherits the operator shell's TCC grant**, so
   it dispatches while the durable launchd job cannot (a false PASS reported as success); and it does
