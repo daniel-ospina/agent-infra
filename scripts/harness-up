@@ -1423,11 +1423,20 @@ hu_row_exec() {
 #                     FALSE-RED on a healthy box — the mirror of the false-green the old silent
 #                     `exit 0` produced. `[singleton]` in `orch-loop.log` names the holder pid, the
 #                     state dir and the reason; an unreadable record fails CLOSED by design.
-#   REFUSED-UNJUDGED last exit = 74: the lock record could not be READ or DATED, so the loop refused
-#                     rather than displace a controller it cannot identify. ⛔ ITS REMEDY IS OPPOSITE
+#   REFUSED-UNJUDGED last exit = 74: the loop could NOT JUDGE the lock record, so it refused rather
+#                     than displace a controller it cannot identify. ⛔ ITS REMEDY IS OPPOSITE
 #                     TO REFUSED-SINGLETON's: there, the holder is the authority and the lock must be
-#                     left alone; here, somebody has to investigate and may remove it. Sharing one row
-#                     told the operator not to touch a lock that may be the only thing wrong.
+#                     left alone; here, somebody has to investigate. Sharing one row told the operator
+#                     not to touch a lock that may be the only thing wrong.
+#                     ⛔ AND 74 IS ITSELF TWO SHAPES, WITH A DIFFERENT REMEDY EACH (fresh-context
+#                     review of #3846): (a) the record is still THERE and cannot be read or dated —
+#                     removing it IS the remedy once nothing holds it; (b) a displaced record could
+#                     NOT BE PUT BACK, so `$O/.orch.lock` is absent or 0-byte and the only copy is
+#                     KEPT at a `.reclaim.` path named by `[singleton]` — `rm -f` the lock is then a
+#                     NO-OP and the copy must be moved BACK. This legend is the header an agent greps
+#                     for the row meanings, so it names both shapes rather than the shorter half: the
+#                     rendered row below says which, and sent to the no-op alone it would repeat the
+#                     defect that put the copy there.
 #   DIED              a NON-ZERO exit status OTHER than 74/75: launchd retries it on its
 #                     ThrottleInterval, so a job that STAYS here is failing on every attempt. The
 #                     launch count is printed as EVIDENCE of how many times it has been started since

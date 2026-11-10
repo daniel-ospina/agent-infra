@@ -843,6 +843,15 @@ ck "(d) …and it gives the OPPOSITE remedy — investigate, and removing the re
 # has to redden here rather than pass silently.
 ck "(d) …and it distinguishes the KEPT-copy shape, whose remedy is to move the file back [$(printf '%s' "$launchd_row" | cut -c241-560)]" \
    "$(case "$launchd_row" in *"move that file back"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND THE FILE'S OWN ROW LEGEND IS PINNED WITH IT (fresh-context review of #3846, cycle 4). The legend
+# at the top of this script is the header an agent greps for what each row MEANS, and it still described
+# 74 as ONE shape seventy lines above the row that had just been taught both — same object, two homes,
+# so an edit to one left the other asserting the no-op remedy. A revert to the single-shape legend
+# reddens here.
+has_legend=0
+awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null | grep -qF 'TWO SHAPES' && \
+  awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null | grep -qF 'NO-OP' && has_legend=1
+ck "(d) the row LEGEND also names rc 2 as two shapes with opposite remedies (not one, above the row)" "$([ "$has_legend" = 1 ] && echo 0 || echo 1)"
 
 # ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
 # code is absent (review cycle 2).
