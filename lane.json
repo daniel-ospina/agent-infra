@@ -1,0 +1,34 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-bgdelivery4-1794288102-p1676132-8b778ebd",
+  "_sha": "8ae31e124c1e9d06d7f926b67209dc5b1fd77715",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.COiD4xnkK3/bg-o/bg/bgdelivery4.log"
+    },
+    {
+      "kind": "worktree",
+      "value": "/tmp/tmp.COiD4xnkK3/wt"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 620,
+  "duration_s": 24,
+  "ended_at": 1794288126,
+  "exit_code": 0,
+  "heartbeat_at": 1794288126,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-bgdelivery4-1794288102-p1676132-8b778ebd",
+  "lease_until": 1794288746,
+  "pid": 1676132,
+  "reason": null,
+  "repo": "owner/repo",
+  "schema": 1,
+  "started_at": 1794288102,
+  "state": "DONE",
+  "tag": "bgdelivery4",
+  "worktree": "/tmp/tmp.COiD4xnkK3/wt"
+}
