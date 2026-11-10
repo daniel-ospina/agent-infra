@@ -1707,7 +1707,7 @@ manifest path above is what a box that is copied into every deploy should use.
 | `SWEEP_ROWS_PER_CYCLE` | `8` | the sweep's per-cycle **window**: how many swept PRs are read per cycle, rotating via `state/sweep-cursor`. A full 70-row pass costs minutes (≥2 `gh pr view` per row) and the controller is relaunched every 12–45 s, so an unbounded pass was torn down before the arms at its end — measured: 0 dispatches in 555 cycles (#2640). The cursor advances AFTER the pass, by the rows that actually produced a disposition, so an interrupted window resumes at its unfinished row instead of stepping over its tail |
 
 ⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `SWEEP_ROWS_PER_CYCLE`, `MERGE_STALL_MIN`, `DRAIN_STALL_FIX_EVERY`, `STALL_FIX_BRIEF_MAX_AGE_MIN`, `MAX_REVIEW_TRIES` and the three wall-clock timeouts are NOT rendered into the plist.** The template
-carries **35** placeholders (counted, not incremented — a number beside a list goes stale by being incremented: `grep -o '__[A-Z_]*__' launchd.plist.template | sort -u | wc -l`) — the limits rendered above them, plus `SCOPE`, `O`, `REPO`, `OR`, `PATH`, `HOME`, and the harness-pin / uv / memory entries. Four of those limits are named HERE rather than in the table above, because they have no row of their own: `MAX_RED_FIX`, `MAX_RED_FIX_TRIES`, `MEM_LANE_RESERVE_MB`, `MEM_SPAWN_RESERVE_LANES`
+carries **36** placeholders (counted, not incremented — a number beside a list goes stale by being incremented: `grep -o '__[A-Z_]*__' launchd.plist.template | sort -u | wc -l`) — the limits rendered above them, plus `SCOPE`, `O`, `REPO`, `OR`, `PATH`, `HOME`, and the harness-pin / uv / memory entries. Four of those limits are named HERE rather than in the table above, because they have no row of their own: `MAX_RED_FIX`, `MAX_RED_FIX_TRIES`, `MEM_LANE_RESERVE_MB`, `MEM_SPAWN_RESERVE_LANES`
 — and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
@@ -1715,8 +1715,8 @@ scripts.
 ⛔ **`ORC_STATE_DIR` and `ORC_CONTROLLER_ORIGIN` are the same hazard with the opposite remedy, and the difference is the point.** Neither is a `__NAME__`
 placeholder: both ship as **literal** keys (`<key>ORC_STATE_DIR</key><string></string>`, `<key>ORC_CONTROLLER_ORIGIN</key><string>launchd</string>`),
 so `install.sh` never fills them from the environment — exporting either and re-running `install.sh` has no effect on the
-render. What they buy in exchange is **durability**: the installed plist's own entry is not overwritten by the next render, so a
-hand-edit survives a reinstall. And an EMPTY string is a MEANING, not an absence — empty `ORC_STATE_DIR` is "rank `O`, then
+render. What they buy in exchange is **durability**: the override has to live HERE in the template, because a
+hand-edit to the INSTALLED plist is wiped by the next render (`sed` over the template → `mv -f` over the plist, `install.sh:1525`, `:1612`). And an EMPTY string is a MEANING, not an absence — empty `ORC_STATE_DIR` is "rank `O`, then
 `$HOME/orchestrator`" (the template comment at that key says why) and empty `ORC_CONTROLLER_ORIGIN` is "no origin label" — so a
 render that filled them from the environment would silently move a controller's state dir instead. Give either one a `__…__`
 placeholder and both properties are lost at once.

@@ -506,8 +506,9 @@ hdr "§8 THE SLACK SEAM — validated before it reaches arithmetic (fresh review
 # value with leading zeros is NORMALISED (`08`->8, `007`->7) and KEPT, because both are inside the
 # bound; only a NON-digit value or one wider than 60 falls to the documented 5.
 # ⛔ `-1` AND `+1` ARE IN THE MATRIX BECAUSE THEY ISOLATE THE STAGE THE REST CANNOT REACH (fresh review of
-# #3846, P2). The guard has three stages — the length bound, the octal strip, and the non-digit test —
-# and every non-digit value above is >=3 characters, so the LENGTH bound catches it first: deleting the
+# #3846, P2). The guard has three stages, in this order in `_orc_lock_slack`: the non-digit test, the
+# octal strip, and the length/width bound — and every non-digit value above is >=3 characters, so the
+# LENGTH bound would catch it if the non-digit test were not FIRST: deleting the
 # non-digit stage (`case "$s" in ''|*[!0-9]*) s=5 ;; esac`) left this suite 68 passed, 0 failed, while
 # `_orc_lock_slack -1` returned `-1` instead of 5 and `+1` returned `+1`. `-1` is TWO characters, so it
 # passes the length bound and the octal strip leaves it alone — straight into `[ "$ps" -gt "$((pe + slack))" ]`

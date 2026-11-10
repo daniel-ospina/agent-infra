@@ -288,10 +288,12 @@ ck "P6 (setup) the report→dispatch window is non-empty, so the scan below is n
 # `O_WORK` split respelled this call `$O/dispatch-merge.sh` -> `${O_WORK:-$O}/dispatch-merge.sh`, and the
 # exact-spelling anchor above matched NOTHING: `_dcall` was empty, so all three windows below fell back
 # to `${_dcall:-0}` and collapsed. Measured at that head: `product-floor.test.sh` 211 passed, 4 failed
-# on a branch whose base is 214 passed, 1 failed — and the pre-call arm at `:292` PASSED while scanning
+# on a branch whose base is 214 passed, 1 failed — and the pre-call arm below PASSED while scanning
 # ZERO lines, printing output byte-identical to the base's genuine pass. The directory part is matched
-# as "anything", so a future respelling cannot silence these scans; what stops an anchor latching onto
-# a WRONG call site is the non-vacuity arm immediately below.
+# as "anything", so a future respelling cannot silence these scans. What catches an anchor latching onto
+# a WRONG call site is the non-vacuity arm immediately below — but ONLY when the wrong site falls OUTSIDE
+# `(repend, dend)`: an earlier matching call INSIDE that window would satisfy the arm while TRUNCATING the
+# pre-call scan, which is why this anchor takes `head -1` of a pattern measured to match exactly once here.
 _dcall="$(grep -nE '^[[:space:]]*bash "[^"]*/dispatch-merge\.sh"' "$LOOP" | head -1 | cut -d: -f1)"
 case "$_dcall" in ''|*[!0-9]*) P6C=1 ;; *) P6C=0 ;; esac
 ck "P6 (setup) the dispatch CALL is locatable (call=${_dcall:-?})" $P6C
