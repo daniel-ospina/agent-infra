@@ -276,8 +276,9 @@ those at agent-infra leaves the FATAL intact. And `REPO` is the **work** repo th
 it must NOT name the harness.
 
 ✅ **Fixed (agent-infra#2093).** `stop` now runs the SAME queue-target gate as `start`/`check`, before its
-first irreversible act (dropping `state/roles/.desired`, bumping the stop generation, killing the doctor,
-killing the controller). On this box the refusal therefore lands at step 1, with everything still running.
+first irreversible act (the leak reap of foreign-root controllers holding this `$O`, then dropping
+`state/roles/.desired`, bumping the stop generation, killing the doctor, killing the controller). On this
+box the refusal therefore lands at step 1, with everything still running.
 The refusal names the queue target, the checkout, the checkout's **actual origin**, and the one-line fix,
 and it is labelled **MERGE-INERT** — the state `check` and `status` report too. It is deliberately narrow:
 `stop` refuses only when the pair is unusable **and** this state dir has something a stop would end. ⛔

@@ -560,8 +560,9 @@ resolve_repo() {
 
 # ONE actionable line, on the verbs that cannot work without a checkout. `status` deliberately does
 # not call it: it is the verb an operator runs to DISCOVER this, so it must still answer.
-# ⛔ $1 IS THE ASKING VERB, AND ONLY `stop` NEEDS IT (review P3, #2093). Every other verb declines to
-# START something, so its refusal is the whole story; `stop` declined to END something, and an
+# ⛔ $1 IS THE ASKING VERB, AND ONLY `stop` NEEDS IT (review P3, #2093). Every other verb that runs
+# this gate (`start`, `check`, `doctor`, `merge`) declines to START or to RUN a pass, so its refusal is
+# the whole story; `stop` declined to END something, and an
 # operator reading that must be told nothing was stopped and how to stop anyway. This leg was the ONE
 # queue-unusable path that reached `die` without the suffix — so on a cell whose `keys.env` is missing
 # (a plausible reason to be stopping it) the new pre-flight refused with no way past it.
@@ -1799,8 +1800,9 @@ assert_queue_target() {
   esac
 }
 
-# The verb-specific tail of a queue-target refusal. Only `stop` needs one today: every other verb
-# declines to START something, so "refused" is the whole story; `stop` declined to END something, and
+# The verb-specific tail of a queue-target refusal. Only `stop` needs one: every other verb that runs
+# this gate (`start`, `check`, `doctor`, `merge`) declines to START or to RUN a pass, so "refused" is the
+# whole story and its message carries the repair in its body; `stop` declined to END something, and
 # an operator reading that must be told, in the message, both that nothing was stopped and how to
 # stop anyway (agent-infra#2093).
 # $1 = the asking verb. $2 = THIS refusal's repair clause, phrased as an imperative WITHOUT the
@@ -1834,10 +1836,14 @@ queue_state_text() {
     # "something is running", so a reader on a box where `ps` fails is refused too — the doc carries that
     # branch and this line did not, which gave one gate two answers (review P3).
     mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (marker, provable own session, doctor loop, or controller pid — or the process table cannot be read) — MERGE-INERT, agent-infra#1901' ;;
-    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
-    unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
-    underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
-    invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse' ;;
+    # ⛔ STOP REFUSES THESE FOUR TOO, so their one-liners must not read as "start/check only" (review P3):
+    # each is refused by `assert_queue_target stop` whenever the state dir has something a stop would end,
+    # and an operator told only "start/check refuse" reaches for `stop` and is refused — the same
+    # experience the line above was rewritten to prevent.
+    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse, and stop refuses while there is something to end (agent-infra#1935)' ;;
+    unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse, and stop refuses while there is something to end' ;;
+    underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse, and stop refuses while there is something to end' ;;
+    invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse, and stop refuses while there is something to end' ;;
     *)           printf 'unknown' ;;
   esac
 }
