@@ -100,8 +100,11 @@
 #      a marker saying REVIEW_VERDICT: ISSUES or carrying no readable count is refused, a marker quoted
 #      inside a fence is a quotation — while marker+0 RECORDS, including the harness reviewer's own
 #      `CLEAN <comment-url>` shape that this file could not parse at all (PR #3781); the prompt carries
-#      the contract it enforces; and two MUTATION controls (gate removed => the markerless CLEAN
-#      records; both marker shapes broken => rc=10 'the scan did not run', never a silent pass)
+#      the contract it enforces; and MUTATION controls (gate removed => the markerless CLEAN records;
+#      both marker shapes broken => rc=10 'the scan did not run', never a silent pass). ⛔ The marker is
+#      anchored BY POSITION: a transcript that only RESTATES the contract block (no verdict line) is
+#      exit 6, and so is a marker placed BEFORE the verdict — the presence of the block is not proof
+#      that a reviewer concluded anything (P2 finding, measured at the first review of this change)
 #
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
@@ -134,10 +137,10 @@ fixture_sha256() {
 # appear exactly when the seam's own shapes say a verdict was reached, or the fixture becomes a
 # second definition of "a verdict" that drifts one spelling over — the class this suite exists to
 # catch. A shape that vanishes from the seam fails LOUDLY here instead of silently un-covering §AQ.
-eval "$(grep -aE '^VD_(CLEAN|ISSUES|LABEL)=' "$SRC")"
-[ -n "${VD_CLEAN:-}" ] && [ -n "${VD_ISSUES:-}" ] && [ -n "${VD_LABEL:-}" ] \
-  || { echo "❌ could not read VD_CLEAN/VD_ISSUES/VD_LABEL from $SRC"; exit 2; }
-export VD_CLEAN VD_ISSUES VD_LABEL
+eval "$(grep -aE '^VD_(CLEAN|CLEAN_URL|ISSUES|LABEL)=' "$SRC")"
+[ -n "${VD_CLEAN:-}" ] && [ -n "${VD_CLEAN_URL:-}" ] && [ -n "${VD_ISSUES:-}" ] && [ -n "${VD_LABEL:-}" ] \
+  || { echo "❌ could not read VD_CLEAN/VD_CLEAN_URL/VD_ISSUES/VD_LABEL from $SRC"; exit 2; }
+export VD_CLEAN VD_CLEAN_URL VD_ISSUES VD_LABEL
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-suite.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -355,7 +358,7 @@ fi
 # "a verdict" — the exact class this suite exists to catch — and every `ISSUES 0`, `### CLEAN` and
 # `ISSUES —` scenario below depends on the fixture agreeing with the seam byte for byte.
 if [ -z "${FIXTURE_NO_MARKER:-}" ] && [ -f "${REVIEWER_SRC:-/nonexistent}" ]; then
-  _vl="$(grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$REVIEWER_SRC" 2>/dev/null | tail -1)"
+  _vl="$(grep -aE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" "$REVIEWER_SRC" 2>/dev/null | tail -1)"
   if [ -n "${_vl:-}" ]; then
     # the verdict WORD is the first CLEAN/ISSUES on that line, exactly as the seam reads it
     _vw="$(printf '%s' "$_vl" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
@@ -3254,6 +3257,26 @@ run "$SRC" 2284
 [ "$(rc_of)" = "6" ]; ck $? "a marker with NO FINDINGS_BLOCKING field is REFUSED (rc=$(rc_of))"
 no_record; ck $? "  ...nothing recorded"
 err_has "no readable FINDINGS_BLOCKING"; ck $? "  ...refusing the INCOMPLETE marker, not a missing one"
+
+# (5b) ⛔ THE P2 FINDING FROM THIS CHANGE'S OWN FIRST REVIEW, pinned as a regression: the marker is
+# anchored BY POSITION. The prompt says "the two lines AFTER the verdict line", and a PRESENCE-only
+# gate read a transcript that merely RESTATED that block as a conclusion and minted a clean record with
+# NO verdict line at all — the one thing this file swears never to fake. It must be exit 6.
+reset; FIXTURE_NO_MARKER=1
+printf 'I read the diff and the contract for this caller.\nThe contract requires:\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 0\nI did not finish the review.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a RESTATEMENT of the contract block with NO verdict line is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded — presence of the block is not a conclusion"
+no_comment; ck $? "  ...and nothing posted as a review artifact"
+
+# (5c) and the same block placed BEFORE the verdict line is refused too: the position is the contract,
+# so a marker cannot be read as qualifying a verdict it precedes.
+reset; FIXTURE_NO_MARKER=1
+printf 'REVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 0\nNothing blocks.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a marker printed BEFORE the verdict line is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+err_has "must sit on a line AFTER the accepted verdict line"; ck $? "  ...and the refusal names the position rule"
 
 # (6) THE WIRE-FORMAT HALF — the harness reviewer's own `CLEAN <comment-url>` string (PR #3781).
 # Without a marker it is still NO VERDICT (the measured bug, pinned so a future widening is visible);

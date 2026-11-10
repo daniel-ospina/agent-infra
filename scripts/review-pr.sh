@@ -1035,6 +1035,17 @@ fi
 # harmless for the terminator rules below (`## CLEAN UP` still fails: `UP` is alphanumeric and the
 # `[^[:alnum:][:space:]]+` arm requires a decoration, not a word).
 VD_CLEAN='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[:space:]]*([.!]|[[:space:]]*$|:[[:space:]]*$|[^[:alnum:][:space:]]+[[:space:]]+)'
+# ⛔ `CLEAN <comment-url>` IS THE HARNESS REVIEWER'S OWN CONTRACT STRING (issue #2670, measured on
+# PR #3781). `reviewer-preflight.sh`'s #2148 reviewer line tells that reviewer to "report
+# `CLEAN <comment-url>`", and VD_CLEAN cannot accept it: its terminator class is `[.!]`, end-of-line,
+# `:` , or a decoration followed by whitespace, and the character after `CLEAN ` is `h` of `https` —
+# ALPHANUMERIC, so no arm fires. Measured cost: a paid 382-second fresh-context review whose only
+# defect was its final line was discarded as exit 6 NO VERDICT, and a re-run reproduced the identical
+# byte shape. The URL arm is DELIBERATELY TIGHT (`CLEAN`, whitespace, one `https?://` token, END OF
+# LINE): it cannot admit prose, and it is only ONE of the two things a record now needs — the
+# structured marker must follow it (require_verdict_marker), so widening this shape alone can never
+# mint an attestation.
+VD_CLEAN_URL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*CLEAN[[:space:]]+https?://[^[:space:]]+[[:space:]]*$'
 # ⛔ THE SHAPE MUST ACCEPT WHAT THE COUNT READER DOCUMENTS (P2, fresh review of #2288). The
 # count reader (`${LAST_LC#*issues}` + the separator class) and the comments in the count block
 # both name `ISSUES — 2` / `ISSUES — 0 × P1` as the realistic report closer, but THIS shape
@@ -1116,6 +1127,13 @@ require_verdict_marker() {
       err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
       die "$E_NOVERDICT" "the structured verdict marker is unreadable — re-run the review" ;;
   esac
+  if [ -z "${V_LINENO:-}" ] || [ -z "${M_LINENO:-}" ] || [ "${M_LINENO}" -le "${V_LINENO}" ]; then
+    err "$PROG: the structured verdict marker is not where the contract puts it — it must sit on a line AFTER the accepted verdict line (the prompt: 'the two lines AFTER the verdict line'), and a marker with no verdict line before it is a RESTATEMENT of the contract, not a conclusion."
+    err "  verdict line: $LAST"
+    err "  marker line:  $MK_VERDICT_LINE"
+    err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+    die "$E_NOVERDICT" "the structured verdict marker does not follow the verdict line — re-run the review"
+  fi
   if [ -z "${MK_COUNT_LINE:-}" ] || [ -z "${MK_COUNT:-}" ]; then
     err "$PROG: the reviewer printed REVIEW_VERDICT but no readable FINDINGS_BLOCKING field — the count is the half of the marker that makes 'reports findings' a comparison rather than a grammar, so a marker without it proves nothing."
     err "  required:  FINDINGS_BLOCKING: 0"
@@ -1314,7 +1332,7 @@ grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
                         print ln[i]
                       }
                     }' | tr -d '\r' > "$RUN_DIR/survivors.txt"
-  grep -av $'^\001' "$RUN_DIR/survivors.txt" | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" > "$RUN_DIR/verdict-lines.txt"
+  grep -av $'^\001' "$RUN_DIR/survivors.txt" | grep -aE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" > "$RUN_DIR/verdict-lines.txt"
   LAST_LINE="$(tail -1 "$RUN_DIR/verdict-lines.txt" 2>/dev/null)"
   # ⛔ EVERY VERDICT-SHAPED LINE IN THE ACCEPTED REGION IS KEPT (P1/P2, fresh review of #2288): the
   # contradiction guard read only this LAST line, so a counted CLEAN — or an `ISSUES 2` — one line
@@ -1345,7 +1363,7 @@ SURVIVORS_FILE="$RUN_DIR/survivors.txt"
 # the last verdict-shaped line in the LOG is the one a text comparison needs — and a filtered
 # intermediate FILE was the wrong shape twice over (a `|` chain under `pipefail` with a non-matching
 # first grep truncated it to empty, so every ordinary CLEAN read as "no verdict").
-RAW_LAST="$(grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
+RAW_LAST="$(grep -aE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
 # ⛔ THE REFUSAL IS DEFERRED, THE FACT IS RECORDED HERE (P1, fresh review of #2288): the decision is
 # made NOW, but it must not preempt the SCANNER-failure arm — a box whose `awk` is broken has no
 # verdict at all and must refuse with exit 10 ("the scan did not run"), not 6 ("a quotation").
@@ -1365,6 +1383,19 @@ grep -av $'^\001' "$SURVIVORS_FILE" 2>/dev/null | grep -aE "($VD_MK_VERDICT)|($V
   || die "$E_SCAN" "the transcript-analysis file $MARKER_LINES_FILE is missing or unreadable — the structured-verdict gate cannot be shown to have run, so no verdict is recorded (transcript: $TRANSCRIPT)"
 MK_VERDICT_LINE="$(grep -aE "$VD_MK_VERDICT" "$MARKER_LINES_FILE" 2>/dev/null | tail -1 | tr -d '\r')"
 MK_COUNT_LINE="$(grep -aE "$VD_MK_COUNT" "$MARKER_LINES_FILE" 2>/dev/null | tail -1 | tr -d '\r')"
+# ⛔ THE MARKER IS ANCHORED BY **POSITION**, NOT MERELY BY PRESENCE (P2, fresh review of #2670 —
+# MEASURED FAIL-OPEN: the prompt says "the two lines after the verdict line", and a PRESENCE-only
+# gate read a transcript that merely RESTATED that contract block (`The contract requires:
+# REVIEW_VERDICT: CLEAN / FINDINGS_BLOCKING: 0`) as a conclusion and minted a clean record with no
+# verdict line at all). The two indices are taken over the SAME `\001`-filtered stream, so they are
+# comparable: the marker must sit STRICTLY AFTER the accepted verdict-shaped line. That is why the
+# marker may no longer SUPPLY a verdict either — a marker with no verdict line before it is exactly
+# the restatement case, and the harness reviewer's own `CLEAN <comment-url>` closing is admitted by
+# `VD_CLEAN_URL` instead, which keeps ONE definition of "a verdict line" (see its declaration).
+V_LINENO="$(grep -av $'^\001' "$SURVIVORS_FILE" 2>/dev/null \
+            | grep -anE "($VD_CLEAN)|($VD_CLEAN_URL)|($VD_ISSUES)|($VD_LABEL)" | tail -1 | cut -d: -f1)"
+M_LINENO="$(grep -av $'^\001' "$SURVIVORS_FILE" 2>/dev/null \
+            | grep -anE "$VD_MK_VERDICT" | tail -1 | cut -d: -f1)"
 MK_VERDICT=""; MK_COUNT=""
 if [ -n "${MK_VERDICT_LINE:-}" ]; then MK_VERDICT="$(marker_field_word "$MK_VERDICT_LINE")"; fi
 if [ -n "${MK_COUNT_LINE:-}" ]; then MK_COUNT="$(marker_field_num "$MK_COUNT_LINE")"; fi
@@ -2244,19 +2275,15 @@ refuse_counted_clean() {
 }
 
 VWORD="$(printf '%s' "$LAST" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
-# ⛔ THE MARKER IS ITSELF A VERDICT LINE (issue #2670). When the prose carries NO verdict-shaped
-# line, a well-formed marker SUPPLIES the verdict; when the prose does carry one, the prose stands
-# and the marker is cross-checked in require_verdict_marker() below. This is the half that closes the
-# measured WIRE-FORMAT drift, not just the paraphrase class: the harness reviewer is instructed (by
-# the #2148 preflight its own role emits) to close with `CLEAN <comment-url>`, and that is not
-# verdict-shaped here at all — VD_CLEAN terminates the token on `[.!]`, end-of-line, `:`, or a
-# decoration followed by whitespace, and the character after `CLEAN ` is `h` of `https`. So a paid,
-# correct review exited 6 NO VERDICT and a re-run produced the identical byte shape (PR #3781,
-# measured: 382 s of reviewer time discarded). A reviewer that prints the marker and the URL form
-# both is now accepted; one that prints NEITHER is still exit 6, unchanged.
-if [ -z "$VWORD" ] && [ -n "${MK_VERDICT:-}" ]; then
-  VWORD="$MK_VERDICT"; LAST="$MK_VERDICT_LINE"
-fi
+# ⛔ THE MARKER DOES NOT SUPPLY A VERDICT — IT QUALIFIES ONE (P2, fresh review of #2670). An earlier
+# draft let a well-formed marker stand in for a missing verdict line, to close the WIRE-FORMAT drift
+# measured on PR #3781 (`CLEAN <comment-url>` is not verdict-shaped to VD_CLEAN, so a paid 382 s review
+# exited 6). That was a FAIL-OPEN, measured by the review that filed it: a transcript that merely
+# RESTATED the prompt's own required block (`The contract requires: REVIEW_VERDICT: CLEAN` /
+# `FINDINGS_BLOCKING: 0`) and never concluded anything recorded a signed clean verdict. The URL shape
+# is now admitted by `VD_CLEAN_URL` at the ONE place a verdict shape belongs, and the marker is
+# anchored to the verdict line by POSITION in require_verdict_marker(), so there is still exactly one
+# definition of "a verdict line" and it is still the reviewer's own.
 case "$VWORD" in
   clean)
     # ⛔ A LINE THAT SAYS CLEAN **AND** CARRIES A NON-ZERO ISSUES COUNT IS REFUSED (P3 label,
