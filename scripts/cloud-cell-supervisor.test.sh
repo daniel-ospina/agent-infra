@@ -2807,7 +2807,11 @@ Q_PRT=''; Q_PRT="$(printf '%s\n' "$Q_OUT2" | sed -n "s/.*sed -i -E '\([^']*\)'.*
 [ -n "$Q_PRT" ] \
   && ok "the refusal prints a runnable command for the operator to paste (extracted its sed pattern from the output)" \
   || bad "could not extract a runnable 'sed -i -E …' command from the refusal — the operator has nothing to paste: $Q_OUT2"
-[ -n "$Q_PRT" ] && sed -i -E "$Q_PRT" "$Q_EXP"
+# ⛔ THE EXTRACTION IS RE-EXECUTED HERE, SO IT MUST NOT DEPEND ON GNU sed: `sed -i -E` on BSD/macOS takes
+# `-E` as `-i`'s suffix, so ERE never turns on, the pattern runs as BRE (where `(|)`, `+`, `?`, `{}` are
+# literal), matches nothing, and exits 0 having edited NOTHING — the very silent no-op this row exists to
+# catch, manufactured by the test on the one host that runs it (`-E` + a temp file is flavour-agnostic).
+[ -n "$Q_PRT" ] && { sed -E "$Q_PRT" "$Q_EXP" > "$Q_EXP.t" && mv "$Q_EXP.t" "$Q_EXP"; }
 grep -q 'OR=' "$Q_EXP" \
   && bad "the command the refusal PRINTS leaves an 'export OR=' line intact — it exits 0 having edited nothing, so the operator returns to the identical refusal" \
   || ok "the command the refusal PRINTS really removes an 'export OR=' line (the repair path works on the shape a cell carries)"
@@ -2900,6 +2904,11 @@ say_case "the session env lives INSIDE the command string, and GH_REPO is neutra
 # recorded argv all reported 'could not recover' as knock-ons. The value here is $Q/agent-repo's OWN
 # repo, which is the only shape that reaches the launch; what is still asserted (and is the point of the
 # #2216/#2235 leak) is that an AGREEING export is not a licence to deliver the value into the session.
+# ⛔ SNAPSHOT THE SHARED keys.env: this arm's whole point is an AGREEING global export, and arms below
+# drive `stop` against a TORTOISE checkout through the SAME file. Leaving it in place made this arm a
+# latent fixture leak: `stop`'s #2235 pre-flight then correctly refused six later arms ("GH_REPO names a
+# DIFFERENT repository"), which is a behaviour of the new gate, not a defect in it (measured).
+_KEYS_SNAPSHOT="$(cat "$Q/keys.env" 2>/dev/null)"; _KEYS_EXISTED=0; [ -f "$Q/keys.env" ] && _KEYS_EXISTED=1
 printf 'export GH_REPO=daniel-ospina/agent-infra\n' > "$Q/keys.env"
 qsup start "$Q/agent-repo" "$Q/st-env"
 [ "$Q_RC" -eq 0 ] && ok "start proceeds with a keys.env that exports a GLOBAL GH_REPO naming THIS checkout (agreeing is neutralised, not refused)" \
@@ -2951,6 +2960,8 @@ if [ -n "$_PROBE_CMD" ] && [ "$_PROBE_CMD" != "$_COMMAND" ]; then
 else
   bad "could not build the runtime probe from the recorded command string — the env-in-session claim is unproven (tail: '${_COMMAND: -160}')"
 fi
+# RESTORE the shared keys.env — everything below must not inherit this arm's agreeing export.
+if [ "$_KEYS_EXISTED" = 1 ]; then printf '%s\n' "$_KEYS_SNAPSHOT" > "$Q/keys.env"; else rm -f "$Q/keys.env"; fi
 # (3) The bring-up half: it must not WRITE a global GH_REPO, and it must drop one that is pushed.
 grep -nE '^[[:space:]]*(export[[:space:]]+)?GH_REPO=' "$BRINGUP" >/dev/null 2>&1 \
   && bad "cloud-cell-bringup.sh WRITES/EXPORTS a global GH_REPO — the repo must be per-invocation state" \
@@ -3300,6 +3311,38 @@ qverb stop "$Q/agent-repo" "$S4J" daniel-ospina/tortoise
 [ "$Q_RC" -eq 0 ] \
   && ok "(3i) …and once that controller is gone the SAME state dir stops (the ownership read is what refused)" \
   || bad "(3i) a state dir with no live controller was refused (rc=$Q_RC), so (3i) cannot show the pid is what refused: $Q_OUT"
+
+#  (3j) A GLOBAL `GH_REPO` IS THE SECOND WRONG-PAIR CONFIG `start` REFUSES (#2235), and until the
+#  pre-flight ran that gate too, `stop` walked past it: a matched queue on a box whose GH_REPO named
+#  another repo was STOPPED, and `start` then refused `GH_REPO names a DIFFERENT repository` — the lane-1
+#  shape one refusal later. Pinned on the positive facts: the refusal names GH_REPO, it says NOTHING WAS
+#  STOPPED (the verb-aware tail), and the marker survives; the control removes GH_REPO and the same state
+#  dir then stops. ⛔ ITS OWN ENV FILE, DELIBERATELY: the shared `$Q/keys.env` is written by earlier arms,
+#  so a control that merely stopped exporting GH_REPO could still inherit one from the file — measured as a
+#  "control" that refused for the very reason it was meant to exclude.
+S4K="$Q/st2093-ghrepo"; rm -rf "$S4K"; mkdir -p "$S4K/o/state/roles"; : > "$S4K/o/state/roles/.desired"
+ghstop() { env -u OR Q_STATE="$S4K" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys-3j.env" \
+             SESSION="ai2093gh-$$" O="$S4K/o" REPO="$Q/tortoise-repo" HARNESS="$Q/harness" HARNESS_REPO="$AI" \
+             HARNESS_FETCH=0 HARNESS_REF="$Q_REF" "$@" bash "$SUP" stop 2>&1; }
+Q_OUT="$(ghstop env GH_REPO=daniel-ospina/agent-infra)"; Q_RC=$?
+[ "$Q_RC" -ne 0 ] \
+  && ok "(3j) stop REFUSES when a global GH_REPO names another repo (the #2235 gate is in the pre-flight)" \
+  || bad "(3j) stop proceeded with GH_REPO naming another repo, so 'start' will refuse what 'stop' just did (rc=$Q_RC): $Q_OUT"
+case "$Q_OUT" in
+  *"GH_REPO names a DIFFERENT repository"*) ok "(3j) …and the refusal is the GH_REPO gate, not the queue gate" ;;
+  *) bad "(3j) refused for an unrelated reason, so the #2235 pre-flight proves nothing: $Q_OUT" ;;
+esac
+case "$Q_OUT" in
+  *"NOTHING WAS STOPPED"*) ok "(3j) …and the refusal says NOTHING WAS STOPPED and names the --force escape (the stop tail reaches this gate too)" ;;
+  *) bad "(3j) the GH_REPO refusal carries no stop tail, so an operator who meant to stop cannot tell nothing was stopped or how to force it: $Q_OUT" ;;
+esac
+[ -f "$S4K/o/state/roles/.desired" ] \
+  && ok "(3j) …and the marker is still there (the refusal was ahead of the first irreversible act)" \
+  || bad "(3j) the marker was removed despite the refusal — the gate ran too late"
+Q_OUT="$(ghstop)"; Q_RC=$?
+[ "$Q_RC" -eq 0 ] \
+  && ok "(3j) …and with GH_REPO unset the SAME state dir stops (so GH_REPO is what refused)" \
+  || bad "(3j) the control was refused too (rc=$Q_RC), so (3j) cannot show GH_REPO is what refused: $Q_OUT"
 
 # (4) The escape hatch is REAL: `stop --force` on a live mismatched box gets past the gate and stops
 # it. Without this arm, "refuses" could be satisfied by a wall no flag can pass.

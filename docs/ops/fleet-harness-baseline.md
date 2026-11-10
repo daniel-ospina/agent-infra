@@ -277,7 +277,11 @@ it must NOT name the harness.
 
 ✅ **Fixed (agent-infra#2093).** `stop` now runs the SAME queue-target gate as `start`/`check`, before its
 first irreversible act (the leak reap of foreign-root controllers holding this `$O`, then dropping
-`state/roles/.desired`, bumping the stop generation, killing the doctor, killing the controller). On this
+`state/roles/.desired`, bumping the stop generation, killing the doctor, killing the controller). ⛔ BOTH
+of `start`'s wrong-pair gates run here, not just the queue one: the queue/checkout mismatch
+(`agent-infra#1901`) and a global `GH_REPO` that names another repo (`agent-infra#2235`) — with only the
+first, a matched queue on a box whose `GH_REPO` named another repo was stopped and `start` then refused,
+which is this same failure one refusal later. On this
 box the refusal therefore lands at step 1, with everything still running.
 The refusal names the queue target, the checkout, the checkout's **actual origin**, and the one-line fix,
 and it is labelled **MERGE-INERT** — the state `check` and `status` report too. It is deliberately narrow:
@@ -403,7 +407,9 @@ was 14 working of 76 resident, and `zombie=` is in the same line so a box full o
   immutable `<sha12>/` snapshot, move the pin, stamp) before launching. Never hand-edit a file inside a
   snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the pre-flight
   that stops and starts nothing (on acceptance it does write — the state dirs and the re-applied lane
-  registry (`provision-lane-registry.py --apply`) — so it is not a no-op), and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — it
+  registry (`provision-lane-registry.py --apply`) — so it is not a no-op), and since agent-infra#2093 `stop`
+  refuses the same unusable pairs `start` refuses — both wrong-pair gates: the queue/checkout mismatch
+  (`agent-infra#1901`) and a global `GH_REPO` that names another repo (`agent-infra#2235`) — it
   just also requires that the state dir has something a stop would end, or that the process table cannot
   be read (which counts as running) — so a
   wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. ⛔

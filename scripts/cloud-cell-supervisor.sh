@@ -1691,10 +1691,16 @@ OR="$QUEUE_REPO"
 #      export buys nothing and only arms the next leak.
 assert_gh_repo_conformance() {
   [ -n "${GH_REPO:-}" ] || return 0
+  # ⛔ $1 IS THE VERB ASKING, exactly as `assert_queue_target` takes it (agent-infra#2093 review, P2):
+  # `stop`'s pre-flight runs this gate too, so its refusal must say NOTHING WAS STOPPED and name the
+  # `--force` escape — the same shape the queue gate's tail provides. A GH_REPO that names another repo
+  # is a wrong-PAIR config of that same class, and until this gate joined the pre-flight `stop` walked
+  # past it and stopped a box `start` then refused, which is the lane-1 shape (#1901) over again.
+  local verb="${1:-}"
   local want="${QUEUE_DERIVED:-$QUEUE_REPO}" have got got_src _h="" _whost=""
   got_src="the checkout's origin remote"
   if [ -z "$want" ]; then
-    die "GH_REPO is set ($GH_REPO) but this cell's CHECKOUT repo could not be read, so it cannot be verified against the tree the controller would grade ('git -C $REPO remote get-url origin' => '${QUEUE_REMOTE:-<none>}'). A global GH_REPO is what produced the #2235 fail-open — gh gives it precedence over the checkout for every call that does not pass --repo, so the rail graded daniel-ospina/tortoise PRs while reporting on agent-infra ones. Remove the GH_REPO line from $ENV_FILE (it is per-invocation state, not cell state); the controller resolves its repo from the checkout."
+    die "GH_REPO is set ($GH_REPO) but this cell's CHECKOUT repo could not be read, so it cannot be verified against the tree the controller would grade ('git -C $REPO remote get-url origin' => '${QUEUE_REMOTE:-<none>}'). A global GH_REPO is what produced the #2235 fail-open — gh gives it precedence over the checkout for every call that does not pass --repo, so the rail graded daniel-ospina/tortoise PRs while reporting on agent-infra ones. Remove the GH_REPO line from $ENV_FILE (it is per-invocation state, not cell state); the controller resolves its repo from the checkout.${verb:+ $(queue_refusal_suffix "$verb" "Remove the GH_REPO line from \`$ENV_FILE\`")}"
   fi
   [ "$want" = "$QUEUE_REPO" ] || got_src="the queue target"
   have="$(printf '%s' "$GH_REPO" | tr '[:upper:]' '[:lower:]')"
@@ -1728,7 +1734,7 @@ assert_gh_repo_conformance() {
   esac
   got="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
   if [ "$have" != "$got" ]; then
-    die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering: this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)"
+    die "GH_REPO names a DIFFERENT repository than $got_src: GH_REPO='$GH_REPO' but $got_src='$want'. gh gives GH_REPO precedence over the checkout for EVERY call that does not pass --repo, so a cell carrying this line grades and reports '$GH_REPO' PRs while believing it is grading '$want' — measured as a rail printing '✅ PR #2232 is ALREADY MERGED' (a September tortoise PR) over an open agent-infra one, exit 0 (#2235). FIX: remove the GH_REPO line from $ENV_FILE — it is per-invocation state, never a cell-wide export; a command that genuinely needs another repo passes --repo. Then re-run. (The session strip would neutralise the leak anyway; this refusal exists to force the keys.env EDIT, because a global export re-arms on the next checkout, clone or rename — but note the ordering ON THE 'start' PATH: there this refuses BEFORE the harness refresh, so a box mid-deploy is left stopped until the line is removed, as documented in docs/ops/fleet-harness-baseline.md.)${verb:+ $(queue_refusal_suffix "$verb" "Remove the GH_REPO line from \`$ENV_FILE\`")}"
   fi
   log_line "ok: GH_REPO ('$GH_REPO', from $ENV_FILE or the ambient shell) names this checkout's repo ($want, case-insensitively) — it is stripped from the controller session anyway (#2235)"
   return 0
@@ -4413,10 +4419,15 @@ cmd_stop() {
   # marker dropped, the generation bumped, and only then did `start` refuse. The box was left
   # stopped with its harness unrefreshed, which is why the measured lane-1 was left running a stale
   # sha rather than repaired. The gate below runs the SAME predicate `start`/`check` run, before the
-  # leak reap on the next line, before the `.desired` removal, and before anything is signalled.
+  # leak reap on the next line, before the `.desired` removal, and before anything is signalled. ⛔ TWO
+  # gates, because `start` refuses on TWO wrong-pair configs — the queue/checkout pair AND a global
+  # `GH_REPO` that names another repo (#2235) — and a pre-flight that ran only the first left the second
+  # reachable: a matched queue on a box whose GH_REPO named another repo was STOPPED, and `start` then
+  # refused `GH_REPO names a DIFFERENT repository`, which is the lane-1 shape one refusal later (review P2).
   # ⛔ Only for a stop that would end something, and only without --force: see stop_would_end_something.
   if [ "$force" != 1 ] && stop_would_end_something; then
     assert_queue_target stop
+    assert_gh_repo_conformance stop
   fi
   # ⛔ #2315 NAMES `stop` EXPLICITLY ("neither start nor stop can clear"). A leaked controller from
   # another harness root is invisible to the ownership reads below (foreign path, no lock), so `stop`
