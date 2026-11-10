@@ -159,7 +159,16 @@ step "wip-sweep: ${SWEEP:-<none found — WORK ON THIS BOX WILL NOT BE ARCHIVED>
 # 2. Stop the supervised controller, then kill EVERY session and ANY stray
 #    controller. tmux kill-server is the only reliable sweep: kill-session -t orch
 #    leaves the fix-*/merge-*/chain-* sessions (and their claim leases) behind.
-[ -n "$SW" ] && bash "$SW" stop >/dev/null 2>&1 || true
+# ⛔ --force (agent-infra#2093): this script's whole verb is "end every controller on this box", and
+# it sweeps with `tmux kill-server` + `pkill` immediately below whatever the supervisor answers. The
+# supervisor's new pre-flight refuses `stop` on a queue/checkout pair it cannot use — mismatch, invalid,
+# unreadable, underivable, an unknown state, and the no-checkout leg (REPO unset or underivable) —
+# WHENEVER this state dir has something a stop would end (the `.desired` marker, a provably-own session,
+# a doctor loop, a controller pid, or a controller leaked from another harness root), or the process-table
+# read cannot be made. That is exactly the
+# state this script runs in (so the documented `stop` → `start` deploy cannot strand a box). Pass the
+# flag rather than letting a guard this script does not rely on change its path.
+[ -n "$SW" ] && bash "$SW" stop --force >/dev/null 2>&1 || true
 tmux kill-server >/dev/null 2>&1 || true
 sleep 2
 # The bracket keeps this pattern from matching this script's own argv.
