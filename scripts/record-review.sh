@@ -1605,7 +1605,7 @@ _tiproot() { # <token> -> the token re-rooted on the attested head, or ""
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -3345,6 +3345,24 @@ $m"
     # all and minted a signed `clean`. One grammar for every reader of the same operator.
     while [[ "$_opends" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})(${_dident}*)[[:space:]]*\.\.([^0-9A-Za-z_.]|$) ]]; do
       _olhs="${BASH_REMATCH[$_g_op1]}${BASH_REMATCH[$_g_dident1]}"
+      # ⛔ THE DOTS MUST NOT SIT BETWEEN TWO OPERANDS (thirtieth review cycle, round 2 — MEASURED, a
+      # FALSE BLOCK this round's separator tolerance introduced). `HEAD .. <other>` is a TWO-endpoint
+      # claim whose left operand is the head; with the tolerance this arm matched `HEAD ..` and refused
+      # it as the omitted-RIGHT form, telling the author their endpoint was omitted when they had
+      # WRITTEN it (`HEAD .. <orphan>` — a mention this file deliberately accepts, MEASURED rc 3 where
+      # `git rev-list --count HEAD..<orphan>` is 1). The omission is `<operand>..` with NOTHING after
+      # it, so a RESOLVABLE token after the dots means the range has both ends and belongs to the arm
+      # above. Resolution, not spelling: `and the rest was not read` does not resolve, `<orphan>` does.
+      _olpost="${_opends#*"${BASH_REMATCH[0]}"}"
+      _olpost="${_olpost#"${_olpost%%[![:space:]]*}"}"
+      _olword="${_olpost%%[[:space:]]*}"
+      if [ -n "$_olword" ]; then
+        _olw="$(_tipvariant "$_olword")"
+        if [ -n "$(delta_git "$root" rev-parse --verify "${_olw}^{commit}" 2>/dev/null || true)" ]; then
+          _opends="${_opends#*"${BASH_REMATCH[0]}"}"
+          continue
+        fi
+      fi
       _opends="${_opends#*"${BASH_REMATCH[0]}"}"
       # The same word-or-word-plus-selector rule as the two-endpoint arm above, and the same git-decided
       # case variant (`Head..` with a tag `Head` at another commit is not `HEAD..`): `_tipvariant`
@@ -3374,6 +3392,17 @@ $m"
         esac
       fi
       [ -n "$_osha" ] || continue
+      # ⛔ THIS DIRECTION COMPARES EQUALITY ONLY, AND THE ASYMMETRY IS THE MEANING, NOT AN OVERSIGHT
+      # (thirtieth review cycle, round 2 — MEASURED BOTH WAYS). `X..` is `X..HEAD`, so it is EMPTY when X
+      # CONTAINS the head, not when X is an ancestor of it: an ANCESTRY test here refused `deltabase..`
+      # and `<base> .. <HEAD>` — honest claims whose range has commits (20h72c, 20h22) — which is the
+      # measured cost of copying the mirror arm's ancestry test into this one. The container case needs
+      # no test here: a descendant operand is already refused by the tip arm's `_afterhead` path
+      # (MEASURED, `afterhead ..` is rc 3), and a non-empty `X..HEAD` is not this arm's population.
+      # DECLARED REMAINDER, symmetric with the mirror's: a range with BOTH ends written where the left
+      # end is an INTERIOR ancestor (`<midref>..HEAD` — a strictly narrower claim) is not refused by
+      # either arm; only EMPTY ranges and tip-relative narrowings are, and a "narrower" test here would
+      # have to refuse the legitimate `<base>~1..HEAD` population the tip arm deliberately accepts.
       if [ "$_osha" = "$to" ]; then
         _emptyrange=1; _emptystated="${_olhs}..HEAD (the endpoint is omitted, so it defaults to the head)"; break
       fi
@@ -3449,7 +3478,16 @@ $m"
         esac
       fi
       [ -n "$_osha" ] || continue
-      if [ "$_osha" = "$to" ]; then
+      # ⛔ `..X` IS `HEAD..X`, SO THE CLAIM IS EMPTY WHENEVER X IS THE HEAD **OR AN ANCESTOR OF IT**
+      # (thirtieth review cycle, round 2 — MEASURED, a fail-open this arm's equality test left open):
+      # `..<base>` and `..<head>~1` name ZERO commits — `HEAD..X` counts the commits reachable from X but
+      # not from HEAD, and for any ancestor of the head (the head included) that set is EMPTY — yet the
+      # arm saw only the head itself and minted a signed `clean` over the whole range. The ancestry test
+      # is the MEANING of an empty `HEAD..X`, not an extra spelling. ⛔ IT BELONGS HERE AND NOT IN THE
+      # `<X>..` ARM ONE HUNDRED LINES UP, and that asymmetry is the point: `X..` is `X..HEAD`, which is
+      # empty when X CONTAINS the head — copying this test there refused `deltabase..` and
+      # `<base> .. <HEAD>` (20h72c, 20h22), MEASURED. The container case is the tip arm's `_afterhead`.
+      if [ "$_osha" = "$to" ] || delta_git "$root" merge-base --is-ancestor "$_osha" "$to" 2>/dev/null; then
         _emptyrange=1; _emptystated="..${_orhs} (the left endpoint is omitted, so it defaults to the head — HEAD..${_orhs} is an EMPTY range)"; break
       fi
     done
@@ -3459,7 +3497,7 @@ $m"
     # text — the class this file calls worse than the gap, and the one thing a refusing gate must
     # never do. The two arms now share the flag but not the sentence.
     if [ "$_emptyrange" = 1 ]; then
-        echo "   delta: the covering artifact '$cover' states an EMPTY range ('$_emptystated' — both endpoints resolve to the attested head ${to:0:12}…), so it names ZERO commits while the record would assert ${from:0:12}…..${to:0:12}…. An empty range is the narrowest claim there is, and it cannot be the evidence for a range that has commits. Nothing was written." >&2
+        echo "   delta: the covering artifact '$cover' states an EMPTY range ('$_emptystated'), so it names ZERO commits while the record would assert ${from:0:12}…..${to:0:12}…. An empty range is the narrowest claim there is, and it cannot be the evidence for a range that has commits. Nothing was written." >&2
         echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
         return 1
     fi
