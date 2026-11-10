@@ -319,9 +319,48 @@ _TRAP_SIGS_AWK='
 # registration whose command word is BUILT (`eval "trap …"`, a `trap` word assembled in a variable) is
 # not matched; asserting the handler bash actually INSTALLED (`trap -p EXIT`) would be stricter still and
 # is the follow-up shape if one of those ever appears.
+# ⛔ A COMMENT STARTS AT A `#` THAT BEGINS A WORD — NOT AT ANY `#` ON THE LINE (fresh review of #3865 at
+# 0fdd46dbc, P2 — fail-OPEN false PASS, MEASURED). The strip used to be `sed -e 's/[[:space:]]*#.*$//'`,
+# and `[[:space:]]*` is satisfied by the EMPTY string, so it cut from the FIRST `#` anywhere on the line:
+# a `#` inside a WORD (`${#X}`, `$#`) or inside a QUOTED STRING (`echo "#tag"`) truncated the line
+# before either scan ever saw it — and BOTH scans truncate the same way, so the pair AGREED on a line
+# neither of them read, which is exactly what the two arms below exist to catch. MEASURED at that head
+# with these helpers copied verbatim, subject = the releaser plus one appended registration:
+#
+#     echo "#tag"; trap 'true' EXIT            -> exit_trap_count=1, trap_reg_total=1, per-line=1
+#     [ "${#X}" -gt 0 ] && trap 'true' EXIT    -> exit_trap_count=1, trap_reg_total=1, per-line=1
+#
+# (want 2/2/2) — so BOTH arms stayed GREEN at `PASS=178 FAIL=0` while bash installed the second handler,
+# REPLACED the releaser and left the lock on disk: #1715 in a spelling the guard could not see. The note
+# this replaces called the `#`-in-an-ACTION case a fail-CLOSED false RED, which was the other direction.
+# The rule implemented here is bash's own (POSIX §2.10.2; GNU Bash Reference, `Comments`): a word
+# beginning with `#` begins a comment, so a `#` begins one at line start or after a METACHARACTER
+# (blank, `;`, `&`, `|`, `(`, `)`, `<`, `>`), and NEVER inside single or double quotes. One
+# implementation, shared by every scan (`trap_regs`, `trap_reg_total`, `trap_pin`), so the counts the
+# accounting arm compares cannot be stripped by two different rules.
+# ⏳ STATED LIMIT: this is a lexical strip, so an escaped quote inside a double-quoted string
+# (`"a \" #b"`) is tracked, but a `#` inside a `$( … )` command substitution is kept (bash would strip
+# a comment there) — fail-CLOSED, a false RED on a spelling no subject here uses.
+_strip_comments() {
+  awk -v sq="$(printf '\047')" '
+    { out = ""; q = ""; prev = ""
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (q != "") {
+          if (c == "\\\\" && q == "\"") { out = out c; if (i < n) { i++; c = substr($0, i, 1); out = out c }; prev = c; continue }
+          if (c == q) q = ""
+          out = out c; prev = c; continue
+        }
+        if (c == sq || c == "\"") { q = c; out = out c; prev = c; continue }
+        if (c == "#" && (i == 1 || prev ~ /[ \t;&|()<>]/)) break
+        out = out c; prev = c
+      }
+      print out }'
+}
 trap_regs() {
   printf '%s\n' "$1" \
-    | sed -e 's/[[:space:]]*#.*$//' \
+    | _strip_comments \
     | grep -E "^[[:space:]]*${_TRAP_CMD_RE}" \
     | awk "$_TRAP_SIGS_AWK"
 }
@@ -366,14 +405,14 @@ exit_trap_count() {
 # (`trap -p EXIT`) is the stricter shape and the follow-up if one ever appears in the subject.
 trap_reg_total() {
   printf '%s\n' "$1" \
-    | sed -e 's/[[:space:]]*#.*$//' \
+    | _strip_comments \
     | awk '{ while ($0 ~ /\\$/ && (getline nxt) > 0) { sub(/\\$/, "", $0); $0 = $0 " " nxt } ; print }' \
     | grep -oE "(^|[;&|({)]|then|do|else|elif|while|until|!)[[:space:]]*${_TRAP_CMD_RE}" \
     | grep -c . || true
 }
 trap_pin() {
   local _lt="$1" _cmd _flat _regs _sigs _body
-  _cmd="$(printf '%s' "$_lt" | sed -e 's/[[:space:]]*#.*$//')"
+  _cmd="$(printf '%s' "$_lt" | _strip_comments)"
   _flat="$(printf '%s' "$_cmd" | sed -e 's/\\//g' -e 's/${LOCKF}/$LOCKF/g')"
   _regs="$(trap_regs "$_lt")"
   _sigs="${_regs%% :: *}"
@@ -601,6 +640,28 @@ trap 'case \"\$1\" in HUP) log ;; esac; cleanup' EXIT" \
 _exitrow 1 "$_REL
 # trap 'true' EXIT" \
   "a COMMENTED-OUT registration is not a registration (no false RED on a correct tree)"
+# ⛔ AND A `#` THAT DOES NOT BEGIN A WORD IS NOT A COMMENT (fresh review of #3865 at 0fdd46dbc, P2 —
+# fail-OPEN false PASS, MEASURED). The strip cut from the FIRST `#` on the line, so a `#` inside a QUOTED
+# STRING or inside a WORD truncated the line before any scan saw the registration on it — and because
+# EVERY scan stripped the same way, the per-line scan and the accounting scan AGREED on a line neither of
+# them read. The two rows here are the PER-LINE witnesses, i.e. registrations that START a line and carry
+# a non-comment `#`: pre-fix each truncated to `trap 'echo "` / `trap 'log ${`, parsed `UNKNOWN` (never
+# `EXIT`) and left the ONLY-EXIT arm GREEN while bash installed the registration and REPLACED the releaser
+# (`exit_trap_count=1`, `trap_reg_total=2`, MEASURED at that head). ⛔ THE REVIEW'S OWN WITNESS SHAPE FOR
+# THIS FINDING WAS `echo "#tag"; trap 'true' EXIT`, AND IT IS NOT APPLICABLE AS AN `_exitrow`: that
+# registration does not START its line, so the line-anchored scan cannot count it at ANY head (MEASURED:
+# `trap_regs` -> 1 registration before AND after the fix, `exit_trap_count=1` both ways) — asserting 2
+# would have added a row that is red on a correct tree, which is the false-correction hazard the review
+# record exists to avoid. That spelling IS a real hole, and it is witnessed by the `_acctrow` rows below
+# (pre-fix `total=1, per-line=1` = AGREE beside a replaced releaser; post-fix `total=2, per-line=1` =
+# disagree = RED), which is the arm whose job it is. The control is the row above: a REAL comment is still
+# stripped, so neither new row can pass by the stripper merely being disabled.
+_exitrow 2 "$_REL
+trap 'echo \"#tag\"' EXIT" \
+  "a '#' inside a QUOTED STRING does not truncate the line — was a false PASS"
+_exitrow 2 "$_REL
+trap 'log \${#X}' EXIT" \
+  "…and a '#' inside a WORD (the \${#…} form a conditional tripwire takes) does not either — was a false PASS"
 _exitrow 1 "$_REL
 trap 'exit 143' TERM
 trap 'exit 130' INT" \
@@ -761,6 +822,21 @@ _acctrow disagree "$_REL; x=1 trap 'true' EXIT" \
   "an ASSIGNMENT-PREFIXED second registration on one line is SEEN by the accounting scan"
 _acctrow disagree "$_REL; x=\"a b\" trap 'true' EXIT" \
   "a QUOTED-ASSIGNMENT-PREFIXED second registration on one line is SEEN by the accounting scan"
+# ⛔ AND A `#` INSIDE A QUOTED STRING OR A WORD MUST NOT TRUNCATE THE LINE FOR THE ACCOUNTING SCAN EITHER
+# (fresh review of #3865 at 0fdd46dbc, P2 — the same finding as the two `_exitrow` rows above, and this
+# is its OTHER half: because `trap_reg_total` stripped from the first `#` too, the two counts AGREED —
+# `total=1, per-line=1` — on a line neither scan read, so the arm that exists to catch an unreadable
+# registration reported ✅. Post-fix the registration is SEEN by `trap_reg_total` and not by the
+# line-anchored scan, so the pair DISAGREES, which is the RED a real second registration must produce.
+# ⏳ STATED, not hidden: these are FALSE REDS in the sense that the subject tree is written validly — that
+# is what this arm is: an accounting tripwire, so ANY second registration the per-line scan cannot see
+# reds it by design (the `case`/`else`/`!`/`&&` rows above are the same shape).)
+_acctrow disagree "$_REL
+echo \"#tag\"; trap 'true' EXIT" \
+  "a '#' inside a QUOTED STRING no longer blinds the accounting scan (it AGREED beside a replaced releaser)"
+_acctrow disagree "$_REL
+[ \"\${#X}\" -gt 0 ] && trap 'true' EXIT" \
+  "…and neither does a '#' inside a WORD (the \${#…} spelling a conditional tripwire takes)"
 # ⛔ AND THE UNKNOWN ARM'S TEXT SOURCE IS A STATED LIMIT, NOT A ROW (fresh review of #3865 at
 # a2da4598b, note): this arm reads `$(cat "$SUBJECT")` while the scans above read `trap_join`'s output, so
 # a releaser split by a trailing `\` reads UNKNOWN here and parses fine above — one spelling, two answers,
