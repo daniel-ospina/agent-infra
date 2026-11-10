@@ -89,8 +89,9 @@
 # not re-implemented: `stop` calls `assert_queue_target` itself, so the verbs cannot drift into the
 # #1745 shape (one verb blesses what the next refuses).
 # ⛔ `stop` STAYS ANSWERABLE, which is the whole reason the refusal is narrow. It refuses only when
-# (a) the pair is not usable AND (b) this state dir has something a stop would actually END. Stopping a
-# cell with NONE of those legs loses nothing; ⛔ a cell that is already DOWN but still carries
+# (a) the pair is not usable AND (b) this state dir has something a stop would actually END **or the
+# process-table read cannot be made** (the fail-closed branch: a read that fails counts as running).
+# Stopping a cell with NONE of those legs loses nothing; ⛔ a cell that is already DOWN but still carries
 # `state/roles/.desired` is not that case — the marker IS one of the legs, so it needs `--force` too.
 # An operator who means to stop a misconfigured box anyway types `stop --force` — the refusal names that
 # flag. `status` is unchanged: it reports the pair and never refuses.
@@ -1828,9 +1829,11 @@ queue_state_text() {
     # ⛔ NAME THE CONDITION THE CODE APPLIES, NOT ONE OF ITS LEGS (review P3, both lanes). The old text said
     # "while a controller is live", but `stop_would_end_something` refuses on more than that: the FIRST leg
     # is `$ROLES_DIR/.desired`, which a box that is DOWN (OOM, reboot, an earlier partial stop) still
-    # carries — exactly the state this PR's own doc §3.2 names. The line therefore names the gate's own
-    # condition, and enumerates the legs the code reads, so it cannot be read as one example of them.
-    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (marker, provable own session, doctor loop, or controller pid) — MERGE-INERT, agent-infra#1901' ;;
+    # carries — exactly the state this PR's own doc §3.2 names. ⛔ AND THE ENUMERATION MUST INCLUDE THE
+    # FAIL-CLOSED BRANCH: `owned_controller_pids || return 0` counts an UNREADABLE process table as
+    # "something is running", so a reader on a box where `ps` fails is refused too — the doc carries that
+    # branch and this line did not, which gave one gate two answers (review P3).
+    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (marker, provable own session, doctor loop, or controller pid — or the process table cannot be read) — MERGE-INERT, agent-infra#1901' ;;
     nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;

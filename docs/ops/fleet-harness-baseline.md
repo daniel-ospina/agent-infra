@@ -321,10 +321,13 @@ cp /tmp/cell-home/keys.env /tmp/cell-home/keys.env.bak-$(date -u +%Y%m%dT%H%M%SZ
 #     ⛔ THE PREFIX IS OPTIONAL ON PURPOSE: a cell's keys.env carries the EXPORTED form as often as the
 #     plain one (`export -p > keys.env` writes `declare -x OR=…`; `export OR=…` is what the harness's own
 #     lane notes describe), and a bare `^OR=` anchor matches NEITHER — it exits 0 having edited nothing
-#     and step 3 refuses again, which is the dead end this recipe exists to remove. Verify after:
-#     `grep -n 'OR' /tmp/cell-home/keys.env` must show no `OR=` line at all.
+#     and step 3 refuses again, which is the dead end this recipe exists to remove. ⛔ VERIFY WITH THE
+#     SAME ANCHORED PATTERN, not a loose `grep 'OR'` (which matches ORIGIN=/ORCH_*) and not a bare
+#     `grep 'OR='` (which still matches `ONLY_OR=` and a commented `# OR=` — lines the repair deliberately
+#     PRESERVES, so either loose check reports a leftover on a repair that worked):
 sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' /tmp/cell-home/keys.env
-grep -n 'OR=' /tmp/cell-home/keys.env || echo 'ok: no OR line left — the queue now derives from the checkout'
+grep -nE '^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=' /tmp/cell-home/keys.env \
+  || echo 'ok: no OR line left — the queue now derives from the checkout'
 # (b) …or point the CHECKOUT at the repo the queue names (a different repo on disk — here agent-infra).
 #     Same prefix rule, for the same reason. ⛔ THE DELIMITER IS `#`, NOT `|`: the PATTERN itself uses `|`
 #     as ERE alternation, so a `s|…|…|` form is truncated at the first inner `|` and sed exits 1 with
