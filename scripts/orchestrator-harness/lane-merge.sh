@@ -354,7 +354,20 @@ if is_limit "${LANE_TIMEOUT:-}" && [ "${LANE_TIMEOUT}" = "${LANE_WALL_S}" ]; the
 elif is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N}" = "${LANE_WALL_S}" ]; then
   LANE_WALL_SRC="LANE_BACKSTOP_S"
 else
-  LANE_WALL_SRC="no usable LANE_TIMEOUT or LANE_BACKSTOP_S, so the shipped default stands"
+  # ⛔ NAME THE KNOB THAT IS ACTUALLY AT FAULT (review, P3 — MEASURED). This branch used to say "no usable
+  # LANE_TIMEOUT or LANE_BACKSTOP_S", which sends an operator to inspect TWO knobs when exactly ONE is at
+  # fault, and asserts the other is unusable when it can be perfectly usable: `LANE_TIMEOUT=abc
+  # LANE_BACKSTOP_S=3600` printed that sentence while 3600 was a valid bound. It was not consulted because
+  # `LANE_WALL_S` above is `${LANE_TIMEOUT:-...}`, and `lane.sh:882` arms the lane with the IDENTICAL
+  # expression — so the line states the masking instead of inviting a fall-through, which would make this
+  # file's clock disagree with the armed one (the mirror-image of the bug this branch fixes).
+  if [ -n "${LANE_TIMEOUT:-}" ]; then
+    LANE_WALL_SRC="the shipped default, because LANE_TIMEOUT='${LANE_TIMEOUT}' is not a bounded integer, and LANE_BACKSTOP_S=${LANE_BACKSTOP_S:-<unset>} was NOT consulted — the arming path masks it with the same \${LANE_TIMEOUT:-…} expression"
+  elif [ -n "${LANE_BACKSTOP_S:-}" ]; then
+    LANE_WALL_SRC="the shipped default, because LANE_BACKSTOP_S='${LANE_BACKSTOP_S}' is not a bounded integer"
+  else
+    LANE_WALL_SRC="the shipped default, because neither LANE_TIMEOUT nor LANE_BACKSTOP_S is set"
+  fi
 fi
 # ⛔ THE DESIGN OPERAND IS THE CALLER'S, NOT THE ARMED ONE (review, P2 — MEASURED, and it is a false block
 # this diff would otherwise introduce). `MAX_WATCH_FIT` is derived from `LANE_WALL_S` at its own definition
@@ -1748,7 +1761,7 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
     _watch_basis_note="an explicit LANE_MERGE_MAX_WATCH=0, which DISABLES the supervision counter"
     _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
   elif is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N:-0}" -gt 0 ]; then
-    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N}s), because the wall axis (LANE_TIMEOUT) is OFF"
+    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N}s), because the wall axis (${LANE_WALL_SRC}) is OFF"
     # ⛔ THE FIGURE MUST BE WHAT THE CODE WILL USE, WHICH INCLUDES THE ELAPSED SUBTRACTION (review cycle
     # 16, P3 — measured: the line printed "a FINITE 29 chunk(s)" on a lane that had spent 3400 s of its 3600 s
     # backstop, where `--watch` derives 1). `_lane_elapsed` is already resolved above for the wait clamp; this
@@ -1771,10 +1784,31 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
       fi
     fi
   else
-    _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_TIMEOUT=0) and no LANE_BACKSTOP_S is exported"
+    # ⛔ THE KNOB NAMED HERE IS THE ONE THAT RESOLVED TO 0, AND THE SENTENCE ABOUT THE BACKSTOP IS A
+    # MEASUREMENT, NOT AN ASSUMPTION (review, P3 — MEASURED both ways). `LANE_BACKSTOP_S=0` with
+    # `LANE_TIMEOUT` unset resolves `LANE_WALL_S` to 0 FROM THE BACKSTOP, yet this branch announced
+    # "LANE_TIMEOUT=0" (a variable never set) and "no LANE_BACKSTOP_S is exported" — while it was
+    # exported, as 0. `lane_wall_bound` arms `--wall 0` for that value, so it really is the OFF switch;
+    # the line must say so instead of telling an operator to set the knob they already set.
+    case "${LANE_WALL_SRC}" in
+      LANE_BACKSTOP_S)
+        _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N} is the same OFF switch lane_wall_bound honours, and LANE_TIMEOUT is unset or empty)" ;;
+      *)
+        if [ -n "${LANE_BACKSTOP_S_N:-}" ]; then
+          _watch_basis_note="no clock at all, because the wall axis is OFF (${LANE_WALL_SRC}=0) and LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N} is the same OFF switch rather than a clock"
+        else
+          _watch_basis_note="no clock at all, because the wall axis is OFF (${LANE_WALL_SRC}=0) and no LANE_BACKSTOP_S is exported"
+        fi ;;
+    esac
     _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
   fi
-  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the design check wait is ${WAIT_S_DESIGN}s and it is NOT clamped by the wall clock (a WATCHDOG cap may still have reduced it to ${WAIT_S}s, and the line above says so when it did), and no wall ceiling is enforced for this lane. Reading 0 as a zero-second budget would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ AND NOTE THE OTHER AXIS: the --watch supervision allowance is NOT derived from that zero clock (review cycle 13, P2) — it comes from ${_watch_basis_note}, so it is ${_watch_supervision_note} here. Do not read this line as 'this lane has no bounds at all'."
+  # ⛔ THE HEADLINE NAMES THE KNOB THAT IS ACTUALLY OFF, NEVER A LITERAL (review, P3 — measured: a
+  # `LANE_BACKSTOP_S=0` lane was told "LANE_TIMEOUT=0 is the documented 'wall axis OFF' value" about a
+  # variable it never set, on the one line an OFF-axis operator reads). Guarded to a knob NAME so a
+  # longer source phrase can never be pasted into an `<operand>=0` sentence.
+  _wall_off_knob="LANE_TIMEOUT"
+  case "${LANE_WALL_SRC}" in LANE_TIMEOUT|LANE_BACKSTOP_S) _wall_off_knob="${LANE_WALL_SRC}" ;; esac
+  say_err "lane-merge: ${_wall_off_knob}=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the design check wait is ${WAIT_S_DESIGN}s and it is NOT clamped by the wall clock (a WATCHDOG cap may still have reduced it to ${WAIT_S}s, and the line above says so when it did), and no wall ceiling is enforced for this lane. Reading 0 as a zero-second budget would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ AND NOTE THE OTHER AXIS: the --watch supervision allowance is NOT derived from that zero clock (review cycle 13, P2) — it comes from ${_watch_basis_note}, so it is ${_watch_supervision_note} here. Do not read this line as 'this lane has no bounds at all'."
 elif [ -n "$_lane_elapsed" ]; then
   _wall_left=$(( LANE_WALL_S - _lane_elapsed - _hb_margin ))
   [ "$_wall_left" -ge 0 ] || _wall_left=0
