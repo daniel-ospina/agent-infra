@@ -867,8 +867,67 @@ resolve_trusted_checkout() {
 # silent for ~15-25 minutes, which reads as a wedged lane to every liveness instrument we have.
 # ⛔ AND IT WILL NOT DOUBLE-REVIEW: merge-one.sh takes state/mergeclaim-<PR>.lock first, so a chain
 # the controller already spawned owns the PR and ours exits without paying a second reviewer.
+# _lm_tree_kind <dir> — ONE of `main` / `flat` / `linked` / `unknown`. The caller decides.
+# ⛔ THE QUESTION IS "IS THIS A LANE'S OWN CHECKOUT?", NOT "IS THIS A MAIN WORKTREE?" (fresh-context
+# review of #3846, P1-2; MEASURED). The anti-bypass rule from #3789 is "a lane must not merge its PR
+# through ITS OWN edited merge gate", and the realistic shape of that attack is a lane editing
+# `merge-one.sh` inside its own `.worktrees/tm-<N>` checkout and having the beside-file fallback pick
+# it up. A lane checkout is a LINKED worktree. Asking "is it a MAIN worktree" refuses that — and ALSO
+# refuses the operator-seeded runtime, which is a FLAT `cp -p` tree with no `.git` at all (the shape
+# `deploy-harness.sh` produces), so `git rev-parse --git-dir` failed and EVERY lane on a split box
+# exited 2 before any merge work. Measured at the round-10 head: `/home/cmux/orchestrator` (this box's
+# real seeded runtime) -> REFUSED; a fresh `cp -p` seed -> REFUSED; the same tree after `git init` ->
+# MAIN-YES. The property to refuse is a LINKED worktree, and the caller has already established the
+# identity that makes a flat tree trustworthy (`_d` IS the controller-declared harness root).
+# Fail-closed the other way round: a tree that carries a `.git` entry but cannot be resolved is
+# `unknown`, and cannot-tell is never trust.
+_lm_tree_kind() {
+  local d="${1:-}" gd="" common="" c=""
+  if [ -z "$d" ] || [ ! -d "$d" ]; then printf 'unknown'; return 0; fi
+  if ! git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
+    # No readable git dir. A `.git` entry that git REFUSES to read is a tree we cannot classify; a
+    # tree with no `.git` at all is the flat seeded runtime, which is the shape this arm exists for.
+    if [ -e "$d/.git" ]; then printf 'unknown'; else printf 'flat'; fi
+    return 0
+  fi
+  gd="$(git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || { printf 'unknown'; return 0; }
+  common="$(git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || { printf 'unknown'; return 0; }
+  if [ -z "$gd" ] || [ -z "$common" ]; then printf 'unknown'; return 0; fi
+  c="$(cd "$d" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P)" || { printf 'unknown'; return 0; }
+  if [ -z "$c" ]; then printf 'unknown'; return 0; fi
+  if [ "$gd" = "$c" ]; then printf 'main'; else printf 'linked'; fi
+  return 0
+}
+# _lm_root_trusted <dir> — 0 when <dir> may supply the merge authority.
+# ⛔ TRUSTED: `main` (a main checkout — the pre-#2095 shape) and `flat` (the seeded runtime, which is
+# what `deploy-harness.sh` produces and what the README's split-state table promotes).
+# ⛔ REFUSED: `linked` (a lane's own checkout — #3789) and `unknown` (a `.git` git cannot resolve).
+# ⛔ RESIDUAL, STATED RATHER THAN HIDDEN: `flat` is trusted because the caller has already required
+# `_d` == the controller-declared `O_WORK`, and that is a DECLARATION a lane can set — so a lane that
+# copies a harness into a flat directory and points `O_WORK` at it is not refused by this predicate.
+# It was not refused before either (`O_WORK` is exactly as settable as `$O`, whose copy has always
+# been the trusted authority, and a lane can write there too); what this predicate closes is the
+# REALISTIC shape — the lane's own `.worktrees/<lane>` checkout, which is a linked worktree.
+_lm_root_trusted() {
+  case "$(_lm_tree_kind "${1:-}")" in
+    main|flat) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 launch_chain() {
-  local head="$1" chain="$O/merge-one.sh"
+  local head="$1" chain="$O/merge-one.sh" _d="" _o_canon="" _root=""
+  # ⛔ `$O` IS THE CONTROLLER'S STATE DIR, AND THE HARNESS ROOT IS A SEPARATE NAME (#2095; fresh-context
+  # review of #3846, P1). Since this PR, `orch-loop.sh` exports `O` = the state dir and `O_WORK` = the
+  # harness root; on the documented `ORC_STATE_DIR` arrangement, and on every `derived:isolated(<copy>)`
+  # instance, `<state>/merge-one.sh` cannot exist and the identity test below compared against a
+  # directory the harness never lives in — so EVERY lane on such a box exited 2 before any merge work,
+  # with an exit code `lane.sh`'s table does not even map (`:580-591` lists 0/10/15/11/12/13/14) and a
+  # remedy (`deploy-harness --o $O`) that would install a whole harness INTO the state dir, undoing the
+  # split. `$O/merge-one.sh` is still tried FIRST: the operator-seeded runtime keeps exact priority, so
+  # no existing box changes behaviour by one byte.
+  _o_canon="$(cd "$O" 2>/dev/null && pwd -P)" || _o_canon="$O"
+  _root="$(cd "${O_WORK:-$O}" 2>/dev/null && pwd -P)" || _root=""
   # ⛔ THE FALLBACK MUST RESOLVE TO THE SAME TREE AS $O, NOT WHEREVER THIS FILE WAS INVOKED. $O's copy
 # is the operator-seeded authority precisely so a lane cannot choose its own gate — and the natural
 # way for a lane to run this script is the checkout copy (`scripts/orchestrator-harness/lane-merge.sh`
@@ -876,19 +935,33 @@ launch_chain() {
 # branch merge its PR through ITS version of the merge gate. Refuse instead: the lane's remedy is to
 # sync the harness, which is safe.
 if [ ! -f "$chain" ]; then
-  _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ "$_d" = "$(cd "$O" 2>/dev/null && pwd)" ]; then
+  _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  if [ "$_d" = "$_o_canon" ]; then
+    # TODAY'S PATH, UNCHANGED: the state dir IS the seeded runtime.
+    chain="$_d/merge-one.sh"
+  elif [ -n "$_root" ] && [ "$_d" = "$_root" ] && [ -f "$_root/merge-one.sh" ] && _lm_root_trusted "$_d"; then
+    # THE CONTROLLER-DECLARED HARNESS ROOT (#2095). Three conditions: a lane CAN set `O_WORK` itself,
+    # so the value alone is not identity — the copy beside the running script must be THAT tree — and
+    # #3789 keeps the last one: the tree must not be a LINKED worktree, which is exactly what a lane's
+    # own `.worktrees/<lane>` checkout is. A FLAT tree (no `.git`) is the seeded runtime and is
+    # accepted; refusing it was the P1-2 defect that made every lane on such a box exit 2.
     chain="$_d/merge-one.sh"
   else
-    say_err "lane-merge: $O/merge-one.sh is missing and the copy beside this script ($_d) is not the"
-    say_err "  harness $O — refusing to select the merge authority from a checkout that may be a lane's"
-    say_err "  own branch. Redeploy it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
+    say_err "lane-merge: no merge authority found — looked in $O/merge-one.sh and in the harness root"
+    say_err "  ${_root:-<unresolved>}/merge-one.sh; the copy beside this script ($_d) is neither the"
+    say_err "  state dir ($_o_canon) nor the controller-declared harness root ($_root), or it is a"
+    say_err "  LINKED worktree / an unreadable git tree, so it may be a lane's own branch. Refusing to"
+    say_err "  select the merge authority from it."
+    say_err "  If this box keeps its state elsewhere, the harness root must be the tree the controller"
+    say_err "  runs from (a main checkout, exported as O_WORK); the remedy is to re-seed THAT tree:"
+    say_err "  bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_root:-$O}"
     exit 2
   fi
 fi
   if [ ! -f "$chain" ]; then
-    say_err "lane-merge: merge-one.sh not found (looked in $O and beside this script) — refusing to"
-    say_err "            hand-roll a merge; redeploy the harness (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
+    say_err "lane-merge: merge-one.sh not found (looked in $O, the harness root ${_root:-<unresolved>}, and"
+    say_err "            beside this script) — refusing to hand-roll a merge; redeploy the harness"
+    say_err "            (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_root:-$O})"
     return 1
   fi
   # ⛔ THE CHECKOUT THE CHAIN RUNS FROM IS RESOLVED, NEVER INHERITED (landing-review F1). Resolved here,

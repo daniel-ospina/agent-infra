@@ -2352,7 +2352,13 @@ else
   bad "the [prtail] block is missing — the incident's own line is unpinned"
 fi
 # (c) the DRAIN STALLED line.
-sed -n '/# \[drain-health:begin\]/,/# \[drain-health:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/dh.sh"
+# ⛔ `O_WORK` IS PREPENDED, NOT ASSUMED (agent-infra#2095, found by this suite). The drain-health block
+# dispatches `"$O_WORK/stall-fix.sh"`, and `O_WORK` is declared far ABOVE the extracted range — so
+# without this binding the fragment ran `"/stall-fix.sh"` and every leg that pins WHAT the fixer is told
+# read "not-called" while the stub it was testing never ran. Binding it to the sandbox `O` is what the
+# drivers already intend, and it keeps the loop's real two-home rule (below) out of the fixture's way.
+{ echo 'O_WORK="${O_WORK:-$O}"'
+  sed -n '/# \[drain-health:begin\]/,/# \[drain-health:end\]/p' "$ORCH" | sed '1d;$d'; } > "$TMP/dh.sh"
 if [ -s "$TMP/dh.sh" ]; then
   drain() {
     : > "$TMP/dh.log"; mkdir -p "$TMP/D/state"; : > "$TMP/D/state/merged-1.done"
@@ -2409,8 +2415,19 @@ if [ -s "$TMP/dh.sh" ]; then
   # every suite stayed green (measured: `pr-dispatch.test.sh` 144/0 and `stall-fix.test.sh` 84/0
   # unchanged). §F in `stall-fix.test.sh` pins the CONSUMER of the value; these legs pin the PRODUCER,
   # because an interface is only pinned when both ends are.
+  # ⛔ THE SANDBOX MUST BE A COMPLETE WORKER ROOT (agent-infra#2095, found by this PR's own suite).
+  # `orch-loop.sh` resolves its worker root as `$O` when `$O` carries the worker scripts, and otherwise
+  # as the directory beside the LOOP. A fixture that seeds only `stall-fix.sh` therefore makes the
+  # SHIPPED loop drive the REAL harness instead of these stubs: every leg below then reads "not-called"
+  # while the stub it is testing never runs, and the leg proves nothing about the producer it pins.
+  # Seeding the three names the loop only `-f`-checks keeps the sandbox authoritative.
+  seed_worker_root() { # <dir>
+    local d="$1" w
+    for w in fix-one.sh merge-one.sh dispatch-merge.sh; do : > "$d/$w"; done
+  }
   stallfix_dispatch() {   # <land-age-minutes> -> <pass counter>|<age provenance> | "not-called"
     rm -f "$TMP/called.txt"; mkdir -p "$TMP/D3/state"; : > "$TMP/D3/state/merged-1.done"
+    seed_worker_root "$TMP/D3"
     cat > "$TMP/D3/stall-fix.sh" <<'STUBFIX'
 #!/bin/bash
 printf '%s|%s' "${1:-}" "${_AGESRC:-<unset>}" >> "$STUBMARK"
@@ -2440,6 +2457,7 @@ STUBFIX
   # it is the EMPTY-ANSWER path (and not a missing marker) that has to reach the dispatcher.
   stallfix_dispatch_noland() {
     rm -f "$TMP/called.txt"; mkdir -p "$TMP/D4/state"; : > "$TMP/D4/state/merged-1.done"
+    seed_worker_root "$TMP/D4"
     cat > "$TMP/D4/stall-fix.sh" <<'STUBFIX'
 #!/bin/bash
 printf '%s|%s' "${1:-}" "${_AGESRC:-<unset>}" >> "$STUBMARK"
@@ -2466,6 +2484,7 @@ STUBFIX
   # passes for the wrong reason is the thing this suite exists to prevent.
   stallfix_dispatch_unreadable_state() {
     rm -f "$TMP/called.txt"; mkdir -p "$TMP/D7/state"; : > "$TMP/D7/state/merged-1.done"
+    seed_worker_root "$TMP/D7"
     chmod 0333 "$TMP/D7/state"
     cat > "$TMP/D7/stall-fix.sh" <<'STUBFIX'
 #!/bin/bash

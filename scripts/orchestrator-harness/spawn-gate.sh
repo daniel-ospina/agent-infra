@@ -3687,14 +3687,19 @@ BRIEF_GATE_SH=""
 #
 # ⛔ THE CANDIDATE LIST IS THE FILE'S OWN HELPERS' LIST, AND THAT IS A FIX, NOT TIDYING (measured
 # 2026-11-01, agent-infra#2293 follow-up). This file is ALSO the installed `pi` shim at
-# `$HOME/.pi/agent/bin/pi`, whose own directory holds NO harness, and the shim inherits `O` only when
-# the launcher exported it (`orch-loop.sh` sets `O="${O:-$HOME/orchestrator}"` and does NOT export
-# it). The first version of this resolver searched `$O` and "beside me" ONLY, so on every spawn whose
-# `O` was absent it resolved nothing and each of those lanes ran with the fork floor SILENTLY OFF
-# behind a per-launch WARN — while `brief_gate_lib`, `lane_bound_path` and the capability probe in
-# this same file all search four locations and therefore worked. The remedy is the instrument being
-# PRESENT: `$HOME/orchestrator` is the documented default for `O`, so it is searched too, and the
-# paths actually tried are RECORDED for the refusal text below.
+# `$HOME/.pi/agent/bin/pi`, whose own directory holds NO harness. The first version of this resolver
+# searched `$O` and "beside me" ONLY, so on every spawn whose `O` was absent it resolved nothing and
+# each of those lanes ran with the fork floor SILENTLY OFF behind a per-launch WARN — while
+# `brief_gate_lib`, `lane_bound_path` and the capability probe in this same file all search four
+# locations and therefore worked. The remedy is the instrument being PRESENT: `$HOME/orchestrator` is
+# the documented default for `O`, so it is searched too, and the paths actually tried are RECORDED for
+# the refusal text below.
+# ⛔ AND THE LAUNCHER'S `O` IS NO LONGER THE HARNESS ROOT (agent-infra#2095, review of #3846, P2).
+# `orch-loop.sh` DOES export `O` now, but `O` is the resolved STATE dir, so a shim inheriting it would
+# resolve `capacity.sh` from a directory that holds only `logs/` and `state/`. The work root is
+# therefore searched FIRST, by its own name (`O_WORK`), before the state dir — otherwise this gate's
+# arithmetic arm would be silently off on exactly the arrangement #2095 documents, which is the
+# SILENTLY-OFF failure this comment's own paragraph above exists to prevent.
 CAP_GATE_MOD_LOADED=0
 # The paths the last resolution attempt searched, space-separated — read by spawn_fork_state so a
 # `nodeploy` refusal can say what it looked for instead of leaving an operator to guess.
@@ -3745,7 +3750,7 @@ spawn_gate_load_capacity() {
   # `CAP_MIN_FORK_HEADROOM=1`, followed by a complete copy reporting `procs=995/1000 headroom=5`,
   # produced `state=ok` and launched pi — the exact false PASS this change exists to close, with
   # nothing logged. A subshell cannot poison this shell, so the winner is the only file ever sourced.
-  for _sgc_d in "${O:-}" "$_sgc_here" \
+  for _sgc_d in "${O_WORK:-}" "${O:-}" "$_sgc_here" \
                 "${AGENT_INFRA_PATH:+$AGENT_INFRA_PATH/scripts/orchestrator-harness}" \
                 "${HOME:+$HOME/orchestrator}" "${HOME:+$HOME/.pi/agent/scripts}"; do
     [ -n "$_sgc_d" ] || continue

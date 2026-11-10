@@ -524,7 +524,7 @@ cat > "$W/harness/merge-one.sh" <<EOF
 k="\${AI_REVIEW_GATE_KEY:-}"
 if [ -z "\$k" ] && [ -f "\$HOME/.pi/agent/.ai-review-gate-key" ]; then k="\$(cat "\$HOME/.pi/agent/.ai-review-gate-key")"; fi
 printf '%s' "\${DEEPSEEK_API_KEY:-}" > '$W/worker-prov'
-printf 'HOME=%s\\nO=%s\\n' "\${HOME:-}" "\${O:-}" > '$W/worker-env'
+printf 'HOME=%s\\nO=%s\\nO_WORK=%s\\n' "\${HOME:-}" "\${O:-}" "\${O_WORK:-}" > '$W/worker-env'
 printf '%s' "\$k" | tr -d '[:space:]' > '$W/worker-key'
 EOF
 chmod +x "$W/harness/orch-loop.sh" "$W/harness/merge-one.sh"
@@ -575,7 +575,11 @@ case "$sub" in
     exit 0 ;;
   new-session)
     if no_server; then
-      for v in PATH HOME O AI_REVIEW_GATE_KEY DEEPSEEK_API_KEY AI1711_STATE; do
+      # ⛔ `O_WORK` IS IN THE SNAPSHOT BECAUSE A REAL SERVER INHERITS THE CLIENT'S WHOLE ENVIRONMENT
+      # (#2095): the list below is a deterministic SLICE of that environment, and the cold arms assert
+      # that a worker created with no pre-existing server still receives the harness root. Omit it here
+      # and the double models a tmux that drops an exported variable — the opposite of the real one.
+      for v in PATH HOME O O_WORK AI_REVIEW_GATE_KEY DEEPSEEK_API_KEY AI1711_STATE; do
         declare -p "$v" 2>/dev/null || printf 'unset %s\n' "$v"
       done > "$S/server-env"
       # Seed a representative slice of tmux's own compiled-in default list, so the suite can tell an
@@ -669,7 +673,7 @@ wk_case() {
   for i in $(seq 1 40); do pgrep -f "$W/harness/orch-loop\.sh" >/dev/null 2>&1 || break; sleep 0.25; done
   env AI_REVIEW_GATE_KEY="$amb" PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
       CELL_HOME="$W/cellhome" HOME="$W/cellhome" ENV_FILE="$envf" \
-      SESSION="$sess" DOCTOR_SESSION="cell-doctor-1711" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 \
+      SESSION="$sess" DOCTOR_SESSION="cell-doctor-1711" O="$W/o" O_WORK="$W/o-work" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 \
       HARNESS_REF="$W_REF" \
       bash "$SUP" start >"$W/start.$kind.$route.$server.out" 2>&1 || rc=$?
   for i in $(seq 1 80); do [ -f "$W/worker-key" ] && break; sleep 0.25; done
@@ -710,6 +714,15 @@ wk_case() {
   grep -q "^O=$W/o$" "$W/worker-env" 2>/dev/null \
     && ok "$tag: the worker's \$O is the controller's (no split state dir)" \
     || bad "$tag: worker \$O was not $W/o — $(tr '\n' ' ' < "$W/worker-env" 2>/dev/null)"
+  # ⛔ AND THE HARNESS ROOT IS A DIFFERENT NAME (#2095, review of #3846 P1). `O` is the STATE dir, so a
+  # worker that crosses this boundary without `O_WORK` resolves its modules (`claims.sh`,
+  # `merge-one.sh`) from a directory that holds none of them and loses the landing/head claims
+  # SILENTLY. Asserted here rather than only in worker-terminal's own suite because THIS is the second
+  # tmux boundary: the `pre` arms are the ones that redden if `O_WORK` is dropped from
+  # WORKER_ENV_NAMES (an operator's existing server supplies the session env).
+  grep -q "^O_WORK=$W/o-work$" "$W/worker-env" 2>/dev/null \
+    && ok "$tag: the worker's \$O_WORK is the controller's harness root (its module layer resolves)" \
+    || bad "$tag: worker \$O_WORK was '$(sed -n 's/^O_WORK=//p' "$W/worker-env" 2>/dev/null)' (want $W/o-work) — a dropped work root silently loses the merge claims"
   # agent-infra#1852: the provider runtime credential is the second half of the same delivery. A cell
   # whose WORKER_ENV_NAMES omits DEEPSEEK_API_KEY still MERGES (the rail needs no agent) while EVERY
   # review and fixer dies `No API key found for deepseek`, so merge-<PR> ends verdict:<none> forever
@@ -4043,8 +4056,11 @@ kill -0 "$PEER" 2>/dev/null && ok "stop: the PEER controller SURVIVED a stale lo
                             || bad "stop: KILLED the peer controller from a stale lock — the peer is not ours to signal"
 [ -e "$P/o/.orch.lock" ] && ok "stop: left the lock in place (a pid we cannot prove dead is not ours to release)" \
                           || bad "stop: released a lock whose named pid is alive"
-# The provably-DEAD form: the same lock with a pid that is gone is noise the harness's acq() clears,
-# but a recycled pid makes acq() see a live process and exit 0 SILENTLY — so `stop` says so.
+# The provably-DEAD form: the same lock with a pid that is gone is noise the harness's lock clears.
+# (A recycled pid used to make `orch-loop.sh` see a live process and exit 0 SILENTLY; agent-infra#2095
+# gave the loop a real identity test — it reclaims a pid that began after the record was written — so
+# that case is now handled by the loop itself, and this suite's concern is only that `stop` names what
+# it cannot prove.)
 kill -9 "$PEER" 2>/dev/null; sleep 0.3
 printf '999999\n' > "$P/o/.orch.lock"
 OUT="$(own_peer stop)"

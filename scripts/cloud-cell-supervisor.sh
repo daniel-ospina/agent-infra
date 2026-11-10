@@ -375,9 +375,18 @@ workers_maybe_live() {
 #                        Without it only the controller would be served. ORDER MATTERS: the adapter
 #                        routes every call through the same `$O/gh-limit.py`, so it must resolve first
 #                        or the adapter is never reached (this file's `start` builds exactly that order
-#                        in both carriers — :4103 for the service-mode export, :4131 for the tmux
-#                        string; `lane.sh:83-84` re-asserts it for lanes).
-WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
+#                        in both carriers — the service-mode pair of `export PATH=…:$PATH` lines, gh-limit
+#                        first and gh-rest prepended AFTER it so the later prepend wins, and the tmux
+#                        `new-session` string's `PATH='$O/gh-rest':'$O/gh-limit':`; `lane.sh` re-asserts
+#                        it for lanes). The carriers are named, not line-numbered, because the #2095
+#                        `O`/`O_WORK` merge moved both — the same positional-claim class #2095 retired.
+#   O_WORK             — the HARNESS ROOT, which is a SEPARATE name from `O` (the state dir) since
+#                        #2095. Every worker resolves its own modules (`claims.sh`, `repo-authority.sh`,
+#                        `merge-one.sh`) from it, so a worker that crosses this second tmux boundary
+#                        without it falls back to `$O` — where those files do not exist — and loses
+#                        the landing/head claims SILENTLY (the duplicate-merge exclusion) while the
+#                        cell keeps reporting RUNNING.
+WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O O_WORK DEEPSEEK_API_KEY PATH"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
@@ -3271,9 +3280,12 @@ cmd_check() {
   # `. "$SELF/<f>" || { …; exit 78; }`, so a $O missing one makes EVERY dispatch on the box die at
   # startup — while this list, whose own comment says it exists to prevent exactly that false PASS,
   # certified the box runnable. `key-gate.sh` (#3331) and `lane-env.sh` (#3060) are the two newest;
+  # `controller-state.sh` (#2095) is the SAME class one degree sharper: `orch-loop.sh` sources it before
+  # its first cycle and `exit 78`s without it, so a $O that predates the change — or is half-synced —
+  # has the CONTROLLER stop on every tick while this check certifies "CELL CAN RUN A CONTROLLER".
   # `brief-gate.sh` (#2258) and `wt-lifecycle.sh` (#2033) are older instances of the same class and were
   # equally absent, so they are added with it rather than left as the next thing to be found by hand.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh controller-state.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"

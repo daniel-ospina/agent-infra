@@ -27,6 +27,18 @@
 #      a runner without it.
 #   H  an EMPTY plist value is a MEANING, not an absence: `install.sh` renders OR empty on purpose
 #      (#2040: "derive it from $REPO's origin"), so forwarding only NON-EMPTY values loses it
+#   I  a singleton REFUSAL is PROPAGATED as the wrapper's own exit 75 (agent-infra#2095) — the plist's
+#      program is `orch-pin-exec.sh`, so launchd sees THIS wrapper's code and never the loop's, and
+#      `harness-up`'s REFUSED-SINGLETON row was unreachable without it. Three arms: the refusal (75); a
+#      plain early death with NO [singleton] line (69, so the arm cannot pass by labelling everything a
+#      refusal); and a STALE [singleton] line from an earlier attempt followed by an unrelated death
+#      (69 — the log is append-only, so an unbounded witness would report a dead controller as a
+#      correct refusal for ever).
+#   J  the refusal WITNESS follows the resolved STATE DIR, not `$O` (fresh-context review of #3846, P2):
+#      `ORC_STATE_DIR` outranks `O` in `controller-state.sh`, so a wrapper watching `$O/logs/orch-loop.log`
+#      misses the `[singleton]` line and answers 69 for a correct refusal. The stub controller mirrors
+#      the shipped loop's rank-1 lookup, so this case also proves the key reaches the PANE (the server's
+#      own environment never carries it).
 #
 # HERMETIC: its own `TMUX_TMPDIR` (so it can never touch, count or reap a real session), its own
 # HOME, its own scratch `$O`, and a stub `orch-loop.sh`. No network. Run: bash launchd-controller.test.sh
@@ -359,6 +371,258 @@ if [ "$D_ELAPSED" -ge $(( FLOOR_S + 2 )) ]; then
 else
   bad "case D: returned after ${D_ELAPSED}s with a ${FLOOR_S}s floor and a ~4 s session — the floor did NOT engage (a floorless build would land here)"
 fi
+
+# ── I. a REFUSAL is propagated, not reported as a crash (agent-infra#2095) ───────────────────────
+# ⛔ WHY THIS ARM EXISTS. The plist's program is `orch-pin-exec.sh`, so launchd's `last exit code` is
+# THIS WRAPPER's, and `harness-up` grew a `REFUSED-SINGLETON` row keyed on 75. Without propagation the
+# wrapper answered 69 for anything that died inside 2 s — exactly what a refusal looks like — so the
+# row could never fire and a CORRECT refusal read as `DIED … every attempt is failing` for ever.
+# A stubbed `harness-up` proves the row's wording; only this arm proves the code ever arrives.
+log_line "I. a [singleton] REFUSAL is propagated as 75, not swallowed as 69"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+REFUSAL_O="$TMP/o-refusal"; mkdir -p "$REFUSAL_O/logs"
+cat > "$REFUSAL_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+# A controller that refuses at startup: it writes the line the shipped loop writes and exits 75.
+mkdir -p "$O/logs" 2>/dev/null
+echo "[singleton] refused me=pid=$$@test state=$O — HELD by live controller pid 999999" >> "$O/logs/orch-loop.log" 2>/dev/null
+exit 75
+SH
+chmod +x "$REFUSAL_O/orch-loop.sh"
+I_ERR="$TMP/i.err"
+O="$REFUSAL_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/i.out" 2>"$I_ERR" &
+I_PID=$!
+wait "$I_PID"; I_RC=$?
+if [ "$I_RC" -eq 75 ]; then
+  ok "case I: a refusal (the loop wrote [singleton] and exited 75) is PROPAGATED as 75"
+else
+  bad "case I: the wrapper exited $I_RC, want 75 — a refusal would be reported as a crash (stderr: $(head -2 "$I_ERR"))"
+fi
+if grep -q 'REFUSED to start' "$I_ERR"; then
+  ok "case I: it SAYS the refusal is a refusal, naming the holder's log"
+else
+  bad "case I: no refusal line on stderr — the operator gets a crash framing"
+fi
+# ⛔ NON-VACUITY CONTROL: the same path must still report a genuine early death as 69. Without this,
+# a wrapper that answered 75 for everything would pass the two checks above.
+DEAD_O="$TMP/o-dead"; mkdir -p "$DEAD_O/logs"
+cat > "$DEAD_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+exit 1
+SH
+chmod +x "$DEAD_O/orch-loop.sh"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+J_ERR="$TMP/j.err"
+O="$DEAD_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/j.out" 2>"$J_ERR" &
+J_PID=$!
+wait "$J_PID"; J_RC=$?
+if [ "$J_RC" -eq 69 ]; then
+  ok "case I control: a loop that dies with NO [singleton] line still exits 69 (no refusal is invented)"
+else
+  bad "case I control: exited $J_RC, want 69 — a plain early death is now labelled something else"
+fi
+# ⛔ AND A STALE REFUSAL MUST NOT SPEAK FOR THIS ATTEMPT (fresh-context review of #3846, P1). The log is
+# APPEND-ONLY, so a refusal recorded earlier stays in it for ever: an unbounded grep turns every LATER
+# early death — a half-synced `$O` (78), missing worker scripts (78), `REPO` unset (78) — into
+# "REFUSED-SINGLETON … nothing to do here", i.e. a dead controller described as a correct refusal. This
+# arm is the one the two fresh-`$O` arms above CANNOT see.
+STALE_O="$TMP/o-stale"; mkdir -p "$STALE_O/logs"
+echo "[singleton] refused me=pid=1@old state=$STALE_O — HELD by live controller pid 999999" > "$STALE_O/logs/orch-loop.log"
+cat > "$STALE_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+# Dies for an UNRELATED reason and writes no [singleton] line of its own.
+echo "[startup] FATAL REPO is not set" >> "$O/logs/orch-loop.log" 2>/dev/null
+exit 78
+SH
+chmod +x "$STALE_O/orch-loop.sh"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+K_ERR="$TMP/k.err"
+O="$STALE_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/k.out" 2>"$K_ERR" &
+K_PID=$!
+wait "$K_PID"; K_RC=$?
+if [ "$K_RC" -eq 69 ]; then
+  ok "case I stale: an OLD [singleton] line does NOT make this attempt read as a refusal (rc 69)"
+else
+  bad "case I stale: exited $K_RC, want 69 — a historical refusal spoke for an unrelated early death"
+fi
+if grep -q 'REFUSED to start' "$K_ERR"; then
+  bad "case I stale: it CLAIMED a refusal for an attempt that never refused"
+else
+  ok "case I stale: it does not claim a refusal it cannot witness"
+fi
+# ⛔ AND THE TWO REFUSALS KEEP THEIR OWN CODES (fresh-context review of #3846). 75 = HELD: a controller
+# owns this state dir, leave the lock alone. 74 = UNJUDGED: the record could not be read or dated, so
+# somebody has to look and may remove it. Opposite remedies, so the wrapper must not flatten them —
+# otherwise `harness-up` asserts "the singleton working, do not touch the lock" over a state whose
+# remedy is the opposite.
+UNJ_O="$TMP/o-unj"; mkdir -p "$UNJ_O/logs"
+cat > "$UNJ_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+echo "[singleton] rc=2 refused me=pid=$$@test state=$O — HELD by pid 999999, whose AGE CANNOT BE READ" >> "$O/logs/orch-loop.log" 2>/dev/null
+exit 74
+SH
+chmod +x "$UNJ_O/orch-loop.sh"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+L_ERR="$TMP/l.err"
+O="$UNJ_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/l.out" 2>"$L_ERR" &
+L_PID=$!
+wait "$L_PID"; L_RC=$?
+if [ "$L_RC" -eq 74 ]; then
+  ok "case I unjudged: an UNJUDGED refusal (rc=2) is propagated as 74, not flattened to 75"
+else
+  bad "case I unjudged: exited $L_RC, want 74 — the two refusals share a code again"
+fi
+# ── J. the witness follows the RESOLVED state dir, not `$O` (fresh-context review of #3846, P2) ──
+# ⛔ `orch-loop.sh` ranks `ORC_STATE_DIR` ABOVE `O` (`controller-state.sh:95-97`) while `O` stays the tree
+# this wrapper execs `$O/orch-loop.sh` from — so a state dir named by a launcher moves the LOG while the
+# wrapper keeps watching `$O/logs/orch-loop.log`. It then finds no `[singleton]` line and answers 69 for
+# a CORRECT refusal: the false-crash framing the witness exists to remove, with `harness-up`'s
+# REFUSED-SINGLETON row unreachable. Reachable today by a hand-run with `ORC_STATE_DIR` exported, and by
+# a rendered plist value once `ORC_STATE_DIR` is forwarded.
+log_line "J. the refusal witness is read from the RESOLVED state dir (ORC_STATE_DIR), not from \$O"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+SD_O="$TMP/o-sd"; SD_STATE="$TMP/state-sd"; mkdir -p "$SD_O" "$SD_STATE/logs"
+cat > "$SD_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+# Mirror the SHIPPED loop's own ranking (rank 1 = ORC_STATE_DIR, else the explicit `O`). The pane gets
+# ORC_STATE_DIR only from the wrapper's whitelist — the tmux SERVER was started from this suite's
+# environment, which does not carry it — so this stub also proves the hand-off.
+_S="${ORC_STATE_DIR:-$O}"
+mkdir -p "$_S/logs" 2>/dev/null
+echo "[singleton] rc=1 refused me=pid=$$@test state=$_S — HELD by live controller pid 999999" >> "$_S/logs/orch-loop.log" 2>/dev/null
+exit 75
+SH
+chmod +x "$SD_O/orch-loop.sh"
+M_ERR="$TMP/m.err"
+O="$SD_O" ORC_STATE_DIR="$SD_STATE" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/m.out" 2>"$M_ERR" &
+M_PID=$!
+wait "$M_PID"; M_RC=$?
+if [ "$M_RC" -eq 75 ]; then
+  ok "case J: a refusal written to \$ORC_STATE_DIR is PROPAGATED as 75 (the witness follows the state dir)"
+else
+  bad "case J: the wrapper exited $M_RC, want 75 — it read the witness from \$O, so a correct refusal reads as a crash (stderr: $(head -2 "$M_ERR"))"
+fi
+if grep -q 'REFUSED to start' "$M_ERR"; then
+  ok "case J: it names the refusal and the log it read it from"
+else
+  bad "case J: no refusal line on stderr — the operator gets a crash framing"
+fi
+# ⛔ NON-VACUITY: the SAME scenario against a wrapper whose witness path is REVERTED to `$O` must answer
+# 69. Without this control the arm above would also pass on a build that never reads the log at all, and
+# on one whose log path happens to coincide with where the stub wrote.
+MUT_J="$TMP/j-mutant.sh"
+sed 's|^_LC_STATE=.*$|_LC_STATE="$O"|' "$TARGET" > "$MUT_J"
+if grep -qx '_LC_STATE="$O"' "$MUT_J"; then
+  "$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+  N_ERR="$TMP/n.err"
+  O="$SD_O" ORC_STATE_DIR="$SD_STATE" CONTROLLER_RESTART_FLOOR=2 bash "$MUT_J" >"$TMP/n.out" 2>"$N_ERR" &
+  N_PID=$!
+  wait "$N_PID"; N_RC=$?
+  if [ "$N_RC" -eq 69 ]; then
+    ok "case J non-vacuity: a witness pinned to \$O answers 69 for the same refusal (the arm measures the fix)"
+  else
+    bad "case J non-vacuity: the reverted-witness mutant exited $N_RC, want 69 — the arm above does not discriminate"
+  fi
+else
+  bad "case J non-vacuity: could not build the reverted-witness mutant — the control cannot run, so the arm above is unproven"
+fi
+# ── K. a SLOW refusal is STILL a refusal (P1-1, fresh-context review of #3846) ────────────────────
+# ⛔ THE WITNESS WAS CONSULTED ONLY INSIDE THE CREATE BRANCH'S TWO PROBES (~2.1 s: the appearance check,
+# then `sleep 2`). A refusal that landed after them fell through to the supervisor and ended on an
+# UNCONDITIONAL `exit 0`, so launchd's `last exit code` was 0, `harness-up` printed its EXITED-CLEAN row
+# (whose text asserts "a 0 is never a refusal"), the REFUSED-SINGLETON/REFUSED-UNJUDGED rows could never
+# fire, and under KeepAlive it repeated every ThrottleInterval on a HEALTHY box. The trigger is a slow
+# START — the very condition of the incident box (load 158, 12.4 GB swap), where the lock is reached
+# after sourcing, `derive_or`'s `git` spawn and the MAX_LOAD block. MEASURED on the round-10 head with
+# this suite's own stub: refusal at 0.5 s / 2.0 s -> 75, at 2.2 s / 2.5 s / 3.0 s -> 0.
+log_line "K. a refusal SLOWER than the create branch's ~2.1 s probes is still propagated as 75"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+SLOW_O="$TMP/o-slowref"; mkdir -p "$SLOW_O/logs"
+cat > "$SLOW_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+# Refuses LATER than the wrapper's two create-branch probes: 3.5 s is inside the supervisor's first
+# `sleep 5` poll, so the refusal is only visible AFTER the probe window has closed.
+sleep 3.5
+mkdir -p "$O/logs" 2>/dev/null
+echo "[singleton] rc=1 refused me=pid=$$@test state=$O — HELD by live controller pid 999999" >> "$O/logs/orch-loop.log" 2>/dev/null
+exit 75
+SH
+chmod +x "$SLOW_O/orch-loop.sh"
+P_ERR="$TMP/p.err"
+O="$SLOW_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/p.out" 2>"$P_ERR" &
+P_PID=$!
+wait "$P_PID"; P_RC=$?
+if [ "$P_RC" -eq 75 ]; then
+  ok "case K: a refusal that lands AFTER the ~2.1 s probe window is still PROPAGATED as 75 (pre-fix: 0)"
+else
+  bad "case K: the wrapper exited $P_RC for a SLOW refusal, want 75 — launchd records 0 and harness-up calls it EXITED-CLEAN (stderr: $(head -2 "$P_ERR"))"
+fi
+if grep -q 'REFUSED to start' "$P_ERR"; then
+  ok "case K: and it names the refusal, so the operator gets the holder's log rather than a clean exit"
+else
+  bad "case K: no refusal line on stderr for a slow refusal — the propagation chain stops at ~2.1 s"
+fi
+# ⛔ NON-VACUITY (1): the SAME slow lifetime with NO `[singleton]` line is a controller that ran and
+# ended normally — exit 0. Without this, a wrapper that answered 75 for every slow death would pass.
+SLOWD_O="$TMP/o-slowdead"; mkdir -p "$SLOWD_O/logs"
+cat > "$SLOWD_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+sleep 3.5
+exit 1
+SH
+chmod +x "$SLOWD_O/orch-loop.sh"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+Q_ERR="$TMP/q.err"
+O="$SLOWD_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/q.out" 2>"$Q_ERR" &
+Q_PID=$!
+wait "$Q_PID"; Q_RC=$?
+if [ "$Q_RC" -eq 0 ]; then
+  ok "case K control: the same SLOW end WITHOUT a [singleton] line is still exit 0 (the arm keys on the witness, not on the lifetime)"
+else
+  bad "case K control: exited $Q_RC, want 0 — a slow but ordinary end is now labelled a refusal"
+fi
+# ⛔ NON-VACUITY (2): AND THE WITNESS IS SCOPED TO THIS ATTEMPT OR IT IS THE FALSE-PASS MIRROR. The log
+# is append-only, so a HISTORICAL `[singleton]` line stays in it for ever. When THIS process CREATED the
+# session the byte offset already excludes it (`case I stale` pins that), but when the session ALREADY
+# EXISTED the guard skips the create branch — so no baseline is taken, `_LC_OFFSET` is 0, and an unscoped
+# post-supervisor read would search the WHOLE log and label a later, unrelated end a REFUSAL. That is the
+# arm `_LC_WITNESS_SCOPED` exists for, and this fixture is the only shape that reaches it.
+SLOWS_O="$TMP/o-slowstale"; mkdir -p "$SLOWS_O/logs"
+printf '[singleton] refused me=pid=1@old state=%s — HELD by live controller pid 999999\n' "$SLOWS_O" > "$SLOWS_O/logs/orch-loop.log"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+# The controller that is ALREADY running when the wrapper arrives: it ends for its own reason, late.
+"$TMUX_BIN" new-session -d -s "$S" "sleep 3.5" >/dev/null 2>&1 || true
+R_ERR="$TMP/r.err"
+O="$SLOWS_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/r.out" 2>"$R_ERR" &
+R_PID=$!
+wait "$R_PID"; R_RC=$?
+if [ "$R_RC" -eq 0 ] && ! grep -q 'REFUSED to start' "$R_ERR"; then
+  ok "case K stale: an OLD [singleton] line does NOT turn the end of an ALREADY-RUNNING session into a refusal (rc 0)"
+else
+  bad "case K stale: exited $R_RC for a historical refusal line — the witness is not scoped to this attempt (stderr: $(head -2 "$R_ERR"))"
+fi
+# ⛔ NON-VACUITY FOR THAT CONTROL: the SAME fixture against a wrapper whose post-supervisor arm drops the
+# scoping gate must answer 75. Without this the control above also passes on a build that never reads the
+# log post-supervisor at all, i.e. on the pre-fix code — it would grade nothing.
+MUT_K="$TMP/k-mutant.sh"
+sed 's|^if \[ "${_LC_WITNESS_SCOPED:-0}" = "1" \] && _lc_refused; then$|if _lc_refused; then|' "$TARGET" > "$MUT_K"
+if grep -qx 'if _lc_refused; then' "$MUT_K"; then
+  "$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+  "$TMUX_BIN" new-session -d -s "$S" "sleep 3.5" >/dev/null 2>&1 || true
+  S_ERR="$TMP/s.err"
+  O="$SLOWS_O" CONTROLLER_RESTART_FLOOR=2 bash "$MUT_K" >"$TMP/s.out" 2>"$S_ERR" &
+  S_PID=$!
+  wait "$S_PID"; S_RC=$?
+  if [ "$S_RC" -eq 75 ]; then
+    ok "case K stale non-vacuity: an UNSCOPED witness answers 75 for the same historical line (the scoping is what the arm measures)"
+  else
+    bad "case K stale non-vacuity: the unscoped mutant exited $S_RC, want 75 — the stale control above does not discriminate"
+  fi
+else
+  bad "case K stale non-vacuity: could not build the unscoped-witness mutant — the control cannot run, so the arm above is unproven"
+fi
+export O="$TMP/o"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
 
 # ── summary ────────────────────────────────────────────────────────────────────────────────────
 log_line "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
