@@ -1366,10 +1366,34 @@ for s in d.get("screens",[]) or []:
     if mode=="liveness":
         if not ids:
             st="empty"
-        elif any(run.get(tabs.get(t) or "",False) for t in ids):
-            st="live"
         else:
-            st="idle"
+            # ⛔ AN ACCOUNTING, NOT A TYPE (agent-infra#2312 review P1). Proving `terminals` is a LIST
+            # says nothing about the tabs a screen NAMES: `run.get(tabs.get(t) or "", False)` answers
+            # "not running" for a tab whose content_id has NO terminal record, so a document that is
+            # type-valid but does not account for its own tabs (a drifted `terminals[]`/id shape across
+            # a cmux upgrade — the header already records that the id shape differs between builds — or a
+            # partial `terminals: []`) read EVERY workspace as `idle`, and the sweep then ran
+            # `cmux workspace rm` on workspaces that may hold a RUNNING lane. That is the one thing this
+            # file says it never does, and the `live` arm of the suite cannot see it because it builds a
+            # resolvable `terminals` list. So a screen whose tabs do NOT all resolve to a terminal record
+            # is UNREADABLE (exit 3, the same answer as a document that will not parse), never `idle`. The
+            # MEASURED idle shape still resolves (`running:false` records PRESENT — 124 of 134 workspaces
+            # on the cell this change was measured on), so the case the sweep exists for keeps working
+            # and the drift case removes nothing instead of removing everything.
+            recs=[run.get(tabs.get(t) or "") for t in ids]
+            # A resolved RUNNING record is decisive on its own — a lane is live whatever else the
+            # document does or does not account for.
+            if any(recs):
+                st="live"
+            elif any(r is None for r in recs):
+                # …and `idle` is the only value that DELETES, so it requires the FULL accounting: every
+                # tab resolved to a terminal record, none of them running. Anything less is `exit(3)`,
+                # the same answer as a document that will not parse. This is also what makes the swept
+                # line's claim ("their terminals had ALL exited") true of the document it read, instead
+                # of an assertion about tabs the census never mentioned.
+                sys.exit(3)
+            else:
+                st="idle"
         print("ws\t%s\t%s" % (wid,st))
         continue
     add("ws",wid)
@@ -2319,7 +2343,7 @@ EOF
 # the line states what the RE-READ still finds, including `could NOT confirm` when the census cannot be
 # read at all.
 wt_sweep_idle_workspaces() {
-  local name="" tree rows k id st n=0 max left
+  local name="" tree rows k id st n=0 max left re nleft
   [ "${WT_IDLE_SWEEP:-1}" = "0" ] && return 0
   command -v cmux >/dev/null 2>&1 || return 0
   # The name rule is `wt_name_ok`'s: anything else is not a workspace this launcher could have made.
@@ -2342,11 +2366,20 @@ EOF
   [ "$n" -gt 0 ] || return 0
   # The census is now WRONG about this box, and `wt_table` memoises it in a file.
   wt_forget
-  left="$(
-    wt_bounded "${WT_TREE_TIMEOUT:-15}" cmux tree --json 2>/dev/null \
-      | python3 -c "$WT_WS_PY" "$name" liveness 2>/dev/null \
-      | awk -F'\t' '$1=="ws" && $3=="idle" {c++} END {print c+0}'
-  )"
+  # ⛔ THE ARM IS DECIDED BY THE RE-READ'S OWN STATUS, NEVER BY WHAT `awk` PRINTED (agent-infra#2312
+  # review P1, reproduced). `awk`'s `END{print c+0}` runs UNCONDITIONALLY — its END block prints even
+  # with no input — and a pipeline's status is its LAST element's, so a fired `wt_bounded`, a failed
+  # `cmux tree --json` and python's own `exit(3)` for an unreadable shape ALL still landed in `left=0`.
+  # The `could NOT confirm` arm below was therefore reachable only if `awk` itself was missing, i.e. it
+  # could not fire for its ONE stated purpose — the exact false PASS this issue is about, printed by the
+  # sentence the docs say will never be printed. Measured on the code this replaces: first `tree` OK,
+  # `rm` OK, second `tree` exit 1 with no output ⇒ "the re-read still finds 0 idle workspace(s)".
+  # Same polarity as the rest of this file: an unreadable reading is not an empty one.
+  left=""
+  re="$(wt_bounded "${WT_TREE_TIMEOUT:-15}" cmux tree --json 2>/dev/null)" || re=""
+  if [ -n "$re" ] && nleft="$(printf '%s\n' "$re" | python3 -c "$WT_WS_PY" "$name" liveness 2>/dev/null)"; then
+    left="$(printf '%s\n' "$nleft" | awk -F'\t' '$1=="ws" && $3=="idle" {c++} END {print c+0}')"
+  fi
   case "${left:-}" in
     ''|*[!0-9]*)
       wt_warn "SWEPT ${name:-<all wt-*>}: asked the daemon to remove $n idle workspace(s) (their terminals had ALL exited), and the re-read could NOT confirm the result — the remaining count is UNVERIFIED" ;;
