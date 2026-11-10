@@ -2993,7 +2993,14 @@ assert_not_contains "$OUT" "UNMANAGED" "§18 a RETIRED label is NOT unmanaged (i
 assert_eq "$RC" "1" "§18 a RETIRED label that is STILL INSTALLED exits 1, not 0 (retire_pass has not run)"
 assert_contains "$OUT" "RETIRED-INSTALLED" "§18 ... with its OWN row class, distinct from UNMANAGED"
 assert_contains "$OUT" "com.eldato.hub-state-check" "§18 ... naming the label"
-assert_contains "$OUT" "install-launchd.sh --install" "§18 ... and the remedy that actually removes it (retire_pass)"
+assert_contains "$OUT" "bash scripts/install-launchd.sh" "§18 ... and the remedy that actually removes it (retire_pass)"
+# ⛔ AND THE PRINTED REMEDY MUST BE A VERB THAT EXISTS (#1867 review, round 10). This row used to read
+# `assert_contains "$OUT" "install-launchd.sh --install"` — it pinned a string that CANNOT RUN: the
+# installer has no `--install` arm, so the printed command fell to `*)` and exited 2. MEASURED following
+# it verbatim: rc 2 `unknown argument: --install`, plist still on disk, RETIRED-INSTALLED still printed;
+# the SAME command with no argument: `RETIRED (unloaded + removed)`, row gone. An assertion that greps a
+# remedy never notices whether the remedy works, so the string is now asserted NEGATIVELY as well.
+assert_not_contains "$OUT" "install-launchd.sh --install" "§18 ... and NOT a verb this file does not have (--install exits 2)"
 assert_not_contains "$OUT" 'bootout gui/' "§18 ... never the hand-deletion remedy: the label is DECLARED, not a stray"
 # ⛔ AND THE FIXTURE MUST BE TORN DOWN (#1867 review, round 8). The old row exited 0 whatever the plist
 # said, so leaving it on disk was invisible; now that it is a FAILING state, a seed without a teardown
@@ -3037,7 +3044,21 @@ assert_not_contains "$OUT" "UNMANAGED" "§18 the blind job is NOT unmanaged once
 assert_eq "$RC" "1" "§18 the blind job still installed is a FAILING state, not a green one"
 assert_contains "$OUT" "RETIRED-INSTALLED" "§18 ... reported as RETIRED-INSTALLED, one line per job"
 assert_contains "$OUT" "com.tortoise.heartbeat-loop" "§18 ... naming the blind heartbeat's own label"
-assert_contains "$OUT" "install-launchd.sh --install" "§18 ... and pointing at the install that runs retire_pass"
+assert_contains "$OUT" "bash scripts/install-launchd.sh" "§18 ... and pointing at the install that runs retire_pass"
+# ⛔ THE REMEDY IS NOW EXERCISED, NOT JUST GREPPED (#1867 review, round 10). The no-argument install is
+# what the row tells the operator to run; here it is actually run, and the row must clear. Round 9's
+# version of this block removed the plist by hand, so the command the operator was told to use was
+# never executed by any assertion.
+set +e
+RETIRE_REMEDY_OUT="$(run_stray_installer)"
+RETIRE_REMEDY_RC=$?
+set -e
+assert_eq "$RETIRE_REMEDY_RC" "0" "§18 the printed remedy (the bare installer) exits 0"
+assert_contains "$RETIRE_REMEDY_OUT" "com.tortoise.heartbeat-loop: RETIRED (unloaded + removed)" \
+    "§18 ... and it UNLOADS + REMOVES the retired label itself (retire_pass ran)"
+[ ! -f "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist" ] \
+    && ok "§18 ... and the plist is gone from disk, not merely reported" \
+    || bad "§18 ... the printed remedy left the retired plist installed"
 rm -f "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist"
 # The CONTROL: with the retired plist gone the box is green again, so the row above is not a stuck red
 # and an operator can verify the removal with the same verb they diagnosed with.
@@ -3318,6 +3339,54 @@ set -e
 assert_eq "$RC" "0" "§18c control: re-installing restores a clean box (the failure above was the absence, not the verb)"
 assert_contains "$OUT" "com.tortoise.pr-doctor: NOT APPLICABLE" "§18c a template the installer SKIPs is NOT APPLICABLE (not a failure)"
 assert_not_contains "$OUT" "com.tortoise.pr-doctor: NOT INSTALLED" "§18c ...and is never reported as an absent job"
+
+# ── 18c2. INSTALLED **AND** SKIPPABLE: A PERMANENT RED NO INSTALL CAN CLEAR (#1867 review, round 10)
+# Round 9 put the skip predicate INSIDE the `[ ! -f "$installed" ]` branch, so it only fired for an
+# ABSENT plist. A job installed while its placeholder resolved, on a box that has since stopped
+# qualifying, fell through to the `cmp` and was reported `DRIFTED … re-run installer` — a remedy that
+# provably cannot clear it, because the installer SKIPs that very template. MEASURED on round 9:
+# install with SWARM_ROOT set → `in sync` rc 0; unset SWARM_ROOT → `(DRIFTED …)` rc 1; run the printed
+# remedy → `SKIP … unresolved placeholder(s) {{SWARM_ROOT}}`, plist still installed, still `DRIFTED`
+# rc 1. The shipped arm hoists the predicate above the installed-check and names the state.
+SWARM_INSTALL_HOME="$T/swarm-install-home"; mkfakehome "$SWARM_INSTALL_HOME"
+run_swarm_install() { # $1 = SWARM_ROOT value
+    ( export HOME="$SWARM_INSTALL_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$TEMPLATES"
+      export AGENTS_DIR="$SWARM_INSTALL_HOME/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      export SWARM_ROOT="$1"
+      unset TORTOISE_REPO PYTHON_BIN
+      bash "$INSTALLER" 2>&1 )
+}
+run_swarm_status_no_swarm() {
+    ( export HOME="$SWARM_INSTALL_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$TEMPLATES"
+      export AGENTS_DIR="$SWARM_INSTALL_HOME/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO PYTHON_BIN SWARM_ROOT
+      bash "$INSTALLER" --status 2>&1 )
+}
+set +e
+SWARM_INSTALL_RC_IGNORED=0
+run_swarm_install "$SWARM_INSTALL_HOME/swarm" >/dev/null 2>&1 || SWARM_INSTALL_RC_IGNORED=$?
+set -e
+assert_eq "$SWARM_INSTALL_RC_IGNORED" "0" "§18c2 fixture: the declared set installs with SWARM_ROOT resolved"
+[ -f "$SWARM_INSTALL_HOME/Library/LaunchAgents/com.eldato.corruption-canary.plist" ] \
+    && ok "§18c2 fixture: the canary installed while SWARM_ROOT resolved (so the arm below is not vacuous)" \
+    || bad "§18c2 fixture: the canary did NOT install — the installed-and-skippable row would be vacuous"
+set +e
+OUT="$(run_swarm_status_no_swarm)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18c2 an INSTALLED job that stops qualifying is NOT a permanent red (rc 0)"
+assert_contains "$OUT" "com.eldato.corruption-canary: INSTALLED, but SKIPPED now" \
+    "§18c2 ... it is named as installed-and-skipped, not silently clean"
+assert_not_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (DRIFTED" \
+    "§18c2 ... and NOT as DRIFTED with a 're-run installer' remedy that cannot clear it"
+rm -f "$SWARM_INSTALL_HOME/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 
 # ── 18d. THE DECLARED SET MUST BE READABLE OR THE ANSWER IS UNKNOWN (#1867 review, round 9) ──────
 # With an EMPTY declared set, "is this label declared?" is `no` for every label — so every installed

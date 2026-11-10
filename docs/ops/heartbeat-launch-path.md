@@ -113,7 +113,9 @@ Two label classes are **declared** and therefore never reported as `UNMANAGED`, 
 is red on a healthy box is one operators learn to ignore:
 
 - `templates/launchd/RETIRED` — declared, **and pending removal**: `retire_pass` unloads and removes
-  it, on the next `--install`. The blind job itself (`com.tortoise.heartbeat-loop`, hand-installed,
+  it on the next install (the bare `bash scripts/install-launchd.sh` — this file has no `--install`
+  verb, and a remedy that does not run is worse than none). The blind job itself
+  (`com.tortoise.heartbeat-loop`, hand-installed,
   no template ever named it) is listed there, so the change that diagnoses it also removes it — no
   human hand-deletion, which `--uninstall` could not do either, since it iterates templates and
   nothing describes this label.
@@ -124,7 +126,8 @@ is red on a healthy box is one operators learn to ignore:
   exempting it from the *exit code* was not — `retire_pass` runs on an install and `--status` never
   does, so the verb certified a box that was still ticking the blind job, and the caller that
   normalises it (`scripts/fleet-schedule.py --verify`) printed `SCHEDULE VERIFIED` over it. The
-  remedy printed for this class is `bash scripts/install-launchd.sh --install` — never the
+  remedy printed for this class is `bash scripts/install-launchd.sh` (the bare invocation — the
+  install path has no `--install` verb) — never the
   `launchctl bootout … && rm -f …` advice, which belongs to jobs nobody declares. The state is
   transient by construction: any install clears it.
 - `templates/launchd/OWNED-BY-OTHER-INSTALLERS` — installed, **or adopted and supervised**, by

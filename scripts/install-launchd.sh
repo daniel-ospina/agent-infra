@@ -1639,14 +1639,36 @@ status_job() {
             unset_ph="$unset_ph {{$ph}}"
         fi
     done
+    # `install_job`'s SECOND skip guard, tested on the value that will actually be WRITTEN: a PATH
+    # composed only of unreadable entries is non-empty RAW and empty RENDERED, so the loop above passes
+    # and the unit would install with `<key>PATH</key><string></string>` (an installed-but-inert job).
     if [ -z "$unset_ph" ] && grep -q '{{PATH}}' "$template" && [ -z "$(launchd_path)" ]; then
         unset_ph=" {{PATH}}"
     fi
-    if [ ! -f "$installed" ]; then
-        if [ -n "$unset_ph" ]; then
-            echo "  $label: NOT APPLICABLE (needs$unset_ph, unset on this box — the installer SKIPs it)"
+    if [ -n "$unset_ph" ]; then
+        # ⛔ THE SKIP PREDICATE OUTRANKS "IS IT INSTALLED" (#1867 review, round 10). Round 9 put this
+        # arm inside the `[ ! -f "$installed" ]` branch, so it only fired for an ABSENT plist: a job
+        # installed while the placeholder still resolved, on a box that has since stopped qualifying
+        # (SWARM_ROOT unset, the tortoise checkout removed), fell through to the `cmp` below and was
+        # reported `DRIFTED … re-run installer` — with a remedy that provably cannot clear it, because
+        # the installer SKIPs that very template. MEASURED: install with SWARM_ROOT set → `in sync` rc
+        # 0; unset SWARM_ROOT → `(DRIFTED …)` rc 1; re-run the printed remedy → `SKIP … unresolved
+        # placeholder(s) {{SWARM_ROOT}}`, plist still installed, status still `DRIFTED` rc 1. That is a
+        # PERMANENT red on a legitimate box — the anti-pattern the OWNED-BY-OTHER-INSTALLERS exemption
+        # exists to remove.
+        if [ -f "$installed" ]; then
+            # Still INSTALLED, so say so — this is not silently a clean box: the copy on disk is
+            # neither refreshed nor removed by an install, so whatever renders today is what runs.
+            # rc 0 because the box did not break: it stopped qualifying, which is the documented
+            # SKIP arm of the install path. The row is the disclosure; the exit code is not the place
+            # to keep a red that no install can clear.
+            echo "  $label: INSTALLED, but SKIPPED now (needs$unset_ph, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)"
             return 0
         fi
+        echo "  $label: NOT APPLICABLE (needs$unset_ph, unset on this box — the installer SKIPs it)"
+        return 0
+    fi
+    if [ ! -f "$installed" ]; then
         # ⛔ AND AN INSTALLABLE TEMPLATE THAT IS NOT THERE IS A FAILURE ROW WITH A FAILURE CODE
         # (#1867 review, round 9). This function used to print the three failure verdicts and return
         # 0 for all of them, so `--status` exited 0 on a box whose declared jobs were absent, unloaded
@@ -2167,7 +2189,14 @@ if [ "${1:-}" = "--status" ]; then
         done <<<"$_retired_installed"
         echo "    Each is declared in templates/launchd/RETIRED and removed by retire_pass, which runs on" >&2
         echo "    an INSTALL — never on --status. Nothing needs them; run:" >&2
-        echo "      bash scripts/install-launchd.sh --install" >&2
+        # ⛔ THE REMEDY MUST BE A VERB THIS FILE HAS (#1867 review, round 10). It printed
+        # `install-launchd.sh --install`, and there is no `--install` arm — it falls to `*)` and exits 2
+        # with a usage error, so the removal path for the blind heartbeat could not be executed as
+        # instructed: MEASURED, the printed command → rc 2, plist still on disk, RETIRED-INSTALLED still
+        # printed; the SAME command with no argument → `RETIRED (unloaded + removed)`, row gone. The
+        # install path is the bare invocation; `--install` was invented by the string. §18 now runs the
+        # no-argument form and asserts the row clears, so a re-introduced dead verb reds.
+        echo "      bash scripts/install-launchd.sh" >&2
         if [ "$status_rc" -eq 0 ]; then
             status_rc=1
         fi

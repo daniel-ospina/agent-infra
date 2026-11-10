@@ -39,9 +39,13 @@
 # The full contract, and the macOS/Linux divergence, is docs/ops/heartbeat-launch-path.md.
 #
 # ⛔ PARITY NOTE — this file governs the LAUNCHD renderer only. On a Linux cell there is no cmux
-# desktop app and therefore no `cmuxOnly` socket, so the same loop is legitimate there; it is
-# delivered by scripts/fleet-schedule.py (the #1864 runtime), not by install-launchd.sh. That is a
-# DOCUMENTED divergence, not an omission — see docs/ops/heartbeat-launch-path.md.
+# desktop app and therefore no `cmuxOnly` socket, so the same loop is LEGITIMATE there. It is NOT
+# delivered there by anything: `scripts/fleet-schedule.py` (the #1864 runtime) schedules exactly these
+# `templates/launchd/*.plist` declarations, and THIS FILE is what forbids a template from naming the
+# loop — so on a cell the loop is hand-started or not running at all, and delivering it is #1864's
+# remaining half. Stated this way because this comment used to claim fleet-schedule delivered it,
+# contradicting docs/ops/heartbeat-launch-path.md and the launcher's own `--help` header (which were
+# corrected first — round 9 — and this manifest was missed).
 #
 # ── MATCHING RULE (stated so a reader can predict the refusal) ──────────────────────────────────
 # A ProgramArguments entry matches when its path ends with `/<entry>`. Repo-relative suffix, not
