@@ -66,16 +66,51 @@
 import { execSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
 import { closureOf, computePin, diskTree, gitTree, parseRefArg, pinReport, sanctionedPaths } from "./sanctioned-pin-tree.mjs";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = realpathSync(fileURLToPath(new URL(".", import.meta.url)));
 const REPO = realpathSync(join(HERE, "..", ".."));
 const PIN_JSON = join(HERE, "sanctioned-scripts.pin.json");
-const PIN_REL = relative(REPO, PIN_JSON);
+const PIN_REL = "extensions/main-worktree-guard/sanctioned-scripts.pin.json";
 const HOOKS = new URL("./module-load-hooks.mjs", import.meta.url).href;
+
+/** Bytes of `rel` from the SAME tree the freshness arm judges (#2818).
+ *
+ *  ⛔ THE BEHAVIOURAL ARM USED TO READ THE CHECKOUT WHILE THE FRESHNESS ARM READ
+ *  `--ref`, so the two halves of this suite judged DIFFERENT trees. In a PR job the
+ *  checkout is GitHub's synthetic MERGE of head onto the base tip, so the identity
+ *  fixtures inherited `main`'s drift: measured 2026-11-10 at head `09f23b263`, main
+ *  carried `scripts/gh-shim/gh` re-written by #3890 WITHOUT a pin re-cut, so the
+ *  merge result put main's bytes beside the branch's pin, the delegation closure
+ *  declined, and this suite reddened `22 passed, 2 failed` on a PR that touches
+ *  nothing sanctioned (arms `(a)` and `(d3)`; reproduced byte-for-byte by
+ *  materialising the merge tree). That is precisely the verdict #2818 removed for
+ *  the freshness arm — "a change that touches nothing sanctioned PASSES however far
+ *  the base has moved" — so the behavioural arm was defeating its own suite's
+ *  contract. ONE tree on both sides, or the verdict is about a tree nobody can
+ *  commit.
+ *  When the tree is unreadable (`TREE_ERROR`) or no `--ref` was given, `TREE` is the
+ *  working tree, i.e. a plain disk read — the pre-existing behaviour, unchanged. */
+function treeBytes(rel) {
+  if (TREE && TREE.has(rel)) return TREE.read(rel);
+  return readFileSync(join(REPO, rel));
+}
+
+/** The pin the GUARD will read (it reads one at load, from its own directory), taken
+ *  from the judged tree so the leaf/closure digests it is compared against and the
+ *  bytes installed at the fixture root come from the same commit. */
+function treePin() {
+  try {
+    const doc = JSON.parse(treeBytes(PIN_REL).toString("utf-8"));
+    return { sha256: doc.sha256 ?? {}, delegates: doc.delegates ?? {} };
+  } catch {
+    return { sha256: {}, delegates: {} }; // fail-closed: an unreadable pin exempts nothing
+  }
+}
 
 // `--ref <rev>` selects the COMMIT freshness is judged on (#2818). Absent ⇒ the
 // working tree, which is the only correct reading on a push to `main` and on a
@@ -134,17 +169,6 @@ const SANCTIONED = TREE_ERROR ? [] : sanctionedPaths(TREE);
 // LOCATION is part of the program that runs, so it is part of the identity
 // (`sanctioned-pin-tree.mjs` carries the pattern and the reasoning).
 const closure = () => closureOf(TREE, SANCTIONED);
-
-/** Bytes of `rel` from the tree UNDER TEST — the SAME tree the pin is read from
- *  (#2818). Absent `--ref` this is the working tree, i.e. byte-identical to the
- *  pre-existing behaviour; with `--ref` it is that commit's blob. Throws rather
- *  than degrading to the checkout: a fixture that cannot read its own reference
- *  must not silently measure some OTHER tree (the inert-gate failure mode). */
-function treeBytes(rel) {
-  const b = TREE.read(rel);
-  if (b === null) throw new Error(`${rel} is not present in ${TREE.label}`);
-  return b;
-}
 
 // ── --cut: regenerate the pin from THIS checkout ──────────────────────────
 function cut() {
@@ -230,7 +254,12 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     for (const f of readdirSync(HERE)) {
       if (/\.(ts|mjs|json)$/.test(f) && !f.startsWith("test")) copyFileSync(join(HERE, f), join(dir, f));
     }
-    const mutations = mutate === null ? [] : (Array.isArray(mutate) ? mutate : [mutate]);    if (mutations.length) {
+    // The pin is read AT LOAD from the guard's own directory, so what lands here is
+    // what the exemption is judged against — install the JUDGED tree's pin, not the
+    // checkout's (see `treeBytes`).
+    writeFileSync(join(dir, "sanctioned-scripts.pin.json"), treeBytes(PIN_REL));
+    const mutations = mutate === null ? [] : (Array.isArray(mutate) ? mutate : [mutate]);
+    if (mutations.length) {
       let src = readFileSync(join(dir, "index.ts"), "utf-8");
       for (const m of mutations) {
         const hits = src.split(m.from).length - 1;
@@ -246,22 +275,6 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     // the whole extensions tree, so the copy has to as well.
     cpSync(join(HERE, "..", "shared"), join(root, "extensions", "shared"), { recursive: true });
     mkdirSync(join(root, ".pi", "agent"), { recursive: true });
-    // ⛔ THE PIN THE GUARD LOADS IS THE JUDGED COMMIT'S PIN, NOT THE CHECKOUT'S
-    // (#2818). `_sanctionedScriptPin()` captures the pin from the module's own
-    // directory AT LOAD, so whichever file lands here decides every exemption
-    // below. In a PR job the checkout is GitHub's synthetic MERGE of head onto
-    // the base TIP: when THIS branch re-cuts the pin and `main` has meanwhile
-    // moved a delegate, the merge result carries this branch's pin beside main's
-    // script — internally inconsistent, so a perfectly valid rail is refused and
-    // the suite reds for a reason that has nothing to do with the change.
-    // MEASURED (PR #3899): `main`'s c903c7543 moved `scripts/gh-shim/gh`, the
-    // merge result paired head's pin (def5111b…, gh-shim/gh at head) with main's
-    // bytes (e1505380…), and the surface read (a) BLOCKED + (d3) inverted —
-    // 22 passed / 2 failed, on a diff that touches neither file. Writing TREE's
-    // pin, together with TREE's script bytes below, keeps the two halves of the
-    // identity in ONE commit — the rule the freshness arm at (f) already obeys.
-    const pinBytes = TREE.read(PIN_REL);
-    if (pinBytes !== null) writeFileSync(join(dir, "sanctioned-scripts.pin.json"), pinBytes);
     return pathToFileURL(join(dir, "index.ts")).href;
   }
 
@@ -277,16 +290,12 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
    *  its own location) into a fixture root — arm 2 verifies the whole program,
    *  so a root with only the leaf is (correctly) not exempt. */
   function installClosure(root, override = {}) {
-    // The DELEGATE LIST and the audited BYTES both come from the judged tree,
-    // for the same reason `deploy` writes that tree's pin: a list from one
-    // commit and bytes from another is exactly the mix #2818 removes.
-    let pin = {};
-    try { pin = JSON.parse(treeBytes(PIN_REL).toString("utf8")).delegates ?? {}; } catch { pin = {}; }
+    const pin = treePin().delegates;
     for (const rel of Object.keys(pin)) {
       const dest = join(root, rel);
       mkdirSync(dirname(dest), { recursive: true });
       if (override[rel] !== undefined) writeFileSync(dest, override[rel]);
-      else writeFileSync(dest, treeBytes(rel));
+      else writeFileSync(dest, treeBytes(rel)); // the judged tree's bytes, deliberately
     }
     return Object.keys(pin);
   }
@@ -320,9 +329,6 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     const fw = join(work, "framework");
     framework(fw);
     mkdirSync(join(fw, "scripts"), { recursive: true });
-    // The audited RAIL bytes come from the SAME tree the pin comes from — see
-    // `deploy`'s note: the checkout is a synthetic merge in a PR job, so its
-    // `scripts/` can come from a different commit than this branch's pin.
     writeFileSync(join(fw, "scripts", "admin-merge.sh"), treeBytes("scripts/admin-merge.sh"));
     installClosure(fw);
 
@@ -610,5 +616,9 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
   }
 }
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ""}`);
+// agent-infra#2723 — the aggregate carried COUNTS and no label, so the merge rail
+// (`scripts/ci_exemption.py`'s `runner::<label>` family) could not name this suite
+// and refused the whole PR blind. Measured on #2667 @ 5e320a09: this suite's only
+// machine-readable output was `❌ 12 passed, 6 failed`.
+reportVerdict("sanctioned-identity", pass, fail, { skip });
 process.exit(fail === 0 ? 0 : 1);

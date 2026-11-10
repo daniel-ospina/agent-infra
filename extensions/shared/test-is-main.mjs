@@ -39,6 +39,7 @@ import {
   UNRESOLVED,
   WARN_PREFIX,
 } from '../../scripts/is-main.mjs';
+import { reportVerdict } from './verdict.mjs';
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const HELPER = join(PROJECT_ROOT, 'scripts', 'is-main.mjs');
@@ -981,5 +982,8 @@ function cleanup() {
 }
 process.on('exit', cleanup);
 cleanup();
-console.log(`\n${pass} passed, ${fail} failed`);
+// agent-infra#2723 — the aggregate carried neither a `❌` marker nor a label, so a
+// failing run of this suite yielded NO identity and the merge rail refused the
+// whole PR blind.
+reportVerdict('test-is-main', pass, fail);
 process.exit(fail > 0 ? 1 : 0);
