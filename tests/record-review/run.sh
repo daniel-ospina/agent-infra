@@ -1782,7 +1782,17 @@ cat > "$T30/bin/gh" <<'EOF'
 # rendered: `pulls/<n>` -> head/base/count, `compare/...` -> mb line + rows.
 for x in "$@"; do
   case "$x" in
-    *"/pulls/"*)    printf '%s\t%s\t%s\n' "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;
+    *"/pulls/"*)   if [ -n "${FIX_META_RC:-}" ] && [ "$FIX_META_RC" != "0" ]; then
+                       # #2628 — the pulls read now KEEPS its status, so a
+                       # fixture that only sets an exit code cannot model it: the
+                       # recorder classifies on the HTTP status `gh` prints on
+                       # STDERR (404/422 = the API refused this PR → rc 3;
+                       # 401/403/5xx/network = nothing was read → rc 1). Same
+                       # shape as FIX_COMPARE_RC/FIX_COMPARE_ERR below.
+                       printf '%s\n' "${FIX_META_ERR:-}" >&2
+                       exit "$FIX_META_RC"
+                     fi
+                     printf '%s\t%s\t%s\n' "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;
     *"/compare/"*)  if [ "${FIX_COMPARE_RC:-0}" != "0" ]; then
                        # The real `gh` prints its own diagnosis on STDERR, and the
                        # recorder now classifies a compare failure by the HTTP
@@ -1901,6 +1911,81 @@ T30_CMP_RC="$(FIX_COMPARE_RC=1 FIX_COMPARE_ERR='gh: Not Found (HTTP 404)' PATH="
 [ "$T30_CMP_RC" = "$(printf 'unclassified\t')" ] \
   && pass "(30xvii) a compare HTTP 404 (fork head / unreachable sha) is UNCLASSIFIED, not unavailable — the API REFUSED this revision" \
   || fail "(30xvii) a compare HTTP 404 was read as transport (got '$T30_CMP_RC')"
+
+# #2628 — THE SAME SPLIT ON THE `pulls` READ, which until #2628 DISCARDED its
+# status (`2>/dev/null … || return 1`) and so called a refused PR read transport.
+# The consequence was not cosmetic: the surface cap became UNVERIFIED and a
+# clean-micro record was written for a diff whose surface was never read, while
+# the micro tier dispatches NO reviewers (the #2511 review's P1). These two
+# vectors pin the split on the read that does the discarding.
+T30_META_404="$(FIX_META_RC=1 FIX_META_ERR='gh: Not Found (HTTP 404)' PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+  FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+  HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+[ "$T30_META_404" = "$(printf 'unclassified\t')" ] \
+  && pass "(30xvii-c) a pulls-read HTTP 404 is UNCLASSIFIED — the API ANSWERED and REFUSED this PR, so it is positive evidence, not transport" \
+  || fail "(30xvii-c) a pulls-read HTTP 404 was read as transport (got '$T30_META_404')"
+# 401 is DELIBERATELY in this list, not an oversight: a credential failure is not
+# evidence about THIS PR, and calling it a refusal would refuse every record in the
+# fleet at once (the mass false-block #2511's reviewers named). It is pinned because
+# nothing else does — widening the classifier to `HTTP (401|404|422)` would strand
+# every clean-micro lane on a bad-credentials window and this loop is the only
+# assertion that reds.
+for _merr in 'gh: API rate limit exceeded for 1.2.3.4. (HTTP 403)' 'gh: Server Error (HTTP 502)' 'gh: Bad credentials (HTTP 401)' 'gh: Get "https://api.github.com/x": connection refused'; do
+  T30_META_TRANS="$(FIX_META_RC=1 FIX_META_ERR="$_merr" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
+    FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
+    HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
+  [ "$T30_META_TRANS" = "$(printf 'unavailable\t')" ] \
+    && pass "(30xvii-d) a non-refusal pulls-read failure ('${_merr:0:38}…') is TRANSPORT (unavailable), not a refusal — a throttle must not strand a legitimate micro lane" \
+    || fail "(30xvii-d) a non-refusal pulls-read failure was classified as a refusal (got '$T30_META_TRANS')"
+done
+
+# #2628 (the a3ceaae2f review's Finding 1) — THE DEGRADED-MODE ANNOUNCEMENT ON THE
+# MACHINE-CONSUMED SEAM. When `mktemp` is unavailable `review_surface_rows` falls
+# back to the pre-#2628 `pulls` read; that read is otherwise identical, so on a
+# healthy run it certifies head/base/count exactly like the temp-file arm. The
+# warning about the degradation therefore has to RIDE THE FAILURE: emitted before
+# the read it printed "the surface cap is UNVERIFIED" on runs where the cap WAS
+# fully verified — including here, on `--print-tier`, where a lane is told to go
+# fix mktemp/TMPDIR over a tier that was already selected and certified.
+# ⛔ The shim degrades every bare `mktemp` in the recorder (see the §8.16 comment),
+# which is what a `mktemp`-less box is; it is NOT narrower than `TMPDIR=/nonexistent`.
+# The two vectors below are the two directions: silent when the fallback read works,
+# and LOUD when it does not — the second one is also what makes the shim
+# load-bearing here, because a run that never entered the fallback prints neither.
+# Measured: restoring the pre-fix echo-before-the-read shape reds ONLY the silent
+# half; deleting the announcement reds only the loud half.
+T30_NOMKT="$T30/nomktemp"; rm -rf "$T30_NOMKT"; mkdir -p "$T30_NOMKT"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$T30_NOMKT/mktemp"; chmod +x "$T30_NOMKT/mktemp"
+T30_DEG_ERR="$T30/deg.err"
+T30_DEG="$(PATH="$T30_NOMKT:$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" FIX_COUNT=1 \
+  FIX_ROWS="$(printf 'modified\tdocs/ops/x.md\t')" \
+  HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>"$T30_DEG_ERR")"
+[ "$T30_DEG" = "$(printf 'ok\tlow')" ] \
+  && pass "(30xvii-e) a mktemp-less --print-tier run whose pulls read SUCCEEDS still certifies the tier (ok/low) — the degraded arm is not a refusal" \
+  || fail "(30xvii-e) the healthy fallback arm did not certify the tier (got '$T30_DEG')"
+# `-f` before the grep, deliberately: `! grep -q … missing-file 2>/dev/null` exits 2,
+# and `!` turns "I never read it" into a PASS. Silence is only evidence when the
+# stderr was actually captured.
+if [ -f "$T30_DEG_ERR" ] && ! grep -qF 'no temp file for the pulls-read status' "$T30_DEG_ERR"; then
+  pass "(30xvii-e) ...and it stays SILENT about a degradation it did not suffer — the warning rides the failure, never the branch"
+else
+  fail "(30xvii-e) a HEALTHY fallback read announced a degradation on the --print-tier seam (or its stderr was never captured, so silence was not observed)"
+fi
+
+# The other direction: the same shim with a FAILING pulls read. Transport still
+# proceeds (unavailable, no tier) and the degradation IS announced, naming the
+# remedy — and because the announcement can only come from the fallback branch,
+# this vector reds if the shim ever stops taking effect.
+T30_DEG_FAIL_ERR="$T30/deg-fail.err"
+T30_DEG_FAIL="$(PATH="$T30_NOMKT:$T30/bin:$PATH" FIX_META_RC=1 FIX_META_ERR='' FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" FIX_COUNT=1 \
+  FIX_ROWS="$(printf 'modified\tdocs/ops/x.md\t')" \
+  HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>"$T30_DEG_FAIL_ERR")"
+[ "$T30_DEG_FAIL" = "$(printf 'unavailable\t')" ] \
+  && pass "(30xvii-e) a mktemp-less --print-tier run whose pulls read FAILS is still TRANSPORT (unavailable, no tier)" \
+  || fail "(30xvii-e) the failed fallback arm did not stay transport (got '$T30_DEG_FAIL')"
+grep -qF 'no temp file for the pulls-read status' "$T30_DEG_FAIL_ERR" 2>/dev/null \
+  && pass "(30xvii-e) ...and the FAILED fallback read DOES announce the degradation on this seam, naming the mktemp/TMPDIR remedy" \
+  || fail "(30xvii-e) the degraded --print-tier run announced nothing — either the announcement was deleted or the shim never took effect (stderr: $(cat "$T30_DEG_FAIL_ERR" 2>/dev/null))"
 
 # ...and on the RECORD path the same response must refuse, like its clean-low
 # sibling does 60 lines later.
@@ -2816,8 +2901,11 @@ fi
 # Review round 4: 204 -> 213. (33h) pins EVERY `--delta` verb-exclusivity / arity / mint-input
 # refusal the verb adds — one assertion per combination, each asserting exit 2 AND a byte-identical
 # record — because both suites previously drove only the bare `--delta <pr> <repo>` form and a
-# deleted guard reddened nothing. MIN_ASSERTIONS is a FLOOR (it reds when FEWER assertions run),
-# so it must be raised with the arm or the arm can be skipped silently; it is not a ceiling.
+# deleted guard reddened nothing. ⛔ MIN_ASSERTIONS is EXACT, not a floor: the check
+# below compares with `-ne`, so it reds when FEWER assertions run (a skipped section)
+# AND when MORE do (an arm added without bumping the pin). An earlier revision of this
+# prose called it a floor; that contradicted the `-ne` fifteen lines down, and
+# "fixing" the code to `-lt` would have made the surplus direction unreachable.
 # MEASURED: `ALL PASSED (213 assertion(s))` on this tree (macOS, bash 3.2). `bash-suites` REFUSES to
 # run on a live cell (exit 78), so a local ALL PASSED is NOT CI evidence — see the PR comment.
 # Review round 5 (THE MERGE WITH #10583): 213 -> 214. The `--delta` verb and this PR's
@@ -2829,7 +2917,21 @@ fi
 # `"delta_range":"30219358085b…0d.."` with an empty base, kind and digest beside a
 # `mint:"delta"` — a signed artifact claiming a reviewed range from the one verb whose
 # contract is that no reviewer ran.
-MIN_ASSERTIONS=214
+MIN_ASSERTIONS=223
+# #2628: 214 -> 219. The ``pulls`` read stopped discarding its HTTP status, so
+# the print-tier seam gained the (30xvii-c)/(30xvii-d) pair: a 404 on the PR read
+# is now `unclassified` (the API REFUSED this PR → positive evidence) and a
+# 403/401/5xx/network failure is still `unavailable` (transport). FIVE assertions:
+# one refusal (30xvii-c) plus the four shapes in (30xvii-d)'s list — 403, 502,
+# 401 and connection-refused. MEASURED 219 on this tree.
+# #2628 (the a3ceaae2f review's Finding 2 corrected the arithmetic above, and its
+# Finding 1 added the vectors below): 219 -> 223 for (30xvii-e), the degraded-mode
+# announcement — a mktemp-less `--print-tier` run that CERTIFIES and stays silent
+# about a degradation it did not suffer (2 assertions), and the same shim with a
+# FAILING read, which stays transport AND announces the degradation (2 more, and
+# the only assertions here that require the shim to have taken effect). Without
+# them the pre-fix shape (the warning emitted before the fallback read, so it fires
+# on healthy runs too) leaves both suites green. MEASURED 223 on this tree.
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

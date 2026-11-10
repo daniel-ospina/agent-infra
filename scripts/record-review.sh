@@ -788,28 +788,88 @@ review_tier_cap() {
 # compare/<base>...<sha>, prefixed by one "mb\t<merge-base>\t<expected-count>"
 # line.
 #   rc 0 = rows printed (header + at least one row)
-#   rc 1 = TRANSPORT failure with nothing read — gh absent, the `pulls` read
-#          failed, or the compare failed for a reason that is NOT a refusal of
-#          this revision (403 rate-limit, 5xx, no route to host). Absent
-#          evidence; the callers warn loudly and proceed.
+#   rc 1 = TRANSPORT failure with nothing read — gh absent, or a `pulls`/compare
+#          read that failed for a reason that is NOT a refusal of this PR or
+#          revision (401 bad credentials, 403 rate-limit, 5xx, no route to
+#          host, no status at all). Absent evidence; the callers warn loudly
+#          and proceed.
 #   rc 2 = the API answered: the PR has NO changed files.
 #   rc 3 = the API ANSWERED and REFUSED, or answered with a payload this
-#          classifier cannot certify: a `pulls` body with no base/count, a
-#          compare HTTP 404/422 (a fork head, a rewritten sha), a compare that
-#          exited 0 with no readable body, no merge base, no rows, a malformed
-#          row. POSITIVE evidence, so the callers REFUSE. It must never be
-#          confused with rc 1: that confusion was how one `copied` row, and
-#          separately a fork-head 404, turned the cap into a no-op and let a
-#          rail edit record `clean-micro`.
+#          classifier cannot certify: a `pulls` HTTP 404/422 (a PR this token
+#          cannot see, a deleted or transferred PR — the read that was never
+#          made is exactly the surface this cap exists to certify), a `pulls`
+#          body with no base/count, a compare HTTP 404/422 (a fork head, a
+#          rewritten sha), a compare that exited 0 with no readable body, no
+#          merge base, no rows, a malformed row. POSITIVE evidence, so the
+#          callers REFUSE. It must never be confused with rc 1: that confusion
+#          is how one `copied` row, and separately a fork-head 404, turned the
+#          cap into a no-op and let a rail edit record `clean-micro`.
 #
 # An EXPLICIT <sha>, not pulls/<n>/files, for the reason the clean-low guard
 # gives above: pulls/<n>/files always describes the CURRENT head, so a push
 # landing between the read and the write would let one revision be certified
 # while another merges. A compare against an explicit sha has no such window.
+#
+# http_refused <stderr-file> — true when `gh` reported an HTTP status meaning the
+# API ANSWERED and REFUSED this request: 404 Not Found (a nonexistent PR, a PR or
+# repo this token cannot see, a fork head not reachable from the base repo) or
+# 422 Unprocessable (a rewritten sha). ONE definition, used by BOTH reads below.
+#
+# `gh api` exits 1 for a 404, a 403, a 401, a 502 and a dead socket alike, so the
+# exit code alone cannot carry this distinction — the HTTP status `gh` prints on
+# STDERR is the only decoder, and the two directions cost differently:
+#   * calling a REFUSAL transport let a PR whose surface was never read record
+#     clean-micro, and the micro tier dispatches no reviewers, so nothing else
+#     looked (the #2511 review's P1; #2628);
+#   * calling TRANSPORT a refusal would strand a legitimate micro PR on a
+#     rate-limit window, a bad-credential window or a blip, and tell it to go pay
+#     for a full review.
+# 401 is deliberately TRANSPORT, not a refusal: a credential failure is not
+# evidence about THIS PR, and it would refuse every record in the fleet at once —
+# the mass false-block #2511's reviewers named. So the classification is a
+# two-status POSITIVE list, never "any non-2xx".
+http_refused() {
+  local f="$1"
+  [ -n "$f" ] && [ -f "$f" ] || return 1
+  command grep -qE 'HTTP (404|422)\b' "$f" 2>/dev/null
+}
 review_surface_rows() {
   local repo="$1" pr="$2" sha="$3" meta head base count cmp mb first rest
+  local meta_err meta_refused
   command -v gh >/dev/null 2>&1 || return 1
-  meta="$(command gh api "repos/$repo/pulls/$pr" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null)" || return 1
+  # #2628 — the `pulls` read KEEPS its status instead of discarding it. Until
+  # this change `2>/dev/null … || return 1` collapsed every failure into
+  # transport, so a 401/403-rate-limit/5xx and a 404 on a PR this token cannot see
+  # were indistinguishable, the surface cap became UNVERIFIED, and a clean-micro
+  # record was written for a diff whose surface was never read.
+  meta_err="$(mktemp 2>/dev/null)" || meta_err=""
+  if [ -n "$meta_err" ]; then
+    meta="$(command gh api "repos/$repo/pulls/$pr" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>"$meta_err")" || {
+      meta_refused=0
+      if http_refused "$meta_err"; then meta_refused=1; fi
+      command rm -f "$meta_err"
+      if [ "$meta_refused" -eq 1 ]; then return 3; fi
+      return 1
+    }
+    command rm -f "$meta_err"
+  else
+    # No temp file (a read-only /tmp): fall back to the pre-#2628 posture. It is
+    # strictly WORSE (a refusal reads as transport), so it is announced rather
+    # than silent — an unannounced degradation is how this bug was invisible.
+    # ⛔ THE ANNOUNCEMENT RIDES THE FAILURE, NOT THE BRANCH. The fallback read is
+    # the PRE-#2628 read: on a healthy `/tmp`-less run it SUCCEEDS and the rows
+    # are certified exactly as on the temp-file arm. Warning before the read
+    # therefore printed "the surface cap is UNVERIFIED" on runs where the cap was
+    # fully verified — which is the very thing this comment exists to prevent,
+    # inverted: a signal that fires on healthy runs stops distinguishing the real
+    # degradation, and it fired for BOTH callers including the machine-consumed
+    # `--print-tier` seam. Announcing only with the `return 1` keeps the message
+    # true of every run that prints it.
+    meta="$(command gh api "repos/$repo/pulls/$pr" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null)" || {
+      echo "⚠️ #2628: no temp file for the pulls-read status of ${repo}#${pr} — a REFUSED PR read cannot be told from a transport failure, so the surface cap is UNVERIFIED. Fix mktemp/TMPDIR to restore the refusal arm." >&2
+      return 1
+    }
+  fi
   head="$(printf '%s' "$meta" | cut -f1)"
   base="$(printf '%s' "$meta" | cut -f2)"
   count="$(printf '%s' "$meta" | cut -f3)"
@@ -840,9 +900,10 @@ review_surface_rows() {
   #   * treating transport as a refusal would strand a legitimate micro PR on a
   #     rate-limit window or a blip, and tell it to go pay for a full review.
   # So classify on the STATUS gh reported: an HTTP refusal of THIS revision
-  # (404 Not Found / 422 Unprocessable) is rc 3; everything else — 403, 5xx, no
-  # route to host, empty stderr — is rc 1 (nothing read, warn and proceed), the
-  # same posture the `pulls` read above already takes.
+  # (404 Not Found / 422 Unprocessable) is rc 3; everything else — 401, 403, 5xx,
+  # no route to host, empty stderr — is rc 1 (nothing read, warn and proceed).
+  # That is `http_refused`, the SAME definition the `pulls` read above uses
+  # (#2628): one status list, so the two arms cannot drift apart.
   CMP_ERR="$(mktemp 2>/dev/null)" || CMP_ERR=""
   if [ -n "$CMP_ERR" ]; then
     cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>"$CMP_ERR")"
@@ -850,11 +911,15 @@ review_surface_rows() {
     cmp="$(command gh api "repos/$repo/compare/$base...$sha" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null)"
   fi
   if ! [[ "$cmp" =~ ^mb ]]; then
-    CMP_REFUSED=0
-    if [ -n "$CMP_ERR" ] && command grep -qE 'HTTP (404|422)\b' "$CMP_ERR" 2>/dev/null; then CMP_REFUSED=1; fi
+    # Same classifier, same status list — see `http_refused` above. Both reads go
+    # through it so a narrowing of the two-status POSITIVE list reds the vectors
+    # for BOTH endpoints, instead of leaving one arm silently regressed.
+    if http_refused "$CMP_ERR"; then
+      [ -n "$CMP_ERR" ] && rm -f "$CMP_ERR"
+      return 3
+    fi
     [ -n "$CMP_ERR" ] && rm -f "$CMP_ERR"
-    [ "$CMP_REFUSED" -eq 1 ] || return 1
-    return 3
+    return 1
   fi
   [ -n "$CMP_ERR" ] && rm -f "$CMP_ERR"
   # Split the header line in BASH, never `printf … | head -1 | cut`. This script
@@ -6117,7 +6182,11 @@ if [ "$VERDICT" = "clean-micro" ]; then
       # written for: the compare 404 of an unreachable fork head. A message that
       # omits it makes the next lane re-diagnose the same 404 from scratch — the
       # exact failure the sibling clean-low guard's wording exists to prevent.
-      echo "❌ clean-micro surface cap: $REPO#$PR at ${SHA:0:12}… — the changed-path payload cannot be certified. Causes: the compare endpoint REFUSED this revision (HTTP 404/422 — an unreachable fork head or a rewritten sha), answered with no readable body, returned no merge base, returned no rows, or returned a malformed row. A diff whose surface cannot be read cannot be cleared for a tier that dispatches no reviewers. Refusing (exit 4, no record). A TRANSPORT failure (403 rate-limit / 5xx / network) does NOT take this arm — it warns and proceeds — so a retry after the window is worth one attempt before paying for a full review." >&2
+      # #2628 adds the FIRST cause: the `pulls` read itself being REFUSED. It is
+      # listed first because it is diagnosed differently — a 404 there is about
+      # the PR this token cannot see, not about a sha that cannot be compared —
+      # and because until #2628 that cause could not reach this arm at all.
+      echo "❌ clean-micro surface cap: $REPO#$PR at ${SHA:0:12}… — the changed-path payload cannot be certified. Causes: the pulls read REFUSED this PR (HTTP 404/422 — a PR this token cannot see, or a deleted/transferred PR), the compare endpoint REFUSED this revision (HTTP 404/422 — an unreachable fork head or a rewritten sha), answered with no readable body, returned no merge base, returned no rows, or returned a malformed row. A diff whose surface cannot be read cannot be cleared for a tier that dispatches no reviewers. Refusing (exit 4, no record). A TRANSPORT failure (401 bad credentials / 403 rate-limit / 5xx / network) does NOT take this arm — it warns and proceeds — so a retry after the window is worth one attempt before paying for a full review." >&2
       echo "   → Run the code-review skill on the current head, then record clean with --evidence <artifact>." >&2
       exit 4
     fi

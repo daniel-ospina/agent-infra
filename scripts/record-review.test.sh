@@ -418,6 +418,31 @@ if [ "$1" = "api" ]; then
     # #1348 clean-low: the head/base/changed_files meta read.
     if grep -qF -- "--jq [(.head.sha), (.base.sha)" <<<"$*"; then
         [ "${STUB_META_FAIL:-0}" = "1" ] && exit 1
+        # #2628 — this read is STATUS-AWARE, exactly as the compare read below is.
+        # `gh api` exits 1 for a 404, a 403, a 401, a 5xx and a dead socket alike,
+        # so the status on STDERR is the only thing that separates "the API
+        # REFUSED this PR" (positive evidence → rc 3, refuse) from "nothing was
+        # read" (transport → rc 1, warn and proceed). The two knobs model those
+        # two halves and are NOT interchangeable:
+        #   STUB_META_FAIL=1   exit 1 with EMPTY stderr — the no-status transport
+        #                      cause (a dead socket, a killed process).
+        #   STUB_META_HTTP=<n> exit 1 with the status `gh` prints — the
+        #                      status-bearing cause, which the classifier keys on.
+        # Before #2628 the arm below was `2>/dev/null … || return 1`, so a 404 on
+        # a PR this token cannot see recorded clean-micro for a surface that was
+        # never read (the #2511 review's P1).
+        if [ -n "${STUB_META_HTTP:-}" ]; then
+            case "$STUB_META_HTTP" in
+                404) _why="Not Found" ;;
+                422) _why="Unprocessable Entity" ;;
+                403) _why="API rate limit exceeded" ;;
+                401) _why="Bad credentials" ;;
+                5*)  _why="Server Error" ;;
+                *)   _why="Error" ;;
+            esac
+            printf 'gh: %s (HTTP %s)\n' "$_why" "$STUB_META_HTTP" >&2
+            exit 1
+        fi
         derived=0
         if [ -n "${STUB_COMPARE:-}" ]; then
             derived="$(printf '%s\n' "$STUB_COMPARE" | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -1348,9 +1373,19 @@ rm -rf "$T/labels"
 # `--print-tier` classification (`too_large`), never this record-path refusal.
 #
 #   EMPTY        the API ANSWERED: 0 changed files            → rc 2, exit 4
-#   UNREADABLE   transport, no status / status-bearing 403/5xx → rc 1, WARN + record
-#   REFUSED      the API answered and REFUSED this revision    → rc 3, exit 4
+#   UNREADABLE   transport, no status / status-bearing 401/403/5xx → rc 1, WARN + record
+#   REFUSED      the API answered and REFUSED this PR (the
+#                `pulls` read, HTTP 404/422) or this revision
+#                (the compare, HTTP 404/422)                   → rc 3, exit 4
 #   INCONSISTENT claims a surface and delivers no row          → rc 3, exit 4
+#
+# #2628 folded the `pulls` read into this split: until then it discarded its
+# status (`2>/dev/null … || return 1`), so BOTH halves of the REFUSED class were
+# reachable only through the compare, and a PR whose own read was refused
+# recorded clean-micro. Both endpoints now go through ONE classifier
+# (`http_refused`), so the vectors below pin the status list for both — and this
+# block pins each endpoint's REFUSED arm separately, because an arm that stops
+# CALLING the classifier is invisible to the other endpoint's vectors.
 #
 # The split is load-bearing, not cosmetic: a transport blip must not strand a
 # legitimate micro record (fail-open), while a payload that cannot certify a
@@ -1392,20 +1427,117 @@ STUB_COMPARE_HTTP=503 STUB_BODY="Fixes #424365" STUB_LABELS="complexity:micro" r
 assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 503 warning names the READ failure"
 assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 503 is NOT reported as an uncertifiable payload"
 
-# UNREADABLE (3/3) — the OTHER rc-1 cause: the `pulls` meta read itself failed,
-# so the cap never reaches the compare. Same posture (warn, record proceeds), and
-# pinned because `review_surface_rows`' contract names three rc-1 causes while a
-# compare-only vector exercises one.
-# ⚠️ PINNED AS-IS, NOT AS SHOULD (#2628). The pulls read does
-# `2>/dev/null ... || return 1`, so it cannot tell a dead socket from a 401/403/
-# 5xx/404 — the #2511 review's P1, still unfixed and was untracked until #2628.
-# This vector therefore pins the CURRENT behaviour deliberately; when #2628 makes
-# that read status-aware (404/422 → rc 3), THIS assertion must change with it.
-# Do not read it as an endorsement.
+# UNREADABLE (3/4) — the `pulls` meta read itself failed with NO status at all,
+# so the cap never reaches the compare. Same posture (warn, record proceeds).
+# This is the TRANSPORT half of that read's failure modes; the refusal half is
+# pinned by the two vectors below it.
+# (#2628 rewrote this pair. Until #2628 the `pulls` read discarded its status, so
+# a 404 on a PR this token cannot see was indistinguishable from this dead-socket
+# case and recorded clean-micro for a surface never read — the #2511 review's P1.
+# That vector used to say, deliberately, "PINNED AS-IS, NOT AS SHOULD"; the arm
+# it pinned is now correct, and this vector pins only the no-status cause.)
 STUB_META_FAIL=1 STUB_BODY="Fixes #424366" STUB_LABELS="complexity:micro" run_micro_verdict 424366
 [ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a failed meta read PROCEEDS (rc 0)" || bad "8.16 unreadable: a failed meta read must proceed (rc=$RECORD_RC, err=$RECORD_ERR)"
 [ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424366.json" ] && ok "8.16 unreadable: the record IS written after a failed meta read" || bad "8.16 unreadable: a failed meta read stranded a legitimate record"
 assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the failed-meta warning names the READ failure"
+
+# UNREADABLE (4/4) — the `pulls` read failed WITH a status that is NOT a refusal
+# of this PR (403 rate-limit: the shape a lane actually hits). This is the
+# FALSE-REFUSAL half of #2628: if the classifier ever widened to "any non-2xx" a
+# throttled read would refuse and strand a legitimate micro record on a window
+# that passes in seconds. Measured: widening `HTTP (404|422)` to include 403 reds
+# this vector (and its compare sibling).
+STUB_META_HTTP=403 STUB_BODY="Fixes #424372" STUB_LABELS="complexity:micro" run_micro_verdict 424372
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a rate-limited meta read (403) PROCEEDS (rc 0)" || bad "8.16 unreadable: a 403 meta read must proceed, not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424372.json" ] && ok "8.16 unreadable: the 403-meta record IS written" || bad "8.16 unreadable: a 403 meta read stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 403-meta warning names the READ failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 403 meta read is NOT reported as an uncertifiable payload"
+
+# UNREADABLE (401) — THE DESIGNED EXCLUSION, PINNED. `record-review.sh`'s
+# `http_refused` states in the strongest terms that `401` is deliberately
+# TRANSPORT, not a refusal: a credential failure is not evidence about THIS PR,
+# and treating it as one would refuse every record in the fleet at once (the
+# mass false-block #2511's reviewers named). Until this vector nothing pinned it
+# — every status-bearing meta vector used 403/404/422/502/503 — so widening the
+# positive list to `HTTP (401|404|422)` (a one-character edit an "auth failures
+# should not certify a surface" argument invites) would convert EVERY clean-micro
+# record in the fleet into an exit-4 refusal with both suites still GREEN. #2628
+# is what makes it reachable: before it the `pulls` read had no classifier at
+# all, so a 401 there could not refuse anything.
+STUB_META_HTTP=401 STUB_BODY="Fixes #424374" STUB_LABELS="complexity:micro" run_micro_verdict 424374
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a bad-credential meta read (401) PROCEEDS (rc 0)" || bad "8.16 unreadable: a 401 meta read must proceed, not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424374.json" ] && ok "8.16 unreadable: the 401-meta record IS written" || bad "8.16 unreadable: a 401 meta read stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 401-meta warning names the READ failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 401 meta read is NOT reported as an uncertifiable payload"
+
+# DEGRADED-ONLY (the a3ceaae2f review's Finding 1) — when `mktemp` is unavailable
+# `review_surface_rows` falls back to the PRE-#2628 `pulls` read, and the warning
+# about that degradation must RIDE THE FAILURE. The fallback read is otherwise
+# identical: on a healthy run it certifies head/base/count exactly as the
+# temp-file arm does, so announcing "the surface cap is UNVERIFIED" there told the
+# operator the cap was unverified on a run where it was fully verified — the
+# signal-that-stops-distinguishing-anything problem `record-review.sh:861-868`
+# describes, inverted, and it fired for both callers including the
+# machine-consumed `--print-tier` seam. Nothing else pinned the move: NO vector
+# entered the `mktemp`-unavailable branch, so reverting the announcement to fire
+# BEFORE the read (the pre-fix shape) left this suite green. Measured: the mutant
+# `move the echo back above the read` reds ONLY the first vector below, and
+# deleting the echo reds only the second.
+#
+# A PATH shim ahead of the real `mktemp` is used to reach it. ⛔ THE SHIM IS NOT
+# NARROWER THAN `TMPDIR=/nonexistent` — an earlier revision of this comment claimed
+# it was, and that claim is false (measured by the a3ceaae2f round's reviewer): a
+# missing `mktemp` fails EVERY bare call in the recorder (`:845` this pulls status,
+# `:907` `CMP_ERR`, `:1568`/`:1952`/`:1953` the delta arms, `:3758`/`:3805`/`:3806`
+# the diff hash, `:3931`/`:3956`/`:3974`/`:4005` the record/evidence temps), and
+# `TMPDIR=/nonexistent` fails the same set. That is deliberate, not a limitation:
+# a box with no working `mktemp` IS globally degraded, so the vector must assert
+# what such a box actually does rather than a hypothetical one-arm version of it.
+# It is also why 424375 asserts that the run still CERTIFIES (the compare arm has
+# its own silent `:907` fallback and survives on it) instead of asserting that only
+# the pulls arm degraded. The compare arm's fallback still cannot KEEP a status, so
+# a compare 404 on a `mktemp`-less box reads as transport — pre-existing, not this
+# change's, and recorded with its measurement on #2624.
+NOMKT="$T/nomktemp"; mkdir -p "$NOMKT"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$NOMKT/mktemp"; chmod +x "$NOMKT/mktemp"
+
+# (1) the read SUCCEEDS: the run certifies, records, and stays SILENT about a
+# degradation it did not suffer.
+PATH="$NOMKT:$PATH" STUB_BODY="Fixes #424375" STUB_LABELS="complexity:micro" run_micro_verdict 424375
+[ "$RECORD_RC" = "0" ] && ok "8.16 degrade: a mktemp-less run whose pulls read SUCCEEDS still certifies and records (rc 0)" || bad "8.16 degrade: a healthy fallback read must still record (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424375.json" ] && ok "8.16 degrade: the record IS written on the fallback arm — the degradation is not a refusal" || bad "8.16 degrade: the healthy fallback arm stranded a legitimate record"
+assert_not_contains "$RECORD_ERR" "no temp file for the pulls-read status" "8.16 degrade: a HEALTHY fallback read does NOT announce a degradation — the warning rides the failure, not the branch"
+assert_not_contains "$RECORD_ERR" "the surface cap is UNVERIFIED" "8.16 degrade: a healthy fallback read never claims an unverified cap it in fact certified"
+
+# (2) the read FAILS: same posture as any transport failure (warn, proceed) — but
+# HERE the announcement is owed, and it must name the degradation so the next
+# operator restores the refusal arm instead of re-diagnosing a silent one.
+PATH="$NOMKT:$PATH" STUB_META_FAIL=1 STUB_BODY="Fixes #424376" STUB_LABELS="complexity:micro" run_micro_verdict 424376
+[ "$RECORD_RC" = "0" ] && ok "8.16 degrade: a mktemp-less run whose pulls read FAILS still proceeds (transport, rc 0)" || bad "8.16 degrade: a failed fallback read must proceed as transport (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "no temp file for the pulls-read status" "8.16 degrade: the FAILED fallback read DOES announce the degradation (this is the only assertion that reds if the announcement is deleted)"
+assert_contains "$RECORD_ERR" "Fix mktemp/TMPDIR to restore the refusal arm" "8.16 degrade: the announcement names the remedy, so the degraded run is actionable rather than merely alarming"
+
+# REFUSED (pulls 404) — THE #2628 FINDING ITSELF. The API ANSWERED and refused to
+# describe this PR (a nonexistent PR, a PR this token cannot see, a deleted or
+# transferred one). POSITIVE evidence: the surface of this PR is knowable and was
+# not read, and the micro tier dispatches NO reviewers — so nothing else would
+# ever look at the diff. Before the fix this vector produced rc 0 and WROTE A
+# RECORD (measured on origin/main at 8d81b5c5c: rc=0, record present), which is
+# the exact class the surface cap exists to close.
+STUB_META_HTTP=404 STUB_BODY="Fixes #424370" STUB_LABELS="complexity:micro" run_micro_verdict 424370
+[ "$RECORD_RC" = "4" ] && ok "8.16 refused: a pulls-read 404 REFUSES (exit 4)" || bad "8.16 refused: a pulls-read 404 must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424370.json" ] && ok "8.16 refused: no record written over a refused PR read" || bad "8.16 refused: recorded clean-micro for a PR whose own read was REFUSED"
+assert_contains "$RECORD_ERR" "cannot be certified" "8.16 refused: the pulls-404 refusal names the uncertifiable payload"
+assert_contains "$RECORD_ERR" "read REFUSED this PR" "8.16 refused: the cause list names the pulls read, not only the compare"
+assert_not_contains "$RECORD_ERR" "could not read the changed paths" "8.16 refused: a pulls API REFUSAL is NOT reported as a transport failure"
+
+# REFUSED (pulls 422) — the same class's other status. Pinned per ENDPOINT, not
+# only through the shared classifier: a regression that stops CALLING
+# `http_refused` from the pulls arm (e.g. reverting it to `|| return 1`) leaves a
+# shared-regex narrowing visible only on the compare side.
+STUB_META_HTTP=422 STUB_BODY="Fixes #424371" STUB_LABELS="complexity:micro" run_micro_verdict 424371
+[ "$RECORD_RC" = "4" ] && ok "8.16 refused: a pulls-read 422 REFUSES (exit 4)" || bad "8.16 refused: a pulls-read 422 must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424371.json" ] && ok "8.16 refused: no record written for a pulls-read 422" || bad "8.16 refused: recorded clean-micro over a 422-refused PR read"
 
 # UNREADABLE (4/4) — and a rate-limit window (403), which `gh` reports WITH a
 # status. Pinned separately from the 503 because it is the shape a lane actually
@@ -2972,7 +3104,7 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:6324 at this head — RE-DERIVE it, do not trust the number: a bare
+#      (scripts/record-review.sh:6594 at this head — RE-DERIVE it, do not trust the number: a bare
 #      line citation here has rotted before, and this comment is not what makes
 #      the assertion true). One command answers it (origin/main bd1b205d is :6225):
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
@@ -5782,13 +5914,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2747 :4473 :6843 :7017, plus a comment mention at :2616; `14.1c-CITE` below
+#     CITE-CHECK: :2812 :4538 :6912 :7086, plus a comment mention at :2681; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:2725) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :2747) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :2812) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6843). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6912). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5814,7 +5946,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:6843` / `:7017` — CITE-CHECK: :6843 :7017 — re-derived by the
+#     this head the predicates are `:6912` / `:7086` — CITE-CHECK: :6912 :7086 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -5931,7 +6063,7 @@ assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marke
 #      previously claimed "`-qxF`->`-qF` at the dedup read left the suite at
 #      PASS=921 FAIL=0". THERE IS NO GREP AT THE DEDUP READ — not anchored, not
 #      unanchored: the loop compares whole bodies with `[ "$_body" = "$marker" ]`
-#      (scripts/record-review.sh:2468 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
+#      (scripts/record-review.sh:2734 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
 #      have been measured. The mutant that actually makes (b2) meaningful is replacing
 #      that equality with a SUBSTRING test (`case "$_body" in *"$marker"*)`): it
 #      reddens (b2) — which expects 1 POST and would get 0.
@@ -6723,7 +6855,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4473 :6843 :7017 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4538 :6912 :7086 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -9483,8 +9615,8 @@ targets = sys.argv[2:]
 # ⛔ A WHOLE-FILE LEXER WAS BUILT AND REJECTED — with the measurement, not as a preference.
 # Carrying quote state across lines is the only way to close the multi-line hole, and on the
 # REAL recorder it desyncs at `$(` inside a double-quoted string, because `$(` resets quoting:
-# the awk program at record-review.sh:1846 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
-# its own comment block across lines (`sed -n '1851,1860p'`), so a lexer that does not model `$(`
+# the awk program at record-review.sh:2112 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
+# its own comment block across lines (`sed -n '2117,2126p'`), so a lexer that does not model `$(`
 # re-opens a quote mid-program and reports those lines as live backticks — 26 false REDs over 12
 # lines in the prototype run (a COUNT, not a line map). Modelling `$(`,
 # `${`, `$'` and heredocs well enough to stay in sync is a bash lexer, which is a different
