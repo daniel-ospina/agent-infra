@@ -344,6 +344,15 @@ if not (isinstance(h, str) and re.fullmatch(r"[0-9a-fA-F]{40}", h)):
     sys.exit(1)
 if not (isinstance(v, str) and v.strip()):
     sys.exit(1)
+# ⛔ `repo` IS PART OF THE READER'S RULE SET, and this function is the definition of "the reader can
+# use it" (#2510 review round 10). `extensions/review-enforcer` refuses the whole record — reads it as
+# ABSENT — when `repo` is present and fails this charset; the sync accepted such a record, so `push`
+# published it and `pull` installed it at rc 0 with `unreadable=0`, and (rule 2 forbids deletion) the
+# bytes are then permanent in the store and on every peer. The regex is IDENTICAL to the one
+# `record-review.sh` enforces at MINT time, so it cannot false-block a legitimately minted record.
+r = d.get("repo")
+if r is not None and not (isinstance(r, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", r)):
+    sys.exit(1)
 PY
   return 0
 }
@@ -1274,7 +1283,9 @@ with open(pairs) as fh:
             continue
         key, _, path = line.partition("\t")
         try:
-            with open(path, "rb") as f:
+            with open(path) as f:   # TEXT, exactly as `record_usable` reads it: a binary read accepts a
+                                    # BOM/UTF-16 record the per-record gate, `review-enforcer` and
+                                    # `read_record` all refuse (round 10 residual)
                 d = json.load(f, parse_constant=_reject)
         except Exception:
             continue
@@ -1284,6 +1295,11 @@ with open(pairs) as fh:
         if not (isinstance(h, str) and re.fullmatch(r"[0-9a-fA-F]{40}", h)):
             continue
         if not (isinstance(v, str) and v.strip()):
+            continue
+        # the SAME rule set as `record_usable`, or the batched pre-pass disagrees with the per-record
+        # gate and the difference decides whether a publish is even attempted (#2510 review round 10).
+        r = d.get("repo")
+        if r is not None and not (isinstance(r, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", r)):
             continue
         keep.append(key)
 with open(out, "w") as fh:

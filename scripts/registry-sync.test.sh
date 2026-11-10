@@ -1097,6 +1097,24 @@ fi
 IN_OUT="$(mini_rs "$IN_BOX" push)"; IN_RC=$?
 assert_not_contains "$IN_OUT" "pushed $NEST_KEY" "§29s an INFINITE stamp is unreadable — never published as an ordering authority"
 assert_contains "$IN_OUT" "no readable reviewed_at" "§29s ...and the run names the missing stamp"
+# §29t — `repo` IS PART OF THE READER'S RULE SET. `extensions/review-enforcer` refuses the whole record
+# (reads it as absent) when `repo` is present and fails its charset; `record_usable` tested only
+# `head_sha`/`verdict`, so `push` published a record the gate cannot use and `pull` installed it, both at
+# rc 0 with `unreadable=0` — and rule 2 forbids deleting it, so the bytes are permanent fleet-wide
+# (round 10). The regex is the one `record-review.sh` enforces at mint time.
+mini_fixture repochars
+RC_BOX="$T/repochars.box"; mkdir -p "$RC_BOX"
+# a LEGACY number-keyed filename, so `local_keyed` does not reject it before the usability gate runs
+printf '{"pr":441,"head_sha":"%s","verdict":"clean","repo":"a+b/c","reviewed_at":"2026-11-09T00:00:00Z"}\n' \
+  "$HEAD_A" > "$RC_BOX/441.json"
+if node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.exit(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(r.repo)?0:1)' "$RC_BOX/441.json" 2>/dev/null; then
+  bad "§29t (premise) the gate's charset ACCEPTED the fixture repo — the arm would prove nothing"
+else
+  ok "§29t (premise) the gate's own charset REFUSES the fixture repo"
+fi
+RC_OUT="$(mini_rs "$RC_BOX" push)"; RC_RC=$?
+assert_not_contains "$RC_OUT" "pushed " "§29t a record whose repo the GATE refuses is never published"
+assert_contains "$RC_OUT" "not one the fleet's rail can USE" "§29t ...and the refusal names usability"
 # §29i — `null` is not a timestamp. The literal text sorts ABOVE every real stamp (`'n' > '2'`), so reading
 # it as `null` made a record with no stamp win the ordering instead of being unreadable.
 NEST9D="$MINI_ROOT/box9"; mkdir -p "$NEST9D"
