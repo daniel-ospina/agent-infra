@@ -108,9 +108,13 @@ nothing, and it exits 0):
    direction the overlap subtraction below exists to remove, at twice the size). ⛔ The two halves are **disjoint**: the process count covers the dispatcher's own
    `bash …/nonblocking-dispatch.sh` subshells too, so `alive = dispatcher + launcher` is only a lane
    count because the launcher clamp subtracts the overlap — an unsubtracted sum counted every live
-   dispatcher lane twice and stood a 10-lane cell down at 11 with a slot free (agent-infra#3886). A
-   dispatcher lane's own root is the dispatcher's half, so it is removed from the launcher's via that
-   overlap; the child rule above is what keeps a lane's `pi` from adding a second lane anywhere. ⛔ When the **process** count is unreadable the clamp does **not** apply and `wt_count` stands
+   dispatcher lane twice and stood a 10-lane cell down at 11 with a slot free (agent-infra#3886). The
+   overlap is the INTERSECTION of the two halves and is measured with the predicate that actually counted
+   the lane (`_counts_as_lane`, the narrower one): measured with the broader rule, a lane the dispatcher
+   half rejected was subtracted from the launcher's share and added to neither — one live lane read as
+   none. A dispatcher lane's own root is the dispatcher's half, so it is removed from the launcher's via
+   that overlap; the child rule above is what keeps a lane's `pi` from adding a second lane anywhere.
+   ⛔ When the **process** count is unreadable the clamp does **not** apply and `wt_count` stands
    unchanged: the fleet's polarity is *unknown is alive*, and the census is the only thing bounding the
    lane total, so an unreadable probe must never read as "no lanes" (that is the over-dispatch
    direction; it dispatched 7 lanes in the suite's mutant of exactly that change). "Unreadable" means

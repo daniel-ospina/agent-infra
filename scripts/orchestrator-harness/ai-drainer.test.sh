@@ -751,6 +751,44 @@ check "(s7b) two pidfiles naming ONE pid count as ONE dispatcher lane" \
   "$(grep "START:" "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
+# ── (s9) ⛔ THE OVERLAP USES THE PREDICATE THAT COUNTED THE LANE (round 5, P2) ────────────────
+# The overlap is the INTERSECTION of "in `disp_alive`" and "inside `procs`", so it must be measured with
+# `_counts_as_lane` — the narrower rule that actually added the lane to `n`. Measured with the broader
+# `_is_lane_process`, a pidfile lane whose argv only THAT rule accepts (`./pi -p x`: `_counts_as_lane`=N
+# because it only takes a bare `pi` or an absolute-path basename; `_is_lane_process`=Y) was SUBTRACTED
+# from `procs` and added to nothing — one live lane in NEITHER half, so `alive` read one lane too low and
+# the tick dispatched into a full box. Broad is the safe direction for a BOUND, never for a SUBTRACTION.
+o="$ROOT/o-s9"; ai="$ROOT/ai-s9"; mkdir -p "$o/bg" "$ai"
+# a real process whose argv[0] is `./pi` (so `_counts_as_lane` rejects it and `_is_lane_process` takes it)
+/bin/bash -c 'exec -a ./pi sleep 60' &
+p9=$!
+echo "$p9" >>"$ROOT/pids"
+printf '%s' "$p9" >"$o/bg/seed-lane-1.pid"
+rows_s9="$ROOT/rows-s9"
+{ printf '%s 1 ./pi -p x\n' "$p9"
+  printf '200 1 /usr/local/bin/pi -p --provider deepseek brief-0\n'
+  printf '201 1 /usr/local/bin/pi -p --provider deepseek brief-1\n'; } >"$rows_s9"
+cat >"$ROOT/ps-s9" <<PSS_EOF
+#!/usr/bin/env bash
+case "\$*" in *"-p "*) exec ps "\$@" ;; esac
+cat "$rows_s9" 2>/dev/null || exit 0
+PSS_EOF
+chmod +x "$ROOT/ps-s9"
+cat >"$STUB/worker-terminal.sh" <<'WT_EOF'
+WT_TREE_PY="stub"; WT_WS_PY="stub"
+wt_table() { printf 'lane-1\talive\n'; }
+wt_count() { printf '34\n'; }
+WT_EOF
+RUN_WT_MOD="$STUB/worker-terminal.sh" RUN_PS="$ROOT/ps-s9" RUN_TARGET=10
+run_drainer_fg s9
+check "(s9) a lane the dispatcher half REJECTS stays in the launcher's share — alive=3, not 2" \
+  'grep -q "alive=3 (dispatcher=0 launcher=3)" "$ai/logs/ai-drainer.log"' \
+  "$(grep -E "START:|SKIP:" "$ai/logs/ai-drainer.log" | head -1)"
+check "(s9) …and it is NOT subtracted from procs, so no lane vanishes from both halves" \
+  'grep -q "census-mismatch launcher=34 pi=3 clamped=3 disp=0" "$ai/logs/ai-drainer.log"' \
+  "$(grep "census-mismatch" "$ai/logs/ai-drainer.log" | head -1)"
+
+reset_run
 # ── (s8b) ⛔ "ps PRODUCED OUTPUT" IS NOT "ps ANSWERED" (#3886 review round 4) ────────────────
 # The root rule reads `ps -A -o pid=,ppid=,command=` and requires pid-prefixed rows, so a `ps` that
 # prints its USAGE TEXT to stdout and exits 0 is UNREADABLE, not "a table with no lane in it" — the

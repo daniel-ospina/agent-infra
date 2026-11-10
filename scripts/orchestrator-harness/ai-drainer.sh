@@ -738,14 +738,16 @@ _census_dispatcher() { # prints "<alive> <overlap>" — dispatcher lanes, then h
     # bounding the lane total (the lock no longer is) — so a `ps` that cannot answer (absent under the
     # unit's PATH, `hidepid`, another uid) must never read as "no lanes".
     if [ -z "$c" ]; then n=$((n + 1)); elif _counts_as_lane "$c"; then n=$((n + 1)); fi
-    # ⛔ THE OVERLAP, measured on the SAME argv read above (no second `ps`). `_live_lane_processes`
-    # counts every lane ROOT on the box, so a dispatcher lane's own
-    # `bash …/nonblocking-dispatch.sh …` subshell sits inside `procs` too — subtracting the dispatcher
-    # count from `procs` without this would remove a process `procs` may never have held (an unreadable
-    # argv: `n` counts it, the launcher predicate cannot) and under-read the launcher's share. An
-    # UNREADABLE argv is therefore NOT part of the overlap: unknown stays counted on the dispatcher's
-    # side only, which is the safe direction.
-    if [ -n "$c" ] && _is_lane_process "$c"; then ov=$((ov + 1)); fi
+    # ⛔ THE PREDICATE MUST BE THE ONE THAT COUNTED THE LANE (#3886 review round 5, P2). The overlap is
+    # the INTERSECTION of "in `n`" and "inside `procs`", so it is measured with `_counts_as_lane` — the
+    # NARROWER predicate, the one that actually added this lane to `n`. Measuring it with the broader
+    # `_is_lane_process` counted a lane the dispatcher half never accepted (an argv like `./pi -p x`, which
+    # only the broad rule matches) and SUBTRACTED it from `procs` while adding it to nothing: that lane was
+    # in NEITHER half, so one live lane on the box read as `alive=0` and a full target's worth of new lanes
+    # was dispatched into it. Broad is the safe direction for a BOUND; for a SUBTRACTION it is the
+    # over-dispatch direction. A lane that is in `procs` but not in `n` now stays in the launcher's share —
+    # over-counted, which is the direction this file accepts everywhere else.
+    if [ -n "$c" ] && _counts_as_lane "$c"; then ov=$((ov + 1)); fi
   done
   printf '%s %s' "$n" "$ov"
 }
