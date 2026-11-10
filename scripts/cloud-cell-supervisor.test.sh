@@ -1432,9 +1432,10 @@ PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
 # `FATAL: a controller is RUNNING (pid 2446252)`, and `--force` was the only way through.
 # ⛔ THE FIXTURE IS A REAL LIVE CONTROLLER, not a stubbed verdict: `seen_controller_pids`'s lock leg needs
 # a running `bash …/orch-loop.sh` whose pid an `.orch.lock` written AFTERWARDS names (the age direction
-# therefore reads "began before the lock" — a controller, not pid reuse), so arm 2 below CANNOT be
-# satisfied by a fixture the guard ignores. Both arms are needed: exempting the flag reddens arm 2 if the
-# guard is deleted outright, and arm 1 reddens if the exemption is missing.
+# therefore reads "began before the lock" — a controller, not pid reuse), so the pin-only assertion below
+# cannot be satisfied by a fixture the guard simply ignores. Both directions are needed: an exemption that
+# had also DELETED the guard reddens the plain-apply assertion, and a missing exemption reddens the
+# pin-only one.
 mkdir -p "$P/lockctl"
 printf '#!/bin/sh\nsleep 300\n' > "$P/lockctl/orch-loop.sh"; chmod +x "$P/lockctl/orch-loop.sh"
 bash "$P/lockctl/orch-loop.sh" >/dev/null 2>&1 & _PIN_LIVE=$!
@@ -1472,8 +1473,9 @@ case "$PROV_OUT" in
 esac
 kill -KILL "$_PIN_LIVE" 2>/dev/null; wait "$_PIN_LIVE" 2>/dev/null
 rm -f "$P/o/.orch.lock"
-# The control: with that controller gone the SAME plain apply seeds, which is what makes arm 2/3 above
-# attributable to the live controller rather than to some other precondition of the fixture.
+# The control: with that controller gone the SAME plain apply seeds, which is what makes the two refusal
+# assertions above attributable to the live controller rather than to some other precondition of the
+# fixture.
 prov apply
 [ "$PROV_RC" -eq 0 ] \
   && ok "…and once the controller is gone the SAME apply seeds (the refusal was the live controller, not the fixture)" \
