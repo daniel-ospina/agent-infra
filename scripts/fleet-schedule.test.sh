@@ -242,6 +242,10 @@ mkplist "$BAD_BROKEN"  com.test.echo     "$T/echo.spec"
 mkplist "$BAD_NOSCHED" com.test.nosched  "$T/nosched.spec"
 mkplist "$BAD_NOSCHED" com.test.echo     "$T/echo.spec"
 mkplist "$BAD_RETIRED" com.test.retired-both "$T/retired-both.spec"
+# The live job is what makes the assertion below non-vacuous: the fixture must be a set the layer
+# CAN run, so `--install` passing is a statement about the retired job alone and not about an
+# empty/inert set (which is refused for its own reason).
+mkplist "$BAD_RETIRED" com.test.echo     "$T/echo.spec"
 mkplist "$DRIFT"    com.test.echo        "$T/echo.spec"
 
 run() { # run <templates-dir> <args...> → prints output, returns the scheduler's rc
@@ -793,12 +797,28 @@ for spec in "unknown:does not know" "broken:broken target" "noschedule:no StartI
   out="$(run "$dir" --verify)"; rc=$?
   [ "$rc" -eq 1 ] && ok "--verify also fails on the '${spec%%:*}' fixture" || bad "--verify passed a broken set (rc=$rc)"
 done
-# RETIRED must not also have a template (the same rule install-launchd.sh enforces)
+# ⛔ RETIRED IS A DISPOSITION ON A MACHINE AND A REFUSAL AT THE DECLARATION GATE (#2908).
+# The label is in RETIRED while its template still exists. That contradiction lives in two REPO
+# files, so the AUTHORING gate refuses it — and every MACHINE verb honours the manifest instead,
+# because the old unconditional refusal took the whole layer down: cells 3 and 4 reached
+# `FATAL: the scheduled layer would not start (rc=1)`, i.e. no reaping, no liveness detection and
+# no canary, over one stale manifest line.
 state_reset "$BAD_RETIRED"
 out="$(run "$BAD_RETIRED" --install)"; rc=$?
-[ "$rc" -eq 1 ] && ok "a RETIRED label that still has a template is refused" || bad "RETIRED conflict accepted (rc=$rc)"
-grep -q 'RETIRED but a template still exists' <<<"$out" && ok "the RETIRED refusal names both halves" \
-  || bad "RETIRED refusal is not diagnosable: $out"
+[ "$rc" -eq 0 ] && ok "--install honours RETIRED over a leftover template (rc=0, the layer starts)" \
+  || bad "--install refused the whole layer over one RETIRED line (rc=$rc): $out"
+grep -q 'SKIP.*com.test.retired-both.*RETIRED' <<<"$out" && ok "the retired job is a NAMED SKIP, not a silent absence" \
+  || bad "the retired job is not named as SKIP/RETIRED: $out"
+grep -q 'com.test.echo' <<<"$out" && ok "the other job in the same set still runs" \
+  || bad "the layer lost every other job too: $out"
+# The mutation arm: the SAME fixture, graded by the declaration gate, must still be REFUSED — the
+# contradiction is not laundered into an accepted set just because a machine can carry on.
+out="$(run "$BAD_RETIRED" --check)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--check still refuses the RETIRED/template contradiction (authoring gate)" \
+  || bad "--check accepted a RETIRED label with a template (rc=$rc): $out"
+grep -q 'RETIRED but a template still exists' <<<"$out" && ok "the --check refusal names both halves" \
+  || bad "--check refusal is not diagnosable: $out"
+state_reset "$BAD_RETIRED"
 
 # ── 6. a per-machine absence is NAMED and does not block certification ───────────────────────
 case_ "6. an unresolved placeholder is a named SKIP, counted, not fatal"

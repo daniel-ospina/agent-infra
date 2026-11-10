@@ -64,7 +64,11 @@ CONTRACT
                                          declarations at all. Runs on EVERY platform including
                                          macOS; `scripts/fleet-schedule.test.sh` is the pre-merge
                                          gate, and this verb is what it drives against the shipped
-                                         set.
+                                         set. ⛔ THIS IS THE ONLY VERB THAT REFUSES A `RETIRED`
+                                         LABEL WHOSE TEMPLATE STILL EXISTS (#2908): the
+                                         contradiction is authored in the repo, so the repo's
+                                         gate is where it is caught — the machine verbs honour
+                                         the manifest and keep running every other job.
   python3 fleet-schedule.py --install     parse, run the DUE jobs now, start the loop, verify.
                                          Non-zero if the job set cannot be parsed, a job target
                                          is broken, or the loop does not come up.
@@ -437,6 +441,12 @@ class Job:
     def cadence(self):
         if self.daemon:
             return "daemon (%s)" % (self.resident_decl or "resident")
+        if self.interval is None and self.calendar is None:
+            # ⛔ A JOB RETIRED BEFORE ITS SCHEDULE IS PARSED HAS NEITHER (#2908), and
+            # `human_secs(None or 0)` rendered that as "every 0s" — a cadence that says a job runs
+            # constantly, next to the SKIP that says it never runs. This is the only state that
+            # reaches here: every other skip is decided AFTER the schedule is read.
+            return "-"
         if self.calendar is not None:
             c = self.calendar
             if "_all" in c:
@@ -501,7 +511,7 @@ def human_secs(seconds: float) -> str:
     return "%dd" % round(seconds / 86400)
 
 
-def load_jobs(check_targets: bool = True) -> list:
+def load_jobs(check_targets: bool = True, strict_declarations: bool = False) -> list:
     """Parse every plist in TEMPLATES_DIR into a Job. Raises ScheduleError for a broken set.
 
     `check_targets=False` grades the DECLARATIONS only, and is what `--check` uses: whether
@@ -510,9 +520,25 @@ def load_jobs(check_targets: bool = True) -> list:
     installed, would refuse a perfectly good template set for the runner's own missing layering.
     The layer's real existence is already the cell's gate: `--install`/`--verify`.
 
-    RETIRED labels are read from the same manifest install-launchd.sh uses; a retired label that
-    still has a template is a loud error in both backends (that file says so). A label in
-    RETIRED with no template is nothing to do here: the loop only runs what is declared.
+    `strict_declarations=True` is the DECLARATION GATE's arm and is what `--check` passes: a
+    contradiction between two REPO files is refused outright there, because the repo is where it
+    was authored and a gate is where it must be caught. Every MACHINE verb (`--install`, `--start`,
+    `--verify`, `--status`, `--loop`) leaves it False — see `RETIRED` below for why one line in a
+    manifest must never be able to disarm a whole cell.
+
+    RETIRED labels are read from the same manifest install-launchd.sh uses. A label in RETIRED with
+    no template is nothing to do here: the loop only runs what is declared.
+
+    ⛔ A LABEL IN RETIRED *WHILE* ITS TEMPLATE STILL EXISTS IS A DISPOSITION AT RUNTIME, NOT A
+    REFUSAL (#2908). It used to raise, which took the WHOLE layer down — so an operator who
+    appended one line to `RETIRED` to stop two jobs they could not run lost every other job with
+    them: no reaping, no liveness detection, no canary, and a disk that then fills (measured on
+    cell 3/4, 2026-10-27: `fatal: the scheduled layer would not start (rc=1)`). The refusal is the
+    right verdict from the DECLARATION gate — both statements are in the repo, so `--check`
+    refuses it (strict_declarations) and CI cannot let an author add a template whose label is
+    still retired, which would be a job that silently never runs. The MACHINE verbs honour the
+    manifest instead: the label is a named SKIP, its installed copy is unloaded by the installer,
+    and the layer still starts over every other job.
     """
     if not os.path.isdir(TEMPLATES_DIR):
         raise ScheduleError("template dir not found: %s" % TEMPLATES_DIR)
@@ -594,10 +620,24 @@ def load_jobs(check_targets: bool = True) -> list:
                 "accepted (the label names this job's stamp, lock and default log)" % label
             )
         if label in retired:
-            raise ScheduleError(
-                "%s is in RETIRED but a template still exists — remove one or the other"
-                % label
+            if strict_declarations:
+                raise ScheduleError(
+                    "%s is in RETIRED but a template still exists — remove one or the other"
+                    % label
+                )
+            # ⛔ THE MANIFEST WINS ON A MACHINE (#2908). Retirement is the only statement here
+            # that a MACHINE can honour: the alternative is refusing the layer, which is the state
+            # that left cell 3/4 with no reaper, no liveness detection and no canary. Nothing else
+            # about the body is graded — a retired job is not going to run, so its schedule, its
+            # placeholders and its targets are all beside the point.
+            job.skip = (
+                "RETIRED — the label is listed in RETIRED while its template (%s) still exists, so "
+                "nothing is scheduled here and install-launchd.sh unloads any installed copy. This "
+                "contradiction is a REPO authoring error: `fleet-schedule.py --check` refuses it, "
+                "so remove the template or the RETIRED line (in the repo) to clear it" % name
             )
+            jobs.append(job)
+            continue
 
         # ⛔ RESIDENCY IS DECIDED BEFORE THE SCHEDULE, because a SCHEDULE MUST NOT MASK IT. The
         # decision used to live INSIDE the no-schedule branch, so `KeepAlive: {"SuccessfulExit":
@@ -2474,7 +2514,11 @@ def cmd_check():
     it ships? Target EXISTENCE is deliberately not graded here (see load_jobs); it is a fact about
     the machine, graded by `--install`/`--verify`.
     """
-    jobs = load_jobs(check_targets=False)
+    # ⛔ THE DECLARATION GATE IS THE ONLY VERB THAT REFUSES A RETIRED/TEMPLATE CONTRADICTION
+    # (#2908). Both statements are in the repo, so this is where it is caught and where CI can
+    # hold an author to it; every machine verb honours the manifest instead, so a stale line can
+    # never cost a cell its whole scheduled layer.
+    jobs = load_jobs(check_targets=False, strict_declarations=True)
     print_table(jobs, time.time())
     errors = [j for j in jobs if j.error]
     skipped = [j for j in jobs if j.skip and not j.error]
