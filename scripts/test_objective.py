@@ -3861,10 +3861,12 @@ def test_the_deriver_is_SOURCED_and_actually_READS_a_checkout(tmp_path):
 
 
 def test_a_deployment_WITHOUT_the_deriver_says_so_instead_of_guessing(tmp_path):
-    """The farm copy (`~/.pi/agent/scripts/`) has no `repo-slug.sh`: `deriver-missing`, not a guess.
+    """A deployment that did not carry `repo-slug.sh` says `deriver-missing`, not a guess.
 
-    Two causes, two remedies -- and the reason must reach the LINE (`repo_check=`), or the operator
-    applies "run from the checkout you mean" for ever on a box that is missing the file.
+    ⛔ NOT THE FARM: the farm copy (`~/.pi/agent/scripts/`) DOES carry the deriver since ai#1552, so
+    the shape under test here is a hand-deployed copy (`objective.py` alone). Two causes, two
+    remedies -- and the reason must reach the LINE (`repo_check=`), or the operator applies "run from
+    the checkout you mean" for ever on a box that is missing the file.
     """
     import importlib.util as ilu
     import shutil as sh
