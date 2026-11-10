@@ -219,12 +219,15 @@ field() { # <file> <name>
         case "$rest" in
           *'{'*|*'}'*|*'['*|*']'*|*\\*) ;;
           *)
-            case "$l1" in *"\"$n\":"*) ;; *) return 0 ;; esac
-            # ⛔ A KEY WITH WHITESPACE BEFORE ITS COLON IS THE READER'S. JSON permits `"k" :`, so the
-            # exact-byte scan cannot tell where the key ends — it would read the field as EMPTY (a
-            # false block on a perfectly valid record). One bracket expression routes the whole shape
-            # to the strict parse.
+            # ⛔ A KEY WITH WHITESPACE BEFORE ITS COLON IS THE READER'S, AND THIS TEST MUST COME FIRST.
+            # JSON permits `"k" :`, so the exact-byte scan cannot tell where the key ends — it would
+            # read the field as EMPTY (a false block on a perfectly valid record: this box could never
+            # publish it, and a peer could never materialise it). Ordering it AFTER the exact-token test
+            # made the route UNREACHABLE for the only shape it exists for, because that test returns 0
+            # when the exact token is absent (measured: 180/255 fuzzed separator variants, ALL of them
+            # this class).
             case "$l1" in *"\"$n\""[[:space:]]*) _field_json "$f" "$n"; return 0 ;; esac
+            case "$l1" in *"\"$n\":"*) ;; *) return 0 ;; esac
             # ⛔ A DUPLICATE KEY IS THE READER'S TOO. The last-match scan is only the reader's answer
             # when there IS one occurrence; JSON permits a repeat, `json.load` takes the LAST, and a
             # repeat written in a form this scan cannot see (`"repo" :`) would silently take an
@@ -277,10 +280,16 @@ field() { # <file> <name>
 _field_json() { # <file> <name>
   command -v python3 >/dev/null 2>&1 || return 0
   python3 - "$1" "$2" <<'PY' 2>/dev/null
-import json, sys
+import json, math, sys
+# ⛔ STRICT, like `JSON.parse` in `extensions/review-enforcer` — NOT python's default. `json.load`
+# accepts the non-RFC constants `NaN`/`Infinity`, which Node REFUSES, and a non-finite float stringifies
+# to `nan`/`inf`, sorting ABOVE every real timestamp: the sync read such a stamp as the newest thing in
+# the store and OVERWROTE a newer peer record with bytes the gate cannot parse (measured, fail OPEN).
+def _reject(c):
+    raise ValueError(c)
 try:
     with open(sys.argv[1]) as fh:
-        d = json.load(fh)
+        d = json.load(fh, parse_constant=_reject)
 except Exception:
     sys.exit(0)
 v = d.get(sys.argv[2], "") if isinstance(d, dict) else ""
@@ -288,6 +297,9 @@ if v is None or isinstance(v, (dict, list)):
     v = ""
 elif isinstance(v, bool):
     v = "true" if v else "false"
+elif isinstance(v, float):
+    # `1e999` parses to `inf` WITHOUT a constant token, so the constant hook above does not catch it
+    v = str(v) if math.isfinite(v) else ""
 elif not isinstance(v, str):
     v = str(v)
 print(v)
@@ -317,8 +329,12 @@ record_usable() { # <file> → 0 when this box's reader can use it
   }
   python3 - "$f" <<'PY' >/dev/null 2>&1 || return 1
 import json, re, sys
+# ⛔ STRICT (`JSON.parse`-equivalent): python's default accepts `NaN`/`Infinity`, which the gate's
+# readers REFUSE, so a record they cannot parse was judged usable here and then published.
+def _reject(c):
+    raise ValueError(c)
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.load(open(sys.argv[1]), parse_constant=_reject)
 except Exception:
     sys.exit(1)
 if not isinstance(d, dict):
@@ -585,9 +601,18 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
   LOCK_OWNED=0
   while [ "$i" -lt 50 ]; do
     if mkdir "$LOCKDIR" 2>/dev/null; then
-      printf '%s\n' "$$" > "$LOCKDIR/pid" 2>/dev/null || :
-      LOCK_OWNED=1
-      return 0
+      # ⛔ A LOCK WE CANNOT RECORD OURSELVES IN IS A LOCK WE CANNOT RELEASE. Swallowing a failed pid
+      # write (`|| :`) and entering anyway leaked the lock permanently: `reg_unlock` removes only a lock
+      # whose `pid` is ours, so it left the directory behind, and the pid-less arm does not fire until the
+      # STALENESS CEILING — every pull on the box then failed `could not serialise` for that whole window
+      # (measured). If we cannot prove ownership we do not enter the critical section.
+      if printf '%s\n' "$$" > "$LOCKDIR/pid" 2>/dev/null; then
+        LOCK_OWNED=1
+        return 0
+      fi
+      chmod -R u+rwX "$LOCKDIR" 2>/dev/null || :
+      rm -rf "$LOCKDIR" 2>/dev/null || :
+      return 1
     fi
     pidf="$LOCKDIR/pid"; pid=""
     [ -f "$pidf" ] && pid="$(command cat "$pidf" 2>/dev/null)"
@@ -1144,6 +1169,10 @@ usable_pairs() { # <key<TAB>path file> <out key list> → 0 ok
   command -v python3 >/dev/null 2>&1 || return 1
   python3 - "$pairs" "$out" <<'PY' || return 1
 import json, re, sys
+# ⛔ STRICT (`JSON.parse`-equivalent) — see `record_usable`. A `NaN`/`Infinity` record is one the gate's
+# readers refuse, so it must not be counted usable here either.
+def _reject(c):
+    raise ValueError(c)
 pairs, out = sys.argv[1], sys.argv[2]
 keep = []
 with open(pairs) as fh:
@@ -1154,7 +1183,7 @@ with open(pairs) as fh:
         key, _, path = line.partition("\t")
         try:
             with open(path, "rb") as f:
-                d = json.load(f)
+                d = json.load(f, parse_constant=_reject)
         except Exception:
             continue
         if not isinstance(d, dict):

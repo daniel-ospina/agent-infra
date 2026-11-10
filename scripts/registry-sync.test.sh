@@ -1018,6 +1018,22 @@ printf '{"pr":2374,"repo":"daniel-ospina/agent-infra","repo":"other/repo","head_
   "$HEAD_A" > "$NESTCD/$NEST_KEY.json"
 NC_OUT="$(mini_rs "$NESTCD" push)"
 assert_not_contains "$NC_OUT" "pushed $NEST_KEY" "§29n a plain duplicate key is resolved to the LAST occurrence, as the reader does"
+# §29o — `NaN`/`Infinity` ARE NOT JSON. Python's `json.load` accepts them; `extensions/review-enforcer`
+# (`JSON.parse`) REFUSES them. A non-finite stamp stringifies to `nan`, which sorts ABOVE every real
+# timestamp, so the sync read it as the newest record in the store and OVERWROTE a newer peer one with
+# bytes the gate cannot parse (round 6, reproduced end-to-end). Non-RFC constants are the strict parse's
+# to reject, on both verbs.
+NESTDD="$MINI_ROOT/boxd"; mkdir -p "$NESTDD"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":NaN}\n' \
+  "$HEAD_A" > "$NESTDD/$NEST_KEY.json"
+if node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$NESTDD/$NEST_KEY.json" 2>/dev/null; then
+  bad "§29o (premise) the gate's own reader ACCEPTED the fixture — the arm would prove nothing"
+else
+  ok "§29o (premise) the gate's own reader (JSON.parse) REFUSES the fixture"
+fi
+ND_OUT="$(mini_rs "$NESTDD" push)"
+assert_not_contains "$ND_OUT" "pushed $NEST_KEY" "§29o a NaN stamp is UNUSABLE — never published"
+assert_contains "$ND_OUT" "not one the fleet's rail can USE" "§29o ...and the refusal NAMES usability"
 # §29i — `null` is not a timestamp. The literal text sorts ABOVE every real stamp (`'n' > '2'`), so reading
 # it as `null` made a record with no stamp win the ordering instead of being unreadable.
 NEST9D="$MINI_ROOT/box9"; mkdir -p "$NEST9D"
@@ -1026,6 +1042,22 @@ printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"dani
 N9_OUT="$(mini_rs "$NEST9D" push)"
 assert_contains "$N9_OUT" "no readable reviewed_at" '§29i "reviewed_at":null is UNREADABLE, not the literal text null'
 assert_not_contains "$N9_OUT" "pushed $NEST_KEY" '§29i ...so it is never published'
+# §29p — the SPACED-KEY-ONLY shape: a flat, strictly-valid record whose only occurrence of the key is
+# written `"k" :v`. The exact-token scan finds nothing, so an ordering that tests the exact token FIRST
+# returns empty and the whitespace route (which exists for exactly this shape) can never fire — this box
+# then cannot publish a record the gate WOULD use, and no peer can materialise it (round 6, measured:
+# 180/255 fuzzed separator variants, all of them this class).
+NESTED_="$MINI_ROOT/boxe"; mkdir -p "$NESTED_"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo" :"daniel-ospina/agent-infra","reviewed_at" :"2026-11-02T00:00:00Z"}\n' \
+  "$HEAD_B" > "$NESTED_/$NEST_KEY.json"
+if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["repo"], d["reviewed_at"])' "$NESTED_/$NEST_KEY.json" 2>/dev/null | grep -q 'daniel-ospina/agent-infra 2026-11-02'; then
+  ok "§29p (premise) the reader accepts the spaced-key record and sees its fields"
+else
+  bad "§29p (premise) the fixture is not the shape the arm needs"
+fi
+NE_OUT="$(mini_rs "$NESTED_" push)"
+assert_contains "$NE_OUT" "pushed $NEST_KEY" "§29p a shared, strictly-valid record with spaced keys IS published (no false block)"
+assert_not_contains "$NE_OUT" "no readable reviewed_at" "§29p ...and is not read as an empty stamp"
 # §29m — NOTHING MAY BE PUBLISHED THAT THE READER REFUSES. Pull-side usability was gated from the start;
 # push-side was not, so a SINGLE-LINE record the strict parser rejects was published to the SHARED store at
 # rc 0 with `unreadable=0` — and every peer then sat at exit 4 for ever (one record per PR, no delete path,
@@ -1271,6 +1303,13 @@ if [ -s "$T/l.called" ]; then ok "§30l (premise) the failing stat WAS consulted
 if [ -d "$LKD/.registry-sync.lock" ]; then ok "§30l ...the lock is still there"; else bad "§30l ...the undateable lock was STOLEN"; fi
 assert_absent "$LKD" "$LKD/$LCK_KEY.json" "§30l ...and nothing was written without it"
 rm -rf "$LKD/.registry-sync.lock"; lock_reset
+# §30m — NOT PINNED, and said so rather than faked. `reg_lock` now refuses to enter the critical section
+# when it cannot write its own `pid` (a lock it cannot record itself in is a lock it can never release:
+# `reg_unlock` removes only a lock whose pid is ours, so the directory would stay and the pid-less arm
+# does not fire until the staleness ceiling). There is no hermetic way to inject that failure through
+# the CLI: `umask 0777` is the only lever and it also makes the run's OWN scratch files unreadable
+# (measured: `store.tsv: Permission denied`), so it fails for an unrelated reason before reaching the
+# lock. The arm is reported as UNPINNED instead of being written vacuously.
 
 # ═══ 31. this box's record is NEWER but UNUSABLE — named, not silently kept for ever ══════
 # Review finding P2 on PR #3894: `git grep 'own rail can use' -- scripts/*.test.sh` → no match, and
