@@ -122,22 +122,25 @@ orc_state_pick() {
 
 # ── 2. THE SINGLETON ─────────────────────────────────────────────────────────────────────────────
 # The record file stays exactly what it has always been — a bare pid on one line in `$O/.orch.lock` —
-# and that is not laziness. ⛔ THE ROSTER IS NOT AN ENUMERATION, and a previous attempt to write one
-# here is how this comment came to say "six": a list goes stale the moment a reader is added, and the
-# reader written against it updates the list instead of the code. What holds is the SHAPE: shipped
-# readers parse the record with `tr -dc '0-9'` — at least eleven call sites across nine files
-# (deploy-mac-orchestrator.sh, install-controller-service.sh, orchestrator-bringup.sh,
-# cloud-cell-supervisor.sh, lib/fleet-inventory.sh, cloud-cell-doctor.sh, harness-refresh.sh,
-# launchd-cycle.sh, watchdog-loop.sh; find them with
-# `git grep -nE "tr -dc ['\"]?0-9" scripts/ | grep -i 'orch\.lock'` — the `grep` matters, because the
-# bare `tr` pattern also matches unrelated pid/cursor reads, and there is a THIRD shape no `tr` grep
-# finds at all: `harness-refresh.sh:569-570` reads `head -1` and sanitises with the Bash glob
-# `${_ctrl_pid//[!0-9]/}`, which concatenates digits exactly the same way) — and two read the WHOLE
-# record instead: install.sh (`cat`, a non-digit sanitise, then `kill -0`) and selftest.sh
-# (`[ "$(cat …)" = "$pid" ]`, on a fixture it created itself). A richer format would make
+# and that is not laziness. ⛔ IT IS READ, NOT ENUMERATED, and an enumeration is how this comment came
+# to say "six": a list goes stale the moment a reader is added, and the reader written against it
+# updates the list instead of the code. What holds is the SHAPE. Shipped readers take the pid out of
+# the record with `tr -dc '0-9'` — deploy-mac-orchestrator.sh, install-controller-service.sh,
+# orchestrator-bringup.sh, cloud-cell-supervisor.sh (:918, :4597), lib/fleet-inventory.sh,
+# cloud-cell-doctor.sh, harness-refresh.sh (:325, :1401), launchd-cycle.sh, watchdog-loop.sh, and this
+# module's own `orc_lock_pid` — while ONE reads it with a Bash glob (`harness-refresh.sh:569-570`:
+# `head -1`, then `${_ctrl_pid//[!0-9]/}`, the same digit-concatenation hazard) and TWO read the WHOLE
+# record (`install.sh`: `cat`, a non-digit sanitise, `kill -0`; `selftest.sh`:
+# `[ "$(cat …)" = "$pid" ]`, on a fixture it created itself). A richer format would make
 # `tr -dc '0-9'` concatenate every digit in the record into a pid that never existed, on the stop path
 # of every one of those tools. So the format is untouched and the IDENTITY lives in the two things the
 # file already has: its pid, and its mtime.
+# ⛔ THE FINDER IS NOT A ROSTER.
+# `git grep -nE "tr -dc ['\"]?0-9" -- '*.sh' | grep -v '\.test\.sh'` matches the IDIOM, not the
+# path, so its output contains BOTH lock readers — including ones that reach the record through a
+# variable, e.g. `cloud-cell-supervisor.sh`'s `$LOCK` — AND unrelated pid/cursor reads (ai-drainer,
+# refresh-candidates, pr-owner-liveness). It cannot tell you which is which, and it does not list the
+# glob or whole-record readers above AT ALL. Read its output; never quote a total from it.
 
 # _orc_record_path_ok <path> — 0 when opening this path as the lock record CANNOT BLOCK: absent, or a
 # regular file. ⛔ A NOCLOBBER `>` IS NOT `O_EXCL` FOR A NON-REGULAR FILE, AND IT BLOCKS (measured,
@@ -145,8 +148,8 @@ orc_state_pick() {
 # opened it O_WRONLY and hung for the whole 5 s probe — the controller neither started nor refused, which
 # under launchd KeepAlive is an endless silent restart and a `harness-up` read that hangs with it. A
 # device node or a socket at that path is not a record either. A SYMLINK to a regular file is fine
-# (`-f` follows it, as every shipped reader of this path does — §2's discovery command lists them), and
-# a dangling symlink is "absent" here —
+# (`-f` follows it, as every shipped reader of this path does — the `tr` ones, the Bash-glob one and
+# both whole-record ones, all named in §2), and a dangling symlink is "absent" here —
 # creating through it is what every other tool does.
 _orc_record_path_ok() {
   local p="${1:-}"
