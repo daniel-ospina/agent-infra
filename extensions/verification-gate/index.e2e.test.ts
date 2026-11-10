@@ -5924,10 +5924,14 @@ async function main() {
     ok(captured.some((l) => l.includes("INSPECTION ONLY") && l.includes(realA) && l.includes(realB)),
       `1265a: the inspection merge must be announced as INSPECTION ONLY and name both roots, got: ${captured.join(" | ")}`);
     // R3: the REWORDED remedy is the change — #1265's one worktree killed three consecutive
-    // children, and the FIRST followed "cd into it" into a tree it did not own. Pin it. The
-    // block reason is NOT the evidence here even though it can now carry a root (block1 commits
-    // `src/shared1265.ts`, which A also holds, so `rootsHoldingPath` names a recorded root);
-    // R3 is about the REMEDY wording, which only the diagnosis line carries.
+    // children, and the FIRST followed "cd into it" into a tree it did not own. Pin it.
+    // ⛔ The block reason CANNOT be the evidence site here, and since #2886 it cannot carry a root
+    // at all: `src/shared1265.ts` is satisfied BY CONTENT by the same-repo sibling's record, so it
+    // never enters `unverified` and `rootsHoldingPath` is never consulted for it (see the row
+    // below). `block1`'s only unverified path is the private `src/b1265.ts`, which no root holds a
+    // record for. R3 is about the REMEDY wording, which only the diagnosis line carries.
+    // (Reworded per fresh-context review round 2: the pre-#2886 text claimed the reason was a
+    // viable evidence site "even though it can now carry a root" — the opposite of the truth now.)
     ok(captured.some((l) => l.includes("re-dispatch verification for THIS root") && l.includes(realB)),
       `1265a: the mismatch remedy must be the followable one and name THIS root, got: ${captured.join(" | ")}`);
     ok(captured.some((l) => l.includes("refused by design")),
