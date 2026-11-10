@@ -140,6 +140,14 @@
 #
 # TEST SEAMS (read-only overrides; production sets none of them):
 #   NCPU LOAD1_100 MEM_AVAIL_MB SWAP_TOTAL_MB SWAP_FREE_MB   skip the platform probes
+#   PROC_ROOT         the /proc tree the cwd witness walks              default: /proc
+#                     (a PLATFORM seam, the same class as DRAINER_OS: Darwin has no /proc, so the arm
+#                     that must exercise "this box has one witness fewer" has to be able to say so. It
+#                     does NOT disarm the gate — `wt_live_holders` is still consulted, and only when
+#                     BOTH witnesses are unavailable does the probe refuse to prove anything, which
+#                     keeps the tree rather than deleting it.)
+#   WTL               wt-lifecycle.sh to source for the live-holder witness (default: $O, then beside
+#                     this script) — the same resolution the launcher census uses for WT_MOD
 #   DRAINER_OS        the platform whose swap semantics apply: Darwin | Linux  default: `uname -s`
 #                     (the suite's seam — the Darwin arm must be exercisable on a Linux cell, which
 #                     has no `sysctl`, and the Linux arm on the operator's Mac)
@@ -600,6 +608,11 @@ fi
 # gone, and deletes the record so it is reported EXACTLY once. A lane still alive is left alone and
 # still counted by the census.
 SETTLED_FAIL=0
+# ⛔ LANES WHOSE RECORDED PID IS GONE BUT WHOSE CHECKOUT IS STILL HELD (agent-infra#2787). They are NOT
+# settled: they are still working, so their window stays theirs and they still count as live. The list
+# is filled by `_settle_lanes` (which is what probes) and read by `_held_offsets` and the census.
+SETTLE_HELD=0
+SETTLE_HELD_NAMES=" "
 # ⛔ EVERY PATH AFTER THE SETTLE GOES THROUGH `finish`. `_settle_lanes` can report a lane that died
 # without a clean status, and three early `exit 0`s (swap floor / load ceiling / at target) used to
 # bypass that report: on a healthy box at target — the normal steady state — a lane that exited 3 was
@@ -611,7 +624,102 @@ finish() { # [<rc>] — 1 when a lane from an earlier tick failed, whatever this
   fi
   exit "${1:-0}"
 }
+# ⛔ WHO OWNS THE WORKTREE'S LIFETIME (agent-infra#2787, MEASURED 2026-10-25). The drainer removed a
+# lane's checkout TWO MINUTES after launching it into a `cap=3000s` lane, and the worker kept running
+# with `getcwd: cannot access parent directories` — its uncommitted work went with the directory. The
+# only proof of "the lane has ended" in this file was `kill -0 <recorded pid>`, and a dead RECORDED pid
+# is a fact about the process the dispatcher chose to name, NOT about the lane: the launcher's pid was
+# gone while the worker it started was alive and mid-task.
+#
+# So the removal now needs the REAPER'S OWN PROOF before it happens — the same requirement
+# `scripts/pi-reap-worktrees.sh` applies to its own reclaim (a live holder refuses the removal, and a
+# probe that cannot be evaluated refuses it too). Two witnesses, both silent before anything is deleted:
+#   A. `wt_live_holders` (wt-lifecycle.sh, the module every other lane-worktree removal goes through):
+#      a process whose ARGV names the checkout, or whose CWD is inside it (via `lsof`).
+#   B. `/proc/<pid>/cwd`, where `/proc` exists. ⛔ THIS IS NOT REDUNDANT: a real holder here is a
+#      `pi -p … <brief-file>` lane whose argv NEVER names the checkout — witness A sees it only through
+#      `lsof`, and a cell without `lsof` installs one witness fewer. On Linux witness B is dependency-free
+#      and catches exactly that shape.
+# The module is resolved the way the launcher census resolves `worker-terminal.sh` ($O first, then beside
+# this script), because `$O` is seeded file by file and a STALE `wt-lifecycle.sh` would otherwise be read
+# as "no holders". A missing/stale module is NOT read as "no holder" — see `_drain_holder`'s rc 2.
+WTL="${WTL:-}"
+if [ -z "$WTL" ]; then
+  for _wtl_cand in "$O/wt-lifecycle.sh" "$SELF_DIR/wt-lifecycle.sh"; do
+    [ -f "$_wtl_cand" ] && { WTL="$_wtl_cand"; break; }
+  done
+fi
+HOLDER_PROBE_WHY="wt-lifecycle.sh not found (looked in $O, $SELF_DIR)"
+if [ -n "$WTL" ] && [ -f "$WTL" ]; then
+  # shellcheck disable=SC1090
+  . "$WTL" 2>/dev/null
+  if command -v wt_live_holders >/dev/null 2>&1; then
+    HOLDER_PROBE="1"; HOLDER_PROBE_WHY="ok ($WTL)"
+  else
+    HOLDER_PROBE="0"
+    HOLDER_PROBE_WHY="wt-lifecycle.sh at $WTL is stale (no wt_live_holders) — fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"
+  fi
+else
+  HOLDER_PROBE="0"
+fi
+# ⛔ WITNESS B RUNS WITH NO FORK THAT INHERITS A WORKTREE CWD. This is the measurement `wt-lifecycle.sh`
+# records for the same class (its `wt_run_bounded`): a subshell does not `exec`, so it inherits its
+# parent's cwd AND argv, and a probe that runs INSIDE the tree it inspects finds ITSELF and refuses every
+# removal for ever. This tick never cds into a lane checkout, so the only requirement here is not to
+# start doing so.
+_proc_cwd_holder() { # <canon path> → 0 + "<pid>\t<cwd-inside-the-worktree>" · 1 none · 2 not evaluable
+  local d tgt root="${PROC_ROOT:-/proc}" n
+  [ -d "$root" ] || return 2
+  for d in "$root"/[0-9]*; do
+    tgt="$(readlink "$d/cwd" 2>/dev/null)" || continue
+    [ -n "$tgt" ] || continue
+    n="${d##*/}"
+    case "$tgt" in
+      "$1"|"$1"/*) printf '%s\t%s\n' "$n" "cwd-inside-the-worktree"; return 0 ;;
+    esac
+  done
+  return 1
+}
+_drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none · 2 could not be evaluated
+  local path out rc=0 proc_rc=0
+  # Canonical, because `/proc/<pid>/cwd` and `lsof` both answer with RESOLVED paths: a `$AI` reached
+  # through a symlink (`/tmp` → `/private/tmp` on Darwin, a linked state dir on a cell) would otherwise
+  # never match, and a holder would read as absent — the direction that destroys work.
+  path="$(cd "$1" 2>/dev/null && pwd -P)" || return 2
+  [ -n "$path" ] || return 2
+  if [ "$HOLDER_PROBE" = "1" ]; then
+    out="$(wt_live_holders "$path")"; rc=$?
+    case "$rc" in
+      0) printf '%s\n' "$out"; return 0 ;;
+      1) rc=1 ;;
+      *) rc=2 ;;
+    esac
+  else
+    rc=2                                   # witness A cannot be evaluated on this box
+  fi
+  out="$(_proc_cwd_holder "$path")"; proc_rc=$?
+  case "$proc_rc" in
+    0) printf '%s\n' "$out"; return 0 ;;
+    1) rc=1 ;;
+    *) : ;;                                # witness B absent (no /proc): keep witness A's verdict
+  esac
+  return "$rc"
+}
 _rm_wt() { # <worktree path> — only ever called for a lane whose pid is PROVABLY DEAD
+  #                         → 0 removed · 2 kept (the probe could not be evaluated) · 3 kept (held)
+  local holder="" hrc=0 hpid="" hwhy=""
+  # ──8<── holder-gate ───────────────────────────────────────────────────────────────────────
+  holder="$(_drain_holder "$1")"; hrc=$?
+  case "$hrc" in
+    0)
+      hpid="${holder%%$'\t'*}"; hwhy="${holder#*$'\t'}"
+      log_line "KEEP: not removing $1 — ${hwhy:-a live process} (pid ${hpid:-?}) still holds it, so the lane is STILL RUNNING whatever its pidfile says (agent-infra#2787); its record stands and a later tick retries"
+      return 3 ;;
+    2)
+      log_line "KEEP: not removing $1 — the live-holder probe could not be evaluated ($HOLDER_PROBE_WHY), and an unproven removal is the one thing this pass may not do (agent-infra#2787); a later tick retries"
+      return 2 ;;
+  esac
+  # ──8<── /holder-gate ──────────────────────────────────────────────────────────────────────
   # ⛔ THE `|| rm -rf` FALLBACK IS NOT REDUNDANT: a leftover directory is not always a REGISTERED git
   # worktree (a wiped $SEED_REPO, a hand-made copy, a half-created tree), and `git worktree remove`
   # refuses those — so a reaper that only called git would leave them for ever and log "could not
@@ -619,6 +727,7 @@ _rm_wt() { # <worktree path> — only ever called for a lane whose pid is PROVAB
   git -C "$SEED_REPO" worktree remove --force "$1" >/dev/null 2>&1 && { rm -f "$1.lane-pid" 2>/dev/null; return 0; }
   rm -rf "$1" 2>/dev/null && { rm -f "$1.lane-pid" 2>/dev/null; return 0; }
   log_line "WARN: could not remove the worktree at $1 — a later tick reaps it; it is named, not silent"
+  return 1
 }
 _settle_lanes() {
   local f name pid rc rc_file g w
@@ -628,6 +737,19 @@ _settle_lanes() {
     pid="$(tr -dc '0-9' 2>/dev/null <"$f")"
     [ -n "$pid" ] || { rm -f "$f" "$LANES_DIR/$name.slice"; continue; }
     kill -0 "$pid" 2>/dev/null && continue          # still working — not this tick's news
+    # ⛔ A DEAD RECORDED PID IS NOT A FINISHED LANE (agent-infra#2787). If something is still working in
+    # the checkout, this lane has NOT ended: it is not settled (so its verdict is reported when it truly
+    # ends, exactly once), its record stands, its slice window stays held, and it still counts as alive.
+    # The tree decides first — before the rc grace below, which would otherwise stall a kept lane for
+    # `RC_GRACE_S` on EVERY tick.
+    w="$AI/wt-drainer-$name"
+    if [ -d "$w" ]; then
+      _rm_wt "$w"
+      if [ $? -ne 0 ]; then
+        SETTLE_HELD=$((SETTLE_HELD + 1)); SETTLE_HELD_NAMES="$SETTLE_HELD_NAMES$name "
+        continue
+      fi
+    fi
     rc_file="$O/bg/$name.rc"
     rc="$(cat "$rc_file" 2>/dev/null || printf '')"
     # A dispatcher that records the status from a DETACHED watcher writes it a moment AFTER the pid
@@ -654,8 +776,6 @@ _settle_lanes() {
       log_line "DONE: lane $name (pid $pid) finished rc=0"
     fi
     rm -f "$f" "$LANES_DIR/$name.slice" 2>/dev/null
-    w="$AI/wt-drainer-$name"
-    [ -d "$w" ] && _rm_wt "$w"
   done
 }
 # ⛔ `git worktree prune` IS NOT A LEFTOVER REAPER: it only drops administrative entries whose directory
@@ -664,16 +784,22 @@ _settle_lanes() {
 # still in use; NO SIDECAR means UNKNOWN, and an unknown tree is left for an operator (a health job
 # does not guess).
 _reap_leftovers() {
-  local w lane n=0
+  local w lane n=0 nm
   for w in "$AI"/wt-drainer-*; do
     case "$w" in *.lane-pid) continue ;; esac       # the sidecar is not a worktree
     [ -d "$w" ] || continue
+    # ⛔ A TREE THIS TICK'S SETTLE ALREADY KEPT IS NOT PROBED A SECOND TIME. `_settle_lanes` runs first
+    # and holds the same verdict; re-probing it here cost a second probe per kept tree per tick and
+    # logged the identical `KEEP:` line twice, which reads like two different refusals.
+    nm="${w##*/wt-drainer-}"
+    case "$SETTLE_HELD_NAMES" in *" $nm "*) continue ;; esac
     lane=""
     [ -f "$w.lane-pid" ] && lane="$(tr -dc '0-9' 2>/dev/null <"$w.lane-pid")"
     [ -n "$lane" ] || continue
     kill -0 "$lane" 2>/dev/null && continue
-    _rm_wt "$w"
-    n=$((n + 1))
+    # ⛔ COUNTED ONLY WHEN IT WAS ACTUALLY REMOVED. A tree kept by the holder gate (or by an
+    # unevaluable probe) is not a reap, and `REAPED: n` must not claim one.
+    _rm_wt "$w" && n=$((n + 1))
   done
   git -C "$SEED_REPO" worktree prune >/dev/null 2>&1 || true
   [ "$n" -eq 0 ] || log_line "REAPED: $n leftover worktree(s) whose lane was gone"
@@ -952,14 +1078,21 @@ _census_launcher() { # <dispatcher-overlap> — prints the count, or nothing whe
 # still on them — two lanes per window, two reviews per head, two merge attempts per PR. So the
 # cursor alone is not enough: the offsets a live lane HOLDS are read from the lane records and
 # skipped, and if the ring holds no free window the tick dispatches nothing and says so.
-_held_offsets() { # prints " 0 10 30 " — offsets held by lanes whose pid is still alive
-  local f name pid off held=" "
+_held_offsets() { # prints " 0 10 30 " — offsets held by lanes that are still working
+  # ⛔ "STILL WORKING" IS NOT "RECORDED PID ALIVE" (agent-infra#2787). `_settle_lanes` already probed
+  # every dead-pid record and left the ones whose checkout is still held in `SETTLE_HELD_NAMES`; those
+  # lanes are alive, so their window is theirs and must not be re-issued to a second lane that would
+  # work the same PRs. Reading that verdict (rather than probing again here) keeps ONE probe per record
+  # per tick, in the pass that already visits them.
+  local f name pid off held=" " still
   for f in "$LANES_DIR"/*.pid; do
     [ -f "$f" ] || continue
     name="${f##*/}"; name="${name%.pid}"
     pid="$(tr -dc '0-9' 2>/dev/null <"$f")"
-    [ -n "$pid" ] || continue
-    kill -0 "$pid" 2>/dev/null || continue
+    still=0
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && still=1
+    [ "$still" = "1" ] || case "$SETTLE_HELD_NAMES" in *" $name "*) still=1 ;; esac
+    [ "$still" = "1" ] || continue
     off="$(tr -dc '0-9' 2>/dev/null <"$LANES_DIR/$name.slice")"
     [ -n "$off" ] && held="$held$off "
   done
@@ -1118,9 +1251,14 @@ if [ "$CENSUS_LAUNCHER" = "1" ] && [ "${lau_alive:-0}" -eq 0 ]; then
 fi
 # ⛔ `disp_alive` and `lau_alive` are DISJOINT (the launcher clamp removed the dispatcher's share of the
 # process count — see `_census_launcher`), which is the only reason a plain sum is the live-lane count.
-lanes=$((disp_alive + ${lau_alive:-0}))
+# ⛔ AND THE THIRD TERM IS A LANE THE PID CENSUS CANNOT SEE (agent-infra#2787): `SETTLE_HELD` counts the
+# records whose pid is gone while their checkout is still held. It is named separately in `alive_src`
+# because it is measured by a DIFFERENT instrument (the holder probe) and an operator must be able to
+# see which one answered — the incident's tick printed `lanes=0` while a `cap=3000s` lane was alive.
+lanes=$((disp_alive + ${lau_alive:-0} + SETTLE_HELD))
 alive_src="dispatcher=$disp_alive"
 [ -n "$lau_alive" ] && alive_src="$alive_src launcher=$lau_alive"
+[ "$SETTLE_HELD" -gt 0 ] && alive_src="$alive_src held=$SETTLE_HELD(pid-gone-checkout-held)"
 [ -n "$lau_note" ] && alive_src="$alive_src ($lau_note)"
 
 # ⛔ THE HARD GUARDS COME FIRST AND EACH NAMES ITSELF. A guard that refuses without saying which read
@@ -1207,6 +1345,22 @@ if [ "$n" -eq 0 ]; then
   # itself is 0 because memory/cores say so.
   log_line "SKIP: nothing to add — $target_why alive=$lanes ($alive_src) free_windows=${#FREE[@]}/$slices $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}')"
   finish 0
+fi
+# ⛔ THE SEED IS PROVEN BEFORE THE FIRST LANE, NOT DISCOVERED PER LANE (agent-infra#2787). MEASURED
+# 2026-10-25: one tick could not create a replacement worktree (`FAIL: cannot create a worktree from
+# /tmp/cell-ai-main (origin/main)` — that seed was simply gone), and the SAME tick had removed a live
+# lane's checkout a minute earlier. A missing seed is a per-tick PRECONDITION, so it is refused once,
+# BEFORE any brief, worktree, sidecar or record exists — which is what makes the tick's state
+# unambiguous (nothing was half-dispatched) and what stops the per-lane message from being the first
+# place an operator hears it. The per-lane check below STAYS: the seed can vanish between this line and
+# the Nth lane, and a race is a different fact from a broken precondition.
+if ! git -C "$SEED_REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  log_line "FAIL: SEED_REPO=$SEED_REPO is not a git checkout (missing, wiped, or not a repo) — no lane was dispatched, no worktree was created and no record was written; every earlier tick's record still stands"
+  finish 1
+fi
+if ! git -C "$SEED_REPO" rev-parse --verify -q "$SEED_REF" >/dev/null 2>&1; then
+  log_line "FAIL: SEED_REPO=$SEED_REPO has no ref '$SEED_REF' to branch a lane from — no lane was dispatched, no worktree was created and no record was written; fetch the seed (git -C $SEED_REPO fetch origin) or set SEED_REF"
+  finish 1
 fi
 log_line "START: $target_why alive=$lanes ($alive_src) dispatching $n $swap_note load=$(awk -v l="$lo100" 'BEGIN{printf "%.2f", l/100}') slices=$slices free_windows=${#FREE[@]} dispatcher=$DISPATCH"
 

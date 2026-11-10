@@ -162,13 +162,37 @@ while nothing happened:
   established is a lane that can never be counted or reaped.
 - **the beat is written by every tick that ran**, including a skip — a skip is the normal steady state,
   and a beat written only after a dispatch would make a correctly-idle job read `LATE` for ever.
-- **a worktree is removed only when its lane is provably dead.** A signal to the TICK says nothing
+- **a worktree is removed only when nothing is still working in it.** A signal to the TICK says nothing
   about the lanes (a `bootout`, a reboot, a Ctrl-C on a hand-run copy), and the tick backgrounds them
-  before it returns — so the normal path is *leave*, and the next tick's settle removes the tree once
-  the pid is gone. The lane pid is recorded beside the tree (`<wt>.lane-pid`) and a later tick reaps a
-  leftover only when that pid is dead; a tree with no sidecar is UNKNOWN and left alone. A fresh
-  checkout per lane with nothing removing it is ~72/day on a box that has been disk-bound, so the
-  reaper is not optional — and a reaper that guesses is worse than none.
+  before it returns — so the normal path is *leave*, and the next tick's settle removes the tree.
+  ⛔ **A DEAD PIDFILE IS NOT A DEAD LANE** (agent-infra#2787, MEASURED 2026-10-25): a tick removed a
+  lane's checkout TWO MINUTES after launching it into a `cap=3000s` lane, and the worker kept running
+  with `getcwd: cannot access parent directories`. The recorded pid
+  (`$AI/state/lanes/<name>.pid`, and `<wt>.lane-pid` beside the tree) is whatever process the
+  DISPATCHER chose to name — a fact about that process, never about the lane — so removal now needs the
+  reaper's own proof first, exactly as `scripts/pi-reap-worktrees.sh` requires for its own reclaim:
+  * a process whose **argv names the checkout**, or whose **cwd is inside it** (`wt_live_holders`, from
+    `wt-lifecycle.sh` — resolved `$O` first, then beside the drainer, and a missing/stale module is
+    *named*, never read as "no holders");
+  * plus a `/proc/<pid>/cwd` witness where `/proc` exists. This is not redundant: a real holder is a
+    `pi -p … <brief>` lane whose argv never names the checkout, which only the cwd witness sees — and a
+    cell without `lsof` installs one witness fewer.
+
+  A tree that is still held is **kept**, and the lane is **not settled**: the tick logs
+  `KEEP: … (pid N) still holds it`, the record stands (so the verdict is still reported exactly once,
+  when the lane truly ends) and a later tick retries. A probe that **cannot be evaluated** keeps the
+  tree too — an unproven removal is the one thing this pass may not do. The same verdict is reused
+  rather than re-derived: those lanes count as **live** in the census (`held=N(pid-gone-checkout-held)`,
+  its own named instrument beside `dispatcher=`/`launcher=`) and keep their slice window, so a second
+  lane cannot be dispatched onto the same PRs. A tree with **no** sidecar is UNKNOWN and left alone.
+  A fresh checkout per lane with nothing removing it is ~72/day on a box that has been disk-bound, so
+  the reaper is not optional — and a reaper that guesses is worse than none.
+- **the seed is a tick precondition, proven before the first lane.** `SEED_REPO` is checked once
+  (`git rev-parse --git-dir`, then the `SEED_REF`), and a missing seed or ref refuses the tick **before**
+  any brief, worktree, sidecar or record exists — so nothing is half-dispatched. The incident's tick
+  both destroyed a live checkout and could not rebuild one, from a seed that was simply gone. The
+  per-lane check remains: the seed can vanish between that line and the Nth lane, which is a race and a
+  different fact.
 
 `ai-drainer.test.sh` drives the shipped script against all of it, and every arm that matters is
 asserted against a **mutation**: the top-up loop is re-run with `n=1` injected (`one lane per tick`, the
@@ -186,6 +210,13 @@ an unreadable `ps` (unknown is ALIVE), the generated brief is piped through the 
 never re-issued while it is live (paired with a mutation that ignores the held set and must then
 re-issue it), an aborted launcher table fails the tick instead of reading as zero workers, and a settled
 lane's failure survives an at-target SKIP.
+
+Arm (i2) is the #2787 register: a live worker whose cwd is in the checkout, with a **dead** recorded pid.
+The tick must keep the tree, keep the record, count the lane (`held=1`), keep its window, and reclaim it
+once the holder exits — and the arm carries its own non-vacuity twin in which the holder gate is deleted
+from a copy of the script, where the live worker's checkout MUST be removed. Arm (i3) pins the
+fail-closed direction (both witnesses unavailable keeps the tree and names the gap; a stale
+`wt-lifecycle.sh` on a Linux box is not a permanent block, because the `/proc` witness still answers).
 
 ## Activate on macOS
 
