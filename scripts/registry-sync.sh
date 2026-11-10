@@ -633,7 +633,7 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
   # it" was therefore false for N > 1. One failure is memoised for the rest of the run, which still
   # counts every key FAILED and still writes nothing.
   [ "${LOCK_UNACQUIRABLE:-0}" = "1" ] && return 1
-  [ -d "$REG_DIR" ] || mkdir -p "$REG_DIR" 2>/dev/null || { LOCK_UNACQUIRABLE=1; return 1; }
+  [ -d "$REG_DIR" ] || mkdir -p "$REG_DIR" 2>/dev/null || { LOCK_UNACQUIRABLE=1; LOCK_FAIL="fatal"; return 1; }
   LOCKDIR="$REG_DIR/.registry-sync.lock"
   LOCK_OWNED=0
   while [ "$i" -lt 50 ]; do
@@ -649,7 +649,7 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
       fi
       chmod -R u+rwX "$LOCKDIR" 2>/dev/null || :
       rm -rf "$LOCKDIR" 2>/dev/null || :
-      LOCK_UNACQUIRABLE=1
+      LOCK_UNACQUIRABLE=1; LOCK_FAIL="fatal"
       return 1
     fi
     pidf="$LOCKDIR/pid"; pid=""
@@ -682,6 +682,18 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
     claim_restore || :
     sleep 0.1; i=$((i + 1))
   done
+  # ⛔ MEMOISING THE FAILURE FIXED THE COST; IT DID NOT FIX THE DIAGNOSIS, and the diagnosis is what the
+  # operator acts on. A lock this box can never acquire is NOT "another run holds it" — nobody holds it,
+  # and the advice "Re-run to retry" sends the operator round a loop that fails identically (the #2349
+  # class this file names elsewhere). Probe the ACTUAL question (can a directory be created in this
+  # registry at all?) so the message can name the permission, and the summary the remedy that works.
+  # MESSAGE ONLY: what is memoised, and when, is unchanged — this arm cannot alter behaviour.
+  LOCK_FAIL="contended"
+  if mkdir "$LOCKDIR.probe.$$" 2>/dev/null; then
+    rmdir "$LOCKDIR.probe.$$" 2>/dev/null || :
+  else
+    LOCK_FAIL="fatal"
+  fi
   LOCK_UNACQUIRABLE=1
   return 1
 }
@@ -705,6 +717,8 @@ LOCKDIR=""
 LOCK_OWNED=0
 PENDING_STALE=""
 LOCK_UNACQUIRABLE=0
+LOCK_FAIL=""        # why the LAST reg_lock failure happened: contended | fatal (message selection only)
+LOCK_FATAL_ANY=0    # sticky within a run: any fatal verdict, so the summary names the permission remedy
 # ── ONE listing per run (agent-infra#3180) ───────────────────────────────────────────────────────
 # `union` = `do_pull` then `do_push`, and both called `fetch_refs` — 4 git network calls to read the
 # SAME namespace twice (measured: ls-remote 2.4-3.9 s + fetch 3.7 s, so ~10-15 s of a land bought
@@ -895,8 +909,14 @@ pull_one() { # <key>
   # pull_one_locked's early returns releases it — a lock leaked on an early return would wedge the
   # next run, which is a worse failure than the race it prevents.
   if ! reg_lock; then
-    warn "  ⚠️ skip $1 — could not serialise the registry (another run holds $REG_DIR/.registry-sync.lock);"
-    warn "     NOTHING was written, so no record was overwritten with an older one. Re-run to retry."
+    if [ "${LOCK_FAIL:-}" = "fatal" ]; then
+      LOCK_FATAL_ANY=1
+      warn "  ⚠️ could not serialise the registry — $REG_DIR/.registry-sync.lock can be neither created nor removed here,"
+      warn "     so NO record is written this run (and none is overwritten with an older one)."
+    else
+      warn "  ⚠️ skip $1 — could not serialise the registry (another run holds $REG_DIR/.registry-sync.lock);"
+      warn "     NOTHING was written, so no record was overwritten with an older one. Re-run to retry."
+    fi
     FAILED=$((FAILED + 1)); return 0
   fi
   pull_one_locked "$1"
@@ -1470,7 +1490,13 @@ summary() { # <verb>
     # WHICH SIDE failed matters at the caller: a failed PULL means the fleet is UNKNOWN here, while a
     # failed PUSH means the records WERE read and this box could not publish. Naming both as "the
     # fleet's records are UNKNOWN" sent an operator to re-run a path that fails identically.
-    if [ "$PUSH_FAILED" -gt 0 ] && [ "$FAILED" -eq "$PUSH_FAILED" ]; then
+    if [ "${LOCK_FATAL_ANY:-0}" = "1" ]; then
+      # The remedy is NOT "re-run": a re-run meets the same unwritable registry. Name the lock and the
+      # permission, so the operator is not sent round a loop that fails identically (#2349's class).
+      warn "registry-sync.sh: $FAILED record(s) could not be moved — the cause was the lock: this user can"
+      warn "  neither create nor remove $REG_DIR/.registry-sync.lock. Check that directory's permissions (and remove"
+      warn "  a root-owned lock left by a sudo run), then re-run. Nothing was deleted and no record was overwritten."
+    elif [ "$PUSH_FAILED" -gt 0 ] && [ "$FAILED" -eq "$PUSH_FAILED" ]; then
       warn "registry-sync.sh: $FAILED record(s) could not be PUBLISHED — the pull side succeeded, so this box"
       warn "  HOLDs the fleet's records but its own are still LOCAL. Re-run to retry (nothing was deleted)."
     else

@@ -1402,6 +1402,39 @@ else
   bad "§30o ...the lock wait was paid per key (${O_SECS}s for 3 keys), so the run is O(keys) x 5s"
 fi
 rm -rf "$LM_BOX/.registry-sync.lock"
+
+# §30p — AND THE MESSAGE MUST BE TRUE. §30o fixes the COST of a permanently unacquirable lock; it left the
+# DIAGNOSIS wrong, and the diagnosis is what the operator acts on: every key reported "another run holds"
+# a lock that nobody held and that this user could not create, and the summary advised "Re-run to retry" —
+# a re-run meets the SAME unwritable registry (the #2349 class: naming the wrong side sends the operator
+# down a path that fails identically). The shape is the one §30e's own premise names: a lock left in a
+# registry this user cannot write (a root-owned lock from a `sudo` run in a shared install), so `mkdir`
+# AND `claim_stale`'s `mv` are both refused and the name never frees. Behaviour is asserted UNCHANGED
+# alongside the wording, so this arm cannot be satisfied by weakening the memoisation §30o pins.
+mini_fixture lockperm
+LP_SEED="$MINI_ROOT/seed"; mkdir -p "$LP_SEED"
+for LP_PR in 921 922 923; do
+  printf '{"pr":%s,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"acme/widget","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+    "$LP_PR" "$HEAD_A" > "$LP_SEED/acme-widget-$LP_PR.json"
+done
+mini_rs "$LP_SEED" push >/dev/null 2>&1
+LP_BOX="$MINI_ROOT/box"; mkdir -p "$LP_BOX"
+mkdir -p "$LP_BOX/.registry-sync.lock"; printf '1\n' > "$LP_BOX/.registry-sync.lock/pid"
+if [ "$(id -u 2>/dev/null || echo 0)" -eq 0 ] || { chmod 500 "$LP_BOX" 2>/dev/null; mkdir "$LP_BOX/.lockprobe" 2>/dev/null; }; then
+  rmdir "$LP_BOX/.lockprobe" 2>/dev/null || :; chmod 700 "$LP_BOX" 2>/dev/null || :
+  ok "§30p (premise NOT reachable) this suite runs as root, where a mode-500 registry is still writable — recorded as an explicit skip, not a silent pass"
+else
+  run_bounded 40 bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LP_BOX" --remote origin --timeout 30
+  P_TO="$RB_TIMED_OUT"; P_OUT="$RB_OUT"; P_RC="$RB_RC"
+  chmod 700 "$LP_BOX" 2>/dev/null || :
+  assert_eq "$P_TO" "0" "§30p a registry that can never host a lock still TERMINATES"
+  assert_eq "$P_RC" "1" "§30p ...and still fails closed (rc 1)"
+  assert_contains "$P_OUT" "can be neither created nor removed here" "§30p ...naming the REAL cause instead of an invisible permission"
+  assert_not_contains "$P_OUT" "another run holds" "§30p ...and NOT claiming a peer holds a lock nobody holds"
+  assert_contains "$P_OUT" "failed=3" "§30p ...still counting every key (§30o's memoisation is not weakened)"
+  assert_contains "$P_OUT" "neither create nor remove" "§30p ...and the summary names the permission as the remedy"
+  assert_not_contains "$P_OUT" "re-run to retry (nothing was deleted, and no record was overwritten with an older one)" "§30p ...rather than a re-run that meets the same directory"
+fi
 # §30m — NOT PINNED, and said so rather than faked. `reg_lock` now refuses to enter the critical section
 # when it cannot write its own `pid` (a lock it cannot record itself in is a lock it can never release:
 # `reg_unlock` removes only a lock whose pid is ours, so the directory would stay and the pid-less arm
