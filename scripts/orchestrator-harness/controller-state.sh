@@ -128,12 +128,15 @@ orc_state_pick() {
 # readers parse the record with `tr -dc '0-9'` — at least eleven call sites across nine files
 # (deploy-mac-orchestrator.sh, install-controller-service.sh, orchestrator-bringup.sh,
 # cloud-cell-supervisor.sh, lib/fleet-inventory.sh, cloud-cell-doctor.sh, harness-refresh.sh,
-# launchd-cycle.sh, watchdog-loop.sh; find them all with `git grep -nE "tr -dc ['\"]?0-9" scripts/`,
-# which is the only count that cannot go stale) — and two read the WHOLE record instead: install.sh
-# (`cat`, a non-digit sanitise, then `kill -0`) and selftest.sh (`[ "$(cat …)" = "$pid" ]`, on a
-# fixture it created itself). A richer format would make `tr -dc '0-9'` concatenate every digit in the
-# record into a pid that never existed, on the stop path of every one of those tools. So the format is
-# untouched and the IDENTITY lives in the two things the
+# launchd-cycle.sh, watchdog-loop.sh; find them with
+# `git grep -nE "tr -dc ['\"]?0-9" scripts/ | grep -i 'orch\.lock'` — the `grep` matters, because the
+# bare `tr` pattern also matches unrelated pid/cursor reads, and there is a THIRD shape no `tr` grep
+# finds at all: `harness-refresh.sh:569-570` reads `head -1` and sanitises with the Bash glob
+# `${_ctrl_pid//[!0-9]/}`, which concatenates digits exactly the same way) — and two read the WHOLE
+# record instead: install.sh (`cat`, a non-digit sanitise, then `kill -0`) and selftest.sh
+# (`[ "$(cat …)" = "$pid" ]`, on a fixture it created itself). A richer format would make
+# `tr -dc '0-9'` concatenate every digit in the record into a pid that never existed, on the stop path
+# of every one of those tools. So the format is untouched and the IDENTITY lives in the two things the
 # file already has: its pid, and its mtime.
 
 # _orc_record_path_ok <path> — 0 when opening this path as the lock record CANNOT BLOCK: absent, or a
@@ -142,7 +145,8 @@ orc_state_pick() {
 # opened it O_WRONLY and hung for the whole 5 s probe — the controller neither started nor refused, which
 # under launchd KeepAlive is an endless silent restart and a `harness-up` read that hangs with it. A
 # device node or a socket at that path is not a record either. A SYMLINK to a regular file is fine
-# (`-f` follows it, exactly as the six shipped readers do), and a dangling symlink is "absent" here —
+# (`-f` follows it, as every shipped reader of this path does — §2's discovery command lists them), and
+# a dangling symlink is "absent" here —
 # creating through it is what every other tool does.
 _orc_record_path_ok() {
   local p="${1:-}"
@@ -168,10 +172,10 @@ orc_lock_write() {
 # was still blocked when it was SIGKILLed (record left as `type=p`), so the controller neither started
 # nor refused — under launchd KeepAlive that is an endless silent restart, and `harness-up`'s read of
 # the same path hangs with it. `[ -f ]` is the test: a bare pid file is a REGULAR file, a FIFO/device/
-# directory/socket there is not a record at all, and a symlink to a regular file is still read (the six
-# shipped readers follow it too). Anything else yields "" — the same answer as an empty record, which
-# every reader already treats as STOPPED — so the caller takes the EMPTY-record reclaim path and
-# displaces the odd object instead of blocking on it.
+# directory/socket there is not a record at all, and a symlink to a regular file is still read (every
+# shipped reader of this path follows it too). Anything else yields "" — the same answer as an empty
+# record, which every reader already treats as STOPPED — so the caller takes the EMPTY-record reclaim
+# path and displaces the odd object instead of blocking on it.
 # ⛔ `2>/dev/null` BEFORE the redirect, not after: redirections apply left to right, so a FAILED
 # `<` reports to a stderr that is already silenced here — but with the order reversed the shell itself
 # printed `…/.orch.lock: No such file or directory` onto the controller's stderr for a record that was
