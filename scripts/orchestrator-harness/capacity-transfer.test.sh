@@ -310,6 +310,15 @@ echo
 echo "=== §1 the refusal becomes a durable record (state/capacity-refused-<N>) ==="
 # The yield length is pinned to a non-default value so the check is not satisfied by the default.
 LANE_YIELD=120
+# ⛔ THE CREATION-BACK-PRESSURE GATE SITS ON THIS SAME PATH AND MUST NOT BE THE ONE THAT ANSWERED
+# (measured 2026-11-10). `spawn-gate.sh` gained #2409's land-backlog gate, which reads this repo's
+# LIVE open-PR count and landing rate through the `$O/gh-rest/gh` adapter. With no adapter installed the
+# read fails, and a FAILED read is never an `OK` — it returns 74 with `UNREADABLE open-PR count`, so
+# every arm below was red with `gate='land'` for a reason that has nothing to do with capacity. The
+# reading is therefore SUPPLIED as a box supplies it (an under-ceiling shape), which is the same
+# pattern the stale-record arm further down already uses and the reason it was the only one that stayed
+# green. The gate still runs for real; only its measurement is a fixture.
+lbgh_install "$TMP/lbgh-ok"
 BEFORE="$(date +%s)"
 ( cd "$LANECWD" && O="$O" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
     CAPACITY_YIELD_SECS=$LANE_YIELD bash "$LANE" --key-gate-off 7 feat/7-tm daniel-ospina/agent-infra ) > "$TMP/lane7.out" 2>&1
@@ -363,12 +372,24 @@ rm -f "$O/state/capacity-refused-17"
 ( cd "$LANECWD"
   # shellcheck shell=bash
   cap_procs_pair_vars() { printf -v "$1" '%s' 15631; printf -v "$2" '%s' 15641; printf -v "$3" '%s' uid; }
+  # ⛔ ALL THREE OF `SPAWN_GATE_CAP_NEEDS` MUST BE FAKED, OR NONE OF THEM ARE USED (#3231 follow-up,
+  # measured 2026-11-10). `spawn-gate.sh` accepts a PRELOADED capacity module only when it provides
+  # EVERY function in `SPAWN_GATE_CAP_NEEDS` (`cap_procs_pair_vars cap_h_for_vars cap_fork_probe`);
+  # with one missing it falls through to the candidate walk and SOURCES a real `capacity.sh` over all
+  # of them. `cap_fork_probe` was added to that set by #3231 (the fork floor reading its own
+  # instrument), and this fixture was not updated — so the headroom override below was silently
+  # DISCARDED, the gate read the box's real headroom, the fork gate passed, and the run fell through
+  # to the LAND-BACKLOG gate on the live repo's PR count (rc=74 gate='land').
+  # The probe is stubbed as `ok` and never decides anything here: the arithmetic arm refuses FIRST
+  # (`headroom=10 < CAP_MIN_FORK_HEADROOM=200`), so the refusal below is still the arithmetic's — the
+  # property this arm exists to pin — and a real two-fork probe would make the arm depend on the box.
+  cap_fork_probe() { return 0; }
   cap_h_for_vars() {
     case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
     case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
     printf -v "$3" '%s' "$(( $2 - $1 ))"
   }
-  export -f cap_procs_pair_vars cap_h_for_vars
+  export -f cap_procs_pair_vars cap_h_for_vars cap_fork_probe
   O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" CAPACITY_YIELD_SECS=$LANE_YIELD \
     bash "$LANE" --key-gate-off 17 feat/17-tm daniel-ospina/agent-infra
 ) > "$TMP/lane17.out" 2>&1
@@ -386,6 +407,7 @@ ck "  …and it is NOT reported as a load refusal — the remedies are opposite,
 grep -q 'disk-gate' <<<"$L17LOG"; rc=$?
 [ "$rc" -ne 0 ]; rc=$?
 ck "  …and the disk gate never ran (fork is evaluated first, so the un-clearable cause is the one named)" $rc
+lbgh_clear   # the creation-gate reading supplied for §1's capacity arms is withdrawn here
 
 # A lane that DOES run supersedes an old refusal: otherwise a later chain for the same issue could
 # read the stale record. (The epoch bound already protects it; this keeps the state dir clean.)
