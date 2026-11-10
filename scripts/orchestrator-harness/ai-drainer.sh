@@ -142,12 +142,12 @@
 #   NCPU LOAD1_100 MEM_AVAIL_MB SWAP_TOTAL_MB SWAP_FREE_MB   skip the platform probes
 #   PROC_ROOT         the /proc tree the cwd witness walks              default: /proc
 #                     (a PLATFORM seam, the same class as DRAINER_OS: Darwin has no /proc, so the arm
-#                     that must exercise "this box has one witness fewer" has to be able to say so. It
-#                     does NOT disarm the gate — `wt_live_holders` is still consulted, and only when
-#                     BOTH witnesses are unavailable does the probe refuse to prove anything, which
-#                     keeps the tree rather than deleting it.)
-#   WTL               wt-lifecycle.sh to source for the live-holder witness (default: $O, then beside
-#                     this script) — the same resolution the launcher census uses for WT_MOD
+#                     that must exercise "this box has one witness fewer" has to be able to say so.
+#                     Witness B is DEGRADED-TOLERANT when absent — witness A answering "none" is enough
+#                     to remove.)
+#   WTL               wt-lifecycle.sh to source for the live-holder witness (default: the first of $O,
+#                     then beside this script, that actually defines `wt_live_holders`). A PINNED value
+#                     is honoured verbatim and never replaced by another copy.
 #   DRAINER_OS        the platform whose swap semantics apply: Darwin | Linux  default: `uname -s`
 #                     (the suite's seam — the Darwin arm must be exercisable on a Linux cell, which
 #                     has no `sysctl`, and the Linux arm on the operator's Mac)
@@ -643,6 +643,17 @@ finish() { # [<rc>] — 1 when a lane from an earlier tick failed, whatever this
 # The module is resolved the way the launcher census resolves `worker-terminal.sh` ($O first, then beside
 # this script), because `$O` is seeded file by file and a STALE `wt-lifecycle.sh` would otherwise be read
 # as "no holders". A missing/stale module is NOT read as "no holder" — see `_drain_holder`'s rc 2.
+# ⛔ THE PRECISE CONTRACT, because the two witnesses are NOT interchangeable (review finding, PR #3918):
+#   * either witness finding a holder            → the tree is KEPT (the lane is still working);
+#   * witness A UNEVALUABLE (stale/missing module) → UNPROVABLE, so the tree is KEPT, even when witness B
+#     answers "none" — A is the only witness that sees an ARGV-only holder (`pytest <wt>/tests`,
+#     `rsync src <wt>`, `bash -c "cd <wt> && …"`), whose cwd is elsewhere. One evaluable witness saying
+#     "none" does not cover the witness that cannot answer;
+#   * A answered "none", and B answered "none" or is ABSENT (no /proc, no `lsof`) → no holder: the tree is
+#     removed. That is the degraded state every reaper in this repo already tolerates — a box with one
+#     witness fewer is not a box where nothing may ever be reclaimed.
+# The failure this pins is silent and destructive: letting B's "none" overwrite A's "I could not tell"
+# dropped the argv witness on every Linux box whose `$O` is one deploy behind.
 # ⛔ THE FIRST CANDIDATE THAT CANNOT ANSWER IS NOT THE LAST ONE TRIED (review finding, PR #3918): the
 # resolution used to take the first file that EXISTS and then test it, so a stale `$O/wt-lifecycle.sh`
 # discarded a perfectly good copy beside the script (a hand-run tick from a checkout is exactly that

@@ -172,8 +172,9 @@ while nothing happened:
   DISPATCHER chose to name — a fact about that process, never about the lane — so removal now needs the
   reaper's own proof first, exactly as `scripts/pi-reap-worktrees.sh` requires for its own reclaim:
   * a process whose **argv names the checkout**, or whose **cwd is inside it** (`wt_live_holders`, from
-    `wt-lifecycle.sh` — resolved `$O` first, then beside the drainer, and a missing/stale module is
-    *named*, never read as "no holders");
+    `wt-lifecycle.sh` — `$O` first, then beside the drainer, and the first candidate that actually
+    *defines* the verb wins: a stale `$O` copy no longer discards a good one beside the script. A
+    module that cannot answer at all is *named*, never read as "no holders");
   * plus a `/proc/<pid>/cwd` witness where `/proc` exists. This is not redundant: a real holder is a
     `pi -p … <brief>` lane whose argv never names the checkout, which only the cwd witness sees — and a
     cell without `lsof` installs one witness fewer.
@@ -215,8 +216,14 @@ Arm (i2) is the #2787 register: a live worker whose cwd is in the checkout, with
 The tick must keep the tree, keep the record, count the lane (`held=1`), keep its window, and reclaim it
 once the holder exits — and the arm carries its own non-vacuity twin in which the holder gate is deleted
 from a copy of the script, where the live worker's checkout MUST be removed. Arm (i3) pins the
-fail-closed direction (both witnesses unavailable keeps the tree and names the gap; a stale
-`wt-lifecycle.sh` on a Linux box is not a permanent block, because the `/proc` witness still answers).
+fail-closed direction, and its polarity is easy to get wrong: a stale `wt-lifecycle.sh` on a Linux box
+is **not** un-blocked by `/proc` answering "none", because one witness's *none* does not overrule the
+other's *unknown* — the tree is kept and the gap is named. It is not a permanent block either: the same
+record is reclaimed once the module answers again (the gate is fail-closed, not a latch). Arm (i3b)
+runs the **argv** witness on its own (`/proc` unavailable, holder's cwd elsewhere), the shape only that
+witness can see. Arm (i5) pins the opposite polarity — a lane whose checkout **cannot be deleted**
+(a permission, a half-broken `$SEED_REPO`) has still ENDED: it is settled, its verdict is reported, and
+it is not counted as alive. `_rm_wt`'s rc 2/3 mean "not finished"; rc 1 is a WARN and does not.
 
 ## Activate on macOS
 
