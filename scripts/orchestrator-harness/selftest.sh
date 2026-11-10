@@ -2990,6 +2990,71 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its helpers are extracted from
   fi
   unset -f cmux tmux kill
 fi
+# ── 15a) THE REAP PASS BUILDS THE CENSUS ONCE, NOT ONCE PER CANDIDATE (#3585) ──────────────────
+# MEASURED 2026-11-10 on the incident box: `reap_stale_workers` read the census once for the pass and
+# then AGAIN per candidate (`wt_alive "$_cn"`, added by #3756), and because the memo's window was
+# shorter than its own build NOT ONE of those reads was a hit. 89 candidates ⇒ 90 full census builds:
+# the pass took 27 min where cycle 117's own `stages=reap:12` records 12 s.
+# THE ASSERTION IS A COUNT of `cmux tree --json` invocations (the census's one daemon read), driven
+# against the SHIPPED reaper with a counting daemon. `WT_TABLE_TTL=0` on purpose: the memo is OFF, so
+# this measures the PASS's own reads and cannot be satisfied by a cache (that is the sibling arm in
+# worker-terminal.test.sh §K2).
+# ⛔ COMPARED AS A NUMBER, NEVER AS A SUBSTRING (measured while writing this). The first cut asserted
+# `case "$out" in *"calls=1"*)` — and `calls=17` MATCHES that, so the arm read GREEN on the pre-fix
+# code whose whole defect is 1 + candidates reads. A gate that cannot fail is not a gate.
+if need "$TMP/reapw.sh" "the reaper is extracted from the shipped loop"; then
+  RB="$TMP/RB"; rm -rf "$RB"; mkdir -p "$RB/state" "$RB/logs" "$RB/bin"
+  _rbw=""; _rbt=""; _rbi=0
+  _rb_rec() { # <name> — one record + its two stub rows, so the daemon reports it RUNNING
+    printf 'kind=terminal\nid=term_%s\nworkspace=ws_%s\ncwd=/tmp\n' "$1" "$1" > "$RB/state/worker-$1"
+    _rbw="$_rbw${_rbw:+,}{\"id\":\"ws_$1\",\"name\":\"wt-$1\"}"
+    _rbt="$_rbt${_rbt:+,}{\"id\":\"term_$1\",\"running\":true}"
+  }
+  # filler: a census with the shape of a real one (the build's cost is per ROW, and so is the cost of
+  # getting this wrong) — no logs, so none of them is a candidate.
+  while [ "$_rbi" -lt 40 ]; do
+    _rbi=$(( _rbi + 1 )); _rb_rec "chain-$_rbi"
+  done
+  # candidates: stale records whose SURFACE THE DAEMON REPORTS RUNNING, so every one is SPARED and
+  # `wt_close` (which owes its own post-close verification read) is never in the path — what is
+  # measured is the per-candidate census read and nothing else.
+  _rbi=0
+  while [ "$_rbi" -lt 6 ]; do
+    _rbi=$(( _rbi + 1 )); _rb_rec "merge-30$_rbi"
+    : > "$RB/logs/merge-30$_rbi.log"; touch -t 202601010000 "$RB/logs/merge-30$_rbi.log"
+  done
+  printf '{"workspaces":[%s],"screens":[],"tabs":[],"terminals":[%s]}\n' "$_rbw" "$_rbt" > "$RB/tree.json"
+  cat > "$RB/bin/cmux" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$RB/calls.log"
+[ "\${1:-}" = "tree" ] && cat "$RB/tree.json"
+exit 0
+SH
+  chmod +x "$RB/bin/cmux"; : > "$RB/calls.log"
+  _rbout="$(
+    tmux() { :; }                     # no tmux sessions, no pane pids: the tmux arm answers nothing
+    export PATH="$RB/bin:$PATH"
+    LOG="$RB/reap.log"; O="$RB"; WT_DIR="$RB/state"; STALE_MIN=1; WT_TABLE_TTL=0
+    _WREAP_WINDOW_MIN=0
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    . "$TMP/reapw.sh"
+    reap_stale_workers
+    printf 'calls %s\ndecisions %s\n' \
+      "$(grep -c '^tree' "$RB/calls.log" 2>/dev/null || true)" \
+      "$(grep -c '^\[reap-worker\] merge-' "$RB/reap.log" 2>/dev/null || true)"
+  )"
+  _rb_calls="$(printf '%s\n' "$_rbout" | sed -n 's/^calls //p' | head -1)"
+  _rb_dec="$(printf '%s\n' "$_rbout" | sed -n 's/^decisions //p' | head -1)"
+  # NON-VACUITY FIRST: if the pass walked nothing, `calls 1` would be green for a reaper that reaps
+  # nothing at all — the vacuous assertion this shard's own review history is about.
+  case "${_rb_dec:-}" in ''|*[!0-9]*) rc=1 ;; *) [ "$_rb_dec" -eq 6 ] && rc=0 || rc=1 ;; esac
+  ck "15a: the driven pass really walks every candidate (6 per-candidate decisions, got '${_rb_dec:-}')" $rc
+  case "${_rb_calls:-}" in ''|*[!0-9]*) rc=1 ;; *) [ "$_rb_calls" -eq 1 ] && rc=0 || rc=1 ;; esac
+  [ "$rc" -eq 0 ] || echo "      census builds in one reap pass: ${_rb_calls:-<none>} (want 1; pre-fix: 1 + candidates = 7)"
+  ck "15a: one reap pass costs ONE census build, whatever the candidate count (measured ${_rb_calls:-<none>})" $rc
+fi
 # ── 15b) a STALE LOG IS NOT A HUNG WORKER: the positive-liveness gate (agent-infra#2104) ───────
 # MEASURED 2026-10-19: this reaper closed a worker logged as "silent 8287s" (2.3 h) while its agent
 # had been running `bash`/`edit` calls for hours with ~200 lines of uncommitted work, and closed 7

@@ -1520,6 +1520,18 @@ wt_tmux_names() {
 # wt_table -> "<worker>\t<alive|dead|unknown>", one line per worker this box knows about, deduped.
 # Memoized for WT_TABLE_TTL seconds (default 10) so a cycle's dozen questions are one daemon read;
 # 0 disables the memo (tests, and an operator debugging a stubborn box).
+# ⛔ THE WINDOW IS FLOORED AT TWICE THE LAST BUILD'S OWN COST, AND THAT FLOOR IS THE WHOLE POINT
+# (#3585, MEASURED 2026-11-10). A census build is not cheap: the daemon answers `tree` in
+# 0.14 s, but the per-record resolution over ~105 records costs 9.1 s cold and 18.1-29.1 s on the same
+# box at load ~215. With `WT_TABLE_TTL` a flat 10 s the memo was stamped at build START, so by the time
+# the build FINISHED the entry was already 9-29 s old — outside its own window. **The memo was never
+# once a hit**: every question rebuilt the whole census, and `reap_stale_workers` asks it once PER
+# CANDIDATE (#3756), so a pass over this box's 89 candidates cost 90 builds and 27 minutes for work that
+# took 12 s at cycle 117. A validity window shorter than its own construction cannot cache — it is a
+# NO-OP GATE, the class this file refuses everywhere else. So the header carries the build's measured
+# duration and the effective window is `max(configured, 2 x took)`: at any configured TTL the memo now
+# survives its own build, and staleness still cannot exceed twice the cost of re-reading it. `0` is
+# untouched — the disable seam must not be derived away.
 # ⛔ THE MEMO IS A FILE, because every call site reads the table through `$(wt_table)` — a shell
 # variable set inside that command substitution dies with the subshell, so an in-memory memo was
 # never once hit (measured: three questions, three full `cmux tree` probes). The file carries its own
@@ -1565,7 +1577,7 @@ WT_ABSENT_STALE_MIN=$(( 4 * CYCN ))
 [ "$WT_ABSENT_STALE_MIN" -ge $(( 2 * WT_ABSENT_CONFIRM )) ] || WT_ABSENT_STALE_MIN=$(( 2 * WT_ABSENT_CONFIRM ))
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree tree_err tfile absent_now absent_since absent_last _cont _mage _wl nrc names probe_ok raw="" tbl="" f name kind id st
+  local now ttl dir cache hdr _wat _wtook _wttl _w2 _wend _wdur tree tree_err tfile absent_now absent_since absent_last _cont _mage _wl nrc names probe_ok raw="" tbl="" f name kind id st
   # ⛔ A FAILED OR BACKWARDS CLOCK MUST NOT FREEZE THE MEMO (review round 13 of #2653, P2). `|| echo 0`
   # is the idiom round 12 removed from the absent arm: with `now=0` (or after a backwards clock step)
   # `now - at` is NEGATIVE, which is `< ttl`, so a memo is served FOREVER instead of for 10 s — the
@@ -1573,19 +1585,47 @@ wt_table() {
   # caps stop binding). The age must be non-negative AND under the TTL.
   now="$(date +%s 2>/dev/null)" || now=""
   case "$now" in ''|*[!0-9]*) now="" ;; esac
+  # ⛔ COERCED, NOT `[ … -gt 0 ]`-TESTED (see the header): a non-numeric value used to fall through the
+  # guard into `[ "$_mage" -lt "$ttl" ]`, which prints a diagnostic on EVERY census read.
   ttl="${WT_TABLE_TTL:-10}"
+  case "$ttl" in
+    ''|*[!0-9]*) ttl=10 ;;
+    # A value too long to be arithmetic is not a window: `$(( 10#… ))` would ERROR on it, and an
+    # expansion error in this function ABORTS the census before it prints (see the `CYC` note above).
+    *) if [ "${#ttl}" -le 9 ]; then ttl=$(( 10#$ttl )); else ttl=10; fi ;;
+  esac
   dir="$(wt_dir)"; cache="$dir/.wt-census"
-  if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
+  _wttl=$ttl
+  if [ "$ttl" -gt 0 ] && [ -f "$cache" ]; then
     hdr="$(head -1 "$cache" 2>/dev/null)"
+    _wat=""; _wtook=""
     case "$hdr" in
-      '# at='*)
-        case "${hdr#\# at=}" in
-          ''|*[!0-9]*) : ;;
-          *) if [ -n "$now" ]; then
-               _mage=$(( now - 10#${hdr#\# at=} ))
-               [ "$_mage" -ge 0 ] && [ "$_mage" -lt "$ttl" ] && { sed '1d' "$cache"; return 0; }
-             fi ;;
-        esac ;;
+      # This build: `# at=<epoch the build started> took=<whole seconds it took>`.
+      '# at='*' took='*)
+        _wat="${hdr%%' took='*}"; _wat="${_wat#\# at=}"
+        _wtook="${hdr##*' took='}" ;;
+      # An older harness's header, or one written before the duration was recorded: the window is the
+      # configured one, i.e. exactly the behaviour this change replaces. Never fatal — a memo that
+      # cannot state its own cost must not become a census that cannot be read.
+      '# at='*) _wat="${hdr#\# at=}" ;;
+      *) : ;;
+    esac
+    # ⛔ THE FLOOR: `max(configured, 2 x took)`. A build longer than its own window is unreadable by
+    # construction — the entry is already older than the TTL when it lands — so the configured window
+    # alone is a no-op gate. The stamp is the build's START (conservative: the census is at least that
+    # old), which is exactly why the duration has to be in the comparison.
+    case "$_wtook" in
+      ''|*[!0-9]*) : ;;
+      *) if [ "${#_wtook}" -le 9 ]; then
+           _w2=$(( 2 * 10#${_wtook} )); [ "$_w2" -gt "$_wttl" ] && _wttl=$_w2
+         fi ;;
+    esac
+    case "$_wat" in
+      ''|*[!0-9]*) : ;;
+      *) if [ -n "$now" ]; then
+           _mage=$(( now - 10#$_wat ))
+           [ "$_mage" -ge 0 ] && [ "$_mage" -lt "$_wttl" ] && { sed '1d' "$cache"; return 0; }
+         fi ;;
     esac
   fi
   # ⛔ AN ABSENT SESSION OWNER IS A READING, NOT AN UNREADABLE ONE (agent-infra#2653, measured
@@ -1630,6 +1670,14 @@ wt_table() {
   # probe still runs with stderr discarded and the absent-owner signal is simply UNOBSERVABLE — the
   # census stays UNKNOWN and the caps binding, which is the pre-change behaviour and the safe side.
   tfile="${TMPDIR:-/tmp}/.wt-tree-err.$$"
+  # ⛔ NOT `wt_bounded`, AND THE REASON IS RECORDED SO IT IS NOT "TIDIED" IN (measured 2026-11-10).
+  # `wt_bounded` bounds with `perl -e 'alarm shift; exec @ARGV'`, i.e. an `exec` — and `exec` cannot
+  # run a shell FUNCTION. Every rig in this repo stubs the surface as a `cmux()` FUNCTION (this suite's
+  # own `sess()` arm among them), so wrapping this call made the census read an EMPTY tree and turned
+  # two `sess()` assertions red: a stub is not a binary, and the bound silently replaced the stub with
+  # "command not found". Bounding this probe needs those ribs converted to PATH binaries first, which is
+  # a change to the FIXTURES (and to the arms whose `cmux()` stub is currently exercised through it),
+  # not a one-line addition here. Recorded on #3585 rather than left as a trap for the next reader.
   if { : >"$tfile"; } 2>/dev/null; then
     tree="$(cmux tree --json 2>"$tfile")" || tree=""
     tree_err="$(cat "$tfile" 2>/dev/null || true)"
@@ -1875,22 +1923,45 @@ EOF
   fi
   WT_TABLE="$(printf '%s\n' "$tbl" | sed '/^$/d' | awk -F'\t' 'NF==2 && !seen[$1]++')"
   WT_TABLE_AT="$now"
+  # ⛔ THE BUILD'S OWN COST RIDES IN THE HEADER, BECAUSE IT IS WHAT THE WINDOW IS JUDGED AGAINST. `at`
+  # stays the START (conservative: the census is at least that old), so the duration is not decoration —
+  # without it a build slower than `WT_TABLE_TTL` looks like an expired entry rather than an entry that
+  # could never have been fresh. Measured from the second `date` that runs AFTER the table is built; a
+  # failed or backwards clock yields 0, which leaves the configured window in force (the pre-change
+  # behaviour) rather than inventing a longer one.
+  _wend="$(date +%s 2>/dev/null)" || _wend=""
+  _wdur=0
+  case "$_wend" in ''|*[!0-9]*) : ;;
+    *) case "$now" in ''|*[!0-9]*) : ;; *) _wdur=$(( _wend - now )); [ "$_wdur" -ge 0 ] || _wdur=0 ;; esac ;;
+  esac
   # ⛔ THE `2>/dev/null` MUST APPLY TO THE GROUP, NOT SIT AFTER THE `>` (review round 8 of #2653, P2):
   # a failing `>` open prints bash's own diagnostic on the PRE-COMMAND stderr, which a redirect placed
   # after it never sees — so an unwritable `$dir` emitted raw bash noise on EVERY census read (~12 per
   # controller cycle) into an append-only, never-rotated log. Measured: the group form silences it and
   # keeps the same status.
-  { { printf '# at=%s\n' "$now"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$"; } 2>/dev/null \
+  { { printf '# at=%s took=%s\n' "$now" "$_wdur"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$"; } 2>/dev/null \
     && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null || rm -f "$cache.tmp.$$" 2>/dev/null
   printf '%s\n' "$WT_TABLE"
 }
 
-# wt_alive <name> — 0 when the worker is ALIVE or UNKNOWN, 1 when it is DEAD or unknown-to-this-box.
-# An absent name is NOT a worker: `sess "fix-42"` for a PR with no worker must answer NO.
+# wt_alive <name> [<table>] — 0 when the worker is ALIVE or UNKNOWN, 1 when it is DEAD or
+# unknown-to-this-box. An absent name is NOT a worker: `sess "fix-42"` for a PR with no worker must
+# answer NO.
+# ⛔ `<table>` IS FOR A CALLER THAT ALREADY PAID FOR THE CENSUS, AND IT CHANGES NO VERDICT (#3585).
+# `reap_stale_workers` reads the table once for the whole pass and then asks about EVERY candidate; asking
+# through `wt_table` threw that table away and rebuilt the whole census per candidate (#3756 made that
+# per-candidate read, and a reap pass went from 12 s to 27 min). The verdict is the same expression on the
+# same rows — this is the same function, not a second opinion — and an EMPTY table falls back to a real
+# read, so a caller cannot pass "nothing" and get "nothing is alive".
 wt_alive() {
-  local n="${1:-}" st
+  local n="${1:-}" tbl="${2-}" st
   [ -n "$n" ] || return 1
-  st="$(wt_table | awk -F'\t' -v n="$n" '$1==n{print $2; exit}')"
+  [ -n "$tbl" ] || tbl="$(wt_table)"
+  # ⛔ HERE-STRING, NOT A PIPE (the same rule this file's `grep -q` arms state): the lookup exits on its
+  # FIRST match, so a piped writer takes SIGPIPE — under `pipefail` a MATCH then reads as a failure, and
+  # measured here it also printed `printf: write error: Broken pipe` on the controller's stderr once per
+  # answered name. A here-string cannot short-write its writer.
+  st="$(awk -F'\t' -v n="$n" '$1==n{print $2; exit}' <<<"$tbl")"
   case "$st" in
     dead) return 1 ;;
     alive|unknown) return 0 ;;
@@ -2466,7 +2537,14 @@ wt_close() {
   dir="$(wt_dir)"; f="$dir/worker-$name"
   kind=tmux; id=""; ws=""
   [ -f "$f" ] && { kind="$(sed -n 's/^kind=//p' "$f" | head -1)"; id="$(sed -n 's/^id=//p' "$f" | head -1)"; ws="$(sed -n 's/^workspace=//p' "$f" | head -1)"; }
-  wt_forget
+  # ⛔ ONE INVALIDATE, AND IT IS THE ONE AFTER THE CLOSE (#3585, MEASURED). This function used
+  # to call `wt_forget` twice — here and again immediately before the verification below. Two calls, one
+  # effect: neither tree reader in the arms below consults the memo (`wt_close_named_surface` and
+  # `wt_sweep_idle_workspaces` read the daemon directly), and the ONLY memo-consuming read after this
+  # point is the `wt_alive` verification — which sits after the SECOND `wt_forget`. So the one here
+  # invalidated nothing and cost everything: it threw away the census a reap pass had just built, so the
+  # next candidate rebuilt it. It cannot make a read stale in either direction, because an entry written
+  # before the close is still dropped before the read that would judge the close.
   case "$kind" in
     terminal)
       [ -n "$id" ] && cmux terminal close "$id" >/dev/null 2>&1

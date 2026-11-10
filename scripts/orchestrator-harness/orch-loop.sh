@@ -2782,7 +2782,14 @@ reap_stale_workers() {
   # samples of the process table with a window between them, and that window must be paid ONCE for the
   # whole pass — a per-candidate `sleep` would stall a loaded box's cycle by N x the window, and the
   # census is usually empty.
-  local _wc=""
+  local _wc="" _census=""
+  # ⛔ THE CENSUS IS BUILT ONCE FOR THE WHOLE PASS (#3585). It used to be read here and then AGAIN per
+  # candidate in phase 2 (`wt_alive "$_cn"`), which is #3756's doing and cost a full 105-record rebuild
+  # per candidate: a pass went from 12 s (cycle 117's own `stages=reap:12`) to 27 min, and 25 reap lines
+  # took 92 min. One table answers every question this pass asks — the candidate list here, and the
+  # surface verdict below — so it is built once and passed down. `wt_alive`'s optional table argument is
+  # the SAME verdict expression over the same rows, so this removes work, never a check.
+  _census="$(wt_table)"
   while IFS="$(printf '\t')" read -r s _st; do
     case "$s" in ''|*[!A-Za-z0-9-]*) continue ;; esac
     # ⛔ `review-*` IS IN THIS LIST NOW (owner ruling 2026-11-04) AND IT WAS THE EXPENSIVE OMISSION.
@@ -2827,7 +2834,7 @@ reap_stale_workers() {
     _wc="${_wc}${s}$(printf '\t')${f}$(printf '\t')${age}$(printf '\t')${m}
 "
   done <<EOF
-$(wt_table)
+$_census
 EOF
   # ── PHASE 2: the POSITIVE-LIVENESS gate (agent-infra#2104) ────────────────────────────────────
   # Nothing below is reached on an empty pass, and nothing is reaped until this gate says so. The
@@ -2858,9 +2865,12 @@ EOF
       esac
       # The launcher's OWN answer to "is this worker's surface still there". `unknown` when the census
       # cannot answer — which is not a licence to kill, only a reason not to use the surface as proof.
+      # ⛔ answered from the table THIS PASS already built (`$_census`), not by rebuilding it (see the
+      # header of this function). `wt_alive` is the same function and the same expression: this is one
+      # census per pass, not one per candidate.
       _surf="unknown"
       if declare -f wt_alive >/dev/null 2>&1; then
-        if wt_alive "$_cn"; then _surf="alive"; else _surf="dead"; fi
+        if wt_alive "$_cn" "$_census"; then _surf="alive"; else _surf="dead"; fi
       fi
       # ⛔ THE VERDICT IS ALWAYS ASKED, INCLUDING WHEN THE PROBE READ NOTHING. An unreadable table
       # used to skip the call and default to UNKNOWN, so a record whose surface is PROVEN GONE could
