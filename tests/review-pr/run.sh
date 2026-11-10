@@ -95,6 +95,13 @@
 #      (a `GH_TOKEN` VALUE and a raw `ghp_…` SHAPE) never reaches the published comment, while the
 #      finding around it survives; and SIGTERM to the seam takes the paid reviewer child with it
 #      (no orphan, nothing recorded, nothing posted). Three of the four carry a MUTATION control.
+#   §AQ (#2670) the CLEAN gate is a STRUCTURED MARKER, not English: a CLEAN whose marker reports
+#      FINDINGS_BLOCKING: 7 is refused, a CLEAN with NO marker is refused (naming the required block),
+#      a marker saying REVIEW_VERDICT: ISSUES or carrying no readable count is refused, a marker quoted
+#      inside a fence is a quotation — while marker+0 RECORDS, including the harness reviewer's own
+#      `CLEAN <comment-url>` shape that this file could not parse at all (PR #3781); the prompt carries
+#      the contract it enforces; and two MUTATION controls (gate removed => the markerless CLEAN
+#      records; both marker shapes broken => rc=10 'the scan did not run', never a silent pass)
 #
 # Assertion-count PIN at the tail: a whole section was once deleted elsewhere and
 # the suite still said ALL PASSED; the pin is a tripwire for section loss, not a
@@ -121,6 +128,17 @@ fixture_sha256() {
 
 [ -f "$SRC" ] || { echo "❌ no review-pr.sh at $SRC"; exit 2; }
 
+# ── the verdict SHAPES, read from the seam (§AQ's fake reviewer needs them) ──────────────────
+# ONLY the three shape constants — no functions, no logic: the assertion discipline here is that the
+# script is RUN for real, never re-implemented. The marker block the fake reviewer appends has to
+# appear exactly when the seam's own shapes say a verdict was reached, or the fixture becomes a
+# second definition of "a verdict" that drifts one spelling over — the class this suite exists to
+# catch. A shape that vanishes from the seam fails LOUDLY here instead of silently un-covering §AQ.
+eval "$(grep -aE '^VD_(CLEAN|ISSUES|LABEL)=' "$SRC")"
+[ -n "${VD_CLEAN:-}" ] && [ -n "${VD_ISSUES:-}" ] && [ -n "${VD_LABEL:-}" ] \
+  || { echo "❌ could not read VD_CLEAN/VD_ISSUES/VD_LABEL from $SRC"; exit 2; }
+export VD_CLEAN VD_ISSUES VD_LABEL
+
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/review-pr-suite.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 export TMP
@@ -138,7 +156,8 @@ export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
        FIXTURE_MARKER_MISSING FIXTURE_MARKER_DIFF FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
-       FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC FIXTURE_LIVE_HEAD_AT_RECORD FIXTURE_PIN_UNCHECKABLE
+       FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC FIXTURE_LIVE_HEAD_AT_RECORD FIXTURE_PIN_UNCHECKABLE \
+       FIXTURE_NO_MARKER FIXTURE_MARKER_VERDICT FIXTURE_MARKER_COUNT
 # ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
 # `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
 # the fake recorder mint a real HMAC even when `run()` passes it NONE — so the suite could not
@@ -316,8 +335,46 @@ if [ -f "$TMP/reviewer-out" ] && grep -q '@TAILPROOF@' "$TMP/reviewer-out" 2>/de
   [ -n "$proof" ] || proof="$(printf '%s%s' "$nonce" "$tail_line" | shasum -a 256 2>/dev/null | cut -d' ' -f1)"
   sed "s/@TAILPROOF@/$proof/g" "$TMP/reviewer-out" > "$TMP/reviewer-out.expanded" 2>/dev/null \
     && cat "$TMP/reviewer-out.expanded"
+  REVIEWER_SRC="$TMP/reviewer-out.expanded"
 else
   cat "$TMP/reviewer-out" 2>/dev/null
+  REVIEWER_SRC="$TMP/reviewer-out"
+fi
+# ── THE STRUCTURED VERDICT MARKER (issue #2670) ───────────────────────────────────────────────
+# This fake stands in for a COMPLIANT reviewer, so a run that REACHED a verdict also prints the
+# caller's required marker block — the same way it prints the `diff-tail:` proof only when there is
+# a proof to print. A run that never concluded (crash, wall-clock cap, provider refusal, the load
+# gate) printed no verdict-shaped line, so it emits NO marker either: that distinction is exactly
+# what the seam has to make, and inventing a marker on a transcript that has no verdict would turn
+# §F's "no verdict" scenario into a clean record. The block is DERIVED from the transcript's own
+# last verdict-shaped line, so every pre-existing scenario stays a faithful reviewer, and three
+# knobs drive the refusal arms: FIXTURE_NO_MARKER (absent), FIXTURE_MARKER_VERDICT,
+# FIXTURE_MARKER_COUNT.
+# The verdict SHAPES are read from the seam itself (`VD_CLEAN`/`VD_ISSUES`/`VD_LABEL`) rather than
+# re-typed here: a fixture that re-implements the grammar becomes a SECOND, drifting definition of
+# "a verdict" — the exact class this suite exists to catch — and every `ISSUES 0`, `### CLEAN` and
+# `ISSUES —` scenario below depends on the fixture agreeing with the seam byte for byte.
+if [ -z "${FIXTURE_NO_MARKER:-}" ] && [ -f "${REVIEWER_SRC:-/nonexistent}" ]; then
+  _vl="$(grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$REVIEWER_SRC" 2>/dev/null | tail -1)"
+  if [ -n "${_vl:-}" ]; then
+    # the verdict WORD is the first CLEAN/ISSUES on that line, exactly as the seam reads it
+    _vw="$(printf '%s' "$_vl" | grep -oiE '(clean|issues)' | head -1 | tr 'A-Z' 'a-z')"
+    case "$_vw" in
+      issues)
+        # a printed count IS the count (never invented) — `ISSUES 2`, `ISSUES: 2`, `ISSUES — 2 × P1`
+        _n="$(printf '%s' "$_vl" | sed -n 's/.*[Ii][Ss][Ss][Uu][Ee][Ss][^0-9]*\([0-9][0-9]*\).*/\1/p')"
+        _wc="${_n:-1}"
+        # `ISSUES 0` IS clean by the contract's own definition (`n` counts BLOCKING findings), so a
+        # compliant reviewer writes the marker that says so. Without this the seam's own
+        # `ISSUES 0 => clean` conversion would meet a marker reading ISSUES and refuse itself — a
+        # WALL, not a guard (and §V pins that conversion from the other side).
+        [ "${_wc:-1}" = "0" ] && _vw=clean
+        ;;
+      *) _wc=0 ;;
+    esac
+    printf '\nREVIEW_VERDICT: %s\nFINDINGS_BLOCKING: %s\n' \
+      "${FIXTURE_MARKER_VERDICT:-$(printf '%s' "$_vw" | tr 'a-z' 'A-Z')}" "${FIXTURE_MARKER_COUNT:-$_wc}"
+  fi
 fi
 exit "${FIXTURE_PI_RC:-0}"
 EOF
@@ -439,6 +496,9 @@ reset() {
   FIXTURE_LIVE_HEAD_AT_RECORD=""
   FIXTURE_PIN_UNCHECKABLE=0
   FIXTURE_PI_SLEEP=""
+  # the structured-verdict marker (issue #2670): absent by default means "derive it from the
+  # transcript", which is what every scenario written before the marker contract expects.
+  FIXTURE_NO_MARKER=""; FIXTURE_MARKER_VERDICT=""; FIXTURE_MARKER_COUNT=""
   # The reviewer's model pair (agent-infra#2208/#3413): empty means "let the seam resolve its own
   # defaults", which is what every scenario except §A5 wants.
   FIXTURE_LANE_PROVIDER=""; FIXTURE_LANE_MODEL=""
@@ -3120,6 +3180,162 @@ sleep 2
 no_record; ck $? "  ...nothing recorded from a killed run"
 no_comment; ck $? "  ...and nothing posted"
 # ══ end §AP ══
+
+# ── §AQ the STRUCTURED VERDICT MARKER (issue #2670) ─────────────────────────────
+echo; echo "§AQ a CLEAN verdict is gated on a STRUCTURED MARKER, not on English (issue #2670)"
+# WHY THIS SECTION EXISTS. Every discriminator the prose classifier added (verb position, adjacency,
+# liveness cues, clause scope) was itself an English heuristic with its own paraphrase: six adversarial
+# reviews each found the next one and PR #2580 spent TWELVE fix rounds without converging — and the
+# class was not confined to paraphrases: the harness's OWN producer string is `CLEAN <comment-url>`
+# (reviewer-preflight.sh's #2148 line), which this file's shape cannot accept at all (the character
+# after `CLEAN ` is `h` of `https`), so a paid, correct 382-second review was discarded as NO VERDICT
+# (PR #3781). The gate is now a FIELD COMPARISON. §AQ drives the issue's own acceptance list, in both
+# directions, and both halves of the proposal: the marker decides the verdict, the prose readers can
+# only ever refuse.
+
+# (1) marker present and 0 findings => the record is minted (the issue's third acceptance bullet)
+reset; FIXTURE_NO_MARKER=1
+printf 'Nothing blocks the merge.\nCLEAN\n\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 0\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a CLEAN whose marker reports FINDINGS_BLOCKING: 0 RECORDS (rc=$(rc_of))"
+grep -q '"verdict":"clean"' "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+ck $? "  ...the record is verdict=clean, bound to the reviewed head"
+
+# (2) marker reporting a NON-ZERO count over a CLEAN verdict => REFUSED (acceptance bullet 1)
+reset; FIXTURE_NO_MARKER=1
+printf 'CLEAN\n\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 7\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a CLEAN whose marker says FINDINGS_BLOCKING: 7 is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+no_comment; ck $? "  ...and nothing posted as a review artifact"
+err_has "FINDINGS_BLOCKING: 7"; ck $? "  ...naming the marker's own count in the refusal"
+
+# (3) NO marker => REFUSED, naming the required block (acceptance bullet 2)
+reset; FIXTURE_NO_MARKER=1
+printf 'Nothing blocks the merge.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a CLEAN with NO marker is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+no_comment; ck $? "  ...and nothing posted"
+err_has "REVIEW_VERDICT: CLEAN"; ck $? "  ...and the refusal names the required marker (REVIEW_VERDICT: CLEAN)"
+err_has "FINDINGS_BLOCKING: 0"; ck $? "  ...including the count field (FINDINGS_BLOCKING: 0)"
+
+# (3b) THE ORDER OF THE TWO REFUSALS. A transcript that REPORTS a blocker must exit 7 ("the reviewer
+# found issues") even with no marker: 7 is the terminal cause a lane acts on, while 6 buys another
+# paid review. So the findings arms run BEFORE the marker gate, and this pins that order.
+reset; FIXTURE_NO_MARKER=1
+printf '[P1] scripts/x.sh:42 — the guard returns 0 on a failed read\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a MARKERLESS CLEAN over a reported blocker is exit 7 (findings win), not 6 (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+
+# (4) marker says ISSUES over a prose CLEAN => REFUSED as a contradiction (the second direction)
+reset; FIXTURE_NO_MARKER=1
+printf 'CLEAN\n\nREVIEW_VERDICT: ISSUES\nFINDINGS_BLOCKING: 2\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a CLEAN whose marker says REVIEW_VERDICT: ISSUES is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+err_has "REVIEW_VERDICT: ISSUES"; ck $? "  ...naming the contradicting marker line"
+
+# (4b) ANTI-WALL: `REVIEW_VERDICT: ISSUES` WITH A ZERO COUNT is the same statement as `ISSUES 0`,
+# which this file already defines as clean. Refusing it would burn a paid review over a WORD, which is
+# the wall this file swears to remove — so it records, and the count is what decides.
+reset; FIXTURE_NO_MARKER=1
+printf 'CLEAN\n\nREVIEW_VERDICT: ISSUES\nFINDINGS_BLOCKING: 0\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "REVIEW_VERDICT: ISSUES with FINDINGS_BLOCKING: 0 RECORDS (same as 'ISSUES 0', rc=$(rc_of))"
+grep -q '"verdict":"clean"' "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+ck $? "  ...the count is the field that decides, not the word"
+
+# (5) a marker whose count field cannot be read is not a field comparison => REFUSED by name
+reset; FIXTURE_NO_MARKER=1
+printf 'CLEAN\n\nREVIEW_VERDICT: CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a marker with NO FINDINGS_BLOCKING field is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+err_has "no readable FINDINGS_BLOCKING"; ck $? "  ...refusing the INCOMPLETE marker, not a missing one"
+
+# (6) THE WIRE-FORMAT HALF — the harness reviewer's own `CLEAN <comment-url>` string (PR #3781).
+# Without a marker it is still NO VERDICT (the measured bug, pinned so a future widening is visible);
+# with the marker the same transcript RECORDS, which is what makes the fix a fix and not a re-prompt.
+URL_FIXTURE="https://github.com/$REPO_FIXTURE/pull/2284#issuecomment-6718920531"
+reset; FIXTURE_NO_MARKER=1
+printf 'CLEAN %s\n' "$URL_FIXTURE" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a bare 'CLEAN <comment-url>' is still NOT verdict-shaped on its own (rc=$(rc_of), PR #3781)"
+no_record; ck $? "  ...nothing recorded"
+reset; FIXTURE_NO_MARKER=1
+printf 'CLEAN %s\n\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 0\n' "$URL_FIXTURE" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "...while that SAME transcript WITH the marker records (rc=$(rc_of)) — the marker is what closes it"
+grep -q '"verdict":"clean"' "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+ck $? "  ...and the record is written at the reviewed head"
+
+# (7) A QUOTED MARKER IS A QUOTATION. The marker is read from the same fence/indent-filtered region as
+# the prose verdict, so a reviewer repeating somebody else's clean block cannot mint an attestation.
+reset; FIXTURE_NO_MARKER=1
+printf 'An earlier head already carried this:\n```\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 0\n```\nI could not complete the deep pass.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a marker QUOTED inside a fence is not a verdict (rc=$(rc_of))"
+no_record; ck $? "  ...nothing recorded"
+no_comment; ck $? "  ...and nothing posted"
+
+# (8) the PRODUCER half — the prompt this file composes must carry the contract it now enforces,
+# or every paid reviewer is refused for a rule it was never told (acceptance bullet 4).
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; run "$SRC" 2284
+QP="$(cat "$TMP/pi-prompt.txt" 2>/dev/null)"
+case "$QP" in *"REVIEW_VERDICT: CLEAN"*) rc=0;; *) rc=1;; esac
+ck $rc "the reviewer's PROMPT carries the marker contract it is gated on (REVIEW_VERDICT: CLEAN)"
+case "$QP" in *"FINDINGS_BLOCKING: 0"*) rc=0;; *) rc=1;; esac
+ck $rc "  ...and the count field (FINDINGS_BLOCKING: 0)"
+case "$QP" in *'CLEAN <comment-url>'*) rc=0;; *) rc=1;; esac
+ck $rc "  ...and reconciles with the harness's own 'CLEAN <comment-url>' instruction instead of silently overriding it"
+case "$QP" in *"Print nothing after the structured verdict block"*) rc=0;; *) rc=1;; esac
+ck $rc "  ...and the 'print nothing after' rule now names the marker block, not the bare verdict line"
+# The old instruction is GONE, not merely supplemented: leaving it would tell a reviewer to stop
+# printing before the very block the gate requires.
+case "$QP" in *"Print nothing after the verdict line"*) rc=1;; *) rc=0;; esac
+ck $rc "  ...and the superseded 'Print nothing after the verdict line' wording is gone"
+
+# ⛔ MUTATION CONTROL (the #2148/#1741 lesson): with the gate call removed, scenario (3) — a prose
+# CLEAN with NO marker — RECORDS. Without this the section would pass on a seam whose gate was
+# deleted, because every positive assertion above would still hold.
+MQ="$TMP/mutant-marker-gate.sh"
+cp "$SRC" "$MQ"; chmod +x "$MQ"
+sed 's/^  require_verdict_marker$/  : # gate removed/' "$SRC" > "$MQ"
+if cmp -s "$SRC" "$MQ"; then
+  fail "the marker-gate mutation did not apply - this control proves NOTHING"
+else
+  reset; FIXTURE_NO_MARKER=1
+  printf 'Nothing blocks the merge.\nCLEAN\n' > "$TMP/reviewer-out"
+  run "$MQ" 2284
+  [ "$(rc_of)" = "0" ]; ck $? "the MUTANT records a markerless CLEAN - so the gate call is what refuses it"
+  grep -q '"verdict":"clean"' "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" 2>/dev/null
+  ck $? "  ...and writes the false clean, the fail-open §AQ(3) catches"
+fi
+
+# ⛔ A BROKEN MARKER READER MUST NOT PASS AS "THE REVIEWER PRINTED NO MARKER": the count classifier's
+# canary has the same invariant (COUNT_SCAN_CANARY_OK), because a reader that compiles but matches
+# nothing is otherwise indistinguishable from an absence, and every clean verdict would then be
+# refused with the WRONG cause for ever. rc=10 is the seam's documented "the scan did not run".
+# (The mutation breaks both shape constants at once — the two halves are one reader, and a canary that
+# only covered one of them would leave the other silently inert.)
+RQ="$TMP/mutant-marker-reader.sh"
+cp "$SRC" "$RQ"; chmod +x "$RQ"
+sed -e "s/^VD_MK_VERDICT=.*/VD_MK_VERDICT='^NEVER_MATCHES_A_MARKER\\$'/" \
+    -e "s/^VD_MK_COUNT=.*/VD_MK_COUNT='^NEVER_MATCHES_A_COUNT\\$'/" \
+    "$SRC" > "$RQ"
+if cmp -s "$SRC" "$RQ"; then
+  fail "the marker-reader mutation did not apply - the canary arm is unproven"
+else
+  reset; FIXTURE_NO_MARKER=1
+  printf 'CLEAN\n\nREVIEW_VERDICT: CLEAN\nFINDINGS_BLOCKING: 0\n' > "$TMP/reviewer-out"
+  run "$RQ" 2284
+  [ "$(rc_of)" = "10" ]; ck $? "a marker reader that matches NOTHING refuses with rc=10 ('the scan did not run'), never a silent pass (rc=$(rc_of))"
+  no_record; ck $? "  ...nothing recorded"
+  err_has "failed its own canary"; ck $? "  ...and the refusal names the canary"
+fi
+# ══ end §AQ ══
 
 [ "$PASS" -ge 891 ]; ck $? "assertion-count pin: >= 891 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
