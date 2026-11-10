@@ -4427,8 +4427,11 @@ classify_one() {
     fi
 
     # ── the age floor in force (already merged / patch-equivalent / scratch aware)
+    # ⛔ `%ss`, NOT `%sms`: the first argument is `$age_s`, i.e. SECONDS. A `ms` literal here
+    # mislabels a 2-day-old row as `age:172800ms` — 2.9 minutes to any reader — inside the very field
+    # this change exists to make legible (#3888 review 2, finding 3).
     if [ "$floor_s" -gt 0 ] && [ "$age_s" -le "$floor_s" ]; then
-        printf 'preserve\ttoo-recent\t\trule=P proof=age:%sms≤%sm(witness=%s) refs=%s%s\n' "$age_s" "$((floor_s / 60))" "$wname" "$refs" "$floor_note"
+        printf 'preserve\ttoo-recent\t\trule=P proof=age:%ss≤%sm(witness=%s) refs=%s%s\n' "$age_s" "$((floor_s / 60))" "$wname" "$refs" "$floor_note"
         return 0
     fi
     if [ "$young" = 1 ]; then
