@@ -624,8 +624,8 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
   # "the old resolution must be GONE" + "the work-root one must be THERE", so deleting the fix reddens
   # the first arm and a half-applied fix reddens the second.
   # ⛔ THE CHAIN SPAWN IS THE SIXTH, AND IT IS THE ONE A HALF-APPLIED FIX LEFT GREEN (fresh-context
-  # review of #3846, P1): `dispatch-merge.sh` was converted at :35/:483/:520 and line :526 — three lines
-  # below a converted sibling — still handed the CHAIN a state-dir path. That pane dies 127 while
+  # review of #3846, P1): `dispatch-merge.sh` was converted at :35/:483/:520 and line :526 — six lines
+  # below the last converted sibling — still handed the CHAIN a state-dir path. That pane dies 127 while
   # `wt_spawn` answers 0 (worker-terminal.sh's pre-check runs `$envpfx`, not `$cmd`), so the dispatch
   # BOOKS `chain-<N>` as spawned, no review/record/merge ever runs, and the issue claim is held for its
   # 4h lease because `chain-merge.sh`'s EXIT trap never fires.
