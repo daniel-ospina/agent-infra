@@ -72,12 +72,16 @@ condition is gone.
   whether a controller is live). On a cell the advance is
   `apply --force --pin-only`: `--pin-only` keeps the scheduler out of `$O` (seeding is
   `start`'s job, and re-seeding under a live loop is the version skew
-  `cloud-cell-supervisor.sh` refuses), and `--force` is what `apply` requires before it
-  will touch a cell whose controller is live — with `--pin-only` alone it REFUSES, so a
-  running cell would never advance. Together they create a NEW per-commit worktree and
-  leave the running tree alone: a lane keeps the code it started with, and the restart is
-  deferred to the next launch (`harness-refresh.sh`'s recorded design, honoured rather
-  than re-decided).
+  `cloud-cell-supervisor.sh` refuses), and that flag is the one that matters. `--force`
+  was once the price of admission here too, because the supervisor's running-controller
+  guard fired on the pin-only path as well — so `apply --pin-only` alone REFUSED on a
+  live cell and a running cell could never advance (this is agent-infra#2738, where the
+  guard and the comment asserting the opposite existed in one file). Since that issue the
+  supervisor **exempts** `--pin-only` from the guard, so `--force` is belt-and-braces:
+  this pass must not depend on where the guard's scope happens to sit. Together they create
+  a NEW per-commit worktree and leave the running tree alone: a lane keeps the code it
+  started with, and the restart is deferred to the next launch (`harness-refresh.sh`'s
+  recorded design, honoured rather than re-decided).
 - **THE READINGS ARE PRINTED EVERY PASS**: `head`, `deployed`, `ref`, `behind`, `ahead`,
   `dirty`, `pin`, `pin_tree`, the mode, and then the action. A verdict without the numbers
   behind it is not auditable, and "behind" is the number that was invisible for 91 commits.
@@ -554,7 +558,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T5 | a box with **no installable scheduler** exits non-zero, says so, and installs nothing |
 | T6 | the pass is a **no-op** when the pin already names the ref tip (`action=none`, HEAD unmoved) |
 | T7 | the pass contains **no `kill` of any kind** — no signal, no restart, and no `kill -0` probe either (a plain zero, not a comparison that can pass as 0 == 0) |
-| T7b | the advance calls the materialiser with **both** `--force` and `--pin-only` — a stub that enforces the supervisor's own refusal makes a regression that drops either flag go red |
+| T7b | the advance calls the materialiser with **both** `--force` and `--pin-only` — the stub refuses without the pair, so a regression that drops either flag goes red. Since agent-infra#2738 the real supervisor exempts `--pin-only` from its running-controller guard, so the pair is now belt-and-braces (the load-bearing half is `--pin-only`); the case pins the invocation, not the guard's scope |
 | T8 | an enabled-but-**inactive** timer fails readiness; a record whose `rc` is a refusal fails it too |
 | T9 | `--dry-run` moves nothing and reports what it *would* preserve |
 | T10 | `--uninstall` disables and removes, and `--status` then reports not-installed |

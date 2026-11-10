@@ -41,9 +41,14 @@
 #              live. The cell advance is PIN-PER-COMMIT, so a lane keeps the tree it started with and
 #              the restart is deferred to the next launch — the recorded design in
 #              harness-refresh.sh's header, honoured rather than re-decided. BOTH flags: `--pin-only`
-#              keeps the scheduler out of $O (seeding is `start`'s job), and `--force` is what `apply`
-#              requires before it will touch a cell whose controller is live — without it the advance
-#              is REFUSED on every running cell (measured in review). Neither relaxes anything else.
+#              keeps the scheduler out of $O (seeding is `start`'s job), and `--force` is kept WITH it
+#              for the reason `--pin-only` alone used to be refused: the supervisor's running-controller
+#              guard fired on the pin-only path too, so this pass recorded rc=23 and the unit went RED
+#              every ten minutes on a healthy cell while the pin never moved (measured in review).
+#              ⛔ THAT GUARD NO LONGER COVERS THIS PATH (agent-infra#2738 — `apply --pin-only` is exempt,
+#              because it never touches $O), so `--force` here is belt-and-braces rather than the price
+#              of admission: a pass that must never redden on a healthy cell should not depend on the
+#              guard's exact scope. Neither flag relaxes anything else.
 #              `scripts/harness-apply-timer.test.sh` pins both, statically and at runtime.
 #
 # ── THE PIN MUST NOT LIE ────────────────────────────────────────────────────────────────────────
@@ -1399,7 +1404,7 @@ finish() { # <ok> <rc> <verdict-phrase>
                 # at 240 and this sentence does not fit in it — measured: `Remedy:` begins at 272.
                 # ⛔ THE COMMAND IS RESOLVED, NOT NAMED (see `supervisor_cmd`): a bare name is
                 # `command not found` on the farmed cells this red fires on.
-                REC_REMEDY="$(supervisor_cmd) apply --force --pin-only (--force is REQUIRED: apply refuses a live cell without it, and an executes: state always has a live controller), then restart the controller from the pinned tree (a redeploy does not clear it)"
+                REC_REMEDY="$(supervisor_cmd) apply --force --pin-only, then restart the controller from the pinned tree (a redeploy does not clear it)"
                 REC_DETAIL="REFUSED deployed-drift: a live controller EXECUTES a harness directory that cannot be matched to this repo (gone, or present with no readable *.sh) (harness=$DRIFT_TOKEN) — this pass succeeded and the code the box RUNS is still not this repo's; a stale copy is not fixed. Remedy: $REC_REMEDY. Readings: head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE:$DRIFT_TOKEN"
                 write_record 0 1 || exit 23
                 err "$REC_DETAIL"
@@ -1762,14 +1767,17 @@ if [ "$PASS_MODE" = pin ]; then
         #      cloud-cell-supervisor.sh's own header refuses. Seeding belongs to `start`; a pin does
         #      not disturb a lane (it keeps the tree it started with) and the restart is deferred to
         #      the next launch, exactly as harness-refresh.sh's recorded design says.
-        #   `--force` because `apply` REFUSES to touch a cell whose controller is live WITHOUT it —
-        #      `--pin-only` does not relax that guard. Measured in review: `apply --pin-only` on a
-        #      live cell exits 1 with "a controller is RUNNING … re-run with --force", so the pass
+        #   `--force` because when this line was written `apply` REFUSED to touch a cell whose
+        #      controller was live even on the pin-only path. Measured in review: `apply --pin-only` on
+        #      a live cell exited 1 with "a controller is RUNNING … re-run with --force", so the pass
         #      recorded rc=23 and the unit went RED every ten minutes on a healthy box while the pin
-        #      never moved. harness-refresh.sh passes both flags for the same reason.
-        #   The guard `--force` relaxes here is "do not replace the harness tree under a live
-        #      controller", and a pin-only advance cannot: it creates a NEW per-commit worktree and
-        #      leaves the running one untouched. Nothing else about `apply` changes.
+        #      never moved.
+        #   ⛔ THAT REFUSAL IS GONE (agent-infra#2738): the supervisor now EXEMPTS `--pin-only` from the
+        #      running-controller guard, because the guard protects `seed_and_stamp` (which this path
+        #      returns before) and a pin-only advance only creates a NEW per-commit worktree. `--force`
+        #      is therefore belt-and-braces here, kept deliberately: this unit must never redden on a
+        #      healthy cell, so it must not depend on where that guard's scope happens to sit. The
+        #      load-bearing flag is `--pin-only`; dropping THAT is still a regression.
         # ⛔ EVERY RESOLVED VALUE GOES TO THE CHILD ON ITS OWN COMMAND LINE, like the checker 400
         #      lines above (agent-infra#3593). The materialiser RESOLVES the same paths from ITS
         #      defaults — it used to be `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"`
