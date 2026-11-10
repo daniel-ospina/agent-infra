@@ -639,11 +639,15 @@ wt_self_chain() { # pids of this process and its ancestors, space-prefixed/termi
 }
 
 # wt_live_holders <canon-path> -> prints "pid<TAB>reason" for a live holder.
-#   0 = a holder was found · 1 = no holder · 2 = the argv probe could not be evaluated
-# Two witnesses, both silent before anything is removed:
+#   0 = a holder was found · 1 = no holder (both witnesses read) · 2 = the argv probe could not be
+#   evaluated · 3 = no holder by argv, and the cwd witness is UNAVAILABLE on this host
+# The caller must NOT read 3 as "nothing is here": it means the probe that would have caught a process
+# sitting in the checkout invisibly — the #2744 shape — did not run. Both witnesses are silent before
+# anything is removed:
 #   argv  — a process whose command line names the checkout (a `bash -c "cd <wt> && …"`, a
 #           `pytest <wt>/…`), and
-#   cwd   — a process whose working directory is inside the checkout, where `lsof` is available.
+#   cwd   — a process whose working directory is inside the checkout, read from the kernel's own
+#           `/proc/<pid>/cwd` on Linux and from `lsof` where there is no /proc (see `wt_cwd_rows`).
 #
 # ⛔ THE WITNESSES MUST EXCLUDE OUR OWN FORKS, AND THAT IS NOT A DETAIL — IT IS THE BUG THAT MADE
 # THIS PROBE REFUSE EVERY SINGLE REAP WHILE I CLAIMED IT WORKED. A forked subshell does NOT exec, so
@@ -655,9 +659,12 @@ wt_self_chain() { # pids of this process and its ancestors, space-prefixed/termi
 # precisely the signature of an inherited argv. A genuine holder (a `bash -c "cd <wt> …"` client, a
 # `pytest` started in the tree) has a DIFFERENT command line and is still seen.
 # The argv witness must be evaluable (a failure there is fail-closed, 2). The cwd witness is
-# degraded-tolerant, exactly as the reviewed reaper treats it (`CWD_PROBE=degraded`): a box whose
-# `lsof` is slow or absent has one witness fewer, which is the state every lane lived in before this
-# file existed — turning that into a permanent refusal would keep every worktree for ever.
+# degraded-tolerant ONLY where NEITHER `/proc` NOR `lsof` exists — a combination no real box has, and
+# it is reported as 3 rather than as a clean "no holder" so the caller can say the probe half-ran.
+# Turning an unreadable witness into a permanent refusal would keep every worktree for ever (the
+# deliberate choice recorded here); what was NOT deliberate, and is #2744, is that a box with `/proc`
+# and no `lsof` — every slim Linux image, and the cells — used to land on that tolerance instead of
+# reading the table it already had.
 # Bounded: `lsof` over a loaded box is not free, and an unbounded probe on the exit path is the
 # "reaper that hangs the fleet" failure this whole family of scripts exists to avoid.
 wt_live_holders() {
@@ -691,10 +698,31 @@ wt_live_holders() {
         }' "$out" "$out")"
     rm -f "$out"
     if [ -n "$line" ]; then printf '%s\n' "$line"; rm -f "$ignore"; return 0; fi
-    # ── witness 2: cwd (optional) ──────────────────────────────────────────────────────────────
-    command -v "${WT_LSOF:-lsof}" >/dev/null 2>&1 || { rm -f "$ignore"; return 1; }
-    out="$tmpbase.lsof"
-    wt_run_bounded "$WT_PROBE_SECONDS" "$out" "${WT_LSOF:-lsof}" -nP -d cwd -Fpn || { rm -f "$out" "$ignore"; return 1; }
+    # ── witness 2: cwd ──────────────────────────────────────────────────────────────────────────
+    # ⛔ IT IS NOT OPTIONAL ON LINUX, AND TREATING IT AS OPTIONAL IS THE #2744 DEFECT.
+    # This arm used to be `lsof`-only, and an absent `lsof` RETURNED 1 — "no holder" — so on a box
+    # without it the cwd witness did not degrade, it silently said "nobody is here". Measured on this
+    # file, 2026-11-10, on the take-back path the dispatcher runs:
+    #   ( cd "$WT" && exec sleep 45 ) &            # cwd IS the checkout, argv does NOT name it
+    #   WT_LSOF=/nonexistent wt_reap_if_empty …    # a slim Linux cell, exactly
+    #   -> rc=0  WT_RESULT=reaped … (probe produced no commits)     and the directory was GONE
+    # while pid still read `sleep 45`. That is agent-infra#2744 verbatim: the same box, in the same
+    # minute, had the REAPER classify the same path `preserve reason=live-cwd` — because the reaper
+    # reads `/proc/<pid>/cwd` (`scripts/lib/live-paths.sh`, `live-ownership.sh::lo_cwd_rows`) and this
+    # probe did not. The liveness predicate the defect needs was already in the repo; the dispatch
+    # path simply did not apply it. `docs/ops/lane-venv-reaper-policy.md:55` states the contract this
+    # line broke: "`live-cwd` | `lsof -a -d cwd` (or `/proc/*/cwd` where lsof is absent)".
+    # `wt_cwd_rows` therefore reads the kernel's own table where it exists and lsof only where it does
+    # not — the SAME two arms, in the SAME order, as `live-ownership.sh` in this directory.
+    out="$tmpbase.cwd"
+    if ! wt_cwd_rows "$out"; then
+        rm -f "$ignore"
+        # ⛔ 3, NOT 1 — "the cwd witness could not be read" is a DIFFERENT fact from "read it, nobody
+        # was there", and the caller must be able to say which one it got. Returning 1 here is what
+        # made a slim Linux cell delete a live lane's checkout with no line anywhere recording that the
+        # half of the probe which would have caught it never ran.
+        return 3
+    fi
     # ⛔ THE PROBE LISTS ITSELF, AND THAT IS THE MEASUREMENT THAT MADE THIS GATE REFUSE EVERY REAP
     # (found while verifying #2033, 2026-10-18). `lsof -d cwd` includes the `lsof` process in its own
     # output, and this helper runs it with the CWD INHERITED FROM THE LANE — i.e. the worktree. So the
@@ -704,25 +732,87 @@ wt_live_holders() {
     # (ancestors only) and its command line is not one of ours, so neither existing rule could catch it.
     # The probe pid is therefore excluded EXPLICITLY, from the pid wt_run_bounded actually forked.
     local probe_pid="${WT_PROBE_PID:-}"
-    pid=""; cwd=""
-    while IFS= read -r line; do
-        case "$line" in
-            p*) pid="${line#p}"; cwd="" ;;
-            n*)
-                cwd="${line#n}"
-                case "$cwd" in
-                    "$path"|"$path"/*) ;;
-                    *) continue ;;
-                esac
-                case "$chain" in *" $pid "*) continue ;; esac
-                [ -n "$probe_pid" ] && [ "$pid" = "$probe_pid" ] && continue
-                if grep -qxF -- "$pid" "$ignore" 2>/dev/null; then continue; fi
-                printf '%s\tcwd-inside-the-worktree\n' "$pid"
-                rm -f "$out" "$ignore"
-                return 0 ;;
+    while IFS="$(printf '\t')" read -r pid cwd; do
+        [ -n "$pid" ] && [ -n "$cwd" ] || continue
+        case "$cwd" in
+            "$path"|"$path"/*) ;;
+            *) continue ;;
         esac
+        case "$chain" in *" $pid "*) continue ;; esac
+        [ -n "$probe_pid" ] && [ "$pid" = "$probe_pid" ] && continue
+        if grep -qxF -- "$pid" "$ignore" 2>/dev/null; then continue; fi
+        printf '%s\tcwd-inside-the-worktree\n' "$pid"
+        rm -f "$out" "$ignore"
+        return 0
     done <"$out"
     rm -f "$out" "$ignore"
+    return 1
+}
+
+# ── the cwd table: the kernel's own links on Linux, `lsof` where there is no /proc ─────────────
+# wt_cwd_rows <outfile> -> writes "<pid>\t<cwd>" rows.
+#   0 = a real census was written   ·   1 = NO witness is available on this host
+# ⛔ ONE PROBE FOR THE WHOLE TABLE, NEVER ONE PER PID. A per-pid `readlink` is ~50 ms x N (this box:
+# 594 pids) and the caller is the lane's EXIT path — the "reaper that hangs the fleet" shape this
+# family exists to avoid. So: ONE `ls` over the table on Linux, ONE `lsof` elsewhere, both bounded by
+# the same watchdog the other witnesses use.
+# ⛔ THE SEMANTICS ARE NOT INVENTED HERE. `/proc/<pid>/cwd` + ` (deleted)` is the parse
+# `live-ownership.sh::lo_cwd_rows` and `scripts/lib/live-paths.sh` already ship, and it is pinned by
+# `orchestrator-harness/claim-cwd.test.sh`. If the three ever disagree, those two are right: this one
+# only asks, it never deletes. ` (deleted)` is STRIPPED because a process whose cwd was removed STILL
+# names the path we are about to reuse, and matching the stripped form is the safe direction.
+# ⛔ AN EMPTY TABLE IS NOT A CENSUS. `cmd | awk` reports AWK's status, so an absent or broken probe
+# looks exactly like a successful scan that found nobody — the one reading that must never be
+# invented. Every arm therefore CAPTURES FIRST and is judged on its own bytes.
+# Seams (tests set them; production never needs them): WT_PROC_ROOT, WT_LS, WT_LSOF.
+wt_cwd_rows() {
+    local out="$1" raw="$1.raw" proc="${WT_PROC_ROOT:-/proc}"
+    : >"$out" 2>/dev/null || return 1
+    # Linux, and anything else exposing the kernel's per-process links. `/proc/self/cwd` is a symlink
+    # only where the link kind actually exists, so a bare `/proc` directory is not taken as evidence.
+    if [ -L "$proc/self/cwd" ] && command -v "${WT_LS:-ls}" >/dev/null 2>&1; then
+        # ⛔ ITS EXIT STATUS IS NOT THE VERDICT (measured 2026-11-10). `ls -l /proc/[0-9]*/cwd` exits 2
+        # on any shared box — another uid's links cannot be read — WHILE LISTING EVERY ONE IT COULD.
+        # Requiring rc=0 here threw that partial-but-real census away and fell through to "no witness",
+        # i.e. the very fail-open this function exists to close, reintroduced one line lower. So:
+        # CAPTURE FIRST, JUDGE THE BYTES. (A watchdog timeout yields no file at all, so it is empty.)
+        wt_run_bounded "$WT_PROBE_SECONDS" "$raw" "${WT_LS:-ls}" -l "$proc"/[0-9]*/cwd
+        if [ -s "$raw" ]; then
+            awk -v proc="$proc" '
+                {
+                  # the link NAME is the first `<proc>/<pid>/cwd` on the line; the TARGET is
+                  # everything after the first " -> ", so a target containing " -> " or a space
+                  # is still read whole.
+                  i = index($0, proc "/")
+                  if (i == 0) next
+                  rest = substr($0, i + length(proc) + 1)
+                  pid = rest; sub(/\/cwd.*$/, "", pid)
+                  if (pid !~ /^[0-9]+$/) next
+                  j = index($0, " -> ")
+                  if (j == 0) next          # an unreadable link (another uid) prints no target
+                  t = substr($0, j + 4)
+                  # `ls` echoes a failed readlink INLINE on some builds (`<name> -> <name>
+                  # (readlink: Permission denied)`); that is not a cwd and must not become a row.
+                  if (t ~ / \(readlink: /) next
+                  sub(/ \(deleted\)$/, "", t)
+                  if (t ~ /^\//) printf "%s\t%s\n", pid, t
+                }' "$raw" >>"$out" 2>/dev/null
+        fi
+        rm -f "$raw"
+        [ -s "$out" ] && return 0
+        : >"$out" 2>/dev/null || return 1
+    fi
+    # macOS / a container with no /proc: `lsof -F` emits "<field><value>" lines — p<pid>, then n<path>.
+    # Same rule: a non-empty table is the answer whatever lsof's status says about the rows it skipped.
+    if command -v "${WT_LSOF:-lsof}" >/dev/null 2>&1; then
+        wt_run_bounded "$WT_PROBE_SECONDS" "$raw" "${WT_LSOF:-lsof}" -nP -d cwd -Fpn
+        [ -s "$raw" ] && awk '/^p/ { p = substr($0, 2); next }
+             /^n/ { t = substr($0, 2); if (p ~ /^[0-9]+$/ && t ~ /^\//) printf "%s\t%s\n", p, t }' \
+            "$raw" >>"$out" 2>/dev/null
+        rm -f "$raw"
+    fi
+    [ -s "$out" ] && return 0
+    rm -f "$out"
     return 1
 }
 
@@ -780,7 +870,7 @@ wt_dirt() {
 # REPO, never from the checkout being deleted.
 wt_reap_if_empty() {
     local repo="$1" path="$2" br="$3" label="${4:-lane}" base="${5:-${WT_BASE:-origin/main}}"
-    local canon cwd_reg a oid holder holder_rc dirt verdict detail upstream cur_br head_sha survivors
+    local canon cwd_reg a oid holder holder_rc dirt verdict detail upstream cur_br head_sha survivors degraded
     WT_RESULT=""
     case "$path" in /*) ;; *) path="$repo/$path" ;; esac
     [ -d "$repo" ] || { WT_RESULT="repo does not exist"; return 1; }
@@ -831,12 +921,17 @@ wt_reap_if_empty() {
     fi
 
     holder=""; holder_rc=0
+    degraded=""
     holder="$(wt_live_holders "$canon")" || holder_rc=$?
     if [ "$holder_rc" = 0 ]; then
         WT_RESULT="a live process still holds the checkout (pid ${holder%%$'\t'*}, ${holder#*$'\t'}) — kept"
         return 1
     fi
-    if [ "$holder_rc" != 1 ]; then
+    if [ "$holder_rc" = 3 ]; then
+        # Both witnesses are still applied — this only records that ONE of them did not run, so a
+        # reap that proceeds says so instead of reporting a clean bill of health it did not earn.
+        degraded=" (⚠️ the cwd witness is UNAVAILABLE on this host — no /proc and no lsof — so the live-holder probe rested on argv alone; a process whose cwd is this checkout and whose command line does not name it would not have been seen, agent-infra#2744)"
+    elif [ "$holder_rc" != 1 ]; then
         WT_RESULT="the live-holder probe could not be evaluated (fail-closed) — kept"
         return 1
     fi
@@ -900,6 +995,6 @@ wt_reap_if_empty() {
         return 2
     fi
     wt_git -C "$repo" config --remove-section "branch.$br" >/dev/null 2>&1 || true
-    WT_RESULT="reaped $path and refs/heads/$br ($label produced no commits)"
+    WT_RESULT="reaped $path and refs/heads/$br ($label produced no commits)$degraded"
     return 0
 }

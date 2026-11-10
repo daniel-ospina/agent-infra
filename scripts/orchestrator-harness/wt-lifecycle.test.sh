@@ -484,6 +484,51 @@ assert_contains "$OUT" "rc=1" "L5d a checkout on ANOTHER branch is preserved"
 assert_contains "$OUT" "feat/other-17" "L5d the reason names the branch it is actually on"
 assert_dir "$REPO/.worktrees/tm-17" "L5d the checkout survives"
 
+# ── L5e: a cwd-ONLY holder keeps the checkout where `lsof` is absent (#2744) ─────────────────
+# ⛔ THE DEFECT. The cwd witness used to be `lsof`-only, and an absent `lsof` returned "no holder" — so
+# on a slim Linux image the one process shape #2744 is about (`pi` sitting in the checkout with a cwd
+# inside it and a command line that never names the path) was INVISIBLE, and the dispatcher's take-back
+# deleted the live lane's tree with no error. The reaper on the same box, in the same minute, classified
+# the same path `preserve reason=live-cwd`, because IT reads `/proc/<pid>/cwd`. The predicate already
+# existed; the dispatch path did not apply it.
+# ⛔ THE TABLE IS A FIXTURE, NOT THIS HOST. `WT_PROC_ROOT` points the arm at a directory of
+# `<pid>/cwd` symlinks and `WT_LSOF` at a binary that does not exist, so the arm states the same thing
+# on macOS (no /proc) as on Linux and measures no real process on the runner.
+ENV=L5e; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"
+in_wt "wt_provision '$REPO' .worktrees/tm-18 feat/18-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "$REPO/.worktrees/tm-18" "$FAKE/4242/cwd"   # pid 4242's cwd IS the checkout
+ln -sfn "$FAKE" "$FAKE/self/cwd"                     # the arm is only taken where `self/cwd` is a link
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE'; WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-18' feat/18-tm 'lane 18'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5e with no lsof, a /proc cwd-only holder still preserves the checkout"
+assert_contains "$OUT" "pid 4242" "L5e and names the pid that holds it"
+assert_contains "$OUT" "cwd-inside-the-worktree" "L5e …by the cwd witness, not by argv"
+assert_dir "$REPO/.worktrees/tm-18" "L5e the live checkout survives (#2744)"
+assert_branch "$REPO" feat/18-tm "L5e and so does its branch"
+
+# ── L5e2: the same fixture, row names a DIFFERENT path → still reaps (non-vacuity) ──────────────
+# Without this the arm above would pass for a "any row at all blocks the reap" bug, which would make
+# every checkout on the box unreapable the moment one process existed.
+ENV=L5e2; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"
+in_wt "wt_provision '$REPO' .worktrees/tm-19 feat/19-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "/some/other/tree" "$FAKE/4242/cwd"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE'; WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-19' feat/19-tm 'lane 19'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=0" "L5e2 a cwd row OUTSIDE the checkout does not block the reap"
+assert_nodir "$REPO/.worktrees/tm-19" "L5e2 the empty checkout is reaped"
+
+# ── L5f: with NEITHER witness available the verdict must SAY so ───────────────────────────────
+# The degraded tolerance is deliberate (refusing for ever would keep every worktree), but a reap that
+# proceeded without the witness that catches #2744 must not read as a clean bill of health: the line is
+# the only record, and `dispatch-merge.sh` prints `WT_RESULT` straight into the dispatch log.
+ENV=L5f; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-20 feat/20-tm origin/main" "$REPO" >/dev/null
+OUT="$(in_wt "WT_PROC_ROOT='$T/$ENV/no-such-proc'; WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-20' feat/20-tm 'lane 20'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=0" "L5f with no /proc and no lsof the empty checkout is still reaped"
+assert_contains "$OUT" "cwd witness is UNAVAILABLE" "L5f …and the verdict discloses that one witness never ran"
+assert_contains "$OUT" "#2744" "L5f …naming what that gap would have missed"
+
 # ⛔ L6/L7 ALSO PIN `MAX_LOAD`, AND THAT IS THE SAME CLASS OF FIXTURE DEFECT (measured 2026-11-03 while
 # reviewing #3331). Both arms read "the lane REACHED its agent" from the ABSENCE of a land-backlog line,
 # so a LOAD refusal (75) — which the ambient load on a busy box produces, with no other symptom — reaps
