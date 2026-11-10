@@ -1202,15 +1202,16 @@ def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname"]})
     assert is_err is False and payload["outcome"] == "RAN", payload
     assert "channel_refused" not in payload and "fail_open" not in payload, payload
-    # …AND THE SAME FOR THE OTHER TWO CLASSES' ANCHORS, which arm 5 pinned for `no-known-daemon` only. A
-    # peer that mentions either phrase MID-LINE is still a run — dropping the `^` from either pattern left
-    # the suite GREEN, i.e. half the declared class bound was unpinned and a future edit could revert it
-    # silently.
+    # …AND THE SAME FOR THE OTHER TWO CLASSES' ANCHORS, which arm 5 pinned for `no-known-daemon` only — and
+    # for that class only its PREFIX, not its `^`. All THREE patterns carry the anchor, so all three are
+    # fed a MID-LINE occurrence here: dropping `^` from any one of them reds this arm (each was verified by
+    # mutation; before this, dropping it from `no-known-daemon` left the suite GREEN).
     monkeypatch.setenv("ORCH_MCP_CMUX", stub(
         tmp_path, "cmux_relay_midline.py",
         "import sys\n"
         "sys.stdout.write(\"note: cmux: link to 'pi-cell-4' exited here previously\\n\")\n"
-        "sys.stdout.write(\"see cmux-tui daemon binary not found at /x for the older box\\n\")\n", 0))
+        "sys.stdout.write(\"see cmux-tui daemon binary not found at /x for the older box\\n\")\n"
+        "sys.stdout.write(\"log: cmux-tui: no known daemon matches this route (historical)\\n\")\n", 0))
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname"]})
     assert is_err is False and payload["outcome"] == "RAN", payload
     assert "channel_refused" not in payload, payload

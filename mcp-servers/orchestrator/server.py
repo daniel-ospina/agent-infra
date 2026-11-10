@@ -2277,9 +2277,12 @@ def _harden_argv(argv: List[str]) -> List[str]:
 #                         once and the remedy is on this box — not on the peer, and not in the command.
 # ⛔ rc=0 IS STILL A REFUSAL. A refusal reported with exit status 0 was measured on `pi-cell-3`
 # (2026-10-23, on the issue): a caller that checks only `rc` read a dead link as success. The class is
-# reported whatever the rc. ⛔ RESIDUAL, NOT COVERED: `_drain_into` keeps each stream's HEAD, so a refusal
-# printed after `cap` bytes is dropped and a rc=0 case would read `RAN` — every measured refusal is the
-# transport's FIRST line (before any relayed output), so this is disclosed rather than claimed closed.
+# reported whatever the rc. ⛔ RESIDUALS, NOT COVERED — both are TRUNCATION, and both are disclosed rather than
+# claimed closed: (a) `_drain_into` keeps each stream's HEAD, so a refusal printed after `cap` bytes is
+# dropped; (b) `cap` is the CALLER's `max_output`, so a `max_output` shorter than the refusal line cuts the
+# line at its head and NO class matches — the caller-visible result is `RAN` with `truncated: true`. Every
+# measured refusal is the transport's FIRST line, well inside the default 20 000 bytes, so (a) needs a
+# refusal after 20 KB of relayed output and (b) needs the caller to ask for < ~40 bytes.
 # ⛔ EVERY PATTERN IS ANCHORED TO ITS LINE START, because these two streams are SHARED: `cmux vm exec`
 # relays the remote command's stdout/stderr into the same `ran.stdout`/`ran.stderr` this classifier reads
 # (`payload["stderr"]` below is exactly that relay), so a bare phrase match would re-label a peer that
