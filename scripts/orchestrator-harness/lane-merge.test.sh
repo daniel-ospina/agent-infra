@@ -1702,6 +1702,21 @@ OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${
       bash "$SCRIPT" 45 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
 ck "a MALFORMED LANE_TIMEOUT is named as the knob at fault, LANE_BACKSTOP_S=3600 is reported as NOT consulted (the arming path masks it with the same expression), and the wall stays the 7200 s default instead of silently falling through to the backstop" \
    $([ "$RC" = 11 ] && grep -q "LANE_TIMEOUT='abc' is not a bounded integer" <<<"$OUT" && grep -q 'LANE_BACKSTOP_S=3600 was NOT consulted' <<<"$OUT" && grep -q "the lane's 7200s wall clock" <<<"$OUT" && ! grep -q 'from LANE_BACKSTOP_S' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ THE SAME MALFORMED `LANE_TIMEOUT` WITH THE BACKSTOP AT ITS SHIPPED VALUE (MEASURED — this is the arm the
+# value-equality source test reds on, and it is the DEFAULT configuration rather than an exotic one): every
+# lane carries `LANE_BACKSTOP_S=7200` because `spawn-gate.sh:3419` defaults it, so a `LANE_TIMEOUT` typo in any
+# lane pairs `abc` with `7200` — the exact value the shipped default resolves to. The source test therefore
+# matched on the NUMBER while the arming expression `${LANE_TIMEOUT:-…}` never read the backstop at all, and
+# every operator line rendered "from LANE_BACKSTOP_S" — the wrong knob, and the malformed one named nowhere.
+# ⛔ THE SOURCE IS DERIVED FROM THE RESOLUTION RULE, NEVER FROM VALUE EQUALITY: which arm can produce 7200 is
+# not the question; whether `${LANE_TIMEOUT:-…}` falls THROUGH to the backstop is. Cheap run: elapsed 7190 of
+# 7200 leaves a 0 s clamp, the same shape as the arm above.
+new_o "$T/pr4.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      LANE_MERGE_MAX_WATCH=15 LANE_TIMEOUT=abc LANE_BACKSTOP_S=7200 LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=7190 \
+      bash "$SCRIPT" 46 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "…and it STILL names the malformed LANE_TIMEOUT when LANE_BACKSTOP_S holds the shipped 7200 s value: provenance comes from the arming expression, not from a number that happens to match, so the backstop is never credited with a clock it was masked out of" \
+   $([ "$RC" = 11 ] && grep -q "LANE_TIMEOUT='abc' is not a bounded integer" <<<"$OUT" && grep -q 'LANE_BACKSTOP_S=7200 was NOT consulted' <<<"$OUT" && grep -q "the lane's 7200s wall clock" <<<"$OUT" && ! grep -q 'from LANE_BACKSTOP_S' <<<"$OUT" && echo 0 || echo 1)
 # …and a lane's elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
 new_o "$T/pr4.tsv"
 WAIT_S=0 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"

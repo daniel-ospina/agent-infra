@@ -351,7 +351,15 @@ LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-7200}}"; is_limit "$LANE_WALL_
 # resolved once, here, and every message that renders `LANE_WALL_S` names it.
 if is_limit "${LANE_TIMEOUT:-}" && [ "${LANE_TIMEOUT}" = "${LANE_WALL_S}" ]; then
   LANE_WALL_SRC="LANE_TIMEOUT"
-elif is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N}" = "${LANE_WALL_S}" ]; then
+# ⛔ THE BACKSTOP IS THE SOURCE ONLY WHEN THE ARMING EXPRESSION WOULD ACTUALLY PICK IT (MEASURED, and it is
+# the same defect one configuration over from the one below). The test here used to be VALUE EQUALITY alone,
+# which attributes by coincidence and not by the rule: `LANE_WALL_S` is `${LANE_TIMEOUT:-…}`, so a NON-EMPTY
+# `LANE_TIMEOUT` wins the mask and the backstop is never read — yet with `LANE_TIMEOUT=abc
+# LANE_BACKSTOP_S=7200` (7200 is spawn-gate.sh:3419's own default, i.e. the value in EVERY lane's env) the
+# backstop happens to equal the shipped default, so the elif matched and every message rendered "from
+# LANE_BACKSTOP_S" while naming no malformed knob at all. `-z ${LANE_TIMEOUT}` is the resolution rule
+# itself, not a second opinion about the number: it is empty exactly when `${LANE_TIMEOUT:-…}` falls through.
+elif [ -z "${LANE_TIMEOUT:-}" ] && is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N}" = "${LANE_WALL_S}" ]; then
   LANE_WALL_SRC="LANE_BACKSTOP_S"
 else
   # ⛔ NAME THE KNOB THAT IS ACTUALLY AT FAULT (review, P3 — MEASURED). This branch used to say "no usable
