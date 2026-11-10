@@ -867,24 +867,52 @@ resolve_trusted_checkout() {
 # silent for ~15-25 minutes, which reads as a wedged lane to every liveness instrument we have.
 # ⛔ AND IT WILL NOT DOUBLE-REVIEW: merge-one.sh takes state/mergeclaim-<PR>.lock first, so a chain
 # the controller already spawned owns the PR and ours exits without paying a second reviewer.
-# _lm_is_main_worktree <dir> — 0 when <dir> is its repo's MAIN worktree, never a LINKED one.
-# ⛔ THIS IS THE SECOND HALF OF #3789's IDENTITY TEST, NOT A REPLACEMENT FOR IT (fresh-context review
-# of #3846, P1). The anti-bypass rule is "a lane must not merge its PR through ITS OWN edited merge
-# gate", and the realistic shape of that attack is a lane editing `merge-one.sh` inside its own
-# `.worktrees/tm-<N>` checkout and having the beside-file fallback pick it up. A linked worktree is
-# exactly what a lane checkout is (`--git-dir` is `<common>/worktrees/<name>`, `--git-common-dir` is
-# the shared dir), so this predicate refuses it while accepting the operator-seeded harness root.
-# Fail-closed on anything it cannot read: an unreadable tree is not evidence of trust.
-_lm_is_main_worktree() {
-  local d="${1:-}" gd="" common=""
-  [ -n "$d" ] && [ -d "$d" ] || return 1
-  git -C "$d" rev-parse --git-dir >/dev/null 2>&1 || return 1
-  gd="$(git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
-  common="$(git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 1
-  [ -n "$gd" ] && [ -n "$common" ] || return 1
-  common="$(cd "$d" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P)" || return 1
-  [ -n "$common" ] || return 1
-  [ "$gd" = "$common" ]
+# _lm_tree_kind <dir> — ONE of `main` / `flat` / `linked` / `unknown`. The caller decides.
+# ⛔ THE QUESTION IS "IS THIS A LANE'S OWN CHECKOUT?", NOT "IS THIS A MAIN WORKTREE?" (fresh-context
+# review of #3846, P1-2; MEASURED). The anti-bypass rule from #3789 is "a lane must not merge its PR
+# through ITS OWN edited merge gate", and the realistic shape of that attack is a lane editing
+# `merge-one.sh` inside its own `.worktrees/tm-<N>` checkout and having the beside-file fallback pick
+# it up. A lane checkout is a LINKED worktree. Asking "is it a MAIN worktree" refuses that — and ALSO
+# refuses the operator-seeded runtime, which is a FLAT `cp -p` tree with no `.git` at all (the shape
+# `deploy-harness.sh` produces), so `git rev-parse --git-dir` failed and EVERY lane on a split box
+# exited 2 before any merge work. Measured at the round-10 head: `/home/cmux/orchestrator` (this box's
+# real seeded runtime) -> REFUSED; a fresh `cp -p` seed -> REFUSED; the same tree after `git init` ->
+# MAIN-YES. The property to refuse is a LINKED worktree, and the caller has already established the
+# identity that makes a flat tree trustworthy (`_d` IS the controller-declared harness root).
+# Fail-closed the other way round: a tree that carries a `.git` entry but cannot be resolved is
+# `unknown`, and cannot-tell is never trust.
+_lm_tree_kind() {
+  local d="${1:-}" gd="" common="" c=""
+  if [ -z "$d" ] || [ ! -d "$d" ]; then printf 'unknown'; return 0; fi
+  if ! git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
+    # No readable git dir. A `.git` entry that git REFUSES to read is a tree we cannot classify; a
+    # tree with no `.git` at all is the flat seeded runtime, which is the shape this arm exists for.
+    if [ -e "$d/.git" ]; then printf 'unknown'; else printf 'flat'; fi
+    return 0
+  fi
+  gd="$(git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || { printf 'unknown'; return 0; }
+  common="$(git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || { printf 'unknown'; return 0; }
+  if [ -z "$gd" ] || [ -z "$common" ]; then printf 'unknown'; return 0; fi
+  c="$(cd "$d" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P)" || { printf 'unknown'; return 0; }
+  if [ -z "$c" ]; then printf 'unknown'; return 0; fi
+  if [ "$gd" = "$c" ]; then printf 'main'; else printf 'linked'; fi
+  return 0
+}
+# _lm_root_trusted <dir> — 0 when <dir> may supply the merge authority.
+# ⛔ TRUSTED: `main` (a main checkout — the pre-#2095 shape) and `flat` (the seeded runtime, which is
+# what `deploy-harness.sh` produces and what the README's split-state table promotes).
+# ⛔ REFUSED: `linked` (a lane's own checkout — #3789) and `unknown` (a `.git` git cannot resolve).
+# ⛔ RESIDUAL, STATED RATHER THAN HIDDEN: `flat` is trusted because the caller has already required
+# `_d` == the controller-declared `O_WORK`, and that is a DECLARATION a lane can set — so a lane that
+# copies a harness into a flat directory and points `O_WORK` at it is not refused by this predicate.
+# It was not refused before either (`O_WORK` is exactly as settable as `$O`, whose copy has always
+# been the trusted authority, and a lane can write there too); what this predicate closes is the
+# REALISTIC shape — the lane's own `.worktrees/<lane>` checkout, which is a linked worktree.
+_lm_root_trusted() {
+  case "$(_lm_tree_kind "${1:-}")" in
+    main|flat) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 launch_chain() {
@@ -911,17 +939,19 @@ if [ ! -f "$chain" ]; then
   if [ "$_d" = "$_o_canon" ]; then
     # TODAY'S PATH, UNCHANGED: the state dir IS the seeded runtime.
     chain="$_d/merge-one.sh"
-  elif [ -n "$_root" ] && [ "$_d" = "$_root" ] && [ -f "$_root/merge-one.sh" ] && _lm_is_main_worktree "$_d"; then
-    # THE CONTROLLER-DECLARED HARNESS ROOT (#2095). Three conditions, and the last is what keeps
-    # #3789 intact: a lane CAN set `O_WORK` itself, so the value alone is not identity — the copy
-    # beside the running script must be THAT tree, and that tree must be a MAIN worktree, which a
-    # lane's own `.worktrees/<lane>` checkout (or a copy of the script inside it) never is.
+  elif [ -n "$_root" ] && [ "$_d" = "$_root" ] && [ -f "$_root/merge-one.sh" ] && _lm_root_trusted "$_d"; then
+    # THE CONTROLLER-DECLARED HARNESS ROOT (#2095). Three conditions: a lane CAN set `O_WORK` itself,
+    # so the value alone is not identity — the copy beside the running script must be THAT tree — and
+    # #3789 keeps the last one: the tree must not be a LINKED worktree, which is exactly what a lane's
+    # own `.worktrees/<lane>` checkout is. A FLAT tree (no `.git`) is the seeded runtime and is
+    # accepted; refusing it was the P1-2 defect that made every lane on such a box exit 2.
     chain="$_d/merge-one.sh"
   else
     say_err "lane-merge: no merge authority found — looked in $O/merge-one.sh and in the harness root"
     say_err "  ${_root:-<unresolved>}/merge-one.sh; the copy beside this script ($_d) is neither the"
-    say_err "  state dir ($_o_canon) nor a MAIN worktree of the controller-declared harness root,"
-    say_err "  so it may be a lane's own branch. Refusing to select the merge authority from it."
+    say_err "  state dir ($_o_canon) nor the controller-declared harness root ($_root), or it is a"
+    say_err "  LINKED worktree / an unreadable git tree, so it may be a lane's own branch. Refusing to"
+    say_err "  select the merge authority from it."
     say_err "  If this box keeps its state elsewhere, the harness root must be the tree the controller"
     say_err "  runs from (a main checkout, exported as O_WORK); the remedy is to re-seed THAT tree:"
     say_err "  bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_root:-$O}"

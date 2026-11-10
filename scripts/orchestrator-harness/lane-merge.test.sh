@@ -1179,6 +1179,33 @@ ck "a lane that points O_WORK at its OWN linked worktree is still refused (exit 
 ck "…and the TAMPERED merge gate never ran" \
    $([ ! -e "$T/tampered-chain.txt" ] && echo 0 || echo 1)
 
+# ⛔ AND THE POSITIVE ARM ABOVE WAS THE WRONG SHAPE FROM PRODUCTION (fresh-context review of #3846, P1-2;
+# MEASURED). It `git init`s its fixture root, so it proved the split-state arm works for a GIT tree — while
+# the tree `deploy-harness.sh` actually produces (and this box's real `/home/cmux/orchestrator`) is a FLAT
+# `cp -p` copy with no `.git` at all. The old predicate asked "is it a MAIN worktree", so `rev-parse`
+# failed, the else arm fired, and EVERY lane on such a box exited 2 before any merge work — the exit code
+# `lane.sh`'s table does not map. The property #3789 needs is "is it a LINKED worktree" (a lane's own
+# checkout), not "is it a main worktree", so this arm drives the same split arrangement over a FLAT root.
+HAR_FLAT="$T/harness-flat"; rm -rf "$HAR_FLAT" "$T/flat-chain.txt"
+mkdir -p "$HAR_FLAT"
+cp "$SCRIPT" "$HAR_FLAT/lane-merge.sh"
+[ -f "$HERE/pr-state.sh" ] && cp "$HERE/pr-state.sh" "$HAR_FLAT/" >/dev/null 2>&1 || true
+printf '#!/usr/bin/env bash\nprintf "FLAT-CHAIN\\n" >> "%s/flat-chain.txt"\nexit 0\n' "$T" > "$HAR_FLAT/merge-one.sh"
+chmod +x "$HAR_FLAT/merge-one.sh" "$HAR_FLAT/lane-merge.sh"
+# Non-vacuity: the fixture must really be the production shape — a harness root with NO git repo in it.
+ck "(fixture) the flat harness root is NOT a git tree, which is the shape deploy-harness.sh produces" \
+   $([ ! -e "$HAR_FLAT/.git" ] && ! git -C "$HAR_FLAT" rev-parse --git-dir >/dev/null 2>&1 && echo 0 || echo 1)
+new_o "$T/junk-q58.tsv"
+printf 'open||flt58|clean\n' > "$T/pr-open58.tsv"
+OUT="$(REPO_PATH="$RUN_REPO" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$SD_SPLIT" O_WORK="$HAR_FLAT" HOME="$T/home" T="$T" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$HAR_FLAT/lane-merge.sh" 58 --repo o/r --pr-tsv "$T/pr-open58.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+sleep 1
+ck "a SEEDED (flat, non-git) harness root is accepted when the state dir is split (rc=$RC, not the unmapped 2)" \
+   $([ "$RC" != "2" ] && [ -s "$T/flat-chain.txt" ] && echo 0 || echo 1)
+ck "…and the chain that runs is the flat root's own merge-one.sh" \
+   $(grep -qx 'FLAT-CHAIN' "$T/flat-chain.txt" 2>/dev/null && echo 0 || echo 1)
+
 # ── 11c-nonies-a. THE HAND-OFF'S PRINTED REMEDY NAMES THE SAME TREE (landing review F1, P1) ──────────
 # ⛔ F1 WAS REINTRODUCED AS DOCUMENTATION. `launch_chain` refuses to run the chain from a lane worktree —
 # merge-one.sh resolves the merge authority as `$REPO/scripts/admin-merge.sh` and that rail resolves its

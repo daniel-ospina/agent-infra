@@ -2308,6 +2308,28 @@ REFRESH_RC=0              # the resolution's own answer (0 recorder · 2 found-b
 REFRESH_SH=""            # the script this loop executes (empty only when NO refresh exists at all)
 REFRESH_SH_SKEW=""       # the first copy passed over because it cannot record
 REFRESH_TRIED=""         # every path tried, in order — the SEED-SKEW verdict names them
+# ⛔ WHERE "SEEDED" LIVES IS A CODE QUESTION, NOT A STATE-DIR ONE (#2095; fresh-context review of
+# #3846, P2, MEASURED). Both call sites below used to hardcode `$O/refresh-candidates.sh` as "the seed",
+# and since this PR `O` is the controller's STATE DIR while the harness root is `O_WORK`. On the
+# documented `ORC_STATE_DIR` arrangement `<state>/refresh-candidates.sh` NEVER exists, so:
+#   * the beat logged `[refresh] SEED-SKEW: the seeded path $O/refresh-candidates.sh is MISSING …`
+#     EVERY CYCLE, with a remedy (`re-seed $O`) that would un-split the box — i.e. the same instrument
+#     the beat uses for a GENUINE skew, turned into noise that stops discriminating; and
+#   * `--check-refresh`, whose exit codes are its documented contract (0 ok / 1 divergence / 2
+#     unknown), answered `relation=skew` and exit **1** on a HEALTHY box — a monitor reading "this box
+#     cannot prove its origination".
+# ⛔ THE ORDER IS THE OPERATOR'S, UNCHANGED: a copy in `$O` still wins outright (#2278 — an operator
+# may seed the state dir deliberately, and no existing box changes behaviour). `$O_WORK` is the fallback
+# because it is the tree the controller RUNS the harness from — the same two-home rule `_claims_home`
+# above already applies. When neither carries one, the answer is `$O`'s path, so the remedy still reads
+# as the path an operator expected to exist.
+refresh_seed_home() {
+  if [ -f "$O/refresh-candidates.sh" ]; then printf '%s\n' "$O/refresh-candidates.sh"; return 0; fi
+  if [ -n "${O_WORK:-}" ] && [ -f "$O_WORK/refresh-candidates.sh" ]; then
+    printf '%s\n' "$O_WORK/refresh-candidates.sh"; return 0
+  fi
+  printf '%s\n' "$O/refresh-candidates.sh"
+}
 # 0 = a RECORDER was found (possibly beside the loop) · 2 = a script was found but NONE can record
 # (the box still runs one — origination keeps queueing, the BEAT just refuses to read its silence as
 # a cause) · 1 = no refresh script anywhere. The three answers are kept apart because their remedies
@@ -2364,27 +2386,35 @@ refresh_contract_gap() {   # <result> <at> <d>
 case "${1:-}" in
   --check-refresh)
     resolve_refresh_sh; _rc=$?
+    # The seed is resolved ONCE per answer (it is a filesystem probe, and the three arms below must
+    # name exactly the same path they compared against).
+    _seed_path="$(refresh_seed_home)"
+    _seed_dir="$(dirname "$_seed_path" 2>/dev/null)"; [ -n "$_seed_dir" ] || _seed_dir="$O"
     if [ "$_rc" = "0" ]; then
-      if [ "$REFRESH_SH" = "$O/refresh-candidates.sh" ]; then
-        printf 'refresh-contract relation=ok executed=%s tried=%s\n' "$REFRESH_SH" "$REFRESH_TRIED"
+      if [ "$REFRESH_SH" = "$_seed_path" ]; then
+        printf 'refresh-contract relation=ok executed=%s seed=%s tried=%s\n' "$REFRESH_SH" "$_seed_path" "$REFRESH_TRIED"
         exit 0
       fi
-      printf 'refresh-contract relation=skew executed=%s passed_over=%s tried=%s\n' \
-        "$REFRESH_SH" "${REFRESH_SH_SKEW:-none}" "$REFRESH_TRIED"
+      printf 'refresh-contract relation=skew executed=%s seed=%s passed_over=%s tried=%s\n' \
+        "$REFRESH_SH" "$_seed_path" "${REFRESH_SH_SKEW:-none}" "$REFRESH_TRIED"
       # ⛔ "MISSING OR CANNOT RECORD", NOT "CANNOT RECORD" (review P2): the skew arm is reachable when
-      # `$O` has NO copy at all (the resolver then finds the one beside the loop), and calling that a
-      # copy that "cannot record" is a false statement about a file that is not there. `passed_over=none`
-      # says which it is; the prose names both states.
-      printf '  DIVERGENCE: the seeded copy is MISSING or cannot record a pass outcome, so this controller would run a different copy. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' >&2
+      # the seed has NO copy at all (the resolver then finds the one beside the loop), and calling that
+      # a copy that "cannot record" is a false statement about a file that is not there.
+      # `passed_over=none` says which it is; the prose names both states.
+      # ⛔ AND THE REMEDY NAMES THE SEED'S OWN HOME, not `$O` (fresh-context review of #3846, P2): on a
+      # split box `$O` is the state dir, so `re-seed $O` installed a harness INTO the state dir —
+      # exactly the arrangement this PR removes.
+      printf '  DIVERGENCE: the seeded copy (%s) is MISSING or cannot record a pass outcome, so this controller would run a different copy. Fix: re-seed %s with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o %s) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' \
+        "$_seed_path" "$_seed_dir" "$_seed_dir" >&2
       exit 1
     fi
     if [ "$_rc" = "2" ]; then
       printf 'refresh-contract relation=unwritable executed=%s tried=%s\n' "${REFRESH_SH:-none}" "${REFRESH_TRIED:-none}"
-      printf '  BROKEN: no refresh-candidates.sh on this box defines refresh_record_write, so state/refresh-last cannot advance and its age proves nothing. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' >&2
+      printf '  BROKEN: no refresh-candidates.sh on this box defines refresh_record_write, so state/refresh-last cannot advance and its age proves nothing. Fix: re-seed %s with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o %s) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' "$_seed_dir" "$_seed_dir" >&2
       exit 2
     fi
     printf 'refresh-contract relation=absent tried=%s\n' "${REFRESH_TRIED:-none}"
-    printf '  UNKNOWN: no refresh-candidates.sh was found at all, so origination cannot run. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' >&2
+    printf '  UNKNOWN: no refresh-candidates.sh was found at all, so origination cannot run. Fix: re-seed %s with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o %s) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' "$_seed_dir" "$_seed_dir" >&2
     exit 2 ;;
 esac
 # [refresh-check:end]
@@ -9609,29 +9639,37 @@ PY
       # cell whose skew was invisible except to `--check-refresh`, which nobody runs per cycle. The arm
       # below asks the only question the contract is about: is the copy being executed the SEEDED one?
       resolve_refresh_sh; _rrc=$?
-      _seeded_refresh="$O/refresh-candidates.sh"
+      # ⛔ THE SEED IS A CODE HOME, NOT A STATE-DIR PATH (#2095; fresh-context review of #3846, P2).
+      # `$O` stays FIRST (an operator-seeded state dir keeps exact priority, #2278), and `$O_WORK` — the
+      # tree the controller runs the harness from — is the fallback. Resolving it from `$O` alone made
+      # EVERY cycle log a permanent SEED-SKEW on a split box, for a copy that is in fact exactly the
+      # seeded one there, which turns the same instrument the beat uses for a genuine skew into noise.
+      _seeded_refresh="$(refresh_seed_home)"
+      # ⛔ AND THE REMEDY NAMES THE SEED'S OWN HOME. `re-seed $O` on a split box installs a harness INTO
+      # the state dir — undoing the split this PR exists to create.
+      _seed_dir="$(dirname "$_seeded_refresh" 2>/dev/null)"; [ -n "$_seed_dir" ] || _seed_dir="$O"
       if [ "$_rrc" = "2" ]; then
-        echo "[refresh] SEED-SKEW: no refresh-candidates.sh on this box can record a pass outcome (passed over: ${REFRESH_SH_SKEW:-none}; tried: ${REFRESH_TRIED:-none}) — running $REFRESH_SH anyway so the pool still fills, but the BEAT will report SEED-SKEW, not a dead pass. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        echo "[refresh] SEED-SKEW: no refresh-candidates.sh on this box can record a pass outcome (passed over: ${REFRESH_SH_SKEW:-none}; tried: ${REFRESH_TRIED:-none}) — running $REFRESH_SH anyway so the pool still fills, but the BEAT will report SEED-SKEW, not a dead pass. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
       elif [ "$_rrc" = "1" ]; then
-        echo "[refresh] SEED-SKEW: no refresh-candidates.sh found at all (tried: ${REFRESH_TRIED:-none}) — NOT spawning a pass that cannot run. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        echo "[refresh] SEED-SKEW: no refresh-candidates.sh found at all (tried: ${REFRESH_TRIED:-none}) — NOT spawning a pass that cannot run. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
         rm -rf "$O/.refresh.lock"
       elif [ -n "$REFRESH_SH" ] && [ "$REFRESH_SH" != "$_seeded_refresh" ]; then
         # ⛔ A COPY OTHER THAN THE SEEDED ONE IS DISCLOSED, NOT SILENT (review P2). Two shapes reach this
         # arm and they are named apart, because their remedies read differently: a seed that EXISTS but
-        # cannot record (the MEASURED cell — a stale `$O` seed, a recording copy beside the loop), and a
-        # seed that is ABSENT entirely. On the pre-fix key, both logged only `spawning`. No lock removal
-        # here — a pass IS being spawned; only the CHOICE OF COPY is being announced.
+        # cannot record (the MEASURED cell — a stale seed, a recording copy beside the loop), and a seed
+        # that is ABSENT entirely. On the pre-fix key, both logged only `spawning`. No lock removal here
+        # — a pass IS being spawned; only the CHOICE OF COPY is being announced.
         if [ -n "$REFRESH_SH_SKEW" ]; then
-          echo "[refresh] SEED-SKEW: the seeded ${REFRESH_SH_SKEW} cannot record a pass outcome — running the recorder beside the loop (${REFRESH_SH:-none}) instead; the BEAT reads no cause from the seed's silence, it was never the writer. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+          echo "[refresh] SEED-SKEW: the seeded ${REFRESH_SH_SKEW} cannot record a pass outcome — running the recorder beside the loop (${REFRESH_SH:-none}) instead; the BEAT reads no cause from the seed's silence, it was never the writer. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
         else
-          echo "[refresh] SEED-SKEW: the seeded path ${_seeded_refresh} is MISSING (never seeded, or deleted) — running the copy beside the loop (${REFRESH_SH:-none}) instead, which the operator did not seed here; only the beside-the-loop copy's record is evidence, never the absent seed's. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+          echo "[refresh] SEED-SKEW: the seeded path ${_seeded_refresh} is MISSING (never seeded, or deleted) — running the copy beside the loop (${REFRESH_SH:-none}) instead, which the operator did not seed here; only the beside-the-loop copy's record is evidence, never the absent seed's. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
         fi
       elif [ -z "$REFRESH_SH" ]; then
         # ⛔ EVERY ARM RELEASES THE LOCK AND SPEAKS (review P2). An answer this branch does not recognise
         # (a future resolver code, a helper that is `command not found` in an extracted rig) used to fall
         # past `if [ -n "$REFRESH_SH" ]` with no `else`: the log had already said `spawning`, nothing ran,
         # and `.refresh.lock` stayed on disk — a silent no-op wearing a spawn line.
-        echo "[refresh] SEED-SKEW: the refresh resolver returned an UNRECOGNISED answer (rc=$_rrc, script='${REFRESH_SH:-none}') — NOT spawning a pass whose writer cannot be identified; tried: ${REFRESH_TRIED:-none}. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        echo "[refresh] SEED-SKEW: the refresh resolver returned an UNRECOGNISED answer (rc=$_rrc, script='${REFRESH_SH:-none}') — NOT spawning a pass whose writer cannot be identified; tried: ${REFRESH_TRIED:-none}. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
         rm -rf "$O/.refresh.lock"
       fi
       # ⛔ A TRANSIENT PASS IS NOW RETRIED ON A SHORT BOUNDED BACKOFF, NOT ONLY AT THE NEXT CYCLE

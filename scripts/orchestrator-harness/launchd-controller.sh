@@ -171,10 +171,18 @@ _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 _LC_STATE="${ORC_STATE_DIR:-$O}"
 _LC_LOG="$_LC_STATE/logs/orch-loop.log"
 _LC_OFFSET=0
+# ⛔ WHETHER THE OFFSET ABOVE BELONGS TO **THIS** ATTEMPT. `_lc_mark_baseline` runs only where this
+# process CREATES the session; when the session already existed (the guard attaches to nothing and goes
+# straight to the supervisor) no baseline was taken, `_LC_OFFSET` is 0, and `_lc_refused` would then
+# search the WHOLE append-only log — reading a refusal from some earlier attempt as this run's verdict.
+# The post-supervisor arm below needs the same scoping the two early arms have, so the flag is set in
+# exactly one place, beside the offset it describes.
+_LC_WITNESS_SCOPED=0
 _lc_mark_baseline() {
   _LC_OFFSET=0
   [ -f "$_LC_LOG" ] && _LC_OFFSET="$(wc -c < "$_LC_LOG" 2>/dev/null | tr -d '[:space:]')"
   case "${_LC_OFFSET:-}" in ''|*[!0-9]*) _LC_OFFSET=0 ;; esac
+  _LC_WITNESS_SCOPED=1
   return 0
 }
 _lc_refused() {
@@ -338,6 +346,27 @@ _STARTED="$(date +%s)"
 while "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; do sleep 5; done
 _LIVED=$(( $(date +%s) - _STARTED ))
 
+# ⛔ A REFUSAL THAT LANDS AFTER THE CREATE BRANCH'S TWO PROBES IS STILL A REFUSAL (P1-1, fresh-context
+# review of #3846; MEASURED). Those probes cover ~2.1 s: the appearance check, then `sleep 2`. A refusal
+# slower than that fell through to the supervisor above and ended here on an UNCONDITIONAL `exit 0` —
+# so launchd recorded `last exit code 0`, `harness-up` printed its `EXITED-CLEAN` row (whose text
+# asserts the opposite, "a 0 is never a refusal"), the REFUSED-SINGLETON/REFUSED-UNJUDGED rows could
+# never fire, and under `KeepAlive` it repeated every `ThrottleInterval` on a healthy box. The trigger
+# is a SLOW START, which is the incident box's own condition: `orch-loop.sh` takes the lock at
+# `:2425`, after sourcing, `derive_or` (a `git` spawn) and the MAX_LOAD block, so 2 s is a warm-cache
+# number, not a bound. Measured at the round-10 head with the shipped wrapper: a refusal at 0.5 s and
+# 2.0 s -> rc 75; at 2.2 s / 2.5 s / 3.0 s -> rc 0.
+# ⛔ AND IT IS SCOPED TO THIS ATTEMPT OR IT IS THE FALSE-PASS MIRROR. `_lc_refused` reads only the bytes
+# this launch appended (`_LC_OFFSET`), and only when THIS process created the session: without that
+# flag, a supervisor that attached to an existing session would read a historical `[singleton]` line as
+# its own refusal and label a later, unrelated end a REFUSAL. That is the same defect as the stale-'O'
+# arm in `case I stale`, moved one branch over.
+# ⛔ NO LIFETIME BOUND IS NEEDED, AND ADDING ONE WOULD BE A GUESS: `[singleton]` has exactly ONE writer
+# in this repo (`orch-loop.sh:2425`, the startup refusal), so a scoped witness that holds IS a refusal.
+if [ "${_LC_WITNESS_SCOPED:-0}" = "1" ] && _lc_refused; then
+  _lc_refusal_exit
+fi
+
 # ⛔ FLOOR THE RESTART RATE. `orch-loop.sh` REFUSES (exit 75, `[singleton]` in the log) at once when
 # another controller holds `.orch.lock` — it used to print "already running" and exit 0 — and a
 # session whose loop refuses to start dies in milliseconds either way, so the floor is unchanged and
@@ -352,8 +381,7 @@ if [ "$_LIVED" -lt "$RESTART_FLOOR" ]; then sleep $(( RESTART_FLOOR - _LIVED ));
 # in launchd.err from an idle box; the lifetime is the one datum that separates them. It stays exit 0
 # because a controller that ends normally is a legitimate state, so this is a diagnostic, not a
 # verdict. ⛔ THE REFUSAL IS NO LONGER ONE OF THOSE STATES (agent-infra#2095): `orch-loop.sh` exits 75
-# when another controller holds the lock and this wrapper PROPAGATES it above (a `[singleton]` line in
-# the loop's log is the witness), because otherwise the wrapper's own exit code hid the refusal from
-# launchd and from every row `harness-up` prints.
+# when another controller holds the lock and this wrapper PROPAGATES it — the two early arms above, and
+# the post-supervisor arm above them, because a refusal slower than ~2.1 s used to reach launchd as 0.
 _lc_err "the '$S' controller session ended after ${_LIVED}s (exit 0)"
 exit 0
