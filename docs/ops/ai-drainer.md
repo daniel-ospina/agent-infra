@@ -103,8 +103,11 @@ nothing, and it exits 0):
    unchanged: the fleet's polarity is *unknown is alive*, and the census is the only thing bounding the
    lane total, so an unreadable probe must never read as "no lanes" (that is the over-dispatch
    direction; it dispatched 7 lanes in the suite's mutant of exactly that change). "Unreadable" means
-   `ps` failed, exited 0 with **no output at all**, or answered non-numerically — a probe that answered
-   with a process table containing no lane in it reads **0**, which is the direction this fix exists for.
+   `ps` **failed**, or exited 0 having printed **no output at all** — a probe that answered with a
+   process table containing no lane in it reads **0**, which is the direction this fix exists for.
+   (The derived COUNT can never be non-numeric: `_live_lane_processes` prints a number on success and
+   nothing on failure. A probe that answers with non-numeric TEXT is just a table with no lane in it,
+   so it reads 0 and DOES clamp.)
    ⛔ The clamp is one-sided in the sense that it cannot **invent** a lane, but it **can lower a real
    count**, and that is the deliberate price of the fix: a probe that answers with a view omitting the
    lanes (`hidepid=2` for another uid, a PID namespace, a filtered `$PS` wrapper) reads 0 and the clamp

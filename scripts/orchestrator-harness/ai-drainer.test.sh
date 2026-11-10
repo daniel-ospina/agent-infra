@@ -643,6 +643,37 @@ check "(s5) a WILDCARD in an argv is not expanded into a lane (CWD holds lane.sh
   "$(grep -E "alive=|census-mismatch" "$LAST_AI/logs/ai-drainer.log" | head -2 | tr '\n' ' ')"
 
 reset_run
+# ── (s6) ⛔ THE DISPATCHER CENSUS IS GLOB-FREE TOO (#3886 review round 3) ───────────────────
+# `(s5)` covers `_is_lane_process` only: its `ps` stub feeds `_live_lane_processes` (the LAUNCHER
+# clamp). `_counts_as_lane` — the DISPATCHER census — had the identical unguarded split, and MEASURED
+# a mutation of exactly that guard left the whole suite green:
+#   M1: `_counts_as_lane` guard+restore deleted → 109 passed, 0 failed  (invisible)
+#   M2: `_is_lane_process` guard+restore deleted → 108 passed, 1 failed  ((s5), the control)
+# This class had already shipped twice (#3882 → #3886) for want of an arm, so here is the arm: ONE live
+# dispatcher pidfile whose `ps -p` answer is a wildcard, run from a CWD holding lane-shaped filenames.
+# With the guard the census reads 0; without it the `*` expands to the file named `pi` and it reads 1.
+o="$ROOT/o-s6"; ai="$ROOT/ai-s6"; mkdir -p "$o/bg" "$ai"
+plant_lane s6 1 >/dev/null
+cat >"$STUB/worker-terminal.sh" <<'WT_EOF'
+WT_TREE_PY="stub"; WT_WS_PY="stub"
+wt_table() { printf 'lane-1\talive\n'; }
+wt_count() { printf '0\n'; }
+WT_EOF
+cat >"$ROOT/ps-disp" <<'PSD_EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"-p "*) printf '%s\n' "/bin/bash -c echo *" ;;   # the argv the dispatcher census will test
+  *)       : ;;                                      # `-A`: no lane-shaped processes for the clamp
+esac
+PSD_EOF
+chmod +x "$ROOT/ps-disp"
+RUN_WT_MOD="$STUB/worker-terminal.sh" RUN_PS="$ROOT/ps-disp" RUN_CWD="$ROOT/globby" RUN_TARGET=2
+run_drainer_fg s6
+check "(s6) the DISPATCHER census does not expand a wildcard into a lane either" \
+  'grep -q "alive=0 (dispatcher=0 launcher=0)" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E "alive=" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+
+reset_run
 # ── ARM (g): THE VERDICT — a lane's own exit status, settled by the NEXT tick ────────────────
 FAKE_LANE_SECS=0 FAKE_RC=0 RUN_TARGET=1
 run_drainer_fg g
