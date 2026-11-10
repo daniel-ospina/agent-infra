@@ -9954,24 +9954,55 @@ test("#2823: childLivenessFor — the pre-turn death is its own state, and the s
   const withEvidence = childLivenessFor({ details: { exitCode: 0 }, hbState: lostTurnStart, pid: 18, stdout: "the answer", exited: true, heartbeatArmed: true });
   equal(withEvidence.childState, "completed", "positive message evidence outranks the missing latch — the answer IS an answer");
   equal(withEvidence.childMessagesSent, 1, "…and the count agrees with the state");
-  // The second independent proof, on its own: a finished tool with no turn_end at all.
-  const lostTurnTool = createHeartbeatState();
-  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", lostTurnTool, 1000);
-  parseHeartbeatLine("[task-heartbeat] tool_start nonce=nn c1 bash", lostTurnTool, 1001);
-  parseHeartbeatLine("[task-heartbeat] tool_end nonce=nn c1", lostTurnTool, 1002);
-  equal(lostTurnTool.turnsCompleted, 0, "no turn ended in this fixture");
-  equal(
-    childLivenessFor({ details: { exitCode: 0 }, hbState: lostTurnTool, pid: 19, stdout: "the answer", exited: true, heartbeatArmed: true }).childState,
-    "completed",
-    "a completed tool is its own proof of work (it also latches everSawWork — asserted here as the invariant)",
+  // ⛔ THE `lastProgressAt` PROOF ALONE (review cycle 1 follow-up). ⚠ The first cut of this row emitted
+  // `tool_start` FIRST — which latches `everSawWork`, the pre-existing proof — so it passed with the new
+  // clause deleted and proved nothing about it. A LOST `tool_start` is the whole premise, so the fixture
+  // must omit it: a lone `tool_end` latches `lastProgressAt` (a completed unit of work) and leaves
+  // `everSawWork` false, which is exactly the marker-loss shape #1208 hardens against.
+  const lostToolStart = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", lostToolStart, 1000);
+  parseHeartbeatLine("[task-heartbeat] tool_end nonce=nn c1", lostToolStart, 1001);
+  equal(lostToolStart.everSawWork, false, "the premise: no tool_start/turn_start, so the old proof is blind here");
+  equal(lostToolStart.turnsCompleted, 0, "no turn ended in this fixture either");
+  ok(lostToolStart.lastProgressAt > 0, "…yet a completed tool advanced the content-grounded progress clock");
+  const toolOnly = childLivenessFor({ details: { exitCode: 0 }, hbState: lostToolStart, pid: 19, stdout: "the answer", exited: true, heartbeatArmed: true });
+  equal(toolOnly.childState, "completed", "a completed tool is its own proof of work — it outranks a missing turn_start");
+  equal(toolOnly.childMessagesSent, 1, "…and the measured count agrees with the state (the floor never had to invent it)");
+
+  // ⛔ THE REVIEWER'S LITERAL COUNTEREXAMPLE, as a marker sequence. A `progress=1` tick with `saw_msg=1`
+  // and NO turn markers: `everSawWork === false`, `turnsCompleted === 0`, `messagesSent === 0` — the old
+  // predicate answered "no turn" and the payload carried `childMessagesSent: 1` beside it.
+  const progressTickOnly = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", progressTickOnly, 1000);
+  parseHeartbeatLine(
+    "[task-heartbeat] tick nonce=nn tools=0 turn=0 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=1",
+    progressTickOnly,
+    1001,
   );
-  // THE INVARIANT, stated directly: no `died-before-first-turn` snapshot may carry a message count.
-  for (const st of [readyNoTurn, createHeartbeatState(), lostTurnStart, lostTurnTool]) {
-    const snap = childLivenessFor({ details: { exitCode: 2 }, hbState: st, pid: 20, stdout: "x", exited: true, heartbeatArmed: true });
-    ok(
-      snap.childState !== "died-before-first-turn" || snap.childMessagesSent !== 1,
-      `the field set cannot contradict itself: ${snap.childState} beside childMessagesSent=${String(snap.childMessagesSent)}`,
-    );
+  equal(progressTickOnly.everSawWork, false, "the premise: the turn latches never fired");
+  equal(progressTickOnly.everSawMsg, true, "…though a message streamed (the content-blind latch)");
+  equal(progressTickOnly.turnsCompleted, 0, "no turn ended");
+  ok(progressTickOnly.lastProgressAt > 0, "the tick reported CONTENT progress");
+  const tickSnap = childLivenessFor({ details: { exitCode: 0 }, hbState: progressTickOnly, pid: 21, stdout: "the answer", exited: true, heartbeatArmed: true });
+  equal(tickSnap.childState, "completed", "content progress outranks the missing latch — a real answer is not a setup failure");
+  equal(tickSnap.childMessagesSent, 1, "…and `1` rides a state that can carry it, never beside 'no turn'");
+
+  // THE INVARIANT, stated directly and in its STRONG form: a `died-before-first-turn` snapshot can carry
+  // no message count at all (`0` = proved silence, `null` = unknown). `1` — floored OR measured — is the
+  // contradiction the state exists to make unreachable, so the assertion forbids the whole class rather
+  // than the one integer, across every evidence shape and both stdout/exited combinations.
+  for (const st of [readyNoTurn, createHeartbeatState(), lostTurnStart, lostToolStart, progressTickOnly]) {
+    for (const [stdout, exited] of [
+      ["x", true],
+      ["", true],
+      ["", false],
+    ] as const) {
+      const snap = childLivenessFor({ details: { exitCode: 2 }, hbState: st, pid: 20, stdout, exited, heartbeatArmed: true });
+      ok(
+        snap.childState !== "died-before-first-turn" || snap.childMessagesSent === 0 || snap.childMessagesSent === null,
+        `the field set cannot contradict itself: ${snap.childState} beside childMessagesSent=${String(snap.childMessagesSent)} (stdout=${stdout ? "yes" : "no"}, exited=${exited})`,
+      );
+    }
   }
 });
 
