@@ -166,7 +166,23 @@ ck "LOCKF is defined ONCE in the whole loop (no split identity of the lock path)
 # never removed — the fail-OPEN direction that pair of arms exists to close.
 # ONE pattern, used by all four scans (both selections, the per-line scan, the accounting scan), so they
 # cannot disagree about what counts as a registration.
-_TRAP_CMD_RE='([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*\\?(builtin[[:space:]]+|command[[:space:]]+)?\\?trap[[:space:]]'
+# ⛔ AND THE ASSIGNMENT VALUE MAY BE A QUOTED STRING (fresh review of #3865 at 6da971433, P3 — false
+# GREEN, MEASURED: the value class was `[^[:space:]]*`, so a PLAIN-TEXT registration with a quoted
+# assignment value — `x="a b" trap 'true' EXIT` — was invisible to all FOUR scans at once. Both counts
+# stayed equal, the accounting arm reported ✅, `exit_trap_count` stayed 1 — and bash REPLACED the
+# releaser (`bash -c 'trap "echo FIRST" EXIT; x="a b" trap "echo SECOND" EXIT; echo body'` prints only
+# SECOND), so the lock outlived the loop: the #1715 outcome, reported as ✅ by the arm built to catch it.
+# The value is one of three shapes — double-quoted, single-quoted, or an unquoted word — and the
+# `'"'"'` splices below are the shell's own way of writing a literal `'` inside a single-quoted string;
+# an apostrophe is a quote too, and a value bash cannot even parse reds the row rather than hiding it.
+# ⛔ THE `\\{0,1}` INTERVAL IS DEFENSIVE AND NO MUTANT ON LINUX CAN REDDEN IT (state it, do not imply a
+# witness): it says "at most one literal backslash", and GNU grep accepts BOTH this spelling and the
+# shorter `\\?`. POSIX leaves a backslash before a non-special character UNDEFINED in an ERE (`\\?` is
+# the BRE spelling of "zero or one"), and a grep that reads it literally matches nothing — which reds
+# the trap arms on the launchd host, a reported failure for a correct tree. An interval is portable, so
+# the suite answers the same on every host it is run from. See #3442: a claim without a witness is
+# labelled, never smuggled in as coverage.
+_TRAP_CMD_RE='([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]*)[[:space:]]+)*\\{0,1}(builtin[[:space:]]+|command[[:space:]]+)?\\{0,1}trap[[:space:]]'
 TRAP_L="$(grep -nE "^[[:space:]]*${_TRAP_CMD_RE}.*LOCKF" "$SUBJECT" 2>/dev/null | head -1 | cut -d: -f1)"
 [ -n "$TRAP_L" ] && [ "$TRAP_L" -gt "$END_L" ]
 ck "the EXIT trap that releases the lock sits BELOW the section (the block runs first)" $?
@@ -231,8 +247,18 @@ ck "the EXIT trap that releases the lock sits BELOW the section (the block runs 
 _TRAP_SIGS_AWK='
   BEGIN { n = split("EXIT INT TERM HUP QUIT ERR DEBUG RETURN 0", sig, " ")
           for (i = 1; i <= n; i++) { ok[sig[i]] = 1; ok[tolower(sig[i])] = 1 } }
+# ⛔ NO BACKSLASH NORMALISATION HERE, AND THAT IS A MEASURED DELETION (fresh review of #3865 at
+# 6da971433, P4 — #3442 rule 3). The previous commit added a `sub` that stripped leading backslashes
+# so a backslash-escaped `trap` word would be found wherever it sits — a claim its message states
+# ("a backslash-tolerant `trap` word in the signal parse") and NOTHING can witness: when no field
+# equals `trap` the parse starts at field 1 and SKIPS FORWARD to the first signal-named token, and
+# every token the per-line selector can put before the command word is an assignment (`name=value`,
+# one field, so it can never BE a signal name) or `builtin`/`command`. MEASURED: reverting the line
+# leaves `trap_regs` output byte-identical on both a plain and a backslash-escaped registration,
+# UNKNOWN rows 0 -> 0, EXIT rows 2 -> 2 — 0 rows red. An inert changed line reads as coverage the
+# suite cannot produce, so it is gone rather than kept as prose.
   { start = 0
-    for (i = 1; i <= NF; i++) { w = tolower($i); sub(/^\\+/, "", w); if (w == "trap") { start = i; break } }
+    for (i = 1; i <= NF; i++) if (tolower($i) == "trap") { start = i; break }
     out = ""
     i = start + 1
     while (out == "" && i <= NF) {
@@ -512,6 +538,17 @@ x=1 trap 'true' EXIT" \
 _exitrow 2 "$_REL
 \\trap 'true' EXIT" \
   "a BACKSLASH-ESCAPED second registration REPLACES the releaser — was a false PASS"
+# ⛔ AND A QUOTED ASSIGNMENT VALUE HID ONE FROM ALL FOUR SCANS (fresh review of #3865 at 6da971433,
+# P3 — false GREEN, MEASURED: `x="a b" trap 'true' EXIT` is plain text, it REPLACES the installed EXIT
+# handler, and the value class `[^[:space:]]*` could not read a value containing whitespace — so the
+# per-line scan, the accounting scan, the ONLY-EXIT arm and `trap_pin` were ALL blind at once and agreed
+# with each other. Driven in all three directions: the correct tree written that way is not a false RED,
+# a second registration that way reds the ONLY-EXIT arm, and on ONE line the accounting scan sees it.)
+_traprow 0 "x=\"a b\" trap 'rm -f \"\$LOCKF\"' EXIT" \
+  "a QUOTED-ASSIGNMENT-PREFIXED releaser PASSES (a quoted value is a word too)"
+_exitrow 2 "$_REL
+x=\"a b\" trap 'true' EXIT" \
+  "a QUOTED-ASSIGNMENT-PREFIXED second registration REPLACES the releaser — was a false PASS"
 # ⛔ AND THE INT/TERM TERMINATION ARM IS DRIVEN THE SAME WAY, over the indirection that defeated the
 # LOCKF filter: a RETURNING INT handler that releases the lock through a FUNCTION removes the lock and
 # leaves the loop alive, which is #1715 spelled in code the `grep … LOCKF` cannot see.
@@ -584,6 +621,8 @@ _acctrow disagree "$_REL; trap 'true' EXIT" \
 # while the post-fix class disagrees, which is what a second registration on one line must do.)
 _acctrow disagree "$_REL; x=1 trap 'true' EXIT" \
   "an ASSIGNMENT-PREFIXED second registration on one line is SEEN by the accounting scan"
+_acctrow disagree "$_REL; x=\"a b\" trap 'true' EXIT" \
+  "a QUOTED-ASSIGNMENT-PREFIXED second registration on one line is SEEN by the accounting scan"
 # ⛔ AND THE UNKNOWN ARM'S TEXT SOURCE IS A STATED LIMIT, NOT A ROW (fresh review of #3865 at
 # a2da4598b, note): this arm reads `$(cat "$SUBJECT")` while the scans above read `trap_join`'s output, so
 # a releaser split by a trailing `\` reads UNKNOWN here and parses fine above — one spelling, two answers,
