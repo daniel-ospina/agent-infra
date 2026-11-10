@@ -170,8 +170,11 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # the min/max, and the claim survives the next run.
 # ⛔ THE DAYS ARE NOT INTERCHANGEABLE, which is why the population is quoted WHOLE rather than as the
 # newest day: on the run-duration clock the slowest day's p95 runs ~6836 s (re-measured 6838/6840 s by
-# `created_at`/`run_started_at` bucketing — so quote it as a bound, ~6.8 h) and its max 7968 s is EXACT
-# (the same run every read). The fastest day's p95 measured ~4565 s on the first read and 4708 s later, so
+# `created_at`/`run_started_at` bucketing — so quote it as a RANGE, ~6.8 ks ≈ 1.9 h; ⛔ NOT "6.8 h", which
+# this paragraph said first: the population's run-duration MAX is 7968 s = 2.2 h, so a per-day p95 inside it
+# cannot be 6.8 h, and a 6.8 H figure belongs to the LANE-VISIBLE clock's tail (p50 4062 s, p90 9825 s,
+# max 32157 s = 8.9 h) — exactly the two-clock confusion this paragraph exists to prevent) and its max
+# 7968 s is EXACT (the same run every read). The fastest day's p95 measured ~4565 s on the first read and 4708 s later, so
 # it is quoted as `~4565 s` with its max marked a LOWER BOUND, not a ceiling (the newest day is still
 # FILLING: 4725 s at the first read, 4872 s a few hours later; re-read now 5067 s). ⛔ AND THIS PARAGRAPH
 # EARLIER SAID THE SLOWEST DAY'S FIGURES WERE "EXACT AND STABLE", WHICH THE SAME QUERY REFUTES (review
@@ -326,15 +329,20 @@ case "${LANE_TIMEOUT:-}" in
   ''|*[!0-9]*) : ;;                                                   # not a number — the sibling passes it through too
   *) LANE_TIMEOUT="${LANE_TIMEOUT#"${LANE_TIMEOUT%%[!0]*}"}"; LANE_TIMEOUT="${LANE_TIMEOUT:-0}" ;;
 esac
-case "${LANE_BACKSTOP_S:-}" in
+# ⛔ NOT RE-ASSIGNED IN PLACE: `LANE_BACKSTOP_S` is a REGISTERED term owned by `spawn-gate.sh`
+# (`extensions/shared/heartbeat-progress-edges.ts`), and a second DECLARATION of it here is exactly the
+# second-authority drift that registry's reverse scan refuses (it red `verify` when this normalisation landed
+# in place). The normalised copy is a LOCAL, so the file reads the bound without becoming a second owner of it.
+LANE_BACKSTOP_S_N="${LANE_BACKSTOP_S:-}"
+case "$LANE_BACKSTOP_S_N" in
   ''|*[!0-9]*) : ;;
-  *) LANE_BACKSTOP_S="${LANE_BACKSTOP_S#"${LANE_BACKSTOP_S%%[!0]*}"}"; LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-0}" ;;
+  *) LANE_BACKSTOP_S_N="${LANE_BACKSTOP_S_N#"${LANE_BACKSTOP_S_N%%[!0]*}"}"; LANE_BACKSTOP_S_N="${LANE_BACKSTOP_S_N:-0}" ;;
 esac
 case "${LANE_BOUND_WALL_S:-}" in
   ''|*[!0-9]*) : ;;
   *) LANE_BOUND_WALL_S="${LANE_BOUND_WALL_S#"${LANE_BOUND_WALL_S%%[!0]*}"}"; LANE_BOUND_WALL_S="${LANE_BOUND_WALL_S:-0}" ;;
 esac
-LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
+LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
 # ⛔ THE NUMBER NOW HAS THREE POSSIBLE SOURCES, SO IT CARRIES THE ONE IT GOT (P3, verified by running the
 # message): `LANE_WALL_S` is no longer necessarily `LANE_TIMEOUT`. An operator who set only
 # `LANE_BOUND_WALL_S` was told "LANE_MERGE_MAX_WATCH exceeds what LANE_TIMEOUT=3600s affords" — naming a
@@ -343,11 +351,23 @@ LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S"
 # resolved once, here, and every message that renders `LANE_WALL_S` names it.
 if is_limit "${LANE_TIMEOUT:-}" && [ "${LANE_TIMEOUT}" = "${LANE_WALL_S}" ]; then
   LANE_WALL_SRC="LANE_TIMEOUT"
-elif is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S}" = "${LANE_WALL_S}" ]; then
+elif is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N}" = "${LANE_WALL_S}" ]; then
   LANE_WALL_SRC="LANE_BACKSTOP_S"
 else
   LANE_WALL_SRC="no usable LANE_TIMEOUT or LANE_BACKSTOP_S, so the shipped default stands"
 fi
+# ⛔ THE DESIGN OPERAND IS THE CALLER'S, NOT THE ARMED ONE (review, P2 — MEASURED, and it is a false block
+# this diff would otherwise introduce). `MAX_WATCH_FIT` is derived from `LANE_WALL_S` at its own definition
+# below, so lowering `LANE_WALL_S` for the RUNTIME clamps also resized the DESIGN allowance: with
+# `LANE_BOUND_WALL_S=3600` it fell from 7 chunks to 1 (`(3600-5400-900)/120` → floored to 1), and the one
+# path that actually consumes the design operand — a `--watch` re-run whose lane clock is UNRESOLVABLE, i.e.
+# the documented controller resume — then gets a single 120 s chunk and declares `BLOCKED_ATTEMPTS` over a
+# chain still legitimately reviewing (median reviewer run 316 s), with `WATCH_F` never rewound. That
+# contradicts the promise stated at `MAX_WATCH`'s re-derivation ("a lane with no resolvable clock — the
+# controller re-run — keeps the shipped 7 chunks") and is a WORSE false block than the 840 s tail this diff
+# discloses as a residual. So the ceiling reducer is applied to `LANE_WALL_S` (the runtime clock) only, and
+# the pre-clamp value is kept here for the design arithmetic.
+LANE_WALL_CALLER_S="$LANE_WALL_S"
 # ⛔ THE ARMED CEILING IS NOT NECESSARILY THIS FILE'S OPERAND (review, P3 — verified against
 # `spawn-gate.sh`'s `lane_wall_bound`): `run_agent` arms `min(caller_bound, LANE_BOUND_WALL_S)` for every
 # POSITIVE `LANE_BOUND_WALL_S`, and that knob is documented as a CEILING REDUCER. Mirroring only
@@ -457,7 +477,7 @@ lane_elapsed_s() {
 # that exits at once at its deadline), and dividing by it would break the arithmetic below instead of
 # yielding a bound.
 _fit_poll="$POLL_S"; [ "$_fit_poll" -ge 1 ] || _fit_poll=120
-MAX_WATCH_FIT=$(( (LANE_WALL_S - WAIT_S_DESIGN - IMPL_RESERVE_S) / _fit_poll ))
+MAX_WATCH_FIT=$(( (LANE_WALL_CALLER_S - WAIT_S_DESIGN - IMPL_RESERVE_S) / _fit_poll ))
 [ "$MAX_WATCH_FIT" -ge 1 ] || MAX_WATCH_FIT=1          # a tiny LANE_TIMEOUT still supervises once
 # ⛔ THE CLAMP ABOVE IS A FLOOR, AND A FLOOR CAN MASK AN OVERSPENT CLOCK (review cycle 3, P3 — verified, not
 # fixed here so the diff stays to its own defect). If an ENV override makes `LANE_WALL_S - WAIT_S -
@@ -503,7 +523,7 @@ if [ -n "${LANE_MERGE_MAX_WATCH:-}" ] && is_limit "${LANE_MERGE_MAX_WATCH:-}"; t
   # ⛔ NOT ON A LANE WITH NO WALL CLOCK: the sentence below says "the lane's wall clock ends the phase
   # first", which is FALSE when `LANE_TIMEOUT=0` (review cycle 15, P3 — measured: a pinned lane printed that
   # warning and, two lines later, "no wall ceiling is enforced for this lane").
-  [ "$LANE_WALL_S" -eq 0 ] || [ "$MAX_WATCH" -le "$MAX_WATCH_FIT" ] || say_err "lane-merge: LANE_MERGE_MAX_WATCH=$MAX_WATCH exceeds what the lane's ${LANE_WALL_S}s wall clock (from ${LANE_WALL_SRC}) affords after the check wait (${WAIT_S_DESIGN}s) and the implementation reserve (${IMPL_RESERVE_S}s) — $MAX_WATCH_FIT chunk(s) fit; honouring the override, but the lane's wall clock ends the phase first."
+  [ "$LANE_WALL_S" -eq 0 ] || [ "$MAX_WATCH" -le "$MAX_WATCH_FIT" ] || say_err "lane-merge: LANE_MERGE_MAX_WATCH=$MAX_WATCH exceeds what the ${LANE_WALL_CALLER_S}s DESIGN allowance (the caller bound, before any ceiling reducer) affords after the check wait (${WAIT_S_DESIGN}s) and the implementation reserve (${IMPL_RESERVE_S}s) — $MAX_WATCH_FIT chunk(s) fit; honouring the override, but the lane's ${LANE_WALL_S}s wall clock (from ${LANE_WALL_SRC}) ends the phase first."
 fi
 PHASE_F="$O/state/lanemerge-$PR.phase"   # "this lane IS in its merge phase" (chain-merge waits on it)
 ROUND_F="$O/state/lanemerge-$PR.round"
@@ -1338,14 +1358,14 @@ if [ "$WATCH" -eq 1 ]; then
     # it; with neither, supervision is unbounded too (a zero allowance means NO COUNTER, not "spent") and
     # the operator line says which of the two it got.
     if [ "$LANE_WALL_S" -eq 0 ]; then
-      if is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
+      if is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N:-0}" -gt 0 ]; then
         # ⛔ AND IT IS THE BACKSTOP THAT IS *LEFT*, NOT THE WHOLE OF IT (review cycle 15, P2 — MEASURED:
         # deriving from the untouched backstop gave a lane with 100 s of its backstop remaining the SAME 22
         # chunks as a fresh lane — 2640 s of supervision against a clock that ends in 100 s, so lane-bound.sh
         # TERMed it mid-supervision with no verdict and no hand-off. That is the very outcome this PR calls
         # "strictly worse than the bound it replaces" for the check wait, and it was reachable only because
         # the finite-wall sibling below subtracts the elapsed time and this branch did not.
-        _bt_left=$(( LANE_BACKSTOP_S - _hb_margin ))
+        _bt_left=$(( LANE_BACKSTOP_S_N - _hb_margin ))
         if [ -n "$_watch_elapsed" ]; then _bt_left=$(( _bt_left - _watch_elapsed )); fi
         _backstop_fit=$(( _bt_left / _fit_poll ))
         [ "$_backstop_fit" -ge 1 ] || _backstop_fit=1
@@ -1727,13 +1747,13 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
     # budget block off). Labelling an unbounded allowance FINITE is the defect class this file keeps fixing.
     _watch_basis_note="an explicit LANE_MERGE_MAX_WATCH=0, which DISABLES the supervision counter"
     _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
-  elif is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
-    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S}s), because the wall axis (LANE_TIMEOUT) is OFF"
+  elif is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N:-0}" -gt 0 ]; then
+    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N}s), because the wall axis (LANE_TIMEOUT) is OFF"
     # ⛔ THE FIGURE MUST BE WHAT THE CODE WILL USE, WHICH INCLUDES THE ELAPSED SUBTRACTION (review cycle
     # 16, P3 — measured: the line printed "a FINITE 29 chunk(s)" on a lane that had spent 3400 s of its 3600 s
     # backstop, where `--watch` derives 1). `_lane_elapsed` is already resolved above for the wait clamp; this
     # is the same datum the `--watch` branch reads as `_watch_elapsed`.
-    _backstop_chunks=$(( (LANE_BACKSTOP_S - _hb_margin - ${_lane_elapsed:-0}) / _fit_poll ))
+    _backstop_chunks=$(( (LANE_BACKSTOP_S_N - _hb_margin - ${_lane_elapsed:-0}) / _fit_poll ))
     [ "$_backstop_chunks" -ge 1 ] || _backstop_chunks=1
     # ⛔ A PINNED `LANE_MERGE_MAX_WATCH` OVERRIDES THIS NUMBER (review cycle 14, observation 2 — measured:
     # `LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2` printed "a FINITE 29 chunk(s)" while the real allowance
