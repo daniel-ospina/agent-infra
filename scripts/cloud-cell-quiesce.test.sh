@@ -81,7 +81,7 @@ mk_world() {
   cp "$d/claims.sh" "$d/repo/scripts/orchestrator-harness/claims.sh" || return 1
   # Supervisor: logs stop/start, and toggles the "controller is running" flag the ps stub reads.
   printf '%s\n' '#!/usr/bin/env bash' \
-    'echo "supervisor:$1" >> "'"$d"'/events"' \
+    'echo "supervisor:$*" >> "'"$d"'/events"' \
     'case "$1" in' \
     '  start) : > "'"$d"'/running" ;;' \
     '  stop)  rm -f "'"$d"'/running" ;;' \
@@ -212,6 +212,14 @@ START_AT="$(grep -n '^supervisor:start' "$D/events" | head -1 | cut -d: -f1)"
 grep -q '^supervisor:stop' "$D/events" \
   && ok "B2 the supervised controller was stopped first (the sweep runs against final trees)" \
   || bad "B2 the supervisor was never stopped"
+# ⛔ THE FLAG IS THE PINNED CONTRACT, NOT A DETAIL (#2093 review P3): the supervisor's queue-target
+# pre-flight refuses `stop` on a mismatched box whenever there is something a stop would end, and on a
+# service-managed box that `stop` is what issues `systemctl stop` — so a revert to plain `stop` would
+# leave the unit running behind a script that reports it stopped. Matching on `$1` alone let exactly
+# that revert stay green.
+grep -q '^supervisor:stop --force$' "$D/events" \
+  && ok "B2b quiesce passes --force to 'stop' — the queue-target pre-flight cannot strand this sweep (#2093)" \
+  || bad "B2b quiesce called 'stop' WITHOUT --force — the #2093 pre-flight refuses it on a mismatched box, leaving the supervised controller running: $(tr '\n' ' ' < "$D/events")"
 
 # ── C/D: a FAILING sweep still restores supervision, and fails the run ───────────────────────────────
 echo; echo "── C/D. a failing sweep does NOT leave the cell with zero controllers ──"
