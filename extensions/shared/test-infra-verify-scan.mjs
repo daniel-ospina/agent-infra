@@ -47,6 +47,7 @@ import { join, resolve, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { reportVerdict } from "./verdict.mjs";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SKILL_PATH = join(PROJECT_ROOT, "skills/post-deploy-verify/infra-verify/SKILL.md");
@@ -71,7 +72,9 @@ check("#1051 Step 2 template-validity block extractable", !!tvBlock);
 check("#1051 Step 2 skill-lint block extractable", !!slBlock);
 if (!step1 || !tvBlock || !slBlock) {
   console.log("\ncannot run the behavioural cases without the blocks");
-  console.log(`${pass} passed, ${fail} failed`);
+  // Early exit, same attributable form — a step that dies here must still be
+  // nameable by the merge rail (agent-infra#2723).
+  reportVerdict("test-infra-verify-scan", pass, Math.max(fail, 1));
   process.exit(1);
 }
 
@@ -724,5 +727,8 @@ if (process.getuid?.() === 0) {
 
 rmSync(root, { recursive: true, force: true });
 
-console.log(`\n${pass} passed, ${fail} failed`);
+// agent-infra#2723 — the aggregate carried neither a `❌` marker nor a label, so a
+// failing run of this suite yielded NO identity and the merge rail refused the
+// whole PR blind.
+reportVerdict("test-infra-verify-scan", pass, fail);
 process.exit(fail > 0 ? 1 : 0);

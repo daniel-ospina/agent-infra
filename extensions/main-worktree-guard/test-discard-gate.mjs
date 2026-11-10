@@ -26,6 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -3167,5 +3168,7 @@ if (process.argv.includes("--mutations")) {
   }
 }
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} test-discard-gate: ${pass} passed, ${fail} failed, ${skip} skipped`);
+// agent-infra#2723 — emit through the shared emitter so the failing arm always
+// carries the `runner::test-discard-gate` identity the merge rail reads.
+reportVerdict("test-discard-gate", pass, fail, { skip });
 process.exit(fail === 0 ? 0 : 1);
