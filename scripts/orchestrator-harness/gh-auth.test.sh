@@ -31,7 +31,12 @@
 #   * a P0-blocker is exempt ONLY when the evidence read SUCCEEDED — an unreadable exemption HOLDS it
 #     over the ceiling (§B6), which is the fail-closed direction `#2409` declares;
 #   * a refusal starts NO session (§B2/B4/B6 assert the `pi` stub never ran) and leaves a READABLE
-#     reason naming the cause (§B2 — `#2210`).
+#     reason naming the cause (§B2 — `#2210`);
+#   * a token name's precedence over the OTHER token name is gh's, not "first non-blank wins" (§A7e-A7h,
+#     §B2h): a blank-but-set `GH_TOKEN` shadows a REAL `GITHUB_TOKEN` and every call fails, so the lane is
+#     HELD and the refusal names the blank name — while a ZERO-LENGTH `GH_TOKEN` really does fall through
+#     to `GITHUB_TOKEN` and must still RESOLVE, so the fix cannot buy its green by refusing a credential
+#     gh would have used.
 #
 # ⛔ HERMETIC: every arm runs `env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME -u GH_TOKEN -u GITHUB_TOKEN`, so a
 # runner that exports one of those (this fleet's cells DO) cannot turn a credential arm green by
@@ -82,9 +87,16 @@ chmod +x "$TMP/bin/pi"
 # ── the `gh` stub: gh's OWN credential rule, then the API answers each arm supplies ────────────────
 # ⛔ THE CREDENTIAL CHECK IS THE POINT OF THIS STUB. A stub that answered unconditionally would make
 # every arm below pass on a box that never resolved anything — it would test the fixture, not the gate.
-# It implements gh's documented order (GH_CONFIG_DIR → $XDG_CONFIG_HOME/gh → $HOME/.config/gh, and a
-# non-blank GH_TOKEN/GITHUB_TOKEN outranking all three) and, when nothing resolves, prints gh's own
-# two lines and exits 4.
+# It implements gh's order (GH_CONFIG_DIR → $XDG_CONFIG_HOME/gh → $HOME/.config/gh, behind a token), and
+# when nothing resolves, prints gh's own two lines and exits 4.
+# ⛔ AND THE TOKEN HALF IS gh's ORDER BETWEEN THE TWO NAMES, MEASURED (2.103.3), NOT "first NON-BLANK
+# wins": the FIRST name holding a NON-EMPTY value decides, and an all-blank value IS the token gh sends
+# (the API then answers 401) — the store is never read.
+#     GH_TOKEN='   ' GITHUB_TOKEN=realtok gh auth token -> [three spaces]  GITHUB_TOKEN is never read
+#     GH_TOKEN=''    GITHUB_TOKEN=realtok gh auth token -> realtok         a zero-length value falls through
+# A fixture that answered "first NON-BLANK wins" SHARES THE MODULE'S OWN WRONG RULE, so no arm in this
+# suite could see the bug the module had (`token|` for the first line above, and the gate then asserted
+# the lane's gh IS credentialed). A7e-A7h and B2h exist to keep these two models apart.
 gh_install() { # <open1> <lands24> <labels> <title> <mode: ok|evidence-fail|all-fail>
   mkdir -p "$O/gh-rest"
   {
@@ -92,17 +104,22 @@ gh_install() { # <open1> <lands24> <labels> <title> <mode: ok|evidence-fail|all-
     printf 'OPEN1=%q\nLANDS=%q\nLAB=%q\nTITLE=%q\nMODE=%q\n' "$1" "$2" "$3" "$4" "$5"
     cat <<'STUB'
 set -u
-case "${GH_TOKEN:-}" in *[![:space:]]*) has=1 ;; *) case "${GITHUB_TOKEN:-}" in *[![:space:]]*) has=1 ;; *) has=0 ;; esac ;; esac
-if [ "$has" = "0" ]; then
-  if [ -n "${GH_CONFIG_DIR:-}" ]; then cfg="$GH_CONFIG_DIR"
-  elif [ -n "${XDG_CONFIG_HOME:-}" ]; then cfg="$XDG_CONFIG_HOME/gh"
-  else cfg="$HOME/.config/gh"; fi
-  if [ ! -f "$cfg/hosts.yml" ]; then
-    printf 'To get started with GitHub CLI, please run:  gh auth login\n' >&2
-    printf 'Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n' >&2
-    exit 4
-  fi
-fi
+tok=""
+if [ -n "${GH_TOKEN-}" ]; then tok="${GH_TOKEN}"
+elif [ -n "${GITHUB_TOKEN-}" ]; then tok="${GITHUB_TOKEN}"; fi
+case "$tok" in
+  '')
+    if [ -n "${GH_CONFIG_DIR:-}" ]; then cfg="$GH_CONFIG_DIR"
+    elif [ -n "${XDG_CONFIG_HOME:-}" ]; then cfg="$XDG_CONFIG_HOME/gh"
+    else cfg="$HOME/.config/gh"; fi
+    if [ ! -f "$cfg/hosts.yml" ]; then
+      printf 'To get started with GitHub CLI, please run:  gh auth login\n' >&2
+      printf 'Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n' >&2
+      exit 4
+    fi ;;
+  *[![:space:]]*) : ;;                                        # a real token: authenticated
+  *) printf 'gh: HTTP 401: Bad credentials\n' >&2; exit 1 ;;  # blank-but-set: gh sends the whitespace
+esac
 [ "$MODE" = "all-fail" ] && exit 1
 jqf() { local a prev=""; for a in "$@"; do if [ "$prev" = "--jq" ]; then printf '%s' "$a"; return 0; fi; prev="$a"; done; return 1; }
 jqexpr="$(jqf "$@")" || jqexpr=""
@@ -197,6 +214,29 @@ ck "A7c …while a ZERO-LENGTH value is NOT a shadow: gh falls through to the st
 r="$(u ". '$GH_AUTH'; GH_TOKEN='   ' gh_auth_ensure '$LANE_HOME' '$ENVF' '$ACCT' >/dev/null; printf '%s' \"\${GH_CONFIG_DIR:-<unset>}\"")"
 [ "$r" = "<unset>" ]; rc=$?
 ck "A7d …and NOTHING is exported for it — an export gh ignores reads as a fix ('$r')" $rc
+# ⛔ AND THE TWO NAMES HAVE AN ORDER, WHICH IS NOT "FIRST NON-BLANK WINS". Measured (gh 2.103.3, no store
+# reachable):
+#     $ GH_TOKEN='   ' GITHUB_TOKEN=realtok gh auth token   ->  [three spaces]   GITHUB_TOKEN never read
+#     $ GH_TOKEN=''    GITHUB_TOKEN=realtok gh auth token   ->  realtok          a zero-length value falls through
+# so gh takes the FIRST name holding a NON-EMPTY value and uses it EVEN WHEN IT IS BLANK — a blank-but-SET
+# `GH_TOKEN` shadows a REAL `GITHUB_TOKEN` exactly as it shadows a store. Asking the two names INDEPENDENTLY
+# (`present`, then `blank`) answered `token|` for that shape while `gh_auth_cause` stayed silent, so the gate
+# printed "the lane's gh IS credentialed (state=token)" over a lane whose every call fails — the same false
+# claim `token-blank` was added to remove, one shape over. A7e-A7h pin the precedence, in BOTH directions:
+# the shadowed arm, and the arm where gh really does fall through (so the fix cannot buy its green by
+# refusing a credential gh would have used).
+r="$(u ". '$GH_AUTH'; GH_TOKEN='   ' GITHUB_TOKEN=fixture-token gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ "$r" = "token-blank|GH_TOKEN" ]; rc=$?
+ck "A7e a BLANK-but-SET GH_TOKEN SHADOWS a real GITHUB_TOKEN — gh reads the whitespace, never the other name ('$r')" $rc
+r="$(u ". '$GH_AUTH'; GH_TOKEN='' GITHUB_TOKEN=fixture-token gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ "$r" = "token|" ]; rc=$?
+ck "A7f …while a ZERO-LENGTH GH_TOKEN DOES fall through to a real GITHUB_TOKEN: the precedence must not become a refusal ('$r')" $rc
+r="$(u ". '$GH_AUTH'; GH_TOKEN='   ' GITHUB_TOKEN=fixture-token gh_auth_ensure '$LANE_HOME' '$ENVF' '$ACCT' >/dev/null; printf '%s' \"\${GH_CONFIG_DIR:-<unset>}\"")"
+[ "$r" = "<unset>" ]; rc=$?
+ck "A7g …and NOTHING is exported for the shadowed shape, even with a usable-looking GITHUB_TOKEN beside it ('$r')" $rc
+c="$(u ". '$GH_AUTH'; GH_TOKEN='   ' GITHUB_TOKEN=fixture-token gh_auth_cause '$LANE_HOME' '$ENVF' '$ACCT'")"
+{ case "$c" in *'GH_TOKEN is set but BLANK'*) ck "A7h …and the cause names GH_TOKEN, so no refusal can assert the lane IS credentialed ('$c')" 0 ;;
+             *) ck "A7h …and the cause names GH_TOKEN (got '$c')" 1 ;; esac; }
 
 # The env file, parsed STATICALLY. Both the plain and the `export -p`/`declare -x` shapes keys.env really
 # carries, and the arm that proves the file is never executed.
@@ -312,6 +352,22 @@ grep -q 'IS credentialed' "$TMP/b2g.log" && rc=1 || rc=0
 ck "B2g3 …and never asserts the lane's gh IS credentialed (the false claim this arm exists to remove)" $rc
 grep -q '\[gh-auth\] state=token-blank dir=- ' "$TMP/b2g.log"; rc=$?
 ck "B2g4 …and the lane log says state=token-blank with NO dir=, so nothing reads as a store that was exported ('$(grep -o 'state=[^ ]* dir=[^ ]*' "$TMP/b2g.log" | head -1)')" $rc
+
+# B2h: THE PRECEDENCE SHAPE, END TO END — a blank-but-SET GH_TOKEN beside a REAL GITHUB_TOKEN, with the
+# account home holding a store. gh resolves GH_TOKEN's whitespace and the first API call is rejected (401),
+# so the lane has no usable credential at all; asking the two names independently reported `token|`, and the
+# refusal then asserted "the lane's gh IS credentialed (state=token)" over a lane whose every gh call fails.
+# The store is REALly populated here for B2g's reason, and the neighbouring token is real for A7f's: the
+# arm's job is that NEITHER the store NOR the usable-looking GITHUB_TOKEN is claimed.
+run_lane 81 15 "P0-blocker,harness" "crash on boot" ok 2519 b2h "$ACCT" GH_TOKEN='   ' GITHUB_TOKEN=fixture-token
+{ [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "B2h a blank-but-set GH_TOKEN beside a REAL GITHUB_TOKEN is HELD (rc=$LANE_RC), and no session ran" $rc
+grep -q 'GH_TOKEN is set but BLANK' "$TMP/b2h.log"; rc=$?
+ck "B2h2 …and the refusal names GH_TOKEN as the cause, not the neighbouring token" $rc
+grep -q 'IS credentialed' "$TMP/b2h.log" && rc=1 || rc=0
+ck "B2h3 …and never asserts the lane's gh IS credentialed (the exact false claim this arm exists to remove)" $rc
+grep -q '\[gh-auth\] state=token-blank dir=- ' "$TMP/b2h.log"; rc=$?
+ck "B2h4 …and the lane log says state=token-blank with no dir= ('$(grep -o 'state=[^ ]* dir=[^ ]*' "$TMP/b2h.log" | head -1)')" $rc
 
 # B3: the module absent (a $O half-synced by a commit that predates it) changes NOTHING but the log.
 # ⛔ THE CREDENTIAL IS GIVEN AMBIENTLY HERE ON PURPOSE, so this arm tests the ONE thing it claims: an

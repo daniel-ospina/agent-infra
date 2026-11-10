@@ -60,6 +60,19 @@
 # `token-blank`, which names the shadowing value instead, and NO export for it: an export gh ignores is
 # worse than no export, because it reads as a fix.
 #
+# ⛔ AND THE SAME MEASUREMENT FIXES gh's ORDER BETWEEN THE TWO NAMES, which is NOT "first non-blank wins"
+# (gh 2.103.3, no store reachable):
+#
+#     $ GH_TOKEN='   ' GITHUB_TOKEN=realtok gh auth token   ->  [three spaces]   GITHUB_TOKEN never read
+#     $ GH_TOKEN=''    GITHUB_TOKEN=realtok gh auth token   ->  realtok          a zero-length value falls through
+#
+# gh takes the FIRST name holding a NON-EMPTY value and uses it even when it is all-blank — so a
+# blank-but-SET `GH_TOKEN` shadows a REAL `GITHUB_TOKEN` exactly as it shadows a store. Asking the two
+# names INDEPENDENTLY (`present` then `blank`) answered `token|` for that shape while `gh_auth_cause`
+# stayed silent, and the gate then asserted the lane's gh IS credentialed over a lane whose every call
+# fails: the same false claim `token-blank` was added to remove, one shape over. `gh_auth_token_state`
+# therefore decides BOTH names in ONE ordered read, and every consumer reads that one answer.
+#
 # ⛔ THE FILE IS PARSED STATICALLY, NEVER EXECUTED. `lane-env.sh` sources `keys.env` at top level for
 # the LANE's own credentials, and this module deliberately does NOT copy that: the dispatcher has
 # already sourced the controller's copy and executing a second one here would move WHAT the dispatcher
@@ -74,30 +87,49 @@
 # SKIPPED reading, never a claimed cause: our own inability to read a datum must not become a refusal
 # loop that stops the fleet (the same rule `key-gate.sh` and `wt_spawn`'s credential gate state).
 
-# gh_auth_token_present — 0 iff this environment carries a value gh will use as a token.
-# ⛔ A BLANK VALUE IS NOT A CREDENTIAL: `GH_TOKEN='   '` is exported by real `keys.env` files and gh
-# treats it as set-then-useless, so the same `*[![:space:]]*` test `worker-terminal.sh` uses applies.
+# gh_auth_token_state — gh's OWN precedence across the two token names, decided ONCE: `<state>|<NAME>`.
+#   token|<NAME>        the first NAME gh would use holds a real (non-blank) value
+#   token-blank|<NAME>  that NAME holds a NON-EMPTY but all-blank value: gh resolves the whitespace
+#                       INSTEAD of the store AND instead of the other name, so nothing may be claimed
+#   rc 1                neither NAME holds anything gh resolves, so gh falls through to the store
+# ⛔ ONE ORDERED DECISION, NOT TWO INDEPENDENT PREDICATES — see the header's measurement. The FIRST name
+# holding a NON-EMPTY value decides, and it decides whether that value is usable; the other name is
+# never consulted after that. (Measured, gh 2.103.3: `GH_TOKEN='   ' GITHUB_TOKEN=realtok gh auth token`
+# prints the three spaces, while `GH_TOKEN='' GITHUB_TOKEN=realtok` prints `realtok`.)
+gh_auth_token_state() {
+  case "${GH_TOKEN-}" in
+    '') ;;                                                         # unset/ZERO-LENGTH: gh falls THROUGH
+    *[![:space:]]*) printf 'token|GH_TOKEN\n'; return 0 ;;        # a real value: gh uses THIS name
+    *)              printf 'token-blank|GH_TOKEN\n'; return 0 ;;  # non-empty all-blank: gh uses the blanks
+  esac
+  case "${GITHUB_TOKEN-}" in
+    '') return 1 ;;                                                # no name holds anything: the store is read
+    *[![:space:]]*) printf 'token|GITHUB_TOKEN\n'; return 0 ;;
+    *)              printf 'token-blank|GITHUB_TOKEN\n'; return 0 ;;
+  esac
+}
+
+# gh_auth_token_present — 0 iff this environment carries a value gh will USE as a token.
+# ⛔ A BLANK VALUE IS NOT A CREDENTIAL, and neither is a real value SHADOWED by a blank one: `GH_TOKEN='   '`
+# is exported by real `keys.env` files and gh resolves it instead of everything else, so the same
+# `*[![:space:]]*` test `worker-terminal.sh` uses applies — through `gh_auth_token_state`, so the order
+# question is answered in exactly one place.
 gh_auth_token_present() {
-  case "${GH_TOKEN:-}" in *[![:space:]]*) return 0 ;; esac
-  case "${GITHUB_TOKEN:-}" in *[![:space:]]*) return 0 ;; esac
+  case "$(gh_auth_token_state)" in token\|*) return 0 ;; esac
   return 1
 }
 
-# gh_auth_blank_token_name — 0 + the NAME on stdout iff a token name is SET but holds no credential.
+# gh_auth_blank_token_name — 0 + the NAME on stdout iff the token name gh RESOLVES holds no credential.
 # ⛔ THIS IS NOT THE NEGATION OF `gh_auth_token_present`, and the difference is the whole finding: an
 # UNSET name and a ZERO-LENGTH value are cases gh falls straight through (the store IS read), while a
 # non-empty all-blank value is what gh resolves INSTEAD of the store (measured; see the header). Only the
 # last one shadows, so only the last one is `token-blank` — calling an empty value a shadow would refuse
-# nothing and mis-describe a lane whose store works.
+# nothing and mis-describe a lane whose store works. ⛔ AND IT NAMES THE NAME gh RESOLVES, not the first
+# blank one it finds: a blank `GITHUB_TOKEN` behind a REAL `GH_TOKEN` shadows nothing at all.
 gh_auth_blank_token_name() {
-  local v
-  # `''` and `*[![:space:]]*` are the two shapes gh falls THROUGH (unset/zero-length, and a real value);
-  # what is left is a non-empty all-blank value — the one gh resolves instead of the store.
-  v="${GH_TOKEN-}"
-  case "$v" in ''|*[![:space:]]*) ;; *) printf '%s\n' GH_TOKEN; return 0 ;; esac
-  v="${GITHUB_TOKEN-}"
-  case "$v" in ''|*[![:space:]]*) ;; *) printf '%s\n' GITHUB_TOKEN; return 0 ;; esac
-  return 1
+  local s
+  s="$(gh_auth_token_state)" || return 1
+  case "$s" in token-blank\|*) printf '%s\n' "${s#token-blank|}" ;; *) return 1 ;; esac
 }
 
 # gh_auth_account_home — the ACCOUNT's home, which on a cell is NOT `$HOME` (HOME is redirected to the
@@ -159,8 +191,9 @@ _gh_auth_file_value() {
 }
 
 # gh_auth_resolve <lane-home> [env-file] [account-home] — ONE line: `<state>|<config-dir>`.
-#   token            a token NAME holds a value; gh authenticates without any config dir
-#   token-blank      a token NAME is set but BLANK, so gh resolves THAT instead of any store: every gh
+#   token            the token name gh RESOLVES (`GH_TOKEN` before `GITHUB_TOKEN`) holds a value; gh
+#                    authenticates without any config dir
+#   token-blank      that name is set but BLANK, so gh resolves THAT instead of any store: every gh
 #                    call in this lane fails, and NO config dir may be claimed or exported for it
 #                    (`|<name>` carries which name shadowed)
 #   ambient          GH_CONFIG_DIR is set and holds hosts.yml
@@ -175,12 +208,19 @@ _gh_auth_file_value() {
 # reason `lane.sh` records about `LANE_KEY_GATE`: an ambient switch can be set by the very env file it
 # is meant to be verified against.
 gh_auth_resolve() {
-  local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" d v
+  local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" s d v
   [ -n "$ef" ] || ef="${ENV_FILE:-${home}/keys.env}"
-  if gh_auth_token_present; then printf 'token|\n'; return 0; fi
-  # ⛔ BEFORE EVERY STORE ARM: a blank-but-set token outranks them in gh's own order, so resolving a
-  # store here would hand the caller a directory gh never consults (the header's measurement).
-  if d="$(gh_auth_blank_token_name)"; then printf 'token-blank|%s\n' "$d"; return 0; fi
+  # ⛔ ONE READ DECIDES BOTH TOKEN ARMS, and it comes FIRST because a token name outranks every store in
+  # gh's own order. Resolving a store for a blank-but-set name would hand the caller a directory gh never
+  # consults (the header's measurement), so the two answers are branches of the SAME ordered decision
+  # rather than two predicates that can disagree — which is how a blank `GH_TOKEN` beside a real
+  # `GITHUB_TOKEN` came to answer `token|` (a "credential" gh rejects) instead of `token-blank`.
+  if s="$(gh_auth_token_state)"; then
+    case "$s" in
+      token\|*)       printf 'token|\n'; return 0 ;;
+      token-blank\|*) printf 'token-blank|%s\n' "${s#token-blank|}"; return 0 ;;
+    esac
+  fi
   if [ -n "${GH_CONFIG_DIR:-}" ]; then
     if [ -f "${GH_CONFIG_DIR}/hosts.yml" ]; then printf 'ambient|%s\n' "$GH_CONFIG_DIR"
     else printf 'ambient-missing|%s\n' "$GH_CONFIG_DIR"; fi
