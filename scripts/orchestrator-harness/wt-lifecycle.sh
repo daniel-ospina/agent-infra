@@ -1004,9 +1004,12 @@ wt_reap_if_empty() {
         # rc 2: a witness ran and produced nothing usable. Fail-closed, and say WHICH probes could be
         # at fault — an operator reading a refused reap needs the arm, not a generic phrase.
         # ⛔ `$degraded` IS DELIBERATELY NOT APPENDED (and it is provably empty here anyway): it is set
-        # only inside the `holder_rc = 3` arm above, which RETURNS. Appending it implied the disclosure
-        # rides the fail-closed verdict, which it never can — a fail-closed veto needs no disclosure
-        # about a witness it refused to trust.
+        # only inside the `holder_rc = 3` arm above, and `holder_rc` cannot be 3 and 2 at once, so that
+        # arm cannot reach this one. It does NOT return, either — it falls THROUGH into `wt_dirt` and
+        # the verdicts below, which is how the disclosure reaches the reaped and DIRTY lines (measured
+        # green by L5f ×2 and L5m ×2). Appending it here implied the disclosure rides the fail-closed
+        # verdict, which it never can — a fail-closed veto needs no disclosure about a witness it
+        # refused to trust.
         WT_RESULT="the live-holder probe could not be evaluated (an argv probe failed, or the cwd census produced nothing usable — unparsable, quoted, or timed out) — kept (fail-closed)"
         return 1
     fi
