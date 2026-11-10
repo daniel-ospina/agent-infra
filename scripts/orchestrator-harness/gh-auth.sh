@@ -123,7 +123,9 @@ gh_auth_token_state() {
 # ⛔ AND THE ORDER ITSELF IS PINNED IN ALL FOUR AXES, not only the one the bug was found in (review
 # round 4, P2): a blank `GITHUB_TOKEN` behind a REAL `GH_TOKEN` shadows NOTHING where the mirror rule
 # (`worker-terminal.sh:1087`'s "a blank one in either hides a valid one") would answer `token-blank`, and a
-# blank token still outranks an AMBIENT store — A7i-A7k and B2i, each red under the mutant it exists for.
+# blank token still outranks an AMBIENT store. A7i-A7k pin that at the resolver, and B2i2-B2i4 pin it in the
+# refusal's text; `B2i` itself (the rc/no-session assertion) is deliberately NOT counted as a witness — a
+# blank-token lane is HELD with 74 under either ordering, so only its detail arms can see the difference.
 
 # gh_auth_account_home — the ACCOUNT's home, which on a cell is NOT `$HOME` (HOME is redirected to the
 # operational home). Best-effort and never fatal: `getent` is Linux, `dscl` is macOS, `~user` is bash.
