@@ -1835,15 +1835,15 @@ queue_state_text() {
     # FAIL-CLOSED BRANCH: `owned_controller_pids || return 0` counts an UNREADABLE process table as
     # "something is running", so a reader on a box where `ps` fails is refused too — the doc carries that
     # branch and this line did not, which gave one gate two answers (review P3).
-    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (marker, provable own session, doctor loop, or controller pid — or the process table cannot be read) — MERGE-INERT, agent-infra#1901' ;;
+    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (marker, provable own session, doctor loop, controller pid, or a controller leaked from another harness root — or the process table cannot be read) — MERGE-INERT, agent-infra#1901' ;;
     # ⛔ STOP REFUSES THESE FOUR TOO, so their one-liners must not read as "start/check only" (review P3):
     # each is refused by `assert_queue_target stop` whenever the state dir has something a stop would end,
     # and an operator told only "start/check refuse" reaches for `stop` and is refused — the same
     # experience the line above was rewritten to prevent.
-    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse, and stop refuses while there is something to end (agent-infra#1935)' ;;
-    unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse, and stop refuses while there is something to end' ;;
-    underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse, and stop refuses while there is something to end' ;;
-    invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse, and stop refuses while there is something to end' ;;
+    nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse, and stop refuses while there is something to end (or the process table cannot be read) (agent-infra#1935)' ;;
+    unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse, and stop refuses while there is something to end (or the process table cannot be read)' ;;
+    underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse, and stop refuses while there is something to end (or the process table cannot be read)' ;;
+    invalid)     printf 'INVALID — OR is not <owner>/<repo>; start/check refuse, and stop refuses while there is something to end (or the process table cannot be read)' ;;
     *)           printf 'unknown' ;;
   esac
 }
@@ -4370,15 +4370,27 @@ unit_stop_effect_verdict() { # <unit>
 # narrowness ("it refuses only when there is something to lose"). Semantically the proof is required,
 # not merely conservative: a session this state dir cannot prove it owns is one `stop` will REFUSE to
 # kill, so it is not something a stop would end. The conservative direction is kept where it belongs —
-# an unreadable process table still counts as "something is running" on the pid legs below, and those
-# legs see any controller actually alive regardless of which session it lives in.
+# an unreadable process table still counts as "something is running" on the pid legs below, and a
+# controller LEAKED from a foreign harness root — invisible to every ownership read here — is counted by
+# its own leg, because the leak reap would otherwise signal it a few lines later.
 stop_would_end_something() {
-  local p
+  local p leak
   [ -f "$ROLES_DIR/.desired" ] && return 0        # the marker `stop` removes FIRST
   tmux has-session -t "$SESSION" 2>/dev/null && session_names_own_state_dir "$SESSION" && return 0
   sup_loop_alive && return 0                       # doctor loop, or its in-flight restart child
   p="$(owned_controller_pids 2>/dev/null)" || return 0   # unreadable table: assume yes
   [ -n "$p" ] && return 0
+  # ⛔ THE REAP IS AN IRREVERSIBLE ACT, AND ITS TARGETS ARE INVISIBLE TO EVERY READ ABOVE (review P2).
+  # A controller leaked from a FOREIGN harness root serves this $O but is neither a provable session nor
+  # an owned/lock pid — that is the whole definition of the leak — so `reap_own_foreign_root_leaks "$O"`,
+  # six lines after this gate, would TERM/KILL a live controller on a pair the gate never judged, leaving
+  # the box stopped with `start` refusing: the exact lane-1 outcome this pre-flight exists to prevent.
+  # The test is EXACTLY the condition the reap itself applies (`cell_own_foreign_root_pids` succeeding
+  # non-empty): where that listing cannot be determined the reap signals NOTHING (it returns 2 and says
+  # so), so there is no irreversible act to guard and this leg must not fire — which is also why the leg
+  # is inert on macOS, where `_proc_root` is absent and the reap never reaps.
+  leak="$(cell_own_foreign_root_pids "$O" "${HARNESS:-}" 2>/dev/null)" || leak=""
+  [ -n "$leak" ] && return 0
   return 1
 }
 

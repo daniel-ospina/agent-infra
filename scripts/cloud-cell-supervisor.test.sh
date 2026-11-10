@@ -3175,6 +3175,43 @@ esac
   && ok "(3d) NOTHING LOST: the provably-ours session survived the refused stop (the double now honours kill-session)" \
   || bad "(3d) the session was killed on a refused stop"
 
+#  (3f) A LEAKED FOREIGN-ROOT CONTROLLER IS SOMETHING A STOP WOULD END (review P2). It is invisible to
+#  EVERY ownership read — its script path is outside this $O and outside $HARNESS, and no lock names it —
+#  yet `reap_own_foreign_root_leaks "$O"`, the statement right after the gate, TERM/KILLs it. Without
+#  its own leg, `stop` skipped the gate on a pair it cannot use and then killed that live controller,
+#  leaving the box stopped with `start` refusing: the lane-1 outcome this pre-flight exists to prevent.
+#  The fixture is exactly a leak by that definition: a real `.../orch-loop.sh` process carrying
+#  `O=<this state dir>`, from a foreign root, with no lock naming it.
+if [ -d "$(printf '/proc')" ]; then
+  S4F="$Q/st2093-leak"; rm -rf "$S4F"; mkdir -p "$S4F/o/state/roles" "$Q/foreign-root/scripts"
+  printf '#!/bin/sh\nsleep 300\n' > "$Q/foreign-root/scripts/orch-loop.sh"
+  chmod +x "$Q/foreign-root/scripts/orch-loop.sh"
+  # NOTE: $O is passed by `env`, which is what `_controller_env_state_dir` reads out of /proc/<pid>/environ.
+  env O="$S4F/o" bash "$Q/foreign-root/scripts/orch-loop.sh" >/dev/null 2>&1 &
+  Q_LEAK_PID=$!
+  sleep 0.3
+  qverb stop "$Q/agent-repo" "$S4F" daniel-ospina/tortoise
+  [ "$Q_RC" -ne 0 ] \
+    && ok "(3f) stop REFUSES while a controller leaked from a foreign harness root is live (the reap would signal it)" \
+    || bad "(3f) stop skipped the gate with a leaked foreign-root controller present — the reap that follows kills it and strands the box (rc=$Q_RC): $Q_OUT"
+  case "$Q_OUT" in
+    *"DIFFERENT repos"*) ok "(3f) …and it refuses through the QUEUE gate, before the reap can signal anything" ;;
+    *) bad "(3f) refused for an unrelated reason, so the leak leg proves nothing: $Q_OUT" ;;
+  esac
+  kill -9 "$Q_LEAK_PID" 2>/dev/null; wait "$Q_LEAK_PID" 2>/dev/null
+  #  The paired control: the SAME shape with the marker present is refused by the marker leg, so (3f)'s
+  #  refusals cannot be satisfied by a fixture that is simply always refused.
+  S4G="$Q/st2093-leak-marked"; rm -rf "$S4G"; mkdir -p "$S4G/o/state/roles"; : > "$S4G/o/state/roles/.desired"
+  qverb stop "$Q/tortoise-repo" "$S4G" ''
+  [ "$Q_RC" -eq 0 ] \
+    && ok "(3f) …and a MATCHED pair with only the marker still stops normally (the leak leg adds no false block)" \
+    || bad "(3f) the leak leg false-blocked a matched pair (rc=$Q_RC): $Q_OUT"
+else
+  # Not a PASS and not a FAIL: the leg is inert here BY DESIGN (the reap signals nothing without /proc),
+  # and counting it as green would be the inert-row defect this suite keeps removing.
+  echo "  ⊘ (3f) SKIPPED — no /proc on this host, so the leak reap never signals and the leg is inert by design"
+fi
+
 # (4) The escape hatch is REAL: `stop --force` on a live mismatched box gets past the gate and stops
 # it. Without this arm, "refuses" could be satisfied by a wall no flag can pass.
 S5="$Q/st2093-force"; rm -rf "$S5"; mkdir -p "$S5"; seed_started_cell "$S5"

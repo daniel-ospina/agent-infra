@@ -164,7 +164,8 @@ step "wip-sweep: ${SWEEP:-<none found — WORK ON THIS BOX WILL NOT BE ARCHIVED>
 # supervisor's new pre-flight refuses `stop` on a queue/checkout pair it cannot use — mismatch, invalid,
 # unreadable, underivable, an unknown state, and the no-checkout leg (REPO unset or underivable) —
 # WHENEVER this state dir has something a stop would end (the `.desired` marker, a provably-own session,
-# a doctor loop, or a controller pid), or the process-table read cannot be made. That is exactly the
+# a doctor loop, a controller pid, or a controller leaked from another harness root), or the process-table
+# read cannot be made. That is exactly the
 # state this script runs in (so the documented `stop` → `start` deploy cannot strand a box). Pass the
 # flag rather than letting a guard this script does not rely on change its path.
 [ -n "$SW" ] && bash "$SW" stop --force >/dev/null 2>&1 || true

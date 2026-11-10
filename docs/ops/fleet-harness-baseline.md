@@ -284,9 +284,11 @@ and it is labelled **MERGE-INERT** — the state `check` and `status` report too
 `stop` refuses only when the pair is unusable **and** this state dir has something a stop would end. ⛔
 What counts as "something" is the code's answer, not a slogan: a desired-state marker (`state/roles/.desired`),
 a **provably-own** controller session (proven by the session's own pane command, because `SESSION` is a
-machine-scoped name — a neighbour cell's `orch` session is not evidence, #1856), a doctor loop, or a
-controller pid; and a read that cannot be made (an unreadable process table) counts as "something is
-running" too, so the gate fails closed rather than stopping a box it cannot see into. So **a box with none
+machine-scoped name — a neighbour cell's `orch` session is not evidence, #1856), a doctor loop, a
+controller pid, or a controller **leaked from another harness root** (invisible to every ownership read,
+but the leak reap would signal it, so it counts); and a read that cannot be made (an unreadable process
+table) counts as "something is running" too, so the gate fails closed rather than stopping a box it cannot
+see into. So **a box with none
 of those legs can still be stopped** — that is the case this pre-flight is deliberately narrow about. The
 marker leg is read as-is and is the strictest: a box that is already down but still carries `.desired` is
 **not** "a box with none of those" — carrying the marker is itself one of them, so it needs `--force`; the
@@ -304,7 +306,8 @@ carries the `REPO`/`OR` pair) is sourced by the supervisor itself:
 SNAP=/tmp/cell-home/harness/bed278f4bbb1   # the versioned snapshot the cell is running
 SUP=$SNAP/scripts/cloud-cell-supervisor.sh
 
-# 1. PRE-FLIGHT. Read-only: stops nothing, starts nothing, writes nothing.
+# 1. PRE-FLIGHT. Read-only: stops nothing, starts nothing, and on a refusal writes nothing either (the
+#    state dirs are only created once it ACCEPTS the pair).
 #    Expect a QUEUE-vs-CHECKOUT refusal here, with the controller still up — that is the point of the
 #    step. ⛔ WHICH refusal depends on the snapshot you are running, and this recipe names a PRE-#2093
 #    one on purpose: `bed278f4` predates the fix, so its `check` prints the #1901 wording ("the QUEUE
@@ -394,7 +397,8 @@ was 14 working of 76 resident, and `zombie=` is in the same line so a box full o
   immutable `<sha12>/` snapshot, move the pin, stamp) before launching. Never hand-edit a file inside a
   snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the read-only
   pre-flight, and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — it
-  just also requires that the state dir has something a stop would end — so a
+  just also requires that the state dir has something a stop would end, or that the process table cannot
+  be read (which counts as running) — so a
   wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. ⛔
   **On a snapshot that includes #2093.** On an older snapshot this claim does not hold as written: there
   `stop` has no gate, and the safety is `check`'s alone — which has always refused, so the sequence is
