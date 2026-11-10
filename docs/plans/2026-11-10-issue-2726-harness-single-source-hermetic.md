@@ -145,9 +145,10 @@ reproduced here before any fix (a mutant of the full workflow, suite unchanged):
    population is now DERIVED from the workflow (and FAILS if it shrinks below 5), and a new
    order-mutant pins the ordering claim.
 
-Non-vacuity: the rewritten suite is **23/23 on the fixed tree**, **4 failures against this branch's
+Non-vacuity: the rewritten suite is **24/24 on the fixed tree**, **4 failures against this branch's
 pre-fix workflow** (the two now-premised `--o` arms), and each of the three routes above reds it by
-name. The two new arms' in-place assertions were re-measured live: deleting their `unset O` and
+name. Arm 1 now also states the population it inspected (6 named steps) and arm 4 refuses a population
+that shrank below 5 invoking arms, so an extractor that stops seeing steps cannot read as a clean sweep. The two new arms' in-place assertions were re-measured live: deleting their `unset O` and
 running with `O=$HOME/orchestrator` gives rc 1 with the named message.
 
 **Finding 2 (P2, the shard count) — FALSIFIED, no change.** The comment posted "201 shards; new

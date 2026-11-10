@@ -53,9 +53,13 @@
 #
 # STATED LIMIT — what a text parser still cannot prove (do not read the green as more than this):
 #   a `unset O` inside a shell function that is never called, or a checker invocation assembled from
-#   variables, would satisfy arm 1. That is the same limit `scripts/run-bash-shards.sh`'s header
-#   records ("no text parser can prove EXECUTION"); what is pinned here is the TEXT of every arm
-#   that runs, and the shapes a future edit is likely to produce are all subject.
+#   variables, would satisfy arm 1. Comments are stripped LINE-WISE only — a `#` inside quotes is not
+#   a comment (`printf '%s\n' '# drift'` is live code), so a TRAILING comment that names the checker
+#   reads as an invocation and the step is asked for a premise it does not need (an over-block, and
+#   the finding names the step). That is the same limit `scripts/run-bash-shards.sh`'s header records
+#   ("no text parser can prove EXECUTION"); what is pinned here is the TEXT of every arm that runs, and
+#   the shapes a future edit is likely to produce are all subject. Arm 4 additionally REFUSES a
+#   population that shrank, so an extractor that stops seeing steps cannot read as a clean sweep.
 #
 # HERMETIC: reads one tracked file; mutations are applied to a copy in a temp dir by exact line
 # deletion/move, and a mutation that does not apply is an ERROR rather than a quietly-passing
@@ -304,6 +308,12 @@ move_step_line_after() {
 }
 
 echo "== 1. LIVE — every checker invocation makes its premise true, NAMES it, and does so FIRST =="
+# The population arm 1 speaks about, stated so an empty/shrunken read cannot pass as "as decided".
+if [ -n "$(names_of "$WF")" ]; then
+  pass "the workflow yields $(names_of "$WF" | wc -l | tr -d ' ') step(s) to inspect"
+else
+  fail "no step was found in $WF — a guard that inspected nothing must not report a pass"
+fi
 OUT="$(audit "$WF")"
 if [ -z "$OUT" ]; then
   pass "every check-single-source.sh arm in the workflow unsets O and names the premise before its invocation"
