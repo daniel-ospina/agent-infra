@@ -372,7 +372,7 @@ ORC_LOCK_START_SLACK_SECONDS="$(_orc_lock_slack "${ORC_LOCK_START_SLACK_SECONDS:
 # ⛔ ONE RULE, TWO HOMES, PINNED. `scripts/lib/pid-identity.sh` owns this (#1178) and is used
 # whenever it can be found. A FLAT DEPLOY has no `lib/` sibling (`$O` IS the harness dir, so
 # `$O/../lib` is `$HOME/lib`, which no deploy writes), so the body below is a VERBATIM MIRROR — the
-# same arrangement `install-controller-service.sh:1275` documents for the same reason, and
+# same arrangement `install-controller-service.sh:1310` documents for the same reason, and
 # `controller-state.test.sh` §5 extracts both bodies and REDDENS if they drift.
 _orc_proc_start_epoch() {
   local p="${1:-}" e d h m s r
@@ -449,7 +449,7 @@ orc_singleton_acquire() {
   if orc_lock_write "$lockf"; then ORC_SINGLETON_WHY="acquired"; return 0; fi
   holder="$(orc_lock_pid "$lockf")"
   # An EMPTY record is not a holder. Every shipped reader already treats it as STOPPED
-  # (`install-controller-service.sh:1330`, `cloud-cell-supervisor.sh:733`), so reclaiming it steals
+  # (`install-controller-service.sh:1361`, `cloud-cell-supervisor.sh:942`), so reclaiming it steals
   # nothing — there is no pid to displace.
   if [ -z "$holder" ]; then
     _orc_reclaim "$lockf" "" "reclaimed an EMPTY record" "an EMPTY record"; return $?
