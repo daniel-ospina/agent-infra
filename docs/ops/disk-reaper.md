@@ -1225,8 +1225,50 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferr
         removed=<n> failed=<n> late_preserved=<n> prune_blocked=<0|1> reasons=<reason>:<n>,…
         main_proof=<auto|local|unavailable|auto-unfetched|ambiguous>
         main_ref=<refs/heads/…|refs/remotes/…|?> pr_merged=<ok|na|unavailable>
-        verdict=<dry-run|reclaimed|idle|reap-ineffective|unmeasured>
+        stalled=<n> verdict=<dry-run|reclaimed|idle|reap-ineffective|unmeasured>
 ```
+
+`stalled=` is the STALLED REVIEW LIST's tally (agent-infra#2179): 0-commits-ahead lane residue this
+pass did NOT release and no later pass will release on its own. It is an exact SUBSET of
+`preserved=` — a selected removal that failed is counted under `remove=` and reported by
+`failed=`/exit 4 instead, so `preserved - stalled` can never underflow. A non-zero tally is PRECEDED
+by the list itself — the rows print above the SUMMARY line, not below it, each row naming the ISSUE
+its branch holds out of dispatch (? when the branch carries no issue number, which a
+`REAP_WT_LANE_BRANCH_RE` override can produce) with its age (whole
+hours, rounded UP, so an hour-floored row never reads as inside the floor it is past; stated in
+SECONDS for the one sub-hour floor, so the age and the floor it is being read against are always in
+the same unit — and that floor's gate is `-ge`, so a record exactly AT it is listed as
+`age=1800s floor=1800s`), the class floor it is at or past (`<n>h`, or `<n>s` for the
+`interrupted-add` class's 1800 s floor — a record that cannot be dated is never listed) and the reason.
+
+A record is named for one of three reasons (`why=`) — **two** of them have no releasing flag, which
+is why the legend gives each one its own remedy: `opt-in-off` (a dirty tree past `REAP_WT_WIP_AGE_HOURS`,
+`--reap-abandoned-wip` unarmed),
+`withheld-by-abstention` (a stash ENTRY names the branch — a stash entry is released by nothing, so
+this reason covers the dirty-tree class, the clean `ghost-zero-ahead` class AND an `interrupted-add`
+record, whose add never returned but whose parked work survived it), and `ignored-data-held` (the tree holds
+**non-regenerable ignored data** past the WIP floor — `ignored-artifact` is the largest preserve
+bucket measured in a real pass, `reasons=ignored-artifact:70`, 20,557 MB, so it is the same
+"blocked for ever" shape; it is named, never auto-released). The three floors a row can name are
+`REAP_WT_GHOST_AGE_HOURS` (2, the clean `ghost-zero-ahead` class), `REAP_WT_WIP_AGE_HOURS` (24, the
+dirty and non-regenerable-ignored-data classes) and `REAP_WT_STALE_INIT_SECONDS` (1800, the
+`interrupted-add` class, the one floor stated in seconds because it is sub-hour); all three appear in
+`--help`, and their unit is the row's own (`<n>h`, or `<n>s`
+for the sub-hour floor) — the row and the legend printed above it are ONE contract, read together
+(the legend states the UNIT and the per-`why=` release path; the three floor NAMES live in `--help`,
+which is where an operator looks them up).
+
+⛔ **Each `why=` names the ONLY release path, and they are NOT interchangeable.** `opt-in-off` is
+released by `--reap-abandoned-wip` (backup verified FIRST). `ignored-data-held` is released only by
+moving or accepting the non-regenerable ignored data — no flag moves that class. And
+`withheld-by-abstention` is released by dropping the STASH ENTRY the work is parked in (`git stash
+drop`); `--reap-abandoned-wip` **cannot** release it, because the stash entry withholds the record
+before that arm is reached, so arming the flag changes nothing about that row.
+
+⛔ `disk-reaper.sh` does NOT aggregate `stalled=` (its lifts are named fields at `:1894-1980`; there is
+no `stalled` there). The delegate's LIST still reaches the operator — the wrapper logs the whole
+delegate output — but a fleet-level pass record carries no stalled count, so read this field from the
+per-repo log, not from the aggregate summary.
 
 ⛔ **`verdict=` is the pass's own ANSWER, and the counters alone cannot supply it (#3041).** A pass
 can be perfectly self-consistent (`examined=52 classified=52 remove=0 preserved=52`) while reclaiming
