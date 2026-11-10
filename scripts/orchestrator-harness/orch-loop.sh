@@ -9653,7 +9653,7 @@ PY
     # briefed from (an empty pool idling read as a throttle). The token is computed where each of those
     # conditions is decided, in the cascade block above; this emit only carries it.
     # ⛔ `slots=` IS THE RUNG'S OWN GRANT, CAPTURED IN THE CASCADE BLOCK — NOT `CASCADE_ISSUE_SLOTS`,
-    # WHICH THE DRAIN ESCAPE RE-ASSIGNS ~600 LINES BELOW THIS BLOCK (review P1). The escape's guard
+    # WHICH THE DRAIN ESCAPE RE-ASSIGNS ~650 LINES ABOVE THIS EMIT (review P1). The escape's guard
     # requires `CASCADE_ISSUE_SLOTS <= 0`, so it can ONLY fire on a level-HOLDS pass; reading the global
     # here therefore printed `level=MERGE slots=N≥1` on exactly those cycles — a pair these comments
     # call impossible — and a reader could not tell a rung's grant from the escape's override. The two
