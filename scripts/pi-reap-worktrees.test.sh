@@ -4053,8 +4053,10 @@ assert_dir "$WT" "A29r-MUT the mutation changes the REPORT only — nothing is r
 # itself to "0-commits-ahead LANE residue" and its legend says each row names "the ISSUE its branch
 # holds out of dispatch". Two non-lane shapes must therefore stay OFF the list, and both are built
 # here because they fail differently: `topic/2966-parked` still parses to an ISSUE number (so the
-# pre-fix row claimed a real issue was held out of dispatch), while `topic/parked` has none at all
-# and printed `issue=?` — the value `stalled_tok`'s own comment says can only mean a parser bug.
+# pre-fix row claimed a real issue was held out of dispatch), while `topic/parked` carries NO issue
+# number at all and printed `issue=?`. ⛔ THAT IS THE LEGITIMATE NO-ISSUE CASE, not a parser bug: an
+# earlier `stalled_tok` comment claimed an empty issue could only mean a parser bug, and the
+# `REAP_WT_LANE_BRANCH_RE` override is exactly what makes that false (review round 10 retracted it).
 ENV=A29v; REPO="$(mk_repo $ENV)"
 WT="$(add_named_wt "$REPO" "$ENV-num" topic/2966-parked)"
 printf 'partial\n' >"$WT/base.txt"

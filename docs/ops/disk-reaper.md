@@ -1245,8 +1245,8 @@ A record is named for one of three reasons (`why=`) — **two** of them have no 
 is why the legend gives each one its own remedy: `opt-in-off` (a dirty tree past `REAP_WT_WIP_AGE_HOURS`,
 `--reap-abandoned-wip` unarmed),
 `withheld-by-abstention` (a stash ENTRY names the branch — a stash entry is released by nothing, so
-this reason covers BOTH the dirty-tree class and an `interrupted-add` record, whose add never returned
-but whose parked work survived it), and `ignored-data-held` (the tree holds
+this reason covers the dirty-tree class, the clean `ghost-zero-ahead` class AND an `interrupted-add`
+record, whose add never returned but whose parked work survived it), and `ignored-data-held` (the tree holds
 **non-regenerable ignored data** past the WIP floor — `ignored-artifact` is the largest preserve
 bucket measured in a real pass, `reasons=ignored-artifact:70`, 20,557 MB, so it is the same
 "blocked for ever" shape; it is named, never auto-released). The three floors a row can name are

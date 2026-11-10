@@ -140,13 +140,21 @@
 # can be asserted from here: a record it RELEASES is removed AND its 0-ahead lane ref deleted, so the
 # issue it named is dispatchable again on the next pre-flight; a record it does NOT release is either
 # inside its floor (nothing to assert yet — the next sweep acts) or on the STALLED list, NAMED with
-# the issue, its age, the class floor it is at or past, and the reason no later pass will move it.
+# its class, its age, the class floor it is at or past, and the reason no later pass will move it —
+# plus the ISSUE whose branch it holds, except where the branch carries no issue number at all
+# (`issue=?`; reachable under a `REAP_WT_LANE_BRANCH_RE` override, stated at the token and in the
+# legend, so this sentence must not promise more than the row prints).
 #
 # WHAT PUTS A RECORD ON THE LIST — only 0-commits-ahead lane residue (`refs=merged`, i.e. the branch
 # holds no commit the main ref does not), PAST its class floor, and only when this pass could not
 # release it:
 #   * `--reap-abandoned-wip` unarmed and a dirty tree past the WIP floor => why=opt-in-off
-#   * the stash / unpushed abstention withheld it, past the floor        => why=withheld-by-abstention
+#   * the STASH abstention withheld it, past the floor                      => why=withheld-by-abstention
+#     ⛔ ONLY THE STASH ARM EARNS THAT TOKEN, and the header said "stash / unpushed" for ten rounds
+#     (review round 12, PR #3881). `abstain_gate` appends the token in its stash arm alone (`:3493`);
+#     its unpushed arms deliberately carry none — `unpushed-unverifiable` abstains without one, and the
+#     readable `unpushed=N` arm "decides nothing" and returns 1, so the row is released. Naming the
+#     unpushed arm here described a `why=` value no code path can produce.
 #   * the tree holds NON-REGENERABLE IGNORED data, past the WIP floor    => why=ignored-data-held
 #     (no flag moves that class at all — `--reap-abandoned-wip` only enters the DIRTY case — so it is
 #     the same "blocked for ever" shape, and `ignored-artifact` was measured as the largest preserve
