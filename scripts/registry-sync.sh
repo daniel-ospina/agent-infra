@@ -197,7 +197,7 @@ git_b() { # <git args…>
 # class and leaves literal garbage in the value (reproduced). The three trims are order-independent:
 # each takes the prefix before the first occurrence of its own character.
 field() { # <file> <name>
-  local f="$1" n="$2" l1="" l2="" l2_rc=0 rest tailp after
+  local f="$1" n="$2" l1="" l2="" l2_rc=0 rest tailp after keytok
   [ -f "$f" ] || return 0
   { IFS= read -r l1 || :; IFS= read -r l2; l2_rc=$?; } < "$f" 2>/dev/null
   case "$l1" in
@@ -220,7 +220,23 @@ field() { # <file> <name>
           *'{'*|*'}'*|*'['*|*']'*|*\\*) ;;
           *)
             case "$l1" in *"\"$n\":"*) ;; *) return 0 ;; esac
-            rest="${l1##*"\"$n\":"}"    # greedy-LAST occurrence — on a flat line, THE top level
+            # ⛔ A KEY WITH WHITESPACE BEFORE ITS COLON IS THE READER'S. JSON permits `"k" :`, so the
+            # exact-byte scan cannot tell where the key ends — it would read the field as EMPTY (a
+            # false block on a perfectly valid record). One bracket expression routes the whole shape
+            # to the strict parse.
+            case "$l1" in *"\"$n\""[[:space:]]*) _field_json "$f" "$n"; return 0 ;; esac
+            # ⛔ A DUPLICATE KEY IS THE READER'S TOO. The last-match scan is only the reader's answer
+            # when there IS one occurrence; JSON permits a repeat, `json.load` takes the LAST, and a
+            # repeat written in a form this scan cannot see (`"repo" :`) would silently take an
+            # EARLIER one — rule 3 then published a record under a key its own strict fields deny
+            # (measured). Two suffix/prefix trims detect a repeat without looping, and ANY repeat is
+            # the strict parse's to resolve.
+            keytok="\"$n\":"
+            case "$l1" in
+              "${l1%%"$keytok"*}""$keytok""${l1##*"$keytok"}") ;;
+              *) _field_json "$f" "$n"; return 0 ;;
+            esac
+            rest="${l1##*"$keytok"}"    # greedy-LAST occurrence — on a flat line, THE top level
             # ⛔ THE VALUE MUST START AT THE COLON with an actual JSON scalar. `json.dumps`'s DEFAULT
             # separators emit `": "`, and a prefix trim does NOT skip whitespace — so a spaced record
             # read back as a single SPACE: non-empty (every unreadable guard passed) and sorting BELOW
@@ -241,6 +257,12 @@ field() { # <file> <name>
                 esac ;;
               -[0-9]*|[0-9]*)
                 rest="${rest%%[,]*}"; rest="${rest%%\}*}"
+                # ⛔ A NUMBER IS `-?[0-9]+`, NOT WHATEVER THE TRIM LEFT. `2e3` and `-0` are legal JSON
+                # with a DIFFERENT numeric value than this text, and `read_record` prints json's
+                # (`2000.0`, `0`); anything that is not a canonical integer is the strict parse's.
+                case "$rest" in
+                  ''|*[!0-9-]*|-*[!0-9]*|-|-*|*--*) _field_json "$f" "$n"; return 0 ;;
+                esac
                 printf '%s' "$rest"; return 0 ;;
             esac
             _field_json "$f" "$n"; return 0 ;;
@@ -731,6 +753,17 @@ supersedes() {
 
 push_one() { # <key> <source-file>
   local key="$1" f="$2" lat cs exp rc blob tree commit attempt
+  # ⛔ NOBODY MAY PUBLISH A RECORD THE READER REFUSES (#2510 review round 5). Pull-side usability was
+  # gated from the start; push-side was not, so a single-line record the strict parser rejects (a
+  # trailing comma, or valid JSON with no 40-hex `head_sha`) was published to the SHARED store at rc 0
+  # with `unreadable=0`, and every peer then sat at exit 4 for ever — one record per PR, no delete
+  # path, so the fleet's only copy is unreadable. `record_usable` IS the reader's definition; the
+  # converged pre-pass skips untouched records before this point, so the extra `python3` is paid only
+  # for records that are actually being published.
+  if ! record_usable "$f"; then
+    warn "  ⚠️ skip $key — this box's record is not one the fleet's rail can USE (no 40-hex head_sha, no verdict, or not strict JSON); publishing it would leave every peer unable to read this key."
+    UNREADABLE=$((UNREADABLE + 1)); LOCAL_UNUSABLE=$((LOCAL_UNUSABLE + 1)); return 0
+  fi
   lat="$(field "$f" reviewed_at)"
   if [ -z "$lat" ]; then
     warn "  ⚠️ skip $key — the local record carries no readable reviewed_at, so no ordering rule can be applied to it."

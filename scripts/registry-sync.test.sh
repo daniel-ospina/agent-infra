@@ -996,6 +996,57 @@ fi
 N7_OUT="$(mini_rs "$NEST7D" push)"
 assert_contains "$N7_OUT" "pushed $NEST_KEY" "§29f a legal JSON escape is decoded, so its key is accepted (not mis-keyed)"
 assert_not_contains "$N7_OUT" "not this key" "§29f ...and the run did not report a key mismatch"
+# §29g — a DUPLICATE key, the last one written with whitespace before its colon (legal JSON). `json.load`
+# takes the LAST; an exact-byte last-match scan cannot see this form and takes an EARLIER one, so rule 3
+# published a record under a key its own strict fields DENY (round 5, measured end-to-end).
+NEST8D="$MINI_ROOT/box8"; mkdir -p "$NEST8D"
+printf '{"pr":2374,"repo":"daniel-ospina/agent-infra","repo" :"other/repo","head_sha":"%s","mint":"fresh","verdict":"clean","reviewed_at":"2026-10-29T00:00:00Z"}\n' \
+  "$HEAD_A" > "$NEST8D/$NEST_KEY.json"
+if python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repo"])' "$NEST8D/$NEST_KEY.json" 2>/dev/null | grep -q '^other/repo$'; then
+  ok "§29g (premise) the strict reader takes the LAST duplicate (repo=other/repo)"
+else
+  bad "§29g (premise) the fixture does not have the duplicate shape the arm needs"
+fi
+N8_OUT="$(mini_rs "$NEST8D" push)"
+assert_not_contains "$N8_OUT" "pushed $NEST_KEY" "§29g a DUPLICATE key is resolved by the reader, so the record is refused rather than published"
+assert_not_contains "$N8_OUT" "pushed " "§29g ...and nothing at all was published"
+# §29n — a repeat in the EXACT byte form. `json.load` takes the LAST, and this scan's greedy `##*` does
+# too; the arm pins that direction, because taking the FIRST would key the record by the earlier value
+# while every reader used the later one (rule 3 publishes under a key its own fields deny).
+NESTCD="$MINI_ROOT/boxc"; mkdir -p "$NESTCD"
+printf '{"pr":2374,"repo":"daniel-ospina/agent-infra","repo":"other/repo","head_sha":"%s","mint":"fresh","verdict":"clean","reviewed_at":"2026-11-01T00:00:00Z"}\n' \
+  "$HEAD_A" > "$NESTCD/$NEST_KEY.json"
+NC_OUT="$(mini_rs "$NESTCD" push)"
+assert_not_contains "$NC_OUT" "pushed $NEST_KEY" "§29n a plain duplicate key is resolved to the LAST occurrence, as the reader does"
+# §29i — `null` is not a timestamp. The literal text sorts ABOVE every real stamp (`'n' > '2'`), so reading
+# it as `null` made a record with no stamp win the ordering instead of being unreadable.
+NEST9D="$MINI_ROOT/box9"; mkdir -p "$NEST9D"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":null}\n' \
+  "$HEAD_A" > "$NEST9D/$NEST_KEY.json"
+N9_OUT="$(mini_rs "$NEST9D" push)"
+assert_contains "$N9_OUT" "no readable reviewed_at" '§29i "reviewed_at":null is UNREADABLE, not the literal text null'
+assert_not_contains "$N9_OUT" "pushed $NEST_KEY" '§29i ...so it is never published'
+# §29m — NOTHING MAY BE PUBLISHED THAT THE READER REFUSES. Pull-side usability was gated from the start;
+# push-side was not, so a SINGLE-LINE record the strict parser rejects was published to the SHARED store at
+# rc 0 with `unreadable=0` — and every peer then sat at exit 4 for ever (one record per PR, no delete path,
+# round 5). A trailing comma is the shape: the fast path reads every field, `json.load` refuses the file.
+NESTAD="$MINI_ROOT/boxa"; mkdir -p "$NESTAD"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-30T00:00:00Z",}\n' \
+  "$HEAD_A" > "$NESTAD/$NEST_KEY.json"
+if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$NESTAD/$NEST_KEY.json" 2>/dev/null; then
+  bad "§29m (premise) the fixture parses — it must NOT (a trailing comma)"
+else
+  ok "§29m (premise) the strict reader REFUSES the fixture"
+fi
+NA_OUT="$(mini_rs "$NESTAD" push)"
+assert_not_contains "$NA_OUT" "pushed $NEST_KEY" "§29m a record the strict reader refuses is NOT published to the shared store"
+assert_contains "$NA_OUT" "not one the fleet's rail can USE" "§29m ...and the refusal NAMES usability, not the ordering"
+# ...and the same for a VALID record this box's rail cannot use (no 40-hex head_sha).
+NESTBD="$MINI_ROOT/boxb"; mkdir -p "$NESTBD"
+printf '{"pr":2374,"head_sha":"nope","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-31T00:00:00Z"}\n' \
+  > "$NESTBD/$NEST_KEY.json"
+NB_OUT="$(mini_rs "$NESTBD" push)"
+assert_not_contains "$NB_OUT" "pushed $NEST_KEY" "§29m a valid-json record with no usable head_sha is NOT published either"
 
 # ═══ 30. the compare+write lock: reclaimed in every dead-holder shape, bounded in every arm ══
 # Review findings P2 (two of them) on PR #3894 — `git grep 'reg_lock' -- scripts/*.test.sh` had NO
@@ -1077,8 +1128,9 @@ fi
 # it. `reg_unlock` now removes only a lock whose `pid` is its own, so a wrong comparison (or a release
 # that skips removal) would leave the lock behind on every pull — and the next run would then see a
 # dead-pid lock. Asserted on the run that just reclaimed and pulled.
+lock_reset
 if [ -d "$LKD/.registry-sync.lock" ]; then
-  bad "§30f a successful pull RELEASED its lock (a leftover would make the next run wait 2 s for a dead holder)"
+  bad "§30f a successful pull RELEASED its lock (a leftover would make the next run wait for a dead holder)"
 else
   ok "§30f a successful pull RELEASED its lock (the ownership check still matches our own pid)"
 fi
@@ -1174,6 +1226,11 @@ rm -rf "$LKD/.registry-sync.lock"; lock_reset
 # (round 4: dropping the age gate left the suite green). Only elapsed time may break the ambiguous shape.
 lock_reset
 mkdir -p "$LKD/.registry-sync.lock"     # no pid file, and NO touch: this lock is seconds old
+J_AGE="$(python3 -c 'import os,sys,time; print(int(time.time()-os.stat(sys.argv[1]).st_mtime))' "$LKD/.registry-sync.lock" 2>/dev/null)"
+case "$J_AGE" in
+  0|1) ok "§30j (premise) the pid-less lock is YOUNGER than the grace (${J_AGE}s), so the ceiling is the only arm that could reclaim it" ;;
+  *) bad "§30j (premise) the fixture is not fresh (${J_AGE}s) — the arm would not discriminate" ;;
+esac
 J_OUT="$(mini_rs "$LKD" pull)"; J_RC=$?
 assert_eq "$J_RC" "1" "§30j a FRESH pid-less lock is NOT reclaimed (it is a live acquirer's mkdir-to-pid window)"
 assert_contains "$J_OUT" "could not serialise" "§30j ...and the run refuses instead of writing"
@@ -1186,8 +1243,8 @@ rm -rf "$LKD/.registry-sync.lock"
 # holder's lock on the first failed probe (round 4). Pinned with a `ps` that can never answer; where
 # /proc exists it PROVES the holder is alive, and where it does not the answer is "unknown", which
 # routes to the ceiling instead of the 2 s grace. Either way the lock is kept.
-SHIM_K="$T/shim-k"; mkdir -p "$SHIM_K"
-printf '#!/bin/sh\nexit 1\n' > "$SHIM_K/ps"; chmod +x "$SHIM_K/ps"
+SHIM_K="$T/shim-k"; mkdir -p "$SHIM_K"; : > "$T/k.called"
+printf '#!/bin/sh\nprintf x >> "%s"\nexit 1\n' "$T/k.called" > "$SHIM_K/ps"; chmod +x "$SHIM_K/ps"
 lock_reset
 mkdir -p "$LKD/.registry-sync.lock"; printf '1\n' > "$LKD/.registry-sync.lock/pid"
 # 60 s: past the 2 s grace (so a `gone` verdict WOULD reclaim it — that is the mutation) and far below the
@@ -1196,8 +1253,23 @@ AGE60="$(python3 -c 'import time;print(time.strftime("%Y%m%d%H%M.%S", time.local
 touch -t "$AGE60" "$LKD/.registry-sync.lock"
 K_OUT="$(PATH="$SHIM_K:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 600 2>&1)"; K_RC=$?
 assert_eq "$K_RC" "1" "§30k a lock whose holder a BLIND ps cannot see is NOT reclaimed (the probe cannot answer)"
+if [ -s "$T/k.called" ]; then ok "§30k (premise) the blind ps WAS consulted (the arm is not vacuous)"; else bad "§30k (premise) the ps shim never ran — the arm proves nothing"; fi
 if [ -d "$LKD/.registry-sync.lock" ]; then ok "§30k ...the live holder's lock is still there"; else bad "§30k ...the lock was STOLEN on an unanswered probe"; fi
 assert_contains "$K_OUT" "could not serialise" "§30k ...and the run fails closed rather than writing"
+rm -rf "$LKD/.registry-sync.lock"; lock_reset
+# (l) AN UNDATEABLE LOCK IS NEVER RECLAIMED. Every reclaim arm keys on elapsed time, so when no `stat` can
+# answer there is NO evidence the holder is gone — stealing it would reopen the compare+write race on the
+# strength of a failed measurement (round 5: the guard could be inverted with the suite green). Pinned
+# with a `stat` that can never answer.
+SHIM_L="$T/shim-l"; mkdir -p "$SHIM_L"; : > "$T/l.called"
+printf '#!/bin/sh\nprintf x >> "%s"\nexit 1\n' "$T/l.called" > "$SHIM_L/stat"; chmod +x "$SHIM_L/stat"
+lock_reset
+mkdir -p "$LKD/.registry-sync.lock"; printf '999999\n' > "$LKD/.registry-sync.lock/pid"
+L_OUT="$(PATH="$SHIM_L:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 30 2>&1)"; L_RC=$?
+assert_eq "$L_RC" "1" '§30l a lock no stat can date is NOT reclaimed (a failed measurement is not evidence)'
+if [ -s "$T/l.called" ]; then ok "§30l (premise) the failing stat WAS consulted (the lock really was undateable)"; else bad "§30l (premise) the stat shim never ran — the arm proves nothing"; fi
+if [ -d "$LKD/.registry-sync.lock" ]; then ok "§30l ...the lock is still there"; else bad "§30l ...the undateable lock was STOLEN"; fi
+assert_absent "$LKD" "$LKD/$LCK_KEY.json" "§30l ...and nothing was written without it"
 rm -rf "$LKD/.registry-sync.lock"; lock_reset
 
 # ═══ 31. this box's record is NEWER but UNUSABLE — named, not silently kept for ever ══════
