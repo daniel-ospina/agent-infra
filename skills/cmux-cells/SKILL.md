@@ -286,7 +286,9 @@ derived first and refuses there — so it is the test seam's twin of this arm, s
 **rc=2, a read that did not resolve** (`UNREADABLE open-PR count` / `UNREADABLE landing rate` — each carries "(the gh read
 failed)"; a third line, `UNREADABLE landing counts for …`, guards counts that do not parse, but `land_backlog_lands` returns
 1 on any read failure and otherwise prints two integers it built itself, so that guard **cannot fire today** — do not
-diagnose a 74 as a parse problem) — **env-local, NOT box-local, and the gate now names which cause it is.** Two arms: (a) the gh chain failed while the
+diagnose a 74 as a parse problem) — **env-local, NOT box-local, and the gate now names which cause it is.** Two arms of a NAMED CAUSE — a third line, `⛔ BUT FIRST: this lane's gh credential could
+NOT be resolved either (state=unresolved)`, prefixes the ratio remedy when the credential instrument is absent, and names no cause
+because it could not read one: (a) the gh chain failed while the
 lane's gh IS credentialed — fix that box's chain; (b) **no credential at all resolved for the lane**, because nothing set
 `GH_CONFIG_DIR` while `HOME` is redirected to the cell home (agent-infra#2509) — measured on `pi-cell-4` and `pi-cell-5`,
 **byte-identical refusals**, so **a re-dispatch to another healthy box does NOT clear it**: every cell redirects `HOME` the

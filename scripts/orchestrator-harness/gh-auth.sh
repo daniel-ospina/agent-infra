@@ -99,11 +99,19 @@
 # read, only absolute-path values are accepted, and an unparseable value is treated as ABSENT (never as
 # an empty export that would hide a real one).
 #
-# ⛔ POLARITY: A REFUSAL IS ONLY EVER BUILT FROM A POSITIVE READING. `gh_auth_cause` speaks only when it
-# can SEE the absence — no token value in the environment AND no `hosts.yml` in any directory gh would
-# look in. An unreadable passwd record, a missing `keys.env`, or an env value it cannot parse yields a
-# SKIPPED reading, never a claimed cause: our own inability to read a datum must not become a refusal
-# loop that stops the fleet (the same rule `key-gate.sh` and `wt_spawn`'s credential gate state).
+# ⛔ POLARITY: A REFUSAL IS ONLY EVER BUILT FROM A POSITIVE READING — and the claim is narrower than
+# "we only speak when every source was read", so it is stated as what it is. THERE IS NO `skipped`
+# STATE: `gh_auth_resolve` answers one of eleven states and none of them means "could not look". An
+# input we cannot read makes THAT SOURCE CONTRIBUTE NOTHING and the read continues over the sources
+# that did resolve — `_gh_auth_file_value` returns 1 for an absent, unreadable, unparseable or
+# non-absolute assignment (a missing `keys.env` is not even a lost reading: there was nothing to
+# read), and `gh_auth_account_home` answers empty when the passwd record cannot be read. Where that
+# leaves the read at `none`, the cause IS spoken, and it names only what was CHECKED: with an
+# unresolvable account home the text prints `<unresolved account home>` in place of that path, so a
+# refusal never asserts a directory was checked when it was not. What the polarity rule forbids, and
+# what the code does honour, is the other direction: we never claim a cause the read CONTRADICTS — no
+# cause while a token value or a readable `hosts.yml` exists (the same rule `key-gate.sh` and
+# `wt_spawn`'s credential gate state).
 
 # gh_auth_token_state — gh's OWN precedence across the two token names, decided ONCE: `<state>|<NAME>`.
 #   token|<NAME>        the first NAME gh would use holds a real (non-blank) value
@@ -337,8 +345,10 @@ gh_auth_log() {
 
 # gh_auth_cause <lane-home> [env-file] [account-home] — the CAUSE + REMEDY, or EMPTY when a credential
 # resolves (in which case the caller must NOT blame the credential).
-# ⛔ IT SPEAKS ONLY ON A POSITIVE READING (see POLARITY above): `none` means every directory gh would
-# look in was CHECKED and holds no hosts.yml, and no token name holds a value.
+# ⛔ IT SPEAKS ONLY ON A POSITIVE READING (see POLARITY above): `none` means every directory this read
+# COULD REACH holds no hosts.yml and no token name holds a value. The account home is the one stop it
+# may be unable to reach (an unreadable passwd record); the text then prints `<unresolved account
+# home>` in place of that path rather than asserting it was checked.
 gh_auth_cause() {
   local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" r st d
   [ -n "$ef" ] || ef="${ENV_FILE:-${home}/keys.env}"
