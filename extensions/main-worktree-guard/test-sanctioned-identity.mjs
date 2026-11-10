@@ -66,7 +66,7 @@
 import { execSync } from "node:child_process";
 import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
 import { closureOf, computePin, diskTree, gitTree, parseRefArg, pinReport, sanctionedPaths } from "./sanctioned-pin-tree.mjs";
@@ -74,6 +74,7 @@ import { closureOf, computePin, diskTree, gitTree, parseRefArg, pinReport, sanct
 const HERE = realpathSync(fileURLToPath(new URL(".", import.meta.url)));
 const REPO = realpathSync(join(HERE, "..", ".."));
 const PIN_JSON = join(HERE, "sanctioned-scripts.pin.json");
+const PIN_REL = relative(REPO, PIN_JSON);
 const HOOKS = new URL("./module-load-hooks.mjs", import.meta.url).href;
 
 // `--ref <rev>` selects the COMMIT freshness is judged on (#2818). Absent ⇒ the
@@ -133,6 +134,17 @@ const SANCTIONED = TREE_ERROR ? [] : sanctionedPaths(TREE);
 // LOCATION is part of the program that runs, so it is part of the identity
 // (`sanctioned-pin-tree.mjs` carries the pattern and the reasoning).
 const closure = () => closureOf(TREE, SANCTIONED);
+
+/** Bytes of `rel` from the tree UNDER TEST — the SAME tree the pin is read from
+ *  (#2818). Absent `--ref` this is the working tree, i.e. byte-identical to the
+ *  pre-existing behaviour; with `--ref` it is that commit's blob. Throws rather
+ *  than degrading to the checkout: a fixture that cannot read its own reference
+ *  must not silently measure some OTHER tree (the inert-gate failure mode). */
+function treeBytes(rel) {
+  const b = TREE.read(rel);
+  if (b === null) throw new Error(`${rel} is not present in ${TREE.label}`);
+  return b;
+}
 
 // ── --cut: regenerate the pin from THIS checkout ──────────────────────────
 function cut() {
@@ -218,8 +230,7 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     for (const f of readdirSync(HERE)) {
       if (/\.(ts|mjs|json)$/.test(f) && !f.startsWith("test")) copyFileSync(join(HERE, f), join(dir, f));
     }
-    const mutations = mutate === null ? [] : (Array.isArray(mutate) ? mutate : [mutate]);
-    if (mutations.length) {
+    const mutations = mutate === null ? [] : (Array.isArray(mutate) ? mutate : [mutate]);    if (mutations.length) {
       let src = readFileSync(join(dir, "index.ts"), "utf-8");
       for (const m of mutations) {
         const hits = src.split(m.from).length - 1;
@@ -235,6 +246,22 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     // the whole extensions tree, so the copy has to as well.
     cpSync(join(HERE, "..", "shared"), join(root, "extensions", "shared"), { recursive: true });
     mkdirSync(join(root, ".pi", "agent"), { recursive: true });
+    // ⛔ THE PIN THE GUARD LOADS IS THE JUDGED COMMIT'S PIN, NOT THE CHECKOUT'S
+    // (#2818). `_sanctionedScriptPin()` captures the pin from the module's own
+    // directory AT LOAD, so whichever file lands here decides every exemption
+    // below. In a PR job the checkout is GitHub's synthetic MERGE of head onto
+    // the base TIP: when THIS branch re-cuts the pin and `main` has meanwhile
+    // moved a delegate, the merge result carries this branch's pin beside main's
+    // script — internally inconsistent, so a perfectly valid rail is refused and
+    // the suite reds for a reason that has nothing to do with the change.
+    // MEASURED (PR #3899): `main`'s c903c7543 moved `scripts/gh-shim/gh`, the
+    // merge result paired head's pin (def5111b…, gh-shim/gh at head) with main's
+    // bytes (e1505380…), and the surface read (a) BLOCKED + (d3) inverted —
+    // 22 passed / 2 failed, on a diff that touches neither file. Writing TREE's
+    // pin, together with TREE's script bytes below, keeps the two halves of the
+    // identity in ONE commit — the rule the freshness arm at (f) already obeys.
+    const pinBytes = TREE.read(PIN_REL);
+    if (pinBytes !== null) writeFileSync(join(dir, "sanctioned-scripts.pin.json"), pinBytes);
     return pathToFileURL(join(dir, "index.ts")).href;
   }
 
@@ -250,13 +277,16 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
    *  its own location) into a fixture root — arm 2 verifies the whole program,
    *  so a root with only the leaf is (correctly) not exempt. */
   function installClosure(root, override = {}) {
+    // The DELEGATE LIST and the audited BYTES both come from the judged tree,
+    // for the same reason `deploy` writes that tree's pin: a list from one
+    // commit and bytes from another is exactly the mix #2818 removes.
     let pin = {};
-    try { pin = JSON.parse(readFileSync(PIN_JSON, "utf-8")).delegates ?? {}; } catch { pin = {}; }
+    try { pin = JSON.parse(treeBytes(PIN_REL).toString("utf8")).delegates ?? {}; } catch { pin = {}; }
     for (const rel of Object.keys(pin)) {
       const dest = join(root, rel);
       mkdirSync(dirname(dest), { recursive: true });
       if (override[rel] !== undefined) writeFileSync(dest, override[rel]);
-      else copyFileSync(join(REPO, rel), dest);
+      else writeFileSync(dest, treeBytes(rel));
     }
     return Object.keys(pin);
   }
@@ -290,7 +320,10 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     const fw = join(work, "framework");
     framework(fw);
     mkdirSync(join(fw, "scripts"), { recursive: true });
-    copyFileSync(join(REPO, "scripts", "admin-merge.sh"), join(fw, "scripts", "admin-merge.sh"));
+    // The audited RAIL bytes come from the SAME tree the pin comes from — see
+    // `deploy`'s note: the checkout is a synthetic merge in a PR job, so its
+    // `scripts/` can come from a different commit than this branch's pin.
+    writeFileSync(join(fw, "scripts", "admin-merge.sh"), treeBytes("scripts/admin-merge.sh"));
     installClosure(fw);
 
     const bash = async (toolCall, command, cwd) => {

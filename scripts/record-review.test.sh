@@ -436,6 +436,7 @@ if [ "$1" = "api" ]; then
                 404) _why="Not Found" ;;
                 422) _why="Unprocessable Entity" ;;
                 403) _why="API rate limit exceeded" ;;
+                401) _why="Bad credentials" ;;
                 5*)  _why="Server Error" ;;
                 *)   _why="Error" ;;
             esac
@@ -1451,6 +1452,23 @@ STUB_META_HTTP=403 STUB_BODY="Fixes #424372" STUB_LABELS="complexity:micro" run_
 [ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424372.json" ] && ok "8.16 unreadable: the 403-meta record IS written" || bad "8.16 unreadable: a 403 meta read stranded a legitimate record"
 assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 403-meta warning names the READ failure"
 assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 403 meta read is NOT reported as an uncertifiable payload"
+
+# UNREADABLE (401) — THE DESIGNED EXCLUSION, PINNED. `record-review.sh`'s
+# `http_refused` states in the strongest terms that `401` is deliberately
+# TRANSPORT, not a refusal: a credential failure is not evidence about THIS PR,
+# and treating it as one would refuse every record in the fleet at once (the
+# mass false-block #2511's reviewers named). Until this vector nothing pinned it
+# — every status-bearing meta vector used 403/404/422/502/503 — so widening the
+# positive list to `HTTP (401|404|422)` (a one-character edit an "auth failures
+# should not certify a surface" argument invites) would convert EVERY clean-micro
+# record in the fleet into an exit-4 refusal with both suites still GREEN. #2628
+# is what makes it reachable: before it the `pulls` read had no classifier at
+# all, so a 401 there could not refuse anything.
+STUB_META_HTTP=401 STUB_BODY="Fixes #424374" STUB_LABELS="complexity:micro" run_micro_verdict 424374
+[ "$RECORD_RC" = "0" ] && ok "8.16 unreadable: a bad-credential meta read (401) PROCEEDS (rc 0)" || bad "8.16 unreadable: a 401 meta read must proceed, not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424374.json" ] && ok "8.16 unreadable: the 401-meta record IS written" || bad "8.16 unreadable: a 401 meta read stranded a legitimate record"
+assert_contains "$RECORD_ERR" "could not read the changed paths" "8.16 unreadable: the 401-meta warning names the READ failure"
+assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 401 meta read is NOT reported as an uncertifiable payload"
 
 # REFUSED (pulls 404) — THE #2628 FINDING ITSELF. The API ANSWERED and refused to
 # describe this PR (a nonexistent PR, a PR this token cannot see, a deleted or
@@ -3039,7 +3057,7 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:6583 at this head — RE-DERIVE it, do not trust the number: a bare
+#      (scripts/record-review.sh:6594 at this head — RE-DERIVE it, do not trust the number: a bare
 #      line citation here has rotted before, and this comment is not what makes
 #      the assertion true). One command answers it (origin/main bd1b205d is :6225):
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
@@ -5849,13 +5867,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2801 :4527 :6901 :7075, plus a comment mention at :2670; `14.1c-CITE` below
+#     CITE-CHECK: :2812 :4538 :6912 :7086, plus a comment mention at :2681; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:2725) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :2801) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :2812) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6901). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6912). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5881,7 +5899,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:6901` / `:7075` — CITE-CHECK: :6901 :7075 — re-derived by the
+#     this head the predicates are `:6912` / `:7086` — CITE-CHECK: :6912 :7086 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -5998,7 +6016,7 @@ assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marke
 #      previously claimed "`-qxF`->`-qF` at the dedup read left the suite at
 #      PASS=921 FAIL=0". THERE IS NO GREP AT THE DEDUP READ — not anchored, not
 #      unanchored: the loop compares whole bodies with `[ "$_body" = "$marker" ]`
-#      (scripts/record-review.sh:2723 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
+#      (scripts/record-review.sh:2734 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
 #      have been measured. The mutant that actually makes (b2) meaningful is replacing
 #      that equality with a SUBSTRING test (`case "$_body" in *"$marker"*)`): it
 #      reddens (b2) — which expects 1 POST and would get 0.
@@ -6790,7 +6808,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4527 :6901 :7075 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4538 :6912 :7086 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -9550,8 +9568,8 @@ targets = sys.argv[2:]
 # ⛔ A WHOLE-FILE LEXER WAS BUILT AND REJECTED — with the measurement, not as a preference.
 # Carrying quote state across lines is the only way to close the multi-line hole, and on the
 # REAL recorder it desyncs at `$(` inside a double-quoted string, because `$(` resets quoting:
-# the awk program at record-review.sh:2101 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
-# its own comment block across lines (`sed -n '2106,2115p'`), so a lexer that does not model `$(`
+# the awk program at record-review.sh:2112 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
+# its own comment block across lines (`sed -n '2117,2126p'`), so a lexer that does not model `$(`
 # re-opens a quote mid-program and reports those lines as live backticks — 26 false REDs over 12
 # lines in the prototype run (a COUNT, not a line map). Modelling `$(`,
 # `${`, `$'` and heredocs well enough to stay in sync is a bash lexer, which is a different

@@ -1924,7 +1924,13 @@ T30_META_404="$(FIX_META_RC=1 FIX_META_ERR='gh: Not Found (HTTP 404)' PATH="$T30
 [ "$T30_META_404" = "$(printf 'unclassified\t')" ] \
   && pass "(30xvii-c) a pulls-read HTTP 404 is UNCLASSIFIED — the API ANSWERED and REFUSED this PR, so it is positive evidence, not transport" \
   || fail "(30xvii-c) a pulls-read HTTP 404 was read as transport (got '$T30_META_404')"
-for _merr in 'gh: API rate limit exceeded for 1.2.3.4. (HTTP 403)' 'gh: Server Error (HTTP 502)' 'gh: Get "https://api.github.com/x": connection refused'; do
+# 401 is DELIBERATELY in this list, not an oversight: a credential failure is not
+# evidence about THIS PR, and calling it a refusal would refuse every record in the
+# fleet at once (the mass false-block #2511's reviewers named). It is pinned because
+# nothing else does — widening the classifier to `HTTP (401|404|422)` would strand
+# every clean-micro lane on a bad-credentials window and this loop is the only
+# assertion that reds.
+for _merr in 'gh: API rate limit exceeded for 1.2.3.4. (HTTP 403)' 'gh: Server Error (HTTP 502)' 'gh: Bad credentials (HTTP 401)' 'gh: Get "https://api.github.com/x": connection refused'; do
   T30_META_TRANS="$(FIX_META_RC=1 FIX_META_ERR="$_merr" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" \
     FIX_COUNT=1 FIX_ROWS="$(printf 'modified\tscripts/admin-merge.sh\t')" \
     HOME="$T30H" bash "$SRC" --print-tier 42 owner/repo 2>/dev/null)"
@@ -2860,7 +2866,7 @@ fi
 # `"delta_range":"30219358085b…0d.."` with an empty base, kind and digest beside a
 # `mint:"delta"` — a signed artifact claiming a reviewed range from the one verb whose
 # contract is that no reviewer ran.
-MIN_ASSERTIONS=218
+MIN_ASSERTIONS=219
 # #2628: 214 -> 218. The ``pulls`` read stopped discarding its HTTP status, so
 # the print-tier seam gained the (30xvii-c)/(30xvii-d) pair: a 404 on the PR read
 # is now `unclassified` (the API REFUSED this PR → positive evidence) and a

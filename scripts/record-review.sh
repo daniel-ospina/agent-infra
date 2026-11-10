@@ -856,8 +856,19 @@ review_surface_rows() {
     # No temp file (a read-only /tmp): fall back to the pre-#2628 posture. It is
     # strictly WORSE (a refusal reads as transport), so it is announced rather
     # than silent — an unannounced degradation is how this bug was invisible.
-    echo "⚠️ #2628: no temp file for the pulls-read status of ${repo}#${pr} — a REFUSED PR read cannot be told from a transport failure, so the surface cap is UNVERIFIED. Fix mktemp/TMPDIR to restore the refusal arm." >&2
-    meta="$(command gh api "repos/$repo/pulls/$pr" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null)" || return 1
+    # ⛔ THE ANNOUNCEMENT RIDES THE FAILURE, NOT THE BRANCH. The fallback read is
+    # the PRE-#2628 read: on a healthy `/tmp`-less run it SUCCEEDS and the rows
+    # are certified exactly as on the temp-file arm. Warning before the read
+    # therefore printed "the surface cap is UNVERIFIED" on runs where the cap was
+    # fully verified — which is the very thing this comment exists to prevent,
+    # inverted: a signal that fires on healthy runs stops distinguishing the real
+    # degradation, and it fired for BOTH callers including the machine-consumed
+    # `--print-tier` seam. Announcing only with the `return 1` keeps the message
+    # true of every run that prints it.
+    meta="$(command gh api "repos/$repo/pulls/$pr" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null)" || {
+      echo "⚠️ #2628: no temp file for the pulls-read status of ${repo}#${pr} — a REFUSED PR read cannot be told from a transport failure, so the surface cap is UNVERIFIED. Fix mktemp/TMPDIR to restore the refusal arm." >&2
+      return 1
+    }
   fi
   head="$(printf '%s' "$meta" | cut -f1)"
   base="$(printf '%s' "$meta" | cut -f2)"
