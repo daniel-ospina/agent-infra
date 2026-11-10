@@ -1233,7 +1233,92 @@ assert_contains "$rep_body" "ln -s $HR/extensions/builtin-tools" "…and carries
 assert_contains "$rep_body" "worktree branch: wt/649rep" "…naming the branch the live runtime was executing"
 rm -rf "$HRWT"; rm -rf "$FARMREP"
 
-# ── 13. End of suite ─────────────────────────────────────────────────────
+# ── 13. #2329: the hub's origin is not a GitHub remote ─────────────────
+# The incident: a test suite repointed the SHARED git config of a hub at a throwaway bare
+# repo (`/tmp/vg-bare-claims.git`, and later `/tmp/rev3203/o-pyanchor.git`), so a lane's
+# `git push` printed `[new branch] … ->` and exited 0 while the commits landed in /tmp.
+# Nothing in this check read the origin URL, so the hub read PASS (clean, on main, current)
+# — a false PASS on exactly the state that hides itself (#1313's class).
+echo ""
+echo "== #2329: origin that is not a GitHub remote =="
+OHUB="$FIX/offsite-hub"
+OREMOTE="$FIX/offsite-origin.git"
+git init -q --bare -b main "$OREMOTE"
+git init -q -b main "$OHUB"
+git -C "$OHUB" config user.email t@t
+git -C "$OHUB" config user.name t
+echo base > "$OHUB/a.txt"
+git -C "$OHUB" add .
+git -C "$OHUB" commit -qm init
+# `upstream` (a real local bare) keeps the hub genuinely FRESH, so the only disorder under
+# test is the push target: `origin` is the /tmp fixture from the incident.
+git -C "$OHUB" remote add upstream "$OREMOTE"
+git -C "$OHUB" push -qu upstream main
+git -C "$OHUB" remote add origin /tmp/vg-bare-claims.git
+out="$(bash "$CHECK" --repo "$OHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a /tmp origin → exit 1 (the hub is otherwise clean, on main, current)"
+assert_eq "$(disorder_tok "$out")" "remote_offsite" "…and the ONLY token is remote_offsite"
+assert_contains "$out" "origin = /tmp/vg-bare-claims.git" "…naming the offending URL, not just the class"
+assert_contains "$out" "PUSH TARGET is not a GitHub remote" "…saying what the URL breaks (the push target)"
+assert_contains "$out" "git remote set-url origin https://github.com/<owner>/<repo>.git" "…and printing the repair"
+assert_contains "$out" "re-push it" "…and warning that the URL repair does NOT recover what was pushed"
+# …and the printed repair really is the fix: applying the canonical form returns PASS.
+git -C "$OHUB" remote set-url origin https://github.com/daniel-ospina/tortoise.git
+out="$(bash "$CHECK" --repo "$OHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "repointing origin at the GitHub remote returns the hub to PASS"
+assert_not_contains "$out" "remote_offsite" "…with no residual remote_offsite token"
+
+# The FORM table: every accepted GitHub spelling must be silent, everything else named. A
+# grammar that accepts `https://github.com` (no repo) is a false PASS on a URL a push cannot
+# land on; one that rejects `git@github.com:o/r.git` is a false FAIL on every real clone.
+for _form in \
+  https://github.com/daniel-ospina/tortoise.git \
+  http://github.com/daniel-ospina/tortoise.git \
+  https://user:tok@github.com/daniel-ospina/tortoise.git \
+  HTTPS://GitHub.COM/daniel-ospina/tortoise.git \
+  git@github.com:daniel-ospina/tortoise.git \
+  ssh://git@github.com/daniel-ospina/tortoise.git \
+  ssh://git@github.com:22/daniel-ospina/tortoise.git ; do
+  git -C "$OHUB" remote set-url origin "$_form"
+  out="$(bash "$CHECK" --repo "$OHUB" 2>&1)" && rc=0 || rc=$?
+  if [[ "$out" == *remote_offsite* ]]; then bad "accepted GitHub form flagged as offsite: $_form"; else ok "accepted GitHub form is not flagged: $_form"; fi
+done
+for _form in \
+  /tmp/rev3203/o-pyanchor.git \
+  file:///tmp/x.git \
+  https://gitlab.com/daniel-ospina/tortoise.git \
+  https://github.com \
+  https://github.com/ \
+  git@github.com: ; do
+  git -C "$OHUB" remote set-url origin "$_form"
+  out="$(bash "$CHECK" --repo "$OHUB" 2>&1)" && rc=0 || rc=$?
+  if [[ "$out" == *remote_offsite* ]]; then ok "offsite form named: $_form"; else bad "offsite form NOT flagged: $_form"; fi
+done
+git -C "$OHUB" remote set-url origin /tmp/vg-bare-claims.git
+
+# An ABSENT origin is NOT this class: there is no push target to mislead, and the freshness
+# classes already cover it. (Without this arm a future refactor could make `remote_offsite`
+# fire on every repo that has only an `upstream`, which is the green-on-nothing inversion.)
+git -C "$OHUB" remote remove origin
+out="$(bash "$CHECK" --repo "$OHUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a hub with no origin at all is not a remote_offsite FAIL"
+git -C "$OHUB" remote add origin /tmp/vg-bare-claims.git
+
+# The --gh-report leg must NOT try to file against the garbage slug the sed would build
+# (`/tmp/vg-bare-claims.git` → `tmp/vg-bare-claims`) and then report a misleading "issue create
+# failed": it says the real cause and files nothing. No fallback remote is invented.
+echo ""
+echo "== #2329: --gh-report cannot file an offsite-origin FAIL (and says so) =="
+: > "$GH_STUB_LOG"
+rm -f "$GH_EXISTING"
+out="$(bash "$CHECK" --repo "$OHUB" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "--gh-report with an offsite origin still exits 1"
+assert_contains "$out" "is not a GitHub remote — no repo slug resolves" "…naming why no issue can be filed"
+if [ -s "$GH_STUB_LOG" ]; then bad "…and makes NO gh call (it would target a garbage slug)"; else ok "…and makes NO gh call (it would target a garbage slug)"; fi
+assert_not_contains "$out" "issue create failed" "…instead of the misleading 'issue create failed'"
+git -C "$OHUB" remote set-url origin https://github.com/daniel-ospina/tortoise.git
+
+# ── 14. End of suite ─────────────────────────────────────────────────────
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -49,6 +49,21 @@
 #                Detected HERE, hub-side, because the fallback is undetectable from
 #                the worktree itself: inside a pre-commit hook `$PWD` and
 #                `git rev-parse --show-toplevel` are BOTH the hub (measured).
+#   remote_offsite  the hub's `origin` is NOT a GitHub remote — e.g. a throwaway bare
+#                repo under /tmp. Then every push, fetch and claim write from this
+#                hub reports SUCCESS against something that is not the repo, and the
+#                work is one temp-dir cleanup from gone (#2329: a test suite
+#                repointed the SHARED git config at `/tmp/vg-bare-claims.git` while a
+#                sub-agent ran, and a lane's `git push` printed `[new branch]` and
+#                landed nowhere; a second occurrence repointed it at
+#                `/tmp/rev3203/o-pyanchor.git`). Independent of the branch/freshness
+#                facts (it composes with them, like `dirty`), because a hub can be
+#                clean, on main and current while pointing at a /tmp fixture.
+#                The blast radius is why it is checked HERE: `remote.origin.url` lives
+#                in the COMMON git config, so one test process redirects every worktree
+#                and every concurrent lane of that hub. An ABSENT `origin` is not this
+#                class (no push target to mislead; the freshness classes cover it) —
+#                only a PRESENT, non-GitHub URL is.
 #
 # `off_main` suppresses the staleness class: a stranded branch's own tip is not
 # the hub's freshness.
@@ -161,6 +176,57 @@ filter_registered_worktrees() { # $1=repo-root ; stdin=porcelain ; stdout=porcel
       *) printf '%s\n' "$line" ;;
     esac
   done <<<"$porcelain"
+}
+
+# #2329 — THE PUSH TARGET, read from the hub's own config. Emits the `origin` URL when it is
+# not a GitHub remote, and nothing when it is (or when there is no `origin` at all).
+#
+# ⛔ WHY THIS IS A CONFIG READ AND NOT A `git remote get-url` SMELL TEST. The damage is not that
+# the URL is unusual, it is that the URL is a THROWAWAY: `git push` to a local bare repo exits 0
+# and prints `[new branch]`, `git ls-remote origin` then agrees (with the fixture), and the commit
+# exists only under /tmp. So the check must answer "is this a git HOST that is not this box's
+# scratch space", which is a host question — the path never participates.
+#
+# ACCEPTED FORMS (`github.com` host, case-insensitive, any userinfo, any port, and a path that
+# names BOTH an owner and a repo — `https://github.com` alone is not a remote):
+#   https://github.com/o/r(.git) · http://github.com/o/r(.git) · ssh://git@github.com[:port]/o/r(.git)
+#   git@github.com:o/r(.git)   (scp-like)
+# Anything else — a bare filesystem path, `file://`, another host, a URL whose host cannot be read —
+# is OFFSITE. The slug grammar itself is `scripts/lib/repo-set.sh`'s question (`_rs_origin_slug`,
+# which proves a checkout's origin NAMES a configured slug); this file answers the narrower one it
+# needs, without a python dependency, because it runs at every pi session start.
+remote_offsite_url() { # $1=hub → the off-GitHub origin URL on stdout; nothing when origin is GitHub/absent
+  local hub="$1" url rest host path
+  url="$(git -C "$hub" remote get-url origin 2>/dev/null || true)"
+  [[ -n "$url" ]] || return 0
+  case "$url" in
+    *://*)
+      rest="${url#*://}"          # [userinfo@]host[:port]/path
+      rest="${rest#*@}"            # userinfo is never part of the host
+      host="${rest%%/*}"           # host[:port]  (a URL with no path at all → whole host)
+      host="${host%%:*}"           # host
+      case "$rest" in */*) path="${rest#*/}" ;; *) path="" ;; esac
+      ;;
+    *:*)
+      host="${url%%:*}"            # scp-like: [user@]host:path
+      host="${host##*@}"
+      path="${url#*:}"
+      ;;
+    *)
+      printf '%s' "$url"           # a bare filesystem path names no host at all
+      return 0
+      ;;
+  esac
+  host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+  # A GitHub host is only HALF the answer: `https://github.com` (no path) names no repo, so a push
+  # to it could not land anywhere either. Require `owner/repo`, ignoring a trailing `.git` and slash.
+  path="${path%/}"
+  path="${path%.git}"
+  path="${path%/}"
+  if [[ "$host" == "github.com" && "$path" == */* && "${path#/}" != "" && "${path##*/}" != "" ]]; then
+    return 0
+  fi
+  printf '%s' "$url"
 }
 
 # #437 (C): disorder-aware recovery guidance. The old static hint
@@ -447,6 +513,25 @@ recovery_guide() {
     lines+=("Then restart pi. A deliberate preview of a branch's extension uses a SEPARATE")
     lines+=("farm root (PI_EXTENSIONS_DIR), never the live one — the live farm is what every")
     lines+=("session, lane and task child loads.")
+  fi
+  # #2329 — THE PUSH TARGET, appended INDEPENDENTLY of every class above. It is not a branch or
+  # freshness fact, so it composes with any of them: a hub that is clean, on main and current is
+  # exactly the state in which a /tmp `origin` is silent, because nothing else here reads the URL.
+  # Read the URL HERE (from $repo) rather than threading an 11th argument through this function and
+  # its --gh-report caller: both parse sites then get the same answer from the same reader.
+  local offsite
+  offsite="$(remote_offsite_url "$repo")"
+  if [[ -n "$offsite" ]]; then
+    lines+=("The hub's PUSH TARGET is not a GitHub remote: origin = $offsite")
+    lines+=("A push, fetch or claim write from this checkout reports SUCCESS against a remote that is")
+    lines+=("not the repo — so a lane's work lands nowhere (#2329: a test process repointed the SHARED")
+    lines+=("git config, which every worktree of this hub inherits, at a throwaway /tmp bare repo).")
+    lines+=("Point origin back at the GitHub remote, then confirm the real remote answers:")
+    lines+=("cd $repo && git remote set-url origin https://github.com/<owner>/<repo>.git")
+    lines+=("git -C $repo ls-remote origin refs/heads/main")
+    lines+=("⚠️  Repairing the URL does NOT recover work: every branch pushed while origin was offsite")
+    lines+=("   is NOT on the real remote — re-push it. The canonical slug, when this machine declares")
+    lines+=("   one, is in \$HOME/.config/orchestrator/repos.conf (scripts/lib/repo-set.sh).")
   fi
   # #431: an EMPTY array expands to an unbound variable under `set -u` on bash 3.2, so a
   # guide that produced no lines would abort its caller instead of reporting. Every class
@@ -910,6 +995,10 @@ for repo_arg in "${REPOS[@]}"; do
   # the state in which this class would otherwise be silent.
   FARM_WT="$(farm_worktree_links "$MAIN_REPO")"
 
+  # #2329 — the hub's push target. Read unconditionally for the same reason the farm check is:
+  # a clean, on-main, current hub is exactly the state in which an offsite `origin` is silent.
+  REMOTE_OFFSITE="$(remote_offsite_url "$MAIN_REPO")"
+
   disorder=""
   [[ $on_main -eq 0 ]] && disorder="off_main"
   [[ $dirty -eq 1 ]] && disorder="${disorder:+${disorder}+}dirty"
@@ -918,6 +1007,9 @@ for repo_arg in "${REPOS[@]}"; do
   # Appended LAST so every earlier token keeps its contiguous position — the gh-report
   # leg reads membership (`*dirty*`) and a PREFIX (`off_main*`), never a suffix.
   [[ -n "$FARM_WT" ]] && disorder="${disorder:+${disorder}+}farm_worktree"
+  # #2329 — appended AFTER farm_worktree, so every earlier token keeps its contiguous position
+  # (the gh-report leg reads membership and a PREFIX, never a suffix).
+  [[ -n "$REMOTE_OFFSITE" ]] && disorder="${disorder:+${disorder}+}remote_offsite"
   # Freshness fields appear only when an upstream was resolvable (a detached /
   # off-main / no-upstream FAIL has nothing to report here).
   fresh_fields=""
@@ -945,6 +1037,15 @@ if [[ $GH_REPORT -eq 1 && $FAIL -gt 0 ]]; then
   else
     for fail_line in "${FAIL_LINES[@]}"; do
       IFS='|' read -r repo_path disorder branch porcelain_count <<<"$fail_line"
+      # #2329 — an OFFSITE origin names no repo. The slug sed below would turn
+      # `/tmp/vg-bare-claims.git` into `tmp/vg-bare-claims`, and gh would then fail with a
+      # misleading "issue create failed". Name the real cause, and invent NO fallback remote
+      # here (Fix Broken Infrastructure: never silently switch the backend a report is filed
+      # against) — the FAIL is printed on the terminal, and by every session, until repaired.
+      if [[ "$disorder" == *remote_offsite* ]]; then
+        echo "⚠️  origin for $repo_path is not a GitHub remote — no repo slug resolves, so this FAIL cannot be filed on GitHub (printed here, and by every session, until origin is repaired)" >&2
+        continue
+      fi
       # Repo slug from the remote URL (https or ssh forms).
       slug="$(git -C "$repo_path" remote get-url origin 2>/dev/null | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git$##' || true)"
       if [[ -z "$slug" ]]; then
