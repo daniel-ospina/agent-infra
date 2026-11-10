@@ -637,6 +637,15 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
   LOCKDIR="$REG_DIR/.registry-sync.lock"
   LOCK_OWNED=0
   while [ "$i" -lt 50 ]; do
+    # ⛔ AN OUTSTANDING PUT-BACK BLOCKS ENTRY, and the test must come BEFORE the acquire attempt: the
+    # comment above promised "this run refuses to acquire while one is outstanding", but the loop tried
+    # `mkdir` first and consulted `claim_restore` only afterwards — so the moment the third acquirer
+    # released the name, the next iteration ACQUIRED with a live holder's lock still in debris, and the
+    # run then wrote beside it (measured, 3 of 4 runs; the warning was printed in the same run that
+    # entered). Two holders in the compare+write section is the rule-1 loss the lock exists for.
+    if [ -n "${PENDING_STALE:-}" ] && ! claim_restore; then
+      sleep 0.1; i=$((i + 1)); continue
+    fi
     if mkdir "$LOCKDIR" 2>/dev/null; then
       # ⛔ A LOCK WE CANNOT RECORD OURSELVES IN IS A LOCK WE CANNOT RELEASE. Swallowing a failed pid
       # write (`|| :`) and entering anyway leaked the lock permanently: `reg_unlock` removes only a lock
@@ -679,7 +688,6 @@ reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
         claim_stale "" "  ⚠️ reclaiming $LOCKDIR — no usable pid after ${age}s (its holder died before it could record itself)." || :
       fi
     fi
-    claim_restore || :
     sleep 0.1; i=$((i + 1))
   done
   # ⛔ MEMOISING THE FAILURE FIXED THE COST; IT DID NOT FIX THE DIAGNOSIS, and the diagnosis is what the

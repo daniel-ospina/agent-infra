@@ -1060,6 +1060,43 @@ PB_OUT="$(mini_rs "$PB_BOX" push)"; PB_RC=$?
 assert_eq "$PB_RC" "4" "§29q an UNREADABLE peer record cannot outrank this box's usable one (exit 4, not converged)"
 assert_contains "$PB_OUT" "not one this box's rail can USE" "§29q ...and the run NAMES the peer's record as unreadable"
 assert_not_contains "$PB_OUT" "the peer is NEWER" "§29q ...instead of claiming the peer is newer on bytes it cannot read"
+# §29r — A STRING VALUE RUNS TO ITS CLOSING QUOTE, NEVER TO THE FIRST `,`. With the old prefix trim a
+# verdict of `clean,partial` read as `clean`, so two same-stamp records that genuinely DISAGREE compared
+# `same` and rule 4's divergence was never reported (round 9: reverting it left the suite green).
+mini_fixture delim
+DL_BOX="$MINI_ROOT/box"; mkdir -p "$DL_BOX"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-05T00:00:00Z"}\n' \
+  "$HEAD_A" > "$DL_BOX/$NEST_KEY.json"
+DL_PEER="$T/delim.peer"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean,partial","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-11-05T00:00:00Z"}\n' \
+  "$HEAD_A" > "$DL_PEER"
+DL_BLOB="$(git -C "$MINI_STORE" hash-object -w "$DL_PEER")"
+DL_TREE="$(printf '100644 blob %s\trecord.json\n' "$DL_BLOB" | git -C "$MINI_STORE" mktree)"
+DL_COMMIT="$(git -C "$MINI_STORE" -c user.name=sync -c user.email=sync@test.invalid commit-tree "$DL_TREE" -m "$NEST_KEY")"
+git -C "$MINI_STORE" push -q origin "$DL_COMMIT:refs/reviews/$NEST_KEY" 2>/dev/null || :
+if python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["verdict"])' "$DL_PEER" 2>/dev/null | grep -qx 'clean,partial'; then
+  ok "§29r (premise) the peer's verdict really is the two-token value"
+else
+  bad "§29r (premise) the fixture lost its comma-carrying verdict"
+fi
+DL_OUT="$(mini_rs "$DL_BOX" push)"; DL_RC=$?
+assert_eq "$DL_RC" "3" "§29r a comma inside a value does not truncate it — the same-stamp disagreement is a CONFLICT"
+assert_not_contains "$DL_OUT" "differ only in carry provenance" "§29r ...not reported as a carry-provenance match"
+# §29s — `1e999` is legal JSON (both parsers take it) and parses to INFINITY, which sorts above every real
+# stamp. `_field_json`'s isfinite guard is the only thing that makes it unreadable; without it such a
+# record is published and becomes the ordering authority for its key (round 9: the guard was unpinned).
+mini_fixture inf
+IN_BOX="$MINI_ROOT/box"; mkdir -p "$IN_BOX"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":1e999}\n' \
+  "$HEAD_A" > "$IN_BOX/$NEST_KEY.json"
+if python3 -c 'import json,sys,math;print(math.isinf(json.load(open(sys.argv[1]))["reviewed_at"]))' "$IN_BOX/$NEST_KEY.json" 2>/dev/null | grep -qx True; then
+  ok "§29s (premise) the reader parses the fixture's stamp to INFINITY (it is legal JSON)"
+else
+  bad "§29s (premise) the fixture does not carry an infinite stamp"
+fi
+IN_OUT="$(mini_rs "$IN_BOX" push)"; IN_RC=$?
+assert_not_contains "$IN_OUT" "pushed $NEST_KEY" "§29s an INFINITE stamp is unreadable — never published as an ordering authority"
+assert_contains "$IN_OUT" "no readable reviewed_at" "§29s ...and the run names the missing stamp"
 # §29i — `null` is not a timestamp. The literal text sorts ABOVE every real stamp (`'n' > '2'`), so reading
 # it as `null` made a record with no stamp win the ordering instead of being unreadable.
 NEST9D="$MINI_ROOT/box9"; mkdir -p "$NEST9D"
@@ -1435,6 +1472,63 @@ else
   assert_contains "$P_OUT" "neither create nor remove" "§30p ...and the summary names the permission as the remedy"
   assert_not_contains "$P_OUT" "re-run to retry (nothing was deleted, and no record was overwritten with an older one)" "§30p ...rather than a re-run that meets the same directory"
 fi
+# (q) AN OUTSTANDING PUT-BACK BLOCKS ENTRY. The round-8 fix remembered an un-restorable claimed directory
+# (`PENDING_STALE`) but still tried `mkdir` first, so once the third acquirer released the name the run
+# ACQUIRED with a live holder's lock still in debris and wrote beside it (round 9, measured 3 of 4 runs).
+# Pinned by replaying exactly that: an `mv` shim re-creates a foreign lock under the claim (so the
+# put-back fails), and a `sleep` shim then FREES the name — mimicking the third acquirer finishing — so a
+# run without the entry gate would acquire and write, while a gated run restores first, finds the name
+# taken by a FRESH lock, and refuses.
+SHIM_P="$T/shim-p"; mkdir -p "$SHIM_P"; : > "$T/p.mv"; : > "$T/p.free"
+# its OWN fixture with exactly the ONE key under test: every `mini_fixture` rebinds the global store, so
+# an arm that reuses `$LKD`/`$MINI_STORE` can end up pulling a LATER fixture's keys (measured: the run
+# converged on someone else's records and reported rc 0 for an unrelated reason).
+mini_fixture lockgate
+PG_SEED="$MINI_ROOT/seed"; mkdir -p "$PG_SEED"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+  "$HEAD_A" > "$PG_SEED/$LCK_KEY.json"
+mini_rs "$PG_SEED" push >/dev/null 2>&1
+LKD="$MINI_ROOT/box"; mkdir -p "$LKD"
+lock_reset() { rm -rf "$LKD/.registry-sync.lock"; rm -f "$LKD/$LCK_KEY.json"; }
+lock_reset
+REAL_MV_P="$(command -v mv)"; REAL_SLEEP_P="$(command -v sleep)"
+cat > "$SHIM_P/mv" <<EOS
+#!/bin/sh
+case "\$1" in
+  */.registry-sync.lock)
+    case "\$2" in
+      */.registry-sync.lock.stale.*)
+        if [ ! -s "$T/p.mv" ]; then
+          printf 'x' > "$T/p.mv"
+          rm -rf "\$1"; mkdir -p "\$1"          # a live acquirer holds the name (fresh, pid-less)...
+          "$REAL_MV_P" "\$@"; rc=\$?            # ...so the claim moves a lock it CANNOT have judged
+          mkdir -p "\$1"                         # and a third party takes the freed name
+          exit \$rc
+        fi ;;
+    esac ;;
+esac
+exec "$REAL_MV_P" "\$@"
+EOS
+cat > "$SHIM_P/sleep" <<EOS
+#!/bin/sh
+if [ -s "$T/p.mv" ] && [ ! -s "$T/p.free" ]; then
+  printf 'x' > "$T/p.free"; rm -rf "$LKD/.registry-sync.lock"   # ...and then releases it
+fi
+exec "$REAL_SLEEP_P" "\$@"
+EOS
+chmod +x "$SHIM_P/mv" "$SHIM_P/sleep"
+mkdir -p "$LKD/.registry-sync.lock"
+touch -t 202001010000 "$LKD/.registry-sync.lock"
+P_OUT="$(PATH="$SHIM_P:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 30 2>&1)"; P_RC=$?
+if [ -s "$T/p.mv" ]; then
+  ok "§30q (premise) a claim moved a lock it could not have judged (the interleaving happened)"
+else
+  bad "§30q (premise) no claim was interposed — the arm proves nothing"
+fi
+assert_contains "$P_OUT" "HELD for restore" "§30q (premise) the put-back really FAILED (a third party held the name)"
+assert_absent "$LKD" "$LKD/$LCK_KEY.json" "§30q a run with an OUTSTANDING put-back does not enter the critical section"
+assert_eq "$P_RC" "1" "§30q ...and it fails closed"
+rm -rf "$LKD/.registry-sync.lock" "$LKD"/.registry-sync.lock.stale.*; lock_reset
 # §30m — NOT PINNED, and said so rather than faked. `reg_lock` now refuses to enter the critical section
 # when it cannot write its own `pid` (a lock it cannot record itself in is a lock it can never release:
 # `reg_unlock` removes only a lock whose pid is ours, so the directory would stay and the pid-less arm
