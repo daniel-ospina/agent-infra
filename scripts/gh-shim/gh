@@ -167,6 +167,12 @@
 #     (`AGENT_GH_SHIM_DEPTH`) ends the ladder at its third hop with a named refusal (#2304). The
 #     cost of the residual is three processes and one broken gh call; the cost before it was a box
 #     at `fork: Resource temporarily unavailable` (measured: 3.4k processes, load 74 on 4 vCPU).
+#     ⛔ AND THE COUNTER IS CALLER-CONTROLLED, stated rather than implied: it lives in the
+#     environment, so a caller that unsets or resets it on every hop removes the bound — the same
+#     class as `AGENT_GH_REAL`, `env -i`, or invoking the real gh by absolute path, i.e. a caller
+#     deliberately removing a guard. What it bounds is the ACCIDENTAL ladder (an install with two
+#     copies under no one's control), which is the one that took the box down; it was never meant
+#     to survive an adversary, and it does not claim to.
 #   - a slot whose recorded PID was later REUSED by an unrelated long-lived process is not
 #     reaped by the liveness probe, so admission waits out `AGENT_GH_GATE_ACQUIRE_TIMEOUT` and
 #     then runs the call ungated. That is a bounded per-call penalty, not a wedge — the fail-open
