@@ -1548,9 +1548,13 @@ ck "a lane that has already spent 7180 s of its 7200 s clock CAPS the check wait
 # …and the clock it clamps against is the ARMED one, including the ceiling-reducer seam (review, P3 —
 # verified against spawn-gate.sh's `lane_wall_bound`, which arms `min(caller, LANE_BOUND_WALL_S)` for a
 # POSITIVE value and REFUSES to reduce to a `0`). Mirroring only LANE_TIMEOUT/LANE_BACKSTOP_S clamped
-# against a clock the lane does not have: with `LANE_BOUND_WALL_S=3630` and 3600 s spent, the wait was cut to
-# 4190 s (7200 − 3600 − 10) — 570 s PAST a clock that ends at 3630 s, i.e. TERMed mid-wait with no verdict,
-# the unlabelled kill the clamp exists to prevent.
+# against a clock the lane does not have: with `LANE_BOUND_WALL_S=3630` and 3600 s spent, the pre-fix wait was
+# cut to 3590 s (7200 − 3600 − 10) — 3560 s past the 30 s the lane actually had left (3630 − 3600), i.e.
+# TERMed mid-wait with no verdict, the unlabelled kill the clamp exists to prevent. ⛔ THE NUMBERS HERE ARE
+# DERIVED FROM THIS ARM'S OWN OPERANDS (review, P3 — this comment carried `4190`/`570`, which are the OLD
+# `elapsed=3000` fixture's cap and overshoot: the P2 resize below re-sized the operands and left the old
+# arithmetic attached to them, so the parenthetical refuted its own result and disagreed with the sentence
+# three lines down. Any re-size must re-derive both numbers.)
 # ⛔ THIS FIXTURE IS SIZED SO THE CLAMP IS SMALL (P2, MEASURED): the wait is `wall − elapsed − margin`, so the
 # arm only has to spend what the clamp leaves. The first cut of this arm used `elapsed=3000` against a 3600 s
 # wall, which leaves 590 s — and because the fixture's checks are in flight the loop SLEEPS that whole cap
@@ -1601,15 +1605,43 @@ ck "with LANE_TIMEOUT=3600 (and no LANE_BOUND_WALL_S) the same warning attribute
 # ⛔ THE WAIT IS DELIBERATELY CHEAP (360 s unclamped, 20 s clamped) SO THE MUTANT FAILS INSTEAD OF HANGING:
 # with the wall clamp skipped the arm reddens in six minutes, not the ~1 h the 5400 s design wait would cost.
 # It reddens on EITHER bad shape — "no wall CAPPED line at all" (clamp skipped) and a clamp that kept the raw
-# `03630` and let `$(( ))` read it as OCTAL 1920 (which floors `_wall_left` at 0, so `_cap42` is `0`).
+# `03630` and let `$(( ))` read it as OCTAL 1944 — `$(( 03630 ))` is 1944, NOT the 1920 of the earlier
+# `03600` example (which floors `_wall_left` at 0, so `_cap42` is `0`).
 new_o "$T/pr4.tsv"
 OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
       LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=360 LANE_MERGE_POLL=5 LANE_MERGE_ELAPSED_S=3600 \
       LANE_TIMEOUT= LANE_BACKSTOP_S= LANE_BOUND_WALL_S=03630 \
       bash "$SCRIPT" 42 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
 _cap42="$(sed -n 's/.*CAPPED at \([0-9][0-9]*\)s (this lane had already spent.*/\1/p' <<<"$OUT" | head -1)"
-ck "LANE_BOUND_WALL_S=03630 (leading zero — the form lane_wall_bound ACCEPTS) arms the lane at 3630 s and the wait is clamped to it: pre-fix there is NO wall CAPPED line at all, and a fix that kept the octal reading clamps to 1920 s and prints 0 s" \
+ck "LANE_BOUND_WALL_S=03630 (leading zero — the form lane_wall_bound ACCEPTS) arms the lane at 3630 s and the wait is clamped to it: pre-fix there is NO wall CAPPED line at all, and a fix that kept the octal reading clamps to 1944 s and prints 0 s" \
    $([ "$RC" = 11 ] && [ -n "${_cap42:-}" ] && [ $(( ${_cap42:-0} + 3610 )) = 3630 ] && grep -q 'the 3630s wall this lane is armed with (from LANE_BOUND_WALL_S' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ THE WALL-OFF DISCLOSURE MUST NAME THE KNOB THAT IS ACTUALLY OFF (review, P3 — MEASURED, and this is the
+# arm that reds on the pre-fix text). `LANE_BACKSTOP_S=0` with `LANE_TIMEOUT` unset resolves `LANE_WALL_S` to 0
+# FROM THE BACKSTOP — a real configuration, because `lane.sh:882` hands that value to `lane_wall_bound`, whose
+# unchanged path arms `--wall 0` — yet the line said "LANE_TIMEOUT=0 is the documented 'wall axis OFF' value"
+# about a variable the run NEVER SET, and "no LANE_BACKSTOP_S is exported" while it was exported, as 0. An
+# operator reading that is sent to set a knob they already set. Pre-fix this arm reds on both the headline
+# grep and the basis-note grep.
+new_o "$T/pr4.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=6 LANE_MERGE_POLL=0 LANE_MERGE_ELAPSED_S=7180 \
+      LANE_TIMEOUT= LANE_BACKSTOP_S=0 LANE_BOUND_WALL_S= \
+      bash "$SCRIPT" 44 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "wall axis OFF via LANE_BACKSTOP_S=0 names THAT knob (never a LANE_TIMEOUT the run never set) and reports the backstop — exported as 0 — as the same OFF switch instead of 'no LANE_BACKSTOP_S is exported'" \
+   $([ "$RC" = 11 ] && grep -q 'lane-merge: LANE_BACKSTOP_S=0 is the documented' <<<"$OUT" && ! grep -q 'LANE_TIMEOUT=0 is the documented' <<<"$OUT" && grep -q 'LANE_BACKSTOP_S=0 is the same OFF switch' <<<"$OUT" && ! grep -q 'no LANE_BACKSTOP_S is exported' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ A MALFORMED-BUT-SET `LANE_TIMEOUT` IS THE ONE KNOB AT FAULT, AND THE LINE MUST SAY THE USABLE BACKSTOP WAS
+# NOT CONSULTED (review, P3 — MEASURED). `LANE_WALL_S` is `${LANE_TIMEOUT:-…}` — the SAME expression `lane.sh:882`
+# arms the lane with — so a non-numeric `LANE_TIMEOUT` wins the masking and `LANE_BACKSTOP_S=3600` is never read;
+# the pre-fix line said "no usable LANE_TIMEOUT or LANE_BACKSTOP_S", sending an operator to inspect two knobs
+# when exactly one is at fault and the other is a valid bound. ⛔ THE ARM ALSO PINS THE NO-FALL-THROUGH: the
+# wall must stay the shipped 7200 s default, because silently consulting the backstop would make this file's
+# clock disagree with the armed one. Cheap run: elapsed 7190 of 7200 leaves a 0 s clamp.
+new_o "$T/pr4.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      LANE_MERGE_MAX_WATCH=15 LANE_TIMEOUT=abc LANE_BACKSTOP_S=3600 LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=7190 \
+      bash "$SCRIPT" 45 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "a MALFORMED LANE_TIMEOUT is named as the knob at fault, LANE_BACKSTOP_S=3600 is reported as NOT consulted (the arming path masks it with the same expression), and the wall stays the 7200 s default instead of silently falling through to the backstop" \
+   $([ "$RC" = 11 ] && grep -q "LANE_TIMEOUT='abc' is not a bounded integer" <<<"$OUT" && grep -q 'LANE_BACKSTOP_S=3600 was NOT consulted' <<<"$OUT" && grep -q "the lane's 7200s wall clock" <<<"$OUT" && ! grep -q 'from LANE_BACKSTOP_S' <<<"$OUT" && echo 0 || echo 1)
 # …and a lane's elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
 new_o "$T/pr4.tsv"
 WAIT_S=0 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
