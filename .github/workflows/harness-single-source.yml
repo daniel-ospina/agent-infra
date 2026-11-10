@@ -232,13 +232,30 @@ jobs:
           cp scripts/orchestrator-harness/*.sh "$d"/
           bash scripts/orchestrator-harness/check-single-source.sh --require-target --o "$d"
       - name: NON-VACUITY — a planted fork is refused
+        # ⛔ THE SAME PREMISE, AND HERE IT IS A PROVEN FALSE PASS (#2726). `--fork` sets no `O_DIR`, so
+        # the checker still falls back to `${O:-}` and grades the BOX's deployment as well — while this
+        # step asserts only `rc == 1` and never WHAT diverged. Measured on `cmux`, the shape the fleet's
+        # cell runners export (`O=$HOME/orchestrator`): a fork holding NONE of the 11 fork-arm files
+        # printed `ok: /tmp/empty-fork holds none of the 11 fork-arm files`, produced **0** fork
+        # divergences, and still exited 1 on the deployment's 56 — so the step PASSED with the arm it
+        # exists to prove stone dead. With `O` unset the same run exits 0 and the assertion is honest.
+        # Both halves are fixed: `unset O` makes the premise true, and the grep below refuses a red
+        # that does not NAME the planted fork, so no future env leak can satisfy this step again.
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm grades the planted fork, not the box's deployment"; exit 1; }
           mkdir -p /tmp/planted-fork
           cp scripts/orchestrator-harness/lane.sh /tmp/planted-fork/lane.sh
           rc=0
-          bash scripts/orchestrator-harness/check-single-source.sh --fork /tmp/planted-fork || rc=$?
+          bash scripts/orchestrator-harness/check-single-source.sh --fork /tmp/planted-fork 2>/tmp/planted-fork.err || rc=$?
           [ "$rc" -eq 1 ] || { echo "FAIL: a reappearing fork must exit 1, got $rc"; exit 1; }
+          # ⛔ rc 1 IS NOT THE CLAIM — the claim is that the FORK was refused. Any other divergence in
+          # the same run also answers 1, and the deployment surface supplies tens of them on a real
+          # runner. A fork refusal always names the fork path, so its absence is a dead arm, not a red.
+          grep -q '/tmp/planted-fork/lane.sh' /tmp/planted-fork.err || {
+            echo "FAIL: rc 1, but no divergence names /tmp/planted-fork/lane.sh — the planted fork was NOT what redded this run:";
+            sed -n '1,20p' /tmp/planted-fork.err; exit 1; }
       - name: NON-VACUITY — a divergent deployed copy is refused
         run: |
           set -euo pipefail
