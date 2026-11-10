@@ -657,6 +657,18 @@ the shim must not resolve a harness layer as "the real gh" — see `find_real_gh
 pacing notes go to `~/.pi/agent/gh-gate/events.log` and are replayed to stderr only when the call
 fails. If you are debugging pacing, read the log.
 
+⛔ **A chain of shims is CUT at its third hop (#2304).** `find_real_gh` refuses *this file* by
+device+inode, which cannot see a **copy** of the shim at another inode — and two copies reachable
+from each other resolve to EACH OTHER, one `exec` per generation, each holding a gate slot. That is
+not hypothetical: it measured **3,456 bash processes, load 74 on 4 vCPU**, then
+`fork: Resource temporarily unavailable`, so nothing could be cleaned up from inside. The shim now
+exports a generation counter (`AGENT_GH_SHIM_DEPTH`) to its child and **refuses the third
+generation** with rc 127 and a message naming the two-copies precondition — three processes and one
+broken `gh` call instead of a dead box. Two generations stay legal on purpose: the call a session
+starts, plus the one its evidence verifier (or real `gh`'s own `git` credential helper) makes. If
+you see that refusal, one box is running two copies — point every copy at ONE inode (a symlink),
+or set `AGENT_GH_REAL=/usr/bin/gh`.
+
 Every `gh` call that goes through the argv-level shim (`scripts/gh-shim/gh`, installed at
 `~/.pi/agent/shims/gh`) is paced per machine:
 

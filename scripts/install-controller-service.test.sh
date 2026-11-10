@@ -88,8 +88,18 @@ say_case() { printf '\n== %s\n' "$*"; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/ctlunit.XXXXXX")"
 PIDS=""
 cleanup() {
-  local p
+  local p f
   for p in $PIDS; do kill -9 "$p" 2>/dev/null || true; done
+  # ⛔ THE SYSTEMD DOUBLE'S DEFAULT MainPID IS A LIVE `sleep` (#2627): the install verdict requires a live
+  # MainPID, so the double starts one per arm and records it in the arm's state dir. Reap ONLY a pid whose
+  # command is still `sleep` — a recorded pid can be recycled between the run and this trap, and killing
+  # whatever now owns it would be worse than leaking one sleeper.
+  for f in "$T"/*/state/mainpid; do
+    [ -f "$f" ] || continue
+    p="$(cat "$f" 2>/dev/null)"
+    case "${p:-}" in ''|*[!0-9]*) continue ;; esac
+    [ "$(ps -o comm= -p "$p" 2>/dev/null)" = sleep ] && kill -9 "$p" 2>/dev/null
+  done
   rm -rf "$T"
 }
 trap cleanup EXIT
@@ -203,8 +213,19 @@ case "\${1:-}" in
   start)
     : > "\$S/active"
     { printf '%s\n' "\$(( \$(cat "\$S/restarts" 2>/dev/null || printf 0) + 1 ))" > "\$S/restarts"; }
-    [ -n "\${SC_HOOK:-}" ] && [ -x "\${SC_HOOK}" ] && { "\$SC_HOOK" || true; }
-    [ -f "\$S/mainpid" ] || printf '4242\n' > "\$S/mainpid"
+    [ -n "\${SC_HOOK:-}" ] && [ -x "\${SC_HOOK:-}" ] && { "\$SC_HOOK" || true; }
+    # ⛔ THE DEFAULT MainPID IS A *LIVE* PROCESS, NOT A LITERAL (review P1, #2627). The install verdict now
+    # requires the unit's MainPID to be alive AFTER the proof wait (a heartbeat whose author is gone is the
+    # false pass this gate exists for), so a double answering the literal pid 4242 — a pid nobody started —
+    # models a DEAD controller on any box where 4242 is free, and every green install arm would turn RED for
+    # a fixture reason. The double therefore starts ONE long-lived sleep per state dir and records its pid:
+    # a process that is alive across REPEATED installs (the idempotency arms install twice, and a pid tied to
+    # the invoking installer would be gone by the second run — a false RED on the very re-install those arms
+    # test). The suite's cleanup kills it by pid, and only while its command is still `sleep` (see cleanup).
+    if [ ! -f "\$S/mainpid" ]; then
+      sleep 900 >/dev/null 2>&1 &
+      printf '%s\n' "\$!" > "\$S/mainpid"
+    fi
     # ⛔ THE INSTALL VERDICT WAITS FOR PROOF OF A *CONTROLLER*, NOT A PROCESS (review P1, #2402): the process
     # doing cmd_check IS the MainPID until it refuses. The real loop proves itself by taking \$O/.orch.lock
     # and by writing a heartbeat after its first cycle; the stub models the second, SC_PROOF=none models a
@@ -2481,9 +2502,12 @@ kill "$DL_LATE" 2>/dev/null || true
 # lets THIS fixture through is the stub `start` writing a FRESH heartbeat under the default SC_PROOF — with
 # SC_PROOF=none the proof refuses it, which is an arm below.)
 DN="$(arm_root dn)"; mk_systemctl "$DN/bin" "$DN/state" "$DN/sc.log"
-printf 'active\n' > "$DN/state/isactive_word"; : > "$DN/state/active"; printf '4242\n' > "$DN/state/mainpid"
+printf 'active\n' > "$DN/state/isactive_word"; : > "$DN/state/active"
+# a LIVE MainPID: the verdict refuses a heartbeat whose author is gone, and `4242` is a pid nobody started
+sleep 60 & DN_LIVE=$!; printf '%s\n' "$DN_LIVE" > "$DN/state/mainpid"
 rm -f "$DN/o/heartbeat"
 DN_RC=0; CONTROLLER_PROOF_TIMEOUT=4 inst dn --install > "$T/dn.out" 2>&1 || DN_RC=$?
+kill "$DN_LIVE" 2>/dev/null || true
 [ "$DN_RC" -eq 0 ] && ok 'install: an ACTIVE unit with NO heartbeat is not refused (the binding has nothing to bind)' \
                    || bad "install: refused an active unit with no heartbeat — the MainPID gate over-reaches: $(cat "$T/dn.out")"
 
@@ -3885,6 +3909,188 @@ for seam in HARNESS_PIN_FILE HARNESS_PIN_DIR ORCH_SUPERVISOR_PREFER ORCH_SUPERVI
     *) bad "§P11: --help does not name $seam — an operator reading only the usage text cannot act on the refusal the installer prints" ;;
   esac
 done
+
+# ── §V — the POST-START verdict is an ALLOW-LIST over the state word, plus a LIVE MainPID (#2627) ─────
+# ⛔ THE DEFECT THESE ARMS PIN (review P1/P1a/P1b/P1c of the merged #2433). The verdict re-read the manager
+# after the proof poll but refused ONLY `failed|inactive`, and read it with `|| true`. Two reachable states
+# therefore went GREEN over a start that produced no controller:
+#   (a) `activating` — with `Restart=always` the moment a ticked-once loop exits the unit is
+#       `activating (auto-restart)`, not `failed`; `controller_proof` passes there on the DEAD incarnation's
+#       fresh heartbeat (`hb >= since`, `age <= 2*CYC` — neither asks who wrote it), and `--install` exited
+#       0, which `cloud-cell-bringup.sh` gates `CELL READY` on;
+#   (b) an UNREADABLE read — `|| true` folded it into an EMPTY word that matches neither branch, so the case
+#       fell through and the verdict printed `installed: … controller pid: <a pid read BEFORE the poll>`.
+# And the comment CLAIMED a MainPID-liveness check that did not exist, so an `active` unit whose process had
+# exited certified the install. Every arm below is RED against the pre-#2627 installer (measured with
+# `INST=<pre-fix copy> bash this-file`: §V-1/§V-2/§V-3 red, §V-4 green — the negative control that keeps
+# them from being a blanket refusal).
+# ⛔ THE CALL ORDER THE ARMS KEY ON: (1) the `pre_active` gate's `is-active`, (2) the tier read after
+# `start` (`unit_active_state`), then the proof poll (`controller_proof` makes no `is-active` call and a
+# passing proof breaks the loop before the `failed` check), then (3) the POST-POLL read. An arm that moves a
+# gate moves these counts, and each arm asserts the MESSAGE of the gate it targets so a mis-aimed arm is red
+# rather than silently testing another refusal.
+
+say_case 'a unit that is ACTIVATING (auto-restart) at the end of the proof wait is NOT a running controller'
+VA="$(arm_root va)"; mk_systemctl "$VA/bin" "$VA/state" "$VA/sc.log"; mk_tmux "$VA/bin" "$VA/tmux.log"
+printf 'inactive\n' > "$VA/state/isactive_word"      # (1) not pre-active, so the proof binds THIS start
+# the controller the unit was running exits during the wait: `start`'s hook flips the state to the RestartSec
+# window, which is what a ticked-once-then-exited loop looks like under `Restart=always`
+printf '#!/bin/bash\nprintf "activating\\n" > %q\n' "$VA/state/isactive_word" > "$VA/hook.sh"; chmod +x "$VA/hook.sh"
+VA_RC=0; EXTRA_ENV="SC_HOOK=$VA/hook.sh" CONTROLLER_PROOF_TIMEOUT=6 inst va --install > "$T/va.out" 2>&1 || VA_RC=$?
+[ "$VA_RC" -ne 0 ] \
+  && ok '§V-1: install REFUSES when the unit is activating at the end of the proof wait (a heartbeat is not a controller)' \
+  || bad "§V-1: exited 0 over an ACTIVATING unit — the dead incarnation's fresh heartbeat certified the start, and bringup gates CELL READY on this rc: $(cat "$T/va.out")"
+case "$(cat "$T/va.out")" in
+  *"is 'activating' at the end of the proof wait"*) ok '§V-1: and the refusal NAMES the state it saw' ;;
+  *) bad "§V-1: refused without naming 'activating' — an operator cannot tell this from a timeout: $(cat "$T/va.out")" ;;
+esac
+if grep -q 'controller pid:' "$T/va.out"; then
+  bad '§V-1: still printed the green "controller pid:" report over a unit it did not prove a controller for'
+else
+  ok '§V-1: and it printed no "controller pid:" report'
+fi
+
+say_case 'an UNREADABLE is-active at the end of the proof wait is a refusal, never a green install'
+# ⛔ `|| true` IS THE DEFECT, NOT THE FIX (P1a, #2627). An expired `sudo -n` timestamp or a user-scope
+# manager with no DBus answers NOTHING at all, and an empty word matched neither `failed` nor `inactive` — so
+# the gate did nothing and the verdict printed a pid read before the poll. The stub below answers the two
+# reads BEFORE the poll and goes silent from the post-poll one on: the manager stopped answering mid-install,
+# which is exactly the state this installer treats as fatal elsewhere (`unit_active_state` returns 3).
+VB="$(arm_root vb)"; mk_tmux "$VB/bin" "$VB/tmux.log"
+cat > "$VB/bin/systemctl" <<STUB
+#!/bin/bash
+printf '%s\n' "\$*" >> "$VB/sc.log"
+S="$VB/state"
+case "\${1:-}" in
+  daemon-reload) exit 0 ;;
+  show)
+    case "\${3:-}" in MainPID) printf 'MainPID=%s\n' "\$(cat "\$S/mainpid")" ;; *) printf '\n' ;; esac
+    exit 0 ;;
+  is-active)
+    n=\$(( \$(cat "\$S/isactive_calls" 2>/dev/null || printf 0) + 1 ))
+    printf '%s\n' "\$n" > "\$S/isactive_calls"
+    case "\$n" in
+      1) printf 'inactive\n'; exit 3 ;;   # the pre_active gate: a fresh start, nothing to bind
+      2) printf 'active\n';   exit 0 ;;   # the tier read after start: it came up
+      *) exit 3 ;;                        # the POST-POLL read: the manager no longer answers
+    esac ;;
+  is-enabled) if [ -f "\$S/enabled" ]; then printf 'enabled\n'; exit 0; else printf 'disabled\n'; exit 1; fi ;;
+  enable)     : > "\$S/enabled"; exit 0 ;;
+  disable)    rm -f "\$S/enabled" "\$S/active" "\$S/mainpid"; exit 0 ;;
+  start)      : > "\$S/active"
+              [ -f "\$S/mainpid" ] || printf '%s\n' "\$PPID" > "\$S/mainpid"
+              mkdir -p "$VB/o" 2>/dev/null; date +%s > "$VB/o/heartbeat" 2>/dev/null || true
+              exit 0 ;;
+  stop)       rm -f "\$S/active" "\$S/mainpid"; exit 0 ;;
+  status)     printf 'stub: %s\n' "\$*"; exit 3 ;;
+  *)          exit 0 ;;
+esac
+STUB
+chmod +x "$VB/bin/systemctl"
+VB_RC=0; CONTROLLER_PROOF_TIMEOUT=6 inst vb --install > "$T/vb.out" 2>&1 || VB_RC=$?
+[ "$VB_RC" -ne 0 ] \
+  && ok '§V-2: install REFUSES when the manager cannot be read at the end of the proof wait' \
+  || bad "§V-2: exited 0 over an UNREADABLE manager read — the `|| true` fold is back, and the report printed a pid it read before the poll: $(cat "$T/vb.out")"
+case "$(cat "$T/vb.out")" in
+  *'at the end of the proof wait'*) ok '§V-2: and the refusal is the POST-POLL one (not the pre-start cannot-read gate)' ;;
+  *) bad "§V-2: did not refuse at the post-poll gate — the arm is aiming at the wrong read: $(cat "$T/vb.out")" ;;
+esac
+if grep -q 'controller pid:' "$T/vb.out"; then
+  bad '§V-2: still printed the green "controller pid:" report over a manager it could not read'
+else
+  ok '§V-2: and it printed no "controller pid:" report'
+fi
+
+say_case 'a MainPID that is NOT LIVE at the end of the proof wait is not a running controller'
+# ⛔ THE COMMENT CLAIMED THIS CHECK AND THE CODE DID NOT PERFORM IT (P1c, #2627). `active` + a FRESH heartbeat
+# was enough: the loop that wrote the heartbeat had exited, systemd had not yet moved the unit off `active`,
+# and the verdict printed `installed: … controller pid: <the gone pid>`. The pid below cannot exist by
+# construction (`pid_max + 1`) — a LITERAL like 4242 is only dead on a box that never used it, which is how
+# this class of arm turns into a false RED on a busy runner.
+VC="$(arm_root vc)"; mk_systemctl "$VC/bin" "$VC/state" "$VC/sc.log"; mk_tmux "$VC/bin" "$VC/tmux.log"
+printf 'active\n' > "$VC/state/isactive_word"; : > "$VC/state/active"
+printf '%s\n' "$(( $(cat /proc/sys/kernel/pid_max 2>/dev/null || printf 4194304) + 1 ))" > "$VC/state/mainpid"
+VC_RC=0; CONTROLLER_PROOF_TIMEOUT=6 inst vc --install > "$T/vc.out" 2>&1 || VC_RC=$?
+[ "$VC_RC" -ne 0 ] \
+  && ok '§V-3: install REFUSES an ACTIVE unit whose MainPID is not live (a heartbeat whose author is gone)' \
+  || bad "§V-3: exited 0 over a live-looking unit with a DEAD MainPID — the heartbeat leg alone certified it: $(cat "$T/vc.out")"
+case "$(cat "$T/vc.out")" in
+  *'is NOT live'*) ok '§V-3: and the refusal says the MainPID is not live (the check the comment claimed)' ;;
+  *) bad "§V-3: refused for another reason — cannot tell the liveness leg from a proof timeout: $(cat "$T/vc.out")" ;;
+esac
+
+say_case 'the verdict stays GREEN for an ACTIVE unit with a LIVE MainPID, and reports the pid read AFTER the poll'
+# ⛔ THE NEGATIVE CONTROL. Without it, every arm above is satisfied by a gate that refuses everything — the
+# "a green check that cannot fail" class this file exists to avoid, inverted. It also pins the SECOND half of
+# the fix (P1c): the pid printed is the one read AFTER the wait, not the pre-poll `$pid`, which a restart
+# inside the wait makes stale. The hook plays systemd restarting the unit: the MainPID it reports CHANGES.
+VD="$(arm_root vd)"; mk_systemctl "$VD/bin" "$VD/state" "$VD/sc.log"; mk_tmux "$VD/bin" "$VD/tmux.log"
+printf 'active\n' > "$VD/state/isactive_word"; : > "$VD/state/active"
+sleep 90 & VD_PRE=$!; sleep 90 & VD_POST=$!
+printf '%s\n' "$VD_PRE" > "$VD/state/mainpid"                                     # the pre-poll MainPID
+printf '#!/bin/bash\nprintf "%%s\\n" %s > %q\n' "$VD_POST" "$VD/state/mainpid" > "$VD/hook.sh"; chmod +x "$VD/hook.sh"
+VD_RC=0; EXTRA_ENV="SC_HOOK=$VD/hook.sh" CONTROLLER_PROOF_TIMEOUT=6 inst vd --install > "$T/vd.out" 2>&1 || VD_RC=$?
+kill "$VD_PRE" "$VD_POST" 2>/dev/null || true
+[ "$VD_RC" -eq 0 ] \
+  && ok '§V-4: an ACTIVE unit with a LIVE MainPID installs (the gate is not a blanket refusal)' \
+  || bad "§V-4: refused a healthy install — the new verdict is a false block, and bringup dies on it: $(cat "$T/vd.out")"
+grep -qxF "  controller pid: $VD_POST" "$T/vd.out" \
+  && ok '§V-4: and the report names the MainPID read AFTER the proof wait (not the pre-poll one)' \
+  || bad "§V-4: the report names a pid that is not the post-poll MainPID ($VD_POST) — the stale pre-poll read is back: $(grep 'controller pid' "$T/vd.out" || echo '<no pid line>')"
+
+# ── §V-5 — the ORPHAN ceiling is a CEILING, not "the bound plus one sleep" (round-12 P1, #2402) ──────
+# ⛔ WHY A TIMING ARM. `foreground_handover` tests `$((_waited + 5)) <= bound` (cloud-cell-supervisor.sh:
+# "THE BOUND IS A CEILING ON THE WHOLE ATTEMPT, AND THE SLEEP IS 5 s GRANULAR"): a bound of T must cost AT
+# MOST T, because the installer's start-limit arithmetic (`burst x (ceiling + RestartSec) < window`) prices
+# the ceiling as the cost. Testing BEFORE the sleep instead let T cost T+5 — and at the accepted maximum the
+# burst could never fill, so `Restart=always` restarted for ever while every surface read the unit supervised.
+# With `CONTROLLER_ORPHAN_TIMEOUT=7`: the fix dies after ONE 5 s sleep (~5 s), the pre-fix shape after TWO
+# (~10 s). No assertion on the exit CODE can tell those apart — both refuse — so the discriminator is
+# elapsed time, bounded on BOTH sides: < 4 s means the orphan branch was never taken (a different refusal),
+# > 9 s means the ceiling drifts a sleep past the bound.
+say_case 'the orphan wait is bounded by the CEILING, not the ceiling plus one 5 s tick (measured)'
+VT="$(arm_root vt)"; mk_systemctl "$VT/bin" "$VT/state" "$VT/sc.log"
+printf '#!/bin/bash\ncase "${1:-}" in\n  has-session) exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$VT/bin/tmux"; chmod +x "$VT/bin/tmux"
+: > "$VT/units/eldato-orchestrator.service"; : > "$VT/state/enabled"
+VT_T0="$(date +%s)"
+VT_RC=0; VT_OUT="$(SUP_EXTRA_ENV="ORCH_FOREGROUND=1 CONTROLLER_HANDOVER_TIMEOUT=4 CONTROLLER_ORPHAN_TIMEOUT=7" sup vt start 2>&1)" || VT_RC=$?
+VT_ELAPSED=$(( $(date +%s) - VT_T0 ))
+[ "$VT_RC" -ne 0 ] \
+  && ok "§V-5: a session nothing owns is REFUSED (elapsed ${VT_ELAPSED}s of a 7s ceiling)" \
+  || bad "§V-5: start returned 0 over an orphaned session it cannot attribute — $VT_OUT"
+if [ "$VT_ELAPSED" -ge 4 ] && [ "$VT_ELAPSED" -le 9 ]; then
+  ok "§V-5: and the wait is BOUNDED BY the ceiling (${VT_ELAPSED}s ≈ 7s; the pre-fix shape spent 10s+) — the start-limit arithmetic prices this as 7s"
+else
+  bad "§V-5: elapsed ${VT_ELAPSED}s against a 7s ceiling — <4s means the orphan branch was not the one taken, >9s means the ceiling still costs an extra 5s tick, which is the endless-restart arithmetic error this pins"
+fi
+case "$VT_OUT" in
+  *'refusing to become a second dispatcher'*) ok '§V-5: and the refusal is the bound phrase (not a different refusal)' ;;
+  *) bad "§V-5: the timing arm refused for another reason — $VT_OUT" ;;
+esac
+
+# ── §V-6 — a SECOND --install on a cell whose keys.env repoints $O still CONVERGES ────────────────────
+# ⛔ THE UNION, NOT THE RESOLUTION (the install-path arm a #2433 delta removed, #2627 P2). A `keys.env` `O=`
+# line moves the controller's state dir; the installer never sources that file. So the proof must poll BOTH
+# dirs — this installer's `$O` and the dir the UNIT resolves to. A proof that polled ONLY the resolved dir
+# would find nothing on a cell whose controller has not yet written there and REFUSE the bring-up's own
+# `--install` after the full proof budget, i.e. the false red that makes a healthy cell unreclaimable.
+# Her the second run is the reachable case: the unit is already active on `$O`'s heartbeat, and `keys.env`
+# starts pointing at `$VT`-style empty dir mid-life.
+say_case 'a second --install on a cell whose keys.env repoints $O still converges (the union, not the resolution)'
+VU="$(arm_root vu)"; mk_systemctl "$VU/bin" "$VU/state" "$VU/sc.log"; mk_tmux "$VU/bin" "$VU/tmux.log"
+VU1_RC=0; CONTROLLER_PROOF_TIMEOUT=8 inst vu --install > "$T/vu1.out" 2>&1 || VU1_RC=$?
+printf 'O=%s\n' "$VU/o2" > "$VU/home/keys.env"; mkdir -p "$VU/o2"
+# the FIRST run's MainPID was this fixture's installer; a healthy cell's controller is still alive, so model
+# that before asking the second run to converge (a DEAD MainPID is refused now — §V-3 — and correctly so).
+sleep 90 & VU_LIVE=$!; printf '%s\n' "$VU_LIVE" > "$VU/state/mainpid"
+VU2_RC=0; CONTROLLER_PROOF_TIMEOUT=8 inst vu --install > "$T/vu2.out" 2>&1 || VU2_RC=$?
+kill "$VU_LIVE" 2>/dev/null || true
+[ "$VU1_RC" -eq 0 ] \
+  && ok '§V-6: fixture — the first install converges' \
+  || bad "§V-6: the FIRST install failed, so the second cannot be graded: $(cat "$T/vu1.out")"
+[ "$VU2_RC" -eq 0 ] \
+  && ok '§V-6: the second --install converges with keys.env repointing $O (the proof read the UNION of both dirs)' \
+  || bad "§V-6: refused its OWN unit after keys.env repointed the state dir — the proof looked only at the RESOLVED dir (empty) and not at \$O, so a healthy cell cannot be re-installed: $(cat "$T/vu2.out")"
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"

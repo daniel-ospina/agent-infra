@@ -140,7 +140,9 @@ jobs:
         # agree with what is on disk — `absent` only where nothing is there, any other kind only
         # where something is (`unreadable` makes no claim, so it is not cross-checked). The
         # NON-VACUITY block at the end of this step reds if that cross-check ever stops refusing a
-        # fabricated answer, so the repair cannot decay into a green no-op.
+        # fabricated answer, so the repair cannot decay into a green no-op — and since #3045 those
+        # mutations are FABRICATED rather than derived from the box, because a box-derived one was
+        # invisible on exactly the runner the job usually lands on.
         run: |
           set -euo pipefail
           rc=0
@@ -185,25 +187,56 @@ jobs:
           check() { python3 "$chk" "$1" "$GITHUB_SHA" "$2"; }
           check "$out" "$rc"
 
-          # NON-VACUITY — the cross-check above must REFUSE a deployed answer this box contradicts.
-          # The mutation flips the kind to the one REALITY denies (present → `absent`, absent →
-          # `stamp`), so it is the degenerate always-one-value doctor that this arm catches, on
-          # whichever runner the job lands on.
+          # NON-VACUITY — the cross-check above must REFUSE a fabricated deployed answer, and it
+          # must do so on BOTH of its branches. ⛔ THE MUTATIONS BELOW ARE FABRICATED, NEVER DERIVED
+          # FROM THE BOX (#3045). This arm used to read `present = os.path.lexists(dep["path"])` and
+          # flip the kind away from what it observed — which made the arm a function of the runner, in
+          # the one direction that matters: on a BARE GitHub-hosted runner (kind `absent`, nothing on
+          # disk — the population this job mostly lands on, and the state `paths:` keeps it running in)
+          # the flip emitted `stamp`, and the OLD `assert dep["kind"] == "absent"` refused `stamp` too,
+          # so a VERBATIM REVERT of the cross-check left this step exiting 0 and printing
+          # `✅ non-vacuity` over a checker that cross-checked nothing. Measured 2026-11-10 against a
+          # reproduction of this step: reverted checker revealed by the bare-runner case ⇒ arm exit 0
+          # (blind), and on a box WITH a deployment the revert reds the FIRST `check` instead of this
+          # arm — so the regression was never attributable to the guard that exists to name it. A path
+          # the mutation asserts into existence makes both arms gradable on any machine (#3045's own
+          # prescription), and each branch of the cross-check now has its own contradictory payload.
           mut="$(mktemp)"
           cat >"$mut" <<'PY'
-          import json, os, sys
+          import json, sys
           d = json.load(sys.stdin)
           dep = d["deployed"]
-          present = bool(dep["path"]) and os.path.lexists(dep["path"])
-          dep["kind"] = "absent" if present else "stamp"
+          # REALITY: this path exists on every runner. THE ANSWER: nothing is there.
+          dep["path"] = "/"
+          dep["kind"] = "absent"
           sys.stdout.write(json.dumps(d))
           PY
           mutated="$(printf '%s\n' "$out" | python3 "$mut")"
           if check "$mutated" "$rc" >/dev/null 2>&1; then
-            echo "❌ NON-VACUITY: the doctor cross-check ACCEPTED a deployed kind this box contradicts: $mutated"
+            echo "❌ NON-VACUITY: the doctor cross-check ACCEPTED an 'absent' beside a path that exists: $mutated"
             exit 1
           fi
-          echo "✅ non-vacuity: a fabricated deployed answer is refused"
+          echo "✅ non-vacuity: a fabricated 'absent' is refused"
+
+          # … and the OTHER branch: an answer claiming something IS there, beside a path that is not.
+          # Both directions are pinned so that deleting EITHER branch of the cross-check is caught
+          # here instead of decaying into a green no-op.
+          mut2="$(mktemp)"
+          cat >"$mut2" <<'PY'
+          import json, sys
+          d = json.load(sys.stdin)
+          dep = d["deployed"]
+          # REALITY: nothing can be here. THE ANSWER: a deployment is.
+          dep["path"] = "/nonexistent-0000000000000000"
+          dep["kind"] = "stamp"
+          sys.stdout.write(json.dumps(d))
+          PY
+          mutated2="$(printf '%s\n' "$out" | python3 "$mut2")"
+          if check "$mutated2" "$rc" >/dev/null 2>&1; then
+            echo "❌ NON-VACUITY: the doctor cross-check ACCEPTED a 'stamp' beside a path that does not exist: $mutated2"
+            exit 1
+          fi
+          echo "✅ non-vacuity: a fabricated present-kind is refused"
       - name: canonical copy is complete (the source of truth has all shared files)
         # ⛔ THE PREMISE IS ASSERTED, NOT INHERITED (#2726). `check-single-source.sh` takes the
         # deployed dir from `${O:-}` (see its arg parsing), and the fleet's CELL RUNNERS EXPORT `O`:
