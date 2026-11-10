@@ -257,6 +257,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PI_VERSION_PIN } from "./frontmatter-fixtures.mjs";
+import { reportVerdict } from "../extensions/shared/verdict.mjs";
 import { parseWorkflowYaml, WorkflowYamlError } from "./workflow-yaml.mjs";
 import {
   LEGACY_LOCK_REL,
@@ -1065,7 +1066,13 @@ let finalized = false;
 function finalize() {
   if (finalized) return;
   finalized = true;
-  console.log(`\ncheck-pi-pin-lockstep.mjs: ${passed} passed, ${failed} failed`);
+  // ⛔ THE FLOOR AND ROSTER ARE COUNTED BEFORE THE VERDICT LINE IS EMITTED.
+  // The order was the reverse, and the reversal was a false PASS in the one place
+  // this suite exists to close: a run that failed ONLY the floor or the roster
+  // printed `… N passed, 0 failed` and exited 1, and the rail's parser treats a
+  // 0-failed aggregate as a PASS line (`ci_exemption.py:2242` — `if failed < 1:
+  // continue`). The identity would then have said GREEN on a red job. Counting
+  // first is what makes the emitted aggregate true of the exit code.
   if (failed === 0 && passed < MIN_EXPECTED_PASSING) {
     failed++;
     console.error(
@@ -1083,6 +1090,12 @@ function finalize() {
     );
     for (const name of missingRequired) console.error(`   - ${name}`);
   }
+  // agent-infra#2723 — ONE attributable aggregate through the shared emitter. This
+  // suite is a `ci / unit-test` PR-lane harness (`ci.yml`'s `test-command` runs it
+  // beside check-skill-lint.test.mjs), and the hand-rolled line it used to print
+  // carried no `❌`/`✅` marker at all, so a failing run parsed to
+  // `ids=0 … runner=0` and the merge rail refused the PR blind.
+  reportVerdict("check-pi-pin-lockstep.mjs", passed, failed);
   if (failed > 0) {
     console.error("❌ SOME TESTS FAILED");
     process.exitCode = 1;
@@ -4936,8 +4949,20 @@ test("an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)",
     ["the TOP of the module body (the earliest catchable point)", "const REPO_ROOT = path.resolve("],
   ];
   for (const [label, anchor] of injections) {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pin-suite-exit-"));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pin-suite-exit-"));
+    const dir = path.join(root, "scripts");
     try {
+      fs.mkdirSync(dir, { recursive: true });
+      // ⛔ THE FIXTURE MIRRORS `scripts/` + `extensions/shared/` (agent-infra#2723):
+      // the suite imports the shared verdict emitter as a SIBLING of `scripts/`
+      // (`../extensions/shared/verdict.mjs`), so a flat copy of four files leaves
+      // the child dying at LOAD with ERR_MODULE_NOT_FOUND — and the assertion
+      // below then reads "must exit non-zero: got 1" as a pass it did not earn.
+      fs.mkdirSync(path.join(root, "extensions", "shared"), { recursive: true });
+      fs.copyFileSync(
+        path.join(REPO_ROOT, "extensions/shared/verdict.mjs"),
+        path.join(root, "extensions/shared/verdict.mjs")
+      );
       for (const rel of [
         "check-pi-pin-lockstep.mjs",
         "frontmatter-fixtures.mjs",
@@ -4966,7 +4991,7 @@ test("an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)",
         `the exit handler must name why it failed; stderr=${JSON.stringify(res.stderr)}`
       );
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   }
 });
@@ -4984,8 +5009,17 @@ test("an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)",
 // flip and fails loudly if the code is ever hardened, so the module header, this
 // fixture's name and the plan's accepted-residual section must move together.
 test("RESIDUAL (pinned, not a guarantee): module-level code in THIS file can still flip a failing run to 0 (#675 final cycle)", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pin-suite-residual-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pin-suite-residual-"));
+  const dir = path.join(root, "scripts");
   try {
+    fs.mkdirSync(dir, { recursive: true });
+    // Same `scripts/` + `extensions/shared/` mirror as the early-exit fixture
+    // above, and for the same reason (agent-infra#2723).
+    fs.mkdirSync(path.join(root, "extensions", "shared"), { recursive: true });
+    fs.copyFileSync(
+      path.join(REPO_ROOT, "extensions/shared/verdict.mjs"),
+      path.join(root, "extensions/shared/verdict.mjs")
+    );
     for (const rel of [
       "check-pi-pin-lockstep.mjs",
       "frontmatter-fixtures.mjs",
@@ -5024,7 +5058,7 @@ test("RESIDUAL (pinned, not a guarantee): module-level code in THIS file can sti
         `otherwise this fixture proves nothing; stderr=${JSON.stringify(res.stderr)}`
     );
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -5117,6 +5151,17 @@ test(STICKY_TEST_NAME, () => {
     fs.cpSync(path.join(REPO_ROOT, ".github"), path.join(dir, ".github"), { recursive: true });
     fs.cpSync(path.join(REPO_ROOT, "templates"), path.join(dir, "templates"), { recursive: true });
     fs.cpSync(path.join(REPO_ROOT, "scripts"), path.join(dir, "scripts"), { recursive: true });
+    // ⛔ agent-infra#2723 — the suite now imports the shared verdict emitter
+    // (`../extensions/shared/verdict.mjs`), so the emitter is part of the READ
+    // surface this fixture must mirror. Without it the child dies at LOAD with
+    // ERR_MODULE_NOT_FOUND, `res.status` is still 1, and the "the summary must
+    // still be printed in full" assertion below is the only thing that notices —
+    // a fixture whose child cannot start proves nothing about `process.exit`.
+    fs.mkdirSync(path.join(dir, "extensions", "shared"), { recursive: true });
+    fs.copyFileSync(
+      path.join(REPO_ROOT, "extensions/shared/verdict.mjs"),
+      path.join(dir, "extensions/shared/verdict.mjs")
+    );
     fs.mkdirSync(path.join(dir, "docs"), { recursive: true });
     fs.copyFileSync(
       path.join(REPO_ROOT, "docs/providers.md"),

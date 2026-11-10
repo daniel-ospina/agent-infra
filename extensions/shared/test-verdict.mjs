@@ -18,6 +18,14 @@
  *      a new harness cannot reintroduce an unattributable aggregate. This is the
  *      drift pin, and it reads the SAME workflow files the runner reads rather
  *      than a list kept here (a hand-kept list IS the drift it would be pinning).
+ *      ⛔ IT READS EVERY WAY THIS REPO INVOKES A HARNESS, not just `run: node x`
+ *      on one line — see `commandTokens()`. Scoping the scan to a single line was
+ *      a false PASS over an incomplete corpus (#2723 review, 2026-11-10): the
+ *      PR-lane invocation lives in `ci.yml`'s `test-command:` VALUE (executed by
+ *      `node-ci.yml`'s `run: ${{ inputs.test-command }}`) and the post-merge ones
+ *      live INSIDE `run: |` bodies, so `scripts/check-skill-lint.test.mjs` — the
+ *      harness on the job a PR actually sees — was never in the corpus while this
+ *      pin reported `78 passed, 0 failed`.
  *
  * ZERO-DEPENDENCY: `node:*` + the repo's own `extensions/shared/verdict.mjs`.
  * Usable in the `verify` job with no `npm ci`. It shells out to
@@ -106,6 +114,9 @@ for (const badLabel of ["", "with space", "slash/here", "#755 tripwire", "(d2)"]
 console.log("\n#2 the rail's parser reads it (scripts/ci_exemption.py)");
 
 const LABELS = [
+  "check-skill-lint.test.mjs",
+  "check-pi-pin-lockstep.mjs",
+  "ci-ref-check",
   "command-position",
   "sanctioned-identity",
   "sanctioned-pin-merge-base",
@@ -129,10 +140,17 @@ const LABELS = [
 const tmp = mkdtempSync(join(tmpdir(), "verdict-pin-"));
 try {
   const log = join(tmp, "capture.log");
-  // The vacuous-skip shape, which is the one that used to vanish (0 failed). If
-  // this shape round-trips, the ordinary failing shape does too — it is the
-  // strictly easier case, and it is asserted directly in #1.
-  writeFileSync(log, LABELS.map((l) => verdictLine(l, 0, 0, { skip: 1, red: true })).join("\n") + "\n");
+  // BOTH shapes go through the REAL parser, because they reach `runner::<label>`
+  // by different rules: the vacuous-skip shape is the one that used to vanish
+  // (0 failed ⇒ the parser calls it a PASS line), and the ordinary failing shape
+  // is the one every migrated harness prints. Round-tripping only the vacuous
+  // shape left the ordinary one checked against nothing but the COPY of the
+  // regex above — an assertion that can only agree with itself (#2723 review,
+  // 2026-11-10: coverage, not a live defect, and one line to close).
+  const SHAPES = [
+    ["the vacuous-skip shape (0 counted failures, red)", LABELS.map((l) => verdictLine(l, 0, 0, { skip: 1, red: true }))],
+    ["the ordinary failing shape (12 passed, 6 failed)", LABELS.map((l) => verdictLine(l, 12, 6))],
+  ];
   const pythons = ["python3.12", "python3"].filter(
     (py) => spawnSync(py, ["--version"], { encoding: "utf8" }).status === 0
   );
@@ -145,11 +163,15 @@ try {
   } else if (!existsSync(PARSER)) {
     bad("#2 the rail's parser is present", `missing ${PARSER}`);
   } else {
-    const r = spawnSync(pythons[0], [PARSER, "ids", "--log", log], { encoding: "utf8" });
-    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
-    eq(`#2 the parser exits 0 over ${LABELS.length} attributable lines`, r.status, 0);
-    for (const l of LABELS) contains(`#2 the parser extracts runner::${l}`, out, `runner::${l}`);
-    contains("#2 the parser drops nothing as unattributable", out, "unattributable=0");
+    for (const [shape, lines] of SHAPES) {
+      writeFileSync(log, lines.join("\n") + "\n");
+      const r = spawnSync(pythons[0], [PARSER, "ids", "--log", log], { encoding: "utf8" });
+      const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+      eq(`#2 the parser exits 0 over ${LABELS.length} attributable lines (${shape})`, r.status, 0);
+      const missing = LABELS.filter((l) => !out.includes(`runner::${l}`));
+      eq(`#2 the parser extracts every runner::<label> (${shape})`, missing, []);
+      contains(`#2 the parser drops nothing as unattributable (${shape})`, out, "unattributable=0");
+    }
   }
 } finally {
   rmSync(tmp, { recursive: true, force: true });
@@ -168,6 +190,11 @@ const EXEMPT = new Map([
     "run via `node --test`: TAP output (`not ok`, `# fail N`) — a different identity family"],
   ["scripts/tortoise-memory.test.mjs",
     "run via `node --test`: TAP output (`not ok`, `# fail N`) — a different identity family"],
+  ["scripts/check-skill-lint.mjs",
+    "a CHECKER, not a harness (`ci-main.yml`'s skill-lint step): it lints SKILL.md frontmatter and " +
+    "prints `N issue(s)` / `Clean.`, so it has no pass/fail aggregate to attribute. Its own " +
+    "reference suite, scripts/check-skill-lint.test.mjs, IS migrated and carries the `ci / unit-test` " +
+    "identity for that surface"],
 ]);
 
 // Where a workflow materialises a harness from somewhere else (a `$RUNNER_TEMP`
@@ -189,14 +216,59 @@ function resolveHarness(token) {
   return null;
 }
 
+/** A YAML mapping key, at any depth, with or without a `- ` sequence marker. */
+const KEY_LINE = /^(\s*)(?:-\s*)?([A-Za-z0-9_.-]+):\s*(.*)$/;
+const BLOCK_SCALAR = /^[|>][+-]?\d*$/;
+
+/** Every COMMAND string a workflow file carries, in the three shapes this repo
+ *  actually uses. (§3's corpus bug, #2723 review 2026-11-10: the old scan matched
+ *  only `^\s*(?:-\s*)?run:` WITH `node` on the SAME line, so two live call sites
+ *  were invisible — `ci.yml:52`'s `test-command:` value, run by `node-ci.yml:230`,
+ *  and the `run: |` bodies in `ci-main.yml`.)
+ *
+ *    1. `run: <command>`                     — one line, carries `node`
+ *    2. `run: |` / `run: >`                   — a BLOCK SCALAR: the commands are
+ *       the following lines indented deeper than the key
+ *    3. `<key>: … node <x>.mjs`               — a reusable workflow's input,
+ *       e.g. `test-command:` and `test-glob:`
+ *
+ *  A line only counts when it names `node`, so a shell comment or a stray
+ *  `.mjs` in prose cannot pull a harness into the corpus that nothing runs — the
+ *  pin would then demand a migration for a file with no call site.
+ *  YAML comments can never match at all: `KEY_LINE` requires the line to start
+ *  with whitespace (optionally `- `) before the key, and `#` does not.
+ */
+function commandTokens(body) {
+  const lines = body.split("\n");
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = KEY_LINE.exec(lines[i]);
+    if (!m) continue;
+    const keyCol = lines[i].indexOf(m[2]);
+    const value = (m[3] ?? "").trim();
+    if (BLOCK_SCALAR.test(value.replace(/\s+#.*$/, ""))) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const line = lines[j];
+        if (line.trim() === "") continue;
+        if (line.length - line.trimStart().length <= keyCol) break; // dedent ends the block
+        if (!/\bnode\b/.test(line)) continue;
+        out.push(line);
+      }
+      continue;
+    }
+    if (!/\bnode\b/.test(value)) continue;
+    out.push(value);
+  }
+  return out;
+}
+
 function workflowNodeHarnesses() {
   const found = new Map(); // repo-relative path -> {wf, token}
   const files = readdirSync(WORKFLOWS).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   for (const wf of files) {
     const body = readFileSync(join(WORKFLOWS, wf), "utf8");
-    for (const line of body.split("\n")) {
-      if (!/^\s*(?:-\s*)?run:/.test(line) || !/\bnode\b/.test(line)) continue;
-      for (const token of line.match(/[A-Za-z0-9_./-]+\.mjs/g) ?? []) {
+    for (const command of commandTokens(body)) {
+      for (const token of command.match(/[A-Za-z0-9_./-]+\.mjs/g) ?? []) {
         const resolved = resolveHarness(token);
         if (resolved) found.set(resolved, { wf, token });
       }
@@ -211,16 +283,48 @@ const harnesses = workflowNodeHarnesses();
 if (harnesses.size >= 10) ok(`#3 the enumeration found ${harnesses.size} workflow-run node harnesses (a non-empty corpus)`);
 else bad("#3 the enumeration found a non-empty corpus", `only ${harnesses.size} — the scan itself is broken`);
 
+const EMITTER_IMPORT = String.raw`(?:^|\n)\s*import\s+\{[^}]*\breportVerdict\b[^}]*\}\s+from\s+["'][./][^"']*verdict\.mjs["']`;
+
+/** A `reportVerdict(` CALL SITE — not the import, and not a mention in a comment.
+ *  ⛔ THE IMPORT ALONE EMITS NOTHING (#2723 review 2026-11-10, measured): the row
+ *  below used to be labelled "emits through reportVerdict" while its test was a
+ *  regex over the IMPORT line, so keeping the import and deleting the call
+ *  (`reportVerdict("x", p, f);` → `void reportVerdict;`) left the pin green while
+ *  the harness emitted nothing and `ci_exemption.py ids` returned `ids=0 …
+ *  runner=0` — the blind refusal, reintroduced by the one mutation that restores
+ *  the defect. Comment lines are skipped so a docblock that names the emitter
+ *  cannot stand in for a call.
+ *  DECLARED RESIDUAL: this is syntactic, so a call that can never be REACHED
+ *  (inside `if (false)`) still satisfies it. Proving reachability needs the
+ *  harness's own runtime per file; the alternative accepted here is the
+ *  per-file run, rejected as the pin's cost on the PR lane (the heavy members of
+ *  the corpus are `discard-gate` and `gui-device-guard`). */
+function callsEmitter(body) {
+  return body.split("\n").some((line) => {
+    const t = line.trim();
+    if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return false;
+    return /\breportVerdict\s*\(/.test(line);
+  });
+}
+
 const sorted = [...harnesses.keys()].sort();
 for (const path of sorted) {
   const wf = harnesses.get(path).wf;
-  const body = readFileSync(join(REPO, path), "utf8");
-  const emitterImport = String.raw`(?:^|\n)\s*import\s+\{[^}]*\breportVerdict\b[^}]*\}\s+from\s+["'][./][^"']*verdict\.mjs["']`;
-  if (new RegExp(emitterImport).test(body)) { ok(`#3 ${path} (${wf}) emits through reportVerdict`); continue; }
   if (EXEMPT.has(path)) { ok(`#3 ${path} (${wf}) is exempt — ${EXEMPT.get(path)}`); continue; }
-  bad(`#3 ${path} (${wf}) emits through reportVerdict`,
-    "it neither imports the shared emitter nor carries a measured exemption, so a failing run of it " +
-    "yields NO identity and the merge rail refuses the PR blind (#2723)");
+  const body = readFileSync(join(REPO, path), "utf8");
+  // Two rows, because the two halves fail differently: an absent import means the
+  // harness never had the emitter; an import with no call means it HAD it and lost
+  // the emission, which is the shape a "tidy-up" produces.
+  if (new RegExp(EMITTER_IMPORT).test(body)) ok(`#3 ${path} (${wf}) imports the shared emitter`);
+  else
+    bad(`#3 ${path} (${wf}) imports the shared emitter`,
+      "it carries no measured exemption, so a failing run of it yields NO identity and the merge " +
+      "rail refuses the PR blind (#2723)");
+  if (callsEmitter(body)) ok(`#3 ${path} (${wf}) calls reportVerdict — the import alone emits nothing`);
+  else
+    bad(`#3 ${path} (${wf}) calls reportVerdict — the import alone emits nothing`,
+      "it imports the emitter but never CALLS it, so its aggregate is whatever the harness prints " +
+      "by hand and `ci_exemption.py ids` finds no `runner::` identity (#2723)");
 }
 
 // The complementary half: none may ALSO keep a hand-rolled aggregate BESIDE the
@@ -320,6 +424,11 @@ for (const path of materialised) {
   const ownDir = path.split("/").slice(0, -1).join("/");
   // The mapping that materialises the harness's OWN directory fixes the base the
   // runtime will resolve its relative specifiers against.
+  // ⛔ SCOPE, stated: `own` is resolved from the WHOLE workflow file, not from the
+  // job/step that runs this harness, so it does not prove the copy happens in the
+  // same step that needs it. Only one mapping exists today (`http-pool-hygiene`),
+  // so there is no live false PASS; this becomes one the moment a second job
+  // copies that directory (#2723 review, 2026-11-10 — recorded, not fixed).
   const own = maps.find((m) => m.dirMode && m.source === ownDir);
   if (!own) {
     bad(`#4 ${path} (${wf}) is copied by a mapping this pin can read`,
