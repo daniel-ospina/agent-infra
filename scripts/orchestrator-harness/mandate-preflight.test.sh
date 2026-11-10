@@ -58,6 +58,15 @@ run()     { CELL_HOME="$TMP/home" bash "$HELPER" "$@"; }
 # ⛔ Not produced by invoking the brief-gate helper from inside this suite (see the note at the seam
 # fixture): a nested script invocation under a variable path makes the working-tree guard refuse to run
 # this file at all, and the mandate arm is not the place to re-test brief-gate's own text.
+# ⛔ EVERY SECTION THE GATE REQUIRES FOR `role: reviewer` MUST BE HERE, OR THE WHOLE §E CLUSTER REDS
+# FOR A REASON THAT HAS NOTHING TO DO WITH THE MANDATE DISCLOSURE (measured 2026-11-10, 18 arms).
+# `brief-gate.sh` gained the `## MUTATION ATTRIBUTION` requirement later (#3442), and this fixture kept
+# the older shape — so `run_agent` refused the brief at the gate (exit 80, "nothing was started"), and
+# every assertion downstream of the dispatch reddened: the append, the log, `STUB-PI-RAN`, the last-line
+# arms, all of it, with the mandate emit never reached. The fixture is the SUBJECT of the appendix, not
+# the gate: the gate's own text is `brief-gate.test.sh`'s subject, and re-testing it here is what let a
+# schema change silently disable 18 arms of a different suite. The `NO NEW ASSERTIONS:` line is written
+# at COLUMN 0 on purpose — the gate skips the indented form, and this brief carries no diff.
 seam_brief() {
   cat > "$1" <<'BRIEF'
 # a brief for the seam
@@ -72,6 +81,8 @@ WIP: keyless — test fixture: this brief is the subject of another suite, not a
 BRANCH: none — test fixture
 WORKTREE: none — test fixture
 PRIOR: no previous attempt — test fixture
+## MUTATION ATTRIBUTION
+NO NEW ASSERTIONS: test fixture — this brief carries no diff; it exists to exercise the mandate disclosure.
 BRIEF
 }
 
