@@ -554,21 +554,34 @@ lock_age() { # <path> → SECONDS since its mtime, "" when no `stat`/`date` can 
 
 # claim_stale <pid-when-judged> <message> → 0 = the lock this run judged is gone
 # `mv` is the atomic claim; exactly one reclaimer can win it. If the directory that landed under the
-# scratch name does not carry the pid the decision was made on, it is NOT the lock we judged — either
-# a peer reclaimed it and re-created it, or it is brand new — so it is PUT BACK and this run waits,
-# never deleted. A claimed directory that cannot be deleted is left as `.stale.<pid>` debris: the LOCK
-# NAME is free either way, which is the only thing that matters for correctness.
+# scratch name is not the lock the decision was made on — a different pid, or (pid-less) a FRESH age —
+# it is PUT BACK and this run waits, never deleted. A claimed directory that cannot be deleted is left as
+# `.stale.<pid>` debris: the LOCK NAME is free either way, which is the only thing that matters for
+# correctness.
 claim_stale() { # <judged-pid> <message>
   # a UNIQUE scratch name per attempt: a repeated reclaim inside one loop would otherwise `mv` the
   # second lock INTO the debris the first left behind (mv-into-existing-dir), silently disarming a peer.
-  local judged="$1" gone="$LOCKDIR.stale.$$.$RANDOM" got=""
+  local judged="$1" gone="$LOCKDIR.stale.$$.$RANDOM" got="" aged=""
   [ -n "$2" ] && warn "$2"
   mv "$LOCKDIR" "$gone" 2>/dev/null || return 1
   [ -f "$gone/pid" ] && got="$(command cat "$gone/pid" 2>/dev/null)"
   case "$got" in ''|*[!0-9]*) got="" ;; esac
   if [ "$got" = "$judged" ]; then
-    rm -rf "$gone" 2>/dev/null || :
-    return 0
+    # ⛔ FOR A PID-LESS LOCK THE PID IS NOT AN IDENTITY — an empty pid matches an empty pid. A peer that
+    # reclaimed and re-created the lock, or a LIVE ACQUIRER in its `mkdir`→pid-write window, also reads
+    # back `""`, so `"" = ""` DELETED a live lock and this run then entered the critical section beside
+    # it (measured with the same interposition the pid-bearing arm uses; the pid-bearing shapes are safe
+    # only because their pid is then non-empty and mismatches). The identity a re-create cannot forge is
+    # the AGE, which `mv` PRESERVES: the lock this run judged still reads its old age, a fresh one ~0 s.
+    if [ -n "$judged" ]; then
+      rm -rf "$gone" 2>/dev/null || :
+      return 0
+    fi
+    aged="$(lock_age "$gone")"
+    if [ -n "$aged" ] && [ "$aged" -ge "$LOCK_STALE_MAX" ]; then
+      rm -rf "$gone" 2>/dev/null || :
+      return 0
+    fi
   fi
   if [ ! -e "$LOCKDIR" ] && mv "$gone" "$LOCKDIR" 2>/dev/null; then
     warn "  · $LOCKDIR was re-created while being reclaimed — restored, not removed."
@@ -940,6 +953,17 @@ pull_one_locked() { # <key>
       UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
     fi
     if [ "$lat" = "$rat" ]; then
+      # ⛔ THE EQUAL-STAMP ARM NEEDS THE SAME USABILITY TEST AS THE NEWER ONE (#2510 review round 7).
+      # It was the one local-record arm still ungated, so a local record the READER REFUSES — a trailing
+      # comma, say — at the same stamp/head/verdict as a usable peer was KEPT and reported converged at
+      # rc 0 with `unreadable=0`, i.e. the same dead end `pull` is advertised as the remedy for (one arm
+      # over from the arm that names it). Rule 1 is not relaxed: the bytes are still not overwritten.
+      if ! record_usable "$lf"; then
+        warn "  ⚠️ skip $key — this box's record matches the peer's stamp ($lat) but is NOT one its own rail can use"
+        warn "     (no 40-hex head_sha, no verdict, or not strict JSON). It is NOT overwritten (#2374 rule 1)"
+        warn "     and \`pull\` cannot repair it — remove or re-mint $lf."
+        UNREADABLE=$((UNREADABLE + 1)); LOCAL_UNUSABLE=$((LOCAL_UNUSABLE + 1)); rm -f "$tmp"; return 0
+      fi
       # The peer's record supersedes this box's only when it is a CARRY of it (same mint time, and
       # `carried_from` names the head this box holds) — the carry arm keeps the stamp, so treating
       # that as a conflict would strand every carried verdict on the box that did not mint it.

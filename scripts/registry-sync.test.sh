@@ -1303,6 +1303,41 @@ if [ -s "$T/l.called" ]; then ok "§30l (premise) the failing stat WAS consulted
 if [ -d "$LKD/.registry-sync.lock" ]; then ok "§30l ...the lock is still there"; else bad "§30l ...the undateable lock was STOLEN"; fi
 assert_absent "$LKD" "$LKD/$LCK_KEY.json" "§30l ...and nothing was written without it"
 rm -rf "$LKD/.registry-sync.lock"; lock_reset
+# (n) THE PID-LESS IDENTITY IS THE AGE, NOT THE PID. `"" = ""` matched a RE-CREATED pid-less lock — a
+# live acquirer in its `mkdir`→pid-write window — so the claim DELETED a live lock and this run then
+# entered the critical section beside it (round 7, reproduced with the same interposition §30i uses, only
+# with a pid-less foreign lock). `mv` preserves mtime, so the judged lock still reads its old age while a
+# fresh one reads ~0 s: the re-created lock must be RESTORED.
+SHIM_N="$T/shim-n"; mkdir -p "$SHIM_N"; : > "$T/n.fired"
+REAL_MV_N="$(command -v mv)"
+cat > "$SHIM_N/mv" <<EOS
+#!/bin/sh
+case "\$1" in
+  */.registry-sync.lock)
+    case "\$2" in
+      */.registry-sync.lock.stale.*)
+        if [ ! -s "$T/n.fired" ]; then
+          printf 'x' > "$T/n.fired"
+          rm -rf "\$1"              # a live acquirer won the name...
+          mkdir -p "\$1"            # ...and has NOT written its pid yet (its mkdir→pid window)
+        fi ;;
+    esac ;;
+esac
+exec "$REAL_MV_N" "\$@"
+EOS
+chmod +x "$SHIM_N/mv"
+lock_reset
+mkdir -p "$LKD/.registry-sync.lock"
+touch -t 202001010000 "$LKD/.registry-sync.lock"
+N_OUT="$(PATH="$SHIM_N:$PATH" bash "$SYNC" pull --repo "$MINI_STORE" --dir "$LKD" --remote origin --timeout 30 2>&1)"; N_RC=$?
+if [ -s "$T/n.fired" ]; then ok "§30n (premise) the pid-less re-create WAS interposed under the claim"; else bad "§30n (premise) the claim never renamed the lock — the arm proves nothing"; fi
+if [ -d "$LKD/.registry-sync.lock" ] && [ ! -f "$LKD/.registry-sync.lock/pid" ]; then
+  ok "§30n a claim that moved a re-created PID-LESS lock put it back (the acquirer's lock survived)"
+else
+  bad "§30n the claim DELETED a live acquirer's pid-less lock (an empty pid is not an identity)"
+fi
+assert_eq "$N_RC" "1" "§30n ...and that run fails closed rather than writing beside the acquirer"
+rm -rf "$LKD/.registry-sync.lock" "$LKD"/.registry-sync.lock.stale.*; lock_reset
 # §30m — NOT PINNED, and said so rather than faked. `reg_lock` now refuses to enter the critical section
 # when it cannot write its own `pid` (a lock it cannot record itself in is a lock it can never release:
 # `reg_unlock` removes only a lock whose pid is ours, so the directory would stay and the pid-less arm
@@ -1340,6 +1375,28 @@ assert_not_contains "$UN_OUT" "this box is NEWER" "§31 ...and the run does not 
 # sentence here sends the operator to the store side — the misdirection this arm exists to remove.
 assert_contains "$UN_OUT" "THIS BOX's OWN unusable" "§31 ...and the SUMMARY blames this box's own record, not the store"
 assert_not_contains "$UN_OUT" "the store holds records this box cannot use" "§31 ...and does not make the fleet-facing claim about the store"
+# §31b — the EQUAL-STAMP arm had no usability test, so this box's own unusable record at the peer's exact
+# stamp/head/verdict was KEPT and reported converged at rc 0 with `unreadable=0` — the same dead end one arm
+# over from the one §31 names (round 7). Rule 1 is still not relaxed: the bytes are not overwritten.
+EQ_BOX="$MINI_ROOT/box-eq"; mkdir -p "$EQ_BOX"
+printf '{"pr":2374,"head_sha":"%s","mint":"fresh","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-10-20T00:00:00Z",}\n' \
+  "$HEAD_A" > "$EQ_BOX/$UN_KEY.json"   # trailing comma: the strict reader REFUSES it
+if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$EQ_BOX/$UN_KEY.json" 2>/dev/null; then
+  bad "§31b (premise) the fixture parses — it must NOT (a trailing comma)"
+else
+  ok "§31b (premise) this box's record is one the strict reader REFUSES"
+fi
+if grep -q '"reviewed_at":"2026-10-20T00:00:00Z"' "$EQ_BOX/$UN_KEY.json"; then
+  ok "§31b (premise) ...and it sits at the PEER's own stamp, so the equal-stamp arm is the one exercised"
+else
+  bad "§31b (premise) the fixture is not at the peer's stamp — the wrong arm would be exercised"
+fi
+EQ_BEFORE="$(digest "$EQ_BOX")"
+EQ_OUT="$(mini_rs "$EQ_BOX" pull)"; EQ_RC=$?
+assert_eq "$EQ_RC" "4" "§31b this box's unusable record at the PEER'S OWN stamp is exit 4, not a converged-looking 0"
+assert_contains "$EQ_OUT" "matches the peer's stamp" "§31b ...and the run NAMES the real state"
+assert_eq "$(digest "$EQ_BOX")" "$EQ_BEFORE" "§31b ...and it is not overwritten"
+assert_not_contains "$EQ_OUT" "differ only in carry provenance" "§31b ...and it is not reported as a carry-provenance match"
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
