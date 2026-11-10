@@ -848,16 +848,35 @@ ck "(d) …and it distinguishes the KEPT-copy shape, whose remedy is to move the
 # 74 as ONE shape seventy lines above the row that had just been taught both — same object, two homes,
 # so an edit to one left the other asserting the no-op remedy. A revert to the single-shape legend
 # reddens here.
+# ⛔ CAPTURE, THEN TEST IN THE SHELL — NEVER `awk … | grep -q` (#841/#864). `grep -q` exits on its
+# first match, so the producer on its left takes EPIPE and SIGPIPEs; under `pipefail` (which callers
+# and CI shells set) the PIPELINE then reports failure even though the pattern matched, so the
+# assertion reads RED on a tree that is correct. A guard that can answer the opposite of what it
+# asserts is worse than no guard.
+# ⛔ AND `check-no-sigpipe-grep.sh` DOES flag this shape, just not for the reason the eye sees: the
+# flagged unit was the `grep -qF 'TWO SHAPES' && awk … | grep -qF 'NO-OP'` command LIST, where the
+# guard reads the first `grep` as the producer feeding the second pipe (it recognises
+# printf|echo|grep). MEASURED at c8b542750751 — `scripts/harness-surface.test.sh — 1 occurrence(s),
+# undeclared` in CI job 129714693871 — so this arm was itself a red `sigpipe-grep` check until it was
+# written this way. The guard's OWN note is why BOTH arms below capture rather than pipe: "any OTHER
+# producer piped into a quiet grep has the same failure mode (#864)", so a lone `awk | grep -q` is the
+# same latent false negative even when the scanner does not name it.
+legend="$(awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null || true)"
+case "$legend" in *'TWO SHAPES'*) leg_shapes=1 ;; *) leg_shapes=0 ;; esac
+case "$legend" in *'NO-OP'*)      leg_noop=1   ;; *) leg_noop=0   ;; esac
 has_legend=0
-awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null | grep -qF 'TWO SHAPES' && \
-  awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null | grep -qF 'NO-OP' && has_legend=1
+[ "$leg_shapes" = 1 ] && [ "$leg_noop" = 1 ] && has_legend=1
 ck "(d) the row LEGEND also names rc 2 as two shapes with opposite remedies (not one, above the row)" "$([ "$has_legend" = 1 ] && echo 0 || echo 1)"
 # ⛔ AND IT MUST NOT SEND THE OPERATOR TO `$O` (fresh-context review of #3846, cycle 5). The lock lives in
 # the RESOLVED state dir (`${ORC_STATE_DIR:-$O}`, `hp_launchd_dead_text`) — this file records that exact
 # wording as the P3 defect it fixed one reader over, and the legend named `$O/.orch.lock` anyway, 26 lines
 # above its own correction. A path-naming revert reddens here instead of shipping a path that may not exist.
+# ⛔ AND IT IS THE SAME CAPTURE, NOT A SECOND PIPE (see the #841/#864 note above). A `awk … | grep -q`
+# here would be the same latent false NEGATIVE one row up — and on a NEGATIVE assertion a false
+# negative is the whole assertion: `legend_has_O` would stay 0 on a legend that names `$O`, so the pin
+# would silently stop pinning. `case` against the captured string cannot be defeated by a SIGPIPE.
 legend_has_O=0
-awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null | grep -qF '$O/.orch.lock' && legend_has_O=1
+case "$legend" in *'$O/.orch.lock'*) legend_has_O=1 ;; *) legend_has_O=0 ;; esac
 ck "(d) …and the legend names NO \$O path for the lock (it is in the resolved state dir)" "$([ "$legend_has_O" = 1 ] && echo 1 || echo 0)"
 
 # ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
