@@ -264,7 +264,9 @@ c="$(u ". '$GH_AUTH'; GH_TOKEN='   ' GITHUB_TOKEN=fixture-token gh_auth_cause '$
              *) ck "A7h …and the cause names GH_TOKEN (got '$c')" 1 ;; esac; }
 # ⛔ THE MIRROR DIRECTION, AND THE POSITION OF THE WHOLE BLOCK, ARE THE OTHER HALF OF "ONE ORDERED READ" —
 # and a suite that pins only the shape it was written for cannot tell an ordering from a mirror rule. Both
-# mutants below kept this suite at 61/61 before A7i-A7k existed (measured at this head):
+# mutants below kept this suite at 61/61 before A7i-A7k existed (measured at `f3adab923`, the head that
+# introduced the ordered read and where this file had 61 arms; the same two mutants were re-run at 75 arms
+# and are reported with the arms that kill them):
 #   M4 — "ANY set-but-all-blank name shadows the other" (the model `worker-terminal.sh:1087` states verbatim,
 #        "a blank one in either hides a valid one") answers `token-blank|GITHUB_TOKEN` where gh answers `realtok`;
 #   M6 — the token block moved AFTER the `ambient` arm answers `ambient|<dir>` where gh reads the whitespace.
@@ -386,10 +388,16 @@ ck "B2f3 …and the lane log carries state=none, so the land-backlog line is not
 # `state=account at …`, exported an inert config dir, and then asserted "the lane's gh IS credentialed" over
 # a lane whose every gh call fails (measured: gh resolves the whitespace INSTEAD of any store). The account
 # home is REALly populated here on purpose: the arm's job is that the store is NOT claimed.
+# ⛔ THE GREP MUST MATCH A STRING ONLY THE REFUSAL PRINTS. `gh_auth_log` emits `${d} is set but BLANK`
+# on EVERY lane (`gh-auth.sh:302`, printed at `:318`) and `gh_auth_cause` emits the same words, so a bare
+# `grep -q 'GH_TOKEN is set but BLANK'` matched the LOG LINE and could not see a refusal that dropped the
+# cause entirely — measured: replacing the refusal's `%s` with a fixed phrase in `spawn-gate.sh` left the
+# suite at 75/0 with no arm red. The `THIS IS NOT THE LANDING RATIO:` prefix exists only on the refusal,
+# so the arm now measures the sentence the operator reads. B2g2/B2h2/B2i2 carry it.
 run_lane 81 15 "P0-blocker,harness" "crash on boot" ok 2518 b2g "$ACCT" GH_TOKEN='   '
 { [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "B2g a blank-but-set GH_TOKEN is HELD (rc=$LANE_RC) even though the account home HAS a store, and no session ran" $rc
-grep -q 'GH_TOKEN is set but BLANK' "$TMP/b2g.log"; rc=$?
+grep -q 'THIS IS NOT THE LANDING RATIO: GH_TOKEN is set but BLANK' "$TMP/b2g.log"; rc=$?
 ck "B2g2 …and the refusal names the blank token as the credential cause" $rc
 grep -q 'IS credentialed' "$TMP/b2g.log" && rc=1 || rc=0
 ck "B2g3 …and never asserts the lane's gh IS credentialed (the false claim this arm exists to remove)" $rc
@@ -405,7 +413,7 @@ ck "B2g4 …and the lane log says state=token-blank with NO dir=, so nothing rea
 run_lane 81 15 "P0-blocker,harness" "crash on boot" ok 2519 b2h "$ACCT" GH_TOKEN='   ' GITHUB_TOKEN=fixture-token
 { [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "B2h a blank-but-set GH_TOKEN beside a REAL GITHUB_TOKEN is HELD (rc=$LANE_RC), and no session ran" $rc
-grep -q 'GH_TOKEN is set but BLANK' "$TMP/b2h.log"; rc=$?
+grep -q 'THIS IS NOT THE LANDING RATIO: GH_TOKEN is set but BLANK' "$TMP/b2h.log"; rc=$?
 ck "B2h2 …and the refusal names GH_TOKEN as the cause, not the neighbouring token" $rc
 grep -q 'IS credentialed' "$TMP/b2h.log" && rc=1 || rc=0
 ck "B2h3 …and never asserts the lane's gh IS credentialed (the exact false claim this arm exists to remove)" $rc
@@ -421,7 +429,7 @@ ck "B2h4 …and the lane log says state=token-blank with no dir= ('$(grep -o 'st
 run_lane 81 15 "P0-blocker,harness" "crash on boot" ok 2520 b2i "$ACCT" GH_CONFIG_DIR="$TMP/cfg-a" GH_TOKEN='   '
 { [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "B2i a blank GH_TOKEN over an AMBIENT store that holds hosts.yml is HELD (rc=$LANE_RC), and no session ran" $rc
-grep -q 'GH_TOKEN is set but BLANK' "$TMP/b2i.log"; rc=$?
+grep -q 'THIS IS NOT THE LANDING RATIO: GH_TOKEN is set but BLANK' "$TMP/b2i.log"; rc=$?
 ck "B2i2 …and the refusal names the blank token, not the store gh was pointed at" $rc
 grep -q 'IS credentialed' "$TMP/b2i.log" && rc=1 || rc=0
 ck "B2i3 …and never asserts the lane's gh IS credentialed (state=ambient would be that false claim)" $rc
