@@ -3104,7 +3104,7 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:8084 at this head — RE-DERIVE it, do not trust the number: a bare
+#      (scripts/record-review.sh:8103 at this head — RE-DERIVE it, do not trust the number: a bare
 #      line citation here has rotted before, and this comment is not what makes
 #      the assertion true). One command answers it (origin/main bd1b205d is :6225):
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
@@ -5110,9 +5110,12 @@ $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "13n9 'fixed' does not excuse the blocker that is still REMAINING (rc 3)"
 [ ! -f "$(Q2 425013)" ] && ok "13n9 no record minted while one of the declared blockers remains" || bad "13n9 minted a record over the remaining blocker"
 
-# 13n9b — THE ROW THAT ACTUALLY PINS (c) (review F2, #3442 rule 3). It carries the COPLA 13n9 lacks,
-# so (b) MATCHES: without (c) cancelling it on the wrong half, the line continues and records `clean`
-# over a standing blocker. Deleting the (c) clause reddens THIS row and nothing else in the section.
+# 13n9b — a VETO row that (review F2) USED TO BE the only pin on (c). It carries the COPLA 13n9
+# lacks, so (b) MATCHES and (c) is what cancels it — but F3's count predicate now vetoes it too (the
+# line declares TWO live blocking mentions), so deleting (c) leaves THIS row green. It stays because
+# "a copula body with a standing blocker is not clean" is worth a row of its own; the (c) pin is
+# 13n29, the row with ONE live mention that (c) alone can catch. ⛔ A row whose verdict also holds for
+# a second reason is not a pin for the first — calling it one is the unrelated-row trap #3442 names.
 rm -f "$(Q2 425026)"
 EV_REF="comment:42502601" run_record_ev 425026 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed, 1 blocking remains.**
 
@@ -5255,6 +5258,56 @@ EV_REF="comment:42503301" run_record_ev 425033 STUB_EVIDENCE_BODY="**Outcome: CL
 
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13n25 a negation in a DIFFERENT clause does not refuse a clean review (rc 0)"
+
+# 13n26-13n27 — (b) ANSWERS ONE COUNT, NOT TWO (agent-infra#2661 third review, F3). (c) is an
+# ENUMERATED synonym list for "this count is not resolved", and the DEFERRAL family is not in it —
+# so `2 blocking were fixed, 1 blocking deferred to a follow-up` escaped on the resolved half and
+# minted `clean`. The family is OPEN-ENDED (deferred / filed / waived / accepted / carried / left /
+# out of scope), so enumerating it is the same mistake one word later. The fix is the RELATIONSHIP:
+# (b) may answer exactly ONE live blocking mention, and a SECOND belongs to no escape. Both bodies
+# below were MEASURED admitted at 233982af4.
+rm -f "$(Q2 425034)"
+EV_REF="comment:42503401" run_record_ev 425034 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed, 1 blocking (P1) deferred to a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n26 the resolved half does NOT answer for a SECOND live blocking count — 'deferred' is not resolved (rc 3)"
+[ ! -f "$(Q2 425034)" ] && ok "13n26 no record minted over a deferred blocker" || bad "13n26 minted a record — the resolved half answered for a deferred blocker"
+
+rm -f "$(Q2 425035)"
+EV_REF="comment:42503501" run_record_ev 425035 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed, 1 blocking (P1) waived.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n27 'waived' is the same open-ended family as 'deferred' — the COUNT closes it, not a synonym (rc 3)"
+
+# 13n28 — THE OVER-BLOCK CONTROL for the count predicate. The obvious over-correction is to count
+# EVERY `blocking` mention, which would refuse this genuinely clean review for the `non-blocking`
+# note beside its resolved blocker — the tortoise#8866 false-refusal class, arriving from a new
+# direction. A NEGATED mention is not a live one, so this row reds under the negation-blind count.
+rm -f "$(Q2 425036)"
+EV_REF="comment:42503601" run_record_ev 425036 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed and re-verified; 4 non-blocking (P3) notes were filed as follow-ups.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n28 a NEGATED second mention is not a live blocker — the count predicate still records a resolved line (rc 0)"
+
+# 13n29 — THE ROW THAT PINS (c) NOW (review F3 moved the pin off 13n9b, which the count predicate
+# also vetoes). It has ONE live blocking mention and a persistence word OUTSIDE the resolved window,
+# so the count predicate cannot catch it and `(b)` matches: `(c)` alone cancels the escape.
+# MEASURED: deleting the (c) conjunct flips THIS row to ADMIT (rc 0) and leaves 13n9/13n9b VETO.
+rm -f "$(Q2 425037)"
+EV_REF="comment:42503701" run_record_ev 425037 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed, 1 of them remains.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n29 the (c) persistence cancel, on a line the COUNT predicate cannot catch (rc 3)"
+
+# 13n30 — THE ROW THAT PINS THE RELATIONSHIP OVER THE DIGITS. A spelled count cannot be subtracted
+# arithmetically (`one blocking` has no digit), so a digit-only version of the count predicate would
+# admit it while still passing 13n26/13n27. Counting LIVE MENTIONS answers the relationship and this
+# row is what distinguishes it from the cheaper proxy.
+rm -f "$(Q2 425038)"
+EV_REF="comment:42503801" run_record_ev 425038 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed, one blocking (P1) deferred.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n30 a SPELLED second count is still a second live blocker — the predicate counts mentions, not digits (rc 3)"
 
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
@@ -6322,13 +6375,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4302 :6028 :8402 :8576, plus a comment mention at :4171; `14.1c-CITE` below
+#     CITE-CHECK: :4321 :6047 :8421 :8595, plus a comment mention at :4190; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4159) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4302) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4321) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8402). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8421). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -6354,7 +6407,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8402` / `:8576` — CITE-CHECK: :8402 :8576 — re-derived by the
+#     this head the predicates are `:8421` / `:8595` — CITE-CHECK: :8421 :8595 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6471,7 +6524,7 @@ assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marke
 #      previously claimed "`-qxF`->`-qF` at the dedup read left the suite at
 #      PASS=921 FAIL=0". THERE IS NO GREP AT THE DEDUP READ — not anchored, not
 #      unanchored: the loop compares whole bodies with `[ "$_body" = "$marker" ]`
-#      (scripts/record-review.sh:4224 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
+#      (scripts/record-review.sh:4243 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
 #      have been measured. The mutant that actually makes (b2) meaningful is replacing
 #      that equality with a SUBSTRING test (`case "$_body" in *"$marker"*)`): it
 #      reddens (b2) — which expects 1 POST and would get 0.
@@ -7258,12 +7311,12 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
 #       and in #3168's diff the only hunk at `post_marker()` (head :4159) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4296) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :4321) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6028 :8402 :8576 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6047 :8421 :8595 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -10032,8 +10085,8 @@ targets = sys.argv[2:]
 # ⛔ A WHOLE-FILE LEXER WAS BUILT AND REJECTED — with the measurement, not as a preference.
 # Carrying quote state across lines is the only way to close the multi-line hole, and on the
 # REAL recorder it desyncs at `$(` inside a double-quoted string, because `$(` resets quoting:
-# the awk program at record-review.sh:2344 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
-# its own comment block across lines (`sed -n '2355,2364p'`), so a lexer that does not model `$(`
+# the awk program at record-review.sh:2363 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
+# its own comment block across lines (`sed -n '2374,2383p'`), so a lexer that does not model `$(`
 # re-opens a quote mid-program and reports those lines as live backticks — 26 false REDs over 12
 # lines in the prototype run (a COUNT, not a line map). Modelling `$(`,
 # `${`, `$'` and heredocs well enough to stay in sync is a bash lexer, which is a different

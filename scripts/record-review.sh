@@ -1087,7 +1087,7 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 #       a negated follow-up clause, not a clean review, and `... all 4 findings non-blocking` (no
 #       count) still escapes.
 #   (b) RESOLVED — the count is declared CLOSED: "3 blocking findings were fixed and re-verified".
-#       Four predicates, each of which a MEASURED vector defeated when it was missing:
+#       Five predicates, each of which a MEASURED vector defeated when it was missing:
 #         * a POSITIVE COUNT precedes the noun;
 #         * a COPULA/AUXILIARY (`were|was|are|is|being|been|now|all|both`) sits between the noun and
 #           the verb, because "closed the socket too early" is a description, not a resolution;
@@ -1097,16 +1097,28 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 #           is the same count with the OPPOSITE TRUTH VALUE — `were not fixed`, `are not yet
 #           resolved`, `were being addressed` and `were never resolved` were all MEASURED admitted at
 #           c33ae248b (review F1), where this window spanned the `not` and never read it.
+#         * EXACTLY ONE LIVE BLOCKING MENTION on the declaration line. (b) answers ONE count; a line
+#           carrying a SECOND live mention has a blocker (b) never accounted for, and the resolved
+#           half must not answer for it. `… 2 blocking (P1) findings were fixed, 1 blocking (P1)
+#           deferred to a follow-up` / `… filed as a follow-up` / `… waived` / `… accepted as a known
+#           risk` / `… left for a later cycle` / `… out of scope` were ALL MEASURED admitted at
+#           233982af4 (review F3). ⛔ THE FIX IS A RELATIONSHIP, NOT A WIDER SYNONYM LIST: deferral,
+#           filing and waiving are an OPEN-ENDED family, so (c) can never enumerate them; what CAN
+#           be counted is how many live blockers the line declares. A NEGATED mention (`no`/`non`/
+#           `zero`/`none`, or `0`) is not a live one, so `2 blocking were fixed; 4 non-blocking (P3)
+#           filed` still escapes (13n28).
 #       The window is bounded and `;`/`.`/`:`-terminated so an unrelated later clause cannot supply
 #       the verb.
 #   (c) NOT RESOLVED — a persistence qualifier inside the SAME window cancels (b):
 #       "2 blocking were fixed, 1 blocking remain" is still a live blocker, and exiting (b) on the
-#       wrong half was the whole point of adding it.
+#       wrong half was the whole point of adding it. ⛔ (c) IS NOT MADE REDUNDANT BY THE COUNT
+#       PREDICATE: a line with ONE live mention and a persistence word outside it (`2 blocking were
+#       fixed, 1 of them remains`) is reachable only through (c) — that is 13n29.
 # What the arm deliberately does NOT judge is whether a declared blocker was later fixed: `(b)` and
-# `(c)` read only the vocabulary of persistence, exactly as every other arm in this file reads shape
-# and never substance.
+# `(c)` read only the vocabulary of persistence, and `(b)`'s count predicate reads only the NUMBER of
+# live mentions — exactly as every other arm in this file reads shape and never substance.
 outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line names blocking findings
-  local decoded line live_count
+  local decoded line live_count live_mentions _mentions _negated
   decoded="$(tsv_decode "$1")"
   while IFS= read -r line; do
     # Only an `Outcome:` DECLARATION is this arm's question — anchored the way arm (1b) anchors it,
@@ -1115,14 +1127,21 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # A LIVE POSITIVE COUNT. The escapes may ANSWER it; none of them may CANCEL it.
     live_count=0
     grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)' <<<"$line" && live_count=1
+    # HOW MANY LIVE BLOCKING MENTIONS. (b) may answer ONE of them; a SECOND belongs to no escape.
+    # A NEGATED mention is not live (`non-blocking`, `no blocking`, `0 blocking`) — that is the
+    # tortoise#8866 class (a) exists for, and it must not be counted against (b) either.
+    _mentions="$(grep -oiE 'block(ing|ers?)' <<<"$line" | wc -l | tr -d '[:space:]')"
+    _negated="$(grep -oiE '(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)' <<<"$line" | wc -l | tr -d '[:space:]')"
+    live_mentions=$(( _mentions - _negated ))
     # (a) zeroed / negated, and ONLY with no live count on the line.
     if [ "$live_count" -eq 0 ] \
        && grep -qiE '(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)' <<<"$line"; then
       continue
     fi
-    # (b) resolved — count, then copula, then a word-anchored verb, with NO negation qualifier
-    # between the copula and the verb, and (c) not a live blocker.
-    if grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)[^.;:]{0,40}(were|was|are|is|being|been|now|all|both)[^.;:]{0,15}[^[:alpha:]](fixed|resolved|closed|addressed|re-verified)([[:space:],.;:!?)]|$)' <<<"$line" \
+    # (b) resolved — ONE live mention, then count, then copula, then a word-anchored verb, with NO
+    # negation qualifier between the copula and the verb, and (c) not a live blocker.
+    if [ "$live_mentions" -eq 1 ] \
+       && grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)[^.;:]{0,40}(were|was|are|is|being|been|now|all|both)[^.;:]{0,15}[^[:alpha:]](fixed|resolved|closed|addressed|re-verified)([[:space:],.;:!?)]|$)' <<<"$line" \
        && ! grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)[^.;:]{0,40}(were|was|are|is|being|been|now|all|both)[^.;:]{0,15}[^[:alpha:]](not|never|yet|still|partially|pending|being)([^[:alpha:]]|$)' <<<"$line" \
        && ! grep -qiE 'block(ing|ers?)[^.;:]{0,60}(remain|remaining|open|outstanding|unresolved|unfixed|unaddressed)' <<<"$line"; then
       continue
