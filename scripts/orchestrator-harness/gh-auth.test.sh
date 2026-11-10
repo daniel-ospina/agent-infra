@@ -36,7 +36,11 @@
 #     §B2h): a blank-but-set `GH_TOKEN` shadows a REAL `GITHUB_TOKEN` and every call fails, so the lane is
 #     HELD and the refusal names the blank name — while a ZERO-LENGTH `GH_TOKEN` really does fall through
 #     to `GITHUB_TOKEN` and must still RESOLVE, so the fix cannot buy its green by refusing a credential
-#     gh would have used.
+#     gh would have used;
+#   * WHICH NAME the blank value lands on, and WHERE the token block sits, are pinned too (§A7i-A7k, §B2i):
+#     a blank `GITHUB_TOKEN` behind a real `GH_TOKEN` shadows NOTHING, and a blank token still outranks an
+#     ambient store — two orderings that were unpinned at the head that introduced the ordered read, each
+#     with a mutant that kept the suite at `passed: 61 failed: 0`.
 #
 # ⛔ HERMETIC: every arm runs `env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME -u GH_TOKEN -u GITHUB_TOKEN`, so a
 # runner that exports one of those (this fleet's cells DO) cannot turn a credential arm green by
@@ -258,6 +262,24 @@ ck "A7g …and NOTHING is exported for the shadowed shape, even with a usable-lo
 c="$(u ". '$GH_AUTH'; GH_TOKEN='   ' GITHUB_TOKEN=fixture-token gh_auth_cause '$LANE_HOME' '$ENVF' '$ACCT'")"
 { case "$c" in *'GH_TOKEN is set but BLANK'*) ck "A7h …and the cause names GH_TOKEN, so no refusal can assert the lane IS credentialed ('$c')" 0 ;;
              *) ck "A7h …and the cause names GH_TOKEN (got '$c')" 1 ;; esac; }
+# ⛔ THE MIRROR DIRECTION, AND THE POSITION OF THE WHOLE BLOCK, ARE THE OTHER HALF OF "ONE ORDERED READ" —
+# and a suite that pins only the shape it was written for cannot tell an ordering from a mirror rule. Both
+# mutants below kept this suite at 61/61 before A7i-A7k existed (measured at this head):
+#   M4 — "ANY set-but-all-blank name shadows the other" (the model `worker-terminal.sh:1087` states verbatim,
+#        "a blank one in either hides a valid one") answers `token-blank|GITHUB_TOKEN` where gh answers `realtok`;
+#   M6 — the token block moved AFTER the `ambient` arm answers `ambient|<dir>` where gh reads the whitespace.
+# A6 could not see M4 (it leaves `GITHUB_TOKEN` unset) and no arm could see M6 (every token arm runs through
+# `u()`, which unsets `GH_CONFIG_DIR`). Each mutant restores the exact false claim this PR removes: the gate
+# then prints "the lane's gh IS credentialed" over a lane whose every call fails.
+r="$(u ". '$GH_AUTH'; GH_TOKEN=realtok GITHUB_TOKEN='   ' gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ "$r" = "token|" ]; rc=$?
+ck "A7i a BLANK GITHUB_TOKEN behind a REAL GH_TOKEN shadows NOTHING: a blank value matters only on the name gh RESOLVES ('$r')" $rc
+c="$(u ". '$GH_AUTH'; GH_TOKEN=realtok GITHUB_TOKEN='   ' gh_auth_cause '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ -z "$c" ]; rc=$?
+ck "A7j …and the cause stays SILENT for it, so the gate cannot blame a credential gh is using ('$c')" $rc
+r="$(u ". '$GH_AUTH'; GH_CONFIG_DIR='$TMP/cfg-a' GH_TOKEN='   ' gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
+[ "$r" = "token-blank|GH_TOKEN" ]; rc=$?
+ck "A7k …and a blank token OUTRANKS an ambient store that really holds hosts.yml — the token block comes before every store arm ('$r')" $rc
 
 # The env file, parsed STATICALLY. Both the plain and the `export -p`/`declare -x` shapes keys.env really
 # carries, and the arm that proves the file is never executed.
@@ -389,6 +411,22 @@ grep -q 'IS credentialed' "$TMP/b2h.log" && rc=1 || rc=0
 ck "B2h3 …and never asserts the lane's gh IS credentialed (the exact false claim this arm exists to remove)" $rc
 grep -q '\[gh-auth\] state=token-blank dir=- ' "$TMP/b2h.log"; rc=$?
 ck "B2h4 …and the lane log says state=token-blank with no dir= ('$(grep -o 'state=[^ ]* dir=[^ ]*' "$TMP/b2h.log" | head -1)')" $rc
+
+# B2i: THE OTHER PLACE THE TOKEN BLOCK COULD SIT — a blank-but-SET GH_TOKEN with an AMBIENT `GH_CONFIG_DIR`
+# that really holds a hosts.yml. `gh_auth_resolve` must still answer `token-blank`, because a token outranks a
+# store in gh's order too; moving the token block after the `ambient` arm answers `ambient|<dir>` instead and
+# `gh_auth_cause` goes silent, so the refusal prints "the lane's gh IS credentialed (state=ambient at …)" over
+# a lane whose every call fails (measured: gh resolves the whitespace and never reads the store). That mutant
+# kept this suite green before B2i; A7k pins the unit truth, this pins the sentence the operator reads.
+run_lane 81 15 "P0-blocker,harness" "crash on boot" ok 2520 b2i "$ACCT" GH_CONFIG_DIR="$TMP/cfg-a" GH_TOKEN='   '
+{ [ "$LANE_RC" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "B2i a blank GH_TOKEN over an AMBIENT store that holds hosts.yml is HELD (rc=$LANE_RC), and no session ran" $rc
+grep -q 'GH_TOKEN is set but BLANK' "$TMP/b2i.log"; rc=$?
+ck "B2i2 …and the refusal names the blank token, not the store gh was pointed at" $rc
+grep -q 'IS credentialed' "$TMP/b2i.log" && rc=1 || rc=0
+ck "B2i3 …and never asserts the lane's gh IS credentialed (state=ambient would be that false claim)" $rc
+grep -q '\[gh-auth\] state=token-blank dir=- ' "$TMP/b2i.log"; rc=$?
+ck "B2i4 …and the lane log says state=token-blank with no dir= ('$(grep -o 'state=[^ ]* dir=[^ ]*' "$TMP/b2i.log" | head -1)')" $rc
 
 # B3: the module absent (a $O half-synced by a commit that predates it) changes NOTHING but the log.
 # ⛔ THE CREDENTIAL IS GIVEN AMBIENTLY HERE ON PURPOSE, so this arm tests the ONE thing it claims: an
