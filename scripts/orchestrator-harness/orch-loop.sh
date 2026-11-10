@@ -2454,7 +2454,18 @@ case "$ORC_SINGLETON_RC" in
     # already has a controller, which is the singleton working" — and tell the operator NOT to touch
     # the lock, while the loop's own text said the opposite. 74 is UNJUDGED and has its own row.
     if [ "$ORC_SINGLETON_RC" = "2" ]; then
-      echo "[orch-loop] the record at $LOCKF could not be judged (contents: '$(orc_lock_pid "$LOCKF" 2>/dev/null)'). Nothing was removed: an unreadable record is not a dead one. Next: read that pid's identity with 'ps -o pid=,etime=,command= -p <pid>'; if no controller of $O is running, rm -f '$LOCKF' and start again." >&2
+      # ⛔ THE TEXT MUST MATCH WHAT THE MODULE ACTUALLY DID (fresh-context review of #3846, cycle 2).
+      # rc 2 has two arms that leave the state dir in OPPOSITE states: an UNREADABLE record is still
+      # THERE, so `rm -f` is the remedy once nothing holds it; a FAILED RESTORE leaves `$LOCKF`
+      # absent or empty and KEEPS the displaced record at `ORC_RECLAIM_TEMP`, where `rm -f $LOCKF` is a
+      # no-op and the copy has to be PUT BACK. Saying "it is present / nothing was removed" for both
+      # sent the operator to a no-op while the only copy sat orphaned — the module was fixed for this
+      # and this line was not.
+      if [ -n "${ORC_RECLAIM_TEMP:-}" ]; then
+        echo "[orch-loop] the record at $LOCKF could not be put back (contents: '$(orc_lock_pid "$LOCKF" 2>/dev/null)'). NOTHING WAS DELETED: the displaced record is KEPT at $ORC_RECLAIM_TEMP. Next: find out why this state dir would not take a record (writable? space/inodes? hard links?), then mv '$ORC_RECLAIM_TEMP' '$LOCKF' and start again. Do NOT delete that file: it is the only record of a controller that may still be running." >&2
+      else
+        echo "[orch-loop] the record at $LOCKF could not be judged (contents: '$(orc_lock_pid "$LOCKF" 2>/dev/null)'). Nothing was removed: an unreadable record is not a dead one. Next: read that pid's identity with 'ps -o pid=,etime=,command= -p <pid>'; if no controller of $O is running, rm -f '$LOCKF' and start again." >&2
+      fi
       exit 74
     fi
     exit 75 ;;

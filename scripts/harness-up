@@ -1498,13 +1498,17 @@ hp_launchd_dead_text() { # <label>
     printf 'REFUSED-SINGLETON (last exit 75%s — orch-loop.sh REFUSED to start because this state dir already has a controller, which is the singleton working, not a crash. It keeps exiting 75 on every ThrottleInterval for as long as that controller lives. Confirm with: tail -3 %s/logs/orch-loop.log — a [singleton] line names the holder pid, the state dir and the reason. The holder is the authority, so do NOT remove %s/.orch.lock while it runs; if the [singleton] line names a pid that is not an orch-loop.sh of %s, read the reason it gives — an unreadable record fails CLOSED by design)' \
       "$seen" "$state" "$state" "$O"
   elif [ "$lexit" = "74" ]; then
-    # ⛔ UNJUDGED IS NOT HELD (fresh-context review of #3846). The lock record exists but could not be
-    # read or dated (an unreadable `ps`, a corrupt record, an unwritable state dir), so the loop
-    # refused to guess. HELD means "nothing to do"; this means "somebody has to look, and possibly
-    # remove the record" — opposite remedies, so they must not share a row (the reason this file
+    # ⛔ UNJUDGED IS NOT HELD (fresh-context review of #3846). HELD means "nothing to do"; this means
+    # "somebody has to look" — opposite remedies, so they must not share a row (the reason this file
     # already splits 0 from non-zero one arm up).
-    printf 'REFUSED-UNJUDGED (last exit 74%s — orch-loop.sh could NOT JUDGE the lock record at %s/.orch.lock: it is present, and either its pid cannot be read or its age cannot be dated, so the loop refused rather than displace a controller it cannot identify. Nothing was removed. Read the [singleton] line in %s/logs/orch-loop.log: it names the record contents and why. Next: ps -o pid=,etime=,command= -p <the pid>; if no controller of %s is running, rm -f %s/.orch.lock and start again — UNLIKE the exit-75 row, removing it is the remedy here when nothing holds it)' \
-      "$seen" "$state" "$state" "$O" "$state"
+    # ⛔ AND rc 2 IS ITSELF TWO SHAPES (cycle 2 of the same review): an UNREADABLE record is still
+    # THERE (`rm -f` is the remedy once nothing holds it), while a record that could NOT BE PUT BACK
+    # leaves `%s/.orch.lock` absent or empty and KEEPS the displaced record at the path
+    # `controller-state.sh` prints in its `[singleton]` line (`ORC_RECLAIM_TEMP`) — where `rm -f` is a
+    # no-op and the copy must be moved BACK. This row used to assert "it is present / Nothing was
+    # removed" for both, which is how an orphaned record went unlooked-for.
+    printf 'REFUSED-UNJUDGED (last exit 74%s — orch-loop.sh could NOT JUDGE the lock record at %s/.orch.lock: either it is present and its pid cannot be read or its age cannot be dated, or it could not be PUT BACK after a reclaim and the displaced record was KEPT at a `.reclaim.` path beside it, so the loop refused rather than displace a controller it cannot identify. Nothing was deleted. The [singleton] line in %s/logs/orch-loop.log says WHICH: if it names a KEPT copy, move that file back to %s/.orch.lock — do NOT delete it, it is the only record of a controller that may still be running; otherwise next: ps -o pid=,etime=,command= -p <the pid>, and if no controller of %s is running, rm -f %s/.orch.lock and start again — UNLIKE the exit-75 row, removing it is the remedy there when nothing holds it)' \
+      "$seen" "$state" "$state" "$state" "$O" "$state"
   elif [ -n "$lexit" ]; then
     printf 'DIED (last exit %s%s; launchd retries a failing KeepAlive job on its ThrottleInterval, so if it STAYS here every attempt is failing; read %s/logs/launchd.err)' \
       "$lexit" "$seen" "$O"

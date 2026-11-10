@@ -170,26 +170,38 @@ orc_mtime() { date -r "$1" +%s 2>/dev/null; }
 # an OCCUPIED target is rc 1 (the occupant wins, our copy is surplus); a failure with a FREE target is
 # restored with the other atomic create this module already uses (noclobber, which needs no link
 # permission), and only a target that is STILL FREE and unwritable is rc 2.
+# ⛔ CONTENT DECIDES, EXISTENCE DOES NOT (fresh-context review of #3846, cycle 2, measured). An `O_EXCL`
+# create can SUCCEED and the WRITE then fail — ENOSPC, EFBIG, `ulimit -f` — leaving a **0-byte record
+# we created ourselves** (measured with `ulimit -f 0`: `create rc=153, file exists: YES size=0`).
+# `[ -e "$lockf" ]` cannot tell that apart from a third starter's record, and answering "taken" for it
+# made the caller delete the displaced record AND leave a record that every reader treats as STOPPED —
+# so the next starter reclaimed it and ACQUIRED over a still-live displaced holder (#1715). The read is
+# therefore `orc_lock_pid`, and only a NON-EMPTY record that is not the pid we were restoring counts as
+# an occupant. An empty or absent path is "nothing to trust": rc 2, and the caller KEEPS the only copy.
 orc_lock_fill() {
-  local tmp="${1:-}" lockf="${2:-}" pid=""
+  local tmp="${1:-}" lockf="${2:-}" pid="" at=""
   [ -n "$tmp" ] && [ -n "$lockf" ] || return 2
   if ln "$tmp" "$lockf" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null
     return 0
   fi
-  if [ -e "$lockf" ]; then return 1; fi        # EEXIST: a newer holder owns the path; ours is surplus
+  at="$(orc_lock_pid "$lockf")"
+  [ -n "$at" ] && return 1                     # a REAL holder owns the path; our copy is surplus
   pid="$(orc_lock_pid "$tmp")"
   [ -n "$pid" ] || return 2                    # nothing to restore — the caller must not delete the temp
-  # The path is FREE and could not be linked into. Restore it the other atomic way: a noclobber create
-  # can only succeed if the path is still free, so a third starter that got there first still wins.
-  # The mtime cost above is the right trade HERE: this branch is the case where the alternative is an
-  # empty state dir, and a record that reads "written now" is HELD (refuse) rather than FREE (co-run).
-  ( set -o noclobber; printf '%s\n' "$pid" > "$lockf" ) 2>/dev/null || {
-    [ -e "$lockf" ] || return 2                # still free and unwritable: cannot tell
-    return 1
-  }
-  rm -f "$tmp" 2>/dev/null
-  return 0
+  # The path is not held (absent, or a record with no pid in it) and could not be linked into. Restore
+  # it the other atomic way: a noclobber create can only succeed if the path is still free, so a third
+  # starter that got there first still wins. The mtime cost noted above is the right trade HERE: the
+  # alternative is an empty state dir, and a record that reads "written now" is HELD (refuse) rather
+  # than FREE (co-run).
+  ( set -o noclobber; printf '%s\n' "$pid" > "$lockf" ) 2>/dev/null
+  at="$(orc_lock_pid "$lockf")"
+  if [ "$at" = "$pid" ]; then
+    rm -f "$tmp" 2>/dev/null
+    return 0
+  fi
+  [ -n "$at" ] && return 1                     # a third starter won the fallback too
+  return 2                                      # empty/absent: nothing to trust; the copy is KEPT
 }
 
 # orc_lock_reclaim <lockf> <the stale pid this caller judged> — replace a record whose holder is

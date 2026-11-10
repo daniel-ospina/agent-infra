@@ -353,6 +353,48 @@ case "$(ls "$LKF"/.orch.lock.reclaim.* 2>/dev/null)" in
   '') ck "§2 …and the fallback consumed the temp (no .reclaim file left beside the record)" 0 ;;
   *)  ck "§2 …and the fallback left a reclaim temp: $(ls "$LKF"/.orch.lock.reclaim.* 2>/dev/null | tr '\n' ' ')" 1 ;;
 esac
+
+# ⛔ A RECORD THAT CANNOT BE PUT BACK IS KEPT, NOT DELETED, AND THE REFUSAL NAMES IT (fresh-context
+# review of #3846, cycle 2). An `O_EXCL` create can SUCCEED and the WRITE then fail — ENOSPC, EFBIG,
+# `ulimit -f` — leaving a **0-byte record we created ourselves** (measured with `ulimit -f 0`:
+# `create rc=153, file exists: YES size=0`). EXISTENCE cannot tell that from a third starter's record,
+# and answering "taken" for it deleted the displaced record AND left a record every shipped reader
+# treats as STOPPED — so the next starter reclaimed the empty record and ACQUIRED over a still-live
+# displaced holder (#1715). CONTENT decides instead, and when there is no content to trust the fill
+# answers "cannot tell" and the caller KEEPS the only copy. The `ln` shim below fails with the
+# destination free and leaves a 0-byte record behind: exactly that state, deterministically.
+LKZ="$T/lkz"; mkdir -p "$LKZ"
+printf '111\n' > "$LKZ/.orch.lock"
+( . "$MOD"
+  orc_lock_pid() { case "${1:-}" in */.orch.lock.reclaim.*) printf '222\n' ;; *) command tr -dc '0-9' 2>/dev/null < "$1" ;; esac; }
+  ln() { : > "$2"; return 1; }
+  orc_lock_reclaim "$LKZ/.orch.lock" 111; printf 'rc=%s temp=%s\n' "$?" "${ORC_RECLAIM_TEMP:-none}" ) > "$T/rcl-keep" 2>&1
+case "$(sed -n 1p "$T/rcl-keep")" in
+  rc=2\ temp=*.orch.lock.reclaim.*) ck "§2 a record that cannot be put back is rc 2 and the KEPT copy is NAMED" 0 ;;
+  *) ck "§2 an unrestorable record returned '$(cat "$T/rcl-keep" | tr '\n' ' ')' — wanted rc 2 with the kept copy named" 1 ;;
+esac
+[ "$(cat "$LKZ"/.orch.lock.reclaim.* 2>/dev/null)" = "111" ] \
+  && ck "§2 …and the displaced record is still on disk beside the lock (NOT deleted)" 0 \
+  || ck "§2 …and the displaced record was DELETED (found '$(cat "$LKZ"/.orch.lock.reclaim.* 2>/dev/null)', wanted 111) — a state dir that reads STOPPED over a live displaced holder (#1715)" 1
+
+# …AND THE OPERATOR-FACING SENTENCE MUST SAY WHERE IT IS. rc 2 is two shapes now — an unreadable
+# record, and a record that could not be put back — and the remedy is opposite (leave it vs move the
+# kept copy back). `orch-loop.sh` branches on `ORC_RECLAIM_TEMP` and `harness-up`'s exit-74 row names
+# both; this row pins the module half, which is what both read.
+LKZ2="$T/lkz2"; mkdir -p "$LKZ2"
+printf '999999\n' > "$LKZ2/.orch.lock"     # a DEAD holder, so the reclaim arm is reachable
+( . "$MOD"
+  orc_lock_pid() { case "${1:-}" in */.orch.lock.reclaim.*) printf '222\n' ;; *) command tr -dc '0-9' 2>/dev/null < "$1" ;; esac; }
+  ln() { : > "$2"; return 1; }
+  orc_singleton_acquire "$LKZ2/.orch.lock"; printf '%s|%s\n' "$?" "$ORC_SINGLETON_WHY" ) > "$T/acq-keep" 2>&1
+case "$(cat "$T/acq-keep")" in
+  2\|*"KEPT at "*.orch.lock.reclaim.*) ck "§2 the UNJUDGED refusal NAMES the kept copy (the operator can find it)" 0 ;;
+  *) ck "§2 the UNJUDGED refusal does not name the kept copy — got '$(cat "$T/acq-keep" | tr '\n' ' ')'" 1 ;;
+esac
+case "$(cat "$T/acq-keep")" in
+  *"nothing was removed"*) ck "§2 …and it does not claim 'nothing was removed' with no location (that is the orphaned-copy text)" 1 ;;
+  *) ck "§2 …and it does not claim 'nothing was removed' with no location" 0 ;;
+esac
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 hdr "§3 FAIL CLOSED — an unjudgeable record is a refusal, not a guess"
 # The age is unreadable when `ps` cannot answer. `PS_BIN` is the seam the fleet's own suites use
