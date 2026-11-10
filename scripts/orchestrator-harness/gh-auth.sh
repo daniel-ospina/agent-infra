@@ -26,9 +26,14 @@
 # config dir, and the remedy names the wrong cause — acting on it means landing PRs to fix a `hosts.yml`
 # problem. ⛔ "NOTHING EVER SET IT" IS A CLAIM ABOUT *THIS PATH*, NOT ABOUT THE TREE, and the honest
 # evidence says so: `git grep -n 'GH_CONFIG_DIR' origin/main -- scripts/` returns READERS all over it —
-# `worker-terminal.sh:500,1074-1081`, `objective.py:2273-2285`, `beta-progress.py:398-401`,
-# `record-review.sh` — and not one provider on the dispatch path was among them, so the lane's `gh` had
-# no store while every one of those readers was pointed at the wrong place. #2509's finding 1 covers the
+# `worker-terminal.sh:500,1074-1081`, `objective.py:2273-2285`, `beta-progress.py:398-401` — and not one
+# provider on the dispatch path was among them, so the lane's `gh` had
+# no store while every one of those readers was pointed at the wrong place. ⛔ `record-review.sh` IS NOT
+# IN THAT LIST, though an earlier draft of this paragraph named it: its single `GH_CONFIG_DIR` hit
+# (`:5173`) is a COMMENT in a residual list — it resolves no config dir and only invokes `command gh`, so
+# it is not a reader of this variable at all. The three cited above are in-process resolvers, and a
+# reader who checks the citations must find that every one of them supports the sentence.
+# #2509's finding 1 covers the
 # OPPOSITE arm (`wt_spawn` REFUSING a `keys.env`-provided `GH_CONFIG_DIR`); this module is the arm where
 # nothing provides it at all, on the `nonblocking-dispatch.sh` → `spawn-gate.sh` path.
 #

@@ -300,6 +300,15 @@ printf 'declare -x XDG_CONFIG_HOME="%s"\n' "$ACCT/.config" > "$ENVF"
 r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "keys-xdg|$ACCT/.config/gh" ]; rc=$?
 ck "A10 the declare -x XDG_CONFIG_HOME shape is read too, and becomes <xdg>/gh ('$r')" $rc
+# ⛔ A10 PINS THE STATE, NOT THE EXPORT (review round 18, P2): deleting `keys-xdg` from `gh_auth_ensure`'s
+# export case left the suite at 116/0, while the three sibling arms of the same decision all redden when
+# dropped (`keys` → A9, `home-xdg` → A5c, `account` → B1/B4b/B5/B7). It is load-bearing: the env file's
+# `XDG_CONFIG_HOME=` is parsed statically and never exported, so without this the store resolves and the
+# lane is handed no credential at all — and `gh_auth_log`'s `keys-xdg)` text claims "…and exported as
+# GH_CONFIG_DIR", a claim nothing verified until this arm.
+r="$(u ". '$GH_AUTH'; gh_auth_ensure '$LANE_HOME' '$ENVF' '$ACCT' >/dev/null; printf '%s' \"\${GH_CONFIG_DIR:-<unset>}\"")"
+[ "$r" = "$ACCT/.config/gh" ]; rc=$?
+ck "A10b …and gh_auth_ensure EXPORTS it, so a statically-parsed XDG store reaches the lane at all ('$r')" $rc
 printf 'export GH_CONFIG_DIR=%s   # a trailing comment\n' "$TMP/cfg-a" > "$ENVF"
 r="$(u ". '$GH_AUTH'; gh_auth_resolve '$LANE_HOME' '$ENVF' '$ACCT'")"
 [ "$r" = "keys|$TMP/cfg-a" ]; rc=$?
@@ -744,6 +753,21 @@ ck "B13f …and a set-but-unreadable ambient GH_CONFIG_DIR stays ambient-missing
 # resolver `home`, the cause silent and the refusal "IS credentialed" over a path `gh` cannot read as
 # config. This shape needs NO uid reservation (`mkdir` works at any uid), which is exactly why it is the
 # cheap mirror of B13g/B13h.
+# ⛔ THE ACCOUNT-HOME SEAM HAD NO ARM AT ALL (review round 18, P3): every arm passed an explicit account
+# home, so (i) deleting `[ -z "$acct" ]` made the `none` cause print "/.config/gh" — a directory it never
+# checked, which the POLARITY block says it never does — and (ii) a regression in the passwd parse would
+# answer `none` for every cell lane with a cause naming a path that does not exist, and nothing reddened.
+# ⛔ THE LOOKUP MUST NOT BE `$HOME` (a lane's HOME is REDIRECTED to the operational home — that is the
+# whole reason this module exists), so the arm redirects HOME and requires a different, absolute answer.
+_ah="$(u "HOME='$TMP/redirected-home'; . '$GH_AUTH' >/dev/null 2>&1; gh_auth_account_home")"
+{ [ -n "$_ah" ] && [ "$_ah" != "$TMP/redirected-home" ]; } && case "$_ah" in /*) rc=0 ;; *) rc=1 ;; esac || rc=1
+ck "B14 gh_auth_account_home answers the PASSWD home, not the redirected HOME ('$_ah')" $rc
+_uc="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_account_home() { :; }; gh_auth_cause '$LANE_HOME' '$TMP/none.env' ''")"
+case "$_uc" in *"<unresolved account home>/.config/gh"*) rc=0 ;; *) rc=1 ;; esac
+ck "B14b …and when the lookup answers nothing the cause discloses <unresolved account home> instead of naming /.config/gh" $rc
+case "$_uc" in *"or /.config/gh"*) rc=1 ;; *) rc=0 ;; esac
+ck "B14c …which is the exact sentence a missing lookup check produced: it never claims to have checked /.config/gh" $rc
+
 DUNREAD="$TMP/store-dirfile"; mkdir -p "$DUNREAD/.config/gh/hosts.yml"
 u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable '$DUNREAD/.config/gh/hosts.yml'" && rc=1 || rc=0
 ck "B13i …a DIRECTORY named hosts.yml is not a store either — the -f half, at any uid" $rc
