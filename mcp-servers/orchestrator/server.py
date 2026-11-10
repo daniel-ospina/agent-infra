@@ -2277,12 +2277,15 @@ def _harden_argv(argv: List[str]) -> List[str]:
 #                         once and the remedy is on this box — not on the peer, and not in the command.
 # ⛔ rc=0 IS STILL A REFUSAL. A refusal reported with exit status 0 was measured on `pi-cell-3`
 # (2026-10-23, on the issue): a caller that checks only `rc` read a dead link as success. The class is
-# reported whatever the rc. ⛔ RESIDUALS, NOT COVERED — both are TRUNCATION, and both are disclosed rather than
-# claimed closed: (a) `_drain_into` keeps each stream's HEAD, so a refusal printed after `cap` bytes is
-# dropped; (b) `cap` is the CALLER's `max_output`, so a `max_output` shorter than the refusal line cuts the
-# line at its head and NO class matches — the caller-visible result is `RAN` with `truncated: true`. Every
-# measured refusal is the transport's FIRST line, well inside the default 20 000 bytes, so (a) needs a
-# refusal after 20 KB of relayed output and (b) needs the caller to ask for < ~40 bytes.
+# reported whatever the rc. ⛔ RESIDUALS, NOT COVERED — both are TRUNCATION, and both are disclosed rather
+# than claimed closed: (a) `_drain_into` keeps each stream's HEAD, so a refusal printed after `cap` bytes is
+# dropped; (b) `cap` is the CALLER's `max_output`, so too small a cap cuts the line before the pattern can
+# match. ⛔ (b) IS BOUNDED BY THE PATTERN'S OWN MATCH LENGTH, NOT BY THE LINE'S: 32 B for `link-refused`,
+# 44 B for `no-known-daemon`, 65 B for the measured `daemon-binary-absent` line (37 B is that pattern's
+# floor). Below that the class is simply unmatched and the caller gets `RAN` at rc=0 — or, at the measured
+# rc=3, plain `NONZERO`, i.e. THE PRE-FIX MIS-VERDICT — with only `truncated: true` to tell them apart.
+# (a) needs a refusal after 20 KB of relayed output; every measured refusal is the transport's FIRST line,
+# far inside the default 20 000, so neither residual is reachable by a default call.
 # ⛔ EVERY PATTERN IS ANCHORED TO ITS LINE START, because these two streams are SHARED: `cmux vm exec`
 # relays the remote command's stdout/stderr into the same `ran.stdout`/`ran.stderr` this classifier reads
 # (`payload["stderr"]` below is exactly that relay), so a bare phrase match would re-label a peer that
@@ -2305,6 +2308,12 @@ def _harden_argv(argv: List[str]) -> List[str]:
 # and the residual is DISCLOSED rather than implied: a peer that echoes that exact sentence is still
 # indistinguishable from the transport, because the streams offer no structural separator.
 LINK_REFUSAL_CLASSES = (
+    # ⛔ FIRST MATCH WINS, AND THE ORDER IS LOAD-BEARING, because a refusal can carry BOTH the transport's
+    # link line and the client's own words (measured 2026-11-03 from `pi-cell-3`: `cmux: link to
+    # 'pi-cell-3' exited` followed by `cmux-tui: no known daemon matches this route; connect with an
+    # invitation`). The transport's line is the one that names the PEER, so it outranks the client's words
+    # — pinned by an arm on that exact two-line buffer, because a reorder here silently changes which
+    # class (and whether `peer`) reaches the caller.
     ("daemon-binary-absent",
      re.compile(r"^(?:cmux: )?cmux-tui daemon binary not found at (?P<path>\S+)", re.M)),
     ("link-refused", re.compile(r"^cmux: link to ['\"](?P<peer>[^'\"]+)['\"] exited", re.M)),

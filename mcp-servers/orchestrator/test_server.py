@@ -1108,6 +1108,21 @@ def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc
     # which return before the transport is invoked. A link refusal DID invoke it and is reporting the
     # CHANNEL, so it must not land in the key a caller switches on to mean "amend my request".
     assert "refused" not in payload, payload
+    # ⛔ AND THE ORDER OF LINK_REFUSAL_CLASSES IS LOAD-BEARING, so it is pinned on the MEASURED two-line
+    # buffer (2026-11-03 from `pi-cell-3`): the transport's link line and the client's own words in ONE
+    # payload. First match wins, and the transport's line names the peer, so `link-refused` must be the
+    # class reported. Nothing pinned this before: reordering the tuple left the suite GREEN while changing
+    # `channel_refused` to `no-known-daemon` and DROPPING `peer` for a measured shape.
+    monkeypatch.setenv("ORCH_MCP_CMUX", refusal_stub(
+        "cmux_both.py",
+        "import sys\n"
+        "sys.stderr.write(\"cmux: link to 'pi-cell-3' exited; see "
+        "/tmp/cell-home/.cmux/peer-links/pi-cell-3.log\\n\")\n"
+        "sys.stderr.write('cmux-tui: no known daemon matches this route; connect with an "
+        "invitation\\n')\n", 3))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-3", "argv": ["uname"]})
+    assert is_err is True and payload["channel_refused"] == "link-refused", payload
+    assert payload["peer"] == "pi-cell-3", payload
     assert "never the command's verdict" in payload["channel_only"], payload
     assert "timed_out and truncated are CHANNEL facts" in payload["channel_only"], payload
     assert "carrier" in payload["refusal_detail"], payload
