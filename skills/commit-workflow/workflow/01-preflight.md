@@ -659,6 +659,31 @@ coverage for every upstream file: recorded incidents went from 39 staged files t
   pre-#3716 2-dot scope too — the opt-out's "previous scope" promise holds for every
   scope producer (substitution aside, no scope is narrowed while the flag is set).
 
+### A record under a SIBLING worktree root is satisfied by CONTENT (#2886)
+
+Records are keyed on `(worktree root, relative path)`. A **rebase re-creates the branch in a
+new worktree**, so every record made for it becomes unusable at once: the next `git commit`
+or `git push` is refused with a list of every file the branch ever touched reported as "no
+verification record for this root", while the op changes a handful — and the only honest
+remedy left is verifying the whole tree again, which is a rubber stamp over files nobody
+read (measured: 5 changed files, ~150 demanded, daniel-ospina/DMeer#1371).
+
+Since #2886 a path with **no record under this root** is satisfied when a record for the
+**same relative path** under a **different root of the SAME repository** still matches the
+bytes at the op's own root. Verification is a judgment about content and the record IS a
+digest, so unchanged bytes re-rooted into a new worktree need no second verdict.
+
+- It never adopts another tree's **root** or its record set: the scope is still computed
+  from THIS root's own diff (#1265 — an adopted clean tree yields an EMPTY scope that would
+  ALLOW an op carrying unverified content).
+- Guards, all fail-closed: same repository by shared `--git-common-dir` (an unrelated
+  checkout is never borrowed, however identical its bytes); the relative path must match; a
+  record whose root is gone or unreadable is skipped; a digest that does not match is a no-op.
+- It writes a `gate_skip` line with `reason: foreign_root_blob_identical` naming the paths
+  and the roots they were borrowed from.
+- **Opt out:** `ELDATO_VGATE_NO_SUBTRACT=1`, like every other narrowing (it can cost time,
+  never coverage).
+
 Scope producers are `git commit` (staged / sweep / pathspec / branch / gh-chain arms) and
 `git push` (the tracking-ref arm unless the #3716 narrowing applies: the tracking ref is
 NOT an ancestor-or-equal of the pushed tip AND the integration base IS one; the tier-B/C

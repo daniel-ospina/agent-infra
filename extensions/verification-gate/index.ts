@@ -522,10 +522,14 @@ function diagnoseRootMismatch(root: string): void {
   // root; adoption is named as refused-by-design so nobody re-proposes it.
   console.log(
     `[verification-gate] ⚠ #3255/#1265: this git op resolves to ${norm}, but the bridge holds verified entries for ` +
-      `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared. ` +
+      `${siblings.join(", ")} (same repo). Those are different trees: their entries are never adopted as ` +
+      `this op's records. ` +
       `Remedy: re-dispatch verification for THIS root (${norm}) — the git-op root stays the command's own cwd. ` +
       `Adopting another tree's entries is refused by design: they are keyed on that tree, so they are inert here, ` +
-      `and an adopted clean tree yields an EMPTY scope that would ALLOW an op carrying unverified content.`,
+      `and an adopted clean tree yields an EMPTY scope that would ALLOW an op carrying unverified content. ` +
+      `(#2886) EXCEPTION, per path: a record for the SAME relative path in one of those trees still satisfies this ` +
+      `op when its stored digest matches the bytes here — verification is a judgment about content, and a rebase ` +
+      `does not change file contents.`,
   );
   // #1265 review: SORT the sibling list. `bridgeRoots()` derives its order from
   // `readBridge().verified_files`, and `writeBridge` publishes the SURVIVORS in file
@@ -1245,6 +1249,9 @@ const GATE_SKIP_REASONS = [
   // against the integration base, and the DISCARDED commits are reported here
   // (never by widening the verify set).
   "non_fast_forward_push",
+  // #2886 — paths with no record under THIS root, satisfied by a record for the same relative path
+  // under a sibling root of the same repository whose digest still matches the bytes here.
+  "foreign_root_blob_identical",
   ...MERGE_SCOPE_DECISION_REASONS,
   ...SUBTRACT_SKIP_REASONS,
 ] as const;
@@ -4983,6 +4990,79 @@ export default function (pi: ExtensionAPI) {
     // #37: normalize worktree root for stable compound keys.
     const worktreeRoot = normalizeWorktreeRoot(cwd);
 
+    // ── #2886 — a record made for the SAME path under a SIBLING worktree root ──
+    // A rebase re-creates the branch in a NEW worktree, so every record made for it is keyed on the
+    // OLD root: the op then lists files whose BYTES nobody changed as "no verification record for this
+    // root", and the only honest way to clear it is to re-verify the whole tree (the rubber stamp the
+    // issue refuses). Verification is a judgment about CONTENT — the record IS a digest — so a record
+    // for the same relative path under a different root of the SAME repository satisfies this op
+    // exactly when its stored digest still matches the bytes here.
+    //
+    // ⛔ Fail-closed at every step, because this REMOVES entries from the block set:
+    //   • SAME REPOSITORY is required, by the shared `--git-common-dir` predicate `pickVerifiedRoot`
+    //     already uses for root adoption (#3255) — an unrelated checkout's record is never borrowed,
+    //     however identical its bytes, and an UNPROVABLE root (gone, unreadable, no git) is skipped.
+    //   • the RELATIVE PATH must be identical, so the record still describes the same file in the same
+    //     tree, and the comparison is made against the bytes at THIS op's root (never the foreign ones).
+    //   • a digest that does not match is a NO-OP (no block decision changes), and every unreadable
+    //     path/probe falls through to the existing fail-closed unverified branch.
+    // `ELDATO_VGATE_NO_SUBTRACT` disables it, exactly like the #755 subtraction and the #3716 push
+    // narrowing: it is the documented scope-WIDENING escape, and an escape that covers only two of
+    // the three narrowings is not an escape.
+    const crossRootAccepted: { file: string; root: string }[] = [];
+    // Read the shared registry at most ONCE per op, and only when a file actually needs it.
+    let bridgeEntriesCache: VerifiedFile[] | null = null;
+    const registryEntries = (): VerifiedFile[] => {
+      if (bridgeEntriesCache === null) {
+        const b = readBridge();
+        bridgeEntriesCache = b && b.status === "PASS" && Array.isArray(b.verified_files) ? b.verified_files : [];
+      }
+      return bridgeEntriesCache;
+    };
+    // `git-common-dir` is a subprocess per root — resolve each root at most once per op.
+    const commonDirMemo = new Map<string, string | null>();
+    const commonDirOnce = (root: string): string | null => {
+      const k = normalizeWorktreeRoot(root);
+      if (!commonDirMemo.has(k)) commonDirMemo.set(k, gitCommonDir(k));
+      return commonDirMemo.get(k) ?? null;
+    };
+    /** A content-identical record under a sibling root of the same repo, or null (fail closed). */
+    const foreignBlobMatch = (normOpRoot: string, relPath: string): { root: string; stored: string } | null => {
+      if (subDisabled) return null;
+      const relNorm = normalizeRegistryPath(normOpRoot, relPath);
+      const candidates: { root: string; hash: string }[] = [];
+      const consideredRoots = new Set<string>();
+      const consider = (key: string, hash: string) => {
+        const parsed = parseCompoundKey(key);
+        if (!parsed || parsed.root === normOpRoot || consideredRoots.has(parsed.root)) return;
+        if (typeof hash !== "string" || hash === "") return;
+        // Compare in the OP ROOT's path domain — the record was keyed in the FOREIGN root's, and the
+        // two spellings differ exactly when a root's realpath does (#305 / #7595).
+        if (normalizeRegistryPath(normOpRoot, parsed.path) !== relNorm) return;
+        consideredRoots.add(parsed.root);
+        candidates.push({ root: parsed.root, hash });
+      };
+      // In-memory first (it holds entries a PASS in THIS session merged but has not yet bridged),
+      // then the durable registry (the only place a PREVIOUS session's records survive).
+      for (const [k, h] of verifiedSet) consider(k, h);
+      for (const vf of registryEntries()) {
+        if (!vf || typeof vf.path !== "string" || typeof vf.hash !== "string") continue;
+        consider(vf.path, vf.hash);
+      }
+      if (candidates.length === 0) return null;
+      const mine = commonDirOnce(normOpRoot);
+      if (mine === null) return null; // unprovable own repo ⇒ no borrowing
+      for (const c of candidates) {
+        if (commonDirOnce(c.root) !== mine) continue; // another repository — never borrowed
+        // ONE read answers "does the record's digest match the bytes HERE"; on a match it also yields
+        // the gate's own sha256, which is what the registry stores (#1460: a supplied md5/sha1 is
+        // evidence, never the standing identity).
+        const digest = matchAndStoredDigest(normOpRoot, relPath, c.hash);
+        if (digest.matched) return { root: c.root, stored: digest.stored };
+      }
+      return null;
+    };
+
     // Check verification
     const unverified: string[] = [];
     interface Mismatch { file: string; expected: string; actual: string }
@@ -5036,10 +5116,31 @@ export default function (pi: ExtensionAPI) {
       const key = compoundKey(worktreeRoot, file);
       const verifiedHash = verifiedSet.get(key);
       if (verifiedHash === undefined) {
-        unverified.push(file);
+        // #2886: no record for THIS root — but the same path may be verified under a sibling root of
+        // this same repository at these exact bytes (a rebased branch re-rooted into a new worktree).
+        // Re-root the record found there rather than demanding a fresh verification of unchanged bytes.
+        const borrowed = foreignBlobMatch(worktreeRoot, file);
+        if (borrowed !== null) {
+          verifiedSet.set(key, borrowed.stored);
+          crossRootAccepted.push({ file, root: borrowed.root });
+        } else {
+          unverified.push(file);
+        }
       } else if (!hashMatchesDisk(cwd, file, verifiedHash)) {
         mismatched.push({ file, expected: verifiedHash, actual: currentHash });
       }
+    }
+
+    // #2886: the borrow is audited even when the op still blocks on OTHER files — an allow decision
+    // reached by widening a record's root must leave a durable record, like every other narrowing
+    // (`content_shape_exempt`, `base_identical_satisfied`, `non_fast_forward_push`).
+    if (crossRootAccepted.length > 0) {
+      const fromRoots = [...new Set(crossRootAccepted.map((c) => c.root))];
+      console.log(`[verification-gate] 🔗 ${crossRootAccepted.length} file(s) satisfied by a content-identical record under another root of this repository`);
+      logGateSkip("foreign_root_blob_identical", command, cwd, {
+        files: crossRootAccepted.map((c) => c.file),
+        from_roots: fromRoots,
+      });
     }
 
     // #7591: auto-bypass after N persistent blocks on the same files —
