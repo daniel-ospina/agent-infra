@@ -8057,7 +8057,26 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //  - heredoc BODIES are stdin data (skipped entirely in the walk; bodies
   //    never shift the cwd, emit tee/cd words, or swallow trailing code — an
   //    unterminated heredoc swallows to EOF, matching bash's heredoc wait).
-  const frames = [{ cwd: base0, pending: null, forkCwd: null, forkAlts: [] }];
+  // pipeC0/pipeActive (per frame): EVERY pipeline segment runs in a subshell,
+  // the LAST one included — a `cd` in the final segment (`true | cd docs; echo
+  // x > f`) does NOT survive the pipeline, so the next command runs from the
+  // pipeline's START cwd. pipeC0 records that start cwd at the first `|` and
+  // applyPending() restores it at the boundary; without it the last segment's
+  // `cd` LEAKED into the following command and a tracked hub write resolved one
+  // directory off — a FAIL-OPEN (`true | cd docs; echo x > tracked.md` resolved
+  // docs/tracked.md where real bash writes the tracked HUB file at the root;
+  // #3954).
+  // The git-side walker has always restored here (`_walkShell`'s pipeC0 /
+  // restoreC0 pair, pinned by its T32/T33).
+  // pipeD0 (per frame): the PIPE boundary restores the `dirStack` too, not just the
+  // cwd. `pushd`/`popd` mutate a stack bash SHARES across the pipeline list, and a
+  // pipeline segment is a subshell — so its pushd/popd die with it. Restoring only the
+  // cwd left the stack one entry deep, a later bare `popd` landed on an entry bash
+  // never had, and the walker's cwd then drifted from real bash's: measured FAIL-OPEN,
+  // `cd c; pushd ../docs | cat; cd ../docs; popd; echo x > tracked.md` really overwrites
+  // the TRACKED hub file at the root while the walker allowed it. Same class as #3954's
+  // cwd restore, same boundary (#3957 review ISSUE 3).
+  const frames = [{ cwd: base0, pending: null, forkCwd: null, forkAlts: [], pipeC0: null, pipeD0: null, pipeActive: false }];
   // pipeBase: cwd at the start of the current PIPE list (updated at every
   // continuation boundary incl. &&); asyncBase: cwd at the start of the
   // current async segment (updated only at ;/newline/start/(/post-& — NOT at
@@ -8065,6 +8084,14 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   // cwd, matching bash: the WHOLE `cd docs && true` list is async).
   const pipeBase = [base0];
   const asyncBase = [base0];
+  // dirBase / dirAsync: the `dirStack` as it stood at each frame's pipe-list start (and
+  // at the current async segment's start), parallel to pipeBase/asyncBase. A pipeline
+  // boundary restores the cwd from pipeBase — it must restore the DIR STACK the same way
+  // (ISSUE 3). ⛔ The snapshot CANNOT be taken at the `|` itself: the first segment has
+  // already run its `pushd` by then, so `pushd ../docs | cat` would snapshot the very
+  // entry the boundary has to discard. It is taken at the BOUNDARY, like pipeBase is.
+  const dirBase = [[]];
+  const dirAsync = [[]];
   let skipStart = -1;   // active heredoc-body region [skipStart, skipEnd):
   let skipEnd = -1;     // the header remainder is walked; the body is jumped
   // simple-command arg-position state (cycle-22 P1): special-word handlers
@@ -8076,6 +8103,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   let casePattern = false;         // cycle-36 P2-1: inside a case, words between `in` and the arm's `)` are PATTERNS — never dispatched
   let caseValPending = false;      // cycle-37 F3: after `case` the NEXT word is the cased VALUE — never dispatched (bash doesn't execute it)
   let caseValConsumed = false;     // cycle-37 F1: only a case's OWN `in` (after its value) opens the pattern phase — a for/select `in` inside an arm must NOT
+  let dblDepth = 0;                // `[[ … ]]` nesting — a `|` in there is regex/boolean alternation, NOT a pipeline (#3957 review P1)
   const caseCwdStack = [];         // cycle-37 F2: each case arm runs from the pre-case cwd (real bash executes ONE arm) — restore at every arm terminator + esac
   let forceCmdNext = false;        // a leading \\ escape dropped — the word is at command position
   let spawnerPending = null;       // sudo/env/xargs/… — next real word is a command
@@ -8115,6 +8143,15 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const pipeB = () => pipeBase[pipeBase.length - 1];
   const asyncB = () => asyncBase[asyncBase.length - 1];
   const skipWs = (k) => { while (k < n && /\s/.test(s[k])) k++; return k; };
+  // A bash SIMPLE COMMAND ends at a bare newline, so an operand read for a
+  // cwd-mutating builtin must not cross one: `popd\ncd a` is TWO commands in
+  // real bash. skipWs() would swallow the newline and read `cd` as popd's
+  // operand, EATING the next command — measured BYPASS: `popd\ncd a; echo pwn >
+  // ../tracked.md` really overwrites the tracked HUB file (cwd is `a`, `..` is
+  // the hub root) while the walker lost the `cd` and resolved the write OUTSIDE
+  // the hub (allowed). A backslash-newline continuation is still a continuation
+  // — it is handled inside readWord, and `\` is not whitespace here. #3956.
+  const skipWsNl = (k) => { while (k < n && (s[k] === " " || s[k] === "\t" || s[k] === "\r")) k++; return k; };
   const readWord = (k) => {
     let w = "";
     let q = null;
@@ -8675,10 +8712,28 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   };
   const applyPending = () => {
     const fr = f();
+    // A pipeline's LAST segment is a subshell too: its `cd` dies here, so the
+    // boundary restores the pipeline's start cwd and DISCARDs that pending cd
+    // (`true | cd docs; echo x > f` writes from the pre-pipeline cwd — real
+    // bash-probe-verified; #3954).
+    if (fr.pipeActive) {
+      fr.cwd = fr.pipeC0 ?? fr.cwd;
+      fr.pipeC0 = null;
+      // …and the DIR STACK is the segment's too: a `pushd`/`popd` inside a pipeline
+      // segment dies with that segment's subshell (ISSUE 3 above).
+      if (fr.pipeD0) dirStack = fr.pipeD0;
+      fr.pipeD0 = null;
+      fr.pipeActive = false;
+      fr.pending = null;
+    }
     if (fr.pending) { fr.cwd = fr.pending; fr.pending = null; }
     pipeBase[pipeBase.length - 1] = fr.cwd;   // &&/;/newline: pipes start here
+    dirBase[dirBase.length - 1] = dirStack.slice(); // …and so does the dir stack snapshot
   };
-  const updateAsyncBase = () => { asyncBase[asyncBase.length - 1] = f().cwd; };
+  const updateAsyncBase = () => {
+    asyncBase[asyncBase.length - 1] = f().cwd;
+    dirAsync[dirAsync.length - 1] = dirStack.slice();
+  };
   const lineEndOf = (i0) => { const e = s.indexOf("\n", i0); return e === -1 ? n : e; };
   // cycle-11: real bash `bash <<'EOF' x.sh` — a FILE POSITIONAL (no -s) on
   // the heredoc header is the SCRIPT; the body is stdin DATA. Returns the
@@ -8845,8 +8900,8 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         i++; continue;
       }
       applyPending();
-      frames.push({ cwd: f().cwd, pending: null, forkCwd: f().forkCwd, forkAlts: f().forkAlts ? [...f().forkAlts] : [] }); // cycle-40 F2: a subshell inherits the parent's case-fork realities
-      pipeBase.push(f().cwd); asyncBase.push(f().cwd); updateAsyncBase();
+      frames.push({ cwd: f().cwd, pending: null, forkCwd: f().forkCwd, forkAlts: f().forkAlts ? [...f().forkAlts] : [], pipeC0: null, pipeD0: null, pipeActive: false }); // cycle-40 F2: a subshell inherits the parent's case-fork realities
+      pipeBase.push(f().cwd); asyncBase.push(f().cwd); dirBase.push(dirStack.slice()); dirAsync.push(dirStack.slice()); updateAsyncBase();
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
       dirStackSnapshots.push(dirStack.slice());
       i++; continue;
@@ -8872,7 +8927,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         }
         i++; continue;                     // case-pattern terminator (y) — NOT a subshell close
       }
-      if (frames.length > 1) { frames.pop(); pipeBase.pop(); asyncBase.pop(); }
+      if (frames.length > 1) { frames.pop(); pipeBase.pop(); asyncBase.pop(); dirBase.pop(); dirAsync.pop(); }
       applyPending(); updateAsyncBase();
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
       if (dirStackSnapshots.length > 0) dirStack = dirStackSnapshots.pop(); // subshell copy semantics
@@ -8893,7 +8948,14 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         continue;
       }
       f().pending = null;              // a cd in the async list dies with the subshell
+      f().pipeC0 = null;               // ... and so does any in-flight pipeline state
+      f().pipeD0 = null;
+      f().pipeActive = false;
       f().cwd = asyncB();              // the WHOLE async list ran at the segment start
+      // …and its pushd/popd died with it, exactly as the pipeline boundary's do below
+      // (ISSUE 3): restore the stack the async segment started with, or a bare `popd`
+      // lands on an entry bash never had and the cwd drifts off the tracked hub file.
+      dirStack = (dirAsync[dirAsync.length - 1] || []).slice();
       pipeBase[pipeBase.length - 1] = f().cwd;
       updateAsyncBase();
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
@@ -8901,7 +8963,20 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       continue;
     }
     if (ch === "|") {
+      // ⛔ A `|` IS NOT ALWAYS A PIPELINE, and latching pipe state on one that is not
+      // throws away the pending `cd` at the next boundary (applyPending restores
+      // pipeC0). Two non-pipeline shapes, both measured/derivable FAIL-OPENS (#3957
+      // review ISSUE 1):
+      //   1. a `case` PATTERN list — `case $x in a|b) cd docs;; esac; echo x >
+      //      tracked.md` really overwrites the TRACKED `docs/tracked.md` (the arm
+      //      runs), but the `;;` boundary discarded the arm's `cd`, leaving only the
+      //      unmatched-arm reality at the root → ALLOW. The `(` handler already
+      //      guards the same phase (`casePattern`); this one did not.
+      //   2. `[[ … ]]` — an unquoted `|` there is regex/boolean alternation
+      //      (`[[ $x =~ a|b ]]`), never a pipe.
+      if (casePattern || dblDepth > 0) { i++; continue; }
       if (s[i + 1] === "|") { applyPending(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; i += 2; continue; } // || continuation
+      if (!f().pipeActive) { f().pipeC0 = pipeB(); f().pipeD0 = (dirBase[dirBase.length - 1] || []).slice(); f().pipeActive = true; } // C0/D0 = the cwd and dir stack at the boundary BEFORE the first segment
       f().pending = null;
       f().cwd = pipeB();               // pipe segments from the pipe-list start
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
@@ -8914,11 +8989,17 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         // P2-1); `;;&` (keep matching) is the same; `;&` (fallthrough body) is
         // deliberately NOT pattern-phase (the next arm body runs commands).
         if (caseDepth > 0 && s[i + 2] !== "&") casePattern = true;
+        // a `;` cannot appear inside `[[ … ]]` (bash rejects it), so any `[[` still
+        // open here is MALFORMED. Bound it: a stuck counter would make every later
+        // `|` look like alternation and silently stop surfacing piped writes.
+        dblDepth = 0;
         applyPending(); updateAsyncBase(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
         i += 2; continue;
       }
+      dblDepth = 0;   // see above — `;` never occurs inside `[[ … ]]`
       applyPending(); updateAsyncBase(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; i++; continue;
     }
+
     // redirects (incl. fd-prefixed)
     if (ch === ">" || (ch >= "0" && ch <= "9")) {
       let k = i;
@@ -9038,6 +9119,17 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }    const w0 = readWord(i);
     const wstart = i;
     i = w0.k;
+    // ⛔ `[[ … ]]` IS TRACKED HERE, NOT IN THE RESET_WORDS BRANCH BELOW, and that
+    // placement is the whole point (measured, first draft of this fix): the walker
+    // treats the words INSIDE `[[ ]]` as commands (`segHadWord` becomes true), so a
+    // `]]` never reached the RESET_WORDS branch and the counter stuck at 1 — after
+    // which EVERY later `|` was treated as non-pipe and `[[ $x =~ a|b ]]; echo hi |
+    // tee docs/tracked.md` resolved NO candidates at all (a brand-new FAIL-OPEN, one
+    // worse than the one being fixed). Updating it on the RAW word, before any
+    // command-position/demotion gate, is what makes the count track the text.
+    // Counted rather than flagged: `[[`/`]]` nest and are parse-valid in bash.
+    if (w0.w === "[[") dblDepth++;
+    else if (w0.w === "]]") dblDepth = Math.max(0, dblDepth - 1);
     const prev = s[wstart - 1];
     const atCmdPos = forceCmdNext || wstart === 0 || (prev !== undefined && /[;&|()\s\n]/.test(prev)); // ) = case-arm start (cycle-26 P2-1)
     forceCmdNext = false;
@@ -9251,18 +9343,35 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (SPAWNER_WORDS.has(wBase2)) { spawnerPending = wBase2; envSawAssign = false; continue; }
     }
     if (w0.w === "cd" || w0.w === "pushd") {
-      const nxt = skipWs(i);
+      const nxt = skipWsNl(i);
       const tgt = readWord(nxt);
       i = tgt.k;
-      if (w0.w === "pushd") {
-        // flag / +N / bare forms don't cd (conservative no-op) — only a dir operand
-        if (!tgt.w || tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w)) { f().pending = null; continue; }
-        dirStack.push(f().cwd);
-      }
+      const isPushd = w0.w === "pushd";
+      // flag / +N / bare forms don't cd (conservative no-op) — only a dir operand
+      if (isPushd && (!tgt.w || tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { f().pending = null; continue; }
+      let next = null;
       if (tgt.w && tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
-        const next = resolve(cwd, tgt.w);
-        f().pending = existsSync(next) ? next : null;       // failed cd — unchanged
+        const cand = resolve(cwd, tgt.w);
+        if (existsSync(cand)) next = cand;                  // failed cd — unchanged
+      }
+      // ⛔ A FAILED pushd NEVER TOUCHES THE DIR STACK (real bash: `pushd
+      // /nonexistent` errors and leaves `dirs` exactly as it was). Pushing the
+      // current dir anyway DESYNCHRONIZES the stack, so every later bare `popd`
+      // lands one entry off and the walker's cwd drifts from real bash's. That
+      // drift is a craftable BYPASS, not just a false positive — measured: `pushd
+      // /nonexistent; cd a; popd; echo pwn > ../tracked.md` really overwrites the
+      // TRACKED hub file at the root, while the walker 'restored' to the root and
+      // resolved the write OUTSIDE the hub (allowed). #3955.
+      if (isPushd && next) dirStack.push(f().cwd);
+      f().pending = next;
+      {
         const frcd = f();
+        // ⛔ NOT gated on `next`: the alt realities are the ones where the PRIMARY cd
+        // FAILED and the arm reality's cd succeeded (that is exactly where an
+        // unmatched-arm write lands). Gating on the primary's existence dropped
+        // `case $mode in a) cd docs;; esac; cd sub && echo hi > q.md`'s `H/sub/q.md`
+        // reality — a measured FAIL-OPEN, and the reason this line reddened the
+        // existing C437r39 pin (#3957 review ISSUE 2). Each alt judges for itself.
         if (frcd.forkCwd && frcd.forkAlts.length && caseDepth === 0) {
           // cycle-38 P1: COMMON tail cds (outside any case arm) apply to every
           // arm-matched reality — shift the fork alts by the same relative
@@ -9271,11 +9380,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           // alts, which represent realities that never ran that arm.
           frcd.forkAlts = [...new Set(frcd.forkAlts.map((b) => { const nx = resolve(b, tgt.w); return existsSync(nx) ? nx : b; }))].slice(0, 64);
         }
-      } else f().pending = null;
+      }
       continue;
     }
     if (w0.w === "popd") {
-      const tgt = readWord(skipWs(i));
+      const tgt = readWord(skipWsNl(i));
       i = tgt.k;
       if (tgt.w && (tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { continue; } // -n/+N: no cd
       const d = dirStack.pop();
