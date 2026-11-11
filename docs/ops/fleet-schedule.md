@@ -298,7 +298,6 @@ that one installer — there is no second one. What was missing was the schedule
 - `--verify` also prints a **`NOTE`** when there is no checkout to compare against at all (no
   `INFRA_ROOT`/`AGENT_INFRA_PATH` resolved), so a `SCHEDULE VERIFIED` can never be silent about an
   arm that did not run — "could not compare" is a different answer from "compared and clean".
-
 Measured cause: a checkout fix for the placeholder drift did nothing on a running cell until the
 farm was refreshed. Refresh with
 `bash <checkout>/pi-bootstrap/cell-install.sh --install`, then `fleet-schedule.py --verify`.
@@ -331,7 +330,13 @@ What closes it:
 - `--start` and `--install` **restart** a stale or unstamped loop instead of answering `already
   running`, and say so. The restart happens **after** the declaration gate, so a broken set costs no
   cell its working scheduler, and BEFORE `spawn_loop()`, which would otherwise defer to the stale
-  loop's box-lock claim and make the restart a no-op that reads as a success.
+  loop's box-lock claim and make the restart a no-op that reads as a success. The loop it restarts is
+  **the one `--verify` graded**, resolved the same way: this state dir's pidfile, then the
+  identity-verified box lock (`loop.pid` is absent in states this file documents as reachable, and
+  names a recycled pid in another — a repair verb reading only the pidfile answered "already running"
+  over a loop the gate had just failed). From a home that holds **no** loop, the foreign holder's
+  staleness is REPORTED with the state dir that must act, because restarting it there would spawn the
+  box's successor from the wrong home.
 
 A rewrite that does not change the bytes is **not** stale (the comparison is content, not mtime or
 inode) — the arm exists to be trusted, so it must not fire on a re-farm that changed nothing.

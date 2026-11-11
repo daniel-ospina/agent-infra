@@ -1632,15 +1632,18 @@ def pid_is_our_loop(pid):
 LOOP_CODE = "loop.code"
 
 
-def loop_code_path() -> str:
+def loop_code_path(state=None) -> str:
     """Where the loop records WHAT IT LOADED. In the loop's OWN state dir.
 
     ⛔ NOT `loop.pid`'s value and not a mtime: the pidfile answers "is a loop running" and the tick
     answers "is it passing", and BOTH are true of a loop that has been executing the same module
     since before the farm was refreshed. This file is the only surface that answers the third
     question — *which build is the running process executing* — and it is why it is named apart.
+
+    `state` exists for ONE caller: a verb asked about a holder in ANOTHER state dir (a two-home box,
+    #2890) must read THAT home's stamp, or it grades its own silence. Default is this dir.
     """
-    return os.path.join(STATE, LOOP_CODE)
+    return os.path.join(state or STATE, LOOP_CODE)
 
 
 def file_digest(path) -> "str | None":
@@ -1696,7 +1699,7 @@ def write_loop_code():
     return rec
 
 
-def read_loop_code():
+def read_loop_code(state=None):
     """The build stamp as a dict, or None — every failure is "no readable stamp".
 
     ⛔ Tolerant on purpose, the same way `read_loop_lock` is: this is a RECOVERY path, and a 0-byte,
@@ -1704,14 +1707,14 @@ def read_loop_code():
     out of `--verify`/`--start` and leave the cell with a scheduler no verb can reason about.
     """
     try:
-        with open(loop_code_path()) as fh:
+        with open(loop_code_path(state)) as fh:
             rec = json.load(fh)
     except (OSError, ValueError, TypeError):
         return None
     return rec if isinstance(rec, dict) else None
 
 
-def loop_code_report(pid) -> tuple:
+def loop_code_report(pid, state=None) -> tuple:
     """(kind, detail) — is the LIVE loop `pid` executing the code that is on disk NOW?
 
     `kind` is one of:
@@ -1732,8 +1735,8 @@ def loop_code_report(pid) -> tuple:
     reported as stale (fail-closed) rather than cleared by absence. Clearing it there would make
     "could not compare" read as "compared and clean" — the no-op gate this file refuses everywhere.
     """
-    where = loop_code_path()
-    rec = read_loop_code()
+    where = loop_code_path(state)
+    rec = read_loop_code(state)
     try:
         stamped_pid = int(rec.get("pid")) if rec else None
     except (TypeError, ValueError, OverflowError):
@@ -3314,9 +3317,23 @@ def cmd_install():
             continue
         print("  %-38s rc=%s  log=%s" % (job.label, "held" if rc is None else rc, job.log_path()))
 
-    pid = loop_pid()
+    # ⛔ THE LIVE LOOP IS RESOLVED FROM THE SAME TWO SIGNALS THE GATE USES (#2961 review, F2), AND
+    # THE SPAWN IS GATED ON IDENTITY, NOT ON "THE PIDFILE IS EMPTY" (F1). Both are the same mistake
+    # in two directions, and both were measured on this change's own review:
+    #   F1 — `loop_pid()` answers LIVENESS only, so a pidfile holding a RECYCLED pid is truthy. Gating
+    #   the spawn on `if not pid:` therefore started nothing in exactly the state the pre-fix `else:`
+    #   repaired, and `--install` returned 1 from `cmd_verify()` with the box left unscheduled — no
+    #   reap, no liveness, no canary. `loop_pid()` is not "there is a loop"; `pid_is_our_loop` is.
+    #   F2 — `loop.pid` is ABSENT in states this file documents as reachable (a failed pidfile write
+    #   leaves the previous file; 19ad removes it), and `cmd_verify` already falls back to the
+    #   identity-verified box lock there. A repair verb that did not would print "restart it: --start"
+    #   over a `--start` that no-ops, which is the "answered 0 and changed nothing" defect this change
+    #   removes, one precondition over. `own_via_lock` is that same signal, read ONCE above.
+    live_pid = loop_pid()
+    if not (live_pid and pid_is_our_loop(live_pid)):
+        live_pid = holder[0] if own_via_lock else None
     stale = None
-    if pid and pid_is_our_loop(pid):
+    if live_pid:
         # ⛔ THE VERB THAT HIDES THIS BEST (#2961). `--install` is what `cloud-cell-bringup.sh --check`
         # runs after refreshing the farm, so "loop already running" is printed in the exact moment the
         # file on disk became newer than the module the loop loaded — and the `cmd_verify()` below then
@@ -3324,16 +3341,16 @@ def cmd_install():
         # Measured state: an operator refreshes the farm, sees the gate green, and the cell still runs
         # the old build. Staleness is decided before that message, so the restart is what happens
         # instead of it — and `cmd_verify()` still has the last word on the result.
-        code_kind, code_detail = loop_code_report(pid)
+        code_kind, code_detail = loop_code_report(live_pid)
         if code_kind == "current":
-            print("loop already running (pid %d)" % pid)
+            print("loop already running (pid %d)" % live_pid)
         else:
             stale = code_detail
             print("  STALE  %s" % code_detail)
     if stale is not None:
         # ⛔ AFTER THE DECLARATION GATE AT THE TOP OF THIS VERB, deliberately: a broken set already
         # returned 1 above, so a cell never trades a working-but-old scheduler for none.
-        ok_stop, why = terminate_loop(pid)
+        ok_stop, why = terminate_loop(live_pid)
         if not ok_stop:
             print(
                 "FAIL: the stale loop could not be replaced (%s) — this machine still runs the code "
@@ -3344,8 +3361,8 @@ def cmd_install():
             )
             return 1
         print("restarting the loop so the file on disk is the code that runs (%s)" % why)
-        pid = None
-    if not pid:
+        live_pid = None
+    if not live_pid:
         pid, started = spawn_loop()
         if not pid:
             print("FAIL: the scheduler loop did not come up (see %s/loop.log)" % STATE, file=sys.stderr)
@@ -3360,7 +3377,19 @@ def cmd_install():
 
 
 def cmd_start():
+    # ⛔ THE LIVE LOOP IS RESOLVED FROM THE SAME TWO SIGNALS `cmd_verify` USES (#2961 review, F2).
+    # `loop_pid()` reads THIS state dir's pidfile, which is ABSENT in states this file documents as
+    # reachable (a failed pidfile write leaves the previous file; 19ad removes it) and names a
+    # RECYCLED pid in another. `cmd_verify` already falls back to the identity-verified box lock in
+    # exactly those states — so a `--start` reading only the pidfile answered "already running" over a
+    # stale loop (or, with the pidfile gone, restarted nothing at all) while `--verify` was telling the
+    # operator "restart it: --start". A named remedy that no-ops is the defect this change removes,
+    # one precondition over: the operator runs it, gets exit 0, and the box keeps the old build.
     pid = loop_pid()
+    if not (pid and pid_is_our_loop(pid)):
+        own = loop_holder()
+        if own is not None and same_state_dir(own[2], STATE):
+            pid = own[0]
     stale = None
     if pid and pid_is_our_loop(pid):
         # ⛔ A LIVE LOOP IS NOT NECESSARILY THIS BUILD (#2961). `--start` is the revival verb, and it
@@ -3438,6 +3467,22 @@ def cmd_start():
             "loop already running (%s) — one loop per box, so this state dir starts none (#2890)"
             % describe_holder(holder)
         )
+        # ⛔ AND IF THAT HOLDER RUNS AN OLDER BUILD, SAY WHERE THE REPAIR CAN BE MADE (#2961 review,
+        # F2). This home must not restart it — one loop per box means the successor would be spawned
+        # from THIS home's state dir, silently moving the box's scheduler; that is a decision, not a
+        # repair. But `cmd_verify` rebinds to the holder and fails `stale`, so the operator is told to
+        # restart a loop this verb then declines to touch, with no instruction about where it CAN be
+        # touched. The exit code stays 0 (the box IS scheduled, and `cloud-cell-supervisor.sh` keys on
+        # it), and the stamp is read from the HOLDER's own state dir — grading ours would answer about
+        # a dir with no loop in it.
+        code_kind, code_detail = loop_code_report(holder[0], holder[2])
+        if code_kind != "current":
+            print("  STALE  %s" % code_detail)
+            print(
+                "        this state dir cannot restart it — run the restart from the home that owns "
+                "that loop: FLEET_SCHEDULE_STATE=%s %s --start"
+                % (holder[2], os.path.basename(sys.argv[0]))
+            )
         # ⛔ A LIVE HOLDER IS NOT NECESSARILY A PASSING ONE, AND THIS VERB CANNOT REVIVE IT. A frozen
         # loop (`SIGSTOP`ped by a lane, a debugger, a stopped container) still owns the box lock, so
         # this starts nothing and the tick goes stale — `--verify` will refuse (19s), but the operator

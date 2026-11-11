@@ -4677,6 +4677,100 @@ else
   [ ! -f "$ST20/loop.code" ] \
     && ok "20 --stop removes the stamp with the pidfile (no record of a loop that is gone)" \
     || bad "20 the build stamp outlived its loop: $(cat "$ST20/loop.code" 2>&1)"
+
+  # ── 20b. F1 — `--install` REPAIRS a recycled pid, and it did not ────────────────────────────────
+  # `loop_pid()` answers LIVENESS only: a pidfile holding a recycled pid (a lane, the controller, a
+  # supervisor) is TRUTHY while `pid_is_our_loop` says it is not the loop. Gating the spawn on
+  # `if not pid:` therefore started nothing in exactly the state the pre-fix `else:` repaired — and
+  # `--install` is the verb `cloud-cell-bringup.sh --check` runs and `die`s on, so the box was left
+  # with no scheduler at all. Case 4b pins this state for `--verify` and case 13 for `--start`;
+  # NOTHING drove `--install`, which is why the suite was green over it.
+  rm -f "$ST20/OFF"   # §20a's --stop recorded a decision; --install refuses to reverse it (by design)
+  sleep 60 & bystander20=$!; echo "$bystander20" >> "$T/pids"
+  printf '%s\n' "$bystander20" > "$ST20/loop.pid"
+  out="$(s20 --install)"; rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "20b F1: --install REPAIRS a recycled pid in loop.pid (it used to start nothing and fail)" \
+    || bad "20b F1: --install failed over a recycled pid (rc=$rc) — the box is left unscheduled: $out"
+  pid20d="$(cat "$ST20/loop.pid" 2>/dev/null)"
+  [ -n "$pid20d" ] && [ "$pid20d" != "$bystander20" ] \
+    && ok "20b F1: loop.pid now names a DIFFERENT pid than the recycled one" \
+    || bad "20b F1: loop.pid still holds the recycled pid ($pid20d)"
+  if [ -r "/proc/$pid20d/cmdline" ]; then
+    grep -q -- '--loop' "/proc/$pid20d/cmdline" \
+      && ok "20b F1: the pid it recorded really is fleet-schedule --loop" \
+      || bad "20b F1: the recorded pid is not a scheduler"
+  else
+    skip "20b F1: no /proc/<pid>/cmdline on this platform"
+  fi
+  kill -0 "$bystander20" 2>/dev/null \
+    && ok "20b F1: the unrelated process was NOT signalled (a repair is not a kill)" \
+    || bad "20b F1: --install killed the process that owned the recycled pid"
+  kill "$bystander20" 2>/dev/null
+
+  # ── 20c. F2 — staleness must be read from the pid the GATE grades, not only the pidfile ────────
+  # `--verify` falls back to the identity-verified box lock when `loop.pid` is absent (a state this
+  # file documents as reachable: a failed pidfile write leaves the previous file, 19ad removes it),
+  # and 19ad/19q pin that state for the POINTER and the OFF switch. Nothing crossed it with §20, so
+  # `--start` read only the pidfile — saw no loop — restarted NOTHING, and answered 0 over a stale
+  # loop while `--verify` printed "restart it: --start". A named remedy that no-ops.
+  s20 --install >/dev/null 2>&1               # a fresh, CURRENT loop
+  pid20e="$(cat "$ST20/loop.pid" 2>/dev/null)"
+  kill -0 "$pid20e" 2>/dev/null \
+    && ok "20c F2 baseline: a real loop is live before the pidfile is removed (the arm grades something)" \
+    || bad "20c F2 baseline: no live loop — this arm would grade an empty state"
+  printf '\n# refreshed again — the running process still holds the previous module\n' \
+    >> "$S20/fleet-schedule.py"
+  rm -f "$ST20/loop.pid"                     # …and its pidfile is gone (the ENOSPC / 19ad state)
+  out="$(s20 --verify)"; rc=$?
+  [ "$rc" -eq 1 ] && grep -q 'THE FILE WAS REFRESHED AND THE PROCESS WAS NOT' <<<"$out" \
+    && ok "20c F2 setup: --verify fails stale with NO pidfile (it grades the box-lock holder)" \
+    || bad "20c F2 setup: --verify did not read the stale holder without a pidfile (rc=$rc): $out"
+  out="$(s20 --start)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "20c F2: --start over a stale, pidfile-less own holder exits 0" \
+                  || bad "20c F2: --start exited $rc: $out"
+  grep -q 'restarting the loop so the file on disk is the code that runs' <<<"$out" \
+    && ok "20c F2: ⛔ --start RESTARTED it — the remedy --verify named is no longer a no-op" \
+    || bad "20c F2: --start answered with nothing / 'already running' over a stale loop (the named remedy no-ops): $out"
+  pid20f="$(cat "$ST20/loop.pid" 2>/dev/null)"
+  [ -n "$pid20f" ] && [ "$pid20f" != "$pid20e" ] \
+    && ok "20c F2: the pid actually changed (a restart is an act, not a message)" \
+    || bad "20c F2: no new loop was started (pid $pid20e -> $pid20f)"
+  out="$(s20 --verify)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "20c F2: and the same --verify then passes" \
+                  || bad "20c F2: --verify still refuses after the restart (rc=$rc): $out"
+
+  # ── 20d. F2 (foreign holder) — this home cannot restart another home's loop, so it must SAY so ──
+  # On a two-home box the box's scheduler belongs to whichever state dir holds the lock (#2890).
+  # `--start` correctly refuses to spawn a competitor — but it used to do so silently about the ONE
+  # thing the operator was told to do (`--verify` rebinds to the holder and fails `stale`), leaving
+  # them with a repair instruction and no home to run it in. The exit code must stay 0 (the box IS
+  # scheduled and `cloud-cell-supervisor.sh` keys on it) and the stamp must be read from the HOLDER.
+  ST20B="$T/st20b-state"; mkdir -p "$ST20B"
+  s20b() { env -u INFRA_ROOT -u AGENT_INFRA_PATH TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$ST20B" \
+               FLEET_SCHEDULE_LOCK_ROOT="$T/st20-box-lock" \
+               python3 "$S20/fleet-schedule.py" "$@" 2>&1; }
+  s20 --stop >/dev/null 2>&1               # home A must own NO loop before B can hold the box
+  s20b --install >/dev/null 2>&1           # home B's loop takes the box lock
+  sleep 1
+  kill -0 "$(cat "$ST20B/loop.pid" 2>/dev/null)" 2>/dev/null \
+    && ok "20d baseline: home B's loop holds the box (the arm grades a REAL foreign holder)" \
+    || bad "20d baseline: home B's loop never came up, so the foreign-holder arm grades nothing"
+  printf '\n# and B is refreshed out from under its loop\n' >> "$S20/fleet-schedule.py"
+  out="$(s20 --start)"; rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "20d a foreign holder still exits 0 from this home (the box is scheduled — the supervisor keys on it)" \
+    || bad "20d --start exited $rc over a foreign holder: $out"
+  grep -q 'STALE' <<<"$out" \
+    && ok "20d ⛔ the FOREIGN holder's staleness is REPORTED, not silent" \
+    || bad "20d --start said nothing about a foreign holder running an older build: $out"
+  grep -q "FLEET_SCHEDULE_STATE=$ST20B" <<<"$out" \
+    && ok "20d the remedy names the HOME that can actually restart it" \
+    || bad "20d the message does not name the holder's state dir: $out"
+  grep -q 'restarting the loop' <<<"$out" \
+    && bad "20d this home restarted ANOTHER home's loop (it must not move the box's scheduler): $out" \
+    || ok "20d this home did not restart the foreign loop"
+  s20b --stop >/dev/null 2>&1
 fi
 
 
