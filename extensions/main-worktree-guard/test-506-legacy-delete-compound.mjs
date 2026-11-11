@@ -239,10 +239,15 @@ if (typeof stripTypeScriptTypes !== "function" ||
     { id: "B5b", dir: "hub", expect: "block", marker: "(stash-pop)",
       cmd: "git stash pop && git push origin -d stale",
       why: "#506: … and through the #443 -d spelling (verdict-override class)" },
+    // ⚠️ DECLARED NON-DISCRIMINATING (review round 3, measured): M3's branch-state
+    // arm precedes every push arm and reads no verdict, so this row is INVARIANT
+    // under both the override revert and the reorder revert. It is kept as
+    // COVERAGE (that arm must keep firing ahead of the push arms) and is
+    // deliberately absent from every expectRed list — the reorder's real pins are
+    // A15b and B5.
     { id: "B5c", dir: "hub", expect: "block", marker: "Branch-state change blocked",
       cmd: "git checkout -f && git push origin --delete stale",
-      why: "#506: the force-checkout lead must block; the M3 branch-state arm owns it in a hub session " +
-           "(pre-fix the laundered verdict never reached M3's verdict-independent arms — it returned allow first)" },
+      why: "coverage: a force-checkout lead is refused by M3 before any push arm is consulted" },
     { id: "B6", dir: "hub", expect: "block", marker: "(reset)",
       cmd: "git reset --hard && git push origin main && git push origin --delete stale",
       why: "#506: the delete in a LATER segment must not launder either (extractor attribution)" },
@@ -490,6 +495,41 @@ if (typeof stripTypeScriptTypes !== "function" ||
           expectDegradedGreen: ["D2", "D3"],
         },
         {
+          // (6) THE hasPush GATE REMOVED (#506 review round 3, finding 2). Without
+          // it the arm re-enters for a `block:commit`, the extractor supplies the
+          // delete target from the commit MESSAGE, and B13/B13b go RED.
+          label: "hasPush gate removed",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "      if (det.hasPush === true &&\n          det.verdict !== \"block:push-delete\" &&",
+            "      if (det.verdict !== \"block:push-delete\" &&",
+          ),
+          // MEASURED, and it corrects the review's prediction: only B13 (`-d`)
+          // reddens. The `--delete` twin (B13b) is INVARIANT under this mutant —
+          // the frozen echo over-match returns `block:push-delete` for it, which
+          // the arm excludes by family, so the gate was never what kept B13b
+          // green. Its partner is the parity assertion, not the gate.
+          expectRed: ["B13"],
+          // RED here means the commit was REFUSED on message text alone.
+          redCheck: (r) => blocked(r) && String(r.reason ?? "").includes("checked out in"),
+          expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B10", "B11", "B13b", "B14"],
+        },
+        {
+          // (7) THE hasPush FLAG NEVER SET (classifier half of finding 2): the flag
+          // is asserted on the mutant MODULE, and the arm it gates goes quiet —
+          // which reds the two worktree #73 pins it exists to drive.
+          label: "hasPush flag never set",
+          file: "classify-git.mjs",
+          revert: (src) => src.replace(
+            "    out.hasPush = true; // #506: \"a real push invocation exists\" — see the doc block",
+            "    // MUTANT: hasPush never set",
+          ),
+          classifierHasPush: ["git reset --hard && git push origin --delete stale", false],
+          expectRed: ["B10", "B14"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B11", "B13", "B13b"],
+        },
+        {
           // (5) THE EXTRACTOR FALLBACK DELETED: a delete that lives in a LATER
           // compound segment loses its attribution, so B6 (reset → push main →
           // push --delete) stops running the #73 check. B6 was deliberately NOT
@@ -517,6 +557,12 @@ if (typeof stripTypeScriptTypes !== "function" ||
           expectTrue(`M: [${mut.label}] the revert was actually applied (anchor is live)`, built.applied,
             "the anchor did not match — a stale anchor proves less than it claims");
           if (!built.applied) continue;
+          if (mut.classifierHasPush) {
+            const mutCg2 = await import(pathToFileURL(join(built.root, "extensions/main-worktree-guard/classify-git.mjs")).href);
+            const got = mutCg2.classifyGitCommandDetailed(mut.classifierHasPush[0]).hasPush === true;
+            expectTrue(`M: [${mut.label}] the mutant reports hasPush=${mut.classifierHasPush[1]} for a REAL push (defect reintroduced)`,
+              got === mut.classifierHasPush[1], `got hasPush=${got}`);
+          }
           if (mut.classifier) {
             // The classifier half is asserted on the mutant MODULE (the unit the
             // revert changes), so it holds even if the loader leg is unavailable.
@@ -526,8 +572,6 @@ if (typeof stripTypeScriptTypes !== "function" ||
               got === mut.classifier[1], `got ${got}`);
           }
           if (mut.expectDegradedRed) {
-            expectTrue(`M: [${mut.label}] the tree really IS degraded (an extension warning was reported)`,
-              true, "—");
             const guard = await loadGuard(built.index);
             expectTrue(`M: [${mut.label}] the mutant extension loads ${mut.omit ? "DEGRADED" : "clean"}`,
               guard.loaded && (mut.omit ? guard.degradation.length > 0 : guard.degradation.length === 0),
