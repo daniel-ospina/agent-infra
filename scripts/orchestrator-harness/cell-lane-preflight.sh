@@ -78,6 +78,16 @@
 #                   `${PI_LANE_PROVIDER:-deepseek}` — the SAME contract as lane-exec.sh and
 #                   spawn-gate.sh::run_agent, so the probe measures the model the lane will run.
 #
+# ENVIRONMENT (the staleness reading, #3932 — it has no flag, because it is BOX state, not a probe
+# argument: a caller must not be able to turn its own readiness field off):
+#   CELL_PREFLIGHT_REPO        the checkout to measure. Default: the first of `${CELL_PREFLIGHT_REPO}`,
+#                              `$HOME/tortoise`, `$HOME/agent-infra` that exists. None found is
+#                              `repo=none behind=unknown` — reported, never refused.
+#   CELL_PREFLIGHT_MAX_BEHIND  refuse when the checkout is MORE than this many commits behind
+#                              `origin/main`. Default 50.
+#   CELL_PREFLIGHT_FETCH_BOUND the fetch gets this many seconds before it is killed and the reading
+#                              becomes `behind=unknown`. Default 12.
+#
 # EXIT
 #   0  CAPABLE   — answered AND returned within the bound
 #   3  REFUSED   — a gate verdict; the line carries the reading it used
@@ -96,7 +106,9 @@
 #                      (a caller passing a flag this copy predates), and the remedy says so.
 #   every other refused reason ⇔ deterministic: `exit-hang` / `no-return` (still alive at the bound,
 #                      with or without the answer), `call-failed` (answered, then errored),
-#                      `keys-unreadable`, `pi-missing`, `misconfigured`. A caller must REFUSE on these.
+#                      `keys-unreadable`, `pi-missing`, `misconfigured`, `stale-code` (the box answers,
+#                      but its checkout is more than `CELL_PREFLIGHT_MAX_BEHIND` commits behind
+#                      `origin/main` — #3932). A caller must REFUSE on these.
 #   `no-return` is the one this file had to grow: a box whose provider is blackholed, whose proxy
 #   drops, or whose extension set hangs BEFORE the first token never produces a token, so before it
 #   existed that box could only ever emit `no-answer` — the WARN arm — and the gate was vacuous for
@@ -150,11 +162,21 @@ emit() {
 # remembered from a possibly-stale ref (the very "flag that records a past state" failure this file's
 # sibling issues describe). A fetch that fails or times out yields `behind=unknown` and does NOT refuse —
 # an unanswerable network read is a WARN, the same doctrine as `no-answer`.
+#
+# ⛔ THE FETCH'S OWN EXIT STATUS IS THE ONLY THING THAT MAKES THAT SENTENCE TRUE (this change's review).
+# The first cut fetched in the background and then read `rev-list` UNCONDITIONALLY. But a failed fetch
+# does not delete `origin/main` — it leaves the last one it saw — so `rev-list` answers, and the gate
+# publishes a number it never measured: a checkout 500 commits behind, last fetched a month ago,
+# reports `behind=8` and is declared READY. That is the same escaped-stale-ref false PASS the header
+# above claims this reading avoided, one line under the claim. The rule is therefore structural: a ref
+# that was NOT refreshed this run is not a measurement, and the status of the fetch (including the
+# watchdog's kill, which surfaces as a non-zero wait status) decides it. `exec` keeps `$!` pointing at
+# `git` itself rather than at a wrapper shell, so the bound's kill reaches the process it bounds.
 MAX_BEHIND="${CELL_PREFLIGHT_MAX_BEHIND:-50}"
 FETCH_BOUND="${CELL_PREFLIGHT_FETCH_BOUND:-12}"
 
 code_freshness() {
-  local repo="" behind="" cand
+  local repo="" behind="" cand fp n fetch_rc
   for cand in "${CELL_PREFLIGHT_REPO:-}" "$HOME/tortoise" "$HOME/agent-infra"; do
     [ -n "$cand" ] || continue
     if [ -e "$cand/.git" ]; then repo="$cand"; break; fi
@@ -162,10 +184,17 @@ code_freshness() {
   [ -n "$repo" ] || { printf 'repo=none behind=unknown'; return 0; }
   # Bounded fetch. `timeout` is absent on macOS and this suite runs on both, so the bound is a
   # background pid + a counted sleep, matching the watchdog form the repo already uses (#2046).
-  ( cd "$repo" 2>/dev/null && git fetch --quiet origin main >/dev/null 2>&1 ) &
-  local fp=$! n=0
+  ( cd "$repo" 2>/dev/null && exec git fetch --quiet origin main >/dev/null 2>&1 ) &
+  fp=$! n=0
   while [ "$n" -lt "$FETCH_BOUND" ] && kill -0 "$fp" 2>/dev/null; do sleep 1; n=$((n+1)); done
   kill -0 "$fp" 2>/dev/null && kill "$fp" 2>/dev/null
+  # The watchdog's kill, a dead network and a missing remote ALL land here as non-zero, and all three
+  # mean the same thing: whatever `origin/main` now holds was not read from the remote this run.
+  wait "$fp" 2>/dev/null; fetch_rc=$?
+  if [ "${fetch_rc:-1}" -ne 0 ]; then
+    printf 'repo=%s behind=unknown fetch_rc=%s' "$(basename "$repo")" "$fetch_rc"
+    return 0
+  fi
   behind="$( cd "$repo" 2>/dev/null && git rev-list --count HEAD..origin/main 2>/dev/null )"
   case "${behind:-}" in
     ''|*[!0-9]*) printf 'repo=%s behind=unknown' "$(basename "$repo")" ;;
@@ -193,6 +222,12 @@ case "$BOUND" in ''|*[!0-9]*) die_usage "--bound must be a positive integer (rea
 case "$ATTEMPTS" in ''|*[!0-9]*) die_usage "--attempts must be a positive integer (read '$ATTEMPTS')" ;; esac
 [ "$BOUND" -gt 0 ] || die_usage "--bound must be > 0 (read '$BOUND')"
 [ "$ATTEMPTS" -gt 0 ] || die_usage "--attempts must be > 0 (read '$ATTEMPTS')"
+# ⛔ AN UNVALIDATED REFUSAL BOUND IS AN INERT ENFORCER (this change's review). `[ "$behind" -gt "$MAX" ]`
+# with a non-numeric MAX makes bash print `integer expression expected` and return 2 — i.e. FALSE — so
+# the staleness refusal silently never fires and the gate reads `ok` for ever, which is exactly the
+# failure #3932 exists to catch. Same doctrine as `--bound`/`--attempts`, and the same readable verdict.
+case "$MAX_BEHIND" in ''|*[!0-9]*) die_usage "CELL_PREFLIGHT_MAX_BEHIND must be a non-negative integer (read '$MAX_BEHIND')" ;; esac
+case "$FETCH_BOUND" in ''|*[!0-9]*) die_usage "CELL_PREFLIGHT_FETCH_BOUND must be a non-negative integer (read '$FETCH_BOUND')" ;; esac
 
 HOST="${HOST:-$(hostname 2>/dev/null || echo '?')}"
 PI_VER="$(pi --version 2>/dev/null | tail -1)"
@@ -339,8 +374,16 @@ while [ "$n" -le "$ATTEMPTS" ]; do
         ''|*[!0-9]*) : ;;   # unmeasurable: reported below, never a refusal
         *)
           if [ "$FRESH_BEHIND" -gt "$MAX_BEHIND" ]; then
+            # ⛔ EXIT 3, LIKE EVERY OTHER REFUSAL (this change's review). The first cut exited 1, and on
+            # this file's own documented table `1` is not a verdict at all — the caller's "no verdict"
+            # arm exists for exactly `rc=1` ("absent or could not start") and WARNS on it. It happened to
+            # refuse here only because the verdict LINE was also present; a consumer that switches on the
+            # code alone (this repo's own EXIT table is what such a consumer reads) would have treated a
+            # stale box as "no probe ran" and dispatched anyway.
             emit "refused why=stale-code" "answered_ms=$A_FIRST_MS attempts=$n bound=${BOUND}s $FRESHNESS max_behind=$MAX_BEHIND"
-            exit 1
+            [ "$QUIET" = "1" ] || printf '%s\n' \
+              "[$PROG] the box can complete a model call, but its checkout is more than ${MAX_BEHIND} commits behind origin/main. A lane cut from that base produces a plausible log and a WRONG diff — it re-derives what main already fixed, or reverts it (#3932). Advance the checkout (git -C <repo> pull --ff-only origin main, or the cell's deploy path) before dispatching; the reading above names the repo and the distance. Override with CELL_PREFLIGHT_MAX_BEHIND=<n> only if a stale base is genuinely intended." >&2
+            exit 3
           fi
           ;;
       esac

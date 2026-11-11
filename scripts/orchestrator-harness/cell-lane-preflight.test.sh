@@ -57,6 +57,19 @@
 #                                            misconfiguration, never an absent answer (measured before
 #                                            this arm: `pi -p --provider  --model  …`, reported as a
 #                                            network arm the caller warns on).
+# A16 fresh checkout                       → `ok`, exit 0, carrying `behind=0`. #3932's gate must PASS
+#                                            a current box, or it is the outage it was built to prevent.
+# A17 stale checkout                       → `refused why=stale-code`, exit 3, carrying the distance
+#                                            (`behind=3 max_behind=2`); and the SAME repo at a higher
+#                                            threshold is `ok` + `behind=3`, so the arm pins the
+#                                            THRESHOLD rather than "any repo refuses".
+# A18 a fetch that FAILS                   → `behind=unknown`, exit 0 — never the count left behind by
+#                                            the last successful fetch. This is the false PASS the
+#                                            reading exists to remove: a box 500 commits behind, last
+#                                            fetched a month ago, answering `behind=8` and READY.
+# A19 no checkout to measure               → `repo=none behind=unknown`, exit 0: the CI/dev path (every
+#                                            other arm here runs it), reported and never refused.
+# A20 a bad threshold                      → exit 2 (`why=usage`), not a silent `ok`.
 #
 # ── MUTATION ────────────────────────────────────────────────────────────────────────────────────
 # Every count below is what THIS file printed, measured by running it. Two mutations, because two
@@ -72,6 +85,10 @@
 #      `cell-lane-preflight:` footer of the run.
 # (M2) refuse a hang on ONE sample (drop the retry): A11 goes red — a single slow sample would refuse
 #      a working box.
+# (M3) read the count WITHOUT the fetch's status (drop the `wait`/`fetch_rc` guard and read `rev-list`
+#      unconditionally — the first cut's shape): A18 goes red, `expected 'behind=unknown' … got:
+#      …behind=0…`. That is the mutation that matters, because it makes the gate publish a number it
+#      never measured, and it is invisible in production right up to the moment a stale base lands work.
 # ⚠️ THE EARLIER HEADER ON THIS FILE NAMED A DIFFERENT MUTATION WITH COUNTS THAT BELONGED TO A THIRD
 # ONE (review of #2991, P2, reproduced by the reviewer). The old counts are deleted rather than
 # restated: a number that does not reproduce under the mutation it names is a claim about process
@@ -152,6 +169,50 @@ run_gate() {
   RC=$?
 }
 mkdir -p "$WORK/home"
+
+# ── staleness fixtures (#3932) ──────────────────────────────────────────────────────────────────
+# "How far behind origin/main is this checkout" can only be answered by git, so these arms build real
+# repositories: a bare origin, a clone of it, and commits pushed to origin AFTER the clone (so the
+# clone is exactly N behind until it fetches). Every remote is a local path — no network.
+# ⛔ The clones are created in sync and then upstream is advanced, so an arm can make the local
+# `origin/main` ref STALE on purpose (A18): that is the shape a failed fetch leaves behind, and it is
+# the one that makes an unconditional `rev-list` look like a measurement.
+g() { git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false \
+         -c tag.gpgsign=false -c init.defaultBranch=main "$@"; }
+mk_ahead() { # mk_ahead <dir> <n> → n more commits on upstream's main, pushed
+  local d="$1" n="${2:-0}" i=0
+  while [ "$i" -lt "$n" ]; do
+    i=$((i+1))
+    g -C "$d/up" commit -q --allow-empty -m "ahead $i" || return 1
+  done
+  [ "$n" -eq 0 ] || g -C "$d/up" push -q origin main || return 1
+  return 0
+}
+mk_repo() { # mk_repo <dir> <n-ahead> → <dir>/repo is <n-ahead> commits behind its origin/main
+  local d="$1" n="${2:-0}"
+  mkdir -p "$d" || return 1
+  g init -q --bare "$d/origin.git" || return 1
+  g -C "$d/origin.git" symbolic-ref HEAD refs/heads/main || return 1
+  g init -q "$d/up" || return 1
+  g -C "$d/up" symbolic-ref HEAD refs/heads/main || return 1
+  g -C "$d/up" remote add origin "$d/origin.git" || return 1
+  g -C "$d/up" commit -q --allow-empty -m init || return 1
+  g -C "$d/up" push -q origin main || return 1
+  g clone -q "$d/origin.git" "$d/repo" || return 1
+  mk_ahead "$d" "$n"
+}
+unreachable_remote() { # the clone keeps its last-fetched origin/main; every further fetch fails
+  g -C "$1/repo" remote set-url origin "$1/does-not-exist.git"
+}
+# run_gate_cell <dir> <bound> [VAR=value …] → RC and OUT, extra env threaded through `env`
+run_gate_cell() {
+  local d="$1" bound="$2"; shift 2
+  OUT="$(env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS -u CELL_PREFLIGHT_REPO \
+          -u CELL_PREFLIGHT_MAX_BEHIND -u CELL_PREFLIGHT_FETCH_BOUND \
+          PATH="$d/bin:$PATH" HOME="$d/home" "$@" \
+          bash "$TARGET" --keys "$d/keys.env" --bound "$bound" 2>&1)"
+  RC=$?
+}
 
 # ── A1: answer + return → ok ────────────────────────────────────────────────────────────────────
 make_stub "$WORK/a1" answer; make_keys "$WORK/a1"
@@ -286,6 +347,66 @@ assert_has "A15 ...naming the argument it rejected" "usage-error=unknown argumen
 OUT="$(bash "$TARGET" --help 2>/dev/null)"; RC=$?
 [ "$RC" -eq 0 ] && ok "A15 --help still exits 0 and is not a refusal" || bad "A15 --help exited $RC"
 assert_not_has "A15 ...emitting no verdict at all" "LANE_CAPABILITY" "$OUT"
+
+# ── A16–A20: CODE STALENESS IS A READINESS FIELD (#3932) ───────────────────────────────────────
+# The measured defect: all five cells were 496–7093 commits behind origin/main and every one emitted
+# `LANE_CAPABILITY=ok`, because the gate only ever asked whether a model call could complete.
+
+# A16 — a CURRENT checkout still passes, and says how it knows.
+make_stub "$WORK/a16" answer; make_keys "$WORK/a16"
+mk_repo "$WORK/a16" 0 || bad "A16 fixture: could not build a git repo (git missing?)"
+run_gate_cell "$WORK/a16" 20 CELL_PREFLIGHT_REPO="$WORK/a16/repo" CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 0 ] && ok "A16 a current checkout is still READY (exit 0)" || bad "A16 expected exit 0, got $RC: $OUT"
+assert_has "A16 verdict" "LANE_CAPABILITY=ok" "$OUT"
+assert_has "A16 carries the measurement it made" "behind=0" "$OUT"
+
+# A17 — a stale checkout REFUSES, and the refusal carries the distance. THIS IS #3932.
+make_stub "$WORK/a17" answer; make_keys "$WORK/a17"
+mk_repo "$WORK/a17" 3 || bad "A17 fixture: could not build a git repo"
+run_gate_cell "$WORK/a17" 20 CELL_PREFLIGHT_REPO="$WORK/a17/repo" CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 3 ] && ok "A17 a stale checkout exits 3 (a gate verdict, like every other refusal)" \
+                || bad "A17 expected exit 3, got $RC: $OUT"
+assert_has "A17 names the staleness" "why=stale-code" "$OUT"
+assert_has "A17 carries the distance it measured" "behind=3" "$OUT"
+assert_has "A17 carries the threshold it applied" "max_behind=2" "$OUT"
+assert_not_has "A17 is never reported ok (the defect this closes)" "LANE_CAPABILITY=ok" "$OUT"
+assert_has "A17 tells the operator the remedy" "Advance the checkout" "$OUT"
+# A17b — and the SAME repo at a higher threshold is READY: the arm pins the threshold, not "any repo
+# refuses", which would be a gate that fails the fleet instead of protecting it.
+run_gate_cell "$WORK/a17" 20 CELL_PREFLIGHT_REPO="$WORK/a17/repo" CELL_PREFLIGHT_MAX_BEHIND=5
+[ "$RC" -eq 0 ] && ok "A17b the same stale checkout is READY under a threshold it satisfies" \
+                || bad "A17b expected exit 0 at max_behind=5, got $RC: $OUT"
+assert_has "A17b still reports the distance" "behind=3" "$OUT"
+
+# A18 — a fetch that FAILS is `unknown`, never the count left behind by the last successful fetch.
+# The clone's origin/main is 0 behind (it was cloned in sync), upstream is now 3 ahead, and the remote
+# is unreachable — so the ONLY count available locally is a stale 0. Publishing it would declare a
+# 3-behind (in production: 500-behind) box READY on the strength of a ref nobody refreshed.
+make_stub "$WORK/a18" answer; make_keys "$WORK/a18"
+mk_repo "$WORK/a18" 0 || bad "A18 fixture: could not build a git repo"
+mk_ahead "$WORK/a18" 3
+unreachable_remote "$WORK/a18"
+run_gate_cell "$WORK/a18" 20 CELL_PREFLIGHT_REPO="$WORK/a18/repo" CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 0 ] && ok "A18 an unanswerable network read is a WARN, not a refusal (exit 0)" \
+                || bad "A18 expected exit 0, got $RC: $OUT"
+assert_has "A18 says the reading is unknown" "behind=unknown" "$OUT"
+assert_not_has "A18 never publishes an unrefreshed ref as a measurement" "behind=0" "$OUT"
+assert_not_has "A18 does not refuse on a number it did not measure" "why=stale-code" "$OUT"
+
+# A19 — nothing to measure is REPORTED, never refused (the CI/dev path every other arm here takes).
+make_stub "$WORK/a19" answer; make_keys "$WORK/a19"; mkdir -p "$WORK/a19/home"
+run_gate_cell "$WORK/a19" 20 CELL_PREFLIGHT_REPO="$WORK/a19/no-such-checkout" CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 0 ] && ok "A19 a box with no checkout to measure is still READY (exit 0)" \
+                || bad "A19 expected exit 0, got $RC: $OUT"
+assert_has "A19 says there was no repo" "repo=none" "$OUT"
+assert_has "A19 says the reading is unknown" "behind=unknown" "$OUT"
+
+# A20 — a non-numeric threshold is a MISCONFIGURATION, not a silent `ok`. `[ "$n" -gt "abc" ]` returns
+# FALSE, so an unvalidated bound is an inert enforcer: the staleness refusal could never fire again.
+OUT="$(CELL_PREFLIGHT_MAX_BEHIND=lots bash "$TARGET" --quiet --bound 5 2>&1)"; RC=$?
+[ "$RC" -eq 2 ] && ok "A20 a non-numeric CELL_PREFLIGHT_MAX_BEHIND exits 2" || bad "A20 expected exit 2, got $RC: $OUT"
+assert_has "A20 ...naming the variable it rejected" "CELL_PREFLIGHT_MAX_BEHIND" "$OUT"
+assert_not_has "A20 ...instead of reading ok on an unappliable bound" "LANE_CAPABILITY=ok" "$OUT"
 
 printf '\ncell-lane-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
