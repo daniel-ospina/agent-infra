@@ -3285,7 +3285,7 @@ cmd_check() {
   # has the CONTROLLER stop on every tick while this check certifies "CELL CAN RUN A CONTROLLER".
   # `brief-gate.sh` (#2258) and `wt-lifecycle.sh` (#2033) are older instances of the same class and were
   # equally absent, so they are added with it rather than left as the next thing to be found by hand.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh controller-state.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh controller-state.sh gh-auth.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
