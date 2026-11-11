@@ -4850,6 +4850,69 @@ try {
     lacks("cd\ndocs; echo x > tracked.md", "redirect:H/docs/tracked.md", "N2: `cd` + newline is a bare cd — the next line is NOT its operand");
   }
 
+  // ── #3956 completion (lane 3956): the issue names THREE indicators and only
+  // the two bypass-direction ones are pinned (C437r45 N1/N2). Indicator 3 — the
+  // CONTROL that "must not regress" — had NO pin, and it is not cosmetic: the
+  // plausible-but-wrong implementation of this very issue ("the operand read
+  // stops at a newline") is to stop the WORD at the newline instead of merely
+  // refusing to SKIP one. That loses the cd entirely, and then
+  // `cd \<NL>docs; echo pwn > ../tracked.md` resolves one level ABOVE the hub
+  // while real bash overwrites the TRACKED root file — the same fail-OPEN this
+  // issue closed, one implementation choice away. So every row below is a
+  // real-bash-verified pair: the continuation (must keep the cd) and its bare
+  // newline neighbour (must NOT read the next line as the operand).
+  // Measured on bash 5.2.21 with HOME OUTSIDE the fixture hub, per arm:
+  //   `cd \<NL>docs && echo x > f.md`      → docs/f.md      (continuation)
+  //   `cd <NL>docs && echo x > f.md`       → f.md, bash: "docs: command not found"
+  //   `cd \<NL>docs; echo pwn > ../tracked.md` → tracked.md (TRACKED root)
+  //   `pushd \<NL>docs; echo pwn > ../tracked.md` → tracked.md (TRACKED root)
+  // ⛔ ONE TRACKED FILE PER ARM FAMILY (#3957 review NOTE 1): with BOTH paths
+  // tracked, the wrong resolution and the right one BOTH block, so the gate rows
+  // could not discriminate. Each `blocks`/`allows` row declares only the file
+  // real bash actually writes; a candidate resolved outside the hub is keyed by
+  // its absolute path, which can never equal a hub-relative tracked name.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt3956-"));
+    mkdirSync(join(H, "docs")); mkdirSync(join(H, "a"));
+    writeFileSync(join(H, "docs", "f.md"), "tracked\n");
+    writeFileSync(join(H, "docs", "tracked.md"), "tracked\n");
+    writeFileSync(join(H, "tracked.md"), "tracked\n");
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const rels = (cmd) => cands(cmd).map((x) => ({
+      rel: x.resolvedPath.startsWith(H + "/") ? x.resolvedPath.slice(H.length + 1) : x.resolvedPath,
+    }));
+    const has = (cmd, needle, label) => expectBool(`C3956: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C3956: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    const blocks = (tracked, cmd, label) => expectBool(`C3956: ${label}`, firstHubTrackedWrite(rels(cmd), tracked) !== null, true);
+    const allows = (tracked, cmd, label) => expectBool(`C3956: ${label}`, firstHubTrackedWrite(rels(cmd), tracked) !== null, false);
+
+    // indicator 3, verbatim: a backslash-newline IS a line continuation.
+    has("cd \\\ndocs && echo x > f.md", "redirect:H/docs/f.md", "N3: `\\`+newline is a continuation — `docs` IS cd's operand");
+    blocks(["docs/f.md"], "cd \\\ndocs && echo x > f.md", "N3 gate: real bash overwrites the TRACKED docs/f.md → BLOCK");
+    // …and its neighbour, which is what makes N3 discriminate: a BARE newline
+    // ends the simple command, so `docs` is a COMMAND (bash: command not found)
+    // and cd has NO operand — the write stays at the fixture root.
+    has("cd\ndocs && echo x > f.md", "redirect:H/f.md", "N3 control: a bare newline is NOT a continuation — `docs` is a command, not cd's operand");
+    lacks("cd\ndocs && echo x > f.md", "redirect:H/docs/f.md", "N3 control: the pre-fix over-read (docs as cd's operand) stays closed");
+    allows(["docs/f.md"], "cd\ndocs && echo x > f.md", "N3 control gate: real bash writes the untracked root f.md → ALLOW");
+
+    // The continuation in the BYPASS direction: an implementation that drops the
+    // continued cd resolves the write one level ABOVE the hub — an ALLOW on a
+    // TRACKED hub file. This is the row the N1/N2 pins cannot catch.
+    has("cd \\\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N4: the continued cd is not lost — the write is the tracked root file, not one level above the hub");
+    blocks(["tracked.md"], "cd \\\ndocs; echo pwn > ../tracked.md", "N4 gate: TRACKED root tracked.md → BLOCK");
+    // its neighbour: with a BARE newline the cd is bare, so `..` is the hub's
+    // PARENT and the tracked root file is never touched.
+    lacks("cd\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N4 control: a bare newline leaves a bare cd — `..` is the hub's parent, not the hub");
+    allows(["tracked.md"], "cd\ndocs; echo pwn > ../tracked.md", "N4 control gate (discriminating pair): same shape and SAME tracked root file — the bare-newline arm resolves above the hub, so only the continuation arm blocks");
+    has("pushd \\\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N5: pushd's operand read honours the continuation too");
+    blocks(["tracked.md"], "pushd \\\ndocs; echo pwn > ../tracked.md", "N5 gate: TRACKED root tracked.md → BLOCK");
+    // continuation + indent, the #625 LEAD-continuation shape, on the cwd path.
+    has("cd \\\n  docs && echo x > f.md", "redirect:H/docs/f.md", "N6: continuation + indent before cd's operand");
+    blocks(["docs/f.md"], "cd \\\n  docs && echo x > f.md", "N6 gate: TRACKED docs/f.md → BLOCK");
+  }
+
   // ── #3957 review (cycle-46) pins: three shapes where THIS PR's own diff sent
   // the walker's cwd model AWAY from real bash's. Each was a FAIL-OPEN on a
   // tracked hub file (a BLOCK became an ALLOW) and each reddened an existing pin
