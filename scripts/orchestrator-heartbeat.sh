@@ -374,7 +374,30 @@ case "$ASK_RAW" in
       N_ASK=$((N_ASK + 1))
       ASK_EV="$ASK_EV scan_failed=${N_SCANFAIL}"
     fi
-    N_ASK=$(printf '%s' "$ASK_EV" | awk '{for(i=1;i<=NF;i++){if(split($i,a,"=")==2 && (a[1]=="pass" || a[1]=="bounce" || a[1]=="answered")) s+=a[2]}} END{print s+0}')
+    N_ASK=$(printf '%s' "$ASK_EV" | awk '{for(i=1;i<=NF;i++){if(split($i,a,"=")==2 && (a[1]=="pass" || a[1]=="bounce" || a[1]=="answered" || a[1]=="unscored")) s+=a[2]}} END{print s+0}')
+    # ⛔ `unscored` IS PART OF THIS SUM (agent-infra#2642), and it is summing it that makes the
+    # questions NAMED rather than merely counted: a question the gate could not score (no key, a
+    # rejected key, a failed call) exits 2, which put it in NO bucket — so a fleet whose decision gate
+    # was dead read exactly like a quiet tick, and the `ask|` lines that name the questions were dropped
+    # by the `N_ASK -gt 0` gate below. `ask-owner.py` emits the field on both summary arms and prints one
+    # `UNSCORED <repo>#<n>` line per question (plus the cause line above it), which is what lands in the
+    # log here.
+    N_UNSCORED=$(printf '%s' "$ASK_EV" | awk '{for(i=1;i<=NF;i++){if(split($i,a,"=")==2 && a[1]=="unscored") s+=a[2]}} END{print s+0}')
+    if [ "${N_UNSCORED:-0}" -gt 0 ]; then
+      # Forced into the log for the same reason as `scan_failed` above: a question that never reached
+      # the owner's queue is not a statistic to be rate-limited away. The beat itself already carries
+      # `unscored=N` inside $ASK_EV; this line says what it costs and where to look.
+      # ⛔ CAUSE-NEUTRAL ON PURPOSE (#2642 review). This alert used to say "no TypeSafe key on this box"
+      # and point straight at the provisioning doc — but `unscored` counts EVERY exit 2, and only one of
+      # `main()`'s five return-2 sites is a missing key. On a box whose key is PRESENT AND WRONG (the
+      # state docs/ops/decision-gate.md itself calls out: the first real question returns `jev http
+      # 401`) the beat logged "no key on this box" every tick and sent the operator to a procedure
+      # whose remedy is "put the key in keys.env" — where it already was. That is the same
+      # misdirection this PR refuses to ship for the provider store (cloud-cell-bringup.sh: "the
+      # operator is told to 'push a valid one', which cannot help"). So the alert names only what the
+      # count PROVES (not scored, not queued) and defers the cause to the per-question lines above it.
+      log "ALERT ask-gate UNSCORED ${N_UNSCORED} question(s) — ask-owner.py could not score them, so they are posted and READABLE but NOT in the owner-decision queue. The cause is on the UNSCORED line above each one (no key, a rejected key — 'jev http 401' — or a failed call); a key that is present and wrong is NOT fixed by provisioning it again. Provisioning, when the cause IS a missing credential: docs/ops/decision-gate.md"
+    fi
     # An answer that could not be routed to a lane has to be carried by hand, so the
     # whole scan output is kept: the summary line says HOW MANY, only these lines say
     # WHICH. Without this the failure mode is an answer nobody ever delivers.
@@ -1350,7 +1373,7 @@ if [ "${OBJ_ALERT:-0}" -eq 1 ]; then
   MSG="${MSG} ⛔ OBJECTIVE AT RISK: ${OBJ#OBJECTIVE } — the objective is the QUEUE (drain it without discarding useful work); the CI minute figure is an INDICATOR, not a target (owner ruling, #6792). BLOCKED means MAIN IS RED, which stops the merge queue: debug the TREE, not the lanes. Read that sha's check-runs, newest attempt per (app, workflow, job), judged by POLARITY — a missing check is not a green check. CI time is JOB wall time, not a run's created-to-updated span. "
 fi
 if [ "$N_ASK" -gt 0 ]; then
-  MSG="$MSG QUESTIONS: ${ASK_EV} — a question either CLEARED the gate (now labelled owner-decision, i.e. in the owner's queue), was SENT BACK with a template (labelled question-bounced; the lane removes that label to re-submit), or was ANSWERED (labelled owner-answered, and the owning lane has just been told to read the reply). Grow = the lane could not be routed — check the log line ending 'NO LANE ROUTE' and carry the answer to the lane by hand."
+  MSG="$MSG QUESTIONS: ${ASK_EV} — a question either CLEARED the gate (now labelled owner-decision, i.e. in the owner's queue), was SENT BACK with a template (labelled question-bounced; the lane removes that label to re-submit), or was ANSWERED (labelled owner-answered, and the owning lane has just been told to read the reply), or was UNSCORED — the gate could not score it, so it is posted and READABLE but NOT in the owner's queue (the log's UNSCORED <repo>#<n> line names it and the cause). Grow = the lane could not be routed — check the log line ending 'NO LANE ROUTE' and carry the answer to the lane by hand."
 fi
 
 # -- ORCHESTRATOR LIVENESS GUARD ------------------------------------------------
