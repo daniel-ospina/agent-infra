@@ -2264,6 +2264,12 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // Cycle-5 P1: --config-env=<name>=<envvar> is the env-indirection form.
     const configOverrides = [];
     const configEnvOverrides = [];
+    // #594 review round 3: git reads ONE ordered config list, so the RELATIVE
+    // order of `-c` and `--config-env` decides which definition wins
+    // (`--config-env=alias.x=E -c alias.x='…'` → the later `-c` wins, measured
+    // rc 0). The two arrays above are kept for their existing consumers; this
+    // one preserves the argv order the alias resolver needs.
+    const configOps = [];
     // Round-3 P1: a bare per-command prefix WINS over an exported value (bash:
     // `export GIT_DIR=/a; GIT_DIR=/b git …` runs with /b — probe-verified).
     let gitDirHint = pendingHints.gitDirHint ?? frame().persistHints.gitDirHint ?? null;
@@ -2309,9 +2315,9 @@ function _walkShell(command, h = {}, seedVars = {}) {
       if (g === "--namespace") { i += 2; continue; }
       if (g.startsWith("--namespace=")) { i++; continue; }
       if (g === "--no-pager" || g === "-p" || g === "--paginate") { i++; continue; }
-      if (g === "-c" || g === "--config") { configOverrides.push(tokens[i + 1] ?? "\u0000"); i += 2; continue; }
-      if (g === "--config-env") { configEnvOverrides.push(tokens[i + 1] ?? "\u0000"); i += 2; continue; } // cycle-6 P1: space form
-      if (g.startsWith("--config-env=")) { configEnvOverrides.push(g.slice("--config-env=".length)); i++; continue; }
+      if (g === "-c" || g === "--config") { configOverrides.push(tokens[i + 1] ?? "\u0000"); configOps.push({ kind: "c", v: tokens[i + 1] ?? "\u0000" }); i += 2; continue; }
+      if (g === "--config-env") { configEnvOverrides.push(tokens[i + 1] ?? "\u0000"); configOps.push({ kind: "env", v: tokens[i + 1] ?? "\u0000" }); i += 2; continue; } // cycle-6 P1: space form
+      if (g.startsWith("--config-env=")) { configEnvOverrides.push(g.slice("--config-env=".length)); configOps.push({ kind: "env", v: g.slice("--config-env=".length) }); i++; continue; }
       if (g.startsWith("-")) { i++; continue; }
       break;
     }
@@ -2356,7 +2362,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
     }
     h.onGitEnd?.({
       verb, args, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint,
-      configOverrides, configEnvOverrides, envPrefixes,
+      configOverrides, configEnvOverrides, configOps, envPrefixes,
       cdChain: f.pipeActive ? f.chain.slice(0, f.baseLen) : [...f.chain],
       vars: { ...f.vars },
       cmdVisible,
@@ -4028,19 +4034,20 @@ function _aliasDefsFromInvocation(inv) {
     const v = value === null || value === undefined ? null : String(value);
     defs.push([m[1], v !== null && v.startsWith("!") ? null : v]);
   };
-  for (const o of inv.configOverrides || []) {
-    const kv = splitKw(o);
-    if (kv) takeAlias(kv[0], kv[1]);
-  }
   const resolveEnv = (name) => {
     // ⛔ PER-COMMAND ENV WINS OVER AN EARLIER SHELL ASSIGNMENT (bash semantics,
     // probe-verified: `E=status; E='branch -fq victimZ <sha>'
-    // git --config-env=alias.x=E x` ran the DESTRUCTIVE alias, rc 0). The
-    // order is therefore envPrefixes → vars → process.env; reading vars first
-    // resolved the stale value and failed OPEN (review round 2).
-    for (const p of inv.envPrefixes || []) {
-      const e = String(p).indexOf("=");
-      if (e > 0 && String(p).slice(0, e) === name) return String(p).slice(e + 1);
+    // git --config-env=alias.x=E x` ran the DESTRUCTIVE alias, rc 0), and the
+    // LAST matching prefix wins when the command sets the name twice
+    // (`E=status E='branch -fq victimDUP main' git …` — measured rc 0). The
+    // order is therefore prefixes (last match) → vars → process.env; reading
+    // vars first, or the FIRST prefix, resolved the stale value and failed OPEN
+    // (review rounds 2 and 3).
+    const prefixes = inv.envPrefixes || [];
+    for (let i = prefixes.length - 1; i >= 0; i--) {
+      const p = String(prefixes[i] ?? "");
+      const e = p.indexOf("=");
+      if (e > 0 && p.slice(0, e) === name) return p.slice(e + 1);
     }
     if (name && inv.vars && Object.prototype.hasOwnProperty.call(inv.vars, name)) {
       const v = inv.vars[name];
@@ -4049,9 +4056,29 @@ function _aliasDefsFromInvocation(inv) {
     if (name && Object.prototype.hasOwnProperty.call(process.env, name)) return String(process.env[name]);
     return null;
   };
-  for (const ce of inv.configEnvOverrides || []) {
-    const kv = splitKw(ce);
-    if (kv) takeAlias(kv[0], resolveEnv(kv[1]));
+  // ⛔ ONE ORDERED CONFIG LIST, exactly as git reads it (review round 3): the
+  // RELATIVE argv order of `-c` and `--config-env` decides the winner, so a
+  // pass over `configOverrides` followed by a pass over `configEnvOverrides`
+  // was measured FAIL-OPEN — with `E=status`, `git --config-env=alias.x=E -c
+  // alias.x='branch -fq victimMIX main' mix` runs the DESTRUCTIVE `-c`
+  // definition (rc 0) while an array-by-array pass expanded the benign env one.
+  // `configOps` is the walker's argv-ordered record; the two arrays stay as the
+  // fallback for callers that build an invocation by hand.
+  if (Array.isArray(inv.configOps) && inv.configOps.length > 0) {
+    for (const op of inv.configOps) {
+      const kv = splitKw(op?.v);
+      if (!kv) continue;
+      takeAlias(kv[0], op.kind === "env" ? resolveEnv(kv[1]) : kv[1]);
+    }
+  } else {
+    for (const o of inv.configOverrides || []) {
+      const kv = splitKw(o);
+      if (kv) takeAlias(kv[0], kv[1]);
+    }
+    for (const ce of inv.configEnvOverrides || []) {
+      const kv = splitKw(ce);
+      if (kv) takeAlias(kv[0], resolveEnv(kv[1]));
+    }
   }
   const cfgPairs = new Map();
   const collectPair = (k, v) => {
@@ -7446,7 +7473,9 @@ function _effectiveConfig(inv) {
     const eq = ce.indexOf("=");
     if (eq <= 0) continue;
     const name = ce.slice(0, eq), envName = ce.slice(eq + 1);
-    const val = (inv.envPrefixes || []).map((p) => { const e = p.indexOf("="); return e > 0 && p.slice(0, e) === envName ? p.slice(e + 1) : null; }).find((v) => v !== null) ??
+    // LAST matching prefix wins (bash applies the later assignment); `find`
+    // returned the FIRST and resolved a stale value (review round 3).
+    const val = (inv.envPrefixes || []).map((p) => { const e = p.indexOf("="); return e > 0 && p.slice(0, e) === envName ? p.slice(e + 1) : null; }).filter((v) => v !== null).pop() ??
       (inv.vars && inv.vars[envName]) ??
       process.env[envName];
     if (val !== undefined && val !== null) cfgArgs.push("-c", `${name}=${val}`);

@@ -1125,6 +1125,20 @@ dexpect("#594-R2d per-command env prefix wins over the statement var for --confi
   `EE=status; EE='branch -fq victimZ main' git --config-env=alias.q=EE q`,
   { branchState: true, stateVerb: "branch" });
 
+// ── #594 review round 3: ORDERING inside git's ONE config list ──
+// The LAST matching env prefix wins (bash applies the later assignment), and
+// `-c` / `--config-env` are ONE argv-ordered list — array-by-array passes read
+// the wrong definition in both directions (measured rc 0, ref moved).
+dexpect("#594-R3a the LAST per-command env prefix wins (`E=status E='branch -fq …'`)",
+  `EE=status EE='branch -fq victimDUP main' git --config-env=alias.x=EE x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimDUP", "main"] });
+dexpect("#594-R3b a later `-c` beats an earlier `--config-env` (argv order)",
+  `EE=status git --config-env=alias.x=EE -c alias.x='branch -fq victimMIX main' x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimMIX", "main"] });
+dexpect("#594-R3c control — a later `--config-env` beats an earlier `-c` (benign value wins, as git runs it)",
+  `EE=status git -c alias.x='branch -fq victimMIX2 main' --config-env=alias.x=EE x`,
+  { verb: "status", branchState: false });
+
 // commit matcher (commit-graph/commit-tree EXCLUDED)
 dexpect("commit → block:commit", `git commit -m x`, { verdict: "block:commit", verb: "commit" });
 dexpect("add+commit → block:commit (detailed)", `git add . && git commit -m 'x'`, { verdict: "block:commit" });
