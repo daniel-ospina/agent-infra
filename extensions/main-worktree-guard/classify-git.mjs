@@ -3896,11 +3896,19 @@ export function _branchInvMutatesBranchState(args) {
  * Detailed classification of a shell command (consumed EXCLUSIVELY by
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
- *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete,
+ *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete, hasPush,
  *     renameFrom, renameTo, syncSource, stateVerb, stateArgs, stateOpCount }
  * - verdict: legacy `block:*` strings for destructive patterns (verb-anchored),
  *   plus NEW `block:commit` / `block:push` / `block:force-push`; `allow` /
  *   `allow-non-git` otherwise.
+ * - hasPush: true iff the command contains a PUSH INVOCATION (any verdict).
+ *   #506 — index.ts's delete-target arm must run the #73 sibling check on a
+ *   compound the verdict did not name a push for, but a `block:commit` verdict
+ *   PROVES there is no push invocation at all, so the only "evidence" there is
+ *   the string extractor matching a commit MESSAGE
+ *   (`git commit -m "… git push origin -d main"`). Even the documented
+ *   echo/comment over-match class needs a real push somewhere; this flag is
+ *   what lets the consumer tell the two apart without re-deriving the walk.
  * - branchState: true for checkout/switch/symbolic-ref/update-ref/branch ops
  *   that mutate the checkout's branch (M3 gate runs on these regardless of
  *   verdict — symbolic-ref/update-ref/branch -f have NO legacy pattern).
@@ -3928,6 +3936,7 @@ export function classifyGitCommandDetailed(command) {
     verdict: "allow", repoHint, gitDirHint, verb: invocations[0]?.verb ?? null,
     verbArgs: invocations[0]?.args ?? [], branchState: false, newBranch: null,
     deleteTargets: [], pushDst: null, pushTargets: [], isPushDelete: false,
+    hasPush: false,
     renameFrom: null, renameTo: null, syncSource: null,
   };
   // #1144 follow-up (P0-1): a hidden shell substitution (`eval "git rebase …"`,
@@ -4035,6 +4044,7 @@ export function classifyGitCommandDetailed(command) {
     const legacyVerdict = out.verdict;
     const args = pushInv.args;
     const joined = `git push ${args.join(" ")}`;
+    out.hasPush = true; // #506: "a real push invocation exists" — see the doc block
     // #443 clean-hub parity (mirrors the #439 disordered-hub closure): delete
     // detection was exact-only (`--delete` / `:branch`), so the documented
     // `-d` short form, merged no-arg short clusters containing `d` (`-dq`), and

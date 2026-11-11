@@ -6279,7 +6279,18 @@ export default function (pi: ExtensionAPI) {
       // THROUGH: the legacy verdict keeps its own arm below (LEGACY_BLOCK in
       // the main checkout, worktree exemption unchanged). This arm can only
       // ADD a block — it never returns an allow.
-      if (det.verdict !== "block:push-delete" &&
+      // ⛔ GATED ON A REAL PUSH INVOCATION (`det.hasPush`), because the fallback
+      // extractor is STRING-matched and would otherwise manufacture evidence:
+      // `block:commit` is only produced when the classifier proved there is NO
+      // push invocation, so `git commit -m "revert: stop running git push origin
+      // -d main"` would be refused with a #73 "main is checked out" message for
+      // a delete that exists only in the commit MESSAGE — and it would split the
+      // spellings, since the `--delete` twin is excluded above and silently
+      // allowed. A real push invocation is the precondition for every shape this
+      // arm exists to cover, and the echo/comment over-match it still shares with
+      // the degraded arm stays confined to commands that really do push.
+      if (det.hasPush === true &&
+          det.verdict !== "block:push-delete" &&
           det.verdict !== "block:push" && det.verdict !== "block:force-push") {
         const legacyDeletes = det.pushTargets.length > 0
           ? det.pushTargets
