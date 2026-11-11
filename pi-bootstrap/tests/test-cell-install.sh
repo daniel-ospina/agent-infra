@@ -901,12 +901,19 @@ rc=$?
   && ok "--verify refuses a HAND-EDITED fork-floor instrument (it would measure an unreviewed ceiling)" \
   || fail "--verify certified a hand-edited fork-floor instrument (rc=$rc)"
 run_install >/dev/null 2>&1
-# …and the BEHAVIOURAL arm the file comparison cannot reach: the copy is byte-identical, but the knob
-# that sets the floor is malformed, so the installed gate cannot decide and must not silently pass.
-# This is the placement/wiring fault `capacity.sh`-beside-the-shim exists to end, caught at verify time.
-CAP_MIN_FORK_HEADROOM=not-a-number run_verify
+# …and the BEHAVIOURAL arm the file comparison cannot reach: the copy is byte-identical, but the floor
+# knob is malformed in the one way `capacity.sh`'s own seam does NOT catch — `cap_int_seam` accepts up
+# to 12 digits, while the gate's `is_limit` bounds a VALUE to 9 (the `[ -lt ]` wrap class). So the
+# installed gate loads a complete instrument and still cannot decide, which must not pass `--verify`:
+# it is exactly the "instrument present, floor silently not running" fault #2843 is about, caught at
+# verify time instead of at the next launch. ⛔ 12 DIGITS, NOT A NON-NUMBER: `cap_int_seam` REPLACES a
+# non-integer with the shipped default (200) and prints a warning, so a non-number never reaches the
+# gate at all — measured, `CAP_MIN_FORK_HEADROOM=not-a-number` left this arm green while proving
+# nothing. The grep also names the knob, so the arm cannot be satisfied by the "no instrument" shape
+# (which answers the same state from a different cause).
+CAP_MIN_FORK_HEADROOM=999999999999 run_verify
 rc=$?
-[ "$rc" -eq 1 ] && grep -q 'ABSTAINS on its fork reading' "$LOG" \
+[ "$rc" -eq 1 ] && grep -q 'ABSTAINS on its fork reading' "$LOG" && grep -q "CAP_MIN_FORK_HEADROOM='999999999999'" "$LOG" \
   && ok "--verify refuses a gate that cannot decide its fork floor, even with its instrument in place (self-test caught it)" \
   || fail "--verify certified an installed gate whose fork floor cannot be decided (rc=$rc)"
 run_install >/dev/null 2>&1
