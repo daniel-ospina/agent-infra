@@ -5798,6 +5798,114 @@ function _ansiTranslate(s) {
 }
 
 /**
+ * #607 (review finding 1, category A — FAIL-OPEN): bash recognizes COMMENTS before
+ * it divides the input into words (GNU Bash Reference Manual, Shell Syntax: "Bash
+ * first recognizes comments, then divides the input into words and operators"). A
+ * `#` at WORD START begins a comment running to end of line, and nothing inside one
+ * is expanded — not quotes, not `$(…)`. ShellCheck SC1011 exists for the exact
+ * consequence below; `mvdan/sh` and bash's own `parse.y` keep a separate comment
+ * token class consumed BEFORE quote state is updated.
+ *
+ * The round-4 masking modelled `'…'` and `"…"` but not comments, so ONE apostrophe
+ * in a `#` comment opened a phantom single-quoted region that ran to end of input
+ * and swallowed every span after it. MEASURED at `2e0b3ab7d`: `# don't` + newline +
+ * `echo "$(git branch -Mq main victim)"` → `hiddenStateMutation === false` →
+ * ADMITTED (victim clobbered rc 0), while the same command with `# safe` was
+ * refused. That is a category-A bypass of the very class #607 closes, introduced
+ * by the round-4 commit — so the ordering here is BASH'S ordering, deliberately.
+ *
+ * A projection, never a rewrite: comment text is blanked to SPACES so offsets and
+ * line structure stay stable for every consumer. Quote state carries ACROSS lines
+ * because this runs on a whole COMMAND, not on one script line: an apostrophe in a
+ * `"…"` region is literal, and a `#` inside `"…"` is NOT a comment.
+ * @param {string} text
+ * @returns {string}
+ */
+function _stripShellCommentsForScan(text) {
+  const src = String(text ?? "");
+  const out = [];
+  const n = src.length;
+  let inD = false;
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (inD) {
+      if (c === "\\") { out.push(src.slice(i, i + 2)); i += 2; continue; }
+      if (c === '"') inD = false;
+      out.push(c);
+      i += 1;
+      continue;
+    }
+    if (c === "'") {
+      // Single-quoted region: LITERAL to bash (a backslash is not an escape
+      // here), so copy it verbatim through its closing quote.
+      let j = i + 1;
+      while (j < n && src[j] !== "'") j++;
+      const end = j < n ? j + 1 : n;
+      out.push(src.slice(i, end));
+      i = end;
+      continue;
+    }
+    if (c === '"') { inD = true; out.push(c); i += 1; continue; }
+    if (c === "#" && (i === 0 || /[\s;|&()]/.test(src[i - 1]))) {
+      let j = i;
+      while (j < n && src[j] !== "\n") j++;
+      out.push(" ".repeat(j - i));
+      i = j;
+      continue;
+    }
+    if (c === "\\") { out.push(src.slice(i, i + 2)); i += 2; continue; }
+    out.push(c);
+    i += 1;
+  }
+  return out.join("");
+}
+
+/**
+ * The `[start, end]` ranges of SINGLE-quoted regions. bash performs NO expansion
+ * inside `'…'` (ShellCheck SC2016 is published for exactly this), so text there is
+ * inert whatever it spells. The collector already skips those regions; the
+ * `eval`/git-alias passes use this to skip a match that merely DESCRIBES a payload.
+ * MEASURED pre-fix (review finding 2b): `git commit -m 'note: git -c
+ * alias.x="branch -fq a b" is the trick'` → `hiddenStateMutation === true` → a
+ * lane's ordinary `git commit` in a worktree REFUSED for describing an alias, with
+ * the remedy "run it directly" — which the command already satisfied.
+ * @param {string} text
+ * @returns {Array<[number, number]>}
+ */
+function _singleQuotedRanges(text) {
+  const src = String(text ?? "");
+  const ranges = [];
+  let inD = false;
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (inD) {
+      if (c === "\\") { i += 2; continue; }
+      if (c === '"') inD = false;
+      i += 1;
+      continue;
+    }
+    if (c === "'") {
+      let j = i + 1;
+      while (j < src.length && src[j] !== "'") j++;
+      ranges.push([i, Math.min(j, src.length - 1)]);
+      i = j < src.length ? j + 1 : src.length;
+      continue;
+    }
+    if (c === '"') { inD = true; i += 1; continue; }
+    i += 1;
+  }
+  return ranges;
+}
+
+/** Is `idx` strictly INSIDE one of the single-quoted ranges? */
+function _insideSingleQuotes(ranges, idx) {
+  for (const [a, b] of ranges) if (idx > a && idx < b) return true;
+  return false;
+}
+
+/**
  * #607: the quote-aware payload-span collector, HOISTED out of
  * `_hasHiddenStateSubst` so the REFUSAL that consumes the flag (index.ts) can
  * enumerate the very spans the decision was computed from. ONE collector, never
@@ -5811,6 +5919,10 @@ function _ansiTranslate(s) {
  */
 function _collectSubstSpansDetailed(src) {
   const spans = [];
+  // #607 (review finding 1): bash's own ordering — comments are recognized
+  // BEFORE quotes are tracked, so an apostrophe in a `#` comment can never open a
+  // phantom quoted region that swallows the live payload after it.
+  src = _stripShellCommentsForScan(src);
   let i = 0;
   const n = src.length;
   // #607 (review round 4, P2): SINGLE-QUOTED regions are INERT — bash performs no
@@ -5884,6 +5996,9 @@ function _collectSubstSpans(src) {
   return _collectSubstSpansDetailed(src).map((sp) => sp.text);
 }
 
+/** The git verbs whose EFFECT depends on their arguments (#607 finding 2a). */
+const BRANCH_STATE_VERBS = new Set(["branch", "checkout", "switch", "symbolic-ref", "update-ref"]);
+
 /**
  * #607: is this invocation a BRANCH-STATE MUTATION? Argument-aware, because the
  * verb alone is not the effect (measured on git 2.50.1):
@@ -5918,8 +6033,46 @@ function _argAwareBranchStateMutation(inv) {
   return inv.verb === "branch" && _branchInvMutatesBranchState(inv.args);
 }
 
+/**
+ * #607 (review finding 2a — over-block): an alias VALUE is a command list that git
+ * COMPLETES with the call-site args, so the two halves must be judged TOGETHER:
+ *   `git -c alias.b='branch --list' b`                 -> `git branch --list` (READ)
+ *   `git -c alias.s='symbolic-ref --short' s HEAD`     -> (READ)
+ *   `git -c alias.x='branch --no-color' x -Mq v main`  -> (WRITE — only visible
+ *                                                        once the call-site args
+ *                                                        are appended)
+ * Judging the first WORD alone (pre-fix) refused the two reads while
+ * `_argAwareBranchStateMutation` exists one function above precisely because a verb
+ * is not the effect; judging the value withOUT the call-site args would fail OPEN on
+ * the third shape. Only the BARE-COMMAND-LIST form is owned here — a value carrying
+ * the `git` word is judged by `scan()`.
+ * @param {string} val         the alias value, leading `!` already stripped
+ * @param {string} aliasName   the alias name whose invocation supplies the args
+ * @param {string} source      the command text the call site lives in
+ * @returns {boolean}
+ */
+function _aliasValueMutates(val, aliasName, source) {
+  const toks = _tokenize(String(val ?? ""))
+    .map((t) => _stripQuotes(t))
+    .filter((t) => t.length > 0);
+  while (toks.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[0])) toks.shift(); // VAR=value prefix
+  if (toks.length === 0) return false;
+  const verb = toks[0];
+  if (!BRANCH_STATE_VERBS.has(verb)) return false; // incl. "git" — scan() owns those
+  let callArgs = [];
+  if (aliasName && source) {
+    const inv = allGitInvocations(String(source)).find((iv) => iv.verb === aliasName);
+    if (inv && Array.isArray(inv.args)) callArgs = inv.args;
+  }
+  return _argAwareBranchStateMutation({ verb, args: [...toks.slice(1), ...callArgs] });
+}
+
 export function _hasHiddenStateSubst(raw) {
-  const source = String(raw ?? "");
+  // #607 (review finding 1): bash recognizes comments BEFORE it tracks quotes, and a
+  // comment expands nothing — so the span collector and every pass below see the
+  // comment-blanked projection. This is a strict narrowing of an INERT region; it
+  // cannot fail open (a comment never executes).
+  const source = _stripShellCommentsForScan(String(raw ?? ""));
   // #607 review finding 1: argument-aware, not verb-only — see
   // _argAwareBranchStateMutation (a one-argument `symbolic-ref` is a READ).
   const mutates = _argAwareBranchStateMutation;
@@ -6071,7 +6224,11 @@ export function _hasHiddenStateMutation(raw) {
   // is already false for `bash <<'EOF' … git branch -Mq …`, so this is not a
   // regression, and the family is named here so the next reader does not read it as
   // covered.
-  const source = _stripQuotedHeredocBodies(String(raw ?? ""));
+  const source = _stripShellCommentsForScan(_stripQuotedHeredocBodies(String(raw ?? "")));
+  // #607 (review finding 2b): matches that sit inside a SINGLE-QUOTED region merely
+  // DESCRIBE a payload — bash expands nothing there — so the `eval`/alias passes skip
+  // them. `eval '<payload>'` itself still fires: its match starts OUTSIDE the quotes.
+  const inertSingleQuoted = _singleQuotedRanges(source);
   const firstWord = (text) => {
     for (const tok of _tokenize(String(text ?? ""))) {
       const t = _stripQuotes(tok);
@@ -6104,10 +6261,20 @@ export function _hasHiddenStateMutation(raw) {
       // pre-existing rule, narrowed to the case it exists for.
       if (/\bgit\b/.test(inner)) return true;
       // An alias VALUE may omit the `git` word entirely (`alias.x='branch x -fq
-      // victim main'`): git appends the call-site args, so a LEADING branch-state
-      // verb is a mutation.
-      if (["branch", "checkout", "switch", "symbolic-ref", "update-ref"].includes(firstWord(inner))) return true;
-      return false;
+      // victim main'`): git appends the call-site args, so the value is judged as a
+      // command list. Judging the VERB ALONE (pre-fix) refused documented READS
+      // (`-c alias.b='branch --list' b`, `-c alias.s='symbolic-ref --short' s HEAD` —
+      // review finding 2a) while `_argAwareBranchStateMutation` exists one function
+      // above precisely because a verb is not the effect. A BARE verb with no args of
+      // its own stays conservative (#805): its call-site args are appended by
+      // `_aliasValueMutates` at the alias passes, never guessed here.
+      const fw = firstWord(inner);
+      if (!BRANCH_STATE_VERBS.has(fw)) return false;
+      const toks = _tokenize(inner).map((t) => _stripQuotes(t)).filter((t) => t.length > 0);
+      while (toks.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[0])) toks.shift();
+      const own = toks.slice(1);
+      if (own.length === 0) return true;
+      return _argAwareBranchStateMutation({ verb: fw, args: own });
     }
     for (const inv of allGitInvocations(inner)) {
       if (inv.verb === "__unverifiable__") continue; // unknown content, no known move
@@ -6134,6 +6301,7 @@ export function _hasHiddenStateMutation(raw) {
   const evalRe = /eval\s+(?:\$'([^']*)'|"([^"]*)"|'([^']*)')/g;
   let m;
   while ((m = evalRe.exec(source)) !== null) {
+    if (_insideSingleQuotes(inertSingleQuoted, m.index)) continue; // 2b: prose, inert
     const ansi = m[1];
     const payload = ansi !== undefined ? _ansiTranslate(ansi) : (m[2] ?? m[3] ?? "");
     if (payload.length > 0 && scan(payload, true)) return true;
@@ -6143,14 +6311,16 @@ export function _hasHiddenStateMutation(raw) {
   const cfgAlias = /(?:\-c|\-\-config)(?:\s+["']?alias\.|=alias\.)([A-Za-z0-9_.\/-]+)=(?:"([^"]*)"|'([^']*)'|(\S+))/g;
   let cm;
   while ((cm = cfgAlias.exec(source)) !== null) {
+    if (_insideSingleQuotes(inertSingleQuoted, cm.index)) continue; // 2b: prose, inert
     const val = (cm[2] ?? cm[3] ?? cm[4] ?? "").replace(/^!/, "");
-    if (val.length > 0 && scan(val, true)) return true;
+    if (val.length > 0 && (scan(val, true) || _aliasValueMutates(val, cm[1], source))) return true;
   }
   const cfgAliasQ = /(?:\-c|\-\-config)\s+(["'])(alias\.[A-Za-z0-9_.\/-]+)=([^"']*)\1/g;
   let cq;
   while ((cq = cfgAliasQ.exec(source)) !== null) {
+    if (_insideSingleQuotes(inertSingleQuoted, cq.index)) continue; // 2b: prose, inert
     const val = (cq[3] ?? "").replace(/^!/, "");
-    if (val.length > 0 && scan(val, true)) return true;
+    if (val.length > 0 && (scan(val, true) || _aliasValueMutates(val, cq[2], source))) return true;
   }
   // opaque env-backed aliases: the VALUE is unreadable and an alias can name a
   // branch-state verb, so this stays a refusal (#805).

@@ -1322,6 +1322,70 @@ async function partB() {
     expectTrue("#607 read-only: a `!`-prefixed shell alias whose value READS is NOT a hidden branch-state mutation [mutant: M6] — MEASURED: M6 fires on it",
       classify607("git -c alias.lg='!git log --graph' lg").hiddenStateMutation === false,
       JSON.stringify(classify607("git -c alias.lg='!git log --graph' lg").hiddenStateMutation));
+
+    // ── #607 round-5 FINDING 1 (P1, category A — FAIL-OPEN): an apostrophe in a `#`
+    // COMMENT. bash recognizes comments BEFORE it tracks quotes, so `# don't` is a
+    // comment whose apostrophe is LITERAL; the round-4 collector treated it as an
+    // opening quote that ran to end of input and swallowed every span after it.
+    // MEASURED at `2e0b3ab7d`: the two block rows below were `hiddenStateMutation ===
+    // false` → ADMITTED from a worktree, `victim` clobbered / branch switched rc 0 —
+    // a category-A bypass of the exact class #607 closes, on the class's own subject
+    // matter (an apostrophe any lane writes in `# don't …`).
+    // The trailing-comment row is the mirror image: text AFTER `#` is inert, so
+    // refusing it was a false block whose printed remedy the command already obeyed.
+    await expect607Block(
+      "#607 comment: an apostrophe in a `#` comment does not swallow the payload after it (`$(git checkout -q …)` still REFUSED) [mutant: M10 — the comment projection removed] — MEASURED at 2e0b3ab7d: ADMITTED",
+      `# it's fine\necho "$(git checkout -q feat/other)"`);
+    await expect607Block(
+      "#607 comment: same, for a CLOBBER payload after `# don't` [mutant: M10] — MEASURED at 2e0b3ab7d: ADMITTED, `victim` clobbered rc 0",
+      `# don't\necho "$(git branch -Mq main victim)"`);
+    await expect607Allow(
+      "#607 comment: a payload spelled INSIDE a trailing `#` comment is INERT — ALLOWED [mutant: M10 — comment text was scanned] — MEASURED at 2e0b3ab7d: REFUSED",
+      "echo ok # $(git branch -Mq main victim)");
+    // Predicate-level controls, so neither handler row above can be satisfied by an
+    // unrelated arm (the refusal, the M3 gate and the legacy arms all live behind the
+    // same return, and only the predicate says WHICH one fired).
+    expectTrue("#607 comment: predicate — the post-comment payload still sets `hiddenStateMutation` [mutant: M10] — MEASURED at 2e0b3ab7d: false",
+      classify607(`# don't\necho "$(git branch -Mq main victim)"`).hiddenStateMutation === true,
+      JSON.stringify(classify607(`# don't\necho "$(git branch -Mq main victim)"`).hiddenStateMutation));
+    expectTrue("#607 comment: predicate — comment text sets nothing, apostrophe or not [mutant: M10] — MEASURED at 2e0b3ab7d: true",
+      classify607("echo ok # $(git branch -Mq main victim)").hiddenStateMutation === false,
+      JSON.stringify(classify607("echo ok # $(git branch -Mq main victim)").hiddenStateMutation));
+    expectTrue("#607 comment: predicate — the SAME apostrophe does not excuse an executable `<(...)` payload on the next line [mutant: M10] — MEASURED at 2e0b3ab7d: false",
+      classify607(`# don't\nbash <(echo 'git branch -Mq victim main')`).hiddenStateMutation === true,
+      JSON.stringify(classify607(`# don't\nbash <(echo 'git branch -Mq victim main')`).hiddenStateMutation));
+
+    // ── #607 round-5 FINDING 2 (P2 — over-block): the alias arm judged the VERB and
+    // not the args, and the eval/alias passes scanned raw source so SINGLE-QUOTED
+    // prose still fired. Both are false blocks on shapes `main` admitted, in a
+    // worktree session, with the remedy "run it directly" — which they already did.
+    // 2a: a READ value must be judged WITH its call-site args (`_argAwareBranchStateMutation`
+    // exists one function above precisely because a verb is not the effect).
+    expectTrue("#607 alias: a READ value (`alias.b='branch --list' b`) is NOT a hidden mutation [mutant: M11 — first word alone] — MEASURED at 2e0b3ab7d: true (refused)",
+      classify607("git -c alias.b='branch --list' b").hiddenStateMutation === false,
+      JSON.stringify(classify607("git -c alias.b='branch --list' b").hiddenStateMutation));
+    expectTrue("#607 alias: same for a `symbolic-ref --short` value + a `HEAD` call-site arg [mutant: M11] — MEASURED at 2e0b3ab7d: true (refused)",
+      classify607("git -c alias.s='symbolic-ref --short' s HEAD").hiddenStateMutation === false,
+      JSON.stringify(classify607("git -c alias.s='symbolic-ref --short' s HEAD").hiddenStateMutation));
+    // …and the DISCRIMINATOR that keeps 2a's fix from failing open: git APPENDS the
+    // call-site args, so a value that reads on its own can still carry the mutation.
+    expectTrue("#607 alias: the call-site args are still APPENDED (`alias.x='branch --no-color' x -Mq victim main` is a mutation) [mutant: M11b — call-site args dropped] — MEASURED: dropping them makes this false",
+      classify607("git -c alias.x='branch --no-color' x -Mq victim main").hiddenStateMutation === true,
+      JSON.stringify(classify607("git -c alias.x='branch --no-color' x -Mq victim main").hiddenStateMutation));
+    // 2b: single-quoted prose DESCRIBING a payload. The `$(…)` twin was closed in
+    // round 4; these two spellings were left open because only the collector was
+    // masked, not the `eval`/alias passes. The existing `#607 bought-exemption: alias
+    // indirection …` row (`alias.br='git branch -fq victim main'`) is the control that
+    // stays REFUSED — its match starts OUTSIDE the quotes.
+    await expect607Allow(
+      "#607 quoting: single-quoted prose DESCRIBING an alias is ALLOWED (the eval/alias passes skip inert regions) [mutant: M12 — raw-source scan] — MEASURED at 2e0b3ab7d: REFUSED",
+      `git commit -m 'note: git -c alias.x="branch -fq a b" is the trick'`);
+    await expect607Allow(
+      "#607 quoting: single-quoted prose DESCRIBING an `eval` is ALLOWED [mutant: M12] — MEASURED at 2e0b3ab7d: REFUSED",
+      `git commit -m 'see eval "git branch -Mq a b" in the repro'`);
+    expectTrue("#607 quoting: predicate — the alias value is judged even when it is single-quoted at the CALL SITE (the match starts outside the `-c`) [mutant: M12] — MEASURED: `alias.br='branch -fq victim main'` stays true",
+      classify607("git -c alias.br='branch -fq victim main' br").hiddenStateMutation === true,
+      JSON.stringify(classify607("git -c alias.br='branch -fq victim main' br").hiddenStateMutation));
     process.chdir(repo);
 
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
