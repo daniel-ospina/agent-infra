@@ -502,12 +502,14 @@ esac
 # ⛔ THE FIXTURE'S OWN PRECONDITION, ASSERTED (#3900). The install verdict requires the unit's MainPID to be a
 # LIVE process, so the shim must model one. Without this row a regression to a literal pid reddens the shard
 # with twenty "clean run FAILED (rc=1)" arms whose cause — a dead MainPID — is named in NO assertion, which is
-# exactly how this shard was red on CI before the fix. Non-vacuity: revert the shim to `echo "MainPID=1234"` and
-# this row goes red on its own.
-_upid="$(cat "${SYSTEMCTL_MAINPID_STATE:-}" 2>/dev/null || true)"
+# exactly how this shard was red on CI before the fix. It asks the SHIM for the answer (not the pid file the
+# shim wrote), so it grades what the installer will actually read: revert either half — `echo "MainPID=1234"` in
+# the read arm, or a `start` arm that records no live process — and this row goes red on its own.
+_ans="$("$SYSTEMCTL" show -p MainPID eldato-orchestrator.service 2>/dev/null || true)"
+_upid="${_ans#MainPID=}"
 case "${_upid:-}" in
   ''|*[!0-9]*)
-    bad "the systemctl shim recorded no MainPID (expected a pid in $SYSTEMCTL_MAINPID_STATE) — the install verdict requires a LIVE MainPID, so every install arm is now decided by the host's process table (#3900)" ;;
+    bad "the systemctl shim answers no numeric MainPID (got '${_ans:-<nothing>}') — the install verdict requires a LIVE MainPID, so every install arm is now decided by the host's process table (#3900)" ;;
   *)
     if kill -0 "$_upid" 2>/dev/null && [ "$(ps -o comm= -p "$_upid" 2>/dev/null)" = sleep ]; then
       ok "the systemctl shim's MainPID ($_upid) is a LIVE process — the install verdict's live-pid leg is graded by a live pid, not by the host"
