@@ -627,14 +627,24 @@ SETTLE_WARN_NAMES=" "
 # per tree per tick AND a summary that counts every outcome the tick actually reached.
 WT_TALLY_REMOVED=0
 WT_TALLY_HELD=0
+WT_TALLY_UNVERIF=0
 WT_TALLY_STUCK=0
-# ⛔ COUNTED BY RETURN CODE: `0` removed · `2` the removal itself FAILED · anything else is a
-# refusal (`_release_wt`'s HELD). Both passes add to the same tally — see the note above.
-_wt_cause_tally() { # <release-wt rc> — adds to the tick's tally
+# ⛔ A CANNOT-VERIFY REFUSAL GETS ITS OWN BUCKET, AND IT IS NOT `HELD:` (agent-infra#2800 review round 8,
+# P2). `HELD:` says "a live holder or uncommitted work was measured", so it may only be printed for
+# `holder`/`dirty`. An unreadable `git status`, or a holder probe that could not be evaluated, measured
+# NOTHING — the operator reading `HELD:` goes hunting for a holder this tick proved is not there, when
+# the remedy is a re-seed, a re-attach, or a mount. The bucket is a VALUE on `WT_HOLD_CAUSE` rather than
+# a second grep of the prose, so the summary cannot drift from the reason the gate recorded.
+# ⛔ COUNTED BY CAUSE, NOT BY RETURN CODE: `0` removed · `2` the removal itself FAILED · otherwise the
+# refusal's own cause decides. Both passes add to the same tally — see the note above.
+_wt_cause_tally() { # <release-wt rc> — adds to the tick's tally from WT_HOLD_CAUSE
   case "${1:-}" in
     0) WT_TALLY_REMOVED=$((WT_TALLY_REMOVED + 1)) ;;
     2) WT_TALLY_STUCK=$((WT_TALLY_STUCK + 1)) ;;
-    *) WT_TALLY_HELD=$((WT_TALLY_HELD + 1)) ;;
+    *) case "${WT_HOLD_CAUSE:-}" in
+         unreadable|probe) WT_TALLY_UNVERIF=$((WT_TALLY_UNVERIF + 1)) ;;
+         *)                WT_TALLY_HELD=$((WT_TALLY_HELD + 1)) ;;
+       esac ;;
   esac
 }
 # ⛔ EVERY PATH AFTER THE SETTLE GOES THROUGH `finish`. `_settle_lanes` can report a lane that died
@@ -982,20 +992,32 @@ _wt_clean() { # <canonical-checkout> — 0 = nothing exists only on disk · 1 = 
   out="$(git --no-optional-locks -C "$canon" status --porcelain 2>/dev/null)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     WT_HOLD_WHY="its state could not be read (git status rc=$rc) — an unreadable checkout is CANNOT-VERIFY, never clean"
+    WT_HOLD_CAUSE="unreadable"
     return 1
   fi
   [ -z "$out" ] && return 0
   WT_HOLD_WHY="it holds UNCOMMITTED WORK ($(printf '%s\n' "$out" | awk 'NR==1{f=$0} END{printf "%d path(s), first: %s", NR, f}')) — removing it would destroy the only copy"
+  WT_HOLD_CAUSE="dirty"
   return 1
 }
 # _wt_removable <checkout> [already-held] — 0 when removing it cannot destroy work · 1 when it must be HELD.
 # WT_HOLD_WHY names the reading that refused, because a hold with no stated reason is a checkout an
 # operator cannot act on.
 WT_HOLD_WHY=""
+# ⛔ WHICH READING REFUSED, AS A VALUE RATHER THAN ONLY AS PROSE (#2800 review round 8, P2).
+#   holder     — a live process was FOUND in the checkout
+#   dirty      — `git status` ran and reported work that exists only on disk
+#   unreadable — `git status` could not run: CANNOT-VERIFY
+#   probe      — the live-holder probe could not be evaluated: CANNOT-VERIFY
+# The distinction is not cosmetic: the tick's aggregate summary may only name a cause that was
+# MEASURED, and these two CANNOT-VERIFY causes are neither "a live holder" nor "uncommitted work".
+# Folding them into that sentence made the summary assert something the tick had measured NOT to exist
+# — the same defect round 7 fixed for the `STUCK:` bucket, one bucket over.
+WT_HOLD_CAUSE=""
 WT_WITNESS=""            # ok = the cwd probe answered · none = it could not (cleanliness alone decided)
 _wt_removable() {
   local wt="$1" canon rc pre_held="${2:-0}"
-  WT_HOLD_WHY=""
+  WT_HOLD_WHY=""; WT_HOLD_CAUSE=""
   canon="$( cd "$wt" 2>/dev/null && pwd -P )" || canon="$wt"
   # ⛔ A QUARANTINED TREE IS A CANDIDATE ON EVERY TICK (`_reap_leftovers` re-evaluates it, and only the
   # removable path clears its `.lane-pid`), so the STEADY STATE the design deliberately creates must not
@@ -1033,6 +1055,7 @@ _wt_removable() {
         *)
           WT_HOLD_WHY="a LIVE process still holds it (pid ${hpid:-?} names this checkout in its ARGV, and its cwd is elsewhere) — only the ARGV witness can see that shape, and the lane's agent tree is not gone whatever its pidfile says (agent-infra#2787)" ;;
       esac
+      WT_HOLD_CAUSE="holder"
       # ⛔ THE RAW PATH, NOT THE CANONICAL ONE: this line is what an operator greps for, and it is the
       # path the record (`<wt>.lane-pid`) and the state dir use. `$canon` is `/private/var/...` on Darwin
       # where `$AI` is `/var/...`, so naming it here made the message unmatchable by the very path the
@@ -1041,6 +1064,7 @@ _wt_removable() {
       return 1 ;;
     2)
       WT_HOLD_WHY="the ARGV/cwd live-holder probe could not be evaluated (${holder:-$HOLDER_PROBE_WHY}), and an unproven removal is the one thing this pass may not do (agent-infra#2787)"
+      WT_HOLD_CAUSE="probe"
       log_line "KEEP: not removing $wt — the live-holder probe could not be evaluated (${holder:-$HOLDER_PROBE_WHY}), and an unproven removal is the one thing this pass may not do (agent-infra#2787); a later tick retries"
       return 1 ;;
   esac
@@ -1050,6 +1074,7 @@ _wt_removable() {
   [ "$rc" -eq 2 ] || WT_WITNESS="ok"
   if [ "$rc" -eq 0 ]; then
     WT_HOLD_WHY="a LIVE process still holds it (pid $WT_HOLDER has this checkout as its cwd) — the recorded pid is gone but the lane's agent tree is not (agent-infra#2800)"
+    WT_HOLD_CAUSE="holder"
     return 1
   fi
   # ⛔ A MISSING WITNESS IS NAMED, NOT FALLEN THROUGH SILENTLY — and it does not, on its own, forbid
@@ -1216,7 +1241,7 @@ _settle_lanes() {
 # still in use; NO SIDECAR means UNKNOWN, and an unknown tree is left for an operator (a health job
 # does not guess).
 _reap_leftovers() {
-  local w lane n=0 h=0 m=0 rc nm
+  local w lane n=0 h=0 u=0 m=0 rc nm
   for w in "$AI"/wt-drainer-*; do
     case "$w" in *.lane-pid|*.lane-held) continue ;; esac   # the sidecars are not worktrees
     [ -d "$w" ] || continue
@@ -1238,13 +1263,18 @@ _reap_leftovers() {
     _wt_cause_tally "$rc"
   done
   git -C "$SEED_REPO" worktree prune >/dev/null 2>&1 || true
-  # THREE OUTCOMES, THREE LINES, EACH CARRIED BY ITS OWN COUNTER: removed / the removal itself FAILED
-  # (`STUCK:`) / a reading refused (`HELD:`). `_rm_wt ... && n=$((n+1))` could not tell the second from
-  # the third, and folding them together made the summary name a cause the tick had measured NOT to
-  # exist (#2800 review round 7).
-  n="$WT_TALLY_REMOVED"; h="$WT_TALLY_HELD"; m="$WT_TALLY_STUCK"
+  # ⛔ FOUR OUTCOMES, FOUR LINES, AND EACH LINE NAMES ONLY ITS OWN CAUSE (agent-infra#2800 review round 8).
+  # Folded together they made the summary state a cause the tick had measured NOT to exist — the defect
+  # round 7 fixed for `STUCK:` and this round fixes for the third refusal. `HELD:` is now reachable only
+  # from a cause that was MEASURED; the two CANNOT-VERIFY causes have their own line and their own
+  # remedy, because an unreadable checkout is a re-seed / re-attach / mount problem, not a salvage.
+  n="$WT_TALLY_REMOVED"; h="$WT_TALLY_HELD"; u="$WT_TALLY_UNVERIF"; m="$WT_TALLY_STUCK"
   [ "$n" -eq 0 ] || log_line "REAPED: $n leftover worktree(s) whose lane was gone"
   [ "$m" -eq 0 ] || log_line "STUCK: $m leftover worktree(s) could NOT be removed — the removal itself FAILED (see the WARN above; a busy mount, EPERM on a parent, a read-only fs). NOT a quarantine: no live holder and no uncommitted work was measured. A later tick retries."
+  # ⛔ CANNOT-VERIFY IS ITS OWN OUTCOME. Nothing was measured to hold these trees: the READING was
+  # refused. An operator following this line re-seeds / re-attaches / checks a mount — they do not go
+  # looking for a holder.
+  [ "$u" -eq 0 ] || log_line "UNVERIFIABLE: $u leftover worktree(s) are quarantined because their state could not be READ — an unreadable `git status` (a re-cloned or moved seed repo, a pruned worktrees entry, an unmounted volume) or a live-holder probe that could not be evaluated. NOTHING here was measured to hold them: no live holder and no uncommitted work was found, and the question itself could not be asked. Fix what prevents the reading (re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) — a later tick re-asks."
   [ "$h" -eq 0 ] || log_line "HELD: $h leftover worktree(s) are quarantined — a live holder or uncommitted work was measured, so no removal; an operator releases them (agent-infra#2800)"
 }
 

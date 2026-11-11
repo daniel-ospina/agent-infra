@@ -1299,6 +1299,41 @@ check "(t7) …and the hold says its state could not be READ, never that the tre
   'grep -q "its state could not be read (git status rc=" "$LAST_AI/logs/ai-drainer.log"' \
   "$(grep 'HELD:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
 
+# ── (t7b) A CANNOT-VERIFY REFUSAL IS NOT "A LIVE HOLDER OR UNCOMMITTED WORK WAS MEASURED" ─────────
+# ⛔ #2800 REVIEW ROUND 8, THE ONE P2 LEFT AT THIS HEAD. `_release_wt` returns 1 for three distinct
+# refusals, and the tick folded all three into ONE aggregate counter whose single line says "a live
+# holder or uncommitted work was measured". Two of those three are CANNOT-VERIFY: nothing was measured
+# to hold the tree at all, only that the READING could not be taken. So on this path the operator-facing
+# summary asserted a cause the tick had measured NOT to exist — verbatim the defect round 7 fixed for
+# `STUCK:`, one bucket over — and the operator it misdirects goes hunting for a holder when the actual
+# remedy is a re-seed / re-attach / mount.
+# The fixture is arm (t7)'s unreadable-gitdir tree, reached by the REAP (no lane RECORD, only the tree's
+# `.lane-pid` sidecar) because that is the pass that prints the aggregate; it gets its OWN state dir so
+# the count cannot be contaminated by another arm.
+# ⛔ THIS ROW MUST FAIL ON THE PRE-FIX CODE, and it does: with the third cause folded back into `h`, the
+# folded sentence appears and `UNVERIFIABLE:` never does — both rows below redden. Demonstrated by
+# reverting `_wt_cause_tally`'s cause branch and the `UNVERIFIABLE:` line in place.
+reset_run
+o_u="$ROOT/o-u"; ai_u="$ROOT/ai-u"; mkdir -p "$o_u/bg" "$ai_u/state/lanes"
+wt_u="$ai_u/wt-drainer-ai-drain-888888-14-1"
+git -C "$SEED" worktree add -f "$wt_u" "$SEED_REF" >/dev/null 2>&1
+printf 'only-copy\n' >"$wt_u/WORK.md"                # real work, on disk, and git can no longer say so
+gdir_u="$(sed -n 's/^gitdir: //p' "$wt_u/.git" 2>/dev/null)"
+rm -rf "$gdir_u"                                       # the gitdir the checkout's .git file points at
+sleep 0 & dead_u=$!; wait "$dead_u" 2>/dev/null          # a pid that is PROVABLY gone
+printf '%s' "$dead_u" >"$wt_u.lane-pid"
+RUN_TARGET=0 run_drainer_fg u
+check "(t7b) the fixture's state cannot be READ — so nothing was measured to hold it" \
+  '[ -d "$wt_u" ] && [ -f "$wt_u/WORK.md" ] && ! git -C "$wt_u" status --porcelain >/dev/null 2>&1' \
+  "tree=$( [ -d "$wt_u" ] && echo present || echo gone ) status-rc=$( git -C "$wt_u" status --porcelain >/dev/null 2>&1; echo $? )"
+check "(t7b) ⛔ a REFUSED READING is not summarised as 'a live holder or uncommitted work was measured'" \
+  '! grep -q "a live holder or uncommitted work was measured" "$LAST_AI/logs/ai-drainer.log"' \
+  "hold-cause lines=$(grep -c 'a live holder or uncommitted work was measured' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null) — $(grep -E 'HELD:|UNVERIFIABLE:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -2 | tr '\n' ' ')"
+check "(t7b) …and it is counted under its OWN outcome, which names no holder and no uncommitted work" \
+  'grep -q "UNVERIFIABLE: 1 leftover worktree(s)" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'UNVERIFIABLE:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+reset_run
+
 # ── (t8) A STALE DEPLOYED WITNESS DOES NOT DISABLE THE CURRENT ONE (#2800 review round 2) ────────
 # ⛔ `$O/live-ownership.sh` is the DEPLOYED copy and `$SELF_DIR`'s is the canonical one; a partial
 # `deploy-harness.sh` re-seed leaves the deployed copy STALE (it predates `lo_cwd_rows`). Picking the

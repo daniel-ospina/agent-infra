@@ -215,12 +215,14 @@ while nothing happened:
   keeps its slice window, so a second lane cannot be dispatched onto the same PRs. A tree with **no**
   sidecar is UNKNOWN and left alone.
 
-  **Three outcomes, and the tick counts them separately**, because folding them together makes the
-  summary name a cause it did not measure: **removed** (`REAPED:`), **held** (a reading refused — the
-  live-holder or `git status` question), and **stuck** — the removal itself failed, which is a
-  permission/mount problem, not a hold (`STUCK: N leftover worktree(s) could NOT be removed …`).
-  `HELD:` is only ever printed for a genuine refusal, so an operator following it looks for a holder that
-  was actually measured rather than fixing the EPERM (#2800 review round 7).
+  **Four outcomes, and the tick counts them separately**, because folding them together makes the summary
+  name a cause it did not measure: **removed** (`REAPED:`); **held** — a holder or a `git status` that
+  was actually *measured*, so `HELD:` and only `HELD:` means "an operator should look for the holder or
+  the uncommitted tree"; **unverifiable** — the READING itself was refused (an unreadable `git status`, an
+  unevaluable holder probe), where `UNVERIFIABLE: …` says explicitly that nothing was measured to hold
+  them and the remedy is a re-seed / re-attach / mount, not a salvage; and **stuck** — the removal itself
+  failed, which is a permission/mount problem, not a hold (`STUCK: N leftover worktree(s) could NOT be
+  removed …`, #2800 review round 7).
 
   The declared residuals: a holder that starts between a probe and the `rm` is not seen (the window is
   one probe plus one `git status` wide — the process table is re-taken per removal, not once per settle
