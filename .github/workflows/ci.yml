@@ -1299,8 +1299,10 @@ jobs:
         # off-baseline MAIN push while the reversed order blocked (the outcome
         # depended on invocation ORDER). M2 now gates EVERY main-resolving
         # mutation, each against its own hints and — for a push — its OWN
-        # refspecs, and the push-delete arm no longer exempts the compound's
-        # other mutations (review F1).
+        # refspecs; the ownership-allowance arm and the push-delete arm both gate
+        # the compound's remaining mutations before admitting it (reviews I1/F1),
+        # and the delete exemption keys on each MUTATION's own `isDelete` rather
+        # than on the compound's verdict path (review I2).
         # Its own step for the reason the POSITION step above states: the
         # `extensions/*/test*.mjs` glob is in ci-main.yml, which has NO
         # `pull_request` trigger, so without this line the only handler-level pin

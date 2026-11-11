@@ -2114,14 +2114,17 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
           ...(d.pushMutations && d.pushMutations.length > 0
             ? d.pushMutations
             : (d.verdict !== "block:commit" ? [{ verb: "push", invVisible: true, hints: d.pushHints, targets: d.pushTargets, dst: d.pushDst, isDelete: false }] : [])),
-        ]
-          // #605 review F1: a delete-spelled push is the #73 arm's business;
-          // index.ts gates the compound's NON-delete mutations before that
-          // arm's early return, so the mirror must too (a `--delete` anywhere
-          // in the raw command otherwise exempted every other mutation).
-          .filter((mu) => !(d.verdict === "block:push-delete" && mu.verb === "push" && mu.isDelete));
+        ];
         let sawMain = false;
         for (const mu of muts) {
+          // #605 reviews F1 + I2: a DELETE-spelled push is the #73
+          // coordinated-delete arm's business, never M2's target comparison —
+          // and the rule keys on the MUTATION's own `isDelete`, not on the
+          // compound's verdict path (verdict-keyed it held only when the delete
+          // was the FIRST push, so a later-segment `-d` was blocked while
+          // `--delete` was allowed). index.ts applies it inside
+          // gateMutations; the mirror must not drift from that.
+          if (mu.verb === "push" && mu.isDelete) continue;
           // #596 round-4 (reviewer P1 follow-up): the repo ALWAYS comes from the
           // classifier's boundary-aware hints (the replay counted a phantom
           // `bash git -C <wt> commit` and worktree-exempted the real main commit).
@@ -2211,6 +2214,11 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       expectBool("#605 F1 control: ON-baseline MAIN push + a --delete segment → allow (no false block)", m2o, "allow");
       const m2p = m2Gate(`git push origin --delete stale`);
       expectBool("#605 F1 control: delete-only command → nothing main-resolving to gate (wt-exempt)", m2p, "wt-exempt");
+      // Review I2: the delete exemption keys on the MUTATION's own `isDelete`,
+      // not on the compound's verdict path — verdict-keyed, the `-d` short form
+      // in a later segment was gated by M2 while `--delete` was not.
+      const m2q = m2Gate(`git push origin feat/1 && git push origin -d stale`);
+      expectBool("#605 I2: later-segment `-d` delete → allow (delete exemption is per-mutation)", m2q, "allow");
       execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
       const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");

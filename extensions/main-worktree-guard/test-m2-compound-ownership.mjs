@@ -30,6 +30,17 @@
 // pins. What this file can and does pin for commits is the NO-FALSE-BLOCK arm:
 // an all-worktree compound must stay allowed.
 //
+// Later review rounds added three more rows here, all handler-level because each
+// is a property of the SHIPPED arm ORDER rather than of M2's decision function:
+//   S3 (F1) — a `--delete` anywhere in the raw command routed it into the #73 arm,
+//             whose early return skipped M2 for every other mutation;
+//   S4 (I1) — the ownership allowance closed the WHOLE command on the FIRST
+//             push's refspecs (`git push origin main ; git push origin
+//             feat/other` was allowed on `main` and the foreign push ran);
+//   S5 (I2) — the delete exemption was keyed on the compound's VERDICT path, so a
+//             later-segment `-d` was blocked by M2 while the byte-identical
+//             `--delete` was allowed.
+//
 // Run: node extensions/main-worktree-guard/test-m2-compound-ownership.mjs
 import { execSync } from "node:child_process";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -76,7 +87,14 @@ async function main() {
   } finally {
     console.warn = realWarn;
   }
-  const degradation = warnings.filter((w) => w.includes("[main-worktree-guard]") && w.includes("degrad"));
+  // ⛔ PREFIX ONLY (review I3). The `&& w.includes("degrad")` this line used to
+  // carry made the assertion DEAD: neither load-failure warning contains the
+  // substring `degrad` (`index.ts:403` "classify-git.mjs failed to load … DISABLED",
+  // `index.ts:488` "branch-ownership.mjs failed to load … DISABLED"), so the
+  // filtered set was empty even when the import genuinely degraded and C1 could
+  // never go RED. Same filter as test-805-push-ownership.mjs:67.
+  const degradation = warnings.filter((w) => w.includes("[main-worktree-guard]"));
+  for (const w of degradation) console.log(`     captured: ${w}`);
   expectTrue("C1: index.ts loads with no degradation warning", degradation.length === 0, degradation.join(" | "));
 
   const handlers = new Map();
@@ -169,6 +187,28 @@ async function main() {
     const s3own = await quiet(() => callBash(`git push origin main ; git push origin --delete stale`));
     expectTrue("S3 F1 control: ON-baseline MAIN push + a --delete segment → ALLOWED (no false block)",
       s3own === undefined, `handler returned ${JSON.stringify(s3own)?.slice(0, 200)}`);
+
+    // ── Scenario 4 (review I1): the OWNERSHIP ALLOWANCE closed the whole
+    // command on the FIRST push's refspecs, so the plain-MAIN twin of #605's own
+    // class stayed open — `git push origin main ; git push origin feat/other`
+    // (baseline main) was allowed on `main` and the FOREIGN push ran. The
+    // allowance's admit path now gates the compound's remaining mutations first.
+    const s4 = await quiet(() => callBash(`git push origin main ; git push origin feat/other`));
+    expectTrue("S4 I1: on-baseline MAIN push + a FOREIGN MAIN push in one compound → M2 BLOCK (allowance no longer closes the command)",
+      refusedBy(s4, M2_PUSH_REASON), `handler returned ${JSON.stringify(s4)?.slice(0, 200)}`);
+
+    // ── Scenario 5 (review I2): the delete exemption must key on the MUTATION's
+    // own spelling, not on the compound's verdict path — verdict-keyed, it held
+    // only when the delete was the FIRST push, so the `-d` short form in a later
+    // segment was BLOCKED while the byte-identical `--delete` was allowed.
+    const s5 = await quiet(() => callBash(`git push origin main && git push origin -d stale`));
+    expectTrue("S5 I2: later-segment `-d` remote-branch delete → ALLOWED (same verdict as the `--delete` spelling)",
+      s5 === undefined, `handler returned ${JSON.stringify(s5)?.slice(0, 200)}`);
+    const s5b = await quiet(() => callBash(`git push origin -d stale`));
+    expectTrue("S5 I2 control: lone `-d` delete → ALLOWED", s5b === undefined, `handler returned ${JSON.stringify(s5b)?.slice(0, 200)}`);
+    const s5c = await quiet(() => callBash(`git -C "${wt}" push origin wtmain && git push origin -d stale`));
+    expectTrue("S5 I2 control: wt lead + later-segment `-d` delete → ALLOWED (no false block)",
+      s5c === undefined, `handler returned ${JSON.stringify(s5c)?.slice(0, 200)}`);
   } catch (e) {
     expectTrue("#605 integration ran without throwing", false, String(e?.stack ?? e).slice(0, 400));
   } finally {

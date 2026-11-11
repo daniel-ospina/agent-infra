@@ -6180,85 +6180,9 @@ export default function (pi: ExtensionAPI) {
         "block:push-delete": "push-delete",
         "block:branch-force-delete": "branch-force-delete",
       };
-      const allowanceKind = ALLOWANCE[det.verdict];
-      if (allowanceKind && eff) {
-        const baseline = baselines.get(pid);
-        // #543: branch -D multi-target — the classifier's deleteTargets carries
-        // EVERY -d/-D/--delete name (mirror of pushTargets' all-targets
-        // semantics). git performs PARTIAL deletes on multi-target `-D`
-        // (`git branch -D main feat/other` refuses the checked-out main but
-        // deletes feat/other, rc=1), so the allowance must validate ALL names
-        // ⊆ baseline∪owned — a first-target-only list (the old newBranch
-        // capture) would let `<baseline|own> <foreign>` slip the trailing
-        // foreign branch past the gate. Prefer deleteTargets over the single
-        // newBranch fallback whenever present.
-        const targets = det.pushTargets && det.pushTargets.length > 0
-          ? det.pushTargets
-          : ((det.deleteTargets && det.deleteTargets.length > 0)
-            ? det.deleteTargets
-            : (det.newBranch ? [det.newBranch] : []));
-        // #1144: sync ops are admitted on their EFFECT, never their verb. The
-        // record is built from the classifier's parsed effect of THIS
-        // invocation plus the LIVE checkout preconditions OF THE SYNC OP'S OWN
-        // REPO (syncEff — never the command-level `eff`, whose hints may come
-        // from a different, worktree-scoped segment). A sync kind with no
-        // record fails closed (see syncEffectAllowed).
-        const isSyncKind = SYNC_ALLOWANCE_KINDS.has(allowanceKind);
-        const syncEff = isSyncKind ? _syncEffectiveRepo(det) : null;
-        const effect = isSyncKind ? _syncAllowanceEffect(syncEff, baseline, det) : undefined;
-        if (branchOwnership.ownershipAllowed({
-          opKind: allowanceKind,
-          currentBranch: eff.currentBranch,
-          baselineBranch: baseline?.branch ?? null,
-          targets,
-          syncSource: det.syncSource,
-          effect,
-          // #376 review fold-in: branches this pid renamed its own baseline
-          // to (scoped to THIS repo) stay locally deletable after the ceremony
-          // return re-bases the baseline (own-branch hygiene). create-new is
-          // never marked — it is blocked since #626 and never re-baselines.
-          ownedBranches: ownedBranches.get(pid)?.get(eff.repoKey ?? ""),
-        })) {
-          // #443: det.pushTargets describe ONLY the first push invocation. A
-          // delete in a LATER compound segment of the -d/--del family (no
-          // frozen legacy evidence) is invisible to them, so an own-baseline
-          // first push (`git push origin main && git push origin -d b` from a
-          // baseline-main hub session) must NOT let this allowance swallow the
-          // whole command — a sibling-held `b` would delete unguarded (the
-          // `--delete` twin classifies block:push-delete targets ["b"] and
-          // DOES block). Skip the allowance whenever the whole-command
-          // extractor reveals a delete target that is not the session's own
-          // baseline; own-branch ceremonies (extractor targets ⊆ baseline,
-          // e.g. `… && git push origin -d feat` while on feat) still allow.
-          // PUSH-FAMILY ONLY (wholeCommandDeleteTargets gates on the verdict):
-          // non-push allowance kinds (pull/merge/rebase/branch -D) keep their
-          // base decision — a `git pull origin main && git push origin -d b`
-          // compound is an origin/main parity gap (the pull allowance already
-          // swallowed it before #443), out of this push-spelling scope.
-          const wcDeletes = wholeCommandDeleteTargets(det.verdict, localCommand);
-          const baselineBranch = baseline?.branch ?? null;
-          // Unknown baseline (no way to tell own from foreign) → keep the
-          // allowance's base decision exactly as before.
-          const foreignDelete = baselineBranch !== null && wcDeletes.some((b) => b !== baselineBranch);
-          if (!foreignDelete) return admitAfterM3();
-          // foreign later-segment delete present → fall through to the #73 arms.
-        } else if (isSyncKind && syncEff?.isWorktree !== true) {
-          // #1144: the sync allowance DENIED. Fall to the legacy arm for the
-          // verdict but with the effect-specific refusal. The exemption keys on
-          // the SYNC OP'S OWN resolved repo (reviewer P0): a leading
-          // `git -C <worktree> …` segment must not exempt a later sync op that
-          // runs at the shell cwd (the shared hub). An unresolvable sync target
-          // (`syncEff === null`) is refused — fail closed, never exempt.
-          return {
-            block: true,
-            reason: _syncAllowanceBlockReason(allowanceKind, baseline, syncEff ?? eff, det, effect),
-          };
-        }
-      }
-
-      // ── M2 mutation list (#605) — built BEFORE the delete arm below, because
-      // that arm used to return without running M2 over the compound's OTHER
-      // mutations (review F1).
+      // ── M2 mutation list (#605) — built BEFORE the ownership-allowance arm and
+      // the push-delete arm, because BOTH used to close the whole command on one
+      // segment's evidence and return (reviews F1, I1).
       // #596 round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS comes
       // from the classifier's boundary-aware invocation hints (a
       // block:commit/block:push verdict implies the invocation exists;
@@ -6360,11 +6284,111 @@ export default function (pi: ExtensionAPI) {
       };
       const gateMutations = (mutations: any[]): { block: true; reason: string } | undefined => {
         for (const mu of mutations) {
+          // #605 (review I2): a DELETE-spelled push is the #73 coordinated-delete
+          // arm's business, never M2's target comparison — pushing it at M2 would
+          // refuse ordinary remote-branch cleanup. The rule keys on the MUTATION's
+          // own field, not on the compound's verdict: keyed on the verdict path it
+          // held only when the delete was the FIRST push (verdict
+          // block:push-delete), so `git push origin main && git push origin -d
+          // stale` (verdict block:push — a later-segment `-d` carries no frozen
+          // legacy evidence) was BLOCKED while the byte-identical `--delete`
+          // spelling was allowed. One rule, applied to every mutation.
+          if (mu.verb === "push" && mu.isDelete) continue;
           const hit = gateOneMutation(mu);
           if (hit) return hit;
         }
         return undefined;
       };
+
+      const allowanceKind = ALLOWANCE[det.verdict];
+      if (allowanceKind && eff) {
+        const baseline = baselines.get(pid);
+        // #543: branch -D multi-target — the classifier's deleteTargets carries
+        // EVERY -d/-D/--delete name (mirror of pushTargets' all-targets
+        // semantics). git performs PARTIAL deletes on multi-target `-D`
+        // (`git branch -D main feat/other` refuses the checked-out main but
+        // deletes feat/other, rc=1), so the allowance must validate ALL names
+        // ⊆ baseline∪owned — a first-target-only list (the old newBranch
+        // capture) would let `<baseline|own> <foreign>` slip the trailing
+        // foreign branch past the gate. Prefer deleteTargets over the single
+        // newBranch fallback whenever present.
+        const targets = det.pushTargets && det.pushTargets.length > 0
+          ? det.pushTargets
+          : ((det.deleteTargets && det.deleteTargets.length > 0)
+            ? det.deleteTargets
+            : (det.newBranch ? [det.newBranch] : []));
+        // #1144: sync ops are admitted on their EFFECT, never their verb. The
+        // record is built from the classifier's parsed effect of THIS
+        // invocation plus the LIVE checkout preconditions OF THE SYNC OP'S OWN
+        // REPO (syncEff — never the command-level `eff`, whose hints may come
+        // from a different, worktree-scoped segment). A sync kind with no
+        // record fails closed (see syncEffectAllowed).
+        const isSyncKind = SYNC_ALLOWANCE_KINDS.has(allowanceKind);
+        const syncEff = isSyncKind ? _syncEffectiveRepo(det) : null;
+        const effect = isSyncKind ? _syncAllowanceEffect(syncEff, baseline, det) : undefined;
+        if (branchOwnership.ownershipAllowed({
+          opKind: allowanceKind,
+          currentBranch: eff.currentBranch,
+          baselineBranch: baseline?.branch ?? null,
+          targets,
+          syncSource: det.syncSource,
+          effect,
+          // #376 review fold-in: branches this pid renamed its own baseline
+          // to (scoped to THIS repo) stay locally deletable after the ceremony
+          // return re-bases the baseline (own-branch hygiene). create-new is
+          // never marked — it is blocked since #626 and never re-baselines.
+          ownedBranches: ownedBranches.get(pid)?.get(eff.repoKey ?? ""),
+        })) {
+          // #443: det.pushTargets describe ONLY the first push invocation. A
+          // delete in a LATER compound segment of the -d/--del family (no
+          // frozen legacy evidence) is invisible to them, so an own-baseline
+          // first push (`git push origin main && git push origin -d b` from a
+          // baseline-main hub session) must NOT let this allowance swallow the
+          // whole command — a sibling-held `b` would delete unguarded (the
+          // `--delete` twin classifies block:push-delete targets ["b"] and
+          // DOES block). Skip the allowance whenever the whole-command
+          // extractor reveals a delete target that is not the session's own
+          // baseline; own-branch ceremonies (extractor targets ⊆ baseline,
+          // e.g. `… && git push origin -d feat` while on feat) still allow.
+          // PUSH-FAMILY ONLY (wholeCommandDeleteTargets gates on the verdict):
+          // non-push allowance kinds (pull/merge/rebase/branch -D) keep their
+          // base decision — a `git pull origin main && git push origin -d b`
+          // compound is an origin/main parity gap (the pull allowance already
+          // swallowed it before #443), out of this push-spelling scope.
+          const wcDeletes = wholeCommandDeleteTargets(det.verdict, localCommand);
+          const baselineBranch = baseline?.branch ?? null;
+          // Unknown baseline (no way to tell own from foreign) → keep the
+          // allowance's base decision exactly as before.
+          const foreignDelete = baselineBranch !== null && wcDeletes.some((b) => b !== baselineBranch);
+          if (!foreignDelete) {
+            // #605 (review I1): `targets` above is `det.pushTargets` — the FIRST
+            // push invocation's refspecs. So this allowance closed the WHOLE
+            // compound on one segment's evidence, and the plain-MAIN twin of the
+            // class this change fixes stayed open:
+            //   `git push origin main ; git push origin feat/other`
+            // (baseline main) — allowed on `main`, and the FOREIGN push ran. The
+            // delete arm below had the same shape (F1). Gate every remaining
+            // main-resolving mutation before admitting; delete-spelled pushes are
+            // skipped inside gateMutations (their own arm decides them), so
+            // ordinary remote-branch cleanup is unaffected.
+            const hit = gateMutations(m2Mutations);
+            if (hit) return hit;
+            return admitAfterM3();
+          }
+          // foreign later-segment delete present → fall through to the #73 arms.
+        } else if (isSyncKind && syncEff?.isWorktree !== true) {
+          // #1144: the sync allowance DENIED. Fall to the legacy arm for the
+          // verdict but with the effect-specific refusal. The exemption keys on
+          // the SYNC OP'S OWN resolved repo (reviewer P0): a leading
+          // `git -C <worktree> …` segment must not exempt a later sync op that
+          // runs at the shell cwd (the shared hub). An unresolvable sync target
+          // (`syncEff === null`) is refused — fail closed, never exempt.
+          return {
+            block: true,
+            reason: _syncAllowanceBlockReason(allowanceKind, baseline, syncEff ?? eff, det, effect),
+          };
+        }
+      }
 
       // ── push --delete: retained #73 coordinated check (foreign targets) ──
       // The matcher is per-FIRST-push-invocation; a delete spelling in a LATER
@@ -6391,7 +6415,7 @@ export default function (pi: ExtensionAPI) {
         // delete-spelled pushes stay this arm's business (they are covered above,
         // and pushing the M2 target comparison on them would refuse ordinary
         // remote-branch cleanup).
-        const hit = gateMutations(m2Mutations.filter((mu) => !(mu.verb === "push" && mu.isDelete)));
+        const hit = gateMutations(m2Mutations);
         if (hit) return hit;
         return admitAfterM3(); // foreign deletes with no checked-out targets — allowed (today's behavior)
       }
