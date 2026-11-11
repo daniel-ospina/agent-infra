@@ -851,6 +851,195 @@ async function partB() {
       `handler returned ${JSON.stringify(ffDiverged)}`);
     console.log((ffDiverged?.reason ?? "(no reason)").split("\n").map((l) => `     | ${l}`).join("\n"));
 
+    // ═════════════════════════════════════════════════════════════════════
+    // B607 — #607: (i) a branch-state git invocation hidden inside a shell
+    // substitution / eval / alias payload is REFUSED, and (ii) M3 decides each
+    // compound segment against the baseline the COMMAND itself has reached.
+    // ═════════════════════════════════════════════════════════════════════
+    // WHAT WAS MEASURED, at 6f508fc30, before either half was written — the
+    // issue's own body is provenance-stale in one direction and too narrow in
+    // the other:
+    //
+    //   (1) The LAUNDER the issue describes (a reBaseline-producing lead
+    //       short-circuits M3, so a later foreign clobber rides it) is ALREADY
+    //       CLOSED: #1144's `stateCarveOutClean` made that return conditional.
+    //       The rows below that re-pin it are regression pins, not new closure —
+    //       and they are pinned at the CLASSIFY layer (the 36-compound matrix)
+    //       and end-to-end in peer PR #3968; they are repeated here only because
+    //       THIS change rewrites the loop they run through, so the launder must
+    //       be re-proved against the NEW decision path (that is the risk this
+    //       block actually carries).
+    //   (2) The HIDDEN-PAYLOAD class was a live category-A bypass, and needs no
+    //       lead at all: `echo "$(git branch -Mq main victim)"` was ALLOWED (the
+    //       substitution executes and clobbers `victim` rc 0) — and so was the
+    //       same payload behind an M3-SANCTIONED lead, via backticks, and via
+    //       `eval`. Nothing refused them: the extractor cannot enumerate a
+    //       `$(…)`/backtick/`eval` payload, so the M3 loop gates only the VISIBLE
+    //       mutations (`hiddenStateSubst` reaches only the #591 carve-out).
+    //   (3) The FALSE BLOCK the issue's "Suggested fix" names: every segment was
+    //       judged against the SESSION baseline, so the legitimate two-segment
+    //       rename ceremony (`git branch -M main tmpA && git branch -M tmpA main`)
+    //       was BLOCKED — segment 2's source is not the session baseline.
+    //
+    // MUTANTS this block was MEASURED against (each row names the one that reddens
+    // it):
+    //   M1 = index.ts `hiddenBranchStateRefusal`'s first line neutered (`return null`)
+    //   M2 = the prospective baseline dropped (`const prospective = undefined`)
+    //   M3 = the #607 freed-name relaxation deleted (dst probe as before)
+    //   M3i = `renameDstExists: dstExists` → `false` (the pre-#598 decision: no dst
+    //         existence check at all) — the non-vacuity arm for the launder rows
+    //   M4 = `hiddenBranchStateRefusal` without the worktree resolution (refuse
+    //         unconditionally) — the non-vacuity arm for the worktree row
+    // Every mutant was APPLIED to a copy of index.ts and the whole suite re-run;
+    // the row names state what each one does to them. A row that CANNOT vary under
+    // any of them says so and names why (refused by an arm this change only
+    // feeds), rather than borrowing a mutant it was measured green under — the
+    // fabricated-discriminator failure #3442 exists to stop.
+    // The rows run in Part B's OWN hub (`repo`, baseline `main` recorded at B9pre
+    // by the registered session_start), NOT in a second fixture. The guard records
+    // ONE baseline per pid (`if (state && !baselines.has(pid))`), so a second
+    // session_start cannot re-point it at another repo — MEASURED: with a fresh
+    // fixture the carve-out refused every row with "this rename runs in a
+    // different checkout than the one that recorded this session's baseline"
+    // (repoKey mismatch), i.e. each row would have exercised the WRONG arm.
+    // PLACEMENT is load-bearing for the same reason: this block sits where the hub
+    // is still clean+main — B8h/B8i write untracked files into it, B7 dirties it,
+    // and M4 freezes every git op on a disordered hub.
+    const g607 = (c, cwd = repo) => execSync(c, { cwd, stdio: "ignore" });
+    // FOREIGN branches the adversarial rows rename/force-create onto. `victim` sits
+    // at a DISCRIMINATING commit (its own commit, not `main`'s tip), so a clobber
+    // would be visible in the repo, not only in the verdict.
+    g607("git checkout -q -b tmpVictim607 && printf 'v\\n' > v607.txt && git add v607.txt && git commit -qm victim607 && git checkout -q main && git branch victim tmpVictim607 && git branch -D tmpVictim607");
+    g607("git branch feat/other main");
+    expect(`#607 fixture: the hub is clean on main (branches: ${execSync("git branch --format='%(refname:short)'", { cwd: repo, encoding: "utf8" }).trim().split("\n").sort().join(",")})`,
+      execSync("git status --porcelain", { cwd: repo, encoding: "utf8" }).trim(), "");
+
+    /** Restore the session baseline to `main` between rows that ADMIT a move.
+     *  LOAD-BEARING, not hygiene: an admitted ceremony re-baselines the session
+     *  (the command is never actually run here), and every later rename row keys
+     *  on `baseline.branch` — a stale one would refuse the next row for the WRONG
+     *  reason and make it a vacuous lock. `git checkout main` is the #376
+     *  return-to-original, which re-baselines on BOTH the correct code and the M2
+     *  mutant, so it is the neutral restore. */
+    const restore607 = async (after) => {
+      const r = await callBash("git checkout main");
+      expectTrue(`#607 harness control: the baseline is re-established after ${after}`,
+        r === undefined, `handler returned ${JSON.stringify(r)}`);
+    };
+    const expect607Block = async (name, command, mutant) => {
+      const v = await callBash(command);
+      expectTrue(name, !!v && v.block === true, `handler returned ${JSON.stringify(v)}` + (mutant ? ` [${mutant}]` : ""));
+      return v;
+    };
+    const expect607Allow = async (name, command) => {
+      const v = await callBash(command);
+      expectTrue(name, v === undefined, `handler returned ${JSON.stringify(v)}`);
+    };
+
+    // ── (2) the hidden-payload class — every row here ALLOWED before the fix ──
+    const hidSubst = await expect607Block(
+      "#607 hidden: a `$(…)` branch-state payload is REFUSED (no visible mutation in the command) [mutant: M1] — MEASURED: M1 admits it (undefined)",
+      'echo "$(git branch -Mq main victim)"', "mutant M1");
+    expectTrue("#607 hidden: the refusal names its own issue and the visibility reason (an agent must be able to act on it)",
+      !!hidSubst && /#607/.test(hidSubst.reason ?? "") && /hidden|hides/.test(hidSubst.reason ?? "")
+      && /using-git-worktrees/.test(hidSubst.reason ?? ""),
+      `reason=${JSON.stringify(hidSubst?.reason ?? "")}`);
+    await expect607Block(
+      "#607 hidden: the BACKTICK spelling is refused [mutant: M1] — MEASURED: M1 admits it",
+      'echo "`git branch -Mq main victim`"', "mutant M1");
+    await expect607Block(
+      "#607 hidden: the `eval` spelling is refused [mutant: M1] — MEASURED: M1 admits it",
+      "eval 'git branch -Mq main victim'", "mutant M1");
+    await expect607Block(
+      "#607 hidden: a hidden SWITCH payload is refused [mutant: M1] — MEASURED: M1 admits it",
+      'echo "$(git checkout -q feat/other)"', "mutant M1");
+    await expect607Block(
+      "#607 hidden: a hidden FORCE-CREATE payload is refused [mutant: M1] — MEASURED: M1 admits it",
+      'echo "$(git branch -fq feat/x main)"', "mutant M1");
+    // The issue's own spelling: a hidden clobber AFTER an M3-SANCTIONED lead. The
+    // lead is allowed on its own (a later row pins that), so only the hidden
+    // payload can refuse this compound.
+    await expect607Block(
+      "#607 hidden: a hidden clobber AFTER a sanctioned own-rename lead is refused [mutant: M1] — MEASURED: M1 admits it",
+      'git branch -M main freeL ; echo "$(git branch -Mq freeL victim)"', "mutant M1");
+    // ⛔ THE REFUSED COMPOUND DID NOT MOVE THE BASELINE (#1144 F3, re-proved on
+    // the new path): the sanctioned lead inside the refused command would have
+    // re-baselined to `freeL`. If the refusal had applied it, the source below
+    // would no longer be the baseline and this row would block for the WRONG
+    // reason — so this row is the control for the one above, and it is
+    // MEASURED-discriminating under a mutant that applies pending re-baselines
+    // on refusal.
+    await expect607Allow(
+      "#607 hidden: a REFUSED compound left the baseline untouched (the follow-up own-rename is still the sanctioned carve-out) [mutant: M1, indirectly — MEASURED: red under M1 because that mutant ADMITS the row above, which legitimately re-baselines]",
+      "git branch -M main afterRefusalX");
+    await restore607("the refused-compound baseline control (baseline `afterRefusalX` → `main`)");
+    // A payload the extractor CAN enumerate is still gated on its own merits (the
+    // pre-existing #265/#598 refusal) — this change must not become the only thing
+    // standing between an interpreter-inline payload and a foreign ref.
+    await expect607Block(
+      "#607 hidden: an ENUMERATED `sh -c` payload is still refused by the M3 arm (enumeration is untouched)",
+      "git branch -M main free4 ; sh -c 'git branch -Mq free4 victim'");
+
+    // ── (3) mid-command baseline propagation — the false block the issue names ──
+    await expect607Allow(
+      "#607 ceremony: rename own baseline away and BACK is ALLOWED (the false block this issue names) [mutants: M2, M3] — MEASURED: both block it",
+      "git branch -M main tmpA && git branch -M tmpA main");
+    await restore607("the rename-back ceremony (baseline `main` → `main`)");
+    await expect607Allow(
+      "#607 ceremony: rename own baseline away, then to a FREE name, is ALLOWED [mutant: M2] — MEASURED: M2 blocks it (segment 2 is judged against `main`)",
+      "git branch -M main tmpB && git branch -M tmpB doneB");
+    await restore607("the rename-to-free ceremony (baseline `doneB` → `main`)");
+    await expect607Allow(
+      "#607 ceremony: a three-segment chain that ends on the original name is ALLOWED [mutants: M2, M3] — MEASURED: both block it",
+      "git branch -M main c1 && git branch -M c1 c2 && git branch -M c2 main");
+    await restore607("the three-segment ceremony");
+
+    // ── the LAUNDER must stay closed on the NEW path (the risk this change carries) ──
+    await expect607Block(
+      "#607 launder: own-rename lead + FOREIGN clobber tail is BLOCKED [mutant: M3i] — MEASURED: M3i admits it",
+      "git branch -M main freeX && git branch -M freeX victim", "mutant M3i");
+    await expect607Block(
+      "#607 launder: own-rename lead + FOREIGN rename SOURCE is BLOCKED (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i — decideM3 refuses the foreign source itself)",
+      "git branch -M main tmpC && git branch -M feat/other tmpC", "mutant M3i");
+    await expect607Block(
+      "#607 launder: own-rename lead + FOREIGN force-create tail is BLOCKED (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i — the force arm refuses the foreign target itself)",
+      "git branch -M main tmpE && git branch -fq feat/other main", "mutant M3i");
+    await expect607Block(
+      "#607 launder: own-rename lead + FOREIGN switch tail is BLOCKED (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i — the switch arm refuses it itself)",
+      "git branch -M main tmpF && git checkout feat/other", "mutant M3i");
+    await expect607Block(
+      "#607 launder: a propagated chain that ENDS on a foreign ref is BLOCKED — mid-command freedom is own-lineage only (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i)",
+      "git branch -M main d1 && git branch -M d1 d2 && git branch -M d2 victim");
+    // Baseline stability across the BLOCKED launder rows: none of them may have
+    // moved the session (they were refused), so a plain own-rename still passes.
+    await expect607Allow(
+      "#607 launder: the refused launder rows left the baseline untouched (follow-up own-rename still allowed)",
+      "git branch -M main afterLaunderX");
+    await restore607("the launder baseline control (baseline `afterLaunderX` → `main`)");
+
+    // ── negative controls: the refusal is NOT a blanket substitution block ────
+    await expect607Allow("#607 scope: `$(git branch --show-current)` is a READ-ONLY substitution → ALLOWED",
+      'echo "$(git branch --show-current)"');
+    await expect607Allow("#607 scope: `$(git rev-parse HEAD)` → ALLOWED", 'echo "$(git rev-parse HEAD)"');
+    await expect607Allow("#607 scope: `$(git status --porcelain)` → ALLOWED", 'echo "$(git status --porcelain)"');
+    await expect607Allow("#607 scope: prose that merely MENTIONS a rename in an argument is not a payload",
+      'git commit --allow-empty -m "git branch -M main x"');
+
+    // ── the WORKTREE exemption (mirrors the visible-mutation policy) ──────────
+    // Lanes work in worktrees; a refusal that ignored that would false-block the
+    // fleet's normal shape. The payload runs at the shell cwd, so the cwd's repo
+    // class decides — exactly as the M3 loop treats an extractor-invisible
+    // mutation (`stateInvVisible === false`).
+    const wt607 = join(tmp, "wt607");
+    execSync(`git worktree add -q "${wt607}" -b wt/x607 HEAD`, { cwd: repo, stdio: "ignore" });
+    process.chdir(wt607);
+    await expect607Allow("#607 worktree: a hidden branch-state payload in a WORKTREE session is exempt [mutant: M4] — MEASURED: M4 refuses it",
+      'echo "$(git branch -Mq wt/x607 wt/y607)"');
+    await expect607Allow("#607 worktree: the visible own-rename in a worktree is exempt (unchanged control)",
+      "git branch -M wt/x607 wt/y607");
+    process.chdir(repo);
+    await expect607Allow("#607 worktree: the hub session is restored for the remaining suites (control)", "git status");
+
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
     // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE
     // script whose only path-shaped content is a markdown code span inside a
@@ -894,6 +1083,7 @@ async function partB() {
       /script location: a linked worktree/.test(wtBlock.reason ?? "") &&
       !/checkout-hygiene\/hub-worktree\.sh/.test(wtBlock.reason ?? ""),
       `reason=${JSON.stringify(wtBlock?.reason ?? "")}`);
+
 
     // ── B8f/B8g/B8h: #1129 sanctioned-framework-script exemption ──
     // The framework's OWN mandated preflight is exempted from the content walk
@@ -975,6 +1165,7 @@ async function partB() {
       (carveOutBlocked.length
         ? ` — but ${carveOutBlocked.length} of writes 1..25 were BLOCKED (${carveOutBlocked.slice(0, 2).join(" | ")}), so this boundary shifted instead of failing (#768)`
         : ""));
+
   } catch (e) {
     expectTrue("B: part B ran without throwing", false, String(e?.message ?? e).slice(0, 200));
   } finally {
