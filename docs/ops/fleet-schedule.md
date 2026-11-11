@@ -178,9 +178,7 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
   are accepted), a target **under `<home>/.pi/agent/`** that does not resolve (an incomplete
   farm), an `argv[0]` that **exists but is not executable** (a target that lost its `+x` bit, or
   whose shebang interpreter is gone, fails every run with `rc=127` and would otherwise be stamped
-  as a live job), an `argv[0]` that **exists but is not executable** (a target that lost its `+x`
-  bit, or whose shebang interpreter is gone, fails every run with `rc=127` and would otherwise be
-  stamped as a live job), or — on `--check` ONLY — a label that is in `RETIRED` while its template
+  as a live job), or — on `--check` ONLY — a label that is in `RETIRED` while its template
   still exists. That last one is the one arm whose verdict differs by verb, deliberately: the
   contradiction lives in two REPO files, so the DECLARATION gate (`--check`, and CI) refuses it,
   while every MACHINE verb honours the manifest — the job becomes a named `SKIP` and any installed

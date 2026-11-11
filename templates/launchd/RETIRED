@@ -18,9 +18,10 @@
 # `scripts/fleet-schedule.py --check` exits 1 for any label listed here that
 # still has a template. That is the AUTHORING check (both statements live in
 # the repo, so that is where the contradiction is caught) and it is the only
-# surface that refuses it — `install-launchd.sh` and `fleet-schedule.py
-# --install/--start/--verify` warn and honour the manifest instead, because a
-# single stale line here must never disarm a whole cell's scheduled layer (no
+# surface that refuses it — `install-launchd.sh` warns (and still unloads +
+# removes), and `fleet-schedule.py --install/--start/--verify/--status` report
+# the label as a named SKIP; both honour the manifest instead, because a single
+# stale line here must never disarm a whole cell's scheduled layer (no
 # reaping, no liveness detection, no canary — measured on cells 3 and 4,
 # 2026-10-27).
 #
