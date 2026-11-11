@@ -21,11 +21,24 @@
 # RAIL_RUN_SH and all state lives in a temp dir.
 #
 # Run:  bash scripts/landing/rail-bg.test.sh
-# Exit: 0 when every assertion passes, 1 on any failure.
+# Exit: 0 when every assertion passes, 1 on any failure, 2 when the run cannot be honest — the portable
+#       bound (scripts/lib/bounded.sh) is missing, so the one arm whose mutant hangs would hang here too.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RB="$DIR/rail-bg.sh"
+# The repo's portable bound, for the ONE arm whose mutant HANGS (section 2's `wait` max_s guard).
+# GNU `timeout` is absent on macOS — the hosts this family runs on — so use `tb_timeout`, the same
+# helper `scripts/disk-reaper.test.sh` bounds its own probes with. A missing lib is a NAMED refusal
+# rather than a `command not found` that would red the arm for the wrong reason.
+if [ ! -f "$DIR/../lib/bounded.sh" ]; then
+  printf 'rail-bg.test.sh: missing %s (the portable bound) — refusing to run a suite whose one\n' \
+    "$DIR/../lib/bounded.sh" >&2
+  printf 'unbounded mutant would HANG instead of reddening.\n' >&2
+  exit 2
+fi
+# shellcheck source=../lib/bounded.sh
+. "$DIR/../lib/bounded.sh"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
@@ -129,11 +142,16 @@ out="$(rb nonsense)"; rc=$?
 assert_rc 2 "$rc" "unknown subcommand is a usage error"
 out="$(rb wait abc)"; rc=$?
 assert_rc 2 "$rc" "a non-numeric PR is a usage error"
-# ⛔ `wait`'s OWN max_s guard, not just `poll`'s (fresh-review finding F3, round 5). MEASURED: delete
-# the guard and this arm does not merely redden — the suite HANGS, because `[ $((SECONDS-start)) -ge
-# nope ]` errors into false and the loop never reaches its bound. That is the defect (an inert bound),
-# and an inert bound cannot be pinned by a green run: it can only be pinned by a run that never ends.
-out="$(rb wait 42 nope)"; rc=$?
+# ⛔ `wait`'s OWN max_s guard, not just `poll`'s (fresh-review finding F3, round 5) — and the PIN for
+# it, which round 6 MEASURED as inert and this arm now bounds. Delete the guard at rail-bg.sh:294 and
+# the call does not redden: `[ $((SECONDS-start)) -ge nope ]` errors into false, so the loop never
+# reaches its bound and the call NEVER RETURNS. A hang is not a verdict — unbounded, that mutant costs
+# a whole shard slice (run-bash-shards.sh's SHARD_BOUND) and records a failure naming the FILE and no
+# row, which reads as "the suite is slow", the exact confusion this arm exists to prevent.
+# MEASURED (round 6 review, reproduced here): guard deleted + no bound → rc=124, 0 red rows, suite
+# never returns; guard deleted + this bound → rc=124 for the call, so both rows below redden and the
+# suite exits 1 in ~11 s; clean head → 107 passed, 0 failed in ~2 s.
+out="$(tb_timeout 10 bash "$RB" wait 42 nope 2>&1)"; rc=$?
 assert_rc 2 "$rc" "a non-numeric max_s is refused by wait (a bound that cannot fire is not a bound)"
 assert_contains "$out" 'max_s must be numeric' "…and the refusal names the offending argument"
 
