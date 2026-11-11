@@ -414,6 +414,7 @@ _gh_auth_searchable() { [ -x "${1:-}" ]; }
 # pointed at a volume.
 _gh_auth_blind_ancestor() {
   local a="${1:-}"
+  case "$a" in /*) ;; *) return 1 ;; esac
   # ⛔ `case` RATHER THAN `${a%/*}` ALONE: a component-less path ("relstore") is unchanged by the strip, so
   # an unguarded loop spins forever on it. A path with no separator left has no ancestor to walk to.
   case "$a" in */*) a="${a%/*}" ;; *) return 1 ;; esac
