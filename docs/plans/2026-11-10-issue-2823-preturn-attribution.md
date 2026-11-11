@@ -4,7 +4,12 @@
 
 ## Problem
 
-`task`/`subagent` present pre-turn output as the child's message. Re-measured on today's main, the
+**`task`** presents pre-turn output as the child's message, and returns no attributable failure. The
+scope of this document and of PR #3925 is the **`task`** dispatcher ONLY: the `subagent` tool
+(`extensions/subagent/index.ts` `runSingleAgent`) has its own spawn path, never calls `spawnSubAgent`,
+carries no liveness attribution at all, and runs its children with the heartbeat emitter deliberately
+ejected (`TASK_HEARTBEAT_DISABLE: "1"`) — so its half of the issue's ask 1 needs its own evidence
+source and is tracked separately in **#3930**. Re-measured on today's main, the
 production defect is narrower than the issue body says and its producer is already fixed:
 
 - The producer — test files farmed into `~/.pi/agent/extensions` and executed as extensions at
@@ -27,10 +32,14 @@ production defect is narrower than the issue body says and its producer is alrea
    - **Proof A:** the emitter ran (`sawReady || markerCount > 0`) and `everSawWork` (latched on
      `turn_start`/`tool_start`) is false ⇒ no turn began. Covers the false-PASS case where stdout
      carries text but pi never wrote a final message.
-   - **Proof B:** the parent ARMED the emitter (`hbEnabled`) and got ZERO markers back on a
+   - **Proof B:** the parent's emitter for this child was **LIVE** and got ZERO markers back on a
      **non-zero** exit ⇒ the child never completed `session_start` ⇒ no turn began. This is the
-     measured #2823 payload. Gated on a non-zero exit so a `TASK_HEARTBEAT_DISABLE=1` child that
-     succeeded is never relabelled.
+     measured #2823 payload. LIVE is not "armed": the task tool sets `TASK_HEARTBEAT=1`
+     UNCONDITIONALLY as the sub-agent identity marker, so the premise is the emitter's own three-term
+     gate — `TASK_HEARTBEAT === "1" && PI_MODE === "print" && TASK_HEARTBEAT_DISABLE !== "1"` — read
+     through `hbEmitterLiveFor()` and pinned to `taskHeartbeatActive` by a drift row. A child whose
+     emitter was ejected emits zero markers BY DESIGN and proves nothing; the non-zero exit gate is
+     the second bound, so a `TASK_HEARTBEAT_DISABLE=1` success is never relabelled.
 2. New `TaskChildState` member `died-before-first-turn` (subsumes nothing: the existing
    `died-before-first-message` arm keeps its population — `!hasStdout && childMessagesSent === 0`).
    The `childMessagesSent` floor is skipped when a turn is DISPROVED, so the field set cannot
@@ -65,6 +74,13 @@ production defect is narrower than the issue body says and its producer is alrea
 | `extensions/shared/spawn-capacity.ts` `FAILED_STATUS` | mirror, so the review floor never counts the payload as a dispatch verdict (drift row `spawn-capacity.test.ts:91`) |
 | `exhaustionStatusFor` / `UNCONFIRMED_END_STATES` | kill precedence unchanged; the new state joins the terminal set so an un-exited child reads `running` |
 | `builtin-tools.test.ts`, `dispatch-record.test.ts` | the tests that must go red without the change |
+| `hbEmitterLiveFor` (drift row) | the parent's "emitter live" premise must stay term-for-term equal to the emitter's `taskHeartbeatActive` gate |
+
+## Scope boundary
+
+- IN: the `task` dispatcher (`spawnSubAgent`), its payload, its durable row, its mirrors.
+- OUT: the `subagent` tool's `runSingleAgent` path — separate spawn, no liveness attribution, emitter
+ejected by design. Tracked in **#3930** (opened from this PR's review, so the claim and the code agree).
 
 ## Steps
 
