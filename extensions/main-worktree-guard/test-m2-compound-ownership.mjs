@@ -322,6 +322,139 @@ async function main() {
     const s9ctl = await quiet(() => callBash(`EV="cd ${hub} && git push -f origin feat/other"; eval $EV`));
     expectTrue("S9 F1-r6 control: the #265 refusal is scoped to an UNRESOLVABLE cwd — a hub-rooted on-baseline session is unchanged",
       s9ctl === undefined, `handler returned ${JSON.stringify(s9ctl)?.slice(0, 240)}`);
+
+    // ── Scenario 10 (#608): the pid-owned set is a statement about the refs the
+    // session CURRENTLY holds, not an append-only memory. #598 lets a forced
+    // rename overwrite a dst that is in this pid's ownedBranches (the session
+    // consolidating its OWN refs) and #543/#376 lets a LOCAL `git branch -D`
+    // delete one — so a STALE entry is a live authorization against a ref the
+    // session no longer holds. Measured pre-fix by driving this handler:
+    //
+    //   git branch -M main feat/608r1     → ALLOW (feat/608r1 owned)
+    //   git branch -M feat/608r1 feat/608r2  → ALLOW (renamed AWAY; pre-fix
+    //                                          feat/608r1 stayed owned)
+    //   git checkout main                 → ALLOW (#376 return)
+    //   <sibling session creates feat/608r1>
+    //   git branch -M main feat/608r1     → pre-fix ALLOW = rc-0 CLOBBER of the
+    //                                       sibling's branch (its commits)
+    //
+    // A second, coupled defect surfaced on the same read: `ownershipAllowed`
+    // flattened the owned set with `.filter`, but index.ts hands it the per-pid
+    // `Set` (the shape decideM3 already accepts), so ANY post-ceremony
+    // `git branch -D <own branch>` threw `TypeError: … .filter is not a
+    // function` inside the handler — and pi blocks a tool on a handler failure,
+    // i.e. the #376 delete allowance was refused by a crash. R2/R3 pin both the
+    // allow and the prune-through-the-Set shape.
+    //
+    // ⛔ These rows run against a piece of state the gate cannot observe being
+    // mutated out of band (the sibling's `git branch` below is a direct
+    // `execSync`, exactly like a parallel pi process's own gate-allowed
+    // create): the assertion is that THIS session's destructive op is refused
+    // once its claim is stale, never that the sibling is gated here.
+    const callBashSafe = async (command) => {
+      try { return await quiet(() => callBash(command)); }
+      catch (e) { return { block: true, reason: `THREW ${String(e?.message ?? e).slice(0, 160)}` }; }
+    };
+    const R1a = await callBashSafe("git branch -M main feat/608r1");
+    expectTrue("R1 #608: own-baseline rename onto a FREE name → ALLOW (and marks it owned)",
+      R1a === undefined, `handler returned ${JSON.stringify(R1a)?.slice(0, 240)}`);
+    const R1b = await callBashSafe("git branch -M feat/608r1 feat/608r2");
+    expectTrue("R1 #608: own-baseline rename AWAY from the owned name → ALLOW",
+      R1b === undefined, `handler returned ${JSON.stringify(R1b)?.slice(0, 240)}`);
+    const R1c = await callBashSafe("git checkout main");
+    expectTrue("R1 #608: sanctioned return to the session's ORIGINAL baseline → ALLOW (#376)",
+      R1c === undefined, `handler returned ${JSON.stringify(R1c)?.slice(0, 240)}`);
+    execSync("git branch feat/608r1", { cwd: hub, stdio: "ignore" }); // a sibling recreates the freed name
+    const R1d = await callBashSafe("git branch -M main feat/608r1");
+    expectTrue("R1 #608: rename onto a sibling's RE-CREATED name → BLOCK (the renamed-away entry is not owned any more)",
+      !!R1d && R1d.block === true && String(R1d.reason || "").includes("already exists as a branch this session does not"),
+      `handler returned ${JSON.stringify(R1d)?.slice(0, 240)}`);
+    const R1e = await callBashSafe("git branch -D feat/608r1");
+    expectTrue("R1 #608: …and the same stale name is not local-deletable either (the delete allowance reads the same set)",
+      !!R1e && R1e.block === true, `handler returned ${JSON.stringify(R1e)?.slice(0, 240)}`);
+
+    // R2/R3 — the DELETE channel. An own-branch delete is ADMITTED (the #376
+    // post-ceremony hygiene `git branch -D <own merged branch>`) and must also
+    // spend the claim: `ownershipAllowed` used to receive a Set and call
+    // `.filter` on it (TypeError → pi blocks the tool), and the entry it
+    // authorized survived the delete, so a sibling that re-created the name
+    // inherited the pid's destructive allowance.
+    const R2a = await callBashSafe("git branch -M main feat/608r3");
+    expectTrue("R2 #608: own-baseline rename onto a free name → ALLOW",
+      R2a === undefined, `handler returned ${JSON.stringify(R2a)?.slice(0, 240)}`);
+    const R2b = await callBashSafe("git checkout main");
+    expectTrue("R2 #608: sanctioned return to the original baseline → ALLOW",
+      R2b === undefined, `handler returned ${JSON.stringify(R2b)?.slice(0, 240)}`);
+    const R2c = await callBashSafe("git branch -D feat/608r3");
+    expectTrue("R2 #608: post-return LOCAL delete of the pid's OWN branch → ALLOW (no TypeError from the Set/array contract)",
+      R2c === undefined || !!(R2c && R2c.block === false), `handler returned ${JSON.stringify(R2c)?.slice(0, 240)}`);
+    execSync("git branch feat/608r3", { cwd: hub, stdio: "ignore" }); // sibling re-creates the deleted name
+    const R3a = await callBashSafe("git branch -M main feat/608r3");
+    expectTrue("R3 #608: rename onto a sibling's RE-CREATED name after the pid deleted it → BLOCK (the delete spent the claim)",
+      !!R3a && R3a.block === true && String(R3a.reason || "").includes("already exists as a branch this session does not"),
+      `handler returned ${JSON.stringify(R3a)?.slice(0, 240)}`);
+    const R3b = await callBashSafe("git branch -D feat/608r3");
+    expectTrue("R3 #608: …and it is not local-deletable either (no stale authorization on a sibling's branch)",
+      !!R3b && R3b.block === true, `handler returned ${JSON.stringify(R3b)?.slice(0, 240)}`);
+
+    // ── NO-FALSE-BLOCK controls: unmarking must not spend a claim the session
+    // still holds, and the prune must not widen the delete allowance.
+    const R4a = await callBashSafe("git branch -M main feat/608r4");
+    expectTrue("R4 #608 control: own-baseline rename onto a free name → ALLOW",
+      R4a === undefined, `handler returned ${JSON.stringify(R4a)?.slice(0, 240)}`);
+    const R4b = await callBashSafe("git checkout main");
+    expectTrue("R4 #608 control: sanctioned return to the original baseline → ALLOW",
+      R4b === undefined, `handler returned ${JSON.stringify(R4b)?.slice(0, 240)}`);
+    const R4c = await callBashSafe("git branch -M main feat/608r4");
+    expectTrue("R4 #608 control: re-rename onto the session's STILL-OWNED ref → ALLOW (#598 own-refs consolidation intact)",
+      R4c === undefined, `handler returned ${JSON.stringify(R4c)?.slice(0, 240)}`);
+    const R4d = await callBashSafe("git checkout main");
+    expectTrue("R4 #608 control: sanctioned return again → ALLOW",
+      R4d === undefined, `handler returned ${JSON.stringify(R4d)?.slice(0, 240)}`);
+    const R4e = await callBashSafe("git branch -D feat/other");
+    expectTrue("R4 #608 control: deleting a NEVER-owned branch stays BLOCKED (the prune does not widen `-D`)",
+      !!R4e && R4e.block === true, `handler returned ${JSON.stringify(R4e)?.slice(0, 240)}`);
+    const R4f = await callBashSafe("git branch -D feat/608r4");
+    expectTrue("R4 #608 control: the still-owned branch remains local-deletable on the SAME admission path",
+      R4f === undefined || !!(R4f && R4f.block === false), `handler returned ${JSON.stringify(R4f)?.slice(0, 240)}`);
+
+    // R5/R6 — the two deletes that never reach the ownership-allowance arm and
+    // so could not be pruned there: a SOFT `-d` (an ALLOW verdict — git's
+    // merged-only delete is self-enforcing) and a WORKTREE-scoped `-D` (exempt
+    // from the gates by design). Both delete the same repo's `refs/heads`, so
+    // both spend the claim; without that, the freed name stays "owned" and a
+    // sibling that re-creates it inherits this pid's destructive allowance.
+    // These two rows fail pre-fix for STALENESS ALONE (no TypeError involved),
+    // which is what makes them independent witnesses of the #608 defect.
+    const R5a = await callBashSafe("git branch -M main feat/608r5");
+    expectTrue("R5 #608: own-baseline rename onto a free name → ALLOW",
+      R5a === undefined, `handler returned ${JSON.stringify(R5a)?.slice(0, 240)}`);
+    const R5b = await callBashSafe("git checkout main");
+    expectTrue("R5 #608: sanctioned return to the original baseline → ALLOW",
+      R5b === undefined, `handler returned ${JSON.stringify(R5b)?.slice(0, 240)}`);
+    const R5c = await callBashSafe("git branch -d feat/608r5");
+    expectTrue("R5 #608: SOFT `-d` of the pid's own (merged) branch → ALLOW (allow verdict, unchanged)",
+      R5c === undefined, `handler returned ${JSON.stringify(R5c)?.slice(0, 240)}`);
+    execSync("git branch feat/608r5", { cwd: hub, stdio: "ignore" }); // sibling re-creates the freed name
+    const R5d = await callBashSafe("git branch -M main feat/608r5");
+    expectTrue("R5 #608: rename onto a sibling's RE-CREATED name after a SOFT delete → BLOCK (the soft delete spent the claim)",
+      !!R5d && R5d.block === true && String(R5d.reason || "").includes("already exists as a branch this session does not"),
+      `handler returned ${JSON.stringify(R5d)?.slice(0, 240)}`);
+
+    const R6a = await callBashSafe("git branch -M main feat/608r6");
+    expectTrue("R6 #608: own-baseline rename onto a free name → ALLOW",
+      R6a === undefined, `handler returned ${JSON.stringify(R6a)?.slice(0, 240)}`);
+    const R6b = await callBashSafe("git checkout main");
+    expectTrue("R6 #608: sanctioned return to the original baseline → ALLOW",
+      R6b === undefined, `handler returned ${JSON.stringify(R6b)?.slice(0, 240)}`);
+    const R6c = await callBashSafe(`git -C "${wt}" branch -D feat/608r6`);
+    expectTrue("R6 #608: WORKTREE-scoped `-D` of the pid's own branch → ALLOW (worktree exemption intact)",
+      R6c === undefined, `handler returned ${JSON.stringify(R6c)?.slice(0, 240)}`);
+    execSync("git branch feat/608r6", { cwd: hub, stdio: "ignore" }); // sibling re-creates the freed name
+    const R6d = await callBashSafe("git branch -M main feat/608r6");
+    expectTrue("R6 #608: rename onto a sibling's RE-CREATED name after a worktree-scoped delete → BLOCK (the exempt delete still spent the claim)",
+      !!R6d && R6d.block === true && String(R6d.reason || "").includes("already exists as a branch this session does not"),
+      `handler returned ${JSON.stringify(R6d)?.slice(0, 240)}`);
   } catch (e) {
     expectTrue("#605 integration ran without throwing", false, String(e?.stack ?? e).slice(0, 400));
   } finally {

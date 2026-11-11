@@ -5148,13 +5148,25 @@ const pendingBaseline = new Set<number>(); // lock contended at session_start �
 // create-new is blocked since #626 and never re-baselines.)
 const ownedBranches = new Map<number, Map<string, Set<string>>>();
 
-function _markOwned(pid: number, repoKey: string | null | undefined, branch: string) {
+function _markOwned(pid: number, repoKey: string | null | undefined, branch: string | null | undefined) {
   if (!repoKey || !branch) return;
   let byRepo = ownedBranches.get(pid);
   if (!byRepo) { byRepo = new Map(); ownedBranches.set(pid, byRepo); }
   let set = byRepo.get(repoKey);
   if (!set) { set = new Set(); byRepo.set(repoKey, set); }
   set.add(branch);
+}
+
+// #608: ownership is a statement about the refs this pid CURRENTLY holds, not an
+// append-only record of every name it ever touched. A name leaves the pid's
+// hands on exactly two observable events — its own rename AWAY from that name,
+// and its own approved LOCAL delete of it — and each unmarks here, so a name a
+// sibling later recreates cannot inherit this pid's destructive allowance (the
+// #598 own-dst overwrite and the #543/#376 own-branch `-D`).
+function _unmarkOwned(pid: number, repoKey: string | null | undefined, branch: string | null | undefined) {
+  if (!repoKey || !branch) return;
+  const set = ownedBranches.get(pid)?.get(repoKey);
+  if (set) set.delete(branch);
 }
 
 function _recordBaseline(pid: number) {
@@ -6124,7 +6136,18 @@ export default function (pi: ExtensionAPI) {
             const applyRebaseline = () => {
               if (branchOp.op === "rename" && branchOp.to) {
                 if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
-                  _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
+                  const ownedKey = baseline?.repoKey ?? muEff.repoKey;
+                  _markOwned(pid, ownedKey, branchOp.to);
+                  // #608: the renamed-AWAY name leaves this pid's control — git
+                  // moves the ref, so the old name is free for anyone. Keeping
+                  // it in the owned set is a STALE authorization: a sibling that
+                  // recreates the freed name would be clobbered by this pid's
+                  // next `git branch -M <baseline> <that name>` (the #598
+                  // own-dst allowance) or by its `git branch -D` (#543/#376).
+                  // The old name is `branchOp.from`; for the 1-pos
+                  // `branch -M <new>` form (from null) it is the checkout's
+                  // current branch — the same substitution decideM3 makes.
+                  _unmarkOwned(pid, ownedKey, branchOp.from ?? muEff.currentBranch);
                 }
               }
               _rebaseline(pid, reBaseline);
@@ -6164,7 +6187,34 @@ export default function (pi: ExtensionAPI) {
       // `touch <marker>` can never fall through to mint un-stamped here.
       if (allowActive) return undefined;
 
-      if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return admitAfterM3();
+      // #608: an ADMITTED local branch delete spends this pid's ownership claim
+      // for that name. Ownership (`ownedBranches`) is the authorization the
+      // #598 rename arm and the #543/#376 delete allowance read, so it must
+      // describe the refs the session CURRENTLY holds: a name the pid deletes
+      // (or renames away from — see the M3 rename arm) is free for any sibling
+      // to re-create, and a stale entry would let this pid clobber or `-D` the
+      // SIBLING's branch rc 0. Called at every arm that ADMITS a delete, never
+      // on a refused one, and only for LOCAL delete targets: a remote
+      // (`git push --delete b`) drops origin's ref and leaves the pid's local
+      // branch in place.
+      const spendLocalDeleteClaims = (repoKey: string | null | undefined, names?: string[] | null) => {
+        if (!names || names.length === 0) return;
+        for (const t of names) _unmarkOwned(pid, repoKey, t);
+      };
+
+      if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") {
+        // #608 (soft-delete arm): `git branch -d <name>` is an ALLOW verdict
+        // (git's merged-only soft delete is self-enforcing), so it never reaches
+        // the ownership-allowance prune below — yet it DELETES the ref, in the
+        // main checkout or in a linked worktree alike (both resolve to the same
+        // repoKey, measured). `deleteTargets` is the branch-delete name list the
+        // classifier builds for the whole `-d`/`-D`/`--delete` family; a push
+        // delete never populates it (that family carries pushTargets).
+        if (det && det.deleteTargets && det.deleteTargets.length > 0) {
+          spendLocalDeleteClaims(eff?.repoKey, det.deleteTargets);
+        }
+        return admitAfterM3();
+      }
 
       // ── Ownership allowance (agent-infra main, own baseline branch) ──
       // Predicate split (plan deviation 7): sync ops (pull/rebase/merge) gate on
@@ -6409,6 +6459,18 @@ export default function (pi: ExtensionAPI) {
             // ordinary remote-branch cleanup is unaffected.
             const hit = gateMutations(m2Mutations);
             if (hit) return hit;
+            // #608: this allowance just authorized a LOCAL hard delete of the
+            // session's own branches — names the pid no longer holds once git
+            // runs. Drop them (fail-closed direction: an entry can only ever
+            // UNLOCK a destructive op, so pruning at worst costs this pid a
+            // later self-delete, which the escape hatch recovers). A sibling
+            // that recreates a freed name must not inherit the authorization —
+            // `git branch -D <sibling's new branch>` would destroy it. Remote
+            // deletes (`push-delete`) do NOT prune: they drop the REMOTE ref and
+            // leave the pid's local branch in place.
+            if (allowanceKind === "branch-force-delete") {
+              spendLocalDeleteClaims(eff.repoKey, targets);
+            }
             return admitAfterM3();
           }
           // foreign later-segment delete present → fall through to the #73 arms.
@@ -6517,7 +6579,17 @@ export default function (pi: ExtensionAPI) {
         // that actually runs at the shell cwd (`git -C <wt> status && git reset
         // --hard origin/main`). `undefined` (no per-invocation data) keeps the
         // previous single-invocation behaviour.
-        if (eff && eff.isWorktree && _allInvocationsWorktreeScoped(det) !== false) return admitAfterM3();
+        if (eff && eff.isWorktree && _allInvocationsWorktreeScoped(det) !== false) {
+          // #608 (worktree arm): a worktree-scoped LOCAL delete is EXEMPT from
+          // the gates, but it deletes the SAME repo's `refs/heads` (a linked
+          // worktree shares the git dir — repoKey is identical, measured). The
+          // bookkeeping therefore still has to run, or the pid keeps a claim on
+          // a branch it just deleted from its worktree.
+          if (det.deleteTargets && det.deleteTargets.length > 0) {
+            spendLocalDeleteClaims(eff.repoKey, det.deleteTargets);
+          }
+          return admitAfterM3();
+        }
         const kind = det.verdict.slice("block:".length);
         return {
           block: true,
