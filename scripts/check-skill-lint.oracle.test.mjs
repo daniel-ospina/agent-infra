@@ -62,8 +62,15 @@ const setEq = (a, b) => a.length === b.length && [...a].sort().join() === [...b]
 
 /** block-scalar fixture — value is a canonical representation (contentIndent
  *  not stripped, chomping not applied), so the oracle asserts direction
- *  (both non-empty strings) instead of byte equality. */
-const isBlockScalarFixture = (content) => /:[ \t]*[>|](?:[+-]?[1-9]?)[ \t]*(?:#.*)?\n/.test(content);
+ *  (both non-empty strings) instead of byte equality.
+ *  ⛔ BOTH INDICATOR ORDERS (YAML 1.2 §8.1.1): `|+2` is chomp-then-indent and
+ *  `|2+` is indent-then-chomp, and BOTH are valid headers. The predicate carried
+ *  only the first order, so an indent-then-chomp fixture (`>1-`) was not
+ *  recognised as a block scalar and the leg compared byte-for-byte — the same
+ *  one-sided-predicate class #370's round-1 fix closed for comment-carrying
+ *  headers (11b73738c). The expression must mirror `frontmatter-validate.mjs`'s
+ *  header grammar, which is the point of the drift lock. */
+const isBlockScalarFixture = (content) => /:[ \t]*[>|](?:[+-]?[1-9]?|[1-9][+-]?)[ \t]*(?:#.*)?\n/.test(content);
 
 // ── pi bundle ───────────────────────────────────────────────────────────────
 let pi;
@@ -417,6 +424,19 @@ const VALUE_POOL = [
   "|-x",
   "|1 #c",
   "|- #c",
+  // #458 review round 1 — the OTHER legal indicator order (YAML 1.2 §8.1.1
+  // permits indentation-then-chomping as well). These LOAD in yaml, so the
+  // header regex must accept them; a validator that flags them is the
+  // false-positive direction this pool now catches.
+  "|2",
+  "|2+",
+  "|2-",
+  ">1-",
+  "|2+ #c",
+  "|1+ #c",
+  // …and the illegal double-indicator forms, which must stay rejected.
+  "|+2+",
+  "|2+-",
 ];
 const KEY_POOL = ["name", "description", "steps", "other", "key", "subjects.team"];
 

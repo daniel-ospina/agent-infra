@@ -1822,6 +1822,66 @@ export const FIXTURES = [
     }
   },
   {
+    "id": "ok-block-header-indent-chomp",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |2+\n  line1\n---\nbody\n",
+    "note": "#458 — indent-then-chomp `|2+` (keep) is a valid header; the twin of `|+2`",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-indent-chomp-strip",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |2-\n  line1\n---\nbody\n",
+    "note": "#458 — indent-then-chomp `|2-` (strip) is a valid header",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-indent-chomp-fold",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: >1-\n line1\n---\nbody\n",
+    "note": "#458 — folded indent-then-chomp `>1-` is a valid header",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-indent-chomp-comment",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |2+ #c\n  line1\n---\nbody\n",
+    "note": "#458 — indent-then-chomp + SPACED comment stays legal (both boundaries at once)",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1\n",
+      "diagnostics": []
+    }
+  },
+  {
     "id": "ok-block-explicit-indent-2",
     "class": "ok",
     "expected": [],

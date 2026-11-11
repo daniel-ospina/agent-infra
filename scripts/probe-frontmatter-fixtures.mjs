@@ -198,6 +198,19 @@ const FIXTURE_DEFS = [
   // validator-clean so the guard is never over-broad.
   { id: 'ok-block-header-explicit-comment', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |1 #c\n  line1\n---\nbody\n', note: '#458 pin — explicit-indent header + SPACED comment stays legal (guards the guard against |1x over-reach)' },
   { id: 'ok-block-header-chomp-comment', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |- #c\n  line1\n---\nbody\n', note: '#458 pin — chomp header + SPACED comment stays legal (the legal twin of the `|-#c` fixture)' },
+  // #458 review round 1 — THE OTHER INDICATOR ORDER. YAML 1.2 §8.1.1
+  // `c-b-block-header` permits `( indentation-indicator chomping-indicator |
+  // chomping-indicator indentation-indicator )`, so indent-then-chomp is a
+  // VALID header and pi loads it. The header regex matched only
+  // chomp-then-indent, so all four of these were P0 (via the #369 digit guard,
+  // and via #458's catch-all) on a skill pi loads — the false positive the
+  // regex extension closes. The pre-existing `ok-block-explicit-keep-2`
+  // (`|+2`) pins the OTHER order; together they make the pair one-sided no
+  // longer.
+  { id: 'ok-block-header-indent-chomp', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |2+\n  line1\n---\nbody\n', note: '#458 — indent-then-chomp `|2+` (keep) is a valid header; the twin of `|+2`' },
+  { id: 'ok-block-header-indent-chomp-strip', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |2-\n  line1\n---\nbody\n', note: '#458 — indent-then-chomp `|2-` (strip) is a valid header' },
+  { id: 'ok-block-header-indent-chomp-fold', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: >1-\n line1\n---\nbody\n', note: '#458 — folded indent-then-chomp `>1-` is a valid header' },
+  { id: 'ok-block-header-indent-chomp-comment', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |2+ #c\n  line1\n---\nbody\n', note: '#458 — indent-then-chomp + SPACED comment stays legal (both boundaries at once)' },
   { id: 'ok-block-explicit-indent-2', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |2\n  line1\n  line2\n---\nbody\n', note: 'P1-1 — explicit indent indicator |2, body at exactly contentIndent' },
   { id: 'ok-block-explicit-keep-2', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |+2\n  line1\n---\nbody\n', note: 'P1-1 — chomp+indent |+2' },
   { id: 'ok-block-tab-after-spaces', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |\n  line1\n  \tline2\n---\nbody\n', note: 'P1-3 — tab AFTER spaces in a block-scalar body line is legal content-indent whitespace; pi loads and preserves the tab in the value (only a line STARTING with a tab ends the scalar)' },
