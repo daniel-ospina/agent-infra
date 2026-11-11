@@ -53,10 +53,13 @@
 #       launch did not start (rail-run could not record a pid) · 78 = rail-run's identity library is
 #       missing (it refuses to guess liveness) · otherwise rail-run's own state code (10 running ·
 #       20 refused · 21 killed · 22 gone-without-verdict · 23 exited-zero · 24 no-run · 25 unknown).
-#       `start`/`wait` exit with rail-run's own code, with ONE exception: when this CLI RETRACTS that
-#       code (it and the row disagree) it exits 25 — rail-run's own abstention — never the retracted
-#       0/20. `poll` exits with the WORST of the per-PR codes (the `gh pr checks` convention for a
-#       multi-item answer). Read the printed CONFIRMED/RECOMMEND lines as well as the code.
+#       `start`/`wait` exit with rail-run's own code, with two stated divergences:
+#         (i) a RETRACTION — a row exists but the code and its state disagree — exits 25 (rail-run's own
+#             abstention), never the retracted 0/20;
+#        (ii) rail-run exiting with NO row at all (`2`/`3`/`5`/`78`) is reported as `ERROR` and keeps
+#             ITS code, so a partial install (78 = pid-identity.sh missing) still names itself.
+#       `poll` exits with the WORST of the per-PR codes (the `gh pr checks` convention for a multi-item
+#       answer). Read the printed CONFIRMED/RECOMMEND lines as well as the code.
 #
 #   The repo identity is LAND_REPO and nothing else: `start` refuses a `--repo` argument, because the
 #   identity keys rail-run's run state and `wait`/`poll` take no `--repo` — so two ways to spell it
@@ -150,19 +153,43 @@ state_for_rc() {
 }
 
 # report <pr> <rail-run rc> <rail-run output> — the row verbatim, then two transcribed lines.
-# RETURNS THE EFFECTIVE EXIT CODE. Normally that is rail-run's `$rc`, unchanged — but when this CLI
-# RETRACTS the code (the code and the row disagree, or the code is outside rail-run's table) it returns
-# rail-run's own abstention code (25) instead: exiting with the retracted 0/20 while printing UNKNOWN
-# told a lane that branches on the documented code `LANDED`/`REFUSED`, which is the false-PASS/abandon
-# shape this file exists to remove (fresh-review finding F1 on #3923).
+# RETURNS THE EFFECTIVE EXIT CODE. Normally that is rail-run's `$rc`, unchanged. Two cases diverge, and
+# they must not be confused with each other (fresh-review findings F1/F2 on #3923, round 4):
+#   * NO ROW AT ALL — rail-run exited before printing one (its own `78` for a missing
+#     `scripts/lib/pid-identity.sh`, `2`/`3`/`5` for a refused invocation or a dead launch). There is
+#     nothing to transcribe, so the code is NOT retracted: it is reported as an `ERROR` line naming
+#     what that code means, and returned as itself. Calling this a "code and row disagree" blamed the
+#     tool for the caller's environment and collapsed `78` to `25`, on the one path a partial install
+#     is supposed to be named.
+#   * A RETRACTION — a row exists but the code and its state disagree, or the code is outside
+#     rail-run's table. Then `25` (rail-run's own abstention) is returned, never the retracted 0/20:
+#     exiting `LANDED`/`REFUSED` while printing UNKNOWN is the false-PASS and #2412 abandon shape in
+#     the signal lanes actually branch on.
 report() {
-  local pr="$1" rc="$2" out="$3" state want merged prstate confirmed reason
+  local pr="$1" rc="$2" out="$3" state want merged prstate confirmed reason why
   state="$(row_state "$out")"
   merged="$(row_field "$out" merged)"
   prstate="$(row_field "$out" pr_state)"
   want="$(state_for_rc "$rc")"
 
   printf '%s\n' "$out"
+
+  # ⛔ ABSENCE IS NOT A VERDICT (AGENTS.md) — and it is not a disagreement either. Checked BEFORE the
+  # transcription, because a missing row means there is no `merged=`/`pr_state=` to read at all.
+  if [ -z "$state" ]; then
+    case "$rc" in
+      2)  why="rail-run reported a usage/configuration error" ;;
+      3)  why="a live run already holds this PR" ;;
+      5)  why="the launch did not start (rail-run could not record a pid)" ;;
+      78) why="rail-run refused to guess liveness: scripts/lib/pid-identity.sh is missing" ;;
+      *)  why="rail-run produced no state row, so there is nothing to transcribe" ;;
+    esac
+    printf 'RECOMMEND: %s ERROR (rc=%s — %s)\n' "$pr" "$rc" "$why"
+    case "$rc" in
+      2|3|5|78) return "$rc" ;;
+      *) return 25 ;;
+    esac
+  fi
 
   # ⛔ ONE TRANSCRIPTION, ONE VALUE, USED BY BOTH LINES BELOW — so `CONFIRMED` and `RECOMMEND`
   # cannot disagree. An earlier version hardcoded the recommendation's `merged=true`, which meant a
@@ -190,10 +217,10 @@ report() {
     printf 'CONFIRMED merged=%s\n' "$confirmed"
   fi
 
-  # ⛔ THE RECOMMENDATION IS A RENAME OF RAIL-RUN'S VERDICT, NEVER A SECOND OPINION. A code and a row
-  # that disagree, or a code that is not in rail-run's table, is UNKNOWN — it can never land here as
-  # LANDED/REFUSED. (Code 3 = "a live run already holds this PR"; 2 = usage.)
-  if [ -z "$want" ] || { [ -n "$state" ] && [ "$state" != "$want" ]; }; then
+  # ⛔ THE RECOMMENDATION IS A RENAME OF RAIL-RUN'S VERDICT, NEVER A SECOND OPINION. A row that
+  # disagrees with the code, or a code that is not in rail-run's table, is UNKNOWN — it can never land
+  # here as LANDED/REFUSED.
+  if [ -z "$want" ] || [ "$state" != "$want" ]; then
     printf 'RECOMMEND: %s UNKNOWN (rc=%s state=%s — rail-run'"'"'s code and row disagree; resolve before acting)\n' \
       "$pr" "$rc" "${state:-absent}"
     return 25

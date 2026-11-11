@@ -75,6 +75,7 @@ case "${1:-}" in
       printf 'started pr=%s run=run-ZZZ pid=4242 session=own repo=fake/repo\n' "${2:-}"
       exit "${FIXTURE_START_RC:-5}"
     fi
+    if [ "${FIXTURE_START_NO_RUNLINE:-0}" = "1" ]; then printf 'rail-run: started (this line carries no run id)\n'; exit 0; fi
     [ "${FIXTURE_START_RC:-0}" = "0" ] || { printf 'rail-run: ✗ refused to start\n' >&2; exit "${FIXTURE_START_RC}"; }
     printf 'started pr=%s run=run-1 pid=4242 session=own repo=fake/repo\n' "${2:-}"
     printf '  log:    %s\n' "$FIXTURE_STATUS"
@@ -297,11 +298,14 @@ status_row 'landed pr=42 run=run-1 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state
 env FIXTURE_RC=0 bash "$RB" wait 42 0 >/dev/null 2>&1
 assert_contains "$(cat "$FIXTURE_ARGV")" 'argv: status 42 --repo fake/repo --run run-1' \
   "wait polls the recorded run id, not whatever is newest"
-rm -f 
+rm -f "$(runf 42)"
 : > "$FIXTURE_ARGV"
 env FIXTURE_RC=0 bash "$RB" wait 42 0 >/dev/null 2>&1
-assert_contains "$(cat "$FIXTURE_ARGV")" 'argv: status 42 --repo fake/repo' \
-  "with no recorded run id, wait uses rail-run's documented newest-run behaviour (no invented id)"
+# ⛔ THE NEEDLE MUST DISTINGUISH THE BRANCHES. `argv: status 42 --repo fake/repo` is a strict
+# PREFIX of the `--run` form, so it matches both and pins nothing; asserting the ABSENCE of
+# `--run` reddens under an invented id AND under an unconditional `--run` (round-4 finding F1).
+assert_not_contains "$(cat "$FIXTURE_ARGV")" '--run' \
+  "with no recorded run id, no --run is passed (rail-run's newest-run behaviour, no invented id)"
 
 # ── 7. poll: several PRs, each reported from a fresh read ────────────────────
 status_row 'landed pr=42 run=run-1 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state=MERGED merged=2026-11-01T00:00:00Z started=x log_bytes=10 log_age_s=1'
@@ -346,6 +350,41 @@ assert_contains "$out" 'RECOMMEND: 7 LANDED' "poll reports the landed PR as LAND
 assert_contains "$out" 'RECOMMEND: 8 UNKNOWN' "…and the abstaining PR as UNKNOWN"
 assert_rc 25 "$rc" "poll exits with the WORST per-PR code (a landing beside an abstention is NOT exit 0)"
 rm -f "$T/row-7.txt" "$T/rc-7.txt" "$T/row-8.txt" "$T/rc-8.txt"
+
+# ── 10. a NO-ROW exit is an ERROR that keeps its code (round-4 finding F2) ─────────────────────
+# A code outside rail-run's state table used to fall into the "code and row disagree" arm even when
+# there was no row at all — so rail-run's 78 (pid-identity.sh missing, printed before any row) was
+# mislabelled a disagreement and collapsed to 25, on the one path a partial install must name itself.
+out="$(wait_arm 42 78 '')"; rc=$?
+assert_contains "$out" 'RECOMMEND: 42 ERROR (rc=78' "a no-row 78 is an ERROR, not a disagreement"
+assert_contains "$out" 'pid-identity.sh is missing' "…and the reason names the missing library"
+assert_rc 78 "$rc" "…and 78 is KEPT (a partial install still names itself), not collapsed to 25"
+assert_not_contains "$out" 'disagree' "…and it is NOT called a code/row disagreement (there was no row)"
+
+out="$(wait_arm 43 0 '')"; rc=$?
+assert_contains "$out" 'RECOMMEND: 43 ERROR (rc=0' "rc=0 with NO row at all is an ERROR, not a landing"
+assert_rc 25 "$rc" "…and exits 25: absence is not a verdict"
+assert_not_contains "$out" 'LANDED' "…never LANDED on an empty read"
+
+out="$(wait_arm 44 5 '')"; rc=$?
+assert_rc 5 "$rc" "a no-row 5 (the launch did not start) keeps its code too"
+
+# ── 11. poll pins WORST, not LAST ─────────────────────────────────────────────────────────
+# The earlier poll arm used `7 8`, where the worst is also the last — so a "last code" mutant survived.
+# The reversed order is the discriminating one.
+printf 'landed pr=7 run=r7 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state=MERGED merged=2026-11-01T00:00:00Z started=x log_bytes=10 log_age_s=1\n' > "$T/row-7.txt"
+printf '0\n' > "$T/rc-7.txt"
+printf 'unknown pr=8 run=r8 repo=fake/repo pid=none rail_pid=none rc=- pr_state=not-read merged=- started=x log_bytes=10 log_age_s=1\n' > "$T/row-8.txt"
+printf '25\n' > "$T/rc-8.txt"
+out="$(bash "$RB" poll --max 0 8 7 2>&1)"; rc=$?
+assert_rc 25 "$rc" "poll over 8(25) then 7(0) exits 25 — the WORST, not the last"
+rm -f "$T/row-7.txt" "$T/rc-7.txt" "$T/row-8.txt" "$T/rc-8.txt"
+
+# ── 12. a success whose start line carries no run id says so ─────────────────────────────────
+out="$(env FIXTURE_START_NO_RUNLINE=1 bash "$RB" start 45 2>&1)"; rc=$?
+assert_rc 0 "$rc" "a launch that printed no run id still succeeds"
+assert_contains "$out" 'will read its NEWEST run' "…and says the follow-up poll will read the newest run"
+assert_eq '' "$(cat "$(runf 45)" 2>/dev/null)" "…and records no invented id"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

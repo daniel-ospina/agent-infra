@@ -230,10 +230,13 @@ The exit code is **rail-run's**, with two stated exceptions: `0` landed · `10` 
 `2` usage/environment · `3` a live run already holds the PR · `5` the launch did not start (rail-run
 could not record a pid) · `78` rail-run's identity library is missing (it refuses to guess liveness).
 
-1. When this CLI **retracts** the code — it and the row disagree, so the report says `UNKNOWN (rc=…
-   state=…)` — it exits `25` (rail-run's own abstention), **never** the retracted `0`/`20`: exiting
-   `LANDED`/`REFUSED` while printing "no verdict" is the false-PASS and #2412 abandon shape in the
-   signal lanes actually branch on.
+1. When this CLI **retracts** the code — a row exists but it and the code disagree, so the report says
+   `UNKNOWN (rc=… state=…)` — it exits `25` (rail-run's own abstention), **never** the retracted
+   `0`/`20`: exiting `LANDED`/`REFUSED` while printing "no verdict" is the false-PASS and #2412
+   abandon shape in the signal lanes actually branch on. When rail-run exits with **no state row at
+   all** (`2` usage, `3` a live run holds the PR, `5` the launch did not start, `78` its identity
+   library is missing) that is **not** a retraction: the report says `ERROR (rc=… — <what it means>)`
+   and the code is kept, so a partial install still names itself.
 2. `poll` exits with the **worst of the per-PR codes** (the `gh pr checks` convention for a multi-item
    answer), so one landed PR beside one abstention exits `25`, not `0`.
 
