@@ -3935,10 +3935,16 @@ export function classifyGitCommandDetailed(command) {
   // only ever gate the VISIBLE mutations of such a command (index.ts refuses it
   // against a non-worktree session repo, #607). A read-only substitution
   // (`$(git branch --show-current)`, `$(git rev-parse HEAD)`) does NOT set it.
-  const hiddenStateMutation = _hasHiddenStateSubst(String(command ?? ""));
+  const hiddenStateMutation = _hasHiddenStateMutation(String(command ?? ""));
   out.hiddenStateMutation = hiddenStateMutation;
+  // ⛔ NOT `hiddenStateMutation || …`: that would SILENTLY narrow the conservative
+  // flag to the precise one, dropping every `_hasHiddenStateSubst` arm
+  // (`__unverifiable__`, `$(<file)`, escaped backticks, proc-subst text, alias
+  // indirection) — and the #591 carve-out's fail-closed rows go red on it. The
+  // two flags are independent: this one stays the UNION, the new one is the
+  // EVIDENCE-of-a-mutation half.
   const hiddenStateSubst =
-    hiddenStateMutation ||
+    _hasHiddenStateSubst(String(command ?? "")) ||
     _unverifiableGitContent(String(command ?? ""));
   out.hiddenStateSubst = hiddenStateSubst;
   if (invocations.length === 0) {
@@ -5803,7 +5809,7 @@ function _ansiTranslate(s) {
  * @param {string} src
  * @returns {string[]}
  */
-function _collectSubstSpans(src) {
+function _collectSubstSpansDetailed(src) {
   const spans = [];
   let i = 0;
   const n = src.length;
@@ -5822,7 +5828,7 @@ function _collectSubstSpans(src) {
       // payload into a second command; without translation the payload
       // tokenizes as ONE glued word and the hidden git invocation is
       // invisible (probe-verified rc 0).
-      spans.push(_ansiTranslate(src.slice(i + 2, j)));
+      spans.push({ text: _ansiTranslate(src.slice(i + 2, j)), procSubst: false });
       i = j < n ? j + 1 : n;
       continue;
     }
@@ -5840,13 +5846,13 @@ function _collectSubstSpans(src) {
         else if (d === ")") depth--;
         j++;
       }
-      spans.push(src.slice(i + 2, Math.max(i + 2, j - 1)));
+      spans.push({ text: src.slice(i + 2, Math.max(i + 2, j - 1)), procSubst: c === "<" || c === ">" });
       i = j;
       continue;
     }
     if (c === "`") {
       const j = src.indexOf("`", i + 1);
-      spans.push(src.slice(i + 1, j > -1 ? j : src.length));
+      spans.push({ text: src.slice(i + 1, j > -1 ? j : src.length), procSubst: false });
       i = j > -1 ? j + 1 : src.length;
       continue;
     }
@@ -5855,17 +5861,50 @@ function _collectSubstSpans(src) {
   return spans;
 }
 
+/** The TEXTS only — the shape every pre-#607 consumer wants. */
+function _collectSubstSpans(src) {
+  return _collectSubstSpansDetailed(src).map((sp) => sp.text);
+}
+
+/**
+ * #607: is this invocation a BRANCH-STATE MUTATION? Argument-aware, because the
+ * verb alone is not the effect (measured on git 2.50.1):
+ *   `git symbolic-ref --short HEAD`        -> PRINTS the branch, rc 0 (a READ —
+ *                                             git-symbolic-ref(1): one argument
+ *                                             reads, two create/update)
+ *   `git symbolic-ref HEAD refs/heads/x`   -> rewrites HEAD (a WRITE)
+ *   `git update-ref refs/heads/x`          -> USAGE ERROR rc 129, moves nothing
+ *   `git update-ref --stdin` / `-d <ref>`  -> writes / deletes
+ *   `git update-ref <ref> <new>`           -> writes
+ * Before this, `symbolic-ref` and `update-ref` were unconditional, which made
+ * `git commit -m "wip on $(git symbolic-ref --short HEAD)"` a "hidden
+ * branch-state mutation" (agent-infra#607 review finding 1: a false block on a
+ * documented READ, admitted on main, with an unusable remedy).
+ * @param {{verb?: string, args?: string[]}} inv
+ */
+function _argAwareBranchStateMutation(inv) {
+  const args = inv.args || [];
+  const flags = args.filter((x) => x.startsWith("-")).map((x) => _stripQuotes(x));
+  const pos = args.filter((x) => !x.startsWith("-"));
+  if (inv.verb === "checkout" || inv.verb === "switch") return true;
+  if (inv.verb === "symbolic-ref") {
+    if (flags.some((f) => f === "-d" || f === "--delete")) return true;
+    return pos.length >= 2; // one arity = read
+  }
+  if (inv.verb === "update-ref") {
+    if (flags.some((f) => f === "-d" || f === "--delete" || f === "--stdin")) return true;
+    return pos.length >= 2; // `<ref>` alone is a usage error, not a move
+  }
+  // #596 (round-2 reviewer F1): the arm-exact mirror — cluster/long-form renames
+  // and force-copy spellings (`-Mq`/`--move`/`-Cq`/…) must be seen.
+  return inv.verb === "branch" && _branchInvMutatesBranchState(inv.args);
+}
+
 export function _hasHiddenStateSubst(raw) {
   const source = String(raw ?? "");
-  const mutates = (inv) => {
-    if (["checkout", "switch", "symbolic-ref", "update-ref"].includes(inv.verb)) return true;
-    // #596 (round-2 reviewer F1): consolidate on the arm-exact mirror — the
-    // stale inline copy only knew exact -m/-M + delete + narrow-force, so the
-    // #592 rename-cluster/long-form and force-COPY spellings (-Mq/--move/
-    // -Cq/…) were invisible here and a hidden payload of that surface
-    // laundered the #591 benign-force carve-out (probe-verified rc 0).
-    return inv.verb === "branch" && _branchInvMutatesBranchState(inv.args);
-  };
+  // #607 review finding 1: argument-aware, not verb-only — see
+  // _argAwareBranchStateMutation (a one-argument `symbolic-ref` is a READ).
+  const mutates = _argAwareBranchStateMutation;
   // Quote-aware payload collector — HOISTED to module scope (#607) so the
   // refusal that consumes this flag can enumerate the SAME spans; see
   // _collectSubstSpans. Behaviour is identical.
@@ -5960,6 +5999,112 @@ export function _hasHiddenStateSubst(raw) {
   // opaque env-backed aliases: --config-env=alias.x=ENV, GIT_CONFIG_KEY_n\d+=
   // alias.x, and GIT_CONFIG_PARAMETERS (git's internal -c env — round-7 cycle-4
   // reviewer P1, probe-verified rc 0) all refuse the carve-out.
+  if (/(?:\-\-config\-env[=\s]+\S*alias\.|GIT_CONFIG_KEY_\d+=alias\.|GIT_CONFIG_PARAMETERS=[^;]*alias\.)/.test(source)) return true;
+  return false;
+}
+
+
+/**
+ * #607: the PRECISE half of `_hasHiddenStateSubst` — "a hidden shell payload
+ * CARRIES A MUTATING BRANCH-STATE git invocation". This is what the refusal in
+ * index.ts consumes. `hiddenStateSubst` keeps its conservative union, because
+ * its other consumer (#591's benign-force carve-out) can only be made SAFER by a
+ * false positive.
+ *
+ * WHY A SECOND PREDICATE (measured, agent-infra#607 review finding 1): the
+ * conservative flags fire on shapes that CANNOT move a ref —
+ *   `__unverifiable__` ($VAR command word, unquoted `eval $VAR`),
+ *   `$(<file)` (inert text until something evals it),
+ *   a `!`-prefixed shell alias whose value is a READ (`!git log --graph`).
+ * Consuming those as "hidden mutation" refused
+ * `git commit -m "wip on $(git symbolic-ref --short HEAD)"` — a documented read
+ * that main admitted — leaving an unhatched lane (task children are unhatched,
+ * #623) blocked with a remedy it had already followed.
+ *
+ * So this answers ONE question, from EVIDENCE of a mutation, and from nothing
+ * else:
+ *   - a substitution / backtick span whose git invocations include a mutating
+ *     branch-state verb (argument-aware: a one-positional `symbolic-ref` is a
+ *     read, `update-ref <ref>` alone is a usage error);
+ *   - a `<(...)`/`>(...)` body: judged by its ARGUMENTS when the body is a git
+ *     command list, and conservatively (`/\bgit\b/`) when it is executable TEXT a
+ *     later step may run (`bash <(echo 'git branch -Mq …')`);
+ *   - a static `eval '…'` literal, judged the same way;
+ *   - a static alias VALUE (`-c alias.x=…`, `GIT_CONFIG_PARAMETERS`), with a
+ *     leading `!` (git's shell-alias marker) stripped before the same test;
+ *   - an OPAQUE alias keyed by env (`--config-env=alias.x`, `GIT_CONFIG_KEY_n`)
+ *     — the value is unreadable here, and an alias can name a branch-state verb.
+ * @param {string} raw
+ * @returns {boolean}
+ */
+export function _hasHiddenStateMutation(raw) {
+  const source = String(raw ?? "");
+  const firstWord = (text) => {
+    for (const tok of _tokenize(String(text ?? ""))) {
+      const t = _stripQuotes(tok);
+      if (t.length === 0) continue;
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue; // VAR=value prefix
+      return t;
+    }
+    return "";
+  };
+  const seen = new Set();
+  const scan = (inner, executableText) => {
+    if (inner === undefined || inner.length === 0 || seen.has(inner)) return false;
+    seen.add(inner);
+    if (executableText && firstWord(inner) !== "git") {
+      // Executable text whose invocation list says nothing about its content
+      // (`bash <(echo 'git …')`) — a git word anywhere is a risk. This is the
+      // pre-existing rule, narrowed to the case it exists for.
+      if (/\bgit\b/.test(inner)) return true;
+      // An alias VALUE may omit the `git` word entirely (`alias.x='branch x -fq
+      // victim main'`): git appends the call-site args, so a LEADING branch-state
+      // verb is a mutation.
+      if (["branch", "checkout", "switch", "symbolic-ref", "update-ref"].includes(firstWord(inner))) return true;
+      return false;
+    }
+    for (const inv of allGitInvocations(inner)) {
+      if (inv.verb === "__unverifiable__") continue; // unknown content, no known move
+      if (_argAwareBranchStateMutation(inv)) return true;
+    }
+    for (const sub of _collectSubstSpansDetailed(inner)) {
+      if (scan(sub.text, sub.procSubst)) return true;
+    }
+    return false;
+  };
+  for (const span of _collectSubstSpansDetailed(source)) {
+    if (scan(span.text, span.procSubst)) return true;
+  }
+  for (const t of _tokenize(source)) {
+    for (const span of _collectSubstSpansDetailed(t)) {
+      if (scan(span.text, span.procSubst)) return true;
+    }
+  }
+  // static eval literals (non-static `eval $EV` cannot be read — and by itself
+  // names no mutation, so it is NOT a refusal here)
+  const evalRe = /eval\s+(?:\$'([^']*)'|"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = evalRe.exec(source)) !== null) {
+    const ansi = m[1];
+    const payload = ansi !== undefined ? _ansiTranslate(ansi) : (m[2] ?? m[3] ?? "");
+    if (payload.length > 0 && scan(payload, true)) return true;
+  }
+  // static alias VALUES (leading `!` is git's shell-alias marker — strip it and
+  // judge the command list)
+  const cfgAlias = /(?:\-c|\-\-config)(?:\s+["']?alias\.|=alias\.)([A-Za-z0-9_.\/-]+)=(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+  let cm;
+  while ((cm = cfgAlias.exec(source)) !== null) {
+    const val = (cm[2] ?? cm[3] ?? cm[4] ?? "").replace(/^!/, "");
+    if (val.length > 0 && scan(val, true)) return true;
+  }
+  const cfgAliasQ = /(?:\-c|\-\-config)\s+(["'])(alias\.[A-Za-z0-9_.\/-]+)=([^"']*)\1/g;
+  let cq;
+  while ((cq = cfgAliasQ.exec(source)) !== null) {
+    const val = (cq[3] ?? "").replace(/^!/, "");
+    if (val.length > 0 && scan(val, true)) return true;
+  }
+  // opaque env-backed aliases: the VALUE is unreadable and an alias can name a
+  // branch-state verb, so this stays a refusal (#805).
   if (/(?:\-\-config\-env[=\s]+\S*alias\.|GIT_CONFIG_KEY_\d+=alias\.|GIT_CONFIG_PARAMETERS=[^;]*alias\.)/.test(source)) return true;
   return false;
 }

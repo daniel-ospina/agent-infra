@@ -888,6 +888,9 @@ async function partB() {
     //   M3 = the #607 freed-name relaxation deleted (dst probe as before)
     //   M3i = `renameDstExists: dstExists` → `false` (the pre-#598 decision: no dst
     //         existence check at all) — the non-vacuity arm for the launder rows
+    //   M6 = `hiddenStateMutation` recomputed from the CONSERVATIVE
+    //         `_hasHiddenStateSubst` (the pre-review head's predicate) — reddens the
+    //         read-only rows below, i.e. the false-block class findings 1/2 named
     //   M4 = a WORKTREE EXEMPTION RE-ADDED to `hiddenBranchStateRefusal` — the
     //         non-vacuity arm for the worktree + cross-repo + bought-exemption rows.
     //         MEASURED: every one of them is ADMITTED under it. That mutant is not
@@ -1026,8 +1029,28 @@ async function partB() {
       'echo "$(git branch --show-current)"');
     await expect607Allow("#607 scope: `$(git rev-parse HEAD)` → ALLOWED", 'echo "$(git rev-parse HEAD)"');
     await expect607Allow("#607 scope: `$(git status --porcelain)` → ALLOWED", 'echo "$(git status --porcelain)"');
-    await expect607Allow("#607 scope: prose that merely MENTIONS a rename in an argument is not a payload",
-      'git commit --allow-empty -m "git branch -M main x"');
+    // #607 scope, at the PREDICATE (review finding 3): the prose row used to assert
+    // ALLOW for `git commit --allow-empty -m "git branch -M main x"`, which rides the
+    // M2 commit-ownership arm and cannot vary under ANY mutant of this diff — a
+    // control for a path this change does not touch. Assert the flag itself instead
+    // (the pure-JS classifier is importable with zero deps, so this needs no fixture).
+    const { classifyGitCommandDetailed: classify607 } = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
+    expectTrue("#607 predicate: prose that merely MENTIONS a rename sets NO hidden-state flag",
+      classify607('git commit --allow-empty -m "git branch -M main x"').hiddenStateMutation === false,
+      JSON.stringify(classify607('git commit --allow-empty -m "git branch -M main x"').hiddenStateMutation));
+    // #607 review finding 1: `symbolic-ref` is argument-aware — one positional is a
+    // READ (git-symbolic-ref(1)), two write. Both the flag and the shape are pinned.
+    expectTrue("#607 predicate: `$(git symbolic-ref --short HEAD)` (a documented READ) is NOT a hidden mutation",
+      classify607('git commit -m "wip on $(git symbolic-ref --short HEAD)"').hiddenStateMutation === false,
+      JSON.stringify(classify607('git commit -m "wip on $(git symbolic-ref --short HEAD)"').hiddenStateMutation));
+    expectTrue("#607 predicate: a TWO-positional `symbolic-ref` DOES write, so it IS a hidden mutation (the read narrowing is not blanket)",
+      classify607('echo "$(git symbolic-ref HEAD refs/heads/main)"').hiddenStateMutation === true,
+      JSON.stringify(classify607('echo "$(git symbolic-ref HEAD refs/heads/main)"').hiddenStateMutation));
+    expectTrue("#607 predicate: `update-ref <ref>` alone is a USAGE ERROR (rc 129, moves nothing) — not a hidden mutation; `--stdin`/`<ref> <new>` are",
+      classify607('echo "$(git update-ref refs/heads/x)"').hiddenStateMutation === false
+      && classify607('echo "$(git update-ref --stdin)"').hiddenStateMutation === true
+      && classify607('echo "$(git update-ref refs/heads/x HEAD)"').hiddenStateMutation === true,
+      "update-ref arity narrowing is wrong");
 
     // ── NO worktree exemption — and this is the SECOND attempt at one ────────
     // ATTEMPT 1 exempted a session whose cwd resolved to a worktree, on the
@@ -1081,13 +1104,17 @@ async function partB() {
     // pinning it as "refused" would be a fabricated row — so the row is the two
     // spellings that DO fire the flag, above and below.
     await expect607Block(
-      "#607 bought-exemption: a benign substitution must not exempt a `$(<file)` payload in the same command [mutant: M4] — MEASURED: M4 admits it (review P1)",
-      'echo "$(git rev-parse HEAD)"; echo "$(< /tmp/payload-607.txt)"');
+      "#607 bought-exemption: a benign substitution must not exempt an ALIAS payload in the same command [mutant: M4] — MEASURED: M4 admits it (review P1)",
+      `echo "$(git rev-parse HEAD)"; git -c alias.x='git branch -fq victim main' x`);
     await expect607Block(
       "#607 bought-exemption: a benign substitution must not exempt an alias payload in the same command [mutant: M4] — MEASURED: M4 admits it (review P1)",
       `git -c alias.br='git -C ${repo} branch -fq victim main' br; echo "$(git rev-parse HEAD)"`);
-    await expect607Block(
-      "#607 bought-exemption: `$(<file)` (opaque file text) is REFUSED from a worktree — unattributable target fails CLOSED (#805) [mutant: M4] — MEASURED: M4 admits it",
+    // ⛔ MEASURED again, and this flipped: `$(<file)` is INERT TEXT until something
+    // evals it (bash's read optimization), so the precise predicate does not treat
+    // it as a branch-state mutation at all — refusing it was one of the false blocks
+    // review finding 1 named. It is ALLOWED now, and that is deliberate.
+    await expect607Allow(
+      "#607 read-only: `$(<file)` (inert file text, no eval) is ALLOWED — refusing it was a false block (review finding 1)",
       'echo "$(< /tmp/not-a-repo-claim.txt)"');
     await expect607Block(
       "#607 bought-exemption: alias indirection with no resolvable span is REFUSED from a worktree (#805) [mutant: M4] — MEASURED: M4 admits it",
@@ -1109,6 +1136,40 @@ async function partB() {
     await expect607Block(
       "#607 proc-subst: a MUTATING proc-subst (`<(git branch -Mq a b)`) is REFUSED — the flag genuinely fires here",
       "git diff --stat <(git branch -Mq a b)");
+    // ⛔ AND the READ-ONLY proc-subst class is `ABSENT HERE`, not "also present
+    // elsewhere" (round-2 review's correction, which round 3 answered from ONE
+    // spelling). The `procRe` prefix bug made every body containing a `)` in quotes
+    // or a nested `$(…)` fire; the precise predicate closes it. Both spellings:
+    await expect607Allow(
+      "#607 proc-subst: a read-only body containing a `)` in quotes is ALLOWED (the round-3 `DO NOT APPLY` was over-broad — closed now)",
+      "git diff --stat <(git log --format='%h (%s)' -1)");
+    await expect607Allow(
+      "#607 proc-subst: a read-only body with a NESTED `$(…)` is ALLOWED",
+      "git log --oneline <(git rev-list --max-count=1 HEAD --not $(git rev-list --all))");
+    await expect607Block(
+      "#607 proc-subst: executable TEXT fed to a shell (`bash <(echo 'git branch -Mq …')`) is still REFUSED — the broad rule survives where it is the only evidence",
+      "bash <(echo 'git branch -Mq victim main')");
+
+    // ── #607 review finding 1: read-only shapes that must NOT be refused ──────
+    // Each of these was ADMITTED on main and REFUSED by the previous head (the
+    // conservative `hiddenStateSubst` flags), leaving an unhatched lane blocked
+    // with a remedy it had already followed. The precise predicate is what makes
+    // them pass, so M6 (consume `hiddenStateSubst` instead) reddens all of them.
+    await expect607Allow(
+      "#607 read-only: a commit message naming the branch (`$(git symbolic-ref --short HEAD)`) is ALLOWED [mutant: M6] — MEASURED: M6 refuses it",
+      'git commit -m "wip on $(git symbolic-ref --short HEAD)"');
+    await expect607Allow(
+      "#607 read-only: capturing the branch into `$BR` then pushing it is ALLOWED [mutant: M6] — MEASURED: M6 refuses it",
+      'BR="$(git symbolic-ref --short HEAD)"; git push origin "$BR"');
+    await expect607Allow(
+      "#607 read-only: a `$VAR` command word holding a read is ALLOWED [mutant: M6] — MEASURED: M6 refuses it",
+      'G="git log --oneline"; $G');
+    // The HANDLER refuses this one at the pre-existing #709 discard gate ("alias-shell",
+    // effect unverifiable) — not at this PR's refusal — so the honest assertion is the
+    // predicate: `#607` must not fire on a shell alias that only READS.
+    expectTrue("#607 read-only: a `!`-prefixed shell alias whose value READS is NOT a hidden branch-state mutation [mutant: M6] — MEASURED: M6 fires on it",
+      classify607("git -c alias.lg='!git log --graph' lg").hiddenStateMutation === false,
+      JSON.stringify(classify607("git -c alias.lg='!git log --graph' lg").hiddenStateMutation));
     process.chdir(repo);
 
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
