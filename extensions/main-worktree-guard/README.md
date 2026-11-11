@@ -2442,11 +2442,22 @@ Both directions are pinned: a body is a PROGRAM only when the interpreter is
 handed no script operand (`bash <<EOF script.sh` → the operand is the script and
 the body is its stdin DATA), and a DATA body (`cat <<EOF`), a CODE body
 (`python3 <<PY`, the #627 surface) and an unterminated/absent heredoc are not
-walked. A body-executed path also forces the via-interpreter verdict: bash reads
-an ENOEXEC file as a shell script, so #1485's opaque-binary stand-down must not
-apply to it — and its ARGV is passed as UNKNOWN (`null`) rather than derived
-from the command line, because the raw tokens after a body line are the heredoc
-DELIMITER and the rest of the program: measured fail-OPEN with them, since
+walked. A body-executed path carries its OWN provenance about how that
+invocation runs it (`extractHeredocProgramScriptInvocations` →
+`interpreted`), and only an invocation that HANDS THE FILE TO A READER forces
+the via-interpreter verdict: `bash x.sh`, `bash < x.sh` and `.`/`source x.sh`
+inside a body are read as text, so #1485's opaque-binary stand-down must not
+apply to them. A BARE body line is the other direction — it is a DIRECT
+execution (`execve`; the kernel runs the ELF/Mach-O and bash's ENOEXEC→shell
+fallback never happens for a valid binary), so forcing the interpreter verdict
+for the whole body was an OVER-BLOCK and a regression against `main`: measured
+BLOCK for a body line `/usr/bin/git status` that `main` ALLOWS (a Go binary's
+bytes contain git-shaped prose — the exact #1485 defect, re-created on this
+surface). Both directions are pinned (`test.mjs` B52p, `test-script-backdoor`
+B7r/B7s/B7t). A body-executed path's ARGV is passed as UNKNOWN (`null`) rather
+than derived from the command line, because the raw tokens after a body line
+are the heredoc DELIMITER and the rest of the program: measured fail-OPEN with
+them, since
 `bash <<EOF` + `"/tmp/x.sh"` reported `$1 = "EOF"` and pruned a
 `case "$1" in "") git reset --hard` branch as unreachable while the body really
 calls the script with NO args and runs it. Unknown argv makes the reachability
@@ -2474,7 +2485,7 @@ one-script-per-command-line class is #3538, unchanged here); two heredocs on ONE
 header line are handled one at a time (the
 `_wtScanLine` one-heredoc-per-line contract), so `bash <<A; bash <<B` runs B's
 body while this walk resolves no path for it — **fail-AWAY, measured**; the
-nested-body walk is depth-bounded at two levels (`_programScriptPaths`), so a
+nested-body walk is depth-bounded at two levels (`_programScriptInvocations`), so a
 four-level heredoc nest runs and resolves nothing — **fail-AWAY, measured**; and
 a body that WRITES a script and then executes it is not statically followable
 (the same class as Residual 1/3 in the discard section).
