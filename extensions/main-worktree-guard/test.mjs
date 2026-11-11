@@ -1024,6 +1024,83 @@ dexpect("#594-R9a pairs resolve by INDEX order — a destructive index-1 definit
 dexpect("#594-R9b control — the SAME assignment order with the destructive value at the LOWER index loses to the benign index-1 (git ran `status`)",
   `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='branch -fq victimS main' GIT_CONFIG_KEY_1=alias.x GIT_CONFIG_VALUE_1=status git x`,
   { branchState: false, verb: "status" });
+// ── #594 review round 10: `GIT_CONFIG_PARAMETERS`, the channel git parses LAST ──
+// git's `git_config_from_parameters` (`config.c:717`) runs the `GIT_CONFIG_COUNT`
+// loop FIRST (`:741-770`) and then `parse_config_env_list` on
+// `CONFIG_DATA_ENVIRONMENT` (`:772-779`), so a definition in this channel SHADOWS a
+// count pair — the one definition source the resolver never read. Measured (git
+// 2.43.0, throwaway repo): R10a created `victimJ` rc 0 while the pre-fix classifier
+// answered `status`/branchState:false, i.e. ALLOWED in a shared main checkout; R10b
+// is its control and pins the ORDER in the other direction (git ran `status`, the
+// pre-fix classifier over-blocked on `branch`). Both are RED on the pre-fix module.
+dexpect("#594-R10a GIT_CONFIG_PARAMETERS shadows a GIT_CONFIG_COUNT pair — a destructive definition in the channel git reads LAST wins (git ran it)",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimJ main'" git br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimJ", "main"] });
+dexpect("#594-R10b control — the SAME channel with a BENIGN value beats a destructive count pair (git ran `status`); this is what makes R10a pin the ORDER and not 'params are unreadable'",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victimL main' GIT_CONFIG_PARAMETERS="'alias.br=status'" git br`,
+  { branchState: false, verb: "status" });
+dexpect("#594-R10c `-c` still BEATS the channel — git appends `-c` to the SAME env value, so it is parsed last (git ran `status`) and a params-first order fails OPEN",
+  `GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimM main'" git -c alias.br=status br`,
+  { branchState: false, verb: "status" });
+dexpect("#594-R10d the NEW-style `'key'='value'` spelling of the channel (git's `git_config_push_split_parameter`) expands too",
+  `GIT_CONFIG_PARAMETERS="'alias.br'='branch -fq victimH main'" git br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimH", "main"] });
+dexpect("#594-R10e several entries in ONE channel value apply in LIST order — the LAST wins (git ran `victimI`)",
+  `GIT_CONFIG_PARAMETERS="'alias.br=status' 'alias.br=branch -fq victimI main'" git br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimI", "main"] });
+dexpect("#594-R10f control — a BENIGN channel-only alias EXPANDS (`status`) instead of collapsing to opaque: the channel is MODELLED, not merely refused",
+  `GIT_CONFIG_PARAMETERS="'alias.br=status'" git br`,
+  { branchState: false, verb: "status" });
+// The ESCAPED forms inside a quoted run: `'\''` dequotes to `'` and `'\!'` to `!`
+// (`need_bs_quote`, quote.c), so a `!`-prefixed shell alias is still reported as an
+// OPAQUE definition (never expanded) — the round-2 decision, applied to this channel.
+dexpect("#594-R10g a `!`-shell-command value in the channel stays OPAQUE (defined, value unreadable) — never expanded",
+  `GIT_CONFIG_PARAMETERS="'alias.br'='!git branch -fq victimSH main'" git br`,
+  { branchState: true, stateVerb: "br" });
+// ── #594 review round 10: the EXPORTED assignment, and the malformed value ──
+// `inv.vars` cannot tell `A=x` from `export A=x` (round 8's finding, same shape), and a
+// plain shell variable is INVISIBLE to git — so a channel value from there is UNPROVEN
+// and every alias-resolvable verb goes opaque instead of trusting a count pair that
+// git's parse of the real channel would shadow. Measured fail-open before the fix:
+// `export GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimU main'";
+//  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`
+// ran the DESTRUCTIVE alias (rc 0) while the classifier answered `status`/false.
+dexpect("#594-R10h an EXPORTED channel value is unproven — the alias-resolvable verb is OPAQUE (fail closed), not expanded from the count pair git never reached",
+  `export GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimU main'"; GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`,
+  { branchState: true, stateVerb: "br" });
+dexpect("#594-R10i a MALFORMED channel value (git: `fatal: unable to parse command-line config`, rc 128) leaves an alias-bearing verb OPAQUE, not expanded from a lower-precedence source",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status GIT_CONFIG_PARAMETERS='alias.br=branch -fq victimX main' git br`,
+  { branchState: true, stateVerb: "br" });
+// An INHERITED channel is in the child's environment by construction and git parses
+// it, so the walk must too — otherwise an ambient definition shadows the count pair
+// exactly as R10a does.
+{
+  const saved = process.env.GIT_CONFIG_PARAMETERS;
+  try {
+    process.env.GIT_CONFIG_PARAMETERS = "'alias.br=branch -fq victimAMB main'";
+    dexpect("#594-R10j an INHERITED (ambient) channel definition shadows the count pair too — it is in the child's env by construction",
+      `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`,
+      { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimAMB", "main"] });
+    dexpect("#594-R10j2 control — the ambient channel does not swallow an ordinary read-only verb",
+      `git status`, { verb: "status", branchState: false });
+  } finally {
+    if (saved === undefined) delete process.env.GIT_CONFIG_PARAMETERS;
+    else process.env.GIT_CONFIG_PARAMETERS = saved;
+  }
+}
+// ── #594 review round 10: the alias NAME is case-folded, as git's key is ──
+// For the plain two-level `alias.<name>` key the section and name are
+// case-INSENSITIVE (a QUOTED subsection — the three-level `alias."Name"` form — is
+// case-sensitive, and git REJECTS it in `-c`: measured rc 128). Measured (git
+// 2.43.0, rc 0): the count-pair spelling below created `victimR`, while a
+// case-preserving map read `alias.br`=status and answered `status`/branchState
+// false — ALLOWED in a shared main checkout.
+dexpect("#594-R10k `alias.BR` and `alias.br` are the SAME config key — the later definition wins (git ran `victimR`)",
+  `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status GIT_CONFIG_KEY_1=alias.BR GIT_CONFIG_VALUE_1='branch -fq victimR main' git br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimR", "main"] });
+dexpect("#594-R10l the `-c` spelling of the case-folded key expands to the command git actually runs (`alias.BR` → `branch`) instead of collapsing to an over-blocked opaque verb",
+  `git -c alias.BR='branch -fq victimQ main' br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimQ", "main"] });
 dexpect("#594 --config-env resolves against the statement's own env prefix",
   `AL='checkout victim' git --config-env=alias.co=AL co`,
   { verdict: "block:checkout-branch", verb: "checkout", branchState: true });

@@ -4031,12 +4031,116 @@ const GIT_BUILTIN_COMMANDS = new Set([
 ]);
 
 /**
+ * #594 review round 10: a FAITHFUL port of git's own reader for the
+ * `GIT_CONFIG_PARAMETERS` channel — `parse_config_env_list` + `sq_dequote_step`
+ * (`config.c:684-713`, `quote.c:121-165` at git v2.43.0) — because this is the
+ * channel git parses LAST, so it SHADOWS the `GIT_CONFIG_COUNT` pairs the
+ * resolver already models. Measured FAIL-OPEN (git 2.43.0, throwaway repo,
+ * rc 0): `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br
+ * GIT_CONFIG_VALUE_0=status GIT_CONFIG_PARAMETERS="'alias.br=branch -fq
+ * victimG main'" git br` created `victimG` while the classifier answered
+ * `verb:status, branchState:false` → M3 never entered → ALLOWED in a shared
+ * main checkout.
+ *
+ * THE FORMAT (git v2.43.0, read from the primary source, not a summary): a
+ * whitespace-separated list of sq-quoted entries in three spellings — OLD
+ * `'key=value'` (the whole pair quoted, split on the FIRST `=`), NEW
+ * `'key'='value'`, and an implicit bool `'key'=`. Inside a quoted run `'\''` and
+ * `'\!'` are escapes for a literal `'` / `!` (`need_bs_quote`, `quote.c`).
+ * Entries apply in LIST ORDER, so the LAST one wins — the same last-wins rule
+ * the count pairs follow by index.
+ *
+ * A list git cannot parse is `fatal: unable to parse command-line config`
+ * (measured rc 128), so nothing runs; this returns `ok:false` and the caller
+ * turns an `alias.`-bearing value into the fail-closed `aliasOpaque` rather
+ * than guessing what it might have defined.
+ * @param {string} raw the channel's value (already shell-dequoted by the walker)
+ * @returns {{ok: boolean, pairs: Array<[string, string|null]>}}
+ */
+function _parseGitConfigParametersEnv(raw) {
+  const s = String(raw ?? "");
+  const n = s.length;
+  // C `isspace` in the C locale — `parse_config_env_list` uses it to separate
+  // entries, so the set must match or the walk splits where git does not.
+  const isSpace = (c) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\v" || c === "\f";
+  // `sq_dequote_step` (quote.c): ONE sq-quoted token. Returns the dequoted text
+  // and the index just past the token, or null for an unterminated run.
+  const dequoteStep = (at) => {
+    if (s[at] !== "'") return null;
+    let out = "";
+    let j = at;
+    for (;;) {
+      j += 1;
+      if (j >= n) return null; // git: a NUL ends the read → bogus format
+      const c = s[j];
+      if (c !== "'") {
+        out += c;
+        continue;
+      }
+      // Stepped out of the quoted run: the next char decides what follows.
+      j += 1;
+      const d = s[j];
+      if (d === undefined) return { text: out, next: n }; // `*next = NULL`
+      if (d === "\\") {
+        const esc = s[j + 1];
+        if ((esc === "'" || esc === "!") && s[j + 2] === "'") {
+          out += esc;
+          j += 2;
+          continue;
+        }
+      }
+      return { text: out, next: j };
+    }
+  };
+  const pairs = [];
+  let i = 0;
+  while (i < n) {
+    const keyTok = dequoteStep(i);
+    if (!keyTok) return { ok: false, pairs: [] };
+    i = keyTok.next;
+    if (i >= n || isSpace(s[i])) {
+      // OLD style: the dequoted token is `key=value` (or a bare bool key).
+      // git splits on the FIRST `=` only, then trims the KEY (`strbuf_trim`)
+      // and leaves the value untouched.
+      const eq = keyTok.text.indexOf("=");
+      const key = (eq < 0 ? keyTok.text : keyTok.text.slice(0, eq)).trim();
+      if (!key) return { ok: false, pairs: [] };
+      pairs.push([key, eq < 0 ? null : keyTok.text.slice(eq + 1)]);
+    } else if (s[i] === "=") {
+      // NEW style: `'key'='value'` or the implicit bool `'key'=`.
+      i += 1;
+      let value = null;
+      if (s[i] === "'") {
+        const valTok = dequoteStep(i);
+        if (!valTok || (valTok.next < n && !isSpace(s[valTok.next]))) return { ok: false, pairs: [] };
+        value = valTok.text;
+        i = valTok.next;
+      } else if (i >= n || isSpace(s[i])) {
+        value = null;
+      } else {
+        return { ok: false, pairs: [] };
+      }
+      if (!keyTok.text) return { ok: false, pairs: [] };
+      pairs.push([keyTok.text, value]);
+    } else {
+      return { ok: false, pairs: [] };
+    }
+    while (i < n && isSpace(s[i])) i += 1;
+  }
+  return { ok: true, pairs };
+}
+
+/**
  * #594: the `alias.<name>` definitions an invocation carries STATICALLY in its
  * own argv/env — the only ones the walk can see BEFORE git runs:
  *   - `-c alias.x=<value>` / `--config alias.x=<value>` (configOverrides)
  *   - `--config-env alias.x=<ENV>` (configEnvOverrides), resolved against the
  *     statement's vars → its env prefixes → process.env; an unresolvable name
  *     is reported as null = "defined, value opaque"
+ *   - `GIT_CONFIG_PARAMETERS`, the channel git itself folds every command-line
+ *     definition INTO and parses LAST (see `_parseGitConfigParametersEnv`), so
+ *     it beats both of the sources around this bullet. A value the walk cannot
+ *     read is reported as `unreadableAliases`, never guessed (round 10).
  *   - `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs from the statement's
  *     env PREFIXES (`VAR=value git …`) — the only source that is in the child's
  *     environment by construction — and ONLY when `GIT_CONFIG_COUNT` is a
@@ -4055,10 +4159,17 @@ const GIT_BUILTIN_COMMANDS = new Set([
  * value is arbitrary shell text, so "the alias IS this command" is not a claim
  * the walk may make.
  * @param {object} inv
- * @returns {Array<[string, string|null]>}
+ * @returns {{defs: Array<[string, string|null]>, unreadableAliases: boolean}}
  */
 function _aliasDefsFromInvocation(inv) {
   const defs = [];
+  // ⛔ SET WHEN A DEFINITION CHANNEL EXISTS BUT CANNOT BE READ: an
+  // `alias.`-bearing `GIT_CONFIG_PARAMETERS` that is malformed (git dies on it,
+  // measured rc 128) or that comes from an EXPORTED shell assignment the walker
+  // cannot prove git sees (round 8's rule for the count pairs, same channel
+  // class). The caller turns it into `aliasOpaque` for any verb an alias could
+  // actually resolve — fail closed, never a guess about what it defines.
+  let unreadableAliases = false;
   const splitKw = (s) => {
     const i = String(s ?? "").indexOf("=");
     return i <= 0 ? null : [String(s).slice(0, i), String(s).slice(i + 1)];
@@ -4066,8 +4177,21 @@ function _aliasDefsFromInvocation(inv) {
   const takeAlias = (key, value) => {
     const m = /^alias\.([A-Za-z0-9._/-]+)$/.exec(String(key ?? "").trim());
     if (!m) return;
+    // ⛔ THE ALIAS NAME IS CASE-FOLDED, BECAUSE GIT'S CONFIG-KEY CANONICALIZATION
+    // IS (review round 10, measured fail-open). For the plain two-level key
+    // `alias.<name>` the SECTION and the NAME are case-insensitive (only a
+    // QUOTED subsection, the three-level `alias."Name"` form, is case-sensitive
+    // — and git REJECTS that in `-c`, measured rc 128). So `alias.BR` and
+    // `alias.br` are the SAME key and the LATER definition wins — measured (git
+    // 2.43.0, rc 0): `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=alias.br
+    // GIT_CONFIG_VALUE_0=status GIT_CONFIG_KEY_1=alias.BR
+    // GIT_CONFIG_VALUE_1='branch -fq victimR main' git br` created `victimR`,
+    // while a case-preserving map held "br"=status and "BR"=destructive, read
+    // the benign one, left `branchState` false and ALLOWED it in a main
+    // checkout. Folding the name makes the map keyed exactly as git keys it.
+    const name = m[1].toLowerCase();
     const v = value === null || value === undefined ? null : String(value);
-    defs.push([m[1], v !== null && v.startsWith("!") ? null : v]);
+    defs.push([name, v !== null && v.startsWith("!") ? null : v]);
   };
   const resolveEnv = (name) => {
     // ⛔ PER-COMMAND ENV WINS OVER AN EARLIER SHELL ASSIGNMENT (bash semantics,
@@ -4157,6 +4281,68 @@ function _aliasDefsFromInvocation(inv) {
       if (pair && pair.key !== undefined) takeAlias(pair.key, pair.value ?? null);
     }
   }
+  // ⛔ `GIT_CONFIG_PARAMETERS` IS THE THIRD SOURCE AND GIT PARSES IT **AFTER**
+  // THE COUNT PAIRS (review round 10, measured FAIL-OPEN — the round-9 fix in
+  // this delta was correct and this is the one source left unread). git's
+  // `git_config_from_parameters` (`config.c:717`) runs the `GIT_CONFIG_COUNT`
+  // loop first (`:741-770`) and then `parse_config_env_list` on
+  // `CONFIG_DATA_ENVIRONMENT` (`:772-779`), so a definition carried in this
+  // channel SHADOWS a count pair. Measured (git 2.43.0, rc 0):
+  //   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status \
+  //   GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimG main'" git br
+  // created `victimG`, while the classifier expanded the count pair, answered
+  // `verb:status, branchState:false`, never entered M3 and ALLOWED it in a
+  // shared main checkout.
+  // ⛔ SOURCE ORDER, MEASURED: count pairs → THIS channel → the argv-ordered
+  // `-c`/`--config-env` list. git serializes `-c` into this same channel
+  // (`git_config_push_split_parameter` APPENDS, old value first) so `-c` still
+  // wins — measured: params destructive + `-c alias.br=status` ran `status`.
+  const paramsChannel = (() => {
+    const prefixes = inv.envPrefixes || [];
+    for (let i = prefixes.length - 1; i >= 0; i--) {
+      const p = String(prefixes[i] ?? "");
+      const e = p.indexOf("=");
+      if (e > 0 && p.slice(0, e) === "GIT_CONFIG_PARAMETERS") {
+        // A prefix assignment REPLACES any inherited value for this child, so
+        // this is authoritative even when it is empty (measured: an empty value
+        // parses to no pairs and does NOT fall back to the inherited channel).
+        return { value: p.slice(e + 1), trusted: true };
+      }
+    }
+    if (inv.vars && Object.prototype.hasOwnProperty.call(inv.vars, "GIT_CONFIG_PARAMETERS")) {
+      const v = inv.vars.GIT_CONFIG_PARAMETERS;
+      if (v !== undefined && v !== null) {
+        // EXPORTED-vs-plain is indistinguishable here (round 8's finding, same
+        // shape as the count pairs): a plain shell variable is invisible to git,
+        // so the definitions are UNPROVEN — fail closed rather than trust one.
+        return { value: String(v), trusted: false };
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(process.env, "GIT_CONFIG_PARAMETERS")) {
+      // INHERITED: in the child's environment by construction, and git would
+      // parse it — so the walk must too, or an ambient definition shadows the
+      // count pair exactly as the finding above does.
+      return { value: String(process.env.GIT_CONFIG_PARAMETERS ?? ""), trusted: true };
+    }
+    return null;
+  })();
+  if (paramsChannel) {
+    const parsed = _parseGitConfigParametersEnv(paramsChannel.value);
+    // `i` on the alias probe: the key is case-insensitive (see `takeAlias`), so
+    // `alias.BR` is just as defining as `alias.br`.
+    const mentionsAlias = /alias\./i.test(paramsChannel.value);
+    if (!paramsChannel.trusted) {
+      if (mentionsAlias) unreadableAliases = true;
+    } else if (!parsed.ok) {
+      // git DIES on a malformed list (rc 128), so no definition from it can run
+      // — but what it WOULD have defined is unknown, so an `alias.`-bearing value
+      // leaves every alias-resolvable verb opaque instead of expanding a
+      // definition from a lower-precedence source that git never reached.
+      if (mentionsAlias) unreadableAliases = true;
+    } else {
+      for (const [k, v] of parsed.pairs) takeAlias(k, v);
+    }
+  }
   // ⛔ ONE ORDERED CONFIG LIST, exactly as git reads it (review round 3): the
   // RELATIVE argv order of `-c` and `--config-env` decides the winner, so a
   // pass over `configOverrides` followed by a pass over `configEnvOverrides`
@@ -4189,7 +4375,7 @@ function _aliasDefsFromInvocation(inv) {
       if (kv) takeAlias(kv[0], resolveEnv(kv[1]));
     }
   }
-  return defs;
+  return { defs, unreadableAliases };
 }
 
 
@@ -4252,11 +4438,28 @@ function _splitAliasValue(value) {
  */
 function _expandAliasInvocations(invocations) {
   const MAX_ALIAS_DEPTH = 5;
-  const expandOne = (inv, depth, defs) => {
+  const expandOne = (inv, depth, res) => {
     const verb = inv.verb;
     if (!verb) return inv;
-    if (defs.has(verb)) {
-      const def = defs.get(verb);
+    // ⛔ AN UNREADABLE `GIT_CONFIG_PARAMETERS` MAKES EVERY ALIAS-RESOLVABLE VERB
+    // OPAQUE (review round 10). The channel is parsed LAST, so a definition in it
+    // shadows whatever a lower-precedence source said — and that includes the
+    // expansion THIS function would otherwise make. Fail-closed scope: a verb an
+    // alias can actually win for is (a) anything that is not a builtin, and
+    // (b) a DEPRECATED builtin, whose alias git consults first. A plain builtin
+    // is unaffected (git's precedence is builtin > alias), so it is classified
+    // as before rather than over-blocked.
+    const aliasMayApply = !GIT_BUILTIN_COMMANDS.has(verb) || GIT_ALIAS_PRECEDES_BUILTIN.has(verb);
+    if (res.unreadableAliases && aliasMayApply) return { ...inv, aliasName: verb, aliasOpaque: true };
+    // ⛔ THE LOOKUP IS CASE-INSENSITIVE, because git's alias lookup keys the
+    // command name into the config key `alias.<cmd>`, whose name part is
+    // case-folded (`alias.BR` IS `alias.br` — measured: `git -c alias.BR='…'
+    // br` ran it), and `defsFor` stores names folded the same way.
+    const defKey = res.defs.has(verb)
+      ? verb
+      : (res.defs.has(String(verb).toLowerCase()) ? String(verb).toLowerCase() : null);
+    if (defKey !== null) {
+      const def = res.defs.get(defKey);
       if (def === null) return { ...inv, aliasName: verb, aliasOpaque: true };
       const words = _splitAliasValue(def);
       const next = words[0];
@@ -4266,7 +4469,7 @@ function _expandAliasInvocations(invocations) {
         verb: next,
         args: [...words.slice(1), ...(inv.args || [])],
         aliasName: verb,
-      }, depth + 1, defs);
+      }, depth + 1, res);
     }
     if (!GIT_BUILTIN_COMMANDS.has(verb)) return { ...inv, aliasName: verb, aliasOpaque: true };
     return inv;
@@ -4292,7 +4495,8 @@ function _expandAliasInvocations(invocations) {
   // a value the guard cannot see IS the bypass #594 is about.
   const defsFor = (inv) => {
     const m = new Map();
-    for (const [name, value] of _aliasDefsFromInvocation(inv)) {
+    const { defs, unreadableAliases } = _aliasDefsFromInvocation(inv);
+    for (const [name, value] of defs) {
       // ⛔ GIT'S PRECEDENCE, MEASURED (git 2.43): builtin > `git-<cmd>` on PATH
       // > alias. `git -c alias.reset=status reset --hard` runs the BUILTIN
       // `reset --hard` (probe-verified; the alias is never consulted, and an
@@ -4307,7 +4511,7 @@ function _expandAliasInvocations(invocations) {
       if (GIT_BUILTIN_COMMANDS.has(name) && !GIT_ALIAS_PRECEDES_BUILTIN.has(name)) continue;
       m.set(name, value);
     }
-    return m;
+    return { defs: m, unreadableAliases };
   };
   return invocations.map((inv) => expandOne(inv, 0, defsFor(inv)));
 }
