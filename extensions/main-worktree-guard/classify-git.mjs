@@ -4862,16 +4862,22 @@ const _SUBST_PLACEHOLDER = "\u0000SUBST";
  * ALLOWED — the fourth mirror-shape of the rounds 1-3 class (redirect-as-boundary,
  * opener-as-terminator, span-word-as-filename, now quote-erasure). `\)` erases the same way.
  *
- * The mask is 1:1 in LENGTH on purpose: `_foldBacktickSubstitutions` slices the body BY INDEX, so a
- * length-preserving substitution keeps its indices valid. Every token is unmasked before it is
- * returned, so a genuinely quoted ref name that contains a paren is unaffected.
+ * The mask is 1:1 in LENGTH, and that is load-bearing (fresh-context review round 5, P3: an earlier
+ * revision of this comment CLAIMED it while the sentinels were `"\u0001QPL"`/`"\u0001QPR"` — 1 → 4
+ * bytes, so the stated invariant was false and a reader trusting it would reason about index
+ * arithmetic that did not exist). `_foldBacktickSubstitutions` slices the body BY INDEX, so keeping
+ * every mask exactly one character means its indices are valid on the MASKED string and map 1:1 back
+ * onto the original. The sentinels are single control characters that cannot occur in a shell word
+ * and cannot collide with `_SUBST_PLACEHOLDER`'s `\u0000` prefix. Every token is unmasked before it
+ * is returned, so a genuinely quoted ref name that contains a paren is unaffected.
  */
-const _QP_L = "\u0001QPL";
-const _QP_R = "\u0001QPR";
+const _QP_L = "\u0001";
+const _QP_R = "\u0002";
 
 /** Replace quoted/escaped `(` and `)` with sentinels, mirroring `_tokenize`'s own rules EXACTLY:
  * a backslash escapes the next char always outside quotes and only inside DOUBLE quotes (POSIX), and
- * inside single quotes it is literal. Length-preserving (see `_QP_L`).
+ * inside single quotes it is literal. LENGTH-PRESERVING: every masked character becomes exactly one
+ * sentinel character (see `_QP_L`).
  * @param {string} body
  * @returns {string}
  */
@@ -4899,12 +4905,16 @@ function _maskQuotedParens(body) {
 }
 
 /** Restore the parens `_maskQuotedParens` replaced.
+ *
+ * ⛔ BOTH sentinels are checked. A token can legitimately contain ONLY `_QP_R` — `-o ")"` masks to that
+ * single character — so sniffing for `_QP_L` alone (the first revision did) left such a token
+ * UNMASKED, feeding `\u0002` onward as if it were a ref.
  * @param {string} tok
  * @returns {string}
  */
 function _unmaskQuotedParens(tok) {
-  if (typeof tok !== "string" || tok.indexOf("\u0001") === -1) return tok;
-  return tok.split(_QP_L).join("(").split(_QP_R).join(")");
+  if (typeof tok !== "string") return tok;
+  return tok.replace(/[\u0001\u0002]/g, (c) => (c === _QP_L ? "(" : ")"));
 }
 
 /**
