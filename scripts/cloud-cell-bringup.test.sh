@@ -293,7 +293,18 @@ export SYSTEMCTL="$STUB/systemctl"
 sleep 900 >/dev/null 2>&1 &
 STUB_UNIT_PID=$!
 export SYSTEMCTL_MAINPID="$STUB_UNIT_PID"
-printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=${SYSTEMCTL_MAINPID:-}" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
+# ⛔ AND A WATCHDOG, SO THE SLEEPER CANNOT OUTLIVE THE SUITE EVEN IF THE EXIT TRAP IS SKIPPED (#3900).
+# `$$` inside a subshell is THIS shell's pid, so the watchdog observes the suite itself and reaps the sleeper
+# within ~5 s of it going away — including the case where the suite is SIGKILLed and no trap runs at all.
+# MEASURED: a run that took a failing path (the mutant that answers a literal MainPID) left one `sleep 900`
+# orphaned past the trap; a green run did not. Rather than chase which arm skipped it, the reaping no longer
+# depends on the trap firing. The comm guard is repeated here for the same reason as in the trap: a recycled
+# pid must never be killed.
+( printf 'WD start shell=%s pid=%s\n' "$$" "$STUB_UNIT_PID" >> /tmp/wd.log
+  while kill -0 "$$" 2>/dev/null; do sleep 5; done
+  printf 'WD shell gone, comm=[%s]\n' "$(ps -o comm= -p "$STUB_UNIT_PID" 2>/dev/null)" >> /tmp/wd.log
+  [ "$(ps -o comm= -p "$STUB_UNIT_PID" 2>/dev/null)" = sleep ] && kill -9 "$STUB_UNIT_PID" 2>/dev/null && printf 'WD killed\n' >> /tmp/wd.log ) >/dev/null 2>&1 &
+printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
                      # invocation and fails closed, blocking the suite from running at all.
