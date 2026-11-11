@@ -517,16 +517,18 @@ jobs:
     # #2055 — this job carries NO job-level bound on purpose. ⛔ THE REASON IS NOT ARITHMETIC, and saying
     # it was arithmetic was FALSE (review finding, P2): this change's FIRST draft had 66 steps of which 65
     # carried a bound, summing 381 min — above the platform's 360-minute ceiling — so no bound could satisfy
-    # `job-bound > Σ step-bounds`, and "a 66-step job cannot" was true THEN. It is not true now: Σ is 326, so
-    # a job bound in 327..359 WOULD satisfy it. The step-only shape is kept deliberately, because a job
+    # `job-bound > Σ step-bounds`, and "a 66-step job cannot" was true THEN. It is not true now: Σ is 334
+    # (68 bounded steps — measured by summing every `timeout-minutes` inside this job's region), so a job
+    # bound in 335..359 WOULD satisfy it. The step-only shape is kept deliberately, because a job
     # bound above Σ can never fire (the last step bound always arrives first) and therefore buys nothing —
     # while it would relabel this job from step-bounded to job-bounded, i.e. to the shape whose trip is
     # `cancelled`, NON-RED to the rail, which pre-empts the red step that actually hung. So EVERY step
-    # below carries its own bound (sum 326 min), sized from that STEP's measured max over 12 completed
+    # below carries its own bound (sum 334 min), sized from that STEP's measured max over 12 completed
     # runs (2026-11-09; the two heavy ones are the finished-lane reaper's mutation control at 7.3 min and
-    # its suite at 2.2 min) — with ONE stated exception: the #718 hub-sweep step landed on main after that
-    # measurement, so it has no 12-run series yet and its bound is sized from its own documented wall
-    # clock instead (see its comment). Every other bound below is a 12-run p90. A step trip is `failure` —
+    # its suite at 2.2 min) — with THREE stated exceptions, each sized from its OWN documented wall clock
+    # instead because none has a 12-run series: the #718 hub-sweep step (it landed on main after that
+    # measurement), and this PR's two #506 suite steps (see their comments). Every other bound below is a
+    # 12-run p90. A step trip is `failure` —
     # RED — which is the property a job bound (`cancelled`, NON-RED to the rail, #3242) cannot provide.
     # This is the amended indicator (b) of this issue applied honestly rather than a bound that is only
     # decorative.
