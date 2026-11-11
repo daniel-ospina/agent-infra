@@ -123,12 +123,12 @@ cat > "$TEMPLATES_DIR/com.test.bringup-schedule.plist" <<PLIST
 PLIST
 # `chmod -R u+w` first: one case makes a parent directory unwritable to force `rm -f` to fail, and
 # the suite must still be able to clean up after itself.
-# ⛔ THE STUB'S LIVENESS DOUBLE IS REAPED HERE, AND ONLY WHILE ITS COMMAND IS STILL `sleep` (#3900). The
-# systemctl shim below starts ONE long-lived `sleep` as the unit's MainPID, because the install verdict
-# requires a live MainPID (`install-controller-service.sh:1823`). A recorded pid can be RECYCLED between the
-# run and this trap, and killing whatever now owns it would be worse than leaking one sleeper — so the
-# command is re-checked before the kill, exactly as install-controller-service.test.sh's own cleanup does.
-trap 'HOME="$T/home" CELL_HOME="$T/home" TEMPLATES_DIR="$T/schedule-templates" python3 "$HERE/fleet-schedule.py" --stop >/dev/null 2>&1; _sp="$(cat "${SYSTEMCTL_MAINPID_STATE:-}" 2>/dev/null)"; case "${_sp:-}" in ""|*[!0-9]*) ;; *) [ "$(ps -o comm= -p "$_sp" 2>/dev/null)" = sleep ] && kill -9 "$_sp" 2>/dev/null ;; esac; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
+# ⛔ THE STUB'S LIVENESS DOUBLE IS REAPED HERE, AND ONLY WHILE ITS COMMAND IS STILL `sleep` (#3900). The suite
+# starts ONE long-lived `sleep` as the unit's MainPID, because the install verdict requires a live MainPID
+# (`install-controller-service.sh:1823`). A pid can be RECYCLED between the run and this trap, and killing
+# whatever now owns it would be worse than leaking one sleeper — so the command is re-checked before the kill,
+# exactly as install-controller-service.test.sh's own cleanup does.
+trap 'HOME="$T/home" CELL_HOME="$T/home" TEMPLATES_DIR="$T/schedule-templates" python3 "$HERE/fleet-schedule.py" --stop >/dev/null 2>&1; case "${STUB_UNIT_PID:-}" in ""|*[!0-9]*) ;; *) [ "$(ps -o comm= -p "$STUB_UNIT_PID" 2>/dev/null)" = sleep ] && kill -9 "$STUB_UNIT_PID" 2>/dev/null ;; esac; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
 
 if [ -f "$BRINGUP" ]; then ok "shipped script present: cloud-cell-bringup.sh"
 else bad "missing $BRINGUP"; echo; echo "  PASS=$PASS FAIL=$FAIL"; exit 1; fi
@@ -279,12 +279,21 @@ export SYSTEMCTL="$STUB/systemctl"
 # literal `1234` models a DEAD controller on any host where 1234 is free — measured 2026-11-11: this shard went
 # red on CI with `eldato-orchestrator.service is 'active' but its MainPID 1234 is NOT live`, 23 assertions, all
 # downstream of it — while a host that HAPPENS to have a live pid 1234 would pass the same arm for the wrong
-# reason (a fixture that grades the host's process table either way). So the shim starts ONE long-lived `sleep`
-# on its first `start` and records that pid, which is the shape install-controller-service.test.sh's double
+# reason (a fixture that grades the host's process table either way). So this suite starts ONE long-lived
+# `sleep` of its own and the shim ANSWERS that pid — the shape install-controller-service.test.sh's double
 # already uses (`:217-230`): a process alive ACROSS REPEATED installs, so the idempotency arms ("install twice
-# changes nothing") are not turned into a false RED by a pid tied to one invocation. Reaped by the EXIT trap.
-export SYSTEMCTL_MAINPID_STATE="$T/systemctl-mainpid"
-printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) _mp="$(cat "$SYSTEMCTL_MAINPID_STATE" 2>/dev/null)"; echo "MainPID=${_mp:-0}" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; if [ ! -f "$SYSTEMCTL_MAINPID_STATE" ]; then sleep 900 >/dev/null 2>&1 & echo "$!" > "$SYSTEMCTL_MAINPID_STATE"; fi; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
+# changes nothing") are not turned into a false RED by a pid tied to one invocation.
+# ⛔ THE SUITE OWNS THE PROCESS, THE SHIM ONLY REPORTS IT — and that is deliberate. First cut had the SHIM start
+# the sleeper and record it in a file, which leaked one orphan per run: MEASURED, an invocation whose state
+# variable did not reach the shim printed `cannot create : Directory nonexistent`, STARTED a `sleep 900` anyway
+# (`&` precedes the redirect failure) and left it with no record, so the trap reaped a file that was never
+# written. A process the SUITE starts is held in a shell variable, reaped by this shell's own EXIT trap, and
+# cannot be orphaned by any child's environment; if the value ever fails to reach the shim, the shim answers
+# `MainPID=` and the install refuses LOUDLY (the MainPID-0 arm) instead of leaking silently.
+sleep 900 >/dev/null 2>&1 &
+STUB_UNIT_PID=$!
+export SYSTEMCTL_MAINPID="$STUB_UNIT_PID"
+printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=${SYSTEMCTL_MAINPID:-}" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
                      # invocation and fails closed, blocking the suite from running at all.
