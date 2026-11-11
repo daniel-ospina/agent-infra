@@ -9930,10 +9930,18 @@ test("#2823: childLivenessFor — the pre-turn death is its own state, and the s
     "completed",
     "a heartbeat-less SUCCESS is still an answer (unarmed ⇒ no claim)",
   );
+  // ⛔ THE `UNCONFIRMED_END_STATES` MEMBER MUST BE ASSERTED THROUGH A ROW THAT CAN REACH IT
+  // (#2823 review cycle 2, ISSUE 2). The first version of this row passed `exitCode: null`, which
+  // disables Proof B outright — so it settled `exited-no-result`, a member that was ALREADY in the set
+  // on main, and it stayed green with the new member deleted. The fixture now reaches the new state and
+  // only the gate turns it into `running`: `exitCode: 2` + armed + zero markers proves no turn began.
+  const unexited = childLivenessFor({ details: { exitCode: 2 }, hbState: createHeartbeatState(), pid: 16, stdout: "", exited: false, heartbeatArmed: true });
+  equal(unexited.childState, "running", "an UN-EXITED child never gets a terminal-outcome claim (the round-8 gate, now reached by the NEW state)");
+  equal(unexited.childExited, false, "…and the payload says the same thing, so the two fields cannot disagree");
   equal(
-    childLivenessFor({ details: { exitCode: null }, hbState: createHeartbeatState(), pid: 16, stdout: "", exited: false, heartbeatArmed: true }).childState,
-    "running",
-    "an UN-EXITED child never gets a terminal-outcome claim (the round-8 gate covers the new state too)",
+    childLivenessFor({ details: { exitCode: 2 }, hbState: createHeartbeatState(), pid: 16, stdout: "", exited: true, heartbeatArmed: true }).childState,
+    "died-before-first-turn",
+    "the NEGATIVE twin: the identical measurement WITH a confirmed exit IS the terminal state",
   );
   equal(
     childLivenessFor({ details: { killed: true }, hbState: readyNoTurn, pid: 17, stdout: "partial", exited: true, heartbeatArmed: true }).childState,
@@ -10001,6 +10009,14 @@ test("#2823: childLivenessFor — the pre-turn death is its own state, and the s
       ok(
         snap.childState !== "died-before-first-turn" || snap.childMessagesSent === 0 || snap.childMessagesSent === null,
         `the field set cannot contradict itself: ${snap.childState} beside childMessagesSent=${String(snap.childMessagesSent)} (stdout=${stdout ? "yes" : "no"}, exited=${exited})`,
+      );
+      // ⛔ AND THE TERMINAL-CLAIM HALF, which the count clause above cannot see (#2823 review cycle 2,
+      // ISSUE 2): `childMessagesSent === null` satisfied the OR on its own, so this loop stayed green
+      // with the `UNCONFIRMED_END_STATES` member deleted. A death claim on a child the OS has not
+      // reported gone is the round-8 contradiction, and it is now asserted for EVERY shape.
+      ok(
+        exited || snap.childState !== "died-before-first-turn",
+        `an un-exited child must never carry a terminal death claim (got ${snap.childState}, exited=${exited})`,
       );
     }
   }

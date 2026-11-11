@@ -140,6 +140,15 @@ case "$SCENARIO" in
     echo "=== Results: 50 passed, 9 failed ===" >&2
     exit 2
     ;;
+  exit0-preturn-stdout)
+    #2823: the FALSE-PASS shape — the emitter reported life, no turn_start ever arrived, and text went
+    # to STDOUT before the prompt. The settle is a CLEAN SUCCESS (exit 0 + stdout), which is exactly the
+    # population that passes no reason to doResolve, so before #2823's second round it wrote ZERO rows
+    # while its payload carried isError: true.
+    echo "FAKE-PI-PRE-TURN-STDOUT"
+    m "ready nonce=$NONCE"
+    exit 0
+    ;;
   exit0-e-shape)
     # #5195 E shape: a child cycling turns that CARRY NO CONTENT, then exiting 0 with empty
     # stdout. Proves zero messages, so it is reclassified died-before-first-message and IS
@@ -639,6 +648,24 @@ test("#2823: a child that died before its first turn is recorded as such, not as
 	equal(rows[0].exitCode, 2, "the measured exit code still rides the row");
 });
 
+// ⛔ #2823 (review cycle 2, ISSUE 1): the DURABLE row was missing on the CLEAN-EXIT population. The row
+// write used to be gated on `opts.reason`, and the `cls === "success" && stdout` settle passes none —
+// so a pre-turn death that PRINTED and exited 0 wrote nothing at all into provider-failover.jsonl while
+// its payload said `isError: true`. Reverting the gate to `opts?.reason` alone reddens THIS row.
+test("#2823: the exit-0 pre-turn settle still writes its row — a clean exit is not a licence to vanish", async () => {
+	const d = await dispatch("exit0-preturn-stdout", {});
+	ok(d.value !== undefined, "settles with a payload");
+	const details = d.value!.details as Record<string, unknown>;
+	equal(details.childState, "died-before-first-turn", "stdout with no turn behind it is not an answer");
+	equal(details.isError, true, "…and the payload says so");
+	equal(details.exitCode, undefined, "the success arm carries no exitCode (the row must fall back to the OS's)");
+	const rows = outcomeRows(d.nonce);
+	equal(rows.length, 1, `exactly one row (got ${rows.length}) — a dispatch that failed at setup must be COUNTABLE`);
+	equal(rows[0].reason, "died-before-first-turn", "the durable surface names the death, not a success");
+	equal(rows[0].reason, details.status, "one settle, two surfaces, ONE claim");
+	equal(rows[0].exitCode, 0, "the OS exit code rides the row even though the settle passed none");
+});
+
 test("silent child at the HARD CAP writes exactly ONE row — even though the close path re-settles as 'cut'", async () => {
 	const d = await dispatch("cap-silent", { extraParentEnv: { TASK_HARD_CAP_MS: "60000", TASK_BACKSTOP_MS: "0" } });
 	ok(d.elapsedMs >= 60_000, `waited out the 60s hard-cap floor (${d.elapsedMs}ms)`);
@@ -806,7 +833,10 @@ section("structural pins — writer placement + attempt threading");
 test("writer is INSIDE doResolve immediately after `settled = true` (never at a call site)", () => {
 	const chokepoint = source.indexOf("if (settled) return;\n      settled = true;");
 	ok(chokepoint > 0, "the settle-once gate exists");
-	const writer = source.indexOf("if (opts?.reason) {", chokepoint);
+	// #2823 (review cycle 2, ISSUE 1): the gate is no longer `opts?.reason` alone — a PROVEN death writes
+	// a row whatever the settle path said, because the clean-exit arm passes no reason and a payload
+	// carrying `isError: true` with no row is the silent loss this file exists to prevent.
+	const writer = source.indexOf("if (opts?.reason || measuredDeathReason) {", chokepoint);
 	const firstDisarm = source.indexOf("exitWatchdog.disarm();", chokepoint);
 	ok(writer > chokepoint && writer < firstDisarm, "the row writer sits inside the gate, right after settled = true");
 	ok(source.includes("if (!dispatchLedgerEnabled(subAgentEnv)) return { ok: false, path: \"\", skipped: true };"));
@@ -848,8 +878,8 @@ test("#783 review: the spawn-error settle records a row — the abnormal populat
 	// than left standing — a false coverage claim is the same defect class this
 	// cycle fixed elsewhere.) The source pin below is non-vacuous: removing the
 	// reason from the settle fails it.
-	const chokepoint = source.indexOf("if (opts?.reason)");
-	ok(chokepoint > 0, "the row gate still keys on opts.reason");
+	const chokepoint = source.indexOf("if (opts?.reason || measuredDeathReason) {");
+	ok(chokepoint > 0, "the row gate exists at the doResolve choke point (opts.reason OR a measured death)");
 	// Anchor on the HANDLER LINE, not the bare call spelling: a doc comment that quotes
 	// `proc.on("error")` matched first and the probe then walked to the WRONG settle
 	// (measured: char 107789 vs the handler's 250973, so the assertion read the hard-cap

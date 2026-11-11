@@ -5054,23 +5054,31 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // be repaired. `settled` is the only gate that guarantees exactly-once,
       // and the cut-with-output arm is covered here too (a call-site writer
       // would miss it, leaving that population uncountable).
-      if (opts?.reason) {
+      // ⛔ THE MEASUREMENT DECIDES WHETHER A ROW EXISTS, NOT ONLY WHAT IT SAYS (#2823 review cycle 2,
+      // ISSUE 1). The gate used to be `opts?.reason` alone, and the two arm that settle a child that
+      // PRINTED and exited cleanly (`cls === "success" && stdout` and `sessionEnded`) pass no reason —
+      // so a pre-turn death on the stdout-bearing arm (the PR's own headline false-PASS shape) wrote
+      // ZERO rows: `isError: true` + `status: died-before-first-turn` in the payload and nothing at all
+      // in `provider-failover.jsonl`. That is precisely the "clean-empty still writes a row because it
+      // is indistinguishable from a silent loss to a ledger reader" rule above, broken one arm over —
+      // and it was unreachable for the older state, whose `!hasStdout` condition always settled through
+      // `clean-empty` (which does pass a reason). A proven death writes a row WHATEVER the settle path
+      // said, so the durable surface cannot go missing on a payload that carries `isError`.
+      const measuredDeathReason =
+        livenessSnapshot.childState === "died-before-first-message"
+          ? "died-before-first-message"
+          : livenessSnapshot.childState === "died-before-first-turn"
+            ? "died-before-first-turn"
+            : undefined;
+      if (opts?.reason || measuredDeathReason) {
         const transcriptPath = resolveTranscript();
         // ⛔ THE MEASUREMENT OUTRANKS THE SETTLE PATH (review round 10, P3). A proven zero-message
         // death is not "success", and `clean-empty` is the label this block documents as one. The
         // row's reason is the SAME claim the payload makes, derived from the same snapshot.
-        const rowReason =
-          livenessSnapshot.childState === "died-before-first-message"
-            ? "died-before-first-message"
-            : livenessSnapshot.childState === "died-before-first-turn"
-              ? // #2823: the row reason follows the SAME two-surface rule as `died-before-first-message`
-                // (review round 10, P3): the label chosen by the settle path is decided before the child
-                // is measured, so a pre-turn death reached through the `non-zero-exit` arm would be
-                // durably recorded as an ordinary failure while the payload said the text was never the
-                // child's — one settle, two surfaces, two claims.
-                "died-before-first-turn"
-              : opts.reason;
-        const recordResult = writeOutcomeRow(rowReason, opts.exitCode ?? null, transcriptPath);
+        const rowReason = measuredDeathReason ?? opts?.reason ?? "failed";
+        // The exit code: the settle path's own value when it carries one, else the OS's
+        // (`proc.exitCode` is set on every exit/close settle — the reason-less arms included).
+        const recordResult = writeOutcomeRow(rowReason, opts?.exitCode ?? proc.exitCode ?? null, transcriptPath);
         if (value && typeof value === "object") {
           const details: Record<string, unknown> = { ...(value.details ?? {}), transcriptPath };
           // Never name a path when nothing was written: an unwritable/full
