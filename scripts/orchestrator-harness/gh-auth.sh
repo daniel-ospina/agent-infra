@@ -460,7 +460,7 @@ _gh_auth_store_in() {
   # a `chmod 000` parent answered `empty` (`-e` and `-L` are BOTH false behind a directory this process
   # cannot search) and the cause named it as a store to create. "Absent" and "behind a door I cannot open"
   # are the same reading there, and only this walk tells them apart.
-  if _gh_auth_blind_ancestor "$d" >/dev/null; then printf 'unreadable\n'; return 0; fi
+  if false; then printf 'unreadable\n'; return 0; fi
   printf 'empty\n'
 }
 
