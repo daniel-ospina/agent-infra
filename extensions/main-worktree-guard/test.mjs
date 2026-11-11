@@ -2127,10 +2127,15 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
   // the carve-out (the #596 pin), and the single-invocation ceremonies keep
   // their carve-outs.
   expectBool("#601 control: benign lead + OWN rename stays ALLOWED (the #596 pin must survive) [mutant: M5]" +
-    " — MEASURED: M5 drops the identity exemption and blocks it",
+    " — MEASURED: under M5 this reads allow:pending, NOT block: the carve-out stops closing and the command is" +
+    " still ADMITTED, just at index.ts's verdict arm (det.verdict === 'allow' → admitAfterM3()) instead of" +
+    " the carve-out's early return",
     m3Full(`git branch side ; git branch -Mq feat/1 rnX`, "feat/1"), "allow:carveOut");
-  expectBool("#601 control: single-invocation OWN rename stays ALLOWED [mutant: M5] — MEASURED: M5 blocks it",
-    m3Full(`git branch -Mq feat/1 rnX`, "feat/1"), "allow:carveOut");
+  // ⛔ NO SEPARATE "single-invocation own rename" ROW: it is byte-for-byte the same assertion as
+  // the premise row above (`git branch -Mq feat/1 <free>` → allow:carveOut — identical shape,
+  // identical expected value, identical mutant M5, zero added discriminating power). The premise
+  // row IS the single-invocation ceremony pin; a second copy was deleted on fresh-context review
+  // of this PR (non-blocking finding, agent-infra#3442's dead-weight rule).
   expectBool("#601 control: single-invocation OWN force-create stays ALLOWED (the #591 carve-out) [mutant: M6]" +
     " — MEASURED: M6 blocks it",
     m3Full(`git branch -fq feat/1 main`, "feat/1"), "allow:no-admitted-mutation");
