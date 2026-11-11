@@ -4135,8 +4135,15 @@ export function classifyGitCommandDetailed(command) {
       // echo/comment over-match (a text that merely MENTIONS a complete
       // `git push … --delete <target>` also populates targets; sibling-
       // conditional safe-direction, consistent with the frozen --delete
-      // echo precedent). Parenthesized later segments (`(git push … -d c)`) are
-      // a tracked residual (token-level paren suffix).
+      // echo precedent). Parenthesized later segments (`(git push … --delete c)`)
+      // WERE the tracked residual — the token-level paren suffix leaked into the
+      // target as `c)` — and are now attributed by the shared extractor
+      // `_pushSegmentTokens`, so this fold-in covers them (pinned by test.mjs's
+      // "parenthesized later-segment --delete → real target only"). The
+      // `-d`/`--del` spelling is NOT served here: the FROZEN legacy regex knows
+      // only `--delete`/`:ref`, so such a compound keeps the `block:push`
+      // verdict and is served by `wholeCommandDeleteTargets`, not by this gated
+      // fold-in.
       if (deleteIdx === -1 && !hasColonTargets) {
         out.pushTargets = extractPushDeleteBranch(String(command)) ?? [];
       }
