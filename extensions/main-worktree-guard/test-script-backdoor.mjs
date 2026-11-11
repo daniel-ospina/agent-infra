@@ -499,6 +499,17 @@ async function partB() {
       allowed(await bash(`cat <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was blocked");
     expectTrue("B7j (#523) control: `bash <<EOF script.sh` — the body is the script's STDIN DATA, not a program",
       allowed(await bash(`bash "${layoutDump}" <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was blocked");
+    // ⛔ THE ARGV-ONLY-BRANCH HOLE (found auditing this change, measured fail-OPEN).
+    // A body-resolved path's argv is NOT on the command line: the raw tokens after it are the
+    // heredoc DELIMITER and the rest of the program, so `extractScriptArgs` reported `$1 = "EOF"`
+    // — which pruned a `case "$1" in "")` branch as UNREACHABLE while the body really calls the
+    // script with NO args and runs it. The verdict must not depend on argv the shell never sees.
+    const caseEvil = join(work, "body-case-evil.sh");
+    writeFileSync(caseEvil, `#!/bin/bash\ncase "$1" in\n  "") git -C "${hub}" ${RESET_VERB} ;;\nesac\n`);
+    expectTrue("B7k (#523): a body-executed script whose mutation is an argv branch does NOT ride a phantom `$1`",
+      blocked(await bash(`bash <<EOF\n"${caseEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7l (#523) control: the SAME script run with an explicit non-matching arg stays ALLOWED (reachability still works)",
+      allowed(await bash(`bash "${caseEvil}" --status`, hub)), "was blocked");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });

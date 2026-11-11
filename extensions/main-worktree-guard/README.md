@@ -2444,7 +2444,13 @@ the body is its stdin DATA), and a DATA body (`cat <<EOF`), a CODE body
 (`python3 <<PY`, the #627 surface) and an unterminated/absent heredoc are not
 walked. A body-executed path also forces the via-interpreter verdict: bash reads
 an ENOEXEC file as a shell script, so #1485's opaque-binary stand-down must not
-apply to it.
+apply to it — and its ARGV is passed as UNKNOWN (`null`) rather than derived
+from the command line, because the raw tokens after a body line are the heredoc
+DELIMITER and the rest of the program: measured fail-OPEN with them, since
+`bash <<EOF` + `"/tmp/x.sh"` reported `$1 = "EOF"` and pruned a
+`case "$1" in "") git reset --hard` branch as unreachable while the body really
+calls the script with NO args and runs it. Unknown argv makes the reachability
+filter bail and the whole script gate.
 **Declared residuals of this arm** (each fails toward gating, never away): the
 command LINE itself still contributes ONE script (the one-script-per-command-line
 class is #3538, unchanged here); a `<<` terminator is matched with `trim()`

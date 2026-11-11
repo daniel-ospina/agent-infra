@@ -5120,7 +5120,14 @@ function _gateScriptPathContent(command: string, scriptPath: string, execCwd: st
     // DIFFERENT subcommand reaches cannot gate this one (e.g. `--probe` must
     // not be blocked by a `--reset`-only discard). [] is a real argv (no args)
     // — `$1` is then provably empty; undefined would be "unknown".
-    const scriptArgs = extractScriptArgs(command, scriptPath);
+    // ⛔ #523: a BODY-resolved path's argv is NOT on the command line — the raw
+    // tokens after it are the heredoc DELIMITER and the rest of the program.
+    // Measured fail-OPEN when they were used: `bash <<EOF` + `"/tmp/x.sh"` (no
+    // args) yielded `$1 = "EOF"`, so a `case "$1" in "") git reset --hard`
+    // branch was pruned as UNREACHABLE while the body really calls the script
+    // with NO args and runs it. A body invocation's argv is unknown here, so it
+    // is `null` → the reachability filter bails and the WHOLE script gates.
+    const scriptArgs = viaBody ? null : extractScriptArgs(command, scriptPath);
     // #1129 — the framework's OWN sanctioned scripts are exempted before the
     // content walk (see SANCTIONED_SCRIPT_RELPATHS for why this is a named
     // list keyed on the guard's own checkout). Deliberate gate relaxation →
