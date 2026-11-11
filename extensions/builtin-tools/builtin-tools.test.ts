@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, describeSpawnFailure, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childNeverBeganTurn, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome, readMarkerAge, decisionSnapshotStale, supersedingEvidence, repoStateReportText, repoStateSnapshotStale, isNotYetStarted } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, describeSpawnFailure, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childNeverBeganTurn, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome, hbEmitterLiveFor, readMarkerAge, decisionSnapshotStale, supersedingEvidence, repoStateReportText, repoStateSnapshotStale, isNotYetStarted } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState, syncRepoState, countCommitsBetween } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -10028,6 +10028,37 @@ test("#2823: the dispatch record names the pre-turn death instead of a generic f
   equal(c.reason, "died-before-first-turn", "the reason names the cause, so a lane reading the record is not left with `non-zero-exit`");
 });
 
+test("#2823 (DRIFT): the parent's 'emitter LIVE' premise IS the emitter's own gate, term for term", () => {
+  // ⛔ #2823 review cycle 3, ISSUE 1. Proof B is only sound if "the parent armed the emitter" means the
+  // child's EMITTER actually ran. The parent cannot observe that directly; it can only read the env it
+  // is about to hand the child. So the premise must be the emitter's OWN gate — read from the child
+  // module, never restated here — over that env. If EITHER side changes (a new term in
+  // `taskHeartbeatActive`, or the parent loosening back to `TASK_HEARTBEAT === "1"`), this row reddens
+  // by name instead of the class silently reappearing as "zero markers ⇒ it never reached session_start".
+  const cases: Array<Record<string, string | undefined>> = [
+    { TASK_HEARTBEAT: "1", PI_MODE: "print" }, // the real task-tool env: LIVE
+    { TASK_HEARTBEAT: "1" }, // identity marker only, no PI_MODE → emitter inert
+    { TASK_HEARTBEAT: "1", PI_MODE: "interactive" }, // wrong mode → inert
+    { TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "1" }, // ejected by the subagent tool
+    { TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "0" }, // any value but "1" leaves it live
+    { PI_MODE: "print" }, // no identity marker → never armed
+    {}, // nothing
+  ];
+  for (const env of cases) {
+    equal(
+      hbEmitterLiveFor(env),
+      childHb.taskHeartbeatActive(env),
+      `parent and emitter disagree on ${JSON.stringify(env)} — the parent's 'armed' claim must BE the emitter's gate`,
+    );
+  }
+  equal(hbEmitterLiveFor({ TASK_HEARTBEAT: "1", PI_MODE: "print" }), true, "the real task-tool env really is armed-and-live");
+  equal(
+    hbEmitterLiveFor({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "1" }),
+    false,
+    "…and a child whose emitter was ejected is NOT armed, so zero markers prove nothing about it",
+  );
+});
+
 // ── #2823 E2E: the SETUP-FAILURE child, driven through the REAL funnel ────────
 // Measured shape (this lane, twice): an extension/session_start hook dies, stdout is EMPTY, the
 // diagnostic lands on STDERR, exit 2, and NO heartbeat marker is ever emitted. This is the payload
@@ -10055,7 +10086,9 @@ async function dispatchWithShim(shim: string, tag: string) {
     process.env.PATH = `${shimDir}:${savedPath}`;
     process.argv[1] = undefined as unknown as string;
     process.env.DISPATCH_LEDGER = "0";
-    const env: Record<string, string | undefined> = { ...process.env, PATH: process.env.PATH, TASK_HEARTBEAT: "1", DISPATCH_LEDGER: "0" };
+    // PI_MODE=print is part of the REAL task-tool child env (index.ts subAgentEnv): the emitter gates on
+    // it too, so omitting it would make "the emitter was armed and silent" true for the wrong reason.
+    const env: Record<string, string | undefined> = { ...process.env, PATH: process.env.PATH, TASK_HEARTBEAT: "1", PI_MODE: "print", DISPATCH_LEDGER: "0" };
     return await spawnSubAgent("deepseek-v4-flash", "deepseek", env, ["-p", "--no-session", "do nothing"]);
   } finally {
     process.env.PATH = savedPath;
@@ -10098,6 +10131,51 @@ testAsync("#2823 (E2E): stdout with NO turn behind it is not an answer either (t
   equal(d.childMessagesSent, 0, "the stdout floor is skipped: `0 messages`, not a contradiction");
   ok(text.includes("died before its first turn"), "the header is present on the exit-0 arm too");
   ok(text.includes("=== Results: 50 passed, 9 failed ==="), "the text is still shown, as a diagnostic");
+});
+
+testAsync("#2823 (E2E): a DISABLED emitter is not a silent child — no marker means nothing, so the answer is the answer", async () => {
+  // ⛔ THE POPULATION THE 'ARMED' FLAG USED TO MISREAD (#2823 review cycle 3, ISSUE 1). The task tool sets
+  // TASK_HEARTBEAT=1 unconditionally, and the subagent tool forces TASK_HEARTBEAT_DISABLE=1 into every
+  // child it spawns — so `hbEnabled` is true while the emitter is OFF by design and emits zero markers
+  // for the whole dispatch. If that silence were read as "never reached session_start", a child that ran
+  // real turns, answered on stdout and exited non-zero would be declared a setup failure, its answer
+  // quarantined, and a false cause recorded. Driven through the REAL funnel: the shim emits NO markers,
+  // prints the answer, exits 3.
+  const dir = mkdtempSync(join(tmpdir(), "t2823-hboff-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(join(shimDir, "pi"), `#!/bin/sh\necho "THE REAL ANSWER: 412 passed, 0 failed"\nexit 3\n`, { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.argv[1] = undefined as unknown as string;
+    process.env.DISPATCH_LEDGER = "0";
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: process.env.PATH,
+      TASK_HEARTBEAT: "1",
+      PI_MODE: "print",
+      TASK_HEARTBEAT_DISABLE: "1",
+      DISPATCH_LEDGER: "0",
+    };
+    const res = await spawnSubAgent("deepseek-v4-flash", "deepseek", env, ["-p", "--no-session", "do nothing"]);
+    ok(res, "settles");
+    const d = (res as any).details as Record<string, unknown>;
+    const text = String((res as any).content?.[0]?.text ?? "");
+    ok(d.childState !== "died-before-first-turn", `a disabled emitter must never produce a pre-turn death claim (got ${String(d.childState)})`);
+    equal(d.isError, undefined, "…and it must not be flagged as a setup failure");
+    ok(!text.includes("died before its first turn"), "…and the header must not assert a setup failure that did not happen");
+    ok(text.includes("THE REAL ANSWER"), "the child's output is delivered as the result, not quarantined as a diagnostic");
+    equal(d.sawToolsUnknown, true, "the parent still STATES that marker evidence is missing (the honest half)");
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER;
+    else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 section("#1208 E2E: the REAL spawnSubAgent funnel stamps liveness on every settled result");

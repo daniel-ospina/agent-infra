@@ -4588,6 +4588,25 @@ export interface SpawnObservers {
   logPath?: string;
 }
 
+/** #2823 (review cycle 3, ISSUE 1): is the child's heartbeat EMITTER live for this dispatch?
+ *
+ * `TASK_HEARTBEAT === "1"` is NOT the answer, and treating it as one is a false-attribution bug. The
+ * task tool sets `TASK_HEARTBEAT` UNCONDITIONALLY, deliberately, as the sub-agent IDENTITY marker
+ * (`isTaskSubAgent`); the emitter's own gate is three-term — `TASK_HEARTBEAT === "1" && PI_MODE ===
+ * "print" && TASK_HEARTBEAT_DISABLE !== "1"` (`taskHeartbeatActive` in `extensions/task-heartbeat.ts`).
+ * The subagent tool forces `TASK_HEARTBEAT_DISABLE: "1"` into every child it spawns (`extensions/
+ * subagent/index.ts`), and any lane/operator exporting it does the same — so a child can carry the
+ * identity marker and emit ZERO markers BY DESIGN for its whole life. Reading that silence as "it
+ * never reached session_start" relabels a real answer as a setup failure, the direction this change
+ * ranks as the worse error.
+ *
+ * This mirrors the emitter's gate term-for-term so the parent claims only what it can honestly claim;
+ * a drift row (`builtin-tools.test.ts`, "the parent's 'emitter live' premise IS the emitter's own
+ * gate") compares the two over a truth table, so a change on either side reddens by name. */
+export function hbEmitterLiveFor(env: Record<string, string | undefined>): boolean {
+  return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print" && env.TASK_HEARTBEAT_DISABLE !== "1";
+}
+
 export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal, record?: DispatchRecordContext, cwd?: string, streamStallMs?: number, observers?: SpawnObservers): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
   // #1071: refuse an unspawnable target BEFORE the promise below — a
   // synchronous `spawn` throw would reject it with no `spawn-error` row and no
@@ -4647,6 +4666,12 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // [provider-exhaustion] marker authentication); absent one, a fresh nonce
     // is generated here (legacy behavior).
     const hbEnabled = subAgentEnv.TASK_HEARTBEAT === "1";
+    // ⛔ "ARMED" IS NOT "LIVE" (#2823 review cycle 3, ISSUE 1). The premise Proof B needs is that the
+    // child's EMITTER ran — not that a marker variable is in the env. `hbEnabled` is the latter (the
+    // task tool sets TASK_HEARTBEAT unconditionally as the sub-agent identity marker), and reading an
+    // ejected emitter's silence as "it never reached session_start" relabels a real answer as a setup
+    // failure. The gate, its reason and its drift row live in `hbEmitterLiveFor` above.
+    const hbEmitterLive = hbEmitterLiveFor(subAgentEnv);
     const hbNonce = hbEnabled ? subAgentEnv.TASK_HEARTBEAT_NONCE || randomBytes(6).toString("hex") : "";
     const spawnEnv = hbEnabled
       ? { ...subAgentEnv, TASK_HEARTBEAT_NONCE: hbNonce }
@@ -5037,8 +5062,9 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         stdout,
         exited: proc.exitCode !== null || proc.signalCode !== null,
         // #2823: WITHOUT this, zero markers reads as "the child ran and said nothing" instead of
-        // "the emitter never ran, so the child never reached session_start".
-        heartbeatArmed: hbEnabled,
+        // "the emitter never ran, so the child never reached session_start". The LIVE flag, not
+        // `hbEnabled` — see its definition.
+        heartbeatArmed: hbEmitterLive,
         // The `undefined` settles carry no payload, so the kill is named by the REASON that
         // settled them. `failed` / `clean-empty` / `spawn-error` are not kills.
         killedByReason: opts?.reason !== undefined && !NON_KILL_SETTLE_REASONS.has(opts.reason),
@@ -5215,7 +5241,11 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
             .trim();
           details.status = "died-before-first-turn";
           details.isError = true;
-          const exit = details.exitCode ?? "not recorded";
+          // ⛔ THE TWO SURFACES MUST AGREE ON THE EXIT CODE (review cycle 3, ISSUE 3 — the declared T3).
+          // The durable row reads `opts?.exitCode ?? proc.exitCode ?? null`, and the reason-less settles
+          // (the exit-0 arm above all) carry no `details.exitCode` — so the header said "not recorded"
+          // about a death whose code the ledger had just written. Same fallback here.
+          const exit = details.exitCode ?? proc.exitCode ?? "not recorded";
           const seen = hbCtx.state.sawReady || hbCtx.state.markerCount > 0;
           const why = seen
             ? "the heartbeat emitter reported life and never reported a turn, so the child exited between " +
