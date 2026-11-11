@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-458-1794394302-p1409025-807fc938",
+  "_sha": "176c7bebfbebe2b0631c426e45aca0a0aa1c160a",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-458.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/458-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "588f1669a43b5eef833c0ded3b6a9a641a02f6db"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/tm-458"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 6994,
+  "ended_at": 1794401296,
+  "exit_code": 0,
+  "heartbeat_at": 1794401296,
+  "host": "cmux",
+  "issue": 458,
+  "kind": "lane",
+  "lane_id": "cmux.klane-458-1794394302-p1409025-807fc938",
+  "lease_until": 1794409096,
+  "pid": 1409025,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794394302,
+  "state": "DONE",
+  "tag": "458",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-458"
+}
