@@ -6027,7 +6027,17 @@ export default function (pi: ExtensionAPI) {
           ? det.stateMutations
           : [{ verb: det.stateVerb, args: det.stateArgs, invVisible: det.stateInvVisible !== false, hints: det.stateHints }];
         for (const mu of mutations) {
-          const branchOp = branchOwnership.classifyBranchOp(mu.verb ?? det.verb, mu.args ?? det.verbArgs);
+          const branchOp = branchOwnership.classifyBranchOp(mu.verb ?? det.verb, mu.args ?? det.verbArgs, {
+            // #594 Finding 1: the invocation is an ALIAS/external-subcommand
+            // indirection whose definition is not statically visible (`git br`
+            // from persisted config, `git -c alias.x=$VAR x`, a `git-foo`
+            // command). git expands it inside its own process, so no arm here
+            // can name the command that runs — decideM3 refuses it in a shared
+            // main checkout (fail closed). classifyBranchOp is told, rather
+            // than the refusal living here, so there is still ONE verdict
+            // function and the worktree exemption above keeps applying.
+            aliasOpaque: mu.aliasOpaque === true,
+          });
           if (!branchOp || branchOp.op === "other") continue;
           // Resolve THIS mutation's repo: the classifier's own boundary-aware
           // hints (visible spellings); extractor-invisible spellings

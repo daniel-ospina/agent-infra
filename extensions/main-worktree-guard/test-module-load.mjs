@@ -394,6 +394,41 @@ async function partB() {
     expectTrue("B6b: `git reset --hard` is blocked by the loaded extension end-to-end",
       !!reset && reset.block === true, `handler returned ${JSON.stringify(reset)}`);
 
+    // ── B10: #594 — the git ALIAS indirection layer and the untracked
+    //    ref-write forms are GATED end-to-end (probe-verified bypasses: each of
+    //    these moved a branch ref rc 0 while the pre-#594 classifier returned
+    //    verdict "allow" + branchState false, so no arm ever ran) ──
+    const aliasVisible = await callBash("git -c alias.co='checkout victim' co");
+    expectTrue("B10a: #594 a statically-visible alias invocation is BLOCKED (the alias is EXPANDED)",
+      !!aliasVisible && aliasVisible.block === true,
+      `handler returned ${JSON.stringify(aliasVisible)} — the walk classified verb "co" instead of "checkout"`);
+    const aliasPersist = await callBash("git config alias.x 'branch -fq victim main' && git x");
+    expectTrue("B10b: #594 persist-then-invoke alias (`git config alias.x … && git x`) is BLOCKED",
+      !!aliasPersist && aliasPersist.block === true, `handler returned ${JSON.stringify(aliasPersist)}`);
+    const aliasOpaque = await callBash("git br");
+    expectTrue("B10c: #594 an alias whose definition is NOT visible (persisted config) is BLOCKED, naming the indirection",
+      !!aliasOpaque && aliasOpaque.block === true && /alias/i.test(String(aliasOpaque.reason ?? aliasOpaque.message ?? "")),
+      `handler returned ${JSON.stringify(aliasOpaque)}`);
+    const aliasBenign = await callBash("git -c alias.lg='log --graph' lg");
+    expectTrue("B10d: control — a READ-ONLY visible alias expands to `log` and stays ALLOWED",
+      aliasBenign === undefined, `handler returned ${JSON.stringify(aliasBenign)}`);
+    const symRefWrite = await callBash("git symbolic-ref refs/heads/victim2 refs/heads/main");
+    expectTrue("B10e: #594 `git symbolic-ref refs/heads/<b> <target>` is BLOCKED",
+      !!symRefWrite && symRefWrite.block === true && /Ref write blocked/.test(String(symRefWrite.reason ?? "")),
+      `handler returned ${JSON.stringify(symRefWrite)}`);
+    const updateStdin = await callBash("git update-ref --stdin");
+    expectTrue("B10f: #594 `git update-ref --stdin` is BLOCKED (refs named on stdin)",
+      !!updateStdin && updateStdin.block === true, `handler returned ${JSON.stringify(updateStdin)}`);
+    const updateMsg = await callBash("git update-ref -m why refs/heads/victim3 HEAD");
+    expectTrue("B10g: #594 `git update-ref -m <reason> refs/heads/<b>` is BLOCKED (the -m VALUE is not a ref)",
+      !!updateMsg && updateMsg.block === true, `handler returned ${JSON.stringify(updateMsg)}`);
+    const symRefQuery = await callBash("git symbolic-ref HEAD");
+    expectTrue("B10h: control — a bare `git symbolic-ref HEAD` QUERY stays ALLOWED",
+      symRefQuery === undefined, `handler returned ${JSON.stringify(symRefQuery)}`);
+    const symRefRead = await callBash("git symbolic-ref refs/heads/main");
+    expectTrue("B10i: control — `git symbolic-ref refs/heads/main` (single positional = QUERY) stays ALLOWED",
+      symRefRead === undefined, `handler returned ${JSON.stringify(symRefRead)}`);
+
     // ── B9: #1144 — the shared-baseline sync allowance is EFFECT-shaped ──
     // The allowance is BASELINE-keyed, so the session baseline must be
     // recorded exactly as a real session records it: fire the registered

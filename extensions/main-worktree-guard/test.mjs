@@ -935,6 +935,73 @@ dexpect("symbolic-ref origin → not branchState", `git symbolic-ref refs/remote
 const updTag = classifyGitCommandDetailed(`git update-ref refs/tags/v1 HEAD`);
 dexpect("update-ref tag → not branchState", `git update-ref refs/tags/v1 HEAD`, { branchState: false });
 
+// ── #594 Finding 1: git ALIAS invocation is an indirection the walk must follow ──
+// Measured bypass (probe-verified rc 0, git 2.43): `git -c alias.br='branch -fq
+// victim main' br` moves a FOREIGN branch while the walk reported verb "br" —
+// unknown, not branch-state → verdict allow, branchState false, M3 never
+// entered. statically-visible aliases are now EXPANDED into the walk; aliases
+// whose VALUE is not visible fail closed.
+dexpect("#594 alias -c: checkout alias EXPANDS → block:checkout-branch + branchState",
+  `git -c alias.co='checkout victim' co`,
+  { verdict: "block:checkout-branch", verb: "checkout", branchState: true });
+dexpect("#594 alias -c: branch force-create alias EXPANDS → branchState, branch args",
+  `git -c alias.br='branch -fq victim main' br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victim", "main"], aliasOpaque: false });
+dexpect("#594 alias via --config: same expansion",
+  `git --config alias.sw='switch --discard-changes main' sw`,
+  { branchState: true, stateVerb: "switch" });
+dexpect("#594 persist-then-invoke in ONE command: `git config alias.x … && git x` EXPANDS",
+  `git config alias.x 'branch -fq victim main' && git x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victim", "main"] });
+dexpect("#594 GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n definition EXPANDS",
+  `GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victim main' git br`,
+  { branchState: true, verb: "branch" });
+dexpect("#594 --config-env resolves against the statement's own env prefix",
+  `AL='checkout victim' git --config-env=alias.co=AL co`,
+  { verdict: "block:checkout-branch", verb: "checkout", branchState: true });
+dexpect("#594 a BENIGN visible alias expands (log) and stays harmless",
+  `git -c alias.lg='log --graph' lg`,
+  { verdict: "allow", verb: "log", branchState: false, aliasOpaque: false });
+// fail-closed arms: the definition is NOT statically visible (persisted config),
+// it is a `!` shell alias, or its env value cannot be resolved.
+dexpect("#594 persisted-config alias invocation → aliasOpaque + branchState (fail closed)",
+  `git br`, { aliasOpaque: true, branchState: true });
+dexpect("#594 external subcommand (`git lfs`) → aliasOpaque (git resolves git-lfs)",
+  `git lfs pull`, { aliasOpaque: true, branchState: true });
+dexpect("#594 `!` shell-command alias → aliasOpaque (arbitrary shell text)",
+  `git -c alias.s='!git checkout main' s`, { aliasOpaque: true, branchState: true });
+dexpect("#594 unresolvable --config-env alias value → aliasOpaque (fail closed)",
+  `git --config-env=alias.co=SOME_UNSET_VAR_594 co`, { aliasOpaque: true, branchState: true });
+dexpect("#594 opaque alias is exposed in stateMutations for the M3 gate",
+  `git br`, { stateMutations: [{ verb: "br", args: [], aliasOpaque: true, aliasName: "br", invVisible: true, hints: { cdChain: [], cHints: [], gitDirHint: null, vars: {} } }] });
+
+// ── #594 Finding 2: symbolic-ref refs/heads/<b> + the -m/--stdin channels ──
+// `git symbolic-ref refs/heads/victim refs/heads/main` re-points an EXISTING
+// branch ref rc 0 (probe-verified) while the old classifier only ever named
+// `HEAD` as branch state → op "other" → M3 skipped entirely.
+dexpect("#594 symbolic-ref refs/heads/<b> write → branchState",
+  `git symbolic-ref refs/heads/victim refs/heads/main`,
+  { branchState: true, stateVerb: "symbolic-ref" });
+dexpect("#594 symbolic-ref -d refs/heads/<b> (delete) → branchState",
+  `git symbolic-ref -d refs/heads/victim`, { branchState: true });
+dexpect("#594 symbolic-ref QUERY (one positional) stays non-branch-state",
+  `git symbolic-ref refs/heads/main`, { branchState: false });
+dexpect("#594 symbolic-ref bare HEAD QUERY stays non-branch-state",
+  `git symbolic-ref HEAD`, { branchState: false });
+// `-m <reason>` consumes the NEXT argv: a naive non-flag scan read the REASON as
+// the first positional, so the write looked like a query of a ref named after
+// the message (probe-verified rc 0 for both verbs).
+dexpect("#594 symbolic-ref -m <reason> refs/heads/<b> write → branchState (value slot)",
+  `git symbolic-ref -m why refs/heads/victim refs/heads/main`, { branchState: true });
+dexpect("#594 symbolic-ref -m <reason> HEAD <ref> write → branchState (value slot)",
+  `git symbolic-ref -m why HEAD refs/heads/feat/x`, { branchState: true });
+dexpect("#594 update-ref -m <reason> refs/heads/<b> write → branchState (value slot)",
+  `git update-ref -m why refs/heads/victim HEAD`, { branchState: true });
+dexpect("#594 update-ref --stdin → branchState (refs arrive on stdin)",
+  `git update-ref --stdin`, { branchState: true });
+dexpect("#594 update-ref refs/tags with -m stays non-branch-state (control)",
+  `git update-ref -m why refs/tags/v1 HEAD`, { branchState: false });
+
 // commit matcher (commit-graph/commit-tree EXCLUDED)
 dexpect("commit → block:commit", `git commit -m x`, { verdict: "block:commit", verb: "commit" });
 dexpect("add+commit → block:commit (detailed)", `git add . && git commit -m 'x'`, { verdict: "block:commit" });

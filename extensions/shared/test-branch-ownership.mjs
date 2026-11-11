@@ -429,6 +429,50 @@ ok("branchOp: symbolic-ref HEAD", op("symbolic-ref", ["HEAD", "refs/heads/x"]) =
 ok("branchOp: symbolic-ref origin", op("symbolic-ref", ["refs/remotes/origin/HEAD", "refs/heads/main"]) === "other");
 ok("branchOp: update-ref refs/heads", op("update-ref", ["refs/heads/x", "HEAD"]) === "switch-existing");
 ok("branchOp: update-ref tag", op("update-ref", ["refs/tags/v1", "HEAD"]) === "other");
+// ── #594 Finding 2: the WRITE form, positionally precise ──
+// `git symbolic-ref refs/heads/<b> <target>` re-points an existing branch ref
+// rc 0 (probe-verified) without touching any checkout — its own op, because
+// "switch-existing" would let the #376 return-to-original arm RE-BASELINE the
+// session onto a branch it never checked out.
+const symRefOp = (args) => classifyBranchOp("symbolic-ref", args);
+ok("branchOp #594: symbolic-ref refs/heads/<b> <target> → ref-write(b)", (() => {
+  const r = symRefOp(["refs/heads/victim", "refs/heads/main"]);
+  return r.op === "ref-write" && r.target === "victim";
+})());
+ok("branchOp #594: symbolic-ref -d refs/heads/<b> → ref-write(b)", (() => {
+  const r = symRefOp(["-d", "refs/heads/victim"]);
+  return r.op === "ref-write" && r.target === "victim";
+})());
+ok("branchOp #594: symbolic-ref --del prefix → ref-write(b)", (() => {
+  const r = symRefOp(["--del", "refs/heads/victim"]);
+  return r.op === "ref-write" && r.target === "victim";
+})());
+ok("branchOp #594: symbolic-ref refs/heads/<b> alone is a QUERY → other", op("symbolic-ref", ["refs/heads/main"]) === "other");
+ok("branchOp #594: symbolic-ref HEAD alone is a QUERY → other", op("symbolic-ref", ["HEAD"]) === "other");
+ok("branchOp #594: `-m <reason>` is a VALUE slot (refs/heads write still ref-write)", (() => {
+  const r = symRefOp(["-m", "why", "refs/heads/victim", "refs/heads/main"]);
+  return r.op === "ref-write" && r.target === "victim";
+})());
+ok("branchOp #594: `-m <reason>` HEAD form is a state change, not a query of a ref named 'why'",
+  op("symbolic-ref", ["-m", "why", "HEAD", "refs/heads/x"]) === "switch-existing");
+ok("branchOp #594: `-mwhy` inline value keeps HEAD as pos[0] (state change)",
+  op("symbolic-ref", ["-mwhy", "HEAD", "refs/heads/x"]) === "switch-existing");
+ok("branchOp #594: update-ref -m <reason> refs/heads/<b> → switch-existing",
+  op("update-ref", ["-m", "why", "refs/heads/x", "HEAD"]) === "switch-existing");
+ok("branchOp #594: update-ref --stdin names no ref on argv → ref-write(null)", (() => {
+  const r = classifyBranchOp("update-ref", ["--stdin"]);
+  return r.op === "ref-write" && r.target === null;
+})());
+ok("branchOp #594: update-ref -z (stdin NUL mode) → ref-write(null)", (() => {
+  const r = classifyBranchOp("update-ref", ["--stdin", "-z"]);
+  return r.op === "ref-write" && r.target === null;
+})());
+ok("branchOp #594: update-ref -m <reason> refs/tags/v1 stays other (control)",
+  op("update-ref", ["-m", "why", "refs/tags/v1", "HEAD"]) === "other");
+ok("branchOp #594: an opaque alias indirection → alias-opaque", (() => {
+  const r = classifyBranchOp("br", [], { aliasOpaque: true });
+  return r.op === "alias-opaque" && r.name === "br";
+})());
 ok("branchOp: branch -f", op("branch", ["-f", "x", "main"]) === "force");
 // #591: git merges NOARG shorts into one cluster (`-fq` ≡ `-f -q`; force short
 // anywhere in the run) and --force accepts its unambiguous abbreviation --forc.
@@ -944,6 +988,24 @@ ok("M3 #376: target-less switch-existing (symbolic-ref/update-ref) still blocks"
 ok("M3 #376: prev-branch '-' never equals the original → blocks", (() => {
   const d = decideM3({ branchOp: { op: "switch-existing", target: "-" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
   return d?.block === true;
+})());
+ok("M3 #594: ref-write (symbolic-ref refs/heads/<b>) BLOCKS — no carve-out applies", (() => {
+  const d = decideM3({ branchOp: { op: "ref-write", target: "main" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey, currentBranch: "main" });
+  return d?.block === true && d?.reBaseline === undefined;
+})());
+ok("M3 #594: ref-write never re-baselines even when the target IS the original", (() => {
+  // `symbolic-ref refs/heads/main HEAD` on a session whose original is `main`
+  // must not be mistaken for the #376 return-to-original re-baseline.
+  const d = decideM3({ branchOp: { op: "ref-write", target: "main" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: "feat/2", original: "main" }, repoKey: mainKey, currentBranch: "feat/2" });
+  return d?.block === true && d?.reBaseline === undefined;
+})());
+ok("M3 #594: `update-ref --stdin` ref-write(null) blocks too", (() => {
+  const d = decideM3({ branchOp: { op: "ref-write", target: null }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
+  return d?.block === true;
+})());
+ok("M3 #594: alias-opaque blocks and names the indirection", (() => {
+  const d = decideM3({ branchOp: { op: "alias-opaque", name: "br" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
+  return d?.block === true && /git br/.test(d.reason) && /alias/i.test(d.reason);
 })());
 ok("M3 #376: other branch-state ops stay blocked (agent-infra, force/orphan/detach/force-create)", (() => {
   return ["force", "orphan", "detach", "force-create"]
