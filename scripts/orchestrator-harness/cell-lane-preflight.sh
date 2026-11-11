@@ -80,7 +80,10 @@
 #   --repo <path>   the checkout to measure for the staleness reading (#3932). Same value as
 #                   `CELL_PREFLIGHT_REPO`, and it wins over it. NOT a way to switch the field off: a
 #                   named path that is not a checkout is reported (`repo=none … reason=not-a-checkout`),
-#                   never silently replaced by a guess.
+#                   never silently replaced by a guess. (`spawn-gate.sh`'s own spawn point names the
+#                   checkout through `CELL_PREFLIGHT_REPO` instead of this flag, on purpose: `$O` is
+#                   seeded file by file, so a caller passing a flag a deployed copy predates makes that
+#                   copy exit 2 `why=usage` — a version skew that would refuse every spawn.)
 #
 # ENVIRONMENT (the staleness reading, #3932 — the THRESHOLD and the BOUND have no flag, because they
 # are policy, not a reading: a caller must not be able to turn its own readiness field off. Naming the
