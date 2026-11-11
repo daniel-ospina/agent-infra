@@ -810,6 +810,11 @@ async function partB() {
     // the exact class agent-infra#3442 forbids. Measured: without this line ind1b survives M2.
     // `git checkout main` returns to `baseline.original` under BOTH the correct code and M2,
     // so every block row below starts from a known baseline.
+    // ⚠️ These two rows are PRECONDITIONS, not new closure coverage: `git checkout main →
+    // undefined` is already pinned twice on main (B9u-cont1 and B9v-cont1). They are asserted
+    // here only so the row that depends on them fails ATTRIBUTABLY (a broken restore must red
+    // on the restore, not on the block row that inherits its drift) — do not count them as
+    // added coverage of the #601 closure.
     const m601r1 = await callBash("git checkout main");
     expectTrue("#601 harness control: the baseline is re-established between the block rows [mutants: M5, M8]" +
       " — MEASURED: blocked under either (M5 by the legacy checkout-branch arm, M8 by the removed #376 arm)",

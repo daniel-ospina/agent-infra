@@ -2084,17 +2084,20 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       classifyGitCommandDetailed(`git branch -Mq feat/1 rnX ; ${tail}`).stateCarveOutClean, false);
   }
   // Indicator 1 — own-baseline rename (reBaseline carve-out) then FOREIGN rename.
+  // NB: the pair below is the ONLY row for this command. `ind1D.stateCarveOutClean === false`
+  // was a byte-for-byte duplicate of the sibling-family `rename` row above (same command
+  // string, same field, same expected value, same mutant M1) and was folded away on
+  // fresh-context review of this PR — the family sweep carries it.
   const ind1 = `git branch -Mq feat/1 rnX ; git branch -Mq feat/x rnY`;
   const ind1D = classifyGitCommandDetailed(ind1);
   expectBool("#601 ind1: BOTH mutations enumerated (the tail must reach the M3 loop) [mutant: M3]" +
     " — MEASURED: M3 slices it to 1",
     Array.isArray(ind1D.stateMutations) && ind1D.stateMutations.length === 2, true);
-  expectBool("#601 ind1: stateCarveOutClean false — the mutating tail is not a read-only sibling [mutant: M1]" +
-    " — MEASURED: M1 makes it true",
-    ind1D.stateCarveOutClean === false, true);
   expectBool("#601 ind1: own rename + FOREIGN rename → M3 BLOCK (no launder) [mutants: M1, M3]" +
-    " — MEASURED: each admits the compound as allow:carveOut (M2 is the e2e-layer mutant: this mirror" +
-    " implements the conditional itself, so reverting index.ts cannot move it)",
+    " — MEASURED: the two mutants admit through DIFFERENT exits — M1 as allow:carveOut (the carve-out" +
+    " closes), M3 as allow:pending (the tail is sliced out of the loop, so the lead's reBaseline is" +
+    " deferred to the verdict arm). M2 is the e2e-layer mutant: this mirror implements the conditional" +
+    " itself, so reverting index.ts cannot move it",
     m3Full(ind1, "feat/1"), "block");
   // The visible-tail matrix. Leads = the TWO reBaseline arms #1144 uniquely owns
   // (own-baseline rename; #376 return-to-original) × every FOREIGN M3-only tail
