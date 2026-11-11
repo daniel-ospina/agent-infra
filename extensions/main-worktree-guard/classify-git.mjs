@@ -2945,6 +2945,58 @@ function _stripQuotedHeredocBodies(text) {
   return out.join("\n");
 }
 
+/**
+ * #607 (final review P0, category A — FAIL-OPEN): an UNQUOTED heredoc body
+ * (`<<EOF`) IS expanded by the outer shell (`$(…)`, backticks, `$VAR`), but bash
+ * does **not** parse QUOTES or COMMENTS inside a heredoc body — an apostrophe
+ * there is a literal character, not an opening quote, and a `#` there is a
+ * literal character, not a comment. Both of the round-5 projections assumed
+ * otherwise, so ONE apostrophe in an unquoted body opened a phantom
+ * single-quoted region that ran to end of input and swallowed the payload:
+ *
+ *   git commit -F - <<EOF
+ *   fix: don't $(git branch -Mq main victim)
+ *   EOF
+ *
+ * MEASURED at `624d369e6`: `hiddenStateMutation === false` → ADMITTED, while
+ * bash expands the body and renames the branch (probe-verified: `main` is gone
+ * afterwards). Same for `git commit -m "$(cat <<EOF … EOF)"` and for
+ * `cat <<EOF / don't / EOF / echo "$(git branch -Mq main victim)"`. Ordinary
+ * lane traffic — "don't" in a commit body is ordinary text — which is why this
+ * is a P0 rather than an adversarial edge.
+ *
+ * This is a PROJECTION, not a rewriter: only `'`, `"` and `#` inside an unquoted
+ * body are blanked to SPACES (offsets and line structure stable). Everything
+ * else in the body is left verbatim, because a `$(…)`/backtick there DOES
+ * expand and must stay harvestable. It is monotone-WIDENING for detection —
+ * every consumer of these projections SKIPS quoted regions, so removing phantom
+ * quoting can only reveal spans, never hide them.
+ *
+ * Quoted bodies stay `_stripQuotedHeredocBodies`' business (they are blanked
+ * whole: nothing expands there). Run that FIRST, this second.
+ * @param {string} text
+ * @returns {string}
+ */
+function _maskUnquotedHeredocBodies(text) {
+  const lines = String(text ?? "").split("\n");
+  const out = [];
+  let pending = null; // delimiter while inside an UNQUOTED heredoc body
+  const carry = { quote: null, arith: 0 };
+  for (const line of lines) {
+    if (pending !== null) {
+      if (line.trim() === pending) { out.push(line); pending = null; continue; }
+      // Body line: quotes and `#` are LITERAL to bash here. Blank them so the
+      // quote/comment scanners cannot invent a region bash does not have.
+      out.push(line.replace(/['"#]/g, " "));
+      continue;
+    }
+    const { delim, delimQuoted } = _wtScanLine(line, carry);
+    out.push(line);
+    if (delim !== null && !delimQuoted) pending = delim;
+  }
+  return out.join("\n");
+}
+
 export function stripHeredocData(text, codeBodies) {
   const lines = String(text ?? "").split("\n");
   const out = [];
@@ -5818,6 +5870,16 @@ function _ansiTranslate(s) {
  * line structure stay stable for every consumer. Quote state carries ACROSS lines
  * because this runs on a whole COMMAND, not on one script line: an apostrophe in a
  * `"…"` region is literal, and a `#` inside `"…"` is NOT a comment.
+ *
+ * ⛔ WORD START IS NOT "the previous character is in some class". A closing `)`
+ * CONTINUES a word in bash — `echo $(date)#x` prints `<date>#x`, the `#` is a
+ * literal character — so `)` must NOT be a comment delimiter. It was one, and it
+ * blanked every live tail after a substitution: MEASURED at `624d369e6`,
+ * `echo $(date)#x; eval 'git branch -Mq main victim'` → `hiddenStateMutation ===
+ * false` → ADMITTED while the shell runs the eval (the `;` control was `true`).
+ * Every remaining delimiter here (whitespace, `;`, `|`, `&`, `(`) is a genuine
+ * word TERMINATOR, so nothing legitimate regresses: a comment written after a
+ * subshell close (` (cd x) # note`) has whitespace before the `#`.
  * @param {string} text
  * @returns {string}
  */
@@ -5861,7 +5923,7 @@ function _stripShellCommentsForScan(text) {
       continue;
     }
     if (c === '"') { inD = true; out.push(c); i += 1; continue; }
-    if (c === "#" && (i === 0 || /[\s;|&()]/.test(src[i - 1]))) {
+    if (c === "#" && (i === 0 || /[\s;|&(]/.test(src[i - 1]))) {
       let j = i;
       while (j < n && src[j] !== "\n") j++;
       out.push(" ".repeat(j - i));
@@ -5876,6 +5938,22 @@ function _stripShellCommentsForScan(text) {
 }
 
 /**
+ * The ONE projection every #607 scan consumes — in bash's own order:
+ *   1. blank QUOTED heredoc bodies (nothing expands there),
+ *   2. blank quotes/`#` inside UNQUOTED heredoc bodies (bash parses neither there,
+ *      while `$(…)` DOES expand — so the rest of the body stays scannable),
+ *   3. blank `#` comments (recognized before quotes are tracked).
+ * Every step is monotone-WIDENING for detection: each consumer below SKIPS quoted
+ * regions, so removing a region bash does not have can only reveal spans. A
+ * projection, never a rewrite — offsets and line structure are preserved.
+ * @param {string} text
+ * @returns {string}
+ */
+function _shellScanProjection(text) {
+  return _stripShellCommentsForScan(_maskUnquotedHeredocBodies(_stripQuotedHeredocBodies(String(text ?? ""))));
+}
+
+/**
  * The `[start, end]` ranges of SINGLE-quoted regions. bash performs NO expansion
  * inside `'…'` (ShellCheck SC2016 is published for exactly this), so text there is
  * inert whatever it spells. The collector already skips those regions; the
@@ -5884,6 +5962,15 @@ function _stripShellCommentsForScan(text) {
  * alias.x="branch -fq a b" is the trick'` → `hiddenStateMutation === true` → a
  * lane's ordinary `git commit` in a worktree REFUSED for describing an alias, with
  * the remedy "run it directly" — which the command already satisfied.
+ *
+ * ⛔ ANSI-C `$'…'` IS INERT TOO, and must be skipped WHOLE with its escapes honoured
+ * (final review P1, category A — FAIL-OPEN). Without that arm the region ended at the
+ * `'` that follows `$`, so an ESCAPED quote (`$'it\'s'`) closed it early and the
+ * literal's real closing `'` then opened a PHANTOM region running to end of input —
+ * every later `eval "…"` / `-c alias.x=…` match was skipped as if it were prose.
+ * MEASURED at `624d369e6`: `echo $'it\'s' ; eval "git branch -Mq main victim"` →
+ * `hiddenStateMutation === false` (ADMITTED) while the control `echo $'it s' ; …` →
+ * `true`. `$'…'` performs no expansion, so an inert range is also the right semantics.
  * @param {string} text
  * @returns {Array<[number, number]>}
  */
@@ -5898,6 +5985,14 @@ function _singleQuotedRanges(text) {
       if (c === "\\") { i += 2; continue; }
       if (c === '"') inD = false;
       i += 1;
+      continue;
+    }
+    if (c === "$" && src[i + 1] === "'") {
+      // ANSI-C literal: `\'` is an ESCAPED quote and does NOT end the region.
+      let j = i + 2;
+      while (j < src.length && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
+      ranges.push([i, Math.min(j, src.length - 1)]);
+      i = j < src.length ? j + 1 : src.length;
       continue;
     }
     if (c === "'") {
@@ -5936,7 +6031,7 @@ function _collectSubstSpansDetailed(src) {
   // #607 (review finding 1): bash's own ordering — comments are recognized
   // BEFORE quotes are tracked, so an apostrophe in a `#` comment can never open a
   // phantom quoted region that swallows the live payload after it.
-  src = _stripShellCommentsForScan(src);
+  src = _stripShellCommentsForScan(_maskUnquotedHeredocBodies(src));
   let i = 0;
   const n = src.length;
   // #607 (review round 4, P2): SINGLE-QUOTED regions are INERT — bash performs no
@@ -6086,7 +6181,7 @@ export function _hasHiddenStateSubst(raw) {
   // comment expands nothing — so the span collector and every pass below see the
   // comment-blanked projection. This is a strict narrowing of an INERT region; it
   // cannot fail open (a comment never executes).
-  const source = _stripShellCommentsForScan(String(raw ?? ""));
+  const source = _stripShellCommentsForScan(_maskUnquotedHeredocBodies(String(raw ?? "")));
   // #607 review finding 1: argument-aware, not verb-only — see
   // _argAwareBranchStateMutation (a one-argument `symbolic-ref` is a READ).
   const mutates = _argAwareBranchStateMutation;
@@ -6238,7 +6333,7 @@ export function _hasHiddenStateMutation(raw) {
   // is already false for `bash <<'EOF' … git branch -Mq …`, so this is not a
   // regression, and the family is named here so the next reader does not read it as
   // covered.
-  const source = _stripShellCommentsForScan(_stripQuotedHeredocBodies(String(raw ?? "")));
+  const source = _shellScanProjection(String(raw ?? ""));
   // #607 (review finding 2b): matches that sit inside a SINGLE-QUOTED region merely
   // DESCRIBE a payload — bash expands nothing there — so the `eval`/alias passes skip
   // them. `eval '<payload>'` itself still fires: its match starts OUTSIDE the quotes.

@@ -1395,6 +1395,97 @@ async function partB() {
     expectTrue("#607 quoting: predicate — the alias value is judged even when it is single-quoted at the CALL SITE (the match starts outside the `-c`) [mutant: M12] — MEASURED: `alias.br='branch -fq victim main'` stays true",
       classify607("git -c alias.br='branch -fq victim main' br").hiddenStateMutation === true,
       JSON.stringify(classify607("git -c alias.br='branch -fq victim main' br").hiddenStateMutation));
+
+    // ── FINAL-REVIEW P0 (category A — FAIL-OPEN): an UNQUOTED heredoc body.
+    // bash expands `$(…)` in an unquoted body but parses NEITHER quotes NOR comments
+    // there, so one apostrophe in the body opened a phantom single-quoted region that
+    // ran to end of input and swallowed the payload after it. MEASURED at `624d369e6`:
+    // `hiddenStateMutation === false` → ADMITTED, and bash expands the body (probe-
+    // verified: the branch is renamed and `main` is gone afterwards). `git commit -F -`
+    // and "don't" in a commit body are ORDINARY lane traffic.
+    await expect607Block(
+      "#607 heredoc: an apostrophe in an UNQUOTED heredoc body does not swallow the payload (REFUSED) [mutant: M14 — the unquoted-body mask removed] — MEASURED at 624d369e6: ADMITTED, branch renamed rc 0",
+      "git commit -F - <<EOF\nfix: don't $(git branch -Mq wt/x607 wt/y607)\nEOF");
+    const hd1 = await expect607Block(
+      "#607 heredoc: the same body inside `$(cat <<EOF … EOF)` is REFUSED [mutant: M14] — MEASURED at 624d369e6: ADMITTED",
+      'git commit -m "$(cat <<EOF\nfix: don\'t $(git branch -Mq wt/x607 wt/y607)\nEOF\n)"');
+    expectTrue("#607 heredoc: the refusal is the #607 one, not an unrelated arm (attribution, #3442)",
+      !!hd1 && /#607/.test(hd1.reason ?? "") && /hidden|hides/.test(hd1.reason ?? ""),
+      `reason=${JSON.stringify(hd1?.reason ?? "")}`);
+    await expect607Block(
+      "#607 heredoc: an apostrophe body does not swallow a LATER line's payload either [mutant: M14] — MEASURED at 624d369e6: ADMITTED",
+      "cat <<EOF\ndon't\nEOF\necho \"$(git branch -Mq wt/x607 wt/y607)\"");
+    // `#` in an unquoted body is a LITERAL character (bash writes `x # HI`, probe-
+    // verified), so the comment stripper must not blank the payload after it.
+    await expect607Block(
+      "#607 heredoc: a `#` in an UNQUOTED heredoc body does not blank the payload after it (it is literal text, not a comment) [mutant: M14] — MEASURED: false without the mask",
+      "cat <<EOF\nx # $(git branch -Mq wt/x607 wt/y607)\nEOF");
+    await expect607Allow(
+      "#607 heredoc: a QUOTED heredoc body stays ALLOWED (nothing expands there) — the mask must not reach it",
+      "git commit -F - <<'EOF'\nfix: don't $(git branch -Mq wt/x607 wt/y607)\nEOF");
+    await expect607Allow(
+      "#607 heredoc: an unquoted body with NO payload is still ALLOWED (the mask is not a blanket heredoc block)",
+      "git commit -F - <<EOF\nplain message, nothing hidden\nEOF");
+    expectTrue("#607 heredoc: predicate — the apostrophe body sets the flag; the quoted twin does not [mutant: M14]",
+      classify607("git commit -F - <<EOF\nfix: don't $(git branch -Mq main victim)\nEOF").hiddenStateMutation === true
+      && classify607("git commit -F - <<'EOF'\nfix: don't $(git branch -Mq main victim)\nEOF").hiddenStateMutation === false,
+      JSON.stringify(classify607("git commit -F - <<EOF\nfix: don't $(git branch -Mq main victim)\nEOF").hiddenStateMutation));
+
+    // ── FINAL-REVIEW P1 — REFUTED BY MEASUREMENT, and pinned so it stays that way.
+    // The review read `gateOneMutation`'s worktree exemption (`if (m2Eff.isWorktree &&
+    // !m2Eff.unresolvedTarget) return undefined;`) as a command-level admission that
+    // skips `admitAfterM3()`, and therefore the #607 refusal. It is not: that
+    // `return undefined` means "this MUTATION is exempt", and every caller of
+    // `gateMutations()` returns through the funnel — `return admitAfterM3();` at the
+    // allowance arm, the push-delete arm and the M2 arm (index.ts). A worktree
+    // COMMIT/PUSH carrying a hidden payload is refused, measured below; the rows exist
+    // because no worktree COMMIT/PUSH row did (the suite exercised `git branch` only,
+    // which returns through the M3 loop).
+    const f1 = await expect607Block(
+      "#607 funnel: a worktree COMMIT carrying a hidden payload is REFUSED (the M2 worktree exemption is per-MUTATION, not command-level) [mutant: M1] — MEASURED: this is the review's P1, and it does not reproduce",
+      'git commit -m "$(git branch -Mq wt/x607 wt/y607)"', "mutant M1");
+    expectTrue("#607 funnel: the worktree COMMIT refusal is the #607 one (attribution, #3442) — the M2 worktree arm is not a command-level admission",
+      !!f1 && /#607/.test(f1.reason ?? "") && /hidden|hides/.test(f1.reason ?? ""),
+      `reason=${JSON.stringify(f1?.reason ?? "")}`);
+    await expect607Block(
+      "#607 funnel: a worktree PUSH carrying a hidden payload is REFUSED too [mutant: M1]",
+      'git push origin "$(git branch -Mq wt/x607 wt/y607)"', "mutant M1");
+
+    // ── PREVIOUS REVIEW FINDING 1 (P1, category A — FAIL-OPEN): ANSI-C `$'…'` with an
+    // ESCAPED quote desynchronised `_singleQuotedRanges`, which then ran to end of
+    // input and made every later `eval` / `-c alias.` match look like prose.
+    // MEASURED at `624d369e6`: false (ADMITTED) while the `$'it s'` control was true.
+    await expect607Block(
+      "#607 quoting: an ANSI-C literal's ESCAPED quote does not disable the EVAL pass [mutant: M16 — the ANSI-C arm removed from `_singleQuotedRanges`] — MEASURED at 624d369e6: ADMITTED",
+      `echo $'it\\'s' ; eval "git branch -Mq wt/x607 wt/y607"`);
+    await expect607Block(
+      "#607 quoting: same desync, against the ALIAS pass [mutant: M16] — MEASURED at 624d369e6: ADMITTED",
+      `echo $'it\\'s' ; git -c alias.x='branch -fq wt/y607 wt/x607' x`);
+    await expect607Allow(
+      "#607 quoting: an ANSI-C commit message with no payload stays ALLOWED (the ANSI-C arm is not a blanket block) — `$'…'` expands nothing",
+      `git commit -m $'note: it\\'s fine'`);
+    expectTrue("#607 quoting: predicate — the escaped-quote form and its control BOTH fire (the desync was the only difference) [mutant: M16]",
+      classify607(`echo $'it\\'s' ; eval "git branch -Mq main victim"`).hiddenStateMutation === true
+      && classify607(`echo $'it s' ; eval "git branch -Mq main victim"`).hiddenStateMutation === true,
+      JSON.stringify(classify607(`echo $'it\\'s' ; eval "git branch -Mq main victim"`).hiddenStateMutation));
+
+    // ── PREVIOUS REVIEW FINDING 2 (P1, category A — FAIL-OPEN): `)` CONTINUES a word
+    // in bash (`echo $(date)#x` prints `<date>#x`), so it is not a comment delimiter.
+    // Treating it as one blanked the live tail after a substitution.
+    // MEASURED at `624d369e6`: false (ADMITTED) while the `;` control was true.
+    await expect607Block(
+      "#607 comment: a mid-word `#` after `)` is a WORD CONTINUATION, not a comment — the tail's payload is REFUSED [mutant: M15 — `)` restored to the comment-delimiter class] — MEASURED at 624d369e6: ADMITTED",
+      "echo $(date)#x; eval 'git branch -Mq wt/x607 wt/y607'");
+    await expect607Block(
+      "#607 comment: same, against the ALIAS pass [mutant: M15] — MEASURED at 624d369e6: ADMITTED",
+      "echo $(date)#x; git -c alias.x='branch -fq wt/y607 wt/x607' x");
+    await expect607Allow(
+      "#607 comment: a GENUINE comment after `)` (whitespace before the `#`) still blanks its tail — ALLOWED",
+      "echo $(date) #x; eval 'git branch -Mq wt/x607 wt/y607'");
+    expectTrue("#607 comment: predicate — `)`-mid-word fires and the whitespace-separated comment does not [mutant: M15]",
+      classify607("echo $(date)#x; eval 'git branch -Mq main victim'").hiddenStateMutation === true
+      && classify607("echo $(date) #x; eval 'git branch -Mq main victim'").hiddenStateMutation === false,
+      JSON.stringify(classify607("echo $(date)#x; eval 'git branch -Mq main victim'").hiddenStateMutation));
     process.chdir(repo);
 
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
