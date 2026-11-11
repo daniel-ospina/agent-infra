@@ -1153,6 +1153,48 @@ outmin="$(lb_drive "$TMP/lbgh-broken" 24 5)"; rcm=$?
 ck "§LB an unreadable ratio returns 2 (hold) and the line STARTS with UNREADABLE — the three states are exhaustive" $rc
 
 
+# ═══ §SC THE STALE-CHECKOUT REFUSAL IS NOT A CAPACITY REFUSAL (agent-infra#3932) ═════════════
+# This change's review, P1-2: the refusal was fixed at the SPAWN GATE (its remedy said "do NOT assume a
+# peer is current") and left on code 71 everywhere else — and 71 is the code every reader treats as a
+# property of THIS box, i.e. an item a PEER should take (`lane.sh` mints `state/capacity-refused-<N>`
+# from it, `orch-loop.sh::capacity_yield_live` stands this box down). In the measured fleet shape —
+# EVERY cell 496-7093 commits behind — that is exactly the circulation the PR exists to stop: the item
+# travels to peers that refuse identically and is never built. So the lane log read "repair this box's
+# pi/extension set or its provider credential ... or dispatch the issue to another box" for a refusal
+# whose only remedy is to advance the checkout. Driven end-to-end through the REAL lane.sh with a stub
+# probe (the same `CELL_PREFLIGHT_SH` seam `spawn-gate.sh` exposes), so this is the production path.
+echo
+echo "=== §SC stale checkout: its own code, and no claim a peer can clear it (#3932) ==="
+cat > "$TMP/fake-stale-probe.sh" <<'FP'
+#!/usr/bin/env bash
+printf '[cell-lane-preflight] LANE_CAPABILITY=refused why=stale-code host=x answered_ms=900 attempts=1 bound=45s repo=tortoise behind=542 max_behind=50\n'
+exit 3
+FP
+chmod +x "$TMP/fake-stale-probe.sh"
+: > "$PI_LOG"; rm -f "$O/logs/lane-120.log" "$O/state/capacity-refused-120"
+lbgh_install "$TMP/lbgh-ok"
+( cd "$LBWT" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" LANE_TIMEOUT=5 \
+    LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-stale-probe.sh" \
+    bash "$LANE" --key-gate-off 120 feat/120-tm daniel-ospina/agent-infra ) > "$TMP/lane-120.out" 2>&1
+s120rc=$?
+{ [ "$s120rc" -eq 85 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "§SC a stale-code refusal exits its OWN code 85 and starts NO agent (rc=$s120rc)" $rc
+grep -q 'NOT started: STALE-CODE' "$O/logs/lane-120.log"; rc=$?
+ck "§SC …and the lane log names STALE-CODE rather than the capability text" $rc
+{ ! grep -q 'or dispatch the issue to another box' "$O/logs/lane-120.log"; }; rc=$?
+ck "§SC …and does NOT hand the item to a peer, which is the circulation this PR exists to stop" $rc
+{ ! grep -q 'capacity transfer' "$O/logs/lane-120.log" && grep -q 'does NOT free the item for a peer' "$O/logs/lane-120.log"; }; rc=$?
+ck "§SC …and its stand-down line does not claim a capacity transfer" $rc
+{ read -r _se _su sgate < "$O/state/capacity-refused-120" 2>/dev/null; [ "${sgate:-}" = "stale" ]; }; rc=$?
+ck "§SC …and the durable record carries gate='stale' (got '${sgate:-<none>}'), so chain-merge stops waiting and the controller publishes the checkout remedy" $rc
+# ⛔ AND THE CHAIN MUST STILL STOP (a PR cannot appear until the checkout is advanced) — under the gate's OWN
+# code, so the caller publishing it never has to guess which of two gates refused.
+( cd "$TMP" && O="$O" CHAIN_POLLS=1 CHAIN_POLL_SECS=1 \
+    bash "$CHAIN" "$LBWT" daniel-ospina/agent-infra 120 fix/120-tm ) >/dev/null 2>&1; schain=$?
+[ "$schain" -eq 85 ]; rc=$?
+ck "§SC chain-merge stops the wait with the SAME code 85, not a normalised 75/71 (rc=$schain)" $rc
+rm -f "$O/state/capacity-refused-120"
+
 echo
 echo "───────────────────────────────────────"
 echo "  passed: $PASS   failed: $FAIL"
