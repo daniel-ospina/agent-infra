@@ -4858,7 +4858,8 @@ function _foldBacktickSubstitutions(body) {
  *  behaviour reported `["$(echo"]`, equally phantom). */
 const _SUBST_PLACEHOLDER = "\u0000SUBST";
 
-/** Sentinels for a QUOTED or ESCAPED parenthesis (`_maskQuotedParens`).
+/** Sentinels for a parenthesis that is DATA — QUOTED, ESCAPED, or inside a `${ … }` parameter
+ * expansion (`_maskDataParens`).
  *
  * ⛔ QUOTED PARENS ARE DATA, NOT OPERATORS (fresh-context review round 4, P2). `_tokenize` is
  * quote-aware for WORD CONTENTS but it STRIPS the quotes, so a word that is exactly `")"` arrives at
@@ -4881,17 +4882,34 @@ const _SUBST_PLACEHOLDER = "\u0000SUBST";
 const _QP_L = "\u0001";
 const _QP_R = "\u0002";
 
-/** Replace quoted/escaped `(` and `)` with sentinels, mirroring `_tokenize`'s own rules EXACTLY:
- * a backslash escapes the next char always outside quotes and only inside DOUBLE quotes (POSIX), and
+/** Replace `(`/`)` that are DATA with sentinels, mirroring `_tokenize`'s own rules EXACTLY: a
+ * backslash escapes the next char always outside quotes and only inside DOUBLE quotes (POSIX), and
  * inside single quotes it is literal. LENGTH-PRESERVING: every masked character becomes exactly one
  * sentinel character (see `_QP_L`).
+ *
+ * Five ways a paren is DATA: (a) quoted, (b) escaped, (c) inside a `${ … }` PARAMETER EXPANSION, and
+ * (d)+(e) inside a `$( … )` / backtick span, which `_pushSegmentTokens`'s span rules already treat as
+ * one word. (c) must be masked here because those span rules cannot see it: the `)` of `${R:-)}` is
+ * not a closer of anything.
+ *
+ * ⛔ A `${ … }` WORD'S PAREN IS DATA, NOT AN OPERATOR (fresh-context review round 6, P2). Only
+ * quoted/escaped parens were masked, so the `)` of `-o ${R:-)}` tokenized as the operator `)` and
+ * ENDED the segment before the delete flag — `git push origin -o ${R:-)} -d held/branch` returned
+ * `[]` where origin/main returned `["held/branch"]`, so `_coordinatedDeleteBlock` was never consulted
+ * and the #73 hazard was ALLOWED (reproduced end-to-end: the remote deletes the branch). The span's
+ * `}` is found by bash's own rule — the first `}` that is not escaped, not inside a quoted string, and
+ * not inside a NESTED expansion (GNU Bash manual, Shell Parameter Expansion; probes: `${R:-)}` →
+ * `)`, `${R:-'}'}` → `}`, `${A:-${B:-)}}` → `)`). An UNCLOSED `${` is a bash syntax error
+ * ("unexpected EOF while looking for matching `}`"), so no runnable command reaches the tail of this
+ * function with a stale `expDepth`.
  * @param {string} body
  * @returns {string}
  */
-function _maskQuotedParens(body) {
+function _maskDataParens(body) {
   const swap = (c) => (c === "(" ? _QP_L : c === ")" ? _QP_R : c);
   let out = "";
   let quote = null;
+  let expDepth = 0; // `${ … }` spans OPEN in this segment: their parens are DATA
   for (let i = 0; i < body.length; i++) {
     const ch = body[i];
     if (quote) {
@@ -4899,6 +4917,10 @@ function _maskQuotedParens(body) {
       if (ch === "\\" && quote === '"' && i + 1 < body.length) {
         out += ch + swap(body[i + 1]); i++; continue;
       }
+      // A `${` inside DOUBLE quotes still opens an expansion (bash expands it there); inside SINGLE
+      // quotes it is literal text, so the single-quote path below never touches `expDepth`.
+      if (quote === '"' && ch === "$" && body[i + 1] === "{") { expDepth++; out += ch + "{"; i++; continue; }
+      if (quote === '"' && ch === "}" && expDepth > 0) { expDepth--; out += ch; continue; }
       out += swap(ch);
       continue;
     }
@@ -4906,12 +4928,14 @@ function _maskQuotedParens(body) {
       out += ch + swap(body[i + 1]); i++; continue;
     }
     if (ch === "'" || ch === '"') { quote = ch; out += ch; continue; }
-    out += ch;
+    if (ch === "$" && body[i + 1] === "{") { expDepth++; out += ch + "{"; i++; continue; }
+    if (ch === "}" && expDepth > 0) { expDepth--; out += ch; continue; }
+    out += expDepth > 0 ? swap(ch) : ch; // inside `${ … }` BOTH parens are data
   }
   return out;
 }
 
-/** Restore the parens `_maskQuotedParens` replaced.
+/** Restore the parens `_maskDataParens` replaced.
  *
  * ⛔ BOTH sentinels are checked. A token can legitimately contain ONLY `_QP_R` — `-o ")"` masks to that
  * single character — so sniffing for `_QP_L` alone (the first revision did) left such a token
@@ -4919,7 +4943,7 @@ function _maskQuotedParens(body) {
  * @param {string} tok
  * @returns {string}
  */
-function _unmaskQuotedParens(tok) {
+function _unmaskDataParens(tok) {
   if (typeof tok !== "string") return tok;
   return tok.replace(/[\u0001\u0002]/g, (c) => (c === _QP_L ? "(" : ")"));
 }
@@ -4953,9 +4977,13 @@ function _redirectTakesOperand(tok) {
  * (`-d 'feat/x)'` is the real ref `feat/x)`). Three rules bound the segment, and each was measured
  * against a fail-open this helper shipped or inherited:
  *
- *   1. `_SHELL_OPS`'s LIST SEPARATORS (`&& || | & ;`) end it. The set also contains `(`/`)`, but
- *      those two are intercepted by rule 3 before this test is reached, so only the separators fire
- *      here.
+ *   1. NO LIST SEPARATOR CAN REACH THIS HELPER (round-6 review, P3: an earlier revision described a
+ *      `_SHELL_OPS` separator break HERE as live; it was dead). `segRe`'s capture is `([^;&|]*)`, so
+ *      `;`, `&` and `|` — and therefore `&&`, `||`, `&>` — are never in the body, and `_tokenize` is
+ *      called WITHOUT `newlineIsSeparator`, so it never synthesises a `;` from a newline either. The
+ *      only `_SHELL_OPS` members that can arrive, `(`/`)`, are intercepted by rule 3. The dead line was
+ *      deleted rather than pinned by a test — the standard rounds 2 and 3 applied to
+ *      `_redirectTakesOperand`'s unreachable branches.
  *   2. A REDIRECT is NOT a boundary (round-1 review P1): `_isRedirectOperator` states that a
  *      redirect may appear ANYWHERE in a simple command, so breaking at `>` truncated the argument
  *      list being scanned — `git push origin 2>/dev/null -d held/branch` gave `[]` where origin/main
@@ -4967,15 +4995,17 @@ function _redirectTakesOperand(tok) {
  *      something started before `git push` (`… && (git push origin -d b)`) and DOES end it, which is
  *      #504 itself.
  *      Backticks are folded first by `_foldBacktickSubstitutions` (rule 3's string-level twin).
- *   4. Only an UNQUOTED paren is an operator (round-4 review P2). `_tokenize` strips quotes, so a
- *      word that is exactly `")"` reached rules 1-3 as the token `)` and ended the segment;
- *      `_maskQuotedParens` neutralises quoted/escaped parens before tokenizing and every token is
- *      unmasked on the way out, so quoted DATA can never drive the span rules.
+ *   4. Only an UNQUOTED, UNEXPANDED paren is an operator (round-4 review P2; round-6 P2).
+ *      `_tokenize` strips quotes, so a word that is exactly `")"` reached rules 1-3 as the token `)`
+ *      and ended the segment — and so did the `)` of a `${ … }` word, whose closer is a BRACE, not a
+ *      paren. `_maskDataParens` neutralises quoted, escaped AND parameter-expansion parens before
+ *      tokenizing and every token is unmasked on the way out, so paren DATA can never drive the span
+ *      rules.
  * @param {string} body raw text after the `git push` word
  * @returns {string[]}
  */
 function _pushSegmentTokens(body) {
-  const toks = _tokenize(_foldBacktickSubstitutions(_maskQuotedParens(body)));
+  const toks = _tokenize(_foldBacktickSubstitutions(_maskDataParens(body)));
   const tokens = [];
   let depth = 0; // parens OPENED inside this segment: their span is one WORD, not a boundary
   for (let i = 0; i < toks.length; i++) {
@@ -4995,7 +5025,6 @@ function _pushSegmentTokens(body) {
       }
       break; // closes a subshell opened before `git push` — the #504 boundary
     }
-    if (_SHELL_OPS.has(t)) break; // ; & && || | — a real list separator
     if (_isRedirectOperator(t)) {
       // ⛔ A PROCESS-SUBSTITUTION WORD IS NOT A FILENAME (round-3 review, P2). `<( list )` /
       // `>( list )` is a single WORD passed as an argument (bash manual §5.1), but `_tokenize` drops
@@ -5007,7 +5036,7 @@ function _pushSegmentTokens(body) {
       continue;
     }
     if (depth > 0) continue; // inside a substitution span — its words are not this command's argv
-    tokens.push(_unmaskQuotedParens(t));
+    tokens.push(_unmaskDataParens(t));
   }
   // An UNCLOSED span stays dropped: its closer is outside anything this segment can see, so no word
   // after it could be attributed. Words collected BEFORE the span are kept (the flag/target survive).
