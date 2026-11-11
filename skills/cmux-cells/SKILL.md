@@ -8,7 +8,7 @@ status: live
 tags: [fleet, cmux, cells, dispatch, capacity, recovery, harness]
 summary: "How to provision, measure, recover, and dispatch on cmux cloud cells, and how work actually lands from them."
 created: 2026-10-19
-updated: 2026-11-05
+updated: 2026-11-11
 ---
 
 > ⛔ **This skill MUST be read in full — not skimmed.** Every section below is a measurement that cost a lost lane, a
@@ -400,6 +400,16 @@ channel verdicts — the first one **is**, and it is listed with them only to sa
   as an owner decision, and treat it as unverified for spawn until `cmux cloud agent … -- "reply OK"` returns a `terminal_id`
   on that box afterwards. Until it is taken, **`tmux` is the surface that still starts a worker** on that box, and `cmux vm ls`
   reading `reachable linked` for a peer says nothing about whether its link opens (#2345).
+  ⛔ **The `cmux self --json` reading quoted above is NOT a daemon verdict — on a box whose daemon is answering it reads the
+  same way, i.e. it points at the owner-gated reset in #2312 on a HEALTHY box.** Measured on **pi-cell-5**, 2026-11-11T03:45Z,
+  with that box's session daemon demonstrably UP: `cmux server status` → `status running`, pid `712399`, socket
+  `/tmp/cmux-tui-1000/cloud.sock`, and `cmux tree --json` → **rc 0** with a live client entry — and in the same minute
+  `cmux self --json` **still** reported `"route": null, "reachable": false` for `self`, while all four peers carried
+  `ws://[fdbc:…]:1337/v1/link` with `"reachable": true`. `route`/`reachable` describe the link the machine is reached BY, so
+  for `self` the field is structurally empty; the CLI's own human render agrees and prints no reachability verdict there at all
+  (`cmux vm ls` → `* pi-cell-5 … running (this machine)`, same minute). So settle the daemon with `cmux server status` +
+  `cmux tree --json` and never read self's `route`/`reachable` as evidence in EITHER direction — the failure in the paragraph
+  above is established by the other two readings and the journal, not by this one.
   ⛔ **The guest-CLI advice in this bullet and every bullet above assumes the guest CLI RUNS AT ALL, and on a measured cell shape it does
   not:** `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui` — the `cmux-tui` symlink dangling and no daemon
   process (agent-infra#2368; the same measurement as `worker-terminal.sh:168-171` and `scripts/orchestrator-harness/README.md:568`).

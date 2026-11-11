@@ -624,10 +624,64 @@ _place="$(sed -n '/LANE.S gh CREDENTIAL (agent-infra#2509)/,/⛔ A MISSING MODUL
 ck "B9 the placement block is still extractable from the shipped spawn-gate.sh (a rename must redden this, never silently empty the arms below)" $rc
 { [ -n "$(sed -n '/^run_agent() {/p' "$HERE/merge-one.sh")" ] && [ "$(grep -c 'gh_auth' "$HERE/merge-one.sh")" -eq 0 ]; }; rc=$?
 ck "B9b merge-one.sh carries its OWN run_agent() and resolves NO gh credential — the fact the block has to disclose" $rc
-# ⛔ HERE-STRINGS, NOT A PIPE (#841): `printf` into a quiet `grep` under `pipefail` reports 141 for a
-# match that IS present, which turns each of these arms into a false "absent" — the builtin-writer
-# inversion is the guard's own documented remedy, and `scripts/check-no-sigpipe-grep.sh` fails the build
-# on the piped spelling.
+# ⛔ HERE-STRINGS, NOT PIPES (#841/#864) — and the binding reason is the STATIC ban, not a live race in
+# this shard. `scripts/check-no-sigpipe-grep.sh` flags the `printf`-into-`grep -q` SHAPE across its SCAN
+# SET (`scripts`, `.husky`, `pi-bootstrap` — ⛔ not "the repo": a shell suite under `tests/` is NOT
+# scanned), whatever the runtime reachability: `grep -q` exits at its FIRST match, so under `pipefail` the
+# writer on the left can take an EPIPE and the PIPELINE's status becomes 141 — which on an INVERTED arm
+# (`&& rc=1 || rc=0`) falls into the `||` and the arm PASSES on text it was written to forbid. These five
+# arms were exactly the guard's five undeclared occurrences on `origin/main` (introduced by #3872), so
+# `sigpipe-grep` was red there and here until the pipes went: a SHAPE violation of a ban whose
+# producer-side over-block is accepted and pinned, never a silent false PASS. ⛔ TWO OF THAT RACE'S THREE
+# PRECONDITIONS DO NOT HOLD HERE — the guard's WINDOWS OF FAILURE lists all three, and the early-LINE one
+# does hold — so a reader must not inherit the opposite of either: the top-level `set -uo pipefail` in
+# `run-bash-shards.sh` governs the DRIVER, while `shard_exec` runs each shard as a NEW `env -u … bash` —
+# `SHELLOPTS` is not exported, so `pipefail` is OFF in the child — and this suite enables `set -u` only;
+# and the payloads B9c-B9h grep (`_place`, `_gha_flat`) sit far below the ~64 KiB pipe buffer the guard
+# requires. ⛔ NO BYTE COUNT IN THIS PARAGRAPH ON PURPOSE: a precise-looking number here is the one part of
+# the sentence that can rot while every arm stays green (review round 14, P3) — B9r prints the LIVE pair
+# and reddens if either crosses the buffer, and B9p refuses a count here. A here-string has no reader to
+# lose, so grep's 0/1 is the arm's status by construction.
+# ⛔ AND THE PARAGRAPH ABOVE IS ITSELF PINNED, in both directions: this suite's own rule is that a comment
+# claiming a guard it does not have reads exactly like one that has it, and the mechanism it states lives
+# in OTHER files, so B9i-B9r make a rot here REDDEN instead of lying (review rounds 13-14, P3).
+_self="${BASH_SOURCE[0]}"; [ -f "$_self" ] || _self="$HERE/gh-auth.test.sh"
+_sig="$(sed -n "/^# ⛔ HERE-STRINGS, NOT PIPES/,/^# lose, so grep's 0\/1 is the arm's status/p" "$_self" \
+  | sed -e 's/^#[[:space:]]*//' | tr '\n' ' ' | tr -s ' ')"
+[ -n "$_sig" ] && [ "${#_sig}" -lt 4000 ]; rc=$?
+ck "B9i the pipe-idiom rationale paragraph is still extractable from this suite AND the extraction STOPS at its own terminator ($(printf '%s' "${#_sig}") chars — a lost end anchor would silently turn B9j/B9k into whole-file greps that cannot fail)" $rc
+grep -q 'runs every shard under `set -uo pipefail`' <<<"$_sig" && rc=1 || rc=0
+ck "B9j …and does NOT claim the shards run under pipefail — the round-13 false mechanism (the DRIVER carries it; its shard children are a new bash that does not)" $rc
+grep -q 'check-no-sigpipe-grep.sh' <<<"$_sig"; rc=$?
+ck "B9k …and names the STATIC guard (#841/#864) as the reason the pipes went, which is the leg that actually fires" $rc
+# ⛔ THE REFUTATION IS PINNED POSITIVELY, not only as the absence of one sentence (review round 15, P3): a
+# paraphrase that re-states the removed mechanism in different words passed B9j, so the arms below pin the
+# CLAIM the paragraph must make, the count it must not carry, and the inheritance wording it must not use.
+grep -q 'SHELLOPTS` is not exported, so `pipefail` is OFF in the child' <<<"$_sig"; rc=$?
+ck "B9o …and STATES the real mechanism — SHELLOPTS is not exported, so pipefail is OFF in the child — not merely the absence of the old sentence" $rc
+! grep -qE '[0-9][0-9,]{2,}[[:space:]]*B([^a-zA-Z]|$)' <<<"$_sig"; rc=$?
+ck "B9p …and carries NO byte count (a precise-looking number here rots while the < 65536 bound stays satisfied, so the live pair lives in B9r's message, never in the prose)" $rc
+# ⛔ THE CLAIM, NOT A CHARACTER COUNT (review round 17, N1): this arm was
+# `! grep -qiE 'inherit[a-z]*[^.]{0,40}pipefail'`, and the paragraph's own CORRECT sentence — "a reader
+# must not inherit the opposite of either: the top-level `set -uo pipefail` …" — puts **48** characters
+# between `inherit` and `pipefail`, so the arm passed on 8 characters of luck and any benign reflow
+# would have reddened it on text whose mechanism did not change. ⛔ WIDENING IS NOT THE FIX, and this is
+# measured: `{0,60}` MATCHES that correct sentence and reddens a green tree, so the note's suggested
+# value (`{0,60}`) is falsified on the live text. A distance window cannot be tuned to separate the
+# negated correct sentence from the affirmative false one. So the arm pins the CLAIM instead: within ONE
+# SENTENCE, `inherit…` and `pipefail` may not co-occur unless the `inherit` is itself negated (`must
+# not`, `does not`, `never`, `opposite`, `n't`). The live sentence is negated; the round-15 paraphrase
+# ("the shard child inherits pipefail from its parent") is not, and reddens — see the mutation table.
+_b9q_bad="$(printf '%s' "$_sig" | tr '.' '\n' | grep -i 'inherit' | grep -i 'pipefail' \
+  | grep -viE "(must not|does not|do not|is not|are not|never|no |cannot|can not|n't|opposite)[^.]{0,12}inherit")"
+[ -z "$_b9q_bad" ]; rc=$?
+ck "B9q …and no sentence says a shard child INHERITS pipefail (a paraphrase of the removed mechanism is the same defect as the original sentence) — asserted per SENTENCE with the negation required, not by a character window the live wording clears by 8 chars" $rc
+# ⛔ THE REMEDY IS THE GUARD'S OWN, not an invention of this suite — `origin/main`'s wording, kept through
+# the merge rather than dropped: `printf` into a quiet `grep` under `pipefail` reports 141 for a match
+# that IS present, which turns each of these arms into a false "absent"; the builtin-writer inversion is
+# `scripts/check-no-sigpipe-grep.sh`'s documented remedy, and that guard fails the build on the piped
+# spelling. (Outside `_sig` on purpose: B9i-B9q pin the paragraph above, this states the same reason in
+# the words the base branch used, so neither side of the merge loses its record.)
 grep -q 'merge-one\.sh' <<<"$_place"; rc=$?
 ck "B9c …so the block NAMES merge-one.sh as a path this resolution does not reach" $rc
 grep -q 'single invocation every worker goes through' <<<"$_place" && rc=1 || rc=0
@@ -657,6 +711,74 @@ ck "B9g …because the tree agrees: spawn-gate.sh makes no wt_spawn CALL, and wt
 _gha_flat="$(sed -e 's/^[[:space:]]*#[[:space:]]*//' "$GH_AUTH" | tr '\n' ' ' | tr -s ' ')"
 grep -q 'launch line reads `GH_CONFIG_DIR`' <<<"$_gha_flat" && rc=1 || rc=0
 ck "B9h …and gh-auth.sh's own export rationale does not repeat the overreach (its chain is run_agent → pi, not wt_spawn)" $rc
+# B9l-B9m: the two TREE facts the B9 here-string paragraph rests on, asserted where they live. Neither can
+# be read off this suite, so a red here means the paragraph must be re-derived — never that the tree is
+# wrong (the same shape as B9g, one file over).
+SHARDS="$HERE/../run-bash-shards.sh"
+{ grep -q '^set -uo pipefail' "$SHARDS" \
+  && grep -q 'shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash ' "$SHARDS"; }; rc=$?
+ck "B9l …because the tree agrees: the driver carries \`set -uo pipefail\` AND \`shard_exec\` runs each shard as a NEW \`env -u … bash\`" $rc
+# ⛔ THE WHOLE DEFINITION, CONTINUATIONS FOLDED (review round 15, P3): the literal pins above both end at
+# `… bash `, so `-o pipefail` appended on the SAME line OR on a wrapped continuation line matched them and
+# left every arm green while making the paragraph false. Fold first, then refuse the word anywhere in the
+# definition — which also covers `set -o pipefail`, `--pipefail` and an `export SHELLOPTS` inside it.
+# ⛔ AND THE READ MUST END AT THE FUNCTION'S OWN CLOSING BRACE (review round 16, P3 — measured): this was
+# `sed -n '/^shard_exec()/,/}/p'`, and GNU sed does NOT test addr2 against the line addr1 matched (`man
+# sed`), so a ONE-LINE definition ran to the NEXT `}` — 73 lines / 5318 B, ending at the brace that closes
+# `shard_run_bounded`. B9m was green for an ACCIDENT (nothing in those 73 lines happens to say
+# pipefail/SHELLOPTS) and, when it did fire, it named the wrong carrier on a healthy `shard_exec`: a
+# comment mentioning pipefail inside `shard_run_bounded` — a different function, three lines down —
+# reddened it. The reader below accumulates by BRACE DEPTH instead, so it stops on the brace that closes
+# the definition: the current one-liner, a folded continuation, and a `{` on the next line all read
+# correctly. ⛔ THIS SUITE'S OWN RULE IS WHY IT MATTERS — a comment claiming a guard it does not have
+# reads exactly like one that has it, and the comment above makes that claim in the words "THE WHOLE
+# DEFINITION".
+# ⛔ THE READER IS A FUNCTION SO IT CAN BE PINNED ON A FIXTURE, not only on the live file (this round,
+# measured): the bound is `d<=0`, NOT `d==0`. A `}` in a trailing COMMENT or a quoted string on the
+# definition line subtracts without a matching add, so the depth lands at -1 and `d==0` never fires on
+# that line — the read then runs on into the NEXT function, which is B9s's defect one shape over, on a
+# HEALTHY `shard_exec`. Negative depth means the definition closed on that line by any reading.
+_shard_exec_def() { # $1 = the file holding `shard_exec()`
+  awk '/^shard_exec\(\)/{seen=1}
+       seen { print; t=$0; o=gsub(/\{/,"{",t); t=$0; c=gsub(/\}/,"}",t); d+=o-c
+              if (o>0) opened=1
+              if (opened && d<=0) exit }' "$1" \
+    | sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta'
+}
+_sx="$(_shard_exec_def "$SHARDS")"
+{ [ -n "$_sx" ] && ! grep -qE 'pipefail|SHELLOPTS' <<<"$_sx"; }; rc=$?
+ck "B9m …and \`shard_exec\`'s OWN braces, line continuations folded, carry no pipefail/SHELLOPTS of ANY spelling — \`-o pipefail\` one line down reddens here too" $rc
+# ⛔ THE REGION IS BOUNDED, AND THAT IS ITS OWN ARM (review round 16, P3): the definition must not swallow
+# what follows it, or B9m grades text that is not this definition. `shard_run_bounded` is the very NEXT
+# function, so its name appearing in the extraction is the measured pre-fix defect identity (73 lines /
+# 5318 B containing it; post-fix 1 line / 93 B, the size measured at this head). This reddens on the
+# range regression itself rather than waiting for a pipefail comment to be the thing that exposes it.
+grep -q 'shard_run_bounded' <<<"$_sx" && rc=1 || rc=0
+ck "B9s …and the extraction STOPS at \`shard_exec\`'s own closing brace — the next function is outside it, so a comment there can never be graded as this definition" $rc
+# ⛔ AND THE BOUND HOLDS WHEN THE DEPTH GOES NEGATIVE (this round, measured): `d==0` is not the
+# question the arm is asking — "has the definition closed on this line" is, and an UNMATCHED `}` in a
+# trailing comment (`… bash "$1"; }  # closed by the brace above }`) makes the running depth -1 without
+# ever passing through 0. Under `d==0` the read ran to EOF and B9s reddened on a HEALTHY `shard_exec`:
+# the same false-block class round 16 fixed, one shape over. Pinned on a SYNTHETIC fixture, not the live
+# file — the live formatting is not a fixture, and this arm must not depend on run-bash-shards.sh
+# happening to carry no brace in a comment today.
+B9T_FIX="$TMP/b9t-shard-exec.sh"
+printf '%s\n' 'shard_exec() { env bash "$1"; }  # closed by the brace above }' \
+  'shard_run_bounded() { echo pipefail; }' >"$B9T_FIX"
+B9T_OUT="$(_shard_exec_def "$B9T_FIX")"
+{ [ -n "$B9T_OUT" ] && ! grep -q 'shard_run_bounded' <<<"$B9T_OUT"; }; rc=$?
+ck "B9t …a \`}\` in a TRAILING COMMENT on the definition line still ends the read (the depth can go NEGATIVE, so the bound is \`<= 0\` — under \`== 0\` the read swallows the next function and B9s reddens on a healthy \`shard_exec\`): $(printf '%s' "$B9T_OUT" | tr '\n' ' ' | cut -c1-60)…" $rc
+# ⛔ THE MECHANISM IS ALSO A PROPERTY OF THE ENVIRONMENT, and that half is PROBED, not read (review round
+# 14, P3): `export SHELLOPTS` in the driver makes a child inherit pipefail without touching `shard_exec`,
+# and only a live launch shows it. This probe says nothing about the FILE — B9m reads the file; this one
+# measures what a child launched in `shard_exec`'s shape actually reports on the bash running this suite.
+_pf_opts="$(set -uo pipefail; env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash -c 'set -o')"
+! grep -q '^pipefail[[:space:]]*on' <<<"$_pf_opts"; rc=$?
+ck "B9n …and PROBED: launched from a shell with pipefail ON, in shard_exec's own env shape, the child still reports pipefail OFF (an exported SHELLOPTS reddens this)" $rc
+_pb_place="$(printf '%s\n' "$_place" | wc -c | tr -d ' ')"
+_pb_gha="$(printf '%s' "$_gha_flat" | wc -c | tr -d ' ')"
+[ "$_pb_place" -lt 65536 ] && [ "$_pb_gha" -lt 65536 ]; rc=$?
+ck "B9r …and both payloads sit BELOW the ~64 KiB pipe buffer (_place ${_pb_place} B, _gha_flat ${_pb_gha} B — the LIVE sizes the paragraph defers to), so no EPIPE window exists here — past that bound the paragraph's \`NOT A LIVE RACE IN THIS SHARD\` clause stops being true and must be re-derived" $rc
 # B12: WHERE THE `EXEMPTION-UNREADABLE` TOKEN ACTUALLY LANDS (review round 11, P3). `README.md` §7.2g said
 # "the refusal line says `EXEMPTION-UNREADABLE`"; at this head the token is printed by the separate
 # `[land-backlog] NOTE` line (three arms, one per credential outcome) and the REFUSAL prints a different
