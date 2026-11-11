@@ -624,9 +624,13 @@ _place="$(sed -n '/LANE.S gh CREDENTIAL (agent-infra#2509)/,/⛔ A MISSING MODUL
 ck "B9 the placement block is still extractable from the shipped spawn-gate.sh (a rename must redden this, never silently empty the arms below)" $rc
 { [ -n "$(sed -n '/^run_agent() {/p' "$HERE/merge-one.sh")" ] && [ "$(grep -c 'gh_auth' "$HERE/merge-one.sh")" -eq 0 ]; }; rc=$?
 ck "B9b merge-one.sh carries its OWN run_agent() and resolves NO gh credential — the fact the block has to disclose" $rc
-printf '%s\n' "$_place" | grep -q 'merge-one\.sh'; rc=$?
+# ⛔ NO PIPE INTO A QUIET grep (check-no-sigpipe-grep.sh — the SIGPIPE false negative under
+# `pipefail`: a `grep -q` that exits early kills the writer, and under `pipefail` the pipeline then
+# reports 141 instead of the match). The here-string is the scanner's own GOOD form and is
+# equivalent here: it also terminates the last line, which is all `grep -q` observes.
+grep -q 'merge-one\.sh' <<<"$_place"; rc=$?
 ck "B9c …so the block NAMES merge-one.sh as a path this resolution does not reach" $rc
-printf '%s\n' "$_place" | grep -q 'single invocation every worker goes through' && rc=1 || rc=0
+grep -q 'single invocation every worker goes through' <<<"$_place" && rc=1 || rc=0
 ck "B9d …and no longer calls this run_agent the single invocation every worker goes through" $rc
 # B9e-B9h: THE OTHER HALF OF THE SAME BOUNDARY (review round 10, P3). The block ALSO claimed the export was
 # "INHERITED … by `wt_spawn`'s launch line", and the tree falsifies it in the STRONGEST direction: that
@@ -639,9 +643,9 @@ ck "B9d …and no longer calls this run_agent the single invocation every worker
 # stripped, newlines folded) — a per-line grep here would be an arm that cannot fail on the very sentence
 # it is written to pin, which is the class A12 and B10d are on this suite's record for.
 _place_flat="$(printf '%s\n' "$_place" | sed -e 's/^[[:space:]]*#[[:space:]]*//' | tr '\n' ' ' | tr -s ' ')"
-printf '%s' "$_place_flat" | grep -q 'DIFFERENT MECHANISM'; rc=$?
+grep -q 'DIFFERENT MECHANISM' <<<"$_place_flat"; rc=$?
 ck "B9e …and NAMES wt_spawn's launch line as a DIFFERENT mechanism, not one this export can reach" $rc
-printf '%s' "$_place_flat" | grep -q 'INHERITED by the `pi` this function starts and by' && rc=1 || rc=0
+grep -q 'INHERITED by the `pi` this function starts and by' <<<"$_place_flat" && rc=1 || rc=0
 ck "B9f …and no longer claims the export is INHERITED by that launch line (the round-10 false clause)" $rc
 # The tree fact the paragraph rests on, asserted in BOTH halves: nothing in spawn-gate.sh CALLS wt_spawn (so
 # the export cannot travel up into a launch line), and `wt_launcher_env`'s default arm still CLEARS both
@@ -651,7 +655,7 @@ ck "B9f …and no longer claims the export is INHERITED by that launch line (the
   && grep -q '; unset GH_CONFIG_DIR XDG_CONFIG_HOME' "$HERE/worker-terminal.sh"; }; rc=$?
 ck "B9g …because the tree agrees: spawn-gate.sh makes no wt_spawn CALL, and wt_launcher_env's default arm still CLEARS both variables" $rc
 _gha_flat="$(sed -e 's/^[[:space:]]*#[[:space:]]*//' "$GH_AUTH" | tr '\n' ' ' | tr -s ' ')"
-printf '%s' "$_gha_flat" | grep -q 'launch line reads `GH_CONFIG_DIR`' && rc=1 || rc=0
+grep -q 'launch line reads `GH_CONFIG_DIR`' <<<"$_gha_flat" && rc=1 || rc=0
 ck "B9h …and gh-auth.sh's own export rationale does not repeat the overreach (its chain is run_agent → pi, not wt_spawn)" $rc
 # B12: WHERE THE `EXEMPTION-UNREADABLE` TOKEN ACTUALLY LANDS (review round 11, P3). `README.md` §7.2g said
 # "the refusal line says `EXEMPTION-UNREADABLE`"; at this head the token is printed by the separate
