@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-11819-1794362624-p1028228-a4d9fa48",
+  "_sha": "cd7b81f2d08528a254223cd01d1a3ad33f13990d",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-11819.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/11819-torch-pin-guard"
+    },
+    {
+      "kind": "sha",
+      "value": "d1447b0fe3adfa4aede8956f1be8f131ed4c1eb7"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/11819-torch-pin-guard"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 378,
+  "ended_at": 1794363002,
+  "exit_code": 0,
+  "heartbeat_at": 1794363002,
+  "host": "cmux",
+  "issue": 11819,
+  "kind": "lane",
+  "lane_id": "cmux.klane-11819-1794362624-p1028228-a4d9fa48",
+  "lease_until": 1794370802,
+  "pid": 1028228,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794362624,
+  "state": "DONE",
+  "tag": "11819",
+  "worktree": "/home/cmux/tortoise/.worktrees/11819-torch-pin-guard"
+}
