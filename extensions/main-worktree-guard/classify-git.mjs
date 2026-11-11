@@ -2834,7 +2834,9 @@ function _wtScanLine(line, carry) {
   let ansiC = carry?.ansiC ?? false; // the open quote was opened by `$'`
   let arith = carry?.arith ?? 0;
   let delim = null;
-  let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
+  let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`), or
+                          // "\\" when it was backslash-escaped (`<<\EOF`) — both suppress
+                          // outer-shell expansion of the body
   // `<<-EOF` (dash form) strips leading TABS from every body line INCLUDING the
   // terminator line before bash compares it; the plain form strips nothing
   // (#523 round-3 F2). Consumers that match the terminator need this flag.
@@ -2872,13 +2874,34 @@ function _wtScanLine(line, carry) {
       let q = null;
       if (line[j] === "'" || line[j] === '"') { q = line[j]; j++; }
       let d = "";
+      let dEscaped = false;
       // An UNQUOTED delimiter is a shell word: it stops at whitespace / shell
       // metacharacters, NOT at the first non-word char. Stopping early (`<<E-O-F`
       // → delimiter `E`) left the terminator unmatched, so the body swallowed
       // every following line — including a later discard (reviewer round-6 P1).
-      while (j < line.length && (q ? line[j] !== q : !/[\s;&|<>(){}'"\\]/.test(line[j]))) { d += line[j]; j++; }
+      // ⛔ A BACKSLASH ESCAPES the next character and is then REMOVED by quote
+      // removal, exactly as bash does it: `bash <<\EOF` is the heredoc delimiter
+      // `EOF`. Ending the word at `\` produced `delim: null`, so no body was
+      // opened and the RAW body text fell into the command-line scan — the
+      // pre-#523 accident, i.e. the exact defect #523 closes, one character away
+      // (measured: `bash <<\EOF` + a body of `echo hi` then `/tmp/x.sh` resolved
+      // `echo` and never read the file; real bash executes it. #523 round-5 F2a).
+      // A backslash-quoted word also stops the outer shell EXPANDING the body,
+      // so it is reported the way a quoted delimiter is (`delimQuoted`), which is
+      // what the M5 substitution projection keys on.
+      while (j < line.length) {
+        const c = line[j];
+        if (q) { if (c === q) break; d += c; j++; continue; }
+        if (c === "\\") {
+          const nxt = line[j + 1] ?? "";
+          if (!nxt) break; // a trailing backslash continues onto the next line
+          d += nxt; dEscaped = true; j += 2; continue;
+        }
+        if (/[\s;&|<>(){}'"]/.test(c)) break;
+        d += c; j++;
+      }
       if (q && line[j] === q) j++;
-      if (d && delim === null) { delim = d; delimQuoted = q; delimDash = dash; }
+      if (d && delim === null) { delim = d; delimQuoted = q ?? (dEscaped ? "\\" : null); delimDash = dash; }
       // Re-emit the delimiter so the walker's `<<` + operand skip consumes the
       // placeholder, never the next real command token. An opener with no
       // delimiter (`<<` in arithmetic) emits bare `<<`.
@@ -10927,14 +10950,30 @@ function _heredocBodyIsProgram(code, kind) {
   // cannot disagree about WHICH segment consumes the body.
   const opener = _wtOpenerSegment(code);
   const openerInterp = _wtHeadInterpreter(opener);
-  if (openerInterp !== null && _WT_SHELL_WORDS.test(basename(String(openerInterp)))) {
-    return _scriptInvocationAt(_tokenize(opener), 0).stdinProgram === true;
+  if (openerInterp !== null) {
+    if (_WT_SHELL_WORDS.test(basename(String(openerInterp)))) {
+      return _scriptInvocationAt(_tokenize(opener), 0).stdinProgram === true;
+    }
+    // ⛔ A NON-SHELL INTERPRETER OPENER CONSUMES THE BODY ITSELF — the pipe
+    // carries that interpreter's STDOUT to whatever is on the right, and the
+    // right-hand command never sees the heredoc. `python3 <<PY | bash` is a
+    // PYTHON program whose output is piped into bash: the body is python SOURCE
+    // and nothing in it executes as shell. Falling through to the pipe loop made
+    // the shell on the right walk the python body as a PROGRAM, so a path in a
+    // `print("./gen.sh")` string was resolved and content-gated as a DIRECT
+    // execution — an OVER-BLOCK and a REGRESSION against `main`, which resolves
+    // nothing here (measured: `["./gen.sh"]` on the head, `null` on `main`;
+    // #523 round-5 F1). A parser answers this from the grammar — a heredoc
+    // belongs to the simple command it is attached to (tree-sitter-bash's
+    // `heredoc_redirect`, mvdan.cc/sh's redirect node) — which is the rule this
+    // branch now follows.
+    return false;
   }
-  // Otherwise the opener is not an interpreter (`cat`, `tee`, `grep …`) and the
-  // body is piped INTO a consumer: the pipeline's first stdin-consuming
-  // interpreter decides. The split mirrors `_wtLinePipesToInterpreter` (same
-  // naive-but-conservative splitting, so the two never disagree about WHETHER
-  // an interpreter consumes the body).
+  // Otherwise the opener is not an interpreter at all (`cat`, `tee`, `grep …`)
+  // and the body is piped INTO a consumer: the pipeline's first
+  // stdin-consuming interpreter decides. The split mirrors
+  // `_wtLinePipesToInterpreter` (same naive-but-conservative splitting, so the
+  // two never disagree about WHETHER an interpreter consumes the body).
   const segs = String(code).split("|");
   for (let k = 1; k < segs.length; k++) {
     const interp = _wtHeadInterpreter(segs[k]);

@@ -570,6 +570,23 @@ async function partB() {
     // are read by `bash`, which runs the operation, while the gate stands down).
     expectTrue("B7t (#523 round-4): a body line with a >4-flag interpreter still counts as INTERPRETED → BLOCKED",
       blocked(await bash(`bash <<EOF\nbash -e -x -u -v -f "${fakeBin}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-5 F1 (blocking, an OVER-BLOCK — a REGRESSION against `main`): a
+    // heredoc attached to a CODE interpreter is that interpreter's SOURCE and the
+    // pipe carries its STDOUT, so the shell on the right NEVER sees the body.
+    // `python3 <<PY | bash` is the generator idiom. The walk fell through to the
+    // pipe consumer and resolved the path inside the python `print(...)` string as
+    // a DIRECT execution, so the hub-mutating file named in a PYTHON LITERAL was
+    // read and content-gated — `main` allows it (it resolves nothing).
+    expectTrue("B7u (#523 round-5 F1) control: a CODE opener's body piped into a shell is not walked → ALLOWED",
+      allowed(await bash(`python3 <<PY | bash\nprint("${bodyEvil}")\nPY`, hub)), "was blocked");
+    // ⛔ ROUND-5 F2a (a live #523 fail-open ONE CHARACTER away, measured): bash
+    // removes the backslash by quote removal, so `<<\EOF` is the delimiter `EOF`
+    // and the body IS a body. Ending the delimiter word at `\` opened NO body,
+    // the raw body text fell into the command-line scan, which resolved the benign
+    // first token (`echo`) — the hub mutation the body really executes was never
+    // read (fail-OPEN, `main` behaves the same: pre-existing, closed here).
+    expectTrue("B7v (#523 round-5 F2a): `bash <<\\EOF` opens a real body → BLOCKED",
+      blocked(await bash(`bash <<\\EOF\necho hi\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });

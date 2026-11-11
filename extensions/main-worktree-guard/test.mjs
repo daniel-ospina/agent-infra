@@ -4373,6 +4373,48 @@ try {
       // and the bare-path export is the same set (membership consumers unchanged)
       extractHeredocProgramScriptPaths(`bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub;
   })(), true);
+  // ⛔ ROUND-5 F1 (blocking, an OVER-BLOCK — a REGRESSION against `main`): a
+  // heredoc that belongs to a CODE interpreter is that interpreter's SOURCE, and
+  // the pipe to its right carries that interpreter's STDOUT — the shell
+  // downstream never sees the body. `python3 <<PY | bash` is the ordinary generator idiom.
+  // The opener branch answered only for a SHELL head and then FELL THROUGH to the
+  // pipe loop, so the shell on the right walked a python body as a PROGRAM:
+  // measured `["…/body-hub.sh"]` on the head for a path inside a
+  // `print("…")` string (resolved as a DIRECT execution, hence content-gated)
+  // while `main` resolves nothing. A parser answers this from the grammar — a
+  // heredoc belongs to the simple command it is attached to
+  // (tree-sitter-bash's `heredoc_redirect`, mvdan.cc/sh's redirect node) — and
+  // that is the rule the branch now follows.
+  expectBool("B52q: a CODE interpreter's heredoc is its SOURCE, not a shell program — a pipe does not change that (round-5 F1)", (() => {
+    const py = `import os\nprint("${sBodyHub}")\n`;
+    return extractScriptPaths(`python3 <<PY | bash\n${py}\nPY`).length === 0 &&
+      extractHeredocProgramScriptPaths(`python3 <<PY | bash\n${py}\nPY`).length === 0 &&
+      extractScriptPaths(`python3 <<PY | tee /tmp/o | bash\n${py}\nPY`).length === 0 &&
+      extractScriptPath(`python3 <<PY | bash\n${py}\nPY`) === null &&
+      // the positive twin (round-3 F1's shape): a SHELL opener still owns its
+      // body through the pipe — so the arm is about the OPENER, not about pipes
+      extractScriptPaths(`bash <<EOF | bash helper.sh\ntrue\n"${sBodyHub}"\nEOF`).join("|") === sBodyHub;
+  })(), true);
+  // ⛔ ROUND-5 F2a (a live #523 fail-open one character away) + F2b (an
+  // unasserted behaviour whose only documentation said the opposite): bash
+  // REMOVES a backslash during quote removal, so `bash <<\EOF` is the delimiter
+  // `EOF` and the body is a real body — ending the delimiter word at `\` opened
+  // NO body, so the raw body fell into the command-line scan and resolved `echo`
+  // while real bash runs the body's file. And an UNTERMINATED body is walked
+  // (bash feeds the rest of the text to the interpreter), which the README
+  // claimed was not walked.
+  expectBool("B52r: a BACKSLASH-ESCAPED delimiter opens the body (`<<\\EOF`), and an UNTERMINATED body is walked (round-5 F2)", (() => {
+    const body = `echo hi\n"${sBodyHub}"`;
+    return extractScriptPath(`bash <<\\EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<-\\EOF\n${body}\nEOF`) === sBodyHub &&
+      // the operand is still the script, exactly as for a plain `<<EOF`
+      extractScriptPath(`bash <<\\EOF script.sh\n${body}\nEOF`) === "script.sh" &&
+      // a DATA consumer stays unwalked — the fix opens the body, it does not
+      // widen WHICH bodies are programs
+      extractScriptPath(`cat <<\\EOF\n${body}\nEOF`) === null &&
+      extractScriptPath(`bash <<EOF\n${body}`) === sBodyHub &&
+      extractScriptPath(`cat <<EOF\n${body}`) === null;
+  })(), true);
 
   // ── Write gate (W) — resolveTargetTopLevel predicate ──
   const hubTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: hubR, encoding: "utf-8" }).trim());

@@ -2440,9 +2440,19 @@ as boundaries, control-flow frame words skipped — so every file it executes is
 resolved, and `_backdoorBlock` gates each one (`_gateScriptPathContent`).
 Both directions are pinned: a body is a PROGRAM only when the interpreter is
 handed no script operand (`bash <<EOF script.sh` → the operand is the script and
-the body is its stdin DATA), and a DATA body (`cat <<EOF`), a CODE body
-(`python3 <<PY`, the #627 surface) and an unterminated/absent heredoc are not
-walked. A body-executed path carries its OWN provenance about how that
+the body is its stdin DATA), and a DATA body (`cat <<EOF`) or a CODE body
+(`python3 <<PY`, the #627 surface) is not walked. A heredoc belongs to the simple
+command it is attached to — the grammar every real shell parser models
+(`tree-sitter-bash`'s `heredoc_redirect`, `mvdan.cc/sh`'s redirect node) — so a
+CODE opener keeps its body even when its STDOUT is piped into a shell:
+`python3 <<PY | bash` is a PYTHON program whose output is piped, the body is
+python SOURCE, and walking it resolved a path out of a `print("./gen.sh")`
+string as a DIRECT execution — measured BLOCK on the head where `main` ALLOWS
+(the #627 surface; pinned by `test.mjs` B52q, `test-script-backdoor` B7u). An
+UNTERMINATED/absent heredoc IS walked: bash feeds the rest of the text to the
+interpreter as the body, so the trailing lines are program text and
+`bash <<EOF` with no terminator resolves the file its tail runs (pinned by
+`test.mjs` B52r). A body-executed path carries its OWN provenance about how that
 invocation runs it (`extractHeredocProgramScriptInvocations` →
 `interpreted`), and only an invocation that HANDS THE FILE TO A READER forces
 the via-interpreter verdict: `bash x.sh`, `bash < x.sh` and `.`/`source x.sh`
@@ -2477,7 +2487,14 @@ heredoc) → program, while `cat <<'X' | bash` hands the body to the pipe consum
 → program via `bash`, and a piped `| bash -c '…'` → data. And the body ends
 where bash ends it: on a line that IS the delimiter, with no leading or trailing
 blanks (`<<-` strips leading TABS, and only tabs) — a space-padded `   EOF` is a
-body line, not a terminator.
+body line, not a terminator. The DELIMITER WORD is read the way bash reads it
+too: quote removal applies, so a backslash-escaped word is the word
+(`bash <<\EOF` is the delimiter `EOF`), and — like a quoted delimiter — it stops
+the outer shell expanding the body. Ending the word at the backslash opened NO
+body, dropped the raw body text into the command-line scan and resolved a benign
+first token (`echo`) while real bash executes the body's file — a live #523
+fail-open one character away (pinned by `test.mjs` B52r, `test-script-backdoor`
+B7v).
 **Declared residuals of this arm** (declared in #523's scope; ⛔ NOT all of them
 fail toward gating — two are measured fail-AWAY and are listed as such rather
 than as a comfort): the command LINE itself still contributes ONE script (the
@@ -2488,7 +2505,12 @@ body while this walk resolves no path for it — **fail-AWAY, measured**; the
 nested-body walk is depth-bounded at two levels (`_programScriptInvocations`), so a
 four-level heredoc nest runs and resolves nothing — **fail-AWAY, measured**; and
 a body that WRITES a script and then executes it is not statically followable
-(the same class as Residual 1/3 in the discard section).
+(the same class as Residual 1/3 in the discard section); and a LEADING
+REDIRECTION on the header line (`2>&1 bash <<EOF`, `>/dev/null bash <<EOF`) is
+not resolved by the leading-position scan, so the body is never walked — **the
+same root as #3970** (two resolvers disagreeing about a leading redirection),
+**fail-AWAY, measured** (`extractScriptPaths("2>&1 bash <<EOF\n/tmp/x.sh\nEOF")`
+→ `[]`).
 
 ## What it does NOT fix
 
