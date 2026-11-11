@@ -5054,6 +5054,13 @@ try {
     // was false for `--`. `cd --` is #2177's recorded root and is untouched here.
     has("cd a; pushd -- ../docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "N1: pushd -- <dir> is the MARKER plus a real operand — bash cds to docs");
     blocks(["docs/tracked.md"], "cd a; pushd -- ../docs; echo x > tracked.md", "N1 gate: TRACKED docs/tracked.md → BLOCK (the no-op model resolved a/tracked.md → ALLOW)");
+    // ── #3955 review NOTE: `popd <path>` / `popd 1` / `popd -x` are bash ERRORS
+    // (`invalid argument` / `invalid number`, rc 2, nothing changes — measured),
+    // and `origin/main` POPPED and cd'd on them. Pinned here because this is the
+    // block that touches the handler.
+    has("cd a; pushd ../docs; popd foo; echo x > tracked.md", "redirect:H/docs/tracked.md", "N2: popd <path> is an error — the stack is untouched, so the write stays in docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd foo; echo x > tracked.md", "N2 gate: TRACKED docs/tracked.md → BLOCK (a pop-on-path model cd's to a and ALLOWs)");
+    has("cd a; pushd ../docs; popd -x; echo x > tracked.md", "redirect:H/docs/tracked.md", "N2 control: an UNKNOWN popd flag is an error too, not a bare popd");
     // #3955's own Targets line: the forms whose `pushd` does NOT cd must leave the
     // dir stack untouched, so a later bare popd cannot consume an entry bash never
     // created. The model is deliberately self-consistent for the unprovable ones
