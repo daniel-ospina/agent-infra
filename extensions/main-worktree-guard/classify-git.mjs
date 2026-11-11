@@ -4609,7 +4609,13 @@ function _cleanDeleteTarget(x) {
  * with `:`).
  * @param {string} command
  * @returns {string[]|null} every delete refspec (short form, deduped, in command
- *   order) — an array, never a bare string; null when the command deletes nothing.
+ *   order) — an array, never a bare string; null when no delete spelling is
+ *   attributable to a refspec. Deliberately OVER-captures the git-REJECTED
+ *   shapes (a lone bare positional — `git push --delete feat/x` → `["feat/x"]`;
+ *   a colon target mixed with `--delete` — `git push origin -d a :b` →
+ *   `["a","b"]`), because an extra target is fail-closed while a missing one
+ *   leaves the delete unguarded. So `null` ⇒ nothing deleted, but a NON-null
+ *   result does NOT prove git will delete it (review P3-1).
  */
 export function extractPushDeleteBranch(command) {
   const c = String(command ?? "").trim();

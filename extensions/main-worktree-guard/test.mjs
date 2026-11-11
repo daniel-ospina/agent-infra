@@ -726,6 +726,14 @@ expectBranches("git push origin main -d b", ["main", "b"]);
 expectBranches("git push origin main --delete b", ["main", "b"]);
 expectBranches("git push origin main -d a b", ["main", "a", "b"]);
 expectBranches("git push origin -d", null); // lone positional BEFORE the flag = the REMOTE: nothing deleted
+// #509 (review P3-3): a TRAILING delete flag with every refspec BEFORE it. Both
+// are real deletes (probe-verified rc 0 against a bare remote) and BOTH returned
+// `null` before this change — not a partial attribution but NO attribution, so
+// the whole command was unguarded on the degradation-fallback #73 arm. The rows
+// above all carry a positional AFTER the flag, so a mutant that restores "skip
+// when nothing follows the flag" would leave them green; these two red it.
+expectBranches("git push origin a b --delete", ["a", "b"]); // two pre-flag refspecs: git deletes a AND b
+expectBranches("git push origin main -d", ["main"]); // one pre-flag refspec: git deletes main
 expectBranches('git push origin --delete "feat/x"', ["feat/x"]);
 expectBranches("git push origin --delete 'feat/x'", ["feat/x"]);
 expectBranches("git push origin :feat/x", ["feat/x"]);
@@ -981,17 +989,26 @@ dexpect("push --delete colon form", `git push origin :feat/x`, { verdict: "block
 // coordinated block fires exactly as for --delete/:branch.
 dexpect("push -d short → isPushDelete + targets", `git push origin -d feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push -d flag-first → targets (first positional = the remote)", `git push -d origin feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
-// #509 (review P2-2): the two #443 surfaces must AGREE on every real delete
-// shape, so this is ONE surface-vs-surface assertion — not two independent pins
-// that no mutant of the change can red. A divergence in either the
-// whole-command extractor (degraded #73 arm) or the detailed classifier (full
-// path) fails here. On pre-#509 code `git push origin -d a b` reds (extractor
-// ["a"] vs ["a","b"]); the pre-flag shape reds if either side drops `main`.
-// Excluded, each for a documented reason: `git push origin -d` (no refspec —
-// detailed over-captures the repository, the extractor returns null; harmless,
-// safe direction) and `git push origin -o -d feat/x` (the `-d` is `-o`'s VALUE,
-// so it is not a delete at all — the detailed classifier's over-capture there is
-// the KNOWN IMPRECISION at classify-git.mjs, pre-existing and harmless).
+// #509 (review P2-2): the two #443 surfaces must AGREE on every delete shape
+// they BOTH attribute, so this is ONE surface-vs-surface assertion — not two
+// independent pins that no mutant of the change can red. A divergence in either
+// the whole-command extractor (degraded #73 arm) or the detailed classifier
+// (full path) fails here. On pre-#509 code `git push origin -d a b` reds
+// (extractor ["a"] vs ["a","b"]); the pre-flag shape reds if either side drops
+// `main`. Two rows are git-REJECTED shapes ON PURPOSE (`git push origin -d a :b`
+// → `--delete only accepts plain target ref names`; `git push --delete
+// chore/old-branch origin`): both surfaces over-capture there and must keep
+// agreeing, so those rows guard PARITY, not git's behaviour (review P3-2).
+// Excluded as a CLASS, not as two instances (review P3-2): `git push origin -d`
+// (no refspec — the detailed classifier over-captures the repository, the
+// extractor returns null; safe direction) and EVERY shape carrying a standalone
+// `-o`/`--push-option` value or a `--delete=X` token (`git push origin -o draft -d b`
+// → extractor ["b"] vs detailed ["draft","b"]; `git push origin --delete=feat/x`
+// → null vs ["origin"]): the detailed classifier over-captures the option value
+// (or the repo) as a target — the KNOWN IMPRECISION at classify-git.mjs,
+// pre-existing and fail-closed. A row from that class would red on that
+// pre-existing imprecision rather than on a #509 regression, so the class is
+// outside this assertion's scope.
 function expectDeleteSurfaceParity(command) {
   const ext = extractPushDeleteBranch(command);
   const det = classifyGitCommandDetailed(command);
@@ -1014,6 +1031,9 @@ function expectDeleteSurfaceParity(command) {
   "git push origin -d a :b",
   "git push origin :a :b",
   "git push --delete chore/old-branch origin",
+  // trailing delete flag, every refspec before it (real deletes — review P3-3):
+  "git push origin a b --delete",
+  "git push origin main -d",
 ].forEach(expectDeleteSurfaceParity);
 dexpect("push -dq cluster → delete", `git push origin -dq feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push -d refs target → short name", `git push origin -d refs/heads/feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
