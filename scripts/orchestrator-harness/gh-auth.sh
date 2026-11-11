@@ -451,7 +451,7 @@ _gh_auth_store_in() {
   # PERMISSIONS; the credential may well be there" about a directory it had opened and found empty, i.e. the
   # round-22 remedy sent to the wrong fault. A symlink that RESOLVES falls through to the
   # `-d`/`-r`/`_gh_auth_searchable` tests below, which answer for its TARGET.
-  if [ -L "$d" ] && [ ! -e "$d" ]; then printf 'unreadable\n'; return 0; fi
+  if [ -L "$d" ]; then printf 'unreadable\n'; return 0; fi
   if [ -e "$d" ] && { [ ! -d "$d" ] || [ ! -r "$d" ] || ! _gh_auth_searchable "$d"; }; then
     printf 'unreadable\n'; return 0
   fi
