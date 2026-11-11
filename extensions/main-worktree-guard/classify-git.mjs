@@ -4138,8 +4138,23 @@ function _aliasDefsFromInvocation(inv) {
       const e = String(p).indexOf("=");
       if (e > 0) collectPair(String(p).slice(0, e), String(p).slice(e + 1));
     }
-    for (const [idx, pair] of cfgPairs) {
-      if (pair.key !== undefined && Number(idx) < cfgCount) takeAlias(pair.key, pair.value ?? null);
+    // ⛔ AND THE PAIRS ARE APPLIED IN **INDEX** ORDER, NOT IN THE ORDER THEY WERE
+    // WRITTEN ON THE SHELL LINE (review round 9, measured fail-open). `cfgPairs` is a
+    // Map keyed by the index STRING, so `for (const [idx, pair] of cfgPairs)` iterates
+    // in INSERTION order — i.e. whichever `GIT_CONFIG_KEY_n` assignment bash happened to
+    // write last — while git's own reader (`config.c`, `git_config_from_parameters`)
+    // loops `for (i = 0; i < count; i++)` ASCENDING, so the HIGHEST index wins. When the
+    // destructive definition sits at the higher index and was written FIRST, the
+    // classifier read the benign one, `branchState` stayed false, and M3 never ran —
+    // measured (git 2.43.0): `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_1=alias.x
+    // GIT_CONFIG_VALUE_1='branch -fq victimR HEAD' GIT_CONFIG_KEY_0=alias.x
+    // GIT_CONFIG_VALUE_0=status git x` created `victimR` rc 0 while this function
+    // answered `verb:status, branchState:false`, i.e. ALLOWED in a shared main checkout.
+    // Iterate the indices ascending instead, bounded by the same `GIT_CONFIG_COUNT`
+    // gate, so entries at or above the count stay inert exactly as before.
+    for (let i = 0; i < cfgCount; i++) {
+      const pair = cfgPairs.get(String(i));
+      if (pair && pair.key !== undefined) takeAlias(pair.key, pair.value ?? null);
     }
   }
   // ⛔ ONE ORDERED CONFIG LIST, exactly as git reads it (review round 3): the

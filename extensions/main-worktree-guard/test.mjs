@@ -1011,6 +1011,19 @@ dexpect("#594-R8b same through `export` — no export flag exists, so the declar
 dexpect("#594-R8c control — the prefix form (git really sees it) still expands, so R8a/R8b pin the SOURCE and not 'pairs are never read'",
   `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.lg GIT_CONFIG_VALUE_0='log --graph' git lg`,
   { branchState: false, verb: "log" });
+// ⛔ AND THE PAIRS WIN BY **INDEX**, NOT BY SHELL-LINE ORDER (review round 9, measured
+// rc 0). git loops `for (i = 0; i < count; i++)` in `git_config_from_parameters`
+// (`config.c`), so the HIGHEST index wins; iterating the Map in insertion order made
+// the winner "whichever assignment bash wrote last". Measured (git 2.43.0): the row
+// below created `victimR` rc 0 while the classifier answered `status` /
+// branchState:false → M3 never entered → ALLOWED in a shared main checkout. These two
+// rows are RED on the pre-fix code (verb "status" instead of "branch").
+dexpect("#594-R9a pairs resolve by INDEX order — a destructive index-1 definition written FIRST still wins (git ran it)",
+  `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_1=alias.x GIT_CONFIG_VALUE_1='branch -fq victimR main' GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=status git x`,
+  { branchState: true, stateVerb: "branch" });
+dexpect("#594-R9b control — the SAME assignment order with the destructive value at the LOWER index loses to the benign index-1 (git ran `status`)",
+  `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='branch -fq victimS main' GIT_CONFIG_KEY_1=alias.x GIT_CONFIG_VALUE_1=status git x`,
+  { branchState: false, verb: "status" });
 dexpect("#594 --config-env resolves against the statement's own env prefix",
   `AL='checkout victim' git --config-env=alias.co=AL co`,
   { verdict: "block:checkout-branch", verb: "checkout", branchState: true });
