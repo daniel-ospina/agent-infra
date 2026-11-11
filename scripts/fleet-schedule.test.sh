@@ -4696,12 +4696,21 @@ else
   [ -n "$pid20d" ] && [ "$pid20d" != "$bystander20" ] \
     && ok "20b F1: loop.pid now names a DIFFERENT pid than the recycled one" \
     || bad "20b F1: loop.pid still holds the recycled pid ($pid20d)"
-  if [ -r "/proc/$pid20d/cmdline" ]; then
-    grep -q -- '--loop' "/proc/$pid20d/cmdline" \
+  # ⛔ THIS IDENTITY READ IS PORTABLE ON PURPOSE. `/proc/<pid>/cmdline` is Linux-only, and this file's
+  # two pre-existing reads are already AT their counted budget (`scripts/portability-baseline.tsv`:
+  # `scripts/fleet-schedule.test.sh procfs-macos-absent 2`), so a third would RAISE the ratchet — the
+  # one direction `scripts/check-portability-traps.sh` refuses (`live > baseline`, exit 1). `ps` is
+  # that gate's own named replacement, and it answers the same question on BOTH hosts — so this arm
+  # now also ASSERTS on macOS instead of silently skipping there. `-ww` is load-bearing: BSD `ps`
+  # truncates `args` to the screen width, and the state dir path is long enough to lose `--loop`
+  # (the same reason `ci_runner_pool.sh:771` uses it).
+  args20d="$(ps -ww -o args= -p "$pid20d" 2>/dev/null)"
+  if [ -n "$args20d" ]; then
+    grep -q -- '--loop' <<<"$args20d" \
       && ok "20b F1: the pid it recorded really is fleet-schedule --loop" \
-      || bad "20b F1: the recorded pid is not a scheduler"
+      || bad "20b F1: the recorded pid is not a scheduler: $args20d"
   else
-    skip "20b F1: no /proc/<pid>/cmdline on this platform"
+    skip "20b F1: no readable command line for pid $pid20d on this platform"
   fi
   kill -0 "$bystander20" 2>/dev/null \
     && ok "20b F1: the unrelated process was NOT signalled (a repair is not a kill)" \
