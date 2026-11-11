@@ -79,7 +79,12 @@ case "${1:-}" in
     printf 'started pr=%s run=run-1 pid=4242 session=own repo=fake/repo\n' "${2:-}"
     printf '  log:    %s\n' "$FIXTURE_STATUS"
     ;;
-  status) cat "$FIXTURE_STATUS"; exit "${FIXTURE_RC:-10}" ;;
+  status)
+    # per-PR overrides so one `poll` can see two different answers (row-<pr>.txt / rc-<pr>.txt)
+    _d="${FIXTURE_STATUS%/*}"; _pr="${2:-}"
+    if [ -f "$_d/row-$_pr.txt" ]; then cat "$_d/row-$_pr.txt"; else cat "$FIXTURE_STATUS"; fi
+    if [ -f "$_d/rc-$_pr.txt" ]; then exit "$(cat "$_d/rc-$_pr.txt")"; fi
+    exit "${FIXTURE_RC:-10}" ;;
   *) printf 'fixture: unexpected verb %s\n' "${1:-}" >&2; exit 98 ;;
 esac
 FIX
@@ -87,6 +92,12 @@ chmod +x "$T/rail-run-fixture.sh"
 export RAIL_RUN_SH="$T/rail-run-fixture.sh"
 
 status_row() { printf '%s\n' "$1" > "$FIXTURE_STATUS"; }
+# The CLI keys its run-id file on (identity, PR) — mirror that here rather than hardcoding a path, so
+# the arms exercise the real key and a change to it cannot silently pass.
+runf() { # <pr> [identity]
+  printf '%s/rail-%s-%s.run' "$LAND_LOG_DIR" \
+    "$(printf '%s' "${2:-$LAND_REPO}" | od -An -tx1 | tr -d ' \n')" "$1"
+}
 rb() { bash "$RB" "$@" 2>&1; }
 
 echo "rail-bg.test.sh — one verdict function, delegated to rail-run.sh (#2905)"
@@ -143,7 +154,7 @@ assert_contains "$out" 'started pr=42 run=run-1' "start prints rail-run's own st
 ARGV="$(cat "$FIXTURE_ARGV")"
 assert_contains "$ARGV" 'argv: start 42 --repo fake/repo --dry-run' "start forwards the PR, the identity and the rail args"
 assert_contains "$ARGV" "rail: $LAND_DIR/scripts/atomic-land.sh" "start points rail-run at atomic-land.sh (the full landing unit)"
-assert_eq 'run-1' "$(cat "$LAND_LOG_DIR/rail-42.run" 2>/dev/null)" "start records WHICH run it created"
+assert_eq 'run-1' "$(cat "$(runf 42)" 2>/dev/null)" "start records WHICH run it created"
 
 # ⛔ ONE IDENTITY: a caller-supplied --repo is REFUSED, not forwarded (fresh-review finding F2 on
 # #3923). Forwarded, it keys rail-run's run state under another slug while `wait`/`poll` — which take
@@ -161,30 +172,29 @@ assert_rc 2 "$rc" "the --repo=VALUE spelling is refused too"
 : > "$FIXTURE_ARGV"
 out="$(env FIXTURE_START_RC=3 bash "$RB" start 8 2>&1)"; rc=$?
 assert_rc 3 "$rc" "a refused launch propagates rail-run's exit code (3 = a live run holds the PR)"
-assert_eq '' "$(cat "$LAND_LOG_DIR/rail-8.run" 2>/dev/null)" "a failed launch records no run id"
 out="$(env FIXTURE_START_RC=5 bash "$RB" start 8 2>&1)"; rc=$?
 assert_rc 5 "$rc" "rail-run's 'launch did not start' (5) is propagated, not remapped"
 
 # ⛔ BOTH HALVES OF "a failed launch leaves no run id" ARE PINNED (fresh-review finding F1 on #3923:
 # the earlier arm asserted a file that could not have existed on either path, so no mutant reddened it).
 # Half 1 — a PREVIOUS run's id must be cleared, not merely not-overwritten.
-printf 'run-OLD\n' > "$LAND_LOG_DIR/rail-9.run"
+printf 'run-OLD\n' > "$(runf 9)"
 out="$(env FIXTURE_START_RC=3 bash "$RB" start 9 2>&1)"; rc=$?
 assert_rc 3 "$rc" "a refused start on a PR with a recorded run exits with rail-run's code"
-assert_eq '' "$(cat "$LAND_LOG_DIR/rail-9.run" 2>/dev/null)" \
+assert_eq '' "$(cat "$(runf 9)" 2>/dev/null)" \
   "a refused start CLEARS the earlier run's id (so wait cannot report that run under this call)"
 # Half 2 — a failure path that DOES print a run line must still record nothing.
 out="$(env FIXTURE_START_RUN_THEN_FAIL=1 FIXTURE_START_RC=5 bash "$RB" start 10 2>&1)"; rc=$?
 assert_rc 5 "$rc" "a launch that printed a run line and still failed propagates its code"
 assert_contains "$out" 'started pr=10 run=run-ZZZ' "…the run line really was printed (the arm can discriminate)"
-assert_eq '' "$(cat "$LAND_LOG_DIR/rail-10.run" 2>/dev/null)" \
+assert_eq '' "$(cat "$(runf 10)" 2>/dev/null)" \
   "…and its run id is NOT recorded (the rc gate is what pins it)"
 
 # parse_run_id does not depend on the start line being FIRST in the merged 2>&1 stream
 : > "$FIXTURE_ARGV"
 out="$(env FIXTURE_PRELUDE=1 bash "$RB" start 11 2>&1)"; rc=$?
 assert_rc 0 "$rc" "a prelude line before the start line does not break start"
-assert_eq 'run-1' "$(cat "$LAND_LOG_DIR/rail-11.run" 2>/dev/null)" \
+assert_eq 'run-1' "$(cat "$(runf 11)" 2>/dev/null)" \
   "the run id is parsed from the start LINE, not from line 1 of the stream"
 
 
@@ -268,14 +278,17 @@ assert_not_contains "$out" 'REFUSED' "an abstained read is NEVER reported REFUSE
 # ── 5. the false-PASS arms: a code/row disagreement can never land ────────────
 out="$(wait_arm 42 0 'unknown pr=42 run=run-1 repo=fake/repo pid=none rail_pid=none rc=- pr_state=not-read merged=- started=x log_bytes=10 log_age_s=1')"; rc=$?
 assert_contains "$out" 'RECOMMEND: 42 UNKNOWN' "rc=0 with an unknown row → UNKNOWN (codes are cross-checked)"
+assert_rc 25 "$rc" "…and the RETRACTED code is not what the shell exits with (25, rail-run's abstention) — not 0/LANDED"
 assert_not_contains "$out" 'LANDED' "a code/row DISAGREEMENT is never resolved in favour of LANDED"
 
 out="$(wait_arm 42 60 'landed pr=42 run=run-1 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state=MERGED merged=2026-11-01T00:00:00Z started=x log_bytes=10 log_age_s=1')"; rc=$?
 assert_contains "$out" 'RECOMMEND: 42 UNKNOWN' "an exit code outside rail-run's table → UNKNOWN"
+assert_rc 25 "$rc" "…and exits 25 rather than propagating the unrecognised code"
 assert_not_contains "$out" 'RECOMMEND: 42 LANDED' "an unrecognised code can never produce LANDED"
 
 out="$(wait_arm 42 20 'redacted pr=42 run=run-1 repo=fake/repo pid=none rail_pid=none rc=1 pr_state=OPEN merged=- started=x log_bytes=10 log_age_s=1')"; rc=$?
 assert_contains "$out" 'RECOMMEND: 42 UNKNOWN' "an unrecognised state word → UNKNOWN"
+assert_rc 25 "$rc" "…and exits 25, not the retracted 20/REFUSED (#2412 shape via the code)"
 assert_not_contains "$out" 'REFUSED' "an unrecognised state word can never produce REFUSED"
 
 # ── 6. wait polls THE run it started, never a newer one ──────────────────────
@@ -284,7 +297,7 @@ status_row 'landed pr=42 run=run-1 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state
 env FIXTURE_RC=0 bash "$RB" wait 42 0 >/dev/null 2>&1
 assert_contains "$(cat "$FIXTURE_ARGV")" 'argv: status 42 --repo fake/repo --run run-1' \
   "wait polls the recorded run id, not whatever is newest"
-rm -f "$LAND_LOG_DIR/rail-42.run"
+rm -f 
 : > "$FIXTURE_ARGV"
 env FIXTURE_RC=0 bash "$RB" wait 42 0 >/dev/null 2>&1
 assert_contains "$(cat "$FIXTURE_ARGV")" 'argv: status 42 --repo fake/repo' \
@@ -307,6 +320,32 @@ out="$(rb poll --max nope 42)"; rc=$?
 assert_rc 2 "$rc" "poll refuses a non-numeric bound (a bound that cannot fire is not a bound)"
 out="$(rb poll)"; rc=$?
 assert_rc 2 "$rc" "poll with no PRs is a usage error"
+
+# ── 8. the run-id bookkeeping is keyed by IDENTITY, not by PR alone (round-3 finding F2) ───────
+# rail-run keys its state on (repo, PR); a PR-only filename here shared one binding between two repos'
+# PR 42 on a box with the shared LAND_LOG_DIR, so `wait` polled one repo's run under another's identity.
+: > "$FIXTURE_ARGV"
+status_row 'running pr=42 run=run-1 repo=other/repo pid=1 rail_pid=2 rc=- pr_state=OPEN merged=- started=x log_bytes=10 log_age_s=1'
+out="$(env LAND_REPO=other/repo bash "$RB" start 42 2>&1)"; rc=$?
+assert_rc 0 "$rc" "start under one identity succeeds"
+assert_eq 'run-1' "$(cat "$(runf 42 other/repo)" 2>/dev/null)" "…and records its run id under THAT identity"
+assert_eq '' "$(cat "$(runf 42 repo-a/x)" 2>/dev/null)" "…and NOT under another identity's key (the PR-only key collided)"
+: > "$FIXTURE_ARGV"
+env LAND_REPO=repo-a/x FIXTURE_RC=10 bash "$RB" wait 42 0 >/dev/null 2>&1
+assert_not_contains "$(cat "$FIXTURE_ARGV")" '--run run-1' \
+  "a wait under another identity never polls the first identity's run id"
+
+# ── 9. poll aggregates by WORST per-PR code (round-3 finding F3) ───────────────────────────────
+# The fixture supports per-PR rows/codes, so this arm can give two PRs two different answers.
+printf 'landed pr=7 run=r7 repo=fake/repo pid=1 rail_pid=2 rc=0 pr_state=MERGED merged=2026-11-01T00:00:00Z started=x log_bytes=10 log_age_s=1\n' > "$T/row-7.txt"
+printf '0\n' > "$T/rc-7.txt"
+printf 'unknown pr=8 run=r8 repo=fake/repo pid=none rail_pid=none rc=- pr_state=not-read merged=- started=x log_bytes=10 log_age_s=1\n' > "$T/row-8.txt"
+printf '25\n' > "$T/rc-8.txt"
+out="$(bash "$RB" poll --max 0 7 8 2>&1)"; rc=$?
+assert_contains "$out" 'RECOMMEND: 7 LANDED' "poll reports the landed PR as LANDED"
+assert_contains "$out" 'RECOMMEND: 8 UNKNOWN' "…and the abstaining PR as UNKNOWN"
+assert_rc 25 "$rc" "poll exits with the WORST per-PR code (a landing beside an abstention is NOT exit 0)"
+rm -f "$T/row-7.txt" "$T/rc-7.txt" "$T/row-8.txt" "$T/rc-8.txt"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

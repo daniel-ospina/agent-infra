@@ -43,15 +43,20 @@
 #                  environment error, never a guess.
 #   LAND_RAIL      the rail executable (default: $LAND_DIR/scripts/atomic-land.sh)
 #   LAND_POLL_MAX  default max_s for `wait`/`poll` (default: 1500); must be numeric
-#   LAND_LOG_DIR   where this CLI remembers WHICH run it started ($LAND_LOG_DIR/rail-<pr>.run), so a
-#                  `wait` polls its own run and never a newer one (default: $TMPDIR/pi-landing-lane)
+#   LAND_LOG_DIR   where this CLI remembers WHICH run it started
+#                  ($LAND_LOG_DIR/rail-<hex(identity)>-<pr>.run — keyed by identity AND PR, because
+#                  rail-run's own store is), so a `wait` polls its own run and never a newer one, on
+#                  any repo (default: $TMPDIR/pi-landing-lane)
 #   RAIL_RUN_SH    the rail-run.sh to delegate to (default: the one beside this script's repo)
 #
 # Exit: 0 = landed · 2 = usage or environment error · 3 = a live run already holds <pr> · 5 = the
 #       launch did not start (rail-run could not record a pid) · 78 = rail-run's identity library is
 #       missing (it refuses to guess liveness) · otherwise rail-run's own state code (10 running ·
 #       20 refused · 21 killed · 22 gone-without-verdict · 23 exited-zero · 24 no-run · 25 unknown).
-#       Read the printed CONFIRMED/RECOMMEND lines; the exit code IS rail-run's, unmodified.
+#       `start`/`wait` exit with rail-run's own code, with ONE exception: when this CLI RETRACTS that
+#       code (it and the row disagree) it exits 25 — rail-run's own abstention — never the retracted
+#       0/20. `poll` exits with the WORST of the per-PR codes (the `gh pr checks` convention for a
+#       multi-item answer). Read the printed CONFIRMED/RECOMMEND lines as well as the code.
 #
 #   The repo identity is LAND_REPO and nothing else: `start` refuses a `--repo` argument, because the
 #   identity keys rail-run's run state and `wait`/`poll` take no `--repo` — so two ways to spell it
@@ -94,7 +99,15 @@ resolve_repo() {
 # WHICH RUN THIS CLI STARTED. Bookkeeping only — no verdict lives here. rail-run already refuses a
 # second live run for the same PR, so this is what keeps `wait` pointed at the run it launched rather
 # than at whatever is newest when it happens to poll.
-run_file() { printf '%s/rail-%s.run' "$LAND_LOG_DIR" "$1"; }
+# ⛔ THE KEY MUST BE NO COARSER THAN THE RECORD IT NAMES (fresh-review finding F2 on #3923, #729's
+# lesson). rail-run keys its run state on (repo, PR); a PR-only filename here shared ONE binding
+# between two identities on a box whose `LAND_LOG_DIR` is the shared default, so `wait` polled repo B's
+# run id under repo A's identity and printed `NO-RUN (nothing was started for this PR)` while A's rail
+# was running. The slug is HEX-encoded rather than `/`→`-` mapped because that mapping is NOT
+# injective (`a/b-c` and `a-b/c` collide) and this key has to be.
+run_file() {
+  printf '%s/rail-%s-%s.run' "$LAND_LOG_DIR" "$(printf '%s' "$REPO" | od -An -tx1 | tr -d ' \n')" "$1"
+}
 recorded_run() { local f; f="$(run_file "$1")"; [ -s "$f" ] && tr -d '\r\n' < "$f" 2>/dev/null || true; }
 
 # The run id from rail-run's `started pr=<n> run=<id> …` line. Scanned over the WHOLE stream, not
@@ -137,6 +150,11 @@ state_for_rc() {
 }
 
 # report <pr> <rail-run rc> <rail-run output> — the row verbatim, then two transcribed lines.
+# RETURNS THE EFFECTIVE EXIT CODE. Normally that is rail-run's `$rc`, unchanged — but when this CLI
+# RETRACTS the code (the code and the row disagree, or the code is outside rail-run's table) it returns
+# rail-run's own abstention code (25) instead: exiting with the retracted 0/20 while printing UNKNOWN
+# told a lane that branches on the documented code `LANDED`/`REFUSED`, which is the false-PASS/abandon
+# shape this file exists to remove (fresh-review finding F1 on #3923).
 report() {
   local pr="$1" rc="$2" out="$3" state want merged prstate confirmed reason
   state="$(row_state "$out")"
@@ -178,7 +196,7 @@ report() {
   if [ -z "$want" ] || { [ -n "$state" ] && [ "$state" != "$want" ]; }; then
     printf 'RECOMMEND: %s UNKNOWN (rc=%s state=%s — rail-run'"'"'s code and row disagree; resolve before acting)\n' \
       "$pr" "$rc" "${state:-absent}"
-    return 0
+    return 25
   fi
   case "$want" in
     landed)  printf 'RECOMMEND: %s LANDED "merged=%s"\n' "$pr" "$confirmed" ;;
@@ -196,6 +214,7 @@ report() {
   if [ "$want" = landed ] && [ "$confirmed" != true ]; then
     printf 'NOTE: rail-run reports `landed` but its recorded merged= field does not read true (%s) — count a landing only on an observed merged=true\n' "$confirmed"
   fi
+  return "$rc"
 }
 
 cmd_start() {
@@ -259,13 +278,13 @@ cmd_wait() {
     if [ $(( SECONDS - start )) -ge "$max" ]; then
       printf 'STILL RUNNING after %ss\n' "$max"
       report "$pr" "$rc" "$out"
-      return "$rc"
+      return $?
     fi
     sleep 15
   done
   printf '── rail-run state after %ss ──\n' "$(( SECONDS - start ))"
   report "$pr" "$rc" "$out"
-  return "$rc"
+  return $?
 }
 
 cmd_poll() {
@@ -282,7 +301,7 @@ cmd_poll() {
   for a in "${prs[@]}"; do is_numeric "$a" || die_usage "PR must be numeric (got '$a')"; done
   REPO="$(resolve_repo)" || die "cannot tell which repository these PRs belong to — set LAND_REPO owner/repo"
 
-  local start=$SECONDS pr out rc alive worst=0
+  local start=$SECONDS pr out rc rrc alive worst=0
   while :; do
     alive=""
     for pr in "${prs[@]}"; do
@@ -301,8 +320,10 @@ cmd_poll() {
   for pr in "${prs[@]}"; do
     printf '════ PR %s ════\n' "$pr"
     out="$(rr_status "$pr" 2>&1)"; rc=$?
-    report "$pr" "$rc" "$out"
-    [ "$rc" -gt "$worst" ] && worst="$rc"
+    # The per-PR EFFECTIVE code (a retracted one is 25), and the aggregate is the worst of them — the
+    # `gh pr checks` convention for a multi-item answer (fresh-review finding F3 on #3923).
+    report "$pr" "$rc" "$out"; rrc=$?
+    [ "$rrc" -gt "$worst" ] && worst="$rrc"
   done
   return "$worst"
 }

@@ -197,7 +197,7 @@ LAND_DIR=... LAND_REPO=daniel-ospina/tortoise scripts/landing/rail-bg.sh wait 68
 | `LAND_DIR` | git top level of this script's directory | the checkout the rail runs in; the rail is `$LAND_DIR/scripts/atomic-land.sh` — an **agent-infra** checkout, never the PR's repo (`tortoise` has no `scripts/atomic-land.sh`) |
 | `LAND_RAIL` | `$LAND_DIR/scripts/atomic-land.sh` | the rail executable, handed to rail-run as `RAIL_RUN_RAIL` |
 | `LAND_REPO` | `gh repo view` **in `LAND_DIR`** | the `[HOST/]owner/name` identity passed to rail-run as `--repo` — it also keys rail-run's run state. It is the **only** way to name it: `start` refuses a `--repo` argument, because `wait`/`poll` take none and two spellings would let them poll a different run than the one `start` created. A failed resolve is an environment error, never a guess |
-| `LAND_LOG_DIR` | `$TMPDIR/pi-landing-lane` | where this CLI remembers **which** run it started (`rail-<pr>.run`), so `wait` polls its own run and never a newer one. Rail state and logs live in rail-run's `RAIL_RUN_DIR`, not here |
+| `LAND_LOG_DIR` | `$TMPDIR/pi-landing-lane` | where this CLI remembers **which** run it started — `rail-<hex(identity)>-<pr>.run`, keyed by identity **and** PR because rail-run's own store is (a PR-only key let two repos' PR 42 share one binding on a box with the shared default dir). Rail state and logs live in rail-run's `RAIL_RUN_DIR`, not here |
 | `LAND_POLL_MAX` | `1500` | default `max_s` for `wait`/`poll`; must be numeric, and a non-numeric value is refused (a bound that can never fire is not a bound) |
 | `RAIL_RUN_SH` | `scripts/rail-run.sh` in this repo | the delegate — a test seam, not a knob to point at a second instrument |
 
@@ -225,11 +225,19 @@ PR's state and merge timestamp) followed by two transcribed lines:
   has no outcome yet and frequently does land (#2412 is the shape where a lane was told "refused" and
   the PR merged four minutes later).
 
-The exit code is **rail-run's, unmodified**: `0` landed · `10` running · `20` refused · `21` killed ·
-`22` gone-without-verdict · `23` exited-zero · `24` no-run · `25` unknown · `2` usage/environment ·
-`3` a live run already holds the PR · `5` the launch did not start (rail-run could not record a pid) ·
-`78` rail-run's identity library is missing (it refuses to guess liveness). `0` on `start` means
-launched, not landed.
+The exit code is **rail-run's**, with two stated exceptions: `0` landed · `10` running · `20` refused ·
+`21` killed · `22` gone-without-verdict · `23` exited-zero · `24` no-run · `25` unknown ·
+`2` usage/environment · `3` a live run already holds the PR · `5` the launch did not start (rail-run
+could not record a pid) · `78` rail-run's identity library is missing (it refuses to guess liveness).
+
+1. When this CLI **retracts** the code — it and the row disagree, so the report says `UNKNOWN (rc=…
+   state=…)` — it exits `25` (rail-run's own abstention), **never** the retracted `0`/`20`: exiting
+   `LANDED`/`REFUSED` while printing "no verdict" is the false-PASS and #2412 abandon shape in the
+   signal lanes actually branch on.
+2. `poll` exits with the **worst of the per-PR codes** (the `gh pr checks` convention for a multi-item
+   answer), so one landed PR beside one abstention exits `25`, not `0`.
+
+`0` on `start` means launched, not landed.
 
 **One rail per PR.** rail-run refuses a second live run for the same PR (exit 3) and its claim has a
 stale bound, so the README's own advice (fact 3 below) — re-run the rail after a base-side fix — is
