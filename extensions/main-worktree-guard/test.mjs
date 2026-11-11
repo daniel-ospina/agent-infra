@@ -4858,19 +4858,46 @@ try {
   // refusing to SKIP one. That loses the cd entirely, and then
   // `cd \<NL>docs; echo pwn > ../tracked.md` resolves one level ABOVE the hub
   // while real bash overwrites the TRACKED root file — the same fail-OPEN this
-  // issue closed, one implementation choice away. So every row below is a
-  // real-bash-verified pair: the continuation (must keep the cd) and its bare
-  // newline neighbour (must NOT read the next line as the operand).
-  // Measured on bash 5.2.21 with HOME OUTSIDE the fixture hub, per arm:
+  // issue closed, one implementation choice away. So every row below is a pair:
+  // the continuation (must keep the cd) and its bare-newline neighbour (must NOT
+  // read the next line as the operand).
+  //
+  // ⛔ WHAT THE BARE-NEWLINE ROWS ACTUALLY PIN: THE WALKER'S MODEL, NOT A
+  // REAL-BASH WRITE (fresh review, P1 — the previous wording there claimed a
+  // real-bash write that does not happen). Measured on bash 5.2.21 with HOME
+  // OUTSIDE the fixture hub: a bare `cd` is `cd "$HOME"` — it does NOT leave the
+  // cwd unchanged — and on the next line `docs` is a COMMAND (`bash: docs:
+  // command not found`, rc 127), so `cd <NL>docs && echo x > f.md` performs NO
+  // WRITE AT ALL: the bare cd left the hub for $HOME and `&&` short-circuits to
+  // nothing. The WALKER models a bare `cd`/`pushd` as a conservative NO-OP
+  // (the "flag / +N / bare forms don't cd (conservative no-op)" arm of its
+  // cd/pushd branch), so it keeps the cwd at the hub and emits `redirect:H/f.md`
+  // — an over-approximation (a write that never happens) in the SAFE direction,
+  // and the direction the N3 control must keep: the mutant this block exists
+  // against is the OVER-read (`skipWsNl` crossing the newline, #3956), which
+  // lands on the TRACKED `docs/f.md`.
+  // Measured per arm (bash 5.2.21, HOME outside the fixture hub):
   //   `cd \<NL>docs && echo x > f.md`      → docs/f.md      (continuation)
-  //   `cd <NL>docs && echo x > f.md`       → f.md, bash: "docs: command not found"
+  //   `cd <NL>docs && echo x > f.md`       → nothing written (bare cd → $HOME;
+  //                                          `docs` exits 127, `&&` short-circuits)
   //   `cd \<NL>docs; echo pwn > ../tracked.md` → tracked.md (TRACKED root)
   //   `pushd \<NL>docs; echo pwn > ../tracked.md` → tracked.md (TRACKED root)
+  // ⛔ AND THE BARE-cd NO-OP IS NOT HARMLESS IN THAT OTHER DIRECTION (measured
+  // on this box, NOT this issue's newline root, and NOT pinned here as a
+  // verdict): real bash's bare `cd` goes to $HOME, so on a box where HOME IS the
+  // hub's parent — this fleet's own layout, HOME=/home/cmux,
+  // hub=/home/cmux/agent-infra — `cd <NL>echo pwn > agent-infra/tracked.md`
+  // really overwrites the TRACKED hub file while the walker (cwd unchanged at
+  // the hub) resolves `agent-infra/tracked.md` one directory too DEEP, i.e. an
+  // ALLOW. Filed as #3981 with that measurement; the bare-newline arms here stay
+  // controls, so nothing below claims the model is real-bash-equal.
   // ⛔ ONE TRACKED FILE PER ARM FAMILY (#3957 review NOTE 1): with BOTH paths
   // tracked, the wrong resolution and the right one BOTH block, so the gate rows
-  // could not discriminate. Each `blocks`/`allows` row declares only the file
-  // real bash actually writes; a candidate resolved outside the hub is keyed by
-  // its absolute path, which can never equal a hub-relative tracked name.
+  // could not discriminate. Each `blocks`/`allows` row declares the one file
+  // THAT ARM writes — the real-bash target for a continuation arm, the walker's
+  // no-op target for a bare-newline control; a candidate resolved outside the
+  // hub is keyed by its absolute path, which can never equal a hub-relative
+  // tracked name.
   {
     const H = mkdtempSync(join(tmpdir(), "bwt3956-"));
     mkdirSync(join(H, "docs")); mkdirSync(join(H, "a"));
@@ -4892,20 +4919,35 @@ try {
     blocks(["docs/f.md"], "cd \\\ndocs && echo x > f.md", "N3 gate: real bash overwrites the TRACKED docs/f.md → BLOCK");
     // …and its neighbour, which is what makes N3 discriminate: a BARE newline
     // ends the simple command, so `docs` is a COMMAND (bash: command not found)
-    // and cd has NO operand — the write stays at the fixture root.
-    has("cd\ndocs && echo x > f.md", "redirect:H/f.md", "N3 control: a bare newline is NOT a continuation — `docs` is a command, not cd's operand");
+    // and cd has NO operand. The row pins the WALKER's model of that shape: a
+    // bare cd is a conservative NO-OP, so the write stays at the fixture root.
+    has("cd\ndocs && echo x > f.md", "redirect:H/f.md", "N3 control: a bare newline is NOT a continuation — `docs` is a command, not cd's operand (walker: bare cd = no-op, so the write is the hub's root f.md)");
     lacks("cd\ndocs && echo x > f.md", "redirect:H/docs/f.md", "N3 control: the pre-fix over-read (docs as cd's operand) stays closed");
-    allows(["docs/f.md"], "cd\ndocs && echo x > f.md", "N3 control gate: real bash writes the untracked root f.md → ALLOW");
+    allows(["docs/f.md"], "cd\ndocs && echo x > f.md", "N3 control gate: the walker's bare-cd no-op keeps the write at the untracked root f.md → ALLOW (real bash writes nothing here at all — the bare cd goes to $HOME and `docs`, a command, exits 127)");
 
     // The continuation in the BYPASS direction: an implementation that drops the
     // continued cd resolves the write one level ABOVE the hub — an ALLOW on a
     // TRACKED hub file. This is the row the N1/N2 pins cannot catch.
     has("cd \\\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N4: the continued cd is not lost — the write is the tracked root file, not one level above the hub");
     blocks(["tracked.md"], "cd \\\ndocs; echo pwn > ../tracked.md", "N4 gate: TRACKED root tracked.md → BLOCK");
-    // its neighbour: with a BARE newline the cd is bare, so `..` is the hub's
-    // PARENT and the tracked root file is never touched.
-    lacks("cd\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N4 control: a bare newline leaves a bare cd — `..` is the hub's parent, not the hub");
+    // its neighbour: with a BARE newline the cd is BARE, and the walker models a
+    // bare cd as a NO-OP, so the cwd stays the hub and `..` resolves one level
+    // ABOVE it — the tracked root file is never touched. ⛔ NOT because "`..` is
+    // the hub's parent" in bash: real bash's cwd here is $HOME (a bare cd is
+    // `cd "$HOME"`), so bash's `..` is $HOME's parent. The ALLOW holds under
+    // both models only because the fixture puts HOME outside the hub (see the
+    // block comment: with HOME == the hub's parent this arm is a fail-OPEN,
+    // filed separately).
+    lacks("cd\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N4 control: a bare newline leaves a bare cd, and the walker's bare-cd no-op keeps the cwd at the hub — so `..` is the hub's PARENT, not the hub (real bash: cwd is $HOME, so `..` is $HOME's parent)");
     allows(["tracked.md"], "cd\ndocs; echo pwn > ../tracked.md", "N4 control gate (discriminating pair): same shape and SAME tracked root file — the bare-newline arm resolves above the hub, so only the continuation arm blocks");
+    // ⛔ PRESENCE PIN (fresh review, P3): the pair above passes on an EMPTY
+    // candidate list — `firstHubTrackedWrite([]) === null` and `!"".includes(…)`
+    // are both true — so if the walker stopped emitting a candidate for this
+    // bare-newline arm the pair would go vacuous and nothing would redden. The N3
+    // control pins presence through its `has` row; this gives N4 the same
+    // guarantee, which is the difference between a pair that discriminates and a
+    // pair that cannot.
+    expectBool("C3956: N4 control still emits a candidate (presence pin)", cands("cd\ndocs; echo pwn > ../tracked.md").length >= 1, true);
     has("pushd \\\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N5: pushd's operand read honours the continuation too");
     blocks(["tracked.md"], "pushd \\\ndocs; echo pwn > ../tracked.md", "N5 gate: TRACKED root tracked.md → BLOCK");
     // continuation + indent, the #625 LEAD-continuation shape, on the cwd path.
