@@ -22,6 +22,14 @@
 #     not-counting = over-dispatch.
 set -uo pipefail
 
+# ── DISK ADMISSION IS NEUTRALISED FOR THIS SUITE (agent-infra#3395's census, its "J" arm) ────
+# This suite DRIVES the provision seam through a shipped caller (`ai-drainer.sh` → the lane
+# provisioner), so without these four terms its outcome would be decided by the HOST's free space:
+# green on a roomy runner, red on a full one. All four are required, and they must be EXPORTED (a
+# bare assignment is a shell variable, not the environment; TREE defaults to 350 MB when unstated).
+# A case that wants a different floor sets it on that command's own `env` prefix.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRAINER="${DRAINER:-$HERE/ai-drainer.sh}"
 LAUNCHER="$HERE/multi-repo-controller.sh"

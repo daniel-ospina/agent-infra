@@ -28,6 +28,15 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOD="$HERE/controller-state.sh"
+
+# ── DISK ADMISSION IS NEUTRALISED FOR THIS SUITE (agent-infra#3395's census, its "J" arm) ────
+# Every case here drives the shipped `orch-loop.sh`, which reaches the provision seam
+# (`wt-lifecycle.sh` → `wt_provision`), so without these four terms the suite's outcome would be
+# decided by the HOST's free space: green on a roomy runner, red on a full one. All four are
+# required, and they must be EXPORTED (a bare assignment is a shell variable, not the environment;
+# TREE defaults to 350 MB when unstated). A case that wants a different floor sets it on that
+# command's own `env` prefix.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
 LOOP="$HERE/orch-loop.sh"
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
