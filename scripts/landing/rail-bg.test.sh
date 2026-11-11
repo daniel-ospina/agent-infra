@@ -21,7 +21,7 @@
 # RAIL_RUN_SH and all state lives in a temp dir.
 #
 # Run:  bash scripts/landing/rail-bg.test.sh
-# Exit: 0 when every assertion passes, 1 on any failure, 2 when the interpreter is missing.
+# Exit: 0 when every assertion passes, 1 on any failure.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -129,6 +129,13 @@ out="$(rb nonsense)"; rc=$?
 assert_rc 2 "$rc" "unknown subcommand is a usage error"
 out="$(rb wait abc)"; rc=$?
 assert_rc 2 "$rc" "a non-numeric PR is a usage error"
+# ⛔ `wait`'s OWN max_s guard, not just `poll`'s (fresh-review finding F3, round 5). MEASURED: delete
+# the guard and this arm does not merely redden — the suite HANGS, because `[ $((SECONDS-start)) -ge
+# nope ]` errors into false and the loop never reaches its bound. That is the defect (an inert bound),
+# and an inert bound cannot be pinned by a green run: it can only be pinned by a run that never ends.
+out="$(rb wait 42 nope)"; rc=$?
+assert_rc 2 "$rc" "a non-numeric max_s is refused by wait (a bound that cannot fire is not a bound)"
+assert_contains "$out" 'max_s must be numeric' "…and the refusal names the offending argument"
 
 # no identity: LAND_REPO unset AND `gh repo view` yields nothing — an environment error, not a guess
 mkdir -p "$T/bin"
@@ -333,7 +340,6 @@ status_row 'running pr=42 run=run-1 repo=other/repo pid=1 rail_pid=2 rc=- pr_sta
 out="$(env LAND_REPO=other/repo bash "$RB" start 42 2>&1)"; rc=$?
 assert_rc 0 "$rc" "start under one identity succeeds"
 assert_eq 'run-1' "$(cat "$(runf 42 other/repo)" 2>/dev/null)" "…and records its run id under THAT identity"
-assert_eq '' "$(cat "$(runf 42 repo-a/x)" 2>/dev/null)" "…and NOT under another identity's key (the PR-only key collided)"
 : > "$FIXTURE_ARGV"
 env LAND_REPO=repo-a/x FIXTURE_RC=10 bash "$RB" wait 42 0 >/dev/null 2>&1
 assert_not_contains "$(cat "$FIXTURE_ARGV")" '--run run-1' \

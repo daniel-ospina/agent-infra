@@ -58,8 +58,9 @@
 #             abstention), never the retracted 0/20;
 #        (ii) rail-run exiting with NO row at all (`2`/`3`/`5`/`78`) is reported as `ERROR` and keeps
 #             ITS code, so a partial install (78 = pid-identity.sh missing) still names itself.
-#       `poll` exits with the WORST of the per-PR codes (the `gh pr checks` convention for a multi-item
-#       answer). Read the printed CONFIRMED/RECOMMEND lines as well as the code.
+#       `poll` exits with the MOST PESSIMISTIC of the per-PR codes — a multi-item answer needs one code,
+#       and the most pessimistic is the only one where a single abstention cannot be masked by a landing
+#       beside it. Read the printed CONFIRMED/RECOMMEND lines as well as the code.
 #
 #   The repo identity is LAND_REPO and nothing else: `start` refuses a `--repo` argument, because the
 #   identity keys rail-run's run state and `wait`/`poll` take no `--repo` — so two ways to spell it
@@ -347,8 +348,11 @@ cmd_poll() {
   for pr in "${prs[@]}"; do
     printf '════ PR %s ════\n' "$pr"
     out="$(rr_status "$pr" 2>&1)"; rc=$?
-    # The per-PR EFFECTIVE code (a retracted one is 25), and the aggregate is the worst of them — the
-    # `gh pr checks` convention for a multi-item answer (fresh-review finding F3 on #3923).
+    # The per-PR EFFECTIVE code (a retracted one is 25), and the aggregate is the MOST PESSIMISTIC of
+    # them: a multi-item answer needs one code, and any other rule lets one abstention be masked by a
+    # landing beside it. (An earlier version attributed this to a `gh pr checks` convention — `gh pr
+    # checks` takes ONE PR, so there is no such convention; the rationale was right, the citation was
+    # not. Fresh-review finding F2, round 5.)
     report "$pr" "$rc" "$out"; rrc=$?
     [ "$rrc" -gt "$worst" ] && worst="$rrc"
   done
