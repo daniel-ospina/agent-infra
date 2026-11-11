@@ -1277,27 +1277,133 @@ echo "── J) every suite that DRIVES the provision seam neutralises the admis
 #   EFFECTIVE   `VAR=v <four terms> bash …` (leading env prefix)    (S2, spawn-gate.test.sh's idiom)
 #   NOT         `true <terms>` / `: <terms>` / `echo <terms>` …     (the terms are ARGUMENTS)
 #   NOT         `<terms>` alone on a line, no export, no command    (a shell variable, not the env)
+# ── FALSE POSITIVES OF THE D1/D2 PREDICATES, BOTH MEASURED ON `origin/main` (#3916) ──────────────
+# Both arms below are TEXTUAL matchers, and text is not code. `bash-suites` was permanently red on
+# main because of two such readings, each a suite that does NOT drive provisioning:
+#   • D2 read a grep-PATTERN TABLE row (`adopt-fix.sh|bash "$O/fix-one.sh"|bash "${_AF_WORK:-$O}/
+#     fix-one.sh"`, controller-state.test.sh:653) as an execution. It is the body of `done <<'PAIRS'`
+#     — STDIN for a `read` loop, i.e. DATA. A heredoc body is code only when its consumer is a SHELL
+#     (`bash <<'EOF'`); when it is `done`/`cat`/`grep`, the body is data and a pattern that reads like
+#     a command is not one.
+#   • D1 read `WTL="$ROOT/no-such-wt-lifecycle.sh"` (ai-drainer.test.sh:1007,1023,1033) as a reference
+#     to the seam. It is a DELIBERATELY NONEXISTENT path, named to prove the drainer works without the
+#     script — and `no-such-` is exactly the point: a name whose preceding character is a path/word
+#     character (`-`, `_`, `.`, alnum) is a DIFFERENT file, never `wt-lifecycle.sh` itself.
+# ⛔ NEITHER EXCEPTION MAY COST THE GUARANTEE. A heredoc body IS scanned when the opener line carries a
+# shell token, and an opener whose delimiter never closes is not treated as a heredoc at all (skipping
+# nothing) — so a mis-read `<<` cannot blind the census. Both directions are pinned below, next to each
+# other, because a predicate that stops flagging real drivers is the hole this arm exists to close.
 provision_drives_seam() { # <file> -> 0 when a NON-COMMENT command references the seam (D1)
   [ -f "$1" ] || return 1
-  awk '/^[ \t]*#/ { next } /wt-lifecycle\.sh|wt_provision/ { found = 1; exit } END { exit(found ? 0 : 1) }' "$1"
+  # ⛔ TEXT IS NOT CODE — the D1 half of #3916. The bare substring matcher read THREE shapes that
+  # reference nothing, all measured on `origin/main`:
+  #   • `WTL="$ROOT/no-such-wt-lifecycle.sh"` (ai-drainer.test.sh:1007,1023,1033) — a DELIBERATELY
+  #     non-existent path, named to prove the drainer works WITHOUT the script. A name whose preceding
+  #     character is a path/word character (`-`, `_`, `.`, alnum) is a DIFFERENT file, never the seam.
+  #   • `grep -q "wt-lifecycle.sh" "$LOG"` (ai-drainer.test.sh:1011) — a grep PATTERN.
+  #   • `bad "T7 …"` / `ok "… the pre-start seam every wt_provision caller refuses …"` /
+  #     `check "(i3) a stale/missing wt-lifecycle.sh does NOT disarm …"` (dispatch-teardown.test.sh:290,
+  #     cloud-cell-supervisor.test.sh:1738, ai-drainer.test.sh:1024) — PROSE in a message.
+  # So the seam name is looked for in an ASSIGNMENT RHS, after a SHELL/exec word (`bash`, `source`, …),
+  # or UNQUOTED — a quoted span that is an ARGUMENT to some other command is text, not a reference.
+  # ⛔ THE RESIDUAL, stated rather than implied: a seam path quoted in COMMAND position with no shell
+  # word in front of it (`"$HERE/wt-lifecycle.sh" args`, direct execution) is NOT counted. Measured on
+  # this population no such suite exists — every real driver binds the seam through an assignment
+  # (`WTL=` / `_WTLIB=`) and the invocation is either sourced or shell-prefixed.
+  awk '
+    function d1code(line,   i, n, ch, qc, keep, out, tok, prev, q1, q2, shelly) {
+      q1 = sprintf("%c", 39); q2 = "\""
+      shelly = "^(bash|sh|source|exec|command|env|sudo|doas|xargs|nohup|builtin|time|then|do|!)$"
+      out = ""; qc = ""; keep = 0; tok = ""
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        ch = substr(line, i, 1)
+        if (qc != "") {
+          if (ch == qc) { if (keep) out = out ch; qc = ""; continue }
+          if (qc == q2 && ch == "\\" && i < n) { if (keep) out = out ch substr(line, i + 1, 1); i++; continue }
+          if (keep) out = out ch
+          continue
+        }
+        if (ch == q1 || ch == q2) {
+          prev = (i > 1) ? substr(line, i - 1, 1) : ""
+          keep = (prev == "=") || (tok ~ shelly)
+          if (keep) out = out ch
+          qc = ch
+          continue
+        }
+        if (ch ~ /[ \t]/) { tok = ""; out = out ch; continue }
+        if (ch ~ /[;&|(){}<>]/) { tok = ""; out = out ch; continue }
+        tok = tok ch
+        out = out ch
+      }
+      return out
+    }
+    /^[ \t]*#/ { next }
+    { code = code d1code($0) "\n" }
+    END { exit(code ~ /(^|[^A-Za-z0-9._-])(wt-lifecycle\.sh|wt_provision)/ ? 0 : 1) }' "$1"
 }
 provision_invokes_caller() { # <file> -> 0 when a NON-COMMENT command runs a shipped caller (D2)
   [ -f "$1" ] || return 1
+  # ⛔ HEREDOC DATA IS NOT CODE (#3916). The skip is on the CONSUMER, not on `<<` alone: a body fed
+  # to a shell is executed and stays scanned. ⛔ THE RESIDUAL THIS LEAVES, declared rather than
+  # implied: a body that a non-shell consumer FEEDS TO CODE (`while read l; do eval "$l"; done <<'X'`)
+  # is data to this walk and is not scanned. The previous predicate did not scan it as code either —
+  # it flagged such bodies only by accident, on the same false positive this fix removes. Measured on
+  # this population: no suite takes its provisioning through a read-loop over a heredoc. The file is buffered so the heredoc walk can be done up front:
+  # a body is skipped ONLY when its opener line carries no shell token AND its delimiter is actually
+  # found. An unterminated opener (a quoted `<<` in prose, a `<<<` herestring) skips NOTHING, so a
+  # mis-detection can only ever scan more, never less.
   awk -v CALLER='(wt-lifecycle|fix-one|adopt-fix|dispatch-merge)[.]sh' '
-    /^[ \t]*#/ { next }
-    {
-      if ($0 !~ CALLER) next
-      rest = $0
+    function scan(line,   rest, start, tail) {
+      if (line !~ CALLER) return 0
+      rest = line
       while (match(rest, /(^|[ \t;&|(])(bash|sh|source)[ \t]/)) {
         start = RSTART + RLENGTH
         tail  = substr(rest, start)
         sub(/[|;&].*$/, "", tail)
-        if (tail ~ CALLER) { found = 1; exit }
+        if (tail ~ CALLER) return 1
         rest = substr(rest, start)
         if (length(rest) == 0) break
       }
+      return 0
     }
-    END { exit(found ? 0 : 1) }' "$1"
+    { buf[NR] = $0 }
+    END {
+      n = NR
+      i = 1
+      while (i <= n) {
+        line = buf[i]
+        if (line ~ /^[ \t]*#/) { i++; continue }
+        if (match(line, /<<-?[ \t]*[^ \t<A-Za-z0-9_]*[A-Za-z_][A-Za-z0-9_]*/)) {
+          op = substr(line, RSTART, RLENGTH)
+          tabs = (op ~ /^<<-/)
+          sub(/^<<-?[ \t]*[^A-Za-z0-9_]*/, "", op)
+          j = i + 1
+          stop = 0
+          while (j <= n) {
+            t = buf[j]
+            if (tabs) sub(/^\t+/, "", t)
+            if (t == op) { stop = j; break }
+            j++
+          }
+          if (stop > 0) {
+            # a body fed to a SHELL is executed; anything else is DATA
+            if (line !~ /(^|[ \t;&|(])(bash|sh|source)[ \t]/)
+              for (k = i + 1; k < stop; k++) skip[k] = 1
+            i = stop + 1
+            continue
+          }
+        }
+        i++
+      }
+      for (i = 1; i <= n; i++) {
+        if (skip[i]) continue
+        line = buf[i]
+        if (line ~ /^[ \t]*#/) continue
+        if (scan(line)) exit 0
+      }
+      exit 1
+    }' "$1"
 }
 provision_neutralises_effectively() { # <file> -> 0 when an EFFECTIVE four-term neutralisation exists
   [ -f "$1" ] || return 1
@@ -1415,6 +1521,41 @@ done
 case "$(provision_neutralisation_offenders "$T/drv/mentions.test.sh")" in
   '') ok "J) NEGATIVE CONTROL: a suite that only MENTIONS the seam in a comment is not a driver and is not flagged (the predicate is not a mention-matcher)" ;;
   *) bad "J) NEGATIVE CONTROL FAILED: a comment-only mention was flagged as a driver — the predicate is a mention-matcher and would red on static-analysis suites" ;;
+esac
+# ── #3916: the two measured FALSE POSITIVES, each pinned NEXT TO the control that proves the fix did
+# not buy the silence with the arm's own guarantee. Every fixture below is the exact shape found on
+# `origin/main`; the `-real` twins are the same file with the data replaced by an execution.
+printf 'for _r in a b; do :; done <<'"'"'PAIRS'"'"'\nadopt-fix.sh|bash "$O/fix-one.sh"|bash "${_AF_WORK:-$O}/fix-one.sh"\nPAIRS\n' > "$T/drv/data-heredoc.test.sh"
+printf 'WTL="$ROOT/no-such-wt-lifecycle.sh"\n' > "$T/drv/absent-seam.test.sh"
+printf 'WTL="$HERE/wt-lifecycle.sh"\n' > "$T/drv/seam-control.test.sh"
+printf 'echo "a << b" ; bash "$HERE/fix-one.sh" --help\n' > "$T/drv/unclosed-opener.test.sh"
+if [ -z "$(provision_neutralisation_offenders "$T/drv/data-heredoc.test.sh")" ]; then
+  ok "J) …a grep-PATTERN TABLE carried as heredoc DATA to a \`done\`/\`read\` loop is not an execution (#3916: controller-state.test.sh:653)"
+else
+  bad "J) a heredoc DATA body was read as an executed caller — the D2 predicate is still pattern-blind on heredoc bodies, so bash-suites stays red on main (#3916)"
+fi
+# ⛔ THE GUARANTEE, side by side with the exception above: the SAME heredoc body IS scanned when its
+# consumer is a shell. Without this pairing the fix would be indistinguishable from deleting the check.
+printf 'PAIRS=1\nbash <<'"'"'RUN'"'"'\ncd "$O" && bash "$O/fix-one.sh" "$R"\nRUN\n' > "$T/drv/exec-heredoc.test.sh"
+case "$(provision_neutralisation_offenders "$T/drv/exec-heredoc.test.sh")" in
+  ?*) ok "J) POSITIVE CONTROL: a heredoc body FED TO A SHELL (\`bash <<'RUN'…RUN\`) IS still flagged — data-skipping did not blind the census" ;;
+  *) bad "J) POSITIVE CONTROL FAILED: a caller executed from a shell-fed heredoc body was NOT flagged — the heredoc fix opened the hole it exists to avoid" ;;
+esac
+# ⛔ AND AN UNTERMINATED OPENER MUST NOT BLIND ANYTHING: a quoted `<<` in prose followed by a REAL
+# caller line. If the walk treated it as a heredoc it would swallow the rest of the file and report a
+# clean census — the one way this fix could turn a false positive into a false NEGATIVE.
+case "$(provision_neutralisation_offenders "$T/drv/unclosed-opener.test.sh")" in
+  ?*) ok "J) POSITIVE CONTROL: an UNTERMINATED op (a quoted \`<<\` in prose) skips nothing — the real caller line after it is still flagged" ;;
+  *) bad "J) POSITIVE CONTROL FAILED: an unterminated heredoc opener swallowed the rest of the file and hid a real caller — the D2 walk now has a false NEGATIVE" ;;
+esac
+if [ -z "$(provision_neutralisation_offenders "$T/drv/absent-seam.test.sh")" ]; then
+  ok "J) …a DELIBERATELY non-existent \`no-such-wt-lifecycle.sh\` is not a reference to the seam (#3916: ai-drainer.test.sh:1007)"
+else
+  bad "J) a hyphen-prefixed NON-EXISTENT path was read as the provision seam — D1 still matches a sub-string of a different filename (#3916)"
+fi
+case "$(provision_neutralisation_offenders "$T/drv/seam-control.test.sh")" in
+  ?*) ok "J) POSITIVE CONTROL: the REAL \`\$HERE/wt-lifecycle.sh\` is still a D1 driver — the boundary fix did not narrow the census" ;;
+  *) bad "J) POSITIVE CONTROL FAILED: a real wt-lifecycle.sh reference is no longer a driver — D1 became blind and the census is vacuous" ;;
 esac
 
 
