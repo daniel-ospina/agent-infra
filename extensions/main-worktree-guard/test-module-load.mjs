@@ -402,6 +402,51 @@ async function partB() {
     expect("B9pre: factory registered a session_start handler", typeof sessionStart, "function");
     if (typeof sessionStart === "function") await sessionStart({});
 
+    // ── B73: #504 — the #73 coordinated-delete block, end-to-end ──
+    // The defect was only reachable through the FULL path: the parser produced a
+    // phantom target and index.ts's #73 arm looked up a ref nobody can check
+    // out, so a WORKTREE session (M2-exempt) could delete a branch a sibling
+    // still had checked out. `test.mjs` pins the extractor alone; this pins the
+    // block an agent actually meets. It must run HERE — while the hermetic hub is
+    // clean and on `main` — because the later B9 cases move the hub's branch.
+    const sib73 = join(tmp, "wt-73-sibling");
+    const mine73 = join(tmp, "wt-73-mine");
+    execSync(`git worktree add -q "${sib73}" -b held/branch HEAD`, { cwd: repo, stdio: "ignore" });
+    execSync(`git worktree add -q "${mine73}" -b feat/mine HEAD`, { cwd: repo, stdio: "ignore" });
+    process.chdir(mine73); // a linked-worktree session: M2 does not gate it
+    if (typeof sessionStart === "function") await sessionStart({});
+    try {
+      const coord = (name, command) => callBash(command);
+      const isCoordBlock = (r, branch) => !!r && r.block === true &&
+        /checked out in/.test(r.reason ?? "") && (r.reason ?? "").includes(branch);
+      const d1 = await coord("d1", "git push origin HEAD:refs/heads/feat && git push origin --delete held/branch");
+      expectTrue("B73a: later-segment `--delete` of a sibling-held branch is BLOCKED by the #73 arm (#504)",
+        isCoordBlock(d1, "held/branch"), `handler returned ${JSON.stringify(d1)?.slice(0, 200)}`);
+      const d2 = await coord("d2", "git push origin HEAD:refs/heads/feat && (git push origin --delete held/branch)");
+      expectTrue("B73b: the PARENTHESIZED later segment is BLOCKED too (#504 residual; the target is not `held/branch)`)",
+        isCoordBlock(d2, "held/branch"), `handler returned ${JSON.stringify(d2)?.slice(0, 200)}`);
+      const d3 = await coord("d3", "git push origin HEAD:refs/heads/feat && (git push origin -d held/branch)");
+      expectTrue("B73c: the parenthesized `-d` twin is BLOCKED (whole-command arm, no frozen legacy evidence)",
+        isCoordBlock(d3, "held/branch"), `handler returned ${JSON.stringify(d3)?.slice(0, 200)}`);
+      const d4 = await coord("d4", "git push origin HEAD:refs/heads/feat && echo $(git push origin -d held/branch)");
+      expectTrue("B73d: a command-substituted later segment is BLOCKED (same boundary rule)",
+        isCoordBlock(d4, "held/branch"), `handler returned ${JSON.stringify(d4)?.slice(0, 200)}`);
+      // Positive controls — the boundary fix must not invent targets: a delete of
+      // a branch NOBODY has checked out stays allowed, and so does a plain
+      // compound push (the #73 arm must not fire on it).
+      const ok1 = await coord("ok1", "git push origin HEAD:refs/heads/feat && (git push origin -d never/checked-out)");
+      expectTrue("B73-cont1: deleting a branch nobody has checked out stays ALLOWED (no over-block)",
+        ok1 === undefined, `handler returned ${JSON.stringify(ok1)?.slice(0, 200)}`);
+      const ok2 = await coord("ok2", "git push origin HEAD:refs/heads/feat && (git push origin HEAD:refs/heads/feat)");
+      expectTrue("B73-cont2: a parenthesized plain push stays ALLOWED (the #73 arm is delete-keyed)",
+        ok2 === undefined, `handler returned ${JSON.stringify(ok2)?.slice(0, 200)}`);
+    } finally {
+      // Restore the hub session state the B9 cases expect: cwd = the hub, and a
+      // baseline recorded from it (main).
+      process.chdir(repo);
+      if (typeof sessionStart === "function") await sessionStart({});
+    }
+
     // B9a — the reported defect, end-to-end through the loaded extension.
     // Before the #1144 fix the allowance consulted the VERB first and returned
     // undefined (ALLOWED): a `rebase` moved the SHARED baseline branch with no

@@ -4792,6 +4792,37 @@ export function unresolvableDeleteTargets(targets) {
   return [...new Set(targets.filter((t) => !isResolvableDeleteTarget(t)))];
 }
 
+/**
+ * Tokenize ONE `git push` segment body, stopping at the first shell BOUNDARY.
+ *
+ * #504 residual (parenthesized later segment). The segment body used to be
+ * `split(/\s+/)`, which keeps a shell operator ATTACHED to the last word — a
+ * subshell/group/substitution closer. `… && (git push origin -d old-feat)`
+ * therefore produced the whole-command target token `old-feat)`, and
+ * `_cleanDeleteTarget` cannot strip that parenthesis without corrupting a
+ * genuinely QUOTED name. The phantom `old-feat)` names no ref, so
+ * `_coordinatedDeleteBlock` looked up `refs/heads/old-feat)`, found nothing
+ * checked out, and ALLOWED the delete of a branch a sibling still holds — the
+ * exact #73 hazard, reachable from a worktree session where M2 is exempt.
+ *
+ * `_tokenize` is the module's quote-aware shell splitter: it emits unquoted
+ * `(` / `)` / redirects as their OWN tokens and keeps QUOTED text inside the
+ * word (`-d 'feat/x)'` stays the real ref `feat/x)`), so truncating at the
+ * first `_isShellBoundary` token models bash rather than guessing from
+ * spacing. The `segRe` capture still cannot contain `;`/`&`/`|` (unchanged
+ * contract, including its documented over-match on quoted/echoed text).
+ * @param {string} body raw text after the `git push` word
+ * @returns {string[]}
+ */
+function _pushSegmentTokens(body) {
+  const tokens = [];
+  for (const t of _tokenize(body)) {
+    if (_isShellBoundary(t)) break;
+    tokens.push(t);
+  }
+  return tokens;
+}
+
 /** Short-name a raw delete target token (`:refs/heads/feat/x` → `feat/x`). */
 function _cleanDeleteTarget(x) {
   return x
@@ -4834,7 +4865,9 @@ export function extractPushDeleteBranch(command) {
   const segRe = /\bgit\s+push\b([^;&|]*)/g;
   let sm;
   while ((sm = segRe.exec(c)) !== null) {
-    const tokens = sm[1].trim().split(/\s+/).filter(Boolean);
+    // #504 residual: bound the segment at the first shell BOUNDARY token using
+    // the quote-aware splitter — see _pushSegmentTokens.
+    const tokens = _pushSegmentTokens(sm[1]);
     if (tokens.length === 0) continue;
     // Arg-taking options consume a value (`-o draft`, `--push-option draft`,
     // merged `-do draft` = -d -o draft; inline `-doDraft`/`--push-option=x`

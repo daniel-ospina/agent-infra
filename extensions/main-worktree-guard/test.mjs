@@ -1079,6 +1079,30 @@ wcdt("src:dst refspec → none", "block:push", "git push origin main && git push
 wcdt("push-delete verdict → none (fold-in already carries targets)", "block:push-delete", "git push origin main && git push origin --delete b", []);
 wcdt("allow verdict → none", "allow", "git push origin main && git push origin -d b", []);
 wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -d b", []);
+
+// ── #504 residual: a delete in a PARENTHESIZED later segment ──────────────
+// The whole-command extractor walked segments with `split(/\s+/)`, which keeps
+// a subshell/substitution CLOSER that is attached to the last word. The target
+// came back as `b)` — a phantom that names no ref, so `_coordinatedDeleteBlock`
+// looked up `refs/heads/b)` and found nothing checked out: the #73 block that
+// protects a sibling-held branch ALLOWED the delete (probe-verified end-to-end
+// from a linked worktree, where M2 is exempt). The segment is now tokenized
+// with the module's quote-aware splitter and truncated at the first shell
+// BOUNDARY token.
+wcdt("parenthesized later-segment -d under block:push", "block:push", "git push origin main && (git push origin -d b)", ["b"]);
+wcdt("parenthesized later-segment --delete under block:push", "block:push", "git push origin main && (git push origin --delete b)", ["b"]);
+wcdt("command-substitution later-segment -d", "block:push", "git push origin main && echo $(git push origin -d b)", ["b"]);
+wcdt("group-brace later-segment -d", "block:push", "git push origin main && { git push origin -d b; }", ["b"]);
+// The fold-in path (frozen legacy evidence in a LATER segment) overrides
+// pushTargets with the SAME extractor — the parenthesized twin must attribute
+// the real target there too, not the phantom `b)`.
+dexpect("parenthesized later-segment --delete → real target only", `git push origin HEAD:refs/heads/feat && (git push origin --delete b)`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
+// QUOTED text is data, not a shell operator: a ref legitimately named `b)`
+// must survive (git ref names allow parentheses), so the boundary rule must be
+// quote-AWARE — a blanket trailing-`)` strip would corrupt it.
+wcdt("a QUOTED paren stays part of the ref name", "block:push", "git push origin main && git push origin -d 'feat/x)'", ["feat/x)"]);
+// Negative controls: the boundary rule must not invent targets.
+wcdt("parenthesized segment with a plain push → none", "block:push", "git push origin main && (git push origin main)", []);
 // --d is AMBIGUOUS with --dry-run — git rejects it (rc 129, probe-verified);
 // it never deletes, so it stays a plain block:push (never block:push-delete).
 dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });
