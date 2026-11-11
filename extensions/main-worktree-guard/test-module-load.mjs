@@ -890,6 +890,12 @@ async function partB() {
     //         existence check at all) — the non-vacuity arm for the launder rows
     //   M4 = `hiddenBranchStateRefusal` without the worktree resolution (refuse
     //         unconditionally) — the non-vacuity arm for the worktree row
+    //   M5 = the PRE-FIX session-cwd-only exemption restored (the `hiddenEscapes`
+    //         test, with no payload attribution) — the non-vacuity arm for the
+    //         cross-repo rows below. APPLIED as the whole #607(1) index.ts hunk
+    //         reverted; every cross-repo row ALLOWED under it (measured), and the
+    //         worktree control row stayed green under it too — which is exactly
+    //         why the exemption needed a target, not a cwd.
     // Every mutant was APPLIED to a copy of index.ts and the whole suite re-run;
     // the row names state what each one does to them. A row that CANNOT vary under
     // any of them says so and names why (refused by an arm this change only
@@ -1037,6 +1043,46 @@ async function partB() {
       'echo "$(git branch -Mq wt/x607 wt/y607)"');
     await expect607Allow("#607 worktree: the visible own-rename in a worktree is exempt (unchanged control)",
       "git branch -M wt/x607 wt/y607");
+
+    // ── #607 (review follow-up): the exemption is a claim about the PAYLOAD'S
+    // repo, not about the session's cwd ──────────────────────────────────────
+    // The premise "the payload runs at the shell cwd" is false for a payload
+    // carrying its OWN repo hints. MEASURED through the REAL handler at this
+    // head, from a WORKTREE session (the fleet's normal shape):
+    //   echo "$(git -C <hub> branch -Mq main victim)"      -> ALLOWED,
+    //   executed rc 0, the hub's `victim` tip clobbered (bfdb30ae -> 4c90be9b)
+    // i.e. the exact class this gate exists to refuse, reachable from every
+    // lane. Each row below is ALLOW under M5 and BLOCK after the attribution.
+    // The hub control is `repo`; these rows never execute the command — only
+    // the verdict is under test (the effect was measured out-of-band, above).
+    const xRepo = await expect607Block(
+      "#607 cross-repo: a payload carrying its own `-C <hub>` is REFUSED from a WORKTREE session [mutant: M5] — MEASURED pre-fix: ALLOWED, and the hub's `victim` ref clobbered rc 0",
+      `echo "$(git -C ${repo} branch -Mq main victim)"`, "mutant M5");
+    expectTrue("#607 cross-repo: the refusal NAMES the worktree nuance (an agent must not read it as a blanket substitution ban)",
+      !!xRepo && /worktree/i.test(xRepo.reason ?? "") && /-C|--git-dir/i.test(xRepo.reason ?? ""),
+      `reason=${JSON.stringify(xRepo?.reason ?? "")}`);
+    await expect607Block(
+      "#607 cross-repo: the same reach via `--git-dir=<hub>/.git` is REFUSED [mutant: M5]",
+      `echo "$(git --git-dir=${repo}/.git branch -Mq main victim)"`, "mutant M5");
+    await expect607Block(
+      "#607 cross-repo: a `cd <hub>` chain inside the payload is REFUSED [mutant: M5] — the payload's own cd, not the session's",
+      `echo "$(cd ${repo} && git branch -Mq main victim)"`, "mutant M5");
+    await expect607Block(
+      "#607 cross-repo: a static `eval` payload naming the hub is REFUSED [mutant: M5] — the eval literal is attributed like any other span",
+      `eval 'git -C ${repo} branch -Mq main victim'`, "mutant M5");
+    // Fully-foreign targets prove the attribution is not a blanket refusal: a
+    // payload that resolves to NO repo (a plain copy) carries no repo claim and
+    // is decided by the session cwd alone, as before.
+    await expect607Allow("#607 cross-repo: a worktree payload with no repo hint is still exempt (attribution is not a blanket ban)",
+      'echo "$(git branch -Mq wt/x607 wt/z607)"');
+    // UNATTRIBUTABLE payloads are refused rather than exempted (#805): the
+    // target cannot be determined, so an exemption would be a guess.
+    await expect607Block(
+      "#607 cross-repo: `$(<file)` (opaque file text) is REFUSED from a worktree — unattributable target fails CLOSED (#805) [mutant: M5]",
+      'echo "$(< /tmp/not-a-repo-claim.txt)"', "mutant M5");
+    await expect607Block(
+      "#607 cross-repo: alias indirection with no resolvable span is REFUSED from a worktree — unattributable target fails CLOSED (#805) [mutant: M5]",
+      "git -c alias.br='git branch -fq victim main' br", "mutant M5");
     process.chdir(repo);
     await expect607Allow("#607 worktree: the hub session is restored for the remaining suites (control)", "git status");
 

@@ -5791,6 +5791,70 @@ function _ansiTranslate(s) {
   });
 }
 
+/**
+ * #607: the quote-aware payload-span collector, HOISTED out of
+ * `_hasHiddenStateSubst` so the REFUSAL that consumes the flag (index.ts) can
+ * enumerate the very spans the decision was computed from. ONE collector, never
+ * a second shell parser that could drift from the one `hiddenStateMutation` is
+ * derived from.
+ * `$(…)`/`<(…)`/`>(…)` spans close only on a paren OUTSIDE quotes/escapes;
+ * ANSI-C `$'…'` literals translate before they are returned; backticks pair to
+ * the next (top-level escaping already fails closed in the callers).
+ * @param {string} src
+ * @returns {string[]}
+ */
+function _collectSubstSpans(src) {
+  const spans = [];
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    if (c === "$" && src[i + 1] === "'") {
+      let j = i + 2;
+      while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
+      // ANSI-C $'…' escapes translate BEFORE scanning: a multiline payload
+      // (`sh -c $'echo a\ngit branch -fq victim main'`) carries the real
+      // newline as \n — without translation the payload tokenizes as ONE
+      // glued word and the hidden git invocation is invisible (round-6
+      // cycle-3 reviewer P1, probe-verified rc 0).
+      // Round-7 (cycle-4 reviewers P1): ANSI-C escapes translate BEFORE
+      // scanning (see _ansiTranslate) — \cJ = a real newline re-splits the
+      // payload into a second command; without translation the payload
+      // tokenizes as ONE glued word and the hidden git invocation is
+      // invisible (probe-verified rc 0).
+      spans.push(_ansiTranslate(src.slice(i + 2, j)));
+      i = j < n ? j + 1 : n;
+      continue;
+    }
+    if ((c === "$" || c === "<" || c === ">") && src[i + 1] === "(") {
+      let depth = 1;
+      let q = null; // null | '"' | "'"
+      let j = i + 2;
+      while (j < n && depth > 0) {
+        const d = src[j];
+        if (q !== null) {
+          if (d === "\\") j++;
+          else if (d === q) q = null;
+        } else if (d === "\"" || d === "'") q = d;
+        else if (d === "(") depth++;
+        else if (d === ")") depth--;
+        j++;
+      }
+      spans.push(src.slice(i + 2, Math.max(i + 2, j - 1)));
+      i = j;
+      continue;
+    }
+    if (c === "`") {
+      const j = src.indexOf("`", i + 1);
+      spans.push(src.slice(i + 1, j > -1 ? j : src.length));
+      i = j > -1 ? j + 1 : src.length;
+      continue;
+    }
+    i++;
+  }
+  return spans;
+}
+
 export function _hasHiddenStateSubst(raw) {
   const source = String(raw ?? "");
   const mutates = (inv) => {
@@ -5802,60 +5866,10 @@ export function _hasHiddenStateSubst(raw) {
     // laundered the #591 benign-force carve-out (probe-verified rc 0).
     return inv.verb === "branch" && _branchInvMutatesBranchState(inv.args);
   };
-  // Quote-aware payload collector: `$(…)`/`<(…)`/`>(…)` spans close only on a
-  // paren OUTSIDE quotes/escapes; ANSI-C `$'…'` literals; backticks pair to
-  // the next (top-level escaping already fails closed above the collector).
-  const collect = (src) => {
-    const spans = [];
-    let i = 0;
-    const n = src.length;
-    while (i < n) {
-      const c = src[i];
-      if (c === "$" && src[i + 1] === "'") {
-        let j = i + 2;
-        while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
-        // ANSI-C $'…' escapes translate BEFORE scanning: a multiline payload
-        // (`sh -c $'echo a\ngit branch -fq victim main'`) carries the real
-        // newline as \n — without translation the payload tokenizes as ONE
-        // glued word and the hidden git invocation is invisible (round-6
-        // cycle-3 reviewer P1, probe-verified rc 0).
-        // Round-7 (cycle-4 reviewers P1): ANSI-C escapes translate BEFORE
-        // scanning (see _ansiTranslate) — \cJ = a real newline re-splits the
-        // payload into a second command; without translation the payload
-        // tokenizes as ONE glued word and the hidden git invocation is
-        // invisible (probe-verified rc 0).
-        spans.push(_ansiTranslate(src.slice(i + 2, j)));
-        i = j < n ? j + 1 : n;
-        continue;
-      }
-      if ((c === "$" || c === "<" || c === ">") && src[i + 1] === "(") {
-        let depth = 1;
-        let q = null; // null | '"' | "'"
-        let j = i + 2;
-        while (j < n && depth > 0) {
-          const d = src[j];
-          if (q !== null) {
-            if (d === "\\") j++;
-            else if (d === q) q = null;
-          } else if (d === "\"" || d === "'") q = d;
-          else if (d === "(") depth++;
-          else if (d === ")") depth--;
-          j++;
-        }
-        spans.push(src.slice(i + 2, Math.max(i + 2, j - 1)));
-        i = j;
-        continue;
-      }
-      if (c === "`") {
-        const j = src.indexOf("`", i + 1);
-        spans.push(src.slice(i + 1, j > -1 ? j : src.length));
-        i = j > -1 ? j + 1 : src.length;
-        continue;
-      }
-      i++;
-    }
-    return spans;
-  };
+  // Quote-aware payload collector — HOISTED to module scope (#607) so the
+  // refusal that consumes this flag can enumerate the SAME spans; see
+  // _collectSubstSpans. Behaviour is identical.
+  const collect = _collectSubstSpans;
   // Top-level unverifiable segment (eval/alias/$VAR command indirection) —
   // its expansion is unclassifiable, so it may hide a second state mutation.
   if (allGitInvocations(source).some((inv) => inv.verb === "__unverifiable__")) return true;
@@ -5948,6 +5962,60 @@ export function _hasHiddenStateSubst(raw) {
   // reviewer P1, probe-verified rc 0) all refuse the carve-out.
   if (/(?:\-\-config\-env[=\s]+\S*alias\.|GIT_CONFIG_KEY_\d+=alias\.|GIT_CONFIG_PARAMETERS=[^;]*alias\.)/.test(source)) return true;
   return false;
+}
+
+/**
+ * #607: the hidden payload TEXTS of a command — recursively the same spans
+ * `_hasHiddenStateSubst` scans, plus static `eval` literal payloads (ANSI-C
+ * translated), because those are the texts the shell will actually RUN.
+ *
+ * WHY THIS EXISTS. The refusal in index.ts exempts a hidden payload only when
+ * it cannot reach a main checkout, and its first form tested the SESSION cwd.
+ * That premise — "the payload runs at the shell cwd" — is FALSE for a payload
+ * carrying its own repo hints, and the gap was measured through the real
+ * handler at this head: from a WORKTREE session
+ *   echo "$(git -C <hub> branch -Mq main victim)"
+ * was ALLOWED, ran with rc 0, and clobbered the hub's `victim` ref — the exact
+ * class the gate exists to refuse, reachable from the fleet's NORMAL shape
+ * (lanes work in worktrees). Attributing a payload requires its TEXT, so the
+ * caller needs the collector's spans rather than a second shell parser.
+ *
+ * An EMPTY result for a command the flag fired on means the payload is
+ * unattributable by construction (`eval $VAR`, `$(<file)`, alias indirection):
+ * the caller fails closed (#805 — a gate that cannot determine the target
+ * refuses).
+ * @param {string} raw
+ * @returns {string[]}
+ */
+export function _hiddenStateSubstSpans(raw) {
+  const source = String(raw ?? "");
+  const out = [];
+  const seen = new Set();
+  const walk = (src, depth) => {
+    // bounded: nested substitutions are finite in practice; the guard keeps a
+    // pathological input from recursing without end.
+    if (depth > 8) return;
+    for (const inner of _collectSubstSpans(src)) {
+      if (!inner || seen.has(inner)) continue;
+      seen.add(inner);
+      out.push(inner);
+      walk(inner, depth + 1);
+    }
+  };
+  walk(source, 0);
+  // Static eval literals — the SAME regex `_hasHiddenStateSubst` uses, so the
+  // span set cannot drift from the flag that triggered the refusal.
+  const evalRe = /eval\s+(?:\$'([^']*)'|"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = evalRe.exec(source)) !== null) {
+    const ansi = m[1];
+    const payload = ansi !== undefined ? _ansiTranslate(ansi) : (m[2] ?? m[3] ?? "");
+    if (payload.length === 0 || seen.has(payload)) continue;
+    seen.add(payload);
+    out.push(payload);
+    walk(payload, 0);
+  }
+  return out;
 }
 
 /**
