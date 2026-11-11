@@ -86,6 +86,15 @@ for (const [name, target, want] of [
   ["backtick fragment", "`cat", false],
   ["glob", "feat/*", false],
   ["lone glob star", "*", false],
+  // ⛔ THE SECURITY-RELEVANT MEMBERS THAT HAD NO ROW (review P2 of PR #3978, measured):
+  // `?` and `[` are ILLEGAL in a ref name AND shell globs — the SHELL expands
+  // `feat/experiment-?` to real branch names before git ever sees a legal ref, so
+  // refusing them is load-bearing rather than "free". Without these rows a future
+  // "reduce the over-block" edit could drop either char and every check stayed green.
+  ["? shell glob (illegal in a ref name — still expands)", "feat/experiment-?", false],
+  ["[ character class (a shell glob)", "feat/[ab]", false],
+  ["lone closing bracket (accepted over-block — pinned)", "feat/x]", false],
+  ["lone closing brace (accepted over-block — pinned)", "feat/x}", false],
   ["brace expansion", "{feat/a,feat/b}", false],
   ["tilde", "~/x", false],
   ["backslash escape", "feat/x\\ y", false],

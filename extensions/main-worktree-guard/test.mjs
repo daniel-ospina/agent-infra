@@ -1104,6 +1104,15 @@ for (const [name, target, want] of [
   ["command-substitution fragment", "$(echo", false],
   ["backtick fragment", "`cat", false],
   ["glob", "feat/*", false],
+  // #653 (review P2 of PR #3978): `?` and `[` are shell globs AND illegal in a ref
+  // name — the SHELL expands them, so refusing them is load-bearing. `]` and `}`
+  // are legal in a ref name and are refused as the accepted over-block; all four
+  // are pinned so a future easing of the class reddens a row instead of silently
+  // reopening the glob hole.
+  ["? shell glob", "feat/experiment-?", false],
+  ["[ character class", "feat/[ab]", false],
+  ["lone closing bracket", "feat/x]", false],
+  ["lone closing brace", "feat/x}", false],
   ["brace expansion", "{feat/a,feat/b}", false],
   ["backslash escape", "feat/x\\ y", false],
   ["empty", "", false],
