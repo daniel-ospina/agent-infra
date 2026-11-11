@@ -22,7 +22,9 @@
  *       `--git-common-dir`), and a record whose root no longer exists is never borrowed;
  *   (d) `ELDATO_VGATE_NO_SUBTRACT=1` restores the pre-fix behaviour (the scope-widening escape);
  *   (e) the issue's own shape: N files identical to a verified sibling + 1 genuinely new file ⇒ the block
- *       names ONLY the new file, not the N.
+ *       names ONLY the new file, not the N;
+ *   (f) the per-op candidate INDEX keeps EVERY candidate: a same-repo sibling's record for DIFFERENT
+ *       bytes, indexed first, must not shadow the matching one behind it.
  *
  * MUTATIONS (each was RUN against this file; each reddens the test named beside it):
  *   M1 drop the same-repo (`--git-common-dir`) guard        → (c) "identical bytes in a different
@@ -40,6 +42,9 @@
  *   M4 ignore `subDisabled`                                  → (d) reddens
  *   M5 drop the relative-path equality (match any path)      → (c) "a record for a DIFFERENT path" and
  *                                                              (e) redden
+ *   M6 keep only the FIRST candidate per path key (dedupe,   → (f) reddens: the stale same-repo sibling
+ *      `idx.set` without the `bucket.push`)                     is then the only candidate, nothing
+ *                                                              matches, and the op blocks
  *
  * Hermetic: HOME is redirected to a temp dir before the plugin is imported (the bridge and the audit log
  * are HOME-derived), and every repo is a throwaway temp checkout.
@@ -353,18 +358,31 @@ test("(d) ELDATO_VGATE_NO_SUBTRACT=1 restores the pre-fix behaviour", async () =
 // #2886 review round 4, finding 1 replaced the per-file registry SCAN with a per-op INDEX. That is a
 // rewrite of the candidate lookup, and the failure it can silently introduce is a candidate LOST by the
 // index (a dedupe-by-root, or an early-return on the first candidate) — which would look exactly like
-// "no record under any root" and re-open the loop this change closes. So: the same path is recorded
-// under an unrelated repo first (bytes that do NOT match) and under a same-repo sibling second (bytes
-// that do), in that order, and the op must still be ALLOWED by the second.
+// "no record under any root" and re-open the loop this change closes.
+//
+// ⛔ #2886 review round 5, finding 1: the shadowing candidate must be a SAME-REPO SIBLING ROOT, not an
+// unrelated repository. `add()` filters on `sameRepo` BEFORE it normalizes or inserts anything
+// (`index.ts:5080`), so an unrelated root never reaches the index and cannot shadow anything — the leg
+// as first written was green under every first-wins/overwrite/dedupe mutant, i.e. it named a behaviour
+// (a same-repo non-matching candidate must not shadow a matching one) it did not construct. So the
+// order below is: an unrelated root's record (proves the build's filter does not lose LATER same-repo
+// candidates), then a same-repo sibling's record for OTHER bytes, then the hub's record for the bytes
+// this op carries. A first-wins/"one candidate per path key" mutant keeps only the stale sibling, no
+// candidate matches, and the op blocks.
 test("(f) a non-matching candidate under one root does not shadow a matching one under another", async () => {
   const { hub, wt } = hubWithWorktree("f-candidate-order");
+  // A SECOND worktree of the SAME repository — it shares the hub's `--git-common-dir`, so it survives
+  // the build's same-repo filter and really is indexed. Its record describes bytes the op does not carry.
+  const stale = join(hub, ".worktrees", "stale");
+  git(hub, `worktree add -q ${stale} -b stale-candidates`);
   const unrelated = bareRepo("f-candidate-order-other");
   writeFileSync(join(unrelated, "src-shared.ts"), "zzz\n");
   git(unrelated, "add src-shared.ts");
   git(unrelated, "commit -m base");
-  // Order matters: the unrelated root's record comes FIRST in the registry.
+  // Order matters: the unrelated root first, the STALE same-repo sibling second, the match last.
   addRegistryEntries([
     { path: `${realpathSync(unrelated)}::src/shared.ts`, hash: sha256("zzz\n") },
+    { path: `${realpathSync(stale)}::src/shared.ts`, hash: sha256("zzz\n") },
     { path: `${realpathSync(hub)}::src/shared.ts`, hash: sha256("s2\n") },
   ]);
   process.chdir(wt);
@@ -374,7 +392,7 @@ test("(f) a non-matching candidate under one root does not shadow a matching one
   equal(
     await fire("tool_call", commitOp()),
     undefined,
-    "the index must keep every candidate: a non-matching root's record must not shadow the same-repo one"
+    "the index must keep every candidate: a same-repo sibling's non-matching record must not shadow the match"
   );
 });
 

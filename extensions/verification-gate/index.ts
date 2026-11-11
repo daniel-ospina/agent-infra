@@ -5019,10 +5019,23 @@ export default function (pi: ExtensionAPI) {
       }
       return bridgeEntriesCache;
     };
-    // `git-common-dir` is a subprocess per root — resolve each root at most once per op.
+    // `git-common-dir` is a subprocess per root AND `normalizeWorktreeRoot` is a `realpathSync` —
+    // resolve each of the two at most once per op, keyed on the RAW root so a repeated spelling costs
+    // a Map lookup rather than a syscall.
+    // ⛔ #2886 review round 5, finding 2: memoizing only the subprocess left the NORMALIZATION
+    // per-call, and `sameRepo` cached positives only — so a root the guard rejects re-entered here for
+    // every entry it owned (~1.9k `realpathSync` calls on the measured registry). Both are memoized.
     const commonDirMemo = new Map<string, string | null>();
+    const rootRealMemo = new Map<string, string>();
+    const normalizeRootOnce = (root: string): string => {
+      const memo = rootRealMemo.get(root);
+      if (memo !== undefined) return memo;
+      const normal = normalizeWorktreeRoot(root);
+      rootRealMemo.set(root, normal);
+      return normal;
+    };
     const commonDirOnce = (root: string): string | null => {
-      const k = normalizeWorktreeRoot(root);
+      const k = normalizeRootOnce(root);
       if (!commonDirMemo.has(k)) commonDirMemo.set(k, gitCommonDir(k));
       return commonDirMemo.get(k) ?? null;
     };
@@ -5065,12 +5078,18 @@ export default function (pi: ExtensionAPI) {
       const idx = new Map<string, { root: string; hash: string }[]>();
       const mine = commonDirOnce(worktreeRoot);
       if (mine === null) return idx; // unprovable own repo ⇒ no borrowing, and no index work at all
-      const seenRoot = new Set<string>();
+      // ⛔ One VERDICT per root, for BOTH polarities. A positive-only cache re-probes every entry of
+      // every rejected root; but ⛔ NOT `seenRoot.add(root)` on the negative branch either — a Set
+      // consulted as `has ⇒ true` would answer "same repo" for a foreign repository, which is the
+      // fail-open this whole block exists to prevent. A Map of verdicts caches the answer without ever
+      // making a rejected root look accepted (#2886 review round 5, finding 2).
+      const sameRepoVerdict = new Map<string, boolean>();
       const sameRepo = (root: string): boolean => {
-        if (seenRoot.has(root)) return true; // one positive answer is recorded per root below
+        const known = sameRepoVerdict.get(root);
+        if (known !== undefined) return known;
         const common = commonDirOnce(root);
         const okRoot = common !== null && common === mine;
-        if (okRoot) seenRoot.add(root);
+        sameRepoVerdict.set(root, okRoot);
         return okRoot;
       };
       const add = (key: string, hash: string) => {
