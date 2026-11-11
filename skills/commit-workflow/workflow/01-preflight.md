@@ -690,9 +690,11 @@ Since #2886 a path with **no record under this root** is satisfied when a record
 bytes at the op's own root. Verification is a judgment about content and the record IS a
 digest, so unchanged bytes re-rooted into a new worktree need no second verdict.
 
-- It never adopts another tree's **root** or its record set: the scope is still computed
+- It never adopts another tree's **root** or substitutes its diff: the scope is still computed
   from THIS root's own diff (#1265 — an adopted clean tree yields an EMPTY scope that would
-  ALLOW an op carrying unverified content).
+  ALLOW an op carrying unverified content). The borrowed path's RECORD is re-rooted into this
+  root's registry (so a later op in this session needs no registry read), audited once at borrow
+  time by the `gate_skip` row below — that row is the provenance.
 - Guards, all fail-closed: same repository by shared `--git-common-dir` (an unrelated
   checkout is never borrowed, however identical its bytes); the relative path must match; a
   record whose root is gone or unreadable is skipped; a digest that does not match is a no-op.

@@ -349,6 +349,35 @@ test("(d) ELDATO_VGATE_NO_SUBTRACT=1 restores the pre-fix behaviour", async () =
 });
 
 // ── (e) THE ISSUE'S OWN SHAPE: 150 demanded, 5 changed ──
+// ── (f) the index must keep EVERY candidate, and a non-matching one must not shadow a later match ──
+// #2886 review round 4, finding 1 replaced the per-file registry SCAN with a per-op INDEX. That is a
+// rewrite of the candidate lookup, and the failure it can silently introduce is a candidate LOST by the
+// index (a dedupe-by-root, or an early-return on the first candidate) — which would look exactly like
+// "no record under any root" and re-open the loop this change closes. So: the same path is recorded
+// under an unrelated repo first (bytes that do NOT match) and under a same-repo sibling second (bytes
+// that do), in that order, and the op must still be ALLOWED by the second.
+test("(f) a non-matching candidate under one root does not shadow a matching one under another", async () => {
+  const { hub, wt } = hubWithWorktree("f-candidate-order");
+  const unrelated = bareRepo("f-candidate-order-other");
+  writeFileSync(join(unrelated, "src-shared.ts"), "zzz\n");
+  git(unrelated, "add src-shared.ts");
+  git(unrelated, "commit -m base");
+  // Order matters: the unrelated root's record comes FIRST in the registry.
+  addRegistryEntries([
+    { path: `${realpathSync(unrelated)}::src/shared.ts`, hash: sha256("zzz\n") },
+    { path: `${realpathSync(hub)}::src/shared.ts`, hash: sha256("s2\n") },
+  ]);
+  process.chdir(wt);
+  await fire("session_start", {});
+  writeFileSync(join(wt, "src/shared.ts"), "s2\n");
+  git(wt, "add src/shared.ts");
+  equal(
+    await fire("tool_call", commitOp()),
+    undefined,
+    "the index must keep every candidate: a non-matching root's record must not shadow the same-repo one"
+  );
+});
+
 test("(e) N files identical to a verified sibling root + 1 genuinely new file ⇒ the block names ONLY the new file", async () => {
   const { hub, wt } = hubWithWorktree("e-issue-shape");
   const same = [

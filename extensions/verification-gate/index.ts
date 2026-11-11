@@ -5026,38 +5026,83 @@ export default function (pi: ExtensionAPI) {
       if (!commonDirMemo.has(k)) commonDirMemo.set(k, gitCommonDir(k));
       return commonDirMemo.get(k) ?? null;
     };
-    /** A content-identical record under a sibling root of the same repo, or null (fail closed). */
-    const foreignBlobMatch = (normOpRoot: string, relPath: string): { root: string; stored: string } | null => {
-      if (subDisabled) return null;
-      const relNorm = normalizeRegistryPath(normOpRoot, relPath);
-      const candidates: { root: string; hash: string }[] = [];
-      const consideredRoots = new Set<string>();
-      const consider = (key: string, hash: string) => {
+    // ⛔ #2886 review round 4, finding 1 — THE SCAN MUST BE PAID ONCE PER OP, NOT ONCE PER FILE.
+    // The registry is MACHINE-GLOBAL (measured 1,910 entries across 57 roots, most of them other
+    // repositories), so a per-file scan is O(unverified × entries): on the shape the issue reports
+    // (150 demanded) that is ~286k iterations and, through `normalizeRegistryPath`'s two
+    // `realpathSync` calls per entry, up to ~573k syscalls per blocked op — repeating on every retry
+    // while blocked, which is exactly the loop this change exists to shorten. A gate that is slow
+    // precisely when it blocks is a gate agents route around (`ELDATO_SKIP_VGATE=1`) or rubber-stamp.
+    // So: the candidate INDEX is built once, lazily, keyed by the path normalized IN THIS OP'S DOMAIN;
+    // the per-file work is then a Map lookup. The same-repo filter (a subprocess per DISTINCT root)
+    // runs during the build, before any path is normalized, so another repository's entries are never
+    // normalized at all.
+    //
+    // `normalizeForOp` is `normalizeRegistryPath`'s rule with its two per-call costs memoized: the op
+    // root's realpath once, and each containing DIRECTORY's realpath once (registry entries cluster
+    // into a handful of directories). It is the same computation — the path is still resolved against
+    // the op root and the PARENT DIRECTORY is realpath'd (never the file, which would resolve a
+    // committed symlink to its target, #305) — only the repeats are removed.
+    let opRealRoot: string | null = null;
+    const dirRealMemo = new Map<string, string>();
+    const normalizeForOp = (filePath: string): string => {
+      if (opRealRoot === null) {
+        try { opRealRoot = realpathSync(worktreeRoot); } catch { opRealRoot = worktreeRoot; }
+      }
+      const abs = resolve(worktreeRoot, filePath);
+      const dir = dirname(abs);
+      let realDir = dirRealMemo.get(dir);
+      if (realDir === undefined) {
+        try { realDir = realpathSync(dir); } catch { realDir = dir; }
+        dirRealMemo.set(dir, realDir);
+      }
+      const rel = relative(opRealRoot, join(realDir, basename(abs)));
+      return rel === "" ? filePath : rel;
+    };
+    // relPath (in this op's domain) → the sibling-root records for it. Built at most once per op.
+    let siblingIndex: Map<string, { root: string; hash: string }[]> | null = null;
+    const buildSiblingIndex = (): Map<string, { root: string; hash: string }[]> => {
+      const idx = new Map<string, { root: string; hash: string }[]>();
+      const mine = commonDirOnce(worktreeRoot);
+      if (mine === null) return idx; // unprovable own repo ⇒ no borrowing, and no index work at all
+      const seenRoot = new Set<string>();
+      const sameRepo = (root: string): boolean => {
+        if (seenRoot.has(root)) return true; // one positive answer is recorded per root below
+        const common = commonDirOnce(root);
+        const okRoot = common !== null && common === mine;
+        if (okRoot) seenRoot.add(root);
+        return okRoot;
+      };
+      const add = (key: string, hash: string) => {
         const parsed = parseCompoundKey(key);
-        if (!parsed || parsed.root === normOpRoot || consideredRoots.has(parsed.root)) return;
+        if (!parsed || parsed.root === worktreeRoot) return;
         if (typeof hash !== "string" || hash === "") return;
-        // Compare in the OP ROOT's path domain — the record was keyed in the FOREIGN root's, and the
-        // two spellings differ exactly when a root's realpath does (#305 / #7595).
-        if (normalizeRegistryPath(normOpRoot, parsed.path) !== relNorm) return;
-        consideredRoots.add(parsed.root);
-        candidates.push({ root: parsed.root, hash });
+        if (!sameRepo(parsed.root)) return; // another repository — never normalized, never indexed
+        const relKey = normalizeForOp(parsed.path);
+        const bucket = idx.get(relKey);
+        if (bucket === undefined) idx.set(relKey, [{ root: parsed.root, hash }]);
+        else bucket.push({ root: parsed.root, hash });
       };
       // In-memory first (it holds entries a PASS in THIS session merged but has not yet bridged),
       // then the durable registry (the only place a PREVIOUS session's records survive).
-      for (const [k, h] of verifiedSet) consider(k, h);
+      for (const [k, h] of verifiedSet) add(k, h);
       for (const vf of registryEntries()) {
         if (!vf || typeof vf.path !== "string" || typeof vf.hash !== "string") continue;
-        consider(vf.path, vf.hash);
+        add(vf.path, vf.hash);
       }
-      if (candidates.length === 0) return null;
-      const mine = commonDirOnce(normOpRoot);
-      if (mine === null) return null; // unprovable own repo ⇒ no borrowing
+      return idx;
+    };
+    /** A content-identical record under a sibling root of the same repo, or null (fail closed). */
+    const foreignBlobMatch = (relPath: string): { root: string; stored: string } | null => {
+      if (subDisabled) return null;
+      if (siblingIndex === null) siblingIndex = buildSiblingIndex();
+      const candidates = siblingIndex.get(normalizeForOp(relPath));
+      if (candidates === undefined) return null;
       for (const c of candidates) {
-        if (commonDirOnce(c.root) !== mine) continue; // another repository — never borrowed
         // ONE read answers "does the record's digest match the bytes HERE"; on a match it also yields
         // the gate's own sha256, which is what the registry stores (#1460: a supplied md5/sha1 is
         // evidence, never the standing identity).
-        const digest = matchAndStoredDigest(normOpRoot, relPath, c.hash);
+        const digest = matchAndStoredDigest(worktreeRoot, relPath, c.hash);
         if (digest.matched) return { root: c.root, stored: digest.stored };
       }
       return null;
@@ -5119,7 +5164,7 @@ export default function (pi: ExtensionAPI) {
         // #2886: no record for THIS root — but the same path may be verified under a sibling root of
         // this same repository at these exact bytes (a rebased branch re-rooted into a new worktree).
         // Re-root the record found there rather than demanding a fresh verification of unchanged bytes.
-        const borrowed = foreignBlobMatch(worktreeRoot, file);
+        const borrowed = foreignBlobMatch(file);
         if (borrowed !== null) {
           verifiedSet.set(key, borrowed.stored);
           crossRootAccepted.push({ file, root: borrowed.root });
