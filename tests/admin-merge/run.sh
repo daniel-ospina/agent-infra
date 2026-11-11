@@ -16895,6 +16895,26 @@ else
   fail "(rd9b) an unreadable clock at the guard exited $rd9b_rc and/or did not name clock-unreadable — the guard would be inert"
 fi
 
+# ⛔ RESTORE THE SHELL FLAGS THE DEADLINE SECTION CHANGED (#3294 latched `set -e`).
+# The `rail-deadline` block above turns `set -e` ON and only ever turns it OFF around its
+# own individual rail calls, so when it ends `set -e` is still IN FORCE for everything
+# below it. Everything below was written under `set -uo pipefail` (this suite's own
+# header) and calls the rail bare:
+#
+#     run_admin_here 42 >/dev/null 2>&1
+#     rc=$?
+#
+# which is correct only WITHOUT `set -e`. With it, the FIRST arm whose rail call is
+# EXPECTED to refuse (§80 (b): "a tree red with NO base counterpart STILL BLOCKS") exits
+# the whole suite on the spot: measured here, the run printed (a) and then returned 1
+# with no footer — so §80 (c)…(i) AND the `--jq` compile guard at the tail of this file
+# never executed at all, while the suite still exited RED for no named reason. A check
+# that cannot run is not a check; the footer is also the only place `failures` is
+# reported, so an abort like this is unattributable.
+# ⛔ `set +e` MUST PRECEDE every arm added below this line. A future block that wants
+# `set -e` must scope it with its own `set +e` on exit, not leave it latched.
+set +e
+
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
 # is push-only and runs the SAME sweep as `script-validate`. Main is red on
