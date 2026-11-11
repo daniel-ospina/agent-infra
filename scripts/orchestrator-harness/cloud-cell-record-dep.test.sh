@@ -548,10 +548,17 @@ mkmrg() { # mkmrg — a fresh merge fixture: repo, HOME with a recorder, stubs, 
   # repo has no report writer, so the gate ABSTAINS (5 NO-CONSUMER) and the worker logs the audited
   # "NOT ENFORCED" arm. ⛔ THE FIXTURE MUST NOT INVENT A WRITER — an abstention is the faithful shape,
   # and seeding a consumer here would make the arms pass by exercising a gate this repo does not have.
-  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$MRG/repo" init -q
+  # ⛔ EACH CALL IS GUARDED (review round 17, N2): an unguarded `git init` that fails leaves a PLAIN
+  # DIRECTORY, and the ~49 merge arms below then redden with the same exit-9 "lane report UNMEASURABLE"
+  # refusal this whole fixture exists to remove — a visible failure, but one whose message names the
+  # gate rather than the fixture. A named exit turns that into a diagnosis.
+  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$MRG/repo" init -q \
+    || { echo "FIXTURE: git init failed in $MRG/repo — the merge fixture cannot be built" >&2; exit 1; }
   env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-    git -C "$MRG/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m fixture
-  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$MRG/repo" checkout -q -b fix/x
+    git -C "$MRG/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m fixture \
+    || { echo "FIXTURE: the empty fixture commit failed in $MRG/repo (git config/ident)" >&2; exit 1; }
+  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$MRG/repo" checkout -q -b fix/x \
+    || { echo "FIXTURE: could not create branch fix/x in $MRG/repo" >&2; exit 1; }
   : > "$MRG/pi-count"
   : > "$MRG/pr-body"
 }

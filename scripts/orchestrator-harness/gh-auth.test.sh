@@ -661,8 +661,21 @@ grep -q 'SHELLOPTS` is not exported, so `pipefail` is OFF in the child' <<<"$_si
 ck "B9o …and STATES the real mechanism — SHELLOPTS is not exported, so pipefail is OFF in the child — not merely the absence of the old sentence" $rc
 ! grep -qE '[0-9][0-9,]{2,}[[:space:]]*B([^a-zA-Z]|$)' <<<"$_sig"; rc=$?
 ck "B9p …and carries NO byte count (a precise-looking number here rots while the < 65536 bound stays satisfied, so the live pair lives in B9r's message, never in the prose)" $rc
-! grep -qiE 'inherit[a-z]*[^.]{0,40}pipefail' <<<"$_sig"; rc=$?
-ck "B9q …and never says a shard child INHERITS pipefail (a paraphrase of the removed mechanism is the same defect as the original sentence)" $rc
+# ⛔ THE CLAIM, NOT A CHARACTER COUNT (review round 17, N1): this arm was
+# `! grep -qiE 'inherit[a-z]*[^.]{0,40}pipefail'`, and the paragraph's own CORRECT sentence — "a reader
+# must not inherit the opposite of either: the top-level `set -uo pipefail` …" — puts **48** characters
+# between `inherit` and `pipefail`, so the arm passed on 8 characters of luck and any benign reflow
+# would have reddened it on text whose mechanism did not change. ⛔ WIDENING IS NOT THE FIX, and this is
+# measured: `{0,60}` MATCHES that correct sentence and reddens a green tree, so the note's suggested
+# value (`{0,60}`) is falsified on the live text. A distance window cannot be tuned to separate the
+# negated correct sentence from the affirmative false one. So the arm pins the CLAIM instead: within ONE
+# SENTENCE, `inherit…` and `pipefail` may not co-occur unless the `inherit` is itself negated (`must
+# not`, `does not`, `never`, `opposite`, `n't`). The live sentence is negated; the round-15 paraphrase
+# ("the shard child inherits pipefail from its parent") is not, and reddens — see the mutation table.
+_b9q_bad="$(printf '%s' "$_sig" | tr '.' '\n' | grep -i 'inherit' | grep -i 'pipefail' \
+  | grep -viE "(must not|does not|do not|is not|are not|never|no |cannot|can not|n't|opposite)[^.]{0,12}inherit")"
+[ -z "$_b9q_bad" ]; rc=$?
+ck "B9q …and no sentence says a shard child INHERITS pipefail (a paraphrase of the removed mechanism is the same defect as the original sentence) — asserted per SENTENCE with the negation required, not by a character window the live wording clears by 8 chars" $rc
 grep -q 'merge-one\.sh' <<<"$_place"; rc=$?
 ck "B9c …so the block NAMES merge-one.sh as a path this resolution does not reach" $rc
 grep -q 'single invocation every worker goes through' <<<"$_place" && rc=1 || rc=0
@@ -724,8 +737,8 @@ ck "B9m …and \`shard_exec\`'s OWN braces, line continuations folded, carry no 
 # ⛔ THE REGION IS BOUNDED, AND THAT IS ITS OWN ARM (review round 16, P3): the definition must not swallow
 # what follows it, or B9m grades text that is not this definition. `shard_run_bounded` is the very NEXT
 # function, so its name appearing in the extraction is the measured pre-fix defect identity (73 lines /
-# 5318 B containing it; post-fix 1 line / 94 B). This reddens on the range regression itself rather than
-# waiting for a pipefail comment to be the thing that finally exposes it.
+# 5318 B containing it; post-fix 1 line / 93 B, the size measured at this head). This reddens on the
+# range regression itself rather than waiting for a pipefail comment to be the thing that exposes it.
 grep -q 'shard_run_bounded' <<<"$_sx" && rc=1 || rc=0
 ck "B9s …and the extraction STOPS at \`shard_exec\`'s own closing brace — the next function is outside it, so a comment there can never be graded as this definition" $rc
 # ⛔ THE MECHANISM IS ALSO A PROPERTY OF THE ENVIRONMENT, and that half is PROBED, not read (review round
