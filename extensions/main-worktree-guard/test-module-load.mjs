@@ -787,12 +787,14 @@ async function partB() {
     // it. What is NEW here (review of this PR corrected an earlier "nothing pinned
     // it" claim: main already carries 8 e2e pins on the closure at B9u1–B9u8,
     // including exact launder shapes whose lead is a SWITCH): the own-baseline
-    // RENAME lead end-to-end, and the control proving a refused compound does not
-    // apply its pending re-baseline. Each row names the mutant that reddens it
-    // (agent-infra#3442); #601's indicators 2–4 are NOT repeated here because they
-    // are refused by arms that fire before the carve-out can matter (#626's
-    // create-new arm; delete → `op "other"` skipped by the M3 loop) — they cannot
-    // vary under any mutation of this fix and are already pinned by #626 / #596 r4.
+    // RENAME lead end-to-end, on two different tail families, each row
+    // independently reachable. Each row names the mutant that reddens it
+    // (agent-infra#3442, MEASURED per row); #601's indicators 2–4 are NOT repeated
+    // here because they are refused by arms that fire before the carve-out can
+    // matter (#626's create-new arm; delete → `op "other"` skipped by the M3 loop)
+    // — they cannot vary under any mutation of this fix and are already pinned by
+    // #626 / #596 r4. The "a refused compound does not re-baseline" property is
+    // B9v1/B9v2's, not this block's (see the note below the rows).
     //   M2 = index.ts's `if (det.stateCarveOutClean === true)` → `if (true)`
     //   M5 = `classify-git.mjs`'s carve-out identity exemption deleted
     //   M6 = `decideM3`'s #591 own-force carve-out removed; M7 = its stateOpCount bound deleted
@@ -809,32 +811,32 @@ async function partB() {
     // `git checkout main` returns to `baseline.original` under BOTH the correct code and M2,
     // so every block row below starts from a known baseline.
     const m601r1 = await callBash("git checkout main");
-    expectTrue("#601 harness control: the baseline is re-established between the block rows (admitted under M2 too)",
+    expectTrue("#601 harness control: the baseline is re-established between the block rows [mutants: M5, M8]" +
+      " — MEASURED: blocked under either (M5 by the legacy checkout-branch arm, M8 by the removed #376 arm)",
       m601r1 === undefined, `handler returned ${JSON.stringify(m601r1)}`);
     const m601b = await callBash("git branch -Mq main rn601b2 ; git branch -fq feat/other main");
     expectTrue("#601 ind1b: own rename + FOREIGN force-create is BLOCKED (a second tail family) [mutant: M2] — MEASURED: M2 admits it",
       !!m601b && m601b.block === true,
       `handler returned ${JSON.stringify(m601b)} — a foreign ref was force-created behind the sanctioned own rename`);
     const m601r2 = await callBash("git checkout main");
-    expectTrue("#601 harness control: the baseline is re-established after the second block row",
+    expectTrue("#601 harness control: the baseline is re-established after the second block row [mutants: M5, M8]" +
+      " — MEASURED: blocked under either",
       m601r2 === undefined, `handler returned ${JSON.stringify(m601r2)}`);
-    // A refused compound must NOT have re-baselined (the deferred closure is
-    // dropped on a block — #1144 F3), and the compound carve-out must still close
-    // when its siblings ARE read-only. Both are proven by one call: `git branch -Mq
-    // main rn601own` is admitted iff the recorded baseline is still `main`, so a
-    // block above that wrongly applied its pending reBaseline would leave this
-    // rename blocked as a foreign one.
-    const m601e = await callBash("git branch -Mq main rn601own ; git status");
-    expectTrue("#601 control: own rename + read-only sibling stays ALLOWED, and the refused compounds above did not re-baseline [mutant: M5] — M5 blocks it",
-      m601e === undefined, `handler returned ${JSON.stringify(m601e)}`);
-    const m601f = await callBash("git checkout main");
-    expectTrue("#601 control: the sanctioned return restores the baseline after the reBaseline control [mutant: M8] — M8 blocks it",
-      m601f === undefined, `handler returned ${JSON.stringify(m601f)}`);
+    // ⛔ NO ROW FOR "the refused compounds above did not re-baseline". An earlier draft had
+    // one here; fresh-context review of this PR measured that it could not observe that
+    // property (the restores above re-establish the baseline regardless) AND that its
+    // claimed mutant could not redden it — under M5 the carve-out simply fails to close and
+    // the command is admitted at index.ts's verdict arm (`det.verdict === "allow"` →
+    // `admitAfterM3()`, which applies the pending re-baseline), so `undefined` still holds.
+    // The property IS pinned, attributably, by the pre-existing B9v1/B9v2 pair
+    // (a REFUSED compound leaves the follow-up rename blocked; an ADMITTED return admits it).
+    // Citing that pair is the honest form; a duplicate here would be the dead weight #3442
+    // forbids.
     const m601g = await callBash("git branch -fq main HEAD");
-    expectTrue("#601 control: the single-invocation own-branch force-create carve-out survives (#591) [mutant: M6] — M6 blocks it",
+    expectTrue("#601 control: the single-invocation own-branch force-create carve-out survives (#591) [mutant: M6] — MEASURED: M6 blocks it",
       m601g === undefined, `handler returned ${JSON.stringify(m601g)}`);
     const m601h = await callBash("git branch side601b ; git branch -fq main HEAD");
-    expectTrue("#601 control: benign lead + own force-create is still REFUSED (#591 stateOpCount bound holds) [mutant: M7] — M7 admits it",
+    expectTrue("#601 control: benign lead + own force-create is still REFUSED (#591 stateOpCount bound holds) [mutant: M7] — MEASURED: M7 admits it",
       !!m601h && m601h.block === true, `handler returned ${JSON.stringify(m601h)}`);
 
     // ── B9w–B9z: #2277 — a lane rooted ELSEWHERE can advance a hub, but only

@@ -2118,7 +2118,8 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       }
     }
     expectBool("#601 matrix: none of the 24 reBaseline-lead × FOREIGN-tail compounds is admitted [mutants: M1, M3]" +
-      " — MEASURED: M1 admits 24/24 (12/12 per lead); M3 admits the own-rename-lead 12" +
+      " — MEASURED: M1 admits 24/24 and M3 admits 24/24 (stateCarveOutClean is computed from `invocations`" +
+      " and is independent of stateMutations, so both leads keep re-baselining under M3)" +
       (seen.length ? ` — ADMITTED: ${seen.join(" · ")}` : ""), admitted, 0);
   }
   // Positive controls — #601's own "must NOT break" list. A benign lead is not
