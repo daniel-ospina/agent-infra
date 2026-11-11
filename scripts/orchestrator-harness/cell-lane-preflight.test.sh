@@ -70,6 +70,27 @@
 # A19 no checkout to measure               → `repo=none behind=unknown`, exit 0: the CI/dev path (every
 #                                            other arm here runs it), reported and never refused.
 # A20 a bad threshold                      → exit 2 (`why=usage`), not a silent `ok`.
+# A21 a checkout at $PWD                   → measured with NOTHING named: the production default (this
+#                                            change's review, P1-1). The pre-fix candidate list was
+#                                            `$HOME/tortoise` / `$HOME/agent-infra` only, so on every
+#                                            box the reading was measured on the gate answered
+#                                            `repo=none behind=unknown → ok` — inert where it had to
+#                                            fire — and no arm noticed, because every arm passed
+#                                            `CELL_PREFLIGHT_REPO` explicitly.
+# A22 the CELL layout                      → `HOME` has no checkout and the harness is at
+#                                            `${CELL_HOME}/agent-infra`; still measured.
+# A23 `HOME` unset                         → the verdict line STILL CARRIES `repo=`/`behind=`. Pre-fix,
+#                                            `$HOME/tortoise` under `set -u` aborted inside `$( )` and
+#                                            the readiness field VANISHED instead of saying `unknown`.
+# A24 a NAMED checkout                     → `--repo` reaches the same reading; and a named path that
+#                                            is not a checkout is REPORTED, never replaced by a guess
+#                                            (looking somewhere other than where you were told is the
+#                                            same defect one step later).
+# A25 a checkout with NO fetch refspec     → the count is still MEASURED. `git fetch origin main`
+#                                            refreshes `origin/main` only by git's OPPORTUNISTIC UPDATE,
+#                                            which needs a configured `remote.origin.fetch`; without it
+#                                            the fetch exits 0 and leaves the stale ref, so the gate
+#                                            printed `behind=0` on a 3-behind checkout. Measured.
 #
 # ── MUTATION ────────────────────────────────────────────────────────────────────────────────────
 # Every count below is what THIS file printed, measured by running it. Two mutations, because two
@@ -89,6 +110,11 @@
 #      unconditionally — the first cut's shape): A18 goes red, `expected 'behind=unknown' … got:
 #      …behind=0…`. That is the mutation that matters, because it makes the gate publish a number it
 #      never measured, and it is invisible in production right up to the moment a stale base lands work.
+# (M4) fetch with `origin main` instead of the explicit `+refs/heads/main:refs/remotes/origin/main`
+#      destination: A25 goes red on a checkout whose `remote.origin.fetch` is unset (`behind=0` on a
+#      3-behind box). Measured on that fixture before the destination was made explicit.
+# (M5) drop `$PWD` from the default candidate list: A21 goes red (`repo=none`). Drop the cell paths:
+#      A22 goes red. Read `$HOME` bare again: A23 goes red on the MISSING FIELD, not on a wrong value.
 # ⚠️ THE EARLIER HEADER ON THIS FILE NAMED A DIFFERENT MUTATION WITH COUNTS THAT BELONGED TO A THIRD
 # ONE (review of #2991, P2, reproduced by the reviewer). The old counts are deleted rather than
 # restated: a number that does not reproduce under the mutation it names is a claim about process
@@ -162,10 +188,16 @@ make_keys() {
   chmod 600 "$d/keys.env"
 }
 # run_gate <dir> <bound> [extra args…] -> sets RC and OUT
+# ⛔ THE PROBE RUNS FROM `<dir>`, NOT FROM WHATEVER CWD THE SUITE WAS STARTED IN (this change's review,
+# P1-1). The staleness reading resolves `$PWD` as a candidate, so an arm launched from the repo root
+# measured the CHECKOUT THE SUITE LIVES IN — a real network fetch per arm, and an `ok` line whose
+# `behind=` depended on the box. `<dir>` holds no `.git`, so these arms take the documented
+# "no checkout to measure" path deterministically, which is what they are about (the capability read).
 run_gate() {
   local d="$1" bound="$2"; shift 2
-  OUT="$(env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS PATH="$d/bin:$PATH" \
-          HOME="$d/home" bash "$TARGET" --keys "$d/keys.env" --bound "$bound" "$@" 2>&1)"
+  OUT="$( cd "$d" && env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS \
+          -u CELL_PREFLIGHT_REPO -u CELL_PREFLIGHT_MAX_BEHIND -u CELL_PREFLIGHT_FETCH_BOUND \
+          PATH="$d/bin:$PATH" HOME="$d/home" bash "$TARGET" --keys "$d/keys.env" --bound "$bound" "$@" 2>&1)"
   RC=$?
 }
 mkdir -p "$WORK/home"
@@ -204,14 +236,19 @@ mk_repo() { # mk_repo <dir> <n-ahead> → <dir>/repo is <n-ahead> commits behind
 unreachable_remote() { # the clone keeps its last-fetched origin/main; every further fetch fails
   g -C "$1/repo" remote set-url origin "$1/does-not-exist.git"
 }
-# run_gate_cell <dir> <bound> [VAR=value …] → RC and OUT, extra env threaded through `env`
-run_gate_cell() {
-  local d="$1" bound="$2"; shift 2
-  OUT="$(env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS -u CELL_PREFLIGHT_REPO \
+# run_gate_in <cwd> <dir> <bound> [VAR=value …] → RC and OUT, the probe running FROM <cwd>
+run_gate_in() {
+  local cwd="$1" d="$2" bound="$3"; shift 3
+  OUT="$( cd "$cwd" && env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS -u CELL_PREFLIGHT_REPO \
           -u CELL_PREFLIGHT_MAX_BEHIND -u CELL_PREFLIGHT_FETCH_BOUND \
           PATH="$d/bin:$PATH" HOME="$d/home" "$@" \
           bash "$TARGET" --keys "$d/keys.env" --bound "$bound" 2>&1)"
   RC=$?
+}
+# run_gate_cell <dir> <bound> [VAR=value …] → RC and OUT, extra env threaded through `env`
+run_gate_cell() {
+  local d="$1" bound="$2"; shift 2
+  run_gate_in "$d" "$d" "$bound" "$@"
 }
 
 # ── A1: answer + return → ok ────────────────────────────────────────────────────────────────────
@@ -407,6 +444,78 @@ OUT="$(CELL_PREFLIGHT_MAX_BEHIND=lots bash "$TARGET" --quiet --bound 5 2>&1)"; R
 [ "$RC" -eq 2 ] && ok "A20 a non-numeric CELL_PREFLIGHT_MAX_BEHIND exits 2" || bad "A20 expected exit 2, got $RC: $OUT"
 assert_has "A20 ...naming the variable it rejected" "CELL_PREFLIGHT_MAX_BEHIND" "$OUT"
 assert_not_has "A20 ...instead of reading ok on an unappliable bound" "LANE_CAPABILITY=ok" "$OUT"
+
+# ── A21–A25: THE DEFAULT RESOLUTION, THE CELL LAYOUT, `HOME`, AND A NAMED CHECKOUT ───────────────
+# ⛔ THE ARMS ABOVE ALL NAME THE CHECKOUT, so none of them could see that the DEFAULT resolved nothing
+# on the boxes the reading was measured on (this change's review, P1-1). Every arm below is RED on the
+# pre-fix code, and the mutation list says which edit makes which one red.
+
+# A21 — the checkout the probe is RUNNING IN is the base a lane will build on, and it is measured with
+# NOTHING named in the environment.
+make_stub "$WORK/a21" answer; make_keys "$WORK/a21"
+mk_repo "$WORK/a21" 0 || bad "A21 fixture: could not build a git repo"
+run_gate_in "$WORK/a21/repo" "$WORK/a21" 20 CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 0 ] && ok "A21 a current checkout at \$PWD is READY with nothing named in the env" \
+                || bad "A21 expected exit 0, got $RC: $OUT"
+assert_has "A21 the default resolution FOUND the checkout the lane will build on" "repo=repo" "$OUT"
+assert_has "A21 ...and measured it" "behind=0" "$OUT"
+
+# A22 — the CELL layout, which is the one that matters: `HOME=/tmp/cell-home` holds no checkout and the
+# tortoise/agent-infra checkouts are `/tmp/cell-t3` and `/tmp/cell-ai` (docs/ops/disk-consumers.md),
+# resolved by `cell-install.sh` / `ci_runner_fleet.sh` through `${CELL_HOME}`. The probe runs from a
+# NEUTRAL cwd, so the cell path is the only way it can find this checkout.
+make_stub "$WORK/a22" answer; make_keys "$WORK/a22"
+mk_repo "$WORK/a22/src" 0 || bad "A22 fixture: could not build a git repo"
+mkdir -p "$WORK/a22/cellhome"
+cp -a "$WORK/a22/src/repo" "$WORK/a22/cellhome/agent-infra" || bad "A22 fixture: could not place the cell checkout"
+run_gate_in "$WORK/a22" "$WORK/a22" 20 CELL_HOME="$WORK/a22/cellhome" CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 0 ] && ok "A22 the cell layout (\$CELL_HOME/agent-infra, HOME has no checkout) is MEASURED" \
+                || bad "A22 expected exit 0, got $RC: $OUT"
+assert_has "A22 ...the cell path is in the default candidate list" "repo=agent-infra" "$OUT"
+assert_has "A22 ...and carries its distance" "behind=0" "$OUT"
+
+# A23 — `HOME` UNSET: the reading must still be ON THE LINE. Pre-fix the bare `$HOME/tortoise` aborted
+# under `set -u` inside `$( )`, so `FRESHNESS` came back EMPTY and the `ok` line carried no `repo=` and
+# no `behind=` at all — the readiness field disappeared rather than saying `unknown`, against this
+# file's own contract that the output is one line and always carries what it read.
+make_stub "$WORK/a23" answer; make_keys "$WORK/a23"
+OUT="$( cd "$WORK/a23" && env -u HOME -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS \
+        -u CELL_PREFLIGHT_REPO PATH="$WORK/a23/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        bash "$TARGET" --keys "$WORK/a23/keys.env" --quiet --bound 20 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "A23 a box with no \$HOME is still measurable (exit 0)" || bad "A23 expected exit 0, got $RC: $OUT"
+assert_has "A23 ...and the readiness field is STILL on the line (it used to vanish)" "behind=" "$OUT"
+assert_has "A23 ...naming that nothing was resolved, rather than reporting nothing at all" "repo=none" "$OUT"
+
+# A24 — `--repo` names the checkout (the caller already knows it), and a NAME THAT IS NOT A CHECKOUT IS
+# REPORTED. The second half is the one a guess would hide: `$PWD` here IS a valid checkout, so a
+# resolution that fell through to it would answer a question nobody asked.
+make_stub "$WORK/a24" answer; make_keys "$WORK/a24"
+mk_repo "$WORK/a24" 3 || bad "A24 fixture: could not build a git repo"
+OUT="$( cd "$WORK/a24" && env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS -u CELL_PREFLIGHT_REPO \
+        PATH="$WORK/a24/bin:$PATH" HOME="$WORK/a24/home" CELL_PREFLIGHT_MAX_BEHIND=2 \
+        bash "$TARGET" --keys "$WORK/a24/keys.env" --repo "$WORK/a24/repo" --bound 20 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "A24 --repo names the checkout, and a stale one REFUSES (exit 3)" || bad "A24 expected exit 3, got $RC: $OUT"
+assert_has "A24 ...carrying the distance from the named checkout" "behind=3" "$OUT"
+OUT="$( cd "$WORK/a24/repo" && env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS -u CELL_PREFLIGHT_REPO \
+        PATH="$WORK/a24/bin:$PATH" HOME="$WORK/a24/home" CELL_PREFLIGHT_MAX_BEHIND=2 \
+        bash "$TARGET" --keys "$WORK/a24/keys.env" --repo "$WORK/a24/no-such-checkout" --quiet --bound 20 2>&1)"; RC=$?
+assert_has "A24b a NAMED path that is not a checkout is REPORTED as such" "reason=not-a-checkout" "$OUT"
+assert_not_has "A24b ...and is never silently replaced by \$PWD, which here IS a valid checkout" "repo=repo" "$OUT"
+
+# A25 — THE FETCH'S DESTINATION IS EXPLICIT, AND THAT IS NOT REDUNDANT. `git fetch origin main` refreshes
+# `refs/remotes/origin/main` only by git's OPPORTUNISTIC UPDATE, which requires a configured
+# `remote.origin.fetch` mapping `main`. A checkout without one takes the fetch, exits 0, leaves
+# `origin/main` at the clone's stale value — and the gate then prints a count it never measured. Built
+# here exactly that way, so the arm is RED on a plain `git fetch origin main` (measured: it read
+# `behind=0` on a checkout that was 3 commits behind).
+make_stub "$WORK/a25" answer; make_keys "$WORK/a25"
+mk_repo "$WORK/a25" 3 || bad "A25 fixture: could not build a git repo"
+if g -C "$WORK/a25/repo" config --unset-all remote.origin.fetch >/dev/null 2>&1; then :; else bad "A25 fixture: could not unset remote.origin.fetch"; fi
+run_gate_cell "$WORK/a25" 20 CELL_PREFLIGHT_REPO="$WORK/a25/repo" CELL_PREFLIGHT_MAX_BEHIND=2
+[ "$RC" -eq 3 ] && ok "A25 a checkout with NO fetch refspec is still MEASURED (exit 3 on a stale one)" \
+                || bad "A25 expected exit 3, got $RC: $OUT"
+assert_has "A25 ...the explicit destination refreshed origin/main, so the distance is real" "behind=3" "$OUT"
+assert_not_has "A25 ...never publishes the stale ref's 0 as a measurement" "behind=0" "$OUT"
 
 printf '\ncell-lane-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -77,12 +77,20 @@
 #   --model/--provider   mirror the launcher's pair. Default `${PI_LANE_MODEL:-deepseek-flash}` /
 #                   `${PI_LANE_PROVIDER:-deepseek}` — the SAME contract as lane-exec.sh and
 #                   spawn-gate.sh::run_agent, so the probe measures the model the lane will run.
+#   --repo <path>   the checkout to measure for the staleness reading (#3932). Same value as
+#                   `CELL_PREFLIGHT_REPO`, and it wins over it. NOT a way to switch the field off: a
+#                   named path that is not a checkout is reported (`repo=none … reason=not-a-checkout`),
+#                   never silently replaced by a guess.
 #
-# ENVIRONMENT (the staleness reading, #3932 — it has no flag, because it is BOX state, not a probe
-# argument: a caller must not be able to turn its own readiness field off):
-#   CELL_PREFLIGHT_REPO        the checkout to measure. Default: the first of `${CELL_PREFLIGHT_REPO}`,
-#                              `$HOME/tortoise`, `$HOME/agent-infra` that exists. None found is
-#                              `repo=none behind=unknown` — reported, never refused.
+# ENVIRONMENT (the staleness reading, #3932 — the THRESHOLD and the BOUND have no flag, because they
+# are policy, not a reading: a caller must not be able to turn its own readiness field off. Naming the
+# checkout is a different thing, and it has one):
+#   CELL_PREFLIGHT_REPO        the checkout to measure. Resolution order, first that EXISTS:
+#                              `--repo`, then `${CELL_PREFLIGHT_REPO}`, then `$PWD` (for a lane that is
+#                              the worktree it will build on), then the paths this repo actually
+#                              resolves cells with (`/tmp/cell-ai`, `/tmp/cell-t3`,
+#                              `${CELL_HOME}/agent-infra`), then `$HOME/tortoise`, `$HOME/agent-infra`.
+#                              Nothing found is `repo=none behind=unknown` — reported, never refused.
 #   CELL_PREFLIGHT_MAX_BEHIND  refuse when the checkout is MORE than this many commits behind
 #                              `origin/main`. Default 50.
 #   CELL_PREFLIGHT_FETCH_BOUND the fetch gets this many seconds before it is killed and the reading
@@ -174,17 +182,66 @@ emit() {
 # `git` itself rather than at a wrapper shell, so the bound's kill reaches the process it bounds.
 MAX_BEHIND="${CELL_PREFLIGHT_MAX_BEHIND:-50}"
 FETCH_BOUND="${CELL_PREFLIGHT_FETCH_BOUND:-12}"
+REPO_ARG=""
+
+# ⛔ WHICH CHECKOUT IS MEASURED IS THE CALLER'S TO NAME, NOT A GUESS (this change's review, P1-1).
+# The first cut guessed `${HOME}/tortoise` and `${HOME}/agent-infra`, and on the boxes the reading was
+# measured on NEITHER EXISTS: a cell runs `HOME=/tmp/cell-home` while the tortoise checkout with all its
+# worktrees is `/tmp/cell-t3` (docs/ops/disk-consumers.md), and the dispatch Mac keeps both checkouts
+# under `Documents/GitHub/`. Every reading was then `repo=none behind=unknown` → `ok`, so the refusal
+# was UNREACHABLE exactly where it was meant to fire — and the suite stayed green because every arm
+# passed `CELL_PREFLIGHT_REPO` explicitly. A readiness field that resolves nothing by default is the
+# no-op-gate class this repo treats as category A.
+# So the order is: what the CALLER named is AUTHORITATIVE (and a named path that is not a checkout does
+# NOT fall through to a guess — looking somewhere other than where you were told is the same defect one
+# step later); then the checkout the probe is RUNNING IN, `$PWD`, which for `run_agent` is the lane's own
+# worktree — the base it will build on; then the paths this repo actually resolves cells with; then the
+# plain `$HOME` layout.
+# ⛔ A `--repo` FLAG DOES NOT LET A CALLER TURN THE FIELD OFF, which is the one thing the first cut's
+# no-flag rule was protecting: naming a checkout can only make the reading MORE specific, a named
+# non-checkout is reported as such, and `CELL_PREFLIGHT_REPO` already had exactly this power.
+# ⛔ `${HOME:-}` THROUGHOUT: the first cut read `$HOME/...` bare under `set -u`, so a caller with no HOME
+# aborted inside `$( )` and the verdict line lost its `repo=`/`behind=` fields ENTIRELY — the readiness
+# field vanished instead of saying `unknown` (this change's review, P2-3).
+# ⛔ IT SETS `REPO_FOUND` RATHER THAN PRINTING THE PATH: the note that says WHY nothing was measured has
+# to survive the call, and a `$( )` would drop it (measured — the arm read the generic
+# `reason=no-checkout` over the specific `reason=not-a-checkout path=…` it had just produced).
+resolve_repo() { # -> 0 and REPO_FOUND set; 1 with REPO_NOTE naming why nothing was measured
+  local cand
+  REPO_FOUND=""
+  for cand in "${REPO_ARG:-}" "${CELL_PREFLIGHT_REPO:-}"; do
+    [ -n "$cand" ] || continue
+    [ -e "$cand/.git" ] && { REPO_FOUND="$cand"; return 0; }
+    REPO_NOTE="reason=not-a-checkout path=$cand"
+    return 1
+  done
+  for cand in "$PWD" /tmp/cell-ai /tmp/cell-t3 \
+              "${CELL_HOME:-}${CELL_HOME:+/agent-infra}" \
+              "${HOME:-}${HOME:+/tortoise}" "${HOME:-}${HOME:+/agent-infra}"; do
+    [ -n "$cand" ] || continue
+    [ -e "$cand/.git" ] && { REPO_FOUND="$cand"; return 0; }
+  done
+  REPO_NOTE="reason=no-checkout tried=pwd,/tmp/cell-ai,/tmp/cell-t3,CELL_HOME/agent-infra,HOME/tortoise,HOME/agent-infra"
+  return 1
+}
 
 code_freshness() {
-  local repo="" behind="" cand fp n fetch_rc
-  for cand in "${CELL_PREFLIGHT_REPO:-}" "$HOME/tortoise" "$HOME/agent-infra"; do
-    [ -n "$cand" ] || continue
-    if [ -e "$cand/.git" ]; then repo="$cand"; break; fi
-  done
-  [ -n "$repo" ] || { printf 'repo=none behind=unknown'; return 0; }
+  local repo="" behind="" fp n fetch_rc
+  REPO_NOTE=""
+  resolve_repo || REPO_FOUND=""
+  repo="$REPO_FOUND"
+  [ -n "$repo" ] || { printf 'repo=none behind=unknown %s' "${REPO_NOTE:-reason=no-checkout}"; return 0; }
   # Bounded fetch. `timeout` is absent on macOS and this suite runs on both, so the bound is a
   # background pid + a counted sleep, matching the watchdog form the repo already uses (#2046).
-  ( cd "$repo" 2>/dev/null && exec git fetch --quiet origin main >/dev/null 2>&1 ) &
+  # ⛔ THE DESTINATION IS EXPLICIT, AND THAT IS NOT REDUNDANT (this change's review: measured). A
+  # command-line refspec with no `:<dst>` only refreshes `refs/remotes/origin/main` by git's
+  # OPPORTUNISTIC UPDATE, which needs a configured `remote.origin.fetch` that maps `main`. Measured on a
+  # checkout whose fetch refspec had been emptied: `git fetch origin main` exited **0**, left
+  # `origin/main` untouched, and the count printed `behind=0` on a checkout that was 3 commits behind —
+  # the exact false PASS this reading exists to remove, one line under the rule that a ref not refreshed
+  # this run is not a measurement. Naming the destination makes the refresh structural instead of
+  # dependent on a config the probe does not own.
+  ( cd "$repo" 2>/dev/null && exec git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' >/dev/null 2>&1 ) &
   fp=$! n=0
   while [ "$n" -lt "$FETCH_BOUND" ] && kill -0 "$fp" 2>/dev/null; do sleep 1; n=$((n+1)); done
   kill -0 "$fp" 2>/dev/null && kill "$fp" 2>/dev/null
@@ -192,12 +249,12 @@ code_freshness() {
   # mean the same thing: whatever `origin/main` now holds was not read from the remote this run.
   wait "$fp" 2>/dev/null; fetch_rc=$?
   if [ "${fetch_rc:-1}" -ne 0 ]; then
-    printf 'repo=%s behind=unknown fetch_rc=%s' "$(basename "$repo")" "$fetch_rc"
+    printf 'repo=%s behind=unknown reason=fetch-failed fetch_rc=%s' "$(basename "$repo")" "$fetch_rc"
     return 0
   fi
   behind="$( cd "$repo" 2>/dev/null && git rev-list --count HEAD..origin/main 2>/dev/null )"
   case "${behind:-}" in
-    ''|*[!0-9]*) printf 'repo=%s behind=unknown' "$(basename "$repo")" ;;
+    ''|*[!0-9]*) printf 'repo=%s behind=unknown reason=rev-list-unreadable' "$(basename "$repo")" ;;
     *)           printf 'repo=%s behind=%s' "$(basename "$repo")" "$behind" ;;
   esac
 }
@@ -210,6 +267,7 @@ while [ $# -gt 0 ]; do
     --model) [ $# -ge 2 ] || die_usage "--model needs a value"; MODEL="$2"; shift 2 ;;
     --provider) [ $# -ge 2 ] || die_usage "--provider needs a value"; PROVIDER="$2"; shift 2 ;;
     --attempts) [ $# -ge 2 ] || die_usage "--attempts needs a number"; ATTEMPTS="$2"; shift 2 ;;
+    --repo) [ $# -ge 2 ] || die_usage "--repo needs a path"; REPO_ARG="$2"; shift 2 ;;
     --quiet) QUIET=1; shift ;;
     # ⛔ UP TO `set -u`, NOT A LINE RANGE: the header grows and a range silently truncates the help
     # (this PR's own USAGE advertised a `--line` flag the parser had no case for, so `--line` exited 2
