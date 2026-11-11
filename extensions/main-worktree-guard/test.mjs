@@ -1088,16 +1088,17 @@ wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -
 // protects a sibling-held branch ALLOWED the delete (probe-verified end-to-end
 // from a linked worktree, where M2 is exempt). The segment is now tokenized
 // with the module's quote-aware splitter (`_tokenize`) and bounded by four rules:
-//   1. `_SHELL_OPS`'s LIST SEPARATORS (`&& || | & ;`) end the segment. The set also contains `(`/`)`,
-//      but those are intercepted by rule 3 FIRST, so only the separators fire here — the parens are
-//      NOT "excluded from ending a segment": an unquoted closer with no opener DOES end it (rule 3).
+//   1. NO LIST SEPARATOR can reach the helper (`segRe`'s `[^;&|]*` capture cannot contain `;`/`&`/`|`,
+//      and `_tokenize` runs without `newlineIsSeparator`), so there is no separator arm to test; the
+//      set's `(`/`)` members are intercepted by rule 3 — an unquoted closer with no opener DOES end
+//      the segment there.
 //   2. a redirect is NOT a boundary — the token is skipped with its filename operand;
 //   3. a span that OPENS inside the segment (`$( … )`, `<( … )`, `<backtick>…<backtick>`) is one WORD:
 //      its contents are skipped and the scan CONTINUES, while a `)` / unpaired backtick with no
 //      opener inside the segment ends it (that is the #504 case itself);
 //   4. only an UNQUOTED paren is an operator — quoted/escaped ones are DATA (`_tokenize` strips
 //      quotes, so `-o ")"` used to arrive as the operator token `)` and end the segment: round-4
-//      fail-open, the same #73 hazard). See `_maskQuotedParens`.
+//      fail-open, the same #73 hazard). See `_maskDataParens`.
 // (An earlier revision of this comment named `_truncateAtUnquotedBacktick` and claimed `(` ends a
 // segment; that function no longer exists and the claim was backwards — it described exactly the
 // round-2 fail-open. Corrected in place, see round-3 review finding.)
@@ -1150,7 +1151,7 @@ wcdt("an OUTPUT process-substitution WORD before the flag", "block:push", "git p
 // ENDED the segment while the delete flag was still ahead of it: `git push origin -o ")" -d b` → []
 // where origin/main → ["b"], so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was
 // allowed in BOTH the full path and the degraded arm. Fourth mirror-shape of the rounds 1-3 class.
-// Quote-state is now carried through tokenization by masking quoted/escaped parens (`_maskQuotedParens`).
+// Quote-state is now carried through tokenization by masking quoted/escaped parens (`_maskDataParens`).
 wcdt("a QUOTED close-paren before the flag is data", "block:push", `git push origin -o ")" -d b`, ["b"]);
 wcdt("a QUOTED open-paren before the flag is data", "block:push", `git push origin -o "(" -d b`, ["b"]);
 wcdt("an ESCAPED close-paren before the flag is data", "block:push", "git push origin -o \\) -d b", ["b"]);
@@ -1159,6 +1160,21 @@ wcdt("a quoted paren INSIDE a span keeps the flag", "block:push", `git push $(ec
 // restored, not mangled by the sentinel.
 wcdt("a QUOTED paren in the TARGET survives masking", "block:push", `git push origin -d "x)"`, ["x)"]);
 wcdt("an ESCAPED paren in the TARGET survives masking", "block:push", "git push origin -d b\\)", ["b)"]);
+// ⛔ A `${ … }` WORD'S PAREN IS DATA, NOT AN OPERATOR (fresh-context review round 6, P2). A parameter
+// expansion's `)` is not a closer of anything — bash ends the span at a BRACE. It was neither quoted nor
+// escaped, so the mask left it as the operator token `)`, which hit the span-closer leg with depth 0 and
+// ENDED the segment before the delete flag: `git push origin -o ${R:-)} -d held/branch` → [] where
+// origin/main → ["held/branch"], so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was
+// allowed (reproduced end-to-end: the remote deleted the branch). Sixth mirror-shape of the same class.
+// Every row below reads `[]` on the pre-fix module and `["b"]` here (measured, both modules).
+wcdt("a data paren inside a parameter expansion before the flag", "block:push", "git push origin -o ${R:-)} -d b", ["b"]);
+wcdt("a NESTED parameter expansion's data paren", "block:push", "git push origin -o ${A:-${B:-)}} -d b", ["b"]);
+// …and the `}` scan is quote-AWARE: a brace inside single quotes does not close the span, so the
+// UNQUOTED paren after it must still be masked (bash: `${R:-'}'x)}` → `}x)`).
+wcdt("a QUOTED brace does not close the expansion", "block:push", "git push origin -o ${R:-'}'x)} -d b", ["b"]);
+wcdt("a parameter expansion before the remote", "block:push", "git push -o ${R:-)} origin -d b", ["b"]);
+wcdt("a parameter expansion before the --delete spelling", "block:push", "git push origin -o ${R:-x)} --delete b", ["b"]);
+wcdt("a substitution span INSIDE a parameter expansion", "block:push", "git push $(echo ${R:-)}) origin -d b", ["b"]);
 // An UNRESOLVABLE target (a substitution in the delete-target position names no ref) must not become a
 // PHANTOM target: origin/main reported `["$(echo"]` / `["`cat"]`, which no ref can match either. The
 // placeholder is dropped, so the extractor says "nothing resolvable" instead of inventing a name.
@@ -1167,6 +1183,9 @@ wcdt("substitution in the TARGET position yields no target (not a phantom)", "bl
 // pushTargets with the SAME extractor — the parenthesized twin must attribute
 // the real target there too, not the phantom `b)`.
 dexpect("parenthesized later-segment --delete → real target only", `git push origin HEAD:refs/heads/feat && (git push origin --delete b)`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
+// The fold-in path carries the SAME surface: a `${ … }` word in the -o slot used to empty pushTargets
+// on a verdict that DID block, so the target was protected only by luck of the fallback (#504).
+dexpect("parameter-expansion later-segment --delete → real target only", "git push origin HEAD:feat && git push origin -o ${R:-)} --delete b", { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
 // QUOTED text is data, not a shell operator: a ref legitimately named `b)`
 // must survive (git ref names allow parentheses), so the boundary rule must be
 // quote-AWARE — a blanket trailing-`)` strip would corrupt it. Same for a quoted
