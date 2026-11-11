@@ -888,6 +888,12 @@ async function partB() {
     //   M3 = the #607 freed-name relaxation deleted (dst probe as before)
     //   M3i = `renameDstExists: dstExists` → `false` (the pre-#598 decision: no dst
     //         existence check at all) — the non-vacuity arm for the launder rows
+    //   M8 = `admitAfterM3` applies `pendingRebaselines` BEFORE the hidden refusal (the
+    //         #1144 F3 ordering this diff guarantees) — reddens the baseline-stability row
+    //   M9 = the collector WITHOUT single-quote masking (the round-4 quoting false block)
+    //         — reddens the two single-quoted rows
+    //   M9b = `_stripQuotedHeredocBodies` removed from the precise predicate — reddens
+    //         the quoted-heredoc row (MEASURED pre-fix: that row reported true)
     //   M6 = `hiddenStateMutation` recomputed from the CONSERVATIVE
     //         `_hasHiddenStateSubst` (the pre-review head's predicate) — reddens the
     //         read-only rows below, i.e. the false-block class findings 1/2 named
@@ -977,7 +983,7 @@ async function partB() {
     // MEASURED-discriminating under a mutant that applies pending re-baselines
     // on refusal.
     await expect607Allow(
-      "#607 hidden: a REFUSED compound left the baseline untouched (the follow-up own-rename is still the sanctioned carve-out) [mutant: M1, indirectly — MEASURED: red under M1 because that mutant ADMITS the row above, which legitimately re-baselines]",
+      "#607 hidden: a REFUSED compound left the baseline untouched (the follow-up own-rename is still the sanctioned carve-out) [mutant: M8 — apply the pending re-baselines BEFORE the hidden refusal in admitAfterM3; MEASURED: it re-baselines the refused lead and this row then blocks as a foreign source]",
       "git branch -M main afterRefusalX");
     await restore607("the refused-compound baseline control (baseline `afterRefusalX` → `main`)");
     // A payload the extractor CAN enumerate is still gated on its own merits (the
@@ -1151,11 +1157,28 @@ async function partB() {
     // inert-first → false (ADMITTED, and the shell runs it, `victim` clobbered rc 0)
     // while exec-first → true. Both orders are now refused (memo keyed on
     // (context, text)) and the inert half alone is still the ALLOW control.
+    // ── ROUND-4 FINDING 1: SINGLE-QUOTED text is INERT — the shell expands nothing
+    // inside `'…'`, so a payload being DISCUSSED in a commit message is not a payload.
+    // MEASURED before this fix: all three rows below were REFUSED, in a worktree
+    // session, on the ordinary `git commit` a lane runs while fixing this very issue.
+    // The double-quoted twin is the discriminator (it DOES expand, so it stays refused).
+    await expect607Allow(
+      "#607 quoting: a payload inside a SINGLE-quoted commit message is ALLOWED (bash expands nothing there) [mutant: M9] — MEASURED: M9 refuses it",
+      `git commit -m 'fix(guard): refuse $(git branch -Mq main victim) (#607)'`);
+    await expect607Allow(
+      "#607 quoting: a payload inside single-quoted BACKTICKS in a message is ALLOWED [mutant: M9] — MEASURED: M9 refuses it",
+      "git commit -m 'docs: `git branch -Mq main victim` is now refused'");
+    await expect607Allow(
+      "#607 quoting: a QUOTED heredoc body fed to `git commit -F -` is ALLOWED (literal to the outer shell) [mutant: M9b — the quoted-heredoc strip removed] — MEASURED pre-fix: refused",
+      "git commit -F - <<'EOF'\nfix(guard): refuse $(git branch -Mq main victim) (#607)\nEOF");
     await expect607Block(
-      "#607 order: same text inert-then-executable is REFUSED (the memo is keyed on context, not text alone)",
+      "#607 quoting: the DOUBLE-quoted twin is still REFUSED — it really does expand",
+      'git commit -m "fix(guard): refuse $(git branch -Mq main victim) (#607)"');
+    await expect607Block(
+      "#607 order: same text inert-then-executable is REFUSED (the memo is keyed on context, not text alone) [mutant: M7] — MEASURED: M7 reverts to text-only keying and admits it",
       "y=$(echo 'git branch -Mq victim main'); bash <(echo 'git branch -Mq victim main')");
     await expect607Block(
-      "#607 order: the same pair exec-then-inert is REFUSED too (order must not decide the verdict)",
+      "#607 order: the same pair exec-then-inert is REFUSED too (symmetry pin: cannot vary under M7 — with a text-only memo this order was ALREADY true; it varies under M1)",
       "bash <(echo 'git branch -Mq victim main'); y=$(echo 'git branch -Mq victim main')");
     await expect607Allow(
       "#607 order: the inert half ALONE is the control — an echo into a variable mutates nothing",

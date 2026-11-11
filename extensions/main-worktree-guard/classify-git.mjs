@@ -5813,8 +5813,26 @@ function _collectSubstSpansDetailed(src) {
   const spans = [];
   let i = 0;
   const n = src.length;
+  // #607 (review round 4, P2): SINGLE-QUOTED regions are INERT — bash performs no
+  // expansion inside `'…'`, so a `$(…)`/backtick inside one is literal text and must
+  // not be harvested as an expansion. MEASURED before this: the collector had no
+  // top-level quote tracking at all, so
+  //   `git commit -m 'fix: refuse $(git branch -Mq main victim) (#607)'`
+  // — prose about a payload — was refused, with the remedy "run it directly", which it
+  // already did. That is the traffic of the very issue being discussed.
+  // DOUBLE-quoted regions still collect (`"$(…)"` DOES expand) and so does the
+  // `eval '…'` literal (handled by a separate pass, not by this collector).
+  let dq = false;
   while (i < n) {
     const c = src[i];
+    if (c === "\\") { i += 2; continue; }        // escaped char — inert
+    if (c === '"') { dq = !dq; i += 1; continue; }
+    if (c === "'" && !dq) {                        // single-quoted region: skip it whole
+      let j = i + 1;
+      while (j < n && src[j] !== "'") j++;
+      i = j < n ? j + 1 : n;
+      continue;
+    }
     if (c === "$" && src[i + 1] === "'") {
       let j = i + 2;
       while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
@@ -6044,7 +6062,16 @@ export function _hasHiddenStateSubst(raw) {
  * @returns {boolean}
  */
 export function _hasHiddenStateMutation(raw) {
-  const source = String(raw ?? "");
+  // #607 (review round 4): a QUOTED heredoc body (`<<'EOF' … EOF`) is literal to the
+  // outer shell — a `$(…)` inside it is not expanded by the command that carries it,
+  // so a `git commit -F - <<'EOF' … EOF` message about a payload must not be refused.
+  // ⚠️ What this deliberately does NOT cover (and never did): an interpreter that
+  // CONSUMES the text (`bash <<'EOF'`, `bash -c "$(…)"`, `$(…) | bash`) — the
+  // "consumer of inert text" family agent-infra#694 owns. MEASURED: the precise flag
+  // is already false for `bash <<'EOF' … git branch -Mq …`, so this is not a
+  // regression, and the family is named here so the next reader does not read it as
+  // covered.
+  const source = _stripQuotedHeredocBodies(String(raw ?? ""));
   const firstWord = (text) => {
     for (const tok of _tokenize(String(text ?? ""))) {
       const t = _stripQuotes(tok);
@@ -6094,11 +6121,14 @@ export function _hasHiddenStateMutation(raw) {
   for (const span of _collectSubstSpansDetailed(source)) {
     if (scan(span.text, span.procSubst)) return true;
   }
-  for (const t of _tokenize(source)) {
-    for (const span of _collectSubstSpansDetailed(t)) {
-      if (scan(span.text, span.procSubst)) return true;
-    }
-  }
+  // ⛔ NO PER-TOKEN RE-SCAN HERE (review round 4). `_tokenize` STRIPS quotes, so
+  // re-collecting spans from each token resurrected exactly the payloads the
+  // single-quote masking above exists to drop (`git commit -m 'refuse $(git branch
+  // -Mq …)'` → the token no longer carries its quotes → harvested). The raw-source
+  // pass is sufficient: a substitution with spaces inside is still inside ONE token
+  // when quoted, and an unquoted `$( … )` spans tokens in the RAW text the pass
+  // already sees. MEASURED both ways: unquoted and double-quoted payloads still fire;
+  // single-quoted and quoted-heredoc ones do not.
   // static eval literals (non-static `eval $EV` cannot be read — and by itself
   // names no mutation, so it is NOT a refusal here)
   const evalRe = /eval\s+(?:\$'([^']*)'|"([^"]*)"|'([^']*)')/g;
