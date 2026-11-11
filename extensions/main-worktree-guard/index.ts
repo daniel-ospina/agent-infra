@@ -6179,17 +6179,25 @@ export default function (pi: ExtensionAPI) {
       // (`echo "$(git rev-parse HEAD)"; eval $PAYLOAD` → ADMITTED from a worktree).
       // A gate whose exemption can be bought by unrelated text is not a gate, so
       // the exemption is GONE: an unenumerable branch-state mutation is refused in
-      // EVERY session, and the remedy is the one that actually works — run the
-      // command DIRECTLY (in a worktree that is then exempt as a visible mutation).
+      // every session the classifier is LOADED in — with one pre-existing exception
+      // this gate does not close: the `!branchOwnership || !classifierLoaded`
+      // degradation fallback below decides on the frozen legacy classifier, where the
+      // flag does not exist at all (loudly reported; Part C pins the noise). The
+      // remedy is the one that actually works — run the command DIRECTLY (in a
+      // worktree that is then exempt as a visible mutation).
       //
       // PROCESS SUBSTITUTION: what actually fires, MEASURED (a review finding
       // claimed a read-only `<(git log …)` idiom is refused here — it is NOT).
       // `hiddenStateMutation` is false for `git diff --stat <(git log --oneline -1)`
-      // and true for `git diff --stat <(git branch -Mq a b)`: the broad
-      // `isProcSubst && /\bgit\b/` arm is a no-op once the same text has been
-      // scanned as an ordinary substitution span (the shared `seen` set in
-      // `_hasHiddenStateSubst`), so a git-led READ-ONLY list resolves to a
-      // non-mutating invocation and the flag stays false. Rows pin both halves.
+      // and true for `git diff --stat <(git branch -Mq a b)`: the PRECISE predicate
+      // judges a git-led body by its ARGUMENTS, so a read-only list resolves to a
+      // non-mutating invocation and the flag stays false. ⛔ Do NOT credit the
+      // conservative `isProcSubst && /\bgit\b/` arm (`_hasHiddenStateSubst`) here —
+      // that flag is not the deciding path for this refusal — and note that both
+      // predicates' `seen` caches are keyed on (CONTEXT, text) precisely because a
+      // text-only key made the verdict depend on segment ORDER (measured: inert-first
+      // admitted, exec-first refused, same two halves). Rows pin both halves, plus the
+      // `)`-in-quotes and nested-`$(…)` spellings.
       const hiddenBranchStateRefusal = (): { block: true; reason: string } | null => {
         if (!det || det.hiddenStateMutation !== true) return null;
         return {
