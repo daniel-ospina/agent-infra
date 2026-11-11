@@ -196,6 +196,12 @@ let stripHeredocData: (text: string, codeBodies?: unknown[] | null) => string = 
 let resolveTargetCheckout: (targetPath: string, cwd?: string) => { top: string; isMain: boolean } | null = () => null;
 let trackedRelsIn: (repoTop: string, rels: string[]) => string[] = () => [];
 let hasDotGitAncestor: (p: string) => boolean = () => false;
+// #608: the classifier's OWN local-branch-delete name extractor (the whole
+// `-d`/`-D`/`--delete` family incl. clusters and value-swallowing flags). Used
+// to spend the pid-owned claim for EVERY branch a command deletes, not just the
+// first invocation's. Fail-safe default: null — a failed import means no claim
+// is spent, which is the pre-#608 behaviour and can never false-block.
+let branchDeleteNames: (verb: string, args?: string[]) => string[] | null = () => null;
 let extractScriptPath: (command: string) => string | null = () => null;
 let extractScriptArgs: (command: string, scriptPath: string) => string[] = () => [];
 let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null, opts?: { viaInterpreter?: boolean }) => "allow" | "block" = () => "allow";
@@ -355,6 +361,9 @@ try {
   // keeps today's (strict) behaviour instead of throwing in the hook.
   if (typeof _m5.maskRemoteExecPayloads === "function") maskRemoteExecPayloads = _m5.maskRemoteExecPayloads;
   if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
+  // #608: namespace read for the same reason as #709/#627 above (the
+  // destructuring target list is pinned by test-module-load.mjs Part A).
+  if (typeof _m5.branchDeleteNames === "function") branchDeleteNames = _m5.branchDeleteNames;
   if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
   // #1919: read from the namespace for the same reason as #709/#627 above — the
   // destructuring target list is pinned by test-module-load.mjs Part A.
@@ -5169,6 +5178,86 @@ function _unmarkOwned(pid: number, repoKey: string | null | undefined, branch: s
   if (set) set.delete(branch);
 }
 
+/** Will git's SOFT `-d` actually delete `name` in `cwd`? Faithful to `git-branch(1)`:
+ *  "the branch must be fully merged in its upstream branch, or in HEAD if no
+ *  upstream was set". The distinction MATTERS — a branch merged into local HEAD
+ *  but NOT into its configured upstream is REFUSED by git, so spending its claim
+ *  on the HEAD-only reading would turn the legitimate `-d` → `-D` escalation on
+ *  the session's own branch into a block (the #3979 review P2 class).
+ *
+ *  `for-each-ref` is what separates "no upstream configured" (empty → git falls
+ *  back to HEAD) from "upstream configured but GONE" (non-empty name that no
+ *  longer resolves — git then refuses `-d` outright). Unverifiable (git error,
+ *  missing ref) → false: the claim is KEPT, the direction that cannot lose a ref. */
+function _softDeleteWillSucceed(cwd: string, name: string): boolean {
+  let target = "HEAD";
+  try {
+    const up = execFileSync("git", ["for-each-ref", "--format=%(upstream)", `refs/heads/${name}`],
+      // #1139: stderr is CAPTURED, never swallowed by "ignore" — the repo-wide
+      // pin in test.mjs forbids the `["ignore", "pipe", "ignore"]` shape, which
+      // leaked a failure message AND made the not-a-checkout arm dead code.
+      { cwd, timeout: 5000, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    if (up) target = up; // configured — a GONE upstream makes the ancestor probe below fail
+  } catch { return false; }
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", `refs/heads/${name}`, target],
+      { cwd, timeout: 5000, stdio: "ignore" });
+    return true;
+  } catch { return false; }
+}
+
+/** #608 — the LOCAL branch deletes this command performs, hard vs soft.
+ *
+ *  The classifier's `deleteTargets` describes ONE invocation (the first mutating
+ *  one), so a compound `git branch -D a && git branch -D b` reports only `a` —
+ *  and the M3 loop already resolves EVERY mutating invocation (stateMutations),
+ *  so the claim set is the union over all of them, named by the classifier's own
+ *  extractor (`branchDeleteNames`), never a re-derived spelling. Hard vs soft
+ *  comes from the SHIPPED classifier too: the single-invocation verdict is
+ *  `block:branch-force-delete` exactly for git's force-delete family. */
+function _localDeleteClaimNames(det: any): { hard: string[]; soft: string[] } {
+  const hard: string[] = [];
+  const soft: string[] = [];
+  if (!det || typeof branchDeleteNames !== "function") return { hard, soft };
+  const muts = (det.stateMutations && det.stateMutations.length > 0)
+    ? det.stateMutations
+    : [{ verb: det.stateVerb, args: det.stateArgs }];
+  for (const mu of muts) {
+    if (!mu || mu.verb !== "branch") continue;
+    let names: string[] | null = null;
+    try { names = branchDeleteNames("branch", mu.args ?? []); } catch { names = null; }
+    if (!names || names.length === 0) continue;
+    let isHard = true; // unverifiable → hard (spend unconditionally: fail-closed)
+    try {
+      isHard = classifyGitCommandDetailed(`git branch ${(mu.args || []).join(" ")}`).verdict === "block:branch-force-delete";
+    } catch { isHard = true; }
+    for (const n of names) (isHard ? hard : soft).push(n);
+  }
+  return { hard, soft };
+}
+
+/** Remove the ownership claims an ADMITTED command destroys.
+ *
+ *  A hard `-D` deletes whatever git can reach, so its name is spent outright.
+ *  A soft `-d` deletes ONLY a merged branch, so its name is spent only when
+ *  git's own predicate says it will go: spending a claim the command did not
+ *  lose turns the standard `-d` → `-D` escalation on the session's OWN branch
+ *  into a block (#3979 review P2). The other refusal — a branch checked out in
+ *  a worktree — needs no probe, because git refuses `-D` there too, so no
+ *  escalation is lost. Every probe is spawn-once and only runs when the command
+ *  actually contains a local delete. */
+function _spendLocalDeleteClaims(pid: number, repoKey: string | null | undefined,
+                                 cwd: string | null | undefined,
+                                 claims: { hard: string[]; soft: string[] }) {
+  if (claims.hard.length === 0 && claims.soft.length === 0) return;
+  for (const n of claims.hard) _unmarkOwned(pid, repoKey, n);
+  if (claims.soft.length === 0) return;
+  const where = cwd || process.cwd();
+  for (const n of claims.soft) {
+    if (_softDeleteWillSucceed(where, n)) _unmarkOwned(pid, repoKey, n);
+  }
+}
+
 function _recordBaseline(pid: number) {
   if (!branchOwnership) return;
   try {
@@ -6013,7 +6102,14 @@ export default function (pi: ExtensionAPI) {
       // admission returns below — the carve-out's own early return, or any
       // later gate that allows.
       let pendingRebaseline: (() => void) | null = null;
+      // #608: the ownership claims this command DESTROYS, spent at the ONE funnel
+      // every admitted arm returns through (#3979 review P1b: the push-delete and
+      // push/commit arms admitted a co-spelled `git branch -D` without spending,
+      // and a compound naming two local deletes spent only the first). Derived
+      // from EVERY mutating invocation, so an arm added later cannot skip it.
+      const localDeleteClaims = _localDeleteClaimNames(det);
       const admitAfterM3 = (): undefined => {
+        _spendLocalDeleteClaims(pid, eff?.repoKey ?? null, eff?.effectiveCwd ?? null, localDeleteClaims);
         if (pendingRebaseline) {
           const apply = pendingRebaseline;
           pendingRebaseline = null;
@@ -6187,34 +6283,7 @@ export default function (pi: ExtensionAPI) {
       // `touch <marker>` can never fall through to mint un-stamped here.
       if (allowActive) return undefined;
 
-      // #608: an ADMITTED local branch delete spends this pid's ownership claim
-      // for that name. Ownership (`ownedBranches`) is the authorization the
-      // #598 rename arm and the #543/#376 delete allowance read, so it must
-      // describe the refs the session CURRENTLY holds: a name the pid deletes
-      // (or renames away from — see the M3 rename arm) is free for any sibling
-      // to re-create, and a stale entry would let this pid clobber or `-D` the
-      // SIBLING's branch rc 0. Called at every arm that ADMITS a delete, never
-      // on a refused one, and only for LOCAL delete targets: a remote
-      // (`git push --delete b`) drops origin's ref and leaves the pid's local
-      // branch in place.
-      const spendLocalDeleteClaims = (repoKey: string | null | undefined, names?: string[] | null) => {
-        if (!names || names.length === 0) return;
-        for (const t of names) _unmarkOwned(pid, repoKey, t);
-      };
-
-      if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") {
-        // #608 (soft-delete arm): `git branch -d <name>` is an ALLOW verdict
-        // (git's merged-only soft delete is self-enforcing), so it never reaches
-        // the ownership-allowance prune below — yet it DELETES the ref, in the
-        // main checkout or in a linked worktree alike (both resolve to the same
-        // repoKey, measured). `deleteTargets` is the branch-delete name list the
-        // classifier builds for the whole `-d`/`-D`/`--delete` family; a push
-        // delete never populates it (that family carries pushTargets).
-        if (det && det.deleteTargets && det.deleteTargets.length > 0) {
-          spendLocalDeleteClaims(eff?.repoKey, det.deleteTargets);
-        }
-        return admitAfterM3();
-      }
+      if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return admitAfterM3();
 
       // ── Ownership allowance (agent-infra main, own baseline branch) ──
       // Predicate split (plan deviation 7): sync ops (pull/rebase/merge) gate on
@@ -6459,18 +6528,6 @@ export default function (pi: ExtensionAPI) {
             // ordinary remote-branch cleanup is unaffected.
             const hit = gateMutations(m2Mutations);
             if (hit) return hit;
-            // #608: this allowance just authorized a LOCAL hard delete of the
-            // session's own branches — names the pid no longer holds once git
-            // runs. Drop them (fail-closed direction: an entry can only ever
-            // UNLOCK a destructive op, so pruning at worst costs this pid a
-            // later self-delete, which the escape hatch recovers). A sibling
-            // that recreates a freed name must not inherit the authorization —
-            // `git branch -D <sibling's new branch>` would destroy it. Remote
-            // deletes (`push-delete`) do NOT prune: they drop the REMOTE ref and
-            // leave the pid's local branch in place.
-            if (allowanceKind === "branch-force-delete") {
-              spendLocalDeleteClaims(eff.repoKey, targets);
-            }
             return admitAfterM3();
           }
           // foreign later-segment delete present → fall through to the #73 arms.
@@ -6579,17 +6636,7 @@ export default function (pi: ExtensionAPI) {
         // that actually runs at the shell cwd (`git -C <wt> status && git reset
         // --hard origin/main`). `undefined` (no per-invocation data) keeps the
         // previous single-invocation behaviour.
-        if (eff && eff.isWorktree && _allInvocationsWorktreeScoped(det) !== false) {
-          // #608 (worktree arm): a worktree-scoped LOCAL delete is EXEMPT from
-          // the gates, but it deletes the SAME repo's `refs/heads` (a linked
-          // worktree shares the git dir — repoKey is identical, measured). The
-          // bookkeeping therefore still has to run, or the pid keeps a claim on
-          // a branch it just deleted from its worktree.
-          if (det.deleteTargets && det.deleteTargets.length > 0) {
-            spendLocalDeleteClaims(eff.repoKey, det.deleteTargets);
-          }
-          return admitAfterM3();
-        }
+        if (eff && eff.isWorktree && _allInvocationsWorktreeScoped(det) !== false) return admitAfterM3();
         const kind = det.verdict.slice("block:".length);
         return {
           block: true,
