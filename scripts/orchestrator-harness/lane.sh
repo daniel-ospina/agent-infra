@@ -952,12 +952,28 @@ lane_transport_rotations() {
 # it over (a pre-change `$O` helper under the tolerant-reference rule), from the `[lane-bound]
 # VERDICT` line `lane-bound.sh` writes into the same log. Run-scoped for the same reason the rotation
 # read is: a previous attempt's verdict must not answer for this one.
+# ⛔ AN ALLOW-LIST, NEVER "ANYTHING THAT IS NOT EMPTY" (found in this change's own review, MEASURED on
+# the arm 9g/9h fixtures). `lane-bound.sh` emits a `VERDICT` line on EVERY path — including
+# `verdict=finished`, the line it writes when the bound watched the agent END ON ITS OWN, and
+# `verdict=unknown`, the field's own default. `spawn-gate.sh` clears `finished` out of
+# `AGENT_BOUND_VERDICT` precisely because "empty means the agent finished on its own", so a truthiness
+# test here RE-ADMITTED the word the caller had filtered: a lane that failed its OWN work was written
+# `outcome=died reason=finished`, erasing the work-failure claim that is the entire point of the
+# attribution above and handing the census a death nothing killed. `reason=unknown` is the same defect
+# the other way round — a death that names no killer, which is the blindness #2833 was filed over.
+# Only the two verdicts that NAME A BOUND may classify the exit; any other value (a future word
+# included) means NO bound ended this lane, which is the fail-safe direction: the item's work keeps the
+# claim, and a bound kill that loses its verdict line is reported as a plain non-zero exit rather than
+# as an unnamed death.
 lane_bound_killer() {
   local v="${AGENT_BOUND_VERDICT:-}"
   if [ -z "$v" ]; then
     v="$(lane_run_output | sed -n 's/.*\[lane-bound\] VERDICT verdict=\([a-z-]*\).*/\1/p' 2>/dev/null | tail -1)"
   fi
-  printf '%s\n' "$v"
+  case "$v" in
+    stalled|exceeded-wallclock) printf '%s\n' "$v" ;;
+    *)                         : ;;
+  esac
 }
 run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
