@@ -789,6 +789,42 @@ export -f pi
 drive "$WT" "$KEYVAR=sk_fixture"
 check_terminal "9f" done "agent-exit-0" 0
 
+# 9g — THE THIRD FALSIFIER, AND THE ONE THAT GUARDS THE WORK-FAILURE CLAIM ITSELF: `lane-bound.sh`
+# emits a `VERDICT` line on EVERY path, including `verdict=finished` — the line it writes when the bound
+# watched the agent END ON ITS OWN. `spawn-gate.sh` therefore CLEARS `finished` out of
+# `AGENT_BOUND_VERDICT` ("empty means the agent finished on its own"), and a fallback read that accepts
+# ANY non-empty verdict re-admits exactly the word the caller had filtered: a lane that failed ITS OWN
+# WORK is then recorded `outcome=died reason=finished`, so the work-failure claim this change exists to
+# keep is erased and the census sees a death nothing killed. The arm writes the finishing line the way
+# `lane-bound.sh` writes it (into the lane log, which is what `run_agent` hands it as `--log`); WHICH of
+# the two lands is a race the caller decides (it kills the watchdog the instant the agent's `wait`
+# returns) and this arm pins the CLASSIFICATION for the case the bound wins it — the arm is about the
+# read, not the race.
+mk_arm finishedverdict; WT="$ARMWT"
+pi() {
+  printf '[lane-bound] VERDICT verdict=finished tag=lane-3331 pid=2 rc=na elapsed=1s wall_bound=2400s idle_bound=2700s silent=0s bytes=5 bytes_delta=5 cpu_cs=0 cpu_delta_cs=0 tol_cs=60 cpu_unreadable=0 signal=none\n'
+  printf 'the change is wrong\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9g" failed "agent-exit-1" 1
+
+# 9h — THE SAME ALLOW-LIST, AT ITS OTHER EDGE (the polarity rule this repo applies to every verdict
+# vocabulary): a verdict word nobody recognises is NOT a bound that ended a lane. `lane-bound.sh`'s
+# `verdict_line` defaults the field to `unknown`, so the value is reachable, and reading it as a killer
+# would mint `outcome=died reason=unknown` — a death that names no killer, which is the blindness #2833
+# was filed over, reintroduced by its own fix. Only `stalled` and `exceeded-wallclock` name a bound.
+mk_arm unknownverdict; WT="$ARMWT"
+pi() {
+  printf '[lane-bound] VERDICT verdict=unknown tag=lane-3331 pid=2 rc=na elapsed=1s wall_bound=2400s idle_bound=2700s silent=0s bytes=5 bytes_delta=5 cpu_cs=0 cpu_delta_cs=0 tol_cs=60 cpu_unreadable=0 signal=none\n'
+  printf 'the change is wrong\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9h" failed "agent-exit-1" 1
+
 echo
 if [ "$FAIL" -gt 0 ]; then
   printf '❌ lane-outcome suite: %s passed, %s FAILED\n' "$PASS" "$FAIL"
