@@ -1961,6 +1961,131 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
   expectBool("#596: later-segment delete of pid-owned branch → allowed (ceremony)", delOwn === true, true);
   const delFor = sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: delD.deleteTargets, ownedBranches: [] });
   expectBool("#596: later-segment delete of FOREIGN branch → not allowed (verdict block stands)", delFor === false, true);
+
+  // ── #601: a LATER branch-state mutation must not launder behind an
+  // M3-ALLOWED FIRST mutation ────────────────────────────────────────────
+  // #601 was filed from a fresh-context review of #596 against a tree that
+  // predates #1144 (its probe baseline is 657789f, 2026-09-08). RE-MEASURED at
+  // this head: the launder it describes — an M3-ALLOWED lead mutation (the
+  // own-baseline rename reBaseline, the #376 return-to-original, or an
+  // ownership-allowed own-branch delete) letting a LATER FOREIGN M3-only
+  // mutation (rename / force-create / force-copy — the families with NO legacy
+  // verdict, so M3 is their only gate) execute rc 0 — is CLOSED by #1144's
+  // `stateCarveOutClean` gate (1ef8abb5d). Pre-#1144 index.ts returned from the
+  // WHOLE handler at the first `reBaseline` (`if (m3?.reBaseline) { … return
+  // undefined; }`) — literally the "first reBaseline decides" short-circuit
+  // #601 and its open peer #607 both describe. The return is now CONDITIONAL on
+  // every OTHER invocation in the command being provably read-only, so a
+  // mutating tail falls through to its own decideM3.
+  //
+  // The CLOSURE was unpinned, though: `git branch -Mq <baseline> X ; git branch
+  // -Mq <foreign> Y` was asserted NOWHERE (the #596 adapter below classifies
+  // only `stateVerb`/`stateArgs` — the FIRST mutation — so it cannot express the
+  // interaction at all), and a refactor of `_isCarveOutReadOnlyInvocation` or of
+  // the M3 loop would restore the launder silently. These pins are that
+  // regression lock, and they are the evidence #607 needs to close.
+  //
+  // The mirror below is index.ts's M3 block FAITHFULLY — it loops EVERY
+  // `stateMutations` entry (not just the first) and honours the
+  // `stateCarveOutClean` early return — because the launder lives in exactly
+  // that interaction. `renameDstExists: false` keeps #598's dst-clobber arm out
+  // of the way so the TAIL's block can only come from its own FOREIGN-target
+  // arms.
+  const m3Full = (cmd, currentBranch) => {
+    const d = classifyGitCommandDetailed(cmd);
+    if (!d.branchState) return "allow:no-branchState";
+    const muts = (d.stateMutations && d.stateMutations.length > 0)
+      ? d.stateMutations
+      : [{ verb: d.stateVerb, args: d.stateArgs }];
+    let pending = null;
+    for (const mu of muts) {
+      const op = sharedClassifyBranchOp(mu.verb ?? d.verb, mu.args ?? d.verbArgs);
+      // op "other" (a delete) skips M3 — the verdict + ownership path gates it.
+      if (!op || op.op === "other") continue;
+      const m3 = sharedDecideM3({
+        branchOp: op, isAgentInfra: true,
+        // `original` is what the #376 return-to-original arm keys on; the real
+        // session baseline records it at session_start (decideM3 requires it, and
+        // a baseline without one is exactly the contended/detached start that
+        // correctly fails closed).
+        baseline: { repoKey: "k", branch: currentBranch, original: "feat/1" },
+        currentBranch, repoKey: "k",
+        stateOpCount: d.stateOpCount ?? 1,
+        hiddenStateSubst: d.hiddenStateSubst === true,
+        renameDstExists: false,
+      });
+      if (m3?.block) return "block";
+      if (m3?.reBaseline) {
+        if (d.stateCarveOutClean === true) return "allow:carveOut";
+        pending = m3.reBaseline;
+      }
+    }
+    return pending ? "allow:pending" : "allow:no-admitted-mutation";
+  };
+  // Indicator 0 (the PREMISE): the lead on its own IS an M3 allow — so a block
+  // on the compound can only come from the tail.
+  expectBool("#601 premise: own-baseline rename lead alone → M3 carve-out allow (the launder's premise)",
+    m3Full(`git branch -Mq feat/1 rnLead`, "feat/1"), "allow:carveOut");
+  expectBool("#601 premise: return-to-original lead alone → M3 carve-out allow",
+    m3Full(`git checkout feat/1`, "feat/1"), "allow:carveOut");
+  // Indicator 1 — own-baseline rename (reBaseline carve-out) then FOREIGN rename.
+  const ind1 = `git branch -Mq feat/1 rnX ; git branch -Mq feat/x rnY`;
+  const ind1D = classifyGitCommandDetailed(ind1);
+  expectBool("#601 ind1: BOTH mutations enumerated (the tail must reach the M3 loop)",
+    Array.isArray(ind1D.stateMutations) && ind1D.stateMutations.length === 2, true);
+  expectBool("#601 ind1: stateCarveOutClean false — the mutating tail is not a read-only sibling",
+    ind1D.stateCarveOutClean === false, true);
+  expectBool("#601 ind1: own rename + FOREIGN rename → M3 BLOCK (no launder)",
+    m3Full(ind1, "feat/1"), "block");
+  // Indicator 2 — create-new lead then FOREIGN force-create (the #591 family).
+  const ind2 = `git checkout -b feat/cer ; git branch -fq feat/other main`;
+  expectBool("#601 ind2: stateCarveOutClean false for a create-new + force-create compound",
+    classifyGitCommandDetailed(ind2).stateCarveOutClean === false, true);
+  expectBool("#601 ind2: create-new + FOREIGN force-create → M3 BLOCK",
+    m3Full(ind2, "feat/1"), "block");
+  // Indicator 3 — ownership-allowed own-branch delete, then FOREIGN rename.
+  const ind3 = `git branch -Dq feat/1 ; git branch -Mq feat/other rnX`;
+  expectBool("#601 ind3: own-branch delete + FOREIGN rename → M3 BLOCK (the delete must not authorise the tail)",
+    m3Full(ind3, "feat/1"), "block");
+  // Indicator 4 — the #596-capture 3-segment twin (benign lead, then delete,
+  // then FOREIGN rename). It went BLOCKED→ALLOWED across #596 on the pre-#1144
+  // tree because the own-branch delete was captured and allowed, and the later
+  // foreign rename rode it; it must stay BLOCKED.
+  const ind4 = `git branch side ; git branch -Dq feat/1 ; git branch -Mq feat/other rnX`;
+  expectBool("#601 ind4: benign lead + own delete + FOREIGN rename → M3 BLOCK",
+    m3Full(ind4, "feat/1"), "block");
+  // The visible-tail matrix: every M3-ALLOWED lead against every FOREIGN
+  // M3-only tail, across all four shell separators git honours. 3 leads × 3
+  // tails × 4 separators = 36 compounds; NONE may be admitted.
+  {
+    const leads = [`git branch -Mq feat/1 rnLead`, `git checkout feat/1`, `git branch -fq feat/1 main`];
+    const tails = [`git branch -Mq feat/other tR1`, `git branch -fq feat/other main`, `git branch -Cq feat/other tC1`];
+    let admitted = 0;
+    const seen = [];
+    for (const lead of leads) {
+      for (const tail of tails) {
+        for (const sep of [";", "&&", "|", "\n"]) {
+          const cmd = `${lead} ${sep} ${tail}`;
+          const v = m3Full(cmd, "feat/1");
+          if (v !== "block") { admitted += 1; seen.push(`${JSON.stringify(cmd)} → ${v}`); }
+        }
+      }
+    }
+    expectBool("#601 matrix: none of the 36 allowed-lead × FOREIGN-tail compounds is admitted" +
+      (seen.length ? ` — ADMITTED: ${seen.join(" · ")}` : ""), admitted, 0);
+  }
+  // Positive controls — #601's own "must NOT break" list. A benign lead is not
+  // an arm-gated mutation, so the own-baseline rename after it must still reach
+  // the carve-out (the #596 pin), and the single-invocation ceremonies keep
+  // their carve-outs.
+  expectBool("#601 control: benign lead + OWN rename stays ALLOWED (the #596 pin must survive)",
+    m3Full(`git branch side ; git branch -Mq feat/1 rnX`, "feat/1"), "allow:carveOut");
+  expectBool("#601 control: single-invocation OWN rename stays ALLOWED",
+    m3Full(`git branch -Mq feat/1 rnX`, "feat/1"), "allow:carveOut");
+  expectBool("#601 control: single-invocation OWN force-create stays ALLOWED (the #591 carve-out)",
+    m3Full(`git branch -fq feat/1 main`, "feat/1"), "allow:no-admitted-mutation");
+  expectBool("#601 control: benign lead + OWN force-create is still REFUSED (the #591 stateOpCount bound)",
+    m3Full(`git branch side ; git branch -fq feat/1 main`, "feat/1"), "block");
   // Round-2 (reviewer F1): _hasHiddenStateSubst's hidden-payload scan must
   // recognize the SAME mutating-branch surface as the arm (it was stale for
   // the #592 rename-cluster/long-form + force-COPY families — exact -m/-M

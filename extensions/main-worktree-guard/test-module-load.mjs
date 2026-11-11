@@ -773,6 +773,55 @@ async function partB() {
     expectTrue("B9v-cont3: baseline restored to the original for the remaining suites (#1144 F3 control)",
       restoreBaseline === undefined, `handler returned ${JSON.stringify(restoreBaseline)}`);
 
+    // ── B9u2x: #601 — an M3-ALLOWED FIRST mutation must not launder a LATER
+    // branch-state mutation (the end-to-end twin of the classify-layer pins in
+    // test.mjs) ──────────────────────────────────────────────────────────
+    // #601 was filed against a tree that predates #1144 (probe baseline
+    // 657789f, 2026-09-08) and describes pre-#1144 index.ts exactly: it returned
+    // from the WHOLE handler at the first `reBaseline`, so an M3-ALLOWED lead
+    // (own-baseline rename / return-to-original / an ownership-allowed delete)
+    // blessed every later segment — including a FOREIGN rename / force-create /
+    // force-copy, the families with NO legacy verdict, for which M3 is the only
+    // gate. #1144 (1ef8abb5d) made that return conditional on every OTHER
+    // invocation being provably read-only (`stateCarveOutClean`), which closes
+    // it — but NOTHING pinned the interaction, so the closure rested on a
+    // comment. These drive the REAL handler: every one of #601's four indicators
+    // must be BLOCKED, and the #596/#591 ceremony carve-outs must survive.
+    const m601a = await callBash("git branch -Mq main rn601 ; git branch -Mq feat/x rn601b");
+    expectTrue("#601 ind1: own-baseline rename + FOREIGN rename is BLOCKED (the rename reBaseline does not authorise the tail)",
+      !!m601a && m601a.block === true,
+      `handler returned ${JSON.stringify(m601a)} — a foreign ref was renamed behind the sanctioned own rename`);
+    const m601b = await callBash("git checkout -b feat/cer601 ; git branch -fq feat/other main");
+    expectTrue("#601 ind2: create-new + FOREIGN force-create is BLOCKED",
+      !!m601b && m601b.block === true,
+      `handler returned ${JSON.stringify(m601b)} — a foreign ref was force-created behind a create-new lead`);
+    const m601c = await callBash("git branch -Dq main ; git branch -Mq feat/other rn601c");
+    expectTrue("#601 ind3: own-branch delete + FOREIGN rename is BLOCKED (the delete must not authorise the tail)",
+      !!m601c && m601c.block === true,
+      `handler returned ${JSON.stringify(m601c)} — a foreign ref was renamed behind an own-branch delete`);
+    const m601d = await callBash("git branch side601 ; git branch -Dq main ; git branch -Mq feat/other rn601d");
+    expectTrue("#601 ind4: benign lead + own delete + FOREIGN rename is BLOCKED (the #596-capture 3-segment twin)",
+      !!m601d && m601d.block === true,
+      `handler returned ${JSON.stringify(m601d)} — the captured own-branch delete laundered a later foreign rename`);
+    // The four refused compounds must NOT have re-baselined (the deferred
+    // closure is dropped on a block — #1144 F3), and the compound carve-out must
+    // still close when its siblings ARE read-only. Both are proven by one call:
+    // `git branch -Mq main rn601own` is admitted iff the recorded baseline is
+    // still `main`, so a block above that wrongly applied its pending reBaseline
+    // would leave this rename blocked as a foreign one.
+    const m601e = await callBash("git branch -Mq main rn601own ; git status");
+    expectTrue("#601 control: a benign-lead-adjacent own rename + read-only sibling stays ALLOWED (the #596 pin)",
+      m601e === undefined, `handler returned ${JSON.stringify(m601e)}`);
+    const m601f = await callBash("git checkout main");
+    expectTrue("#601 control: the sanctioned return restores the baseline after the reBaseline control",
+      m601f === undefined, `handler returned ${JSON.stringify(m601f)}`);
+    const m601g = await callBash("git branch -fq main HEAD");
+    expectTrue("#601 control: the single-invocation own-branch force-create carve-out survives (#591)",
+      m601g === undefined, `handler returned ${JSON.stringify(m601g)}`);
+    const m601h = await callBash("git branch side601b ; git branch -fq main HEAD");
+    expectTrue("#601 control: benign lead + own force-create is still REFUSED (#591 stateOpCount bound holds)",
+      !!m601h && m601h.block === true, `handler returned ${JSON.stringify(m601h)}`);
+
     // ── B9w–B9z: #2277 — a lane rooted ELSEWHERE can advance a hub, but only
     // on a MEASURED fast-forward proof ────────────────────────────────────
     // Measured 2026-10-21 on the agent-infra hub itself: `0 ahead / 76 behind
