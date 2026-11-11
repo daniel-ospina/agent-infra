@@ -100,6 +100,7 @@ ENV
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import math
 import os
@@ -1626,6 +1627,170 @@ def pid_is_our_loop(pid):
     return "fleet-schedule" in cmdline and "--loop" in cmdline
 
 
+# ──────────────────────────────── the LIVE loop's BUILD STAMP (#2961)
+
+LOOP_CODE = "loop.code"
+
+
+def loop_code_path() -> str:
+    """Where the loop records WHAT IT LOADED. In the loop's OWN state dir.
+
+    ⛔ NOT `loop.pid`'s value and not a mtime: the pidfile answers "is a loop running" and the tick
+    answers "is it passing", and BOTH are true of a loop that has been executing the same module
+    since before the farm was refreshed. This file is the only surface that answers the third
+    question — *which build is the running process executing* — and it is why it is named apart.
+    """
+    return os.path.join(STATE, LOOP_CODE)
+
+
+def file_digest(path) -> "str | None":
+    """sha256("[:16] of a file's bytes, or None when it cannot be read.
+
+    16 hex characters (64 bits) is the budget the built-in `staged_copy_report()` byte comparison
+    already implies: this digest exists to answer "is this the same build", never to authenticate
+    one, so a collision would require an accidental 2**-64 event between two copies of one file.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def write_loop_code():
+    """Record the file THIS process loaded, as JSON, atomically, guarded (#2961).
+
+    ⛔ ATOMIC AND GUARDED FOR THE SAME REASON THE PIDFILE IS. `--loop` is the cell's only scheduler:
+    an ENOSPC here must cost the stamp, never the process. The stamp is written BESIDE and renamed,
+    so a failed write leaves the previous record intact rather than truncating it.
+
+    ⛔ AND IT IS WRITTEN *BEFORE* THE PIDFILE, DELIBERATELY. Every other verb decides "there is a
+    loop" either from the pidfile or from the box lock, and `--install` re-verifies in the SAME
+    process microseconds after `spawn_loop()` returns. With this order, "the loop is visible" always
+    implies "its stamp exists" — so the verify cannot read a live loop as `unstamped` merely because
+    it raced the child's startup. (The box lock is claimed before both, so the residual window is
+    the lock claim itself; a loop that wins the box and then loses its stamp is a REAL `unstamped`
+    state and must be reported, not papered over.)
+
+    The recorded `path` is ABSOLUTE and is the path the STAMP is judged against later — not
+    `__file__` at VERIFY time. That is what makes the two facts comparable: verifying a checkout
+    copy must not read as "stale" over a cell whose loop runs a byte-identical staged copy.
+    """
+    me = os.path.abspath(__file__)
+    rec = {
+        "digest": file_digest(me),
+        "pid": os.getpid(),
+        "path": me,
+        "started": time.time(),
+    }
+    path = loop_code_path()
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(rec, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log("ERROR loop: cannot record the build stamp in %s (%s: %s) — the loop still runs, but "
+            "--verify will read no stamp and refuse it as stale (#2961)"
+            % (path, type(exc).__name__, exc))
+    return rec
+
+
+def read_loop_code():
+    """The build stamp as a dict, or None — every failure is "no readable stamp".
+
+    ⛔ Tolerant on purpose, the same way `read_loop_lock` is: this is a RECOVERY path, and a 0-byte,
+    truncated or hand-edited record must answer "unstamped" (which fails closed) rather than raise
+    out of `--verify`/`--start` and leave the cell with a scheduler no verb can reason about.
+    """
+    try:
+        with open(loop_code_path()) as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def loop_code_report(pid) -> tuple:
+    """(kind, detail) — is the LIVE loop `pid` executing the code that is on disk NOW?
+
+    `kind` is one of:
+      "current"   — the stamp names this pid and the file it recorded STILL has the recorded digest
+      "stale"     — the recorded file's digest has CHANGED (or it can no longer be read): the farm
+                    was refreshed and the process was not, so the landing is not live
+      "unstamped" — no stamp, an unreadable one, or one written by a DIFFERENT pid: there is NO
+                    evidence about which build is running, which is the pre-fix build
+
+    ⛔ THE TWO FAILING KINDS ARE BOTH FAILURES, AND THEIR POLARITY IS THE WHOLE POINT (#2961).
+    `staged_copy_report()` grades FILE against CHECKOUT; this grades PROCESS against FILE, and the
+    gap between the two is the measured defect: `cell-install.sh --install` refreshes the farm so
+    the files byte-match, `--verify` prints `SCHEDULE VERIFIED`, and the loop that is actually
+    ticking is still the module it loaded before the refresh — so an operator who just landed a fix
+    and saw the gate go green believes the fix is live. It is not, until the process restarts, and
+    nothing said so. A MISSING stamp under a live loop is the same claim from the other side: a loop
+    started from a build that predates this record CANNOT be shown to run the code on disk, so it is
+    reported as stale (fail-closed) rather than cleared by absence. Clearing it there would make
+    "could not compare" read as "compared and clean" — the no-op gate this file refuses everywhere.
+    """
+    where = loop_code_path()
+    rec = read_loop_code()
+    try:
+        stamped_pid = int(rec.get("pid")) if rec else None
+    except (TypeError, ValueError, OverflowError):
+        stamped_pid = None
+    restart = "%s --start" % os.path.basename(sys.argv[0])
+    if rec is None or stamped_pid != pid:
+        return "unstamped", (
+            "the LIVE loop (pid %d) carries NO build stamp in %s — it was started by a build that "
+            "predates the stamp, so nothing proves it runs the code on disk; there is no evidence "
+            "about which build is executing, which is the pre-fix state: restart it with %s"
+            % (pid, where, restart)
+        )
+    recorded = str(rec.get("path") or "")
+    recorded_digest = rec.get("digest")
+    on_disk = file_digest(recorded) if recorded else None
+    if on_disk is None:
+        return "stale", (
+            "the LIVE loop (pid %d) loaded %s, which cannot be read any more — the file it is "
+            "executing is gone or unreadable, so what it runs and what is on disk cannot be shown to "
+            "be the same; restart it with %s"
+            % (pid, recorded or "(no path recorded in the stamp)", restart)
+        )
+    if on_disk != recorded_digest:
+        return "stale", (
+            "the LIVE loop (pid %d) is executing the code it LOADED (%s from %s), but that file is "
+            "now %s: THE FILE WAS REFRESHED AND THE PROCESS WAS NOT, so a landing in that file is "
+            "NOT live on this machine until the loop restarts — a file comparison cannot see this, "
+            "because the file is already the new one. Restart the loop: %s"
+            % (pid, recorded_digest, recorded, on_disk, restart)
+        )
+    return "current", ("the LIVE loop (pid %d) executes %s (%s)" % (pid, recorded, on_disk))
+
+
+def terminate_loop(pid) -> tuple:
+    """(ok, detail) — SIGTERM a loop and wait for it to go, WITHOUT the OFF switch.
+
+    ⛔ NOT `--stop`, AND THE DIFFERENCE IS THE DECISION, NOT THE MECHANISM. `--stop` records that a
+    human wants the schedule OFF; replacing a loop that is merely running an older build must not
+    leave that decision behind, or the successor exits on its first tick and the cell goes dark —
+    the OFF-switch-permanence bug case 19q already pins for `--start`.
+
+    The pid is re-checked before signalling: a recycled pid must never be killed on the strength of
+    a number (case 13b).
+    """
+    if not pid_is_our_loop(pid):
+        return True, "pid %d is no longer fleet-schedule --loop" % pid
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        return False, "pid %d could not be signalled (%s: %s)" % (pid, type(exc).__name__, exc)
+    for _ in range(25):
+        if not pid_alive(pid):
+            return True, "pid %d exited" % pid
+        time.sleep(0.2)
+    return False, "pid %d is still alive 5s after SIGTERM" % pid
+
+
 # ──────────────────────────────────────────────────────────────── due / calendar
 
 
@@ -2132,6 +2297,12 @@ def cmd_loop():
         log(msg)
         print(msg, flush=True)
         return 0
+    # ⛔ THE BUILD STAMP IS WRITTEN BEFORE THE PIDFILE (#2961), so any observation of "this loop is
+    # running" already implies "its stamp exists" — see write_loop_code(). It records THIS process's
+    # own `__file__` and its digest, i.e. the code this interpreter loaded. Everything downstream
+    # (`--verify`, `--start`, `--install`) compares that digest with the file's CONTENT later, which
+    # is the only way to tell a refreshed file from a refreshed PROCESS.
+    write_loop_code()
     # ⛔ ATOMIC, AND GUARDED — this file is the cell's ONLY evidence that a loop is running, and the
     # old `open(pidfile, "w")` TRUNCATED it before writing. On ENOSPC (this PR's own trigger) the
     # write raised, the process died, and the truncated 0-byte pidfile made every recovery command
@@ -2149,10 +2320,14 @@ def cmd_loop():
 
     def bye(signum, _frame):
         log("loop: signal %d — exiting" % signum)
-        try:
-            os.unlink(pidfile)
-        except OSError:
-            pass
+        for gone in (pidfile, loop_code_path()):
+            # ⛔ The stamp goes with the pidfile. A stamp outliving its loop is read as "a loop is
+            # running build X" by nothing (every reader keys on a LIVE pid first), but leaving it is
+            # still a lying record on disk, and the second unlink is one line.
+            try:
+                os.unlink(gone)
+            except OSError:
+                pass
         # ⛔ Ownership-checked: a TERM'd loop must not delete the lock of the loop that replaced it
         # (`kickstart -k` SIGTERMs and starts the successor immediately).
         release_loop_lock()
@@ -2257,6 +2432,10 @@ def cmd_loop():
             report_bookkeeping_failure(exc)
     try:
         os.unlink(pidfile)
+    except OSError:
+        pass
+    try:
+        os.unlink(loop_code_path())
     except OSError:
         pass
     release_loop_lock()
@@ -2590,6 +2769,12 @@ def cmd_status():
     )
     print("fleet-schedule — surface=linux templates=%s" % TEMPLATES_DIR)
     print("  loop=%s last_tick=%s jobs=%d" % (live, fmt_age(age), len(jobs)))
+    # ⛔ THE THIRD QUESTION (#2961): the two above say a loop exists and is passing, and BOTH are true
+    # of a loop that has been executing a pre-refresh module since it started. `code=` is the only
+    # line on this surface that answers "which build is the process running".
+    if pid and pid_is_our_loop(pid):
+        code_kind, code_detail = loop_code_report(pid)
+        print("  code=%s %s" % (code_kind if code_kind == "current" else code_kind.upper(), code_detail))
     print_table(jobs, time.time())
     off = os.path.join(STATE, "OFF")
     if os.path.exists(off):
@@ -2772,6 +2957,16 @@ def cmd_verify():
             "the pid in %s/loop.pid (%d) is not fleet-schedule --loop — a stale pid reads as a "
             "running scheduler" % (STATE, pid)
         )
+    else:
+        # ⛔ THE SECOND SEAM (#2961), AND THE ONE `staged_copy_report()` CANNOT REACH. That arm grades
+        # the FILE against the CHECKOUT; this one grades the RUNNING PROCESS against the FILE. A cell
+        # that has just been re-farmed passes the first and fails the second, because the loop loaded
+        # its module before the refresh and never re-execs — measured as `SCHEDULE VERIFIED` over a
+        # cell still executing the pre-refresh build, which `cloud-cell-bringup.sh` turns into
+        # `CELL READY`. Nothing said so, and nothing could: both facts were true of the same cell.
+        code_kind, code_detail = loop_code_report(pid)
+        if code_kind != "current":
+            failures.append(code_detail)
     age = tick_age()
     stale_after = max(3 * TICK, 300)
     # Read ONCE and shared by both arms below: a job that is running is the explanation for a stale
@@ -3120,9 +3315,37 @@ def cmd_install():
         print("  %-38s rc=%s  log=%s" % (job.label, "held" if rc is None else rc, job.log_path()))
 
     pid = loop_pid()
+    stale = None
     if pid and pid_is_our_loop(pid):
-        print("loop already running (pid %d)" % pid)
-    else:
+        # ⛔ THE VERB THAT HIDES THIS BEST (#2961). `--install` is what `cloud-cell-bringup.sh --check`
+        # runs after refreshing the farm, so "loop already running" is printed in the exact moment the
+        # file on disk became newer than the module the loop loaded — and the `cmd_verify()` below then
+        # graded the FILE, found it byte-identical to the checkout, and printed `SCHEDULE VERIFIED`.
+        # Measured state: an operator refreshes the farm, sees the gate green, and the cell still runs
+        # the old build. Staleness is decided before that message, so the restart is what happens
+        # instead of it — and `cmd_verify()` still has the last word on the result.
+        code_kind, code_detail = loop_code_report(pid)
+        if code_kind == "current":
+            print("loop already running (pid %d)" % pid)
+        else:
+            stale = code_detail
+            print("  STALE  %s" % code_detail)
+    if stale is not None:
+        # ⛔ AFTER THE DECLARATION GATE AT THE TOP OF THIS VERB, deliberately: a broken set already
+        # returned 1 above, so a cell never trades a working-but-old scheduler for none.
+        ok_stop, why = terminate_loop(pid)
+        if not ok_stop:
+            print(
+                "FAIL: the stale loop could not be replaced (%s) — this machine still runs the code "
+                "it loaded before the refresh; stop it from its own state dir: "
+                "FLEET_SCHEDULE_STATE=%s %s --stop"
+                % (why, STATE, os.path.basename(sys.argv[0])),
+                file=sys.stderr,
+            )
+            return 1
+        print("restarting the loop so the file on disk is the code that runs (%s)" % why)
+        pid = None
+    if not pid:
         pid, started = spawn_loop()
         if not pid:
             print("FAIL: the scheduler loop did not come up (see %s/loop.log)" % STATE, file=sys.stderr)
@@ -3138,21 +3361,32 @@ def cmd_install():
 
 def cmd_start():
     pid = loop_pid()
+    stale = None
     if pid and pid_is_our_loop(pid):
-        # ⛔ THE OFF SWITCH IS CLEARED EVEN HERE. `--start` is the revival verb (#1864) and an OFF
-        # set while the loop was still alive outlived it: the loop exited at its next check and the
-        # box went dark while `--start` — the one verb an operator reaches for — answered 0 and
-        # changed nothing (measured by the reviewer: `OFF still present? YES`, loop gone one tick
-        # later, `--verify` then `NOT RUNNING` with nothing left to revive it). The own-state holder
-        # with a MISSING pidfile already falls through to the clear below; this is the same ruling
-        # for the same state, not a new one. A FOREIGN holder still changes nothing (next arm).
-        off = os.path.join(STATE, "OFF")
-        if os.path.exists(off):
-            os.unlink(off)
-            print("loop already running (pid %d) — OFF switch cleared" % pid)
-        else:
-            print("loop already running (pid %d)" % pid)
-        return 0
+        # ⛔ A LIVE LOOP IS NOT NECESSARILY THIS BUILD (#2961). `--start` is the revival verb, and it
+        # used to answer `loop already running` — exit 0 and change nothing — over a loop executing a
+        # module that was replaced on disk hours ago. That made `--start` the second place a landing
+        # could be invisible on a running cell: the file was refreshed, the process was not, and the
+        # one verb an operator reaches for said there was nothing to do. So staleness is decided
+        # FIRST, and a stale loop FALLS THROUGH to the restart below instead of returning here.
+        code_kind, code_detail = loop_code_report(pid)
+        if code_kind == "current":
+            # ⛔ THE OFF SWITCH IS CLEARED EVEN HERE. `--start` is the revival verb (#1864) and an OFF
+            # set while the loop was still alive outlived it: the loop exited at its next check and the
+            # box went dark while `--start` — the one verb an operator reaches for — answered 0 and
+            # changed nothing (measured by the reviewer: `OFF still present? YES`, loop gone one tick
+            # later, `--verify` then `NOT RUNNING` with nothing left to revive it). The own-state holder
+            # with a MISSING pidfile already falls through to the clear below; this is the same ruling
+            # for the same state, not a new one. A FOREIGN holder still changes nothing (next arm).
+            off = os.path.join(STATE, "OFF")
+            if os.path.exists(off):
+                os.unlink(off)
+                print("loop already running (pid %d) — OFF switch cleared" % pid)
+            else:
+                print("loop already running (pid %d)" % pid)
+            return 0
+        stale = code_detail
+        print("  STALE  %s" % code_detail)
     # ⛔ READ THE DECLARATIONS BEFORE SPAWNING, and refuse in the terms the caller keys on.
     # main() returns 3 only when there is no template PATH AT ALL; a remembered templates-dir
     # pointer that resolves to a deleted checkout, or a dir holding no *.plist, fell straight
@@ -3215,6 +3449,26 @@ def cmd_start():
         )
         return 0
     off = os.path.join(STATE, "OFF")
+    if stale is not None:
+        # ⛔ THE RESTART HAPPENS *HERE*, AFTER BOTH GATES ABOVE — deliberately. The declaration set is
+        # read and refused first (exit 3/1) and the box's foreign holder is honoured first, so a stale
+        # loop over a BROKEN set costs nothing: a cell keeps the loop it has rather than trading a
+        # working-but-old scheduler for none. `--start` cannot certify a set, so it must not be able to
+        # destroy one.
+        # ⛔ AND IT MUST RUN BEFORE `spawn_loop()`, not after: that function refuses to add a second
+        # loop to a box that already has a verified holder, so a stale loop left alive would make the
+        # restart a no-op that PRINTS as a restart — the same false success this arm removes.
+        ok_stop, why = terminate_loop(pid)
+        if not ok_stop:
+            print(
+                "FAIL: the stale loop could not be replaced (%s) — this machine still runs the code "
+                "it loaded before the refresh; stop it from its own state dir: "
+                "FLEET_SCHEDULE_STATE=%s %s --stop"
+                % (why, STATE, os.path.basename(sys.argv[0])),
+                file=sys.stderr,
+            )
+            return 1
+        print("restarting the loop so the file on disk is the code that runs (%s)" % why)
     if os.path.exists(off):
         os.unlink(off)  # --start is the operator saying "on"; the OFF switch is cleared on purpose
     pid, started = spawn_loop()
