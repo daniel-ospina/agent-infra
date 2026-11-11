@@ -703,9 +703,31 @@ ck "B9l …because the tree agrees: the driver carries \`set -uo pipefail\` AND 
 # `… bash `, so `-o pipefail` appended on the SAME line OR on a wrapped continuation line matched them and
 # left every arm green while making the paragraph false. Fold first, then refuse the word anywhere in the
 # definition — which also covers `set -o pipefail`, `--pipefail` and an `export SHELLOPTS` inside it.
-_sx="$(sed -n '/^shard_exec()/,/}/p' "$SHARDS" | sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta')"
+# ⛔ AND THE READ MUST END AT THE FUNCTION'S OWN CLOSING BRACE (review round 16, P3 — measured): this was
+# `sed -n '/^shard_exec()/,/}/p'`, and GNU sed does NOT test addr2 against the line addr1 matched (`man
+# sed`), so a ONE-LINE definition ran to the NEXT `}` — 73 lines / 5318 B, ending at the brace that closes
+# `shard_run_bounded`. B9m was green for an ACCIDENT (nothing in those 73 lines happens to say
+# pipefail/SHELLOPTS) and, when it did fire, it named the wrong carrier on a healthy `shard_exec`: a
+# comment mentioning pipefail inside `shard_run_bounded` — a different function, three lines down —
+# reddened it. The reader below accumulates by BRACE DEPTH instead, so it stops on the brace that closes
+# the definition: the current one-liner, a folded continuation, and a `{` on the next line all read
+# correctly. ⛔ THIS SUITE'S OWN RULE IS WHY IT MATTERS — a comment claiming a guard it does not have
+# reads exactly like one that has it, and the comment above makes that claim in the words "THE WHOLE
+# DEFINITION".
+_sx="$(awk '/^shard_exec\(\)/{seen=1}
+             seen { print; t=$0; o=gsub(/\{/,"{",t); t=$0; c=gsub(/\}/,"}",t); d+=o-c
+                    if (o>0) opened=1
+                    if (opened && d==0) exit }' "$SHARDS" \
+        | sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta')"
 { [ -n "$_sx" ] && ! grep -qE 'pipefail|SHELLOPTS' <<<"$_sx"; }; rc=$?
-ck "B9m …and its WHOLE \`shard_exec\` definition, line continuations folded, carries no pipefail/SHELLOPTS of ANY spelling — \`-o pipefail\` one line down reddens here too" $rc
+ck "B9m …and \`shard_exec\`'s OWN braces, line continuations folded, carry no pipefail/SHELLOPTS of ANY spelling — \`-o pipefail\` one line down reddens here too" $rc
+# ⛔ THE REGION IS BOUNDED, AND THAT IS ITS OWN ARM (review round 16, P3): the definition must not swallow
+# what follows it, or B9m grades text that is not this definition. `shard_run_bounded` is the very NEXT
+# function, so its name appearing in the extraction is the measured pre-fix defect identity (73 lines /
+# 5318 B containing it; post-fix 1 line / 94 B). This reddens on the range regression itself rather than
+# waiting for a pipefail comment to be the thing that finally exposes it.
+grep -q 'shard_run_bounded' <<<"$_sx" && rc=1 || rc=0
+ck "B9s …and the extraction STOPS at \`shard_exec\`'s own closing brace — the next function is outside it, so a comment there can never be graded as this definition" $rc
 # ⛔ THE MECHANISM IS ALSO A PROPERTY OF THE ENVIRONMENT, and that half is PROBED, not read (review round
 # 14, P3): `export SHELLOPTS` in the driver makes a child inherit pipefail without touching `shard_exec`,
 # and only a live launch shows it. This probe says nothing about the FILE — B9m reads the file; this one
