@@ -698,19 +698,26 @@ has " $FOUND" "died " "8d …a 'died' outcome (all four are reachable, not just 
 # verdict=exceeded-wallclock`. The line the census reads said "the work failed" about lanes that were
 # never allowed to finish, which is the question this issue was filed over.
 #
-# ⛔ TWO OF THESE EIGHT ARMS REDDEN ON THE PRE-CHANGE TREE; SIX ARE OVER-REACH FALSIFIERS — and the
-# split is stated because the earlier text flattened it, claiming all eight redden pre-change. That
-# claim was FALSE by construction (review finding on this change) and the arithmetic is checkable:
-# `origin/main:scripts/orchestrator-harness/lane.sh:962` calls EVERY non-zero exit `failed
-# agent-exit-<rc>`, and six of these arms ask for exactly that.
+# ⛔ TWO KINDS OF ARM, AND THE SPLIT IS STATED BECAUSE THE EARLIER TEXT FLATTENED IT: the behaviour
+# arms REDDEN ON THE PRE-CHANGE TREE, the six over-reach falsifiers stay GREEN there and redden under the
+# opposite mutation. Claiming all of them redden pre-change was FALSE by construction (review finding on
+# this change) and the arithmetic is checkable: `origin/main:scripts/orchestrator-harness/lane.sh:962`
+# calls EVERY non-zero exit `failed agent-exit-<rc>`, and six of these arms ask for exactly that.
 #
-#   * 9a and 9e are the BEHAVIOUR arms: on the pre-change tree the outputs they demand — `died
-#     reason=transport-unreachable:…` and `died reason=exceeded-wallclock` — are UNREACHABLE, so they
-#     go RED there. That is the mutation the issue asks for, and it was MEASURED, not reasoned: with
-#     the attribution block reverted to `else lane_outcome failed "agent-exit-$rc"`, this suite fails
-#     exactly 5 assertions — 9a (outcome), 9a (reason), 9a2, 9e, 9e2 — and 9e's mutated output is the
-#     measured defect verbatim: `outcome=failed reason=agent-exit-143` for a lane the wall ceiling
-#     had ENDED.
+#   * 9a, 9a3/9a3b and 9e are the BEHAVIOUR arms: on the pre-change tree the outputs they demand — `died
+#     reason=transport-unreachable:…`, the operator sentence that names it, and `died
+#     reason=exceeded-wallclock` — are UNREACHABLE, so they go RED there. That is the mutation the issue
+#     asks for, and it was MEASURED, not reasoned: with the attribution block reverted to `else
+#     lane_outcome failed "agent-exit-$rc"`, this suite fails exactly 7 assertions (227 passed, 7 failed)
+#     — 9a (outcome), 9a (reason), 9a2, 9a3, 9a3b, 9e, 9e2 — and 9e's mutated output is the measured
+#     defect verbatim: `outcome=failed reason=agent-exit-143` for a lane the wall ceiling had ENDED.
+#     ⛔ AND THE SAME 7 FAIL AGAINST THE REAL PRE-CHANGE FILE, not only against that reconstruction:
+#     `origin/main`'s own `lane.sh` copied into a scratch tree beside this suite gives 227 passed, 7
+#     failed, the identical seven. So the proof does not rest on the revert being faithful.
+#     9a3/9a3b were added because the fresh-context review of this change at 56123d11f recorded the hole
+#     they close: 9a2 asserts the terminal TOKEN and 9e2 asserts the BOUND branch's sentence, so deleting
+#     the TRANSPORT branch's `echo` reddened NOTHING. MEASURED at this head — deleting that one line from
+#     `lane.sh` gives 232 passed, 2 failed, and the two are exactly 9a3 and 9a3b.
 #   * 9b/9c/9d/9f/9g/9h are OVER-REACH falsifiers: GREEN on the pre-change tree BY CONSTRUCTION (it
 #     called everything `failed`, which is what they ask for). They redden under the OPPOSITE
 #     mutation — a fix that attributes too much — and every row below was RUN against this tree, not
@@ -751,6 +758,20 @@ case "$(lastline)" in
   outcome=failed*) bad "9a2 a transport death is NOT reported as a work failure (got: '$(lastline)')" ;;
   *) ok "9a2 …and it is not the work-failure token, which is the whole point: a retryable death read as a failed attempt is the treadmill #2833 measured" ;;
 esac
+
+# 9a3 — THE TRANSPORT BRANCH'S OPERATOR SENTENCE, which had NO WITNESS until this arm. The fresh-context
+# review of this change at 56123d11f recorded it as the one uncovered line: 9a2 asserts the terminal TOKEN
+# and 9e2 asserts the BOUND branch's sentence, so deleting the transport branch's `echo` reddened
+# NOTHING. It is prose behind no gate, but it is the reading that tells an operator "retry this, the item
+# is not implicated" — the remedy this change exists to deliver — so its silent removal must not pass.
+# ⛔ IT CANNOT BE SATISFIED BY THE OTHER BRANCH: 9a's fixture carries no `[lane-bound] VERDICT`, so the
+# transport arm is the only writer here that can emit 'TRANSPORT death'. Measured: deleting that one
+# `echo` from `lane.sh` reddens exactly these two assertions and nothing else.
+LOGTXT9A="$(cat "$(LOG)" 2>/dev/null)"
+has "$LOGTXT9A" 'TRANSPORT death' \
+    "9a3 …and the log names WHICH death this was, so the operator is not left decoding the token"
+has "$LOGTXT9A" 'after 3 connection-pool rotation(s)' \
+    "9a3b …and it reports the count THIS run measured, not a bare claim that it was transport"
 
 # 9b — THE FALSIFIER. A lane whose work failed, with no transport evidence, must NOT become retryable:
 # an automatic retry of a real work failure burns a lane's budget and repeats the same outcome.
