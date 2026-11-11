@@ -48,6 +48,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -264,5 +265,18 @@ async function main() {
 }
 
 await main();
-console.log(`\n${fail === 0 ? "✅" : "❌"} test-m2-compound-ownership: ${pass} passed, ${fail} failed, ${skip} skipped`);
-process.exit(fail === 0 ? 0 : 1);
+// ⛔ THE AGGREGATE IS THE SHARED EMITTER'S (agent-infra#2723), never hand-rolled
+// here. `extensions/shared/test-verdict.mjs` §3 reads the workflows the runner
+// reads and, for every harness named there, requires the shared `reportVerdict`
+// import AND call and refuses a hand-rolled `passed`/`failed` aggregate — which
+// is how the merge rail attributes a red lane (`runner::<label>`) instead of
+// failing the PR blind. WIRING THIS FILE INTO `ci.yml` is what brings it into
+// that corpus (review round-4 F-1: the wiring landed and the aggregate stayed
+// hand-rolled, reddening `test-verdict` on the PR lane).
+// `vacuous` reports the whole-suite SKIP (a Node without
+// stripTypeScriptTypes) as the failure it is — otherwise "nothing ran" exits 0
+// and reads as green, the shape `test-unborn-head.mjs` refuses.
+const vacuous = skip > 0 && pass === 0;
+reportVerdict("test-m2-compound-ownership", pass, fail, { skip, red: vacuous });
+if (vacuous) console.log("❌ the whole suite was SKIPPED — zero assertions ran, so this is not a pass");
+process.exit(fail === 0 && !vacuous ? 0 : 1);

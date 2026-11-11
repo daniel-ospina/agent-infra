@@ -2230,6 +2230,20 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       expectBool("#605 F1-r3: off-baseline MAIN commit + a no-refspec `git push --delete` → M2 BLOCK", m2s, "block");
       const m2t = m2Gate(`git push --delete`);
       expectBool("#605 F1-r3 control: lone no-refspec `git push --delete` → nothing main-resolving (wt-exempt)", m2t, "wt-exempt");
+      // ── ANTI-DRIFT source pins (agent-infra#3442, reviewer residual) ──
+      // `m2Gate` is a HAND-WRITTEN mirror of index.ts's M2 loop, so a shipped
+      // arm could lose its gate call while every row above stayed green (the
+      // mirror would keep modelling the pre-loss rule). These three pins tie the
+      // mirror's three rules to the SHIPPED source. They are not an equivalence
+      // proof — that is what the handler suite is for — they make a silent
+      // REMOVAL of any of the three impossible without a red row.
+      const m2GateCalls = (pinSrc.match(/gateMutations\(m2Mutations\)/g) ?? []).length;
+      expectBool("#605 source pin: index.ts gates the compound in ALL THREE arms (M2, allowance admit, push-delete)",
+        m2GateCalls >= 3, true);
+      expectBool("#605 source pin: the delete exemption keys on the MUTATION's own isDelete (not the verdict path)",
+        pinSrc.includes('if (mu.verb === "push" && mu.isDelete) continue;'), true);
+      expectBool("#605 source pin: the #73 coordinated check unions EVERY delete invocation's targets",
+        pinSrc.includes("_coordinatedDeleteBlock(deleteTargets)"), true);
       execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
       const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");
