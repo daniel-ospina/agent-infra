@@ -773,6 +773,124 @@ async function partB() {
     expectTrue("B9v-cont3: baseline restored to the original for the remaining suites (#1144 F3 control)",
       restoreBaseline === undefined, `handler returned ${JSON.stringify(restoreBaseline)}`);
 
+    // ── B9u2x: #601 — an M3-ALLOWED FIRST mutation must not launder a LATER
+    // branch-state mutation (the end-to-end twin of the classify-layer pins in
+    // test.mjs) ──────────────────────────────────────────────────────────
+    // #601 was filed against a tree that predates #1144 (probe baseline
+    // 657789f, 2026-09-08) and describes pre-#1144 index.ts exactly: it returned
+    // from the WHOLE handler at the first `reBaseline`, so an M3-ALLOWED lead
+    // (own-baseline rename / return-to-original / an ownership-allowed delete)
+    // blessed every later segment — including a FOREIGN rename / force-create /
+    // force-copy, the families with NO legacy verdict, for which M3 is the only
+    // gate. #1144 (1ef8abb5d) made that return conditional on every OTHER
+    // invocation being provably read-only (`stateCarveOutClean`), which closes
+    // it. What is NEW here (review of this PR corrected an earlier "nothing pinned
+    // it" claim: main already carries 8 e2e pins on the closure at B9u1–B9u8,
+    // including exact launder shapes whose lead is a SWITCH): the own-baseline
+    // RENAME lead end-to-end, on two different tail families, each row
+    // independently reachable. Each row names the mutant that reddens it
+    // (agent-infra#3442, MEASURED per row); #601's indicators 2–4 are NOT repeated
+    // here because they are refused by arms that fire before the carve-out can
+    // matter (#626's create-new arm; delete → `op "other"` skipped by the M3 loop)
+    // — they cannot vary under any mutation of this fix and are already pinned by
+    // #626 / #596 r4. The "a refused compound does not re-baseline" property is
+    // B9v1/B9v2's, not this block's (see the note below the rows).
+    //   M2 = index.ts's `if (det.stateCarveOutClean === true)` → `if (true)`
+    //   M5 = `classify-git.mjs`'s carve-out identity exemption deleted
+    //   M6 = `decideM3`'s #591 own-force carve-out removed; M7 = its stateOpCount bound deleted
+    //   M8 = `decideM3`'s #376 return-to-original arm deleted
+    const m601a = await callBash("git branch -Mq main rn601 ; git branch -Mq feat/x rn601b");
+    expectTrue("#601 ind1: own-baseline rename + FOREIGN rename is BLOCKED [mutant: M2] — MEASURED: M2 admits it (undefined)",
+      !!m601a && m601a.block === true,
+      `handler returned ${JSON.stringify(m601a)} — a foreign ref was renamed behind the sanctioned own rename`);
+    // ⛔ THE RESTORE IS LOAD-BEARING, not hygiene. Under M2 the row above is ADMITTED and
+    // its pending re-baseline is applied, so the session baseline becomes `rn601`; the next
+    // block row would then be refused by the FOREIGN-rename arm for the WRONG reason
+    // (baseline mismatch) and would stay green under M2 — i.e. it would be a vacuous lock,
+    // the exact class agent-infra#3442 forbids. Measured: without this line ind1b survives M2.
+    // `git checkout main` returns to `baseline.original` under BOTH the correct code and M2,
+    // so every block row below starts from a known baseline.
+    // ⚠️ These two rows are PRECONDITIONS, not new closure coverage: `git checkout main →
+    // undefined` is already pinned twice on main (B9u-cont1 and B9v-cont1). They are asserted
+    // here only so the row that depends on them fails ATTRIBUTABLY (a broken restore must red
+    // on the restore, not on the block row that inherits its drift) — do not count them as
+    // added coverage of the #601 closure.
+    const m601r1 = await callBash("git checkout main");
+    expectTrue("#601 harness control: the baseline is re-established between the block rows [mutants: M5, M8]" +
+      " — MEASURED: blocked under either (M5 by the legacy checkout-branch arm, M8 by the removed #376 arm)",
+      m601r1 === undefined, `handler returned ${JSON.stringify(m601r1)}`);
+    const m601b = await callBash("git branch -Mq main rn601b2 ; git branch -fq feat/other main");
+    expectTrue("#601 ind1b: own rename + FOREIGN force-create is BLOCKED (a second tail family) [mutant: M2] — MEASURED: M2 admits it",
+      !!m601b && m601b.block === true,
+      `handler returned ${JSON.stringify(m601b)} — a foreign ref was force-created behind the sanctioned own rename`);
+    const m601r2 = await callBash("git checkout main");
+    expectTrue("#601 harness control: the baseline is re-established after the second block row [mutants: M5, M8]" +
+      " — MEASURED: blocked under either",
+      m601r2 === undefined, `handler returned ${JSON.stringify(m601r2)}`);
+    // ⛔ NO ROW FOR "the refused compounds above did not re-baseline". An earlier draft had
+    // one here; fresh-context review of this PR measured that it could not observe that
+    // property (the restores above re-establish the baseline regardless) AND that its
+    // claimed mutant could not redden it — under M5 the carve-out simply fails to close and
+    // the command is admitted at index.ts's verdict arm (`det.verdict === "allow"` →
+    // `admitAfterM3()`, which applies the pending re-baseline), so `undefined` still holds.
+    // The property IS pinned, attributably, by the pre-existing B9v1/B9v2 pair
+    // (a REFUSED compound leaves the follow-up rename blocked; an ADMITTED return admits it).
+    // Citing that pair is the honest form; a duplicate here would be the dead weight #3442
+    // forbids.
+    const m601g = await callBash("git branch -fq main HEAD");
+    expectTrue("#601 control: the single-invocation own-branch force-create carve-out survives (#591) [mutant: M6] — MEASURED: M6 blocks it",
+      m601g === undefined, `handler returned ${JSON.stringify(m601g)}`);
+    const m601h = await callBash("git branch side601b ; git branch -fq main HEAD");
+    expectTrue("#601 control: benign lead + own force-create is still REFUSED (#591 stateOpCount bound holds) [mutant: M7] — MEASURED: M7 admits it",
+      !!m601h && m601h.block === true, `handler returned ${JSON.stringify(m601h)}`);
+
+    // ✅ RESIDUAL NOW CLOSED — #607's hidden-payload refusal (`index.ts`
+    // `hiddenBranchStateRefusal`, reached through `admitAfterM3`) refuses any
+    // UNENUMERABLE branch-state payload, which is exactly what this row recorded as
+    // open. A HIDDEN shell tail (`$(…)`, backticks, `eval "…"`) still contributes
+    // NO invocation, so `stateMutations` still keeps only the LEAD and the M3 loop
+    // still has no second mutation to gate — but the command no longer reaches the
+    // verdict arm unexplained: the refusal fires first (#805, fail closed).
+    // INVERTED FROM A TRIPWIRE, per this row's own instruction ("invert it and cite
+    // the fix; never delete it"). The citation is **#607**, not #656: #607's refusal
+    // is what closes this class. #656's ROOT stays open for the
+    // interpreter-CONSUMED family (`bash <<'EOF'`, `bash -c "$(…)"`, `$(…) | bash`),
+    // which is #694's and is recorded there.
+    const m601res = await callBash(`git branch -Mq main rn601res ; echo "$(git branch -Mq feat/601foreign rn601stolen)"`);
+    expectTrue("#607 closes #601's #656-residual: a `$()`-hidden FOREIGN rename behind an M3-allowed lead is REFUSED (inverted from the tripwire, cited) [mutant: #607-M1 — `hiddenBranchStateRefusal` returns null] — MEASURED: admitted under M1, which is what this row asserted before #607",
+      !!m601res && m601res.block === true,
+      `handler returned ${JSON.stringify(m601res)} — a \`$(…)\`-hidden foreign rename behind a sanctioned lead was ADMITTED: the #656 residual is open again`);
+    // ⛔ DELETED (#3442, round-6 finding F2): this block used to CREATE
+    // `feat/601foreign` and rename it to `rn601stolen` with `execSync`, then assert the
+    // ref existed — labelled "…so the admitted command moves a FOREIGN ref". Its whole
+    // input was the test's OWN git calls: no guard module runs between the setup and the
+    // assertion, so its value could not vary under ANY mutant of this diff, under the
+    // pre-fix code, or under #656's eventual fix. By #3442's letter that is dead weight
+    // that actively misleads, and its label drew a conclusion (the admitted command moves
+    // a foreign ref) the test never demonstrated — it moved the ref itself. The
+    // foreign-ness of the hidden tail is a property of the COMMAND SPELLING recorded in
+    // the row above (`feat/601foreign` ≠ the baseline), not a measurement this suite has
+    // to re-take. No replacement assertion: a real one would have to observe the guard.
+    // The residual ROW above is the record; nothing here is #601 coverage.
+    // The row above is now REFUSED, so nothing was applied: the guard's baseline was
+    // NOT re-based to `rn601res` (that is the #1144 F3 property, on the hidden-payload
+    // path). The control stays because the following suites require
+    // `baseline.branch === "main"` on exit.
+    const m601resR = await callBash("git checkout main");
+    expectTrue("#601 ⚠️ RESIDUAL harness control: the fixture is back on main after the (now refused) row [mutants: M5, M8] — MEASURED: blocked under either",
+      m601resR === undefined, `handler returned ${JSON.stringify(m601resR)}`);
+    // ── FIXTURE HYGIENE PRECONDITION, NOT #601 EVIDENCE (#3442, round-6 finding F2) ──
+    // The old row here said "back on main with no stray branch" but read ONLY `HEAD`, so
+    // its "no stray branch" half was an unasserted claim sitting on a best-effort
+    // `try/catch` delete. It now measures what it says: HEAD *and* the absence of the
+    // purpose-made refs. It is deliberately invariant under every mutant of this diff —
+    // it observes the FIXTURE the following suites need (`baseline.branch === "main"`),
+    // not the guard — so it is labelled a precondition, is the one row in this block with
+    // no mutation-attribution entry, and claims nothing about #601.
+    const afterResidual = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repo, encoding: "utf8" }).trim();
+    const strayResidual = execSync("git branch --list 'rn601*' '601foreign'", { cwd: repo, encoding: "utf8" }).trim();
+    expect(`#601 ⚠️ RESIDUAL precondition (fixture hygiene — NOT #601 coverage, no mutant can move it)`, `head=${afterResidual} stray=${strayResidual || "none"}`, "head=main stray=none");
+
     // ── B9w–B9z: #2277 — a lane rooted ELSEWHERE can advance a hub, but only
     // on a MEASURED fast-forward proof ────────────────────────────────────
     // Measured 2026-10-21 on the agent-infra hub itself: `0 ahead / 76 behind
