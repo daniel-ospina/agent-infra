@@ -5539,9 +5539,20 @@ try {
   // anchor helper (a second, drift-prone copy is the regression shape), the
   // exemption scoped to the harvested SET (never to the command), and the
   // message correction.
+  // ⛔ #2775 RE-KEYED THIS PREDICATE ON THE PINNED BYTES, AND THE PINS MOVE WITH IT (agent-infra#2955).
+  // `_sanctionedScriptExemption`'s arm 1 is PATH-ONLY by spec, so a script minted at a sanctioned
+  // relpath under a copy-deployed module root had its discards DROPPED instead of gated — the #1228
+  // fail-open (`_isAuditedSanctionedScript`'s docblock carries the measurement). M5 therefore asks
+  // `_auditedSanctionedExemption(<path>, s.digest)`, handing it the digest of the body the discards
+  // were parsed from and never a re-read of the path (that re-read is the TOCTOU the digest exists to
+  // close). The pins below are the halves that keep that narrowing from being quietly undone: the
+  // AUDITED helper is the only thing consulted, it is handed the SET'S OWN digest, and a set with no
+  // body behind it (`s.digest === null`) is GATED rather than exempted.
   expectBool("#1139: M5 consults the SAME hardened exempt helper — one definition, one anchor, one list",
-    pinSrc.includes("_sanctionedScriptExemption(resolve(execCwd, s.script))") &&
+    pinSrc.includes("_auditedSanctionedExemption(resolve(execCwd, s.script), s.digest)") &&
+    pinSrc.includes("s.digest === null ? null :") &&
     (pinSrc.match(/function _sanctionedScriptExemption\(/g) ?? []).length === 1 &&
+    (pinSrc.match(/function _auditedSanctionedExemption\(/g) ?? []).length === 1 &&
     (pinSrc.match(/const SANCTIONED_SCRIPT_RELPATHS = \[/g) ?? []).length === 1, true);
   expectBool("#1139: the M5 exemption drops the harvested SET, never the command's argv",
     pinSrc.includes("const gatedSets = sets.filter((s) => {") &&
@@ -5556,7 +5567,7 @@ try {
     // even when the dropped set carried no discards, and summing raw push sites
     // double-counts one file pushed as two sets — review cycle-2 P2).
     pinSrc.includes("discards_dropped") && pinSrc.includes("sets_exempted") &&
-    pinSrc.includes("const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>()") &&
+    pinSrc.includes("const exempted = new Map<string, { rel: string; via: \"module-root\" | \"identity\"; discards: number; forms: Set<string> }>()") &&
     // …and a repeated push site must not ADD UP (review cycle-3 P2): the same
     // realpath always yields the same discard list, so `sets_exempted=1` with
     // `discards_dropped=2` misstated the suppression the row exists to report.
@@ -5565,23 +5576,29 @@ try {
   expectBool("#1139: the fail-closed remedy is printed only when that file exists",
     pinSrc.includes("if (existsSync(p)) sanctionedHelper = p;") &&
     !pinSrc.includes("const sanctionedHelper = _frameworkRoot"), true);
-  // #2332 reshaped this predicate: the anchor is no longer the ONLY gate, so the
-  // pin is on the three things that must all still fail CLOSED — (1) an absent
-  // module root skips arm 1 instead of taking it, (2) arm 2 requires a pin (a
-  // missing/unreadable pin JSON yields an empty map, so no relpath is exempt),
-  // and (3) a throwing probe still keeps the M5 set gated. A regression in any
-  // of them turns "cannot tell" into "allow", which is the fail-open this test
-  // exists for.
-  // ⚠️ The anchor string must be UNIQUE in index.ts. `if (_frameworkRoot) {` is
-  // not: it occurs in an unrelated function too, so mutating arm 1 to
+  // #2332 reshaped this predicate and #2775 re-keyed it on the pinned bytes, so the anchor is no
+  // longer the ONLY gate; the pin is on the four things that must all still fail CLOSED — (1) an
+  // absent module root skips arm 1 instead of taking it, (2) arm 2 requires a pin (a missing or
+  // unreadable pin JSON yields an empty map, so no relpath is exempt), (3) the audited helper refuses
+  // on that same absent pin (`return null`, so the caller GATES), and (4) a body whose digest is not
+  // the pin's is refused by the DIGEST — the half #2775 added, and the one that a copy-deployed box
+  // depends on. A regression in any of them turns "cannot tell" into "allow", which is the fail-open
+  // this test exists for.
+  // ⛔ The anchor string must be UNIQUE in index.ts. `if (_frameworkRoot) {`
+  // is not: it occurs in an unrelated function too, so mutating arm 1 to
   // `if (true) {` left the assertion green (measured at #2332 review). The pin
   // is on the arm-1 open + its own loop, which appears exactly once.
+  // ⛔ `catch { sa = null; }` / `if (sa === null) return true;` REPLACED THE PRE-#2775 M5 NAMES
+  // (`rel`) when the predicate was re-keyed; the site is the same one, so the arm keeps testing the
+  // same property rather than being deleted.
   expectBool("#1139 T6: a null anchor / an absent pin / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
     pinSrc.includes("if (_frameworkRoot) {\n    for (const rel of SANCTIONED_SCRIPT_RELPATHS) {") &&
     (pinSrc.match(/if \(_frameworkRoot\) \{\n    for \(const rel of SANCTIONED_SCRIPT_RELPATHS\) \{/g) ?? []).length === 1 &&
     pinSrc.includes("if (typeof want !== \"string\" || want.length !== 64) continue;") &&
-    pinSrc.includes("catch { rel = null; }") &&
-    pinSrc.includes("if (rel === null) return true;"), true);
+    pinSrc.includes("if (typeof want !== \"string\" || want.length !== 64) return null;") &&
+    pinSrc.includes("return bodyDigest === want ? sa : null;") &&
+    pinSrc.includes("catch { sa = null; }") &&
+    pinSrc.includes("if (sa === null) return true;"), true);
   expectBool("#1139 (review cycle-1 P1): the pipe-seed walk TOKENIZES shell words (a quoted piped script was unwalked)",
     pinSrc.includes("wtShellWords(String(pipeSeg.slice(0, -1).join(\"|\")))") &&
     // ... and does NOT dequote-then-split, which invents a seed for unquoted
