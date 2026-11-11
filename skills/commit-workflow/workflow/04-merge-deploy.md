@@ -198,13 +198,12 @@ gh pr merge <PR_NUMBER> --merge
 PR_BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
 # Remote delete is server-side. The #73 coordinated-delete guard blocks deleting a
 # branch still checked out in ANY worktree (including your own) — and it matches the
-# LITERAL ref, so ⛔ run the delete with the name WRITTEN OUT (the line above only
-# RESOLVES it for you to read) — not via "$PR_BRANCH": an unresolvable target (a
-# variable, a $(…) substitution, a glob, a brace expansion) is REFUSED fail-closed
-# (#653), because the guard cannot tell which ref such a target would delete. The
-# mitigation below is the WARN, not a bypass.
+# LITERAL ref, so ⛔ an unresolvable target ("$PR_BRANCH", a $(…) substitution, a
+# glob, a brace expansion) is REFUSED fail-closed since #653: the guard cannot tell
+# which ref it would delete. The mitigation below is the WARN, not a bypass.
 #   → print the literal first:  echo "git push origin --delete $PR_BRANCH"
-git push origin --delete feat/my-branch 2>&1 || echo "⚠️ remote delete blocked/failed — retry after teardown or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/feat/my-branch"
+#   → then REPLACE REPLACE-WITH-PR-BRANCH with that ref and run:
+git push origin --delete feat/REPLACE-WITH-PR-BRANCH 2>&1 || echo "⚠️ remote delete did NOT run for feat/REPLACE-WITH-PR-BRANCH — substitute the PR branch printed above, or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/<that-ref>"
 # Local delete degrades gracefully: tolerate the worktree lock, do NOT fail the ceremony.
 # `git branch -D` (not -d) so a merged-but-not-fully-reconciled local branch still cleans up.
 if git worktree list --porcelain | grep -q "branch refs/heads/$PR_BRANCH"; then
