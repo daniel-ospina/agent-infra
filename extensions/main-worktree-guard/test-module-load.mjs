@@ -862,19 +862,18 @@ async function partB() {
     expectTrue("#601 ⚠️ RESIDUAL (#656 root — NOT closed by #601): a `$()`-hidden FOREIGN rename behind an M3-allowed lead is ADMITTED today (tripwire, not a lock) [no mutant — records a GAP] — invert when #656 lands",
       m601res === undefined,
       `handler returned ${JSON.stringify(m601res)} — if this is now {block:true}, #656's fail-closed fix HAS landed: INVERT this row and cite #656`);
-    // …and the hidden tail is a REAL FOREIGN MUTATION, not a no-op spelling. The
-    // handler is a GATE, not an executor — `callBash` returns the verdict and runs
-    // nothing — so the tail is executed here OUTSIDE the gate (the same way the
-    // fixture setup above runs git) to show what the admission lets through, and
-    // then cleaned up. Both refs are purpose-made so no other row's fixture moves.
-    // `-f` (not plain create) so this block is re-runnable: the row is a record of a
-    // GAP, not a one-shot, and a rerun must not die on an existing fixture branch.
-    execSync("git branch -f feat/601foreign HEAD", { cwd: repo, stdio: "ignore" });
-    execSync("git branch -Mq feat/601foreign rn601stolen", { cwd: repo, stdio: "ignore" });
-    let stolen610 = "";
-    try { stolen610 = execSync("git branch --list rn601stolen", { cwd: repo, encoding: "utf8" }).trim(); } catch { stolen610 = ""; }
-    expectTrue("#601 ⚠️ RESIDUAL: …and the substituted tail IS a real foreign-branch rename rc 0 (executed outside the gate — the handler only gates), so the admitted command moves a FOREIGN ref",
-      stolen610.includes("rn601stolen"), `git branch --list rn601stolen → ${JSON.stringify(stolen610)}`);
+    // ⛔ DELETED (#3442, round-6 finding F2): this block used to CREATE
+    // `feat/601foreign` and rename it to `rn601stolen` with `execSync`, then assert the
+    // ref existed — labelled "…so the admitted command moves a FOREIGN ref". Its whole
+    // input was the test's OWN git calls: no guard module runs between the setup and the
+    // assertion, so its value could not vary under ANY mutant of this diff, under the
+    // pre-fix code, or under #656's eventual fix. By #3442's letter that is dead weight
+    // that actively misleads, and its label drew a conclusion (the admitted command moves
+    // a foreign ref) the test never demonstrated — it moved the ref itself. The
+    // foreign-ness of the hidden tail is a property of the COMMAND SPELLING recorded in
+    // the row above (`feat/601foreign` ≠ the baseline), not a measurement this suite has
+    // to re-take. No replacement assertion: a real one would have to observe the guard.
+    // The residual ROW above is the record; nothing here is #601 coverage.
     // Restore the fixture: the admitted row left the GUARD's baseline re-based to
     // `rn601res` (bookkeeping only — no git ran), so the sanctioned return (#376
     // arm, keyed on `original` = main) puts it back. The following suites require
@@ -882,9 +881,17 @@ async function partB() {
     const m601resR = await callBash("git checkout main");
     expectTrue("#601 ⚠️ RESIDUAL harness control: the baseline is re-established after the admitted row [mutants: M5, M8] — MEASURED: blocked under either",
       m601resR === undefined, `handler returned ${JSON.stringify(m601resR)}`);
-    try { execSync("git branch -q -D rn601stolen", { cwd: repo, stdio: "ignore" }); } catch { /* best-effort fixture cleanup */ }
+    // ── FIXTURE HYGIENE PRECONDITION, NOT #601 EVIDENCE (#3442, round-6 finding F2) ──
+    // The old row here said "back on main with no stray branch" but read ONLY `HEAD`, so
+    // its "no stray branch" half was an unasserted claim sitting on a best-effort
+    // `try/catch` delete. It now measures what it says: HEAD *and* the absence of the
+    // purpose-made refs. It is deliberately invariant under every mutant of this diff —
+    // it observes the FIXTURE the following suites need (`baseline.branch === "main"`),
+    // not the guard — so it is labelled a precondition, is the one row in this block with
+    // no mutation-attribution entry, and claims nothing about #601.
     const afterResidual = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repo, encoding: "utf8" }).trim();
-    expect(`#601 ⚠️ RESIDUAL: the fixture is back on main with no stray branch (state: ${afterResidual})`, afterResidual, "main");
+    const strayResidual = execSync("git branch --list 'rn601*' '601foreign'", { cwd: repo, encoding: "utf8" }).trim();
+    expect(`#601 ⚠️ RESIDUAL precondition (fixture hygiene — NOT #601 coverage, no mutant can move it)`, `head=${afterResidual} stray=${strayResidual || "none"}`, "head=main stray=none");
 
     // ── B9w–B9z: #2277 — a lane rooted ELSEWHERE can advance a hub, but only
     // on a MEASURED fast-forward proof ────────────────────────────────────
