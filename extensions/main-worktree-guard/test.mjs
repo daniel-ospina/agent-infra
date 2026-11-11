@@ -5415,7 +5415,7 @@ try {
     // the #3955 review): `pushd +9` and `popd -9` stay green with the range guards
     // deleted, because slice(9) on a 3-entry stack is the identity and popd -9's
     // `idx = -7` gives two empty slices either way. The bounds that ARE
-    // load-bearing have their own rows below (`B3`, `B4`); these two keep the
+    // load-bearing have their own rows below (`I2d`); these two keep the
     // four out-of-range forms honest about "bash errors and nothing changes".
     has("cd a; pushd ../docs; pushd ../a; pushd +9; echo x > tracked.md", "redirect:H/a/tracked.md", "C3 control: pushd +9 is out of range — bash errors, cwd stays a");
     has("cd a; pushd ../docs; pushd ../a; popd -9; echo x > tracked.md", "redirect:H/a/tracked.md", "C4 control: popd -9 is out of range — bash errors, cwd stays a");
@@ -5498,6 +5498,38 @@ try {
     // (`$VAR`/`~`): no cd AND no push, which is where bash also lands.
     has("pushd $NOPE; cd a; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T$: an unresolved $VAR pushd neither cd's nor pushes — the popd is a bash no-op");
     has("cd a; pushd ~; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T~: pushd ~ is modelled no-cd/no-push and stays self-consistent (bash also lands back in a)");
+    // ── #3955 review Finding 1 (net-new P1, MEASURED fail-open REGRESSION): an
+    // UNEXPANDED operand. This walker never expands, so `popd $EMPTY` / `popd "$1"`
+    // reach the handler as literal text and the `/^[^+-]/` guard swallowed them as
+    // "bash error ⇒ no change". Real bash expands them, and an empty expansion IS a
+    // bare popd: measured on the fixture below, `popd $EMPTY` leaves the shell in
+    // `a`, so `echo pwn > tracked.md` really overwrites TRACKED `a/tracked.md`.
+    // ⛔ BOTH realities are pinned, in opposite fixtures, because either model alone
+    // is a fail-open in the other direction (origin/main popped, so it ALLOWed the
+    // docs reality; the pre-fix no-change model ALLOWed the a reality).
+    has("cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "redirect:H/a/tracked.md", "F1: a `$VAR` operand emits the POP reality (bash pops on an empty expansion)");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "F1 gate: TRACKED a/tracked.md → BLOCK (the pre-fix walker resolved docs/ and ALLOWed a measured overwrite)");
+    has("cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "redirect:H/docs/tracked.md", "F1: …AND the unchanged-cwd reality (the expansion could be a path ⇒ bash errors)");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "F1 gate: TRACKED docs/tracked.md → BLOCK too (a pop-ONLY model, i.e. origin/main, ALLOWs this one)");
+    has("cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "redirect:H/a/tracked.md", "F1: the QUOTED expansion is the same class — readWord strips the quotes, not the expansion");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "F1 gate: quoted `$1` → BLOCK");
+    // `popd -n $VAR` has the same shape one branch over: `-n` never cds, so an empty
+    // expansion is the bare `-n` (drop element 1) and a path is an error. The
+    // stack-side divergence a LATER bare popd exposes is the declared residual.
+    has("cd a; pushd ../docs; pushd ../b; popd -n $EMPTY; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "F1: popd -n $VAR is the bare `-n` — the next popd lands on a, not on docs");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n $EMPTY; popd; echo x > tracked.md", "F1 gate: TRACKED a/tracked.md → BLOCK (the pre-fix no-op left the popd on docs → ALLOW)");
+    // ── #3955 review Finding 4 (still open, re-measured): once `sel` and `-n` are
+    // consumed, EVERY other operand is a bash error RC 2 that changes neither the
+    // stack nor the cwd — including a `+`-prefixed non-numeric one. The previous
+    // guards let `+x`/`+1x`/`+` fall through to a bare popd, so the walker cd'd to
+    // `a` while bash stayed in docs: a measured fail-open (`+1x`) AND a regression
+    // against origin/main (which popped nothing there).
+    has("cd a; pushd ../docs; popd +1x; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4: popd +1x is 'invalid number' — the cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +1x; echo x > tracked.md", "F4 gate: TRACKED docs/tracked.md → BLOCK (the pre-fix fall-through popped to a and ALLOWed)");
+    has("cd a; pushd ../docs; popd +x; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4: popd +x is an error too — nothing changes");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +x; echo x > tracked.md", "F4 gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd a; pushd ../docs; popd +; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4: a bare `+` operand is an error, not a bare popd");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +; echo x > tracked.md", "F4 gate: TRACKED docs/tracked.md → BLOCK");
   }
 
 

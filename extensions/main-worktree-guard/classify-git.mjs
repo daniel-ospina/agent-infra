@@ -9624,13 +9624,30 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         // `-n --` is exactly a bare `popd -n` (measured); any OTHER non-numeric
         // operand is bash's "invalid number"/"invalid argument" error (rc 2), which
         // changes nothing — so it must not be read as the bare form either.
-        if (!nSel && opw.w && opw.w !== "--") continue;
+        // ⛔ EXCEPT an unexpandable operand (#3955 review Finding 1, same class as
+        // the bare-popd path below): `popd -n $EMPTY` IS a bare `popd -n` and the
+        // previous model swallowed it as a no-op. `-n` never cds, so the two
+        // realities differ only in the STACK, not in the cwd; the empty-expansion
+        // reading (the dominant one) is taken. ⚠️ Declared residual: if the
+        // expansion is a path, bash errors and the stack is untouched, so a LATER
+        // bare `popd` is modelled one entry off — representable only by forking the
+        // stack, which this walker has no representation for.
+        const nUnprovable = /^[$`]/.test(opw.w || "");
+        if (!nSel && opw.w && opw.w !== "--" && !nUnprovable) continue;
         i = opw.k;
         let idx = 1;                                            // bare `-n`: the entry a bare popd would cd to
         if (nSel) {
           const n = Number(nSel[2]);
           idx = nSel[1] === "+" ? n : S.length - 1 - n;
-          if (idx === 0) idx = 1;                               // element 0 is the cwd — bash drops 1 instead (measured)
+          // `+0` names element 0, which IS the current directory, so bash drops
+          // element 1 instead (measured, [b,docs,a] … `popd -n +0` ⇒ [b,a]).
+          // ⛔ THIS LINE CANNOT BE PINNED BY ANY ROW, and saying so is the point
+          // (#3955 review Finding 5): `vstack` re-derives element 0 from
+          // `f().cwd`, and this arm never assigns `pending`, so dropping index 0
+          // and dropping index 1 store the SAME tail at every depth — disabling
+          // it (`if (false) idx = 1;`) reddens nothing, `I1 control` included.
+          // Kept because it states bash's real rule, NOT because a test covers it.
+          if (idx === 0) idx = 1;
           // An out-of-range operand is a bash error and nothing changes. (For `+N`
           // the bound is BELT-AND-BRACES: `slice(0, idx)` beyond the end is the
           // whole array, so a dropped `idx < S.length` cannot mis-remove — measured
@@ -9640,10 +9657,40 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (S.length > 1) setVStack(S.slice(0, idx).concat(S.slice(idx + 1)));
         continue;
       }
-      if (tgt.w && tgt.w !== "--" && tgt.w.startsWith("-")) { continue; } // unmodelled flag form — conservative
-      if (tgt.w && tgt.w !== "--" && /^[^+-]/.test(tgt.w)) { continue; }   // path operand → bash errors, no change
+      // ⛔ EVERY OTHER OPERAND IS A BASH ERROR (#3955 review Finding 4). Once `sel`
+      // and `-n` are consumed, `popd foo` / `popd 1` / `popd +x` / `popd +` /
+      // `popd +1x` / `popd -x` all print "invalid argument"/"invalid number"
+      // (rc 2) and change NEITHER the stack nor the cwd (bash 5.2.21, measured).
+      // `--` stays exempt — it IS a bare popd. The previous pair of guards let any
+      // `+`-prefixed non-numeric operand fall through to a bare popd: a measured
+      // fail-OPEN (`cd a; pushd ../docs; popd +1x; echo x > tracked.md` really
+      // writes TRACKED `docs/tracked.md`; the walker resolved `a/tracked.md` →
+      // ALLOW) and a REGRESSION against origin/main, which popped nothing there.
+      // ⛔ AN UNEXPANDED OPERAND IS A DIFFERENT CLASS, and it is NOT an error
+      // (#3955 review Finding 1). This walker never expands, so `popd $VAR`,
+      // `popd "$1"`, `popd $(…)` and `popd \`…\`` arrive here as literal text.
+      // Real bash resolves them to ONE of: a bare `popd` (empty, or `--`), an
+      // indexed form, or the error above — and the two CWD outcomes are different
+      // directories, so picking either alone is a fail-open in the other. That is
+      // measured, not theoretical: `cd a; pushd ../docs; popd $EMPTY; echo pwn >
+      // tracked.md` really overwrites TRACKED `a/tracked.md`, while the no-change
+      // model resolved `docs/` → ALLOW (origin/main popped and graded it right —
+      // so this guard was a regression). Popping alone is equally wrong whenever
+      // the variable holds a path. BOTH realities are therefore emitted: continue
+      // in the POP reality and carry the unchanged cwd as an arm-alt, which every
+      // later write site already unions through `forkTwins`.
+      const unprovable = /^[$`]/.test(tgt.w || "");
+      if (tgt.w && tgt.w !== "--" && !unprovable) continue;   // bash error → no change
+      const keepCwd = f().cwd;
       const d = dirStack.pop();
-      f().pending = d !== undefined && existsSync(d) ? d : null; // empty stack → bash no-op
+      const popTo = d !== undefined && existsSync(d) ? d : null;
+      if (unprovable && popTo !== null && popTo !== keepCwd) {
+        // the "the expansion was a path ⇒ bash errored, nothing changed" reality
+        f().forkCwd = f().forkCwd || popTo;
+        f().forkAlts = [...new Set([...(f().forkAlts || []), keepCwd])]
+          .filter((x) => x !== popTo).slice(0, 64);
+      }
+      f().pending = popTo;                                    // empty stack → bash no-op
       continue;
     }
     if (w0.w === "python" || w0.w.startsWith("python")) {
