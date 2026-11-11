@@ -4608,7 +4608,8 @@ function _cleanDeleteTarget(x) {
  * it is a normal push, not a delete — the empty-source form starts the token
  * with `:`).
  * @param {string} command
- * @returns {string|null} branch name (short form) or null
+ * @returns {string[]|null} every delete refspec (short form, deduped, in command
+ *   order) — an array, never a bare string; null when the command deletes nothing.
  */
 export function extractPushDeleteBranch(command) {
   const c = String(command ?? "").trim();
