@@ -2113,8 +2113,13 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
             : (d.verdict === "block:commit" ? [{ verb: "commit", invVisible: true, hints: d.commitHints, targets: null, dst: null }] : [])),
           ...(d.pushMutations && d.pushMutations.length > 0
             ? d.pushMutations
-            : (d.verdict !== "block:commit" ? [{ verb: "push", invVisible: true, hints: d.pushHints, targets: d.pushTargets, dst: d.pushDst }] : [])),
-        ];
+            : (d.verdict !== "block:commit" ? [{ verb: "push", invVisible: true, hints: d.pushHints, targets: d.pushTargets, dst: d.pushDst, isDelete: false }] : [])),
+        ]
+          // #605 review F1: a delete-spelled push is the #73 arm's business;
+          // index.ts gates the compound's NON-delete mutations before that
+          // arm's early return, so the mirror must too (a `--delete` anywhere
+          // in the raw command otherwise exempted every other mutation).
+          .filter((mu) => !(d.verdict === "block:push-delete" && mu.verb === "push" && mu.isDelete));
         let sawMain = false;
         for (const mu of muts) {
           // #596 round-4 (reviewer P1 follow-up): the repo ALWAYS comes from the
@@ -2181,6 +2186,12 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       expectBool("#605: visible wt-scoped push LEAD + off-baseline MAIN push → M2 BLOCK", m2i, "block");
       const m2j = m2Gate(`git -C "${wtR}" push origin feat/1 ; git push origin feat/other`);
       expectBool("#605: leading wt push naming the BASELINE branch cannot launder a MAIN push of a foreign one", m2j, "block");
+      // …and the F1 sibling of the same gap, in the off-baseline state: a
+      // `--delete` anywhere in the raw command routes the verdict to the #73
+      // arm, whose early return used to skip M2 for the compound's OTHER
+      // mutations too.
+      const m2nd = m2Gate(`git commit -m x ; git push origin --delete stale`);
+      expectBool("#605 F1: off-baseline MAIN commit + an unrelated --delete segment → M2 BLOCK", m2nd, "block");
       // The other half of the same loop: per-invocation TARGETS. A MAIN push of
       // the session's OWN branch stays allowed even when the LEAD names a
       // different one, and an all-worktree compound is exempt (no false block).
@@ -2188,6 +2199,18 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       expectBool("#605: wt lead + ON-baseline MAIN push (own refspec) → allow (targets are per-invocation)", m2k, "allow");
       const m2l = m2Gate(`git -C "${wtR}" commit -m z ; git -C "${wtR}" commit -w`);
       expectBool("#605: ALL-wt compound (both mutations -C <wt>) → wt-exempt (no false block)", m2l, "wt-exempt");
+      // Review F1 (same class, one level above the hints): the push-delete verdict
+      // is set from the WHOLE raw command, so a `--delete` anywhere in a compound
+      // routed it into the #73 arm, whose early return skipped M2 entirely —
+      // `git push origin feat/other ; git push origin --delete stale` let the
+      // off-baseline MAIN push through. The delete arm now gates the compound's
+      // NON-delete mutations (the delete-spelled push itself stays #73's).
+      const m2m = m2Gate(`git push origin feat/other ; git push origin --delete stale`);
+      expectBool("#605 F1: off-baseline MAIN push + an unrelated --delete segment → M2 BLOCK", m2m, "block");
+      const m2o = m2Gate(`git push origin feat/1 ; git push origin --delete stale`);
+      expectBool("#605 F1 control: ON-baseline MAIN push + a --delete segment → allow (no false block)", m2o, "allow");
+      const m2p = m2Gate(`git push origin --delete stale`);
+      expectBool("#605 F1 control: delete-only command → nothing main-resolving to gate (wt-exempt)", m2p, "wt-exempt");
       execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
       const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");

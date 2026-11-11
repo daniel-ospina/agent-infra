@@ -6256,6 +6256,116 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // ── M2 mutation list (#605) — built BEFORE the delete arm below, because
+      // that arm used to return without running M2 over the compound's OTHER
+      // mutations (review F1).
+      // #596 round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS comes
+      // from the classifier's boundary-aware invocation hints (a
+      // block:commit/block:push verdict implies the invocation exists;
+      // hint-less commits resolve at the session cwd). The extractor replay
+      // phantom-counted script-file attempts (`bash git -C <wt> commit -m z` —
+      // consumed by the classifier as interpreter+path) and the no-stateVerb
+      // path (eff = replay of det.verb) wrongly worktree-exempted the REAL main
+      // commit.
+      //
+      // #605: and the hints must be those of EVERY commit/push invocation, not
+      // only the FIRST extractor-visible one. `commitHints`/`pushHints` describe
+      // the first visible invocation, so a fully-VISIBLE worktree-scoped LEAD
+      // resolved the whole command to its worktree → decideM2 returned null →
+      // the later OFF-baseline MAIN commit/push ran rc 0 (`git -C <wt> commit
+      // -m z ; git commit -m x`, and the push twin; the reversed order blocks).
+      // Each mutation now resolves its OWN repo (and a push its OWN refspecs),
+      // and every main-resolving one is gated — block wins — exactly as the
+      // round-4 M3 stateMutations loop does for branch-state mutations.
+      const m2Mutations: any[] = [];
+      const commitMuts = (det.commitMutations && det.commitMutations.length > 0)
+        ? det.commitMutations
+        : (det.verdict === "block:commit"
+          ? [{ verb: "commit", invVisible: true, hints: det.commitHints ?? null, targets: null, dst: null }]
+          : []);
+      const pushMuts = (det.pushMutations && det.pushMutations.length > 0)
+        ? det.pushMutations
+        : (det.verdict !== "block:commit"
+          ? [{ verb: "push", invVisible: true, hints: det.pushHints ?? null, targets: det.pushTargets, dst: det.pushDst, isDelete: false }]
+          : []);
+      m2Mutations.push(...commitMuts, ...pushMuts);
+      // #805/#605: gate ONE commit/push mutation. Returns the refusal, or
+      // undefined when this mutation is exempt/on-baseline.
+      const gateOneMutation = (mu: any): { block: true; reason: string } | undefined => {
+        // Resolve THIS mutation's repo: the classifier's own boundary-aware
+        // hints (visible spellings); an extractor-invisible spelling
+        // (interpreter-inline payload) executes at the shell cwd → session
+        // repo (#596 round-4 F2 policy).
+        let m2Eff = mu.hints
+          ? branchOwnership.resolveRepoFromInv(mu.hints, process.cwd())
+          : (mu.invVisible === false
+            ? branchOwnership.resolveEffectiveRepo("git status", process.cwd())
+            : null);
+        // #596 round-4 (F2): a null read means the hints-based resolution failed
+        // (git read error, or the invocation was extractor-invisible — an
+        // interpreter-inline payload is ONE opaque token to the repo layer). The
+        // payload executes at the shell cwd, so resolve at the SESSION cwd.
+        // Fail-closed is preserved — session-cwd gates apply, never a silent
+        // pass; an OFF-baseline session still blocks, while the round-4
+        // regression (blocking an ON-baseline invisible commit that
+        // pre-round-3 allowed) stays undone.
+        if (!m2Eff) {
+          m2Eff = branchOwnership.resolveEffectiveRepo("git status", process.cwd());
+        }
+        if (!m2Eff) {
+          return {
+            block: true,
+            reason: "⛔ git commit/push blocked — could not verify repo ownership (git read failed; fail-closed, #265).",
+          };
+        }
+        // THIS mutation is worktree-scoped — exempt it, and keep gating the rest
+        // (`git -C <wt> commit ; git commit` must not blanket-exempt).
+        // #805: an UNRESOLVED target (bare cd / unexpandable $VAR / `-C`
+        // sentinel) is never worktree-exempt — the resolution may REPORT the
+        // session worktree while the real target is the shared hub, so the
+        // exemption must not short-circuit decideM2's fail-closed refusal
+        // (reordering this ahead of the unresolvedTarget arm let
+        // `cd $AGENT_INFRA_PATH && git commit` through in the #805 fixture).
+        if (m2Eff.isWorktree && !m2Eff.unresolvedTarget) return undefined;
+        const baseline = baselines.get(pid);
+        // A mutation's own verb decides which decideM2 arm applies; a push keeps
+        // the compound's force classification (force and plain push share one
+        // decideM2 arm — the distinction is advisory).
+        const muVerdict = mu.verb === "commit"
+          ? "block:commit"
+          : (det.verdict === "block:force-push" ? "block:force-push" : "block:push");
+        // #805 P1: with NO baseline, decideM2 must know whether the resolved MAIN
+        // checkout is THIS session's own (a worktree shares its common dir, so
+        // `repoKey` equality identifies it) or the agent-infra hub — only those
+        // two are refused; a different repo's MAIN checkout is ordinary
+        // cross-repo work and stays allowed. Both probes spawn git, so they run
+        // only in the (rare, anomalous) no-baseline case.
+        const m2 = branchOwnership.decideM2({
+          effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
+          // #605: a push is gated against ITS OWN refspecs, never the first
+          // push's — attributing the lead's targets to a later MAIN push blocks
+          // or (when the lead named the session's baseline branch) ALLOWS the
+          // wrong push.
+          pushDst: mu.verb === "push" ? (mu.dst ?? null) : det.pushDst,
+          pushTargets: mu.verb === "push"
+            ? (Array.isArray(mu.targets) ? mu.targets : det.pushTargets)
+            : det.pushTargets,
+          verdict: muVerdict, allowActive: false,
+          ...(baseline ? {} : {
+            sessionRepoKey: branchOwnership.repoKey(process.cwd()) ?? null,
+            effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd),
+          }),
+        });
+        return m2?.block ? { block: true, reason: m2.reason } : undefined;
+      };
+      const gateMutations = (mutations: any[]): { block: true; reason: string } | undefined => {
+        for (const mu of mutations) {
+          const hit = gateOneMutation(mu);
+          if (hit) return hit;
+        }
+        return undefined;
+      };
+
       // ── push --delete: retained #73 coordinated check (foreign targets) ──
       // The matcher is per-FIRST-push-invocation; a delete spelling in a LATER
       // compound segment is attributed via the whole-command extractor (matcher
@@ -6270,6 +6380,19 @@ export default function (pi: ExtensionAPI) {
       if (det.verdict === "block:push-delete" && det.pushTargets.length > 0) {
         const blocked = _coordinatedDeleteBlock(det.pushTargets);
         if (blocked) return blocked;
+        // #605 (review F1): the push-delete verdict is set from the WHOLE raw
+        // command, so an UNRELATED `--delete` segment anywhere in a compound used
+        // to reach this early return and exempt EVERY other mutation in it —
+        // `git -C <hub> push origin feat/other ; git push origin --delete stale`
+        // and `git commit -m x ; git push origin --delete stale` both ran their
+        // MAIN mutation ungated. That is the identical "a benign segment exempts
+        // a later MAIN mutation" class this change closes, one level above the
+        // hints mechanism, so the non-delete mutations are gated here too. The
+        // delete-spelled pushes stay this arm's business (they are covered above,
+        // and pushing the M2 target comparison on them would refuse ordinary
+        // remote-branch cleanup).
+        const hit = gateMutations(m2Mutations.filter((mu) => !(mu.verb === "push" && mu.isDelete)));
+        if (hit) return hit;
         return admitAfterM3(); // foreign deletes with no checked-out targets — allowed (today's behavior)
       }
       if (det.verdict === "block:push" || det.verdict === "block:force-push") {
@@ -6283,112 +6406,18 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── M2: commit/push ownership (block off-baseline) ──
+      // #596 (round-3 reviewer P2-2): M2 must gate the COMMIT/PUSH's own repo,
+      // not the M3 state-invocation repo — a compound with an off-baseline MAIN
+      // commit and a later `-C <wt>`-scoped branch mutation would otherwise
+      // reuse the worktree-exempt eff and let the off-baseline commit through
+      // (the pre-#596 single-eff conflation predates this PR for 2-segment
+      // forms; the 3-segment benign-lead form flipped block→allow in round-2).
+      // The mutation list and the per-mutation gate live ABOVE the delete arm
+      // (#605 review F1), so a `--delete` anywhere in the command cannot exempt
+      // the compound's other mutations either.
       if (det.verdict === "block:commit" || det.verdict === "block:push" || det.verdict === "block:force-push") {
-        // #596 (round-3 reviewer P2-2): M2 must gate the COMMIT/PUSH's own
-        // repo, not the M3 state-invocation repo — a compound with an
-        // off-baseline MAIN commit and a later `-C <wt>`-scoped branch
-        // mutation would otherwise reuse the worktree-exempt eff and let the
-        // off-baseline commit through (the pre-#596 single-eff conflation
-        // predates this PR for 2-segment forms; the 3-segment benign-lead form
-        // flipped block→allow in round-2).
-        // #596 round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS
-        // comes from the classifier's boundary-aware commit/push invocation
-        // hints (a block:commit/block:push verdict implies the invocation
-        // exists; hint-less commits resolve at the session cwd). The extractor
-        // replay phantom-counted script-file attempts (`bash git -C <wt>
-        // commit -m z` — consumed by the classifier as interpreter+path) and
-        // the no-stateVerb path (eff = replay of det.verb) wrongly
-        // worktree-exempted the REAL main commit.
-        //
-        // #605: and it must be the hints of EVERY commit/push invocation, not
-        // only the FIRST extractor-visible one. `commitHints`/`pushHints`
-        // describe the first visible invocation, so a fully-VISIBLE
-        // worktree-scoped LEAD resolved the whole command to its worktree →
-        // decideM2 returned null → the later OFF-baseline MAIN commit/push ran
-        // rc 0 (`git -C <wt> commit -m z ; git commit -m x`, and the push twin;
-        // the reversed order blocks). The classifier now exposes every
-        // commit/push invocation with its OWN hints (+ a push's own targets),
-        // and this arm gates each main-resolving one — block wins — exactly as
-        // the round-4 M3 stateMutations loop does for branch-state mutations.
-        const mutationList: any[] = [];
-        const commitMuts = (det.commitMutations && det.commitMutations.length > 0)
-          ? det.commitMutations
-          : (det.verdict === "block:commit"
-            ? [{ verb: "commit", invVisible: true, hints: det.commitHints ?? null, targets: null, dst: null }]
-            : []);
-        const pushMuts = (det.pushMutations && det.pushMutations.length > 0)
-          ? det.pushMutations
-          : (det.verdict !== "block:commit"
-            ? [{ verb: "push", invVisible: true, hints: det.pushHints ?? null, targets: det.pushTargets, dst: det.pushDst }]
-            : []);
-        mutationList.push(...commitMuts, ...pushMuts);
-        for (const mu of mutationList) {
-          // Resolve THIS mutation's repo: the classifier's own boundary-aware
-          // hints (visible spellings); an extractor-invisible spelling
-          // (interpreter-inline payload) executes at the shell cwd → session
-          // repo (#596 round-4 F2 policy).
-          let m2Eff = mu.hints
-            ? branchOwnership.resolveRepoFromInv(mu.hints, process.cwd())
-            : (mu.invVisible === false
-              ? branchOwnership.resolveEffectiveRepo("git status", process.cwd())
-              : null);
-          // #596 round-4 (F2): a null read means the hints-based resolution
-          // failed (git read error, or the invocation was extractor-invisible —
-          // an interpreter-inline payload is ONE opaque token to the repo
-          // layer). The payload executes at the shell cwd, so resolve at the
-          // SESSION cwd. Fail-closed is preserved — session-cwd gates apply,
-          // never a silent pass; an OFF-baseline session still blocks, while
-          // the round-4 regression (blocking an ON-baseline invisible commit
-          // that pre-round-3 allowed) stays undone.
-          if (!m2Eff) {
-            m2Eff = branchOwnership.resolveEffectiveRepo("git status", process.cwd());
-          }
-          if (!m2Eff) {
-            return {
-              block: true,
-              reason: "⛔ git commit/push blocked — could not verify repo ownership (git read failed; fail-closed, #265).",
-            };
-          }
-          // THIS mutation is worktree-scoped — exempt it, and keep gating the
-          // rest (`git -C <wt> commit ; git commit` must not blanket-exempt).
-          // #805: an UNRESOLVED target (bare cd / unexpandable $VAR / `-C`
-          // sentinel) is never worktree-exempt — the resolution may REPORT the
-          // session worktree while the real target is the shared hub, so the
-          // exemption must not short-circuit decideM2's fail-closed refusal
-          // (reordering this ahead of the unresolvedTarget arm let
-          // `cd $AGENT_INFRA_PATH && git commit` through in the #805 fixture).
-          if (m2Eff.isWorktree && !m2Eff.unresolvedTarget) continue;
-          const baseline = baselines.get(pid);
-          // A mutation's own verb decides which decideM2 arm applies; a push
-          // keeps the compound's force classification (force and plain push
-          // share one decideM2 arm — the distinction is advisory).
-          const muVerdict = mu.verb === "commit"
-            ? "block:commit"
-            : (det.verdict === "block:force-push" ? "block:force-push" : "block:push");
-          // #805 P1: with NO baseline, decideM2 must know whether the resolved
-          // MAIN checkout is THIS session's own (a worktree shares its common
-          // dir, so `repoKey` equality identifies it) or the agent-infra hub —
-          // only those two are refused; a different repo's MAIN checkout is
-          // ordinary cross-repo work and stays allowed. Both probes spawn git, so
-          // they run only in the (rare, anomalous) no-baseline case.
-          const m2 = branchOwnership.decideM2({
-            effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
-            // #605: a push is gated against ITS OWN refspecs, never the first
-            // push's — attributing the lead's targets to a later MAIN push
-            // blocks or (when the lead named the session's baseline branch)
-            // ALLOWS the wrong push.
-            pushDst: mu.verb === "push" ? (mu.dst ?? null) : det.pushDst,
-            pushTargets: mu.verb === "push"
-              ? (Array.isArray(mu.targets) ? mu.targets : det.pushTargets)
-              : det.pushTargets,
-            verdict: muVerdict, allowActive: false,
-            ...(baseline ? {} : {
-              sessionRepoKey: branchOwnership.repoKey(process.cwd()) ?? null,
-              effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd),
-            }),
-          });
-          if (m2?.block) return { block: true, reason: m2.reason };
-        }
+        const hit = gateMutations(m2Mutations);
+        if (hit) return hit;
         return admitAfterM3(); // on-baseline or unverifiable-but-exempt
       }
 

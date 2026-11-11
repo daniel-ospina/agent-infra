@@ -149,6 +149,26 @@ async function main() {
     const s2c = await quiet(() => callBash(`git -C "${wt}" commit -m z ; git -C "${wt}" commit -m w`));
     expectTrue("S2 #605: ALL-wt compound (both commits -C <wt>) → ALLOWED (no false block)",
       s2c === undefined, `handler returned ${JSON.stringify(s2c)?.slice(0, 200)}`);
+
+    // ── Scenario 3 (review F1): a `--delete` anywhere used to exempt the rest ──
+    // The push-delete verdict is set from the WHOLE raw command, and that arm
+    // returned without running M2 — so an UNRELATED delete segment exempted
+    // every other mutation in the compound (the same class, one level above the
+    // hints): `git push origin feat/other ; git push origin --delete stale`
+    // reached the #73 arm, found no sibling holding `stale`, and let the
+    // off-baseline MAIN push run. The delete arm now gates the compound's
+    // NON-delete mutations first.
+    const s3 = await quiet(() => callBash(`git push origin feat/other ; git push origin --delete stale`));
+    expectTrue("S3 F1: off-baseline MAIN push + an unrelated --delete segment → M2 BLOCK (delete no longer exempts)",
+      refusedBy(s3, M2_PUSH_REASON), `handler returned ${JSON.stringify(s3)?.slice(0, 200)}`);
+    // The no-false-block controls for the same arm: a delete-only command is
+    // unchanged, and an ON-baseline push beside a delete stays allowed.
+    const s3only = await quiet(() => callBash(`git push origin --delete stale`));
+    expectTrue("S3 F1 control: delete-only command → ALLOWED (unchanged #73 behavior)",
+      s3only === undefined, `handler returned ${JSON.stringify(s3only)?.slice(0, 200)}`);
+    const s3own = await quiet(() => callBash(`git push origin main ; git push origin --delete stale`));
+    expectTrue("S3 F1 control: ON-baseline MAIN push + a --delete segment → ALLOWED (no false block)",
+      s3own === undefined, `handler returned ${JSON.stringify(s3own)?.slice(0, 200)}`);
   } catch (e) {
     expectTrue("#605 integration ran without throwing", false, String(e?.stack ?? e).slice(0, 400));
   } finally {

@@ -4473,6 +4473,11 @@ export function classifyGitCommandDetailed(command) {
         hints: _mutationHints(v),
         targets: t.targets,
         dst: t.dst,
+        // #605 review F1: a delete-spelled push is the #73 coordinated-delete
+        // arm's business, not M2's target comparison — index.ts M2 needs to
+        // tell them apart when a delete ANYWHERE in a compound routes the whole
+        // command to that arm.
+        isDelete: t.isDelete,
       };
     });
 
@@ -4622,7 +4627,7 @@ function _markOptionValueSlots(tokens) {
  * first-push arm, including its documented `-o`-value over-capture, so the two
  * surfaces cannot drift.
  * @param {string[]} args
- * @returns {{targets: string[], dst: string|null}}
+ * @returns {{targets: string[], dst: string|null, isDelete: boolean}}
  */
 function _pushInvocationTargets(args) {
   const argv = args || [];
@@ -4637,11 +4642,12 @@ function _pushInvocationTargets(args) {
         .map((x) => _stripQuotes(x).replace(/^:/, "").replace(/^refs\/heads\//, ""))
         .filter(Boolean),
       dst: null,
+      isDelete: true,
     };
   }
   const refspecs = positionals.length > 1 ? positionals.slice(1) : [];
   const targets = refspecs.map(_refspecDst).filter((x) => x !== null && x !== undefined);
-  return { targets, dst: targets.length === 1 ? targets[0] : null };
+  return { targets, dst: targets.length === 1 ? targets[0] : null, isDelete: false };
 }
 
 function _isPushDeleteFlagToken(a) {

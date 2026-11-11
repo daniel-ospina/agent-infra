@@ -1290,6 +1290,26 @@ jobs:
         # before anything reads it.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s.
         run: node extensions/main-worktree-guard/test-command-position.mjs
+      - name: main-worktree-guard M2 commit/push COMPOUND ownership (#605)
+        timeout-minutes: 4
+        # #605: M2 resolved ONE repo per command (`commitHints`/`pushHints`
+        # describe the first EXTRACTOR-VISIBLE invocation), so a fully-visible
+        # worktree-scoped LEAD blanked the gate for the rest of the compound —
+        # `git -C <wt> push origin wtmain ; git push origin feat/other` ran the
+        # off-baseline MAIN push while the reversed order blocked (the outcome
+        # depended on invocation ORDER). M2 now gates EVERY main-resolving
+        # mutation, each against its own hints and — for a push — its OWN
+        # refspecs, and the push-delete arm no longer exempts the compound's
+        # other mutations (review F1).
+        # Its own step for the reason the POSITION step above states: the
+        # `extensions/*/test*.mjs` glob is in ci-main.yml, which has NO
+        # `pull_request` trigger, so without this line the only handler-level pin
+        # of this fix is collected AFTER the merge it is supposed to gate.
+        # Behavioural: loads the REAL index.ts through module-load-hooks.mjs and
+        # drives the tool_call handler against a hermetic git fixture, asserting
+        # decideM2's own reason text (never a bare `block: true`).
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~2s.
+        run: node extensions/main-worktree-guard/test-m2-compound-ownership.mjs
       - name: main-worktree-guard hub working-tree SWEEP detection (#718)
         # Sized from this step's own documented wall clock (~16s: a dozen deliberate `pause(1600)`
         # bursts inside the arms), NOT from a 12-run p90 — the step landed on main today (#3781), so
