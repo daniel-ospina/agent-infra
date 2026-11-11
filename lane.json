@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-11860.log"
+    },
+    {
+      "kind": "branch",
+      "value": "chore/11395-main-repair-bold-and-tense"
+    },
+    {
+      "kind": "sha",
+      "value": "79b6958c0114b842c932e0e243483bb4d81cc3a2"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-11860"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 5388,
+  "ended_at": 1794400839,
+  "exit_code": 143,
+  "heartbeat_at": 1794400839,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-11860-1794395451-p3314575-fb977eba",
+  "lease_until": 1794408639,
+  "pid": 3314575,
+  "reason": "exit:143",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794395451,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-11860",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-11860"
+}
