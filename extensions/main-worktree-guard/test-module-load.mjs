@@ -445,6 +445,9 @@ async function partB() {
     const nonBuiltin = await callBash("git p4");
     expectTrue("B10l: #594 a non-builtin verb with no visible definition (`git p4`) is BLOCKED, not trusted",
       !!nonBuiltin && nonBuiltin.block === true, `handler returned ${JSON.stringify(nonBuiltin)}`);
+    const transientLeak = await callBash("git -c alias.br=status br && git br");
+    expectTrue("B10m: #594 a transient `-c` does not license a later segment's persisted alias",
+      !!transientLeak && transientLeak.block === true, `handler returned ${JSON.stringify(transientLeak)}`);
 
     // ── B9: #1144 — the shared-baseline sync allowance is EFFECT-shaped ──
     // The allowance is BASELINE-keyed, so the session baseline must be
