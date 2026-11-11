@@ -679,7 +679,11 @@ RC=$?
 set -e
 assert_eq "$RC" "0" "retirement is idempotent (second run exits 0)"
 assert_not_contains "$OUT" "RETIRED (unloaded + removed)" "no repeat retirement chatter"
-# A retired label that STILL has a template is a config error → loud + exit 1.
+# A retired label that STILL has a template is a CONTRADICTION between two repo files. The MANIFEST
+# wins on a machine (#2908): warn loudly, retire the label, never install the template — and exit 0,
+# because one stale RETIRED line used to take the ENTIRE layer down (cells 3 and 4 ran with no
+# reaper, no liveness detection and no canary over exactly this). The repo's DECLARATION gate is
+# what refuses it: `scripts/fleet-schedule.py --check` exits 1 for this state.
 # The `cp` is guarded: a renamed/removed template is a broken target, and under `set -e` a bare `cp`
 # ended the whole suite here with `cp: cannot stat …`, exit 1 and no tally at all (§2 through §14
 # never ran). Report the missing vehicle template and carry on with the next section.
@@ -692,9 +696,38 @@ set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2" 2>&1)"
 RC=$?
 set -e
-assert_eq "$RC" "1" "retired label with template → exit 1"
+assert_eq "$RC" "0" "retired label with template → exit 0, the manifest wins (#2908)"
 assert_contains "$OUT" "com.eldato.hub-state-check is in RETIRED but a template still exists" "retire/template conflict named loudly"
+assert_not_contains "$OUT" "one or more jobs FAILED" "the conflict does not fail the whole install"
 [ ! -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist" ] && ok "conflicting template NOT installed" || bad "conflicting template NOT installed"
+# ⛔ AND `--status` MUST NAME THE RETIREMENT, NOT AN ABSENCE (#2908 review, P1). A retired job is
+# DELIBERATELY never installed, so status_job reported "NOT INSTALLED" — and `fleet-schedule.py
+# --verify` on macOS turns every NOT INSTALLED line into FAIL / SCHEDULE NOT VERIFIED / rc 1. The
+# layer therefore STARTED and its own gate then called it broken: the #3029 false-FAIL class this
+# PR closes on Linux, left standing on the macOS backend over the one-line manifest edit the docs
+# advertise. systemd's comparable (`mask`) names the state as `masked`, never "missing"; so does this.
+# Non-vacuity: pre-fix this fixture printed `com.eldato.hub-state-check: NOT INSTALLED (template v…)`,
+# so the first assertion reds on the old code and the second is what forbids it coming back.
+set +e
+STATUS_OUT="$(run_installer "$HOME2" --status 2>&1)"
+STATUS_RC=$?
+set -e
+assert_eq "$STATUS_RC" "0" "--status still exits 0 with a retired label present"
+assert_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins — template present; remove the template in the repo)" \
+    "--status names a retired label as RETIRED, so macOS --verify stops reporting it as FAIL"
+assert_not_contains "$STATUS_OUT" "com.eldato.hub-state-check: NOT INSTALLED" \
+    "--status never reports a retired label as NOT INSTALLED (that is the macOS false FAIL)"
+# The other half of the split: a retired label whose installed copy SURVIVES is drift from the
+# manifest, and must NOT be laundered into a clean status — closing a false FAIL must not open a false
+# PASS. `--install` is what clears it (retire_pass unloads + removes).
+cp "$TEMPLATES/com.eldato.hub-state-check.plist" "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist"
+set +e
+STATUS_OUT="$(run_installer "$HOME2" --status 2>&1)"
+STATUS_RC=$?
+set -e
+assert_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins) — DRIFTED" \
+    "--status reports a surviving installed copy of a retired label as DRIFT, not as a clean status"
+rm -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 rm -f "$TEMPLATES/com.eldato.hub-state-check.plist"
 
 echo "── 3. Render determinism ─────────────────────────────────────────"
