@@ -8,8 +8,30 @@
 # >24h) from pi's session_start — an interactive, TCC-approved process tree.
 #
 # install-launchd.sh unloads + removes jobs listed here on machines that
-# installed them pre-retirement. A label here must NOT also have a *.plist
-# template in this directory (installer errors on the conflict).
+# installed them pre-retirement. A label here RETIRES the job even if a *.plist
+# template for it still exists (the manifest wins on a machine — #2908): the
+# job is not scheduled, and an installed copy is unloaded and removed. Retiring
+# a job is therefore an operator action on ONE file, not a repo change that also
+# has to delete a template.
+#
+# ⛔ BUT THE TEMPLATE SHOULD STILL GO, and the repo's declaration gate says so:
+# `scripts/fleet-schedule.py --check` exits 1 for any label listed here that
+# still has a template. That is the AUTHORING check (both statements live in
+# the repo, so that is where the contradiction is caught) and it is the only
+# surface that refuses it — `install-launchd.sh` warns (and still unloads +
+# removes), and `fleet-schedule.py --install/--start/--verify/--status` report
+# the label as a named SKIP; both honour the manifest instead, because a single
+# stale line here must never disarm a whole cell's scheduled layer (no
+# reaping, no liveness detection, no canary — measured on cells 3 and 4,
+# 2026-10-27). On macOS the schedule verbs are the installer's, and it names the
+# same state: `install-launchd.sh --status` prints
+# `RETIRED (manifest wins — template present; remove the template in the repo)`
+# rather than `NOT INSTALLED`, so `fleet-schedule.py --verify` (which delegates
+# to that verb) certifies the layer instead of reporting it broken — a retired
+# job is deliberately never installed, and an absence is not a failure. A copy
+# still installed after retirement is reported `DRIFTED`, so closing that false
+# FAIL does not launder a stale job into a clean status: re-run the installer
+# and it is unloaded + removed.
 #
 # Corruption-canary + provider-latency-tripwire REMAIN launchd jobs: the
 # canary watches ~/swarm (unprotected), the tripwire touches no protected

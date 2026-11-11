@@ -1547,7 +1547,19 @@ uninstall_job() {
 # (#427/#431). The installer unloads + removes retired jobs on machines that
 # installed them pre-retirement (the template loop only manages PRESENT
 # templates, so a removed template would otherwise strand installed jobs
-# forever). A retired label must NOT also have a *.plist template.
+# forever).
+#
+# ⛔ A LABEL HERE RETIRES THE JOB EVEN WHEN ITS TEMPLATE IS STILL PRESENT, AND
+# THAT IS DELIBERATE (#2908). The installer used to ERROR and exit 1 on the
+# conflict, which on a cell meant one stale manifest line disarmed the WHOLE
+# scheduled layer — no reaping, no liveness detection, no canary (measured
+# 2026-10-27: `FATAL: the scheduled layer would not start (rc=1)` on cells 3
+# and 4). Retirement is the operator's stated intent and the only statement a
+# MACHINE can honour, so it wins: the job is skipped and any installed copy is
+# unloaded + removed. The contradiction is a REPO authoring error and is refused
+# where it is authored instead — `scripts/fleet-schedule.py --check`, which
+# exits 1 for every label listed here that still has a template. Both backends
+# follow that split: the declaration gate refuses, the machine honours.
 retired_labels() {
     local manifest="$TEMPLATES_DIR/RETIRED" label
     [ -f "$manifest" ] || return 0
@@ -1578,17 +1590,23 @@ retire_job() { # $1 = label; unload + remove when installed (silent when gone)
 
 # Unload retired jobs in both flows: the --uninstall path and the idempotent
 # install path (so a merged retirement propagates on the next sync).
+#
+# ⛔ A TEMPLATE THAT STILL EXISTS IS A WARNING, NOT A LAYER-WIDE REFUSAL (#2908). This used to
+# `rc=1` — and every caller propagates that, so a single contradictory line in RETIRED took the
+# ENTIRE layer down on the machine that needed it (the #2908 cells ran with no reaper, no liveness
+# detection and no canary). The manifest is the operator's stated intent, so it is honoured: warn,
+# unload + remove, let the template loop skip the job. The authoring error is refused by the
+# repo's own declaration gate — `fleet-schedule.py --check` exits 1 for exactly this state — which
+# is the same split the Linux runtime makes.
 retire_pass() {
-    local label rc=0
+    local label
     for label in $(retired_labels); do
         if [ -f "$TEMPLATES_DIR/$label.plist" ]; then
-            echo "ERROR: $label is in RETIRED but a template still exists — remove one or the other" >&2
-            rc=1
-            continue
+            echo "WARN: $label is in RETIRED but a template still exists — retiring it anyway (the manifest wins); remove the template in the repo to clear this" >&2
         fi
         retire_job "$label"
     done
-    return "$rc"
+    return 0
 }
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
@@ -1644,6 +1662,26 @@ if [ "${1:-}" = "--status" ]; then
     echo "=== agent-infra launchd status (templates: $TEMPLATES_DIR) ==="
     for template in "$TEMPLATES_DIR"/*.plist; do
         [ -f "$template" ] || continue
+        # ⛔ A RETIRED LABEL IS A NAMED STATE, NEVER AN ABSENCE (#2908 review, P1). A retired job is
+        # DELIBERATELY never installed, so handing it to status_job printed "NOT INSTALLED" — and
+        # `fleet-schedule.py --verify` on macOS turns every NOT INSTALLED line into FAIL
+        # `SCHEDULE NOT VERIFIED`, rc 1. So the one-line manifest edit this PR advertises
+        # (templates/launchd/RETIRED:12-14, "an operator action on ONE file") started the layer and
+        # then had its own gate report it broken: the #3029 false-FAIL class, closed on Linux and
+        # left standing on the other backend. The comparable (systemd `mask`) names the retirement
+        # as a state (`masked`) rather than reporting the unit absent, and so does this.
+        # The installed-copy arm stays a FAILURE on purpose: the manifest says retired, so a copy
+        # still on disk is DRIFT from the declaration — a false PASS here would be worse than the
+        # false FAIL being closed, and `--install` is what clears it (retire_pass unloads + removes).
+        label="$(job_label "$template")"
+        if is_retired "$label"; then
+            if [ -f "$AGENTS_DIR/$label.plist" ]; then
+                echo "  $label: RETIRED (manifest wins) — DRIFTED: an installed copy survives; re-run the installer to unload + remove it"
+            else
+                echo "  $label: RETIRED (manifest wins — template present; remove the template in the repo)"
+            fi
+            continue
+        fi
         status_job "$template"
     done
     if [ -n "$(retired_labels)" ]; then
@@ -1719,7 +1757,8 @@ retire_pass || fail=1
 for template in "$TEMPLATES_DIR"/*.plist; do
     [ -f "$template" ] || continue
     if is_retired "$(basename "$template" .plist)"; then
-        # retire_pass already ERRORED above (fail=1) — don't ALSO install it.
+        # retire_pass has already warned + unloaded above when the two files contradict; either
+        # way a retired label is never installed (#2908 — the manifest wins on a machine).
         echo "  $(basename "$template" .plist): skipped (in RETIRED — remove the template)" >&2
         continue
     fi

@@ -178,7 +178,18 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
   are accepted), a target **under `<home>/.pi/agent/`** that does not resolve (an incomplete
   farm), an `argv[0]` that **exists but is not executable** (a target that lost its `+x` bit, or
   whose shebang interpreter is gone, fails every run with `rc=127` and would otherwise be stamped
-  as a live job), or a label that is in `RETIRED` while its template still exists. Only `argv[0]`
+  as a live job), or — on `--check` ONLY — a label that is in `RETIRED` while its template
+  still exists. That last one is the one arm whose verdict differs by verb, deliberately: the
+  contradiction lives in two REPO files, so the DECLARATION gate (`--check`, and CI) refuses it,
+  while every MACHINE verb honours the manifest — the job becomes a named `SKIP` and any installed
+  copy is unloaded — because a single stale `RETIRED` line must never disarm a whole cell's
+  scheduled layer (agent-infra#2908: cells 3 and 4 ran with no reaper, no liveness detection and no
+  canary over exactly that). On macOS those verbs are the installer's, and it names the same state:
+  `install-launchd.sh --status` prints `RETIRED (manifest wins — template present; remove the
+  template in the repo)` instead of `NOT INSTALLED`, so the delegated `--verify` above certifies the
+  layer rather than reporting it broken. That is not a licence for a stale job: a retired label
+  whose installed copy **survives** prints `DRIFTED` and still fails `--verify`, until the installer
+  unloads + removes it. Only `argv[0]`
   is held to the execute bit — the remaining arguments are data, and a plist may legitimately point
   one at a non-executable file. Like a missing target, the execute-bit refusal follows the layer
   split: inside `<home>/.pi/agent/` it is fatal (that farm is ours to install), anywhere else it is

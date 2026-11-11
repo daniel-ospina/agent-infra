@@ -950,8 +950,8 @@ which §4.2 declared non-existent (§5.0 V1) and which is already behind an MCP 
 
 ### 5.8.3 Prior art that changes *how* a tool should be written, not *what* it does
 
-**M20 — `scripts/orchestrator-harness/landing/` (`bulk.py`, `landability.py`, `rail-bg.sh`) and
-`scripts/lane-guard.py` (242).** `lane-guard.py` is the **inverse-polarity** bracket: not *"is the verdict
+**M20 — `scripts/landing/` (`bulk.py`, `landability.py`, `rail-bg.sh` — the last a CLI over
+`scripts/rail-run.sh`, #2905) and `scripts/lane-guard.py` (242).** `lane-guard.py` is the **inverse-polarity** bracket: not *"is the verdict
 DONE-IDLE"* (a stale sample) but *"is there POSITIVE evidence that nothing is in flight"*, lane-local and
 re-runnable because the bulk classifier measured **88 s** for 27 lanes. That is the shape any `lane_status`
 used as a dispatch precondition needs, and §5's row 1 does not mention it.
