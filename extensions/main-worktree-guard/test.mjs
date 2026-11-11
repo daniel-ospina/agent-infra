@@ -2100,19 +2100,50 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       const mainKey = sharedResolveEffectiveRepo("git status", mainR)?.repoKey;
       const m2Gate = (cmd) => {
         const d = classifyGitCommandDetailed(cmd);
-        const gateVerb = d.verdict === "block:commit" ? "commit" : "push";
-        // round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS comes
-        // from the classifier's boundary-aware commit/push invocation hints
-        // (the replay counted a phantom `bash git -C <wt> commit` and
-        // worktree-exempted the real main commit).
-        let m2Eff = sharedResolveRepoFromInv(gateVerb === "commit" ? d.commitHints : d.pushHints, mainR);
-        // #596 round-4 (F2): null m2Eff under a block:commit/push verdict →
-        // resolve the session repo, mirroring index.ts's M2 arm fallback.
-        if (!m2Eff) m2Eff = sharedResolveEffectiveRepo("git status", mainR);
-        if (!m2Eff) return "no-eff";
-        if (m2Eff.isWorktree) return "wt-exempt";
-        const m2 = sharedDecideM2({ effectiveRepo: m2Eff, baseline: { repoKey: mainKey, branch: "feat/1" }, currentBranch: m2Eff.currentBranch, pushDst: d.pushDst, pushTargets: d.pushTargets, verdict: d.verdict, allowActive: false });
-        return m2?.block ? "block" : "allow";
+        // #605: mirror index.ts M2 — gate EVERY commit/push invocation, each
+        // resolved from ITS OWN classifier hints (+ a push's OWN targets), and
+        // block wins. A fully-VISIBLE `-C <wt>` LEAD used to resolve the whole
+        // command to its worktree, so the later OFF-baseline MAIN mutation was
+        // exempted (`git -C <wt> commit ; git commit` → ALLOW; the reversed
+        // order blocked). Same rule the round-4 M3 loop (#596) applies to
+        // branch-state mutations.
+        const muts = [
+          ...(d.commitMutations && d.commitMutations.length > 0
+            ? d.commitMutations
+            : (d.verdict === "block:commit" ? [{ verb: "commit", invVisible: true, hints: d.commitHints, targets: null, dst: null }] : [])),
+          ...(d.pushMutations && d.pushMutations.length > 0
+            ? d.pushMutations
+            : (d.verdict !== "block:commit" ? [{ verb: "push", invVisible: true, hints: d.pushHints, targets: d.pushTargets, dst: d.pushDst }] : [])),
+        ];
+        let sawMain = false;
+        for (const mu of muts) {
+          // #596 round-4 (reviewer P1 follow-up): the repo ALWAYS comes from the
+          // classifier's boundary-aware hints (the replay counted a phantom
+          // `bash git -C <wt> commit` and worktree-exempted the real main commit).
+          let m2Eff = mu.hints
+            ? sharedResolveRepoFromInv(mu.hints, mainR)
+            : (mu.invVisible === false ? sharedResolveEffectiveRepo("git status", mainR) : null);
+          // #596 round-4 (F2): null m2Eff → resolve the session repo, mirroring
+          // index.ts's M2 arm fallback.
+          if (!m2Eff) m2Eff = sharedResolveEffectiveRepo("git status", mainR);
+          if (!m2Eff) return "no-eff";
+          // #805: an UNRESOLVED target is never worktree-exempt (it must reach
+          // decideM2's fail-closed refusal), exactly as index.ts orders it.
+          if (m2Eff.isWorktree && !m2Eff.unresolvedTarget) continue;
+          sawMain = true;
+          const muVerdict = mu.verb === "commit"
+            ? "block:commit"
+            : (d.verdict === "block:force-push" ? "block:force-push" : "block:push");
+          const m2 = sharedDecideM2({
+            effectiveRepo: m2Eff, baseline: { repoKey: mainKey, branch: "feat/1" },
+            currentBranch: m2Eff.currentBranch,
+            pushDst: mu.verb === "push" ? (mu.dst ?? null) : d.pushDst,
+            pushTargets: mu.verb === "push" ? (Array.isArray(mu.targets) ? mu.targets : d.pushTargets) : d.pushTargets,
+            verdict: muVerdict, allowActive: false,
+          });
+          if (m2?.block) return "block";
+        }
+        return sawMain ? "allow" : "wt-exempt";
       };
       const m2a = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: off-baseline main commit + -C wt mutation tail → M2 BLOCK (commit repo)", m2a, "block");
@@ -2134,6 +2165,29 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       // not exempt the real OFF-baseline MAIN commit.
       const m2f = m2Gate(`sh -c "git -C \"${wtR}\" commit -m z" ; git commit -m x`);
       expectBool("#596 r4 P1a: invisible wt-payload commit lead + real off-baseline main commit → M2 BLOCK", m2f, "block");
+      // ── #605: the VISIBLE twin of the P1a hole ──
+      // commitHints/pushHints describe only the FIRST VISIBLE commit/push, so a
+      // fully-visible worktree-scoped LEAD supplied the ONLY resolved repo
+      // (a worktree) and decideM2 exempted the whole command: the real
+      // OFF-baseline MAIN commit / push of a foreign branch ran rc 0. The gate
+      // outcome must not depend on invocation ORDER (the reversed forms below
+      // blocked even before the fix). index.ts M2 now gates EVERY mutation, and
+      // a push is gated against ITS OWN refspecs.
+      const m2g = m2Gate(`git -C "${wtR}" commit -m z ; git commit -m x`);
+      expectBool("#605: visible wt-scoped commit LEAD + off-baseline MAIN commit → M2 BLOCK", m2g, "block");
+      const m2h = m2Gate(`git commit -m x ; git -C "${wtR}" commit -m z`);
+      expectBool("#605: control — same mutations in the reversed order → M2 BLOCK (order-independent)", m2h, "block");
+      const m2i = m2Gate(`git -C "${wtR}" push origin wtmain ; git push origin feat/other`);
+      expectBool("#605: visible wt-scoped push LEAD + off-baseline MAIN push → M2 BLOCK", m2i, "block");
+      const m2j = m2Gate(`git -C "${wtR}" push origin feat/1 ; git push origin feat/other`);
+      expectBool("#605: leading wt push naming the BASELINE branch cannot launder a MAIN push of a foreign one", m2j, "block");
+      // The other half of the same loop: per-invocation TARGETS. A MAIN push of
+      // the session's OWN branch stays allowed even when the LEAD names a
+      // different one, and an all-worktree compound is exempt (no false block).
+      const m2k = m2Gate(`git -C "${wtR}" push origin wtmain ; git push origin feat/1`);
+      expectBool("#605: wt lead + ON-baseline MAIN push (own refspec) → allow (targets are per-invocation)", m2k, "allow");
+      const m2l = m2Gate(`git -C "${wtR}" commit -m z ; git -C "${wtR}" commit -w`);
+      expectBool("#605: ALL-wt compound (both mutations -C <wt>) → wt-exempt (no false block)", m2l, "wt-exempt");
       execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
       const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");
