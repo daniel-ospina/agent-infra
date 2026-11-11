@@ -4259,6 +4259,50 @@ try {
   expectBool("B52j: the body walk reports WHICH paths came from a body (opaque-binary stand-down)",
     extractHeredocProgramScriptPaths(`bash <<EOF\necho hi\n"${sBodyHub}"\nEOF`).join("|") === sBodyHub &&
     extractHeredocProgramScriptPaths(`bash "${sBodyHub}"`).length === 0, true);
+  // ⛔ ROUND-2 P1 (blocking, and a REGRESSION against `main`): LAST fd-0 REDIRECT
+  // WINS. bash processes redirections LEFT TO RIGHT, so in `bash < /dev/null
+  // <<EOF` the HEREDOC replaces the earlier `<` as fd 0 — the body IS the
+  // program and `/dev/null` is never read as a script. The predicate read only
+  // the first `<` operand, so `program` was false, the body went unwalked, and
+  // the only path gated was `/dev/null` (a char device the content gate skips):
+  // measured ALLOWED for `bash < /dev/null <<EOF` + a hub-mutating body while
+  // `main` BLOCKED it (main resolved the body token by accident). Probes below
+  // are bash-verified: every one of them EXECUTES the body.
+  expectBool("B52k: `bash < file <<EOF` — the heredoc wins fd 0, so the BODY is the program (round-2 P1)", (() => {
+    const body = `echo hi\n"${sBodyHub}"`;
+    const clean = mkS("body-null.sh", "echo hi\n");
+    return extractScriptPath(`bash < /dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash 0</dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash -x < /dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash -s < /dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`sudo bash < /dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      // …and the SUPERSEDED `<` operand is not a script at all: the clean file
+      // is never read, so it must not appear in the resolved set.
+      !extractScriptPaths(`bash < ${clean} <<EOF\n${body}\nEOF`).includes(clean) &&
+      extractScriptPath(`bash < ${clean} <<EOF\n${body}\nEOF`) === sBodyHub;
+  })(), true);
+  // The MIRROR shape is the other direction of the same rule, and it must NOT
+  // move: there the FILE is the later redirect, so it is the program and the
+  // body is data.
+  expectBool("B52k-ii: `bash <<EOF < file` — the FILE is the later redirect, so the body is DATA (mirror control)",
+    extractScriptPath(`bash <<EOF < /dev/null\necho hi\n"${sBodyHub}"\nEOF`) === "/dev/null" &&
+    !extractHeredocProgramScriptPaths(`bash <<EOF < /dev/null\necho hi\n"${sBodyHub}"\nEOF`).includes(sBodyHub), true);
+  // ⛔ ROUND-2 P2 (new false-block, narrow): `bash -c '…' <<EOF` — the body is
+  // the `-c` PROGRAM's stdin DATA; nothing in it executes, so walking it can only
+  // over-block. `sawInline` returned a null path, and the old predicate read a
+  // null path as "no operand → the body is the program".
+  expectBool("B52l: an INLINE `-c` program's heredoc body is stdin DATA, not a program (round-2 P2)",
+    extractScriptPath(`bash -c 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`) === null &&
+    extractScriptPath(`bash -ec 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`) === null &&
+    extractScriptPath(`bash --command 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`) === null &&
+    extractScriptPaths(`bash -c 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`).length === 0 &&
+    extractHeredocProgramScriptPaths(`bash -c 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`).length === 0, true);
+  // …the SAME rule through a PIPE, where the consumer is after the `|` and the
+  // head is the data writer: a piped `-c` is DATA, a piped plain interpreter is
+  // a program (the pair is what makes each half discriminating).
+  expectBool("B52m: a PIPED `-c` consumer's body is DATA, while a piped interpreter's body is a program (round-2 P2)",
+    extractScriptPath(`cat <<'X' | bash -c 'cat >/dev/null'\necho hi\n"${sBodyHub}"\nX`) === null &&
+    extractScriptPath(`cat <<'X' | bash\necho hi\n"${sBodyHub}"\nX`) === sBodyHub, true);
 
   // ── Write gate (W) — resolveTargetTopLevel predicate ──
   const hubTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: hubR, encoding: "utf-8" }).trim());

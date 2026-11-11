@@ -10667,17 +10667,21 @@ const _PROGRAM_FRAME_WORDS = new Set([
 /**
  * Resolve the script FILE the simple command at `tokens[i0]` executes.
  *
- * Returns `{ path, next }`: `path` is the script operand (or null), and `next`
- * is the index a PROGRAM walk resumes from (the next command boundary). Only
- * `path` is read by `extractScriptPath`, so the command-line semantics are
- * exactly what they were — the resume index exists for the heredoc-body walk,
- * which must see every command in a program, not just the first (#523).
+ * Returns `{ path, next, stdinProgram }`: `path` is the script operand (or
+ * null), `next` is the index a PROGRAM walk resumes from (the next command
+ * boundary), and `stdinProgram` says whether the interpreter's program comes
+ * from STDIN at all — i.e. no script operand, no `-c`/`--command` inline
+ * string, no process-substitution operand, and no fd-0 FILE redirect left
+ * standing (#523 round-2). Only `path` is read by `extractScriptPath`, so the
+ * command-line semantics are exactly what they were — `next` and
+ * `stdinProgram` exist for the heredoc-body walk, which must see every command
+ * in a program and must know whether a body is that program (#523).
  * @param {string[]} tokens
  * @param {number} i0
- * @returns {{path: string|null, next: number}}
+ * @returns {{path: string|null, next: number, stdinProgram: boolean}}
  */
 function _scriptInvocationAt(tokens, i0) {
-  const done = (path, from) => ({ path, next: _nextScriptCommandAt(tokens, from) });
+  const done = (path, from) => ({ path, next: _nextScriptCommandAt(tokens, from), stdinProgram: false });
   // Reviewer round-5 P2 regression guard: basename matching must apply ONLY to
   // ABSOLUTE tokens (`/bin/sh`, `/usr/bin/env`). Matching a RELATIVE token's
   // basename retired the M4 script-content closure for colliding names —
@@ -10775,6 +10779,20 @@ function _scriptInvocationAt(tokens, i0) {
         // phantom path), and made the body's first token look like the script.
         if (n === "<" || n === "0<") {
           stdinOperand = tokens[j + 1]; // the stdin FILE — the program with -s, or with no script positional
+        } else if (/^(?:[0-9]+)?<<-?$/.test(n)) {
+          // (#523 round-2 P1) LAST fd-0 REDIRECT WINS. bash processes
+          // redirections LEFT TO RIGHT, so a heredoc opener AFTER an `<` file
+          // redirect REPLACES it as fd 0 — `bash < /dev/null <<EOF` feeds the
+          // BODY (the file is never read), so the earlier `<` operand is NOT a
+          // script and the body IS the program. Keeping the stale operand made
+          // `program` false, the body went unwalked, and the only path gated
+          // was `/dev/null` (a char device `_gateScriptPathContent` skips) —
+          // measured ALLOWED on the head for `bash < /dev/null <<EOF` +
+          // `/tmp/evil.sh` while `main` BLOCKED it: a regression, and exactly
+          // the defect #523 exists to close. The mirror shape is unaffected:
+          // in `bash <<EOF < /dev/null` the FILE is the later redirect and the
+          // `<` branch above has already overwritten the operand.
+          stdinOperand = null;
         }
         j += 2;
         continue;
@@ -10818,7 +10836,16 @@ function _scriptInvocationAt(tokens, i0) {
     // arg1` → f; arg1 is $1, #437 round-13 VGATE sub-case). A HEREDOC's operand
     // (its delimiter) is deliberately not a candidate — the program is the
     // body, resolved by `extractHeredocProgramScriptPaths` (#523).
-    return done(stdinOperand && !stdinOperand.startsWith("-") ? stdinOperand : null, i);
+    //
+    // `stdinProgram` is TRUE only when NOTHING else claims the program: a
+    // leftover fd-0 file operand means the file is the program (a heredoc that
+    // came earlier was then superseded), and `-c`/`<(` were returned above.
+    // This flag is what the #523 body predicate reads — `operand === null`
+    // alone was too coarse in both directions: it walked a `-c` program's STDIN
+    // DATA (over-block, round-2 P2) and, with the stale `<` operand above, it
+    // refused to walk the body a heredoc really feeds (fail-open, round-2 P1).
+    const stdinPath = stdinOperand && !String(stdinOperand).startsWith("-") ? stdinOperand : null;
+    return { path: stdinPath, next: _nextScriptCommandAt(tokens, i), stdinProgram: stdinOperand === null };
   }
   if (t === ".") { // `. script`
     const next = tokens[i + 1];
@@ -10826,6 +10853,45 @@ function _scriptInvocationAt(tokens, i0) {
   }
   if (/^\.{0,2}\//.test(t)) return done(t, i); // ./x.sh or /abs/x.sh direct execution
   return done(null, i);
+}
+
+/**
+ * Is the heredoc body on this opener line the PROGRAM its consumer runs (#523)?
+ *
+ * TRUE only when a SHELL interpreter consumes the body as its stdin PROGRAM:
+ * no script operand, no `-c`/`--command` inline string, no `<(` operand, and
+ * the deciding fd-0 redirect is the heredoc itself (see the last-redirect-wins
+ * note in `_scriptInvocationAt`). Both directions are measured shapes:
+ *
+ *  - `bash < /dev/null <<EOF` → TRUE. bash's redirections are processed left to
+ *    right, so the heredoc replaces the earlier `<` as fd 0; the file is never
+ *    read and the body executes. (Pre-fix: the stale `<` operand made this
+ *    FALSE, the body was not walked, and the defect #523 closes stayed open —
+ *    a regression against `main`, which resolved the body token by accident.)
+ *  - `bash -c 'echo hi' <<EOF` → FALSE. The body is the `-c` string's stdin
+ *    DATA; nothing in it executes, so walking it could only over-block.
+ *  - `cat <<'X' | bash` → TRUE, via the segment after the pipe: the CONSUMER is
+ *    the interpreter there, and a piped `-c` (`| bash -c 'cat'`) is DATA again.
+ *  - `cat <<EOF | python3` → FALSE: a code interpreter consumes the body as
+ *    CODE (the #627 surface, same as the head form `python3 <<PY`), never as a
+ *    shell program.
+ * @param {string} code the opener line, comment-stripped
+ * @param {string|null} kind `_wtHeredocKind(code)` — nothing is a program unless this is `"shell"`
+ * @returns {boolean}
+ */
+function _heredocBodyIsProgram(code, kind) {
+  if (kind !== "shell") return false;
+  // A pipeline's LAST stdin-consuming interpreter decides. The split mirrors
+  // `_wtLinePipesToInterpreter` (same naive-but-conservative splitting, so the
+  // two never disagree about WHETHER an interpreter consumes the body).
+  const segs = String(code).split("|");
+  for (let k = 1; k < segs.length; k++) {
+    const interp = _wtHeadInterpreter(segs[k]);
+    if (interp === null) continue;
+    if (!_WT_SHELL_WORDS.test(basename(String(interp)))) return false; // CODE consumer → #627 surface
+    return _scriptInvocationAt(_tokenize(segs[k]), 0).stdinProgram === true;
+  }
+  return _scriptInvocationAt(_tokenize(code), 0).stdinProgram === true;
 }
 
 /**
@@ -10873,10 +10939,12 @@ function _heredocSplitForScripts(command) {
     if (delim !== null) {
       const kind = _wtHeredocKind(code);
       // `bash <<EOF script.sh` — the operand IS the script and the body is its
-      // stdin DATA (probe-verified against real bash). Only a body with NO
-      // script operand on its header line is the interpreter's program.
-      const operand = kind === "shell" ? _scriptInvocationAt(_tokenize(code), 0).path : null;
-      pending = { delim, kind, program: operand === null, buf: [] };
+      // stdin DATA (probe-verified against real bash). Only a body a shell
+      // interpreter reads as its stdin PROGRAM is walked: `_heredocBodyIsProgram`
+      // owns the whole predicate (no script operand, no `-c` inline string, no
+      // process substitution, last-fd-0-redirect-wins), because each of those
+      // parts was a separate measured hole (#523 round-2 P1/P2).
+      pending = { delim, kind, program: _heredocBodyIsProgram(code, kind), buf: [] };
     }
   }
   // Unterminated heredoc: bash feeds the rest of the text to the interpreter as

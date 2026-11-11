@@ -510,6 +510,22 @@ async function partB() {
       blocked(await bash(`bash <<EOF\n"${caseEvil}"\nEOF`, hub)), "was allowed");
     expectTrue("B7l (#523) control: the SAME script run with an explicit non-matching arg stays ALLOWED (reachability still works)",
       allowed(await bash(`bash "${caseEvil}" --status`, hub)), "was blocked");
+    // ⛔ ROUND-2 P1 — the `< file <<EOF` REGRESSION (measured ALLOWED on the pre-fix
+    // head, BLOCKED on `main`): bash processes redirections LEFT TO RIGHT, so the
+    // HEREDOC wins fd 0, the body executes, and the earlier `<` file is never read
+    // as a script. The predicate read only that first operand, so the body went
+    // unwalked and the only gated path was `/dev/null` (a char device the content
+    // walk skips). `bash < /dev/null <<EOF` is an ordinary idiom, so this was
+    // reachable by accident as well as deliberately.
+    expectTrue("B7m (#523 round-2 P1): `bash < /dev/null <<EOF` — the HEREDOC wins fd 0, so the body is the program → BLOCKED",
+      blocked(await bash(`bash < /dev/null <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-2 P2 — the over-block direction of the same predicate: a `-c`
+    // program's heredoc is its stdin DATA (nothing in it executes), so walking it
+    // would only gate a file that is never run. Paired with B7m, the two arms are
+    // what prove the predicate keys on WHERE THE PROGRAM COMES FROM, not on
+    // "is there a redirect".
+    expectTrue("B7n (#523 round-2 P2) control: a `-c` program's heredoc body is its stdin DATA → ALLOWED",
+      allowed(await bash(`bash -c 'cat >/dev/null' <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was blocked");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });

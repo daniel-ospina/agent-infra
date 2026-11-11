@@ -2451,14 +2451,29 @@ DELIMITER and the rest of the program: measured fail-OPEN with them, since
 `case "$1" in "") git reset --hard` branch as unreachable while the body really
 calls the script with NO args and runs it. Unknown argv makes the reachability
 filter bail and the whole script gate.
-**Declared residuals of this arm** (each fails toward gating, never away): the
-command LINE itself still contributes ONE script (the one-script-per-command-line
-class is #3538, unchanged here); a `<<` terminator is matched with `trim()`
-(the M5 precedent), so a space-padded terminator ends the body here while bash
-keeps it open — which can only expose MORE text to the walk, not less; two
-heredocs on ONE header line are handled one at a time (the `_wtScanLine`
-contract); and a body that WRITES a script and then executes it is not
-statically followable (the same class as Residual 1/3 in the discard section).
+Which fd 0 wins is `bash`'s rule, not a guess: redirections are processed LEFT to
+RIGHT, so the LAST one on the line decides. `bash < /dev/null <<EOF` feeds the
+BODY (the file is never read — the body is the program, and the superseded `<`
+operand is not a script), while `bash <<EOF < /dev/null` feeds the FILE (the body
+is data). Both directions are pinned. A `-c`/`--command` inline string is not a
+program source for the body either: `bash -c '…' <<EOF` gives the body to the
+`-c` string as stdin DATA, so walking it could only over-block — the predicate
+follows where the program COMES FROM (no script operand, no inline string, no
+process substitution, last fd-0 redirect is the heredoc), which is the same rule
+through a pipe (`cat <<'X' | bash` → program; `| bash -c '…'` → data).
+**Declared residuals of this arm** (declared in #523's scope; ⛔ NOT all of them
+fail toward gating — two are measured fail-AWAY and are listed as such rather
+than as a comfort): the command LINE itself still contributes ONE script (the
+one-script-per-command-line class is #3538, unchanged here); a `<<` terminator is
+matched with `trim()` (the M5 precedent), so a space-padded terminator ends the
+body here while bash keeps it open — which can only expose MORE text to the walk,
+not less; two heredocs on ONE header line are handled one at a time (the
+`_wtScanLine` one-heredoc-per-line contract), so `bash <<A; bash <<B` runs B's
+body while this walk resolves no path for it — **fail-AWAY, measured**; the
+nested-body walk is depth-bounded at two levels (`_programScriptPaths`), so a
+four-level heredoc nest runs and resolves nothing — **fail-AWAY, measured**; and
+a body that WRITES a script and then executes it is not statically followable
+(the same class as Residual 1/3 in the discard section).
 
 ## What it does NOT fix
 
