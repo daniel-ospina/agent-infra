@@ -4851,6 +4851,62 @@ function _foldBacktickSubstitutions(body) {
  *  behaviour reported `["$(echo"]`, equally phantom). */
 const _SUBST_PLACEHOLDER = "\u0000SUBST";
 
+/** Sentinels for a QUOTED or ESCAPED parenthesis (`_maskQuotedParens`).
+ *
+ * ⛔ QUOTED PARENS ARE DATA, NOT OPERATORS (fresh-context review round 4, P2). `_tokenize` is
+ * quote-aware for WORD CONTENTS but it STRIPS the quotes, so a word that is exactly `")"` arrives at
+ * `_pushSegmentTokens` as the token `)` — indistinguishable from the shell operator. That token then
+ * hit the span-closer leg with `depth === 0` and ENDED the segment, discarding the delete flag:
+ * `git push origin -o ")" -d held/branch` returned `[]` where `origin/main` returned
+ * `["held/branch"]`, so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was
+ * ALLOWED — the fourth mirror-shape of the rounds 1-3 class (redirect-as-boundary,
+ * opener-as-terminator, span-word-as-filename, now quote-erasure). `\)` erases the same way.
+ *
+ * The mask is 1:1 in LENGTH on purpose: `_foldBacktickSubstitutions` slices the body BY INDEX, so a
+ * length-preserving substitution keeps its indices valid. Every token is unmasked before it is
+ * returned, so a genuinely quoted ref name that contains a paren is unaffected.
+ */
+const _QP_L = "\u0001QPL";
+const _QP_R = "\u0001QPR";
+
+/** Replace quoted/escaped `(` and `)` with sentinels, mirroring `_tokenize`'s own rules EXACTLY:
+ * a backslash escapes the next char always outside quotes and only inside DOUBLE quotes (POSIX), and
+ * inside single quotes it is literal. Length-preserving (see `_QP_L`).
+ * @param {string} body
+ * @returns {string}
+ */
+function _maskQuotedParens(body) {
+  const swap = (c) => (c === "(" ? _QP_L : c === ")" ? _QP_R : c);
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      if (ch === quote) { quote = null; out += ch; continue; }
+      if (ch === "\\" && quote === '"' && i + 1 < body.length) {
+        out += ch + swap(body[i + 1]); i++; continue;
+      }
+      out += swap(ch);
+      continue;
+    }
+    if (ch === "\\" && i + 1 < body.length) {
+      out += ch + swap(body[i + 1]); i++; continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; out += ch; continue; }
+    out += ch;
+  }
+  return out;
+}
+
+/** Restore the parens `_maskQuotedParens` replaced.
+ * @param {string} tok
+ * @returns {string}
+ */
+function _unmaskQuotedParens(tok) {
+  if (typeof tok !== "string" || tok.indexOf("\u0001") === -1) return tok;
+  return tok.split(_QP_L).join("(").split(_QP_R).join(")");
+}
+
 /**
  * Does this redirect operator CONSUME the next shell word as its operand?
  * `>`, `>>`, `<`, `<<` and their fd-prefixed forms take a filename. Only these are REACHABLE here:
@@ -4880,8 +4936,9 @@ function _redirectTakesOperand(tok) {
  * (`-d 'feat/x)'` is the real ref `feat/x)`). Three rules bound the segment, and each was measured
  * against a fail-open this helper shipped or inherited:
  *
- *   1. `_SHELL_OPS` (`&& || | & ;`) ends it — a real list separator. NOT `(` / `)`: those are
- *      handled by rule 3.
+ *   1. `_SHELL_OPS`'s LIST SEPARATORS (`&& || | & ;`) end it. The set also contains `(`/`)`, but
+ *      those two are intercepted by rule 3 before this test is reached, so only the separators fire
+ *      here.
  *   2. A REDIRECT is NOT a boundary (round-1 review P1): `_isRedirectOperator` states that a
  *      redirect may appear ANYWHERE in a simple command, so breaking at `>` truncated the argument
  *      list being scanned — `git push origin 2>/dev/null -d held/branch` gave `[]` where origin/main
@@ -4893,11 +4950,15 @@ function _redirectTakesOperand(tok) {
  *      something started before `git push` (`… && (git push origin -d b)`) and DOES end it, which is
  *      #504 itself.
  *      Backticks are folded first by `_foldBacktickSubstitutions` (rule 3's string-level twin).
+ *   4. Only an UNQUOTED paren is an operator (round-4 review P2). `_tokenize` strips quotes, so a
+ *      word that is exactly `")"` reached rules 1-3 as the token `)` and ended the segment;
+ *      `_maskQuotedParens` neutralises quoted/escaped parens before tokenizing and every token is
+ *      unmasked on the way out, so quoted DATA can never drive the span rules.
  * @param {string} body raw text after the `git push` word
  * @returns {string[]}
  */
 function _pushSegmentTokens(body) {
-  const toks = _tokenize(_foldBacktickSubstitutions(body));
+  const toks = _tokenize(_foldBacktickSubstitutions(_maskQuotedParens(body)));
   const tokens = [];
   let depth = 0; // parens OPENED inside this segment: their span is one WORD, not a boundary
   for (let i = 0; i < toks.length; i++) {
@@ -4929,7 +4990,7 @@ function _pushSegmentTokens(body) {
       continue;
     }
     if (depth > 0) continue; // inside a substitution span — its words are not this command's argv
-    tokens.push(t);
+    tokens.push(_unmaskQuotedParens(t));
   }
   // An UNCLOSED span stays dropped: its closer is outside anything this segment can see, so no word
   // after it could be attributed. Words collected BEFORE the span are kept (the flag/target survive).

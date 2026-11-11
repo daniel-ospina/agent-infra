@@ -1087,12 +1087,17 @@ wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -
 // looked up `refs/heads/b)` and found nothing checked out: the #73 block that
 // protects a sibling-held branch ALLOWED the delete (probe-verified end-to-end
 // from a linked worktree, where M2 is exempt). The segment is now tokenized
-// with the module's quote-aware splitter (`_tokenize`) and bounded by three rules:
-//   1. `_SHELL_OPS` WITHOUT the parens (`&& || | & ;`) ends the segment;
+// with the module's quote-aware splitter (`_tokenize`) and bounded by four rules:
+//   1. `_SHELL_OPS`'s LIST SEPARATORS (`&& || | & ;`) end the segment. The set also contains `(`/`)`,
+//      but those are intercepted by rule 3 FIRST, so only the separators fire here — the parens are
+//      NOT "excluded from ending a segment": an unquoted closer with no opener DOES end it (rule 3).
 //   2. a redirect is NOT a boundary — the token is skipped with its filename operand;
 //   3. a span that OPENS inside the segment (`$( … )`, `<( … )`, `<backtick>…<backtick>`) is one WORD:
 //      its contents are skipped and the scan CONTINUES, while a `)` / unpaired backtick with no
-//      opener inside the segment ends it (that is the #504 case itself).
+//      opener inside the segment ends it (that is the #504 case itself);
+//   4. only an UNQUOTED paren is an operator — quoted/escaped ones are DATA (`_tokenize` strips
+//      quotes, so `-o ")"` used to arrive as the operator token `)` and end the segment: round-4
+//      fail-open, the same #73 hazard). See `_maskQuotedParens`.
 // (An earlier revision of this comment named `_truncateAtUnquotedBacktick` and claimed `(` ends a
 // segment; that function no longer exists and the claim was backwards — it described exactly the
 // round-2 fail-open. Corrected in place, see round-3 review finding.)
@@ -1139,6 +1144,21 @@ wcdt("the redirect's filename is not an argv word", "block:push", "git push orig
 // `git push origin <(cat f) -d b` → null where origin/main → ["b"].
 wcdt("a process-substitution WORD before the flag", "block:push", "git push origin <(cat f) -d b", ["b"]);
 wcdt("an OUTPUT process-substitution WORD before the flag", "block:push", "git push origin >(cat f) -d b", ["b"]);
+// ⛔ A QUOTED PAREN IS DATA, NOT AN OPERATOR (fresh-context review round 4, P2). `_tokenize` is
+// quote-aware for WORD CONTENTS but it STRIPS the quotes, so a word that is exactly `")"` arrives as the
+// token `)` — indistinguishable from the shell operator. It then hit the span-closer leg with depth 0 and
+// ENDED the segment while the delete flag was still ahead of it: `git push origin -o ")" -d b` → []
+// where origin/main → ["b"], so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was
+// allowed in BOTH the full path and the degraded arm. Fourth mirror-shape of the rounds 1-3 class.
+// Quote-state is now carried through tokenization by masking quoted/escaped parens (`_maskQuotedParens`).
+wcdt("a QUOTED close-paren before the flag is data", "block:push", `git push origin -o ")" -d b`, ["b"]);
+wcdt("a QUOTED open-paren before the flag is data", "block:push", `git push origin -o "(" -d b`, ["b"]);
+wcdt("an ESCAPED close-paren before the flag is data", "block:push", "git push origin -o \\) -d b", ["b"]);
+wcdt("a quoted paren INSIDE a span keeps the flag", "block:push", `git push $(echo ")") origin -d b`, ["b"]);
+// …and the masking must be REVERSIBLE: a ref name that legitimately contains a (quoted) paren is
+// restored, not mangled by the sentinel.
+wcdt("a QUOTED paren in the TARGET survives masking", "block:push", `git push origin -d "x)"`, ["x)"]);
+wcdt("an ESCAPED paren in the TARGET survives masking", "block:push", "git push origin -d b\\)", ["b)"]);
 // An UNRESOLVABLE target (a substitution in the delete-target position names no ref) must not become a
 // PHANTOM target: origin/main reported `["$(echo"]` / `["`cat"]`, which no ref can match either. The
 // placeholder is dropped, so the extractor says "nothing resolvable" instead of inventing a name.

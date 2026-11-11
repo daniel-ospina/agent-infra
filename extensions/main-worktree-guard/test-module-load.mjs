@@ -466,6 +466,12 @@ async function partB() {
       const d11 = await coord("d11", "git push origin HEAD:refs/heads/feat && git push origin -d 2>/dev/null held/branch");
       expectTrue("B73k: a redirect BETWEEN the delete flag and its target keeps the target",
         isCoordBlock(d11, "held/branch"), `handler returned ${JSON.stringify(d11)?.slice(0, 200)}`);
+      // ⛔ A QUOTED PAREN IS DATA, NOT AN OPERATOR (round-4 review, P2): `_tokenize` strips the quotes, so
+      // a word that is exactly `")"` reached the segment helper as the token `)` and ended the segment
+      // before the delete flag — the #73 arm never fired and the sibling-held branch was deletable.
+      const d12 = await coord("d12", "git push origin HEAD:refs/heads/feat && git push origin -o \")\" -d held/branch");
+      expectTrue("B73l: a QUOTED `)` before the delete flag does not hide the delete (quote erasure)",
+        isCoordBlock(d12, "held/branch"), `handler returned ${JSON.stringify(d12)?.slice(0, 200)}`);
       // Positive controls — the boundary fix must not invent targets: a delete of
       // a branch NOBODY has checked out stays allowed, and so does a plain
       // compound push (the #73 arm must not fire on it).
