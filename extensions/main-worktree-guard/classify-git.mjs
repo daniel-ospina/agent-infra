@@ -4072,6 +4072,13 @@ function _splitAliasValue(value) {
  * subcommand, or a typo, and in all three cases the guard cannot know what it
  * runs (fail closed — the M3 gate refuses it in a shared main checkout, and the
  * command can never launder a benign-force carve-out).
+ *
+ * NAMED RESIDUAL: a visible alias is expanded even though an INSTALLED
+ * `git-<name>` would win over it (git's measured precedence is builtin >
+ * external command > alias). Expansion is the over-approximation that keeps a
+ * benign `git lg` usable; the residual needs an external `git-<name>` whose name
+ * collides with an alias defined in the SAME command. Builtin-named definitions
+ * are the dangerous half of that rule and ARE dropped — see below.
  * @param {Array<object>} invocations
  * @returns {Array<object>}
  */
@@ -4080,6 +4087,14 @@ function _expandAliasInvocations(invocations) {
   const defs = new Map();
   for (const inv of invocations) {
     for (const [name, value] of _aliasDefsFromInvocation(inv)) {
+      // ⛔ GIT'S PRECEDENCE, MEASURED (git 2.43): builtin > `git-<cmd>` on PATH
+      // > alias. `git -c alias.reset=status reset --hard` runs the BUILTIN
+      // `reset --hard` (probe-verified; the alias is never consulted, and an
+      // installed `git-foo` likewise wins over `alias.foo`). Expanding a
+      // builtin-named definition would therefore classify a destructive command
+      // as whatever the IGNORED alias value says — a false ALLOW
+      // (`reset --hard` read as `status`). Such a definition is dropped.
+      if (GIT_BUILTIN_COMMANDS.has(name)) continue;
       if (!defs.has(name)) defs.set(name, value);
       else if (defs.get(name) !== null && value === null) defs.set(name, null); // any opaque def → opaque
     }
