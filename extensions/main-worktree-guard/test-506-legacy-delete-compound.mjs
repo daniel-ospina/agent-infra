@@ -278,6 +278,21 @@ if (typeof stripTypeScriptTypes !== "function" ||
     { id: "B13b", dir: "wt", expect: "allow",
       cmd: 'git commit -m "revert: stop running git push origin --delete main"',
       why: "review finding 1: the spellings must not split — the `--delete` twin stays allowed too" },
+    // ── review round 4: the arm must sit ABOVE the ownership allowance's admit ──
+    // A `block:branch-force-delete` compound is admitted by the allowance
+    // (targets ⊆ baseline ∪ pid-owned) before any arm below it can run, so while
+    // the #506 arm sat lower, the delete half lost #73 entirely. These two rows
+    // are the reachable discriminator: the hub session's OWN baseline name is a
+    // target the allowance admits, and the hub holding it is exactly what #73
+    // exists to refuse.
+    { id: "B15", dir: "hub", expect: "block", marker: "checked out in",
+      cmd: "git branch -D main; git push origin --delete main",
+      why: "ordering pin: the delete half must reach #73 BEFORE the allowance admits the compound " +
+           "(pre-hoist this was ADMITTED and the hub's own branch lost its upstream)" },
+    { id: "B15b", dir: "hub", expect: "block", marker: "(branch-force-delete)",
+      cmd: "git branch -D stale; git push origin --delete stale",
+      why: "ordering control: with a target held NOWHERE the #73 check adds nothing and the legacy " +
+           "arm still owns the verdict — the hoist did not turn the class into a #73 block" },
     // ── the EXTRACTOR FALLBACK's own pin (mutant 5) ──
     { id: "B14", dir: "wt", expect: "block", marker: "checked out in",
       cmd: "git reset --hard && git push origin main && git push origin --delete held",
@@ -351,6 +366,23 @@ if (typeof stripTypeScriptTypes !== "function" ||
     expectTrue("B12: B10/B11 differ ONLY by the delete target's checked-out state",
       blocked(results.get("B10")) && results.get("B11") === undefined,
       `B10 → ${show(results.get("B10"))}; B11 → ${show(results.get("B11"))}`);
+
+    // ── the ORDERING implemented above is pinned structurally too ──
+    // The behavioural B15 row pins the outcome; this pins the placement that
+    // produces it, because a later edit can move one arm without changing any
+    // row's answer on the day (the allowance's kind map is the thing that would
+    // have to grow first). Read from the source text, not from behaviour.
+    {
+      const src = readFileSync(INDEX_TS, "utf8");
+      const armAt = src.indexOf("// ── #506: delete spelling inside a LEGACY-DESTRUCTIVE compound ──");
+      const allowAt = src.indexOf("// ── Ownership allowance (agent-infra main, own baseline branch) ──");
+      const admitAt = src.indexOf("return admitAfterM3(); // on-baseline or unverifiable-but-exempt");
+      expectTrue("O1: the #506 arm is placed ABOVE the ownership-allowance block (deny-wins order)",
+        armAt !== -1 && allowAt !== -1 && armAt < allowAt,
+        `arm@${armAt} allowance@${allowAt} — an admit is a RETURN, so anything below it is unreachable`);
+      expectTrue("O2: the allowance's admit still sits below both (the pin reads the real arm)",
+        admitAt !== -1 && armAt < admitAt, `arm@${armAt} admit@${admitAt}`);
+    }
 
     // ── The DEGRADED path (#506 review finding 2) ──
     // A tree WITHOUT shared/branch-ownership.mjs: `branchOwnership` stays null, so
@@ -513,6 +545,26 @@ if (typeof stripTypeScriptTypes !== "function" ||
           // RED here means the commit was REFUSED on message text alone.
           redCheck: (r) => blocked(r) && String(r.reason ?? "").includes("checked out in"),
           expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B10", "B11", "B13b", "B14"],
+        },
+        {
+          // (8) THE HOIST REVERTED (review round 4): the arm is moved back below
+          // the ownership-allowance block, i.e. exactly where it sat when the
+          // bypass was measured. B15 must go RED — the compound is ADMITTED — and
+          // B15b stays green (the legacy arm still blocks it).
+          label: "delete arm moved below the ownership allowance",
+          file: "index.ts",
+          revert: (src) => {
+            const H = "      // ── #506: delete spelling inside a LEGACY-DESTRUCTIVE compound ──";
+            const E = "      // ── Ownership allowance (agent-infra main, own baseline branch) ──";
+            const D = "      // ── push --delete: retained #73 coordinated check (foreign targets) ──";
+            const a = src.indexOf(H), b = src.indexOf(E), c = src.indexOf(D);
+            if (a === -1 || b === -1 || c === -1 || !(a < b && b < c)) return src;
+            const block = src.slice(a, b);
+            return src.slice(0, a) + src.slice(b, c) + block + src.slice(c); // MUTANT: below the allowance
+          },
+          expectRed: ["B15"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B10", "B11", "B14", "B15b"],
         },
         {
           // (7) THE hasPush FLAG NEVER SET (classifier half of finding 2): the flag
