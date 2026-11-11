@@ -908,6 +908,38 @@ else
   ck "B13y …on the FILESYSTEM too: a store behind a real chmod-000 parent is unreadable, not empty ('$_ra')" $rc
 fi
 chmod 755 "$REALANC/parent"
+# ⛔ AND THE WALK'S OWN HEADER WAS WIDER THAN THE WALK (review round 26, P3, measured): it claimed "only
+# absolute paths are walked" and NO such guard existed — any value containing `/` was walked, relative
+# included. The walk is KEPT and the header corrected (see the function), so this arm PINS WHICH of the two
+# the code does rather than leaving the claim to prose: a relative multi-component store path behind a
+# component this read cannot search answers `unreadable`, resolved against THIS process's cwd. Reverting to
+# the documented-but-absent restriction (`case "$a" in /*) ;; *) return 1 ;; esac`) reddens this row.
+# ⛔ AND THE ROW IS A DECLARED RESIDUAL, NOT A DESIRABLE: `gh` would resolve the same relative value against
+# the LANE's cwd, so a relative ambient `GH_CONFIG_DIR` can name a blind ancestor the lane's `gh` never sees.
+# It is pinned so the limitation is a measured fact (the module header and README row name it) and cannot be
+# silently "tidied" back into an unenforced claim.
+RELSTORE="$TMP/store-relanc"; mkdir -p "$RELSTORE/sub/blind/store"
+_rl="$(cd "$RELSTORE" && u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_searchable() { [ \"\$1\" = 'sub/blind' ] && return 1; [ -x \"\$1\" ]; }; _gh_auth_store_in 'sub/blind/store'")"
+[ "$_rl" = unreadable ]; rc=$?
+ck "B13z …a RELATIVE multi-component store path IS walked (resolved against this process's cwd) and its blind ancestor is UNREADABLE ('$_rl')" $rc
+# ⛔ AND AN ANCESTOR THAT IS NOT A DIRECTORY IS ABSENT, NOT A DOOR (round 26, measured): round 25's predicate
+# was `[ -e "$a" ] && ! _gh_auth_searchable "$a"`, so a plain regular file ancestor was graded by its EXEC
+# BIT — `unreadable` at 644 ("fix those PERMISSIONS") and `empty` at 755 about the SAME file. A file cannot
+# contain a store, so both readings must be `empty`, and the arm asserts both spellings for that reason.
+FILEANC="$TMP/store-fileanc"; mkdir -p "$FILEANC"; : > "$FILEANC/blocker-644"; : > "$FILEANC/blocker-755"
+chmod 644 "$FILEANC/blocker-644"; chmod 755 "$FILEANC/blocker-755"
+_fa644="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$FILEANC/blocker-644/store'")"
+_fa755="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$FILEANC/blocker-755/store'")"
+[ "$_fa644" = empty ] && [ "$_fa755" = empty ]; rc=$?
+ck "B13za …and a store path under a plain FILE ancestor is EMPTY at 644 ('$_fa644') and at 755 ('$_fa755') — a file cannot hold a store, and the exec bit must not decide" $rc
+# ⛔ AND THAT DOOR IS THE DANGLING-SYMLINK ANCESTOR — round 25's dangling STORE one layer up (round 26,
+# measured): behind a symlink to an unmounted volume, `-e` is FALSE for every component, so the walk skipped
+# it and the cause told the operator to create a store on a path that is pointed at that volume. Built without
+# `chmod`, so it runs at ANY uid.
+SYMANC="$TMP/store-symanc"; mkdir -p "$SYMANC"; ln -sfn /nonexistent-volume "$SYMANC/vol"
+_sa="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$SYMANC/vol/.config/gh'")"
+[ "$_sa" = unreadable ]; rc=$?
+ck "B13zb …and an ancestor that is a DANGLING SYMLINK is that same door, not an absent store ('$_sa')" $rc
 
 # ⛔ READABILITY IS PINNED ON **EVERY** STORE ARM, NOT JUST `home` AND `ambient` (review round 17, P2):
 # flipping the predicate back to `[ -f ]` in the `keys` arm ALONE left the suite green, and on a
