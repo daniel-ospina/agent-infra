@@ -162,37 +162,79 @@ while nothing happened:
   established is a lane that can never be counted or reaped.
 - **the beat is written by every tick that ran**, including a skip — a skip is the normal steady state,
   and a beat written only after a dispatch would make a correctly-idle job read `LATE` for ever.
-- **a worktree is removed only when nothing is still working in it.** A signal to the TICK says nothing
-  about the lanes (a `bootout`, a reboot, a Ctrl-C on a hand-run copy), and the tick backgrounds them
-  before it returns — so the normal path is *leave*, and the next tick's settle removes the tree.
-  ⛔ **A DEAD PIDFILE IS NOT A DEAD LANE** (agent-infra#2787, MEASURED 2026-10-25): a tick removed a
-  lane's checkout TWO MINUTES after launching it into a `cap=3000s` lane, and the worker kept running
-  with `getcwd: cannot access parent directories`. The recorded pid
-  (`$AI/state/lanes/<name>.pid`, and `<wt>.lane-pid` beside the tree) is whatever process the
-  DISPATCHER chose to name — a fact about that process, never about the lane — so removal now needs the
-  reaper's own proof first, exactly as `scripts/pi-reap-worktrees.sh` requires for its own reclaim:
-  * a process whose **argv names the checkout**, or whose **cwd is inside it** (`wt_live_holders`, from
-    `wt-lifecycle.sh` — `$O` first, then beside the drainer, and the first candidate that actually
-    *defines* the verb wins: a stale `$O` copy no longer discards a good one beside the script. A
-    module that cannot answer at all is *named*, never read as "no holders");
-  * plus a `/proc/<pid>/cwd` witness where `/proc` exists. This is not redundant: a real holder is a
-    `pi -p … <brief>` lane whose argv never names the checkout, which only the cwd witness sees — and a
-    cell without `lsof` installs one witness fewer. It reads the **whole table once** (`ls -l
-    /proc/[0-9]*/cwd`, one `awk` pass) rather than forking a `readlink` per pid: measured 20 ms against
-    1.3 s over ~600 pids, and this probe runs on the common path — every ordinary reclaim, inside the
-    tick's lock. A table it could not read at all is `UNKNOWN`, never "no holder"; a partial table and
-    a cwd whose directory was already unlinked (` (deleted)` in the kernel's own link) are read, never
-    invented.
+- **a worktree is removed only when its LANE is provably gone** — which is not the same question as
+  "is the recorded pid gone", and conflating the two deleted live agents' checkouts (agent-infra#2800,
+  agent-infra#2787). `$O/bg/<name>.pid` is the dispatcher's **backgrounded subshell** and `pi` is that
+  subshell's **child**, so a subshell that dies alone (the OOM killer, an operator signalling the
+  recorded pid, a parent shell exiting under a dispatcher that does not `exec`) leaves a live agent
+  behind while `kill -0` reports the lane dead. A signal to the TICK says nothing about the lanes either
+  (a `bootout`, a reboot, a Ctrl-C on a hand-run copy), and the tick backgrounds them before it returns
+  — so the normal path is *leave*, and the next tick is what decides.
 
-  A tree that is still held is **kept**, and the lane is **not settled**: the tick logs
-  `KEEP: … (pid N) still holds it`, the record stands (so the verdict is still reported exactly once,
-  when the lane truly ends) and a later tick retries. A probe that **cannot be evaluated** keeps the
-  tree too — an unproven removal is the one thing this pass may not do. The same verdict is reused
-  rather than re-derived: those lanes count as **live** in the census (`held=N(pid-gone-checkout-held)`,
-  its own named instrument beside `dispatcher=`/`launcher=`) and keep their slice window, so a second
-  lane cannot be dispatched onto the same PRs. A tree with **no** sidecar is UNKNOWN and left alone.
-  A fresh checkout per lane with nothing removing it is ~72/day on a box that has been disk-bound, so
-  the reaper is not optional — and a reaper that guesses is worse than none.
+  Every removal therefore goes through **one gate**, `_release_wt`, and that gate asks **two witness
+  families**, because they are not interchangeable and a tree is removed only when **both** clear it:
+
+  * **no live holder of the checkout, asked two ways.** The witness is the **cwd**, not the parent
+    chain: a reparented child's `ppid` is 1, so the event that strands an agent also erases the evidence
+    of whose child it was, while its working directory survives (the dispatcher `cd`s into the lane's
+    checkout before it forks, and the path is unique per lane).
+    - `live-ownership.sh`'s `lo_cwd_rows` (`/proc` where the kernel exposes it, `lsof` otherwise) —
+      never a second copy of that parse.
+    - `wt_lifecycle.sh`'s `wt_live_holders`, resolved `$O` first and then beside the drainer, taking
+      the first candidate that actually *defines* the verb (a stale `$O` copy no longer discards a good
+      one beside the script); plus a `/proc/<pid>/cwd` witness where `/proc` exists, read as **one
+      table** (`ls -l /proc/[0-9]*/cwd`, one pass) rather than a `readlink` per pid — measured 20 ms
+      against 1.3 s over ~600 pids. This family is the one that sees an **argv-only** holder
+      (`pytest <wt>/tests`, `rsync src <wt>`, `bash -c "cd <wt> && …"`), whose cwd is elsewhere: a
+      module that cannot answer is therefore **not** readable as "no holders", even when the cwd
+      witness says "none" — an unproven removal keeps the tree.
+    Both probes exclude **this tick's own process chain**, so a tick hand-run from inside a lane tree
+    does not read itself as that lane's live holder and latch every reap for ever.
+  * **nothing that exists only on disk.** `git status --porcelain` empty, and a `git status` that could
+    not run is CANNOT-VERIFY, never clean. This is the repo's recorded posture (cleanliness is the
+    worktree safety property, #3888), and it is the conservative direction: a **dirty** checkout waits
+    for an operator, so a hold costs **disk instead of work**. Two readings that look alike are kept
+    apart on purpose: a directory with **no `.git`** at all holds no git state, so it is removed (that
+    is what stops the #1095 accumulation), while a checkout that **carries a `.git` it cannot read
+    through** — a re-cloned or moved seed repo, a pruned `worktrees/<id>` entry, an unmounted volume —
+    is CANNOT-VERIFY and is HELD: there the work is on disk and only the metadata is gone.
+
+  A held checkout is quarantined (`<wt>.lane-held`), named **once** on its transition (`HELD: …` with the
+  reading that refused and the lane's `$O/bg/<name>.end` record), counted once per tick, and
+  re-evaluated by every later tick — which removes it with `RELEASED: …` the moment every witness is
+  clear. `RELEASED:` means the tree is **gone**, not that a removal was attempted: if both mechanisms
+  fail (a busy mount, EPERM on a parent, a read-only fs) the tick logs
+  `WARN: could not remove the worktree at …`, the quarantine **stays** (`<wt>.lane-held` is deleted only
+  after the removal succeeded, and it is written even on a *first* sighting that failed to remove), and a
+  later tick retries — so a hold cannot be reported as over while the checkout is still on disk (#2800
+  review round 6).
+
+  A lane whose tree is still held is **not settled**: the record stands (so the verdict is still reported
+  exactly once, when the lane truly ends), it counts as **live** in the census
+  (`held=N(pid-gone-checkout-held)`, its own named instrument beside `dispatcher=`/`launcher=`) and it
+  keeps its slice window, so a second lane cannot be dispatched onto the same PRs. A tree with **no**
+  sidecar is UNKNOWN and left alone.
+
+  **Three outcomes, and the tick counts them separately**, because folding them together makes the
+  summary name a cause it did not measure: **removed** (`REAPED:`), **held** (a reading refused — the
+  live-holder or `git status` question), and **stuck** — the removal itself failed, which is a
+  permission/mount problem, not a hold (`STUCK: N leftover worktree(s) could NOT be removed …`).
+  `HELD:` is only ever printed for a genuine refusal, so an operator following it looks for a holder that
+  was actually measured rather than fixing the EPERM (#2800 review round 7).
+
+  The declared residuals: a holder that starts between a probe and the `rm` is not seen (the window is
+  one probe plus one `git status` wide — the process table is re-taken per removal, not once per settle
+  pass, so a stalled lane's status grace cannot stale a later tree's reading); a **gitignored** file is
+  not "work" for the cleanliness question, so a lane's `.venv`/`node_modules` cannot pin a checkout for
+  ever; and a box on which **every** holder witness is unavailable removes on cleanliness alone — logged
+  as `DEGRADED: the cwd witness is UNAVAILABLE`, never silently. A tree that is already quarantined and
+  still dirty (or still unreadable) is HELD from the cheap reading alone and costs no probe, so the
+  quarantine steady state does not pay a process-table scan per held tree per tick.
+
+  A fresh checkout per lane with nothing removing it is ~72/day on a box that has been disk-bound, so the
+  reaper is not optional — but **a reaper that guesses is worse than none**, which is what this gate is
+  for.
+
 - **the seed is a tick precondition, proven before the first lane.** `SEED_REPO` is checked once
   (`git rev-parse --git-dir`, then the `SEED_REF`), and a missing seed or ref refuses the tick **before**
   any brief, worktree, sidecar or record exists — so nothing is half-dispatched. The incident's tick
@@ -215,7 +257,13 @@ an unreadable `ps` (unknown is ALIVE), the generated brief is piped through the 
 `brief-gate.sh` (plus a non-vacuity arm in which the stripped brief MUST be refused), a lane's window is
 never re-issued while it is live (paired with a mutation that ignores the held set and must then
 re-issue it), an aborted launcher table fails the tick instead of reading as zero workers, and a settled
-lane's failure survives an at-target SKIP.
+lane's failure survives an at-target SKIP. Arm (t) drives the #2800 shape end to end — a lane whose
+recorded pid is **killed while its child lives with the checkout as its cwd** — and asserts the checkout
+survives, that the hold names the holder, that the same checkout IS released once the child exits, and
+that a **dirty** checkout whose lane is gone is held until an operator clears it (each paired with the
+release that proves the gate is not an inert keep-everything). Arm (t7) is the same class one layer out:
+a checkout whose `.git` file points at a gitdir that is **gone** answers rc=128 to `rev-parse` and
+`status` alike, and it is held (not `rm -rf`'d) because the work is still on disk.
 
 Arm (i2) is the #2787 register: a live worker whose cwd is in the checkout, with a **dead** recorded pid.
 The tick must keep the tree, keep the record, count the lane (`held=1`), keep its window, and reclaim it

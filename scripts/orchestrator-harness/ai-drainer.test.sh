@@ -103,6 +103,9 @@ chmod +x "$DISPATCH"
 #   RUN_PRESSURE    the Darwin `kern.memorystatus_vm_pressure_level` to assume (1|2|4|unreadable)
 #   RUN_MAX_PRESSURE  MAX_MEM_PRESSURE_LEVEL (the Darwin refuse-at threshold)
 #   RUN_WT_MOD      worker-terminal.sh for the launcher census     default: a path that does not exist
+#   RUN_LO_MOD      live-ownership.sh (the cwd witness, #2800)     default: resolved by the drainer
+#   RUN_LO_CWD_PROBE  the probe COMMAND lo_cwd_rows uses (ls / lsof)  default: resolved by the module
+#                   (a counting stub pins "one probe per removal", #2800 review round 2)
 #   RUN_CWD         the CWD one arm runs the drainer from          default: this suite's own CWD
 #                   (for the #3882 glob arm: the token split must not pathname-expand, and that can
 #                   only be OBSERVED from a CWD that holds lane-shaped filenames)
@@ -122,6 +125,8 @@ _drainer_env() { # <tag> → echoes the env assignments, one per line (callers u
     "MAX_MEM_PRESSURE_LEVEL=${RUN_MAX_PRESSURE:-}" \
     "WT_MOD=${RUN_WT_MOD:-$ROOT/no-such-worker-terminal.sh}" \
     "PROC_ROOT=${RUN_PROC_ROOT:-/proc}" "WTL=${RUN_WTL:-}" \
+    "LO_MOD=${RUN_LO_MOD:-}" \
+    "LO_CWD_PROBE=${RUN_LO_CWD_PROBE:-}" \
     "LANE_TIMEOUT=${RUN_LANE_TIMEOUT:-60}" "PS=${RUN_PS:-ps}" \
     "SLICE_WIDTH=${RUN_SLICE_WIDTH:-10}" "SLICE_TOTAL=${RUN_SLICE_TOTAL:-70}" \
     "FAKE_LANE_SECS=${FAKE_LANE_SECS:-0}" "FAKE_RC=${FAKE_RC:-0}" "FAKE_NO_PIDFILE=${FAKE_NO_PIDFILE:-0}" \
@@ -171,6 +176,8 @@ reset_run() {
   RUN_DRAINER_OS=; RUN_PRESSURE=; RUN_MAX_PRESSURE=
   RUN_FLEET_REPO=; RUN_NO_FLEET_REPO=0; RUN_SEED_REPO=; RUN_SEED_REF=; RUN_CAPACITY_MOD=; RUN_EXPECTED=
   RUN_PROC_ROOT=; RUN_WTL=
+  RUN_FLEET_REPO=; RUN_NO_FLEET_REPO=0; RUN_SEED_REPO=; RUN_CAPACITY_MOD=; RUN_EXPECTED=
+  RUN_LO_MOD=; RUN_LO_CWD_PROBE=
   FAKE_LANE_SECS=0; FAKE_RC=0; FAKE_NO_PIDFILE=0; FAKE_DISPATCH_SLEEP=0
 }
 # A lane-shaped live process in $O/bg, so the CENSUS sees it. A pidfile alone is not enough (the
@@ -1128,16 +1135,25 @@ else
   chmod 0755 "$I2_WT" 2>/dev/null; rm -rf "$I2_WT" 2>/dev/null
 fi
 
-# ── NON-VACUITY (HOLDER GATE): delete the gate and arm (i2) MUST fail ────────────────────────
+# ── NON-VACUITY (HOLDER GATE): delete BOTH witness families and arm (i2) MUST fail ──────────
 # The mutation is the DEFECT ITSELF — "a dead pidfile is a dead lane" — restored by deleting the gate
 # between the shipped markers. If (i2) still passed here, its kept checkout would be proving nothing
-# about the gate: every removal in `_rm_wt` would already be safe for some other reason.
+# about the gate: every removal would already be safe for some other reason.
+# ⛔ BOTH FAMILIES, BECAUSE THIS TREE HAS TWO REASONS TO SURVIVE (merge note, #2800 × #3918). Before the
+# two holder gates were fused, deleting this one was the WHOLE revert: `_rm_wt` was the only place a
+# holder was looked for. It is not any more — `_wt_holder` (the #2800 cwd witness) is a second, and it
+# keeps the tree on its own — so a mutant that removes only the first now proves nothing about either
+# and the two rows below would be asserting a behaviour they cannot observe. The mutant therefore
+# deletes the #2787 gate AND neuters the #2800 witness, which restores exactly the pre-#2800 behaviour
+# ("the recorded pid is dead, so the checkout is mine to delete").
 reset_run
 MUTG="$ROOT/ai-drainer-nogholder.sh"
 awk '/──8<── holder-gate/{inblk=1} !inblk{print} /──8<── \/holder-gate/{inblk=0}' "$DRAINER" >"$MUTG"
-check "mutation: the holder gate was removed from the copy (and _rm_wt survived it)" \
-  '[ -s "$MUTG" ] && ! grep -q "holder=\"\$(_drain_holder" "$MUTG" && grep -q "^_rm_wt() {" "$MUTG"' \
-  "gated=$(grep -c 'holder="\$(_drain_holder' "$MUTG" 2>/dev/null) rmwt=$(grep -c '^_rm_wt() {' "$MUTG" 2>/dev/null)"
+awk '/──8<── holder-gate/{inblk=1} !inblk{print} /──8<── \/holder-gate/{inblk=0}' "$DRAINER" \
+  | awk 'index($0, "_wt_holder \"$canon\"; rc=$?") > 0 { print "  rc=1"; next } { print }' >"$MUTG"
+check "mutation: BOTH holder witness families were removed from the copy (and _rm_wt survived it)" \
+  '[ -s "$MUTG" ] && ! grep -q "holder=\"\$(_drain_holder" "$MUTG" && ! grep -q "^  _wt_holder \"\$canon\"" "$MUTG" && grep -q "^_rm_wt() {" "$MUTG"' \
+  "gated=$(grep -c 'holder="\$(_drain_holder' "$MUTG" 2>/dev/null) wt_holder=$(grep -c '^  _wt_holder "\$canon"' "$MUTG" 2>/dev/null) rmwt=$(grep -c '^_rm_wt() {' "$MUTG" 2>/dev/null)"
 _i2_plant mv
 # ⛔ THE MUTANT RUN CARRIES THE SAME NON-ZERO STATUS ARM (i2) PLANTS, so this block PROVES the row above
 # can redden: with the gate deleted the record settles, the tick reports `FAIL: lane …` and exits 1 —
@@ -1151,6 +1167,434 @@ check "non-vacuity: …and the mis-settle IS reported as a FAILED lane (so the (
   'grep -q "FAIL: lane $I2_NAME" "$LAST_AI/logs/ai-drainer.log" && [ "$LAST_RC" -ne 0 ]' \
   "rc=$LAST_RC $(grep -E 'FAIL: lane|DONE: lane' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
 kill "$I2_HOLD" 2>/dev/null; wait "$I2_HOLD" 2>/dev/null
+# ── ARM (t): "PROVABLY DEAD" IS A QUESTION ABOUT THE LANE, NOT ABOUT ONE PID (agent-infra#2800) ──
+# ⛔ THE DEFECT THIS ARM EXISTS FOR. `$O/bg/<name>.pid` is the dispatcher's BACKGROUNDED SUBSHELL and
+# `pi` is that subshell's CHILD (both shipped dispatchers record `$!` of `( … run_agent … ) &`), so
+# `kill -0 <pid>` answers "is the subshell gone" — not "is the lane gone". When the subshell dies ALONE
+# (the OOM killer picking the larger-RSS member of the pair, an operator signalling the recorded pid, a
+# parent shell exiting under a dispatcher that does not `exec`) the agent survives, reparented away from
+# the pid the record names, and the tick's `git worktree remove --force` deleted the checkout it was
+# still writing in. The fixture IS that shape, and it is REAL processes — a subshell that forks a child
+# whose CWD is the checkout and is then SIGKILLed, leaving the child alive:
+#
+#     ( cd <wt> && { sleep 60 & echo $! >child.pid; wait; } ) &   # the "subshell" the pidfile names
+#     kill -9 <that subshell>                                     # → the child survives, reparented
+#
+# The child's `ppid` is 1 by then, so a parent-chain walk cannot find it; its CWD is the checkout, which
+# is the witness the gate actually uses.
+o="$ROOT/o-t"; ai="$ROOT/ai-t"; mkdir -p "$o/bg" "$ai/state" "$ai/state/lanes"
+wt_t="$ai/wt-drainer-ai-drain-888888-1-1"
+git -C "$SEED" worktree add -f "$wt_t" "$SEED_REF" >/dev/null 2>&1
+( cd "$wt_t" && { sleep 60 & printf '%s' "$!" >"$ROOT/t-child.pid"; wait; } ) &
+lane_t=$!
+echo "$lane_t" >>"$ROOT/pids"
+printf '%s' "$lane_t" >"$ai/state/lanes/ai-drain-888888-1-1.pid"
+printf '%s' "$lane_t" >"$wt_t.lane-pid"
+printf '0\n' >"$o/bg/ai-drain-888888-1-1.rc"      # the lane's outcome IS recorded (settle reports it)
+if wait_for_path "$ROOT/t-child.pid" 25; then
+  child_t="$(cat "$ROOT/t-child.pid" 2>/dev/null)"
+  kill -9 "$lane_t" 2>/dev/null                 # ⛔ SIGKILL: the subshell gets no chance to clean up
+  sleep 0.4
+  RUN_TARGET=0 run_drainer_fg t               # target 0: the settle/reap pass is the whole subject
+  check "(t1) a lane pid that is DEAD while its child lives in the checkout does NOT remove it" \
+    '[ -d "$wt_t" ]' "checkout gone — a live agent's tree was deleted"
+  check "(t1) …the child is alive and reparented (the fixture is the real shape, not a stubbed tree)" \
+    'kill -0 "$child_t" 2>/dev/null && [ "$(ps -o ppid= -p "$child_t" 2>/dev/null | tr -d " ")" != "$lane_t" ]' \
+    "child=$child_t ppid=$(ps -o ppid= -p "$child_t" 2>/dev/null | tr -d ' ')"
+  held_t="$(grep -m1 'HELD:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+  check "(t1) …the tick NAMES the holder and the reading that refused (pid $child_t, cwd witness)" \
+    "grep -qF 'LIVE process still holds it (pid $child_t has this checkout as its cwd)' <<<\"\$held_t\"" \
+    "held='${held_t:-<none>}'"
+  check "(t1) …and the lane is NOT settled while its checkout is held — the record STANDS, so its verdict is reported ONCE, when it truly ends" \
+    '[ -f "$ai/state/lanes/ai-drain-888888-1-1.pid" ] && ! grep -q "DONE: lane ai-drain-888888-1-1" "$LAST_AI/logs/ai-drainer.log"' \
+    "record=$( [ -f "$ai/state/lanes/ai-drain-888888-1-1.pid" ] && echo present || echo settled ) verdict-lines=$(grep -c 'DONE: lane ai-drain-888888-1-1' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+  check "(t1) …and the hold is DURABLE, not re-logged every tick (one HELD transition + one aggregate)" \
+    '[ "$(grep -c "HELD:" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)" -eq 2 ] && [ -f "$wt_t.lane-held" ]' \
+    "HELD lines=$(grep -c 'HELD:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null) marker=$( [ -f "$wt_t.lane-held" ] && echo yes || echo no )"
+  # ⛔ AND IT IS A TRANSITION, NOT A PER-TICK WARN (a WARN per tree per tick is how a reader learns to
+  # ignore the log — the same ruling this file's LEAVE line already records). A SECOND tick over the
+  # SAME held tree adds only the aggregate count: one per-tree line, in total, however long it stays.
+  RUN_TARGET=0 run_drainer_fg t
+  check "(t1) …a second tick adds only the COUNT (1 per-tree transition, 2 aggregates), never a re-WARN" \
+    '[ "$(grep -c "HELD: lane .* NOT removed" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)" -eq 1 ] && [ "$(grep -c "HELD: 1 leftover worktree(s) are quarantined" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)" -eq 2 ]' \
+    "transitions=$(grep -c 'HELD: lane .* NOT removed' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null) aggregates=$(grep -c 'leftover worktree(s) are quarantined' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+  # ── (t2) NON-VACUITY: the gate must not be an inert KEEP-EVERYTHING (the #1095 accumulation) ────
+  kill -9 "$child_t" 2>/dev/null                # the holder is gone; the checkout is still clean
+  sleep 0.4
+  RUN_TARGET=0 run_drainer_fg t
+  check "(t2) …once the holder is gone the SAME checkout IS released (the gate is not keep-everything)" \
+    '[ ! -d "$wt_t" ]' "checkout still present — the gate would accumulate for ever"
+  check "(t2) …and the log says the hold is OVER, so a quarantined tree has a visible end" \
+    'grep -q "RELEASED: .* the hold is over" "$LAST_AI/logs/ai-drainer.log"' \
+    "$(grep -E 'RELEASED|HELD' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -2 | tr '\n' ' ')"
+else
+  bad "(t1) the subshell/child fixture never started (no $ROOT/t-child.pid) — the #2800 arms did not run"
+fi
+
+# ── (t3) A DEAD LANE THAT LEFT UNCOMMITTED WORK IS HELD, NOT DELETED ────────────────────────────
+# The cwd witness can fail (no `/proc`, no `lsof`, a `hidepid` mount, a partial answer), so cleanliness
+# is the SECOND safety property and it is the one that actually protects work that exists only on disk.
+# A reaper that deletes a dirty checkout because a pid died is the report this issue is written from.
+wt_d="$ai/wt-drainer-ai-drain-888888-2-1"
+git -C "$SEED" worktree add -f "$wt_d" "$SEED_REF" >/dev/null 2>&1
+printf 'only-copy\n' >"$wt_d/WORK.md"                  # untracked, uncommitted, the only copy
+sleep 0 & dead_p=$!; wait "$dead_p" 2>/dev/null         # a pid that is PROVABLY gone
+printf '%s' "$dead_p" >"$ai/state/lanes/ai-drain-888888-2-1.pid"
+printf '%s' "$dead_p" >"$wt_d.lane-pid"
+printf '0\n' >"$o/bg/ai-drain-888888-2-1.rc"
+RUN_TARGET=0 run_drainer_fg t
+check "(t3) a DIRTY checkout whose lane is gone is NOT removed" \
+  '[ -d "$wt_d" ] && [ -f "$wt_d/WORK.md" ]' "the only copy of WORK.md was deleted"
+check "(t3) …and the hold names the uncommitted work it refused to destroy" \
+  'grep -q "UNCOMMITTED WORK (1 path(s), first: ?? WORK.md)" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep 'HELD:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+# ── (t4) NON-VACUITY: once an operator clears the work, the same checkout is reclaimed ────────────
+rm -f "$wt_d/WORK.md"
+RUN_TARGET=0 run_drainer_fg t
+check "(t4) …and once the work is cleared the same checkout IS reclaimed" \
+  '[ ! -d "$wt_d" ]' "checkout still present — a dirty hold would never end"
+
+# ── (t5) A MISSING CWD WITNESS IS NAMED, NEVER SILENT ───────────────────────────────────────────
+# No `/proc` AND no `lsof` is a shape whole boxes live in, and refusing every removal there would keep
+# every worktree for ever (#1095). So the removal proceeds on cleanliness alone — and says so, because
+# "clean, so it went" must not read as "nothing was still running in it".
+reset_run
+wt_e="$ai/wt-drainer-ai-drain-888888-3-1"
+git -C "$SEED" worktree add -f "$wt_e" "$SEED_REF" >/dev/null 2>&1
+sleep 0 & dead_e=$!; wait "$dead_e" 2>/dev/null
+printf '%s' "$dead_e" >"$ai/state/lanes/ai-drain-888888-3-1.pid"
+printf '%s' "$dead_e" >"$wt_e.lane-pid"
+printf '0\n' >"$o/bg/ai-drain-888888-3-1.rc"
+RUN_TARGET=0 RUN_LO_MOD="$ROOT/no-such-live-ownership.sh" run_drainer_fg t
+check "(t5) with no cwd witness a CLEAN checkout is still reclaimed (a degraded box does not freeze)" \
+  '[ ! -d "$wt_e" ]' "checkout still present"
+check "(t5) …and the tick NAMES the degradation instead of implying it checked everything" \
+  'grep -q "DEGRADED: the cwd witness is UNAVAILABLE" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep 'DEGRADED:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+
+# ── (t7) A CHECKOUT THAT CARRIES A `.git` IT CANNOT READ THROUGH IS HELD, NOT DELETED ─────────────
+# ⛔ THE #2800 REVIEW'S P0, and the arm that would have caught it. The first cut asked git
+# `rev-parse --git-dir` and treated a FAILURE as "not a git worktree, nothing to lose" — removable. But
+# a lane checkout whose `$SEED_REPO` was re-cloned or moved, or whose `worktrees/<id>` admin entry was
+# dropped (which this very file's `git worktree prune` can do), answers rc=128 to BOTH `rev-parse` and
+# `status`: the work is on disk and only the METADATA is gone. That short-circuit `rm -rf`'d the only
+# copy and logged "no uncommitted work". The fixture keeps the `.git` file and deletes what it points at.
+reset_run
+wt_g="$ai/wt-drainer-ai-drain-888888-4-1"
+git -C "$SEED" worktree add -f "$wt_g" "$SEED_REF" >/dev/null 2>&1
+printf 'only-copy\n' >"$wt_g/WORK.md"                 # the only copy — and git can no longer say so
+gdir_g="$(sed -n 's/^gitdir: //p' "$wt_g/.git" 2>/dev/null)"
+rm -rf "$gdir_g"                                       # the gitdir the checkout's .git file points at
+sleep 0 & dead_g=$!; wait "$dead_g" 2>/dev/null
+printf '%s' "$dead_g" >"$ai/state/lanes/ai-drain-888888-4-1.pid"
+printf '%s' "$dead_g" >"$wt_g.lane-pid"
+printf '0\n' >"$o/bg/ai-drain-888888-4-1.rc"
+check "(t7) the fixture really is 'has a .git, cannot read through it' (not git's happy path)" \
+  '[ -n "$gdir_g" ] && [ -e "$wt_g/.git" ] && ! git -C "$wt_g" rev-parse --git-dir >/dev/null 2>&1 && ! git -C "$wt_g" status --porcelain >/dev/null 2>&1' \
+  "gdir='$gdir_g' rev-parse rc=$( git -C "$wt_g" rev-parse --git-dir >/dev/null 2>&1; echo $? )"
+RUN_TARGET=0 run_drainer_fg t
+check "(t7) a checkout whose gitdir is unreachable is NOT removed (lost metadata is not lost work)" \
+  '[ -d "$wt_g" ] && [ -f "$wt_g/WORK.md" ]' "the only copy of WORK.md was deleted"
+check "(t7) …and the hold says its state could not be READ, never that the tree was clean" \
+  'grep -q "its state could not be read (git status rc=" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep 'HELD:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+
+# ── (t8) A STALE DEPLOYED WITNESS DOES NOT DISABLE THE CURRENT ONE (#2800 review round 2) ────────
+# ⛔ `$O/live-ownership.sh` is the DEPLOYED copy and `$SELF_DIR`'s is the canonical one; a partial
+# `deploy-harness.sh` re-seed leaves the deployed copy STALE (it predates `lo_cwd_rows`). Picking the
+# first candidate that merely EXISTS made the cwd witness unavailable for the whole tick, so a live
+# agent's checkout was released on CLEANLINESS ALONE. The fixture is (t1)'s real subshell/child shape
+# plus a stale `$O` module: the holder MUST still be found, through `$SELF_DIR`. Its own tag (u) keeps
+# its log separate — the other (t) arms run under tag `t` and (t5) deliberately logs DEGRADED there.
+reset_run
+o_u="$ROOT/o-u"; ai_u="$ROOT/ai-u"; mkdir -p "$o_u/bg" "$ai_u/state/lanes"
+cat >"$o_u/live-ownership.sh" <<'EOS'
+#!/usr/bin/env bash
+# a STALE deployed copy: it predates lo_cwd_rows
+lo_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+EOS
+wt_h="$ai_u/wt-drainer-ai-drain-888888-5-1"
+git -C "$SEED" worktree add -f "$wt_h" "$SEED_REF" >/dev/null 2>&1
+( cd "$wt_h" && { sleep 60 & printf '%s' "$!" >"$ROOT/t8-child.pid"; wait; } ) &
+lane_h=$!
+echo "$lane_h" >>"$ROOT/pids"
+printf '%s' "$lane_h" >"$ai_u/state/lanes/ai-drain-888888-5-1.pid"
+printf '%s' "$lane_h" >"$wt_h.lane-pid"
+printf '0\n' >"$o_u/bg/ai-drain-888888-5-1.rc"
+if wait_for_path "$ROOT/t8-child.pid" 25; then
+  child_h="$(cat "$ROOT/t8-child.pid" 2>/dev/null)"
+  kill -9 "$lane_h" 2>/dev/null
+  sleep 0.4
+  RUN_TARGET=0 run_drainer_fg u
+  check "(t8) a STALE deployed witness falls through to the current one — the live holder is still seen" \
+    '[ -d "$wt_h" ]' "checkout gone — the stale \$O copy disabled the witness and cleanliness alone released a held tree"
+  check "(t8) …and it did NOT report the box degraded (the witness it used was a working one)" \
+    '! grep -q "DEGRADED: the cwd witness is UNAVAILABLE" "$LAST_AI/logs/ai-drainer.log"' \
+    "$(grep 'DEGRADED:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+  kill -9 "$child_h" 2>/dev/null
+  sleep 0.4
+else
+  bad "(t8) the subshell/child fixture never started (no $ROOT/t8-child.pid) — the stale-witness arm did not run"
+fi
+
+# ── (t9) A TABLE THAT DOES NOT PARSE IS UNREADABLE, NOT "NOBODY IS HERE" (#2800 review round 2) ──
+# ⛔ The probe answering is NOT the same as its output being non-empty. A row-format drift made every
+# checkout look unheld while the state said `ok` and NO `DEGRADED` note was ever written — "nobody is
+# here" invented from "I could not read the table", the exact conflation `live-ownership.sh`'s
+# capture-first arms exist to prevent. A module that defines the probe and prints rubbish is the fixture.
+reset_run
+o_v="$ROOT/o-v"; ai_v="$ROOT/ai-v"; mkdir -p "$o_v/bg" "$ai_v/state/lanes"
+cat >"$o_v/live-ownership.sh" <<'EOS'
+#!/usr/bin/env bash
+# a witness whose TABLE does not parse: non-empty output, no <pid>\t<absolute-cwd> row
+lo_cwd_rows() { printf 'garbage-no-separator\n'; }
+EOS
+wt_p="$ai_v/wt-drainer-ai-drain-888888-6-1"
+git -C "$SEED" worktree add -f "$wt_p" "$SEED_REF" >/dev/null 2>&1
+sleep 0 & dead_p=$!; wait "$dead_p" 2>/dev/null
+printf '%s' "$dead_p" >"$ai_v/state/lanes/ai-drain-888888-6-1.pid"
+printf '%s' "$dead_p" >"$wt_p.lane-pid"
+printf '0\n' >"$o_v/bg/ai-drain-888888-6-1.rc"
+RUN_TARGET=0 run_drainer_fg v
+check "(t9) an unparseable process table is reported as a DEGRADED witness, never silently 'ok'" \
+  'grep -q "DEGRADED: the cwd witness is UNAVAILABLE" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -E 'DEGRADED:|REAPED:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -2 | tr '\n' ' ')"
+check "(t9) …and the degraded box still reclaims the clean checkout (it does not freeze)" \
+  '[ ! -d "$wt_p" ]' "checkout still present"
+
+# ── (t10) ONE PROBE PER REMOVAL — AND NONE FOR A TREE THE CHEAP READING ALREADY HOLDS ─────────────
+# Two behaviours, both introduced by round 2's P2s, pinned with a COUNTING probe stub (the suite's rule:
+# a probe is INJECTED, never read off the host):
+#   (a) two removals in ONE tick take TWO readings — the per-SITE memo this replaced took one, and the
+#       declared residual is "the window is one probe wide";
+#   (b) an already-quarantined DIRTY tree costs NONE on a later tick — otherwise the quarantine steady
+#       state is a full process-table scan per held tree per tick, for ever, for zero removals.
+reset_run
+o_w="$ROOT/o-w"; ai_w="$ROOT/ai-w"; mkdir -p "$o_w/bg" "$ai_w/state/lanes"
+cat >"$ROOT/count-probe.sh" <<EOS
+#!/usr/bin/env bash
+n="\$(cat '$ROOT/probe-count.txt' 2>/dev/null || printf 0)"
+printf '%s\n' "\$((n + 1))" >'$ROOT/probe-count.txt'
+exec ls -l "\$@"
+EOS
+chmod +x "$ROOT/count-probe.sh"
+printf '0\n' >"$ROOT/probe-count.txt"
+for k in 7 8; do
+  wt_k="$ai_w/wt-drainer-ai-drain-888888-$k-1"
+  git -C "$SEED" worktree add -f "$wt_k" "$SEED_REF" >/dev/null 2>&1
+  sleep 0 & dk=$!; wait "$dk" 2>/dev/null
+  printf '%s' "$dk" >"$ai_w/state/lanes/ai-drain-888888-$k-1.pid"
+  printf '%s' "$dk" >"$wt_k.lane-pid"
+  printf '0\n' >"$o_w/bg/ai-drain-888888-$k-1.rc"
+done
+RUN_TARGET=0 RUN_LO_CWD_PROBE="$ROOT/count-probe.sh" run_drainer_fg w
+check "(t10) two removals in ONE tick take TWO cwd readings (the residual is one probe wide)" \
+  '[ "$(cat "$ROOT/probe-count.txt" 2>/dev/null)" -eq 2 ] && [ ! -d "$ai_w/wt-drainer-ai-drain-888888-7-1" ] && [ ! -d "$ai_w/wt-drainer-ai-drain-888888-8-1" ]' \
+  "probes=$(cat "$ROOT/probe-count.txt" 2>/dev/null) (want 2) · tree7=$( [ -d "$ai_w/wt-drainer-ai-drain-888888-7-1" ] && echo present || echo gone ) tree8=$( [ -d "$ai_w/wt-drainer-ai-drain-888888-8-1" ] && echo present || echo gone )"
+wt_q="$ai_w/wt-drainer-ai-drain-888888-9-1"
+git -C "$SEED" worktree add -f "$wt_q" "$SEED_REF" >/dev/null 2>&1
+printf 'only-copy\n' >"$wt_q/WORK.md"
+sleep 0 & dead_q=$!; wait "$dead_q" 2>/dev/null
+printf '%s' "$dead_q" >"$ai_w/state/lanes/ai-drain-888888-9-1.pid"
+printf '%s' "$dead_q" >"$wt_q.lane-pid"
+printf '0\n' >"$o_w/bg/ai-drain-888888-9-1.rc"
+RUN_TARGET=0 RUN_LO_CWD_PROBE="$ROOT/count-probe.sh" run_drainer_fg w
+check "(t10) the FIRST sighting of a dirty tree is held (and pays its one reading)" \
+  '[ -d "$wt_q" ]' "dirty checkout was removed"
+after_first="$(cat "$ROOT/probe-count.txt" 2>/dev/null)"
+RUN_TARGET=0 RUN_LO_CWD_PROBE="$ROOT/count-probe.sh" run_drainer_fg w
+check "(t10) …and a SECOND tick over the same quarantined tree costs NO further reading" \
+  '[ "$(cat "$ROOT/probe-count.txt" 2>/dev/null)" -eq "$after_first" ] && [ -d "$wt_q" ]' \
+  "probes went $after_first → $(cat "$ROOT/probe-count.txt" 2>/dev/null) (want unchanged) · tree=$( [ -d "$wt_q" ] && echo present || echo gone )"
+
+# ── (t11) THE DEGRADED PATH STILL PASSES THROUGH THE CLEANLINESS ARM (#2800 review, ISSUE 1 — P1) ──
+# ⛔ THE SCOPE CONTRACT'S `T3` HAS TWO HALVES AND ONLY ONE WAS PINNED. `T3` reads "an unreadable/absent
+# cwd probe read as 'no holder' — accepted ONLY with the `DEGRADED:` disclosure **and the cleanliness
+# arm still in front of the `rm`**". (t5) and (t9) both use a CLEAN checkout, so they assert
+# "degraded ⇒ still reclaims" and never "degraded ⇒ dirty still HOLDS". The natural edit a reader makes
+# ("no witness ⇒ no point asking git either") therefore left the WHOLE SUITE GREEN while a dirty lane
+# checkout — the exact data-loss class #2800 exists to close — was force-removed on every box without
+# `/proc`+`lsof`. The fixture is (t3)'s tree (an untracked `WORK.md`, the only copy) under (t5)'s
+# degraded environment.
+reset_run
+o_x="$ROOT/o-x"; ai_x="$ROOT/ai-x"; mkdir -p "$o_x/bg" "$ai_x/state/lanes"
+wt_x="$ai_x/wt-drainer-ai-drain-888888-10-1"
+git -C "$SEED" worktree add -f "$wt_x" "$SEED_REF" >/dev/null 2>&1
+printf 'only-copy\n' >"$wt_x/WORK.md"                # uncommitted, untracked, the only copy
+sleep 0 & dead_x=$!; wait "$dead_x" 2>/dev/null
+printf '%s' "$dead_x" >"$ai_x/state/lanes/ai-drain-888888-10-1.pid"
+printf '%s' "$dead_x" >"$wt_x.lane-pid"
+printf '0\n' >"$o_x/bg/ai-drain-888888-10-1.rc"
+RUN_TARGET=0 RUN_LO_MOD="$ROOT/no-such-live-ownership.sh" run_drainer_fg x
+check "(t11) with NO cwd witness a DIRTY checkout is still HELD (the cleanliness arm is not skipped)" \
+  '[ -d "$wt_x" ] && [ -f "$wt_x/WORK.md" ]' \
+  "the only copy of WORK.md was deleted — the degraded path short-circuited the cleanliness gate"
+check "(t11) …and the hold quotes the UNCOMMITTED WORK it refused to destroy" \
+  'grep -q "UNCOMMITTED WORK (1 path(s), first: ?? WORK.md)" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep 'HELD:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -1)"
+reset_run
+
+# ── (t12) THE PROBE NEVER REPORTS ITSELF AS A HOLDER (#2800 review, ISSUE 2 — the contract's `R2`) ──
+# ⛔ `R2` DECLARED ITS CATCH AS (i)/(g), AND THOSE ARMS CANNOT EXHIBIT THE FAILURE: the drainer runs
+# from the suite dir while every reaped tree is `$ROOT/ai-*/wt-drainer-*`, so a probe fork whose cwd is
+# the suite dir matches no checkout — deleting BOTH the `cd /` in `_cwd_rows` AND the whole `_own_chain`
+# exclusion left the suite green. The hazard is real and it is the #1095 accumulation: on a box where the
+# tick's cwd sits INSIDE a lane checkout, a probe that inherits that cwd lists ITSELF as the checkout's
+# holder and refuses every removal for ever. `RUN_CWD` is the seam, and it is the only cwd at which the
+# hazard exists: the drainer is run from the very checkout it is about to reap.
+reset_run
+o_y="$ROOT/o-y"; ai_y="$ROOT/ai-y"; mkdir -p "$o_y/bg" "$ai_y/state/lanes"
+wt_y="$ai_y/wt-drainer-ai-drain-888888-11-1"
+git -C "$SEED" worktree add -f "$wt_y" "$SEED_REF" >/dev/null 2>&1
+sleep 0 & dead_y=$!; wait "$dead_y" 2>/dev/null                    # a clean tree whose lane is gone
+printf '%s' "$dead_y" >"$ai_y/state/lanes/ai-drain-888888-11-1.pid"
+printf '%s' "$dead_y" >"$wt_y.lane-pid"
+printf '0\n' >"$o_y/bg/ai-drain-888888-11-1.rc"
+RUN_TARGET=0 RUN_CWD="$wt_y" run_drainer_fg y
+check "(t12) a tick whose OWN cwd is the checkout still reaps it (the probe never lists itself)" \
+  '[ ! -d "$wt_y" ]' \
+  "checkout still present — the probe (or this tick) was reported as its own holder; that latches every reap for ever (#1095)"
+reset_run
+reset_run
+
+# ── (t6) EVERY DESTRUCTIVE PATH ROUTES THROUGH THE ONE GATE ─────────────────────────────────────
+# The same shape `dispatch-teardown.test.sh` T6 pins for `wt_reap_if_empty`, for the same reason: a
+# second caller of the mechanical removal is a SECOND teardown, and it would bypass the holder and
+# cleanliness questions while every behaviour arm above stayed green (they all reach `_release_wt`).
+check "(t6) the three removal paths call _release_wt, and NOTHING but it calls _rm_wt" \
+  '[ "$(grep -cE "^[^#]*_rm_wt[ (]" "$DRAINER")" -eq 2 ] && [ "$(grep -cE "^[^#]*_release_wt \"" "$DRAINER")" -eq 3 ]' \
+  "_rm_wt lines=$(grep -cE '^[^#]*_rm_wt[ (]' "$DRAINER") (want 2 = 1 def + the 1 call inside _release_wt) · _release_wt call sites=$(grep -cE '^[^#]*_release_wt "' "$DRAINER") (want 3: settle, reap, exit)"
+# ⛔ AND THE NAME-COUNT IS NOT THE CLAIM ABOVE IT (#2800 review P2, and round 2 showed the first fix was
+# still defeatable). A text exclusion is not a location: a function whose body is `_rm_wt`'s two lines
+# VERBATIM is filtered out wherever it lives, and the shapes an inline teardown really takes (`rm -rf
+# "$w"` in `_reap_leftovers`, `rm -rf "$AI"/wt-*`, `worktree remove --force "$w"`) carry no
+# `wt-drainer` token on the line. So the assertion is by LOCATION: `_rm_wt`'s body is cut out, and the
+# lines left outside it must contain exactly the 8 removals this file legitimately owns — the 7
+# lock/stage removals and the one `git worktree prune` — and none of them may name a lane tree.
+awk '/^_rm_wt\(\) \{/{inb=1;next} inb&&/^\}/{inb=0;next} !inb' "$DRAINER" \
+  | grep -E '^[^#]*(rm -rf|rm -fr|worktree remove|worktree prune)' >"$ROOT/drainer-verbs-outside-rmw.txt"
+check "(t6) …and OUTSIDE _rm_wt's own body the removal verbs are exactly the 8 this file owns" \
+  '[ "$(wc -l <"$ROOT/drainer-verbs-outside-rmw.txt")" -eq 8 ]' \
+  "outside verbs: $(tr '\n' '|' <"$ROOT/drainer-verbs-outside-rmw.txt") (want 7 lock/stage removals + 1 worktree prune — a second teardown lands here)"
+check "(t6) …and none of them names a lane tree (a copied/inline teardown cannot hide)" \
+  '! grep -qF -e "\$AI" -e "\$w" -e "\$wt" -e "\$canon" -e "wt-drainer" -e "wt-" "$ROOT/drainer-verbs-outside-rmw.txt"' \
+  "lane-tree targets: $(grep -nF -e '\$AI' -e '\$w' -e '\$wt' -e '\$canon' -e 'wt-drainer' -e 'wt-' "$ROOT/drainer-verbs-outside-rmw.txt" | tr '\n' ' ')"
+reset_run
+
+# ── (t13) THE EXIT PATH STATES THE NEW CONTRACT, NOT THE ONE THIS CHANGE REFUTES ──────────────────
+# ⛔ A COMMENT IS THIS FILE'S DESIGN RECORD, AND THE BLOCK INTRODUCING THE EXIT PATH CONTRADICTED THE
+# #2800 BLOCK ~700 LINES ABOVE IT (#2800 review round 5, P2). It said "The pid is the guard" and that
+# the next tick "removes the tree once the pid is gone" — the exact premise #2800 exists to refute,
+# and the edit that would reintroduce the P0 — four lines above a comment stating the opposite. So the
+# contract is read, not assumed: the contiguous comment block that introduces `LANE_PIDS=()` must name
+# the ONE gate and BOTH removal properties, and must not restate the refuted invariant. A maintainer
+# who reinstates the old sentences (or deletes the block) reddens this, which is the point.
+awk '/^LANE_PIDS=\(\)/{exit} /^#/{buf=buf $0 "\n"; next} {buf=""} END{printf "%s", buf}' "$DRAINER" \
+  >"$ROOT/exit-contract.txt"
+EXIT_CONTRACT="$(tr '\n' ' ' <"$ROOT/exit-contract.txt" | tr -s ' ')"
+check "(t13) the exit path's contract names the ONE gate and BOTH removal properties" \
+  '[ -s "$ROOT/exit-contract.txt" ] && grep -q "_release_wt" "$ROOT/exit-contract.txt" && grep -qi "only on disk" "$ROOT/exit-contract.txt"' \
+  "block=[$EXIT_CONTRACT] (want the contiguous comment block above LANE_PIDS=() naming _release_wt and 'exists only on disk')"
+check "(t13) …and it does not restate the refuted 'the pid is the guard' invariant" \
+  '[ -n "$EXIT_CONTRACT" ] && ! grep -qi "the pid is the guard" <<<"$EXIT_CONTRACT" && ! grep -qi "once the pid is gone" <<<"$EXIT_CONTRACT"' \
+  "still says: $(grep -oiE "the pid is the guard|once the pid is gone" <<<"$EXIT_CONTRACT" | tr '\n' ' ')"
+reset_run
+
+# ── (t14) A REMOVAL THAT MECHANICALLY FAILED IS NOT REPORTED AS A RELEASED HOLD ────────────────────
+# ⛔ #2800 REVIEW ROUND 6, AND THE HALF OF THIS GATE THE SUITE COULD NOT SEE. `_rm_wt` ended with
+# `log_line`, i.e. with `printf … >>"$LOG"`, so its exit status was the LOG WRITE's and not the
+# REMOVAL's: on both mechanisms failing (a busy mount, EPERM on a parent, a read-only fs) it returned 0
+# whenever the log was writable. Two decisions keyed on that status were therefore taken on a reading
+# that cannot express failure — `RELEASED: … the hold is over` was printed for a tree that is still
+# there, and `_release_wt` returned 0 so `REAPED:` counted it. The hold marker was also deleted BEFORE
+# the removal was attempted, so a failed removal un-quarantined the tree: the next tick re-entered it as
+# a FIRST sighting and logged a fresh `HELD:` transition, inverting the "named ONCE on its transition"
+# contract in exactly the case that persists. On `origin/main` `_rm_wt`'s status was IGNORED, so the wart
+# was inert; this diff is the first code to branch on it, which is why the pin is required here.
+# Fixture: a tree QUARANTINED on tick 1 (an untracked only-copy), cleared by the operator, and then made
+# mechanically unremovable (`chmod 500` ⇒ `git worktree remove --force` and `rm -rf` both fail).
+reset_run
+o_z="$ROOT/o-z"; ai_z="$ROOT/ai-z"; mkdir -p "$o_z/bg" "$ai_z/state/lanes"
+wt_z="$ai_z/wt-drainer-ai-drain-888888-12-1"
+git -C "$SEED" worktree add -f "$wt_z" "$SEED_REF" >/dev/null 2>&1
+printf 'only-copy\n' >"$wt_z/WORK.md"                  # uncommitted, untracked, the only copy
+sleep 0 & dead_z=$!; wait "$dead_z" 2>/dev/null          # a pid that is PROVABLY gone
+printf '%s' "$dead_z" >"$ai_z/state/lanes/ai-drain-888888-12-1.pid"
+printf '%s' "$dead_z" >"$wt_z.lane-pid"
+printf '0\n' >"$o_z/bg/ai-drain-888888-12-1.rc"
+RUN_TARGET=0 run_drainer_fg z
+check "(t14) the fixture's FIRST tick quarantines the dirty tree (the hold marker is written)" \
+  '[ -d "$wt_z" ] && [ -f "$wt_z.lane-held" ]' \
+  "tree=$( [ -d "$wt_z" ] && echo present || echo gone ) marker=$( [ -f "$wt_z.lane-held" ] && echo yes || echo no )"
+rm -f "$wt_z/WORK.md"                                    # the operator cleared the work: the tree is CLEAN
+chmod 500 "$wt_z"                                        # …and neither removal mechanism can succeed
+RUN_TARGET=0 run_drainer_fg z
+check "(t14) a removal that FAILED is not announced as RELEASED (the status is the removal's, not the log write's)" \
+  '! grep -q "RELEASED: leftover" "$LAST_AI/logs/ai-drainer.log" && [ -d "$wt_z" ]' \
+  "$(grep -E 'RELEASED|WARN: could not remove' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tail -2 | tr '\n' ' ')"
+check "(t14) …and the hold SURVIVES the failed removal, so the next tick does not re-latch it as a first sighting" \
+  '[ -f "$wt_z.lane-held" ] && ! grep -q "RELEASED: leftover" "$LAST_AI/logs/ai-drainer.log"' \
+  "marker=$( [ -f "$wt_z.lane-held" ] && echo yes || echo no ) — a failed removal must not un-quarantine the tree"
+check "(t14) …and the mechanical failure is NAMED, not silent" \
+  'grep -qF "WARN: could not remove the worktree at $wt_z" "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep -c 'WARN: could not remove' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null) WARN line(s)"
+# ⛔ #2800 REVIEW ROUND 7, THE AGGREGATE'S OWN CLAIM. The per-tree WARN was already honest; the TICK's
+# summary was not: `_release_wt` returned 1 for a failed removal, i.e. into the same `h` bucket whose
+# ONE line says "a live holder or uncommitted work was measured" — a cause this path measured NOT to
+# exist. So an operator following the summary hunts a holder or a dirty tree instead of fixing the
+# EPERM/mount, and a tree with no marker is counted as "quarantined". The failed tick must therefore
+# claim the hold cause ZERO times: this fixture's tick 1 is a GENUINE hold (1 aggregate), tick 2 is a
+# mechanical failure, so the count below is exactly the difference between the two causes.
+check "(t14) …and the failed tick does NOT claim a holder or uncommitted work was measured (its cause is not the hold cause)" \
+  '[ "$(grep -c "a live holder or uncommitted work was measured" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)" -eq 1 ]' \
+  "hold-cause lines=$(grep -c 'a live holder or uncommitted work was measured' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null) (want 1: tick 1's genuine hold only — the failed tick must not add a second)"
+check "(t14) …and it reports the failure as its OWN outcome (STUCK:), so a persistent failure cannot read as a reap or a hold" \
+  'grep -qF "STUCK: 1 leftover worktree(s) could NOT be removed" "$LAST_AI/logs/ai-drainer.log"' \
+  "outcomes=$(grep -oE 'REAPED: [0-9]+|HELD: [0-9]+ leftover|STUCK: [0-9]+ leftover' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | tr '\n' ' ')"
+# The fixture must not leak an unremovable directory into the suite's own cleanup.
+chmod 700 "$wt_z" 2>/dev/null
+reset_run
+
+# ── (t15) A *FIRST-SIGHTING* REMOVAL THAT FAILED IS QUARANTINED, NOT RE-ENTERED AS A FIRST SIGHTING ──
+# ⛔ #2800 REVIEW ROUND 7, SECONDARY (a). `(t14)` only ever reaches the failed-removal arm with the
+# marker ALREADY present (`was_held=1`), so it cannot see this: on a FIRST sighting the pre-fix code
+# wrote no marker at all, and both claims it printed — "the hold marker STAYS", "the quarantine stays" —
+# were false for exactly the case that persists. The tree was then re-entered as a first sighting on
+# every tick for as long as the failure lasted: the per-tick re-latch the marker exists to prevent.
+# Fixture: a CLEAN checkout (so the gate clears it — unlike (t14), nothing holds it) that neither
+# removal mechanism can delete, reached by the REAP (`_reap_leftovers`) alone — no lane RECORD, only the
+# tree's `.lane-pid` sidecar — so the counting call is the one that meets the failure. (With a lane
+# record the SETTLE meets it first, and on the next read the tree has already lost its gitlink: see the
+# honest division asserted below.)
+reset_run
+o_y="$ROOT/o-y"; ai_y="$ROOT/ai-y"; mkdir -p "$o_y/bg" "$ai_y/state/lanes"
+wt_y="$ai_y/wt-drainer-ai-drain-999999-13-1"
+git -C "$SEED" worktree add -f "$wt_y" "$SEED_REF" >/dev/null 2>&1
+chmod 500 "$wt_y"                                     # clean, and unremovable by BOTH mechanisms
+sleep 0 & dead_y=$!; wait "$dead_y" 2>/dev/null          # a pid that is PROVABLY gone
+printf '%s' "$dead_y" >"$wt_y.lane-pid"                 # the reaper's own evidence; NO lane record
+RUN_TARGET=0 run_drainer_fg y
+check "(t15) a FIRST-sighting removal that FAILED still WRITES the quarantine marker (so the next tick does not re-enter it as a first sighting)" \
+  '[ -d "$wt_y" ] && [ -f "$wt_y.lane-held" ]' \
+  "tree=$( [ -d "$wt_y" ] && echo present || echo gone ) marker=$( [ -f "$wt_y.lane-held" ] && echo yes || echo no )"
+check "(t15) …and the marker names the FAILURE, not a hold that was never measured" \
+  'grep -q "the removal itself FAILED" "$wt_y.lane-held" && ! grep -q "LIVE process still holds it\|UNCOMMITTED WORK\|could not be read" "$wt_y.lane-held"' \
+  "marker=[$(head -1 "$wt_y.lane-held" 2>/dev/null)]"
+check "(t15) …and that first tick classifies it STUCK, not quarantined — a failure is not a hold cause" \
+  'grep -qF "STUCK: 1 leftover worktree(s) could NOT be removed" "$ai_y/logs/ai-drainer.log" && ! grep -q "a live holder or uncommitted work was measured" "$ai_y/logs/ai-drainer.log" && ! grep -q "REAPED: " "$ai_y/logs/ai-drainer.log"' \
+  "outcomes=$(grep -oE 'REAPED: [0-9]+|HELD: [0-9]+ leftover|STUCK: [0-9]+ leftover' "$ai_y/logs/ai-drainer.log" 2>/dev/null | tr '\n' ' ')"
+RUN_TARGET=0 run_drainer_fg y
+# The SECOND tick is an HONEST hold, not a re-latch: `git worktree remove --force` destroys the gitlink
+# even when it cannot delete the directory, so the tree now carries a `.git` it cannot read through —
+# CANNOT-VERIFY, the round-1 P0 posture. What must NOT happen is a fresh first-sighting transition: the
+# marker written above is what keeps it a CONTINUATION of the same tree.
+check "(t15) …so the retry is a CONTINUATION (marker survives, no fresh first-sighting HELD transition, no reaped claim)" \
+  '[ -f "$wt_y.lane-held" ] && [ "$(grep -c "HELD: leftover worktree" "$ai_y/logs/ai-drainer.log" 2>/dev/null)" -eq 0 ] && ! grep -q "REAPED: " "$ai_y/logs/ai-drainer.log"' \
+  "marker=$( [ -f "$wt_y.lane-held" ] && echo yes || echo no ) first-sighting-transitions=$(grep -c 'HELD: leftover worktree' "$ai_y/logs/ai-drainer.log" 2>/dev/null) (want 0) reaped=$(grep -c 'REAPED: ' "$ai_y/logs/ai-drainer.log" 2>/dev/null)"
+# The fixture must not leak an unremovable directory into the suite's own cleanup.
+chmod 700 "$wt_y" 2>/dev/null
+reset_run
+
 
 reset_run
 # ── ARM (j): the SLICE ROTATES ACROSS TICKS AND WRAPS ───────────────────────────────────────

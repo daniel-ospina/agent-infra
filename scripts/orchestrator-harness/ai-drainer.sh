@@ -618,6 +618,25 @@ SETTLE_HELD_NAMES=" "
 # `WARN: could not remove` twice, which reads like two different failures (review note, PR #3918). One
 # probe per tree per tick; a later tick retries the removal, exactly as the WARN says.
 SETTLE_WARN_NAMES=" "
+# ⛔ ONE OUTCOME TALLY PER TICK, FILLED BY BOTH PASSES (agent-infra#2800 review round 8 × #3918).
+# `_settle_lanes` and `_reap_leftovers` are two visits to the same population (a record's own tree, and a
+# tree whose record outlived it), and #3918 established that a tree is PROBED once per tick so the same
+# `WARN:` is not logged twice. That left the second pass owning the aggregate counters, so a tree held
+# or stuck during the SETTLE appeared in no summary at all. The counters live here instead, both passes
+# add to them, and the four aggregate lines are printed once, at the end of the reap pass — one probe
+# per tree per tick AND a summary that counts every outcome the tick actually reached.
+WT_TALLY_REMOVED=0
+WT_TALLY_HELD=0
+WT_TALLY_STUCK=0
+# ⛔ COUNTED BY RETURN CODE: `0` removed · `2` the removal itself FAILED · anything else is a
+# refusal (`_release_wt`'s HELD). Both passes add to the same tally — see the note above.
+_wt_cause_tally() { # <release-wt rc> — adds to the tick's tally
+  case "${1:-}" in
+    0) WT_TALLY_REMOVED=$((WT_TALLY_REMOVED + 1)) ;;
+    2) WT_TALLY_STUCK=$((WT_TALLY_STUCK + 1)) ;;
+    *) WT_TALLY_HELD=$((WT_TALLY_HELD + 1)) ;;
+  esac
+}
 # ⛔ EVERY PATH AFTER THE SETTLE GOES THROUGH `finish`. `_settle_lanes` can report a lane that died
 # without a clean status, and three early `exit 0`s (swap floor / load ceiling / at target) used to
 # bypass that report: on a healthy box at target — the normal steady state — a lane that exited 3 was
@@ -691,6 +710,14 @@ fi
 # parent's cwd AND argv, and a probe that runs INSIDE the tree it inspects finds ITSELF and refuses every
 # removal for ever. This tick never cds into a lane checkout, so the only requirement here is not to
 # start doing so.
+# ⛔ AND ON THE ONE PATH WHERE IT DOES, THE CHAIN IS EXCLUDED (#2800, `_own_chain`). "The tick never cds
+# into a checkout" was a HYPOTHESIS, not an invariant: `ai-drainer.test.sh`'s arm (t12) runs the tick
+# with its cwd set to the very checkout it is about to reap, and an operator can hand-run one from
+# inside a lane tree. There the probe's own row matches, the tick reads itself as that lane's live
+# holder, and the tree is quarantined for ever — the failure the #1095 accumulation is made of, produced
+# by the instrument rather than by the lane. The exclusion is `_own_chain`'s (this process and its
+# ancestors, read from a FORK's `ppid` because `$$` is constant across `$( )`), applied inside the awk
+# so a self-match cannot consume the FIRST-MATCH slot and hide a real holder listed after it.
 _proc_cwd_holder() { # <canon path> → 0 + "<pid>\t<cwd-inside-the-worktree>" · 1 none · 2 not evaluable
   local root="${PROC_ROOT:-/proc}" raw out
   [ -d "$root" ] || return 2
@@ -708,13 +735,14 @@ _proc_cwd_holder() { # <canon path> → 0 + "<pid>\t<cwd-inside-the-worktree>" �
   # ` (deleted)` suffix is stripped rather than matched.
   raw="$(ls -l "$root"/[0-9]*/cwd 2>/dev/null)"
   [ -n "$raw" ] || return 2                  # read nothing at all → UNKNOWN, never "no holder"
-  out="$(printf '%s\n' "$raw" | awk -v wt="$1" '
+  out="$(printf '%s\n' "$raw" | awk -v wt="$1" -v skip="${_CWD_CHAIN:- }" '
     !found {
       i = index($0, " -> "); if (i == 0) next          # not a readable symlink row
       left = substr($0, 1, i - 1); tgt = substr($0, i + 4)
       sub(/ \(deleted\)$/, "", tgt)
       n = split(left, seg, "/"); pid = seg[n - 1]      # "<root>/<pid>/cwd"
       if (pid !~ /^[0-9]+$/ || tgt !~ /^\//) next
+      if (index(skip, " " pid " ")) next          # THIS tick own chain, never a holder
       if (tgt == wt || substr(tgt, 1, length(wt) + 1) == wt "/") {
         printf "%s\t%s\n", pid, "cwd-inside-the-worktree"; found = 1
       }
@@ -732,10 +760,28 @@ _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none
   # never match, and a holder would read as absent — the direction that destroys work.
   path="$(cd "$1" 2>/dev/null && pwd -P)" || return 2
   [ -n "$path" ] || return 2
+  # ⛔ OUR OWN CHAIN IS COMPUTED BEFORE EITHER WITNESS AND IS NEVER A HOLDER (#2800 `_own_chain`, merge
+  # note). Both witnesses see this tick's own probe processes — witness B because they inherit its cwd,
+  # witness A because `wt_live_holders` matches a cwd too — so without this a tick run from inside a
+  # checkout quarantines that checkout for ever. It is memoised by `_own_chain` (one fork, one `ps` walk
+  # per tick), so calling it here costs nothing on the arms that never needed it.
+  _own_chain
   if [ "$HOLDER_PROBE" = "1" ]; then
     out="$(wt_live_holders "$path")"; rc=$?
     case "$rc" in
-      0) printf '%s\n' "$out"; return 0 ;;
+      0)
+        # ⛔ DROP ROWS NAMING THIS TICK'S OWN CHAIN, IN THIS SHELL (#2800 `_own_chain`). Not through a
+        # pipeline: a pipeline's last stage is a SUBSHELL, so an accumulator assigned there dies with it
+        # and the filter silently returns "no rows" — which reads as "no holder", the destructive
+        # direction. A here-string runs the loop in the current shell, so `_kept` survives.
+        local _kept="" _p _why
+        while IFS=$'\t' read -r _p _why; do
+          [ -n "$_p" ] || continue
+          case "${_CWD_CHAIN:- }" in *" $_p "*) continue ;; esac
+          _kept="$_kept$_p"$'\t'"$_why"$'\n'
+        done <<< "$out"
+        if [ -n "$_kept" ]; then printf '%s' "$_kept"; return 0; fi
+        rc=1 ;;                          # every hit was our own chain → this witness says "none"
       1) rc=1 ;;
       # ⛔ THE MODULE LOADED BUT COULD NOT ANSWER (its own rc 2: `/proc` absent, its ignore-file guard
       # unwritable — a full disk, the very state this gate exists for). Reporting the LOAD-TIME "ok
@@ -760,34 +806,345 @@ _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none
   [ "$rc" = "2" ] && printf '%s\n' "$why"
   return "$rc"
 }
-_rm_wt() { # <worktree path> — only ever called for a lane whose pid is PROVABLY DEAD
-  #   → 0 removed · 1 removal FAILED (the WARN below) · 2 kept (the probe could not be evaluated) ·
-  #   3 kept (a live holder). ⛔ 2 and 3 mean "the lane has NOT ended"; 1 does not, and a caller that
-  #   treats them alike never settles a lane whose tree cannot be deleted (review finding, PR #3918).
+# ── "PROVABLY GONE" IS A QUESTION ABOUT THE LANE, NOT ABOUT ONE PID (agent-infra#2800) ───────────
+# ⛔ THE PID IN `$O/bg/<name>.pid` IS THE DISPATCHER'S BACKGROUNDED SUBSHELL, NOT THE AGENT. Both
+# shipped dispatchers record `$!` of `( … run_agent … ) &`, and `pi` is that subshell's CHILD — the
+# same shape `_counts_as_lane` above already has to accept, which is why it matches on argv SHAPE.
+# So every "is this lane dead?" decision in this file was `kill -0 <subshell>`, one level short of the
+# question: if the SUBSHELL dies alone — the OOM killer picking the larger-RSS member of the pair, an
+# operator signalling the recorded pid, a parent shell exiting under a dispatcher that does not `exec`
+# — then its `pi` and that `pi`'s tool children SURVIVE, reparented away from the pid the record names.
+# `kill -0` then says "provably dead" about a lane still writing, and `git worktree remove --force`
+# deletes the checkout underneath it. That is silent destruction of uncommitted work — the failure
+# class this file exists to prevent — and `--force` is precisely the flag that suppresses git's own
+# refusal to remove a dirty tree.
+#
+# ⛔ THE WITNESS IS THE CWD, NOT THE PPID CHAIN. A reparented child's `ppid` is 1 (or a subreaper), so
+# a `ps -o ppid=` walk from the recorded pid CANNOT find it: the event that strands the agent also
+# erases the evidence of whose child it was. What does survive reparenting is the agent's WORKING
+# DIRECTORY — the dispatcher `cd`s into the lane's checkout before it forks, every child inherits it,
+# and the checkout path is unique per lane (`$AI/wt-drainer-<name>`). "A live process whose cwd is
+# inside this checkout" is therefore an exact, platform-neutral attribution, needing no `setsid`, no
+# process group (a `setsid` child escapes one) and no cgroups (absent on macOS).
+# ⛔ ONE IMPLEMENTATION, TWO ADAPTERS — `live-ownership.sh`'s `lo_cwd_rows` is the fleet's cwd probe
+# (`ls -l /proc/[0-9]*/cwd` where the kernel exposes it, `lsof -a -d cwd -Fpn` otherwise, capture-first
+# so "could not read the table" is never invented as "nobody is here"). This file must not carry a
+# second copy of that parse — the rule the census already applies to `worker-terminal.sh` and
+# `capacity.sh`.
+# ⛔ AND A LIVE HOLDER IS NOT THE ONLY WAY TO LOSE WORK. Attribution can fail (no `/proc`, no `lsof`, a
+# `hidepid` mount, a partially-answering probe), so a removal ALSO requires the checkout to hold
+# nothing that exists only on disk: `git status --porcelain` empty, and a `git status` that could not
+# run is CANNOT-VERIFY, never clean (the same ruling `spawn-gate.sh`'s cap snapshot records). That is
+# the repo's recorded posture for worktrees — cleanliness IS the safety property (#3888,
+# `pi-reap-worktrees.sh` rule 2) — and it is the conservative direction #2800 names: a dirty tree
+# waits for an operator, which costs DISK instead of WORK.
+# ⛔ WHAT REMAINS, STATED RATHER THAN IMPLIED:
+#   * a holder that STARTS between the probe and the `rm` is not seen — the probe is a witness, not a
+#     lock; the window is ONE PROBE PLUS ONE `git status` wide (the process table is re-taken per
+#     removal, so a stalled lane's 30 s status grace cannot stale a later tree's reading), instead of
+#     the lane's whole life;
+#   * a GITIGNORED file is not "work" for this gate (`status --porcelain` does not report it), so a
+#     lane's `.venv`/`node_modules` cannot pin a checkout for ever — it would pin every one of them;
+#   * the CENSUS is unchanged: it counts a pid that is alive, so a lane whose subshell died while its
+#     agent lives is not counted and the tick over-dispatches. That is a capacity error (measured in
+#     lanes), not a data-loss one, and widening it needs this same attribution per lane;
+#   * a QUARANTINED tree is re-evaluated by every later tick and named ON ITS TRANSITION only, not per
+#     tick — a hold that never ends costs one HELD line plus the aggregate count, never a WARN storm.
+#   * `_lo_probe_ok` accepts a candidate that DEFINES `lo_cwd_rows`, not one whose body is current, so a
+#     stale deployed copy that still defines it is used (its `_cwd_rows_parsed` floor is what stops the
+#     empty-output failure from reading as "nobody is here"). Byte equality is
+#     `check-single-source.sh`'s job, not a startup probe's.
+# ⛔ A CANDIDATE IS ACCEPTED ON WHAT IT PROVIDES, NOT ON EXISTING (#2800 review P2). `$O/live-ownership.sh`
+# is the DEPLOYED copy, and `deploy-harness.sh` produces a window in which it is stale while `$SELF_DIR`'s
+# is current — so picking the first file that EXISTS silently disabled the cwd witness for the whole tick,
+# leaving every removal resting on cleanliness alone (a backstop, see below). Sourcing one of these modules
+# has no effect beyond function definitions (`live-ownership.sh` carries no top-level statements), so a
+# stale candidate costs one `source` and the loop moves on to the next.
+_lo_probe_ok() { # <path> — 0 only when this module SOURCES and defines the fleet's cwd probe
+  [ -n "$1" ] && [ -f "$1" ] || return 1
+  # shellcheck disable=SC1090
+  . "$1" 2>/dev/null
+  command -v lo_cwd_rows >/dev/null 2>&1
+}
+LO_MOD="${LO_MOD:-}"
+LO_MOD_PINNED=0
+[ -n "$LO_MOD" ] && LO_MOD_PINNED=1
+CWD_WITNESS=0
+CWD_WITNESS_WHY="live-ownership.sh not found (looked in \$O, \$SELF_DIR, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts)"
+if [ "$LO_MOD_PINNED" = "1" ]; then
+  # An explicit LO_MOD is a PIN, not a preference: it is not second-guessed, only reported on.
+  if _lo_probe_ok "$LO_MOD"; then
+    CWD_WITNESS=1; CWD_WITNESS_WHY="ok"
+  else
+    CWD_WITNESS_WHY="LO_MOD=$LO_MOD does not provide lo_cwd_rows (absent, unreadable, or stale)"
+  fi
+else
+  for _lo_cand in "$O/live-ownership.sh" "$SELF_DIR/live-ownership.sh" \
+                  "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/live-ownership.sh" \
+                  "${HOME:-}/.pi/agent/scripts/live-ownership.sh"; do
+    _lo_probe_ok "$_lo_cand" && { LO_MOD="$_lo_cand"; CWD_WITNESS=1; CWD_WITNESS_WHY="ok"; break; }
+  done
+fi
+# The rows, memoised PER REMOVAL (never inside a `$( )` — a command substitution would silently lose the
+# memo and probe the process table once per worktree).
+_CWD_ROWS=""
+_CWD_ROWS_STATE=""
+_CWD_CHAIN=""
+_WITNESS_NOTED=0        # once per tick: the DEGRADED note is about the BOX, not about each tree
+_cwd_rows_reset() { _CWD_ROWS=""; _CWD_ROWS_STATE=""; }
+# ⛔ "THE PROBE ANSWERED" IS NOT "ITS OUTPUT WAS NON-EMPTY" (#2800 review P2). A row that does not parse as
+# `<pid>\t<absolute-cwd>` matches no checkout, so every tree would read as unheld WHILE the state said `ok`
+# — the "nobody is here" invented from "I could not read the table" that `live-ownership.sh`'s capture-first
+# arms exist to prevent, re-introduced one layer up. Requiring one parseable row is a FORMAT check, never a
+# false degradation on a healthy box: `lo_cwd_rows` prints a row only when the target is absolute
+# (`live-ownership.sh:75`), so its own output always satisfies this.
+_cwd_rows_parsed() {
+  case "$_CWD_ROWS" in
+    *$'\t'/*) return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+# ⛔ THE PROBE RUNS FROM A NEUTRAL CWD, AND THAT IS A CORRECTNESS REQUIREMENT, NOT TIDINESS: a forked
+# child inherits the caller's cwd, so a probe launched with the tick's cwd inside a lane checkout would
+# list ITSELF as that checkout's holder and refuse every removal for ever. `wt-lifecycle.sh` measured
+# exactly this, three times, before adding the same `cd /`.
+_cwd_rows() {
+  if [ -z "$_CWD_ROWS_STATE" ]; then
+    if [ "$CWD_WITNESS" = "1" ] \
+       && _CWD_ROWS="$( cd / 2>/dev/null || cd "${TMPDIR:-/tmp}" 2>/dev/null || :; lo_cwd_rows 2>/dev/null )" \
+       && _cwd_rows_parsed; then
+      _CWD_ROWS_STATE=ok
+    else
+      _CWD_ROWS=""; _CWD_ROWS_STATE=unreadable
+    fi
+  fi
+  [ "$_CWD_ROWS_STATE" = "ok" ]
+}
+# This process and its ancestors — excluded from the witness, because a subshell or a command
+# substitution inherits BOTH the argv and the cwd of its parent and would otherwise be reported as a
+# holder of whatever its parent is standing in. ⛔ `$$` cannot answer here for the reason
+# `wt-lifecycle.sh` records at length: bash keeps `$$` constant across `$( )`, and macOS bash 3.2 has no
+# `$BASHPID`. So fork once and read the CHILD's `ppid`, which IS the pid of the process running this.
+# ⛔ IT SETS A GLOBAL AND PRINTS NOTHING, ON PURPOSE — the same reason `_cwd_rows` is not read through a
+# `$( )`: a command substitution would run this in a subshell, so `_CWD_CHAIN` would be assigned in a
+# process that exits immediately and the memo below would be INERT — a fork plus a `ps` walk per
+# worktree, for ever, behind a guard that reads as if it prevented exactly that.
+_own_chain() {
+  if [ -z "$_CWD_CHAIN" ]; then
+    local p c i=0
+    "$SLEEP_BIN" 0.1 & c=$!
+    p="$("$PS" -o ppid= -p "$c" 2>/dev/null | tr -d ' ')"
+    wait "$c" 2>/dev/null
+    p="${p:-$$}"
+    _CWD_CHAIN=" "
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$i" -lt 64 ]; do
+      _CWD_CHAIN="$_CWD_CHAIN$p "
+      p="$("$PS" -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+      i=$((i + 1))
+    done
+  fi
+  return 0
+}
+# _wt_holder <canonical-checkout> — sets WT_HOLDER and returns:
+#   0 = a live process still holds it · 1 = nothing holds it · 2 = no cwd witness is available
+WT_HOLDER=""
+_wt_holder() {
+  local path="$1" pid cwd
+  WT_HOLDER=""
+  _cwd_rows || return 2
+  _own_chain
+  while IFS=$'\t' read -r pid cwd; do
+    [ -n "$pid" ] || continue
+    case "$cwd" in "$path"|"$path"/*) ;; *) continue ;; esac
+    case "$_CWD_CHAIN" in *" $pid "*) continue ;; esac
+    WT_HOLDER="$pid"
+    return 0
+  done <<EOF
+$_CWD_ROWS
+EOF
+  return 1
+}
+_wt_clean() { # <canonical-checkout> — 0 = nothing exists only on disk · 1 = HOLD, and WT_HOLD_WHY says why
+  local canon="$1" out rc  # ⛔ A CHECKOUT THAT CARRIES A `.git` IT CANNOT READ THROUGH IS NOT AN EMPTY ONE (#2800 review P0).
+  # Asking git `rev-parse --git-dir` conflated two states that look alike and are opposites:
+  #   * a half-created / wiped directory with NO git state at all — nothing to lose, and `_rm_wt`'s
+  #     `|| rm -rf` fallback is what stops those accumulating (#1095);
+  #   * a REAL lane checkout whose gitdir became unreachable (a re-cloned or moved `$SEED_REPO`, a
+  #     dropped `worktrees/<id>` entry, an unmounted volume). There the work is ON DISK and only the
+  #     METADATA is gone: `rev-parse` and `status` both fail rc=128, so asking git is asking the broken
+  #     thing — and `return 0` deleted a quarantined checkout while logging "no uncommitted work".
+  # Presence of `.git` is the marker that separates them (`git worktree add` gives every lane a `.git`
+  # FILE), and a tree that carries one falls through to the `status` probe, which is CANNOT-VERIFY and
+  # therefore HOLDS. `-e` and not `-f`: a `.git` DIRECTORY (a plain clone left under $AI) counts too.
+  if [ ! -e "$canon/.git" ]; then
+    return 0
+  fi
+  out="$(git --no-optional-locks -C "$canon" status --porcelain 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    WT_HOLD_WHY="its state could not be read (git status rc=$rc) — an unreadable checkout is CANNOT-VERIFY, never clean"
+    return 1
+  fi
+  [ -z "$out" ] && return 0
+  WT_HOLD_WHY="it holds UNCOMMITTED WORK ($(printf '%s\n' "$out" | awk 'NR==1{f=$0} END{printf "%d path(s), first: %s", NR, f}')) — removing it would destroy the only copy"
+  return 1
+}
+# _wt_removable <checkout> [already-held] — 0 when removing it cannot destroy work · 1 when it must be HELD.
+# WT_HOLD_WHY names the reading that refused, because a hold with no stated reason is a checkout an
+# operator cannot act on.
+WT_HOLD_WHY=""
+WT_WITNESS=""            # ok = the cwd probe answered · none = it could not (cleanliness alone decided)
+_wt_removable() {
+  local wt="$1" canon rc pre_held="${2:-0}"
+  WT_HOLD_WHY=""
+  canon="$( cd "$wt" 2>/dev/null && pwd -P )" || canon="$wt"
+  # ⛔ A QUARANTINED TREE IS A CANDIDATE ON EVERY TICK (`_reap_leftovers` re-evaluates it, and only the
+  # removable path clears its `.lane-pid`), so the STEADY STATE the design deliberately creates must not
+  # cost a process-table probe per held tree for ever (#2800 review round 2). A tree that is still dirty —
+  # or still unreadable — is HELD whatever the holder says, and its HELD line already named the reading
+  # that refused on the transition, so the CHEAP reading decides it here and the probe is skipped. A tree
+  # that reads CLEAN still takes the probe below: that is the only way a departed holder can be seen, i.e.
+  # the only way a quarantine can ever end.
+  if [ "$pre_held" = "1" ] && ! _wt_clean "$canon"; then
+    return 1
+  fi
+  # ⛔ TWO WITNESS FAMILIES, BOTH EVALUATED — this function is the ONE gate, and this is where
+  # `feat/2800-tm` and agent-infra#3918 are merged. Neither probe replaces the other, because they are
+  # not interchangeable: the #2787 probe below (`_drain_holder`) asks `wt-lifecycle.sh`'s ARGV witness
+  # (the ONLY one that sees `pytest <wt>/tests` or `bash -c "cd <wt> && …"`, whose cwd is elsewhere) and
+  # `/proc/<pid>/cwd`; the #2800 gate below that asks `live-ownership.sh`'s cwd witness and then git's
+  # cleanliness question. A tree is removed only when BOTH families clear it, which is strictly more
+  # conservative than either alone — the only direction this merge may move a deletion predicate.
+  # ⛔ THE #2787 PROBE RUNS FIRST, AND THAT ORDER IS LOAD-BEARING: it is the one that refuses an
+  # UNPROVABLE box (witness A unevaluable ⇒ KEEP even when the other witness says "none"), so it must
+  # not be reached only after another probe has already said "no holder".
   local holder="" hrc=0 hpid="" hwhy=""
   # ──8<── holder-gate ───────────────────────────────────────────────────────────────────────
-  holder="$(_drain_holder "$1")"; hrc=$?
+  holder="$(_drain_holder "$canon")"; hrc=$?
   case "$hrc" in
     0)
       hpid="${holder%%$'\t'*}"; hwhy="${holder#*$'\t'}"
-      log_line "KEEP: not removing $1 — ${hwhy:-a live process} (pid ${hpid:-?}) still holds it, so the lane is STILL RUNNING whatever its pidfile says (agent-infra#2787); its record stands and a later tick retries"
-      return 3 ;;
+      # ⛔ THE HOLD REASON IS CANONICAL ACROSS BOTH WITNESS FAMILIES. A cwd hit is worded exactly as the
+      # #2800 gate words it, because there is ONE fact here ("a live process holds this checkout") and an
+      # operator should read the same sentence whichever witness happened to answer first. An ARGV hit
+      # says so, because that is the one shape only this family can see.
+      case "$hwhy" in
+        *cwd-inside*)
+          WT_HOLD_WHY="a LIVE process still holds it (pid ${hpid:-?} has this checkout as its cwd) — the recorded pid is gone but the lane's agent tree is not (agent-infra#2800)" ;;
+        *)
+          WT_HOLD_WHY="a LIVE process still holds it (pid ${hpid:-?} names this checkout in its ARGV, and its cwd is elsewhere) — only the ARGV witness can see that shape, and the lane's agent tree is not gone whatever its pidfile says (agent-infra#2787)" ;;
+      esac
+      # ⛔ THE RAW PATH, NOT THE CANONICAL ONE: this line is what an operator greps for, and it is the
+      # path the record (`<wt>.lane-pid`) and the state dir use. `$canon` is `/private/var/...` on Darwin
+      # where `$AI` is `/var/...`, so naming it here made the message unmatchable by the very path the
+      # tick was handed (merge note: #3918's own arm pinned the raw form).
+      log_line "KEEP: not removing $wt — ${hwhy:-a live process} (pid ${hpid:-?}) still holds it, so the lane is STILL RUNNING whatever its pidfile says (agent-infra#2787); its record stands and a later tick retries"
+      return 1 ;;
     2)
-      log_line "KEEP: not removing $1 — the live-holder probe could not be evaluated (${holder:-$HOLDER_PROBE_WHY}), and an unproven removal is the one thing this pass may not do (agent-infra#2787); a later tick retries"
-      return 2 ;;
+      WT_HOLD_WHY="the ARGV/cwd live-holder probe could not be evaluated (${holder:-$HOLDER_PROBE_WHY}), and an unproven removal is the one thing this pass may not do (agent-infra#2787)"
+      log_line "KEEP: not removing $wt — the live-holder probe could not be evaluated (${holder:-$HOLDER_PROBE_WHY}), and an unproven removal is the one thing this pass may not do (agent-infra#2787); a later tick retries"
+      return 1 ;;
   esac
   # ──8<── /holder-gate ──────────────────────────────────────────────────────────────────────
+  WT_WITNESS="none"
+  _wt_holder "$canon"; rc=$?
+  [ "$rc" -eq 2 ] || WT_WITNESS="ok"
+  if [ "$rc" -eq 0 ]; then
+    WT_HOLD_WHY="a LIVE process still holds it (pid $WT_HOLDER has this checkout as its cwd) — the recorded pid is gone but the lane's agent tree is not (agent-infra#2800)"
+    return 1
+  fi
+  # ⛔ A MISSING WITNESS IS NAMED, NOT FALLEN THROUGH SILENTLY — and it does not, on its own, forbid
+  # the removal: no `/proc` and no `lsof` is a shape whole boxes live in, and refusing there would keep
+  # every worktree for ever (the #1095 accumulation). Cleanliness is then the only safety property, and
+  # it is still a non-destructive one. `_release_wt` logs that degradation on the FIRST removal it makes
+  # under it, so a box without the witness cannot look like a box that checked everything.
+  _wt_clean "$canon" && return 0
+  return 1
+}
+_release_wt() { # <checkout> <label> — the ONLY destructive entry point for a lane worktree
+  # ⛔ THREE OUTCOMES, THREE RETURN CODES — because two outcomes and two codes made the third a LIE.
+  #   0 = REMOVED (the tree is gone) · 1 = HELD (a reading refused: a live holder, or work only on disk)
+  #   2 = the removal itself FAILED (git refused AND `rm -rf` refused — a busy mount, EPERM on a parent,
+  #       a read-only fs). Nothing was MEASURED to hold a 2: folding it into 1 made the tick's own
+  #       summary state the opposite cause on the one path this gate's failure handling exists for
+  #       (#2800 review round 7).
+  local wt="$1" label="$2" held="$1.lane-held" was_held=0 lane
+  # ⛔ THE TABLE IS RE-TAKEN PER REMOVAL, NOT PER SITE (#2800 review P2). The declared residual is "a
+  # holder that starts between the probe and the `rm` is not seen — the window is one probe wide", and a
+  # site-level memo made that a LIE by up to `RC_GRACE_S` (30 s) per stalled lane: `_settle_lanes` can
+  # sleep through a stalled lane's status grace between two removals, so the reading that cleared tree B
+  # could predate an operator (following the HELD line's own advice) starting a salvage session in it.
+  # One probe per removal is the cost of that claim being true. A tick's REMOVALS are rare; its
+  # CANDIDATES are not (a quarantined tree is re-evaluated every tick), which is exactly why the
+  # already-held short-circuit in `_wt_removable` makes the steady state cheap instead of N probes per
+  # tick for ever — see the block there.
+  _cwd_rows_reset
+  [ -f "$held" ] && was_held=1
+  if _wt_removable "$wt" "$was_held"; then
+    # ⛔ THE DEGRADATION IS ON THE REMOVAL, not only in a header comment: on a box with neither `/proc`
+    # nor `lsof` the cwd witness cannot answer, and "clean tree, so it went" must not read as "nothing
+    # was still running in it". Once per tick, so a many-lane reap does not repeat it per lane.
+    if [ "$WT_WITNESS" = "none" ] && [ "$_WITNESS_NOTED" = "0" ]; then
+      _WITNESS_NOTED=1
+      log_line "DEGRADED: the cwd witness is UNAVAILABLE ($CWD_WITNESS_WHY), so this removal rested on CLEANLINESS ALONE — a live agent writing in a still-clean checkout would not have been seen (agent-infra#2800). Re-seed the harness (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)"
+    fi
+    if _rm_wt "$wt"; then
+      # ⛔ THE MARKER IS DROPPED ONLY AFTER THE REMOVAL IS KNOWN TO HAVE HAPPENED (#2800 review round 6).
+      # Deleting it BEFORE `_rm_wt` meant a removal that mechanically FAILED (a busy mount, EPERM on a
+      # parent, a read-only fs) silently un-quarantined the tree: the next tick re-entered it as a FIRST
+      # sighting and logged a fresh `HELD:` transition, inverting the "named ONCE on its transition"
+      # contract in exactly the case that persists. The hold is over when the tree is GONE.
+      rm -f "$held" 2>/dev/null
+      [ "$was_held" -eq 0 ] \
+        || log_line "RELEASED: $label worktree $wt — the hold is over (no live holder, no uncommitted work)"
+      return 0
+    fi
+    # ⛔ A REMOVAL THAT FAILED IS ITS OWN OUTCOME — never the HOLD bucket (#2800 review round 7). The
+    # per-tree WARN (`_rm_wt`) was already honest; the tick's aggregate was not: returning 1 here fed
+    # the `h` counter, whose ONE line says "a live holder or uncommitted work was measured" — a cause
+    # this path MEASURED NOT to exist, and the operator it misdirects goes looking for a holder instead
+    # of fixing the EPERM/mount. So: `return 2`, its own counter, its own line. `WT_HOLD_WHY` is set
+    # because a marker must name what it is quarantining for; it also gives the tree a durable state.
+    WT_HOLD_WHY="the removal itself FAILED (see the WARN above — a busy mount, EPERM on a parent, a read-only fs); nothing here was measured to hold it, so a later tick retries"
+    if [ "$was_held" -eq 0 ]; then
+      # ⛔ THE MARKER IS WRITTEN ON A FAILED FIRST SIGHTING TOO. It is not a hold, but an ABSENT marker
+      # made "the quarantine stays" false for exactly this case and re-entered the tree as a first
+      # sighting on every tick for as long as the failure persisted: the per-tick re-latch the marker
+      # exists to prevent. A clean tree with a marker still takes the probe and is still retried — so
+      # this records the state without ever turning into a permanent hold.
+      printf '%s\n' "$WT_HOLD_WHY" >"$held" 2>/dev/null \
+        || log_line "WARN: cannot write the hold marker $held — this tree is re-evaluated (and re-logged) every tick until it is written"
+    fi
+    return 2
+  fi
+  # HELD — loud ON THE TRANSITION only, so a quarantined tree does not re-WARN every tick for ever.
+  if [ "$was_held" -eq 0 ]; then
+    lane="${wt##*/}"; lane="${lane#wt-drainer-}"
+    if ! printf '%s\n' "$WT_HOLD_WHY" >"$held" 2>/dev/null; then
+      log_line "WARN: cannot write the hold marker $held — this tree is re-evaluated (and re-logged) every tick until it is written"
+    fi
+    # ⛔ NOT A SILENT KEEP. The dispatcher's terminal record for this lane ($O/bg/<name>.end) names what
+    # the exit path did with the work (tree=clean|dirty, rescue=refs/wip/…), which is the first thing an
+    # operator needs and the cheapest way to decide whether to delete or rescue.
+    log_line "HELD: $label worktree $wt — NOT removed: $WT_HOLD_WHY. It stays until an operator (or the fleet's own worktree reaper) releases it; disk is cheaper than work. Lane record: $O/bg/$lane.end"
+  fi
+  return 1
+}
+_rm_wt() { # <worktree path> — the MECHANICAL removal, called only from `_release_wt`, never directly
   # ⛔ THE `|| rm -rf` FALLBACK IS NOT REDUNDANT: a leftover directory is not always a REGISTERED git
   # worktree (a wiped $SEED_REPO, a hand-made copy, a half-created tree), and `git worktree remove`
   # refuses those — so a reaper that only called git would leave them for ever and log "could not
   # remove" every tick (the shape that made 407 worktrees / 179 GB accumulate, #1095).
   git -C "$SEED_REPO" worktree remove --force "$1" >/dev/null 2>&1 && { rm -f "$1.lane-pid" 2>/dev/null; return 0; }
   rm -rf "$1" 2>/dev/null && { rm -f "$1.lane-pid" 2>/dev/null; return 0; }
+  # ⛔ THE STATUS IS THE REMOVAL'S, NOT THE LOG WRITE's (#2800 review round 6). `log_line` is
+  # `printf … >>"$LOG"`, so ending the function with it made every failure return 0 whenever the log was
+  # writable — and `_release_wt` branches on this status to print `RELEASED:` and to feed `REAPED:`. The
+  # WARN is honest; the RELEASED it enabled was false. `return 1` is the whole fix.
   log_line "WARN: could not remove the worktree at $1 — a later tick reaps it; it is named, not silent"
   return 1
 }
 _settle_lanes() {
-  local f name pid rc rc_file g w
+  local f name pid rc rc_file g w wrc
   for f in "$LANES_DIR"/*.pid; do
     [ -f "$f" ] || continue
     name="${f##*/}"; name="${name%.pid}"
@@ -801,17 +1158,22 @@ _settle_lanes() {
     # `RC_GRACE_S` on EVERY tick.
     w="$AI/wt-drainer-$name"
     if [ -d "$w" ]; then
-      _rm_wt "$w"
-      # ⛔ ONLY "HELD" AND "UNPROVABLE" MEAN "NOT FINISHED" (review finding, PR #3918). Treating ANY
-      # non-zero as still-running made a lane whose tree cannot be deleted (a permission, a half-broken
+      # ⛔ THE GATE IS `_release_wt` — THE ONE DESTRUCTIVE ENTRY POINT (#2800) — AND ITS THREE RETURN
+      # CODES ARE #2800's, not the removed `_rm_wt`'s 0/1/2/3. 0 = removed · 1 = HELD (a reading
+      # refused) · 2 = the removal itself FAILED. This is the #3918 mapping carried across unchanged:
+      # a HOLD means the lane has NOT ended, and a FAILED REMOVAL means it has.
+      _release_wt "$w" "lane $name"; wrc=$?
+      _wt_cause_tally "$wrc"
+      # ⛔ ONLY "HELD" MEANS "NOT FINISHED" (review finding, PR #3918). Treating ANY non-zero as
+      # still-running made a lane whose tree cannot be deleted (a permission, a half-broken
       # `$SEED_REPO`, `rm -rf` refused) un-settleable for ever: never reported, counted as live, its
-      # window held. rc 1 is the WARN path — the lane HAS ended, and it is reported as before.
-      case $? in
-        2|3) SETTLE_HELD=$((SETTLE_HELD + 1)); SETTLE_HELD_NAMES="$SETTLE_HELD_NAMES$name "
-             continue ;;
-        # rc 1 (removal refused, nothing holds it) settles as before — and is recorded as PROBED so
+      # window held. rc 2 is the STUCK path — the lane HAS ended, and it is reported as before.
+      case $wrc in
+        1) SETTLE_HELD=$((SETTLE_HELD + 1)); SETTLE_HELD_NAMES="$SETTLE_HELD_NAMES$name "
+           continue ;;
+        # rc 2 (removal refused, nothing holds it) settles as before — and is recorded as PROBED so
         # `_reap_leftovers` does not ask the same question again this tick.
-        1) SETTLE_WARN_NAMES="$SETTLE_WARN_NAMES$name " ;;
+        2) SETTLE_WARN_NAMES="$SETTLE_WARN_NAMES$name " ;;
       esac
     fi
     rc_file="$O/bg/$name.rc"
@@ -840,6 +1202,12 @@ _settle_lanes() {
       log_line "DONE: lane $name (pid $pid) finished rc=0"
     fi
     rm -f "$f" "$LANES_DIR/$name.slice" 2>/dev/null
+    # ⛔ THE TREE WAS ALREADY ANSWERED FOR ABOVE, AND THE RECORD IS NOT ITS ANSWER (#2787 × #2800).
+    # `_settle_lanes` probes the checkout FIRST and `continue`s when it is still held — that lane has not
+    # ended, so its verdict is deferred to the tick it truly ends, its slice window stays held and the
+    # census counts it (the incident's tick printed `lanes=0` while a `cap=3000s` lane ran). Releasing the
+    # tree again here would be a second probe of the same checkout in the same tick and would settle a
+    # record whose lane is still working. `_reap_leftovers` re-evaluates any tree this tick did not settle.
   done
 }
 # ⛔ `git worktree prune` IS NOT A LEFTOVER REAPER: it only drops administrative entries whose directory
@@ -848,9 +1216,9 @@ _settle_lanes() {
 # still in use; NO SIDECAR means UNKNOWN, and an unknown tree is left for an operator (a health job
 # does not guess).
 _reap_leftovers() {
-  local w lane n=0 nm
+  local w lane n=0 h=0 m=0 rc nm
   for w in "$AI"/wt-drainer-*; do
-    case "$w" in *.lane-pid) continue ;; esac       # the sidecar is not a worktree
+    case "$w" in *.lane-pid|*.lane-held) continue ;; esac   # the sidecars are not worktrees
     [ -d "$w" ] || continue
     # ⛔ A TREE THIS TICK'S SETTLE ALREADY KEPT (holder gate / unevaluable probe) OR ALREADY FAILED TO
     # REMOVE is not probed a second time. `_settle_lanes` runs first and holds the same verdict;
@@ -862,12 +1230,22 @@ _reap_leftovers() {
     [ -f "$w.lane-pid" ] && lane="$(tr -dc '0-9' 2>/dev/null <"$w.lane-pid")"
     [ -n "$lane" ] || continue
     kill -0 "$lane" 2>/dev/null && continue
-    # ⛔ COUNTED ONLY WHEN IT WAS ACTUALLY REMOVED. A tree kept by the holder gate (or by an
-    # unevaluable probe) is not a reap, and `REAPED: n` must not claim one.
-    _rm_wt "$w" && n=$((n + 1))
+    # A dead sidecar pid is NOT a dead lane (#2800): `_release_wt` asks the checkout's holder questions
+    # (both witness families) and its cleanliness question before anything is deleted, and quarantines
+    # what it cannot prove. The outcome is counted by CAUSE (`_wt_cause_tally`) rather than by return
+    # code alone, so the summary reports four outcomes and names no cause it did not measure.
+    _release_wt "$w" "leftover"; rc=$?
+    _wt_cause_tally "$rc"
   done
   git -C "$SEED_REPO" worktree prune >/dev/null 2>&1 || true
+  # THREE OUTCOMES, THREE LINES, EACH CARRIED BY ITS OWN COUNTER: removed / the removal itself FAILED
+  # (`STUCK:`) / a reading refused (`HELD:`). `_rm_wt ... && n=$((n+1))` could not tell the second from
+  # the third, and folding them together made the summary name a cause the tick had measured NOT to
+  # exist (#2800 review round 7).
+  n="$WT_TALLY_REMOVED"; h="$WT_TALLY_HELD"; m="$WT_TALLY_STUCK"
   [ "$n" -eq 0 ] || log_line "REAPED: $n leftover worktree(s) whose lane was gone"
+  [ "$m" -eq 0 ] || log_line "STUCK: $m leftover worktree(s) could NOT be removed — the removal itself FAILED (see the WARN above; a busy mount, EPERM on a parent, a read-only fs). NOT a quarantine: no live holder and no uncommitted work was measured. A later tick retries."
+  [ "$h" -eq 0 ] || log_line "HELD: $h leftover worktree(s) are quarantined — a live holder or uncommitted work was measured, so no removal; an operator releases them (agent-infra#2800)"
 }
 
 # ── GUARD 2: THE CENSUS — how many lanes this box is ALREADY running ───────────────────────────
@@ -1254,15 +1632,21 @@ BRIEFEOF
 _settle_lanes
 _reap_leftovers
 
-# ⛔ THE LANES DISPATCHED HERE ARE REMOVED ONLY WHEN THEIR PID IS PROVABLY DEAD. A signal to THIS tick
-# (launchd bootout, a reboot, an operator's Ctrl-C on a hand-run copy) says nothing about the lanes,
-# which may be mid-edit in their checkouts — `git worktree remove --force` there destroys uncommitted
-# work, the P0 this fleet has already paid for. The pid is the guard. (And because the tick never waits
-# for a lane, EVERY lane it dispatches outlives it: the next tick's settle removes the tree once the
-# pid is gone, which is why `_settle_lanes` — not this trap — is the normal removal path.)
+# ⛔ A SIGNAL TO THIS TICK SAYS NOTHING ABOUT THE LANES. They may be mid-edit in their checkouts when
+# launchd boots this tick out, a reboot lands, or an operator Ctrl-C's a hand-run copy — and
+# `git worktree remove --force` there destroys uncommitted work, the P0 this fleet has already paid
+# for. So the `kill -0` test below is a NECESSARY condition, never a sufficient one: a recorded pid
+# that is GONE is not a lane that is gone (#2800 — that pid is the dispatcher's backgrounded subshell,
+# and its agent survives it; see the #2800 block above), so every removal from this trap goes through
+# `_release_wt`, the ONE gate: no live holder in the checkout AND nothing that exists only on disk.
+# And because the tick never waits for a lane, EVERY lane it dispatches outlives it: the next tick's
+# `_settle_lanes` is the NORMAL removal path, and this trap is the exception.
 LANE_PIDS=()
 rm_worktrees_on_exit() { # [loud] — one aggregate line normally, per-lane detail on a signal
   local n pid w live=0
+  # ⛔ THE TICK'S OWN EXIT PATH ASKS THE SAME QUESTION AS THE SETTLE (#2800): a lane whose recorded pid
+  # is gone may still have its agent tree alive, so the removal goes through `_release_wt` — the ONE
+  # destructive entry point — never straight to `_rm_wt`, and it re-takes the cwd table itself.
   for n in "${LANE_PIDS[@]:-}"; do
     [ -n "$n" ] || continue
     pid="$(tr -dc '0-9' 2>/dev/null <"$LANES_DIR/$n.pid")"
@@ -1272,7 +1656,7 @@ rm_worktrees_on_exit() { # [loud] — one aggregate line normally, per-lane deta
       continue
     fi
     w="$AI/wt-drainer-$n"
-    [ -d "$w" ] && _rm_wt "$w"
+    [ -d "$w" ] && _release_wt "$w" "lane $n"
   done
   # ⛔ NOT A WARN. Every lane a tick dispatches outlives it (the tick never waits), so "left in place"
   # is the NORMAL state — a WARN per lane per tick is how a reader learns to ignore the log. The
