@@ -716,6 +716,16 @@ expectBranches("git push -d origin refs/heads/a refs/heads/b", ["a", "b"]);
 expectBranches("git push origin -d -q a b c", ["a", "b", "c"]); // cluster + three refspecs
 expectBranches("git push origin -d a :b", ["a", "b"]); // flag + colon-delete mix, one target each
 expectBranches("git push --delete a b", ["b"]); // lone-pair flag-first: a is the REMOTE only
+// #509 (review P2-1): `--delete` is a PUSH-WIDE option, so a refspec placed
+// BEFORE the flag is a delete target too. Probe-verified against a local bare
+// remote: `git push origin main -d b` prints `- [deleted] b` AND
+// `- [deleted] main`. Dropping the pre-flag positional left `main` — the branch
+// most likely to be checked out in a sibling or the hub — unguarded on the
+// degradation-fallback #73 arm.
+expectBranches("git push origin main -d b", ["main", "b"]);
+expectBranches("git push origin main --delete b", ["main", "b"]);
+expectBranches("git push origin main -d a b", ["main", "a", "b"]);
+expectBranches("git push origin -d", null); // lone positional BEFORE the flag = the REMOTE: nothing deleted
 expectBranches('git push origin --delete "feat/x"', ["feat/x"]);
 expectBranches("git push origin --delete 'feat/x'", ["feat/x"]);
 expectBranches("git push origin :feat/x", ["feat/x"]);
@@ -739,7 +749,6 @@ expectBranches("git push origin -o -d feat/x", null);
 // Consecutive arg-takers pair off → trailing -d is a REAL delete:
 expectBranches("git push origin -o -o -d feat/x", ["feat/x"]);
 expectBranches("git push origin -o -o -o -d feat/x", null); // odd chain consumes -d
-expectBranches("git push origin -d", null); // no target — invalid in git
 // Non-delete coloned refspecs (src:dst) are NOT deletes — never extracted.
 expectBranches("git push origin main:feature", null);
 expectBranches("git push origin HEAD:refs/heads/feat/x", null);
@@ -972,11 +981,40 @@ dexpect("push --delete colon form", `git push origin :feat/x`, { verdict: "block
 // coordinated block fires exactly as for --delete/:branch.
 dexpect("push -d short → isPushDelete + targets", `git push origin -d feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push -d flag-first → targets (first positional = the remote)", `git push -d origin feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
-// #509 parity pin: the detailed classifier already attributes EVERY delete
-// refspec; the whole-command `extractPushDeleteBranch` must agree, or the
-// degradation-fallback #73 arm guards only the first of a multi-refspec delete.
-dexpect("push -d flag-first multi-refspec → all targets", `git push -d origin a b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["a", "b"] });
-dexpect("push origin -d multi-refspec → all targets", `git push origin -d a b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["a", "b"] });
+// #509 (review P2-2): the two #443 surfaces must AGREE on every real delete
+// shape, so this is ONE surface-vs-surface assertion — not two independent pins
+// that no mutant of the change can red. A divergence in either the
+// whole-command extractor (degraded #73 arm) or the detailed classifier (full
+// path) fails here. On pre-#509 code `git push origin -d a b` reds (extractor
+// ["a"] vs ["a","b"]); the pre-flag shape reds if either side drops `main`.
+// Excluded, each for a documented reason: `git push origin -d` (no refspec —
+// detailed over-captures the repository, the extractor returns null; harmless,
+// safe direction) and `git push origin -o -d feat/x` (the `-d` is `-o`'s VALUE,
+// so it is not a delete at all — the detailed classifier's over-capture there is
+// the KNOWN IMPRECISION at classify-git.mjs, pre-existing and harmless).
+function expectDeleteSurfaceParity(command) {
+  const ext = extractPushDeleteBranch(command);
+  const det = classifyGitCommandDetailed(command);
+  const ok = det.verdict === "block:push-delete" && JSON.stringify(ext) === JSON.stringify(det.pushTargets);
+  console.log(`${ok ? "✅" : "❌"} delete-surface parity "${command.slice(0, 45)}": extractor ${JSON.stringify(ext)} vs detailed ${JSON.stringify(det.pushTargets)} (${det.verdict})`);
+  ok ? pass++ : fail++;
+}
+[
+  "git push origin -d a b",
+  "git push -d origin a b",
+  "git push origin --delete a b",
+  "git push origin main -d b",
+  "git push origin main --delete b",
+  "git push origin main -d a b",
+  "git push --delete origin c",
+  "git push --delete feat/x",
+  "git push -d origin feat/x",
+  "git push origin -d -q a b c",
+  "git push origin -d refs/heads/a refs/heads/b",
+  "git push origin -d a :b",
+  "git push origin :a :b",
+  "git push --delete chore/old-branch origin",
+].forEach(expectDeleteSurfaceParity);
 dexpect("push -dq cluster → delete", `git push origin -dq feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push -d refs target → short name", `git push origin -d refs/heads/feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push --del abbrev → delete", `git push origin --del feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
