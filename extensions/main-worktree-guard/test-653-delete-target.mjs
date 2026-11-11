@@ -119,7 +119,10 @@ if (typeof stripTypeScriptTypes !== "function" ||
   else register(new URL("./module-load-hooks.mjs", import.meta.url), import.meta.url);
   process.removeAllListeners("warning");
 
-  const savedEnv = new Map(["AGENT_ALLOW_MAIN_EDITS", "ELDATO_ALLOW_MAIN_EDITS", "AGENT_INFRA_PATH", "AGENT_LOCKS_DIR"]
+  // HOME IS IN THIS LIST because the fixture REBINDS it (the hermetic ~/.pi/agent), and
+  // the `finally` restore branches on `savedEnv.get("HOME")` — leaving it out DELETED the
+  // real HOME instead of restoring it (review observation on PR #3978).
+  const savedEnv = new Map(["AGENT_ALLOW_MAIN_EDITS", "ELDATO_ALLOW_MAIN_EDITS", "AGENT_INFRA_PATH", "AGENT_LOCKS_DIR", "HOME"]
     .map((v) => [v, process.env[v]]));
   const HATCH = ["AGENT_ALLOW_MAIN_EDITS", "ELDATO_ALLOW_MAIN_EDITS"];
 
@@ -292,6 +295,86 @@ if (typeof stripTypeScriptTypes !== "function" ||
         }
         // The control: the mutant must NOT redden the literal rows — otherwise the
         // "redden exactly the pins it reverts" claim would be false.
+        // ── M9/M10 — the SKEW path (review P1 of PR #3978) ──────────────────
+        // A stale/short `classify-git.mjs` must leave the fail-safe DEFAULT, never
+        // bind `undefined`: a destructuring-target binding did the latter and
+        // THREW a TypeError out of `_coordinatedDeleteBlock` on every
+        // delete-shaped command (`classifierLoaded` is still true — nothing threw
+        // at import). The mutant here is that stale module: the new export is
+        // gone, everything else is the shipped file.
+        const skewDir = join(tmp, "ext-skew");
+        cpSync(join(HERE, ".."), skewDir, {
+          recursive: true,
+          filter: (p2) => !p2.includes("node_modules") && !p2.endsWith(".git"),
+        });
+        const skewClassify = join(skewDir, "main-worktree-guard", "classify-git.mjs");
+        {
+          const cgSrc = readFileSync(skewClassify, "utf-8");
+          const start = cgSrc.indexOf("export function unresolvableDeleteTargets(");
+          const end = cgSrc.indexOf("\n}\n", start);
+          expectTrue("M9: the skew mutant could be built (a stale-module row that cannot be built proves nothing)",
+            start !== -1 && end !== -1);
+          if (start !== -1 && end !== -1) {
+            writeFileSync(skewClassify, cgSrc.slice(0, start) + cgSrc.slice(end + 3));
+          }
+        }
+        const skew = await loadGuard(join(skewDir, "main-worktree-guard", "index.ts"), hub);
+        expectTrue("M9b: the skewed module still LOADS (the export's absence must not be an import-time throw)",
+          skew.loaded, JSON.stringify(skew.warnings.filter((w) => w.includes("main-worktree-guard"))).slice(0, 200));
+        await quiet(() => skew.start(hub));
+        let skewThrew = null;
+        let skewLiteral = null;
+        try {
+          skewLiteral = await quiet(() => skew.bash("git push origin --delete held"));
+        } catch (e) {
+          skewThrew = String(e).slice(0, 160);
+        }
+        expectTrue("M10 (P1): under module skew a delete-shaped command does NOT throw — the fail-safe default holds",
+          skewThrew === null, String(skewThrew));
+        expectTrue("M10b (P1): and #73's own literal block still fires from the skewed module",
+          refusedBy(skewLiteral, HOLDS), `handler returned ${JSON.stringify(skewLiteral)?.slice(0, 160)}`);
+        let skewUnresolvedThrew = null;
+        try {
+          await quiet(() => skew.bash(`git push origin --delete "$PR_BRANCH"`));
+        } catch (e) {
+          skewUnresolvedThrew = String(e).slice(0, 160);
+        }
+        expectTrue("M10c (P1): the unresolvable form also does not throw under skew (it degrades to the pre-#653 ALLOW, which is what a stale module can know)",
+          skewUnresolvedThrew === null, String(skewUnresolvedThrew));
+
+        // ── M11 — the SAME skew, with the PRE-FIX BINDING (a destructuring target) ──
+        // This is the discriminating half of M10: the absent export is bound as
+        // `undefined` (a destructuring assignment overwrites the declared default),
+        // so the seam THROWS instead of degrading. If M11 does not throw, M10 is
+        // not measuring the binding and the P1 pin is dead weight.
+        const skew2Dir = join(tmp, "ext-skew-destructure");
+        cpSync(skewDir, skew2Dir, { recursive: true });
+        const skew2Index = join(skew2Dir, "main-worktree-guard", "index.ts");
+        {
+          const iSrc = readFileSync(skew2Index, "utf-8");
+          const guardBlock = `  if (typeof _m5.unresolvableDeleteTargets === "function") {\n    unresolvableDeleteTargets = _m5.unresolvableDeleteTargets;\n  }`;
+          const destructureAnchor = "     extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,";
+          const built = iSrc.includes(guardBlock) && iSrc.includes(destructureAnchor);
+          expectTrue("M11: the pre-fix-binding mutant could be built (a stale anchor is a failure, never a green)", built);
+          if (built) {
+            writeFileSync(skew2Index, iSrc
+              .replace(guardBlock, "")
+              .replace(destructureAnchor, destructureAnchor + "\n     unresolvableDeleteTargets,"));
+          }
+        }
+        if (skew2Dir) {
+          const skew2 = await loadGuard(skew2Index, hub);
+          await quiet(() => skew2.start(hub));
+          let preFixThrew = null;
+          try {
+            await quiet(() => skew2.bash("git push origin --delete held"));
+          } catch (e) {
+            preFixThrew = String(e).slice(0, 120);
+          }
+          expectTrue("M11 (P1, DISCRIMINATING): the destructuring binding THROWS under module skew — the shipped typeof guard does not",
+            preFixThrew !== null, "no throw: the M10 row is not measuring the binding");
+        }
+
         expectTrue("M7 mutant control: the literal delete of an unheld branch stays ALLOWED under the mutant",
           (await quiet(() => mut.bash("git push origin -d stale"))) === undefined);
         expectTrue("M8 mutant control: #73's own literal protection stays BLOCKED under the mutant",

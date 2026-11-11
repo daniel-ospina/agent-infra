@@ -204,7 +204,7 @@ PR_BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
 # (#653), because the guard cannot tell which ref such a target would delete. The
 # mitigation below is the WARN, not a bypass.
 #   → print the literal first:  echo "git push origin --delete $PR_BRANCH"
-git push origin --delete <branch-name-literal> 2>&1 || echo "⚠️ remote delete blocked/failed — retry after teardown or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/<branch-name-literal>"
+git push origin --delete feat/my-branch 2>&1 || echo "⚠️ remote delete blocked/failed — retry after teardown or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/feat/my-branch"
 # Local delete degrades gracefully: tolerate the worktree lock, do NOT fail the ceremony.
 # `git branch -D` (not -d) so a merged-but-not-fully-reconciled local branch still cleans up.
 if git worktree list --porcelain | grep -q "branch refs/heads/$PR_BRANCH"; then

@@ -1134,7 +1134,10 @@ for (const [name, target, want] of [
 {
   const t653 = readFileSync(new URL("./test-653-delete-target.mjs", import.meta.url), "utf-8");
   const rows = [
-    ["it sets an exit code from its verdict", /process\.exit\(fail === 0/.test(t653)],
+    // ⛔ THE POLARITY, NOT THE SHAPE (review observation on PR #3978): `/process\.exit\(fail === 0/`
+    // is satisfied by `process.exit(fail === 0 ? 0 : 0)` — the same vacuous green. Bind the whole
+    // expression, both outcomes included.
+    ["it sets an exit code from its verdict", /process\.exit\(fail === 0 && !vacuous \? 0 : 1\);/.test(t653)],
     ["it passes the skip/red OPTIONS object, not a bare number", /reportVerdict\("test-653-delete-target", pass, fail, \{ skip, red: vacuous \}\)/.test(t653)],
     ["a skipped behavioral half is reported as a failure", /behaviouralSkipped = true/.test(t653)],
   ];

@@ -4674,6 +4674,9 @@ function _isPushDeleteFlagToken(a) {
 //           the extractor reports a FRAGMENT of the substitution (`$(echo`) as if
 //           it were a ref name, so no ref ever matches and the arm allows.
 //   *  ?  [  ]   globbing — the shell expands to N words (or leaves the literal).
+//           `*`, `?` and `[` are ILLEGAL in a ref name (free to refuse); `]` is
+//           LEGAL and is refused too — a character class needs its closing bracket,
+//           and a lone `]` in a branch name is not worth a hole in the class.
 //   {  }     brace expansion — `{a,b}` becomes TWO words the guard never sees;
 //           measured: the extractor reads it as ONE token and allows. ⛔ ACCEPTED
 //           OVER-BLOCK: braces ARE legal in a ref name (`git check-ref-format --branch

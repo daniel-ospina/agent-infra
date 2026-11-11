@@ -119,8 +119,8 @@ BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null
 # brace expansion — is now REFUSED fail-closed (#653), because the guard cannot
 # tell which ref such a target would delete.
 # "remote ref does not exist" means deleteBranchOnMerge already removed it = success.
-git push origin --delete <branch-name-literal> 2>/dev/null \
-  || echo "ℹ️ remote branch <branch-name-literal> already deleted or unavailable"
+git push origin --delete feat/my-branch 2>/dev/null \
+  || echo "ℹ️ remote branch feat/my-branch already deleted or unavailable"
 
 # Local delete — best-effort. If the worktree was removed above the branch is no
 # longer checked out, but the HUB's main-checkout branch-force-delete gate still

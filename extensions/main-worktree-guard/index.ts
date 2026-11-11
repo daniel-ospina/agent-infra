@@ -160,6 +160,9 @@ let wholeCommandDeleteTargets: (verdict: string, command: string) => string[] = 
 // #653: the fail-closed delete-target predicate. The default mirrors the stub
 // above — with no extractor there are no delete names to judge — so a stale
 // classify-git module keeps today's degradation and cannot invent a block.
+// ⛔ BOUND BY A typeof GUARD, never by the destructuring target list: a
+// destructuring assignment binds `undefined` for a missing export, which would
+// THROW here rather than degrade (see the binding site's comment).
 let unresolvableDeleteTargets: (targets: string[]) => string[] = () => [];
 let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
@@ -328,7 +331,6 @@ let _currentHatchActive = false;
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
      extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
-     unresolvableDeleteTargets,
      getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS,
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
@@ -384,6 +386,19 @@ try {
   // #1139: the quote-aware shell tokenizer the pipe-seed walk uses (same skew
   // contract as above).
   if (typeof _m5.wtShellWords === "function") wtShellWords = _m5.wtShellWords;
+  // ⛔ #653 — NAMESPACE READ + typeof GUARD, NOT A DESTRUCTURING TARGET (review P1 of
+  // PR #3978, measured). The name was first added to the destructuring list above,
+  // and a destructuring ASSIGNMENT overwrites the declared fail-safe default with
+  // `undefined` when the export is absent — measured on this box (Node 24.21.0): a
+  // destructuring target whose key is missing from the source object binds
+  // `undefined`, it does not leave the earlier default in place — so on a
+  // stale/short classify-git.mjs `classifierLoaded` is
+  // still true and `_coordinatedDeleteBlock`'s call THROWS a TypeError on every
+  // delete-shaped command instead of degrading. That is the inverse of the default's
+  // own comment and of the #627/#628/#709/#3444 contract 15 lines below.
+  if (typeof _m5.unresolvableDeleteTargets === "function") {
+    unresolvableDeleteTargets = _m5.unresolvableDeleteTargets;
+  }
   // #967/#1484: the invocation's positional args feed the subcommand
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
