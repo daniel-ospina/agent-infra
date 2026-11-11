@@ -2865,6 +2865,178 @@ esac
 [ ! -e "$JEVCFG" ] && ok "…and no store was minted from a blank value" \
                    || bad "a store was written from a blank keys.env value: $(cat "$JEVCFG" 2>/dev/null)"
 
+# ── THE BOX'S REPO IS DERIVED, NEVER BAKED IN (agent-infra#2919) ────────────────────────────────
+# MEASURED on cell 4, 2026-10-27 16:29–16:38Z against origin/main 0d443381: `cloud-cell-bringup.sh:76`
+# assigned `REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"`, and `check_dispatch` hands that value to
+# the pre-flight as `OR` (the queue target). An agent-infra box was therefore refused provisioning THREE
+# TIMES IN A ROW — `NOT PROVISIONABLE: $REPO is /home/cmux/agent-infra … NOT the queue target
+# daniel-ospina/tortoise` — while every other leg reported `ok`; it passed only when the default was
+# overridden by hand, and the box had been running a TORTOISE clone to compensate. The arms below pin
+# the three things that failure needs: the slug is DERIVED from the checkout the box works, a
+# declaration still wins, and a box that can say neither is refused BY NAME (never guessed at).
+say_case "repo slug: DERIVED from the checkout's origin, never a repo name baked into the script"
+# ⛔ THE MUTATION ARM, and it is asked of the SHIPPED FILE rather than of a mutant copy: restoring
+# `REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"` (or any other repo name used as a default) is the
+# exact regression #2919 records, and this reddens on it. The pattern is anchored to an ASSIGNMENT
+# (`^REPO_SLUG=`) so this file's own prose — which quotes the pre-fix line — cannot satisfy it.
+if grep -Eq '^[[:space:]]*REPO_SLUG="?\$\{REPO_SLUG:-[A-Za-z0-9._-]+/[A-Za-z0-9._-]+' "$BRINGUP"; then
+  bad "$BRINGUP still DEFAULTS REPO_SLUG to a repo name — that is #2919 itself (a wrong target by default for every other repo)"
+else
+  ok "the shipped script carries NO default repo name for REPO_SLUG"
+fi
+if grep -q '^repo_slug_resolve() {' "$BRINGUP" && grep -q '^check_repo_slug() {' "$BRINGUP"; then
+  ok "…and the resolver it uses instead is present (repo_slug_resolve + check_repo_slug)"
+else
+  bad "the resolver is missing — nothing can derive the box's repo (agent-infra#2919)"
+fi
+# A REAL checkout per repo, because the subject IS what `git config` reports (see mk_checkout above).
+mk_checkout "$T/slug/agent-infra" https://github.com/daniel-ospina/agent-infra.git slug-ai \
+  && ok "fixture: an agent-infra checkout with a real 'origin'" \
+  || bad "fixture: could not build the agent-infra checkout"
+mk_checkout "$T/slug/tortoise" https://github.com/daniel-ospina/tortoise.git slug-t3 \
+  && ok "fixture: a tortoise checkout with a real 'origin'" \
+  || bad "fixture: could not build the tortoise checkout"
+# The sourceable copy lives beside the CURRENT repo-slug.sh (the parser and the shape rule are used by
+# name, so a fixture without them would test a degraded path instead of the shipped one).
+LIB2919="$T/clean-bringup/cloud-cell-bringup.sh"
+slug_drive() { # <declared-slug> <workdir> <declared-or>  → prints "<slug>|<source>|<rc>"
+  CELL_HOME="$T/home" bash -c '. "$1"; out=""; rc=0; out="$(repo_slug_resolve "$2" "$3" "$4")" || rc=$?; printf "%s|%s|%s\n" "$(printf "%s\n" "$out" | sed -n 1p)" "$(printf "%s\n" "$out" | sed -n 2p)" "$rc"' \
+    _ "$LIB2919" "$1" "$2" "$3" 2>&1
+}
+DERIVED="$(slug_drive "" "$T/slug/agent-infra" "")"
+case "$DERIVED" in
+  "daniel-ospina/agent-infra|derived from "*"'origin'|0") ok "an undeclared agent-infra box derives ITS own repo from WORKDIR's origin" ;;
+  *"daniel-ospina/tortoise"*) bad "an undeclared agent-infra box resolved to TORTOISE — the #2919 defect is back: $DERIVED" ;;
+  *) bad "the slug was not derived from the checkout's origin: $DERIVED" ;;
+esac
+# ⛔ NON-VACUITY: the same call on another checkpoint of the fleet must answer THAT repo, so the arm
+# above cannot be satisfied by a resolver that always says agent-infra.
+DERIVED_T3="$(slug_drive "" "$T/slug/tortoise" "")"
+case "$DERIVED_T3" in
+  "daniel-ospina/tortoise|derived from "*"'origin'|0") ok "…and a tortoise checkout derives tortoise (non-vacuity: the answer is measured, not fixed)" ;;
+  *) bad "a tortoise checkout did not derive tortoise: $DERIVED_T3" ;;
+esac
+# ⛔ `repo-slug.sh`'s own recorded rule: "An explicit OR in the environment … still WINS … but the default
+# is derived, never guessed". A declaration must never be silently overridden by whatever tree happens to
+# be on the box — that is the same silent override #2919 measured, one direction over.
+DECL="$(slug_drive "daniel-ospina/agent-infra" "$T/slug/tortoise" "")"
+case "$DECL" in
+  "daniel-ospina/agent-infra|declared in REPO_SLUG|0") ok "a declared REPO_SLUG WINS over a different checkout's origin" ;;
+  *) bad "a declared REPO_SLUG lost to the checkout's origin (or was not reported as the source): $DECL" ;;
+esac
+DECL_OR="$(slug_drive "" "$T/slug/tortoise" "daniel-ospina/agent-infra")"
+case "$DECL_OR" in
+  "daniel-ospina/agent-infra|declared in OR|0") ok "a declared OR is arm 1b — it wins too, and says so" ;;
+  *) bad "a declared OR was ignored or misreported: $DECL_OR" ;;
+esac
+# ⛔ THE ARM #2919 ASK 1 EXISTS FOR: with nothing declared and nothing to derive, the answer is a
+# REFUSAL, never a guess. A repo name here is the defect, so this arm fails on any answer that is one.
+NOTHING="$(slug_drive "" "$T/slug/absent" "")"
+case "$NOTHING" in
+  "||1") ok "with nothing declared and no checkout, the resolver REFUSES instead of guessing a repo" ;;
+  *) bad "the resolver invented an answer with nothing to resolve: $NOTHING" ;;
+esac
+BADPIN="$(slug_drive "acme/wid get" "" "")"
+case "$BADPIN" in
+  "||2") ok "a pin that is not an <owner>/<name> is rc 2 (a config error), not a silent fallback" ;;
+  *) bad "a malformed pin was not refused as a config error: $BADPIN" ;;
+esac
+case "$(slug_drive '*' "" "")" in
+  "||2") ok "…and the wildcard '*' is refused, so it cannot reach repo_identity_scan as the ANY-REPO exemption" ;;
+  *) bad "REPO_SLUG='*' passed validation — every repo under a generic name would read clean: $(slug_drive '*' '' '')" ;;
+esac
+# ── the refusal NAMES the remedy, and never the wrong-repo one (agent-infra#2919 ask 2) ──────────
+# The pre-fix message an agent-infra operator got was the PRE-FLIGHT's, whose only remedy was
+# `fix: set REPO=<a checkout of daniel-ospina/tortoise>` — i.e. fetch another repo and grade its issues
+# from this box, which is the mis-target #1901 and the GH_REPO class (#2235) exist to prevent.
+# ⛔ `env -u REPO_SLUG -u OR` IS LOAD-BEARING: this suite's own environment may carry either (a cell
+# exports them to every child), and a run that inherited one would take arm 1 and never reach the
+# refusal — the arm would then assert on a resolution it did not exercise.
+REFUSAL="$(env -u REPO_SLUG -u OR CELL_HOME="$T/home" WORKDIR="$T/slug/absent" \
+  bash -c '. "$1"; check_repo_slug; echo "rc=$?"' _ "$LIB2919" 2>&1)"
+case "$REFUSAL" in
+  *"REPO_SLUG=<owner/name of the repo THIS BOX is for>"*) ok "the refusal names the declaration that fixes it (REPO_SLUG=<this box's repo>)" ;;
+  *) bad "the refusal does not name REPO_SLUG — the operator is left to invent a remedy: $REFUSAL" ;;
+esac
+case "$REFUSAL" in
+  *"set REPO=<"*) bad "the refusal offers the WRONG-REPO remedy (point REPO at another checkout) — that is #2919 ask 2: $REFUSAL" ;;
+  *) ok "…and it does NOT invite the operator to point REPO at another repo's checkout" ;;
+esac
+case "$REFUSAL" in
+  *"rc=0"*) bad "the box was CERTIFIED with no repo at all: $REFUSAL" ;;
+  *) ok "…and a box with no resolvable repo is refused, not certified" ;;
+esac
+# The whole point of the change: an undeclared agent-infra box now RESOLVES and publishes it.
+# Driven from a FILE rather than nested `bash -c` quoting: the subject is "does a CHILD process see the
+# value", so the child has to be a real one, and a quoting accident inside the arm would read as a
+# product failure.
+cat > "$T/publish-probe.sh" <<'PROBE'
+. "$1"
+check_repo_slug >/dev/null 2>&1 || { printf 'rc=%s' "$?"; exit 0; }
+printf 'rc=0 slug=[%s] exported=[%s]' "$REPO_SLUG" "$(sh -c 'printf %s "$REPO_SLUG"')"
+PROBE
+PUBLISHED="$(env -u REPO_SLUG -u OR CELL_HOME="$T/home" WORKDIR="$T/slug/agent-infra" \
+  bash "$T/publish-probe.sh" "$LIB2919" 2>&1)"
+case "$PUBLISHED" in
+  "rc=0 slug=[daniel-ospina/agent-infra]"*) ok "check_repo_slug publishes the derived value ($PUBLISHED)" ;;
+  *) bad "the derived slug was not published: $PUBLISHED" ;;
+esac
+case "$PUBLISHED" in
+  *"exported=[daniel-ospina/agent-infra]") ok "…and EXPORTS it, so the pre-flight and the supervisor's children see it" ;;
+  *) bad "the derived slug is not exported — a child would fall back to its own idea of the repo: $PUBLISHED" ;;
+esac
+# ── the DISPATCH refusal (rc 3), the message the issue actually measured (ask 2) ─────────────────
+# A stub harness whose pre-flight refuses the way the real one does on a queue/checkout mismatch. The
+# subject is the FATAL the operator reads, not the pre-flight's own text (which has its own suite).
+mkdir -p "$T/harness-refuse"
+cat > "$T/harness-refuse/refresh-candidates.sh" <<'STUBREF'
+#!/bin/bash
+printf '%s\n' '[refresh] NOT PROVISIONABLE: $REPO is /home/cmux/agent-infra, whose origin is … — NOT the queue target daniel-ospina/tortoise'
+exit 3
+STUBREF
+DISPATCH_REF="$(CELL_HOME="$T/home" HARNESS="$T/harness-refuse" WORKDIR="$T/slug/agent-infra" REPO_SLUG="daniel-ospina/tortoise" \
+  bash -c '. "$1"; check_dispatch; echo "rc=$?"' _ "$LIB2919" 2>&1)"
+case "$DISPATCH_REF" in
+  *"REPO_SLUG='daniel-ospina/tortoise'"*) ok "the dispatch refusal NAMES the queue target it used, so the operator can tell which side is wrong" ;;
+  *) bad "the dispatch refusal does not name the queue target it used: $DISPATCH_REF" ;;
+esac
+case "$DISPATCH_REF" in
+  *"set REPO_SLUG=<that repo's owner/name>"*) ok "…and names REPO_SLUG as the remedy when this box is for another repo" ;;
+  *) bad "the dispatch refusal offers no REPO_SLUG remedy — an agent-infra box gets no way out: $DISPATCH_REF" ;;
+esac
+case "$DISPATCH_REF" in
+  *"DO NOT fix this by pointing REPO at a checkout of another repo"*) ok "…and REFUSES the wrong-repo remedy in words (the mis-target #1901 exists to prevent)" ;;
+  *) bad "the dispatch refusal does not warn against pointing REPO at another repo — that is what made an agent-infra cell grade tortoise work: $DISPATCH_REF" ;;
+esac
+# ── END TO END through the SHIPPED pre-flight: the pairing the derivation produces is ACCEPTED ────
+# The arms above test the resolver; this one runs the REAL `refresh-candidates.sh --check` to prove the
+# value it produces passes the very comparison that refused the box (the origin pairing, #1901). It is
+# the non-vacuity arm for the whole change: a resolver whose answer the pre-flight still refuses would
+# satisfy every arm above and fix nothing.
+PREFLIGHT="$HERE/orchestrator-harness/refresh-candidates.sh"
+if [ -f "$PREFLIGHT" ]; then
+  PF_DERIVED="$(REPO="$T/slug/agent-infra" OR="$(slug_drive "" "$T/slug/agent-infra" "" | cut -d'|' -f1)" \
+    O="$T/pf-derived" bash "$PREFLIGHT" --check 2>&1)" || true
+  case "$PF_DERIVED" in
+    *"NOT the queue target"*) bad "the pre-flight REFUSED the pairing its own derivation produces — the box still cannot be provisioned: $(printf '%s' "$PF_DERIVED" | tr '\n' ' ' | cut -c1-300)" ;;
+    *) ok "the REAL pre-flight accepts the derived pairing (the origin comparison that refused cell 4 is passed)" ;;
+  esac
+  # AND THE OTHER DIRECTION, so a pre-flight that simply stopped comparing could not satisfy the arm above.
+  PF_MISMATCH="$(REPO="$T/slug/agent-infra" OR="daniel-ospina/tortoise" O="$T/pf-mismatch" \
+    bash "$PREFLIGHT" --check 2>&1)" || true
+  case "$PF_MISMATCH" in
+    *"NOT the queue target"*) ok "…and it still REFUSES a queue target that is a different repo (the check is not inert)" ;;
+    *) bad "a genuinely mismatched queue target was not refused — the pairing check went inert: $(printf '%s' "$PF_MISMATCH" | tr '\n' ' ' | cut -c1-300)" ;;
+  esac
+  # …and its remedy names BOTH directions, never the wrong-repo one alone (ask 2 for the pre-flight).
+  case "$PF_MISMATCH" in
+    *"set REPO_SLUG=<that repo's owner/name>"*) ok "…and its remedy names REPO_SLUG first, not 'clone the other repo'" ;;
+    *) bad "the pre-flight's remedy still offers only 'set REPO=<a checkout of …>': $(printf '%s' "$PF_MISMATCH" | tr '\n' ' ' | cut -c1-300)" ;;
+  esac
+else
+  bad "missing $PREFLIGHT — the end-to-end pairing arm cannot run"
+fi
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIPPED=$SKIP"
 if [ "$SKIP" -gt 0 ]; then
