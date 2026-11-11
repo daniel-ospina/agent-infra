@@ -24,12 +24,17 @@
 # extracted from the REAL `atomic-land.sh`. Both are awk extractions over the shipped
 # files (never copies — a copy would drift), each asserted non-empty and asserted to
 # contain the fix, so a refactor that moves the seam fails loudly instead of testing
-# nothing. A mutation arm re-introduces the #1614 reversal in a mutant and shows the
-# dead-end-gate arm goes RED there.
+# nothing. TWO mutation arms: (f) re-introduces the #1614 reversal in a mutant and
+# shows the dead-end-gate arm goes RED there, and (h) re-spells the classifier's
+# reason prefix and shows arm (a) — the only arm the classification can change — goes
+# RED there. (h) exists because a copy of that CLASSIFIER used to be emitted inside
+# the extracted lib's body and silently shadow the extract (review P1).
 #
 # ✖ The rail's whole behaviour under the knob is pinned by `tests/admin-merge/run.sh`
-# (arm (e) there is the integration proof of the #1614 gate; arm (g) here is the same
-# decision at unit level, and is what the mutation arm discriminates)
+# (arm (e) there is the integration proof of the #1614 gate, arm (f) the integration
+# proof that the CLASSIFICATION reaches the decision — `no-pr-trigger` + a failed
+# probe read; arm (g) here is the same decision at unit level, and is what mutation
+# (f) discriminates)
 # and the wait itself by `tests/first-checks-lane-rederive/run.sh`; this file pins only
 # the decisions that were wrong.
 #
@@ -79,12 +84,15 @@ build_lib() { # $1 = source path, $2 = output file
     printf '%s\n' 'run_s0b() {'
     printf '%s\n' '  local ANY_WORKFLOW="$1" WORKFLOW="$2" head="deadbeef" WF_PR_CHANGED_PATHS="scripts/admin-merge.sh" wf_args=() lane="python-ci.yml"'
     printf '%s\n' '  AP_LOG=""'
-    printf '%s\n' '  lane_no_pr_trigger() {'
-    printf '%s\n' '    case "${1:-}" in'
-    printf '%s\n' "      'lane-applicable: no-pr-trigger'*) return 0 ;;"
-    printf '%s\n' '    esac'
-    printf '%s\n' '    return 1'
-    printf '%s\n' '  }'
+    # ⛔ NO INLINE COPY OF `lane_no_pr_trigger` HERE (review P1). One used to be
+    # emitted inside this function body, and a definition in the body wins at CALL
+    # time — so it REPLACED the extracted helper below and the real bytes never ran.
+    # Every arm was then invariant to the classifier: re-spelling the reason prefix
+    # that `scripts/ci-workflow-pr-evaluable.sh` emits (`lane-applicable:
+    # no-pr-trigger`) re-opened #2465's 3900 s burn with this whole suite green. The
+    # helper appended AFTER `run_s0b`'s closing brace is the one that must run — the
+    # guard below asserts it is the only definition in the lib, and arm (h) is the
+    # mutation that proves arm (a) discriminates on it.
     printf '%s\n' "$block"
     printf '%s\n' '  printf "ANY_WORKFLOW=%s\n" "$ANY_WORKFLOW" >&2'
     printf '%s\n' '  printf "WF_ARGS=%s\n" "${wf_args[*]:-}" >&2'
@@ -107,6 +115,12 @@ ck "the extracted block CONTAINS the structural branch (not testing an empty sea
    "$(grep -q 'lane_no_pr_trigger "\$LANE_APPLICABILITY_REASON"' "$LIB" && echo 0 || echo 1)"
 ck "the extracted block CONSULTS the three-valued run probe (the #1614 gate is in the seam)" \
    "$(grep -q 'lane_head_run_state "\$head"' "$LIB" && echo 0 || echo 1)"
+# ⛔ THE ONE THAT SHADOWED IT (review P1). `lane_no_pr_trigger` must be defined
+# EXACTLY ONCE in the lib, and that definition must be the EXTRACT — a copy inside
+# `run_s0b` re-defines it at call time and the shipped classifier never executes, so
+# no arm could go red when it stopped classifying. Counted, not eyeballed.
+ck "the lib defines lane_no_pr_trigger EXACTLY ONCE — the extract, with no shadowing copy (review P1)" \
+   "$([ "$(grep -c 'lane_no_pr_trigger() {' "$LIB")" -eq 1 ] && echo 0 || echo 1)"
 
 # drive <verdict> <reason> <probe_state> → sets R_ANY / R_WFARGS / R_LANE / R_LOG / R_ERR
 # ⛔ `bash < "$LIB"`, NEVER `bash -c 'source "$1"'`: the suite must stay RUNNABLE
@@ -231,6 +245,43 @@ MUT_ERR="$(AP_VERDICT="inapplicable" AP_REASON='lane-applicable: no-pr-trigger �
 MUT_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$MUT_ERR")"
 ck "(f) against the mutant, arm (g)'s assertion is RED (ANY_WORKFLOW='$MUT_ANY' — a lane that DID run for the head is widened away)" \
    "$([ "$MUT_ANY" = 1 ] && echo 0 || echo 1)"
+
+# ── (h) MUTATION PROOF — re-spell the classifier, arm (a) must go RED ──────
+# (review P1) The arms above are all INVARIANT to `lane_no_pr_trigger` except (a):
+# (b) and (c2) widen on a probe answer of `none`, (g) keeps on `has-run`, and (c)/(c3)
+# are `paths-excluded`. The only state where the CLASSIFICATION itself decides is
+# `structural + unreadable` (`admin-merge.sh:9913`), so with the shadow removed arm
+# (a) is the attributable row — and this mutation is its falsifier. The edit is the
+# realistic one: the reason string is produced in ANOTHER file
+# (`scripts/ci-workflow-pr-evaluable.sh` emits `lane-applicable: no-pr-trigger`), and
+# classifier and producer are coupled only by that string prefix, so a re-spelling on
+# either side silently de-classifies the lane. If arm (a) cannot tell this mutant from
+# the shipped source, the arm is decorative and the 3900 s burn is reachable again.
+echo "(h) MUTATION: the classifier's reason prefix re-spelled → arm (a) is RED there (review P1)"
+CLMUT="$TMP/classifier-mutant.sh"
+awk '
+  /^    .lane-applicable: no-pr-trigger.\*\) return 0 ;;$/ {
+    print "    " sprintf("%c",39) "lane-applicable: structural" sprintf("%c",39) "*) return 0 ;;"
+    n++; next
+  }
+  { print }
+  END { exit (n == 1 ? 0 : 1) }
+' "$SRC" > "$CLMUT"
+ck "(h) the classifier mutation applied EXACTLY once to the reason match (a silent no-op mutation would prove nothing)" "$?"
+ck "(h) the mutant parses (bash -n)" "$(bash -n "$CLMUT" 2>/dev/null && echo 0 || echo 1)"
+CLMUTLIB="$TMP/classifier-mutant-lib.sh"
+build_lib "$CLMUT" "$CLMUTLIB"
+ck "(h) the mutant still builds a lib with the classifier in it (not testing an empty seam)" \
+   "$(grep -q 'lane-applicable: structural' "$CLMUTLIB" && echo 0 || echo 1)"
+# Arm (a)'s own fixture, driven against the mutant: the same structural + UNREADABLE
+# case that must widen. The classifier no longer matches, so `lane_structural` stays 0,
+# the `*` arm resolves to no dead end, and the filter is kept — #2465's burn.
+CM_ERR="$(AP_VERDICT=inapplicable \
+  AP_REASON='lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_call)' \
+  AP_PROBE_STATE=unreadable bash < "$CLMUTLIB" 2>&1 >/dev/null)"
+CM_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$CM_ERR")"
+ck "(h) against the mutant, arm (a)'s 'the fallback FIRED' assertion is RED (ANY_WORKFLOW='$CM_ANY' — the 3900 s poll is back)" \
+   "$([ "$CM_ANY" = 0 ] && echo 0 || echo 1)"
 
 echo
 echo "── B. atomic-land --no-wait must REACH the step that waits ────────────────"

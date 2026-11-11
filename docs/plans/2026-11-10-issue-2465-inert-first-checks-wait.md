@@ -48,9 +48,9 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 
 | Surface | Change | Test layer |
 |---|---|---|
-| `admin-merge.sh` §0b decision | structural class bypasses the probe | `tests/issue-2465-inert-wait/run.sh` A(a)-(e) + mutation (f) |
+| `admin-merge.sh` §0b decision | the THREE-valued probe is consulted for EVERY inapplicable class; `has-run` never widens, `none` widens, `unreadable` widens only for the STRUCTURAL class | `tests/issue-2465-inert-wait/run.sh` A(a)-(e) + mutations (f)/(h); integration in `tests/admin-merge/run.sh` §#1614 arms (e) and (f) |
 | `admin-merge.sh` §0b `unknown` arm | was silent → prints reason + escape | same suite A(d) |
-| `admin-merge.sh` `lane_no_pr_trigger` (new helper) | reason classifier | same suite (extraction + arms) |
+| `admin-merge.sh` `lane_no_pr_trigger` (new helper) | reason classifier — which class §0b is in | unit: arm (a) is the attributable row, plus the single-definition guard and mutant (h) (`tests/issue-2465-inert-wait/run.sh`); integration: `tests/admin-merge/run.sh` §#1614 **arm (f)** — a `no-pr-trigger` lane whose single probe read FAILED |
 | `admin-merge.sh` FIRST-CHECKS wait | **unchanged** (contract intact) | `tests/first-checks-lane-rederive/run.sh` (37 arms, re-run) |
 | `atomic-land.sh` `do_land` | env carry to the land step | `tests/issue-2465-inert-wait/run.sh` B1-B5 |
 | `tests/*/run.sh` discovery | new suite auto-wired by the glob (`scripts/run-bash-shards.sh:203`) | shard runner |
@@ -82,6 +82,15 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
    `unreadable` still fails closed; **A(g) STRUCTURAL + `has-run` → NO widening**, with mutant
    (f) rebuilding the reversal to prove (g) is load-bearing. The integration proof of the #1614
    gate remains `tests/admin-merge/run.sh` §#1614 arm (e).
+   ⛔ **THE CLASSIFIER MUST BE EXECUTED BY A TEST** (review P1): `lane_no_pr_trigger` decides
+   whether the whole branch is reachable, and the reason string it matches is produced in a
+   DIFFERENT file (`ci-workflow-pr-evaluable.sh`), so the two are coupled only by a string
+   prefix. A copy of the helper emitted inside the lib's `run_s0b` used to SHADOW the extract,
+   which made every arm invariant to it and left a re-spelled prefix green while #2465's burn
+   came back. Now: the lib defines it exactly once (a counted guard), mutant (h) re-spells the
+   prefix and reds arm (a), and `tests/admin-merge/run.sh` §#1614 arm (f) pins the same state at
+   integration level (STRUCTURAL + an UNREADABLE probe → fallback fires, class named, read
+   failure named, lane dropped from the certificate).
 2. Print the `unknown` arm's reason + the `--any-workflow` escape (it was `:` — quiet by design).
    Test: A(d) asserts the line; deleting it reds A(d).
 3. Carry `--no-wait` into the land step as `ADMIN_MERGE_FIRST_CHECKS_WAIT=0`, never overriding an
@@ -118,6 +127,11 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
   class widens on TWO grounds (`none` and `unreadable`) and only one of them measured "no run",
   so the class text branches on the probe state; unit arm (a) asserts the `unreadable` case does
   NOT claim "the lane has NO run for head" and the certificate line was corrected the same way.
+- R8 the CLASSIFIER is executed by no test (review P1) — a re-spelled reason prefix silently
+  de-classifies the lane and restores the 3900 s poll with a green board → the unit suite's
+  shadowing copy is gone (a counted single-definition guard), mutant (h) proves arm (a)
+  discriminates on the classifier, and rail arm (f) produces the only state in which the
+  classification changes the outcome (`structural + unreadable`).
 
 **Threat classes** (`gate-enforcement`): `T1` fail-open by widening the merge surface — must be
 impossible; the only widening is to the surface `--any-workflow` already selects, and §4.5

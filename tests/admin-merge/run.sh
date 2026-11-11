@@ -13364,6 +13364,54 @@ grep -q "lane: python-ci.yml" "$SCEN/out" \
   && pass "(e) …and the certificate still names the requested lane" \
   || fail "(e) the certificate no longer names the lane that was actually used"
 
+# ── (f) THE CLASSIFIER ITSELF: STRUCTURAL + the probe's read FAILED ─────────
+# Every arm above is INVARIANT to the classifier except this one: (a) writes an
+# EMPTY lane listing (probe → `none`, which widens on the measurement alone), (d)
+# is `paths-excluded`, and (e) is `has-run` (which never widens). The only state in
+# which `lane_no_pr_trigger` decides the outcome is `structural + unreadable`
+# (`admin-merge.sh:9913`) — #2465's MEASURED burn, one failed `gh run list` on the
+# default `workflow_call`-only lane. No arm produced it, so re-spelling the reason
+# prefix (its producer lives in ANOTHER file, `scripts/ci-workflow-pr-evaluable.sh:
+# ``lane-applicable: no-pr-trigger``, and the two are coupled only by that prefix)
+# left the whole board green while restoring the 3900 s poll #2465 was filed for.
+# This arm keys on the classification: the probe's read is failed THROUGH THE
+# COUNTED SEAM (`fail-run-list-nth`) so the parser and the wait stay readable and
+# the arm grades the DECISION, not a listing outage. The probe is §0b's FIRST
+# `gh run list`; a shift in that order reds this arm loudly (the fixture's other
+# reads would answer, and the STRUCTURAL/read-FAILED assertions would not match)
+# rather than silently decomposing into a no-op.
+new_scen lanestructunreadable
+HEAD_LF="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LF" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml "$REUSABLE_YAML"
+pr_changed_files bin/agent-infra.js tests/drift/run.sh
+printf '1\n' > "$SCEN/fail-run-list-nth"
+# The truth of this shape: the lane has no run (it cannot have one) AND the read
+# failed. Both are needed — the empty lane-filtered listing is what the mutant's
+# kept filter finds, while the fallback never reads it.
+: > "$SCEN/runs-$HEAD_LF.by-workflow.python-ci.yml"
+lane_pass "$HEAD_LF" 20051 > "$SCEN/runs-$HEAD_LF"
+lane_pass mainlane 20052 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(f) STRUCTURAL + an UNREADABLE probe is repaired: the rail falls back and proceeds (exit $rc) — #2465's burn" \
+  || { fail "(f) one failed 'gh run list' still dead-ends the rail on a workflow_call-only lane (exit $rc)"; sed 's/^/      /' "$SCEN/err" | head -25; }
+grep -q "dead-end class: STRUCTURAL" "$SCEN/err" \
+  && pass "(f) …and the classification that SELECTED the branch is named on stderr" \
+  || fail "(f) the fallback did not classify the lane as STRUCTURAL — the classifier no longer selects the branch"
+grep -q "read FAILED" "$SCEN/err" \
+  && pass "(f) …on the measured ground: the probe's READ failed, not a measured absence of runs" \
+  || fail "(f) the message does not name the failed read — the P2 regression, back again"
+grep -q "lane has NO run for head" "$SCEN/err" \
+  && fail "(f) it claims 'no run for head' although the read FAILED — an unmeasured claim" \
+  || pass "(f) …and it does NOT claim the lane has no run for the head (that answer was never read)"
+grep -q "lane: any workflow" "$SCEN/out" \
+  && pass "(f) …and the certificate was produced on the full evaluated surface" \
+  || fail "(f) the certificate still claims the inapplicable lane"
+
 # ── 68. #1623: an UNEXPANDED run is not in flight ──────────────────────────
 # GitHub can leave a workflow run `queued` FOREVER without ever creating a job for
 # it (measured on PR #1615: three such runs, `status=queued`, `conclusion=null`,
