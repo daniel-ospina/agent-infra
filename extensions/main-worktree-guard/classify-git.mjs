@@ -8188,7 +8188,17 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   let envSawAssign = false;        // cycle-34 P2-2: env option parsing ENDS at the first name=value operand
   let spawnerOperandNext = false;  // a spawner flag that takes an operand
   const SPAWNER_WORDS = new Set(["sudo", "env", "xargs", "nohup", "command", "time", "nice", "doas", "stdbuf", "timeout", "builtin", "exec", "setsid"]); // exec = spawner prefix (r37 P3); setsid cycle-32 P1-1
-  let dirStack = [];            // pushd/popd directory stack (cycle-23 F2)
+  let dirStack = [];            // pushd/popd directory stack (cycle-23 F2) — REVERSED:
+                               // its END is the entry just below the top (the one
+                               // `pending`/a bare popd consumes). bash's own model
+                               // is [cwd, …pushed] with index 0 = the CURRENT dir
+                               // (`dirs` prints it left to right), and its indexed
+                               // forms (`pushd +N`/`-N`, `popd +N`/`-N`) index INTO
+                               // that list. vstack/setVStack are the ONLY conversion
+                               // points so a rotation can never disagree about
+                               // orientation (#3955).
+  const vstack = (top) => [top, ...dirStack.slice().reverse()];
+  const setVStack = (S) => { dirStack = S.slice(1).reverse(); return S[0]; };
   let dirStackSnapshots = [];  // FULL copy per ( - restored at ) (cycle-24 P1 r29 D1-D3:
                                // a subshell gets a COPY — ( popd ) must not eat an inherited entry)
   const SPAWNER_FLAG_OPERANDS = {
@@ -9425,8 +9435,46 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       const tgt = readWord(nxt);
       i = tgt.k;
       const isPushd = w0.w === "pushd";
-      // flag / +N / bare forms don't cd (conservative no-op) — only a dir operand
-      if (isPushd && (!tgt.w || tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { f().pending = null; continue; }
+      // ── The dir stack's INDEXED forms (#3955's "flag/+N" half). Real bash
+      // (measured, bash 5.2.21) indexes a stack whose element 0 is the CURRENT
+      // directory:
+      //   pushd +N  rotate LEFT by N, so element N becomes the top, then cd
+      //   pushd -N  rotate RIGHT by N+1, then cd        (`-0` ⇒ right by 1)
+      //   popd  +N  REMOVE element N without cd         (N=0 ⇒ cd to the new top)
+      //   popd  -N  REMOVE element len-1-N without cd
+      //   popd  --  exactly a bare popd
+      //   popd  -n  remove the element a bare popd would have cd'd to; keep cwd
+      //   pushd -n <dir>  INSERT <dir> at index 1; keep cwd
+      // An out-of-range index is a bash ERROR: stack and cwd both untouched.
+      // Treating them ALL as "no cd AND no stack change" (the previous model)
+      // drifted the walker's cwd off bash's in BOTH directions — measured
+      // fail-OPENs (`cd a; pushd ../docs; pushd ../a; pushd +1; echo x >
+      // tracked.md` really overwrites the TRACKED `docs/tracked.md`, while the
+      // walker resolved `a/tracked.md` → ALLOW; likewise `pushd -1`, `popd +0`
+      // and `pushd -n ../docs; popd`) and measured false positives (`popd --`).
+      if (isPushd) {
+        const numeric = /^([+-])([0-9]+)$/.exec(tgt.w || "");
+        if (numeric) {
+          const S = vstack(f().cwd);
+          const n = Number(numeric[2]);
+          const k = numeric[1] === "+" ? n : n + 1;              // left by N · right by N+1
+          if (k > 0 && k < S.length) {                           // k===0 → identity; k>=len → bash error
+            f().pending = setVStack(numeric[1] === "+"
+              ? S.slice(k).concat(S.slice(0, k))                    // rotate left
+              : S.slice(S.length - k).concat(S.slice(0, S.length - k))); // rotate right
+          }
+          continue;
+        }
+        if (tgt.w === "-n") {                                   // -n <dir>: insert below the top, no cd
+          const nw = readWord(skipWsNl(tgt.k));
+          i = nw.k;
+          const ins = nw.w && nw.w !== "~" && !nw.w.startsWith("~/") && nw.w !== "-" ? resolve(cwd, nw.w) : null;
+          if (ins && existsSync(ins)) { const S = vstack(f().cwd); S.splice(1, 0, ins); setVStack(S); }
+          continue;
+        }
+        // remaining flag forms (`-`, `--`, `+` with no digits) never cd — conservative no-op
+        if (!tgt.w || tgt.w.startsWith("-")) { f().pending = null; continue; }
+      }
       let next = null;
       if (tgt.w && tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
         const cand = resolve(cwd, tgt.w);
@@ -9464,7 +9512,21 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     if (w0.w === "popd") {
       const tgt = readWord(skipWsNl(i));
       i = tgt.k;
-      if (tgt.w && (tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { continue; } // -n/+N: no cd
+      // Indexed / filtered forms — see the vstack block in the pushd handler.
+      const sel = /^([+-])([0-9]+)$/.exec(tgt.w || "");
+      if (sel) {
+        const S = vstack(f().cwd);
+        const idx = sel[1] === "+" ? Number(sel[2]) : S.length - 1 - Number(sel[2]);
+        if (idx >= 0 && idx < S.length) f().pending = setVStack(S.slice(0, idx).concat(S.slice(idx + 1)));
+        continue;                                              // out of range → bash error, no change
+      }
+      if (tgt.w === "-n") {                                    // drop the entry a bare popd would cd to
+        const S = vstack(f().cwd);
+        if (S.length > 1) setVStack(S.slice(0, 1).concat(S.slice(2)));
+        continue;
+      }
+      if (tgt.w && tgt.w !== "--" && tgt.w.startsWith("-")) { continue; } // unmodelled flag form — conservative
+      if (tgt.w && tgt.w !== "--" && /^[^+-]/.test(tgt.w)) { continue; }   // path operand → bash errors, no change
       const d = dirStack.pop();
       f().pending = d !== undefined && existsSync(d) ? d : null; // empty stack → bash no-op
       continue;

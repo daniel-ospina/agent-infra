@@ -4927,6 +4927,71 @@ try {
     blocks(["tracked.md"], "true | cd docs; echo x > tracked.md", "F1 gate (tightened, NOTE 1): only the ROOT tracked.md is tracked, so the mutant's docs/ resolution cannot pass");
   }
 
+  // ── #3955 (C) round-47: the dir stack's INDEXED and FILTERED forms. Real bash
+  // (measured, bash 5.2.21) indexes a stack whose element 0 is the CURRENT
+  // directory: `pushd +N` rotates LEFT by N then cds; `pushd -N` rotates RIGHT
+  // by N+1 then cds; `popd +N` REMOVEs element N without cd (`+0` is a bare
+  // popd, so it cd's to the new top); `popd -N` removes element len-1-N;
+  // `popd --` is exactly a bare popd; `popd -n` drops the element a bare popd
+  // would have cd'd to; `pushd -n <dir>` INSERTS <dir> at index 1 without cd;
+  // and an out-of-range index is a bash ERROR (stack and cwd both untouched).
+  //
+  // The walker treated EVERY one of those as "no cd AND no stack change", which
+  // drifts its cwd off bash's in BOTH directions. The four `R*` rows were
+  // measured FAIL-OPENs (the gate ALLOWed a tracked hub write real bash
+  // performs) and `C2` was a measured FALSE POSITIVE; each family tracks ONE
+  // file (the #3957 review NOTE 1 lesson — a fixture tracking both candidate
+  // paths cannot grade the gate, since the right and wrong resolutions both
+  // BLOCK). ⚠️ These rows are #3955's own "flag/+N form" target, whose body
+  // asserted `+N` does NOT cd; RE-MEASURED here it does, so the target's remedy
+  // is to MODEL the rotation rather than to ignore it.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r47-"));
+    for (const d of ["a", "b", "c", "docs"]) mkdirSync(join(H, d));
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r47: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const verdict = (tracked, cmd) =>
+      firstHubTrackedWrite(cands(cmd).map((x) => ({ rel: x.resolvedPath.slice(H.length + 1) })), tracked) !== null;
+    const blocks = (tracked, cmd, label) => expectBool(`C437r47: ${label}`, verdict(tracked, cmd), true);
+    const allows = (tracked, cmd, label) => expectBool(`C437r47: ${label}`, verdict(tracked, cmd), false);
+
+    // `pushd +1` — the measured #3955 fail-open. From `a` with the stack
+    // [a, docs, a], `+1` makes docs the top; real bash overwrites TRACKED
+    // docs/tracked.md, while "no stack change" left the walker in `a` → ALLOW.
+    has("cd a; pushd ../docs; pushd ../a; pushd +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R+1: pushd +1 rotates left by N and cds");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../a; pushd +1; echo x > tracked.md", "R+1 gate: TRACKED docs/tracked.md → BLOCK");
+    // `pushd -1` — rotate RIGHT by N+1 (`-0` ⇒ right by 1).
+    has("cd a; pushd ../docs; pushd ../a; pushd -1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R-1: pushd -1 rotates right by N+1 and cds");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../a; pushd -1; echo x > tracked.md", "R-1 gate: TRACKED docs/tracked.md → BLOCK");
+    // `popd +0` removes the TOP, i.e. exactly a bare popd — it cd's to the new top.
+    has("cd a; pushd ../docs; pushd ../a; popd +0; echo x > tracked.md", "redirect:H/docs/tracked.md", "R+0: popd +0 removes element 0 and cd's to the new top");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../a; popd +0; echo x > tracked.md", "R+0 gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd a; pushd ../docs; pushd ../a; popd +1; echo x > tracked.md", "redirect:H/a/tracked.md", "R+0 control: popd +1 removes a NON-top element — the cwd does not move");
+    // `pushd -n <dir>` inserts at index 1 WITHOUT cd, so the next bare popd cd's
+    // there. "No stack change" lost that entry entirely → ALLOW.
+    has("cd a; pushd -n ../docs; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R-n: pushd -n inserts below the top without cd; the popd lands on it");
+    blocks(["docs/tracked.md"], "cd a; pushd -n ../docs; popd; echo x > tracked.md", "R-n gate: TRACKED docs/tracked.md → BLOCK");
+    // Positive control: the SAME rotation in the other direction must not block.
+    has("cd docs; pushd ../a; pushd ../docs; pushd +1; echo x > tracked.md", "redirect:H/a/tracked.md", "C1 control: a rotation AWAY from docs lands in a");
+    blocks(["a/tracked.md"], "cd docs; pushd ../a; pushd ../docs; pushd +1; echo x > tracked.md", "C1 control gate: only a/tracked.md is tracked — the a resolution is graded, not assumed");
+    // `popd --` is exactly a bare popd (measured) — treating it as a flag no-op
+    // FALSE-POSITIVEd on docs/tracked.md.
+    has("cd a; pushd ../docs; popd --; echo x > tracked.md", "redirect:H/a/tracked.md", "C2 control: popd -- behaves exactly like a bare popd (a)");
+    allows(["docs/tracked.md"], "cd a; pushd ../docs; popd --; echo x > tracked.md", "C2 control gate: the a write is untracked → ALLOW (no false positive on docs)");
+    // Out-of-range index = bash ERROR, nothing changes — the ONE arm where the old
+    // "no-op" answer was right, pinned so a bounds check cannot over-rotate.
+    has("cd a; pushd ../docs; pushd ../a; pushd +9; echo x > tracked.md", "redirect:H/a/tracked.md", "C3 control: pushd +9 is out of range — bash errors, cwd stays a");
+    has("cd a; pushd ../docs; pushd ../a; popd -9; echo x > tracked.md", "redirect:H/a/tracked.md", "C4 control: popd -9 is out of range — bash errors, cwd stays a");
+    // #3955's own Targets line: the forms whose `pushd` does NOT cd must leave the
+    // dir stack untouched, so a later bare popd cannot consume an entry bash never
+    // created. The model is deliberately self-consistent for the unprovable ones
+    // (`$VAR`/`~`): no cd AND no push, which is where bash also lands.
+    has("pushd $NOPE; cd a; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T$: an unresolved $VAR pushd neither cd's nor pushes — the popd is a bash no-op");
+    has("cd a; pushd ~; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T~: pushd ~ is modelled no-cd/no-push and stays self-consistent (bash also lands back in a)");
+    has("cd a; pushd +1; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T+: pushd +1 on a 1-entry stack is out of range — no push, so the popd cannot steal an entry");
+  }
+
 
   // walk (`>`/`>>`/`tee`/python open) never surfaced `sed -i`/`cp`/`mv`/
   // `truncate`/`dd of=`/`perl -pi`/`awk -i inplace` onto a tracked hub file,
