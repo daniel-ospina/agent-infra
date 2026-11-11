@@ -420,8 +420,7 @@ _gh_auth_blind_ancestor() {
   while [ -n "$a" ] && [ "$a" != "/" ]; do
     # A non-directory ancestor ends the walk: nothing can be stored UNDER a file, so the store is ABSENT
     # however the file's permission bits read.
-    if [ -e "$a" ] && [ ! -d "$a" ]; then return 1; fi
-    if { [ -d "$a" ] && ! _gh_auth_searchable "$a"; } || { [ -L "$a" ] && [ ! -e "$a" ]; }; then
+    if { [ -e "$a" ] && ! _gh_auth_searchable "$a"; } || { [ -L "$a" ] && [ ! -e "$a" ]; }; then
       printf '%s\n' "$a"; return 0
     fi
     case "$a" in */*) a="${a%/*}" ;; *) return 1 ;; esac
