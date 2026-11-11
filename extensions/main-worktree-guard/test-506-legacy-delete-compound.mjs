@@ -32,6 +32,17 @@
 //       only ADD a block and never returns an allow. Without it, part (1) alone
 //       would silently WEAKEN #73 inside linked worktrees (where the legacy arm
 //       is exempt by design).
+//   (3) classify-git.mjs (review round 8, P1): the SKIMMED re-test — the pass
+//       that reconstructs each invocation because `-C`/`-c`/`GIT_DIR` prefixes
+//       defeat the raw regexes' `git <verb>` adjacency — used to run only when
+//       the raw pass found NOTHING. A delete spelling IS a raw hit, so it made
+//       that pass unreachable: `git -C . reset --hard && git push origin --delete
+//       stale` kept `block:push-delete`, whose #73 arm allows when the target is
+//       held nowhere, and the hard reset RAN in the shared hub (measured). Both
+//       passes now run and are combined by PRIORITY (the pattern array is a
+//       priority list), so the verdict always names the compound's most severe
+//       verb — the prefix class, not one spelling of it (`-C .` reset + `-f`
+//       force-push was laundered identically).
 //
 // Run: node extensions/main-worktree-guard/test-506-legacy-delete-compound.mjs
 //      node extensions/main-worktree-guard/test-506-legacy-delete-compound.mjs --mutations
@@ -115,6 +126,30 @@ const CLASSIFIER_PINS = [
   // command is ALLOWED, matching the `-d` twin (B13/B13b).
   ["A17 commit message mentioning a --delete (pre-existing echo over-match)",
     'git commit -m "revert: stop running git push origin --delete main"', "block:push-delete", false, []],
+  // ── review round 8 (P1): the PREFIX-DEFEATED spelling of the lead verb ──
+  // The raw pass cannot see `git -C . reset --hard` (the `-C`/`-c`/`GIT_DIR`
+  // prefix defeats the patterns' `git <verb>` adjacency), and it USED to gate
+  // the skimmed re-test on `verdict === "allow"` — so a delete spelling that
+  // the raw pass DID match made the skimmed pass unreachable and the compound
+  // kept the LEAST severe verdict. These rows pin the combined-by-priority
+  // rule: the verdict names the compound's most severe verb, while the delete
+  // FACTS are still reported.
+  ["A23 -C-prefixed reset + --delete", "git -C . reset --hard && git push origin --delete stale",
+    "block:reset", true, ["stale"]],
+  ["A24 -C-prefixed stash pop + --delete", "git -C . stash pop && git push origin --delete stale",
+    "block:stash-pop", true, ["stale"]],
+  // The delete FIRST: the skimmed pass must not STOP at the delete segment (its
+  // own `push-delete` hit) when the raw verdict already was `push-delete` — the
+  // prefix-hidden verb lives in a LATER segment.
+  ["A25 --delete FIRST, -C-prefixed reset SECOND",
+    "git push origin --delete stale && git -C . reset --hard", "block:reset", true, ["stale"]],
+  // The force-push twin: same class, one verdict over. Raw matches `force-push`
+  // (also a LESS severe owner than the hidden reset — index.ts's ownership
+  // allowance admits `block:force-push` on the baseline), so the same rule keeps
+  // the reset either way. This row is why the fix is stated as a PRIORITY rule
+  // rather than a `push-delete`-only exception.
+  ["A26 -C-prefixed reset + force-push (force-push twin)",
+    "git -C . reset --hard && git push -f origin main", "block:reset", false, []],
 ];
 for (const [label, cmd, verdict, isPushDelete, targets] of CLASSIFIER_PINS) {
   const d = classifyGitCommandDetailed(cmd);
@@ -150,6 +185,15 @@ for (const [label, cmd, want] of [
     "git push origin --delete stale", "block:push-delete"],
   ["A15b PIN of the reorder: the frozen classifier names the LEAD verb, not the delete",
     "git stash pop && git push origin --delete stale", "block:stash-pop"],
+  // The frozen classifier is byte-FROZEN (back-compat) and its raw whole-command
+  // scan cannot see a prefix-defeated verb, so it still reports the delete for
+  // A23's command. That is DECLARED, not fixed here: `classifyGitCommandDetailed`
+  // is the classifier index.ts consumes EXCLUSIVELY (plan deviation 8), and the
+  // degraded fallback (which does read this one) only runs when classify-git.mjs
+  // itself failed to load. This row makes the residual visible instead of
+  // letting a reader assume the frozen layer was fixed too.
+  ["A28 DECLARED residual: the FROZEN classifier still launders the -C-prefixed lead verb",
+    "git -C . reset --hard && git push origin --delete stale", "block:push-delete"],
 ]) {
   expectTrue(label, classifyGitCommand(cmd) === want, `got ${classifyGitCommand(cmd)}`);
 }
@@ -319,6 +363,41 @@ if (typeof stripTypeScriptTypes !== "function" ||
       why: "union-NOT-replace: `pushTargets` is [held,stale] while the extractor sees only " +
            "[stale] (the documented -o value over-capture). Adopting the extractor wholesale " +
            "would ALLOW this; the union keeps `held` attributed" },
+    // ── review round 8, P1: the PREFIX-DEFEATED spelling ──
+    // The classifier's skimmed re-test exists BECAUSE `-C`/`-c`/`GIT_DIR` prefixes
+    // defeat the raw regexes' `git <verb>` adjacency, and it used to run only when
+    // the raw pass found NOTHING. A delete spelling IS a raw hit, so it made the
+    // skimmed pass unreachable and the compound kept `block:push-delete` — the one
+    // verdict whose #73 arm returns an ALLOW when the target is checked out
+    // nowhere. These rows drive the real handler, because the verdict is only a
+    // string and the harm is the hub command that RUNS.
+    { id: "P1", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git -C . reset --hard && git push origin --delete stale",
+      why: "round 8 P1: a `-C`-prefixed hard reset must not be laundered by the delete spelling " +
+           "(measured pre-fix: ALLOWED, so the reset ran in the shared hub)" },
+    { id: "P2", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git -C . stash pop && git push origin --delete stale",
+      why: "round 8 P1: the same laundering through the stash family (it fails identically)" },
+    { id: "P3", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git -C . reset --hard && git push origin --delete held",
+      why: "round 8 P1: in a worktree the legacy arm is exempt by design, so the delete half must " +
+           "still hit #73 — the fix must not trade the sibling check for the legacy verdict" },
+    { id: "P4", dir: "hub", expect: "block", marker: "Working-tree discard blocked",
+      cmd: "git --git-dir=$PWD/.git reset --hard && git push origin --delete stale",
+      why: "round 8 CONTROL: this prefix spelling ALREADY blocked pre-fix (the raw reset pattern " +
+           "matches `\\.git reset` — `.` is a non-word char, so `\\bgit` holds) — and M5's discard " +
+           "gate owns the refusal here, which is exactly the point: the P1/P2 spellings are the class, " +
+           "not a blanket over the word `git`" },
+    { id: "P5", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git -C . reset --hard",
+      why: "round 8 CONTROL + attribution: the prefixed reset ALONE already blocks (the skimmed pass " +
+           "fires when the raw pass finds nothing), so P1's pre-fix allow was attributable to the " +
+           "delete spelling making that pass unreachable — not to the prefix defeating the guard" },
+    { id: "P6", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git -C . reset --hard && git push -f origin main",
+      why: "round 8: the FORCE-PUSH twin of the same class. `block:force-push` is also admitted by " +
+           "the ownership allowance on the baseline, so the hidden reset ran pre-fix here too — " +
+           "which is why the fix is a PRIORITY rule, not a push-delete-only exception" },
   ];
 
   /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
@@ -657,6 +736,26 @@ if (typeof stripTypeScriptTypes !== "function" ||
           expectRed: ["B17"],
           redCheck: (r) => !blocked(r),
           expectGreen: ["B6", "B10", "B14", "B16"],
+        },
+        {
+          // (11) THE SKIMMED PASS RE-GATED ON `allow` — the round-8 defect put
+          // back. The raw pass's hit (a delete spelling, or a force-push) makes
+          // the skimmed re-test unreachable again, so the prefix-defeated lead
+          // verb keeps the LESS severe verdict and P1/P2/P6 return to ALLOWED.
+          // The three controls are what keep this from being a claim: P5 (the
+          // prefixed verb alone) still blocks — the skimmed pass still runs when
+          // the raw pass finds nothing, exactly as before this fix — and P3/P4
+          // were already blocked pre-fix and stay blocked.
+          label: "skimmed pass gated on allow again (pre-fix short-circuit)",
+          file: "classify-git.mjs",
+          revert: (src) => src.replace(
+            "  for (const inv of invocations) {\n    if (patternIdx === 0) break; // already the highest-priority pattern",
+            "  for (const inv of (patternIdx === -1 ? invocations : [])) { // MUTANT: pre-fix short-circuit\n    if (patternIdx === 0) break;",
+          ),
+          expectRed: ["P1", "P2", "P6"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P3", "P4", "P5", "B1"],
+          classifier: ["git -C . reset --hard && git push origin --delete stale", "block:push-delete"],
         },
       ];
 
