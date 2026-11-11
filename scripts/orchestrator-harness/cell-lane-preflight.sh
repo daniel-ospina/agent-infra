@@ -139,6 +139,40 @@ emit() {
 # `run_agent`, `rc=0, agent launched` — a lane dispatched by a probe that never measured anything,
 # against this file's own EXIT table ("2 CANNOT MEASURE — EVERY caller must refuse too"). The exit
 # code stays 2 (it IS cannot-measure); what changes is that it can now be READ.
+# ⛔ CODE STALENESS IS A READINESS FIELD (agent-infra#3932). This file existed to answer "can this box
+# complete a model call" — and a checkout hundreds of commits behind passes that perfectly. Measured
+# 2026-12-02 on all five cells: c1 496, c2 7093, c3 705, c5 542 commits behind origin/main, and
+# `LANE_CAPABILITY=ok` was emitted on every one. A lane cut from that base produces a PLAUSIBLE LOG AND A
+# WRONG DIFF: it re-derives something main already fixed, or reverts it. That is indistinguishable from a
+# working lane until the work is read, and tortoise is the product this base feeds.
+#
+# The reading is `HEAD..origin/main` AFTER A BOUNDED FETCH, so the number is measured rather than
+# remembered from a possibly-stale ref (the very "flag that records a past state" failure this file's
+# sibling issues describe). A fetch that fails or times out yields `behind=unknown` and does NOT refuse —
+# an unanswerable network read is a WARN, the same doctrine as `no-answer`.
+MAX_BEHIND="${CELL_PREFLIGHT_MAX_BEHIND:-50}"
+FETCH_BOUND="${CELL_PREFLIGHT_FETCH_BOUND:-12}"
+
+code_freshness() {
+  local repo="" behind="" cand
+  for cand in "${CELL_PREFLIGHT_REPO:-}" "$HOME/tortoise" "$HOME/agent-infra"; do
+    [ -n "$cand" ] || continue
+    if [ -e "$cand/.git" ]; then repo="$cand"; break; fi
+  done
+  [ -n "$repo" ] || { printf 'repo=none behind=unknown'; return 0; }
+  # Bounded fetch. `timeout` is absent on macOS and this suite runs on both, so the bound is a
+  # background pid + a counted sleep, matching the watchdog form the repo already uses (#2046).
+  ( cd "$repo" 2>/dev/null && git fetch --quiet origin main >/dev/null 2>&1 ) &
+  local fp=$! n=0
+  while [ "$n" -lt "$FETCH_BOUND" ] && kill -0 "$fp" 2>/dev/null; do sleep 1; n=$((n+1)); done
+  kill -0 "$fp" 2>/dev/null && kill "$fp" 2>/dev/null
+  behind="$( cd "$repo" 2>/dev/null && git rev-list --count HEAD..origin/main 2>/dev/null )"
+  case "${behind:-}" in
+    ''|*[!0-9]*) printf 'repo=%s behind=unknown' "$(basename "$repo")" ;;
+    *)           printf 'repo=%s behind=%s' "$(basename "$repo")" "$behind" ;;
+  esac
+}
+
 die_usage() { printf '%s: %s\n' "$PROG" "$*" >&2; emit "refused why=usage" "usage-error=$*"; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -297,7 +331,20 @@ while [ "$n" -le "$ATTEMPTS" ]; do
   attempts_used=$n
   if grep -qF "$TOKEN" "$TMPD/out.$n" 2>/dev/null; then
     if [ "$A_RC" -eq 0 ] && [ "$A_KILLED" -eq 0 ]; then
-      emit "ok" "answered_ms=$A_FIRST_MS returned_ms=$A_WALL_MS attempts=$n bound=${BOUND}s key=$KEY_SOURCE"
+      # ⛔ THE BOX CAN ANSWER; IS ITS CODE CURRENT? A stale base is the failure this gate was blind to
+      # (#3932): the model call succeeds and the lane then builds on a month-old checkout.
+      FRESHNESS="$(code_freshness)"
+      FRESH_BEHIND="${FRESHNESS##*behind=}"
+      case "$FRESH_BEHIND" in
+        ''|*[!0-9]*) : ;;   # unmeasurable: reported below, never a refusal
+        *)
+          if [ "$FRESH_BEHIND" -gt "$MAX_BEHIND" ]; then
+            emit "refused why=stale-code" "answered_ms=$A_FIRST_MS attempts=$n bound=${BOUND}s $FRESHNESS max_behind=$MAX_BEHIND"
+            exit 1
+          fi
+          ;;
+      esac
+      emit "ok" "answered_ms=$A_FIRST_MS returned_ms=$A_WALL_MS attempts=$n bound=${BOUND}s key=$KEY_SOURCE $FRESHNESS"
       exit 0
     fi
     # answered, then failed or hung
