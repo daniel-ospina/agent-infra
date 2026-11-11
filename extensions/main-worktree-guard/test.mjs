@@ -4303,6 +4303,48 @@ try {
   expectBool("B52m: a PIPED `-c` consumer's body is DATA, while a piped interpreter's body is a program (round-2 P2)",
     extractScriptPath(`cat <<'X' | bash -c 'cat >/dev/null'\necho hi\n"${sBodyHub}"\nX`) === null &&
     extractScriptPath(`cat <<'X' | bash\necho hi\n"${sBodyHub}"\nX`) === sBodyHub, true);
+  // ⛔ ROUND-3 F1 (blocking, fail-OPEN): a pipe to the RIGHT of the heredoc is
+  // NOT the heredoc's consumer. The predicate returned the pipe consumer's
+  // verdict unconditionally, so `bash <<EOF | bash helper.sh` resolved `[]`
+  // while real bash runs the body as the LEFT shell's program — a fail-open
+  // introduced inside this change (commits 1-2 resolved the shape; the round-2
+  // P2 fix generalised "the consumer decides" to pipes that never see the
+  // heredoc). The rule: the segment that OWNS the `<<` decides FIRST; only when
+  // that segment is not an interpreter does the pipe consumer decide.
+  expectBool("B52n: a pipe AFTER the heredoc does not veto the body its OWN opener executes (round-3 F1)", (() => {
+    const body = `echo hi\n"${sBodyHub}"`;
+    return extractScriptPath(`bash <<EOF | bash helper.sh\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF | bash -c 'true'\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF | python3 -c 'pass'\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF | tee /tmp/x\n${body}\nEOF`) === sBodyHub &&
+      // …and the resolved set carries the BODY's file, never the pipe consumer's
+      !extractScriptPaths(`bash <<EOF | bash helper.sh\n${body}\nEOF`).includes("helper.sh");
+  })(), true);
+  // The over-block half of the same predicate: an opener that is NOT a
+  // stdin-program shell (a `-c` string, a script operand) makes the body that
+  // program's stdin DATA even when its stdout is piped into another shell.
+  expectBool("B52n-ii: a `-c`/script-operand OPENER keeps the body DATA through a pipe (round-3 F1, over-block half)", (() => {
+    const body = `"${sBodyHub}"`;
+    return extractScriptPath(`bash -c 'echo hi' <<EOF | bash\n${body}\nEOF`) === null &&
+      extractScriptPath(`bash layout.sh <<EOF | bash\n${body}\nEOF`) === "layout.sh" &&
+      extractHeredocProgramScriptPaths(`bash -c 'echo hi' <<EOF | bash\n${body}\nEOF`).length === 0;
+  })(), true);
+  // ⛔ ROUND-3 F2 (blocking, fail-OPEN): bash ends a heredoc on a line that IS
+  // the delimiter — no leading or trailing blanks — and `<<-` strips leading
+  // TABS only. The split used `trim()`, so `   EOF` ended the body early and
+  // routed the REST of the program into the COMMAND-LINE scan, which resolves
+  // ONE path: it resolved the benign `true` and never read the file the body
+  // really executes (measured ALLOWED while real bash runs the marker line and
+  // continues). The trim() precedent is the M5 DISCARD walk's, where ending a
+  // body early exposes MORE text — here the polarity is reversed.
+  expectBool("B52o: the heredoc TERMINATOR is matched exactly, as bash does (round-3 F2)", (() => {
+    const body = `true\n"${sBodyHub}"`;
+    return extractScriptPath(`bash <<EOF\n   EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF\nEOF   \n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<-EOF\n  EOF\n${body}\nEOF`) === sBodyHub && // `<<-` strips TABS, not spaces
+      // positive `<<-` control: a TAB-indented terminator still ends the body
+      extractScriptPath(`bash <<-EOF\n\ttrue\n\t"${sBodyHub}"\n\tEOF`) === sBodyHub;
+  })(), true);
 
   // ── Write gate (W) — resolveTargetTopLevel predicate ──
   const hubTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: hubR, encoding: "utf-8" }).trim());

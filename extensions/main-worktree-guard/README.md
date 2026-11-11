@@ -2459,15 +2459,19 @@ is data). Both directions are pinned. A `-c`/`--command` inline string is not a
 program source for the body either: `bash -c '…' <<EOF` gives the body to the
 `-c` string as stdin DATA, so walking it could only over-block — the predicate
 follows where the program COMES FROM (no script operand, no inline string, no
-process substitution, last fd-0 redirect is the heredoc), which is the same rule
-through a pipe (`cat <<'X' | bash` → program; `| bash -c '…'` → data).
+process substitution, last fd-0 redirect is the heredoc). The segment that OWNS
+the `<<` decides that first: `bash <<EOF | bash helper.sh` runs the body as the
+LEFT shell's program (the pipe consumes that shell's stdout and never sees the
+heredoc) → program, while `cat <<'X' | bash` hands the body to the pipe consumer
+→ program via `bash`, and a piped `| bash -c '…'` → data. And the body ends
+where bash ends it: on a line that IS the delimiter, with no leading or trailing
+blanks (`<<-` strips leading TABS, and only tabs) — a space-padded `   EOF` is a
+body line, not a terminator.
 **Declared residuals of this arm** (declared in #523's scope; ⛔ NOT all of them
 fail toward gating — two are measured fail-AWAY and are listed as such rather
 than as a comfort): the command LINE itself still contributes ONE script (the
-one-script-per-command-line class is #3538, unchanged here); a `<<` terminator is
-matched with `trim()` (the M5 precedent), so a space-padded terminator ends the
-body here while bash keeps it open — which can only expose MORE text to the walk,
-not less; two heredocs on ONE header line are handled one at a time (the
+one-script-per-command-line class is #3538, unchanged here); two heredocs on ONE
+header line are handled one at a time (the
 `_wtScanLine` one-heredoc-per-line contract), so `bash <<A; bash <<B` runs B's
 body while this walk resolves no path for it — **fail-AWAY, measured**; the
 nested-body walk is depth-bounded at two levels (`_programScriptPaths`), so a

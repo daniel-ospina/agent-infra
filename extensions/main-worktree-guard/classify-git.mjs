@@ -2835,6 +2835,10 @@ function _wtScanLine(line, carry) {
   let arith = carry?.arith ?? 0;
   let delim = null;
   let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
+  // `<<-EOF` (dash form) strips leading TABS from every body line INCLUDING the
+  // terminator line before bash compares it; the plain form strips nothing
+  // (#523 round-3 F2). Consumers that match the terminator need this flag.
+  let delimDash = false;
   let atWordStart = true;
   while (i < line.length) {
     const ch = line[i];
@@ -2862,7 +2866,8 @@ function _wtScanLine(line, carry) {
     }
     if (ch === "<" && line[i + 1] === "<") {
       let j = i + 2;
-      if (line[j] === "-") j++;
+      const dash = line[j] === "-";
+      if (dash) j++;
       while (line[j] === " " || line[j] === "\t") j++;
       let q = null;
       if (line[j] === "'" || line[j] === '"') { q = line[j]; j++; }
@@ -2873,7 +2878,7 @@ function _wtScanLine(line, carry) {
       // every following line — including a later discard (reviewer round-6 P1).
       while (j < line.length && (q ? line[j] !== q : !/[\s;&|<>(){}'"\\]/.test(line[j]))) { d += line[j]; j++; }
       if (q && line[j] === q) j++;
-      if (d && delim === null) { delim = d; delimQuoted = q; }
+      if (d && delim === null) { delim = d; delimQuoted = q; delimDash = dash; }
       // Re-emit the delimiter so the walker's `<<` + operand skip consumes the
       // placeholder, never the next real command token. An opener with no
       // delimiter (`<<` in arithmetic) emits bare `<<`.
@@ -2908,7 +2913,7 @@ function _wtScanLine(line, carry) {
   // apostrophe. The mirror direction is a false BLOCK: a commented-out
   // `git checkout -- x` on the line after a code line was harvested as live.
   if (carry) { carry.quote = quote; carry.ansiC = ansiC; carry.arith = arith; }
-  return { text: out, delim, delimQuoted };
+  return { text: out, delim, delimQuoted, delimDash };
 }
 
 /**
@@ -10870,8 +10875,15 @@ function _scriptInvocationAt(tokens, i0) {
  *    a regression against `main`, which resolved the body token by accident.)
  *  - `bash -c 'echo hi' <<EOF` → FALSE. The body is the `-c` string's stdin
  *    DATA; nothing in it executes, so walking it could only over-block.
- *  - `cat <<'X' | bash` → TRUE, via the segment after the pipe: the CONSUMER is
- *    the interpreter there, and a piped `-c` (`| bash -c 'cat'`) is DATA again.
+ *  - `bash <<EOF | bash helper.sh` → TRUE. The SEGMENT THAT OWNS THE `<<` is a
+ *    stdin-program shell, so it executes the body; the pipe to its right
+ *    consumes that shell's STDOUT and never sees the heredoc. (Pre-fix: any
+ *    pipe interpreter's verdict was returned unconditionally, so this shape
+ *    resolved NOTHING while real bash ran the body — a fail-OPEN, and a
+ *    regression inside this change.)
+ *  - `cat <<'X' | bash` → TRUE, via the segment after the pipe: the OPENER is
+ *    not an interpreter, so the CONSUMER is the interpreter there, and a piped
+ *    `-c` (`| bash -c 'cat'`) is DATA again.
  *  - `cat <<EOF | python3` → FALSE: a code interpreter consumes the body as
  *    CODE (the #627 surface, same as the head form `python3 <<PY`), never as a
  *    shell program.
@@ -10881,9 +10893,25 @@ function _scriptInvocationAt(tokens, i0) {
  */
 function _heredocBodyIsProgram(code, kind) {
   if (kind !== "shell") return false;
-  // A pipeline's LAST stdin-consuming interpreter decides. The split mirrors
-  // `_wtLinePipesToInterpreter` (same naive-but-conservative splitting, so the
-  // two never disagree about WHETHER an interpreter consumes the body).
+  // ⛔ THE SEGMENT THAT OWNS THE `<<` DECIDES FIRST. When it is itself a shell
+  // interpreter it reads the body as its stdin program (or as DATA, when it has
+  // a script operand or a `-c` string), and everything to the right of a pipe
+  // gets that shell's STDOUT — never the heredoc. Asking the pipe consumer
+  // instead made `bash <<EOF | bash helper.sh`, `| bash -c 'true'` and
+  // `| python3 -c …` fail OPEN: real bash executes the body, the walk resolved
+  // `[]`, and `_backdoorBlock` saw no path to gate (#523 round-3 F1, measured).
+  // `_wtOpenerSegment` is the same opener the kind decision uses, so the two
+  // cannot disagree about WHICH segment consumes the body.
+  const opener = _wtOpenerSegment(code);
+  const openerInterp = _wtHeadInterpreter(opener);
+  if (openerInterp !== null && _WT_SHELL_WORDS.test(basename(String(openerInterp)))) {
+    return _scriptInvocationAt(_tokenize(opener), 0).stdinProgram === true;
+  }
+  // Otherwise the opener is not an interpreter (`cat`, `tee`, `grep …`) and the
+  // body is piped INTO a consumer: the pipeline's first stdin-consuming
+  // interpreter decides. The split mirrors `_wtLinePipesToInterpreter` (same
+  // naive-but-conservative splitting, so the two never disagree about WHETHER
+  // an interpreter consumes the body).
   const segs = String(code).split("|");
   for (let k = 1; k < segs.length; k++) {
     const interp = _wtHeadInterpreter(segs[k]);
@@ -10924,7 +10952,19 @@ function _heredocSplitForScripts(command) {
   let pending = null;
   for (const line of text.split("\n")) {
     if (pending) {
-      if (line.trim() === pending.delim) {
+      // ⛔ MATCH THE TERMINATOR THE WAY BASH DOES — the line must BE the
+      // delimiter, with no leading or trailing blanks; `<<-` strips leading
+      // TABS (and only tabs) first. `trim()` also accepted `   EOF` / `EOF   `,
+      // which bash keeps as BODY lines: the split ended the body early and
+      // routed the rest of the program into `header`, where the command-line
+      // scan resolves ONE path — so a space-padded `EOF` shielded an arbitrary
+      // body (measured: `bash <<EOF` + `   EOF` + `true` + `/tmp/evil.sh` +
+      // `EOF` → `["true"]`, ALLOWED, while real bash runs the marker; #523
+      // round-3 F2). The trim() precedent is the M5 DISCARD walk's, where
+      // ending a body early exposes MORE text; here the seam has the opposite
+      // polarity, so the borrowed rationale does not carry.
+      const term = pending.dash ? line.replace(/^\t+/, "") : line;
+      if (term === pending.delim) {
         bodies.push({ kind: pending.kind, text: pending.buf.join("\n"), program: pending.program });
         header.push("");
         pending = null;
@@ -10934,7 +10974,7 @@ function _heredocSplitForScripts(command) {
       header.push("");
       continue;
     }
-    const { text: code, delim } = _wtScanLine(line, carry);
+    const { text: code, delim, delimDash } = _wtScanLine(line, carry);
     header.push(code);
     if (delim !== null) {
       const kind = _wtHeredocKind(code);
@@ -10944,7 +10984,7 @@ function _heredocSplitForScripts(command) {
       // owns the whole predicate (no script operand, no `-c` inline string, no
       // process substitution, last-fd-0-redirect-wins), because each of those
       // parts was a separate measured hole (#523 round-2 P1/P2).
-      pending = { delim, kind, program: _heredocBodyIsProgram(code, kind), buf: [] };
+      pending = { delim, dash: delimDash, kind, program: _heredocBodyIsProgram(code, kind), buf: [] };
     }
   }
   // Unterminated heredoc: bash feeds the rest of the text to the interpreter as

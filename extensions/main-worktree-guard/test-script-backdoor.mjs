@@ -526,6 +526,25 @@ async function partB() {
     // "is there a redirect".
     expectTrue("B7n (#523 round-2 P2) control: a `-c` program's heredoc body is its stdin DATA → ALLOWED",
       allowed(await bash(`bash -c 'cat >/dev/null' <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was blocked");
+    // ⛔ ROUND-3 F1 (measured ALLOWED on the pre-fix head): a pipe to the RIGHT of
+    // the heredoc is NOT the heredoc's consumer — the LEFT shell executes the body
+    // as its program and only its STDOUT travels down the pipe. Returning the pipe
+    // consumer's verdict vetoed the body, the walk resolved nothing, and the
+    // hub-mutating script the body runs was never read (the #523 defect, reopened).
+    expectTrue("B7o (#523 round-3 F1): `bash <<EOF | bash -c …` — the OPENER executes the body → BLOCKED",
+      blocked(await bash(`bash <<EOF | bash -c 'cat >/dev/null'\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // The over-block half: when the OPENER is not a stdin-program shell the body
+    // is piped INTO the consumer, and a `-c` consumer's body is DATA — nothing in
+    // it executes, so it must stay ALLOWED.
+    expectTrue("B7p (#523 round-3 F1) control: `cat <<'X' | bash -c 'cat'` — a piped `-c` body is DATA → ALLOWED",
+      allowed(await bash(`cat <<'X' | bash -c 'cat >/dev/null'\n"${bodyEvil}"\nX`, hub)), "was blocked");
+    // ⛔ ROUND-3 F2 (measured ALLOWED on the pre-fix head): bash wants the
+    // delimiter EXACTLY, so a space-padded `   EOF` is a BODY line, not the
+    // terminator. `trim()` ended the body there and the command-line scan then
+    // resolved the benign first token (`true`) — the rest of the program, the hub
+    // mutation included, was never read.
+    expectTrue("B7q (#523 round-3 F2): a space-padded `   EOF` does not end the body → BLOCKED",
+      blocked(await bash(`bash <<EOF\n   EOF\ntrue\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });
