@@ -1110,6 +1110,19 @@ dexpect("#594-R3b a later `-c` beats an earlier `--config-env` (argv order)",
 dexpect("#594-R3c control — a later `--config-env` beats an earlier `-c` (benign value wins, as git runs it)",
   `EE=status git -c alias.x='branch -fq victimMIX2 main' --config-env=alias.x=EE x`,
   { verb: "status", branchState: false });
+// The SAME two defects reachable through spellings the round-3 rows above do not walk: a
+// duplicated prefix handed through `env` (its assignments are argv, not the shell's), and the
+// SPACE form of `--config-env`. Both were measured FAIL-OPEN at `bd0ecbeca` (bState=false) and
+// are green only after the ordered-config fix — so each is a pin the fix must keep, not a
+// restatement of R3a/R3b. (The review's own reproducer spelled the FIRST one with the verb
+// `mix` while defining `alias.x`, which git rejects rc 129; the MECHANISM is real and is what
+// these two rows pin, measured against git 2.43.0 with `x`.)
+dexpect("#594-R3d a duplicated prefix handed through `env` — the LAST one wins too",
+  `env Z=status Z='branch -fq victimENV main' git --config-env=alias.x=Z x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimENV", "main"] });
+dexpect("#594-R3e the SPACE form of `--config-env` keeps its argv position against a later `-c`",
+  `EE=status git --config-env alias.x=EE -c alias.x='branch -fq victimSP main' x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimSP", "main"] });
 
 // commit matcher (commit-graph/commit-tree EXCLUDED)
 dexpect("commit → block:commit", `git commit -m x`, { verdict: "block:commit", verb: "commit" });
