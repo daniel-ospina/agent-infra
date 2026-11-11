@@ -2174,19 +2174,68 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       const mainKey = sharedResolveEffectiveRepo("git status", mainR)?.repoKey;
       const m2Gate = (cmd) => {
         const d = classifyGitCommandDetailed(cmd);
-        const gateVerb = d.verdict === "block:commit" ? "commit" : "push";
-        // round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS comes
-        // from the classifier's boundary-aware commit/push invocation hints
-        // (the replay counted a phantom `bash git -C <wt> commit` and
-        // worktree-exempted the real main commit).
-        let m2Eff = sharedResolveRepoFromInv(gateVerb === "commit" ? d.commitHints : d.pushHints, mainR);
-        // #596 round-4 (F2): null m2Eff under a block:commit/push verdict →
-        // resolve the session repo, mirroring index.ts's M2 arm fallback.
-        if (!m2Eff) m2Eff = sharedResolveEffectiveRepo("git status", mainR);
-        if (!m2Eff) return "no-eff";
-        if (m2Eff.isWorktree) return "wt-exempt";
-        const m2 = sharedDecideM2({ effectiveRepo: m2Eff, baseline: { repoKey: mainKey, branch: "feat/1" }, currentBranch: m2Eff.currentBranch, pushDst: d.pushDst, pushTargets: d.pushTargets, verdict: d.verdict, allowActive: false });
-        return m2?.block ? "block" : "allow";
+        // #605: mirror index.ts M2 — gate EVERY commit/push invocation, each
+        // resolved from ITS OWN classifier hints (+ a push's OWN targets), and
+        // block wins. A fully-VISIBLE `-C <wt>` LEAD used to resolve the whole
+        // command to its worktree, so the later OFF-baseline MAIN mutation was
+        // exempted (`git -C <wt> commit ; git commit` → ALLOW; the reversed
+        // order blocked). Same rule the round-4 M3 loop (#596) applies to
+        // branch-state mutations.
+        // ⛔ THE MIRROR INVENTS NO MUTATION (review round-6 F2). This used to
+        // SYNTHESIZE one from `det.commitHints`/`det.pushHints` when the
+        // classifier reported none — the exact fallback `index.ts` deleted in
+        // round 5, kept here one round longer. Two costs, both measured:
+        //   • the classifier-level suite could not SEE round-6 F1: for an opaque
+        //     `eval "git push -f …"` the mirror invented a push with
+        //     `invVisible: true`, resolved the session repo and answered
+        //     "block" while the SHIPPED gate admitted — an over-block the suite
+        //     called correct, over a hole in the gate;
+        //   • it is the drift this group's source pins exist to prevent: the pins
+        //     below cover the three `gateMutations(m2Mutations)` call sites, the
+        //     `isDelete` line and the #73 union, but NOT the list itself, so the
+        //     mirror kept modelling the deleted rule and every pin stayed green.
+        // The mirror now mirrors: only invocations the command ACTUALLY contains.
+        const muts = [
+          ...(d.commitMutations ?? []),
+          ...(d.pushMutations ?? []),
+        ];
+        let sawMain = false;
+        for (const mu of muts) {
+          // #605 reviews F1 + I2: a DELETE-spelled push is the #73
+          // coordinated-delete arm's business, never M2's target comparison —
+          // and the rule keys on the MUTATION's own `isDelete`, not on the
+          // compound's verdict path (verdict-keyed it held only when the delete
+          // was the FIRST push, so a later-segment `-d` was blocked while
+          // `--delete` was allowed). index.ts applies it inside
+          // gateMutations; the mirror must not drift from that.
+          if (mu.verb === "push" && mu.isDelete) continue;
+          // #596 round-4 (reviewer P1 follow-up): the repo ALWAYS comes from the
+          // classifier's boundary-aware hints (the replay counted a phantom
+          // `bash git -C <wt> commit` and worktree-exempted the real main commit).
+          let m2Eff = mu.hints
+            ? sharedResolveRepoFromInv(mu.hints, mainR)
+            : (mu.invVisible === false ? sharedResolveEffectiveRepo("git status", mainR) : null);
+          // #596 round-4 (F2): null m2Eff → resolve the session repo, mirroring
+          // index.ts's M2 arm fallback.
+          if (!m2Eff) m2Eff = sharedResolveEffectiveRepo("git status", mainR);
+          if (!m2Eff) return "no-eff";
+          // #805: an UNRESOLVED target is never worktree-exempt (it must reach
+          // decideM2's fail-closed refusal), exactly as index.ts orders it.
+          if (m2Eff.isWorktree && !m2Eff.unresolvedTarget) continue;
+          sawMain = true;
+          const muVerdict = mu.verb === "commit"
+            ? "block:commit"
+            : (d.verdict === "block:force-push" ? "block:force-push" : "block:push");
+          const m2 = sharedDecideM2({
+            effectiveRepo: m2Eff, baseline: { repoKey: mainKey, branch: "feat/1" },
+            currentBranch: m2Eff.currentBranch,
+            pushDst: mu.verb === "push" ? (mu.dst ?? null) : d.pushDst,
+            pushTargets: mu.verb === "push" ? (Array.isArray(mu.targets) ? mu.targets : d.pushTargets) : d.pushTargets,
+            verdict: muVerdict, allowActive: false,
+          });
+          if (m2?.block) return "block";
+        }
+        return sawMain ? "allow" : "wt-exempt";
       };
       const m2a = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: off-baseline main commit + -C wt mutation tail → M2 BLOCK (commit repo)", m2a, "block");
@@ -2208,6 +2257,92 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       // not exempt the real OFF-baseline MAIN commit.
       const m2f = m2Gate(`sh -c "git -C \"${wtR}\" commit -m z" ; git commit -m x`);
       expectBool("#596 r4 P1a: invisible wt-payload commit lead + real off-baseline main commit → M2 BLOCK", m2f, "block");
+      // ── #605: the VISIBLE twin of the P1a hole ──
+      // commitHints/pushHints describe only the FIRST VISIBLE commit/push, so a
+      // fully-visible worktree-scoped LEAD supplied the ONLY resolved repo
+      // (a worktree) and decideM2 exempted the whole command: the real
+      // OFF-baseline MAIN commit / push of a foreign branch ran rc 0. The gate
+      // outcome must not depend on invocation ORDER (the reversed forms below
+      // blocked even before the fix). index.ts M2 now gates EVERY mutation, and
+      // a push is gated against ITS OWN refspecs.
+      const m2g = m2Gate(`git -C "${wtR}" commit -m z ; git commit -m x`);
+      expectBool("#605: visible wt-scoped commit LEAD + off-baseline MAIN commit → M2 BLOCK", m2g, "block");
+      const m2h = m2Gate(`git commit -m x ; git -C "${wtR}" commit -m z`);
+      expectBool("#605: control — same mutations in the reversed order → M2 BLOCK (order-independent)", m2h, "block");
+      const m2i = m2Gate(`git -C "${wtR}" push origin wtmain ; git push origin feat/other`);
+      expectBool("#605: visible wt-scoped push LEAD + off-baseline MAIN push → M2 BLOCK", m2i, "block");
+      const m2j = m2Gate(`git -C "${wtR}" push origin feat/1 ; git push origin feat/other`);
+      expectBool("#605: leading wt push naming the BASELINE branch cannot launder a MAIN push of a foreign one", m2j, "block");
+      // …and the F1 sibling of the same gap, in the off-baseline state: a
+      // `--delete` anywhere in the raw command routes the verdict to the #73
+      // arm, whose early return used to skip M2 for the compound's OTHER
+      // mutations too.
+      const m2nd = m2Gate(`git commit -m x ; git push origin --delete stale`);
+      expectBool("#605 F1: off-baseline MAIN commit + an unrelated --delete segment → M2 BLOCK", m2nd, "block");
+      // The other half of the same loop: per-invocation TARGETS. A MAIN push of
+      // the session's OWN branch stays allowed even when the LEAD names a
+      // different one, and an all-worktree compound is exempt (no false block).
+      const m2k = m2Gate(`git -C "${wtR}" push origin wtmain ; git push origin feat/1`);
+      expectBool("#605: wt lead + ON-baseline MAIN push (own refspec) → allow (targets are per-invocation)", m2k, "allow");
+      const m2l = m2Gate(`git -C "${wtR}" commit -m z ; git -C "${wtR}" commit -w`);
+      expectBool("#605: ALL-wt compound (both mutations -C <wt>) → wt-exempt (no false block)", m2l, "wt-exempt");
+      // Review F1 (same class, one level above the hints): the push-delete verdict
+      // is set from the WHOLE raw command, so a `--delete` anywhere in a compound
+      // routed it into the #73 arm, whose early return skipped M2 entirely —
+      // `git push origin feat/other ; git push origin --delete stale` let the
+      // off-baseline MAIN push through. The delete arm now gates the compound's
+      // NON-delete mutations (the delete-spelled push itself stays #73's).
+      const m2m = m2Gate(`git push origin feat/other ; git push origin --delete stale`);
+      expectBool("#605 F1: off-baseline MAIN push + an unrelated --delete segment → M2 BLOCK", m2m, "block");
+      const m2o = m2Gate(`git push origin feat/1 ; git push origin --delete stale`);
+      expectBool("#605 F1 control: ON-baseline MAIN push + a --delete segment → allow (no false block)", m2o, "allow");
+      const m2p = m2Gate(`git push origin --delete stale`);
+      expectBool("#605 F1 control: delete-only command → nothing main-resolving to gate (wt-exempt)", m2p, "wt-exempt");
+      // Review I2: the delete exemption keys on the MUTATION's own `isDelete`,
+      // not on the compound's verdict path — verdict-keyed, the `-d` short form
+      // in a later segment was gated by M2 while `--delete` was not.
+      const m2q = m2Gate(`git push origin feat/1 && git push origin -d stale`);
+      expectBool("#605 I2: later-segment `-d` delete → allow (delete exemption is per-mutation)", m2q, "allow");
+      // Review round-3 F1: the #73 arm's target-count precondition and the M2 leg
+      // used to be one guard, so a no-refspec `git push --delete` (a git error)
+      // skipped the arm entirely and exempted the compound. The M2 leg now runs
+      // on the VERDICT; the mirror models that by gating the non-delete mutations
+      // for a block:push-delete verdict whether or not det.pushTargets is empty.
+      const m2r = m2Gate(`git push origin feat/other && git push --delete`);
+      expectBool("#605 F1-r3: off-baseline MAIN push + a no-refspec `git push --delete` → M2 BLOCK", m2r, "block");
+      const m2s = m2Gate(`git commit -m x ; git push --delete`);
+      expectBool("#605 F1-r3: off-baseline MAIN commit + a no-refspec `git push --delete` → M2 BLOCK", m2s, "block");
+      const m2t = m2Gate(`git push --delete`);
+      expectBool("#605 F1-r3 control: lone no-refspec `git push --delete` → nothing main-resolving (wt-exempt)", m2t, "wt-exempt");
+      // Review round-6 F2: with the invented mutations gone, the mirror reports the
+      // ZERO-mutation shape the classifier actually produces for an opaque payload,
+      // instead of a synthetic block the shipped gate never returns.
+      const m2u = m2Gate(`eval "cd /tmp && git push -f origin feat/other"`);
+      expectBool("#605 r6: an opaque `eval` force-push yields NO mutations to gate (the fail-closed arm is the shipped one)",
+        m2u, "wt-exempt");
+      // ── ANTI-DRIFT source pins (agent-infra#3442, reviewer residual) ──
+      // `m2Gate` is a HAND-WRITTEN mirror of index.ts's M2 loop, so a shipped
+      // arm could lose its gate call while every row above stayed green (the
+      // mirror would keep modelling the pre-loss rule). These three pins tie the
+      // mirror's three rules to the SHIPPED source. They are not an equivalence
+      // proof — that is what the handler suite is for — they make a silent
+      // REMOVAL of any of the three impossible without a red row.
+      const m2GateCalls = (pinSrc.match(/gateMutations\(m2Mutations\)/g) ?? []).length;
+      expectBool("#605 source pin: index.ts gates the compound in ALL THREE arms (M2, allowance admit, push-delete)",
+        m2GateCalls >= 3, true);
+      expectBool("#605 source pin: the delete exemption keys on the MUTATION's own isDelete (not the verdict path)",
+        pinSrc.includes('if (mu.verb === "push" && mu.isDelete) continue;'), true);
+      expectBool("#605 source pin: the #73 coordinated check unions EVERY delete invocation's targets",
+        pinSrc.includes("_coordinatedDeleteBlock(deleteTargets)"), true);
+      // Review round-6 F2: the mutation list ITSELF is a rule, and it was the one
+      // rule with no pin — the mirror above could keep the deleted synthesis while
+      // every pin stayed green. The mirror cannot represent the shipped arm (it
+      // resolves at `mainR`, the arm resolves at the session cwd), so the arm is
+      // pinned at its SOURCE here and pinned EXECUTABLY at the handler level in
+      // test-m2-compound-ownership.mjs S9.
+      const unseenPushPin = pinSrc.match(/m2Mutations\.length === 0 &&\s*\(det\.verdict === "block:force-push" \|\| det\.verdict === "block:push-delete"\)/);
+      expectBool("#605 r6 source pin: a push verdict the extractor could not see is FAIL-CLOSED, not an empty list to admit",
+        unseenPushPin !== null && pinSrc.includes("could not verify repo ownership (git read failed; fail-closed, #265)"), true);
       execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
       const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");

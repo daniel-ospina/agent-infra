@@ -4440,6 +4440,46 @@ export function classifyGitCommandDetailed(command) {
   out.pushHints = pushVisInv
     ? { cdChain: pushVisInv.cdChain, cHints: pushVisInv.cHints, gitDirHint: pushVisInv.gitDirHint, vars: pushVisInv.vars }
     : null;
+  // #605: EVERY commit/push invocation, each with ITS OWN boundary-aware
+  // resolution hints (visible → that invocation's own -C/cd hints; invisible
+  // interpreter payload → null hints, i.e. it executes at the shell cwd) and,
+  // for a push, ITS OWN refspec targets/destination. The *_Hints fields above
+  // describe only the FIRST extractor-visible invocation, so M2 resolved ONE
+  // repo per command — a fully-VISIBLE worktree-scoped lead overwrote the
+  // hints the later MAIN invocation needed: `git -C <wt> commit -m z ; git
+  // commit -m x` (off-baseline session) resolved to the worktree, decideM2
+  // returned null for the whole command, and the real OFF-baseline MAIN commit
+  // ran rc 0 (probe-verified; the reversed order blocks). Same for the push
+  // twin, where the first push's targets also attributed the wrong refspec to
+  // the later MAIN push. index.ts M2 now gates EVERY main-resolving mutation
+  // (block wins), mirroring the round-4 M3 stateMutations fix of #596.
+  const _mutationHints = (v) => (v.cmdVisible !== false
+    ? { cdChain: v.cdChain, cHints: v.cHints, gitDirHint: v.gitDirHint, vars: v.vars }
+    : null);
+  out.commitMutations = invocations
+    .filter((v) => v.verb === "commit")
+    .map((v) => ({
+      verb: v.verb, args: v.args,
+      invVisible: v.cmdVisible !== false,
+      hints: _mutationHints(v),
+    }));
+  out.pushMutations = invocations
+    .filter((v) => v.verb === "push")
+    .map((v) => {
+      const t = _pushInvocationTargets(v.args);
+      return {
+        verb: v.verb, args: v.args,
+        invVisible: v.cmdVisible !== false,
+        hints: _mutationHints(v),
+        targets: t.targets,
+        dst: t.dst,
+        // #605 review F1: a delete-spelled push is the #73 coordinated-delete
+        // arm's business, not M2's target comparison — index.ts M2 needs to
+        // tell them apart when a delete ANYWHERE in a compound routes the whole
+        // command to that arm.
+        isDelete: t.isDelete,
+      };
+    });
 
   return out;
 }
@@ -4570,6 +4610,44 @@ function _markOptionValueSlots(tokens) {
     }
   }
   return valueSlot;
+}
+
+/**
+ * #605: describe ONE `git push` invocation's own destination, so a compound's
+ * EACH push can be gated against the repo and the refspec it actually pushes.
+ * `out.pushTargets`/`out.pushDst` describe only the FIRST push invocation (plus
+ * the whole-command delete fold-in), which is the wrong hint for a later
+ * segment: `git -C <wt> push origin wtmain ; git push origin feat/other` gated
+ * the MAIN push against `wtmain` — and would have ALLOWED it outright whenever
+ * the leading worktree push happened to name the session's baseline branch.
+ * The extraction below is the push arm's own (option-value slots → delete /
+ * colon forms → ``positionals[0]`` = remote, the rest = refspecs; the same
+ * ``positionals.length > 1`` rule, so a lone positional is the remote and the
+ * target falls back to the checked-out branch). Deliberately identical to the
+ * first-push arm, including its documented `-o`-value over-capture, so the two
+ * surfaces cannot drift.
+ * @param {string[]} args
+ * @returns {{targets: string[], dst: string|null, isDelete: boolean}}
+ */
+function _pushInvocationTargets(args) {
+  const argv = args || [];
+  const optSlots = _markOptionValueSlots(argv);
+  const deleteIdx = argv.findIndex((a, i) => !optSlots[i] && _isPushDeleteFlagToken(a));
+  const hasColonTargets = argv.some((a, i) => !optSlots[i] && /^:/.test(a));
+  const positionals = argv.filter((x) => !x.startsWith("-"));
+  if (deleteIdx !== -1 || hasColonTargets) {
+    const rawTargets = positionals.length > 1 ? positionals.slice(1) : positionals;
+    return {
+      targets: rawTargets
+        .map((x) => _stripQuotes(x).replace(/^:/, "").replace(/^refs\/heads\//, ""))
+        .filter(Boolean),
+      dst: null,
+      isDelete: true,
+    };
+  }
+  const refspecs = positionals.length > 1 ? positionals.slice(1) : [];
+  const targets = refspecs.map(_refspecDst).filter((x) => x !== null && x !== undefined);
+  return { targets, dst: targets.length === 1 ? targets[0] : null, isDelete: false };
 }
 
 function _isPushDeleteFlagToken(a) {
