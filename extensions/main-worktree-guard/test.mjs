@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -1084,6 +1084,43 @@ wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -
 dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });
 // --dry-run stays a normal push (no false delete).
 dexpect("push --dry-run NOT delete", `git push origin --dry-run feat/x`, { verdict: "block:push", isPushDelete: false });
+
+// ── #653: the delete target must be a LITERAL ref, or the arm fails closed ──
+// The #73 arm matched the delete target as TEXT, so a target the SHELL produces
+// named no ref, nothing was checked out under it, and the delete was ALLOWED.
+// `unresolvableDeleteTargets` decides resolvability and index.ts
+// `_coordinatedDeleteBlock` refuses on it BEFORE the checkout lookup. These rows
+// pin the POLICY SEAM; the handler-level evidence (the refusal, its message, the
+// worktree root, the no-false-block controls and the mutation leg) is
+// test-653-delete-target.mjs — its own CI step, because this file's ci-main leg
+// is not PR-triggered.
+for (const [name, target, want] of [
+  ["literal short ref", "feat/x", true],
+  ["literal full ref", "refs/heads/feat/x", true],
+  ["a comma is legal in a ref name", "release,2026", true],
+  ["$VAR", "$PR_BRANCH", false],
+  ["${VAR}", "${PR_BRANCH}", false],
+  ["${VAR:-default}", "${BRANCH:-feat/x}", false],
+  ["command-substitution fragment", "$(echo", false],
+  ["backtick fragment", "`cat", false],
+  ["glob", "feat/*", false],
+  ["brace expansion", "{feat/a,feat/b}", false],
+  ["backslash escape", "feat/x\\ y", false],
+  ["empty", "", false],
+]) {
+  const got = isResolvableDeleteTarget(target);
+  console.log(`${got === want ? "✅" : "❌"} #653 isResolvableDeleteTarget(${name}): ${got}${got === want ? "" : ` (expected ${want})`}`);
+  got === want ? pass++ : fail++;
+}
+{
+  const got = unresolvableDeleteTargets(["$A", "feat/x", "$A", "$(cat"]);
+  const ok = JSON.stringify(got) === JSON.stringify(["$A", "$(cat"]);
+  console.log(`${ok ? "✅" : "❌"} #653 unresolvableDeleteTargets filters + dedupes: ${JSON.stringify(got)}`);
+  ok ? pass++ : fail++;
+  const inert = JSON.stringify(unresolvableDeleteTargets(undefined)) === "[]";
+  console.log(`${inert ? "✅" : "❌"} #653 unresolvableDeleteTargets(non-array) is inert: ${inert}`);
+  inert ? pass++ : fail++;
+}
 
 // sync-source extraction (ownership allowance)
 dexpect("pull --rebase origin main → syncSource main", `git -c commit.gpgsign=false pull --rebase origin main`, { verdict: "block:pull", syncSource: "main" });

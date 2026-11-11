@@ -4663,6 +4663,55 @@ function _isPushDeleteFlagToken(a) {
   return false;
 }
 
+// #653 — the shell mechanisms that make a delete target's WORD differ from its
+// TEXT, so the guard cannot know which ref the delete will name. This is the
+// allow-hole #653 reported: `git push origin --delete "$PR_BRANCH"` extracts the
+// literal string `$PR_BRANCH`, no worktree holds a ref by that name, the #73 arm
+// finds nothing to coordinate and ALLOWS — the delete then runs (measured).
+//
+//   $  `     parameter expansion / command substitution — the word is whatever the
+//           shell produces (`$BRANCH`, `${X:-y}`, `$(…)`, `` `…` ``); measured:
+//           the extractor reports a FRAGMENT of the substitution (`$(echo`) as if
+//           it were a ref name, so no ref ever matches and the arm allows.
+//   *  ?  [  ]   globbing — the shell expands to N words (or leaves the literal).
+//   {  }     brace expansion — `{a,b}` becomes TWO words the guard never sees;
+//           measured: the extractor reads it as ONE token and allows.
+//   ~        tilde expansion at word start.
+//   \       escape — the word is not the text.
+//
+// Deliberately NOT included: `,` (legal in a ref name; brace expansion is caught
+// by its own braces) and `^`/`:` (illegal in a ref name and not a shell
+// expansion — git rejects such a refspec, so it cannot delete a held branch).
+const DELETE_TARGET_UNRESOLVABLE_RE = /[$`*?[\]{}\\~]/;
+
+/**
+ * #653 — can the guard resolve this delete target to the ref git would delete?
+ * `true` only when the extracted token is the literal word the shell will pass.
+ * The decision is fail-closed in the caller: an unresolvable target is REFUSED
+ * (option 2 of #653), never looked up-and-allowed.
+ * @param {string} target
+ * @returns {boolean}
+ */
+export function isResolvableDeleteTarget(target) {
+  const t = String(target ?? "");
+  if (t === "") return false;
+  return !DELETE_TARGET_UNRESOLVABLE_RE.test(t);
+}
+
+/**
+ * #653 — the subset of delete targets the guard cannot resolve (deduped, in
+ * command order). Exported and pure so every #73 surface (the degradation arm,
+ * the push-delete arm and the later-segment delete arm — all of which funnel
+ * through index.ts `_coordinatedDeleteBlock`) shares ONE definition, and so the
+ * policy is unit-pinnable without a git fixture.
+ * @param {string[]} targets
+ * @returns {string[]}
+ */
+export function unresolvableDeleteTargets(targets) {
+  if (!Array.isArray(targets)) return [];
+  return [...new Set(targets.filter((t) => !isResolvableDeleteTarget(t)))];
+}
+
 /** Short-name a raw delete target token (`:refs/heads/feat/x` → `feat/x`). */
 function _cleanDeleteTarget(x) {
   return x
