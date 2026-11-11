@@ -4974,7 +4974,7 @@ function _redirectTakesOperand(tok) {
  * #73 hazard, reachable from a worktree session where M2 is exempt.
  *
  * `_tokenize` is the module's quote-aware shell splitter, so QUOTED text stays in the word
- * (`-d 'feat/x)'` is the real ref `feat/x)`). Three rules bound the segment, and each was measured
+ * (`-d 'feat/x)'` is the real ref `feat/x)`). FOUR rules bound the segment, and each was measured
  * against a fail-open this helper shipped or inherited:
  *
  *   1. NO LIST SEPARATOR CAN REACH THIS HELPER (round-6 review, P3: an earlier revision described a
