@@ -386,48 +386,6 @@ gh_auth_log() {
 _gh_auth_store_readable() { # <hosts.yml path>
   [ -f "$1" ] && [ -r "$1" ]
 }
-# _gh_auth_searchable <dir> — can this read TRAVERSE <dir>? The `-x` half, given a name of its own so an
-# arm can inject the shape on a box whose uid makes every permission bit readable (the same reason
-# `_gh_auth_store_readable` is a function and not an inline test).
-_gh_auth_searchable() { [ -x "${1:-}" ]; }
-# _gh_auth_blind_ancestor <dir> — the first ancestor of <dir> this read cannot PASS THROUGH, or empty.
-# Walks from <dir>'s PARENT upward; <dir> itself is tested by `_gh_auth_store_in`, and `/` is never
-# reported: a read that cannot search it cannot run at all.
-# ⛔ IT WALKS ANY PATH CONTAINING `/`, RELATIVE INCLUDED, AND SAYS SO (review round 26, P3, measured): an
-# earlier header claimed "Only absolute paths are walked" and NO such guard existed — the only test was
-# `case "$a" in */*)`. The walk is KEPT and the claim CORRECTED, because the helper's question is "can
-# THIS READ tell whether <dir> holds a store?" (`_gh_auth_store_in`'s contract), and for a relative path
-# resolved against this process's cwd the honest answer is still "no" when an ancestor cannot be
-# searched. Implementing the old wording instead would print `empty` — "a store is not here" — about a
-# directory this read could not enter, which is the exact conflation this walk exists to remove.
-# ⛔ THE RESIDUAL THAT COMES WITH THAT CHOICE, stated rather than tidied away: `gh` resolves a RELATIVE
-# `GH_CONFIG_DIR` against ITS OWN cwd (the lane's), not this module's, so a relative ambient value whose
-# walk reports a blind ancestor names a path the `ambient-missing` remedy ("fix those PERMISSIONS on the
-# box") was never measured against. Absolute values — every path `_gh_auth_file_value` can return — carry
-# no such dependence.
-# ⛔ A NON-DIRECTORY ANCESTOR IS ABSENT, NOT A DOOR (round 26, measured): a regular file cannot contain a
-# store, yet the round-25 predicate graded it by its EXEC BIT — the same file answered `unreadable`
-# ("fix those permissions") at 644 and `empty` at 755, one fact with two answers.
-# ⛔ AND A DANGLING-SYMLINK ANCESTOR IS THE DOOR — round 25's dangling STORE, one layer up (measured):
-# a store path under `/mnt/vol` where `/mnt/vol` is a symlink to an unmounted volume is `-e`-FALSE at
-# every component, so the walk skipped it and the cause named a store to create on a path that is
-# pointed at a volume.
-_gh_auth_blind_ancestor() {
-  local a="${1:-}"
-  # ⛔ `case` RATHER THAN `${a%/*}` ALONE: a component-less path ("relstore") is unchanged by the strip, so
-  # an unguarded loop spins forever on it. A path with no separator left has no ancestor to walk to.
-  case "$a" in */*) a="${a%/*}" ;; *) return 1 ;; esac
-  while [ -n "$a" ] && [ "$a" != "/" ]; do
-    # A non-directory ancestor ends the walk: nothing can be stored UNDER a file, so the store is ABSENT
-    # however the file's permission bits read.
-    if [ -e "$a" ] && [ ! -d "$a" ]; then return 1; fi
-    if { [ -d "$a" ] && ! _gh_auth_searchable "$a"; } || { [ -L "$a" ] && [ ! -e "$a" ]; }; then
-      printf '%s\n' "$a"; return 0
-    fi
-    case "$a" in */*) a="${a%/*}" ;; *) return 1 ;; esac
-  done
-  return 1
-}
 _gh_auth_store_in() {
   local d="${1:-}"
   [ -n "$d" ] || { printf 'empty\n'; return 0; }
@@ -441,26 +399,13 @@ _gh_auth_store_in() {
   if [ -e "$d/hosts.yml" ] || [ -L "$d/hosts.yml" ]; then printf 'unreadable\n'; return 0; fi
   # ⛔ AND THE DIRECTORY ITSELF CAN BE THE UNREACHABLE PART (review round 22, P2): a `$d` that is a DANGLING
   # SYMLINK — a store pointed at a volume that is not mounted, the shape this file's own round-17 note names
-  # as realistic — is neither `-d` nor searchable, so every test above is false and it answered `empty`:
-  # IDENTICAL to a genuinely absent path, after which the cause said "GH_CONFIG_DIR=… is set but holds no
-  # hosts.yml" over a store that IS there and told the operator to create one. A dirent that exists but is
-  # not a directory this read can SEARCH is `unreadable`, not absent.
-  # ⛔ AND ONLY a DANGLING symlink is (round 25, measured): `[ -L "$d" ]` ALONE marked EVERY symlinked store
-  # directory unreadable — a `GH_CONFIG_DIR` that points through a symlink at a traversable, EMPTY store
-  # answered `unreadable`, so `gh_auth_cause` told the operator "this read could not OPEN it … fix those
-  # PERMISSIONS; the credential may well be there" about a directory it had opened and found empty, i.e. the
-  # round-22 remedy sent to the wrong fault. A symlink that RESOLVES falls through to the
-  # `-d`/`-r`/`_gh_auth_searchable` tests below, which answer for its TARGET.
-  if [ -L "$d" ] && [ ! -e "$d" ]; then printf 'unreadable\n'; return 0; fi
-  if [ -e "$d" ] && { [ ! -d "$d" ] || [ ! -r "$d" ] || ! _gh_auth_searchable "$d"; }; then
+  # as realistic — or that sits behind an UNSEARCHABLE ancestor, is neither `-d` nor searchable, so every
+  # test above is false and it answered `empty`: IDENTICAL to a genuinely absent path, after which the cause
+  # said "GH_CONFIG_DIR=… is set but holds no hosts.yml" over a store that IS there and told the operator to
+  # create one. A dirent that exists but is not a directory this read can SEARCH is `unreadable`, not absent.
+  if [ -L "$d" ] || { [ -e "$d" ] && { [ ! -d "$d" ] || [ ! -r "$d" ] || [ ! -x "$d" ]; }; }; then
     printf 'unreadable\n'; return 0
   fi
-  # ⛔ AND `empty` IS ONLY A READING IF THE PATH WAS REACHABLE AT ALL (round 25, P3): round 22's fix caught
-  # the dangling STORE but not the unsearchable ANCESTOR its own comment claimed — measured, a store behind
-  # a `chmod 000` parent answered `empty` (`-e` and `-L` are BOTH false behind a directory this process
-  # cannot search) and the cause named it as a store to create. "Absent" and "behind a door I cannot open"
-  # are the same reading there, and only this walk tells them apart.
-  if _gh_auth_blind_ancestor "$d" >/dev/null; then printf 'unreadable\n'; return 0; fi
   printf 'empty\n'
 }
 
