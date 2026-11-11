@@ -4038,9 +4038,13 @@ const GIT_BUILTIN_COMMANDS = new Set([
  *     statement's vars → its env prefixes → process.env; an unresolvable name
  *     is reported as null = "defined, value opaque"
  *   - `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs from the statement's
- *     vars or its env prefixes (the same sources _effectiveConfig reads),
- *     ONLY when `GIT_CONFIG_COUNT` is a positive integer <= 64 — git ignores the
- *     numbered pairs entirely without it (probe-verified rc 0, round 7)
+ *     env PREFIXES (`VAR=value git …`) — the only source that is in the child's
+ *     environment by construction — and ONLY when `GIT_CONFIG_COUNT` is a
+ *     positive integer <= 64 from those same prefixes: git ignores the numbered
+ *     pairs entirely without it (probe-verified rc 0, round 7). They are NOT
+ *     read from `inv.vars`, which cannot tell `A=1` from `export A=1` — an
+ *     invisible pair is ignored by git SILENTLY, so trusting one fails OPEN
+ *     (probe-verified rc 0, round 8).
  * ⛔ It does NOT read `git config alias.x <value>` writes, and it must not: the
  * config scope order (system→global→local→worktree→cmdline) means a write the
  * guard CAN see is still shadowed by a file it cannot, so a persisted definition
@@ -4101,14 +4105,26 @@ function _aliasDefsFromInvocation(inv) {
   // them unconditionally therefore fabricated a benign definition and let a
   // persisted alias run — the exact bypass this issue closes. The gate mirrors
   // `_effectiveConfig`'s (`Number(GIT_CONFIG_COUNT) > 0`, capped at 64).
+  // ⛔ AND THE PAIRS MUST BE IN THE COMMAND'S OWN ENVIRONMENT (review round 8, measured):
+  // the count and the pairs are read ONLY from `inv.envPrefixes` — the `VAR=value`
+  // prefixes bash puts in THIS child's env — never from `inv.vars`. The walker's
+  // `frame().vars` merges `A=1` and `export A=1` into one map with no export flag,
+  // so a pair it carries may be a plain SHELL variable git cannot see. git ignores
+  // an invisible pair SILENTLY (`--config-env` at least refuses, rc 128), so
+  // trusting it fabricates a benign definition and lets a persisted alias run —
+  // measured (git 2.43.0, persisted destructive `alias.br`):
+  // `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status; git br`
+  // created `victimP` rc 0 while the classifier expanded to the read-only `status`
+  // and answered branchState:false, i.e. M3 never ran. Restricting to prefixes is
+  // the FAIL-CLOSED direction: an EXPORTED pair is no longer expanded, so its verb
+  // is `aliasOpaque` and is refused in a main checkout (an over-block, not a hole).
   const cfgCount = (() => {
     const raw = (inv.envPrefixes || []).map((p) => {
       const e = String(p).indexOf("=");
       return e > 0 && String(p).slice(0, e) === "GIT_CONFIG_COUNT" ? String(p).slice(e + 1) : null;
-    }).filter((v) => v !== null).pop() ??
-      (inv.vars && Object.prototype.hasOwnProperty.call(inv.vars, "GIT_CONFIG_COUNT") ? inv.vars.GIT_CONFIG_COUNT : null);
+    }).filter((v) => v !== null).pop();
     const n = Number(raw);
-    return Number.isInteger(n) && n > 0 && n <= 64 ? n : 0;
+    return raw !== undefined && Number.isInteger(n) && n > 0 && n <= 64 ? n : 0;
   })();
   if (cfgCount > 0) {
     const cfgPairs = new Map();
@@ -4118,9 +4134,6 @@ function _aliasDefsFromInvocation(inv) {
       const mv = /^GIT_CONFIG_VALUE_(\d+)$/.exec(String(k ?? ""));
       if (mv) cfgPairs.set(mv[1], { ...(cfgPairs.get(mv[1]) || {}), value: v });
     };
-    for (const [k, v] of Object.entries(inv.vars || {})) {
-      if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(k)) collectPair(k, v);
-    }
     for (const p of inv.envPrefixes || []) {
       const e = String(p).indexOf("=");
       if (e > 0) collectPair(String(p).slice(0, e), String(p).slice(e + 1));

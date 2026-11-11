@@ -995,6 +995,22 @@ dexpect("#594-R7b GIT_CONFIG_COUNT=0 is the same (pairs ignored) → opaque",
 dexpect("#594-R7c control — with GIT_CONFIG_COUNT=1 the pair IS live and expands",
   `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victim main' git br`,
   { branchState: true, verb: "branch" });
+// ⛔ AND THE PAIR MUST BE IN *THIS COMMAND'S* ENVIRONMENT (review round 8, measured
+// rc 0): the count gate alone was not enough, because `inv.vars` carries plain SHELL
+// assignments too. git ignores an invisible pair SILENTLY, so expanding one fabricates
+// a benign definition and lets a persisted alias run — the same bypass, one spelling
+// further. Measured (git 2.43.0, persisted destructive `alias.br`): the command below
+// created `victimP` rc 0 while the classifier answered `status` / branchState:false.
+// These two rows are RED on the pre-fix code (verb "status" instead of "br").
+dexpect("#594-R8a a pair set by a SEPARATE shell statement (never exported) is invisible to git → the verb stays opaque",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status; git br`,
+  { branchState: true, verb: "br" });
+dexpect("#594-R8b same through `export` — no export flag exists, so the declared FAIL-CLOSED over-block: opaque, not expanded",
+  `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status; git br`,
+  { branchState: true, verb: "br" });
+dexpect("#594-R8c control — the prefix form (git really sees it) still expands, so R8a/R8b pin the SOURCE and not 'pairs are never read'",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.lg GIT_CONFIG_VALUE_0='log --graph' git lg`,
+  { branchState: false, verb: "log" });
 dexpect("#594 --config-env resolves against the statement's own env prefix",
   `AL='checkout victim' git --config-env=alias.co=AL co`,
   { verdict: "block:checkout-branch", verb: "checkout", branchState: true });
