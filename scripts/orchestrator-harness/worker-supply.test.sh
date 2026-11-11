@@ -197,11 +197,32 @@ PY
 
 echo "== worker-supply.test.sh =="
 
+# ⛔ THE FIXTURE BRIEFS MUST SATISFY THE GATE THAT JUDGES THEM (agent-infra#3958). Every re-offer is
+# REVALIDATED against `brief-gate.sh` now, so the old bare `echo brief > …` fixture is a brief the real
+# gate REFUSES — a brief that could not be dispatched on any real box. Left as it was, every healthy-path
+# case below would redden for the FIXTURE's sake instead of for the behaviour it grades, which is the
+# "grading my own stub" trap this suite's header warns about in the other direction.
+# The admitted brief is RENDERED BY THE SHIPPED GATE (`--section worker` — the same call `pr-doctor`
+# splices into every worker brief, so a healthy fixture is byte-identical in kind to a real order) and
+# cached ONCE: the gate costs ~0.2 s and the suite has a 60 s bound. Case (j) keeps a REFUSED brief on
+# purpose, and asserts the gate really refuses it.
+ADMITTED_BRIEF="$TMP/admitted-brief.txt"
+bash "$HERE/brief-gate.sh" --section worker > "$ADMITTED_BRIEF" 2>/dev/null
+if bash "$HERE/brief-gate.sh" --check "$ADMITTED_BRIEF" worker >/dev/null 2>&1; then
+  ok "fixture: the shipped brief gate ADMITS its own rendered worker brief (a healthy re-offer is a real, dispatcheable order)"
+else
+  bad "fixture: \`brief-gate.sh --section worker\` renders a brief its own --check REFUSES — the healthy-path cases would grade the fixture, not the supervisor"
+fi
+mkbrief() { # <path> — an order brief the gate will ADMIT
+  cp "$ADMITTED_BRIEF" "$1" 2>/dev/null || :
+  return 0
+}
+
 # ── (a) a dead worker is refilled ─────────────────────────────────────────────────────────────
 echo "-- (a) dead worker refilled"
 reset
 mkwt "$TMP/wt/prd-11" fix/11
-echo brief > "$TMP/briefs/prd-11.txt"
+mkbrief "$TMP/briefs/prd-11.txt"
 mkorder prd-11 "$TMP/wt/prd-11" fix/11 "$TMP/briefs/prd-11.txt" 2400 "2026-10-27 01:00:00"
 before="$(py_live_for 11)"
 [ "$before" = "absent" ] && ok "precondition: the doctor's reader says the order has NO worker ($before) — the pool is empty" \
@@ -242,7 +263,7 @@ O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/status.out" 2>&1; rcs=$?
 echo "-- (b) single-instance guard (pid + lock)"
 reset
 mkwt "$TMP/wt/prd-12" fix/12
-echo brief > "$TMP/briefs/prd-12.txt"
+mkbrief "$TMP/briefs/prd-12.txt"
 mkorder prd-12 "$TMP/wt/prd-12" fix/12 "$TMP/briefs/prd-12.txt"
 # a REAL supervisor holds the lock for its lifetime; the second must refuse rather than drain alongside it
 O="$O" SPAWNS="$SPAWNS" WORKER_SUPPLY_INTERVAL_S=60 MAX_FIX=3 MAX_REVIEW=4 \
@@ -313,7 +334,7 @@ reset
 i=1
 while [ "$i" -le 4 ]; do
   mkwt "$TMP/wt/prd-3$i" "fix/3$i"
-  echo brief > "$TMP/briefs/prd-3$i.txt"
+mkbrief "$TMP/briefs/prd-3$i.txt"
   mkorder "prd-3$i" "$TMP/wt/prd-3$i" "fix/3$i" "$TMP/briefs/prd-3$i.txt"
   i=$(( i + 1 ))
 done
@@ -330,7 +351,7 @@ grep -q 'budget full' "$ST/worker-supply.state" 2>/dev/null && ok "the record NA
 echo "-- (d) mid-order death: replaced, re-offered EXACTLY once"
 reset
 mkwt "$TMP/wt/prd-21" fix/21
-echo brief > "$TMP/briefs/prd-21.txt"
+mkbrief "$TMP/briefs/prd-21.txt"
 mkorder prd-21 "$TMP/wt/prd-21" fix/21 "$TMP/briefs/prd-21.txt" 2400 "2026-10-27 01:00:00"
 live_worker prd-21                                   # the order's ORIGINAL worker, alive
 O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
@@ -376,7 +397,7 @@ grep -q 'spent its 2 refill' "$ST/worker-supply.log" 2>/dev/null && ok "…and t
 reset
 mkdir -p "$BG" 2>/dev/null
 mkwt "$TMP/wt/prd-31" fix/31
-echo brief > "$TMP/briefs/prd-31.txt"
+mkbrief "$TMP/briefs/prd-31.txt"
 mkorder prd-31 "$TMP/wt/prd-31" fix/31 "$TMP/briefs/prd-31.txt" 2400 "2026-10-27 01:00:00"
 knob_line="$(O="$O" WORKER_SUPPLY_MAX_REFILLS=two WORKER_SUPPLY_INTERVAL_S=abc WORKER_SUPPLY_PREFIX='prd -' \
              bash "$SUPPLY" status 2>/dev/null | grep -o 'interval_s=[0-9]* max_refills=[0-9]* prefix=[^ ]*' | head -1)"
@@ -411,7 +432,7 @@ echo "-- (d2) one worktree, two names: no second worker into a live tree"
 # (i) the ALIAS arm: `prd-42` runs, and the DEAD order is the mode-qualified name for the SAME tree.
 reset
 mkwt "$TMP/wt/prd-42" fix/42
-echo brief > "$TMP/briefs/prd-42.txt"
+mkbrief "$TMP/briefs/prd-42.txt"
 live_worker prd-42                                     # the single-repo pass's worker: LIVE, no order file
 mkorder prd-daniel-ospina-tortoise-42 "$TMP/wt/prd-42" fix/42 "$TMP/briefs/prd-42.txt"
 [ "$(py_live_for 42)" = "live" ] && ok "the doctor's own reader says PR 42 is LIVE ($(cat "$BG/prd-42.pid"))" \
@@ -428,7 +449,7 @@ grep -q 'another order holds its worktree' "$TMP/d2a.out" 2>/dev/null \
 # (ii) the POPULATION arm: BOTH names have an order file, the second one DEAD, the first LIVE.
 reset
 mkwt "$TMP/wt/prd-43" fix/43
-echo brief > "$TMP/briefs/prd-43.txt"
+mkbrief "$TMP/briefs/prd-43.txt"
 mkorder prd-43 "$TMP/wt/prd-43" fix/43 "$TMP/briefs/prd-43.txt"
 live_worker prd-43
 mkorder prd-daniel-ospina-tortoise-43 "$TMP/wt/prd-43" fix/43 "$TMP/briefs/prd-43.txt"
@@ -440,7 +461,7 @@ O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/d2b.out" 2>&1
 # harness cannot be trusted — the safe direction is still not to spawn.
 reset
 mkwt "$TMP/wt/prd-44" fix/44
-echo brief > "$TMP/briefs/prd-44.txt"
+mkbrief "$TMP/briefs/prd-44.txt"
 mkorder prd-44 "$TMP/wt/prd-44" fix/44 "$TMP/briefs/prd-44.txt" 60 "2026-10-27 01:00:00"   # ancient stamp
 # ⛔ THE STALE-CLAIM IS COMPUTED FROM THE RECORD'S MTIME, NOT ITS `started=` FIELD (`mtime_of "$stamp"`
 # in ask_status), so the FILE must be aged: a fresh file holding an old stamp is NOT stale.
@@ -457,7 +478,7 @@ O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/d2c.out" 2>&1
 # (iv) the guard must NOT block a worktree nobody else holds — the same fixture, one name, refills.
 reset
 mkwt "$TMP/wt/prd-45" fix/45
-echo brief > "$TMP/briefs/prd-45.txt"
+mkbrief "$TMP/briefs/prd-45.txt"
 mkorder prd-45 "$TMP/wt/prd-45" fix/45 "$TMP/briefs/prd-45.txt"
 O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
 [ "$(spawns_for prd-45)" = "1" ] && ok "a worktree nobody holds is still refilled (the guard is not a blanket refusal)" \
@@ -472,7 +493,7 @@ O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
 # census too and not only on rc.
 reset
 mkwt "$TMP/wt/prd-46" fix/46
-echo brief > "$TMP/briefs/prd-46.txt"
+mkbrief "$TMP/briefs/prd-46.txt"
 mkorder prd-46 "$TMP/wt/prd-46" fix/46 "$TMP/briefs/prd-46.txt" 60 "2026-10-27 01:00:00"
 touch -d '3 hours ago' "$BG/prd-46.started" 2>/dev/null || touch -t 202601010101 "$BG/prd-46.started"
 live_worker prd-46                                    # answers `running`, past its own cap+slack
@@ -501,6 +522,78 @@ O="$O" SPAWNS="$SPAWNS" WORKER_SUPPLY_LOCK_MAX_S=abc MAX_FIX=3 MAX_REVIEW=4 sup 
 grep -q 'ALREADY-RUNNING' "$TMP/lockknob.out" 2>/dev/null && ok "…and it SAYS the lock is held (ALREADY-RUNNING), rather than classifying it stale" \
                                                            || bad "the refusal did not name the lock: $(head -2 "$TMP/lockknob.out")"
 
+# ── (j) A BRIEF THE GATE REFUSES IS NEVER RE-OFFERED UNCHANGED (agent-infra#3958) ────────────────━
+# ⛔ THE MEASURED DEFECT. A re-offer replays the argv `nonblocking-dispatch.sh` recorded at ACCEPT time,
+# and one of those arguments is the brief PATH — so a brief written once during a bad window was handed
+# to the gate on EVERY pass and refused `rc=80` for ever: `orders=100 live=0/18 dead=83 … 72
+# re-offer(s) refused`, pass after pass, while the composer (`pr-doctor.py`) rewrites briefs correctly
+# and its own passes were logging `research contract rendered … admitted by 1 validator(s)`.
+# THE INVARIANT: a brief the gate refuses never reaches the dispatcher again, the skip is reported as a
+# REGENERATION NEED (naming the composer) rather than as a dispatch attempt, and it spends none of the
+# order's refills — so the order recovers the moment the composer rewrites the brief.
+echo "-- (j) a refused (stale) brief is never re-offered: REGENERATION REQUIRED, no refill spent"
+reset
+mkwt "$TMP/wt/prd-71" fix/71
+printf '## ORDER — re-run the checks on this head\n\n(the 18-day-old shape: no research contract)\n' > "$TMP/briefs/prd-71.txt"
+cp "$TMP/briefs/prd-71.txt" "$TMP/briefs/prd-71.fossil"      # the bytes must survive the pass
+mkorder prd-71 "$TMP/wt/prd-71" fix/71 "$TMP/briefs/prd-71.txt" 2400 "2026-10-24 23:03:00"
+bash "$HERE/brief-gate.sh" --check "$TMP/briefs/prd-71.txt" worker >/dev/null 2>&1
+[ "$?" = "80" ] && ok "fixture: the shipped gate REFUSES this brief (rc=80) — the fossil shape measured on the box" \
+                || bad "fixture: the shipped gate did not refuse the stale brief, so case (j) would grade nothing"
+O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/j.out" 2>&1; jrc=$?
+[ "$(spawns_for prd-71)" = "0" ] && ok "the refused brief was NEVER handed to the dispatcher (0 spawns) — the fossil is not replayed" \
+                                 || bad "the refused brief WAS re-offered $(spawns_for prd-71)x — the invariant is missing"
+grep -q 'REFUSED by the brief gate (rc=80)' "$TMP/j.out" 2>/dev/null && grep -q 'REGENERATION REQUIRED' "$TMP/j.out" 2>/dev/null \
+  && ok "…and the skip is REPORTED as a regeneration need, quoting the gate's own rc (REGENERATION REQUIRED)" \
+  || bad "the skip was not logged as a regeneration need: $(head -3 "$TMP/j.out")"
+grep -q 'pr-doctor' "$TMP/j.out" 2>/dev/null && ok "…and it names the one COMPOSER (pr-doctor.py) — this supervisor does not invent an order" \
+                                            || bad "the regeneration line does not name the composer"
+cmp -s "$TMP/briefs/prd-71.txt" "$TMP/briefs/prd-71.fossil" \
+  && ok "…and the brief file is BYTE-IDENTICAL: the supervisor neither edits nor deletes a fossil" \
+  || bad "the supervisor MODIFIED the cached brief — editing the symptom teaches the loop nothing"
+[ -f "$ST/worker-supply-offers.tsv" ] && bad "a skip wrote a LEDGER row — it would spend one of the order's MAX_REFILLS" \
+                                     || ok "…and no ledger row was written (a regeneration is not a failed worker, so no refill is spent)"
+[ "$jrc" = "6" ] && ok "the pass is DEFERRED (rc=6) — it supplied nothing and did not call itself clean" \
+                || bad "pass rc=$jrc, expected 6 (a pass that skipped its only dead order is not a clean pass)"
+[ "$(record_field stale_briefs)" = "1" ] && ok "…and the RECORD names the bound (stale_briefs=1), so \`status\` reports it without the log" \
+                                        || bad "record stale_briefs='$(record_field stale_briefs)', expected 1"
+grep -q 'REGENERATION REQUIRED' "$ST/worker-supply.state" 2>/dev/null && ok "…and the record's reason says what has to happen (not a silent skip)" \
+                                                                    || bad "the record does not name the regeneration"
+# ⛔ AND THE SKIP IS NOT A PERMANENT WEDGE. `pr-doctor.py:4338-4340` rewrites the brief
+# UNCONDITIONALLY on its next spawn for the PR, so the same PATH starts holding admitted bytes and the
+# very next pass re-offers the order. Pinned here because a fix that skipped forever would turn a
+# replay bug into a stranded order.
+O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
+[ "$(spawns_for prd-71)" = "0" ] && ok "a second pass still offers nothing (the recorded brief is still the fossil)" \
+                                 || bad "a second pass re-offered the refused brief ($(spawns_for prd-71) spawns)"
+mkbrief "$TMP/briefs/prd-71.txt"            # the composer regenerates it — same PATH, admitted bytes
+O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/j2.out" 2>&1; j2rc=$?
+[ "$(spawns_for prd-71)" = "1" ] && ok "…and once the brief is REGENERATED the order IS re-offered (no refill was spent on the skips)" \
+                                 || bad "a regenerated brief was NOT re-offered ($(spawns_for prd-71) spawns) — the fix would strand the order"
+[ "$j2rc" = "0" ] && ok "…and that pass is clean (rc=0): supply recovered the order the moment its brief became admissible" \
+                  || bad "the recovering pass exited $j2rc, expected 0"
+
+# ── (l) A GATE THAT CANNOT ANSWER IS NOT "STALE" ────────────────────────────────━─────━──━──━──━──━
+# ⛔ THE POLARITY THAT MUST NOT FLIP. `brief-gate.sh` exits 78 when the VALIDATOR is missing and 142
+# when the bound fires; neither says anything about the brief. Converting those into "this order needs a
+# new brief" would report an INSTALL fault as a content fault — the `$O`-skew lesson (#2708). The offer
+# must still reach the DISPATCHER, which owns that refusal and reports it loudly (rc=78).
+echo "-- (l) a gate that cannot answer falls through to the dispatcher, not to a false 'stale' verdict"
+reset
+mkdir -p "$TMP/bin"
+printf '#!/usr/bin/env bash\nexit 78\n' > "$TMP/bin/brief-gate-78.sh"; chmod +x "$TMP/bin/brief-gate-78.sh"
+mkwt "$TMP/wt/prd-81" fix/81
+printf '## ORDER — no contract here either\n' > "$TMP/briefs/prd-81.txt"
+mkorder prd-81 "$TMP/wt/prd-81" fix/81 "$TMP/briefs/prd-81.txt" 2400 "2026-10-27 01:00:00"
+WORKER_SUPPLY_BRIEF_GATE="$TMP/bin/brief-gate-78.sh" O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 \
+  sup refill >"$TMP/l.out" 2>&1; lrc=$?
+[ "$(spawns_for prd-81)" = "1" ] && ok "a gate that returns NO VERDICT (rc=78) does not suppress the offer — the dispatcher still receives it" \
+                                 || bad "an unanswerable gate was read as 'stale brief' and swallowed the offer ($(spawns_for prd-81) spawns)"
+grep -q 'could not be revalidated' "$TMP/l.out" 2>/dev/null && ok "…and the pass SAYS the revalidation could not be taken (rc named), instead of staying silent" \
+                                                        || bad "the unanswerable gate was not reported: $(head -3 "$TMP/l.out")"
+! grep -q 'REGENERATION REQUIRED' "$TMP/l.out" 2>/dev/null && ok "…and it does NOT claim the brief needs regenerating (the wrong fault, and the wrong remedy)" \
+                                                   || bad "an install fault was reported as a stale brief"
+
 # ── (d3) an accepted re-offer that ENDS AT ONCE holds no slot ───────────────────────────────━━
 # ⛔ FOUND BY REVIEW (#2896 round 1, P2): the confirmation step treated "the worker already left a
 # .rc" as ACCEPTANCE *and* as a LIVE slot, so a fast-failing worker (bad credentials, missing
@@ -511,8 +604,8 @@ echo "-- (d3) a re-offer that ends at once holds no slot"
 reset
 mkwt "$TMP/wt/prd-61" fix/61
 mkwt "$TMP/wt/prd-62" fix/62
-echo brief > "$TMP/briefs/prd-61.txt"
-echo brief > "$TMP/briefs/prd-62.txt"
+mkbrief "$TMP/briefs/prd-61.txt"
+mkbrief "$TMP/briefs/prd-62.txt"
 mkorder prd-61 "$TMP/wt/prd-61" fix/61 "$TMP/briefs/prd-61.txt" 60 "2026-10-27 01:00:00"
 mkorder prd-62 "$TMP/wt/prd-62" fix/62 "$TMP/briefs/prd-62.txt" 60 "2026-10-27 01:00:00"
 # a dispatcher whose worker dies instantly: it writes the spawn and a non-zero .rc at once.
@@ -549,8 +642,8 @@ echo "-- (e2) completed is not dead: no replay of a finished order"
 reset
 mkwt "$TMP/wt/prd-41" fix/41
 mkwt "$TMP/wt/prd-42" fix/42
-echo brief > "$TMP/briefs/prd-41.txt"
-echo brief > "$TMP/briefs/prd-42.txt"
+mkbrief "$TMP/briefs/prd-41.txt"
+mkbrief "$TMP/briefs/prd-42.txt"
 mkorder prd-41 "$TMP/wt/prd-41" fix/41 "$TMP/briefs/prd-41.txt"
 mkorder prd-42 "$TMP/wt/prd-42" fix/42 "$TMP/briefs/prd-42.txt"
 echo 0 > "$BG/prd-41.rc"          # the order RAN TO COMPLETION (the harness's own verdict)
@@ -570,7 +663,7 @@ e2rc=$?
 echo "-- (e3) --dry-run is a rehearsal: no record, no ledger row, no spawn"
 reset
 mkwt "$TMP/wt/prd-51" fix/51
-echo brief > "$TMP/briefs/prd-51.txt"
+mkbrief "$TMP/briefs/prd-51.txt"
 mkorder prd-51 "$TMP/wt/prd-51" fix/51 "$TMP/briefs/prd-51.txt"
 O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup --dry-run >"$TMP/dry.out" 2>&1; dryrc=$?
 [ "$dryrc" = "0" ] && ok "the dry run exits 0 (a rehearsal is not a pass verdict)" || bad "dry run rc=$dryrc"
@@ -738,7 +831,7 @@ if cmp -s "$SUPPLY" "$MUT"; then
 else
   reset
   mkwt "$TMP/wt/prd-11" fix/11
-  echo brief > "$TMP/briefs/prd-11.txt"
+mkbrief "$TMP/briefs/prd-11.txt"
   mkorder prd-11 "$TMP/wt/prd-11" fix/11 "$TMP/briefs/prd-11.txt" 2400 "2026-10-27 01:00:00"
   O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 bash "$MUT" refill >/dev/null 2>&1
   n_mut="$(spawn_count)"; live_mut="$(py_live_for 11)"
@@ -746,6 +839,31 @@ else
     ok "with the refill step neutered the (a) assertion REDDENS: spawns=$n_mut, doctor's reader=$live_mut — the test really tests the refill"
   else
     bad "the mutation did NOT redden (a): spawns=$n_mut reader=$live_mut — (a) would pass on a supervisor that refills nothing"
+  fi
+fi
+
+# ── (j2) MUTATION: neuter the revalidation, and (j) must redden ───────────────────────────────
+# ⛔ A NEW ASSERTION THAT CANNOT FAIL IS NOT A TEST (#3442). Case (j) is the one that pins the #3958
+# invariant, so the mutant that REMOVES the invariant must redden it: with `brief_verdict` forced to 0
+# the fossil reaches the dispatcher again — which is exactly the live defect
+# (`72 re-offer(s) refused by the dispatcher`, pass after pass).
+echo "-- (j2) mutation: no brief revalidation must redden (j)"
+MUT3="$TMP/worker-supply.norevalidate.sh"
+sed 's|^brief_verdict() { # <brief>$|brief_verdict() { return 0   # MUTATION: the brief is never revalidated|' \
+  "$SUPPLY" > "$MUT3"
+if cmp -s "$SUPPLY" "$MUT3"; then
+  bad "the revalidation mutation did not apply (\`brief_verdict() {\` was not found) — a mutation that cannot mutate proves nothing"
+else
+  reset
+  mkwt "$TMP/wt/prd-72" fix/72
+  printf '## ORDER — re-run the checks on this head\n' > "$TMP/briefs/prd-72.txt"
+  mkorder prd-72 "$TMP/wt/prd-72" fix/72 "$TMP/briefs/prd-72.txt" 2400 "2026-10-24 23:03:00"
+  O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 bash "$MUT3" refill >"$TMP/j2mut.out" 2>&1
+  n_mut3="$(spawns_for prd-72)"
+  if [ "$n_mut3" = "1" ]; then
+    ok "with the revalidation neutered the (j) assertion REDDENS: the refused brief reached the dispatcher ($n_mut3 spawn) — (j) really grades the invariant"
+  else
+    bad "the mutation did NOT redden (j): spawns=$n_mut3 — (j) would pass on a supervisor that replays a refused brief for ever"
   fi
 fi
 
@@ -759,7 +877,7 @@ if cmp -s "$SUPPLY" "$MUT2"; then
 else
   reset
   mkwt "$TMP/wt/prd-13" fix/13
-  echo brief > "$TMP/briefs/prd-13.txt"
+mkbrief "$TMP/briefs/prd-13.txt"
   mkorder prd-13 "$TMP/wt/prd-13" fix/13 "$TMP/briefs/prd-13.txt"
   # the same shape as (b): a live supervisor holding the guard, then a second one against it
   O="$O" SPAWNS="$SPAWNS" WORKER_SUPPLY_INTERVAL_S=60 MAX_FIX=3 MAX_REVIEW=4 \
@@ -799,11 +917,22 @@ fi
 # ⛔ THIS IS A TEST, NOT A COMMENT. The first attempt at this fix died inside its own suite: 45 minutes
 # and no result, so the fix never shipped. An unbounded test is a defect in the deliverable, so the
 # duration is measured and asserted like any other property.
+# ⛔ THE BOUND IS 180 s, RAISED FROM 60 s, AND THE REASON IS MEASURED RATHER THAN FELT (agent-infra#3958).
+# Two facts, both read on this box 2026-11-11: (1) every re-offer now runs the SHIPPED brief gate, which
+# is ~0.22 s per call — stubbing it (`WORKER_SUPPLY_BRIEF_GATE=/usr/bin/true`) measured 89 s against
+# 98 s, i.e. the new work is ~9 s of the total; (2) the rest is the BOX, not the suite: `uptime` read
+# **load 230 on 10 CPUs** in the same window, and this suite is mostly bounded `sleep`/poll loops, so it
+# stretches with saturation. A bound tuned on a quiet box fails on a loaded one for a reason that says
+# nothing about the deliverable. 180 s is still 15x under the 45-minute hang it exists to catch, and the
+# LOAD is printed beside it so the next reader can tell saturation from a genuinely unbounded test
+# instead of re-deriving which one this was.
 echo "-- (h) the suite's own wall-clock"
+SUITE_BOUND_S=180
 SUITE_END=$(date +%s); ELAPSED=$(( SUITE_END - SUITE_START ))
-echo "   suite wall-clock: ${ELAPSED}s (bound 60s, fake-worker slice ${WORKER_STUB_LIFETIME}s)"
-[ "$ELAPSED" -le 60 ] && ok "the suite finished in ${ELAPSED}s, inside its 60s bound" \
-                      || bad "the suite took ${ELAPSED}s — an unbounded test is why the fix never shipped"
+LOAD_NOW="$(uptime 2>/dev/null | sed -n 's/.*load averages*: *//p' | cut -c1-40)"
+echo "   suite wall-clock: ${ELAPSED}s (bound ${SUITE_BOUND_S}s, fake-worker slice ${WORKER_STUB_LIFETIME}s, load ${LOAD_NOW:-<unreadable>})"
+[ "$ELAPSED" -le "$SUITE_BOUND_S" ] && ok "the suite finished in ${ELAPSED}s, inside its ${SUITE_BOUND_S}s bound (load ${LOAD_NOW:-?})" \
+                                    || bad "the suite took ${ELAPSED}s (load ${LOAD_NOW:-?}) — an unbounded test is why the fix never shipped"
 
 echo
 echo "passed=$PASS failed=$FAIL (${ELAPSED}s)"
