@@ -137,7 +137,31 @@ mk_issue_claim() {   # <dir> <issue> <lease-seconds-from-now> [<owner-host>]
 # turned 114 arms of this suite red for a reason that has nothing to do with provisioning. A case
 # that WANTS a declared target sets `OR=` on its own invocation (the acme/widget arms do), so
 # clearing the ambient value costs nothing and makes the shard deterministic on any box.
+#
+# ⛔ CLEARING `$OR` IS NOT ENOUGH — THE MARKER FORCES THE SAME REFUSAL ON ITS OWN (#2953 lane,
+# 2026-11-11, MEASURED on a fleet lane box). `refresh-candidates.sh` reads TWO knobs: `$OR_FROM_ENV`
+# and the loop's declaration marker `OR_OPERATOR_DECLARED` (`orch-loop.sh:193-195` EXPORTS that marker
+# on every cell, `1` when the operator named the target). `OR_DECLARED=1` survives a cleared `$OR`, and
+# `OR` then FALLS BACK to `daniel-ospina/tortoise` — so a box whose env carries the marker refused
+# every local-path fixture at `resolve_repo` (rc=3, a stage ABOVE the behaviour under test):
+#
+#     PASS=261 FAIL=221
+#     ❌ (p1) --check does NOT fail a stale-tracking-ref FULL checkout (rc=3)
+#     [refresh] NOT PROVISIONABLE: $REPO is …/repo, whose 'origin' is the local path …/origin.git —
+#       it cannot prove it is a checkout of $OR (daniel-ospina/tortoise), and $OR was DECLARED
+#
+# Those 221 include (p1)/(p2), the arms that pin #2956's fix — so on the box the fleet actually runs
+# this suite on, the shard could not discriminate the regression it exists for. The sibling suite paid
+# for the same lesson in #3174 and clears BOTH; this one cleared only `$OR`.
+# ⛔ THE CLEAR LIST IS WRITTEN ONCE, HERE, and every invocation site uses it (agent-infra#3174 review:
+# two verbatim copies is how one copy drifts). A new ambient provisioning knob goes in this array and
+# nowhere else; `(h)` exports both `$OR` knobs into the suite precisely so a drift reddens an arm
+# instead of quietly making 221 of them meaningless. A case that WANTS a knob still sets it on its own
+# invocation — GNU `env` applies `KEY=VAL` AFTER `-u KEY`, so the case's value is the one the pass sees.
 OUT=""; RC=0
+SCOUT_CLEAR=(-u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS
+             -u SCOUT_LOCK_STALE_SECS -u GH_HOST -u CELL_HOME -u GH_CONFIG_DIR
+             -u OR -u OR_OPERATOR_DECLARED)
 rf() {
   local dir="$1" mode="$2"; shift 2
   # `RF_LIMIT` overrides the candidate window (argv, which the shipped script reads as `$LIMIT`).
@@ -145,8 +169,7 @@ rf() {
   # non-vacuity control for “the stop outranks the walk-past”.
   local args=("${RF_LIMIT:-6}"); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
-  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
-          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR -u OR \
+  OUT="$(env "${SCOUT_CLEAR[@]}" \
           HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
           bash "$REFRESH" "${args[@]}" 2>&1)"
   RC=$?
@@ -965,7 +988,7 @@ echo; echo "── an unwritable state dir is refused, not absorbed ──"
 mk_case unwritable-o
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#' > "$D/state-file" # a REGULAR FILE where $O must be a directory
-OUT="$(env -u GH_HOST -u CELL_HOME -u OR HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
+OUT="$(env "${SCOUT_CLEAR[@]}" HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
         O="$D/state-file" bash "$REFRESH" 2>&1)"; RC=$?
 [ "$RC" -eq 1 ] && ok "unwritable \$O: rc=1 (TRANSIENT — loud, and no permanent marker)" \
                || bad "unwritable \$O: rc=$RC (want 1) — output: $OUT"
@@ -4055,8 +4078,10 @@ if [ -s "$MUTP" ]; then
 # test, and the assertion below saw a NOT PROVISIONABLE line instead of the `check: FAIL the scout`
 # one. Same rule as `rf`'s: the shard must be deterministic on any box, and a case that WANTS a
 # declared target sets `OR=` on its own invocation.
-OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
-        -u OR -u GH_HOST -u CELL_HOME -u GH_CONFIG_DIR \
+# ⛔ AND IT USES THE SHARED CLEAR LIST, not a third hand-built copy: this arm is env-by-hand only
+# because it runs a MUTATION `$MUTP` rather than `$REFRESH`, and the copy here is exactly how the
+# `OR_OPERATOR_DECLARED` leak got back in after `rf` was fixed once (#2953 lane, 2026-11-11).
+OUT="$(env "${SCOUT_CLEAR[@]}" \
         HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$MUTP" --check 2>&1)"
 RC=$?
 ck "(p2) WITHOUT the fix --check FAILS the stale-tracking-ref checkout (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
@@ -4834,6 +4859,42 @@ esac
 grep -qx 42 "$D/o/candidates.txt" 2>/dev/null \
   && bad "unlandable publish: #42 was queued although no classification could be recorded" \
   || ok "unlandable publish: nothing was released or queued on a classification that could not be persisted"
+
+# ── (h) HERMETICITY: THE CLEAR LIST IS THE SUITE'S OWN INVARIANT ─────────────────────────────────
+# Every fixture in this file builds a bare LOCAL origin (`git init -q --bare "$D/origin.git"`), and
+# `resolve_repo` tolerates a local-path origin only while the queue target is UNDECLARED. TWO knobs
+# declare it — `$OR`, and the loop's `OR_OPERATOR_DECLARED` marker (`orch-loop.sh:193-195` exports it
+# on every cell) — and BOTH are exported into this suite's OWN environment here, so this arm reddens
+# the moment either entry drifts out of `SCOUT_CLEAR`. MEASURED before the marker's entry existed
+# (2026-11-11, a fleet lane box): the marker ALONE turned 221 of 482 arms red, (p1)/(p2) — the arms
+# that pin #2956's fix — among them, every one reading `NOT PROVISIONABLE … cannot prove it is a
+# checkout of $OR (daniel-ospina/tortoise)` from a stage ABOVE the behaviour under test. A shard that
+# is red for another reason on the box the fleet runs it on cannot discriminate a regression.
+# ⛔ IT ASSERTS BOTH DIRECTIONS, so it cannot be satisfied by a pass that simply ignores `$OR`: the
+# ambient-exported run must PROCEED, and a DECLARED `$OR` handed to the INVOCATION must still REFUSE
+# (rc=3) — the deliberate `resolve_repo` behaviour that made the ambient leak fatal in the first place.
+echo; echo "── hermeticity: neither \$OR nor the loop's OR_OPERATOR_DECLARED reaches a case ──"
+mk_stale_ref_case hermetic
+HERM_OR_SAVE="${OR:-}"; HERM_DECL_SAVE="${OR_OPERATOR_DECLARED:-}"
+export OR="daniel-ospina/tortoise" OR_OPERATOR_DECLARED=1
+rf "$D" check
+ck "(h) an AMBIENT exported \$OR + OR_OPERATOR_DECLARED does not reach the pass (rc=$RC — it must proceed)" "$([ "$RC" -eq 0 ]; echo $?)"
+case "$OUT" in
+  *"sub-step=resolve-repo"*|*"NOT PROVISIONABLE"*) r=1 ;;
+  *) r=0 ;;
+esac
+ck "(h) …and the pass never refused at resolve_repo (the ambient leak's signature)" "$r"
+# the positive control: the SAME value, handed over deliberately, IS refused — so (h) is not a fixture
+# that has simply stopped testing the resolver, and the clear list cannot be satisfied by a no-op.
+rf "$D" check OR="daniel-ospina/tortoise"
+ck "(h) a DECLARED \$OR on the INVOCATION is still REFUSED (rc=$RC — want 3)" "$([ "$RC" -eq 3 ]; echo $?)"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*"local path"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck "(h) …and it NAMES the local-path origin it could not prove" "$r"
+if [ -n "$HERM_OR_SAVE" ]; then export OR="$HERM_OR_SAVE"; else unset OR 2>/dev/null || true; fi
+if [ -n "$HERM_DECL_SAVE" ]; then export OR_OPERATOR_DECLARED="$HERM_DECL_SAVE"; else unset OR_OPERATOR_DECLARED 2>/dev/null || true; fi
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

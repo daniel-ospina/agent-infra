@@ -2174,19 +2174,68 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       const mainKey = sharedResolveEffectiveRepo("git status", mainR)?.repoKey;
       const m2Gate = (cmd) => {
         const d = classifyGitCommandDetailed(cmd);
-        const gateVerb = d.verdict === "block:commit" ? "commit" : "push";
-        // round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS comes
-        // from the classifier's boundary-aware commit/push invocation hints
-        // (the replay counted a phantom `bash git -C <wt> commit` and
-        // worktree-exempted the real main commit).
-        let m2Eff = sharedResolveRepoFromInv(gateVerb === "commit" ? d.commitHints : d.pushHints, mainR);
-        // #596 round-4 (F2): null m2Eff under a block:commit/push verdict →
-        // resolve the session repo, mirroring index.ts's M2 arm fallback.
-        if (!m2Eff) m2Eff = sharedResolveEffectiveRepo("git status", mainR);
-        if (!m2Eff) return "no-eff";
-        if (m2Eff.isWorktree) return "wt-exempt";
-        const m2 = sharedDecideM2({ effectiveRepo: m2Eff, baseline: { repoKey: mainKey, branch: "feat/1" }, currentBranch: m2Eff.currentBranch, pushDst: d.pushDst, pushTargets: d.pushTargets, verdict: d.verdict, allowActive: false });
-        return m2?.block ? "block" : "allow";
+        // #605: mirror index.ts M2 — gate EVERY commit/push invocation, each
+        // resolved from ITS OWN classifier hints (+ a push's OWN targets), and
+        // block wins. A fully-VISIBLE `-C <wt>` LEAD used to resolve the whole
+        // command to its worktree, so the later OFF-baseline MAIN mutation was
+        // exempted (`git -C <wt> commit ; git commit` → ALLOW; the reversed
+        // order blocked). Same rule the round-4 M3 loop (#596) applies to
+        // branch-state mutations.
+        // ⛔ THE MIRROR INVENTS NO MUTATION (review round-6 F2). This used to
+        // SYNTHESIZE one from `det.commitHints`/`det.pushHints` when the
+        // classifier reported none — the exact fallback `index.ts` deleted in
+        // round 5, kept here one round longer. Two costs, both measured:
+        //   • the classifier-level suite could not SEE round-6 F1: for an opaque
+        //     `eval "git push -f …"` the mirror invented a push with
+        //     `invVisible: true`, resolved the session repo and answered
+        //     "block" while the SHIPPED gate admitted — an over-block the suite
+        //     called correct, over a hole in the gate;
+        //   • it is the drift this group's source pins exist to prevent: the pins
+        //     below cover the three `gateMutations(m2Mutations)` call sites, the
+        //     `isDelete` line and the #73 union, but NOT the list itself, so the
+        //     mirror kept modelling the deleted rule and every pin stayed green.
+        // The mirror now mirrors: only invocations the command ACTUALLY contains.
+        const muts = [
+          ...(d.commitMutations ?? []),
+          ...(d.pushMutations ?? []),
+        ];
+        let sawMain = false;
+        for (const mu of muts) {
+          // #605 reviews F1 + I2: a DELETE-spelled push is the #73
+          // coordinated-delete arm's business, never M2's target comparison —
+          // and the rule keys on the MUTATION's own `isDelete`, not on the
+          // compound's verdict path (verdict-keyed it held only when the delete
+          // was the FIRST push, so a later-segment `-d` was blocked while
+          // `--delete` was allowed). index.ts applies it inside
+          // gateMutations; the mirror must not drift from that.
+          if (mu.verb === "push" && mu.isDelete) continue;
+          // #596 round-4 (reviewer P1 follow-up): the repo ALWAYS comes from the
+          // classifier's boundary-aware hints (the replay counted a phantom
+          // `bash git -C <wt> commit` and worktree-exempted the real main commit).
+          let m2Eff = mu.hints
+            ? sharedResolveRepoFromInv(mu.hints, mainR)
+            : (mu.invVisible === false ? sharedResolveEffectiveRepo("git status", mainR) : null);
+          // #596 round-4 (F2): null m2Eff → resolve the session repo, mirroring
+          // index.ts's M2 arm fallback.
+          if (!m2Eff) m2Eff = sharedResolveEffectiveRepo("git status", mainR);
+          if (!m2Eff) return "no-eff";
+          // #805: an UNRESOLVED target is never worktree-exempt (it must reach
+          // decideM2's fail-closed refusal), exactly as index.ts orders it.
+          if (m2Eff.isWorktree && !m2Eff.unresolvedTarget) continue;
+          sawMain = true;
+          const muVerdict = mu.verb === "commit"
+            ? "block:commit"
+            : (d.verdict === "block:force-push" ? "block:force-push" : "block:push");
+          const m2 = sharedDecideM2({
+            effectiveRepo: m2Eff, baseline: { repoKey: mainKey, branch: "feat/1" },
+            currentBranch: m2Eff.currentBranch,
+            pushDst: mu.verb === "push" ? (mu.dst ?? null) : d.pushDst,
+            pushTargets: mu.verb === "push" ? (Array.isArray(mu.targets) ? mu.targets : d.pushTargets) : d.pushTargets,
+            verdict: muVerdict, allowActive: false,
+          });
+          if (m2?.block) return "block";
+        }
+        return sawMain ? "allow" : "wt-exempt";
       };
       const m2a = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: off-baseline main commit + -C wt mutation tail → M2 BLOCK (commit repo)", m2a, "block");
@@ -2208,6 +2257,92 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       // not exempt the real OFF-baseline MAIN commit.
       const m2f = m2Gate(`sh -c "git -C \"${wtR}\" commit -m z" ; git commit -m x`);
       expectBool("#596 r4 P1a: invisible wt-payload commit lead + real off-baseline main commit → M2 BLOCK", m2f, "block");
+      // ── #605: the VISIBLE twin of the P1a hole ──
+      // commitHints/pushHints describe only the FIRST VISIBLE commit/push, so a
+      // fully-visible worktree-scoped LEAD supplied the ONLY resolved repo
+      // (a worktree) and decideM2 exempted the whole command: the real
+      // OFF-baseline MAIN commit / push of a foreign branch ran rc 0. The gate
+      // outcome must not depend on invocation ORDER (the reversed forms below
+      // blocked even before the fix). index.ts M2 now gates EVERY mutation, and
+      // a push is gated against ITS OWN refspecs.
+      const m2g = m2Gate(`git -C "${wtR}" commit -m z ; git commit -m x`);
+      expectBool("#605: visible wt-scoped commit LEAD + off-baseline MAIN commit → M2 BLOCK", m2g, "block");
+      const m2h = m2Gate(`git commit -m x ; git -C "${wtR}" commit -m z`);
+      expectBool("#605: control — same mutations in the reversed order → M2 BLOCK (order-independent)", m2h, "block");
+      const m2i = m2Gate(`git -C "${wtR}" push origin wtmain ; git push origin feat/other`);
+      expectBool("#605: visible wt-scoped push LEAD + off-baseline MAIN push → M2 BLOCK", m2i, "block");
+      const m2j = m2Gate(`git -C "${wtR}" push origin feat/1 ; git push origin feat/other`);
+      expectBool("#605: leading wt push naming the BASELINE branch cannot launder a MAIN push of a foreign one", m2j, "block");
+      // …and the F1 sibling of the same gap, in the off-baseline state: a
+      // `--delete` anywhere in the raw command routes the verdict to the #73
+      // arm, whose early return used to skip M2 for the compound's OTHER
+      // mutations too.
+      const m2nd = m2Gate(`git commit -m x ; git push origin --delete stale`);
+      expectBool("#605 F1: off-baseline MAIN commit + an unrelated --delete segment → M2 BLOCK", m2nd, "block");
+      // The other half of the same loop: per-invocation TARGETS. A MAIN push of
+      // the session's OWN branch stays allowed even when the LEAD names a
+      // different one, and an all-worktree compound is exempt (no false block).
+      const m2k = m2Gate(`git -C "${wtR}" push origin wtmain ; git push origin feat/1`);
+      expectBool("#605: wt lead + ON-baseline MAIN push (own refspec) → allow (targets are per-invocation)", m2k, "allow");
+      const m2l = m2Gate(`git -C "${wtR}" commit -m z ; git -C "${wtR}" commit -w`);
+      expectBool("#605: ALL-wt compound (both mutations -C <wt>) → wt-exempt (no false block)", m2l, "wt-exempt");
+      // Review F1 (same class, one level above the hints): the push-delete verdict
+      // is set from the WHOLE raw command, so a `--delete` anywhere in a compound
+      // routed it into the #73 arm, whose early return skipped M2 entirely —
+      // `git push origin feat/other ; git push origin --delete stale` let the
+      // off-baseline MAIN push through. The delete arm now gates the compound's
+      // NON-delete mutations (the delete-spelled push itself stays #73's).
+      const m2m = m2Gate(`git push origin feat/other ; git push origin --delete stale`);
+      expectBool("#605 F1: off-baseline MAIN push + an unrelated --delete segment → M2 BLOCK", m2m, "block");
+      const m2o = m2Gate(`git push origin feat/1 ; git push origin --delete stale`);
+      expectBool("#605 F1 control: ON-baseline MAIN push + a --delete segment → allow (no false block)", m2o, "allow");
+      const m2p = m2Gate(`git push origin --delete stale`);
+      expectBool("#605 F1 control: delete-only command → nothing main-resolving to gate (wt-exempt)", m2p, "wt-exempt");
+      // Review I2: the delete exemption keys on the MUTATION's own `isDelete`,
+      // not on the compound's verdict path — verdict-keyed, the `-d` short form
+      // in a later segment was gated by M2 while `--delete` was not.
+      const m2q = m2Gate(`git push origin feat/1 && git push origin -d stale`);
+      expectBool("#605 I2: later-segment `-d` delete → allow (delete exemption is per-mutation)", m2q, "allow");
+      // Review round-3 F1: the #73 arm's target-count precondition and the M2 leg
+      // used to be one guard, so a no-refspec `git push --delete` (a git error)
+      // skipped the arm entirely and exempted the compound. The M2 leg now runs
+      // on the VERDICT; the mirror models that by gating the non-delete mutations
+      // for a block:push-delete verdict whether or not det.pushTargets is empty.
+      const m2r = m2Gate(`git push origin feat/other && git push --delete`);
+      expectBool("#605 F1-r3: off-baseline MAIN push + a no-refspec `git push --delete` → M2 BLOCK", m2r, "block");
+      const m2s = m2Gate(`git commit -m x ; git push --delete`);
+      expectBool("#605 F1-r3: off-baseline MAIN commit + a no-refspec `git push --delete` → M2 BLOCK", m2s, "block");
+      const m2t = m2Gate(`git push --delete`);
+      expectBool("#605 F1-r3 control: lone no-refspec `git push --delete` → nothing main-resolving (wt-exempt)", m2t, "wt-exempt");
+      // Review round-6 F2: with the invented mutations gone, the mirror reports the
+      // ZERO-mutation shape the classifier actually produces for an opaque payload,
+      // instead of a synthetic block the shipped gate never returns.
+      const m2u = m2Gate(`eval "cd /tmp && git push -f origin feat/other"`);
+      expectBool("#605 r6: an opaque `eval` force-push yields NO mutations to gate (the fail-closed arm is the shipped one)",
+        m2u, "wt-exempt");
+      // ── ANTI-DRIFT source pins (agent-infra#3442, reviewer residual) ──
+      // `m2Gate` is a HAND-WRITTEN mirror of index.ts's M2 loop, so a shipped
+      // arm could lose its gate call while every row above stayed green (the
+      // mirror would keep modelling the pre-loss rule). These three pins tie the
+      // mirror's three rules to the SHIPPED source. They are not an equivalence
+      // proof — that is what the handler suite is for — they make a silent
+      // REMOVAL of any of the three impossible without a red row.
+      const m2GateCalls = (pinSrc.match(/gateMutations\(m2Mutations\)/g) ?? []).length;
+      expectBool("#605 source pin: index.ts gates the compound in ALL THREE arms (M2, allowance admit, push-delete)",
+        m2GateCalls >= 3, true);
+      expectBool("#605 source pin: the delete exemption keys on the MUTATION's own isDelete (not the verdict path)",
+        pinSrc.includes('if (mu.verb === "push" && mu.isDelete) continue;'), true);
+      expectBool("#605 source pin: the #73 coordinated check unions EVERY delete invocation's targets",
+        pinSrc.includes("_coordinatedDeleteBlock(deleteTargets)"), true);
+      // Review round-6 F2: the mutation list ITSELF is a rule, and it was the one
+      // rule with no pin — the mirror above could keep the deleted synthesis while
+      // every pin stayed green. The mirror cannot represent the shipped arm (it
+      // resolves at `mainR`, the arm resolves at the session cwd), so the arm is
+      // pinned at its SOURCE here and pinned EXECUTABLY at the handler level in
+      // test-m2-compound-ownership.mjs S9.
+      const unseenPushPin = pinSrc.match(/m2Mutations\.length === 0 &&\s*\(det\.verdict === "block:force-push" \|\| det\.verdict === "block:push-delete"\)/);
+      expectBool("#605 r6 source pin: a push verdict the extractor could not see is FAIL-CLOSED, not an empty list to admit",
+        unseenPushPin !== null && pinSrc.includes("could not verify repo ownership (git read failed; fail-closed, #265)"), true);
       execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
       const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");
@@ -4642,7 +4777,157 @@ try {
     none("echo hi", "prose silence");
   }
 
-  // ── #625: in-place overwrite VERBS — walker-level pins. The primitive-only
+  // ── #437/#456 (C) round-45 (probe-verified against real bash): the cwd
+  // model must equal bash's on (a) a `( popd )` in a subshell, (b) the LAST
+  // segment of a pipeline, (c) a FAILED pushd, and (d) a newline that ends a
+  // simple command. (a) is the #456 residual itself — the walker is already
+  // real-bash-equal there and these pins exist so a future "optimisation" of
+  // the `)` handler (a LENGTH truncation cannot restore a popped VALUE, which
+  // is what #456's body proposes) cannot silently reintroduce the fail-open.
+  // (b)-(d) were MEASURED divergences found while verifying (a) (#3954 the
+  // pipeline boundary, #3955 the failed-pushd stack membership, #3956 the
+  // newline-terminated operand read); each was a fail-OPEN (a tracked hub write
+  // resolved outside the hub), and each is pinned in BOTH directions — the positive control is the neighbouring
+  // command that must still resolve where bash resolves it.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r45-"));
+    mkdirSync(join(H, "a")); mkdirSync(join(H, "c")); mkdirSync(join(H, "docs"));
+    // The hub the probes model: `docs/tracked.md` and the ROOT `tracked.md` are
+    // TRACKED; `a/` and `c/` are not — so a write there is the #436 carve-out's
+    // untracked NEW file (ALLOW) and a write to docs/ or the root BLOCKS.
+    const TRACKED = ["docs/tracked.md", "tracked.md"];
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r45: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C437r45: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    // The GATE decision, not just the resolution: block iff the resolved target
+    // is a TRACKED hub file (#436 carve-out: an untracked NEW file is allowed).
+    const verdict = (cmd) => firstHubTrackedWrite(cands(cmd).map((x) => ({ rel: x.resolvedPath.slice(H.length + 1) })), TRACKED) !== null;
+    const blocks = (cmd, label) => expectBool(`C437r45: ${label}`, verdict(cmd), true);
+    const allows = (cmd, label) => expectBool(`C437r45: ${label}`, verdict(cmd), false);
+
+    // ── (a) #456: `( popd )` must NOT eat the inherited stack entry. Bash
+    // copies the dir stack into the subshell and discards the copy at `)`, so
+    // the OUTER popd still restores the inherited entry. Length-only restore
+    // cannot do this (it re-holes the array → the outer popd no-ops).
+    // Real bash, verified: c/tracked.md (untracked) · docs/tracked.md (TRACKED)
+    // · a/tracked.md (untracked) — i.e. D1/D3 ALLOW, D2 BLOCK.
+    has("cd c; pushd ../docs; ( popd ); popd; echo x > tracked.md", "redirect:H/c/tracked.md", "D1: ( popd ) discarded; outer popd restores the pre-pushd cwd (c)");
+    allows("cd c; pushd ../docs; ( popd ); popd; echo x > tracked.md", "D1 gate: writable new file in c → ALLOW");
+    has("cd docs; pushd ../c; ( popd ); popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "D2: outer popd restores docs — the TRACKED hub write is not lost");
+    blocks("cd docs; pushd ../c; ( popd ); popd; echo x > tracked.md", "D2 gate: TRACKED docs/tracked.md → BLOCK (the #437 dirty-hub inflow)");
+    has("cd a; pushd ../docs; ( popd ); popd; echo x > tracked.md", "redirect:H/a/tracked.md", "D3: ( popd ) discarded; outer popd restores the pre-pushd cwd (a)");
+    allows("cd a; pushd ../docs; ( popd ); popd; echo x > tracked.md", "D3 gate: writable new file in a → ALLOW");
+    has("cd docs; pushd ../c; ( ( popd ) ); popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "nested ( ( popd ) ): the inner frames' pops never reach the outer stack");
+    has("cd docs; pushd ../c; pushd ../a; ( popd ); popd; echo x > tracked.md", "redirect:H/c/tracked.md", "two inherited entries: one subshell pop discards only its own copy");
+
+    // ── (b) EVERY pipeline segment is a subshell, the LAST one included: a cd
+    // in the final segment dies at the boundary, so the next command runs from
+    // the pipeline's START cwd. Real bash (fixture root): F1/F2/F3 write the
+    // ROOT tracked.md; the control F5 (`cd` BEFORE the `|`) writes docs/.
+    has("true | cd docs; echo x > tracked.md", "redirect:H/tracked.md", "F1: the last pipeline segment's cd dies at `;`");
+    blocks("true | cd docs; echo x > tracked.md", "F1 gate: the write is the TRACKED root file → BLOCK");
+    has("cd docs | cd a; echo x > tracked.md", "redirect:H/tracked.md", "F2: BOTH segments are subshells — neither cd survives");
+    has("echo hi | cd docs\n echo x > tracked.md", "redirect:H/tracked.md", "F3: a newline is a boundary too — the last segment's cd still dies");
+    has("cd docs && true | cat; echo x > t.md", "redirect:H/docs/t.md", "F5 control: a cd BEFORE the pipe is NOT a pipeline segment — it survives");
+    has("cd docs | cat; echo x > t.md", "redirect:H/t.md", "F6 control: the cd IS the pipeline segment — it dies at `|` (round-2 pin holds)");
+
+    // ── (c) a FAILED pushd never touches the dir stack (bash errors and leaves
+    // `dirs` unchanged). Pushing the cwd anyway desynchronises the stack, so a
+    // later bare popd lands one entry off and the walker's cwd drifts INTO the
+    // fail-open direction. Real bash: root tracked.md is overwritten.
+    has("pushd /nonexistent; cd a; popd; echo x > ../tracked.md", "redirect:H/tracked.md", "B1: a failed pushd leaves the stack alone — popd is a no-op, cwd stays a");
+    blocks("pushd /nonexistent; cd a; popd; echo x > ../tracked.md", "B1 gate: the real write is the TRACKED root file → BLOCK");
+    has("cd docs; pushd ../c; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "B2 control: a SUCCESSFUL pushd still collapses on the bare popd (docs)");
+
+    // ── (d) a bare newline ends a simple command, so a cwd builtin must not
+    // read its operand across one (`popd` + newline + `cd a`: real bash runs
+    // TWO commands). Real bash: cwd is `a`, so `../tracked.md` is the TRACKED
+    // root file.
+    has("popd\ncd a; echo x > ../tracked.md", "redirect:H/tracked.md", "N1: the bare popd does not eat the next line's `cd`");
+    blocks("popd\ncd a; echo x > ../tracked.md", "N1 gate: the real write is the TRACKED root file → BLOCK");
+    lacks("cd\ndocs; echo x > tracked.md", "redirect:H/docs/tracked.md", "N2: `cd` + newline is a bare cd — the next line is NOT its operand");
+  }
+
+  // ── #3957 review (cycle-46) pins: three shapes where THIS PR's own diff sent
+  // the walker's cwd model AWAY from real bash's. Each was a FAIL-OPEN on a
+  // tracked hub file (a BLOCK became an ALLOW) and each reddened an existing pin
+  // that the body counted as "pre-existing" — C437r43 for ISSUE 1, C437r39 for
+  // ISSUE 2; ISSUE 3 is the same class as #3954 one state variable over.
+  // Every arm is real-bash-verified. The `has(…)` rows pin the RESOLUTION and the
+  // `blocks(…)`/`allows(…)` rows pin the GATE VERDICT, so a fix that resolves
+  // correctly but grades wrong (or vice versa) still reddens.
+  // ⛔ TRACKED IS ONE FILE PER ARM FAMILY — the one real bash overwrites. A
+  // fixture that tracks BOTH candidate paths cannot grade the gate at all: the
+  // wrong resolution and the right one would both BLOCK. That is #3957 review
+  // NOTE 1 on the C437r45 `F1 gate` row, and it is fixed here by construction
+  // (see the tightened F1 row at the end of this block).
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r46-"));
+    mkdirSync(join(H, "c")); mkdirSync(join(H, "docs")); mkdirSync(join(H, "sub"));
+    writeFileSync(join(H, "docs", "tracked.md"), "tracked\n");
+    writeFileSync(join(H, "sub", "q.md"), "tracked\n");
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r46: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const verdict = (tracked, cmd) =>
+      firstHubTrackedWrite(cands(cmd).map((x) => ({ rel: x.resolvedPath.slice(H.length + 1) })), tracked) !== null;
+    const blocks = (tracked, cmd, label) => expectBool(`C437r46: ${label}`, verdict(tracked, cmd), true);
+    const allows = (tracked, cmd, label) => expectBool(`C437r46: ${label}`, verdict(tracked, cmd), false);
+
+    // ── ISSUE 1 (P1, fail-open): a `|` in a case PATTERN is a separator, not a
+    // pipe. Latching pipe state on it made the `;;` boundary restore pipeC0 and
+    // THROW AWAY the arm's `cd docs`, leaving only the unmatched-arm reality at
+    // the root — so the arm's tracked write was never a candidate. The `(`
+    // handler already guards this phase; the `|` handler did not.
+    // Real bash (`x=a`): the arm matches, so docs/tracked.md (TRACKED) is hit.
+    has("case $x in a|b) cd docs;; esac; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1a: alt-member case pattern — the matched arm's cd survives");
+    blocks(["docs/tracked.md"], "case $x in a|b) cd docs;; esac; echo x > tracked.md", "I1a gate: real bash overwrites the TRACKED docs/tracked.md → BLOCK");
+    has("case $x in (a|b) cd docs;; esac; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1b: paren-led alt-member — same arm cd");
+    blocks(["docs/tracked.md"], "case $x in (a|b) cd docs;; esac; echo x > tracked.md", "I1b gate: TRACKED docs/tracked.md → BLOCK");
+    has("case $x in a) cd docs;; esac; echo hi | tee tracked.md", "tee:H/docs/tracked.md", "I1 control: a REAL pipe in an arm body is still a pipe (the pattern guard does not leak into the body)");
+    // `[[ … ]]`: an unquoted `|` there is regex/boolean alternation, never a pipe.
+    // The latch was benign for the cwd (pipeC0 re-derives to the same path) but it
+    // DISCARDED the pending cd, so the invariant is pinned here. ⚠️ These two rows
+    // are CONTROLS on this head — the pre-fix walker also passed them — so they
+    // guard the mechanism rather than redden on a mutant of this diff. The
+    // measurement that earns them: tracking the counter in the RESET_WORDS branch
+    // (the first draft) left it STUCK at 1, and `[[ … ]]; echo hi | tee
+    // docs/tracked.md` then resolved NO candidates at all — a new fail-open.
+    has("cd c; [[ $x =~ a|b ]] && cd ../docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1c control: `|` inside [[ ]] is alternation — the latch must not eat the cd");
+    has("[[ $x =~ a|b ]]; echo hi | tee docs/tracked.md", "tee:H/docs/tracked.md", "I1d control: the [[ ]] counter CLEARS — a later real pipe still surfaces a tee write");
+
+    // ── ISSUE 2 (P1, fail-open): gating the fork-alt `cd` shift on the PRIMARY
+    // candidate's existence drops the alt realities — which are precisely the ones
+    // where the primary cd FAILED and the unmatched-arm write lands. Real bash
+    // (`mode` ≠ `a`): cwd stays at the root, `cd sub` succeeds, sub/q.md is hit.
+    has("case $mode in a) cd docs;; esac; cd sub && echo hi > q.md", "redirect:H/sub/q.md", "I2: the unmatched-arm reality takes the tail cd — its site is not dropped");
+    blocks(["sub/q.md"], "case $mode in a) cd docs;; esac; cd sub && echo hi > q.md", "I2 gate: real bash overwrites the TRACKED sub/q.md → BLOCK");
+    has("case $mode in a) cd docs;; esac; cd sub && echo hi > q.md", "redirect:H/docs/q.md", "I2 control: the matched-arm reality (docs) is still emitted");
+
+    // ── ISSUE 3 (P1, same class as #3954): the pipeline boundary restored the
+    // cwd but not the `dirStack`. `pushd`/`popd` mutate a stack bash SHARES across
+    // the list and every segment is a subshell, so a segment's pushd/popd die with
+    // it; restoring only the cwd left the stack one entry deep, and a later bare
+    // `popd` then landed one entry off. Real bash: the pushd dies, `cd ../docs`
+    // lands in docs, `popd` is an empty-stack NO-OP → docs/tracked.md is hit.
+    has("cd c; pushd ../docs | cat; cd ../docs; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I3p: a pushd in a pipeline segment dies with it — the later bare popd is a bash no-op");
+    blocks(["docs/tracked.md"], "cd c; pushd ../docs | cat; cd ../docs; popd; echo x > tracked.md", "I3p gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd c; pushd ../docs & cd ../docs; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I3a: an async (&) pushd dies with its subshell the same way");
+    blocks(["docs/tracked.md"], "cd c; pushd ../docs & cd ../docs; popd; echo x > tracked.md", "I3a gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd c; pushd ../docs; cd ../docs; popd; echo x > tracked.md", "redirect:H/c/tracked.md", "I3 control: a pushd that really runs is still popd-restored (c)");
+    allows(["docs/tracked.md"], "cd c; pushd ../docs; cd ../docs; popd; echo x > tracked.md", "I3 control gate: the c write is an untracked new file → ALLOW");
+    has("cd c; pushd ../docs | cat; echo x > tracked.md", "redirect:H/c/tracked.md", "I3 control: the pipeline still discards the segment's own cd (cwd stays c)");
+
+    // ── NOTE 1 (tightened): the C437r45 `F1 gate` row tracked BOTH `tracked.md`
+    // and `docs/tracked.md`, so it stayed GREEN under the exact mutant that broke
+    // F1's resolution. With only the ROOT file tracked, the wrong `docs/`
+    // resolution ALLOWS and this row reddens.
+    blocks(["tracked.md"], "true | cd docs; echo x > tracked.md", "F1 gate (tightened, NOTE 1): only the ROOT tracked.md is tracked, so the mutant's docs/ resolution cannot pass");
+  }
+
+
   // walk (`>`/`>>`/`tee`/python open) never surfaced `sed -i`/`cp`/`mv`/
   // `truncate`/`dd of=`/`perl -pi`/`awk -i inplace` onto a tracked hub file,
   // so the same-file write was blocked via redirect but slipped via the verb.
