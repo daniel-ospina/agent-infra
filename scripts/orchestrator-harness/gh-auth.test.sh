@@ -634,17 +634,20 @@ ck "B9b merge-one.sh carries its OWN run_agent() and resolves NO gh credential �
 # silent false PASS. ⛔ NEITHER PRECONDITION OF THAT RACE HOLDS IN THIS SHARD, and a reader must not
 # inherit the opposite: the top-level `set -uo pipefail` in `run-bash-shards.sh` governs the DRIVER, while
 # `shard_exec` runs each shard as a NEW `env -u … bash` — `SHELLOPTS` is not exported, so `pipefail` is OFF
-# in the child, and this suite enables `set -u` only — and both extracted payloads here (`_place` 4,626 B,
-# `_gha_flat` 32,310 B) are far below the ~64 KiB pipe buffer the guard's WINDOWS OF FAILURE requires. A
-# here-string has no reader to lose, so grep's 0/1 is the arm's status by construction.
+# in the child, and this suite enables `set -u` only — and the payloads B9c-B9h grep (`_place`, `_gha_flat`)
+# sit far below the ~64 KiB pipe buffer the guard's WINDOWS OF FAILURE requires. ⛔ NO BYTE COUNT IN THIS
+# PARAGRAPH ON PURPOSE: a precise-looking number here is the one part of the sentence that can rot while
+# every arm stays green (review round 14, P3) — B9m prints the LIVE pair and reddens if either crosses the
+# buffer, so read the figures there. A here-string has no reader to lose, so grep's 0/1 is the arm's status
+# by construction.
 # ⛔ AND THE PARAGRAPH ABOVE IS ITSELF PINNED, in both directions: this suite's own rule is that a comment
 # claiming a guard it does not have reads exactly like one that has it, and the mechanism it states lives
-# in OTHER files, so B9i-B9m make a rot here REDDEN instead of lying (review round 13, P3).
+# in OTHER files, so B9i-B9n make a rot here REDDEN instead of lying (review rounds 13-14, P3).
 _self="${BASH_SOURCE[0]}"; [ -f "$_self" ] || _self="$HERE/gh-auth.test.sh"
-_sig="$(sed -n '/^# ⛔ HERE-STRINGS, NOT PIPES/,/^# here-string has no reader to lose/p' "$_self" \
+_sig="$(sed -n '/^# ⛔ HERE-STRINGS, NOT PIPES/,/^# by construction\.$/p' "$_self" \
   | sed -e 's/^#[[:space:]]*//' | tr '\n' ' ' | tr -s ' ')"
-[ -n "$_sig" ]; rc=$?
-ck "B9i the pipe-idiom rationale paragraph is still extractable from this suite (a rewrite must redden this, never silently empty the arms below)" $rc
+[ -n "$_sig" ] && [ "${#_sig}" -lt 4000 ]; rc=$?
+ck "B9i the pipe-idiom rationale paragraph is still extractable from this suite AND the extraction STOPS at its own terminator ($(printf '%s' "${#_sig}") chars — a lost end anchor would silently turn B9j/B9k into whole-file greps that cannot fail)" $rc
 grep -q 'runs every shard under `set -uo pipefail`' <<<"$_sig" && rc=1 || rc=0
 ck "B9j …and does NOT claim the shards run under pipefail — the round-13 false mechanism (the DRIVER carries it; its shard children are a new bash that does not)" $rc
 grep -q 'check-no-sigpipe-grep.sh' <<<"$_sig"; rc=$?
@@ -683,12 +686,20 @@ ck "B9h …and gh-auth.sh's own export rationale does not repeat the overreach (
 # wrong (the same shape as B9g, one file over).
 SHARDS="$HERE/../run-bash-shards.sh"
 { grep -q '^set -uo pipefail' "$SHARDS" \
-  && grep -q 'shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash ' "$SHARDS"; }; rc=$?
-ck "B9l …because the tree agrees: the driver carries \`set -uo pipefail\` AND \`shard_exec\` runs each shard as a NEW \`env -u … bash\`, so no shard child inherits it" $rc
+  && grep -q 'shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash ' "$SHARDS" \
+  && ! grep -qE 'shard_exec\(\).*-o pipefail' "$SHARDS"; }; rc=$?
+ck "B9l …because the tree agrees: the driver carries \`set -uo pipefail\` AND \`shard_exec\` runs each shard as a NEW \`env -u … bash\` WITHOUT \`-o pipefail\`, so no shard child inherits it" $rc
+# ⛔ THE MECHANISM IS A PROPERTY, NOT A SPELLING (review round 14, P3): the literal pins above cannot see an
+# edit that keeps `… bash ` and appends `-o pipefail` (the exact thing someone chasing "why is pipefail off
+# in my shard?" would write), and `export SHELLOPTS` in the driver would defeat it another way. So the child
+# launch is PROBED with `shard_exec`'s own `env -u` shape from a shell that really has pipefail ON.
+_pf_opts="$(set -uo pipefail; env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash -c 'set -o')"
+! grep -q '^pipefail[[:space:]]*on' <<<"$_pf_opts"; rc=$?
+ck "B9n …and PROBED on the running bash: launched from a shell with pipefail ON, in shard_exec's own shape, the child still reports pipefail OFF" $rc
 _pb_place="$(printf '%s\n' "$_place" | wc -c | tr -d ' ')"
 _pb_gha="$(printf '%s' "$_gha_flat" | wc -c | tr -d ' ')"
 [ "$_pb_place" -lt 65536 ] && [ "$_pb_gha" -lt 65536 ]; rc=$?
-ck "B9m …and both payloads sit BELOW the ~64 KiB pipe buffer (_place ${_pb_place} B, _gha_flat ${_pb_gha} B), so no EPIPE window exists here — past that bound the paragraph's 'no live race' sentence stops being true and must be re-derived" $rc
+ck "B9m …and both payloads sit BELOW the ~64 KiB pipe buffer (_place ${_pb_place} B, _gha_flat ${_pb_gha} B — the LIVE sizes the paragraph defers to), so no EPIPE window exists here — past that bound the paragraph's 'no live race' sentence stops being true and must be re-derived" $rc
 # B12: WHERE THE `EXEMPTION-UNREADABLE` TOKEN ACTUALLY LANDS (review round 11, P3). `README.md` §7.2g said
 # "the refusal line says `EXEMPTION-UNREADABLE`"; at this head the token is printed by the separate
 # `[land-backlog] NOTE` line (three arms, one per credential outcome) and the REFUSAL prints a different
