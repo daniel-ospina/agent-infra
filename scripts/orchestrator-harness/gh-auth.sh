@@ -438,8 +438,18 @@ gh_auth_cause() {
       ;;
     none)
       [ -n "$acct" ] || acct="$(gh_auth_account_home)"
-      hd="${home:-$HOME}/.config/gh"
-      [ "$(_gh_auth_store_in "$hd")" = unreadable ] && hd="<unreadable: $hd>"
+      # ⛔ A LANE HOME WE COULD NOT RESOLVE IS NOT A DIRECTORY WE CHECKED (review round 24, P3): the
+      # resolver's home arm is guarded by `[ -n "$home" ]`, so with an EMPTY lane home it examined NOTHING at
+      # `/ .config/gh` — yet this sentence named that path, and did so even when a store sitting there was
+      # READABLE (`_gh_auth_store_in` → `ok`), i.e. it printed an absence its own probe contradicted. Both
+      # shipped call sites pass `${HOME:-}`, which is empty on a process with no HOME. The lane-home half now
+      # mirrors the account disclosure below, and `ok` is never rendered as "no hosts.yml".
+      if [ -n "$home" ]; then
+        hd="$home/.config/gh"
+        [ "$(_gh_auth_store_in "$hd")" = unreadable ] && hd="<unreadable: $hd>"
+      else
+        hd='<unresolved lane home>/.config/gh'
+      fi
       if [ -z "$acct" ]; then
         ad='<unresolved account home>/.config/gh'
       else

@@ -819,6 +819,15 @@ case "$_uc" in *"<unresolved account home>/.config/gh"*) rc=0 ;; *) rc=1 ;; esac
 ck "B14b …and when the lookup answers nothing the cause discloses <unresolved account home> instead of naming /.config/gh" $rc
 case "$_uc" in *"or /.config/gh"*) rc=1 ;; *) rc=0 ;; esac
 ck "B14c …which is the exact sentence a missing lookup check produced: it never claims to have checked /.config/gh" $rc
+# ⛔ AND THE LANE-HOME HALF OF THE SAME DISCLOSURE (review round 24, P3): `gh_auth_resolve`'s home arm is
+# guarded by `[ -n "$home" ]`, so an EMPTY lane home examined nothing there — yet this sentence named
+# `/.config/gh` as if it had, and did so even over a store that was READABLE. Both shipped call sites pass
+# `${HOME:-}`, so this is the shape a process with no HOME produces.
+_uh="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_account_home() { :; }; HOME=; gh_auth_cause '' '$TMP/none.env' ''")"
+case "$_uh" in *"<unresolved lane home>/.config/gh"*) rc=0 ;; *) rc=1 ;; esac
+ck "B14d …and an EMPTY lane home is disclosed as <unresolved lane home>, not rendered as /.config/gh" $rc
+case "$_uh" in *"under /.config/gh"*) rc=1 ;; *) rc=0 ;; esac
+ck "B14e …because that path was never examined by the resolver, so the cause must not name it as checked" $rc
 
 DUNREAD="$TMP/store-dirfile"; mkdir -p "$DUNREAD/.config/gh/hosts.yml"
 u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable '$DUNREAD/.config/gh/hosts.yml'" && rc=1 || rc=0
