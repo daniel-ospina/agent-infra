@@ -412,6 +412,13 @@ async function partB() {
     const aliasBenign = await callBash("git -c alias.lg='log --graph' lg");
     expectTrue("B10d: control — a READ-ONLY visible alias expands to `log` and stays ALLOWED",
       aliasBenign === undefined, `handler returned ${JSON.stringify(aliasBenign)}`);
+    // ⛔ GIT'S PRECEDENCE (probe-verified): builtin > `git-<cmd>` on PATH >
+    // alias, so a BUILTIN-named alias definition is never used. Expanding it
+    // would have classified `reset --hard` as the ignored alias value — a false
+    // ALLOW of a destructive command.
+    const aliasShadow = await callBash("git -c alias.reset=status reset --hard");
+    expectTrue("B10d2: #594 a builtin-named alias CANNOT mask `reset --hard` (still BLOCKED)",
+      !!aliasShadow && aliasShadow.block === true, `handler returned ${JSON.stringify(aliasShadow)}`);
     const symRefWrite = await callBash("git symbolic-ref refs/heads/victim2 refs/heads/main");
     expectTrue("B10e: #594 `git symbolic-ref refs/heads/<b> <target>` is BLOCKED",
       !!symRefWrite && symRefWrite.block === true && /Ref write blocked/.test(String(symRefWrite.reason ?? "")),

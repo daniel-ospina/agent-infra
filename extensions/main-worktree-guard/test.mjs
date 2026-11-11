@@ -1002,6 +1002,17 @@ dexpect("#594 unresolvable --config-env alias value → aliasOpaque (fail closed
   `git --config-env=alias.co=SOME_UNSET_VAR_594 co`, { aliasOpaque: true, branchState: true });
 dexpect("#594 opaque alias is exposed in stateMutations for the M3 gate",
   `git br`, { stateMutations: [{ verb: "br", args: [], aliasOpaque: true, aliasName: "br", invVisible: true, hints: { cdChain: [], cHints: [], gitDirHint: null, vars: {} } }] });
+// ⛔ GIT'S PRECEDENCE IS BUILTIN > `git-<cmd>` ON PATH > ALIAS (probe-verified,
+// git 2.43): `git -c alias.reset=status reset --hard` runs the BUILTIN
+// `reset --hard`. Expanding a builtin-named definition would classify the
+// destructive command as the IGNORED alias value — a false ALLOW — so those
+// definitions are dropped.
+dexpect("#594 a builtin-named alias definition is IGNORED (git never uses it) — reset --hard still blocks",
+  `git -c alias.reset=status reset --hard`,
+  { verb: "reset", verdict: "block:reset", aliasOpaque: false });
+dexpect("#594 a builtin-named alias cannot mask `checkout <other>`",
+  `git -c alias.checkout='status' checkout victim`,
+  { verb: "checkout", verdict: "block:checkout-branch", branchState: true });
 
 // ── #594 Finding 2: symbolic-ref refs/heads/<b> + the -m/--stdin channels ──
 // `git symbolic-ref refs/heads/victim refs/heads/main` re-points an EXISTING
