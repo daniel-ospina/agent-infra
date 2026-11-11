@@ -6401,20 +6401,42 @@ export default function (pi: ExtensionAPI) {
       // below, so the first segment's push stays gated exactly as origin/main
       // gated it. String-evidence echo/comment over-match is the documented
       // safe-direction class shared with the degradation arm.
-      if (det.verdict === "block:push-delete" && det.pushTargets.length > 0) {
-        const blocked = _coordinatedDeleteBlock(det.pushTargets);
-        if (blocked) return blocked;
-        // #605 (review F1): the push-delete verdict is set from the WHOLE raw
-        // command, so an UNRELATED `--delete` segment anywhere in a compound used
-        // to reach this early return and exempt EVERY other mutation in it —
-        // `git -C <hub> push origin feat/other ; git push origin --delete stale`
-        // and `git commit -m x ; git push origin --delete stale` both ran their
-        // MAIN mutation ungated. That is the identical "a benign segment exempts
-        // a later MAIN mutation" class this change closes, one level above the
-        // hints mechanism, so the non-delete mutations are gated here too. The
-        // delete-spelled pushes stay this arm's business (they are covered above,
-        // and pushing the M2 target comparison on them would refuse ordinary
-        // remote-branch cleanup).
+      // #605 (review F1): the push-delete verdict is set from the WHOLE raw
+      // command, so an UNRELATED `--delete` segment anywhere in a compound used
+      // to reach an early return here and exempt EVERY other mutation in it —
+      // `git -C <hub> push origin feat/other ; git push origin --delete stale`
+      // and `git commit -m x ; git push origin --delete stale` both ran their MAIN
+      // mutation ungated. The identical "a benign segment exempts a later MAIN
+      // mutation" class this change closes, one level above the hints mechanism.
+      // The delete-spelled pushes stay this arm's business (M2's target
+      // comparison at them would refuse ordinary remote-branch cleanup), so the
+      // arm gates the NON-delete mutations via gateMutations, which skips them by
+      // each mutation's own `isDelete`.
+      if (det.verdict === "block:push-delete") {
+        // Two guards used to be one: `… && det.pushTargets.length > 0`. The
+        // TARGET-COUNT half is the #73 check's precondition (with no refspec there
+        // is nothing to look up), but the M2 leg must run on the VERDICT —
+        // otherwise appending a no-op `git push --delete` (a git error: "--delete
+        // doesn't make sense without any refs") exempted the whole command.
+        // MEASURED before this split: `git push origin feat/other && git push
+        // --delete` → ALLOW, while `git push origin feat/other` alone → BLOCK.
+        //
+        // #605 (review F3): and the #73 check must see EVERY delete invocation.
+        // `det.pushTargets` is first-invocation-scoped, so
+        // `git push origin --delete b && git push origin --delete
+        // <sibling-held>` ran with the sibling-held target never checked —
+        // MEASURED: ALLOW, while that delete ALONE → BLOCK (#73). Each
+        // pushMutations entry carries its own targets, so the union is exact.
+        const deleteTargets = [...new Set([
+          ...(det.pushTargets ?? []),
+          ...m2Mutations
+            .filter((mu) => mu.verb === "push" && mu.isDelete)
+            .flatMap((mu) => (Array.isArray(mu.targets) ? mu.targets : [])),
+        ])];
+        if (deleteTargets.length > 0) {
+          const blocked = _coordinatedDeleteBlock(deleteTargets);
+          if (blocked) return blocked;
+        }
         const hit = gateMutations(m2Mutations);
         if (hit) return hit;
         return admitAfterM3(); // foreign deletes with no checked-out targets — allowed (today's behavior)

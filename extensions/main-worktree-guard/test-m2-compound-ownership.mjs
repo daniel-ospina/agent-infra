@@ -112,6 +112,7 @@ async function main() {
   const prevCwd = process.cwd();
   const hub = join(tmp, "hub");
   const wt = join(tmp, "wt");
+  const held = join(tmp, "held");
   const quiet = async (fn) => { const w = console.warn; console.warn = () => {}; try { return await fn(); } finally { console.warn = w; } };
   const callBash = (command) => toolCall({ toolName: "bash", input: { command } }, undefined);
   const refusedBy = (r, needle) => !!r && r.block === true && String(r.reason || "").includes(needle);
@@ -120,7 +121,11 @@ async function main() {
     execSync(`git init -q -b main "${hub}"`, { stdio: "ignore" });
     execSync("git config user.email t@t && git config user.name t", { cwd: hub, stdio: "ignore" });
     writeFileSync(join(hub, "tracked.txt"), "x\n");
-    execSync("git add -A && git commit -qm init && git branch feat/other", { cwd: hub, stdio: "ignore" });
+    // `stale`/`stale2` exist so the delete rows name REAL branches (nothing holds
+    // them); `held` is checked out in a sibling worktree below, which is exactly
+    // what the #73 coordinated-delete check must see.
+    execSync("git add -A && git commit -qm init && git branch feat/other && git branch stale && git branch stale2 && git branch held",
+      { cwd: hub, stdio: "ignore" });
     execSync(`git worktree add -q -b wtmain "${wt}"`, { cwd: hub, stdio: "ignore" });
     for (const v of HATCH_VARS) delete process.env[v];
     process.env.AGENT_INFRA_PATH = hub; // the shared agent-infra checkout
@@ -162,11 +167,16 @@ async function main() {
     const s2own = await quiet(() => callBash(`git -C "${wt}" push origin feat/other`));
     expectTrue("S2 #605: ordinary worktree push of a foreign branch stays ALLOWED (worktree-scoped)",
       s2own === undefined, `handler returned ${JSON.stringify(s2own)?.slice(0, 200)}`);
-    // The commit half's no-false-block arm: an all-worktree compound has no
-    // main-resolving mutation, so no gate may fire on it.
-    const s2c = await quiet(() => callBash(`git -C "${wt}" commit -m z ; git -C "${wt}" commit -m w`));
-    expectTrue("S2 #605: ALL-wt compound (both commits -C <wt>) → ALLOWED (no false block)",
-      s2c === undefined, `handler returned ${JSON.stringify(s2c)?.slice(0, 200)}`);
+    // ⛔ NO all-worktree COMMIT row here (review round-3 F2; agent-infra#3442
+    // rule 3). Such a row cannot go RED under ANY edit this change can make: in
+    // this fixture the hub is ON `main` and `main` is the session baseline, so
+    // every way the commit leg can break still lands on an allowed decision —
+    // dropping the per-mutation worktree exemption leaves decideM2's own
+    // `isWorktree -> null`, nulling the hints resolves to the hub on its baseline
+    // branch, and pointing the hints at the hub does the same. The property is
+    // real and reachable at the classifier level, where it IS pinned: `test.mjs`
+    // "#605: ALL-wt compound ... -> wt-exempt" (m2l) reddens under exactly those
+    // mutants. A row here would be a pin that cannot fail — worse than no row.
 
     // ── Scenario 3 (review F1): a `--delete` anywhere used to exempt the rest ──
     // The push-delete verdict is set from the WHOLE raw command, and that arm
@@ -209,6 +219,39 @@ async function main() {
     const s5c = await quiet(() => callBash(`git -C "${wt}" push origin wtmain && git push origin -d stale`));
     expectTrue("S5 I2 control: wt lead + later-segment `-d` delete → ALLOWED (no false block)",
       s5c === undefined, `handler returned ${JSON.stringify(s5c)?.slice(0, 200)}`);
+
+    // ── Scenario 6 (review round-3 F1): the #73 arm's TARGET-COUNT precondition
+    // and the M2 leg were ONE guard, so a delete spelling that resolves to no
+    // refspec (`git push --delete` — a git error: "--delete doesn't make sense
+    // without any refs") skipped the whole arm and exempted the compound. The
+    // guards are split: the target-count precondition still belongs to #73, the
+    // M2 leg runs on the VERDICT.
+    const s6 = await quiet(() => callBash(`git push origin feat/other && git push --delete`));
+    expectTrue("S6 F1: off-baseline MAIN push + a no-refspec `git push --delete` segment → M2 BLOCK",
+      refusedBy(s6, M2_PUSH_REASON), `handler returned ${JSON.stringify(s6)?.slice(0, 200)}`);
+    const s6semi = await quiet(() => callBash(`git push origin feat/other ; git push --delete`));
+    expectTrue("S6 F1: same, `;`-compound spelling → M2 BLOCK",
+      refusedBy(s6semi, M2_PUSH_REASON), `handler returned ${JSON.stringify(s6semi)?.slice(0, 200)}`);
+    // It is a git ERROR, not a delete: alone it must stay allowed.
+    const s6only = await quiet(() => callBash(`git push --delete`));
+    expectTrue("S6 F1 control: lone no-refspec `git push --delete` → ALLOWED (a git error, not a delete)",
+      s6only === undefined, `handler returned ${JSON.stringify(s6only)?.slice(0, 200)}`);
+
+    // ── Scenario 7 (review round-3 F3): the #73 check saw only the FIRST delete
+    // invocation's targets, so a SECOND delete segment aimed at a
+    // sibling-checked-out branch was never looked up — the protection held for
+    // one spelling and vanished when the delete was split in two.
+    execSync(`git worktree add -q "${held}" held`, { cwd: hub, stdio: "ignore" });
+    const s7 = await quiet(() => callBash(`git push origin --delete stale && git push origin --delete held`));
+    expectTrue("S7 F3: second delete segment aimed at a sibling-checked-out branch → #73 BLOCK (targets are unioned)",
+      !!s7 && s7.block === true && String(s7.reason || "").includes("Cannot delete"),
+      `handler returned ${JSON.stringify(s7)?.slice(0, 200)}`);
+    const s7only = await quiet(() => callBash(`git push origin --delete held`));
+    expectTrue("S7 F3 control: the same delete ALONE is still blocked (this row is not the union's only witness)",
+      !!s7only && s7only.block === true, `handler returned ${JSON.stringify(s7only)?.slice(0, 200)}`);
+    const s7free = await quiet(() => callBash(`git push origin --delete stale && git push origin --delete stale2`));
+    expectTrue("S7 F3 control: two deletes of unheld branches → ALLOWED (no false block)",
+      s7free === undefined, `handler returned ${JSON.stringify(s7free)?.slice(0, 200)}`);
   } catch (e) {
     expectTrue("#605 integration ran without throwing", false, String(e?.stack ?? e).slice(0, 400));
   } finally {

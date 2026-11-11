@@ -1301,8 +1301,11 @@ jobs:
         # mutation, each against its own hints and — for a push — its OWN
         # refspecs; the ownership-allowance arm and the push-delete arm both gate
         # the compound's remaining mutations before admitting it (reviews I1/F1),
-        # and the delete exemption keys on each MUTATION's own `isDelete` rather
-        # than on the compound's verdict path (review I2).
+        # the delete exemption keys on each MUTATION's own `isDelete` rather than
+        # on the compound's verdict path (review I2), the M2 leg runs on the
+        # push-delete VERDICT rather than on its non-empty target list (a
+        # no-refspec `git push --delete` used to exempt the compound), and the #73
+        # coordinated-delete check unions EVERY delete invocation's targets.
         # Its own step for the reason the POSITION step above states: the
         # `extensions/*/test*.mjs` glob is in ci-main.yml, which has NO
         # `pull_request` trigger, so without this line the only handler-level pin

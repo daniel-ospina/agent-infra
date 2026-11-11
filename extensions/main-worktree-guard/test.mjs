@@ -2219,6 +2219,17 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       // in a later segment was gated by M2 while `--delete` was not.
       const m2q = m2Gate(`git push origin feat/1 && git push origin -d stale`);
       expectBool("#605 I2: later-segment `-d` delete → allow (delete exemption is per-mutation)", m2q, "allow");
+      // Review round-3 F1: the #73 arm's target-count precondition and the M2 leg
+      // used to be one guard, so a no-refspec `git push --delete` (a git error)
+      // skipped the arm entirely and exempted the compound. The M2 leg now runs
+      // on the VERDICT; the mirror models that by gating the non-delete mutations
+      // for a block:push-delete verdict whether or not det.pushTargets is empty.
+      const m2r = m2Gate(`git push origin feat/other && git push --delete`);
+      expectBool("#605 F1-r3: off-baseline MAIN push + a no-refspec `git push --delete` → M2 BLOCK", m2r, "block");
+      const m2s = m2Gate(`git commit -m x ; git push --delete`);
+      expectBool("#605 F1-r3: off-baseline MAIN commit + a no-refspec `git push --delete` → M2 BLOCK", m2s, "block");
+      const m2t = m2Gate(`git push --delete`);
+      expectBool("#605 F1-r3 control: lone no-refspec `git push --delete` → nothing main-resolving (wt-exempt)", m2t, "wt-exempt");
       execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
       const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");
