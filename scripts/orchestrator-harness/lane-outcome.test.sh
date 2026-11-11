@@ -698,10 +698,33 @@ has " $FOUND" "died " "8d …a 'died' outcome (all four are reachable, not just 
 # verdict=exceeded-wallclock`. The line the census reads said "the work failed" about lanes that were
 # never allowed to finish, which is the question this issue was filed over.
 #
-# ⛔ EVERY ARM BELOW REDDENS ON THE PRE-CHANGE TREE, and each of the four falsifiers is the direction
-# that would make the fix WORSE (retry the wrong things): a work failure must NOT become retryable
-# (9b/9c), a PREVIOUS run's connection storm must NOT classify THIS run (9d), and a lane that merely
-# logged a blip and then completed must stay `done` (9f).
+# ⛔ ONLY TWO OF THESE EIGHT ARMS REDDEN ON THE PRE-CHANGE TREE — and the two kinds of arm prove
+# different things, so the distinction is stated rather than flattened (review finding on this very
+# change, and it was right: the earlier text claimed all of them redden pre-change, which is false by
+# construction).
+#
+#   * 9a and 9e are the BEHAVIOUR arms. On `origin/main` the non-zero branch is unconditional
+#     (`lane_outcome failed "agent-exit-$rc"`), so the outputs they demand — `died
+#     reason=transport-unreachable:…` and `died reason=exceeded-wallclock` — are UNREACHABLE there and
+#     both arms go RED. That is the mutation the issue asks for.
+#   * 9b/9c/9d/9f/9g/9h are OVER-REACH falsifiers, and they are GREEN on the pre-change tree BY
+#     CONSTRUCTION (it called everything `failed`, which is what they ask for). They exist to redden
+#     under the OPPOSITE mutation — a fix that attributes too much — and each one names the edit that
+#     reverts the protection it guards:
+#         9b  make the transport comparison unconditional (`-ge 0`, or drop the `elif` guard)
+#         9c  `LANE_TRANSPORT_MIN_ROTATIONS=1` in the sanitiser's default arm
+#         9d  set `LANE_AGENT_LOG_OFF=0` unconditionally (read the whole append-only log)
+#         9f  hoist the attribution above the `rc = 0` arm
+#         9g  replace `lane_bound_killer`'s `case` with a truthiness test (`[ -n "$v" ]`)
+#         9h  add `unknown` to the killer allow-list — ⛔ CONDITIONAL, and said so: the arm
+#             discriminates only while the fixture's `unknown` line is the LAST `[lane-bound] VERDICT`
+#             in this run's output, because `tail -1` reads the last one and the reaped watchdog can
+#             append its own `verdict=finished` after `pi` exits. It is pinned as a forward-guard on
+#             the allow-list, not counted as proof on its own; the unconditional half of that rule is
+#             9g, whose fixture cannot lose the comparison.
+#     A work failure must NOT become retryable (9b/9c), a PREVIOUS run's connection storm must NOT
+#     classify THIS run (9d), a lane that merely logged a blip and then completed must stay `done`
+#     (9f), and a verdict word that names no bound must not be minted as a killer (9g/9h).
 
 # 9a — the model/provider was unreachable: the agent's own transcript carries the rotations, the exit
 # is not about the work, and the terminal line says RETRYABLE instead of `failed`.
