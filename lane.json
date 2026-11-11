@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-456-1794377729-p164719-e0bd56df",
+  "_sha": "ade1804257716b746be282c5261112086fe50dc1",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-456.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/456-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "829549788faa68c5c10d1b4fffb9a9f82a2c83d6"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/tm-456"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 5333,
+  "ended_at": 1794383062,
+  "exit_code": 0,
+  "heartbeat_at": 1794383062,
+  "host": "cmux",
+  "issue": 456,
+  "kind": "lane",
+  "lane_id": "cmux.klane-456-1794377729-p164719-e0bd56df",
+  "lease_until": 1794390862,
+  "pid": 164719,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794377729,
+  "state": "DONE",
+  "tag": "456",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-456"
+}
