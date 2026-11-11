@@ -3968,6 +3968,17 @@ export function _branchInvMutatesBranchState(args) {
  * an alias / external-subcommand indirection the guard cannot verify (fail
  * closed — see _expandAliasInvocations).
  */
+/**
+ * #594 review round 5: the DEPRECATED builtins, for which git's `run_argv`
+ * consults the ALIAS **before** the builtin (`is_deprecated_command` →
+ * `handle_alias` before `handle_builtin`; `git.c` v2.52.0 lists
+ * `pack-redundant` and `whatchanged`). For these two the alias really does win,
+ * so a definition of that name must be EXPANDED rather than dropped — the
+ * opposite of every other builtin name. (Unreachable on a pre-2.52 git, where
+ * the alias is simply ignored; expanding it there only over-blocks.)
+ */
+const GIT_ALIAS_PRECEDES_BUILTIN = new Set(["pack-redundant", "whatchanged"]);
+
 const GIT_BUILTIN_COMMANDS = new Set([
   "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch",
   "bugreport", "bundle", "cat-file", "check-attr", "check-ignore",
@@ -4052,30 +4063,12 @@ function _aliasDefsFromInvocation(inv) {
     if (name && Object.prototype.hasOwnProperty.call(process.env, name)) return String(process.env[name]);
     return null;
   };
-  // ⛔ ONE ORDERED CONFIG LIST, exactly as git reads it (review round 3): the
-  // RELATIVE argv order of `-c` and `--config-env` decides the winner, so a
-  // pass over `configOverrides` followed by a pass over `configEnvOverrides`
-  // was measured FAIL-OPEN — with `E=status`, `git --config-env=alias.x=E -c
-  // alias.x='branch -fq victimMIX main' mix` runs the DESTRUCTIVE `-c`
-  // definition (rc 0) while an array-by-array pass expanded the benign env one.
-  // `configOps` is the walker's argv-ordered record; the two arrays stay as the
-  // fallback for callers that build an invocation by hand.
-  if (Array.isArray(inv.configOps) && inv.configOps.length > 0) {
-    for (const op of inv.configOps) {
-      const kv = splitKw(op?.v);
-      if (!kv) continue;
-      takeAlias(kv[0], op.kind === "env" ? resolveEnv(kv[1]) : kv[1]);
-    }
-  } else {
-    for (const o of inv.configOverrides || []) {
-      const kv = splitKw(o);
-      if (kv) takeAlias(kv[0], kv[1]);
-    }
-    for (const ce of inv.configEnvOverrides || []) {
-      const kv = splitKw(ce);
-      if (kv) takeAlias(kv[0], resolveEnv(kv[1]));
-    }
-  }
+  // ⛔ GIT_CONFIG_KEY_n/VALUE_n ENV PAIRS COME FIRST (review round 5): git
+  // parses the `GIT_CONFIG_COUNT` loop in `git_config_from_parameters` BEFORE it
+  // pushes `-c`/`--config-env` into `GIT_CONFIG_PARAMETERS`, so a `-c` definition
+  // WINS over an env pair with the same key — measured fail-open the other way:
+  // `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=status git -c
+  // alias.x='branch -fq victim main' x` runs the destructive `-c` alias.
   const cfgPairs = new Map();
   const collectPair = (k, v) => {
     const mk = /^GIT_CONFIG_KEY_(\d+)$/.exec(String(k ?? ""));
@@ -4093,51 +4086,41 @@ function _aliasDefsFromInvocation(inv) {
   for (const [, pair] of cfgPairs) {
     if (pair.key !== undefined) takeAlias(pair.key, pair.value ?? null);
   }
+  // ⛔ ONE ORDERED CONFIG LIST, exactly as git reads it (review round 3): the
+  // RELATIVE argv order of `-c` and `--config-env` decides the winner, so a
+  // pass over `configOverrides` followed by a pass over `configEnvOverrides`
+  // was measured FAIL-OPEN — with `E=status`, `git --config-env=alias.x=E -c
+  // alias.x='branch -fq victimMIX main' mix` runs the DESTRUCTIVE `-c`
+  // definition (rc 0) while an array-by-array pass expanded the benign env one.
+  // `configOps` is the walker's argv-ordered record; the two arrays stay as the
+  // fallback for callers that build an invocation by hand.
+  // ⛔ ORDER, MEASURED (review round 5): git parses the `GIT_CONFIG_COUNT` loop
+  // FIRST (`git_config_from_parameters`) and pushes `-c`/`--config-env` into
+  // `GIT_CONFIG_PARAMETERS` AFTERWARDS, so a `-c` definition BEATS a
+  // `GIT_CONFIG_KEY_n`/`VALUE_n` pair with the same key — the reverse of the
+  // order this function used, which was measured fail-open
+  // (`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=status git
+  // -c alias.x='branch -fq victim main' x` runs the destructive `-c` alias).
+  // So: env pairs first, then the argv-ordered `-c`/`--config-env` list.
+  if (Array.isArray(inv.configOps) && inv.configOps.length > 0) {
+    for (const op of inv.configOps) {
+      const kv = splitKw(op?.v);
+      if (!kv) continue;
+      takeAlias(kv[0], op.kind === "env" ? resolveEnv(kv[1]) : kv[1]);
+    }
+  } else {
+    for (const o of inv.configOverrides || []) {
+      const kv = splitKw(o);
+      if (kv) takeAlias(kv[0], kv[1]);
+    }
+    for (const ce of inv.configEnvOverrides || []) {
+      const kv = splitKw(ce);
+      if (kv) takeAlias(kv[0], resolveEnv(kv[1]));
+    }
+  }
   return defs;
 }
 
-/**
- * #594 review round 4: the aliases an invocation PERSISTS for later segments —
- * `git config [--global|--local|--system|--worktree] [--add|--replace-all]
- * alias.<name> <value>`, and the removals (`--unset`/`--unset-all`/
- * `--remove-section`) reported as null = "definedness is now unknown" (the
- * effective value falls back to a lower-precedence file the guard cannot see, so
- * it must fail closed).
- *
- * ⛔ A `-f/--file/--blob <path>` write is NOT harvested: it writes a DIFFERENT
- * file, which a later plain `git <alias>` never reads — measured:
- * `git config -f /tmp/other.cfg alias.br status && git br` ran the PERSISTED
- * `alias.br`, not `status`. A pure read (`git config alias.x`) names no value
- * and is not a write.
- * @param {object} inv
- * @returns {Array<[string, string|null]>}
- */
-function _configWriteDefs(inv) {
-  if (inv.verb !== "config") return [];
-  const a = inv.args || [];
-  const writesToOtherFile = a.some((t) => {
-    const s = String(t ?? "");
-    return s === "-f" || s === "--file" || s === "--blob" ||
-      s.startsWith("--file=") || s.startsWith("--blob=");
-  });
-  if (writesToOtherFile) return [];
-  const pos = [];
-  for (let i = 0; i < a.length; i++) {
-    const s = String(a[i] ?? "");
-    if (s === "-f" || s === "--file" || s === "--blob") { i++; continue; }
-    if (s.startsWith("-")) continue;
-    pos.push(s);
-  }
-  const key = /^alias\.([A-Za-z0-9._/-]+)$/.exec(pos[0] ?? "");
-  if (!key) return [];
-  const name = key[1];
-  const removing = a.some((t) => /^--(?:unset|unset-all|remove-section)$/.test(String(t ?? "")) ||
-    String(t ?? "") === "--unset");
-  if (removing) return [[name, null]];
-  const value = pos[1];
-  if (value === undefined) return []; // a READ (`git config alias.x`) writes nothing
-  return [[name, String(value).startsWith("!") ? null : String(value)]];
-}
 
 /**
  * Split a git alias VALUE into words the way git does (whitespace-separated,
@@ -4217,39 +4200,45 @@ function _expandAliasInvocations(invocations) {
     if (!GIT_BUILTIN_COMMANDS.has(verb)) return { ...inv, aliasName: verb, aliasOpaque: true };
     return inv;
   };
-  // ⛔ SEGMENT-ORDERED, and LIFETIMES ARE SEPARATE (review rounds 2 and 4):
-  //   · TRANSIENT — this invocation's own `-c`/`--config`/`--config-env`/
-  //     GIT_CONFIG_*. They end with that process, so they must NOT reach a later
-  //     segment: measured, `git -c alias.br=status br && git br` ran the
-  //     PERSISTED (destructive) `alias.br` in segment 2 while a command-global
-  //     map had it as `status` → false ALLOW.
-  //   · PERSISTENT — `git config alias.x <value>` writes (see _configWriteDefs),
-  //     which later plain invocations DO read, applied in segment order.
-  // Within one invocation the transient list is argv-ordered and last-wins
-  // (probe-verified: `-c alias.x=… -c alias.x=…` runs the LAST one), and a
-  // transient `-c` outranks persisted config exactly as git does.
-  const persistent = new Map();
-  const out = [];
-  const addDef = (map, name, value) => {
-    // ⛔ GIT'S PRECEDENCE, MEASURED (git 2.43): builtin > `git-<cmd>` on PATH
-    // > alias. `git -c alias.reset=status reset --hard` runs the BUILTIN
-    // `reset --hard` (probe-verified; the alias is never consulted, and an
-    // installed `git-foo` likewise wins over `alias.foo`). A definition with a
-    // BUILTIN name is therefore never used — expanding it would classify a
-    // destructive command as whatever the ignored alias value says (a false
-    // ALLOW: `reset --hard` read as `status`). Dropped.
-    if (GIT_BUILTIN_COMMANDS.has(name)) return;
-    map.set(name, value);
+  // ⛔ ONLY THIS INVOCATION'S OWN, PROCESS-LOCAL DEFINITIONS ARE EXPANDED, and
+  // nothing else — a decision that took four review rounds to get right, each
+  // round measured (git 2.43) as a false ALLOW:
+  //   · a command-global map let a LATER benign redefinition reclassify an
+  //     EARLIER destructive segment (`git -c alias.x='branch -fq victimA …' x &&
+  //     git -c alias.x=status x`);
+  //   · a definition leaked FORWARD past its process's lifetime
+  //     (`git -c alias.br=status br && git br` ran the PERSISTED destructive
+  //     alias.br in segment 2);
+  //   · a `git config alias.x <value>` write was harvested, but git's config
+  //     scope order is system→global→LOCAL→worktree→cmdline, so
+  //     `git config --global alias.br status && git br` still runs a pre-existing
+  //     repo-local `alias.br`, and a `-C <other-repo>`/`GIT_DIR=` write lands in a
+  //     repo the later invocation never reads.
+  // A persisted alias is therefore NOT modelled at all: an invocation of a name
+  // with no process-local definition is `aliasOpaque` and fails closed (see the
+  // decideM3 alias-opaque arm). That costs a benign `git config alias.lg …
+  // && git lg` in a main checkout, which is the fail-closed direction: trusting
+  // a value the guard cannot see IS the bypass #594 is about.
+  const defsFor = (inv) => {
+    const m = new Map();
+    for (const [name, value] of _aliasDefsFromInvocation(inv)) {
+      // ⛔ GIT'S PRECEDENCE, MEASURED (git 2.43): builtin > `git-<cmd>` on PATH
+      // > alias. `git -c alias.reset=status reset --hard` runs the BUILTIN
+      // `reset --hard` (probe-verified; the alias is never consulted, and an
+      // installed `git-foo` likewise wins over `alias.foo`). A definition with a
+      // BUILTIN name is therefore never used, and expanding it would classify a
+      // destructive command as whatever the ignored alias value says — a false
+      // ALLOW (`reset --hard` read as `status`). Dropped…
+      // …EXCEPT the DEPRECATED builtins: `git.c`'s run_argv consults the ALIAS
+      // FIRST for those (`is_deprecated_command` → handle_alias before
+      // handle_builtin, v2.52.0 — `pack-redundant`, `whatchanged`), so an alias
+      // DOES win there and must be expanded, not dropped.
+      if (GIT_BUILTIN_COMMANDS.has(name) && !GIT_ALIAS_PRECEDES_BUILTIN.has(name)) continue;
+      m.set(name, value);
+    }
+    return m;
   };
-  for (const inv of invocations) {
-    const transient = new Map();
-    for (const [name, value] of _aliasDefsFromInvocation(inv)) addDef(transient, name, value);
-    const view = new Map(persistent);
-    for (const [name, value] of transient) view.set(name, value); // -c wins over config
-    out.push(expandOne(inv, 0, view));
-    for (const [name, value] of _configWriteDefs(inv)) addDef(persistent, name, value);
-  }
-  return out;
+  return invocations.map((inv) => expandOne(inv, 0, defsFor(inv)));
 }
 
 /**

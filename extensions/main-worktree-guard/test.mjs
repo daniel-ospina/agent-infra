@@ -978,9 +978,9 @@ dexpect("#594 alias -c: branch force-create alias EXPANDS → branchState, branc
 dexpect("#594 alias via --config: same expansion",
   `git --config alias.sw='switch --discard-changes main' sw`,
   { branchState: true, stateVerb: "switch" });
-dexpect("#594 persist-then-invoke in ONE command: `git config alias.x … && git x` EXPANDS",
+dexpect("#594 persist-then-invoke in ONE command: `git config alias.x … && git x` is BLOCKED (a persisted write cannot be verified)",
   `git config alias.x 'branch -fq victim main' && git x`,
-  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victim", "main"] });
+  { branchState: true });
 dexpect("#594 GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n definition EXPANDS",
   `GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victim main' git br`,
   { branchState: true, verb: "branch" });
@@ -1147,10 +1147,30 @@ dexpect("#594-R4a a transient `-c` does not leak into the next segment (segment 
   `git -c alias.br=status br && git br`, { branchState: true });
 dexpect("#594-R4b a `git config -f <other-file>` write is not visible to a later plain `git br`",
   `git config -f /tmp/pm594-other.cfg alias.br status && git br`, { branchState: true });
-dexpect("#594-R4c control — a PLAIN `git config alias.br status && git br` persists, so segment 2 IS `status` (not opaque)",
-  `git config alias.br status && git br`, { branchState: false, stateOpCount: 0 });
+dexpect("#594-R4c a PLAIN `git config alias.br status && git br` is opaque too — a persisted value cannot be shadow-checked",
+  `git config alias.br status && git br`, { branchState: true });
 dexpect("#594-R4d `git config --unset alias.br && git br` leaves definedness unknown → opaque",
   `git config --unset alias.br && git br`, { branchState: true });
+
+// ── #594 review round 5: SCOPES, the env-pair order, deprecated builtins ──
+// git's config order is system→global→LOCAL→worktree→cmdline, so a `--global`
+// (or a `-C <other-repo>`) write cannot prove what a later plain `git br`
+// resolves — the pre-existing repo-local alias still wins and RUNS.
+dexpect("#594-R5a a `--global` alias write cannot license a later `git br` (local scope still wins)",
+  `git config --global alias.br status && git br`, { branchState: true });
+dexpect("#594-R5b a `-C <other-repo>` alias write lands in another repo → later `git br` opaque",
+  `git -C /tmp/pm594-other-repo config alias.br status && git br`, { branchState: true });
+// git parses the GIT_CONFIG_COUNT loop BEFORE pushing -c into
+// GIT_CONFIG_PARAMETERS, so `-c` beats a GIT_CONFIG_KEY_n pair.
+dexpect("#594-R5c `-c` beats a GIT_CONFIG_KEY_n/VALUE_n pair (git's own parse order)",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=status git -c alias.x='branch -fq victimQ main' x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimQ", "main"] });
+// git.c consults the ALIAS before the builtin for the DEPRECATED commands.
+dexpect("#594-R5d the DEPRECATED builtin `whatchanged` resolves to its ALIAS (alias wins there)",
+  `git -c alias.whatchanged='branch -fq victimW main' whatchanged`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimW", "main"] });
+dexpect("#594-R5e control — a NON-deprecated builtin name is still the builtin (alias ignored)",
+  `git -c alias.reset=status reset --hard`, { verb: "reset", branchState: false });
 // The census is `git --list-cmds=builtins` and NOTHING else: a `main` command
 // (`filter-branch`, `subtree`, `submodule`, …) is an external `git-<name>` that
 // git can fall back to an alias for, so treating one as a builtin is fail-OPEN.
