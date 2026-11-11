@@ -946,7 +946,7 @@ dexpect("#594 alias -c: checkout alias EXPANDS → block:checkout-branch + branc
   { verdict: "block:checkout-branch", verb: "checkout", branchState: true });
 dexpect("#594 alias -c: branch force-create alias EXPANDS → branchState, branch args",
   `git -c alias.br='branch -fq victim main' br`,
-  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victim", "main"], aliasOpaque: false });
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victim", "main"] });
 dexpect("#594 alias via --config: same expansion",
   `git --config alias.sw='switch --discard-changes main' sw`,
   { branchState: true, stateVerb: "switch" });
@@ -961,17 +961,17 @@ dexpect("#594 --config-env resolves against the statement's own env prefix",
   { verdict: "block:checkout-branch", verb: "checkout", branchState: true });
 dexpect("#594 a BENIGN visible alias expands (log) and stays harmless",
   `git -c alias.lg='log --graph' lg`,
-  { verdict: "allow", verb: "log", branchState: false, aliasOpaque: false });
+  { verdict: "allow", verb: "log", branchState: false });
 // fail-closed arms: the definition is NOT statically visible (persisted config),
 // it is a `!` shell alias, or its env value cannot be resolved.
-dexpect("#594 persisted-config alias invocation → aliasOpaque + branchState (fail closed)",
-  `git br`, { aliasOpaque: true, branchState: true });
-dexpect("#594 external subcommand (`git lfs`) → aliasOpaque (git resolves git-lfs)",
-  `git lfs pull`, { aliasOpaque: true, branchState: true });
-dexpect("#594 `!` shell-command alias → aliasOpaque (arbitrary shell text)",
-  `git -c alias.s='!git checkout main' s`, { aliasOpaque: true, branchState: true });
-dexpect("#594 unresolvable --config-env alias value → aliasOpaque (fail closed)",
-  `git --config-env=alias.co=SOME_UNSET_VAR_594 co`, { aliasOpaque: true, branchState: true });
+dexpect("#594 persisted-config alias invocation → opaque + branchState (fail closed)",
+  `git br`, { branchState: true });
+dexpect("#594 external subcommand (`git lfs`) → opaque (git resolves git-lfs)",
+  `git lfs pull`, { branchState: true });
+dexpect("#594 `!` shell-command alias → opaque (arbitrary shell text)",
+  `git -c alias.s='!git checkout main' s`, { branchState: true });
+dexpect("#594 unresolvable --config-env alias value → opaque (fail closed)",
+  `git --config-env=alias.co=SOME_UNSET_VAR_594 co`, { branchState: true });
 dexpect("#594 opaque alias is exposed in stateMutations for the M3 gate",
   `git br`, { stateMutations: [{ verb: "br", args: [], aliasOpaque: true, aliasName: "br", invVisible: true, hints: { cdChain: [], cHints: [], gitDirHint: null, vars: {} } }] });
 // ⛔ GIT'S PRECEDENCE IS BUILTIN > `git-<cmd>` ON PATH > ALIAS (probe-verified,
@@ -981,7 +981,7 @@ dexpect("#594 opaque alias is exposed in stateMutations for the M3 gate",
 // definitions are dropped.
 dexpect("#594 a builtin-named alias definition is IGNORED (git never uses it) — reset --hard still blocks",
   `git -c alias.reset=status reset --hard`,
-  { verb: "reset", verdict: "block:reset", aliasOpaque: false });
+  { verb: "reset", verdict: "block:reset" });
 dexpect("#594 a builtin-named alias cannot mask `checkout <other>`",
   `git -c alias.checkout='status' checkout victim`,
   { verb: "checkout", verdict: "block:checkout-branch", branchState: true });
@@ -1012,6 +1012,55 @@ dexpect("#594 update-ref --stdin → branchState (refs arrive on stdin)",
   `git update-ref --stdin`, { branchState: true });
 dexpect("#594 update-ref refs/tags with -m stays non-branch-state (control)",
   `git update-ref -m why refs/tags/v1 HEAD`, { branchState: false });
+
+// ── #594 review round 1: FIVE measured bypasses the first cut left open ──
+// Each was reproduced against git 2.43 before it was fixed; each is now pinned
+// so the fix cannot be reverted silently.
+dexpect("#594-1 the LAST alias definition wins (a benign early `-c` must not launder a destructive later one)",
+  `git -c alias.yy=status -c alias.yy='branch -fq victim9 main' yy`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victim9", "main"] });
+dexpect("#594-1b and when the LAST definition is benign, that is what runs (git's own precedence)",
+  `git -c alias.zz='branch -fq v m' -c alias.zz=status zz`,
+  { verb: "status", branchState: false });
+// `update-ref` has no other `--st…` option, so git takes any unambiguous prefix
+// of `--stdin` (measured rc 0, ref moved, for --s/--st/--std/--stdi).
+dexpect("#594-2 `update-ref --stdi` (unambiguous prefix of --stdin) → branchState",
+  `git update-ref --stdi`, { branchState: true });
+dexpect("#594-2b `update-ref --s` (shortest accepted prefix) → branchState",
+  `git update-ref --s`, { branchState: true });
+dexpect("#594-2c `update-ref --no-stdin` is the opposite (argv form, rc 129 alone) → not state",
+  `git update-ref --no-stdin`, { branchState: false });
+// git merges NOARG shorts into ONE cluster: `-qd`/`-dq` delete the symref rc 0.
+dexpect("#594-3 `symbolic-ref -qd <ref>` (clustered delete) → branchState",
+  `git symbolic-ref -qd refs/heads/victim`, { branchState: true });
+dexpect("#594-3b `symbolic-ref -dq <ref>` → branchState",
+  `git symbolic-ref -dq refs/heads/victim`, { branchState: true });
+dexpect("#594-3c `-md` is `-m d` (the m VALUE), not a delete — but the 2-positional form is still a write",
+  `git symbolic-ref -md refs/heads/sym3 refs/heads/main`, { branchState: true });
+// An unresolved operand names no ref the gate can read → fail closed.
+dexpect("#594-4 `symbolic-ref $R <target>` (variable ref) → branchState (fail closed)",
+  `RR=refs/heads/victimA; git symbolic-ref $RR refs/heads/main`, { branchState: true });
+dexpect("#594-4b `symbolic-ref $(…) <target>` (unquoted substitution, collapsed to the walk's `$` sentinel) → branchState",
+  `git symbolic-ref $(printf refs/heads/victimB) refs/heads/main`, { branchState: true });
+dexpect("#594-4c `update-ref $R HEAD` (variable ref) → branchState (fail closed)",
+  `RR=refs/heads/x; git update-ref $RR HEAD`, { branchState: true });
+dexpect("#594-4d control — a ONE-positional query of a computed name cannot mutate → not state",
+  `RR=refs/heads/x; git symbolic-ref $RR`, { branchState: false });
+// The carve-out is exempted by IDENTITY and index.ts returns at the first
+// reBaseline, so a sibling the read-only test wrongly admits is never gated
+// (#1144 F1). Read-only-ness must therefore come from the SAME write predicate:
+// an unresolved/collapsed operand is a WRITE, so it can never ride a
+// `git checkout <original> && …` compound.
+dexpect("#594-5 `checkout main && symbolic-ref <refs/heads> <target>` refuses the carve-out",
+  `git checkout main && git symbolic-ref refs/heads/v2 refs/heads/main`,
+  { branchState: true, stateCarveOutClean: false });
+dexpect("#594-5b `checkout main && symbolic-ref $(…) …` refuses the carve-out (hidden operands)",
+  `git checkout main && git symbolic-ref $(printf refs/heads/v) refs/heads/main`,
+  { stateCarveOutClean: false });
+dexpect("#594-5c `checkout main && update-ref --stdin` refuses the carve-out",
+  `git checkout main && git update-ref --stdin`, { stateCarveOutClean: false });
+dexpect("#594-5d control — `checkout main && symbolic-ref HEAD` (a QUERY) keeps the carve-out clean",
+  `git checkout main && git symbolic-ref HEAD`, { stateCarveOutClean: true });
 
 // commit matcher (commit-graph/commit-tree EXCLUDED)
 dexpect("commit → block:commit", `git commit -m x`, { verdict: "block:commit", verb: "commit" });

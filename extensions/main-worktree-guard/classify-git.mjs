@@ -4095,8 +4095,15 @@ function _expandAliasInvocations(invocations) {
       // as whatever the IGNORED alias value says — a false ALLOW
       // (`reset --hard` read as `status`). Such a definition is dropped.
       if (GIT_BUILTIN_COMMANDS.has(name)) continue;
-      if (!defs.has(name)) defs.set(name, value);
-      else if (defs.get(name) !== null && value === null) defs.set(name, null); // any opaque def → opaque
+      // ⛔ LAST DEFINITION WINS (probe-verified git 2.43): `-c alias.x=… -c
+      // alias.x=…` runs the LAST one
+      // (`git -c alias.yy=status -c alias.yy='branch -fq victim9 main' yy`
+      // moved victim9, rc 0), so first-wins let a benign earlier definition
+      // launder a destructive later one — the exact bypass class this change
+      // exists to close. The map is command-global, so a definition in a LATER
+      // segment also governs an EARLIER invocation of the same name: that can
+      // only over-block (a name git had not yet redefined), never launder.
+      defs.set(name, value);
     }
   }
   const expandOne = (inv, depth) => {
@@ -4119,6 +4126,45 @@ function _expandAliasInvocations(invocations) {
     return inv;
   };
   return invocations.map((inv) => expandOne(inv, 0));
+}
+
+/**
+ * #594: a ref NAME the classifier can reason about. git's ref grammar allows
+ * `/` `-` `.`; anything carrying shell syntax (`$VAR`, `$(…)`, backticks, `{}`)
+ * is UNRESOLVED at classify time — the operand is whatever the shell expands it
+ * to, and a write to it cannot be named (measured: `R=refs/heads/victimA; git
+ * symbolic-ref $R refs/heads/main` and the `$(printf refs/heads/victim)` twin
+ * both create the symref, rc 0). Such operands FAIL CLOSED, the same doctrine
+ * as the #805 unresolved-target sentinel.
+ */
+const LITERAL_REF_NAME = /^[A-Za-z0-9._/-]+$/;
+
+/**
+ * #594: the shell tokenizer's COLLAPSED-SUBSTITUTION sentinel. An unquoted
+ * `$(…)`/`$((…))` is subject to word splitting, so the walk replaces it AND the
+ * rest of the simple command with one opaque token (measured: `git
+ * symbolic-ref $(printf refs/heads/victim) refs/heads/main` reports args
+ * `["$"]` while git creates the symref). An operand list of exactly this one
+ * token therefore means "there were more operands, and nobody can read them".
+ */
+const COLLAPSED_SUBST_TOKEN = "$";
+
+/**
+ * #594: `--stdin` in every spelling git's parse-options accepts. `--stdin` is
+ * the only `--st…` option on `update-ref`, so git takes any unambiguous prefix
+ * of it (measured rc 0 — the ref moved — for `--s`, `--st`, `--std`, `--stdi`),
+ * while the `--no-stdin` negation means the opposite and takes argv instead.
+ * `-z` (NUL-delimited stdin) implies the same channel.
+ * @param {string} t
+ * @returns {boolean}
+ */
+function _isStdinChannelFlag(t) {
+  const s = String(t ?? "");
+  if (s === "-z") return true;
+  if (!s.startsWith("--")) return false;
+  const name = s.slice(2);
+  if (name.startsWith("no-")) return false; // --no-stdin DISABLES the channel
+  return name.length > 0 && "stdin".startsWith(name);
 }
 
 /**
@@ -4167,13 +4213,34 @@ function _refVerbPositionals(args) {
  */
 export function symbolicRefWriteTarget(args) {
   const a = args || [];
-  const deleting = a.some((t) => t === "-d" || /^--d(e(?:l(?:e(?:t(?:e)?)?)?)?)?$/.test(String(t)));
+  // `-d` may sit ANYWHERE in a single-dash NOARG cluster (`-qd` ≡ `-q -d`,
+  // `-dq` — probe-verified rc 0, ref deleted), an option-letter hazard this
+  // file already handles for `branch`/`push`. A cluster's `m` is different: it
+  // TAKES ITS VALUE from the rest of the same token (`-md` is `-m d`, NOT a
+  // delete — probe-verified), so the scan stops there.
+  const deletes = a.some((t) => {
+    const s = String(t ?? "");
+    if (s.startsWith("--")) return /^--d(e(?:l(?:e(?:t(?:e)?)?)?)?)?$/.test(s);
+    if (!/^-[A-Za-z]+$/.test(s)) return false;
+    for (const ch of s.slice(1)) {
+      if (ch === "d") return true;
+      if (ch === "m") break; // -m consumes the rest of the token as its value
+    }
+    return false;
+  });
   const pos = _refVerbPositionals(a);
-  if (!deleting && pos.length < 2) return null; // one positional = QUERY
+  // #594: a collapsed unquoted substitution hides the real operands — a write
+  // whose target cannot be read, so it fails closed.
+  if (pos.length === 1 && pos[0] === COLLAPSED_SUBST_TOKEN) {
+    return { name: null, branch: null, opaque: true };
+  }
+  if (!deletes && pos.length < 2) return null; // one positional = QUERY
   const name = pos[0];
   if (!name) return null;
   const m = /^refs\/heads\/(.+)$/.exec(name);
-  return { name, branch: m ? m[1] : null };
+  // An UNRESOLVABLE spelling (shell syntax in the operand) is a write whose
+  // target nobody can name → error on the conservative side.
+  return { name, branch: m ? m[1] : null, opaque: !LITERAL_REF_NAME.test(name) };
 }
 
 /**
@@ -4192,18 +4259,26 @@ export function symbolicRefWriteTarget(args) {
  */
 export function updateRefWriteTarget(args) {
   const a = args || [];
-  if (a.some((t) => /^--?stdin$/.test(String(t)) || t === "-z")) return { name: null, branch: null };
+  if (a.some(_isStdinChannelFlag)) return { name: null, branch: null, opaque: true };
   const deleting = a.some((t) => t === "-d" || /^--delete$/.test(String(t)));
   const pos = _refVerbPositionals(a);
   const name = pos[0] ?? null;
   if (!name) return null;
+  // #594: a collapsed unquoted substitution hides the real operands.
+  if (name === COLLAPSED_SUBST_TOKEN && pos.length === 1) {
+    return { name: null, branch: null, opaque: true };
+  }
+  // An UNRESOLVABLE spelling (`$R`, `$(…)`) names no ref the gate can read.
+  const opaque = !LITERAL_REF_NAME.test(name);
   if (!deleting && pos.length < 2) {
     // <ref> alone is an rc-129 no-op in git; keep the historic over-block.
-    return /^refs\/heads\//.test(name) || name === "HEAD" ? { name, branch: null } : null;
+    return /^refs\/heads\//.test(name) || name === "HEAD" || opaque
+      ? { name, branch: null, opaque }
+      : null;
   }
   const m = /^refs\/heads\/(.+)$/.exec(name);
-  if (!m && name !== "HEAD") return null; // tags / notes / remotes — not branch state
-  return { name, branch: m ? m[1] : null };
+  if (!m && name !== "HEAD" && !opaque) return null; // tags / notes / remotes — not branch state
+  return { name, branch: m ? m[1] : null, opaque };
 }
 
 /**
@@ -4340,11 +4415,13 @@ export function classifyGitCommandDetailed(command) {
       // positional-precise (`-m <reason>` consumes its value), so a
       // `refs/heads/<b>` re-point and the `-m`-prefixed HEAD form are both
       // state mutations while `git symbolic-ref refs/heads/x` stays a read.
+      // An UNRESOLVABLE operand (`$R`, `$(…)`) counts too — fail closed.
       const w = symbolicRefWriteTarget(v.args);
-      return !!w && (w.name === "HEAD" || w.branch !== null);
+      return !!w && (w.opaque === true || w.name === "HEAD" || w.branch !== null);
     }
     if (v.verb === "update-ref") {
-      // #594: `-m <reason>` value slots and the stdin channel (`--stdin`).
+      // #594: `-m <reason>` value slots, the stdin channel (`--stdin` and every
+      // unambiguous prefix of it) and unresolvable operands.
       return updateRefWriteTarget(v.args) !== null;
     }
     return v.verb === "branch" && _branchInvMutatesBranchState(v.args);
@@ -4556,9 +4633,11 @@ export function classifyGitCommandDetailed(command) {
       const write = verb === "symbolic-ref"
         ? symbolicRefWriteTarget(args)
         : updateRefWriteTarget(args);
-      // Only checkout state and `refs/heads/<b>` are branch state here; a
-      // refs/remotes/… write stays M4's business (unchanged behaviour).
-      if (write && (verb !== "symbolic-ref" || write.name === "HEAD" || write.branch !== null)) {
+      // Only checkout state, `refs/heads/<b>` and an unresolvable operand are
+      // branch state here; a refs/remotes/… write stays M4's business
+      // (unchanged behaviour).
+      if (write && (verb !== "symbolic-ref" || write.opaque === true ||
+          write.name === "HEAD" || write.branch !== null)) {
         out.branchState = true;
       }
     } else if (stateInv.aliasOpaque === true) {
@@ -4777,9 +4856,6 @@ export function classifyGitCommandDetailed(command) {
   // block restores pre-#591 compound parity.
   out.stateOpCount = invocations.filter((v) => v.aliasOpaque === true ||
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
-  // #594: does the command contain an unverifiable alias/external-subcommand
-  // invocation at all? Exposed for the M3 arm and for cross-layer pins.
-  out.aliasOpaque = invocations.some((v) => v.aliasOpaque === true);
   // #591 (round-3→5 fold): `hiddenStateSubst` is computed UP FRONT (see the
   // zero-invocation guard) and already on `out` — it now feeds not only the M3
   // benign-force carve-out but the sync arm's `onlyGitInvocation` claim
@@ -5384,12 +5460,12 @@ function _isCarveOutReadOnlyInvocation(v) {
   // stay read-only; a second checkout/switch, any `update-ref`, a ref-writing
   // symbolic-ref, and every branch mutation fall through as non-read-only.
   if (verb === "branch") return !_branchInvMutatesBranchState(args);
-  // A symbolic-ref QUERY is exactly `<name>` with only --quiet/--short; -d
-  // (and every abbreviation of --delete) writes, and any unenumerated flag
-  // fails closed rather than being read as a query.
+  // A symbolic-ref QUERY is whatever the WRITE-form predicate says is not a
+  // write — one authoritative reading (see symbolicRefWriteTarget), so a
+  // clustered `-qd`, an unresolved `$R`/`$(…)` operand or a hidden-operand
+  // sentinel can never be judged read-only here while M3 judges it a write.
   if (verb === "symbolic-ref") {
-    return pos.length === 1 && args.every((a) =>
-      !a.startsWith("-") || a === "-q" || a === "--quiet" || a === "-s" || a === "--short");
+    return symbolicRefWriteTarget(args) === null;
   }
   return false;
 }

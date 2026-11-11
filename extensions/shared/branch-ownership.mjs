@@ -778,22 +778,72 @@ function _refVerbPositionals(args) {
 }
 
 /**
- * #594 Finding 2: the WRITE form of `git symbolic-ref`, positionally precise.
+ * #594: a ref NAME this module can reason about. Anything carrying shell syntax
+ * (`$VAR`, `$(…)`, backticks) is UNRESOLVED at classify time — the operand is
+ * whatever the shell expands it to (measured: `R=refs/heads/victimA; git
+ * symbolic-ref $R refs/heads/main` creates the symref, rc 0) — so such a write
+ * FAILS CLOSED rather than reading as "not branch state" (the #805 doctrine).
+ */
+const LITERAL_REF_NAME = /^[A-Za-z0-9._/-]+$/;
+
+/**
+ * #594: the shell tokenizer's COLLAPSED-SUBSTITUTION sentinel — an unquoted
+ * `$(…)` is subject to word splitting, so the walk replaces it AND the rest of
+ * the simple command with one opaque token (measured: `git symbolic-ref
+ * $(printf refs/heads/victim) refs/heads/main` reports args `["$"]` while git
+ * creates the symref). Mirror of classify-git's constant, cross-pinned in
+ * test-branch-ownership.mjs.
+ */
+const COLLAPSED_SUBST_TOKEN = "$";
+
+/**
+ * #594: the WRITE form of `git symbolic-ref`, positionally precise.
  * One positional is a QUERY (git prints the symref, or fails rc 128 when the
  * ref is not symbolic); a second positional, or a `-d`/`--delete` (any
- * unambiguous `--del…` prefix), is a WRITE.
+ * unambiguous `--del…` prefix, or a `d` inside a single-dash NOARG cluster —
+ * `-qd`/`-dq` delete rc 0, probe-verified; a cluster's `m` takes the rest of
+ * the token as its VALUE, so `-md` is NOT a delete).
  * @param {string[]} args
- * @returns {{name: string, branch: string|null}|null}
+ * @returns {{name: string, branch: string|null, opaque: boolean}|null}
  */
 function _symbolicRefWriteTarget(args) {
   const a = args || [];
-  const deleting = a.some((t) => t === "-d" || /^--d(e(?:l(?:e(?:t(?:e)?)?)?)?)?$/.test(String(t)));
+  const deleting = a.some((t) => {
+    const s = String(t ?? "");
+    if (s.startsWith("--")) return /^--d(e(?:l(?:e(?:t(?:e)?)?)?)?)?$/.test(s);
+    if (!/^-[A-Za-z]+$/.test(s)) return false;
+    for (const ch of s.slice(1)) {
+      if (ch === "d") return true;
+      if (ch === "m") break;
+    }
+    return false;
+  });
   const pos = _refVerbPositionals(a);
+  if (pos.length === 1 && pos[0] === COLLAPSED_SUBST_TOKEN) {
+    return { name: null, branch: null, opaque: true }; // hidden operands
+  }
   if (!deleting && pos.length < 2) return null;
   const name = pos[0];
   if (!name) return null;
   const m = /^refs\/heads\/(.+)$/.exec(name);
-  return { name, branch: m ? m[1] : null };
+  return { name, branch: m ? m[1] : null, opaque: !LITERAL_REF_NAME.test(name) };
+}
+
+/**
+ * #594: `--stdin` in every spelling git's parse-options accepts — `update-ref`
+ * has no other `--st…` option, so an unambiguous prefix works (measured rc 0,
+ * ref moved, for `--s`/`--st`/`--std`/`--stdi`), while `--no-stdin` is the
+ * opposite (argv form, rc 129 with no operands).
+ * @param {string} t
+ * @returns {boolean}
+ */
+function _isStdinChannelFlag(t) {
+  const s = String(t ?? "");
+  if (s === "-z") return true;
+  if (!s.startsWith("--")) return false;
+  const name = s.slice(2);
+  if (name.startsWith("no-")) return false;
+  return name.length > 0 && "stdin".startsWith(name);
 }
 
 export function classifyBranchOp(subcmd, args, opts = {}) {
@@ -847,21 +897,26 @@ export function classifyBranchOp(subcmd, args, opts = {}) {
     //     re-points <b> at another ref (rc 0, probe-verified) without touching
     //     any checkout, so it is NOT "switch-existing" (whose #376
     //     return-to-original arm would re-baseline) — op "ref-write" blocks.
-    //   `symbolic-ref -d <name>`                   → delete (write form)
+    //   `symbolic-ref -d <name>` / `-qd <name>`    → delete (write form)
+    //   `symbolic-ref $R <ref>`                    → unresolvable target: the
+    //     same op, blocked (#805 fail-closed doctrine)
     const w = _symbolicRefWriteTarget(args);
     if (!w) return { op: "other" }; // query
+    if (w.opaque === true) return { op: "ref-write", target: null };
     if (w.name === "HEAD") return { op: "switch-existing" };
     if (w.branch !== null) return { op: "ref-write", target: w.branch };
     return { op: "other" }; // refs/remotes/… — not checkout state (M4 owns that)
   }
   if (subcmd === "update-ref") {
-    // #594: `--stdin` (`-z`) names no ref on argv — every update arrives on
-    // stdin (`printf 'update refs/heads/u2 <sha>\n' | git update-ref --stdin`
-    // moves the branch rc 0, probe-verified) → an unverifiable ref write.
-    if (a.some((t) => /^--?stdin$/.test(String(t)) || t === "-z")) {
+    // #594: `--stdin` (`-z`, and every unambiguous prefix of --stdin) names no
+    // ref on argv — every update arrives on stdin (`printf 'update
+    // refs/heads/u2 <sha>\n' | git update-ref --stdin` moves the branch rc 0,
+    // probe-verified) → an unverifiable ref write.
+    if (a.some(_isStdinChannelFlag)) {
       return { op: "ref-write", target: null };
     }
     const pos = _refVerbPositionals(a);
+    if (pos[0] && !LITERAL_REF_NAME.test(pos[0])) return { op: "ref-write", target: null };
     if (pos[0] && (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD")) {
       return { op: "switch-existing" };
     }
