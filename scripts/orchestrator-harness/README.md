@@ -3038,9 +3038,49 @@ what distinguishes them, because a killed run genuinely has no verdict.
 - `failed` — the agent ran and returned non-zero (`reason=agent-exit-<rc>`).
 - `died` — the lane was ENDED (`reason=signal:TERM`), a signal's status is carried in `rc=`, it reached
   its end with NOTHING recorded (`reason=no-outcome-recorded:exit-<rc>`) — the half-synced-`$O` shape, a
-  crash, an early `78` — or the KEY gate itself could not run
+  crash, an early `78` — the KEY gate itself could not run
   (`reason=key-gate-not-run:no-outcome-file` / `:rc<N>`), which is a statement about `$O`, not about the
-  credential.
+  credential, **or a non-zero agent exit that is attributed to something other than the item's work**
+  (below).
+
+⛔ **`failed` IS A CLAIM ABOUT THE WORK, AND IT IS NO LONGER MADE FOR AN EXIT THE HARNESS OR THE BOX
+CAUSED** (agent-infra#2833). Measured on this fleet's own lane logs (2026-11-11): **53 lanes exited
+non-zero and all 53 read `outcome=failed reason=agent-exit-<rc>`** — including the **35 (66%) that
+`lane-bound.sh` had ended at the wall ceiling**, every one of which already carried
+`[lane-bound] VERDICT verdict=exceeded-wallclock … signal=TERM` in the same log. The census therefore
+reported "the work failed" about lanes that were never allowed to finish — the exact question #2833 was
+filed over ("lanes die constantly, and the harness cannot even say HOW they died"). Two facts the run
+already measures are now consulted BEFORE that claim is made, in this order:
+
+| reason token | who ended the lane | retryable? |
+|---|---|---|
+| `exceeded-wallclock` · `stalled` | a BOUND (`lane-bound.sh`), read from `run_agent`'s verdict file or the run's own `[lane-bound] VERDICT` line | **not unchanged**: the same box re-fires the same bound — fix the bound, or move the item |
+| `transport-unreachable:rc<rc>:rotations=<n>` | the model/provider was unreachable: the run's own transcript carries `n` `[http-pool-hygiene] rotated connection pool` lines, `n` ≥ `LANE_TRANSPORT_MIN_ROTATIONS` (default **3**) | **yes** — nothing about the item is implicated |
+| `agent-exit-<rc>` (outcome=`failed`) | the item's work | no |
+
+```bash
+# the retryable population, in one read — a transport death is NOT a failed attempt at the work
+grep -h '^outcome=died reason=transport-unreachable:' $O/logs/lane-*.outcome
+# and the lanes a BOUND ended, which must not be re-dispatched unchanged
+grep -h '^outcome=died reason=\(exceeded-wallclock\|stalled\)' $O/logs/lane-*.outcome
+```
+
+⛔ **THE CLASS IS CARRIED OUT OF BAND, NOT AS AN EXIT CODE** — #2833 proposed `EX_TEMPFAIL` (75) with a
+dispatcher that retries it. 75 is already `AGENT_LOAD_REFUSED` (a REFUSAL: the opposite polarity, no
+agent ran), and the recorded correction after #1986 is that a refusal/verdict is **not** an exit code:
+its value space is shared with `pi` and with sysexits, and overloading it produced a false "refusal" on
+a verb that had FAILED. No shipped caller of `lane.sh` reads its exit status for a retry decision
+(`dispatch-merge.sh:476` launches it through `wt_spawn`, detached), so a new code would be an inert
+signal — the no-op-gate class this repo forbids. The terminal line is the out-of-band carrier and is
+already the documented single read, so the queries above are the retry decision.
+⛔ **BOTH READS ARE RUN-SCOPED.** The lane log is append-only across runs, so the rotation count and the
+`[lane-bound]` line are read from the byte this run appended at (`LANE_AGENT_LOG_OFF`, taken
+immediately before `run_agent`) — the same stale-flag class the per-run verdict file closes for
+`outcome=` itself. Without it a previous attempt's connection storm would retry every later real
+failure of the same issue for ever.
+⛔ **AND THE FALSIFIER IS THE OTHER DIRECTION:** a lane with fewer than the threshold rotations, or one
+that recovered and COMPLETED, is `failed`/`done` as before — an automatic retry of a real work failure
+burns a lane's budget and repeats the same outcome.
 
 ⛔ **This is what makes "a lane that does not run" visible at all.** Measured 2026-11-02 on two cells:
 the log simply STOPPED (a print-mode `pi` buffers, so a silent log reads exactly like a working lane),
