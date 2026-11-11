@@ -523,13 +523,29 @@ export function tokenizeFrontmatter(yamlString) {
       };
     }
 
-    // P2-1: `|0` / `|12` / `|+0` / `|-0` / `>0` — a block-scalar header with a
-    // DIGIT explicit-indent that the valid regex rejects ([1-9]? only) falls
-    // through to the plain-scalar path → typed as string → gate passes →
-    // validator clean while pi throws "Block scalar header includes extra
-    // characters" (probe: every digit form throws — |0 |00 |12 |+0 |-0 >0 |2x;
-    // single-digit 1-9 like `|1` is valid and handled above).
-    if (/^[>|][+-]?[0-9]+/.test(valueText)) {
+    // #369 P2-1 + #458: a value that STARTS with a block-scalar indicator but
+    // is NOT a legal header. The valid-header regex above accepts exactly the
+    // grammar-legal spellings — `[>|]`, an optional chomp `[+-]?`, an optional
+    // SINGLE explicit indent `[1-9]`, then (whitespace-separated) nothing or a
+    // `#`-comment. Every other spelling throws in yaml (probe pi 0.85.1 /
+    // yaml 2.9.0), and each previously fell through to the plain-scalar path
+    // → typed as string → gate passed → validator clean while pi DROPPED the
+    // skill:
+    //   #369 P2-1 digit forms — `|0` `|00` `|12` `|+0` `|-0` `>0` `|2x` `|10`
+    //     → "Block scalar header includes extra characters"
+    //   #458 NO-space tails — `|x` `|comment` `>text` `|-#c` `|+x` `|1x` `|-x`
+    //     → same "extra characters" class
+    //   #458 unseparated comments — `|#c` `|#` `>#x` `|-#c`
+    //     → "Comments must be separated from other tokens by white space
+    //        characters" (a comment needs leading whitespace)
+    // Zero false positives, from the plain-scalar grammar itself: `|` and `>`
+    // are c-indicators, and `ns-plain-first` forbids a plain scalar from
+    // BEGINNING with a c-indicator (only `?` `:` `-` are allowed, and only
+    // followed by a non-space). So no value yaml resolves as a plain string
+    // starts with `|` or `>` — every such start IS a block header, and the
+    // ones that reach here are exactly the ones yaml rejects. The #370 probe
+    // reached the same conclusion empirically over the live 126-file corpus.
+    if (valueText[0] === '>' || valueText[0] === '|') {
       emit({ t: TOKEN.TOKENIZE_ERROR, kind: 'block-header', line: lineNo, detail: 'invalid block scalar header (extra characters)' });
       return { nextI: startI };
     }

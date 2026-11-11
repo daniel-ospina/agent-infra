@@ -398,6 +398,25 @@ const VALUE_POOL = [
   "|1 token",
   "|- x",
   "| x # y",
+  // #458 — the NO-SPACE sibling class: indicator immediately followed by a
+  // non-grammar tail. #370 pinned the space-then-token forms above but not the
+  // adjacent boundary, which is the one the header regex never matched at all
+  // (it requires whitespace before a tail) → fell through to the plain-scalar
+  // path → typed string → gate passed → pi dropped. Legal no-space forms
+  // (`|1`, `|-`, `|+`) are already in the pool; `|1 #c` / `|- #c` sit on the
+  // false-positive boundary the generalized guard must not cross.
+  "|#c",
+  "|#",
+  ">#x",
+  "|x",
+  "|comment",
+  ">text",
+  "|-#c",
+  "|+x",
+  "|1x",
+  "|-x",
+  "|1 #c",
+  "|- #c",
 ];
 const KEY_POOL = ["name", "description", "steps", "other", "key", "subjects.team"];
 

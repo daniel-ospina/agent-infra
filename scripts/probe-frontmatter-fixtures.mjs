@@ -97,6 +97,19 @@ const FIXTURE_DEFS = [
   // after the header is legal; pi loads and must stay validator-clean.
   { id: 'ok-block-header-comment', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: | #c\n  line1\n---\nbody\n', note: '#370 pin — #-comment immediately after the header stays legal (pi loads, body is the value)' },
   { id: 'ok-block-header-comment-spaced', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |  # comment\n  line1\n---\nbody\n', note: '#370 pin — whitespace run + #-comment after the header stays legal (multi-space; guards the trimStart boundary)' },
+  // #458 — the NO-SPACE sibling class: a block-scalar indicator immediately
+  // followed by a non-grammar tail. The header regex requires WHITESPACE before
+  // any tail, so these never matched it at all and fell through to the
+  // plain-scalar path → typed string → gate passed → validator clean while pi
+  // DROPPED the skill. Two yaml messages, one grammar rule (the tail is not a
+  // legal header): "Block scalar header includes extra characters" for a token
+  // tail, "Comments must be separated from other tokens by white space
+  // characters" for an unseparated `#`. Both map to throw-invalid-block-header.
+  { id: 'throw-block-header-nospace-token', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |x\n  line1\n---\nbody\n', note: '#458 — `|x` indicator + no-space token tail ("Block scalar header includes extra characters")' },
+  { id: 'throw-block-header-nospace-word', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |comment\n  line1\n---\nbody\n', note: '#458 — `|comment` no-space word tail (the `| comment` space form is #370; this is the adjacent form)' },
+  { id: 'throw-block-header-nospace-fold', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: >text\n  line1\n---\nbody\n', note: '#458 — folded `>text` no-space tail (the folded sibling of `|x`)' },
+  { id: 'throw-block-header-nospace-comment', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |#c\n  line1\n---\nbody\n', note: '#458 — `|#c` unseparated comment ("Comments must be separated from other tokens by white space characters"); `| #c` stays legal, pinned above' },
+  { id: 'throw-block-header-nospace-chomp-comment', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |-#c\n  line1\n---\nbody\n', note: '#458 — `|-#c` chomp then unseparated comment (the chomp modifier must not mask the whitespace rule)' },
   { id: 'throw-reserved-at', class: 'throw-reserved-char-start', expected: ['throw-reserved-char-start'], expectedRelation: 'drop', content: '---\nname: x\ndescription: @x\n---\nbody\n' },
   { id: 'throw-reserved-backtick', class: 'throw-reserved-char-start', expected: ['throw-reserved-char-start'], expectedRelation: 'drop', content: '---\nname: x\ndescription: `x`\n---\nbody\n' },
   { id: 'throw-reserved-percent', class: 'throw-reserved-char-start', expected: ['throw-reserved-char-start'], expectedRelation: 'drop', content: '---\nname: x\ndescription: %foo\n---\nbody\n' },
@@ -179,6 +192,12 @@ const FIXTURE_DEFS = [
   { id: 'ok-block-content', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |\n  line1\n  line2\n---\nbody\n' },
   { id: 'ok-block-minimal-indent', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |\n line1\n line2\n---\nbody\n', note: 'P1-1 — body at the auto-detected contentIndent (1 space after a 0-indent key); pi loads' },
   { id: 'ok-block-minimal-folded', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: >\n folded\n text\n---\nbody\n', note: 'P1-1 — folded `>` with 1-space body' },
+  // #458 ok-pins — the FALSE-POSITIVE boundary of the generalized `[>|]`
+  // start guard. A legal header with an explicit indent and/or chomp modifier
+  // followed by a WHITESPACE-SEPARATED comment is legal; these must stay
+  // validator-clean so the guard is never over-broad.
+  { id: 'ok-block-header-explicit-comment', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |1 #c\n  line1\n---\nbody\n', note: '#458 pin — explicit-indent header + SPACED comment stays legal (guards the guard against |1x over-reach)' },
+  { id: 'ok-block-header-chomp-comment', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |- #c\n  line1\n---\nbody\n', note: '#458 pin — chomp header + SPACED comment stays legal (the legal twin of the `|-#c` fixture)' },
   { id: 'ok-block-explicit-indent-2', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |2\n  line1\n  line2\n---\nbody\n', note: 'P1-1 — explicit indent indicator |2, body at exactly contentIndent' },
   { id: 'ok-block-explicit-keep-2', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |+2\n  line1\n---\nbody\n', note: 'P1-1 — chomp+indent |+2' },
   { id: 'ok-block-tab-after-spaces', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |\n  line1\n  \tline2\n---\nbody\n', note: 'P1-3 — tab AFTER spaces in a block-scalar body line is legal content-indent whitespace; pi loads and preserves the tab in the value (only a line STARTING with a tab ends the scalar)' },
