@@ -727,11 +727,19 @@ ck "B9l …because the tree agrees: the driver carries \`set -uo pipefail\` AND 
 # correctly. ⛔ THIS SUITE'S OWN RULE IS WHY IT MATTERS — a comment claiming a guard it does not have
 # reads exactly like one that has it, and the comment above makes that claim in the words "THE WHOLE
 # DEFINITION".
-_sx="$(awk '/^shard_exec\(\)/{seen=1}
-             seen { print; t=$0; o=gsub(/\{/,"{",t); t=$0; c=gsub(/\}/,"}",t); d+=o-c
-                    if (o>0) opened=1
-                    if (opened && d==0) exit }' "$SHARDS" \
-        | sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta')"
+# ⛔ THE READER IS A FUNCTION SO IT CAN BE PINNED ON A FIXTURE, not only on the live file (this round,
+# measured): the bound is `d<=0`, NOT `d==0`. A `}` in a trailing COMMENT or a quoted string on the
+# definition line subtracts without a matching add, so the depth lands at -1 and `d==0` never fires on
+# that line — the read then runs on into the NEXT function, which is B9s's defect one shape over, on a
+# HEALTHY `shard_exec`. Negative depth means the definition closed on that line by any reading.
+_shard_exec_def() { # $1 = the file holding `shard_exec()`
+  awk '/^shard_exec\(\)/{seen=1}
+       seen { print; t=$0; o=gsub(/\{/,"{",t); t=$0; c=gsub(/\}/,"}",t); d+=o-c
+              if (o>0) opened=1
+              if (opened && d<=0) exit }' "$1" \
+    | sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta'
+}
+_sx="$(_shard_exec_def "$SHARDS")"
 { [ -n "$_sx" ] && ! grep -qE 'pipefail|SHELLOPTS' <<<"$_sx"; }; rc=$?
 ck "B9m …and \`shard_exec\`'s OWN braces, line continuations folded, carry no pipefail/SHELLOPTS of ANY spelling — \`-o pipefail\` one line down reddens here too" $rc
 # ⛔ THE REGION IS BOUNDED, AND THAT IS ITS OWN ARM (review round 16, P3): the definition must not swallow
@@ -741,6 +749,19 @@ ck "B9m …and \`shard_exec\`'s OWN braces, line continuations folded, carry no 
 # range regression itself rather than waiting for a pipefail comment to be the thing that exposes it.
 grep -q 'shard_run_bounded' <<<"$_sx" && rc=1 || rc=0
 ck "B9s …and the extraction STOPS at \`shard_exec\`'s own closing brace — the next function is outside it, so a comment there can never be graded as this definition" $rc
+# ⛔ AND THE BOUND HOLDS WHEN THE DEPTH GOES NEGATIVE (this round, measured): `d==0` is not the
+# question the arm is asking — "has the definition closed on this line" is, and an UNMATCHED `}` in a
+# trailing comment (`… bash "$1"; }  # closed by the brace above }`) makes the running depth -1 without
+# ever passing through 0. Under `d==0` the read ran to EOF and B9s reddened on a HEALTHY `shard_exec`:
+# the same false-block class round 16 fixed, one shape over. Pinned on a SYNTHETIC fixture, not the live
+# file — the live formatting is not a fixture, and this arm must not depend on run-bash-shards.sh
+# happening to carry no brace in a comment today.
+B9T_FIX="$TMP/b9t-shard-exec.sh"
+printf '%s\n' 'shard_exec() { env bash "$1"; }  # closed by the brace above }' \
+  'shard_run_bounded() { echo pipefail; }' >"$B9T_FIX"
+B9T_OUT="$(_shard_exec_def "$B9T_FIX")"
+{ [ -n "$B9T_OUT" ] && ! grep -q 'shard_run_bounded' <<<"$B9T_OUT"; }; rc=$?
+ck "B9t …a \`}\` in a TRAILING COMMENT on the definition line still ends the read (the depth can go NEGATIVE, so the bound is \`<= 0\` — under \`== 0\` the read swallows the next function and B9s reddens on a healthy \`shard_exec\`): $(printf '%s' "$B9T_OUT" | tr '\n' ' ' | cut -c1-60)…" $rc
 # ⛔ THE MECHANISM IS ALSO A PROPERTY OF THE ENVIRONMENT, and that half is PROBED, not read (review round
 # 14, P3): `export SHELLOPTS` in the driver makes a child inherit pipefail without touching `shard_exec`,
 # and only a live launch shows it. This probe says nothing about the FILE — B9m reads the file; this one
