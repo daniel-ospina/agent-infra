@@ -5293,18 +5293,41 @@ cmd_apply() {
   safe_argv "${HARNESS_PIN_FILE:-}" || die "\$HARNESS_PIN_FILE must not contain a quote or shell metacharacter"
   local before_c; before_c="$(harness_commit)"
   # Same authority as `start`/`status`: a controller outside the session still owns the harness tree
-  # this verb is about to replace, so the tmux session is not sufficient (#1761).
-  if [ "$force" != 1 ]; then
+  # this verb is about to SEED, so the tmux session is not sufficient (#1761).
+  #
+  # ⛔ THE GUARD BELONGS TO THE SEEDING PATH — `--pin-only` IS EXEMPT (agent-infra#2738). What this
+  # guard protects is `seed_and_stamp` below: it rewrites `$O/<worker>.sh` underneath a LIVE loop, so
+  # the loop is the OLD `$O/orch-loop.sh` while the helpers it calls are the new ones — a version skew
+  # no other path in this repo produces. `--pin-only` returns BEFORE that call, so it cannot produce
+  # the skew: `harness_apply` pins a per-commit worktree at `$HARNESS_PIN_DIR/<sha12>` and re-points
+  # `$HARNESS_PIN_FILE` at it, and the controller keeps executing the `$O` it was launched from.
+  # ⛔ REFUSING IT WAS THE BUG, and it was measured: 2026-10-24 19:05Z on pi-cell-3
+  # (`vm-915c3930…`) the pin record named `709ceb911b03` while `/tmp/cell-home/harness/` held only
+  # `d4ccaf6ee8e6`, the pin the live controller was executing — so the cell could not have been
+  # started from its own record. Repairing the record is EXACTLY this no-skew path, and the guard
+  # refused it; the only route left was `--force`, which bypasses the guard on the SEEDING path too.
+  # So the refusal taught an operator the one flag that defeats the guard everywhere, and `--force`
+  # stopped distinguishing "harmless pin-only" from "re-seed `$O` under a live loop". Exempting the
+  # flag here is what makes `--force` mean ONE thing again, and it makes the message below able to
+  # name the verb a live cell actually has.
+  if [ "$pin_only" != 1 ] && [ "$force" != 1 ]; then
     live="$(seen_controller_pids)" \
       || die "cannot read the process table (ps) — refusing to replace the harness tree on an unreadable read"
     # ⛔ THE REFUSAL IS RIGHT EVEN WHEN THE CONTROLLER IS ANOTHER REPO'S, and the message says so:
     # the harness tree is SHARED across repos on one machine, so replacing it changes the code a peer
     # repo's controller is running. The false-block direction is a real cost (the owner's second
     # half), so name the pid, say it may not be yours, and give the remedy rather than implying
-    # `stop` will clear it.
-    [ -z "$live" ] || die "a controller is RUNNING (pid $(_pids_join "$live")) — possibly another repo's, from this cell's shared harness path — and apply would replace the harness tree under it; 'stop' it from its own state dir, or re-run with --force"
+    # `stop` will clear it. ⛔ AND NAME `--pin-only` AS THE NON-DESTRUCTIVE REMEDY: a message that
+    # offers only 'stop' and `--force` is what made the operator reach for the flag that defeats the
+    # guard (agent-infra#2738).
+    # ⛔ SINGLE QUOTES, NEVER BACKTICKS, around a command in a `die` string: a backticked span inside
+    # double quotes is COMMAND SUBSTITUTION, so the message would RUN the verb it is recommending and
+    # splice its output into the refusal — measured while writing this arm (the refusal printed a real
+    # `harness PINNED:` block and advanced the pin as a side effect). Same class as the commit-message
+    # rule in AGENTS.md, and just as silent.
+    [ -z "$live" ] || die "a controller is RUNNING (pid $(_pids_join "$live")) — possibly another repo's, from this cell's shared harness path — and re-seeding would replace the harness tree under it. If you only need to advance the PIN, run '$0 apply --pin-only' (it never touches the running loop); to 'stop' it, use its own state dir; to seed under it anyway, re-run with --force"
     tmux has-session -t "$SESSION" 2>/dev/null \
-      && die "a controller is RUNNING (tmux '$SESSION') and apply would replace the harness tree under it — 'stop' first, or re-run with --force"
+      && die "a controller is RUNNING (tmux '$SESSION') and re-seeding would replace the harness tree under it — '$0 apply --pin-only' if you only need the pin advanced, else 'stop' first, or re-run with --force"
   fi
   harness_apply
   # ⛔ `--pin-only` IS THE PATH A RUNNING CELL USES TO ADVANCE WITHOUT VERSION SKEW (agent-infra#2215).
@@ -5316,11 +5339,17 @@ cmd_apply() {
   # So the per-cycle self-refresh advances the pin with `--pin-only`, and the next `start` seeds $O from
   # the NEW pin (start calls seed_and_stamp) — one cycle of "pinned ahead, running behind", disclosed
   # as `restart-pending`, and never a mixed pair of script versions in one loop.
+  # ⛔ AND SINCE agent-infra#2738 THE GUARD ABOVE DOES NOT RUN ON THIS PATH: the two statements — the
+  # comment saying a live cell advances through `--pin-only`, and the guard refusing exactly that —
+  # asserted two different contracts about one flag. The guard now covers the seeding path only, which
+  # is the one it can actually protect, so an operator (and the harness-apply pass, whose unit went RED
+  # every ten minutes on a healthy box for this) can reach this arm without `--force`.
   if [ "$pin_only" = 1 ]; then
     log_line "harness PINNED: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
     log_line "  path:   $HARNESS"
     log_line "  ref:    $HARNESS_REF in $HARNESS_REPO"
     log_line "  record: $HARNESS_PIN_FILE (seed NOT updated: 'start' re-seeds \$O from this pin, so running code never mixes two harness commits)"
+    log_line "  a live controller is unaffected: this path never touches \$O (agent-infra#2738)"
     return 0
   fi
   seed_and_stamp

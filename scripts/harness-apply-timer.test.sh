@@ -302,12 +302,17 @@ assert_eq "$(printf '%s\n' "$BODY" | grep -c 'kill ' | tr -d ' ')" "0" \
 assert_contains "$BODY" "--pin-only" "T7 and it DOES use the non-disturbing advance while a controller is live"
 
 # ── T7b: the advance calls the materialiser the ONE way `apply` accepts, and only claims a move ──
-# MEASURED IN REVIEW: `apply --pin-only` alone is REFUSED whenever a controller is live ("re-run with
-# --force") — `--pin-only` does not relax that guard. The pass therefore never advanced on any running
-# cell, recorded rc=23, and reddened the unit every ten minutes while the pin stayed put. The stub here
-# reproduces the supervisor's refusal, and it MOVES the pin like the real thing does: a stub that exits 0
-# without moving anything is the other half of the same defect (a green `advanced` over an unchanged
-# pin), and the second case pins that too.
+# MEASURED IN REVIEW (and since fixed): `apply --pin-only` alone was REFUSED whenever a controller was
+# live ("re-run with --force") — the guard did not relax for `--pin-only`. The pass therefore never
+# advanced on a running cell, recorded rc=23, and reddened the unit every ten minutes while the pin
+# stayed put. ⛔ THE SUPERVISOR NOW EXEMPTS `--pin-only` FROM THAT GUARD (agent-infra#2738, because the
+# pin-only path returns before `seed_and_stamp` — the only step that touches the live `$O`), so on the
+# real verb `--force` is belt-and-braces. This case still pins the PAIR, deliberately: the stub below is
+# a hand-written double of the invocation contract, and a pass that must never redden on a healthy cell
+# must not start depending on where the guard's scope sits. The load-bearing flag is `--pin-only`; the
+# stub MOVES the pin like the real thing does, because a stub that exits 0 without moving anything is
+# the other half of the same defect (a green `advanced` over an unchanged pin), and the second case
+# pins that too.
 say_case "T7b the materialiser is called with --force --pin-only, and a no-move is not 'advanced'"
 mk_origin t7; mk_clone t7
 REPO_P="$CLONE"; MODE_P=pin
