@@ -893,6 +893,13 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # this operator repair the box or dispatch the PR elsewhere — the extension set is fine and every
     # other box runs the same pair, so both remedies send them to an event that cannot arrive.
     why="HARNESS/MISMATCH gate: this fixer's caller and the deployed cell-lane-preflight.sh do not agree (usage/version skew, or a corrupt copy), so no measurement was possible (#2991), OR the spawn gate could not resolve `capacity.sh` at all (its `nodeploy` arm, #2293 follow-up). Both are harness defects, not a property of the box and not a finding about this PR: do NOT dispatch the PR elsewhere, sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) and re-run. Nothing was consumed"
+  elif [ "$ar" = "${AGENT_STALE_CODE_REFUSED:-85}" ]; then
+    # ⛔ A STALE CHECKOUT IS ITS OWN REMEDY, AND IT IS NOT ON A PEER (agent-infra#3932, this change's
+    # review, P1-2). Before this arm the refusal landed on the CAPABILITY text below — "repair the box
+    # (installed pi/extension set, provider credential) or dispatch the PR elsewhere" — and all three are
+    # wrong: the model call SUCCEEDED (that is how the reading was taken), and the measured wave had every
+    # cell hundreds of commits behind, so the peer refuses identically. The fix is on THIS box's checkout.
+    why="STALE-CODE gate: this box completed the model call but its checkout is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (#3932) — a fix cut from it produces a plausible log and a WRONG diff. The [capability-gate] REFUSED line in the log names the repo and the distance: advance THAT checkout (git fetch, then cut the worktree from origin/main, or the cell's own sync path) and re-run. Do NOT dispatch the PR elsewhere, and waiting cannot clear it. Nothing was consumed"
   elif [ "$ar" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ A FIFTH REMEDY, AND THE ONE THAT IS NEITHER "wait" NOR "reclaim" (review of #2991, P1): the
     # box could not complete one model call and RETURN (agent-infra#2935). It does NOT clear by waiting
