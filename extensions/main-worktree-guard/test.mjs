@@ -1139,7 +1139,13 @@ for (const [name, target, want] of [
     // expression, both outcomes included.
     ["it sets an exit code from its verdict", /process\.exit\(fail === 0 && !vacuous \? 0 : 1\);/.test(t653)],
     ["it passes the skip/red OPTIONS object, not a bare number", /reportVerdict\("test-653-delete-target", pass, fail, \{ skip, red: vacuous \}\)/.test(t653)],
-    ["a skipped behavioral half is reported as a failure", /behaviouralSkipped = true/.test(t653)],
+    // ⛔ THE FLAG'S CONSUMPTION, NOT JUST ITS ASSIGNMENT (review P2 of PR #3978): binding
+    // only `behaviouralSkipped = true` is green over a mutant that raises the flag and
+    // drops the line that CONVERTS it into the failure (`const vacuous = … || behaviouralSkipped`)
+    // — the same shape-only binding the row above was fixed for, one line down. Keep the
+    // assignment row (it has its own mutant: deleting line :115) and add the consumption.
+    ["a skipped behavioral half RAISES the flag", /behaviouralSkipped = true/.test(t653)],
+    ["that flag is CONSUMED into the failure verdict", /const vacuous = \(skip > 0 && pass === 0\) \|\| behaviouralSkipped;/.test(t653)],
   ];
   for (const [what, ok] of rows) {
     console.log(`${ok ? "✅" : "❌"} #653 review P0: the harness ${what}`);
