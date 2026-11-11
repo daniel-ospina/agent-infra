@@ -2422,6 +2422,38 @@ bare stdin/pipe/heredoc payloads, file/shebang payloads, dynamic string
 construction, and pathological obfuscation (the open-ended family shared with
 the shell residual tier).
 
+**#523 — a heredoc-fed interpreter's BODY is a program, not command-line text.**
+A heredoc is not part of the command line: bash feeds the body to the
+interpreter as its stdin, so a body line executes while its tokens were never
+operands. The walk used to tokenize the raw text, so the FIRST body token was
+read as the script — `bash <<EOF` + a body of `echo hi` then `/tmp/evil.sh`
+resolved `echo` (a non-file), the content walk no-opped, and the
+hub-mutating file the body actually executed was never read. Measured on this
+build's parent: six body shapes ALLOWED (`bash <<EOF`, `sh <<'X'`, `cat <<EOF |
+bash`, `<<-`, a nested `bash <file>` in the body, and a second dirty file after
+a clean one) while the control `bash <file>` was BLOCKED. `extractScriptPaths`
+now splits the command at its heredoc regions (`_heredocSplitForScripts`, on the
+same quote/arith-aware `_wtScanLine` the M5 walk uses): the HEADER keeps its
+command line for the existing leading-position scan, and each SHELL-programmed
+body is walked as a PROGRAM — every command position, `;`/`&&`/`||`/`|`/newline
+as boundaries, control-flow frame words skipped — so every file it executes is
+resolved, and `_backdoorBlock` gates each one (`_gateScriptPathContent`).
+Both directions are pinned: a body is a PROGRAM only when the interpreter is
+handed no script operand (`bash <<EOF script.sh` → the operand is the script and
+the body is its stdin DATA), and a DATA body (`cat <<EOF`), a CODE body
+(`python3 <<PY`, the #627 surface) and an unterminated/absent heredoc are not
+walked. A body-executed path also forces the via-interpreter verdict: bash reads
+an ENOEXEC file as a shell script, so #1485's opaque-binary stand-down must not
+apply to it.
+**Declared residuals of this arm** (each fails toward gating, never away): the
+command LINE itself still contributes ONE script (the one-script-per-command-line
+class is #3538, unchanged here); a `<<` terminator is matched with `trim()`
+(the M5 precedent), so a space-padded terminator ends the body here while bash
+keeps it open — which can only expose MORE text to the walk, not less; two
+heredocs on ONE header line are handled one at a time (the `_wtScanLine`
+contract); and a body that WRITES a script and then executes it is not
+statically followable (the same class as Residual 1/3 in the discard section).
+
 ## What it does NOT fix
 
 **Hung processes.** A hung process cannot issue any tool call, so it can never

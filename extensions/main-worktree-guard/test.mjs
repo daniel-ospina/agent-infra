@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptPaths, extractHeredocProgramScriptPaths, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -4213,6 +4213,52 @@ try {
   expectBool("B26: script shared-ref branch -D → block", scriptGitVerdict(sBranchD, "main", hubR, hubR) === "block", true);
   expectBool("B27: script push of the wt's OWN branch → allow (wt-HEAD carve-out)", scriptGitVerdict(sPushOwn, "main", hubR, hubR) === "allow", true);
   expectBool("B28: script crafted gitdir attack → block (two-way validation)", scriptGitVerdict(sCrafted, "main", wtR, hubR) === "block", true);
+
+  // ── #523: a heredoc BODY is a PROGRAM, not command-line tokens ───────────
+  // A heredoc-fed interpreter reads its body as stdin, so bash executes the
+  // body's commands while the body's tokens are NOT on the command line. The
+  // old walk tokenized the raw text, so the FIRST body token looked like the
+  // script: `bash <<EOF` + a body whose first line is `echo hi` resolved
+  // `echo` (a non-file) and the content gate no-opped, while the file the body
+  // actually executed went unread. Every arm below is a MEASURED bash shape.
+  const sBodyHub = mkS("body-hub.sh", `git -C "${hubR}" reset --hard\n`);
+  expectBool("B52: heredoc body — no first-token path (old resolved `echo`)",
+    extractScriptPath(`bash <<EOF\necho hi\n"${sBodyHub}"\nEOF`) === sBodyHub, true);
+  expectBool("B52b: heredoc body — the body's file is CONTENT-GATED (hub mutation → block)", (() => {
+    const q = extractScriptPath(`bash <<EOF\necho hi\n"${sBodyHub}"\nEOF`);
+    return q === sBodyHub && scriptGitVerdict(q, "main", hubR, hubR) === "block";
+  })(), true);
+  expectBool("B52c: heredoc body — every script it executes, not just the first", (() => {
+    const clean = mkS("body-clean.sh", `echo hi\n`);
+    const got = extractScriptPaths(`bash <<EOF\ntrue\n"${clean}"\n"${sBodyHub}"\nEOF`);
+    return got.length === 2 && got[0] === clean && got[1] === sBodyHub;
+  })(), true);
+  expectBool("B52d: heredoc body — quoted delimiter / piped / <<- / nested interpreter all resolve", (() => {
+    const p = `\"${sBodyHub}\"`;
+    return extractScriptPath(`sh <<'X'\necho hi\n${p}\nX`) === sBodyHub &&
+      extractScriptPath(`cat <<'EOF' | bash\necho hi\n${p}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<-EOF\n\techo hi\n\t${p}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF\nbash ${p}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF\nif true; then ${p}; else echo no; fi\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF\necho hi; ${p}\nEOF`) === sBodyHub;
+  })(), true);
+  // Both DIRECTORIES of the rule, so each fix has an arm that goes red when it
+  // is textually reverted: a body that is DATA (no interpreter operand, a code
+  // interpreter, a script operand on the header line) must NOT be walked.
+  expectBool("B52e: a DATA heredoc body is not a program (`cat`, no interpreter)",
+    extractScriptPath(`cat <<EOF\n${sBodyHub}\nEOF`) === null &&
+    extractScriptPath(`python3 <<PY\n"${sBodyHub}"\nPY`) === null, true);
+  expectBool("B52f: `bash <<EOF script.sh` — the OPERAND is the script, the body is stdin DATA",
+    extractScriptPath(`bash <<EOF script.sh\n"${sBodyHub}"\nEOF`) === "script.sh", true);
+  expectBool("B52g: a heredoc delimiter is never a script path (old resolved `EOF`)",
+    extractScriptPath(`bash <<EOF\necho hi\nEOF`) === null && extractScriptPath(`sh <<X\nX`) === null, true);
+  expectBool("B52h: `bash < file` (a REAL stdin file) still resolves the program",
+    extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash -s < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B52i: here-string is not a heredoc (body stays on the command line)",
+    extractScriptPath(`bash <<< '/tmp/evil.sh'`) === "/tmp/evil.sh", true);
+  expectBool("B52j: the body walk reports WHICH paths came from a body (opaque-binary stand-down)",
+    extractHeredocProgramScriptPaths(`bash <<EOF\necho hi\n"${sBodyHub}"\nEOF`).join("|") === sBodyHub &&
+    extractHeredocProgramScriptPaths(`bash "${sBodyHub}"`).length === 0, true);
 
   // ── Write gate (W) — resolveTargetTopLevel predicate ──
   const hubTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: hubR, encoding: "utf-8" }).trim());

@@ -460,6 +460,45 @@ async function partB() {
     sh('git add -A && git commit -qm "committed rail"', hub);
     expectTrue("B5e (b): a script COMMITTED in the session's own repo that runs `eval '<destructive op>'` → BLOCKED",
       blocked(await bash("bash scripts/eval-rail.sh", hub)), "was allowed");
+
+    // ── agent-infra#523: a heredoc-fed interpreter runs its BODY as a program ──
+    // MEASURED RED before the fix (2026-11 on this box): every shape below was
+    // ALLOWED while the direct control `bash <file>` was BLOCKED, because
+    // `extractScriptPath` tokenized the raw text — so the FIRST BODY TOKEN was
+    // read as the script operand (`echo`, a non-file), the content walk ran on
+    // nothing, and the file the body actually executed was never read. Each arm
+    // is a real bash shape (probe-verified: a heredoc body line executes, and a
+    // script operand on the header line makes the body its stdin DATA).
+    const bodyEvil = join(work, "body-evil.sh");
+    writeFileSync(bodyEvil, `#!/bin/bash\ngit -C "${hub}" ${RESET_VERB}\n`);
+    const bodyClean = join(work, "body-clean.sh");
+    writeFileSync(bodyClean, "#!/bin/bash\necho hi\n");
+    // A script that only DRAINS its stdin: with it as the header's operand the
+    // heredoc is that script's DATA, so the body must not be walked (#523's
+    // both-directions arm — a body is a program only when the interpreter has no
+    // script operand).
+    const layoutDump = join(work, "layout-dump.sh");
+    writeFileSync(layoutDump, "#!/bin/bash\ncat >/dev/null\n");
+    expectTrue("B7a (#523): heredoc body whose FIRST line is the script → BLOCKED",
+      blocked(await bash(`bash <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7b (#523): heredoc body with a BENIGN first line → BLOCKED (the reported defect)",
+      blocked(await bash(`bash <<EOF\necho hi\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7c (#523): quoted delimiter + benign first line → BLOCKED",
+      blocked(await bash(`sh <<'X'\necho hi\n"${bodyEvil}"\nX`, hub)), "was allowed");
+    expectTrue("B7d (#523): the body PIPED into the interpreter → BLOCKED",
+      blocked(await bash(`cat <<'EOF' | bash\necho hi\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7e (#523): `<<-` tab-stripped body → BLOCKED",
+      blocked(await bash(`bash <<-EOF\n\techo hi\n\t"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7f (#523): a nested interpreter inside the body → BLOCKED",
+      blocked(await bash(`bash <<EOF\nbash "${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7g (#523): TWO files in one body — the SECOND is dirtied → BLOCKED (one path per command was not enough)",
+      blocked(await bash(`bash <<EOF\ntrue\n"${bodyClean}"\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7h (#523) control: a body that executes a HARMLESS script stays ALLOWED",
+      allowed(await bash(`bash <<EOF\necho hi\n"${bodyClean}"\nEOF`, hub)), "was blocked");
+    expectTrue("B7i (#523) control: a DATA body (`cat`, no interpreter) stays ALLOWED",
+      allowed(await bash(`cat <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was blocked");
+    expectTrue("B7j (#523) control: `bash <<EOF script.sh` — the body is the script's STDIN DATA, not a program",
+      allowed(await bash(`bash "${layoutDump}" <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was blocked");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });

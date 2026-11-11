@@ -10622,11 +10622,62 @@ const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "ash", "
  * not execute a script FILE (inline `-c` strings are the caller's command
  * itself and are gated by the normal classifier). Only LEADING positions count
  * (env-prefix / cd / separators allowed) so `git add ./foo` never false-matches.
+ *
+ * #523: a heredoc BODY is not part of the command line, so its tokens are never
+ * script operands — see `extractScriptPaths`, which resolves the scripts a
+ * heredoc-fed interpreter's PROGRAM executes.
  * @param {string} command
  * @returns {string|null}
  */
 export function extractScriptPath(command) {
-  const tokens = _tokenize(command);
+  const paths = extractScriptPaths(command);
+  return paths.length > 0 ? paths[0] : null;
+}
+
+/** A command-position token that ENDS a simple command — the resume point for
+ *  the heredoc-program walk. `;`/`&&`/`||`/`(`/`)` are also walked over by
+ *  `_scriptInvocationAt`'s own leading scan; `|`/`&` are not, which is why the
+ *  walk skips them itself. */
+function _isScriptCommandBoundary(t) {
+  return t === ";" || t === "&&" || t === "||" || t === "|" || t === "&" || t === "(" || t === ")";
+}
+
+/** Index a program walk resumes from after the simple command starting at
+ *  `from`: the next boundary token, or tokens.length when the command runs to
+ *  the end. */
+function _nextScriptCommandAt(tokens, from) {
+  for (let k = from; k < tokens.length; k++) {
+    if (_isScriptCommandBoundary(tokens[k])) return k;
+  }
+  return tokens.length;
+}
+
+/** Shell KEYWORDS that occupy a command position without being the command
+ *  (`if true; then <cmd>`, `for f in a; do <cmd>`, `case x in a) <cmd>;; esac`).
+ *  Only the heredoc-PROGRAM walk skips them: it is looking for the programs a
+ *  body runs, so a frame word must not hide the command inside the frame. The
+ *  deliberately EXCLUDED words are the ones that are also ordinary commands
+ *  (`test`, `true`, `set`, `cd`, `eval`, `time`, `:` …) — skipping those would
+ *  move the scan onto their first ARGUMENT and read it as a script path. */
+const _PROGRAM_FRAME_WORDS = new Set([
+  "if", "then", "elif", "else", "fi", "while", "until", "do", "done",
+  "for", "in", "case", "esac", "!", "{", "}",
+]);
+
+/**
+ * Resolve the script FILE the simple command at `tokens[i0]` executes.
+ *
+ * Returns `{ path, next }`: `path` is the script operand (or null), and `next`
+ * is the index a PROGRAM walk resumes from (the next command boundary). Only
+ * `path` is read by `extractScriptPath`, so the command-line semantics are
+ * exactly what they were — the resume index exists for the heredoc-body walk,
+ * which must see every command in a program, not just the first (#523).
+ * @param {string[]} tokens
+ * @param {number} i0
+ * @returns {{path: string|null, next: number}}
+ */
+function _scriptInvocationAt(tokens, i0) {
+  const done = (path, from) => ({ path, next: _nextScriptCommandAt(tokens, from) });
   // Reviewer round-5 P2 regression guard: basename matching must apply ONLY to
   // ABSOLUTE tokens (`/bin/sh`, `/usr/bin/env`). Matching a RELATIVE token's
   // basename retired the M4 script-content closure for colliding names —
@@ -10634,7 +10685,7 @@ export function extractScriptPath(command) {
   // `./time`, so the script was never read.
   const isSpawnerTok = (x) => SPAWNER_WORDS.has(x) || (String(x).startsWith("/") && SPAWNER_WORDS.has(basename(String(x))));
   const isShellTok = (x) => SHELL_INTERPRETERS.has(x) || (String(x).startsWith("/") && SHELL_INTERPRETERS.has(basename(String(x))));
-  let i = 0;
+  let i = i0;
   while (i < tokens.length) {
     const t = tokens[i];
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }   // env prefix
@@ -10668,9 +10719,12 @@ export function extractScriptPath(command) {
     if (t === "&&" || t === ";" || t === "||") { i++; continue; } // separators
     if (t === "(" || t === ")") { i++; continue; }                 // #347: subshell wrappers
     if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(t) || t === "<&" || /^[<>]&/.test(t)) { i++; continue; } // round-17: fd-dup/close prefixes
+    // A non-script command word ENDS the leading scan: the token itself is
+    // resolved below (it may be the interpreter), and a program walk resumes at
+    // the separator that ends this simple command.
     break;
   }
-  if (i >= tokens.length) return null;
+  if (i >= tokens.length) return { path: null, next: tokens.length };
   const t = tokens[i];
   if (isShellTok(t)) { // abs path: `/bin/sh evil.sh`
     // (#444) The script operand is the FIRST non-flag, non-redirect positional
@@ -10714,14 +10768,19 @@ export function extractScriptPath(command) {
       if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(n)) { j++; continue; } // fd-dup/close — no operand
       if (n === "<(" || n.startsWith("<(")) { sawProcessSub = true; j++; continue; } // process substitution FD
       if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n)) {
-        if (n === "<" || n === "<<" || n === "0<" || n === "0<<") {
-          stdinOperand = tokens[j + 1]; // the stdin file — the program only with -s, or without a script positional
+        // `<<` (§523): the next token is a HEREDOC DELIMITER, not a file — the
+        // program it feeds is the BODY, which is not on this command line at
+        // all (`_heredocSplitForScripts` removes it before tokenizing). Reading
+        // the delimiter as a stdin file made `bash <<EOF` resolve `EOF` (a
+        // phantom path), and made the body's first token look like the script.
+        if (n === "<" || n === "0<") {
+          stdinOperand = tokens[j + 1]; // the stdin FILE — the program with -s, or with no script positional
         }
         j += 2;
         continue;
       }
-      if (_isShellBoundary(n)) break;
-      if (sawDoubleDash) return n; // after `--` ANY operand is the script (dash-leading too)
+      if (_isShellBoundary(n)) break; // fall through: a stdin operand seen so far IS the program (B34/B36)
+      if (sawDoubleDash) return done(n, j); // after `--` ANY operand is the script (dash-leading too)
       if (n === "--") { sawDoubleDash = true; j++; continue; }
       if (n === "-c" || n === "--command" || n.startsWith("--command=")) {
         sawInline = true;
@@ -10750,21 +10809,152 @@ export function extractScriptPath(command) {
       // A non-flag, non-redirect operand:
       if (sawInline) { j++; continue; } // -c: $0/$1 args — never a script file
       if (sawDashS) { j++; continue; }  // -s: $0/$1 — the program is stdin (redirect seen above)
-      return n;                         // THE script — later tokens are its args ($1…)
+      return done(n, j);                // THE script — later tokens are its args ($1…)
     }
-    if (sawInline) return null; // `-c 'inline'` — gated by the normal classifier
-    if (sawProcessSub) return null; // `bash <(echo 'git …')` — FD, not a file (fail-closed via _unverifiableGitContent)
+    if (sawInline) return done(null, i); // `-c 'inline'` — gated by the normal classifier
+    if (sawProcessSub) return done(null, i); // `bash <(echo 'git …')` — FD, not a file (fail-closed via _unverifiableGitContent)
     // No script positional: a stdin redirect's operand IS the program —
     // `bash < evil.sh`, and with -s the ONLY program source (`bash -s < f
-    // arg1` → f; arg1 is $1, #437 round-13 VGATE sub-case).
-    return stdinOperand && !stdinOperand.startsWith("-") ? stdinOperand : null;
+    // arg1` → f; arg1 is $1, #437 round-13 VGATE sub-case). A HEREDOC's operand
+    // (its delimiter) is deliberately not a candidate — the program is the
+    // body, resolved by `extractHeredocProgramScriptPaths` (#523).
+    return done(stdinOperand && !stdinOperand.startsWith("-") ? stdinOperand : null, i);
   }
   if (t === ".") { // `. script`
     const next = tokens[i + 1];
-    return next && !next.startsWith("-") ? next : null;
+    return done(next && !next.startsWith("-") ? next : null, i);
   }
-  if (/^\.{0,2}\//.test(t)) return t; // ./x.sh or /abs/x.sh direct execution
-  return null;
+  if (/^\.{0,2}\//.test(t)) return done(t, i); // ./x.sh or /abs/x.sh direct execution
+  return done(null, i);
+}
+
+/**
+ * Split a command at its heredoc regions for the script-path walk (#523).
+ *
+ * `header` is the command with every heredoc BODY blanked — line-for-line, so
+ * line numbers and offsets are unchanged — and `bodies` carries each body's
+ * text, its consumer kind (`_wtHeredocKind`: `"shell"` = a shell EXECUTES the
+ * body, `"code"` = a non-shell interpreter does, `null` = a positively
+ * identified DATA consumer) and `program`: true when the body IS the program
+ * the interpreter runs, i.e. the opener line hands it no script operand.
+ *
+ * Why the header matters: a heredoc body is NOT part of the command line. The
+ * old walk tokenized the raw text, so the tokens after `<<DELIM` were scanned
+ * as if they were command-line words — `bash <<EOF` with a body whose first
+ * line is `echo hi` resolved `echo` (a non-file), the content gate no-opped,
+ * and every file the body actually executed went unread (#523, measured:
+ * `bash <<EOF` + `/tmp/evil.sh` ALLOWED while `bash /tmp/evil.sh` BLOCKED).
+ * @param {string} command
+ * @returns {{header: string, bodies: Array<{kind: string|null, text: string, program: boolean}>}}
+ */
+function _heredocSplitForScripts(command) {
+  const text = String(command ?? "");
+  // Cheap superset bail: no `<<` anywhere means no heredoc (and `<<<` here-strings
+  // are not heredocs to `_wtScanLine`, which emits them as `<<` + `<`).
+  if (!text.includes("<<")) return { header: text, bodies: [] };
+  const header = [];
+  const bodies = [];
+  const carry = { quote: null, arith: 0 };
+  let pending = null;
+  for (const line of text.split("\n")) {
+    if (pending) {
+      if (line.trim() === pending.delim) {
+        bodies.push({ kind: pending.kind, text: pending.buf.join("\n"), program: pending.program });
+        header.push("");
+        pending = null;
+        continue;
+      }
+      pending.buf.push(line);
+      header.push("");
+      continue;
+    }
+    const { text: code, delim } = _wtScanLine(line, carry);
+    header.push(code);
+    if (delim !== null) {
+      const kind = _wtHeredocKind(code);
+      // `bash <<EOF script.sh` — the operand IS the script and the body is its
+      // stdin DATA (probe-verified against real bash). Only a body with NO
+      // script operand on its header line is the interpreter's program.
+      const operand = kind === "shell" ? _scriptInvocationAt(_tokenize(code), 0).path : null;
+      pending = { delim, kind, program: operand === null, buf: [] };
+    }
+  }
+  // Unterminated heredoc: bash feeds the rest of the text to the interpreter as
+  // the body, so the trailing lines are program text, not command-line tokens.
+  if (pending) bodies.push({ kind: pending.kind, text: pending.buf.join("\n"), program: pending.program });
+  return { header: header.join("\n"), bodies };
+}
+
+/**
+ * Every script FILE a heredoc-fed SHELL interpreter's program executes (#523).
+ *
+ * The body is a PROGRAM, not a command line, so every command position in it is
+ * walked (line breaks and `;`/`&&`/`||`/`|` are command boundaries there, and
+ * control-flow frame words are skipped). Nested heredocs inside a body are
+ * followed to a depth bound, and a body that is not a shell program (python
+ * `<<PY` is the #627 code surface; `cat`'s heredoc is data) contributes
+ * nothing.
+ * @param {string} bodyText
+ * @param {number} depth
+ * @returns {string[]}
+ */
+function _programScriptPaths(bodyText, depth = 0) {
+  const out = [];
+  const { header, bodies } = _heredocSplitForScripts(bodyText);
+  const tokens = _tokenize(header, { newlineIsSeparator: true });
+  let i = 0;
+  while (i < tokens.length) {
+    while (i < tokens.length && (_isScriptCommandBoundary(tokens[i]) || _PROGRAM_FRAME_WORDS.has(tokens[i]))) i++;
+    if (i >= tokens.length) break;
+    const { path, next } = _scriptInvocationAt(tokens, i);
+    if (path) out.push(path);
+    i = next > i ? next : i + 1; // never spin on a zero-width advance
+  }
+  if (depth < 2) {
+    for (const b of bodies) {
+      if (b.kind === "shell" && b.program) out.push(..._programScriptPaths(b.text, depth + 1));
+    }
+  }
+  return out;
+}
+
+/**
+ * The script FILES a heredoc body executes, for the consumers that gate EVERY
+ * one of them rather than the first (#523). `extractScriptPaths` already
+ * includes these; this export exists so a caller can tell a body-resolved path
+ * apart from a command-line one (a body-resolved file is executed BY THE SHELL,
+ * so its bytes can never be dismissed as an opaque binary — bash falls back to
+ * reading an ENOEXEC file as a shell script).
+ * @param {string} command
+ * @returns {string[]}
+ */
+export function extractHeredocProgramScriptPaths(command) {
+  const out = [];
+  const { bodies } = _heredocSplitForScripts(command);
+  for (const b of bodies) {
+    if (b.kind === "shell" && b.program) out.push(..._programScriptPaths(b.text));
+  }
+  return [...new Set(out)];
+}
+
+/**
+ * Every script FILE this command executes, in resolution order: the command
+ * line's leading script invocation first (at most one — the
+ * one-script-per-command-line class is #3538, and is deliberately NOT this
+ * surface), then every script execution in each heredoc body a shell
+ * interpreter reads as its PROGRAM.
+ * @param {string} command
+ * @returns {string[]}
+ */
+export function extractScriptPaths(command) {
+  const { header, bodies } = _heredocSplitForScripts(command);
+  const out = [];
+  const lead = _scriptInvocationAt(_tokenize(header), 0).path;
+  if (lead) out.push(lead);
+  for (const b of bodies) {
+    if (b.kind === "shell" && b.program) out.push(..._programScriptPaths(b.text));
+  }
+  return [...new Set(out)];
 }
 
 /**

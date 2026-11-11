@@ -210,6 +210,15 @@ let hasDotGitAncestor: (p: string) => boolean = () => false;
 // is spent, which is the pre-#608 behaviour and can never false-block.
 let branchDeleteNames: (verb: string, args?: string[]) => string[] | null = () => null;
 let extractScriptPath: (command: string) => string | null = () => null;
+// #523: EVERY script file a command executes, and the subset a heredoc BODY
+// executes. Defaults DERIVE from `extractScriptPath` (resolved at call time), so
+// a stale/short classify-git degrades to exactly the pre-#523 behaviour instead
+// of gating nothing — never fail-open.
+let extractScriptPaths: (command: string) => string[] = (command) => {
+  const p = extractScriptPath(command);
+  return p ? [p] : [];
+};
+let extractHeredocProgramScriptPaths: (command: string) => string[] = () => [];
 let extractScriptArgs: (command: string, scriptPath: string) => string[] = () => [];
 let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null, opts?: { viaInterpreter?: boolean }) => "allow" | "block" = () => "allow";
 // #1485: does the invocation hand the file to an INTERPRETER (text) or execute
@@ -412,6 +421,14 @@ try {
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
   if (typeof _m5.extractScriptArgs === "function") extractScriptArgs = _m5.extractScriptArgs;
+  // #523: the heredoc-PROGRAM walk (a heredoc-fed interpreter's BODY is a
+  // program, and its script executions must be content-gated like the command
+  // line's). Same skew contract: a stale module leaves the defaults above,
+  // which are the pre-#523 single-path behaviour.
+  if (typeof _m5.extractScriptPaths === "function") extractScriptPaths = _m5.extractScriptPaths;
+  if (typeof _m5.extractHeredocProgramScriptPaths === "function") {
+    extractHeredocProgramScriptPaths = _m5.extractHeredocProgramScriptPaths;
+  }
   // Stale-classify-git skew guard: a missing export must leave the fail-safe
   // defaults (never overwrite a function with undefined → TypeError on the
   // write branch).
@@ -5061,8 +5078,37 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
       return null; // resolved inline code invocation — no shell script to gate
     }
     if (code) return null; // non-inline code form — out of #627 scope (residual)
-    const scriptPath = extractScriptPath(command);
-    if (!scriptPath) return null;
+    // #523: gate EVERY script FILE the command executes. The command LINE
+    // contributes at most one (unchanged — that class is #3538), but a
+    // heredoc-fed interpreter runs its BODY as a PROGRAM, and a program can
+    // execute several files. Measured before this change: `bash <<EOF` with a
+    // body whose first line is `echo hi` and whose second is `/tmp/evil.sh`
+    // resolved `echo` — a non-file — so the content gate ran on nothing and the
+    // file the body actually executed was never read.
+    const scriptPaths = extractScriptPaths(command);
+    if (scriptPaths.length === 0) return null;
+    // A path a heredoc BODY executes is executed BY THE SHELL, so its bytes are
+    // never an "opaque binary" — bash reads an ENOEXEC file as a shell script
+    // (#1485's `isOpaqueExecutablePath` stand-down must not apply to it).
+    const bodyScriptPaths = new Set(extractHeredocProgramScriptPaths(command));
+    for (const scriptPath of scriptPaths) {
+      const blocked = _gateScriptPathContent(command, scriptPath, execCwd, bodyScriptPaths.has(scriptPath));
+      if (blocked) return blocked;
+    }
+    return null;
+  } catch {
+    return null; // fail-silent — never block on read/stat errors
+  }
+}
+
+// #523: the per-script content gate. Lifted verbatim out of `_backdoorBlock`
+// (body indentation preserved, so the move is one reviewable hunk rather than a
+// reindent) so it can run once per script the command executes — a heredoc body
+// is a program and may execute several. Returns the block REASON, or null when
+// this script is clean. `viaBody` marks a path a heredoc body executes: the
+// shell reads such a file as a program however its bytes begin, so the
+// opaque-binary stand-down (#1485) does not apply.
+function _gateScriptPathContent(command: string, scriptPath: string, execCwd: string | undefined, viaBody: boolean): string | null {
     // #347: resolve the script path + content gating against the command's
     // EXECUTION cwd (cd-resolved), not the session cwd — a hub session running
     // `cd <wt> && bash x.sh` resolves x.sh inside the worktree.
@@ -5129,7 +5175,11 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // #1485 (review cycle 3): a magic header does not make a file a binary when a
     // SHELL is asked to read it — `bash x` strips the first line and runs the rest,
     // so a `printf`-prefixed script skipped the walk entirely. The invocation decides.
-    const viaInterpreter = scriptIsInterpreted(command, scriptPath);
+    // #523: a heredoc BODY executes its files THROUGH the shell, so the
+    // interpreter verdict is forced — bash reads an ENOEXEC file as a shell
+    // script, and `scriptIsInterpreted` cannot see an interpreter in front of a
+    // body line (there isn't one in argv).
+    const viaInterpreter = viaBody || scriptIsInterpreted(command, scriptPath);
     if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd()), scriptArgs, { viaInterpreter }) === "block") {
       // #743: label the SCRIPT's own checkout, not the session's. A linked
       // worktree's copy is not "the shared main checkout", and the old message
@@ -5163,9 +5213,6 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
       ].join("\n");
     }
     return null;
-  } catch {
-    return null; // fail-silent — never block on read/stat errors
-  }
 }
 
 const WHY = [
