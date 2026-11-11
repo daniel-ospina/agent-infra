@@ -6033,9 +6033,10 @@ export default function (pi: ExtensionAPI) {
             // from persisted config, `git -c alias.x=$VAR x`, a `git-foo`
             // command). git expands it inside its own process, so no arm here
             // can name the command that runs — decideM3 refuses it in a shared
-            // main checkout (fail closed). classifyBranchOp is told, rather
+            // main checkout (fail closed). classifyBranchOp is TOLD, rather
             // than the refusal living here, so there is still ONE verdict
-            // function and the worktree exemption above keeps applying.
+            // function and the worktree exemption below still applies (a
+            // worktree-scoped invocation is exempted before decideM3 runs).
             aliasOpaque: mu.aliasOpaque === true,
           });
           if (!branchOp || branchOp.op === "other") continue;

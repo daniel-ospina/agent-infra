@@ -473,6 +473,54 @@ ok("branchOp #594: an opaque alias indirection → alias-opaque", (() => {
   const r = classifyBranchOp("br", [], { aliasOpaque: true });
   return r.op === "alias-opaque" && r.name === "br";
 })());
+
+// ── #594 CROSS-LAYER PIN: the CLI classifier and this module must agree ──
+// `symbolic-ref`/`update-ref` WRITE detection exists twice on purpose (this
+// module must not import classify-git.mjs — #99 degradation contract, stated in
+// the module header). The two copies are what determines whether the M3 gate is
+// ENTERED at all (classify-git: branchState/stateMutations) and what it then
+// DECIDES (this module: classifyBranchOp). A lag in either direction is silent:
+// branchState true + op "other" skips the gate, and branchState false never
+// reaches it. So the matrix is asserted against BOTH layers.
+const cg = await import("../main-worktree-guard/classify-git.mjs");
+const REF_MATRIX = [
+  ["symbolic-ref", ["refs/heads/victim", "refs/heads/main"], true],
+  ["symbolic-ref", ["-m", "why", "refs/heads/victim", "refs/heads/main"], true],
+  ["symbolic-ref", ["-d", "refs/heads/victim"], true],
+  ["symbolic-ref", ["--del", "refs/heads/victim"], true],
+  ["symbolic-ref", ["-m", "why", "HEAD", "refs/heads/x"], true],
+  ["symbolic-ref", ["HEAD", "refs/heads/x"], true],
+  ["symbolic-ref", ["refs/heads/main"], false],
+  ["symbolic-ref", ["HEAD"], false],
+  ["symbolic-ref", ["-q", "--short", "HEAD"], false],
+  ["symbolic-ref", ["refs/remotes/origin/HEAD", "refs/heads/main"], false],
+  ["update-ref", ["refs/heads/x", "HEAD"], true],
+  ["update-ref", ["-m", "why", "refs/heads/x", "HEAD"], true],
+  ["update-ref", ["-d", "refs/heads/x"], true],
+  ["update-ref", ["--stdin"], true],
+  ["update-ref", ["--stdin", "-z"], true],
+  ["update-ref", ["refs/tags/v1", "HEAD"], false],
+  ["update-ref", ["-m", "why", "refs/tags/v1", "HEAD"], false],
+];
+const cliWrite = (verb, args) => (verb === "symbolic-ref"
+  ? cg.symbolicRefWriteTarget(args)
+  : cg.updateRefWriteTarget(args));
+const cliSaysWrite = (verb, args) => {
+  const w = cliWrite(verb, args);
+  if (!w) return false;
+  return verb === "symbolic-ref" ? (w.name === "HEAD" || w.branch !== null) : true;
+};
+const opSaysWrite = (verb, args) => {
+  const r = classifyBranchOp(verb, args);
+  return r.op === "ref-write" || r.op === "switch-existing";
+};
+for (const [verb, args, isWrite] of REF_MATRIX) {
+  const label = `${verb} ${args.join(" ")}`;
+  ok(`#594 cross-pin: classify-git sees a write=${isWrite} for \`${label}\``,
+    cliSaysWrite(verb, args) === isWrite);
+  ok(`#594 cross-pin: classifyBranchOp agrees (write=${isWrite}) for \`${label}\``,
+    opSaysWrite(verb, args) === isWrite);
+}
 ok("branchOp: branch -f", op("branch", ["-f", "x", "main"]) === "force");
 // #591: git merges NOARG shorts into one cluster (`-fq` ≡ `-f -q`; force short
 // anywhere in the run) and --force accepts its unambiguous abbreviation --forc.
