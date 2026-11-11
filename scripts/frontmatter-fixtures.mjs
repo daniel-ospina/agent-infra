@@ -437,6 +437,106 @@ export const FIXTURES = [
     }
   },
   {
+    "id": "throw-block-header-nospace-token",
+    "class": "throw-invalid-block-header",
+    "expected": [
+      "throw-invalid-block-header",
+      "throw-bare-key"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: |x\n  line1\n---\nbody\n",
+    "note": "#458 — `|x` indicator + no-space token tail (\"Block scalar header includes extra characters\")",
+    "piConsequence": {
+      "parseErr": "Block scalar header includes extra characters: |x at line 2, column 15:",
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "Block scalar header includes extra characters: |x at line 2, column 15:"
+      ]
+    }
+  },
+  {
+    "id": "throw-block-header-nospace-word",
+    "class": "throw-invalid-block-header",
+    "expected": [
+      "throw-invalid-block-header",
+      "throw-bare-key"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: |comment\n  line1\n---\nbody\n",
+    "note": "#458 — `|comment` no-space word tail (the `| comment` space form is #370; this is the adjacent form)",
+    "piConsequence": {
+      "parseErr": "Block scalar header includes extra characters: |comment at line 2, column 15:",
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "Block scalar header includes extra characters: |comment at line 2, column 15:"
+      ]
+    }
+  },
+  {
+    "id": "throw-block-header-nospace-fold",
+    "class": "throw-invalid-block-header",
+    "expected": [
+      "throw-invalid-block-header",
+      "throw-bare-key"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: >text\n  line1\n---\nbody\n",
+    "note": "#458 — folded `>text` no-space tail (the folded sibling of `|x`)",
+    "piConsequence": {
+      "parseErr": "Block scalar header includes extra characters: >text at line 2, column 15:",
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "Block scalar header includes extra characters: >text at line 2, column 15:"
+      ]
+    }
+  },
+  {
+    "id": "throw-block-header-nospace-comment",
+    "class": "throw-invalid-block-header",
+    "expected": [
+      "throw-invalid-block-header",
+      "throw-bare-key"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: |#c\n  line1\n---\nbody\n",
+    "note": "#458 — `|#c` unseparated comment (\"Comments must be separated from other tokens by white space characters\"); `| #c` stays legal, pinned above",
+    "piConsequence": {
+      "parseErr": "Comments must be separated from other tokens by white space characters at line 2, column 15:",
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "Comments must be separated from other tokens by white space characters at line 2, column 15:"
+      ]
+    }
+  },
+  {
+    "id": "throw-block-header-nospace-chomp-comment",
+    "class": "throw-invalid-block-header",
+    "expected": [
+      "throw-invalid-block-header",
+      "throw-bare-key"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: |-#c\n  line1\n---\nbody\n",
+    "note": "#458 — `|-#c` chomp then unseparated comment (the chomp modifier must not mask the whitespace rule)",
+    "piConsequence": {
+      "parseErr": "Comments must be separated from other tokens by white space characters at line 2, column 16:",
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "Comments must be separated from other tokens by white space characters at line 2, column 16:"
+      ]
+    }
+  },
+  {
     "id": "throw-reserved-at",
     "class": "throw-reserved-char-start",
     "expected": [
@@ -1688,6 +1788,96 @@ export const FIXTURES = [
       "loaded": true,
       "name": "x",
       "description": "folded text\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-explicit-comment",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |1 #c\n  line1\n---\nbody\n",
+    "note": "#458 pin — explicit-indent header + SPACED comment stays legal (guards the guard against |1x over-reach)",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": " line1\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-chomp-comment",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |- #c\n  line1\n---\nbody\n",
+    "note": "#458 pin — chomp header + SPACED comment stays legal (the legal twin of the `|-#c` fixture)",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-indent-chomp",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |2+\n  line1\n---\nbody\n",
+    "note": "#458 — indent-then-chomp `|2+` (keep) is a valid header; the twin of `|+2`",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-indent-chomp-strip",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |2-\n  line1\n---\nbody\n",
+    "note": "#458 — indent-then-chomp `|2-` (strip) is a valid header",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-indent-chomp-fold",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: >1-\n line1\n---\nbody\n",
+    "note": "#458 — folded indent-then-chomp `>1-` is a valid header",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-indent-chomp-comment",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |2+ #c\n  line1\n---\nbody\n",
+    "note": "#458 — indent-then-chomp + SPACED comment stays legal (both boundaries at once)",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1\n",
       "diagnostics": []
     }
   },

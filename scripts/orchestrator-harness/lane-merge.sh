@@ -766,7 +766,11 @@ checks_read() { # checks_read <head> [--full]
   local q="repos/$OR/commits/$head/check-runs?per_page=100&filter=all"
   local rows='(.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // ""), (.id // 0), (.app.slug // "")] | @tsv)'
   if [ "$full" = "--full" ]; then
-    gh api "$q" --paginate --jq "$rows" 2>/dev/null
+    # ⛔ NO 2>/dev/null ON THIS ONE (#3858). The single-page poll above can stay quiet — its TOTAL row
+    # already answers "is this all of it" — but on the PAGINATED path the read's own stderr is the only
+    # place the reason a page stream stopped exists, and suppressing it left an operator looking at a
+    # held head with nothing to act on. The caller routes it to a file and prints the first line.
+    gh api "$q" --paginate --jq "$rows"
     return $?
   fi
   # One page, plus the total as a 2-field TSV row so the caller can tell "this page is all of it"
@@ -1795,7 +1799,10 @@ esac
 # Wait for THIS head's checks to be terminal, bounded, printing progress so the lane never looks
 # wedged and so a human reading the transcript can see it is making progress and not hung.
 CHECK_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks.XXXXXX")" || exit 2
-trap 'rm -f "$CHECK_TMP"' EXIT
+# Where the FULL (paginated) check-run read's stderr lands, so a read that stopped early can say why
+# (#3858). Separate from CHECK_TMP because that one is the classifier's input.
+CHECK_ERR_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks-err.XXXXXX")" || { rm -f "$CHECK_TMP"; exit 2; }
+trap 'rm -f "$CHECK_TMP" "$CHECK_ERR_TMP"' EXIT
 # ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S **REMAINING** WALL CLOCK, NOT JUST THE WHOLE OF IT
 # (#3584 review, P1 — verified). `deadline` was `now + WAIT_S` and nothing compared it with how much of
 # `LANE_WALL_S` THIS lane had already spent. At the shipped numbers a lane entering its merge phase more
@@ -1910,7 +1917,29 @@ fi
 _wait_t0="$(date +%s)"
 deadline=$(( _wait_t0 + WAIT_S ))
 while :; do
-  rows="$(checks_read "$HEAD")"
+  # ⛔ A CHECK-RUN READ THAT DID NOT FINISH IS NOT A MEASUREMENT — AND ON THIS LOOP IT FLIPS THE
+  # VERDICT (#3858). Both reads below hand their rows to `classify`, which derives GREEN from the rows
+  # it is GIVEN (`IF=0` + empty RED over whatever arrived) — so a read that dropped rows drops the
+  # PENDING ones with them, a head with queued runs looks terminal-and-clean, and the loop `break`s,
+  # which is the ONLY path to `launch_chain`. Measured on a fixture (issue #3858, 2026-11-09): page 2
+  # held `redjob failure`, page 1 held one green row, and origin/main launched the merge chain on that
+  # unmeasured head; the same fixture with page 2 delivered exited 10 FIX_REQUIRED. The missing page IS
+  # the difference between the two verdicts, so this is a false PASS in the merge gate, not a partial
+  # log line. The verdict was reproducible because the read's exit status was DISCARDED here and no
+  # row count was ever compared with the TOTAL the single-page read had just returned: completeness was
+  # assumed from having ASKED for more.
+  # ⛔ BOTH HALVES ARE NEEDED AND NEITHER SUBSTITUTES FOR THE OTHER: the exit status catches a read
+  # that FAILED (a secondary rate limit, a 502 on page 2, a broken pipe), and the COUNT catches one
+  # that exited 0 having silently dropped rows — which is why the exit-status fix alone is not the fix.
+  # The count assertion is also the external convention: GitHub's REST check-runs response carries
+  # `total_count`, and comparing the flattened row count against it (fail closed on a mismatch) is how
+  # a pagination is known to have ended. Same shape this repo's own graph reads adopted — a `truncated:`
+  # marker rather than silence.
+  # ⛔ FAIL-CLOSED DIRECTION: a truncated/undetermined read is HELD (IF=1, RED empty, retried next
+  # poll, reported WAITING_CHECKS at the bound) — the bucket an unreadable classification already uses.
+  # It is never green, and the loop's own bound keeps a held head from waiting for ever.
+  _read_rc=0
+  rows="$(checks_read "$HEAD")"; _read_rc=$?
   # The single-page read carries a TOTAL line so "this page is all of it" is distinguishable from
   # "there is more". Only then pay for the full paginated read (the rare case), and never let the
   # TOTAL line itself reach the classifier — a head with 0 check-runs would otherwise classify as
@@ -1919,10 +1948,35 @@ while :; do
   # would arrive with 5 fields — matching it here would read a status string as a count.
   total="$(printf '%s\n' "${rows:-}" | awk -F'\t' '$1=="TOTAL" && NF==2 {print $2; exit}')"
   rows="$(printf '%s\n' "${rows:-}" | awk -F'\t' 'NF>=4')"
-  if [ -n "${total:-}" ] && [ "$total" -gt 100 ] 2>/dev/null; then
-    rows="$(checks_read "$HEAD" --full)"
+  _undet=""; _n=0
+  if [ "$_read_rc" -ne 0 ]; then
+    # A non-zero exit can still have printed rows (the shim writes as it goes), and none of them can
+    # be trusted as the whole set. On a SUCCESSFUL single page the TOTAL row is always present, so
+    # "no TOTAL and rc 0" is not a reachable state in production and "no TOTAL" needs no arm here.
+    _undet="the single-page check-run read FAILED (exit ${_read_rc})"
+  elif [ -n "${total:-}" ] && [ "$total" -gt 100 ] 2>/dev/null; then
+    : > "$CHECK_ERR_TMP"
+    _full_rc=0
+    rows="$(checks_read "$HEAD" --full 2>"$CHECK_ERR_TMP")"; _full_rc=$?
+    # Count the rows the classifier will actually see (NF>=4, exactly its own predicate). A job name
+    # carrying an embedded newline can only ever DEFLATE this count, and a deflated count holds — the
+    # safe direction. Growth (check-runs created between the two reads) is expected and allowed.
+    _n="$(printf '%s\n' "${rows:-}" | awk -F'\t' 'NF>=4 {n++} END{print n+0}')"
+    if [ "$_full_rc" -ne 0 ]; then
+      _undet="the FULL (paginated) check-run read FAILED (exit ${_full_rc}) after ${_n} of ${total} rows"
+    elif [ "${_n:-0}" -lt "$total" ]; then
+      _undet="the FULL (paginated) check-run read returned ${_n} of ${total} rows, so it was TRUNCATED"
+    fi
   fi
-  if [ -z "${rows:-}" ]; then
+  if [ -n "$_undet" ]; then
+    log_line "… ${_undet} at head ${HEAD:0:12} — a partial read is not a measurement, so this head is HELD (a truncation never reads as green)"
+    # Say WHY the read stopped, once: the read's own stderr is the only place that reason exists.
+    if [ -s "$CHECK_ERR_TMP" ]; then
+      _why="$(head -1 "$CHECK_ERR_TMP" 2>/dev/null)"
+      [ -n "$_why" ] && say_err "lane-merge:   the read said: ${_why:0:400}"
+    fi
+    IF=1; RED=""
+  elif [ -z "${rows:-}" ]; then
     # An EMPTY check-run set is not a green set: nothing has been measured. Keep polling (this is
     # the "a queued run is not a green run" rule at its surface), and the bound below reports it.
     log_line "… no check-runs reported for head ${HEAD:0:12} yet — a queued run is not a green run"
@@ -1997,6 +2051,15 @@ while :; do
     # four ways AFTER the constant is read (watchdog allowance, remaining wall clock, a lost heartbeat,
     # the seam), so a line rendered from `WAIT_S` would name a bound that never fired.
     _waited=$(( now - _wait_t0 ))
+    # ⛔ A HELD HEAD IS NOT AN IN-FLIGHT ONE (#3858). When the last read could not be completed, the
+    # in-flight count is this loop's own placeholder, so quoting it as "still in flight" would report a
+    # state nobody measured. Name the read failure instead.
+    if [ -n "${_undet:-}" ]; then
+      log_line "… this head's checks could NOT be measured after ${_waited}s (${_undet}) — re-run this script; nothing was merged"
+      disposition WAITING_CHECKS
+      verdict WAITING_CHECKS "check-run read incomplete after ${_waited}s: ${_undet}"
+      exit 11
+    fi
     log_line "… checks still IN FLIGHT (${IF}) after ${_waited}s — re-run this script; nothing was merged"
     disposition WAITING_CHECKS
     verdict WAITING_CHECKS "checks still in flight after ${_waited}s"

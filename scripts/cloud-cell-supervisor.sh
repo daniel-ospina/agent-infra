@@ -3513,7 +3513,7 @@ cmd_check() {
     if [ ! -f "$rpath" ] || [ ! -s "$rpath" ] || [ ! -x "$rpath" ]; then rmissing="$rmissing $rname"; fi
   done
   if [ -n "$rmissing" ]; then
-    die "the LANDING RAIL is incomplete under $rdir — missing, empty or non-executable:$rmissing. Step 4 (record-review.sh) can mint a clean record but step 5 (admin-merge.sh) has no runnable path, so every lane on this cell would finish its review and stall at the last step (agent-infra#2176). 'start' provisions all four from $(rail_src_dir), or: for f in $(rail_names); do cp '$(rail_src_dir)/'\"\$f\" '$rdir/'; chmod +x '$rdir'/\"\$f\"; done"
+    die "the LANDING RAIL is incomplete under $rdir — missing, empty or non-executable:$rmissing. Step 4 (record-review.sh) can mint a clean record but step 5 (admin-merge.sh) has no runnable path, so every lane on this cell would finish its review and stall at the last step (agent-infra#2176). 'start' provisions all four from $(rail_src_dir), or: for f in $(printf '%s ' $(rail_names)); do cp '$(rail_src_dir)/'\"\$f\" '$rdir/'; chmod +x '$rdir'/\"\$f\"; done"
   fi
   log_line "ok: landing rail present and executable (admin-merge.sh + ci-failure-set.sh + ci_exemption.py + ci-workflow-pr-evaluable.sh under $rdir)"
 

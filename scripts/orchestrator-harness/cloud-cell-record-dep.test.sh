@@ -297,6 +297,39 @@ printf '#!/bin/bash\nexit 0\n' > "$RECORDER"; chmod +x "$RECORDER"
 RECORDER_LIB="$CELL_HOME/.pi/agent/scripts/lib/diff-normalize.py"
 mkdir -p "$(dirname "$RECORDER_LIB")"
 printf '#!/usr/bin/env python3\n' > "$RECORDER_LIB"; chmod +x "$RECORDER_LIB"
+# ── THE LANDING RAIL (#2176/#3889), beside the recorder it lands AFTER ──────────────
+# ⛔ THE FIXTURE CELL MUST CARRY THE RAIL CLOSURE, or every `cmd_check` below dies BEFORE the recorder
+# probe this suite exists for. Step 5 of the landing contract is `admin-merge.sh` PLUS the three helpers
+# it execs from its own directory (`ci-failure-set.sh`, `ci_exemption.py`, `ci-workflow-pr-evaluable.sh`),
+# and `cmd_check` refuses a cell whose closure is incomplete — "the recorder exists" is not "the cell can
+# land" (#2176). #3889 landed that refusal AFTER this fixture was written and did not seed it here, so
+# the fixture's cell stopped being a CELL: measured on `origin/main` (identical file — this is base-owned,
+# not a property of the change under test) it is 65 passed / 56 failed, and every one of the 56 is the
+# LANDING RAIL `die` firing before the arm's own subject. Same on a clean CI runner (`bash-suites (4)`).
+# The set is DERIVED from the shipped supervisor, never hand-copied: a fifth rail file must reach this
+# fixture automatically, or the arms would exercise an incomplete-rail refusal instead of their subject
+# (the rule `cloud-cell-supervisor.test.sh` already applies to its own fixtures).
+RAIL_FILES="$(awk '/^rail_names\(\)/ {
+    i = index($0, "printf"); if (!i) next
+    rest = substr($0, i)
+    sub(/^printf[^ ]* +'"'"'[^'"'"']*'"'"' +/, "", rest)
+    sub(/;[[:space:]]*}[[:space:]]*$/, "", rest)
+    print rest; exit }' "$SUP")"
+if [ -z "$RAIL_FILES" ]; then
+  echo "❌ cannot parse rail_names() out of $SUP — every cell fixture below would seed an empty rail"
+  echo "   and every certification arm would be decided by the incomplete-rail refusal."
+  exit 1
+fi
+# Seeded at BOTH ends of the delivery, mirroring a real checkout: `rail_src_dir()` is `$HARNESS/..`
+# (the `<checkout>/scripts` a cell provisions FROM), and the recorder's own directory is where `start`
+# provisions TO. Real copies rather than `exit 0` stubs: nothing in this suite EXECUTES a rail file, so
+# a stub here would only make the fixture lighter than the tree it claims to be.
+for _rail in $RAIL_FILES; do
+  for _dir in "$CELL_HARNESS/.." "$(dirname "$RECORDER")"; do
+    cp "$HERE/../$_rail" "$_dir/$_rail" && chmod +x "$_dir/$_rail" \
+      || { echo "❌ cannot seed the rail closure ($_rail) into $_dir"; exit 1; }
+  done
+done
 
 cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's stub PATH
   # `MIN_FREE_MB=1`: same class as `-u OR` below and as `GH_REPO` at the top — `cmd_check_disk` enforces
@@ -504,6 +537,28 @@ mkmrg() { # mkmrg — a fresh merge fixture: repo, HOME with a recorder, stubs, 
   # json.load never runs, the gate reads EMPTY, and the worker waits the full 30 x 30s loop before
   # exiting 4 — a fixture defect that reads as a worker hang, not as a failure.
   p="$(command -v python3 2>/dev/null)" && ln -sf "$p" "$MRG/stubs/python3"
+  # ⛔ THE MERGE REPO MUST BE A REAL GIT REPO ON THE BRANCH THE WORKER IS DRIVEN WITH (#2977/#3771).
+  # `merge-one.sh` sources `lane-report-gate.sh`, and that library UNSETS any `git` shell function
+  # before it reads — so the gate always talks to the REAL binary: `git -C "$REPO" rev-parse --git-dir`
+  # and `git -C "$REPO" worktree list --porcelain`. A plain directory makes the first fail and the gate
+  # answer 7 UNMEASURABLE, which `merge-one.sh` treats as a REFUSAL (exit 9), so EVERY merge arm below
+  # failed before the record step this suite exists for (measured: 49 of them, identically on
+  # `origin/main` — base-owned, not a property of the change under test).
+  # A real repo on `fix/x` that ships NO `tools/worktree_report.py` is what agent-infra actually is: the
+  # repo has no report writer, so the gate ABSTAINS (5 NO-CONSUMER) and the worker logs the audited
+  # "NOT ENFORCED" arm. ⛔ THE FIXTURE MUST NOT INVENT A WRITER — an abstention is the faithful shape,
+  # and seeding a consumer here would make the arms pass by exercising a gate this repo does not have.
+  # ⛔ EACH CALL IS GUARDED (review round 17, N2): an unguarded `git init` that fails leaves a PLAIN
+  # DIRECTORY, and the ~49 merge arms below then redden with the same exit-9 "lane report UNMEASURABLE"
+  # refusal this whole fixture exists to remove — a visible failure, but one whose message names the
+  # gate rather than the fixture. A named exit turns that into a diagnosis.
+  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$MRG/repo" init -q \
+    || { echo "FIXTURE: git init failed in $MRG/repo — the merge fixture cannot be built" >&2; exit 1; }
+  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    git -C "$MRG/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m fixture \
+    || { echo "FIXTURE: the empty fixture commit failed in $MRG/repo (git config/ident)" >&2; exit 1; }
+  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$MRG/repo" checkout -q -b fix/x \
+    || { echo "FIXTURE: could not create branch fix/x in $MRG/repo" >&2; exit 1; }
   : > "$MRG/pi-count"
   : > "$MRG/pr-body"
 }

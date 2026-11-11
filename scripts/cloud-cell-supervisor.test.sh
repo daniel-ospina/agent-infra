@@ -919,6 +919,18 @@ case "$CC_OUT" in
   *"agent-infra#2176"*) ok "check: the refusal carries its issue, so the remedy is findable" ;;
   *) bad "check: the refusal does not cite agent-infra#2176" ;;
 esac
+# ⛔ THE REMEDY MUST BE PASTEABLE (measured, P3): `rail_names()` prints ONE NAME PER LINE, and the
+# refusal used to interpolate it straight into `for f in $(rail_names); do …`, so the command an
+# operator is handed spanned FOUR lines — pasting it runs `for f in admin-merge.sh` and then
+# `ci-failure-set.sh` as a command (`syntax error near unexpected token`). A refusal whose own remedy
+# does not run is the same class as the false PASS this block exists to remove, and it is invisible to
+# every arm above (they grep the message for NAMES, not for the SHAPE of the command in it).
+# The expected list is DERIVED from `$RAIL_FILES` (one line, source order) rather than hand-copied, so a
+# new rail file reaches this arm the same way it reaches every fixture — the rule at the top of this file.
+case "$CC_OUT" in
+  *"for f in $RAIL_FILES"*) ok "check: the rail remedy's loop list is on ONE line, so the suggested command is pasteable" ;;
+  *) bad "check: the rail remedy is NOT pasteable — its for-f-in list is newline-separated — output: $CC_OUT" ;;
+esac
 mv -f "$F/home/.pi/agent/scripts/ci_exemption.py.off" "$F/home/.pi/agent/scripts/ci_exemption.py"
 # (b) Present but NOT executable. The lane TYPES this path, so an x-less copy is a seam nobody can
 # run — and it must not be certifiable, or the failure surfaces at step 5 instead of at the gate.

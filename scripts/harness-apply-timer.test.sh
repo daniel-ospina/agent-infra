@@ -452,7 +452,14 @@ assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null)" "action
 # `<script>: line 644: executes:: command not found` and the sentence silently lost its token
 # ("and an  state always has a live controller"). Control flow was unaffected, so nothing caught it.
 # This asserts the prose survives intact, which is the only way that class is observable.
-assert_contains "$OUT" "an executes: state always has a live controller" "T24 and the refusal PROSE survives — no backtick command substitution ate the token"
+# ⛔ AND THE ANCHOR IS THE LIVE SENTENCE, WHICH MOVED (measured, base-owned): the pinned phrase was
+# removed from `REC_REMEDY` by 21e40bdaf (#3914) — the `executes:` clause was dropped from the remedy
+# sentence — so this arm reddened at a commit that changed no behaviour it protects, while the claim it
+# protects is still made, one clause earlier, by `REC_DETAIL`. Pinning the phrase that is GONE would
+# need the clause restored to the remedy; pinning the sentence that MAKES the claim keeps the guarantee
+# observable. Either way the backtick class is what this row is for: wrap any word of the sentence below
+# in backticks and it disappears from the output.
+assert_contains "$OUT" "a live controller EXECUTES a harness directory that cannot be matched to this repo" "T24 and the refusal PROSE survives — no backtick command substitution ate the token"
 # ⛔ THE REMEDY MUST BE PASTEABLE ON THE BOX IT FIRES ON (review P2, #10114). Nothing in this fleet puts
 # `cloud-cell-supervisor.sh` on PATH (`command -v` is empty on a deployed cell; the farm keeps it BESIDE
 # this pass at `~/.pi/agent/scripts/`), so a remedy naming the BARE command is `command not found`
