@@ -119,6 +119,10 @@ State lives in `$HOME/.pi/agent/state/fleet-schedule/`:
 
 ```
 loop.pid              the loop process (its COMMAND LINE is checked, not just the pid)
+loop.code             WHAT THE LIVE LOOP LOADED: {digest, pid, path, started} (#2961). Written by
+                      the loop before its pidfile and removed with it; `--verify` grades the RUNNING
+                      PROCESS against the file this record names, which is the only way to see a
+                      refreshed file over a process that never re-exec'd
 tick                  epoch of the last completed pass
 OFF                   kill switch: the loop exits while it exists. `--start` removes it;
                       `--install` REFUSES rather than silently reversing a decision
@@ -138,10 +142,16 @@ python3 ~/.pi/agent/scripts/fleet-schedule.py --status
 ```
 fleet-schedule — surface=linux templates=/tmp/cell/agent-infra/templates/launchd
   loop=running(pid=4183) last_tick=12s ago jobs=10
+  code=current the LIVE loop (pid 4183) executes /tmp/cell/.pi/agent/scripts/fleet-schedule.py (3f1a…)
   ok     com.eldato.pi-session-reaper        every 1h    last=3m ago rc=0 next=in 57m log=…
   ok     com.eldato.lane-liveness            every 30m   last=3m ago rc=0 next=in 27m log=…
   SKIP   com.tortoise.worktree-reaper        every 6h    unresolved placeholder(s) {{TORTOISE_REPO}} — absent on this machine
 ```
+
+`loop=` and `code=` answer two different questions, and only the second one is about the BUILD:
+`loop=running` means a `fleet-schedule --loop` process exists, `last_tick` means it is passing, and
+`code=current` means the module that process **loaded** is still the module on disk. A `code=STALE`
+line is the "I fixed it and it did not take" state — see *The staged copy* below.
 
 A job is **either** `ok` (with a last run, its rc and its next due time), **or** `SKIP` with the
 reason it cannot run here, **or** `ERROR` with what is broken about the declaration. There is no
@@ -151,6 +161,17 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
 
 - no loop, or a `loop.pid` whose pid is **not** `fleet-schedule --loop` (a recycled pid must not
   read as a running scheduler — and `--start` REPLACES such a pid rather than reporting it);
+- **the live loop is not running the code on disk** (#2961). The loop records what it loaded in
+  `loop.code` (digest + pid + path) when it starts; `--verify` re-digests the file the record names
+  and fails when they differ — *the file was refreshed and the process was not*, which is invisible
+  to every file-to-file comparison because the file is already the new one. A **MISSING** stamp under
+  a live loop fails too: a loop started before this record existed cannot be shown to run the code on
+  disk, so absence is the pre-fix build, not a clean arm. `--start`/`--install` restart such a loop
+  (after the declarations validate) instead of reporting `already running`, and `--status` prints it
+  as `code=current` / `code=STALE`. ⛔ ONE EXCEPTION, and it belongs to the BOX rather than this home:
+  when the box lock is held by ANOTHER state dir, neither verb touches that loop — it reports the
+  holder's own stamp and names the home that must act, because re-homing the box's scheduler is a
+  decision, not a repair (`#2890`, one loop per box);
 - a tick older than `max(3 × tick, 300 s)` while **no job is running** (the process exists but is
   not passing). A job that is running announces itself in `state/busy/<label>.json` with an
   expiring deadline, so a job the templates budget 1800 s for is reported `BUSY`, not `stale` —
@@ -232,9 +253,13 @@ target inside the layer) is exit **1** there too.
 ```bash
 python3 scripts/fleet-schedule.py --check     # DECLARATIONS only: exit 1 if this runtime cannot run the shipped set, 3 if there is no declaration set to grade (a box that was never installed)
 python3 scripts/fleet-schedule.py --install   # converge, run the due jobs NOW, start the loop, verify
+                                              # (never when ANOTHER state dir holds the box's lock: it
+                                              # reports that loop's state and names the home that must act)
 python3 scripts/fleet-schedule.py --status    # the table above
 python3 scripts/fleet-schedule.py --verify    # exit 1 on any arm above
-python3 scripts/fleet-schedule.py --start     # idempotent; clears the OFF switch, replaces a recycled pid
+python3 scripts/fleet-schedule.py --start     # idempotent; clears the OFF switch, replaces a recycled pid,
+                                              # and restarts a loop running an older build than the file —
+                                              # except a loop owned by ANOTHER state dir, which it reports
 python3 scripts/fleet-schedule.py --stop      # OFF switch + SIGTERM (creates the state dir if needed)
 ```
 
@@ -279,10 +304,48 @@ that one installer — there is no second one. What was missing was the schedule
 - `--verify` also prints a **`NOTE`** when there is no checkout to compare against at all (no
   `INFRA_ROOT`/`AGENT_INFRA_PATH` resolved), so a `SCHEDULE VERIFIED` can never be silent about an
   arm that did not run — "could not compare" is a different answer from "compared and clean".
-
 Measured cause: a checkout fix for the placeholder drift did nothing on a running cell until the
 farm was refreshed. Refresh with
 `bash <checkout>/pi-bootstrap/cell-install.sh --install`, then `fleet-schedule.py --verify`.
+
+#### The other half of the same seam — the FILE and the PROCESS are different facts (#2961)
+
+The check above compares two **files**. The loop is a long-lived Python process: it re-reads the
+*declarations* every pass, but it never re-execs, so **the module it loaded at startup is the code it
+runs for ever**. So the arm above can be clean while the cell is executing the previous build:
+
+1. `cell-install.sh --install` refreshes the farm — the staged file now byte-matches the checkout;
+2. `--verify` compares the two files, finds them identical, and prints `SCHEDULE VERIFIED`;
+3. the loop that is actually ticking is still the pre-refresh module;
+4. `--start` could not help either — it returned 0 at `loop already running` before any staleness
+   question was asked, and `--install` printed the same line.
+
+`cloud-cell-bringup.sh --check` calls `--install`, and a cell is not `CELL READY` on an unproven
+schedule — so an operator who lands a fix, refreshes the farm and watches the gate go green believes
+the fix is live on that cell. It is not, until something restarts the loop.
+
+What closes it:
+
+- the loop writes `<STATE>/loop.code` — `{digest: sha256(its own file)[:16], pid, path, started}` —
+  when it starts (before its pidfile, so "the loop is visible" always implies "its stamp exists") and
+  removes it when it exits (both the signal handler and the OFF-switch break);
+- `--verify` re-digests **the file that record names** and fails on `stale` (digest changed, or the
+  file is gone) and on `unstamped` (no record, or a record from a different pid — the pre-fix build).
+  The recorded PATH is what makes the two comparable: verifying a checkout copy must not read as
+  stale over a cell whose loop runs a byte-identical staged copy;
+- `--start` and `--install` **restart** a stale or unstamped loop instead of answering `already
+  running`, and say so. The restart happens **after** the declaration gate, so a broken set costs no
+  cell its working scheduler, and BEFORE `spawn_loop()`, which would otherwise defer to the stale
+  loop's box-lock claim and make the restart a no-op that reads as a success. The loop it restarts is
+  **the one `--verify` graded**, resolved the same way: this state dir's pidfile, then the
+  identity-verified box lock (`loop.pid` is absent in states this file documents as reachable, and
+  names a recycled pid in another — a repair verb reading only the pidfile answered "already running"
+  over a loop the gate had just failed). From a home that holds **no** loop, the foreign holder's
+  staleness is REPORTED with the state dir that must act, because restarting it there would spawn the
+  box's successor from the wrong home.
+
+A rewrite that does not change the bytes is **not** stale (the comparison is content, not mtime or
+inode) — the arm exists to be trusted, so it must not fire on a re-farm that changed nothing.
 
 `FLEET_SCHEDULE_TICK` (60 s), `FLEET_SCHEDULE_JOB_TIMEOUT` (1800 s), `FLEET_SCHEDULE_STATE`,
 `TEMPLATES_DIR`, `INFRA_ROOT` override the defaults. A killed job is stamped `rc=124` and logged —
