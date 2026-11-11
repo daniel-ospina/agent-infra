@@ -5919,9 +5919,15 @@ export function _hasHiddenStateSubst(raw) {
   // scan() because ANSI-C translation can REVEAL a decoded `$(<` (\x24\x3c).
   if (/\$\(</.test(source)) return true;
   const seen = new Set();
+  // Same (CONTEXT, TEXT) keying as `_hasHiddenStateMutation`: a text-only key here let
+  // an inert `$(…)` scan suppress the later proc-subst scan of the same text — the
+  // conservative flag's own false negative, found by the same review.
+  const memoKey = (ctx, text) => (ctx ? "p" : "s") + "\u0000" + text;
   const scan = (inner, isProcSubst) => {
-    if (inner === undefined || inner.length === 0 || seen.has(inner)) return false;
-    seen.add(inner);
+    if (inner === undefined || inner.length === 0) return false;
+    const k = memoKey(isProcSubst, inner);
+    if (seen.has(k)) return false;
+    seen.add(k);
     if (/\$\(</.test(inner)) return true; // decoded file-read substitution inside a span (\x24\x3c …)
     if (isProcSubst && /\bgit\b/.test(inner)) return true; // executable text fed to a shell (round-19 parity)
     for (const inv of allGitInvocations(inner)) {
@@ -6049,9 +6055,22 @@ export function _hasHiddenStateMutation(raw) {
     return "";
   };
   const seen = new Set();
+  // ⛔ THE MEMO IS KEYED ON (CONTEXT, TEXT), NEVER ON TEXT ALONE (review finding,
+  // measured). `executableText` is the whole distinction this predicate draws: a
+  // `<(...)`/eval/alias body is text a later step may RUN and is judged
+  // conservatively; a `$(...)` body is inert and judged by its arguments. Keyed on
+  // text alone, whichever context saw the text FIRST won and the verdict became
+  // order-dependent:
+  //   `y=$(echo 'git branch -Mq victim main'); bash <(echo 'git branch -Mq victim main')`
+  // measured FALSE (admitted, and the shell runs it: victim clobbered rc 0) while the
+  // same two halves in the other order measured TRUE. A gate whose answer flips with
+  // segment order is deciding on its cache, not on what the shell executes.
+  const memoKey = (ctx, text) => (ctx ? "x" : "n") + "\u0000" + text;
   const scan = (inner, executableText) => {
-    if (inner === undefined || inner.length === 0 || seen.has(inner)) return false;
-    seen.add(inner);
+    if (inner === undefined || inner.length === 0) return false;
+    const k = memoKey(executableText, inner);
+    if (seen.has(k)) return false;
+    seen.add(k);
     if (executableText && firstWord(inner) !== "git") {
       // Executable text whose invocation list says nothing about its content
       // (`bash <(echo 'git …')`) — a git word anywhere is a risk. This is the

@@ -1119,19 +1119,14 @@ async function partB() {
     await expect607Block(
       "#607 bought-exemption: alias indirection with no resolvable span is REFUSED from a worktree (#805) [mutant: M4] — MEASURED: M4 admits it",
       "git -c alias.br='git branch -fq victim main' br");
-    // ── PROCESS SUBSTITUTION — the review's second finding, MEASURED ──────────
-    // The finding said a read-only proc-subst idiom is now refused (a new false
-    // block). MEASURED on this head through the classifier and the handler: it is
-    // NOT — `hiddenStateMutation` is FALSE for `git diff --stat <(git log --oneline
-    // -1)`, because the shared `seen` set makes the broad `isProcSubst &&
-    // /\bgit\b/` arm a no-op once the same text was scanned as an ordinary
-    // substitution span, and a git-led READ-ONLY list does not `mutate()`. The
-    // finding is therefore ⛔ DO NOT APPLY: there is no new false block and no
-    // scope/claim mismatch (the reason text only ever appears for a MUTATING
-    // payload). Both halves are pinned so a future edit cannot silently turn the
-    // first row into a false block — or the second into a bypass.
+    // ── PROCESS SUBSTITUTION — read-only bodies are ALLOWED, mutating bodies are not.
+    // ⚠️ RECORD CORRECTION: an intermediate revision of this block concluded, from ONE
+    // spelling, that the read-only-proc-subst finding was "⛔ DO NOT APPLY". That was
+    // over-broad and the next review showed why — a body containing a `)` in quotes or
+    // a nested `$(…)` WAS refused. The rows below are the class-level pin, and they are
+    // the reason the DO NOT APPLY is gone rather than left standing.
     await expect607Allow(
-      "#607 proc-subst: a READ-ONLY proc-subst (`git diff --stat <(git log …)`) is ALLOWED (review finding 2 does NOT reproduce — measured)",
+      "#607 proc-subst: a READ-ONLY proc-subst (`git diff --stat <(git log …)`) is ALLOWED (the paren-free control)",
       "git diff --stat <(git log --oneline -1)");
     await expect607Block(
       "#607 proc-subst: a MUTATING proc-subst (`<(git branch -Mq a b)`) is REFUSED — the flag genuinely fires here",
@@ -1149,6 +1144,22 @@ async function partB() {
     await expect607Block(
       "#607 proc-subst: executable TEXT fed to a shell (`bash <(echo 'git branch -Mq …')`) is still REFUSED — the broad rule survives where it is the only evidence",
       "bash <(echo 'git branch -Mq victim main')");
+
+    // ⛔ ROUND-5 FINDING (order-dependent fail-open in the PRECISE predicate): its memo
+    // used to be keyed on span TEXT alone, so a payload first seen as INERT (`$(…)`)
+    // suppressed its later EXECUTABLE (`<(...)`) scan of the same text. MEASURED then:
+    // inert-first → false (ADMITTED, and the shell runs it, `victim` clobbered rc 0)
+    // while exec-first → true. Both orders are now refused (memo keyed on
+    // (context, text)) and the inert half alone is still the ALLOW control.
+    await expect607Block(
+      "#607 order: same text inert-then-executable is REFUSED (the memo is keyed on context, not text alone)",
+      "y=$(echo 'git branch -Mq victim main'); bash <(echo 'git branch -Mq victim main')");
+    await expect607Block(
+      "#607 order: the same pair exec-then-inert is REFUSED too (order must not decide the verdict)",
+      "bash <(echo 'git branch -Mq victim main'); y=$(echo 'git branch -Mq victim main')");
+    await expect607Allow(
+      "#607 order: the inert half ALONE is the control — an echo into a variable mutates nothing",
+      "y=$(echo 'git branch -Mq victim main')");
 
     // ── #607 review finding 1: read-only shapes that must NOT be refused ──────
     // Each of these was ADMITTED on main and REFUSED by the previous head (the
