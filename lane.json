@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-11923-1794429994-p3703128-dc376e6a",
+  "_sha": "bebf515e9de75be59873c73ffada64dc44633167",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-11923.log"
+    },
+    {
+      "kind": "branch",
+      "value": "docs/7860-goal-measurement-design"
+    },
+    {
+      "kind": "sha",
+      "value": "c9f4d0551dbfa4ed55b9108ca129d40310b42c82"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-11923"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 4606,
+  "ended_at": 1794434600,
+  "exit_code": 143,
+  "heartbeat_at": 1794434600,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-11923-1794429994-p3703128-dc376e6a",
+  "lease_until": 1794442400,
+  "pid": 3703128,
+  "reason": "exit:143",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794429994,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-11923",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-11923"
+}
