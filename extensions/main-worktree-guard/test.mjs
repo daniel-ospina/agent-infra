@@ -4979,17 +4979,87 @@ try {
     // FALSE-POSITIVEd on docs/tracked.md.
     has("cd a; pushd ../docs; popd --; echo x > tracked.md", "redirect:H/a/tracked.md", "C2 control: popd -- behaves exactly like a bare popd (a)");
     allows(["docs/tracked.md"], "cd a; pushd ../docs; popd --; echo x > tracked.md", "C2 control gate: the a write is untracked → ALLOW (no false positive on docs)");
-    // Out-of-range index = bash ERROR, nothing changes — the ONE arm where the old
-    // "no-op" answer was right, pinned so a bounds check cannot over-rotate.
+    // Out-of-range index = bash ERROR, nothing changes. ⛔ THESE TWO ROWS DO NOT
+    // PIN EACH GUARD'S OWN BOUND (a C3/C4 label that claimed to was falsified in
+    // the #3955 review): `pushd +9` and `popd -9` stay green with the range guards
+    // deleted, because slice(9) on a 3-entry stack is the identity and popd -9's
+    // `idx = -7` gives two empty slices either way. The bounds that ARE
+    // load-bearing have their own rows below (`B3`, `B4`); these two keep the
+    // four out-of-range forms honest about "bash errors and nothing changes".
     has("cd a; pushd ../docs; pushd ../a; pushd +9; echo x > tracked.md", "redirect:H/a/tracked.md", "C3 control: pushd +9 is out of range — bash errors, cwd stays a");
     has("cd a; pushd ../docs; pushd ../a; popd -9; echo x > tracked.md", "redirect:H/a/tracked.md", "C4 control: popd -9 is out of range — bash errors, cwd stays a");
+    // ── #3955 review ISSUE 2(b): NO `popd -n` row existed, so the branch ISSUE 1
+    // lives in could be deleted outright without reddening anything. A bare `-n`
+    // drops element 1 and keeps the cwd, so its effect is only visible on the
+    // NEXT bare popd — that is what these rows drive.
+    has("cd a; pushd ../docs; pushd ../b; popd -n; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "I2b: a bare popd -n drops element 1, so the next popd lands on a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n; popd; echo x > tracked.md", "I2b gate: TRACKED a/tracked.md → BLOCK (deleting the -n arm lands on docs instead)");
+    // `popd -n --` is exactly a bare `popd -n` (measured); a NON-numeric operand
+    // that is not `--` is bash's "invalid number" error and changes nothing, so a
+    // model that read any non-numeric word as the bare form would be wrong.
+    has("cd a; pushd ../docs; pushd ../b; popd -n --; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "I2b control: popd -n -- == a bare popd -n (the marker is not an operand)");
+    has("cd a; pushd ../docs; pushd ../b; popd -n foo; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I2b control: popd -n foo is bash's 'invalid number' — the whole form changes NOTHING");
+    // ── #3955 review ISSUE 1 (P1 FAIL-OPEN): `-n` COMBINES with the numeric
+    // operand (`popd [-n] [+N | -N]`, GNU bash manual §6.8.1) — the operand picks
+    // WHICH entry is dropped. Measured bash 5.2.21 on stack [b, docs, a] (cwd b):
+    // `-n +2`/`-n -0` ⇒ [b, docs], `-n +0` ⇒ [b, a] (== bare), `-n +9` ⇒ error.
+    // The pre-fix handler removed element 1 for EVERY operand, so the next bare
+    // popd landed in `a` while real bash landed in `docs` → the gate ALLOWed the
+    // TRACKED hub write bash performs (`origin/main` graded this right only by
+    // accident: it no-opped the whole form).
+    has("cd a; pushd ../docs; pushd ../b; popd -n +2; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1: popd -n +2 drops element 2, so the next bare popd lands on docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n +2; popd; echo x > tracked.md", "I1 gate: TRACKED docs/tracked.md → BLOCK (pre-fix resolved a/tracked.md → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd -n -0; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1: popd -n -0 drops index len-1-N (the deepest), same landing as +2");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n -0; popd; echo x > tracked.md", "I1 gate: the -N translation is asserted too, not only the +N one");
+    has("cd a; pushd ../docs; pushd ../b; popd -n +0; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "I1 control: popd -n +0 IS the bare -n target — element 1, so the next popd lands on a");
+    has("cd a; pushd ../docs; pushd ../b; popd -n +9; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1 control: an out-of-range operand is a bash ERROR — the stack is untouched, so the popd still lands on docs");
+    // ── #3955 review ISSUE 2(a): the in-range `popd -N` translation
+    // (`S.length - 1 - N`) had NO row — the only `-N` row was `popd -9`, out of
+    // range under both formulas. `popd -0` removes the DEEPEST entry and keeps
+    // the cwd, so a walker that read `-0` as `+0` would cd to docs instead.
+    has("cd a; pushd ../docs; pushd ../b; popd -0; echo x > tracked.md", "redirect:H/b/tracked.md", "I2a: popd -0 removes the stack bottom and does NOT cd — the write stays in b");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -0; echo x > tracked.md", "I2a gate: TRACKED b/tracked.md → BLOCK (the mutant `idx = Number(sel[2])` cd's to docs and ALLOWs)");
+    // ── #3955 review ISSUE 2(c): `R-n` reaches `pushd -n` with a 1-deep stack,
+    // where `S.splice(1, 0, ins)` and `S.push(ins)` are the same array — so the
+    // INSERT POSITION was unasserted. A 2-deep stack with a DISTINCT inserted dir
+    // makes the two disagree on which entry the next popd consumes.
+    has("cd a; pushd ../docs; pushd -n ../b; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "I2c: pushd -n inserts at index 1 — the next popd lands on b, not on the stack bottom");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd -n ../b; popd; echo x > tracked.md", "I2c gate: TRACKED b/tracked.md → BLOCK (the mutant `S.push(ins)` pops a and ALLOWs)");
+    // ── #3955 review ISSUE 2(d): the bounds. `pushd -N`'s UPPER edge (`k <
+    // S.length`) IS load-bearing — deleting it rotates in a directory bash never
+    // enters, so the walker's cwd (and therefore the graded write) moves. The
+    // `popd` side is belt-and-braces by construction (`slice(0, idx)` past the end
+    // is the whole array, so a dropped `idx < S.length` cannot mis-remove —
+    // measured as a surviving mutant); its row pins the BEHAVIOUR bash promises
+    // (out of range = an error that changes nothing) rather than the guard.
+    has("cd a; pushd ../docs; pushd ../b; pushd -4; echo x > tracked.md", "redirect:H/b/tracked.md", "I2d: pushd -4 is out of range on a 3-entry stack — bash errors and the cwd stays b");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -4; echo x > tracked.md", "I2d gate: TRACKED b/tracked.md → BLOCK (the mutant `if (k > 0)` rotates in docs and ALLOWs)");
+    has("cd a; pushd ../docs; pushd ../b; popd +9; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I2d: popd +9 is out of range — nothing changes, so the next popd still lands on docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd +9; popd; echo x > tracked.md", "I2d gate: TRACKED docs/tracked.md → BLOCK (an out-of-range popd must not shift the stack)");
+    // ── #3955 review ISSUE 2(e): `T+` used a 1-entry stack, where the push/pop
+    // pair nets back to the same directory under EVERY implementation — it could
+    // not vary under any mutation of this diff. Give the stack a SECOND, distinct
+    // directory so the rotation is observable through the next popd.
+    has("cd a; pushd ../docs; pushd +1; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "T+: pushd +1 on a 2-entry stack rotates, so the next popd lands back on docs");
+    // ── #3955 review (sibling arm): `pushd -n +N` is LEGAL (`pushd [-n] [+N | -N
+    // | dir]`) and is NOT a path: measured, bash rotates exactly as `pushd +N`
+    // would and REPLACES the rotated-in entry with the cwd — never cd'ing. Reading
+    // it as a failed path left the stack unrotated, so the next popd went one
+    // entry too deep: the same fail-open shape as `pushd +N`.
+    has("cd a; pushd ../docs; pushd ../b; pushd -n +1; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "I3: pushd -n +1 rotates without cd'ing — the next popd lands on a, not on docs");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n +1; popd; echo x > tracked.md", "I3 gate: TRACKED a/tracked.md → BLOCK (a failed-path no-op leaves the popd on docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n +2; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "I3 control: pushd -n +2 rotates in the cwd itself, so the popd stays in b");
+    // ── #3955 review NOTE: `pushd -- <dir>` DOES cd (measured: cwd docs, stack
+    // pushed) — the `:9475` comment claiming every remaining flag form never cds
+    // was false for `--`. `cd --` is #2177's recorded root and is untouched here.
+    has("cd a; pushd -- ../docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "N1: pushd -- <dir> is the MARKER plus a real operand — bash cds to docs");
+    blocks(["docs/tracked.md"], "cd a; pushd -- ../docs; echo x > tracked.md", "N1 gate: TRACKED docs/tracked.md → BLOCK (the no-op model resolved a/tracked.md → ALLOW)");
     // #3955's own Targets line: the forms whose `pushd` does NOT cd must leave the
     // dir stack untouched, so a later bare popd cannot consume an entry bash never
     // created. The model is deliberately self-consistent for the unprovable ones
     // (`$VAR`/`~`): no cd AND no push, which is where bash also lands.
     has("pushd $NOPE; cd a; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T$: an unresolved $VAR pushd neither cd's nor pushes — the popd is a bash no-op");
     has("cd a; pushd ~; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T~: pushd ~ is modelled no-cd/no-push and stays self-consistent (bash also lands back in a)");
-    has("cd a; pushd +1; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T+: pushd +1 on a 1-entry stack is out of range — no push, so the popd cannot steal an entry");
   }
 
 

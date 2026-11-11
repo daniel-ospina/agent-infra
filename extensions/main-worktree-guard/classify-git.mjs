@@ -9432,7 +9432,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }
     if (w0.w === "cd" || w0.w === "pushd") {
       const nxt = skipWsNl(i);
-      const tgt = readWord(nxt);
+      let tgt = readWord(nxt);
       i = tgt.k;
       const isPushd = w0.w === "pushd";
       // ── The dir stack's INDEXED forms (#3955's "flag/+N" half). Real bash
@@ -9440,11 +9440,20 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // directory:
       //   pushd +N  rotate LEFT by N, so element N becomes the top, then cd
       //   pushd -N  rotate RIGHT by N+1, then cd        (`-0` ⇒ right by 1)
+      //   pushd -- <dir>  the marker, NOT the operand — bash cds (measured)
       //   popd  +N  REMOVE element N without cd         (N=0 ⇒ cd to the new top)
       //   popd  -N  REMOVE element len-1-N without cd
       //   popd  --  exactly a bare popd
       //   popd  -n  remove the element a bare popd would have cd'd to; keep cwd
       //   pushd -n <dir>  INSERT <dir> at index 1; keep cwd
+      // ⛔ `-n` is an OPTION, not an alternative form — `pushd [-n] [+N | -N |
+      // dir]` / `popd [-n] [+N | -N]` (GNU bash manual §6.8.1) — so `-n` COMBINES
+      // with the numeric operand, and the operand picks WHICH entry moves.
+      // Measured on the same bash, stack [b, docs, a] (cwd b): `popd -n +2` and
+      // `popd -n -0` ⇒ [b, docs]; `popd -n +0` ⇒ [b, a] (== bare `popd -n`);
+      // `popd -n +9`/`-n foo` ⇒ error, nothing changes; `pushd -n +1` ⇒
+      // [b, a, b] — the stack rotates exactly as `pushd +1` would and the
+      // rotated-in entry is REPLACED by the cwd (no cd ever happens).
       // An out-of-range index is a bash ERROR: stack and cwd both untouched.
       // Treating them ALL as "no cd AND no stack change" (the previous model)
       // drifted the walker's cwd off bash's in BOTH directions — measured
@@ -9452,6 +9461,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // tracked.md` really overwrites the TRACKED `docs/tracked.md`, while the
       // walker resolved `a/tracked.md` → ALLOW; likewise `pushd -1`, `popd +0`
       // and `pushd -n ../docs; popd`) and measured false positives (`popd --`).
+      // ⛔ READING `-n` ALONE IS THE SAME CLASS: `popd -n +2` dropped element 1
+      // whatever the operand said, so the next bare `popd` landed one entry too
+      // deep and the gate ALLOWed the tracked write real bash performs — a
+      // fail-OPEN of the #437/#3955 shape, and the arm `origin/main` graded
+      // right only by accident (it no-opped the whole form) (#3955 review 1).
       if (isPushd) {
         const numeric = /^([+-])([0-9]+)$/.exec(tgt.w || "");
         if (numeric) {
@@ -9465,14 +9479,38 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           }
           continue;
         }
-        if (tgt.w === "-n") {                                   // -n <dir>: insert below the top, no cd
+        if (tgt.w === "--") {                                   // `pushd -- <dir>` DOES cd — the marker is not the operand
+          tgt = readWord(skipWsNl(tgt.k));
+          i = tgt.k;
+        }
+        if (tgt.w === "-n") {
           const nw = readWord(skipWsNl(tgt.k));
           i = nw.k;
+          // `pushd -n [+N | -N]` rotates the stack WITHOUT cd'ing, and the entry
+          // rotated in is REPLACED by the current dir (measured above). Modelling
+          // it as a failed path (the previous behaviour) left the stack
+          // unrotated, so a later bare `popd` landed one entry too deep — the
+          // same fail-open shape as `pushd +N`.
+          const rot = /^([+-])([0-9]+)$/.exec(nw.w || "");
+          if (rot) {
+            const S = vstack(f().cwd);
+            const rn = Number(rot[2]);
+            const rk = rot[1] === "+" ? rn : S.length - 1 - rn;   // left by N · left by len-1-N
+            if (rk > 0 && rk < S.length) {                        // rk===0 → identity; out of range → bash error
+              // No cd ever happens. bash REPLACES the rotated-in entry with the
+              // current dir; that entry is element 0 of the stack, which
+              // `vstack` always derives from `f().cwd`, so only the tail is
+              // stored — the rotation is the whole model.
+              setVStack(S.slice(rk).concat(S.slice(0, rk)));
+            }
+            continue;
+          }
+          // -n <dir>: insert below the top, no cd
           const ins = nw.w && nw.w !== "~" && !nw.w.startsWith("~/") && nw.w !== "-" ? resolve(cwd, nw.w) : null;
           if (ins && existsSync(ins)) { const S = vstack(f().cwd); S.splice(1, 0, ins); setVStack(S); }
           continue;
         }
-        // remaining flag forms (`-`, `--`, `+` with no digits) never cd — conservative no-op
+        // remaining flag forms (`-`, `+` with no digits) never cd — conservative no-op
         if (!tgt.w || tgt.w.startsWith("-")) { f().pending = null; continue; }
       }
       let next = null;
@@ -9520,9 +9558,27 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (idx >= 0 && idx < S.length) f().pending = setVStack(S.slice(0, idx).concat(S.slice(idx + 1)));
         continue;                                              // out of range → bash error, no change
       }
-      if (tgt.w === "-n") {                                    // drop the entry a bare popd would cd to
+      if (tgt.w === "-n") {                                    // `-n` + its OWN operand — see the pushd block
         const S = vstack(f().cwd);
-        if (S.length > 1) setVStack(S.slice(0, 1).concat(S.slice(2)));
+        const opw = readWord(skipWsNl(tgt.k));
+        const nSel = /^([+-])([0-9]+)$/.exec(opw.w || "");
+        // `-n --` is exactly a bare `popd -n` (measured); any OTHER non-numeric
+        // operand is bash's "invalid number"/"invalid argument" error (rc 2), which
+        // changes nothing — so it must not be read as the bare form either.
+        if (!nSel && opw.w && opw.w !== "--") continue;
+        i = opw.k;
+        let idx = 1;                                            // bare `-n`: the entry a bare popd would cd to
+        if (nSel) {
+          const n = Number(nSel[2]);
+          idx = nSel[1] === "+" ? n : S.length - 1 - n;
+          if (idx === 0) idx = 1;                               // element 0 is the cwd — bash drops 1 instead (measured)
+          // An out-of-range operand is a bash error and nothing changes. (For `+N`
+          // the bound is BELT-AND-BRACES: `slice(0, idx)` beyond the end is the
+          // whole array, so a dropped `idx < S.length` cannot mis-remove — measured
+          // as a surviving mutant, so no row pretends to kill it.)
+          if (idx < 0 || idx >= S.length) continue;
+        }
+        if (S.length > 1) setVStack(S.slice(0, idx).concat(S.slice(idx + 1)));
         continue;
       }
       if (tgt.w && tgt.w !== "--" && tgt.w.startsWith("-")) { continue; } // unmodelled flag form — conservative
