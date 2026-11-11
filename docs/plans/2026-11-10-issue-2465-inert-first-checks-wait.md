@@ -68,9 +68,20 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 
 ## Implementation steps
 
-1. Add `lane_no_pr_trigger` + restructure the §0b `inapplicable` arm into a two-class decision
-   (`STRUCTURAL` = no PR trigger at all; `NOT-RUN` = trigger exists, matched nothing, no run).
-   Test: A(a) red before the change, green after; A(c) proves `paths-excluded` still probes.
+1. Add `lane_no_pr_trigger` + replace the boolean `lane_has_no_head_run` with the three-valued
+   `lane_head_run_state` (`has-run` | `none` | `unreadable`), and make §0b's `inapplicable` arm
+   consult it for EVERY class:
+   - `has-run` → no widening, the certificate keeps the lane's name (the RECORDED #1614 gate);
+   - `none` → widen, loudly (waiting cannot create a run that does not exist);
+   - `unreadable` → widen only for `STRUCTURAL` (no PR trigger at all, so the filtered wait is
+     inert and no run can appear while it runs — #2465's measured burn); every other class keeps
+     the filter and lets §1b refuse (fail closed).
+   ⛔ NOT "skip the probe for STRUCTURAL" — a first cut did that and reversed #1614 (review P0).
+   Test: A(a) red before the change (against `origin/main`'s rail) and green after; A(b) the
+   measured-`none` half; A(c)/A(c2) `paths-excluded` still probes; A(c3) non-structural
+   `unreadable` still fails closed; **A(g) STRUCTURAL + `has-run` → NO widening**, with mutant
+   (f) rebuilding the reversal to prove (g) is load-bearing. The integration proof of the #1614
+   gate remains `tests/admin-merge/run.sh` §#1614 arm (e).
 2. Print the `unknown` arm's reason + the `--any-workflow` escape (it was `:` — quiet by design).
    Test: A(d) asserts the line; deleting it reds A(d).
 3. Carry `--no-wait` into the land step as `ADMIN_MERGE_FIRST_CHECKS_WAIT=0`, never overriding an
