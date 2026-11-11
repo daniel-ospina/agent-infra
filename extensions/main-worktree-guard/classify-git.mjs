@@ -3971,8 +3971,9 @@ export function classifyGitCommandDetailed(command) {
   }
 
   // ── verb-anchored legacy destructive patterns ──
-  // Run on the RAW command (compound chains: `git pull && git merge`), and if
-  // that misses, on EVERY invocation's SKIMMED reconstruction (`git -C x
+  // Run on the RAW command (compound chains: `git pull && git merge`), and —
+  // ALWAYS, never only when the raw pass misses (#506 review round 8, P1) — on
+  // EVERY invocation's SKIMMED reconstruction (`git -C x
   // checkout main` ≡ `git checkout main` — the -C/-c/GIT_DIR prefixes defeat
   // the raw regexes' `git\s+branch` adjacency, which is exactly why they were
   // verified bypasses). #587 (review fold-in): the re-test covers every
@@ -3981,18 +3982,45 @@ export function classifyGitCommandDetailed(command) {
   // escaped both passes. index.ts resolves the effective repo from the STATE
   // invocation, so worktree/foreign-targeted deletes stay exempt downstream.
   const raw = String(command ?? "").trim();
-  for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
-    if (re.test(raw)) { out.verdict = `block:${name}`; break; }
+  // The INDEX of the winning pattern in the priority list (-1 = nothing matched
+  // yet). Both passes share it, so a later pass can only ever move the verdict
+  // to a STRICTLY HIGHER-priority verb — never weaken it.
+  let patternIdx = -1;
+  for (let i = 0; i < DESTRUCTIVE_GIT_PATTERNS.length; i++) {
+    if (DESTRUCTIVE_GIT_PATTERNS[i].re.test(raw)) {
+      out.verdict = `block:${DESTRUCTIVE_GIT_PATTERNS[i].name}`;
+      patternIdx = i;
+      break;
+    }
   }
-  if (out.verdict === "allow") {
-    for (const inv of invocations) {
-      const skimmed = `git ${inv.verb ?? ""} ${(inv.args || []).join(" ")}`.trim();
-      if (skimmed === "git") continue;
-      let hit = false;
-      for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
-        if (re.test(skimmed)) { out.verdict = `block:${name}`; hit = true; break; }
+  // ⛔ THE SKIMMED PASS RUNS **ALWAYS** — it is not conditional on the raw pass
+  // having found nothing (#506 review round 8, P1; measured end-to-end). It
+  // exists because the `-C`/`-c`/`GIT_DIR` prefixes defeat the raw regexes'
+  // `git <verb>` adjacency, so a raw hit is evidence about the raw TEXT, not
+  // about the verbs the command contains. Gating it on `verdict === "allow"`
+  // left the prefix class open one spelling over: for
+  // `git -C . reset --hard && git push origin --delete stale` the raw pass
+  // matches ONLY `push-delete` (the reset is prefix-defeated), the skimmed pass
+  // never ran, and the compound reached index.ts as `block:push-delete` — whose
+  // #73 arm returns its allow-when-no-sibling-checkout verdict — so the hard
+  // reset RAN in the shared hub main checkout. That is exactly the laundering
+  // #506 exists to close, through the one spelling the raw pass cannot see.
+  // The two passes are therefore combined by PRIORITY (`DESTRUCTIVE_GIT_PATTERNS`
+  // is a priority list, #506): whichever pass names the more severe verb wins,
+  // and the skimmed pass cannot lower a raw verdict. The delete FACTS
+  // (`isPushDelete`/`pushTargets`) are unaffected — they are computed from the
+  // push invocation below, not from the verdict.
+  for (const inv of invocations) {
+    if (patternIdx === 0) break; // already the highest-priority pattern
+    const skimmed = `git ${inv.verb ?? ""} ${(inv.args || []).join(" ")}`.trim();
+    if (skimmed === "git") continue;
+    for (let i = 0; i < DESTRUCTIVE_GIT_PATTERNS.length; i++) {
+      if (!DESTRUCTIVE_GIT_PATTERNS[i].re.test(skimmed)) continue;
+      if (patternIdx === -1 || i < patternIdx) {
+        out.verdict = `block:${DESTRUCTIVE_GIT_PATTERNS[i].name}`;
+        patternIdx = i;
       }
-      if (hit) break;
+      break; // the first matching pattern for THIS invocation is its own verdict
     }
   }
 
