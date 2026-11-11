@@ -2035,6 +2035,245 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
   expectBool("#596: later-segment delete of pid-owned branch → allowed (ceremony)", delOwn === true, true);
   const delFor = sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: delD.deleteTargets, ownedBranches: [] });
   expectBool("#596: later-segment delete of FOREIGN branch → not allowed (verdict block stands)", delFor === false, true);
+
+  // ── #601: a LATER branch-state mutation must not launder behind an
+  // M3-ALLOWED FIRST mutation ────────────────────────────────────────────
+  // #601 was filed from a fresh-context review of #596 against a tree that
+  // predates #1144 (its probe baseline is 657789f, 2026-09-08). RE-MEASURED at
+  // this head: the launder it describes — an M3-ALLOWED lead mutation (the
+  // own-baseline rename reBaseline, the #376 return-to-original, or a delete)
+  // letting a LATER FOREIGN M3-only mutation (rename / force-create /
+  // force-copy — the families with NO legacy verdict, so M3 is their only gate)
+  // execute rc 0 — is CLOSED by #1144's `stateCarveOutClean` gate (1ef8abb5d).
+  // Pre-#1144 index.ts returned from the WHOLE handler at the first `reBaseline`
+  // (`if (m3?.reBaseline) { … return undefined; }`) — literally the "first
+  // reBaseline decides" short-circuit #601 and its open peer #607 both describe.
+  // The return is now CONDITIONAL on every OTHER invocation in the command being
+  // provably read-only, so a mutating tail falls through to its own decideM3.
+  //
+  // WHAT IS GENUINELY NEW HERE (stated precisely — an earlier draft of this
+  // comment claimed the closure had "zero assertions", which is false: main
+  // already pins `stateCarveOutClean` for destructive / hidden / `worktree add` /
+  // `tag v1` / `stash` siblings, and 8 end-to-end pins at test-module-load.mjs
+  // B9u1–B9u8 include exact launder shapes with a SWITCH lead. Fresh-context
+  // review of this PR falsified the absolute claim, correctly):
+  //   (a) `stateCarveOutClean === false` when the sibling is a BRANCH-STATE
+  //       mutation — no pre-existing pin covers that family, and it is precisely
+  //       the family the M3 carve-outs live in (pinned per tail ARG family below);
+  //   (b) the own-baseline RENAME lead end-to-end (B9u5's lead is a switch, not a
+  //       rename) — see test-module-load.mjs;
+  //   (c) the compound form `git branch -Mq <baseline> X ; git branch -Mq
+  //       <foreign> Y` at this layer, which no assertion could express before
+  //       because the #596 adapter classifies only `stateVerb`/`stateArgs` (the
+  //       FIRST mutation).
+  // These pins are that regression lock, and they are the evidence #607 needs.
+  //
+  // ⛔ WHAT THIS PR DOES **NOT** CLOSE — #656's ROOT, and the reason its record
+  // says so plainly. The closure above is a claim about the classifier's
+  // INVOCATION list. A HIDDEN shell tail (`$(…)`, backticks, `eval "…"`) is
+  // deliberately invisible to that list (#656: `_hasHiddenStateSubst` flags it,
+  // it contributes no invocation, `stateMutations` keeps only the LEAD). Then:
+  // `stateCarveOutClean` is correctly `false` (the list is not provably clean),
+  // the lead's re-baseline is deferred … and there is NO second mutation for the
+  // M3 loop to gate, so index.ts admits the WHOLE command at its VERDICT arm
+  // (`det.verdict === "allow"` → `admitAfterM3()`, which applies the deferred
+  // re-baseline). Measured at this head, end-to-end through the real handler: the
+  // FOREIGN ref inside the substitution is renamed rc 0. So the launder #601
+  // describes is closed for every VISIBLE tail and OPEN for a hidden one — an
+  // earlier draft of this record claimed `$()` was probed clean, which is false:
+  // round 1's probe measured `hidden=true clean=false` and stopped at the
+  // classifier, never reaching the verdict arm that admits it.
+  //
+  // #656 is NOT out of scope because it "has no lead" (its own probes had none):
+  // with a lead the command DOES enter M3, and is still admitted. It is out of
+  // scope here because this PR is test-only and #656's fix is a production
+  // change — a fail-closed return when `hiddenStateSubst` is true, which is the
+  // decision already recorded at classify-git.mjs:4164–4183. Until it lands, the
+  // `⚠️ RESIDUAL` row below PINS TODAY'S ADMITTED BEHAVIOUR as a tripwire so
+  // that this record is true and #656's fix has something to red against.
+  //
+  // The mirror below is index.ts's M3 block FAITHFULLY — it loops EVERY
+  // `stateMutations` entry (not just the first) and honours the
+  // `stateCarveOutClean` early return — because the launder lives in exactly
+  // that interaction. `renameDstExists: false` keeps #598's dst-clobber arm out
+  // of the way so the TAIL's block can only come from its own FOREIGN-target
+  // arms.
+  const m3Full = (cmd, currentBranch) => {
+    const d = classifyGitCommandDetailed(cmd);
+    if (!d.branchState) return "allow:no-branchState";
+    const muts = (d.stateMutations && d.stateMutations.length > 0)
+      ? d.stateMutations
+      : [{ verb: d.stateVerb, args: d.stateArgs }];
+    let pending = null;
+    for (const mu of muts) {
+      const op = sharedClassifyBranchOp(mu.verb ?? d.verb, mu.args ?? d.verbArgs);
+      // op "other" (a delete) skips M3 — the verdict + ownership path gates it.
+      if (!op || op.op === "other") continue;
+      const m3 = sharedDecideM3({
+        branchOp: op, isAgentInfra: true,
+        // `original` is what the #376 return-to-original arm keys on; the real
+        // session baseline records it at session_start (decideM3 requires it, and
+        // a baseline without one is exactly the contended/detached start that
+        // correctly fails closed).
+        baseline: { repoKey: "k", branch: currentBranch, original: "feat/1" },
+        currentBranch, repoKey: "k",
+        stateOpCount: d.stateOpCount ?? 1,
+        hiddenStateSubst: d.hiddenStateSubst === true,
+        renameDstExists: false,
+      });
+      if (m3?.block) return "block";
+      if (m3?.reBaseline) {
+        if (d.stateCarveOutClean === true) return "allow:carveOut";
+        pending = m3.reBaseline;
+      }
+    }
+    return pending ? "allow:pending" : "allow:no-admitted-mutation";
+  };
+  // Indicator 0 (the PREMISE): the lead on its own IS an M3 allow — so a block
+  // on the compound can only come from the tail.
+  // Evidence discipline (agent-infra#3442 — a recorded decision: "an assertion whose
+  // value cannot vary under any mutation of the diff is dead weight that actively
+  // misleads a reader … either make it reachable or delete it. A comment explaining
+  // why it cannot fail is not a fix."): every LOCK row below names the mutant that
+  // reddens it, and a row that could not be made to name one was DELETED rather than
+  // kept with a disclaimer (the ONE exception is the `⚠️ RESIDUAL` row, which is a
+  // tripwire that records a GAP and says so in its own label). The deleted rows are
+  // #601's indicators 2, 3 and 4 at this layer; the two closures behind them —
+  // #626's and #596 round-4's — are both real, but reachability differs per row and
+  // is stated at the measured strength, not stronger (round-5 review corrected an
+  // earlier draft that called both of them unreachable):
+  //   • ind2 (`checkout -b … ; branch -fq <foreign>`) — the `create-new` arm returns
+  //     `{block:true}` UNCONDITIONALLY (branch-ownership.mjs decideM3, #626), so the
+  //     lead blocks and the tail is never reached under ANY mutant. Its closure is
+  //     #626's, pinned at test.mjs `#626: … → BLOCKED (no #376 reBaseline)`.
+  //   • ind3 / ind4 (an own-branch delete lead) — a row asserting `block` there is
+  //     NOT unreachable: MEASURED, `git branch -Dq feat/1 ; git branch -Mq feat/other
+  //     rnX` is `block` at base and `allow:no-admitted-mutation` under M3 (the delete
+  //     is `op "other"` → `continue`, so slicing `stateMutations` down to it leaves
+  //     nothing with a reBaseline). So such a row WOULD redden — under M3, a mutant
+  //     of the M3 loop's own list, not under any mutation of #1144's carve-out, which
+  //     is the closure this block exists to pin. `classifyBranchOp` returns
+  //     `{op:"other"}` for delete mode by design, so a delete yields no reBaseline
+  //     for the carve-out to be judged on. Their closure is #596 round-4's, pinned at
+  //     test.mjs `#596 r4: wt lead + later MAIN rename`, `#596: later-segment delete
+  //     → op other`, and its siblings — so deleting them HERE is about attribution
+  //     (they would name a mutant of a different closure), not unreachability.
+  // Both underlying closures are already pinned on main; re-pinning them here would
+  // be dead weight. What #1144's `stateCarveOutClean` uniquely owns is the RENAME /
+  // RETURN leads — pinned below with the mutant named per row.
+  //
+  // Mutants referenced (all applied to the two `.mjs` modules, no repo file):
+  //   M1 = `stateCarveOutClean = !hiddenStateSubst && invocations.every(...)`
+  //        → `= !hiddenStateSubst`   (the read-only sibling test removed)
+  //   M2 = index.ts's `if (det.stateCarveOutClean === true)` → `if (true)`
+  //        (equivalently: the carve-out always closes — the full pre-#1144 revert)
+  //   M3 = `out.stateMutations = stateMutations.map(...)` → `.slice(0, 1)`
+  //   M5 = the carve-out's IDENTITY exemption (`v === stateInv ||`) deleted
+  //   M6 = the #591 own-force carve-out removed; M7 = its `stateOpCount === 1` deleted
+  //   M8 = the #376 return-to-original arm deleted
+  expectBool("#601 premise: own-baseline rename lead alone → M3 carve-out allow (the launder's premise) [mutant: M5]" +
+    " — MEASURED: M5 turns this into allow:pending",
+    m3Full(`git branch -Mq feat/1 rnLead`, "feat/1"), "allow:carveOut");
+  expectBool("#601 premise: return-to-original lead alone → M3 carve-out allow [mutant: M8] — MEASURED: M8 blocks it",
+    m3Full(`git checkout feat/1`, "feat/1"), "allow:carveOut");
+  // THE PIECE #1144 UNIQUELY OWNS AT THIS LAYER: `_isCarveOutReadOnlyInvocation`
+  // must refuse a MUTATING BRANCH invocation as a read-only sibling. The pre-existing
+  // `stateCarveOutClean` pins cover a destructive sibling, a hidden payload, and the
+  // mutating forms of `worktree add` / `tag v1` / `stash` — NOT the branch-state
+  // family, which is exactly the family the M3 carve-outs live in. Each spelling
+  // below is a distinct tail ARG family (rename / force-create / force-copy), and
+  // M1 turns every one of them `true`.
+  for (const [label, tail] of [
+    ["rename", `git branch -Mq feat/x rnY`],
+    ["force-create", `git branch -fq feat/other main`],
+    ["force-copy", `git branch -Cq feat/other tC1`],
+  ]) {
+    expectBool(`#601 sibling-family: a mutating branch tail (${label}) is NOT a read-only sibling → stateCarveOutClean false [mutant: M1]` +
+      " — MEASURED: M1 makes it true",
+      classifyGitCommandDetailed(`git branch -Mq feat/1 rnX ; ${tail}`).stateCarveOutClean, false);
+  }
+  // Indicator 1 — own-baseline rename (reBaseline carve-out) then FOREIGN rename.
+  // NB: the pair below is the ONLY row for this command. `ind1D.stateCarveOutClean === false`
+  // was a byte-for-byte duplicate of the sibling-family `rename` row above (same command
+  // string, same field, same expected value, same mutant M1) and was folded away on
+  // fresh-context review of this PR — the family sweep carries it.
+  const ind1 = `git branch -Mq feat/1 rnX ; git branch -Mq feat/x rnY`;
+  const ind1D = classifyGitCommandDetailed(ind1);
+  expectBool("#601 ind1: BOTH mutations enumerated (the tail must reach the M3 loop) [mutant: M3]" +
+    " — MEASURED: M3 slices it to 1",
+    Array.isArray(ind1D.stateMutations) && ind1D.stateMutations.length === 2, true);
+  expectBool("#601 ind1: own rename + FOREIGN rename → M3 BLOCK (no launder) [mutants: M1, M3]" +
+    " — MEASURED: the two mutants admit through DIFFERENT exits — M1 as allow:carveOut (the carve-out" +
+    " closes), M3 as allow:pending (the tail is sliced out of the loop, so the lead's reBaseline is" +
+    " deferred to the verdict arm). M2 is the e2e-layer mutant: this mirror implements the conditional" +
+    " itself, so reverting index.ts cannot move it",
+    m3Full(ind1, "feat/1"), "block");
+  // ⚠️ RESIDUAL (#656's root — NOT closed by #601). The row below asserts TODAY'S
+  // ADMITTED behaviour, on purpose, so this PR's record is true: a HIDDEN tail is
+  // invisible to the classifier, so the compound reaches the verdict arm and is
+  // admitted (see the block header). It is a TRIPWIRE, NOT A LOCK, and it is the
+  // one row here with NO mutant among M1–M8 — deliberately: none of them can move
+  // it, because the gap it records lives in production's verdict arm and this
+  // diff adds no code it observes. Its non-vacuity is established by its VISIBLE
+  // twin immediately above (same lead, same foreign rename, `block`) rather than
+  // by a mutation of this diff.
+  //   #601's own framing: the launder is closed for every VISIBLE tail and OPEN
+  //   for a hidden one. When #656 lands its recorded fix (fail closed when
+  //   `hiddenStateSubst` is true, per classify-git.mjs:4164–4183) this row goes
+  //   RED — the correct repair is then to INVERT it and cite #656, never to
+  //   delete it. Deleting it would silently restore the "closure complete"
+  //   over-claim this row exists to prevent.
+  expectBool("#601 ⚠️ RESIDUAL (#656 root — NOT closed by #601): a `$()`-hidden FOREIGN rename behind an M3-allowed lead → allow:pending, i.e. ADMITTED at index.ts's verdict arm [no mutant — this row records a GAP, it is a tripwire not a lock]" +
+    " — MEASURED: hidden=true clean=false muts=1 → the lead's reBaseline is deferred and then admitted via" +
+    " admitAfterM3(); the VISIBLE twin above measures `block`, and backticks / eval measure this same" +
+    " allow:pending. Invert this row when #656 lands",
+    m3Full(`git branch -Mq feat/1 rnX ; echo "$(git branch -Mq feat/other tR1)"`, "feat/1"), "allow:pending");
+  // The visible-tail matrix. Leads = the TWO reBaseline arms #1144 uniquely owns
+  // (own-baseline rename; #376 return-to-original) × every FOREIGN M3-only tail
+  // family × all four shell separators git honours = 24 compounds, none admitted.
+  // The own-force-create lead is DELIBERATELY absent: it is refused at the LEAD by
+  // the #591 `stateOpCount` bound (`decideM3`), so all 12 of its cells stay `block`
+  // under EVERY mutant — 0/12 discriminating. That behaviour keeps its own control
+  // row below (mutant M7) instead of masquerading as launder coverage.
+  {
+    const leads = [`git branch -Mq feat/1 rnLead`, `git checkout feat/1`];
+    const tails = [`git branch -Mq feat/other tR1`, `git branch -fq feat/other main`, `git branch -Cq feat/other tC1`];
+    let admitted = 0;
+    const seen = [];
+    for (const lead of leads) {
+      for (const tail of tails) {
+        for (const sep of [";", "&&", "|", "\n"]) {
+          const cmd = `${lead} ${sep} ${tail}`;
+          const v = m3Full(cmd, "feat/1");
+          if (v !== "block") { admitted += 1; seen.push(`${JSON.stringify(cmd)} → ${v}`); }
+        }
+      }
+    }
+    expectBool("#601 matrix: none of the 24 reBaseline-lead × FOREIGN-tail compounds is admitted [mutants: M1, M3]" +
+      " — MEASURED: M1 admits 24/24 and M3 admits 24/24 (stateCarveOutClean is computed from `invocations`" +
+      " and is independent of stateMutations, so both leads keep re-baselining under M3)" +
+      (seen.length ? ` — ADMITTED: ${seen.join(" · ")}` : ""), admitted, 0);
+  }
+  // Positive controls — #601's own "must NOT break" list. A benign lead is not
+  // an arm-gated mutation, so the own-baseline rename after it must still reach
+  // the carve-out (the #596 pin), and the single-invocation ceremonies keep
+  // their carve-outs.
+  expectBool("#601 control: benign lead + OWN rename stays ALLOWED (the #596 pin must survive) [mutant: M5]" +
+    " — MEASURED: under M5 this reads allow:pending, NOT block: the carve-out stops closing and the command is" +
+    " still ADMITTED, just at index.ts's verdict arm (det.verdict === 'allow' → admitAfterM3()) instead of" +
+    " the carve-out's early return",
+    m3Full(`git branch side ; git branch -Mq feat/1 rnX`, "feat/1"), "allow:carveOut");
+  // ⛔ NO SEPARATE "single-invocation own rename" ROW: it is byte-for-byte the same assertion as
+  // the premise row above (`git branch -Mq feat/1 <free>` → allow:carveOut — identical shape,
+  // identical expected value, identical mutant M5, zero added discriminating power). The premise
+  // row IS the single-invocation ceremony pin; a second copy was deleted on fresh-context review
+  // of this PR (non-blocking finding, agent-infra#3442's dead-weight rule).
+  expectBool("#601 control: single-invocation OWN force-create stays ALLOWED (the #591 carve-out) [mutant: M6]" +
+    " — MEASURED: M6 blocks it",
+    m3Full(`git branch -fq feat/1 main`, "feat/1"), "allow:no-admitted-mutation");
+  expectBool("#601 control: benign lead + OWN force-create is still REFUSED (the #591 stateOpCount bound) [mutant: M7]" +
+    " — MEASURED: M7 admits it as allow:no-admitted-mutation",
+    m3Full(`git branch side ; git branch -fq feat/1 main`, "feat/1"), "block");
   // Round-2 (reviewer F1): _hasHiddenStateSubst's hidden-payload scan must
   // recognize the SAME mutating-branch surface as the arm (it was stale for
   // the #592 rename-cluster/long-form + force-COPY families — exact -m/-M
@@ -2090,6 +2329,16 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       execSync("echo a > f && git add . && git commit -qm init && git branch feat/x && git branch feat/other", { cwd: mainR, stdio: "ignore" });
       execSync(`git worktree add -q "${wtR}" -b wtmain`, { cwd: mainR, stdio: "ignore" });
       const idxGate = (cmd) => {
+        // ⛔ PRE-#1144 SEMANTICS — DO NOT REUSE FOR CARVE-OUT / LAUNDER QUESTIONS.
+        // This mirror RETURNS at the first mutation that resolves (below), which is
+        // the "first block/reBaseline decides" short-circuit #1144 removed from
+        // index.ts. It is kept because its assertions only ask "does the FIRST
+        // main-resolving mutation gate (or worktree-exempt)?" — a question that is
+        // still valid — but it can never see a LATER tail. For the compound form use
+        // `m3Full` (the #601 block above), which loops every mutation and honours
+        // `stateCarveOutClean`. Two mirrors of one production block that disagree is
+        // a trap: if you add a case here that depends on later segments, move it to
+        // `m3Full` instead (fresh-context review of PR #3968, non-blocking note).
         const d = classifyGitCommandDetailed(cmd);
         // round-4: mirror index.ts M3 — gate EVERY main-resolving mutating
         // branch-state invocation (resolveRepoFromInv on each mutation's own
@@ -4848,6 +5097,111 @@ try {
     has("popd\ncd a; echo x > ../tracked.md", "redirect:H/tracked.md", "N1: the bare popd does not eat the next line's `cd`");
     blocks("popd\ncd a; echo x > ../tracked.md", "N1 gate: the real write is the TRACKED root file → BLOCK");
     lacks("cd\ndocs; echo x > tracked.md", "redirect:H/docs/tracked.md", "N2: `cd` + newline is a bare cd — the next line is NOT its operand");
+  }
+
+  // ── #3956 completion (lane 3956): the issue names THREE indicators and only
+  // the two bypass-direction ones are pinned (C437r45 N1/N2). Indicator 3 — the
+  // CONTROL that "must not regress" — had NO pin, and it is not cosmetic: the
+  // plausible-but-wrong implementation of this very issue ("the operand read
+  // stops at a newline") is to stop the WORD at the newline instead of merely
+  // refusing to SKIP one. That loses the cd entirely, and then
+  // `cd \<NL>docs; echo pwn > ../tracked.md` resolves one level ABOVE the hub
+  // while real bash overwrites the TRACKED root file — the same fail-OPEN this
+  // issue closed, one implementation choice away. So every row below is a pair:
+  // the continuation (must keep the cd) and its bare-newline neighbour (must NOT
+  // read the next line as the operand).
+  //
+  // ⛔ WHAT THE BARE-NEWLINE ROWS ACTUALLY PIN: THE WALKER'S MODEL, NOT A
+  // REAL-BASH WRITE (fresh review, P1 — the previous wording there claimed a
+  // real-bash write that does not happen). Measured on bash 5.2.21 with HOME
+  // OUTSIDE the fixture hub: a bare `cd` is `cd "$HOME"` — it does NOT leave the
+  // cwd unchanged — and on the next line `docs` is a COMMAND (`bash: docs:
+  // command not found`, rc 127), so `cd <NL>docs && echo x > f.md` performs NO
+  // WRITE AT ALL: the bare cd left the hub for $HOME and `&&` short-circuits to
+  // nothing. The WALKER models a bare `cd`/`pushd` as a conservative NO-OP
+  // (the "flag / +N / bare forms don't cd (conservative no-op)" arm of its
+  // cd/pushd branch), so it keeps the cwd at the hub and emits `redirect:H/f.md`
+  // — an over-approximation (a write that never happens) in the SAFE direction,
+  // and the direction the N3 control must keep: the mutant this block exists
+  // against is the OVER-read (`skipWsNl` crossing the newline, #3956), which
+  // lands on the TRACKED `docs/f.md`.
+  // Measured per arm (bash 5.2.21, HOME outside the fixture hub):
+  //   `cd \<NL>docs && echo x > f.md`      → docs/f.md      (continuation)
+  //   `cd <NL>docs && echo x > f.md`       → nothing written (bare cd → $HOME;
+  //                                          `docs` exits 127, `&&` short-circuits)
+  //   `cd \<NL>docs; echo pwn > ../tracked.md` → tracked.md (TRACKED root)
+  //   `pushd \<NL>docs; echo pwn > ../tracked.md` → tracked.md (TRACKED root)
+  // ⛔ AND THE BARE-cd NO-OP IS NOT HARMLESS IN THAT OTHER DIRECTION (measured
+  // on this box, NOT this issue's newline root, and NOT pinned here as a
+  // verdict): real bash's bare `cd` goes to $HOME, so on a box where HOME IS the
+  // hub's parent — this fleet's own layout, HOME=/home/cmux,
+  // hub=/home/cmux/agent-infra — `cd <NL>echo pwn > agent-infra/tracked.md`
+  // really overwrites the TRACKED hub file while the walker (cwd unchanged at
+  // the hub) resolves `agent-infra/tracked.md` one directory too DEEP, i.e. an
+  // ALLOW. Filed as #3981 with that measurement; the bare-newline arms here stay
+  // controls, so nothing below claims the model is real-bash-equal.
+  // ⛔ ONE TRACKED FILE PER ARM FAMILY (#3957 review NOTE 1): with BOTH paths
+  // tracked, the wrong resolution and the right one BOTH block, so the gate rows
+  // could not discriminate. Each `blocks`/`allows` row declares the one file
+  // THAT ARM writes — the real-bash target for a continuation arm, the walker's
+  // no-op target for a bare-newline control; a candidate resolved outside the
+  // hub is keyed by its absolute path, which can never equal a hub-relative
+  // tracked name.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt3956-"));
+    mkdirSync(join(H, "docs")); mkdirSync(join(H, "a"));
+    writeFileSync(join(H, "docs", "f.md"), "tracked\n");
+    writeFileSync(join(H, "docs", "tracked.md"), "tracked\n");
+    writeFileSync(join(H, "tracked.md"), "tracked\n");
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const rels = (cmd) => cands(cmd).map((x) => ({
+      rel: x.resolvedPath.startsWith(H + "/") ? x.resolvedPath.slice(H.length + 1) : x.resolvedPath,
+    }));
+    const has = (cmd, needle, label) => expectBool(`C3956: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C3956: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    const blocks = (tracked, cmd, label) => expectBool(`C3956: ${label}`, firstHubTrackedWrite(rels(cmd), tracked) !== null, true);
+    const allows = (tracked, cmd, label) => expectBool(`C3956: ${label}`, firstHubTrackedWrite(rels(cmd), tracked) !== null, false);
+
+    // indicator 3, verbatim: a backslash-newline IS a line continuation.
+    has("cd \\\ndocs && echo x > f.md", "redirect:H/docs/f.md", "N3: `\\`+newline is a continuation — `docs` IS cd's operand");
+    blocks(["docs/f.md"], "cd \\\ndocs && echo x > f.md", "N3 gate: real bash overwrites the TRACKED docs/f.md → BLOCK");
+    // …and its neighbour, which is what makes N3 discriminate: a BARE newline
+    // ends the simple command, so `docs` is a COMMAND (bash: command not found)
+    // and cd has NO operand. The row pins the WALKER's model of that shape: a
+    // bare cd is a conservative NO-OP, so the write stays at the fixture root.
+    has("cd\ndocs && echo x > f.md", "redirect:H/f.md", "N3 control: a bare newline is NOT a continuation — `docs` is a command, not cd's operand (walker: bare cd = no-op, so the write is the hub's root f.md)");
+    lacks("cd\ndocs && echo x > f.md", "redirect:H/docs/f.md", "N3 control: the pre-fix over-read (docs as cd's operand) stays closed");
+    allows(["docs/f.md"], "cd\ndocs && echo x > f.md", "N3 control gate: the walker's bare-cd no-op keeps the write at the untracked root f.md → ALLOW (real bash writes nothing here at all — the bare cd goes to $HOME and `docs`, a command, exits 127)");
+
+    // The continuation in the BYPASS direction: an implementation that drops the
+    // continued cd resolves the write one level ABOVE the hub — an ALLOW on a
+    // TRACKED hub file. This is the row the N1/N2 pins cannot catch.
+    has("cd \\\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N4: the continued cd is not lost — the write is the tracked root file, not one level above the hub");
+    blocks(["tracked.md"], "cd \\\ndocs; echo pwn > ../tracked.md", "N4 gate: TRACKED root tracked.md → BLOCK");
+    // its neighbour: with a BARE newline the cd is BARE, and the walker models a
+    // bare cd as a NO-OP, so the cwd stays the hub and `..` resolves one level
+    // ABOVE it — the tracked root file is never touched. ⛔ NOT because "`..` is
+    // the hub's parent" in bash: real bash's cwd here is $HOME (a bare cd is
+    // `cd "$HOME"`), so bash's `..` is $HOME's parent. The ALLOW holds under
+    // both models only because the fixture puts HOME outside the hub (see the
+    // block comment: with HOME == the hub's parent this arm is a fail-OPEN,
+    // filed separately).
+    lacks("cd\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N4 control: a bare newline leaves a bare cd, and the walker's bare-cd no-op keeps the cwd at the hub — so `..` is the hub's PARENT, not the hub (real bash: cwd is $HOME, so `..` is $HOME's parent)");
+    allows(["tracked.md"], "cd\ndocs; echo pwn > ../tracked.md", "N4 control gate (discriminating pair): same shape and SAME tracked root file — the bare-newline arm resolves above the hub, so only the continuation arm blocks");
+    // ⛔ PRESENCE PIN (fresh review, P3): the pair above passes on an EMPTY
+    // candidate list — `firstHubTrackedWrite([]) === null` and `!"".includes(…)`
+    // are both true — so if the walker stopped emitting a candidate for this
+    // bare-newline arm the pair would go vacuous and nothing would redden. The N3
+    // control pins presence through its `has` row; this gives N4 the same
+    // guarantee, which is the difference between a pair that discriminates and a
+    // pair that cannot.
+    expectBool("C3956: N4 control still emits a candidate (presence pin)", cands("cd\ndocs; echo pwn > ../tracked.md").length >= 1, true);
+    has("pushd \\\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N5: pushd's operand read honours the continuation too");
+    blocks(["tracked.md"], "pushd \\\ndocs; echo pwn > ../tracked.md", "N5 gate: TRACKED root tracked.md → BLOCK");
+    // continuation + indent, the #625 LEAD-continuation shape, on the cwd path.
+    has("cd \\\n  docs && echo x > f.md", "redirect:H/docs/f.md", "N6: continuation + indent before cd's operand");
+    blocks(["docs/f.md"], "cd \\\n  docs && echo x > f.md", "N6 gate: TRACKED docs/f.md → BLOCK");
   }
 
   // ── #3957 review (cycle-46) pins: three shapes where THIS PR's own diff sent
