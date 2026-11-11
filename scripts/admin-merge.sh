@@ -6509,25 +6509,27 @@ lane_applicable() {
 # reason is the STRUCTURAL class: the lane's own `on:` block declares neither
 # `pull_request` nor `pull_request_target`, so no push to a PR head can START it (#2465).
 #
-# ⛔ WHY THIS CLASS NEEDS NO `lane_has_no_head_run` PROBE, AND WHY DROPPING THE LANE
-# FILTER FOR IT IS NOT A WIDENING. The probe asks "does a run exist RIGHT NOW", and
-# a run of a "mixed" lane can still appear later while the wait runs — which is why
-# `lane_has_no_head_run` gates the `paths-excluded` class (there, whether the lane ran
-# is real information). For this class the probe cannot decide anything the wait does
-# not: an unfiltered read is a strict SUPERSET of the filtered one, so
-#   * if no run of the lane ever attaches → the filtered wait is INERT and can never
-#     clear (the #2465 defect: 3900s per round, then "no run appeared for head"), while
-#     the unfiltered wait clears on the head's other runs; and
-#   * if one does attach (a PR-triggered CALLER, #1413) → the unfiltered wait sees it
-#     too, because it sees everything the filtered wait sees.
-# So for this class the probe carried no decision, while its SINGLE transient
-# gh-read failure (§0b's probe runs exactly once) silently pinned the filtered wait for
-# the whole window — a 65-minute burn decided by one unread REST response (#2465's
-# "either lane_applicable answers differently … or lane_has_no_head_run is answering").
-# The merge decision is NOT loosened: §4.5 grades the evaluated tree across EVERY
-# workflow and app, exactly as it does for `--any-workflow` and for the FIRST-CHECKS
-# wait's own #2862 re-derive, whose fixture pins that the dropped filter reaches the
-# SAME verdict as the operator's proven-safe escape.
+# ⛔ THIS CLASS DOES *NOT* SKIP THE RUN PROBE — DO NOT REINTRODUCE THAT (#1614).
+# A first cut of #2465 did: it treated "structural" as "the probe cannot decide
+# anything", dropped the filter unconditionally, and thereby reversed the RECORDED
+# #1614 dead-end gate (`f2e84b617` / PR #1619) as a side effect — a `on: push` lane
+# is a STRUCTURAL lane for this classification, yet it DOES run on the PR head's own
+# commit, and `tests/admin-merge/run.sh` arm (e) pins that such a lane keeps its
+# filter and its name in the certificate. Widening there is how "every trigger-split
+# repo silently becomes `--any-workflow`".
+#
+# WHAT THE CLASS DOES CHANGE is the policy on ONE probe answer, `unreadable`:
+#   * the STRUCTURAL class widens on it. No run of this lane can be STARTED by this
+#     PR, so the filtered wait is INERT — it can only ever clear on a run that cannot
+#     appear — and #2465's measured 3900 s burn was caused by exactly ONE failed
+#     `gh run list` (§0b runs the probe once), not by a probe that answered "has a
+#     run". Waiting longer cannot outlast a failed read.
+#   * every other class keeps the filter on it (fail closed): there a run CAN appear,
+#     so an unread answer is not an exemption.
+# The merge decision is NOT loosened either way: §4.5 grades the evaluated tree across
+# EVERY workflow and app, exactly as it does for `--any-workflow` and for the
+# FIRST-CHECKS wait's own #2862 re-derive, whose fixture pins that the dropped filter
+# reaches the SAME verdict as the operator's proven-safe escape.
 lane_no_pr_trigger() {
   case "${1:-}" in
     'lane-applicable: no-pr-trigger'*) return 0 ;;
@@ -6535,20 +6537,37 @@ lane_no_pr_trigger() {
   return 1
 }
 
-# lane_has_no_head_run <head> — TRUE (0) only when the watched lane PROVABLY has
-# NO run for <head>. This is what keeps the #1614 fallback a DEAD-END repair
-# rather than a trigger-shape repair: a lane that matched no trigger path but DID
-# run for the head is not a dead end (precondition 1 is satisfiable), and widening
-# there would be gratuitous. An UNREADABLE listing is NOT "no run" — fail closed,
-# no widening.
-# ⛔ IT NO LONGER GATES THE STRUCTURAL CLASS (#2465) — see `lane_no_pr_trigger`.
-lane_has_no_head_run() {
+# lane_head_run_state <head> — MEASURE whether the watched lane has a run for
+# <head>, into the THREE-valued global LANE_HEAD_RUN_STATE:
+#
+#   has-run     a run of `$WORKFLOW` is attached to <head>  → NOT a dead end
+#   none        the listing was read and is EMPTY           → provably no run
+#   unreadable  the `gh run list` read FAILED               → NOT "no run"
+#
+# ⛔ THREE STATES, NOT TWO (#2465 review). The old `lane_has_no_head_run` boolean
+# collapsed `unreadable` into `has-run`, so no caller could tell "we measured a run"
+# from "we could not measure anything" — and "we could not measure anything" is the
+# state that has to be resolved differently per class. `has-run` is the #1614 answer
+# (a lane that DID run for the head is not a dead end, precondition 1 is satisfiable,
+# and widening would be gratuitous); `none` is the dead end; `unreadable` is neither,
+# and §0b's policy for it is class-dependent — see `lane_no_pr_trigger`.
+#
+# The listing is FILTERED by `--workflow "$WORKFLOW"` on purpose: that is the very
+# predicate the FIRST-CHECKS wait applies, so "has a run" means "the filtered wait
+# can clear", which is the only reading under which keeping the filter is honest.
+lane_head_run_state() {
   local head="$1" args=() out rc=0
+  # UNREADABLE until proven otherwise: every early return leaves the fail-safe.
+  LANE_HEAD_RUN_STATE="unreadable"
   [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
   out="$($GH run list --commit "$head" --limit 1 --workflow "$WORKFLOW" \
            ${args[@]+"${args[@]}"} --json databaseId --jq '.[].databaseId' 2>/dev/null)" || rc=$?
-  [ "$rc" -eq 0 ] || return 1
-  [ -z "$out" ] || return 1
+  [ "$rc" -eq 0 ] || return 0
+  if [ -z "$out" ]; then
+    LANE_HEAD_RUN_STATE="none"
+  else
+    LANE_HEAD_RUN_STATE="has-run"
+  fi
   return 0
 }
 
@@ -9855,28 +9874,44 @@ main() {
     lane_applicable ".github/workflows/$WORKFLOW" "$head"
     case "$LANE_APPLICABILITY" in
       inapplicable)
-        # ⛔ THE FALLBACK IS FOR THE DEAD END, NOT FOR THE TRIGGER SHAPE. An
-        # inapplicable lane only DEAD-ENDS the rail when it has NO run for this
-        # head (that is what makes precondition 1 unsatisfiable). A lane that
-        # matched no trigger path but DID run for the head is not a dead end, and
-        # widening there would be gratuitous — so the probe decides, and an
-        # UNREADABLE probe fails closed (no widening).
+        # ⛔ THE FALLBACK IS FOR THE DEAD END, NOT FOR THE TRIGGER SHAPE — AND THE RUN
+        # PROBE IS STILL WHAT DECIDES IT (#1614, a RECORDED decision). An inapplicable
+        # lane only DEAD-ENDS the rail when it has NO run for this head (that is what
+        # makes precondition 1 unsatisfiable). A lane that matched no trigger path but
+        # DID run for the head is not a dead end, and widening there would be gratuitous
+        # — the gate that keeps a trigger-split repo from silently becoming
+        # `--any-workflow` (pinned by tests/admin-merge/run.sh arm (e), `f2e84b617` /
+        # PR #1619). So the probe is consulted for EVERY INAPPLICABLE class, and its
+        # THREE-valued answer decides:
         #
-        # ⛔ EXCEPT THE STRUCTURAL CLASS (#2465). A lane whose `on:` block declares
-        # NO PR trigger cannot be STARTED by any push to a PR head, so the probe's
-        # "is there a run yet" answers no decision the wait does not: an unfiltered
-        # read is a superset of the filtered one (see `lane_no_pr_trigger`). Gating
-        # THIS class on the probe bought nothing and cost the whole
-        # `ADMIN_MERGE_FIRST_CHECKS_WAIT` window whenever the probe's one gh read
-        # failed or found nothing at t=0 — the inert wait #2465 reports. The lane is
-        # classified ONCE, here, and the FIRST-CHECKS wait consumes THAT decision
-        # (via ANY_WORKFLOW) instead of re-deriving it per poll.
-        local lane_dead_end=0
-        if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then
-          lane_dead_end=1
-        elif lane_has_no_head_run "$head"; then
-          lane_dead_end=1
-        fi
+        #   has-run     → NO widening, and the lane keeps its name in the certificate.
+        #                 This holds for the STRUCTURAL class too: a `on: push` lane is
+        #                 STRUCTURAL and it DOES run on the PR head's own commit, so the
+        #                 filtered wait CAN clear. (A first cut of #2465 skipped the probe
+        #                 here and reversed #1614 as a side effect — do not reintroduce it.)
+        #   none        → widen, loudly. Waiting cannot create a run that does not exist.
+        #   unreadable  → class-dependent, because the two classes disagree on whether a
+        #                 run can still APPEAR:
+        #                 * STRUCTURAL — it cannot (no PR trigger can start one), so the
+        #                   filtered wait is INERT and one failed `gh run list` is not
+        #                   something waiting can outlast. Widen, loudly. THIS is
+        #                   #2465's measured burn (3900 s decided by one unread REST
+        #                   response), not a probe that answered "has a run".
+        #                 * every other class — a run can appear while the wait runs, so
+        #                   an unread answer is not an exemption: KEEP the filter and let
+        #                   §1b refuse exactly as before (fail closed).
+        # The lane is classified ONCE, here, and the FIRST-CHECKS wait consumes THAT
+        # decision (via ANY_WORKFLOW) instead of re-deriving it per poll.
+        local lane_dead_end=0 lane_structural=0 lane_probe_state=""
+        local LANE_HEAD_RUN_STATE="unreadable"
+        if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then lane_structural=1; fi
+        lane_head_run_state "$head"
+        lane_probe_state="$LANE_HEAD_RUN_STATE"
+        case "$lane_probe_state" in
+          has-run) lane_dead_end=0 ;;
+          none)    lane_dead_end=1 ;;
+          *)       lane_dead_end="$lane_structural" ;;
+        esac
         if [ "$lane_dead_end" -eq 1 ]; then
           LANE_FALLBACK_FROM="$WORKFLOW"
           # ⛔ NEVER embed the fallback text in a `${VAR:-word}` default here. An
@@ -9890,21 +9925,37 @@ main() {
           say_err "admin-merge: ⚠️  LANE INAPPLICABLE — falling back to the evaluated surface (this is NOT a silent widening)."
           say_err "   watched lane: '$WORKFLOW'  (workflow file: .github/workflows/$WORKFLOW at head $head)"
           say_err "   $lane_reason"
-          # Name WHICH dead-end class fired: the structural one never consulted the
-          # run probe, so a reader can tell "this lane cannot run here" from "this
-          # lane has not run here yet" (#2465 — the two were indistinguishable, and
-          # the operator paid 65 minutes for the difference).
-          if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then
-            say_err "   dead-end class: STRUCTURAL — no pull_request / pull_request_target trigger exists,"
-            say_err "   so no push to head $head can start it; the run probe was NOT consulted (its answer could"
-            say_err "   not change the outcome, and its one transient read failure cost a whole wait window)."
+          # Name WHICH dead-end class fired, and on WHICH probe answer, so a reader can
+          # tell "this lane cannot run here" from "this lane has not run here yet" from
+          # "we could not read the answer" (#2465 — the first two were indistinguishable
+          # at the operator's terminal, and the cost was 65 minutes).
+          # ⛔ NOTHING BELOW MAY CLAIM A MEASUREMENT THE CODE DID NOT TAKE (review P2):
+          # the STRUCTURAL class widens on MORE THAN ONE ground and only ONE of them
+          # measured "no run", so the run clause is derived from the probe state ONCE,
+          # and an unrecognised state claims nothing (a later state added to
+          # `lane_head_run_state` must not inherit "measured" by falling through).
+          local lane_run_clause=""
+          if [ "$lane_probe_state" = none ]; then
+            lane_run_clause="the lane has NO run for head $head (MEASURED: an empty listing, not a read failure) — waiting for CI cannot clear it"
+          elif [ "$lane_probe_state" = unreadable ]; then
+            lane_run_clause="the run probe's single 'gh run list' read FAILED for head $head, so no run can be CLAIMED either way (an unreadable probe is not 'no run')"
+          else
+            lane_run_clause="the run probe's answer for head $head did not resolve ('$lane_probe_state'), so no run is CLAIMED either way"
+          fi
+          if [ "$lane_structural" -eq 1 ]; then
+            say_err "   dead-end class: STRUCTURAL — no pull_request / pull_request_target trigger exists, so no"
+            say_err "   pull_request event for head $head can START it (a push-triggered member of the class is"
+            say_err "   only started by an actual push to the branch), and $lane_run_clause."
+            if [ "$lane_probe_state" = unreadable ]; then
+              say_err "   For this class no run can appear while the wait runs either, so the filtered wait is"
+              say_err "   INERT and waiting cannot outlast a failed read (#2465: one failed read cost 3900 s)."
+            fi
           else
             say_err "   dead-end class: NOT-RUN — the lane declares a PR trigger this changed set does not match,"
             say_err "   and it has NO run for head $head (measured; an unreadable probe would have failed closed)."
           fi
-          say_err "   Why: the lane's own 'on:' block cannot fire for THIS PR's changed set, and the"
-          say_err "   lane has NO run for head $head — waiting for CI cannot clear it. The lane is"
-          say_err "   INAPPLICABLE here, not missing."
+          say_err "   Why: the lane's own 'on:' block cannot fire for THIS PR's changed set, and"
+          say_err "   $lane_run_clause. The lane is INAPPLICABLE here, not missing."
           if [ -n "$WF_PR_CHANGED_PATHS" ]; then
             say_err "   changed file(s) consulted ($(printf '%s' "$WF_PR_CHANGED_PATHS" | grep -c '[^[:space:]]') total):"
             printf '%s\n' "$WF_PR_CHANGED_PATHS" | sed -n '1,10p' | sed 's/^/      /' >&2
@@ -9919,6 +9970,21 @@ main() {
           ANY_WORKFLOW=1
           wf_args=(--any-workflow)
           lane="any workflow"
+        elif [ "$lane_structural" -eq 1 ]; then
+          # ── THE #1614 DEAD-END GATE HELD: the lane HAS a run for this head ─────
+          # A STRUCTURAL lane is NOT automatically a dead end. `on: push` is a member
+          # of this class and it DOES run on the PR head's own commit, so the filtered
+          # FIRST-CHECKS wait clears on that very run. Dropping the filter here would
+          # (a) drop an EVIDENCED lane out of the certificate and (b) pull unrelated
+          # workflow reds into the comparison — the gratuitous widening #1614 exists to
+          # prevent ("otherwise every trigger-split repo silently becomes
+          # `--any-workflow`", f2e84b617 / PR #1619; pinned by tests/admin-merge/run.sh
+          # arm (e)). So the filter is KEPT.
+          # SAID OUT LOUD, because #2465's confusion was silence: "this lane cannot run"
+          # and "this lane did not run" must never look the same at the operator's
+          # terminal. ⛔ The wording must not contain the sequence "LANE INAPPLICABLE":
+          # that string means "the lane was DROPPED" to a reader and to arm (e).
+          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: its 'on:' block declares no pull_request trigger, but the lane HAS a run for this head, so the filtered wait can clear and widening would drop an evidenced lane (#1614 dead-end gate, not a #2465 dead end)."
         fi
         ;;
       unknown)
@@ -11770,7 +11836,7 @@ ${parity_forgiven_note}"
   # the literal parity lines — never spliced into them.
   if [ -n "$LANE_FALLBACK_FROM" ]; then
     analyzed="${analyzed}
-   lane applicability fallback (#1614): the watched lane '${LANE_FALLBACK_FROM}' is INAPPLICABLE to this diff — its workflow's 'on:' block declares no pull_request / pull_request_target trigger that can fire for this PR's changed set, so no run OF that lane can attach to head $head. The lane filter was DROPPED for this run (the full evaluated surface was compared) — a MEASURED fallback, never a silent widening. A lane that SHOULD have run and produced no run still refuses at step 1b; only a lane that CANNOT run is skipped."
+   lane applicability fallback (#1614): the watched lane '${LANE_FALLBACK_FROM}' is INAPPLICABLE to this diff — its workflow's 'on:' block declares no pull_request / pull_request_target trigger that can fire for this PR's changed set, so the filtered FIRST-CHECKS wait cannot clear on a run THIS PR starts (the run probe found no run for head $head, or — for a lane this PR cannot start at all — could not be read; the classification's own reason is on stderr). The lane filter was DROPPED for this run (the full evaluated surface was compared) — a MEASURED fallback, never a silent widening. A lane that SHOULD have run and produced no run still refuses at step 1b; only a lane that CANNOT run is skipped."
   fi
 
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \

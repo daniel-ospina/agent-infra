@@ -4,9 +4,18 @@
 # that could never appear:
 #
 #   A. §0b classified a STRUCTURALLY inapplicable lane (its `on:` block declares no
-#      `pull_request` / `pull_request_target`) but then gated the fallback on the
-#      `lane_has_no_head_run` run probe — a second, single-shot gh read whose failure (or
-#      empty answer at t=0) silently left the lane filter in place.
+#      `pull_request` / `pull_request_target`) but then gated the fallback on a boolean
+#      run probe that folded TWO different answers together: `has a run` and `the gh
+#      read FAILED`. So one failed `gh run list` — the actual cause of the measured
+#      3900 s burn — was indistinguishable from "a run exists, wait for it", and the
+#      lane filter stayed in place for the whole window.
+#      ⛔ THE FIX IS NOT "SKIP THE PROBE" (that was a first cut, and it silently
+#      reversed the RECORDED #1614 dead-end gate: a `on: push` lane is STRUCTURAL and
+#      it DOES run on the PR head's own commit). The probe is THREE-valued and its
+#      answer decides — `has-run` keeps the filter and the lane's name (#1614),
+#      `none` widens, and `unreadable` widens ONLY for the structural class, which is
+#      the one class where no run can still appear while the wait runs. This file
+#      pins all three, including the #1614 arm the reversal broke.
 #   B. `atomic-land.sh --no-wait` skipped only its OWN `[2/4] verify` and handed the head
 #      to a land step that waited the rail's full FIRST-CHECKS window — so a caller that
 #      explicitly declined to wait still waited 65 minutes, once per round.
@@ -15,11 +24,14 @@
 # extracted from the REAL `atomic-land.sh`. Both are awk extractions over the shipped
 # files (never copies — a copy would drift), each asserted non-empty and asserted to
 # contain the fix, so a refactor that moves the seam fails loudly instead of testing
-# nothing. A mutation arm rebuilds §0b from a PRE-FIX mutant and shows arm A goes red.
+# nothing. A mutation arm re-introduces the #1614 reversal in a mutant and shows the
+# dead-end-gate arm goes RED there.
 #
 # ✖ The rail's whole behaviour under the knob is pinned by `tests/admin-merge/run.sh`
+# (arm (e) there is the integration proof of the #1614 gate; arm (g) here is the same
+# decision at unit level, and is what the mutation arm discriminates)
 # and the wait itself by `tests/first-checks-lane-rederive/run.sh`; this file pins only
-# the two decisions that were wrong.
+# the decisions that were wrong.
 #
 # Usage: bash tests/issue-2465-inert-wait/run.sh
 #        ADMIN_MERGE_SRC=<path> / ATOMIC_LAND_SRC=<path> to point at a MUTANT
@@ -59,9 +71,10 @@ build_lib() { # $1 = source path, $2 = output file
     printf '%s\n' 'say_err() { printf "%s\n" "$*" >&2; }'
     printf '%s\n' 'info()   { printf "%s\n" "$*" >&2; }'
     # The two collaborators §0b consults. Each appends to $AP_LOG so an arm can assert
-    # WHICH of them decided — the whole point of the fix is that one of them is skipped.
+    # WHICH of them decided. The probe is THREE-valued (has-run | none | unreadable):
+    # the whole point of this fix is that `unreadable` is NOT `has-run`.
     printf '%s\n' 'lane_applicable() { AP_LOG+="lane_applicable "; LANE_APPLICABILITY="$AP_VERDICT"; LANE_APPLICABILITY_REASON="$AP_REASON"; }'
-    printf '%s\n' 'lane_has_no_head_run() { AP_LOG+="probe "; return "${AP_PROBE_RC:-1}"; }'
+    printf '%s\n' 'lane_head_run_state() { AP_LOG+="probe "; LANE_HEAD_RUN_STATE="${AP_PROBE_STATE:-has-run}"; }'
     printf '%s\n' ''
     printf '%s\n' 'run_s0b() {'
     printf '%s\n' '  local ANY_WORKFLOW="$1" WORKFLOW="$2" head="deadbeef" WF_PR_CHANGED_PATHS="scripts/admin-merge.sh" wf_args=() lane="python-ci.yml"'
@@ -79,6 +92,11 @@ build_lib() { # $1 = source path, $2 = output file
     printf '%s\n' '  printf "APLOG=%s\n" "$AP_LOG" >&2'
     printf '%s\n' '}'
     printf '%s\n' "$helper"
+    # The lib is RUN (`bash < lib`), not SOURCED from a `bash -c` payload: a
+    # `source "$1"` token makes the suite's own body unreadable to
+    # main-worktree-guard (#1484), which then refuses to run the suite at all. The
+    # trailing call is what a `source` used to be paired with in the caller.
+    printf '%s\n' 'run_s0b 0 python-ci.yml'
   } > "$out"
   [ -n "$block" ] && [ -n "$helper" ]
 }
@@ -87,52 +105,86 @@ LIB="$TMP/lib.sh"
 ck "extracted the §0b block and lane_no_pr_trigger from $(basename "$SRC")" "$(build_lib "$SRC" "$LIB" && echo 0 || echo 1)"
 ck "the extracted block CONTAINS the structural branch (not testing an empty seam)" \
    "$(grep -q 'lane_no_pr_trigger "\$LANE_APPLICABILITY_REASON"' "$LIB" && echo 0 || echo 1)"
+ck "the extracted block CONSULTS the three-valued run probe (the #1614 gate is in the seam)" \
+   "$(grep -q 'lane_head_run_state "\$head"' "$LIB" && echo 0 || echo 1)"
 
-# drive <verdict> <reason> <probe_rc> → sets R_ANY / R_WFARGS / R_LANE / R_LOG / R_ERR
+# drive <verdict> <reason> <probe_state> → sets R_ANY / R_WFARGS / R_LANE / R_LOG / R_ERR
+# ⛔ `bash < "$LIB"`, NEVER `bash -c 'source "$1"'`: the suite must stay RUNNABLE
+# (main-worktree-guard #1484 refuses any body containing an unresolvable script
+# token, and the suite is exactly such a body — this is pre-existing friction the
+# reviewer recorded, not the PR's change, but a suite nobody can run pins nothing).
 drive() {
-  R_ERR="$(AP_VERDICT="$1" AP_REASON="$2" AP_PROBE_RC="$3" bash -c '
-    source "$1"
-    run_s0b 0 python-ci.yml
-  ' _ "$LIB" 2>&1 >/dev/null)"
+  R_ERR="$(AP_VERDICT="$1" AP_REASON="$2" AP_PROBE_STATE="$3" bash < "$LIB" 2>&1 >/dev/null)"
   R_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$R_ERR")"
   R_WFARGS="$(sed -n 's/^WF_ARGS=//p' <<<"$R_ERR")"
   R_LANE="$(sed -n 's/^LANE=//p' <<<"$R_ERR")"
   R_LOG="$(sed -n 's/^APLOG=//p' <<<"$R_ERR")"
 }
 
-# ── (a) STRUCTURAL class + a probe that says "has a run" ────────────────────
-echo "(a) STRUCTURAL (no PR trigger) + the run probe says 'has a run' — the #2465 defect arm"
-drive inapplicable 'lane-applicable: no-pr-trigger — the workflow'"'"'s on: block declares no pull_request / pull_request_target, so no run of it can attach to a PR head (declared triggers: workflow_call)' 1
-ck "(a) the fallback FIRED: ANY_WORKFLOW=1 (was 0 → the wait then polled a lane that cannot run, 3900s/round)" \
+# ── (a) STRUCTURAL class + an UNREADABLE probe — #2465's MEASURED case ──────
+echo "(a) STRUCTURAL (no PR trigger) + the run probe READ FAILED — #2465's actual 3900s burn"
+drive inapplicable 'lane-applicable: no-pr-trigger — the workflow'"'"'s on: block declares no pull_request / pull_request_target, so no run of it can attach to a PR head (declared triggers: workflow_call)' unreadable
+ck "(a) the fallback FIRED: ANY_WORKFLOW=1 (was 0 under the boolean probe → the wait then polled a lane that cannot run, 3900s/round)" \
    "$([ "$R_ANY" = 1 ] && echo 0 || echo 1)"
 ck "(a) the lane filter is dropped in the SAME path --any-workflow uses (wf_args='$R_WFARGS', lane='$R_LANE')" \
    "$([ "$R_WFARGS" = "--any-workflow" ] && [ "$R_LANE" = "any workflow" ] && echo 0 || echo 1)"
-ck "(a) the run probe was NEVER CONSULTED (its answer cannot change a structural verdict); calls='$R_LOG'" \
-   "$(grep -q 'probe' <<<"$R_LOG" && echo 1 || echo 0)"
+ck "(a) the probe WAS consulted and its answer is the UNREADABLE one ('$R_LOG')" \
+   "$(grep -q 'probe' <<<"$R_LOG" && echo 0 || echo 1)"
 ck "(a) it names the STRUCTURAL dead-end class (so this is not confused with 'not run yet')" \
    "$(grep -q 'dead-end class: STRUCTURAL' <<<"$R_ERR" && echo 0 || echo 1)"
+ck "(a) it says the read FAILED (not that a run was measured absent)" \
+   "$(grep -q 'read FAILED' <<<"$R_ERR" && echo 0 || echo 1)"
+ck "(a) ⛔ it does NOT claim the lane has no run for the head — the probe never answered that (review P2)" \
+   "$(grep -q 'lane has NO run for head' <<<"$R_ERR" && echo 1 || echo 0)"
 ck "(a) it still prints the loud LANE INAPPLICABLE heading and the §4.5 reassurance" \
    "$(grep -q 'LANE INAPPLICABLE' <<<"$R_ERR" && grep -q '§4.5' <<<"$R_ERR" && echo 0 || echo 1)"
 
-# ── (b) STRUCTURAL class + probe that says "no run" ─────────────────────────
-echo "(b) STRUCTURAL (no PR trigger) + the run probe says 'no run' — pre-existing behaviour preserved"
-drive inapplicable 'lane-applicable: no-pr-trigger — the workflow declares no pull_request (declared triggers: workflow_call)' 0
+# ── (b) STRUCTURAL class + probe that MEASURED "no run" ────────────────────
+echo "(b) STRUCTURAL (no PR trigger) + the run probe MEASURED no run — dead end on the measurement"
+drive inapplicable 'lane-applicable: no-pr-trigger — the workflow declares no pull_request (declared triggers: workflow_call)' none
 ck "(b) the fallback fires (ANY_WORKFLOW=1)" "$([ "$R_ANY" = 1 ] && echo 0 || echo 1)"
-ck "(b) and the probe was skipped here too — one decision, one path" \
-   "$(grep -q 'probe' <<<"$R_LOG" && echo 1 || echo 0)"
+ck "(b) and the probe WAS consulted — one decision, one probe" \
+   "$(grep -q 'probe' <<<"$R_LOG" && echo 0 || echo 1)"
+ck "(b) it reports the measurement it actually took ('MEASURED: an empty listing, not a read failure')" \
+   "$(grep -q 'MEASURED: an empty listing, not a read failure' <<<"$R_ERR" && echo 0 || echo 1)"
+ck "(b) and it does NOT claim a failed read" \
+   "$(grep -q 'read FAILED' <<<"$R_ERR" && echo 1 || echo 0)"
 
-# ── (c) paths-excluded: the probe STILL decides ─────────────────────────────
+# ── (c) paths-excluded: the probe STILL decides ────────────────────────────
 echo "(c) paths-excluded (a REAL PR trigger that matched nothing) — the probe must still decide"
-drive inapplicable 'lane-applicable: paths-excluded — the declared PR trigger'"'"'s path filter matches none of this PR'"'"'s changed files' 1
+drive inapplicable 'lane-applicable: paths-excluded — the declared PR trigger'"'"'s path filter matches none of this PR'"'"'s changed files' has-run
 ck "(c) probe says 'has a run' → NO fallback (ANY_WORKFLOW=0): a lane that DID run is not a dead end" \
    "$([ "$R_ANY" = 0 ] && echo 0 || echo 1)"
 ck "(c) and the probe WAS consulted ($R_LOG)" "$(grep -q 'probe' <<<"$R_LOG" && echo 0 || echo 1)"
-ck "(c) the NOT-RUN class text is the one printed, never STRUCTURAL" \
-   "$(grep -q 'dead-end class: STRUCTURAL' <<<"$R_ERR" && echo 1 || echo 0)"
-drive inapplicable 'lane-applicable: paths-excluded — no declared PR trigger can fire for this changed set' 0
+ck "(c) neither dead-end class text is printed (nothing was widened, so nothing to explain)" \
+   "$(grep -Eq 'dead-end class: (STRUCTURAL|NOT-RUN)' <<<"$R_ERR" && echo 1 || echo 0)"
+drive inapplicable 'lane-applicable: paths-excluded — no declared PR trigger can fire for this changed set' none
 ck "(c2) probe says 'no run' → fallback fires (ANY_WORKFLOW=1), the #1614 dead-end repair intact" \
    "$([ "$R_ANY" = 1 ] && echo 0 || echo 1)"
 ck "(c2) it names the NOT-RUN class" "$(grep -q 'dead-end class: NOT-RUN' <<<"$R_ERR" && echo 0 || echo 1)"
+drive inapplicable 'lane-applicable: paths-excluded — no declared PR trigger can fire for this changed set' unreadable
+ck "(c3) probe says 'UNREADABLE' on a NON-structural class → NO fallback: a run can still appear, so an unread answer is not an exemption (#1614 fail-closed)" \
+   "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+
+# ── (g) STRUCTURAL + the lane HAS a run for the head → NO widening (#1614) ──
+# This is the RECORDED #1614 dead-end gate. A first cut of #2465 skipped the probe
+# for the structural class and broke it as a side effect; `tests/admin-merge/run.sh`
+# arm (e) is the integration proof, this is the same decision at unit level and the
+# arm the mutation below discriminates.
+# ⚠️ SCOPE OF THIS ARM: the probe is STUBBED here (`lane_head_run_state` is replaced),
+# so this pins §0b's POLICY on the answer, never the probe's own scoping/plumbing —
+# a mutant that declared LANE_HEAD_RUN_STATE `local` inside the probe leaves (g) green.
+# That regression is caught by rail arm (e), which runs the real helper.
+echo "(g) STRUCTURAL (no PR trigger) + the lane HAS a run for the head — the #1614 dead-end gate"
+drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: push)' has-run
+ck "(g) NO gratuitous widening (ANY_WORKFLOW=0, wf_args='$R_WFARGS') — 'otherwise every trigger-split repo silently becomes --any-workflow'" \
+   "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+ck "(g) the certificate keeps naming the requested lane (lane='$R_LANE')" \
+   "$([ "$R_LANE" = "python-ci.yml" ] && echo 0 || echo 1)"
+ck "(g) no 'LANE INAPPLICABLE' line (that string means the lane was DROPPED)" \
+   "$(grep -q 'LANE INAPPLICABLE' <<<"$R_ERR" && echo 1 || echo 0)"
+ck "(g) but the decision is SAID OUT LOUD, not silent (#2465's confusion was silence)" \
+   "$(grep -q 'LANE KEPT' <<<"$R_ERR" && echo 0 || echo 1)"
 
 # ── (d) unknown: fail closed, but NOT silently ──────────────────────────────
 echo "(d) UNMEASURED applicability — fail closed, and say so at the point the decision is made"
@@ -154,30 +206,31 @@ ck "(e) ANY_WORKFLOW stays 0 and wf_args stays empty" \
 ck "(e) no LANE INAPPLICABLE / UNMEASURED noise" \
    "$(grep -Eq 'LANE INAPPLICABLE|APPLICABILITY UNMEASURED' <<<"$R_ERR" && echo 1 || echo 0)"
 
-# ── (f) MUTATION PROOF — remove the structural branch, arm (a) must go RED ──
-echo "(f) MUTATION: the structural branch removed from a mutant copy → arm (a) is RED there"
+# ── (f) MUTATION PROOF — drop the #1614 gate, arm (g) must go RED ─────────
+# The mutation is the REVERSAL the review found: `has-run` widens for the structural
+# class (the reviewed head skipped the probe entirely, which is the same behaviour for
+# the structural class). If arm (g) cannot tell this source from that one, arm (g) is
+# not pinning the recorded decision.
+echo "(f) MUTATION: the #1614 gate removed from a mutant copy → arm (g) is RED there"
 MUT="$TMP/mutant.sh"
-# The mutation is the PRE-FIX source: §0b gated the whole fallback on the run probe.
 awk '
-  /^        local lane_dead_end=0$/ { skip = 1; next }
-  skip && /^        if \[ "\$lane_dead_end" -eq 1 \]; then$/ {
-    print "        if lane_has_no_head_run \"$head\"; then"; skip = 0; next
+  /^          has-run\) lane_dead_end=0 ;;$/ {
+    print "          has-run) lane_dead_end=1 ;;"; n++; next
   }
-  skip && /^        elif lane_has_no_head_run "\$head"; then$/ { next }
-  skip && /^        fi$/ { next }
-  skip { next }
   { print }
+  END { exit (n == 1 ? 0 : 1) }
 ' "$SRC" > "$MUT"
+ck "(f) the mutation applied EXACTLY once to the 'has-run' decision (a silent no-op mutation would prove nothing)" "$?"
 ck "(f) the mutant parses (bash -n)" "$(bash -n "$MUT" 2>/dev/null && echo 0 || echo 1)"
 MUTLIB="$TMP/mutant-lib.sh"
 build_lib "$MUT" "$MUTLIB"
-ck "(f) the mutant's DECISION no longer consults the structural class (no lane_dead_end gate left)" \
-   "$(grep -q 'lane_dead_end' "$MUTLIB" && echo 1 || echo 0)"
-MUT_ERR="$(AP_VERDICT="inapplicable" AP_REASON='lane-applicable: no-pr-trigger — declares no pull_request' AP_PROBE_RC=1 \
-  bash -c 'source "$1"; run_s0b 0 python-ci.yml' _ "$MUTLIB" 2>&1 >/dev/null)"
+ck "(f) the mutant still builds a lib with the decision in it (not testing an empty seam)" \
+   "$(grep -q 'lane_dead_end' "$MUTLIB" && echo 0 || echo 1)"
+MUT_ERR="$(AP_VERDICT="inapplicable" AP_REASON='lane-applicable: no-pr-trigger — declares no pull_request' AP_PROBE_STATE=has-run \
+  bash < "$MUTLIB" 2>&1 >/dev/null)"
 MUT_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$MUT_ERR")"
-ck "(f) against the mutant, arm (a)'s assertion is RED (ANY_WORKFLOW='$MUT_ANY' — the pre-fix 3900s behaviour)" \
-   "$([ "$MUT_ANY" = 0 ] && echo 0 || echo 1)"
+ck "(f) against the mutant, arm (g)'s assertion is RED (ANY_WORKFLOW='$MUT_ANY' — a lane that DID run for the head is widened away)" \
+   "$([ "$MUT_ANY" = 1 ] && echo 0 || echo 1)"
 
 echo
 echo "── B. atomic-land --no-wait must REACH the step that waits ────────────────"
@@ -194,6 +247,8 @@ ck "the extracted do_land CARRIES --no-wait to the land step (the fix is in the 
   printf '%s\n' 'MERGE_FLAGS=()'
   printf '%s\n' 'PR=2513'
   printf '%s\n' "$DO_LAND"
+  # RUN the lib's driver step (see `drive`: `bash < lib`, never a `source "$1"`).
+  printf '%s\n' 'do_land'
 } > "$DLIB"
 
 # The fake land step ANNOUNCES what it was handed — the assertion is on the child's
@@ -219,7 +274,7 @@ land_err() {
   [ -n "${2:-}" ] && pre=("ADMIN_MERGE_FIRST_CHECKS_WAIT=$2")
   NO_WAIT="$1" DRY_RUN="${3:-0}" QUEUE_MODE="${4:-0}" ADMIN_MERGE="$FAKE_LAND" \
     env -u ADMIN_MERGE_FIRST_CHECKS_WAIT ${pre[@]+"${pre[@]}"} \
-    bash -c 'source "$1"; do_land' _ "$DLIB" 2>&1 >/dev/null
+    bash < "$DLIB" 2>&1 >/dev/null
 }
 saw() { sed -n 's/^LAND_SAW_WAIT=\[//p' <<<"$1" | sed 's/\]$//'; }
 

@@ -14,8 +14,11 @@ reached before the wait:
    `.github/workflows/<lane>` at the head through `lane_applicable`, which in
    `lane-applicable` mode answers `no-pr-trigger` when the workflow declares no
    `pull_request` / `pull_request_target` (`scripts/ci-workflow-pr-evaluable.sh:826-833`).
-2. It then required **`lane_has_no_head_run "$head"`** — a second, single-shot gh read
-   (`scripts/admin-merge.sh`, `lane_has_no_head_run`) — before setting `ANY_WORKFLOW=1`.
+2. It then required a **boolean** run probe (`lane_has_no_head_run`) — a second, single-shot
+   gh read — before setting `ANY_WORKFLOW=1`. That boolean merged two different answers
+   ("a run exists for this head" and "the gh read failed"), which is what this fix removes:
+   the probe is three-valued (`lane_head_run_state` → `has-run` / `none` / `unreadable`), and
+   each answer has its own policy per class (see R1/R7).
 3. The **FIRST-CHECKS wait** (`wait_for_first_checks`) filters its run list on `$WORKFLOW`
    unless `ANY_WORKFLOW=1`, and its own #2862 re-derive only fires when the head already
    carries check-runs.
@@ -56,7 +59,7 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 
 | Call site / consumer | What it does there |
 |---|---|
-| `main()` §0b `admin-merge.sh` | the only caller of `lane_applicable` / `lane_has_no_head_run` / (new) `lane_no_pr_trigger`; sets `ANY_WORKFLOW`, `wf_args`, `lane` |
+| `main()` §0b `admin-merge.sh` | the only caller of `lane_applicable` / `lane_head_run_state` (three-valued) / `lane_no_pr_trigger`; sets `ANY_WORKFLOW`, `wf_args`, `lane` |
 | `wait_for_first_checks` | reads `ANY_WORKFLOW` to decide `lane_filter_active` — consumes §0b's decision, unchanged |
 | `lane_run_ids`, certificate, failure-set lane | read `wf_args` / `ANY_WORKFLOW`; the same single path `--any-workflow` sets (unchanged by this fix) |
 | §4.5 `check_surface_probe "\$head" "the PR's evaluated tree"` | the gate that still refuses a red on every workflow — not touched |
@@ -84,9 +87,13 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 
 **Risk surface** — what this change can break, each with the check that would catch it:
 
-- R1 the structural class widens the lane filter for a lane that **did** run → caught by the
-  superset argument + A(c) (probe still decides for `paths-excluded`) and
-  `tests/first-checks-lane-rederive/run.sh` arm (b2) (drop ≡ `--any-workflow` verdict).
+- R1 a structural lane that **did** run for the head loses its filter — the RECORDED #1614
+  dead-end gate (`f2e84b617` / PR #1619), whose reversal would make "every trigger-split repo
+  silently become `--any-workflow`" → the probe is consulted for every INAPPLICABLE class, so
+  `has-run` never widens; caught by `tests/admin-merge/run.sh` §#1614 arm (e) (fixture
+  UNCHANGED, green) at integration level, and by unit arm (g) in
+  `tests/issue-2465-inert-wait/run.sh`, with mutant (f) proving (g) is red against the
+  reversal. A(c) + `first-checks-lane-rederive` arm (b2) still cover the `paths-excluded` half.
 - R2 an unmeasurable applicability becomes an exemption (fail-open) → A(d) asserts
   `ANY_WORKFLOW` stays 0 and `wf_args` stays empty.
 - R3 the fallback body silently no-ops (the `${VAR:-word}` apostrophe trap already documented
@@ -96,6 +103,10 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 - R5 the carry leaks into the default path → B2 (child sees the variable unset).
 - R6 the wait's own contract (budget, stall, ceiling, §4.5) is altered as a side effect →
   the wait function is **not touched**; `tests/first-checks-lane-rederive/run.sh` re-run green.
+- R7 the fallback text asserts a measurement the code did not take (review P2) → the STRUCTURAL
+  class widens on TWO grounds (`none` and `unreadable`) and only one of them measured "no run",
+  so the class text branches on the probe state; unit arm (a) asserts the `unreadable` case does
+  NOT claim "the lane has NO run for head" and the certificate line was corrected the same way.
 
 **Threat classes** (`gate-enforcement`): `T1` fail-open by widening the merge surface — must be
 impossible; the only widening is to the surface `--any-workflow` already selects, and §4.5
@@ -105,3 +116,8 @@ without the branch, and (f) rebuilds the pre-fix decision from a mutant to prove
 **Out of scope — must NOT be raised**: the #2862 re-derive budget semantics (recorded decision);
 the FIRST-CHECKS window's documented bounds; `paths-excluded` probe semantics; the `--queue`
 land path; any pre-existing gh-quota behaviour.
+
+**Explicitly IN scope and defended**: the #1614 dead-end gate. A first cut of this fix reversed it
+as a side effect (it skipped the probe for the structural class); the gate is now re-stated at
+`scripts/admin-merge.sh` (`lane_no_pr_trigger`) and pinned by arm (e) + unit arm (g) + mutant (f),
+so a future trigger-shape refactor cannot drop it silently again.
