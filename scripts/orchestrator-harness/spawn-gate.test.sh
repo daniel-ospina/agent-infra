@@ -2541,6 +2541,20 @@ grep -q 'VERSION SKEW' "$LOG"; rc=$?
 ck "...and the remedy names what a usage error actually is — helper/consumer skew, not the extension set" $rc
 grep -q 'do NOT dispatch the item elsewhere' "$LOG"; rc=$?
 ck "...and says the refusal is NOT a box property, so a peer must not be handed the item" $rc
+# (g2b) A STALE CHECKOUT IS NOT A CAPACITY SHORTFALL (#3932). The reason had no arm, so it took the
+# generic *"the reading above names the refusal"* arm and the caller published the 71 text — "dispatch
+# the issue to another box" — for a fault the measurement found on EVERY cell (496-7093 commits
+# behind). The item then circulates between cells that refuse identically and is never built. The
+# refusal itself is correct (no agent was started, nothing consumed): it is the REMEDY that was wrong.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=stale-code host=x answered_ms=900 attempts=1 bound=45s repo=tortoise behind=542 max_behind=50' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a stale-checkout refusal starts NO agent (rc=$CRC)" $rc
+grep -q 'more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main' "$LOG"; rc=$?
+ck "...and its remedy names the reading instead of the generic one" $rc
+grep -q 'do NOT assume a peer is current' "$LOG"; rc=$?
+ck "...and does not hand the item to a peer, because the measured fleet was stale on every cell" $rc
 # (g3) A REFUSAL'S READING IS NOT ITS VERDICT (follow-up to #2991, P3, measured). `why=no-return` and
 # `why=call-failed` end in `tail=<last 240 bytes of pi's own output>`, and the arms above were chosen
 # by a substring test over the WHOLE line — so a deterministic refusal whose tail happened to embed
