@@ -253,6 +253,41 @@ async function main() {
     const s7free = await quiet(() => callBash(`git push origin --delete stale && git push origin --delete stale2`));
     expectTrue("S7 F3 control: two deletes of unheld branches → ALLOWED (no false block)",
       s7free === undefined, `handler returned ${JSON.stringify(s7free)?.slice(0, 200)}`);
+
+    // ── Scenario 8 (review round-5 F1): the mutation list must contain only
+    // invocations the command ACTUALLY contains. It used to synthesize one from
+    // `det.commitHints`/`det.pushHints` when the classifier saw none, which is
+    // unreachable at the M2 arm (the verdict implies the invocation) but NOT at
+    // the arms that gate without such a verdict: a `git pull --ff-only` got a
+    // phantom push whose null hints resolved at the session cwd, so #2277's own
+    // recovery shape — a lane rooted OUTSIDE any git repo syncing a clean hub —
+    // was refused with "⛔ git commit/push blocked — could not verify repo
+    // ownership" on a command containing no commit and no push (MEASURED).
+    //
+    // This scenario needs a real upstream, because #2277's allowance admits only a
+    // PROVEN fast-forward onto the checkout's own upstream: a bare origin, the hub
+    // one commit behind it, and a session rooted in a NON-git directory.
+    const ffOrigin = join(tmp, "origin.git");
+    const ffClone = join(tmp, "ff-clone");
+    const outside = join(tmp, "outside-any-repo");
+    execSync(`git init -q --bare "${ffOrigin}"`, { stdio: "ignore" });
+    execSync("git symbolic-ref HEAD refs/heads/main", { cwd: ffOrigin, stdio: "ignore" });
+    execSync(`git remote add fforigin "${ffOrigin}"`, { cwd: hub, stdio: "ignore" });
+    execSync("git push -q fforigin main", { cwd: hub, stdio: "ignore" });
+    execSync(`git clone -q -b main "${ffOrigin}" "${ffClone}"`, { stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: ffClone, stdio: "ignore" });
+    writeFileSync(join(ffClone, "second.txt"), "y\n");
+    execSync("git add -A && git commit -qm second && git push -q origin main", { cwd: ffClone, stdio: "ignore" });
+    execSync("git remote set-head fforigin main", { cwd: hub, stdio: "ignore" });
+    execSync("git fetch -q fforigin", { cwd: hub, stdio: "ignore" });
+    execSync(`mkdir -p "${outside}"`);
+    process.chdir(outside); // session rooted OUTSIDE any git repo (#2277's shape)
+    const s8 = await quiet(() => callBash(`cd "${hub}" && git pull --ff-only`));
+    expectTrue("S8 F1-r5: a `git pull --ff-only` compound (no commit, no push) is NOT refused — no phantom mutation is gated",
+      s8 === undefined, `handler returned ${JSON.stringify(s8)?.slice(0, 240)}`);
+    const s8c = await quiet(() => callBash(`git -C "${hub}" pull --ff-only`));
+    expectTrue("S8 F1-r5: same, `-C` spelling → not refused",
+      s8c === undefined, `handler returned ${JSON.stringify(s8c)?.slice(0, 240)}`);
   } catch (e) {
     expectTrue("#605 integration ran without throwing", false, String(e?.stack ?? e).slice(0, 400));
   } finally {

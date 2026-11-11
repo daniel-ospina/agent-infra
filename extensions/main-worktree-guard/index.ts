@@ -6202,17 +6202,21 @@ export default function (pi: ExtensionAPI) {
       // and every main-resolving one is gated — block wins — exactly as the
       // round-4 M3 stateMutations loop does for branch-state mutations.
       const m2Mutations: any[] = [];
-      const commitMuts = (det.commitMutations && det.commitMutations.length > 0)
-        ? det.commitMutations
-        : (det.verdict === "block:commit"
-          ? [{ verb: "commit", invVisible: true, hints: det.commitHints ?? null, targets: null, dst: null }]
-          : []);
-      const pushMuts = (det.pushMutations && det.pushMutations.length > 0)
-        ? det.pushMutations
-        : (det.verdict !== "block:commit"
-          ? [{ verb: "push", invVisible: true, hints: det.pushHints ?? null, targets: det.pushTargets, dst: det.pushDst, isDelete: false }]
-          : []);
-      m2Mutations.push(...commitMuts, ...pushMuts);
+      // ⛔ ONLY INVOCATIONS THE COMMAND ACTUALLY CONTAINS (review round-5 F1).
+      // This list used to SYNTHESIZE a mutation from `det.commitHints`/
+      // `det.pushHints` when the classifier saw none — a fallback with no
+      // referent: a `block:commit`/`block:push` verdict is only ever set because
+      // an invocation exists (`classify-git.mjs` sets it from `commitInv`/
+      // `pushInv`), and a degraded classifier returns `verdict: "allow"` and
+      // leaves this path entirely. Its only effect was on the arms that gate
+      // WITHOUT such a verdict: a `git pull --ff-only` (verdict block:pull, no
+      // push invocation at all) got a PHANTOM push whose null hints resolved at
+      // the session cwd, so a lane rooted outside any git repo — #2277's own
+      // recovery shape — was refused with "⛔ git commit/push blocked — could not
+      // verify repo ownership" on a command containing no commit and no push
+      // (MEASURED). Gating must judge the compound's real invocations, exactly as
+      // the comparator's per-subcommand model does.
+      m2Mutations.push(...(det.commitMutations ?? []), ...(det.pushMutations ?? []));
       // #805/#605: gate ONE commit/push mutation. Returns the refusal, or
       // undefined when this mutation is exempt/on-baseline.
       const gateOneMutation = (mu: any): { block: true; reason: string } | undefined => {
