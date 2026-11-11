@@ -112,7 +112,7 @@ cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key` a
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability /
-  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 memory / 82 key / 83 harness-skew), not a gate: an
+  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 memory / 82 key / 83 harness-skew / 85 stale-code), not a gate: an
   # unrecognised value is reported as
   # `load` because the refusal
   # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
