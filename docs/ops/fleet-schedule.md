@@ -168,7 +168,10 @@ fourth state and no silent absence: this table is what makes "deployed" checkabl
   a live loop fails too: a loop started before this record existed cannot be shown to run the code on
   disk, so absence is the pre-fix build, not a clean arm. `--start`/`--install` restart such a loop
   (after the declarations validate) instead of reporting `already running`, and `--status` prints it
-  as `code=current` / `code=STALE`;
+  as `code=current` / `code=STALE`. ⛔ ONE EXCEPTION, and it belongs to the BOX rather than this home:
+  when the box lock is held by ANOTHER state dir, neither verb touches that loop — it reports the
+  holder's own stamp and names the home that must act, because re-homing the box's scheduler is a
+  decision, not a repair (`#2890`, one loop per box);
 - a tick older than `max(3 × tick, 300 s)` while **no job is running** (the process exists but is
   not passing). A job that is running announces itself in `state/busy/<label>.json` with an
   expiring deadline, so a job the templates budget 1800 s for is reported `BUSY`, not `stale` —
@@ -250,10 +253,13 @@ target inside the layer) is exit **1** there too.
 ```bash
 python3 scripts/fleet-schedule.py --check     # DECLARATIONS only: exit 1 if this runtime cannot run the shipped set, 3 if there is no declaration set to grade (a box that was never installed)
 python3 scripts/fleet-schedule.py --install   # converge, run the due jobs NOW, start the loop, verify
+                                              # (never when ANOTHER state dir holds the box's lock: it
+                                              # reports that loop's state and names the home that must act)
 python3 scripts/fleet-schedule.py --status    # the table above
 python3 scripts/fleet-schedule.py --verify    # exit 1 on any arm above
 python3 scripts/fleet-schedule.py --start     # idempotent; clears the OFF switch, replaces a recycled pid,
-                                              # and restarts a loop running an older build than the file
+                                              # and restarts a loop running an older build than the file —
+                                              # except a loop owned by ANOTHER state dir, which it reports
 python3 scripts/fleet-schedule.py --stop      # OFF switch + SIGTERM (creates the state dir if needed)
 ```
 
