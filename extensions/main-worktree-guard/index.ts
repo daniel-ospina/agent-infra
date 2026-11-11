@@ -219,6 +219,12 @@ let extractScriptPaths: (command: string) => string[] = (command) => {
   return p ? [p] : [];
 };
 let extractHeredocProgramScriptPaths: (command: string) => string[] = () => [];
+// #523 review round-4: the SAME set, with each path's per-invocation provenance
+// (`interpreted`: the body line hands the file to a reader, vs. executes it
+// directly). Default `[]` — a degraded import then falls back to
+// `scriptIsInterpreted` alone for every body path, which is the pre-#523
+// behaviour and never fail-open.
+let extractHeredocProgramScriptInvocations: (command: string) => { path: string; interpreted: boolean }[] = () => [];
 let extractScriptArgs: (command: string, scriptPath: string) => string[] = () => [];
 let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null, opts?: { viaInterpreter?: boolean }) => "allow" | "block" = () => "allow";
 // #1485: does the invocation hand the file to an INTERPRETER (text) or execute
@@ -428,6 +434,9 @@ try {
   if (typeof _m5.extractScriptPaths === "function") extractScriptPaths = _m5.extractScriptPaths;
   if (typeof _m5.extractHeredocProgramScriptPaths === "function") {
     extractHeredocProgramScriptPaths = _m5.extractHeredocProgramScriptPaths;
+  }
+  if (typeof _m5.extractHeredocProgramScriptInvocations === "function") {
+    extractHeredocProgramScriptInvocations = _m5.extractHeredocProgramScriptInvocations;
   }
   // Stale-classify-git skew guard: a missing export must leave the fail-safe
   // defaults (never overwrite a function with undefined → TypeError on the
@@ -5087,12 +5096,34 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // file the body actually executed was never read.
     const scriptPaths = extractScriptPaths(command);
     if (scriptPaths.length === 0) return null;
-    // A path a heredoc BODY executes is executed BY THE SHELL, so its bytes are
-    // never an "opaque binary" — bash reads an ENOEXEC file as a shell script
-    // (#1485's `isOpaqueExecutablePath` stand-down must not apply to it).
+    // Which of those paths came from a heredoc BODY, and — per invocation —
+    // whether that body line HANDS THE FILE TO A READER (#523 review round-4).
+    //
+    // ⛔ `viaBody` ALONE WAS THE OVER-BLOCK. It forced `viaInterpreter`, and
+    // `viaInterpreter` is exactly what switches off the #1485 stand-down. But a
+    // bare body line is a DIRECT execution: the shell `execve`s it, the kernel
+    // runs the ELF/Mach-O, and no interpreter ever reads the bytes — bash's
+    // ENOEXEC→shell-script fallback applies only to files the kernel CANNOT
+    // exec. Measured on the head that forced it: a `bash` heredoc body whose
+    // single line is `/usr/bin/git status` BLOCKED while `main` ALLOWED it (a Go
+    // binary's bytes contain git-shaped prose) — the exact defect #1485 exists to
+    // prevent, re-created on a new surface, with no assertion to red on it. The
+    // provenance below is what replaces the blanket flag; `bash x.sh` /
+    // `bash < x.sh` / `. x.sh` INSIDE a body still report `interpreted: true`, so
+    // they stay gated.
     const bodyScriptPaths = new Set(extractHeredocProgramScriptPaths(command));
+    const bodyInterpretedPaths = new Set<string>();
+    for (const inv of extractHeredocProgramScriptInvocations(command)) {
+      if (inv && inv.interpreted === true) bodyInterpretedPaths.add(inv.path);
+    }
     for (const scriptPath of scriptPaths) {
-      const blocked = _gateScriptPathContent(command, scriptPath, execCwd, bodyScriptPaths.has(scriptPath));
+      const blocked = _gateScriptPathContent(
+        command,
+        scriptPath,
+        execCwd,
+        bodyScriptPaths.has(scriptPath),
+        bodyInterpretedPaths.has(scriptPath),
+      );
       if (blocked) return blocked;
     }
     return null;
@@ -5105,10 +5136,12 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
 // (body indentation preserved, so the move is one reviewable hunk rather than a
 // reindent) so it can run once per script the command executes — a heredoc body
 // is a program and may execute several. Returns the block REASON, or null when
-// this script is clean. `viaBody` marks a path a heredoc body executes: the
-// shell reads such a file as a program however its bytes begin, so the
-// opaque-binary stand-down (#1485) does not apply.
-function _gateScriptPathContent(command: string, scriptPath: string, execCwd: string | undefined, viaBody: boolean): string | null {
+// this script is clean. `viaBody` marks a path a heredoc body resolves, and
+// `bodyInterpreted` marks the SUBSET of those whose body invocation hands the
+// file to a READER (`bash x.sh`, `bash < x.sh`, `. x.sh`) rather than executing
+// it directly — only then is the file's text read, so only then does the
+// opaque-binary stand-down (#1485) not apply.
+function _gateScriptPathContent(command: string, scriptPath: string, execCwd: string | undefined, viaBody: boolean, bodyInterpreted: boolean): string | null {
     // #347: resolve the script path + content gating against the command's
     // EXECUTION cwd (cd-resolved), not the session cwd — a hub session running
     // `cd <wt> && bash x.sh` resolves x.sh inside the worktree.
@@ -5182,11 +5215,13 @@ function _gateScriptPathContent(command: string, scriptPath: string, execCwd: st
     // #1485 (review cycle 3): a magic header does not make a file a binary when a
     // SHELL is asked to read it — `bash x` strips the first line and runs the rest,
     // so a `printf`-prefixed script skipped the walk entirely. The invocation decides.
-    // #523: a heredoc BODY executes its files THROUGH the shell, so the
-    // interpreter verdict is forced — bash reads an ENOEXEC file as a shell
-    // script, and `scriptIsInterpreted` cannot see an interpreter in front of a
-    // body line (there isn't one in argv).
-    const viaInterpreter = viaBody || scriptIsInterpreted(command, scriptPath);
+    // #523 review round-4: a heredoc BODY no longer forces the interpreter verdict
+    // for every path it resolves — the forcing belongs to the INVOCATION, so the
+    // body's own provenance (`bodyInterpreted`) supplies it, and the pre-#523
+    // command-line scan is kept as the OR so a path named BOTH on the command line
+    // and in a body is still gated for its command-line occurrence (dropping that
+    // OR would be a fail-OPEN against `main` for `bash x.sh <<EOF … x.sh … EOF`).
+    const viaInterpreter = scriptIsInterpreted(command, scriptPath) || (viaBody && bodyInterpreted);
     if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd()), scriptArgs, { viaInterpreter }) === "block") {
       // #743: label the SCRIPT's own checkout, not the session's. A linked
       // worktree's copy is not "the shared main checkout", and the old message

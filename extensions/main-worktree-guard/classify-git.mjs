@@ -10672,21 +10672,38 @@ const _PROGRAM_FRAME_WORDS = new Set([
 /**
  * Resolve the script FILE the simple command at `tokens[i0]` executes.
  *
- * Returns `{ path, next, stdinProgram }`: `path` is the script operand (or
- * null), `next` is the index a PROGRAM walk resumes from (the next command
- * boundary), and `stdinProgram` says whether the interpreter's program comes
- * from STDIN at all — i.e. no script operand, no `-c`/`--command` inline
+ * Returns `{ path, next, stdinProgram, interpreted }`: `path` is the script
+ * operand (or null), `next` is the index a PROGRAM walk resumes from (the next
+ * command boundary), `stdinProgram` says whether the interpreter's program
+ * comes from STDIN at all — i.e. no script operand, no `-c`/`--command` inline
  * string, no process-substitution operand, and no fd-0 FILE redirect left
- * standing (#523 round-2). Only `path` is read by `extractScriptPath`, so the
- * command-line semantics are exactly what they were — `next` and
- * `stdinProgram` exist for the heredoc-body walk, which must see every command
- * in a program and must know whether a body is that program (#523).
+ * standing (#523 round-2) — and `interpreted` says HOW `path` runs. Only `path`
+ * is read by `extractScriptPath`, so the command-line semantics are exactly what
+ * they were; the other three exist for the heredoc-body walk, which must see
+ * every command in a program, must know whether a body is that program, and
+ * must know per PATH whether the shell READS the file (#523 review round-4 —
+ * see `extractHeredocProgramScriptInvocations`).
  * @param {string[]} tokens
  * @param {number} i0
- * @returns {{path: string|null, next: number, stdinProgram: boolean}}
+ * @returns {{path: string|null, next: number, stdinProgram: boolean, interpreted: boolean}}
  */
 function _scriptInvocationAt(tokens, i0) {
-  const done = (path, from) => ({ path, next: _nextScriptCommandAt(tokens, from), stdinProgram: false });
+  // `interpreted` (#523 round-4) distinguishes the two ways a resolved path runs,
+  // because only one of them reads the file's BYTES:
+  //   TRUE  — an INTERPRETER reads it as text: a shell script operand
+  //           (`bash x.sh`), a stdin file (`bash < x.sh`), `.`/`source x.sh`.
+  //           The content walk must run whatever the first bytes are.
+  //   FALSE — the file is executed DIRECTLY (execve): the kernel runs an ELF /
+  //           Mach-O and never asks an interpreter to read it, so the #1485
+  //           opaque-binary stand-down applies. A bare `/abs/x.sh` or `./x.sh`
+  //           token is this form.
+  // Only meaningful when `path` is non-null; every null return reports false.
+  const done = (path, from, interpreted = true) => ({
+    path,
+    next: _nextScriptCommandAt(tokens, from),
+    stdinProgram: false,
+    interpreted: path ? interpreted !== false : false,
+  });
   // Reviewer round-5 P2 regression guard: basename matching must apply ONLY to
   // ABSOLUTE tokens (`/bin/sh`, `/usr/bin/env`). Matching a RELATIVE token's
   // basename retired the M4 script-content closure for colliding names —
@@ -10733,7 +10750,7 @@ function _scriptInvocationAt(tokens, i0) {
     // the separator that ends this simple command.
     break;
   }
-  if (i >= tokens.length) return { path: null, next: tokens.length };
+  if (i >= tokens.length) return { path: null, next: tokens.length, stdinProgram: false, interpreted: false };
   const t = tokens[i];
   if (isShellTok(t)) { // abs path: `/bin/sh evil.sh`
     // (#444) The script operand is the FIRST non-flag, non-redirect positional
@@ -10850,13 +10867,19 @@ function _scriptInvocationAt(tokens, i0) {
     // DATA (over-block, round-2 P2) and, with the stale `<` operand above, it
     // refused to walk the body a heredoc really feeds (fail-open, round-2 P1).
     const stdinPath = stdinOperand && !String(stdinOperand).startsWith("-") ? stdinOperand : null;
-    return { path: stdinPath, next: _nextScriptCommandAt(tokens, i), stdinProgram: stdinOperand === null };
+    // A stdin FILE operand is READ by the interpreter, so it is `interpreted`.
+    return {
+      path: stdinPath,
+      next: _nextScriptCommandAt(tokens, i),
+      stdinProgram: stdinOperand === null,
+      interpreted: stdinPath ? true : false,
+    };
   }
   if (t === ".") { // `. script`
     const next = tokens[i + 1];
     return done(next && !next.startsWith("-") ? next : null, i);
   }
-  if (/^\.{0,2}\//.test(t)) return done(t, i); // ./x.sh or /abs/x.sh direct execution
+  if (/^\.{0,2}\//.test(t)) return done(t, i, false); // ./x.sh or /abs/x.sh — DIRECT execution (execve, no reader)
   return done(null, i);
 }
 
@@ -10994,7 +11017,8 @@ function _heredocSplitForScripts(command) {
 }
 
 /**
- * Every script FILE a heredoc-fed SHELL interpreter's program executes (#523).
+ * Every script FILE a heredoc-fed SHELL interpreter's program executes (#523),
+ * with PER-PATH PROVENANCE about how that invocation runs the file.
  *
  * The body is a PROGRAM, not a command line, so every command position in it is
  * walked (line breaks and `;`/`&&`/`||`/`|` are command boundaries there, and
@@ -11002,11 +11026,20 @@ function _heredocSplitForScripts(command) {
  * followed to a depth bound, and a body that is not a shell program (python
  * `<<PY` is the #627 code surface; `cat`'s heredoc is data) contributes
  * nothing.
+ *
+ * `interpreted` is per INVOCATION, not per command (#523 review round-4): a
+ * bare body line (`/usr/bin/git status`, `./x.sh`) is executed DIRECTLY — the
+ * kernel runs it and no interpreter ever reads the bytes — while `bash x.sh`,
+ * `bash < x.sh` and `. x.sh` on a body line hand the file to a READER. The
+ * handler needs that distinction: forcing `viaInterpreter` for EVERY body path
+ * re-created the #1485 false block on every opaque binary a body executes (a
+ * Go binary's bytes contain git-shaped prose; measured BLOCK for the body form
+ * of a command `main` ALLOWS directly).
  * @param {string} bodyText
  * @param {number} depth
- * @returns {string[]}
+ * @returns {{path: string, interpreted: boolean}[]}
  */
-function _programScriptPaths(bodyText, depth = 0) {
+function _programScriptInvocations(bodyText, depth = 0) {
   const out = [];
   const { header, bodies } = _heredocSplitForScripts(bodyText);
   const tokens = _tokenize(header, { newlineIsSeparator: true });
@@ -11014,35 +11047,60 @@ function _programScriptPaths(bodyText, depth = 0) {
   while (i < tokens.length) {
     while (i < tokens.length && (_isScriptCommandBoundary(tokens[i]) || _PROGRAM_FRAME_WORDS.has(tokens[i]))) i++;
     if (i >= tokens.length) break;
-    const { path, next } = _scriptInvocationAt(tokens, i);
-    if (path) out.push(path);
+    const { path, next, interpreted } = _scriptInvocationAt(tokens, i);
+    if (path) out.push({ path, interpreted: interpreted === true });
     i = next > i ? next : i + 1; // never spin on a zero-width advance
   }
   if (depth < 2) {
     for (const b of bodies) {
-      if (b.kind === "shell" && b.program) out.push(..._programScriptPaths(b.text, depth + 1));
+      if (b.kind === "shell" && b.program) out.push(..._programScriptInvocations(b.text, depth + 1));
     }
   }
   return out;
 }
 
 /**
- * The script FILES a heredoc body executes, for the consumers that gate EVERY
- * one of them rather than the first (#523). `extractScriptPaths` already
- * includes these; this export exists so a caller can tell a body-resolved path
- * apart from a command-line one (a body-resolved file is executed BY THE SHELL,
- * so its bytes can never be dismissed as an opaque binary — bash falls back to
- * reading an ENOEXEC file as a shell script).
+ * Collapse repeated invocations of the SAME path to one entry, keeping order and
+ * OR-ing `interpreted` — the conservative direction: if ANY invocation of a path
+ * hands it to a reader, one invocation's bytes are READ, so the path must be
+ * content-gated.
+ * @param {{path: string, interpreted: boolean}[]} list
+ * @returns {{path: string, interpreted: boolean}[]}
+ */
+function _dedupeScriptInvocations(list) {
+  const byPath = new Map();
+  for (const inv of list) byPath.set(inv.path, (byPath.get(inv.path) ?? false) || inv.interpreted === true);
+  return [...byPath].map(([path, interpreted]) => ({ path, interpreted }));
+}
+
+/**
+ * The script FILES a heredoc body executes, each with its per-invocation
+ * provenance, for the consumers that gate EVERY one of them rather than the
+ * first (#523). `extractScriptPaths` already includes these paths; this export
+ * exists so a caller can tell a body-resolved path apart from a command-line
+ * one AND know whether that body invocation READS the file (see
+ * `_programScriptInvocations`).
+ * @param {string} command
+ * @returns {{path: string, interpreted: boolean}[]}
+ */
+export function extractHeredocProgramScriptInvocations(command) {
+  const out = [];
+  const { bodies } = _heredocSplitForScripts(command);
+  for (const b of bodies) {
+    if (b.kind === "shell" && b.program) out.push(..._programScriptInvocations(b.text));
+  }
+  return _dedupeScriptInvocations(out);
+}
+
+/**
+ * The script FILES a heredoc body executes (#523) — bare paths, for callers
+ * that need membership only. `extractHeredocProgramScriptInvocations` is the
+ * form that also reports how each path runs.
  * @param {string} command
  * @returns {string[]}
  */
 export function extractHeredocProgramScriptPaths(command) {
-  const out = [];
-  const { bodies } = _heredocSplitForScripts(command);
-  for (const b of bodies) {
-    if (b.kind === "shell" && b.program) out.push(..._programScriptPaths(b.text));
-  }
-  return [...new Set(out)];
+  return extractHeredocProgramScriptInvocations(command).map((inv) => inv.path);
 }
 
 /**
@@ -11060,7 +11118,7 @@ export function extractScriptPaths(command) {
   const lead = _scriptInvocationAt(_tokenize(header), 0).path;
   if (lead) out.push(lead);
   for (const b of bodies) {
-    if (b.kind === "shell" && b.program) out.push(..._programScriptPaths(b.text));
+    if (b.kind === "shell" && b.program) out.push(..._programScriptInvocations(b.text).map((inv) => inv.path));
   }
   return [...new Set(out)];
 }

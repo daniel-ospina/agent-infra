@@ -545,6 +545,31 @@ async function partB() {
     // mutation included, was never read.
     expectTrue("B7q (#523 round-3 F2): a space-padded `   EOF` does not end the body → BLOCKED",
       blocked(await bash(`bash <<EOF\n   EOF\ntrue\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-4 (blocking, an OVER-BLOCK — measured `main` ALLOW → head BLOCK):
+    // the body walk reported WHICH paths came from a body but not HOW each one
+    // runs, and the handler forced `viaInterpreter` for ALL of them. A bare body
+    // line is a DIRECT execution — the shell `execve`s it, the kernel runs the
+    // ELF/Mach-O, and bash's ENOEXEC→shell-script fallback never happens for a
+    // valid binary — so forcing the interpreter verdict re-created the #1485
+    // false block: an opaque executable whose bytes merely CONTAIN git-shaped
+    // prose was refused for the operation that prose mentions. The fixture is
+    // the SAME `fakeBin` arm B4 uses as a direct command (opaque magic + the
+    // blocked op in its bytes), so the pair proves the verdict is keyed on the
+    // INVOCATION, not on the bytes: same file, ALLOWED from a body line, and
+    // BLOCKED when a body line hands it to `bash`.
+    expectTrue("B7r (#523 round-4) control: a body line that DIRECTLY executes an opaque binary → ALLOWED (the #1485 stand-down)",
+      allowed(await bash(`bash <<EOF\n"${fakeBin}" issue list --repo o/r\nEOF`, hub)), "was blocked");
+    expectTrue("B7s (#523 round-4): the SAME binary handed to `bash` FROM THE BODY is read as text → BLOCKED",
+      blocked(await bash(`bash <<EOF\nbash "${fakeBin}"\nEOF`, hub)), "was allowed");
+    // …and the provenance term is LOAD-BEARING, not decoration: the pre-#523
+    // `scriptIsInterpreted` back-scan walks at most FOUR tokens toward the
+    // command word, so an interpreter with more than four flags in front of the
+    // script is not located and it answers FALSE (measured on `bash -e -x -u -v
+    // -f <file>`). Only the body walk's per-invocation `interpreted` sees the
+    // reader there — without that term this shape fails OPEN (the binary's bytes
+    // are read by `bash`, which runs the operation, while the gate stands down).
+    expectTrue("B7t (#523 round-4): a body line with a >4-flag interpreter still counts as INTERPRETED → BLOCKED",
+      blocked(await bash(`bash <<EOF\nbash -e -x -u -v -f "${fakeBin}"\nEOF`, hub)), "was allowed");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });

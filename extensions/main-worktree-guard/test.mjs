@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptPaths, extractHeredocProgramScriptPaths, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptPaths, extractHeredocProgramScriptPaths, extractHeredocProgramScriptInvocations, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -4344,6 +4344,34 @@ try {
       extractScriptPath(`bash <<-EOF\n  EOF\n${body}\nEOF`) === sBodyHub && // `<<-` strips TABS, not spaces
       // positive `<<-` control: a TAB-indented terminator still ends the body
       extractScriptPath(`bash <<-EOF\n\ttrue\n\t"${sBodyHub}"\n\tEOF`) === sBodyHub;
+  })(), true);
+  // ⛔ ROUND-4 (blocking, an OVER-BLOCK — a regression against `main`): the
+  // body walk reported WHICH paths came from a body but not HOW each one runs,
+  // and the handler then forced `viaInterpreter` for all of them. A bare body
+  // line is a DIRECT execution (`execve` — the kernel runs the ELF/Mach-O and
+  // no interpreter reads the bytes), so forcing the interpreter verdict
+  // re-created the #1485 false block on every opaque binary a body runs:
+  // measured BLOCK on the head for a body line `/usr/bin/git status` that
+  // `main` ALLOWS. The provenance is per INVOCATION: a body line that hands the
+  // path to a READER (`bash x.sh`, `bash < x.sh`, `source x.sh`, `. x.sh`) is
+  // `interpreted`, a bare `/abs/x.sh` / `./x.sh` is not.
+  expectBool("B52p: a body-resolved path carries HOW it runs — direct exec vs an interpreter reading it (round-4)", (() => {
+    const p = `"${sBodyHub}"`;
+    const flags = (cmd) => extractHeredocProgramScriptInvocations(cmd).map((i) => `${i.path}:${i.interpreted}`);
+    return flags(`bash <<EOF\n${p}\nEOF`).join("|") === `${sBodyHub}:false` &&
+      flags(`bash <<EOF\ntrue\n${p}\nEOF`).join("|") === `${sBodyHub}:false` && // a benign first line does not change it
+      flags(`bash <<EOF\nbash ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      flags(`bash <<EOF\nbash < ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      flags(`bash <<EOF\nsource ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      flags(`bash <<EOF\n. ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      // per INVOCATION, not per command: the same path used both ways reports the
+      // READER (the conservative direction — one occurrence does read the bytes)
+      flags(`bash <<EOF\n${p}\nbash ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      // the command LINE is not a body invocation, so it contributes nothing here
+      // (it keeps its own `scriptIsInterpreted` answer in the handler)
+      extractHeredocProgramScriptInvocations(`bash ${p}`).length === 0 &&
+      // and the bare-path export is the same set (membership consumers unchanged)
+      extractHeredocProgramScriptPaths(`bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub;
   })(), true);
 
   // ── Write gate (W) — resolveTargetTopLevel predicate ──
