@@ -3923,32 +3923,28 @@ const GIT_BUILTIN_COMMANDS = new Set([
   "checkout-index", "cherry", "cherry-pick", "clean", "clone", "column",
   "commit", "commit-graph", "commit-tree", "config", "count-objects",
   "credential", "credential-cache", "credential-cache--daemon",
-  "credential-store", "daemon", "describe", "diagnose", "diff",
-  "diff-files", "diff-index", "diff-tree", "difftool", "difftool--helper",
-  "fast-export", "fast-import", "fetch", "fetch-pack", "filter-branch",
-  "fmt-merge-msg", "for-each-ref", "for-each-repo", "format-patch", "fsck",
-  "fsck-objects", "fsmonitor--daemon", "gc", "get-tar-commit-id", "grep",
-  "hash-object", "help", "hook", "http-backend", "http-fetch", "http-push",
-  "imap-send", "index-pack", "init", "init-db", "instaweb",
-  "interpret-trailers", "log", "ls-files", "ls-remote", "ls-tree", "mailinfo",
-  "mailsplit", "maintenance", "merge", "merge-base", "merge-file",
-  "merge-index", "merge-octopus", "merge-one-file", "merge-ours",
-  "merge-recursive", "merge-recursive-ours", "merge-recursive-theirs",
-  "merge-resolve", "merge-subtree", "merge-tree", "mergetool", "mktag",
-  "mktree", "multi-pack-index", "mv", "name-rev", "notes", "pack-objects",
-  "pack-redundant", "pack-refs", "patch-id", "pickaxe", "prune",
-  "prune-packed", "pull", "push", "quiltimport", "range-diff", "read-tree",
-  "rebase", "receive-pack", "reflog", "remote", "remote-ext", "remote-fd",
-  "remote-ftp", "remote-ftps", "remote-http", "remote-https", "repack",
-  "replace", "request-pull", "rerere", "reset", "restore", "rev-list",
-  "rev-parse", "revert", "rm", "send-pack", "sh-i18n--envsubst", "shell",
-  "shortlog", "show", "show-branch", "show-index", "show-ref",
-  "sparse-checkout", "stage", "stash", "status", "stripspace", "submodule",
-  "submodule--helper", "subtree", "switch", "symbolic-ref", "tag",
-  "unpack-file", "unpack-objects", "update-index", "update-ref",
-  "update-server-info", "upload-archive", "upload-archive--writer",
-  "upload-pack", "var", "verify-commit", "verify-pack", "verify-tag",
-  "version", "web--browse", "whatchanged", "worktree", "write-tree",
+  "credential-store", "describe", "diagnose", "diff", "diff-files",
+  "diff-index", "diff-tree", "difftool", "fast-export", "fast-import",
+  "fetch", "fetch-pack", "fmt-merge-msg", "for-each-ref", "for-each-repo",
+  "format-patch", "fsck", "fsck-objects", "fsmonitor--daemon", "gc",
+  "get-tar-commit-id", "grep", "hash-object", "help", "hook", "index-pack",
+  "init", "init-db", "interpret-trailers", "log", "ls-files", "ls-remote",
+  "ls-tree", "mailinfo", "mailsplit", "maintenance", "merge", "merge-base",
+  "merge-file", "merge-index", "merge-ours", "merge-recursive",
+  "merge-recursive-ours", "merge-recursive-theirs", "merge-subtree",
+  "merge-tree", "mktag", "mktree", "multi-pack-index", "mv", "name-rev",
+  "notes", "pack-objects", "pack-redundant", "pack-refs", "patch-id",
+  "pickaxe", "prune", "prune-packed", "pull", "push", "range-diff",
+  "read-tree", "rebase", "receive-pack", "reflog", "remote", "remote-ext",
+  "remote-fd", "repack", "replace", "rerere", "reset", "restore", "rev-list",
+  "rev-parse", "revert", "rm", "send-pack", "shortlog", "show",
+  "show-branch", "show-index", "show-ref", "sparse-checkout", "stage",
+  "stash", "status", "stripspace", "submodule--helper", "switch",
+  "symbolic-ref", "tag", "unpack-file", "unpack-objects", "update-index",
+  "update-ref", "update-server-info", "upload-archive",
+  "upload-archive--writer", "upload-pack", "var", "verify-commit",
+  "verify-pack", "verify-tag", "version", "whatchanged", "worktree",
+  "write-tree",
 ]);
 
 /**
@@ -4045,21 +4041,50 @@ function _aliasDefsFromInvocation(inv) {
   for (const [, pair] of cfgPairs) {
     if (pair.key !== undefined) takeAlias(pair.key, pair.value ?? null);
   }
-  // `git config … alias.x <value>` — persist + invoke in ONE command.
-  if (inv.verb === "config") {
-    const a = inv.args || [];
-    const pos = [];
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] === "-f" || a[i] === "--file" || a[i] === "--blob") { i++; continue; }
-      if (String(a[i]).startsWith("-")) continue;
-      pos.push(a[i]);
-    }
-    for (let i = 0; i < pos.length - 1; i++) {
-      const m = /^alias\.([A-Za-z0-9._/-]+)$/.exec(pos[i]);
-      if (m) { takeAlias(pos[i], pos[i + 1]); break; }
-    }
-  }
   return defs;
+}
+
+/**
+ * #594 review round 4: the aliases an invocation PERSISTS for later segments —
+ * `git config [--global|--local|--system|--worktree] [--add|--replace-all]
+ * alias.<name> <value>`, and the removals (`--unset`/`--unset-all`/
+ * `--remove-section`) reported as null = "definedness is now unknown" (the
+ * effective value falls back to a lower-precedence file the guard cannot see, so
+ * it must fail closed).
+ *
+ * ⛔ A `-f/--file/--blob <path>` write is NOT harvested: it writes a DIFFERENT
+ * file, which a later plain `git <alias>` never reads — measured:
+ * `git config -f /tmp/other.cfg alias.br status && git br` ran the PERSISTED
+ * `alias.br`, not `status`. A pure read (`git config alias.x`) names no value
+ * and is not a write.
+ * @param {object} inv
+ * @returns {Array<[string, string|null]>}
+ */
+function _configWriteDefs(inv) {
+  if (inv.verb !== "config") return [];
+  const a = inv.args || [];
+  const writesToOtherFile = a.some((t) => {
+    const s = String(t ?? "");
+    return s === "-f" || s === "--file" || s === "--blob" ||
+      s.startsWith("--file=") || s.startsWith("--blob=");
+  });
+  if (writesToOtherFile) return [];
+  const pos = [];
+  for (let i = 0; i < a.length; i++) {
+    const s = String(a[i] ?? "");
+    if (s === "-f" || s === "--file" || s === "--blob") { i++; continue; }
+    if (s.startsWith("-")) continue;
+    pos.push(s);
+  }
+  const key = /^alias\.([A-Za-z0-9._/-]+)$/.exec(pos[0] ?? "");
+  if (!key) return [];
+  const name = key[1];
+  const removing = a.some((t) => /^--(?:unset|unset-all|remove-section)$/.test(String(t ?? "")) ||
+    String(t ?? "") === "--unset");
+  if (removing) return [[name, null]];
+  const value = pos[1];
+  if (value === undefined) return []; // a READ (`git config alias.x`) writes nothing
+  return [[name, String(value).startsWith("!") ? null : String(value)]];
 }
 
 /**
@@ -4121,8 +4146,7 @@ function _splitAliasValue(value) {
  */
 function _expandAliasInvocations(invocations) {
   const MAX_ALIAS_DEPTH = 5;
-  const defs = new Map();
-  const expandOne = (inv, depth) => {
+  const expandOne = (inv, depth, defs) => {
     const verb = inv.verb;
     if (!verb) return inv;
     if (defs.has(verb)) {
@@ -4136,37 +4160,42 @@ function _expandAliasInvocations(invocations) {
         verb: next,
         args: [...words.slice(1), ...(inv.args || [])],
         aliasName: verb,
-      }, depth + 1);
+      }, depth + 1, defs);
     }
     if (!GIT_BUILTIN_COMMANDS.has(verb)) return { ...inv, aliasName: verb, aliasOpaque: true };
     return inv;
   };
-  // ⛔ SEGMENT-ORDERED, and each invocation's own definitions apply to itself
-  // (git reads the whole argv/env before running the command). A single
-  // command-global map read AFTER a first pass was measured FAIL-OPEN: with
-  // last-wins over the whole command, `git -c alias.x='branch -fq victimA <sha>'
-  // x && git -c alias.x=status x` ran the destructive first segment while the
-  // map had already been overwritten by the benign second definition
-  // (victimA moved, rc 0). Definitions therefore accumulate as the walk
-  // advances, so an earlier segment can only ever be judged by the definitions
-  // that exist when git would actually run it.
+  // ⛔ SEGMENT-ORDERED, and LIFETIMES ARE SEPARATE (review rounds 2 and 4):
+  //   · TRANSIENT — this invocation's own `-c`/`--config`/`--config-env`/
+  //     GIT_CONFIG_*. They end with that process, so they must NOT reach a later
+  //     segment: measured, `git -c alias.br=status br && git br` ran the
+  //     PERSISTED (destructive) `alias.br` in segment 2 while a command-global
+  //     map had it as `status` → false ALLOW.
+  //   · PERSISTENT — `git config alias.x <value>` writes (see _configWriteDefs),
+  //     which later plain invocations DO read, applied in segment order.
+  // Within one invocation the transient list is argv-ordered and last-wins
+  // (probe-verified: `-c alias.x=… -c alias.x=…` runs the LAST one), and a
+  // transient `-c` outranks persisted config exactly as git does.
+  const persistent = new Map();
   const out = [];
+  const addDef = (map, name, value) => {
+    // ⛔ GIT'S PRECEDENCE, MEASURED (git 2.43): builtin > `git-<cmd>` on PATH
+    // > alias. `git -c alias.reset=status reset --hard` runs the BUILTIN
+    // `reset --hard` (probe-verified; the alias is never consulted, and an
+    // installed `git-foo` likewise wins over `alias.foo`). A definition with a
+    // BUILTIN name is therefore never used — expanding it would classify a
+    // destructive command as whatever the ignored alias value says (a false
+    // ALLOW: `reset --hard` read as `status`). Dropped.
+    if (GIT_BUILTIN_COMMANDS.has(name)) return;
+    map.set(name, value);
+  };
   for (const inv of invocations) {
-    for (const [name, value] of _aliasDefsFromInvocation(inv)) {
-      // ⛔ GIT'S PRECEDENCE, MEASURED (git 2.43): builtin > `git-<cmd>` on PATH
-      // > alias. `git -c alias.reset=status reset --hard` runs the BUILTIN
-      // `reset --hard` (probe-verified; the alias is never consulted, and an
-      // installed `git-foo` likewise wins over `alias.foo`). Expanding a
-      // builtin-named definition would therefore classify a destructive command
-      // as whatever the IGNORED alias value says — a false ALLOW
-      // (`reset --hard` read as `status`). Such a definition is dropped.
-      if (GIT_BUILTIN_COMMANDS.has(name)) continue;
-      // Last definition wins WITHIN a command's own config (probe-verified:
-      // `-c alias.x=… -c alias.x=…` runs the LAST one), so a benign earlier
-      // definition cannot launder a destructive later one.
-      defs.set(name, value);
-    }
-    out.push(expandOne(inv, 0));
+    const transient = new Map();
+    for (const [name, value] of _aliasDefsFromInvocation(inv)) addDef(transient, name, value);
+    const view = new Map(persistent);
+    for (const [name, value] of transient) view.set(name, value); // -c wins over config
+    out.push(expandOne(inv, 0, view));
+    for (const [name, value] of _configWriteDefs(inv)) addDef(persistent, name, value);
   }
   return out;
 }
