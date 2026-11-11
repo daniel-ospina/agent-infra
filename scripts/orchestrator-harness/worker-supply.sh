@@ -35,6 +35,11 @@
 # (worktree, brief, cap, kind). A supervisor that grew its own spawn logic would diverge from
 # `spawn-gate.sh`'s load/disk/brief gates and stop being a supply path at all — the same reason
 # `pr-doctor.dispatch()` routes through it. `worker-supply.test.sh` asserts the invoker set.
+# ⛔ AND THE BRIEF IT REPLAYS IS REVALIDATED FIRST (agent-infra#3958). Replaying a recorded argv replays
+# the recorded brief PATH, so an order whose cached brief the gate refuses would be refused `rc=80` on
+# every pass for ever. The invariant — a refused brief never reaches the dispatcher again — is stated
+# and implemented above `brief_verdict()`; it does NOT relax the gate, and this file never composes a
+# brief.
 #
 # ⛔ IT IS NOT A MERGE AUTHORITY. It never calls `gh`, never calls `admin-merge.sh`, never records a
 # review, never reaps or kills a worker. Its only actions are: READ the records, WRITE an offer through
@@ -103,6 +108,10 @@
 #      its refills, or its record is un-replayable. A pass that re-offered SOME and then hit a bound is
 #      DEFERRED too (a verdict about what is left, not a pass) — `refilled>0` alone is not a clean
 #      pass, which is the doctor's `dispatched 0 of M` law. The record names which bound held it.
+#      "UN-REPLAYABLE" INCLUDES A REFUSED BRIEF (agent-infra#3958): an order whose cached brief the gate
+#      refuses is not re-offered at all — it is reported as needing REGENERATION by its composer, and
+#      the record's `stale_briefs=` counts it. It is NOT `3` (nothing was attempted) and it is NOT `0`
+#      (the order is still dead).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
@@ -112,6 +121,11 @@ O="${O:-$HOME/orchestrator}"
 STATE_DIR="${WORKER_SUPPLY_STATE_DIR:-$O/state}"
 BG_DIR="${WORKER_SUPPLY_BG_DIR:-$O/bg}"
 DISPATCH="${WORKER_SUPPLY_DISPATCH:-$O/nonblocking-dispatch.sh}"
+# The brief validator. EMPTY means "resolve the copy the dispatcher will judge with" (`brief_gate_path`,
+# the same ladder `spawn-gate.sh::brief_gate_lib` walks); the knob exists so a test can grade the
+# revalidation without a second copy of the gate. An override that is not a FILE is skipped, not obeyed.
+BRIEF_GATE="${WORKER_SUPPLY_BRIEF_GATE:-}"
+BRIEF_GATE_TIMEOUT="${WORKER_SUPPLY_BRIEF_GATE_TIMEOUT_S:-30}"  # bounds ONE gate call, not the pass
 PREFIX="${WORKER_SUPPLY_PREFIX:-prd-}"                 # the worker NAMESPACE it supplies
 INTERVAL_S="${WORKER_SUPPLY_INTERVAL_S:-60}"           # --loop cadence
 MAX_REFILLS="${WORKER_SUPPLY_MAX_REFILLS:-2}"          # re-offers per ORDER (a crash loop bound)
@@ -217,6 +231,7 @@ knob_num WORKER_SUPPLY_PROBE_TIMEOUT_S   "$PROBE_TIMEOUT"      60      pos || PR
 knob_num WORKER_SUPPLY_STALE_SLACK_S     "$STALE_SLACK_S"      300     any || STALE_SLACK_S=300
 knob_num WORKER_SUPPLY_LOCK_MAX_S        "$LOCK_MAX_S"         900     pos || LOCK_MAX_S=900
 knob_num WORKER_SUPPLY_LOG_MAX_BYTES     "$LOG_MAX_BYTES"      262144  pos || LOG_MAX_BYTES=262144
+knob_num WORKER_SUPPLY_BRIEF_GATE_TIMEOUT_S "$BRIEF_GATE_TIMEOUT" 30    pos || BRIEF_GATE_TIMEOUT=30
 case "$PREFIX" in
   ''|*[[:space:]]*)
     log_line "knob: WORKER_SUPPLY_PREFIX='$PREFIX' is empty or contains whitespace — using 'prd-' (the order glob would match nothing, and an empty queue reads as a clean pass)"
@@ -442,7 +457,97 @@ offer_append() { # <name> <sig> <verdict>
   return 0
 }
 
-write_record() { # <decision> <orders> <live> <dead> <unknown> <cap> <fix> <review> <refilled> <why> [<complete>]
+# ── THE BRIEF IS REVALIDATED BEFORE IT IS OFFERED AGAIN (agent-infra#3958) ──────────────────
+# ⛔ THE DEFECT, MEASURED. A re-offer replays the argv `nonblocking-dispatch.sh` recorded at ACCEPT
+# time, and one of those arguments is the brief PATH. So the SAME brief file is handed to the SAME
+# gate on every pass: the gate refuses it `rc=80`, the pass reports `72 re-offer(s) refused by the
+# dispatcher`, and it does that for ever — measured on this box 2026-11-11, pass after pass
+# (`orders=100 live=0/18 dead=83 … 72 re-offer(s) refused`, 537 such lines accumulated).
+# The GENERATOR is healthy: `pr-doctor.py:4338-4340` rewrites the brief UNCONDITIONALLY on every
+# spawn, so the fossils survive only because this path never reaches that code — 100 of the 100
+# orders recorded in `$O/bg` point at a brief the current gate refuses, while the briefs pr-doctor
+# has composed recently are admitted (`research contract rendered … admitted by 1 validator(s)`).
+#
+# THE INVARIANT: a brief the gate has REFUSED is never handed to the dispatcher again. A cache whose
+# validity is never checked is not a cache, it is a fossil — the "stale flag that records a past
+# state and is never revalidated" class, here on a dispatch path.
+#
+# ⛔ IT IS NOT FIXED BY RELAXING THE GATE. The `RESEARCH FIRST`/`PREVIOUS WORK` contract exists because
+# two lanes in one day acted on a false premise (#2258, #3484); a bypass here would restore exactly
+# that failure, so the refusal STANDS and this path stops offering the fossil instead.
+# ⛔ AND IT IS NOT FIXED BY COMPOSING A BRIEF HERE. A brief is an ORDER ("re-run the checks on this
+# head", "resolve this conflict") that `pr-doctor` derives from a classification of the PR AS IT
+# STANDS NOW; splicing a fresh contract block onto an 18-day-old order would hand a worker a
+# current-LOOKING brief for work the PR may no longer need. That is inventing work, which this file
+# refuses to do (`contract_note()`'s argument one layer over) — so the brief is skipped and REPORTED
+# as needing regeneration, and the one composer (`pr-doctor`) is named as the only thing that writes it.
+# ⛔ NO LEDGER ROW IS WRITTEN FOR A SKIP, deliberately: `refills_of()` counts rows per order, so a row
+# would spend one of the order's `MAX_REFILLS` — and a regeneration is not a failed worker. (Pinned by
+# the test: an order stays re-offerable after any number of skipped passes.)
+
+brief_gate_path() { # -> the copy the DISPATCHER will judge with, or rc=1 (nothing resolved)
+  local c
+  [ -n "$BRIEF_GATE" ] && [ -f "$BRIEF_GATE" ] && { printf '%s\n' "$BRIEF_GATE"; return 0; }
+  # The ladder is `spawn-gate.sh::brief_gate_lib`'s, in ITS order (`$O` first), because the verdict this
+  # path acts on has to come from the copy that will actually judge the re-offer. A copy that merely
+  # EXISTS somewhere else is not that copy — the 6h32m stall #2708 measured.
+  for c in "${O:-}/brief-gate.sh" "$HERE/brief-gate.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh" \
+           "${HOME:-}/.pi/agent/scripts/brief-gate.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# The gate's OWN WORDS, reduced to its `missing:` list: the teaching block is ~3.5 KB and this runs on
+# a 60 s clock, once per refused order. Nothing is paraphrased — the bullets are the gate's own text.
+brief_gate_missing() { # <gate output>
+  printf '%s\n' "$1" | awk '
+    /^\[brief-gate\][[:space:]]*missing:/ { f=1; next }
+    f && /^\[brief-gate\]/ { exit }
+    f && NF { sub(/^[[:space:]]+/, ""); s = (s == "" ? $0 : s "; " $0) }
+    END { print s }'
+}
+
+# 0 = ADMITTED · 80 = REFUSED (never re-offer unchanged) · anything else = NO VERDICT.
+# ⛔ A NO VERDICT FALLS THROUGH TO THE DISPATCHER, UNCHANGED. `brief-gate.sh` exits 78 when the
+# VALIDATOR is missing and this file's own bound answers 142; neither says anything about the BRIEF.
+# The dispatcher owns that refusal (it exits 78 itself, loudly), and converting an install fault into
+# "this order needs a new brief" would name the wrong fault — the `$O`-skew lesson (#2708, #2986).
+brief_verdict() { # <brief>
+  local g out rc
+  BRIEF_GATE_WHY=""; BRIEF_GATE_USED=""
+  if ! g="$(brief_gate_path)"; then
+    BRIEF_GATE_WHY="no brief-gate.sh on any resolved root (\$O, this directory, \$AGENT_INFRA_PATH, ~/.pi/agent/scripts)"
+    return 78
+  fi
+  BRIEF_GATE_USED="$g"
+  out="$(bounded "$BRIEF_GATE_TIMEOUT" bash "$g" --check "$1" worker 2>&1)"; rc=$?
+  case "$rc" in
+    0)  return 0 ;;
+    80) BRIEF_GATE_WHY="$(brief_gate_missing "$out")"
+        [ -n "$BRIEF_GATE_WHY" ] || BRIEF_GATE_WHY="refused, and the gate printed no missing list"
+        return 80 ;;
+    *)  BRIEF_GATE_WHY="rc=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+        return "$rc" ;;
+  esac
+}
+
+# ⛔ THE LOG IS AN EVENT STREAM, NOT A CLOCK — this file's own rule, one layer out. Emitting the same
+# regeneration line for every refused order on every 60 s pass is ~100k lines a day against a 256 KB
+# rotation, so the log would be rewritten about every 18 minutes and the pass that mattered would be
+# gone. The COUNT is the durable signal (it is in `$RECORD` and in the pass line, both re-read by
+# `status`); the per-order detail is emitted once per process. A restart re-emits it — which is the
+# right amount of repetition for a condition an operator has to fix.
+STALE_LOGGED=" "
+log_once() { # <key> <message>
+  case "$STALE_LOGGED" in *" $1 "*) return 0 ;; esac
+  STALE_LOGGED="$STALE_LOGGED$1 "
+  log_line "$2"
+  return 0
+}
+
+write_record() { # <decision> <orders> <live> <dead> <unknown> <cap> <fix> <review> <refilled> <why> [<complete>] [<stale_briefs>]
   local tmp="$RECORD.tmp"
   {
     printf 'ts=%s\n' "$(date '+%Y-%m-%dT%H:%M:%SZ')"
@@ -450,6 +555,7 @@ write_record() { # <decision> <orders> <live> <dead> <unknown> <cap> <fix> <revi
     printf 'orders=%s\nlive=%s\ndead=%s\nunknown=%s\ncomplete=%s\n' "$2" "$3" "$4" "$5" "${11:-0}"
     printf 'capacity=%s\nmax_fix=%s\nmax_review=%s\n' "$6" "$7" "$8"
     printf 'refilled=%s\nmax_refills=%s\ninterval_s=%s\nprefix=%s\n' "$9" "$MAX_REFILLS" "$INTERVAL_S" "$PREFIX"
+    printf 'stale_briefs=%s\n' "${12:-0}"
     printf 'reason=%s\n' "${10}"
   } > "$tmp" 2>/dev/null || return 1
   mv -f "$tmp" "$RECORD" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
@@ -461,8 +567,8 @@ DRY=0
 pass() {
   local plenv orders=0 live=0 dead=0 unknown=0 cap fix review refilled=0 why="" decision=clean prev=""
   local complete=0
-  local n_offered=0 n_dead_total=0 refused=0 budget_full=0 exhausted=0 no_record=0
-  local f name wt prompt kind stamp wt_branch rec_branch capr sig hold
+  local n_offered=0 n_dead_total=0 refused=0 budget_full=0 exhausted=0 no_record=0 stale_brief=0
+  local f name wt prompt kind stamp wt_branch rec_branch capr sig hold bgrc stale_note prev_stale
 
   mkdir -p "$STATE_DIR" 2>/dev/null || { log_line "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
   plenv="$STATE_DIR/.worker-supply.plistenv"
@@ -548,6 +654,26 @@ pass() {
       log_line "$name: not re-offered — this exact spawn instance (started=$sig) was already re-offered once"
       continue
     fi
+    # ⛔ THE BRIEF MUST STILL SATISFY THE GATE THAT WILL JUDGE IT (#3958) — the invariant is declared
+    # above `brief_verdict`. It runs AFTER the cheap skips (an exhausted, held or already-offered order
+    # never costs a subprocess) and BEFORE the dry-run branch, so a rehearsal tells the truth about the
+    # same orders a real pass would refuse.
+    brief_verdict "$prompt"; bgrc=$?
+    if [ "$bgrc" = 80 ]; then
+      # NOT A DISPATCH ATTEMPT, so it is not `refused`, nothing is written to the ledger, and the order
+      # keeps its refills. What it is: a brief that must be REGENERATED by its composer.
+      stale_brief=$(( stale_brief + 1 ))
+      if [ "$DRY" = 1 ]; then
+        log_line "DRY-RUN would NOT re-offer $name — the brief recorded for the order is REFUSED by the brief gate (rc=80) and re-offering it would replay it unchanged; REGENERATION REQUIRED ($BRIEF_GATE_USED says: $(printf '%s' "$BRIEF_GATE_WHY" | cut -c1-300))"
+      else
+        log_once "$name:stale" "$name: NOT re-offered — the brief recorded for the order is REFUSED by the brief gate (rc=80), and re-offering it would replay the same file the gate keeps refusing. REGENERATION REQUIRED: $BRIEF_GATE_USED says: $(printf '%s' "$BRIEF_GATE_WHY" | cut -c1-300). The composer is pr-doctor.py, which rewrites $prompt on its next spawn for this PR; this supervisor neither composes nor edits a brief (agent-infra#3958)"
+      fi
+      continue
+    fi
+    if [ "$bgrc" != 0 ]; then
+      # NO VERDICT: say so, and let the DISPATCHER own the refusal (see `brief_verdict`).
+      log_once "$name:unvalidated" "$name: the brief could not be revalidated before this offer ($BRIEF_GATE_WHY) — handing the offer to the dispatcher, which owns this refusal"
+    fi
     if [ "$DRY" = 1 ]; then
       log_line "DRY-RUN would re-offer $name in $wt (kind=$kind cap=${capr}s) — the order's worker is dead"
       n_offered=$(( n_offered + 1 )); refilled=$(( refilled + 1 ))
@@ -589,19 +715,24 @@ pass() {
   # `dispatched 0 of M` defect one layer down: a bounded pass reported as a complete one. So ANY order
   # still dead after both walks is DEFERRED (rc=6) and the reason names the bound that held it; only a
   # pass with nothing left dead may call itself refilled.
+  # ⛔ A SKIPPED FOSSIL IS A REASON THE PASS DID NOT SUPPLY, SO IT MUST APPEAR IN EVERY ARM THAT SAYS
+  # WHY (#3958). It rides in the `why` string and in the record's `stale_briefs=` so `status` — the
+  # durable answer — names it without the log.
+  [ "$stale_brief" -gt 0 ] && stale_note="$stale_brief order(s) had a brief the gate REFUSES — REGENERATION REQUIRED by pr-doctor (never re-offered unchanged, and no refill spent)"
   if [ "$orders" -eq 0 ]; then
     decision=idle; why="no $PREFIX orders in $BG_DIR — nothing to supply (a pass that never placed an order leaves no record to refill)"
   elif [ "$refused" -gt 0 ]; then
-    decision=refused; why="$refused re-offer(s) refused by the dispatcher ($refilled accepted first)"
+    decision=refused; why="$refused re-offer(s) refused by the dispatcher ($refilled accepted first)${stale_note:+; $stale_note}"
   elif [ "$dead" -gt 0 ]; then
     decision=deferred
     local held=""
     [ "$budget_full" -gt 0 ] && held="$held, budget full ($live/$cap live) held $budget_full"
     [ "$exhausted" -gt 0 ] && held="$held, $exhausted spent their $MAX_REFILLS refill(s)"
     [ "$no_record" -gt 0 ] && held="$held, $no_record had no replayable record"
+    [ "$stale_brief" -gt 0 ] && held="$held, $stale_note"
     why="$refilled of $n_dead_total re-offered; $dead still dead${held}"
   elif [ "$refilled" -gt 0 ]; then
-    decision=refilled; why="$refilled of $n_dead_total dead order(s) re-offered"
+    decision=refilled; why="$refilled of $n_dead_total dead order(s) re-offered${stale_note:+; $stale_note}"
   elif [ "$live" -eq 0 ] && [ "$unknown" -gt 0 ]; then
     # ⛔ A PASS THAT SUPPLIED NOTHING BECAUSE IT COULD NOT READ THE POOL IS NOT A CLEAN PASS (review
     # #2896 round 3). Every UNKNOWN path used to fall through to the `clean` arm below, so a pass whose
@@ -619,16 +750,18 @@ pass() {
   # overwrote it (its `refilled=` counting would-is, its `ts=` claiming a pass that never happened)
   # destroys exactly that. The dry run's verdict goes to stdout and nowhere else.
   if [ "$DRY" = 1 ]; then
-    log_line "DRY-RUN pass: decision=$decision orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown would-refill=$refilled — $why (no record, no ledger row, nothing spawned)"
+    log_line "DRY-RUN pass: decision=$decision orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown would-refill=$refilled stale_briefs=$stale_brief — $why (no record, no ledger row, nothing spawned)"
     return 0
   fi
   prev="$(awk -F= '$1=="decision"{ print $2; exit }' "$RECORD" 2>/dev/null || true)"
-  write_record "$decision" "$orders" "$live" "$dead" "$unknown" "$cap" "$fix" "$review" "$refilled" "$why" "$complete"
+  prev_stale="$(awk -F= '$1=="stale_briefs"{ print $2; exit }' "$RECORD" 2>/dev/null || true)"
+  write_record "$decision" "$orders" "$live" "$dead" "$unknown" "$cap" "$fix" "$review" "$refilled" "$why" "$complete" "$stale_brief"
   # ⛔ THE LOG IS AN EVENT STREAM, NOT A CLOCK. An unchanged `idle`/`clean` pass writes NOTHING: a
   # 60 s service logging `nothing to do` 1,440 times a day is noise that hides the pass that mattered,
   # and the last-pass record (`$RECORD`, with its own `ts=`) is the heartbeat a reader checks instead.
-  # A refill and every refusal always log.
-  if [ "$decision" != "$prev" ] || [ "$refilled" -gt 0 ] || [ "$refused" -gt 0 ]; then
+  # A refill and every refusal always log; so does a CHANGE in the fossil count (the per-order lines are
+  # emitted once per process — see `log_once`), because a supply outage whose size moves is news.
+  if [ "$decision" != "$prev" ] || [ "$refilled" -gt 0 ] || [ "$refused" -gt 0 ] || [ "$stale_brief" != "${prev_stale:-0}" ]; then
     log_line "pass: $decision — orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown refilled=$refilled — $why"
   fi
 
