@@ -4793,22 +4793,31 @@ export function unresolvableDeleteTargets(targets) {
 }
 
 /**
- * Truncate a segment body at the first UNQUOTED backtick.
+ * Collapse BACKTICK command substitutions in a segment body to an opaque word.
  *
- * An unquoted backtick opens/closes a command substitution exactly like `)` closes a subshell, but
- * `_tokenize` keeps it inside the word (`git push origin -d b` + backtick → `b` backtick), so the
- * extractor used to report the phantom target `b`+backtick: no ref by that name is ever checked out,
- * `_coordinatedDeleteBlock` finds nothing, and the #73 hazard is allowed. Pre-existing on origin/main
- * (this helper does not introduce it) but the same class as the parenthesized residual, so it is
- * closed here rather than documented: QUOTED backticks are data and survive (`-d 'feat/x` + backtick
- * + `'`).
- * @param {string} s
+ * An unquoted backtick is a substitution delimiter, but `_tokenize` keeps it inside the word, so
+ * the extractor used to report the phantom target `b`+backtick (`echo `git push origin -d b``): no
+ * ref by that name is ever checked out, `_coordinatedDeleteBlock` finds nothing, and the #73 hazard
+ * is allowed. Pre-existing on origin/main (measured), closed here.
+ *
+ * ⛔ AN OPENER IS NOT A TERMINATOR (fresh-context review round 2, P2). A first attempt truncated at
+ * the first unquoted backtick, which is only right for a CLOSER. `git push `date` origin -d
+ * held/branch` has its OPENER inside the segment; truncating there discarded `-d held/branch` and
+ * returned null where origin/main returned the target — the same fail-open the fix exists to close.
+ * Bash's model is a SPAN: the delimited text is one word of the enclosing simple command, and the
+ * words after it belong to that command. So unquoted backticks are PAIRED left-to-right inside the
+ * segment body and each pair collapses to one opaque placeholder word (which keeps every following
+ * word, including the delete flag and its target); only an UNPAIRED one — the closer of a
+ * substitution opened before `git push`, or an opener whose closer lies beyond this segment — ends
+ * the body. QUOTED backticks are data and are never paired.
+ * @param {string} body
  * @returns {string}
  */
-function _truncateAtUnquotedBacktick(s) {
+function _foldBacktickSubstitutions(body) {
+  const marks = [];
   let quote = null;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
     if (quote) {
       // A backslash escapes the next char only inside double quotes (POSIX); inside single quotes it
       // is literal, so skipping there would mis-read a later closing quote.
@@ -4818,69 +4827,97 @@ function _truncateAtUnquotedBacktick(s) {
     }
     if (ch === "\\") { i++; continue; }
     if (ch === "'" || ch === '"') { quote = ch; continue; }
-    if (ch === "`") return s.slice(0, i);
+    if (ch === "`") marks.push(i);
   }
-  return s;
+  if (marks.length === 0) return body;
+  let out = "";
+  let prev = 0;
+  for (let k = 0; k < marks.length; k += 2) {
+    const open = marks[k];
+    const close = marks[k + 1];
+    if (close === undefined) return out + body.slice(prev, open); // unpaired → ends the body
+    out += body.slice(prev, open) + _SUBST_PLACEHOLDER;
+    prev = close + 1;
+  }
+  return out + body.slice(prev);
 }
+
+/** One opaque word standing in for a collapsed command substitution (`$( … )` / backticks).
+ *  NUL cannot occur in a shell word (bash words are NUL-terminated C strings) and it matches no
+ *  flag/target shape, so consumers treat it as an ordinary positional — exactly what the
+ *  substitution's WORD is. */
+const _SUBST_PLACEHOLDER = "\u0000SUBST";
 
 /**
  * Does this redirect operator CONSUME the next shell word as its operand?
- * `>`, `>>`, `<`, `<<` (and their fd-prefixed forms) and `&>`/`&>>` take a filename; the fd-dup and
- * fd-close forms (`2>&1`, `>&2`, `2>&-`, `<&0`) consume nothing.
+ * `>`, `>>`, `<`, `<<` and their fd-prefixed forms take a filename. Only these are REACHABLE here:
+ * `segRe`'s `[^;&|]*` capture stops at `&`, so the `&>`/`&>>` family and the fd-dup/fd-close forms
+ * (`2>&1`, `>&2`, `2>&-`) can never reach this helper — they used to be listed with branches that
+ * no input could exercise (fresh-context review round 2, finding 2: a row asserting them could not
+ * redden under any mutation). The unreachable forms are dropped rather than pinned by a test.
  * @param {string} tok
  * @returns {boolean}
  */
 function _redirectTakesOperand(tok) {
-  if (tok === "&>" || tok === "&>>") return true;
   return /^(?:[0-9]+)?(?:>>?|<<?)$/.test(tok);
 }
 
 /**
- * Tokenize ONE `git push` segment body, stopping at the first shell BOUNDARY.
+ * Tokenize ONE `git push` segment body, stopping where BASH ENDS THE COMMAND.
  *
- * #504 residual (parenthesized later segment). The segment body used to be
- * `split(/\s+/)`, which keeps a shell operator ATTACHED to the last word — a
- * subshell/substitution/group closer. `… && (git push origin -d old-feat)`
- * therefore produced the whole-command target token `old-feat)`, and
- * `_cleanDeleteTarget` cannot strip that parenthesis without corrupting a
- * genuinely QUOTED name. The phantom `old-feat)` names no ref, so
- * `_coordinatedDeleteBlock` looked up `refs/heads/old-feat)`, found nothing
- * checked out, and ALLOWED the delete of a branch a sibling still holds — the
- * exact #73 hazard, reachable from a worktree session where M2 is exempt.
+ * #504 residual (parenthesized later segment). The segment body used to be `split(/\s+/)`, which
+ * keeps a shell operator ATTACHED to the last word — a subshell/substitution closer. `… && (git push
+ * origin -d old-feat)` therefore produced the whole-command target token `old-feat)`, and
+ * `_cleanDeleteTarget` cannot strip that parenthesis without corrupting a genuinely QUOTED name. The
+ * phantom `old-feat)` names no ref, so `_coordinatedDeleteBlock` looked up `refs/heads/old-feat)`,
+ * found nothing checked out, and ALLOWED the delete of a branch a sibling still holds — the exact
+ * #73 hazard, reachable from a worktree session where M2 is exempt.
  *
- * `_tokenize` is the module's quote-aware shell splitter: it emits unquoted
- * `(` / `)` / redirects as their OWN tokens and keeps QUOTED text inside the
- * word (`-d 'feat/x)'` stays the real ref `feat/x)`), so truncating at the
- * first shell boundary models bash rather than guessing from spacing. The
- * `segRe` capture above still cannot contain `;`/`&`/`|` (unchanged contract,
- * including its documented over-match on quoted/echoed text).
+ * `_tokenize` is the module's quote-aware shell splitter, so QUOTED text stays in the word
+ * (`-d 'feat/x)'` is the real ref `feat/x)`). Three rules bound the segment, and each was measured
+ * against a fail-open this helper shipped or inherited:
  *
- * ⛔ A REDIRECT IS **NOT** A BOUNDARY, and treating it as one was a fail-open
- * regression this helper originally shipped (fresh-context review, P1).
- * `_isRedirectOperator` states the module's own rule: a redirect may appear
- * ANYWHERE in a simple command (`git > /dev/null push …` IS `git push …`), so
- * breaking at `>` truncated the very argument list being scanned —
- * `git push origin 2>/dev/null -d held/branch` yielded `[]`, and with no targets
- * `_coordinatedDeleteBlock` was never consulted: ALLOWED where origin/main
- * BLOCKED, in both the full path and the degraded (classifier-unavailable) arm
- * whose entire purpose is to keep this check alive. So only `_SHELL_OPS` ends
- * the segment; a redirect token is SKIPPED together with its filename operand
- * (which is not an argv word git ever sees) and scanning continues.
+ *   1. `_SHELL_OPS` (`&& || | & ;`) ends it — a real list separator. NOT `(` / `)`: those are
+ *      handled by rule 3.
+ *   2. A REDIRECT is NOT a boundary (round-1 review P1): `_isRedirectOperator` states that a
+ *      redirect may appear ANYWHERE in a simple command, so breaking at `>` truncated the argument
+ *      list being scanned — `git push origin 2>/dev/null -d held/branch` gave `[]` where origin/main
+ *      gave the target. The token is SKIPPED with its filename operand instead.
+ *   3. A parenthesised span is a WORD, not a boundary, when it OPENS inside the segment (`$(
+ *      cat .remote)`, `-o $(date)`): its contents are skipped and scanning CONTINUES, so the flag
+ *      and target after it survive (round-2 review P2 — truncating at the opener returned null
+ *      where origin/main returned the target). A `)` with no matching opener in the segment closes
+ *      something started before `git push` (`… && (git push origin -d b)`) and DOES end it, which is
+ *      #504 itself.
+ *      Backticks are folded first by `_foldBacktickSubstitutions` (rule 3's string-level twin).
  * @param {string} body raw text after the `git push` word
  * @returns {string[]}
  */
 function _pushSegmentTokens(body) {
-  const toks = _tokenize(_truncateAtUnquotedBacktick(body));
+  const toks = _tokenize(_foldBacktickSubstitutions(body));
   const tokens = [];
+  let depth = 0; // parens OPENED inside this segment: their span is one WORD, not a boundary
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
-    if (_SHELL_OPS.has(t)) break; // a real simple-command terminator
+    if (t === "(") { depth++; continue; }
+    if (t === ")") {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0) tokens.push(_SUBST_PLACEHOLDER); // the span is one positional word
+        continue;
+      }
+      break; // closes a subshell opened before `git push` — the #504 boundary
+    }
+    if (_SHELL_OPS.has(t)) break; // ; & && || | — a real list separator
     if (_isRedirectOperator(t)) {
       if (_redirectTakesOperand(t)) i++; // the filename is not an argv word
       continue;
     }
+    if (depth > 0) continue; // inside a substitution span — its words are not this command's argv
     tokens.push(t);
   }
+  // An UNCLOSED span stays dropped: its closer is outside anything this segment can see, so no word
+  // after it could be attributed. Words collected BEFORE the span are kept (the flag/target survive).
   return tokens;
 }
 

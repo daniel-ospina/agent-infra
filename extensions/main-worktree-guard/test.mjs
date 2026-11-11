@@ -1111,7 +1111,20 @@ wcdt("unquoted-backtick later-segment -d", "block:push", "git push origin main &
 wcdt("redirect BEFORE the remote consumes its filename", "block:push", "git push 2>/dev/null origin -d b", ["b"]);
 wcdt("redirect attached before the delete flag", "block:push", "git push origin >/dev/null -d b", ["b"]);
 wcdt("redirect between push and the --delete spelling", "block:push", "git push origin -q 2>/dev/null --delete b", ["b"]);
-wcdt("fd-dup redirect consumes nothing", "block:push", "git push origin -d b >&2", ["b"]);
+// ⛔ A SUBSTITUTION OPENER IS NOT A TERMINATOR (fresh-context review round 2, P2). The round-1 fix
+// truncated the segment at the first `_SHELL_OPS`/backtick token — correct for a CLOSER, wrong for an
+// OPENER: `git push $(cat .remote) origin -d b` then returned null where origin/main returned the
+// target, so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was allowed again. A
+// span that OPENS inside the segment is one WORD of the command, so its contents are skipped and the
+// scan continues; only a `)`/backtick with no opener inside the segment ends the body.
+wcdt("command-substitution OPENER keeps the flag and target", "block:push", "git push $(cat .remote) origin -d b", ["b"]);
+wcdt("substitution in an option VALUE keeps the flag and target", "block:push", "git push -o $(date) origin -d b", ["b"]);
+wcdt("BACKTICK substitution opener keeps the flag and target", "block:push", "git push origin `date` -d b", ["b"]);
+// ⛔ NO fd-dup ROW HERE (fresh-context review round 2, finding 2). `segRe`'s capture is `[^;&|]*`, so
+// it stops at the `&` inside `>&2` / `2>&1`: those tokens can NEVER reach `_redirectTakesOperand`, and
+// with the target placed BEFORE the redirect the row could not redden under any mutation (observed 0/13).
+// The unreachable `&>`/`&>>`/fd-dup branches were dropped from the helper for the same reason — the
+// reachable `>`/`>>`/`<`/`2>` forms are pinned by the rows above.
 wcdt("redirect AFTER the target (control)", "block:push", "git push origin -d b 2>/dev/null", ["b"]);
 // The fold-in path (frozen legacy evidence in a LATER segment) overrides
 // pushTargets with the SAME extractor — the parenthesized twin must attribute

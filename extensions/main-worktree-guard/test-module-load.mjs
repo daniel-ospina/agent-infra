@@ -444,6 +444,15 @@ async function partB() {
       const d7 = await coord("d7", "git push origin HEAD:refs/heads/feat && echo `git push origin -d held/branch`");
       expectTrue("B73g: an unquoted-backtick later segment is BLOCKED (not the phantom `held/branch`+backtick)",
         isCoordBlock(d7, "held/branch"), `handler returned ${JSON.stringify(d7)?.slice(0, 200)}`);
+      // ⛔ A SUBSTITUTION OPENER IS NOT A TERMINATOR (fresh-context review round 2). Truncating at the
+      // opener dropped `-d held/branch` and the block silently stopped firing — the same fail-open,
+      // reached by a spelling an agent writes whenever it needs the remote from a file or a date stamp.
+      const d8 = await coord("d8", "git push origin HEAD:refs/heads/feat && git push $(cat .remote) origin -d held/branch");
+      expectTrue("B73h: a `$( … )` OPENER before the delete flag does not hide the delete",
+        isCoordBlock(d8, "held/branch"), `handler returned ${JSON.stringify(d8)?.slice(0, 200)}`);
+      const d9 = await coord("d9", "git push origin HEAD:refs/heads/feat && git push origin `date` -d held/branch");
+      expectTrue("B73i: a backtick-substitution OPENER before the delete flag does not hide the delete",
+        isCoordBlock(d9, "held/branch"), `handler returned ${JSON.stringify(d9)?.slice(0, 200)}`);
       // Positive controls — the boundary fix must not invent targets: a delete of
       // a branch NOBODY has checked out stays allowed, and so does a plain
       // compound push (the #73 arm must not fire on it).
