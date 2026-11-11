@@ -10100,6 +10100,50 @@ testAsync("#2823 (E2E): stdout with NO turn behind it is not an answer either (t
   ok(text.includes("=== Results: 50 passed, 9 failed ==="), "the text is still shown, as a diagnostic");
 });
 
+testAsync("#2823 (E2E): a DISABLED emitter is not a silent child — no marker means nothing, so the answer is the answer", async () => {
+  // ⛔ THE POPULATION THE 'ARMED' FLAG USED TO MISREAD (#2823 review cycle 3, ISSUE 1). The task tool sets
+  // TASK_HEARTBEAT=1 unconditionally, and the subagent tool forces TASK_HEARTBEAT_DISABLE=1 into every
+  // child it spawns — so `hbEnabled` is true while the emitter is OFF by design and emits zero markers
+  // for the whole dispatch. If that silence were read as "never reached session_start", a child that ran
+  // real turns, answered on stdout and exited non-zero would be declared a setup failure, its answer
+  // quarantined, and a false cause recorded. Driven through the REAL funnel: the shim emits NO markers,
+  // prints the answer, exits 3.
+  const dir = mkdtempSync(join(tmpdir(), "t2823-hboff-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(join(shimDir, "pi"), `#!/bin/sh\necho "THE REAL ANSWER: 412 passed, 0 failed"\nexit 3\n`, { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.argv[1] = undefined as unknown as string;
+    process.env.DISPATCH_LEDGER = "0";
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: process.env.PATH,
+      TASK_HEARTBEAT: "1",
+      TASK_HEARTBEAT_DISABLE: "1",
+      DISPATCH_LEDGER: "0",
+    };
+    const res = await spawnSubAgent("deepseek-v4-flash", "deepseek", env, ["-p", "--no-session", "do nothing"]);
+    ok(res, "settles");
+    const d = (res as any).details as Record<string, unknown>;
+    const text = String((res as any).content?.[0]?.text ?? "");
+    ok(d.childState !== "died-before-first-turn", `a disabled emitter must never produce a pre-turn death claim (got ${String(d.childState)})`);
+    equal(d.isError, undefined, "…and it must not be flagged as a setup failure");
+    ok(!text.includes("died before its first turn"), "…and the header must not assert a setup failure that did not happen");
+    ok(text.includes("THE REAL ANSWER"), "the child's output is delivered as the result, not quarantined as a diagnostic");
+    equal(d.sawToolsUnknown, true, "the parent still STATES that marker evidence is missing (the honest half)");
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER;
+    else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 section("#1208 E2E: the REAL spawnSubAgent funnel stamps liveness on every settled result");
 
 // Two scripted children that differ ONLY in whether a turn completed. Same exit

@@ -664,6 +664,15 @@ test("#2823: the exit-0 pre-turn settle still writes its row — a clean exit is
 	equal(rows[0].reason, "died-before-first-turn", "the durable surface names the death, not a success");
 	equal(rows[0].reason, details.status, "one settle, two surfaces, ONE claim");
 	equal(rows[0].exitCode, 0, "the OS exit code rides the row even though the settle passed none");
+	// ⛔ AND THE PAYLOAD SAYS THE SAME THING (#2823 review cycle 3, ISSUE 3 — the declared T3). The header
+	// used `details.exitCode ?? "not recorded"`, so on exactly this population it told the operator "exit
+	// not recorded" about a death whose code the ledger had just written. One settle, two surfaces, one
+	// claim — asserted, not asserted-about.
+	ok(
+		payloadText(d.value).includes("exit 0"),
+		`the header names the exit code the row records (got: ${payloadText(d.value).slice(0, 200)})`,
+	);
+	ok(!payloadText(d.value).includes("not recorded"), "…and never claims the code is unknown when it is known");
 });
 
 test("silent child at the HARD CAP writes exactly ONE row — even though the close path re-settles as 'cut'", async () => {

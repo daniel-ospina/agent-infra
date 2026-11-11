@@ -4647,6 +4647,17 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // [provider-exhaustion] marker authentication); absent one, a fresh nonce
     // is generated here (legacy behavior).
     const hbEnabled = subAgentEnv.TASK_HEARTBEAT === "1";
+    // ⛔ "ARMED" IS NOT "LIVE" (#2823 review cycle 3, ISSUE 1). `hbEnabled` only says the variable is in
+    // the env — the task tool sets TASK_HEARTBEAT unconditionally, deliberately (7281-7285), and the
+    // EMITTER's own gate is `TASK_HEARTBEAT=1 && PI_MODE=print && TASK_HEARTBEAT_DISABLE !== "1"`
+    // (`extensions/task-heartbeat.ts:taskHeartbeatActive`). The subagent tool forces
+    // `TASK_HEARTBEAT_DISABLE: "1"` into every child it spawns, and any lane/operator that exports it
+    // does the same, so a child can be `hbEnabled` and emit ZERO markers BY DESIGN for its whole life.
+    // Reading that silence as "it never reached session_start" would declare a child that ran real turns
+    // and answered `died-before-first-turn`, quarantine its answer and record a false cause — the
+    // false-attribution direction this change ranks as the worse error. Proof B is therefore gated on the
+    // emitter being LIVE, which is the only claim the parent can honestly make.
+    const hbEmitterLive = hbEnabled && subAgentEnv.TASK_HEARTBEAT_DISABLE !== "1";
     const hbNonce = hbEnabled ? subAgentEnv.TASK_HEARTBEAT_NONCE || randomBytes(6).toString("hex") : "";
     const spawnEnv = hbEnabled
       ? { ...subAgentEnv, TASK_HEARTBEAT_NONCE: hbNonce }
@@ -5030,6 +5041,10 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // about what happened; deriving it from the settle path while the payload derived it from the
       // measurement let ONE settle be `clean-empty` (documented as a success) in the ledger and a
       // proven zero-message death in the result. The measurement is the single source for both.
+      if (process.env.DBG2823 === "1") {
+        // eslint-disable-next-line no-console
+        console.error("[dbg2823]", JSON.stringify({ hbEnabled, disable: subAgentEnv.TASK_HEARTBEAT_DISABLE, armed: hbEmitterLive, sawReady: hbCtx.state.sawReady, markers: hbCtx.state.markerCount, exit: proc.exitCode, pid: proc.pid }));
+      }
       const livenessSnapshot = childLivenessFor({
         details: value && typeof value === "object" ? (value.details ?? {}) : {},
         hbState: hbCtx.state,
@@ -5037,8 +5052,9 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         stdout,
         exited: proc.exitCode !== null || proc.signalCode !== null,
         // #2823: WITHOUT this, zero markers reads as "the child ran and said nothing" instead of
-        // "the emitter never ran, so the child never reached session_start".
-        heartbeatArmed: hbEnabled,
+        // "the emitter never ran, so the child never reached session_start". The LIVE flag, not
+        // `hbEnabled` — see its definition.
+        heartbeatArmed: hbEmitterLive,
         // The `undefined` settles carry no payload, so the kill is named by the REASON that
         // settled them. `failed` / `clean-empty` / `spawn-error` are not kills.
         killedByReason: opts?.reason !== undefined && !NON_KILL_SETTLE_REASONS.has(opts.reason),
@@ -5215,7 +5231,11 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
             .trim();
           details.status = "died-before-first-turn";
           details.isError = true;
-          const exit = details.exitCode ?? "not recorded";
+          // ⛔ THE TWO SURFACES MUST AGREE ON THE EXIT CODE (review cycle 3, ISSUE 3 — the declared T3).
+          // The durable row reads `opts?.exitCode ?? proc.exitCode ?? null`, and the reason-less settles
+          // (the exit-0 arm above all) carry no `details.exitCode` — so the header said "not recorded"
+          // about a death whose code the ledger had just written. Same fallback here.
+          const exit = details.exitCode ?? proc.exitCode ?? "not recorded";
           const seen = hbCtx.state.sawReady || hbCtx.state.markerCount > 0;
           const why = seen
             ? "the heartbeat emitter reported life and never reported a turn, so the child exited between " +
