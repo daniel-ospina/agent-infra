@@ -4676,7 +4676,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
           # the consumer is the no-op-gate class this repo treats as category A.
           case "$_pf_line" in
             *behind=unknown*)
-              echo "[capability-gate] WARN $label: the staleness reading is UNMEASURABLE — the line above carries behind=unknown, so this spawn is admitted with NO evidence its base is current (#3932). The reason is on that line: reason=no-checkout / reason=not-a-checkout (the probe resolved no checkout — name it with CELL_PREFLIGHT_REPO or pass the lane's --repo-dir), reason=fetch-failed (a dead/slow remote, or a fetch killed at CELL_PREFLIGHT_FETCH_BOUND), or reason=rev-list-unreadable. This is NOT a refusal and nothing was consumed; it is the one shape in which a stale box passes this gate." >> "$log" ;;
+              echo "[capability-gate] WARN $label: the staleness reading is UNMEASURABLE — the line above carries behind=unknown, so this spawn is admitted with NO evidence its base is current (#3932). The reason is on that line: reason=no-checkout / reason=not-a-checkout (the probe resolved no checkout — export CELL_PREFLIGHT_REPO=<the checkout this lane builds on> to name it explicitly), reason=fetch-failed (a dead/slow remote, or a fetch killed at CELL_PREFLIGHT_FETCH_BOUND), or reason=rev-list-unreadable. This is NOT a refusal and nothing was consumed; it is the one shape in which a stale box passes this gate." >> "$log" ;;
           esac ;;
         *)
           # ⛔ `rc=2` IS A VERDICT, AND IT IS THE ONE THE PROBE'S OWN EXIT TABLE SAYS EVERY CALLER MUST
