@@ -698,30 +698,39 @@ has " $FOUND" "died " "8d …a 'died' outcome (all four are reachable, not just 
 # verdict=exceeded-wallclock`. The line the census reads said "the work failed" about lanes that were
 # never allowed to finish, which is the question this issue was filed over.
 #
-# ⛔ ONLY TWO OF THESE EIGHT ARMS REDDEN ON THE PRE-CHANGE TREE — and the two kinds of arm prove
-# different things, so the distinction is stated rather than flattened (review finding on this very
-# change, and it was right: the earlier text claimed all of them redden pre-change, which is false by
-# construction).
+# ⛔ TWO OF THESE EIGHT ARMS REDDEN ON THE PRE-CHANGE TREE; SIX ARE OVER-REACH FALSIFIERS — and the
+# split is stated because the earlier text flattened it, claiming all eight redden pre-change. That
+# claim was FALSE by construction (review finding on this change) and the arithmetic is checkable:
+# `origin/main:scripts/orchestrator-harness/lane.sh:962` calls EVERY non-zero exit `failed
+# agent-exit-<rc>`, and six of these arms ask for exactly that.
 #
-#   * 9a and 9e are the BEHAVIOUR arms. On `origin/main` the non-zero branch is unconditional
-#     (`lane_outcome failed "agent-exit-$rc"`), so the outputs they demand — `died
-#     reason=transport-unreachable:…` and `died reason=exceeded-wallclock` — are UNREACHABLE there and
-#     both arms go RED. That is the mutation the issue asks for.
-#   * 9b/9c/9d/9f/9g/9h are OVER-REACH falsifiers, and they are GREEN on the pre-change tree BY
-#     CONSTRUCTION (it called everything `failed`, which is what they ask for). They exist to redden
-#     under the OPPOSITE mutation — a fix that attributes too much — and each one names the edit that
-#     reverts the protection it guards:
-#         9b  make the transport comparison unconditional (`-ge 0`, or drop the `elif` guard)
-#         9c  `LANE_TRANSPORT_MIN_ROTATIONS=1` in the sanitiser's default arm
-#         9d  set `LANE_AGENT_LOG_OFF=0` unconditionally (read the whole append-only log)
-#         9f  hoist the attribution above the `rc = 0` arm
-#         9g  replace `lane_bound_killer`'s `case` with a truthiness test (`[ -n "$v" ]`)
-#         9h  add `unknown` to the killer allow-list — ⛔ CONDITIONAL, and said so: the arm
-#             discriminates only while the fixture's `unknown` line is the LAST `[lane-bound] VERDICT`
-#             in this run's output, because `tail -1` reads the last one and the reaped watchdog can
-#             append its own `verdict=finished` after `pi` exits. It is pinned as a forward-guard on
-#             the allow-list, not counted as proof on its own; the unconditional half of that rule is
-#             9g, whose fixture cannot lose the comparison.
+#   * 9a and 9e are the BEHAVIOUR arms: on the pre-change tree the outputs they demand — `died
+#     reason=transport-unreachable:…` and `died reason=exceeded-wallclock` — are UNREACHABLE, so they
+#     go RED there. That is the mutation the issue asks for, and it was MEASURED, not reasoned: with
+#     the attribution block reverted to `else lane_outcome failed "agent-exit-$rc"`, this suite fails
+#     exactly 5 assertions — 9a (outcome), 9a (reason), 9a2, 9e, 9e2 — and 9e's mutated output is the
+#     measured defect verbatim: `outcome=failed reason=agent-exit-143` for a lane the wall ceiling
+#     had ENDED.
+#   * 9b/9c/9d/9f/9g/9h are OVER-REACH falsifiers: GREEN on the pre-change tree BY CONSTRUCTION (it
+#     called everything `failed`, which is what they ask for). They redden under the OPPOSITE
+#     mutation — a fix that attributes too much — and every row below was RUN against this tree, not
+#     read off the source (mutant → §9 arms that redden):
+#         9b  transport threshold `-ge 0` (attribution unmetered)         → 9b 9c 9d 9g 9h
+#         9c  `LANE_TRANSPORT_MIN_ROTATIONS=1` in the sanitiser's default → 9c
+#         9d  `LANE_AGENT_LOG_OFF` never advances (whole log read)         → 9d (rotations=5, the
+#                                                                            previous run's storm)
+#         9f  `rc = 0` no longer decided first (attribution hoisted)       → 9f
+#         9g  `lane_bound_killer`'s `case` → truthiness test `[ -n "$v" ]` → 9g 9h
+#         9h  `unknown` added to the killer allow-list                     → 9h (`died reason=unknown`)
+#     9b is the broadest: an unmetered transport read converts EVERY non-zero exit into a retryable
+#     death, which is why it reddens five §9 arms at once (and, outside §9, 3b and 8c). That breadth
+#     is the point of the arm — it is the mutation that would make the fix worse than the defect.
+#     9h was reported as CONDITIONAL by that review (it can only discriminate while the fixture's
+#     `unknown` line is the LAST `[lane-bound] VERDICT` in the run, because the read is `tail -1`, and
+#     a reaped watchdog may append its own `verdict=finished`). MEASURED at this head: the allow-list
+#     mutant is caught — 9h fails with `died reason=unknown` — so the fixture's line IS the last one.
+#     The race is real in production but it did not occur here; 9g pins the unconditional half of the
+#     rule (its fixture cannot lose the comparison).
 #     A work failure must NOT become retryable (9b/9c), a PREVIOUS run's connection storm must NOT
 #     classify THIS run (9d), a lane that merely logged a blip and then completed must stay `done`
 #     (9f), and a verdict word that names no bound must not be minted as a killer (9g/9h).
