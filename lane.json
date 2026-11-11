@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-11484-1794362525-p966258-90cac1a3",
+  "_sha": "deef73f758e97b5db68746a9b34381f99b065c62",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-11484.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/11484-derive-vocabulary"
+    },
+    {
+      "kind": "sha",
+      "value": "d1447b0fe3adfa4aede8956f1be8f131ed4c1eb7"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/11484-derive-vocab"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7231,
+  "ended_at": 1794369756,
+  "exit_code": 143,
+  "heartbeat_at": 1794369756,
+  "host": "cmux",
+  "issue": 11484,
+  "kind": "lane",
+  "lane_id": "cmux.klane-11484-1794362525-p966258-90cac1a3",
+  "lease_until": 1794377556,
+  "pid": 966258,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794362525,
+  "state": "FAILED",
+  "tag": "11484",
+  "worktree": "/home/cmux/tortoise/.worktrees/11484-derive-vocab"
+}
