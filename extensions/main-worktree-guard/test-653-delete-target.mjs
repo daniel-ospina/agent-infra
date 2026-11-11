@@ -147,13 +147,22 @@ if (typeof stripTypeScriptTypes !== "function" ||
     mod.default({ on(name, fn) { if (!handlers.has(name)) handlers.set(name, []); handlers.get(name).push(fn); } });
     const toolCall = handlers.get("tool_call")?.[0];
     const sessionStart = handlers.get("session_start")?.[0];
+    // ⛔ THE SESSION DIRECTORY IS MUTABLE AND IS WHAT EVERY LATER CALL RUNS IN
+    // (review P2 of PR #3978, MEASURED). `start(at)` used to chdir for
+    // `session_start` only and restore the previous cwd, while `bash` chdir'd to the
+    // LOAD-time cwd — so Part E ("from a WORKTREE") actually drove the handler from
+    // the fixture HUB. The guard reads `process.cwd()` at call time, so the rows
+    // exercised a shape the fleet never has, and a future worktree exemption
+    // inserted ahead of the delete arm would have left E1 GREEN.
+    let cur = cwd;
     const bash = async (command) => {
       const prev = process.cwd();
-      process.chdir(cwd);
+      process.chdir(cur);
       try { return await toolCall({ toolName: "bash", input: { command } }, undefined); }
       finally { process.chdir(prev); }
     };
     const start = async (at) => {
+      cur = at;
       const prev = process.cwd();
       process.chdir(at);
       try { await sessionStart({}, undefined); } finally { process.chdir(prev); }
