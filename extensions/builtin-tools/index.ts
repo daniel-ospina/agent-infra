@@ -5013,13 +5013,20 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     const doResolve = (
       value: TaskSettlePayload | undefined,
       // `reason` is the row discriminator. A row is written IFF `reason` is
-      // provided, and the enumeration is exact (#783 review — the previous
-      // "success → NO row" phrasing was false for `clean-empty`):
+      // provided OR the settle's own MEASUREMENT proves a death (`measuredDeathReason`),
+      // and the enumeration is exact (#783 review — the previous
+      // "success → NO row" phrasing was false for `clean-empty`; #2823 review cycle 4, LOW — it went
+      // false a second time when the measurement became a row gate, so both halves are stated here):
       //   ROW   hard-cap | cut | backstop | failed | clean-empty | spawn-error |
       //         any heartbeat `decision.reason` (tool-silence, tool-dead,
       //         tool-stall, stream-stall, silence-threshold, first-message-stall,
       //         max-dispatch, no-progress, zero-output)
+      //   ROW   died-before-first-message | died-before-first-turn
+      //         — MEASUREMENT-derived (`measuredDeathReason`), written on ANY settle path, INCLUDING a
+      //         reason-less `exit 0` one: a proven death is not a settle label, so `reason` is not the
+      //         only thing that can open this gate.
       //   NO ROW clean success | sessionEnded | abort-after-end
+      //         — and each of these writes one anyway if the measurement proves a death.
       // `clean-empty` is a SUCCESS settle (exit 0, empty stdout, no sessionEnded)
       // that still writes a row, because it is indistinguishable from a silent
       // loss to a ledger reader. `spawn-error` (pi not found, EACCES, EMFILE)

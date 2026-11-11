@@ -324,6 +324,14 @@ async function dispatch(scenario: string, opts: DispatchOptions = {}): Promise<D
 		// term the `exit2-no-marker` / `exit0-preturn-stdout` rows would model a child whose emitter was
 		// inert for a DIFFERENT reason than the one they claim (armed-and-silent).
 		PI_MODE: "print",
+		// ⛔ …AND THE THIRD TERM IS THE SAME ARGUMENT (#2823 review cycle 4, ISSUE 1). The spread above
+		// carries the OPERATOR's env, and `extensions/subagent/index.ts` forces
+		// `TASK_HEARTBEAT_DISABLE=1` into every child it spawns — so this suite run from one of those
+		// would model an EJECTED emitter while the `exit2-no-marker` row claims an armed-and-silent one
+		// (`childState` `exited-no-result`, row reason `failed`). Node drops an `undefined` env value, so
+		// this REMOVES the term for both the parent's premise (`hbEmitterLiveFor`) and the child; a
+		// fixture that wants the ejected emitter must set it explicitly.
+		TASK_HEARTBEAT_DISABLE: undefined,
 		TASK_HEARTBEAT_NONCE: nonce,
 		FAKE_PI_SCENARIO: scenario,
 		FAKE_PI_CLOSED_FILE: closedFile,

@@ -64,6 +64,26 @@ production defect is narrower than the issue body says and its producer is alrea
 - **Retry on this state.** Retrying a setup failure re-runs the same broken setup and pays a model call;
   the existing `died-before-first-message` arm does not retry either. The caller decides.
 
+## Residual (stated, not hidden)
+
+Two windows this design does **not** close, named so a later reader's risk model is correct rather than
+optimistic. They are NOT the same window and they are not bounded the same way:
+
+1. **Proof A fires on ANY exit code — it has no exit-code gate.** `childNeverBeganTurn` answers
+   `!everSawWork` whenever the emitter is seen to have run (`sawReady || markerCount > 0`), and that arm
+   is deliberately exit-agnostic (the truth table pins *"ready + no `turn_start` is 'no turn', **even on
+   exit 0** (the false PASS)"*). So an **exit-0 child that answered on stdout is relabelled a setup
+   failure if both its `turn_start` and its `turn_end` marker were lost**: the answer is quarantined
+   behind `--- what the child left behind (NOT its message) ---`, `isError: true` is stamped, and the
+   durable row records `died-before-first-turn`. Proof A's guarantee therefore rests on those two
+   markers arriving; unlike Proof B it is NOT bounded by the exit code. `everSawMsg` — a streamed
+   assistant message, which does prove a turn existed — is deliberately not a `positiveMessageEvidence`
+   term (it is content-blind, so trusting it would be a systematic false PASS on the #5195 E shape),
+   so it cannot rescue this window either.
+2. **An emitter that is live-but-failing in a way that emits no `ready` and no turn markers** is
+   indistinguishable from a child that never started. Proof B's non-zero-exit gate bounds this one to
+   failing children.
+
 ## Wiring
 
 | Call site / consumer | What it does there |

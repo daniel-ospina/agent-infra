@@ -10088,7 +10088,13 @@ async function dispatchWithShim(shim: string, tag: string) {
     process.env.DISPATCH_LEDGER = "0";
     // PI_MODE=print is part of the REAL task-tool child env (index.ts subAgentEnv): the emitter gates on
     // it too, so omitting it would make "the emitter was armed and silent" true for the wrong reason.
-    const env: Record<string, string | undefined> = { ...process.env, PATH: process.env.PATH, TASK_HEARTBEAT: "1", PI_MODE: "print", DISPATCH_LEDGER: "0" };
+    // ⛔ AND SO IS THE THIRD TERM (#2823 review cycle 4, ISSUE 1). `...process.env` carries whatever the
+    // OPERATOR exported, and the `subagent` tool forces `TASK_HEARTBEAT_DISABLE=1` into every child it
+    // spawns — so a lane running this suite from one of those models an EJECTED emitter while the row
+    // claims an armed-and-silent one, and reddens for an environment reason no mutant caused. Node
+    // drops an `undefined` env value, so this REMOVES the term for both the parent's premise
+    // (`hbEmitterLiveFor`) and the child. The DISABLED-emitter row below sets it explicitly on purpose.
+    const env: Record<string, string | undefined> = { ...process.env, PATH: process.env.PATH, TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, DISPATCH_LEDGER: "0" };
     return await spawnSubAgent("deepseek-v4-flash", "deepseek", env, ["-p", "--no-session", "do nothing"]);
   } finally {
     process.env.PATH = savedPath;
