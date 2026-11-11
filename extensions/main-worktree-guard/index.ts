@@ -6210,12 +6210,29 @@ export default function (pi: ExtensionAPI) {
       // allowed. A real push invocation is the precondition for every shape this
       // arm exists to cover, and the echo/comment over-match it still shares with
       // the degraded arm stays confined to commands that really do push.
+      // ⛔ EVERY DELETE TARGET IN THE COMPOUND MUST BE ATTRIBUTED (review round 6,
+      // finding 1). `det.pushTargets` describes ONE push invocation — the FIRST —
+      // because the classifier's later-segment fold-in is conditional on that
+      // invocation carrying NO delete spelling (`classify-git.mjs:4099`). So in
+      // `git reset --hard && git push origin --delete stale && git push origin
+      // --delete held` the parsed list is `["stale"]` while the whole-command
+      // extractor returns `["stale","held"]`: preferring `pushTargets` outright
+      // LOST the second delete, and `held` — checked out in a sibling — kept its
+      // upstream destroyed. Measured pre-fix: that row was ADMITTED in a worktree.
+      // The fix is the UNION of both surfaces, taken when the parsed list is EMPTY
+      // (the #504 later-segment case, unchanged) **or** the first push really
+      // carried a delete spelling (`det.isPushDelete` — a parsed fact, not string
+      // evidence). Union rather than replace: `pushTargets` also carries targets
+      // the string extractor does not see (the `-o`/`--push-option` value
+      // over-capture documented above, which errs toward BLOCKING), and adopting
+      // the extractor wholesale would trade this hole for a narrower one.
       if (det.hasPush === true &&
           det.verdict !== "block:push-delete" &&
           det.verdict !== "block:push" && det.verdict !== "block:force-push") {
-        const legacyDeletes = det.pushTargets.length > 0
-          ? det.pushTargets
-          : (extractPushDeleteBranch(localCommand) ?? []);
+        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)
+          ? (extractPushDeleteBranch(localCommand) ?? [])
+          : [];
+        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];
         const blocked = _coordinatedDeleteBlock(legacyDeletes);
         if (blocked) return blocked;
       }
