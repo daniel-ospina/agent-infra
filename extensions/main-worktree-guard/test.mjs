@@ -4642,7 +4642,80 @@ try {
     none("echo hi", "prose silence");
   }
 
-  // ── #625: in-place overwrite VERBS — walker-level pins. The primitive-only
+  // ── #437/#456 (C) round-45 (probe-verified against real bash): the cwd
+  // model must equal bash's on (a) a `( popd )` in a subshell, (b) the LAST
+  // segment of a pipeline, (c) a FAILED pushd, and (d) a newline that ends a
+  // simple command. (a) is the #456 residual itself — the walker is already
+  // real-bash-equal there and these pins exist so a future "optimisation" of
+  // the `)` handler (a LENGTH truncation cannot restore a popped VALUE, which
+  // is what #456's body proposes) cannot silently reintroduce the fail-open.
+  // (b)-(d) were MEASURED divergences found while verifying (a) (#3954 the
+  // pipeline boundary, #3955 the failed-pushd stack membership, #3956 the
+  // newline-terminated operand read); each was a fail-OPEN (a tracked hub write
+  // resolved outside the hub), and each is pinned in BOTH directions — the positive control is the neighbouring
+  // command that must still resolve where bash resolves it.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r45-"));
+    mkdirSync(join(H, "a")); mkdirSync(join(H, "c")); mkdirSync(join(H, "docs"));
+    // The hub the probes model: `docs/tracked.md` and the ROOT `tracked.md` are
+    // TRACKED; `a/` and `c/` are not — so a write there is the #436 carve-out's
+    // untracked NEW file (ALLOW) and a write to docs/ or the root BLOCKS.
+    const TRACKED = ["docs/tracked.md", "tracked.md"];
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r45: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C437r45: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    // The GATE decision, not just the resolution: block iff the resolved target
+    // is a TRACKED hub file (#436 carve-out: an untracked NEW file is allowed).
+    const verdict = (cmd) => firstHubTrackedWrite(cands(cmd).map((x) => ({ rel: x.resolvedPath.slice(H.length + 1) })), TRACKED) !== null;
+    const blocks = (cmd, label) => expectBool(`C437r45: ${label}`, verdict(cmd), true);
+    const allows = (cmd, label) => expectBool(`C437r45: ${label}`, verdict(cmd), false);
+
+    // ── (a) #456: `( popd )` must NOT eat the inherited stack entry. Bash
+    // copies the dir stack into the subshell and discards the copy at `)`, so
+    // the OUTER popd still restores the inherited entry. Length-only restore
+    // cannot do this (it re-holes the array → the outer popd no-ops).
+    // Real bash, verified: c/tracked.md (untracked) · docs/tracked.md (TRACKED)
+    // · a/tracked.md (untracked) — i.e. D1/D3 ALLOW, D2 BLOCK.
+    has("cd c; pushd ../docs; ( popd ); popd; echo x > tracked.md", "redirect:H/c/tracked.md", "D1: ( popd ) discarded; outer popd restores the pre-pushd cwd (c)");
+    allows("cd c; pushd ../docs; ( popd ); popd; echo x > tracked.md", "D1 gate: writable new file in c → ALLOW");
+    has("cd docs; pushd ../c; ( popd ); popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "D2: outer popd restores docs — the TRACKED hub write is not lost");
+    blocks("cd docs; pushd ../c; ( popd ); popd; echo x > tracked.md", "D2 gate: TRACKED docs/tracked.md → BLOCK (the #437 dirty-hub inflow)");
+    has("cd a; pushd ../docs; ( popd ); popd; echo x > tracked.md", "redirect:H/a/tracked.md", "D3: ( popd ) discarded; outer popd restores the pre-pushd cwd (a)");
+    allows("cd a; pushd ../docs; ( popd ); popd; echo x > tracked.md", "D3 gate: writable new file in a → ALLOW");
+    has("cd docs; pushd ../c; ( ( popd ) ); popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "nested ( ( popd ) ): the inner frames' pops never reach the outer stack");
+    has("cd docs; pushd ../c; pushd ../a; ( popd ); popd; echo x > tracked.md", "redirect:H/c/tracked.md", "two inherited entries: one subshell pop discards only its own copy");
+
+    // ── (b) EVERY pipeline segment is a subshell, the LAST one included: a cd
+    // in the final segment dies at the boundary, so the next command runs from
+    // the pipeline's START cwd. Real bash (fixture root): F1/F2/F3 write the
+    // ROOT tracked.md; the control F5 (`cd` BEFORE the `|`) writes docs/.
+    has("true | cd docs; echo x > tracked.md", "redirect:H/tracked.md", "F1: the last pipeline segment's cd dies at `;`");
+    blocks("true | cd docs; echo x > tracked.md", "F1 gate: the write is the TRACKED root file → BLOCK");
+    has("cd docs | cd a; echo x > tracked.md", "redirect:H/tracked.md", "F2: BOTH segments are subshells — neither cd survives");
+    has("echo hi | cd docs\n echo x > tracked.md", "redirect:H/tracked.md", "F3: a newline is a boundary too — the last segment's cd still dies");
+    has("cd docs && true | cat; echo x > t.md", "redirect:H/docs/t.md", "F5 control: a cd BEFORE the pipe is NOT a pipeline segment — it survives");
+    has("cd docs | cat; echo x > t.md", "redirect:H/t.md", "F6 control: the cd IS the pipeline segment — it dies at `|` (round-2 pin holds)");
+
+    // ── (c) a FAILED pushd never touches the dir stack (bash errors and leaves
+    // `dirs` unchanged). Pushing the cwd anyway desynchronises the stack, so a
+    // later bare popd lands one entry off and the walker's cwd drifts INTO the
+    // fail-open direction. Real bash: root tracked.md is overwritten.
+    has("pushd /nonexistent; cd a; popd; echo x > ../tracked.md", "redirect:H/tracked.md", "B1: a failed pushd leaves the stack alone — popd is a no-op, cwd stays a");
+    blocks("pushd /nonexistent; cd a; popd; echo x > ../tracked.md", "B1 gate: the real write is the TRACKED root file → BLOCK");
+    has("cd docs; pushd ../c; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "B2 control: a SUCCESSFUL pushd still collapses on the bare popd (docs)");
+
+    // ── (d) a bare newline ends a simple command, so a cwd builtin must not
+    // read its operand across one (`popd` + newline + `cd a`: real bash runs
+    // TWO commands). Real bash: cwd is `a`, so `../tracked.md` is the TRACKED
+    // root file.
+    has("popd\ncd a; echo x > ../tracked.md", "redirect:H/tracked.md", "N1: the bare popd does not eat the next line's `cd`");
+    blocks("popd\ncd a; echo x > ../tracked.md", "N1 gate: the real write is the TRACKED root file → BLOCK");
+    lacks("cd\ndocs; echo x > tracked.md", "redirect:H/docs/tracked.md", "N2: `cd` + newline is a bare cd — the next line is NOT its operand");
+  }
+
+
   // walk (`>`/`>>`/`tee`/python open) never surfaced `sed -i`/`cp`/`mv`/
   // `truncate`/`dd of=`/`perl -pi`/`awk -i inplace` onto a tracked hub file,
   // so the same-file write was blocked via redirect but slipped via the verb.

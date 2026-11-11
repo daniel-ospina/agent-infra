@@ -8057,7 +8057,18 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //  - heredoc BODIES are stdin data (skipped entirely in the walk; bodies
   //    never shift the cwd, emit tee/cd words, or swallow trailing code — an
   //    unterminated heredoc swallows to EOF, matching bash's heredoc wait).
-  const frames = [{ cwd: base0, pending: null, forkCwd: null, forkAlts: [] }];
+  // pipeC0/pipeActive (per frame): EVERY pipeline segment runs in a subshell,
+  // the LAST one included — a `cd` in the final segment (`true | cd docs; echo
+  // x > f`) does NOT survive the pipeline, so the next command runs from the
+  // pipeline's START cwd. pipeC0 records that start cwd at the first `|` and
+  // applyPending() restores it at the boundary; without it the last segment's
+  // `cd` LEAKED into the following command and a tracked hub write resolved one
+  // directory off — a FAIL-OPEN (`true | cd docs; echo x > tracked.md` resolved
+  // docs/tracked.md where real bash writes the tracked HUB file at the root;
+  // #3954).
+  // The git-side walker has always restored here (`_walkShell`'s pipeC0 /
+  // restoreC0 pair, pinned by its T32/T33).
+  const frames = [{ cwd: base0, pending: null, forkCwd: null, forkAlts: [], pipeC0: null, pipeActive: false }];
   // pipeBase: cwd at the start of the current PIPE list (updated at every
   // continuation boundary incl. &&); asyncBase: cwd at the start of the
   // current async segment (updated only at ;/newline/start/(/post-& — NOT at
@@ -8115,6 +8126,15 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const pipeB = () => pipeBase[pipeBase.length - 1];
   const asyncB = () => asyncBase[asyncBase.length - 1];
   const skipWs = (k) => { while (k < n && /\s/.test(s[k])) k++; return k; };
+  // A bash SIMPLE COMMAND ends at a bare newline, so an operand read for a
+  // cwd-mutating builtin must not cross one: `popd\ncd a` is TWO commands in
+  // real bash. skipWs() would swallow the newline and read `cd` as popd's
+  // operand, EATING the next command — measured BYPASS: `popd\ncd a; echo pwn >
+  // ../tracked.md` really overwrites the tracked HUB file (cwd is `a`, `..` is
+  // the hub root) while the walker lost the `cd` and resolved the write OUTSIDE
+  // the hub (allowed). A backslash-newline continuation is still a continuation
+  // — it is handled inside readWord, and `\` is not whitespace here. #3956.
+  const skipWsNl = (k) => { while (k < n && (s[k] === " " || s[k] === "\t" || s[k] === "\r")) k++; return k; };
   const readWord = (k) => {
     let w = "";
     let q = null;
@@ -8675,6 +8695,16 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   };
   const applyPending = () => {
     const fr = f();
+    // A pipeline's LAST segment is a subshell too: its `cd` dies here, so the
+    // boundary restores the pipeline's start cwd and DISCARDs that pending cd
+    // (`true | cd docs; echo x > f` writes from the pre-pipeline cwd — real
+    // bash-probe-verified; #3954).
+    if (fr.pipeActive) {
+      fr.cwd = fr.pipeC0 ?? fr.cwd;
+      fr.pipeC0 = null;
+      fr.pipeActive = false;
+      fr.pending = null;
+    }
     if (fr.pending) { fr.cwd = fr.pending; fr.pending = null; }
     pipeBase[pipeBase.length - 1] = fr.cwd;   // &&/;/newline: pipes start here
   };
@@ -8845,7 +8875,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         i++; continue;
       }
       applyPending();
-      frames.push({ cwd: f().cwd, pending: null, forkCwd: f().forkCwd, forkAlts: f().forkAlts ? [...f().forkAlts] : [] }); // cycle-40 F2: a subshell inherits the parent's case-fork realities
+      frames.push({ cwd: f().cwd, pending: null, forkCwd: f().forkCwd, forkAlts: f().forkAlts ? [...f().forkAlts] : [], pipeC0: null, pipeActive: false }); // cycle-40 F2: a subshell inherits the parent's case-fork realities
       pipeBase.push(f().cwd); asyncBase.push(f().cwd); updateAsyncBase();
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
       dirStackSnapshots.push(dirStack.slice());
@@ -8893,6 +8923,8 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         continue;
       }
       f().pending = null;              // a cd in the async list dies with the subshell
+      f().pipeC0 = null;               // ... and so does any in-flight pipeline state
+      f().pipeActive = false;
       f().cwd = asyncB();              // the WHOLE async list ran at the segment start
       pipeBase[pipeBase.length - 1] = f().cwd;
       updateAsyncBase();
@@ -8902,6 +8934,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }
     if (ch === "|") {
       if (s[i + 1] === "|") { applyPending(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; i += 2; continue; } // || continuation
+      if (!f().pipeActive) { f().pipeC0 = pipeB(); f().pipeActive = true; } // C0 = the cwd at the boundary BEFORE the first segment
       f().pending = null;
       f().cwd = pipeB();               // pipe segments from the pipe-list start
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
@@ -9251,19 +9284,30 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (SPAWNER_WORDS.has(wBase2)) { spawnerPending = wBase2; envSawAssign = false; continue; }
     }
     if (w0.w === "cd" || w0.w === "pushd") {
-      const nxt = skipWs(i);
+      const nxt = skipWsNl(i);
       const tgt = readWord(nxt);
       i = tgt.k;
-      if (w0.w === "pushd") {
-        // flag / +N / bare forms don't cd (conservative no-op) — only a dir operand
-        if (!tgt.w || tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w)) { f().pending = null; continue; }
-        dirStack.push(f().cwd);
-      }
+      const isPushd = w0.w === "pushd";
+      // flag / +N / bare forms don't cd (conservative no-op) — only a dir operand
+      if (isPushd && (!tgt.w || tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { f().pending = null; continue; }
+      let next = null;
       if (tgt.w && tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
-        const next = resolve(cwd, tgt.w);
-        f().pending = existsSync(next) ? next : null;       // failed cd — unchanged
+        const cand = resolve(cwd, tgt.w);
+        if (existsSync(cand)) next = cand;                  // failed cd — unchanged
+      }
+      // ⛔ A FAILED pushd NEVER TOUCHES THE DIR STACK (real bash: `pushd
+      // /nonexistent` errors and leaves `dirs` exactly as it was). Pushing the
+      // current dir anyway DESYNCHRONIZES the stack, so every later bare `popd`
+      // lands one entry off and the walker's cwd drifts from real bash's. That
+      // drift is a craftable BYPASS, not just a false positive — measured: `pushd
+      // /nonexistent; cd a; popd; echo pwn > ../tracked.md` really overwrites the
+      // TRACKED hub file at the root, while the walker 'restored' to the root and
+      // resolved the write OUTSIDE the hub (allowed). #3955.
+      if (isPushd && next) dirStack.push(f().cwd);
+      f().pending = next;
+      {
         const frcd = f();
-        if (frcd.forkCwd && frcd.forkAlts.length && caseDepth === 0) {
+        if (next && frcd.forkCwd && frcd.forkAlts.length && caseDepth === 0) {
           // cycle-38 P1: COMMON tail cds (outside any case arm) apply to every
           // arm-matched reality — shift the fork alts by the same relative
           // step. cycle-39 F1: a cd inside a LATER case's arm is conditional
@@ -9271,11 +9315,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           // alts, which represent realities that never ran that arm.
           frcd.forkAlts = [...new Set(frcd.forkAlts.map((b) => { const nx = resolve(b, tgt.w); return existsSync(nx) ? nx : b; }))].slice(0, 64);
         }
-      } else f().pending = null;
+      }
       continue;
     }
     if (w0.w === "popd") {
-      const tgt = readWord(skipWs(i));
+      const tgt = readWord(skipWsNl(i));
       i = tgt.k;
       if (tgt.w && (tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { continue; } // -n/+N: no cd
       const d = dirStack.pop();
