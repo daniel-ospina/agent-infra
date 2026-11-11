@@ -288,6 +288,40 @@ async function main() {
     const s8c = await quiet(() => callBash(`git -C "${hub}" pull --ff-only`));
     expectTrue("S8 F1-r5: same, `-C` spelling → not refused",
       s8c === undefined, `handler returned ${JSON.stringify(s8c)?.slice(0, 240)}`);
+
+    // ── Scenario 9 (review round-6 F1): a push verdict the extractor could NOT
+    // SEE still has a referent, and an EMPTY mutation list under it is an
+    // UNRESOLVABLE TARGET — #805 refuses it — not "nothing to gate". The
+    // classifier's zero-invocation early return sets `block:force-push` /
+    // `block:push-delete` from the RAW text and returns BEFORE
+    // commitMutations/pushMutations are populated, so round 5's phantom removal
+    // (correct for `git pull --ff-only`, whose verdict implies no push) left
+    // `gateMutations([])` → undefined → ADMIT. MEASURED regression: on main the
+    // same inputs were refused by the null-resolution arm, so a #2277 lane —
+    // rooted OUTSIDE any git repo, which is exactly this cwd — went
+    // BLOCK → ALLOW on the force-push it could not see.
+    const s9var = await quiet(() => callBash(`EV="cd ${hub} && git push -f origin feat/other"; eval $EV`));
+    expectTrue("S9 F1-r6: an opaque `eval $VAR` force-push (zero mutations) is FAIL-CLOSED, not admitted",
+      refusedBy(s9var, "could not verify repo ownership"),
+      `handler returned ${JSON.stringify(s9var)?.slice(0, 240)}`);
+    const s9eval = await quiet(() => callBash(`eval "cd ${hub} && git push -f origin feat/other"`));
+    expectTrue("S9 F1-r6: same, literal `eval \"…\"` spelling → FAIL-CLOSED",
+      refusedBy(s9eval, "could not verify repo ownership"),
+      `handler returned ${JSON.stringify(s9eval)?.slice(0, 240)}`);
+    // The same class on the delete verdict — the identical zero-mutation shape,
+    // and the identical fail-open when the list was empty.
+    const s9del = await quiet(() => callBash(`eval "git push origin --delete stale"`));
+    expectTrue("S9 F1-r6: an opaque `eval` --delete push (zero mutations) → FAIL-CLOSED (same class)",
+      refusedBy(s9del, "could not verify repo ownership"),
+      `handler returned ${JSON.stringify(s9del)?.slice(0, 240)}`);
+    // ⛔ SCOPE CONTROL (no new false block): the arm refuses only when the
+    // session's own repo is UNRESOLVABLE. With the cwd back in the hub — on
+    // `main`, the recorded baseline — the arm does not fire and main's behaviour
+    // is unchanged, so this is a restoration, not an extension.
+    process.chdir(hub);
+    const s9ctl = await quiet(() => callBash(`EV="cd ${hub} && git push -f origin feat/other"; eval $EV`));
+    expectTrue("S9 F1-r6 control: the #265 refusal is scoped to an UNRESOLVABLE cwd — a hub-rooted on-baseline session is unchanged",
+      s9ctl === undefined, `handler returned ${JSON.stringify(s9ctl)?.slice(0, 240)}`);
   } catch (e) {
     expectTrue("#605 integration ran without throwing", false, String(e?.stack ?? e).slice(0, 400));
   } finally {

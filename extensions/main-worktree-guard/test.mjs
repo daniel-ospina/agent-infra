@@ -2181,13 +2181,23 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
         // exempted (`git -C <wt> commit ; git commit` → ALLOW; the reversed
         // order blocked). Same rule the round-4 M3 loop (#596) applies to
         // branch-state mutations.
+        // ⛔ THE MIRROR INVENTS NO MUTATION (review round-6 F2). This used to
+        // SYNTHESIZE one from `det.commitHints`/`det.pushHints` when the
+        // classifier reported none — the exact fallback `index.ts` deleted in
+        // round 5, kept here one round longer. Two costs, both measured:
+        //   • the classifier-level suite could not SEE round-6 F1: for an opaque
+        //     `eval "git push -f …"` the mirror invented a push with
+        //     `invVisible: true`, resolved the session repo and answered
+        //     "block" while the SHIPPED gate admitted — an over-block the suite
+        //     called correct, over a hole in the gate;
+        //   • it is the drift this group's source pins exist to prevent: the pins
+        //     below cover the three `gateMutations(m2Mutations)` call sites, the
+        //     `isDelete` line and the #73 union, but NOT the list itself, so the
+        //     mirror kept modelling the deleted rule and every pin stayed green.
+        // The mirror now mirrors: only invocations the command ACTUALLY contains.
         const muts = [
-          ...(d.commitMutations && d.commitMutations.length > 0
-            ? d.commitMutations
-            : (d.verdict === "block:commit" ? [{ verb: "commit", invVisible: true, hints: d.commitHints, targets: null, dst: null }] : [])),
-          ...(d.pushMutations && d.pushMutations.length > 0
-            ? d.pushMutations
-            : (d.verdict !== "block:commit" ? [{ verb: "push", invVisible: true, hints: d.pushHints, targets: d.pushTargets, dst: d.pushDst, isDelete: false }] : [])),
+          ...(d.commitMutations ?? []),
+          ...(d.pushMutations ?? []),
         ];
         let sawMain = false;
         for (const mu of muts) {
@@ -2304,6 +2314,12 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       expectBool("#605 F1-r3: off-baseline MAIN commit + a no-refspec `git push --delete` → M2 BLOCK", m2s, "block");
       const m2t = m2Gate(`git push --delete`);
       expectBool("#605 F1-r3 control: lone no-refspec `git push --delete` → nothing main-resolving (wt-exempt)", m2t, "wt-exempt");
+      // Review round-6 F2: with the invented mutations gone, the mirror reports the
+      // ZERO-mutation shape the classifier actually produces for an opaque payload,
+      // instead of a synthetic block the shipped gate never returns.
+      const m2u = m2Gate(`eval "cd /tmp && git push -f origin feat/other"`);
+      expectBool("#605 r6: an opaque `eval` force-push yields NO mutations to gate (the fail-closed arm is the shipped one)",
+        m2u, "wt-exempt");
       // ── ANTI-DRIFT source pins (agent-infra#3442, reviewer residual) ──
       // `m2Gate` is a HAND-WRITTEN mirror of index.ts's M2 loop, so a shipped
       // arm could lose its gate call while every row above stayed green (the
@@ -2318,6 +2334,15 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
         pinSrc.includes('if (mu.verb === "push" && mu.isDelete) continue;'), true);
       expectBool("#605 source pin: the #73 coordinated check unions EVERY delete invocation's targets",
         pinSrc.includes("_coordinatedDeleteBlock(deleteTargets)"), true);
+      // Review round-6 F2: the mutation list ITSELF is a rule, and it was the one
+      // rule with no pin — the mirror above could keep the deleted synthesis while
+      // every pin stayed green. The mirror cannot represent the shipped arm (it
+      // resolves at `mainR`, the arm resolves at the session cwd), so the arm is
+      // pinned at its SOURCE here and pinned EXECUTABLY at the handler level in
+      // test-m2-compound-ownership.mjs S9.
+      const unseenPushPin = pinSrc.match(/m2Mutations\.length === 0 &&\s*\(det\.verdict === "block:force-push" \|\| det\.verdict === "block:push-delete"\)/);
+      expectBool("#605 r6 source pin: a push verdict the extractor could not see is FAIL-CLOSED, not an empty list to admit",
+        unseenPushPin !== null && pinSrc.includes("could not verify repo ownership (git read failed; fail-closed, #265)"), true);
       execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
       const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");

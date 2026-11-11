@@ -6217,6 +6217,38 @@ export default function (pi: ExtensionAPI) {
       // (MEASURED). Gating must judge the compound's real invocations, exactly as
       // the comparator's per-subcommand model does.
       m2Mutations.push(...(det.commitMutations ?? []), ...(det.pushMutations ?? []));
+      // ⛔ …BUT AN EMPTY LIST UNDER A PUSH VERDICT IS AN UNRESOLVABLE TARGET, NOT
+      // "nothing to gate" (review round-6 F1). `block:force-push` and
+      // `block:push-delete` are ALSO set by the raw-text pass in the classifier's
+      // ZERO-INVOCATION early return (`classify-git.mjs:3932-3945`), which returns
+      // BEFORE `commitMutations`/`pushMutations` are populated — so
+      // `eval "cd <hub> && git push -f origin feat/other"` carries the verdict with
+      // an EMPTY mutation list. MEASURED: every VISIBLE invocation yields ≥1
+      // mutation (`git push -f`, `git push -f --all`, `git push --force --mirror`,
+      // `git push --delete`, `git push origin -d stale` → 1 each), so an empty list
+      // under these two verdicts is exactly "a push the tokenizer could not expand".
+      //
+      // Without this arm `gateMutations([])` returns undefined and the M2 arm admits:
+      // MEASURED regression — a #2277 lane (rooted OUTSIDE any git repo) went
+      // BLOCK → ALLOW on the very force-push it could not see, while
+      // `block:commit`/`block:push` in the SAME arm line kept their gate. #805 is
+      // the decision: a gate that cannot determine the target REFUSES, never
+      // exempts. This restores the refusal the null resolution carried on main
+      // (`main:index.ts:6323`); it does not extend it — a session whose cwd DOES
+      // resolve keeps main's behaviour (one synthesized push, gated against the
+      // session repo), so no new false block is introduced.
+      //
+      // S8 stays green: `git pull --ff-only` is `block:pull`, which implies no push
+      // and is NOT in this set, so round 5's phantom-mutation removal stands.
+      if (m2Mutations.length === 0 &&
+          (det.verdict === "block:force-push" || det.verdict === "block:push-delete")) {
+        if (!branchOwnership.resolveEffectiveRepo("git status", process.cwd())) {
+          return {
+            block: true,
+            reason: "⛔ git commit/push blocked — could not verify repo ownership (git read failed; fail-closed, #265).",
+          };
+        }
+      }
       // #805/#605: gate ONE commit/push mutation. Returns the refusal, or
       // undefined when this mutation is exempt/on-baseline.
       const gateOneMutation = (mu: any): { block: true; reason: string } | undefined => {
