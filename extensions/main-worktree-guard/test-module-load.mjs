@@ -1354,6 +1354,15 @@ async function partB() {
     expectTrue("#607 comment: predicate — the SAME apostrophe does not excuse an executable `<(...)` payload on the next line [mutant: M10] — MEASURED at 2e0b3ab7d: false",
       classify607(`# don't\nbash <(echo 'git branch -Mq victim main')`).hiddenStateMutation === true,
       JSON.stringify(classify607(`# don't\nbash <(echo 'git branch -Mq victim main')`).hiddenStateMutation));
+    // ⛔ FOUND while fixing finding 1, in this fix's OWN first cut: an ANSI-C
+    // `$'…'` literal may contain an ESCAPED quote (`$'it\'s …'`). Treated as an
+    // ordinary single-quoted region it ended at the escaped quote, so a later `#` on
+    // the same line blanked the rest — including a LIVE payload after it. MEASURED:
+    // false (ADMITTED) without the ANSI-C arm, true with it. Pinned so the arm cannot
+    // be dropped again.
+    await expect607Block(
+      "#607 comment: an ANSI-C literal's ESCAPED quote does not end the region early — a LIVE payload later on the same line is still REFUSED [mutant: M13 — the ANSI-C arm removed] — MEASURED: ADMITTED without it",
+      `echo $'it\\'s # x' ; echo "$(git branch -Mq main victim)"`);
 
     // ── #607 round-5 FINDING 2 (P2 — over-block): the alias arm judged the VERB and
     // not the args, and the eval/alias passes scanned raw source so SINGLE-QUOTED

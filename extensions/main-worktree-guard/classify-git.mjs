@@ -5836,6 +5836,20 @@ function _stripShellCommentsForScan(text) {
       i += 1;
       continue;
     }
+    if (c === "$" && src[i + 1] === "'") {
+      // ANSI-C `$'…'`: a QUOTED string to the shell (nothing inside expands except
+      // its own escapes), and `\'` is an ESCAPED quote. Copy it whole — without this
+      // arm the escaped quote ended the region early, and a later `#` on the same
+      // line then blanked a LIVE payload after it (MEASURED while fixing this:
+      // `echo $'it\'s # x' ; echo "$(git branch -Mq main victim)"` → false, while the
+      // shell runs the substitution).
+      let j = i + 2;
+      while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
+      const end = j < n ? j + 1 : n;
+      out.push(src.slice(i, end));
+      i = end;
+      continue;
+    }
     if (c === "'") {
       // Single-quoted region: LITERAL to bash (a backslash is not an escape
       // here), so copy it verbatim through its closing quote.
