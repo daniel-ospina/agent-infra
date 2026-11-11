@@ -28,7 +28,20 @@ cat > "$BIN/gh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${GH_LOG:-/dev/null}"
 case " $* " in
-  *"check-runs"*) [ -n "${CHECKS_STUB:-}" ] && cat "$CHECKS_STUB"; exit 0 ;;
+  # ⛔ TWO DIFFERENT READS HIT THIS URL AND THEY ARE NOT INTERCHANGEABLE (#3858): the single-page
+  # poll, and the rare `--paginate` FULL read taken when TOTAL says there is more than one page. A
+  # suite must be able to make ONE of them come back short or fail while the other stays healthy —
+  # that difference IS the defect (page 2 dropped ⇒ green; page 2 delivered ⇒ red).
+  *"check-runs"*)
+    case " $* " in
+      *" --paginate "*)
+        if [ -n "${FULL_CHECKS_STUB:-}" ]; then cat "$FULL_CHECKS_STUB"; elif [ -n "${CHECKS_STUB:-}" ]; then cat "$CHECKS_STUB"; fi
+        [ -n "${FULL_CHECKS_STDERR:-}" ] && printf '%s\n' "$FULL_CHECKS_STDERR" >&2
+        exit "${FULL_CHECKS_RC:-0}" ;;
+      *)
+        [ -n "${CHECKS_STUB:-}" ] && cat "$CHECKS_STUB"
+        exit "${CHECKS_RC:-0}" ;;
+    esac ;;
   *"pulls/"*)
     # TWO different reads hit this URL, and they must not be confused: the script's own PR read
     # carries `join(`, the detached wrapper's merge CONFIRMATION (F3) is a bare merged_at jq. If the
@@ -109,6 +122,21 @@ run() { # run <pr> <args…>  → sets RC, OUT
         bash "$SCRIPT" "$@" 2>&1)"; RC=$?
 }
 verdict_of() { cat "$OT/state/lanemerge-$1.verdict" 2>/dev/null; }
+# `run` plus the check-run stub's own knobs (#3858). The single-page poll and the rare paginated FULL
+# read are two different reads on one URL, so a suite has to be able to make one come back short or
+# fail while the other stays healthy. Plain (unexported) assignments in the caller are read here and
+# passed explicitly into the child's environment, so nothing leaks into a later `run` arm.
+run_stub() { # run_stub <pr> <args…>  (CHECKS_STUB / CHECKS_RC / FULL_CHECKS_STUB / FULL_CHECKS_RC / FULL_CHECKS_STDERR)
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+        CHECKS_STUB="${CHECKS_STUB:-}" CHECKS_RC="${CHECKS_RC:-0}" \
+        FULL_CHECKS_STUB="${FULL_CHECKS_STUB:-}" FULL_CHECKS_RC="${FULL_CHECKS_RC:-0}" \
+        FULL_CHECKS_STDERR="${FULL_CHECKS_STDERR:-}" \
+        LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT="${WAIT_S:-0}" LANE_MERGE_POLL="${POLL_S:-0}" \
+        LANE_MERGE_ELAPSED_S="${LANE_MERGE_ELAPSED_S:-}" \
+        bash "$SCRIPT" "$@" 2>&1)"; RC=$?
+}
+reset_stub_knobs() { CHECKS_STUB=""; CHECKS_RC=0; FULL_CHECKS_STUB=""; FULL_CHECKS_RC=0; FULL_CHECKS_STDERR=""; }
+reset_stub_knobs
 
 mkdir -p "$T/home"
 echo "==> lane-merge.sh offline suite"
@@ -1390,6 +1418,76 @@ ck "a TOTAL-only response is NOT a green head (0 check-runs = nothing measured, 
      PATH="$BIN:$PATH" GH_LOG=/dev/null CHECKS_STUB="$T/checks-empty.tsv" O="$OT" HOME="$T/home" \
        LANE_MERGE_WAIT=0 LANE_MERGE_INTERVAL=0 bash "$SCRIPT" 31 --repo o/r --pr-tsv "$T/pr31.tsv" >/dev/null 2>&1; RC2=$?; \
      [ "$RC2" = 11 ] && [ "$(verdict_of 31 | cut -d' ' -f1)" = WAITING_CHECKS ] && echo 0 || echo 1)
+
+# ── 17c. A >100-CHECK-RUN HEAD MUST NOT GO GREEN FROM A TRUNCATED READ (#3858) ──────────────────
+# The single-page read answers TOTAL=150, so the loop pays for the paginated full read — and that read
+# is the ONE place completeness was assumed from having ASKED for more: its exit status was discarded
+# at the call site and no row count was ever compared with TOTAL. `classify` derives GREEN from the
+# rows it is GIVEN, so a dropped page took its pending and red rows WITH it, the loop broke, and the
+# merge chain launched on a head nobody had measured. Measured for the issue: page 2 held
+# `redjob failure`, page 1 held one green row, and origin/main launched the chain; the same fixture
+# with page 2 delivered exited 10 FIX_REQUIRED. Every arm below is a different way for that read to
+# come back short, and each must land in the HELD bucket (WAITING_CHECKS) — never in the green one —
+# while a genuinely complete read must still pass, or the fix has just moved the false verdict.
+# One fixture PER ARM, so no arm's outcome can depend on a previous arm's — in particular on whether a
+# previous arm WRONGLY let the chain run and rewrote the fixture to closed+merged (which is exactly what
+# the pre-fix tree does here, and it would hide an arm rather than fail it).
+for _f in 638 638b 638c; do printf 'open||head%s|clean\n' "$_f" > "$T/pr$_f.tsv"; done
+{ printf 'TOTAL\t150\n'; printf 'allgood\tcompleted\tsuccess\t41\tgithub-actions\n'; } > "$T/checks-150-short.tsv"
+# A REAL 150-row page set: the control arm, so the count assertion is pinned in BOTH directions.
+{ for i in $(seq 1 150); do printf 'job%03d\tcompleted\tsuccess\t%04d\tgithub-actions\n' "$i" "$i"; done; } > "$T/checks-150-full.tsv"
+
+# (i) the read EXITED 0 having silently dropped rows: the COUNT assertion alone must catch this.
+reset_stub_knobs; CHECKS_STUB="$T/checks-150-short.tsv"
+new_o "$T/pr638.tsv"
+run_stub 63 --repo o/r --pr-tsv "$T/pr638.tsv"
+ck "a >100 head whose full read returns 1 of its 150 rows is HELD (WAITING_CHECKS), not green (got RC=$RC verdict=$(verdict_of 63))" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 63 | cut -d' ' -f1)" = WAITING_CHECKS ] && echo 0 || echo 1)
+ck "…and the merge chain was NOT launched on that unmeasured head (a truncation is not a green head)" \
+   $(! grep -q "MERGED via the rail" "$OT/logs/lane-merge-63.log" 2>/dev/null && echo 0 || echo 1)
+ck "…and the log names the COUNT that failed, so the operator can see what was measured" \
+   $(grep -q "returned 1 of 150 rows, so it was TRUNCATED" <<<"$OUT" && echo 0 || echo 1)
+
+# (ii) the read FAILED: the exit-status half. Rows that did arrive are still not a measurement.
+reset_stub_knobs
+CHECKS_STUB="$T/checks-150-short.tsv"; FULL_CHECKS_STUB="$T/checks-150-short.tsv"; FULL_CHECKS_RC=1
+FULL_CHECKS_STDERR="HTTP 502: Bad Gateway (page 2 of 2)"
+new_o "$T/pr638b.tsv"
+run_stub 64 --repo o/r --pr-tsv "$T/pr638b.tsv"
+ck "a FAILED full read (exit 1) is HELD even though the rows it printed are green" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 64 | cut -d' ' -f1)" = WAITING_CHECKS ] && echo 0 || echo 1)
+ck "…and it names the exit status AND how many of how many rows arrived (got: $(grep -o 'FAILED (exit [0-9]*) after [0-9]* of [0-9]* rows' <<<"$OUT" | head -1))" \
+   $(grep -q "FAILED (exit 1) after 1 of 150 rows" <<<"$OUT" && echo 0 || echo 1)
+ck "…and the READ'S OWN stderr is surfaced (the old 2>/dev/null threw away the only reason a page stream stops)" \
+   $(grep -q "the read said: HTTP 502: Bad Gateway" <<<"$OUT" && echo 0 || echo 1)
+ck "…and the chain did not launch" \
+   $(! grep -q "MERGED via the rail" "$OT/logs/lane-merge-64.log" 2>/dev/null && echo 0 || echo 1)
+
+# (iii) the CONTROL: a genuinely COMPLETE full read must still go green, or the fix has traded a false
+# PASS for a permanent false block (the direction the issue requires, but not at the cost of the loop).
+reset_stub_knobs; CHECKS_STUB="$T/checks-150-short.tsv"; FULL_CHECKS_STUB="$T/checks-150-full.tsv"
+new_o "$T/pr638c.tsv"
+run_stub 65 --repo o/r --pr-tsv "$T/pr638c.tsv"
+ck "a COMPLETE full read (150 of 150 rows) is still GREEN and the chain IS launched — the assertion does not over-block" \
+   $([ "$RC" = 11 ] && grep -q "MERGED via the rail" "$OT/logs/lane-merge-65.log" 2>/dev/null && echo 0 || echo 1)
+ck "…and no truncated-read line was emitted for it" \
+   $(! grep -q "TRUNCATED" <<<"$OUT" && echo 0 || echo 1)
+
+# (iv) the single-page read itself failing while its rows LOOK complete: the same false-PASS class one
+# level down, closed by the same rule (a read that did not finish is not a measurement).
+reset_stub_knobs; CHECKS_STUB="$T/checks-total.tsv"; CHECKS_RC=1
+# Its OWN PR fixture: the case-(iii) chain rewrote $T/pr638.tsv to closed+merged, and a merged PR is
+# answered before any check is read — that would test the MERGED short-circuit instead of this arm.
+printf 'open||head639|clean\n' > "$T/pr639.tsv"
+new_o "$T/pr639.tsv"
+run_stub 66 --repo o/r --pr-tsv "$T/pr639.tsv"
+ck "a FAILED single-page read is HELD even when the rows it printed look green (got RC=$RC verdict=$(verdict_of 66))" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 66 | cut -d' ' -f1)" = WAITING_CHECKS ] && echo 0 || echo 1)
+ck "…and it says the read FAILED rather than reporting a check count nobody measured" \
+   $(grep -q "single-page check-run read FAILED (exit 1)" <<<"$OUT" && echo 0 || echo 1)
+ck "…and the chain did not launch" \
+   $(! grep -q "MERGED via the rail" "$OT/logs/lane-merge-66.log" 2>/dev/null && echo 0 || echo 1)
+reset_stub_knobs
 
 # ── 18. the SUPERVISION BUDGET is sized to what the LANE can actually SPEND, and re-armed (E1) ────
 # ⛔ THE OLD INVARIANT WAS SATISFIED BY MAKING THE TWO SIDES EQUAL (landing review, P1, verified):

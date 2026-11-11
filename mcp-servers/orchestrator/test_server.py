@@ -340,6 +340,13 @@ def test_S11_the_mcp_answers_identically_to_the_cli(env):
     for key in ("registry_path", "registry_sha256", "instrument_sha256", "liveness",
                 "liveness_requested", "liveness_source"):
         mcp.pop(key, None)
+    # ⛔ AND THE `pool` DELTA IS AN MCP-SURFACE FIELD, NOT A REGISTRY ONE (#2921): `list_payload`
+    # answers "which lanes hold a record", and the `pi` PROCESS census answers "which processes exist"
+    # — a question the CLI's registry builder never asks, which is why an unwrapped CLI could never be
+    # identical on it. Popping it here is narrow on purpose: everything the BUILDER produces is still
+    # compared key by key below, so the drift this test exists for stays caught.
+    mcp.pop("pool", None)
+    mcp.pop("pool_requested", None)
     cli.pop("measured_at", None)
     mcp.pop("measured_at", None)
     # ⛔ THE ONLY FIELDS NORMALISED ARE THE ONES THAT ARE A FUNCTION OF *WHEN* THE READ HAPPENED. Both
@@ -2156,3 +2163,83 @@ def test_T_pin_the_help_boundary_shapes():
     for argv in (["git", "status", "-h"], ["git", "status", "-help"],
                  ["git", "status", "--hel"], ["git", "status", "--help-all"]):
         assert mod._allowlisted(argv)[0], argv
+
+
+# ── S16 / S17 — the `pi` PROCESS population (#1777, #2921): a DELTA on lane.list ──────────────
+#
+# The population this reports is the one NO session store can contain: an orchestrator lane runs
+# `pi -p --no-session`, writes no transcript and no cmux store record, and is therefore absent from
+# every session-store population BY CONSTRUCTION (measured 2026-10-27: 29 processes, 2.64 GB, and an
+# hour of hand-measurement was the only instrument that saw them). `lane.list` answered from the
+# REGISTRY alone reported none of them and said nothing about it — an absence read as a clean bill.
+
+def test_S16_lane_list_pool_reports_the_process_population_and_its_one_verdict_source(env, tmp_path,
+                                                                                    monkeypatch):
+    """The census is `orphan-reap.py --pool pi --json`, WRAPPED — same four states, same predicate."""
+    census = {
+        "pool": "pi", "sample_s": 15.0, "tolerance_s": 0.1, "fence_s": 3, "outlier_factor": 3,
+        "idle_floor_s": 86400,
+        "counts": {"LIVE": 1, "PARKED-REAPABLE": 1, "KEEP-HUMAN": 0, "UNVERIFIABLE": 0},
+        "rows": [
+            # the class #1777 is about: a pi with NO transcript at all (`--no-session`)
+            {"pid": 4242, "state": "PARKED-REAPABLE", "reason": "parked-and-retired",
+             "transcript": None, "cpu_delta": 0.0, "age_h": None, "etime": "23:58:11",
+             "canon": None, "binding": "unbound", "readings": {}},
+            {"pid": 4343, "state": "LIVE", "reason": "cpu-advancing", "transcript": None,
+             "cpu_delta": 9.9, "age_h": None, "etime": "00:03:00", "canon": None,
+             "binding": "unbound", "readings": {}},
+        ],
+    }
+    monkeypatch.setenv("ORCH_MCP_ORPHAN_REAP", stub_json(tmp_path, "orphan_reap.py", census))
+    registry, _origin, _repo, _tmp = env
+    _is_err, payload = call(registry, "lane.list", {"pool": True})
+    pool = payload["pool"]
+    assert payload["pool_requested"] is True
+    assert pool["population"] == "pi-process-pool", pool
+    assert pool["counts"]["PARKED-REAPABLE"] == 1
+    assert pool["source"].endswith("orphan-reap.py --pool pi --json")
+    # ⛔ THE MANDATE IS "ONE VERDICT FUNCTION, NEVER A SECOND" — the wrapper must SAY which one it uses
+    assert "liveness.py::evaluate" in pool["verdict_source"]
+    # the row that has no transcript is carried as such, not dropped: that IS the population
+    assert [r["transcript"] for r in pool["rows"]] == [None, None]
+    # ⛔ a SHORT CPU WINDOW is not progress, and the declaration says so where a caller will read it
+    assert "short" in pool["declaration"]["cpu_basis"].lower()
+    assert pool["measured_at"] > 0
+
+
+def test_S17_an_unreadable_pi_pool_is_UNMEASURED_and_never_a_census_of_zero(env, tmp_path, monkeypatch):
+    """`counts: null` (the census could not be read) must never render as `LIVE: 0`.
+
+    This is the FALSE CLEAN class at the heart of #2921: "0 to reap" is a reading, and a read that
+    failed is a DIFFERENT reading. `orphan-reap.py` keeps the two apart on its own stdout by emitting
+    `counts: null` + `error`; the wrapper must pass that abstention through instead of defaulting.
+    """
+    unreadable = {"pool": "pi", "error": "ps-unreadable", "counts": None, "rows": [], "gates": None}
+    registry, _origin, _repo, _tmp = env
+    monkeypatch.setenv("ORCH_MCP_ORPHAN_REAP",
+                       stub_json(tmp_path, "orphan_reap_bad.py", unreadable, code=2))
+    _is_err, payload = call(registry, "lane.list", {"pool": True})
+    pool = payload["pool"]
+    assert "counts" not in pool, pool
+    assert pool["unmeasured"].startswith("UNMEASURED(pi pool census + ps-unreadable)"), pool
+    assert pool["exit_code"] == 2
+    # a prose document from a successful run is a PARSE failure, never "the command failed"
+    monkeypatch.setenv("ORCH_MCP_ORPHAN_REAP",
+                       stub(tmp_path, "orphan_reap_prose.py", "print('the pool is empty')"))
+    _is_err, payload = call(registry, "lane.list", {"pool": True})
+    assert "not JSON" in payload["pool"]["unmeasured"], payload["pool"]
+
+
+def test_S18_the_pi_pool_is_never_omitted_from_the_payload(env):
+    """Not asking is a DECLARED gap, not a silent one.
+
+    A payload with no `pool` key reads as "nothing to report", which is exactly the FALSE CLEAN this
+    population was hidden behind. The key is always present; when the census was not run it carries
+    the reason, in the same shape `liveness` uses for its own unrequested arm.
+    """
+    registry, _origin, _repo, _tmp = env
+    _is_err, payload = call(registry, "lane.list", {})
+    assert payload["pool_requested"] is False
+    assert payload["pool"].startswith("UNMEASURED(pool + not requested:"), payload["pool"]
+    # and the argument the caller must pass is named in the message a client can read
+    assert "pool:true" in payload["pool"]
