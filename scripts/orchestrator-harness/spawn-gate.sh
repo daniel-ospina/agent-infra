@@ -3706,6 +3706,20 @@ AGENT_CAPABILITY_REFUSED=71
 # third-party process produces it by accident, the property #2258 chose 80 for.
 # `spawn-gate.test.sh` now DERIVES the set of gates and fails when two of them claim one code.
 AGENT_HARNESS_SKEW_REFUSED=83
+# The STALE-CHECKOUT refusal (this change's review, P1-2). A SEVENTH code, for the reason the skew one
+# took 83: every reader maps 71 to a property of THIS box, and a property of THIS box is what makes
+# `lane.sh` mint `state/capacity-refused-<N>` and the controller stand down SO A PEER CAN TAKE THE
+# ITEM. For a stale checkout that is exactly wrong in the shape the PR measured — every cell 496-7093
+# commits behind — so the item circulates between boxes that refuse identically and is never built,
+# which is WORSE than the refusal it was escaping. The remedy lives on the box (advance the checkout),
+# not on a peer, and the operator-facing text in `lane.sh`/`orch-loop.sh` is chosen by the CODE, so a
+# distinct code is the only thing that makes those readers publish it. ⛔ 85, NOT 82/84: 82 is
+# `key-gate.sh`'s KEY_GATE_REFUSED (#3331), 84 is `PI_GATE_MEM_REFUSED` (this file's spawn point), and
+# 78/79/80 are the fork cannot-verify pair, adopt-fix.sh's deferral and brief-gate.sh's refusal — so 85
+# is the lowest free code, outside the sysexits range and outside bash's reserved 126/127/128+, the same
+# property #2258 chose 80 for. `spawn-gate.test.sh` derives the set of gates and fails when two claim
+# one code, so this cannot silently collide with a later gate.
+AGENT_STALE_CODE_REFUSED=85
 # The disk gate's refusal code, and it is a SEPARATE code on purpose: the remedies are opposite. A
 # load refusal clears when the box quietens and the controller re-dispatches next cycle; a disk
 # refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
@@ -4549,7 +4563,19 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   if [ "${LANE_PREFLIGHT:-1}" != "0" ]; then
     local _pf_sh="" _pf_line="" _pf_rc=0 _pf_remedy="" _pf_reason="" _pf_rest="" _pf_code=""
     if _pf_sh="$(cell_preflight_path)"; then
-      _pf_line="$(bash "$_pf_sh" --quiet --bound "${LANE_PREFLIGHT_BOUND:-45}" \
+      # ⛔ THE CHECKOUT THE LANE WILL BUILD ON IS NAMED HERE, AND VIA THE ENV — NOT A NEW FLAG (this
+      # change's review, P1-1). The probe used to GUESS (`$HOME/tortoise` / `$HOME/agent-infra`), and on
+      # the boxes the reading was measured on neither exists, so the gate was inert where it mattered.
+      # The caller knows the answer: `$WIP_PATH` is the tree this agent's work lives in (set by the
+      # fixers, exactly as they set DISK_GATE_PATH), and otherwise the agent's own cwd, which is the
+      # worktree a lane builds in. It travels as `CELL_PREFLIGHT_REPO` rather than as a new `--repo` flag
+      # ON PURPOSE: `$O` is seeded FILE BY FILE, so a new caller can run against a probe that predates
+      # any flag it invents — and an unknown argument makes that probe exit 2 `why=usage`, i.e. REFUSE
+      # EVERY SPAWN, for a version skew it is not the box's fault. The env var is read by both versions,
+      # so the seam is skew-safe in both directions. An operator's own `CELL_PREFLIGHT_REPO` still wins:
+      # this only fills a value nobody set.
+      _pf_line="$(CELL_PREFLIGHT_REPO="${CELL_PREFLIGHT_REPO:-${WIP_PATH:-$PWD}}" \
+                    bash "$_pf_sh" --quiet --bound "${LANE_PREFLIGHT_BOUND:-45}" \
                     --provider "$lane_provider" --model "$lane_model" 2>>"$log")"
       _pf_rc=$?
       echo "[capability-gate] $_pf_line" >> "$log"
@@ -4616,8 +4642,19 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
             # ⛔ THE CODE FOLLOWS THE REMEDY (follow-up review of #2991, P2). `usage` is the one reason
             # in this block whose cause is the helper pair rather than the box, so it leaves under its
             # own code and every caller can publish the sync remedy instead of a capacity one.
-            _pf_code="$AGENT_CAPABILITY_REFUSED"
-            [ "$_pf_reason" = "usage" ] && _pf_code="$AGENT_HARNESS_SKEW_REFUSED"
+            # ⛔ AND A STALE CHECKOUT IS THE SECOND SUCH REASON (this change's review, P1-2). Leaving it
+            # on 71 left the two surfaces publishing CONTRADICTORY instructions for one refusal:
+            # this line said "do NOT assume a peer is current" while `lane.sh` minted a
+            # `capacity-refused-<N>` record whose text is "dispatch the issue to another box" and whose
+            # consumer (`orch-loop.sh::capacity_yield_live`) stood this box down SO A PEER COULD TAKE
+            # IT. In the measured fleet shape — every cell hundreds of commits behind — that is the
+            # circulation this PR exists to stop. Its own code is what makes the readers publish the
+            # checkout remedy instead, exactly as 83 does for a skewed helper pair.
+            case "$_pf_reason" in
+              usage)      _pf_code="$AGENT_HARNESS_SKEW_REFUSED" ;;
+              stale-code) _pf_code="$AGENT_STALE_CODE_REFUSED" ;;
+              *)          _pf_code="$AGENT_CAPABILITY_REFUSED" ;;
+            esac
             echo "[capability-gate] REFUSED $label: LANE_CAPABILITY (exit $_pf_rc, refusal $_pf_code) — no agent was started, so nothing was consumed and no 3300s slot is spent on a box that cannot complete one call and return. $_pf_remedy Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
             # ⛔ JOB CONTROL IS RESTORED BEFORE THE EARLY RETURN (review P2). `set -m` was turned on
             # above for the launch, and the restore line lives after it — so this return is the one path
@@ -4627,7 +4664,20 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
             [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
             return "$_pf_code"
           fi ;;
-        *LANE_CAPABILITY=ok*) : ;;
+        *LANE_CAPABILITY=ok*)
+          # ⛔ AN UNMEASURABLE STALENESS READ IS ANNOUNCED, NOT SILENT (this change's review, P2-3).
+          # `behind=unknown` is admitted by design (an unanswerable network read is a WARN, the same
+          # doctrine as `no-answer`), but it was admitted WITHOUT A WORD — no log line, no counter —
+          # while `why=no-answer` gets an explicit WARN. So a readiness field that measured nothing
+          # looked exactly like one that measured `0`, and every route to `unknown` is a box that is
+          # MORE likely to be stale, not less: a fetch that failed or was killed at the bound is a slow
+          # or blocked remote, and the transfer grows with the distance being measured while the bound
+          # is a fixed 12 s. A gate whose measurement can be unavailable everywhere with no signal at
+          # the consumer is the no-op-gate class this repo treats as category A.
+          case "$_pf_line" in
+            *behind=unknown*)
+              echo "[capability-gate] WARN $label: the staleness reading is UNMEASURABLE — the line above carries behind=unknown, so this spawn is admitted with NO evidence its base is current (#3932). The reason is on that line: reason=no-checkout / reason=not-a-checkout (the probe resolved no checkout — name it with CELL_PREFLIGHT_REPO or pass the lane's --repo-dir), reason=fetch-failed (a dead/slow remote, or a fetch killed at CELL_PREFLIGHT_FETCH_BOUND), or reason=rev-list-unreadable. This is NOT a refusal and nothing was consumed; it is the one shape in which a stale box passes this gate." >> "$log" ;;
+          esac ;;
         *)
           # ⛔ `rc=2` IS A VERDICT, AND IT IS THE ONE THE PROBE'S OWN EXIT TABLE SAYS EVERY CALLER MUST
           # REFUSE ON (`cell-lane-preflight.sh`: "2 CANNOT MEASURE — EVERY caller must refuse too").
