@@ -6000,13 +6000,73 @@ export default function (pi: ExtensionAPI) {
       // …` M1 warning). The pending closure is applied exactly once, at the
       // admission returns below — the carve-out's own early return, or any
       // later gate that allows.
-      let pendingRebaseline: (() => void) | null = null;
-      const admitAfterM3 = (): undefined => {
-        if (pendingRebaseline) {
-          const apply = pendingRebaseline;
-          pendingRebaseline = null;
-          apply();
-        }
+      let pendingRebaselines: Array<() => void> = [];
+      // ── #607: an UNENUMERABLE branch-state mutation is a refusal ──
+      // `det.hiddenStateMutation` (classify-git) is true exactly when a shell
+      // substitution / backtick / `eval` / ANSI-C / process-substitution /
+      // git-alias payload CARRIES A MUTATING BRANCH-STATE git invocation
+      // (`_hasHiddenStateSubst`'s hardened collector — the branch-state half of
+      // `hiddenStateSubst`, without that flag's broader unverifiable-git union).
+      // The extractor cannot enumerate such a payload, so the M3 loop below gates
+      // only the VISIBLE mutations: MEASURED at 6f508fc30 through the real handler
+      // on a real hub — `echo "$(git branch -Mq main victim)"` ALLOWED (victim's
+      // tip clobbered, rc 0), and every hidden-payload spelling after an M3-
+      // SANCTIONED lead (`git branch -M main freeL ; echo "$(git branch -Mq freeL
+      // victim)"`, the backtick twin, `eval '…'`) ALSO allowed — the sanctioned
+      // lead changes nothing about the payload being unenumerable (#596's
+      // hiddenStateSubst bound reaches only the #591 benign-force carve-out).
+      // A branch-state mutation the guard cannot attribute to a repo/target must
+      // never be admitted (#805: a gate that cannot determine the target REFUSES).
+      //
+      // WHY THIS IS LAST-RESORT, NOT FIRST: every other arm's refusal is MORE
+      // specific (the sync arm names the permitted fast-forward forms, the legacy
+      // arm names the destructive verb), and those arms doubling as the pin for
+      // their own mechanism is why B9p/B9p3 assert their `#1144` marker. Folding
+      // this into `admitAfterM3()` — the ONE funnel every admission passes through
+      // — keeps each of them ahead of it while still closing the hole on commands
+      // NOTHING else refuses (the measured ones above).
+      //
+      // SCOPE — NOT a blanket substitution block: a substitution carrying a
+      // READ-ONLY git call (`$(git branch --show-current)`, `$(git rev-parse
+      // HEAD)`, `$(git status --porcelain)`) does not set the flag. The refusal
+      // also resolves at the SESSION cwd, exactly as the M3 loop resolves an
+      // extractor-invisible mutation's repo (round-3 policy: the payload runs at
+      // the shell cwd), so a WORKTREE session is exempt the way its visible
+      // branch-state mutations are; an unresolvable target stays refused
+      // (fail-closed, #805).
+      const hiddenBranchStateRefusal = (): { block: true; reason: string } | null => {
+        if (!det || det.hiddenStateMutation !== true) return null;
+        const hiddenEff = branchOwnership.resolveEffectiveRepo("git status", process.cwd());
+        const hiddenEscapes = !!hiddenEff
+          && hiddenEff.unresolvedTarget !== true
+          && hiddenEff.isWorktree === true;
+        if (hiddenEscapes) return null;
+        return {
+          block: true,
+          reason: [
+            "⛔ Branch-state command blocked in the MAIN checkout (#607).",
+            "   Why: the command hides a branch-state git invocation inside a shell",
+            "   substitution / backticks / eval / alias payload. The guard cannot see",
+            "   which ref it moves, so it cannot rule out that the hidden command",
+            "   clobbers or switches a branch you do not own — the main checkout is between",
+            "   parallel agents (#265).",
+            "   → Run the branch-state git command directly (outside $(…), backticks,",
+            "     eval and aliases), or work in an isolated worktree",
+            "     (using-git-worktrees skill).",
+            "   Hatch, if this is deliberate solo work in the hub:",
+            "     AGENT_ALLOW_MAIN_EDITS=1 or ~/.pi/agent/.allow-main-edits (#1239).",
+          ].join("\n"),
+        };
+      };
+      const admitAfterM3 = (): undefined | { block: true; reason: string } => {
+        const hiddenRefusal = hiddenBranchStateRefusal();
+        if (hiddenRefusal) return hiddenRefusal;
+        // #607: apply the recorded re-baselines IN COMMAND ORDER — mid-command
+        // propagation lets one compound carry more than one sanctioned move, and
+        // overwriting a single slot dropped the earlier rename's `_markOwned`.
+        const applies = pendingRebaselines;
+        pendingRebaselines = [];
+        for (const apply of applies) apply();
         return undefined;
       };
 
@@ -6026,6 +6086,32 @@ export default function (pi: ExtensionAPI) {
         const mutations = (det.stateMutations && det.stateMutations.length > 0)
           ? det.stateMutations
           : [{ verb: det.stateVerb, args: det.stateArgs, invVisible: det.stateInvVisible !== false, hints: det.stateHints }];
+        // ── #607: MID-COMMAND BASELINE PROPAGATION ──
+        // Each mutation used to be decided against the SESSION baseline — the
+        // branch the session was on BEFORE the command ran — so a sanctioned
+        // lead that MOVES the baseline (own-baseline rename, #376 return) left
+        // every later segment judged against a branch the command itself had
+        // already moved off. MEASURED at 6f508fc30 (real handler, real git):
+        // `git branch -M main tmpA && git branch -M tmpA main` and `… && git
+        // branch -M tmpA done` were BLOCKED — the legitimate two-segment rename
+        // ceremony — because segment 2's source (`tmpA`) is not the session
+        // baseline (`main`). The LAUNDER the pre-#1144 short-circuit allowed is
+        // NOT re-opened by judging against the propagated baseline: the #1144
+        // `stateCarveOutClean` closure is what refuses a mutating tail, and each
+        // later segment still runs its OWN decideM3 (a foreign source or an
+        // existing foreign rename DST still blocks).
+        // Two pieces of prospective state, both REPO-KEYED (a mutation in another
+        // checkout must never inherit this repo's prospective branch — decideM3's
+        // rename arm is repoKey-scoped, and so is this):
+        //   previewBranch — the branch this compound will be ON when the segment runs.
+        //   freedNames    — names an EARLIER sanctioned rename of this compound
+        //                   renames AWAY from, so the #598 dst probe must not read
+        //                   them as "an existing foreign ref" (they are gone by the
+        //                   time the segment runs). Only ever OWN lineage: a name is
+        //                   added only as the `from` of a rename decideM3 already
+        //                   sanctioned, i.e. the branch the session was on.
+        const previewBranch = new Map<string, string>();
+        const freedNames = new Map<string, Set<string>>();
         for (const mu of mutations) {
           const branchOp = branchOwnership.classifyBranchOp(mu.verb ?? det.verb, mu.args ?? det.verbArgs);
           if (!branchOp || branchOp.op === "other") continue;
@@ -6054,7 +6140,15 @@ export default function (pi: ExtensionAPI) {
             };
           }
           if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
-          const baseline = baselines.get(pid);
+          const muRepoKey = muEff.repoKey ?? "";
+          const sessionBaseline = baselines.get(pid);
+          // #607: judge this segment against the baseline the compound will
+          // have reached here, when an earlier segment of the SAME repo moved it.
+          const prospective = previewBranch.get(muRepoKey);
+          const baseline = (sessionBaseline && prospective != null
+            && sessionBaseline.repoKey === muEff.repoKey)
+            ? { ...sessionBaseline, branch: prospective }
+            : sessionBaseline;
           const isInfra = isAgentInfraRepo(muEff.effectiveCwd);
           // #598: a forced rename of the session's own baseline onto an
           // EXISTING branch this session does not own clobbers that foreign
@@ -6064,8 +6158,13 @@ export default function (pi: ExtensionAPI) {
           // `--git-dir=<other>` mutation is never checked against the cwd
           // repo's refs. Only the decideM3 rename arm consumes it (the
           // force/create/switch arms key on branch/currentBranch alone).
+          // #607: a name an EARLIER segment of this same compound renames away
+          // from will not exist when this segment runs (the probe reads the repo
+          // BEFORE the command executes), so a sanctioned rename-back
+          // (`… && git branch -M tmp main`) was refused as a foreign clobber.
           const dstExists = (branchOp.op === "rename" && branchOp.to != null)
-            ? branchOwnership.localBranchExists(muEff.effectiveCwd, branchOp.to, muEff.gitDir) !== false
+            ? (branchOwnership.localBranchExists(muEff.effectiveCwd, branchOp.to, muEff.gitDir) !== false)
+              && !(freedNames.get(muRepoKey)?.has(branchOp.to) ?? false)
             : false;
           const m3 = branchOwnership.decideM3({
             branchOp, isAgentInfra: isInfra, baseline,
@@ -6144,14 +6243,30 @@ export default function (pi: ExtensionAPI) {
             // at classification time, the same way `syncOnlyInvocation` and
             // `_allInvocationsWorktreeScoped` consult it.
             if (det.stateCarveOutClean === true) {
-              applyRebaseline();
-              return undefined;
+              // #607: through the funnel (admitAfterM3), so the order-preserving
+              // apply and the hidden-branch-state gate both run on this path too;
+              // `stateCarveOutClean` folds `hiddenStateSubst`, so it cannot
+              // contradict that gate.
+              pendingRebaselines.push(applyRebaseline);
+              return admitAfterM3();
             }
             // Not closed by the carve-out — the later gates decide. Defer the
             // re-baseline until one of them admits: a REFUSED command must not
             // move the baseline every later M1/M2/M3 decision keys on (#1144
             // F3). `admitAfterM3()` applies it at each admission return.
-            pendingRebaseline = applyRebaseline;
+            // #607: record the PROSPECTIVE baseline + the name this segment frees
+            // for the segments AFTER it. Nothing is applied to session state here
+            // — a refused compound must leave `baselines[pid]` untouched.
+            previewBranch.set(muRepoKey, reBaseline);
+            if (branchOp.op === "rename") {
+              const from = branchOp.from ?? muEff.currentBranch;
+              if (from) {
+                const freed = freedNames.get(muRepoKey) ?? new Set<string>();
+                freed.add(from);
+                freedNames.set(muRepoKey, freed);
+              }
+            }
+            pendingRebaselines.push(applyRebaseline);
           }
         }
       }

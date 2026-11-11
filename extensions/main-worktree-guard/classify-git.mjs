@@ -3925,8 +3925,20 @@ export function classifyGitCommandDetailed(command) {
   // branch-state-mutating scan with the hub-gate's hardened unverifiable-git
   // shape set (round-6→19 review-hardened; the two consumers reuse it so the
   // construct coverage cannot drift).
+  // #607: the BRANCH-STATE half of the same scan, kept SEPARATE. `hiddenStateSubst`
+  // above ORs in the hub-gate's broader unverifiable-git shape set (heredoc-fed
+  // interpreter, `$(< file)`, process substitution, alias indirection), which the
+  // #591 carve-out consumes; a gate that REFUSES on that union would also swallow
+  // shapes it was never about. `hiddenStateMutation` is exactly "a shell
+  // substitution / eval / alias payload carries a MUTATING branch-state git
+  // invocation" — the class the extractor cannot enumerate, so the M3 loop can
+  // only ever gate the VISIBLE mutations of such a command (index.ts refuses it
+  // against a non-worktree session repo, #607). A read-only substitution
+  // (`$(git branch --show-current)`, `$(git rev-parse HEAD)`) does NOT set it.
+  const hiddenStateMutation = _hasHiddenStateSubst(String(command ?? ""));
+  out.hiddenStateMutation = hiddenStateMutation;
   const hiddenStateSubst =
-    _hasHiddenStateSubst(String(command ?? "")) ||
+    hiddenStateMutation ||
     _unverifiableGitContent(String(command ?? ""));
   out.hiddenStateSubst = hiddenStateSubst;
   if (invocations.length === 0) {
