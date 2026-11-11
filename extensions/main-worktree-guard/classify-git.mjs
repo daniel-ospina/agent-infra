@@ -2382,7 +2382,13 @@ export function allGitInvocations(command, seedVars = {}) {
   _walkShell(command, {
     onGitEnd: (inv) => invocations.push(inv),
   }, seedVars);
-  return invocations;
+  // #594: the walk sees the SPELLED word, but git resolves aliases (and every
+  // external `git-<word>`) itself — expand the statically-visible ones and flag
+  // the rest opaque, so no consumer ever reasons on a verb that is not the
+  // command that runs. Expansion happens HERE, once, so every consumer of the
+  // walk (the detailed classifier, the discard family, the script arms) sees
+  // the same resolved command.
+  return _expandAliasInvocations(invocations);
 }
 
 // ── #709: working-tree-discard family (command layer) ──────────────────────
@@ -3929,6 +3935,315 @@ export function _branchInvMutatesBranchState(args) {
 }
 
 /**
+ * #594: git's own top-level commands, so the classifier can answer "could this
+ * word be a git builtin?" BY ITSELF.
+ *
+ * Measured with `git --list-cmds=builtins,main | sort -u` (163 names, git
+ * 2.43.0) plus the historical contrib commands that ship outside the core tree
+ * (cvsimport/cvsexportcommit/cvsserver/archimport/p4/gui/citool/gitk).
+ * Regenerate with that command; keep it COMPLETE rather than minimal: a real
+ * command missing here is a false block in the shared main checkout, while a
+ * name git does not know can only cost the alias expansion for that one
+ * spelling (git rejects it rc 129 — probe-verified).
+ *
+ * WHY (issue #594, Finding 1): git resolves `git <word>` as an ALIAS inside its
+ * own process whenever <word> is not a command — `git -c alias.co='checkout
+ * victim' co` flips the shared hub rc 0, and it does so with verb "co", which
+ * every arm downstream reads as "some harmless non-branch verb". The token walk
+ * can never see the expanded command, so every non-builtin verb is treated as
+ * an alias / external-subcommand indirection the guard cannot verify (fail
+ * closed — see _expandAliasInvocations).
+ */
+const GIT_BUILTIN_COMMANDS = new Set([
+  "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch",
+  "bugreport", "bundle", "cat-file", "check-attr", "check-ignore",
+  "check-mailmap", "check-ref-format", "checkout", "checkout--worker",
+  "checkout-index", "cherry", "cherry-pick", "clean", "clone", "column",
+  "commit", "commit-graph", "commit-tree", "config", "count-objects",
+  "credential", "credential-cache", "credential-cache--daemon",
+  "credential-store", "daemon", "describe", "diagnose", "diff",
+  "diff-files", "diff-index", "diff-tree", "difftool", "difftool--helper",
+  "fast-export", "fast-import", "fetch", "fetch-pack", "filter-branch",
+  "fmt-merge-msg", "for-each-ref", "for-each-repo", "format-patch", "fsck",
+  "fsck-objects", "fsmonitor--daemon", "gc", "get-tar-commit-id", "grep",
+  "hash-object", "help", "hook", "http-backend", "http-fetch", "http-push",
+  "imap-send", "index-pack", "init", "init-db", "instaweb",
+  "interpret-trailers", "log", "ls-files", "ls-remote", "ls-tree", "mailinfo",
+  "mailsplit", "maintenance", "merge", "merge-base", "merge-file",
+  "merge-index", "merge-octopus", "merge-one-file", "merge-ours",
+  "merge-recursive", "merge-recursive-ours", "merge-recursive-theirs",
+  "merge-resolve", "merge-subtree", "merge-tree", "mergetool", "mktag",
+  "mktree", "multi-pack-index", "mv", "name-rev", "notes", "pack-objects",
+  "pack-redundant", "pack-refs", "patch-id", "pickaxe", "prune",
+  "prune-packed", "pull", "push", "quiltimport", "range-diff", "read-tree",
+  "rebase", "receive-pack", "reflog", "remote", "remote-ext", "remote-fd",
+  "remote-ftp", "remote-ftps", "remote-http", "remote-https", "repack",
+  "replace", "request-pull", "rerere", "reset", "restore", "rev-list",
+  "rev-parse", "revert", "rm", "send-pack", "sh-i18n--envsubst", "shell",
+  "shortlog", "show", "show-branch", "show-index", "show-ref",
+  "sparse-checkout", "stage", "stash", "status", "stripspace", "submodule",
+  "submodule--helper", "subtree", "switch", "symbolic-ref", "tag",
+  "unpack-file", "unpack-objects", "update-index", "update-ref",
+  "update-server-info", "upload-archive", "upload-archive--writer",
+  "upload-pack", "var", "verify-commit", "verify-pack", "verify-tag",
+  "version", "web--browse", "whatchanged", "worktree", "write-tree",
+  // historical / contrib commands that are not in the core builtin table
+  "archimport", "citool", "cvsimport", "cvsexportcommit", "cvsserver", "gui",
+  "gitk", "p4",
+]);
+
+/**
+ * #594: the `alias.<name>` definitions an invocation carries STATICALLY in its
+ * own argv/env — the only ones the walk can see BEFORE git runs:
+ *   - `-c alias.x=<value>` / `--config alias.x=<value>` (configOverrides)
+ *   - `--config-env alias.x=<ENV>` (configEnvOverrides), resolved against the
+ *     statement's vars → its env prefixes → process.env; an unresolvable name
+ *     is reported as null = "defined, value opaque"
+ *   - `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs from the statement's
+ *     vars or its env prefixes (the same sources _effectiveConfig reads)
+ *   - `git config [--add|--replace-all] [--global] alias.x <value>` — the
+ *     persist-then-invoke form (`git config alias.x '…' && git x`) that the
+ *     #591 fold only half-covered: it refused the M3 carve-out but never
+ *     gated the invocation itself (probe-verified rc 0).
+ * A `!`-prefixed value (git's shell-command alias) is reported as null: the
+ * value is arbitrary shell text, so "the alias IS this command" is not a claim
+ * the walk may make.
+ * @param {object} inv
+ * @returns {Array<[string, string|null]>}
+ */
+function _aliasDefsFromInvocation(inv) {
+  const defs = [];
+  const splitKw = (s) => {
+    const i = String(s ?? "").indexOf("=");
+    return i <= 0 ? null : [String(s).slice(0, i), String(s).slice(i + 1)];
+  };
+  const takeAlias = (key, value) => {
+    const m = /^alias\.([A-Za-z0-9._/-]+)$/.exec(String(key ?? "").trim());
+    if (!m) return;
+    const v = value === null || value === undefined ? null : String(value);
+    defs.push([m[1], v !== null && v.startsWith("!") ? null : v]);
+  };
+  for (const o of inv.configOverrides || []) {
+    const kv = splitKw(o);
+    if (kv) takeAlias(kv[0], kv[1]);
+  }
+  const resolveEnv = (name) => {
+    if (name && inv.vars && Object.prototype.hasOwnProperty.call(inv.vars, name)) {
+      const v = inv.vars[name];
+      if (v !== undefined && v !== null) return String(v);
+    }
+    for (const p of inv.envPrefixes || []) {
+      const e = String(p).indexOf("=");
+      if (e > 0 && String(p).slice(0, e) === name) return String(p).slice(e + 1);
+    }
+    if (name && Object.prototype.hasOwnProperty.call(process.env, name)) return String(process.env[name]);
+    return null;
+  };
+  for (const ce of inv.configEnvOverrides || []) {
+    const kv = splitKw(ce);
+    if (kv) takeAlias(kv[0], resolveEnv(kv[1]));
+  }
+  const cfgPairs = new Map();
+  const collectPair = (k, v) => {
+    const mk = /^GIT_CONFIG_KEY_(\d+)$/.exec(String(k ?? ""));
+    if (mk) cfgPairs.set(mk[1], { ...(cfgPairs.get(mk[1]) || {}), key: v });
+    const mv = /^GIT_CONFIG_VALUE_(\d+)$/.exec(String(k ?? ""));
+    if (mv) cfgPairs.set(mv[1], { ...(cfgPairs.get(mv[1]) || {}), value: v });
+  };
+  for (const [k, v] of Object.entries(inv.vars || {})) {
+    if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(k)) collectPair(k, v);
+  }
+  for (const p of inv.envPrefixes || []) {
+    const e = String(p).indexOf("=");
+    if (e > 0) collectPair(String(p).slice(0, e), String(p).slice(e + 1));
+  }
+  for (const [, pair] of cfgPairs) {
+    if (pair.key !== undefined) takeAlias(pair.key, pair.value ?? null);
+  }
+  // `git config … alias.x <value>` — persist + invoke in ONE command.
+  if (inv.verb === "config") {
+    const a = inv.args || [];
+    const pos = [];
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] === "-f" || a[i] === "--file" || a[i] === "--blob") { i++; continue; }
+      if (String(a[i]).startsWith("-")) continue;
+      pos.push(a[i]);
+    }
+    for (let i = 0; i < pos.length - 1; i++) {
+      const m = /^alias\.([A-Za-z0-9._/-]+)$/.exec(pos[i]);
+      if (m) { takeAlias(pos[i], pos[i + 1]); break; }
+    }
+  }
+  return defs;
+}
+
+/**
+ * Split a git alias VALUE into words the way git does (whitespace-separated,
+ * with single/double quotes and backslash escapes grouping a word). Git's own
+ * docs: "the arguments are split on whitespace with support for quoting".
+ * @param {string} value
+ * @returns {string[]}
+ */
+function _splitAliasValue(value) {
+  const words = [];
+  let cur = "";
+  let started = false;
+  const s = String(value ?? "");
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === " " || c === "\t" || c === "\n") {
+      if (started) { words.push(cur); cur = ""; started = false; }
+      continue;
+    }
+    if (c === "\\" && i + 1 < s.length) { cur += s[i + 1]; i++; started = true; continue; }
+    if (c === "'" || c === '"') {
+      const close = s.indexOf(c, i + 1);
+      const end = close === -1 ? s.length : close;
+      cur += s.slice(i + 1, end);
+      i = end;
+      started = true;
+      continue;
+    }
+    cur += c;
+    started = true;
+  }
+  if (started) words.push(cur);
+  return words;
+}
+
+/**
+ * #594: follow the ALIAS indirection layer, which git applies inside its own
+ * process and the token walk therefore cannot see.
+ *
+ * Every invocation whose verb is a statically-visible `alias.<name>` is
+ * EXPANDED into the command it names (bounded depth, cycle-safe), so the rest
+ * of the classifier — the legacy verdict patterns, branchState/stateMutations,
+ * stateOpCount, the hub-recovery allowlist — sees the real verb and args. Every
+ * invocation whose verb is NEITHER a builtin NOR a visible alias is marked
+ * `aliasOpaque`: it may be a persisted-config alias, a `git-foo` external
+ * subcommand, or a typo, and in all three cases the guard cannot know what it
+ * runs (fail closed — the M3 gate refuses it in a shared main checkout, and the
+ * command can never launder a benign-force carve-out).
+ * @param {Array<object>} invocations
+ * @returns {Array<object>}
+ */
+function _expandAliasInvocations(invocations) {
+  const MAX_ALIAS_DEPTH = 5;
+  const defs = new Map();
+  for (const inv of invocations) {
+    for (const [name, value] of _aliasDefsFromInvocation(inv)) {
+      if (!defs.has(name)) defs.set(name, value);
+      else if (defs.get(name) !== null && value === null) defs.set(name, null); // any opaque def → opaque
+    }
+  }
+  const expandOne = (inv, depth) => {
+    const verb = inv.verb;
+    if (!verb) return inv;
+    if (defs.has(verb)) {
+      const def = defs.get(verb);
+      if (def === null) return { ...inv, aliasName: verb, aliasOpaque: true };
+      const words = _splitAliasValue(def);
+      const next = words[0];
+      if (!next || depth >= MAX_ALIAS_DEPTH) return { ...inv, aliasName: verb, aliasOpaque: true };
+      return expandOne({
+        ...inv,
+        verb: next,
+        args: [...words.slice(1), ...(inv.args || [])],
+        aliasName: verb,
+      }, depth + 1);
+    }
+    if (!GIT_BUILTIN_COMMANDS.has(verb)) return { ...inv, aliasName: verb, aliasOpaque: true };
+    return inv;
+  };
+  return invocations.map((inv) => expandOne(inv, 0));
+}
+
+/**
+ * #594 Finding 2: value-slot-aware positionals for the ref-WRITING verbs
+ * (`symbolic-ref`, `update-ref`).
+ *
+ * Both verbs parse `-m <reason>` through git's parse-options, which CONSUMES
+ * the next argv as the option's VALUE (probe-verified git 2.43: `--reason` /
+ * `--message` do not exist, rc 129 — only `-m`). A naive "non-flag tokens"
+ * scan therefore reads the REASON as the first positional and slides the real
+ * ref operand into pos[1], so the write read as a query of a ref literally
+ * named after the message (probe-verified rc 0, both verbs):
+ *   git symbolic-ref -m why refs/heads/victim refs/heads/main   # re-points victim
+ *   git update-ref  -m why refs/heads/victim HEAD              # moves victim
+ * `-m<inline>` keeps its value in the same token and stays a plain flag.
+ * @param {string[]} args
+ * @returns {string[]} positional operands, option values excluded
+ */
+function _refVerbPositionals(args) {
+  const a = args || [];
+  const out = [];
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i];
+    if (t === "--") { // git accepts `--` here; everything after it is an operand
+      for (let j = i + 1; j < a.length; j++) out.push(a[j]);
+      break;
+    }
+    if (t === "-m") { i++; continue; } // value = the NEXT argv
+    if (String(t).startsWith("-")) continue;
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * #594 Finding 2: is this `symbolic-ref` invocation a WRITE, and to which ref?
+ *
+ * git's grammar (probe-verified git 2.43): `symbolic-ref <name>` with ONE
+ * positional is a QUERY; a second positional, or `-d`/`--delete` (any
+ * unambiguous `--del…` prefix), is a WRITE — `symbolic-ref refs/heads/<b>
+ * refs/heads/<target>` re-points the branch ref `b` rc 0 while the old
+ * classifier only ever named `HEAD` as branch state, so `classifyBranchOp`
+ * returned op "other" and the M3 gate was skipped entirely.
+ * @param {string[]} args
+ * @returns {{name: string, branch: string|null}|null} write target, or null
+ */
+export function symbolicRefWriteTarget(args) {
+  const a = args || [];
+  const deleting = a.some((t) => t === "-d" || /^--d(e(?:l(?:e(?:t(?:e)?)?)?)?)?$/.test(String(t)));
+  const pos = _refVerbPositionals(a);
+  if (!deleting && pos.length < 2) return null; // one positional = QUERY
+  const name = pos[0];
+  if (!name) return null;
+  const m = /^refs\/heads\/(.+)$/.exec(name);
+  return { name, branch: m ? m[1] : null };
+}
+
+/**
+ * #594 Finding 2: is this `update-ref` invocation a WRITE, and to which ref?
+ *
+ * Covers the forms a value-blind positional scan missed:
+ *   - `-m <reason>` (see _refVerbPositionals) — pos[0] was the MESSAGE;
+ *   - `--stdin` (and `-z`), where EVERY ref update arrives on stdin and argv
+ *     names none at all (`printf 'update refs/heads/u2 <sha>\n' | git
+ *     update-ref --stdin` moves the branch rc 0, probe-verified) — reported as
+ *     a write with `branch: null` (target unknowable from the command).
+ * A bare `<ref>` with no new value is an rc-129 no-op in git, but it stays
+ * classified as a write: that is today's behaviour and the over-block is free.
+ * @param {string[]} args
+ * @returns {{name: string|null, branch: string|null}|null}
+ */
+export function updateRefWriteTarget(args) {
+  const a = args || [];
+  if (a.some((t) => /^--?stdin$/.test(String(t)) || t === "-z")) return { name: null, branch: null };
+  const deleting = a.some((t) => t === "-d" || /^--delete$/.test(String(t)));
+  const pos = _refVerbPositionals(a);
+  const name = pos[0] ?? null;
+  if (!name) return null;
+  if (!deleting && pos.length < 2) {
+    // <ref> alone is an rc-129 no-op in git; keep the historic over-block.
+    return /^refs\/heads\//.test(name) || name === "HEAD" ? { name, branch: null } : null;
+  }
+  const m = /^refs\/heads\/(.+)$/.exec(name);
+  if (!m && name !== "HEAD") return null; // tags / notes / remotes — not branch state
+  return { name, branch: m ? m[1] : null };
+}
+
+/**
  * Detailed classification of a shell command (consumed EXCLUSIVELY by
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
@@ -4063,19 +4378,29 @@ export function classifyGitCommandDetailed(command) {
   // and the arm leaves branchState false). branchState is then true iff the
   // command CONTAINS a branch-state mutation, regardless of segment position;
   // stateVerb/stateArgs point at the mutation the M3 gate must classify.
-  const stateInvs = invocations.filter((v) =>
+  const stateInvs = invocations.filter((v) => v.aliasOpaque === true ||
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb));
   // Round-4 (reviewer P1b follow-up): the MUTATING predicate is reused both
   // for the single selection below AND for stateMutations (every mutating
   // branch-state invocation) — index.ts gates EVERY main-resolving mutation
   // so a leading `-C <wt>` mutation can't blanket-exempt a later MAIN one.
   const _isStateMutating = (v) => {
+    // #594: an alias/external-subcommand indirection is unverifiable — the
+    // command runs SOMETHING the walk cannot name, so it is gated like a
+    // branch-state mutation rather than admitted as harmless.
+    if (v.aliasOpaque === true) return true;
     if (v.verb === "checkout" || v.verb === "switch") return true;
-    if (v.verb === "symbolic-ref" || v.verb === "update-ref") {
-      const pos = (v.args || []).filter((x) => !x.startsWith("-"));
-      return (v.verb === "symbolic-ref" && pos[0] === "HEAD") ||
-        (v.verb === "update-ref" && pos[0] &&
-          (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD"));
+    if (v.verb === "symbolic-ref") {
+      // #594 Finding 2: WRITE-form precise (one positional is a QUERY), and
+      // positional-precise (`-m <reason>` consumes its value), so a
+      // `refs/heads/<b>` re-point and the `-m`-prefixed HEAD form are both
+      // state mutations while `git symbolic-ref refs/heads/x` stays a read.
+      const w = symbolicRefWriteTarget(v.args);
+      return !!w && (w.name === "HEAD" || w.branch !== null);
+    }
+    if (v.verb === "update-ref") {
+      // #594: `-m <reason>` value slots and the stdin channel (`--stdin`).
+      return updateRefWriteTarget(v.args) !== null;
     }
     return v.verb === "branch" && _branchInvMutatesBranchState(v.args);
   };
@@ -4278,11 +4603,26 @@ export function classifyGitCommandDetailed(command) {
       // surface (attached shorts + long forms), not just exact `-b`/`-B` tokens.
       out.newBranch = _checkoutCreateBranch(verb, args);
     } else if (verb === "symbolic-ref" || verb === "update-ref") {
-      const pos = args.filter((x) => !x.startsWith("-"));
-      if ((verb === "symbolic-ref" && pos[0] === "HEAD") ||
-          (verb === "update-ref" && pos[0] && (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD"))) {
+      // #594 Findings 1+2: WRITE-form + option-value-slot + stdin precision
+      // (shared with _isStateMutating above, so selection and arm cannot
+      // drift). branchState now covers `symbolic-ref refs/heads/<b> <target>`
+      // (a branch-REF rewrite the classifier never saw) and the `-m`/`--stdin`
+      // spellings of both verbs.
+      const write = verb === "symbolic-ref"
+        ? symbolicRefWriteTarget(args)
+        : updateRefWriteTarget(args);
+      // Only checkout state and `refs/heads/<b>` are branch state here; a
+      // refs/remotes/… write stays M4's business (unchanged behaviour).
+      if (write && (verb !== "symbolic-ref" || write.name === "HEAD" || write.branch !== null)) {
         out.branchState = true;
       }
+    } else if (stateInv.aliasOpaque === true) {
+      // #594 Finding 1: a verb that is not a git builtin and not a
+      // statically-visible alias — a persisted-config alias, a `git-<word>`
+      // external command, or a typo. Nothing about it can be verified, so it is
+      // branch state (M3 gates it in a shared main checkout; index.ts names it
+      // precisely).
+      out.branchState = true;
     } else if (verb === "branch") {
       // #592: rename/move arm widened from EXACT-token (-m/-M) to git's full
       // spelling surface (sibling closure: #587 delete clusters, #591
@@ -4469,6 +4809,11 @@ export function classifyGitCommandDetailed(command) {
     out.stateMutations = stateMutations.map((v) => ({
       verb: v.verb,
       args: v.args,
+      // #594: carried so index.ts can refuse an unverifiable indirection with a
+      // reason that names the actual problem instead of a generic branch op.
+      // Added ONLY for the opaque class, so every already-pinned mutation shape
+      // stays byte-identical.
+      ...(v.aliasOpaque === true ? { aliasOpaque: true, aliasName: v.aliasName ?? null } : {}),
       invVisible: v.cmdVisible !== false,
       hints: v.cmdVisible !== false
         ? { cdChain: v.cdChain, cHints: v.cHints, gitDirHint: v.gitDirHint, vars: v.vars }
@@ -4485,8 +4830,11 @@ export function classifyGitCommandDetailed(command) {
   // mutating one — #596; pre-#591 the exact-force segment 1 blocked the whole
   // command). stateOpCount ≥ 2 → decideM3 refuses the carve-out → default
   // block restores pre-#591 compound parity.
-  out.stateOpCount = invocations.filter((v) =>
+  out.stateOpCount = invocations.filter((v) => v.aliasOpaque === true ||
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
+  // #594: does the command contain an unverifiable alias/external-subcommand
+  // invocation at all? Exposed for the M3 arm and for cross-layer pins.
+  out.aliasOpaque = invocations.some((v) => v.aliasOpaque === true);
   // #591 (round-3→5 fold): `hiddenStateSubst` is computed UP FRONT (see the
   // zero-invocation guard) and already on `out` — it now feeds not only the M3
   // benign-force carve-out but the sync arm's `onlyGitInvocation` claim
