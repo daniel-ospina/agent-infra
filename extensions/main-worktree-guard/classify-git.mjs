@@ -4675,7 +4675,14 @@ function _isPushDeleteFlagToken(a) {
 //           it were a ref name, so no ref ever matches and the arm allows.
 //   *  ?  [  ]   globbing — the shell expands to N words (or leaves the literal).
 //   {  }     brace expansion — `{a,b}` becomes TWO words the guard never sees;
-//           measured: the extractor reads it as ONE token and allows.
+//           measured: the extractor reads it as ONE token and allows. ⛔ ACCEPTED
+//           OVER-BLOCK: braces ARE legal in a ref name (`git check-ref-format --branch
+//           'feat/{x}'` passes) and `{x}` alone expands to nothing, so a branch
+//           literally named `feat/{x}` is refused too. The guard cannot tell the
+//           two apart from the text, the fleet holds no such branch, and the
+//           refusal names both remedies (write the literal ref out; or the
+//           documented hatch / `gh api -X DELETE`). Over-blocking a legal-but-
+//           vanishing shape is the direction a delete guard must err in.
 //   ~        tilde expansion at word start.
 //   \       escape — the word is not the text.
 //

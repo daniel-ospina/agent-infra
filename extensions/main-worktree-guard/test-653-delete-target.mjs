@@ -46,6 +46,12 @@ const INDEX_TS = join(HERE, "index.ts");
 const MUTATIONS = process.argv.includes("--mutations");
 
 let pass = 0, fail = 0, skip = 0;
+// ⛔ THE BEHAVIOURAL HALF IS THIS FILE'S POINT, so its absence is a FAILURE even
+// when Part A's pure rows still passed. `skip > 0 && pass === 0` (the sibling
+// harnesses' test) is NOT enough here: Part A runs before the loader check, so a
+// Node without `stripTypeScriptTypes` would print "23 passed, 1 skipped" and exit
+// 0 — green over a run where the shipped gate was never driven at all.
+let behaviouralSkipped = false;
 function expect(name, got, expected) {
   const ok = JSON.stringify(got) === JSON.stringify(expected);
   console.log(`${ok ? "✅" : "❌"} ${name}: ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(expected)})`}`);
@@ -106,7 +112,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
     (typeof register !== "function" && typeof registerHooks !== "function")) {
   const msg = `node ${process.versions.node} lacks stripTypeScriptTypes (needs Node >= 22.13)`;
   if (MUTATIONS) expectTrue("M: the mutation leg REQUIRES the real index.ts loader", false, msg);
-  else skipped("Part B/M: real index.ts load", msg);
+  else { behaviouralSkipped = true; skipped("Part B/M: real index.ts load", msg); }
 } else {
   const hooks = await import(new URL("./module-load-hooks.mjs", import.meta.url).href);
   if (typeof registerHooks === "function") registerHooks({ resolve: hooks.resolve, load: hooks.load });
@@ -306,4 +312,19 @@ if (typeof stripTypeScriptTypes !== "function" ||
   }
 }
 
-reportVerdict("test-653-delete-target", pass, fail, skip);
+// ⛔ THE EXIT CODE IS THE DELIVERABLE, AND IT IS NOT THE AGGREGATE's (review P0 of
+// this PR, and it is the category-A shape: a suite that prints `❌` and exits 0).
+// `reportVerdict` RETURNS the code — `verdict.mjs:96-98` says so in as many words
+// ("the caller still owns `process.exit`") — so a harness that discards it is
+// green over every failure, which makes BOTH ci.yml steps over this file inert,
+// including the `--mutations` leg whose entire job is to prove the pins can fail.
+// Same contract as the two siblings that gate on the same `stripTypeScriptTypes`
+// capability (test-m2-compound-ownership.mjs, test-unborn-head.mjs): the 4th
+// argument is `{ skip, red }` — NOT the bare `skip` number, whose `opts.skip` /
+// `opts.red` reads are `undefined` and silently drop the `, N skipped` tail — and
+// a run where the whole behavioural half was SKIPPED (`pass === 0`) is a FAILURE,
+// never a clean pass.
+const vacuous = (skip > 0 && pass === 0) || behaviouralSkipped;
+reportVerdict("test-653-delete-target", pass, fail, { skip, red: vacuous });
+if (vacuous) console.log("❌ the suite could not run its behavioral half (or ran NOTHING) — the shipped gate was never driven, so this is not a pass");
+process.exit(fail === 0 && !vacuous ? 0 : 1);

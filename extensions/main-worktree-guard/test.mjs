@@ -1122,6 +1122,28 @@ for (const [name, target, want] of [
   inert ? pass++ : fail++;
 }
 
+// ⛔ #653 (review P0 of PR #3978): the harness that pins THIS fix must be able to
+// FAIL. `reportVerdict` RETURNS the exit code — it never sets it (`verdict.mjs`:
+// "the caller still owns `process.exit`") — so a harness that discards the return
+// value prints `❌` and exits 0, which makes its CI steps green over every red,
+// including the `--mutations` leg whose whole job is proving the pins can fail.
+// The 4th argument is `{ skip, red }`, NOT the bare `skip` number (whose
+// `opts.skip`/`opts.red` reads are undefined and drop the skip tail). Pinned here
+// rather than only inside that file, because a self-check that can be deleted with
+// the thing it guards is not a pin.
+{
+  const t653 = readFileSync(new URL("./test-653-delete-target.mjs", import.meta.url), "utf-8");
+  const rows = [
+    ["it sets an exit code from its verdict", /process\.exit\(fail === 0/.test(t653)],
+    ["it passes the skip/red OPTIONS object, not a bare number", /reportVerdict\("test-653-delete-target", pass, fail, \{ skip, red: vacuous \}\)/.test(t653)],
+    ["a skipped behavioral half is reported as a failure", /behaviouralSkipped = true/.test(t653)],
+  ];
+  for (const [what, ok] of rows) {
+    console.log(`${ok ? "✅" : "❌"} #653 review P0: the harness ${what}`);
+    ok ? pass++ : fail++;
+  }
+}
+
 // sync-source extraction (ownership allowance)
 dexpect("pull --rebase origin main → syncSource main", `git -c commit.gpgsign=false pull --rebase origin main`, { verdict: "block:pull", syncSource: "main" });
 dexpect("merge origin/main → syncSource", `git fetch origin && git merge origin/main`, { verdict: "block:merge", syncSource: "origin/main" });
