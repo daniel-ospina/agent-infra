@@ -3887,12 +3887,20 @@ export function _branchInvMutatesBranchState(args) {
  * word be a git builtin?" BY ITSELF.
  *
  * Measured with `git --list-cmds=builtins,main | sort -u` (163 names, git
- * 2.43.0) plus the historical contrib commands that ship outside the core tree
- * (cvsimport/cvsexportcommit/cvsserver/archimport/p4/gui/citool/gitk).
- * Regenerate with that command; keep it COMPLETE rather than minimal: a real
- * command missing here is a false block in the shared main checkout, while a
- * name git does not know can only cost the alias expansion for that one
- * spelling (git rejects it rc 129 — probe-verified).
+ * 2.43.0) — THE WHOLE LIST AND NOTHING ELSE. Regenerate with that command; keep
+ * it COMPLETE rather than minimal, because a real builtin missing here is a
+ * false block in a main checkout.
+ *
+ * ⛔ DO NOT ADD the historical contrib commands (cvsimport, archimport, p4, gui,
+ * gitk, citool, cvsexportcommit, cvsserver). They are NOT builtins: git falls
+ * back to `git-<name>` on PATH and THEN TO THE ALIAS, so treating one as a
+ * builtin has two fail-OPEN consequences in one step — a definition of that name
+ * is dropped from the alias map (see _expandAliasInvocations) and the invocation
+ * is trusted instead of being flagged opaque. Measured (git 2.43, no `git-p4`
+ * installed): `git config alias.p4 'branch -fq victimP <sha>'; git p4` moved the
+ * ref rc 0 while the classifier answered branchState:false. A name git does not
+ * know can only cost the alias expansion for that one spelling (git rejects it
+ * rc 129 — probe-verified) — the safe direction.
  *
  * WHY (issue #594, Finding 1): git resolves `git <word>` as an ALIAS inside its
  * own process whenever <word> is not a command — `git -c alias.co='checkout
@@ -3935,9 +3943,6 @@ const GIT_BUILTIN_COMMANDS = new Set([
   "update-server-info", "upload-archive", "upload-archive--writer",
   "upload-pack", "var", "verify-commit", "verify-pack", "verify-tag",
   "version", "web--browse", "whatchanged", "worktree", "write-tree",
-  // historical / contrib commands that are not in the core builtin table
-  "archimport", "citool", "cvsimport", "cvsexportcommit", "cvsserver", "gui",
-  "gitk", "p4",
 ]);
 
 /**
@@ -3976,13 +3981,18 @@ function _aliasDefsFromInvocation(inv) {
     if (kv) takeAlias(kv[0], kv[1]);
   }
   const resolveEnv = (name) => {
-    if (name && inv.vars && Object.prototype.hasOwnProperty.call(inv.vars, name)) {
-      const v = inv.vars[name];
-      if (v !== undefined && v !== null) return String(v);
-    }
+    // ⛔ PER-COMMAND ENV WINS OVER AN EARLIER SHELL ASSIGNMENT (bash semantics,
+    // probe-verified: `E=status; E='branch -fq victimZ <sha>'
+    // git --config-env=alias.x=E x` ran the DESTRUCTIVE alias, rc 0). The
+    // order is therefore envPrefixes → vars → process.env; reading vars first
+    // resolved the stale value and failed OPEN (review round 2).
     for (const p of inv.envPrefixes || []) {
       const e = String(p).indexOf("=");
       if (e > 0 && String(p).slice(0, e) === name) return String(p).slice(e + 1);
+    }
+    if (name && inv.vars && Object.prototype.hasOwnProperty.call(inv.vars, name)) {
+      const v = inv.vars[name];
+      if (v !== undefined && v !== null) return String(v);
     }
     if (name && Object.prototype.hasOwnProperty.call(process.env, name)) return String(process.env[name]);
     return null;
@@ -4085,27 +4095,6 @@ function _splitAliasValue(value) {
 function _expandAliasInvocations(invocations) {
   const MAX_ALIAS_DEPTH = 5;
   const defs = new Map();
-  for (const inv of invocations) {
-    for (const [name, value] of _aliasDefsFromInvocation(inv)) {
-      // ⛔ GIT'S PRECEDENCE, MEASURED (git 2.43): builtin > `git-<cmd>` on PATH
-      // > alias. `git -c alias.reset=status reset --hard` runs the BUILTIN
-      // `reset --hard` (probe-verified; the alias is never consulted, and an
-      // installed `git-foo` likewise wins over `alias.foo`). Expanding a
-      // builtin-named definition would therefore classify a destructive command
-      // as whatever the IGNORED alias value says — a false ALLOW
-      // (`reset --hard` read as `status`). Such a definition is dropped.
-      if (GIT_BUILTIN_COMMANDS.has(name)) continue;
-      // ⛔ LAST DEFINITION WINS (probe-verified git 2.43): `-c alias.x=… -c
-      // alias.x=…` runs the LAST one
-      // (`git -c alias.yy=status -c alias.yy='branch -fq victim9 main' yy`
-      // moved victim9, rc 0), so first-wins let a benign earlier definition
-      // launder a destructive later one — the exact bypass class this change
-      // exists to close. The map is command-global, so a definition in a LATER
-      // segment also governs an EARLIER invocation of the same name: that can
-      // only over-block (a name git had not yet redefined), never launder.
-      defs.set(name, value);
-    }
-  }
   const expandOne = (inv, depth) => {
     const verb = inv.verb;
     if (!verb) return inv;
@@ -4125,7 +4114,34 @@ function _expandAliasInvocations(invocations) {
     if (!GIT_BUILTIN_COMMANDS.has(verb)) return { ...inv, aliasName: verb, aliasOpaque: true };
     return inv;
   };
-  return invocations.map((inv) => expandOne(inv, 0));
+  // ⛔ SEGMENT-ORDERED, and each invocation's own definitions apply to itself
+  // (git reads the whole argv/env before running the command). A single
+  // command-global map read AFTER a first pass was measured FAIL-OPEN: with
+  // last-wins over the whole command, `git -c alias.x='branch -fq victimA <sha>'
+  // x && git -c alias.x=status x` ran the destructive first segment while the
+  // map had already been overwritten by the benign second definition
+  // (victimA moved, rc 0). Definitions therefore accumulate as the walk
+  // advances, so an earlier segment can only ever be judged by the definitions
+  // that exist when git would actually run it.
+  const out = [];
+  for (const inv of invocations) {
+    for (const [name, value] of _aliasDefsFromInvocation(inv)) {
+      // ⛔ GIT'S PRECEDENCE, MEASURED (git 2.43): builtin > `git-<cmd>` on PATH
+      // > alias. `git -c alias.reset=status reset --hard` runs the BUILTIN
+      // `reset --hard` (probe-verified; the alias is never consulted, and an
+      // installed `git-foo` likewise wins over `alias.foo`). Expanding a
+      // builtin-named definition would therefore classify a destructive command
+      // as whatever the IGNORED alias value says — a false ALLOW
+      // (`reset --hard` read as `status`). Such a definition is dropped.
+      if (GIT_BUILTIN_COMMANDS.has(name)) continue;
+      // Last definition wins WITHIN a command's own config (probe-verified:
+      // `-c alias.x=… -c alias.x=…` runs the LAST one), so a benign earlier
+      // definition cannot launder a destructive later one.
+      defs.set(name, value);
+    }
+    out.push(expandOne(inv, 0));
+  }
+  return out;
 }
 
 /**
@@ -4188,12 +4204,23 @@ function _refVerbPositionals(args) {
   const out = [];
   for (let i = 0; i < a.length; i++) {
     const t = a[i];
-    if (t === "--") { // git accepts `--` here; everything after it is an operand
+    const s = String(t ?? "");
+    if (s === "--") { // git accepts `--` here; everything after it is an operand
       for (let j = i + 1; j < a.length; j++) out.push(a[j]);
       break;
     }
-    if (t === "-m") { i++; continue; } // value = the NEXT argv
-    if (String(t).startsWith("-")) continue;
+    if (/^-[A-Za-z]+$/.test(s)) {
+      // #594 review round 2: git merges NOARG shorts into ONE cluster and a
+      // `m` in that cluster takes a value — `-qm why <name> <ref>` is
+      // `-q -m why …` (measured rc 0, symref re-pointed; `-qqm` likewise). An
+      // `m` with letters AFTER it carries its value INLINE (`-md` = `-m d`,
+      // measured rc 0), so only a TRAILING `m` consumes the next argv.
+      const letters = s.slice(1);
+      const at = letters.indexOf("m");
+      if (at !== -1 && at === letters.length - 1) i++;
+      continue;
+    }
+    if (s.startsWith("-")) continue;
     out.push(t);
   }
   return out;
@@ -6756,8 +6783,8 @@ function _effectiveConfig(inv) {
     const eq = ce.indexOf("=");
     if (eq <= 0) continue;
     const name = ce.slice(0, eq), envName = ce.slice(eq + 1);
-    const val = (inv.vars && inv.vars[envName]) ??
-      (inv.envPrefixes || []).map((p) => { const e = p.indexOf("="); return e > 0 && p.slice(0, e) === envName ? p.slice(e + 1) : null; }).find((v) => v !== null) ??
+    const val = (inv.envPrefixes || []).map((p) => { const e = p.indexOf("="); return e > 0 && p.slice(0, e) === envName ? p.slice(e + 1) : null; }).find((v) => v !== null) ??
+      (inv.vars && inv.vars[envName]) ??
       process.env[envName];
     if (val !== undefined && val !== null) cfgArgs.push("-c", `${name}=${val}`);
   }

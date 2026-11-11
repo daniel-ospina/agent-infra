@@ -766,12 +766,22 @@ function _refVerbPositionals(args) {
   const out = [];
   for (let i = 0; i < a.length; i++) {
     const t = a[i];
-    if (t === "--") {
+    const s = String(t ?? "");
+    if (s === "--") {
       for (let j = i + 1; j < a.length; j++) out.push(a[j]);
       break;
     }
-    if (t === "-m") { i++; continue; }
-    if (String(t).startsWith("-")) continue;
+    if (/^-[A-Za-z]+$/.test(s)) {
+      // git merges NOARG shorts into ONE cluster and a `m` takes a value:
+      // `-qm why <name> <ref>` is `-q -m why …` (measured rc 0, symref
+      // re-pointed), while `-md` carries its value INLINE (`-m d`, rc 0). Only
+      // a TRAILING `m` consumes the next argv. Mirror of classify-git's copy.
+      const letters = s.slice(1);
+      const at = letters.indexOf("m");
+      if (at !== -1 && at === letters.length - 1) i++;
+      continue;
+    }
+    if (s.startsWith("-")) continue;
     out.push(t);
   }
   return out;

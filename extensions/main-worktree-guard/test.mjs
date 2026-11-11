@@ -1062,6 +1062,41 @@ dexpect("#594-5c `checkout main && update-ref --stdin` refuses the carve-out",
 dexpect("#594-5d control — `checkout main && symbolic-ref HEAD` (a QUERY) keeps the carve-out clean",
   `git checkout main && git symbolic-ref HEAD`, { stateCarveOutClean: true });
 
+// ── #594 review round 2: FOUR measured fail-opens in the round-1 fix ──
+// (a) a non-builtin verb is NOT a builtin: git falls back to `git-<name>` and
+// then to the alias, so listing those names as builtins both dropped their
+// alias definitions AND trusted the invocation (measured: `git p4` moved a ref
+// rc 0 with no `git-p4` installed).
+dexpect("#594-R2a `git -c alias.p4='branch -fq victimP main' p4` EXPANDS (p4 is not a builtin)",
+  `git -c alias.p4='branch -fq victimP main' p4`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimP", "main"] });
+dexpect("#594-R2a2 a bare non-builtin verb (`git p4`, `git gui`) is opaque, not trusted",
+  `git gui`, { branchState: true });
+// (b) definitions accumulate in SEGMENT ORDER: a benign definition later in the
+// command must not reclassify an earlier destructive invocation.
+dexpect("#594-R2b destructive alias in segment 1, benign redefinition in segment 2 → segment 1 still classified",
+  `git -c alias.x='branch -fq victimA main' x && git -c alias.x=status x`,
+  { branchState: true, stateVerb: "branch" });
+dexpect("#594-R2b2 benign alias in segment 1, destructive redefinition in segment 2 → segment 2 classified",
+  `git -c alias.x=status x && git -c alias.x='branch -fq victimA main' x`,
+  { branchState: true, stateVerb: "branch" });
+// (c) git merges NOARG shorts into ONE cluster and a TRAILING `m` takes the
+// NEXT argv — `-qm why` and `-qqm why` are `-m why` (measured rc 0).
+dexpect("#594-R2c `symbolic-ref -qm why <ref> <target>` → branchState (clustered -m value slot)",
+  `git symbolic-ref -qm why refs/heads/victim refs/heads/main`,
+  { branchState: true, stateVerb: "symbolic-ref" });
+dexpect("#594-R2c2 `symbolic-ref -qqm why …` → branchState",
+  `git symbolic-ref -qqm why refs/heads/qm2 refs/heads/main`, { branchState: true });
+dexpect("#594-R2c3 `update-ref -dm why <ref> HEAD` → branchState (clustered delete + -m value)",
+  `git update-ref -dm why refs/heads/victimD HEAD`, { branchState: true });
+dexpect("#594-R2c4 `symbolic-ref -md <ref> <target>` (= `-m d`) → branchState via its positionals",
+  `git symbolic-ref -md refs/heads/P3 refs/heads/main`, { branchState: true });
+// (d) a per-command env prefix beats an earlier shell assignment (bash
+// semantics, measured: the destructive alias ran).
+dexpect("#594-R2d per-command env prefix wins over the statement var for --config-env",
+  `EE=status; EE='branch -fq victimZ main' git --config-env=alias.q=EE q`,
+  { branchState: true, stateVerb: "branch" });
+
 // commit matcher (commit-graph/commit-tree EXCLUDED)
 dexpect("commit → block:commit", `git commit -m x`, { verdict: "block:commit", verb: "commit" });
 dexpect("add+commit → block:commit (detailed)", `git add . && git commit -m 'x'`, { verdict: "block:commit" });
