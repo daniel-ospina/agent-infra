@@ -803,8 +803,14 @@ input to the environment contract.)
 Around the spawn, three properties hold:
 
 - **the concurrency caps still bind** — `wt_count` reads ONE census (`cmux tree --json` plus the tmux
-  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s (the absent-owner confirmation window is `WT_ABSENT_CONFIRM=60`s — overridable, but `0` is NOT "off": it is coerced to 60, because zero would confirm on ONE sample), because every caller reads it
-  through a command substitution), and a worker is identified the way its launcher named it: by the
+  session list), memoized in `state/.wt-census` for at least `WT_TABLE_TTL=10`s: the configured value is
+  the **floor**, and the effective window is `max(WT_TABLE_TTL, 2 × the last build's own duration)`, read
+  from the header's `took=` — `0` still disables the memo, and a legacy header carrying no `took=` uses the
+  configured window. (The floor is the point: a build measured at 9.1 s cold and 18.1–29.1 s at load
+  outlived its own 10 s window, so the memo was never once a hit and a reap pass cost 90 builds — #3585.
+  The absent-owner confirmation window is a separate knob: `WT_ABSENT_CONFIRM=60`s — overridable, but `0`
+  is NOT "off": it is coerced to 60, because zero would confirm on ONE sample. Every caller reads the
+  census through a command substitution.) A worker is identified the way its launcher named it: by the
   `wt-<worker>` workspace for the layout grammar, and by its **terminal id** (recorded at spawn) for
   `surface new-terminal`, which takes no name. Its polarity is fail-CLOSED in BOTH halves: a `cmux
   tree` that cannot be read counts its workers ALIVE, and so does a `tmux ls` that fails with anything
