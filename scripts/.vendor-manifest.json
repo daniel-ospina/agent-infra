@@ -24,7 +24,7 @@
       "identical@base": false,
       "patch": "scripts/.vendor-patches/test_parallel_work_check.py.patch",
       "base_sha256": "2ad53d8ae271336d2b4cd87048078a125c8bb9cc49280096ca234609f7cf4b64",
-      "patched_sha256": "3e3e064bd846bc8b2a6660dbec771f24a9d8ab932dd7a81fb0758a65abb41f20"
+      "patched_sha256": "b65490dab4ef2c452c1ea66aec908e1133598d01fd18570e959343086c9984f3"
     },
     "scripts/fake_supabase.py": {
       "identical@base": true,
