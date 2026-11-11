@@ -698,13 +698,24 @@ function expectBranches(command, expectedArray) {
 expectBranches("git push origin --delete feat/x", ["feat/x"]);
 expectBranches("git push --delete feat/x", ["feat/x"]);
 expectBranches("git push origin --delete refs/heads/feat/x", ["feat/x"]);
-// Flag BEFORE the remote: git treats the first positional as the REPOSITORY
-// when ≥2 positionals follow the flag (`--delete origin c` deletes c on
-// origin — probe-verified). The first following positional is dropped.
+// Flag BEFORE the remote with ONE refspec: git treats the first positional as
+// the REPOSITORY (`git push --delete origin c` deletes c on origin —
+// probe-verified). The first following positional is dropped.
 expectBranches("git push --delete origin c", ["c"]);
 expectBranches("git push origin main && git push --delete origin c", ["c"]); // later-segment flag-before-remote
 expectBranches("git push --delete chore/old-branch origin", ["origin"]); // git-invalid (chore/old-branch is not a repo) — repo-drop still applied
-expectBranches("git push origin --delete a b", ["a"]); // repo precedes flag — a and b are BOTH refspecs; single-target contract keeps a
+// #509: EVERY refspec is a target, never just the first. The repo precedes the
+// flag, so `a` is NOT the remote — a and b are BOTH refspecs and git deletes
+// both (probe-verified: `- [deleted] a` / `- [deleted] b`). The pre-#509
+// single-target capture returned ["a"], so a sibling holding `b` was never
+// coordinated-blocked on the degradation-fallback arm.
+expectBranches("git push origin --delete a b", ["a", "b"]);
+expectBranches("git push -d origin a b", ["a", "b"]); // flag-first: origin is the REMOTE, both refspecs are targets
+expectBranches("git push origin -d a b", ["a", "b"]);
+expectBranches("git push -d origin refs/heads/a refs/heads/b", ["a", "b"]);
+expectBranches("git push origin -d -q a b c", ["a", "b", "c"]); // cluster + three refspecs
+expectBranches("git push origin -d a :b", ["a", "b"]); // flag + colon-delete mix, one target each
+expectBranches("git push --delete a b", ["b"]); // lone-pair flag-first: a is the REMOTE only
 expectBranches('git push origin --delete "feat/x"', ["feat/x"]);
 expectBranches("git push origin --delete 'feat/x'", ["feat/x"]);
 expectBranches("git push origin :feat/x", ["feat/x"]);
@@ -961,6 +972,11 @@ dexpect("push --delete colon form", `git push origin :feat/x`, { verdict: "block
 // coordinated block fires exactly as for --delete/:branch.
 dexpect("push -d short → isPushDelete + targets", `git push origin -d feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push -d flag-first → targets (first positional = the remote)", `git push -d origin feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+// #509 parity pin: the detailed classifier already attributes EVERY delete
+// refspec; the whole-command `extractPushDeleteBranch` must agree, or the
+// degradation-fallback #73 arm guards only the first of a multi-refspec delete.
+dexpect("push -d flag-first multi-refspec → all targets", `git push -d origin a b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["a", "b"] });
+dexpect("push origin -d multi-refspec → all targets", `git push origin -d a b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["a", "b"] });
 dexpect("push -dq cluster → delete", `git push origin -dq feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push -d refs target → short name", `git push origin -d refs/heads/feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push --del abbrev → delete", `git push origin --del feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
