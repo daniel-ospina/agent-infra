@@ -5965,60 +5965,6 @@ export function _hasHiddenStateSubst(raw) {
 }
 
 /**
- * #607: the hidden payload TEXTS of a command — recursively the same spans
- * `_hasHiddenStateSubst` scans, plus static `eval` literal payloads (ANSI-C
- * translated), because those are the texts the shell will actually RUN.
- *
- * WHY THIS EXISTS. The refusal in index.ts exempts a hidden payload only when
- * it cannot reach a main checkout, and its first form tested the SESSION cwd.
- * That premise — "the payload runs at the shell cwd" — is FALSE for a payload
- * carrying its own repo hints, and the gap was measured through the real
- * handler at this head: from a WORKTREE session
- *   echo "$(git -C <hub> branch -Mq main victim)"
- * was ALLOWED, ran with rc 0, and clobbered the hub's `victim` ref — the exact
- * class the gate exists to refuse, reachable from the fleet's NORMAL shape
- * (lanes work in worktrees). Attributing a payload requires its TEXT, so the
- * caller needs the collector's spans rather than a second shell parser.
- *
- * An EMPTY result for a command the flag fired on means the payload is
- * unattributable by construction (`eval $VAR`, `$(<file)`, alias indirection):
- * the caller fails closed (#805 — a gate that cannot determine the target
- * refuses).
- * @param {string} raw
- * @returns {string[]}
- */
-export function _hiddenStateSubstSpans(raw) {
-  const source = String(raw ?? "");
-  const out = [];
-  const seen = new Set();
-  const walk = (src, depth) => {
-    // bounded: nested substitutions are finite in practice; the guard keeps a
-    // pathological input from recursing without end.
-    if (depth > 8) return;
-    for (const inner of _collectSubstSpans(src)) {
-      if (!inner || seen.has(inner)) continue;
-      seen.add(inner);
-      out.push(inner);
-      walk(inner, depth + 1);
-    }
-  };
-  walk(source, 0);
-  // Static eval literals — the SAME regex `_hasHiddenStateSubst` uses, so the
-  // span set cannot drift from the flag that triggered the refusal.
-  const evalRe = /eval\s+(?:\$'([^']*)'|"([^"]*)"|'([^']*)')/g;
-  let m;
-  while ((m = evalRe.exec(source)) !== null) {
-    const ansi = m[1];
-    const payload = ansi !== undefined ? _ansiTranslate(ansi) : (m[2] ?? m[3] ?? "");
-    if (payload.length === 0 || seen.has(payload)) continue;
-    seen.add(payload);
-    out.push(payload);
-    walk(payload, 0);
-  }
-  return out;
-}
-
-/**
  * #436 (B carve-out): extract the deleted branch SHORT names from a branch /
  * push-delete git invocation, or null when the invocation is not a ref-delete
  * OR is outside the MINIMAL SAFE SHAPE SET (fail-closed on ambiguity):

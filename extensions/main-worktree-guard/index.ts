@@ -287,12 +287,6 @@ let ansiTranslate: (s: string) => string = (s: string) => String(s ?? "");
 // rather than letting an undefined call throw inside the tool hook (which aborts
 // the bash call) — the same skew contract as the #709/#627 bindings above.
 let maskRemoteExecPayloads: (command: string) => string = (c: string) => String(c ?? "");
-// #607: the hidden-payload SPAN enumerator the branch-state refusal uses to
-// ATTRIBUTE a hidden payload's repo (a payload carries its own -C/--git-dir/cd
-// hints, so "the payload runs at the shell cwd" is only a claim to VERIFY).
-// Fail-safe default: null → the refusal cannot attribute the target, so it
-// REFUSES (fail-closed, #805). Absence must never buy an exemption.
-let hiddenStateSubstSpans: ((raw: string) => string[]) | null = null;
 // #437 (C): bash-write gate for TRACKED hub files in a DISORDERED hub (pure
 // intersect of bash-write candidates with index-tracked rels). Fail-safe
 // default: inert (null) — a failed import NEVER false-blocks (same contract
@@ -360,10 +354,6 @@ try {
   // skew reason as #709/#627 — a stale module leaves the IDENTITY default, which
   // keeps today's (strict) behaviour instead of throwing in the hook.
   if (typeof _m5.maskRemoteExecPayloads === "function") maskRemoteExecPayloads = _m5.maskRemoteExecPayloads;
-  // #607: same namespace-read + typeof-guard skew contract as #709/#627 — a
-  // stale module leaves the fail-safe default (null), which makes the hidden
-  // refusal fail CLOSED instead of throwing inside the tool hook.
-  if (typeof _m5._hiddenStateSubstSpans === "function") hiddenStateSubstSpans = _m5._hiddenStateSubstSpans;
   if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
   if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
   // #1919: read from the namespace for the same reason as #709/#627 above — the
@@ -6038,66 +6028,49 @@ export default function (pi: ExtensionAPI) {
       //
       // SCOPE — NOT a blanket substitution block: a substitution carrying a
       // READ-ONLY git call (`$(git branch --show-current)`, `$(git rev-parse
-      // HEAD)`, `$(git status --porcelain)`) does not set the flag. The refusal
-      // resolves against the payload's OWN repo, exactly as the M3 loop resolves
-      // an extractor-invisible mutation's repo (round-3 policy: the payload runs
-      // at the shell cwd) — and, since #607's review follow-up, it VERIFIES that
-      // claim instead of assuming it: a WORKTREE session is exempt only when the
-      // payload attributes to a worktree too, and an unresolvable target stays
-      // refused (fail-closed, #805).
+      // HEAD)`, `$(git status --porcelain)`) does not set the flag, because
+      // `_hasHiddenStateSubst`'s `mutates()` requires a MUTATING branch-state verb.
+      //
+      // ⛔ NO WORKTREE EXEMPTION, DELIBERATELY — and this is the SECOND attempt at
+      // it. The first one exempted a session whose cwd resolved to a worktree, on
+      // the premise "the payload runs at the shell cwd". That premise is FALSE: a
+      // payload carries its OWN repo hints (`-C`/`--git-dir`/`--work-tree`/`cd`/
+      // `GIT_DIR=`), so from a lane worktree
+      // `echo "$(git -C <hub> branch -Mq main victim)"` executed rc 0 and clobbered
+      // the hub's `victim` tip (MEASURED). The second attempt attributed the
+      // payload's SPANS instead — and a fresh-context reviewer measured THAT open
+      // too: `hiddenStateMutation` fires from arms that produce NO span
+      // (`__unverifiable__` / `eval $VAR`, `$(<file)`, `-c alias.x=…`,
+      // `GIT_CONFIG_PARAMETERS`), so ONE benign substitution anywhere in the
+      // command paid for an exemption of an unattributable payload
+      // (`echo "$(git rev-parse HEAD)"; eval $PAYLOAD` → ADMITTED from a worktree).
+      // A gate whose exemption can be bought by unrelated text is not a gate, so
+      // the exemption is GONE: an unenumerable branch-state mutation is refused in
+      // EVERY session, and the remedy is the one that actually works — run the
+      // command DIRECTLY (in a worktree that is then exempt as a visible mutation).
+      //
+      // PROCESS SUBSTITUTION: what actually fires, MEASURED (a review finding
+      // claimed a read-only `<(git log …)` idiom is refused here — it is NOT).
+      // `hiddenStateMutation` is false for `git diff --stat <(git log --oneline -1)`
+      // and true for `git diff --stat <(git branch -Mq a b)`: the broad
+      // `isProcSubst && /\bgit\b/` arm is a no-op once the same text has been
+      // scanned as an ordinary substitution span (the shared `seen` set in
+      // `_hasHiddenStateSubst`), so a git-led READ-ONLY list resolves to a
+      // non-mutating invocation and the flag stays false. Rows pin both halves.
       const hiddenBranchStateRefusal = (): { block: true; reason: string } | null => {
         if (!det || det.hiddenStateMutation !== true) return null;
-        const hiddenEff = branchOwnership.resolveEffectiveRepo("git status", process.cwd());
-        const sessionIsWorktree = !!hiddenEff
-          && hiddenEff.unresolvedTarget !== true
-          && hiddenEff.isWorktree === true;
-        // #607 (review follow-up): the session-cwd test alone is NOT sound. Its
-        // premise — "the payload runs at the shell cwd" — is FALSE for a payload
-        // carrying its OWN repo hints (`-C`/`--cd`/`--git-dir`/`--work-tree`/
-        // `--git-common-dir`, a `cd` chain, or a `GIT_DIR=` prefix). MEASURED at
-        // this head through the real handler, from a WORKTREE session:
-        //   echo "$(git -C <hub> branch -Mq main victim)"  -> ALLOWED, rc 0,
-        //   the hub's `victim` tip clobbered — the very class this gate exists
-        //   to refuse, reachable from the fleet's NORMAL shape (lanes work in
-        //   worktrees). So a worktree session is exempt only when the payload is
-        //   ATTRIBUTABLE and resolves to a worktree too; an unattributable
-        //   payload (`eval $VAR`, `$(<file)`, alias indirection) is refused —
-        //   #805: a gate that cannot determine the target REFUSES.
-        let refusedFromWorktree = false;
-        if (sessionIsWorktree) {
-          const spans = typeof hiddenStateSubstSpans === "function"
-            ? hiddenStateSubstSpans(localCommand)
-            : null;
-          let attributable = false;
-          for (const span of spans ?? []) {
-            const spanEff = branchOwnership.resolveEffectiveRepo(span, process.cwd());
-            if (!spanEff) continue; // this span claims no repo at all
-            if (spanEff.unresolvedTarget === true || spanEff.isWorktree !== true) {
-              attributable = false; // resolves to a MAIN checkout, or cannot resolve
-              break;
-            }
-            attributable = true;
-          }
-          if (attributable) return null;
-          refusedFromWorktree = true;
-        }
         return {
           block: true,
           reason: [
-            "⛔ Branch-state command blocked in the MAIN checkout (#607).",
+            "⛔ Branch-state command blocked (#607).",
             "   Why: the command hides a branch-state git invocation inside a shell",
-            "   substitution / backticks / eval / alias payload. The guard cannot see",
-            "   which ref it moves, so it cannot rule out that the hidden command",
-            "   clobbers or switches a branch you do not own — the main checkout is between",
-            "   parallel agents (#265).",
-            ...(refusedFromWorktree ? [
-              "   This session is in a worktree, but this hidden payload names its OWN repo",
-              "   target (-C / --git-dir / cd) or cannot be enumerated, so it can act",
-              "   OUTSIDE this worktree — the MAIN checkout is not protected by it.",
-            ] : []),
-            "   → Run the branch-state git command directly (outside $(…), backticks,",
-            "     eval and aliases), or work in an isolated worktree",
-            "     (using-git-worktrees skill).",
+            "   substitution / backticks / eval / alias / process-substitution payload.",
+            "   The guard cannot see which ref it moves — and a payload can name its OWN",
+            "   repo (-C / --git-dir / cd), so even a worktree session cannot rule out",
+            "   that it clobbers or switches a branch in a SHARED main checkout (#265).",
+            "   → Run the branch-state git command DIRECTLY (outside $(…), backticks,",
+            "     eval and aliases). Direct branch-state commands in an isolated",
+            "     worktree are exempt as before (using-git-worktrees skill).",
             "   Hatch, if this is deliberate solo work in the hub:",
             "     AGENT_ALLOW_MAIN_EDITS=1 or ~/.pi/agent/.allow-main-edits (#1239).",
           ].join("\n"),

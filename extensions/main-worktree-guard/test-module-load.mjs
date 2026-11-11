@@ -888,14 +888,12 @@ async function partB() {
     //   M3 = the #607 freed-name relaxation deleted (dst probe as before)
     //   M3i = `renameDstExists: dstExists` → `false` (the pre-#598 decision: no dst
     //         existence check at all) — the non-vacuity arm for the launder rows
-    //   M4 = `hiddenBranchStateRefusal` without the worktree resolution (refuse
-    //         unconditionally) — the non-vacuity arm for the worktree row
-    //   M5 = the PRE-FIX session-cwd-only exemption restored (the `hiddenEscapes`
-    //         test, with no payload attribution) — the non-vacuity arm for the
-    //         cross-repo rows below. APPLIED as the whole #607(1) index.ts hunk
-    //         reverted; every cross-repo row ALLOWED under it (measured), and the
-    //         worktree control row stayed green under it too — which is exactly
-    //         why the exemption needed a target, not a cwd.
+    //   M4 = a WORKTREE EXEMPTION RE-ADDED to `hiddenBranchStateRefusal` — the
+    //         non-vacuity arm for the worktree + cross-repo + bought-exemption rows.
+    //         MEASURED: every one of them is ADMITTED under it. That mutant is not
+    //         hypothetical — TWO exemption designs were measured open by
+    //         fresh-context review before this head (session-cwd, then span
+    //         attribution); the rows are the pin against a third.
     // Every mutant was APPLIED to a copy of index.ts and the whole suite re-run;
     // the row names state what each one does to them. A row that CANNOT vary under
     // any of them says so and names why (refused by an arm this change only
@@ -1006,13 +1004,13 @@ async function partB() {
       "git branch -M main freeX && git branch -M freeX victim", "mutant M3i");
     await expect607Block(
       "#607 launder: own-rename lead + FOREIGN rename SOURCE is BLOCKED (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i — decideM3 refuses the foreign source itself)",
-      "git branch -M main tmpC && git branch -M feat/other tmpC", "mutant M3i");
+      "git branch -M main tmpC && git branch -M feat/other tmpC");
     await expect607Block(
       "#607 launder: own-rename lead + FOREIGN force-create tail is BLOCKED (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i — the force arm refuses the foreign target itself)",
-      "git branch -M main tmpE && git branch -fq feat/other main", "mutant M3i");
+      "git branch -M main tmpE && git branch -fq feat/other main");
     await expect607Block(
       "#607 launder: own-rename lead + FOREIGN switch tail is BLOCKED (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i — the switch arm refuses it itself)",
-      "git branch -M main tmpF && git checkout feat/other", "mutant M3i");
+      "git branch -M main tmpF && git checkout feat/other");
     await expect607Block(
       "#607 launder: a propagated chain that ENDS on a foreign ref is BLOCKED — mid-command freedom is own-lineage only (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i)",
       "git branch -M main d1 && git branch -M d1 d2 && git branch -M d2 victim");
@@ -1031,60 +1029,87 @@ async function partB() {
     await expect607Allow("#607 scope: prose that merely MENTIONS a rename in an argument is not a payload",
       'git commit --allow-empty -m "git branch -M main x"');
 
-    // ── the WORKTREE exemption (mirrors the visible-mutation policy) ──────────
-    // Lanes work in worktrees; a refusal that ignored that would false-block the
-    // fleet's normal shape. The payload runs at the shell cwd, so the cwd's repo
-    // class decides — exactly as the M3 loop treats an extractor-invisible
-    // mutation (`stateInvVisible === false`).
+    // ── NO worktree exemption — and this is the SECOND attempt at one ────────
+    // ATTEMPT 1 exempted a session whose cwd resolved to a worktree, on the
+    // premise "the payload runs at the shell cwd". ATTEMPT 2 attributed the
+    // payload's SPANS instead. Both were measured OPEN by fresh-context review:
+    //   1) the premise is false — a payload carries its OWN repo hints, so from a
+    //      lane worktree `echo "$(git -C <hub> branch -Mq main victim)"` executed
+    //      rc 0 and clobbered the hub's `victim` tip (bfdb30ae -> 4c90be9b);
+    //   2) the attribution was BUYABLE — `hiddenStateMutation` also fires from arms
+    //      that produce NO span (`__unverifiable__`/`eval $VAR`, `$(<file)`,
+    //      `-c alias.x=…`, `GIT_CONFIG_PARAMETERS`), so ONE benign substitution in
+    //      the same command paid for an exemption of an unattributable payload:
+    //      `echo "$(git rev-parse HEAD)"; eval $PAYLOAD` was ADMITTED from a
+    //      worktree.
+    // So the exemption is GONE: an unenumerable branch-state mutation is refused in
+    // EVERY session, and the remedy is the one that works — run it directly (which
+    // in a worktree is a visible mutation and exempt as before). The rows below are
+    // the anti-regression pins for both attempts; `M4` = a worktree exemption
+    // RE-ADDED (the pre-fix form), which admits them.
     const wt607 = join(tmp, "wt607");
     execSync(`git worktree add -q "${wt607}" -b wt/x607 HEAD`, { cwd: repo, stdio: "ignore" });
     process.chdir(wt607);
-    await expect607Allow("#607 worktree: a hidden branch-state payload in a WORKTREE session is exempt [mutant: M4] — MEASURED: M4 refuses it",
-      'echo "$(git branch -Mq wt/x607 wt/y607)"');
-    await expect607Allow("#607 worktree: the visible own-rename in a worktree is exempt (unchanged control)",
+    await expect607Block("#607 worktree: a hidden branch-state payload in a WORKTREE session is REFUSED [mutant: M4] — MEASURED: M4 admits it",
+      'echo "$(git branch -Mq wt/x607 wt/y607)"', "mutant M4");
+    await expect607Allow("#607 worktree: the DIRECT (visible) own-rename in a worktree is still exempt (the remedy the refusal names)",
       "git branch -M wt/x607 wt/y607");
-
-    // ── #607 (review follow-up): the exemption is a claim about the PAYLOAD'S
-    // repo, not about the session's cwd ──────────────────────────────────────
-    // The premise "the payload runs at the shell cwd" is false for a payload
-    // carrying its OWN repo hints. MEASURED through the REAL handler at this
-    // head, from a WORKTREE session (the fleet's normal shape):
-    //   echo "$(git -C <hub> branch -Mq main victim)"      -> ALLOWED,
-    //   executed rc 0, the hub's `victim` tip clobbered (bfdb30ae -> 4c90be9b)
-    // i.e. the exact class this gate exists to refuse, reachable from every
-    // lane. Each row below is ALLOW under M5 and BLOCK after the attribution.
-    // The hub control is `repo`; these rows never execute the command — only
-    // the verdict is under test (the effect was measured out-of-band, above).
     const xRepo = await expect607Block(
-      "#607 cross-repo: a payload carrying its own `-C <hub>` is REFUSED from a WORKTREE session [mutant: M5] — MEASURED pre-fix: ALLOWED, and the hub's `victim` ref clobbered rc 0",
-      `echo "$(git -C ${repo} branch -Mq main victim)"`, "mutant M5");
-    expectTrue("#607 cross-repo: the refusal NAMES the worktree nuance (an agent must not read it as a blanket substitution ban)",
+      "#607 cross-repo: a payload carrying its own `-C <hub>` is REFUSED from a WORKTREE session [mutant: M4] — MEASURED pre-attempt-2: ALLOWED, the hub's `victim` clobbered rc 0",
+      `echo "$(git -C ${repo} branch -Mq main victim)"`, "mutant M4");
+    expectTrue("#607 cross-repo: the refusal NAMES the payload-owns-its-repo reason (not a blanket substitution ban)",
       !!xRepo && /worktree/i.test(xRepo.reason ?? "") && /-C|--git-dir/i.test(xRepo.reason ?? ""),
       `reason=${JSON.stringify(xRepo?.reason ?? "")}`);
     await expect607Block(
-      "#607 cross-repo: the same reach via `--git-dir=<hub>/.git` is REFUSED [mutant: M5]",
-      `echo "$(git --git-dir=${repo}/.git branch -Mq main victim)"`, "mutant M5");
+      "#607 cross-repo: the same reach via `--git-dir=<hub>/.git` is REFUSED [mutant: M4]",
+      `echo "$(git --git-dir=${repo}/.git branch -Mq main victim)"`, "mutant M4");
     await expect607Block(
-      "#607 cross-repo: a `cd <hub>` chain inside the payload is REFUSED [mutant: M5] — the payload's own cd, not the session's",
-      `echo "$(cd ${repo} && git branch -Mq main victim)"`, "mutant M5");
+      "#607 cross-repo: a `cd <hub>` chain inside the payload is REFUSED [mutant: M4] — the payload's own cd, not the session's",
+      `echo "$(cd ${repo} && git branch -Mq main victim)"`, "mutant M4");
     await expect607Block(
-      "#607 cross-repo: a static `eval` payload naming the hub is REFUSED [mutant: M5] — the eval literal is attributed like any other span",
-      `eval 'git -C ${repo} branch -Mq main victim'`, "mutant M5");
-    // Fully-foreign targets prove the attribution is not a blanket refusal: a
-    // payload that resolves to NO repo (a plain copy) carries no repo claim and
-    // is decided by the session cwd alone, as before.
-    await expect607Allow("#607 cross-repo: a worktree payload with no repo hint is still exempt (attribution is not a blanket ban)",
-      'echo "$(git branch -Mq wt/x607 wt/z607)"');
-    // UNATTRIBUTABLE payloads are refused rather than exempted (#805): the
-    // target cannot be determined, so an exemption would be a guess.
+      "#607 cross-repo: a static `eval` payload naming the hub is REFUSED [mutant: M4]",
+      `eval 'git -C ${repo} branch -Mq main victim'`, "mutant M4");
+    // ⛔ THE REVIEW'S P1, PINNED THREE WAYS: a benign span must not BUY an
+    // exemption for an unattributable payload. Each of these was ADMITTED under
+    // attempt 2 (no mutant of THIS head re-admits them — the attribution that could
+    // be bought no longer exists; they are the regression pins for its return).
+    // ⛔ MEASURED CORRECTION to the review's first example: `eval $PAYLOAD` (and
+    // `eval "$PAYLOAD"`, and `$CMD` indirection) does NOT set `hiddenStateMutation`
+    // at all on this head — the flag is false for all three, so that spelling was
+    // never admitted by a buyable exemption. It is a SEPARATE, PRE-EXISTING gap in
+    // `_hasHiddenStateSubst` (filed as its own issue, not claimed fixed here), and
+    // pinning it as "refused" would be a fabricated row — so the row is the two
+    // spellings that DO fire the flag, above and below.
     await expect607Block(
-      "#607 cross-repo: `$(<file)` (opaque file text) is REFUSED from a worktree — unattributable target fails CLOSED (#805) [mutant: M5]",
-      'echo "$(< /tmp/not-a-repo-claim.txt)"', "mutant M5");
+      "#607 bought-exemption: a benign substitution must not exempt a `$(<file)` payload in the same command [mutant: M4] — MEASURED: M4 admits it (review P1)",
+      'echo "$(git rev-parse HEAD)"; echo "$(< /tmp/payload-607.txt)"');
     await expect607Block(
-      "#607 cross-repo: alias indirection with no resolvable span is REFUSED from a worktree — unattributable target fails CLOSED (#805) [mutant: M5]",
-      "git -c alias.br='git branch -fq victim main' br", "mutant M5");
+      "#607 bought-exemption: a benign substitution must not exempt an alias payload in the same command [mutant: M4] — MEASURED: M4 admits it (review P1)",
+      `git -c alias.br='git -C ${repo} branch -fq victim main' br; echo "$(git rev-parse HEAD)"`);
+    await expect607Block(
+      "#607 bought-exemption: `$(<file)` (opaque file text) is REFUSED from a worktree — unattributable target fails CLOSED (#805) [mutant: M4] — MEASURED: M4 admits it",
+      'echo "$(< /tmp/not-a-repo-claim.txt)"');
+    await expect607Block(
+      "#607 bought-exemption: alias indirection with no resolvable span is REFUSED from a worktree (#805) [mutant: M4] — MEASURED: M4 admits it",
+      "git -c alias.br='git branch -fq victim main' br");
+    // ── PROCESS SUBSTITUTION — the review's second finding, MEASURED ──────────
+    // The finding said a read-only proc-subst idiom is now refused (a new false
+    // block). MEASURED on this head through the classifier and the handler: it is
+    // NOT — `hiddenStateMutation` is FALSE for `git diff --stat <(git log --oneline
+    // -1)`, because the shared `seen` set makes the broad `isProcSubst &&
+    // /\bgit\b/` arm a no-op once the same text was scanned as an ordinary
+    // substitution span, and a git-led READ-ONLY list does not `mutate()`. The
+    // finding is therefore ⛔ DO NOT APPLY: there is no new false block and no
+    // scope/claim mismatch (the reason text only ever appears for a MUTATING
+    // payload). Both halves are pinned so a future edit cannot silently turn the
+    // first row into a false block — or the second into a bypass.
+    await expect607Allow(
+      "#607 proc-subst: a READ-ONLY proc-subst (`git diff --stat <(git log …)`) is ALLOWED (review finding 2 does NOT reproduce — measured)",
+      "git diff --stat <(git log --oneline -1)");
+    await expect607Block(
+      "#607 proc-subst: a MUTATING proc-subst (`<(git branch -Mq a b)`) is REFUSED — the flag genuinely fires here",
+      "git diff --stat <(git branch -Mq a b)");
     process.chdir(repo);
-    await expect607Allow("#607 worktree: the hub session is restored for the remaining suites (control)", "git status");
 
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
     // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE
