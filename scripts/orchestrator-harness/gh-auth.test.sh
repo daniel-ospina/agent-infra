@@ -676,6 +676,12 @@ _b9q_bad="$(printf '%s' "$_sig" | tr '.' '\n' | grep -i 'inherit' | grep -i 'pip
   | grep -viE "(must not|does not|do not|is not|are not|never|no |cannot|can not|n't|opposite)[^.]{0,12}inherit")"
 [ -z "$_b9q_bad" ]; rc=$?
 ck "B9q …and no sentence says a shard child INHERITS pipefail (a paraphrase of the removed mechanism is the same defect as the original sentence) — asserted per SENTENCE with the negation required, not by a character window the live wording clears by 8 chars" $rc
+# ⛔ THE REMEDY IS THE GUARD'S OWN, not an invention of this suite — `origin/main`'s wording, kept through
+# the merge rather than dropped: `printf` into a quiet `grep` under `pipefail` reports 141 for a match
+# that IS present, which turns each of these arms into a false "absent"; the builtin-writer inversion is
+# `scripts/check-no-sigpipe-grep.sh`'s documented remedy, and that guard fails the build on the piped
+# spelling. (Outside `_sig` on purpose: B9i-B9q pin the paragraph above, this states the same reason in
+# the words the base branch used, so neither side of the merge loses its record.)
 grep -q 'merge-one\.sh' <<<"$_place"; rc=$?
 ck "B9c …so the block NAMES merge-one.sh as a path this resolution does not reach" $rc
 grep -q 'single invocation every worker goes through' <<<"$_place" && rc=1 || rc=0
@@ -981,6 +987,81 @@ _FDIR="$TMP/store-as-file"; mkdir -p "$_FDIR/.config"; : > "$_FDIR/.config/gh"
 _ff="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$_FDIR/.config/gh'")"
 [ "$_ff" = unreadable ]; rc=$?
 ck "B13t …and a store path that is a regular FILE is UNREADABLE, not empty ('$_ff')" $rc
+# ⛔ BUT ONLY A **DANGLING** SYMLINK IS THAT SHAPE (review round 25, measured): the round-22 predicate was a
+# bare `[ -L "$d" ]`, which calls EVERY symlinked store directory unopenable — including one that points at
+# a traversable, EMPTY store. That is the same class one shape over: `gh_auth_cause` then said "this read
+# could not OPEN it … fix those PERMISSIONS; the credential may well be there" about a directory it had
+# OPENED and found empty, sending the operator to the wrong fault entirely. A symlink that resolves answers
+# for its TARGET below.
+SYMLINKED="$TMP/store-symlinked"; mkdir -p "$SYMLINKED/.config" "$TMP/store-symlinked-real"
+ln -sfn "$TMP/store-symlinked-real" "$SYMLINKED/.config/gh"
+_sl="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$SYMLINKED/.config/gh'")"
+[ "$_sl" = empty ]; rc=$?
+ck "B13u …but a symlink that RESOLVES to a traversable store dir with no hosts.yml is EMPTY, not unreadable ('$_sl')" $rc
+_slc="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_cause '$SYMLINKED' '$TMP/none.env' '$ACCT_EMPTY'")"
+case "$_slc" in *"<unreadable: $SYMLINKED/.config/gh>"*) rc=1 ;; *) rc=0 ;; esac
+ck "B13v …so the cause names it as the lane-HOME store it IS (no '<unreadable: …>' marker) rather than a door it could not open" $rc
+# ⛔ AND `empty` MUST ONLY BE SPOKEN FOR A REACHABLE PATH (review round 25, P3): round 22's fix caught the
+# dangling STORE and left the UNSEARCHABLE ANCESTOR its own comment claimed — `-e` and `-L` are both FALSE
+# behind a directory this process cannot search, so the helper answered `empty` and the cause named a store
+# to create over one that is there. `_gh_auth_searchable` is a named predicate so this shape can be injected
+# at ANY uid (uid 0 reads through every permission bit, so a `chmod` fixture would be green there).
+# ⛔ THE INJECTED SHAPE PUTS AN ABSENT STORE UNDER A DENIED ANCESTOR, WHICH IS WHAT A REAL ONE LOOKS LIKE FROM
+# HERE: behind a directory this read cannot search, `$d`, `$d/hosts.yml` and `-L "$d"` are all FALSE — the
+# injection reproduces exactly that reading (`$d` genuinely absent) and adds only the ancestor verdict, so the
+# arm measures the WALK and nothing else.
+BLIND="$TMP/store-blindanc"; mkdir -p "$BLIND/.config"
+_ba="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_searchable() { [ \"\$1\" = '$BLIND/.config' ] && return 1; [ -x \"\$1\" ]; }; _gh_auth_store_in '$BLIND/.config/gh'")"
+[ "$_ba" = unreadable ]; rc=$?
+ck "B13w …and a store whose ANCESTOR this read cannot search is UNREADABLE, not empty ('$_ba')" $rc
+_bac="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_searchable() { [ \"\$1\" = '$BLIND/.config' ] && return 1; [ -x \"\$1\" ]; }; gh_auth_cause '$BLIND' '$TMP/none.env' '$ACCT_EMPTY'")"
+case "$_bac" in *"<unreadable: $BLIND/.config/gh>"*) rc=0 ;; *) rc=1 ;; esac
+ck "B13x …and the cause discloses it rather than naming a store the operator should create" $rc
+# ⛔ AND THE REAL SHAPE, NOT ONLY THE INJECTED ONE — the same rule B13g/B13h apply to readability: a `chmod`
+# shape cannot be built as uid 0, so it is a declared RESERVATION there and never counted as a pass.
+REALANC="$TMP/store-realanc"; mkdir -p "$REALANC/parent/store"; printf 'user: x\n' > "$REALANC/parent/store/hosts.yml"
+chmod 000 "$REALANC/parent"
+if [ "$(id -u)" = 0 ]; then
+  SKIPPED=$((SKIPPED+1))
+  printf '  ⏭️  B13y SKIPPED (uid 0 reads through permission bits, so an unsearchable ANCESTOR cannot be built here) — UNMEASURED in this run\n'
+else
+  _ra="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$REALANC/parent/store'")"
+  [ "$_ra" = unreadable ]; rc=$?
+  ck "B13y …on the FILESYSTEM too: a store behind a real chmod-000 parent is unreadable, not empty ('$_ra')" $rc
+fi
+chmod 755 "$REALANC/parent"
+# ⛔ AND THE WALK'S OWN HEADER WAS WIDER THAN THE WALK (review round 26, P3, measured): it claimed "only
+# absolute paths are walked" and NO such guard existed — any value containing `/` was walked, relative
+# included. The walk is KEPT and the header corrected (see the function), so this arm PINS WHICH of the two
+# the code does rather than leaving the claim to prose: a relative multi-component store path behind a
+# component this read cannot search answers `unreadable`, resolved against THIS process's cwd. Reverting to
+# the documented-but-absent restriction (`case "$a" in /*) ;; *) return 1 ;; esac`) reddens this row.
+# ⛔ AND THE ROW IS A DECLARED RESIDUAL, NOT A DESIRABLE: `gh` would resolve the same relative value against
+# the LANE's cwd, so a relative ambient `GH_CONFIG_DIR` can name a blind ancestor the lane's `gh` never sees.
+# It is pinned so the limitation is a measured fact (the module header and README row name it) and cannot be
+# silently "tidied" back into an unenforced claim.
+RELSTORE="$TMP/store-relanc"; mkdir -p "$RELSTORE/sub/blind/store"
+_rl="$(cd "$RELSTORE" && u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_searchable() { [ \"\$1\" = 'sub/blind' ] && return 1; [ -x \"\$1\" ]; }; _gh_auth_store_in 'sub/blind/store'")"
+[ "$_rl" = unreadable ]; rc=$?
+ck "B13z …a RELATIVE multi-component store path IS walked (resolved against this process's cwd) and its blind ancestor is UNREADABLE ('$_rl')" $rc
+# ⛔ AND AN ANCESTOR THAT IS NOT A DIRECTORY IS ABSENT, NOT A DOOR (round 26, measured): round 25's predicate
+# was `[ -e "$a" ] && ! _gh_auth_searchable "$a"`, so a plain regular file ancestor was graded by its EXEC
+# BIT — `unreadable` at 644 ("fix those PERMISSIONS") and `empty` at 755 about the SAME file. A file cannot
+# contain a store, so both readings must be `empty`, and the arm asserts both spellings for that reason.
+FILEANC="$TMP/store-fileanc"; mkdir -p "$FILEANC"; : > "$FILEANC/blocker-644"; : > "$FILEANC/blocker-755"
+chmod 644 "$FILEANC/blocker-644"; chmod 755 "$FILEANC/blocker-755"
+_fa644="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$FILEANC/blocker-644/store'")"
+_fa755="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$FILEANC/blocker-755/store'")"
+[ "$_fa644" = empty ] && [ "$_fa755" = empty ]; rc=$?
+ck "B13za …and a store path under a plain FILE ancestor is EMPTY at 644 ('$_fa644') and at 755 ('$_fa755') — a file cannot hold a store, and the exec bit must not decide" $rc
+# ⛔ AND THAT DOOR IS THE DANGLING-SYMLINK ANCESTOR — round 25's dangling STORE one layer up (round 26,
+# measured): behind a symlink to an unmounted volume, `-e` is FALSE for every component, so the walk skipped
+# it and the cause told the operator to create a store on a path that is pointed at that volume. Built without
+# `chmod`, so it runs at ANY uid.
+SYMANC="$TMP/store-symanc"; mkdir -p "$SYMANC"; ln -sfn /nonexistent-volume "$SYMANC/vol"
+_sa="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$SYMANC/vol/.config/gh'")"
+[ "$_sa" = unreadable ]; rc=$?
+ck "B13zb …and an ancestor that is a DANGLING SYMLINK is that same door, not an absent store ('$_sa')" $rc
 
 # ⛔ READABILITY IS PINNED ON **EVERY** STORE ARM, NOT JUST `home` AND `ambient` (review round 17, P2):
 # flipping the predicate back to `[ -f ]` in the `keys` arm ALONE left the suite green, and on a

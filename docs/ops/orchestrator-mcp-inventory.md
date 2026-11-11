@@ -1042,6 +1042,23 @@ not answer the tool's own signature, the missing half was written **into that mo
 5. **Tree step 5's classification is still `lane-actions.py`'s** (one batched JEV call for the fleet, D7). The
    MCP attaches its **input** (`lane.artifact`'s words axis) and never makes a second JEV call.
 
+**§5.10a — the `pi` POOL delta (#2921), added after Phase 2.** The one population this surface could not
+answer for is the one no session store can contain: an orchestrator lane runs `pi -p --no-session`, so it
+writes no transcript and no cmux store record, and a `lane.list` answered from the REGISTRY alone reported
+none of them **and said nothing about it** — an absence read as a clean bill (#1777; measured 2026-10-27:
+29 processes, 2.64 GB, an hour of hand-measurement). `lane.list` now carries `pool: true`, which is
+`scripts/orphan-reap.py --pool pi --json` **wrapped** — the pool's own owner, four states, verdicts from
+`tools/fleet/liveness.py::evaluate`. No new predicate, no new state name, no new store: a delta on a shipped
+name, which is the shape §5.9 sanctions. Three properties are pinned in `test_server.py`:
+`S16` (the census and its `verdict_source`), `S17` (`counts: null` is `UNMEASURED`, never `LIVE: 0`; a
+non-JSON document from a successful run is a PARSE failure, not a command failure), `S18` (an unrequested
+pool is `UNMEASURED(pool + not requested)`, never an absent key — an omitted reading is not a clean one).
+
+**Still not on this surface, and deliberately so:** the CI queue composition (`ci_queue_health.py` lives in
+the product repo) and the heartbeat's CADENCE measurement (in-band rate / worst gap / missed sends —
+`fleet.reminder` owns delivery and its timer lifecycle, not a cadence statistic). Both are named in #2921's
+definition-of-done and remain open there.
+
 **Invariants → tests (all in `mcp-servers/orchestrator/test_server.py`, each naming its fixture):**
 
 | # | test | the fixture it reproduces |

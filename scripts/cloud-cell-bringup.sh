@@ -95,7 +95,24 @@ fi
 # later steps (the disk-reaper timer's TEMPLATES_DIR) use the SAME checkout, rather than resolving a
 # second, possibly untrusted one.
 LAYER_ROOT=""
-REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"
+# ⛔ NO REPO NAME IS BAKED IN HERE (agent-infra#2919). This line used to read
+# `REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"`, and `check_dispatch` hands the value to the
+# pre-flight as `OR` (the queue target). Measured on cell 4, 2026-10-27 16:29–16:38Z against
+# origin/main 0d443381: an agent-infra box was refused provisioning THREE TIMES in a row —
+# `[refresh] NOT PROVISIONABLE: $REPO is /home/cmux/agent-infra, whose 'origin' is
+# …/agent-infra.git — NOT the queue target daniel-ospina/tortoise` — while every other leg reported
+# `ok`. Setting OR/REPO/REPO_SLUG in the environment did not help, because the value compared against
+# came from a DEFAULT rather than from anything the operator set: the only cell shape that could pass
+# provisioning was tortoise, so the agent-infra box ran a TORTOISE clone to compensate (and graded
+# agent-infra work from it). A repo name baked into a provisioning script is a wrong target by
+# default for every other repo this fleet runs, which is #1901/#2235's class.
+# So the value is DERIVED, late — after keys.env is sourced — by `check_repo_slug` below, through the
+# SAME resolver the controller, the refresh pass and the identity walker use (`repo-slug.sh`).
+REPO_SLUG="${REPO_SLUG:-}"
+# The operator's own pin, captured BEFORE `$ENV_FILE` is sourced and before any default, so a
+# declaration can be told apart from a value this run resolved. Empty here means "nothing declared".
+REPO_SLUG_DECLARED_AT_LOAD="${REPO_SLUG}"
+OR_DECLARED_AT_LOAD="${OR:-}"
 WORKDIR="${WORKDIR:-/tmp/cell}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 # The pushed gh token. Overridable for the same reason every other path here is (a hermetic test
@@ -1333,6 +1350,124 @@ check_gh() {
     && ok "push permission: true" || die "no push permission on $REPO_SLUG — lanes cannot open PRs"
 }
 
+# ── WHICH REPO THIS BOX IS FOR — DERIVED, never a name baked in (agent-infra#2919) ─────────────
+# One resolver, three callers' worth of evidence, and NO repo name anywhere in this file: the operator's
+# declaration first (it is the only thing that can say which queue this box serves), then the checkout
+# the box works in — whose `origin` is the honest answer to "what repo is this" — and otherwise a
+# refusal that NAMES what is missing. The order matters and it is `repo-slug.sh`'s own recorded rule
+# ("An explicit OR in the environment … still WINS … but the default is derived, never guessed"), so a
+# declaration is never silently overridden by a stale tree, and an undeclared box is never guessed at.
+#
+# ⛔ NOT A SECOND SLUG PARSER. `derive_or` in `orchestrator-harness/repo-slug.sh` is the ONE reader of a
+# checkout's `origin` (it scrubs `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`/`GIT_INDEX_FILE` and reads
+# `--local`, so an ambient environment cannot re-point the answer), and `repo_slug_valid` is the ONE
+# owner of what an `owner/name` is. Both are used here by name. The supervisor keeps its own
+# `queue_repo_from_url` for its own documented reason and is held in lockstep with this pair by
+# test-gates.sh's CROSS-PARSER LOCKSTEP section, so a drift between the two answers a cell can get
+# reddens instead of being described.
+#
+# ⛔ THE FOURTH ARM OF #2919'S ASK — "`OR` from keys.env" — IS SUBSUMED, DELIBERATELY, AND THE REASON IS
+# THE FIX, NOT AN OMISSION. `source_env_file` sources `$ENV_FILE` into THIS shell, so by the time this
+# runs a keys.env `OR`/`REPO_SLUG` is indistinguishable from an operator's export and is read by the
+# FIRST arm. Keeping it as a separate, LOWER-precedence arm would require snapshotting the shell before
+# sourcing — and would then let a stale `$WORKDIR` checkout outrank the operator's own `keys.env` pin,
+# which is the silent override in the other direction. A declaration is one predicate, whichever file
+# carried it, and a declaration that DISAGREES with `$WORKDIR`'s origin is refused by name further
+# down (`check_dispatch` -> `refresh-candidates.sh`'s pairing check, `#1901`) rather than resolved here.
+#
+# Contract, both functions: rc 0 + the value; rc 1 = nothing to resolve; rc 2 = the operator's pin is
+# not an `owner/name` (a config error, refused by name — the same vocabulary `derive_or` uses).
+# `repo_slug_resolve <declared-slug> <workdir> <declared-or>` prints `<slug>` then `<source>` on stdout
+# so the caller can REPORT which one it used instead of presenting a derived value as a declaration.
+repo_slug_resolve() {
+  local declared="${1:-}" workdir="${2:-}" declared_or="${3:-}" slug=""
+  # ⛔ A MISSING VALIDATOR IS NOT A REFUSAL (the rule this file already applies to `lib/cell-home.sh`
+  # and `uv-env.sh`). `repo_slug_valid` lives in `repo-slug.sh`, which a STANDALONE bring-up — the
+  # documented bare-VM path, a script pushed to /tmp — does not carry at all. Refusing a declared slug
+  # because the box cannot CHECK it would block exactly the box that never had the parser; the value is
+  # therefore used as declared and the SOURCE LINE SAYS it is unverified, so nothing is claimed as
+  # measured. Loading the harness makes the shape real; an unparseable pin then refuses by name below.
+  # ARM 1a — the operator named REPO_SLUG. Validated when the one shape rule is present, never passed
+  # through unvalidated on a box that HAS it: `repo_slug_valid` also refuses the literal `*`, which
+  # `repo_identity_scan` reads as the ANY-REPO exemption, so an unvalidated `*` handed onward would be a
+  # wildcard exemption wearing a declaration's clothes.
+  if [ -n "$declared" ]; then
+    if command -v repo_slug_valid >/dev/null 2>&1; then
+      repo_slug_valid "$declared" || return 2
+      printf '%s\n%s\n' "$declared" "declared in REPO_SLUG"
+    else
+      printf '%s\n%s\n' "$declared" "declared in REPO_SLUG (shape UNVERIFIED — repo-slug.sh is not on this box)"
+    fi
+    return 0
+  fi
+  # ARM 1b — the operator named OR (the queue target). Same validation, same reason.
+  if [ -n "$declared_or" ]; then    if command -v repo_slug_valid >/dev/null 2>&1; then
+      repo_slug_valid "$declared_or" || return 2
+      printf '%s\n%s\n' "$declared_or" "declared in OR"
+    else
+      printf '%s\n%s\n' "$declared_or" "declared in OR (shape UNVERIFIED — repo-slug.sh is not on this box)"
+    fi
+    return 0
+  fi
+  # ARM 2 — DERIVE from the checkout this box works in. `derive_or` refuses a remote that is not a
+  # GitHub slug (a local path, a `file://` mirror, `ftp://…`), so an unparseable origin falls through to
+  # the refusal below rather than becoming an invented `owner/name`. Its answer is already validated by
+  # `repo_slug_from_remote`, which delegates to the one shape rule.
+  if [ -n "$workdir" ] && [ -d "$workdir" ] && command -v derive_or >/dev/null 2>&1; then
+    slug="$(derive_or "$workdir" 2>/dev/null)" || slug=""
+    if [ -n "$slug" ]; then
+      printf '%s\n%s\n' "$slug" "derived from $workdir's 'origin'"
+      return 0
+    fi
+  fi
+  # ARM 3 — nothing to resolve. NOT a default: a repo name here is `#2919` itself.
+  return 1
+}
+
+# `check_repo_slug` — resolve it, publish it, and refuse BY NAME when there is nothing to resolve.
+# ⛔ PLACED BEFORE `check_gh` (which spends a `gh api repos/$REPO_SLUG` call) and before
+# `check_repo_identity` (whose generic-name row reads `$REPO_SLUG` as "the cell's own repo"), and AFTER
+# `check_provider_env` — it reads what `$ENV_FILE` declared. A run placed earlier would grade a
+# declaration the cell never made.
+# ⛔ THE REFUSAL NAMES `REPO_SLUG` AND NOT `REPO`, DELIBERATELY (agent-infra#2919 ask 2). The pre-fix
+# message on an agent-infra cell said `fix: set REPO=<a checkout of daniel-ospina/tortoise>`, i.e. it
+# invited the operator to grade tortoise from an agent-infra box — the exact mis-target #1901 and the
+# `GH_REPO` class (#2235) exist to prevent. The remedy for "this box is for another repo" is to say
+# WHICH repo, not to fetch a different checkout.
+check_repo_slug() {
+  local out rc=0 slug src why="" workdir_state=""
+  out="$(repo_slug_resolve "${REPO_SLUG:-}" "${WORKDIR:-}" "${OR:-}")" || rc=$?
+  case "$rc" in
+    0)
+      slug="$(printf '%s\n' "$out" | sed -n 1p)"
+      src="$(printf '%s\n' "$out" | sed -n 2p)"
+      REPO_SLUG="$slug"
+      # Exported: `refresh-candidates.sh` and the supervisor's children read it from the environment,
+      # and the lane briefs print it. A value this run DERIVED must be visible to what it starts.
+      export REPO_SLUG
+      ok "repo slug: $REPO_SLUG ($src)" ;;
+    2)
+      # Name the value the operator actually typed, and which variable carried it — a refusal that says
+      # "is not an owner/name" without quoting the offending value sends them looking at the wrong one.
+      if [ -n "${REPO_SLUG:-}" ]; then why="REPO_SLUG='$REPO_SLUG'"; else why="OR='${OR:-}'"; fi
+      die "CHECK FAILED [repo slug]: $why is not an <owner>/<repo> — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing (agent-infra#2919). FIX: set REPO_SLUG=<owner/name of the repo THIS BOX is for>, in $ENV_FILE, or drop the pin and let the slug be derived from \$WORKDIR's 'origin'." ;;
+    *)
+      # Say WHAT was found instead of an origin, so the operator does not go hunting for a declaration
+      # that is already absent (the pre-fix message's shape: it told an agent-infra box to fetch a
+      # tortoise checkout, which is the defect itself).
+      if [ -z "${WORKDIR:-}" ]; then
+        workdir_state="\$WORKDIR is unset"
+      elif [ ! -e "$WORKDIR/.git" ]; then
+        workdir_state="\$WORKDIR ('$WORKDIR') is not a checkout, so it has no 'origin' to read"
+      elif ! command -v derive_or >/dev/null 2>&1; then
+        workdir_state="the one slug parser (repo-slug.sh's derive_or) is not loaded on this box, so \$WORKDIR's 'origin' could not be read — deploy the harness ('cloud-cell-supervisor.sh apply', or bring up from a full checkout) and re-run"
+      else
+        workdir_state="\$WORKDIR ('$WORKDIR') is a checkout whose 'origin' is not a GitHub owner/name (a local path, a file:// mirror or no remote at all), so no repo could be derived from it"
+      fi
+      die "CHECK FAILED [repo slug]: this box declares no repo and none could be DERIVED — REPO_SLUG and OR are unset, and $workdir_state (agent-infra#2919). A repo name baked into this script is a WRONG TARGET BY DEFAULT for every cell that is not that repo: measured on cell 4, 2026-10-27, an agent-infra box could NEVER be provisioned and ran a tortoise clone to compensate. FIX: put REPO_SLUG=<owner/name of the repo THIS BOX is for> in $ENV_FILE, or point WORKDIR at that repo's checkout so its 'origin' can be read." ;;
+  esac
+}
+
 # ── repo identity: a directory must not lie about which repo it is (agent-infra#3521) ──────────
 # MEASURED 2026-11-05 on cell-2: `/home/cmux/agent-infra` was a checkout of `daniel-ospina/tortoise`.
 # Nothing errored. `pull/3456/head` would not resolve, its `main` reported commits no other box had, and
@@ -1557,7 +1692,7 @@ check_dispatch() {
     # the rest, only a TRANSIENT refusal that names the SCOUT gets the scout wording — rc=1 also covers
     # causes that are not the scout at all (`FAIL repo not found`, `'uv' is not runnable`).
     if [ "$outrc" -eq 3 ]; then
-      die "this repo cannot be provisioned for dispatch — the cell would merge only (agent-infra#1736)"
+      die "this repo cannot be provisioned for dispatch — the cell would merge only (agent-infra#1736). ⛔ DO NOT fix this by pointing REPO at a checkout of another repo: that is how an agent-infra cell came to grade tortoise work (agent-infra#2919/#1901). The queue target this pass used is REPO_SLUG='$REPO_SLUG'; if THIS BOX is for a different repo, set REPO_SLUG=<that repo's owner/name> in $ENV_FILE and re-run, and if it is the right repo, fix the reason above (for a checkout/queue mismatch: \$WORKDIR must be a checkout of $REPO_SLUG)."
     fi
     case "$out" in
       *"TRANSIENT: scout"*) die "the scout worktree cannot be refreshed right now (see the reason above): clear it, then re-run (agent-infra#2174)" ;;
@@ -2814,6 +2949,16 @@ main() {
       #     actually reads, so the store is what is checked — and the provider is the one lanes use.
       check_provider_env
       check_one_home env
+      # ⛔ THE BOX'S REPO, RESOLVED BEFORE ANYTHING THAT NAMES ONE (agent-infra#2919) — and AFTER the
+      # env is sourced (step 1) and the HOME layout is judged (step 2), because the declaration it reads
+      # comes from `$ENV_FILE` and a run about to be refused for its home must not first resolve state
+      # against it. Every step below that names a repo reads `$REPO_SLUG`: `check_gh` spends a
+      # `gh api repos/$REPO_SLUG` call on it, `check_repo` CLONES from it, `check_repo_identity` uses it
+      # as "the cell's own repo", and `check_dispatch` hands it to the pre-flight as the queue target
+      # `OR`. Resolving it from the declaration the cell actually made — or from `$WORKDIR`'s own origin
+      # — is what replaces the tortoise name this file used to bake in; a step placed after any of them
+      # would grade a value nothing established.
+      check_repo_slug
       # BEFORE check_gh/check_repo: this judges the box as it ARRIVED. `check_repo` clones $WORKDIR, so a
       # check placed after it would grade the tree this run just created.
       check_repo_identity
