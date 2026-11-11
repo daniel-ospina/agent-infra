@@ -1373,6 +1373,36 @@ jobs:
         # step so neither verdict can suppress the other (the rule every
         # sibling suite here follows). Zero-dep, ~10s.
         run: node extensions/main-worktree-guard/test-remote-context.mjs --mutations
+      - name: main-worktree-guard laundered legacy+push-delete compound (#506)
+        timeout-minutes: 4
+        # A push-delete spelling in a compound OVERWROTE the legacy destructive
+        # verdict, so `git reset --hard && git push origin --delete stale`
+        # classified `block:push-delete` — and the full path's #73 arm returns
+        # `admitAfterM3()` as soon as no sibling has the target checked out, a
+        # return that SKIPS the LEGACY_BLOCK arm below it. Pre-fix, probe-
+        # verified: the hard reset RAN in the shared hub main checkout.
+        # `block:push-delete` is also the one verdict the ownership allowance
+        # admits outright, so the hole was wider than the #73 arm.
+        # This suite pins BOTH halves of the fix — the classifier keeps the
+        # legacy verdict, and index.ts still runs the #73 sibling check on the
+        # delete half (without which the classifier half would WEAKEN #73 inside
+        # linked worktrees, where the legacy arm is exempt by design) — plus the
+        # controls that keep it from becoming a blanket refusal: a delete of a
+        # branch held nowhere is still allowed, and a worktree's legacy exemption
+        # is unchanged. Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~8s.
+        # Its OWN step (the `extensions/*/test*.mjs` glob in ci-main.yml runs on
+        # the push lane only, so a PR would otherwise never read it).
+        run: node extensions/main-worktree-guard/test-506-legacy-delete-compound.mjs
+      - name: main-worktree-guard laundered legacy+push-delete MUTATION evidence (#506)
+        timeout-minutes: 4
+        # Each half of the #506 fix is pinned INDEPENDENTLY, because either one
+        # alone is a plausible-looking change that leaves a hole: revert the
+        # classifier guard and every hub pin goes back to ALLOWED (the
+        # laundering), while reverting the index.ts delete-target arm leaves the
+        # hub pins green and reddens ONLY the worktree #73 pin — so a partial fix
+        # cannot pass as a whole one. Its OWN step so neither verdict can
+        # suppress the other (the rule every sibling suite here follows).
+        run: node extensions/main-worktree-guard/test-506-legacy-delete-compound.mjs --mutations
       - name: task-cwd-guard shared-main spawn-cwd gate (#1240)
         timeout-minutes: 4
         # A `task` dispatch with no explicit `cwd` inherits the PARENT's cwd

@@ -87,7 +87,6 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   // classifies it separately (branch-state mutation, ownership-gated).
   { name: "branch-force-delete", re: /\bgit\s+branch\b(?=[^;&|]*[ \t](?:["']?--d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|["']?-(?![A-Za-z]*u)[A-Za-z]*[dD]))(?=[^;&|]*[ \t](?:["']?--forc(?:e)?(?![A-Za-z0-9])|["']?-(?![A-Za-z]*u)[A-Za-z]*f))[^;&|]*/ },
   { name: "force-push", re: /\bgit\s+push\b[^;&|]*(-f|--force)\b/ },
-  { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
   { name: "force-checkout", re: /\bgit\s+(checkout|switch)\s+(-f|--force)\b/ },
   { name: "checkout-discard-all", re: /\bgit\s+(checkout|switch)\s+-{0,2}\s*\.(\s|$|[;&|])/ },
   // Bare-ref or -b branch switch: `git checkout main`, `git checkout -b feat/x`,
@@ -97,6 +96,23 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "checkout-branch", re: /\bgit\s+(checkout|switch)\s+(-b\s+)?(?!--)(?!-\w)(\S+)/ },
   { name: "restore", re: /\bgit\s+restore\b/ },
   { name: "stash-pop", re: /\bgit\s+stash\s+(pop|apply|drop|clear)\b/ },
+  // #506 — the ARRAY IS A PRIORITY LIST, and `push-delete` used to sit ABOVE
+  // force-checkout / checkout-discard-all / checkout-branch / restore /
+  // stash-pop. Because `classifyGitCommand` returns the FIRST match on the WHOLE
+  // command string, a compound whose lead verb is one of those five classified
+  // `block:push-delete` — a LESS severe verdict than the verb it contains — and
+  // the full path's #73 arm then returned allow whenever the delete target was
+  // checked out nowhere, so the lead verb RAN in the hub main checkout
+  // (`git stash pop && git push origin --delete stale` — probe-verified). The
+  // verbs above (reset/clean/merge/rebase/pull/branch-force-delete/force-push)
+  // never had this shape: they out-rank push-delete and reached the full path as
+  // themselves, where the DETAILED classifier's unconditional override (#506's
+  // main defect) laundered them instead.
+  // A remote-branch delete is the LEAST destructive entry in this family, so it
+  // belongs LAST: a compound now names its most severe verb, exactly as the
+  // guard's contract says. Pure delete pushes are unaffected (nothing else
+  // matches), and `force-push` still out-ranks it (`git push -f … --delete`).
+  { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
 ];
 
 /**
@@ -4035,9 +4051,28 @@ export function classifyGitCommandDetailed(command) {
     const optSlots = _markOptionValueSlots(args);
     const deleteIdx = args.findIndex((a, i) => !optSlots[i] && _isPushDeleteFlagToken(a));
     const hasColonTargets = args.some((a, i) => !optSlots[i] && /^:/.test(a));
+    // #506 — a delete spelling must NEVER override an UNRELATED legacy
+    // destructive verdict. The legacy verdict is assigned from the WHOLE
+    // command string (`git reset --hard && git push origin --delete b` ⇒
+    // block:reset), i.e. it names the most severe effect of the compound. The
+    // override handed such a compound to index.ts's #73 coordinated arm as
+    // `block:push-delete`; when the delete target is not checked out anywhere
+    // that arm returns its allow-when-no-sibling-checkout verdict and the
+    // LEGACY_BLOCK arm is never reached — so the hard reset RAN in the shared
+    // hub main checkout (the laundering this issue records; it predates #443,
+    // which only extended it to the `-d`/`--del` spellings). Keep the legacy
+    // verdict, and keep the delete FACTS (`isPushDelete` + `pushTargets`) so
+    // index.ts can still run the #73 sibling check on the delete targets
+    // independently of the verdict — the delete is a real effect of the
+    // compound even when it is not the verdict's verb.
+    // The push family is unchanged: `block:push-delete` and
+    // `block:force-push` verdicts resolve to block:push-delete exactly as
+    // before (both are push verdicts, and the coordinated arm owns both).
+    const legacyIsOtherDestructive = legacyVerdict.startsWith("block:") &&
+      legacyVerdict !== "block:push-delete" && legacyVerdict !== "block:force-push";
     if (deleteIdx !== -1 || hasColonTargets || legacyVerdict === "block:push-delete") {
       out.isPushDelete = true;
-      out.verdict = "block:push-delete";
+      if (!legacyIsOtherDestructive) out.verdict = "block:push-delete";
       // git treats the FIRST positional as the repository and every further
       // positional as a delete refspec when a delete form is present
       // (`git push --delete origin a b` deletes a AND b — probe-verified;
@@ -4093,7 +4128,8 @@ export function classifyGitCommandDetailed(command) {
         else out.verdict = "block:push"; // legacy --force\b false-matched lease/includes
       }
     }
-    // legacyVerdict was some other destructive (reset etc.) → keep it
+    // legacyVerdict was some other destructive (reset etc.) → keep it —
+    // with or without a delete spelling in the compound (#506).
   }
 
   // ── commit matcher (excludes commit-graph/commit-tree) — only when no

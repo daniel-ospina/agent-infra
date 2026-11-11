@@ -5921,12 +5921,22 @@ export default function (pi: ExtensionAPI) {
         // arm below so the main-checkout force-push block is preserved.
         const pushDeleteVerdict = verdict === "block:push-delete" ||
           (verdict === "allow" && rawDeleteNames.length > 0) ||
-          (verdict === "block:force-push" && rawDeleteNames.length > 0);
+          (verdict === "block:force-push" && rawDeleteNames.length > 0) ||
+          // #506: ANY other legacy block whose compound ALSO carries a delete
+          // spelling. Symmetric with the full path's #506 arm: the guard must
+          // not lose the #73 sibling check just because a more severe verb owns
+          // the verdict. It NEVER returns the coordinated arm's allow verdict —
+          // it falls through to the generic block arm below, so this can only
+          // add a refusal (in a linked worktree, where the legacy arm exempts,
+          // it is the only thing that still stops a sibling's upstream being
+          // deleted).
+          (verdict.startsWith("block:") && rawDeleteNames.length > 0);
         if (pushDeleteVerdict) {
           const blocked = _coordinatedDeleteBlock(rawDeleteNames);
           if (blocked) return blocked;
           if (verdict === "block:push-delete" || verdict === "allow") return undefined;
-          // verdict === block:force-push: fall through to the generic arm.
+          // verdict === block:force-push (or any other legacy block, #506): fall
+          // through to the generic arm.
         }
         if (verdict.startsWith("block:")) {
           let inWorktree = true;
@@ -6254,6 +6264,28 @@ export default function (pi: ExtensionAPI) {
             reason: _syncAllowanceBlockReason(allowanceKind, baseline, syncEff ?? eff, det, effect),
           };
         }
+      }
+
+      // ── #506: delete spelling inside a LEGACY-DESTRUCTIVE compound ──
+      // The classifier keeps the legacy verdict when a compound pairs an
+      // UNRELATED destructive with a push-delete spelling
+      // (`git reset --hard && git push origin --delete b` ⇒ block:reset), so
+      // the two push-family arms below never see the delete targets and the
+      // #73 sibling check would silently stop applying to the delete half —
+      // exactly the protection the pre-#506 (laundered) verdict used to get.
+      // Run it here, on the delete facts the classifier still records
+      // (isPushDelete + pushTargets, with the whole-command extractor as the
+      // fallback for a delete that lives in a LATER segment), and then FALL
+      // THROUGH: the legacy verdict keeps its own arm below (LEGACY_BLOCK in
+      // the main checkout, worktree exemption unchanged). This arm can only
+      // ADD a block — it never returns an allow.
+      if (det.verdict !== "block:push-delete" &&
+          det.verdict !== "block:push" && det.verdict !== "block:force-push") {
+        const legacyDeletes = det.pushTargets.length > 0
+          ? det.pushTargets
+          : (extractPushDeleteBranch(localCommand) ?? []);
+        const blocked = _coordinatedDeleteBlock(legacyDeletes);
+        if (blocked) return blocked;
       }
 
       // ── push --delete: retained #73 coordinated check (foreign targets) ──
