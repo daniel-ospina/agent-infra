@@ -624,12 +624,31 @@ _place="$(sed -n '/LANE.S gh CREDENTIAL (agent-infra#2509)/,/⛔ A MISSING MODUL
 ck "B9 the placement block is still extractable from the shipped spawn-gate.sh (a rename must redden this, never silently empty the arms below)" $rc
 { [ -n "$(sed -n '/^run_agent() {/p' "$HERE/merge-one.sh")" ] && [ "$(grep -c 'gh_auth' "$HERE/merge-one.sh")" -eq 0 ]; }; rc=$?
 ck "B9b merge-one.sh carries its OWN run_agent() and resolves NO gh credential — the fact the block has to disclose" $rc
-# ⛔ HERE-STRINGS, NOT PIPES (#841/#864). `run-bash-shards.sh:147` runs every shard under `set -uo
-# pipefail`, and `grep -q` exits at the first match — so the `printf` on the left of a pipe can take an
-# EPIPE and the PIPELINE's status becomes 141. On the two asserting arms that reads as a false FAIL of
-# a true claim; on the three INVERTED arms below (`&& rc=1 || rc=0`) 141 falls into the `||` branch and
-# the arm PASSES on text it was written to forbid — a false PASS in the direction that matters. A
+# ⛔ HERE-STRINGS, NOT PIPES (#841/#864) — and the binding reason is the STATIC ban, not a live race in
+# this shard. `scripts/check-no-sigpipe-grep.sh` flags the `printf`-into-`grep -q` SHAPE repo-wide: `grep
+# -q` exits at its FIRST match, so under `pipefail` the writer on the left can take an EPIPE and the
+# PIPELINE's status becomes 141 — which on an INVERTED arm (`&& rc=1 || rc=0`) falls into the `||` and
+# PASSES on text it was written to forbid. These five arms were exactly the guard's five undeclared
+# occurrences on `origin/main` (introduced by #3872), so `sigpipe-grep` was red there and here until the
+# pipes went: a SHAPE violation of a ban whose producer-side over-block is accepted and pinned, never a
+# silent false PASS. ⛔ NEITHER PRECONDITION OF THAT RACE HOLDS IN THIS SHARD, and a reader must not
+# inherit the opposite: the top-level `set -uo pipefail` in `run-bash-shards.sh` governs the DRIVER, while
+# `shard_exec` runs each shard as a NEW `env -u … bash` — `SHELLOPTS` is not exported, so `pipefail` is OFF
+# in the child, and this suite enables `set -u` only — and both extracted payloads here (`_place` 4,626 B,
+# `_gha_flat` 32,310 B) are far below the ~64 KiB pipe buffer the guard's WINDOWS OF FAILURE requires. A
 # here-string has no reader to lose, so grep's 0/1 is the arm's status by construction.
+# ⛔ AND THE PARAGRAPH ABOVE IS ITSELF PINNED, in both directions: this suite's own rule is that a comment
+# claiming a guard it does not have reads exactly like one that has it, and the mechanism it states lives
+# in OTHER files, so B9i-B9m make a rot here REDDEN instead of lying (review round 13, P3).
+_self="${BASH_SOURCE[0]}"; [ -f "$_self" ] || _self="$HERE/gh-auth.test.sh"
+_sig="$(sed -n '/^# ⛔ HERE-STRINGS, NOT PIPES/,/^# here-string has no reader to lose/p' "$_self" \
+  | sed -e 's/^#[[:space:]]*//' | tr '\n' ' ' | tr -s ' ')"
+[ -n "$_sig" ]; rc=$?
+ck "B9i the pipe-idiom rationale paragraph is still extractable from this suite (a rewrite must redden this, never silently empty the arms below)" $rc
+grep -q 'runs every shard under `set -uo pipefail`' <<<"$_sig" && rc=1 || rc=0
+ck "B9j …and does NOT claim the shards run under pipefail — the round-13 false mechanism (the DRIVER carries it; its shard children are a new bash that does not)" $rc
+grep -q 'check-no-sigpipe-grep.sh' <<<"$_sig"; rc=$?
+ck "B9k …and names the STATIC guard (#841/#864) as the reason the pipes went, which is the leg that actually fires" $rc
 grep -q 'merge-one\.sh' <<<"$_place"; rc=$?
 ck "B9c …so the block NAMES merge-one.sh as a path this resolution does not reach" $rc
 grep -q 'single invocation every worker goes through' <<<"$_place" && rc=1 || rc=0
@@ -659,6 +678,17 @@ ck "B9g …because the tree agrees: spawn-gate.sh makes no wt_spawn CALL, and wt
 _gha_flat="$(sed -e 's/^[[:space:]]*#[[:space:]]*//' "$GH_AUTH" | tr '\n' ' ' | tr -s ' ')"
 grep -q 'launch line reads `GH_CONFIG_DIR`' <<<"$_gha_flat" && rc=1 || rc=0
 ck "B9h …and gh-auth.sh's own export rationale does not repeat the overreach (its chain is run_agent → pi, not wt_spawn)" $rc
+# B9l-B9m: the two TREE facts the B9 here-string paragraph rests on, asserted where they live. Neither can
+# be read off this suite, so a red here means the paragraph must be re-derived — never that the tree is
+# wrong (the same shape as B9g, one file over).
+SHARDS="$HERE/../run-bash-shards.sh"
+{ grep -q '^set -uo pipefail' "$SHARDS" \
+  && grep -q 'shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash ' "$SHARDS"; }; rc=$?
+ck "B9l …because the tree agrees: the driver carries \`set -uo pipefail\` AND \`shard_exec\` runs each shard as a NEW \`env -u … bash\`, so no shard child inherits it" $rc
+_pb_place="$(printf '%s\n' "$_place" | wc -c | tr -d ' ')"
+_pb_gha="$(printf '%s' "$_gha_flat" | wc -c | tr -d ' ')"
+[ "$_pb_place" -lt 65536 ] && [ "$_pb_gha" -lt 65536 ]; rc=$?
+ck "B9m …and both payloads sit BELOW the ~64 KiB pipe buffer (_place ${_pb_place} B, _gha_flat ${_pb_gha} B), so no EPIPE window exists here — past that bound the paragraph's 'no live race' sentence stops being true and must be re-derived" $rc
 # B12: WHERE THE `EXEMPTION-UNREADABLE` TOKEN ACTUALLY LANDS (review round 11, P3). `README.md` §7.2g said
 # "the refusal line says `EXEMPTION-UNREADABLE`"; at this head the token is printed by the separate
 # `[land-backlog] NOTE` line (three arms, one per credential outcome) and the REFUSAL prints a different
