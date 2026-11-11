@@ -1088,19 +1088,41 @@ wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -
 // protects a sibling-held branch ALLOWED the delete (probe-verified end-to-end
 // from a linked worktree, where M2 is exempt). The segment is now tokenized
 // with the module's quote-aware splitter and truncated at the first shell
-// BOUNDARY token.
+// BOUNDARY token. Only `_SHELL_OPS` (`&& || | & ; ( )`) ends a segment, and an
+// unquoted backtick does too (see _truncateAtUnquotedBacktick).
 wcdt("parenthesized later-segment -d under block:push", "block:push", "git push origin main && (git push origin -d b)", ["b"]);
 wcdt("parenthesized later-segment --delete under block:push", "block:push", "git push origin main && (git push origin --delete b)", ["b"]);
 wcdt("command-substitution later-segment -d", "block:push", "git push origin main && echo $(git push origin -d b)", ["b"]);
-wcdt("group-brace later-segment -d", "block:push", "git push origin main && { git push origin -d b; }", ["b"]);
+// ⛔ NO `{ …; }` GROUP ROW HERE. `segRe`'s capture contract is `[^;&|]*` and a
+// brace group REQUIRES the `;` before `}`, so the capture is exactly
+// ` origin -d b` — there is no boundary token left for this helper to act on and
+// the row read `["b"]` before and after the fix (fresh-context review P2): an
+// assertion that cannot redden under any mutation of the change it accompanies is
+// decoration, not coverage.
+// Backtick substitution: an UNQUOTED backtick closes a substitution exactly like
+// `)`, and `_tokenize` keeps it inside the word (measured on origin/main:
+// `["b`"]` — the same phantom class).
+wcdt("unquoted-backtick later-segment -d", "block:push", "git push origin main && echo `git push origin -d b`", ["b"]);
+// ⛔ A REDIRECT IS NOT A BOUNDARY (fresh-context review P1). A redirect may appear ANYWHERE in a
+// simple command (`_isRedirectOperator`'s own rule), so ending the segment at `>` dropped the very
+// argument list being scanned: `git push origin 2>/dev/null -d b` returned `[]`, `_coordinatedDeleteBlock`
+// was never consulted, and the delete was ALLOWED where origin/main BLOCKED — in both the full path and
+// the degraded (classifier-unavailable) arm. The redirect token is skipped WITH its filename operand.
+wcdt("redirect BEFORE the remote consumes its filename", "block:push", "git push 2>/dev/null origin -d b", ["b"]);
+wcdt("redirect attached before the delete flag", "block:push", "git push origin >/dev/null -d b", ["b"]);
+wcdt("redirect between push and the --delete spelling", "block:push", "git push origin -q 2>/dev/null --delete b", ["b"]);
+wcdt("fd-dup redirect consumes nothing", "block:push", "git push origin -d b >&2", ["b"]);
+wcdt("redirect AFTER the target (control)", "block:push", "git push origin -d b 2>/dev/null", ["b"]);
 // The fold-in path (frozen legacy evidence in a LATER segment) overrides
 // pushTargets with the SAME extractor — the parenthesized twin must attribute
 // the real target there too, not the phantom `b)`.
 dexpect("parenthesized later-segment --delete → real target only", `git push origin HEAD:refs/heads/feat && (git push origin --delete b)`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
 // QUOTED text is data, not a shell operator: a ref legitimately named `b)`
 // must survive (git ref names allow parentheses), so the boundary rule must be
-// quote-AWARE — a blanket trailing-`)` strip would corrupt it.
+// quote-AWARE — a blanket trailing-`)` strip would corrupt it. Same for a quoted
+// backtick.
 wcdt("a QUOTED paren stays part of the ref name", "block:push", "git push origin main && git push origin -d 'feat/x)'", ["feat/x)"]);
+wcdt("a QUOTED backtick stays part of the ref name", "block:push", "git push origin main && git push origin -d 'feat/x`'", ["feat/x`"]);
 // Negative controls: the boundary rule must not invent targets.
 wcdt("parenthesized segment with a plain push → none", "block:push", "git push origin main && (git push origin main)", []);
 // --d is AMBIGUOUS with --dry-run — git rejects it (rc 129, probe-verified);

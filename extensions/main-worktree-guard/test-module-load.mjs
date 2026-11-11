@@ -431,6 +431,19 @@ async function partB() {
       const d4 = await coord("d4", "git push origin HEAD:refs/heads/feat && echo $(git push origin -d held/branch)");
       expectTrue("B73d: a command-substituted later segment is BLOCKED (same boundary rule)",
         isCoordBlock(d4, "held/branch"), `handler returned ${JSON.stringify(d4)?.slice(0, 200)}`);
+      // ⛔ A REDIRECT IS NOT A BOUNDARY (fresh-context review P1). `2>/dev/null` is what an agent adds
+      // for ordinary noise suppression, and it sits BETWEEN push and the delete spelling — so a
+      // boundary rule that broke at `>` silently emptied the target list and this #73 block stopped
+      // firing on the very command it exists for.
+      const d5 = await coord("d5", "git push origin HEAD:refs/heads/feat && git push origin 2>/dev/null -d held/branch");
+      expectTrue("B73e: a redirect between `push` and `-d` does NOT hide the delete (redirect ≠ boundary)",
+        isCoordBlock(d5, "held/branch"), `handler returned ${JSON.stringify(d5)?.slice(0, 200)}`);
+      const d6 = await coord("d6", "git push origin HEAD:refs/heads/feat && git push origin >/dev/null --delete held/branch");
+      expectTrue("B73f: an attached redirect before `--delete` does not hide it either",
+        isCoordBlock(d6, "held/branch"), `handler returned ${JSON.stringify(d6)?.slice(0, 200)}`);
+      const d7 = await coord("d7", "git push origin HEAD:refs/heads/feat && echo `git push origin -d held/branch`");
+      expectTrue("B73g: an unquoted-backtick later segment is BLOCKED (not the phantom `held/branch`+backtick)",
+        isCoordBlock(d7, "held/branch"), `handler returned ${JSON.stringify(d7)?.slice(0, 200)}`);
       // Positive controls — the boundary fix must not invent targets: a delete of
       // a branch NOBODY has checked out stays allowed, and so does a plain
       // compound push (the #73 arm must not fire on it).

@@ -4793,11 +4793,54 @@ export function unresolvableDeleteTargets(targets) {
 }
 
 /**
+ * Truncate a segment body at the first UNQUOTED backtick.
+ *
+ * An unquoted backtick opens/closes a command substitution exactly like `)` closes a subshell, but
+ * `_tokenize` keeps it inside the word (`git push origin -d b` + backtick → `b` backtick), so the
+ * extractor used to report the phantom target `b`+backtick: no ref by that name is ever checked out,
+ * `_coordinatedDeleteBlock` finds nothing, and the #73 hazard is allowed. Pre-existing on origin/main
+ * (this helper does not introduce it) but the same class as the parenthesized residual, so it is
+ * closed here rather than documented: QUOTED backticks are data and survive (`-d 'feat/x` + backtick
+ * + `'`).
+ * @param {string} s
+ * @returns {string}
+ */
+function _truncateAtUnquotedBacktick(s) {
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      // A backslash escapes the next char only inside double quotes (POSIX); inside single quotes it
+      // is literal, so skipping there would mis-read a later closing quote.
+      if (ch === "\\" && quote === '"') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "`") return s.slice(0, i);
+  }
+  return s;
+}
+
+/**
+ * Does this redirect operator CONSUME the next shell word as its operand?
+ * `>`, `>>`, `<`, `<<` (and their fd-prefixed forms) and `&>`/`&>>` take a filename; the fd-dup and
+ * fd-close forms (`2>&1`, `>&2`, `2>&-`, `<&0`) consume nothing.
+ * @param {string} tok
+ * @returns {boolean}
+ */
+function _redirectTakesOperand(tok) {
+  if (tok === "&>" || tok === "&>>") return true;
+  return /^(?:[0-9]+)?(?:>>?|<<?)$/.test(tok);
+}
+
+/**
  * Tokenize ONE `git push` segment body, stopping at the first shell BOUNDARY.
  *
  * #504 residual (parenthesized later segment). The segment body used to be
  * `split(/\s+/)`, which keeps a shell operator ATTACHED to the last word — a
- * subshell/group/substitution closer. `… && (git push origin -d old-feat)`
+ * subshell/substitution/group closer. `… && (git push origin -d old-feat)`
  * therefore produced the whole-command target token `old-feat)`, and
  * `_cleanDeleteTarget` cannot strip that parenthesis without corrupting a
  * genuinely QUOTED name. The phantom `old-feat)` names no ref, so
@@ -4808,16 +4851,34 @@ export function unresolvableDeleteTargets(targets) {
  * `_tokenize` is the module's quote-aware shell splitter: it emits unquoted
  * `(` / `)` / redirects as their OWN tokens and keeps QUOTED text inside the
  * word (`-d 'feat/x)'` stays the real ref `feat/x)`), so truncating at the
- * first `_isShellBoundary` token models bash rather than guessing from
- * spacing. The `segRe` capture still cannot contain `;`/`&`/`|` (unchanged
- * contract, including its documented over-match on quoted/echoed text).
+ * first shell boundary models bash rather than guessing from spacing. The
+ * `segRe` capture above still cannot contain `;`/`&`/`|` (unchanged contract,
+ * including its documented over-match on quoted/echoed text).
+ *
+ * ⛔ A REDIRECT IS **NOT** A BOUNDARY, and treating it as one was a fail-open
+ * regression this helper originally shipped (fresh-context review, P1).
+ * `_isRedirectOperator` states the module's own rule: a redirect may appear
+ * ANYWHERE in a simple command (`git > /dev/null push …` IS `git push …`), so
+ * breaking at `>` truncated the very argument list being scanned —
+ * `git push origin 2>/dev/null -d held/branch` yielded `[]`, and with no targets
+ * `_coordinatedDeleteBlock` was never consulted: ALLOWED where origin/main
+ * BLOCKED, in both the full path and the degraded (classifier-unavailable) arm
+ * whose entire purpose is to keep this check alive. So only `_SHELL_OPS` ends
+ * the segment; a redirect token is SKIPPED together with its filename operand
+ * (which is not an argv word git ever sees) and scanning continues.
  * @param {string} body raw text after the `git push` word
  * @returns {string[]}
  */
 function _pushSegmentTokens(body) {
+  const toks = _tokenize(_truncateAtUnquotedBacktick(body));
   const tokens = [];
-  for (const t of _tokenize(body)) {
-    if (_isShellBoundary(t)) break;
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (_SHELL_OPS.has(t)) break; // a real simple-command terminator
+    if (_isRedirectOperator(t)) {
+      if (_redirectTakesOperand(t)) i++; // the filename is not an argv word
+      continue;
+    }
     tokens.push(t);
   }
   return tokens;
