@@ -113,11 +113,14 @@ BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null
 
 # Remote delete — server-side; run it AFTER the teardown above. The #73
 # coordinated-delete guard blocks deleting a branch still checked out in ANY
-# worktree, but it matches the LITERAL ref in the command text, so this
-# shell-variable form is not guard-matched (the teardown ordering makes it moot).
+# worktree, and it matches the LITERAL ref in the command text. ⛔ Run this step
+# with the branch name WRITTEN OUT (resolve it above, then type it), not via
+# "$BRANCH": an unresolvable target — a variable, a $(…) substitution, a glob, a
+# brace expansion — is now REFUSED fail-closed (#653), because the guard cannot
+# tell which ref such a target would delete.
 # "remote ref does not exist" means deleteBranchOnMerge already removed it = success.
-git push origin --delete "$BRANCH" 2>/dev/null \
-  || echo "ℹ️ remote branch $BRANCH already deleted or unavailable"
+git push origin --delete <branch-name-literal> 2>/dev/null \
+  || echo "ℹ️ remote branch <branch-name-literal> already deleted or unavailable"
 
 # Local delete — best-effort. If the worktree was removed above the branch is no
 # longer checked out, but the HUB's main-checkout branch-force-delete gate still
