@@ -29,7 +29,10 @@
  *                                                              repository are never borrowed" + (c) dead
  *                                                              root + (b) + (d) redden
  *   M2 drop the `matchAndStoredDigest` match (accept any     → (b) "different bytes under the sibling root
- *      foreign record for the path)                             still BLOCK" reddens
+ *      foreign record for the path)                             still BLOCK" reddens, and so does (b)
+ *                                                              "a sibling root's record for DIFFERENT
+ *                                                              bytes" — that leg exists precisely so a
+ *                                                              re-blessing mutant is observable
  *   M3 drop the durable-registry read (verifiedSet only)     → (a) "a record only in the durable registry
  *                                                              (a prior session)" reddens — and ONLY
  *                                                              because that leg carries two recorded
@@ -250,6 +253,27 @@ test("(b) an edited-after-verification file at the SAME root still blocks (no re
   git(repo, "add a.txt");
   const blocked = await fire("tool_call", commitOp());
   ok(blocked?.block === true, "an edit after the PASS must still block (content-addressing never re-blesses disk)");
+});
+
+// ⛔ The leg above pins #1460's own `hashMatchesDisk` branch, and has NO sibling root at all — so
+// `foreignBlobMatch` never has a candidate and the row is green under EVERY mutant of the added
+// lines (fresh-context review round 3, finding 2: it read as coverage of "the borrow never
+// re-blesses disk" while proving nothing about the borrow). This leg is the discriminating half: a
+// same-repo sibling root DOES hold a record for the same path, at DIFFERENT bytes, and the op root
+// has no record of its own. A re-blessing mutant (accepting a candidate without the digest test,
+// `index.ts:5064`) allows the op and reddens here; the correct code fails the match and blocks.
+test("(b) a sibling root's record for DIFFERENT bytes never re-blesses this op's content", async () => {
+  const { hub, wt } = hubWithWorktree("b-foreign-stale-bytes");
+  // The sibling's record describes src/shared.ts at s1 (the committed bytes it was verified at).
+  addRegistryEntries([{ path: `${realpathSync(hub)}::src/shared.ts`, hash: sha256("s1\n") }]);
+  process.chdir(wt);
+  await fire("session_start", {});
+  writeFileSync(join(wt, "src/shared.ts"), "s9\n"); // neither root has a record for THESE bytes
+  git(wt, "add src/shared.ts");
+  const before = borrowRows().length;
+  const blocked = await fire("tool_call", commitOp());
+  ok(blocked?.block === true, "a sibling record for other bytes must not authorize this content");
+  equal(borrowRows().length, before, "no borrow may be audited when no candidate's digest matches");
 });
 
 // ── (c) PROTECTION: same bytes are not enough — the RANGE of what is borrowed is narrow ──
