@@ -6176,6 +6176,50 @@ export default function (pi: ExtensionAPI) {
 
       if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return admitAfterM3();
 
+      // ── #506: delete spelling inside a LEGACY-DESTRUCTIVE compound ──
+      // The classifier keeps the legacy verdict when a compound pairs an
+      // UNRELATED destructive with a push-delete spelling
+      // (`git reset --hard && git push origin --delete b` ⇒ block:reset), so
+      // the two push-family arms below never see the delete targets and the
+      // #73 sibling check would silently stop applying to the delete half —
+      // exactly the protection the pre-#506 (laundered) verdict used to get.
+      // Fall THROUGH on null: the legacy verdict keeps its own arm below
+      // (LEGACY_BLOCK in the main checkout, worktree exemption unchanged). This
+      // arm can only ADD a block — it never returns an allow.
+      // ⛔ IT SITS **ABOVE** THE OWNERSHIP ALLOWANCE, AND THAT PLACEMENT IS
+      // LOAD-BEARING (review round 4, P2). The allowance's admit is a `return`
+      // (`if (!foreignDelete) return admitAfterM3();`), so anything below it is
+      // UNREACHABLE for every kind the map covers — and `branch-force-delete` is
+      // one of them, admitted when every target is the baseline OR a
+      // pid-owned name. A delete-carrying compound that part 1 moved onto that
+      // verdict therefore lost the #73 check entirely: the delete half is a real
+      // effect of the command whatever the verdict's verb, and #73's harm does
+      // not change because a local `branch -D` (which #376/#543 do keep allowed)
+      // shares the command. Deny-wins ordering is also the converged practice in
+      // comparable harnesses (Claude Code: "deny → ask → allow", an allow on one
+      // subcommand never authorises a chained one; VS Code agent approvals: false
+      // rules take precedence). The claim this arm makes — it can only ADD a
+      // block — was FALSE while it sat below an allowing return.
+      // ⛔ GATED ON A REAL PUSH INVOCATION (`det.hasPush`), because the fallback
+      // extractor is STRING-matched and would otherwise manufacture evidence:
+      // `block:commit` is only produced when the classifier proved there is NO
+      // push invocation, so `git commit -m "revert: stop running git push origin
+      // -d main"` would be refused with a #73 "main is checked out" message for
+      // a delete that exists only in the commit MESSAGE — and it would split the
+      // spellings, since the `--delete` twin is excluded above and silently
+      // allowed. A real push invocation is the precondition for every shape this
+      // arm exists to cover, and the echo/comment over-match it still shares with
+      // the degraded arm stays confined to commands that really do push.
+      if (det.hasPush === true &&
+          det.verdict !== "block:push-delete" &&
+          det.verdict !== "block:push" && det.verdict !== "block:force-push") {
+        const legacyDeletes = det.pushTargets.length > 0
+          ? det.pushTargets
+          : (extractPushDeleteBranch(localCommand) ?? []);
+        const blocked = _coordinatedDeleteBlock(legacyDeletes);
+        if (blocked) return blocked;
+      }
+
       // ── Ownership allowance (agent-infra main, own baseline branch) ──
       // Predicate split (plan deviation 7): sync ops (pull/rebase/merge) gate on
       // current-branch == baseline; push/delete/branch -D gate on ALL targets ==
@@ -6264,39 +6308,6 @@ export default function (pi: ExtensionAPI) {
             reason: _syncAllowanceBlockReason(allowanceKind, baseline, syncEff ?? eff, det, effect),
           };
         }
-      }
-
-      // ── #506: delete spelling inside a LEGACY-DESTRUCTIVE compound ──
-      // The classifier keeps the legacy verdict when a compound pairs an
-      // UNRELATED destructive with a push-delete spelling
-      // (`git reset --hard && git push origin --delete b` ⇒ block:reset), so
-      // the two push-family arms below never see the delete targets and the
-      // #73 sibling check would silently stop applying to the delete half —
-      // exactly the protection the pre-#506 (laundered) verdict used to get.
-      // Run it here, on the delete facts the classifier still records
-      // (isPushDelete + pushTargets, with the whole-command extractor as the
-      // fallback for a delete that lives in a LATER segment), and then FALL
-      // THROUGH: the legacy verdict keeps its own arm below (LEGACY_BLOCK in
-      // the main checkout, worktree exemption unchanged). This arm can only
-      // ADD a block — it never returns an allow.
-      // ⛔ GATED ON A REAL PUSH INVOCATION (`det.hasPush`), because the fallback
-      // extractor is STRING-matched and would otherwise manufacture evidence:
-      // `block:commit` is only produced when the classifier proved there is NO
-      // push invocation, so `git commit -m "revert: stop running git push origin
-      // -d main"` would be refused with a #73 "main is checked out" message for
-      // a delete that exists only in the commit MESSAGE — and it would split the
-      // spellings, since the `--delete` twin is excluded above and silently
-      // allowed. A real push invocation is the precondition for every shape this
-      // arm exists to cover, and the echo/comment over-match it still shares with
-      // the degraded arm stays confined to commands that really do push.
-      if (det.hasPush === true &&
-          det.verdict !== "block:push-delete" &&
-          det.verdict !== "block:push" && det.verdict !== "block:force-push") {
-        const legacyDeletes = det.pushTargets.length > 0
-          ? det.pushTargets
-          : (extractPushDeleteBranch(localCommand) ?? []);
-        const blocked = _coordinatedDeleteBlock(legacyDeletes);
-        if (blocked) return blocked;
       }
 
       // ── push --delete: retained #73 coordinated check (foreign targets) ──
