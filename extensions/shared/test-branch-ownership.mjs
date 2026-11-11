@@ -1000,6 +1000,18 @@ ok("allow: branch -D multi all-owned allowed", ownershipAllowed({ opKind: "branc
 ok("allow: branch -D master protected even if listed owned (never trunk)", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["master"], ownedBranches: ["master"] }) === false);
 ok("allow: branch -D owned off-baseline false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "feat/1", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === false);
 ok("allow: push of owned branch stays baseline-only", ownershipAllowed({ opKind: "push", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === false);
+// ⛔ #608: the owned set is a per-pid `Set` in index.ts (the live caller hands
+// ownershipAllowed the same Set it hands decideM3, whose ownership arm accepts
+// Set OR array). These rows pinned nothing here because every row above passes
+// an ARRAY — and `(ownedBranches || []).filter(…)` threw
+// `TypeError: … .filter is not a function` on the real shape, which pi turns
+// into a BLOCK: the #376 post-ceremony delete allowance was refused by a crash
+// for every session that had renamed its own baseline in that repo.
+ok("allow #608: branch -D pid-owned, Set shape (the live caller's shape) → allowed", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: new Set(["feat/2"]) }) === true);
+ok("allow #608: Set shape, not-owned → false (no accidental union with the baseline)", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/other"], ownedBranches: new Set(["feat/2"]) }) === false);
+ok("allow #608: Set shape, multi-target with a trailing foreign branch → false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2", "feat/other"], ownedBranches: new Set(["feat/2"]) }) === false);
+ok("allow #608: Set shape, trunk stays protected even when listed owned", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["master"], ownedBranches: new Set(["master"]) }) === false);
+ok("allow #608: an unexpected shape (neither Set nor array) degrades to empty, never throws", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: { size: 1 } }) === false);
 ok("allow: bare pull own w/o effect evidence → refused (fail closed)", ownershipAllowed({ opKind: "pull", currentBranch: "feat/1", baselineBranch: "feat/1" }) === false);
 
 // ── #1144: the sync allowance is EFFECT-shaped, not verb-shaped ────────────

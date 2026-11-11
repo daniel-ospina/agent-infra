@@ -157,6 +157,13 @@ let isWorktreeCwd: (cwd: string) => boolean = () => true;      // bash path: fai
 let isWorktreeCwdWrite: (cwd: string) => boolean = () => false; // write/edit: fail-closed
 let extractPushDeleteBranch: (cmd: string) => string[] | null = () => null;
 let wholeCommandDeleteTargets: (verdict: string, command: string) => string[] = () => [];
+// #653: the fail-closed delete-target predicate. The default mirrors the stub
+// above — with no extractor there are no delete names to judge — so a stale
+// classify-git module keeps today's degradation and cannot invent a block.
+// ⛔ BOUND BY A typeof GUARD, never by the destructuring target list: a
+// destructuring assignment binds `undefined` for a missing export, which would
+// THROW here rather than degrade (see the binding site's comment).
+let unresolvableDeleteTargets: (targets: string[]) => string[] = () => [];
 let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
@@ -196,6 +203,12 @@ let stripHeredocData: (text: string, codeBodies?: unknown[] | null) => string = 
 let resolveTargetCheckout: (targetPath: string, cwd?: string) => { top: string; isMain: boolean } | null = () => null;
 let trackedRelsIn: (repoTop: string, rels: string[]) => string[] = () => [];
 let hasDotGitAncestor: (p: string) => boolean = () => false;
+// #608: the classifier's OWN local-branch-delete name extractor (the whole
+// `-d`/`-D`/`--delete` family incl. clusters and value-swallowing flags). Used
+// to spend the pid-owned claim for EVERY branch a command deletes, not just the
+// first invocation's. Fail-safe default: null — a failed import means no claim
+// is spent, which is the pre-#608 behaviour and can never false-block.
+let branchDeleteNames: (verb: string, args?: string[]) => string[] | null = () => null;
 let extractScriptPath: (command: string) => string | null = () => null;
 let extractScriptArgs: (command: string, scriptPath: string) => string[] = () => [];
 let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null, opts?: { viaInterpreter?: boolean }) => "allow" | "block" = () => "allow";
@@ -355,6 +368,9 @@ try {
   // keeps today's (strict) behaviour instead of throwing in the hook.
   if (typeof _m5.maskRemoteExecPayloads === "function") maskRemoteExecPayloads = _m5.maskRemoteExecPayloads;
   if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
+  // #608: namespace read for the same reason as #709/#627 above (the
+  // destructuring target list is pinned by test-module-load.mjs Part A).
+  if (typeof _m5.branchDeleteNames === "function") branchDeleteNames = _m5.branchDeleteNames;
   if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
   // #1919: read from the namespace for the same reason as #709/#627 above — the
   // destructuring target list is pinned by test-module-load.mjs Part A.
@@ -379,6 +395,19 @@ try {
   // #1139: the quote-aware shell tokenizer the pipe-seed walk uses (same skew
   // contract as above).
   if (typeof _m5.wtShellWords === "function") wtShellWords = _m5.wtShellWords;
+  // ⛔ #653 — NAMESPACE READ + typeof GUARD, NOT A DESTRUCTURING TARGET (review P1 of
+  // PR #3978, measured). The name was first added to the destructuring list above,
+  // and a destructuring ASSIGNMENT overwrites the declared fail-safe default with
+  // `undefined` when the export is absent — measured on this box (Node 24.21.0): a
+  // destructuring target whose key is missing from the source object binds
+  // `undefined`, it does not leave the earlier default in place — so on a
+  // stale/short classify-git.mjs `classifierLoaded` is
+  // still true and `_coordinatedDeleteBlock`'s call THROWS a TypeError on every
+  // delete-shaped command instead of degrading. That is the inverse of the default's
+  // own comment and of the #627/#628/#709/#3444 contract 15 lines below.
+  if (typeof _m5.unresolvableDeleteTargets === "function") {
+    unresolvableDeleteTargets = _m5.unresolvableDeleteTargets;
+  }
   // #967/#1484: the invocation's positional args feed the subcommand
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
@@ -574,6 +603,39 @@ function _mainTopLevel(): string | null {
 // anywhere — foreign deletes with no checked-out targets are allowed.
 function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: string } | null {
   if (!branchNames || branchNames.length === 0) return null;
+  // ── #653: FAIL CLOSED ON AN UNRESOLVABLE DELETE TARGET ──
+  // The #73 check below is only as good as the NAME it is given, and the names
+  // come from the command TEXT. A shell variable, a command substitution or an
+  // expansion makes the executed word differ from that text, so the lookup asks
+  // about a ref no worktree can hold (measured: `git push origin --delete
+  // "$PR_BRANCH"` → the literal `$PR_BRANCH`; `-d $(echo held/branch)` → the
+  // FRAGMENT `$(echo`) and the arm then ALLOWS the delete of a sibling-held
+  // branch. That is #73's protection defeated by ordinary shell usage — and the
+  // ceremony snippets in skills/commit-workflow assigned the branch to a
+  // variable first, so the DOCUMENTED path was the unmatched one.
+  //
+  // Option 2 of #653 (the smaller change, and the one that closes the class):
+  // an unresolvable target is REFUSED with the literal-ref remedy, rather than
+  // resolved-then-allowed. This runs BEFORE the checkout lookup, so it holds in
+  // every arm that reaches this seam (degradation, push-delete, later-segment
+  // deletes) and cannot be skipped by a state read that fails.
+  const unresolved = unresolvableDeleteTargets(branchNames);
+  if (unresolved.length > 0) {
+    return {
+      block: true,
+      reason: [
+        `⛔ Cannot delete — the delete target is not a literal ref name, so the guard cannot tell WHICH branch would be removed:`,
+        ...unresolved.map((b: string) => `   • ${b}`),
+        "",
+        "   Why: #73's coordinated-delete check matches the ref in the command TEXT.",
+        "   A variable, a command substitution or a glob is only known once the shell",
+        "   runs, so the guard would be checking a name no worktree can hold — and would",
+        "   let the delete through unchecked (#653).",
+        "   → Re-run with the LITERAL ref: `git push origin --delete feat/my-branch`.",
+        "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+      ].join("\n"),
+    };
+  }
   const worktreeBranches = getWorktreeBranches();
   const blockedBranches: string[] = [];
   for (const branchName of branchNames) {
@@ -5148,13 +5210,123 @@ const pendingBaseline = new Set<number>(); // lock contended at session_start �
 // create-new is blocked since #626 and never re-baselines.)
 const ownedBranches = new Map<number, Map<string, Set<string>>>();
 
-function _markOwned(pid: number, repoKey: string | null | undefined, branch: string) {
+function _markOwned(pid: number, repoKey: string | null | undefined, branch: string | null | undefined) {
   if (!repoKey || !branch) return;
   let byRepo = ownedBranches.get(pid);
   if (!byRepo) { byRepo = new Map(); ownedBranches.set(pid, byRepo); }
   let set = byRepo.get(repoKey);
   if (!set) { set = new Set(); byRepo.set(repoKey, set); }
   set.add(branch);
+}
+
+// #608: ownership is a statement about the refs this pid CURRENTLY holds, not an
+// append-only record of every name it ever touched. A name leaves the pid's
+// hands on exactly two observable events — its own rename AWAY from that name,
+// and its own approved LOCAL delete of it — and each unmarks here, so a name a
+// sibling later recreates cannot inherit this pid's destructive allowance (the
+// #598 own-dst overwrite and the #543/#376 own-branch `-D`).
+function _unmarkOwned(pid: number, repoKey: string | null | undefined, branch: string | null | undefined) {
+  if (!repoKey || !branch) return;
+  const set = ownedBranches.get(pid)?.get(repoKey);
+  if (set) set.delete(branch);
+}
+
+/** Will git's SOFT `-d` actually delete `name` in `cwd`? Faithful to git's own
+ *  `branch_merged()` (`builtin/branch.c`), NOT to the prose of git-branch(1):
+ *
+ *    "the branch must be fully merged in its upstream branch, or in HEAD if no
+ *     upstream was set"
+ *
+ *  The prose is silent on the case that decides this probe: an upstream
+ *  CONFIGURED but GONE (`[gone]` after `git fetch --prune`). `%(upstream)` still
+ *  prints the configured refname there, but `branch_merged()` resolves it and —
+ *  when it does not resolve — leaves `reference_rev` NULL and falls back to
+ *  `head_rev`, i.e. it treats "upstream set but gone" EXACTLY like "no upstream
+ *  set" and DELETES the merged branch (measured, git 2.43.0: `-d` rc 0 with the
+ *  remote ref absent). So the upstream is only consulted when it RESOLVES; the
+ *  unresolvable case must fall back to HEAD, or this probe answers "kept" where
+ *  git deletes — the fail-open direction, and a stale claim is exactly the #608
+ *  destruction.
+ *
+ *  Unverifiable (git error, missing ref) → false: the claim is KEPT, the
+ *  direction that cannot lose a ref. */
+function _softDeleteWillSucceed(cwd: string, name: string): boolean {
+  let target = "HEAD";
+  try {
+    const up = execFileSync("git", ["for-each-ref", "--format=%(upstream)", `refs/heads/${name}`],
+      // #1139: stderr is CAPTURED, never swallowed by "ignore" — the repo-wide
+      // pin in test.mjs forbids the `["ignore", "pipe", "ignore"]` shape, which
+      // leaked a failure message AND made the not-a-checkout arm dead code.
+      { cwd, timeout: 5000, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    if (up) {
+      // Only a RESOLVABLE upstream constrains the delete; a `[gone]` one makes
+      // git fall back to HEAD (see above). One extra spawn, soft-deletes only.
+      let resolves = false;
+      try {
+        execFileSync("git", ["rev-parse", "--verify", "--quiet", up],
+          { cwd, timeout: 5000, stdio: "ignore" });
+        resolves = true;
+      } catch { resolves = false; }
+      if (resolves) target = up;
+    }
+  } catch { return false; }
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", `refs/heads/${name}`, target],
+      { cwd, timeout: 5000, stdio: "ignore" });
+    return true;
+  } catch { return false; }
+}
+
+/** #608 — the LOCAL branch deletes this command performs, hard vs soft.
+ *
+ *  The classifier's `deleteTargets` describes ONE invocation (the first mutating
+ *  one), so a compound `git branch -D a && git branch -D b` reports only `a` —
+ *  and the M3 loop already resolves EVERY mutating invocation (stateMutations),
+ *  so the claim set is the union over all of them, named by the classifier's own
+ *  extractor (`branchDeleteNames`), never a re-derived spelling. Hard vs soft
+ *  comes from the SHIPPED classifier too: the single-invocation verdict is
+ *  `block:branch-force-delete` exactly for git's force-delete family. */
+function _localDeleteClaimNames(det: any): { hard: string[]; soft: string[] } {
+  const hard: string[] = [];
+  const soft: string[] = [];
+  if (!det || typeof branchDeleteNames !== "function") return { hard, soft };
+  const muts = (det.stateMutations && det.stateMutations.length > 0)
+    ? det.stateMutations
+    : [{ verb: det.stateVerb, args: det.stateArgs }];
+  for (const mu of muts) {
+    if (!mu || mu.verb !== "branch") continue;
+    let names: string[] | null = null;
+    try { names = branchDeleteNames("branch", mu.args ?? []); } catch { names = null; }
+    if (!names || names.length === 0) continue;
+    let isHard = true; // unverifiable → hard (spend unconditionally: fail-closed)
+    try {
+      isHard = classifyGitCommandDetailed(`git branch ${(mu.args || []).join(" ")}`).verdict === "block:branch-force-delete";
+    } catch { isHard = true; }
+    for (const n of names) (isHard ? hard : soft).push(n);
+  }
+  return { hard, soft };
+}
+
+/** Remove the ownership claims an ADMITTED command destroys.
+ *
+ *  A hard `-D` deletes whatever git can reach, so its name is spent outright.
+ *  A soft `-d` deletes ONLY a merged branch, so its name is spent only when
+ *  git's own predicate says it will go: spending a claim the command did not
+ *  lose turns the standard `-d` → `-D` escalation on the session's OWN branch
+ *  into a block (#3979 review P2). The other refusal — a branch checked out in
+ *  a worktree — needs no probe, because git refuses `-D` there too, so no
+ *  escalation is lost. Every probe is spawn-once and only runs when the command
+ *  actually contains a local delete. */
+function _spendLocalDeleteClaims(pid: number, repoKey: string | null | undefined,
+                                 cwd: string | null | undefined,
+                                 claims: { hard: string[]; soft: string[] }) {
+  if (claims.hard.length === 0 && claims.soft.length === 0) return;
+  for (const n of claims.hard) _unmarkOwned(pid, repoKey, n);
+  if (claims.soft.length === 0) return;
+  const where = cwd || process.cwd();
+  for (const n of claims.soft) {
+    if (_softDeleteWillSucceed(where, n)) _unmarkOwned(pid, repoKey, n);
+  }
 }
 
 function _recordBaseline(pid: number) {
@@ -5748,6 +5920,20 @@ export default function (pi: ExtensionAPI) {
               // being compound/wrapped) to stamp the marker it already holds.
               const discardReason = _worktreeDiscardBlock(localCommand, _currentHatchActive);
               if (discardReason) return { block: true, reason: discardReason };
+              // #608 (#3979 review P2): this arm is an ADMISSION, and it sits
+              // ~200 lines BEFORE the M3 funnel — so it used to admit a LOCAL
+              // branch delete with the claim left intact. It is not a theoretical
+              // path: with the hub disordered, `evaluateHubGateWithTargets` routes
+              // `git branch -D <b>` through the #436 (B) carve-out
+              // (classify-git.mjs branchDeleteNames + branchDeleteAllowance +
+              // sawRecovery) and answers "allowed". Spend here for the same
+              // reason the funnel does: every arm that ADMITS a local delete has
+              // to spend it, or the stale claim re-authorizes a #598 own-dst
+              // rename / #543 `-D` over a sibling's re-created branch. `pushDet`
+              // is the same classification this arm already pays for.
+              let m4RepoKey: string | null = null;
+              try { m4RepoKey = branchOwnership?.repoKey?.(resolve(process.cwd())) ?? null; } catch { m4RepoKey = null; }
+              _spendLocalDeleteClaims(pid, m4RepoKey, resolve(process.cwd()), _localDeleteClaimNames(pushDet));
               return undefined; // sanctioned recovery / read-only / non-push — done
             }
           }
@@ -6001,7 +6187,14 @@ export default function (pi: ExtensionAPI) {
       // admission returns below — the carve-out's own early return, or any
       // later gate that allows.
       let pendingRebaseline: (() => void) | null = null;
+      // #608: the ownership claims this command DESTROYS, spent at the ONE funnel
+      // every admitted arm returns through (#3979 review P1b: the push-delete and
+      // push/commit arms admitted a co-spelled `git branch -D` without spending,
+      // and a compound naming two local deletes spent only the first). Derived
+      // from EVERY mutating invocation, so an arm added later cannot skip it.
+      const localDeleteClaims = _localDeleteClaimNames(det);
       const admitAfterM3 = (): undefined => {
+        _spendLocalDeleteClaims(pid, eff?.repoKey ?? null, eff?.effectiveCwd ?? null, localDeleteClaims);
         if (pendingRebaseline) {
           const apply = pendingRebaseline;
           pendingRebaseline = null;
@@ -6124,7 +6317,18 @@ export default function (pi: ExtensionAPI) {
             const applyRebaseline = () => {
               if (branchOp.op === "rename" && branchOp.to) {
                 if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
-                  _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
+                  const ownedKey = baseline?.repoKey ?? muEff.repoKey;
+                  _markOwned(pid, ownedKey, branchOp.to);
+                  // #608: the renamed-AWAY name leaves this pid's control — git
+                  // moves the ref, so the old name is free for anyone. Keeping
+                  // it in the owned set is a STALE authorization: a sibling that
+                  // recreates the freed name would be clobbered by this pid's
+                  // next `git branch -M <baseline> <that name>` (the #598
+                  // own-dst allowance) or by its `git branch -D` (#543/#376).
+                  // The old name is `branchOp.from`; for the 1-pos
+                  // `branch -M <new>` form (from null) it is the checkout's
+                  // current branch — the same substitution decideM3 makes.
+                  _unmarkOwned(pid, ownedKey, branchOp.from ?? muEff.currentBranch);
                 }
               }
               _rebaseline(pid, reBaseline);
