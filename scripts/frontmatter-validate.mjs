@@ -492,9 +492,12 @@ export function tokenizeFrontmatter(yamlString) {
     // chomping-indicator indentation-indicator )`), so `|+2` (chomp-then-
     // indent) and `|2+` (indent-then-chomp) are BOTH valid headers and both
     // load. The single-order regex this replaces matched
-    // chomp-then-OPTIONAL-indent, so an indent-ONLY spelling (`|2`, `|1` —
-    // pinned accepted since before this PR by the `ok-block-explicit-indent-2`
-    // fixture) always worked, while every INDENT-THEN-CHOMP spelling —
+    // chomp-then-OPTIONAL-indent, so an indent-ONLY spelling always worked
+    // (`|2` — pinned accepted since before this PR by the
+    // `ok-block-explicit-indent-2` fixture; `|1` accepted by the same
+    // `[+-]?([1-9])?` branch, but pinned only by this PR's `VALUE_POOL` — the
+    // pre-PR tree carries no bare-`|1` fixture, only `|12` and `|1 token`),
+    // while every INDENT-THEN-CHOMP spelling —
     // `|2+`, `|2-`, `>1-` — fell through to the digit guard: a P0 on a skill
     // pi LOADS (probe yaml 2.9.0: all three load their body). Pre-existing,
     // and it is exactly the class this guard's comment used to claim was
@@ -516,7 +519,12 @@ export function tokenizeFrontmatter(yamlString) {
         emit({ t: TOKEN.TOKENIZE_ERROR, kind: 'block-header-trailing', line: lineNo, detail: 'non-comment token after a block scalar header' });
         return { nextI: startI };
       }
-      // chomp: group 2 (chomp-then-indent) or group 5 (indent-then-chomp)
+      // chomp: group 2 (chomp-then-indent) or group 5 (indent-then-chomp).
+      // ⛔ WRITE-ONLY FIELD: no rule reads `chomp` (`grep -n chomp` returns
+      // comments plus this emit), so the `|| bm[5]` fallback is grammar-correct
+      // (YAML 1.2 §8.1.1, both orders) but UNOBSERVABLE — no test reddens if it
+      // is wrong. A green row in the mutation table here is silence, not
+      // coverage; do not read it as one.
       const chomp = bm[2] || bm[5] || '';
       emit({ t: TOKEN.VALUE_BLOCK_HEADER, chomp, indent: keyIndent, line: lineNo });
       // explicit indent: group 3 (chomp-then-indent) or group 4 (indent-then-chomp)
