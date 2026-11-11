@@ -62,13 +62,13 @@ The broken pipeline produces issues that prescribe solutions before understandin
 
 ## Step 1 — Gather
 
-**What the source actually is.** The writer is `extensions/reflect-hook.ts` (agent-infra). On every session *quit* it appends exactly ONE JSON object per session to `~/.tortoise/session-events/<YYYY-MM-DD>.jsonl`, and — only when hosted capture is explicitly opted in (`"cloud": true` in `~/.pi/agent/tortoise-config.json`) **and** a key is present (a key alone never enables egress — #803) — POSTs the same payload to hosted tortoise `POST /v1/sessions`. A repo narrows it with `<repo>/.pi/tortoise-capture.json` `{"cloud": false}`; `TORTOISE_CAPTURE_CLOUD=0` denies for a session. The effective state is stated at session start and again at quit, so a silent capture outage cannot be mistaken for a quiet system.
+**What the source actually is.** The writer is `extensions/reflect-hook.ts` (agent-infra). On every session *quit* it appends ONE JSON object per session to `~/.tortoise/session-events/<YYYY-MM-DD>.jsonl` — except an empty session, which is skipped (`Skipped — empty session`) and leaves no record. It also POSTs the same payload to hosted tortoise `POST /v1/sessions`, but ONLY when hosted capture is explicitly opted in (`"cloud": true` in `~/.pi/agent/tortoise-config.json`) **and** a key is present (a key alone never enables egress — #803). A repo narrows it with `<repo>/.pi/tortoise-capture.json` `{"cloud": false}`; `TORTOISE_CAPTURE_CLOUD=0` denies for a session. The effective state is stated at session start and again at quit, so a silent capture outage cannot be mistaken for a quiet system.
 
 ⛔ **The record is a raw transcript, not a friction list.** Schema of one line (measured 2026-11-11 against `~/.tortoise/session-events/2026-11-11.jsonl`):
 
 ```
 { "session_id": "…",
-  "conversation": [ { "role": "user"|"assistant", "content": "…" } ],  # every turn, ≤5000 chars each, ≤1000 turns
+  "conversation": [ { "role": "user"|"assistant", "content": "…" } ],  # user/assistant TEXT turns only, ≤5000 chars each, ≤1000 turns
   "metadata": { "capturedAt", "charCount", "projectRoot", "prs": ["123", …], "source": "pi-session-quit", "team" },
   "harness": "pi", "machine_id": "…", "model": "…" }
 ```

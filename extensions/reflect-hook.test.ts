@@ -111,6 +111,21 @@ async function testBuildQuitPayload() {
   // exist — the silently-dead-consumer class #94 exists to kill, and one nothing
   // else detects (the skill is prose, the JSONL is data: neither fails). Pin the
   // key set so a breaking change fails HERE instead of at read time.
+  //
+  // SUPERSET, NOT EQUALITY (#3953 review, confirmed by mutation): the consumer is a
+  // TOLERANT READER — its jq selects named paths and defaults absent arrays
+  // (`.metadata.prs // []`) — so a field the writer ADDS breaks nothing, and an
+  // exact-set assertion would falsely red on a non-breaking change (measured: adding
+  // `metadata.schemaVersion` reddened this row and no other). A RENAME or a DROP is
+  // what silences the consumer, and both still redden here because the documented
+  // name stops being present. Pin presence, not exclusivity.
+  const documentedTopKeys = ["conversation", "harness", "machine_id", "metadata", "session_id"];
+  const documentedMetaKeys = ["capturedAt", "charCount", "projectRoot", "prs", "source", "team"];
+  const assertSuperset = (actual: string[], documented: string[], what: string) => {
+    const missing = documented.filter((k) => !actual.includes(k));
+    deepEqual(missing, [], `${what}: every key the skill's jq reads must be present (missing)`);
+  };
+
   await test("consumer contract: the key set friction-triage Step 1 documents", () => {
     const payload = buildQuitPayload({
       sessionId: "sess-contract",
@@ -127,17 +142,13 @@ async function testBuildQuitPayload() {
       attribution: testAttribution("deepseek/deepseek-v4-flash"),
     });
 
-    // Top level — `model` is conditional (tested above), everything else is fixed.
-    deepEqual(
-      Object.keys(payload).filter((k) => k !== "model").sort(),
-      ["conversation", "harness", "machine_id", "metadata", "session_id"],
-      "top-level keys the skill's jq reads: .session_id .conversation .metadata",
-    );
+    // Top level — `model` is conditional (tested above), so it is never required here.
+    assertSuperset(Object.keys(payload), documentedTopKeys, "top-level");
     // metadata — every one of these is named in Step 1's schema block.
-    deepEqual(
-      Object.keys(payload.metadata as Record<string, unknown>).sort(),
-      ["capturedAt", "charCount", "projectRoot", "prs", "source", "team"],
-      "metadata keys the skill's jq reads: .metadata.{capturedAt,charCount,projectRoot,prs,source,team}",
+    assertSuperset(
+      Object.keys(payload.metadata as Record<string, unknown>),
+      documentedMetaKeys,
+      "metadata",
     );
     // Turns — the skill slices `.content`, so content must be a string and role a string.
     const turns = payload.conversation as Array<Record<string, unknown>>;
