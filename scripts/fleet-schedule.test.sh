@@ -96,6 +96,8 @@ cleanup() {
   [ -f "$T/bare-state/loop.pid" ] && kill "$(cat "$T/bare-state/loop.pid" 2>/dev/null)" 2>/dev/null
   # §19's per-arm state dirs: a loop left behind here keeps ticking at a deleted directory.
   for _s in "$T"/s19*/loop.pid; do [ -f "$_s" ] && kill "$(cat "$_s" 2>/dev/null)" 2>/dev/null; done
+  # §20 (the build stamp) keeps its own state dir so it can never contend with §19's box lock.
+  for _s in "$T"/st20*/loop.pid; do [ -f "$_s" ] && kill "$(cat "$_s" 2>/dev/null)" 2>/dev/null; done
   for p in $(cat "$T"/pids 2>/dev/null); do kill "$p" 2>/dev/null; done
   rm -rf "$T"
 }
@@ -259,6 +261,22 @@ state_reset() {
   mkdir -p "$FLEET_SCHEDULE_STATE"
   unset FLEET_SCHEDULE_STATE_BACKUP
   export FLEET_SCHEDULE_STATE="$T/state"
+}
+
+code_stamp() { # code_stamp <state-dir> <pid> <path-the-loop-loaded> — a SIMULATED live loop's stamp
+  # ⛔ A HAND-BUILT loop.pid MODELS A LIVE LOOP, AND A LIVE LOOP FROM THIS BUILD ALSO RECORDS WHAT IT
+  # LOADED (#2961). A fixture that writes only the pidfile models the PRE-STAMP build instead — a
+  # state `--verify` now refuses by design, and case 20 pins that it does. So the simulation is made
+  # FAITHFUL here rather than the runtime made lenient there: this helper writes the stamp the real
+  # loop writes, with the digest of the file the fake loop claims to run.
+  python3 - "$1" "$2" "$3" <<'PY'
+import hashlib, json, os, sys, time
+state, pid, path = sys.argv[1], int(sys.argv[2]), os.path.abspath(sys.argv[3])
+with open(path, "rb") as fh:
+    digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+with open(os.path.join(state, "loop.code"), "w") as fh:
+    json.dump({"digest": digest, "pid": pid, "path": path, "started": time.time()}, fh)
+PY
 }
 
 # ── 1. the repo's own declarations are read, not re-listed ─────────────────────────────────────
@@ -1406,6 +1424,7 @@ rm -f "$FLEET_SCHEDULE_STATE/OFF"
 # nothing can re-stamp the tick and the staleness is deterministic, not a race.
 bash -c 'exec -a "fleet-schedule.py --loop" sleep 120' & fakepid=$!; echo "$fakepid" >> "$T/pids"
 printf '%s\n' "$fakepid" > "$FLEET_SCHEDULE_STATE/loop.pid"
+code_stamp "$FLEET_SCHEDULE_STATE" "$fakepid" "$SCHED"   # a live loop from THIS build also stamps
 busy_marker() { # busy_marker <deadline-offset> [<started-offset>] [<label>]
   python3 - "$FLEET_SCHEDULE_STATE" "$1" "${2:--900}" "${3:-com.test.echo}" <<'PY'
 import json, os, sys, time
@@ -4541,6 +4560,281 @@ grep -q 'Operation not supported' <<<"$out19aq" \
 grep -q 'cannot create the box lock' <<<"$out19aq" \
   && ok "19aq the create path is still NAMED as the create path" \
   || bad "19aq the create failure was not named: $out19aq"
+
+
+# ── 20. THE FILE AND THE PROCESS ARE DIFFERENT FACTS (#2961) ─────────────────────────────────
+# `staged_copy_report()` grades the FILE against the CHECKOUT. It structurally cannot see the second
+# seam: the loop is a LONG-LIVED Python process — it re-reads DECLARATIONS every pass (`cmd_loop` →
+# `load_jobs`) but never re-execs, so the module it loaded at startup is the code it runs for ever.
+# So after `cell-install.sh --install` refreshes the farm, the staged file byte-matches the checkout,
+# `--verify` compares the two FILES, and prints `SCHEDULE VERIFIED` over a cell whose ticking loop is
+# still the pre-refresh module — and `--start` could not help either, because it returned 0 at
+# `loop already running` before any staleness question was asked. `cloud-cell-bringup.sh` turns that
+# green into `CELL READY`, so an operator who lands a fix, refreshes, and watches the gate go green
+# believes the fix is live on that cell. It is not. The runtime now records WHAT IT LOADED
+# (`loop.code`: digest + pid + path) and grades the PROCESS against the file it recorded.
+case_ "20. the LIVE loop is graded against the file it loaded, and a stale one is restartable (#2961)"
+if [ "$(uname -s)" = "Darwin" ]; then
+  skip "--install/--start/--verify delegate to launchd on macOS, so the build stamp cannot be driven here"
+else
+  S20="$T/st20-staged"; ST20="$T/st20-state"
+  mkdir -p "$S20" "$ST20"
+  cp "$SCHED" "$S20/fleet-schedule.py"      # a STAGED copy — the cell's own delivery path
+  # ⛔ ITS OWN box-lock root: §19's may still hold another arm's loop, and a foreign holder would
+  # make every --install below answer "this state dir starts none" and grade nothing. And
+  # INFRA_ROOT/AGENT_INFRA_PATH are unset ON PURPOSE: this arm grades PROCESS against FILE, so the
+  # file-vs-checkout arm must stay out of it (a staged snapshot is not this working tree, and the
+  # `differs` failure would mask every assertion below — case 1f owns that arm).
+  s20() { env -u INFRA_ROOT -u AGENT_INFRA_PATH TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$ST20" \
+             FLEET_SCHEDULE_LOCK_ROOT="$T/st20-box-lock" \
+             python3 "$S20/fleet-schedule.py" "$@" 2>&1; }
+
+  out="$(s20 --install)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "20 baseline: --install on the staged copy exits 0" \
+                  || bad "20 baseline install failed (rc=$rc): $out"
+  pid20="$(cat "$ST20/loop.pid" 2>/dev/null)"
+  grep -q '"digest"' "$ST20/loop.code" 2>/dev/null \
+    && ok "20 the loop RECORDS a build stamp (digest + pid + path) when it starts" \
+    || bad "20 no build stamp was written: $(ls "$ST20" 2>&1)"
+  out="$(s20 --status)"
+  grep -q 'code=current' <<<"$out" \
+    && ok "20 --status answers WHICH BUILD the live loop runs (code=current)" \
+    || bad "20 --status does not report the running build: $out"
+  out="$(s20 --verify)"; rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "20 a loop running the file it loaded verifies clean (no false alarm)" \
+    || bad "20 a CURRENT loop was refused (rc=$rc): $out"
+
+  # THE DEFECT, EXACTLY: refresh the FILE the loop loaded and leave the process alone. This is the
+  # state `cell-install.sh --install` creates, and it is invisible to any file-to-file comparison
+  # because the file IS already the new one.
+  printf '\n# refreshed by the farm — the PROCESS above never loaded this\n' >> "$S20/fleet-schedule.py"
+  out="$(s20 --verify)"; rc=$?
+  [ "$rc" -eq 1 ] \
+    && ok "20 ⛔ --verify FAILS over a loop still executing the pre-refresh build" \
+    || bad "20 a cell whose loop runs the OLD build was certified (rc=$rc): $out"
+  grep -q 'THE FILE WAS REFRESHED AND THE PROCESS WAS NOT' <<<"$out" \
+    && ok "20 the failure names the seam (file refreshed, process not), not some other arm" \
+    || bad "20 the failure does not name the refreshed-file/old-process state: $out"
+  grep -q -- '--start' <<<"$out" \
+    && ok "20 the failure says how to make the landing live (--start)" \
+    || bad "20 the failure named no remedy: $out"
+  kill -0 "$pid20" 2>/dev/null \
+    && ok "20 --verify graded the PROCESS without killing it (a gate is not a restart)" \
+    || bad "20 --verify killed the loop it was asked to diagnose"
+
+  # `--start` is the revival verb, and it used to answer `loop already running` here: exit 0,
+  # nothing changed, no staleness question asked.
+  out="$(s20 --start)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "20 --start over a stale loop exits 0" \
+                  || bad "20 --start failed over a stale loop (rc=$rc): $out"
+  pid20b="$(cat "$ST20/loop.pid" 2>/dev/null)"
+  [ -n "$pid20b" ] && [ "$pid20b" != "$pid20" ] \
+    && ok "20 --start REPLACED the stale loop instead of reporting it as current" \
+    || bad "20 --start left the pre-refresh process running (pid $pid20 -> $pid20b)"
+  grep -q 'restarting the loop so the file on disk is the code that runs' <<<"$out" \
+    && ok "20 --start says what it did (a restart is an ACT, reported as one)" \
+    || bad "20 --start restarted without saying so: $out"
+  out="$(s20 --verify)"; rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "20 after the restart the same --verify passes (the landing is now LIVE)" \
+    || bad "20 --verify still refuses after a real restart (rc=$rc): $out"
+  grep -q "\"pid\": $pid20b" "$ST20/loop.code" 2>/dev/null \
+    && ok "20 the replacement loop stamped ITS OWN pid (the stamp is not the stale one)" \
+    || bad "20 the stamp was not rewritten by the new loop: $(cat "$ST20/loop.code" 2>&1)"
+
+  # ⛔ "COULD NOT COMPARE" NEVER READS AS CLEAN. A loop started by a build that PREDATES the stamp
+  # writes none, so absence is not evidence of being current — it is the pre-fix build, and it is
+  # graded stale (fail-closed) rather than cleared. Clearing it is the no-op-gate shape: the one arm
+  # that exists to stop a cell certifying an unrunnable build would be skipped on exactly the cells
+  # that have not been refreshed yet.
+  rm -f "$ST20/loop.code"
+  out="$(s20 --verify)"; rc=$?
+  [ "$rc" -eq 1 ] \
+    && ok "20 a MISSING stamp under a live loop is STALE, not clean (fail-closed)" \
+    || bad "20 a loop that cannot show which build it runs was certified (rc=$rc): $out"
+  grep -q 'NO build stamp' <<<"$out" \
+    && ok "20 the missing-stamp failure says there is NO evidence, and how to produce it" \
+    || bad "20 the missing-stamp failure is unattributed: $out"
+  out="$(s20 --start)"; rc=$?
+  pid20c="$(cat "$ST20/loop.pid" 2>/dev/null)"
+  [ "$rc" -eq 0 ] && [ -n "$pid20c" ] && [ "$pid20c" != "$pid20b" ] \
+    && ok "20 --start also replaces an UNSTAMPED loop (the pre-fix build is restartable)" \
+    || bad "20 --start left an unstamped loop in place (rc=$rc, pid $pid20b -> $pid20c): $out"
+
+  # ⛔ THE FALSE-ALARM DIRECTION, WHICH IS WHAT MAKES THE ARM USABLE. A rewrite that does not change
+  # the BYTES is not a new build: same digest, still current, still verified. An mtime or an inode
+  # would fail this, and an operator who is told "stale" over an identical file learns to ignore it.
+  cp "$S20/fleet-schedule.py" "$S20/rewritten" && mv "$S20/rewritten" "$S20/fleet-schedule.py"
+  out="$(s20 --verify)"; rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "20 a byte-identical rewrite is NOT stale (the comparison is content, not mtime)" \
+    || bad "20 an identical file was reported stale (a false alarm trains operators to ignore it): $out"
+
+  # ⛔ THE STAMP DOES NOT OUTLIVE ITS LOOP. A `loop.code` left behind after a stop is a record on
+  # disk claiming a build is live when nothing is running.
+  s20 --stop >/dev/null 2>&1
+  [ ! -f "$ST20/loop.code" ] \
+    && ok "20 --stop removes the stamp with the pidfile (no record of a loop that is gone)" \
+    || bad "20 the build stamp outlived its loop: $(cat "$ST20/loop.code" 2>&1)"
+
+  # ── 20b. F1 — `--install` REPAIRS a recycled pid, and it did not ────────────────────────────────
+  # `loop_pid()` answers LIVENESS only: a pidfile holding a recycled pid (a lane, the controller, a
+  # supervisor) is TRUTHY while `pid_is_our_loop` says it is not the loop. Gating the spawn on
+  # `if not pid:` therefore started nothing in exactly the state the pre-fix `else:` repaired — and
+  # `--install` is the verb `cloud-cell-bringup.sh --check` runs and `die`s on, so the box was left
+  # with no scheduler at all. Case 4b pins this state for `--verify` and case 13 for `--start`;
+  # NOTHING drove `--install`, which is why the suite was green over it.
+  rm -f "$ST20/OFF"   # §20a's --stop recorded a decision; --install refuses to reverse it (by design)
+  sleep 60 & bystander20=$!; echo "$bystander20" >> "$T/pids"
+  printf '%s\n' "$bystander20" > "$ST20/loop.pid"
+  out="$(s20 --install)"; rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "20b F1: --install REPAIRS a recycled pid in loop.pid (it used to start nothing and fail)" \
+    || bad "20b F1: --install failed over a recycled pid (rc=$rc) — the box is left unscheduled: $out"
+  pid20d="$(cat "$ST20/loop.pid" 2>/dev/null)"
+  [ -n "$pid20d" ] && [ "$pid20d" != "$bystander20" ] \
+    && ok "20b F1: loop.pid now names a DIFFERENT pid than the recycled one" \
+    || bad "20b F1: loop.pid still holds the recycled pid ($pid20d)"
+  # ⛔ THIS IDENTITY READ IS PORTABLE ON PURPOSE. `/proc/<pid>/cmdline` is Linux-only, and this file's
+  # two pre-existing reads are already AT their counted budget (`scripts/portability-baseline.tsv`:
+  # `scripts/fleet-schedule.test.sh procfs-macos-absent 2`), so a third would RAISE the ratchet — the
+  # one direction `scripts/check-portability-traps.sh` refuses (`live > baseline`, exit 1). `ps` is
+  # that gate's own named replacement, and it answers the same question on BOTH hosts — so this arm
+  # now also ASSERTS on macOS instead of silently skipping there. `-ww` is load-bearing: BSD `ps`
+  # truncates `args` to the screen width, and the state dir path is long enough to lose `--loop`
+  # (the same reason `ci_runner_pool.sh:771` uses it).
+  args20d="$(ps -ww -o args= -p "$pid20d" 2>/dev/null)"
+  if [ -n "$args20d" ]; then
+    grep -q -- '--loop' <<<"$args20d" \
+      && ok "20b F1: the pid it recorded really is fleet-schedule --loop" \
+      || bad "20b F1: the recorded pid is not a scheduler: $args20d"
+  else
+    skip "20b F1: no readable command line for pid $pid20d on this platform"
+  fi
+  kill -0 "$bystander20" 2>/dev/null \
+    && ok "20b F1: the unrelated process was NOT signalled (a repair is not a kill)" \
+    || bad "20b F1: --install killed the process that owned the recycled pid"
+  kill "$bystander20" 2>/dev/null
+
+  # ── 20c. F2 — staleness must be read from the pid the GATE grades, not only the pidfile ────────
+  # `--verify` falls back to the identity-verified box lock when `loop.pid` is absent (a state this
+  # file documents as reachable: a failed pidfile write leaves the previous file, 19ad removes it),
+  # and 19ad/19q pin that state for the POINTER and the OFF switch. Nothing crossed it with §20, so
+  # `--start` read only the pidfile — saw no loop — restarted NOTHING, and answered 0 over a stale
+  # loop while `--verify` printed "restart it: --start". A named remedy that no-ops.
+  s20 --install >/dev/null 2>&1               # a fresh, CURRENT loop
+  pid20e="$(cat "$ST20/loop.pid" 2>/dev/null)"
+  kill -0 "$pid20e" 2>/dev/null \
+    && ok "20c F2 baseline: a real loop is live before the pidfile is removed (the arm grades something)" \
+    || bad "20c F2 baseline: no live loop — this arm would grade an empty state"
+  printf '\n# refreshed again — the running process still holds the previous module\n' \
+    >> "$S20/fleet-schedule.py"
+  rm -f "$ST20/loop.pid"                     # …and its pidfile is gone (the ENOSPC / 19ad state)
+  out="$(s20 --verify)"; rc=$?
+  [ "$rc" -eq 1 ] && grep -q 'THE FILE WAS REFRESHED AND THE PROCESS WAS NOT' <<<"$out" \
+    && ok "20c F2 setup: --verify fails stale with NO pidfile (it grades the box-lock holder)" \
+    || bad "20c F2 setup: --verify did not read the stale holder without a pidfile (rc=$rc): $out"
+  out="$(s20 --start)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "20c F2: --start over a stale, pidfile-less own holder exits 0" \
+                  || bad "20c F2: --start exited $rc: $out"
+  grep -q 'restarting the loop so the file on disk is the code that runs' <<<"$out" \
+    && ok "20c F2: ⛔ --start RESTARTED it — the remedy --verify named is no longer a no-op" \
+    || bad "20c F2: --start answered with nothing / 'already running' over a stale loop (the named remedy no-ops): $out"
+  pid20f="$(cat "$ST20/loop.pid" 2>/dev/null)"
+  [ -n "$pid20f" ] && [ "$pid20f" != "$pid20e" ] \
+    && ok "20c F2: the pid actually changed (a restart is an act, not a message)" \
+    || bad "20c F2: no new loop was started (pid $pid20e -> $pid20f)"
+  out="$(s20 --verify)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "20c F2: and the same --verify then passes" \
+                  || bad "20c F2: --verify still refuses after the restart (rc=$rc): $out"
+
+  # ── 20d. F2 (foreign holder) — this home cannot restart another home's loop, so it must SAY so ──
+  # On a two-home box the box's scheduler belongs to whichever state dir holds the lock (#2890).
+  # `--start` correctly refuses to spawn a competitor — but it used to do so silently about the ONE
+  # thing the operator was told to do (`--verify` rebinds to the holder and fails `stale`), leaving
+  # them with a repair instruction and no home to run it in. The exit code must stay 0 (the box IS
+  # scheduled and `cloud-cell-supervisor.sh` keys on it) and the stamp must be read from the HOLDER.
+  ST20B="$T/st20b-state"; mkdir -p "$ST20B"
+  s20b() { env -u INFRA_ROOT -u AGENT_INFRA_PATH TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$ST20B" \
+               FLEET_SCHEDULE_LOCK_ROOT="$T/st20-box-lock" \
+               python3 "$S20/fleet-schedule.py" "$@" 2>&1; }
+  s20 --stop >/dev/null 2>&1               # home A must own NO loop before B can hold the box
+  s20b --install >/dev/null 2>&1           # home B's loop takes the box lock
+  sleep 1
+  kill -0 "$(cat "$ST20B/loop.pid" 2>/dev/null)" 2>/dev/null \
+    && ok "20d baseline: home B's loop holds the box (the arm grades a REAL foreign holder)" \
+    || bad "20d baseline: home B's loop never came up, so the foreign-holder arm grades nothing"
+  printf '\n# and B is refreshed out from under its loop\n' >> "$S20/fleet-schedule.py"
+  out="$(s20 --start)"; rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "20d a foreign holder still exits 0 from this home (the box is scheduled — the supervisor keys on it)" \
+    || bad "20d --start exited $rc over a foreign holder: $out"
+  grep -q 'STALE' <<<"$out" \
+    && ok "20d ⛔ the FOREIGN holder's staleness is REPORTED, not silent" \
+    || bad "20d --start said nothing about a foreign holder running an older build: $out"
+  grep -q "FLEET_SCHEDULE_STATE=$ST20B" <<<"$out" \
+    && ok "20d the remedy names the HOME that can actually restart it" \
+    || bad "20d the message does not name the holder's state dir: $out"
+  grep -q 'restarting the loop' <<<"$out" \
+    && bad "20d this home restarted ANOTHER home's loop (it must not move the box's scheduler): $out" \
+    || ok "20d this home did not restart the foreign loop"
+  s20b --stop >/dev/null 2>&1
+
+  # ── 20e. ROUND-2 F1 — a pidfile naming ANOTHER home's live loop is not a title deed ──────────────
+  # `pid_is_our_loop` proves only "a fleet-schedule --loop": EVERY loop on the box satisfies it, so a
+  # `loop.pid` holding a RECYCLED pid that landed on a foreign home's loop (the #3029 hazard; a state
+  # dir restored from another home reaches it too) resolved to a pid this verb does not own. The new
+  # stale branch then graded it against THIS dir's stamp (unstamped BY CONSTRUCTION — a false
+  # statement about a loop that stamped correctly at home), SIGTERMed it and spawned a successor from
+  # here, silently MOVING the box's scheduler. Pre-fix `--install` printed `loop already running` and
+  # let `cmd_verify` rebind to the holder and grade the real loop; nothing was signalled. The box
+  # lock is the ownership fact.
+  rm -f "$ST20/OFF" "$ST20B/OFF"      # both stops above recorded a decision; --install honours it
+  s20b --install >/dev/null 2>&1                  # B (re)takes the box
+  printf '\n# and the loop at B predates this refresh\n' >> "$S20/fleet-schedule.py"   # → B is STALE
+  sleep 1
+  pid20B="$(cat "$ST20B/loop.pid" 2>/dev/null)"
+  kill -0 "$pid20B" 2>/dev/null \
+    && ok "20e baseline: B's loop really holds the box and is stale (the arm cannot pass vacuously)" \
+    || bad "20e baseline: B's loop is not live — the ownership arm would grade nothing"
+  printf '%s\n' "$pid20B" > "$ST20/loop.pid"      # this home's pidfile names B's LIVE loop
+  out="$(s20 --install)"; rc=$?
+  [ "$rc" -eq 1 ] && grep -q 'THE FILE WAS REFRESHED AND THE PROCESS WAS NOT' <<<"$out" \
+    && ok "20e --install reports the foreign holder's staleness (via cmd_verify, which rebinds to it)" \
+    || bad "20e --install did not report the stale foreign holder (rc=$rc): $out"
+  grep -q 'restarting the loop' <<<"$out" \
+    && bad "20e ⛔ this home TORE DOWN another home's loop and re-homed the box's scheduler: $out" \
+    || ok "20e ⛔ it did NOT terminate a loop it does not own (no re-homing under #2890)"
+  grep -q "FLEET_SCHEDULE_STATE=$ST20B" <<<"$out" \
+    && ok "20e the message names the home that must act" \
+    || bad "20e the message does not name the owning home: $out"
+  kill -0 "$pid20B" 2>/dev/null \
+    && ok "20e the foreign loop SURVIVED (it was never signalled)" \
+    || bad "20e --install SIGTERMed another state dir's live loop"
+  [ "$(cat "$ST20B/loop.pid" 2>/dev/null)" = "$pid20B" ] \
+    && ok "20e the box's scheduler was not moved to this home" \
+    || bad "20e the box's scheduler was re-homed (B's pidfile now reads '$(cat "$ST20B/loop.pid" 2>&1)')"
+  s20b --stop >/dev/null 2>&1
+
+  # ── 20f. ROUND-2 F2 — a restart must re-record the declaration pointer ────────────────────────
+  # The successor inherits the CALLER's `TEMPLATES_DIR`. A pointer written only by the pre-restart
+  # arm then names a set the running loop does NOT read (19al/19ap's measured state: "pointer tplA ->
+  # tplB while loop.log still start-named tplA"), and a later bare-env `--start` — the supervisor's
+  # revival, which is why the pointer is load-bearing — resurrects a loop over the wrong set.
+  # `cmd_start` records on `started`; `--install` did not.
+  rm -f "$ST20/OFF"
+  s20 --install >/dev/null 2>&1                     # a current loop, and its pointer is correct
+  printf '\n# refreshed once more for the pointer arm\n' >> "$S20/fleet-schedule.py"
+  printf '%s\n' "$T/a-decoy-templates-dir" > "$ST20/templates-dir"   # a set nothing runs
+  out="$(s20 --install)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "20f --install restarts a stale loop and still exits 0" \
+                  || bad "20f --install exited $rc over a stale loop: $out"
+  [ "$(cat "$ST20/templates-dir" 2>/dev/null)" = "$GOOD" ] \
+    && ok "20f ⛔ the restart RE-RECORDED the pointer to the set the successor actually runs" \
+    || bad "20f the pointer still names a set nothing runs ('$(cat "$ST20/templates-dir" 2>&1)') — a later bare-env --start revives the wrong set"
+  s20 --stop >/dev/null 2>&1
+fi
 
 
 echo
