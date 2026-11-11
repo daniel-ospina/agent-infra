@@ -3944,10 +3944,18 @@ export function _branchInvMutatesBranchState(args) {
  * #594: git's own top-level commands, so the classifier can answer "could this
  * word be a git builtin?" BY ITSELF.
  *
- * Measured with `git --list-cmds=builtins,main | sort -u` (163 names, git
- * 2.43.0) — THE WHOLE LIST AND NOTHING ELSE. Regenerate with that command; keep
- * it COMPLETE rather than minimal, because a real builtin missing here is a
- * false block in a main checkout.
+ * Measured with `git --list-cmds=builtins` (140 names, git 2.43.0) — THE WHOLE
+ * LIST AND NOTHING ELSE, and that is the ONLY command that regenerates it. Keep
+ * it COMPLETE rather than minimal: a real builtin missing here is a false block
+ * in a main checkout.
+ *
+ * ⛔ DO NOT regenerate with `--list-cmds=builtins,main` (163). The 23 extra names
+ * are `git-<name>` EXECUTABLES (submodule, subtree, filter-branch, request-pull,
+ * mergetool, instaweb, web--browse, remote-*, shell, …), not builtins, and git
+ * falls back to the ALIAS for one when its external is absent — measured
+ * (git 2.43, no `git-p4` installed): `git -c alias.filter-branch='branch -fq v1
+ * main' filter-branch` created the branch while the classifier read it as a
+ * trusted builtin. Listing one is fail-OPEN; see the R4e/R4e2 pins.
  *
  * ⛔ DO NOT ADD the historical contrib commands (cvsimport, archimport, p4, gui,
  * gitk, citool, cvsexportcommit, cvsserver). They are NOT builtins: git falls
@@ -3976,6 +3984,14 @@ export function _branchInvMutatesBranchState(args) {
  * so a definition of that name must be EXPANDED rather than dropped — the
  * opposite of every other builtin name. (Unreachable on a pre-2.52 git, where
  * the alias is simply ignored; expanding it there only over-blocks.)
+ *
+ * ⛔ SNAPSHOT HAZARD, recorded deliberately: this list is git >= 2.52's. If a
+ * LATER git marks another builtin deprecated, that name starts consulting its
+ * alias first while this file keeps DROPPING its definition — i.e. the drop rule
+ * becomes fail-OPEN for it, silently. Every one of the 140 census names was
+ * measured on git 2.43.0 (`git -c alias.<n>='branch -fq victim <sha>' <n>`) and
+ * none consults an alias today, so the rule is sound on the running git; a
+ * git upgrade that adds a DEPRECATED row must add it here in the same change.
  */
 const GIT_ALIAS_PRECEDES_BUILTIN = new Set(["pack-redundant", "whatchanged"]);
 

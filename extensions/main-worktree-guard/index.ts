@@ -6371,7 +6371,21 @@ export default function (pi: ExtensionAPI) {
               reason: "⛔ Branch-state command blocked — the command's target repository is unresolved (fail-closed; #805).",
             };
           }
-          if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
+          // #594 (round-6 review): the WORKTREE EXEMPTION IS NOT UNIVERSAL.
+          // It exists because a linked worktree's checkout (HEAD, index) is its
+          // OWN — but two of the op classes below are not checkout state at all:
+          //   · `ref-write` mutates a ref in the namespace SHARED by the hub and
+          //     every sibling worktree (measured: from a linked worktree `git
+          //     symbolic-ref refs/heads/victim refs/heads/main` rc 0 re-points
+          //     the branch the MAIN checkout then reads);
+          //   · `alias-opaque` cannot establish locality in the first place — the
+          //     hidden command may carry `-C <hub>` / `--git-dir=<hub>`, in which
+          //     case the resolution sees the worktree while git writes the hub.
+          //     That is exactly the premise the exemption rests on, so an
+          //     unreadable verb never earns it.
+          if (muEff.isWorktree && branchOp.op !== "ref-write" && branchOp.op !== "alias-opaque") {
+            continue; // THIS mutation is wt-scoped — exempt
+          }
           const muRepoKey = muEff.repoKey ?? "";
           const sessionBaseline = baselines.get(pid);
           // #607: judge this segment against the baseline the compound will

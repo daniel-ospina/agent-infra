@@ -449,6 +449,25 @@ async function partB() {
     expectTrue("B10m: #594 a transient `-c` does not license a later segment's persisted alias",
       !!transientLeak && transientLeak.block === true, `handler returned ${JSON.stringify(transientLeak)}`);
 
+    // ── B11: #594 (round 6) — the WORKTREE exemption is not universal ──
+    // A linked worktree's checkout is its own, but the REF NAMESPACE is shared
+    // with the hub and every sibling worktree, and an unreadable verb cannot
+    // establish locality at all (it may carry `-C <hub>`). Both were reproduced
+    // rc 0 from a linked worktree at the previous head.
+    const probeWt = join(tmp, "hub-wt");
+    execSync(`git -C "${repo}" worktree add -q -b ${JSON.stringify("wt-probe")} "${probeWt}"`, { stdio: "ignore" });
+    process.chdir(probeWt);
+    const wtRefWrite = await callBash("git symbolic-ref refs/heads/wtvictim refs/heads/main");
+    expectTrue("B11a: #594 a `ref-write` from a LINKED WORKTREE is BLOCKED (shared ref namespace)",
+      !!wtRefWrite && wtRefWrite.block === true, `handler returned ${JSON.stringify(wtRefWrite)}`);
+    const wtOpaque = await callBash("git br");
+    expectTrue("B11b: #594 an opaque alias invocation from a LINKED WORKTREE is BLOCKED (locality unprovable)",
+      !!wtOpaque && wtOpaque.block === true, `handler returned ${JSON.stringify(wtOpaque)}`);
+    const wtBranchForce = await callBash("git branch -f wtvictim2 main");
+    expectTrue("B11c: control — an ordinary branch-state op from a LINKED WORKTREE keeps its existing exemption",
+      wtBranchForce === undefined, `handler returned ${JSON.stringify(wtBranchForce)}`);
+    process.chdir(repo);
+
     // ── B9: #1144 — the shared-baseline sync allowance is EFFECT-shaped ──
     // The allowance is BASELINE-keyed, so the session baseline must be
     // recorded exactly as a real session records it: fire the registered
