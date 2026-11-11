@@ -294,10 +294,32 @@ if (typeof stripTypeScriptTypes !== "function" ||
       why: "ordering control: with a target held NOWHERE the #73 check adds nothing and the legacy " +
            "arm still owns the verdict — the hoist did not turn the class into a #73 block" },
     // ── the EXTRACTOR FALLBACK's own pin (mutant 5) ──
+    // ── the EXTRACTOR FALLBACK's own pin (mutant 5) ──
     { id: "B14", dir: "wt", expect: "block", marker: "checked out in",
       cmd: "git reset --hard && git push origin main && git push origin --delete held",
       why: "#506: the delete lives in the SECOND push invocation, so `pushTargets` is empty and ONLY " +
            "the whole-command extractor can attribute it — the one row that pins that fallback" },
+    // ── review round 6, FINDING 1: EVERY delete push in the compound ──
+    // The delete lives in the FIRST push invocation here, so the classifier's
+    // later-segment fold-in does NOT run and `pushTargets` is just ["stale"].
+    // Pre-fix the second delete's target was therefore dropped and this row was
+    // ADMITTED (measured), destroying `held`'s upstream from a worktree.
+    { id: "B16", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git reset --hard && git push origin --delete stale && git push origin --delete held",
+      why: "round-6 finding 1: the FIRST push carries the delete, so only the whole-command " +
+           "extractor attributes the SECOND push's held target — preferring `pushTargets` lost it" },
+    { id: "B16b", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git reset --hard && git push origin -d stale && git push origin -d held",
+      why: "…and the #443 `-d` twin runs the same attribution path (the spellings must not split)" },
+    { id: "B16c", dir: "wt", expect: "allow",
+      cmd: "git reset --hard && git push origin --delete stale && git push origin --delete stale2",
+      why: "control: BOTH targets held nowhere ⇒ still WORKTREE-EXEMPT — the union is an " +
+           "attribution fix, not a blanket refusal of a multi-delete compound" },
+    { id: "B17", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git reset --hard && git push origin -do held --delete stale",
+      why: "union-NOT-replace: `pushTargets` is [held,stale] while the extractor sees only " +
+           "[stale] (the documented -o value over-capture). Adopting the extractor wholesale " +
+           "would ALLOW this; the union keeps `held` attributed" },
   ];
 
   /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
@@ -590,16 +612,52 @@ if (typeof stripTypeScriptTypes !== "function" ||
           label: "extractor fallback removed",
           file: "index.ts",
           revert: (src) => src.replace(
-            "        const legacyDeletes = det.pushTargets.length > 0\n          ? det.pushTargets\n          : (extractPushDeleteBranch(localCommand) ?? []);",
+            "        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)\n          ? (extractPushDeleteBranch(localCommand) ?? [])\n          : [];\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];",
             "        const legacyDeletes = det.pushTargets; // MUTANT: no extractor fallback",
           ),
           // B6 still BLOCKS (LEGACY_BLOCK owns the reset) — the fallback's loss is
           // only visible where the legacy arm exempts, so the pin is B10's
           // later-segment analogue: a worktree compound whose delete is in the
-          // SECOND push invocation. That row is B14 below, added for this mutant.
-          expectRed: ["B14"],
+          // SECOND push invocation (B14). B16/B16b redden here TOO — round 6's row
+          // also depends on the extractor, so removing it re-opens that hole
+          // (measured: under this mutant B16 is ALLOWED again). B17 stays green
+          // because its `held` target comes from `pushTargets` itself.
+          expectRed: ["B14", "B16", "B16b"],
           redCheck: (r) => !blocked(r),
-          expectGreen: ["B6", "B10"],
+          expectGreen: ["B6", "B10", "B17"],
+        },
+        {
+          // (9) THE ROUND-6 DEFECT REINTRODUCED: `pushTargets` preferred outright
+          // whenever it is non-empty, so a SECOND delete push in the same
+          // compound loses its attribution. B16/B16b go RED (allowed); B16c
+          // stays green (it was a control either way) and B14 stays green —
+          // its delete is in the second push, which takes the empty-list path.
+          label: "first push's targets only (round-6 finding 1 reintroduced)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)\n          ? (extractPushDeleteBranch(localCommand) ?? [])\n          : [];\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];",
+            "        const legacyDeletes = det.pushTargets.length > 0\n          ? det.pushTargets\n          : (extractPushDeleteBranch(localCommand) ?? []); // MUTANT: first push only",
+          ),
+          expectRed: ["B16", "B16b"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B6", "B10", "B14", "B16c", "B17"],
+        },
+        {
+          // (10) THE UNION COLLAPSED TO A REPLACE: when the extractor finds
+          // anything it is used ALONE, discarding the parsed targets it does not
+          // see (the `-o` value over-capture). B17 goes RED — the held target in
+          // `pushTargets` vanishes — while B16 stays green (the extractor is a
+          // superset for a pure delete compound). This is the row that pins the
+          // UNION choice over the narrower replace.
+          label: "extractor replaces the parsed targets (union collapsed)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "          : [];\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];",
+            "          : [];\n        const legacyDeletes = extractedDeletes.length > 0 ? extractedDeletes : det.pushTargets; // MUTANT: replace, not union",
+          ),
+          expectRed: ["B17"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B6", "B10", "B14", "B16"],
         },
       ];
 
