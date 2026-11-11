@@ -156,6 +156,11 @@ cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key` a
     # normaliser it folded into `*` -> `load`, which is the #2991 defect exactly: a bool number, a peer
     # yield, and an operator reading "load" about a missing key.
     key) printf 'key' ;;
+    # ⛔ `stale` IS THE STALE-CHECKOUT REFUSAL (agent-infra#3932, this change's review). It is named here
+    # for the reason `capability` and `skew` are: this function's `case` chooses the VALUE the arm below
+    # dispatches on, so folding it into `*` would report a LOAD reading for a box whose model call
+    # succeeded and whose checkout is behind — and the operator would wait for load to fall.
+    stale) printf 'stale' ;;
     *) printf 'load' ;;
   esac
   return 0
@@ -318,6 +323,13 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # "which codes are free" from the tree alone reads 81 as free and re-claims it green. That is the
       # exact failure this PR exists to prevent, so the sentence must not be read as a registry entry.
       skew) _cap_rc=83 ;;
+      # 85 is spawn-gate.sh's AGENT_STALE_CODE_REFUSED (agent-infra#3932, this change's review). ⛔ NOT 71:
+      # every reader treats 71 as a property of THIS box and therefore a PEER's to take, and a stale
+      # checkout is measured stale on every cell of the wave (496-7093 commits behind at the time of
+      # writing) — so the item would circulate between boxes that refuse identically and never be built.
+      # The chain must still STOP here (no PR can appear until the checkout is advanced) and the EXIT
+      # trap still releases refs/claims/issue-$N, because the item is fine and must not stay stranded.
+      stale) _cap_rc="${AGENT_STALE_CODE_REFUSED:-85}" ;;
       # 82 is key-gate.sh's KEY_GATE_REFUSED (#3331): the lane REFUSED before spawning the agent because
       # its environment holds no model credential for the provider. Named rather than folded, for the
       # same reason as every other arm: an operator told 75 waits for load to fall on a box whose
