@@ -531,6 +531,11 @@ const REF_MATRIX = [
   ["update-ref", ["--s"], true],
   ["update-ref", ["--no-stdin"], false],
   ["update-ref", ["$R", "HEAD"], true],
+  // #594 review round 2 — the clustered `-m` VALUE slot.
+  ["symbolic-ref", ["-qm", "why", "refs/heads/victim", "refs/heads/main"], true],
+  ["symbolic-ref", ["-qqm", "why", "refs/heads/victim", "refs/heads/main"], true],
+  ["symbolic-ref", ["-md", "refs/heads/P3", "refs/heads/main"], true],
+  ["update-ref", ["-dm", "why", "refs/heads/victimD", "HEAD"], true],
 ];
 const cliWrite = (verb, args) => (verb === "symbolic-ref"
   ? cg.symbolicRefWriteTarget(args)

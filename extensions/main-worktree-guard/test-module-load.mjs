@@ -435,6 +435,16 @@ async function partB() {
     const symRefRead = await callBash("git symbolic-ref refs/heads/main");
     expectTrue("B10i: control — `git symbolic-ref refs/heads/main` (single positional = QUERY) stays ALLOWED",
       symRefRead === undefined, `handler returned ${JSON.stringify(symRefRead)}`);
+    // Round-2 review findings, at the handler layer.
+    const aliasSegOrder = await callBash("git -c alias.x='branch -fq victimA main' x && git -c alias.x=status x");
+    expectTrue("B10j: #594 a LATER benign redefinition does not launder an EARLIER destructive alias segment",
+      !!aliasSegOrder && aliasSegOrder.block === true, `handler returned ${JSON.stringify(aliasSegOrder)}`);
+    const clusteredM = await callBash("git symbolic-ref -qm why refs/heads/v2 refs/heads/main");
+    expectTrue("B10k: #594 `-qm why` (clustered -m value slot) is BLOCKED",
+      !!clusteredM && clusteredM.block === true, `handler returned ${JSON.stringify(clusteredM)}`);
+    const nonBuiltin = await callBash("git p4");
+    expectTrue("B10l: #594 a non-builtin verb with no visible definition (`git p4`) is BLOCKED, not trusted",
+      !!nonBuiltin && nonBuiltin.block === true, `handler returned ${JSON.stringify(nonBuiltin)}`);
 
     // ── B9: #1144 — the shared-baseline sync allowance is EFFECT-shaped ──
     // The allowance is BASELINE-keyed, so the session baseline must be
