@@ -1139,6 +1139,40 @@ dexpect("#594-R3c control — a later `--config-env` beats an earlier `-c` (beni
   `EE=status git -c alias.x='branch -fq victimMIX2 main' --config-env=alias.x=EE x`,
   { verb: "status", branchState: false });
 
+// ── #594 review round 4: definition LIFETIMES, and the builtins-only census ──
+// A `-c` ends with its own process, so it must not reclassify a LATER segment —
+// measured: `git -c alias.br=status br && git br` ran the PERSISTED (destructive)
+// alias.br in segment 2, while a command-global map had it as `status`.
+dexpect("#594-R4a a transient `-c` does not leak into the next segment (segment 2 stays opaque)",
+  `git -c alias.br=status br && git br`, { branchState: true });
+dexpect("#594-R4b a `git config -f <other-file>` write is not visible to a later plain `git br`",
+  `git config -f /tmp/pm594-other.cfg alias.br status && git br`, { branchState: true });
+dexpect("#594-R4c control — a PLAIN `git config alias.br status && git br` persists, so segment 2 IS `status` (not opaque)",
+  `git config alias.br status && git br`, { branchState: false, stateOpCount: 0 });
+dexpect("#594-R4d `git config --unset alias.br && git br` leaves definedness unknown → opaque",
+  `git config --unset alias.br && git br`, { branchState: true });
+// The census is `git --list-cmds=builtins` and NOTHING else: a `main` command
+// (`filter-branch`, `subtree`, `submodule`, …) is an external `git-<name>` that
+// git can fall back to an alias for, so treating one as a builtin is fail-OPEN.
+dexpect("#594-R4e a non-builtin `main` command name EXPANDS its alias (`filter-branch`)",
+  `git -c alias.filter-branch='branch -fq v1 main' filter-branch`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "v1", "main"] });
+dexpect("#594-R4e2 `git subtree …` (an external command, not a builtin) is opaque",
+  `git subtree add -P x y`, { branchState: true });
+// The SAME two defects reachable through spellings the round-3 rows above do not walk: a
+// duplicated prefix handed through `env` (its assignments are argv, not the shell's), and the
+// SPACE form of `--config-env`. Both were measured FAIL-OPEN at `bd0ecbeca` (bState=false) and
+// are green only after the ordered-config fix — so each is a pin the fix must keep, not a
+// restatement of R3a/R3b. (The review's own reproducer spelled the FIRST one with the verb
+// `mix` while defining `alias.x`, which git rejects rc 129; the MECHANISM is real and is what
+// these two rows pin, measured against git 2.43.0 with `x`.)
+dexpect("#594-R3d a duplicated prefix handed through `env` — the LAST one wins too",
+  `env Z=status Z='branch -fq victimENV main' git --config-env=alias.x=Z x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimENV", "main"] });
+dexpect("#594-R3e the SPACE form of `--config-env` keeps its argv position against a later `-c`",
+  `EE=status git --config-env alias.x=EE -c alias.x='branch -fq victimSP main' x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimSP", "main"] });
+
 // commit matcher (commit-graph/commit-tree EXCLUDED)
 dexpect("commit → block:commit", `git commit -m x`, { verdict: "block:commit", verb: "commit" });
 dexpect("add+commit → block:commit (detailed)", `git add . && git commit -m 'x'`, { verdict: "block:commit" });
