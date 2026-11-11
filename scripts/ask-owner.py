@@ -26,7 +26,13 @@ Usage:
                                              # no comments, no gh calls
 
 Exit: 0 = passed and labelled · 1 = bounced (posted back to the lane) ·
-      2 = could not check (no key / network) — NOT a pass.
+      2 = could not check (no key / rejected key / failed call / unreadable input) — NOT a pass,
+          and NOT in the owner's queue. A SCORING failure from `jev()` prints
+          `UNSCORED — the owner queue did not receive this`; the other exit-2 causes name
+          themselves and print no `UNSCORED` line (`could not read <repo>#<n>`, `could not read
+          the answer state … UNKNOWN`, `jev returned no answer for …`) — agent-infra#2642. Do not
+          grep for `UNSCORED` to decide whether a question was routed: read the exit code, which
+          is 2 on every one of those paths.
 """
 
 import json
@@ -743,12 +749,32 @@ def _key():
         return None
 
 
+# ⛔ THE UNSCORED LINE IS PART OF THE GATE'S VOCABULARY, NOT A DECORATION (#2642). Exit 2 is honest
+# — the script refuses to label a question it could not score — but on a CELL it was SILENT in the one
+# place it mattered: the comment is posted and readable, the lane's own report says "asked", and the
+# question is absent from the gate-fed queue the owner actually reads. "Posted" and "queued" are
+# different states (the same distinction as "sent" vs "delivered" in the dispatch path), so the
+# call site is told WHICH one it is in, in the words the rest of the fleet greps for. Measured
+# 2026-10-24 on a cell: nine owner questions were posted and none reached the queue.
+# ⛔ AND IT NAMES NO CAUSE, ON PURPOSE (#2642 review). Exit 2 covers FIVE outcomes (an unreadable
+# issue, an unreadable answer state, a partial 200 body, and `jev()`'s three scoring failures: no key,
+# a rejected key, a failed call), so a sentence that said "no TypeSafe key" would be FALSE on a box
+# whose key is present and wrong — the state this file's own doc calls out, where the first real
+# question returns `jev http 401`. The cause is printed by whoever KNOWS it, on the line above; this
+# sentence states only the consequence, which is the same for all five.
+UNSCORED = ("UNSCORED — the owner queue did not receive this: the gate could not score it, "
+            "so it was neither labelled `owner-decision` nor bounced. `posted` is not `queued`; "
+            "record it in your own report as UNROUTED (see the line above for the cause, and "
+            "docs/ops/decision-gate.md for the provisioning that fixes a missing credential).")
+
+
 def jev(state):
     key = _key()
     if not key:
         print("no TypeSafe key (env TYPESAFE_API_KEY or JEV_API_KEY, or "
               "~/.pi/agent/jev-config.json)"
               " — cannot check (this is NOT a pass)")
+        print(UNSCORED)
         return None
     req = urllib.request.Request(
         JEV_URL,
@@ -765,9 +791,18 @@ def jev(state):
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         print(f"jev http {e.code}: {e.read().decode()[:300]}")
+        # ⛔ A REJECTED KEY AND A FAILED CALL ARE SCORING FAILURES TOO (#2642 review). `UNSCORED`
+        # used to be printed ONLY on the no-key arm, so on a box whose key is present-but-wrong the
+        # `unscored` count in `--scan`'s summary incremented while not one `UNSCORED` sentence
+        # appeared — the count and the vocabulary disagreed about the same event, and the heartbeat's
+        # alert (which read the count) told the operator to provision a key that was already there.
+        # Every arm that returns None from here is "the gate could not score it", which is exactly
+        # what the sentence says; the arm-specific cause is the line printed just above it.
+        print(UNSCORED)
         return None
     except Exception as e:  # noqa: BLE001
         print(f"jev call failed: {e}")
+        print(UNSCORED)
         return None
 
 
@@ -1276,7 +1311,7 @@ def scan(dry):
         pending.extend(extra)
     print(f"pending questions: {len(pending)}")
     rc = 0
-    npass = nbounce = nans = 0
+    npass = nbounce = nans = nunscored = 0
     for repo, n in pending[:MAX_SCAN]:
         # ── the other half of the handshake, checked BEFORE scoring ──────────
         # The owner answers by commenting and REMOVING `owner-decision`. Removing it
@@ -1332,6 +1367,22 @@ def scan(dry):
             npass += 1
         elif r == 1:
             nbounce += 1
+        elif r == 2:
+            # ⛔ COUNTED, AND NAMED (#2642). An exit 2 used to leave pass/bounce/answered summing to
+            # LESS than pending with nothing saying why — so a box that could not score anything (no
+            # key: every cell, measured 2026-10-24) read exactly like a quiet tick. The count alone
+            # is not enough: the sentence is what an operator acts on.
+            # ⛔ AND NAMED PER QUESTION, WHICH A COUNT IS NOT (#2642 review). `main()` returns 2 from
+            # FIVE sites and only `jev()`'s arms print a sentence — so on the no-key path every
+            # question emitted the SAME two lines and NOTHING in the log carried `repo#number`. The
+            # count arrived; the LIST did not, and assembling it by hand is what #2642's own body had
+            # to do. This branch cannot know the cause (`2` also covers an unreadable issue, an
+            # unreadable answer state and a partial body), so it carries the IDENTITY and leaves the
+            # cause to the line above it — which is the only place that knows.
+            nunscored += 1
+            print(f"UNSCORED {repo}#{n} — the owner queue did not receive this: the gate"
+                  f" could not score it (the cause is on the lines above), so it was neither"
+                  f" labelled `owner-decision` nor bounced")
         rc = rc or r
     if len(pending) > MAX_SCAN:
         print(f"(capped at {MAX_SCAN} this tick; {len(pending) - MAX_SCAN} left "
@@ -1344,12 +1395,19 @@ def scan(dry):
     # repo could not be read, the count is UNKNOWN and says so. Measured
     # 2026-09-25: gh exit 127 from the loop (PATH) made this line read
     # `pending=0` for every tick while the scan was dead.
+    if nunscored:
+        print(f"{UNSCORED}")
+    # ⛔ `unscored=` IS APPENDED, NEVER SUBSTITUTED: the heartbeat parses this line by NAME
+    # (`orchestrator-heartbeat.sh` sums `pass`/`bounce`/`answered`/`scan_failed`), so a new field is
+    # additive and an existing reader cannot be broken by it. It is emitted on BOTH arms — a scan that
+    # could not read a repo AND could not score what it did read are two different failures, and
+    # dropping the field on the `pending=?` arm would make the quieter one look resolved.
     if scan_failed:
         print(f"ASK pending=? pass={npass} bounce={nbounce} answered={nans}"
-              f" scan_failed={scan_failed}")
+              f" unscored={nunscored} scan_failed={scan_failed}")
     else:
         print(f"ASK pending={len(pending)} pass={npass} bounce={nbounce}"
-              f" answered={nans}")
+              f" answered={nans} unscored={nunscored}")
     return rc
 
 

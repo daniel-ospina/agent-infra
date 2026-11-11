@@ -72,7 +72,7 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # it stops every dispatch); origin/main adds brief-gate.sh (#2258), repo-target.sh (#2724/#2694) and
 # harness-provenance.sh. A file executed from the installed $O that is absent from this list is a
 # divergence nothing byte-compares.
-EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh mandate-preflight.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh stall-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh key-gate.sh lane-env.sh controller-state.sh"
+EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh mandate-preflight.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh stall-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh key-gate.sh lane-env.sh controller-state.sh gh-auth.sh"
 # …`stall-fix.sh` (#2929) joins the EXECUTED half on the list's own test: `orch-loop.sh` runs it as
 # `bash "$O/stall-fix.sh"` on every stalled pass, and this list byte-compares only files that are
 # PRESENT — so before this line a `$O` WITHOUT it produced NO divergence. The shipped escalation would
@@ -98,6 +98,13 @@ EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-ga
 # does not merely lose an assertion — it stops every lane on that box. And the divergence is invisible
 # without this entry in the other direction too: `cell-lane-preflight.sh`-style probes never read it, so
 # a MISSING copy would surface only as a box-wide refusal with no instrument naming the cause.
+# …`gh-auth.sh` (#2509) is presence-required on the SOURCED half: `spawn-gate.sh` sources it at load
+# time and `run_agent` resolves the lane's gh credential with it. It fails SOFT on purpose (a missing
+# module reports `[gh-auth] UNAVAILABLE` and the lane still starts), so the absence is caught BEFORE a
+# lane runs only by a PRESENCE check — this list, `install.sh`'s DRIFTED list, and
+# `cloud-cell-supervisor.sh check` (the three `README.md`'s row names) — while the runtime line says so in
+# that lane's own log, one lane late. ⛔ "THE ONLY PLACE" WAS WRONG HERE (round 23, P3): three instruments
+# report it, which is exactly what the module row states.
 # …`harness-provenance.sh` joins the OPERATOR-SURFACE half of this list on the same test as
 # `check-deployed-drift.sh`: nothing on the daemon runs it, and the operator is told to run it from the
 # DEPLOYED tree — `bash ~/orchestrator/harness-provenance.sh show --o ~/orchestrator` is README §4.3's

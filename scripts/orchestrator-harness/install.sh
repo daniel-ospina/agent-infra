@@ -1722,7 +1722,14 @@ DRIFTED=""
 # lane_registry.py (#3382) is the registry the harness's own lane-surface tools import to answer "did
 # this lane finish?"; a $O deployed without it makes every such caller import-fail, so it joins the
 # same union as the names above — this one from the #3382 branch, not from main.
-for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh mandate-preflight.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh lane_registry.py merge-rate.sh key-gate.sh lane-env.sh lane-report-gate.sh controller-state.sh; do
+for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh mandate-preflight.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh lane_registry.py merge-rate.sh key-gate.sh lane-env.sh lane-report-gate.sh controller-state.sh gh-auth.sh; do
+# gh-auth.sh (#2509) is the same class as `key-gate.sh`/`lane-env.sh` one gate earlier: `spawn-gate.sh`
+# SOURCES it and `run_agent` uses it to resolve the lane's gh credential before the land-backlog gate
+# reads GitHub with it. A $O without it does not crash — `run_agent` reports `[gh-auth] UNAVAILABLE` and
+# carries on — so the absence is reported BEFORE the first lane runs only by a PRESENCE check (this list,
+# `check-single-source.sh` and `cloud-cell-supervisor.sh check`), and the lane's gh silently goes back to
+# being unauthenticated under a redirected HOME (the runtime `[gh-auth] UNAVAILABLE` line lands in that
+# lane's own log, one lane late).
   # ⛔ A FILE THE PIN DOES NOT CARRY YET CANNOT BE "DRIFTED" FROM IT (#3243 review cycle-2, F2): on a box
   # installing ON the commit that introduces `orch-pin-exec.sh`, every run warned that the stub it had
   # just seeded "differs from the PINNED tree" — noise from a verdict about a file the pin does not have.

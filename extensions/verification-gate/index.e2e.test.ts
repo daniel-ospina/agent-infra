@@ -5838,19 +5838,25 @@ async function main() {
     // `src/b1265.ts`, so B's lookup key could never intersect anything A contributes and B
     // blocked under EVERY adoption mutant. Measured: re-keying the inspected sibling's
     // entries onto the own root — R1's exact failure mode — left the whole suite green.
-    // With a shared, identical-bytes path the re-keyed digest MATCHES B's copy, so an
-    // adopting gate ALLOWS the op and `block1` reddens.
     writeFileSync(join(wtA, "src", "shared1265.ts"), "s\n");
     git(wtA, "add src/a1265.ts");
     git(wtA, "add src/shared1265.ts");
     git(wtA, "commit -m work-a");
     mkdirSync(join(wtB, "src"), { recursive: true });
-    // B's FIRST op touches ONLY the shared path, so its whole scope is satisfiable by an
-    // adopted A entry — that is what makes the fail-open row discriminating. `b1265.ts` is
-    // written here but staged AFTER that op, so it cannot mask the result.
+    // ⛔ #2886 CHANGED WHAT THIS LEG PROVES, and the fixture changed with it. Since #2886 a record
+    // for the SAME path under a SIBLING root of the same repository satisfies a path whose bytes
+    // are identical (the rebase case) — so "B's op is allowed" no longer distinguishes ADOPTION
+    // from content identity: the shared path alone is now LEGITIMATELY satisfied. What must still
+    // distinguish them is that adoption also substitutes the ROOT, which yields an EMPTY diff scope
+    // and allows an op carrying content nothing verified. So B's first op stages the shared path
+    // AND a private file no tree has ever verified:
+    //   · adopt-the-root mutant → empty scope → the op is ALLOWED → `block1` reddens
+    //   · #2886 borrow          → shared satisfied by content, private still blocks → BLOCKED
+    //   · no borrow (pre-#2886) → blocked naming BOTH paths
     writeFileSync(join(wtB, "src", "shared1265.ts"), "s\n");
     writeFileSync(join(wtB, "src", "b1265.ts"), "b\n");
     git(wtB, "add src/shared1265.ts");
+    git(wtB, "add src/b1265.ts");
 
     // The bridge holds REAL, hash-matching entries for worktree A ONLY.
     const realA = realpathSync(wtA);
@@ -5918,10 +5924,14 @@ async function main() {
     ok(captured.some((l) => l.includes("INSPECTION ONLY") && l.includes(realA) && l.includes(realB)),
       `1265a: the inspection merge must be announced as INSPECTION ONLY and name both roots, got: ${captured.join(" | ")}`);
     // R3: the REWORDED remedy is the change — #1265's one worktree killed three consecutive
-    // children, and the FIRST followed "cd into it" into a tree it did not own. Pin it. The
-    // block reason is NOT the evidence here even though it can now carry a root (block1 commits
-    // `src/shared1265.ts`, which A also holds, so `rootsHoldingPath` names a recorded root);
-    // R3 is about the REMEDY wording, which only the diagnosis line carries.
+    // children, and the FIRST followed "cd into it" into a tree it did not own. Pin it.
+    // ⛔ The block reason CANNOT be the evidence site here, and since #2886 it cannot carry a root
+    // at all: `src/shared1265.ts` is satisfied BY CONTENT by the same-repo sibling's record, so it
+    // never enters `unverified` and `rootsHoldingPath` is never consulted for it (see the row
+    // below). `block1`'s only unverified path is the private `src/b1265.ts`, which no root holds a
+    // record for. R3 is about the REMEDY wording, which only the diagnosis line carries.
+    // (Reworded per fresh-context review round 2: the pre-#2886 text claimed the reason was a
+    // viable evidence site "even though it can now carry a root" — the opposite of the truth now.)
     ok(captured.some((l) => l.includes("re-dispatch verification for THIS root") && l.includes(realB)),
       `1265a: the mismatch remedy must be the followable one and name THIS root, got: ${captured.join(" | ")}`);
     ok(captured.some((l) => l.includes("refused by design")),
@@ -5976,13 +5986,15 @@ async function main() {
     equal(forB("gate_recovery_foreign_root")[0].inspected, 2,
       "1265a: the record must carry the inspected count (A's two entries)");
 
-    // AC (a): the op still FAILS CLOSED, and the diagnosis names THIS root.
-    // ⛔ THIS is the row that makes ADOPTION observable, and it is discriminating ONLY
-    // because `block1`'s scope is the path A and B share with identical bytes. Under the
-    // re-keying mutant `realB::src/shared1265.ts` exists with a digest of A's "s\n", which
-    // matches B's identical copy — so an adopting gate ALLOWS the op and this row reddens.
-    ok(block1 && block1.block === true, "1265a: B's commit must still be BLOCKED — A's entries are inert here (no fail-open)");
-    ok(String(block1.reason).includes("src/shared1265.ts"), "1265a: the block names B's own changed file");
+    // AC (a): the op still FAILS CLOSED on content nothing verified, and the diagnosis names THIS root.
+    // ⛔ THIS is the row that makes ROOT ADOPTION observable: an adopting gate substitutes A's root,
+    // computes an EMPTY scope for B and ALLOWS the op — so `block1` reddens. It can no longer redden on
+    // the shared path alone (#2886 satisfies that one by CONTENT), which is exactly why the private
+    // file `src/b1265.ts` is staged alongside it.
+    ok(block1 && block1.block === true, "1265a: B's commit must still be BLOCKED — the private file no tree verified keeps it closed (no fail-open)");
+    ok(String(block1.reason).includes("src/b1265.ts"), "1265a: the block names the file nothing verified");
+    ok(!/src\/shared1265\.ts/.test(String(block1.reason)),
+      "1265a: the byte-identical shared path is satisfied by CONTENT (#2886) and must not be demanded again");
     ok(!/src\/a1265\.ts/.test(String(block1.reason)), "1265a: the block must not carry A's entry for a path B did not change (src/a1265.ts)");
 
     // AC (b): exactly ONE durable root-mismatch record for this (root, siblings)
@@ -6002,8 +6014,8 @@ async function main() {
     equal(audit.filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realC).length, 1,
       "1265a: C's own (root, siblings) pair records its mismatch exactly once too");
 
-    // B's SECOND op adds its OWN private file, `src/b1265.ts`, which no tree has verified.
-    // Blocked too, and the reason still names only files in B's own scope — A holds
+    // B's SECOND op retries the same scope: the private file `src/b1265.ts`, which no tree has
+    // verified. Blocked again, and the reason still names only files in B's own scope — A holds
     // `a1265.ts` and `shared1265.ts`, and B is not committing either under this name.
     git(wtB, "add src/b1265.ts");
     const blockB2 = await fire("tool_call", opB);

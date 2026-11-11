@@ -3285,7 +3285,7 @@ cmd_check() {
   # has the CONTROLLER stop on every tick while this check certifies "CELL CAN RUN A CONTROLLER".
   # `brief-gate.sh` (#2258) and `wt-lifecycle.sh` (#2033) are older instances of the same class and were
   # equally absent, so they are added with it rather than left as the next thing to be found by hand.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh controller-state.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh controller-state.sh gh-auth.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
@@ -4773,6 +4773,70 @@ cmd_stop() {
   [ "$rc" -eq 0 ] || return 1
   return 0
 }
+# ── the DECISION GATE's credential (agent-infra#2642) — READ-ONLY, and it names the repairer ──
+# `ask-owner.py` is the gate that decides whether a lane's question earns the `owner-decision` label —
+# the queue the owner actually reads. With no TypeSafe/JEV credential it exits 2 on EVERY question,
+# which is honest and SILENT: the comment is posted and readable, the lane's report says "asked", and
+# nothing reaches the queue. Measured 2026-10-24 on a cell: nine questions posted, none queued.
+#
+# ⛔ READ-ONLY HERE, AND THAT IS THE DESIGN — the WRITER is
+# `cloud-cell-bringup.sh::check_decision_gate`, which materialises the 0600 store from the box's OWN
+# `keys.env` and REFUSES a box it cannot fill (the same one-writer rule as the provider store above:
+# two writers of one secret is how a repaired box and a certified box drift apart). This verb judges
+# and names the one command that repairs.
+# ⛔ AND IT JUDGES THE **FILE**, NOT THIS SHELL. A lane sources `$ENV_FILE` itself, while an export in
+# an operator's shell reaches no worker (tmux serves a session the SERVER's environment — the rule
+# this file already applies to AI_REVIEW_GATE_KEY and DEEPSEEK_API_KEY). So a key that lives only in
+# this shell is reported as the near-miss it is, never as configured.
+# The variable names and their order are the SAME ones `ask-owner.py::_key()` reads, deliberately
+# duplicated for the reason the provider table states: both scripts are pushed STANDALONE onto a cell.
+jev_state_line() {
+  local cfg k infile=0
+  cfg="${CELL_HOME:-$HOME}/.pi/agent/jev-config.json"
+  if [ -f "$ENV_FILE" ]; then
+    # Probed in a SUBPROCESS, like KEY_IN_FILE/TORTOISE_IN_FILE above: `status` must not run an
+    # operator's keys.env into its own shell.
+    # ⛔ TRIMMED, BECAUSE A WHITESPACE-ONLY VALUE IS NOT A KEY (#2642 review). The pre-fix probe tested
+    # `-n` alone, so `TYPESAFE_API_KEY="   "` in keys.env — what an operator leaves behind after
+    # blanking a key — printed `jev: configured … ask-owner.py can score a question` while
+    # `ask-owner.py::_key()` strips and REJECTS the same value, so every question exits 2 and NOTHING
+    # reaches the queue. This is the same acceptance rule the bring-up (`jev_key_var` /
+    # `keys_env_has_value`) and this function's own store arm already apply; only this arm was loose.
+    [ "$(env -u TYPESAFE_API_KEY -u JEV_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; { [ -n "${TYPESAFE_API_KEY//[[:space:]]/}" ] || [ -n "${JEV_API_KEY//[[:space:]]/}" ]; } && printf x' _ "$ENV_FILE" 2>/dev/null)" = x ] && infile=1
+  fi
+  if [ "$infile" = 1 ]; then
+    printf 'jev: configured (%s carries the TypeSafe key) — ask-owner.py can score a question, so it reaches the owner queue\n' "$ENV_FILE"
+    return 0
+  fi
+  if [ -f "$cfg" ]; then
+    # ONE LINE, NO `\n` ESCAPES: a multi-line `python3 -c` inside `$( … )` needs either a real
+    # newline in the source or a heredoc, and this repo's bash 3.2 refuses a quoted heredoc inside a
+    # double-quoted assignment (see STORE_STATE_PY). A store that will not parse prints nothing, which
+    # reads as "no key" here — the BRING-UP is where `unreadable` is its own, distinct refusal.
+    # ⛔ THE SAME ACCEPTANCE RULE AS THE GATE AND THE BRING-UP (#2642 review): truthiness stringified
+    # a non-string into a false `configured`. `ask-owner.py::_key()` returns the RAW JSON value and
+    # `jev()` sends `Bearer {key}`, so a number, object, array or `true` is not a credential — it takes
+    # the unkeyed branch or 401s, and every question is UNSCORED. `isinstance(…, str)` is the type
+    # test `cloud-cell-bringup.sh::write_jev_store` already makes; both surfaces must answer alike
+    # because an operator reads them as one verdict.
+    k="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));k=d.get("apiKey") if isinstance(d,dict) else None;print(k if isinstance(k,str) else "")' "$cfg" 2>/dev/null)"
+    if [ -n "$(printf '%s' "$k" | tr -d '[:space:]')" ]; then
+      printf 'jev: configured (%s, mode %s) — ask-owner.py can score a question, so it reaches the owner queue\n' "$cfg" "$(stat -c '%a' "$cfg" 2>/dev/null || stat -f '%Lp' "$cfg" 2>/dev/null || echo unknown)"
+      return 0
+    fi
+  fi
+  # ⛔ TRIMMED FOR THE SAME REASON AS THE FILE PROBE ABOVE: a blank ambient export is not a key, so it
+  # is the MISSING line's business, not this near-miss's (the remedy here — "put it in the FILE" — is
+  # not what the operator needs to do with an empty variable).
+  if [ -n "$(printenv TYPESAFE_API_KEY 2>/dev/null | tr -d '[:space:]')$(printenv JEV_API_KEY 2>/dev/null | tr -d '[:space:]')" ]; then
+    printf '⛔ jev: a TypeSafe key is set in THIS shell but NOT in %s — a lane sources the FILE, so a worker may have no key. Put TYPESAFE_API_KEY=<the key> in %s and re-run the bring-up.\n' "$ENV_FILE" "$ENV_FILE"
+    return 0
+  fi
+  printf '⛔ jev: MISSING — neither %s nor %s carries a TypeSafe key, so ask-owner.py exits 2 on every question and NOTHING reaches the owner queue (posted is not queued). Repair: put TYPESAFE_API_KEY=<the key> in %s, then run: bash %s/cloud-cell-bringup.sh --check (it writes %s, mode 600).\n' \
+    "$ENV_FILE" "$cfg" "$ENV_FILE" "$(dirname "${BASH_SOURCE[0]:-$0}")" "$cfg"
+  return 0
+}
+
 cmd_status() {
   local cpids own foreign
   # ⛔ NOT HERE — the ceiling line goes LAST in this verb (review P2). Two callers read the HEAD of
@@ -5074,6 +5138,9 @@ cmd_status() {
   # surface, and the census is the one read that is right on both.) An unreadable census prints
   # UNKNOWN, never 0.
   log_line "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
+  # agent-infra#2642 — the owner-question gate. Printed (read-only) so the state the cell silently sat
+  # in — a decision gate that cannot fire — is answered by the one verb an operator runs.
+  log_line "$(jev_state_line)"
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
   # the fix for the measured "a dead loop looks identical to an idle cell".

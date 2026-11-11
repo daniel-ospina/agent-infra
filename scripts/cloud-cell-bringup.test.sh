@@ -341,7 +341,11 @@ mk_checkout() { # <dir> <origin-url> <tag>
 git init -q "$T/cell" >/dev/null 2>&1 || { echo "fixture: git init failed" >&2; exit 1; }
 git -C "$T/cell" -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false \
     commit -q --allow-empty -m fixture >/dev/null 2>&1 || { echo "fixture: git commit failed" >&2; exit 1; }
-printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
+# ⛔ THE DECISION-GATE KEY IS PART OF A HEALTHY CELL'S keys.env (agent-infra#2642): the bring-up now
+# REFUSES a box whose owner-question gate cannot fire, so a fixture that omits it cannot reach
+# CELL READY — and (because this home is reused) every later arm would redden behind it. The store it
+# materialises from this line is what the later arms (which rewrite $T/keys.env) inherit.
+printf 'DEEPSEEK_API_KEY=fake\nTYPESAFE_API_KEY=fake-jev-key\n' > "$T/keys.env"
 TOK="$T/tok/.gh-tok"
 printf 'ghp_FAKE_PUSH_CAPABLE_TOKEN\n' > "$TOK"   # (re-created per case; asserted deleted after)
 TOK_BODY="$(cat "$TOK")"
@@ -420,6 +424,7 @@ br() {
   # through `BR_EXTRA_ENV`, which is applied AFTER these clears.
   BR_OUT="$(env -u AGENT_INFRA_PATH -u INFRA_ROOT -u TORTOISE_REPO -u DISK_REAPER_REPOS -u GH_REPO \
             -u DEEPSEEK_API_KEY -u ANTHROPIC_API_KEY \
+            -u TYPESAFE_API_KEY -u JEV_API_KEY \
             -u HARNESS_PIN_DIR -u HARNESS_PIN_FILE \
             PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" GH_REPO="${BR_GH_REPO:-}" \
             ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
@@ -2678,6 +2683,187 @@ case "$MISS_OUT" in
   *"was not found"*"rc=0"*) ok "with no copy at all it reports UNVERIFIED and continues (a bare VM is a documented path)" ;;
   *) bad "an absent repo-slug.sh did not report UNVERIFIED, or refused the box: $MISS_OUT" ;;
 esac
+
+# ── the DECISION GATE's credential (agent-infra#2642) ────────────────────────────────────────────
+# MEASURED 2026-10-24 on agent-infra cell-1: nine owner questions were posted, `ask-owner.py` returned
+# exit 2 for every one (no `~/.pi/agent/jev-config.json` on ANY cell), and NOTHING reached the
+# `owner-decision` queue the owner reads. The gate was honest and the failure was silent, so the fix
+# is a bring-up that either PROVISIONS the credential or REFUSES the box by name.
+# These arms pin the three ways that can go wrong: a box certified with no credential at all, a
+# credential left in the operator's shell instead of the file a lane reads, and a repair that
+# overwrites a store holding a different key (a rotation is a decision, not a repair).
+JEVCFG="$T/home/.pi/agent/jev-config.json"
+# ⛔ ITS OWN KEYS FILE, NOT `$T/keys.env`: earlier arms REWRITE that fixture (several drop everything
+# but DEEPSEEK_API_KEY), so an arm that depended on it would be testing whatever the previous case
+# left behind — the order-dependence this suite keeps getting bitten by.
+JEVKEYS="$T/keys-withjev.env"
+printf 'DEEPSEEK_API_KEY=fake\nTYPESAFE_API_KEY=fake-jev-key\n' > "$JEVKEYS"
+
+say_case "the decision gate: a box with NO TypeSafe credential is REFUSED by name (#2642)"
+rm -f "$JEVCFG"
+printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys-nojev.env"      # no decision-gate key anywhere
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-nojev.env" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "bring-up REFUSES a box whose owner-question gate cannot fire (rc=$BR_RC)" \
+                   || bad "bring-up certified a cell that cannot gate a single question — every question it posts is UNSCORED and never queued"
+case "$BR_OUT" in
+  *"decision gate"*) ok "…and the refusal NAMES the decision gate (not 'provider failed', which sends an operator to the wrong key)" ;;
+  *) bad "the refusal does not name the decision gate: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"TYPESAFE_API_KEY"*) ok "…and prescribes the exact fix (the variable to put in keys.env)" ;;
+  *) bad "the refusal does not say what to push: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness on a box that cannot reach the owner queue" ;;
+  *) ok "does not claim CELL READY with no decision-gate credential" ;;
+esac
+[ ! -e "$JEVCFG" ] && ok "…and wrote NO store (a refusal must not mint a credential it does not have)" \
+                   || bad "a jev store appeared with no key to build it from — something guessed"
+
+say_case "the decision gate: the store is MATERIALISED from the box's own keys.env, mode 600"
+rm -f "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$JEVKEYS" br ok normal --check    # this box's keys.env carries TYPESAFE_API_KEY
+[ "$BR_RC" -eq 0 ] && ok "a box whose keys.env carries the key reaches CELL READY (non-vacuity)" \
+                   || bad "a properly provisioned box was refused (rc=$BR_RC): $BR_OUT"
+[ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "fake-jev-key" ] \
+  && ok "…the store exists and holds the key keys.env delivered" \
+  || bad "no store at $JEVCFG, or it holds the wrong key: $(cat "$JEVCFG" 2>/dev/null)"
+# ⛔ `ls -l`'s MODE STRING, not `stat`: the portability gate correctly refuses a bare GNU `stat -c`
+# (there is no box_* helper for MODE — only for mtime), and this suite runs on macOS as well.
+[ "$(ls -ld "$JEVCFG" 2>/dev/null | cut -c1-10)" = "-rw-------" ] \
+  && ok "…mode 600 (a credential on disk, not a world-readable one)" \
+  || bad "the store's mode is not 600: $(ls -ld "$JEVCFG" 2>/dev/null | cut -c1-10)"
+case "$BR_OUT" in
+  *"REPAIRED decision gate"*) ok "…and the repair is REPORTED (a silent write is a credential nobody knows exists)" ;;
+  *) bad "the materialisation was silent: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"jev: configured"*) ok "…and the configured state is reported as its own line" ;;
+  *) bad "the bring-up never reports the decision gate as configured: $BR_OUT" ;;
+esac
+
+say_case "the decision gate: an EXISTING store is never overwritten, and a rotation is NAMED"
+printf '{"apiKey":"sk_stale_in_store","model":"jev-stored"}\n' > "$JEVCFG"
+chmod 600 "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$JEVKEYS" br ok normal --check    # keys.env delivers a DIFFERENT key
+[ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "sk_stale_in_store" ] \
+  && ok "an existing stored key is NOT overwritten by the delivered one (a decision, not a repair)" \
+  || bad "the repair overwrote an existing decision-gate credential"
+[ "$(jq -r '.model // ""' "$JEVCFG" 2>/dev/null)" = "jev-stored" ] \
+  && ok "…and a field this script does not understand is PRESERVED (the laptop's store also carries 'model')" \
+  || bad "the write dropped a field it did not understand: $(cat "$JEVCFG" 2>/dev/null)"
+case "$BR_OUT" in
+  *"DIFFERENT key"*) ok "…and the shadow is reported, so a rotation is diagnosable" ;;
+  *) bad "a stored key shadows keys.env silently — an operator would rotate the wrong half: $BR_OUT" ;;
+esac
+# ⛔ THE LINE MUST NOT INVERT THE GATE'S PRECEDENCE (#2642 review). The first wording was a transplant
+# of the provider-store line ("pi reads the STORE first", which is true there): it told the operator
+# that `ask-owner.py` reads the STORE and "the stored value is the one used". `_key()` is ENV-FIRST —
+# on the normal lane path, which sources `keys.env`, the FILE's value is the one used and the stored
+# value is not. The two readers are SPLIT (lanes: file; a systemd unit or a hand-run scan: store), so
+# "the stored value wins" cannot be the takeaway. The `DIFFERENT key` grep above passes on ANY
+# wording, so this row is what pins the claim.
+case "$BR_OUT" in
+  *"reads the STORE, so the stored value is the one used"*) bad "the rotation line INVERTS the gate's order — _key() is env-first, so a lane uses the keys.env value, not the stored one: $BR_OUT" ;;
+  *"a lane sources"*"the FILE's value is the one a lane uses"*) ok "…and it states the SPLIT readers instead of naming one winner (a lane reads the file, a clean-shell reader the store)" ;;
+  *) bad "the rotation line names no precedence at all, so an operator cannot tell which value a lane uses: $BR_OUT" ;;
+esac
+printf '{"apiKey":"   "}\n' > "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$JEVKEYS" br ok normal --check
+[ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "fake-jev-key" ] \
+  && ok "a BLANK stored apiKey is repaired (a whitespace value is not a credential)" \
+  || bad "a blank apiKey was accepted as configured, or the repair skipped it: $(cat "$JEVCFG" 2>/dev/null)"
+
+say_case "the decision gate: a WRONG-TYPED apiKey is not a credential (#2642 review)"
+# ⛔ `jev_store_state` used `| tostring`, so ANY non-null value — a number, an object, an array,
+# `true` — rendered as non-empty text and the store answered `present`. The gate cannot score with
+# one: `ask-owner.py::_key()` returns the RAW JSON value, so `0`/`{}` take the unkeyed branch and
+# `{"a":1}`/`true` are sent as `Bearer {'a': 1}` / `Bearer True` and 401 — every question UNSCORED.
+# MEASURED pre-fix: the box printed `jev: configured` and `CELL READY` over a dead owner queue and
+# never repaired the store. A wrong-typed value must be `empty` (the REPAIR arm), the same rule
+# `write_jev_store` already applies to what it writes.
+for wrong in '{"apiKey":{"a":1},"model":"jev-stored"}' '{"apiKey":0}' '{"apiKey":["k"]}' '{"apiKey":true}'; do
+  printf '%s\n' "$wrong" > "$JEVCFG"
+  chmod 600 "$JEVCFG"
+  printf '%s\n' "$TOK_BODY" > "$TOK"
+  BR_ENV_FILE="$JEVKEYS" br ok normal --check      # this box's keys.env DOES deliver a usable key
+  # ⛔ NO `rc` ASSERTION HERE, DELIBERATELY. The discriminating fact is the STORE'S POST-STATE: if a
+  # wrong-typed value still read `present`, the repair arm is never reached and the store keeps a value
+  # the gate cannot send. That is rc-independent, so this arm measures the fix rather than whether the
+  # whole bring-up run can complete on this host (a box missing its harness worktree fails later, for
+  # reasons unrelated to the decision gate — the sibling cases above own that rc).
+  [ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "fake-jev-key" ] \
+    && ok "…$wrong: the wrong-typed store is REPAIRED from keys.env, not read as 'present'" \
+    || bad "…$wrong: the store still holds a value ask-owner.py cannot send, so it read as present: $(cat "$JEVCFG" 2>/dev/null)"
+  case "$BR_OUT" in
+    *"REPAIRED decision gate"*) ok "…$wrong: and the repair is REPORTED (not a silent rewrite)" ;;
+    *) bad "…$wrong: the repair was silent: $BR_OUT" ;;
+  esac
+  case "$BR_OUT" in
+    *"jev: configured"*) ok "…$wrong: and configured is claimed only AFTER the repair" ;;
+    *) bad "…$wrong: the bring-up never reported the repaired store as configured: $BR_OUT" ;;
+  esac
+  # …and a field the script does not understand survives the repair, exactly as for the blank case.
+  [ "$wrong" != '{"apiKey":{"a":1},"model":"jev-stored"}' ] \
+    || { [ "$(jq -r '.model // ""' "$JEVCFG" 2>/dev/null)" = "jev-stored" ] \
+           && ok "…and a field it does not understand ('model') is PRESERVED across the repair" \
+           || bad "the wrong-typed repair dropped a field it did not understand: $(cat "$JEVCFG" 2>/dev/null)"; }
+done
+# The other half of the mapping: with NOTHING to repair from, the box is REFUSED — never certified on
+# a store the gate cannot use, and never silently emptied of the value it holds.
+printf '{"apiKey":{"a":1}}\n' > "$JEVCFG"
+chmod 600 "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-nojev.env" br ok normal --check      # no decision-gate key anywhere to repair from
+[ "$BR_RC" -ne 0 ] \
+  && ok "…and with no key in keys.env a wrong-typed store REFUSES the box (not certified, not guessed)" \
+  || bad "a store ask-owner.py cannot use certified the box with nothing to repair it from"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness over a wrong-typed apiKey the gate cannot send" ;;
+  *) ok "…does not claim CELL READY over a wrong-typed apiKey" ;;
+esac
+[ "$(jq -c '.apiKey' "$JEVCFG" 2>/dev/null)" = '{"a":1}' ] \
+  && ok "…and the refused box's store is left EXACTLY as it was (no silent deletion of a credential file)" \
+  || bad "the refusal rewrote or emptied a store it could not repair: $(cat "$JEVCFG" 2>/dev/null)"
+
+say_case "the decision gate: an AMBIENT key is not a source, and the refusal says so"
+rm -f "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-nojev.env" BR_EXTRA_ENV="TYPESAFE_API_KEY=sk_ambient_only" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an ambient-only key does not certify the box (a lane sources the FILE, not the shell)" \
+                   || bad "the bring-up certified a cell whose only decision-gate key lives in an operator's shell"
+case "$BR_OUT" in
+  *"NOT in"*|*"ambient export reaches no lane"*) ok "…and the refusal names the near-miss, so the fix is obvious" ;;
+  *) bad "an ambient-only key is refused with no explanation of why it does not count: $BR_OUT" ;;
+esac
+[ ! -e "$JEVCFG" ] && ok "…and the ambient value was NOT materialised into the store" \
+                   || bad "the store was written from an ambient export — the image's stale-key class"
+
+# ⛔ A BLANK KEY IN keys.env IS NOT AN AMBIENT EXPORT (#2642 review, same root). keys.env is sourced
+# with `set -a`, so a blank value lands in this process — and the pre-fix ambient test took ANY
+# non-empty `printenv` as "set in THIS shell but NOT in $ENV_FILE", so the box was told to put the key
+# in the file it was already in. The box is correctly REFUSED either way; what this pins is that the
+# remedy is not a circle.
+rm -f "$JEVCFG"
+printf 'DEEPSEEK_API_KEY=fake\nTYPESAFE_API_KEY="   "\n' > "$T/keys-blankjev.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-blankjev.env" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "a BLANK TypeSafe key in keys.env does not certify the box (a whitespace value is not a credential)" \
+                   || bad "the bring-up certified a box whose only decision-gate value is whitespace"
+case "$BR_OUT" in
+  *"ambient export reaches no lane"*|*"but NOT in"*) bad "a BLANK value IN keys.env is reported as an AMBIENT export — the remedy it prints (put the key in the file) is what the operator already did: $BR_OUT" ;;
+  *) ok "…and the refusal does not misreport a blank keys.env value as an ambient-only key" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness over a blank decision-gate value" ;;
+  *) ok "…does not claim CELL READY over a blank decision-gate value" ;;
+esac
+[ ! -e "$JEVCFG" ] && ok "…and no store was minted from a blank value" \
+                   || bad "a store was written from a blank keys.env value: $(cat "$JEVCFG" 2>/dev/null)"
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIPPED=$SKIP"
