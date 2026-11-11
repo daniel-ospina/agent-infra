@@ -99,6 +99,22 @@ const CLASSIFIER_PINS = [
   ["A11 reset alone", "git reset --hard", "block:reset", false, []],
   ["A12 plain push", "git push origin main", "block:push", false, ["main"]],
   ["A13 merge + plain push", "git merge origin/main && git push origin main", "block:merge", false, []],
+  // #506 review finding 1: `block:commit` is only produced when the classifier
+  // PROVED there is no push invocation, so a delete spelling inside a commit
+  // MESSAGE is text only. `hasPush` is the flag the consumer gates on; the
+  // extractor's echo/comment over-match is why `pushTargets` stays empty here
+  // while the string extractor still finds `main`.
+  ["A16 commit message mentioning a -d delete",
+    'git commit -m "revert: stop running git push origin -d main"', "block:commit", false, []],
+  // A17 is the OTHER half of the same edge, and it is PRE-EXISTING, not #506's:
+  // the frozen `push-delete` pattern is string-matched, so a `--delete` inside a
+  // commit MESSAGE still yields the legacy verdict `block:push-delete` (the
+  // documented echo/comment over-match). The detailed verdict therefore cannot
+  // be `block:commit`, and index.ts's push-delete arm needs a non-empty
+  // `pushTargets` — empty here, because there is no push invocation — so the
+  // command is ALLOWED, matching the `-d` twin (B13/B13b).
+  ["A17 commit message mentioning a --delete (pre-existing echo over-match)",
+    'git commit -m "revert: stop running git push origin --delete main"', "block:push-delete", false, []],
 ];
 for (const [label, cmd, verdict, isPushDelete, targets] of CLASSIFIER_PINS) {
   const d = classifyGitCommandDetailed(cmd);
@@ -107,12 +123,33 @@ for (const [label, cmd, verdict, isPushDelete, targets] of CLASSIFIER_PINS) {
   expectTrue(`${label} → ${verdict}`, ok,
     `got verdict=${d.verdict} isPushDelete=${d.isPushDelete} pushTargets=${JSON.stringify(d.pushTargets)}`);
 }
-// The frozen string classifier is UNTOUCHED by #506 (it never had the override).
+// `hasPush` — the flag index.ts's #506 arm is gated on (review finding 1). It is
+// derived from the INVOCATION WALK, never from the string extractor, so it is
+// the only thing that can tell a real push compound from a message that talks
+// about one.
 for (const [label, cmd, want] of [
-  ["A14 frozen classifier still says block:reset for the compound",
+  ["A18 hasPush TRUE for a real delete compound", "git reset --hard && git push origin --delete stale", true],
+  ["A19 hasPush TRUE for a plain push", "git push origin main", true],
+  ["A20 hasPush FALSE for a commit whose MESSAGE names a -d delete",
+    'git commit -m "revert: stop running git push origin -d main"', false],
+  ["A21 hasPush FALSE for a commit whose MESSAGE names a --delete",
+    'git commit -m "revert: stop running git push origin --delete main"', false],
+  ["A22 hasPush FALSE for a non-git command", "echo hi", false],
+]) {
+  const got = classifyGitCommandDetailed(cmd).hasPush === true;
+  expectTrue(`${label} (hasPush=${want})`, got === want, `got hasPush=${got}`);
+}
+// The frozen string classifier — the layer part 2 of the fix DID change (the
+// priority list is shared). A14 is a CONTROL, not a pin of that reorder: `reset`
+// out-ranks `push-delete` in both orders, so no mutation of this diff can flip
+// it. The reorder's real pins are A5b/A6/A6b/A6c and the behavioural B5.
+for (const [label, cmd, want] of [
+  ["A14 CONTROL (invariant under the reorder): frozen classifier says block:reset for the compound",
     "git reset --hard && git push origin --delete stale", "block:reset"],
   ["A15 frozen classifier still says block:push-delete for a plain delete",
     "git push origin --delete stale", "block:push-delete"],
+  ["A15b PIN of the reorder: the frozen classifier names the LEAD verb, not the delete",
+    "git stash pop && git push origin --delete stale", "block:stash-pop"],
 ]) {
   expectTrue(label, classifyGitCommand(cmd) === want, `got ${classifyGitCommand(cmd)}`);
 }
@@ -226,6 +263,40 @@ if (typeof stripTypeScriptTypes !== "function" ||
     { id: "B11", dir: "wt", expect: "allow",
       cmd: "git reset --hard && git push origin --delete stale",
       why: "part 2 control: the SAME compound with an unheld target stays allowed (B10 is #73, not a blanket)" },
+    // ── review finding 1: a commit MESSAGE must not manufacture delete evidence ──
+    { id: "B13", dir: "wt", expect: "allow",
+      cmd: 'git commit -m "revert: stop running git push origin -d main"',
+      why: "review finding 1: the extractor's only evidence is the MESSAGE text, and there is no push " +
+           "invocation (`hasPush` false), so the #73 arm must not fire — and the `--delete` twin must " +
+           "behave identically (B13b). CONTROL: B1 is the same session geometry with a REAL delete " +
+           "compound and it still blocks, so an allow here is the arm's absence, not a dead guard" },
+    { id: "B13b", dir: "wt", expect: "allow",
+      cmd: 'git commit -m "revert: stop running git push origin --delete main"',
+      why: "review finding 1: the spellings must not split — the `--delete` twin stays allowed too" },
+    // ── the EXTRACTOR FALLBACK's own pin (mutant 5) ──
+    { id: "B14", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git reset --hard && git push origin main && git push origin --delete held",
+      why: "#506: the delete lives in the SECOND push invocation, so `pushTargets` is empty and ONLY " +
+           "the whole-command extractor can attribute it — the one row that pins that fallback" },
+  ];
+
+  /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
+   *  arm (`!branchOwnership || !classifierLoaded`) is a DIFFERENT guard with its
+   *  own #73 clause, and nothing in the full-path rows above can reach it — so it
+   *  gets its own tree (a copy WITHOUT `shared/branch-ownership.mjs`) and its own
+   *  rows, and the load MUST report the degradation (asserted, so the rows cannot
+   *  silently execute the full path and still read green). */
+  const DEGRADED_PINS = [
+    { id: "D1", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git push origin --delete held",
+      why: "degraded arm: post-#506 the frozen verdict is block:stash-pop, so the #73 check must be " +
+           "run by the new clause instead of the old block:push-delete arm" },
+    { id: "D2", dir: "wt", expect: "allow",
+      cmd: "git stash pop && git push origin --delete stale",
+      why: "degraded arm control: the same compound with an UNHELD target is still worktree-exempt" },
+    { id: "D3", dir: "hub", expect: "block", marker: "Destructive git command blocked",
+      cmd: "git stash pop && git push origin --delete stale",
+      why: "degraded arm control: in the hub the generic legacy block still fires" },
   ];
 
   const real = await loadGuard(INDEX_TS);
@@ -276,30 +347,76 @@ if (typeof stripTypeScriptTypes !== "function" ||
       blocked(results.get("B10")) && results.get("B11") === undefined,
       `B10 → ${show(results.get("B10"))}; B11 → ${show(results.get("B11"))}`);
 
-    // ── Part M — MUTATION EVIDENCE: each half of the fix is load-bearing ──
-    if (MUTATIONS) {
-      console.log("\n── Part M: mutation evidence (#506) ──");
+    // ── The DEGRADED path (#506 review finding 2) ──
+    // A tree WITHOUT shared/branch-ownership.mjs: `branchOwnership` stays null, so
+    // the `!branchOwnership || !classifierLoaded` arm owns the decision and the
+    // full-path rows above cannot reach it. The degradation MUST be reported —
+    // that assertion is what keeps these rows from silently re-testing the full
+    // path (and it is the non-vacuity floor for the whole block).
+    console.log("\n── Part D: the degradation-fallback arm (#506 finding 2) ──");
 
-      /** Copy this extension (plus the shared modules index.ts imports) into a
-       *  temp tree and apply ONE textual revert to ONE file. */
-      function buildMutant(label, file, revert) {
-        const root = realpathSync(mkdtempSync(join(tmpdir(), `legacy-delete-mut-${label}-`)));
-        const ext = join(root, "extensions");
-        mkdirSync(join(ext, "main-worktree-guard"), { recursive: true });
-        mkdirSync(join(ext, "shared"), { recursive: true });
-        for (const f of ["index.ts", "classify-git.mjs", "module-load-hooks.mjs"]) {
-          cpSync(join(HERE, f), join(ext, "main-worktree-guard", f));
-        }
-        for (const f of ["print-mode.ts", "audit-log.ts", "tool-call-event.ts", "branch-ownership.mjs"]) {
-          cpSync(join(REPO_EXTENSIONS, "shared", f), join(ext, "shared", f));
-        }
+    /** Copy this extension (plus the shared modules index.ts imports) into a
+     *  temp tree. `omit` drops a module (the degraded fixtures), `file`+`revert`
+     *  applies ONE textual revert (the mutants). */
+    function buildTree(label, { omit = [], file = null, revert = null } = {}) {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), `legacy-delete-${label}-`)));
+      const ext = join(root, "extensions");
+      mkdirSync(join(ext, "main-worktree-guard"), { recursive: true });
+      mkdirSync(join(ext, "shared"), { recursive: true });
+      for (const f of ["index.ts", "classify-git.mjs", "module-load-hooks.mjs"]) {
+        cpSync(join(HERE, f), join(ext, "main-worktree-guard", f));
+      }
+      for (const f of ["print-mode.ts", "audit-log.ts", "tool-call-event.ts", "branch-ownership.mjs"]) {
+        if (omit.includes(`shared/${f}`)) continue;
+        cpSync(join(REPO_EXTENSIONS, "shared", f), join(ext, "shared", f));
+      }
+      let applied = false;
+      if (file && revert) {
         const target = join(ext, "main-worktree-guard", file);
         const src = readFileSync(target, "utf8");
         const mutated = revert(src);
-        const applied = mutated !== src;
+        applied = mutated !== src;
         writeFileSync(target, mutated);
-        return { root, index: join(ext, "main-worktree-guard", "index.ts"), applied };
       }
+      return { root, index: join(ext, "main-worktree-guard", "index.ts"), applied };
+    }
+
+    /** Drive the DEGRADED_PINS against one tree and report each row. */
+    async function runDegradedRows(built, label, { redCheck = null } = {}) {
+      const guard = await loadGuard(built.index);
+      expectTrue(`D0: [${label}] the tree really IS degraded (an extension warning was reported)`,
+        guard.degradation.length > 0 || !guard.loaded,
+        "no degradation was reported — the rows below would exercise the FULL path");
+      if (!guard.loaded) return false;
+      await guard.sessionStart(hub);
+      await guard.sessionStart(wtSession);
+      let allOk = true;
+      for (const p of DEGRADED_PINS) {
+        const r = await guard.bash(dirs[p.dir], p.cmd);
+        const ok = p.expect === "block" ? blocked(r) : r === undefined;
+        if (redCheck) {
+          expectTrue(`M: [${label}] ${p.id} goes RED — ${p.why}`, redCheck(r), `under the mutant: ${show(r)}`);
+          continue;
+        }
+        expectTrue(`${p.id} ${p.expect === "block" ? "BLOCKED" : "ALLOWED"} — ${p.why}`,
+          ok, `${JSON.stringify(p.cmd)} → ${show(r)}`);
+        if (!ok) allOk = false;
+        if (p.marker && blocked(r)) {
+          expectTrue(`${p.id}: the refusal is the ${p.marker} arm (which guard fired)`,
+            String(r.reason ?? "").includes(p.marker), show(r));
+        }
+      }
+      return allOk;
+    }
+    {
+      const plain = buildTree("degraded-no-branch-ownership", { omit: ["shared/branch-ownership.mjs"] });
+      try { await runDegradedRows(plain, "no branch-ownership"); }
+      finally { rmSync(plain.root, { recursive: true, force: true }); }
+    }
+
+    // ── Part M — MUTATION EVIDENCE: each half of the fix is load-bearing ──
+    if (MUTATIONS) {
+      console.log("\n── Part M: mutation evidence (#506) ──");
 
       const MUTANT_PAIRS = [
         {
@@ -320,7 +437,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
           // caught it pre-fix too) and B10/B11 (a worktree reach region where the
           // pre-fix `block:push-delete` verdict still ran the #73 arm — that is
           // exactly the protection part 2 must not lose).
-          expectGreen: ["B6", "B7", "B8", "B10", "B11"],
+          expectGreen: ["B6", "B7", "B8", "B10", "B11", "B13", "B13b", "B14"],
           classifier: ["git reset --hard && git push origin --delete stale", "block:push-delete"],
         },
         {
@@ -331,17 +448,71 @@ if (typeof stripTypeScriptTypes !== "function" ||
           label: "#506 delete-target arm removed",
           file: "index.ts",
           revert: (src) => src.replace(
-            '      if (det.verdict !== "block:push-delete" &&\n          det.verdict !== "block:push" && det.verdict !== "block:force-push") {',
-            '      if (false && det.verdict !== "block:push-delete" &&\n          det.verdict !== "block:push" && det.verdict !== "block:force-push") {',
+            '      if (det.hasPush === true &&\n          det.verdict !== "block:push-delete" &&',
+            '      if (false && det.hasPush === true &&\n          det.verdict !== "block:push-delete" &&',
           ),
-          expectRed: ["B10"],
+          expectRed: ["B10", "B14"],
           redCheck: (r) => !blocked(r),
-          expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B11"],
+          expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B11", "B13", "B13b"],
+        },
+        {
+          // (3) THE REORDER REVERTED: `push-delete` back above `force-checkout` in
+          // the shared priority list. This is the half that has no other mutant;
+          // its pins are the frozen-layer A15b and the behavioural B5 (a `stash
+          // pop` lead, which the old order swallowed into `block:push-delete`).
+          label: "push-delete restored above force-checkout",
+          file: "classify-git.mjs",
+          revert: (src) => {
+            const line = '  { name: "push-delete", re: /\\bgit\\s+push\\b[^;&|]*(--delete\\b|\\s:\\S+)/ },';
+            const at = src.indexOf(line);
+            if (at === -1) return src; // anchor dead → `applied` false, reported as a stale anchor
+            const without = src.slice(0, at) + src.slice(at + line.length);
+            const anchor = '  { name: "force-checkout", re: /\\bgit\\s+(checkout|switch)\\s+(-f|--force)\\b/ },\n';
+            return without.replace(anchor, line + "\n" + anchor); // MUTANT: pre-#506 order
+          },
+          expectRed: ["B5"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B1", "B2", "B3", "B4", "B6", "B10", "B11", "B13", "B14"],
+          classifier: ["git stash pop && git push origin --delete stale", "block:push-delete"],
+        },
+        {
+          // (4) THE DEGRADED CLAUSE REMOVED (#506 review finding 2). Runs on its
+          // OWN tree (no branch-ownership) because the clause only exists in the
+          // degradation arm; D1 must go RED — allowed — the moment it is gone.
+          label: "degraded #73 clause removed",
+          file: "index.ts",
+          omit: ["shared/branch-ownership.mjs"],
+          revert: (src) => src.replace(
+            '          (verdict.startsWith("block:") && rawDeleteNames.length > 0);',
+            '          false; // MUTANT: #506 degraded clause removed',
+          ),
+          expectDegradedRed: ["D1"],
+          expectDegradedGreen: ["D2", "D3"],
+        },
+        {
+          // (5) THE EXTRACTOR FALLBACK DELETED: a delete that lives in a LATER
+          // compound segment loses its attribution, so B6 (reset → push main →
+          // push --delete) stops running the #73 check. B6 was deliberately NOT
+          // discriminating for the override mutant (it blocks either way), so
+          // this is the mutant that pins the fallback itself.
+          label: "extractor fallback removed",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "        const legacyDeletes = det.pushTargets.length > 0\n          ? det.pushTargets\n          : (extractPushDeleteBranch(localCommand) ?? []);",
+            "        const legacyDeletes = det.pushTargets; // MUTANT: no extractor fallback",
+          ),
+          // B6 still BLOCKS (LEGACY_BLOCK owns the reset) — the fallback's loss is
+          // only visible where the legacy arm exempts, so the pin is B10's
+          // later-segment analogue: a worktree compound whose delete is in the
+          // SECOND push invocation. That row is B14 below, added for this mutant.
+          expectRed: ["B14"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B6", "B10"],
         },
       ];
 
       for (const mut of MUTANT_PAIRS) {
-        const built = buildMutant(mut.label.replace(/[^a-z0-9]+/gi, "-"), mut.file, mut.revert);
+        const built = buildTree(mut.label.replace(/[^a-z0-9]+/gi, "-"), mut);
         try {
           expectTrue(`M: [${mut.label}] the revert was actually applied (anchor is live)`, built.applied,
             "the anchor did not match — a stale anchor proves less than it claims");
@@ -353,6 +524,29 @@ if (typeof stripTypeScriptTypes !== "function" ||
             const got = mutCg.classifyGitCommandDetailed(mut.classifier[0]).verdict;
             expectTrue(`M: [${mut.label}] the mutant classifies the compound ${mut.classifier[1]} (defect reintroduced)`,
               got === mut.classifier[1], `got ${got}`);
+          }
+          if (mut.expectDegradedRed) {
+            expectTrue(`M: [${mut.label}] the tree really IS degraded (an extension warning was reported)`,
+              true, "—");
+            const guard = await loadGuard(built.index);
+            expectTrue(`M: [${mut.label}] the mutant extension loads ${mut.omit ? "DEGRADED" : "clean"}`,
+              guard.loaded && (mut.omit ? guard.degradation.length > 0 : guard.degradation.length === 0),
+              guard.degradation.join(" | ") || "no degradation reported");
+            if (!guard.loaded) continue;
+            await guard.sessionStart(hub);
+            await guard.sessionStart(wtSession);
+            for (const id of mut.expectDegradedRed) {
+              const p = DEGRADED_PINS.find((x) => x.id === id);
+              const r = await guard.bash(dirs[p.dir], p.cmd);
+              expectTrue(`M: [${mut.label}] ${id} goes RED — ${p.why}`, !blocked(r), `under the mutant: ${show(r)}`);
+            }
+            for (const id of mut.expectDegradedGreen ?? []) {
+              const p = DEGRADED_PINS.find((x) => x.id === id);
+              const r = await guard.bash(dirs[p.dir], p.cmd);
+              const ok = p.expect === "block" ? blocked(r) : r === undefined;
+              expectTrue(`M: [${mut.label}] ${id} is unaffected`, ok, `under the mutant: ${show(r)}`);
+            }
+            continue;
           }
           const mutant = await loadGuard(built.index);
           expectTrue(`M: [${mut.label}] the mutant extension loads without degradation`,
