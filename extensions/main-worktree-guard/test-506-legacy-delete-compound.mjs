@@ -294,7 +294,6 @@ if (typeof stripTypeScriptTypes !== "function" ||
       why: "ordering control: with a target held NOWHERE the #73 check adds nothing and the legacy " +
            "arm still owns the verdict — the hoist did not turn the class into a #73 block" },
     // ── the EXTRACTOR FALLBACK's own pin (mutant 5) ──
-    // ── the EXTRACTOR FALLBACK's own pin (mutant 5) ──
     { id: "B14", dir: "wt", expect: "block", marker: "checked out in",
       cmd: "git reset --hard && git push origin main && git push origin --delete held",
       why: "#506: the delete lives in the SECOND push invocation, so `pushTargets` is empty and ONLY " +
