@@ -1527,7 +1527,9 @@ wt_tmux_names() {
 # the build FINISHED the entry was already 9-29 s old — outside its own window. **The memo was never
 # once a hit**: every question rebuilt the whole census, and `reap_stale_workers` asks it once PER
 # CANDIDATE (#3756), so a pass over this box's 89 candidates cost 90 builds and 27 minutes for work that
-# took 12 s at cycle 117. A validity window shorter than its own construction cannot cache — it is a
+# took 12 s at cycle 117. (⛔ SCOPED DELIBERATELY, review of this diff: the memo DOES hit on a box whose
+# build is shorter than its window — this suite's §K arm pins that — so the claim is about a census whose
+# build outruns `WT_TABLE_TTL`, i.e. this box, not every box.) A validity window shorter than its own construction cannot cache — it is a
 # NO-OP GATE, the class this file refuses everywhere else. So the header carries the build's measured
 # duration and the effective window is `max(configured, 2 x took)`: at any configured TTL the memo now
 # survives its own build, and staleness still cannot exceed twice the cost of re-reading it. `0` is
@@ -1585,14 +1587,23 @@ wt_table() {
   # caps stop binding). The age must be non-negative AND under the TTL.
   now="$(date +%s 2>/dev/null)" || now=""
   case "$now" in ''|*[!0-9]*) now="" ;; esac
-  # ⛔ COERCED, NOT `[ … -gt 0 ]`-TESTED (see the header): a non-numeric value used to fall through the
-  # guard into `[ "$_mage" -lt "$ttl" ]`, which prints a diagnostic on EVERY census read.
+  # ⛔ COERCED TO `0`, NOT TO THE DEFAULT (review of this diff, P3 — MEASURED). On the code this
+  # replaces, `[ "${ttl:-0}" -gt 0 ] 2>/dev/null` was rc 2 for a NON-NUMERIC value, so the memo block
+  # was skipped entirely: a malformed `WT_TABLE_TTL` (`off` is the obvious way an operator writes
+  # "stop doing this") meant NO MEMO. Coercing it to 10 would have quietly turned that operator's
+  # choice back into a 10 s cache — a change in the UNSAFE direction, since the memo's staleness is
+  # what `wt_alive` and the caps read. `0` is the disable seam, so a value this function cannot parse
+  # lands there. (The old guard's failure also never reached `[ "$_mage" -lt "$ttl" ]`, so it printed
+  # no diagnostic — `2>/dev/null` saw to that; an earlier draft of this comment claimed otherwise.)
   ttl="${WT_TABLE_TTL:-10}"
   case "$ttl" in
-    ''|*[!0-9]*) ttl=10 ;;
-    # A value too long to be arithmetic is not a window: `$(( 10#… ))` would ERROR on it, and an
-    # expansion error in this function ABORTS the census before it prints (see the `CYC` note above).
-    *) if [ "${#ttl}" -le 9 ]; then ttl=$(( 10#$ttl )); else ttl=10; fi ;;
+    ''|*[!0-9]*) ttl=0 ;;
+    # ⛔ NOT "this would ERROR" (review of this diff, P3 — MEASURED: `$(( 10#1234…30 digits ))` WRAPS to
+    # a negative number and returns 0 on bash 3.2.57, it does not abort; the abort class the `CYC` note
+    # records is INVALID DIGITS, e.g. `$(( 4 * 08 ))` → "value too great for base"). A wrapped value is
+    # not a crash, it is a nonsense window — a census that serves itself for an unbounded or negative
+    # span. Disabling the memo is the honest reading of a window nobody can compute.
+    *) if [ "${#ttl}" -le 9 ]; then ttl=$(( 10#$ttl )); else ttl=0; fi ;;
   esac
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   _wttl=$ttl
@@ -1953,9 +1964,17 @@ EOF
 # per-candidate read, and a reap pass went from 12 s to 27 min). The verdict is the same expression on the
 # same rows — this is the same function, not a second opinion — and an EMPTY table falls back to a real
 # read, so a caller cannot pass "nothing" and get "nothing is alive".
+# ⛔ AND ONLY A TABLE IS ACCEPTED (review of this diff, P3). A second positional is easy to pass by
+# accident, and any other string finds no row and answers DEAD — the direction that frees the caps and
+# lets `wt_close` proceed. Every row `wt_table` emits is `<name><TAB><status>`, so a value with no TAB is
+# not a table and is discarded, exactly like an empty one.
 wt_alive() {
   local n="${1:-}" tbl="${2-}" st
   [ -n "$n" ] || return 1
+  case "$tbl" in
+    *"$(printf '\t')"*) : ;;
+    *) tbl="" ;;
+  esac
   [ -n "$tbl" ] || tbl="$(wt_table)"
   # ⛔ HERE-STRING, NOT A PIPE (the same rule this file's `grep -q` arms state): the lookup exits on its
   # FIRST match, so a piped writer takes SIGPIPE — under `pipefail` a MATCH then reads as a failure, and

@@ -1827,6 +1827,28 @@ SH
 out="$(bash "$TMP/k3.sh" "$LIB" "$TMP/bin-host" "$TMP/O13f" "$TMP/cmux13f.log" 2>&1)"
 case "$out" in *"alive=yes probes=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "a memo header with no recorded duration still serves (an older cache is not a forced rebuild)" $rc
+# ⛔ A TTL THIS FUNCTION CANNOT PARSE MEANS "NO MEMO", WHICH IS WHAT IT ALWAYS MEANT (review of this
+# diff, P3 — MEASURED). On the code this replaces, `[ "${ttl:-0}" -gt 0 ]` was rc 2 for `off`, so the
+# memo block was skipped: an operator writing `WT_TABLE_TTL=off` got no memo. Coercing a malformed value
+# to the DEFAULT would have silently turned that back into a 10 s cache — the unsafe direction, since the
+# memo's staleness is what `wt_alive` and the caps read. `0` is the disable seam; a value that cannot be
+# parsed lands there, and this arm is what stops the next edit from "tidying" it to the default.
+cat > "$TMP/k4.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL="${5:-off}"; mkdir -p "$WT_DIR"
+export CMUX_LOG="$4"; : > "$CMUX_LOG"
+. "$1"
+printf 'kind=terminal\nid=term_host42\nworkspace=\n' > "$WT_DIR/worker-merge-5"
+export CMUX_TREE_JSON='{"workspaces":[],"screens":[],"tabs":[],"terminals":[{"id":"term_host42","running":true}]}'
+x="$(wt_alive merge-5 && echo yes)"; y="$(wt_alive merge-5 && echo yes)"
+printf 'answers=%s/%s probes=%s\n' "$x" "$y" "$(grep -c 'CMUX tree' "$CMUX_LOG")"
+SH
+out="$(bash "$TMP/k4.sh" "$LIB" "$TMP/bin-host" "$TMP/O13g" "$TMP/cmux13g.log" 2>&1)"
+case "$out" in *"probes=2"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a WT_TABLE_TTL this cannot parse DISABLES the memo (it never becomes the 10 s default)" $rc
+out="$(bash "$TMP/k4.sh" "$LIB" "$TMP/bin-host" "$TMP/O13h" "$TMP/cmux13h.log" 0 2>&1)"
+case "$out" in *"probes=2"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and the explicit 0 seam still means the same thing" $rc
 
 echo
 echo "── L) a spawn that cannot RECORD itself is not a success ──"
