@@ -9569,8 +9569,23 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           if (ins && existsSync(ins)) { const S = vstack(f().cwd); S.splice(1, 0, ins); setVStack(S); }
           continue;
         }
-        // remaining flag forms (`-`, `+` with no digits) never cd — conservative no-op
-        if (!tgt.w || tgt.w.startsWith("-")) { f().pending = null; continue; }
+        // ⛔ BARE `pushd` IS NOT A NO-OP — MEASURED, bash 5.2.21 (#3955 review, the
+        // note the reviewer filed as pre-existing): with a 2+-entry stack bash SWAPS
+        // the top two entries and cd's to the new top — `[docs, a]` ⇒ `[a, docs]`,
+        // cwd `a`; `[b, docs, a]` ⇒ `[docs, b, a]`, cwd `docs` — and `pushd --` does
+        // exactly the same (the marker is not an operand). On a 1-deep stack bash
+        // prints "pushd: no other directory", rc 1, and changes NOTHING. The old
+        // model no-opped both, drifting the walker's cwd off bash's — the same
+        // craftable fail-OPEN shape as `pushd +N` (real bash moves, the gate does
+        // not), so it is modelled rather than only commented on.
+        if (!tgt.w) {
+          const S = vstack(f().cwd);
+          f().pending = S.length > 1 ? setVStack([S[1], S[0], ...S.slice(2)]) : null;
+          continue;
+        }
+        // remaining flag forms (`-` = OLDPWD, #2177's recorded residual; a bare `-x`)
+        // never cd — conservative no-op
+        if (tgt.w.startsWith("-")) { f().pending = null; continue; }
       }
       let next = null;
       if (tgt.w && tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {

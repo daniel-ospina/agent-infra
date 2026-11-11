@@ -5530,6 +5530,19 @@ try {
     blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +x; echo x > tracked.md", "F4 gate: TRACKED docs/tracked.md → BLOCK");
     has("cd a; pushd ../docs; popd +; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4: a bare `+` operand is an error, not a bare popd");
     blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +; echo x > tracked.md", "F4 gate: TRACKED docs/tracked.md → BLOCK");
+    // ── #3955 review (the note filed as pre-existing): bare `pushd` / `pushd --` are
+    // NOT no-ops. Measured on bash 5.2.21: `[docs, a]` ⇒ `[a, docs]` with cwd `a`;
+    // `[b, docs, a]` ⇒ `[docs, b, a]` with cwd `docs`; a 1-deep stack errors and
+    // changes nothing. The old model no-opped both, so the walker stayed somewhere
+    // bash had left — the same fail-OPEN shape as `pushd +N`.
+    has("cd a; pushd ../docs; pushd; echo x > tracked.md", "redirect:H/a/tracked.md", "P0: a bare `pushd` swaps the top two entries and cd's to the new top (a)");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd; echo x > tracked.md", "P0 gate: TRACKED a/tracked.md → BLOCK (the no-op model stayed in docs and ALLOWed)");
+    has("cd a; pushd ../docs; pushd ../b; pushd; echo x > tracked.md", "redirect:H/docs/tracked.md", "P0: …and on a 3-entry stack the swap still moves exactly ONE entry (docs)");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd; echo x > tracked.md", "P0 gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd a; pushd ../docs; pushd --; echo x > tracked.md", "redirect:H/a/tracked.md", "P0: `pushd --` is the SAME swap — the marker is not an operand");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd --; echo x > tracked.md", "P0 gate: TRACKED a/tracked.md → BLOCK");
+    has("cd a; pushd; echo x > tracked.md", "redirect:H/a/tracked.md", "P0 ANTI-NARROWING: a 1-deep stack is 'no other directory' (rc 1) — the cwd must NOT move");
+    allows(["docs/tracked.md"], "cd a; pushd; echo x > tracked.md", "P0 ANTI-NARROWING gate: the write is in a, so a docs resolution would be a false positive");
   }
 
 
