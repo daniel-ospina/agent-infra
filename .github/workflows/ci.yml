@@ -1315,6 +1315,41 @@ jobs:
         # decideM2's own reason text (never a bare `block: true`).
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~2s.
         run: node extensions/main-worktree-guard/test-m2-compound-ownership.mjs
+      - name: main-worktree-guard #73 delete target must be a LITERAL ref (#653)
+        timeout-minutes: 4
+        # #653: the #73 coordinated-delete guard matched the delete target as
+        # TEXT, so a target the SHELL produces (`git push origin --delete
+        # "$PR_BRANCH"`, `-d $(echo held/branch)`, backticks, brace/glob
+        # expansion) named no ref, no worktree was found to be holding it, and
+        # the arm ALLOWED the delete — #73's protection defeated by ordinary
+        # shell usage, and the ceremony snippets in skills/commit-workflow
+        # assigned the branch to a variable first, so the DOCUMENTED path was
+        # the unmatched one. The fix is option 2 of the issue: an unresolvable
+        # target is REFUSED (fail-closed) with the literal-ref remedy.
+        # Behavioural: loads the REAL index.ts through module-load-hooks.mjs and
+        # drives the tool_call handler against a hermetic hub + a sibling
+        # worktree that holds the branch, asserting the #653 refusal's OWN text
+        # (never a bare `block: true`), the no-false-block controls on the
+        # literal path, #73's unchanged literal protection, a worktree-rooted
+        # session, and the override hatch. Zero-dep (`node:*` + the `git`
+        # binary), no `npm ci`, ~3s. Its own step for the reason the sibling
+        # steps above state: the `extensions/*/test*.mjs` glob is in ci-main.yml,
+        # which has NO `pull_request` trigger.
+        run: node extensions/main-worktree-guard/test-653-delete-target.mjs
+      - name: main-worktree-guard #653 delete-target MUTATION evidence
+        timeout-minutes: 4
+        # The suite above is only a pin if it can FAIL, and this fix has two
+        # directions to get wrong — too little (the class is not refused) and too
+        # much (the fail-closed arm becomes an over-block on the literal path).
+        # `--mutations` reverts EXACTLY the #653 decision (`if (unresolved.length
+        # > 0)` → `if (false)`) in a TEMP copy of the extension and requires each
+        # #653 row to be ALLOWED again by the mutant while the real module still
+        # refuses it in the SAME run — plus the controls (the literal delete and
+        # #73's own block must NOT change under the mutant). A mutant that fails
+        # to load is a failure, never a green. Its OWN step so neither verdict can
+        # suppress the other (the rule every sibling suite here follows).
+        # Zero-dep, ~5s.
+        run: node extensions/main-worktree-guard/test-653-delete-target.mjs --mutations
       - name: main-worktree-guard hub working-tree SWEEP detection (#718)
         # Sized from this step's own documented wall clock (~16s: a dozen deliberate `pause(1600)`
         # bursts inside the arms), NOT from a 12-run p90 — the step landed on main today (#3781), so

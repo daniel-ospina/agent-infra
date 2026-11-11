@@ -157,6 +157,13 @@ let isWorktreeCwd: (cwd: string) => boolean = () => true;      // bash path: fai
 let isWorktreeCwdWrite: (cwd: string) => boolean = () => false; // write/edit: fail-closed
 let extractPushDeleteBranch: (cmd: string) => string[] | null = () => null;
 let wholeCommandDeleteTargets: (verdict: string, command: string) => string[] = () => [];
+// #653: the fail-closed delete-target predicate. The default mirrors the stub
+// above — with no extractor there are no delete names to judge — so a stale
+// classify-git module keeps today's degradation and cannot invent a block.
+// ⛔ BOUND BY A typeof GUARD, never by the destructuring target list: a
+// destructuring assignment binds `undefined` for a missing export, which would
+// THROW here rather than degrade (see the binding site's comment).
+let unresolvableDeleteTargets: (targets: string[]) => string[] = () => [];
 let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
@@ -388,6 +395,19 @@ try {
   // #1139: the quote-aware shell tokenizer the pipe-seed walk uses (same skew
   // contract as above).
   if (typeof _m5.wtShellWords === "function") wtShellWords = _m5.wtShellWords;
+  // ⛔ #653 — NAMESPACE READ + typeof GUARD, NOT A DESTRUCTURING TARGET (review P1 of
+  // PR #3978, measured). The name was first added to the destructuring list above,
+  // and a destructuring ASSIGNMENT overwrites the declared fail-safe default with
+  // `undefined` when the export is absent — measured on this box (Node 24.21.0): a
+  // destructuring target whose key is missing from the source object binds
+  // `undefined`, it does not leave the earlier default in place — so on a
+  // stale/short classify-git.mjs `classifierLoaded` is
+  // still true and `_coordinatedDeleteBlock`'s call THROWS a TypeError on every
+  // delete-shaped command instead of degrading. That is the inverse of the default's
+  // own comment and of the #627/#628/#709/#3444 contract 15 lines below.
+  if (typeof _m5.unresolvableDeleteTargets === "function") {
+    unresolvableDeleteTargets = _m5.unresolvableDeleteTargets;
+  }
   // #967/#1484: the invocation's positional args feed the subcommand
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
@@ -583,6 +603,39 @@ function _mainTopLevel(): string | null {
 // anywhere — foreign deletes with no checked-out targets are allowed.
 function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: string } | null {
   if (!branchNames || branchNames.length === 0) return null;
+  // ── #653: FAIL CLOSED ON AN UNRESOLVABLE DELETE TARGET ──
+  // The #73 check below is only as good as the NAME it is given, and the names
+  // come from the command TEXT. A shell variable, a command substitution or an
+  // expansion makes the executed word differ from that text, so the lookup asks
+  // about a ref no worktree can hold (measured: `git push origin --delete
+  // "$PR_BRANCH"` → the literal `$PR_BRANCH`; `-d $(echo held/branch)` → the
+  // FRAGMENT `$(echo`) and the arm then ALLOWS the delete of a sibling-held
+  // branch. That is #73's protection defeated by ordinary shell usage — and the
+  // ceremony snippets in skills/commit-workflow assigned the branch to a
+  // variable first, so the DOCUMENTED path was the unmatched one.
+  //
+  // Option 2 of #653 (the smaller change, and the one that closes the class):
+  // an unresolvable target is REFUSED with the literal-ref remedy, rather than
+  // resolved-then-allowed. This runs BEFORE the checkout lookup, so it holds in
+  // every arm that reaches this seam (degradation, push-delete, later-segment
+  // deletes) and cannot be skipped by a state read that fails.
+  const unresolved = unresolvableDeleteTargets(branchNames);
+  if (unresolved.length > 0) {
+    return {
+      block: true,
+      reason: [
+        `⛔ Cannot delete — the delete target is not a literal ref name, so the guard cannot tell WHICH branch would be removed:`,
+        ...unresolved.map((b: string) => `   • ${b}`),
+        "",
+        "   Why: #73's coordinated-delete check matches the ref in the command TEXT.",
+        "   A variable, a command substitution or a glob is only known once the shell",
+        "   runs, so the guard would be checking a name no worktree can hold — and would",
+        "   let the delete through unchecked (#653).",
+        "   → Re-run with the LITERAL ref: `git push origin --delete feat/my-branch`.",
+        "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+      ].join("\n"),
+    };
+  }
   const worktreeBranches = getWorktreeBranches();
   const blockedBranches: string[] = [];
   for (const branchName of branchNames) {

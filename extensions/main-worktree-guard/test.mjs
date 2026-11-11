@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -1084,6 +1084,83 @@ wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -
 dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });
 // --dry-run stays a normal push (no false delete).
 dexpect("push --dry-run NOT delete", `git push origin --dry-run feat/x`, { verdict: "block:push", isPushDelete: false });
+
+// ── #653: the delete target must be a LITERAL ref, or the arm fails closed ──
+// The #73 arm matched the delete target as TEXT, so a target the SHELL produces
+// named no ref, nothing was checked out under it, and the delete was ALLOWED.
+// `unresolvableDeleteTargets` decides resolvability and index.ts
+// `_coordinatedDeleteBlock` refuses on it BEFORE the checkout lookup. These rows
+// pin the POLICY SEAM; the handler-level evidence (the refusal, its message, the
+// worktree root, the no-false-block controls and the mutation leg) is
+// test-653-delete-target.mjs — its own CI step, because this file's ci-main leg
+// is not PR-triggered.
+for (const [name, target, want] of [
+  ["literal short ref", "feat/x", true],
+  ["literal full ref", "refs/heads/feat/x", true],
+  ["a comma is legal in a ref name", "release,2026", true],
+  ["$VAR", "$PR_BRANCH", false],
+  ["${VAR}", "${PR_BRANCH}", false],
+  ["${VAR:-default}", "${BRANCH:-feat/x}", false],
+  ["command-substitution fragment", "$(echo", false],
+  ["backtick fragment", "`cat", false],
+  ["glob", "feat/*", false],
+  // #653 (review P2 of PR #3978): `?` and `[` are shell globs AND illegal in a ref
+  // name — the SHELL expands them, so refusing them is load-bearing. `]` and `}`
+  // are legal in a ref name and are refused as the accepted over-block; all four
+  // are pinned so a future easing of the class reddens a row instead of silently
+  // reopening the glob hole.
+  ["? shell glob", "feat/experiment-?", false],
+  ["[ character class", "feat/[ab]", false],
+  ["lone closing bracket", "feat/x]", false],
+  ["lone closing brace", "feat/x}", false],
+  ["brace expansion", "{feat/a,feat/b}", false],
+  ["backslash escape", "feat/x\\ y", false],
+  ["empty", "", false],
+]) {
+  const got = isResolvableDeleteTarget(target);
+  console.log(`${got === want ? "✅" : "❌"} #653 isResolvableDeleteTarget(${name}): ${got}${got === want ? "" : ` (expected ${want})`}`);
+  got === want ? pass++ : fail++;
+}
+{
+  const got = unresolvableDeleteTargets(["$A", "feat/x", "$A", "$(cat"]);
+  const ok = JSON.stringify(got) === JSON.stringify(["$A", "$(cat"]);
+  console.log(`${ok ? "✅" : "❌"} #653 unresolvableDeleteTargets filters + dedupes: ${JSON.stringify(got)}`);
+  ok ? pass++ : fail++;
+  const inert = JSON.stringify(unresolvableDeleteTargets(undefined)) === "[]";
+  console.log(`${inert ? "✅" : "❌"} #653 unresolvableDeleteTargets(non-array) is inert: ${inert}`);
+  inert ? pass++ : fail++;
+}
+
+// ⛔ #653 (review P0 of PR #3978): the harness that pins THIS fix must be able to
+// FAIL. `reportVerdict` RETURNS the exit code — it never sets it (`verdict.mjs`:
+// "the caller still owns `process.exit`") — so a harness that discards the return
+// value prints `❌` and exits 0, which makes its CI steps green over every red,
+// including the `--mutations` leg whose whole job is proving the pins can fail.
+// The 4th argument is `{ skip, red }`, NOT the bare `skip` number (whose
+// `opts.skip`/`opts.red` reads are undefined and drop the skip tail). Pinned here
+// rather than only inside that file, because a self-check that can be deleted with
+// the thing it guards is not a pin.
+{
+  const t653 = readFileSync(new URL("./test-653-delete-target.mjs", import.meta.url), "utf-8");
+  const rows = [
+    // ⛔ THE POLARITY, NOT THE SHAPE (review observation on PR #3978): `/process\.exit\(fail === 0/`
+    // is satisfied by `process.exit(fail === 0 ? 0 : 0)` — the same vacuous green. Bind the whole
+    // expression, both outcomes included.
+    ["it sets an exit code from its verdict", /process\.exit\(fail === 0 && !vacuous \? 0 : 1\);/.test(t653)],
+    ["it passes the skip/red OPTIONS object, not a bare number", /reportVerdict\("test-653-delete-target", pass, fail, \{ skip, red: vacuous \}\)/.test(t653)],
+    // ⛔ THE FLAG'S CONSUMPTION, NOT JUST ITS ASSIGNMENT (review P2 of PR #3978): binding
+    // only `behaviouralSkipped = true` is green over a mutant that raises the flag and
+    // drops the line that CONVERTS it into the failure (`const vacuous = … || behaviouralSkipped`)
+    // — the same shape-only binding the row above was fixed for, one line down. Keep the
+    // assignment row (it has its own mutant: deleting line :115) and add the consumption.
+    ["a skipped behavioral half RAISES the flag", /behaviouralSkipped = true/.test(t653)],
+    ["that flag is CONSUMED into the failure verdict", /const vacuous = \(skip > 0 && pass === 0\) \|\| behaviouralSkipped;/.test(t653)],
+  ];
+  for (const [what, ok] of rows) {
+    console.log(`${ok ? "✅" : "❌"} #653 review P0: the harness ${what}`);
+    ok ? pass++ : fail++;
+  }
+}
 
 // sync-source extraction (ownership allowance)
 dexpect("pull --rebase origin main → syncSource main", `git -c commit.gpgsign=false pull --rebase origin main`, { verdict: "block:pull", syncSource: "main" });
