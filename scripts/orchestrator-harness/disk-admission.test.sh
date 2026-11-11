@@ -1304,17 +1304,31 @@ provision_drives_seam() { # <file> -> 0 when a NON-COMMENT command references th
   #   • `bad "T7 …"` / `ok "… the pre-start seam every wt_provision caller refuses …"` /
   #     `check "(i3) a stale/missing wt-lifecycle.sh does NOT disarm …"` (dispatch-teardown.test.sh:290,
   #     cloud-cell-supervisor.test.sh:1738, ai-drainer.test.sh:1024) — PROSE in a message.
-  # So the seam name is looked for in an ASSIGNMENT RHS, after a SHELL/exec word (`bash`, `source`, …),
-  # or UNQUOTED — a quoted span that is an ARGUMENT to some other command is text, not a reference.
+  # So the seam name is looked for in an ASSIGNMENT RHS, after a SHELL/exec word (`bash`, `source`, `.`,
+  # …), or UNQUOTED — a quoted span that is an ARGUMENT to some other command is text, not a reference.
+  # ⛔ "AFTER A SHELL WORD" USED TO BE DEAD CODE (#3955 review Finding 2): `tok` was reset on every
+  # whitespace BEFORE the quote was examined, so at the quote in `bash "$HERE/wt-lifecycle.sh"` `tok`
+  # was already "" and the leg could only ever fire for the degenerate `bash"…"`. The commonest driver
+  # shape in this very population was therefore INVISIBLE to D1 — masked only by D2, whose caller regex
+  # happens to cover `wt-lifecycle.sh`. The word before the quote is now remembered (`wlast`) and the
+  # COMMAND word of the simple command is tracked (`cmd`), so a quoted argument is CODE when its command
+  # is a shell — which also covers `. "$HERE/…"` (dot-source, absent from the old list) and
+  # `bash -c "…"` (a code PAYLOAD behind `-c`/`--command`).
   # ⛔ THE RESIDUAL, stated rather than implied: a seam path quoted in COMMAND position with no shell
   # word in front of it (`"$HERE/wt-lifecycle.sh" args`, direct execution) is NOT counted. Measured on
   # this population no such suite exists — every real driver binds the seam through an assignment
-  # (`WTL=` / `_WTLIB=`) and the invocation is either sourced or shell-prefixed.
+  # (`WTL=` / `_WTLIB=`) and the invocation is either sourced or shell-prefixed. The same applies to an
+  # invocation whose shell is itself behind an option this walk does not read (`sudo -E bash "$X"`).
   awk '
-    function d1code(line,   i, n, ch, qc, keep, out, tok, prev, q1, q2, shelly) {
+    function d1code(line,   i, n, ch, qc, keep, out, tok, prev, q1, q2, shellw, keyw, spawnw, cmd, cmdset, wlast, redirt) {
       q1 = sprintf("%c", 39); q2 = "\""
-      shelly = "^(bash|sh|source|exec|command|env|sudo|doas|xargs|nohup|builtin|time|then|do|!)$"
-      out = ""; qc = ""; keep = 0; tok = ""
+      # a word that EXECUTES another command — its quoted argument is CODE
+      shellw = "^(bash|sh|source|dash|zsh|ksh|\\.)$"
+      # not the command word: a control keyword, so the NEXT word is the command
+      keyw   = "^(if|then|elif|else|while|until|do|!|time|\\{|\\()$"
+      # prefix words: the command word is the next real word (`exec bash "$X"`)
+      spawnw = "^(exec|command|env|sudo|doas|xargs|nohup|builtin|time|nice|stdbuf|timeout|setsid)$"
+      out = ""; qc = ""; keep = 0; tok = ""; cmd = ""; cmdset = 0; wlast = ""; redirt = 0
       n = length(line)
       for (i = 1; i <= n; i++) {
         ch = substr(line, i, 1)
@@ -1326,13 +1340,26 @@ provision_drives_seam() { # <file> -> 0 when a NON-COMMENT command references th
         }
         if (ch == q1 || ch == q2) {
           prev = (i > 1) ? substr(line, i - 1, 1) : ""
-          keep = (prev == "=") || (tok ~ shelly)
+          keep = (prev == "=") || (tok ~ shellw) ||
+                 (cmd ~ shellw && (wlast ~ shellw || wlast ~ /^(-c|--command)$/))
           if (keep) out = out ch
           qc = ch
           continue
         }
-        if (ch ~ /[ \t]/) { tok = ""; out = out ch; continue }
-        if (ch ~ /[;&|(){}<>]/) { tok = ""; out = out ch; continue }
+        if (ch ~ /[ \t]/) {
+          if (tok != "") {
+            if (redirt) { redirt = 0 }
+            else {
+              wlast = tok
+              if (!cmdset && tok !~ keyw && tok !~ spawnw && tok !~ /^-/ &&
+                  tok !~ /^[A-Za-z_][A-Za-z0-9_]*=/) { cmd = tok; cmdset = 1 }
+            }
+            tok = ""
+          }
+          out = out ch; continue
+        }
+        if (ch ~ /[;&|(){}]/) { tok = ""; wlast = ""; cmd = ""; cmdset = 0; redirt = 0; out = out ch; continue }
+        if (ch ~ /[<>]/) { tok = ""; redirt = (ch == ">" || ch == "<"); out = out ch; continue }
         tok = tok ch
         out = out ch
       }
@@ -1353,7 +1380,22 @@ provision_invokes_caller() { # <file> -> 0 when a NON-COMMENT command runs a shi
   # a body is skipped ONLY when its opener line carries no shell token AND its delimiter is actually
   # found. An unterminated opener (a quoted `<<` in prose, a `<<<` herestring) skips NOTHING, so a
   # mis-detection can only ever scan more, never less.
+  # ⛔ THE SKIP USED TO REQUIRE `bash|sh|source` FOLLOWED BY A SPACE (#3955 review Finding 3), so a
+  # body fed to a shell by OTHER means read as data and a real driver went unseen — a fail-OPEN, since
+  # an unseen driver is never required to neutralise the admission. Both shapes are measured on this
+  # head: `cat <<'X' | bash` (the shell is on the END of the opener, not in front of it) and `bash<<'X'`
+  # (no space before the operator). `feeds_shell` now decides from the opener's actual shell tokens
+  # with quoted spans removed, so a quoted mention of `bash` in prose is not a shell.
   awk -v CALLER='(wt-lifecycle|fix-one|adopt-fix|dispatch-merge)[.]sh' '
+    function feeds_shell(line,   s) {
+      s = line
+      gsub(/"[^"]*"/, " ", s)     # quoted spans are TEXT, not command words
+      gsub(/'"'"'[^'"'"']*'"'"'/, " ", s)
+      gsub(/`[^`]*`/, " ", s)
+      # a shell word at command position, attaching to the operator (`bash<<'X'`),
+      # or anywhere in a pipeline / && run (`cat <<'X' | bash`)
+      return (s ~ /(^|[ \t;&|(])(bash|sh|source)([ \t]|<<|$)/)
+    }
     function scan(line,   rest, start, tail) {
       if (line !~ CALLER) return 0
       rest = line
@@ -1388,7 +1430,7 @@ provision_invokes_caller() { # <file> -> 0 when a NON-COMMENT command runs a shi
           }
           if (stop > 0) {
             # a body fed to a SHELL is executed; anything else is DATA
-            if (line !~ /(^|[ \t;&|(])(bash|sh|source)[ \t]/)
+            if (!feeds_shell(line))
               for (k = i + 1; k < stop; k++) skip[k] = 1
             i = stop + 1
             continue
@@ -1557,6 +1599,43 @@ case "$(provision_neutralisation_offenders "$T/drv/seam-control.test.sh")" in
   ?*) ok "J) POSITIVE CONTROL: the REAL \`\$HERE/wt-lifecycle.sh\` is still a D1 driver — the boundary fix did not narrow the census" ;;
   *) bad "J) POSITIVE CONTROL FAILED: a real wt-lifecycle.sh reference is no longer a driver — D1 became blind and the census is vacuous" ;;
 esac
+# ── #3955 review Findings 2-3: the SEAM-REFERENCE shapes that were INVISIBLE. An unseen driver is
+# never required to neutralise the admission, so each of these made arm J fail OPEN for the suite that
+# uses it. Every one of them is a real bash execution of the seam; the pre-fix predicates skipped all
+# four, and the two `-not` twins below are the anti-narrowing controls that keep the fix from becoming
+# a mention-matcher.
+# D1's "after a SHELL/exec word" leg was DEAD CODE (tok was reset on the whitespace before the quote
+# was examined), so the commonest driver shape in this population was invisible to it.
+printf '. "$HERE/wt-lifecycle.sh"\n' > "$T/drv/dotsource.test.sh"
+case "$(provision_neutralisation_offenders "$T/drv/dotsource.test.sh")" in
+  ?*) ok "J) …a DOT-SOURCE of the seam (\`. "\$HERE/wt-lifecycle.sh"\`) IS a driver — the shape install-controller-service/fleet-inventory use is no longer invisible (Finding 2)" ;;
+  *) bad "J) a \`. "\$HERE/wt-lifecycle.sh"\` dot-source was NOT flagged — D1's after-a-shell-word leg is dead code again and a future suite using the population's own idiom escapes the census (Finding 2)" ;;
+esac
+printf 'bash -c "wt_provision $R .wt x"\n' > "$T/drv/command-payload.test.sh"
+case "$(provision_neutralisation_offenders "$T/drv/command-payload.test.sh")" in
+  ?*) ok 'J) …a code PAYLOAD behind `-c` (`bash -c "wt_provision …"`) IS a driver (Finding 2)' ;;
+  *) bad "J) a \`bash -c "wt_provision …"\` payload was NOT flagged — the quoted payload is CODE, not an argument, and D1 cannot see it (Finding 2)" ;;
+esac
+# ANTI-NARROWING: the two shapes that MUST stay unflagged. If the fix above turns D1 into a
+# mention-matcher, these red instead — which is how the #3916 false positives come back.
+printf 'bad "the pre-start seam every wt_provision caller refuses"\n' > "$T/drv/prose-arg.test.sh"
+printf 'grep -q "wt-lifecycle.sh" "$LOG"\n' > "$T/drv/grep-pattern.test.sh"
+for _fx in prose-arg grep-pattern; do
+  case "$(provision_neutralisation_offenders "$T/drv/$_fx.test.sh")" in
+    '') ok "J) ANTI-NARROWING: '$_fx' is PROSE/ARGV, not a seam reference — still not a driver (Finding 2 must not buy its coverage with a mention-matcher)" ;;
+    *) bad "J) ANTI-NARROWING FAILED: the '$_fx' shape was read as a seam reference — D1 is now a mention-matcher again and would red a healthy suite (#3916's false positive class)" ;;
+  esac
+done
+# D2's heredoc skip keyed on `bash|sh|source` followed by a SPACE **before** the operator, so a body fed
+# to a shell by other means read as DATA: a real driver went unseen (Finding 3).
+printf 'cat <<'"'"'X'"'"' | bash\ncd "$O" && bash "$O/fix-one.sh" "$R"\nX\n' > "$T/drv/pipe-heredoc.test.sh"
+printf 'bash<<'"'"'X'"'"'\ncd "$O" && bash "$O/fix-one.sh" "$R"\nX\n' > "$T/drv/nospace-heredoc.test.sh"
+for _fx in pipe-heredoc nospace-heredoc; do
+  case "$(provision_neutralisation_offenders "$T/drv/$_fx.test.sh")" in
+    ?*) ok "J) …a heredoc body fed to a SHELL by pipe or by an unsplit operator ('$_fx') IS an execution — the skip no longer requires a shell word followed by a SPACE on the opener (Finding 3)" ;;
+    *) bad "J) the '$_fx' body was read as DATA — a body fed to a shell is CODE, and skipping it makes arm J fail OPEN for any suite that feeds provisioning through a pipe (Finding 3)" ;;
+  esac
+done
 
 
 echo
