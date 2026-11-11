@@ -2068,6 +2068,30 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
   //       FIRST mutation).
   // These pins are that regression lock, and they are the evidence #607 needs.
   //
+  // ⛔ WHAT THIS PR DOES **NOT** CLOSE — #656's ROOT, and the reason its record
+  // says so plainly. The closure above is a claim about the classifier's
+  // INVOCATION list. A HIDDEN shell tail (`$(…)`, backticks, `eval "…"`) is
+  // deliberately invisible to that list (#656: `_hasHiddenStateSubst` flags it,
+  // it contributes no invocation, `stateMutations` keeps only the LEAD). Then:
+  // `stateCarveOutClean` is correctly `false` (the list is not provably clean),
+  // the lead's re-baseline is deferred … and there is NO second mutation for the
+  // M3 loop to gate, so index.ts admits the WHOLE command at its VERDICT arm
+  // (`det.verdict === "allow"` → `admitAfterM3()`, which applies the deferred
+  // re-baseline). Measured at this head, end-to-end through the real handler: the
+  // FOREIGN ref inside the substitution is renamed rc 0. So the launder #601
+  // describes is closed for every VISIBLE tail and OPEN for a hidden one — an
+  // earlier draft of this record claimed `$()` was probed clean, which is false:
+  // round 1's probe measured `hidden=true clean=false` and stopped at the
+  // classifier, never reaching the verdict arm that admits it.
+  //
+  // #656 is NOT out of scope because it "has no lead" (its own probes had none):
+  // with a lead the command DOES enter M3, and is still admitted. It is out of
+  // scope here because this PR is test-only and #656's fix is a production
+  // change — a fail-closed return when `hiddenStateSubst` is true, which is the
+  // decision already recorded at classify-git.mjs:4164–4183. Until it lands, the
+  // `⚠️ RESIDUAL` row below PINS TODAY'S ADMITTED BEHAVIOUR as a tripwire so
+  // that this record is true and #656's fix has something to red against.
+  //
   // The mirror below is index.ts's M3 block FAITHFULLY — it loops EVERY
   // `stateMutations` entry (not just the first) and honours the
   // `stateCarveOutClean` early return — because the launder lives in exactly
@@ -2110,22 +2134,33 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
   // Evidence discipline (agent-infra#3442 — a recorded decision: "an assertion whose
   // value cannot vary under any mutation of the diff is dead weight that actively
   // misleads a reader … either make it reachable or delete it. A comment explaining
-  // why it cannot fail is not a fix."): every row below names the mutant that reddens
-  // it, and the rows that could NOT be made reachable were DELETED rather than kept
-  // with a disclaimer. The deleted rows are #601's indicators 2, 3 and 4 at this
-  // layer, and the reason they are unfixable here is structural, not cosmetic:
+  // why it cannot fail is not a fix."): every LOCK row below names the mutant that
+  // reddens it, and a row that could not be made to name one was DELETED rather than
+  // kept with a disclaimer (the ONE exception is the `⚠️ RESIDUAL` row, which is a
+  // tripwire that records a GAP and says so in its own label). The deleted rows are
+  // #601's indicators 2, 3 and 4 at this layer; the two closures behind them —
+  // #626's and #596 round-4's — are both real, but reachability differs per row and
+  // is stated at the measured strength, not stronger (round-5 review corrected an
+  // earlier draft that called both of them unreachable):
   //   • ind2 (`checkout -b … ; branch -fq <foreign>`) — the `create-new` arm returns
   //     `{block:true}` UNCONDITIONALLY (branch-ownership.mjs decideM3, #626), so the
   //     lead blocks and the tail is never reached under ANY mutant. Its closure is
   //     #626's, pinned at test.mjs `#626: … → BLOCKED (no #376 reBaseline)`.
-  //   • ind3 / ind4 (an own-branch delete lead) — `classifyBranchOp` returns
-  //     `{op:"other"}` for delete mode by design, this mirror `continue`s on it, so a
-  //     delete yields NO reBaseline and cannot short-circuit M3 at all. Their closure
-  //     is #596 round-4's, pinned at test.mjs `#596 r4: wt lead + later MAIN rename`,
-  //     `#596: later-segment delete → op other`, and its siblings.
-  // Both closures are already pinned on main; re-pinning them here would be dead
-  // weight. What #1144's `stateCarveOutClean` uniquely owns is the RENAME / RETURN
-  // leads — pinned below with the mutant named per row.
+  //   • ind3 / ind4 (an own-branch delete lead) — a row asserting `block` there is
+  //     NOT unreachable: MEASURED, `git branch -Dq feat/1 ; git branch -Mq feat/other
+  //     rnX` is `block` at base and `allow:no-admitted-mutation` under M3 (the delete
+  //     is `op "other"` → `continue`, so slicing `stateMutations` down to it leaves
+  //     nothing with a reBaseline). So such a row WOULD redden — under M3, a mutant
+  //     of the M3 loop's own list, not under any mutation of #1144's carve-out, which
+  //     is the closure this block exists to pin. `classifyBranchOp` returns
+  //     `{op:"other"}` for delete mode by design, so a delete yields no reBaseline
+  //     for the carve-out to be judged on. Their closure is #596 round-4's, pinned at
+  //     test.mjs `#596 r4: wt lead + later MAIN rename`, `#596: later-segment delete
+  //     → op other`, and its siblings — so deleting them HERE is about attribution
+  //     (they would name a mutant of a different closure), not unreachability.
+  // Both underlying closures are already pinned on main; re-pinning them here would
+  // be dead weight. What #1144's `stateCarveOutClean` uniquely owns is the RENAME /
+  // RETURN leads — pinned below with the mutant named per row.
   //
   // Mutants referenced (all applied to the two `.mjs` modules, no repo file):
   //   M1 = `stateCarveOutClean = !hiddenStateSubst && invocations.every(...)`
@@ -2173,6 +2208,26 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
     " deferred to the verdict arm). M2 is the e2e-layer mutant: this mirror implements the conditional" +
     " itself, so reverting index.ts cannot move it",
     m3Full(ind1, "feat/1"), "block");
+  // ⚠️ RESIDUAL (#656's root — NOT closed by #601). The row below asserts TODAY'S
+  // ADMITTED behaviour, on purpose, so this PR's record is true: a HIDDEN tail is
+  // invisible to the classifier, so the compound reaches the verdict arm and is
+  // admitted (see the block header). It is a TRIPWIRE, NOT A LOCK, and it is the
+  // one row here with NO mutant among M1–M8 — deliberately: none of them can move
+  // it, because the gap it records lives in production's verdict arm and this
+  // diff adds no code it observes. Its non-vacuity is established by its VISIBLE
+  // twin immediately above (same lead, same foreign rename, `block`) rather than
+  // by a mutation of this diff.
+  //   #601's own framing: the launder is closed for every VISIBLE tail and OPEN
+  //   for a hidden one. When #656 lands its recorded fix (fail closed when
+  //   `hiddenStateSubst` is true, per classify-git.mjs:4164–4183) this row goes
+  //   RED — the correct repair is then to INVERT it and cite #656, never to
+  //   delete it. Deleting it would silently restore the "closure complete"
+  //   over-claim this row exists to prevent.
+  expectBool("#601 ⚠️ RESIDUAL (#656 root — NOT closed by #601): a `$()`-hidden FOREIGN rename behind an M3-allowed lead → allow:pending, i.e. ADMITTED at index.ts's verdict arm [no mutant — this row records a GAP, it is a tripwire not a lock]" +
+    " — MEASURED: hidden=true clean=false muts=1 → the lead's reBaseline is deferred and then admitted via" +
+    " admitAfterM3(); the VISIBLE twin above measures `block`, and backticks / eval measure this same" +
+    " allow:pending. Invert this row when #656 lands",
+    m3Full(`git branch -Mq feat/1 rnX ; echo "$(git branch -Mq feat/other tR1)"`, "feat/1"), "allow:pending");
   // The visible-tail matrix. Leads = the TWO reBaseline arms #1144 uniquely owns
   // (own-baseline rename; #376 return-to-original) × every FOREIGN M3-only tail
   // family × all four shell separators git honours = 24 compounds, none admitted.

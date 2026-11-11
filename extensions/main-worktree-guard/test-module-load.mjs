@@ -844,6 +844,48 @@ async function partB() {
     expectTrue("#601 control: benign lead + own force-create is still REFUSED (#591 stateOpCount bound holds) [mutant: M7] — MEASURED: M7 admits it",
       !!m601h && m601h.block === true, `handler returned ${JSON.stringify(m601h)}`);
 
+    // ⚠️ RESIDUAL — #656's ROOT IS NOT CLOSED BY #601, and this row is the record.
+    // A HIDDEN shell tail (`$(…)`, backticks, `eval "…"`) contributes NO invocation,
+    // so `stateMutations` keeps only the LEAD. #1144's flag is then correctly false
+    // (`stateCarveOutClean === false`), the lead's re-baseline is DEFERRED … and
+    // there is no second mutation for the M3 loop to gate, so index.ts admits the
+    // whole command at its VERDICT arm (`det.verdict === "allow"` → `admitAfterM3()`,
+    // which applies the deferred re-baseline). Measured at this head: the FOREIGN ref
+    // inside the substitution is renamed rc 0 — the launder is closed for every
+    // VISIBLE tail (the two rows above) and OPEN for a hidden one.
+    // This is a TRIPWIRE, NOT A LOCK: it asserts TODAY'S ADMITTED behaviour so the
+    // PR's record is true, and it has no mutant among M1–M8 because the gap it
+    // records lives in production's verdict arm. When #656 lands its recorded fix
+    // (fail closed on `hiddenStateSubst`, classify-git.mjs:4164–4183) this row MUST
+    // go RED — invert it and cite #656; never delete it.
+    const m601res = await callBash(`git branch -Mq main rn601res ; echo "$(git branch -Mq feat/601foreign rn601stolen)"`);
+    expectTrue("#601 ⚠️ RESIDUAL (#656 root — NOT closed by #601): a `$()`-hidden FOREIGN rename behind an M3-allowed lead is ADMITTED today (tripwire, not a lock) [no mutant — records a GAP] — invert when #656 lands",
+      m601res === undefined,
+      `handler returned ${JSON.stringify(m601res)} — if this is now {block:true}, #656's fail-closed fix HAS landed: INVERT this row and cite #656`);
+    // …and the hidden tail is a REAL FOREIGN MUTATION, not a no-op spelling. The
+    // handler is a GATE, not an executor — `callBash` returns the verdict and runs
+    // nothing — so the tail is executed here OUTSIDE the gate (the same way the
+    // fixture setup above runs git) to show what the admission lets through, and
+    // then cleaned up. Both refs are purpose-made so no other row's fixture moves.
+    // `-f` (not plain create) so this block is re-runnable: the row is a record of a
+    // GAP, not a one-shot, and a rerun must not die on an existing fixture branch.
+    execSync("git branch -f feat/601foreign HEAD", { cwd: repo, stdio: "ignore" });
+    execSync("git branch -Mq feat/601foreign rn601stolen", { cwd: repo, stdio: "ignore" });
+    let stolen610 = "";
+    try { stolen610 = execSync("git branch --list rn601stolen", { cwd: repo, encoding: "utf8" }).trim(); } catch { stolen610 = ""; }
+    expectTrue("#601 ⚠️ RESIDUAL: …and the substituted tail IS a real foreign-branch rename rc 0 (executed outside the gate — the handler only gates), so the admitted command moves a FOREIGN ref",
+      stolen610.includes("rn601stolen"), `git branch --list rn601stolen → ${JSON.stringify(stolen610)}`);
+    // Restore the fixture: the admitted row left the GUARD's baseline re-based to
+    // `rn601res` (bookkeeping only — no git ran), so the sanctioned return (#376
+    // arm, keyed on `original` = main) puts it back. The following suites require
+    // `baseline.branch === "main"` on exit.
+    const m601resR = await callBash("git checkout main");
+    expectTrue("#601 ⚠️ RESIDUAL harness control: the baseline is re-established after the admitted row [mutants: M5, M8] — MEASURED: blocked under either",
+      m601resR === undefined, `handler returned ${JSON.stringify(m601resR)}`);
+    try { execSync("git branch -q -D rn601stolen", { cwd: repo, stdio: "ignore" }); } catch { /* best-effort fixture cleanup */ }
+    const afterResidual = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repo, encoding: "utf8" }).trim();
+    expect(`#601 ⚠️ RESIDUAL: the fixture is back on main with no stray branch (state: ${afterResidual})`, afterResidual, "main");
+
     // ── B9w–B9z: #2277 — a lane rooted ELSEWHERE can advance a hub, but only
     // on a MEASURED fast-forward proof ────────────────────────────────────
     // Measured 2026-10-21 on the agent-infra hub itself: `0 ahead / 76 behind
