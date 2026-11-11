@@ -120,6 +120,12 @@ printf '%s\n' "CMUX $*" >> "${CMUX_LOG:-/dev/null}"
 if [ "${CMUX_ABSENT:-0}" = "1" ]; then echo "cmux: no daemon from the surface-stub" >&2; exit 1; fi
 case "${1:-}" in
   tree)
+    # ⛔ A SLOW DAEMON, IN WHOLE SECONDS, because the census BUILD'S OWN COST is the input one arm
+    # below drives (§K2): `WT_TABLE_TTL` is floored at `2 x took`, so a build slower than its configured
+    # window must still produce a memo that can be hit. Without this knob the pre-fix defect (a memo
+    # whose window is shorter than its own construction) is only reachable on a box whose census is
+    # genuinely large — i.e. never on CI.
+    [ -n "${CMUX_TREE_SLEEP:-}" ] && sleep "$CMUX_TREE_SLEEP"
     # ⛔ AN ABSENT SESSION OWNER: no stdout, a transport error ON STDERR, non-zero rc. This is the
     # measured shape of the live cell on 2026-10-24 (`cannot connect to session socket …: Connection
     # refused (os error 111)`) and it is a READING, not an unreadable census (agent-infra#2653).
@@ -1778,6 +1784,71 @@ case "$out" in *"probes=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "three separate census questions cost ONE daemon read (the memo survives the subshell)" $rc
 case "$out" in *"answers=yes/1/yes"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…and the memo answers all three correctly" $rc
+
+# ⛔ K2) A MEMO WHOSE WINDOW IS SHORTER THAN ITS OWN CONSTRUCTION IS A NO-OP GATE (#3585).
+# MEASURED 2026-11-10: a census build over ~105 worker records takes 10-12 s (9.1 s cold, 28.6 s under
+# load), `WT_TABLE_TTL` defaulted to a flat 10 s, and the entry was stamped at build START — so the memo
+# was ALREADY outside its window when it landed and was never once hit. Every question rebuilt the whole
+# census; `reap_stale_workers` asks it once per candidate (#3756), so a reap pass cost 90 builds and 27
+# minutes for work that took 12 s at cycle 117. The count is the whole assertion: a slow daemon (2 s)
+# against a TTL smaller than that build must STILL answer the second question from the memo, because the
+# window is `max(configured, 2 x took)`. The pre-fix code answers this with `probes=2`.
+cat > "$TMP/k2.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=1; mkdir -p "$WT_DIR"
+export CMUX_LOG="$4" CMUX_TREE_SLEEP=2; : > "$CMUX_LOG"
+. "$1"
+printf 'kind=terminal\nid=term_host42\nworkspace=\n' > "$WT_DIR/worker-merge-5"
+export CMUX_TREE_JSON='{"workspaces":[],"screens":[],"tabs":[],"terminals":[{"id":"term_host42","running":true}]}'
+x="$(wt_alive merge-5 && echo yes)"; y="$(wt_alive merge-5 && echo yes)"
+printf 'answers=%s/%s probes=%s\n' "$x" "$y" "$(grep -c 'CMUX tree' "$CMUX_LOG")"
+# The duration the window is derived from is an ARTIFACT, not an inference: it rides in the header.
+printf 'header=%s\n' "$(head -1 "$WT_DIR/.wt-census" 2>/dev/null)"
+SH
+out="$(bash "$TMP/k2.sh" "$LIB" "$TMP/bin-host" "$TMP/O13e" "$TMP/cmux13e.log" 2>&1)"
+case "$out" in *"probes=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a build SLOWER than WT_TABLE_TTL still memoizes (the window is floored at twice the build)" $rc
+case "$out" in *"answers=yes/yes"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and both answers are still correct (the floor widens the window, it does not change a verdict)" $rc
+case "$out" in *"took=0"*|*"took="$'\n'*) rc=1; echo "      $out" ;; *"header=# at="*" took="*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and the header RECORDS the build's own cost, which is what the window is judged against" $rc
+# ⛔ A CACHE THE NEW PARSER CANNOT READ MUST NOT BECOME A CENSUS THAT CANNOT BE READ. A header written
+# by an older harness (or a fixture) carries no `took=`: the window falls back to the configured one
+# rather than the entry being rejected — rejecting it would silently turn every memoised read into a
+# rebuild, which is the defect this arm is about, reached from the other side.
+cat > "$TMP/k3.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=10; mkdir -p "$WT_DIR"
+export CMUX_LOG="$4"; : > "$CMUX_LOG"
+. "$1"
+printf '# at=%s\nmerge-5\talive\n' "$(date +%s)" > "$WT_DIR/.wt-census"
+printf 'alive=%s probes=%s\n' "$(wt_alive merge-5 && echo yes)" "$(grep -c 'CMUX tree' "$CMUX_LOG")"
+SH
+out="$(bash "$TMP/k3.sh" "$LIB" "$TMP/bin-host" "$TMP/O13f" "$TMP/cmux13f.log" 2>&1)"
+case "$out" in *"alive=yes probes=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a memo header with no recorded duration still serves (an older cache is not a forced rebuild)" $rc
+# ⛔ A TTL THIS FUNCTION CANNOT PARSE MEANS "NO MEMO", WHICH IS WHAT IT ALWAYS MEANT (review of this
+# diff, P3 — MEASURED). On the code this replaces, `[ "${ttl:-0}" -gt 0 ]` was rc 2 for `off`, so the
+# memo block was skipped: an operator writing `WT_TABLE_TTL=off` got no memo. Coercing a malformed value
+# to the DEFAULT would have silently turned that back into a 10 s cache — the unsafe direction, since the
+# memo's staleness is what `wt_alive` and the caps read. `0` is the disable seam; a value that cannot be
+# parsed lands there, and this arm is what stops the next edit from "tidying" it to the default.
+cat > "$TMP/k4.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL="${5:-off}"; mkdir -p "$WT_DIR"
+export CMUX_LOG="$4"; : > "$CMUX_LOG"
+. "$1"
+printf 'kind=terminal\nid=term_host42\nworkspace=\n' > "$WT_DIR/worker-merge-5"
+export CMUX_TREE_JSON='{"workspaces":[],"screens":[],"tabs":[],"terminals":[{"id":"term_host42","running":true}]}'
+x="$(wt_alive merge-5 && echo yes)"; y="$(wt_alive merge-5 && echo yes)"
+printf 'answers=%s/%s probes=%s\n' "$x" "$y" "$(grep -c 'CMUX tree' "$CMUX_LOG")"
+SH
+out="$(bash "$TMP/k4.sh" "$LIB" "$TMP/bin-host" "$TMP/O13g" "$TMP/cmux13g.log" 2>&1)"
+case "$out" in *"probes=2"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a WT_TABLE_TTL this cannot parse DISABLES the memo (it never becomes the 10 s default)" $rc
+out="$(bash "$TMP/k4.sh" "$LIB" "$TMP/bin-host" "$TMP/O13h" "$TMP/cmux13h.log" 0 2>&1)"
+case "$out" in *"probes=2"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…and the explicit 0 seam still means the same thing" $rc
 
 echo
 echo "── L) a spawn that cannot RECORD itself is not a success ──"
