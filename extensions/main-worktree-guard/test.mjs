@@ -981,8 +981,19 @@ dexpect("#594 alias via --config: same expansion",
 dexpect("#594 persist-then-invoke in ONE command: `git config alias.x … && git x` is BLOCKED (a persisted write cannot be verified)",
   `git config alias.x 'branch -fq victim main' && git x`,
   { branchState: true });
-dexpect("#594 GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n definition EXPANDS",
-  `GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victim main' git br`,
+dexpect("#594 GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n definition EXPANDS — but only WITH GIT_CONFIG_COUNT",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victim main' git br`,
+  { branchState: true, verb: "branch" });
+// git reads the numbered pairs ONLY through the GIT_CONFIG_COUNT loop (measured
+// rc 0, round 7): without it the pair is INERT, so harvesting it fabricated a
+// benign definition and let a persisted alias run.
+dexpect("#594-R7a a GIT_CONFIG_KEY_n pair WITHOUT GIT_CONFIG_COUNT is inert → the verb stays opaque",
+  `GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`, { branchState: true, verb: "br" });
+dexpect("#594-R7b GIT_CONFIG_COUNT=0 is the same (pairs ignored) → opaque",
+  `GIT_CONFIG_COUNT=0 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`,
+  { branchState: true, verb: "br" });
+dexpect("#594-R7c control — with GIT_CONFIG_COUNT=1 the pair IS live and expands",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victim main' git br`,
   { branchState: true, verb: "branch" });
 dexpect("#594 --config-env resolves against the statement's own env prefix",
   `AL='checkout victim' git --config-env=alias.co=AL co`,

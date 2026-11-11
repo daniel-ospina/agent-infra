@@ -3966,7 +3966,11 @@ export function _branchInvMutatesBranchState(args) {
  * installed): `git config alias.p4 'branch -fq victimP <sha>'; git p4` moved the
  * ref rc 0 while the classifier answered branchState:false. A name git does not
  * know can only cost the alias expansion for that one spelling (git rejects it
- * rc 129 — probe-verified) — the safe direction.
+ * rc 129 — probe-verified) — the safe direction. The SAME applies in the other
+ * direction on a git UPGRADE: a builtin a newer git adds is absent here → the
+ * verb is treated as opaque → refused in a main checkout (friction, not a hole:
+ * fail-closed), so a git upgrade that adds commands must regenerate this list in
+ * the same change.
  *
  * WHY (issue #594, Finding 1): git resolves `git <word>` as an ALIAS inside its
  * own process whenever <word> is not a command — `git -c alias.co='checkout
@@ -4034,11 +4038,15 @@ const GIT_BUILTIN_COMMANDS = new Set([
  *     statement's vars → its env prefixes → process.env; an unresolvable name
  *     is reported as null = "defined, value opaque"
  *   - `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs from the statement's
- *     vars or its env prefixes (the same sources _effectiveConfig reads)
- *   - `git config [--add|--replace-all] [--global] alias.x <value>` — the
- *     persist-then-invoke form (`git config alias.x '…' && git x`) that the
- *     #591 fold only half-covered: it refused the M3 carve-out but never
- *     gated the invocation itself (probe-verified rc 0).
+ *     vars or its env prefixes (the same sources _effectiveConfig reads),
+ *     ONLY when `GIT_CONFIG_COUNT` is a positive integer <= 64 — git ignores the
+ *     numbered pairs entirely without it (probe-verified rc 0, round 7)
+ * ⛔ It does NOT read `git config alias.x <value>` writes, and it must not: the
+ * config scope order (system→global→local→worktree→cmdline) means a write the
+ * guard CAN see is still shadowed by a file it cannot, so a persisted definition
+ * is never expanded — the later `git <name>` is `aliasOpaque` and fails closed
+ * (rounds 4-5): `git config alias.x '…' && git x` is therefore BLOCKED, not
+ * expanded.
  * A `!`-prefixed value (git's shell-command alias) is reported as null: the
  * value is arbitrary shell text, so "the alias IS this command" is not a claim
  * the walk may make.
@@ -4085,22 +4093,41 @@ function _aliasDefsFromInvocation(inv) {
   // WINS over an env pair with the same key — measured fail-open the other way:
   // `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=status git -c
   // alias.x='branch -fq victim main' x` runs the destructive `-c` alias.
-  const cfgPairs = new Map();
-  const collectPair = (k, v) => {
-    const mk = /^GIT_CONFIG_KEY_(\d+)$/.exec(String(k ?? ""));
-    if (mk) cfgPairs.set(mk[1], { ...(cfgPairs.get(mk[1]) || {}), key: v });
-    const mv = /^GIT_CONFIG_VALUE_(\d+)$/.exec(String(k ?? ""));
-    if (mv) cfgPairs.set(mv[1], { ...(cfgPairs.get(mv[1]) || {}), value: v });
-  };
-  for (const [k, v] of Object.entries(inv.vars || {})) {
-    if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(k)) collectPair(k, v);
-  }
-  for (const p of inv.envPrefixes || []) {
-    const e = String(p).indexOf("=");
-    if (e > 0) collectPair(String(p).slice(0, e), String(p).slice(e + 1));
-  }
-  for (const [, pair] of cfgPairs) {
-    if (pair.key !== undefined) takeAlias(pair.key, pair.value ?? null);
+  // ⛔ THE NUMBERED PAIRS ARE INERT WITHOUT `GIT_CONFIG_COUNT` (review round 7):
+  // git reads them ONLY through the `GIT_CONFIG_COUNT` loop, so with the count
+  // unset or 0 the pairs are IGNORED — measured (git 2.43.0, persisted
+  // destructive `alias.br`): `GIT_CONFIG_KEY_0=alias.br
+  // GIT_CONFIG_VALUE_0=status git br` created the victim branch rc 0. Harvesting
+  // them unconditionally therefore fabricated a benign definition and let a
+  // persisted alias run — the exact bypass this issue closes. The gate mirrors
+  // `_effectiveConfig`'s (`Number(GIT_CONFIG_COUNT) > 0`, capped at 64).
+  const cfgCount = (() => {
+    const raw = (inv.envPrefixes || []).map((p) => {
+      const e = String(p).indexOf("=");
+      return e > 0 && String(p).slice(0, e) === "GIT_CONFIG_COUNT" ? String(p).slice(e + 1) : null;
+    }).filter((v) => v !== null).pop() ??
+      (inv.vars && Object.prototype.hasOwnProperty.call(inv.vars, "GIT_CONFIG_COUNT") ? inv.vars.GIT_CONFIG_COUNT : null);
+    const n = Number(raw);
+    return Number.isInteger(n) && n > 0 && n <= 64 ? n : 0;
+  })();
+  if (cfgCount > 0) {
+    const cfgPairs = new Map();
+    const collectPair = (k, v) => {
+      const mk = /^GIT_CONFIG_KEY_(\d+)$/.exec(String(k ?? ""));
+      if (mk) cfgPairs.set(mk[1], { ...(cfgPairs.get(mk[1]) || {}), key: v });
+      const mv = /^GIT_CONFIG_VALUE_(\d+)$/.exec(String(k ?? ""));
+      if (mv) cfgPairs.set(mv[1], { ...(cfgPairs.get(mv[1]) || {}), value: v });
+    };
+    for (const [k, v] of Object.entries(inv.vars || {})) {
+      if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(k)) collectPair(k, v);
+    }
+    for (const p of inv.envPrefixes || []) {
+      const e = String(p).indexOf("=");
+      if (e > 0) collectPair(String(p).slice(0, e), String(p).slice(e + 1));
+    }
+    for (const [idx, pair] of cfgPairs) {
+      if (pair.key !== undefined && Number(idx) < cfgCount) takeAlias(pair.key, pair.value ?? null);
+    }
   }
   // ⛔ ONE ORDERED CONFIG LIST, exactly as git reads it (review round 3): the
   // RELATIVE argv order of `-c` and `--config-env` decides the winner, so a
