@@ -861,6 +861,49 @@ _FDIR="$TMP/store-as-file"; mkdir -p "$_FDIR/.config"; : > "$_FDIR/.config/gh"
 _ff="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$_FDIR/.config/gh'")"
 [ "$_ff" = unreadable ]; rc=$?
 ck "B13t …and a store path that is a regular FILE is UNREADABLE, not empty ('$_ff')" $rc
+# ⛔ BUT ONLY A **DANGLING** SYMLINK IS THAT SHAPE (review round 25, measured): the round-22 predicate was a
+# bare `[ -L "$d" ]`, which calls EVERY symlinked store directory unopenable — including one that points at
+# a traversable, EMPTY store. That is the same class one shape over: `gh_auth_cause` then said "this read
+# could not OPEN it … fix those PERMISSIONS; the credential may well be there" about a directory it had
+# OPENED and found empty, sending the operator to the wrong fault entirely. A symlink that resolves answers
+# for its TARGET below.
+SYMLINKED="$TMP/store-symlinked"; mkdir -p "$SYMLINKED/.config" "$TMP/store-symlinked-real"
+ln -sfn "$TMP/store-symlinked-real" "$SYMLINKED/.config/gh"
+_sl="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$SYMLINKED/.config/gh'")"
+[ "$_sl" = empty ]; rc=$?
+ck "B13u …but a symlink that RESOLVES to a traversable store dir with no hosts.yml is EMPTY, not unreadable ('$_sl')" $rc
+_slc="$(u ". '$GH_AUTH' >/dev/null 2>&1; gh_auth_cause '$SYMLINKED' '$TMP/none.env' '$ACCT_EMPTY'")"
+case "$_slc" in *"<unreadable: $SYMLINKED/.config/gh>"*) rc=1 ;; *) rc=0 ;; esac
+ck "B13v …so the cause names it as the lane-HOME store it IS (no '<unreadable: …>' marker) rather than a door it could not open" $rc
+# ⛔ AND `empty` MUST ONLY BE SPOKEN FOR A REACHABLE PATH (review round 25, P3): round 22's fix caught the
+# dangling STORE and left the UNSEARCHABLE ANCESTOR its own comment claimed — `-e` and `-L` are both FALSE
+# behind a directory this process cannot search, so the helper answered `empty` and the cause named a store
+# to create over one that is there. `_gh_auth_searchable` is a named predicate so this shape can be injected
+# at ANY uid (uid 0 reads through every permission bit, so a `chmod` fixture would be green there).
+# ⛔ THE INJECTED SHAPE PUTS AN ABSENT STORE UNDER A DENIED ANCESTOR, WHICH IS WHAT A REAL ONE LOOKS LIKE FROM
+# HERE: behind a directory this read cannot search, `$d`, `$d/hosts.yml` and `-L "$d"` are all FALSE — the
+# injection reproduces exactly that reading (`$d` genuinely absent) and adds only the ancestor verdict, so the
+# arm measures the WALK and nothing else.
+BLIND="$TMP/store-blindanc"; mkdir -p "$BLIND/.config"
+_ba="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_searchable() { [ \"\$1\" = '$BLIND/.config' ] && return 1; [ -x \"\$1\" ]; }; _gh_auth_store_in '$BLIND/.config/gh'")"
+[ "$_ba" = unreadable ]; rc=$?
+ck "B13w …and a store whose ANCESTOR this read cannot search is UNREADABLE, not empty ('$_ba')" $rc
+_bac="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_searchable() { [ \"\$1\" = '$BLIND/.config' ] && return 1; [ -x \"\$1\" ]; }; gh_auth_cause '$BLIND' '$TMP/none.env' '$ACCT_EMPTY'")"
+case "$_bac" in *"<unreadable: $BLIND/.config/gh>"*) rc=0 ;; *) rc=1 ;; esac
+ck "B13x …and the cause discloses it rather than naming a store the operator should create" $rc
+# ⛔ AND THE REAL SHAPE, NOT ONLY THE INJECTED ONE — the same rule B13g/B13h apply to readability: a `chmod`
+# shape cannot be built as uid 0, so it is a declared RESERVATION there and never counted as a pass.
+REALANC="$TMP/store-realanc"; mkdir -p "$REALANC/parent/store"; printf 'user: x\n' > "$REALANC/parent/store/hosts.yml"
+chmod 000 "$REALANC/parent"
+if [ "$(id -u)" = 0 ]; then
+  SKIPPED=$((SKIPPED+1))
+  printf '  ⏭️  B13y SKIPPED (uid 0 reads through permission bits, so an unsearchable ANCESTOR cannot be built here) — UNMEASURED in this run\n'
+else
+  _ra="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$REALANC/parent/store'")"
+  [ "$_ra" = unreadable ]; rc=$?
+  ck "B13y …on the FILESYSTEM too: a store behind a real chmod-000 parent is unreadable, not empty ('$_ra')" $rc
+fi
+chmod 755 "$REALANC/parent"
 
 # ⛔ READABILITY IS PINNED ON **EVERY** STORE ARM, NOT JUST `home` AND `ambient` (review round 17, P2):
 # flipping the predicate back to `[ -f ]` in the `keys` arm ALONE left the suite green, and on a
