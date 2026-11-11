@@ -795,7 +795,20 @@ done
 # (`:168-169`), neither of which is `$DEST/scripts` — so its "repo identity UNVERIFIED" walk is
 # untouched by this entry and needs its own fix. An earlier revision of this comment claimed the
 # warning was the degradation this entry removes; it is not, and the paths were measured.
-mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh repo-slug.sh)
+# ⛔ `brief-gate.sh` (#3958) IS A PRODUCER THE FARM MUST CARRY, and it is the one that decides whether
+# the revalidation is a check or a formality. `worker-supply.sh` is farmed by `fleet_srcs` (nested dest
+# `$DEST/scripts/orchestrator-harness/`), and its `brief_gate_path()` walks the DISPATCHER's four-rung
+# ladder — `$O`, its own directory, `$AGENT_INFRA_PATH/scripts/orchestrator-harness/`, and the FLAT
+# `$HOME/.pi/agent/scripts/brief-gate.sh`. On a farmed box with no checkout, three of those four cannot
+# exist and the FLAT one is the only rung that can: deliver it anywhere else and `brief_verdict()`
+# answers 78 ("no brief-gate.sh on any resolved root") on every pass, so #3958's revalidation degrades
+# to the fall-through and the fossil is re-offered exactly as before. That is the
+# `producer(s) exec'd by a farmed consumer and DELIVERED BY NOTHING: brief-gate.sh` failure (#1552/#1899)
+# measured by `pi-bootstrap/tests/test-setup-no-nesting.sh`, which is why this entry is here and not in
+# `fleet_srcs`: the destination this consumer searches is the FLAT `$DEST/scripts/`, the same
+# src-one-down/dest-flat shape `repo-slug.sh` above already takes. Its one optional dependency,
+# `scripts/lib/bounded.sh`, is already farmed by `lib_srcs` and resolved from the sibling `lib/`.
+mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh repo-slug.sh brief-gate.sh)
 for base in "${mcp_harness_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
   f="$INFRA_ROOT/scripts/orchestrator-harness/$base"
