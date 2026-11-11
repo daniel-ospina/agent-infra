@@ -1087,9 +1087,15 @@ wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -
 // looked up `refs/heads/b)` and found nothing checked out: the #73 block that
 // protects a sibling-held branch ALLOWED the delete (probe-verified end-to-end
 // from a linked worktree, where M2 is exempt). The segment is now tokenized
-// with the module's quote-aware splitter and truncated at the first shell
-// BOUNDARY token. Only `_SHELL_OPS` (`&& || | & ; ( )`) ends a segment, and an
-// unquoted backtick does too (see _truncateAtUnquotedBacktick).
+// with the module's quote-aware splitter (`_tokenize`) and bounded by three rules:
+//   1. `_SHELL_OPS` WITHOUT the parens (`&& || | & ;`) ends the segment;
+//   2. a redirect is NOT a boundary — the token is skipped with its filename operand;
+//   3. a span that OPENS inside the segment (`$( … )`, `<( … )`, `<backtick>…<backtick>`) is one WORD:
+//      its contents are skipped and the scan CONTINUES, while a `)` / unpaired backtick with no
+//      opener inside the segment ends it (that is the #504 case itself).
+// (An earlier revision of this comment named `_truncateAtUnquotedBacktick` and claimed `(` ends a
+// segment; that function no longer exists and the claim was backwards — it described exactly the
+// round-2 fail-open. Corrected in place, see round-3 review finding.)
 wcdt("parenthesized later-segment -d under block:push", "block:push", "git push origin main && (git push origin -d b)", ["b"]);
 wcdt("parenthesized later-segment --delete under block:push", "block:push", "git push origin main && (git push origin --delete b)", ["b"]);
 wcdt("command-substitution later-segment -d", "block:push", "git push origin main && echo $(git push origin -d b)", ["b"]);
@@ -1123,9 +1129,20 @@ wcdt("BACKTICK substitution opener keeps the flag and target", "block:push", "gi
 // ⛔ NO fd-dup ROW HERE (fresh-context review round 2, finding 2). `segRe`'s capture is `[^;&|]*`, so
 // it stops at the `&` inside `>&2` / `2>&1`: those tokens can NEVER reach `_redirectTakesOperand`, and
 // with the target placed BEFORE the redirect the row could not redden under any mutation (observed 0/13).
-// The unreachable `&>`/`&>>`/fd-dup branches were dropped from the helper for the same reason — the
-// reachable `>`/`>>`/`<`/`2>` forms are pinned by the rows above.
-wcdt("redirect AFTER the target (control)", "block:push", "git push origin -d b 2>/dev/null", ["b"]);
+// The unreachable `&>`/`&>>`/fd-dup branches were dropped from the helper for the same reason.
+// Nor a "redirect after the target" row (round 3, finding 3): the target precedes the redirect there, so
+// no mutant of this change can move it — the shape that PINS the operand-skip is the one below.
+wcdt("the redirect's filename is not an argv word", "block:push", "git push origin -d 2>/dev/null b", ["b"]);
+// ⛔ A PROCESS-SUBSTITUTION WORD IS NOT A FILENAME (fresh-context review round 3, P2). `<( list )` is one
+// WORD (bash manual §5.1) but `_tokenize` emits `<` + `(` as separate tokens, so consuming the next
+// token as the redirect's filename ate the span OPENER and the span's `)` then terminated the segment:
+// `git push origin <(cat f) -d b` → null where origin/main → ["b"].
+wcdt("a process-substitution WORD before the flag", "block:push", "git push origin <(cat f) -d b", ["b"]);
+wcdt("an OUTPUT process-substitution WORD before the flag", "block:push", "git push origin >(cat f) -d b", ["b"]);
+// An UNRESOLVABLE target (a substitution in the delete-target position names no ref) must not become a
+// PHANTOM target: origin/main reported `["$(echo"]` / `["`cat"]`, which no ref can match either. The
+// placeholder is dropped, so the extractor says "nothing resolvable" instead of inventing a name.
+wcdt("substitution in the TARGET position yields no target (not a phantom)", "block:push", "git push origin -d $(echo b)", []);
 // The fold-in path (frozen legacy evidence in a LATER segment) overrides
 // pushTargets with the SAME extractor — the parenthesized twin must attribute
 // the real target there too, not the phantom `b)`.
@@ -1133,11 +1150,12 @@ dexpect("parenthesized later-segment --delete → real target only", `git push o
 // QUOTED text is data, not a shell operator: a ref legitimately named `b)`
 // must survive (git ref names allow parentheses), so the boundary rule must be
 // quote-AWARE — a blanket trailing-`)` strip would corrupt it. Same for a quoted
-// backtick.
+// backtick. This row reddens under the quote-unaware fold (round-3 attribution table).
 wcdt("a QUOTED paren stays part of the ref name", "block:push", "git push origin main && git push origin -d 'feat/x)'", ["feat/x)"]);
 wcdt("a QUOTED backtick stays part of the ref name", "block:push", "git push origin main && git push origin -d 'feat/x`'", ["feat/x`"]);
-// Negative controls: the boundary rule must not invent targets.
-wcdt("parenthesized segment with a plain push → none", "block:push", "git push origin main && (git push origin main)", []);
+// ⚠️ CONTROL, NOT A DISCRIMINATOR (round-3 review, finding 3): this row cannot redden under any mutant of
+// this change — it can only catch a GROSS over-block that refuses a plain push outright.
+wcdt("CONTROL: parenthesized segment with a plain push → none", "block:push", "git push origin main && (git push origin main)", []);
 // --d is AMBIGUOUS with --dry-run — git rejects it (rc 129, probe-verified);
 // it never deletes, so it stays a plain block:push (never block:push-delete).
 dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });

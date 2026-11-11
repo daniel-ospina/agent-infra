@@ -4845,7 +4845,10 @@ function _foldBacktickSubstitutions(body) {
 /** One opaque word standing in for a collapsed command substitution (`$( … )` / backticks).
  *  NUL cannot occur in a shell word (bash words are NUL-terminated C strings) and it matches no
  *  flag/target shape, so consumers treat it as an ordinary positional — exactly what the
- *  substitution's WORD is. */
+ *  substitution's WORD is. `_cleanDeleteTarget` maps it to "" so it can never be reported as a
+ *  BRANCH NAME: `git push origin -d $(cat list)` names no ref we can resolve, and reporting the
+ *  placeholder as a target would put a phantom into `_coordinatedDeleteBlock` (the pre-existing base
+ *  behaviour reported `["$(echo"]`, equally phantom). */
 const _SUBST_PLACEHOLDER = "\u0000SUBST";
 
 /**
@@ -4899,7 +4902,13 @@ function _pushSegmentTokens(body) {
   let depth = 0; // parens OPENED inside this segment: their span is one WORD, not a boundary
   for (let i = 0; i < toks.length; i++) {
     const t = toks[i];
-    if (t === "(") { depth++; continue; }
+    if (t === "(") {
+      // The `$` of a `$( … )` is a separate token from `_tokenize`; it is part of the span, not an
+      // argv word, so do not let it sit in the token list as a positional.
+      if (tokens[tokens.length - 1] === "$") tokens.pop();
+      depth++;
+      continue;
+    }
     if (t === ")") {
       if (depth > 0) {
         depth--;
@@ -4910,7 +4919,13 @@ function _pushSegmentTokens(body) {
     }
     if (_SHELL_OPS.has(t)) break; // ; & && || | — a real list separator
     if (_isRedirectOperator(t)) {
-      if (_redirectTakesOperand(t)) i++; // the filename is not an argv word
+      // ⛔ A PROCESS-SUBSTITUTION WORD IS NOT A FILENAME (round-3 review, P2). `<( list )` /
+      // `>( list )` is a single WORD passed as an argument (bash manual §5.1), but `_tokenize` drops
+      // the adjacency and emits `<` + `(` as two tokens — so consuming the next token as the
+      // redirect's filename ate the span OPENER, depth stayed 0, and the span's `)` then terminated
+      // the segment: `git push origin <(cat f) -d held/branch` returned null where origin/main
+      // returned the target. Leave `(` alone and let the span rule above handle it.
+      if (_redirectTakesOperand(t) && toks[i + 1] !== "(") i++; // the filename is not an argv word
       continue;
     }
     if (depth > 0) continue; // inside a substitution span — its words are not this command's argv
@@ -4923,6 +4938,10 @@ function _pushSegmentTokens(body) {
 
 /** Short-name a raw delete target token (`:refs/heads/feat/x` → `feat/x`). */
 function _cleanDeleteTarget(x) {
+  // A collapsed substitution (see _SUBST_PLACEHOLDER) is not a branch name we can resolve — drop it
+  // rather than hand a phantom to `_coordinatedDeleteBlock` (see the jsdoc there and the follow-up
+  // issue for the unresolvable-target residual).
+  if (x === _SUBST_PLACEHOLDER) return "";
   return x
     .replace(/^["']|["']$/g, "")   // strip surrounding quotes
     .replace(/^:+/, "")             // leading empty-source colon(s)

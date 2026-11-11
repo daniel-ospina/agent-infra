@@ -420,7 +420,11 @@ async function partB() {
       const isCoordBlock = (r, branch) => !!r && r.block === true &&
         /checked out in/.test(r.reason ?? "") && (r.reason ?? "").includes(branch);
       const d1 = await coord("d1", "git push origin HEAD:refs/heads/feat && git push origin --delete held/branch");
-      expectTrue("B73a: later-segment `--delete` of a sibling-held branch is BLOCKED by the #73 arm (#504)",
+      // ⚠️ B73a is a WIRING PIN, not a discriminator (#3442 rule 3, round-3 review): it stays green on
+      // origin/main too — it proves the loaded extension still routes the body-delete repro through the
+      // #73 arm, the same role B6b plays above. The DISCRIMINATING rows are B73b/c/d/g (base) and
+      // B73e/f/h/i (intermediate revisions this PR itself shipped).
+      expectTrue("B73a: later-segment `--delete` of a sibling-held branch is BLOCKED by the #73 arm (#504; wiring pin, not a discriminator)",
         isCoordBlock(d1, "held/branch"), `handler returned ${JSON.stringify(d1)?.slice(0, 200)}`);
       const d2 = await coord("d2", "git push origin HEAD:refs/heads/feat && (git push origin --delete held/branch)");
       expectTrue("B73b: the PARENTHESIZED later segment is BLOCKED too (#504 residual; the target is not `held/branch)`)",
@@ -453,6 +457,15 @@ async function partB() {
       const d9 = await coord("d9", "git push origin HEAD:refs/heads/feat && git push origin `date` -d held/branch");
       expectTrue("B73i: a backtick-substitution OPENER before the delete flag does not hide the delete",
         isCoordBlock(d9, "held/branch"), `handler returned ${JSON.stringify(d9)?.slice(0, 200)}`);
+      // ⛔ A PROCESS-SUBSTITUTION WORD IS NOT A FILENAME (round-3 review, P2): `<( list )` is one word,
+      // so consuming the token after `<` as a redirect filename ate the span opener and the span's `)`
+      // then ended the segment.
+      const d10 = await coord("d10", "git push origin HEAD:refs/heads/feat && git push origin <(cat f) -d held/branch");
+      expectTrue("B73j: a `<( … )` WORD before the delete flag does not hide the delete",
+        isCoordBlock(d10, "held/branch"), `handler returned ${JSON.stringify(d10)?.slice(0, 200)}`);
+      const d11 = await coord("d11", "git push origin HEAD:refs/heads/feat && git push origin -d 2>/dev/null held/branch");
+      expectTrue("B73k: a redirect BETWEEN the delete flag and its target keeps the target",
+        isCoordBlock(d11, "held/branch"), `handler returned ${JSON.stringify(d11)?.slice(0, 200)}`);
       // Positive controls — the boundary fix must not invent targets: a delete of
       // a branch NOBODY has checked out stays allowed, and so does a plain
       // compound push (the #73 arm must not fire on it).
