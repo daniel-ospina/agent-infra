@@ -568,6 +568,49 @@ async function main() {
     expectTrue("R9 #608: …the `-d` → `-D` escalation still works (the UPSTREAM leg also spends nothing when git refuses)",
       r9hard === undefined && branchExists("feat/608r9") === false,
       `handler returned ${JSON.stringify(r9hard)?.slice(0, 240)}`);
+    // R10 (review round-2 P1, the FAIL-OPEN leg) — an upstream that is
+    // CONFIGURED but GONE (`[gone]` after `git fetch --prune`). `%(upstream)`
+    // still prints the refname, but git's `branch_merged()` cannot resolve it and
+    // falls back to HEAD — so git DELETES the merged branch. A probe that trusts
+    // the refname returns "refused" and KEEPS the claim: a stale authorization
+    // for a ref this session no longer holds, the #608 destruction itself.
+    const r10 = await ceremony("feat/608r10");
+    expectTrue("R10 #608: ceremony → ALLOW", r10.renamed === undefined && r10.back === undefined, JSON.stringify(r10)?.slice(0, 200));
+    execSync("git config branch.feat/608r10.remote origin && git config branch.feat/608r10.merge refs/heads/main",
+      { cwd: hub, stdio: "ignore" });
+    execSync("git update-ref -d refs/remotes/origin/main", { cwd: hub, stdio: "ignore" }); // `--prune` took it
+    const r10up = execSync("git for-each-ref --format='%(upstream)' refs/heads/feat/608r10",
+      { cwd: hub, encoding: "utf-8" }).trim();
+    expectTrue("R10 #608 fixture: the upstream is configured but does NOT resolve, yet %(upstream) still prints a refname",
+      r10up !== "" && r10up.includes("origin"),
+      `%(upstream) printed ${JSON.stringify(r10up)}`);
+    const r10soft = await callRun("git branch -d feat/608r10");
+    expectTrue("R10 #608: soft `-d` with a GONE upstream → ADMITTED and git really DELETES it (falls back to HEAD)",
+      r10soft === undefined && branchExists("feat/608r10") === false,
+      `handler returned ${JSON.stringify(r10soft)?.slice(0, 240)}`);
+    execSync(`git branch feat/608r10 ${mainSha()}`, { cwd: hub, stdio: "ignore" }); // sibling re-creates
+    const r10stale = await callBashSafe("git branch -M main feat/608r10");
+    expectTrue("R10 #608: that delete SPENT the claim (the probe tracks git, not the refname) → rename BLOCKS",
+      !!r10stale && r10stale.block === true && String(r10stale.reason || "").includes(CLAIM_SPENT),
+      `handler returned ${JSON.stringify(r10stale)?.slice(0, 240)}`);
+
+    // R11 (review round-2 P2) — the M4 hub-disorder arm is an ADMISSION too, and
+    // it sits ~200 lines BEFORE the M3 funnel. With the hub disordered, M4 routes
+    // `git branch -D <non-checked-out>` through the #436 (B) carve-out and answers
+    // "allowed", so a spend wired only to the funnel leaves the claim intact.
+    const r11 = await ceremony("feat/608r11");
+    expectTrue("R11 #608: ceremony → ALLOW", r11.renamed === undefined && r11.back === undefined, JSON.stringify(r11)?.slice(0, 200));
+    writeFileSync(join(hub, "dirt-608.txt"), "untracked dirt → the hub reads disordered\n"); // M4 engages
+    const r11del = await callBashSafe("git branch -D feat/608r11");
+    expectTrue("R11 #608: with the hub disordered, `-D` of the pid's own branch is ADMITTED by M4's #436 carve-out",
+      r11del === undefined, `handler returned ${JSON.stringify(r11del)?.slice(0, 240)}`);
+    try { execSync("git branch -D feat/608r11", { cwd: hub, stdio: "ignore" }); } catch { /* the admitted command runs */ }
+    rmSync(join(hub, "dirt-608.txt"), { force: true }); // back to a healthy hub before asserting
+    execSync(`git branch feat/608r11 ${mainSha()}`, { cwd: hub, stdio: "ignore" }); // sibling re-creates
+    const r11stale = await callBashSafe("git branch -M main feat/608r11");
+    expectTrue("R11 #608: that admission spent the claim → rename onto the sibling's branch BLOCKS",
+      !!r11stale && r11stale.block === true && String(r11stale.reason || "").includes(CLAIM_SPENT),
+      `handler returned ${JSON.stringify(r11stale)?.slice(0, 240)}`);
   } catch (e) {
     expectTrue("#605 integration ran without throwing", false, String(e?.stack ?? e).slice(0, 400));
   } finally {

@@ -5178,17 +5178,25 @@ function _unmarkOwned(pid: number, repoKey: string | null | undefined, branch: s
   if (set) set.delete(branch);
 }
 
-/** Will git's SOFT `-d` actually delete `name` in `cwd`? Faithful to `git-branch(1)`:
- *  "the branch must be fully merged in its upstream branch, or in HEAD if no
- *  upstream was set". The distinction MATTERS — a branch merged into local HEAD
- *  but NOT into its configured upstream is REFUSED by git, so spending its claim
- *  on the HEAD-only reading would turn the legitimate `-d` → `-D` escalation on
- *  the session's own branch into a block (the #3979 review P2 class).
+/** Will git's SOFT `-d` actually delete `name` in `cwd`? Faithful to git's own
+ *  `branch_merged()` (`builtin/branch.c`), NOT to the prose of git-branch(1):
  *
- *  `for-each-ref` is what separates "no upstream configured" (empty → git falls
- *  back to HEAD) from "upstream configured but GONE" (non-empty name that no
- *  longer resolves — git then refuses `-d` outright). Unverifiable (git error,
- *  missing ref) → false: the claim is KEPT, the direction that cannot lose a ref. */
+ *    "the branch must be fully merged in its upstream branch, or in HEAD if no
+ *     upstream was set"
+ *
+ *  The prose is silent on the case that decides this probe: an upstream
+ *  CONFIGURED but GONE (`[gone]` after `git fetch --prune`). `%(upstream)` still
+ *  prints the configured refname there, but `branch_merged()` resolves it and —
+ *  when it does not resolve — leaves `reference_rev` NULL and falls back to
+ *  `head_rev`, i.e. it treats "upstream set but gone" EXACTLY like "no upstream
+ *  set" and DELETES the merged branch (measured, git 2.43.0: `-d` rc 0 with the
+ *  remote ref absent). So the upstream is only consulted when it RESOLVES; the
+ *  unresolvable case must fall back to HEAD, or this probe answers "kept" where
+ *  git deletes — the fail-open direction, and a stale claim is exactly the #608
+ *  destruction.
+ *
+ *  Unverifiable (git error, missing ref) → false: the claim is KEPT, the
+ *  direction that cannot lose a ref. */
 function _softDeleteWillSucceed(cwd: string, name: string): boolean {
   let target = "HEAD";
   try {
@@ -5197,7 +5205,17 @@ function _softDeleteWillSucceed(cwd: string, name: string): boolean {
       // pin in test.mjs forbids the `["ignore", "pipe", "ignore"]` shape, which
       // leaked a failure message AND made the not-a-checkout arm dead code.
       { cwd, timeout: 5000, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-    if (up) target = up; // configured — a GONE upstream makes the ancestor probe below fail
+    if (up) {
+      // Only a RESOLVABLE upstream constrains the delete; a `[gone]` one makes
+      // git fall back to HEAD (see above). One extra spawn, soft-deletes only.
+      let resolves = false;
+      try {
+        execFileSync("git", ["rev-parse", "--verify", "--quiet", up],
+          { cwd, timeout: 5000, stdio: "ignore" });
+        resolves = true;
+      } catch { resolves = false; }
+      if (resolves) target = up;
+    }
   } catch { return false; }
   try {
     execFileSync("git", ["merge-base", "--is-ancestor", `refs/heads/${name}`, target],
@@ -5849,6 +5867,20 @@ export default function (pi: ExtensionAPI) {
               // being compound/wrapped) to stamp the marker it already holds.
               const discardReason = _worktreeDiscardBlock(localCommand, _currentHatchActive);
               if (discardReason) return { block: true, reason: discardReason };
+              // #608 (#3979 review P2): this arm is an ADMISSION, and it sits
+              // ~200 lines BEFORE the M3 funnel — so it used to admit a LOCAL
+              // branch delete with the claim left intact. It is not a theoretical
+              // path: with the hub disordered, `evaluateHubGateWithTargets` routes
+              // `git branch -D <b>` through the #436 (B) carve-out
+              // (classify-git.mjs branchDeleteNames + branchDeleteAllowance +
+              // sawRecovery) and answers "allowed". Spend here for the same
+              // reason the funnel does: every arm that ADMITS a local delete has
+              // to spend it, or the stale claim re-authorizes a #598 own-dst
+              // rename / #543 `-D` over a sibling's re-created branch. `pushDet`
+              // is the same classification this arm already pays for.
+              let m4RepoKey: string | null = null;
+              try { m4RepoKey = branchOwnership?.repoKey?.(resolve(process.cwd())) ?? null; } catch { m4RepoKey = null; }
+              _spendLocalDeleteClaims(pid, m4RepoKey, resolve(process.cwd()), _localDeleteClaimNames(pushDet));
               return undefined; // sanctioned recovery / read-only / non-push — done
             }
           }
