@@ -1477,6 +1477,19 @@ reset_run
 # tick's cwd sits INSIDE a lane checkout, a probe that inherits that cwd lists ITSELF as the checkout's
 # holder and refuses every removal for ever. `RUN_CWD` is the seam, and it is the only cwd at which the
 # hazard exists: the drainer is run from the very checkout it is about to reap.
+# ⛔ AND IT WAS RED ON LINUX AT `5bdf7bafa`, WHICH IS WHY THE THIRD ROW BELOW IS A PRODUCT DEFECT, NOT A
+# FLAKE (review P2 at 6aee4539 read this arm as box-dependent). `_own_chain` is this process and its
+# ANCESTORS, while every `$( )` witness fork is a DESCENDANT — measured: the "holder" the gate named was
+# `_proc_cwd_holder`'s own fork (`ps -o ppid=` → the `_drain_holder` fork, cwd = the worktree). Closed by
+# `_probe_neutral` plus the `cd /` inside each probe substitution, and row 1 is what reddens if either
+# regresses.
+# ⛔ ROW 1 STILL DEPENDS ON ONE THING THE BOX DECIDES — a process that is NOT this tick standing in the
+# checkout legitimately holds the tree (the over-attribution the doc now declares). So the EXCLUSION is
+# pinned hermetically in rows 2/3, on a FIXTURE `/proc` (the `PROC_ROOT` seam) that no real process can
+# perturb, with OPPOSITE polarity so the pair cannot pass by excluding every row:
+#   2. the planted row names a pid that IS in this tick's chain (this suite's own shell, an ancestor of
+#      every tick it runs) ⇒ NOT a holder ⇒ the tree is REAPED.
+#   3. the planted row names a STRANGER ⇒ IS a holder ⇒ the tree is HELD and named.
 reset_run
 o_y="$ROOT/o-y"; ai_y="$ROOT/ai-y"; mkdir -p "$o_y/bg" "$ai_y/state/lanes"
 wt_y="$ai_y/wt-drainer-ai-drain-888888-11-1"
@@ -1490,6 +1503,46 @@ check "(t12) a tick whose OWN cwd is the checkout still reaps it (the probe neve
   '[ ! -d "$wt_y" ]' \
   "checkout still present — the probe (or this tick) was reported as its own holder; that latches every reap for ever (#1095)"
 reset_run
+
+# ── (t12) rows 2/3: the chain exclusion, on a FIXTURE /proc (hermetic — no real process can perturb it)
+# The two witness MODULES are stubbed to "none" so the fixture table is the only thing that can answer:
+# row 2 would otherwise pass because witness A said "none", not because the chain was excluded, and row 3
+# would depend on the box's population to produce the holder the fixture is meant to provide.
+cat >"$ROOT/t12-wt-none.sh" <<'WT_NONE_EOF'
+wt_live_holders() { return 1; }
+WT_NONE_EOF
+cat >"$ROOT/t12-lo-none.sh" <<'LO_NONE_EOF'
+# A parseable `<pid><TAB><abs>` row that matches no checkout: "the probe answered, nobody is here".
+lo_cwd_rows() { printf '1\t/\n'; }
+LO_NONE_EOF
+fp="$ROOT/t12-fakeproc"
+# <fixture> <worktree> <pid> — one symlink row, the shape `_proc_cwd_holder` reads (`ls -l <root>/<pid>/cwd`).
+t12_proc_row() { mkdir -p "$1/$3"; ln -sfn "$(cd "$2" && pwd -P)" "$1/$3/cwd"; }
+# ── row 2: a pid IN this tick's chain is never a holder ⇒ the clean tree IS reaped.
+reset_run
+o_y2="$ROOT/o-y2"; ai_y2="$ROOT/ai-y2"; mkdir -p "$o_y2/bg" "$ai_y2/state/lanes"
+wt_y2="$ai_y2/wt-drainer-ai-drain-888888-12-1"
+git -C "$SEED" worktree add -f "$wt_y2" "$SEED_REF" >/dev/null 2>&1
+printf '%s' "$dead_y" >"$wt_y2.lane-pid"
+printf '0\n' >"$o_y2/bg/ai-drain-888888-12-1.rc"
+t12_proc_row "$fp" "$wt_y2" "$$"                                    # this suite's shell: an ANCESTOR of the tick
+RUN_TARGET=0 RUN_PROC_ROOT="$fp" RUN_WTL="$ROOT/t12-wt-none.sh" RUN_LO_MOD="$ROOT/t12-lo-none.sh" run_drainer_fg y2
+check "(t12) a table naming THIS TICK'S OWN CHAIN (a fixture row for an ancestor) is not a holder — the tree is reaped" \
+  '[ ! -d "$wt_y2" ]' \
+  "tree kept; holders named: $(grep -oE 'pid [0-9]+ has this checkout as its cwd|\\(pid [0-9]+\\)' "$ai_y2/logs/ai-drainer.log" 2>/dev/null | sort -u | tr '\n' ' ')"
+# ── row 3: the SAME fixture shape, a pid OUTSIDE the chain ⇒ it IS a holder ⇒ the tree is HELD and NAMED.
+# Without this the pair would be satisfied by an exclusion that drops every row — the destructive direction.
+reset_run
+o_y3="$ROOT/o-y3"; ai_y3="$ROOT/ai-y3"; mkdir -p "$o_y3/bg" "$ai_y3/state/lanes"
+wt_y3="$ai_y3/wt-drainer-ai-drain-888888-12-2"
+git -C "$SEED" worktree add -f "$wt_y3" "$SEED_REF" >/dev/null 2>&1
+printf '%s' "$dead_y" >"$wt_y3.lane-pid"
+printf '0\n' >"$o_y3/bg/ai-drain-888888-12-2.rc"
+t12_proc_row "$fp" "$wt_y3" "424242"                                  # a pid no tick in this suite owns
+RUN_TARGET=0 RUN_PROC_ROOT="$fp" RUN_WTL="$ROOT/t12-wt-none.sh" RUN_LO_MOD="$ROOT/t12-lo-none.sh" run_drainer_fg y3
+check "(t12) …while the same table naming a STRANGER holds the tree AND names it (the exclusion is not 'drop every row')" \
+  '[ -d "$wt_y3" ] && grep -q "pid 424242 has this checkout as its cwd" "$ai_y3/logs/ai-drainer.log"' \
+  "tree=$( [ -d "$wt_y3" ] && echo present || echo gone ) · $(grep -E 'KEEP|HELD' "$ai_y3/logs/ai-drainer.log" 2>/dev/null | tail -1)"
 reset_run
 
 # ── (t6) EVERY DESTRUCTIVE PATH ROUTES THROUGH THE ONE GATE ─────────────────────────────────────
@@ -1602,32 +1655,37 @@ reset_run
 # record the SETTLE meets it first, and on the next read the tree has already lost its gitlink: see the
 # honest division asserted below.)
 reset_run
-o_y="$ROOT/o-y"; ai_y="$ROOT/ai-y"; mkdir -p "$o_y/bg" "$ai_y/state/lanes"
-wt_y="$ai_y/wt-drainer-ai-drain-999999-13-1"
-git -C "$SEED" worktree add -f "$wt_y" "$SEED_REF" >/dev/null 2>&1
-chmod 500 "$wt_y"                                     # clean, and unremovable by BOTH mechanisms
+# ⛔ ITS OWN TAG, NOT (t12)'s (`y`). Both arms used `y`, so the log this arm greps carried (t12)'s ticks
+# too: once (t12)'s tick reaped its tree it logged `REAPED: 1 leftover worktree(s)`, and the two
+# "no reaped claim" rows below then matched ANOTHER arm's line and reddened on a correct tick (measured
+# on Linux at 5bdf7bafa: reaped=1 with this arm's own tick clean). An arm that asserts on a LOG must own
+# that log.
+o_y4="$ROOT/o-y4"; ai_y4="$ROOT/ai-y4"; mkdir -p "$o_y4/bg" "$ai_y4/state/lanes"
+wt_y4="$ai_y4/wt-drainer-ai-drain-999999-13-1"
+git -C "$SEED" worktree add -f "$wt_y4" "$SEED_REF" >/dev/null 2>&1
+chmod 500 "$wt_y4"                                     # clean, and unremovable by BOTH mechanisms
 sleep 0 & dead_y=$!; wait "$dead_y" 2>/dev/null          # a pid that is PROVABLY gone
-printf '%s' "$dead_y" >"$wt_y.lane-pid"                 # the reaper's own evidence; NO lane record
-RUN_TARGET=0 run_drainer_fg y
+printf '%s' "$dead_y" >"$wt_y4.lane-pid"                 # the reaper's own evidence; NO lane record
+RUN_TARGET=0 run_drainer_fg y4
 check "(t15) a FIRST-sighting removal that FAILED still WRITES the quarantine marker (so the next tick does not re-enter it as a first sighting)" \
-  '[ -d "$wt_y" ] && [ -f "$wt_y.lane-held" ]' \
-  "tree=$( [ -d "$wt_y" ] && echo present || echo gone ) marker=$( [ -f "$wt_y.lane-held" ] && echo yes || echo no )"
+  '[ -d "$wt_y4" ] && [ -f "$wt_y4.lane-held" ]' \
+  "tree=$( [ -d "$wt_y4" ] && echo present || echo gone ) marker=$( [ -f "$wt_y4.lane-held" ] && echo yes || echo no )"
 check "(t15) …and the marker names the FAILURE, not a hold that was never measured" \
-  'grep -q "the removal itself FAILED" "$wt_y.lane-held" && ! grep -q "LIVE process still holds it\|UNCOMMITTED WORK\|could not be read" "$wt_y.lane-held"' \
-  "marker=[$(head -1 "$wt_y.lane-held" 2>/dev/null)]"
+  'grep -q "the removal itself FAILED" "$wt_y4.lane-held" && ! grep -q "LIVE process still holds it\|UNCOMMITTED WORK\|could not be read" "$wt_y4.lane-held"' \
+  "marker=[$(head -1 "$wt_y4.lane-held" 2>/dev/null)]"
 check "(t15) …and that first tick classifies it STUCK, not quarantined — a failure is not a hold cause" \
-  'grep -qF "STUCK: 1 leftover worktree(s) could NOT be removed" "$ai_y/logs/ai-drainer.log" && ! grep -q "a live holder or uncommitted work was measured" "$ai_y/logs/ai-drainer.log" && ! grep -q "REAPED: " "$ai_y/logs/ai-drainer.log"' \
-  "outcomes=$(grep -oE 'REAPED: [0-9]+|HELD: [0-9]+ leftover|STUCK: [0-9]+ leftover' "$ai_y/logs/ai-drainer.log" 2>/dev/null | tr '\n' ' ')"
-RUN_TARGET=0 run_drainer_fg y
+  'grep -qF "STUCK: 1 leftover worktree(s) could NOT be removed" "$ai_y4/logs/ai-drainer.log" && ! grep -q "a live holder or uncommitted work was measured" "$ai_y4/logs/ai-drainer.log" && ! grep -q "REAPED: " "$ai_y4/logs/ai-drainer.log"' \
+  "outcomes=$(grep -oE 'REAPED: [0-9]+|HELD: [0-9]+ leftover|STUCK: [0-9]+ leftover|UNVERIFIABLE: [0-9]+' "$ai_y4/logs/ai-drainer.log" 2>/dev/null | tr '\n' ' ')"
+RUN_TARGET=0 run_drainer_fg y4
 # The SECOND tick is an HONEST hold, not a re-latch: `git worktree remove --force` destroys the gitlink
 # even when it cannot delete the directory, so the tree now carries a `.git` it cannot read through —
 # CANNOT-VERIFY, the round-1 P0 posture. What must NOT happen is a fresh first-sighting transition: the
 # marker written above is what keeps it a CONTINUATION of the same tree.
 check "(t15) …so the retry is a CONTINUATION (marker survives, no fresh first-sighting HELD transition, no reaped claim)" \
-  '[ -f "$wt_y.lane-held" ] && [ "$(grep -c "HELD: leftover worktree" "$ai_y/logs/ai-drainer.log" 2>/dev/null)" -eq 0 ] && ! grep -q "REAPED: " "$ai_y/logs/ai-drainer.log"' \
-  "marker=$( [ -f "$wt_y.lane-held" ] && echo yes || echo no ) first-sighting-transitions=$(grep -c 'HELD: leftover worktree' "$ai_y/logs/ai-drainer.log" 2>/dev/null) (want 0) reaped=$(grep -c 'REAPED: ' "$ai_y/logs/ai-drainer.log" 2>/dev/null)"
+  '[ -f "$wt_y4.lane-held" ] && [ "$(grep -c "HELD: leftover worktree" "$ai_y4/logs/ai-drainer.log" 2>/dev/null)" -eq 0 ] && ! grep -q "REAPED: " "$ai_y4/logs/ai-drainer.log"' \
+  "marker=$( [ -f "$wt_y4.lane-held" ] && echo yes || echo no ) first-sighting-transitions=$(grep -c 'HELD: leftover worktree' "$ai_y4/logs/ai-drainer.log" 2>/dev/null) (want 0) reaped=$(grep -c 'REAPED: ' "$ai_y4/logs/ai-drainer.log" 2>/dev/null)"
 # The fixture must not leak an unremovable directory into the suite's own cleanup.
-chmod 700 "$wt_y" 2>/dev/null
+chmod 700 "$wt_y4" 2>/dev/null
 reset_run
 
 

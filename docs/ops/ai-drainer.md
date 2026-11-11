@@ -188,8 +188,12 @@ while nothing happened:
       (`pytest <wt>/tests`, `rsync src <wt>`, `bash -c "cd <wt> && …"`), whose cwd is elsewhere: a
       module that cannot answer is therefore **not** readable as "no holders", even when the cwd
       witness says "none" — an unproven removal keeps the tree.
-    Both probes exclude **this tick's own process chain**, so a tick hand-run from inside a lane tree
-    does not read itself as that lane's live holder and latch every reap for ever.
+    Both probes exclude **this tick's own process chain** — and each witness is *also* run from the
+    filesystem root, because the chain covers this process and its ancestors while a witness's own forks
+    are its **descendants** (and descendants cannot be excluded wholesale: a dispatched lane is one).
+    So a tick hand-run from inside a lane tree — an operator, or arm `(t12)` — does not read itself or its
+    probe forks as that lane's live holder and latch every reap for ever. Measured at `5bdf7bafa`: the
+    holder it named was `_proc_cwd_holder`'s own fork, not a lane.
   * **nothing that exists only on disk.** `git status --porcelain` empty, and a `git status` that could
     not run is CANNOT-VERIFY, never clean. This is the repo's recorded posture (cleanliness is the
     worktree safety property, #3888), and it is the conservative direction: a **dirty** checkout waits
@@ -228,10 +232,16 @@ while nothing happened:
   one probe plus one `git status` wide — the process table is re-taken per removal, not once per settle
   pass, so a stalled lane's status grace cannot stale a later tree's reading); a **gitignored** file is
   not "work" for the cleanliness question, so a lane's `.venv`/`node_modules` cannot pin a checkout for
-  ever; and a box on which **every** holder witness is unavailable removes on cleanliness alone — logged
-  as `DEGRADED: the cwd witness is UNAVAILABLE`, never silently. A tree that is already quarantined and
-  still dirty (or still unreadable) is HELD from the cheap reading alone and costs no probe, so the
-  quarantine steady state does not pay a process-table scan per held tree per tick.
+  ever; **over-attribution is possible and is not a defect** — the witness answers "some live process has
+  this checkout as its cwd", which cannot distinguish a lane from anything else standing there (an
+  operator's shell `cd`-ed in for a salvage, a reparented helper, another agent's stray child). Such a
+  tree stays quarantined and the `KEEP:`/`HELD:` line names that pid as the holder, whose cwd is the
+  evidence: the direction is keep-not-delete, so it costs **disk, not work**, and the pid is named so an
+  operator can see it is not a lane; and a box on which **every** holder witness is unavailable removes
+  on cleanliness alone — logged as `DEGRADED: the cwd witness is UNAVAILABLE`, never silently. A tree
+  that is already quarantined and still dirty (or still unreadable) is HELD from the cheap reading alone
+  and costs no probe, so the quarantine steady state does not pay a process-table scan per held tree per
+  tick.
 
   A fresh checkout per lane with nothing removing it is ~72/day on a box that has been disk-bound, so the
   reaper is not optional — but **a reaper that guesses is worse than none**, which is what this gate is

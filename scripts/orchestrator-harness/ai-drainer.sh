@@ -743,7 +743,15 @@ _proc_cwd_holder() { # <canon path> → 0 + "<pid>\t<cwd-inside-the-worktree>" �
   # table (another uid's `/proc` entries are unreadable, `ls` exits non-zero while listing what it
   # could) is still a real census, and a cwd that was unlinked still NAMES its path, so the kernel's
   # ` (deleted)` suffix is stripped rather than matched.
-  raw="$(ls -l "$root"/[0-9]*/cwd 2>/dev/null)"
+  # ⛔ THE PROBE ITSELF MUST NOT BE IN THE TABLE IT READS (#2800 review, P2 — MEASURED). `ls` is a FORK
+  # of this tick, so it inherits the tick's cwd; `$root/<pid>/cwd` then points at the very checkout being
+  # judged, and the row names a process that IS the instrument — not a lane. `_own_chain` cannot cover
+  # it: the chain is this process and its ANCESTORS, while `ls` is a DESCENDANT (and descendants must
+  # NOT be excluded wholesale — a dispatched lane is one). So the neutral cwd is the fix here too, the
+  # same one `_cwd_rows` applies to `lo_cwd_rows` and `wt-lifecycle.sh` records three times. Measured on
+  # Linux at 6aee4539/5bdf7bafa: without this line, arm (t12) — the tick run from the checkout it is
+  # about to reap — reads its own `ls` as the checkout's live holder and quarantines it for ever.
+  raw="$( cd / 2>/dev/null || cd "${TMPDIR:-/tmp}" 2>/dev/null || :; ls -l "$root"/[0-9]*/cwd 2>/dev/null )"
   [ -n "$raw" ] || return 2                  # read nothing at all → UNKNOWN, never "no holder"
   out="$(printf '%s\n' "$raw" | awk -v wt="$1" -v skip="${_CWD_CHAIN:- }" '
     !found {
@@ -761,6 +769,21 @@ _proc_cwd_holder() { # <canon path> → 0 + "<pid>\t<cwd-inside-the-worktree>" �
   printf '%s\n' "$out"
   return 0
 }
+# ⛔ EVERY WITNESS FORK RUNS FROM A NEUTRAL CWD — `_own_chain` CANNOT COVER THESE. `$( )` forks a CHILD
+# of this tick, and the chain is this process and its ANCESTORS; descendants must not be excluded
+# wholesale (a dispatched lane IS one, and it is exactly what this gate exists to protect). So when the
+# tick's own cwd is inside the lane checkout it is about to reap — an operator hand-running it there, or
+# arm (t12) — the fork that RUNS a witness inherits that cwd, appears in the table as the checkout's
+# live holder, and quarantines it for ever: the #1095 accumulation produced by the instrument.
+# ⛔ MEASURED, Linux, at 5bdf7bafa: the named holder was `_proc_cwd_holder`'s OWN fork (`ps -o ppid=` →
+# the `_drain_holder` fork, `cwd` = the worktree), so the row is not a stray-process artifact — the probe
+# read itself. `wt-lifecycle.sh` records the same measurement (`wt_run_bounded`) and `_cwd_rows` applies
+# the same `cd /` to the `lo_cwd_rows` fork; this is the third site, and the two inner `$( )`s keep their
+# own `cd /` as well, because each level forks separately.
+_probe_neutral() { # <command> [args…] — run a witness from the filesystem root so it is never in its own table
+  cd / 2>/dev/null || cd "${TMPDIR:-/tmp}" 2>/dev/null || :
+  "$@"
+}
 _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none · 2 could not be evaluated
   #   (a 2 also prints the CALL-TIME reason as one line, so the KEEP message cannot report a load-time
   #    status as if it were this call's failure — review note, PR #3918)
@@ -777,7 +800,7 @@ _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none
   # per tick), so calling it here costs nothing on the arms that never needed it.
   _own_chain
   if [ "$HOLDER_PROBE" = "1" ]; then
-    out="$(wt_live_holders "$path")"; rc=$?
+    out="$(_probe_neutral wt_live_holders "$path")"; rc=$?
     case "$rc" in
       0)
         # ⛔ DROP ROWS NAMING THIS TICK'S OWN CHAIN, IN THIS SHELL (#2800 `_own_chain`). Not through a
@@ -802,7 +825,7 @@ _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none
   else
     rc=2                                   # witness A cannot be evaluated on this box
   fi
-  out="$(_proc_cwd_holder "$path")"; proc_rc=$?
+  out="$(_probe_neutral _proc_cwd_holder "$path")"; proc_rc=$?
   case "$proc_rc" in
     0) printf '%s\n' "$out"; return 0 ;;
     # ⛔ WITNESS B'S "NONE" CLEARS ONLY WITNESS A'S "NONE", NEVER ITS "I COULD NOT TELL" (review
@@ -853,6 +876,14 @@ _drain_holder() { # <path> → 0 a live holder (prints pid<TAB>reason) · 1 none
 #     lock; the window is ONE PROBE PLUS ONE `git status` wide (the process table is re-taken per
 #     removal, so a stalled lane's 30 s status grace cannot stale a later tree's reading), instead of
 #     the lane's whole life;
+#   * OVER-ATTRIBUTION IS POSSIBLE AND IS NOT A DEFECT (review P2 at 6aee4539, declared rather than
+#     fixed): the witness answers "some LIVE PROCESS has this checkout as its cwd", and that question
+#     cannot tell a lane from anything else standing there — an operator's shell `cd`-ed in for a
+#     salvage, a reparented helper, a stray child of another agent. The tree is then held and the
+#     `KEEP:`/`HELD:` line NAMES that pid, so the misdirection is bounded: keep-not-delete costs disk,
+#     never work, and the named pid's own cwd is what an operator checks. What this change DID fix is
+#     the one case where the misattributed process is the instrument itself — the probe's own forks,
+#     which `_probe_neutral` (and the `cd /` in each `$( )`) keeps out of the table it reads;
 #   * a GITIGNORED file is not "work" for this gate (`status --porcelain` does not report it), so a
 #     lane's `.venv`/`node_modules` cannot pin a checkout for ever — it would pin every one of them;
 #   * the CENSUS is unchanged: it counts a pid that is alive, so a lane whose subshell died while its
