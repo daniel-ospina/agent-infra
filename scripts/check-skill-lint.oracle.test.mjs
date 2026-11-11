@@ -409,9 +409,10 @@ const VALUE_POOL = [
   // non-grammar tail. #370 pinned the space-then-token forms above but not the
   // adjacent boundary, which is the one the header regex never matched at all
   // (it requires whitespace before a tail) → fell through to the plain-scalar
-  // path → typed string → gate passed → pi dropped. Legal no-space forms
-  // (`|1`, `|-`, `|+`) are already in the pool; `|1 #c` / `|- #c` sit on the
-  // false-positive boundary the generalized guard must not cross.
+  // path → typed string → gate passed → pi dropped. The legal modifier-only
+  // headers are here too: `|` and `|-` above, and bare `|1` / `|+` in the
+  // boundary block below — and `|1 #c` / `|- #c` sit on the false-positive
+  // boundary the generalized guard must not cross.
   "|#c",
   "|#",
   ">#x",
@@ -424,6 +425,11 @@ const VALUE_POOL = [
   "|-x",
   "|1 #c",
   "|- #c",
+  // #458 review round 2 — the modifier-only headers this pool did NOT already
+  // carry: `|-` and `|` were here, bare `|1` and `|+` were not (only the
+  // ILLEGAL `|1 token`, `|+0`, `|+2+`). Both are legal and pi loads them.
+  "|1",
+  "|+",
   // #458 review round 1 — the OTHER legal indicator order (YAML 1.2 §8.1.1
   // permits indentation-then-chomping as well). These LOAD in yaml, so the
   // header regex must accept them; a validator that flags them is the

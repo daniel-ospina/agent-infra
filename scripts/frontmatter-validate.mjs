@@ -491,12 +491,14 @@ export function tokenizeFrontmatter(yamlString) {
     // `c-b-block-header` = `( indentation-indicator chomping-indicator |
     // chomping-indicator indentation-indicator )`), so `|+2` (chomp-then-
     // indent) and `|2+` (indent-then-chomp) are BOTH valid headers and both
-    // load. The single-order regex this replaces matched only
-    // chomp-then-indent, so every indent-then-chomp spelling (`|2`, `|2+`,
-    // `|2-`, `>1-`) fell through to the digit guard — a P0 on a skill pi
-    // LOADS (probe yaml 2.9.0: all four load their body). Pre-existing, and
-    // it is exactly the class this guard's comment used to claim was closed;
-    // accepting the second order is what makes that claim true (#458).
+    // load. The single-order regex this replaces matched
+    // chomp-then-OPTIONAL-indent, so an indent-ONLY spelling (`|2`, `|1` —
+    // pinned accepted since before this PR by the `ok-block-explicit-indent-2`
+    // fixture) always worked, while every INDENT-THEN-CHOMP spelling —
+    // `|2+`, `|2-`, `>1-` — fell through to the digit guard: a P0 on a skill
+    // pi LOADS (probe yaml 2.9.0: all three load their body). Pre-existing,
+    // and it is exactly the class this guard's comment used to claim was
+    // closed; accepting the second order is what makes that claim true (#458).
     const bm = /^([>|])(?:([+-]?)([1-9])?|([1-9])([+-])?)(?:[ \t]+(.*))?$/.exec(valueText);
     if (bm && bm[1]) {
       // #370 (P1 false negative — issue severity; the guard emits a P0 throw):
