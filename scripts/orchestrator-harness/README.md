@@ -3072,6 +3072,13 @@ already the documented single read, so the queries above are the retry decision.
 immediately before `run_agent`) — the same stale-flag class the per-run verdict file closes for
 `outcome=` itself. Without it a previous attempt's connection storm would retry every later real
 failure of the same issue for ever.
+⛔ **AND ONLY A NAMED BOUND MAY CLASSIFY THE EXIT.** The verdict read is an **allow-list**
+(`stalled`, `exceeded-wallclock`), never "any verdict that is not empty": `lane-bound.sh` emits a
+`VERDICT` line on every path — including `verdict=finished`, the line it writes when the bound watched
+the agent end on its own, which `spawn-gate.sh` deliberately clears from `AGENT_BOUND_VERDICT` — so a
+truthiness test re-admits exactly the word the caller filtered and turns a real work failure into
+`outcome=died reason=finished` (measured, suite arms 9g/9h). Any word that does not name a bound means
+NO bound ended the lane, and the item's work keeps its `failed` claim.
 ⛔ **AND THE FALSIFIER IS THE OTHER DIRECTION:** a lane with fewer than the threshold rotations, or one
 that recovered and COMPLETED, is `failed`/`done` as before — an automatic retry of a real work failure
 burns a lane's budget and repeats the same outcome.
