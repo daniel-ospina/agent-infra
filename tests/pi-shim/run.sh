@@ -232,10 +232,45 @@ after="$(ledger_rows)"
   && pass "the row carries verdict=refused, the reading (999), the ceiling (10) and the item tag (t3)" \
   || fail "the ledger row does not record verdict/load/ceiling/tag: $(sed -n "${after}p" "$LEDGER" | cut -f2-4,8)"
 nf="$(sed -n "${after}p" "$LEDGER" | awk -F'\t' '{print NF}')"
-[ "$nf" = "12" ] && pass "the row has all 12 fields (epoch, verdict, load, max, pid, ppid, KIND, TAG, cwd, caller, mem_avail, mem_floor) — the memory columns are APPENDED so every cut -f1-10 reader survives" \
-  || fail "the ledger row has $nf fields, expected 12 — a truncated row cannot be counted reliably"
+[ "$nf" = "13" ] && pass "the row has all 13 fields (epoch, verdict, load, max, pid, ppid, KIND, TAG, cwd, caller, mem_avail, mem_floor, fork) — each later column is APPENDED so every cut -f1-10 reader survives" \
+  || fail "the ledger row has $nf fields, expected 13 — a truncated row cannot be counted reliably"
 [ "$(ledger_field "$after" 12)" != "" ] && pass "…and field 12 carries the FLOOR that was in force (so a later reader can recompute the refusal without the log)" \
   || fail "the ledger row records no memory floor"
+# ⛔ THE FORK COLUMN (#2843): before it, a launch whose process-headroom floor was OFF (an abstention)
+# and one that ENFORCED it produced IDENTICAL `allowed` rows — so "did the floor run yesterday" needed
+# a grep through per-lane logs that rotate. This row was a LOAD refusal, and the fork reading was
+# taken BEFORE it, so the column must carry the verdict the gate actually obtained.
+[ "$(ledger_field "$after" 13)" = "fork=ok" ] && pass "…and field 13 keys the FORK verdict that was actually obtained (fork=ok), so 'the floor ran' is a durable fact (#2843)" \
+  || fail "the ledger row does not record the fork verdict (field 13 = '$(ledger_field "$after" 13)')"
+
+# ── 3b. an ABSTENTION is recorded too, not just a refusal (#2843) ────────────
+# The issue names this as its own bound: "an abstention is not recorded durably the way a refusal is".
+# The fork reading can legitimately abstain — the instrument RAN and could not produce a number — and
+# the gate proceeds, because an unmeasurable reading is not evidence of a starved box. What must not
+# recur is the resulting row being INDISTINGUISHABLE from one where the floor was enforced: measured
+# 2026-10-25, the entire trace of 18 abstentions was a per-worker log, and that log rotates.
+# ⛔ HOME IS A FRESH DIR so the ledger read back is THIS arm's: `pi_gate_ledger` writes under
+# `$HOME/.pi/agent/state`, and `run_shim` inherits whichever HOME the child was given.
+reset_probe
+HLEDGER="$TMP/halfhome/.pi/agent/state/spawn-gate.tsv"
+mkdir -p "$TMP/halfhome/orchestrator"; rm -f "$HLEDGER"
+cat > "$TMP/halfhome/orchestrator/capacity.sh" <<'CAPEOF'
+# A COMPLETE instrument (all three functions the gate hard-requires) whose READING fails — the
+# `unknown` arm, distinct from `nodeploy` (where no complete instrument is found at all).
+cap_procs_pair_vars() { return 1; }
+cap_h_for_vars() { printf -v "${3:?}" '%s' '0'; }
+cap_fork_probe() { return 0; }
+CAPEOF
+err="$( ( unset O O_WORK AGENT_INFRA_PATH; HOME="$TMP/halfhome" FAKE_LOAD=0 MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 run_shim runner ) 2>&1 >/dev/null)"; rc=$?
+{ [ "$rc" -eq 0 ] \
+  && [ "$(sed -n 1p "$HLEDGER" 2>/dev/null | cut -f2)" = "allowed" ] \
+  && [ "$(sed -n 1p "$HLEDGER" 2>/dev/null | cut -f13)" = "fork=unknown" ]; }; rc2=$?
+[ "$rc2" -eq 0 ] && pass "an ABSTAINED fork reading still launches, and its ledger row says so (verdict=allowed, field 13 = fork=unknown)" \
+  || fail "an abstention leaves no durable mark (rc=$rc, verdict='$(sed -n 1p "$HLEDGER" 2>/dev/null | cut -f2)', field 13='$(sed -n 1p "$HLEDGER" 2>/dev/null | cut -f13)') — the #2843 blindness is back"
+grep -q 'fork headroom UNREADABLE' <<<"$err" \
+  && pass "…and the WARN still names what it could not read" \
+  || fail "an abstention no longer says why: $(head -1 <<<"$err")"
+rm -rf "$TMP/halfhome"
 # The running count is in the message too: "counted" must be visible in the log line, not only in a
 # file an operator has to know to look for.
 reset_probe
@@ -426,6 +461,13 @@ for f in "$SETUP_SH" "$CELL_INSTALL"; do
   if grep -q 'scripts/orchestrator-harness/spawn-gate.sh' "$f" && grep -q 'DEST/bin' "$f"; then rc=0; else rc=1; fi
   label="$(basename "$f") installs the spawn-point gate as \$DEST/bin/pi"
   [ "$rc" -eq 0 ] && pass "$label" || fail "$label — the gate would reach no box through this installer"
+  # ⛔ AND ITS INSTRUMENT, BESIDE IT (#2843) — the same source-shaped check, same stated limit. A shim
+  # installed without `capacity.sh` beside it is the #2843 defect itself: the fork floor REFUSES (83) on
+  # every launch through it, and it is the path most launches take. Both halves are asserted together
+  # because either one alone reads as a complete install.
+  if grep -q 'scripts/orchestrator-harness/capacity.sh' "$f" && grep -q 'bin/capacity.sh' "$f"; then rc=0; else rc=1; fi
+  label="$(basename "$f") installs the fork-floor instrument BESIDE the gate (\$DEST/bin/capacity.sh)"
+  [ "$rc" -eq 0 ] && pass "$label" || fail "$label — the installed shim could not read its own fork instrument (#2843)"
 done
 
 # ── 12. the spawn point is MEMORY-gated too, and says so in its own words (#2387) ──

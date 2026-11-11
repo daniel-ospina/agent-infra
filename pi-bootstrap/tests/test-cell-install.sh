@@ -858,25 +858,74 @@ else
 fi
 [ -x "$GATE_DST" ] && ok "…and it is executable (PATH resolves PAST a non-executable entry, silently)" \
   || fail "$GATE_DST is not executable — PATH would skip the gate"
+# ── (k2) AND ITS INSTRUMENT, BESIDE IT (#2843) ──────────────────────────────────────
+# The gate reads the process-headroom floor from `capacity.sh`. Installed as `$DEST/bin/pi` with no
+# `capacity.sh` in `$DEST/bin`, the resolver's "beside me" candidate found nothing, so every launch
+# through the installed shim — the path most launches take — could not read its own instrument. The
+# measured shape was 18 abstentions in one worker log while the box had 4,675 processes of headroom;
+# since #3231 that residue REFUSES (83) instead of warning, so a half-install is now a box that starts
+# nothing. Both are the same defect: the gate and its instrument are ONE install.
+CAP_SRC="$ROOT/scripts/orchestrator-harness/capacity.sh"
+CAP_DST="$DEST/bin/capacity.sh"
+if [ -f "$CAP_DST" ] && cmp -s "$CAP_SRC" "$CAP_DST"; then
+  ok "the fork-floor instrument is installed BYTE-IDENTICAL BESIDE the gate at \$DEST/bin/capacity.sh (#2843)"
+else
+  fail "the instrument is missing or stale at $CAP_DST — the installed \`pi\` would ABSTAIN (83) on every launch, so the process-headroom floor would silently never run"
+fi
+[ -x "$CAP_DST" ] && ok "…and it is executable" || fail "$CAP_DST is not executable"
+# ⛔ AND THE PAIR IS DRIVEN WITH NO OTHER CANDIDATE IN REACH (#2843 item 2). The search order is
+# $O_WORK, $O, BESIDE THE GATE, then three ambient homes — so a box whose `~/orchestrator` happens to
+# hold a copy would PASS a self-test that never touched the placement under test. That is the
+# host-decides class this repo keeps naming, which is why every other candidate is scrubbed and `HOME`
+# points at a directory holding no harness. `ok` and `refused` are both healthy readings; the defect is
+# obtaining NO reading (`unknown`/`nodeploy`).
+_self="$( ( unset O O_WORK AGENT_INFRA_PATH; HOME="$TMP/gate-nohome" \
+  bash -c '. "$1" >/dev/null 2>&1; spawn_fork_state _ss _dd; printf "%s|%s" "$_ss" "$_dd"' _ "$GATE_DST" ) 2>/dev/null || true )"
+case "${_self%%|*}" in
+  ok|refused) ok "the INSTALLED gate resolves a fork reading from the placement alone (answered '${_self%%|*}' with O, AGENT_INFRA_PATH and HOME scrubbed)" ;;
+  *) fail "the installed gate ABSTAINS on its own fork reading when nothing but the placement is in reach ('${_self%%|*}'): ${_self#*|}" ;;
+esac
+# The read-back half: `--verify` must refuse the missing instrument and the drifted one, on the same
+# reasoning it applies to the gate itself (a stale ceiling nobody reviewed is worse than a loud gap).
+rm -f "$CAP_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'fork-floor instrument MISSING' "$LOG" \
+  && ok "--verify refuses a MISSING fork-floor instrument, naming the consequence" \
+  || fail "--verify passed with the fork-floor instrument missing (rc=$rc)"
+run_install >/dev/null 2>&1
+echo "# drift injected by the test" >> "$CAP_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'fork-floor instrument DIFFERS' "$LOG" \
+  && ok "--verify refuses a HAND-EDITED fork-floor instrument (it would measure an unreviewed ceiling)" \
+  || fail "--verify certified a hand-edited fork-floor instrument (rc=$rc)"
+run_install >/dev/null 2>&1
+# …and the BEHAVIOURAL arm the file comparison cannot reach: the copy is byte-identical, but the knob
+# that sets the floor is malformed, so the installed gate cannot decide and must not silently pass.
+# This is the placement/wiring fault `capacity.sh`-beside-the-shim exists to end, caught at verify time.
+CAP_MIN_FORK_HEADROOM=not-a-number run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'ABSTAINS on its fork reading' "$LOG" \
+  && ok "--verify refuses a gate that cannot decide its fork floor, even with its instrument in place (self-test caught it)" \
+  || fail "--verify certified an installed gate whose fork floor cannot be decided (rc=$rc)"
+run_install >/dev/null 2>&1
 # BEHAVIOUR, not just the artifact: RUN the installed file as `pi`. MAX_LOAD=0 is the deterministic
 # refusal lever and keeps its documented meaning ("spawn nothing"); the fake real pi behind it is
 # what proves the refusal happened AT the spawn point instead of before the gate ever ran.
-# ⛔ AND THE FORK INSTRUMENT IS DEPLOYED FIRST (agent-infra#2293 / #2843), because the spawn point now
-# HARD-REQUIRES `capacity.sh` and refuses under 83 (`AGENT_HARNESS_SKEW_REFUSED`) when it cannot read
-# the fork floor — which is the whole point of that fix and NOT a wall this arm may assume away. A
-# `HOME` with no harness is a HALF-DEPLOYED box: both drives below would answer 83 and this arm would
-# stop testing the load gate at all. `$HOME/orchestrator` is the DOCUMENTED default harness home (one
-# of the resolver's candidates), so seeding it there is the production shape, not a fixture-only
-# dodge; the INSTALL half (shipping the instrument beside the installed `pi`) is #2843's open half.
-# ⛔ A STUB, NOT THE SHIPPED FILE: the shipped `capacity.sh` reads THIS HOST's process population, so
-# the arm's verdict would be decided by the runner's fork headroom instead of by the gate under test.
-mkdir -p "$TMP/gate-home/orchestrator"
-cat > "$TMP/gate-home/orchestrator/capacity.sh" <<'CAPEOF'
-# Hermetic HEALTHY instrument stub: the three functions the spawn gate hard-requires, fixed readings.
-cap_procs_pair_vars() { printf -v "${1:?}" '%s' 100; printf -v "${2:?}" '%s' 10000; printf -v "${3:?}" '%s' 'fixture'; }
-cap_h_for_vars() { printf -v "${3:?}" '%s' "$(( ${2:-0} - ${1:-0} ))"; }
-cap_fork_probe() { return 0; }
-CAPEOF
+# ⛔ THE FIXTURE USED TO SEED A STUB `capacity.sh` AT `$HOME/orchestrator`, because the installed gate
+# had no instrument beside it. Since #2843 it DOES (`$DEST/bin/capacity.sh`, asserted in (k2) above),
+# and "beside the gate" outranks `$HOME/orchestrator` in the resolver — so a stub there would be dead
+# weight that makes the drives look hermetic while the shipped file is what answers. The floor knob is
+# pinned instead (see below), which is honest about which file is under test.
+# ⛔ THE FORK FLOOR IS PINNED TO 1 FOR THESE TWO DRIVES, and it must be. Since #2843 the instrument
+# sits BESIDE the installed gate, so the real (shipped) `capacity.sh` answers these arms — it reads
+# THIS HOST's live process population, so left alone the arm's verdict would be decided by the
+# runner's fork headroom instead of by the LOAD ceiling it exists to test (a busy runner reads
+# `headroom=1` and refuses 73 before the load gate runs). Same seam, same direction, as
+# `MEM_MIN_AVAIL_MB=1` below: pin the lever that is not the subject. `cap_int_seam` refuses a leading
+# zero/`0`, so 1 is the smallest legible floor — and the two-fork probe still runs, so a box that
+# genuinely cannot fork still refuses, which is the truth and not a flake.
 # ⛔ MEM_MIN_AVAIL_MB=1 IS THE MEMORY GATE'S NEUTRALISER (#2387), and it is NOT optional here. The
 # installed shim checks MEMORY before load, so on a box whose MemAvailable is under the shipped 2048
 # floor this arm was decided by the memory gate (rc=84) and the suite reported its own subject — the
@@ -886,7 +935,7 @@ mkdir -p "$TMP/gate-real" "$TMP/gate-home"
 printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
 chmod +x "$TMP/gate-real/pi"
 rm -f "$TMP/gate-ran"
-HOME="$TMP/gate-home" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
+HOME="$TMP/gate-home" MAX_LOAD=0 CAP_MIN_FORK_HEADROOM=1 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
 grc=$?
 if [ "$grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
   ok "the INSTALLED gate REFUSES a spawn at MAX_LOAD=0 (exit 76) and the real pi never runs"
@@ -894,7 +943,7 @@ else
   fail "the installed gate did not refuse an over-ceiling spawn (rc=$grc, real pi ran=$([ -e "$TMP/gate-ran" ] && echo yes || echo no))"
 fi
 rm -f "$TMP/gate-ran"
-HOME="$TMP/gate-home" MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
+HOME="$TMP/gate-home" MAX_LOAD=999999999 CAP_MIN_FORK_HEADROOM=1 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
 grc=$?
 if [ "$grc" -eq 0 ] && [ -e "$TMP/gate-ran" ]; then
   ok "POSITIVE CONTROL: below the ceiling the installed gate EXECs the real pi (it is not a wall)"

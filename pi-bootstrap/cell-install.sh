@@ -2308,19 +2308,38 @@ migrate_legacy_tools_farm() {
 # before the installer's own "no checkout" refusal could print — the exact false reason run 6 of
 # pi-bootstrap/tests/test-cell-install.sh exists to catch).
 install_spawn_gate() {
-  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi"
+  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi" \
+        cap_src="$INFRA_ROOT/scripts/orchestrator-harness/capacity.sh" cap_dst="$DEST/bin/capacity.sh"
   if [ ! -f "$src" ]; then
     die "$src is missing from the checkout — the pi spawn-point gate (#1884) cannot be installed, so a hand-written runner's \`pi\` would be ungated and silent"
   fi
+  # ⛔ THE GATE AND ITS INSTRUMENT ARE ONE INSTALL (#2843). The fork floor reads `capacity.sh`; a shim
+  # installed without the module beside it ABSTAINS on every launch through it, and the installed shim
+  # IS the path most launches take (every caller that resolves `pi` through PATH). Measured
+  # 2026-10-25: 18 abstentions in one worker log (`~/orchestrator/bg/t5163.log`) while the box reported
+  # 4,675 processes of headroom. Failing the install here is deliberate — a cell with no instrument has
+  # a process-headroom floor that never runs, and "the guard silently does not run" is the defect, not
+  # a degraded mode. `$DEST/bin` is where the resolver's "beside me" candidate looks, so placement is
+  # the whole mechanism: it needs no environment variable, which a launchd/tmux/cron caller would not
+  # have.
+  if [ ! -f "$cap_src" ]; then
+    die "$cap_src is missing from the checkout — the spawn-point gate would be installed WITHOUT the fork-floor instrument beside it, so the process-headroom floor would silently ABSTAIN on every launch (#2843)"
+  fi
   install_file "$src" "$dst" || die "could not install $dst"
   log_line "pi spawn-point gate installed at $dst (#1884)"
+  install_file "$cap_src" "$cap_dst" || die "could not install $cap_dst"
+  log_line "fork-floor instrument installed at $cap_dst (#2843)"
 }
 
 # Check (both modes; READ-ONLY). Byte-compared, not `[ -e ]`: a stale or hand-edited copy of a GATE
 # is worse than a missing one, because the missing one is loud while the stale one certifies a
-# ceiling it no longer applies.
+# ceiling it no longer applies. The INSTRUMENT is held to the same standard for the same reason: a
+# `capacity.sh` that has drifted from the reviewed one measures a ceiling nobody reviewed — and a
+# missing one is a floor that abstains, which is silent.
 guard_spawn_gate() {
-  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi"
+  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi" \
+        cap_src="$INFRA_ROOT/scripts/orchestrator-harness/capacity.sh" cap_dst="$DEST/bin/capacity.sh" \
+        selftest="" st_state=""
   if [ ! -f "$src" ]; then
     fail "$src is missing from the checkout — verify cannot vouch for the spawn-point gate it did not read"
     return 0
@@ -2331,6 +2350,36 @@ guard_spawn_gate() {
     fail "pi spawn-point gate DIFFERS from the checkout: $dst (a stale or hand-edited copy — the ceiling it applies is not the one this install reviewed)"
   elif [ ! -x "$dst" ]; then
     fail "pi spawn-point gate is NOT EXECUTABLE: $dst — PATH would resolve past it to the real pi, silently"
+  fi
+  # ── THE INSTRUMENT BESIDE IT (#2843), as a FILE and as a BEHAVIOUR ───────────
+  # The byte comparison catches drift; the self-test catches the PLACEMENT/WIRING failure that a
+  # byte-identical copy in the wrong place still has — the exact shape that produced the #2843 report
+  # (a complete, correct `capacity.sh` that the installed gate could not reach).
+  if [ ! -f "$cap_src" ]; then
+    fail "$cap_src is missing from the checkout — verify cannot vouch for a fork-floor instrument it did not read"
+    return 0
+  fi
+  if [ ! -f "$cap_dst" ]; then
+    fail "fork-floor instrument MISSING: $cap_dst — the installed \`pi\` would ABSTAIN on every launch, so the process-headroom floor would silently never run (#2843)"
+  elif ! cmp -s "$cap_src" "$cap_dst"; then
+    fail "fork-floor instrument DIFFERS from the checkout: $cap_dst (the ceiling it measures is not the one this install reviewed)"
+  elif [ -f "$dst" ]; then
+    # ⛔ THE RESOLVER'S OTHER CANDIDATES ARE SCRUBBED, and that is the point of the arm: left ambient,
+    # `$O` (or `$AGENT_INFRA_PATH`, or `$HOME/orchestrator`) answers and the self-test certifies a
+    # placement it never tested — green on the box of whoever ran it. `HOME` is pointed at a directory
+    # that holds no harness for the same reason, so the ONLY candidate left is the one under test.
+    # ⛔ `ok` AND `refused` ARE BOTH PASSES: `refused` is a real reading of a genuinely starved box,
+    # and failing the verify there would block the box that most needs the gate. The failure this arm
+    # exists for is "no reading was obtained at all" — `unknown` (the instrument ran and could not
+    # measure a box) and `nodeploy` (it could not be found/loaded, or a knob is malformed).
+    selftest="$( ( unset O O_WORK AGENT_INFRA_PATH
+      HOME="${TMPDIR:-/tmp}/pi-gate-selftest-$$" bash -c '. "$1" >/dev/null 2>&1; spawn_fork_state _ss _dd; printf "%s|%s" "$_ss" "$_dd"' \
+        _ "$dst" ) 2>/dev/null || true )"
+    st_state="${selftest%%|*}"
+    case "$st_state" in
+      ok|refused) : ;;
+      *) fail "the installed spawn-point gate ABSTAINS on its fork reading (self-test answered '${st_state:-<no answer>}': ${selftest#*|}) — the process-headroom floor would silently not run on every launch through $dst (#2843)" ;;
+    esac
   fi
 }
 

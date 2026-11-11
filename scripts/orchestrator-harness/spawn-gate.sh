@@ -5375,8 +5375,16 @@ reap_lane_venv() {
 #     what a spawn is — the exact shape (`pi --print` vs `-p` vs an alias) a caller could hide
 #     behind. The rescue route is the operator's, above.
 #   * A box where neither pi-bootstrap/setup.sh nor pi-bootstrap/cell-install.sh has run has no shim.
-#     Both install it (`$DEST/bin/pi`) and the cell installer byte-compares it on `--verify`, so the
-#     state is checked rather than assumed — but it is a state, and it is stated.
+#     Both install it (`$DEST/bin/pi`) **together with its fork instrument beside it** (`$DEST/bin/capacity.sh`
+#     — #2843: the gate reads its process-headroom floor from that module, so a shim installed without
+#     it is a floor that abstains or refuses on every launch through the path most launches take).
+#     Both also SELF-TEST the installed pair at install time, and the cell installer byte-compares both
+#     files on `--verify`, so the state is checked rather than assumed — but it is a state, and it is
+#     stated.
+#   * The instrument's SEARCH is a preference order, so a box holding two copies reads the earlier one.
+#     The chosen copy is published in `SPAWN_GATE_CAP_MOD` and printed on every reading and every
+#     refusal (`mod=…`), so "which copy answered" is a fact an operator reads rather than an inference
+#     from which directories happen to exist.
 #   * The DISK gate (#1765) is NOT here FOR A SPAWN. Its reading is per-spawn (DISK_GATE_PATH is the
 #     worktree the agent will fill), which a shim cannot know: a spawn through the shim is disk-gated
 #     only when its caller runs through run_agent() above. Named residual, and it is the reason
@@ -5428,12 +5436,24 @@ pi_gate_real() { # pi_gate_real <self-path>
   return 1
 }
 
-# pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<mem_avail_mb> <mem_floor_mb>] — one
-# append-only row per pi invocation.
+# pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<mem_avail_mb> <mem_floor_mb> [<fork_state>]]
+# — one append-only row per pi invocation.
 # ALLOWED runs are recorded too, for the reason the disk ledger states: a series that records only
 # refusals cannot answer "how close did we get", which is the question that would have caught both
 # incidents early. Fields: epoch, verdict, load, max_load, pid, ppid, KIND, TAG, cwd, caller,
-# mem_avail, mem_floor.
+# mem_avail, mem_floor, fork.
+#
+# ⛔ THE `fork=` COLUMN IS #2843's SECOND HALF, AND IT IS AN APPEND, NOT A REPLACEMENT. The first
+# twelve fields keep their positions and meanings, so every reader written before this column existed
+# keeps working (`pi_gate_refusal_count` reads `$2`; the suites read by column; `stall-fix.sh` reads
+# the leading fields). It carries the FORK VERDICT the gate actually obtained — `ok`, `refused`,
+# `nodeploy`, or `unknown` — because before it, a launched-with-the-floor-OFF spawn and a
+# launched-with-the-floor-ENFORCED spawn produced IDENTICAL rows (`allowed`). That is the defect the
+# issue states as its own bound: "an abstention is not recorded durably the way a refusal is". The
+# trace that existed was a WARN in a per-worker log — measured 2026-10-25, 18 of them in one
+# `~/orchestrator/bg/t5163.log` — so the only way to answer "did the fork floor run yesterday" was to
+# grep a log that rotates per lane. With this column it is `awk -F'\t' '$13 != "fork=ok"'`. The cost
+# is one column; the cost of its absence was a guard nobody could see was off.
 # ⛔ THE MEMORY COLUMNS ARE APPENDED, NEVER INSERTED (#2387 review P3). The load/max pair alone left
 # the memory figure persisted NOWHERE for the shim-only population (merge-one's reviewers, hand-written
 # runners, interactive sessions) — the binding reading was written only to stderr, and `mem-avail.tsv`
@@ -5443,7 +5463,7 @@ pi_gate_real() { # pi_gate_real <self-path>
 # It writes to $HOME/.pi/agent/state (the durable per-box state dir that already holds locks/,
 # reviews/ and audit/) rather than to `$O`, because a hand-written runner — the exact caller this
 # mode exists for — is under no obligation to have `$O` set.
-pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<mem_avail> <mem_floor>]
+pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<mem_avail> <mem_floor> [<fork_state>]]
   local dir f
   [ -n "${HOME:-}" ] || return 0
   dir="$HOME/.pi/agent/state"
@@ -5459,9 +5479,15 @@ pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<mem_
   if [ -f "$f" ] && [ "$(wc -c < "$f" 2>/dev/null || printf '0')" -ge "$PI_GATE_LEDGER_MAX_BYTES" ]; then
     mv -f "$f" "$f.1" 2>/dev/null || :
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  # ⛔ THE FORK FIELD IS KEYED (`fork=`), not a bare value, and it DEFAULTS rather than empties. A
+  # column a caller can forget to pass must still be readable: an absent 13th field would make every
+  # older writer's row look like "the floor did not run", which is precisely the wrong inference from
+  # an absence. `fork=unknown` is the honest default — "no verdict was obtained" — and it is also the
+  # literal state an abstention carries, so a forgotten argument under-reports enforcement (the safe
+  # direction) instead of certifying it.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%s)" "${1:-}" "${2:-}" "${3:-}" "$$" "${PPID:-0}" "${KIND:-}" "${TAG:-}" "${4:-}" "${5:-}" \
-    "${6:--}" "${7:--}" \
+    "${6:--}" "${7:--}" "fork=${8:-unknown}" \
     >> "$f" 2>/dev/null || return 0
 }
 
@@ -5537,7 +5563,7 @@ pi_shim_main() {
       "$(( n + 1 ))" "${HOME:-<no HOME>}" >&2
     printf '[pi-gate]   remedy: this box is out of PROCESSES, so waiting for load will not help. Restart or drain the BOX from outside (agent-infra#2293); operator rescue is the real pi by absolute path (%s)\n' \
       "$real" >&2
-    pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
+    pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller" - - "$_fstate"
     exit "$PI_FORK_REFUSED"
   fi
   if [ "$_fstate" = "nodeploy" ]; then
@@ -5550,7 +5576,7 @@ pi_shim_main() {
     # gate may never make. The operator rescue is the real pi by absolute path.
     printf '[pi-gate] REFUSED fork headroom UNREADABLE: %s. NO pi was started and nothing was consumed.\n' "$_fdetail" >&2
     printf '[pi-gate]   this is a DEPLOY/SYNC or CONFIG fault, not a reading about this box. The detail above is the authority on WHICH — it can name the file it read (`mod=…`), the dirs it searched (a `searched:` list), or both, and the shapes are not exclusive: a copy that is present but TRUNCATED, or whose arithmetic yields a non-numeric headroom, is rejected even though the file is there. So follow the detail, not a guess: if it names a file, redeploy over THAT file; if it lists dirs, place the pair in ONE of them; if it names CAP_MIN_FORK_HEADROOM, that knob is the malformed input — fix it; if it says `mod=preloaded`, the module came from the calling shell, so re-source the pair. The population this arm exists for is the launcher that never exported `O`, whose resolvable home is ~/orchestrator. Either way use a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <the dir holding the pair>. Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
-    pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
+    pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller" - - "$_fstate"
     exit "$AGENT_HARNESS_SKEW_REFUSED"
   fi
   if [ "$_fstate" = "unknown" ]; then
@@ -5592,7 +5618,7 @@ pi_shim_main() {
     fi
     # The reading and the floor ARE persisted (review P3): the load/max pair below cannot answer "how
     # close to the floor", which is the question this gate exists to make answerable after the fact.
-    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB"
+    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB" "$_fstate"
     exit "$PI_GATE_MEM_REFUSED"
   fi
   if ! can_spawn "$load"; then
@@ -5609,10 +5635,13 @@ pi_shim_main() {
     # fix. See STATED LIMITS.
     printf '[pi-gate]   remedy: re-dispatch when the 1-min load falls below %s; operator rescue is the real pi by absolute path (%s) or an explicit MAX_LOAD\n' \
       "$MAX_LOAD" "$real" >&2
-    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB"
+    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB" "$_fstate"
     exit "$PI_GATE_REFUSED"
   fi
-  pi_gate_ledger allowed "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB"
+  # The ALLOWED row carries the fork verdict too — THAT is the row an abstention used to erase. An
+  # `allowed` with `fork=unknown` is a launch whose process-headroom floor was OFF, and it is now
+  # distinguishable from one it enforced without reading a single log file.
+  pi_gate_ledger allowed "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB" "$_fstate"
   exec "$real" "$@"
 }
 
