@@ -4591,6 +4591,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
               _pf_remedy="This does NOT clear by waiting: there is no pi on this box's PATH — install/repair the harness on the box before re-dispatching." ;;
             misconfigured)
               _pf_remedy="This does NOT clear by waiting: the lane's model/provider PAIR is empty, so no box could run it — fix the dispatch, not the box." ;;
+            stale-code)
+              # A stale checkout is a property of THIS box's CHECKOUT, not of its capacity: the probe
+              # ANSWERED, so the box is fine and nothing was consumed — and re-dispatching the item to a
+              # peer is the wrong move, because the measured fleet state was EVERY cell 496-7093 commits
+              # behind (#3932). A peer is likely behind too, so the item would circulate without ever
+              # being built, which is worse than the refusal it was meant to escape.
+              _pf_remedy="This does NOT clear by waiting and it is NOT a capacity shortfall: the box answered the probe, but its checkout is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (the line above names the repo and the distance), so a lane cut from it produces a plausible log and a wrong diff. Advance that checkout (git fetch, then cut the worktree from origin/main, or the cell's own sync path) before re-dispatching — and do NOT assume a peer is current: the measured fleet state was every cell hundreds of commits behind (#3932). Override with CELL_PREFLIGHT_MAX_BEHIND=<n> only if a stale base is genuinely intended." ;;
             usage)
               # Version skew, not a property of the box: the probe rejected an argument it was handed.
               # ⛔ AND IT IS NOT A CAPACITY REFUSAL, WHICH IS WHY IT EXITS 83 (`AGENT_HARNESS_SKEW_REFUSED`
