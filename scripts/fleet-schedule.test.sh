@@ -818,6 +818,46 @@ out="$(run "$BAD_RETIRED" --check)"; rc=$?
   || bad "--check accepted a RETIRED label with a template (rc=$rc): $out"
 grep -q 'RETIRED but a template still exists' <<<"$out" && ok "the --check refusal names both halves" \
   || bad "--check refusal is not diagnosable: $out"
+# ⛔ THE CADENCE COLUMN IS PART OF THE ROW, AND NOTHING ASSERTED IT (#2908 review, P3). A retired
+# job is built with NEITHER an interval nor a calendar (its body is never parsed), so `human_secs(self.
+# interval or 0)` rendered it as `every 0s` — a cadence that says the job runs constantly, in the same
+# row whose SKIP says it never runs. `Job.cadence` returns "-" for that state, and a mutant restoring
+# the old expression reddened NOTHING: the assertion above greps `SKIP.*…RETIRED` and never reaches the
+# cadence column. Pin the exact rendered row, including the column that was wrong.
+state_reset "$BAD_RETIRED"
+out="$(run "$BAD_RETIRED" --status)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--status exits 0 over a retired label with a template" \
+  || bad "--status failed over the retired fixture (rc=$rc): $out"
+grep -qE '^  SKIP   com\.test\.retired-both +- +RETIRED' <<<"$out" \
+  && ok "the retired job's cadence column renders '-' (not 'every 0s') beside its SKIP" \
+  || bad "the retired row's cadence is not '-' — a job that never runs must not render a cadence: $out"
+grep -q 'every 0s' <<<"$out" \
+  && bad "a retired job is rendered as 'every 0s' — the cadence contradicts the SKIP: $out" \
+  || ok "no retired job renders a bogus 'every 0s' cadence"
+state_reset "$BAD_RETIRED"
+# ⛔ A LEFTOVER TEMPLATE THAT DOES NOT PARSE MUST NOT DISARM THE CELL (#2908 review, P2). The retired
+# short-circuit used to sit BELOW `plistlib.load`, so one stale `RETIRED` line still raised
+# "cannot parse" whenever the file it failed to delete was corrupt/truncated — a layer-wide rc 1, which
+# is the exact #2908 failure mode the split exists to end (measured on cells 3/4). Retirement is
+# decidable from the manifest + the FILENAME, so it is now decided before the body is read.
+# The `--check` arm is what keeps this honest: the AUTHORING gate must still refuse the contradiction.
+cp "$BAD_RETIRED/RETIRED" "$T/retired.manifest.bak"
+printf 'com.test.retired-corrupt\n' >> "$BAD_RETIRED/RETIRED"
+printf 'this is not a plist \000\001 truncated \002' > "$BAD_RETIRED/com.test.retired-corrupt.plist"
+out="$(run "$BAD_RETIRED" --install)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--install survives an UNPARSABLE leftover template of a retired label (rc=0)" \
+  || bad "a corrupt leftover template took the whole layer down over one RETIRED line (rc=$rc): $out"
+grep -q 'SKIP.*com.test.retired-corrupt.*RETIRED' <<<"$out" \
+  && ok "the unparsable retired template is a NAMED SKIP, not a parse refusal" \
+  || bad "the unparsable retired template is not named as SKIP/RETIRED: $out"
+grep -q 'cannot parse' <<<"$out" \
+  && bad "the retired label's body was parsed anyway (a 'cannot parse' refusal): $out" \
+  || ok "the retired label's unreadable body was never parsed"
+out="$(run "$BAD_RETIRED" --check)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--check still refuses the contradiction even with an unparsable leftover" \
+  || bad "--check accepted the contradiction behind an unparsable template (rc=$rc): $out"
+rm -f "$BAD_RETIRED/com.test.retired-corrupt.plist"
+cp "$T/retired.manifest.bak" "$BAD_RETIRED/RETIRED"
 state_reset "$BAD_RETIRED"
 
 # ── 6. a per-machine absence is NAMED and does not block certification ───────────────────────
@@ -1005,6 +1045,47 @@ out="$(darwin_run --stop)"; rc=$?
 [ "$rc" -eq 0 ] && grep -q -- '--uninstall' <<<"$out" \
   && ok "--stop points at install-launchd.sh --uninstall instead of inventing a stop" \
   || bad "--stop did not name the launchd uninstall path (rc=$rc): $out"
+# ⛔ A RETIRED LABEL MUST NOT FAIL macOS `--verify` (#2908 review, P1). The delegate's scan treats
+# NOT INSTALLED / DRIFTED / "not loaded" as FAIL, and a retired job is DELIBERATELY never installed —
+# so the false FAIL this PR removes on Linux stayed on the macOS backend, over the one-line manifest
+# edit `templates/launchd/RETIRED:12-14` advertises as "an operator action on ONE file": --install
+# started the layer, and --verify then called it broken. systemd's comparable (`mask`) names the
+# state (`masked`) rather than reporting the unit absent, and `install-launchd.sh --status` now does
+# the same — pinned here through the SHIPPED --verify, so the two halves cannot drift apart.
+#
+# Both polarities are pinned, because only one of them is "the fix": the NOT INSTALLED arm is the
+# PRE-FIX behaviour and must stay a FAILURE (a scan that stopped flagging absences would be a false
+# PASS, worse than the false FAIL being closed); the RETIRED arm is what the fix makes certifiable.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+cat <<'STATUS'
+=== agent-infra launchd status (templates: /fixture) ===
+  com.eldato.hub-state-check: RETIRED (manifest wins — template present; remove the template in the repo)
+  com.eldato.lane-liveness: installed=loaded version=v0.1.0 (in sync)
+STATUS
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--verify CERTIFIES a set whose only retirement is a named RETIRED state (no false FAIL)" \
+  || bad "a retired label was reported as FAIL on macOS (rc=$rc): $out"
+grep -q 'FAIL' <<<"$out" && bad "--verify printed a FAIL line for a named retirement: $out" \
+  || ok "--verify prints no FAIL line for a named retirement"
+# The scan must stay strict: the same fixture worded the way it WAS (a bare absence) still fails.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+cat <<'STATUS'
+=== agent-infra launchd status (templates: /fixture) ===
+  com.eldato.hub-state-check: NOT INSTALLED (template v0.1.0)
+STATUS
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+[ "$rc" -eq 1 ] && ok "--verify still FAILS a genuine NOT INSTALLED (the scan was not neutered by the fix)" \
+  || bad "closing the retired false-FAIL also stopped flagging real absences (rc=$rc): $out"
 
 # ── 11. a Label is a PATH COMPONENT, so it is validated before it is used as one ─────────────
 case_ "11. a Label that is not a safe file name is refused, and cannot escape the state dir"

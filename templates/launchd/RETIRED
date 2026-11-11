@@ -23,7 +23,15 @@
 # the label as a named SKIP; both honour the manifest instead, because a single
 # stale line here must never disarm a whole cell's scheduled layer (no
 # reaping, no liveness detection, no canary — measured on cells 3 and 4,
-# 2026-10-27).
+# 2026-10-27). On macOS the schedule verbs are the installer's, and it names the
+# same state: `install-launchd.sh --status` prints
+# `RETIRED (manifest wins — template present; remove the template in the repo)`
+# rather than `NOT INSTALLED`, so `fleet-schedule.py --verify` (which delegates
+# to that verb) certifies the layer instead of reporting it broken — a retired
+# job is deliberately never installed, and an absence is not a failure. A copy
+# still installed after retirement is reported `DRIFTED`, so closing that false
+# FAIL does not launder a stale job into a clean status: re-run the installer
+# and it is unloaded + removed.
 #
 # Corruption-canary + provider-latency-tripwire REMAIN launchd jobs: the
 # canary watches ~/swarm (unprotected), the tripwire touches no protected

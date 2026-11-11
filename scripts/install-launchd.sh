@@ -1662,6 +1662,26 @@ if [ "${1:-}" = "--status" ]; then
     echo "=== agent-infra launchd status (templates: $TEMPLATES_DIR) ==="
     for template in "$TEMPLATES_DIR"/*.plist; do
         [ -f "$template" ] || continue
+        # ⛔ A RETIRED LABEL IS A NAMED STATE, NEVER AN ABSENCE (#2908 review, P1). A retired job is
+        # DELIBERATELY never installed, so handing it to status_job printed "NOT INSTALLED" — and
+        # `fleet-schedule.py --verify` on macOS turns every NOT INSTALLED line into FAIL
+        # `SCHEDULE NOT VERIFIED`, rc 1. So the one-line manifest edit this PR advertises
+        # (templates/launchd/RETIRED:12-14, "an operator action on ONE file") started the layer and
+        # then had its own gate report it broken: the #3029 false-FAIL class, closed on Linux and
+        # left standing on the other backend. The comparable (systemd `mask`) names the retirement
+        # as a state (`masked`) rather than reporting the unit absent, and so does this.
+        # The installed-copy arm stays a FAILURE on purpose: the manifest says retired, so a copy
+        # still on disk is DRIFT from the declaration — a false PASS here would be worse than the
+        # false FAIL being closed, and `--install` is what clears it (retire_pass unloads + removes).
+        label="$(job_label "$template")"
+        if is_retired "$label"; then
+            if [ -f "$AGENTS_DIR/$label.plist" ]; then
+                echo "  $label: RETIRED (manifest wins) — DRIFTED: an installed copy survives; re-run the installer to unload + remove it"
+            else
+                echo "  $label: RETIRED (manifest wins — template present; remove the template in the repo)"
+            fi
+            continue
+        fi
         status_job "$template"
     done
     if [ -n "$(retired_labels)" ]; then

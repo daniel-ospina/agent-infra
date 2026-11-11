@@ -511,6 +511,33 @@ def human_secs(seconds: float) -> str:
     return "%dd" % round(seconds / 86400)
 
 
+def retired_job(name, label, strict_declarations):
+    """The RETIRED/template contradiction, decided WITHOUT reading the template body.
+
+    Two callers, one rule — the filename arm in `load_jobs` (before the body is parsed) and the
+    internal-`Label` arm (after it) — so the message and the strict/machine split cannot drift
+    between them.
+
+    ⛔ THE DECLARATION GATE REFUSES, THE MACHINE HONOURS (#2908). Retirement is the only statement
+    here a MACHINE can honour: the alternative is refusing the layer, which is the state that left
+    cell 3/4 with no reaper, no liveness detection and no canary. Nothing else about the body is
+    graded — a retired job is not going to run, so its schedule, its placeholders and its targets
+    are all beside the point — and that is now true of the BODY-UNREADABLE case too (review P2),
+    because the filename arm returns here before `plistlib.load` is ever reached.
+    """
+    if strict_declarations:
+        raise ScheduleError(
+            "%s is in RETIRED but a template still exists — remove one or the other" % label)
+    job = Job(label, [], {}, None, None, "", "")
+    job.skip = (
+        "RETIRED — the label is listed in RETIRED while its template (%s) still exists, so "
+        "nothing is scheduled here and install-launchd.sh unloads any installed copy. This "
+        "contradiction is a REPO authoring error: `fleet-schedule.py --check` refuses it, "
+        "so remove the template or the RETIRED line (in the repo) to clear it" % name
+    )
+    return job
+
+
 def load_jobs(check_targets: bool = True, strict_declarations: bool = False) -> list:
     """Parse every plist in TEMPLATES_DIR into a Job. Raises ScheduleError for a broken set.
 
@@ -588,6 +615,20 @@ def load_jobs(check_targets: bool = True, strict_declarations: bool = False) -> 
             continue
         path = os.path.join(TEMPLATES_DIR, name)
         label_from_file = name[: -len(".plist")]
+
+        # ⛔ A RETIRED JOB IS DECIDED FROM THE MANIFEST + THE FILENAME, BEFORE THE BODY IS READ
+        # (#2908 review, P2). This arm used to sit 30 lines below — after `plistlib.load`, the
+        # dict-root check and the unsafe-`Label` check — while its own comment claimed "nothing
+        # else about the body is graded". A corrupt/truncated leftover template, an array-root
+        # file, or an unsafe Label therefore still RAISED (or set `job.error`, which `--install`
+        # :2951 turns into a layer-wide rc 1) — so one stale RETIRED line still disarmed the WHOLE
+        # cell whenever the file it failed to delete was unparsable, which is the precise #2908
+        # failure mode this split exists to end. Retirement is decidable without the body, so it
+        # is decided without it; only what will actually run is parsed.
+        if label_from_file in retired:
+            jobs.append(retired_job(name, label_from_file, strict_declarations))
+            continue
+
         try:
             with open(path, "rb") as fh:
                 data = plistlib.load(fh)
@@ -619,24 +660,13 @@ def load_jobs(check_targets: bool = True, strict_declarations: bool = False) -> 
                 "Label %r is not a safe file name — only letters, digits, '.', '_' and '-' are "
                 "accepted (the label names this job's stamp, lock and default log)" % label
             )
+        # ⛔ THE INTERNAL `Label` CAN DIFFER FROM THE FILENAME, and the manifest may name either.
+        # The filename arm above is the one that must run before the parse (it is what makes an
+        # unparsable leftover harmless); this one keeps a retired label in the body honoured too,
+        # and it is reached only for a body that parsed — the same input the arm above already
+        # short-circuits, so it costs nothing and preserves the previous matching.
         if label in retired:
-            if strict_declarations:
-                raise ScheduleError(
-                    "%s is in RETIRED but a template still exists — remove one or the other"
-                    % label
-                )
-            # ⛔ THE MANIFEST WINS ON A MACHINE (#2908). Retirement is the only statement here
-            # that a MACHINE can honour: the alternative is refusing the layer, which is the state
-            # that left cell 3/4 with no reaper, no liveness detection and no canary. Nothing else
-            # about the body is graded — a retired job is not going to run, so its schedule, its
-            # placeholders and its targets are all beside the point.
-            job.skip = (
-                "RETIRED — the label is listed in RETIRED while its template (%s) still exists, so "
-                "nothing is scheduled here and install-launchd.sh unloads any installed copy. This "
-                "contradiction is a REPO authoring error: `fleet-schedule.py --check` refuses it, "
-                "so remove the template or the RETIRED line (in the repo) to clear it" % name
-            )
-            jobs.append(job)
+            jobs.append(retired_job(name, label, strict_declarations))
             continue
 
         # ⛔ RESIDENCY IS DECIDED BEFORE THE SCHEDULE, because a SCHEDULE MUST NOT MASK IT. The
