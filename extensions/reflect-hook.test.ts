@@ -104,6 +104,52 @@ async function testBuildQuitPayload() {
     equal(payload.metadata.team, "test-team");
   });
 
+  // #94 consumer contract. The record this builder produces is READ by an agent
+  // following skills/friction-triage/SKILL.md Step 1, which documents the exact
+  // keys below and the runnable extraction built on them. A writer change that
+  // drops or renames one of them leaves that skill pointing at fields that do not
+  // exist — the silently-dead-consumer class #94 exists to kill, and one nothing
+  // else detects (the skill is prose, the JSONL is data: neither fails). Pin the
+  // key set so a breaking change fails HERE instead of at read time.
+  await test("consumer contract: the key set friction-triage Step 1 documents", () => {
+    const payload = buildQuitPayload({
+      sessionId: "sess-contract",
+      turns: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+      ],
+      meta: {
+        team: "test-team",
+        projectRoot: "/tmp/contract",
+        prs: ["94"],
+        charCount: 8,
+      },
+      attribution: testAttribution("deepseek/deepseek-v4-flash"),
+    });
+
+    // Top level — `model` is conditional (tested above), everything else is fixed.
+    deepEqual(
+      Object.keys(payload).filter((k) => k !== "model").sort(),
+      ["conversation", "harness", "machine_id", "metadata", "session_id"],
+      "top-level keys the skill's jq reads: .session_id .conversation .metadata",
+    );
+    // metadata — every one of these is named in Step 1's schema block.
+    deepEqual(
+      Object.keys(payload.metadata as Record<string, unknown>).sort(),
+      ["capturedAt", "charCount", "projectRoot", "prs", "source", "team"],
+      "metadata keys the skill's jq reads: .metadata.{capturedAt,charCount,projectRoot,prs,source,team}",
+    );
+    // Turns — the skill slices `.content`, so content must be a string and role a string.
+    const turns = payload.conversation as Array<Record<string, unknown>>;
+    equal(turns.length, 2);
+    for (const t of turns) {
+      ok(typeof t["role"] === "string", "turn.role is a string");
+      ok(typeof t["content"] === "string", "turn.content is a string");
+    }
+    // `prs` must be a string array — the skill joins it (`.prs | join(",")`).
+    ok(Array.isArray(payload.metadata.prs), "metadata.prs is an array");
+  });
+
   await test("model key absent when attribution has no model", () => {
     const payload = buildQuitPayload({
       sessionId: "sess-2",
