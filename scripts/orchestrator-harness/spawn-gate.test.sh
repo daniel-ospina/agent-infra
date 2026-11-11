@@ -2546,15 +2546,49 @@ ck "...and says the refusal is NOT a box property, so a peer must not be handed 
 # the issue to another box" — for a fault the measurement found on EVERY cell (496-7093 commits
 # behind). The item then circulates between cells that refuse identically and is never built. The
 # refusal itself is correct (no agent was started, nothing consumed): it is the REMEDY that was wrong.
+# (g2b) A STALE CHECKOUT IS NOT A CAPACITY SHORTFALL (#3932). The reason had no arm, so it took the
+# generic *"the reading above names the refusal"* arm and the caller published the 71 text — "dispatch
+# the issue to another box" — for a fault the measurement found on EVERY cell (496-7093 commits
+# behind). The item then circulates between cells that refuse identically and is never built. The
+# refusal itself is correct (no agent was started, nothing consumed): it is the REMEDY that was wrong.
+# ⛔ AND THE REMEDY ALONE WAS NOT ENOUGH (this change's review, P1-2): the CODE was still 71, and every
+# reader maps 71 to a property of THIS box — `lane.sh` minted `state/capacity-refused-<N>` and the
+# controller stood down so a PEER could take the item, while this line said "do NOT assume a peer is
+# current". Two surfaces, contradictory instructions, one refusal. So the arm pins the CODE too.
 mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=stale-code host=x answered_ms=900 attempts=1 bound=45s repo=tortoise behind=542 max_behind=50' 3
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
-{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
-ck "a stale-checkout refusal starts NO agent (rc=$CRC)" $rc
+{ [ "$CRC" -eq 85 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a stale-checkout refusal starts NO agent and exits its OWN code 85, not 71 (rc=$CRC)" $rc
 grep -q 'more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main' "$LOG"; rc=$?
 ck "...and its remedy names the reading instead of the generic one" $rc
 grep -q 'do NOT assume a peer is current' "$LOG"; rc=$?
 ck "...and does not hand the item to a peer, because the measured fleet was stale on every cell" $rc
+# …and its code is DISTINCT from the capability one, which is what makes `lane.sh`/`orch-loop.sh`
+# publish the checkout remedy: a shared code would put the peer-yield text back on a different line.
+{ [ "$CRC" -ne 71 ] && [ "$(printf '%s\n' "$CRC")" != "$(codes_for_name AGENT_CAPABILITY_REFUSED)" ]; }; rc=$?
+ck "...which is NOT the capability code (capability=$(codes_for_name AGENT_CAPABILITY_REFUSED), stale=$CRC)" $rc
+# (g2c) AN UNMEASURABLE STALENESS READ IS ANNOUNCED (this change's review, P2-3). `behind=unknown` is
+# admitted by design — an unanswerable network read is a WARN, the same doctrine as `no-answer` — but it
+# was admitted SILENTLY: no log line, no counter, while `why=no-answer` gets an explicit WARN. So a
+# readiness field that measured nothing looked exactly like one that measured `0`, and every route to
+# `unknown` (no checkout resolved, a failed/killed fetch, no default branch) is a box that is MORE
+# likely stale, not less. The spawn is still ADMITTED: this is loudness, not a new refusal.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=ok host=x answered_ms=900 returned_ms=950 attempts=1 bound=45s key=env repo=none behind=unknown reason=no-checkout tried=pwd,HOME/tortoise' 0
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "an unmeasurable staleness read still ADMITS the spawn (rc=$CRC, agent ran) — it is a WARN, not a refusal" $rc
+grep -q 'staleness reading is UNMEASURABLE' "$LOG"; rc=$?
+ck "...but it is ANNOUNCED, so an inert staleness check is not silent" $rc
+grep -q 'behind=unknown' "$LOG"; rc=$?
+ck "...naming the reading, so the operator can tell 'measured 0' from 'measured nothing'" $rc
+# …and the CONTROL: a MEASURED ok line stays quiet, so the WARN cannot be satisfied by always warning.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=ok host=x answered_ms=900 returned_ms=950 attempts=1 bound=45s key=env repo=tortoise behind=3' 0
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 0 ] && ! grep -q 'UNMEASURABLE' "$LOG"; }; rc=$?
+ck "...while a MEASURED reading (behind=3) is admitted with no such WARN (control)" $rc
 # (g3) A REFUSAL'S READING IS NOT ITS VERDICT (follow-up to #2991, P3, measured). `why=no-return` and
 # `why=call-failed` end in `tail=<last 240 bytes of pi's own output>`, and the arms above were chosen
 # by a substring test over the WHOLE line — so a deterministic refusal whose tail happened to embed
@@ -2797,7 +2831,7 @@ chain_probe() { # <gate-word> -> sets CHAIN_RC and CHAIN_REMEDY (the gate the ch
 }
 # `<gate-word>:<CONSTANT-NAME>` — the value is read from the helper, so a RENUMBER here is followed
 # rather than pinned twice, and an absent constant shows up as an empty `want` (red), not as a pass.
-_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED key:KEY_GATE_REFUSED mem:AGENT_MEM_REFUSED"
+_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED key:KEY_GATE_REFUSED mem:AGENT_MEM_REFUSED stale:AGENT_STALE_CODE_REFUSED"
 _seen=""; _exercised=""
 for _pair in $_gate_expected; do
   _g="${_pair%%:*}"; _c="${_pair##*:}"
@@ -3781,6 +3815,7 @@ ck "the REAL deploy unit reports NOTHING unparseable, NO stale reader default an
 # this row drives it, so the collision cannot be merged into main a second time without a red.
 _fixer_arms="AGENT_BRIEF_REFUSED:BRIEF gate
 AGENT_CAPABILITY_REFUSED:CAPABILITY gate
+AGENT_STALE_CODE_REFUSED:STALE-CODE gate
 AGENT_FORK_REFUSED:fork gate
 AGENT_LOAD_REFUSED:load gate
 AGENT_DISK_REFUSED:disk gate
