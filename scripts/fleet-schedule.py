@@ -3329,9 +3329,33 @@ def cmd_install():
     #   identity-verified box lock there. A repair verb that did not would print "restart it: --start"
     #   over a `--start` that no-ops, which is the "answered 0 and changed nothing" defect this change
     #   removes, one precondition over. `own_via_lock` is that same signal, read ONCE above.
-    live_pid = loop_pid()
-    if not (live_pid and pid_is_our_loop(live_pid)):
-        live_pid = holder[0] if own_via_lock else None
+    # ⛔ AND THE THIRD F, WHICH THIS DIFF ITSELF INTRODUCED (round-2 review, F1): OWNERSHIP. The
+    # pidfile is not a title deed. `pid_is_our_loop` proves only "a fleet-schedule --loop" — EVERY loop
+    # on the box satisfies it, whichever state dir it belongs to — so a `loop.pid` holding a RECYCLED
+    # pid that landed on ANOTHER home's live loop (the #3029 hazard; a state dir copied from another
+    # home reaches it too) resolved to a pid this verb does not own, graded it against THIS dir's
+    # stamp (unstamped by construction, a false statement about a loop that stamped correctly at
+    # home), SIGTERMed it, and then spawned a successor from here — silently MOVING the box's
+    # scheduler to a different home. That is the decision `cmd_start` refuses to make (`#2890`,
+    # "one loop per box"), and pre-fix `--install` did not make it either: it printed `loop already
+    # running` and let `cmd_verify` REBIND to the holder and grade the real loop. Nothing was
+    # signalled. So the box lock is the ownership fact, and a FOREIGN holder short-circuits the
+    # restart path exactly as it does there: report (from the holder's OWN stamp) and touch nothing —
+    # `spawn_loop()` below refuses to add a second loop, and `cmd_verify()` grades the holder.
+    live_pid = None
+    if foreign_holder is not None:
+        code_kind, code_detail = loop_code_report(foreign_holder[0], foreign_holder[2])
+        if code_kind != "current":
+            print("  STALE  %s" % code_detail)
+            print(
+                "        this state dir cannot restart it — run the restart from the home that owns "
+                "that loop: FLEET_SCHEDULE_STATE=%s %s --start"
+                % (foreign_holder[2], os.path.basename(sys.argv[0]))
+            )
+    else:
+        live_pid = loop_pid()
+        if not (live_pid and pid_is_our_loop(live_pid)):
+            live_pid = holder[0] if own_via_lock else None
     stale = None
     if live_pid:
         # ⛔ THE VERB THAT HIDES THIS BEST (#2961). `--install` is what `cloud-cell-bringup.sh --check`
@@ -3367,6 +3391,24 @@ def cmd_install():
         if not pid:
             print("FAIL: the scheduler loop did not come up (see %s/loop.log)" % STATE, file=sys.stderr)
             return 1
+        # ⛔ THE POINTER IS RE-RECORDED WHEN THIS INVOCATION STARTED A LOOP (round-2 review, F2).
+        # The successor inherited the CALLER's resolved `TEMPLATES_DIR`, so when the caller's set
+        # differs from the recorded pointer, a pointer written only by the `own_alive` arm above now
+        # names a set the running loop does not read — the exact state 19al/19ap forbid (measured
+        # there as "pointer tplA -> tplB while `loop.log` still start-named tplA"). `cmd_start`
+        # already records on `started` (`:3529`), so without this the two entry points disagree about
+        # the same verb outcome, and a later bare-env `--start` (the supervisor's revival — the reason
+        # the pointer is load-bearing) resurrects a loop over the wrong set.
+        if started:
+            try:
+                remember_templates_dir()
+            except OSError as exc:
+                print(
+                    "  NOTE   could not record the declaration set in %s (%s) — a later `--start` from "
+                    "an environment without INFRA_ROOT/TEMPLATES_DIR will not find the declarations"
+                    % (STATE, exc),
+                    file=sys.stderr,
+                )
         # ⛔ "loop started" IS A CLAIM ABOUT AN ACT. When the box's lock is held by another state
         # dir, `spawn_loop` returns that holder's pid and started NOTHING — printing "loop started
         # (pid N)" there reported a pid this verb never created, one line after the honest "a second

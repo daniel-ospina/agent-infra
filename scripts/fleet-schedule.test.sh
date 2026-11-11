@@ -4771,6 +4771,60 @@ else
     && bad "20d this home restarted ANOTHER home's loop (it must not move the box's scheduler): $out" \
     || ok "20d this home did not restart the foreign loop"
   s20b --stop >/dev/null 2>&1
+
+  # ── 20e. ROUND-2 F1 — a pidfile naming ANOTHER home's live loop is not a title deed ──────────────
+  # `pid_is_our_loop` proves only "a fleet-schedule --loop": EVERY loop on the box satisfies it, so a
+  # `loop.pid` holding a RECYCLED pid that landed on a foreign home's loop (the #3029 hazard; a state
+  # dir restored from another home reaches it too) resolved to a pid this verb does not own. The new
+  # stale branch then graded it against THIS dir's stamp (unstamped BY CONSTRUCTION — a false
+  # statement about a loop that stamped correctly at home), SIGTERMed it and spawned a successor from
+  # here, silently MOVING the box's scheduler. Pre-fix `--install` printed `loop already running` and
+  # let `cmd_verify` rebind to the holder and grade the real loop; nothing was signalled. The box
+  # lock is the ownership fact.
+  rm -f "$ST20/OFF" "$ST20B/OFF"      # both stops above recorded a decision; --install honours it
+  s20b --install >/dev/null 2>&1                  # B (re)takes the box
+  printf '\n# and the loop at B predates this refresh\n' >> "$S20/fleet-schedule.py"   # → B is STALE
+  sleep 1
+  pid20B="$(cat "$ST20B/loop.pid" 2>/dev/null)"
+  kill -0 "$pid20B" 2>/dev/null \
+    && ok "20e baseline: B's loop really holds the box and is stale (the arm cannot pass vacuously)" \
+    || bad "20e baseline: B's loop is not live — the ownership arm would grade nothing"
+  printf '%s\n' "$pid20B" > "$ST20/loop.pid"      # this home's pidfile names B's LIVE loop
+  out="$(s20 --install)"; rc=$?
+  [ "$rc" -eq 1 ] && grep -q 'THE FILE WAS REFRESHED AND THE PROCESS WAS NOT' <<<"$out" \
+    && ok "20e --install reports the foreign holder's staleness (via cmd_verify, which rebinds to it)" \
+    || bad "20e --install did not report the stale foreign holder (rc=$rc): $out"
+  grep -q 'restarting the loop' <<<"$out" \
+    && bad "20e ⛔ this home TORE DOWN another home's loop and re-homed the box's scheduler: $out" \
+    || ok "20e ⛔ it did NOT terminate a loop it does not own (no re-homing under #2890)"
+  grep -q "FLEET_SCHEDULE_STATE=$ST20B" <<<"$out" \
+    && ok "20e the message names the home that must act" \
+    || bad "20e the message does not name the owning home: $out"
+  kill -0 "$pid20B" 2>/dev/null \
+    && ok "20e the foreign loop SURVIVED (it was never signalled)" \
+    || bad "20e --install SIGTERMed another state dir's live loop"
+  [ "$(cat "$ST20B/loop.pid" 2>/dev/null)" = "$pid20B" ] \
+    && ok "20e the box's scheduler was not moved to this home" \
+    || bad "20e the box's scheduler was re-homed (B's pidfile now reads '$(cat "$ST20B/loop.pid" 2>&1)')"
+  s20b --stop >/dev/null 2>&1
+
+  # ── 20f. ROUND-2 F2 — a restart must re-record the declaration pointer ────────────────────────
+  # The successor inherits the CALLER's `TEMPLATES_DIR`. A pointer written only by the pre-restart
+  # arm then names a set the running loop does NOT read (19al/19ap's measured state: "pointer tplA ->
+  # tplB while loop.log still start-named tplA"), and a later bare-env `--start` — the supervisor's
+  # revival, which is why the pointer is load-bearing — resurrects a loop over the wrong set.
+  # `cmd_start` records on `started`; `--install` did not.
+  rm -f "$ST20/OFF"
+  s20 --install >/dev/null 2>&1                     # a current loop, and its pointer is correct
+  printf '\n# refreshed once more for the pointer arm\n' >> "$S20/fleet-schedule.py"
+  printf '%s\n' "$T/a-decoy-templates-dir" > "$ST20/templates-dir"   # a set nothing runs
+  out="$(s20 --install)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "20f --install restarts a stale loop and still exits 0" \
+                  || bad "20f --install exited $rc over a stale loop: $out"
+  [ "$(cat "$ST20/templates-dir" 2>/dev/null)" = "$GOOD" ] \
+    && ok "20f ⛔ the restart RE-RECORDED the pointer to the set the successor actually runs" \
+    || bad "20f the pointer still names a set nothing runs ('$(cat "$ST20/templates-dir" 2>&1)') — a later bare-env --start revives the wrong set"
+  s20 --stop >/dev/null 2>&1
 fi
 
 
