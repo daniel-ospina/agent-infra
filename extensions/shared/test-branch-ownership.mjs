@@ -463,6 +463,26 @@ ok("branchOp #594: update-ref --stdin names no ref on argv → ref-write(null)",
   const r = classifyBranchOp("update-ref", ["--stdin"]);
   return r.op === "ref-write" && r.target === null;
 })());
+ok("branchOp #594: update-ref --stdi / --s (unambiguous --stdin prefixes) → ref-write(null)",
+  ["--stdi", "--st", "--std", "--s"].every((f) => classifyBranchOp("update-ref", [f]).op === "ref-write"));
+ok("branchOp #594: update-ref --no-stdin is the opposite → other",
+  classifyBranchOp("update-ref", ["--no-stdin"]).op === "other");
+ok("branchOp #594: symbolic-ref -qd / -dq (clustered delete) → ref-write(b)",
+  ["-qd", "-dq"].every((f) => {
+    const r = classifyBranchOp("symbolic-ref", [f, "refs/heads/victim"]);
+    return r.op === "ref-write" && r.target === "victim";
+  }));
+ok("branchOp #594: symbolic-ref -md is `-m d` → not a delete cluster (2 positionals still a write)",
+  classifyBranchOp("symbolic-ref", ["-md", "refs/heads/sym3", "refs/heads/main"]).op === "ref-write");
+ok("branchOp #594: an UNRESOLVED ref operand (`$R`, `$(…)`, the collapsed `$` sentinel) → ref-write(null)",
+  [["$R", "refs/heads/main"], ["$(printf refs/heads/v)", "refs/heads/main"], ["$"]].every((args) => {
+    const r = classifyBranchOp("symbolic-ref", args);
+    return r.op === "ref-write" && r.target === null;
+  }));
+ok("branchOp #594: update-ref with an unresolved ref operand → ref-write(null)",
+  classifyBranchOp("update-ref", ["$R", "HEAD"]).op === "ref-write");
+ok("branchOp #594: a LITERAL non-branch ref (myref) keeps today's 'other' (behaviour unchanged)",
+  classifyBranchOp("symbolic-ref", ["myref", "refs/heads/main"]).op === "other");
 ok("branchOp #594: update-ref -z (stdin NUL mode) → ref-write(null)", (() => {
   const r = classifyBranchOp("update-ref", ["--stdin", "-z"]);
   return r.op === "ref-write" && r.target === null;
@@ -501,6 +521,16 @@ const REF_MATRIX = [
   ["update-ref", ["--stdin", "-z"], true],
   ["update-ref", ["refs/tags/v1", "HEAD"], false],
   ["update-ref", ["-m", "why", "refs/tags/v1", "HEAD"], false],
+  // #594 review round 1 — the five measured shapes the first cut left open.
+  ["symbolic-ref", ["-qd", "refs/heads/victim"], true],
+  ["symbolic-ref", ["-dq", "refs/heads/victim"], true],
+  ["symbolic-ref", ["-md", "refs/heads/sym3", "refs/heads/main"], true],
+  ["symbolic-ref", ["$(printf refs/heads/victim)", "refs/heads/main"], true],
+  ["symbolic-ref", ["$"], true],
+  ["update-ref", ["--stdi"], true],
+  ["update-ref", ["--s"], true],
+  ["update-ref", ["--no-stdin"], false],
+  ["update-ref", ["$R", "HEAD"], true],
 ];
 const cliWrite = (verb, args) => (verb === "symbolic-ref"
   ? cg.symbolicRefWriteTarget(args)
@@ -508,7 +538,8 @@ const cliWrite = (verb, args) => (verb === "symbolic-ref"
 const cliSaysWrite = (verb, args) => {
   const w = cliWrite(verb, args);
   if (!w) return false;
-  return verb === "symbolic-ref" ? (w.name === "HEAD" || w.branch !== null) : true;
+  if (verb === "update-ref") return true;
+  return w.opaque === true || w.name === "HEAD" || w.branch !== null;
 };
 const opSaysWrite = (verb, args) => {
   const r = classifyBranchOp(verb, args);
