@@ -4595,8 +4595,11 @@ function _cleanDeleteTarget(x) {
 }
 
 /**
- * Extract the branch name from `git push [remote] --delete <branch>`.
- * Handles both short names ("feat/x") and full refs ("refs/heads/feat/x").
+ * Extract the branch name(s) from `git push [remote] --delete <branch>…`.
+ * Handles both short names ("feat/x") and full refs ("refs/heads/feat/x"), and
+ * returns EVERY delete refspec of a push that carries a delete flag (git's
+ * positional model: first positional = repository, the rest = refspecs), so a
+ * multi-refspec delete is attributed in full — never just its first target.
  * #443: the legacy raw-string regex was exact-only (`--delete`/`:branch`), so
  * `-d`/`--del`(-prefix) spellings returned null and the degradation-fallback
  * #73 sibling-checked-out check never fired for them. Rewritten token-based to
@@ -4605,7 +4608,14 @@ function _cleanDeleteTarget(x) {
  * it is a normal push, not a delete — the empty-source form starts the token
  * with `:`).
  * @param {string} command
- * @returns {string|null} branch name (short form) or null
+ * @returns {string[]|null} every delete refspec (short form, deduped, in command
+ *   order) — an array, never a bare string; null when no delete spelling is
+ *   attributable to a refspec. Deliberately OVER-captures the git-REJECTED
+ *   shapes (a lone bare positional — `git push --delete feat/x` → `["feat/x"]`;
+ *   a colon target mixed with `--delete` — `git push origin -d a :b` →
+ *   `["a","b"]`), because an extra target is fail-closed while a missing one
+ *   leaves the delete unguarded. So `null` ⇒ nothing deleted, but a NON-null
+ *   result does NOT prove git will delete it (review P3-1).
  */
 export function extractPushDeleteBranch(command) {
   const c = String(command ?? "").trim();
@@ -4635,25 +4645,42 @@ export function extractPushDeleteBranch(command) {
       // delete; a pre-#443 quote-aware extractor handled it, keep that).
       const tq = t.replace(/^["']|["']$/g, "");
       if (_isPushDeleteFlagToken(tq)) {
-        // git's positional model: when a delete flag is present and ≥2
-        // positionals follow it with none BEFORE it, the FIRST is the
-        // REPOSITORY (`git push --delete origin c` deletes c on origin —
-        // probe-verified; `git push --delete origin a b` deletes a AND b).
-        // When the repo precedes the flag (`git push origin --delete a b`)
-        // every following positional is a delete refspec. The extractor's
-        // documented single-target contract keeps the first real refspec, so
-        // a repo that TRAILS the flag is dropped. (A lone positional after
-        // the flag with no repo anywhere is git-invalid — kept as a harmless
-        // over-capture matching the original extractor.)
-        const before = [];
-        const following = [];
+        // git's positional model, wherever the flag sits: the FIRST positional
+        // of the push is the REPOSITORY and EVERY other positional is a delete
+        // refspec — INCLUDING the ones that precede the flag, because `--delete`
+        // is a push-wide option, not a per-refspec one. Probe-verified against a
+        // local bare remote:
+        //   `git push -d origin a b`      → `- [deleted] a`, `- [deleted] b`
+        //   `git push origin -d a b`      → `- [deleted] a`, `- [deleted] b`
+        //   `git push origin main -d b`   → `- [deleted] b`, `- [deleted] main`
+        //   `git push --delete origin c`  → `- [deleted] c`
+        // #509: the previous single-target capture returned only the FIRST
+        // refspec, so on the degradation-fallback #73 arm a multi-refspec delete
+        // of a sibling-checked-out branch was never coordinated-blocked
+        // (e.g. `git push -d origin a b` extracted ["a"] — the real target `b`
+        // was lost and its upstream destroyed). Attribute ALL refspecs, exactly
+        // as `classifyGitCommandDetailed`'s delete pushTargets does
+        // (`positionals.length > 1 ? positionals.slice(1) : positionals`), so the
+        // two #443 surfaces stay in parity.
+        // Only the FIRST positional overall is dropped (the repository). The one
+        // exception is the git-REJECTED lone bare positional, where no repository
+        // can be identified: a single positional AFTER the flag is kept as a
+        // target (`git push --delete feat/x` → `fatal: --delete doesn't make sense
+        // without any refs` — probe-verified; the keep is the documented harmless
+        // over-capture), while a single positional BEFORE the flag IS the
+        // repository and deletes nothing (`git push origin -d` → nothing deleted).
+        const positionals = [];
+        let beforeCount = 0;
         for (let j = 0; j < tokens.length; j++) {
           if (j === i || tokens[j].startsWith("-") || valueSlot[j]) continue;
-          (j < i ? before : following).push(tokens[j]);
+          if (j < i) beforeCount++;
+          positionals.push(tokens[j]);
         }
-        if (following.length === 0) continue; // no refspec after the flag → git errors, nothing deleted
-        const targetTok = following.length >= 2 && before.length === 0 ? following[1] : following[0];
-        branches.push(_cleanDeleteTarget(targetTok));
+        if (positionals.length === 0) continue; // no positional at all → git errors, nothing deleted
+        const targets = positionals.length > 1
+          ? positionals.slice(1)                        // first positional = the REMOTE
+          : (beforeCount === 0 ? positionals : []);      // lone refspec after the flag, or the repo alone
+        for (const tok of targets) branches.push(_cleanDeleteTarget(tok));
       } else if (/^:/.test(tq)) {
         // Empty-source colon refspec (`:feat/x`) = a delete. src:dst refspecs
         // (`main:feature`) never start with `:` — they stay plain pushes.
