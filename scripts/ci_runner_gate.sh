@@ -134,9 +134,10 @@ QUEUE_PAGE=100
 #     predicate) found **14 consecutive rows with ZERO jobs created at all**, 2026-11-11
 #     20:49:45Z…20:53:24Z, with real demand at index 15 (run 43130574723, 30 jobs, 1 queued);
 #   * the gate's own 25-row pass one minute earlier discounted **10** ghosts before reaching demand
-#     (`probe: queued=238 queued_demanding=228 ghost_runs=10 queue_head_run=43128807199
-#     oldest_queued_s=11178 in_progress=9`) — the head moves as new runs arrive, so the two counts
-#     differ by WHEN they were taken, not by method.
+#     (`probe: … ghost_runs=10 … oldest_queued_s=11178 in_progress=9` — quoted with an elision: the
+#     line in the log carries `threshold=` between those fields, so it cannot be grepped contiguously)
+#     — the head moves as new runs arrive, so the two counts differ by WHEN they were taken, not by
+#     method.
 # Either way a 5-run window cannot reach demand, and the pass refuses: measured twice by hand on
 # 2026-11-12 (`beyond the 5-run scan window`, exit 2 — and `--dry-run` writes no verdict, so a box
 # that only ever hand-runs this gate keeps an arbitrarily old verdict file; this box's said
@@ -849,6 +850,7 @@ print(comp, len(inc))
     0)            log "queue head scan bound is ZERO ('${QUEUE_HEAD_SCAN_MAX}') — a non-empty queue could never be measured, so this would disarm the leg rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
   QUEUE_GHOSTS=0
+  scanned=0
   queued_demanding="$queued"
   DEMAND_LABELS=""
   demand_head_id=""; demand_head_created=""
@@ -932,7 +934,7 @@ print(comp, len(inc))
         # The candidate list ENDED before the queue did: a truncated read, not an empty one. The
         # wording is "readable run row(s)" because the list may be the PAGE's rows or the single
         # candidate synthesised from a body that carried only a head id.
-        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing"; return 2
+        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing$(if [ "$scanned" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
       else
         log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"; return 2
       fi
@@ -1097,7 +1099,7 @@ print(age)
   # every other unread operand; it is the answer here too, and the message names BOTH values so the
   # misconfiguration is visible instead of silent.
   if [ "$queued" -gt "$QUEUE_PAGE" ]; then
-    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs and the bound (%s) is already at or above it, so no bound can see past this page — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_HEAD_SCAN_MAX"; fi)"
+    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing"
     return 2
   fi
 

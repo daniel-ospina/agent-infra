@@ -553,9 +553,9 @@ fi
 # scan stopped by the BOUND does, so they must be fed the SHIPPED bound rather than a hardcoded 5:
 # with the shipped bound at 25 a five-ghost page no longer exhausts the window, and those arms no
 # longer refuse at all — the scan reaches the demand row behind the five ghosts (measured: both exit 0
-# and write a verdict). They RED in that state rather than passing quietly (measured: the RC assertion
-# and both message assertions on each arm), and the shipped value itself is ALSO pinned literally at
-# the `#3995` arm (agent-infra#3995).
+# and write a verdict). They RED in that state rather than passing quietly (measured: 8 — each arm's RC
+# assertion and message assertions, plus the no-state-file / no-PUT safety assertions), and the shipped
+# value itself is ALSO pinned literally at the `#3995` arm (agent-infra#3995).
 ghost_window_fixture() {
   local n="$1" ids="" rows="" i id
   for i in $(seq 1 "$n"); do
@@ -1216,29 +1216,20 @@ assert_contains "$OUT" "TRUNCATED" "the refusal names the truncation"
 # the ceiling does not apply below QUEUE_PAGE (agent-infra#3995 review cycle 2, finding 4).
 assert_not_contains "$OUT" "ONE page of" "the page-ceiling note is absent below QUEUE_PAGE"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a truncated page advanced no state file"
-# ⛔ THE CEILING NOTE IS WIRED, and it is the half an operator needs when the knob alone cannot help: a
-# bound AT the page size can never read past the page, so the TRUNCATED refusal must say so. Without
-# this arm the `-ge` in that conditional could be flipped to `-le` and the whole suite stayed green
-# (measured, agent-infra#3995 review cycle 2, finding 4).
-echo "── #3995: a scan bound AT the page ceiling NAMES the ceiling the knob cannot pass ──"
-# A FULL page of ghosts (the production shape): the generator's ids end at 4000+n, so the demand row
-# sits past them at 4200 — a hardcoded 4100 would collide at n=100. The bound equals the page size, so
-# the scan breaks on the BOUND before it reaches the demand row: the window refusal, with the ceiling.
+echo "── #3995: a TRUNCATED read of a FULL page NAMES the page ceiling the knob cannot pass ──"
+# ⛔ THE REACHABLE CEILING SHAPE IS A FULL PAGE THAT ENDS EARLY — not a bound break (agent-infra#3995
+# review cycle 4, findings 1/2, measured): with `per_page=100` no response can carry 101 rows, so a
+# bound at or above the page size never breaks on the bound; the scan runs out of ROWS and reaches the
+# TRUNCATED refusal, which is where the note belongs. A 101-row fixture made this arm take the WINDOW
+# branch — a page the API cannot produce.
 GW_FULL="$(ghost_window_fixture "$QUEUE_PAGE_SHIPPED")"
-run_gate ghost-window-at-page GH_QUEUED="$((QUEUE_PAGE_SHIPPED + 5))" GH_INPROGRESS=0 \
+run_gate ghost-truncated-fullpage GH_QUEUED="$((QUEUE_PAGE_SHIPPED + 5))" GH_INPROGRESS=0 \
   GH_DEMAND_GHOST_IDS="${GW_FULL%%|*}" \
-  GH_QUEUE_ROWS_SPEC="${GW_FULL#*|}4200:2592000" CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_PAGE_SHIPPED" --
-assert_eq "$RC" "2" "a window that runs out at the page ceiling → exit 2"
-assert_contains "$OUT" "beyond the ${QUEUE_PAGE_SHIPPED}-run scan window" "the window refusal names its bound"
+  GH_QUEUE_ROWS_SPEC="${GW_FULL#*|}" CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_PAGE_SHIPPED" --
+assert_eq "$RC" "2" "a full ghost page that ends early → exit 2 (could-not-measure)"
+assert_contains "$OUT" "TRUNCATED" "it is reported as truncation"
 assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound cannot pass"
 assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "…and the knob, so the operator sees both facts on one line"
-# …and the OTHER surface where the page is the ceiling is the saturated read: a queue deeper than the
-# page while the length leg did not decide. The note belongs there too (it is the same fact), and it
-# must be gated on the bound actually being at the ceiling — the shipped 25 is not.
-echo "── #3995: a SATURATED read names the page ceiling only when the bound is at it ──"
-run_gate page-saturated-at-page GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 \
-  CI_GATE_QUEUE_THRESHOLD=200 CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_PAGE_SHIPPED" --
-assert_contains "$OUT" "ONE page of" "a saturated read at the ceiling names the ceiling"
 # ⛔ …AND THE NOTE IS ABOUT A FULL PAGE, NOT ABOUT THE BOUND (agent-infra#3995 review cycle 3, finding
 # 1). Keyed on the bound alone it fired on a DEGRADED body (a synthesised single candidate) and on any
 # short page, blaming the page cap for a list no bound could have widened — advice that cannot help.
