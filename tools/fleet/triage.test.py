@@ -601,12 +601,19 @@ def leg_wiring() -> None:
     repo = os.path.dirname(HERE)
     setup = os.path.join(os.path.dirname(repo), "pi-bootstrap", "setup.sh")
     if os.path.exists(setup):
+        import re as _re
         blob = open(setup, encoding="utf-8", errors="replace").read()
-        m = blob.split("fleet_tools=(", 1)
-        decl = m[1].split(")", 1)[0] if len(m) == 2 else ""
+        # ⛔ LINE-ANCHORED, EXACTLY AS `test-setup-no-nesting.sh` DERIVES IT
+        # (`sed -n 's/^fleet_tools=(\(.*\))$/\1/p'`). A looser search matched the PROSE in the comment
+        # that explains this rule, i.e. the assertion would have passed on a comment and failed on the
+        # array — measured, and the reason this leg reads the array the way its real consumer does.
+        m = _re.search(r"^fleet_tools=\((.*)\)$", blob, _re.M)
+        decl = m.group(1) if m else ""
+        ok("the fleet_tools array is readable by the no-nesting gate's own derivation", bool(decl),
+           "a wrapped or commented array reads as EMPTY there (#1899)")
         for needed in ("triage.py", "triage_arms.py"):
             ok("pi-bootstrap farms %s (turn-end.py imports it from $SCRIPTS/fleet)" % needed,
-               needed in decl, decl[:120])
+               needed in decl.split(), decl[:140])
     else:
         ok("pi-bootstrap/setup.sh is present to declare the farm", False, setup)
 
