@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-issue-11954-1794450567-p2907274-af5d166b",
+  "_sha": "d8f2ab237ecdf9bd594d5278b6ca5ea4efaf2117",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/cell-home/orchestrator/bg/issue-11954.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/11954-register-guard-ast"
+    },
+    {
+      "kind": "sha",
+      "value": "55df9f1934749a72d853124806dd9230511d4f67"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/wt-11954"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 3997,
+  "ended_at": 1794454564,
+  "exit_code": 0,
+  "heartbeat_at": 1794454564,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-issue-11954-1794450567-p2907274-af5d166b",
+  "lease_until": 1794462364,
+  "pid": 2907274,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794450567,
+  "state": "DONE",
+  "tag": "issue-11954",
+  "worktree": "/home/cmux/wt-11954"
+}
