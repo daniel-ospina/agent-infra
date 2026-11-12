@@ -89,8 +89,11 @@
 # deleted, and never re-offered.
 # ⛔ RETIREMENT IS TTL-BOUNDED, SO IT CANNOT LOSE LIVE WORK. Only an order whose record is older than
 # `WORKER_SUPPLY_ORDER_TTL_S` (7 days) is eligible, and only in a state this path has already decided it
-# cannot supply: its refills are SPENT, or its brief the gate REFUSES. A fresh order -- including one
-# whose worker simply died -- is never retired, so the refill path is untouched.
+# cannot supply: its refills are SPENT, the WORKTREE it names is gone, the BRIEF it names is gone, or its
+# brief the gate REFUSES. A fresh order -- including one whose worker simply died -- is never retired, so
+# the refill path is untouched. (The worktree/brief arms are the DOMINANT measured case: 80 orders, 0
+# worktrees present -- the deterministic `prd-<n>` repair trees had been reaped, which every pass logged
+# as "the worktree recorded for the order is gone" and could never act on.)
 # ⛔ AND IT IS REVERSIBLE WITHOUT A HUMAN. `retired_row()` matches the SAME `started` record instance
 # (mtime), and `pr-doctor.py` rewrites that file UNCONDITIONALLY on every spawn -- so if the PR is still
 # open, the composer's next order writes a NEW record, the row stops matching, and the order is supplied
@@ -654,6 +657,7 @@ pass() {
   local complete=0 retired=0 retired_new=0 ret_note="" age=0 m_age=""
   local n_offered=0 n_dead_total=0 refused=0 budget_full=0 exhausted=0 no_record=0 stale_brief=0
   local f name wt prompt kind stamp wt_branch rec_branch capr sig hold bgrc stale_note prev_stale
+  local wt_now prompt_now ret_reason
 
   mkdir -p "$STATE_DIR" 2>/dev/null || { log_line "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
   plenv="$STATE_DIR/.worker-supply.plistenv"
@@ -697,20 +701,34 @@ pass() {
     ask_status "$name" "$f"
     [ "$STATUS_KIND" = DEAD ] || continue
     # ⛔ AN ORDER THIS PASS CAN NEVER SUPPLY IS RETIRED, NOT DEFERRED FOR EVER (agent-infra#4007).
-    # The eligibility is deliberately NARROW -- both halves must hold: this path has already decided it
-    # cannot act (its refills are SPENT, the branch below), AND the record is older than the TTL, so a
-    # transient crash burst cannot retire an order that a later pass would have supplied. The retired
-    # order leaves `dead` (nothing remains to wait for) and enters `retired`; no spawn, no gate call, no
-    # ledger row, and no log line per pass -- the count is the durable signal.
+    # The eligibility is deliberately NARROW: this path has already decided it cannot act on the order,
+    # AND the record is older than the TTL -- so a transient crash burst can never retire an order a
+    # later pass would have supplied. THREE un-actionable states qualify, named by the reason recorded:
+    #   refills-spent   its `MAX_REFILLS` are gone -- the branch below logs this one for ever
+    #   worktree-gone   the repair tree it names is not there -- the DOMINANT measured case (80 orders,
+    #                   0 worktrees present, 2026-12-04): every pass logged "the worktree recorded for the
+    #                   order is gone" and could not act. Before this arm that line was permanent.
+    #   brief-gone      the brief file it names is not there (same shape, one field over)
+    # `brief-refused` is the fourth, and it is decided where the gate is asked (below). The retired order
+    # leaves `dead` (nothing remains to wait for) and enters `retired`; no spawn, no gate call, no ledger
+    # row, and no log line per pass -- the count is the durable signal.
     age=0
     if m_age="$(mtime_of "$f")" && [ -n "$m_age" ]; then age=$(( $(date +%s) - m_age )); fi
-    if [ "$age" -gt "$RETIRE_TTL_S" ] && [ "$(refills_of "$name")" -ge "$MAX_REFILLS" ]; then
+    ret_reason=""
+    if [ "$age" -gt "$RETIRE_TTL_S" ]; then
+      wt_now="$(field "$f" worktree)"; prompt_now="$(field "$f" prompt)"
+      if [ "$(refills_of "$name")" -ge "$MAX_REFILLS" ]; then ret_reason=refills-spent
+      elif [ -z "$wt_now" ] || [ ! -d "$wt_now" ]; then ret_reason=worktree-gone
+      elif [ -z "$prompt_now" ] || [ ! -f "$prompt_now" ]; then ret_reason=brief-gone
+      fi
+    fi
+    if [ -n "$ret_reason" ]; then
       if [ "$DRY" = 1 ]; then
-        log_line "DRY-RUN would RETIRE $name — its worker died, it has spent its $MAX_REFILLS refill(s) and its record is ${age}s old (TTL ${RETIRE_TTL_S}s); no pass can act on it again"
+        log_line "DRY-RUN would RETIRE $name (reason=$ret_reason) — its record is ${age}s old (TTL ${RETIRE_TTL_S}s) and no pass can act on it again"
         retired_new=$(( retired_new + 1 )); retired=$(( retired + 1 )); dead=$(( dead - 1 ))
-      elif retire_order "$name" "$f" refills-spent; then
+      elif retire_order "$name" "$f" "$ret_reason"; then
         retired_new=$(( retired_new + 1 )); retired=$(( retired + 1 )); dead=$(( dead - 1 ))
-        log_line "$name: RETIRED — its worker died, it has spent its $MAX_REFILLS refill(s) and its record is ${age}s old (TTL ${RETIRE_TTL_S}s). It leaves the pool: no pass can act on it again. The composer (pr-doctor.py) re-orders the PR with a fresh record if it is still open, which un-retires it (agent-infra#4007)"
+        log_line "$name: RETIRED (reason=$ret_reason) — its record is ${age}s old (TTL ${RETIRE_TTL_S}s) and no pass can act on it again. It leaves the pool. The composer (pr-doctor.py) re-orders the PR with a fresh record and a fresh worktree/brief if it is still open, which un-retires it (agent-infra#4007)"
       fi
       continue
     fi
@@ -845,7 +863,7 @@ pass() {
   # WHY (#3958). It rides in the `why` string and in the record's `stale_briefs=` so `status` — the
   # durable answer — names it without the log.
   [ "$stale_brief" -gt 0 ] && stale_note="$stale_brief order(s) had a brief the gate REFUSES — REGENERATION REQUIRED by pr-doctor (never re-offered unchanged, and no refill spent)"
-  [ "$retired_new" -gt 0 ] && ret_note="$retired_new order(s) RETIRED this pass — un-actionable (spent refills / refused brief older than the ${RETIRE_TTL_S}s TTL); $retired retired in the population, out of the refill walk"
+  [ "$retired_new" -gt 0 ] && ret_note="$retired_new order(s) RETIRED this pass — un-actionable (spent refills / worktree gone / brief gone or refused, record older than the ${RETIRE_TTL_S}s TTL); $retired retired in the population, out of the refill walk"
   if [ "$orders" -eq 0 ]; then
     decision=idle; why="no $PREFIX orders in $BG_DIR — nothing to supply (a pass that never placed an order leaves no record to refill)"
   elif [ "$refused" -gt 0 ]; then

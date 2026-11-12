@@ -947,11 +947,19 @@ fossil_fixture() { # two dead orders whose refills are spent; only prd-41 is old
     printf '%s\t%s\t%s\t%s\n' 2 "prd-$_n" s2 accepted >> "$ST/worker-supply-offers.tsv"
   done
   touch -t 202601010000 "$BG/prd-41.started"      # the FOSSIL: older than the 7-day TTL
+  # ⛔ AND THE DOMINANT REAL CASE: the repair tree the order names had been REAPED (measured 2026-12-04:
+  # 80 orders, 0 worktrees present). Every pass logged "the worktree recorded for the order is gone" and
+  # could never act, so this order is a fossil too — and it is old enough to be retired on that reason.
+  mkorder prd-44 "$TMP/wt/prd-44-reaped" fix/44 "$TMP/briefs/prd-41.txt" 2400 "2026-10-27 01:00:00"
+  touch -t 202601010000 "$BG/prd-44.started"
 }
 fossil_fixture
 O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/k1.out" 2>&1; rck=$?
-[ "$(record_field retired)" = "1" ] && ok "the un-actionable FOSSIL is RETIRED (record retired=1) — it leaves the pool instead of being deferred for ever" \
-                                    || bad "record retired='$(record_field retired)', expected 1"
+[ "$(record_field retired)" = "2" ] && ok "both un-actionable FOSSILS are RETIRED (record retired=2: spent refills + a REAPED worktree) — they leave the pool instead of being deferred for ever" \
+                                    || bad "record retired='$(record_field retired)', expected 2 (prd-41 spent refills, prd-44 reaped worktree)"
+[ "$(awk -F'\t' '$2=="prd-44" { print $3 }' "$ST/worker-supply-retired.tsv" 2>/dev/null)" = "worktree-gone" ] \
+  && ok "…and the reason is RECORDED (prd-44: worktree-gone — the measured 80-orders/0-worktrees shape)" \
+  || bad "the reaped-worktree order's retirement reason is '$(awk -F'\t' '$2=="prd-44" { print $3 }' "$ST/worker-supply-retired.tsv" 2>/dev/null)', expected worktree-gone"
 [ "$(spawns_for prd-41)" = "0" ] && ok "…and it was NOT re-offered (a retired order costs no spawn and no gate call)" \
                                   || bad "the retired order was re-offered: $(spawns_for prd-41) spawn(s)"
 [ "$(awk -F'\t' '$2=="prd-41"' "$ST/worker-supply-retired.tsv" 2>/dev/null | wc -l | tr -d ' ')" = "1" ] \
@@ -966,6 +974,8 @@ O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/k1.out" 2>&1; r
 # re-ordered PR produces a NEW record instance and the retirement row stops matching. Then NEW work
 # appears — and that is the acceptance criterion this case exists for: `live` becomes non-zero.
 mkorder prd-41 "$TMP/wt/prd-41" fix/41 "$TMP/briefs/prd-41.txt" 2400 "$(date '+%Y-%m-%d %H:%M:%S')"
+mkwt "$TMP/wt/prd-44" fix/44          # the composer re-materialised the tree; its record is rewritten too
+mkorder prd-44 "$TMP/wt/prd-44" fix/44 "$TMP/briefs/prd-41.txt" 2400 "$(date '+%Y-%m-%d %H:%M:%S')"
 mkwt "$TMP/wt/prd-43" fix/43
 mkbrief "$TMP/briefs/prd-43.txt"
 mkorder prd-43 "$TMP/wt/prd-43" fix/43 "$TMP/briefs/prd-43.txt"
@@ -974,8 +984,8 @@ O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/k2.out" 2>&1
                                     || bad "record retired='$(record_field retired)' after the composer re-ordered it, expected 0"
 [ "$(spawns_for prd-43)" = "1" ] && ok "NEW work is supplied on the same pass (prd-43 spawned once)" \
                                   || bad "new work was not supplied: $(spawns_for prd-43) spawn(s)"
-[ "$(record_field live)" = "1" ] && ok "…and the pool's live count becomes NON-ZERO with the new work (record live=1) — the reading that could not happen over a 100 %-fossil pool" \
-                                  || bad "record live='$(record_field live)', expected 1"
+[ "$(record_field live)" = "2" ] && ok "…and the pool's live count becomes NON-ZERO with the new work (record live=2: the new order + the re-materialised one) — the reading that could not happen over a 100 %-fossil pool" \
+                                  || bad "record live='$(record_field live)', expected 2"
 
 # ── (k2) MUTATION: neuter retirement, and (k) must redden ──────────────────────────────────────
 echo "-- (k2) mutation: no retirement must redden (k)"
