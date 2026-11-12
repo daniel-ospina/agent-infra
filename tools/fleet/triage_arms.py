@@ -216,7 +216,7 @@ def mandate_missing(brief: str) -> list:
 
 # ── arm 1: the user-question lane ──────────────────────────────────────────────────────────────
 def arm_user_question(ws: str, lane: str, question: str, surface: Surface,
-                      poll=None) -> Proof:
+                      nap=None) -> Proof:
     """Route a waiting lane's question to the dedicated question lane, and prove it landed ROUTED.
 
     The proof is `question-lane-ack`, and it is taken at the artifact in three parts:
@@ -288,7 +288,13 @@ def arm_user_question(ws: str, lane: str, question: str, surface: Surface,
             if not pane_missing:
                 break
         if attempt < 2:
-            (poll or time.sleep)(1.0)
+            # ⛔ A ONE-ARGUMENT SLEEPER, NOT `poll` (round 5, #4046 P0). `poll` is
+            # `(ws, before, bound_s)` — the resumption reader the CONTINUE arm needs — so passing it
+            # here raised `TypeError: missing 2 required positional arguments` out of the arm and out
+            # of `lane-route.main()` on the first retry, i.e. on the NORMAL case where the pane has
+            # not painted yet. The question then never reached the lane and no record was written,
+            # and the suite could not see it because every fixture passed a 1-arg stub.
+            (nap or time.sleep)(1.0)
 
     moved = bool(moved_rc) and idx == QUESTION_LANE_INDEX
     verified = bool(sent and moved and pane is not None and not pane_missing)
@@ -348,7 +354,11 @@ def arm_continue(ws: str, lane: str, surface: Surface, bound_s: float = RESUME_B
 # because the bar is drawn only once the prompt has been satisfied, for the CURRENT process.
 BOOT_BLOCK_MARKER = "Press any key to continue"
 # pi's stats line is `42.0%/700k (auto)`-shaped; only its ORDER against the marker is used.
-_STATS_RE = re.compile(r"\d+(?:\.\d+)?\s*%\s*/\s*\d")
+# ⛔ WIDER THAN A PERCENTAGE (round 5, #4046 P2): `cmux_dispatch.READY_RE` also accepts the
+# unknown-percentage form `?/700k`, which is the NORMAL state right after boot — exactly when this arm
+# reads the pane. A percentage-only pattern read that pane as BLOCKED and reported "the prompt is
+# STILL on the pane" for a repair that worked.
+_STATS_RE = re.compile(r"(?:\?|\d+(?:\.\d+)?\s*%?)\s*/\s*\d")
 
 
 def _boot_blocked(screen: Optional[str]):
@@ -426,10 +436,19 @@ def arm_child(lane: str, child: dict, state_dir: Optional[str] = None) -> Proof:
     os.makedirs(state_dir, exist_ok=True)
     row = {"kind": "child-handoff", "lane": lane, "child": dict(child or {}), "named": named}
     tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(row, fh, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(row, fh, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        # ⛔ A WRITE THAT FAILED IS NOT A HAND-OFF. Pathological (an unwritable state dir, a directory
+        # where the record should be) but cheap to answer honestly — the alternative is an exception
+        # out of `lane-route.main()` and no record at all, which is what the previous round's `poll`
+        # arity bug did on the normal path.
+        return Proof("repair-child", triage.PROOFS["repair-child"], False,
+                     "the hand-off record could not be written: %s" % (exc,),
+                     {"lane": lane, "child": dict(child or {}), "fields": named, "path": path})
     # RE-READ: the written file is the artifact, so its CONTENT is what verifies — not the write call.
     try:
         with open(path) as fh:
@@ -485,7 +504,7 @@ def arm_reading(action: str, reason: str, extra: Optional[dict] = None) -> Proof
 
 
 def execute(route, ev, surface: Surface, *, ws: str = "", dispatch=None, relaunch=None,
-            poll=None, bound_s: float = RESUME_BOUND_S, child: Optional[dict] = None,
+            poll=None, nap=None, bound_s: float = RESUME_BOUND_S, child: Optional[dict] = None,
             state_dir: Optional[str] = None) -> Proof:
     """Dispatch one Route to its arm. Total over `triage.REMEDIES` + the router's own actions."""
     if not route.complete:
@@ -493,7 +512,7 @@ def execute(route, ev, surface: Surface, *, ws: str = "", dispatch=None, relaunc
                            % (route.route, route.action, route.proof))
     action = route.action
     if action == "route-to-question-lane":
-        return arm_user_question(ws, ev.lane, ev.last_text, surface, poll=poll)
+        return arm_user_question(ws, ev.lane, ev.last_text, surface, nap=nap)
     if action == "send-continue":
         return arm_continue(ws, ev.lane, surface, bound_s=bound_s, poll=poll)
     if action == "repair-boot-prompt":
@@ -528,8 +547,17 @@ def write_record(state_dir: str, lane: str, route, proof: Proof) -> str:
            "action": route.action, "proof": route.proof, "reason": route.reason,
            "result": proof.as_dict()}
     tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(row, fh, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(row, fh, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        # ⛔ A WRITE THAT FAILED IS NOT A HAND-OFF. Pathological (an unwritable state dir, a directory
+        # where the record should be) but cheap to answer honestly — the alternative is an exception
+        # out of `lane-route.main()` and no record at all, which is what the previous round's `poll`
+        # arity bug did on the normal path.
+        return Proof("repair-child", triage.PROOFS["repair-child"], False,
+                     "the hand-off record could not be written: %s" % (exc,),
+                     {"lane": lane, "child": dict(child or {}), "fields": named, "path": path})
     return path

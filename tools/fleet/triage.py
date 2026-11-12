@@ -151,7 +151,68 @@ PROOFS = {
 #
 # It judges the ENDING, never the topic — the same rule turn-classify.py's own criteria state
 # ("A turn that reports finished work and then adds 'tell me if you want more' still ENDED by
-# asking"), and it reads only the last paragraph for that reason.
+# asking"). It reads the WHOLE readable tail, because a hand-off followed by a status paragraph is
+# the ordinary shape of a lane waiting on its owner (round 4, #4046 P0 — the paragraph window was
+# removed for `?` in round 2 and for the phrase classes in round 4).
+# ⛔ THE PHRASE LIST IS NOT THE ONLY DETECTOR, BUT IT STILL HAS TO COVER THE CLASS (round 5, #4046
+# P1). A hand-written hand-off corpus at the previous head returned `not-asked` for 21 of 25 shapes —
+# "I'm holding the deploy until you say otherwise.", "Ping me when you've picked one.", "Your move.",
+# "Tell me to proceed and I will.", "This needs your input before I go further." — and every
+# unambiguous one of those routed `idle-continue`/`send-continue`, i.e. straight to the harm. The
+# vocabulary below is what those shapes have in common: a pause/hold/await verb, a request to be
+# told, or a named dependency on the owner. `_HANDOFF_SHAPE` catches the open-ended ones by SHAPE
+# (a sentence that BEGINS with one of these), because a closed list of whole sentences cannot.
+_HANDOFF_SHAPE = re.compile(
+    r"(?m)^\s*(?:awaiting|waiting on|waiting for your|pending your|tell me|ping me|reply|your move|"
+    r"your input|i'?ll (?:wait|hold|pause)|i am (?:holding|waiting)|i'?m (?:holding|waiting|pausing)|"
+    r"this needs your|needs your|blocked on your|holding (?:the|this|it)|over to you|"
+    r"(?:i )?will wait)\b")
+
+# ⛔ NON-ENGLISH, DELIBERATELY MINIMAL (round 5, #4046 P1). The fleet's lanes write in Spanish when the
+# owner does; a detector that only reads English answers `not-asked` to "Quedo a la espera de tu
+# aprobación". These are the same hand-off shapes, not a translation layer.
+_HANDOFF_I18N = ("quedo a la espera", "esperando tu", "espero tu", "avísame", "avisame", "dime si",
+                 "dime cuándo", "a tu criterio", "en tus manos", "requiere tu")
+
+# ⛔ TWO KINDS OF DISARM, BECAUSE ONE IS SAFE AND ONE IS NOT (round 5, #4046 P1).
+#   * `_PAST_HARD` — a TEMPORAL ANCHOR or a DENIAL. "yesterday", "from Monday", "at 14:02",
+#     "after your approval", "Nothing needs your input now." A sentence carrying one of these reports
+#     something already decided, whatever its tense markers say, so it is never an ask.
+#   * `_PAST_SOFT` — a completion verb or possessive about a PAST decision ("matched your", "recorded
+#     your", "was your call"). This disarms ONLY when the sentence carries no future/desiderative
+#     marker, because the SAME words are a live hand-off in the future tense: "I'll merge on your
+#     approval." is an ask, "Merged the PR on your approval at 14:02." is a report. Measured before
+#     this split: adding `on your approval` to a single cue list read the FIRST as `not-asked` and
+#     routed a waiting lane to `send-continue` — the harm, introduced by the fix for its mirror.
+_PAST_HARD = re.compile(
+    r"\b(?:yesterday|last (?:night|week|month)|this morning|on monday|from monday|earlier today|"
+    r"after your (?:approval|decision|call)|at \d{1,2}:\d{2}|previously|already approved|"
+    r"approved by|as you decided|per your decision|your decision (?:was|stood)|"
+    r"nothing needs your|no need for your|doesn'?t need your|does not need your|never needed your)\b")
+_PAST_SOFT = re.compile(
+    r"\b(?:matched your|recorded your|went through|was your call|had approved|has approved|"
+    r"on your approval)\b")
+_FUTURE_CUE = re.compile(
+    r"\b(?:i'?ll|i will|we'?ll|will|shall|should|would|waiting|await|until|once|before|please|"
+    r"need|needs|let me|go-ahead|your call on)\b")
+
+
+def _disarmed(low: str) -> bool:
+    if _PAST_HARD.search(low):
+        return True
+    return bool(_PAST_SOFT.search(low)) and not _FUTURE_CUE.search(low)
+
+
+def _sentences(body: str) -> list:
+    """Split a readable tail into sentences/paragraphs, keeping line structure."""
+    out = []
+    for line in body.split("\n"):
+        for part in re.split(r"(?<=[.!?])\s+", line):
+            if part.strip():
+                out.append(part)
+    return out
+
+
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 # ⛔ TWO PHRASE CLASSES, NOT ONE (fresh-context review round 2, #4046 P1). The first cut matched
 # `confirm` / `approve` as BARE SUBSTRINGS, so ordinary completion prose — "Confirmed: 210 pass, 0
@@ -159,9 +220,11 @@ _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 # realistic completion endings misclassified, each one routing a finished lane to the question lane
 # and SUPPRESSING its nudge. A detector that fires on "Confirmed" is worse than no detector: it fills
 # the owner's queue with lanes that have nothing to ask.
-#   * `_ASK_FRAME`  — interrogative or a direct offer. Safe in the paragraph that ends the turn.
-#   * `_HANDOFF`    — a declarative hand-off ("blocked on your decision"). Safe in the FINAL paragraph
-#                    only; it is the sentence a lane writes INSTEAD of a question mark.
+#   * `_ASK_FRAME`  — interrogative or a direct offer.
+#   * `_HANDOFF`    — a declarative hand-off ("blocked on your decision"), the sentence a lane writes
+#                    INSTEAD of a question mark. Both classes are read in EVERY sentence of the
+#                    readable tail, and a sentence carrying a PAST-tense completion cue is not an ask
+#                    (round 5, #4046 P1: "Merged the PR on your approval at 14:02" read as an ask).
 # `confirm`/`approve` appear ONLY in their ADDRESSED forms ("please confirm", "needs your approval"),
 # because the bare stem is a report of something already done.
 _ASK_FRAME = (
@@ -188,7 +251,13 @@ _HANDOFF = (
     "go-ahead", "go ahead from you", "for your go", "waiting to hear", "ready for your",
     "hold here until", "until you confirm", "until you approve", "wait for your word",
     "your call on", "in your hands", "needs your sign", "for sign-off", "for your sign-off",
-)
+    # ⛔ THE SHAPES THE ROUND-5 CORPUS MEASURED AS MISSES (see `_HANDOFF_SHAPE` for the open-ended
+    # ones). Each was `not-asked` and routed `send-continue` at 502fa170a.
+    "say otherwise", "until you say", "for your input", "your input", "awaiting instruction",
+    "awaiting a steer", "tell me to proceed", "reply and i", "ping me", "your move",
+    "needs your input", "before i go further", "pause here", "holding the deploy", "holding this",
+    "on your word", "your steer", "your read on", "wait for your input",
+) + _HANDOFF_I18N
 ASKED = "asked"
 NOT_ASKED = "not-asked"
 UNREAD = "unread"
@@ -262,7 +331,7 @@ def asks_owner(text: str) -> str:
     Nothing else moved."), which read `not-asked` and produced `send-continue`. Widening a paragraph
     window only moves the boundary, so the window is gone: in an agent's own report, a `?` outside a
     fence or a quote is addressed to the reader. The two phrase classes then cover the ASK THAT IS
-    WRITTEN WITHOUT ONE — `_ASK_FRAME` in the closing paragraph, `_HANDOFF` in the final paragraph only.
+    WRITTEN WITHOUT ONE, in every sentence of the same tail.
 
     THE TRADE IS DELIBERATE AND ONE-DIRECTIONAL: a `?` quoted in prose (not blockquoted) can make a
     comment read as a question, which costs a question-lane wake-up and one pass of nudge suppression.
@@ -281,10 +350,24 @@ def asks_owner(text: str) -> str:
     # final paragraph returned `asked`. A hand-off followed by a status paragraph is the ordinary
     # shape of a lane that has finished everything except the thing it is waiting on, so the
     # asymmetry had no defensible side: both classes now read the whole readable tail.
-    low = " ".join(body.lower().split())
-    for phrase in _ASK_FRAME + _HANDOFF:
-        if phrase in low:
-            return ASKED
+    for sent in _sentences(body):
+        low = " ".join(sent.lower().split())
+        if not low:
+            continue
+        if not (any(phrase in low for phrase in _ASK_FRAME + _HANDOFF)
+                or _HANDOFF_SHAPE.match(sent.strip().lower())):
+            continue
+        # ⛔ A PAST-TENSE COMPLETION CUE DISARMS THE PHRASE (round 5, #4046 P1). Widening the phrase
+        # classes to the whole tail (round 4) made ordinary completion prose read as an ask —
+        # measured, 7 of 8 of "Merged the PR on your approval at 14:02, checks green.", "Everything
+        # went through after your approval yesterday.", "That join was your call and it held up.",
+        # "Recorded your decision in the doc; shipped it." Each routed a FINISHED lane to the owner's
+        # question lane and suppressed its nudge — a regression of a fix this same change made in
+        # round 2. The cue is per SENTENCE, so a tail whose FIRST sentence is a hand-off and
+        # whose second reports a past merge still reads as an ask.
+        if _disarmed(low):
+            continue
+        return ASKED
     return NOT_ASKED
 
 
@@ -591,7 +674,22 @@ def _route_ladder(ev: Evidence, ask: str) -> Route:
                      evidence="verdict=%r turn=%s" % (ev.lane_verdict,
                                                       getattr(ev.turn, "reason", "unread")))
 
-    # ── 4. none — everything still working, or nothing readable ─────────────────────────────────
+    # ── 4. an IDLE VERDICT WE COULD NOT READ IS A REFUSAL, NOT "NOTHING TO DO" ──────────────────
+    # ⛔ (round 5, #4046 P1). With an idle verdict and an UNREADABLE turn boundary — no session file,
+    # or a boundary the reader could not parse — the ladder fell through to `none`/`none`, which is
+    # the "nothing to do" reading the branch above explicitly forbids. Downstream, `lane-route.py`
+    # counts only `action == "refuse"`, so a fleet-wide unreadable population disappeared from
+    # `router=refuse:N` and read as a quiet fleet, and `turn-end.py` suppressed the nudge on EVERY
+    # tick (it used to send it). `refuse` is the honest answer: an arm WAS earned on the verdict and
+    # the read withheld it.
+    if ev.lane_verdict in ("DONE-IDLE", "WIP-IDLE", "EMPTY", "UNBOUND") and not _turn_resting(ev):
+        return Route(route="none", action="refuse", proof=PROOFS["refuse"],
+                     reason="an idle verdict whose turn boundary could not be read (%s) — a nudge "
+                            "cannot be ruled safe, and this refusal is COUNTED rather than read as "
+                            "an idle lane" % (getattr(ev.turn, "reason", "unread"),),
+                     evidence="verdict=%r ask=%s" % (ev.lane_verdict, ask))
+
+    # ── 5. none — everything still working, or nothing readable ─────────────────────────────────
     why = {
         "WORKING": "the lane is working (CPU/output proven)",
         "WAITING-CHILD": "a child is in flight and healthy — the parent is correct to wait",

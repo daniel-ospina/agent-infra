@@ -31,6 +31,7 @@ unreadable read routes to `refuse`/`inspect`, which is a ROUTE, not a crash.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -146,9 +147,52 @@ class CmuxSurface(triage_arms.Surface):
         except OSError:
             return None
 
+    def _terminal_for(self, ws):
+        """Resolve a workspace to a TERMINAL id. `read-screen` does not take a workspace (#4046).
+
+        ⛔ MEASURED (round 5, #4046 P1): `cmux read-screen --workspace <ws> --lines 5` is a USAGE
+        error on this cmux build — `cmux: usage: cmux read-screen [--terminal <id>] [--json]`, rc=2 —
+        while `--terminal <id>` returns the screen. Without `--lines` the same argv exits 0 with EMPTY
+        stdout, which a naive `rc != 0` check reads as a blank pane, so every pane proof silently
+        answered "no boot prompt" from a read that never happened. Resolved from `cmux tree --json`
+        each call: the pane's terminal changes when a workspace is re-opened, and a cached id would
+        read a dead terminal as the live one.
+        """
+        rc, out, _ = _cmux(["tree", "--json"])
+        if rc != 0 or not out.strip():
+            return None
+        try:
+            blob = json.loads(out)
+        except ValueError:
+            return None
+        for space in (blob.get("workspaces") or []):
+            if not isinstance(space, dict) or space.get("id") != ws:
+                continue
+            for key in ("terminal", "terminal_id"):
+                if isinstance(space.get(key), str) and space.get(key):
+                    return space[key]
+            for arr in ("terminals", "tabs", "panes"):
+                for item in (space.get(arr) or []):
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("terminal", "terminal_id", "id"):
+                        val = item.get(key)
+                        if isinstance(val, str) and val.startswith("term"):
+                            return val
+        return None
+
     def screen_tail(self, ws, lines=40):
-        rc, out, _ = _cmux(["read-screen", "--workspace", ws, "--lines", str(lines)])
+        term = self._terminal_for(ws)
+        if not term:
+            return None
+        rc, out, _ = _cmux(["read-screen", "--terminal", term, "--lines", str(lines)])
         if rc != 0:
+            return None
+        # ⛔ AN EMPTY CAPTURE IS NOT A BLANK PANE. rc=0 with no output is what this build returns when
+        # the argv is a near-miss; reading it as "" made `_boot_blocked` answer `False` ("no prompt")
+        # from a read that produced nothing. `None` is the unread answer, and the arms treat it as
+        # unverified.
+        if not (out or "").strip():
             return None
         return out
 
@@ -304,7 +348,9 @@ def main(argv):
     ap.add_argument("--stdin", default="")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--lane", default="")
+    # ⛔ REPEATABLE (round 5, #4046 P2): `turn-end.py` routes every asking lane in ONE call, so a
+    # tick pays for ONE `lane-status.py` scan rather than one per asking lane.
+    ap.add_argument("--lane", action="append", default=[])
     ap.add_argument("--state", default=STATE)
     a = ap.parse_args(argv)
 
@@ -338,7 +384,8 @@ def main(argv):
         return 0
 
     if a.lane:
-        rows = [r for r in rows if (r.get("lane") or "") == a.lane]
+        wanted = set(a.lane)
+        rows = [r for r in rows if (r.get("lane") or "") in wanted]
 
     surface = CmuxSurface(sessions=_session_paths(rows)) if a.apply else None
     out = []
@@ -372,7 +419,13 @@ def main(argv):
                 except (OSError, ValueError):
                     old = {}
                 old_res = (old.get("result") or {})
+                # ⛔ AND THE PRIOR ROUTE MUST HAVE BEEN VERIFIED (round 5, #4046 P1). The artifact
+                # carries `brief_sha` on EVERY path after workspace resolution, including a FAILED
+                # send — so matching on route+digest alone replayed an unverified attempt as
+                # `already-routed, verified: true` forever: the question was never re-sent and the
+                # record asserted it had been delivered. A prior `verified: false` is a RETRY.
                 if (old.get("route") == r.route
+                        and old_res.get("verified") is True
                         and (old_res.get("artifact") or {}).get("brief_sha")
                         == triage_arms._digest(payload)):
                     item["result"] = {"action": "already-routed", "proof": r.proof,
@@ -382,14 +435,26 @@ def main(argv):
                                       "sent": False, "artifact": {"dedupe": "brief_sha"}}
                     out.append(item)
                     continue
-            brief = os.path.join(a.state, "lane-route", "payload.txt")
+            # ⛔ ONE PAYLOAD FILE PER LANE PER PROCESS (round 5, #4046 P2). This was a single shared
+            # `payload.txt` handed to `cmux_dispatch.py` (420 s timeout), so a `turn-end` tick and an
+            # operator run could overwrite it between write and read and type ONE lane's boot brief
+            # into ANOTHER lane. Lane- and pid-keyed like `record_path`/`handoff_path`.
+            brief = os.path.join(a.state, "lane-route",
+                                 "payload-%s-%d.txt" % (re.sub(r"[^A-Za-z0-9_.-]", "_",
+                                                               ev.lane or "lane"), os.getpid()))
             with open(brief, "w") as fh:
                 fh.write(payload)
-            proof = triage_arms.execute(
-                r, ev, surface, ws=extra["ws"], child=extra["child"],
-                dispatch=_make_dispatch(brief), relaunch=_make_relaunch(),
-                poll=_make_poll(surface), state_dir=a.state,
-            )
+            try:
+                proof = triage_arms.execute(
+                    r, ev, surface, ws=extra["ws"], child=extra["child"],
+                    dispatch=_make_dispatch(brief), relaunch=_make_relaunch(),
+                    poll=_make_poll(surface), state_dir=a.state,
+                )
+            finally:
+                try:
+                    os.unlink(brief)
+                except OSError:
+                    pass
             triage_arms.write_record(a.state, ev.lane, r, proof)
             item["result"] = proof.as_dict()
         out.append(item)

@@ -13,7 +13,7 @@ command is quoted verbatim so it can be re-run.
 
 | command | result |
 |---|---|
-| `python3.12 tools/fleet/triage.test.py` | `PASS=297 FAIL=0` |
+| `python3.12 tools/fleet/triage.test.py` | `PASS=335 FAIL=0` |
 | `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (12 RED controls, all fired) |
 | `/tmp/pyenv4046/bin/python -m pytest scripts/ -q --timeout=300` | `1436 passed, 3 skipped, 1 xpassed in 216.67s` |
 | `python3.12 tools/fleet/liveness.test.py` | `PASS=58 FAIL=0` (+ `every stated count matches the suite (58 tests, 113 mutations)`) |
@@ -68,10 +68,12 @@ open turn + retry tail → `model-retry`/`rerun` (the positive control, still re
 ```
 tools/fleet/triage.py          NEW  the router: precedence, wedged subcases, remedies, proof table
 tools/fleet/triage_arms.py     NEW  the three arms, each proving its effect at its artifact
-tools/fleet/triage.test.py     NEW  hermetic suite, 254 assertions, 12 RED controls
+tools/fleet/triage.test.py     NEW  hermetic suite, 335 assertions, 12 RED controls
 scripts/lane-route.py          NEW  operator CLI (route / --json / --apply)
-scripts/turn-end.py            MOD  gates its WIP nudge on triage.may_continue()
-pi-bootstrap/setup.sh          MOD  farms triage.py + triage_arms.py into $DEST/scripts/fleet
+scripts/turn-end.py            MOD  gates its WIP nudge on route_gate(), and APPLIES a
+                                    user-question route (batched, capped, bounded, logged)
+pi-bootstrap/setup.sh          MOD  farms triage.py + triage_arms.py into $DEST/scripts/fleet,
+                                    and lane-route.py (the only caller of the arms) into $DEST/scripts
 .github/workflows/ci.yml       MOD  two steps: the suite, and its RED controls alone
 docs/ops/fleet-liveness.md     MOD  §0z: a verdict is not a route; `wedged` means two things
 ```

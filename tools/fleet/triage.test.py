@@ -29,6 +29,9 @@ that cannot fail is a suite that certifies nothing.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import re
 import sys
@@ -113,6 +116,28 @@ QUESTION_TEXTS = [
     "Blocked on your decision.\n\nEverything else is green.",
     "Let me know if you want the migration run.\n\nSuite is green.",
     "The rollout is staged.\n\nWaiting to hear whether to proceed.",
+    # ⛔ THE ROUND-5 HAND-OFF CORPUS (P1). At 502fa170a, 21 of 25 of a hand-written hand-off corpus
+    # read `not-asked`; these are the ten UNAMBIGUOUS ones, and every one routed `send-continue`.
+    "I'm holding the deploy until you say otherwise.",
+    "Ping me when you've picked one.",
+    "I'll pause here for your input.",
+    "Awaiting instruction.",
+    "Your move.",
+    "Reply and I'll continue.",
+    "Tell me to proceed and I will.",
+    "Awaiting a steer on the API shape.",
+    "This needs your input before I go further.",
+    # the fleet's lanes write in Spanish when the owner does; an English-only detector answers
+    # `not-asked` to an obvious hand-off.
+    "Quedo a la espera de tu aprobación para aplicar.",
+    # ⛔ AND A QUESTION THE PHRASE LIST DOES NOT NAME (round 5, #4046 P2). Mutation-measured after the
+    # round-5 fixes: disabling the `?` rule entirely left the suite GREEN, because every fixture also
+    # matched a listed phrase — so the rule that carries questions like these had no discriminating
+    # leg at all. These four are pure `?` asks: no interrogative frame, no hand-off vocabulary.
+    "Did the patch land cleanly?",
+    "Is the cache warm enough for the load test?",
+    "Any reason the rail would refuse this one?",
+    "Can the migration be re-applied without dropping the index?",
 ]
 
 
@@ -133,6 +158,16 @@ def leg_precedence() -> None:
 
     wedged_and_idle = ev(lane_verdict="CHILD-STUCK", steerable=True)
     eq("wedged beats idle", triage.route(wedged_and_idle).route, "wedged")
+
+    # ⛔ AN IDLE VERDICT WE COULD NOT READ IS A REFUSAL, NOT "NOTHING TO DO" (round 5, #4046 P1).
+    # `none`/`none` here meant an unreadable lane vanished from `lane-route.py`'s `router=refuse:N`
+    # count AND had its nudge suppressed on every tick — a fleet-wide unreadable population read as a
+    # quiet fleet.
+    for verdict in ("WIP-IDLE", "DONE-IDLE", "EMPTY", "UNBOUND"):
+        ru = triage.route(ev(lane_verdict=verdict, turn=None, last_text=""))
+        eq("an idle verdict on an UNREAD turn refuses (%s)" % verdict, ru.action, "refuse")
+    eq("…while a genuinely working lane still routes nowhere",
+       triage.route(ev(lane_verdict="WORKING", turn=None, last_text="")).action, "none")
 
     # ⛔ A QUESTION ON AN OPEN TURN MUST NOT BE RELAUNCHED (round 4, #4046 P1). `liveness.Turn(True,
     # "turn-open:no-terminal-stop")` — a turn that carries text but no terminal stop, the
@@ -323,6 +358,18 @@ def leg_ask_detector() -> None:
         # lane to the owner's question lane and suppressed its nudge before the token rule.
         "Deployed to https://ops.example.com/health?full=1 and it returned 200.\n\nAll green.",
         "Wrote the rule to docs/faq?/README.md and confirmed it lands.",
+        # ⛔ PAST-TENSE COMPLETION PROSE (round 5, #4046 P1). Widening the phrase classes to the whole
+        # tail made 7 of these 8 read `asked`, routing a FINISHED lane to the owner's question lane and
+        # suppressing its nudge — a regression of the fix round 2 made. The disarm is per SENTENCE and
+        # tense-aware: "I'll merge on your approval" stays an ask, "Merged it on your approval at
+        # 14:02" does not.
+        "Merged the PR on your approval at 14:02, checks green.",
+        "Everything went through after your approval yesterday.",
+        "That join was your call and it held up.",
+        "Recorded your decision in the doc; shipped it.",
+        "The plan matched your approval exactly.",
+        "Landed it pending your approval from Monday.",
+        "Rebased onto main and merged. Nothing needs your input now.",
     ]
     for text in NOT_Q:
         eq("asks_owner(not-asked): %r" % text[:38], triage.asks_owner(text), "not-asked")
@@ -637,26 +684,26 @@ def leg_user_question_end_to_end() -> None:
         ("a surface whose pane cannot be read", FakeSurface(
             spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}], screen_unreadable=True)),
     ):
-        pb = triage_arms.execute(r, e, bad, ws="ws_owner", poll=lambda _s: None)
+        pb = triage_arms.execute(r, e, bad, ws="ws_owner", nap=lambda _s: None)
         ok("NOT verified: %s" % label, not pb.verified, pb.detail)
     empty = FakeSurface(spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}],
                         screens={"ws_new_1": "composer ready"})
     # a pane that shows SOMETHING ELSE is a transport that did not deliver the mandate
     empty.send = lambda ws, text: (empty.sent.setdefault(ws, []).append(text)
                                    or empty.last_sent.__setitem__(ws, text) or True)
-    pb = triage_arms.execute(r, e, empty, ws="ws_owner", poll=lambda _s: None)
+    pb = triage_arms.execute(r, e, empty, ws="ws_owner", nap=lambda _s: None)
     ok("NOT verified when the pane shows no mandate at all", not pb.verified, pb.detail)
     # and the owner-message fact is DERIVED, so it can read True (round 4, #4046 P1)
     noisy = FakeSurface(spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}],
                         screens={"ws_new_1": "ready"})
-    pm = triage_arms.execute(r, e, noisy, ws="ws_owner", poll=lambda _s: None)
+    pm = triage_arms.execute(r, e, noisy, ws="ws_owner", nap=lambda _s: None)
     ok("the record says the owning lane was not messaged", pm.verified)
     eq("…and that field is False when nothing was sent to it",
        pm.artifact.get("owner_lane_sent_anything"), False)
     noisy_owner = FakeSurface(spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}],
                               screens={"ws_new_1": "ready"})
     noisy_owner.send("ws_owner", "continue")
-    pn = triage_arms.execute(r, e, noisy_owner, ws="ws_owner", poll=lambda _s: None)
+    pn = triage_arms.execute(r, e, noisy_owner, ws="ws_owner", nap=lambda _s: None)
     eq("…and TRUE the moment anything is sent to the owning lane",
        pn.artifact.get("owner_lane_sent_anything"), True)
 
@@ -775,6 +822,47 @@ def leg_arm_wedged_remedies() -> None:
     ok("the hand-off record is a REAL file on disk", os.path.exists(hp), hp)
     p_nostate = triage_arms.arm_child("L", REAL_CHILD)
     ok("a hand-off with nowhere to write is NOT verified", not p_nostate.verified, p_nostate.detail)
+    # ⛔ AND THE RE-READ MUST BE THE THING THAT DECIDES (round 5, #4046 P2). Mutation-measured at
+    # 502fa170a: replacing the comparison with `True` left the suite GREEN, so the arm's documented
+    # proof had no discriminating leg. A record on disk carrying a DIFFERENT child must not verify.
+    # ⛔ A RECORD THAT WAS READ BUT SAYS SOMETHING ELSE (round 5, #4046 P2). Mutation-measured at
+    # 502fa170a: replacing the comparison with `True` left the suite GREEN — the arm's documented
+    # proof had no discriminating leg. The failing write below is not enough (it fails before the
+    # comparison); the comparison itself needs a readable record carrying a DIFFERENT child. A torn
+    # write is exactly that shape, so `os.replace` is made a no-op for one call, leaving the previous
+    # record — a different child — where the arm expects its own.
+    stale = {"call_id": "c-OTHER", "task": "a different child"}
+    with open(hp, "w") as fh:
+        json.dump({"kind": "child-handoff", "lane": "L", "child": stale}, fh)
+    real_replace = os.replace
+
+    def _torn(src, dst, *a, **kw):     # the write happened, the RENAME did not
+        try:
+            os.unlink(src)
+        except OSError:
+            pass
+
+    os.replace = _torn
+    try:
+        p_torn = triage_arms.arm_child("L", REAL_CHILD, state_dir=tmpd)
+    finally:
+        os.replace = real_replace
+    ok("a readable record carrying a DIFFERENT child is NOT verified", not p_torn.verified,
+       p_torn.detail)
+    ok("…and the artifact shows what was actually read back",
+       (p_torn.artifact.get("read_back") or {}).get("call_id") == "c-OTHER",
+       repr(p_torn.artifact.get("read_back")))
+    # (and the write itself failing must not raise: a directory where the record belongs)
+    os.unlink(hp)
+    os.makedirs(hp)
+    p_dir = triage_arms.arm_child("L", REAL_CHILD, state_dir=tmpd)
+    ok("a record that cannot be RE-READ is not verified", not p_dir.verified, p_dir.detail)
+    os.rmdir(hp)
+    p_ok = triage_arms.arm_child("L", REAL_CHILD, state_dir=tmpd)
+    ok("…and the same call verifies once the record can be written and read back", p_ok.verified,
+       p_ok.detail)
+    eq("the artifact carries the child it re-read", p_ok.artifact["read_back"]["call_id"],
+       "c-4242")
 
     # rerun: lane-relaunch.py's own exit code IS the proof
     e = ev(lane_verdict="WEDGED", turn=TURN_OPEN)
@@ -1049,6 +1137,102 @@ def leg_wiring() -> None:
        triage.route(e_open).subcase, "model-retry")
 
 
+def leg_cli_apply() -> None:
+    """`scripts/lane-route.py --apply`, driven END TO END with its REAL helpers (round 5, #4046 P0).
+
+    ⛔ WHY THIS LEG EXISTS. The question arm was retrying the pane read with the CONTINUE arm's
+    `poll` — a 3-argument resumption reader — so the first retry raised `TypeError` out of the arm and
+    out of `lane-route.main()`, i.e. on the NORMAL case where the pane has not painted yet. The suite
+    could not see it because every fixture passed a 1-arg stub: THE TEST CERTIFIED AN ARITY PRODUCTION
+    NEVER SUPPLIED. So this leg drives `main()` itself, with the real `_make_poll`, `_make_dispatch`
+    and `_make_relaunch` in place, a fake SURFACE, and a pane that gains the mandate on its second
+    read (which forces the retry path). It also pins the dedupe: a prior UNVERIFIED route must be
+    RETRIED, not replayed as `already-routed, verified: true`.
+    """
+    print("\n── CLI APPLY — the real `lane-route.py --apply`, retries and dedupe included ──")
+    lr_path = os.path.join(os.path.dirname(os.path.dirname(HERE)), "scripts", "lane-route.py")
+    import importlib.util as _ilu2
+    spec = _ilu2.spec_from_file_location("lane_route_apply_under_test", lr_path)
+    lr = _ilu2.module_from_spec(spec)
+    spec.loader.exec_module(lr)
+
+    state = tempfile.mkdtemp(prefix="triage-cli-state-")
+    rows_file = os.path.join(state, "rows.json")
+
+    class ReadingSurface(FakeSurface):
+        """Fails the pane read until the SECOND attempt — the retry the arity bug killed."""
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.reads = 0
+
+        def screen_tail(self, ws, lines=40):
+            self.reads += 1
+            return super().screen_tail(ws, lines) if self.reads >= 2 else ""
+
+    def make_surface(sessions=None):
+        return surf
+
+    e = ev(lane="lane-cli", last_text="Should I merge, or hold?", lane_verdict="WIP-IDLE",
+           steerable=True)
+    surf = ReadingSurface(spaces=[{"id": "ws_owner", "name": "lane-cli", "index": 3}])
+    saved = (lr.CmuxSurface, lr.evidence_for)
+    lr.CmuxSurface = make_surface
+    lr.evidence_for = lambda row, **kw: (e, {"ws": "ws_owner", "child": {}})
+    # the retry sleeps a real second per attempt, and there are several ticks here
+    nap_saved = triage_arms.time
+    triage_arms.time = type("T", (), {"sleep": staticmethod(lambda _s: None)})()
+    try:
+        with open(rows_file, "w") as fh:
+            json.dump([{"lane": "lane-cli"}], fh)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = lr.main(["--apply", "--json", "--stdin", rows_file, "--state", state])
+        ok("--apply returns 0 with a pane that needed a RETRY (the poll-arity class)",
+           rc == 0, out.getvalue()[-300:])
+        rec = triage_arms.record_path(state, "lane-cli")
+        ok("a record was written", os.path.exists(rec), rec)
+        with open(rec) as fh:
+            blob = json.load(fh)
+        ok("the first read failed and the retry still verified the route",
+           (blob.get("result") or {}).get("verified") is True, repr(blob.get("result"))[:300])
+        ok("…and the arm ran the RETRY (the pane was read more than once)", surf.reads >= 2,
+           "reads=%d" % surf.reads)
+
+        # ⛔ AN UNVERIFIED PRIOR ROUTE MUST BE RETRIED (round 5, #4046 P1). Simulate the record a
+        # FAILED send leaves: same route, same brief digest, verified false. The next tick must try
+        # again rather than reporting `already-routed, verified: true` forever.
+        with open(rec, "w") as fh:
+            json.dump({"lane": "lane-cli", "route": "user-question",
+                       "result": {"action": "route-to-question-lane", "verified": False,
+                                  "artifact": (blob.get("result") or {}).get("artifact") or {}}}, fh)
+        before = len(surf.sent.get(blob["result"]["artifact"]["question_ws"], []))
+        with contextlib.redirect_stdout(io.StringIO()):
+            lr.main(["--apply", "--json", "--stdin", rows_file, "--state", state])
+        after = len(surf.sent.get(blob["result"]["artifact"]["question_ws"], []))
+        ok("an UNVERIFIED prior route is RETRIED, not replayed as already-routed", after > before,
+           "sends %d -> %d" % (before, after))
+
+        # and once verified, the repeat is a no-op (the tick guard must still work)
+        with contextlib.redirect_stdout(io.StringIO()):
+            lr.main(["--apply", "--json", "--stdin", rows_file, "--state", state])
+        resend = len(surf.sent.get(blob["result"]["artifact"]["question_ws"], []))
+        with contextlib.redirect_stdout(io.StringIO()):
+            lr.main(["--apply", "--json", "--stdin", rows_file, "--state", state])
+        ok("…while a VERIFIED route is not typed twice", 
+           len(surf.sent.get(blob["result"]["artifact"]["question_ws"], [])) == resend,
+           "sends %d -> %d" % (resend,
+                               len(surf.sent.get(blob["result"]["artifact"]["question_ws"], []))))
+        # the shared-payload-file class: nothing may be left behind under the state dir
+        leftovers = ([n for n in os.listdir(os.path.join(state, "lane-route"))
+                      if n.startswith("payload") or n.endswith(".tmp")]
+                     if os.path.isdir(os.path.join(state, "lane-route")) else [])
+        eq("no payload/temp file is left behind after the run", leftovers, [])
+    finally:
+        lr.CmuxSurface, lr.evidence_for = saved
+        triage_arms.time = nap_saved
+
+
 LEGS = (
     ("precedence", leg_precedence),
     ("no-continue", leg_no_continue_to_question),
@@ -1063,6 +1247,7 @@ LEGS = (
     ("arm-wedged", leg_arm_wedged_remedies),
     ("records", leg_records),
     ("wiring", leg_wiring),
+    ("cli-apply", leg_cli_apply),
 )
 
 
