@@ -38,6 +38,7 @@ if HERE not in sys.path:
 
 import liveness  # noqa: E402
 import triage  # noqa: E402
+import triage_arms  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -361,6 +362,28 @@ def run_red_control() -> bool:
     good &= _red("R7 a router that republished 'dead' would be a second liveness verdict",
                  "dead" not in triage.ROUTES)
 
+    # (R8) a question brief that DROPPED the mandate must not be routed — a question forwarded raw
+    # has been relayed, not answered.
+    relayed = "Lane X asks: should we merge?"
+    good &= _red("R8 a mandate-free brief is refused before it is sent",
+                 bool(triage_arms.mandate_missing(relayed)))
+
+    # (R9) an arm that reports a SEND as an effect must be refused.
+    liar = triage_arms.Proof("send-continue", "transcript-growth", True, "sent fine", sent=True)
+    good &= _red("R9 'sent' alone never earns a transcript-growth proof",
+                 not (liar.proof == "transcript-growth" and liar.artifact.get("after") is not None))
+
+    # (R10) a question routed through the OWNING lane would be the exact harm.
+    class _OwnerOnly(FakeSurface):
+        def __init__(self):
+            super().__init__(spaces=[{"id": "ws_owner", "name": "lane-7", "index": 0}])
+
+    s = _OwnerOnly()
+    triage_arms.execute(triage.route(ev(last_text="Should I merge?")),
+                        ev(lane="lane-7", last_text="Should I merge?"), s, ws="ws_owner")
+    good &= _red("R10 the question arm must never type into the owning lane",
+                 "ws_owner" not in s.sent)
+
     print("\n  RED controls: %s" % ("all fired" if good else "SOME DID NOT FIRE"))
     return good
 
@@ -376,6 +399,189 @@ def _red(name: str, cond: bool) -> bool:
     return False
 
 
+# ── leg 9: the arms, against a fake surface ─────────────────────────────────────────────────────
+class FakeSurface(triage_arms.Surface):
+    """A surface that records every typed payload per workspace, so a leg can assert on the ARTIFACT.
+
+    `sizes` is the transcript-size reading per workspace, mutated by `grow()` — that is what lets a
+    leg distinguish "we sent" from "the lane advanced", which is the whole point of the arms.
+    """
+
+    def __init__(self, spaces=None, sizes=None, screens=None, fail_send=False):
+        self.spaces = list(spaces or [])          # [{id, name, index}]
+        self.sizes = dict(sizes or {})
+        self.screens = dict(screens or {})
+        self.sent = {}                             # ws -> [texts]
+        self.moves = []
+        self.last_sent = {}
+        self.fail_send = fail_send
+
+    def list_workspaces(self):
+        return list(self.spaces)
+
+    def new_workspace(self, name):
+        ws = "ws_new_%d" % (len(self.spaces) + 1)
+        self.spaces.append({"id": ws, "name": name, "index": len(self.spaces)})
+        return ws
+
+    def move_workspace(self, ws, index):
+        self.moves.append((ws, index))
+        for sp in self.spaces:
+            if sp["id"] == ws:
+                sp["index"] = index
+        return True
+
+    def send(self, ws, text):
+        if self.fail_send:
+            return False
+        self.sent.setdefault(ws, []).append(text)
+        self.last_sent[ws] = text
+        # a send that lands grows the transcript, which is what an honest surface does
+        self.sizes[ws] = self.sizes.get(ws, 0) + len(text)
+        return True
+
+    def transcript_size(self, ws):
+        return self.sizes.get(ws)
+
+    def screen_tail(self, ws, lines=40):
+        return self.screens.get(ws)
+
+
+def leg_user_question_end_to_end() -> None:
+    print("\n── USER-QUESTION END-TO-END — a synthetic asking lane, routed and answered ──")
+    # The lane asked the owner in its own pane and never posted a labelled comment, so the OLD guard
+    # (`turn-end.py`'s `lanes_with_open_question`, which reads the `owner-decision` LABEL) cannot see
+    # it. It reads WIP-IDLE and used to receive "CONTINUE IT".
+    e = ev(lane="lane-7", last_text="Detection is landed.\n\nShould I build the router next, or "
+                                     "wait for your ruling on the precedence?",
+           lane_verdict="WIP-IDLE", steerable=True)
+    r = triage.route(e)
+    eq("the synthetic lane is classified user-question", r.route, "user-question")
+
+    surface = FakeSurface(spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}],
+                          screens={"ws_new_1": "composer ready"})
+    proof = triage_arms.execute(r, e, surface, ws="ws_owner")
+
+    ok("the arm verified its effect at the artifact", proof.verified, proof.detail)
+    eq("the proof names the question-lane artifact", proof.proof, "question-lane-ack")
+    qws = proof.artifact.get("question_ws")
+    ok("a question workspace was resolved/created", bool(qws), repr(proof.artifact))
+    eq("it sits in the cmux LEFT-HAND panel (index 0)",
+       [sp["index"] for sp in surface.spaces if sp["id"] == qws], [0])
+
+    brief = (surface.sent.get(qws) or [""])[0]
+    ok("the brief carries the research mandate", "RESEARCH FIRST" in brief, brief[:120])
+    ok("the brief carries the contradiction test", "CONTRADICTION TEST" in brief, brief[:120])
+    for part in ("context", "options", "analysis", "recommendation"):
+        ok("the brief carries the protocol part %r" % part, part in brief.lower())
+    ok("the brief names the owning lane", "lane-7" in brief)
+
+    # ⛔ THE POINT OF THE WHOLE ISSUE: the owning lane receives NOTHING from this arm. In particular
+    # no "continue" — a question reported as idle is what tells a lane to proceed on a premise the
+    # owner has not decided.
+    ok("the OWNING lane received nothing at all", "ws_owner" not in surface.sent,
+       repr(surface.sent.get("ws_owner")))
+    ok("the OWNING lane certainly received no 'continue'",
+       not any("continue" in t.lower() for t in surface.sent.get("ws_owner", [])))
+    eq("the artifact records that the owning lane was not messaged",
+       proof.artifact.get("owner_lane_sent_anything"), False)
+
+    # and the answer comes back the other way: the question lane is told to post the decision back.
+    ok("the brief tells the question lane to answer the waiting lane",
+       "answer" in brief.lower() or "resume" in brief.lower())
+
+
+def leg_arm_continue_proves_resumption() -> None:
+    print("\n── IDLE-CONTINUE — the arm proves resumption, and never marks BUSY unproven ──")
+    e = ev(lane="lane-2", lane_verdict="WIP-IDLE")
+    r = triage.route(e)
+    eq("a clean idle lane routes idle-continue", r.route, "idle-continue")
+
+    growing = FakeSurface(sizes={"ws_a": 100})
+    p = triage_arms.execute(r, e, growing, ws="ws_a")
+    ok("a lane that GREW is verified", p.verified, p.detail)
+    ok("the proof is the byte delta, not the send", "100 ->" in p.detail, p.detail)
+
+    frozen = FakeSurface(sizes={"ws_b": 100})
+    frozen.send = lambda ws, text: (frozen.sent.setdefault(ws, []).append(text) or True)  # no growth
+    p2 = triage_arms.execute(r, e, frozen, ws="ws_b")
+    ok("a lane that did NOT grow is NOT verified", not p2.verified, p2.detail)
+    ok("…and the detail says escalate, not BUSY", "escalate" in p2.detail, p2.detail)
+    ok("…and it still records that a send happened (so it is visible)", p2.sent)
+
+    blind = FakeSurface()
+    p3 = triage_arms.execute(r, e, blind, ws="ws_c")
+    ok("no readable transcript before the send => nothing is sent", not p3.sent, p3.detail)
+    ok("…and it is not verified", not p3.verified)
+
+
+def leg_arm_wedged_remedies() -> None:
+    print("\n── WEDGED ARMS — each remedy produces its own artifact, none sends 'continue' ──")
+    # tool-in-flight and wedged-unverified execute NOTHING and must say so
+    for subcase, want in (("tool-in-flight", "wait"), ("wedged-unverified", "inspect")):
+        e = (ev(lane_verdict="LONG-TOOL", tool_in_flight=True, tool_budget_open=True, turn=TURN_OPEN)
+             if subcase == "tool-in-flight"
+             else ev(lane_verdict="WEDGED", turn=TURN_ENDED))
+        r = triage.route(e)
+        eq("%s: subcase" % subcase, r.subcase, subcase)
+        p = triage_arms.execute(r, e, FakeSurface(), ws="ws_x")
+        eq("%s: action" % subcase, p.action, want)
+        ok("%s: nothing was sent" % subcase, not p.sent)
+        ok("%s: the reading is the artifact" % subcase, p.verified and p.proof == "written-reading")
+
+    # boot-prompt: reuses the dispatcher, and the proof is the PANE
+    e = ev(lane_verdict="DONE-IDLE", boot_prompt=True)
+    r = triage.route(e)
+    eq("boot-prompt: subcase", r.subcase, "boot-prompt")
+    surf = FakeSurface(screens={"ws_bp": "composer ready, pi footer"})
+    p = triage_arms.execute(r, e, surf, ws="ws_bp", dispatch=lambda ws, lane: 0)
+    ok("boot-prompt: verified once the pane stops showing the prompt", p.verified, p.detail)
+    still = FakeSurface(screens={"ws_bp": "Press any key to continue..."})
+    p2 = triage_arms.execute(r, e, still, ws="ws_bp", dispatch=lambda ws, lane: 0)
+    ok("boot-prompt: NOT verified while the prompt is still on the pane", not p2.verified, p2.detail)
+
+    # child subcases: a named hand-off, never a kill from this arm
+    for subcase, verdict in (("child-stuck", "CHILD-STUCK"), ("child-overdue", "CHILD-OVERDUE")):
+        e = ev(lane_verdict=verdict)
+        r = triage.route(e)
+        eq("%s: subcase" % subcase, r.subcase, subcase)
+        p = triage_arms.execute(r, e, FakeSurface(), ws="ws_c", child={"pid": 4242, "label": "kid"})
+        eq("%s: action" % subcase, p.action, "repair-child")
+        ok("%s: the child is NAMED in the artifact" % subcase, p.artifact["child"].get("pid") == 4242)
+        ok("%s: nothing was killed and nothing was typed" % subcase, not p.sent)
+        unnamed = triage_arms.execute(r, e, FakeSurface(), ws="ws_c", child={})
+        ok("%s: an unread child is not verified and not killed" % subcase, not unnamed.verified)
+
+    # rerun: lane-relaunch.py's own exit code IS the proof
+    e = ev(lane_verdict="WEDGED", turn=TURN_OPEN)
+    r = triage.route(e)
+    eq("open-turn-never-closes: subcase", r.subcase, "open-turn-never-closes")
+    p = triage_arms.execute(r, e, FakeSurface(), ws="ws_r", relaunch=lambda ws: 0)
+    ok("rerun: CONFIRMED (rc 0) verifies", p.verified, p.detail)
+    for rc, why in ((3, "REFUSED"), (4, "UNCONFIRMED"), (5, "DRY-RUN"), (1, "ERROR")):
+        p = triage_arms.execute(r, e, FakeSurface(), ws="ws_r", relaunch=lambda ws, _rc=rc: _rc)
+        ok("rerun: rc=%d is not verified and says %s" % (rc, why),
+           (not p.verified) and why in p.detail, p.detail)
+
+
+def leg_records() -> None:
+    print("\n── RECORDS — the decision and its proof are durable, and 'verified' is carried ──")
+    import json as _json
+    import tempfile
+    e = ev(lane="lane-9", lane_verdict="WIP-IDLE")
+    r = triage.route(e)
+    surf = FakeSurface(sizes={"ws_a": 10})
+    p = triage_arms.execute(r, e, surf, ws="ws_a")
+    with tempfile.TemporaryDirectory() as td:
+        path = triage_arms.write_record(td, "lane-9", r, p)
+        with open(path) as fh:
+            row = _json.load(fh)
+    eq("the record carries the route", row["route"], "idle-continue")
+    eq("the record carries the proof name", row["proof"], "transcript-growth")
+    eq("the record carries whether the effect was VERIFIED", row["result"]["verified"], True)
+    ok("the record carries the evidence that decided it", bool(row["reason"]))
+
+
 LEGS = (
     ("precedence", leg_precedence),
     ("no-continue", leg_no_continue_to_question),
@@ -385,6 +591,10 @@ LEGS = (
     ("one-classifier", leg_one_classifier),
     ("ask-detector", leg_ask_detector),
     ("rows", leg_rows),
+    ("e2e-question", leg_user_question_end_to_end),
+    ("arm-continue", leg_arm_continue_proves_resumption),
+    ("arm-wedged", leg_arm_wedged_remedies),
+    ("records", leg_records),
 )
 
 
