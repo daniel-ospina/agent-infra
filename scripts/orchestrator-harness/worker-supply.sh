@@ -990,22 +990,27 @@ show_status() {
   # bound is what a DEAD or WEDGED supervisor looks like from outside, so it is named `STALE` and it
   # EXITS 5 -- a monitor that reads the code (a lane, `set -e`, an activation grid) gets a verdict rather
   # than an `ActiveState=active` over a loop that stopped passing.
-  local rec_m pass_m newest
+  # ⛔ WHICH SURFACE WON IS TRACKED EXPLICITLY, NEVER RE-DERIVED BY COMPARING THEM (review P3, round 3 on
+  # #4017, reproduced). Both mtimes are WHOLE SECONDS, and a pass that starts and finishes inside one
+  # second leaves `pass_m == rec_m`: comparing `pass_m` against `newest` then reported a COMPLETED pass as
+  # "IN PROGRESS" and suppressed the completed-pass age — the one number this verb exists to print — on a
+  # perfectly normal idle box. `beat_src` is set where the choice is made and nowhere else.
+  local rec_m pass_m newest beat_src=record
   rec_m="$(mtime_of "$RECORD")"; pass_m="$(mtime_of "$PASS_BEAT")"
   case "${rec_m:-}" in ''|*[!0-9]*) rec_m="" ;; esac
   case "${pass_m:-}" in ''|*[!0-9]*) pass_m="" ;; esac
   newest="${rec_m:-}"
-  if [ -n "$pass_m" ] && { [ -z "$newest" ] || [ "$pass_m" -gt "$newest" ]; }; then newest="$pass_m"; fi
+  if [ -n "$pass_m" ] && { [ -z "$newest" ] || [ "$pass_m" -gt "$newest" ]; }; then newest="$pass_m"; beat_src=pass; fi
   if [ -n "$newest" ]; then
     age=$(( $(date +%s) - newest ))
     if [ "$age" -gt "$STALE_AFTER_S" ]; then
-      if [ -n "$pass_m" ] && [ "$pass_m" = "$newest" ]; then
+      if [ "$beat_src" = pass ]; then
         beat="STALE — a pass STARTED ${age}s ago and has not finished, over the ${STALE_AFTER_S}s bound: the process is WEDGED (or died mid-pass), not working"
       else
         beat="STALE — the last completed pass was ${age}s ago, over the ${STALE_AFTER_S}s bound: the process that should be passing is DEAD or WEDGED, not idle"
       fi
       rc=5
-    elif [ -n "$pass_m" ] && [ "$pass_m" = "$newest" ]; then
+    elif [ "$beat_src" = pass ]; then
       beat="ok — a pass is IN PROGRESS (started ${age}s ago; the completed-pass record updates when it ends, bound ${STALE_AFTER_S}s)"
     else
       beat="ok — last completed pass ${age}s ago (bound ${STALE_AFTER_S}s)"

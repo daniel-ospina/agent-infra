@@ -1078,9 +1078,13 @@ O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m0.out" 2>&1; rcm0=$?
   || bad "an absent pass record reported rc=$rcm0 / '$(beat_line_of "$TMP/m0.out")', expected STALE + 5"
 O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
 O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m1.out" 2>&1; rcm1=$?
-[ "$rcm1" = "0" ] && grep -q 'beat:  ok' "$TMP/m1.out" \
-  && ok "…and a pass that just completed reads ok (rc=0) — the assertion is not vacuous" \
-  || bad "a fresh record reported rc=$rcm1 / '$(beat_line_of "$TMP/m1.out")', expected ok + 0"
+# ⛔ AND IT MUST SAY **COMPLETED** (review P3, round 3 on #4017, reproduced): a pass that starts and
+# finishes inside the same wall-clock second leaves EQUAL mtimes, and the first version re-derived "which
+# surface won" by comparing them — so a finished pass read "IN PROGRESS" and the completed-pass AGE (the
+# number this verb exists to print) disappeared on a normal idle box.
+[ "$rcm1" = "0" ] && grep -q 'last completed pass' "$TMP/m1.out" \
+  && ok "…and a pass that just completed reads ok with its COMPLETED age (rc=0) — never 'IN PROGRESS' when start and end share a second" \
+  || bad "a fresh record reported rc=$rcm1 / '$(beat_line_of "$TMP/m1.out")', expected 'last completed pass' + 0"
 touch -t 202601010000 "$ST/worker-supply.state" "$ST/worker-supply.pass-start"
 O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m2.out" 2>&1; rcm2=$?
 [ "$rcm2" = "5" ] && grep -q 'beat:  STALE' "$TMP/m2.out" \
