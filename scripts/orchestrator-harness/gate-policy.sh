@@ -56,6 +56,12 @@
 # `gate-policy.test.sh` (so a template that regrows the hatch is RED before it reaches a box).
 # STATED LIMIT, so no reader over-reads it: this grades the DECLARATION. `EnvironmentFile=`/a sourced
 # rc file/the spawned script's own `export` are outside it — the census sees what the unit itself says.
+# What it DOES grade includes `\`-continued `Environment=` lines, joined the way systemd joins them
+# (systemd.syntax(5): the backslash "is replaced by a space character"), because a hatch on the
+# continued line is the same directive to the process that runs. That join makes ONE over-block
+# possible, declared here rather than discovered later: a comment block following a continuation is
+# joined too, so a bypass flag NAMED IN SUCH A COMMENT is vetoed although systemd ignores it. That is
+# the fail-closed direction (a false refusal, never a false pass), and it is not worth a parser.
 #
 # SEAMS (tests): GP_REPO=<path> (harness checkout to probe), GP_LOG=<file> (audit), GP_QUIET=1.
 
@@ -88,7 +94,23 @@ gate_policy_unit_veto() {
   # hatch back in. A commented-out line is not a declaration, so the `^[[:space:]]*Environment` anchor
   # deliberately does not see it; `EnvironmentFile=` is not `Environment=` and is outside this census
   # (the STATED LIMIT in this file's header).
-  envlines="$(grep -E '^[[:space:]]*Environment[[:space:]]*=' "$f" 2>/dev/null || true)"
+  # ⛔ JOIN CONTINUATION LINES FIRST, BECAUSE THE PARSER DOES (agent-infra#4002). systemd.syntax(5):
+  # "Lines ending in a backslash are concatenated with the following line while reading and the
+  # backslash is replaced by a space character." So this declaration is ONE `Environment=` to the
+  # process that ends up running, and a census that greps PHYSICAL lines alone answers CLEAN for a job
+  # that starts with the review gate off — MEASURED at fix time: a unit with
+  #   Environment=NORMAL=1 \
+  #               AGENT_SKIP_REVIEW_GATE=1
+  # returned rc=0 (clean) before this join existed, and the installer installed it. That is the exact
+  # defect this census exists to refuse, in syntax the parser honours.
+  # The replacement is a SPACE, not an empty string, because systemd replaces the backslash with a
+  # space: `AGENT_SKIP_\` + `REVIEW_GATE=1` therefore resolves to `AGENT_SKIP_ REVIEW_GATE=1` — an
+  # invalid name that is correctly NOT a hit (a split name sets no flag).
+  # Applied to the systemd arm only: a plist is XML with no continuation syntax, and joining it could
+  # fuse a `<string>` value that legitimately ends in a backslash.
+  local joined=""
+  joined="$(awk '{ while (sub(/\\[[:space:]]*$/, "")) { if ((getline nxt) <= 0) break; $0 = $0 " " nxt } print }' "$f" 2>/dev/null || true)"
+  envlines="$(grep -E '^[[:space:]]*Environment[[:space:]]*=' <<<"$joined" 2>/dev/null || true)"
   for flag in $GP_UNIT_BYPASS_FLAGS; do
     # ⛔ HERE-STRING, NOT `printf … | grep -q` (#841/#864): under `set -o pipefail` a quiet grep exits at
     # its first match, the still-writing printf takes SIGPIPE (141), pipefail promotes it, and this

@@ -438,6 +438,37 @@ bash "$POLICY" --unit-veto "$TMP/no-such-declaration" absent >/dev/null 2>&1; AB
   && ok "(5d) edges: an ungradable declaration answers 2 (not 0) — 'cannot check' is never a pass" \
   || bad "(5d) edges: an absent declaration answered rc=$ABSENT_RC (a no-op gate reports clean)"
 
+# (5e) CONTINUATION LINES — the hatch on the CONTINUED line, which is the SAME `Environment=` to the
+# parser that executes it. systemd.syntax(5): "Lines ending in a backslash are concatenated with the
+# following line while reading and the backslash is replaced by a space character." So a census that
+# greps PHYSICAL lines alone answers CLEAN for a job that starts with the review gate off — measured
+# before this arm existed: that unit returned rc=0. It is the exact defect #4002 exists to refuse,
+# arriving in syntax the parser honours, so it is graded, not assumed.
+printf '[Service]\nEnvironment=NORMAL=1 \\\n            AGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/continuation.service"
+bash "$POLICY" --unit-veto "$TMP/continuation.service" continuation >/dev/null 2>&1; CONT_RC=$?
+[ "$CONT_RC" -eq 1 ] \
+  && ok "(5e) continuation: a hatch on a \\\\-continued Environment= line IS vetoed (rc=1)" \
+  || bad "(5e) continuation: a hatch on a continued line answered rc=$CONT_RC (0 = the census read physical lines only, so the hatch ships)"
+# …and the JOIN must not become an over-block: a continuation that carries no hatch stays clean.
+printf '[Service]\nEnvironment=NORMAL=1 \\\n            OTHER=2\nExecStart=/bin/true\n' >"$TMP/continuation-clean.service"
+bash "$POLICY" --unit-veto "$TMP/continuation-clean.service" continuation-clean >/dev/null 2>&1 \
+  && ok "(5e) continuation: a hatch-free continued Environment= is still clean (the join does not over-block)" \
+  || bad "(5e) continuation: a hatch-free continued Environment= was vetoed — the join fabricated a hit"
+# …and the INSTALLER refuses it too: the census is one function, but the install is the refusal an
+# operator actually experiences, and a render-time hatch can arrive from a SUBSTITUTION.
+CV="$TMP/continuation-install"; mkdir -p "$CV/tpl"
+cp "$REPO/templates/systemd/eldato-ai-drainer.service" "$REPO/templates/systemd/eldato-ai-drainer.timer" "$CV/tpl/"
+printf 'Environment=NORMAL=1 \\\n            AGENT_SKIP_REVIEW_GATE=1\n' >>"$CV/tpl/eldato-ai-drainer.service"
+CV_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$CV/units" TEMPLATES_DIR="$CV/tpl" \
+          DRAINER="$HERE/ai-drainer.sh" DRAINER_STATE="$CV/state" DRAINER_O="$CV" \
+          bash "$INST" 2>&1)"; CV_RC=$?
+[ "$CV_RC" -ne 0 ] && grep -q 'AGENT_SKIP_REVIEW_GATE' <<<"$CV_OUT" \
+  && ok "(5e) continuation: the INSTALLER REFUSES a continued-byte hatch and names the flag" \
+  || bad "(5e) continuation: the installer installed a unit whose hatch is on a continued line (rc=$CV_RC): $(printf '%s' "$CV_OUT" | tail -1)"
+[ ! -f "$CV/units/eldato-ai-drainer.service" ] \
+  && ok "(5e) continuation: …and a refused install leaves no artefact" \
+  || bad "(5e) continuation: a refused install still wrote $CV/units/eldato-ai-drainer.service"
+
 printf '\ngate-policy.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$(uname -s)"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
