@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-issue-11415-1794450585-p2933314-81b88916",
+  "_sha": "91a67311b8cacc8e9c503a492bedd9e415748d3c",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/cell-home/orchestrator/bg/issue-11415.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/11415-11455-instruments-score-honestly"
+    },
+    {
+      "kind": "sha",
+      "value": "8c013e4f212e10bcb0b493e1d0352e3142a2bbea"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/wt-11415"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7234,
+  "ended_at": 1794457819,
+  "exit_code": 143,
+  "heartbeat_at": 1794457819,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-issue-11415-1794450585-p2933314-81b88916",
+  "lease_until": 1794465619,
+  "pid": 2933314,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794450585,
+  "state": "FAILED",
+  "tag": "issue-11415",
+  "worktree": "/home/cmux/wt-11415"
+}
