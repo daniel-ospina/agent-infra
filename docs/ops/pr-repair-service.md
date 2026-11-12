@@ -177,3 +177,15 @@ erases) and never a checkout the reaper may reclaim. Both new scripts are declar
   capability's activation, and the per-cell state is recorded on #2700.
 - **`systemctl is-active` is a hint, not the proof.** The proof is the journal decision **and** a PR
   whose state changed because of that box (#2709 §1).
+- ⛔ **`activate-harness.sh --check` no longer grades this capability on `ActiveState` alone**
+  (agent-infra#4010). It reads the loop's own pass record (`$O/state/pr-repair.status.json`, the file
+  `pr-repair-loop.sh::write_status` writes every pass) and reports `FAILING` while the decision is
+  `refusing` / `place-undelivered` / `pass-failed`, and `LATE` while it is `deferred` / `idle` /
+  `skipped`, or when a green record stopped moving (bound: 3 x the unit's own `REPAIR_INTERVAL_S`,
+  floored at 1800 s). The reason is quoted from the record, so the row and `--status` cannot disagree.
+  **Why that had to change:** measured on a cloud cell 2026-11-12, the unit read `active (running)` for
+  three days while every pass wrote `decision: refusing` — `reason:
+  env-file-unreadable:/tmp/cell-home/keys.env`, a pre-#3453 render pointing at a home the box does not
+  have — and the grid printed `OK … active` over it. The loop CONTINUES on a refusal (it does not
+  exit), so the restart policy never fires and `ActiveState` can never see this state. A row that
+  cannot fail is a caption, not a gate.

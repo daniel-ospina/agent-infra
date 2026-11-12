@@ -411,6 +411,126 @@ probe_systemd_service() { # <unit> <class> <beacon-path|-> <max_age_s> <note>
     emit "$unit" "$class" OK "$unit active"
 }
 
+# ── probe: the PR repair loop, graded on its OWN last pass (agent-infra#4010) ────────────────
+# ⛔ `ActiveState=active` IS NOT "the review stage is running", AND THIS ROW USED TO BELIEVE IT WAS.
+# MEASURED on a cloud cell 2026-11-12: `eldato-pr-repair.service` had read `active (running)` for three
+# days while EVERY pass wrote
+#     {"decision": "refusing", "reason": "env-file-unreadable:/tmp/cell-home/keys.env"}
+# and journalled `REFUSING: ENV_FILE=… could not be read` every 15 minutes. This grid printed
+#     eldato-pr-repair.service   must   OK   eldato-pr-repair.service active
+# over it — so the fleet's own activation instrument certified the review stage on a box that had never
+# reviewed a pull request, which is precisely the claim #4010 exists to stop making (“no cell has ever
+# run a review”). A row that cannot fail is not a gate; it is a caption.
+#
+# ⛔ WHY `ActiveState` CAN NEVER SEE THIS ONE. `pr-repair-loop.sh --loop` treats a REFUSAL as a
+# CONTINUE, not an exit ("a loop that exits on a single rc=3 is a supply path that stops about the first
+# refusal it meets"), so a pure configuration fault — here, a credential path rendered for a home this
+# box does not have — never converges to `failed` and the restart policy never speaks. The unit is alive
+# BY DESIGN while doing nothing BY MEASUREMENT: the ALIVE / REFUSING state `docs/ops/harness-activation.md`
+# §2 names, and no `ActiveState` read can distinguish it from a working pass.
+#
+# The artifact that answers it is the loop's OWN record, `$O/state/pr-repair.status.json`, written by
+# `write_status` on every pass, whose `decision` is one of dispatched | idle | deferred | refusing |
+# placed-undelivered | pass-failed | skipped and whose `reason` names why. So this row grades THAT, and
+# the three install / enable / active arms are kept because they are still facts that must be reported
+# in their own words rather than folded into one verdict.
+probe_repair_service() { # <unit> <class> <note>
+    local unit="$1" class="$2" note="${3:-}"
+    local en act env_str o_dir interval bound rec py_out decision reason ep cap now age assumed remedy
+    if ! sc_available; then
+        emit "$unit" "$class" UNKNOWN "$SYSTEMCTL_BIN is not executable — this service cannot be read on this box (a failed read, not an absence)"
+        return 0
+    fi
+    if ! sc_scope_for "$unit"; then
+        emit "$unit" "$class" MISSING "$unit is not installed in either systemd manager${note:+ — $note}"
+        return 0
+    fi
+    en="$(sysd_show "$unit" UnitFileState)"
+    act="$(sysd_show "$unit" ActiveState)"
+    case "$en" in
+        enabled|enabled-runtime) ;;
+        *) emit "$unit" "$class" MISSING "$unit is installed but NOT ENABLED (UnitFileState=$en)"; return 0 ;;
+    esac
+    case "$act" in
+        active|activating) ;;
+        failed) emit "$unit" "$class" FAILING "$unit is FAILED — the restart policy gave up; nothing is watching it"; return 0 ;;
+        *) emit "$unit" "$class" FAILING "$unit is ${act:-unknown} — enabled but not running"; return 0 ;;
+    esac
+    # ⛔ THE STATE DIR IS THE UNIT'S, NOT THIS LAUNCHER'S DEFAULT (the same rule `cr_state` follows
+    # above). A box rendered with a non-default `O=` writes its record there, and reading `$O_RES`
+    # instead would grade a HEALTHY box LATE for ever — two paths that look alike, one of them wrong.
+    # An unreadable Environment is not evidence of the default, so the fallback SAYS it fell back.
+    env_str="$(sysd_show "$unit" Environment 2>/dev/null)"
+    o_dir="$(printf '%s' "$env_str" | tr ' ' '\n' | sed -n 's/^O=//p' | head -1)"
+    interval="$(printf '%s' "$env_str" | tr ' ' '\n' | sed -n 's/^REPAIR_INTERVAL_S=//p' | head -1)"
+    assumed=""
+    if [ -z "$o_dir" ]; then o_dir="$O_RES"; assumed=" (the unit declares no O=, so the record was read from this launcher's $O_RES)"; fi
+    case "$interval" in ''|*[!0-9]*) interval=900 ;; esac
+    [ "$interval" -ge 1 ] || interval=900
+    # 3 x the period: one completed pass, the journal between two, and one missed slot. Floored at 1800 s
+    # so a sub-minute cadence cannot turn a normal pass into an instant red.
+    bound=$(( interval * 3 )); [ "$bound" -ge 1800 ] || bound=1800
+    rec="$o_dir/state/pr-repair.status.json"
+    if [ ! -f "$rec" ]; then
+        emit "$unit" "$class" LATE "$unit is active but has NEVER written a pass record at $rec — enabled and running proves the loop was STARTED, not that a pass ever ran$assumed"
+        return 0
+    fi
+    # A record this launcher cannot parse is CANNOT-VERIFY, never a pass — the rule the whole file follows.
+    py_out="$(python3 -c 'import calendar, json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+dec = str(d.get("decision") or "")
+if not dec:
+    sys.exit(1)
+why = str(d.get("reason") or "")
+cap = str(d.get("cap"))
+ep = d.get("epoch")
+if not isinstance(ep, (int, float)):
+    try:
+        ep = calendar.timegm(time.strptime(str(d.get("ts")), "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        ep = 0
+print("%s\t%s\t%d\t%s" % (dec, why.replace("\t", " "), int(ep), cap))' "$rec" 2>/dev/null)" || py_out=""
+    if [ -z "$py_out" ]; then
+        emit "$unit" "$class" UNKNOWN "$unit is active but its pass record $rec carries no readable decision (or is not the JSON the loop writes) — cannot verify, which is never a pass$assumed"
+        return 0
+    fi
+    decision="$(printf '%s' "$py_out" | cut -f1)"
+    reason="$(printf '%s' "$py_out" | cut -f2)"
+    ep="$(printf '%s' "$py_out" | cut -f3)"
+    cap="$(printf '%s' "$py_out" | cut -f4)"
+    case "$ep" in ''|*[!0-9]*) ep=0 ;; esac
+    now="$(date +%s)"; age=$(( now - ep )); [ "$age" -lt 0 ] && age=0
+    [ -n "$reason" ] || reason="(the record names no reason)"
+    remedy="Re-render the unit (bash scripts/install-repair-service.sh --install) and read --status, which names the rendered directives it disagrees with"
+    case "$decision" in
+        dispatched|ok)
+            if [ "$age" -gt "$bound" ]; then
+                emit "$unit" "$class" LATE "$unit is active but its last pass DISPATCHED ${age}s ago (bound ${bound}s = 3 x ${interval}s) — the review stage has stopped passing$assumed"
+            else
+                emit "$unit" "$class" OK "$unit active; last pass dispatched ${age}s ago (bound ${bound}s), cap=${cap:-?}${assumed}"
+            fi ;;
+        refusing)
+            # ⛔ FAILING, NOT LATE: a refusal does NOT clear by waiting. The loop continues on it, so the
+            # unit stays `active` for ever and only a re-render (or a fix) changes the verdict.
+            emit "$unit" "$class" FAILING "$unit is ACTIVE while EVERY pass REFUSES — reason=$reason. A refusal is not a transient: the loop treats it as a continue, so the unit never converges to failed and nothing else will notice. $remedy$assumed" ;;
+        placed-undelivered)
+            emit "$unit" "$class" FAILING "$unit is ACTIVE but its last pass was UNDELIVERED — reason=$reason: the queue was classified and NO worker took an order. This is the state the epic's own audit reports as 0 of N dispatched. $remedy$assumed" ;;
+        pass-failed)
+            emit "$unit" "$class" FAILING "$unit is ACTIVE but its last pass FAILED — reason=$reason (a dispatcher crash does not clear by waiting). $remedy$assumed" ;;
+        deferred)
+            emit "$unit" "$class" LATE "$unit is ACTIVE but its last pass DEFERRED — reason=$reason: the box measured itself unable to afford a pass, so no review happens while it holds$assumed" ;;
+        idle)
+            emit "$unit" "$class" LATE "$unit is ACTIVE but its last pass was a DRY RUN — reason=$reason: nothing is dispatched while the unit is armed this way$assumed" ;;
+        skipped)
+            emit "$unit" "$class" LATE "$unit is ACTIVE but its last pass skipped itself — reason=$reason$assumed" ;;
+        *)
+            emit "$unit" "$class" UNKNOWN "$unit is active and its last pass reported an UNRECOGNISED decision '$decision' — cannot verify, which is never a pass$assumed" ;;
+    esac
+}
+
 # ── probe: the fleet-schedule loop (a cell's portable scheduler) ────────────────────────────
 # ⛔ NOT a pid read: `pgrep -f fleet-schedule.py` matches the shell running it. The runtime's own
 # `--verify` is the authority, and its `tick` file is the beacon. `--verify` is used rather than
@@ -765,8 +885,11 @@ build_grid() {
         probe_fleet_schedule "${CELL_HOME_RES}/.pi/agent/scripts/fleet-schedule.py"
         probe_systemd_service "eldato-orchestrator.service" "must" "$O_RES/heartbeat" 2400 \
             "the controller; without it a cell dispatches nothing and the only signal is a quiet queue"
-        probe_systemd_service "eldato-pr-repair.service" "must" "-" 0 \
-            "the PR repair loop"
+        # ⛔ NOT `probe_systemd_service`: `ActiveState` cannot fail for this unit (#4010). The loop
+        # continues on a refusal, so an enabled, active, permanently-refusing repair loop reads green —
+        # measured for three days on a real cell. `probe_repair_service` grades the loop's own pass
+        # record instead, and keeps these same three arms underneath it.
+        probe_repair_service "eldato-pr-repair.service" "must" "the PR repair loop"
         # ⛔ #2700's SUPPLY HALF HAD NO ROW AT ALL (review cycle 11, F2), and it is the clearest
         # instance of this file's own defect class: `templates/systemd/eldato-worker-supply.service`
         # SHIPS here, `scripts/install-worker-supply.sh` renders and installs it on Linux, and it
