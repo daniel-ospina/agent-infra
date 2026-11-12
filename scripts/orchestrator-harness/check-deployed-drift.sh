@@ -116,6 +116,18 @@
 #      separates "behind" from "edited". A file already named by half 3 is not repeated here (one
 #      defect, one line).
 #
+#   4a. MODE (the other half of question (b) — agent-infra#4003's post-deploy case). Every depth-1
+#      `*.sh` the ref carries as `100755` must be EXECUTABLE in $O. A mode is not a byte and a blob
+#      cannot carry one: `git hash-object` hashes CONTENT, so a 0644 copy of a 0755 script hashes
+#      identically and this whole half graded GREEN over a script the box cannot exec (measured on this
+#      fleet: `nonblocking-dispatch.sh`, 36,175 B, `-rw-r--r--`, dispatch path dead while every
+#      instrument read clean). That is #4003's silent-disarm class surviving a check that was written
+#      against it, so the source mode is read from the ref's TREE ENTRY (`git ls-tree`, the field git
+#      actually stores) and the deployed side is `[ -x ]`. It is the arm that catches a bit lost AFTER
+#      a good deploy — a restore, a `cp` without `-p`, a tarball, an `rsync` without `--perms`, a
+#      `core.fileMode=false` checkout — and it reports SEPARATELY from a byte difference, because
+#      "redeploy to adopt" is not the diagnosis for a file whose bytes are already the ref's.
+#
 # It answers ONE question and changes nothing: READ-ONLY, safe to run while the loop is working.
 # A `git fetch` of the ref is the only network call (skipped with --no-fetch), and a failed fetch
 # says so rather than silently comparing a stale ref.
@@ -174,6 +186,10 @@ broken=0
 # WHICH QUESTION failed, kept separately: conflating them is the defect this split exists to remove
 # (see the two-question note above the record resolution).
 Q_IDENT=0; Q_RECORD=0; Q_BYTES=0
+# ⛔ A MODE IS NOT A BYTE, SO IT IS A FLAG OF ITS OWN (#4003). Folded into `Q_BYTES`, the summary would
+# say "$O's bytes differ from the checkout" about a byte-IDENTICAL copy and print a remedy that names no
+# mode — the same conflation the two-question split above exists to remove, one level down.
+Q_MODE=0
 drift() { bad "DRIFT: $*"; problems=$((problems + 1)); }
 # ⛔ A LABELLED DRIFT IS STILL A DRIFT: it must reach `problems` (the exit code) — only its PREFIX
 # differs, so a reader can tell which of the two questions failed. Every labelled drift goes through
@@ -491,6 +507,10 @@ trap 'rm -rf "$TMPD"' EXIT
 MISSING_N=0
 : > "$TMPD/unrec-names"
 UNREC_N=0
+# Files that are byte-identical (or not) but NOT EXECUTABLE where the ref ships them 100755, kept so the
+# one-line token can NAME one — a token that says only "a mode differs" is a count, and counts are not
+# actionable at 3 a.m.
+: > "$TMPD/mode-names"
 git -C "$REPO" ls-tree -r --name-only "$TIP" -- "$REL" 2>/dev/null | grep -E "^${REL}/[^/]+\.sh\$" > "$TMPD/repo-sh" || unknown "cannot read the harness tree at $TIP"
 
 # ── 3. QUESTION (a) — does $O still hold the bytes its OWN RECORD says were deployed? ────────────
@@ -616,6 +636,35 @@ while IFS= read -r f; do
   if [ ! -f "$O/$d" ]; then
     Q_BYTES=1
     drift_q checkout "$d — shipped by the repo at $REF but MISSING from $O"
+    continue
+  fi
+  # ⛔ THE EXEC BIT IS PART OF "IS THIS THE CODE?" (#4003), AND IT IS THE ONE COMPARISON IN THIS FILE
+  # THAT CANNOT USE A BLOB SHA. `git hash-object` hashes bytes; a file's MODE live in the tree ENTRY, not
+  # in the blob, so a 0644 copy of a 0755 script hashes identically — which is how a deployed dispatcher
+  # at 36,175 B, `-rw-r--r--`, read GREEN here while the dispatch path was dead. `git ls-tree` is the
+  # source of truth for the mode git actually stores (the same read `check-farm-drift.sh`'s
+  # NOT-EXECUTABLE arm uses, so one class has one rule).
+  # ⛔ POLARITY IS DELIBERATELY ONE-WAY: a source `100755` the deployed copy cannot exec is the silent
+  # disarm; the REVERSE (an executable copy of a `100644` source) breaks nothing and is NOT reported —
+  # a check that reddens a healthy box is its own failure, and the fleet has a long record of them.
+  # `[ -x ]` is the predicate, not an exact mode: git stores only 644/755, so demanding bit-for-bit 0755
+  # would redden a working 0700 copy for a reason no deploy can explain.
+  d_mode="$(git -C "$REPO" ls-tree "$TIP" -- "$f" 2>/dev/null | cut -d' ' -f1)"
+  # An unreadable mode is CANNOT-VERIFY, like every other unreadable read in this file — never a silent
+  # skip past the arm. `$f` resolved above (it has a blob at $TIP), so an empty answer here is a read
+  # failure, not an absent entry.
+  [ -n "$d_mode" ] || unknown "cannot read the mode of $f at $TIP — cannot verify whether the deployed $d must be executable"
+  if [ "$d_mode" = "100755" ] && [ ! -x "$O/$d" ]; then
+    Q_MODE=1
+    printf '%s\n' "$d" >> "$TMPD/mode-names"
+    # WHICH SIDE, as in the byte arm above: "the mode was lost on the box" and "the repo gained the bit"
+    # are different histories with different remedies, and only the mode can tell them apart.
+    dm_now="$(ls -l "$O/$d" 2>/dev/null | cut -c1-10)"; [ -n "$dm_now" ] || dm_now="unreadable"
+    drift_q checkout "$d — the deployed copy is NOT EXECUTABLE (mode $dm_now) where the repo ships it 100755 at $REF. Its BYTES may be identical to the ref's: a mode is not in a blob, so no byte comparison can see this (a restore, a cp without -p, a tarball or an rsync without --perms loses the bit) and the box runs a script it cannot exec"
+    # One defect, one line — the same rule the byte arm applies to a file already named by question (a),
+    # and the same order `check-farm-drift.sh` uses (NOT-EXECUTABLE short-circuits the sha verdict). The
+    # remedy for either reading is the same redeploy when the bytes differ too, and the mode line is the
+    # one that says why the box cannot RUN what it has.
     continue
   fi
   have="$(git hash-object -- "$O/$d" 2>/dev/null || true)"
@@ -1297,6 +1346,13 @@ if [ "$problems" -gt 0 ]; then
     # A THIRD STATE, NAMED. `payload-differs` would be false (the bytes that ARE there match the
     # record) and `uncommitted-edit` would be false (nothing was edited) — it is an INCOMPLETE tree.
     HTOKEN="incomplete:$(head -1 "$TMPD/missing-names" 2>/dev/null)"
+  elif [ "$Q_MODE" -eq 1 ]; then
+    # ⛔ A MODE LOSS IS NOT `payload-differs` (#4003). That token is defined as "the bytes differ from
+    # the checkout", which is exactly what a byte-identical unrunnable copy does NOT satisfy — and its
+    # documented remedy (redeploy to adopt) tells an operator nothing about the bit that is missing. It
+    # sits BELOW `incomplete:` because a file that is GONE is the more actionable of the two, and ABOVE
+    # the surface arm because it is a statement about `$O` itself.
+    HTOKEN="not-executable:$(head -1 "$TMPD/mode-names" 2>/dev/null)"
   elif [ "$DIRTY" = true ]; then
     # ⛔ A DIRTY-SOURCE RECORD ON THE TIP IS NOT `payload-differs` (measured 2026-10-30, review of
     # #3053/#3090). It fell through to the else below — but README §4.3 defines that token as "the
@@ -1310,7 +1366,8 @@ if [ "$problems" -gt 0 ]; then
     # Measured: putting this arm first narrowed `incomplete:b.sh` to `source-dirty:<sha>` for a
     # dirty-source record with a missing file. Precedence, stated rather than implied (and it must stay
     # in step with the `if` chain BELOW, which is the one that decides):
-    # executes: > uncommitted-edit > behind/diverged > incomplete > source-dirty > (surface | payload-differs).
+    # executes: > uncommitted-edit > behind/diverged > incomplete > not-executable > source-dirty >
+    # (surface | payload-differs).
     # ⛔ THE `O_ABSENT` ARM PRECEDES ALL OF THESE (review of #3090): no question about `$O` was
     # answered, so there is nothing to order it against — and it is NOT the `Q_BYTES=0` surface arm
     # below, where that flag is a real answer rather than the initialisation at the top of the script.
@@ -1364,6 +1421,20 @@ if [ "$problems" -gt 0 ]; then
   if [ "$Q_BYTES" -eq 1 ]; then
     bad "  (b) checkout: \$O's bytes differ from the checkout at $REF — redeploy to adopt it:"
     bad "      bash '$REPO/$REL/deploy-harness.sh' --src '$REPO/$REL' --o '$O'   &&   O='$O' bash '$REPO/$REL/install.sh'"
+  fi
+  if [ "$Q_MODE" -eq 1 ]; then
+    # ⛔ NO BYTE ARM MAY CLAIM THIS ONE, AND THIS ARM MAY NOT CLAIM A REDEPLOY IS THE ONLY FIX. The
+    # mode is missing on the DEPLOY side, so `chmod +x` is a complete remedy when the bytes are the
+    # ref's; when they are not, the byte arm above has already said so and a redeploy covers both.
+    # ⛔ AND THE REMEDY NAMES THE REAL PATH — this file's own rule (`write --o $O --src`, printed on a
+    # case where it MINTS a false record, is the precedent): a printed command that cannot be pasted is
+    # a remedy that does not exist at 3 a.m.
+    bad "  (b) mode: the deployed copy is NOT EXECUTABLE where $REF ships the file 100755. A blob carries no mode, so NO byte comparison can see this and the bytes may be the ref's exactly — restore the bit:"
+    while IFS= read -r _mn; do
+      [ -n "$_mn" ] || continue
+      bad "      chmod +x '$O/$_mn'"
+    done < "$TMPD/mode-names"
+    bad "      …or redeploy, which writes the mode from git: bash '$REPO/$REL/deploy-harness.sh' --src '$REPO/$REL' --o '$O'"
   fi
   if [ "$UNREC_N" -gt 0 ]; then
     bad "  (a) record: $UNREC_N file(s) at \$O already hold $REF's bytes and the record predates them — an UNRECORDED (partial) deploy, not an edit. Nothing you wrote is discarded; a completed deploy records it."

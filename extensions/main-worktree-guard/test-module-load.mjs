@@ -40,6 +40,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -772,6 +773,124 @@ async function partB() {
     expectTrue("B9v-cont3: baseline restored to the original for the remaining suites (#1144 F3 control)",
       restoreBaseline === undefined, `handler returned ${JSON.stringify(restoreBaseline)}`);
 
+    // ── B9u2x: #601 — an M3-ALLOWED FIRST mutation must not launder a LATER
+    // branch-state mutation (the end-to-end twin of the classify-layer pins in
+    // test.mjs) ──────────────────────────────────────────────────────────
+    // #601 was filed against a tree that predates #1144 (probe baseline
+    // 657789f, 2026-09-08) and describes pre-#1144 index.ts exactly: it returned
+    // from the WHOLE handler at the first `reBaseline`, so an M3-ALLOWED lead
+    // (own-baseline rename / return-to-original / an ownership-allowed delete)
+    // blessed every later segment — including a FOREIGN rename / force-create /
+    // force-copy, the families with NO legacy verdict, for which M3 is the only
+    // gate. #1144 (1ef8abb5d) made that return conditional on every OTHER
+    // invocation being provably read-only (`stateCarveOutClean`), which closes
+    // it. What is NEW here (review of this PR corrected an earlier "nothing pinned
+    // it" claim: main already carries 8 e2e pins on the closure at B9u1–B9u8,
+    // including exact launder shapes whose lead is a SWITCH): the own-baseline
+    // RENAME lead end-to-end, on two different tail families, each row
+    // independently reachable. Each row names the mutant that reddens it
+    // (agent-infra#3442, MEASURED per row); #601's indicators 2–4 are NOT repeated
+    // here because they are refused by arms that fire before the carve-out can
+    // matter (#626's create-new arm; delete → `op "other"` skipped by the M3 loop)
+    // — they cannot vary under any mutation of this fix and are already pinned by
+    // #626 / #596 r4. The "a refused compound does not re-baseline" property is
+    // B9v1/B9v2's, not this block's (see the note below the rows).
+    //   M2 = index.ts's `if (det.stateCarveOutClean === true)` → `if (true)`
+    //   M5 = `classify-git.mjs`'s carve-out identity exemption deleted
+    //   M6 = `decideM3`'s #591 own-force carve-out removed; M7 = its stateOpCount bound deleted
+    //   M8 = `decideM3`'s #376 return-to-original arm deleted
+    const m601a = await callBash("git branch -Mq main rn601 ; git branch -Mq feat/x rn601b");
+    expectTrue("#601 ind1: own-baseline rename + FOREIGN rename is BLOCKED [mutant: M2] — MEASURED: M2 admits it (undefined)",
+      !!m601a && m601a.block === true,
+      `handler returned ${JSON.stringify(m601a)} — a foreign ref was renamed behind the sanctioned own rename`);
+    // ⛔ THE RESTORE IS LOAD-BEARING, not hygiene. Under M2 the row above is ADMITTED and
+    // its pending re-baseline is applied, so the session baseline becomes `rn601`; the next
+    // block row would then be refused by the FOREIGN-rename arm for the WRONG reason
+    // (baseline mismatch) and would stay green under M2 — i.e. it would be a vacuous lock,
+    // the exact class agent-infra#3442 forbids. Measured: without this line ind1b survives M2.
+    // `git checkout main` returns to `baseline.original` under BOTH the correct code and M2,
+    // so every block row below starts from a known baseline.
+    // ⚠️ These two rows are PRECONDITIONS, not new closure coverage: `git checkout main →
+    // undefined` is already pinned twice on main (B9u-cont1 and B9v-cont1). They are asserted
+    // here only so the row that depends on them fails ATTRIBUTABLY (a broken restore must red
+    // on the restore, not on the block row that inherits its drift) — do not count them as
+    // added coverage of the #601 closure.
+    const m601r1 = await callBash("git checkout main");
+    expectTrue("#601 harness control: the baseline is re-established between the block rows [mutants: M5, M8]" +
+      " — MEASURED: blocked under either (M5 by the legacy checkout-branch arm, M8 by the removed #376 arm)",
+      m601r1 === undefined, `handler returned ${JSON.stringify(m601r1)}`);
+    const m601b = await callBash("git branch -Mq main rn601b2 ; git branch -fq feat/other main");
+    expectTrue("#601 ind1b: own rename + FOREIGN force-create is BLOCKED (a second tail family) [mutant: M2] — MEASURED: M2 admits it",
+      !!m601b && m601b.block === true,
+      `handler returned ${JSON.stringify(m601b)} — a foreign ref was force-created behind the sanctioned own rename`);
+    const m601r2 = await callBash("git checkout main");
+    expectTrue("#601 harness control: the baseline is re-established after the second block row [mutants: M5, M8]" +
+      " — MEASURED: blocked under either",
+      m601r2 === undefined, `handler returned ${JSON.stringify(m601r2)}`);
+    // ⛔ NO ROW FOR "the refused compounds above did not re-baseline". An earlier draft had
+    // one here; fresh-context review of this PR measured that it could not observe that
+    // property (the restores above re-establish the baseline regardless) AND that its
+    // claimed mutant could not redden it — under M5 the carve-out simply fails to close and
+    // the command is admitted at index.ts's verdict arm (`det.verdict === "allow"` →
+    // `admitAfterM3()`, which applies the pending re-baseline), so `undefined` still holds.
+    // The property IS pinned, attributably, by the pre-existing B9v1/B9v2 pair
+    // (a REFUSED compound leaves the follow-up rename blocked; an ADMITTED return admits it).
+    // Citing that pair is the honest form; a duplicate here would be the dead weight #3442
+    // forbids.
+    const m601g = await callBash("git branch -fq main HEAD");
+    expectTrue("#601 control: the single-invocation own-branch force-create carve-out survives (#591) [mutant: M6] — MEASURED: M6 blocks it",
+      m601g === undefined, `handler returned ${JSON.stringify(m601g)}`);
+    const m601h = await callBash("git branch side601b ; git branch -fq main HEAD");
+    expectTrue("#601 control: benign lead + own force-create is still REFUSED (#591 stateOpCount bound holds) [mutant: M7] — MEASURED: M7 admits it",
+      !!m601h && m601h.block === true, `handler returned ${JSON.stringify(m601h)}`);
+
+    // ✅ RESIDUAL NOW CLOSED — #607's hidden-payload refusal (`index.ts`
+    // `hiddenBranchStateRefusal`, reached through `admitAfterM3`) refuses any
+    // UNENUMERABLE branch-state payload, which is exactly what this row recorded as
+    // open. A HIDDEN shell tail (`$(…)`, backticks, `eval "…"`) still contributes
+    // NO invocation, so `stateMutations` still keeps only the LEAD and the M3 loop
+    // still has no second mutation to gate — but the command no longer reaches the
+    // verdict arm unexplained: the refusal fires first (#805, fail closed).
+    // INVERTED FROM A TRIPWIRE, per this row's own instruction ("invert it and cite
+    // the fix; never delete it"). The citation is **#607**, not #656: #607's refusal
+    // is what closes this class. #656's ROOT stays open for the
+    // interpreter-CONSUMED family (`bash <<'EOF'`, `bash -c "$(…)"`, `$(…) | bash`),
+    // which is #694's and is recorded there.
+    const m601res = await callBash(`git branch -Mq main rn601res ; echo "$(git branch -Mq feat/601foreign rn601stolen)"`);
+    expectTrue("#607 closes #601's #656-residual: a `$()`-hidden FOREIGN rename behind an M3-allowed lead is REFUSED (inverted from the tripwire, cited) [mutant: #607-M1 — `hiddenBranchStateRefusal` returns null] — MEASURED: admitted under M1, which is what this row asserted before #607",
+      !!m601res && m601res.block === true,
+      `handler returned ${JSON.stringify(m601res)} — a \`$(…)\`-hidden foreign rename behind a sanctioned lead was ADMITTED: the #656 residual is open again`);
+    // ⛔ DELETED (#3442, round-6 finding F2): this block used to CREATE
+    // `feat/601foreign` and rename it to `rn601stolen` with `execSync`, then assert the
+    // ref existed — labelled "…so the admitted command moves a FOREIGN ref". Its whole
+    // input was the test's OWN git calls: no guard module runs between the setup and the
+    // assertion, so its value could not vary under ANY mutant of this diff, under the
+    // pre-fix code, or under #656's eventual fix. By #3442's letter that is dead weight
+    // that actively misleads, and its label drew a conclusion (the admitted command moves
+    // a foreign ref) the test never demonstrated — it moved the ref itself. The
+    // foreign-ness of the hidden tail is a property of the COMMAND SPELLING recorded in
+    // the row above (`feat/601foreign` ≠ the baseline), not a measurement this suite has
+    // to re-take. No replacement assertion: a real one would have to observe the guard.
+    // The residual ROW above is the record; nothing here is #601 coverage.
+    // The row above is now REFUSED, so nothing was applied: the guard's baseline was
+    // NOT re-based to `rn601res` (that is the #1144 F3 property, on the hidden-payload
+    // path). The control stays because the following suites require
+    // `baseline.branch === "main"` on exit.
+    const m601resR = await callBash("git checkout main");
+    expectTrue("#601 ⚠️ RESIDUAL harness control: the fixture is back on main after the (now refused) row [mutants: M5, M8] — MEASURED: blocked under either",
+      m601resR === undefined, `handler returned ${JSON.stringify(m601resR)}`);
+    // ── FIXTURE HYGIENE PRECONDITION, NOT #601 EVIDENCE (#3442, round-6 finding F2) ──
+    // The old row here said "back on main with no stray branch" but read ONLY `HEAD`, so
+    // its "no stray branch" half was an unasserted claim sitting on a best-effort
+    // `try/catch` delete. It now measures what it says: HEAD *and* the absence of the
+    // purpose-made refs. It is deliberately invariant under every mutant of this diff —
+    // it observes the FIXTURE the following suites need (`baseline.branch === "main"`),
+    // not the guard — so it is labelled a precondition, is the one row in this block with
+    // no mutation-attribution entry, and claims nothing about #601.
+    const afterResidual = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repo, encoding: "utf8" }).trim();
+    const strayResidual = execSync("git branch --list 'rn601*' '601foreign'", { cwd: repo, encoding: "utf8" }).trim();
+    expect(`#601 ⚠️ RESIDUAL precondition (fixture hygiene — NOT #601 coverage, no mutant can move it)`, `head=${afterResidual} stray=${strayResidual || "none"}`, "head=main stray=none");
+
     // ── B9w–B9z: #2277 — a lane rooted ELSEWHERE can advance a hub, but only
     // on a MEASURED fast-forward proof ────────────────────────────────────
     // Measured 2026-10-21 on the agent-infra hub itself: `0 ahead / 76 behind
@@ -850,6 +969,525 @@ async function partB() {
       `handler returned ${JSON.stringify(ffDiverged)}`);
     console.log((ffDiverged?.reason ?? "(no reason)").split("\n").map((l) => `     | ${l}`).join("\n"));
 
+    // ═════════════════════════════════════════════════════════════════════
+    // B607 — #607: (i) a branch-state git invocation hidden inside a shell
+    // substitution / eval / alias payload is REFUSED, and (ii) M3 decides each
+    // compound segment against the baseline the COMMAND itself has reached.
+    // ═════════════════════════════════════════════════════════════════════
+    // WHAT WAS MEASURED, at 6f508fc30, before either half was written — the
+    // issue's own body is provenance-stale in one direction and too narrow in
+    // the other:
+    //
+    //   (1) The LAUNDER the issue describes (a reBaseline-producing lead
+    //       short-circuits M3, so a later foreign clobber rides it) is ALREADY
+    //       CLOSED: #1144's `stateCarveOutClean` made that return conditional.
+    //       The rows below that re-pin it are regression pins, not new closure —
+    //       and they are pinned at the CLASSIFY layer (the 36-compound matrix)
+    //       and end-to-end in peer PR #3968; they are repeated here only because
+    //       THIS change rewrites the loop they run through, so the launder must
+    //       be re-proved against the NEW decision path (that is the risk this
+    //       block actually carries).
+    //   (2) The HIDDEN-PAYLOAD class was a live category-A bypass, and needs no
+    //       lead at all: `echo "$(git branch -Mq main victim)"` was ALLOWED (the
+    //       substitution executes and clobbers `victim` rc 0) — and so was the
+    //       same payload behind an M3-SANCTIONED lead, via backticks, and via
+    //       `eval`. Nothing refused them: the extractor cannot enumerate a
+    //       `$(…)`/backtick/`eval` payload, so the M3 loop gates only the VISIBLE
+    //       mutations (`hiddenStateSubst` reaches only the #591 carve-out).
+    //   (3) The FALSE BLOCK the issue's "Suggested fix" names: every segment was
+    //       judged against the SESSION baseline, so the legitimate two-segment
+    //       rename ceremony (`git branch -M main tmpA && git branch -M tmpA main`)
+    //       was BLOCKED — segment 2's source is not the session baseline.
+    //
+    // MUTANTS this block was MEASURED against (each row names the one that reddens
+    // it):
+    //   M1 = index.ts `hiddenBranchStateRefusal`'s first line neutered (`return null`)
+    //   M2 = the prospective baseline dropped (`const prospective = undefined`)
+    //   M3 = the #607 freed-name relaxation deleted (dst probe as before)
+    //   M3i = `renameDstExists: dstExists` → `false` (the pre-#598 decision: no dst
+    //         existence check at all) — the non-vacuity arm for the launder rows
+    //   M8 = `admitAfterM3` applies `pendingRebaselines` BEFORE the hidden refusal (the
+    //         #1144 F3 ordering this diff guarantees) — reddens the baseline-stability row
+    //   M9 = the collector WITHOUT single-quote masking (the round-4 quoting false block)
+    //         — reddens the two single-quoted rows
+    //   M9b = `_stripQuotedHeredocBodies` removed from the precise predicate — reddens
+    //         the quoted-heredoc row (MEASURED pre-fix: that row reported true)
+    //   M6 = `hiddenStateMutation` recomputed from the CONSERVATIVE
+    //         `_hasHiddenStateSubst` (the pre-review head's predicate) — reddens the
+    //         read-only rows below, i.e. the false-block class findings 1/2 named
+    //   M4 = a WORKTREE EXEMPTION RE-ADDED to `hiddenBranchStateRefusal` — the
+    //         non-vacuity arm for the worktree + cross-repo + bought-exemption rows.
+    //         MEASURED: every one of them is ADMITTED under it. That mutant is not
+    //         hypothetical — TWO exemption designs were measured open by
+    //         fresh-context review before this head (session-cwd, then span
+    //         attribution); the rows are the pin against a third.
+    // Every mutant was APPLIED to a copy of index.ts and the whole suite re-run;
+    // the row names state what each one does to them. A row that CANNOT vary under
+    // any of them says so and names why (refused by an arm this change only
+    // feeds), rather than borrowing a mutant it was measured green under — the
+    // fabricated-discriminator failure #3442 exists to stop.
+    // The rows run in Part B's OWN hub (`repo`, baseline `main` recorded at B9pre
+    // by the registered session_start), NOT in a second fixture. The guard records
+    // ONE baseline per pid (`if (state && !baselines.has(pid))`), so a second
+    // session_start cannot re-point it at another repo — MEASURED: with a fresh
+    // fixture the carve-out refused every row with "this rename runs in a
+    // different checkout than the one that recorded this session's baseline"
+    // (repoKey mismatch), i.e. each row would have exercised the WRONG arm.
+    // PLACEMENT is load-bearing for the same reason: this block sits where the hub
+    // is still clean+main — B8h/B8i write untracked files into it, B7 dirties it,
+    // and M4 freezes every git op on a disordered hub.
+    const g607 = (c, cwd = repo) => execSync(c, { cwd, stdio: "ignore" });
+    // FOREIGN branches the adversarial rows rename/force-create onto. `victim` sits
+    // at a DISCRIMINATING commit (its own commit, not `main`'s tip), so a clobber
+    // would be visible in the repo, not only in the verdict.
+    g607("git checkout -q -b tmpVictim607 && printf 'v\\n' > v607.txt && git add v607.txt && git commit -qm victim607 && git checkout -q main && git branch victim tmpVictim607 && git branch -D tmpVictim607");
+    g607("git branch feat/other main");
+    expect(`#607 fixture: the hub is clean on main (branches: ${execSync("git branch --format='%(refname:short)'", { cwd: repo, encoding: "utf8" }).trim().split("\n").sort().join(",")})`,
+      execSync("git status --porcelain", { cwd: repo, encoding: "utf8" }).trim(), "");
+
+    /** Restore the session baseline to `main` between rows that ADMIT a move.
+     *  LOAD-BEARING, not hygiene: an admitted ceremony re-baselines the session
+     *  (the command is never actually run here), and every later rename row keys
+     *  on `baseline.branch` — a stale one would refuse the next row for the WRONG
+     *  reason and make it a vacuous lock. `git checkout main` is the #376
+     *  return-to-original, which re-baselines on BOTH the correct code and the M2
+     *  mutant, so it is the neutral restore. */
+    const restore607 = async (after) => {
+      const r = await callBash("git checkout main");
+      expectTrue(`#607 harness control: the baseline is re-established after ${after}`,
+        r === undefined, `handler returned ${JSON.stringify(r)}`);
+    };
+    const expect607Block = async (name, command, mutant) => {
+      const v = await callBash(command);
+      expectTrue(name, !!v && v.block === true, `handler returned ${JSON.stringify(v)}` + (mutant ? ` [${mutant}]` : ""));
+      return v;
+    };
+    const expect607Allow = async (name, command) => {
+      const v = await callBash(command);
+      expectTrue(name, v === undefined, `handler returned ${JSON.stringify(v)}`);
+    };
+
+    // ── (2) the hidden-payload class — every row here ALLOWED before the fix ──
+    const hidSubst = await expect607Block(
+      "#607 hidden: a `$(…)` branch-state payload is REFUSED (no visible mutation in the command) [mutant: M1] — MEASURED: M1 admits it (undefined)",
+      'echo "$(git branch -Mq main victim)"', "mutant M1");
+    expectTrue("#607 hidden: the refusal names its own issue and the visibility reason (an agent must be able to act on it)",
+      !!hidSubst && /#607/.test(hidSubst.reason ?? "") && /hidden|hides/.test(hidSubst.reason ?? "")
+      && /using-git-worktrees/.test(hidSubst.reason ?? ""),
+      `reason=${JSON.stringify(hidSubst?.reason ?? "")}`);
+    await expect607Block(
+      "#607 hidden: the BACKTICK spelling is refused [mutant: M1] — MEASURED: M1 admits it",
+      'echo "`git branch -Mq main victim`"', "mutant M1");
+    await expect607Block(
+      "#607 hidden: the `eval` spelling is refused [mutant: M1] — MEASURED: M1 admits it",
+      "eval 'git branch -Mq main victim'", "mutant M1");
+    await expect607Block(
+      "#607 hidden: a hidden SWITCH payload is refused [mutant: M1] — MEASURED: M1 admits it",
+      'echo "$(git checkout -q feat/other)"', "mutant M1");
+    await expect607Block(
+      "#607 hidden: a hidden FORCE-CREATE payload is refused [mutant: M1] — MEASURED: M1 admits it",
+      'echo "$(git branch -fq feat/x main)"', "mutant M1");
+    // The issue's own spelling: a hidden clobber AFTER an M3-SANCTIONED lead. The
+    // lead is allowed on its own (a later row pins that), so only the hidden
+    // payload can refuse this compound.
+    await expect607Block(
+      "#607 hidden: a hidden clobber AFTER a sanctioned own-rename lead is refused [mutant: M1] — MEASURED: M1 admits it",
+      'git branch -M main freeL ; echo "$(git branch -Mq freeL victim)"', "mutant M1");
+    // ⛔ THE REFUSED COMPOUND DID NOT MOVE THE BASELINE (#1144 F3, re-proved on
+    // the new path): the sanctioned lead inside the refused command would have
+    // re-baselined to `freeL`. If the refusal had applied it, the source below
+    // would no longer be the baseline and this row would block for the WRONG
+    // reason — so this row is the control for the one above, and it is
+    // MEASURED-discriminating under a mutant that applies pending re-baselines
+    // on refusal.
+    await expect607Allow(
+      "#607 hidden: a REFUSED compound left the baseline untouched (the follow-up own-rename is still the sanctioned carve-out) [mutant: M8 — apply the pending re-baselines BEFORE the hidden refusal in admitAfterM3; MEASURED: it re-baselines the refused lead and this row then blocks as a foreign source]",
+      "git branch -M main afterRefusalX");
+    await restore607("the refused-compound baseline control (baseline `afterRefusalX` → `main`)");
+    // A payload the extractor CAN enumerate is still gated on its own merits (the
+    // pre-existing #265/#598 refusal) — this change must not become the only thing
+    // standing between an interpreter-inline payload and a foreign ref.
+    await expect607Block(
+      "#607 hidden: an ENUMERATED `sh -c` payload is still refused by the M3 arm (enumeration is untouched)",
+      "git branch -M main free4 ; sh -c 'git branch -Mq free4 victim'");
+
+    // ── (3) mid-command baseline propagation — the false block the issue names ──
+    await expect607Allow(
+      "#607 ceremony: rename own baseline away and BACK is ALLOWED (the false block this issue names) [mutants: M2, M3] — MEASURED: both block it",
+      "git branch -M main tmpA && git branch -M tmpA main");
+    await restore607("the rename-back ceremony (baseline `main` → `main`)");
+    await expect607Allow(
+      "#607 ceremony: rename own baseline away, then to a FREE name, is ALLOWED [mutant: M2] — MEASURED: M2 blocks it (segment 2 is judged against `main`)",
+      "git branch -M main tmpB && git branch -M tmpB doneB");
+    await restore607("the rename-to-free ceremony (baseline `doneB` → `main`)");
+    await expect607Allow(
+      "#607 ceremony: a three-segment chain that ends on the original name is ALLOWED [mutants: M2, M3] — MEASURED: both block it",
+      "git branch -M main c1 && git branch -M c1 c2 && git branch -M c2 main");
+    await restore607("the three-segment ceremony");
+
+    // ── the LAUNDER must stay closed on the NEW path (the risk this change carries) ──
+    await expect607Block(
+      "#607 launder: own-rename lead + FOREIGN clobber tail is BLOCKED [mutant: M3i] — MEASURED: M3i admits it",
+      "git branch -M main freeX && git branch -M freeX victim", "mutant M3i");
+    await expect607Block(
+      "#607 launder: own-rename lead + FOREIGN rename SOURCE is BLOCKED (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i — decideM3 refuses the foreign source itself)",
+      "git branch -M main tmpC && git branch -M feat/other tmpC");
+    await expect607Block(
+      "#607 launder: own-rename lead + FOREIGN force-create tail is BLOCKED (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i — the force arm refuses the foreign target itself)",
+      "git branch -M main tmpE && git branch -fq feat/other main");
+    await expect607Block(
+      "#607 launder: own-rename lead + FOREIGN switch tail is BLOCKED (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i — the switch arm refuses it itself)",
+      "git branch -M main tmpF && git checkout feat/other");
+    await expect607Block(
+      "#607 launder: a propagated chain that ENDS on a foreign ref is BLOCKED — mid-command freedom is own-lineage only (regression pin, no single mutant: MEASURED GREEN under M1/M2/M3/M3i)",
+      "git branch -M main d1 && git branch -M d1 d2 && git branch -M d2 victim");
+    // Baseline stability across the BLOCKED launder rows: none of them may have
+    // moved the session (they were refused), so a plain own-rename still passes.
+    await expect607Allow(
+      "#607 launder: the refused launder rows left the baseline untouched (follow-up own-rename still allowed)",
+      "git branch -M main afterLaunderX");
+    await restore607("the launder baseline control (baseline `afterLaunderX` → `main`)");
+
+    // ── negative controls: the refusal is NOT a blanket substitution block ────
+    await expect607Allow("#607 scope: `$(git branch --show-current)` is a READ-ONLY substitution → ALLOWED",
+      'echo "$(git branch --show-current)"');
+    await expect607Allow("#607 scope: `$(git rev-parse HEAD)` → ALLOWED", 'echo "$(git rev-parse HEAD)"');
+    await expect607Allow("#607 scope: `$(git status --porcelain)` → ALLOWED", 'echo "$(git status --porcelain)"');
+    // #607 scope, at the PREDICATE (review finding 3): the prose row used to assert
+    // ALLOW for `git commit --allow-empty -m "git branch -M main x"`, which rides the
+    // M2 commit-ownership arm and cannot vary under ANY mutant of this diff — a
+    // control for a path this change does not touch. Assert the flag itself instead
+    // (the pure-JS classifier is importable with zero deps, so this needs no fixture).
+    const { classifyGitCommandDetailed: classify607 } = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
+    expectTrue("#607 predicate: prose that merely MENTIONS a rename sets NO hidden-state flag",
+      classify607('git commit --allow-empty -m "git branch -M main x"').hiddenStateMutation === false,
+      JSON.stringify(classify607('git commit --allow-empty -m "git branch -M main x"').hiddenStateMutation));
+    // #607 review finding 1: `symbolic-ref` is argument-aware — one positional is a
+    // READ (git-symbolic-ref(1)), two write. Both the flag and the shape are pinned.
+    expectTrue("#607 predicate: `$(git symbolic-ref --short HEAD)` (a documented READ) is NOT a hidden mutation",
+      classify607('git commit -m "wip on $(git symbolic-ref --short HEAD)"').hiddenStateMutation === false,
+      JSON.stringify(classify607('git commit -m "wip on $(git symbolic-ref --short HEAD)"').hiddenStateMutation));
+    expectTrue("#607 predicate: a TWO-positional `symbolic-ref` DOES write, so it IS a hidden mutation (the read narrowing is not blanket)",
+      classify607('echo "$(git symbolic-ref HEAD refs/heads/main)"').hiddenStateMutation === true,
+      JSON.stringify(classify607('echo "$(git symbolic-ref HEAD refs/heads/main)"').hiddenStateMutation));
+    expectTrue("#607 predicate: `update-ref <ref>` alone is a USAGE ERROR (rc 129, moves nothing) — not a hidden mutation; `--stdin`/`<ref> <new>` are",
+      classify607('echo "$(git update-ref refs/heads/x)"').hiddenStateMutation === false
+      && classify607('echo "$(git update-ref --stdin)"').hiddenStateMutation === true
+      && classify607('echo "$(git update-ref refs/heads/x HEAD)"').hiddenStateMutation === true,
+      "update-ref arity narrowing is wrong");
+
+    // ── NO worktree exemption — and this is the SECOND attempt at one ────────
+    // ATTEMPT 1 exempted a session whose cwd resolved to a worktree, on the
+    // premise "the payload runs at the shell cwd". ATTEMPT 2 attributed the
+    // payload's SPANS instead. Both were measured OPEN by fresh-context review:
+    //   1) the premise is false — a payload carries its OWN repo hints, so from a
+    //      lane worktree `echo "$(git -C <hub> branch -Mq main victim)"` executed
+    //      rc 0 and clobbered the hub's `victim` tip (bfdb30ae -> 4c90be9b);
+    //   2) the attribution was BUYABLE — `hiddenStateMutation` also fires from arms
+    //      that produce NO span (`__unverifiable__`/`eval $VAR`, `$(<file)`,
+    //      `-c alias.x=…`, `GIT_CONFIG_PARAMETERS`), so ONE benign substitution in
+    //      the same command paid for an exemption of an unattributable payload:
+    //      `echo "$(git rev-parse HEAD)"; eval $PAYLOAD` was ADMITTED from a
+    //      worktree.
+    // So the exemption is GONE: an unenumerable branch-state mutation is refused in
+    // EVERY session, and the remedy is the one that works — run it directly (which
+    // in a worktree is a visible mutation and exempt as before). The rows below are
+    // the anti-regression pins for both attempts; `M4` = a worktree exemption
+    // RE-ADDED (the pre-fix form), which admits them.
+    const wt607 = join(tmp, "wt607");
+    execSync(`git worktree add -q "${wt607}" -b wt/x607 HEAD`, { cwd: repo, stdio: "ignore" });
+    process.chdir(wt607);
+    await expect607Block("#607 worktree: a hidden branch-state payload in a WORKTREE session is REFUSED [mutant: M4] — MEASURED: M4 admits it",
+      'echo "$(git branch -Mq wt/x607 wt/y607)"', "mutant M4");
+    await expect607Allow("#607 worktree: the DIRECT (visible) own-rename in a worktree is still exempt (the remedy the refusal names)",
+      "git branch -M wt/x607 wt/y607");
+    const xRepo = await expect607Block(
+      "#607 cross-repo: a payload carrying its own `-C <hub>` is REFUSED from a WORKTREE session [mutant: M4] — MEASURED pre-attempt-2: ALLOWED, the hub's `victim` clobbered rc 0",
+      `echo "$(git -C ${repo} branch -Mq main victim)"`, "mutant M4");
+    expectTrue("#607 cross-repo: the refusal NAMES the payload-owns-its-repo reason (not a blanket substitution ban)",
+      !!xRepo && /worktree/i.test(xRepo.reason ?? "") && /-C|--git-dir/i.test(xRepo.reason ?? ""),
+      `reason=${JSON.stringify(xRepo?.reason ?? "")}`);
+    await expect607Block(
+      "#607 cross-repo: the same reach via `--git-dir=<hub>/.git` is REFUSED [mutant: M4]",
+      `echo "$(git --git-dir=${repo}/.git branch -Mq main victim)"`, "mutant M4");
+    await expect607Block(
+      "#607 cross-repo: a `cd <hub>` chain inside the payload is REFUSED [mutant: M4] — the payload's own cd, not the session's",
+      `echo "$(cd ${repo} && git branch -Mq main victim)"`, "mutant M4");
+    await expect607Block(
+      "#607 cross-repo: a static `eval` payload naming the hub is REFUSED [mutant: M4]",
+      `eval 'git -C ${repo} branch -Mq main victim'`, "mutant M4");
+    // ⛔ THE REVIEW'S P1, PINNED THREE WAYS: a benign span must not BUY an
+    // exemption for an unattributable payload. Each of these was ADMITTED under
+    // attempt 2 (no mutant of THIS head re-admits them — the attribution that could
+    // be bought no longer exists; they are the regression pins for its return).
+    // ⛔ MEASURED CORRECTION to the review's first example: `eval $PAYLOAD` (and
+    // `eval "$PAYLOAD"`, and `$CMD` indirection) does NOT set `hiddenStateMutation`
+    // at all on this head — the flag is false for all three, so that spelling was
+    // never admitted by a buyable exemption. It is a SEPARATE, PRE-EXISTING gap in
+    // `_hasHiddenStateSubst` (filed as its own issue, not claimed fixed here), and
+    // pinning it as "refused" would be a fabricated row — so the row is the two
+    // spellings that DO fire the flag, above and below.
+    await expect607Block(
+      "#607 bought-exemption: a benign substitution must not exempt an ALIAS payload in the same command [mutant: M4] — MEASURED: M4 admits it (review P1)",
+      `echo "$(git rev-parse HEAD)"; git -c alias.x='git branch -fq victim main' x`);
+    await expect607Block(
+      "#607 bought-exemption: a benign substitution must not exempt an alias payload in the same command [mutant: M4] — MEASURED: M4 admits it (review P1)",
+      `git -c alias.br='git -C ${repo} branch -fq victim main' br; echo "$(git rev-parse HEAD)"`);
+    // ⛔ MEASURED again, and this flipped: `$(<file)` is INERT TEXT until something
+    // evals it (bash's read optimization), so the precise predicate does not treat
+    // it as a branch-state mutation at all — refusing it was one of the false blocks
+    // review finding 1 named. It is ALLOWED now, and that is deliberate.
+    await expect607Allow(
+      "#607 read-only: `$(<file)` (inert file text, no eval) is ALLOWED — refusing it was a false block (review finding 1)",
+      'echo "$(< /tmp/not-a-repo-claim.txt)"');
+    await expect607Block(
+      "#607 bought-exemption: alias indirection with no resolvable span is REFUSED from a worktree (#805) [mutant: M4] — MEASURED: M4 admits it",
+      "git -c alias.br='git branch -fq victim main' br");
+    // ── PROCESS SUBSTITUTION — read-only bodies are ALLOWED, mutating bodies are not.
+    // ⚠️ RECORD CORRECTION: an intermediate revision of this block concluded, from ONE
+    // spelling, that the read-only-proc-subst finding was "⛔ DO NOT APPLY". That was
+    // over-broad and the next review showed why — a body containing a `)` in quotes or
+    // a nested `$(…)` WAS refused. The rows below are the class-level pin, and they are
+    // the reason the DO NOT APPLY is gone rather than left standing.
+    await expect607Allow(
+      "#607 proc-subst: a READ-ONLY proc-subst (`git diff --stat <(git log …)`) is ALLOWED (the paren-free control)",
+      "git diff --stat <(git log --oneline -1)");
+    await expect607Block(
+      "#607 proc-subst: a MUTATING proc-subst (`<(git branch -Mq a b)`) is REFUSED — the flag genuinely fires here",
+      "git diff --stat <(git branch -Mq a b)");
+    // ⛔ AND the READ-ONLY proc-subst class is `ABSENT HERE`, not "also present
+    // elsewhere" (round-2 review's correction, which round 3 answered from ONE
+    // spelling). The `procRe` prefix bug made every body containing a `)` in quotes
+    // or a nested `$(…)` fire; the precise predicate closes it. Both spellings:
+    await expect607Allow(
+      "#607 proc-subst: a read-only body containing a `)` in quotes is ALLOWED (the round-3 `DO NOT APPLY` was over-broad — closed now)",
+      "git diff --stat <(git log --format='%h (%s)' -1)");
+    await expect607Allow(
+      "#607 proc-subst: a read-only body with a NESTED `$(…)` is ALLOWED",
+      "git log --oneline <(git rev-list --max-count=1 HEAD --not $(git rev-list --all))");
+    await expect607Block(
+      "#607 proc-subst: executable TEXT fed to a shell (`bash <(echo 'git branch -Mq …')`) is still REFUSED — the broad rule survives where it is the only evidence",
+      "bash <(echo 'git branch -Mq victim main')");
+
+    // ⛔ ROUND-5 FINDING (order-dependent fail-open in the PRECISE predicate): its memo
+    // used to be keyed on span TEXT alone, so a payload first seen as INERT (`$(…)`)
+    // suppressed its later EXECUTABLE (`<(...)`) scan of the same text. MEASURED then:
+    // inert-first → false (ADMITTED, and the shell runs it, `victim` clobbered rc 0)
+    // while exec-first → true. Both orders are now refused (memo keyed on
+    // (context, text)) and the inert half alone is still the ALLOW control.
+    // ── ROUND-4 FINDING 1: SINGLE-QUOTED text is INERT — the shell expands nothing
+    // inside `'…'`, so a payload being DISCUSSED in a commit message is not a payload.
+    // MEASURED before this fix: all three rows below were REFUSED, in a worktree
+    // session, on the ordinary `git commit` a lane runs while fixing this very issue.
+    // The double-quoted twin is the discriminator (it DOES expand, so it stays refused).
+    await expect607Allow(
+      "#607 quoting: a payload inside a SINGLE-quoted commit message is ALLOWED (bash expands nothing there) [mutant: M9] — MEASURED: M9 refuses it",
+      `git commit -m 'fix(guard): refuse $(git branch -Mq main victim) (#607)'`);
+    await expect607Allow(
+      "#607 quoting: a payload inside single-quoted BACKTICKS in a message is ALLOWED [mutant: M9] — MEASURED: M9 refuses it",
+      "git commit -m 'docs: `git branch -Mq main victim` is now refused'");
+    await expect607Allow(
+      "#607 quoting: a QUOTED heredoc body fed to `git commit -F -` is ALLOWED (literal to the outer shell) [mutant: M9b — the quoted-heredoc strip removed] — MEASURED pre-fix: refused",
+      "git commit -F - <<'EOF'\nfix(guard): refuse $(git branch -Mq main victim) (#607)\nEOF");
+    await expect607Block(
+      "#607 quoting: the DOUBLE-quoted twin is still REFUSED — it really does expand",
+      'git commit -m "fix(guard): refuse $(git branch -Mq main victim) (#607)"');
+    await expect607Block(
+      "#607 order: same text inert-then-executable is REFUSED (the memo is keyed on context, not text alone) [mutant: M7] — MEASURED: M7 reverts to text-only keying and admits it",
+      "y=$(echo 'git branch -Mq victim main'); bash <(echo 'git branch -Mq victim main')");
+    await expect607Block(
+      "#607 order: the same pair exec-then-inert is REFUSED too (symmetry pin: cannot vary under M7 — with a text-only memo this order was ALREADY true; it varies under M1)",
+      "bash <(echo 'git branch -Mq victim main'); y=$(echo 'git branch -Mq victim main')");
+    await expect607Allow(
+      "#607 order: the inert half ALONE is the control — an echo into a variable mutates nothing",
+      "y=$(echo 'git branch -Mq victim main')");
+
+    // ── #607 review finding 1: read-only shapes that must NOT be refused ──────
+    // Each of these was ADMITTED on main and REFUSED by the previous head (the
+    // conservative `hiddenStateSubst` flags), leaving an unhatched lane blocked
+    // with a remedy it had already followed. The precise predicate is what makes
+    // them pass, so M6 (consume `hiddenStateSubst` instead) reddens all of them.
+    await expect607Allow(
+      "#607 read-only: a commit message naming the branch (`$(git symbolic-ref --short HEAD)`) is ALLOWED [mutant: M6] — MEASURED: M6 refuses it",
+      'git commit -m "wip on $(git symbolic-ref --short HEAD)"');
+    await expect607Allow(
+      "#607 read-only: capturing the branch into `$BR` then pushing it is ALLOWED [mutant: M6] — MEASURED: M6 refuses it",
+      'BR="$(git symbolic-ref --short HEAD)"; git push origin "$BR"');
+    await expect607Allow(
+      "#607 read-only: a `$VAR` command word holding a read is ALLOWED [mutant: M6] — MEASURED: M6 refuses it",
+      'G="git log --oneline"; $G');
+    // The HANDLER refuses this one at the pre-existing #709 discard gate ("alias-shell",
+    // effect unverifiable) — not at this PR's refusal — so the honest assertion is the
+    // predicate: `#607` must not fire on a shell alias that only READS.
+    expectTrue("#607 read-only: a `!`-prefixed shell alias whose value READS is NOT a hidden branch-state mutation [mutant: M6] — MEASURED: M6 fires on it",
+      classify607("git -c alias.lg='!git log --graph' lg").hiddenStateMutation === false,
+      JSON.stringify(classify607("git -c alias.lg='!git log --graph' lg").hiddenStateMutation));
+
+    // ── #607 round-5 FINDING 1 (P1, category A — FAIL-OPEN): an apostrophe in a `#`
+    // COMMENT. bash recognizes comments BEFORE it tracks quotes, so `# don't` is a
+    // comment whose apostrophe is LITERAL; the round-4 collector treated it as an
+    // opening quote that ran to end of input and swallowed every span after it.
+    // MEASURED at `2e0b3ab7d`: the two block rows below were `hiddenStateMutation ===
+    // false` → ADMITTED from a worktree, `victim` clobbered / branch switched rc 0 —
+    // a category-A bypass of the exact class #607 closes, on the class's own subject
+    // matter (an apostrophe any lane writes in `# don't …`).
+    // The trailing-comment row is the mirror image: text AFTER `#` is inert, so
+    // refusing it was a false block whose printed remedy the command already obeyed.
+    await expect607Block(
+      "#607 comment: an apostrophe in a `#` comment does not swallow the payload after it (`$(git checkout -q …)` still REFUSED) [mutant: M10 — the comment projection removed] — MEASURED at 2e0b3ab7d: ADMITTED",
+      `# it's fine\necho "$(git checkout -q feat/other)"`);
+    await expect607Block(
+      "#607 comment: same, for a CLOBBER payload after `# don't` [mutant: M10] — MEASURED at 2e0b3ab7d: ADMITTED, `victim` clobbered rc 0",
+      `# don't\necho "$(git branch -Mq main victim)"`);
+    await expect607Allow(
+      "#607 comment: a payload spelled INSIDE a trailing `#` comment is INERT — ALLOWED [mutant: M10 — comment text was scanned] — MEASURED at 2e0b3ab7d: REFUSED",
+      "echo ok # $(git branch -Mq main victim)");
+    // Predicate-level controls, so neither handler row above can be satisfied by an
+    // unrelated arm (the refusal, the M3 gate and the legacy arms all live behind the
+    // same return, and only the predicate says WHICH one fired).
+    expectTrue("#607 comment: predicate — the post-comment payload still sets `hiddenStateMutation` [mutant: M10] — MEASURED at 2e0b3ab7d: false",
+      classify607(`# don't\necho "$(git branch -Mq main victim)"`).hiddenStateMutation === true,
+      JSON.stringify(classify607(`# don't\necho "$(git branch -Mq main victim)"`).hiddenStateMutation));
+    expectTrue("#607 comment: predicate — comment text sets nothing, apostrophe or not [mutant: M10] — MEASURED at 2e0b3ab7d: true",
+      classify607("echo ok # $(git branch -Mq main victim)").hiddenStateMutation === false,
+      JSON.stringify(classify607("echo ok # $(git branch -Mq main victim)").hiddenStateMutation));
+    expectTrue("#607 comment: predicate — the SAME apostrophe does not excuse an executable `<(...)` payload on the next line [mutant: M10] — MEASURED at 2e0b3ab7d: false",
+      classify607(`# don't\nbash <(echo 'git branch -Mq victim main')`).hiddenStateMutation === true,
+      JSON.stringify(classify607(`# don't\nbash <(echo 'git branch -Mq victim main')`).hiddenStateMutation));
+    // ⛔ FOUND while fixing finding 1, in this fix's OWN first cut: an ANSI-C
+    // `$'…'` literal may contain an ESCAPED quote (`$'it\'s …'`). Treated as an
+    // ordinary single-quoted region it ended at the escaped quote, so a later `#` on
+    // the same line blanked the rest — including a LIVE payload after it. MEASURED:
+    // false (ADMITTED) without the ANSI-C arm, true with it. Pinned so the arm cannot
+    // be dropped again.
+    await expect607Block(
+      "#607 comment: an ANSI-C literal's ESCAPED quote does not end the region early — a LIVE payload later on the same line is still REFUSED [mutant: M13 — the ANSI-C arm removed] — MEASURED: ADMITTED without it",
+      `echo $'it\\'s # x' ; echo "$(git branch -Mq main victim)"`);
+
+    // ── #607 round-5 FINDING 2 (P2 — over-block): the alias arm judged the VERB and
+    // not the args, and the eval/alias passes scanned raw source so SINGLE-QUOTED
+    // prose still fired. Both are false blocks on shapes `main` admitted, in a
+    // worktree session, with the remedy "run it directly" — which they already did.
+    // 2a: a READ value must be judged WITH its call-site args (`_argAwareBranchStateMutation`
+    // exists one function above precisely because a verb is not the effect).
+    expectTrue("#607 alias: a READ value (`alias.b='branch --list' b`) is NOT a hidden mutation [mutant: M11 — first word alone] — MEASURED at 2e0b3ab7d: true (refused)",
+      classify607("git -c alias.b='branch --list' b").hiddenStateMutation === false,
+      JSON.stringify(classify607("git -c alias.b='branch --list' b").hiddenStateMutation));
+    expectTrue("#607 alias: same for a `symbolic-ref --short` value + a `HEAD` call-site arg [mutant: M11] — MEASURED at 2e0b3ab7d: true (refused)",
+      classify607("git -c alias.s='symbolic-ref --short' s HEAD").hiddenStateMutation === false,
+      JSON.stringify(classify607("git -c alias.s='symbolic-ref --short' s HEAD").hiddenStateMutation));
+    // …and the DISCRIMINATOR that keeps 2a's fix from failing open: git APPENDS the
+    // call-site args, so a value that reads on its own can still carry the mutation.
+    expectTrue("#607 alias: the call-site args are still APPENDED (`alias.x='branch --no-color' x -Mq victim main` is a mutation) [mutant: M11b — call-site args dropped] — MEASURED: dropping them makes this false",
+      classify607("git -c alias.x='branch --no-color' x -Mq victim main").hiddenStateMutation === true,
+      JSON.stringify(classify607("git -c alias.x='branch --no-color' x -Mq victim main").hiddenStateMutation));
+    // 2b: single-quoted prose DESCRIBING a payload. The `$(…)` twin was closed in
+    // round 4; these two spellings were left open because only the collector was
+    // masked, not the `eval`/alias passes. The existing `#607 bought-exemption: alias
+    // indirection …` row (`alias.br='git branch -fq victim main'`) is the control that
+    // stays REFUSED — its match starts OUTSIDE the quotes.
+    await expect607Allow(
+      "#607 quoting: single-quoted prose DESCRIBING an alias is ALLOWED (the eval/alias passes skip inert regions) [mutant: M12 — raw-source scan] — MEASURED at 2e0b3ab7d: REFUSED",
+      `git commit -m 'note: git -c alias.x="branch -fq a b" is the trick'`);
+    await expect607Allow(
+      "#607 quoting: single-quoted prose DESCRIBING an `eval` is ALLOWED [mutant: M12] — MEASURED at 2e0b3ab7d: REFUSED",
+      `git commit -m 'see eval "git branch -Mq a b" in the repro'`);
+    expectTrue("#607 quoting: predicate — the alias value is judged even when it is single-quoted at the CALL SITE (the match starts outside the `-c`) [mutant: M12] — MEASURED: `alias.br='branch -fq victim main'` stays true",
+      classify607("git -c alias.br='branch -fq victim main' br").hiddenStateMutation === true,
+      JSON.stringify(classify607("git -c alias.br='branch -fq victim main' br").hiddenStateMutation));
+
+    // ── FINAL-REVIEW P0 (category A — FAIL-OPEN): an UNQUOTED heredoc body.
+    // bash expands `$(…)` in an unquoted body but parses NEITHER quotes NOR comments
+    // there, so one apostrophe in the body opened a phantom single-quoted region that
+    // ran to end of input and swallowed the payload after it. MEASURED at `624d369e6`:
+    // `hiddenStateMutation === false` → ADMITTED, and bash expands the body (probe-
+    // verified: the branch is renamed and `main` is gone afterwards). `git commit -F -`
+    // and "don't" in a commit body are ORDINARY lane traffic.
+    await expect607Block(
+      "#607 heredoc: an apostrophe in an UNQUOTED heredoc body does not swallow the payload (REFUSED) [mutant: M14 — the unquoted-body mask removed] — MEASURED at 624d369e6: ADMITTED, branch renamed rc 0",
+      "git commit -F - <<EOF\nfix: don't $(git branch -Mq wt/x607 wt/y607)\nEOF");
+    const hd1 = await expect607Block(
+      "#607 heredoc: the same body inside `$(cat <<EOF … EOF)` is REFUSED [mutant: M14] — MEASURED at 624d369e6: ADMITTED",
+      'git commit -m "$(cat <<EOF\nfix: don\'t $(git branch -Mq wt/x607 wt/y607)\nEOF\n)"');
+    expectTrue("#607 heredoc: the refusal is the #607 one, not an unrelated arm (attribution, #3442)",
+      !!hd1 && /#607/.test(hd1.reason ?? "") && /hidden|hides/.test(hd1.reason ?? ""),
+      `reason=${JSON.stringify(hd1?.reason ?? "")}`);
+    await expect607Block(
+      "#607 heredoc: an apostrophe body does not swallow a LATER line's payload either [mutant: M14] — MEASURED at 624d369e6: ADMITTED",
+      "cat <<EOF\ndon't\nEOF\necho \"$(git branch -Mq wt/x607 wt/y607)\"");
+    // `#` in an unquoted body is a LITERAL character (bash writes `x # HI`, probe-
+    // verified), so the comment stripper must not blank the payload after it.
+    await expect607Block(
+      "#607 heredoc: a `#` in an UNQUOTED heredoc body does not blank the payload after it (it is literal text, not a comment) [mutant: M14] — MEASURED: false without the mask",
+      "cat <<EOF\nx # $(git branch -Mq wt/x607 wt/y607)\nEOF");
+    await expect607Allow(
+      "#607 heredoc: a QUOTED heredoc body stays ALLOWED (nothing expands there) — the mask must not reach it",
+      "git commit -F - <<'EOF'\nfix: don't $(git branch -Mq wt/x607 wt/y607)\nEOF");
+    await expect607Allow(
+      "#607 heredoc: an unquoted body with NO payload is still ALLOWED (the mask is not a blanket heredoc block)",
+      "git commit -F - <<EOF\nplain message, nothing hidden\nEOF");
+    expectTrue("#607 heredoc: predicate — the apostrophe body sets the flag; the quoted twin does not [mutant: M14]",
+      classify607("git commit -F - <<EOF\nfix: don't $(git branch -Mq main victim)\nEOF").hiddenStateMutation === true
+      && classify607("git commit -F - <<'EOF'\nfix: don't $(git branch -Mq main victim)\nEOF").hiddenStateMutation === false,
+      JSON.stringify(classify607("git commit -F - <<EOF\nfix: don't $(git branch -Mq main victim)\nEOF").hiddenStateMutation));
+
+    // ── FINAL-REVIEW P1 — REFUTED BY MEASUREMENT, and pinned so it stays that way.
+    // The review read `gateOneMutation`'s worktree exemption (`if (m2Eff.isWorktree &&
+    // !m2Eff.unresolvedTarget) return undefined;`) as a command-level admission that
+    // skips `admitAfterM3()`, and therefore the #607 refusal. It is not: that
+    // `return undefined` means "this MUTATION is exempt", and every caller of
+    // `gateMutations()` returns through the funnel — `return admitAfterM3();` at the
+    // allowance arm, the push-delete arm and the M2 arm (index.ts). A worktree
+    // COMMIT/PUSH carrying a hidden payload is refused, measured below; the rows exist
+    // because no worktree COMMIT/PUSH row did (the suite exercised `git branch` only,
+    // which returns through the M3 loop).
+    const f1 = await expect607Block(
+      "#607 funnel: a worktree COMMIT carrying a hidden payload is REFUSED (the M2 worktree exemption is per-MUTATION, not command-level) [mutant: M1] — MEASURED: this is the review's P1, and it does not reproduce",
+      'git commit -m "$(git branch -Mq wt/x607 wt/y607)"', "mutant M1");
+    expectTrue("#607 funnel: the worktree COMMIT refusal is the #607 one (attribution, #3442) — the M2 worktree arm is not a command-level admission",
+      !!f1 && /#607/.test(f1.reason ?? "") && /hidden|hides/.test(f1.reason ?? ""),
+      `reason=${JSON.stringify(f1?.reason ?? "")}`);
+    await expect607Block(
+      "#607 funnel: a worktree PUSH carrying a hidden payload is REFUSED too [mutant: M1]",
+      'git push origin "$(git branch -Mq wt/x607 wt/y607)"', "mutant M1");
+
+    // ── PREVIOUS REVIEW FINDING 1 (P1, category A — FAIL-OPEN): ANSI-C `$'…'` with an
+    // ESCAPED quote desynchronised `_singleQuotedRanges`, which then ran to end of
+    // input and made every later `eval` / `-c alias.` match look like prose.
+    // MEASURED at `624d369e6`: false (ADMITTED) while the `$'it s'` control was true.
+    await expect607Block(
+      "#607 quoting: an ANSI-C literal's ESCAPED quote does not disable the EVAL pass [mutant: M16 — the ANSI-C arm removed from `_singleQuotedRanges`] — MEASURED at 624d369e6: ADMITTED",
+      `echo $'it\\'s' ; eval "git branch -Mq wt/x607 wt/y607"`);
+    await expect607Block(
+      "#607 quoting: same desync, against the ALIAS pass [mutant: M16] — MEASURED at 624d369e6: ADMITTED",
+      `echo $'it\\'s' ; git -c alias.x='branch -fq wt/y607 wt/x607' x`);
+    await expect607Allow(
+      "#607 quoting: an ANSI-C commit message with no payload stays ALLOWED (the ANSI-C arm is not a blanket block) — `$'…'` expands nothing",
+      `git commit -m $'note: it\\'s fine'`);
+    expectTrue("#607 quoting: predicate — the escaped-quote form and its control BOTH fire (the desync was the only difference) [mutant: M16]",
+      classify607(`echo $'it\\'s' ; eval "git branch -Mq main victim"`).hiddenStateMutation === true
+      && classify607(`echo $'it s' ; eval "git branch -Mq main victim"`).hiddenStateMutation === true,
+      JSON.stringify(classify607(`echo $'it\\'s' ; eval "git branch -Mq main victim"`).hiddenStateMutation));
+
+    // ── PREVIOUS REVIEW FINDING 2 (P1, category A — FAIL-OPEN): `)` CONTINUES a word
+    // in bash (`echo $(date)#x` prints `<date>#x`), so it is not a comment delimiter.
+    // Treating it as one blanked the live tail after a substitution.
+    // MEASURED at `624d369e6`: false (ADMITTED) while the `;` control was true.
+    await expect607Block(
+      "#607 comment: a mid-word `#` after `)` is a WORD CONTINUATION, not a comment — the tail's payload is REFUSED [mutant: M15 — `)` restored to the comment-delimiter class] — MEASURED at 624d369e6: ADMITTED",
+      "echo $(date)#x; eval 'git branch -Mq wt/x607 wt/y607'");
+    await expect607Block(
+      "#607 comment: same, against the ALIAS pass [mutant: M15] — MEASURED at 624d369e6: ADMITTED",
+      "echo $(date)#x; git -c alias.x='branch -fq wt/y607 wt/x607' x");
+    await expect607Allow(
+      "#607 comment: a GENUINE comment after `)` (whitespace before the `#`) still blanks its tail — ALLOWED",
+      "echo $(date) #x; eval 'git branch -Mq wt/x607 wt/y607'");
+    expectTrue("#607 comment: predicate — `)`-mid-word fires and the whitespace-separated comment does not [mutant: M15]",
+      classify607("echo $(date)#x; eval 'git branch -Mq main victim'").hiddenStateMutation === true
+      && classify607("echo $(date) #x; eval 'git branch -Mq main victim'").hiddenStateMutation === false,
+      JSON.stringify(classify607("echo $(date)#x; eval 'git branch -Mq main victim'").hiddenStateMutation));
+    process.chdir(repo);
+
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
     // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE
     // script whose only path-shaped content is a markdown code span inside a
@@ -893,6 +1531,7 @@ async function partB() {
       /script location: a linked worktree/.test(wtBlock.reason ?? "") &&
       !/checkout-hygiene\/hub-worktree\.sh/.test(wtBlock.reason ?? ""),
       `reason=${JSON.stringify(wtBlock?.reason ?? "")}`);
+
 
     // ── B8f/B8g/B8h: #1129 sanctioned-framework-script exemption ──
     // The framework's OWN mandated preflight is exempted from the content walk
@@ -974,6 +1613,7 @@ async function partB() {
       (carveOutBlocked.length
         ? ` — but ${carveOutBlocked.length} of writes 1..25 were BLOCKED (${carveOutBlocked.slice(0, 2).join(" | ")}), so this boundary shifted instead of failing (#768)`
         : ""));
+
   } catch (e) {
     expectTrue("B: part B ran without throwing", false, String(e?.message ?? e).slice(0, 200));
   } finally {
@@ -1235,5 +1875,7 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, decl
 
 await partC();
 
-console.log(`\n${fail === 0 ? "✅" : "❌"} test-module-load: ${pass} passed, ${fail} failed, ${skip} skipped`);
+// agent-infra#2723 — emit through the shared emitter so the failing arm always
+// carries the `runner::test-module-load` identity the merge rail reads.
+reportVerdict("test-module-load", pass, fail, { skip });
 process.exit(fail === 0 ? 0 : 1);

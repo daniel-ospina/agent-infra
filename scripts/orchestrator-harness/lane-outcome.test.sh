@@ -574,7 +574,16 @@ for _g in load disk land fork capability skew key mem; do
   has "$_fmt" "\`$_g\`" "4e …and the FORMAT contract names the \`$_g\` gate (a consumer built from it cannot fold it)"
 done
 has "$_fmt" "EIGHT refusal gates" "4e …and the COUNT agrees with the list (it said SIX beside seven names, then SEVEN beside eight)"
-_ret="$(head -n 80 "$(dirname "$LANE")/chain-merge.sh" | grep -n '^cap_refusal_gate()')"
+# ⛔ LOCATE THE DECLARATION BY NAME, NOT BY LINE NUMBER (agent-infra#2095). This read used to be
+# `head -n 80 … | grep -n '^cap_refusal_gate()'`, which gave the three arms below a SECOND, unstated
+# precondition: that no unrelated change ever pushes the function past line 80. #2095 adds lines of
+# comment above it (the work-root split) and moved the declaration 75 → 81, at which point `_ret` went
+# EMPTY and all three arms failed — a red ABOUT A POSITION, reported as a red about the return
+# contract, inside a suite nobody suspects because `bash-suites` reds are routinely attributed to the
+# base. The property these arms assert is "the contract line names the gate its `case` dispatches on",
+# and the contract lives ON the declaration line; position was never part of it. Same class as the
+# #2095 P0: an assertion that silently encoded a positional assumption the diff never mentioned.
+_ret="$(grep -n '^cap_refusal_gate()' "$(dirname "$LANE")/chain-merge.sh" | head -1)"
 for _g in key skew mem; do
   has "$_ret" "$_g" "4e …and chain-merge's return contract names \`$_g\`, which its case arm dispatches on"
 done
@@ -681,6 +690,193 @@ has " $FOUND" "done " "8a the arms produced a 'done' outcome"
 has " $FOUND" "refused " "8b …a 'refused' outcome"
 has " $FOUND" "failed " "8c …a 'failed' outcome"
 has " $FOUND" "died " "8d …a 'died' outcome (all four are reachable, not just declared)"
+
+# ═══ 9. WHO ENDED THE LANE (#2833) — attribution before any work-failure claim ═══════════════
+# MEASURED before the change (this fleet's own logs, 2026-11-11): 53 lanes exited non-zero and ALL 53
+# were `outcome=failed reason=agent-exit-<rc>`, including the 35 (66%) that `lane-bound.sh` had ended at
+# the wall ceiling — every one of those logs already carried `[lane-bound] VERDICT
+# verdict=exceeded-wallclock`. The line the census reads said "the work failed" about lanes that were
+# never allowed to finish, which is the question this issue was filed over.
+#
+# ⛔ TWO KINDS OF ARM, AND THE SPLIT IS STATED BECAUSE THE EARLIER TEXT FLATTENED IT: the behaviour
+# arms REDDEN ON THE PRE-CHANGE TREE, the six over-reach falsifiers stay GREEN there and redden under the
+# opposite mutation. Claiming all of them redden pre-change was FALSE by construction (review finding on
+# this change) and the arithmetic is checkable: `origin/main:scripts/orchestrator-harness/lane.sh:962`
+# calls EVERY non-zero exit `failed agent-exit-<rc>`, and six of these arms ask for exactly that.
+#
+#   * 9a, 9a3/9a3b and 9e are the BEHAVIOUR arms: on the pre-change tree the outputs they demand — `died
+#     reason=transport-unreachable:…`, the operator sentence that names it, and `died
+#     reason=exceeded-wallclock` — are UNREACHABLE, so they go RED there. That is the mutation the issue
+#     asks for, and it was MEASURED, not reasoned: with the attribution block reverted to `else
+#     lane_outcome failed "agent-exit-$rc"`, this suite fails exactly 7 assertions (227 passed, 7 failed)
+#     — 9a (outcome), 9a (reason), 9a2, 9a3, 9a3b, 9e, 9e2 — and 9e's mutated output is the measured
+#     defect verbatim: `outcome=failed reason=agent-exit-143` for a lane the wall ceiling had ENDED.
+#     ⛔ AND THE SAME 7 FAIL AGAINST THE REAL PRE-CHANGE FILE, not only against that reconstruction:
+#     `origin/main`'s own `lane.sh` copied into a scratch tree beside this suite gives 227 passed, 7
+#     failed, the identical seven. So the proof does not rest on the revert being faithful.
+#     9a3/9a3b were added because the fresh-context review of this change at 56123d11f recorded the hole
+#     they close: 9a2 asserts the terminal TOKEN and 9e2 asserts the BOUND branch's sentence, so deleting
+#     the TRANSPORT branch's `echo` reddened NOTHING. MEASURED at this head — deleting that one line from
+#     `lane.sh` gives 232 passed, 2 failed, and the two are exactly 9a3 and 9a3b.
+#   * 9b/9c/9d/9f/9g/9h are OVER-REACH falsifiers: GREEN on the pre-change tree BY CONSTRUCTION (it
+#     called everything `failed`, which is what they ask for). They redden under the OPPOSITE
+#     mutation — a fix that attributes too much — and every row below was RUN against this tree, not
+#     read off the source (mutant → §9 arms that redden):
+#         9b  transport threshold `-ge 0` (attribution unmetered)         → 9b 9c 9d 9g 9h
+#         9c  `LANE_TRANSPORT_MIN_ROTATIONS=1` in the sanitiser's default → 9c
+#         9d  `LANE_AGENT_LOG_OFF` never advances (whole log read)         → 9d (rotations=5, the
+#                                                                            previous run's storm)
+#         9f  `rc = 0` no longer decided first (attribution hoisted)       → 9f
+#         9g  `lane_bound_killer`'s `case` → truthiness test `[ -n "$v" ]` → 9g 9h
+#         9h  `unknown` added to the killer allow-list                     → 9h (`died reason=unknown`)
+#     9b is the broadest: an unmetered transport read converts EVERY non-zero exit into a retryable
+#     death, which is why it reddens five §9 arms at once (and, outside §9, 3b and 8c). That breadth
+#     is the point of the arm — it is the mutation that would make the fix worse than the defect.
+#     9h was reported as CONDITIONAL by that review (it can only discriminate while the fixture's
+#     `unknown` line is the LAST `[lane-bound] VERDICT` in the run, because the read is `tail -1`, and
+#     a reaped watchdog may append its own `verdict=finished`). MEASURED at this head: the allow-list
+#     mutant is caught — 9h fails with `died reason=unknown` — so the fixture's line IS the last one.
+#     The race is real in production but it did not occur here; 9g pins the unconditional half of the
+#     rule (its fixture cannot lose the comparison).
+#     A work failure must NOT become retryable (9b/9c), a PREVIOUS run's connection storm must NOT
+#     classify THIS run (9d), a lane that merely logged a blip and then completed must stay `done`
+#     (9f), and a verdict word that names no bound must not be minted as a killer (9g/9h).
+
+# 9a — the model/provider was unreachable: the agent's own transcript carries the rotations, the exit
+# is not about the work, and the terminal line says RETRYABLE instead of `failed`.
+mk_arm transport; WT="$ARMWT"
+pi() {
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #1)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #2)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #3)\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9a" died "transport-unreachable:rc1:rotations=3" 1
+case "$(lastline)" in
+  outcome=failed*) bad "9a2 a transport death is NOT reported as a work failure (got: '$(lastline)')" ;;
+  *) ok "9a2 …and it is not the work-failure token, which is the whole point: a retryable death read as a failed attempt is the treadmill #2833 measured" ;;
+esac
+
+# 9a3 — THE TRANSPORT BRANCH'S OPERATOR SENTENCE, which had NO WITNESS until this arm. The fresh-context
+# review of this change at 56123d11f recorded it as the one uncovered line: 9a2 asserts the terminal TOKEN
+# and 9e2 asserts the BOUND branch's sentence, so deleting the transport branch's `echo` reddened
+# NOTHING. It is prose behind no gate, but it is the reading that tells an operator "retry this, the item
+# is not implicated" — the remedy this change exists to deliver — so its silent removal must not pass.
+# ⛔ IT CANNOT BE SATISFIED BY THE OTHER BRANCH: 9a's fixture carries no `[lane-bound] VERDICT`, so the
+# transport arm is the only writer here that can emit 'TRANSPORT death'. Measured: deleting that one
+# `echo` from `lane.sh` reddens exactly these two assertions and nothing else.
+LOGTXT9A="$(cat "$(LOG)" 2>/dev/null)"
+has "$LOGTXT9A" 'TRANSPORT death' \
+    "9a3 …and the log names WHICH death this was, so the operator is not left decoding the token"
+has "$LOGTXT9A" 'after 3 connection-pool rotation(s)' \
+    "9a3b …and it reports the count THIS run measured, not a bare claim that it was transport"
+
+# 9b — THE FALSIFIER. A lane whose work failed, with no transport evidence, must NOT become retryable:
+# an automatic retry of a real work failure burns a lane's budget and repeats the same outcome.
+mk_arm workfail; WT="$ARMWT"
+pi() { printf 'the change is wrong\n'; return 1; }
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9b" failed "agent-exit-1" 1
+
+# 9c — THE THRESHOLD'S LOWER EDGE. One or two rotations inside a run that then failed ON ITS OWN WORK is
+# a work failure: a single rotation is a blip that the agent recovered from, and retrying on it is the
+# false-retry direction. Pinned at 2 (one below the default) rather than at 0 so a future default of 1
+# reddens here.
+mk_arm belowthresh; WT="$ARMWT"
+pi() {
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #1)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #2)\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9c" failed "agent-exit-1" 1
+
+# 9d — THE STALE-FLAG DIRECTION, which is the defect this file already closes once for `outcome=`. The
+# lane log is APPEND-ONLY across runs, so a PREVIOUS attempt that died of a connection storm leaves its
+# rotations in the file. Classifying the NEXT run's work failure as transport would silently convert
+# every subsequent real failure of that issue into an endless retry — so the read is RUN-SCOPED.
+mk_arm runsccoped; WT="$ARMWT"
+printf '%s\n' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #1)' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #2)' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #3)' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #4)' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #5)' \
+  > "$(LOG)"
+pi() { printf 'the change is wrong\n'; return 1; }
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9d" failed "agent-exit-1" 1
+
+# 9e — THE BOUND ARM, driven END TO END rather than by hand-writing a verdict line: a real
+# `lane-bound.sh` ends a real lane at a 4 s wall ceiling, and the terminal line must name the bound that
+# killed it instead of claiming a work failure. This is item 4 of #2833 ("the kill reason must name the
+# killer") at the only surface a census reads.
+mk_arm boundkill; WT="$ARMWT"
+pi() { sleep 30; return 0; }
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture" LANE_BOUND_WALL_S=4 LANE_BOUND_POLL_S=1
+ecase="$(lastline)"
+case "$ecase" in
+  "outcome=died reason=exceeded-wallclock"*) ok "9e a lane the wall ceiling ENDED is attributed to the bound, not to its work (got: '$ecase')" ;;
+  *) bad "9e expected outcome=died reason=exceeded-wallclock, got: '$ecase'" ;;
+esac
+has "$(cat "$(LOG)" 2>/dev/null)" 'ATTRIBUTED: the agent exited' \
+    "9e2 …and the log carries the attribution line that tells an operator the bound's own readings are above it"
+
+# 9f — THE OTHER FALSIFIER: rotations that did NOT end the lane. A lane that recovered from a storm and
+# then COMPLETED is `done`, never `died reason=transport-unreachable` — retrying a lane that succeeded is
+# the most wasteful form of this bug.
+mk_arm recovered; WT="$ARMWT"
+pi() {
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #1)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #2)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #3)\n'
+  return 0
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9f" done "agent-exit-0" 0
+
+# 9g — THE THIRD FALSIFIER, AND THE ONE THAT GUARDS THE WORK-FAILURE CLAIM ITSELF: `lane-bound.sh`
+# emits a `VERDICT` line on EVERY path, including `verdict=finished` — the line it writes when the bound
+# watched the agent END ON ITS OWN. `spawn-gate.sh` therefore CLEARS `finished` out of
+# `AGENT_BOUND_VERDICT` ("empty means the agent finished on its own"), and a fallback read that accepts
+# ANY non-empty verdict re-admits exactly the word the caller had filtered: a lane that failed ITS OWN
+# WORK is then recorded `outcome=died reason=finished`, so the work-failure claim this change exists to
+# keep is erased and the census sees a death nothing killed. The arm writes the finishing line the way
+# `lane-bound.sh` writes it (into the lane log, which is what `run_agent` hands it as `--log`); WHICH of
+# the two lands is a race the caller decides (it kills the watchdog the instant the agent's `wait`
+# returns) and this arm pins the CLASSIFICATION for the case the bound wins it — the arm is about the
+# read, not the race.
+mk_arm finishedverdict; WT="$ARMWT"
+pi() {
+  printf '[lane-bound] VERDICT verdict=finished tag=lane-3331 pid=2 rc=na elapsed=1s wall_bound=2400s idle_bound=2700s silent=0s bytes=5 bytes_delta=5 cpu_cs=0 cpu_delta_cs=0 tol_cs=60 cpu_unreadable=0 signal=none\n'
+  printf 'the change is wrong\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9g" failed "agent-exit-1" 1
+
+# 9h — THE SAME ALLOW-LIST, AT ITS OTHER EDGE (the polarity rule this repo applies to every verdict
+# vocabulary): a verdict word nobody recognises is NOT a bound that ended a lane. `lane-bound.sh`'s
+# `verdict_line` defaults the field to `unknown`, so the value is reachable, and reading it as a killer
+# would mint `outcome=died reason=unknown` — a death that names no killer, which is the blindness #2833
+# was filed over, reintroduced by its own fix. Only `stalled` and `exceeded-wallclock` name a bound.
+mk_arm unknownverdict; WT="$ARMWT"
+pi() {
+  printf '[lane-bound] VERDICT verdict=unknown tag=lane-3331 pid=2 rc=na elapsed=1s wall_bound=2400s idle_bound=2700s silent=0s bytes=5 bytes_delta=5 cpu_cs=0 cpu_delta_cs=0 tol_cs=60 cpu_unreadable=0 signal=none\n'
+  printf 'the change is wrong\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9h" failed "agent-exit-1" 1
 
 echo
 if [ "$FAIL" -gt 0 ]; then

@@ -238,6 +238,30 @@ recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
 # the same paid-loop class as the missing recorder itself. Resolved from the harness checkout.
 recorder_lib_path() { printf '%s\n' "$(dirname "$(recorder_path)")/lib/diff-normalize.py"; }
 recorder_lib_src()  { printf '%s\n' "$HARNESS/../lib/diff-normalize.py"; }
+# ── THE LANDING RAIL (#2176) ─────────────────────────────────────────────────────────────────────
+# The record step is only HALF the landing contract. Step 4 is `record-review.sh`; step 5 is the
+# RAIL, `admin-merge.sh` — and a cell that carries the recorder without the rail completes a PAID
+# review, mints a clean record, and then has nothing runnable left to land with. That is the state
+# agent-infra#2176 measured on every Linux cell, and `start` was one of the two ways to reach it:
+# it provisioned `record-review.sh` (and its declared sibling) and NO part of the rail, so a cell
+# whose `$CELL_HOME/.pi/agent/scripts/` came from `start` — rather than from a fresh
+# `pi-bootstrap`/`cell-install` farm pass — could never land, forever, while `cmd_check` certified
+# it "CELL CAN RUN A CONTROLLER".
+#
+# ⛔ THE LIST IS THE RAIL'S OWN CLOSURE, and it is not a guess: `admin-merge.sh` resolves three
+# helpers from `$SELF_DIR` and REFUSES when one is missing (`CFS="$SELF_DIR/ci-failure-set.sh"`,
+# `EXEMPTION_PY="$SELF_DIR/ci_exemption.py"`, `bash "$SELF_DIR/ci-workflow-pr-evaluable.sh"` at its
+# three evaluator call sites), and `ci-failure-set.sh` resolves `ci_exemption.py` beside itself.
+# Delivering `admin-merge.sh` alone ships an executable whose own executables are absent, i.e. a
+# rail that exits 1 on every invocation — the #1552 class, one delivery mechanism over
+# (`pi-bootstrap/setup.sh`'s `merge_gate_srcs` carries the same four for the same reason).
+# ⛔ THE DESTINATION IS FLAT, beside the recorder, matching the farm — the rail resolves its helpers
+# from its OWN directory, so a nested layout would deliver four files and still satisfy nothing.
+# Sources are read from `$HARNESS/..` — the same tree `recorder_src()` reads the recorder from, so
+# the recorder and the rail can never come from two different checkouts.
+rail_names()    { printf '%s\n' admin-merge.sh ci-failure-set.sh ci_exemption.py ci-workflow-pr-evaluable.sh; }
+rail_dest_dir() { printf '%s\n' "$(dirname "$(recorder_path)")"; }
+rail_src_dir()  { printf '%s\n' "$HARNESS/.."; }
 SESSION="${SESSION:-orch}"
 # The doctor loop's tmux session (agent-infra#1989). A NAME of its own, never a prefix of `$SESSION`.
 # ⛔ Every tmux target that names the DOCTOR uses `=name` exact matching, for the reason orch-loop's
@@ -351,9 +375,18 @@ workers_maybe_live() {
 #                        Without it only the controller would be served. ORDER MATTERS: the adapter
 #                        routes every call through the same `$O/gh-limit.py`, so it must resolve first
 #                        or the adapter is never reached (this file's `start` builds exactly that order
-#                        in both carriers — :4103 for the service-mode export, :4131 for the tmux
-#                        string; `lane.sh:83-84` re-asserts it for lanes).
-WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
+#                        in both carriers — the service-mode pair of `export PATH=…:$PATH` lines, gh-limit
+#                        first and gh-rest prepended AFTER it so the later prepend wins, and the tmux
+#                        `new-session` string's `PATH='$O/gh-rest':'$O/gh-limit':`; `lane.sh` re-asserts
+#                        it for lanes). The carriers are named, not line-numbered, because the #2095
+#                        `O`/`O_WORK` merge moved both — the same positional-claim class #2095 retired.
+#   O_WORK             — the HARNESS ROOT, which is a SEPARATE name from `O` (the state dir) since
+#                        #2095. Every worker resolves its own modules (`claims.sh`, `repo-authority.sh`,
+#                        `merge-one.sh`) from it, so a worker that crosses this second tmux boundary
+#                        without it falls back to `$O` — where those files do not exist — and loses
+#                        the landing/head claims SILENTLY (the duplicate-merge exclusion) while the
+#                        cell keeps reporting RUNNING.
+WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O O_WORK DEEPSEEK_API_KEY PATH"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
@@ -3247,9 +3280,12 @@ cmd_check() {
   # `. "$SELF/<f>" || { …; exit 78; }`, so a $O missing one makes EVERY dispatch on the box die at
   # startup — while this list, whose own comment says it exists to prevent exactly that false PASS,
   # certified the box runnable. `key-gate.sh` (#3331) and `lane-env.sh` (#3060) are the two newest;
+  # `controller-state.sh` (#2095) is the SAME class one degree sharper: `orch-loop.sh` sources it before
+  # its first cycle and `exit 78`s without it, so a $O that predates the change — or is half-synced —
+  # has the CONTROLLER stop on every tick while this check certifies "CELL CAN RUN A CONTROLLER".
   # `brief-gate.sh` (#2258) and `wt-lifecycle.sh` (#2033) are older instances of the same class and were
   # equally absent, so they are added with it rather than left as the next thing to be found by hand.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh controller-state.sh gh-auth.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
@@ -3464,6 +3500,22 @@ cmd_check() {
     die "diff-normalize.py MISSING (or not a regular file, or empty) at $reclib — record-review.sh resolves it as its own sibling, and without it every base-only update re-pays for a fresh review. 'start' provisions it from $(recorder_lib_src), or: mkdir -p '$(dirname "$reclib")' && cp '$(recorder_lib_src)' '$reclib' && chmod +x '$reclib'"
   fi
   log_line "ok: record step present and executable ($rec, with $(recorder_lib_path))"
+
+  # …and step 5 (#2176). Judged as a CLOSURE, not as one file: a rail missing any helper it execs
+  # is a rail that exits 1 on every invocation, so "admin-merge.sh exists" is not the property this
+  # certification needs — "the rail can run" is. Regular, non-empty and EXECUTABLE for each, for the
+  # same reasons the recorder is judged that way one paragraph up: `[ -x ]` is true for a directory,
+  # and a zero-byte file is executable and silently does nothing.
+  local rdir rname rpath rmissing=""
+  rdir="$(rail_dest_dir)"
+  for rname in $(rail_names); do
+    rpath="$rdir/$rname"
+    if [ ! -f "$rpath" ] || [ ! -s "$rpath" ] || [ ! -x "$rpath" ]; then rmissing="$rmissing $rname"; fi
+  done
+  if [ -n "$rmissing" ]; then
+    die "the LANDING RAIL is incomplete under $rdir — missing, empty or non-executable:$rmissing. Step 4 (record-review.sh) can mint a clean record but step 5 (admin-merge.sh) has no runnable path, so every lane on this cell would finish its review and stall at the last step (agent-infra#2176). 'start' provisions all four from $(rail_src_dir), or: for f in $(printf '%s ' $(rail_names)); do cp '$(rail_src_dir)/'\"\$f\" '$rdir/'; chmod +x '$rdir'/\"\$f\"; done"
+  fi
+  log_line "ok: landing rail present and executable (admin-merge.sh + ci-failure-set.sh + ci_exemption.py + ci-workflow-pr-evaluable.sh under $rdir)"
 
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
@@ -4143,6 +4195,29 @@ cmd_start() {
     mv -f "$ltmp" "$rlib" || { rm -f "$ltmp"; die "cannot install the provisioned normalizer at $rlib"; }
     log_line "provisioned record-step library: $rlibsrc -> $rlib"
   fi
+  # ── the LANDING RAIL (#2176) ─────────────────────────────────────────────────────────────────────
+  # Provisioned here for the same reason, on the same rule, as the recorder above: it is a hard
+  # dependency of the ONLY landing path, and `start` is the one verb that runs on every cell launch,
+  # so it is the only delivery that reaches a cell that was INSTALLED before the farm carried the
+  # rail (a cell-install pass is not re-run by `apply`). Absent-or-empty only — a complete operator
+  # copy is never clobbered — atomic tmp+mv so a concurrent reader cannot observe a half-written
+  # rail, and `chmod +x` because the lane TYPES `admin-merge.sh <PR>`.
+  # ⛔ NOT optional and not best-effort: a rail source that is missing means the harness checkout is
+  # not a full agent-infra checkout, and a cell certified in that state lands nothing (see cmd_check).
+  local rdir rsrc_f_dir rname rdest rtmp2
+  rdir="$(rail_dest_dir)"; rsrc_f_dir="$(rail_src_dir)"
+  for rname in $(rail_names); do
+    rdest="$rdir/$rname"
+    [ -f "$rdest" ] && [ -s "$rdest" ] && [ -x "$rdest" ] && continue
+    [ -e "$rdest" ] && [ ! -f "$rdest" ] && die "$rdest exists but is not a regular file — remove it, then re-run 'start'"
+    mkdir -p "$rdir" || die "cannot create $rdir"
+    rtmp2="${rdest}.tmp.$$"
+    cp -p "$rsrc_f_dir/$rname" "$rtmp2" 2>/dev/null \
+      || { rm -f "$rtmp2"; die "$rname missing at $rsrc_f_dir and cannot provision the landing rail to $rdest — the harness checkout must be a full agent-infra checkout (agent-infra#2176: without the rail a lane can review and record but never land)"; }
+    chmod +x "$rtmp2" || { rm -f "$rtmp2"; die "cannot make $rdest executable"; }
+    mv -f "$rtmp2" "$rdest" || { rm -f "$rtmp2"; die "cannot install the provisioned rail file at $rdest"; }
+    log_line "provisioned landing rail: $rsrc_f_dir/$rname -> $rdest"
+  done
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
   # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.
@@ -4698,6 +4773,70 @@ cmd_stop() {
   [ "$rc" -eq 0 ] || return 1
   return 0
 }
+# ── the DECISION GATE's credential (agent-infra#2642) — READ-ONLY, and it names the repairer ──
+# `ask-owner.py` is the gate that decides whether a lane's question earns the `owner-decision` label —
+# the queue the owner actually reads. With no TypeSafe/JEV credential it exits 2 on EVERY question,
+# which is honest and SILENT: the comment is posted and readable, the lane's report says "asked", and
+# nothing reaches the queue. Measured 2026-10-24 on a cell: nine questions posted, none queued.
+#
+# ⛔ READ-ONLY HERE, AND THAT IS THE DESIGN — the WRITER is
+# `cloud-cell-bringup.sh::check_decision_gate`, which materialises the 0600 store from the box's OWN
+# `keys.env` and REFUSES a box it cannot fill (the same one-writer rule as the provider store above:
+# two writers of one secret is how a repaired box and a certified box drift apart). This verb judges
+# and names the one command that repairs.
+# ⛔ AND IT JUDGES THE **FILE**, NOT THIS SHELL. A lane sources `$ENV_FILE` itself, while an export in
+# an operator's shell reaches no worker (tmux serves a session the SERVER's environment — the rule
+# this file already applies to AI_REVIEW_GATE_KEY and DEEPSEEK_API_KEY). So a key that lives only in
+# this shell is reported as the near-miss it is, never as configured.
+# The variable names and their order are the SAME ones `ask-owner.py::_key()` reads, deliberately
+# duplicated for the reason the provider table states: both scripts are pushed STANDALONE onto a cell.
+jev_state_line() {
+  local cfg k infile=0
+  cfg="${CELL_HOME:-$HOME}/.pi/agent/jev-config.json"
+  if [ -f "$ENV_FILE" ]; then
+    # Probed in a SUBPROCESS, like KEY_IN_FILE/TORTOISE_IN_FILE above: `status` must not run an
+    # operator's keys.env into its own shell.
+    # ⛔ TRIMMED, BECAUSE A WHITESPACE-ONLY VALUE IS NOT A KEY (#2642 review). The pre-fix probe tested
+    # `-n` alone, so `TYPESAFE_API_KEY="   "` in keys.env — what an operator leaves behind after
+    # blanking a key — printed `jev: configured … ask-owner.py can score a question` while
+    # `ask-owner.py::_key()` strips and REJECTS the same value, so every question exits 2 and NOTHING
+    # reaches the queue. This is the same acceptance rule the bring-up (`jev_key_var` /
+    # `keys_env_has_value`) and this function's own store arm already apply; only this arm was loose.
+    [ "$(env -u TYPESAFE_API_KEY -u JEV_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; { [ -n "${TYPESAFE_API_KEY//[[:space:]]/}" ] || [ -n "${JEV_API_KEY//[[:space:]]/}" ]; } && printf x' _ "$ENV_FILE" 2>/dev/null)" = x ] && infile=1
+  fi
+  if [ "$infile" = 1 ]; then
+    printf 'jev: configured (%s carries the TypeSafe key) — ask-owner.py can score a question, so it reaches the owner queue\n' "$ENV_FILE"
+    return 0
+  fi
+  if [ -f "$cfg" ]; then
+    # ONE LINE, NO `\n` ESCAPES: a multi-line `python3 -c` inside `$( … )` needs either a real
+    # newline in the source or a heredoc, and this repo's bash 3.2 refuses a quoted heredoc inside a
+    # double-quoted assignment (see STORE_STATE_PY). A store that will not parse prints nothing, which
+    # reads as "no key" here — the BRING-UP is where `unreadable` is its own, distinct refusal.
+    # ⛔ THE SAME ACCEPTANCE RULE AS THE GATE AND THE BRING-UP (#2642 review): truthiness stringified
+    # a non-string into a false `configured`. `ask-owner.py::_key()` returns the RAW JSON value and
+    # `jev()` sends `Bearer {key}`, so a number, object, array or `true` is not a credential — it takes
+    # the unkeyed branch or 401s, and every question is UNSCORED. `isinstance(…, str)` is the type
+    # test `cloud-cell-bringup.sh::write_jev_store` already makes; both surfaces must answer alike
+    # because an operator reads them as one verdict.
+    k="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));k=d.get("apiKey") if isinstance(d,dict) else None;print(k if isinstance(k,str) else "")' "$cfg" 2>/dev/null)"
+    if [ -n "$(printf '%s' "$k" | tr -d '[:space:]')" ]; then
+      printf 'jev: configured (%s, mode %s) — ask-owner.py can score a question, so it reaches the owner queue\n' "$cfg" "$(stat -c '%a' "$cfg" 2>/dev/null || stat -f '%Lp' "$cfg" 2>/dev/null || echo unknown)"
+      return 0
+    fi
+  fi
+  # ⛔ TRIMMED FOR THE SAME REASON AS THE FILE PROBE ABOVE: a blank ambient export is not a key, so it
+  # is the MISSING line's business, not this near-miss's (the remedy here — "put it in the FILE" — is
+  # not what the operator needs to do with an empty variable).
+  if [ -n "$(printenv TYPESAFE_API_KEY 2>/dev/null | tr -d '[:space:]')$(printenv JEV_API_KEY 2>/dev/null | tr -d '[:space:]')" ]; then
+    printf '⛔ jev: a TypeSafe key is set in THIS shell but NOT in %s — a lane sources the FILE, so a worker may have no key. Put TYPESAFE_API_KEY=<the key> in %s and re-run the bring-up.\n' "$ENV_FILE" "$ENV_FILE"
+    return 0
+  fi
+  printf '⛔ jev: MISSING — neither %s nor %s carries a TypeSafe key, so ask-owner.py exits 2 on every question and NOTHING reaches the owner queue (posted is not queued). Repair: put TYPESAFE_API_KEY=<the key> in %s, then run: bash %s/cloud-cell-bringup.sh --check (it writes %s, mode 600).\n' \
+    "$ENV_FILE" "$cfg" "$ENV_FILE" "$(dirname "${BASH_SOURCE[0]:-$0}")" "$cfg"
+  return 0
+}
+
 cmd_status() {
   local cpids own foreign
   # ⛔ NOT HERE — the ceiling line goes LAST in this verb (review P2). Two callers read the HEAD of
@@ -4999,6 +5138,9 @@ cmd_status() {
   # surface, and the census is the one read that is right on both.) An unreadable census prints
   # UNKNOWN, never 0.
   log_line "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
+  # agent-infra#2642 — the owner-question gate. Printed (read-only) so the state the cell silently sat
+  # in — a decision gate that cannot fire — is answered by the one verb an operator runs.
+  log_line "$(jev_state_line)"
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
   # the fix for the measured "a dead loop looks identical to an idle cell".
@@ -5218,18 +5360,41 @@ cmd_apply() {
   safe_argv "${HARNESS_PIN_FILE:-}" || die "\$HARNESS_PIN_FILE must not contain a quote or shell metacharacter"
   local before_c; before_c="$(harness_commit)"
   # Same authority as `start`/`status`: a controller outside the session still owns the harness tree
-  # this verb is about to replace, so the tmux session is not sufficient (#1761).
-  if [ "$force" != 1 ]; then
+  # this verb is about to SEED, so the tmux session is not sufficient (#1761).
+  #
+  # ⛔ THE GUARD BELONGS TO THE SEEDING PATH — `--pin-only` IS EXEMPT (agent-infra#2738). What this
+  # guard protects is `seed_and_stamp` below: it rewrites `$O/<worker>.sh` underneath a LIVE loop, so
+  # the loop is the OLD `$O/orch-loop.sh` while the helpers it calls are the new ones — a version skew
+  # no other path in this repo produces. `--pin-only` returns BEFORE that call, so it cannot produce
+  # the skew: `harness_apply` pins a per-commit worktree at `$HARNESS_PIN_DIR/<sha12>` and re-points
+  # `$HARNESS_PIN_FILE` at it, and the controller keeps executing the `$O` it was launched from.
+  # ⛔ REFUSING IT WAS THE BUG, and it was measured: 2026-10-24 19:05Z on pi-cell-3
+  # (`vm-915c3930…`) the pin record named `709ceb911b03` while `/tmp/cell-home/harness/` held only
+  # `d4ccaf6ee8e6`, the pin the live controller was executing — so the cell could not have been
+  # started from its own record. Repairing the record is EXACTLY this no-skew path, and the guard
+  # refused it; the only route left was `--force`, which bypasses the guard on the SEEDING path too.
+  # So the refusal taught an operator the one flag that defeats the guard everywhere, and `--force`
+  # stopped distinguishing "harmless pin-only" from "re-seed `$O` under a live loop". Exempting the
+  # flag here is what makes `--force` mean ONE thing again, and it makes the message below able to
+  # name the verb a live cell actually has.
+  if [ "$pin_only" != 1 ] && [ "$force" != 1 ]; then
     live="$(seen_controller_pids)" \
       || die "cannot read the process table (ps) — refusing to replace the harness tree on an unreadable read"
     # ⛔ THE REFUSAL IS RIGHT EVEN WHEN THE CONTROLLER IS ANOTHER REPO'S, and the message says so:
     # the harness tree is SHARED across repos on one machine, so replacing it changes the code a peer
     # repo's controller is running. The false-block direction is a real cost (the owner's second
     # half), so name the pid, say it may not be yours, and give the remedy rather than implying
-    # `stop` will clear it.
-    [ -z "$live" ] || die "a controller is RUNNING (pid $(_pids_join "$live")) — possibly another repo's, from this cell's shared harness path — and apply would replace the harness tree under it; 'stop' it from its own state dir, or re-run with --force"
+    # `stop` will clear it. ⛔ AND NAME `--pin-only` AS THE NON-DESTRUCTIVE REMEDY: a message that
+    # offers only 'stop' and `--force` is what made the operator reach for the flag that defeats the
+    # guard (agent-infra#2738).
+    # ⛔ SINGLE QUOTES, NEVER BACKTICKS, around a command in a `die` string: a backticked span inside
+    # double quotes is COMMAND SUBSTITUTION, so the message would RUN the verb it is recommending and
+    # splice its output into the refusal — measured while writing this arm (the refusal printed a real
+    # `harness PINNED:` block and advanced the pin as a side effect). Same class as the commit-message
+    # rule in AGENTS.md, and just as silent.
+    [ -z "$live" ] || die "a controller is RUNNING (pid $(_pids_join "$live")) — possibly another repo's, from this cell's shared harness path — and re-seeding would replace the harness tree under it. If you only need to advance the PIN, run '$0 apply --pin-only' (it never touches the running loop); to 'stop' it, use its own state dir; to seed under it anyway, re-run with --force"
     tmux has-session -t "$SESSION" 2>/dev/null \
-      && die "a controller is RUNNING (tmux '$SESSION') and apply would replace the harness tree under it — 'stop' first, or re-run with --force"
+      && die "a controller is RUNNING (tmux '$SESSION') and re-seeding would replace the harness tree under it — '$0 apply --pin-only' if you only need the pin advanced, else 'stop' first, or re-run with --force"
   fi
   harness_apply
   # ⛔ `--pin-only` IS THE PATH A RUNNING CELL USES TO ADVANCE WITHOUT VERSION SKEW (agent-infra#2215).
@@ -5241,11 +5406,17 @@ cmd_apply() {
   # So the per-cycle self-refresh advances the pin with `--pin-only`, and the next `start` seeds $O from
   # the NEW pin (start calls seed_and_stamp) — one cycle of "pinned ahead, running behind", disclosed
   # as `restart-pending`, and never a mixed pair of script versions in one loop.
+  # ⛔ AND SINCE agent-infra#2738 THE GUARD ABOVE DOES NOT RUN ON THIS PATH: the two statements — the
+  # comment saying a live cell advances through `--pin-only`, and the guard refusing exactly that —
+  # asserted two different contracts about one flag. The guard now covers the seeding path only, which
+  # is the one it can actually protect, so an operator (and the harness-apply pass, whose unit went RED
+  # every ten minutes on a healthy box for this) can reach this arm without `--force`.
   if [ "$pin_only" = 1 ]; then
     log_line "harness PINNED: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
     log_line "  path:   $HARNESS"
     log_line "  ref:    $HARNESS_REF in $HARNESS_REPO"
     log_line "  record: $HARNESS_PIN_FILE (seed NOT updated: 'start' re-seeds \$O from this pin, so running code never mixes two harness commits)"
+    log_line "  a live controller is unaffected: this path never touches \$O (agent-infra#2738)"
     return 0
   fi
   seed_and_stamp

@@ -126,10 +126,24 @@ QUEUE_PAGE=100
 # makes the fallback ABLE to help: a run with no queued job has nothing to schedule onto the pool.
 # The scan is BOUNDED because each candidate costs one jobs read on the repo's `actions:read` surface.
 # Ghosts accumulate at the OLD end (they never start while newer runs come and go), which is both
-# where they are and where the age comes from; 5 covers the measured population (3 on agent-infra, 3
-# on tortoise) with headroom. A queue whose whole scan window is ghosts while MORE runs are still
-# queued behind it is refused rather than guessed at (see the scan in `evaluate`).
-QUEUE_HEAD_SCAN_MAX="${CI_GATE_QUEUE_HEAD_SCAN_MAX:-5}"
+# where they are and where the age comes from — so the bound must exceed the LIVE ghost population or
+# every pass refuses. ⛔ IT WAS 5, ON THE MEASUREMENT "3 on agent-infra, 3 on tortoise with headroom",
+# AND THAT MEASUREMENT DID NOT HOLD (agent-infra#3995, measured 2026-11-12T03:43Z): tortoise's queue
+# carried **14 consecutive job-less runs** at the head of the gate's own candidate list (2026-11-11
+# 20:49:45Z…20:53:24Z, `jobs: 0` on every one), so a 5-run window refused on EVERY pass —
+# `beyond the 5-run scan window`, no verdict written for 15 h (the verdict file still said `queued=83`
+# against a live queue of 238), and the `local → github` release unreachable. The SAME script with
+# `CI_GATE_QUEUE_HEAD_SCAN_MAX=25` measured the queue on the same minute. 25 is that population with
+# ~1.8x headroom; the cost is one jobs read per skipped ghost, on a pass whose cadence is minutes.
+# ⛔ THE POPULATION GROWS (3 a week earlier → 14), so if this refuses again the answer is to raise the
+# bound HERE — the default — and never to treat the refusal as "no demand". ⛔ AND NOT BY SETTING THE
+# ENV KNOB ON THE DEPLOYED COPY: the farmed `~/.pi/agent/scripts/ci_runner_gate.sh` is overwritten by
+# `pi-bootstrap/setup.sh` on sync, and the launchd job carries only HOME and PATH by design (an added
+# key is a red assertion in `ci_runner_gate.test.sh`), so the only durable route is this default; a
+# hand run with the env override raises the bound for THAT pass alone.
+# A queue whose whole scan window is ghosts while MORE runs are still queued behind it is refused
+# rather than guessed at (see the scan in `evaluate`).
+QUEUE_HEAD_SCAN_MAX="${CI_GATE_QUEUE_HEAD_SCAN_MAX:-25}"
 # ── the THROUGHPUT (absorption) leg — agent-infra#2904 ─────────────────────────────────────────
 # ⛔ LENGTH IS NOT ABSORPTION. `queued` below the length threshold says "not a stampede"; it cannot
 # say "work is moving".
@@ -909,9 +923,9 @@ print(comp, len(inc))
         # The candidate list ENDED before the queue did: a truncated read, not an empty one. The
         # wording is "readable run row(s)" because the list may be the PAGE's rows or the single
         # candidate synthesised from a body that carried only a head id.
-        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing"; return 2
+        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
       else
-        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing"; return 2
+        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"; return 2
       fi
     fi
     # No ghost/depth re-check here: the contradiction was refused above for both outcomes, and the

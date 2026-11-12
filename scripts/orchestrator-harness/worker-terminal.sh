@@ -1081,6 +1081,22 @@ wt_launcher_env() {
     printf '; unset GH_CONFIG_DIR XDG_CONFIG_HOME'
   fi
   [ -n "${O:-}" ] && printf '; export O=%s' "$(wt_q "$O")"
+  # ⛔ AND THE WORK ROOT, WHICH IS A SEPARATE NAME ON A STATE-DIR INSTANCE (#2095; fresh-context
+  # review of #3846, P1). `O` is the controller's STATE dir and `O_WORK` is the harness root, so with
+  # only `O` handed over a tmux-launched worker resolves `_FIX_MOD_DIR`/`_M1_MOD` to the STATE dir:
+  # `fix-one.sh` then skips its whole cross-box claim block with no line at all (`-f "$dir/claims.sh"`
+  # has no `else`) and 127s its re-review; `merge-one.sh` skips BOTH the landing claim and the head
+  # claim the same silent way. That is the duplicate-merge exclusion, lost and unlogged.
+  # ⛔ BOTH DIRECTIONS, exactly like the `GH_CONFIG_DIR` block above and for the same measured reason:
+  # a pane inherits the tmux SERVER's environment, so an OLD controller's leftover `O_WORK` would
+  # point this worker at a different tree — the inverse of the bug. A caller that never set it gets
+  # the pre-#2095 behaviour (`$O`), which is what §7's "unchanged for a caller that never set O_WORK"
+  # arm asserts.
+  if [ -n "${O_WORK:-}" ]; then
+    printf '; export O_WORK=%s' "$(wt_q "$O_WORK")"
+  else
+    printf '; unset O_WORK'
+  fi
   # ⛔ A BLANK VALUE IS NOT A CREDENTIAL, AND THE CLEAR MUST SEE WHAT THE SOURCE WROTE (P1 review
   # finding, 2026-10-23, MEASURED): the pre-source clear could not, so a `keys.env` re-introducing
   # `GH_TOKEN='   '` survived on every arm whose post-source check did not fire. Both names, because gh
@@ -1316,24 +1332,76 @@ wt_tree_probe() { # stdin: `cmux tree --json`; stdout: "w:<worker>"|"t:<terminal
 # `term<TAB><terminal-id>` for its `wt-<name>` workspace. Needed because the census counts a worker
 # whose RECORD is gone (a wiped $O/state, a lane from an older harness) — and a reap that cannot
 # resolve that worker leaves it holding a slot forever while logging "could NOT be proven gone".
+# ⛔ AND ITS `liveness` MODE IS WHAT THE SWEEP READS (agent-infra#2312). The default shape answers
+# "which surfaces belong to this worker"; the daemon happily offers SEVERAL workspaces for one name,
+# and a close that resolves only the recorded one leaves the rest unreachable for ever. So the sweep
+# needs the same parse with the ONE fact the default shape drops — whether each workspace still holds
+# a RUNNING terminal — as `ws<TAB><id><TAB>live|idle|empty`. THREE values, not two: a workspace with
+# no terminal at all is a create IN FLIGHT (or a create that failed before its surface existed), and
+# folding it into `idle` would let a sweep delete the workspace another spawn is about to fill.
 # ⛔ FUNCTION BODY, NOT AN INLINE HEREDOC IN THE SUBSTITUTION — see the bash 3.2 note above (#2248).
+# ⛔ AND IT STAYS ONE PROGRAM: a second module-level `WT_*_PY` variable has to be added to
+# orch-loop.sh's startup guard (and to the test that pins that guard's exact text) or a macOS 3.2
+# mis-parse that empties it turns the sweep into a silent no-op — an enforcer that never fires.
 _wt_ws_py_body() { cat <<'PY'
 import json,sys
 name=sys.argv[1]
+mode=sys.argv[2] if len(sys.argv)>2 else ""
 try:
     d=json.load(sys.stdin)
 except Exception:
     sys.exit(3)
+if mode=="liveness" and not isinstance(d.get("terminals"),list):
+    # A DELETION DECISION IS NOT TAKEN ON A SHAPE THIS PROGRAM CANNOT READ.
+    sys.exit(3)
 ws={w.get("id"):(w.get("name") or "") for w in d.get("workspaces",[]) or []}
 tabs={t.get("id"):t.get("content_id") for t in d.get("tabs",[]) or []}
+# ⛔ A RECORD THAT DOES NOT STATE LIVENESS IS NOT AN EXITED ONE (review rounds 2 and 3).
+# `bool(t.get("running"))` mapped an ABSENT key to `False`, i.e. to "this terminal exited", so a build
+# that renamed the field (`"state": "running"`, measured) made every tab read as NOT RUNNING; and testing
+# only for key PRESENCE still let a value that states NOTHING (`null`, `""`) fall through `bool()` to the
+# same `False` (measured: `running:null` and `running:""` both ran `workspace rm`). Both then satisfied
+# the accounting below and assigned `idle` — the ONE value the sweep DELETES on — for a workspace that may
+# be live. The census tolerates an absent key in the SAFE direction elsewhere (`wt_tree_probe` reads it
+# dead, which costs a re-spawn); on the deletion path it must be UNREADABLE, so anything that is not a
+# boolean or a number is `None` and `exit(3)` is taken below. 0/1 stays READABLE on purpose: a numeric
+# encoding is a plausible build difference, and folding it into `None` would turn this sweep into an
+# enforcer that can never fire.
+def _live(v):
+    if isinstance(v,bool):
+        return v
+    if isinstance(v,(int,float)):
+        return bool(v)
+    return None
+run={t.get("id"):_live(t.get("running")) for t in d.get("terminals",[]) or []}
 seen=[]
+# ⛔ LIVENESS MODE IS PER WORKSPACE, NOT PER SCREEN (agent-infra#2312 fix-round review, reproduced).
+# `screens` is MANY-TO-ONE on `workspace_id` — a workspace holds panes/tabs, each carrying its own
+# `screen_id` in the upstream model, and this module's own default shape already dedupes a workspace
+# through `seen` for exactly that reason. Printing one verdict PER SCREEN made the sweep act on a row
+# that is not a workspace: a workspace whose s1 held a RUNNING terminal and whose s2 held an EXITED one
+# emitted `ws <id> idle`, and `wt_sweep_idle_workspaces` ran `cmux workspace rm` on a LIVE lane — the one
+# thing this file says it never does, printed as "their terminals had ALL exited". It also double-counted
+# a purely idle workspace (two screens ⇒ two `rm` calls and "asked the daemon to remove 2" for one).
+# So: the MOST PROTECTIVE verdict over a workspace's screens wins (`live` > `empty` > `idle`, and any
+# unreadable screen exits 3 before anything is printed), and ONE row per workspace is emitted.
+lv={}
+LV_ORDER=["idle","empty","live"]   # index = strength; a workspace keeps the STRONGEST one
+
 def add(k,v):
     if v and (k,v) not in seen: seen.append((k,v))
 for s in d.get("screens",[]) or []:
     wid=s.get("workspace_id") or ""
-    if ws.get(wid,"") != name:
+    wname=ws.get(wid,"")
+    # ⛔ THE PREFIX IS REQUIRED, AND AN EMPTY NAME MEANS "EVERY `wt-*`" (the sweep's whole-registry
+    # form). Without both, an empty name matched only workspaces with NO name — a guaranteed no-op that
+    # reads exactly like "nothing to free". Every caller passes a real `wt-<name>` today, so the
+    # prefix test changes no existing answer; it only stops a future caller's typo from addressing a
+    # workspace this launcher never made.
+    if not wname.startswith("wt-"):
         continue
-    add("ws",wid)
+    if name and wname != name:
+        continue
     ids=[]
     stack=[((s.get("layout") or {}).get("root") or {})]
     while stack:
@@ -1341,8 +1409,48 @@ for s in d.get("screens",[]) or []:
         if not isinstance(n,dict): continue
         ids.extend(n.get("tab_ids") or [])
         stack.extend(n.get("children") or [])
+    if mode=="liveness":
+        if not ids:
+            st="empty"
+        else:
+            # ⛔ AN ACCOUNTING, NOT A TYPE (agent-infra#2312 review P1). Proving `terminals` is a LIST
+            # says nothing about the tabs a screen NAMES: `run.get(tabs.get(t) or "", False)` answers
+            # "not running" for a tab whose content_id has NO terminal record, so a document that is
+            # type-valid but does not account for its own tabs (a drifted `terminals[]`/id shape across
+            # a cmux upgrade — the header already records that the id shape differs between builds — or a
+            # partial `terminals: []`) read EVERY workspace as `idle`, and the sweep then ran
+            # `cmux workspace rm` on workspaces that may hold a RUNNING lane. That is the one thing this
+            # file says it never does, and the `live` arm of the suite cannot see it because it builds a
+            # resolvable `terminals` list. So a screen whose tabs do NOT all resolve to a terminal record
+            # is UNREADABLE (exit 3, the same answer as a document that will not parse), never `idle`. The
+            # MEASURED idle shape still resolves (`running:false` records PRESENT — 124 of 134 workspaces
+            # on the cell this change was measured on), so the case the sweep exists for keeps working
+            # and the drift case removes nothing instead of removing everything.
+            recs=[run.get(tabs.get(t) or "") for t in ids]
+            # A resolved RUNNING record is decisive on its own — a lane is live whatever else the
+            # document does or does not account for.
+            if any(recs):
+                st="live"
+            elif any(r is None for r in recs):
+                # …and `idle` is the only value that DELETES, so it requires the FULL accounting: every
+                # tab resolved to a terminal record, none of them running. Anything less is `exit(3)`,
+                # the same answer as a document that will not parse. This is also what makes the swept
+                # line's claim ("their terminals had ALL exited") true of the document it read, instead
+                # of an assertion about tabs the census never mentioned.
+                sys.exit(3)
+            else:
+                st="idle"
+        keep=lv.get(wid)
+        if keep is None or LV_ORDER.index(st) > LV_ORDER.index(keep):
+            lv[wid]=st
+        continue
+    add("ws",wid)
     for t in ids:
         add("term",tabs.get(t))
+if mode=="liveness":
+    for wid_ in sorted(lv):
+        print("ws\t%s\t%s" % (wid_,lv[wid_]))
+    sys.exit(0)
 for k,v in seen:
     print("%s\t%s" % (k,v))
 PY
@@ -1412,6 +1520,20 @@ wt_tmux_names() {
 # wt_table -> "<worker>\t<alive|dead|unknown>", one line per worker this box knows about, deduped.
 # Memoized for WT_TABLE_TTL seconds (default 10) so a cycle's dozen questions are one daemon read;
 # 0 disables the memo (tests, and an operator debugging a stubborn box).
+# ⛔ THE WINDOW IS FLOORED AT TWICE THE LAST BUILD'S OWN COST, AND THAT FLOOR IS THE WHOLE POINT
+# (#3585, MEASURED 2026-11-10). A census build is not cheap: the daemon answers `tree` in
+# 0.14 s, but the per-record resolution over ~105 records costs 9.1 s cold and 18.1-29.1 s on the same
+# box at load ~215. With `WT_TABLE_TTL` a flat 10 s the memo was stamped at build START, so by the time
+# the build FINISHED the entry was already 9-29 s old — outside its own window. **The memo was never
+# once a hit**: every question rebuilt the whole census, and `reap_stale_workers` asks it once PER
+# CANDIDATE (#3756), so a pass over this box's 89 candidates cost 90 builds and 27 minutes for work that
+# took 12 s at cycle 117. (⛔ SCOPED DELIBERATELY, review of this diff: the memo DOES hit on a box whose
+# build is shorter than its window — this suite's §K arm pins that — so the claim is about a census whose
+# build outruns `WT_TABLE_TTL`, i.e. this box, not every box.) A validity window shorter than its own construction cannot cache — it is a
+# NO-OP GATE, the class this file refuses everywhere else. So the header carries the build's measured
+# duration and the effective window is `max(configured, 2 x took)`: at any configured TTL the memo now
+# survives its own build, and staleness still cannot exceed twice the cost of re-reading it. `0` is
+# untouched — the disable seam must not be derived away.
 # ⛔ THE MEMO IS A FILE, because every call site reads the table through `$(wt_table)` — a shell
 # variable set inside that command substitution dies with the subshell, so an in-memory memo was
 # never once hit (measured: three questions, three full `cmux tree` probes). The file carries its own
@@ -1457,7 +1579,7 @@ WT_ABSENT_STALE_MIN=$(( 4 * CYCN ))
 [ "$WT_ABSENT_STALE_MIN" -ge $(( 2 * WT_ABSENT_CONFIRM )) ] || WT_ABSENT_STALE_MIN=$(( 2 * WT_ABSENT_CONFIRM ))
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree tree_err tfile absent_now absent_since absent_last _cont _mage _wl nrc names probe_ok raw="" tbl="" f name kind id st
+  local now ttl dir cache hdr _wat _wtook _wttl _w2 _wend _wdur tree tree_err tfile absent_now absent_since absent_last _cont _mage _wl nrc names probe_ok raw="" tbl="" f name kind id st
   # ⛔ A FAILED OR BACKWARDS CLOCK MUST NOT FREEZE THE MEMO (review round 13 of #2653, P2). `|| echo 0`
   # is the idiom round 12 removed from the absent arm: with `now=0` (or after a backwards clock step)
   # `now - at` is NEGATIVE, which is `< ttl`, so a memo is served FOREVER instead of for 10 s — the
@@ -1465,19 +1587,56 @@ wt_table() {
   # caps stop binding). The age must be non-negative AND under the TTL.
   now="$(date +%s 2>/dev/null)" || now=""
   case "$now" in ''|*[!0-9]*) now="" ;; esac
+  # ⛔ COERCED TO `0`, NOT TO THE DEFAULT (review of this diff, P3 — MEASURED). On the code this
+  # replaces, `[ "${ttl:-0}" -gt 0 ] 2>/dev/null` was rc 2 for a NON-NUMERIC value, so the memo block
+  # was skipped entirely: a malformed `WT_TABLE_TTL` (`off` is the obvious way an operator writes
+  # "stop doing this") meant NO MEMO. Coercing it to 10 would have quietly turned that operator's
+  # choice back into a 10 s cache — a change in the UNSAFE direction, since the memo's staleness is
+  # what `wt_alive` and the caps read. `0` is the disable seam, so a value this function cannot parse
+  # lands there. (The old guard's failure also never reached `[ "$_mage" -lt "$ttl" ]`, so it printed
+  # no diagnostic — `2>/dev/null` saw to that; an earlier draft of this comment claimed otherwise.)
   ttl="${WT_TABLE_TTL:-10}"
+  case "$ttl" in
+    ''|*[!0-9]*) ttl=0 ;;
+    # ⛔ NOT "this would ERROR" (review of this diff, P3 — MEASURED: `$(( 10#1234…30 digits ))` WRAPS to
+    # a negative number and returns 0 on bash 3.2.57, it does not abort; the abort class the `CYC` note
+    # records is INVALID DIGITS, e.g. `$(( 4 * 08 ))` → "value too great for base"). A wrapped value is
+    # not a crash, it is a nonsense window — a census that serves itself for an unbounded or negative
+    # span. Disabling the memo is the honest reading of a window nobody can compute.
+    *) if [ "${#ttl}" -le 9 ]; then ttl=$(( 10#$ttl )); else ttl=0; fi ;;
+  esac
   dir="$(wt_dir)"; cache="$dir/.wt-census"
-  if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
+  _wttl=$ttl
+  if [ "$ttl" -gt 0 ] && [ -f "$cache" ]; then
     hdr="$(head -1 "$cache" 2>/dev/null)"
+    _wat=""; _wtook=""
     case "$hdr" in
-      '# at='*)
-        case "${hdr#\# at=}" in
-          ''|*[!0-9]*) : ;;
-          *) if [ -n "$now" ]; then
-               _mage=$(( now - 10#${hdr#\# at=} ))
-               [ "$_mage" -ge 0 ] && [ "$_mage" -lt "$ttl" ] && { sed '1d' "$cache"; return 0; }
-             fi ;;
-        esac ;;
+      # This build: `# at=<epoch the build started> took=<whole seconds it took>`.
+      '# at='*' took='*)
+        _wat="${hdr%%' took='*}"; _wat="${_wat#\# at=}"
+        _wtook="${hdr##*' took='}" ;;
+      # An older harness's header, or one written before the duration was recorded: the window is the
+      # configured one, i.e. exactly the behaviour this change replaces. Never fatal — a memo that
+      # cannot state its own cost must not become a census that cannot be read.
+      '# at='*) _wat="${hdr#\# at=}" ;;
+      *) : ;;
+    esac
+    # ⛔ THE FLOOR: `max(configured, 2 x took)`. A build longer than its own window is unreadable by
+    # construction — the entry is already older than the TTL when it lands — so the configured window
+    # alone is a no-op gate. The stamp is the build's START (conservative: the census is at least that
+    # old), which is exactly why the duration has to be in the comparison.
+    case "$_wtook" in
+      ''|*[!0-9]*) : ;;
+      *) if [ "${#_wtook}" -le 9 ]; then
+           _w2=$(( 2 * 10#${_wtook} )); [ "$_w2" -gt "$_wttl" ] && _wttl=$_w2
+         fi ;;
+    esac
+    case "$_wat" in
+      ''|*[!0-9]*) : ;;
+      *) if [ -n "$now" ]; then
+           _mage=$(( now - 10#$_wat ))
+           [ "$_mage" -ge 0 ] && [ "$_mage" -lt "$_wttl" ] && { sed '1d' "$cache"; return 0; }
+         fi ;;
     esac
   fi
   # ⛔ AN ABSENT SESSION OWNER IS A READING, NOT AN UNREADABLE ONE (agent-infra#2653, measured
@@ -1522,6 +1681,14 @@ wt_table() {
   # probe still runs with stderr discarded and the absent-owner signal is simply UNOBSERVABLE — the
   # census stays UNKNOWN and the caps binding, which is the pre-change behaviour and the safe side.
   tfile="${TMPDIR:-/tmp}/.wt-tree-err.$$"
+  # ⛔ NOT `wt_bounded`, AND THE REASON IS RECORDED SO IT IS NOT "TIDIED" IN (measured 2026-11-10).
+  # `wt_bounded` bounds with `perl -e 'alarm shift; exec @ARGV'`, i.e. an `exec` — and `exec` cannot
+  # run a shell FUNCTION. Every rig in this repo stubs the surface as a `cmux()` FUNCTION (this suite's
+  # own `sess()` arm among them), so wrapping this call made the census read an EMPTY tree and turned
+  # two `sess()` assertions red: a stub is not a binary, and the bound silently replaced the stub with
+  # "command not found". Bounding this probe needs those ribs converted to PATH binaries first, which is
+  # a change to the FIXTURES (and to the arms whose `cmux()` stub is currently exercised through it),
+  # not a one-line addition here. Recorded on #3585 rather than left as a trap for the next reader.
   if { : >"$tfile"; } 2>/dev/null; then
     tree="$(cmux tree --json 2>"$tfile")" || tree=""
     tree_err="$(cat "$tfile" 2>/dev/null || true)"
@@ -1767,22 +1934,53 @@ EOF
   fi
   WT_TABLE="$(printf '%s\n' "$tbl" | sed '/^$/d' | awk -F'\t' 'NF==2 && !seen[$1]++')"
   WT_TABLE_AT="$now"
+  # ⛔ THE BUILD'S OWN COST RIDES IN THE HEADER, BECAUSE IT IS WHAT THE WINDOW IS JUDGED AGAINST. `at`
+  # stays the START (conservative: the census is at least that old), so the duration is not decoration —
+  # without it a build slower than `WT_TABLE_TTL` looks like an expired entry rather than an entry that
+  # could never have been fresh. Measured from the second `date` that runs AFTER the table is built; a
+  # failed or backwards clock yields 0, which leaves the configured window in force (the pre-change
+  # behaviour) rather than inventing a longer one.
+  _wend="$(date +%s 2>/dev/null)" || _wend=""
+  _wdur=0
+  case "$_wend" in ''|*[!0-9]*) : ;;
+    *) case "$now" in ''|*[!0-9]*) : ;; *) _wdur=$(( _wend - now )); [ "$_wdur" -ge 0 ] || _wdur=0 ;; esac ;;
+  esac
   # ⛔ THE `2>/dev/null` MUST APPLY TO THE GROUP, NOT SIT AFTER THE `>` (review round 8 of #2653, P2):
   # a failing `>` open prints bash's own diagnostic on the PRE-COMMAND stderr, which a redirect placed
   # after it never sees — so an unwritable `$dir` emitted raw bash noise on EVERY census read (~12 per
   # controller cycle) into an append-only, never-rotated log. Measured: the group form silences it and
   # keeps the same status.
-  { { printf '# at=%s\n' "$now"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$"; } 2>/dev/null \
+  { { printf '# at=%s took=%s\n' "$now" "$_wdur"; printf '%s\n' "$WT_TABLE"; } > "$cache.tmp.$$"; } 2>/dev/null \
     && mv -f "$cache.tmp.$$" "$cache" 2>/dev/null || rm -f "$cache.tmp.$$" 2>/dev/null
   printf '%s\n' "$WT_TABLE"
 }
 
-# wt_alive <name> — 0 when the worker is ALIVE or UNKNOWN, 1 when it is DEAD or unknown-to-this-box.
-# An absent name is NOT a worker: `sess "fix-42"` for a PR with no worker must answer NO.
+# wt_alive <name> [<table>] — 0 when the worker is ALIVE or UNKNOWN, 1 when it is DEAD or
+# unknown-to-this-box. An absent name is NOT a worker: `sess "fix-42"` for a PR with no worker must
+# answer NO.
+# ⛔ `<table>` IS FOR A CALLER THAT ALREADY PAID FOR THE CENSUS, AND IT CHANGES NO VERDICT (#3585).
+# `reap_stale_workers` reads the table once for the whole pass and then asks about EVERY candidate; asking
+# through `wt_table` threw that table away and rebuilt the whole census per candidate (#3756 made that
+# per-candidate read, and a reap pass went from 12 s to 27 min). The verdict is the same expression on the
+# same rows — this is the same function, not a second opinion — and an EMPTY table falls back to a real
+# read, so a caller cannot pass "nothing" and get "nothing is alive".
+# ⛔ AND ONLY A TABLE IS ACCEPTED (review of this diff, P3). A second positional is easy to pass by
+# accident, and any other string finds no row and answers DEAD — the direction that frees the caps and
+# lets `wt_close` proceed. Every row `wt_table` emits is `<name><TAB><status>`, so a value with no TAB is
+# not a table and is discarded, exactly like an empty one.
 wt_alive() {
-  local n="${1:-}" st
+  local n="${1:-}" tbl="${2-}" st
   [ -n "$n" ] || return 1
-  st="$(wt_table | awk -F'\t' -v n="$n" '$1==n{print $2; exit}')"
+  case "$tbl" in
+    *"$(printf '\t')"*) : ;;
+    *) tbl="" ;;
+  esac
+  [ -n "$tbl" ] || tbl="$(wt_table)"
+  # ⛔ HERE-STRING, NOT A PIPE (the same rule this file's `grep -q` arms state): the lookup exits on its
+  # FIRST match, so a piped writer takes SIGPIPE — under `pipefail` a MATCH then reads as a failure, and
+  # measured here it also printed `printf: write error: Broken pipe` on the controller's stderr once per
+  # answered name. A here-string cannot short-write its writer.
+  st="$(awk -F'\t' -v n="$n" '$1==n{print $2; exit}' <<<"$tbl")"
   case "$st" in
     dead) return 1 ;;
     alive|unknown) return 0 ;;
@@ -1801,8 +1999,8 @@ wt_count() {
 }
 
 # ── spawn ────────────────────────────────────────────────────────────────────────────────────
-# The env snapshot: everything the controller exports, plus O (which the controller sets but does
-# NOT export — a worker falling back to $HOME/orchestrator is how a box silently runs a different
+# The env snapshot: everything the controller exports, plus O and O_WORK re-asserted explicitly — a
+# worker falling back to $HOME/orchestrator is how a box silently runs a different
 # harness). Mode 0600 and removed with the worker: it carries the same secrets as the cell's keys.env.
 #
 # ⛔ THE uv PIN IS EMITTED AFTER `export -p`, AND THAT POSITION IS THE WHOLE POINT (agent-infra#2159).
@@ -2092,6 +2290,16 @@ PY
     # successful re-attempt. Closing it here is deliberately NOT done: this path is reached without a
     # liveness re-check, so an unconditional reap of `wt-<name>` could end a LIVE lane holding that name —
     # the one thing this file never does. Recorded as a residual on #2404.
+    # ⛔ A SPAWN DOES NOT ADD A FOURTH `wt-<name>` WORKSPACE (agent-infra#2312, measured above).
+    # Every dispatch of an issue whose previous lane's surface was never closed used to create ONE MORE
+    # workspace under the SAME name, and the reap frees only the id in the record — so the registry grew
+    # without bound (134 workspaces over 26 names, 124 of them idle, on one cell; the incident at 981
+    # workspaces / 0 bytes free). Clearing the name's IDLE surfaces first makes the registry bounded by
+    # the number of NAMES in use rather than by the number of spawns: "a reused workspace is the
+    # default", and the workspace itself is recycled rather than leaked. It cannot touch a live lane —
+    # the sweep skips any workspace holding a running terminal, and an `empty` one (a create in flight)
+    # — and it is bounded (`WT_IDLE_SWEEP_MAX`).
+    wt_sweep_idle_workspaces "$name"
     _larc=0
     out="$(printf '%s\n' "$doc" | cmux layout apply --name "wt-$name" --cwd "$cwd" --json - 2>&1)" || _larc=$?
     if [ "$_larc" -ne 0 ]; then
@@ -2244,6 +2452,100 @@ EOF
   return 0
 }
 
+# wt_sweep_idle_workspaces [<name>] — free every `wt-<name>` workspace (or every `wt-*` when the
+# name is empty) whose terminals have ALL exited. Prints nothing when there was nothing to free; says
+# what it did, verified, when there was.
+#
+# ⛔ WHY THIS EXISTS (agent-infra#2312). The workspace registry is the durable trace of every spawn, and
+# nothing ever removed the ones whose lane had ENDED. The mechanism is in this file: the worker record
+# is PER NAME (`worker-<name>`, holding one workspace id), so each spawn of a recycled name overwrites
+# its predecessor's id, and `wt_close` addressed only the id in the record. Every older surface of that
+# name then belonged to nobody: no record named it, so the record-driven reaper never looked at it, and
+# the census deliberately AGGREGATES by name (`wt_tree_probe`), so a name with 29 workspaces still
+# printed one row and read "dead" — the multiplicity was invisible on every surface an operator reads.
+# Measured 2026-11-10 on one cell: 134 workspaces over 26 distinct names, exactly one terminal each,
+# **124 idle**, `workspace-registry.sqlite3` at 8.26 GB on a 7.9 GB volume at 99 % (128 MB free); the
+# incident this issue records reached 981 workspaces / 0 bytes free, at which point EVERY `cmux`
+# mutation fails — including the close that would drain it — and no lane can start on that box again.
+#
+# ⛔ WHAT IT MAY DESTROY, SAID OUT LOUD. Removing a workspace discards that terminal's SCROLLBACK. It
+# is done only when the terminal has already EXITED, so no lane, process or uncommitted edit can be
+# behind it (the polarity rule this file states for liveness is the same one here: a workspace is
+# swept only on a POSITIVE "no running terminal" reading, and `live`/`empty`/unreadable all spare it).
+# A worker's durable evidence does not live in its scrollback: `$O/logs/<worker>.log`, the run script
+# and the env snapshot are on disk and are untouched. It never runs `cmux server stop --force`, which
+# is the lever that ends LIVE terminals — the one the self-healing contract keeps an operator action
+# (`docs/ops/self-healing-contract.md` §3.8).
+#
+# ⛔ AND IT VERIFIES ITS OWN RESULT. A sweep that reports "freed N" on the strength of `cmux workspace
+# rm` exit status would be a FALSE PASS of exactly the shape this issue is about (`cmux` refuses a
+# mutation and exits 0 on a full volume); so the count is the number the daemon was ASKED to remove and
+# the line states what the RE-READ still finds, including `could NOT confirm` when the census cannot be
+# read at all.
+wt_sweep_idle_workspaces() {
+  local name="" tree rows k id st n=0 max left re nleft
+  [ "${WT_IDLE_SWEEP:-1}" = "0" ] && return 0
+  command -v cmux >/dev/null 2>&1 || return 0
+  # The name rule is `wt_name_ok`'s: anything else is not a workspace this launcher could have made.
+  if [ -n "${1:-}" ]; then wt_name_ok "$1" || return 0; name="wt-$1"; fi
+  max="${WT_IDLE_SWEEP_MAX:-50}"; case "$max" in ''|*[!0-9]*|0*) max=50 ;; esac
+  tree="$(wt_bounded "${WT_TREE_TIMEOUT:-15}" cmux tree --json 2>/dev/null)" || return 0
+  [ -n "$tree" ] || return 0
+  # ⛔ AN UNREADABLE READING IS NOT AN EMPTY ONE — AT THE READ THAT DECIDES WHETHER THIS RUNS AT ALL
+  # (review P2). Discarding python's status here made an `exit(3)` refusal — the shape the liveness
+  # accounting exists for — BYTE-IDENTICAL to "there was nothing to free": same silence, same rc 0. One
+  # drifted tab (a `terminals[]`/id-shape difference across builds, the file's own recorded risk) then
+  # disarmed the sweep for that name for ever while every operator surface read healthy, and `wt_spawn`
+  # went on adding one workspace per dispatch — the leak this change exists to stop, resumed in silence.
+  # It now SAYS SO and frees nothing: a refusal is a reading about the CENSUS, not a clearance.
+  if ! rows="$(printf '%s\n' "$tree" | python3 -c "$WT_WS_PY" "$name" liveness 2>/dev/null)"; then
+    wt_warn "IDLE SWEEP ${name:-<all wt-*>}: the census could NOT be read for liveness (an unreadable or drifted document) — nothing was freed, and this is not a 'nothing to free' reading"
+    return 0
+  fi
+  [ -n "$rows" ] || return 0
+  while IFS="$(printf '\t')" read -r k id st; do
+    [ "$k" = "ws" ] || continue
+    [ "$st" = "idle" ] || continue      # live | empty | anything else: spared, never guessed at
+    [ -n "$id" ] || continue
+    [ "$n" -lt "$max" ] || break
+    # ⛔ BOUNDED, LIKE THE TWO READS BESIDE IT (review P2). `cmux workspace rm` was the ONE unbounded
+    # daemon call this function put on the controller's SYNCHRONOUS spawn path, up to WT_IDLE_SWEEP_MAX
+    # (50) per spawn — and the loop that drains a 124-workspace backlog is precisely the case that runs
+    # when the daemon is degraded. The file's own rule for this path (:159-171) is that an unbounded
+    # daemon call there is "a controller that silently stops cycling". A bound that fires costs one
+    # un-freed workspace that the next pass retries; the re-read below already reports the outcome
+    # honestly, so a killed `rm` cannot be mistaken for a clearance.
+    wt_bounded "${WT_TREE_TIMEOUT:-15}" cmux workspace rm "$id" >/dev/null 2>&1
+    n=$(( n + 1 ))
+  done <<EOF
+$rows
+EOF
+  [ "$n" -gt 0 ] || return 0
+  # The census is now WRONG about this box, and `wt_table` memoises it in a file.
+  wt_forget
+  # ⛔ THE ARM IS DECIDED BY THE RE-READ'S OWN STATUS, NEVER BY WHAT `awk` PRINTED (agent-infra#2312
+  # review P1, reproduced). `awk`'s `END{print c+0}` runs UNCONDITIONALLY — its END block prints even
+  # with no input — and a pipeline's status is its LAST element's, so a fired `wt_bounded`, a failed
+  # `cmux tree --json` and python's own `exit(3)` for an unreadable shape ALL still landed in `left=0`.
+  # The `could NOT confirm` arm below was therefore reachable only if `awk` itself was missing, i.e. it
+  # could not fire for its ONE stated purpose — the exact false PASS this issue is about, printed by the
+  # sentence the docs say will never be printed. Measured on the code this replaces: first `tree` OK,
+  # `rm` OK, second `tree` exit 1 with no output ⇒ "the re-read still finds 0 idle workspace(s)".
+  # Same polarity as the rest of this file: an unreadable reading is not an empty one.
+  left=""
+  re="$(wt_bounded "${WT_TREE_TIMEOUT:-15}" cmux tree --json 2>/dev/null)" || re=""
+  if [ -n "$re" ] && nleft="$(printf '%s\n' "$re" | python3 -c "$WT_WS_PY" "$name" liveness 2>/dev/null)"; then
+    left="$(printf '%s\n' "$nleft" | awk -F'\t' '$1=="ws" && $3=="idle" {c++} END {print c+0}')"
+  fi
+  case "${left:-}" in
+    ''|*[!0-9]*)
+      wt_warn "SWEPT ${name:-<all wt-*>}: asked the daemon to remove $n idle workspace(s) (their terminals had ALL exited), and the re-read could NOT confirm the result — the remaining count is UNVERIFIED" ;;
+    *)
+      wt_warn "SWEPT ${name:-<all wt-*>}: asked the daemon to remove $n idle workspace(s) (their terminals had ALL exited); the re-read still finds $left idle workspace(s) of that name" ;;
+  esac
+  return 0
+}
+
 # wt_close <name> — kill the worker and PROVE it is gone. Returns 1 when it cannot prove that, and
 # then it KEEPS the record so a later cycle retries: "closed" is a claim about reality, and a reaper
 # that reports a kill it did not verify is the same class of lie as a spawn that never happened.
@@ -2254,7 +2556,14 @@ wt_close() {
   dir="$(wt_dir)"; f="$dir/worker-$name"
   kind=tmux; id=""; ws=""
   [ -f "$f" ] && { kind="$(sed -n 's/^kind=//p' "$f" | head -1)"; id="$(sed -n 's/^id=//p' "$f" | head -1)"; ws="$(sed -n 's/^workspace=//p' "$f" | head -1)"; }
-  wt_forget
+  # ⛔ ONE INVALIDATE, AND IT IS THE ONE AFTER THE CLOSE (#3585, MEASURED). This function used
+  # to call `wt_forget` twice — here and again immediately before the verification below. Two calls, one
+  # effect: neither tree reader in the arms below consults the memo (`wt_close_named_surface` and
+  # `wt_sweep_idle_workspaces` read the daemon directly), and the ONLY memo-consuming read after this
+  # point is the `wt_alive` verification — which sits after the SECOND `wt_forget`. So the one here
+  # invalidated nothing and cost everything: it threw away the census a reap pass had just built, so the
+  # next candidate rebuilt it. It cannot make a read stale in either direction, because an entry written
+  # before the close is still dropped before the read that would judge the close.
   case "$kind" in
     terminal)
       [ -n "$id" ] && cmux terminal close "$id" >/dev/null 2>&1
@@ -2262,6 +2571,15 @@ wt_close() {
       # A record with neither field (an older harness) has nothing to address by id: fall back to
       # the workspace name, the same handle the census uses.
       [ -z "$id" ] && [ -z "$ws" ] && wt_close_named_surface "$name"
+      # ⛔ AND EVERY OTHER `wt-<name>` WORKSPACE, NOT ONLY THE RECORDED ONE (agent-infra#2312). The
+      # record is PER NAME, so each spawn OVERWRITES the previous one's workspace id: the closed id is
+      # the newest, and every older surface of that name became unreachable for ever — no record names
+      # it, and `wt_close_named_surface` (which exists precisely for a surface no record names) was
+      # reached only from the tmux arm and the no-handle arm, never from here. Measured on one cell,
+      # 2026-11-10: `wt-chain-9` × 29, `wt-lane-9` × 28, `wt-lane-7`/`wt-chain-7`/`wt-lane-8`/`wt-chain-8`
+      # × 14 each — 124 of 134 workspaces idle, i.e. 124 terminated lanes still occupying the registry.
+      # The tmux arm has always swept by name here; a durable terminal is the one surface that did not.
+      wt_sweep_idle_workspaces "$name"
       ;;
     *)
       # tmux: resolve the pane pid BEFORE killing the session (the session is what holds it), kill the

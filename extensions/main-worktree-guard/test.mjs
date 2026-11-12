@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -698,13 +698,42 @@ function expectBranches(command, expectedArray) {
 expectBranches("git push origin --delete feat/x", ["feat/x"]);
 expectBranches("git push --delete feat/x", ["feat/x"]);
 expectBranches("git push origin --delete refs/heads/feat/x", ["feat/x"]);
-// Flag BEFORE the remote: git treats the first positional as the REPOSITORY
-// when ≥2 positionals follow the flag (`--delete origin c` deletes c on
-// origin — probe-verified). The first following positional is dropped.
+// Flag BEFORE the remote with ONE refspec: git treats the first positional as
+// the REPOSITORY (`git push --delete origin c` deletes c on origin —
+// probe-verified). The first following positional is dropped.
 expectBranches("git push --delete origin c", ["c"]);
 expectBranches("git push origin main && git push --delete origin c", ["c"]); // later-segment flag-before-remote
 expectBranches("git push --delete chore/old-branch origin", ["origin"]); // git-invalid (chore/old-branch is not a repo) — repo-drop still applied
-expectBranches("git push origin --delete a b", ["a"]); // repo precedes flag — a and b are BOTH refspecs; single-target contract keeps a
+// #509: EVERY refspec is a target, never just the first. The repo precedes the
+// flag, so `a` is NOT the remote — a and b are BOTH refspecs and git deletes
+// both (probe-verified: `- [deleted] a` / `- [deleted] b`). The pre-#509
+// single-target capture returned ["a"], so a sibling holding `b` was never
+// coordinated-blocked on the degradation-fallback arm.
+expectBranches("git push origin --delete a b", ["a", "b"]);
+expectBranches("git push -d origin a b", ["a", "b"]); // flag-first: origin is the REMOTE, both refspecs are targets
+expectBranches("git push origin -d a b", ["a", "b"]);
+expectBranches("git push -d origin refs/heads/a refs/heads/b", ["a", "b"]);
+expectBranches("git push origin -d -q a b c", ["a", "b", "c"]); // cluster + three refspecs
+expectBranches("git push origin -d a :b", ["a", "b"]); // flag + colon-delete mix, one target each
+expectBranches("git push --delete a b", ["b"]); // lone-pair flag-first: a is the REMOTE only
+// #509 (review P2-1): `--delete` is a PUSH-WIDE option, so a refspec placed
+// BEFORE the flag is a delete target too. Probe-verified against a local bare
+// remote: `git push origin main -d b` prints `- [deleted] b` AND
+// `- [deleted] main`. Dropping the pre-flag positional left `main` — the branch
+// most likely to be checked out in a sibling or the hub — unguarded on the
+// degradation-fallback #73 arm.
+expectBranches("git push origin main -d b", ["main", "b"]);
+expectBranches("git push origin main --delete b", ["main", "b"]);
+expectBranches("git push origin main -d a b", ["main", "a", "b"]);
+expectBranches("git push origin -d", null); // lone positional BEFORE the flag = the REMOTE: nothing deleted
+// #509 (review P3-3): a TRAILING delete flag with every refspec BEFORE it. Both
+// are real deletes (probe-verified rc 0 against a bare remote) and BOTH returned
+// `null` before this change — not a partial attribution but NO attribution, so
+// the whole command was unguarded on the degradation-fallback #73 arm. The rows
+// above all carry a positional AFTER the flag, so a mutant that restores "skip
+// when nothing follows the flag" would leave them green; these two red it.
+expectBranches("git push origin a b --delete", ["a", "b"]); // two pre-flag refspecs: git deletes a AND b
+expectBranches("git push origin main -d", ["main"]); // one pre-flag refspec: git deletes main
 expectBranches('git push origin --delete "feat/x"', ["feat/x"]);
 expectBranches("git push origin --delete 'feat/x'", ["feat/x"]);
 expectBranches("git push origin :feat/x", ["feat/x"]);
@@ -728,7 +757,6 @@ expectBranches("git push origin -o -d feat/x", null);
 // Consecutive arg-takers pair off → trailing -d is a REAL delete:
 expectBranches("git push origin -o -o -d feat/x", ["feat/x"]);
 expectBranches("git push origin -o -o -o -d feat/x", null); // odd chain consumes -d
-expectBranches("git push origin -d", null); // no target — invalid in git
 // Non-delete coloned refspecs (src:dst) are NOT deletes — never extracted.
 expectBranches("git push origin main:feature", null);
 expectBranches("git push origin HEAD:refs/heads/feat/x", null);
@@ -961,6 +989,52 @@ dexpect("push --delete colon form", `git push origin :feat/x`, { verdict: "block
 // coordinated block fires exactly as for --delete/:branch.
 dexpect("push -d short → isPushDelete + targets", `git push origin -d feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push -d flag-first → targets (first positional = the remote)", `git push -d origin feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+// #509 (review P2-2): the two #443 surfaces must AGREE on every delete shape
+// they BOTH attribute, so this is ONE surface-vs-surface assertion — not two
+// independent pins that no mutant of the change can red. A divergence in either
+// the whole-command extractor (degraded #73 arm) or the detailed classifier
+// (full path) fails here. On pre-#509 code `git push origin -d a b` reds
+// (extractor ["a"] vs ["a","b"]); the pre-flag shape reds if either side drops
+// `main`. Two rows are git-REJECTED shapes ON PURPOSE (`git push origin -d a :b`
+// → `--delete only accepts plain target ref names`; `git push --delete
+// chore/old-branch origin`): both surfaces over-capture there and must keep
+// agreeing, so those rows guard PARITY, not git's behaviour (review P3-2).
+// Excluded as a CLASS, not as two instances (review P3-2): `git push origin -d`
+// (no refspec — the detailed classifier over-captures the repository, the
+// extractor returns null; safe direction) and EVERY shape carrying a standalone
+// `-o`/`--push-option` value or a `--delete=X` token (`git push origin -o draft -d b`
+// → extractor ["b"] vs detailed ["draft","b"]; `git push origin --delete=feat/x`
+// → null vs ["origin"]): the detailed classifier over-captures the option value
+// (or the repo) as a target — the KNOWN IMPRECISION at classify-git.mjs,
+// pre-existing and fail-closed. A row from that class would red on that
+// pre-existing imprecision rather than on a #509 regression, so the class is
+// outside this assertion's scope.
+function expectDeleteSurfaceParity(command) {
+  const ext = extractPushDeleteBranch(command);
+  const det = classifyGitCommandDetailed(command);
+  const ok = det.verdict === "block:push-delete" && JSON.stringify(ext) === JSON.stringify(det.pushTargets);
+  console.log(`${ok ? "✅" : "❌"} delete-surface parity "${command.slice(0, 45)}": extractor ${JSON.stringify(ext)} vs detailed ${JSON.stringify(det.pushTargets)} (${det.verdict})`);
+  ok ? pass++ : fail++;
+}
+[
+  "git push origin -d a b",
+  "git push -d origin a b",
+  "git push origin --delete a b",
+  "git push origin main -d b",
+  "git push origin main --delete b",
+  "git push origin main -d a b",
+  "git push --delete origin c",
+  "git push --delete feat/x",
+  "git push -d origin feat/x",
+  "git push origin -d -q a b c",
+  "git push origin -d refs/heads/a refs/heads/b",
+  "git push origin -d a :b",
+  "git push origin :a :b",
+  "git push --delete chore/old-branch origin",
+  // trailing delete flag, every refspec before it (real deletes — review P3-3):
+  "git push origin a b --delete",
+  "git push origin main -d",
+].forEach(expectDeleteSurfaceParity);
 dexpect("push -dq cluster → delete", `git push origin -dq feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push -d refs target → short name", `git push origin -d refs/heads/feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
 dexpect("push --del abbrev → delete", `git push origin --del feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
@@ -1010,6 +1084,83 @@ wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -
 dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });
 // --dry-run stays a normal push (no false delete).
 dexpect("push --dry-run NOT delete", `git push origin --dry-run feat/x`, { verdict: "block:push", isPushDelete: false });
+
+// ── #653: the delete target must be a LITERAL ref, or the arm fails closed ──
+// The #73 arm matched the delete target as TEXT, so a target the SHELL produces
+// named no ref, nothing was checked out under it, and the delete was ALLOWED.
+// `unresolvableDeleteTargets` decides resolvability and index.ts
+// `_coordinatedDeleteBlock` refuses on it BEFORE the checkout lookup. These rows
+// pin the POLICY SEAM; the handler-level evidence (the refusal, its message, the
+// worktree root, the no-false-block controls and the mutation leg) is
+// test-653-delete-target.mjs — its own CI step, because this file's ci-main leg
+// is not PR-triggered.
+for (const [name, target, want] of [
+  ["literal short ref", "feat/x", true],
+  ["literal full ref", "refs/heads/feat/x", true],
+  ["a comma is legal in a ref name", "release,2026", true],
+  ["$VAR", "$PR_BRANCH", false],
+  ["${VAR}", "${PR_BRANCH}", false],
+  ["${VAR:-default}", "${BRANCH:-feat/x}", false],
+  ["command-substitution fragment", "$(echo", false],
+  ["backtick fragment", "`cat", false],
+  ["glob", "feat/*", false],
+  // #653 (review P2 of PR #3978): `?` and `[` are shell globs AND illegal in a ref
+  // name — the SHELL expands them, so refusing them is load-bearing. `]` and `}`
+  // are legal in a ref name and are refused as the accepted over-block; all four
+  // are pinned so a future easing of the class reddens a row instead of silently
+  // reopening the glob hole.
+  ["? shell glob", "feat/experiment-?", false],
+  ["[ character class", "feat/[ab]", false],
+  ["lone closing bracket", "feat/x]", false],
+  ["lone closing brace", "feat/x}", false],
+  ["brace expansion", "{feat/a,feat/b}", false],
+  ["backslash escape", "feat/x\\ y", false],
+  ["empty", "", false],
+]) {
+  const got = isResolvableDeleteTarget(target);
+  console.log(`${got === want ? "✅" : "❌"} #653 isResolvableDeleteTarget(${name}): ${got}${got === want ? "" : ` (expected ${want})`}`);
+  got === want ? pass++ : fail++;
+}
+{
+  const got = unresolvableDeleteTargets(["$A", "feat/x", "$A", "$(cat"]);
+  const ok = JSON.stringify(got) === JSON.stringify(["$A", "$(cat"]);
+  console.log(`${ok ? "✅" : "❌"} #653 unresolvableDeleteTargets filters + dedupes: ${JSON.stringify(got)}`);
+  ok ? pass++ : fail++;
+  const inert = JSON.stringify(unresolvableDeleteTargets(undefined)) === "[]";
+  console.log(`${inert ? "✅" : "❌"} #653 unresolvableDeleteTargets(non-array) is inert: ${inert}`);
+  inert ? pass++ : fail++;
+}
+
+// ⛔ #653 (review P0 of PR #3978): the harness that pins THIS fix must be able to
+// FAIL. `reportVerdict` RETURNS the exit code — it never sets it (`verdict.mjs`:
+// "the caller still owns `process.exit`") — so a harness that discards the return
+// value prints `❌` and exits 0, which makes its CI steps green over every red,
+// including the `--mutations` leg whose whole job is proving the pins can fail.
+// The 4th argument is `{ skip, red }`, NOT the bare `skip` number (whose
+// `opts.skip`/`opts.red` reads are undefined and drop the skip tail). Pinned here
+// rather than only inside that file, because a self-check that can be deleted with
+// the thing it guards is not a pin.
+{
+  const t653 = readFileSync(new URL("./test-653-delete-target.mjs", import.meta.url), "utf-8");
+  const rows = [
+    // ⛔ THE POLARITY, NOT THE SHAPE (review observation on PR #3978): `/process\.exit\(fail === 0/`
+    // is satisfied by `process.exit(fail === 0 ? 0 : 0)` — the same vacuous green. Bind the whole
+    // expression, both outcomes included.
+    ["it sets an exit code from its verdict", /process\.exit\(fail === 0 && !vacuous \? 0 : 1\);/.test(t653)],
+    ["it passes the skip/red OPTIONS object, not a bare number", /reportVerdict\("test-653-delete-target", pass, fail, \{ skip, red: vacuous \}\)/.test(t653)],
+    // ⛔ THE FLAG'S CONSUMPTION, NOT JUST ITS ASSIGNMENT (review P2 of PR #3978): binding
+    // only `behaviouralSkipped = true` is green over a mutant that raises the flag and
+    // drops the line that CONVERTS it into the failure (`const vacuous = … || behaviouralSkipped`)
+    // — the same shape-only binding the row above was fixed for, one line down. Keep the
+    // assignment row (it has its own mutant: deleting line :115) and add the consumption.
+    ["a skipped behavioral half RAISES the flag", /behaviouralSkipped = true/.test(t653)],
+    ["that flag is CONSUMED into the failure verdict", /const vacuous = \(skip > 0 && pass === 0\) \|\| behaviouralSkipped;/.test(t653)],
+  ];
+  for (const [what, ok] of rows) {
+    console.log(`${ok ? "✅" : "❌"} #653 review P0: the harness ${what}`);
+    ok ? pass++ : fail++;
+  }
+}
 
 // sync-source extraction (ownership allowance)
 dexpect("pull --rebase origin main → syncSource main", `git -c commit.gpgsign=false pull --rebase origin main`, { verdict: "block:pull", syncSource: "main" });
@@ -1961,6 +2112,245 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
   expectBool("#596: later-segment delete of pid-owned branch → allowed (ceremony)", delOwn === true, true);
   const delFor = sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: delD.deleteTargets, ownedBranches: [] });
   expectBool("#596: later-segment delete of FOREIGN branch → not allowed (verdict block stands)", delFor === false, true);
+
+  // ── #601: a LATER branch-state mutation must not launder behind an
+  // M3-ALLOWED FIRST mutation ────────────────────────────────────────────
+  // #601 was filed from a fresh-context review of #596 against a tree that
+  // predates #1144 (its probe baseline is 657789f, 2026-09-08). RE-MEASURED at
+  // this head: the launder it describes — an M3-ALLOWED lead mutation (the
+  // own-baseline rename reBaseline, the #376 return-to-original, or a delete)
+  // letting a LATER FOREIGN M3-only mutation (rename / force-create /
+  // force-copy — the families with NO legacy verdict, so M3 is their only gate)
+  // execute rc 0 — is CLOSED by #1144's `stateCarveOutClean` gate (1ef8abb5d).
+  // Pre-#1144 index.ts returned from the WHOLE handler at the first `reBaseline`
+  // (`if (m3?.reBaseline) { … return undefined; }`) — literally the "first
+  // reBaseline decides" short-circuit #601 and its open peer #607 both describe.
+  // The return is now CONDITIONAL on every OTHER invocation in the command being
+  // provably read-only, so a mutating tail falls through to its own decideM3.
+  //
+  // WHAT IS GENUINELY NEW HERE (stated precisely — an earlier draft of this
+  // comment claimed the closure had "zero assertions", which is false: main
+  // already pins `stateCarveOutClean` for destructive / hidden / `worktree add` /
+  // `tag v1` / `stash` siblings, and 8 end-to-end pins at test-module-load.mjs
+  // B9u1–B9u8 include exact launder shapes with a SWITCH lead. Fresh-context
+  // review of this PR falsified the absolute claim, correctly):
+  //   (a) `stateCarveOutClean === false` when the sibling is a BRANCH-STATE
+  //       mutation — no pre-existing pin covers that family, and it is precisely
+  //       the family the M3 carve-outs live in (pinned per tail ARG family below);
+  //   (b) the own-baseline RENAME lead end-to-end (B9u5's lead is a switch, not a
+  //       rename) — see test-module-load.mjs;
+  //   (c) the compound form `git branch -Mq <baseline> X ; git branch -Mq
+  //       <foreign> Y` at this layer, which no assertion could express before
+  //       because the #596 adapter classifies only `stateVerb`/`stateArgs` (the
+  //       FIRST mutation).
+  // These pins are that regression lock, and they are the evidence #607 needs.
+  //
+  // ⛔ WHAT THIS PR DOES **NOT** CLOSE — #656's ROOT, and the reason its record
+  // says so plainly. The closure above is a claim about the classifier's
+  // INVOCATION list. A HIDDEN shell tail (`$(…)`, backticks, `eval "…"`) is
+  // deliberately invisible to that list (#656: `_hasHiddenStateSubst` flags it,
+  // it contributes no invocation, `stateMutations` keeps only the LEAD). Then:
+  // `stateCarveOutClean` is correctly `false` (the list is not provably clean),
+  // the lead's re-baseline is deferred … and there is NO second mutation for the
+  // M3 loop to gate, so index.ts admits the WHOLE command at its VERDICT arm
+  // (`det.verdict === "allow"` → `admitAfterM3()`, which applies the deferred
+  // re-baseline). Measured at this head, end-to-end through the real handler: the
+  // FOREIGN ref inside the substitution is renamed rc 0. So the launder #601
+  // describes is closed for every VISIBLE tail and OPEN for a hidden one — an
+  // earlier draft of this record claimed `$()` was probed clean, which is false:
+  // round 1's probe measured `hidden=true clean=false` and stopped at the
+  // classifier, never reaching the verdict arm that admits it.
+  //
+  // #656 is NOT out of scope because it "has no lead" (its own probes had none):
+  // with a lead the command DOES enter M3, and is still admitted. It is out of
+  // scope here because this PR is test-only and #656's fix is a production
+  // change — a fail-closed return when `hiddenStateSubst` is true, which is the
+  // decision already recorded at classify-git.mjs:4164–4183. Until it lands, the
+  // `⚠️ RESIDUAL` row below PINS TODAY'S ADMITTED BEHAVIOUR as a tripwire so
+  // that this record is true and #656's fix has something to red against.
+  //
+  // The mirror below is index.ts's M3 block FAITHFULLY — it loops EVERY
+  // `stateMutations` entry (not just the first) and honours the
+  // `stateCarveOutClean` early return — because the launder lives in exactly
+  // that interaction. `renameDstExists: false` keeps #598's dst-clobber arm out
+  // of the way so the TAIL's block can only come from its own FOREIGN-target
+  // arms.
+  const m3Full = (cmd, currentBranch) => {
+    const d = classifyGitCommandDetailed(cmd);
+    if (!d.branchState) return "allow:no-branchState";
+    const muts = (d.stateMutations && d.stateMutations.length > 0)
+      ? d.stateMutations
+      : [{ verb: d.stateVerb, args: d.stateArgs }];
+    let pending = null;
+    for (const mu of muts) {
+      const op = sharedClassifyBranchOp(mu.verb ?? d.verb, mu.args ?? d.verbArgs);
+      // op "other" (a delete) skips M3 — the verdict + ownership path gates it.
+      if (!op || op.op === "other") continue;
+      const m3 = sharedDecideM3({
+        branchOp: op, isAgentInfra: true,
+        // `original` is what the #376 return-to-original arm keys on; the real
+        // session baseline records it at session_start (decideM3 requires it, and
+        // a baseline without one is exactly the contended/detached start that
+        // correctly fails closed).
+        baseline: { repoKey: "k", branch: currentBranch, original: "feat/1" },
+        currentBranch, repoKey: "k",
+        stateOpCount: d.stateOpCount ?? 1,
+        hiddenStateSubst: d.hiddenStateSubst === true,
+        renameDstExists: false,
+      });
+      if (m3?.block) return "block";
+      if (m3?.reBaseline) {
+        if (d.stateCarveOutClean === true) return "allow:carveOut";
+        pending = m3.reBaseline;
+      }
+    }
+    return pending ? "allow:pending" : "allow:no-admitted-mutation";
+  };
+  // Indicator 0 (the PREMISE): the lead on its own IS an M3 allow — so a block
+  // on the compound can only come from the tail.
+  // Evidence discipline (agent-infra#3442 — a recorded decision: "an assertion whose
+  // value cannot vary under any mutation of the diff is dead weight that actively
+  // misleads a reader … either make it reachable or delete it. A comment explaining
+  // why it cannot fail is not a fix."): every LOCK row below names the mutant that
+  // reddens it, and a row that could not be made to name one was DELETED rather than
+  // kept with a disclaimer (the ONE exception is the `⚠️ RESIDUAL` row, which is a
+  // tripwire that records a GAP and says so in its own label). The deleted rows are
+  // #601's indicators 2, 3 and 4 at this layer; the two closures behind them —
+  // #626's and #596 round-4's — are both real, but reachability differs per row and
+  // is stated at the measured strength, not stronger (round-5 review corrected an
+  // earlier draft that called both of them unreachable):
+  //   • ind2 (`checkout -b … ; branch -fq <foreign>`) — the `create-new` arm returns
+  //     `{block:true}` UNCONDITIONALLY (branch-ownership.mjs decideM3, #626), so the
+  //     lead blocks and the tail is never reached under ANY mutant. Its closure is
+  //     #626's, pinned at test.mjs `#626: … → BLOCKED (no #376 reBaseline)`.
+  //   • ind3 / ind4 (an own-branch delete lead) — a row asserting `block` there is
+  //     NOT unreachable: MEASURED, `git branch -Dq feat/1 ; git branch -Mq feat/other
+  //     rnX` is `block` at base and `allow:no-admitted-mutation` under M3 (the delete
+  //     is `op "other"` → `continue`, so slicing `stateMutations` down to it leaves
+  //     nothing with a reBaseline). So such a row WOULD redden — under M3, a mutant
+  //     of the M3 loop's own list, not under any mutation of #1144's carve-out, which
+  //     is the closure this block exists to pin. `classifyBranchOp` returns
+  //     `{op:"other"}` for delete mode by design, so a delete yields no reBaseline
+  //     for the carve-out to be judged on. Their closure is #596 round-4's, pinned at
+  //     test.mjs `#596 r4: wt lead + later MAIN rename`, `#596: later-segment delete
+  //     → op other`, and its siblings — so deleting them HERE is about attribution
+  //     (they would name a mutant of a different closure), not unreachability.
+  // Both underlying closures are already pinned on main; re-pinning them here would
+  // be dead weight. What #1144's `stateCarveOutClean` uniquely owns is the RENAME /
+  // RETURN leads — pinned below with the mutant named per row.
+  //
+  // Mutants referenced (all applied to the two `.mjs` modules, no repo file):
+  //   M1 = `stateCarveOutClean = !hiddenStateSubst && invocations.every(...)`
+  //        → `= !hiddenStateSubst`   (the read-only sibling test removed)
+  //   M2 = index.ts's `if (det.stateCarveOutClean === true)` → `if (true)`
+  //        (equivalently: the carve-out always closes — the full pre-#1144 revert)
+  //   M3 = `out.stateMutations = stateMutations.map(...)` → `.slice(0, 1)`
+  //   M5 = the carve-out's IDENTITY exemption (`v === stateInv ||`) deleted
+  //   M6 = the #591 own-force carve-out removed; M7 = its `stateOpCount === 1` deleted
+  //   M8 = the #376 return-to-original arm deleted
+  expectBool("#601 premise: own-baseline rename lead alone → M3 carve-out allow (the launder's premise) [mutant: M5]" +
+    " — MEASURED: M5 turns this into allow:pending",
+    m3Full(`git branch -Mq feat/1 rnLead`, "feat/1"), "allow:carveOut");
+  expectBool("#601 premise: return-to-original lead alone → M3 carve-out allow [mutant: M8] — MEASURED: M8 blocks it",
+    m3Full(`git checkout feat/1`, "feat/1"), "allow:carveOut");
+  // THE PIECE #1144 UNIQUELY OWNS AT THIS LAYER: `_isCarveOutReadOnlyInvocation`
+  // must refuse a MUTATING BRANCH invocation as a read-only sibling. The pre-existing
+  // `stateCarveOutClean` pins cover a destructive sibling, a hidden payload, and the
+  // mutating forms of `worktree add` / `tag v1` / `stash` — NOT the branch-state
+  // family, which is exactly the family the M3 carve-outs live in. Each spelling
+  // below is a distinct tail ARG family (rename / force-create / force-copy), and
+  // M1 turns every one of them `true`.
+  for (const [label, tail] of [
+    ["rename", `git branch -Mq feat/x rnY`],
+    ["force-create", `git branch -fq feat/other main`],
+    ["force-copy", `git branch -Cq feat/other tC1`],
+  ]) {
+    expectBool(`#601 sibling-family: a mutating branch tail (${label}) is NOT a read-only sibling → stateCarveOutClean false [mutant: M1]` +
+      " — MEASURED: M1 makes it true",
+      classifyGitCommandDetailed(`git branch -Mq feat/1 rnX ; ${tail}`).stateCarveOutClean, false);
+  }
+  // Indicator 1 — own-baseline rename (reBaseline carve-out) then FOREIGN rename.
+  // NB: the pair below is the ONLY row for this command. `ind1D.stateCarveOutClean === false`
+  // was a byte-for-byte duplicate of the sibling-family `rename` row above (same command
+  // string, same field, same expected value, same mutant M1) and was folded away on
+  // fresh-context review of this PR — the family sweep carries it.
+  const ind1 = `git branch -Mq feat/1 rnX ; git branch -Mq feat/x rnY`;
+  const ind1D = classifyGitCommandDetailed(ind1);
+  expectBool("#601 ind1: BOTH mutations enumerated (the tail must reach the M3 loop) [mutant: M3]" +
+    " — MEASURED: M3 slices it to 1",
+    Array.isArray(ind1D.stateMutations) && ind1D.stateMutations.length === 2, true);
+  expectBool("#601 ind1: own rename + FOREIGN rename → M3 BLOCK (no launder) [mutants: M1, M3]" +
+    " — MEASURED: the two mutants admit through DIFFERENT exits — M1 as allow:carveOut (the carve-out" +
+    " closes), M3 as allow:pending (the tail is sliced out of the loop, so the lead's reBaseline is" +
+    " deferred to the verdict arm). M2 is the e2e-layer mutant: this mirror implements the conditional" +
+    " itself, so reverting index.ts cannot move it",
+    m3Full(ind1, "feat/1"), "block");
+  // ⚠️ RESIDUAL (#656's root — NOT closed by #601). The row below asserts TODAY'S
+  // ADMITTED behaviour, on purpose, so this PR's record is true: a HIDDEN tail is
+  // invisible to the classifier, so the compound reaches the verdict arm and is
+  // admitted (see the block header). It is a TRIPWIRE, NOT A LOCK, and it is the
+  // one row here with NO mutant among M1–M8 — deliberately: none of them can move
+  // it, because the gap it records lives in production's verdict arm and this
+  // diff adds no code it observes. Its non-vacuity is established by its VISIBLE
+  // twin immediately above (same lead, same foreign rename, `block`) rather than
+  // by a mutation of this diff.
+  //   #601's own framing: the launder is closed for every VISIBLE tail and OPEN
+  //   for a hidden one. When #656 lands its recorded fix (fail closed when
+  //   `hiddenStateSubst` is true, per classify-git.mjs:4164–4183) this row goes
+  //   RED — the correct repair is then to INVERT it and cite #656, never to
+  //   delete it. Deleting it would silently restore the "closure complete"
+  //   over-claim this row exists to prevent.
+  expectBool("#601 ⚠️ RESIDUAL (#656 root — NOT closed by #601): a `$()`-hidden FOREIGN rename behind an M3-allowed lead → allow:pending, i.e. ADMITTED at index.ts's verdict arm [no mutant — this row records a GAP, it is a tripwire not a lock]" +
+    " — MEASURED: hidden=true clean=false muts=1 → the lead's reBaseline is deferred and then admitted via" +
+    " admitAfterM3(); the VISIBLE twin above measures `block`, and backticks / eval measure this same" +
+    " allow:pending. Invert this row when #656 lands",
+    m3Full(`git branch -Mq feat/1 rnX ; echo "$(git branch -Mq feat/other tR1)"`, "feat/1"), "allow:pending");
+  // The visible-tail matrix. Leads = the TWO reBaseline arms #1144 uniquely owns
+  // (own-baseline rename; #376 return-to-original) × every FOREIGN M3-only tail
+  // family × all four shell separators git honours = 24 compounds, none admitted.
+  // The own-force-create lead is DELIBERATELY absent: it is refused at the LEAD by
+  // the #591 `stateOpCount` bound (`decideM3`), so all 12 of its cells stay `block`
+  // under EVERY mutant — 0/12 discriminating. That behaviour keeps its own control
+  // row below (mutant M7) instead of masquerading as launder coverage.
+  {
+    const leads = [`git branch -Mq feat/1 rnLead`, `git checkout feat/1`];
+    const tails = [`git branch -Mq feat/other tR1`, `git branch -fq feat/other main`, `git branch -Cq feat/other tC1`];
+    let admitted = 0;
+    const seen = [];
+    for (const lead of leads) {
+      for (const tail of tails) {
+        for (const sep of [";", "&&", "|", "\n"]) {
+          const cmd = `${lead} ${sep} ${tail}`;
+          const v = m3Full(cmd, "feat/1");
+          if (v !== "block") { admitted += 1; seen.push(`${JSON.stringify(cmd)} → ${v}`); }
+        }
+      }
+    }
+    expectBool("#601 matrix: none of the 24 reBaseline-lead × FOREIGN-tail compounds is admitted [mutants: M1, M3]" +
+      " — MEASURED: M1 admits 24/24 and M3 admits 24/24 (stateCarveOutClean is computed from `invocations`" +
+      " and is independent of stateMutations, so both leads keep re-baselining under M3)" +
+      (seen.length ? ` — ADMITTED: ${seen.join(" · ")}` : ""), admitted, 0);
+  }
+  // Positive controls — #601's own "must NOT break" list. A benign lead is not
+  // an arm-gated mutation, so the own-baseline rename after it must still reach
+  // the carve-out (the #596 pin), and the single-invocation ceremonies keep
+  // their carve-outs.
+  expectBool("#601 control: benign lead + OWN rename stays ALLOWED (the #596 pin must survive) [mutant: M5]" +
+    " — MEASURED: under M5 this reads allow:pending, NOT block: the carve-out stops closing and the command is" +
+    " still ADMITTED, just at index.ts's verdict arm (det.verdict === 'allow' → admitAfterM3()) instead of" +
+    " the carve-out's early return",
+    m3Full(`git branch side ; git branch -Mq feat/1 rnX`, "feat/1"), "allow:carveOut");
+  // ⛔ NO SEPARATE "single-invocation own rename" ROW: it is byte-for-byte the same assertion as
+  // the premise row above (`git branch -Mq feat/1 <free>` → allow:carveOut — identical shape,
+  // identical expected value, identical mutant M5, zero added discriminating power). The premise
+  // row IS the single-invocation ceremony pin; a second copy was deleted on fresh-context review
+  // of this PR (non-blocking finding, agent-infra#3442's dead-weight rule).
+  expectBool("#601 control: single-invocation OWN force-create stays ALLOWED (the #591 carve-out) [mutant: M6]" +
+    " — MEASURED: M6 blocks it",
+    m3Full(`git branch -fq feat/1 main`, "feat/1"), "allow:no-admitted-mutation");
+  expectBool("#601 control: benign lead + OWN force-create is still REFUSED (the #591 stateOpCount bound) [mutant: M7]" +
+    " — MEASURED: M7 admits it as allow:no-admitted-mutation",
+    m3Full(`git branch side ; git branch -fq feat/1 main`, "feat/1"), "block");
   // Round-2 (reviewer F1): _hasHiddenStateSubst's hidden-payload scan must
   // recognize the SAME mutating-branch surface as the arm (it was stale for
   // the #592 rename-cluster/long-form + force-COPY families — exact -m/-M
@@ -2016,6 +2406,16 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       execSync("echo a > f && git add . && git commit -qm init && git branch feat/x && git branch feat/other", { cwd: mainR, stdio: "ignore" });
       execSync(`git worktree add -q "${wtR}" -b wtmain`, { cwd: mainR, stdio: "ignore" });
       const idxGate = (cmd) => {
+        // ⛔ PRE-#1144 SEMANTICS — DO NOT REUSE FOR CARVE-OUT / LAUNDER QUESTIONS.
+        // This mirror RETURNS at the first mutation that resolves (below), which is
+        // the "first block/reBaseline decides" short-circuit #1144 removed from
+        // index.ts. It is kept because its assertions only ask "does the FIRST
+        // main-resolving mutation gate (or worktree-exempt)?" — a question that is
+        // still valid — but it can never see a LATER tail. For the compound form use
+        // `m3Full` (the #601 block above), which loops every mutation and honours
+        // `stateCarveOutClean`. Two mirrors of one production block that disagree is
+        // a trap: if you add a case here that depends on later segments, move it to
+        // `m3Full` instead (fresh-context review of PR #3968, non-blocking note).
         const d = classifyGitCommandDetailed(cmd);
         // round-4: mirror index.ts M3 — gate EVERY main-resolving mutating
         // branch-state invocation (resolveRepoFromInv on each mutation's own
@@ -2100,19 +2500,68 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       const mainKey = sharedResolveEffectiveRepo("git status", mainR)?.repoKey;
       const m2Gate = (cmd) => {
         const d = classifyGitCommandDetailed(cmd);
-        const gateVerb = d.verdict === "block:commit" ? "commit" : "push";
-        // round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS comes
-        // from the classifier's boundary-aware commit/push invocation hints
-        // (the replay counted a phantom `bash git -C <wt> commit` and
-        // worktree-exempted the real main commit).
-        let m2Eff = sharedResolveRepoFromInv(gateVerb === "commit" ? d.commitHints : d.pushHints, mainR);
-        // #596 round-4 (F2): null m2Eff under a block:commit/push verdict →
-        // resolve the session repo, mirroring index.ts's M2 arm fallback.
-        if (!m2Eff) m2Eff = sharedResolveEffectiveRepo("git status", mainR);
-        if (!m2Eff) return "no-eff";
-        if (m2Eff.isWorktree) return "wt-exempt";
-        const m2 = sharedDecideM2({ effectiveRepo: m2Eff, baseline: { repoKey: mainKey, branch: "feat/1" }, currentBranch: m2Eff.currentBranch, pushDst: d.pushDst, pushTargets: d.pushTargets, verdict: d.verdict, allowActive: false });
-        return m2?.block ? "block" : "allow";
+        // #605: mirror index.ts M2 — gate EVERY commit/push invocation, each
+        // resolved from ITS OWN classifier hints (+ a push's OWN targets), and
+        // block wins. A fully-VISIBLE `-C <wt>` LEAD used to resolve the whole
+        // command to its worktree, so the later OFF-baseline MAIN mutation was
+        // exempted (`git -C <wt> commit ; git commit` → ALLOW; the reversed
+        // order blocked). Same rule the round-4 M3 loop (#596) applies to
+        // branch-state mutations.
+        // ⛔ THE MIRROR INVENTS NO MUTATION (review round-6 F2). This used to
+        // SYNTHESIZE one from `det.commitHints`/`det.pushHints` when the
+        // classifier reported none — the exact fallback `index.ts` deleted in
+        // round 5, kept here one round longer. Two costs, both measured:
+        //   • the classifier-level suite could not SEE round-6 F1: for an opaque
+        //     `eval "git push -f …"` the mirror invented a push with
+        //     `invVisible: true`, resolved the session repo and answered
+        //     "block" while the SHIPPED gate admitted — an over-block the suite
+        //     called correct, over a hole in the gate;
+        //   • it is the drift this group's source pins exist to prevent: the pins
+        //     below cover the three `gateMutations(m2Mutations)` call sites, the
+        //     `isDelete` line and the #73 union, but NOT the list itself, so the
+        //     mirror kept modelling the deleted rule and every pin stayed green.
+        // The mirror now mirrors: only invocations the command ACTUALLY contains.
+        const muts = [
+          ...(d.commitMutations ?? []),
+          ...(d.pushMutations ?? []),
+        ];
+        let sawMain = false;
+        for (const mu of muts) {
+          // #605 reviews F1 + I2: a DELETE-spelled push is the #73
+          // coordinated-delete arm's business, never M2's target comparison —
+          // and the rule keys on the MUTATION's own `isDelete`, not on the
+          // compound's verdict path (verdict-keyed it held only when the delete
+          // was the FIRST push, so a later-segment `-d` was blocked while
+          // `--delete` was allowed). index.ts applies it inside
+          // gateMutations; the mirror must not drift from that.
+          if (mu.verb === "push" && mu.isDelete) continue;
+          // #596 round-4 (reviewer P1 follow-up): the repo ALWAYS comes from the
+          // classifier's boundary-aware hints (the replay counted a phantom
+          // `bash git -C <wt> commit` and worktree-exempted the real main commit).
+          let m2Eff = mu.hints
+            ? sharedResolveRepoFromInv(mu.hints, mainR)
+            : (mu.invVisible === false ? sharedResolveEffectiveRepo("git status", mainR) : null);
+          // #596 round-4 (F2): null m2Eff → resolve the session repo, mirroring
+          // index.ts's M2 arm fallback.
+          if (!m2Eff) m2Eff = sharedResolveEffectiveRepo("git status", mainR);
+          if (!m2Eff) return "no-eff";
+          // #805: an UNRESOLVED target is never worktree-exempt (it must reach
+          // decideM2's fail-closed refusal), exactly as index.ts orders it.
+          if (m2Eff.isWorktree && !m2Eff.unresolvedTarget) continue;
+          sawMain = true;
+          const muVerdict = mu.verb === "commit"
+            ? "block:commit"
+            : (d.verdict === "block:force-push" ? "block:force-push" : "block:push");
+          const m2 = sharedDecideM2({
+            effectiveRepo: m2Eff, baseline: { repoKey: mainKey, branch: "feat/1" },
+            currentBranch: m2Eff.currentBranch,
+            pushDst: mu.verb === "push" ? (mu.dst ?? null) : d.pushDst,
+            pushTargets: mu.verb === "push" ? (Array.isArray(mu.targets) ? mu.targets : d.pushTargets) : d.pushTargets,
+            verdict: muVerdict, allowActive: false,
+          });
+          if (m2?.block) return "block";
+        }
+        return sawMain ? "allow" : "wt-exempt";
       };
       const m2a = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: off-baseline main commit + -C wt mutation tail → M2 BLOCK (commit repo)", m2a, "block");
@@ -2134,6 +2583,92 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
       // not exempt the real OFF-baseline MAIN commit.
       const m2f = m2Gate(`sh -c "git -C \"${wtR}\" commit -m z" ; git commit -m x`);
       expectBool("#596 r4 P1a: invisible wt-payload commit lead + real off-baseline main commit → M2 BLOCK", m2f, "block");
+      // ── #605: the VISIBLE twin of the P1a hole ──
+      // commitHints/pushHints describe only the FIRST VISIBLE commit/push, so a
+      // fully-visible worktree-scoped LEAD supplied the ONLY resolved repo
+      // (a worktree) and decideM2 exempted the whole command: the real
+      // OFF-baseline MAIN commit / push of a foreign branch ran rc 0. The gate
+      // outcome must not depend on invocation ORDER (the reversed forms below
+      // blocked even before the fix). index.ts M2 now gates EVERY mutation, and
+      // a push is gated against ITS OWN refspecs.
+      const m2g = m2Gate(`git -C "${wtR}" commit -m z ; git commit -m x`);
+      expectBool("#605: visible wt-scoped commit LEAD + off-baseline MAIN commit → M2 BLOCK", m2g, "block");
+      const m2h = m2Gate(`git commit -m x ; git -C "${wtR}" commit -m z`);
+      expectBool("#605: control — same mutations in the reversed order → M2 BLOCK (order-independent)", m2h, "block");
+      const m2i = m2Gate(`git -C "${wtR}" push origin wtmain ; git push origin feat/other`);
+      expectBool("#605: visible wt-scoped push LEAD + off-baseline MAIN push → M2 BLOCK", m2i, "block");
+      const m2j = m2Gate(`git -C "${wtR}" push origin feat/1 ; git push origin feat/other`);
+      expectBool("#605: leading wt push naming the BASELINE branch cannot launder a MAIN push of a foreign one", m2j, "block");
+      // …and the F1 sibling of the same gap, in the off-baseline state: a
+      // `--delete` anywhere in the raw command routes the verdict to the #73
+      // arm, whose early return used to skip M2 for the compound's OTHER
+      // mutations too.
+      const m2nd = m2Gate(`git commit -m x ; git push origin --delete stale`);
+      expectBool("#605 F1: off-baseline MAIN commit + an unrelated --delete segment → M2 BLOCK", m2nd, "block");
+      // The other half of the same loop: per-invocation TARGETS. A MAIN push of
+      // the session's OWN branch stays allowed even when the LEAD names a
+      // different one, and an all-worktree compound is exempt (no false block).
+      const m2k = m2Gate(`git -C "${wtR}" push origin wtmain ; git push origin feat/1`);
+      expectBool("#605: wt lead + ON-baseline MAIN push (own refspec) → allow (targets are per-invocation)", m2k, "allow");
+      const m2l = m2Gate(`git -C "${wtR}" commit -m z ; git -C "${wtR}" commit -w`);
+      expectBool("#605: ALL-wt compound (both mutations -C <wt>) → wt-exempt (no false block)", m2l, "wt-exempt");
+      // Review F1 (same class, one level above the hints): the push-delete verdict
+      // is set from the WHOLE raw command, so a `--delete` anywhere in a compound
+      // routed it into the #73 arm, whose early return skipped M2 entirely —
+      // `git push origin feat/other ; git push origin --delete stale` let the
+      // off-baseline MAIN push through. The delete arm now gates the compound's
+      // NON-delete mutations (the delete-spelled push itself stays #73's).
+      const m2m = m2Gate(`git push origin feat/other ; git push origin --delete stale`);
+      expectBool("#605 F1: off-baseline MAIN push + an unrelated --delete segment → M2 BLOCK", m2m, "block");
+      const m2o = m2Gate(`git push origin feat/1 ; git push origin --delete stale`);
+      expectBool("#605 F1 control: ON-baseline MAIN push + a --delete segment → allow (no false block)", m2o, "allow");
+      const m2p = m2Gate(`git push origin --delete stale`);
+      expectBool("#605 F1 control: delete-only command → nothing main-resolving to gate (wt-exempt)", m2p, "wt-exempt");
+      // Review I2: the delete exemption keys on the MUTATION's own `isDelete`,
+      // not on the compound's verdict path — verdict-keyed, the `-d` short form
+      // in a later segment was gated by M2 while `--delete` was not.
+      const m2q = m2Gate(`git push origin feat/1 && git push origin -d stale`);
+      expectBool("#605 I2: later-segment `-d` delete → allow (delete exemption is per-mutation)", m2q, "allow");
+      // Review round-3 F1: the #73 arm's target-count precondition and the M2 leg
+      // used to be one guard, so a no-refspec `git push --delete` (a git error)
+      // skipped the arm entirely and exempted the compound. The M2 leg now runs
+      // on the VERDICT; the mirror models that by gating the non-delete mutations
+      // for a block:push-delete verdict whether or not det.pushTargets is empty.
+      const m2r = m2Gate(`git push origin feat/other && git push --delete`);
+      expectBool("#605 F1-r3: off-baseline MAIN push + a no-refspec `git push --delete` → M2 BLOCK", m2r, "block");
+      const m2s = m2Gate(`git commit -m x ; git push --delete`);
+      expectBool("#605 F1-r3: off-baseline MAIN commit + a no-refspec `git push --delete` → M2 BLOCK", m2s, "block");
+      const m2t = m2Gate(`git push --delete`);
+      expectBool("#605 F1-r3 control: lone no-refspec `git push --delete` → nothing main-resolving (wt-exempt)", m2t, "wt-exempt");
+      // Review round-6 F2: with the invented mutations gone, the mirror reports the
+      // ZERO-mutation shape the classifier actually produces for an opaque payload,
+      // instead of a synthetic block the shipped gate never returns.
+      const m2u = m2Gate(`eval "cd /tmp && git push -f origin feat/other"`);
+      expectBool("#605 r6: an opaque `eval` force-push yields NO mutations to gate (the fail-closed arm is the shipped one)",
+        m2u, "wt-exempt");
+      // ── ANTI-DRIFT source pins (agent-infra#3442, reviewer residual) ──
+      // `m2Gate` is a HAND-WRITTEN mirror of index.ts's M2 loop, so a shipped
+      // arm could lose its gate call while every row above stayed green (the
+      // mirror would keep modelling the pre-loss rule). These three pins tie the
+      // mirror's three rules to the SHIPPED source. They are not an equivalence
+      // proof — that is what the handler suite is for — they make a silent
+      // REMOVAL of any of the three impossible without a red row.
+      const m2GateCalls = (pinSrc.match(/gateMutations\(m2Mutations\)/g) ?? []).length;
+      expectBool("#605 source pin: index.ts gates the compound in ALL THREE arms (M2, allowance admit, push-delete)",
+        m2GateCalls >= 3, true);
+      expectBool("#605 source pin: the delete exemption keys on the MUTATION's own isDelete (not the verdict path)",
+        pinSrc.includes('if (mu.verb === "push" && mu.isDelete) continue;'), true);
+      expectBool("#605 source pin: the #73 coordinated check unions EVERY delete invocation's targets",
+        pinSrc.includes("_coordinatedDeleteBlock(deleteTargets)"), true);
+      // Review round-6 F2: the mutation list ITSELF is a rule, and it was the one
+      // rule with no pin — the mirror above could keep the deleted synthesis while
+      // every pin stayed green. The mirror cannot represent the shipped arm (it
+      // resolves at `mainR`, the arm resolves at the session cwd), so the arm is
+      // pinned at its SOURCE here and pinned EXECUTABLY at the handler level in
+      // test-m2-compound-ownership.mjs S9.
+      const unseenPushPin = pinSrc.match(/m2Mutations\.length === 0 &&\s*\(det\.verdict === "block:force-push" \|\| det\.verdict === "block:push-delete"\)/);
+      expectBool("#605 r6 source pin: a push verdict the extractor could not see is FAIL-CLOSED, not an empty list to admit",
+        unseenPushPin !== null && pinSrc.includes("could not verify repo ownership (git read failed; fail-closed, #265)"), true);
       execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
       const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
       expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");
@@ -4568,7 +5103,262 @@ try {
     none("echo hi", "prose silence");
   }
 
-  // ── #625: in-place overwrite VERBS — walker-level pins. The primitive-only
+  // ── #437/#456 (C) round-45 (probe-verified against real bash): the cwd
+  // model must equal bash's on (a) a `( popd )` in a subshell, (b) the LAST
+  // segment of a pipeline, (c) a FAILED pushd, and (d) a newline that ends a
+  // simple command. (a) is the #456 residual itself — the walker is already
+  // real-bash-equal there and these pins exist so a future "optimisation" of
+  // the `)` handler (a LENGTH truncation cannot restore a popped VALUE, which
+  // is what #456's body proposes) cannot silently reintroduce the fail-open.
+  // (b)-(d) were MEASURED divergences found while verifying (a) (#3954 the
+  // pipeline boundary, #3955 the failed-pushd stack membership, #3956 the
+  // newline-terminated operand read); each was a fail-OPEN (a tracked hub write
+  // resolved outside the hub), and each is pinned in BOTH directions — the positive control is the neighbouring
+  // command that must still resolve where bash resolves it.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r45-"));
+    mkdirSync(join(H, "a")); mkdirSync(join(H, "c")); mkdirSync(join(H, "docs"));
+    // The hub the probes model: `docs/tracked.md` and the ROOT `tracked.md` are
+    // TRACKED; `a/` and `c/` are not — so a write there is the #436 carve-out's
+    // untracked NEW file (ALLOW) and a write to docs/ or the root BLOCKS.
+    const TRACKED = ["docs/tracked.md", "tracked.md"];
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r45: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C437r45: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    // The GATE decision, not just the resolution: block iff the resolved target
+    // is a TRACKED hub file (#436 carve-out: an untracked NEW file is allowed).
+    const verdict = (cmd) => firstHubTrackedWrite(cands(cmd).map((x) => ({ rel: x.resolvedPath.slice(H.length + 1) })), TRACKED) !== null;
+    const blocks = (cmd, label) => expectBool(`C437r45: ${label}`, verdict(cmd), true);
+    const allows = (cmd, label) => expectBool(`C437r45: ${label}`, verdict(cmd), false);
+
+    // ── (a) #456: `( popd )` must NOT eat the inherited stack entry. Bash
+    // copies the dir stack into the subshell and discards the copy at `)`, so
+    // the OUTER popd still restores the inherited entry. Length-only restore
+    // cannot do this (it re-holes the array → the outer popd no-ops).
+    // Real bash, verified: c/tracked.md (untracked) · docs/tracked.md (TRACKED)
+    // · a/tracked.md (untracked) — i.e. D1/D3 ALLOW, D2 BLOCK.
+    has("cd c; pushd ../docs; ( popd ); popd; echo x > tracked.md", "redirect:H/c/tracked.md", "D1: ( popd ) discarded; outer popd restores the pre-pushd cwd (c)");
+    allows("cd c; pushd ../docs; ( popd ); popd; echo x > tracked.md", "D1 gate: writable new file in c → ALLOW");
+    has("cd docs; pushd ../c; ( popd ); popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "D2: outer popd restores docs — the TRACKED hub write is not lost");
+    blocks("cd docs; pushd ../c; ( popd ); popd; echo x > tracked.md", "D2 gate: TRACKED docs/tracked.md → BLOCK (the #437 dirty-hub inflow)");
+    has("cd a; pushd ../docs; ( popd ); popd; echo x > tracked.md", "redirect:H/a/tracked.md", "D3: ( popd ) discarded; outer popd restores the pre-pushd cwd (a)");
+    allows("cd a; pushd ../docs; ( popd ); popd; echo x > tracked.md", "D3 gate: writable new file in a → ALLOW");
+    has("cd docs; pushd ../c; ( ( popd ) ); popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "nested ( ( popd ) ): the inner frames' pops never reach the outer stack");
+    has("cd docs; pushd ../c; pushd ../a; ( popd ); popd; echo x > tracked.md", "redirect:H/c/tracked.md", "two inherited entries: one subshell pop discards only its own copy");
+
+    // ── (b) EVERY pipeline segment is a subshell, the LAST one included: a cd
+    // in the final segment dies at the boundary, so the next command runs from
+    // the pipeline's START cwd. Real bash (fixture root): F1/F2/F3 write the
+    // ROOT tracked.md; the control F5 (`cd` BEFORE the `|`) writes docs/.
+    has("true | cd docs; echo x > tracked.md", "redirect:H/tracked.md", "F1: the last pipeline segment's cd dies at `;`");
+    blocks("true | cd docs; echo x > tracked.md", "F1 gate: the write is the TRACKED root file → BLOCK");
+    has("cd docs | cd a; echo x > tracked.md", "redirect:H/tracked.md", "F2: BOTH segments are subshells — neither cd survives");
+    has("echo hi | cd docs\n echo x > tracked.md", "redirect:H/tracked.md", "F3: a newline is a boundary too — the last segment's cd still dies");
+    has("cd docs && true | cat; echo x > t.md", "redirect:H/docs/t.md", "F5 control: a cd BEFORE the pipe is NOT a pipeline segment — it survives");
+    has("cd docs | cat; echo x > t.md", "redirect:H/t.md", "F6 control: the cd IS the pipeline segment — it dies at `|` (round-2 pin holds)");
+
+    // ── (c) a FAILED pushd never touches the dir stack (bash errors and leaves
+    // `dirs` unchanged). Pushing the cwd anyway desynchronises the stack, so a
+    // later bare popd lands one entry off and the walker's cwd drifts INTO the
+    // fail-open direction. Real bash: root tracked.md is overwritten.
+    has("pushd /nonexistent; cd a; popd; echo x > ../tracked.md", "redirect:H/tracked.md", "B1: a failed pushd leaves the stack alone — popd is a no-op, cwd stays a");
+    blocks("pushd /nonexistent; cd a; popd; echo x > ../tracked.md", "B1 gate: the real write is the TRACKED root file → BLOCK");
+    has("cd docs; pushd ../c; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "B2 control: a SUCCESSFUL pushd still collapses on the bare popd (docs)");
+
+    // ── (d) a bare newline ends a simple command, so a cwd builtin must not
+    // read its operand across one (`popd` + newline + `cd a`: real bash runs
+    // TWO commands). Real bash: cwd is `a`, so `../tracked.md` is the TRACKED
+    // root file.
+    has("popd\ncd a; echo x > ../tracked.md", "redirect:H/tracked.md", "N1: the bare popd does not eat the next line's `cd`");
+    blocks("popd\ncd a; echo x > ../tracked.md", "N1 gate: the real write is the TRACKED root file → BLOCK");
+    lacks("cd\ndocs; echo x > tracked.md", "redirect:H/docs/tracked.md", "N2: `cd` + newline is a bare cd — the next line is NOT its operand");
+  }
+
+  // ── #3956 completion (lane 3956): the issue names THREE indicators and only
+  // the two bypass-direction ones are pinned (C437r45 N1/N2). Indicator 3 — the
+  // CONTROL that "must not regress" — had NO pin, and it is not cosmetic: the
+  // plausible-but-wrong implementation of this very issue ("the operand read
+  // stops at a newline") is to stop the WORD at the newline instead of merely
+  // refusing to SKIP one. That loses the cd entirely, and then
+  // `cd \<NL>docs; echo pwn > ../tracked.md` resolves one level ABOVE the hub
+  // while real bash overwrites the TRACKED root file — the same fail-OPEN this
+  // issue closed, one implementation choice away. So every row below is a pair:
+  // the continuation (must keep the cd) and its bare-newline neighbour (must NOT
+  // read the next line as the operand).
+  //
+  // ⛔ WHAT THE BARE-NEWLINE ROWS ACTUALLY PIN: THE WALKER'S MODEL, NOT A
+  // REAL-BASH WRITE (fresh review, P1 — the previous wording there claimed a
+  // real-bash write that does not happen). Measured on bash 5.2.21 with HOME
+  // OUTSIDE the fixture hub: a bare `cd` is `cd "$HOME"` — it does NOT leave the
+  // cwd unchanged — and on the next line `docs` is a COMMAND (`bash: docs:
+  // command not found`, rc 127), so `cd <NL>docs && echo x > f.md` performs NO
+  // WRITE AT ALL: the bare cd left the hub for $HOME and `&&` short-circuits to
+  // nothing. The WALKER models a bare `cd`/`pushd` as a conservative NO-OP
+  // (the "flag / +N / bare forms don't cd (conservative no-op)" arm of its
+  // cd/pushd branch), so it keeps the cwd at the hub and emits `redirect:H/f.md`
+  // — an over-approximation (a write that never happens) in the SAFE direction,
+  // and the direction the N3 control must keep: the mutant this block exists
+  // against is the OVER-read (`skipWsNl` crossing the newline, #3956), which
+  // lands on the TRACKED `docs/f.md`.
+  // Measured per arm (bash 5.2.21, HOME outside the fixture hub):
+  //   `cd \<NL>docs && echo x > f.md`      → docs/f.md      (continuation)
+  //   `cd <NL>docs && echo x > f.md`       → nothing written (bare cd → $HOME;
+  //                                          `docs` exits 127, `&&` short-circuits)
+  //   `cd \<NL>docs; echo pwn > ../tracked.md` → tracked.md (TRACKED root)
+  //   `pushd \<NL>docs; echo pwn > ../tracked.md` → tracked.md (TRACKED root)
+  // ⛔ AND THE BARE-cd NO-OP IS NOT HARMLESS IN THAT OTHER DIRECTION (measured
+  // on this box, NOT this issue's newline root, and NOT pinned here as a
+  // verdict): real bash's bare `cd` goes to $HOME, so on a box where HOME IS the
+  // hub's parent — this fleet's own layout, HOME=/home/cmux,
+  // hub=/home/cmux/agent-infra — `cd <NL>echo pwn > agent-infra/tracked.md`
+  // really overwrites the TRACKED hub file while the walker (cwd unchanged at
+  // the hub) resolves `agent-infra/tracked.md` one directory too DEEP, i.e. an
+  // ALLOW. Filed as #3981 with that measurement; the bare-newline arms here stay
+  // controls, so nothing below claims the model is real-bash-equal.
+  // ⛔ ONE TRACKED FILE PER ARM FAMILY (#3957 review NOTE 1): with BOTH paths
+  // tracked, the wrong resolution and the right one BOTH block, so the gate rows
+  // could not discriminate. Each `blocks`/`allows` row declares the one file
+  // THAT ARM writes — the real-bash target for a continuation arm, the walker's
+  // no-op target for a bare-newline control; a candidate resolved outside the
+  // hub is keyed by its absolute path, which can never equal a hub-relative
+  // tracked name.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt3956-"));
+    mkdirSync(join(H, "docs")); mkdirSync(join(H, "a"));
+    writeFileSync(join(H, "docs", "f.md"), "tracked\n");
+    writeFileSync(join(H, "docs", "tracked.md"), "tracked\n");
+    writeFileSync(join(H, "tracked.md"), "tracked\n");
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const rels = (cmd) => cands(cmd).map((x) => ({
+      rel: x.resolvedPath.startsWith(H + "/") ? x.resolvedPath.slice(H.length + 1) : x.resolvedPath,
+    }));
+    const has = (cmd, needle, label) => expectBool(`C3956: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C3956: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    const blocks = (tracked, cmd, label) => expectBool(`C3956: ${label}`, firstHubTrackedWrite(rels(cmd), tracked) !== null, true);
+    const allows = (tracked, cmd, label) => expectBool(`C3956: ${label}`, firstHubTrackedWrite(rels(cmd), tracked) !== null, false);
+
+    // indicator 3, verbatim: a backslash-newline IS a line continuation.
+    has("cd \\\ndocs && echo x > f.md", "redirect:H/docs/f.md", "N3: `\\`+newline is a continuation — `docs` IS cd's operand");
+    blocks(["docs/f.md"], "cd \\\ndocs && echo x > f.md", "N3 gate: real bash overwrites the TRACKED docs/f.md → BLOCK");
+    // …and its neighbour, which is what makes N3 discriminate: a BARE newline
+    // ends the simple command, so `docs` is a COMMAND (bash: command not found)
+    // and cd has NO operand. The row pins the WALKER's model of that shape: a
+    // bare cd is a conservative NO-OP, so the write stays at the fixture root.
+    has("cd\ndocs && echo x > f.md", "redirect:H/f.md", "N3 control: a bare newline is NOT a continuation — `docs` is a command, not cd's operand (walker: bare cd = no-op, so the write is the hub's root f.md)");
+    lacks("cd\ndocs && echo x > f.md", "redirect:H/docs/f.md", "N3 control: the pre-fix over-read (docs as cd's operand) stays closed");
+    allows(["docs/f.md"], "cd\ndocs && echo x > f.md", "N3 control gate: the walker's bare-cd no-op keeps the write at the untracked root f.md → ALLOW (real bash writes nothing here at all — the bare cd goes to $HOME and `docs`, a command, exits 127)");
+
+    // The continuation in the BYPASS direction: an implementation that drops the
+    // continued cd resolves the write one level ABOVE the hub — an ALLOW on a
+    // TRACKED hub file. This is the row the N1/N2 pins cannot catch.
+    has("cd \\\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N4: the continued cd is not lost — the write is the tracked root file, not one level above the hub");
+    blocks(["tracked.md"], "cd \\\ndocs; echo pwn > ../tracked.md", "N4 gate: TRACKED root tracked.md → BLOCK");
+    // its neighbour: with a BARE newline the cd is BARE, and the walker models a
+    // bare cd as a NO-OP, so the cwd stays the hub and `..` resolves one level
+    // ABOVE it — the tracked root file is never touched. ⛔ NOT because "`..` is
+    // the hub's parent" in bash: real bash's cwd here is $HOME (a bare cd is
+    // `cd "$HOME"`), so bash's `..` is $HOME's parent. The ALLOW holds under
+    // both models only because the fixture puts HOME outside the hub (see the
+    // block comment: with HOME == the hub's parent this arm is a fail-OPEN,
+    // filed separately).
+    lacks("cd\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N4 control: a bare newline leaves a bare cd, and the walker's bare-cd no-op keeps the cwd at the hub — so `..` is the hub's PARENT, not the hub (real bash: cwd is $HOME, so `..` is $HOME's parent)");
+    allows(["tracked.md"], "cd\ndocs; echo pwn > ../tracked.md", "N4 control gate (discriminating pair): same shape and SAME tracked root file — the bare-newline arm resolves above the hub, so only the continuation arm blocks");
+    // ⛔ PRESENCE PIN (fresh review, P3): the pair above passes on an EMPTY
+    // candidate list — `firstHubTrackedWrite([]) === null` and `!"".includes(…)`
+    // are both true — so if the walker stopped emitting a candidate for this
+    // bare-newline arm the pair would go vacuous and nothing would redden. The N3
+    // control pins presence through its `has` row; this gives N4 the same
+    // guarantee, which is the difference between a pair that discriminates and a
+    // pair that cannot.
+    expectBool("C3956: N4 control still emits a candidate (presence pin)", cands("cd\ndocs; echo pwn > ../tracked.md").length >= 1, true);
+    has("pushd \\\ndocs; echo pwn > ../tracked.md", "redirect:H/tracked.md", "N5: pushd's operand read honours the continuation too");
+    blocks(["tracked.md"], "pushd \\\ndocs; echo pwn > ../tracked.md", "N5 gate: TRACKED root tracked.md → BLOCK");
+    // continuation + indent, the #625 LEAD-continuation shape, on the cwd path.
+    has("cd \\\n  docs && echo x > f.md", "redirect:H/docs/f.md", "N6: continuation + indent before cd's operand");
+    blocks(["docs/f.md"], "cd \\\n  docs && echo x > f.md", "N6 gate: TRACKED docs/f.md → BLOCK");
+  }
+
+  // ── #3957 review (cycle-46) pins: three shapes where THIS PR's own diff sent
+  // the walker's cwd model AWAY from real bash's. Each was a FAIL-OPEN on a
+  // tracked hub file (a BLOCK became an ALLOW) and each reddened an existing pin
+  // that the body counted as "pre-existing" — C437r43 for ISSUE 1, C437r39 for
+  // ISSUE 2; ISSUE 3 is the same class as #3954 one state variable over.
+  // Every arm is real-bash-verified. The `has(…)` rows pin the RESOLUTION and the
+  // `blocks(…)`/`allows(…)` rows pin the GATE VERDICT, so a fix that resolves
+  // correctly but grades wrong (or vice versa) still reddens.
+  // ⛔ TRACKED IS ONE FILE PER ARM FAMILY — the one real bash overwrites. A
+  // fixture that tracks BOTH candidate paths cannot grade the gate at all: the
+  // wrong resolution and the right one would both BLOCK. That is #3957 review
+  // NOTE 1 on the C437r45 `F1 gate` row, and it is fixed here by construction
+  // (see the tightened F1 row at the end of this block).
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r46-"));
+    mkdirSync(join(H, "c")); mkdirSync(join(H, "docs")); mkdirSync(join(H, "sub"));
+    writeFileSync(join(H, "docs", "tracked.md"), "tracked\n");
+    writeFileSync(join(H, "sub", "q.md"), "tracked\n");
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r46: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const verdict = (tracked, cmd) =>
+      firstHubTrackedWrite(cands(cmd).map((x) => ({ rel: x.resolvedPath.slice(H.length + 1) })), tracked) !== null;
+    const blocks = (tracked, cmd, label) => expectBool(`C437r46: ${label}`, verdict(tracked, cmd), true);
+    const allows = (tracked, cmd, label) => expectBool(`C437r46: ${label}`, verdict(tracked, cmd), false);
+
+    // ── ISSUE 1 (P1, fail-open): a `|` in a case PATTERN is a separator, not a
+    // pipe. Latching pipe state on it made the `;;` boundary restore pipeC0 and
+    // THROW AWAY the arm's `cd docs`, leaving only the unmatched-arm reality at
+    // the root — so the arm's tracked write was never a candidate. The `(`
+    // handler already guards this phase; the `|` handler did not.
+    // Real bash (`x=a`): the arm matches, so docs/tracked.md (TRACKED) is hit.
+    has("case $x in a|b) cd docs;; esac; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1a: alt-member case pattern — the matched arm's cd survives");
+    blocks(["docs/tracked.md"], "case $x in a|b) cd docs;; esac; echo x > tracked.md", "I1a gate: real bash overwrites the TRACKED docs/tracked.md → BLOCK");
+    has("case $x in (a|b) cd docs;; esac; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1b: paren-led alt-member — same arm cd");
+    blocks(["docs/tracked.md"], "case $x in (a|b) cd docs;; esac; echo x > tracked.md", "I1b gate: TRACKED docs/tracked.md → BLOCK");
+    has("case $x in a) cd docs;; esac; echo hi | tee tracked.md", "tee:H/docs/tracked.md", "I1 control: a REAL pipe in an arm body is still a pipe (the pattern guard does not leak into the body)");
+    // `[[ … ]]`: an unquoted `|` there is regex/boolean alternation, never a pipe.
+    // The latch was benign for the cwd (pipeC0 re-derives to the same path) but it
+    // DISCARDED the pending cd, so the invariant is pinned here. ⚠️ These two rows
+    // are CONTROLS on this head — the pre-fix walker also passed them — so they
+    // guard the mechanism rather than redden on a mutant of this diff. The
+    // measurement that earns them: tracking the counter in the RESET_WORDS branch
+    // (the first draft) left it STUCK at 1, and `[[ … ]]; echo hi | tee
+    // docs/tracked.md` then resolved NO candidates at all — a new fail-open.
+    has("cd c; [[ $x =~ a|b ]] && cd ../docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1c control: `|` inside [[ ]] is alternation — the latch must not eat the cd");
+    has("[[ $x =~ a|b ]]; echo hi | tee docs/tracked.md", "tee:H/docs/tracked.md", "I1d control: the [[ ]] counter CLEARS — a later real pipe still surfaces a tee write");
+
+    // ── ISSUE 2 (P1, fail-open): gating the fork-alt `cd` shift on the PRIMARY
+    // candidate's existence drops the alt realities — which are precisely the ones
+    // where the primary cd FAILED and the unmatched-arm write lands. Real bash
+    // (`mode` ≠ `a`): cwd stays at the root, `cd sub` succeeds, sub/q.md is hit.
+    has("case $mode in a) cd docs;; esac; cd sub && echo hi > q.md", "redirect:H/sub/q.md", "I2: the unmatched-arm reality takes the tail cd — its site is not dropped");
+    blocks(["sub/q.md"], "case $mode in a) cd docs;; esac; cd sub && echo hi > q.md", "I2 gate: real bash overwrites the TRACKED sub/q.md → BLOCK");
+    has("case $mode in a) cd docs;; esac; cd sub && echo hi > q.md", "redirect:H/docs/q.md", "I2 control: the matched-arm reality (docs) is still emitted");
+
+    // ── ISSUE 3 (P1, same class as #3954): the pipeline boundary restored the
+    // cwd but not the `dirStack`. `pushd`/`popd` mutate a stack bash SHARES across
+    // the list and every segment is a subshell, so a segment's pushd/popd die with
+    // it; restoring only the cwd left the stack one entry deep, and a later bare
+    // `popd` then landed one entry off. Real bash: the pushd dies, `cd ../docs`
+    // lands in docs, `popd` is an empty-stack NO-OP → docs/tracked.md is hit.
+    has("cd c; pushd ../docs | cat; cd ../docs; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I3p: a pushd in a pipeline segment dies with it — the later bare popd is a bash no-op");
+    blocks(["docs/tracked.md"], "cd c; pushd ../docs | cat; cd ../docs; popd; echo x > tracked.md", "I3p gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd c; pushd ../docs & cd ../docs; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I3a: an async (&) pushd dies with its subshell the same way");
+    blocks(["docs/tracked.md"], "cd c; pushd ../docs & cd ../docs; popd; echo x > tracked.md", "I3a gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd c; pushd ../docs; cd ../docs; popd; echo x > tracked.md", "redirect:H/c/tracked.md", "I3 control: a pushd that really runs is still popd-restored (c)");
+    allows(["docs/tracked.md"], "cd c; pushd ../docs; cd ../docs; popd; echo x > tracked.md", "I3 control gate: the c write is an untracked new file → ALLOW");
+    has("cd c; pushd ../docs | cat; echo x > tracked.md", "redirect:H/c/tracked.md", "I3 control: the pipeline still discards the segment's own cd (cwd stays c)");
+
+    // ── NOTE 1 (tightened): the C437r45 `F1 gate` row tracked BOTH `tracked.md`
+    // and `docs/tracked.md`, so it stayed GREEN under the exact mutant that broke
+    // F1's resolution. With only the ROOT file tracked, the wrong `docs/`
+    // resolution ALLOWS and this row reddens.
+    blocks(["tracked.md"], "true | cd docs; echo x > tracked.md", "F1 gate (tightened, NOTE 1): only the ROOT tracked.md is tracked, so the mutant's docs/ resolution cannot pass");
+  }
+
+
   // walk (`>`/`>>`/`tee`/python open) never surfaced `sed -i`/`cp`/`mv`/
   // `truncate`/`dd of=`/`perl -pi`/`awk -i inplace` onto a tracked hub file,
   // so the same-file write was blocked via redirect but slipped via the verb.
@@ -5180,9 +5970,20 @@ try {
   // anchor helper (a second, drift-prone copy is the regression shape), the
   // exemption scoped to the harvested SET (never to the command), and the
   // message correction.
+  // ⛔ #2775 RE-KEYED THIS PREDICATE ON THE PINNED BYTES, AND THE PINS MOVE WITH IT (agent-infra#2955).
+  // `_sanctionedScriptExemption`'s arm 1 is PATH-ONLY by spec, so a script minted at a sanctioned
+  // relpath under a copy-deployed module root had its discards DROPPED instead of gated — the #1228
+  // fail-open (`_isAuditedSanctionedScript`'s docblock carries the measurement). M5 therefore asks
+  // `_auditedSanctionedExemption(<path>, s.digest)`, handing it the digest of the body the discards
+  // were parsed from and never a re-read of the path (that re-read is the TOCTOU the digest exists to
+  // close). The pins below are the halves that keep that narrowing from being quietly undone: the
+  // AUDITED helper is the only thing consulted, it is handed the SET'S OWN digest, and a set with no
+  // body behind it (`s.digest === null`) is GATED rather than exempted.
   expectBool("#1139: M5 consults the SAME hardened exempt helper — one definition, one anchor, one list",
-    pinSrc.includes("_sanctionedScriptExemption(resolve(execCwd, s.script))") &&
+    pinSrc.includes("_auditedSanctionedExemption(resolve(execCwd, s.script), s.digest)") &&
+    pinSrc.includes("s.digest === null ? null :") &&
     (pinSrc.match(/function _sanctionedScriptExemption\(/g) ?? []).length === 1 &&
+    (pinSrc.match(/function _auditedSanctionedExemption\(/g) ?? []).length === 1 &&
     (pinSrc.match(/const SANCTIONED_SCRIPT_RELPATHS = \[/g) ?? []).length === 1, true);
   expectBool("#1139: the M5 exemption drops the harvested SET, never the command's argv",
     pinSrc.includes("const gatedSets = sets.filter((s) => {") &&
@@ -5197,7 +5998,7 @@ try {
     // even when the dropped set carried no discards, and summing raw push sites
     // double-counts one file pushed as two sets — review cycle-2 P2).
     pinSrc.includes("discards_dropped") && pinSrc.includes("sets_exempted") &&
-    pinSrc.includes("const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>()") &&
+    pinSrc.includes("const exempted = new Map<string, { rel: string; via: \"module-root\" | \"identity\"; discards: number; forms: Set<string> }>()") &&
     // …and a repeated push site must not ADD UP (review cycle-3 P2): the same
     // realpath always yields the same discard list, so `sets_exempted=1` with
     // `discards_dropped=2` misstated the suppression the row exists to report.
@@ -5206,23 +6007,29 @@ try {
   expectBool("#1139: the fail-closed remedy is printed only when that file exists",
     pinSrc.includes("if (existsSync(p)) sanctionedHelper = p;") &&
     !pinSrc.includes("const sanctionedHelper = _frameworkRoot"), true);
-  // #2332 reshaped this predicate: the anchor is no longer the ONLY gate, so the
-  // pin is on the three things that must all still fail CLOSED — (1) an absent
-  // module root skips arm 1 instead of taking it, (2) arm 2 requires a pin (a
-  // missing/unreadable pin JSON yields an empty map, so no relpath is exempt),
-  // and (3) a throwing probe still keeps the M5 set gated. A regression in any
-  // of them turns "cannot tell" into "allow", which is the fail-open this test
-  // exists for.
-  // ⚠️ The anchor string must be UNIQUE in index.ts. `if (_frameworkRoot) {` is
-  // not: it occurs in an unrelated function too, so mutating arm 1 to
+  // #2332 reshaped this predicate and #2775 re-keyed it on the pinned bytes, so the anchor is no
+  // longer the ONLY gate; the pin is on the four things that must all still fail CLOSED — (1) an
+  // absent module root skips arm 1 instead of taking it, (2) arm 2 requires a pin (a missing or
+  // unreadable pin JSON yields an empty map, so no relpath is exempt), (3) the audited helper refuses
+  // on that same absent pin (`return null`, so the caller GATES), and (4) a body whose digest is not
+  // the pin's is refused by the DIGEST — the half #2775 added, and the one that a copy-deployed box
+  // depends on. A regression in any of them turns "cannot tell" into "allow", which is the fail-open
+  // this test exists for.
+  // ⛔ The anchor string must be UNIQUE in index.ts. `if (_frameworkRoot) {`
+  // is not: it occurs in an unrelated function too, so mutating arm 1 to
   // `if (true) {` left the assertion green (measured at #2332 review). The pin
   // is on the arm-1 open + its own loop, which appears exactly once.
+  // ⛔ `catch { sa = null; }` / `if (sa === null) return true;` REPLACED THE PRE-#2775 M5 NAMES
+  // (`rel`) when the predicate was re-keyed; the site is the same one, so the arm keeps testing the
+  // same property rather than being deleted.
   expectBool("#1139 T6: a null anchor / an absent pin / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
     pinSrc.includes("if (_frameworkRoot) {\n    for (const rel of SANCTIONED_SCRIPT_RELPATHS) {") &&
     (pinSrc.match(/if \(_frameworkRoot\) \{\n    for \(const rel of SANCTIONED_SCRIPT_RELPATHS\) \{/g) ?? []).length === 1 &&
     pinSrc.includes("if (typeof want !== \"string\" || want.length !== 64) continue;") &&
-    pinSrc.includes("catch { rel = null; }") &&
-    pinSrc.includes("if (rel === null) return true;"), true);
+    pinSrc.includes("if (typeof want !== \"string\" || want.length !== 64) return null;") &&
+    pinSrc.includes("return bodyDigest === want ? sa : null;") &&
+    pinSrc.includes("catch { sa = null; }") &&
+    pinSrc.includes("if (sa === null) return true;"), true);
   expectBool("#1139 (review cycle-1 P1): the pipe-seed walk TOKENIZES shell words (a quoted piped script was unwalked)",
     pinSrc.includes("wtShellWords(String(pipeSeg.slice(0, -1).join(\"|\")))") &&
     // ... and does NOT dequote-then-split, which invents a seed for unquoted

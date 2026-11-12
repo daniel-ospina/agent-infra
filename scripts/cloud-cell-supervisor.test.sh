@@ -67,6 +67,24 @@ if [ -z "$SEED_WORKERS" ]; then
   echo "       seed NOTHING and every start arm would pass vacuously."
   exit 1
 fi
+# ⛔ THE LANDING-RAIL SET IS DERIVED FROM THE SHIPPED SUPERVISOR TOO (#2176), for the same reason and
+# by the same rule: a hand-written copy of the rail's closure in a fixture would let the supervisor
+# grow a fifth rail file while every fixture kept seeding four — and the arms would then exercise an
+# INCOMPLETE rail refusal instead of the delivery they describe. `rail_names()` is one printf line on
+# purpose (its own comment says so: the list IS the closure), so it parses the same way SEED_WORKERS
+# does. A parse that yields nothing is FATAL, not empty: an empty set makes every rail assertion
+# below vacuous while the suite reports green.
+RAIL_FILES="$(awk '/^rail_names\(\)/ {
+    i = index($0, "printf"); if (!i) next
+    rest = substr($0, i)
+    sub(/^printf[^ ]* +'"'"'[^'"'"']*'"'"' +/, "", rest)
+    sub(/;[[:space:]]*}[[:space:]]*$/, "", rest)
+    print rest; exit }' "$SUP")"
+if [ -z "$RAIL_FILES" ]; then
+  echo "FATAL: cannot parse rail_names() out of $SUP — the landing-rail assertions below would test"
+  echo "       NOTHING and every fixture would seed an empty rail."
+  exit 1
+fi
 # Each seed site calls this; it records the SITE (not a counter) because several sites run inside a
 # `( … )` subshell — the #1989 arms — where an incremented variable would be discarded on exit.
 seed_site() { printf '%s\n' "${BASH_SOURCE[0]}:$1" >> "$SEED_LOG" 2>/dev/null || true; }
@@ -222,6 +240,9 @@ make_ai_repo() {
   printf '#!/bin/bash\nexit 0\n' > "$AI/scripts/record-review.sh"
   mkdir -p "$AI/scripts/lib"
   printf '#!/usr/bin/env python3\n' > "$AI/scripts/lib/diff-normalize.py"
+  # …and the LANDING RAIL `start` provisions beside it (#2176). `rail_src_dir()` is `$HARNESS/..`, so
+  # it reads the same `$AI/scripts/` the recorder comes from.
+  stub_rail "$AI/scripts"
   # #1932: `prune` delegates a worktree `.venv` to this reaper, so the fixture checkout carries the
   # REAL script — a fixture without it would make every prune arm pass for the wrong reason ("reaper
   # not found, so nothing was removed"), which is exactly the vacuous shape this suite avoids.
@@ -241,6 +262,23 @@ write_doctor_stub() { # <dir>
   mkdir -p "$1" || return 1
   printf '#!/bin/bash\n[ "${1:-}" = loop ] && exec sleep 20\nexit 0\n' > "$1/cloud-cell-doctor.sh" || return 1
   chmod +x "$1/cloud-cell-doctor.sh"
+}
+
+# The LANDING RAIL (#2176). `start` provisions it into $CELL_HOME/.pi/agent/scripts/ and `cmd_check`
+# certifies a cell only when the CLOSURE is present and executable — `admin-merge.sh` PLUS the three
+# helpers it execs from its own directory (`ci-failure-set.sh`, `ci_exemption.py`,
+# `ci-workflow-pr-evaluable.sh`), because the rail refuses to run when any is missing. So a fixture
+# that stubs the rail with one file exercises the incomplete-rail refusal instead of the arm it says
+# it exercises, and a fixture that stubs none of it dies there instead. This is the same rule the
+# `$SEED_WORKERS`/record-step fixtures already follow: every fixture must be a CELL, not a partial
+# copy that only the newest refusal can reach.
+stub_rail() { # <dir>
+  local _n
+  mkdir -p "$1" || return 1
+  for _n in $RAIL_FILES; do
+    printf '#!/bin/bash\nexit 0\n' > "$1/$_n" || return 1
+    chmod +x "$1/$_n" || return 1
+  done
 }
 
 make_ai_repo
@@ -471,6 +509,7 @@ printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # … cannot pin a harness to verify against" instead of exercising key delivery.
 printf '#!/bin/bash\nexit 0\n' > "$W/record-review.sh"; chmod +x "$W/record-review.sh"
 mkdir -p "$W/lib"; printf '#!/usr/bin/env python3\n' > "$W/lib/diff-normalize.py"
+stub_rail "$W"   # #2176: the rail `start` provisions beside the recorder, one above the harness
 stub_missing "$W/bin" pi
 # The controller's ONLY relevant act: the second tmux boundary. `sleep 4` keeps the session alive
 # past cmd_start's own `sleep 3` has-session check.
@@ -485,7 +524,7 @@ cat > "$W/harness/merge-one.sh" <<EOF
 k="\${AI_REVIEW_GATE_KEY:-}"
 if [ -z "\$k" ] && [ -f "\$HOME/.pi/agent/.ai-review-gate-key" ]; then k="\$(cat "\$HOME/.pi/agent/.ai-review-gate-key")"; fi
 printf '%s' "\${DEEPSEEK_API_KEY:-}" > '$W/worker-prov'
-printf 'HOME=%s\\nO=%s\\n' "\${HOME:-}" "\${O:-}" > '$W/worker-env'
+printf 'HOME=%s\\nO=%s\\nO_WORK=%s\\n' "\${HOME:-}" "\${O:-}" "\${O_WORK:-}" > '$W/worker-env'
 printf '%s' "\$k" | tr -d '[:space:]' > '$W/worker-key'
 EOF
 chmod +x "$W/harness/orch-loop.sh" "$W/harness/merge-one.sh"
@@ -536,7 +575,11 @@ case "$sub" in
     exit 0 ;;
   new-session)
     if no_server; then
-      for v in PATH HOME O AI_REVIEW_GATE_KEY DEEPSEEK_API_KEY AI1711_STATE; do
+      # ⛔ `O_WORK` IS IN THE SNAPSHOT BECAUSE A REAL SERVER INHERITS THE CLIENT'S WHOLE ENVIRONMENT
+      # (#2095): the list below is a deterministic SLICE of that environment, and the cold arms assert
+      # that a worker created with no pre-existing server still receives the harness root. Omit it here
+      # and the double models a tmux that drops an exported variable — the opposite of the real one.
+      for v in PATH HOME O O_WORK AI_REVIEW_GATE_KEY DEEPSEEK_API_KEY AI1711_STATE; do
         declare -p "$v" 2>/dev/null || printf 'unset %s\n' "$v"
       done > "$S/server-env"
       # Seed a representative slice of tmux's own compiled-in default list, so the suite can tell an
@@ -630,13 +673,31 @@ wk_case() {
   for i in $(seq 1 40); do pgrep -f "$W/harness/orch-loop\.sh" >/dev/null 2>&1 || break; sleep 0.25; done
   env AI_REVIEW_GATE_KEY="$amb" PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
       CELL_HOME="$W/cellhome" HOME="$W/cellhome" ENV_FILE="$envf" \
-      SESSION="$sess" DOCTOR_SESSION="cell-doctor-1711" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 \
+      SESSION="$sess" DOCTOR_SESSION="cell-doctor-1711" O="$W/o" O_WORK="$W/o-work" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 \
       HARNESS_REF="$W_REF" \
       bash "$SUP" start >"$W/start.$kind.$route.$server.out" 2>&1 || rc=$?
   for i in $(seq 1 80); do [ -f "$W/worker-key" ] && break; sleep 0.25; done
   if [ "$rc" -ne 0 ]; then
     bad "$tag: start failed (rc=$rc): $(tail -2 "$W/start.$kind.$route.$server.out" | tr '\n' ' ')"
     return
+  fi
+  # #2176 — THE LANDING RAIL. Step 4 (the recorder, provisioned above by the shipped `start`) is
+  # only half the landing contract; step 5 is `admin-merge.sh`. A cell that receives the recorder and
+  # not the rail completes a PAID review, mints a clean record, and then has nothing runnable — the
+  # state agent-infra#2176 measured on every Linux cell, reached here because `start` provisioned the
+  # recorder only. Asserted as the CLOSURE the rail actually execs, and ONCE: the delivery is
+  # idempotent and this function runs per route/server combination.
+  if [ "${RAIL_ASSERTED:-0}" = 0 ]; then
+    RAIL_ASSERTED=1
+    for _rf in $RAIL_FILES; do
+      [ -f "$W/cellhome/.pi/agent/scripts/$_rf" ] && [ -x "$W/cellhome/.pi/agent/scripts/$_rf" ] \
+        && ok "start: provisioned landing-rail file $_rf into \$CELL_HOME/.pi/agent/scripts/ (#2176)" \
+        || bad "start: did NOT provision $_rf — a cell holding only the recorder can review, record and then NEVER LAND (#2176)"
+    done
+    grep -q "provisioned landing rail: $W/harness/../admin-merge.sh -> $W/cellhome/.pi/agent/scripts/admin-merge.sh" \
+        "$W/start.$kind.$route.$server.out" \
+      && ok "start: says WHICH tree the rail came from (a wrong checkout is visible, not silent)" \
+      || bad "start: never reported provisioning the rail — $(grep -i 'rail' "$W/start.$kind.$route.$server.out" | head -2 | tr '\n' ' ')"
   fi
   got="$(cat "$W/worker-key" 2>/dev/null || true)"
   [ "$got" = "$want" ] \
@@ -653,6 +714,15 @@ wk_case() {
   grep -q "^O=$W/o$" "$W/worker-env" 2>/dev/null \
     && ok "$tag: the worker's \$O is the controller's (no split state dir)" \
     || bad "$tag: worker \$O was not $W/o — $(tr '\n' ' ' < "$W/worker-env" 2>/dev/null)"
+  # ⛔ AND THE HARNESS ROOT IS A DIFFERENT NAME (#2095, review of #3846 P1). `O` is the STATE dir, so a
+  # worker that crosses this boundary without `O_WORK` resolves its modules (`claims.sh`,
+  # `merge-one.sh`) from a directory that holds none of them and loses the landing/head claims
+  # SILENTLY. Asserted here rather than only in worker-terminal's own suite because THIS is the second
+  # tmux boundary: the `pre` arms are the ones that redden if `O_WORK` is dropped from
+  # WORKER_ENV_NAMES (an operator's existing server supplies the session env).
+  grep -q "^O_WORK=$W/o-work$" "$W/worker-env" 2>/dev/null \
+    && ok "$tag: the worker's \$O_WORK is the controller's harness root (its module layer resolves)" \
+    || bad "$tag: worker \$O_WORK was '$(sed -n 's/^O_WORK=//p' "$W/worker-env" 2>/dev/null)' (want $W/o-work) — a dropped work root silently loses the merge claims"
   # agent-infra#1852: the provider runtime credential is the second half of the same delivery. A cell
   # whose WORKER_ENV_NAMES omits DEEPSEEK_API_KEY still MERGES (the rail needs no agent) while EVERY
   # review and fixer dies `No API key found for deepseek`, so merge-<PR> ends verdict:<none> forever
@@ -756,6 +826,7 @@ chmod +x "$F/home/.pi/agent/scripts/record-review.sh"
 printf '#!/usr/bin/env python3\n' > "$F/home/.pi/agent/scripts/lib/diff-normalize.py"
 printf '#!/bin/bash\nexit 0\n' > "$F/record-review.sh"; chmod +x "$F/record-review.sh"
 mkdir -p "$F/lib"; printf '#!/usr/bin/env python3\n' > "$F/lib/diff-normalize.py"
+stub_rail "$F"; stub_rail "$F/home/.pi/agent/scripts"   # #2176: rail source + already-provisioned cell
 stub_missing "$F/bin" pi
 # Stand-in for refresh-candidates.sh --check: echoes the REPO/O it was handed (so a probe run
 # against the wrong repo cannot pass silently) and exits with $PROBE_RC.
@@ -815,6 +886,68 @@ case "$CC_OUT" in
   *"CELL CAN RUN A CONTROLLER"*) ok "check: reaches the CELL CAN RUN banner when the repo is fine" ;;
   *) bad "check: did not reach the banner on a healthy repo — output: $CC_OUT" ;;
 esac
+
+# ── THE LANDING RAIL (#2176) ────────────────────────────────────────────────────────────────────
+# Step 4 of the landing contract is `record-review.sh`; step 5 is the RAIL, `admin-merge.sh`. The
+# recorder is provisioned and refused above (a cell without it can never mint a record); the rail is
+# the same hard dependency one step later, and certifying a cell that holds the recorder but not the
+# rail is the false PASS this issue measured — the lane reviews, records, and then has nothing
+# runnable. Judged as the CLOSURE the rail execs from its OWN directory, because `admin-merge.sh`
+# refuses to run when any helper is missing: "the file exists" is not "the rail can run".
+say_case "check certifies the landing rail only when it can actually RUN (#2176)"
+cellcheck 0
+case "$CC_OUT" in
+  *"the LANDING RAIL is incomplete"*) bad "check: refused a cell carrying the whole rail — output: $CC_OUT" ;;
+  *) ok "check: a cell carrying the full rail closure is not refused" ;;
+esac
+case "$CC_OUT" in
+  *"landing rail present and executable"*) ok "check: reports the rail it verified (a positive reading, not an absence)" ;;
+  *) bad "check: never reported the rail — output: $CC_OUT" ;;
+esac
+# (a) ONE helper short: the rail still EXISTS and is executable, and would exit 1 on EVERY run.
+# Renaming (not deleting) keeps the mutation reversible and keeps `admin-merge.sh` present, so the
+# arm cannot pass by taking a "no rail at all" path.
+mv -f "$F/home/.pi/agent/scripts/ci_exemption.py" "$F/home/.pi/agent/scripts/ci_exemption.py.off"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check: a rail missing one helper it EXECS is refused (non-zero)" \
+                   || bad "check: certified a cell whose admin-merge.sh would exit 1 on every run"
+case "$CC_OUT" in
+  *"ci_exemption.py"*) ok "check: names the missing rail file" ;;
+  *) bad "check: the refusal does not name ci_exemption.py — output: $CC_OUT" ;;
+esac
+case "$CC_OUT" in
+  *"agent-infra#2176"*) ok "check: the refusal carries its issue, so the remedy is findable" ;;
+  *) bad "check: the refusal does not cite agent-infra#2176" ;;
+esac
+# ⛔ THE REMEDY MUST BE PASTEABLE (measured, P3): `rail_names()` prints ONE NAME PER LINE, and the
+# refusal used to interpolate it straight into `for f in $(rail_names); do …`, so the command an
+# operator is handed spanned FOUR lines — pasting it runs `for f in admin-merge.sh` and then
+# `ci-failure-set.sh` as a command (`syntax error near unexpected token`). A refusal whose own remedy
+# does not run is the same class as the false PASS this block exists to remove, and it is invisible to
+# every arm above (they grep the message for NAMES, not for the SHAPE of the command in it).
+# The expected list is DERIVED from `$RAIL_FILES` (one line, source order) rather than hand-copied, so a
+# new rail file reaches this arm the same way it reaches every fixture — the rule at the top of this file.
+case "$CC_OUT" in
+  *"for f in $RAIL_FILES"*) ok "check: the rail remedy's loop list is on ONE line, so the suggested command is pasteable" ;;
+  *) bad "check: the rail remedy is NOT pasteable — its for-f-in list is newline-separated — output: $CC_OUT" ;;
+esac
+mv -f "$F/home/.pi/agent/scripts/ci_exemption.py.off" "$F/home/.pi/agent/scripts/ci_exemption.py"
+# (b) Present but NOT executable. The lane TYPES this path, so an x-less copy is a seam nobody can
+# run — and it must not be certifiable, or the failure surfaces at step 5 instead of at the gate.
+chmod -x "$F/home/.pi/agent/scripts/admin-merge.sh"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check: a non-executable admin-merge.sh is refused (the lane types this path)" \
+                   || bad "check: certified a cell whose rail is not executable"
+case "$CC_OUT" in
+  *"admin-merge.sh"*) ok "check: names the non-executable rail file" ;;
+  *) bad "check: the refusal does not name admin-merge.sh — output: $CC_OUT" ;;
+esac
+chmod +x "$F/home/.pi/agent/scripts/admin-merge.sh"
+# (c) The fixture is WHOLE again — asserted, so neither mutation above can leave a later section
+# reddening for a reason this one created.
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check: the restored fixture passes again (the two mutations were the only delta)" \
+                   || bad "check: fixture not restored — rc=$CC_RC: $CC_OUT"
 
 # ── the provider CREDENTIAL STORE (agent-infra#2024) ───────────────────────────────────────────
 # MEASURED 2026-11-05 on all five cells: `~/.pi/agent/auth.json` was `{}` (2 bytes). pi consults the
@@ -1050,6 +1183,7 @@ mkdir -p "$P/home/.pi/agent/scripts/lib"
 printf '#!/bin/bash\nexit 0\n' > "$P/home/.pi/agent/scripts/record-review.sh"
 chmod +x "$P/home/.pi/agent/scripts/record-review.sh"
 printf '#!/usr/bin/env python3\n' > "$P/home/.pi/agent/scripts/lib/diff-normalize.py"
+stub_rail "$P"; stub_rail "$P/home/.pi/agent/scripts"   # #2176: rail source + the cell's provisioned copy
 # …and the runtime-dependency probe needs `pi`, which the ubuntu CI runner does not install. GAPS
 # ONLY (see `stub_missing`): `git` must stay REAL here — the provenance arms below read its output.
 stub_missing "$P/bin" pi
@@ -1299,6 +1433,80 @@ cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
 # Restore PH to the record: `prov` points HARNESS at whatever PH holds, and the cases below assert
 # against origin/main — leaving it on the old detached worktree would make (f) fail for the wrong
 # reason (a behind harness, not a post-seed edit).
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+
+# (e2b) `apply --pin-only` ON A CELL WHOSE CONTROLLER IS LIVE (agent-infra#2738).
+# The guard above `harness_apply` used to run BEFORE the `--pin-only` branch, so the one verb that exists
+# for a running cell was refused by it — and the refusal's own message offered `--force`, which defeats the
+# SAME guard on the SEEDING path, so `--force` stopped distinguishing "advance the pin" from "re-seed `$O`
+# under a live loop". MEASURED 2026-10-24 19:05Z on `pi-cell-3`: the pin record named `709ceb911b03` and
+# that pin directory did not exist, the repair was `apply --pin-only`, it printed
+# `FATAL: a controller is RUNNING (pid 2446252)`, and `--force` was the only way through.
+# ⛔ THE FIXTURE IS A REAL LIVE CONTROLLER, not a stubbed verdict: `seen_controller_pids`'s lock leg needs
+# a running `bash …/orch-loop.sh` whose pid an `.orch.lock` written AFTERWARDS names (the age direction
+# therefore reads "began before the lock" — a controller, not pid reuse), so the pin-only assertion below
+# cannot be satisfied by a fixture the guard simply ignores. Both directions are needed: an exemption that
+# had also DELETED the guard reddens the plain-apply assertion, and a missing exemption reddens the
+# pin-only one.
+mkdir -p "$P/lockctl"
+printf '#!/bin/sh\nsleep 300\n' > "$P/lockctl/orch-loop.sh"; chmod +x "$P/lockctl/orch-loop.sh"
+bash "$P/lockctl/orch-loop.sh" >/dev/null 2>&1 & _PIN_LIVE=$!
+sleep 0.3
+printf '%s\n' "$_PIN_LIVE" > "$P/o/.orch.lock"
+# Point the box BACK at the pre-(e) pin and hand-edit $O, so "the pin advanced" and "$O was not re-seeded"
+# are both observable rather than implied.
+# ⛔ ASSIGNING `PH` IS NOT ENOUGH — THE RECORD MUST BE MOVED TOO, OR THE ADVANCE ARM IS VACUOUS
+# (independent review of this PR, P1, and it was right). `prov` passes `HARNESS="$PH"` but the NEXT
+# `apply` re-resolves the harness from `$HARNESS_PIN_FILE`, which §(e)/(e2) left naming
+# `pin/<the tip>`: the post-call record would then already satisfy the "advanced" pattern and the arm
+# would pass over a `--pin-only` that did NOTHING. The value written here is also the exact pi-cell-3
+# shape — a record naming a pin directory that does NOT exist — so the arm exercises the repair, not a
+# no-op.
+PH="$P/pin/000000000000/scripts/orchestrator-harness"
+printf '%s\n' "$PH" > "$P/home/.harness-path"
+_REC_BEFORE="$(cat "$P/home/.harness-path" 2>/dev/null)"
+printf '\n# hand edit a pin-only would erase\n' >> "$P/o/orch-loop.sh"
+prov apply --pin-only
+[ "$PROV_RC" -eq 0 ] \
+  && ok "apply --pin-only is ALLOWED on a cell whose controller is live (the no-skew advance is reachable)" \
+  || bad "apply --pin-only was REFUSED with a live controller — the guard still gates the pin-only path (rc=$PROV_RC): $PROV_OUT"
+_PIN_AFTER="$(cat "$P/home/.harness-path" 2>/dev/null)"
+[ "$_PIN_AFTER" != "$_REC_BEFORE" ] \
+  && ok "…and it REWROTE the pin record (fixture check: it named a non-existent pin before the call)" \
+  || bad "the pin record still names '$_REC_BEFORE' — `--pin-only` exited 0 without advancing anything (the reachable-but-inert mutant)"
+case "$_PIN_AFTER" in
+  "$P/pin/$(printf '%s' "$WANT" | cut -c1-12)"/*) ok "…and the pin really advanced to origin/main under the live controller (the measured pi-cell-3 repair)" ;;
+  *) bad "--pin-only recorded '$_PIN_AFTER' instead of the pin for $WANT — the exempted path did nothing: $PROV_OUT" ;;
+esac
+grep -q 'hand edit a pin-only would erase' "$P/o/orch-loop.sh" 2>/dev/null \
+  && ok "…and it did NOT seed \$O under the live loop (the skew the guard exists to prevent is still absent)" \
+  || bad "--pin-only re-seeded \$O/orch-loop.sh — the exemption let the exempted path do the guarded thing"
+# THE GUARD IS NOT GONE — the same live controller must still refuse the SEEDING path, or the exemption
+# above is indistinguishable from having deleted the guard.
+prov apply
+[ "$PROV_RC" -ne 0 ] \
+  && ok "…while a plain apply is STILL refused with a live controller (the guard kept its seeding path)" \
+  || bad "a plain apply SEEDED the running cell's state dir — exempting --pin-only removed the guard instead of scoping it (rc=$PROV_RC): $PROV_OUT"
+case "$PROV_OUT" in
+  *"a controller is RUNNING (pid $_PIN_LIVE"*) ok "…naming the pid it can see, so the refusal is this fixture's controller" ;;
+  *) bad "the refusal did not name the live pid $_PIN_LIVE — it came from something else, so the arm above proves nothing: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"apply --pin-only"*) ok "…and it NAMES a non-destructive remedy, so an operator is not steered to the flag that defeats the guard" ;;
+  *) bad "the refusal still offers only 'stop' and '--force' — the pi-cell-3 dead end (agent-infra#2738): $PROV_OUT" ;;
+esac
+kill -KILL "$_PIN_LIVE" 2>/dev/null; wait "$_PIN_LIVE" 2>/dev/null
+rm -f "$P/o/.orch.lock"
+# The control: with that controller gone the SAME plain apply seeds, which is what makes the two refusal
+# assertions above attributable to the live controller rather than to some other precondition of the
+# fixture.
+prov apply
+[ "$PROV_RC" -eq 0 ] \
+  && ok "…and once the controller is gone the SAME apply seeds (the refusal was the live controller, not the fixture)" \
+  || bad "a plain apply was still refused with no controller running, so the guard arms above prove nothing (rc=$PROV_RC): $PROV_OUT"
+cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
+  && ok "…and that seed erased the hand edit, so the 'did NOT seed' arm above was not vacuous" \
+  || bad "the control seed left the hand edit in \$O/orch-loop.sh, so 'did not seed' proved nothing"
 PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
 
 # (e3) STATUS must bound the self-refresh verdict by the LOOP's cycle, not an operator-shell default.
@@ -2463,6 +2671,7 @@ chmod +x "$Q/harness/refresh-candidates.sh"
 # without it (and its declared sibling), one directory up from the harness.
 printf '#!/bin/bash\nexit 0\n' > "$Q/record-review.sh"; chmod +x "$Q/record-review.sh"
 mkdir -p "$Q/lib"; printf '#!/usr/bin/env python3\n' > "$Q/lib/diff-normalize.py"
+stub_rail "$Q"   # #2176: the rail `start` provisions beside the recorder
 git -C "$Q/harness" add -A
 git -C "$Q/harness" commit -q -m "section 12 fixture harness"
 Q_REF="$(git -C "$Q/harness" rev-parse HEAD)"
@@ -3933,8 +4142,11 @@ kill -0 "$PEER" 2>/dev/null && ok "stop: the PEER controller SURVIVED a stale lo
                             || bad "stop: KILLED the peer controller from a stale lock — the peer is not ours to signal"
 [ -e "$P/o/.orch.lock" ] && ok "stop: left the lock in place (a pid we cannot prove dead is not ours to release)" \
                           || bad "stop: released a lock whose named pid is alive"
-# The provably-DEAD form: the same lock with a pid that is gone is noise the harness's acq() clears,
-# but a recycled pid makes acq() see a live process and exit 0 SILENTLY — so `stop` says so.
+# The provably-DEAD form: the same lock with a pid that is gone is noise the harness's lock clears.
+# (A recycled pid used to make `orch-loop.sh` see a live process and exit 0 SILENTLY; agent-infra#2095
+# gave the loop a real identity test — it reclaims a pid that began after the record was written — so
+# that case is now handled by the loop itself, and this suite's concern is only that `stop` names what
+# it cannot prove.)
 kill -9 "$PEER" 2>/dev/null; sleep 0.3
 printf '999999\n' > "$P/o/.orch.lock"
 OUT="$(own_peer stop)"
@@ -4667,6 +4879,7 @@ chmod +x "$Q/bin/tmux"
 printf '#!/bin/bash\nexit 0\n' > "$Q/home/.pi/agent/scripts/record-review.sh"
 chmod +x "$Q/home/.pi/agent/scripts/record-review.sh"
 printf '#!/usr/bin/env python3\n' > "$Q/home/.pi/agent/scripts/lib/diff-normalize.py"
+stub_rail "$Q"; stub_rail "$Q/home/.pi/agent/scripts"   # #2176: rail source + the cell's provisioned copy
 printf '#!/bin/bash\nexit 0\n' > "$Q/record-review.sh"; chmod +x "$Q/record-review.sh"
 mkdir -p "$Q/lib"; printf '#!/usr/bin/env python3\n' > "$Q/lib/diff-normalize.py"
 # GAPS ONLY (see stub_missing): git/python3 stay REAL — the provenance gate reads their output.
@@ -5237,6 +5450,7 @@ exit 0
 SH
 mkdir -p "$W2/lib"; printf '#!/usr/bin/env python3\n' > "$W2/lib/diff-normalize.py"
 chmod +x "$W2/record-review.sh"
+stub_rail "$W2"   # #2176: the rail `start` provisions beside the recorder, one above the harness
 git -C "$W2/harness" add -A >/dev/null 2>&1 || true
 git -C "$W2/harness" -c user.email=t@t -c user.name=t commit -q -m "1989 fixture harness" >/dev/null 2>&1 || true
 W2_REF="$(git -C "$W2/harness" rev-parse HEAD 2>/dev/null || echo origin/main)"
@@ -5382,7 +5596,7 @@ seed_provider_store "$LA/home"
 # loop record, so the harness path it is scanned against must be private to it.
 cp -a "$W2/harness/." "$LA/h/"
 # …plus the record step, which `start` provisions from ONE LEVEL ABOVE the harness (`$HARNESS/../`).
-cp -a "$W2/record-review.sh" "$LA/record-review.sh"; cp -a "$W2/lib" "$LA/lib"
+cp -a "$W2/record-review.sh" "$LA/record-review.sh"; cp -a "$W2/lib" "$LA/lib"; stub_rail "$LA"   # #2176
 cat > "$LA/o/cloud-cell-doctor.sh" <<'SH'
 #!/bin/bash
 [ "${1:-}" = loop ] && exec sleep 30
@@ -6313,6 +6527,7 @@ mkdir -p "$QT/home/.pi/agent/scripts/lib"
 printf '#!/bin/bash\nexit 0\n' > "$QT/home/.pi/agent/scripts/record-review.sh"
 chmod +x "$QT/home/.pi/agent/scripts/record-review.sh"
 printf '#!/usr/bin/env python3\n' > "$QT/home/.pi/agent/scripts/lib/diff-normalize.py"
+stub_rail "$QT/home/.pi/agent/scripts"   # #2176: `check` certifies a cell only with the rail closure
 printf '#!/bin/bash\nexit 0\n' > "$QT/bin/gh"; chmod +x "$QT/bin/gh"
 stub_missing "$QT/bin" pi
 # A RECORDING tmux double: the controller's own command line is the surface the issue is about, so it is
@@ -6605,6 +6820,102 @@ grep -qE 'cp "\$HERE/gh-rest/gh"' "$HERE/orchestrator-harness/install.sh" \
   && ok "install.sh carries a real CP of the adapter (the Mac half of the same seed set)" \
   || bad "install.sh no longer copies the adapter — the Mac half of the parity is gone"
 
+
+# ── §DECISION-GATE: `status` reports the owner-question gate, read-only (agent-infra#2642) ────────
+# MEASURED 2026-10-24 on agent-infra cell-1: `ask-owner.py` exited 2 on all nine owner questions it
+# was handed (no TypeSafe key on the box), so NOTHING reached the `owner-decision` queue while every
+# lane's own report said "asked". `status` is the verb an operator runs to discover a cell's state, so
+# it must answer this one — and it must READ: the WRITER is the bring-up's `check_decision_gate`, and a
+# second writer of one secret is how a repaired box and a certified box drift apart.
+say_case "§DECISION-GATE: status reports the owner-question gate, read-only"
+DG="$T/dgate"
+mkdir -p "$DG/home/.pi/agent" "$DG/bin" "$DG/o" "$DG/repo"
+printf '#!/bin/sh\nexit 1\n' > "$DG/bin/tmux"      # no session on the OPERATOR's tmux server
+chmod +x "$DG/bin/tmux"
+: > "$DG/keys.env"
+dg_sup() { PATH="$DG/bin:$PATH" CELL_HOME="$DG/home" ENV_FILE="$DG/keys.env" O="$DG/o" \
+             REPO="$DG/repo" OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" \
+             bash "$SUP" status 2>&1; }
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: MISSING"*) ok "status prints the decision-gate state when no credential exists (jev: MISSING)" ;;
+  *) bad "status does not report the missing decision-gate credential — a box that cannot queue a question still reads healthy: $OUT" ;;
+esac
+case "$OUT" in
+  *"owner queue"*) ok "…and says what it costs (questions never reach the owner queue), not just 'jev' with no meaning" ;;
+  *) bad "the MISSING line does not say what it costs: $OUT" ;;
+esac
+case "$OUT" in
+  *"cloud-cell-bringup.sh --check"*) ok "…and names the ONE command that repairs it" ;;
+  *) bad "the MISSING line does not name the repairer: $OUT" ;;
+esac
+[ ! -e "$DG/home/.pi/agent/jev-config.json" ] \
+  && ok "…and status WROTE NOTHING (the bring-up is the only writer of that credential)" \
+  || bad "status MINTED a decision-gate credential — two writers of one secret is the drift this gate prevents"
+# The store path: one hand-written 0600 store is enough, and it is read as configured.
+printf '{"apiKey":"sk_store_only","model":"jev-latest"}\n' > "$DG/home/.pi/agent/jev-config.json"
+chmod 600 "$DG/home/.pi/agent/jev-config.json"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*"jev-config.json"*) ok "status reads an existing 0600 store as configured, naming the file it read" ;;
+  *) bad "status did not read the provisioned store as configured: $OUT" ;;
+esac
+# ⛔ A WRONG-TYPED apiKey IS NOT `configured` (#2642 review). The reader stringified a truthy
+# non-string, so `{"apiKey":{"a":1}}` read as configured while `ask-owner.py` builds
+# `Bearer {'a': 1}` from the raw value and gets a 401 — the operator would be told the gate works on a
+# box where it cannot score a single question. The bring-up's `jev_store_state` and the writer
+# `write_jev_store` both already require a string; both surfaces must answer alike.
+printf '{"apiKey":{"a":1},"model":"jev-latest"}\n' > "$DG/home/.pi/agent/jev-config.json"
+chmod 600 "$DG/home/.pi/agent/jev-config.json"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*) bad "status called a wrong-typed apiKey configured — ask-owner.py cannot send it (Bearer {'a': 1} → 401), so every question is UNSCORED: $OUT" ;;
+  *"jev: MISSING"*) ok "a wrong-typed apiKey is NOT read as configured (only a JSON string is a credential the gate can send)" ;;
+  *) bad "a wrong-typed apiKey is reported as neither configured nor MISSING: $OUT" ;;
+esac
+# The FILE is the contract: an ambient export reaches no worker (tmux serves the session the SERVER's
+# environment), so it must be reported as the near-miss it is rather than as configured.
+rm -f "$DG/home/.pi/agent/jev-config.json"
+OUT="$(TYPESAFE_API_KEY=sk_ambient dg_sup)"
+case "$OUT" in
+  *"NOT in"*) ok "an AMBIENT-only key is reported as a near-miss, not as configured (a lane sources the file)" ;;
+  *"jev: configured"*) bad "status called an ambient-only key configured — that is the state a worker has no key in: $OUT" ;;
+  *) bad "an ambient-only key is reported with no explanation: $OUT" ;;
+esac
+# …and the FILE does count, because a lane sources it.
+printf 'TYPESAFE_API_KEY=sk_in_file\n' > "$DG/keys.env"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*"keys.env"*) ok "a key the keys.env FILE carries IS configured (a lane sources that file itself)" ;;
+  *) bad "a keys.env-delivered key was not read as configured: $OUT" ;;
+esac
+# ⛔ A WHITESPACE-ONLY VALUE IS NOT A KEY ON THIS SURFACE EITHER (#2642 review). The `keys.env` arm
+# tested `-n` with no trim, so a blanked key printed `jev: configured … ask-owner.py can score a
+# question` — while `ask-owner.py::_key()` strips and REJECTS the same value, takes the unkeyed branch,
+# and exits 2 on every question. That is exactly the "status certifies a dead decision gate" failure
+# this gate exists to prevent, and it is the population `status` exists for: cells brought up before
+# the gate existed, where no bring-up has run to refuse the box. The bring-up's `jev_key_var` and this
+# function's own store arm already trim; this arm must apply the same rule.
+printf 'TYPESAFE_API_KEY="   "\n' > "$DG/keys.env"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*) bad "status called a WHITESPACE-ONLY keys.env value configured — ask-owner.py strips it and rejects it, so every question exits 2 and nothing reaches the queue: $OUT" ;;
+  *"jev: MISSING"*) ok "a WHITESPACE-ONLY keys.env value is NOT configured (ask-owner.py trims it and finds no key)" ;;
+  *"NOT in"*) ok "a WHITESPACE-ONLY keys.env value is NOT configured (reported as the near-miss it is)" ;;
+  *) bad "a whitespace-only keys.env value is reported as neither configured nor MISSING: $OUT" ;;
+esac
+[ ! -e "$DG/home/.pi/agent/jev-config.json" ] \
+  && ok "…and it still WROTE NOTHING for a blank value (the bring-up remains the only writer)" \
+  || bad "status MINTED a store while judging a blank keys.env value"
+# …and the SAME rule for the ambient arm: a blank export is not a key, so it is the MISSING line's
+# business. Reporting it as "a key is set in THIS shell but NOT in the FILE" would name a near-miss that
+# does not exist (`ask-owner.py` trims it and finds no key either).
+OUT="$(TYPESAFE_API_KEY='   ' dg_sup)"
+case "$OUT" in
+  *"NOT in"*) bad "a WHITESPACE-ONLY ambient export is reported as a key set in this shell — ask-owner.py trims it and finds no key, so that near-miss does not exist: $OUT" ;;
+  *"jev: MISSING"*) ok "…a whitespace-only AMBIENT export is MISSING, not a near-miss (one trimming rule on every arm)" ;;
+  *) bad "a whitespace-only ambient export is reported as neither MISSING nor a near-miss: $OUT" ;;
+esac
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

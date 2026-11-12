@@ -14,6 +14,9 @@
 #   retirement             pre-seeded retired plists unloaded + removed
 #   render determinism     same env → byte-identical output
 #   idempotent skip        second run: "unchanged", no bootout/bootstrap
+#   installed-but-UNLOADED installed plist, byte-identical render, job NOT in the domain (#4008's
+#                          measured state: `bootout` leaves the plist) → the installer BOOTSTRAPS it
+#                          and reads it back; a bootstrap that exits 0 without loading FAILS loudly
 #   change → reload        template bump → reinstall + one new bootstrap
 #   bootstrap failure      shim FAILS bootstrap → installer exits 1, loud
 #   broken-target guard    missing script → refuse, exit 1, no install
@@ -37,10 +40,10 @@ set -euo pipefail
 
 # ⛔ Neutralise the AMBIENT environment before anything runs. Every section decides HOME, launchd
 # provenance and the checkout for itself, and `run_installer` inherits the caller's exports — so a dev
-# box with `ELDATO_ALLOW_TEST_HOME=1`, `FAKE_BOOTSTRAP_FAIL=1`, `FAKE_JOB_NOT_LOADED=1` or a
+# box with `ELDATO_ALLOW_TEST_HOME=1`, `FAKE_BOOTSTRAP_FAIL=1`, `FAKE_JOB_NOT_LOADED=<label>` or a
 # `TORTOISE_REPO` pointing at a broken checkout read differently from CI on the same code (measured:
 # 138/6, 49/80, 142/2 and §8 red respectively). Sections that need one set it explicitly, per run.
-unset ELDATO_ALLOW_TEST_HOME FAKE_BOOTSTRAP_FAIL FAKE_JOB_NOT_LOADED TORTOISE_REPO
+unset ELDATO_ALLOW_TEST_HOME FAKE_BOOTSTRAP_FAIL FAKE_JOB_NOT_LOADED FAKE_BOOTSTRAP_NO_LOAD TORTOISE_REPO
 # #1863 F10 — and hold it EMPTY for the whole suite, not only inside `run_installer`: several sections
 # invoke the installer DIRECTLY (`bash "$INSTALLER" ...`) with a partial env list, so an ambient
 # TORTOISE_REPO (the orchestrator box sets it) leaked in and the {{TORTOISE_REPO}}-gated jobs resolved
@@ -90,15 +93,38 @@ mkdir -p "$T/bin"
 cat > "$T/bin/launchctl" <<'SHIM'
 #!/usr/bin/env bash
 echo "launchctl $*" >> "${FAKE_LAUNCHCTL_LOG:?}"
+# ── DOMAIN MEMBERSHIP IS MODELLED, BECAUSE IT IS NOT THE FILE (agent-infra#4008) ────────────────
+# launchd keeps the loaded state in the DOMAIN, not in the plist: `bootout` takes a job out of the
+# domain and LEAVES THE PLIST ON DISK. A shim whose `print` always answers 0 cannot tell "installed"
+# from "loaded", so it could never have caught the installer answering "unchanged (skip)" to a
+# booted-out job. Each job's membership is a marker file: `bootstrap` creates it, `bootout` removes
+# it. FAKE_JOB_NOT_LOADED=<label> names ONE job that is not in the domain — the field's shape — so a
+# section can model #4008 exactly without changing any other job's verdict.
+loaded_mark="${FAKE_LAUNCHCTL_LOG:?}.loaded"
+case "$1" in
+    print)             lbl="${2##*/}" ;;                       # gui/<uid>/<label> → <label>
+    bootstrap|bootout) lbl="$(basename "${3:-}" .plist)" ;;     # <domain> <plist path> → <label>
+    *)                 lbl="" ;;
+esac
 case "$1" in
     bootstrap)
         if [ -n "${FAKE_BOOTSTRAP_FAIL:-}" ]; then
             echo "bootstrap failed (simulated)" >&2
             exit 1
-        fi ;;
+        fi
+        # FAKE_BOOTSTRAP_NO_LOAD models the OTHER launchd shape: the request is ACCEPTED (exit 0) and
+        # the job is not in the domain. It is the read-back's own control — with the read-back deleted
+        # again, this box would read as converged.
+        [ -n "${FAKE_BOOTSTRAP_NO_LOAD:-}" ] || : > "$loaded_mark.$lbl" ;;
+    bootout)
+        rm -f "$loaded_mark.$lbl" ;;
     print)
-        # "loaded" always in the fake domain
-        [ -n "${FAKE_JOB_NOT_LOADED:-}" ] && exit 1 ;;
+        # "loaded" in the fake domain, except for the one label a section declares out of it — and even
+        # then a successful bootstrap puts it back, so "booted out → installer must bring it back" is
+        # tested end to end rather than asserted against a canned exit code.
+        if [ -n "${FAKE_JOB_NOT_LOADED:-}" ] && [ "${FAKE_JOB_NOT_LOADED}" = "$lbl" ] && [ ! -f "$loaded_mark.$lbl" ]; then
+            exit 1
+        fi ;;
 esac
 exit 0
 SHIM
@@ -679,7 +705,11 @@ RC=$?
 set -e
 assert_eq "$RC" "0" "retirement is idempotent (second run exits 0)"
 assert_not_contains "$OUT" "RETIRED (unloaded + removed)" "no repeat retirement chatter"
-# A retired label that STILL has a template is a config error → loud + exit 1.
+# A retired label that STILL has a template is a CONTRADICTION between two repo files. The MANIFEST
+# wins on a machine (#2908): warn loudly, retire the label, never install the template — and exit 0,
+# because one stale RETIRED line used to take the ENTIRE layer down (cells 3 and 4 ran with no
+# reaper, no liveness detection and no canary over exactly this). The repo's DECLARATION gate is
+# what refuses it: `scripts/fleet-schedule.py --check` exits 1 for this state.
 # The `cp` is guarded: a renamed/removed template is a broken target, and under `set -e` a bare `cp`
 # ended the whole suite here with `cp: cannot stat …`, exit 1 and no tally at all (§2 through §14
 # never ran). Report the missing vehicle template and carry on with the next section.
@@ -692,9 +722,38 @@ set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2" 2>&1)"
 RC=$?
 set -e
-assert_eq "$RC" "1" "retired label with template → exit 1"
+assert_eq "$RC" "0" "retired label with template → exit 0, the manifest wins (#2908)"
 assert_contains "$OUT" "com.eldato.hub-state-check is in RETIRED but a template still exists" "retire/template conflict named loudly"
+assert_not_contains "$OUT" "one or more jobs FAILED" "the conflict does not fail the whole install"
 [ ! -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist" ] && ok "conflicting template NOT installed" || bad "conflicting template NOT installed"
+# ⛔ AND `--status` MUST NAME THE RETIREMENT, NOT AN ABSENCE (#2908 review, P1). A retired job is
+# DELIBERATELY never installed, so status_job reported "NOT INSTALLED" — and `fleet-schedule.py
+# --verify` on macOS turns every NOT INSTALLED line into FAIL / SCHEDULE NOT VERIFIED / rc 1. The
+# layer therefore STARTED and its own gate then called it broken: the #3029 false-FAIL class this
+# PR closes on Linux, left standing on the macOS backend over the one-line manifest edit the docs
+# advertise. systemd's comparable (`mask`) names the state as `masked`, never "missing"; so does this.
+# Non-vacuity: pre-fix this fixture printed `com.eldato.hub-state-check: NOT INSTALLED (template v…)`,
+# so the first assertion reds on the old code and the second is what forbids it coming back.
+set +e
+STATUS_OUT="$(run_installer "$HOME2" --status 2>&1)"
+STATUS_RC=$?
+set -e
+assert_eq "$STATUS_RC" "0" "--status still exits 0 with a retired label present"
+assert_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins — template present; remove the template in the repo)" \
+    "--status names a retired label as RETIRED, so macOS --verify stops reporting it as FAIL"
+assert_not_contains "$STATUS_OUT" "com.eldato.hub-state-check: NOT INSTALLED" \
+    "--status never reports a retired label as NOT INSTALLED (that is the macOS false FAIL)"
+# The other half of the split: a retired label whose installed copy SURVIVES is drift from the
+# manifest, and must NOT be laundered into a clean status — closing a false FAIL must not open a false
+# PASS. `--install` is what clears it (retire_pass unloads + removes).
+cp "$TEMPLATES/com.eldato.hub-state-check.plist" "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist"
+set +e
+STATUS_OUT="$(run_installer "$HOME2" --status 2>&1)"
+STATUS_RC=$?
+set -e
+assert_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins) — DRIFTED" \
+    "--status reports a surviving installed copy of a retired label as DRIFT, not as a clean status"
+rm -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 rm -f "$TEMPLATES/com.eldato.hub-state-check.plist"
 
 echo "── 3. Render determinism ─────────────────────────────────────────"
@@ -734,7 +793,62 @@ assert_contains "$OUT" "corruption-canary: unchanged (skip)" "canary job skipped
 BOOTSTRAP_COUNT2="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 assert_eq "$BOOTSTRAP_COUNT2" "$BOOTSTRAP_COUNT1" "no reload on no-change"
 
+echo "── 4b. Installed-but-NOT-LOADED is converged, not skipped (#4008) ──"
+# ⛔ THIS IS #4008's MEASURED STATE, reproduced. `~/Library/LaunchAgents/com.eldato.worker-supply.plist`
+# EXISTED and `launchctl list | grep -c worker-supply` printed 0. launchd keeps membership in the
+# DOMAIN, so `bootout` leaves the plist on disk: "the file is byte-identical" and "the job is loaded"
+# are INDEPENDENT facts. The installer tested only the first and answered `unchanged (skip)` — so the
+# one box that needed repair was the one box no install verb in the repo could repair, while BOTH
+# readers (`--status` here, `fleet-schedule.py --verify`) correctly named it "not loaded". Diagnosed
+# by everything, fixed by nothing.
+# The vehicle is the tripwire: installed by §1 and untouched since (§4 only re-ran), so its render is
+# byte-identical and the ONLY thing wrong with it is that it is out of the domain.
+TRIPWIRE_LABEL="com.eldato.provider-latency-tripwire"
+rm -f "$LOG.loaded.$TRIPWIRE_LABEL"     # the bootout: the FILE stays, the job leaves the domain
+set +e
+OUT="$(FAKE_JOB_NOT_LOADED="$TRIPWIRE_LABEL" run_installer "$HOME1" 2>&1)"
+RC=$?
+set -e
+assert_eq "$RC" "0" "§4b a booted-out job with a byte-identical plist is CONVERGED (exit 0)"
+assert_contains "$OUT" "$TRIPWIRE_LABEL: unchanged on disk but NOT LOADED — bootstrapping it" \
+    "§4b ... the installer NAMES the state it is repairing instead of reporting 'unchanged (skip)'"
+assert_contains "$OUT" "$TRIPWIRE_LABEL: reloaded + loaded" "§4b ... and READS THE JOB BACK after bootstrapping"
+BOOTSTRAP_COUNT2b="$(grep -c 'launchctl bootstrap' "$LOG" || true)"
+assert_eq "$BOOTSTRAP_COUNT2b" "$((BOOTSTRAP_COUNT2 + 1))" \
+    "§4b ... exactly ONE bootstrap: only the out-of-domain job is reloaded, the other jobs are untouched"
+# THE NO-CHURN PROPERTY MUST SURVIVE THE FIX: a healthy job is never restarted by a sync, which is
+# the whole reason the byte-identical skip existed. Same box, now loaded → skip again, no bootstrap.
+set +e
+OUT="$(FAKE_JOB_NOT_LOADED="$TRIPWIRE_LABEL" run_installer "$HOME1" 2>&1)"
+RC=$?
+set -e
+assert_eq "$RC" "0" "§4b second run on the now-loaded box exits 0"
+assert_contains "$OUT" "$TRIPWIRE_LABEL: unchanged (skip)" \
+    "§4b ... and a LOADED job still skips (the fix does not turn every sync into a reload storm)"
+BOOTSTRAP_COUNT2c="$(grep -c 'launchctl bootstrap' "$LOG" || true)"
+assert_eq "$BOOTSTRAP_COUNT2c" "$BOOTSTRAP_COUNT2b" "§4b ... with no further bootstrap"
+# ⛔ AND THE READ-BACK MUST BE REAL, NOT DECORATION. launchd can ACCEPT a bootstrap (exit 0) and not
+# put the job in the domain. An implementation that trusted `bootstrap`'s exit code — or whose read-back
+# was deleted — calls this box converged. It must instead FAIL, and must NOT delete the plist: the
+# artifact is valid, launchd is the fault, and removing it would erase the evidence.
+rm -f "$LOG.loaded.$TRIPWIRE_LABEL"
+set +e
+OUT="$(FAKE_JOB_NOT_LOADED="$TRIPWIRE_LABEL" FAKE_BOOTSTRAP_NO_LOAD=1 run_installer "$HOME1" 2>&1)"
+RC=$?
+set -e
+assert_eq "$RC" "1" "§4b bootstrap exiting 0 without loading the job → exit 1 (the false PASS is refused)"
+assert_contains "$OUT" "STILL NOT LOADED" "§4b ... and the FAIL names the unloaded job rather than a generic error"
+[ -f "$TRIPWIRE_INSTALLED" ] && ok "§4b ... and the valid plist is NOT deleted" || bad "§4b the plist survived the refusal"
+# restore the box for the sections after this one: the job is back in the domain, which is exactly
+# what a successful bootstrap leaves behind (a marker write, not another installer run — an extra run
+# here would add a bootstrap that later sections' counts would have to explain).
+: > "$LOG.loaded.$TRIPWIRE_LABEL"
+
+
 echo "── 5. Change → reload ────────────────────────────────────────────"
+# The baseline is taken HERE, not inherited from §4: §4b legitimately bootstraps (§4008), and a
+# comparison against §2's count would read that repair as "an extra reload for the changed job".
+BOOTSTRAP_COUNT_BEFORE5="$(grep -c 'launchctl bootstrap' "$LOG" || true)"
 sed -i.bak 's/<integer>3600<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
 set +e
 OUT="$(run_installer "$HOME1")"
@@ -744,7 +858,7 @@ assert_eq "$RC" "0" "change install exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire reloaded on template change"
 assert_contains "$(cat "$TRIPWIRE_INSTALLED")" "3601" "new StartInterval applied"
 BOOTSTRAP_COUNT3="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
-assert_eq "$BOOTSTRAP_COUNT3" "$((BOOTSTRAP_COUNT2 + 1))" "exactly one reload for the changed job"
+assert_eq "$BOOTSTRAP_COUNT3" "$((BOOTSTRAP_COUNT_BEFORE5 + 1))" "exactly one reload for the changed job"
 
 echo "── 6. Bootstrap failure is loud ──────────────────────────────────"
 # Force a change so the installer reloads — with the shim configured to fail

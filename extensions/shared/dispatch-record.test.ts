@@ -132,6 +132,23 @@ case "$SCENARIO" in
   exit0-silent)
     exit 0
     ;;
+  exit2-no-marker)
+    #2823: the MEASURED setup-failure shape — the emitter was ARMED (the parent exports
+    # TASK_HEARTBEAT_NONCE) and NOT ONE marker arrived, the diagnostic goes to STDERR and the exit is
+    # non-zero. The child never completed session_start, so it never began a turn and its stderr is
+    # not the reply. Without the #2823 arm this settle is recorded as an ordinary 'failed'.
+    echo "=== Results: 50 passed, 9 failed ===" >&2
+    exit 2
+    ;;
+  exit0-preturn-stdout)
+    #2823: the FALSE-PASS shape — the emitter reported life, no turn_start ever arrived, and text went
+    # to STDOUT before the prompt. The settle is a CLEAN SUCCESS (exit 0 + stdout), which is exactly the
+    # population that passes no reason to doResolve, so before #2823's second round it wrote ZERO rows
+    # while its payload carried isError: true.
+    echo "FAKE-PI-PRE-TURN-STDOUT"
+    m "ready nonce=$NONCE"
+    exit 0
+    ;;
   exit0-e-shape)
     # #5195 E shape: a child cycling turns that CARRY NO CONTENT, then exiting 0 with empty
     # stdout. Proves zero messages, so it is reclassified died-before-first-message and IS
@@ -302,6 +319,19 @@ async function dispatch(scenario: string, opts: DispatchOptions = {}): Promise<D
 	const subAgentEnv: Record<string, string | undefined> = {
 		...process.env,
 		TASK_HEARTBEAT: "1",
+		// #2823 (review cycle 3, ISSUE 1): the REAL task-tool child env carries PI_MODE=print, and the
+		// emitter's gate is `TASK_HEARTBEAT=1 && PI_MODE=print && !TASK_HEARTBEAT_DISABLE`. Without this
+		// term the `exit2-no-marker` / `exit0-preturn-stdout` rows would model a child whose emitter was
+		// inert for a DIFFERENT reason than the one they claim (armed-and-silent).
+		PI_MODE: "print",
+		// ⛔ …AND THE THIRD TERM IS THE SAME ARGUMENT (#2823 review cycle 4, ISSUE 1). The spread above
+		// carries the OPERATOR's env, and `extensions/subagent/index.ts` forces
+		// `TASK_HEARTBEAT_DISABLE=1` into every child it spawns — so this suite run from one of those
+		// would model an EJECTED emitter while the `exit2-no-marker` row claims an armed-and-silent one
+		// (`childState` `exited-no-result`, row reason `failed`). Node drops an `undefined` env value, so
+		// this REMOVES the term for both the parent's premise (`hbEmitterLiveFor`) and the child; a
+		// fixture that wants the ejected emitter must set it explicitly.
+		TASK_HEARTBEAT_DISABLE: undefined,
 		TASK_HEARTBEAT_NONCE: nonce,
 		FAKE_PI_SCENARIO: scenario,
 		FAKE_PI_CLOSED_FILE: closedFile,
@@ -605,6 +635,59 @@ test("#1208: a PROVEN zero-message death is recorded as such, not as the 'clean-
 	equal(rows[0].exitCode, 0, "the measured exit code still rides the row");
 });
 
+// ⛔ #2823: THE SECOND SURFACE OF THE SAME CLAIM. The payload says "this text was never the child's
+// message" and `spawn-capacity` refuses to count it as a review verdict, so the append-only ledger —
+// which outlives the report and is read by every ledger consumer — must NOT record an ordinary
+// `failed` for the same settle. Reverting the `rowReason` arm leaves every other suite green, which is
+// why this row exists: it reddens BY NAME when the arm is deleted (review cycle 1, ISSUE 1).
+test("#2823: a child that died before its first turn is recorded as such, not as an ordinary failure", async () => {
+	const d = await dispatch("exit2-no-marker", {});
+	ok(d.value !== undefined, "the non-clean arm composes a payload");
+	const details = d.value!.details as Record<string, unknown>;
+	// The payload's half first, so the row assertion cannot pass by the death no longer being detected.
+	equal(details.childState, "died-before-first-turn", "armed + zero markers + exit 2 ⇒ it never began a turn");
+	equal(details.status, "died-before-first-turn", "the machine status names it");
+	equal(details.isError, true, "…and it is an error, so a parent stops");
+	equal(details.childMessagesSent, null, "no emitter evidence is UNKNOWN — never a floored 1");
+	equal(details.sawToolsUnknown, true, "the missing marker stream is stated, not hidden");
+	const rows = outcomeRows(d.nonce);
+	equal(rows.length, 1, `exactly one row (got ${rows.length})`);
+	equal(
+		rows[0].reason,
+		"died-before-first-turn",
+		"the DURABLE surface names the same cause the payload does — `failed` here would outlive the report and misname it",
+	);
+	equal(rows[0].reason, details.status, "one settle, two surfaces, ONE claim");
+	equal(rows[0].exitCode, 2, "the measured exit code still rides the row");
+});
+
+// ⛔ #2823 (review cycle 2, ISSUE 1): the DURABLE row was missing on the CLEAN-EXIT population. The row
+// write used to be gated on `opts.reason`, and the `cls === "success" && stdout` settle passes none —
+// so a pre-turn death that PRINTED and exited 0 wrote nothing at all into provider-failover.jsonl while
+// its payload said `isError: true`. Reverting the gate to `opts?.reason` alone reddens THIS row.
+test("#2823: the exit-0 pre-turn settle still writes its row — a clean exit is not a licence to vanish", async () => {
+	const d = await dispatch("exit0-preturn-stdout", {});
+	ok(d.value !== undefined, "settles with a payload");
+	const details = d.value!.details as Record<string, unknown>;
+	equal(details.childState, "died-before-first-turn", "stdout with no turn behind it is not an answer");
+	equal(details.isError, true, "…and the payload says so");
+	equal(details.exitCode, undefined, "the success arm carries no exitCode (the row must fall back to the OS's)");
+	const rows = outcomeRows(d.nonce);
+	equal(rows.length, 1, `exactly one row (got ${rows.length}) — a dispatch that failed at setup must be COUNTABLE`);
+	equal(rows[0].reason, "died-before-first-turn", "the durable surface names the death, not a success");
+	equal(rows[0].reason, details.status, "one settle, two surfaces, ONE claim");
+	equal(rows[0].exitCode, 0, "the OS exit code rides the row even though the settle passed none");
+	// ⛔ AND THE PAYLOAD SAYS THE SAME THING (#2823 review cycle 3, ISSUE 3 — the declared T3). The header
+	// used `details.exitCode ?? "not recorded"`, so on exactly this population it told the operator "exit
+	// not recorded" about a death whose code the ledger had just written. One settle, two surfaces, one
+	// claim — asserted, not asserted-about.
+	ok(
+		payloadText(d.value).includes("exit 0"),
+		`the header names the exit code the row records (got: ${payloadText(d.value).slice(0, 200)})`,
+	);
+	ok(!payloadText(d.value).includes("not recorded"), "…and never claims the code is unknown when it is known");
+});
+
 test("silent child at the HARD CAP writes exactly ONE row — even though the close path re-settles as 'cut'", async () => {
 	const d = await dispatch("cap-silent", { extraParentEnv: { TASK_HARD_CAP_MS: "60000", TASK_BACKSTOP_MS: "0" } });
 	ok(d.elapsedMs >= 60_000, `waited out the 60s hard-cap floor (${d.elapsedMs}ms)`);
@@ -772,7 +855,10 @@ section("structural pins — writer placement + attempt threading");
 test("writer is INSIDE doResolve immediately after `settled = true` (never at a call site)", () => {
 	const chokepoint = source.indexOf("if (settled) return;\n      settled = true;");
 	ok(chokepoint > 0, "the settle-once gate exists");
-	const writer = source.indexOf("if (opts?.reason) {", chokepoint);
+	// #2823 (review cycle 2, ISSUE 1): the gate is no longer `opts?.reason` alone — a PROVEN death writes
+	// a row whatever the settle path said, because the clean-exit arm passes no reason and a payload
+	// carrying `isError: true` with no row is the silent loss this file exists to prevent.
+	const writer = source.indexOf("if (opts?.reason || measuredDeathReason) {", chokepoint);
 	const firstDisarm = source.indexOf("exitWatchdog.disarm();", chokepoint);
 	ok(writer > chokepoint && writer < firstDisarm, "the row writer sits inside the gate, right after settled = true");
 	ok(source.includes("if (!dispatchLedgerEnabled(subAgentEnv)) return { ok: false, path: \"\", skipped: true };"));
@@ -814,8 +900,8 @@ test("#783 review: the spawn-error settle records a row — the abnormal populat
 	// than left standing — a false coverage claim is the same defect class this
 	// cycle fixed elsewhere.) The source pin below is non-vacuous: removing the
 	// reason from the settle fails it.
-	const chokepoint = source.indexOf("if (opts?.reason)");
-	ok(chokepoint > 0, "the row gate still keys on opts.reason");
+	const chokepoint = source.indexOf("if (opts?.reason || measuredDeathReason) {");
+	ok(chokepoint > 0, "the row gate exists at the doResolve choke point (opts.reason OR a measured death)");
 	// Anchor on the HANDLER LINE, not the bare call spelling: a doc comment that quotes
 	// `proc.on("error")` matched first and the probe then walked to the WRONG settle
 	// (measured: char 107789 vs the handler's 250973, so the assertion read the hard-cap

@@ -2990,6 +2990,186 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its helpers are extracted from
   fi
   unset -f cmux tmux kill
 fi
+# ── 15a) THE REAP PASS BUILDS THE CENSUS ONCE, NOT ONCE PER CANDIDATE (#3585) ──────────────────
+# MEASURED 2026-11-10 on the incident box: `reap_stale_workers` read the census once for the pass and
+# then AGAIN per candidate (`wt_alive "$_cn"`, added by #3756), and because the memo's window was
+# shorter than its own build NOT ONE of those reads was a hit. 89 candidates ⇒ 90 full census builds:
+# the pass took 27 min where cycle 117's own `stages=reap:12` records 12 s.
+# THE ASSERTION IS A COUNT of `cmux tree --json` invocations (the census's one daemon read), driven
+# against the SHIPPED reaper with a counting daemon. `WT_TABLE_TTL=0` on purpose: the memo is OFF, so
+# this measures the PASS's own reads and cannot be satisfied by a cache (that is the sibling arm in
+# worker-terminal.test.sh §K2).
+# ⛔ COMPARED AS A NUMBER, NEVER AS A SUBSTRING (measured while writing this). The first cut asserted
+# `case "$out" in *"calls=1"*)` — and `calls=17` MATCHES that, so the arm read GREEN on the pre-fix
+# code whose whole defect is 1 + candidates reads. A gate that cannot fail is not a gate.
+if need "$TMP/reapw.sh" "the reaper is extracted from the shipped loop"; then
+  RB="$TMP/RB"; rm -rf "$RB"; mkdir -p "$RB/state" "$RB/logs" "$RB/bin"
+  _rbw=""; _rbt=""; _rbi=0
+  _rb_rec() { # <name> — one record + its two stub rows, so the daemon reports it RUNNING
+    printf 'kind=terminal\nid=term_%s\nworkspace=ws_%s\ncwd=/tmp\n' "$1" "$1" > "$RB/state/worker-$1"
+    _rbw="$_rbw${_rbw:+,}{\"id\":\"ws_$1\",\"name\":\"wt-$1\"}"
+    _rbt="$_rbt${_rbt:+,}{\"id\":\"term_$1\",\"running\":true}"
+  }
+  # filler: a census with the shape of a real one (the build's cost is per ROW, and so is the cost of
+  # getting this wrong) — no logs, so none of them is a candidate.
+  while [ "$_rbi" -lt 40 ]; do
+    _rbi=$(( _rbi + 1 )); _rb_rec "chain-$_rbi"
+  done
+  # candidates: stale records whose SURFACE THE DAEMON REPORTS RUNNING, so every one is SPARED and
+  # `wt_close` (which owes its own post-close verification read) is never in the path — what is
+  # measured is the per-candidate census read and nothing else.
+  _rbi=0
+  while [ "$_rbi" -lt 6 ]; do
+    _rbi=$(( _rbi + 1 )); _rb_rec "merge-30$_rbi"
+    : > "$RB/logs/merge-30$_rbi.log"; touch -t 202601010000 "$RB/logs/merge-30$_rbi.log"
+  done
+  printf '{"workspaces":[%s],"screens":[],"tabs":[],"terminals":[%s]}\n' "$_rbw" "$_rbt" > "$RB/tree.json"
+  cat > "$RB/bin/cmux" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$RB/calls.log"
+[ "\${1:-}" = "tree" ] && cat "$RB/tree.json"
+exit 0
+SH
+  chmod +x "$RB/bin/cmux"; : > "$RB/calls.log"
+  _rbout="$(
+    tmux() { :; }                     # no tmux sessions, no pane pids: the tmux arm answers nothing
+    export PATH="$RB/bin:$PATH"
+    LOG="$RB/reap.log"; O="$RB"; WT_DIR="$RB/state"; STALE_MIN=1; WT_TABLE_TTL=0
+    _WREAP_WINDOW_MIN=0
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    . "$TMP/reapw.sh"
+    reap_stale_workers
+    printf 'calls %s\ndecisions %s\n' \
+      "$(grep -c '^tree' "$RB/calls.log" 2>/dev/null || true)" \
+      "$(grep -c '^\[reap-worker\] merge-' "$RB/reap.log" 2>/dev/null || true)"
+  )"
+  _rb_calls="$(printf '%s\n' "$_rbout" | sed -n 's/^calls //p' | head -1)"
+  _rb_dec="$(printf '%s\n' "$_rbout" | sed -n 's/^decisions //p' | head -1)"
+  # NON-VACUITY FIRST: if the pass walked nothing, `calls 1` would be green for a reaper that reaps
+  # nothing at all — the vacuous assertion this shard's own review history is about.
+  case "${_rb_dec:-}" in ''|*[!0-9]*) rc=1 ;; *) [ "$_rb_dec" -eq 6 ] && rc=0 || rc=1 ;; esac
+  ck "15a: the driven pass really walks every candidate (6 per-candidate decisions, got '${_rb_dec:-}')" $rc
+  case "${_rb_calls:-}" in ''|*[!0-9]*) rc=1 ;; *) [ "$_rb_calls" -eq 1 ] && rc=0 || rc=1 ;; esac
+  [ "$rc" -eq 0 ] || echo "      census builds in one reap pass: ${_rb_calls:-<none>} (want 1; pre-fix: 1 + candidates = 7)"
+  ck "15a: one reap pass costs ONE census build, whatever the candidate count (measured ${_rb_calls:-<none>})" $rc
+fi
+# ⛔ 15a2) THE PASS-ENTRY CENSUS MAY NOT AUTHORISE A KILL ON ITS OWN (#3585 review, P2).
+# `_surf` is answered from the census the PASS built, and `wt_close` KILLS before it verifies. So a row
+# that was `dead` at pass entry — a `merge-<PR>` respawned onto the same box mid-pass reuses the stale
+# log, so it is still a candidate — would authorise a close of a worker that is alive NOW. The reaper
+# therefore re-asks the surface with a FRESH read before it closes anything. Driven with a daemon that
+# answers `dead` on its first read and `alive` on every read after: the candidate must be SPARED and its
+# record must survive. On a reaper that trusts the pass-entry table, the record is deleted.
+if need "$TMP/reapw.sh" "the reaper is extracted from the shipped loop"; then
+  R2="$TMP/R2"; rm -rf "$R2"; mkdir -p "$R2/state" "$R2/logs" "$R2/bin"
+  printf 'kind=terminal\nid=term_live9\nworkspace=ws_live9\ncwd=/tmp\n' > "$R2/state/worker-merge-9009"
+  : > "$R2/logs/merge-9009.log"; touch -t 202601010000 "$R2/logs/merge-9009.log"
+  cat > "$R2/bin/cmux" <<SH
+#!/usr/bin/env bash
+# 1st read: the record's terminal is NOT in the tree (the pass-entry table says dead).
+# 2nd+ reads: it IS there and running (the worker is alive NOW).
+_n=\$(cat "$R2/n" 2>/dev/null || echo 0); _n=\$((_n+1)); printf '%s\n' "\$_n" > "$R2/n"
+case "\${1:-}" in
+  tree)
+    printf '%s\n' "\$*" >> "$R2/calls.log"
+    if [ "\$_n" -le 1 ]; then
+      printf '%s\n' '{"workspaces":[{"id":"ws_live9","name":"wt-merge-9009"}],"screens":[],"tabs":[],"terminals":[]}'
+    else
+      printf '%s\n' '{"workspaces":[{"id":"ws_live9","name":"wt-merge-9009"}],"screens":[],"tabs":[],"terminals":[{"id":"term_live9","running":true}]}'
+    fi ;;
+  # ⛔ THE KILL IS THE HARM, AND IT IS RECORDED. `wt_close` closes BEFORE it verifies, so the post-close
+  # re-read that keeps the record does not undo a surface it already destroyed. This is the artifact the
+  # arm asserts on: a reaper that trusts the pass-entry table CLOSES a live worker even when it then
+  # decides to keep the record.
+  terminal|workspace) printf '%s\n' "\$*" >> "$R2/closed.log" ;;
+esac
+exit 0
+SH
+  chmod +x "$R2/bin/cmux"; : > "$R2/calls.log"; : > "$R2/closed.log"; rm -f "$R2/n"
+  (
+    tmux() { :; }
+    export PATH="$R2/bin:$PATH"
+    LOG="$R2/reap.log"; O="$R2"; WT_DIR="$R2/state"; STALE_MIN=1; WT_TABLE_TTL=0
+    _WREAP_WINDOW_MIN=0
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    . "$TMP/reapw.sh"
+    reap_stale_workers
+  )
+  # ⛔ NOTHING MAY BE CLOSED — the record surviving is NOT the assertion (a post-close re-read keeps it
+  # even after the surface was destroyed, measured: the mutant below deletes nothing and still kills).
+  [ -s "$R2/closed.log" ] && { rc=1; echo "      CLOSED a live worker on a pass-entry 'dead' row: $(cat "$R2/closed.log")"; } || rc=0
+  ck "15a2: a worker whose surface is ALIVE on a FRESH read is NOT CLOSED (pass-entry census is not proof)" $rc
+  [ -f "$R2/state/worker-merge-9009" ] && rc=0 || { rc=1; echo "      the record was deleted"; }
+  ck "…and its record survives, so the slot is still accounted for" $rc
+  grep -q '^\[reap-worker\] merge-9009 .*FRESH read reports its surface ALIVE' "$R2/reap.log" 2>/dev/null && rc=0 || { rc=1; echo "      log: $(cat "$R2/reap.log" 2>/dev/null)"; }
+  ck "…and it SAYS SO, naming the fresh read rather than the stale row" $rc
+  [ "$(grep -c '^tree' "$R2/calls.log" 2>/dev/null || true)" -ge 2 ] && rc=0 || { rc=1; echo "      only $(grep -c '^tree' "$R2/calls.log" 2>/dev/null || true) read(s): the fresh re-read never happened"; }
+  ck "…because it really re-read the surface (≥2 census reads: the pass, then the pre-close check)" $rc
+fi
+# ⛔ 15a3) THE OTHER ROUTE TO A REAP MUST STILL REAP (#3585 review, P1 — the mirror of 15a2).
+# `_wreap_verdict` reaches REAP by TWO routes: (a) a MEASURED flat process tree over the window — the
+# #2104 arm, where the surface is ALIVE by definition, since a hung `pi` parked at 0 CPU still holds its
+# terminal — and (b) no identity matched + surface PROVEN GONE, where a stale row is the only evidence.
+# The pre-close fresh read belongs to (b) ALONE: run unconditionally it spares exactly the corpse (a)
+# exists to free, for ever, while the log still announces a reap. Driven here with a surface the daemon
+# reports ALIVE on EVERY read and a process tree measured FLAT across the window: the worker must be
+# CLOSED. An unscoped fresh read turns this green -> red (measured).
+if need "$TMP/reapw.sh" "the reaper is extracted from the shipped loop"; then
+  R3="$TMP/R3"; rm -rf "$R3"; mkdir -p "$R3/state" "$R3/logs" "$R3/bin"
+  printf 'kind=terminal\nid=term_hung1\nworkspace=ws_hung1\ncwd=/tmp\n' > "$R3/state/worker-merge-9010"
+  : > "$R3/logs/merge-9010.log"; touch -t 202601010000 "$R3/logs/merge-9010.log"
+  # The window: a baseline 10 min old, taken AFTER the log was last written (so `_wreap_prev` honours it),
+  # with an identity at the previous sighting (`pm` = 1) — the shape a hung worker is in on pass 2.
+  printf '%s 0 1\n' "$(( $(date +%s) - 600 ))" > "$R3/state/wreap-merge-9010"
+  # A STATEFUL daemon: once the terminal is closed it stops appearing in the tree, exactly as the real
+  # one behaves. Without that, `wt_close` cannot PROVE the close (its verification read is `wt_alive`),
+  # correctly returns 1, keeps the record — and the arm would fail for a reason that is the shipped
+  # safety rule working, not a scoping bug.
+  cat > "$R3/bin/cmux" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+  tree)
+    if [ -f "$R3/closed-once" ]; then
+      printf '%s\n' '{"workspaces":[{"id":"ws_hung1","name":"wt-merge-9010"}],"screens":[],"tabs":[],"terminals":[]}'
+    else
+      printf '%s\n' '{"workspaces":[{"id":"ws_hung1","name":"wt-merge-9010"}],"screens":[],"tabs":[],"terminals":[{"id":"term_hung1","running":true}]}'
+    fi ;;
+  terminal|workspace)
+    printf '%s\n' "\$*" >> "$R3/closed.log"; : > "$R3/closed-once" ;;
+esac
+exit 0
+SH
+  chmod +x "$R3/bin/cmux"; : > "$R3/closed.log"; rm -f "$R3/closed-once"
+  (
+    tmux() { :; }
+    export PATH="$R3/bin:$PATH"
+    LOG="$R3/reap.log"; O="$R3"; WT_DIR="$R3/state"; STALE_MIN=1; WT_TABLE_TTL=0
+    _WREAP_WINDOW_MIN=0
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    . "$TMP/reapw.sh"
+    # ⛔ THE STUB GOES **AFTER** THE EXTRACTION, NOT BEFORE (measured while writing this): `reapw.sh`
+    # DEFINES `_wreap_ps`, so a stub placed above it is silently replaced by the shipped probe, the fake
+    # process never appears, `matched=0` spares the worker for the UNRELATED reason ("no identity"), and
+    # the arm reads as a scoping failure instead of a fixture bug. The probe is what a suite cannot
+    # spawn (a hung `pi`); the VERDICT stays the shipped one. `0:00.05` = 5 cs on both readings, so the
+    # delta is 0 <= tol and this is route (a).
+    _wreap_ps() { printf '%s\n' "  4242     1  0:00.05 bash $R3/state/run-merge-9010.sh"; }
+    reap_stale_workers
+  )
+  # Non-vacuity FIRST: the flat-tree route must have actually fired, or "closed" proves nothing.
+  grep -q '^\[reap-worker\] merge-9010 .*burned no CPU across the window' "$R3/reap.log" 2>/dev/null && rc=0 || { rc=1; echo "      the flat-CPU route never fired: $(cat "$R3/reap.log" 2>/dev/null | head -2)"; }
+  ck "15a3: a worker measured FLAT across the window is reaped on the CPU route (verdict reached)" $rc
+  [ -s "$R3/closed.log" ] && rc=0 || { rc=1; echo "      NOTHING was closed: an unscoped fresh surface read spared a hung worker for ever"; }
+  ck "15a3: …and it IS closed — the fresh surface read is scoped to the surface-only route" $rc
+  [ -f "$R3/state/worker-merge-9010" ] && { rc=1; echo "      record kept"; } || rc=0
+  ck "15a3: …and its record is freed (the slot the ceilings read is released)" $rc
+fi
 # ── 15b) a STALE LOG IS NOT A HUNG WORKER: the positive-liveness gate (agent-infra#2104) ───────
 # MEASURED 2026-10-19: this reaper closed a worker logged as "silent 8287s" (2.3 h) while its agent
 # had been running `bash`/`edit` calls for hours with ~200 lines of uncommitted work, and closed 7
@@ -5305,10 +5485,32 @@ ck "§6g: NO launchd call in this run addressed a production label (loop AND wat
 # on one PR queue. Driven against the SHIPPED lock+trap block (extracted, not re-implemented) with a
 # stub loop, so it fails on the pre-fix copy. The invariant asserted is "the lock and the process
 # go away together": a released lock may only ever be observed as the process is leaving.
-sed -n '/^# single-instance lock/,/^trap .rm -f "\$LOCKF".*$/p' "$LOOP" > "$TMP/lockblock.sh"
+sed -n '/^# single-instance lock/,/^trap .orc_singleton_release .*EXIT$/p' "$LOOP" > "$TMP/lockblock.sh"
 if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped orch-loop.sh"; then
+  # ⛔ ASSERTED BY CONTENT, NOT BY PRESENCE. Both halves must be there: the decision (the module
+  # call) and the trap. ⛔ AND BE PRECISE ABOUT WHAT THIS CATCHES (fresh-context review of #3846): it
+  # catches a START anchor that moved (an empty or decision-less extraction), NOT an END anchor that
+  # stopped matching — a range that runs to EOF still contains both names. The end anchor is pinned by
+  # the `trap .orc_singleton_release` pattern itself and by the driver's own `bash -n`; what this arm
+  # buys is that the two lines this PR wired are still the lines being extracted.
+  if grep -q 'orc_singleton_acquire' "$TMP/lockblock.sh" && grep -q 'orc_singleton_release' "$TMP/lockblock.sh"; then rc=0; else
+    rc=1; echo "      the extracted block is not the shipped lock+trap pair (its end marker moved)"; fi
+  ck "the lock block is extracted WITH its decision and its trap (not a run to EOF)" $rc
+  # ⛔ EVERY NAME THE EXTRACTED BLOCK READS IS DEFINED HERE, AND THAT IS A FIX, NOT PADDING
+  # (agent-infra#2095, and it is a finding a previous review of the same block made: the refusal path
+  # reads MAX_LOAD/MAX_LOAD_SRC/ORC_INSTANCE/ORC_STATE_SRC, which the extraction does NOT carry. Under
+  # `set -u` an unbound expansion is FATAL and `|| true` does not catch it, so the driver died with
+  # status 1 BEFORE `exit 75` — and the arms below assert only "no ACQUIRED", which a crash satisfies.
+  # A check that cannot tell "refused loudly" from "aborted halfway" is not a check.)
+  lockblock_prelude() { # <state dir>
+    printf 'set -u\nO=%s\n' "'$1'"
+    printf 'LOG="$O/logs/orch-loop.log"; mkdir -p "$O/logs"\n'
+    printf 'ORC_INSTANCE=selftest-%s\n' "$$"
+    printf 'ORC_STATE_SRC=selftest\nMAX_LOAD=100\nMAX_LOAD_SRC=selftest\n'
+    printf '. "%s"\n' "$HERE/controller-state.sh"
+  }
   LK="$TMP/LK"; mkdir -p "$LK/state"
-  { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'while :; do sleep 0.2; done'; } > "$LK/drive.sh"
+  { lockblock_prelude "$LK"; cat "$TMP/lockblock.sh"; echo 'while :; do sleep 0.2; done'; } > "$LK/drive.sh"
   bash -n "$LK/drive.sh" && rc=0 || rc=1
   ck "the lock-trap driver parses" $rc
   rm -f "$LK/.orch.lock"
@@ -5398,7 +5600,7 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
     # interruptibility check below while re-introducing the thundering herd it exists to prevent.
     grep -q 'RANDOM' "$TMP/cycsleep.sh" && rc=0 || rc=1
     ck "the shipped cycle sleep is jittered (±20% of CYC), not a fixed interval" $rc
-    { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'CYC=8'; cat "$TMP/cycsleep.sh"; } > "$LK/cyc.sh"
+    { lockblock_prelude "$LK"; cat "$TMP/lockblock.sh"; echo 'CYC=8'; cat "$TMP/cycsleep.sh"; } > "$LK/cyc.sh"
     bash -n "$LK/cyc.sh" && rc=0 || rc=1
     ck "the cycle-sleep driver parses" $rc
     # Non-vacuity: the driver must OWN the lock (a leftover lock would make it refuse the lock and
@@ -5441,33 +5643,39 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   # next start (the SIGKILL/reboot path), while one held by a LIVE pid is refused. Without the
   # negative control, "reclaimed" and "silently overwritten" would be the same test. Deliberately
   # LAST in this section: the live-pid case intentionally leaves a lock in place.
-  # ⛔ `LOG` IS SUPPLIED, AND THE LIVE-OWNER FIXTURE IS LOOP-SHAPED (fresh review of agent-infra#1985,
-  # P2). Two separate premises changed with #1985: the block now LOGS a reclaim (`selftest.sh` runs it
-  # under `set -u`, so an absent `LOG` aborted the shell — a red arm here and a VACUOUSLY green one
-  # below), and a live pid is no longer enough to be the owner — `$$` is this SUITE's shell, not an
-  # `orch-loop.sh` invocation, which the loop now reclaims BY DESIGN. So the negative control uses a
-  # real loop-shaped process (`bash <dir>/orch-loop.sh`), which is the shape every shipped launcher
-  # produces, and it is spawned BEFORE the lock is written (the real write order).
-  mkdir -p "$LK/logs"
-  { echo 'set -u'; echo "O='$LK'"; echo "LOG='$LK/logs/orch-loop.log'"; cat "$TMP/lockblock.sh"; echo 'echo ACQUIRED'; } > "$LK/acquire.sh"
+  { lockblock_prelude "$LK"; cat "$TMP/lockblock.sh"; echo 'echo ACQUIRED'; } > "$LK/acquire.sh"
   bash -n "$LK/acquire.sh" && rc=0 || rc=1
   ck "the stale-lock driver parses" $rc
   printf '999999\n' > "$LK/.orch.lock"
   out="$(bash "$LK/acquire.sh" 2>&1)"
   case "$out" in *ACQUIRED*) rc=0;; *) rc=1; echo "      got '$out'";; esac
   ck "a stale lock (dead pid) is reclaimed by the next start" $rc
-  # ⛔ THE STUB IS SELF-BOUNDED (60s), because it is a process literally named `orch-loop.sh` and this
-  # repo's arms read the process table by that shape: if this suite is killed between the spawn and the
-  # `kill -9` below, an unbounded stub would still be running when a LATER arm pgrep's for a controller
-  # — a leak that reads as a live owner. 60s is far longer than the 0.4s the assertion needs.
+  # ⛔ THE LIVE-OWNER FIXTURE IS LOOP-SHAPED (fresh review of agent-infra#1985, P2), AND IT IS
+  # SELF-BOUNDED (60s). This is a process literally named `orch-loop.sh`, and this repo's arms read the
+  # process table by that shape: if this suite is killed between the spawn and the `kill -9` below, an
+  # unbounded stub would still be running when a LATER arm pgrep's for a controller — a leak that reads
+  # as a live owner. 60s is far longer than the 0.4s the assertion needs. The spawn order is the real
+  # one: the owner exists FIRST, then the record naming it is written.
   printf '#!/bin/bash\ntrap "exit 0" TERM INT\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$LK/orch-loop.sh"
   chmod +x "$LK/orch-loop.sh"
   bash "$LK/orch-loop.sh" >/dev/null 2>&1 & owner=$!
   sleep 0.4                                   # the lock is written AFTER the owner exists (real order)
   printf '%s\n' "$owner" > "$LK/.orch.lock"
-  out="$(bash "$LK/acquire.sh" 2>&1)"
+  rm -f "$LK/logs/orch-loop.log"
+  # ⛔ "NO ACQUIRED" IS NOT ENOUGH (agent-infra#2095). That assertion is satisfied by a driver that
+  # CRASHES before reaching the lock — which is exactly what the pre-#2095 extraction did (an unbound
+  # MAX_LOAD killed it under `set -u`). The refusal has to be POSITIVE evidence: exit 75, and the
+  # `[singleton]` line on disk naming the holder. A silent `exit 0` (the shipped behaviour this
+  # replaces) fails all three of these.
+  if out="$(bash "$LK/acquire.sh" 2>&1)"; then acq_rc=0; else acq_rc=$?; fi
   case "$out" in *ACQUIRED*) rc=1; echo "      a live lock was stolen";; *) rc=0;; esac
   ck "a lock held by a LIVE LOOP-SHAPED owner is NOT stolen (reclamation is not a silent overwrite)" $rc
+  [ "$acq_rc" = "75" ] && rc=0 || { rc=1; echo "      refused with rc=$acq_rc, not 75 (a silent 0 reads as a healthy no-op under KeepAlive)"; }
+  ck "the refusal is EXIT 75, not a quiet success" $rc
+  grep -q '\[singleton\]' "$LK/logs/orch-loop.log" 2>/dev/null && rc=0 || { rc=1; echo "      no [singleton] line was written to the log"; }
+  ck "the refusal is on record in the log, naming the holder" $rc
+  [ "$(cat "$LK/.orch.lock" 2>/dev/null)" = "$owner" ] && rc=0 || rc=1
+  ck "the refused instance left the holder's record intact" $rc
   kill -9 "$owner" 2>/dev/null
 fi
 

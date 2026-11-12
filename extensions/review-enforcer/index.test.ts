@@ -4658,6 +4658,46 @@ test("#485 T2: REVIEW-ENFORCER-TIER-RULE fence == TIER_RULE + no micro-warn clai
   }
 });
 
+// ── #2886 — the cross-root doc section must not orphan #755's tail ──
+//
+// The #2886 section was inserted BETWEEN #755's bullet list and the "Scope
+// producers are …" paragraph that belongs to #755, which re-homed subtraction /
+// push-range semantics under a heading about cross-root record borrowing: a
+// reader following the `#2886` heading was handed semantics that have nothing to
+// do with it, and a reader of `#755` lost them. The section IS the doc's topic
+// unit (a heading is also a link target), so pin which section owns that
+// paragraph. Measured pre-fix: 413 passed / 1 failed — the first assert reds
+// ('Scope producers are' is not inside the #755 section at all); the second
+// keeps it from being re-homed under #2886.
+test("#2886: 'Scope producers' stays under the #755 section, not the #2886 one", () => {
+  if (!isSourceCheckout()) {
+    console.log("  ↪ skip (deployed copy — not an agent-infra source checkout)");
+    return;
+  }
+  const url = new URL("../../skills/commit-workflow/workflow/01-preflight.md", import.meta.url);
+  ok(
+    existsSync(url),
+    "01-preflight.md unreachable from the agent-infra source tree — section-ownership pin would pass vacuously"
+  );
+  const sections = markdownSections(readFileSync(url, "utf8"));
+  const subtraction = sections.filter((s) => s.heading.includes("#755"));
+  const crossRoot = sections.filter((s) => s.heading.includes("#2886"));
+  equal(subtraction.length, 1, `expected exactly one #755 heading in 01-preflight.md, found ${subtraction.length}`);
+  equal(crossRoot.length, 1, `expected exactly one #2886 heading in 01-preflight.md, found ${crossRoot.length}`);
+  ok(
+    crossRoot[0].text.includes("foreign_root_blob_identical"),
+    "vacuity guard: the #2886 section must carry its own gate_skip reason — an empty section would make the ownership asserts below meaningless"
+  );
+  ok(
+    subtraction[0].text.includes("Scope producers are"),
+    "the 'Scope producers are …' paragraph is #755's tail — it must sit inside the #755 section"
+  );
+  ok(
+    !crossRoot[0].text.includes("Scope producers are"),
+    "the 'Scope producers are …' paragraph is #755's subtraction/push-range tail and must NOT be re-homed under the #2886 cross-root heading"
+  );
+});
+
 // ── #745 — the scoped pin's two-sided proof ──
 
 test("#485 T2b: warn-vocabulary pin flags review-enforcer re-drift, ignores other gates", () => {

@@ -950,8 +950,8 @@ which §4.2 declared non-existent (§5.0 V1) and which is already behind an MCP 
 
 ### 5.8.3 Prior art that changes *how* a tool should be written, not *what* it does
 
-**M20 — `scripts/orchestrator-harness/landing/` (`bulk.py`, `landability.py`, `rail-bg.sh`) and
-`scripts/lane-guard.py` (242).** `lane-guard.py` is the **inverse-polarity** bracket: not *"is the verdict
+**M20 — `scripts/landing/` (`bulk.py`, `landability.py`, `rail-bg.sh` — the last a CLI over
+`scripts/rail-run.sh`, #2905) and `scripts/lane-guard.py` (242).** `lane-guard.py` is the **inverse-polarity** bracket: not *"is the verdict
 DONE-IDLE"* (a stale sample) but *"is there POSITIVE evidence that nothing is in flight"*, lane-local and
 re-runnable because the bulk classifier measured **88 s** for 27 lanes. That is the shape any `lane_status`
 used as a dispatch precondition needs, and §5's row 1 does not mention it.
@@ -1011,7 +1011,7 @@ not answer the tool's own signature, the missing half was written **into that mo
 | `pr.queue` (**row 5**) | `tools/fleet/pr_state.py --json` (the 15 actions + `fidelity`) | the **6-class VIEW** over the 15, in one direction only (§13 Q4); the `UNMAPPED` count makes a silent loss impossible |
 | `claim.check` (**row 6**) | `tools/fleet/claim_lanes.py --json` (the registry axis, `render_json`) | a **typed refusal** when no repo is named, because the reader never uses the cwd implicitly; the abstention doctrine travels in the payload |
 | `lane.dispatch` (**row 7**) | `nonblocking-dispatch.sh` (2/72–80), the `.pid` file, `git rev-parse`/`ls-remote` for the branch | the **two measured silent actuators as typed refusals** (`no-pid`, `branch-exists`) and the **mapping** onto the existing vocabulary — no gate re-implemented |
-| `box.exec` (**row 9**) | `cmux vm exec --timeout` | the `{rc, stdout, stderr, timed_out, truncated}` shape, an **ARGV-only** surface, and a **fail-closed allowlist** with a typed refusal |
+| `box.exec` (**row 9**) | `cmux vm exec --timeout` | the `{rc, stdout, stderr, timed_out, truncated}` shape, an **ARGV-only** surface, and a **fail-closed allowlist** with a typed refusal. ⛔ And, from **#2345**, a **LINK REFUSAL is a CHANNEL fact, not the command's rc**: `outcome: CHANNEL-REFUSED` + `channel_refused` = `link-refused` / `no-known-daemon` / `daemon-binary-absent` and the class's own remedy — the peer never ran anything, so its rc is the TRANSPORT's (a refusal that exits **0** is reported too, as `fail_open`). ⛔ `channel_refused`, **not** `refused`: that key already means "this surface ran nothing" (`read-only`, `command-not-allowlisted`, …), which these classes do not mean. `peer` is carried only for `link-refused` and `peer_log` only where the transport's line names a `…peer-links/…` path — *not* for all three classes. ⛔ And the three classes are not symmetric: `daemon-binary-absent` has one measured cause and one remedy (the calling box), while `link-refused` and `no-known-daemon` each cover TWO causes that print the IDENTICAL line — pairing refused for a healthy peer, or the peer has no listener — so their `refusal_detail` names both and says to probe the peer's `:1337` from the CALLING box; no key here separates them |
 | `pr.review_record` (**row 10**) | `record-review.sh --check-carry` (positional) | the 7 verdicts → `current`/`stale`/`absent` **with each verdict's own next action kept**, plus the head-bound digests in one reply |
 | `pr.closure_audit` (**row 12**) | `gh pr view --json closingIssuesReferences` + each issue's live `state` | the **comparison** nothing else makes: `closed` / `still_open` / `mentioned_but_not_closing`, with “a mention is not a closure” as a field |
 | `fleet.reminder` (**row 13**) | `merge-reminder.py` (`--install-timer` / `--uninstall-timer` / `--interval`) | a **file-backed queue** under the state dir (atomic write), `set`/`list`/`cancel` as one tool |
@@ -1041,6 +1041,23 @@ not answer the tool's own signature, the missing half was written **into that mo
    implementing against §4.1 does not reproduce it.
 5. **Tree step 5's classification is still `lane-actions.py`'s** (one batched JEV call for the fleet, D7). The
    MCP attaches its **input** (`lane.artifact`'s words axis) and never makes a second JEV call.
+
+**§5.10a — the `pi` POOL delta (#2921), added after Phase 2.** The one population this surface could not
+answer for is the one no session store can contain: an orchestrator lane runs `pi -p --no-session`, so it
+writes no transcript and no cmux store record, and a `lane.list` answered from the REGISTRY alone reported
+none of them **and said nothing about it** — an absence read as a clean bill (#1777; measured 2026-10-27:
+29 processes, 2.64 GB, an hour of hand-measurement). `lane.list` now carries `pool: true`, which is
+`scripts/orphan-reap.py --pool pi --json` **wrapped** — the pool's own owner, four states, verdicts from
+`tools/fleet/liveness.py::evaluate`. No new predicate, no new state name, no new store: a delta on a shipped
+name, which is the shape §5.9 sanctions. Three properties are pinned in `test_server.py`:
+`S16` (the census and its `verdict_source`), `S17` (`counts: null` is `UNMEASURED`, never `LIVE: 0`; a
+non-JSON document from a successful run is a PARSE failure, not a command failure), `S18` (an unrequested
+pool is `UNMEASURED(pool + not requested)`, never an absent key — an omitted reading is not a clean one).
+
+**Still not on this surface, and deliberately so:** the CI queue composition (`ci_queue_health.py` lives in
+the product repo) and the heartbeat's CADENCE measurement (in-band rate / worst gap / missed sends —
+`fleet.reminder` owns delivery and its timer lifecycle, not a cadence statistic). Both are named in #2921's
+definition-of-done and remain open there.
 
 **Invariants → tests (all in `mcp-servers/orchestrator/test_server.py`, each naming its fixture):**
 
@@ -1333,6 +1350,7 @@ supposed to work.
 | **`ps -o pcpu` is a lifetime average** | Tree step 2 | a long-lived working session reads ~flat (measured: 3 of 73 processes moved) | cumulative `ps -o time`, two samples, **stated tolerance** |
 | **`ps` unreadable ≠ `ps` empty** | `scripts/lib/pid-identity.sh` exit 1 vs 2 | a failed read becomes `dead` | already encoded: exit 1 = positively absent, exit 2 = unknown. Preserve it |
 | **an `exec` timeout is a CHANNEL reading, not a box reading** | `skills/cmux-cells` §3 | a disk-full guest answers `running` while every `exec` times out; a 502 or a silent empty is the channel | carry `timed_out` as its own field; never synthesise `box-unreachable` from it |
+| **a LINK REFUSAL is a CHANNEL reading too — and the transport can exit 0 while refusing it** | **agent-infra#2345**, measured 2026-11-08 from `pi-cell-5`: `vm ls --json` printed `"reachable":true` for all four peers while `vm exec` refused all four (`cmux: link to '<peer>' exited`) | the peer never ran the command, so the caller reads the transport's rc as a verdict about the command (or about the box's health) and repairs the wrong thing; and a refusal that exits 0 reads as SUCCESS to any caller keying on `rc` (measured on `pi-cell-3`, 2026-10-23) | `box.exec` reports `outcome: CHANNEL-REFUSED` with `channel_refused` = `link-refused` / `no-known-daemon` / `daemon-binary-absent` (three different remedies — the last one is on the CALLING box, #3195), keeps the transport's rc labelled as the channel's, and **carries the peer-log path only where the transport's own line names one** (i.e. `link-refused`; `peer` likewise) — `daemon-binary-absent` instead carries `binary_path`. ⛔ The first two classes each cover TWO measured causes behind the identical line (pairing refused for a healthy peer; the peer has no listener), so the payload does not claim which — it names both and points at a peer `:1337` probe from the CALLING box |
 | **`cmux vm <verb>` takes the NAME column, not the LABEL** | `skills/cmux-cells` opening + §3 | `cmux vm stats pi-cell-4` returns a 404 whose own advice is "start a new one" — a spend-flavoured remedy for a running box | resolve LABEL→NAME from `cmux vm ls` and report the resolution |
 | **`cmux workspace close` needs `--force`** for a running process | lane measurement (this brief) | the close appears to succeed while the lane keeps running | pass `--force` when the process is live, and re-read the process afterwards |
 

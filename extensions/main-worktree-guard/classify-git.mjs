@@ -2945,6 +2945,58 @@ function _stripQuotedHeredocBodies(text) {
   return out.join("\n");
 }
 
+/**
+ * #607 (final review P0, category A — FAIL-OPEN): an UNQUOTED heredoc body
+ * (`<<EOF`) IS expanded by the outer shell (`$(…)`, backticks, `$VAR`), but bash
+ * does **not** parse QUOTES or COMMENTS inside a heredoc body — an apostrophe
+ * there is a literal character, not an opening quote, and a `#` there is a
+ * literal character, not a comment. Both of the round-5 projections assumed
+ * otherwise, so ONE apostrophe in an unquoted body opened a phantom
+ * single-quoted region that ran to end of input and swallowed the payload:
+ *
+ *   git commit -F - <<EOF
+ *   fix: don't $(git branch -Mq main victim)
+ *   EOF
+ *
+ * MEASURED at `624d369e6`: `hiddenStateMutation === false` → ADMITTED, while
+ * bash expands the body and renames the branch (probe-verified: `main` is gone
+ * afterwards). Same for `git commit -m "$(cat <<EOF … EOF)"` and for
+ * `cat <<EOF / don't / EOF / echo "$(git branch -Mq main victim)"`. Ordinary
+ * lane traffic — "don't" in a commit body is ordinary text — which is why this
+ * is a P0 rather than an adversarial edge.
+ *
+ * This is a PROJECTION, not a rewriter: only `'`, `"` and `#` inside an unquoted
+ * body are blanked to SPACES (offsets and line structure stable). Everything
+ * else in the body is left verbatim, because a `$(…)`/backtick there DOES
+ * expand and must stay harvestable. It is monotone-WIDENING for detection —
+ * every consumer of these projections SKIPS quoted regions, so removing phantom
+ * quoting can only reveal spans, never hide them.
+ *
+ * Quoted bodies stay `_stripQuotedHeredocBodies`' business (they are blanked
+ * whole: nothing expands there). Run that FIRST, this second.
+ * @param {string} text
+ * @returns {string}
+ */
+function _maskUnquotedHeredocBodies(text) {
+  const lines = String(text ?? "").split("\n");
+  const out = [];
+  let pending = null; // delimiter while inside an UNQUOTED heredoc body
+  const carry = { quote: null, arith: 0 };
+  for (const line of lines) {
+    if (pending !== null) {
+      if (line.trim() === pending) { out.push(line); pending = null; continue; }
+      // Body line: quotes and `#` are LITERAL to bash here. Blank them so the
+      // quote/comment scanners cannot invent a region bash does not have.
+      out.push(line.replace(/['"#]/g, " "));
+      continue;
+    }
+    const { delim, delimQuoted } = _wtScanLine(line, carry);
+    out.push(line);
+    if (delim !== null && !delimQuoted) pending = delim;
+  }
+  return out.join("\n");
+}
+
 export function stripHeredocData(text, codeBodies) {
   const lines = String(text ?? "").split("\n");
   const out = [];
@@ -3925,6 +3977,24 @@ export function classifyGitCommandDetailed(command) {
   // branch-state-mutating scan with the hub-gate's hardened unverifiable-git
   // shape set (round-6→19 review-hardened; the two consumers reuse it so the
   // construct coverage cannot drift).
+  // #607: the BRANCH-STATE half of the same scan, kept SEPARATE. `hiddenStateSubst`
+  // above ORs in the hub-gate's broader unverifiable-git shape set (heredoc-fed
+  // interpreter, `$(< file)`, process substitution, alias indirection), which the
+  // #591 carve-out consumes; a gate that REFUSES on that union would also swallow
+  // shapes it was never about. `hiddenStateMutation` is exactly "a shell
+  // substitution / eval / alias payload carries a MUTATING branch-state git
+  // invocation" — the class the extractor cannot enumerate, so the M3 loop can
+  // only ever gate the VISIBLE mutations of such a command (index.ts refuses it
+  // against a non-worktree session repo, #607). A read-only substitution
+  // (`$(git branch --show-current)`, `$(git rev-parse HEAD)`) does NOT set it.
+  const hiddenStateMutation = _hasHiddenStateMutation(String(command ?? ""));
+  out.hiddenStateMutation = hiddenStateMutation;
+  // ⛔ NOT `hiddenStateMutation || …`: that would SILENTLY narrow the conservative
+  // flag to the precise one, dropping every `_hasHiddenStateSubst` arm
+  // (`__unverifiable__`, `$(<file)`, escaped backticks, proc-subst text, alias
+  // indirection) — and the #591 carve-out's fail-closed rows go red on it. The
+  // two flags are independent: this one stays the UNION, the new one is the
+  // EVIDENCE-of-a-mutation half.
   const hiddenStateSubst =
     _hasHiddenStateSubst(String(command ?? "")) ||
     _unverifiableGitContent(String(command ?? ""));
@@ -4440,6 +4510,46 @@ export function classifyGitCommandDetailed(command) {
   out.pushHints = pushVisInv
     ? { cdChain: pushVisInv.cdChain, cHints: pushVisInv.cHints, gitDirHint: pushVisInv.gitDirHint, vars: pushVisInv.vars }
     : null;
+  // #605: EVERY commit/push invocation, each with ITS OWN boundary-aware
+  // resolution hints (visible → that invocation's own -C/cd hints; invisible
+  // interpreter payload → null hints, i.e. it executes at the shell cwd) and,
+  // for a push, ITS OWN refspec targets/destination. The *_Hints fields above
+  // describe only the FIRST extractor-visible invocation, so M2 resolved ONE
+  // repo per command — a fully-VISIBLE worktree-scoped lead overwrote the
+  // hints the later MAIN invocation needed: `git -C <wt> commit -m z ; git
+  // commit -m x` (off-baseline session) resolved to the worktree, decideM2
+  // returned null for the whole command, and the real OFF-baseline MAIN commit
+  // ran rc 0 (probe-verified; the reversed order blocks). Same for the push
+  // twin, where the first push's targets also attributed the wrong refspec to
+  // the later MAIN push. index.ts M2 now gates EVERY main-resolving mutation
+  // (block wins), mirroring the round-4 M3 stateMutations fix of #596.
+  const _mutationHints = (v) => (v.cmdVisible !== false
+    ? { cdChain: v.cdChain, cHints: v.cHints, gitDirHint: v.gitDirHint, vars: v.vars }
+    : null);
+  out.commitMutations = invocations
+    .filter((v) => v.verb === "commit")
+    .map((v) => ({
+      verb: v.verb, args: v.args,
+      invVisible: v.cmdVisible !== false,
+      hints: _mutationHints(v),
+    }));
+  out.pushMutations = invocations
+    .filter((v) => v.verb === "push")
+    .map((v) => {
+      const t = _pushInvocationTargets(v.args);
+      return {
+        verb: v.verb, args: v.args,
+        invVisible: v.cmdVisible !== false,
+        hints: _mutationHints(v),
+        targets: t.targets,
+        dst: t.dst,
+        // #605 review F1: a delete-spelled push is the #73 coordinated-delete
+        // arm's business, not M2's target comparison — index.ts M2 needs to
+        // tell them apart when a delete ANYWHERE in a compound routes the whole
+        // command to that arm.
+        isDelete: t.isDelete,
+      };
+    });
 
   return out;
 }
@@ -4572,6 +4682,44 @@ function _markOptionValueSlots(tokens) {
   return valueSlot;
 }
 
+/**
+ * #605: describe ONE `git push` invocation's own destination, so a compound's
+ * EACH push can be gated against the repo and the refspec it actually pushes.
+ * `out.pushTargets`/`out.pushDst` describe only the FIRST push invocation (plus
+ * the whole-command delete fold-in), which is the wrong hint for a later
+ * segment: `git -C <wt> push origin wtmain ; git push origin feat/other` gated
+ * the MAIN push against `wtmain` — and would have ALLOWED it outright whenever
+ * the leading worktree push happened to name the session's baseline branch.
+ * The extraction below is the push arm's own (option-value slots → delete /
+ * colon forms → ``positionals[0]`` = remote, the rest = refspecs; the same
+ * ``positionals.length > 1`` rule, so a lone positional is the remote and the
+ * target falls back to the checked-out branch). Deliberately identical to the
+ * first-push arm, including its documented `-o`-value over-capture, so the two
+ * surfaces cannot drift.
+ * @param {string[]} args
+ * @returns {{targets: string[], dst: string|null, isDelete: boolean}}
+ */
+function _pushInvocationTargets(args) {
+  const argv = args || [];
+  const optSlots = _markOptionValueSlots(argv);
+  const deleteIdx = argv.findIndex((a, i) => !optSlots[i] && _isPushDeleteFlagToken(a));
+  const hasColonTargets = argv.some((a, i) => !optSlots[i] && /^:/.test(a));
+  const positionals = argv.filter((x) => !x.startsWith("-"));
+  if (deleteIdx !== -1 || hasColonTargets) {
+    const rawTargets = positionals.length > 1 ? positionals.slice(1) : positionals;
+    return {
+      targets: rawTargets
+        .map((x) => _stripQuotes(x).replace(/^:/, "").replace(/^refs\/heads\//, ""))
+        .filter(Boolean),
+      dst: null,
+      isDelete: true,
+    };
+  }
+  const refspecs = positionals.length > 1 ? positionals.slice(1) : [];
+  const targets = refspecs.map(_refspecDst).filter((x) => x !== null && x !== undefined);
+  return { targets, dst: targets.length === 1 ? targets[0] : null, isDelete: false };
+}
+
 function _isPushDeleteFlagToken(a) {
   if (a === "-d" || a === "--delete" || a.startsWith("--delete=")) return true;
   // `-dq`/`-qd`/`-df` … merged short clusters containing the delete short.
@@ -4585,6 +4733,65 @@ function _isPushDeleteFlagToken(a) {
   return false;
 }
 
+// #653 — the shell mechanisms that make a delete target's WORD differ from its
+// TEXT, so the guard cannot know which ref the delete will name. This is the
+// allow-hole #653 reported: `git push origin --delete "$PR_BRANCH"` extracts the
+// literal string `$PR_BRANCH`, no worktree holds a ref by that name, the #73 arm
+// finds nothing to coordinate and ALLOWS — the delete then runs (measured).
+//
+//   $  `     parameter expansion / command substitution — the word is whatever the
+//           shell produces (`$BRANCH`, `${X:-y}`, `$(…)`, `` `…` ``); measured:
+//           the extractor reports a FRAGMENT of the substitution (`$(echo`) as if
+//           it were a ref name, so no ref ever matches and the arm allows.
+//   *  ?  [  ]   globbing — the shell expands to N words (or leaves the literal).
+//           `*`, `?` and `[` are ILLEGAL in a ref name (free to refuse); `]` is
+//           LEGAL and is refused too — a character class needs its closing bracket,
+//           and a lone `]` in a branch name is not worth a hole in the class.
+//   {  }     brace expansion — `{a,b}` becomes TWO words the guard never sees;
+//           measured: the extractor reads it as ONE token and allows. ⛔ ACCEPTED
+//           OVER-BLOCK: braces ARE legal in a ref name (`git check-ref-format --branch
+//           'feat/{x}'` passes) and `{x}` alone expands to nothing, so a branch
+//           literally named `feat/{x}` is refused too. The guard cannot tell the
+//           two apart from the text, the fleet holds no such branch, and the
+//           refusal names both remedies (write the literal ref out; or the
+//           documented hatch / `gh api -X DELETE`). Over-blocking a legal-but-
+//           vanishing shape is the direction a delete guard must err in.
+//   ~        tilde expansion at word start.
+//   \       escape — the word is not the text.
+//
+// Deliberately NOT included: `,` (legal in a ref name; brace expansion is caught
+// by its own braces) and `^`/`:` (illegal in a ref name and not a shell
+// expansion — git rejects such a refspec, so it cannot delete a held branch).
+const DELETE_TARGET_UNRESOLVABLE_RE = /[$`*?[\]{}\\~]/;
+
+/**
+ * #653 — can the guard resolve this delete target to the ref git would delete?
+ * `true` only when the extracted token is the literal word the shell will pass.
+ * The decision is fail-closed in the caller: an unresolvable target is REFUSED
+ * (option 2 of #653), never looked up-and-allowed.
+ * @param {string} target
+ * @returns {boolean}
+ */
+export function isResolvableDeleteTarget(target) {
+  const t = String(target ?? "");
+  if (t === "") return false;
+  return !DELETE_TARGET_UNRESOLVABLE_RE.test(t);
+}
+
+/**
+ * #653 — the subset of delete targets the guard cannot resolve (deduped, in
+ * command order). Exported and pure so every #73 surface (the degradation arm,
+ * the push-delete arm and the later-segment delete arm — all of which funnel
+ * through index.ts `_coordinatedDeleteBlock`) shares ONE definition, and so the
+ * policy is unit-pinnable without a git fixture.
+ * @param {string[]} targets
+ * @returns {string[]}
+ */
+export function unresolvableDeleteTargets(targets) {
+  if (!Array.isArray(targets)) return [];
+  return [...new Set(targets.filter((t) => !isResolvableDeleteTarget(t)))];
+}
+
 /** Short-name a raw delete target token (`:refs/heads/feat/x` → `feat/x`). */
 function _cleanDeleteTarget(x) {
   return x
@@ -4595,8 +4802,11 @@ function _cleanDeleteTarget(x) {
 }
 
 /**
- * Extract the branch name from `git push [remote] --delete <branch>`.
- * Handles both short names ("feat/x") and full refs ("refs/heads/feat/x").
+ * Extract the branch name(s) from `git push [remote] --delete <branch>…`.
+ * Handles both short names ("feat/x") and full refs ("refs/heads/feat/x"), and
+ * returns EVERY delete refspec of a push that carries a delete flag (git's
+ * positional model: first positional = repository, the rest = refspecs), so a
+ * multi-refspec delete is attributed in full — never just its first target.
  * #443: the legacy raw-string regex was exact-only (`--delete`/`:branch`), so
  * `-d`/`--del`(-prefix) spellings returned null and the degradation-fallback
  * #73 sibling-checked-out check never fired for them. Rewritten token-based to
@@ -4605,7 +4815,14 @@ function _cleanDeleteTarget(x) {
  * it is a normal push, not a delete — the empty-source form starts the token
  * with `:`).
  * @param {string} command
- * @returns {string|null} branch name (short form) or null
+ * @returns {string[]|null} every delete refspec (short form, deduped, in command
+ *   order) — an array, never a bare string; null when no delete spelling is
+ *   attributable to a refspec. Deliberately OVER-captures the git-REJECTED
+ *   shapes (a lone bare positional — `git push --delete feat/x` → `["feat/x"]`;
+ *   a colon target mixed with `--delete` — `git push origin -d a :b` →
+ *   `["a","b"]`), because an extra target is fail-closed while a missing one
+ *   leaves the delete unguarded. So `null` ⇒ nothing deleted, but a NON-null
+ *   result does NOT prove git will delete it (review P3-1).
  */
 export function extractPushDeleteBranch(command) {
   const c = String(command ?? "").trim();
@@ -4635,25 +4852,42 @@ export function extractPushDeleteBranch(command) {
       // delete; a pre-#443 quote-aware extractor handled it, keep that).
       const tq = t.replace(/^["']|["']$/g, "");
       if (_isPushDeleteFlagToken(tq)) {
-        // git's positional model: when a delete flag is present and ≥2
-        // positionals follow it with none BEFORE it, the FIRST is the
-        // REPOSITORY (`git push --delete origin c` deletes c on origin —
-        // probe-verified; `git push --delete origin a b` deletes a AND b).
-        // When the repo precedes the flag (`git push origin --delete a b`)
-        // every following positional is a delete refspec. The extractor's
-        // documented single-target contract keeps the first real refspec, so
-        // a repo that TRAILS the flag is dropped. (A lone positional after
-        // the flag with no repo anywhere is git-invalid — kept as a harmless
-        // over-capture matching the original extractor.)
-        const before = [];
-        const following = [];
+        // git's positional model, wherever the flag sits: the FIRST positional
+        // of the push is the REPOSITORY and EVERY other positional is a delete
+        // refspec — INCLUDING the ones that precede the flag, because `--delete`
+        // is a push-wide option, not a per-refspec one. Probe-verified against a
+        // local bare remote:
+        //   `git push -d origin a b`      → `- [deleted] a`, `- [deleted] b`
+        //   `git push origin -d a b`      → `- [deleted] a`, `- [deleted] b`
+        //   `git push origin main -d b`   → `- [deleted] b`, `- [deleted] main`
+        //   `git push --delete origin c`  → `- [deleted] c`
+        // #509: the previous single-target capture returned only the FIRST
+        // refspec, so on the degradation-fallback #73 arm a multi-refspec delete
+        // of a sibling-checked-out branch was never coordinated-blocked
+        // (e.g. `git push -d origin a b` extracted ["a"] — the real target `b`
+        // was lost and its upstream destroyed). Attribute ALL refspecs, exactly
+        // as `classifyGitCommandDetailed`'s delete pushTargets does
+        // (`positionals.length > 1 ? positionals.slice(1) : positionals`), so the
+        // two #443 surfaces stay in parity.
+        // Only the FIRST positional overall is dropped (the repository). The one
+        // exception is the git-REJECTED lone bare positional, where no repository
+        // can be identified: a single positional AFTER the flag is kept as a
+        // target (`git push --delete feat/x` → `fatal: --delete doesn't make sense
+        // without any refs` — probe-verified; the keep is the documented harmless
+        // over-capture), while a single positional BEFORE the flag IS the
+        // repository and deletes nothing (`git push origin -d` → nothing deleted).
+        const positionals = [];
+        let beforeCount = 0;
         for (let j = 0; j < tokens.length; j++) {
           if (j === i || tokens[j].startsWith("-") || valueSlot[j]) continue;
-          (j < i ? before : following).push(tokens[j]);
+          if (j < i) beforeCount++;
+          positionals.push(tokens[j]);
         }
-        if (following.length === 0) continue; // no refspec after the flag → git errors, nothing deleted
-        const targetTok = following.length >= 2 && before.length === 0 ? following[1] : following[0];
-        branches.push(_cleanDeleteTarget(targetTok));
+        if (positionals.length === 0) continue; // no positional at all → git errors, nothing deleted
+        const targets = positionals.length > 1
+          ? positionals.slice(1)                        // first positional = the REMOTE
+          : (beforeCount === 0 ? positionals : []);      // lone refspec after the flag, or the repo alone
+        for (const tok of targets) branches.push(_cleanDeleteTarget(tok));
       } else if (/^:/.test(tq)) {
         // Empty-source colon refspec (`:feat/x`) = a delete. src:dst refspecs
         // (`main:feature`) never start with `:` — they stay plain pushes.
@@ -5674,71 +5908,346 @@ function _ansiTranslate(s) {
   });
 }
 
-export function _hasHiddenStateSubst(raw) {
-  const source = String(raw ?? "");
-  const mutates = (inv) => {
-    if (["checkout", "switch", "symbolic-ref", "update-ref"].includes(inv.verb)) return true;
-    // #596 (round-2 reviewer F1): consolidate on the arm-exact mirror — the
-    // stale inline copy only knew exact -m/-M + delete + narrow-force, so the
-    // #592 rename-cluster/long-form and force-COPY spellings (-Mq/--move/
-    // -Cq/…) were invisible here and a hidden payload of that surface
-    // laundered the #591 benign-force carve-out (probe-verified rc 0).
-    return inv.verb === "branch" && _branchInvMutatesBranchState(inv.args);
-  };
-  // Quote-aware payload collector: `$(…)`/`<(…)`/`>(…)` spans close only on a
-  // paren OUTSIDE quotes/escapes; ANSI-C `$'…'` literals; backticks pair to
-  // the next (top-level escaping already fails closed above the collector).
-  const collect = (src) => {
-    const spans = [];
-    let i = 0;
-    const n = src.length;
-    while (i < n) {
-      const c = src[i];
-      if (c === "$" && src[i + 1] === "'") {
-        let j = i + 2;
-        while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
-        // ANSI-C $'…' escapes translate BEFORE scanning: a multiline payload
-        // (`sh -c $'echo a\ngit branch -fq victim main'`) carries the real
-        // newline as \n — without translation the payload tokenizes as ONE
-        // glued word and the hidden git invocation is invisible (round-6
-        // cycle-3 reviewer P1, probe-verified rc 0).
-        // Round-7 (cycle-4 reviewers P1): ANSI-C escapes translate BEFORE
-        // scanning (see _ansiTranslate) — \cJ = a real newline re-splits the
-        // payload into a second command; without translation the payload
-        // tokenizes as ONE glued word and the hidden git invocation is
-        // invisible (probe-verified rc 0).
-        spans.push(_ansiTranslate(src.slice(i + 2, j)));
-        i = j < n ? j + 1 : n;
-        continue;
-      }
-      if ((c === "$" || c === "<" || c === ">") && src[i + 1] === "(") {
-        let depth = 1;
-        let q = null; // null | '"' | "'"
-        let j = i + 2;
-        while (j < n && depth > 0) {
-          const d = src[j];
-          if (q !== null) {
-            if (d === "\\") j++;
-            else if (d === q) q = null;
-          } else if (d === "\"" || d === "'") q = d;
-          else if (d === "(") depth++;
-          else if (d === ")") depth--;
-          j++;
-        }
-        spans.push(src.slice(i + 2, Math.max(i + 2, j - 1)));
-        i = j;
-        continue;
-      }
-      if (c === "`") {
-        const j = src.indexOf("`", i + 1);
-        spans.push(src.slice(i + 1, j > -1 ? j : src.length));
-        i = j > -1 ? j + 1 : src.length;
-        continue;
-      }
-      i++;
+/**
+ * #607 (review finding 1, category A — FAIL-OPEN): bash recognizes COMMENTS before
+ * it divides the input into words (GNU Bash Reference Manual, Shell Syntax: "Bash
+ * first recognizes comments, then divides the input into words and operators"). A
+ * `#` at WORD START begins a comment running to end of line, and nothing inside one
+ * is expanded — not quotes, not `$(…)`. ShellCheck SC1011 exists for the exact
+ * consequence below; `mvdan/sh` and bash's own `parse.y` keep a separate comment
+ * token class consumed BEFORE quote state is updated.
+ *
+ * The round-4 masking modelled `'…'` and `"…"` but not comments, so ONE apostrophe
+ * in a `#` comment opened a phantom single-quoted region that ran to end of input
+ * and swallowed every span after it. MEASURED at `2e0b3ab7d`: `# don't` + newline +
+ * `echo "$(git branch -Mq main victim)"` → `hiddenStateMutation === false` →
+ * ADMITTED (victim clobbered rc 0), while the same command with `# safe` was
+ * refused. That is a category-A bypass of the very class #607 closes, introduced
+ * by the round-4 commit — so the ordering here is BASH'S ordering, deliberately.
+ *
+ * A projection, never a rewrite: comment text is blanked to SPACES so offsets and
+ * line structure stay stable for every consumer. Quote state carries ACROSS lines
+ * because this runs on a whole COMMAND, not on one script line: an apostrophe in a
+ * `"…"` region is literal, and a `#` inside `"…"` is NOT a comment.
+ *
+ * ⛔ WORD START IS NOT "the previous character is in some class". A closing `)`
+ * CONTINUES a word in bash — `echo $(date)#x` prints `<date>#x`, the `#` is a
+ * literal character — so `)` must NOT be a comment delimiter. It was one, and it
+ * blanked every live tail after a substitution: MEASURED at `624d369e6`,
+ * `echo $(date)#x; eval 'git branch -Mq main victim'` → `hiddenStateMutation ===
+ * false` → ADMITTED while the shell runs the eval (the `;` control was `true`).
+ * Every remaining delimiter here (whitespace, `;`, `|`, `&`, `(`) is a genuine
+ * word TERMINATOR, so nothing legitimate regresses: a comment written after a
+ * subshell close (` (cd x) # note`) has whitespace before the `#`.
+ * @param {string} text
+ * @returns {string}
+ */
+function _stripShellCommentsForScan(text) {
+  const src = String(text ?? "");
+  const out = [];
+  const n = src.length;
+  let inD = false;
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (inD) {
+      if (c === "\\") { out.push(src.slice(i, i + 2)); i += 2; continue; }
+      if (c === '"') inD = false;
+      out.push(c);
+      i += 1;
+      continue;
     }
-    return spans;
-  };
+    if (c === "$" && src[i + 1] === "'") {
+      // ANSI-C `$'…'`: a QUOTED string to the shell (nothing inside expands except
+      // its own escapes), and `\'` is an ESCAPED quote. Copy it whole — without this
+      // arm the escaped quote ended the region early, and a later `#` on the same
+      // line then blanked a LIVE payload after it (MEASURED while fixing this:
+      // `echo $'it\'s # x' ; echo "$(git branch -Mq main victim)"` → false, while the
+      // shell runs the substitution).
+      let j = i + 2;
+      while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
+      const end = j < n ? j + 1 : n;
+      out.push(src.slice(i, end));
+      i = end;
+      continue;
+    }
+    if (c === "'") {
+      // Single-quoted region: LITERAL to bash (a backslash is not an escape
+      // here), so copy it verbatim through its closing quote.
+      let j = i + 1;
+      while (j < n && src[j] !== "'") j++;
+      const end = j < n ? j + 1 : n;
+      out.push(src.slice(i, end));
+      i = end;
+      continue;
+    }
+    if (c === '"') { inD = true; out.push(c); i += 1; continue; }
+    if (c === "#" && (i === 0 || /[\s;|&(]/.test(src[i - 1]))) {
+      let j = i;
+      while (j < n && src[j] !== "\n") j++;
+      out.push(" ".repeat(j - i));
+      i = j;
+      continue;
+    }
+    if (c === "\\") { out.push(src.slice(i, i + 2)); i += 2; continue; }
+    out.push(c);
+    i += 1;
+  }
+  return out.join("");
+}
+
+/**
+ * The ONE projection every #607 scan consumes — in bash's own order:
+ *   1. blank QUOTED heredoc bodies (nothing expands there),
+ *   2. blank quotes/`#` inside UNQUOTED heredoc bodies (bash parses neither there,
+ *      while `$(…)` DOES expand — so the rest of the body stays scannable),
+ *   3. blank `#` comments (recognized before quotes are tracked).
+ * Every step is monotone-WIDENING for detection: each consumer below SKIPS quoted
+ * regions, so removing a region bash does not have can only reveal spans. A
+ * projection, never a rewrite — offsets and line structure are preserved.
+ * @param {string} text
+ * @returns {string}
+ */
+function _shellScanProjection(text) {
+  return _stripShellCommentsForScan(_maskUnquotedHeredocBodies(_stripQuotedHeredocBodies(String(text ?? ""))));
+}
+
+/**
+ * The `[start, end]` ranges of SINGLE-quoted regions. bash performs NO expansion
+ * inside `'…'` (ShellCheck SC2016 is published for exactly this), so text there is
+ * inert whatever it spells. The collector already skips those regions; the
+ * `eval`/git-alias passes use this to skip a match that merely DESCRIBES a payload.
+ * MEASURED pre-fix (review finding 2b): `git commit -m 'note: git -c
+ * alias.x="branch -fq a b" is the trick'` → `hiddenStateMutation === true` → a
+ * lane's ordinary `git commit` in a worktree REFUSED for describing an alias, with
+ * the remedy "run it directly" — which the command already satisfied.
+ *
+ * ⛔ ANSI-C `$'…'` IS INERT TOO, and must be skipped WHOLE with its escapes honoured
+ * (final review P1, category A — FAIL-OPEN). Without that arm the region ended at the
+ * `'` that follows `$`, so an ESCAPED quote (`$'it\'s'`) closed it early and the
+ * literal's real closing `'` then opened a PHANTOM region running to end of input —
+ * every later `eval "…"` / `-c alias.x=…` match was skipped as if it were prose.
+ * MEASURED at `624d369e6`: `echo $'it\'s' ; eval "git branch -Mq main victim"` →
+ * `hiddenStateMutation === false` (ADMITTED) while the control `echo $'it s' ; …` →
+ * `true`. `$'…'` performs no expansion, so an inert range is also the right semantics.
+ * @param {string} text
+ * @returns {Array<[number, number]>}
+ */
+function _singleQuotedRanges(text) {
+  const src = String(text ?? "");
+  const ranges = [];
+  let inD = false;
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (inD) {
+      if (c === "\\") { i += 2; continue; }
+      if (c === '"') inD = false;
+      i += 1;
+      continue;
+    }
+    if (c === "$" && src[i + 1] === "'") {
+      // ANSI-C literal: `\'` is an ESCAPED quote and does NOT end the region.
+      let j = i + 2;
+      while (j < src.length && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
+      ranges.push([i, Math.min(j, src.length - 1)]);
+      i = j < src.length ? j + 1 : src.length;
+      continue;
+    }
+    if (c === "'") {
+      let j = i + 1;
+      while (j < src.length && src[j] !== "'") j++;
+      ranges.push([i, Math.min(j, src.length - 1)]);
+      i = j < src.length ? j + 1 : src.length;
+      continue;
+    }
+    if (c === '"') { inD = true; i += 1; continue; }
+    i += 1;
+  }
+  return ranges;
+}
+
+/** Is `idx` strictly INSIDE one of the single-quoted ranges? */
+function _insideSingleQuotes(ranges, idx) {
+  for (const [a, b] of ranges) if (idx > a && idx < b) return true;
+  return false;
+}
+
+/**
+ * #607: the quote-aware payload-span collector, HOISTED out of
+ * `_hasHiddenStateSubst` so the REFUSAL that consumes the flag (index.ts) can
+ * enumerate the very spans the decision was computed from. ONE collector, never
+ * a second shell parser that could drift from the one `hiddenStateMutation` is
+ * derived from.
+ * `$(…)`/`<(…)`/`>(…)` spans close only on a paren OUTSIDE quotes/escapes;
+ * ANSI-C `$'…'` literals translate before they are returned; backticks pair to
+ * the next (top-level escaping already fails closed in the callers).
+ * @param {string} src
+ * @returns {string[]}
+ */
+function _collectSubstSpansDetailed(src) {
+  const spans = [];
+  // #607 (review finding 1): bash's own ordering — comments are recognized
+  // BEFORE quotes are tracked, so an apostrophe in a `#` comment can never open a
+  // phantom quoted region that swallows the live payload after it.
+  src = _stripShellCommentsForScan(_maskUnquotedHeredocBodies(src));
+  let i = 0;
+  const n = src.length;
+  // #607 (review round 4, P2): SINGLE-QUOTED regions are INERT — bash performs no
+  // expansion inside `'…'`, so a `$(…)`/backtick inside one is literal text and must
+  // not be harvested as an expansion. MEASURED before this: the collector had no
+  // top-level quote tracking at all, so
+  //   `git commit -m 'fix: refuse $(git branch -Mq main victim) (#607)'`
+  // — prose about a payload — was refused, with the remedy "run it directly", which it
+  // already did. That is the traffic of the very issue being discussed.
+  // DOUBLE-quoted regions still collect (`"$(…)"` DOES expand) and so does the
+  // `eval '…'` literal (handled by a separate pass, not by this collector).
+  let dq = false;
+  while (i < n) {
+    const c = src[i];
+    if (c === "\\") { i += 2; continue; }        // escaped char — inert
+    if (c === '"') { dq = !dq; i += 1; continue; }
+    if (c === "'" && !dq) {                        // single-quoted region: skip it whole
+      let j = i + 1;
+      while (j < n && src[j] !== "'") j++;
+      i = j < n ? j + 1 : n;
+      continue;
+    }
+    if (c === "$" && src[i + 1] === "'") {
+      let j = i + 2;
+      while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
+      // ANSI-C $'…' escapes translate BEFORE scanning: a multiline payload
+      // (`sh -c $'echo a\ngit branch -fq victim main'`) carries the real
+      // newline as \n — without translation the payload tokenizes as ONE
+      // glued word and the hidden git invocation is invisible (round-6
+      // cycle-3 reviewer P1, probe-verified rc 0).
+      // Round-7 (cycle-4 reviewers P1): ANSI-C escapes translate BEFORE
+      // scanning (see _ansiTranslate) — \cJ = a real newline re-splits the
+      // payload into a second command; without translation the payload
+      // tokenizes as ONE glued word and the hidden git invocation is
+      // invisible (probe-verified rc 0).
+      spans.push({ text: _ansiTranslate(src.slice(i + 2, j)), procSubst: false });
+      i = j < n ? j + 1 : n;
+      continue;
+    }
+    if ((c === "$" || c === "<" || c === ">") && src[i + 1] === "(") {
+      let depth = 1;
+      let q = null; // null | '"' | "'"
+      let j = i + 2;
+      while (j < n && depth > 0) {
+        const d = src[j];
+        if (q !== null) {
+          if (d === "\\") j++;
+          else if (d === q) q = null;
+        } else if (d === "\"" || d === "'") q = d;
+        else if (d === "(") depth++;
+        else if (d === ")") depth--;
+        j++;
+      }
+      spans.push({ text: src.slice(i + 2, Math.max(i + 2, j - 1)), procSubst: c === "<" || c === ">" });
+      i = j;
+      continue;
+    }
+    if (c === "`") {
+      const j = src.indexOf("`", i + 1);
+      spans.push({ text: src.slice(i + 1, j > -1 ? j : src.length), procSubst: false });
+      i = j > -1 ? j + 1 : src.length;
+      continue;
+    }
+    i++;
+  }
+  return spans;
+}
+
+/** The TEXTS only — the shape every pre-#607 consumer wants. */
+function _collectSubstSpans(src) {
+  return _collectSubstSpansDetailed(src).map((sp) => sp.text);
+}
+
+/** The git verbs whose EFFECT depends on their arguments (#607 finding 2a). */
+const BRANCH_STATE_VERBS = new Set(["branch", "checkout", "switch", "symbolic-ref", "update-ref"]);
+
+/**
+ * #607: is this invocation a BRANCH-STATE MUTATION? Argument-aware, because the
+ * verb alone is not the effect (measured on git 2.50.1):
+ *   `git symbolic-ref --short HEAD`        -> PRINTS the branch, rc 0 (a READ —
+ *                                             git-symbolic-ref(1): one argument
+ *                                             reads, two create/update)
+ *   `git symbolic-ref HEAD refs/heads/x`   -> rewrites HEAD (a WRITE)
+ *   `git update-ref refs/heads/x`          -> USAGE ERROR rc 129, moves nothing
+ *   `git update-ref --stdin` / `-d <ref>`  -> writes / deletes
+ *   `git update-ref <ref> <new>`           -> writes
+ * Before this, `symbolic-ref` and `update-ref` were unconditional, which made
+ * `git commit -m "wip on $(git symbolic-ref --short HEAD)"` a "hidden
+ * branch-state mutation" (agent-infra#607 review finding 1: a false block on a
+ * documented READ, admitted on main, with an unusable remedy).
+ * @param {{verb?: string, args?: string[]}} inv
+ */
+function _argAwareBranchStateMutation(inv) {
+  const args = inv.args || [];
+  const flags = args.filter((x) => x.startsWith("-")).map((x) => _stripQuotes(x));
+  const pos = args.filter((x) => !x.startsWith("-"));
+  if (inv.verb === "checkout" || inv.verb === "switch") return true;
+  if (inv.verb === "symbolic-ref") {
+    if (flags.some((f) => f === "-d" || f === "--delete")) return true;
+    return pos.length >= 2; // one arity = read
+  }
+  if (inv.verb === "update-ref") {
+    if (flags.some((f) => f === "-d" || f === "--delete" || f === "--stdin")) return true;
+    return pos.length >= 2; // `<ref>` alone is a usage error, not a move
+  }
+  // #596 (round-2 reviewer F1): the arm-exact mirror — cluster/long-form renames
+  // and force-copy spellings (`-Mq`/`--move`/`-Cq`/…) must be seen.
+  return inv.verb === "branch" && _branchInvMutatesBranchState(inv.args);
+}
+
+/**
+ * #607 (review finding 2a — over-block): an alias VALUE is a command list that git
+ * COMPLETES with the call-site args, so the two halves must be judged TOGETHER:
+ *   `git -c alias.b='branch --list' b`                 -> `git branch --list` (READ)
+ *   `git -c alias.s='symbolic-ref --short' s HEAD`     -> (READ)
+ *   `git -c alias.x='branch --no-color' x -Mq v main`  -> (WRITE — only visible
+ *                                                        once the call-site args
+ *                                                        are appended)
+ * Judging the first WORD alone (pre-fix) refused the two reads while
+ * `_argAwareBranchStateMutation` exists one function above precisely because a verb
+ * is not the effect; judging the value withOUT the call-site args would fail OPEN on
+ * the third shape. Only the BARE-COMMAND-LIST form is owned here — a value carrying
+ * the `git` word is judged by `scan()`.
+ * @param {string} val         the alias value, leading `!` already stripped
+ * @param {string} aliasName   the alias name whose invocation supplies the args
+ * @param {string} source      the command text the call site lives in
+ * @returns {boolean}
+ */
+function _aliasValueMutates(val, aliasName, source) {
+  const toks = _tokenize(String(val ?? ""))
+    .map((t) => _stripQuotes(t))
+    .filter((t) => t.length > 0);
+  while (toks.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[0])) toks.shift(); // VAR=value prefix
+  if (toks.length === 0) return false;
+  const verb = toks[0];
+  if (!BRANCH_STATE_VERBS.has(verb)) return false; // incl. "git" — scan() owns those
+  let callArgs = [];
+  if (aliasName && source) {
+    const inv = allGitInvocations(String(source)).find((iv) => iv.verb === aliasName);
+    if (inv && Array.isArray(inv.args)) callArgs = inv.args;
+  }
+  return _argAwareBranchStateMutation({ verb, args: [...toks.slice(1), ...callArgs] });
+}
+
+export function _hasHiddenStateSubst(raw) {
+  // #607 (review finding 1): bash recognizes comments BEFORE it tracks quotes, and a
+  // comment expands nothing — so the span collector and every pass below see the
+  // comment-blanked projection. This is a strict narrowing of an INERT region; it
+  // cannot fail open (a comment never executes).
+  const source = _stripShellCommentsForScan(_maskUnquotedHeredocBodies(String(raw ?? "")));
+  // #607 review finding 1: argument-aware, not verb-only — see
+  // _argAwareBranchStateMutation (a one-argument `symbolic-ref` is a READ).
+  const mutates = _argAwareBranchStateMutation;
+  // Quote-aware payload collector — HOISTED to module scope (#607) so the
+  // refusal that consumes this flag can enumerate the SAME spans; see
+  // _collectSubstSpans. Behaviour is identical.
+  const collect = _collectSubstSpans;
   // Top-level unverifiable segment (eval/alias/$VAR command indirection) —
   // its expansion is unclassifiable, so it may hide a second state mutation.
   if (allGitInvocations(source).some((inv) => inv.verb === "__unverifiable__")) return true;
@@ -5749,9 +6258,15 @@ export function _hasHiddenStateSubst(raw) {
   // scan() because ANSI-C translation can REVEAL a decoded `$(<` (\x24\x3c).
   if (/\$\(</.test(source)) return true;
   const seen = new Set();
+  // Same (CONTEXT, TEXT) keying as `_hasHiddenStateMutation`: a text-only key here let
+  // an inert `$(…)` scan suppress the later proc-subst scan of the same text — the
+  // conservative flag's own false negative, found by the same review.
+  const memoKey = (ctx, text) => (ctx ? "p" : "s") + "\u0000" + text;
   const scan = (inner, isProcSubst) => {
-    if (inner === undefined || inner.length === 0 || seen.has(inner)) return false;
-    seen.add(inner);
+    if (inner === undefined || inner.length === 0) return false;
+    const k = memoKey(isProcSubst, inner);
+    if (seen.has(k)) return false;
+    seen.add(k);
     if (/\$\(</.test(inner)) return true; // decoded file-read substitution inside a span (\x24\x3c …)
     if (isProcSubst && /\bgit\b/.test(inner)) return true; // executable text fed to a shell (round-19 parity)
     for (const inv of allGitInvocations(inner)) {
@@ -5829,6 +6344,154 @@ export function _hasHiddenStateSubst(raw) {
   // opaque env-backed aliases: --config-env=alias.x=ENV, GIT_CONFIG_KEY_n\d+=
   // alias.x, and GIT_CONFIG_PARAMETERS (git's internal -c env — round-7 cycle-4
   // reviewer P1, probe-verified rc 0) all refuse the carve-out.
+  if (/(?:\-\-config\-env[=\s]+\S*alias\.|GIT_CONFIG_KEY_\d+=alias\.|GIT_CONFIG_PARAMETERS=[^;]*alias\.)/.test(source)) return true;
+  return false;
+}
+
+
+/**
+ * #607: the PRECISE half of `_hasHiddenStateSubst` — "a hidden shell payload
+ * CARRIES A MUTATING BRANCH-STATE git invocation". This is what the refusal in
+ * index.ts consumes. `hiddenStateSubst` keeps its conservative union, because
+ * its other consumer (#591's benign-force carve-out) can only be made SAFER by a
+ * false positive.
+ *
+ * WHY A SECOND PREDICATE (measured, agent-infra#607 review finding 1): the
+ * conservative flags fire on shapes that CANNOT move a ref —
+ *   `__unverifiable__` ($VAR command word, unquoted `eval $VAR`),
+ *   `$(<file)` (inert text until something evals it),
+ *   a `!`-prefixed shell alias whose value is a READ (`!git log --graph`).
+ * Consuming those as "hidden mutation" refused
+ * `git commit -m "wip on $(git symbolic-ref --short HEAD)"` — a documented read
+ * that main admitted — leaving an unhatched lane (task children are unhatched,
+ * #623) blocked with a remedy it had already followed.
+ *
+ * So this answers ONE question, from EVIDENCE of a mutation, and from nothing
+ * else:
+ *   - a substitution / backtick span whose git invocations include a mutating
+ *     branch-state verb (argument-aware: a one-positional `symbolic-ref` is a
+ *     read, `update-ref <ref>` alone is a usage error);
+ *   - a `<(...)`/`>(...)` body: judged by its ARGUMENTS when the body is a git
+ *     command list, and conservatively (`/\bgit\b/`) when it is executable TEXT a
+ *     later step may run (`bash <(echo 'git branch -Mq …')`);
+ *   - a static `eval '…'` literal, judged the same way;
+ *   - a static alias VALUE (`-c alias.x=…`, `GIT_CONFIG_PARAMETERS`), with a
+ *     leading `!` (git's shell-alias marker) stripped before the same test;
+ *   - an OPAQUE alias keyed by env (`--config-env=alias.x`, `GIT_CONFIG_KEY_n`)
+ *     — the value is unreadable here, and an alias can name a branch-state verb.
+ * @param {string} raw
+ * @returns {boolean}
+ */
+export function _hasHiddenStateMutation(raw) {
+  // #607 (review round 4): a QUOTED heredoc body (`<<'EOF' … EOF`) is literal to the
+  // outer shell — a `$(…)` inside it is not expanded by the command that carries it,
+  // so a `git commit -F - <<'EOF' … EOF` message about a payload must not be refused.
+  // ⚠️ What this deliberately does NOT cover (and never did): an interpreter that
+  // CONSUMES the text (`bash <<'EOF'`, `bash -c "$(…)"`, `$(…) | bash`) — the
+  // "consumer of inert text" family agent-infra#694 owns. MEASURED: the precise flag
+  // is already false for `bash <<'EOF' … git branch -Mq …`, so this is not a
+  // regression, and the family is named here so the next reader does not read it as
+  // covered.
+  const source = _shellScanProjection(String(raw ?? ""));
+  // #607 (review finding 2b): matches that sit inside a SINGLE-QUOTED region merely
+  // DESCRIBE a payload — bash expands nothing there — so the `eval`/alias passes skip
+  // them. `eval '<payload>'` itself still fires: its match starts OUTSIDE the quotes.
+  const inertSingleQuoted = _singleQuotedRanges(source);
+  const firstWord = (text) => {
+    for (const tok of _tokenize(String(text ?? ""))) {
+      const t = _stripQuotes(tok);
+      if (t.length === 0) continue;
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue; // VAR=value prefix
+      return t;
+    }
+    return "";
+  };
+  const seen = new Set();
+  // ⛔ THE MEMO IS KEYED ON (CONTEXT, TEXT), NEVER ON TEXT ALONE (review finding,
+  // measured). `executableText` is the whole distinction this predicate draws: a
+  // `<(...)`/eval/alias body is text a later step may RUN and is judged
+  // conservatively; a `$(...)` body is inert and judged by its arguments. Keyed on
+  // text alone, whichever context saw the text FIRST won and the verdict became
+  // order-dependent:
+  //   `y=$(echo 'git branch -Mq victim main'); bash <(echo 'git branch -Mq victim main')`
+  // measured FALSE (admitted, and the shell runs it: victim clobbered rc 0) while the
+  // same two halves in the other order measured TRUE. A gate whose answer flips with
+  // segment order is deciding on its cache, not on what the shell executes.
+  const memoKey = (ctx, text) => (ctx ? "x" : "n") + "\u0000" + text;
+  const scan = (inner, executableText) => {
+    if (inner === undefined || inner.length === 0) return false;
+    const k = memoKey(executableText, inner);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    if (executableText && firstWord(inner) !== "git") {
+      // Executable text whose invocation list says nothing about its content
+      // (`bash <(echo 'git …')`) — a git word anywhere is a risk. This is the
+      // pre-existing rule, narrowed to the case it exists for.
+      if (/\bgit\b/.test(inner)) return true;
+      // An alias VALUE may omit the `git` word entirely (`alias.x='branch x -fq
+      // victim main'`): git appends the call-site args, so the value is judged as a
+      // command list. Judging the VERB ALONE (pre-fix) refused documented READS
+      // (`-c alias.b='branch --list' b`, `-c alias.s='symbolic-ref --short' s HEAD` —
+      // review finding 2a) while `_argAwareBranchStateMutation` exists one function
+      // above precisely because a verb is not the effect. A BARE verb with no args of
+      // its own stays conservative (#805): its call-site args are appended by
+      // `_aliasValueMutates` at the alias passes, never guessed here.
+      const fw = firstWord(inner);
+      if (!BRANCH_STATE_VERBS.has(fw)) return false;
+      const toks = _tokenize(inner).map((t) => _stripQuotes(t)).filter((t) => t.length > 0);
+      while (toks.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[0])) toks.shift();
+      const own = toks.slice(1);
+      if (own.length === 0) return true;
+      return _argAwareBranchStateMutation({ verb: fw, args: own });
+    }
+    for (const inv of allGitInvocations(inner)) {
+      if (inv.verb === "__unverifiable__") continue; // unknown content, no known move
+      if (_argAwareBranchStateMutation(inv)) return true;
+    }
+    for (const sub of _collectSubstSpansDetailed(inner)) {
+      if (scan(sub.text, sub.procSubst)) return true;
+    }
+    return false;
+  };
+  for (const span of _collectSubstSpansDetailed(source)) {
+    if (scan(span.text, span.procSubst)) return true;
+  }
+  // ⛔ NO PER-TOKEN RE-SCAN HERE (review round 4). `_tokenize` STRIPS quotes, so
+  // re-collecting spans from each token resurrected exactly the payloads the
+  // single-quote masking above exists to drop (`git commit -m 'refuse $(git branch
+  // -Mq …)'` → the token no longer carries its quotes → harvested). The raw-source
+  // pass is sufficient: a substitution with spaces inside is still inside ONE token
+  // when quoted, and an unquoted `$( … )` spans tokens in the RAW text the pass
+  // already sees. MEASURED both ways: unquoted and double-quoted payloads still fire;
+  // single-quoted and quoted-heredoc ones do not.
+  // static eval literals (non-static `eval $EV` cannot be read — and by itself
+  // names no mutation, so it is NOT a refusal here)
+  const evalRe = /eval\s+(?:\$'([^']*)'|"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = evalRe.exec(source)) !== null) {
+    if (_insideSingleQuotes(inertSingleQuoted, m.index)) continue; // 2b: prose, inert
+    const ansi = m[1];
+    const payload = ansi !== undefined ? _ansiTranslate(ansi) : (m[2] ?? m[3] ?? "");
+    if (payload.length > 0 && scan(payload, true)) return true;
+  }
+  // static alias VALUES (leading `!` is git's shell-alias marker — strip it and
+  // judge the command list)
+  const cfgAlias = /(?:\-c|\-\-config)(?:\s+["']?alias\.|=alias\.)([A-Za-z0-9_.\/-]+)=(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+  let cm;
+  while ((cm = cfgAlias.exec(source)) !== null) {
+    if (_insideSingleQuotes(inertSingleQuoted, cm.index)) continue; // 2b: prose, inert
+    const val = (cm[2] ?? cm[3] ?? cm[4] ?? "").replace(/^!/, "");
+    if (val.length > 0 && (scan(val, true) || _aliasValueMutates(val, cm[1], source))) return true;
+  }
+  const cfgAliasQ = /(?:\-c|\-\-config)\s+(["'])(alias\.[A-Za-z0-9_.\/-]+)=([^"']*)\1/g;
+  let cq;
+  while ((cq = cfgAliasQ.exec(source)) !== null) {
+    if (_insideSingleQuotes(inertSingleQuoted, cq.index)) continue; // 2b: prose, inert
+    const val = (cq[3] ?? "").replace(/^!/, "");
+    if (val.length > 0 && (scan(val, true) || _aliasValueMutates(val, cq[2], source))) return true;
+  }
+  // opaque env-backed aliases: the VALUE is unreadable and an alias can name a
+  // branch-state verb, so this stays a refusal (#805).
   if (/(?:\-\-config\-env[=\s]+\S*alias\.|GIT_CONFIG_KEY_\d+=alias\.|GIT_CONFIG_PARAMETERS=[^;]*alias\.)/.test(source)) return true;
   return false;
 }
@@ -8030,7 +8693,26 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //  - heredoc BODIES are stdin data (skipped entirely in the walk; bodies
   //    never shift the cwd, emit tee/cd words, or swallow trailing code — an
   //    unterminated heredoc swallows to EOF, matching bash's heredoc wait).
-  const frames = [{ cwd: base0, pending: null, forkCwd: null, forkAlts: [] }];
+  // pipeC0/pipeActive (per frame): EVERY pipeline segment runs in a subshell,
+  // the LAST one included — a `cd` in the final segment (`true | cd docs; echo
+  // x > f`) does NOT survive the pipeline, so the next command runs from the
+  // pipeline's START cwd. pipeC0 records that start cwd at the first `|` and
+  // applyPending() restores it at the boundary; without it the last segment's
+  // `cd` LEAKED into the following command and a tracked hub write resolved one
+  // directory off — a FAIL-OPEN (`true | cd docs; echo x > tracked.md` resolved
+  // docs/tracked.md where real bash writes the tracked HUB file at the root;
+  // #3954).
+  // The git-side walker has always restored here (`_walkShell`'s pipeC0 /
+  // restoreC0 pair, pinned by its T32/T33).
+  // pipeD0 (per frame): the PIPE boundary restores the `dirStack` too, not just the
+  // cwd. `pushd`/`popd` mutate a stack bash SHARES across the pipeline list, and a
+  // pipeline segment is a subshell — so its pushd/popd die with it. Restoring only the
+  // cwd left the stack one entry deep, a later bare `popd` landed on an entry bash
+  // never had, and the walker's cwd then drifted from real bash's: measured FAIL-OPEN,
+  // `cd c; pushd ../docs | cat; cd ../docs; popd; echo x > tracked.md` really overwrites
+  // the TRACKED hub file at the root while the walker allowed it. Same class as #3954's
+  // cwd restore, same boundary (#3957 review ISSUE 3).
+  const frames = [{ cwd: base0, pending: null, forkCwd: null, forkAlts: [], pipeC0: null, pipeD0: null, pipeActive: false }];
   // pipeBase: cwd at the start of the current PIPE list (updated at every
   // continuation boundary incl. &&); asyncBase: cwd at the start of the
   // current async segment (updated only at ;/newline/start/(/post-& — NOT at
@@ -8038,6 +8720,14 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   // cwd, matching bash: the WHOLE `cd docs && true` list is async).
   const pipeBase = [base0];
   const asyncBase = [base0];
+  // dirBase / dirAsync: the `dirStack` as it stood at each frame's pipe-list start (and
+  // at the current async segment's start), parallel to pipeBase/asyncBase. A pipeline
+  // boundary restores the cwd from pipeBase — it must restore the DIR STACK the same way
+  // (ISSUE 3). ⛔ The snapshot CANNOT be taken at the `|` itself: the first segment has
+  // already run its `pushd` by then, so `pushd ../docs | cat` would snapshot the very
+  // entry the boundary has to discard. It is taken at the BOUNDARY, like pipeBase is.
+  const dirBase = [[]];
+  const dirAsync = [[]];
   let skipStart = -1;   // active heredoc-body region [skipStart, skipEnd):
   let skipEnd = -1;     // the header remainder is walked; the body is jumped
   // simple-command arg-position state (cycle-22 P1): special-word handlers
@@ -8049,6 +8739,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   let casePattern = false;         // cycle-36 P2-1: inside a case, words between `in` and the arm's `)` are PATTERNS — never dispatched
   let caseValPending = false;      // cycle-37 F3: after `case` the NEXT word is the cased VALUE — never dispatched (bash doesn't execute it)
   let caseValConsumed = false;     // cycle-37 F1: only a case's OWN `in` (after its value) opens the pattern phase — a for/select `in` inside an arm must NOT
+  let dblDepth = 0;                // `[[ … ]]` nesting — a `|` in there is regex/boolean alternation, NOT a pipeline (#3957 review P1)
   const caseCwdStack = [];         // cycle-37 F2: each case arm runs from the pre-case cwd (real bash executes ONE arm) — restore at every arm terminator + esac
   let forceCmdNext = false;        // a leading \\ escape dropped — the word is at command position
   let spawnerPending = null;       // sudo/env/xargs/… — next real word is a command
@@ -8088,6 +8779,15 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const pipeB = () => pipeBase[pipeBase.length - 1];
   const asyncB = () => asyncBase[asyncBase.length - 1];
   const skipWs = (k) => { while (k < n && /\s/.test(s[k])) k++; return k; };
+  // A bash SIMPLE COMMAND ends at a bare newline, so an operand read for a
+  // cwd-mutating builtin must not cross one: `popd\ncd a` is TWO commands in
+  // real bash. skipWs() would swallow the newline and read `cd` as popd's
+  // operand, EATING the next command — measured BYPASS: `popd\ncd a; echo pwn >
+  // ../tracked.md` really overwrites the tracked HUB file (cwd is `a`, `..` is
+  // the hub root) while the walker lost the `cd` and resolved the write OUTSIDE
+  // the hub (allowed). A backslash-newline continuation is still a continuation
+  // — it is handled inside readWord, and `\` is not whitespace here. #3956.
+  const skipWsNl = (k) => { while (k < n && (s[k] === " " || s[k] === "\t" || s[k] === "\r")) k++; return k; };
   const readWord = (k) => {
     let w = "";
     let q = null;
@@ -8648,10 +9348,28 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   };
   const applyPending = () => {
     const fr = f();
+    // A pipeline's LAST segment is a subshell too: its `cd` dies here, so the
+    // boundary restores the pipeline's start cwd and DISCARDs that pending cd
+    // (`true | cd docs; echo x > f` writes from the pre-pipeline cwd — real
+    // bash-probe-verified; #3954).
+    if (fr.pipeActive) {
+      fr.cwd = fr.pipeC0 ?? fr.cwd;
+      fr.pipeC0 = null;
+      // …and the DIR STACK is the segment's too: a `pushd`/`popd` inside a pipeline
+      // segment dies with that segment's subshell (ISSUE 3 above).
+      if (fr.pipeD0) dirStack = fr.pipeD0;
+      fr.pipeD0 = null;
+      fr.pipeActive = false;
+      fr.pending = null;
+    }
     if (fr.pending) { fr.cwd = fr.pending; fr.pending = null; }
     pipeBase[pipeBase.length - 1] = fr.cwd;   // &&/;/newline: pipes start here
+    dirBase[dirBase.length - 1] = dirStack.slice(); // …and so does the dir stack snapshot
   };
-  const updateAsyncBase = () => { asyncBase[asyncBase.length - 1] = f().cwd; };
+  const updateAsyncBase = () => {
+    asyncBase[asyncBase.length - 1] = f().cwd;
+    dirAsync[dirAsync.length - 1] = dirStack.slice();
+  };
   const lineEndOf = (i0) => { const e = s.indexOf("\n", i0); return e === -1 ? n : e; };
   // cycle-11: real bash `bash <<'EOF' x.sh` — a FILE POSITIONAL (no -s) on
   // the heredoc header is the SCRIPT; the body is stdin DATA. Returns the
@@ -8818,8 +9536,8 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         i++; continue;
       }
       applyPending();
-      frames.push({ cwd: f().cwd, pending: null, forkCwd: f().forkCwd, forkAlts: f().forkAlts ? [...f().forkAlts] : [] }); // cycle-40 F2: a subshell inherits the parent's case-fork realities
-      pipeBase.push(f().cwd); asyncBase.push(f().cwd); updateAsyncBase();
+      frames.push({ cwd: f().cwd, pending: null, forkCwd: f().forkCwd, forkAlts: f().forkAlts ? [...f().forkAlts] : [], pipeC0: null, pipeD0: null, pipeActive: false }); // cycle-40 F2: a subshell inherits the parent's case-fork realities
+      pipeBase.push(f().cwd); asyncBase.push(f().cwd); dirBase.push(dirStack.slice()); dirAsync.push(dirStack.slice()); updateAsyncBase();
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
       dirStackSnapshots.push(dirStack.slice());
       i++; continue;
@@ -8845,7 +9563,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         }
         i++; continue;                     // case-pattern terminator (y) — NOT a subshell close
       }
-      if (frames.length > 1) { frames.pop(); pipeBase.pop(); asyncBase.pop(); }
+      if (frames.length > 1) { frames.pop(); pipeBase.pop(); asyncBase.pop(); dirBase.pop(); dirAsync.pop(); }
       applyPending(); updateAsyncBase();
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
       if (dirStackSnapshots.length > 0) dirStack = dirStackSnapshots.pop(); // subshell copy semantics
@@ -8866,7 +9584,14 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         continue;
       }
       f().pending = null;              // a cd in the async list dies with the subshell
+      f().pipeC0 = null;               // ... and so does any in-flight pipeline state
+      f().pipeD0 = null;
+      f().pipeActive = false;
       f().cwd = asyncB();              // the WHOLE async list ran at the segment start
+      // …and its pushd/popd died with it, exactly as the pipeline boundary's do below
+      // (ISSUE 3): restore the stack the async segment started with, or a bare `popd`
+      // lands on an entry bash never had and the cwd drifts off the tracked hub file.
+      dirStack = (dirAsync[dirAsync.length - 1] || []).slice();
       pipeBase[pipeBase.length - 1] = f().cwd;
       updateAsyncBase();
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
@@ -8874,7 +9599,20 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       continue;
     }
     if (ch === "|") {
+      // ⛔ A `|` IS NOT ALWAYS A PIPELINE, and latching pipe state on one that is not
+      // throws away the pending `cd` at the next boundary (applyPending restores
+      // pipeC0). Two non-pipeline shapes, both measured/derivable FAIL-OPENS (#3957
+      // review ISSUE 1):
+      //   1. a `case` PATTERN list — `case $x in a|b) cd docs;; esac; echo x >
+      //      tracked.md` really overwrites the TRACKED `docs/tracked.md` (the arm
+      //      runs), but the `;;` boundary discarded the arm's `cd`, leaving only the
+      //      unmatched-arm reality at the root → ALLOW. The `(` handler already
+      //      guards the same phase (`casePattern`); this one did not.
+      //   2. `[[ … ]]` — an unquoted `|` there is regex/boolean alternation
+      //      (`[[ $x =~ a|b ]]`), never a pipe.
+      if (casePattern || dblDepth > 0) { i++; continue; }
       if (s[i + 1] === "|") { applyPending(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; i += 2; continue; } // || continuation
+      if (!f().pipeActive) { f().pipeC0 = pipeB(); f().pipeD0 = (dirBase[dirBase.length - 1] || []).slice(); f().pipeActive = true; } // C0/D0 = the cwd and dir stack at the boundary BEFORE the first segment
       f().pending = null;
       f().cwd = pipeB();               // pipe segments from the pipe-list start
       segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
@@ -8887,11 +9625,17 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         // P2-1); `;;&` (keep matching) is the same; `;&` (fallthrough body) is
         // deliberately NOT pattern-phase (the next arm body runs commands).
         if (caseDepth > 0 && s[i + 2] !== "&") casePattern = true;
+        // a `;` cannot appear inside `[[ … ]]` (bash rejects it), so any `[[` still
+        // open here is MALFORMED. Bound it: a stuck counter would make every later
+        // `|` look like alternation and silently stop surfacing piped writes.
+        dblDepth = 0;
         applyPending(); updateAsyncBase(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
         i += 2; continue;
       }
+      dblDepth = 0;   // see above — `;` never occurs inside `[[ … ]]`
       applyPending(); updateAsyncBase(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; i++; continue;
     }
+
     // redirects (incl. fd-prefixed)
     if (ch === ">" || (ch >= "0" && ch <= "9")) {
       let k = i;
@@ -9011,6 +9755,17 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }    const w0 = readWord(i);
     const wstart = i;
     i = w0.k;
+    // ⛔ `[[ … ]]` IS TRACKED HERE, NOT IN THE RESET_WORDS BRANCH BELOW, and that
+    // placement is the whole point (measured, first draft of this fix): the walker
+    // treats the words INSIDE `[[ ]]` as commands (`segHadWord` becomes true), so a
+    // `]]` never reached the RESET_WORDS branch and the counter stuck at 1 — after
+    // which EVERY later `|` was treated as non-pipe and `[[ $x =~ a|b ]]; echo hi |
+    // tee docs/tracked.md` resolved NO candidates at all (a brand-new FAIL-OPEN, one
+    // worse than the one being fixed). Updating it on the RAW word, before any
+    // command-position/demotion gate, is what makes the count track the text.
+    // Counted rather than flagged: `[[`/`]]` nest and are parse-valid in bash.
+    if (w0.w === "[[") dblDepth++;
+    else if (w0.w === "]]") dblDepth = Math.max(0, dblDepth - 1);
     const prev = s[wstart - 1];
     const atCmdPos = forceCmdNext || wstart === 0 || (prev !== undefined && /[;&|()\s\n]/.test(prev)); // ) = case-arm start (cycle-26 P2-1)
     forceCmdNext = false;
@@ -9224,18 +9979,35 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (SPAWNER_WORDS.has(wBase2)) { spawnerPending = wBase2; envSawAssign = false; continue; }
     }
     if (w0.w === "cd" || w0.w === "pushd") {
-      const nxt = skipWs(i);
+      const nxt = skipWsNl(i);
       const tgt = readWord(nxt);
       i = tgt.k;
-      if (w0.w === "pushd") {
-        // flag / +N / bare forms don't cd (conservative no-op) — only a dir operand
-        if (!tgt.w || tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w)) { f().pending = null; continue; }
-        dirStack.push(f().cwd);
-      }
+      const isPushd = w0.w === "pushd";
+      // flag / +N / bare forms don't cd (conservative no-op) — only a dir operand
+      if (isPushd && (!tgt.w || tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { f().pending = null; continue; }
+      let next = null;
       if (tgt.w && tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
-        const next = resolve(cwd, tgt.w);
-        f().pending = existsSync(next) ? next : null;       // failed cd — unchanged
+        const cand = resolve(cwd, tgt.w);
+        if (existsSync(cand)) next = cand;                  // failed cd — unchanged
+      }
+      // ⛔ A FAILED pushd NEVER TOUCHES THE DIR STACK (real bash: `pushd
+      // /nonexistent` errors and leaves `dirs` exactly as it was). Pushing the
+      // current dir anyway DESYNCHRONIZES the stack, so every later bare `popd`
+      // lands one entry off and the walker's cwd drifts from real bash's. That
+      // drift is a craftable BYPASS, not just a false positive — measured: `pushd
+      // /nonexistent; cd a; popd; echo pwn > ../tracked.md` really overwrites the
+      // TRACKED hub file at the root, while the walker 'restored' to the root and
+      // resolved the write OUTSIDE the hub (allowed). #3955.
+      if (isPushd && next) dirStack.push(f().cwd);
+      f().pending = next;
+      {
         const frcd = f();
+        // ⛔ NOT gated on `next`: the alt realities are the ones where the PRIMARY cd
+        // FAILED and the arm reality's cd succeeded (that is exactly where an
+        // unmatched-arm write lands). Gating on the primary's existence dropped
+        // `case $mode in a) cd docs;; esac; cd sub && echo hi > q.md`'s `H/sub/q.md`
+        // reality — a measured FAIL-OPEN, and the reason this line reddened the
+        // existing C437r39 pin (#3957 review ISSUE 2). Each alt judges for itself.
         if (frcd.forkCwd && frcd.forkAlts.length && caseDepth === 0) {
           // cycle-38 P1: COMMON tail cds (outside any case arm) apply to every
           // arm-matched reality — shift the fork alts by the same relative
@@ -9244,11 +10016,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           // alts, which represent realities that never ran that arm.
           frcd.forkAlts = [...new Set(frcd.forkAlts.map((b) => { const nx = resolve(b, tgt.w); return existsSync(nx) ? nx : b; }))].slice(0, 64);
         }
-      } else f().pending = null;
+      }
       continue;
     }
     if (w0.w === "popd") {
-      const tgt = readWord(skipWs(i));
+      const tgt = readWord(skipWsNl(i));
       i = tgt.k;
       if (tgt.w && (tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { continue; } // -n/+N: no cd
       const d = dirStack.pop();

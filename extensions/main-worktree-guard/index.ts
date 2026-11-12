@@ -157,6 +157,13 @@ let isWorktreeCwd: (cwd: string) => boolean = () => true;      // bash path: fai
 let isWorktreeCwdWrite: (cwd: string) => boolean = () => false; // write/edit: fail-closed
 let extractPushDeleteBranch: (cmd: string) => string[] | null = () => null;
 let wholeCommandDeleteTargets: (verdict: string, command: string) => string[] = () => [];
+// #653: the fail-closed delete-target predicate. The default mirrors the stub
+// above — with no extractor there are no delete names to judge — so a stale
+// classify-git module keeps today's degradation and cannot invent a block.
+// ⛔ BOUND BY A typeof GUARD, never by the destructuring target list: a
+// destructuring assignment binds `undefined` for a missing export, which would
+// THROW here rather than degrade (see the binding site's comment).
+let unresolvableDeleteTargets: (targets: string[]) => string[] = () => [];
 let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
@@ -196,6 +203,12 @@ let stripHeredocData: (text: string, codeBodies?: unknown[] | null) => string = 
 let resolveTargetCheckout: (targetPath: string, cwd?: string) => { top: string; isMain: boolean } | null = () => null;
 let trackedRelsIn: (repoTop: string, rels: string[]) => string[] = () => [];
 let hasDotGitAncestor: (p: string) => boolean = () => false;
+// #608: the classifier's OWN local-branch-delete name extractor (the whole
+// `-d`/`-D`/`--delete` family incl. clusters and value-swallowing flags). Used
+// to spend the pid-owned claim for EVERY branch a command deletes, not just the
+// first invocation's. Fail-safe default: null — a failed import means no claim
+// is spent, which is the pre-#608 behaviour and can never false-block.
+let branchDeleteNames: (verb: string, args?: string[]) => string[] | null = () => null;
 let extractScriptPath: (command: string) => string | null = () => null;
 let extractScriptArgs: (command: string, scriptPath: string) => string[] = () => [];
 let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null, opts?: { viaInterpreter?: boolean }) => "allow" | "block" = () => "allow";
@@ -355,6 +368,9 @@ try {
   // keeps today's (strict) behaviour instead of throwing in the hook.
   if (typeof _m5.maskRemoteExecPayloads === "function") maskRemoteExecPayloads = _m5.maskRemoteExecPayloads;
   if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
+  // #608: namespace read for the same reason as #709/#627 above (the
+  // destructuring target list is pinned by test-module-load.mjs Part A).
+  if (typeof _m5.branchDeleteNames === "function") branchDeleteNames = _m5.branchDeleteNames;
   if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
   // #1919: read from the namespace for the same reason as #709/#627 above — the
   // destructuring target list is pinned by test-module-load.mjs Part A.
@@ -379,6 +395,19 @@ try {
   // #1139: the quote-aware shell tokenizer the pipe-seed walk uses (same skew
   // contract as above).
   if (typeof _m5.wtShellWords === "function") wtShellWords = _m5.wtShellWords;
+  // ⛔ #653 — NAMESPACE READ + typeof GUARD, NOT A DESTRUCTURING TARGET (review P1 of
+  // PR #3978, measured). The name was first added to the destructuring list above,
+  // and a destructuring ASSIGNMENT overwrites the declared fail-safe default with
+  // `undefined` when the export is absent — measured on this box (Node 24.21.0): a
+  // destructuring target whose key is missing from the source object binds
+  // `undefined`, it does not leave the earlier default in place — so on a
+  // stale/short classify-git.mjs `classifierLoaded` is
+  // still true and `_coordinatedDeleteBlock`'s call THROWS a TypeError on every
+  // delete-shaped command instead of degrading. That is the inverse of the default's
+  // own comment and of the #627/#628/#709/#3444 contract 15 lines below.
+  if (typeof _m5.unresolvableDeleteTargets === "function") {
+    unresolvableDeleteTargets = _m5.unresolvableDeleteTargets;
+  }
   // #967/#1484: the invocation's positional args feed the subcommand
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
@@ -574,6 +603,39 @@ function _mainTopLevel(): string | null {
 // anywhere — foreign deletes with no checked-out targets are allowed.
 function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: string } | null {
   if (!branchNames || branchNames.length === 0) return null;
+  // ── #653: FAIL CLOSED ON AN UNRESOLVABLE DELETE TARGET ──
+  // The #73 check below is only as good as the NAME it is given, and the names
+  // come from the command TEXT. A shell variable, a command substitution or an
+  // expansion makes the executed word differ from that text, so the lookup asks
+  // about a ref no worktree can hold (measured: `git push origin --delete
+  // "$PR_BRANCH"` → the literal `$PR_BRANCH`; `-d $(echo held/branch)` → the
+  // FRAGMENT `$(echo`) and the arm then ALLOWS the delete of a sibling-held
+  // branch. That is #73's protection defeated by ordinary shell usage — and the
+  // ceremony snippets in skills/commit-workflow assigned the branch to a
+  // variable first, so the DOCUMENTED path was the unmatched one.
+  //
+  // Option 2 of #653 (the smaller change, and the one that closes the class):
+  // an unresolvable target is REFUSED with the literal-ref remedy, rather than
+  // resolved-then-allowed. This runs BEFORE the checkout lookup, so it holds in
+  // every arm that reaches this seam (degradation, push-delete, later-segment
+  // deletes) and cannot be skipped by a state read that fails.
+  const unresolved = unresolvableDeleteTargets(branchNames);
+  if (unresolved.length > 0) {
+    return {
+      block: true,
+      reason: [
+        `⛔ Cannot delete — the delete target is not a literal ref name, so the guard cannot tell WHICH branch would be removed:`,
+        ...unresolved.map((b: string) => `   • ${b}`),
+        "",
+        "   Why: #73's coordinated-delete check matches the ref in the command TEXT.",
+        "   A variable, a command substitution or a glob is only known once the shell",
+        "   runs, so the guard would be checking a name no worktree can hold — and would",
+        "   let the delete through unchecked (#653).",
+        "   → Re-run with the LITERAL ref: `git push origin --delete feat/my-branch`.",
+        "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+      ].join("\n"),
+    };
+  }
   const worktreeBranches = getWorktreeBranches();
   const blockedBranches: string[] = [];
   for (const branchName of branchNames) {
@@ -5148,13 +5210,123 @@ const pendingBaseline = new Set<number>(); // lock contended at session_start �
 // create-new is blocked since #626 and never re-baselines.)
 const ownedBranches = new Map<number, Map<string, Set<string>>>();
 
-function _markOwned(pid: number, repoKey: string | null | undefined, branch: string) {
+function _markOwned(pid: number, repoKey: string | null | undefined, branch: string | null | undefined) {
   if (!repoKey || !branch) return;
   let byRepo = ownedBranches.get(pid);
   if (!byRepo) { byRepo = new Map(); ownedBranches.set(pid, byRepo); }
   let set = byRepo.get(repoKey);
   if (!set) { set = new Set(); byRepo.set(repoKey, set); }
   set.add(branch);
+}
+
+// #608: ownership is a statement about the refs this pid CURRENTLY holds, not an
+// append-only record of every name it ever touched. A name leaves the pid's
+// hands on exactly two observable events — its own rename AWAY from that name,
+// and its own approved LOCAL delete of it — and each unmarks here, so a name a
+// sibling later recreates cannot inherit this pid's destructive allowance (the
+// #598 own-dst overwrite and the #543/#376 own-branch `-D`).
+function _unmarkOwned(pid: number, repoKey: string | null | undefined, branch: string | null | undefined) {
+  if (!repoKey || !branch) return;
+  const set = ownedBranches.get(pid)?.get(repoKey);
+  if (set) set.delete(branch);
+}
+
+/** Will git's SOFT `-d` actually delete `name` in `cwd`? Faithful to git's own
+ *  `branch_merged()` (`builtin/branch.c`), NOT to the prose of git-branch(1):
+ *
+ *    "the branch must be fully merged in its upstream branch, or in HEAD if no
+ *     upstream was set"
+ *
+ *  The prose is silent on the case that decides this probe: an upstream
+ *  CONFIGURED but GONE (`[gone]` after `git fetch --prune`). `%(upstream)` still
+ *  prints the configured refname there, but `branch_merged()` resolves it and —
+ *  when it does not resolve — leaves `reference_rev` NULL and falls back to
+ *  `head_rev`, i.e. it treats "upstream set but gone" EXACTLY like "no upstream
+ *  set" and DELETES the merged branch (measured, git 2.43.0: `-d` rc 0 with the
+ *  remote ref absent). So the upstream is only consulted when it RESOLVES; the
+ *  unresolvable case must fall back to HEAD, or this probe answers "kept" where
+ *  git deletes — the fail-open direction, and a stale claim is exactly the #608
+ *  destruction.
+ *
+ *  Unverifiable (git error, missing ref) → false: the claim is KEPT, the
+ *  direction that cannot lose a ref. */
+function _softDeleteWillSucceed(cwd: string, name: string): boolean {
+  let target = "HEAD";
+  try {
+    const up = execFileSync("git", ["for-each-ref", "--format=%(upstream)", `refs/heads/${name}`],
+      // #1139: stderr is CAPTURED, never swallowed by "ignore" — the repo-wide
+      // pin in test.mjs forbids the `["ignore", "pipe", "ignore"]` shape, which
+      // leaked a failure message AND made the not-a-checkout arm dead code.
+      { cwd, timeout: 5000, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    if (up) {
+      // Only a RESOLVABLE upstream constrains the delete; a `[gone]` one makes
+      // git fall back to HEAD (see above). One extra spawn, soft-deletes only.
+      let resolves = false;
+      try {
+        execFileSync("git", ["rev-parse", "--verify", "--quiet", up],
+          { cwd, timeout: 5000, stdio: "ignore" });
+        resolves = true;
+      } catch { resolves = false; }
+      if (resolves) target = up;
+    }
+  } catch { return false; }
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", `refs/heads/${name}`, target],
+      { cwd, timeout: 5000, stdio: "ignore" });
+    return true;
+  } catch { return false; }
+}
+
+/** #608 — the LOCAL branch deletes this command performs, hard vs soft.
+ *
+ *  The classifier's `deleteTargets` describes ONE invocation (the first mutating
+ *  one), so a compound `git branch -D a && git branch -D b` reports only `a` —
+ *  and the M3 loop already resolves EVERY mutating invocation (stateMutations),
+ *  so the claim set is the union over all of them, named by the classifier's own
+ *  extractor (`branchDeleteNames`), never a re-derived spelling. Hard vs soft
+ *  comes from the SHIPPED classifier too: the single-invocation verdict is
+ *  `block:branch-force-delete` exactly for git's force-delete family. */
+function _localDeleteClaimNames(det: any): { hard: string[]; soft: string[] } {
+  const hard: string[] = [];
+  const soft: string[] = [];
+  if (!det || typeof branchDeleteNames !== "function") return { hard, soft };
+  const muts = (det.stateMutations && det.stateMutations.length > 0)
+    ? det.stateMutations
+    : [{ verb: det.stateVerb, args: det.stateArgs }];
+  for (const mu of muts) {
+    if (!mu || mu.verb !== "branch") continue;
+    let names: string[] | null = null;
+    try { names = branchDeleteNames("branch", mu.args ?? []); } catch { names = null; }
+    if (!names || names.length === 0) continue;
+    let isHard = true; // unverifiable → hard (spend unconditionally: fail-closed)
+    try {
+      isHard = classifyGitCommandDetailed(`git branch ${(mu.args || []).join(" ")}`).verdict === "block:branch-force-delete";
+    } catch { isHard = true; }
+    for (const n of names) (isHard ? hard : soft).push(n);
+  }
+  return { hard, soft };
+}
+
+/** Remove the ownership claims an ADMITTED command destroys.
+ *
+ *  A hard `-D` deletes whatever git can reach, so its name is spent outright.
+ *  A soft `-d` deletes ONLY a merged branch, so its name is spent only when
+ *  git's own predicate says it will go: spending a claim the command did not
+ *  lose turns the standard `-d` → `-D` escalation on the session's OWN branch
+ *  into a block (#3979 review P2). The other refusal — a branch checked out in
+ *  a worktree — needs no probe, because git refuses `-D` there too, so no
+ *  escalation is lost. Every probe is spawn-once and only runs when the command
+ *  actually contains a local delete. */
+function _spendLocalDeleteClaims(pid: number, repoKey: string | null | undefined,
+                                 cwd: string | null | undefined,
+                                 claims: { hard: string[]; soft: string[] }) {
+  if (claims.hard.length === 0 && claims.soft.length === 0) return;
+  for (const n of claims.hard) _unmarkOwned(pid, repoKey, n);
+  if (claims.soft.length === 0) return;
+  const where = cwd || process.cwd();
+  for (const n of claims.soft) {
+    if (_softDeleteWillSucceed(where, n)) _unmarkOwned(pid, repoKey, n);
+  }
 }
 
 function _recordBaseline(pid: number) {
@@ -5748,6 +5920,20 @@ export default function (pi: ExtensionAPI) {
               // being compound/wrapped) to stamp the marker it already holds.
               const discardReason = _worktreeDiscardBlock(localCommand, _currentHatchActive);
               if (discardReason) return { block: true, reason: discardReason };
+              // #608 (#3979 review P2): this arm is an ADMISSION, and it sits
+              // ~200 lines BEFORE the M3 funnel — so it used to admit a LOCAL
+              // branch delete with the claim left intact. It is not a theoretical
+              // path: with the hub disordered, `evaluateHubGateWithTargets` routes
+              // `git branch -D <b>` through the #436 (B) carve-out
+              // (classify-git.mjs branchDeleteNames + branchDeleteAllowance +
+              // sawRecovery) and answers "allowed". Spend here for the same
+              // reason the funnel does: every arm that ADMITS a local delete has
+              // to spend it, or the stale claim re-authorizes a #598 own-dst
+              // rename / #543 `-D` over a sibling's re-created branch. `pushDet`
+              // is the same classification this arm already pays for.
+              let m4RepoKey: string | null = null;
+              try { m4RepoKey = branchOwnership?.repoKey?.(resolve(process.cwd())) ?? null; } catch { m4RepoKey = null; }
+              _spendLocalDeleteClaims(pid, m4RepoKey, resolve(process.cwd()), _localDeleteClaimNames(pushDet));
               return undefined; // sanctioned recovery / read-only / non-push — done
             }
           }
@@ -6000,13 +6186,108 @@ export default function (pi: ExtensionAPI) {
       // …` M1 warning). The pending closure is applied exactly once, at the
       // admission returns below — the carve-out's own early return, or any
       // later gate that allows.
-      let pendingRebaseline: (() => void) | null = null;
-      const admitAfterM3 = (): undefined => {
-        if (pendingRebaseline) {
-          const apply = pendingRebaseline;
-          pendingRebaseline = null;
-          apply();
-        }
+      let pendingRebaselines: Array<() => void> = [];
+      // ── #607: an UNENUMERABLE branch-state mutation is a refusal ──
+      // `det.hiddenStateMutation` (classify-git) is true exactly when a shell
+      // substitution / backtick / `eval` / ANSI-C / process-substitution /
+      // git-alias payload CARRIES A MUTATING BRANCH-STATE git invocation
+      // (`_hasHiddenStateSubst`'s hardened collector — the branch-state half of
+      // `hiddenStateSubst`, without that flag's broader unverifiable-git union).
+      // The extractor cannot enumerate such a payload, so the M3 loop below gates
+      // only the VISIBLE mutations: MEASURED at 6f508fc30 through the real handler
+      // on a real hub — `echo "$(git branch -Mq main victim)"` ALLOWED (victim's
+      // tip clobbered, rc 0), and every hidden-payload spelling after an M3-
+      // SANCTIONED lead (`git branch -M main freeL ; echo "$(git branch -Mq freeL
+      // victim)"`, the backtick twin, `eval '…'`) ALSO allowed — the sanctioned
+      // lead changes nothing about the payload being unenumerable (#596's
+      // hiddenStateSubst bound reaches only the #591 benign-force carve-out).
+      // A branch-state mutation the guard cannot attribute to a repo/target must
+      // never be admitted (#805: a gate that cannot determine the target REFUSES).
+      //
+      // WHY THIS IS LAST-RESORT, NOT FIRST: every other arm's refusal is MORE
+      // specific (the sync arm names the permitted fast-forward forms, the legacy
+      // arm names the destructive verb), and those arms doubling as the pin for
+      // their own mechanism is why B9p/B9p3 assert their `#1144` marker. Folding
+      // this into `admitAfterM3()` — the ONE funnel every admission passes through
+      // — keeps each of them ahead of it while still closing the hole on commands
+      // NOTHING else refuses (the measured ones above).
+      //
+      // SCOPE — NOT a blanket substitution block: a substitution carrying a
+      // READ-ONLY git call (`$(git branch --show-current)`, `$(git rev-parse
+      // HEAD)`, `$(git status --porcelain)`) does not set the flag, because
+      // `_hasHiddenStateSubst`'s `mutates()` requires a MUTATING branch-state verb.
+      //
+      // ⛔ NO WORKTREE EXEMPTION, DELIBERATELY — and this is the SECOND attempt at
+      // it. The first one exempted a session whose cwd resolved to a worktree, on
+      // the premise "the payload runs at the shell cwd". That premise is FALSE: a
+      // payload carries its OWN repo hints (`-C`/`--git-dir`/`--work-tree`/`cd`/
+      // `GIT_DIR=`), so from a lane worktree
+      // `echo "$(git -C <hub> branch -Mq main victim)"` executed rc 0 and clobbered
+      // the hub's `victim` tip (MEASURED). The second attempt attributed the
+      // payload's SPANS instead — and a fresh-context reviewer measured THAT open
+      // too: `hiddenStateMutation` fires from arms that produce NO span
+      // (`__unverifiable__` / `eval $VAR`, `$(<file)`, `-c alias.x=…`,
+      // `GIT_CONFIG_PARAMETERS`), so ONE benign substitution anywhere in the
+      // command paid for an exemption of an unattributable payload
+      // (`echo "$(git rev-parse HEAD)"; eval $PAYLOAD` → ADMITTED from a worktree).
+      // A gate whose exemption can be bought by unrelated text is not a gate, so
+      // the exemption is GONE: an unenumerable branch-state mutation is refused in
+      // every session the classifier is LOADED in — with one pre-existing exception
+      // this gate does not close: the `!branchOwnership || !classifierLoaded`
+      // degradation fallback below decides on the frozen legacy classifier, where the
+      // flag does not exist at all (loudly reported; Part C pins the noise). The
+      // remedy is the one that actually works — run the command DIRECTLY (in a
+      // worktree that is then exempt as a visible mutation).
+      //
+      // PROCESS SUBSTITUTION: what actually fires, MEASURED (a review finding
+      // claimed a read-only `<(git log …)` idiom is refused here — it is NOT).
+      // `hiddenStateMutation` is false for `git diff --stat <(git log --oneline -1)`
+      // and true for `git diff --stat <(git branch -Mq a b)`: the PRECISE predicate
+      // judges a git-led body by its ARGUMENTS, so a read-only list resolves to a
+      // non-mutating invocation and the flag stays false. ⛔ Do NOT credit the
+      // conservative `isProcSubst && /\bgit\b/` arm (`_hasHiddenStateSubst`) here —
+      // that flag is not the deciding path for this refusal — and note that both
+      // predicates' `seen` caches are keyed on (CONTEXT, text) precisely because a
+      // text-only key made the verdict depend on segment ORDER (measured: inert-first
+      // admitted, exec-first refused, same two halves). Rows pin both halves, plus the
+      // `)`-in-quotes and nested-`$(…)` spellings.
+      const hiddenBranchStateRefusal = (): { block: true; reason: string } | null => {
+        if (!det || det.hiddenStateMutation !== true) return null;
+        return {
+          block: true,
+          reason: [
+            "⛔ Branch-state command blocked (#607).",
+            "   Why: the command hides a branch-state git invocation inside a shell",
+            "   substitution / backticks / eval / alias / process-substitution payload.",
+            "   The guard cannot see which ref it moves — and a payload can name its OWN",
+            "   repo (-C / --git-dir / cd), so even a worktree session cannot rule out",
+            "   that it clobbers or switches a branch in a SHARED main checkout (#265).",
+            "   → Run the branch-state git command DIRECTLY (outside $(…), backticks,",
+            "     eval and aliases). Direct branch-state commands in an isolated",
+            "     worktree are exempt as before (using-git-worktrees skill).",
+            "   Hatch, if this is deliberate solo work in the hub:",
+            "     AGENT_ALLOW_MAIN_EDITS=1 or ~/.pi/agent/.allow-main-edits (#1239).",
+          ].join("\n"),
+        };
+      };
+      // #608: the ownership claims this command DESTROYS, spent at the ONE funnel
+      // every admitted arm returns through (#3979 review P1b: the push-delete and
+      // push/commit arms admitted a co-spelled `git branch -D` without spending,
+      // and a compound naming two local deletes spent only the first). Derived
+      // from EVERY mutating invocation, so an arm added later cannot skip it.
+      const localDeleteClaims = _localDeleteClaimNames(det);
+      const admitAfterM3 = (): undefined | { block: true; reason: string } => {
+        // #607 refusal FIRST: a refused command must move nothing — neither the
+        // session baseline (#1144 F3) nor the ownership claims spent below.
+        const hiddenRefusal = hiddenBranchStateRefusal();
+        if (hiddenRefusal) return hiddenRefusal;
+        _spendLocalDeleteClaims(pid, eff?.repoKey ?? null, eff?.effectiveCwd ?? null, localDeleteClaims);
+        // #607: apply the recorded re-baselines IN COMMAND ORDER — mid-command
+        // propagation lets one compound carry more than one sanctioned move, and
+        // overwriting a single slot dropped the earlier rename's `_markOwned`.
+        const applies = pendingRebaselines;
+        pendingRebaselines = [];
+        for (const apply of applies) apply();
         return undefined;
       };
 
@@ -6026,6 +6307,32 @@ export default function (pi: ExtensionAPI) {
         const mutations = (det.stateMutations && det.stateMutations.length > 0)
           ? det.stateMutations
           : [{ verb: det.stateVerb, args: det.stateArgs, invVisible: det.stateInvVisible !== false, hints: det.stateHints }];
+        // ── #607: MID-COMMAND BASELINE PROPAGATION ──
+        // Each mutation used to be decided against the SESSION baseline — the
+        // branch the session was on BEFORE the command ran — so a sanctioned
+        // lead that MOVES the baseline (own-baseline rename, #376 return) left
+        // every later segment judged against a branch the command itself had
+        // already moved off. MEASURED at 6f508fc30 (real handler, real git):
+        // `git branch -M main tmpA && git branch -M tmpA main` and `… && git
+        // branch -M tmpA done` were BLOCKED — the legitimate two-segment rename
+        // ceremony — because segment 2's source (`tmpA`) is not the session
+        // baseline (`main`). The LAUNDER the pre-#1144 short-circuit allowed is
+        // NOT re-opened by judging against the propagated baseline: the #1144
+        // `stateCarveOutClean` closure is what refuses a mutating tail, and each
+        // later segment still runs its OWN decideM3 (a foreign source or an
+        // existing foreign rename DST still blocks).
+        // Two pieces of prospective state, both REPO-KEYED (a mutation in another
+        // checkout must never inherit this repo's prospective branch — decideM3's
+        // rename arm is repoKey-scoped, and so is this):
+        //   previewBranch — the branch this compound will be ON when the segment runs.
+        //   freedNames    — names an EARLIER sanctioned rename of this compound
+        //                   renames AWAY from, so the #598 dst probe must not read
+        //                   them as "an existing foreign ref" (they are gone by the
+        //                   time the segment runs). Only ever OWN lineage: a name is
+        //                   added only as the `from` of a rename decideM3 already
+        //                   sanctioned, i.e. the branch the session was on.
+        const previewBranch = new Map<string, string>();
+        const freedNames = new Map<string, Set<string>>();
         for (const mu of mutations) {
           const branchOp = branchOwnership.classifyBranchOp(mu.verb ?? det.verb, mu.args ?? det.verbArgs);
           if (!branchOp || branchOp.op === "other") continue;
@@ -6054,7 +6361,15 @@ export default function (pi: ExtensionAPI) {
             };
           }
           if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
-          const baseline = baselines.get(pid);
+          const muRepoKey = muEff.repoKey ?? "";
+          const sessionBaseline = baselines.get(pid);
+          // #607: judge this segment against the baseline the compound will
+          // have reached here, when an earlier segment of the SAME repo moved it.
+          const prospective = previewBranch.get(muRepoKey);
+          const baseline = (sessionBaseline && prospective != null
+            && sessionBaseline.repoKey === muEff.repoKey)
+            ? { ...sessionBaseline, branch: prospective }
+            : sessionBaseline;
           const isInfra = isAgentInfraRepo(muEff.effectiveCwd);
           // #598: a forced rename of the session's own baseline onto an
           // EXISTING branch this session does not own clobbers that foreign
@@ -6064,8 +6379,13 @@ export default function (pi: ExtensionAPI) {
           // `--git-dir=<other>` mutation is never checked against the cwd
           // repo's refs. Only the decideM3 rename arm consumes it (the
           // force/create/switch arms key on branch/currentBranch alone).
+          // #607: a name an EARLIER segment of this same compound renames away
+          // from will not exist when this segment runs (the probe reads the repo
+          // BEFORE the command executes), so a sanctioned rename-back
+          // (`… && git branch -M tmp main`) was refused as a foreign clobber.
           const dstExists = (branchOp.op === "rename" && branchOp.to != null)
-            ? branchOwnership.localBranchExists(muEff.effectiveCwd, branchOp.to, muEff.gitDir) !== false
+            ? (branchOwnership.localBranchExists(muEff.effectiveCwd, branchOp.to, muEff.gitDir) !== false)
+              && !(freedNames.get(muRepoKey)?.has(branchOp.to) ?? false)
             : false;
           const m3 = branchOwnership.decideM3({
             branchOp, isAgentInfra: isInfra, baseline,
@@ -6124,7 +6444,18 @@ export default function (pi: ExtensionAPI) {
             const applyRebaseline = () => {
               if (branchOp.op === "rename" && branchOp.to) {
                 if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
-                  _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
+                  const ownedKey = baseline?.repoKey ?? muEff.repoKey;
+                  _markOwned(pid, ownedKey, branchOp.to);
+                  // #608: the renamed-AWAY name leaves this pid's control — git
+                  // moves the ref, so the old name is free for anyone. Keeping
+                  // it in the owned set is a STALE authorization: a sibling that
+                  // recreates the freed name would be clobbered by this pid's
+                  // next `git branch -M <baseline> <that name>` (the #598
+                  // own-dst allowance) or by its `git branch -D` (#543/#376).
+                  // The old name is `branchOp.from`; for the 1-pos
+                  // `branch -M <new>` form (from null) it is the checkout's
+                  // current branch — the same substitution decideM3 makes.
+                  _unmarkOwned(pid, ownedKey, branchOp.from ?? muEff.currentBranch);
                 }
               }
               _rebaseline(pid, reBaseline);
@@ -6144,14 +6475,30 @@ export default function (pi: ExtensionAPI) {
             // at classification time, the same way `syncOnlyInvocation` and
             // `_allInvocationsWorktreeScoped` consult it.
             if (det.stateCarveOutClean === true) {
-              applyRebaseline();
-              return undefined;
+              // #607: through the funnel (admitAfterM3), so the order-preserving
+              // apply and the hidden-branch-state gate both run on this path too;
+              // `stateCarveOutClean` folds `hiddenStateSubst`, so it cannot
+              // contradict that gate.
+              pendingRebaselines.push(applyRebaseline);
+              return admitAfterM3();
             }
             // Not closed by the carve-out — the later gates decide. Defer the
             // re-baseline until one of them admits: a REFUSED command must not
             // move the baseline every later M1/M2/M3 decision keys on (#1144
             // F3). `admitAfterM3()` applies it at each admission return.
-            pendingRebaseline = applyRebaseline;
+            // #607: record the PROSPECTIVE baseline + the name this segment frees
+            // for the segments AFTER it. Nothing is applied to session state here
+            // — a refused compound must leave `baselines[pid]` untouched.
+            previewBranch.set(muRepoKey, reBaseline);
+            if (branchOp.op === "rename") {
+              const from = branchOp.from ?? muEff.currentBranch;
+              if (from) {
+                const freed = freedNames.get(muRepoKey) ?? new Set<string>();
+                freed.add(from);
+                freedNames.set(muRepoKey, freed);
+              }
+            }
+            pendingRebaselines.push(applyRebaseline);
           }
         }
       }
@@ -6180,6 +6527,162 @@ export default function (pi: ExtensionAPI) {
         "block:push-delete": "push-delete",
         "block:branch-force-delete": "branch-force-delete",
       };
+      // ── M2 mutation list (#605) — built BEFORE the ownership-allowance arm and
+      // the push-delete arm, because BOTH used to close the whole command on one
+      // segment's evidence and return (reviews F1, I1).
+      // #596 round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS comes
+      // from the classifier's boundary-aware invocation hints (a
+      // block:commit/block:push verdict implies the invocation exists;
+      // hint-less commits resolve at the session cwd). The extractor replay
+      // phantom-counted script-file attempts (`bash git -C <wt> commit -m z` —
+      // consumed by the classifier as interpreter+path) and the no-stateVerb
+      // path (eff = replay of det.verb) wrongly worktree-exempted the REAL main
+      // commit.
+      //
+      // #605: and the hints must be those of EVERY commit/push invocation, not
+      // only the FIRST extractor-visible one. `commitHints`/`pushHints` describe
+      // the first visible invocation, so a fully-VISIBLE worktree-scoped LEAD
+      // resolved the whole command to its worktree → decideM2 returned null →
+      // the later OFF-baseline MAIN commit/push ran rc 0 (`git -C <wt> commit
+      // -m z ; git commit -m x`, and the push twin; the reversed order blocks).
+      // Each mutation now resolves its OWN repo (and a push its OWN refspecs),
+      // and every main-resolving one is gated — block wins — exactly as the
+      // round-4 M3 stateMutations loop does for branch-state mutations.
+      const m2Mutations: any[] = [];
+      // ⛔ ONLY INVOCATIONS THE COMMAND ACTUALLY CONTAINS (review round-5 F1).
+      // This list used to SYNTHESIZE a mutation from `det.commitHints`/
+      // `det.pushHints` when the classifier saw none — a fallback with no
+      // referent: a `block:commit`/`block:push` verdict is only ever set because
+      // an invocation exists (`classify-git.mjs` sets it from `commitInv`/
+      // `pushInv`), and a degraded classifier returns `verdict: "allow"` and
+      // leaves this path entirely. Its only effect was on the arms that gate
+      // WITHOUT such a verdict: a `git pull --ff-only` (verdict block:pull, no
+      // push invocation at all) got a PHANTOM push whose null hints resolved at
+      // the session cwd, so a lane rooted outside any git repo — #2277's own
+      // recovery shape — was refused with "⛔ git commit/push blocked — could not
+      // verify repo ownership" on a command containing no commit and no push
+      // (MEASURED). Gating must judge the compound's real invocations, exactly as
+      // the comparator's per-subcommand model does.
+      m2Mutations.push(...(det.commitMutations ?? []), ...(det.pushMutations ?? []));
+      // ⛔ …BUT AN EMPTY LIST UNDER A PUSH VERDICT IS AN UNRESOLVABLE TARGET, NOT
+      // "nothing to gate" (review round-6 F1). `block:force-push` and
+      // `block:push-delete` are ALSO set by the raw-text pass in the classifier's
+      // ZERO-INVOCATION early return (`classify-git.mjs:3932-3945`), which returns
+      // BEFORE `commitMutations`/`pushMutations` are populated — so
+      // `eval "cd <hub> && git push -f origin feat/other"` carries the verdict with
+      // an EMPTY mutation list. MEASURED: every VISIBLE invocation yields ≥1
+      // mutation (`git push -f`, `git push -f --all`, `git push --force --mirror`,
+      // `git push --delete`, `git push origin -d stale` → 1 each), so an empty list
+      // under these two verdicts is exactly "a push the tokenizer could not expand".
+      //
+      // Without this arm `gateMutations([])` returns undefined and the M2 arm admits:
+      // MEASURED regression — a #2277 lane (rooted OUTSIDE any git repo) went
+      // BLOCK → ALLOW on the very force-push it could not see, while
+      // `block:commit`/`block:push` in the SAME arm line kept their gate. #805 is
+      // the decision: a gate that cannot determine the target REFUSES, never
+      // exempts. This restores the refusal the null resolution carried on main
+      // (`main:index.ts:6323`); it does not extend it — a session whose cwd DOES
+      // resolve keeps main's behaviour (one synthesized push, gated against the
+      // session repo), so no new false block is introduced.
+      //
+      // S8 stays green: `git pull --ff-only` is `block:pull`, which implies no push
+      // and is NOT in this set, so round 5's phantom-mutation removal stands.
+      if (m2Mutations.length === 0 &&
+          (det.verdict === "block:force-push" || det.verdict === "block:push-delete")) {
+        if (!branchOwnership.resolveEffectiveRepo("git status", process.cwd())) {
+          return {
+            block: true,
+            reason: "⛔ git commit/push blocked — could not verify repo ownership (git read failed; fail-closed, #265).",
+          };
+        }
+      }
+      // #805/#605: gate ONE commit/push mutation. Returns the refusal, or
+      // undefined when this mutation is exempt/on-baseline.
+      const gateOneMutation = (mu: any): { block: true; reason: string } | undefined => {
+        // Resolve THIS mutation's repo: the classifier's own boundary-aware
+        // hints (visible spellings); an extractor-invisible spelling
+        // (interpreter-inline payload) executes at the shell cwd → session
+        // repo (#596 round-4 F2 policy).
+        let m2Eff = mu.hints
+          ? branchOwnership.resolveRepoFromInv(mu.hints, process.cwd())
+          : (mu.invVisible === false
+            ? branchOwnership.resolveEffectiveRepo("git status", process.cwd())
+            : null);
+        // #596 round-4 (F2): a null read means the hints-based resolution failed
+        // (git read error, or the invocation was extractor-invisible — an
+        // interpreter-inline payload is ONE opaque token to the repo layer). The
+        // payload executes at the shell cwd, so resolve at the SESSION cwd.
+        // Fail-closed is preserved — session-cwd gates apply, never a silent
+        // pass; an OFF-baseline session still blocks, while the round-4
+        // regression (blocking an ON-baseline invisible commit that
+        // pre-round-3 allowed) stays undone.
+        if (!m2Eff) {
+          m2Eff = branchOwnership.resolveEffectiveRepo("git status", process.cwd());
+        }
+        if (!m2Eff) {
+          return {
+            block: true,
+            reason: "⛔ git commit/push blocked — could not verify repo ownership (git read failed; fail-closed, #265).",
+          };
+        }
+        // THIS mutation is worktree-scoped — exempt it, and keep gating the rest
+        // (`git -C <wt> commit ; git commit` must not blanket-exempt).
+        // #805: an UNRESOLVED target (bare cd / unexpandable $VAR / `-C`
+        // sentinel) is never worktree-exempt — the resolution may REPORT the
+        // session worktree while the real target is the shared hub, so the
+        // exemption must not short-circuit decideM2's fail-closed refusal
+        // (reordering this ahead of the unresolvedTarget arm let
+        // `cd $AGENT_INFRA_PATH && git commit` through in the #805 fixture).
+        if (m2Eff.isWorktree && !m2Eff.unresolvedTarget) return undefined;
+        const baseline = baselines.get(pid);
+        // A mutation's own verb decides which decideM2 arm applies; a push keeps
+        // the compound's force classification (force and plain push share one
+        // decideM2 arm — the distinction is advisory).
+        const muVerdict = mu.verb === "commit"
+          ? "block:commit"
+          : (det.verdict === "block:force-push" ? "block:force-push" : "block:push");
+        // #805 P1: with NO baseline, decideM2 must know whether the resolved MAIN
+        // checkout is THIS session's own (a worktree shares its common dir, so
+        // `repoKey` equality identifies it) or the agent-infra hub — only those
+        // two are refused; a different repo's MAIN checkout is ordinary
+        // cross-repo work and stays allowed. Both probes spawn git, so they run
+        // only in the (rare, anomalous) no-baseline case.
+        const m2 = branchOwnership.decideM2({
+          effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
+          // #605: a push is gated against ITS OWN refspecs, never the first
+          // push's — attributing the lead's targets to a later MAIN push blocks
+          // or (when the lead named the session's baseline branch) ALLOWS the
+          // wrong push.
+          pushDst: mu.verb === "push" ? (mu.dst ?? null) : det.pushDst,
+          pushTargets: mu.verb === "push"
+            ? (Array.isArray(mu.targets) ? mu.targets : det.pushTargets)
+            : det.pushTargets,
+          verdict: muVerdict, allowActive: false,
+          ...(baseline ? {} : {
+            sessionRepoKey: branchOwnership.repoKey(process.cwd()) ?? null,
+            effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd),
+          }),
+        });
+        return m2?.block ? { block: true, reason: m2.reason } : undefined;
+      };
+      const gateMutations = (mutations: any[]): { block: true; reason: string } | undefined => {
+        for (const mu of mutations) {
+          // #605 (review I2): a DELETE-spelled push is the #73 coordinated-delete
+          // arm's business, never M2's target comparison — pushing it at M2 would
+          // refuse ordinary remote-branch cleanup. The rule keys on the MUTATION's
+          // own field, not on the compound's verdict: keyed on the verdict path it
+          // held only when the delete was the FIRST push (verdict
+          // block:push-delete), so `git push origin main && git push origin -d
+          // stale` (verdict block:push — a later-segment `-d` carries no frozen
+          // legacy evidence) was BLOCKED while the byte-identical `--delete`
+          // spelling was allowed. One rule, applied to every mutation.
+          if (mu.verb === "push" && mu.isDelete) continue;
+          const hit = gateOneMutation(mu);
+          if (hit) return hit;
+        }
+        return undefined;
+      };
+
       const allowanceKind = ALLOWANCE[det.verdict];
       if (allowanceKind && eff) {
         const baseline = baselines.get(pid);
@@ -6240,7 +6743,21 @@ export default function (pi: ExtensionAPI) {
           // Unknown baseline (no way to tell own from foreign) → keep the
           // allowance's base decision exactly as before.
           const foreignDelete = baselineBranch !== null && wcDeletes.some((b) => b !== baselineBranch);
-          if (!foreignDelete) return admitAfterM3();
+          if (!foreignDelete) {
+            // #605 (review I1): `targets` above is `det.pushTargets` — the FIRST
+            // push invocation's refspecs. So this allowance closed the WHOLE
+            // compound on one segment's evidence, and the plain-MAIN twin of the
+            // class this change fixes stayed open:
+            //   `git push origin main ; git push origin feat/other`
+            // (baseline main) — allowed on `main`, and the FOREIGN push ran. The
+            // delete arm below had the same shape (F1). Gate every remaining
+            // main-resolving mutation before admitting; delete-spelled pushes are
+            // skipped inside gateMutations (their own arm decides them), so
+            // ordinary remote-branch cleanup is unaffected.
+            const hit = gateMutations(m2Mutations);
+            if (hit) return hit;
+            return admitAfterM3();
+          }
           // foreign later-segment delete present → fall through to the #73 arms.
         } else if (isSyncKind && syncEff?.isWorktree !== true) {
           // #1144: the sync allowance DENIED. Fall to the legacy arm for the
@@ -6267,9 +6784,44 @@ export default function (pi: ExtensionAPI) {
       // below, so the first segment's push stays gated exactly as origin/main
       // gated it. String-evidence echo/comment over-match is the documented
       // safe-direction class shared with the degradation arm.
-      if (det.verdict === "block:push-delete" && det.pushTargets.length > 0) {
-        const blocked = _coordinatedDeleteBlock(det.pushTargets);
-        if (blocked) return blocked;
+      // #605 (review F1): the push-delete verdict is set from the WHOLE raw
+      // command, so an UNRELATED `--delete` segment anywhere in a compound used
+      // to reach an early return here and exempt EVERY other mutation in it —
+      // `git -C <hub> push origin feat/other ; git push origin --delete stale`
+      // and `git commit -m x ; git push origin --delete stale` both ran their MAIN
+      // mutation ungated. The identical "a benign segment exempts a later MAIN
+      // mutation" class this change closes, one level above the hints mechanism.
+      // The delete-spelled pushes stay this arm's business (M2's target
+      // comparison at them would refuse ordinary remote-branch cleanup), so the
+      // arm gates the NON-delete mutations via gateMutations, which skips them by
+      // each mutation's own `isDelete`.
+      if (det.verdict === "block:push-delete") {
+        // Two guards used to be one: `… && det.pushTargets.length > 0`. The
+        // TARGET-COUNT half is the #73 check's precondition (with no refspec there
+        // is nothing to look up), but the M2 leg must run on the VERDICT —
+        // otherwise appending a no-op `git push --delete` (a git error: "--delete
+        // doesn't make sense without any refs") exempted the whole command.
+        // MEASURED before this split: `git push origin feat/other && git push
+        // --delete` → ALLOW, while `git push origin feat/other` alone → BLOCK.
+        //
+        // #605 (review F3): and the #73 check must see EVERY delete invocation.
+        // `det.pushTargets` is first-invocation-scoped, so
+        // `git push origin --delete b && git push origin --delete
+        // <sibling-held>` ran with the sibling-held target never checked —
+        // MEASURED: ALLOW, while that delete ALONE → BLOCK (#73). Each
+        // pushMutations entry carries its own targets, so the union is exact.
+        const deleteTargets = [...new Set([
+          ...(det.pushTargets ?? []),
+          ...m2Mutations
+            .filter((mu) => mu.verb === "push" && mu.isDelete)
+            .flatMap((mu) => (Array.isArray(mu.targets) ? mu.targets : [])),
+        ])];
+        if (deleteTargets.length > 0) {
+          const blocked = _coordinatedDeleteBlock(deleteTargets);
+          if (blocked) return blocked;
+        }
+        const hit = gateMutations(m2Mutations);
+        if (hit) return hit;
         return admitAfterM3(); // foreign deletes with no checked-out targets — allowed (today's behavior)
       }
       if (det.verdict === "block:push" || det.verdict === "block:force-push") {
@@ -6283,63 +6835,18 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── M2: commit/push ownership (block off-baseline) ──
+      // #596 (round-3 reviewer P2-2): M2 must gate the COMMIT/PUSH's own repo,
+      // not the M3 state-invocation repo — a compound with an off-baseline MAIN
+      // commit and a later `-C <wt>`-scoped branch mutation would otherwise
+      // reuse the worktree-exempt eff and let the off-baseline commit through
+      // (the pre-#596 single-eff conflation predates this PR for 2-segment
+      // forms; the 3-segment benign-lead form flipped block→allow in round-2).
+      // The mutation list and the per-mutation gate live ABOVE the delete arm
+      // (#605 review F1), so a `--delete` anywhere in the command cannot exempt
+      // the compound's other mutations either.
       if (det.verdict === "block:commit" || det.verdict === "block:push" || det.verdict === "block:force-push") {
-        // #596 (round-3 reviewer P2-2): M2 must gate the COMMIT/PUSH's own
-        // repo, not the M3 state-invocation repo — a compound with an
-        // off-baseline MAIN commit and a later `-C <wt>`-scoped branch
-        // mutation would otherwise reuse the worktree-exempt eff and let the
-        // off-baseline commit through (the pre-#596 single-eff conflation
-        // predates this PR for 2-segment forms; the 3-segment benign-lead form
-        // flipped block→allow in round-2). preferVerb = the verdict's verb
-        // resolves the commit/push invocation's own repo.
-        const gateVerb = det.verdict === "block:commit" ? "commit" : "push";
-        // #596 round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS
-        // comes from the classifier's boundary-aware commit/push invocation
-        // hints (commitHints/pushHints — a block:commit/block:push verdict
-        // implies the invocation exists; hint-less commits resolve at the
-        // session cwd). The extractor replay phantom-counted script-file
-        // attempts (`bash git -C <wt> commit -m z` — consumed by the
-        // classifier as interpreter+path) and the no-stateVerb path
-        // (eff = replay of det.verb) wrongly worktree-exempted the REAL main
-        // commit.
-        let m2Eff = branchOwnership.resolveRepoFromInv(
-          gateVerb === "commit" ? det.commitHints : det.pushHints, process.cwd());
-        // #596 round-4 (F2): null m2Eff under a block:commit/block:push
-        // verdict means the hints-based read failed (git read error, or the
-        // invocation was extractor-invisible — an interpreter-inline payload
-        // is ONE opaque token to the repo layer). Mirror the M3
-        // stateInvVisible===false round-3 policy: the payload executes at the
-        // shell cwd, so resolve the commit/push repo at the SESSION cwd.
-        // Fail-closed is preserved — session-cwd gates apply, never a silent
-        // pass; an OFF-baseline session still blocks, while the round-4
-        // regression (blocking an ON-baseline invisible commit that
-        // pre-round-3 allowed) is undone.
-        if (!m2Eff) {
-          m2Eff = branchOwnership.resolveEffectiveRepo("git status", process.cwd());
-        }
-        if (!m2Eff) {
-          return {
-            block: true,
-            reason: "⛔ git commit/push blocked — could not verify repo ownership (git read failed; fail-closed, #265).",
-          };
-        }
-        const baseline = baselines.get(pid);
-        // #805 P1: with NO baseline, decideM2 must know whether the resolved
-        // MAIN checkout is THIS session's own (a worktree shares its common
-        // dir, so `repoKey` equality identifies it) or the agent-infra hub —
-        // only those two are refused; a different repo's MAIN checkout is
-        // ordinary cross-repo work and stays allowed. Both probes spawn git, so
-        // they run only in the (rare, anomalous) no-baseline case.
-        const m2 = branchOwnership.decideM2({
-          effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
-          pushDst: det.pushDst, pushTargets: det.pushTargets,
-          verdict: det.verdict, allowActive: false,
-          ...(baseline ? {} : {
-            sessionRepoKey: branchOwnership.repoKey(process.cwd()) ?? null,
-            effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd),
-          }),
-        });
-        if (m2?.block) return { block: true, reason: m2.reason };
+        const hit = gateMutations(m2Mutations);
+        if (hit) return hit;
         return admitAfterM3(); // on-baseline or unverifiable-but-exempt
       }
 

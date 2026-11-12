@@ -95,7 +95,24 @@ fi
 # later steps (the disk-reaper timer's TEMPLATES_DIR) use the SAME checkout, rather than resolving a
 # second, possibly untrusted one.
 LAYER_ROOT=""
-REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"
+# ⛔ NO REPO NAME IS BAKED IN HERE (agent-infra#2919). This line used to read
+# `REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"`, and `check_dispatch` hands the value to the
+# pre-flight as `OR` (the queue target). Measured on cell 4, 2026-10-27 16:29–16:38Z against
+# origin/main 0d443381: an agent-infra box was refused provisioning THREE TIMES in a row —
+# `[refresh] NOT PROVISIONABLE: $REPO is /home/cmux/agent-infra, whose 'origin' is
+# …/agent-infra.git — NOT the queue target daniel-ospina/tortoise` — while every other leg reported
+# `ok`. Setting OR/REPO/REPO_SLUG in the environment did not help, because the value compared against
+# came from a DEFAULT rather than from anything the operator set: the only cell shape that could pass
+# provisioning was tortoise, so the agent-infra box ran a TORTOISE clone to compensate (and graded
+# agent-infra work from it). A repo name baked into a provisioning script is a wrong target by
+# default for every other repo this fleet runs, which is #1901/#2235's class.
+# So the value is DERIVED, late — after keys.env is sourced — by `check_repo_slug` below, through the
+# SAME resolver the controller, the refresh pass and the identity walker use (`repo-slug.sh`).
+REPO_SLUG="${REPO_SLUG:-}"
+# The operator's own pin, captured BEFORE `$ENV_FILE` is sourced and before any default, so a
+# declaration can be told apart from a value this run resolved. Empty here means "nothing declared".
+REPO_SLUG_DECLARED_AT_LOAD="${REPO_SLUG}"
+OR_DECLARED_AT_LOAD="${OR:-}"
 WORKDIR="${WORKDIR:-/tmp/cell}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 # The pushed gh token. Overridable for the same reason every other path here is (a hermetic test
@@ -244,6 +261,15 @@ warn() { log_line "warn: $*"; }
 #     `gh auth status`. Not a leftover, so not removed.
 #   * $CELL_HOME/.pi/agent/.ai-review-gate-key — written by the operator/harness, never by this
 #     script; not touched.
+#   * $CELL_HOME/.pi/agent/jev-config.json — the TypeSafe/JEV key `ask-owner.py` scores owner
+#     questions with (agent-infra#2642). WRITTEN by `check_decision_gate` from $ENV_FILE when it is
+#     absent, mode 600, and deliberately DURABLE — a clean-shell reader (a systemd unit, a hand-run
+#     `ask-owner.py --scan`) sources nothing, so this store is what lets the decision gate work at all.
+#     Never removed, and never overwritten when it already holds a DIFFERENT key (a rotated credential
+#     is a decision, not a repair). Its atomic temp file is swept by AGE, never registered with the
+#     removal trap, for the same reason.
+#   * $HOME/.pi/agent/auth.json — pi's provider credential store, repaired by
+#     `check_provider_store` from $ENV_FILE; durable for the identical reason.
 # Register below the moment this script starts handling another secret.
 SECRET_FILES=()
 
@@ -982,6 +1008,184 @@ check_provider_store() {
   fi
 }
 
+# ── (2·gate) the DECISION GATE's credential: the owner-question queue (agent-infra#2642) ────────
+# MEASURED 2026-10-24, agent-infra cell-1, immediately after a lane posted nine owner questions:
+# `ask-owner.py` returned exit 2 ("could not check") for EVERY one of them, because
+# `~/.pi/agent/jev-config.json` — the 0600 store that module calls "the only source on this box" —
+# existed on the laptop and on NO cell. Exit 2 is honest (it refuses to label a question it could not
+# score), but the consequence is silent: the comment is posted and readable, the lane's report says
+# "asked", and the question is absent from the `owner-decision` queue the owner actually reads. Nine
+# issues — the largest owner-blocked class in tortoise's P0/P1 set — sat in exactly that state.
+#
+# ⛔ WHY THIS REFUSES RATHER THAN WARNS, WHEN THE PROVIDER STORE'S SIBLING PROBLEM (#3275 D6) WARNS.
+# That decision covers a DIFFERENT credential (the hosted-MCP token) and a DIFFERENT verifier (the
+# layer's own `--verify`), so it does not reach this work; THIS issue carries the decision that does —
+# its own OVERRIDES line: "the general 'credentials are per-box and live outside the fleet's
+# provisioning' practice — a decision gate that only works on the laptop cannot gate fleet work; the
+# credential must be provisioned by the harness like the harness pin itself." A cell that prints
+# `CELL READY` while its decision gate cannot fire is the inert-enforcer shape this repo files as a
+# defect (the schedule check is fatal for the same reason, docs/ops/fleet-schedule.md:114).
+#
+# ⛔ WHAT COUNTS AS A SOURCE, AND WHY AN AMBIENT EXPORT DOES NOT. The box's OWN `$ENV_FILE` and the
+# 0600 store are sources; an export that lives only in an operator's shell is not — a lane sources
+# `$ENV_FILE` itself and tmux serves the CLIENT's environment, so an ambient export reaches no worker
+# (the rule `cloud-cell-supervisor.sh`'s provider-store section already applies, and the reason this
+# script's provider repair refuses ambient keys too).
+#
+# ⛔ THE WRITER IS HERE AND THE READER IS NOT, BY DESIGN. `ask-owner.py` resolves the key env-first and
+# then from the store; this check MATERIALISES the store from `$ENV_FILE` (the same repair shape, and
+# the same reason, as the provider store: a clean-shell reader — a systemd unit, a hand-run scan —
+# sources nothing, and the store is the only source that survives that). It never overwrites a store
+# holding a DIFFERENT key; a rotated credential is a decision, not a repair, so that is REPORTED.
+jev_config_path() { printf '%s/.pi/agent/jev-config.json\n' "${1%/}"; }
+
+# jev_store_state <cfg> — one word: present | empty | unreadable | absent.
+# The three non-present arms are different questions (a missing file is provisionable, a file that
+# cannot be parsed is a credential this script must not replace), and collapsing them is how the
+# provider store's writer once destroyed a store full of entries it never read.
+jev_store_state() {
+  local cfg="${1:-}" k
+  [ -f "$cfg" ] || { printf 'absent\n'; return 0; }
+  jq -e 'type == "object"' "$cfg" >/dev/null 2>&1 || { printf 'unreadable\n'; return 0; }
+  # ⛔ THE VALUE'S TYPE IS PART OF THE PREDICATE (#2642 review). `| tostring` rendered ANY non-null
+  # value — a number, an object, an array, `true` — as non-empty text, so a store the gate cannot use
+  # still answered `present` and the box went on to `CELL READY`. The gate's own reader
+  # (`ask-owner.py::_key()`) returns the RAW JSON value and `jev()` builds `Bearer {key}` from it: `0`
+  # and `{}` are falsy and take the unkeyed branch, `{"a":1}` and `true` are sent as
+  # `Bearer {'a': 1}` / `Bearer True` and 401 — every one of them UNSCORED, exit 2. `write_jev_store`
+  # below already accepts only `type == "string"`, so `tostring` made this READER wider than the
+  # WRITER and wider than the gate. A wrong-typed value is `empty`: the arm that already REPAIRS from
+  # `$ENV_FILE`, and that refuses when there is nothing to repair from.
+  jq -e '(.["apiKey"] // null) | type == "string"' "$cfg" >/dev/null 2>&1 \
+    || { printf 'empty\n'; return 0; }
+  k="$(jq -r '.apiKey // ""' "$cfg" 2>/dev/null)" || { printf 'unreadable\n'; return 0; }
+  [ -n "$(printf '%s' "$k" | tr -d '[:space:]')" ] || { printf 'empty\n'; return 0; }
+  printf 'present\n'
+}
+
+# jev_trim <value> — leading/trailing whitespace off, one line out.
+jev_trim() { printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+# jev_key_var — the VARIABLE NAME `$ENV_FILE` delivers a usable key in (TYPESAFE_API_KEY first, then
+# the older JEV_API_KEY, the same order `ask-owner.py`'s `_key()` uses); rc 1 when it delivers none.
+# ⛔ TRIMMED, because a whitespace-only value is not a key: `ask-owner.py` sends it as `Bearer ` and
+# the 401 that comes back looks like a provisioned box.
+jev_key_var() {
+  local var
+  for var in TYPESAFE_API_KEY JEV_API_KEY; do
+    keys_env_has_value "$var" || continue
+    [ -n "$(jev_trim "$(printenv "$var" 2>/dev/null)")" ] && { printf '%s\n' "$var"; return 0; }
+  done
+  return 1
+}
+
+# jev_key_env — the key itself, trimmed; rc 1 when `$ENV_FILE` delivers none.
+jev_key_env() {
+  local var
+  var="$(jev_key_var)" || return 1
+  jev_trim "$(printenv "$var" 2>/dev/null)"
+}
+
+# write_jev_store <cfg> <VAR> — write ONE literal `apiKey` from the environment, preserving every
+# other field (the laptop's store also carries `model`, and a repair that dropped a field it did not
+# understand would be the destructive shape this repo refuses).
+# ⛔ THE SECRET NEVER REACHES AN ARGV: `/proc/<pid>/cmdline` is world-readable on Linux, so the value
+# is read from the environment inside jq (`$ENV[$var]`), never passed as `--arg`. The temp file is
+# created under `umask 077` and renamed into place only after it parses and carries the key, so a
+# failed write can neither truncate nor half-write the store.
+# ⛔ NOT registered with the secret-lifetime trap, deliberately: this is a DURABLE credential (that is
+# the point of the issue), not a pushed file that must not outlive the bring-up. A stale temp from a
+# killed run IS a credential on disk, so temps are swept by AGE, never blindly (an unconditional
+# `rm -f` would delete the in-flight file of a CONCURRENT run).
+write_jev_store() {
+  local cfg="$1" var="$2" tmp
+  mkdir -p "$(dirname "$cfg")" 2>/dev/null || return 1
+  find "$(dirname "$cfg")" -maxdepth 1 -name "$(basename "$cfg").bringup.*" -mmin +60 \
+       -exec rm -f {} + 2>/dev/null
+  tmp="$(umask 077; mktemp "$cfg.bringup.XXXXXX" 2>/dev/null)" \
+    || { tmp="$cfg.bringup.$$"; ( umask 077; : > "$tmp" ) 2>/dev/null || return 1; }
+  ( umask 077
+    if [ -s "$cfg" ]; then
+      jq --arg v "$var" '.apiKey = (($ENV[$v] // "") | gsub("^\\s+|\\s+$"; ""))' "$cfg"
+    else
+      jq -n --arg v "$var" '{apiKey: (($ENV[$v] // "") | gsub("^\\s+|\\s+$"; ""))}'
+    fi > "$tmp" ) || { rm -f "$tmp" 2>/dev/null; return 1; }
+  if ! { [ -s "$tmp" ] && jq -e '(.["apiKey"] // "") | (type == "string") and ((gsub("^\\s+|\\s+$"; "")) | length) > 0' \
+           "$tmp" >/dev/null 2>&1; }; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  chmod 600 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$cfg" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  chmod 600 "$cfg" 2>/dev/null
+  return 0
+}
+
+# check_decision_gate — can this cell's OWNER QUEUE receive a question?
+# Called from main() AFTER `check_provider_store`, and before the paid provider probe: a box with no
+# decision gate is refused cheaply, and it is refused AFTER the home layout has been accepted (a run
+# about to be refused for its home must not first write a credential into a home nobody will use).
+# ⛔ THE RE-READ IS THE VERDICT. A write attempt is not a materialisation (the provider store's own
+# rule): the store is asked again, with the same reader the gate uses.
+check_decision_gate() {
+  local cfg st key
+  cfg="$(jev_config_path "$CELL_HOME")"
+  st="$(jev_store_state "$cfg")"
+  case "$st" in
+    unreadable)
+      die "CHECK FAILED [decision gate]: $cfg exists but is not a JSON object this script can parse — refusing to replace a credential file it cannot read (it may hold fields this script does not know). Inspect it by hand (it should look like {\"apiKey\":\"…\"}), or move it aside deliberately and re-run. Until it is repaired, every question a lane asks exits 2 and never reaches the owner queue (agent-infra#2642)." ;;
+    present)
+      # Either the store was already provisioned, or a previous key was rotated. A store that DISAGREES
+      # with what $ENV_FILE delivers is reported, never overwritten: which one is current is not this
+      # script's call (the same rule the provider store follows).
+      if key="$(jev_key_env)" && [ "$key" != "$(jq -r '.apiKey // ""' "$cfg" 2>/dev/null)" ]; then
+        # ⛔ THE TWO READERS ARE SPLIT, SO THIS LINE STATES THE SPLIT — NOT ONE WINNER (#2642 review).
+        # The previous wording ("ask-owner.py reads the STORE, so the stored value is the one used")
+        # was a transplant of the provider-store line, where pi really is store-first. `_key()` is
+        # ENV-FIRST: it returns `$ENV_FILE`'s value for a lane, and reaches the store only for a reader
+        # that sources nothing (a systemd unit, a hand-run `--scan`). An operator told the stored value
+        # wins would rotate the wrong half on the normal lane path.
+        log_line "jev: $cfg holds a DIFFERENT key than $ENV_FILE delivers — the two READERS differ: a lane sources $ENV_FILE first, so the FILE's value is the one a lane uses; a clean-shell reader (systemd, a hand-run scan) reads the STORE, so the stored value is what that one uses. If the key was rotated, update or remove $(printf '%s' "$cfg") by hand to keep both consistent (this script will not overwrite an existing credential)."
+      fi
+      chmod 600 "$cfg" 2>/dev/null
+      ok "jev: configured (store $(printf '%s' "$cfg") — ask-owner.py can score a question, so it can reach the owner queue)"
+      return 0 ;;
+  esac
+
+  # The store holds no usable key: the box's own keys.env is the only source that may fill it.
+  key="$(jev_key_env)" || key=""
+  if [ -n "$key" ]; then
+    # ⛔ THE VARIABLE NAME COMES FROM THE SAME RESOLVER that produced the key, so the value written
+    # is the one that was judged usable — never a second guess at which of the two names it came from.
+    write_jev_store "$cfg" "$(jev_key_var)" \
+      || die "CHECK FAILED [decision gate]: could not write $cfg from the key $ENV_FILE delivers (a full disk, or a directory that cannot be written). Until it is repaired every question a lane asks exits 2 and never reaches the owner queue (agent-infra#2642)."
+    [ "$(jev_store_state "$cfg")" = present ] \
+      || die "CHECK FAILED [decision gate]: the write to $cfg did not produce a store the gate can read — a write attempt is not a credential. Inspect $cfg by hand."
+    log_line "REPAIRED decision gate: $cfg — wrote the TypeSafe key from $ENV_FILE, mode 600. This is a REPAIR of the store ask-owner.py READS, not a new credential: the key was already on this box."
+    ok "jev: configured (store $cfg, written from $ENV_FILE — ask-owner.py can score a question, so it can reach the owner queue)"
+    return 0
+  fi
+
+  # Nothing usable. Name which of the two near-misses this is, because the remedy differs.
+  # ⛔ A NEAR-MISS MUST BE A REAL ONE (#2642 review). The pre-fix test took ANY non-empty `printenv`
+  # as "set in THIS shell but NOT in $ENV_FILE" — so a variable that IS in $ENV_FILE with a BLANK value
+  # (`TYPESAFE_API_KEY="   "`, what an operator leaves behind after blanking a key; keys.env is sourced
+  # with `set -a`, so it lands in this process) got the ambient refusal and was told to put the key in
+  # the file it is already in. One rule, both surfaces: a value is a credential only if it survives
+  # trimming, and an ambient one only if $ENV_FILE does not carry that NAME.
+  local amb=0 v
+  for v in TYPESAFE_API_KEY JEV_API_KEY; do
+    [ -n "$(jev_trim "$(printenv "$v" 2>/dev/null)")" ] || continue
+    keys_env_names "$v" && continue
+    amb=1; break
+  done
+  if [ "$amb" = 1 ]; then
+    die "CHECK FAILED [decision gate]: a TypeSafe key is set in THIS shell but NOT in $ENV_FILE — an ambient export reaches no lane (a lane sources $ENV_FILE itself, and a tmux worker is served the server's environment), so ask-owner.py would still exit 2 for every question. FIX: put TYPESAFE_API_KEY=<the key> in $ENV_FILE (cmux vm push --secret … --mode 600) and re-run; this script materialises $cfg from it."
+  fi
+  die "CHECK FAILED [decision gate]: this cell cannot reach the owner's decision queue. $cfg does not exist (or holds no apiKey) and $ENV_FILE delivers neither TYPESAFE_API_KEY nor JEV_API_KEY, so ask-owner.py exits 2 on EVERY question: the comment is posted and readable, the lane's report says 'asked', and the question is absent from the queue the owner reads (measured 2026-10-24: nine questions on agent-infra cell-1, none queued). FIX: put TYPESAFE_API_KEY=<the key> in $ENV_FILE (cmux vm push --secret … --mode 600) and re-run; this script materialises $(jev_config_path "$CELL_HOME") from it, mode 600. This is a refusal, not a warning, by this issue's OWNER DECISION (its OVERRIDES line): an autonomy layer that cannot reach its decision gate is not autonomous."
+}
+
+
 # ── (2·env) source the cell's environment, under the cell's home ────────────────────────────────
 # Split out of `check_provider` because the steps that follow it are ORDERED requirements, not
 # implementation detail: the ONE-home predicate must judge the env this run will hand the cell, and
@@ -1144,6 +1348,124 @@ check_gh() {
   [ -n "$login" ] && ok "gh login: $login" || die "gh cannot read the API"
   gh api "repos/$REPO_SLUG" --jq '.permissions.push' 2>/dev/null | grep -q true \
     && ok "push permission: true" || die "no push permission on $REPO_SLUG — lanes cannot open PRs"
+}
+
+# ── WHICH REPO THIS BOX IS FOR — DERIVED, never a name baked in (agent-infra#2919) ─────────────
+# One resolver, three callers' worth of evidence, and NO repo name anywhere in this file: the operator's
+# declaration first (it is the only thing that can say which queue this box serves), then the checkout
+# the box works in — whose `origin` is the honest answer to "what repo is this" — and otherwise a
+# refusal that NAMES what is missing. The order matters and it is `repo-slug.sh`'s own recorded rule
+# ("An explicit OR in the environment … still WINS … but the default is derived, never guessed"), so a
+# declaration is never silently overridden by a stale tree, and an undeclared box is never guessed at.
+#
+# ⛔ NOT A SECOND SLUG PARSER. `derive_or` in `orchestrator-harness/repo-slug.sh` is the ONE reader of a
+# checkout's `origin` (it scrubs `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`/`GIT_INDEX_FILE` and reads
+# `--local`, so an ambient environment cannot re-point the answer), and `repo_slug_valid` is the ONE
+# owner of what an `owner/name` is. Both are used here by name. The supervisor keeps its own
+# `queue_repo_from_url` for its own documented reason and is held in lockstep with this pair by
+# test-gates.sh's CROSS-PARSER LOCKSTEP section, so a drift between the two answers a cell can get
+# reddens instead of being described.
+#
+# ⛔ THE FOURTH ARM OF #2919'S ASK — "`OR` from keys.env" — IS SUBSUMED, DELIBERATELY, AND THE REASON IS
+# THE FIX, NOT AN OMISSION. `source_env_file` sources `$ENV_FILE` into THIS shell, so by the time this
+# runs a keys.env `OR`/`REPO_SLUG` is indistinguishable from an operator's export and is read by the
+# FIRST arm. Keeping it as a separate, LOWER-precedence arm would require snapshotting the shell before
+# sourcing — and would then let a stale `$WORKDIR` checkout outrank the operator's own `keys.env` pin,
+# which is the silent override in the other direction. A declaration is one predicate, whichever file
+# carried it, and a declaration that DISAGREES with `$WORKDIR`'s origin is refused by name further
+# down (`check_dispatch` -> `refresh-candidates.sh`'s pairing check, `#1901`) rather than resolved here.
+#
+# Contract, both functions: rc 0 + the value; rc 1 = nothing to resolve; rc 2 = the operator's pin is
+# not an `owner/name` (a config error, refused by name — the same vocabulary `derive_or` uses).
+# `repo_slug_resolve <declared-slug> <workdir> <declared-or>` prints `<slug>` then `<source>` on stdout
+# so the caller can REPORT which one it used instead of presenting a derived value as a declaration.
+repo_slug_resolve() {
+  local declared="${1:-}" workdir="${2:-}" declared_or="${3:-}" slug=""
+  # ⛔ A MISSING VALIDATOR IS NOT A REFUSAL (the rule this file already applies to `lib/cell-home.sh`
+  # and `uv-env.sh`). `repo_slug_valid` lives in `repo-slug.sh`, which a STANDALONE bring-up — the
+  # documented bare-VM path, a script pushed to /tmp — does not carry at all. Refusing a declared slug
+  # because the box cannot CHECK it would block exactly the box that never had the parser; the value is
+  # therefore used as declared and the SOURCE LINE SAYS it is unverified, so nothing is claimed as
+  # measured. Loading the harness makes the shape real; an unparseable pin then refuses by name below.
+  # ARM 1a — the operator named REPO_SLUG. Validated when the one shape rule is present, never passed
+  # through unvalidated on a box that HAS it: `repo_slug_valid` also refuses the literal `*`, which
+  # `repo_identity_scan` reads as the ANY-REPO exemption, so an unvalidated `*` handed onward would be a
+  # wildcard exemption wearing a declaration's clothes.
+  if [ -n "$declared" ]; then
+    if command -v repo_slug_valid >/dev/null 2>&1; then
+      repo_slug_valid "$declared" || return 2
+      printf '%s\n%s\n' "$declared" "declared in REPO_SLUG"
+    else
+      printf '%s\n%s\n' "$declared" "declared in REPO_SLUG (shape UNVERIFIED — repo-slug.sh is not on this box)"
+    fi
+    return 0
+  fi
+  # ARM 1b — the operator named OR (the queue target). Same validation, same reason.
+  if [ -n "$declared_or" ]; then    if command -v repo_slug_valid >/dev/null 2>&1; then
+      repo_slug_valid "$declared_or" || return 2
+      printf '%s\n%s\n' "$declared_or" "declared in OR"
+    else
+      printf '%s\n%s\n' "$declared_or" "declared in OR (shape UNVERIFIED — repo-slug.sh is not on this box)"
+    fi
+    return 0
+  fi
+  # ARM 2 — DERIVE from the checkout this box works in. `derive_or` refuses a remote that is not a
+  # GitHub slug (a local path, a `file://` mirror, `ftp://…`), so an unparseable origin falls through to
+  # the refusal below rather than becoming an invented `owner/name`. Its answer is already validated by
+  # `repo_slug_from_remote`, which delegates to the one shape rule.
+  if [ -n "$workdir" ] && [ -d "$workdir" ] && command -v derive_or >/dev/null 2>&1; then
+    slug="$(derive_or "$workdir" 2>/dev/null)" || slug=""
+    if [ -n "$slug" ]; then
+      printf '%s\n%s\n' "$slug" "derived from $workdir's 'origin'"
+      return 0
+    fi
+  fi
+  # ARM 3 — nothing to resolve. NOT a default: a repo name here is `#2919` itself.
+  return 1
+}
+
+# `check_repo_slug` — resolve it, publish it, and refuse BY NAME when there is nothing to resolve.
+# ⛔ PLACED BEFORE `check_gh` (which spends a `gh api repos/$REPO_SLUG` call) and before
+# `check_repo_identity` (whose generic-name row reads `$REPO_SLUG` as "the cell's own repo"), and AFTER
+# `check_provider_env` — it reads what `$ENV_FILE` declared. A run placed earlier would grade a
+# declaration the cell never made.
+# ⛔ THE REFUSAL NAMES `REPO_SLUG` AND NOT `REPO`, DELIBERATELY (agent-infra#2919 ask 2). The pre-fix
+# message on an agent-infra cell said `fix: set REPO=<a checkout of daniel-ospina/tortoise>`, i.e. it
+# invited the operator to grade tortoise from an agent-infra box — the exact mis-target #1901 and the
+# `GH_REPO` class (#2235) exist to prevent. The remedy for "this box is for another repo" is to say
+# WHICH repo, not to fetch a different checkout.
+check_repo_slug() {
+  local out rc=0 slug src why="" workdir_state=""
+  out="$(repo_slug_resolve "${REPO_SLUG:-}" "${WORKDIR:-}" "${OR:-}")" || rc=$?
+  case "$rc" in
+    0)
+      slug="$(printf '%s\n' "$out" | sed -n 1p)"
+      src="$(printf '%s\n' "$out" | sed -n 2p)"
+      REPO_SLUG="$slug"
+      # Exported: `refresh-candidates.sh` and the supervisor's children read it from the environment,
+      # and the lane briefs print it. A value this run DERIVED must be visible to what it starts.
+      export REPO_SLUG
+      ok "repo slug: $REPO_SLUG ($src)" ;;
+    2)
+      # Name the value the operator actually typed, and which variable carried it — a refusal that says
+      # "is not an owner/name" without quoting the offending value sends them looking at the wrong one.
+      if [ -n "${REPO_SLUG:-}" ]; then why="REPO_SLUG='$REPO_SLUG'"; else why="OR='${OR:-}'"; fi
+      die "CHECK FAILED [repo slug]: $why is not an <owner>/<repo> — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing (agent-infra#2919). FIX: set REPO_SLUG=<owner/name of the repo THIS BOX is for>, in $ENV_FILE, or drop the pin and let the slug be derived from \$WORKDIR's 'origin'." ;;
+    *)
+      # Say WHAT was found instead of an origin, so the operator does not go hunting for a declaration
+      # that is already absent (the pre-fix message's shape: it told an agent-infra box to fetch a
+      # tortoise checkout, which is the defect itself).
+      if [ -z "${WORKDIR:-}" ]; then
+        workdir_state="\$WORKDIR is unset"
+      elif [ ! -e "$WORKDIR/.git" ]; then
+        workdir_state="\$WORKDIR ('$WORKDIR') is not a checkout, so it has no 'origin' to read"
+      elif ! command -v derive_or >/dev/null 2>&1; then
+        workdir_state="the one slug parser (repo-slug.sh's derive_or) is not loaded on this box, so \$WORKDIR's 'origin' could not be read — deploy the harness ('cloud-cell-supervisor.sh apply', or bring up from a full checkout) and re-run"
+      else
+        workdir_state="\$WORKDIR ('$WORKDIR') is a checkout whose 'origin' is not a GitHub owner/name (a local path, a file:// mirror or no remote at all), so no repo could be derived from it"
+      fi
+      die "CHECK FAILED [repo slug]: this box declares no repo and none could be DERIVED — REPO_SLUG and OR are unset, and $workdir_state (agent-infra#2919). A repo name baked into this script is a WRONG TARGET BY DEFAULT for every cell that is not that repo: measured on cell 4, 2026-10-27, an agent-infra box could NEVER be provisioned and ran a tortoise clone to compensate. FIX: put REPO_SLUG=<owner/name of the repo THIS BOX is for> in $ENV_FILE, or point WORKDIR at that repo's checkout so its 'origin' can be read." ;;
+  esac
 }
 
 # ── repo identity: a directory must not lie about which repo it is (agent-infra#3521) ──────────
@@ -1370,7 +1692,7 @@ check_dispatch() {
     # the rest, only a TRANSIENT refusal that names the SCOUT gets the scout wording — rc=1 also covers
     # causes that are not the scout at all (`FAIL repo not found`, `'uv' is not runnable`).
     if [ "$outrc" -eq 3 ]; then
-      die "this repo cannot be provisioned for dispatch — the cell would merge only (agent-infra#1736)"
+      die "this repo cannot be provisioned for dispatch — the cell would merge only (agent-infra#1736). ⛔ DO NOT fix this by pointing REPO at a checkout of another repo: that is how an agent-infra cell came to grade tortoise work (agent-infra#2919/#1901). The queue target this pass used is REPO_SLUG='$REPO_SLUG'; if THIS BOX is for a different repo, set REPO_SLUG=<that repo's owner/name> in $ENV_FILE and re-run, and if it is the right repo, fix the reason above (for a checkout/queue mismatch: \$WORKDIR must be a checkout of $REPO_SLUG)."
     fi
     case "$out" in
       *"TRANSIENT: scout"*) die "the scout worktree cannot be refreshed right now (see the reason above): clear it, then re-run (agent-infra#2174)" ;;
@@ -2627,10 +2949,24 @@ main() {
       #     actually reads, so the store is what is checked — and the provider is the one lanes use.
       check_provider_env
       check_one_home env
+      # ⛔ THE BOX'S REPO, RESOLVED BEFORE ANYTHING THAT NAMES ONE (agent-infra#2919) — and AFTER the
+      # env is sourced (step 1) and the HOME layout is judged (step 2), because the declaration it reads
+      # comes from `$ENV_FILE` and a run about to be refused for its home must not first resolve state
+      # against it. Every step below that names a repo reads `$REPO_SLUG`: `check_gh` spends a
+      # `gh api repos/$REPO_SLUG` call on it, `check_repo` CLONES from it, `check_repo_identity` uses it
+      # as "the cell's own repo", and `check_dispatch` hands it to the pre-flight as the queue target
+      # `OR`. Resolving it from the declaration the cell actually made — or from `$WORKDIR`'s own origin
+      # — is what replaces the tortoise name this file used to bake in; a step placed after any of them
+      # would grade a value nothing established.
+      check_repo_slug
       # BEFORE check_gh/check_repo: this judges the box as it ARRIVED. `check_repo` clones $WORKDIR, so a
       # check placed after it would grade the tree this run just created.
       check_repo_identity
       check_provider_store "${PI_LANE_PROVIDER:-deepseek}"
+      # ⛔ BEFORE check_provider, WHICH SPENDS A PAID MODEL CALL: a box that cannot gate a question is
+      # refused cheaply. AFTER check_provider_store/check_one_home, because the key this check
+      # materialises must not be written into a home the run is about to refuse.
+      check_decision_gate
       check_provider
       check_gh
       check_repo
@@ -2693,7 +3029,7 @@ main() {
         "repo identity") READY_HEADLINE="all links verified" ;;
         *)                 READY_HEADLINE="links checked — one or more NOT fully verified (see the lines above)" ;;
       esac
-      log_line "CELL READY — $READY_HEADLINE (one home, $REPO_IDENTITY_TOKEN, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
+      log_line "CELL READY — $READY_HEADLINE (one home, $REPO_IDENTITY_TOKEN, tools, network, provider, decision gate, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
       ;;
     *)
       log_line "unknown mode: $MODE (use --check)"; exit 2 ;;

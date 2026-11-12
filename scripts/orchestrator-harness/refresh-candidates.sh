@@ -228,6 +228,11 @@ resolve_home --create \
   || echo "[refresh] WARN: neither \$HOME ('${HOME:-<unset>}') nor CELL_HOME ('$CELL_HOME') is a writable directory — the pre-flight's gh surfaces will be unreadable and its verdicts degraded"
 
 O="${O:-$HOME/orchestrator}"
+# ⛔ THE WORK ROOT (#2095, review of #3846, P1). The controller exports `O` = its STATE dir and `O_WORK`
+# = the harness root. `claims.sh` is CODE, so it is resolved from the work root: reading `$O/claims.sh`
+# alone made a state-dir instance answer "the registry is NOT INSTALLED" while it was installed one
+# directory over — the check and the run would both refuse for a reason that is not true.
+_RC_WORK="${O_WORK:-$O}"
 
 # ⛔ ONE BOARD REBUILD PER PASS, NOT ONE PER CANDIDATE (#2022). A pass runs the pre-flight once per
 # candidate, and the fleet-board rebuild inside it measured 15.9 s of a 19 s run — identical every
@@ -404,7 +409,14 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
            *://*|*@*:*)
              echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is $url — NOT the queue target $OR"
              echo "[refresh]   the queue target (\$OR) and the checkout (\$REPO) must be the same repo; retrying cannot fix this, and pre-flighting one repo's issues against another repo's tree is #1901"
-             echo "[refresh]   fix: set REPO=<a checkout of $OR>, or clone it to ~/cell"
+             # ⛔ TWO REMEDIES, AND THE REPO IS THE FIRST ONE NAMED (agent-infra#2919 ask 2). This line used
+             # to offer only `set REPO=<a checkout of $OR>` — so on a box that IS the other repo it invited
+             # the operator to fetch a DIFFERENT checkout and grade another repo's issues from it, which is
+             # the mis-target #1901 exists to prevent (measured: an agent-infra cell ran a tortoise clone
+             # for exactly this reason). WHICH side is wrong has to be stated, because only the operator
+             # knows what the box is for: the queue target is wrong ⇒ say which repo the box is for
+             # (REPO_SLUG); the checkout is wrong ⇒ point REPO at a checkout of $OR.
+             echo "[refresh]   fix: if THIS BOX is for a different repo, set REPO_SLUG=<that repo's owner/name> (a cell: in \$HOME/keys.env) — do NOT clone $OR just to satisfy this check; if $OR is right, set REPO=<a checkout of $OR>, or clone it to ~/cell"
              return 1 ;;
            # A FILESYSTEM-PATH origin (a local bare repo — what this harness's own fixtures use, and
            # how a local dev clone is made) cannot express a queue target at all, so there is nothing to
@@ -461,7 +473,10 @@ repo_unresolved() {
   seen="$(repo_candidates | sed '/^$/d' | sort -u | tr '\n' ' ')"; seen="${seen% }"
   echo "[refresh] NOT PROVISIONABLE: \$REPO is not set and no git checkout of $OR was found where this harness puts one ($seen) — the checkout the pass would stand in is UNKNOWN"
   echo "[refresh]   the queue target (\$OR) and the checkout (\$REPO) must be the same repo; a path is not proof of that and the old default was one developer's home directory"
-  echo "[refresh]   fix: set REPO=<a checkout of $OR> (e.g. in $HOME/keys.env), or clone it to ~/cell"
+  # ⛔ SAME TWO DIRECTIONS AS THE MISMATCH ARM ABOVE (agent-infra#2919 ask 2): with no checkout of $OR on
+  # the box, the likeliest cause is that the box is for another repo — and the remedy an operator reads
+  # must not be "clone the other repo".
+  echo "[refresh]   fix: if THIS BOX is for a different repo, set REPO_SLUG=<that repo's owner/name> (a cell: in \$HOME/keys.env); otherwise set REPO=<a checkout of $OR> (e.g. in \$HOME/keys.env), or clone it to ~/cell"
 }
 
 # ── the interpreter minimum, from the TOOL (agent-infra#1748 review) ──────────────────────────
@@ -1334,7 +1349,10 @@ gh_env_verdict() {
 # exact "disable it by ambient env" shape orch-loop.sh's dispatch gate forbids. It is now a path:
 # `$O/claims.sh`, everywhere, and the regression suite drives a sandbox `O` instead.
 issue_claim_verdict() { # <issue> -> 0 CLEAN / 1 COLLISION / 2 INCOMPLETE / 3 NOT PROVISIONABLE
-  local csh="$O/claims.sh"
+  # ⛔ `${_RC_WORK:-$O}`: `issue_claim_verdict` is EXTRACTED and driven on its own, so the
+  # file-level declaration is unbound there — the verdict would read "registry NOT INSTALLED"
+  # for a registry that is present, i.e. the INCOMPLETE refusal applied to a healthy box.
+  local csh="${_RC_WORK:-$O}/claims.sh"
   if [ ! -f "$csh" ]; then
     CLAIM_RESULT="the claim registry ($csh) is NOT INSTALLED — INCOMPLETE, never CLEAN"
     return 2
@@ -1553,24 +1571,24 @@ cmd_check() {
   # is the whole point of a provisioning verdict: it needs no network, no `gh`, and no scout, and it
   # refuses to certify a cell that could only merge. A byte-identical check to the one the refresh
   # applies (`declare -f claim_issue_preflight`), so a check can never disagree with the run.
-  if [ -f "$O/claims.sh" ]; then
+  if [ -f "${_RC_WORK:-$O}/claims.sh" ]; then
     # ONE probe for both failure kinds — unloadable, or loaded but carrying no `claim_issue_preflight`
     # — because they share the one operator fix and the one consequence (the pre-flight refuses every
     # issue, so the cell can only merge). Behaviourally byte-identical to the refresh's own check.
-    if ! ( CLAIM_REPO="$SC"; . "$O/claims.sh"; declare -f claim_issue_preflight >/dev/null 2>&1 ) 2>/dev/null; then
-      echo "[refresh] check: FAIL $O/claims.sh cannot answer the issue-claim question (unloadable, or predating the issue-claim reader)"
+    if ! ( CLAIM_REPO="$SC"; . "${_RC_WORK:-$O}/claims.sh"; declare -f claim_issue_preflight >/dev/null 2>&1 ) 2>/dev/null; then
+      echo "[refresh] check: FAIL ${_RC_WORK:-$O}/claims.sh cannot answer the issue-claim question (unloadable, or predating the issue-claim reader)"
       echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE, so a cell on this repo would MERGE ONLY"
       echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
       return "$EXIT_NOT_PROVISIONABLE"
     fi
-    echo "[refresh] check: claim registry=$O/claims.sh (issue-claim reader present)"
+    echo "[refresh] check: claim registry=${_RC_WORK:-$O}/claims.sh (issue-claim reader present)"
   else
     # ⛔ A MISSING REGISTRY IS NOT A PASS (agent-infra#2466). This arm used to certify the cell and say
     # the refresh would "WARN per issue and dispatch without a cross-box claim" — a check blessing the
     # exact state the run now refuses, i.e. a false PASS. The run path (`issue_claim_verdict`) answers
     # INCOMPLETE for a missing file, and `--check` must refuse what the run refuses, so both name the
     # same one-line remedy.
-    echo "[refresh] check: FAIL $O/claims.sh is absent — the cross-box claim registry is NOT INSTALLED"
+    echo "[refresh] check: FAIL ${_RC_WORK:-$O}/claims.sh is absent — the cross-box claim registry is NOT INSTALLED"
     echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE (claim-unreadable), so a cell on this repo would dispatch NOTHING"
     echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
     return "$EXIT_NOT_PROVISIONABLE"
@@ -3771,7 +3789,7 @@ _ck_tmp="$O/.checked-decided.$$"
     # the one fact this pass cannot answer locally, so a pass that could not consult the registry
     # must not be byte-identical on the line to one that did. `none` means "nothing was refused";
     # this uses its own value. It records a REFUSAL now, which is what the slug always described.
-    [ -f "$O/claims.sh" ] || CHECKED_REFUSED="claim-registry-absent"
+    [ -f "${_RC_WORK:-$O}/claims.sh" ] || CHECKED_REFUSED="claim-registry-absent"
     _ck_sorted="$(mktemp "${TMPDIR:-/tmp}/ck-sorted.XXXXXX")" || _ck_sorted=""
     # ⛔ A FAILED SORT IS NOT A BINDING CAP (review cycle 3). Both failures landed every candidate in
     # `deferred`, which the reader renders as "CHECKED_RELEASE_MAX is too small for this cell" — the

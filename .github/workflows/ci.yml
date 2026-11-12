@@ -1290,6 +1290,66 @@ jobs:
         # before anything reads it.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s.
         run: node extensions/main-worktree-guard/test-command-position.mjs
+      - name: main-worktree-guard M2 commit/push COMPOUND ownership (#605)
+        timeout-minutes: 4
+        # #605: M2 resolved ONE repo per command (`commitHints`/`pushHints`
+        # describe the first EXTRACTOR-VISIBLE invocation), so a fully-visible
+        # worktree-scoped LEAD blanked the gate for the rest of the compound —
+        # `git -C <wt> push origin wtmain ; git push origin feat/other` ran the
+        # off-baseline MAIN push while the reversed order blocked (the outcome
+        # depended on invocation ORDER). M2 now gates EVERY main-resolving
+        # mutation, each against its own hints and — for a push — its OWN
+        # refspecs; the ownership-allowance arm and the push-delete arm both gate
+        # the compound's remaining mutations before admitting it (reviews I1/F1),
+        # the delete exemption keys on each MUTATION's own `isDelete` rather than
+        # on the compound's verdict path (review I2), the M2 leg runs on the
+        # push-delete VERDICT rather than on its non-empty target list (a
+        # no-refspec `git push --delete` used to exempt the compound), and the #73
+        # coordinated-delete check unions EVERY delete invocation's targets.
+        # Its own step for the reason the POSITION step above states: the
+        # `extensions/*/test*.mjs` glob is in ci-main.yml, which has NO
+        # `pull_request` trigger, so without this line the only handler-level pin
+        # of this fix is collected AFTER the merge it is supposed to gate.
+        # Behavioural: loads the REAL index.ts through module-load-hooks.mjs and
+        # drives the tool_call handler against a hermetic git fixture, asserting
+        # decideM2's own reason text (never a bare `block: true`).
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~2s.
+        run: node extensions/main-worktree-guard/test-m2-compound-ownership.mjs
+      - name: main-worktree-guard #73 delete target must be a LITERAL ref (#653)
+        timeout-minutes: 4
+        # #653: the #73 coordinated-delete guard matched the delete target as
+        # TEXT, so a target the SHELL produces (`git push origin --delete
+        # "$PR_BRANCH"`, `-d $(echo held/branch)`, backticks, brace/glob
+        # expansion) named no ref, no worktree was found to be holding it, and
+        # the arm ALLOWED the delete — #73's protection defeated by ordinary
+        # shell usage, and the ceremony snippets in skills/commit-workflow
+        # assigned the branch to a variable first, so the DOCUMENTED path was
+        # the unmatched one. The fix is option 2 of the issue: an unresolvable
+        # target is REFUSED (fail-closed) with the literal-ref remedy.
+        # Behavioural: loads the REAL index.ts through module-load-hooks.mjs and
+        # drives the tool_call handler against a hermetic hub + a sibling
+        # worktree that holds the branch, asserting the #653 refusal's OWN text
+        # (never a bare `block: true`), the no-false-block controls on the
+        # literal path, #73's unchanged literal protection, a worktree-rooted
+        # session, and the override hatch. Zero-dep (`node:*` + the `git`
+        # binary), no `npm ci`, ~3s. Its own step for the reason the sibling
+        # steps above state: the `extensions/*/test*.mjs` glob is in ci-main.yml,
+        # which has NO `pull_request` trigger.
+        run: node extensions/main-worktree-guard/test-653-delete-target.mjs
+      - name: main-worktree-guard #653 delete-target MUTATION evidence
+        timeout-minutes: 4
+        # The suite above is only a pin if it can FAIL, and this fix has two
+        # directions to get wrong — too little (the class is not refused) and too
+        # much (the fail-closed arm becomes an over-block on the literal path).
+        # `--mutations` reverts EXACTLY the #653 decision (`if (unresolved.length
+        # > 0)` → `if (false)`) in a TEMP copy of the extension and requires each
+        # #653 row to be ALLOWED again by the mutant while the real module still
+        # refuses it in the SAME run — plus the controls (the literal delete and
+        # #73's own block must NOT change under the mutant). A mutant that fails
+        # to load is a failure, never a green. Its OWN step so neither verdict can
+        # suppress the other (the rule every sibling suite here follows).
+        # Zero-dep, ~5s.
+        run: node extensions/main-worktree-guard/test-653-delete-target.mjs --mutations
       - name: main-worktree-guard hub working-tree SWEEP detection (#718)
         # Sized from this step's own documented wall clock (~16s: a dozen deliberate `pause(1600)`
         # bursts inside the arms), NOT from a 12-run p90 — the step landed on main today (#3781), so
@@ -1497,6 +1557,68 @@ jobs:
         # (provenance).
         run: '! grep -rE ''/Users/danielospina/swarm/operations/coordination'' skills/ extensions/ scripts/'
 
+  verdict-pin:
+    # ⛔ ITS OWN JOB, NOT A STEP IN `verify` (agent-infra#2723, the #3121 rule). The
+    # #2723 pin was first written as step ~63 of `verify`, and on its FIRST CI run
+    # an unrelated red nine steps earlier (`main-worktree-guard script-content
+    # backdoor gate (#1484)`) made the runner report it `skipped` — so the pin that
+    # exists to prove a `verify` red is attributable had itself been disarmed by a
+    # `verify` red, and the PR looked green on the one thing this change is about.
+    # A gate that can be disarmed by an unrelated red is not a gate (#3121, measured
+    # on PR #3103), so it gets a job whose ONLY step is this one.
+    runs-on: ubuntu-latest
+    # #2055 — job-level bound ABOVE the step sum, and the STEP bound is the red one:
+    # a step trip is `failure`; a job trip is `cancelled`, which the rail reads
+    # NON-RED (#3242). ~3s measured (one `python3.12` subprocess, no network); the
+    # step bounds below sum to 35, so this is kept above them.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+      - uses: actions/setup-node@v4
+        timeout-minutes: 10
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        timeout-minutes: 10
+        # The pin runs the rail's OWN parser (`scripts/ci_exemption.py ids`) over the
+        # emitter's output rather than comparing the format against a string the test
+        # also owns — a test that re-states the format can only agree with itself.
+        # That needs a python, and `verify` has none of its own to borrow here.
+        with:
+          python-version: '3.12'
+      - name: Verdict emitter + attribution drift pin (#2723, zero-dep)
+        timeout-minutes: 5
+        # agent-infra#2723 — a `verify` red yielded NO parseable failure identity, so
+        # the merge rail refused every PR whose only red was that job:
+        #
+        #   ⛔ admin-merge: BLOCKED — 1 of 1 failing PR run(s) yielded NO parseable
+        #      failure identity … This is a refusal, not a comparison.
+        #
+        # The rail reads a JS harness through its `runner::<label>` family, anchored
+        # on `❌ <label>: <N> passed, <M> failed` (scripts/ci_exemption.py,
+        # `_RUNNER_AGG_RE`). Sixteen harnesses hand-rolled that aggregate in five
+        # shapes — label-less counts, no marker at all, a count where the label goes
+        # — so the measured output of the failing step in run 40110626277 parsed to
+        # `ids=0`, and the rail could not name it.
+        #
+        # The fix is at the PRODUCER (#1185's precedent): `extensions/shared/verdict.mjs`
+        # prints the attributable form and every harness now goes through it. No
+        # parser change — the identity family and its refusal path are untouched.
+        #
+        # The pin asserts BOTH halves and is only a pin if it can FAIL, so it is
+        # bidirectionally measured: (a) the emitter's output is round-tripped through
+        # the rail's OWN parser, and (b) every zero-dep `node` harness a workflow runs
+        # must import the emitter — read from `.github/workflows/*.yml`, the same files
+        # the runner reads, not from a list kept here. Verified RED both ways: deleting
+        # one harness's import (73 → 71 passed, 2 failed), and dropping the emitter's
+        # zero-count clamp (exit 1, all 18 `runner::` arms red).
+        #
+        # Zero-dep (`node:*` only; `python3.12` for the parser round-trip), no `npm ci`,
+        # ~3s. `test-verdict.mjs` prints its own attributable aggregate, so a red here
+        # names itself to the rail like any other harness (#2723's own fix).
+        run: node extensions/shared/test-verdict.mjs
+
   http-pool-hygiene:
     # #1110 — the real-transport arms of this suite (the dead-socket RED
     # baseline and the keepAliveMaxTimeout falsifier) need a real undici copy.
@@ -1529,10 +1651,22 @@ jobs:
           node-version: '22'
       - name: Install undici for the real-transport arms (test-only)
         timeout-minutes: 5
+        # ⛔ THE COPY SET IS THE MODULE GRAPH, NOT THE EXTENSION DIRECTORY (#2723).
+        # The harness imports its verdict emitter as `../shared/verdict.mjs`, and ESM
+        # resolves a relative specifier against the IMPORTING module's URL — so under
+        # this temp root that specifier means `$RUNNER_TEMP/shared/verdict.mjs`, not
+        # the repo's `extensions/shared/verdict.mjs`. Copying only the extension left
+        # the sibling absent and the job died at load with
+        # `ERR_MODULE_NOT_FOUND … /_temp/shared/verdict.mjs` — the suite never ran, so
+        # this job reported RED for a reason that named no defect in the pool hygiene
+        # code. Materialise the emitter at the path the harness actually resolves;
+        # `extensions/shared/test-verdict.mjs` §4 now refuses a copy step that omits
+        # any import a materialised harness makes outside its own directory.
         run: |
           tmp="$RUNNER_TEMP/pool-hygiene-ext"
-          mkdir -p "$tmp"
+          mkdir -p "$tmp" "$RUNNER_TEMP/shared"
           cp -R extensions/http-pool-hygiene/. "$tmp/"
+          cp extensions/shared/verdict.mjs "$RUNNER_TEMP/shared/"
           npm install --no-save --no-audit --no-fund --prefix "$tmp" undici@8.9.0
       - name: http-pool-hygiene suite (real transport REQUIRED)
         timeout-minutes: 5

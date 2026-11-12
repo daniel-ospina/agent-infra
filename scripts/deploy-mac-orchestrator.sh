@@ -100,13 +100,103 @@ lock_pid() { # -> pid on stdout, empty when there is no usable lock
   ps -o command= -p "$p" 2>/dev/null | grep -q "bash $O/orch-loop\.sh" || return 0
   printf '%s\n' "$p"
 }
+# Phase A's install leg, as a FUNCTION so its verdict can be DRIVEN (#4003).
+# ⛔ IT RETURNS NON-ZERO ON THE FIRST ENTRY IT COULD NOT LAND, AND THE COUNT GOES IN `INST_FAIL`. It
+# must NOT print the count: every failure inside it `log`s a FATAL line to STDOUT, so a
+# `$(install_phase_a …)` capture would swallow the operator's diagnosis INTO the number and leave the
+# run reporting a count nobody can see the reasons for. The caller checks the status and reports the
+# count — that separation is the point.
+# This loop used to DISCARD `install_file`'s status, so a file that did not land — or landed
+# non-executable — was followed by "phase A: copied N entries", and only `claims.sh`/`orch-loop.sh`
+# were ever verified by name. A box missing `nonblocking-dispatch.sh` looks idle-but-healthy, and the
+# deploy said it was done.
+INST_FAIL=0
+install_phase_a() { # install_phase_a <staged-harness-dir> <runtime-dir>  -> non-zero if any entry did not land
+  local H="$1" O="$2" f b
+  INST_FAIL=0
+  for f in "$H"/*; do
+    b="$(basename "$f")"
+    [ "$b" = "orch-loop.sh" ] && continue
+    if [ -d "$f" ]; then cp -R "$f" "$O/" || { log "FATAL: phase A: cp -R $b -> $O/ FAILED"; INST_FAIL=$((INST_FAIL+1)); }
+    else install_file "$f" "$O/$b" || INST_FAIL=$((INST_FAIL+1)); fi
+  done
+  [ "$INST_FAIL" -eq 0 ]
+}
+# ── THE MODE AND THE EXECUTABLE BIT (agent-infra#4003) ───────────────────────────────────────────
+# A deployed harness script the box EXECUTES must carry its `x` bit. `stall-fix.sh` runs `"$DISP"`
+# where `DISP="$O/nonblocking-dispatch.sh"`, and refuses up front on `[ ! -x "$DISP" ]` — so a 0644
+# copy disarms the whole dispatch path while every line it writes reads like a configuration note.
+# ⛔ THE BIT CANNOT BE INHERITED FROM THE COPY. `cp` creates the destination with the SOURCE's mode
+# masked by the umask, and a umask can only CLEAR bits — it can never add one — so a source tracked
+# 100644 in git lands non-executable whatever the umask is. MEASURED 2026-11-12: the issue's own
+# evidence is this file — `scripts/orchestrator-harness/nonblocking-dispatch.sh` was tracked 100644
+# while `~/orchestrator/nonblocking-dispatch.sh` was the same 36,175 bytes at mode `-rw-r--r--`, and
+# the controller logged `DISPATCH (no executable …)` for as long as the bit had been missing.
+# ⛔ AND THE RESULT IS VERIFIED ON THE DESTINATION (#4003): a `chmod` that exits 0 while the kernel or
+# a mount masks the bit is exactly what a check on the temporary file cannot see.
+# ⛔ NOT A `chmod "$(stat …)"` OF THE SOURCE'S MODE. That would need one of the two mutually
+# incompatible `stat` dialects, which this repo records as a cross-platform trap
+# (`scripts/check-portability-traps.sh`), and it buys nothing here: `cp` into a fresh name already
+# applies the source's mode through the umask, this script never applied one either, and the only bit
+# whose loss is SILENT AND FATAL is the exec bit — which is set and then verified below.
+# A PROGRAM is anything the harness or a launchd unit may run by name: a shell script, or a python
+# file invoked as a program. Non-programs (`*.md`, `*.txt`, the plist template) keep their own mode.
+is_program() { # <path>
+  case "$1" in
+    *.sh|*.py) return 0 ;;
+  esac
+  return 1
+}
+# The mode, for EVIDENCE in a failure line — never as a predicate (`[ -x ]` is the predicate, and it is
+# the portable one). `ls -l | cut` rather than `stat -c`/`stat -f`: the two `stat` dialects are a
+# recorded cross-platform trap here (`scripts/check-portability-traps.sh`), and this line must render
+# on both boxes.
+mode_str() { ls -l "$1" 2>/dev/null | cut -c1-10; }
 # Atomic install: temp file in the SAME directory, then rename (new inode). A running bash keeps
 # reading its old inode, so a swap can never be read half-old/half-new — the property that makes
 # phase A and phase B safe at ANY time, in-flight work or not.
-install_file() { # install_file <src> <dst>
+# ⛔ IT RETURNS 0 ONLY FOR A DESTINATION THAT IS THERE AND, WHEN IT IS A PROGRAM, EXECUTABLE. The
+# previous two-statement form returned `mv`'s status, which cannot observe a lost `x` bit or a `cp`
+# that wrote the wrong object — the caller's only evidence was the exit code of a rename.
+install_file() { # install_file <src> <dst>  -> 0 only when <dst> is a verbatim, runnable copy
   local s="$1" d="$2" t
+  # `mv -f file existing-directory` MOVES INTO it and exits 0, so a directory at `$d` would report a
+  # successful install while nothing landed at the path (the hazard `farm_install` names, #3991).
+  if [ -d "$d" ]; then
+    log "FATAL: install_file: $d is a DIRECTORY — refusing to install over it"
+    return 1
+  fi
   t="$(dirname "$d")/.$(basename "$d").new.$$"
-  cp "$s" "$t" && mv -f "$t" "$d"
+  # The scratch name is predictable ($$), so a DIRECTORY left at it would make `cp` copy INTO it and
+  # `mv` rename the directory onto `$d` — a "successful" install with the wrong object and no file.
+  if [ -d "$t" ]; then
+    log "FATAL: install_file: $t is a DIRECTORY — refusing to use it as scratch"
+    return 1
+  fi
+  # stderr is NOT discarded: a disk that filled is a documented failure mode and `cp: No space left on
+  # device` is the only line that names it.
+  if ! cp "$s" "$t"; then
+    log "FATAL: install_file: cp $s -> $t FAILED (the cause is the cp line above) — $d was left as it was"
+    rm -f "$t" 2>/dev/null || true
+    return 1
+  fi
+  # The source's mode arrives with the copy (above). This is the bit whose loss is silent and fatal.
+  if is_program "$d" && [ ! -x "$t" ] && ! chmod +x "$t" 2>/dev/null; then
+    log "FATAL: install_file: cannot set the executable bit on $t — this box EXECS $d, so it would deploy unrunnable"
+    rm -f "$t" 2>/dev/null || true
+    return 1
+  fi
+  if ! mv -f "$t" "$d"; then
+    log "FATAL: install_file: mv $t -> $d FAILED — $d was left as it was"
+    rm -f "$t" 2>/dev/null || true
+    return 1
+  fi
+  # THE VERIFICATION, ON THE INSTALLED OBJECT, AFTER THE RENAME (#4003's acceptance criterion 1).
+  if is_program "$d" && [ ! -x "$d" ]; then
+    log "FATAL: install_file: $d is INSTALLED but NOT EXECUTABLE (mode $(mode_str "$d")) — a consumer that execs it stands down SILENTLY, which is the #4003 class. Remedy: chmod +x \"$d\"; and check whether the source is tracked 100644 in git (git update-index --chmod=+x <path>)."
+    return 1
+  fi
+  return 0
 }
 
 log "=== deploy Mac orchestrator: $SRC_REF -> $O (phase $PHASE) ==="
@@ -301,11 +391,11 @@ fi
 # The Mac's own drift is visible instead: `check-deployed-drift.sh` grades $O against the ref, and
 # `bin/harness doctor` names the deployed kind, so a runtime-only difference is REPORTED rather than
 # quietly preserved by a comment that no longer holds.
-for f in "$H"/*; do
-  b="$(basename "$f")"
-  [ "$b" = "orch-loop.sh" ] && continue
-  if [ -d "$f" ]; then cp -R "$f" "$O/"; else install_file "$f" "$O/$b"; fi
-done
+# ⛔ A PER-FILE FAILURE IS A FAILED DEPLOY, NOT A WARNING (#4003).
+if ! install_phase_a "$H" "$O"; then
+  log "FATAL: phase A: $INST_FAIL entry/entries did NOT land (each is named above) — the runtime at $O is NOT $SRC_REF"
+  rm -rf "$STAGE"; exit 1
+fi
 log "phase A: copied $(ls "$H" | grep -vc '^orch-loop.sh$') entries"
 # ⛔ THE LIBRARY THE FLAT DEPLOY NEEDS, INTO THE PATH install.sh PROBES (review P1, agent-infra#3146).
 # install.sh resolves two layouts: `../lib` from a checkout, and `./lib` BESIDE ITSELF on the deployed
@@ -316,7 +406,8 @@ log "phase A: copied $(ls "$H" | grep -vc '^orch-loop.sh$') entries"
 # a FATAL: the installer then takes its NAMED "report unavailable" branch, which is loud.
 if [ -f "$STAGE/scripts/lib/lane-ceiling.sh" ]; then
   mkdir -p "$O/lib"
-  install_file "$STAGE/scripts/lib/lane-ceiling.sh" "$O/lib/lane-ceiling.sh"
+  install_file "$STAGE/scripts/lib/lane-ceiling.sh" "$O/lib/lane-ceiling.sh" \
+    || { log "FATAL: phase A: $O/lib/lane-ceiling.sh did NOT land"; rm -rf "$STAGE"; exit 1; }
   cmp -s "$STAGE/scripts/lib/lane-ceiling.sh" "$O/lib/lane-ceiling.sh" \
     || { log "FATAL: $O/lib/lane-ceiling.sh differs from $SRC_REF"; exit 1; }
   log "phase A: staged $O/lib/lane-ceiling.sh (the path install.sh probes on the flat layout)"
@@ -351,7 +442,8 @@ if [ "$WAIT" = "1" ]; then
 fi
 
 # ---- 4. Phase B: swap orch-loop.sh (atomic), restart, verify ---------------------------
-install_file "$H/orch-loop.sh" "$O/orch-loop.sh"
+install_file "$H/orch-loop.sh" "$O/orch-loop.sh" \
+  || { log "FATAL: phase B: orch-loop.sh did NOT land — refusing to restart a controller on a half-deployed tree"; rm -rf "$STAGE"; exit 1; }
 log "phase B: orch-loop.sh replaced (atomic rename; inode now $(ls -i "$O/orch-loop.sh" | awk '{print $1}'))"
 
 OLDPID="$(lock_pid)"
@@ -468,7 +560,15 @@ done
 [ -n "$DEPLOY_PATH" ] || DEPLOY_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 log "relaunch PATH: $DEPLOY_PATH"
 cd "$HOME" || exit 1
-PATH="$DEPLOY_PATH" \
+# ⛔ `O` MUST REACH THE CHILD (agent-infra#2095). It was never exported: the default `O` happened to
+# work because the loop resolved `$HOME/orchestrator`, which is also where this script put the scripts —
+# so `_HERE_RS == $HOME/orchestrator == production`, the copy "lives in production", and nothing showed
+# the gap. With the documented `O=<dir> bash deploy-mac-orchestrator.sh` override the child sees NO `O`,
+# resolves its state dir as `derived:isolated(<dir>)`, takes its lock under $TMPDIR, and this script's
+# OWN verification then fails ("no controller holds $O/.orch.lock after the restart", exit 1) while the
+# isolated controller it launched keeps running under nohup — a failed deploy plus an unsupervised
+# controller. One word, and `deploy-crossbox.sh:179` already passes `O=` into its invocation the same way.
+O="$O" PATH="$DEPLOY_PATH" \
   nohup bash "$O/orch-loop.sh" >> "$O/logs/nohup.out" 2>&1 &
 sleep 8
 

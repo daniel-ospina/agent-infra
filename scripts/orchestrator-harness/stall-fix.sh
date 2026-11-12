@@ -28,6 +28,9 @@
 set -uo pipefail
 
 O="${O:-$HOME/orchestrator}"
+# ⛔ THE WORK ROOT (#2095, review of #3846, P1): the controller exports `O` = its STATE dir and `O_WORK`
+# = the harness root, where the dispatcher this file execs actually lives.
+_SF_WORK="${O_WORK:-$O}"
 SEEN="${1:-}"                       # the pass's stall counter (_dpass), from the loop
 EVERY="${DRAIN_STALL_FIX_EVERY:-3}"
 TIMEOUT="${DRAIN_STALL_FIX_TIMEOUT:-1800}"
@@ -170,9 +173,22 @@ if [ "$(( SEEN % EVERY ))" -ne 0 ]; then
   exit 0
 fi
 
-DISP="$O/nonblocking-dispatch.sh"
+DISP="${_SF_WORK:-$O}/nonblocking-dispatch.sh"
+# ⛔ ABSENT AND PRESENT-BUT-NOT-EXECUTABLE ARE DIFFERENT FAULTS WITH DIFFERENT REMEDIES (#4003).
+# The single `[ ! -x ]` line said "no executable $DISP" for BOTH, so the measured failure — the file
+# THERE, 36,175 bytes, mode `-rw-r--r--`, a deployment that had lost the bit — read as a configuration
+# note rather than as a failure, and the dispatch path stayed dead for as long as the bit was missing.
+# Name the state, and name the remedy: a consumer that cannot tell "not installed" from "installed but
+# unrunnable" sends the operator to the wrong fix.
+if [ ! -e "$DISP" ]; then
+  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH ($DISP is ABSENT — nothing is installed at that path) — remedy: redeploy the harness (bash scripts/deploy-mac-orchestrator.sh, or the cell's pin refresh). The stall line is the only trace"
+  exit 0
+fi
 if [ ! -x "$DISP" ]; then
-  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no executable $DISP) — the stall line is the only trace"
+  # The mode is read through `ls -l` because a `stat` invocation differs between GNU and BSD and this
+  # line must render on both. It is evidence, not a predicate — `[ -x ]` above is the predicate.
+  _dm="$(ls -l "$DISP" 2>/dev/null | cut -c1-10)"
+  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH ($DISP EXISTS but is NOT EXECUTABLE — mode ${_dm:-unreadable}) — this script EXECS it directly, so a missing 'x' bit disarms the dispatch path SILENTLY. Remedy: chmod +x \"$DISP\"; and if the repo's copy is tracked 100644, fix it there too (git update-index --chmod=+x <path>), or the next deploy re-creates the fault. The stall line is the only trace"
   exit 0
 fi
 

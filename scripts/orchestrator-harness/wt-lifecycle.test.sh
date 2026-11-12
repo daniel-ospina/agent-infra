@@ -484,6 +484,201 @@ assert_contains "$OUT" "rc=1" "L5d a checkout on ANOTHER branch is preserved"
 assert_contains "$OUT" "feat/other-17" "L5d the reason names the branch it is actually on"
 assert_dir "$REPO/.worktrees/tm-17" "L5d the checkout survives"
 
+# ── L5e: a cwd-ONLY holder keeps the checkout where `lsof` is absent (#2744) ─────────────────
+# ⛔ THE DEFECT. The cwd witness used to be `lsof`-only, and an absent `lsof` returned "no holder" — so
+# on a slim Linux image the one process shape #2744 is about (`pi` sitting in the checkout with a cwd
+# inside it and a command line that never names the path) was INVISIBLE, and the dispatcher's take-back
+# deleted the live lane's tree with no error. The reaper on the same box, in the same minute, classified
+# the same path `preserve reason=live-cwd`, because IT reads `/proc/<pid>/cwd`. The predicate already
+# existed; the dispatch path did not apply it.
+# ⛔ THE TABLE IS A FIXTURE, NOT THIS HOST. `WT_PROC_ROOT` points the arm at a directory of
+# `<pid>/cwd` symlinks and `WT_LSOF` at a binary that does not exist, so the arm states the same thing
+# on macOS (no /proc) as on Linux and measures no real process on the runner.
+ENV=L5e; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"
+in_wt "wt_provision '$REPO' .worktrees/tm-18 feat/18-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "$REPO/.worktrees/tm-18" "$FAKE/4242/cwd"   # pid 4242's cwd IS the checkout
+ln -sfn "$FAKE" "$FAKE/self/cwd"                     # the arm is only taken where `self/cwd` is a link
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE'; WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-18' feat/18-tm 'lane 18'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5e with no lsof, a /proc cwd-only holder still preserves the checkout"
+assert_contains "$OUT" "pid 4242" "L5e and names the pid that holds it"
+assert_contains "$OUT" "cwd-inside-the-worktree" "L5e …by the cwd witness, not by argv"
+assert_dir "$REPO/.worktrees/tm-18" "L5e the live checkout survives (#2744)"
+assert_branch "$REPO" feat/18-tm "L5e and so does its branch"
+
+# ── L5e2: the same fixture, row names a DIFFERENT path → still reaps (non-vacuity) ──────────────
+# Without this the arm above would pass for a "any row at all blocks the reap" bug, which would make
+# every checkout on the box unreapable the moment one process existed.
+ENV=L5e2; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"
+in_wt "wt_provision '$REPO' .worktrees/tm-19 feat/19-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "/some/other/tree" "$FAKE/4242/cwd"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE'; WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-19' feat/19-tm 'lane 19'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=0" "L5e2 a cwd row OUTSIDE the checkout does not block the reap"
+assert_nodir "$REPO/.worktrees/tm-19" "L5e2 the empty checkout is reaped"
+
+# ── L5f: with NEITHER witness available the verdict must SAY so ───────────────────────────────
+# The degraded tolerance is deliberate (refusing for ever would keep every worktree), but a reap that
+# proceeded without the witness that catches #2744 must not read as a clean bill of health: the line is
+# the only record, and `dispatch-merge.sh` prints `WT_RESULT` straight into the dispatch log.
+ENV=L5f; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-20 feat/20-tm origin/main" "$REPO" >/dev/null
+OUT="$(in_wt "WT_PROC_ROOT='$T/$ENV/no-such-proc'; WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$REPO/.worktrees/tm-20' feat/20-tm 'lane 20'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=0" "L5f with no /proc and no lsof the empty checkout is still reaped"
+assert_contains "$OUT" "cwd witness is UNAVAILABLE" "L5f …and the verdict discloses that one witness never ran"
+assert_contains "$OUT" "#2744" "L5f …naming what that gap would have missed"
+
+# ── L5g: the ambient `QUOTING_STYLE` cannot disarm the census (#2744 review, P1 MEASURED) ──────
+# ⛔ THE DEFECT (reproduced before this arm existed, on this fixture shape). `ls` quotes names
+# according to the AMBIENT `QUOTING_STYLE` environment variable, and both useful styles defeated the
+# parse in opposite directions — which is why one arm cannot pin it:
+#   `c`      wraps the link name AND the target, so NO row is produced → the census reads as "no
+#            witness" → the caller reaps. Measured: rc=0, `WT_RESULT=reaped …`, directory GONE,
+#            holder pid still alive.
+#   `escape` produces a row whose target reads `…/re\ po\ wt` — PRESENT, but it can never equal the
+#            checkout path, so it silently matches nothing and the reap carries NO disclosure at all.
+# The checkout path therefore carries a SPACE: that is the input which makes quoting visible, and
+# without it both styles would produce the same bytes as the literal style. An ambient env var must
+# not be able to disarm a gate (the `bypass by ambient env` class), so the census forces the style.
+ENV=L5g; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"; WTP="$REPO/.worktrees/re po wt"
+in_wt "wt_provision '$REPO' '.worktrees/re po wt' feat/18-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "$WTP" "$FAKE/4242/cwd"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+OUT="$(in_wt "export QUOTING_STYLE=c WT_PROC_ROOT='$FAKE' WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$WTP' feat/18-tm 'lane 18'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5g QUOTING_STYLE=c cannot make the census unreadable"
+assert_contains "$OUT" "pid 4242" "L5g …the cwd holder is still named, by pid"
+assert_dir "$WTP" "L5g the live checkout survives an ambient QUOTING_STYLE (#2744)"
+OUT="$(in_wt "export QUOTING_STYLE=escape WT_PROC_ROOT='$FAKE' WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$WTP' feat/18-tm 'lane 18'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5g2 QUOTING_STYLE=escape cannot turn the row into a path that never matches"
+assert_contains "$OUT" "pid 4242" "L5g2 …the cwd holder is still named, by pid"
+assert_dir "$WTP" "L5g2 the live checkout survives an escaped target (#2744)"
+
+# ── L5h: a census that RUNS but yields nothing usable is FAIL-CLOSED, not "unavailable" ──
+# ⛔ THE DEFECT (P1 MEASURED). "No witness on this host" (tolerated, disclosed, reap proceeds) and
+# "this witness ran and its output cannot be trusted" were collapsed into one return code, so any
+# unparsable census licensed a deletion. The two facts are now different codes, and this arm pins the
+# one that deletes work if it is wrong: the probe produced bytes and NOT ONE usable row.
+ENV=L5h; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"; WTP="$REPO/.worktrees/tm-21"
+GARBAGE="$T/$ENV/garbage-ls"
+in_wt "wt_provision '$REPO' .worktrees/tm-21 feat/21-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "$WTP" "$FAKE/4242/cwd"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+printf '#!/bin/sh\necho "total 0"\necho "not a table at all"\n' >"$GARBAGE"; chmod +x "$GARBAGE"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE' WT_LS='$GARBAGE' WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$WTP' feat/21-tm 'lane 21'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5h an unparsable census PRESERVES the checkout (fail-closed, not 'unavailable')"
+assert_contains "$OUT" "cwd census produced nothing usable" "L5h …and the verdict names the census, not a generic phrase"
+assert_dir "$WTP" "L5h the live checkout survives an unparsable census (#2744 review)"
+assert_branch "$REPO" feat/21-tm "L5h …and so does its branch"
+
+# ── L5i: a census the WATCHDOG killed is fail-closed too ────────────────────────────────────────
+# ⛔ THE DEFECT (P2 MEASURED). `wt_run_bounded` DELETES the partial table on timeout, so an unchecked
+# rc read exactly like a successful scan that found nobody: measured rc 3 ("unavailable") and the
+# checkout was deleted while its holder was alive. A probe that never finished decided a deletion.
+# ⛔ AND THE lsof ARM MUST BE ABLE TO ANSWER, OR THIS ARM IS A SECOND ROUTE TO L5h (agent-infra#3442
+# rule 2 — a finding a fresh reviewer measured: with `WT_LSOF=/nonexistent-lsof` the fall-through
+# reaches the `saw` arm and returns the SAME 2 with the SAME verdict, so deleting the timeout check
+# left all three assertions GREEN). The fake lsof below answers with a valid table naming a path that
+# is NOT this checkout: now the timeout check is the ONLY thing between preserve and reap, so
+#   shipped -> wt_cwd_rows rc=2 (fail-closed veto) -> rc=1, checkout kept
+#   mutant  -> the lsof arm decides         -> rc=0 reaped, and `rc=1` + `assert_dir` both go RED
+ENV=L5i; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"; WTP="$REPO/.worktrees/tm-22"
+SLOWLS="$T/$ENV/slow-ls"; FAKELSOF="$T/$ENV/fake-lsof"
+in_wt "wt_provision '$REPO' .worktrees/tm-22 feat/22-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "$WTP" "$FAKE/4242/cwd"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+printf '#!/bin/sh\nsleep 5\nexec /bin/ls "$@"\n' >"$SLOWLS"; chmod +x "$SLOWLS"
+# A census that RUNS and SUCCEEDS, and names somebody else's tree — never this checkout.
+printf '#!/bin/sh\nprintf "p4242\\nn/somewhere/else\\n"\n' >"$FAKELSOF"; chmod +x "$FAKELSOF"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE' WT_LS='$SLOWLS' WT_LSOF='$FAKELSOF' WT_PROBE_SECONDS=1; wt_reap_if_empty '$REPO' '$WTP' feat/22-tm 'lane 22'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5i a census the watchdog killed PRESERVES the checkout"
+assert_contains "$OUT" "could not be evaluated" "L5i …and says the probe could not be evaluated"
+assert_dir "$WTP" "L5i the live checkout survives a timed-out census (#2744 review)"
+
+# ── L5j: the lsof arm's `-Fpn` pairing, and the `(deleted)` strip, are covered at all ──────
+# Neither was exercised by any arm before this one (#2744 review, finding 6): the lsof fallback is
+# what runs on macOS and in a container with no /proc, and the ` (deleted)` suffix is what a process
+# whose checkout was already removed still reports — the shape that must stay BLOCKING.
+ENV=L5j; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"; WTP="$REPO/.worktrees/tm-23"
+FAKELSOF="$T/$ENV/fake-lsof"
+in_wt "wt_provision '$REPO' .worktrees/tm-23 feat/23-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/self"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+printf '#!/bin/sh\nprintf "p4242\\nn%s\\np9999\\nn/somewhere/else\\n"\n' "$WTP" >"$FAKELSOF"; chmod +x "$FAKELSOF"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE' WT_LS=/nonexistent-ls WT_LSOF='$FAKELSOF'; wt_reap_if_empty '$REPO' '$WTP' feat/23-tm 'lane 23'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5j the lsof -Fpn fallback sees a holder inside the checkout"
+assert_contains "$OUT" "pid 4242" "L5j …and names it (p/n rows paired correctly)"
+assert_contains "$OUT" "cwd-inside-the-worktree" "L5j …by the cwd witness"
+assert_dir "$WTP" "L5j the live checkout survives the lsof arm"
+
+# ── L5k: ` (deleted)` is STRIPPED, so an already-removed-then-recreated path still blocks ──────
+ENV=L5k; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"; WTP="$REPO/.worktrees/tm-24"
+in_wt "wt_provision '$REPO' .worktrees/tm-24 feat/24-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "$WTP (deleted)" "$FAKE/4242/cwd"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE' WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$WTP' feat/24-tm 'lane 24'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5k a ' (deleted)' target still names the checkout and blocks the reap"
+assert_contains "$OUT" "pid 4242" "L5k …naming the pid"
+assert_dir "$WTP" "L5k the checkout survives"
+
+# ── L5l: an UNREADABLE row (another uid) must not throw the readable rows away ────────────────
+# `ls -l /proc/[0-9]*/cwd` exits 2 on any shared box while listing every link it could read, and an
+# unreadable link prints no ` -> ` at all. The holder must still be found in the same table.
+ENV=L5l; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"; WTP="$REPO/.worktrees/tm-25"
+MIXEDLS="$T/$ENV/mixed-ls"
+in_wt "wt_provision '$REPO' .worktrees/tm-25 feat/25-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/self"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+printf '#!/bin/sh\nprintf "lrwxrwxrwx 1 root root 0 Nov 10 20:00 %s/1111/cwd\\nlrwxrwxrwx 1 root root 0 Nov 10 20:00 %s/4242/cwd -> %s\\n"\nexit 2\n' "$FAKE" "$FAKE" "$WTP" >"$MIXEDLS"; chmod +x "$MIXEDLS"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE' WT_LS='$MIXEDLS' WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$WTP' feat/25-tm 'lane 25'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5l a partial census (rc=2 from ls) still finds the holder it could read"
+assert_contains "$OUT" "pid 4242" "L5l …and names it"
+assert_dir "$WTP" "L5l the live checkout survives"
+
+# ── L5m: a HALF-RUN probe that PRESERVES must disclose it too ─────────────────────────────────
+# The disclosure used to ride only the REAP verdict, so exactly the paths an operator reads when a
+# checkout will not go away were the ones that said nothing about the missing witness (#2744 review P3).
+ENV=L5m; REPO="$(mk_repo $ENV)"; WTP="$REPO/.worktrees/tm-26"
+in_wt "wt_provision '$REPO' .worktrees/tm-26 feat/26-tm origin/main" "$REPO" >/dev/null
+printf 'uncommitted\n' >"$WTP/scratch.txt"
+OUT="$(in_wt "WT_PROC_ROOT='$T/$ENV/no-such-proc' WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$WTP' feat/26-tm 'lane 26'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5m a dirty tree with no cwd witness is preserved"
+assert_contains "$OUT" "DIRTY" "L5m …for its own reason"
+assert_contains "$OUT" "cwd witness is UNAVAILABLE" "L5m …AND the preserve verdict discloses the missing witness"
+assert_contains "$OUT" "#2744" "L5m …naming what that gap would have missed"
+
+# ── L5n: a target that STILL reads quoted/escaped marks the census UNUSABLE, never "no holder" ──
+# ⛔ THIS PINS THE `bad` GUARD, WHICH HAD NO ARM AT ALL (#2744 review round 3, MEASURED). Every `ls`
+# shim in this suite emitted either LITERAL or wholly UNPARSABLE output, so the `bad` file was never
+# populated by any arm and this line could be deleted with the whole suite green:
+#
+#     if (t ~ /^["\047]/ || t ~ /\\ /) { print $0 >> bad; next }
+#
+# That is the quietest fail-open there is: the row is PRESENT but can never equal `$path`, so it reads
+# as "no holder", with no disclosure, and the reap proceeds. It is also what makes the busybox/BSD
+# retry (an `ls` that ignores `--quoting-style`) sound — on such a build THIS is the only thing between
+# a quoted target and a silent deletion, so one arm covers both.
+# The checkout path deliberately CONTAINS A SPACE: that is the shape an escaping `ls` turns into
+# `re\ po\ wt`, a path which can never match.
+ENV=L5n; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"; WTP="$REPO/.worktrees/re po wt"
+QUOTELS="$T/$ENV/quoting-ls"
+in_wt "wt_provision '$REPO' '.worktrees/re po wt' feat/18-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "$WTP" "$FAKE/4242/cwd"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+# An `ls` that escapes the target WHATEVER option it is handed — the residue case the `bad` guard owns.
+printf '#!/bin/sh\nprintf "lrwxrwxrwx 1 root root 0 Nov 10 20:00 %%s/4242/cwd -> %%s\\n" "%s" "%s"\n' \
+  "$FAKE" "${WTP// /\\ }" >"$QUOTELS"
+chmod +x "$QUOTELS"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE' WT_LS='$QUOTELS' WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$WTP' feat/18-tm 'lane 18'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5n a still-quoted target PRESERVES the checkout"
+assert_contains "$OUT" "cwd census produced nothing usable" "L5n …as an UNUSABLE census, not 'no holder'"
+assert_dir "$WTP" "L5n the live checkout survives a quoting ls (#2744)"
+
 # ⛔ L6/L7 ALSO PIN `MAX_LOAD`, AND THAT IS THE SAME CLASS OF FIXTURE DEFECT (measured 2026-11-03 while
 # reviewing #3331). Both arms read "the lane REACHED its agent" from the ABSENCE of a land-backlog line,
 # so a LOAD refusal (75) — which the ambient load on a busy box produces, with no other symptom — reaps

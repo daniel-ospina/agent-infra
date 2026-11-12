@@ -3,8 +3,12 @@
 # (agent-infra #304).
 #
 # Renders templates/launchd/*.plist with machine env, diffs the rendered
-# output against the installed copy in ~/Library/LaunchAgents, and only
-# reloads (enable → bootout → bootstrap) on change. Byte-identical → skip.
+# output against the installed copy in ~/Library/LaunchAgents, and reloads
+# (enable → bootout → bootstrap) on change.
+# ⛔ "Byte-identical → skip" is a statement about the FILE, never about the JOB (#4008). A
+# byte-identical plist whose job is NOT in the domain is bootstrapped (the reload runs only when the
+# job is absent, so a healthy job is still never restarted), and every reload is read back with
+# `launchctl print` — `bootstrap` exiting 0 is launchd accepting the request, not the job running.
 # Converges any machine to the canonical scheduled state; safe to run on
 # every sync (this is the propagation trigger: a merged template bump applies
 # on the next run).
@@ -1410,6 +1414,32 @@ job_loaded() {
     launchctl print "$DOMAIN/$1" >/dev/null 2>&1
 }
 
+# ── reload_job: PUT THE JOB IN THE DOMAIN, then READ IT BACK ────────────────────────────────────
+# ⛔ `enable` COMES FIRST AND IS NOT DECORATION. A `launchctl disable` override is stored OUTSIDE the
+# plist and survives `bootout` AND `bootstrap` (launchctl(1): "a disabled service cannot be loaded in
+# that domain until re-enabled"), so a bare bootstrap on a box where anything ever disabled the label
+# fails for a reason that reads as a launchd fault. The reload path has always done this; #4008's new
+# path must too, or the fix would converge every box except the one that needs it.
+# ⛔ `bootout` IS TOLERATED ON FAILURE because a job that was never loaded exits nonzero — but it is
+# still issued, so `bootstrap` always starts from a free slot rather than racing an existing job.
+# ⛔ AND THE READ-BACK IS THE POINT: `bootstrap` exiting 0 is launchd ACCEPTING the request, not the
+# job being in the domain. Reading `job_loaded` back is what makes "installed + loaded" a measurement
+# instead of an assumption — the #4008 probe in install_job depends on it.
+reload_job() { # <label> <installed-plist>; 0 = loaded (read back), 1 = not
+    local label="$1" installed="$2"
+    launchctl enable "$DOMAIN/$label" 2>/dev/null || true
+    launchctl bootout "$DOMAIN" "$installed" 2>/dev/null || true
+    if ! launchctl bootstrap "$DOMAIN" "$installed"; then
+        echo "  FAIL $label: launchctl bootstrap exited nonzero — see 'launchctl print $DOMAIN/$label'" >&2
+        return 1
+    fi
+    if ! job_loaded "$label"; then
+        echo "  FAIL $label: launchctl bootstrap exited 0, but 'launchctl print $DOMAIN/$label' does not list the job — it is STILL NOT LOADED and will never run" >&2
+        return 1
+    fi
+    return 0
+}
+
 install_job() {
     local template="$1" label installed rendered tmp left ph unset_ph=""
     label="$(job_label "$template")"
@@ -1482,21 +1512,40 @@ install_job() {
         return 1
     fi
 
+    # ⛔ BYTE-IDENTICAL IS NOT CONVERGED — THE FILE IS NOT THE JOB (agent-infra#4008).
+    # This branch used to return 0 on `cmp -s` ALONE, so the installer converged the FILE and never
+    # asked whether the job was IN THE DOMAIN. The two are independent: `launchctl bootout` removes a
+    # job from its domain and LEAVES THE PLIST FILE IN PLACE (launchctl(1) — measured), a `disable`
+    # override survives both, and a bootstrap that failed after an earlier bootout leaves exactly this
+    # shape. So `~/Library/LaunchAgents/com.eldato.worker-supply.plist` existed,
+    # `launchctl list | grep -c worker-supply` printed 0, and every run of this installer answered
+    # "unchanged (skip)" — forever. Not one install verb in the repo could bring that job back, while
+    # BOTH readers (`status_job` below, and `fleet-schedule.py --verify`) named it "not loaded": the
+    # box was diagnosed correctly and repaired by nothing, which is #4008's measured state exactly.
+    # ⛔ THE LINUX HALF ALREADY LEARNED THIS AND THE MAC HALF DID NOT. `install-worker-supply.sh`'s
+    # byte-identical branch says: "the read-back still runs, because 'unchanged file + not running' is
+    # a real state that must not read as healthy" — and then starts the unit. Same capability, same
+    # convergence contract, one backend missing the read-back. This closes that asymmetry rather than
+    # inventing a rule: the no-churn property (a healthy job is NOT restarted on every sync) survives
+    # untouched, because the reload only happens when the job is absent from the domain.
     if [ -f "$installed" ] && cmp -s "$installed" "$tmp"; then
         rm -f "$tmp"
-        echo "  $label: unchanged (skip)"
+        if job_loaded "$label"; then
+            echo "  $label: unchanged (skip)"
+            return 0
+        fi
+        echo "  $label: unchanged on disk but NOT LOADED — bootstrapping it (a booted-out job keeps its plist)"
+        if ! reload_job "$label" "$installed"; then
+            return 1
+        fi
+        echo "  $label: reloaded + loaded (v$(version_of "$template" || echo unknown))"
         return 0
     fi
 
     mkdir -p "$AGENTS_DIR"
     mv "$tmp" "$installed"
-    # Clear any disabled override, then reload. bootout is tolerated (a job
-    # that was never loaded exits nonzero — fine). bootstrap must succeed.
-    launchctl enable "$DOMAIN/$label" 2>/dev/null || true
-    launchctl bootout "$DOMAIN" "$installed" 2>/dev/null || true
-    if ! launchctl bootstrap "$DOMAIN" "$installed"; then
+    if ! reload_job "$label" "$installed"; then
         rm -f "$installed"   # nothing half-installed
-        echo "  FAIL $label: launchctl bootstrap exited nonzero — see 'launchctl print $DOMAIN/$label'" >&2
         return 1
     fi
     echo "  $label: installed + loaded (v$(version_of "$template" || echo unknown))"
@@ -1547,7 +1596,19 @@ uninstall_job() {
 # (#427/#431). The installer unloads + removes retired jobs on machines that
 # installed them pre-retirement (the template loop only manages PRESENT
 # templates, so a removed template would otherwise strand installed jobs
-# forever). A retired label must NOT also have a *.plist template.
+# forever).
+#
+# ⛔ A LABEL HERE RETIRES THE JOB EVEN WHEN ITS TEMPLATE IS STILL PRESENT, AND
+# THAT IS DELIBERATE (#2908). The installer used to ERROR and exit 1 on the
+# conflict, which on a cell meant one stale manifest line disarmed the WHOLE
+# scheduled layer — no reaping, no liveness detection, no canary (measured
+# 2026-10-27: `FATAL: the scheduled layer would not start (rc=1)` on cells 3
+# and 4). Retirement is the operator's stated intent and the only statement a
+# MACHINE can honour, so it wins: the job is skipped and any installed copy is
+# unloaded + removed. The contradiction is a REPO authoring error and is refused
+# where it is authored instead — `scripts/fleet-schedule.py --check`, which
+# exits 1 for every label listed here that still has a template. Both backends
+# follow that split: the declaration gate refuses, the machine honours.
 retired_labels() {
     local manifest="$TEMPLATES_DIR/RETIRED" label
     [ -f "$manifest" ] || return 0
@@ -1578,17 +1639,23 @@ retire_job() { # $1 = label; unload + remove when installed (silent when gone)
 
 # Unload retired jobs in both flows: the --uninstall path and the idempotent
 # install path (so a merged retirement propagates on the next sync).
+#
+# ⛔ A TEMPLATE THAT STILL EXISTS IS A WARNING, NOT A LAYER-WIDE REFUSAL (#2908). This used to
+# `rc=1` — and every caller propagates that, so a single contradictory line in RETIRED took the
+# ENTIRE layer down on the machine that needed it (the #2908 cells ran with no reaper, no liveness
+# detection and no canary). The manifest is the operator's stated intent, so it is honoured: warn,
+# unload + remove, let the template loop skip the job. The authoring error is refused by the
+# repo's own declaration gate — `fleet-schedule.py --check` exits 1 for exactly this state — which
+# is the same split the Linux runtime makes.
 retire_pass() {
-    local label rc=0
+    local label
     for label in $(retired_labels); do
         if [ -f "$TEMPLATES_DIR/$label.plist" ]; then
-            echo "ERROR: $label is in RETIRED but a template still exists — remove one or the other" >&2
-            rc=1
-            continue
+            echo "WARN: $label is in RETIRED but a template still exists — retiring it anyway (the manifest wins); remove the template in the repo to clear this" >&2
         fi
         retire_job "$label"
     done
-    return "$rc"
+    return 0
 }
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
@@ -1644,6 +1711,26 @@ if [ "${1:-}" = "--status" ]; then
     echo "=== agent-infra launchd status (templates: $TEMPLATES_DIR) ==="
     for template in "$TEMPLATES_DIR"/*.plist; do
         [ -f "$template" ] || continue
+        # ⛔ A RETIRED LABEL IS A NAMED STATE, NEVER AN ABSENCE (#2908 review, P1). A retired job is
+        # DELIBERATELY never installed, so handing it to status_job printed "NOT INSTALLED" — and
+        # `fleet-schedule.py --verify` on macOS turns every NOT INSTALLED line into FAIL
+        # `SCHEDULE NOT VERIFIED`, rc 1. So the one-line manifest edit this PR advertises
+        # (templates/launchd/RETIRED:12-14, "an operator action on ONE file") started the layer and
+        # then had its own gate report it broken: the #3029 false-FAIL class, closed on Linux and
+        # left standing on the other backend. The comparable (systemd `mask`) names the retirement
+        # as a state (`masked`) rather than reporting the unit absent, and so does this.
+        # The installed-copy arm stays a FAILURE on purpose: the manifest says retired, so a copy
+        # still on disk is DRIFT from the declaration — a false PASS here would be worse than the
+        # false FAIL being closed, and `--install` is what clears it (retire_pass unloads + removes).
+        label="$(job_label "$template")"
+        if is_retired "$label"; then
+            if [ -f "$AGENTS_DIR/$label.plist" ]; then
+                echo "  $label: RETIRED (manifest wins) — DRIFTED: an installed copy survives; re-run the installer to unload + remove it"
+            else
+                echo "  $label: RETIRED (manifest wins — template present; remove the template in the repo)"
+            fi
+            continue
+        fi
         status_job "$template"
     done
     if [ -n "$(retired_labels)" ]; then
@@ -1719,7 +1806,8 @@ retire_pass || fail=1
 for template in "$TEMPLATES_DIR"/*.plist; do
     [ -f "$template" ] || continue
     if is_retired "$(basename "$template" .plist)"; then
-        # retire_pass already ERRORED above (fail=1) — don't ALSO install it.
+        # retire_pass has already warned + unloaded above when the two files contradict; either
+        # way a retired label is never installed (#2908 — the manifest wins on a machine).
         echo "  $(basename "$template" .plist): skipped (in RETIRED — remove the template)" >&2
         continue
     fi

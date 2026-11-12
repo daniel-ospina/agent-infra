@@ -40,7 +40,14 @@
 #   open-pr                 G5a  (branch is an open PR head => PRESERVE)
 #   gh-unavailable          G5c  (=> exit 3, dry AND armed)
 #   no-github-remote        G5d  (PR gate N/A => still reclaims)
-#   too-recent              G6a  (HEAD < aged-days => PRESERVE)
+#   too-recent              G6a  (RULE D: a clean, holder-free, no-open-PR checkout is DISPOSABLE —
+#                                floor REAP_WT_DISPOSABLE_AGE_MINUTES, 12 h; G6a2/G6a3 pin the
+#                                cooldown direction and the `=0` restore, G6a4 pins that a floor already
+#                                at 0 STAYS 0, G6d2/N5a pin that a merged/patch-equivalent head keeps
+#                                its own floor, G6w2 pins that the clean gate still outranks it)
+#   ⛔ dirty is never collected G6w  (76d old, past every floor, held by the clean gate alone; G6w2 is
+#                                the row RULE D can actually reach — 2d, inside the 7d window and past
+#                                the 12h cooldown — and the `no-clean-gate` mutant reclaims it)
 #   aged / branch-retained  G6b  (unmerged named branch => REMOVE,
 #                                refs=branch-retained, ref survives)
 #   aged boundary           G6c  (strict > at 7d, 7d+1s, 7d+2s)
@@ -244,6 +251,7 @@ ep() { python3 -c 'import datetime,sys;print(int(datetime.datetime.fromisoformat
 NOW="$(ep 2026-09-15T20:00:00+00:00)"
 OLD_DATE="2026-07-01T12:00:00+00:00"     # 76 days before NOW
 RECENT_DATE="2026-09-13T12:00:00+00:00"  # 2 days before NOW
+TWO_HOURS_DATE="2026-09-15T18:00:00+00:00" # 2 hours before NOW — inside a 12 h cooldown, past rule 7's 45 min
 
 # ── shims ──────────────────────────────────────────────────────────────
 mkdir -p "$T/bin"
@@ -793,6 +801,7 @@ run_reaper() {
     REAP_WT_MERGED_AGE_DAYS="${REAP_WT_MERGED_AGE_DAYS_OVERRIDE:-0}" \
     REAP_WT_SCRATCH_AGE_DAYS="${REAP_WT_SCRATCH_AGE_DAYS_OVERRIDE:-1}" \
     REAP_WT_SCRATCH_GLOB="${REAP_WT_SCRATCH_GLOB_OVERRIDE:-wt-*|cell-wt-*}" \
+    REAP_WT_DISPOSABLE_AGE_MINUTES="${REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE:-0}" \
     REAP_WT_MAX_DAYS=1000000 \
     REAP_WT_MAIN_REF="${REAP_WT_MAIN_REF_OVERRIDE:-}" \
     TAR_BIN="${TAR_BIN_OVERRIDE:-tar}" \
@@ -838,6 +847,8 @@ run_reaper() {
     FAKE_GH_PRS="${FAKE_GH_PRS:-}" \
     REAP_WT_MAIN_PROOF="local" \
     REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES_OVERRIDE:-45}" \
+    REAP_WT_GHOST_AGE_HOURS="${REAP_WT_GHOST_AGE_HOURS_OVERRIDE:-2}" \
+    REAP_WT_WIP_AGE_HOURS="${REAP_WT_WIP_AGE_HOURS_OVERRIDE:-24}" \
     REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-}" \
     CELL_HOME="${CELL_HOME_OVERRIDE:-}" \
     HARNESS_PIN_FILE="${HARNESS_PIN_FILE_OVERRIDE:-}" \
@@ -930,9 +941,15 @@ ANCHORS = {
     # so the row falls through to the rules and a merged row is RECLAIMED. That is
     # "cannot read the register" being read as "the register is clear" (fail-open),
     # and before M5 no fixture executed this arm, so the edit kept the suite green.
+    # ⛔ THE ANCHOR IS THE CASE LABEL ALONE (PR #3881 review round 3). It used to span the label AND
+    # the next printf line, so adding a comment between them made it match ZERO times — and a mutant
+    # that matched nothing left M5 asserting a switch no mutation had flipped. The label occurs ONCE
+    # in the file, and renaming it is what the mutation MEANS: the case no longer matches, so
+    # "cannot read the register" falls through to "the register is clear". (No apostrophes here: this
+    # block is a single-quoted python -c argument — see the warning on the ANCHORS header.)
     "no-stash-unverifiable-arm": (
-        "        unreadable)\n            printf \x27preserve\\tstranded-stash-unverifiable",
-        "        __mutant_arm_removed__)\n            printf \x27preserve\\tstranded-stash-unverifiable",
+        "        unreadable)",
+        "        __mutant_arm_removed__)",
     ),
     # the ROTATION cursor per-repo key: drop the REPO_CANON component, i.e. return
     # to the repo-agnostic filename the ⛔ comment in the script says was a real
@@ -1101,6 +1118,51 @@ ANCHORS = {
     "no-record-unreadable-notfile": (
         " || [ ! -f \"$rec\" ]",
         " || false",
+    ),
+    # (9) DELETE THE STALLED COLLECTOR (#2179). The token is emitted inside `classify_one`, which runs
+    # in a COMMAND SUBSTITUTION, so the parent s `case` is the only thing that turns it into the review
+    # list — every row stays byte-identical on its detail and the list empties. That is exactly the
+    # silent-preserve defect #2179 exists to remove, so A29a must red under this mutant while A29-MUT
+    # proves the row itself still carries the token (i.e. the mutation is on the COLLECTOR, not the
+    # emitter). ⛔ NO APOSTROPHES IN THIS BLOCK (single-quoted `python3 -c` argument).
+    "stall-collector": (
+        "*\"stalled=1 class=\"*)",
+        "*\"stalled=1 class=-never\"*)",
+    ),
+    # (10) DROP THE INTERRUPTED-ADD CLASS TOKEN (#2179 review round 7). That arm was the ONE
+    # 0-commits-ahead lane arm that neither released nor listed a withheld record, so this mutation IS
+    # the pre-fix code: the token argument the caller supplies is removed and a durable stash entry strands the
+    # record silently (`stalled=0` on a pass that kept the issue un-dispatchable). ⛔ THE ANCHOR IS THE
+    # CALL WITH ITS TOKEN ARGUMENT, never the bare call — the bare form ALSO appears at the aged
+    # rule site, so it matches 2 times and this registry exits 9 on anything but exactly 1 (which is
+    # the point: a re-spelling reddens A29p-MUT instead of silently skipping it). ⛔ NO APOSTROPHES IN
+    # THIS BLOCK (single-quoted `python3 -c` argument).
+    "no-interrupted-add-token": (
+        "        abstain_gate \"$path\" \"$branch\" \"$refs\" 0 \"$_ia_st\" && return 0",
+        "        abstain_gate \"$path\" \"$branch\" \"$refs\" 0 && return 0   # MUTANT: the class token is dropped",
+    ),
+    # (11) LOOSEN THE refs=merged CARVE-OUT (#2179 review round 8). Round 7 gated the interrupted-add
+    # token on `[ "$refs" = merged ]` precisely because that arm ALSO admits `branch-retained:*`,
+    # whose branch still HOLDS commits and is therefore not 0-ahead residue. The positive half was
+    # pinned (dropping the block reds A29p), the NEGATIVE half was not: A29p/A29q are both 0-ahead,
+    # so loosening the comparison published a commit-holding record as residue and left the suite
+    # GREEN. The mutant widens the test to any surviving ref; A29r is the commit-holding fixture and
+    # A29r-MUT drives this anchor. ⛔ THE ANCHOR IS THE COMPARISON LINE, which occurs exactly once
+    # (the bare `abstain_gate` form at the aged rule site does not contain it).
+    "branch-retained-no-token": (
+        "[ \"$refs\" = merged ] && is_lane_branch \"$branch\"; then",
+        "[ \"$refs\" != \"\" ] && is_lane_branch \"$branch\"; then   # MUTANT: the 0-ahead carve-out is loosened",
+    ),
+    # (12) DROP THE INTERRUPTED-ADD ARM LANE GATE (#2179 review round 9). That arm is entered from
+    # `init_lock_age` alone, so it was the ONE emitter with no `is_lane_branch` test — while the list
+    # header scopes itself to "0-commits-ahead LANE residue" and the legend says each row names "the
+    # ISSUE its branch holds out of dispatch". Without the gate any `topic/…` checkout whose stash
+    # register names it was published as lane residue. A29v is the non-lane fixture; this mutant
+    # is the pre-fix spelling. ⛔ THE ANCHOR IS THE WHOLE CONDITION (it occurs exactly once, and the
+    # bare `refs = merged` fragment does not).
+    "interrupted-add-no-lane-gate": (
+        "        if [ \"$refs\" = merged ] && is_lane_branch \"$branch\"; then",
+        "        if [ \"$refs\" = merged ]; then   # MUTANT: the lane gate is dropped",
     ),
 }
 s = open(src).read()
@@ -1716,26 +1778,149 @@ WT_RECENT="$(add_named_wt "$REPO" "$ENV-recent" feat/g6-recent)"
 commit_in_wt "$WT_RECENT" "$RECENT_DATE" recent
 WT_AGED="$(add_named_wt "$REPO" "$ENV-aged" feat/g6-aged)"
 commit_in_wt "$WT_AGED" "$OLD_DATE" aged          # UNMERGED, aged, owns its commit
+# ── G6a: RULE D — THE DISPOSABLE-CLEAN FLOOR, and it is OFF unless it is ARMED ────────────────────
+# The capability that answers `worktree=0`. A CLEAN, holder-free, no-open-PR checkout was held by the
+# 7-day abandonment PROXY alone; measured on cell-3 (2026-11-10) that was 60 of 194 preserved rows
+# while the box reaped ZERO worktrees per hourly pass. Cleanliness + the census + the open-PR veto +
+# `refs=` ARE the safety property, so the floor for such a row can be a COOLDOWN (12 h), not a week.
+# ⛔ IT IS NOT THE DEFAULT, and G6a0 pins that: rule 6's 7-day window is a recorded, tested decision
+# (A2/A3/A14a/E3b/E4/G14d all measure it), so shipping it ON would reverse that decision silently.
+# Arming it is a deliberate per-box act, the same shape #1678 already uses for the reaper itself.
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" "G6a HEAD 2d old => preserve too-recent"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
+    "G6a0 DEFAULT (unarmed) still keeps a 2d clean row behind rule 6's 7-day window — the recorded decision is not reversed"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "ruleD" "G6a0 …and no row cites a ruleD floor while the rule is unarmed"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=reclaimable" \
+    "G6a ARMED (720m) a clean+holder-free+no-open-PR row at 2d => REMOVED under RULE D (not held by the 7d proxy)"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "floor=720m(ruleD)" \
+    "G6a the row NAMES the floor that decided it — a removal citing an unexpected floor is the complaint this change answers"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "proof=disposable-floor(" \
+    "G6a …and the removal's proof label agrees with its marker (a row the cooldown decided must not call itself an aged floor)"
+# ── G6a2: the floor is still a COOLDOWN — raise it above the row's age and the row is preserved.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=4320 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
+    "G6a2 a floor ABOVE the row's age (3d > 2d) preserves it — RULE D only ever LOWERS a floor, never removes one"
+# ⛔ AND THE UNITS ON THAT ROW ARE PART OF ITS CLAIM. `age:<n>s≤<n>m` states the age in SECONDS and
+# the floor in MINUTES; the `%sms` literal that used to be here expanded a 2-day row to
+# `age:172800ms` — 2.9 minutes to any reader — in the one field this change exists to make legible.
+# The `assert_contains` is the PRECONDITION (an absent row would otherwise satisfy assert_absent
+# vacuously), the `assert_absent` is the measurement (#3888 review 2, finding 3).
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "proof=age:" \
+    "G6a2 precondition: the preserved row carries its age/floor proof at all"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "ms≤" \
+    "G6a2 …and it never labels a SECONDS value as ms (a 2d row would read age:172800ms = 2.9 minutes)"
+# ── G6a3: 0 DISABLES it and restores the pre-rule behaviour EXACTLY, which is what makes the change
+# reversible on a box without a code change.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=0 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_RECENT")" "reason=too-recent" \
+    "G6a3 REAP_WT_DISPOSABLE_AGE_MINUTES=0 restores the 7d floor exactly"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "ruleD" \
+    "G6a3 … and the row no longer cites the ruleD floor (the disable is visible, not implied)"
+assert_absent "$(row_for "$OUT" "$WT_RECENT")" "floor=720m" \
+    "G6a3 … and no 720m floor survives the disable"
 assert_contains "$(row_for "$OUT" "$WT_AGED")" "reason=reclaimable" "G6b aged HEAD => remove"
 assert_contains "$(row_for "$OUT" "$WT_AGED")" "refs=branch-retained:feat/g6-aged" \
     "G6b UNMERGED named branch reported as branch-retained (the 48-row class)"
-run_reaper $ENV --apply --repo "$REPO" >/dev/null
+# ARMED for the apply leg: WT_RECENT is only removable because RULE D was armed above, so the two
+# rows below measure the armed policy end-to-end rather than the default window.
+REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --apply --repo "$REPO" >/dev/null
 assert_nodir "$WT_AGED" "G6b --apply removed the unmerged branch-retained worktree"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/g6-aged | wc -l | tr -d ' ')" "1" \
     "G6b the unmerged branch ref still resolves after removal"
-assert_dir "$WT_RECENT" "G6b --apply kept the too-recent worktree"
-# strict-> boundary: exactly 7d survives; 7d+1s and 7d+2s are reaped
+assert_nodir "$WT_RECENT" "G6b --apply removed the 2d clean row (RULE D)"
+# ── G6a4: RULE D LOWERS a floor, so a floor already at ZERO STAYS zero. REAP_WT_AGED_DAYS=0 is a
+# supported, documented operator setting (validation admits 0; `--aged-days 0` is the operator remedy)
+# and 0 means "no floor". The pre-fix zero-disjunct RAISED a 12 h cooldown onto it, so on the box that
+# chose the MOST aggressive age setting every clean row younger than 12 h was preserved instead — the
+# exact "reaper reclaims nothing" class RULE D exists to end, produced by RULE D itself.
+# ⛔ ITS OWN ENV/REPO on purpose: it reassigns OUT, so it runs AFTER the G6 rows that still read the
+# G6 pass's output (G6b above). A row_for over another repo silently matches nothing.
+ENV=G6a4; REPO="$(mk_repo $ENV)"
+WT_H2="$(add_named_wt "$REPO" "$ENV-2h" feat/g6a4-2h)"
+commit_in_wt "$WT_H2" "$TWO_HOURS_DATE" h2
+OUT="$(REAP_WT_AGED_DAYS_OVERRIDE=0 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_H2")" "reason=reclaimable" \
+    "G6a4 precondition: with NO age floor a clean 2h row is reclaimed"
+OUT="$(REAP_WT_AGED_DAYS_OVERRIDE=0 REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_H2")" "reason=reclaimable" \
+    "G6a4 armed RULE D does NOT raise a 12h floor onto REAP_WT_AGED_DAYS=0 (it only ever LOWERS one)"
+assert_absent "$(row_for "$OUT" "$WT_H2")" "reason=too-recent" \
+    "G6a4 …the pre-fix zero-disjunct made this same 2h row too-recent (floor raised 0 -> 720m)"
+# ⛔ THE OTHER HALF OF THE MIN: when the armed cooldown does NOT lower the floor, it must not CLAIM it
+# did. This is the one configuration in the whole suite where `disp_s >= floor_s`, so it is the only
+# row that can observe the `else disp_s=0` disarm — drop that arm and every other armed row takes the
+# lowering branch, so nothing reds while this row's marker starts lying (`floor=<n>m(ruleD)` /
+# `proof=disposable-floor(…)` on a removal the AGED floor decided). A reader then re-tunes the dial
+# that did nothing — the "reclaims the wrong thing with no legible cause" loop this change answers.
+assert_absent "$(row_for "$OUT" "$WT_H2")" "ruleD" \
+    "G6a4 …an armed cooldown that does NOT lower the floor must not CLAIM it did (the else disp_s=0 disarm)"
+assert_contains "$(row_for "$OUT" "$WT_H2")" "floor=0m(aged)" \
+    "G6a4 …so the marker still names the AGED floor that actually decided it (0m, i.e. no floor)"
+assert_absent "$(row_for "$OUT" "$WT_H2")" "proof=disposable-floor(" \
+    "G6a4 …and the removal's proof label agrees with its marker (never disposable-floor while the floor stayed 0)"
+# strict-> boundary: exactly 7d survives; 7d+1s and 7d+2s are reaped.
+# ⛔ PINNED WITH RULE D OFF. This group's subject is the AGED floor's `>` boundary, and RULE D caps that
+# floor at 12 h by default — so leaving it on would measure the disposable floor while claiming to
+# measure the 7-day one. `=0` is exactly the "pre-rule behaviour" the contract promises to restore.
 ENV=G6c; REPO="$(mk_repo $ENV)"
 WT_EDGE="$(add_named_wt "$REPO" "$ENV-edge" feat/g6-edge)"
 commit_in_wt "$WT_EDGE" "$(python3 -c 'import datetime;print((datetime.datetime.fromisoformat("2026-09-15T20:00:00+00:00")-datetime.timedelta(days=7)).isoformat())')" edge
-OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=0 run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=too-recent" "G6c exactly 7d survives (strict >)"
-OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 1)) run_reaper $ENV --dry-run --repo "$REPO")"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 1)) run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=reclaimable" "G6c 7d+1s is reaped (strict >)"
-OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 2)) run_reaper $ENV --dry-run --repo "$REPO")"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 2)) run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_EDGE")" "reason=reclaimable" "G6c 7d+2s is reaped (strict >)"
+
+# ── G6w: ⛔ A DIRTY CHECKOUT IS NEVER COLLECTED — the ONE case removal destroys work ────────────
+# RULE D lowers an AGE floor; it must never reach the CLEAN gate, because uncommitted work is the only
+# loss `git worktree remove` can inflict that nothing recovers (the branch and every commit survive the
+# removal). ⛔ WHAT EACH ROW CAN AND CANNOT PROVE, stated because the earlier claim was too strong:
+#   * G6w  (76 d, dirty) is refused by the PRE-EXISTING rule 2, past every floor including the
+#     disposable one — so it is GREEN on the pre-rule code too. It is the end-to-end survival proof
+#     (the uncommitted line is still there after `--apply`), not a proof about RULE D.
+#   * G6w2 (2 d, dirty) is the row RULE D can actually reach: inside rule 6's 7 d window, past the
+#     12 h cooldown. It is the ONLY shape that can distinguish "clean gate first" from "floor first",
+#     so it is what detects a reordering that put RULE D's floor in front of the clean gate.
+#   * the `no-clean-gate` mutant drops the gate and both rows become removable, which is the
+#     non-vacuity leg (it mutates a PRE-EXISTING gate, so it anchors the survival property, not RULE D.
+ENV=G6w; REPO="$(mk_repo $ENV)"
+WT_DIRTW="$(add_named_wt "$REPO" "$ENV-dirty" feat/g6w-dirty)"
+commit_in_wt "$WT_DIRTW" "$OLD_DATE" dirty
+WT_DIRTW2="$(add_named_wt "$REPO" "$ENV-dirty-2d" feat/g6w-dirty-2d)"
+commit_in_wt "$WT_DIRTW2" "$RECENT_DATE" dirty2d
+printf 'uncommitted-work-that-nothing-can-recover\n' >>"$WT_DIRTW2/base.txt"
+printf 'uncommitted-work-that-nothing-can-recover\n' >>"$WT_DIRTW/base.txt"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW")" "reason=dirty" \
+    "G6w a DIRTY checkout 76d old is preserved — past EVERY floor, held by the clean gate alone"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW")" "reason=reclaimable" \
+    "G6w … and is never classified for removal at all (so 'preserved' cannot be a near-miss)"
+# G6w2 — the row RULE D can REACH, with the rule ARMED. 2 d is inside rule 6's 7 d window and past the
+# 12 h cooldown, so this is the one shape where the ORDER of the clean gate and the floor is
+# observable: floor-first would classify 2 d as removable, gate-first cannot.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW2")" "reason=dirty" \
+    "G6w2 a DIRTY 2d row inside the ARMED cooldown's reach is still refused by the clean gate"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW2")" "reason=too-recent" \
+    "G6w2 … refused as DIRTY, not parked behind the floor (the two orders are distinguishable here)"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW2")" "reason=reclaimable" \
+    "G6w2 … and never classified for removal"
+run_reaper $ENV --apply --repo "$REPO" >/dev/null
+assert_dir "$WT_DIRTW" "G6w --apply left the dirty checkout in place"
+assert_contains "$(cat "$WT_DIRTW/base.txt" 2>/dev/null)" "uncommitted-work-that-nothing-can-recover" \
+    "G6w the uncommitted line SURVIVED — the only property the whole rule table exists to protect"
+assert_dir "$WT_DIRTW2" "G6w2 --apply left the armed-cooldown dirty checkout in place"
+MUTW="$T/mutant-no-clean-gate-g6w.sh"
+mutate_reaper_anchored "$MUTW" no-clean-gate
+OUT="$(REAPER="$MUTW" REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_absent "$(row_for "$OUT" "$WT_DIRTW")" "reason=dirty" \
+    "G6w MUTANT really dropped the clean gate (otherwise the assertion below proves nothing)"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW")" "reason=reclaimable" \
+    "G6w WITHOUT the clean gate the dirty checkout becomes reclaimable — so G6w MEASURES the gate"
+assert_contains "$(row_for "$OUT" "$WT_DIRTW2")" "reason=reclaimable" \
+    "G6w2 WITHOUT the clean gate the ARMED-cooldown dirty row becomes reclaimable — so the survival claim is not a vacuous green"
 
 # ── G6d: a MERGED head is exempt from the age floor (agent-infra#2032) ──
 # The floor's job is "work may still be in progress"; a merge is the proof it is not.
@@ -1758,6 +1943,18 @@ assert_contains "$(row_for "$OUT" "$WT_MERGED")" "reason=too-recent" \
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO" --aged-days 0)"
 assert_contains "$(row_for "$OUT" "$WT_MERGED")" "reason=reclaimable" \
     "G6d --aged-days 0 is unaffected (the floor is already zero)"
+# G6d2 — RULE D MUST NOT TOUCH A MERGED HEAD. Its 0-day floor is a separate, deliberate decision, so
+# the armed cooldown must leave the row exactly where the merged rule put it and the marker must still
+# say `merged`. ⛔ WITHOUT THIS ROW THE GATE IS UNPINNED: every merged/patch-equivalent fixture used to
+# run with the rule UNARMED, and an unarmed rule never computes `disp_s` at all — so deleting either
+# `floor_src=merged` assignment left the suite green (#3888 review F3).
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_MERGED")" "reason=reclaimable" \
+    "G6d2 a MERGED head stays reclaimable with RULE D armed — the cooldown never re-decides a merged floor"
+assert_contains "$(row_for "$OUT" "$WT_MERGED")" "floor=0m(merged)" \
+    "G6d2 …and the row still names the MERGED floor, not the cooldown"
+assert_absent "$(row_for "$OUT" "$WT_MERGED")" "ruleD" \
+    "G6d2 …with no ruleD marker anywhere on it"
 run_reaper $ENV --apply --repo "$REPO" >/dev/null
 assert_nodir "$WT_MERGED" "G6d --apply removed the merged checkout"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/g6-merged | wc -l | tr -d ' ')" "1" \
@@ -2326,6 +2523,38 @@ assert_eq "$RC" "2" "A14g --repo that is not a directory => exit 2"
 OUT="$(REAP_WT_MERGED_AGE_DAYS_OVERRIDE=99999999 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "A14h a merged floor above REAP_WT_MAX_DAYS => exit 2 (never a silently different pass)"
 assert_contains "$OUT" "bad REAP_WT_MERGED_AGE_DAYS" "A14h ... and the refusal names the seam, not a generic usage error"
+# A14j — the three seams the STALLED list's floors depend on are validated like every other numeric
+# knob (finding 2(b), review round 6, PR #3881). Without the validation entries a malformed value
+# reaches `$(( … * 3600 ))` on EVERY pass: `REAP_WT_WIP_AGE_HOURS=abc` is arithmetic on a string, and
+# `REAP_WT_STALE_INIT_SECONDS=abc` disables the interrupted-add detector's threshold. Deleting any of
+# the three loop entries must redden this leg, not pass silently — A14h's shape, one name at a time.
+OUT="$(REAP_WT_GHOST_AGE_HOURS_OVERRIDE=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14j a non-numeric REAP_WT_GHOST_AGE_HOURS => exit 2 (never arithmetic on a string)"
+assert_contains "$OUT" "bad REAP_WT_GHOST_AGE_HOURS" "A14j ... and the refusal names the seam it refused"
+OUT="$(REAP_WT_WIP_AGE_HOURS_OVERRIDE=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14j a non-numeric REAP_WT_WIP_AGE_HOURS => exit 2 (the class floor cannot be a string)"
+assert_contains "$OUT" "bad REAP_WT_WIP_AGE_HOURS" "A14j ... and the refusal names the seam it refused"
+OUT="$(REAP_WT_STALE_INIT_SECONDS=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14j a non-numeric REAP_WT_STALE_INIT_SECONDS => exit 2 (the interrupted-add floor)"
+assert_contains "$OUT" "bad REAP_WT_STALE_INIT_SECONDS" "A14j ... and the refusal names the seam it refused"
+# A14k — RULE D's cooldown is BOUNDED, not merely digit-checked. (#3881 took `A14j` for the three
+# STALLED seams while this branch was open, so the id here is `A14k` — the registry's `guardedBy`
+# cites it, and reusing `A14j` would leave that one id on main's six assertions plus this leg's
+# five, so the citation would stop identifying a guard.)
+# The floor is computed as `minutes * 60` in shell ARITHMETIC, so a digit string big enough to
+# overflow makes it NEGATIVE — and a negative floor makes every `[ "$floor_s" -gt 0 ]` gate false,
+# i.e. the floor silently DISAPPEARS and the pass reaps clean non-merged checkouts at any age while
+# printing a `floor=0m(…)` marker as if that were ordinary. That is the `seam_too_large` fail-open
+# recorded at scripts/disk-reaper.sh:697-704, one seam over. The ceiling is the day dials' own bound,
+# expressed in this dial's unit.
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=200000000000000000 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14k an overflowing REAP_WT_DISPOSABLE_AGE_MINUTES => exit 2 (never a silently deleted floor)"
+assert_contains "$OUT" "bad REAP_WT_DISPOSABLE_AGE_MINUTES" "A14k … and the refusal names the seam"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=2000000000 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14k a cooldown above REAP_WT_MAX_DAYS*1440 => exit 2 (the ceiling is the day dials' bound)"
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14k a non-numeric cooldown => exit 2"
+assert_contains "$OUT" "bad REAP_WT_DISPOSABLE_AGE_MINUTES" "A14k … a non-numeric one too, named"
 # A14i — the pass's SUMMARY must satisfy ITS OWN identities on a REAL pass: `examined = classified +
 # deferred` and `classified = remove + preserved`. Two identities over four counters is where a
 # deferral double-count (or a missing one) becomes readable instead of inferred; the doc states them,
@@ -3438,6 +3667,25 @@ assert_dir "$WT" "A28d the checkout is STILL THERE"
 assert_eq "$(cat "$WT/loose.txt" 2>/dev/null)" "loose" "A28d the untracked file survived"
 assert_branch "$REPO" feat/2604-tm "A28d the branch was not deleted either"
 assert_absent "$(cat "$T/$ENV/reap.log")" "REMOVED-FORCED" "A28d the forced removal never ran"
+# ⛔ AND IT IS NOT ON THE STALLED LIST (review, PR #3881). A selected removal that failed is past its
+# floor and unremoved, so it looks like the list's subject — but it is counted under `remove=`, and
+# folding it in would make `stalled=` stop being a subset of `preserved=`. It is reported by
+# `failed=`/exit 4 instead, which this same arm already asserts.
+SUM="$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)"
+assert_contains "$SUM" "stalled=0" \
+    "A28d a FAILED removal is not on the stalled list (it is counted under remove= and failed=)"
+# ⛔ EXACT FIELD, NOT A SUBSTRING (review round 3, PR #3881). `assert_contains "$SUM" "preserved=0"` can
+# NEVER fail: the SUMMARY always carries `late_preserved=0`, which supplies `preserved=0` as a substring
+# whatever the real value is. Parsed at a field boundary instead, so the precondition is pinned.
+sum_field() { sed -n "s/.*[ ]$1=\([0-9][0-9]*\).*/\1/p" <<<"$2" | head -1; }
+# preserved=1 is the MAIN CHECKOUT, and 1 is exactly what this pins: the failed removal adds NOTHING
+# to preserved (it is under remove=), which is the half that could make `preserved - stalled` underflow.
+# ⛔ IT IS A REGRESSION PIN ON THE ACCOUNTING, NOT A GUARD THIS DIFF'S MUTATION CAN MOVE (review round
+# 10, PR #3881): the collector increments `STALLED_N` only, so no edit to this PR changes `preserved`
+# here. Stated as a precondition rather than sold as a kill-switch for the change.
+assert_eq "$(sum_field preserved "$SUM")" "1" \
+    "A28d precondition: the failed removal is NOT counted as preserved (only the main checkout is)"
+assert_eq "$(sum_field remove "$SUM")" "1" "A28d precondition: remove=1 — the failed record is a selected removal"
 
 # ── A28e: the ref MOVES between classification and deletion => branch KEPT ───────────
 # The TOCTOU the re-proof exists for: the checkout is still residue (it is removed), but
@@ -3528,6 +3776,640 @@ assert_contains "$(cat "$T/$ENV/reap.log")" "REMOVED-FORCED $WT" \
     "A28h the partial checkout is force-removed (after a verified backup)"
 assert_nodir "$WT" "A28h the interrupted add's checkout is gone"
 assert_eq "$RC" "0" "A28h a completed removal is not a failed pass"
+
+# ══ A29: THE STALLED REVIEW LIST and its BOUND (#2179) ═══════════════════════════════════════
+# #2179's defect, measured on the live estate while this section was written: `.worktrees/tm-1729`
+# held `feat/1729-tm` at 0 commits ahead with 25h of uncommitted edits, and the pass reported
+# `reason=dirty` with NO age, NO class and NO issue — so issue #1729 (still OPEN) was held out of
+# dispatch and nothing in the artifact said so. A `preserve` that carries no review state is a
+# silent block, which is the half the per-class floors (#2033) do not reach.
+#
+# ⛔ EACH ARM MUST BE ABLE TO GO RED, and the two directions are pinned together: A29a proves a
+# record that CANNOT be released is listed, A29b proves the SAME record is NOT listed once it IS
+# released, A29c proves a record INSIDE its floor is not listed, and A29d proves a lane checkout that
+# holds a commit is not residue at all. An emitter that fired on everything passes A29a and fails
+# A29c/A29d; one that never fired passes A29c/A29d and fails A29a.
+echo "stalled review list: the 0-commits lane class that no floor will move (#2179)"
+
+# ── A29a: dirty + 0-ahead + lane-owned, opt-in OFF => PRESERVED and NAMED ───────────────
+ENV=A29a; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2941-tm)"
+printf 'edited\n' >"$WT/base.txt"           # tracked modification => the abandoned-wip class
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_eq "$RC" "0" "A29a an unarmed pass over uncommitted residue is not a failed pass"
+assert_contains "$ROW" "reason=dirty" "A29a the tree is still PRESERVED (rule 2 is untouched)"
+assert_dir "$WT" "A29a the checkout survives — this change releases nothing on its own"
+assert_branch "$REPO" feat/2941-tm "A29a and its branch survives"
+assert_contains "$ROW" "stalled=1 class=abandoned-wip" \
+    "A29a a 0-ahead lane record the pass cannot release is MARKED stalled"
+assert_contains "$ROW" "issue=#2941" "A29a …and names the ISSUE its branch holds out of dispatch"
+assert_contains "$ROW" "floor=${REAP_WT_WIP_AGE_HOURS_OVERRIDE:-24}h" \
+    "A29a …and names the class floor in force (24h; PAST it is what makes the record reviewable)"
+assert_contains "$ROW" "why=opt-in-off" "A29a …and names WHY it cannot move"
+assert_contains "$OUT" "STALLED REVIEW LIST" "A29a the list itself is PRINTED, not just counted"
+assert_contains "$OUT" "  $WT" "A29a …with the record's path on its own indented line"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" \
+    "A29a the SUMMARY carries the tally (a subset of preserved=, not a fourth verdict)"
+assert_contains "$(footer $ENV)" "STALLED=1" "A29a the footer carries it too"
+
+# ── A29b: the SAME record, released => the list does NOT name it ─────────────────────────
+# The falsifier for A29a: if the list fired on the CLASS rather than on the WITHHOLDING, this arm
+# would still print a row for a record the pass just removed.
+ENV=A29b; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2942-tm)"
+printf 'edited\n' >"$WT/base.txt"
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --reap-abandoned-wip --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A29b the armed pass over the same fixture exits 0"
+assert_contains "$(row_for "$OUT" "$WT")" "reason=abandoned-wip" \
+    "A29b armed, the record takes its RELEASE path (the opt-in path is untouched by this change)"
+assert_nodir "$WT" "A29b …and is removed (after a verified backup)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
+    "A29b a RELEASED record is NOT on the stalled list — the bound held"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29b …and the list is not printed at all"
+
+# ── A29c: a record INSIDE its floor is not stalled (the next sweep resolves it) ──────────
+# Without this, "past its floor" would be an unchecked qualifier and every fresh lane checkout would
+# be published as stalled residue on the very pass that is about to reap it.
+# ⛔ THE CLOCK IS TAKEN HERE, not borrowed from the section header: A28's fixtures take minutes, and a
+# record created AFTER `NOW_REAL` has a timestamp in that clock's FUTURE — which `wt_created_ts`
+# correctly refuses (`unreadable-worktree-age`), turning this arm into a test of the guard it is not
+# about. A28g makes the same adjustment for the same reason.
+ENV=A29c; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2943-tm)"     # clean, 0 ahead, lane-owned
+rm -f "$T/$ENV/reap.log"
+NOW_C="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 60 ))"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_C" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=too-recent" \
+    "A29c a checkout seconds old is inside its 2h ghost floor"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
+    "A29c a record INSIDE its floor is NOT stalled — the next sweep releases it, so the bound holds"
+assert_contains "$(footer $ENV)" "STALLED=0" "A29c the footer says so explicitly (a measured zero, not an absent field)"
+
+# ── A29d: a lane checkout that HOLDS A COMMIT is not residue, at any age ─────────────────
+# `refs=merged` is the 0-ahead test, and the mutant that list cannot survive is a lane checkout with
+# one unpushed commit and a dirty tree: it is a lane MID-FLIGHT, not residue, and listing it would
+# put a live lane's work in front of an operator as "release this".
+ENV=A29d; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2944-tm)"
+commit_in_wt "$WT" "$OLD_DATE" a29d
+printf 'edited\n' >"$WT/base.txt"
+rm -f "$T/$ENV/reap.log"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count main..feat/2944-tm)" "1" \
+    "A29d precondition: the branch is 1 commit AHEAD, so it is not the 0-ahead class"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=dirty" "A29d the dirty tree is preserved as before"
+assert_absent "$(row_for "$OUT" "$WT")" "stalled=1" \
+    "A29d a lane that HOLDS a commit is not stalled residue — it is work in flight"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29d …so the tally is 0"
+assert_dir "$WT" "A29d and its checkout is untouched"
+
+# ── A29e: an UNREADABLE claim registry is NOT stalled — it self-resolves next pass ───────
+# ⛔ THIS LEG IS THE FALSIFIER FOR A REVERT (review round 2, PR #3881). The first revision listed
+# `claim-unverified` here, on the premise that "nothing in the fleet retries a claim read for one
+# record". That premise is FALSE: `claims_load` re-reads the registry at the top of EVERY pass, so a
+# transient fetch failure is resolved by the next sweep with no operator action — and the gate runs
+# BEFORE the class-floor test, so the same revision could have listed a record created seconds ago.
+# A stalled entry must be a state NO LATER PASS can resolve. Re-adding a token to that arm reddens this.
+ENV=A29e; REPO="$(mk_repo $ENV)"; add_origin "$REPO" $ENV
+add_claim "$REPO" 2945 "$((NOW_FUTURE + 86400))"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2945-tm)"
+rm -f "$T/$ENV/reap.log"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-claim-fetch" \
+    REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=claim-unverified" "A29e the unevaluable registry still abstains (fail-closed, unchanged)"
+assert_dir "$WT" "A29e nothing was removed on a guess"
+assert_absent "$ROW" "stalled=1" \
+    "A29e …and the record is NOT published as stalled residue (the registry is re-read next pass)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29e …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29e …and no list is printed at all"
+
+# ── A29f: a dirty 0-ahead lane record INSIDE the WIP floor is NOT listed ──────────────────
+# The unarmed arm must still honour the class floor: it exists to cover `worktree add` -> first
+# commit, so a lane's FIRST uncommitted edit is not published as stale residue. (Found by the PR's own
+# fresh review: the first version of this arm bypassed both floors.)
+ENV=A29f; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2947-tm)"
+printf 'edited\n' >"$WT/base.txt"
+rm -f "$T/$ENV/reap.log"
+NOW_F="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 60 ))"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_F" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=dirty" "A29f the tree is preserved as before"
+assert_absent "$(row_for "$OUT" "$WT")" "stalled=1" \
+    "A29f a record INSIDE the 24h abandoned-wip floor is NOT stale residue"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
+    "A29f …so the tally is 0 (the class floor covers worktree-add -> first commit)"
+
+# ── A29g: only a DURABLE stash entry is stalled — an unreadable REGISTER is not ───────────
+# A29f pinned the floor; this pins the OTHER half of "no later pass can resolve it". The two shapes
+# look alike in the artifact (both are an abstention that kept a lane record) and only one of them
+# survives a pass: `stranded_stash_for` re-reads the same register next sweep and finds the same entry,
+# while `STASH_STATE=unreadable` is a transient `mktemp`/timeout failure. (Round 3 of the PR's own
+# review found the token on BOTH; this leg is what makes re-adding it to the transient arm go red.)
+ENV=A29g; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2948-tm)"
+printf 'edited\n' >"$WT/base.txt"
+register_stash "$REPO" feat/2948-tm
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --reap-abandoned-wip --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29g a stash ENTRY naming the branch stops the release (parked work outranks the class)"
+assert_contains "$ROW" "stalled=1 class=abandoned-wip" \
+    "A29g …and it IS stalled: the same entry is re-read by every later pass, so nothing releases it"
+assert_contains "$ROW" "why=withheld-by-abstention" "A29g …with the abstention named"
+assert_dir "$WT" "A29g nothing was removed"
+
+# The unreadable REGISTER (not a stash hit) on the same 0-ahead lane class, driven the way M5 drives
+# it: the register READ fails, so the arm abstains. It must NOT be published as stalled residue.
+ENV=A29h; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2949-tm)"
+register_stash "$REPO" feat/2949-tm
+rm -f "$T/$ENV/reap.log"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-stash-log" REAP_WT_DRY_RUN_OVERRIDE=0 \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=stranded-stash-unverifiable" \
+    "A29h non-vacuity: the pass reached the unreadable-register arm (an empty row would pass on anything)"
+assert_absent "$ROW" "stalled=1" \
+    "A29h an UNREADABLE register is NOT stalled — a transient probe failure the next pass re-takes"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29h …so the tally stays 0"
+assert_dir "$WT" "A29h and nothing was removed on an unreadable probe"
+
+# ── A29i/A29j: the listed `age=` must be PAST-ROUNDED, or the row cannot show its own qualifier ─
+# ⛔ THE FLOOR TESTS COMPARE SECONDS; the row prints HOURS. Truncated, a 2h30m record printed
+# `age=2h floor=2h` — indistinguishable from a record AT its floor, which is NOT listed — so the row
+# could not show the ONE thing it exists to state (that it is PAST it). Round 3 fixed only the unarmed
+# arm's token; both armed/abstention tokens still truncated (review round 4). Each leg pins one of the
+# two sites the fix now routes through `age_h_ceil`, at a time offset that truncation CANNOT express:
+# `now` is the real clock + floor + 30m, so the truth is one hour past the printed floor.
+NOW_GHOST_PAST="$((NOW_REAL + 2 * 3600 + 1800))"     # 2h30m => age=3h, floor=2h
+NOW_WIP_PAST="$((NOW_REAL + 24 * 3600 + 1800))"      # 24h30m => age=25h, floor=24h
+
+# A29i — the GHOST arm's token (the default path: no flag needed). A durable stash entry names the
+# branch, so `abstain_gate` withholds the removal AND the row carries the class token.
+ENV=A29i; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2950-tm)"     # clean, 0 ahead, lane-owned
+register_stash "$REPO" feat/2950-tm
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_GHOST_PAST" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "stalled=1 class=ghost-zero-ahead" \
+    "A29i non-vacuity: the ghost arm's token fired (a row without it would pass on any age)"
+assert_contains "$ROW" "age=3h floor=${REAP_WT_GHOST_AGE_HOURS_OVERRIDE:-2}h" \
+    "A29i a 2h30m record reads age=3h, NOT age=2h — the row must SHOW it is past its 2h floor"
+assert_dir "$WT" "A29i the abstention still kept the checkout"
+
+# A29j — the ARMED abandoned-wip token. Same shape as A29g (durable stash entry, `--reap-abandoned-wip`
+# armed) at a time offset truncation cannot express: 24h30m must read 25h against the 24h floor.
+ENV=A29j; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2951-tm)"
+printf 'edited\n' >"$WT/base.txt"
+register_stash "$REPO" feat/2951-tm
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_WIP_PAST" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --reap-abandoned-wip --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "stalled=1 class=abandoned-wip" \
+    "A29j non-vacuity: the armed arm's token fired"
+assert_contains "$ROW" "age=25h floor=${REAP_WT_WIP_AGE_HOURS_OVERRIDE:-24}h" \
+    "A29j a 24h30m record reads age=25h, NOT age=24h — the row must SHOW it is past its 24h floor"
+assert_dir "$WT" "A29j the abstention still kept the checkout"
+
+# ── A29k/A29l: a 0-ahead record holding NON-REGENERABLE IGNORED data is named too ───────────
+# ⛔ THE OTHER WAY A RECORD IS BLOCKED FOR EVER (review round 5, PR #3881). `ignored-artifact` is a
+# `rule=2` PRESERVE with no flag behind it — `--reap-abandoned-wip` only enters the DIRTY case — so a
+# 0-commits-ahead lane record whose tree holds an ignored non-cache artifact blocks its issue on every
+# pass while its row reads as routine. It is the largest preserve bucket measured in a real pass
+# (`reasons=ignored-artifact:70`, 20,557 MB), which is why #2179 §Required 2 cannot be honoured for
+# this class by leaving it unnamed. A29k pins the listing (past the WIP floor); A29l pins the floor
+# itself (a fresh lane checkout holding node_modules/data must NOT be published as residue).
+ENV=A29k; REPO="$(mk_repo $ENV)"
+printf 'data/\n' >"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm ignore
+WT="$(add_named_wt "$REPO" "$ENV-data" feat/2952-tm)"     # 0 ahead; only IGNORED data below
+mkdir -p "$WT/data"; printf 'z\n' >"$WT/data/notes.txt"
+rm -f "$T/$ENV/reap.log"
+NOW_K="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 24 * 3600 + 1800 ))"   # 24h30m => age=25h
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_K" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29k non-vacuity: the fixture is classified by the ignored-artifact arm"
+assert_contains "$ROW" "stalled=1 class=ignored-artifact" \
+    "A29k a 0-ahead lane record holding ignored NON-regenerable data is NAMED, not silently preserved"
+assert_contains "$ROW" "age=25h floor=${REAP_WT_WIP_AGE_HOURS_OVERRIDE:-24}h" \
+    "A29k …with its real age past the WIP floor (the data-holding class, never the 2h ghost floor)"
+assert_contains "$ROW" "why=ignored-data-held" \
+    "A29k …and the reason no later pass moves it (no flag enters this class at all)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" \
+    "A29k the tally carries it (still a subset of preserved=)"
+assert_dir "$WT" "A29k nothing was removed — this class is NAMED for an operator, never reaped on age"
+
+# A29l: the same record INSIDE the floor must stay off the list. `worktree add` → the first build
+# artifact is exactly the window the floor covers, so listing a checkout assembled minutes ago would
+# publish a live lane as stale residue.
+NOW_L="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 60 ))"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_L" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29l non-vacuity: still the ignored-artifact arm (an empty row would pass on anything)"
+assert_absent "$ROW" "stalled=1" \
+    "A29l a record INSIDE its WIP floor is NOT listed — the next sweep resolves it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29l …so the tally is 0"
+
+# ── A29n: an UNREADABLE registry does NOT publish a dirty 0-ahead lane record as stalled ──
+# ⛔ THE UNARMED DIRTY ARM'S OWN FALSIFIER (review round 6, PR #3881). It was the only lane-residue arm
+# that never consulted `claim`, so ONE failed registry probe (a logged, transient condition — the
+# `claim=live` early return cannot fire while the registry is unreadable) published every dirty
+# 0-ahead lane record past the WIP floor, including the one a LIVE lease holds here, with
+# `why=opt-in-off`. The next pass re-reads the registry and the rows vanish: the list flapped on a
+# probe failure, which is the class rounds 2/3/5 removed from the sibling arms. Deleting the arm's
+# `claim=unknown` gate reddens every assertion below.
+ENV=A29n; REPO="$(mk_repo $ENV)"; add_origin "$REPO" $ENV
+add_claim "$REPO" 2953 "$((NOW_FUTURE + 86400))"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2953-tm)"
+printf 'edited\n' >"$WT/base.txt"           # tracked modification => the abandoned-wip class
+rm -f "$T/$ENV/reap.log"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-claim-fetch" \
+    REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=claim-unverified" \
+    "A29n an unevaluable registry abstains on the UNARMED dirty arm too (named, fail-closed)"
+assert_dir "$WT" "A29n nothing was removed on an unreadable probe"
+assert_absent "$ROW" "stalled=1" \
+    "A29n …and the record is NOT published as stalled residue (the registry is re-read next pass)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29n …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29n …and no list is printed at all"
+
+# ── A29o: the ignored-artifact arm's OWN claim gate — `[ "$claim" != "unknown" ]` ──────────
+# ⛔ FINDING 2(a) OF REVIEW ROUND 6: that disjunct is the fourth arm's copy of the same rule and NO leg
+# drove it. A29k/A29l run on a repo with NO origin, so `claims_load` answers `na` and `claim` is
+# constantly `absent` — delete the disjunct and both stayed green. So this is A29k's fixture (a
+# 0-ahead lane record whose only dirt is IGNORED, non-regenerable data) past the WIP floor, with the
+# registry probe FAILING: it must be preserved WITHOUT the token.
+ENV=A29o; REPO="$(mk_repo $ENV)"; add_origin "$REPO" $ENV
+printf 'data/\n' >"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm ignore
+add_claim "$REPO" 2954 "$((NOW_FUTURE + 86400))"
+WT="$(add_named_wt "$REPO" "$ENV-data" feat/2954-tm)"     # 0 ahead; only IGNORED data below
+mkdir -p "$WT/data"; printf 'z\n' >"$WT/data/notes.txt"
+rm -f "$T/$ENV/reap.log"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-claim-fetch" \
+    REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29o non-vacuity: the fixture still takes the ignored-artifact arm (an empty row passes on anything)"
+assert_dir "$WT" "A29o the data-holding record is preserved, as always"
+assert_absent "$ROW" "stalled=1" \
+    "A29o an UNREADABLE registry keeps the ignored-data class OFF the list — it self-resolves next pass"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29o …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29o …and no list is printed at all"
+
+# ── A29p: an INTERRUPTED ADD withheld by a stash entry is NAMED, not silently stranded ───
+# ⛔ REVIEW ROUND 7, PR #3881. That arm was the ONE 0-commits-ahead lane arm that neither released nor
+# listed a withheld record: `abstain_gate` ran there with NO token, so a durable stash entry — which
+# no later pass releases, because `stranded_stash_for` re-reads the same register — left the record
+# blocked while the artifact reported `stalled=0`. That is the false "all clear" the list exists to
+# prevent, and the header states the opposite rule. Only the arm's `refs=merged` half is named:
+# `branch-retained:*` still HOLDS commits, so it is not 0-ahead residue (A29d's rule) and gets no
+# token. The fixture is A28h's interrupted add (a backdated `initializing` lock on a 0-ahead lane
+# branch) PLUS the stash-register entry A29g builds.
+ENV=A29p; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ia" feat/2961-tm)"
+printf 'partial\n' >"$WT/base.txt"            # an interrupted add reads dirty as well
+ADMIN="$REPO/.git/worktrees/$ENV-ia"
+printf 'initializing' >"$ADMIN/locked"         # git's own marker for an add that never returned
+touch -t 202001010000 "$ADMIN/locked"          # long past REAP_WT_STALE_INIT_SECONDS (1800s)
+register_stash "$REPO" feat/2961-tm            # parked lane work no later pass will release
+rm -f "$T/$ENV/reap.log"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count main..feat/2961-tm)" "0" \
+    "A29p precondition: the branch is 0 commits AHEAD — the 0-ahead residue class"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_eq "$RC" "0" "A29p a preserve-only pass is not a failed pass"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29p non-vacuity: the stash ENTRY withheld the removal (an empty row would pass on anything)"
+assert_contains "$ROW" "stalled=1 class=interrupted-add" \
+    "A29p the interrupted add IS named — 0-ahead residue this pass could not release"
+assert_contains "$ROW" "issue=#2961" "A29p …with the ISSUE it holds out of dispatch"
+assert_contains "$ROW" "floor=${REAP_WT_STALE_INIT_SECONDS:-1800}s" \
+    "A29p …and its OWN class floor, in the seconds it is actually applied in (never a rounded hour)"
+assert_contains "$ROW" "why=withheld-by-abstention" "A29p …and the reason no later pass moves it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" \
+    "A29p the tally carries it (still a subset of preserved=)"
+assert_contains "$OUT" "STALLED REVIEW LIST" "A29p the list itself is PRINTED"
+assert_contains "$OUT" "  $WT" "A29p …with the stranded record's path"
+# ⛔ THE LEGEND PRINTED UNDER THE ROW IS PART OF THE ARTIFACT (review round 8, PR #3881): it said
+# `floor=<n>h is the class floor it is past` UNDER a row reading `floor=1800s`, and named a release
+# flag (`--reap-abandoned-wip`) that cannot move this class at all. Both are pinned here because the
+# legend is static text with no other assertion anywhere in this file.
+assert_contains "$OUT" "AT OR PAST" \
+    "A29p the legend states the qualifier the row is printed under, on the row's own terms"
+assert_contains "$OUT" "in that class's own unit" \
+    "A29p …and the UNIT, so a floor=1800s row is not contradicted two lines further down"
+assert_contains "$OUT" "CANNOT release that one" \
+    "A29p …and a class-aware remedy, because --reap-abandoned-wip cannot release a stash-withheld record"
+assert_contains "$OUT" "? when the branch carries" \
+    "A29p …and says what an unnamed ISSUE looks like, which a lane-pattern override makes reachable"
+assert_dir "$WT" "A29p nothing was removed — the stash entry still parks lane work"
+
+# A29p-MUT: the token is what makes the leg above able to fail. This mutation IS the pre-fix code —
+# the caller's token argument is dropped — so a leg that passed on the old spelling would pass here
+# too (which is why the review could say "no current leg can distinguish the two states").
+ENV=A29q; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ia" feat/2962-tm)"
+printf 'partial\n' >"$WT/base.txt"
+ADMIN="$REPO/.git/worktrees/$ENV-ia"
+printf 'initializing' >"$ADMIN/locked"
+touch -t 202001010000 "$ADMIN/locked"
+register_stash "$REPO" feat/2962-tm
+MUT29P="$T/mutant-no-interrupted-add-token.sh"
+mutate_reaper_anchored "$MUT29P" no-interrupted-add-token
+OUT="$(REAPER="$MUT29P" REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29p-MUT non-vacuity: the mutation leaves the preserve itself alone"
+assert_absent "$ROW" "stalled=1" \
+    "A29p-MUT WITHOUT the token the record is stranded SILENTLY — so A29p MEASURES the token"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
+    "A29p-MUT …and the tally falls with it"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29p-MUT …and no list is printed at all"
+
+# ── A29r: the refs=merged CARVE-OUT is load-bearing — a commit-holding interrupted add is NOT named ──
+# ⛔ REVIEW ROUND 8, PR #3881. Round 7 gated the token on `[ "$refs" = merged ]` because the arm ALSO
+# admits `branch-retained:*`, whose branch still HOLDS commits and is therefore not 0-ahead residue at
+# all. The code is right — but nothing could falsify it: A29p/A29q are both 0-ahead, so loosening the
+# comparison emitted the token for a commit-holding record and left the whole suite GREEN. This leg is
+# that falsifier: A29p's fixture plus ONE commit the main ref does not have.
+ENV=A29r; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ia" feat/2963-tm)"
+commit_in_wt "$WT" "2020-01-01T00:00:00 +0000" retained   # the branch HOLDS a commit main does not
+printf 'edited\n' >"$WT/base.txt"
+ADMIN="$REPO/.git/worktrees/$ENV-ia"
+printf 'initializing' >"$ADMIN/locked"
+touch -t 202001010000 "$ADMIN/locked"
+register_stash "$REPO" feat/2963-tm
+rm -f "$T/$ENV/reap.log"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count main..feat/2963-tm)" "1" \
+    "A29r precondition: the branch HOLDS a commit (refs=branch-retained:*, not the 0-ahead class)"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_eq "$RC" "0" "A29r a preserve-only pass is not a failed pass"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29r non-vacuity: the stash ENTRY withheld the removal, so the record took the SAME arm as A29p"
+assert_absent "$ROW" "stalled=1" \
+    "A29r a record whose branch holds a commit is NOT 0-ahead residue — so it is never named"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
+    "A29r …the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29r …and no list is printed at all"
+assert_dir "$WT" "A29r nothing was removed — the commit and the parked work are still there"
+
+# A29r-MUT: loosening the carve-out is exactly what A29r measures. The mutation widens
+# `[ "$refs" = merged ]` to "any surviving ref", i.e. it re-publishes a commit-holding record as
+# 0-ahead residue — the direction no leg could see before A29r existed.
+ENV=A29s; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ia" feat/2964-tm)"
+commit_in_wt "$WT" "2020-01-01T00:00:00 +0000" retained
+printf 'edited\n' >"$WT/base.txt"
+ADMIN="$REPO/.git/worktrees/$ENV-ia"
+printf 'initializing' >"$ADMIN/locked"
+touch -t 202001010000 "$ADMIN/locked"
+register_stash "$REPO" feat/2964-tm
+MUT29R="$T/mutant-branch-retained-token.sh"
+mutate_reaper_anchored "$MUT29R" branch-retained-no-token
+OUT="$(REAPER="$MUT29R" REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "stalled=1 class=interrupted-add" \
+    "A29r-MUT WITHOUT the carve-out a commit-holding record IS published as 0-ahead residue — so A29r MEASURES it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" \
+    "A29r-MUT …and the tally inflates with it"
+assert_contains "$OUT" "STALLED REVIEW LIST" \
+    "A29r-MUT …and a record that HOLDS a commit is printed on the review list"
+assert_dir "$WT" "A29r-MUT the mutation changes the REPORT only — nothing is removed either way"
+
+# ── A29v: the interrupted-add token is LANE-GATED, like every sibling emitter ────────────
+# ⛔ REVIEW ROUND 9, PR #3881. That arm is entered from `init_lock_age` alone — no branch-shape test
+# anywhere above it — so it was the ONE emitter with no `is_lane_branch`, while the list header scopes
+# itself to "0-commits-ahead LANE residue" and its legend says each row names "the ISSUE its branch
+# holds out of dispatch". Two non-lane shapes must therefore stay OFF the list, and both are built
+# here because they fail differently: `topic/2966-parked` still parses to an ISSUE number (so the
+# pre-fix row claimed a real issue was held out of dispatch), while `topic/parked` carries NO issue
+# number at all and printed `issue=?`. ⛔ THAT IS THE LEGITIMATE NO-ISSUE CASE, not a parser bug: an
+# earlier `stalled_tok` comment claimed an empty issue could only mean a parser bug, and the
+# `REAP_WT_LANE_BRANCH_RE` override is exactly what makes that false (review round 10 retracted it).
+ENV=A29v; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-num" topic/2966-parked)"
+printf 'partial\n' >"$WT/base.txt"
+printf 'initializing' >"$REPO/.git/worktrees/$ENV-num/locked"
+touch -t 202001010000 "$REPO/.git/worktrees/$ENV-num/locked"
+register_stash "$REPO" topic/2966-parked
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "reason=stranded-stash" \
+    "A29v non-vacuity: the stash entry withheld the non-lane record too (an empty row passes on anything)"
+assert_absent "$(row_for "$OUT" "$WT")" "stalled=1" \
+    "A29v an interrupted add on a NON-LANE branch is not lane residue — so it is not listed"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29v …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29v …and no list is printed at all"
+assert_dir "$WT" "A29v the non-lane checkout survives — the gate changes the REPORT only"
+
+# A29v2 — the SAME shape on a branch with NO issue number at all, in its OWN repo. ⛔ ITS OWN REPO IS
+# LOAD-BEARING (first draft shared one and this half went missing): `register_stash` re-points the
+# single `refs/stash`, and when the second branch is 0-ahead its stash commit is the SAME sha, so
+# `update-ref` records no reflog entry and the second branch never has a stash entry at all. The
+# record was then legitimately removed by the interrupted-add arm — a fixture bug, not a code one.
+ENV=A29v2; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-plain" topic/parked)"
+printf 'partial\n' >"$WT/base.txt"
+printf 'initializing' >"$REPO/.git/worktrees/$ENV-plain/locked"
+touch -t 202001010000 "$REPO/.git/worktrees/$ENV-plain/locked"
+register_stash "$REPO" topic/parked
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29v2 non-vacuity: the stash entry withheld this record too"
+assert_absent "$ROW" "stalled=1" \
+    "A29v2 an interrupted add on a branch with NO issue number is not listed (never an unknown-issue row)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29v2 …so the tally stays 0"
+assert_absent "$OUT" "STALLED REVIEW LIST" "A29v2 …and no list is printed at all"
+assert_dir "$WT" "A29v2 the checkout survives — the gate changes the REPORT only"
+
+# A29v-MUT: the registered `interrupted-add-no-lane-gate` mutant IS the pre-fix code (the gate the
+# diff added is deleted), so a leg that passed before the gate would pass here too.
+ENV=A29w; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-num" topic/2967-parked)"
+printf 'partial\n' >"$WT/base.txt"
+printf 'initializing' >"$REPO/.git/worktrees/$ENV-num/locked"
+touch -t 202001010000 "$REPO/.git/worktrees/$ENV-num/locked"
+register_stash "$REPO" topic/2967-parked
+MUT29V="$T/mutant-interrupted-add-no-lane-gate.sh"
+mutate_reaper_anchored "$MUT29V" interrupted-add-no-lane-gate
+OUT="$(REAPER="$MUT29V" REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "stalled=1 class=interrupted-add" \
+    "A29v-MUT WITHOUT the lane gate a non-lane record IS published as a lane's residue — so A29v MEASURES it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=1" "A29v-MUT …and the tally inflates"
+
+# ── A29x/A29y/A29z: the ignored-artifact arm's OTHER three conjuncts can each go red ─────
+# ⛔ REVIEW ROUND 9 (finding 3), PR #3881. That arm gates on five conditions and only two were
+# falsifiable: `claim != unknown` (A29o) and the class floor (A29k past / A29l inside). `is_lane_branch`,
+# `wt_ok = 1` and `commits_survive = merged` could ALL be deleted with the suite still green, because
+# every ignored-artifact fixture in the file is a lane branch, 0-ahead, and freshly dated. A guard the
+# diff added that no leg can see is the class rounds 6 and 8 each turned into a finding, so each one
+# gets the fixture that reds it:
+#   A29x non-lane branch        => deleting `is_lane_branch` from the arm reds it
+#   A29y branch holds a commit  => deleting `commits_survive = merged` reds it
+#   A29z undatable record       => deleting `wt_ok = 1` reds it. ⛔ NOT via a future record stamp: rung 1
+#                                  of `wt_created_ts` returns the BIRTH time, which `touch` cannot move,
+#                                  so that fixture would pass on the class floor instead of on `wt_ok`.
+#                                  The seam is a surgical `stat` shim (see A29z below).
+mk_ignored() { # <env> <wt-name> <branch> -> repo with `data/` ignored and a data-holding checkout
+    local envname="$1" name="$2" branch="$3" repo wt
+    repo="$(mk_repo "$envname")"
+    printf 'data/\n' >"$repo/.gitignore"
+    "$REAL_GIT" -C "$repo" add .gitignore
+    GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$repo" commit -qm ignore
+    wt="$(add_named_wt "$repo" "$name" "$branch")"
+    mkdir -p "$wt/data"; printf 'z\n' >"$wt/data/notes.txt"
+    printf '%s\n' "$repo"
+}
+
+# A29x — a NON-LANE branch holding non-regenerable ignored data past the floor. `add_named_wt`
+# places the checkout at `$T/<name>`, so the caller knows the path without a helper returning two values.
+ENV=A29x; REPO="$(mk_ignored $ENV "$ENV-data" topic/2968-parked)"
+WT="$T/$ENV-data"
+rm -f "$T/$ENV/reap.log"
+NOW_X="$(( $(/bin/date +%s 2>/dev/null || date +%s) + 24 * 3600 + 1800 ))"   # 24h30m => age=25h
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_X" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29x non-vacuity: a non-lane data-holding record still takes the ignored-artifact arm"
+assert_absent "$ROW" "stalled=1" \
+    "A29x a NON-LANE record is not lane residue — so the ignored-data class is not named for it"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29x …so the tally stays 0"
+assert_dir "$WT" "A29x the data-holding checkout is preserved, as always"
+
+# A29y — a LANE record whose branch HOLDS a commit (so `commits_survive` is branch-retained, not merged).
+ENV=A29y; REPO="$(mk_ignored $ENV "$ENV-data" feat/2969-tm)"
+WT="$T/$ENV-data"
+commit_in_wt "$WT" "$OLD_DATE" a29y
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count main..feat/2969-tm)" "1" \
+    "A29y precondition: the branch HOLDS a commit, so it is not the 0-ahead class"
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_X" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29y non-vacuity: still the ignored-artifact arm"
+assert_absent "$ROW" "stalled=1" \
+    "A29y a lane record that HOLDS a commit is work in flight, not residue — so it is not named"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29y …so the tally stays 0"
+
+# A29z — a LANE, 0-ahead, data-holding record whose OWN RECORD STAMP is unreadable. `wt_created_ts`
+# walks four `stat` rungs (GNU birth, GNU ctime, BSD birth, BSD ctime) and needs a strictly positive
+# integer from one; with none it returns no age, which is `wt_ok=0`. ⛔ A FUTURE stamp is NOT the way to
+# build this (the first tried): rung 1 returns the BIRTH time, which `touch` cannot move, so the record
+# still resolved to a real age and the leg would have passed on the floor, not on `wt_ok`. So the seam
+# is a surgical `stat` shim: it fails ONLY for this record's admin path and delegates every other call,
+# and it is reached by prefixing PATH ahead of the suite's own `$T/bin`.
+ENV=A29z; REPO="$(mk_ignored $ENV "$ENV-data" feat/2970-tm)"
+WT="$T/$ENV-data"
+mkdir -p "$T/statbin"
+REAL_STAT="$(command -v stat)"
+cat >"$T/statbin/stat" <<SHIM
+#!/usr/bin/env bash
+case " \$* " in *"worktrees/A29z-data"*) exit 1 ;; esac
+exec "$REAL_STAT" "\$@"
+SHIM
+chmod +x "$T/statbin/stat"
+assert_eq "$(PATH="$T/statbin:$PATH" stat -c %Y "$REPO/.git/worktrees/$ENV-data" 2>/dev/null; echo rc=$?)" "rc=1" \
+    "A29z precondition: the shim makes exactly this record's stamp unreadable"
+assert_eq "$(PATH="$T/statbin:$PATH" stat -c %Y "$REPO" 2>/dev/null | grep -c '^[0-9][0-9]*$')" "1" \
+    "A29z …and delegates every OTHER path to the real stat (only that one record is blinded)"
+rm -f "$T/$ENV/reap.log"
+OUT="$(PATH="$T/statbin:$PATH" REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_X" \
+    REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=ignored-artifact" \
+    "A29z non-vacuity: the undatable record still takes the ignored-artifact arm"
+assert_absent "$ROW" "stalled=1" \
+    "A29z a record whose age cannot be read is NOT named (the floor could not be applied)"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29z …so the tally stays 0"
+assert_dir "$WT" "A29z the record is preserved — an undatable age never reaps, never lists"
+
+# ── A29u: the ARTIFACT'S OWN --help NAMES THE THIRD FLOOR, ITS UNIT, AND ITS RELEASE PATH ──────
+# ⛔ REVIEW ROUND 8, PR #3881. The interrupted-add row prints `age=<n>s floor=1800s`, while `--help`
+# said the floor is "always an hour count", named only TWO floors, and mentioned
+# `REAP_WT_STALE_INIT_SECONDS` nowhere — so an operator holding a `floor=1800s` row had no entry for
+# it. Nothing in this file pinned any of that prose, which is exactly why three rounds' worth of
+# documentation fixes could have been undone in silence. One leg, one grep per claim.
+HELP="$("$REAPER" --help)"
+assert_contains "$HELP" "REAP_WT_STALE_INIT_SECONDS" \
+    "A29u --help NAMES the interrupted-add floor (a floor=1800s row is look-up-able)"
+assert_contains "$HELP" "The three floors a listed row can name" \
+    "A29u …and says there are THREE floors, not two"
+assert_absent "$HELP" "always an hour count" \
+    "A29u …and no longer claims every floor is an hour count (the sub-hour floor is in seconds)"
+assert_absent "$HELP" "The two floors a listed row can name" \
+    "A29u …and the two-floor sentence is gone (it contradicted the row it describes)"
+assert_contains "$HELP" "CANNOT release this one" \
+    "A29u …and the release paths are class-aware, so a stash-withheld row names a remedy that works"
+# ⛔ AND `--help` NO LONGER PROMISES AN ISSUE ON EVERY ROW (review round 11, PR #3881). The legend was
+# qualified for `issue=?` in round 10 but `--help` and the doc were not, so the artifact said three
+# different things about one field. The `?` is reachable on a GENUINE lane row whenever
+# `REAP_WT_LANE_BRANCH_RE` (a documented override) names lanes without digits, because the gate is a
+# regex and the issue is leading digits. Pinned here so the qualification cannot be dropped again.
+assert_contains "$HELP" "? when the branch carries no issue number" \
+    "A29u …and --help qualifies the ISSUE field, as the legend does"
+
+# ── A29-MUT: the COLLECTOR is load-bearing (drop it and A29a goes red) ───────────────────
+# The token is emitted inside `classify_one`, which runs in a command substitution, so the parent's
+# `case` is the ONLY thing that turns it into a list. Neutering that pattern leaves every row
+# byte-identical on its detail and empties the list — which is exactly the silent-preserve defect.
+ENV=A29m; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2946-tm)"
+printf 'edited\n' >"$WT/base.txt"
+# ⛔ `mutate_reaper_anchored`, not `mutate_reaper`: the sed helper is defined FURTHER DOWN this file
+# (its #2354 section), and this leg runs before it exists — `undefined command: mutate_reaper` was the
+# first run of this arm. The anchored registry is defined near the top and also ASSERTS the anchor
+# matches exactly once, so a future re-spelling of the collector reddens this leg instead of silently
+# skipping it.
+MUT29="$T/mutant-stall-collector.sh"
+mutate_reaper_anchored "$MUT29" stall-collector
+OUT="$(REAPER="$MUT29" REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT")" "stalled=1 class=abandoned-wip" \
+    "A29-MUT the row still carries its token (the mutation is on the collector, not the emitter)"
+assert_absent "$OUT" "STALLED REVIEW LIST" \
+    "A29-MUT WITHOUT the collector the list is EMPTY — so A29a MEASURES the collector"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
+    "A29-MUT …and the tally falls with it"
 
 # ── N: the #2354 class — SQUASH-MERGED, DEAD-LANE SCRATCH, NESTED ─────
 # A squash merge rewrites the branch into ONE new commit on main, so ancestry is
@@ -3624,6 +4506,14 @@ assert_contains "$(cat "$T/$ENV/reap.log")" "CLASSIFY patch-equivalent $WT_SQ" \
     "N5 the age floor was lifted by the patch evidence, and the log says on what basis"
 assert_contains "$(row_for "$OUT" "$WT_SQ")" "reason=reclaimable" \
     "N5 a squash-merged checkout 2d old is reclaimed without waiting out the 7d floor"
+# N5a — the SECOND shape RULE D's gate must not touch: patch-equivalence lifts the floor to the MERGED
+# dial without `refs=merged`, so `floor_src` is the ONLY thing that keeps the cooldown off it. Armed
+# here, because an unarmed rule never reads `floor_src` (#3888 review F3).
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_SQ")" "reason=reclaimable" \
+    "N5a a PATCH-EQUIVALENT head stays reclaimable with RULE D armed (its floor came from the merged dial)"
+assert_contains "$(row_for "$OUT" "$WT_SQ")" "floor=0m(merged)" \
+    "N5a …and names the MERGED floor rather than the cooldown"
 OUT="$(REAP_WT_MERGED_AGE_DAYS_OVERRIDE=7 run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_SQ")" "reason=too-recent" \
     "N5 with the merged floor pinned to 7d the same fixture is kept (the exemption is the decider)"
@@ -3655,6 +4545,21 @@ assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "reason=reclaimable" \
     "N6 a dead lane's wt-* scratch dir 2d old is reclaimed (REAP_WT_SCRATCH_AGE_DAYS)"
 assert_contains "$(row_for "$OUT" "$WT_NAMED")" "reason=no-pr" \
     "N6 the SAME row under a non-scratch path keeps the 7d floor (the rule is path-scoped)"
+# ⛔ AND WITH RULE D ARMED. `floor_src=scratch` is the SECOND arm of RULE D's gate (the `floor_src =
+# aged` test), and the F3 fix pinned only the MERGED arm (G6d2/N5a): no armed run in this suite ran
+# over a scratch fixture, so deleting that assignment left the WHOLE suite green while an armed box
+# silently capped a lane-scratch checkout at the 12 h cooldown instead of REAP_WT_SCRATCH_AGE_DAYS —
+# re-deciding the recorded #2354 floor that the reaper's RULE D header block and the registry note
+# both state as a guarantee. ⛔ THE GUARANTEE IS CONDITIONAL AND THIS FIXTURE IS THE CONDITION'S
+# FAVOURABLE SIDE: the scratch arm fires where `REAP_WT_SCRATCH_AGE_DAYS` is BELOW the aged floor,
+# which holds here (1 d < the 7 d default). With the two dials EQUAL nothing is capped, the floor came
+# from the AGED dial, and an armed cooldown lowers that row like any other — the header states that
+# boundary rather than claiming an unconditional exemption. (#3888 review 2, finding 2.)
+OUT="$(REAP_WT_DISPOSABLE_AGE_MINUTES_OVERRIDE=720 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_SCRATCH")" "floor=1440m(scratch)" \
+    "N6a armed RULE D leaves a wt-* scratch dir on its OWN floor (REAP_WT_SCRATCH_AGE_DAYS=1d), not on the cooldown"
+assert_absent "$(row_for "$OUT" "$WT_SCRATCH")" "ruleD" \
+    "N6a …and never claims the cooldown decided it"
 # The pattern is narrow IN TWO DIRECTIONS, and both halves need a fixture: `wt-*` must not read as a
 # PREFIX (a checkout named `wtfoo` is not a lane scratch dir), and the second alternative of the
 # default glob (`cell-wt-*`) must actually match. Asserting both against $WT_NAMED pinned neither —

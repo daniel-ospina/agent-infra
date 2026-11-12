@@ -231,7 +231,7 @@ BEHIND=$(git rev-list --count HEAD.."origin/$DEFAULT_BRANCH" 2>/dev/null || echo
 | `BEHIND > 0` + clean tree | **Do NOT rebase for freshness.** Staleness does not block a merge unless the repo under work requires up-to-date branches. The fleet default is now `strict: false` (tortoise `main`, ruled DELIBERATE 2026-09-28 — tortoise #4764): with it there is no must-update, so rebasing here only restarts CI and re-runs the pre-flight regression tests for nothing, and that churn is exactly what left verified PRs unlandable for days. Rebase ONLY if (a) the repo under work requires up-to-date branches (`strict: true`) — check, do not assume — or (b) the branch has an actual conflict. When you do rebase: `git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"`, then RE-RUN the affected pre-flight regression tests. If the branch was previously pushed and the post-rebase push is rejected as non-fast-forward → `git push --force-with-lease`. |
 | `BEHIND > 0` + dirty tree | **WARN**: "Branch is N behind origin/<default> — commit first (a WIP commit on your own branch; **never** a bare stash in a linked worktree, #1264), then `git -c commit.gpgsign=false pull --rebase origin <default>`." NEVER autostash (conflict-unsafe unattended). |
 
-**Pre-flight: the main-worktree-guard's branch-ownership gates (#265) run on every bash tool_call.** This skill runs from the session's WORKTREE — agent-infra included (the #99 in-main-work exemption was removed in #615; the agent-infra hub is main+clean like every hub, and in-hub `checkout -b` is BLOCKED there too, #626). In a worktree BOTH the M2/M3 gates and the legacy destructive-block arm are worktree-exempt (`eff.isWorktree`) — M2/M3 apply only to MAIN-checkout-effective mutations, and the legacy arm carries its own exemption — so the pre-flight's own-branch hygiene ops — `pull --rebase`, `rebase`, `merge origin/<default>`, `push` incl. `--force-with-lease` — run ungated on the worktree's branch. The merged-branch cleanup's remote `git push --delete <branch>` is NOT worktree-exempt: it hits the #73 coordinated-delete guard while the branch is checked out in ANY worktree (including this one), so run it after teardown (05-cleanup.md Step 3.8) or use `gh api -X DELETE`. The guard matches the LITERAL ref in the command text — a shell-variable form (`git push origin --delete "$PR_BRANCH"`) is NOT resolved by the classifier and is therefore not guard-matched. The local `git branch -D` is best-effort: git refuses it while checked out, and after teardown the HUB's main-checkout `block:branch-force-delete` gate blocks a branch that is not the session's baseline or pid-owned (a `git worktree add -b` branch is never recorded as owned — create-new is blocked, #626). A guard block rejects the bash call BEFORE the shell runs, so write the teardown note yourself — the `||` echo only covers git's own refusal. If a command is blocked with a "branch ownership violated" message, you are running against the MAIN checkout (a stray `cd`/`-C` back to the hub): return to the worktree and retry — never `git checkout -b` in a hub (blocked for agent-infra and non-infra alike; the M3 create-new carve-out was removed in #626).
+**Pre-flight: the main-worktree-guard's branch-ownership gates (#265) run on every bash tool_call.** This skill runs from the session's WORKTREE — agent-infra included (the #99 in-main-work exemption was removed in #615; the agent-infra hub is main+clean like every hub, and in-hub `checkout -b` is BLOCKED there too, #626). In a worktree BOTH the M2/M3 gates and the legacy destructive-block arm are worktree-exempt (`eff.isWorktree`) — M2/M3 apply only to MAIN-checkout-effective mutations, and the legacy arm carries its own exemption — so the pre-flight's own-branch hygiene ops — `pull --rebase`, `rebase`, `merge origin/<default>`, `push` incl. `--force-with-lease` — run ungated on the worktree's branch. The merged-branch cleanup's remote `git push --delete <branch>` is NOT worktree-exempt: it hits the #73 coordinated-delete guard while the branch is checked out in ANY worktree (including this one), so run it after teardown (05-cleanup.md Step 3.8) or use `gh api -X DELETE`. The guard matches the LITERAL ref in the command text, and ⛔ since #653 an UNRESOLVABLE target is REFUSED fail-closed: a shell-variable form (`git push origin --delete "$PR_BRANCH"`), a `$(…)`/backtick substitution, a glob or a brace expansion cannot be resolved to a ref, so the delete is blocked with the literal-ref remedy — write the branch name OUT (resolve it first, then type it), or use `gh api -X DELETE`. It is not a bypass and not an allow: the variable form is now the one that fails. The local `git branch -D` is best-effort: git refuses it while checked out, and after teardown the HUB's main-checkout `block:branch-force-delete` gate blocks a branch that is not the session's baseline or pid-owned (a `git worktree add -b` branch is never recorded as owned — create-new is blocked, #626). A guard block rejects the bash call BEFORE the shell runs, so write the teardown note yourself — the `||` echo only covers git's own refusal. If a command is blocked with a "branch ownership violated" message, you are running against the MAIN checkout (a stray `cd`/`-C` back to the hub): return to the worktree and retry — never `git checkout -b` in a hub (blocked for agent-infra and non-infra alike; the M3 create-new carve-out was removed in #626).
 
 Notes: `commit.gpgsign=false` is process-scoped and prevents headless pinentry
 hangs during rebase (fleet ships squash-merged; research-verified). Condition 5
@@ -675,6 +675,33 @@ surface; a `--global`/env key does NOT activate — confirmed by a checked-in
 present; agent-infra #1491),
 is resolved on pinned commit OIDs, and is never chosen from a ref name or the
 push remote's `main`. No config ⇒ no narrowing (fail closed).
+
+### A record under a SIBLING worktree root is satisfied by CONTENT (#2886)
+
+Records are keyed on `(worktree root, relative path)`. A **rebase re-creates the branch in a
+new worktree**, so every record made for it becomes unusable at once: the next `git commit`
+or `git push` is refused with a list of every file the branch ever touched reported as "no
+verification record for this root", while the op changes a handful — and the only honest
+remedy left is verifying the whole tree again, which is a rubber stamp over files nobody
+read (measured: 5 changed files, ~150 demanded, daniel-ospina/DMeer#1371).
+
+Since #2886 a path with **no record under this root** is satisfied when a record for the
+**same relative path** under a **different root of the SAME repository** still matches the
+bytes at the op's own root. Verification is a judgment about content and the record IS a
+digest, so unchanged bytes re-rooted into a new worktree need no second verdict.
+
+- It never adopts another tree's **root** or substitutes its diff: the scope is still computed
+  from THIS root's own diff (#1265 — an adopted clean tree yields an EMPTY scope that would
+  ALLOW an op carrying unverified content). The borrowed path's RECORD is re-rooted into this
+  root's registry (so a later op in this session needs no registry read), audited once at borrow
+  time by the `gate_skip` row below — that row is the provenance.
+- Guards, all fail-closed: same repository by shared `--git-common-dir` (an unrelated
+  checkout is never borrowed, however identical its bytes); the relative path must match; a
+  record whose root is gone or unreadable is skipped; a digest that does not match is a no-op.
+- It writes a `gate_skip` line with `reason: foreign_root_blob_identical` naming the paths
+  and the roots they were borrowed from.
+- **Opt out:** `ELDATO_VGATE_NO_SUBTRACT=1`, like every other narrowing (it can cost time,
+  never coverage).
 
 ### VGATE ceremony diagnostics & recovery (#561)
 

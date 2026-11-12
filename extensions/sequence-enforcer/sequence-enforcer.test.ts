@@ -258,7 +258,13 @@ await test("parseTokenTs: ISO string → epoch ms", () => {
 });
 
 await test("parseTokenTs: numeric-ms number → as-is", () => {
-  equal(parseTokenTs(Date.now()), Date.now());
+  // ⛔ ONE `Date.now()`, NOT TWO (measured RED on CI, run 42732698043). `equal(parseTokenTs(Date.now()),
+  // Date.now())` compares two DIFFERENT reads of the clock, so it fails by 1 ms whenever the tick lands
+  // between them — a flaky RED on a required check, which is a false block on every PR that touches a
+  // different file. The subject is "a numeric-ms value passes through unchanged", and that is what this
+  // asserts now.
+  const now = Date.now();
+  equal(parseTokenTs(now), now);
 });
 
 await test("parseTokenTs: numeric-s (1.7e9) → ×1000 → ms", () => {

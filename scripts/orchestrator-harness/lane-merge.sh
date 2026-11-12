@@ -351,10 +351,31 @@ LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-7200}}"; is_limit "$LANE_WALL_
 # resolved once, here, and every message that renders `LANE_WALL_S` names it.
 if is_limit "${LANE_TIMEOUT:-}" && [ "${LANE_TIMEOUT}" = "${LANE_WALL_S}" ]; then
   LANE_WALL_SRC="LANE_TIMEOUT"
-elif is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N}" = "${LANE_WALL_S}" ]; then
+# ⛔ THE BACKSTOP IS THE SOURCE ONLY WHEN THE ARMING EXPRESSION WOULD ACTUALLY PICK IT (MEASURED, and it is
+# the same defect one configuration over from the one below). The test here used to be VALUE EQUALITY alone,
+# which attributes by coincidence and not by the rule: `LANE_WALL_S` is `${LANE_TIMEOUT:-…}`, so a NON-EMPTY
+# `LANE_TIMEOUT` wins the mask and the backstop is never read — yet with `LANE_TIMEOUT=abc
+# LANE_BACKSTOP_S=7200` (7200 is spawn-gate.sh:3419's own default, i.e. the value in EVERY lane's env) the
+# backstop happens to equal the shipped default, so the elif matched and every message rendered "from
+# LANE_BACKSTOP_S" while naming no malformed knob at all. `-z ${LANE_TIMEOUT}` is the resolution rule
+# itself, not a second opinion about the number: it is empty exactly when `${LANE_TIMEOUT:-…}` falls through.
+elif [ -z "${LANE_TIMEOUT:-}" ] && is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N}" = "${LANE_WALL_S}" ]; then
   LANE_WALL_SRC="LANE_BACKSTOP_S"
 else
-  LANE_WALL_SRC="no usable LANE_TIMEOUT or LANE_BACKSTOP_S, so the shipped default stands"
+  # ⛔ NAME THE KNOB THAT IS ACTUALLY AT FAULT (review, P3 — MEASURED). This branch used to say "no usable
+  # LANE_TIMEOUT or LANE_BACKSTOP_S", which sends an operator to inspect TWO knobs when exactly ONE is at
+  # fault, and asserts the other is unusable when it can be perfectly usable: `LANE_TIMEOUT=abc
+  # LANE_BACKSTOP_S=3600` printed that sentence while 3600 was a valid bound. It was not consulted because
+  # `LANE_WALL_S` above is `${LANE_TIMEOUT:-...}`, and `lane.sh:882` arms the lane with the IDENTICAL
+  # expression — so the line states the masking instead of inviting a fall-through, which would make this
+  # file's clock disagree with the armed one (the mirror-image of the bug this branch fixes).
+  if [ -n "${LANE_TIMEOUT:-}" ]; then
+    LANE_WALL_SRC="the shipped default, because LANE_TIMEOUT='${LANE_TIMEOUT}' is not a bounded integer, and LANE_BACKSTOP_S=${LANE_BACKSTOP_S:-<unset>} was NOT consulted — the arming path masks it with the same \${LANE_TIMEOUT:-…} expression"
+  elif [ -n "${LANE_BACKSTOP_S:-}" ]; then
+    LANE_WALL_SRC="the shipped default, because LANE_BACKSTOP_S='${LANE_BACKSTOP_S}' is not a bounded integer"
+  else
+    LANE_WALL_SRC="the shipped default, because neither LANE_TIMEOUT nor LANE_BACKSTOP_S is set"
+  fi
 fi
 # ⛔ THE DESIGN OPERAND IS THE CALLER'S, NOT THE ARMED ONE (review, P2 — MEASURED, and it is a false block
 # this diff would otherwise introduce). `MAX_WATCH_FIT` is derived from `LANE_WALL_S` at its own definition
@@ -745,7 +766,11 @@ checks_read() { # checks_read <head> [--full]
   local q="repos/$OR/commits/$head/check-runs?per_page=100&filter=all"
   local rows='(.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // ""), (.id // 0), (.app.slug // "")] | @tsv)'
   if [ "$full" = "--full" ]; then
-    gh api "$q" --paginate --jq "$rows" 2>/dev/null
+    # ⛔ NO 2>/dev/null ON THIS ONE (#3858). The single-page poll above can stay quiet — its TOTAL row
+    # already answers "is this all of it" — but on the PAGINATED path the read's own stderr is the only
+    # place the reason a page stream stopped exists, and suppressing it left an operator looking at a
+    # held head with nothing to act on. The caller routes it to a file and prints the first line.
+    gh api "$q" --paginate --jq "$rows"
     return $?
   fi
   # One page, plus the total as a 2-field TSV row so the caller can tell "this page is all of it"
@@ -867,8 +892,67 @@ resolve_trusted_checkout() {
 # silent for ~15-25 minutes, which reads as a wedged lane to every liveness instrument we have.
 # ⛔ AND IT WILL NOT DOUBLE-REVIEW: merge-one.sh takes state/mergeclaim-<PR>.lock first, so a chain
 # the controller already spawned owns the PR and ours exits without paying a second reviewer.
+# _lm_tree_kind <dir> — ONE of `main` / `flat` / `linked` / `unknown`. The caller decides.
+# ⛔ THE QUESTION IS "IS THIS A LANE'S OWN CHECKOUT?", NOT "IS THIS A MAIN WORKTREE?" (fresh-context
+# review of #3846, P1-2; MEASURED). The anti-bypass rule from #3789 is "a lane must not merge its PR
+# through ITS OWN edited merge gate", and the realistic shape of that attack is a lane editing
+# `merge-one.sh` inside its own `.worktrees/tm-<N>` checkout and having the beside-file fallback pick
+# it up. A lane checkout is a LINKED worktree. Asking "is it a MAIN worktree" refuses that — and ALSO
+# refuses the operator-seeded runtime, which is a FLAT `cp -p` tree with no `.git` at all (the shape
+# `deploy-harness.sh` produces), so `git rev-parse --git-dir` failed and EVERY lane on a split box
+# exited 2 before any merge work. Measured at the round-10 head: `/home/cmux/orchestrator` (this box's
+# real seeded runtime) -> REFUSED; a fresh `cp -p` seed -> REFUSED; the same tree after `git init` ->
+# MAIN-YES. The property to refuse is a LINKED worktree, and the caller has already established the
+# identity that makes a flat tree trustworthy (`_d` IS the controller-declared harness root).
+# Fail-closed the other way round: a tree that carries a `.git` entry but cannot be resolved is
+# `unknown`, and cannot-tell is never trust.
+_lm_tree_kind() {
+  local d="${1:-}" gd="" common="" c=""
+  if [ -z "$d" ] || [ ! -d "$d" ]; then printf 'unknown'; return 0; fi
+  if ! git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
+    # No readable git dir. A `.git` entry that git REFUSES to read is a tree we cannot classify; a
+    # tree with no `.git` at all is the flat seeded runtime, which is the shape this arm exists for.
+    if [ -e "$d/.git" ]; then printf 'unknown'; else printf 'flat'; fi
+    return 0
+  fi
+  gd="$(git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || { printf 'unknown'; return 0; }
+  common="$(git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || { printf 'unknown'; return 0; }
+  if [ -z "$gd" ] || [ -z "$common" ]; then printf 'unknown'; return 0; fi
+  c="$(cd "$d" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P)" || { printf 'unknown'; return 0; }
+  if [ -z "$c" ]; then printf 'unknown'; return 0; fi
+  if [ "$gd" = "$c" ]; then printf 'main'; else printf 'linked'; fi
+  return 0
+}
+# _lm_root_trusted <dir> — 0 when <dir> may supply the merge authority.
+# ⛔ TRUSTED: `main` (a main checkout — the pre-#2095 shape) and `flat` (the seeded runtime, which is
+# what `deploy-harness.sh` produces and what the README's split-state table promotes).
+# ⛔ REFUSED: `linked` (a lane's own checkout — #3789) and `unknown` (a `.git` git cannot resolve).
+# ⛔ RESIDUAL, STATED RATHER THAN HIDDEN: `flat` is trusted because the caller has already required
+# `_d` == the controller-declared `O_WORK`, and that is a DECLARATION a lane can set — so a lane that
+# copies a harness into a flat directory and points `O_WORK` at it is not refused by this predicate.
+# It was not refused before either (`O_WORK` is exactly as settable as `$O`, whose copy has always
+# been the trusted authority, and a lane can write there too); what this predicate closes is the
+# REALISTIC shape — the lane's own `.worktrees/<lane>` checkout, which is a linked worktree.
+_lm_root_trusted() {
+  case "$(_lm_tree_kind "${1:-}")" in
+    main|flat) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 launch_chain() {
-  local head="$1" chain="$O/merge-one.sh"
+  local head="$1" chain="$O/merge-one.sh" _d="" _o_canon="" _root=""
+  # ⛔ `$O` IS THE CONTROLLER'S STATE DIR, AND THE HARNESS ROOT IS A SEPARATE NAME (#2095; fresh-context
+  # review of #3846, P1). Since this PR, `orch-loop.sh` exports `O` = the state dir and `O_WORK` = the
+  # harness root; on the documented `ORC_STATE_DIR` arrangement, and on every `derived:isolated(<copy>)`
+  # instance, `<state>/merge-one.sh` cannot exist and the identity test below compared against a
+  # directory the harness never lives in — so EVERY lane on such a box exited 2 before any merge work,
+  # with an exit code `lane.sh`'s table does not even map (`:580-591` lists 0/10/15/11/12/13/14) and a
+  # remedy (`deploy-harness --o $O`) that would install a whole harness INTO the state dir, undoing the
+  # split. `$O/merge-one.sh` is still tried FIRST: the operator-seeded runtime keeps exact priority, so
+  # no existing box changes behaviour by one byte.
+  _o_canon="$(cd "$O" 2>/dev/null && pwd -P)" || _o_canon="$O"
+  _root="$(cd "${O_WORK:-$O}" 2>/dev/null && pwd -P)" || _root=""
   # ⛔ THE FALLBACK MUST RESOLVE TO THE SAME TREE AS $O, NOT WHEREVER THIS FILE WAS INVOKED. $O's copy
 # is the operator-seeded authority precisely so a lane cannot choose its own gate — and the natural
 # way for a lane to run this script is the checkout copy (`scripts/orchestrator-harness/lane-merge.sh`
@@ -876,19 +960,33 @@ launch_chain() {
 # branch merge its PR through ITS version of the merge gate. Refuse instead: the lane's remedy is to
 # sync the harness, which is safe.
 if [ ! -f "$chain" ]; then
-  _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ "$_d" = "$(cd "$O" 2>/dev/null && pwd)" ]; then
+  _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  if [ "$_d" = "$_o_canon" ]; then
+    # TODAY'S PATH, UNCHANGED: the state dir IS the seeded runtime.
+    chain="$_d/merge-one.sh"
+  elif [ -n "$_root" ] && [ "$_d" = "$_root" ] && [ -f "$_root/merge-one.sh" ] && _lm_root_trusted "$_d"; then
+    # THE CONTROLLER-DECLARED HARNESS ROOT (#2095). Three conditions: a lane CAN set `O_WORK` itself,
+    # so the value alone is not identity — the copy beside the running script must be THAT tree — and
+    # #3789 keeps the last one: the tree must not be a LINKED worktree, which is exactly what a lane's
+    # own `.worktrees/<lane>` checkout is. A FLAT tree (no `.git`) is the seeded runtime and is
+    # accepted; refusing it was the P1-2 defect that made every lane on such a box exit 2.
     chain="$_d/merge-one.sh"
   else
-    say_err "lane-merge: $O/merge-one.sh is missing and the copy beside this script ($_d) is not the"
-    say_err "  harness $O — refusing to select the merge authority from a checkout that may be a lane's"
-    say_err "  own branch. Redeploy it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
+    say_err "lane-merge: no merge authority found — looked in $O/merge-one.sh and in the harness root"
+    say_err "  ${_root:-<unresolved>}/merge-one.sh; the copy beside this script ($_d) is neither the"
+    say_err "  state dir ($_o_canon) nor the controller-declared harness root ($_root), or it is a"
+    say_err "  LINKED worktree / an unreadable git tree, so it may be a lane's own branch. Refusing to"
+    say_err "  select the merge authority from it."
+    say_err "  If this box keeps its state elsewhere, the harness root must be the tree the controller"
+    say_err "  runs from (a main checkout, exported as O_WORK); the remedy is to re-seed THAT tree:"
+    say_err "  bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_root:-$O}"
     exit 2
   fi
 fi
   if [ ! -f "$chain" ]; then
-    say_err "lane-merge: merge-one.sh not found (looked in $O and beside this script) — refusing to"
-    say_err "            hand-roll a merge; redeploy the harness (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
+    say_err "lane-merge: merge-one.sh not found (looked in $O, the harness root ${_root:-<unresolved>}, and"
+    say_err "            beside this script) — refusing to hand-roll a merge; redeploy the harness"
+    say_err "            (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_root:-$O})"
     return 1
   fi
   # ⛔ THE CHECKOUT THE CHAIN RUNS FROM IS RESOLVED, NEVER INHERITED (landing-review F1). Resolved here,
@@ -1701,7 +1799,10 @@ esac
 # Wait for THIS head's checks to be terminal, bounded, printing progress so the lane never looks
 # wedged and so a human reading the transcript can see it is making progress and not hung.
 CHECK_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks.XXXXXX")" || exit 2
-trap 'rm -f "$CHECK_TMP"' EXIT
+# Where the FULL (paginated) check-run read's stderr lands, so a read that stopped early can say why
+# (#3858). Separate from CHECK_TMP because that one is the classifier's input.
+CHECK_ERR_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks-err.XXXXXX")" || { rm -f "$CHECK_TMP"; exit 2; }
+trap 'rm -f "$CHECK_TMP" "$CHECK_ERR_TMP"' EXIT
 # ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S **REMAINING** WALL CLOCK, NOT JUST THE WHOLE OF IT
 # (#3584 review, P1 — verified). `deadline` was `now + WAIT_S` and nothing compared it with how much of
 # `LANE_WALL_S` THIS lane had already spent. At the shipped numbers a lane entering its merge phase more
@@ -1748,7 +1849,7 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
     _watch_basis_note="an explicit LANE_MERGE_MAX_WATCH=0, which DISABLES the supervision counter"
     _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
   elif is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N:-0}" -gt 0 ]; then
-    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N}s), because the wall axis (LANE_TIMEOUT) is OFF"
+    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N}s), because the wall axis (${LANE_WALL_SRC}) is OFF"
     # ⛔ THE FIGURE MUST BE WHAT THE CODE WILL USE, WHICH INCLUDES THE ELAPSED SUBTRACTION (review cycle
     # 16, P3 — measured: the line printed "a FINITE 29 chunk(s)" on a lane that had spent 3400 s of its 3600 s
     # backstop, where `--watch` derives 1). `_lane_elapsed` is already resolved above for the wait clamp; this
@@ -1771,10 +1872,31 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
       fi
     fi
   else
-    _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_TIMEOUT=0) and no LANE_BACKSTOP_S is exported"
+    # ⛔ THE KNOB NAMED HERE IS THE ONE THAT RESOLVED TO 0, AND THE SENTENCE ABOUT THE BACKSTOP IS A
+    # MEASUREMENT, NOT AN ASSUMPTION (review, P3 — MEASURED both ways). `LANE_BACKSTOP_S=0` with
+    # `LANE_TIMEOUT` unset resolves `LANE_WALL_S` to 0 FROM THE BACKSTOP, yet this branch announced
+    # "LANE_TIMEOUT=0" (a variable never set) and "no LANE_BACKSTOP_S is exported" — while it was
+    # exported, as 0. `lane_wall_bound` arms `--wall 0` for that value, so it really is the OFF switch;
+    # the line must say so instead of telling an operator to set the knob they already set.
+    case "${LANE_WALL_SRC}" in
+      LANE_BACKSTOP_S)
+        _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N} is the same OFF switch lane_wall_bound honours, and LANE_TIMEOUT is unset or empty)" ;;
+      *)
+        if [ -n "${LANE_BACKSTOP_S_N:-}" ]; then
+          _watch_basis_note="no clock at all, because the wall axis is OFF (${LANE_WALL_SRC}=0) and LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N} is the same OFF switch rather than a clock"
+        else
+          _watch_basis_note="no clock at all, because the wall axis is OFF (${LANE_WALL_SRC}=0) and no LANE_BACKSTOP_S is exported"
+        fi ;;
+    esac
     _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
   fi
-  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the design check wait is ${WAIT_S_DESIGN}s and it is NOT clamped by the wall clock (a WATCHDOG cap may still have reduced it to ${WAIT_S}s, and the line above says so when it did), and no wall ceiling is enforced for this lane. Reading 0 as a zero-second budget would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ AND NOTE THE OTHER AXIS: the --watch supervision allowance is NOT derived from that zero clock (review cycle 13, P2) — it comes from ${_watch_basis_note}, so it is ${_watch_supervision_note} here. Do not read this line as 'this lane has no bounds at all'."
+  # ⛔ THE HEADLINE NAMES THE KNOB THAT IS ACTUALLY OFF, NEVER A LITERAL (review, P3 — measured: a
+  # `LANE_BACKSTOP_S=0` lane was told "LANE_TIMEOUT=0 is the documented 'wall axis OFF' value" about a
+  # variable it never set, on the one line an OFF-axis operator reads). Guarded to a knob NAME so a
+  # longer source phrase can never be pasted into an `<operand>=0` sentence.
+  _wall_off_knob="LANE_TIMEOUT"
+  case "${LANE_WALL_SRC}" in LANE_TIMEOUT|LANE_BACKSTOP_S) _wall_off_knob="${LANE_WALL_SRC}" ;; esac
+  say_err "lane-merge: ${_wall_off_knob}=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the design check wait is ${WAIT_S_DESIGN}s and it is NOT clamped by the wall clock (a WATCHDOG cap may still have reduced it to ${WAIT_S}s, and the line above says so when it did), and no wall ceiling is enforced for this lane. Reading 0 as a zero-second budget would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ AND NOTE THE OTHER AXIS: the --watch supervision allowance is NOT derived from that zero clock (review cycle 13, P2) — it comes from ${_watch_basis_note}, so it is ${_watch_supervision_note} here. Do not read this line as 'this lane has no bounds at all'."
 elif [ -n "$_lane_elapsed" ]; then
   _wall_left=$(( LANE_WALL_S - _lane_elapsed - _hb_margin ))
   [ "$_wall_left" -ge 0 ] || _wall_left=0
@@ -1795,7 +1917,29 @@ fi
 _wait_t0="$(date +%s)"
 deadline=$(( _wait_t0 + WAIT_S ))
 while :; do
-  rows="$(checks_read "$HEAD")"
+  # ⛔ A CHECK-RUN READ THAT DID NOT FINISH IS NOT A MEASUREMENT — AND ON THIS LOOP IT FLIPS THE
+  # VERDICT (#3858). Both reads below hand their rows to `classify`, which derives GREEN from the rows
+  # it is GIVEN (`IF=0` + empty RED over whatever arrived) — so a read that dropped rows drops the
+  # PENDING ones with them, a head with queued runs looks terminal-and-clean, and the loop `break`s,
+  # which is the ONLY path to `launch_chain`. Measured on a fixture (issue #3858, 2026-11-09): page 2
+  # held `redjob failure`, page 1 held one green row, and origin/main launched the merge chain on that
+  # unmeasured head; the same fixture with page 2 delivered exited 10 FIX_REQUIRED. The missing page IS
+  # the difference between the two verdicts, so this is a false PASS in the merge gate, not a partial
+  # log line. The verdict was reproducible because the read's exit status was DISCARDED here and no
+  # row count was ever compared with the TOTAL the single-page read had just returned: completeness was
+  # assumed from having ASKED for more.
+  # ⛔ BOTH HALVES ARE NEEDED AND NEITHER SUBSTITUTES FOR THE OTHER: the exit status catches a read
+  # that FAILED (a secondary rate limit, a 502 on page 2, a broken pipe), and the COUNT catches one
+  # that exited 0 having silently dropped rows — which is why the exit-status fix alone is not the fix.
+  # The count assertion is also the external convention: GitHub's REST check-runs response carries
+  # `total_count`, and comparing the flattened row count against it (fail closed on a mismatch) is how
+  # a pagination is known to have ended. Same shape this repo's own graph reads adopted — a `truncated:`
+  # marker rather than silence.
+  # ⛔ FAIL-CLOSED DIRECTION: a truncated/undetermined read is HELD (IF=1, RED empty, retried next
+  # poll, reported WAITING_CHECKS at the bound) — the bucket an unreadable classification already uses.
+  # It is never green, and the loop's own bound keeps a held head from waiting for ever.
+  _read_rc=0
+  rows="$(checks_read "$HEAD")"; _read_rc=$?
   # The single-page read carries a TOTAL line so "this page is all of it" is distinguishable from
   # "there is more". Only then pay for the full paginated read (the rare case), and never let the
   # TOTAL line itself reach the classifier — a head with 0 check-runs would otherwise classify as
@@ -1804,10 +1948,35 @@ while :; do
   # would arrive with 5 fields — matching it here would read a status string as a count.
   total="$(printf '%s\n' "${rows:-}" | awk -F'\t' '$1=="TOTAL" && NF==2 {print $2; exit}')"
   rows="$(printf '%s\n' "${rows:-}" | awk -F'\t' 'NF>=4')"
-  if [ -n "${total:-}" ] && [ "$total" -gt 100 ] 2>/dev/null; then
-    rows="$(checks_read "$HEAD" --full)"
+  _undet=""; _n=0
+  if [ "$_read_rc" -ne 0 ]; then
+    # A non-zero exit can still have printed rows (the shim writes as it goes), and none of them can
+    # be trusted as the whole set. On a SUCCESSFUL single page the TOTAL row is always present, so
+    # "no TOTAL and rc 0" is not a reachable state in production and "no TOTAL" needs no arm here.
+    _undet="the single-page check-run read FAILED (exit ${_read_rc})"
+  elif [ -n "${total:-}" ] && [ "$total" -gt 100 ] 2>/dev/null; then
+    : > "$CHECK_ERR_TMP"
+    _full_rc=0
+    rows="$(checks_read "$HEAD" --full 2>"$CHECK_ERR_TMP")"; _full_rc=$?
+    # Count the rows the classifier will actually see (NF>=4, exactly its own predicate). A job name
+    # carrying an embedded newline can only ever DEFLATE this count, and a deflated count holds — the
+    # safe direction. Growth (check-runs created between the two reads) is expected and allowed.
+    _n="$(printf '%s\n' "${rows:-}" | awk -F'\t' 'NF>=4 {n++} END{print n+0}')"
+    if [ "$_full_rc" -ne 0 ]; then
+      _undet="the FULL (paginated) check-run read FAILED (exit ${_full_rc}) after ${_n} of ${total} rows"
+    elif [ "${_n:-0}" -lt "$total" ]; then
+      _undet="the FULL (paginated) check-run read returned ${_n} of ${total} rows, so it was TRUNCATED"
+    fi
   fi
-  if [ -z "${rows:-}" ]; then
+  if [ -n "$_undet" ]; then
+    log_line "… ${_undet} at head ${HEAD:0:12} — a partial read is not a measurement, so this head is HELD (a truncation never reads as green)"
+    # Say WHY the read stopped, once: the read's own stderr is the only place that reason exists.
+    if [ -s "$CHECK_ERR_TMP" ]; then
+      _why="$(head -1 "$CHECK_ERR_TMP" 2>/dev/null)"
+      [ -n "$_why" ] && say_err "lane-merge:   the read said: ${_why:0:400}"
+    fi
+    IF=1; RED=""
+  elif [ -z "${rows:-}" ]; then
     # An EMPTY check-run set is not a green set: nothing has been measured. Keep polling (this is
     # the "a queued run is not a green run" rule at its surface), and the bound below reports it.
     log_line "… no check-runs reported for head ${HEAD:0:12} yet — a queued run is not a green run"
@@ -1882,6 +2051,15 @@ while :; do
     # four ways AFTER the constant is read (watchdog allowance, remaining wall clock, a lost heartbeat,
     # the seam), so a line rendered from `WAIT_S` would name a bound that never fired.
     _waited=$(( now - _wait_t0 ))
+    # ⛔ A HELD HEAD IS NOT AN IN-FLIGHT ONE (#3858). When the last read could not be completed, the
+    # in-flight count is this loop's own placeholder, so quoting it as "still in flight" would report a
+    # state nobody measured. Name the read failure instead.
+    if [ -n "${_undet:-}" ]; then
+      log_line "… this head's checks could NOT be measured after ${_waited}s (${_undet}) — re-run this script; nothing was merged"
+      disposition WAITING_CHECKS
+      verdict WAITING_CHECKS "check-run read incomplete after ${_waited}s: ${_undet}"
+      exit 11
+    fi
     log_line "… checks still IN FLIGHT (${IF}) after ${_waited}s — re-run this script; nothing was merged"
     disposition WAITING_CHECKS
     verdict WAITING_CHECKS "checks still in flight after ${_waited}s"

@@ -80,8 +80,12 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
 # provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# ⛔ AND THE ROOTS ARE TWO NAMES NOW (#2095; review of #3846). `O` is the controller's STATE dir and
+# `O_WORK` is the harness root, so on an `ORC_STATE_DIR`/isolated instance the seeded adapters live
+# under the WORK root — reading `$O` here would leave a lane unthrottled and without the REST adapter
+# while every gate reports the layer present.
+if [ -d "${O_WORK:-$O}/gh-limit" ]; then PATH="${O_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 # ── THE TERMINAL LINE: EVERY LANE LOG ENDS BY SAYING WHAT HAPPENED (agent-infra#3331) ─────────────
 # Measured 2026-11-02 on two cells: a lane's log simply STOPPED, and the dispatch record still said
 # "launched". A print-mode `pi` buffers, so a log that ends silently is indistinguishable from a lane
@@ -323,8 +327,10 @@ unset LANE_TARGET_ARG LANE_ISSUE_ARG LANE_BRANCH_ARG LANE_REPO_DIR_ARG LANE_OUT_
 # answers `0`. The file still owns the REST of PATH (its entries keep their order and reach the child);
 # only the two adapter directories are pinned back in front, which is the rule :64-65 already states.
 # A6 is untouched: it drives `lane-env.sh` directly and never runs this file.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# The one substitution from :83-84 is the WORK ROOT (#2095, review of #3846): `O_WORK` when the
+# controller names a state dir, `$O` otherwise.
+if [ -d "${O_WORK:-$O}/gh-limit" ]; then PATH="${O_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
@@ -892,6 +898,83 @@ else
     exit "$KEY_GATE_RC"
   fi
 fi
+# ── THE RUN-SCOPED OUTPUT OFFSET (agent-infra#2833) ─────────────────────────────────────────────
+# The lane log is APPEND-ONLY across runs (`tee -a` / `>>`), so any read of "what did this run's agent
+# printed" must start at the byte this run appended from. The same stale-flag class the per-run
+# verdict file closes for `outcome=`, closed here for the agent's own transcript: a PREVIOUS attempt
+# that died of a connection storm must not classify THIS attempt's exit as transport (see the
+# attribution block below for why that matters).
+LANE_AGENT_LOG_OFF=0
+if [ -r "$O/logs/lane-$N.log" ]; then
+  LANE_AGENT_LOG_OFF="$(wc -c < "$O/logs/lane-$N.log" 2>/dev/null | tr -dc '0-9')"
+fi
+LANE_AGENT_LOG_OFF="${LANE_AGENT_LOG_OFF:-0}"
+# The agent's OWN output for THIS run — never the whole file. Streamed, not buffered: a print-mode
+# transcript is tens of MB and this runs once, at exit.
+lane_run_output() {
+  [ -r "$O/logs/lane-$N.log" ] || return 0
+  tail -c "+$(( ${LANE_AGENT_LOG_OFF:-0} + 1 ))" "$O/logs/lane-$N.log" 2>/dev/null || true
+}
+# ── THE EXIT IS ATTRIBUTED TO ITS OWN CAUSE BEFORE IT IS EVER CALLED A WORK FAILURE (#2833) ─────
+# MEASURED (this fleet's own lane logs, 2026-11-11): 53 lanes exited non-zero and **all 53** were
+# recorded `outcome=failed reason=agent-exit-<rc>` — the work-failure token — including **35 (66%)**
+# that `lane-bound.sh` had ENDED at the wall-clock ceiling, every one of which carries
+# `[lane-bound] VERDICT verdict=exceeded-wallclock … signal=TERM` in the SAME log. So the artifact the
+# census reads said "the work failed" about lanes that had never been given a chance to finish, which
+# is the reading the whole issue exists to remove ("lanes die constantly, and the harness cannot even
+# say HOW they died"). The information was already measured; the terminal line threw it away.
+#
+# ⛔ THE CLASS IS CARRIED OUT OF BAND, NOT AS A NEW EXIT CODE. This issue proposed a dedicated code
+# (EX_TEMPFAIL 75). Two measured reasons it is not one: 75 is already `AGENT_LOAD_REFUSED` (a
+# REFUSAL, the opposite polarity — no agent ran), and the recorded correction in this repo after
+# #1986 is that a refusal/verdict is NOT an exit code — its value space is shared with `pi` and with
+# sysexits, and overloading it produced a false "refusal" on a verb that had FAILED. No shipped
+# caller of `lane.sh` reads its exit status for a retry decision (`dispatch-merge.sh:476` launches it
+# through `wt_spawn`, detached), so a new code would be an inert signal — the exact no-op-gate class
+# this repo's own A/B rule forbids. The terminal line IS the out-of-band carrier, and it is already
+# the documented single read (`cat $O/logs/lane-<N>.outcome`), so the retry query is one grep:
+#     grep -h '^outcome=died reason=transport-unreachable:' $O/logs/lane-*.outcome
+# ⛔ `LANE_TRANSPORT_MIN_ROTATIONS` IS THE FALSIFIER'S KNOB, and the default is deliberately NOT 1: a
+# lane that logged a single rotation and then failed on its own work is a WORK failure, and retrying
+# it burns a lane's budget for nothing. Three independent rotations of the connection pool inside one
+# run is the shape the issue measured (#1…#23), never a blip.
+case "${LANE_TRANSPORT_MIN_ROTATIONS:-}" in
+  ''|*[!0-9]*) LANE_TRANSPORT_MIN_ROTATIONS=3 ;;
+  *)           LANE_TRANSPORT_MIN_ROTATIONS="$((10#${LANE_TRANSPORT_MIN_ROTATIONS}))" ;;
+esac
+lane_transport_rotations() {
+  local n
+  n="$(lane_run_output | grep -c -- 'rotated connection pool' 2>/dev/null || true)"
+  n="$(printf '%s' "${n:-0}" | tr -dc '0-9')"
+  printf '%s\n' "${n:-0}"
+}
+# The killer, read back from the run's own bound verdict file — and, when `run_agent` could not hand
+# it over (a pre-change `$O` helper under the tolerant-reference rule), from the `[lane-bound]
+# VERDICT` line `lane-bound.sh` writes into the same log. Run-scoped for the same reason the rotation
+# read is: a previous attempt's verdict must not answer for this one.
+# ⛔ AN ALLOW-LIST, NEVER "ANYTHING THAT IS NOT EMPTY" (found in this change's own review, MEASURED on
+# the arm 9g/9h fixtures). `lane-bound.sh` emits a `VERDICT` line on EVERY path — including
+# `verdict=finished`, the line it writes when the bound watched the agent END ON ITS OWN, and
+# `verdict=unknown`, the field's own default. `spawn-gate.sh` clears `finished` out of
+# `AGENT_BOUND_VERDICT` precisely because "empty means the agent finished on its own", so a truthiness
+# test here RE-ADMITTED the word the caller had filtered: a lane that failed its OWN work was written
+# `outcome=died reason=finished`, erasing the work-failure claim that is the entire point of the
+# attribution above and handing the census a death nothing killed. `reason=unknown` is the same defect
+# the other way round — a death that names no killer, which is the blindness #2833 was filed over.
+# Only the two verdicts that NAME A BOUND may classify the exit; any other value (a future word
+# included) means NO bound ended this lane, which is the fail-safe direction: the item's work keeps the
+# claim, and a bound kill that loses its verdict line is reported as a plain non-zero exit rather than
+# as an unnamed death.
+lane_bound_killer() {
+  local v="${AGENT_BOUND_VERDICT:-}"
+  if [ -z "$v" ]; then
+    v="$(lane_run_output | sed -n 's/.*\[lane-bound\] VERDICT verdict=\([a-z-]*\).*/\1/p' 2>/dev/null | tail -1)"
+  fi
+  case "$v" in
+    stalled|exceeded-wallclock) printf '%s\n' "$v" ;;
+    *)                         : ;;
+  esac
+}
 run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
@@ -953,7 +1036,28 @@ if [ "$AGENT_STARTED" = "0" ]; then
 elif [ "$rc" = "0" ]; then
   lane_outcome done "agent-exit-0"
 else
-  lane_outcome failed "agent-exit-$rc"
+  # ── ATTRIBUTION (#2833): WHO ended this lane, before calling it a work failure ──────────────────
+  # Order matters and is not interchangeable. A bound that ended the lane is a fact about the
+  # HARNESS (retrying on this box hits the same ceiling); transport is a fact about the BOX's data
+  # path (retrying is right); the work failing is a fact about the ITEM (retrying repeats it). Fold
+  # any of the first two into the third and the census reports a work failure for a lane that never
+  # got to work — which is the reading this issue was filed over.
+  LANE_KILLER="$(lane_bound_killer)"
+  LANE_ROTATIONS="$(lane_transport_rotations)"
+  if [ -n "${LANE_KILLER:-}" ]; then
+    # `exceeded-wallclock` / `stalled` — lane-bound.sh ended it and the verdict names the bound, the
+    # silence, the CPU delta and the signal (item 4 of #2833: "the kill reason must name the killer").
+    lane_outcome died "${LANE_KILLER}"
+    echo "[lane $N] ATTRIBUTED: the agent exited $rc because a BOUND ENDED THIS LANE (verdict=${LANE_KILLER}) — this is NOT a work failure, and the bound's own line above carries the elapsed/silence/CPU readings that decided it. Do not re-dispatch the same item to the same box unchanged: the bound fires again." >> "$O/logs/lane-$N.log"
+  elif [ "${LANE_ROTATIONS:-0}" -ge "${LANE_TRANSPORT_MIN_ROTATIONS:-3}" ] 2>/dev/null; then
+    # The model/provider was unreachable for this run: the agent's own transcript carries N pool
+    # rotations, i.e. N successful recoveries that were followed by another dead connection and
+    # finally by an exit that is not about the work. RETRYABLE — the reason token says so.
+    lane_outcome died "transport-unreachable:rc$rc:rotations=$LANE_ROTATIONS"
+    echo "[lane $N] ATTRIBUTED: the agent exited $rc after $LANE_ROTATIONS connection-pool rotation(s) in THIS run — the model/provider was unreachable, so this is a TRANSPORT death, NOT a work failure. Retryable: nothing about the item is implicated. Re-dispatch it (the pool rotation count is on the terminal line) rather than treating it as a failed attempt at the work. (agent-infra#2833)" >> "$O/logs/lane-$N.log"
+  else
+    lane_outcome failed "agent-exit-$rc"
+  fi
 fi
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh

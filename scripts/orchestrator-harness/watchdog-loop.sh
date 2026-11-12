@@ -72,10 +72,11 @@
 #             operator who wants the fleet stopped must keep a live controller, or point
 #             `WATCHDOG_PLIST` at nothing. ⛔ A PRE-`enable` refusal on a `disabled` read was considered
 #             and is WRONG: it would make this arm inert for its own main case. The mechanism, in
-#             `orch-loop.sh`'s own words: the lock is `LOCKF="$O/.orch.lock"` (`:1570`) and its
-#             acquisition is `if ! acq; then … if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID"; then echo
-#             "[orch-loop] already running (pid $OPID)"; exit 0` (`:1573-1574`) — so a newcomer beside a
-#             LIVE lock-holder EXITS AT ONCE rather than queueing behind it (and `KeepAlive` then
+#             `orch-loop.sh`'s own words: the lock is `LOCKF="$O/.orch.lock"` and its acquisition is
+#             `orc_singleton_acquire "$LOCKF"` (its decision lives in `controller-state.sh`;
+#             agent-infra#2095) — a newcomer beside a LIVE lock-holder EXITS AT ONCE, with **75** and a
+#             `[singleton]` line naming the holder, rather than queueing behind it (this used to be a
+#             silent `exit 0`; the arm's reasoning is unchanged, its citation was) (and `KeepAlive` then
 #             relaunches it into the same exit, i.e. thrash), while where that controller's lock is
 #             ABSENT OR STALE the newcomer TAKES IT OVER. Both ends are the duplicate-controller class
 #             (#1715). ⛔ AN EARLIER VERSION OF THIS COMMENT CITED `orch-loop.sh:1546-1551` AND CLAIMED
