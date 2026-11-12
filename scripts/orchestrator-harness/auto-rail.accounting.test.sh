@@ -66,6 +66,9 @@ eval "$(sed -n '/^forget_tried() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^rail_bound_file() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^rail_bound_state() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^rail_bound_elapsed() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^rail_bound_kills_file() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^rail_bound_kills() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^lane_bound_path() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^reap_bounded_rail() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^launch_rail() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^lock_holder_is_live() {/,/^}$/p' "$SUT")"
@@ -73,7 +76,8 @@ eval "$(sed -n '/^acquire_lock() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^report_search() {/,/^}$/p' "$SUT")"
 for _fn in rail_rows rails_for_repo rails_should_defer candidate_deferred max_total_for \
            rail_already_running rail_says_skip denied cooldown_for forget_tried \
-           rail_bound_file rail_bound_state rail_bound_elapsed reap_bounded_rail launch_rail \
+           rail_bound_file rail_bound_state rail_bound_elapsed rail_bound_kills_file \
+           rail_bound_kills lane_bound_path reap_bounded_rail launch_rail \
            lock_holder_is_live acquire_lock report_search; do
   command -v "$_fn" >/dev/null || { echo "FATAL: $_fn not found in $SUT"; exit 2; }
 done
@@ -96,6 +100,7 @@ LANE_BOUND="$HERE/lane-bound.sh"
 RAIL_MAX_S=60
 RAIL_BOUND_POLL_S=1
 RAIL_BOUND_GRACE_S=15
+RAIL_BOUND_MAX_KILLS=2
 COOLDOWN_S=21600
 COOLDOWN_TRANSIENT_S=900
 LOCK_AGE_GRACE=120
@@ -2572,6 +2577,7 @@ LANE_BOUND="$(dirname "$SUT")/lane-bound.sh"
 RAIL_MAX_S=2            # a 2s ceiling: the shipped 3600s would make this arm untestable
 RAIL_BOUND_POLL_S=1
 RAIL_BOUND_GRACE_S=1    # and a 1s TERM->KILL grace, so the ESCALATION is exercised, not just the TERM
+RAIL_BOUND_MAX_KILLS=2
 LAUNCH_VERIFY_S=1
 LOG=$(mktemp)
 TRIED=$(mktemp)
@@ -2673,6 +2679,65 @@ LANE_BOUND="$_bad_bound"
 grep -q '^9103	feedface	' "$TRIED" && bad "a refused launch must not leave a cooldown row (nothing ran)"
 grep -q '#9103 NOT LAUNCHED' "$LOG" || bad "a refused launch must SAY WHY in the log (no '#9103 NOT LAUNCHED' line)"
 [ -f "$_bpid" ] && { bad "the rail stub RAN despite the missing bound — the refusal is not wired to the launch"; kill -9 "$(cat "$_bpid")" 2>/dev/null; }
+# ── the bound is RESOLVED over the harness's own candidate set, never `dirname $0` alone (review round 2,
+# P1). `lane-bound.sh` is a delivered harness file; `auto-rail.sh` is in NO delivery list and runs from the
+# STATE directory on the box the issue measured — so adjacency is an assumption no manifest makes, and the
+# failure mode is every launch refused with the actuator exiting 0.
+_bres=$(mktemp -d); cp "$LANE_BOUND" "$_bres/lane-bound.sh"; chmod +x "$_bres/lane-bound.sh"
+_bsave=${AGENT_INFRA_PATH:-}; _hsave=$HOME
+# $HOME is redirected too: on a box that HAS the deployed copies this arm would otherwise resolve
+# `$HOME/orchestrator/lane-bound.sh` and prove nothing about the candidate being tested.
+HOME="$_bres/nohome"
+mkdir -p "$_bres/scripts/orchestrator-harness"; cp "$LANE_BOUND" "$_bres/scripts/orchestrator-harness/lane-bound.sh"
+AGENT_INFRA_PATH="$_bres"
+_brp=$(lane_bound_path "/no/such/harness/dir")
+[ "$_brp" = "$_bres/scripts/orchestrator-harness/lane-bound.sh" ] \
+  || bad "lane_bound_path must find the bound through \$AGENT_INFRA_PATH/scripts/orchestrator-harness when it does not sit beside the actuator (got '${_brp:-<none>}') — a bound that resolves only by adjacency is absent on the box that reports the actuator at ~/.pi/agent/state/"
+_brp=$(lane_bound_path "$_bres")   # adjacent wins when it is there
+[ "$_brp" = "$_bres/lane-bound.sh" ] || bad "lane_bound_path must prefer the directory beside the actuator when that file is usable (got '${_brp:-<none>}')"
+mv "$_bres/lane-bound.sh" "$_bres/lane-bound.sh.moved"
+: > "$_bres/scripts/orchestrator-harness/lane-bound.sh"
+lane_bound_path "/no/such" >/dev/null && bad "lane_bound_path must REFUSE a zero-byte bound — existence is not capability (a zero-byte shell file exits 0 and would launch the rail completely unbounded)"
+printf 'if then\n' > "$_bres/scripts/orchestrator-harness/lane-bound.sh"
+lane_bound_path "/no/such" >/dev/null && bad "lane_bound_path must REFUSE a bound that does not PARSE ('bash -n')"
+mv "$_bres/lane-bound.sh.moved" "$_bres/lane-bound.sh"
+# ⛔ AND THE SHIPPED DEFAULT ITSELF RESOLVES ON THIS BOX — the arm above drives the function, and this one
+# proves the variable the launch actually reads was RESOLVED, not left as a bare `dirname $0` guess.
+grep -qF 'LANE_BOUND=${LANE_BOUND:-$(lane_bound_path' "$SUT" \
+  || bad "the shipped LANE_BOUND default must go through the RESOLVER, not \$(dirname \"\$0\")/lane-bound.sh alone (review round 2, P1)"
+grep -qF 'REFUSED: no usable rail lifetime bound' "$SUT" \
+  || bad "a missing bound must be a STARTUP refusal beside the RAIL_SCRIPT check — discovering it per launch means the actuator exits 0 and lands nothing, which is the shape the startup ladder forbids"
+AGENT_INFRA_PATH="$_bsave"; HOME=$_hsave
+rm -rf "$_bres"
+# ── AND THE KILL LOOP IS BOUNDED PER HEAD (review round 2, P2): a deterministic wedge must not re-hold a
+# MAX slot for ever with a 60-minute period, and a new head must re-arm it without an operator.
+TRIED=$(mktemp); rm -f "$_bpid"
+_kf=$(rail_bound_kills_file daniel-ospina/tortoise 9104 feedface)
+printf '60\n60\n' > "$_kf"
+[ "$(rail_bound_kills "$_kf")" = 2 ] || bad "rail_bound_kills must count the recorded kills (got '$(rail_bound_kills "$_kf")')"
+RAIL_SCRIPT="$_bstub" launch_rail daniel-ospina/tortoise 9104 feedface "$_bdir/auto-x-9104.out" \
+  && bad "a head whose bound has killed it RAIL_BOUND_MAX_KILLS times must NOT be re-launched — the wedge reproduces at the same revision, so re-launching holds a MAX slot for ever"
+grep -q '^9104	feedface	' "$TRIED" && bad "a launch refused at the kill cap must leave NO cooldown row (nothing ran)"
+grep -q '#9104 NOT LAUNCHED' "$LOG" || bad "a launch refused at the kill cap must SAY SO (no '#9104 NOT LAUNCHED' line)"
+[ -f "$_bpid" ] && { bad "the rail stub RAN for a head at its kill cap"; kill -9 "$(cat "$_bpid")" 2>/dev/null; }
+# …and the REAP is what enforces the cap: the 1st kill rolls the row back, the 2nd refuses to.
+TRIED=$(mktemp)
+printf '9105	feedface	111
+' > "$TRIED"
+printf '[lane-bound] VERDICT verdict=exceeded-wallclock tag=t pid=1 rc=na elapsed=42s wall_bound=2s idle_bound=0s signal=TERM log=x\n' > "$_bf"
+reap_bounded_rail daniel-ospina/tortoise 9105 feedface "$_bf" || bad "kill 1/2 must be REPORTED"
+[ "$(rail_bound_kills "$(rail_bound_kills_file daniel-ospina/tortoise 9105 feedface)")" = 1 ] || bad "the reap must RECORD the kill against the head"
+grep -q '^9105	feedface	111$' "$TRIED" && bad "kill 1 of 2 must roll the row back (the head is retried next pass)"
+printf '9105	feedface	111
+' > "$TRIED"
+printf '[lane-bound] VERDICT verdict=exceeded-wallclock tag=t pid=1 rc=na elapsed=43s wall_bound=2s idle_bound=0s signal=TERM log=x\n' > "$_bf"
+reap_bounded_rail daniel-ospina/tortoise 9105 feedface "$_bf"
+[ "$(rail_bound_kills "$(rail_bound_kills_file daniel-ospina/tortoise 9105 feedface)")" = 2 ] || bad "the second kill must be recorded (cap 2)"
+grep -q '^9105	feedface	111$' "$TRIED" || bad "at the kill CAP the cooldown row must SURVIVE — rolling it back is what turns a deterministic wedge into an unbounded retry loop"
+grep -q '#9105 RAIL-BOUND-EXHAUSTED' "$LOG" || bad "reaching the kill cap must be LOGGED by name (no '#9105 RAIL-BOUND-EXHAUSTED' line) — silent exhaustion is a parked head nobody can see"
+# …and a NEW HEAD is a new key, so it is re-armed with no operator in the loop.
+[ "$(rail_bound_kills "$(rail_bound_kills_file daniel-ospina/tortoise 9105 cafebabe)")" = 0 ] \
+  || bad "a NEW head must start from a clean kill count (got '$(rail_bound_kills "$(rail_bound_kills_file daniel-ospina/tortoise 9105 cafebabe)")')"
 rm -rf "$_bdir"
 
 PATH=$_oldpath

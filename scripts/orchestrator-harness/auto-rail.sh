@@ -132,7 +132,7 @@ case "${LAUNCH_VERIFY_S}" in ''|*[!0-9]*)
 # phase bounds (`rail_deadline_default`) and refuses at it — but ONLY from `rail_guard_poll`, which is
 # called at the head of the rail's POLL loops. A rail parked in a BLOCKING child wait — the re-entrant
 # child above is precisely that shape — reaches no poll loop, so no comparison is ever evaluated and a
-# 19,864s ceiling held a live process for 52,860s. That is the `inert enforcer` class (AGENTS.md:
+# 21,454s ceiling held a live process for 52,860s. That is the `inert enforcer` class (AGENTS.md:
 # "a runner whose termination condition can never fire while it appears to protect something"): the
 # guard is right and unreachable. The actuator is the only actor that CAN end that attempt, because it
 # owns the slot, the count AND the dedupe guard that is currently waiting on it.
@@ -173,11 +173,44 @@ RAIL_BOUND_GRACE_S=${RAIL_BOUND_GRACE_S:-15}
 case "${RAIL_BOUND_GRACE_S}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: RAIL_BOUND_GRACE_S='${RAIL_BOUND_GRACE_S}' is not a non-negative integer" >> "$LOG"; exit 3;; esac
 knob_fits RAIL_BOUND_GRACE_S "$RAIL_BOUND_GRACE_S"
-# The bound's implementation, beside this file because the farm delivers the harness as ONE directory
-# (`~/.pi/agent/scripts/`, `$HOME/orchestrator/`): a path that resolves only on a developer's box would
-# make the bound silently absent on the box that runs it. Absence is REFUSED AT LAUNCH (see
-# `launch_rail`), never degraded to an unbounded rail.
-LANE_BOUND=${LANE_BOUND:-$(dirname "$0")/lane-bound.sh}
+# ⛔ HOW MANY TIMES ONE HEAD MAY BE KILLED AT ITS BOUND BEFORE THIS ACTUATOR STOPS RE-RAILING IT (review
+# round 2, P2). The rollback below makes a killed attempt RETRIED, which is right for a transient wedge and
+# WRONG for a deterministic one: a rail that re-enters itself wedges the same way every time, so
+# kill -> retry -> kill would hold a MAX slot ~100% of the time — the exact symptom #4001 is about, merely
+# now with a 60-minute period. This file already records that rule for the sibling arm ("PER-PASS IS NOT A
+# LIFETIME BOUND", the review arm's per-head attempt ledger); the bound now has the same shape. At the cap
+# the head is NOT re-railed until a NEW head (which is a new key by construction, so a fix always starts
+# from a clean count), and the fact is logged rather than silently held.
+RAIL_BOUND_MAX_KILLS=${RAIL_BOUND_MAX_KILLS:-2}
+case "${RAIL_BOUND_MAX_KILLS}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: RAIL_BOUND_MAX_KILLS='${RAIL_BOUND_MAX_KILLS}' is not a positive integer" >> "$LOG"; exit 3;; esac
+knob_fits RAIL_BOUND_MAX_KILLS "$RAIL_BOUND_MAX_KILLS"
+[ "$RAIL_BOUND_MAX_KILLS" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: RAIL_BOUND_MAX_KILLS='${RAIL_BOUND_MAX_KILLS}' is not a POSITIVE integer — 0 refuses every head at its first kill, i.e. a parked fleet, and the bound's whole point is to bound an attempt, not to give up on the PR" >> "$LOG"; exit 3; }
+# ⛔ THE BOUND IS RESOLVED OVER THE SAME CANDIDATE SET THE HARNESS ALREADY USES FOR THIS FILE — NOT
+# `dirname "$0"` (review round 2, P1). `lane-bound.sh` IS a delivered harness file (`install.sh`'s presence
+# list, `check-single-source.sh` `EXECUTED`); `auto-rail.sh` is in NEITHER list, and issue #4001 records the
+# running actuator at `~/.pi/agent/state/auto-rail.sh` — the STATE directory, not the harness directory. So
+# assuming adjacency is assuming something no manifest in this repo guarantees, and the failure mode is the
+# worst one available: every launch refused on every pass, with the actuator exiting 0 and landing nothing.
+# `scripts/orchestrator-harness/spawn-gate.sh` already resolves this exact file over four locations for
+# exactly this reason ("a bound that silently becomes a weaker bound is the 'fix that is not live' shape");
+# this uses the same set, and the ABSENCE is a STARTUP refusal (see the ladder below), not a per-launch one.
+lane_bound_path() {  # $1 = the directory this script runs from; prints a usable path, rc 1 = none
+  local here=$1 c
+  for c in "$here/lane-bound.sh" \
+           "${HOME:-}/orchestrator/lane-bound.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/lane-bound.sh" \
+           "${HOME:-}/.pi/agent/scripts/lane-bound.sh"; do
+    [ -n "$c" ] && [ "$c" != "/lane-bound.sh" ] || continue
+    [ -f "$c" ] && [ -s "$c" ] && bash -n "$c" 2>/dev/null || continue
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+# An explicit override still wins (it is the test seam and the operator's last word), and an override that
+# is unusable is caught by the STARTUP check below rather than being silently replaced by a different file.
+LANE_BOUND=${LANE_BOUND:-$(lane_bound_path "$(cd "$(dirname "$0")" 2>/dev/null && pwd)")}
 COOLDOWN_TRANSIENT_S=${COOLDOWN_TRANSIENT_S:-900}
 case "${COOLDOWN_TRANSIENT_S}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: COOLDOWN_TRANSIENT_S='${COOLDOWN_TRANSIENT_S}' is not a positive integer" >> "$LOG"; exit 3;; esac
@@ -326,6 +359,16 @@ if ! touch "$TRIED" 2>/dev/null || [ ! -w "$TRIED" ]; then
 fi
 if [ ! -f "$RAIL_SCRIPT" ]; then
   echo "$(date -u +%FT%TZ) REFUSED: rail not found at $RAIL_SCRIPT — this actuator cannot land anything" >> "$LOG"
+  exit 3
+fi
+# ⛔ AND THE BOUND IS THE SAME CONSEQUENCE CLASS, SO IT IS THE SAME KIND OF CHECK (review round 2, P1). A
+# missing bound means every launch is refused — the actuator lands NOTHING — so discovering it once per
+# candidate per pass, for ever, is the `candidates=0`-for-weeks shape this startup ladder exists to forbid
+# ("NO ACTUATOR MAY PASS SILENTLY WITH A MISSING DEPENDENCY. Fail loudly, once, at start"). The bar is
+# CAPABILITY, not existence (a zero-byte `lane-bound.sh` is valid shell that exits 0), and it is the same
+# bar `launch_rail` re-checks per launch as belt-and-braces against a file deleted after start.
+if [ ! -f "$LANE_BOUND" ] || [ ! -s "$LANE_BOUND" ] || ! bash -n "$LANE_BOUND" 2>/dev/null; then
+  echo "$(date -u +%FT%TZ) REFUSED: no usable rail lifetime bound at '${LANE_BOUND}' (resolved over $(dirname "$0")/lane-bound.sh, \$HOME/orchestrator/lane-bound.sh, \${AGENT_INFRA_PATH}/scripts/orchestrator-harness/lane-bound.sh, \$HOME/.pi/agent/scripts/lane-bound.sh; needs to exist, be non-empty and parse) — this actuator cannot launch a bounded rail, and an unbounded rail is the #4001 defect it may not fall back to. Set LANE_BOUND to a usable path." >> "$LOG"
   exit 3
 fi
 # ⛔ PRs the consolidation pass (aiconsol2, 2026-10-24) flagged as one of a DUPLICATE PAIR whose
@@ -703,6 +746,20 @@ rail_bound_state() {  # $1 = the bound's verdict file; prints none|finished|boun
 rail_bound_elapsed() {  # $1 = the bound's verdict file; prints the seconds, or nothing
   sed -n 's/.*\[lane-bound\] VERDICT .* elapsed=\([0-9][0-9]*\)s .*/\1/p' "$1" 2>/dev/null | head -1
 }
+# ── THE PER-HEAD KILL COUNT (review round 2, P2) ─────────────────────────────────────────────────────
+# The rollback below makes a killed attempt RETRIED. For a DETERMINISTIC wedge that is an unbounded loop with
+# a 60-minute period, holding a MAX slot ~100% of the time — the very symptom #4001 exists to remove. The
+# count is per (repo, PR, HEAD) for the same reason every other key in this file is: a push is a new attempt,
+# so a head nobody has wedged yet always starts from a clean count and needs no operator.
+rail_bound_kills_file() {  # $1 = repo, $2 = PR, $3 = head
+  printf '%s/bound-kills-%s-%s-%s.txt\n' "$RAIL_DIR" "$(printf '%s' "$1" | tr '/' '-')" "$2" "$3"
+}
+rail_bound_kills() {  # $1 = the kill ledger; prints the number of bound kills recorded at this head
+  local n
+  [ -f "$1" ] || { printf '0\n'; return 0; }
+  n=$(grep -c . "$1" 2>/dev/null)
+  case "${n:-}" in ''|*[!0-9]*) printf '0\n' ;; *) printf '%s\n' "$n" ;; esac
+}
 # ⛔ THE REACTION THE ISSUE ASKS FOR, IN ONE PLACE: when the bound fired, the attempt reached NO verdict,
 # so (a) the log says so BY NAME — the PR and the elapsed time, which is what the actuator's log could
 # never say about a 14-hour rail — and (b) the cooldown row is ROLLED BACK so the head is retried on the
@@ -720,8 +777,20 @@ reap_bounded_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = bound verdict file;
       # tab-separated ledger rather than a `grep` pattern built from two variables, so neither a PR number
       # nor a SHA is ever read as a regex.
       row=$(awk -F'\t' -v p="$pr" -v h="$head" '$1==p && $2==h {r=$0} END{if (r != "") print r}' "$TRIED" 2>/dev/null)
-      [ -n "$row" ] && forget_tried "$row"
-      log_line "$repo #$pr RAIL-BOUND at $head — the rail attempt was KILLED at ${el}s (bound ${RAIL_MAX_S}s, enforced by $LANE_BOUND; rail output $RAIL_DIR/auto-$(printf '%s' "$repo" | tr '/' '-')-$pr.out) because it reached no verdict; its cooldown row is rolled back so this head is RETRIED next pass instead of holding a MAX slot and reading as 'rail already running'"
+      local kf kn
+      kf=$(rail_bound_kills_file "$repo" "$pr" "$head")
+      printf '%s\n' "$el" >> "$kf" 2>/dev/null
+      kn=$(rail_bound_kills "$kf")
+      if [ "$kn" -ge "$RAIL_BOUND_MAX_KILLS" ]; then
+        # ⛔ THE CAP IS REACHED: STOP RE-RAILING THIS HEAD. A wedge that reproduces at the same head will
+        # reproduce every time, and re-launching it is an unbounded loop holding a MAX slot ~100% of the
+        # time. The row is NOT rolled back, so the transient window applies as usual, and `launch_rail`
+        # refuses further attempts at this head until a NEW head (a new key) re-arms it.
+        log_line "$repo #$pr RAIL-BOUND-EXHAUSTED at $head — ${kn} bound kill(s) at this head (cap ${RAIL_BOUND_MAX_KILLS}, bound ${RAIL_MAX_S}s, last at ${el}s, enforced by $LANE_BOUND): this head is NOT re-railed until a NEW head lands; the wedge reproduces at the same revision, so re-launching it would hold a MAX slot for ever with a ${RAIL_MAX_S}s period (the shape #4001 exists to remove). Evidence: $kf"
+      else
+        [ -n "$row" ] && forget_tried "$row"
+        log_line "$repo #$pr RAIL-BOUND at $head — the rail attempt was KILLED at ${el}s (bound ${RAIL_MAX_S}s, enforced by $LANE_BOUND; rail output $RAIL_DIR/auto-$(printf '%s' "$repo" | tr '/' '-')-$pr.out) because it reached no verdict; its cooldown row is rolled back so this head is RETRIED next pass instead of holding a MAX slot and reading as 'rail already running' (kill ${kn}/${RAIL_BOUND_MAX_KILLS} at this head)"
+      fi
       rm -f "$bf" 2>/dev/null
       return 0 ;;
     finished)
@@ -763,6 +832,12 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
   # 0, and the rail would then be launched completely unbounded with a clean log.
   if [ ! -f "$LANE_BOUND" ] || [ ! -s "$LANE_BOUND" ] || ! bash -n "$LANE_BOUND" 2>/dev/null; then
     log_line "$repo #$pr NOT LAUNCHED — no usable rail lifetime bound at $LANE_BOUND (needs to exist, be non-empty and parse); an unbounded rail is the #4001 defect, so nothing is launched and this head is retried next pass"
+    return 1
+  fi
+  # ⛔ A HEAD WHOSE BOUND HAS KILLED IT AT THE CAP IS NOT RE-LAUNCHED (review round 2, P2). Same key as
+  # everything else here — (repo, PR, HEAD) — so a push re-arms it automatically and no operator is needed.
+  if [ "$(rail_bound_kills "$(rail_bound_kills_file "$repo" "$pr" "$head")")" -ge "$RAIL_BOUND_MAX_KILLS" ]; then
+    log_line "$repo #$pr NOT LAUNCHED — this head has already been killed at its ${RAIL_MAX_S}s bound ${RAIL_BOUND_MAX_KILLS} time(s) (cap RAIL_BOUND_MAX_KILLS); a wedge that reproduces at one revision reproduces every time, so re-launching it would hold a MAX slot for ever. A NEW head re-arms it. Evidence: $(rail_bound_kills_file "$repo" "$pr" "$head")"
     return 1
   fi
   row="$pr	$head	$(date +%s)"
