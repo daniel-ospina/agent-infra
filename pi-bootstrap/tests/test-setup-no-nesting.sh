@@ -663,18 +663,19 @@ check_farm_arrays() { # <repo-root> <label>
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
 script:admin-merge.sh script:ai_pr_status.py script:ask-owner.py script:beta-progress.py
-script:bg-rescue-wip.sh script:cadence-nudge.sh script:cloud-cell-doctor.sh script:cloud-cell-supervisor.sh
-script:cmux_dispatch.py script:conflict-rebase-timer.sh script:conflict-rebase.py script:disk-reaper-run.sh
-script:disk-reaper.sh script:fleet-cost-report.sh script:fleet-schedule.py script:goal-state.py
-script:harness-apply-pass.sh script:heartbeat-loop.sh script:install-ci-runner-x64.sh
-script:install-controller-service.sh script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh
-script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
-script:orchestrator-heartbeat.sh script:pi-cache-reap.sh script:pi-reap-worktrees-launchd.py
-script:pi-reap-worktrees.sh script:pr-doctor-trigger.py script:pr-doctor.py script:pr-repair-loop.sh
-script:publish-live-workspaces.py script:reap-lane-venvs.sh script:record-review.sh script:registry-sync.sh
-script:repo-slug.sh script:repo-target.sh script:runner_autoscale.py script:session-postmortem.sh
-script:tortoise_graph_client.py script:turn-classify.py script:turn-end.py script:undelivered-answers.py
-script:venv-real-cost.py script:watch-truncation.sh script:wip-sweep.sh
+script:bg-rescue-wip.sh script:brief-gate.sh script:cadence-nudge.sh script:cloud-cell-doctor.sh
+script:cloud-cell-supervisor.sh script:cmux_dispatch.py script:conflict-rebase-timer.sh
+script:conflict-rebase.py script:disk-reaper-run.sh script:disk-reaper.sh script:fleet-cost-report.sh
+script:fleet-schedule.py script:goal-state.py script:harness-apply-pass.sh script:heartbeat-loop.sh
+script:install-ci-runner-x64.sh script:install-controller-service.sh script:lane-actions.py
+script:lane-guard.py script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py
+script:merge-queue.py script:objective.py script:orchestrator-heartbeat.sh script:pi-cache-reap.sh
+script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh script:pr-doctor-trigger.py
+script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py script:reap-lane-venvs.sh
+script:record-review.sh script:registry-sync.sh script:repo-slug.sh script:repo-target.sh
+script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
+script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py
+script:watch-truncation.sh script:wip-sweep.sh
 lib:beat-pair.sh lib:bounded.sh lib:cell-home.sh lib:cmux-dispatch-path.sh lib:cmux_payload.py
 lib:diff-normalize.py lib:live-paths.sh lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
@@ -683,6 +684,15 @@ other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
 other:orchestrator-harness/cloud-cell-doctor.sh other:orchestrator-harness/repo-slug.sh
 "
 
+# RE-CUT 2026-11-11 (computed by `--cut` from the CODE, never hand-typed): ONE PIN LINE added
+# (`script:brief-gate.sh`), nothing removed. `worker-supply.sh` — farmed by `fleet_srcs` — now walks the
+# dispatcher's own four-rung ladder (#3958), and its FLAT rung `$HOME/.pi/agent/scripts/brief-gate.sh` is
+# an exec site the derivation correctly calls a `script:` producer; it was DELIVERED BY NOTHING, which is
+# the same failure `repo-slug.sh` produced below. It is now in `setup.sh`'s `mcp_harness_srcs` (src
+# `scripts/orchestrator-harness/`, dest FLAT `$DEST/scripts/`), which IS that rung — so the pin states a
+# delivery that now exists; it does not excuse an absence. The delivery is what makes the #3958
+# revalidation a check rather than a formality on a box with no checkout: without it `brief_verdict`
+# answers 78 on every pass and the refused fossil is re-offered exactly as before.
 # RE-CUT 2026-11-10 (computed by `--cut` from the CODE, never hand-typed): `script:repo-slug.sh` and
 # `other:orchestrator-harness/repo-slug.sh` ADDED, nothing removed. `repo-slug.sh` was a producer a
 # farmed consumer EXECS (the doctor, `cloud-cell-doctor.sh:160`) and that NO farm array delivered — the
