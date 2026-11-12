@@ -1142,7 +1142,16 @@ run_gate ghost-window-at-page GH_QUEUED="$((QUEUE_PAGE_SHIPPED + 5))" GH_INPROGR
 assert_eq "$RC" "2" "a full ghost page scanned to the SHIPPED bound → exit 2 (could-not-measure)"
 assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the window refusal names its bound"
 assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound cannot pass"
-assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "…and the knob, so the operator sees both facts on one line"
+# ⛔ THE CLAUSE NEEDS ITS OWN TOKEN, NOT ONE THE BASE LINE ALREADY PRINTS (#3995 review cycle 6, F2).
+# This row used to assert the bare token `CI_GATE_QUEUE_HEAD_SCAN_MAX`, which the WINDOW base text above
+# already carries from #3996 (`…or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> …`), so it
+# stayed GREEN with the ceiling clause deleted — it claimed to pin the note while pinning the older,
+# unrelated remedy sentence, and no mutant of this diff could red it (#3442 rule 3). The clause's own
+# wording is `a bound at or above %s cannot see past it`, and `cannot see past it` appears nowhere else
+# on this output, so the row now reds exactly when the clause is removed. Note the clause deliberately
+# says "a bound", not the knob name: below the page the knob still has room, and that distinction lives
+# in the base remedy sentence, not here.
+assert_contains "$OUT" "cannot see past it" "…and what that ceiling will NOT fix: a bound at or above the page cannot see past it"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a window-limited scan advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a window-limited scan relabelled no runner"
 # …and the bound is an OPERAND like every other one here: a zero or non-numeric value would silently
