@@ -473,7 +473,13 @@ if [ -z "${PRS// /}" ] && [ -n "$SNAPSHOT_IN" ]; then
   done
 fi
 if [ -z "${PRS// /}" ] && [ -n "$ISSUE" ]; then
-  PRS="$("$GH" pr list --repo "$REPO" --state merged --search "Closes #$ISSUE" --limit 5 --json number --jq '.[].number' 2>/dev/null | tr '\n' ' ')"
+  # ⛔ THE SEARCH IS FUZZY, SO THE CLOSING KEYWORD IS RE-DECIDED HERE. `--search "Closes #N"`
+  # returned two merged PRs for the same issue (measured: --issue 3995 -> #3900 and #3969), and
+  # reporting a stranger's PR as the one that closed the issue is the false-PASS direction. The
+  # keyword is matched ON ITS OWN LINE, the same position rule `pipeline-compliance` check (a) uses.
+  PRS="$("$GH" pr list --repo "$REPO" --state merged --search "Closes #$ISSUE" --limit 10 --json number,body \
+    --jq ".[] | select((.body // \"\") | test(\"(?im)^[[:space:]>*+-]*(closes|fixes|resolves)[[:space:]]+#$ISSUE([^0-9]|$)\")) | .number" \
+    2>/dev/null | tr '\n' ' ')"
   if [ -z "${PRS// /}" ]; then
     printf 'verify-landing-chain: no merged PR found closing #%s in %s\n' "$ISSUE" "$REPO" >&2
     exit 2
