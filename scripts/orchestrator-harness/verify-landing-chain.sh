@@ -473,11 +473,22 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
       #   completed            → it existed: `completed_at` is when it voted
       #   NOT completed        → it exists: a `queued` run has a NULL `started_at` by design, so the
       #                          absence of a timestamp is never read as "it did not exist yet".
-      exists = (status != "completed") ||
-               (done_at != "-" && done_at != "" && done_at <= merged) ||
-               (started_at != "-" && started_at != "" && started_at <= merged)
-      if (exists && (!(g in nid) || id > nid[g])) {
-        nid[g] = id; ncls[g] = classify(status, conc); nconc[g] = conc; ndone[g] = done_at
+      existed = (status != "completed") ||
+                (done_at != "-" && done_at != "" && done_at <= merged) ||
+                (started_at != "-" && started_at != "" && started_at <= merged)
+      # ⛔ ONLY A VERDICT KNOWN BY THE MERGE COUNTS (fresh-context review, round 5 F1 — BLOCKING, a
+      # false PASS). The previous line admitted a COMPLETED attempt whose `started_at` was before the
+      # merge and then classified it by its FINAL conclusion — so a re-run that started 05:00 and went
+      # green 05:24 on a 05:05 merge was recorded as `green`, while the flag three lines below recorded
+      # the same attempt as a LATE green. The two disagreed, and the standing verdict was the one
+      # deciding the exit code. Measured: identical fixture, only `started_at` changed →
+      # 05:00 gave `VERDICT: ALL-MET` exit 0; 05:20 gave the correct FAIL. The verdict turned on when
+      # the re-run STARTED, not on what the landing SAW.
+      voted_by_merge = (status == "completed" && done_at != "-" && done_at != "" && done_at <= merged)
+      if (existed && (!(g in nid) || id > nid[g])) {
+        nid[g] = id; ndone[g] = done_at
+        if (voted_by_merge) { ncls[g] = classify(status, conc); nconc[g] = conc }
+        else                { ncls[g] = "pending";              nconc[g] = "-"  }   # it existed, it had not voted
       }
       # the green timing is about the whole HISTORY of the job, so it looks at every attempt
       if (classify(status, conc) == "green") {
@@ -747,36 +758,15 @@ analyse() { # analyse <dir> <pr>
           if [ "$ngreen" -eq 0 ]; then
             emit green_gated FAIL "no group was GREEN at mergedAt=$merged on ${rsha:0:12} ($nnonred non-red only) — no green gated this landing"
           else
-            emit green_gated PASS "$ngreen group(s) GREEN at mergedAt=$merged on ${rsha:0:12} (newest attempt per app/workflow/job)${nnonred:+ · $nnonred non-red}${later:+ · not part of this gate (no run existed by mergedAt): $later}"
+            emit green_gated PASS "$ngreen group(s) GREEN at mergedAt=$merged on ${rsha:0:12} (newest attempt per app/workflow/job)${nnonred:+$([ "$nnonred" -gt 0 ] && printf ' · %s non-red' "$nnonred")}${later:+ · not part of this gate (no run existed by mergedAt): $later}"
           fi
         fi
       fi
     fi
   fi
 
-  # ── 6 rail_landed — artifact-only; an override is a FAIL for this condition ──────────────────
-  local override_found="" f
-  for f in "$dir/rail.out" "$dir/merge.log" "$dir/chain.verdict"; do
-    [ -s "$f" ] || continue
-    if grep -qE 'admin_merge_override|AGENT_ADMIN_MERGE_OVERRIDE' "$f" 2>/dev/null; then
-      override_found="${f##*/}"
-    fi
-  done
-  if [ -n "$override_found" ]; then
-    emit rail_landed FAIL "an admin-merge override is recorded ($override_found) — condition 6 forbids a landing that bypassed the certificate"
-  elif [ -s "$dir/rail.out" ]; then
-    emit rail_landed PASS "the rail's own output for this PR is on disk (rail.out) and carries no override"
-  elif [ -f "$dir/chain.merged" ] || [ -s "$dir/chain.verdict" ]; then
-    emit rail_landed FAIL "landed by the per-PR chain, not by auto-rail — capstone condition 6 requires the rail to land it on its own"
-  elif [ -f "$dir/chain.merged.out-of-window" ] || [ -f "$dir/chain.verdict.out-of-window" ] || [ -f "$dir/merge.log.out-of-window" ]; then
-    # ⛔ THE MARKER EXISTED AND WAS REFUSED (F4). `$O/state` is shared by every repo on this box and
-    # `merged-<PR>.done` carries no repo, so a `tortoise#<same n>` merge would otherwise be attributed
-    # to THIS PR's landing. Outside this PR's own merge window it is not evidence — say so, and keep
-    # the route unknown rather than guessing.
-    emit rail_landed INCONCLUSIVE "a PR-number-keyed chain marker exists but is OUTSIDE this PR's merge window (mergedAt=$merged, window ${CHAIN_MARKER_WINDOW}s) — it is not proof for this repo's landing (chain-merge.sh:246-251 records the same rule), so the route stays unknown"
-  else
-    emit rail_landed INCONCLUSIVE "no rail or chain artifact for this PR on this box — the landing route is not readable here"
-  fi
+  # ── 6 rail_landed — one decision, one place (the block above; a second copy is the drift shape) ──
+  emit_rail_landed "$dir" "$pr" "$merged"
   return 0
 }
 

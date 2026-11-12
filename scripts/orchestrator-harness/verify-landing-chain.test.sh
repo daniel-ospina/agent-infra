@@ -50,10 +50,17 @@ mk() { # mk <case-name> <pr>  → prints the snapshot root
 
 # group <root> <pr> <check-run id> <workflow-run-id> <job name> <status> <conclusion> <completed_at>
 # run   <root> <pr> <workflow-run-id> <workflow name> <run attempt>
+# group <root> <pr> <id> <run> <name> <status> <conclusion> <completed_at> [started_at]
+# `started_at` is the 8th field of the surface the script reads, and it is OPTIONAL in the API (null for
+# a run that is still queued) — so it is optional here too. It was missing from this helper, which made
+# every "started before the merge, voted after" case unreachable in the suite: F1t silently degraded
+# into "the re-run is a post-merge job" and asserted the wrong sentence.
 group() {
-  local d="$1/pr-$2"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$3" "github-actions" "$5" "$6" "$7" "$8" \
-    "https://github.com/o/r/actions/runs/$4/job/1" >> "$d/checkruns-$HEAD.tsv"
+  local d="$1/pr-$2" line
+  line="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$3" "github-actions" "$5" "$6" "$7" "$8" \
+    "https://github.com/o/r/actions/runs/$4/job/1")"
+  if [ -n "${9:-}" ]; then line="$line$(printf '\t%s' "$9")"; fi
+  printf '%s\n' "$line" >> "$d/checkruns-$HEAD.tsv"
 }
 run() { printf '%s\t%s\t%s\n' "$3" "$4" "$5" >> "$1/pr-$2/runs-$HEAD.tsv"; }
 # Both surfaces are captured for every case: the TEXT report is what a human reads (so its DETAIL is
@@ -315,6 +322,19 @@ ck "F2c: a QUEUED group at mergedAt FAILs as 'did not wait for it'" "$(has "did 
 ck "F2c: …and it is never described as a group that did not exist yet" "$(has "no run existed by mergedAt" && echo 1 || echo 0)"
 ck "F2c: …so the verdict is NOT-MET (exit 1), not a pass" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
 
+# F1t — round 5's F1 (BLOCKING, a false PASS): a re-run that STARTED before the merge and finished
+# GREEN after it must not count as a green. Only a verdict KNOWN BY THE MERGE counts; this attempt
+# existed and had not voted, so the group is `waited` → FAIL. The old rule classified it by its final
+# conclusion and flipped the whole VERDICT to ALL-MET on nothing but the re-run's `started_at`.
+R="$(mk f1t-started-before-voted-after 460)"
+run "$R" 460 9001 "CI" 1
+group "$R" 460 10 9001 "pipeline-compliance" completed success "2026-11-12T04:41:17Z" "2026-11-12T04:40:00Z"
+group "$R" 460 20 9001 "pipeline-compliance" completed success "2026-11-12T05:24:50Z" "2026-11-12T05:00:00Z"
+verify "$R"; rc=$?
+ck "F1t: a re-run that had not voted by the merge FAILs as 'did not wait for'" "$(has "did not wait for"; echo $?)"
+ck "F1t: …and the group is never reported GREEN" "$(has "1 group(s) GREEN" && echo 1 || echo 0)"
+ck "F1t: …so the verdict is not ALL-MET (exit 1)" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+
 # F3n — round 4's F3: an OLDER green must not outvote a NEWER attempt that never voted. The newest
 # attempt at the merge was in flight, so the landing went ahead without a verdict from the job whose
 # last word was green — the header's invariant ("the newest attempt of EVERY group was GREEN and
@@ -493,7 +513,7 @@ mutation_verdict M1 "Workflow B/packaging-smoke:failure" \
   "grouping by the job name alone loses the red — case 8 is discriminating"
 
 # M2 — read the newest attempt OVERALL instead of the newest that had finished by mergedAt.
-MS="$(mutant newest-overall 'if (exists && (!(g in nid) || id > nid[g])) {' 'if (!(g in nid) || id > nid[g]) {')" || bad "M2 mutation could not be applied"
+MS="$(mutant newest-overall 'existed = (status != "completed") ||' 'existed = 1 ||' )" || bad "M2 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-newest-overall 431)"
 run "$R" 431 9001 "CI" 1
@@ -576,7 +596,7 @@ mutation_verdict M10 "FAIL  review_record" \
   "a standing not-clean is not a review record — case F2n is discriminating"
 
 # M11 — let an older green outvote the newest in-flight attempt (round 4's F3).
-MS="$(mutant f3-newest-voting-wins 'if (exists && (!(g in nid) || id > nid[g])) {' 'if (status == "completed" && (!(g in nid) || id > nid[g])) {')" \
+MS="$(mutant f3-newest-voting-wins 'if (existed && (!(g in nid) || id > nid[g])) {' 'if (voted_by_merge && (!(g in nid) || id > nid[g])) {')" \
   || bad "M11 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-newest-voting 459)"
@@ -586,6 +606,18 @@ group "$R" 459 20 9001 "unit-test" in_progress -       "-"                "2026-
 verify_with "$MS" "$R"
 mutation_verdict M11 "did not wait for" \
   "counting only voting attempts hides the in-flight newest one — case F3n is discriminating"
+
+# M12 — classify a not-yet-voted attempt by its POST-merge conclusion (round 5's F1, the false PASS).
+MS="$(mutant f1t-post-merge-verdict '        if (voted_by_merge) { ncls[g] = classify(status, conc); nconc[g] = conc }' '        if (1) { ncls[g] = classify(status, conc); nconc[g] = conc }')" \
+  || bad "M12 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-post-merge 461)"
+run "$R" 461 9001 "CI" 1
+group "$R" 461 10 9001 "pipeline-compliance" completed success "2026-11-12T04:41:17Z" "2026-11-12T04:40:00Z"
+group "$R" 461 20 9001 "pipeline-compliance" completed success "2026-11-12T05:24:50Z" "2026-11-12T05:00:00Z"
+verify_with "$MS" "$R"
+mutation_verdict M12 "did not wait for" \
+  "a re-run's post-merge conclusion must not gate the landing — case F1t is discriminating"
 
 # M9 — drop the rail_landed row on the unread-record path (round 3, note 2): a 5-row report.
 MS="$(mutant unread-drops-route '    emit_rail_landed "$dir" "$pr" "$merged"' '    :')" \
