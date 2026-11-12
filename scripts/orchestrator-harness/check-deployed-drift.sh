@@ -486,12 +486,31 @@ fi
 # (`scripts/check-*.mjs`) are `.mjs`, and a harness wrapper added later must not need this line
 # changed before it can be compared. A declared set that only names today's files is the #4015 defect.
 HARNESS_EXTS="sh py mjs"
-HARNESS_EXT_RE='sh|py|mjs'
-# The same set as an operator-facing LIST (`*.sh, *.py, *.mjs`), for the two messages that have to say
-# what was looked for. Derived from HARNESS_EXTS so the line an operator reads cannot drift from the
-# set the comparison actually used — a message naming fewer extensions than the check covers is the
-# #4015 defect in prose form.
-HARNESS_EXTS_GLOB="*.${HARNESS_EXTS// /*.}"
+# ⛔ DERIVED, NEVER A SECOND LITERAL (review finding 1, PR #4038). The first version of this block wrote
+# `HARNESS_EXT_RE='sh|py|mjs'` by hand beside `HARNESS_EXTS`, and then only HARNESS_EXTS_GLOB read the
+# declaration: the three COMPARISONS (the ref listing, `ship_list_dir`, the deployed listing) read the
+# hand-written alternation. Adding `ts` to the line the comment calls "the ONE place" would therefore
+# have widened the operator MESSAGES while the comparison stayed at three extensions — the check would
+# say it looked for a set it did not look for, and pass. That is #3016/#4015's false green one level
+# down, inside the mechanism written to prevent it, so the alternation is now computed from the
+# declaration and there is no second spelling to drift. §12e grades it behaviourally (add an extension
+# to the declaration, plant a stale file of that kind, expect a red).
+HARNESS_EXT_RE="${HARNESS_EXTS// /|}"
+# The same set as an operator-facing LIST (`*.sh, *.py, *.mjs`), for the THREE messages that have to
+# say what was looked for — the `DRIFT(exec)` line, the surface arm's cannot-verify line, and the
+# `(c) executing tree` remedy row. Derived from HARNESS_EXTS so the line an operator reads cannot drift
+# from the set the comparison actually used — a message naming fewer extensions than the check covers
+# is the #4015 defect in prose form, and the remedy row was the one site that still said `*.sh`
+# (review finding 2, PR #4038).
+# ⛔ BUILT BY A LOOP, NOT BY PARAMETER EXPANSION (review follow-up, PR #4038):
+# `"*.${HARNESS_EXTS// /*.}"` expands to the unreadable, comma-less `*.sh*.py*.mjs` — a message that
+# looks like a glob and reads as a typo, in the three lines an operator uses to decide what was looked
+# for. §12e pins the exact rendered string, so a later edit cannot make the message ambiguous again.
+HARNESS_EXTS_GLOB=""
+for _he in $HARNESS_EXTS; do
+  HARNESS_EXTS_GLOB="${HARNESS_EXTS_GLOB:+$HARNESS_EXTS_GLOB, }*.$_he"
+done
+unset _he
 # Every shipped harness file at depth 1 of <dir>, as bare basenames. Empty when the dir carries none
 # of the extensions — the CALLER decides whether emptiness is an answer or a cannot-verify, because
 # those are opposite reports (see the surface arm's "a RUNNING dir is never dropped" guard).
@@ -1523,7 +1542,7 @@ if [ "$problems" -gt 0 ]; then
     # interpreter holds open after deletion). Saying "NOT THERE" for both made the summary state a falsehood
     # about the box for the second, and the `executes:` row is the doc a lane reads to decide whether the
     # token applies. The DRIFT line above names which of the two it is.
-    bad "  (c) executing tree: $EXEC_N live controller process(es) execute a harness directory that cannot be matched to this repo — it is GONE, or it still exists with NO readable *.sh (named above, and the DRIFT line says which). The pin record and the deploy record can both be correct while this is true — they describe copies at rest, and the box is running a tree that is one of those two states. Restart the controller from the pinned tree (scripts/harness-up); redeploying \$O does not clear it"
+    bad "  (c) executing tree: $EXEC_N live controller process(es) execute a harness directory that cannot be matched to this repo — it is GONE, or it still exists with NO readable shipped file ($HARNESS_EXTS_GLOB) (named above, and the DRIFT line says which). The pin record and the deploy record can both be correct while this is true — they describe copies at rest, and the box is running a tree that is one of those two states. Restart the controller from the pinned tree (scripts/harness-up); redeploying \$O does not clear it"
   fi
   exit 1
 fi
