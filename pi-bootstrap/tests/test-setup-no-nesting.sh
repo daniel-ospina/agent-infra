@@ -2853,6 +2853,146 @@ else
   fail "a cell-local mutation of the spawn-point gate survived the re-run"
 fi
 
+# --- farm installs are ATOMIC (#3991) --------------------------------------
+# `$DEST/scripts` is the directory the box EXECUTES, and a lane calls its gates WHILE a farm runs
+# (this farm runs at session_start; a re-run also happens mid-merge). So a torn copy is not
+# cosmetic: `record-review.sh` truncated at the wrong instant mints an attestation from half a
+# file. The pre-#3991 legs did `cp -f "$f" "$dest"` and then `chmod +x "$dest"` — TWO windows on
+# the DESTINATION itself (O_TRUNC-then-write, then a file that exists but cannot be executed). The
+# property that closes both is that the install never writes THROUGH the existing destination
+# inode: it writes a sibling temp, sets the bit THERE, and rename(2)s it into place.
+#
+# ARM 1 — static: every script farm leg calls `farm_install`, no leg truncates or chmods the
+#   destination directly (the two spellings that ARE the defect), and the spawn-point gate at
+#   `$DEST/bin/pi` — the name every lane's `pi` resolves to — goes through it as well.
+# ARM 2/3 — behavioural, deterministic and RACE-FREE: the REAL helper is extracted from the
+#   installer under test and driven. A write-through install SUCCEEDS in a READ-ONLY destination
+#   directory (the existing file is writable; the directory bit is irrelevant to it) while a
+#   temp+rename install CANNOT (it must create a new name in that directory), so the two are
+#   distinguishable without sampling for a race — and the assertion that the previous copy is
+#   still byte-identical AND still executable is the "leaving any previous copy in place" contract
+#   every leg now relies on. ARM 3 pins the success arm: new bytes land, EXECUTABLE, no temp left.
+echo "== farm installs are atomic (#3991)"
+SETUP_SH="$ROOT/pi-bootstrap/setup.sh"
+atomic_calls="$(grep -c 'farm_install "' "$SETUP_SH" || true)"
+# 8 = the seven script farm legs + the $DEST/bin/pi spawn-point gate. `-ge` (never `-eq`) so a leg
+# ADDED later does not red this arm for the COUNT alone; a leg REMOVED, or one that stops calling the
+# helper, drops the count below 8 and fails here.
+# ⛔ WHAT THIS ARM DOES NOT DO: it counts call sites, so it does not pin a NEW leg that is written
+# with a different spelling (`cp -f "$src" "$dest"`, `install -m 755 …`, `chmod 755 "$dest"`).
+# The three pattern arms below are what bind a literal revert; a ninth leg using other variables is
+# caught by review, not by this count — do not read the count as "future legs are covered".
+if [ "$atomic_calls" -ge 8 ]; then
+  echo "ok: $atomic_calls install site(s) go through farm_install (temp + chmod + rename)"
+else
+  fail "only $atomic_calls install site(s) call farm_install — #3991 requires all 8 (checkout-hygiene, fleet, mcp-harness, lib, fleet-tools, merge-gate, graph, bin/pi)"
+fi
+if grep -nE '^[[:space:]]*cp -f "\$f" "\$dest"' "$SETUP_SH" >/dev/null; then
+  fail "a farm leg still writes THROUGH the destination ('cp -f \"\$f\" \"\$dest\"') — a concurrent reader can observe a zero-byte or half-written gate (#3991)"
+else
+  echo "ok: no farm leg truncates the destination in place"
+fi
+if grep -nE '^[[:space:]]*chmod \+x "\$dest"' "$SETUP_SH" >/dev/null; then
+  fail "a farm leg chmods the DESTINATION after installing it — the file exists non-executable in between (#3991)"
+else
+  echo "ok: no farm leg chmods the destination (the bit is set on the temp, before the rename)"
+fi
+# `$DEST/bin/pi` is the spawn point EVERY lane resolves (`$DEST/bin` is first on PATH), so a torn or
+# not-yet-`x` copy there is a broken `pi` for a session starting at that instant — the same class,
+# on the binary that starts every lane.
+if grep -nE '^[[:space:]]*cp -f "\$SPAWN_GATE_SRC".*"\$DEST/bin/pi"' "$SETUP_SH" >/dev/null; then
+  fail "the spawn-point gate is still installed with a bare 'cp -f … \"\$DEST/bin/pi\"' — a lane spawning mid-write can exec a truncated pi (#3991)"
+else
+  echo "ok: the spawn-point gate is installed through farm_install too (never a torn \$DEST/bin/pi)"
+fi
+ATOM_DIR="$TMP/atomic"
+mkdir -p "$ATOM_DIR"
+printf '#!/bin/bash\necho OLD\n' > "$ATOM_DIR/gate.sh"
+chmod 755 "$ATOM_DIR/gate.sh"
+printf '#!/bin/bash\necho NEW\n' > "$TMP/atomic-src.sh"
+atomic_fn="$(sed -n '/^farm_install() {/,/^}/p' "$SETUP_SH")"
+if [ -z "$atomic_fn" ]; then
+  fail "farm_install() is not defined in $SETUP_SH — the atomic install path cannot be driven"
+else
+  eval "$atomic_fn"
+  # ARM 3: the success arm.
+  if farm_install "$TMP/atomic-src.sh" "$ATOM_DIR/gate.sh" \
+     && cmp -s "$TMP/atomic-src.sh" "$ATOM_DIR/gate.sh" \
+     && [ -x "$ATOM_DIR/gate.sh" ]; then
+    echo "ok: a successful install lands the new bytes and they are EXECUTABLE"
+  else
+    fail "farm_install did not land an executable copy of the new bytes at $ATOM_DIR/gate.sh"
+  fi
+  if find "$ATOM_DIR" -maxdepth 1 -name 'gate.sh.tmp.*' -print -quit 2>/dev/null | grep -q .; then
+    fail "farm_install left a temp file beside the destination — a reader can find a half-written name (#3991)"
+  else
+    echo "ok: a successful install leaves no temp file behind"
+  fi
+  # ARM 3b: a DIRECTORY at the predictable scratch name. On a FRESH destination an unguarded install
+  # would `cp` into that directory and `mv` it onto `$dest` — rc=0, the leg counts a copy, and
+  # `$DEST/scripts/<gate>` is a DIRECTORY. Two details make this arm honest, and both were measured
+  # against the real helper: (1) the destination must NOT pre-exist — with an existing regular file
+  # `mv` refuses on its own (`cannot overwrite non-directory ... with directory`), returning the same
+  # rc=1 and the same untouched destination as the guard, so the arm would pass with the guard deleted;
+  # (2) the refusal's OWN words must be seen, or `mv`'s message impersonates it.
+  rm -f "$ATOM_DIR/fresh.sh"
+  rm -rf "$ATOM_DIR/fresh.sh.tmp.$$"
+  mkdir -p "$ATOM_DIR/fresh.sh.tmp.$$"
+  scratch_rc=0
+  scratch_err="$(farm_install "$TMP/atomic-src.sh" "$ATOM_DIR/fresh.sh" 2>&1)" || scratch_rc=$?
+  if [ "$scratch_rc" -eq 0 ]; then
+    fail "farm_install reported SUCCESS with a DIRECTORY at its scratch name — nothing was delivered at $ATOM_DIR/fresh.sh"
+  elif [ -e "$ATOM_DIR/fresh.sh" ]; then
+    fail "the scratch-directory refusal still left something at $ATOM_DIR/fresh.sh"
+  elif ! grep -q 'refusing to use it as scratch' <<<"$scratch_err"; then
+    fail "the scratch-directory refusal did not say so in its own words (got: $scratch_err) — mv's refusal would satisfy this arm just as well"
+  else
+    echo "ok: a directory at the scratch name is refused, in its own words, with nothing delivered"
+  fi
+  rm -rf "$ATOM_DIR/fresh.sh.tmp.$$"
+
+  # ARM 2: the discriminator. A write-through install succeeds here; a temp+rename cannot.
+  printf '#!/bin/bash\necho OLD\n' > "$ATOM_DIR/gate.sh"
+  chmod 755 "$ATOM_DIR/gate.sh"
+  atomic_old="$(cat "$ATOM_DIR/gate.sh")"
+  cp "$ATOM_DIR/gate.sh" "$TMP/atomic-old.sh"
+  if [ "$(id -u)" -eq 0 ]; then
+    echo "ok: read-only-directory arm skipped (running as root, where the mode bits prove nothing)"
+  else
+    chmod a-w "$ATOM_DIR"
+    atomic_rc=0
+    farm_install "$TMP/atomic-src.sh" "$ATOM_DIR/gate.sh" || atomic_rc=$?
+    chmod u+w "$ATOM_DIR"
+    if [ "$atomic_rc" -eq 0 ]; then
+      fail "farm_install SUCCEEDED with a read-only destination directory — it wrote THROUGH the existing destination inode instead of creating a sibling temp and renaming it (#3991)"
+    elif ! cmp -s "$TMP/atomic-old.sh" "$ATOM_DIR/gate.sh" || [ ! -x "$ATOM_DIR/gate.sh" ]; then
+      fail "a failed install did NOT leave the previous copy intact and executable ($ATOM_DIR/gate.sh) — a lane merging at that instant loses a runnable gate"
+    else
+      echo "ok: a failed install leaves the previous copy byte-identical AND executable, and does not write through it"
+    fi
+  fi
+  # ARM 4: a DIRECTORY at the destination is REFUSED, in its own words, with nothing delivered.
+  # `mv -f file existing-dir` MOVES INTO it and exits 0, so without the helper's guard this path
+  # reports SUCCESS while the declared path stays empty — "a farm that reports success over a file it
+  # did not deliver" (#1931/#1924), a shape a `cp -f` implementation cannot fail either. Measured
+  # against the real helper, not assumed: with the `[ -d "$dest" ]` guard deleted this arm reds on
+  # "reported SUCCESS". The refusal's OWN words are asserted as well, so `mv` failing for an
+  # unrelated reason cannot satisfy this arm in the guard's place (the poison ARM 3b names).
+  rm -rf "$ATOM_DIR/dirgate.sh"
+  mkdir -p "$ATOM_DIR/dirgate.sh"
+  dirgate_rc=0
+  dirgate_err="$(farm_install "$TMP/atomic-src.sh" "$ATOM_DIR/dirgate.sh" 2>&1)" || dirgate_rc=$?
+  if [ "$dirgate_rc" -eq 0 ]; then
+    fail "farm_install reported SUCCESS with a DIRECTORY at the destination ($ATOM_DIR/dirgate.sh) — 'mv -f file dir' moves the file INTO it and exits 0, so the leg would count a copy it never delivered (#3991)"
+  elif [ -e "$ATOM_DIR/dirgate.sh/atomic-src.sh" ]; then
+    fail "farm_install moved the source INTO the destination directory ($ATOM_DIR/dirgate.sh/atomic-src.sh) instead of refusing — the declared path stays empty while the leg reports a failure for the wrong reason"
+  elif ! grep -q 'refusing to install over it' <<<"$dirgate_err"; then
+    fail "the destination-directory refusal did not say so in its own words (got: $dirgate_err) — mv's own refusal would satisfy this arm just as well"
+  else
+    echo "ok: a DIRECTORY at the destination is REFUSED in its own words, with nothing delivered"
+  fi
+fi
+
 # --- done -----------------------------------------------------------------
 # #446: every setup.sh run happened under the temp HOME; the launchctl shim
 # must be SILENT (no call escaped to any launchctl) and the installer's
