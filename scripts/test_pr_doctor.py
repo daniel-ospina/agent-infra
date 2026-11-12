@@ -7802,7 +7802,19 @@ def test_a_repo_whose_rubric_was_not_supplied_is_refused_not_graded(monkeypatch)
         assert _REPO_A in note, note
         # The refusal is a GATE-class refusal: nothing consumed, no state row, and the pass reports
         # EXIT_UNDELIVERABLE rather than a confident wrong order.
-        assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False)
+        assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (
+            False, pr.rubric_refusal_note(note), False)
+        # ⛔ AND THE DETAIL CARRIES THE CLASS (#4009). `main()` decides the pass's VERDICT from this
+        # detail; without a marker it could only see "a refusal", so it reported a CONFIG gap as a
+        # broken transport chain on 2920 consecutive passes. The note stays a SUFFIX, so nothing that
+        # greps the operator's sentence loses it.
+        _ok, _detail, _record = pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False)
+        assert pr.rubric_refused(_detail) is True, _detail
+        assert _detail.endswith(note), _detail
+        # The predicate is a CLASSIFIER, not a substring of any refusal: a transport refusal is not
+        # this class, which is what keeps the two remedies apart.
+        assert pr.rubric_refused("rc=127: bash: nonblocking-dispatch.sh: No such file") is False
+        assert pr.rubric_refused("") is False
         # …and a DRY RUN says the same thing, so an operator cannot read a plan the pass would refuse.
         assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=True)[0] is False
     finally:
@@ -7851,6 +7863,167 @@ def test_the_refusal_is_derived_so_the_next_repo_in_a_set_is_not_refused_for_the
         assert pr.contract_note(pr.REPO) == "", "repo B inherited repo A's refusal"
     finally:
         pr.canonical_paths()
+
+
+# ── 12b. THE VERDICT MUST NAME THE COMPONENT THAT FAILED, NOT THE ONE BESIDE IT (agent-infra#4009) ──
+#
+# ⛔ THE MEASURED DEFECT, 2026-11-07 → 2026-11-12 (Mac + cell, 2920 log lines):
+#
+#   dispatched 0 of 17 queued — VERDICT=UNDELIVERED next=repair-chain; repair the dispatch chain
+#   named on the line above -- this does NOT clear by waiting; 17 order(s) no worker accepted
+#
+# The dispatch chain was HEALTHY and was NEVER INVOKED. `dispatch()` returned at its
+# `contract_note()` guard, before any worktree was materialised and before
+# `$O/nonblocking-dispatch.sh` was exec'd at all, because `OBJECTIVE_REQUIRED`/`OBJECTIVE_SURFACE`
+# had not been supplied for the repo being graded. Two measurements, both cheap to repeat:
+#
+#   $ bash ~/orchestrator/nonblocking-dispatch.sh --status <name>
+#     <name> lost (no exit status recorded and pid <unknown> is gone)     # rc 0 — the chain answers
+#   $ grep -c 'rubric: REFUSING TO DISPATCH' $STATE/pr-doctor.log
+#     2920                                                                # one per pass, for days
+#
+# So the verdict named a component that had not failed, AND "the line above" named no component at
+# all. An operator repairing the chain cured nothing. The class is CONFIG; its remedy is
+# `contract_note()`'s own `Fix:` sentence.
+#
+# ⛔ IT MUST STILL REFUSE. #3105's ruling is not negotiable here: a pass that delivers nothing may
+# not read as a quiet queue. This keeps rc 3 and only changes the ATTRIBUTION.
+
+
+def test_a_rubric_refusal_is_its_OWN_verdict_and_never_blames_the_dispatch_chain(monkeypatch):
+    """→ `VERDICT=RUBRIC next=supply-rubric`, rc 3, and NEVER `next=repair-chain`.
+
+    Fails on the pre-#4009 tree: the same pass printed `VERDICT=UNDELIVERED next=repair-chain`.
+    """
+    rc, joined = _refused_pass(monkeypatch, pr.rubric_refusal_note("no rubric declared for o/r"))
+    side = json.loads(pathlib.Path(pr.STATUS).read_text())
+
+    # 1. THE REFUSAL IS PRESERVED (#3105). Not 0, not "nothing to do".
+    assert rc == pr.EXIT_UNDELIVERED == 3, joined
+    # 2. THE ATTRIBUTION CHANGED — the whole point.
+    assert side["verdict"] == "RUBRIC", side
+    assert "VERDICT=RUBRIC" in joined and "next=supply-rubric" in joined, joined
+    assert "repair-chain" not in joined, joined
+    assert "no worker accepted" not in joined, joined
+    # 3. AND THE SENTENCE SAYS THE CHAIN WAS NOT REACHED, so an operator cannot read the old remedy
+    #    back out of the prose.
+    assert "NEVER INVOKED" in joined, joined
+    assert "rubric:" in joined, joined
+    # 4. THE REMEDY SURVIVES THE BEAT'S 110-CHAR CUT (`objective.py::pr_doctor_last_run`).
+    assert "next=supply-rubric" in side["reason"][:110], side["reason"]
+    # 5. No cooldown, no budget slot: a rubric refusal consumed nothing, so a row here would hold a
+    #    real 45-minute cooldown for work that never ran.
+    assert pr.load_state() == {}, pr.load_state()
+
+
+def test_a_broken_chain_is_NAMED_BY_RESOLVED_PATH_and_never_left_to_the_reader(monkeypatch, tmp_path):
+    """`next=repair-chain` is only a remedy if the line carries WHICH file (#4009 acceptance 2).
+
+    Pre-#4009 the verdict said *"repair the dispatch chain named on the line above"* and the line
+    above it read `REFUSING: N order(s) no worker accepted` — no chain, no path, no component. The
+    resolution is `ORCH_DIR` (the `$O` seam) plus the script name, and `$O`'s VALUE is exactly what
+    differs between the Mac and a cell, so the field carries the resolved absolute path instead.
+    """
+    missing = str(tmp_path / "absent" / "nonblocking-dispatch.sh")
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", missing)
+    assert pr.dispatch_chain_brief() == "%s (MISSING)" % missing
+
+    rc, joined = _refused_pass(
+        monkeypatch, "rc=127: bash: %s: No such file or directory" % missing)
+    assert rc == pr.EXIT_UNDELIVERED == 3, joined
+    assert "VERDICT=UNDELIVERED" in joined, joined
+    assert "chain=%s (MISSING)" % missing in joined, joined
+    assert "NAMED BY `chain=`" in joined, joined
+    # …and the resolved path is inside the machine-field region, ahead of the prose, so the 110-char
+    # cut cannot sever the one datum the remedy is about.
+    assert pr.dispatch_chain_brief() in json.loads(
+        pathlib.Path(pr.STATUS).read_text())["reason"][:160]
+
+    # A chain that IS deployed reports its path with no qualifier — the field is a resolution, not a
+    # status verb, so it must not acquire "(OK)"/"(PRESENT)" decoration.
+    present = tmp_path / "nonblocking-dispatch.sh"
+    present.write_text("exit 0\n")
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(present))
+    assert pr.dispatch_chain_brief() == str(present)
+
+
+def _repaired_chain(tmp_path, monkeypatch):
+    """A chain that ANSWERS: `--status` replies, and a launch writes a complete `.rc`.
+
+    Deliberately a stub and not the shipped script: the shipped one carries a start assertion whose
+    arms need a real `pi` process, and this test is about the COUNT a repaired chain produces, not
+    about that assertion (which has its own tests).
+    """
+    o = tmp_path / "orch"
+    (o / "bg").mkdir(parents=True)
+    chain = o / "nonblocking-dispatch.sh"
+    chain.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -u\n"
+        "if [ \"${1:-}\" = \"--status\" ]; then echo \"${2:-?} lost (no exit status recorded)\"; exit 0; fi\n"
+        "name=\"$1\"\n"
+        "printf '0\\n' > \"$(dirname \"$0\")/bg/$name.rc\"\n"
+        "exit 0\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(o))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", str(chain))
+    return chain
+
+
+def test_a_REPAIRED_chain_turns_the_SAME_queued_orders_into_a_dispatch_count(tmp_path, monkeypatch):
+    """#4009 acceptance 1+3: a queued order plus a broken chain is UNDELIVERED; repaired, it counts.
+
+    Both arms run the SAME queue through the SAME real `dispatch()`; the only difference is the
+    rubric. That is the measurement the issue asks for, and it is what makes the old verdict wrong
+    rather than merely unhelpful: nothing about the chain changed between the two arms.
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    _repaired_chain(tmp_path, monkeypatch)
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p, dry=False: (str(wt), ""))
+
+    def _pass(logs, rubric_supplied):
+        monkeypatch.delenv("OBJECTIVE_REQUIRED", raising=False)
+        monkeypatch.delenv("OBJECTIVE_SURFACE", raising=False)
+        if rubric_supplied:
+            monkeypatch.setenv("OBJECTIVE_REQUIRED", "pipeline-compliance")
+            monkeypatch.setenv("OBJECTIVE_SURFACE", "config/surface-manifest.yml")
+        pr.canonical_paths()
+        monkeypatch.setattr(pr, "load_state", lambda: {})
+        monkeypatch.setattr(pr, "save_state", lambda st: None)
+        monkeypatch.setattr(pr, "open_prs", lambda: [_pr(1, "a" * 40), _pr(2, "b" * 40)])
+        monkeypatch.setattr(pr, "classify", lambda p: ("fix-ci", "why", []))
+        monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: _OK_BRIEF)
+        monkeypatch.setattr(pr, "worker_live", lambda name: False)
+        monkeypatch.setattr(pr, "box_room", lambda repo_dir="": "host=h ncpu=8 load1=0 "
+                                                          "disk_free_mb=99999 via=stub")
+        monkeypatch.setattr(pr, "log", logs.append)
+        # ⛔ NOT `--dry-run`, on purpose: the whole point of ARM 2 is that the order really is placed,
+        # so the pass must walk `spawn_argv() -> the chain -> _confirm()` rather than stop at the
+        # would-spawn branch. The state file is isolated by the suite's own fixture, so a real pass
+        # here cannot write a row the live job would read.
+        monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+        try:
+            return pr.main()
+        finally:
+            pr.canonical_paths()
+
+    # ARM 1 — no rubric: nothing can be placed, for the CONFIG reason, and it still refuses.
+    logs = []
+    rc_main = _pass(logs, rubric_supplied=False)
+    joined = "\n".join(logs)
+    assert rc_main == pr.EXIT_UNDELIVERED == 3, joined
+    assert "dispatched 0 of 2 queued" in joined, joined
+    assert "VERDICT=RUBRIC" in joined and "next=repair-chain" not in joined, joined
+
+    # ARM 2 — the SAME chain, the SAME queue, the rubric supplied: the orders go out, and the pass
+    # reports the count with its denominator instead of a transport failure.
+    logs = []
+    rc_main = _pass(logs, rubric_supplied=True)
+    joined = "\n".join(logs)
+    assert rc_main == pr.EXIT_CLEAN == 0, joined
+    assert "dispatched 2 of 2 queued" in joined, joined
+    assert "VERDICT=OK" in joined, joined
+    assert "no worker accepted" not in joined, joined
 
 
 # ── the two records, and the per-repo log ────────────────────────────────────────────────────────
@@ -8011,7 +8184,7 @@ def test_a_machine_wide_rubric_cannot_attribute_a_SET_of_repos(tmp_path, monkeyp
     # The refusal is a REFUSAL on the dispatch path too, so a set that skips `run_pass` cannot
     # still place an order.
     assert pr.dispatch({"number": 1}, "rerun-checks", "brief", True,
-                       seen[0][1]) == (False, seen[0][1], False)
+                       seen[0][1]) == (False, pr.rubric_refusal_note(seen[0][1]), False)
 
 
 def test_the_machine_wide_status_view_NAMES_its_own_age_and_the_per_repo_records(tmp_path,
@@ -8254,7 +8427,8 @@ def test_HALF_a_rubric_seam_is_a_hybrid_rubric_and_refuses_even_the_built_in_rep
             assert "HYBRID" in note and named in note, note
             # …and the refusal reaches the only path that spawns, for that repo too.
             pr.apply_repo(_REPO_B, "")
-            assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (False, note, False)
+            assert pr.dispatch(_pr(7), "rerun-checks", "brief", dry=False) == (
+                False, pr.rubric_refusal_note(note), False)
     finally:
         pr.canonical_paths()
 

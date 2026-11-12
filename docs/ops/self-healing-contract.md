@@ -356,7 +356,13 @@ deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doct
 `rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` **NOT DELIVERED** — the work was
 legible and none of it went out: no worker took an order that was placed, **or** a durable state (a
 worktree holding uncommitted work, a refusing transport) stopped the order before delivery, so an
-operator must repair the chain; `6` **NO-CAPACITY** — the box's own spawn gate refused every order,
+operator must repair the chain; ⛔ **the `verdict` field says WHICH**, because those remedies are not
+interchangeable: `UNDELIVERED` — the transport refused, and `chain=<resolved path>` on the same line
+names the one file to repair; `REFUSED` — a worktree, `next=fix-worktree`; `RUBRIC` — **nothing was
+placed and the chain was never invoked**, because this pass holds no rubric for the repo it grades
+(`next=supply-rubric`, the `OBJECTIVE_REQUIRED`/`OBJECTIVE_SURFACE` seams). Until `#4009` all three
+read `next=repair-chain` and named no chain at all — measured over **2920** passes while the chain
+answered `--status` in one call, i.e. the verdict sent operators to a healthy component; `6` **NO-CAPACITY** — the box's own spawn gate refused every order,
 **nothing was consumed**, and the sidecar also carries `verdict`, `refusal_bound`
 (`<axis>=<count>[,…]`, e.g. `load=1` or `disk=2,load=1`) and
 `room` (the `capacity.sh probe` record measured at decision time); the reason is a PREFIX —

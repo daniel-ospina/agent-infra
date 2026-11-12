@@ -3316,7 +3316,14 @@ repo=daniel-ospina/tortoise             open_prs=0     unplaced=0     dispatched
 The verdict words are the exit codes' own vocabulary and stay distinct: `clean` (`0`), `REFUSING`
 (`2` — I could not READ the queue), `UNPLACED` (`3` — I read it, placed the work, no worker took it),
 `CRASH` (`4`), `NO-CAPACITY` (`6` — the BOX's own spawn gate refused the order, so nothing was
-consumed; never `RED`, which is the generic unknown-code fallback). Each entry is `owner/name`, or
+consumed; never `RED`, which is the generic unknown-code fallback). Within the `3` family the
+record's own `verdict` field names the cause, because the remedies differ: `UNDELIVERED` (the
+transport refused — the same line carries `chain=<resolved path>`, `(MISSING)` when deploying is
+the repair), `REFUSED` (a worktree, `next=fix-worktree`), and `RUBRIC` (this pass holds no rubric
+for the repo it grades, so **no order could be placed and the chain was never invoked** —
+`next=supply-rubric`). Until `agent-infra#4009` all three read `next=repair-chain` and named no
+chain at all — measured over 2920 passes against a chain that answered `--status` in one call.
+Each entry is `owner/name`, or
 `owner/name=<checkout>` when the checkout is not the one
 `REPO` names; `?` in a column means the pass never got far enough to count it. Repeated `--repo`
 flags REPLACE the `PR_DOCTOR_REPOS` default rather than joining it (a named list is the narrower
