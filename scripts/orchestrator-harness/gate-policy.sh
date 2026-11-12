@@ -5,6 +5,7 @@
 #   apply_gate_policy <carrier-name>      # called by every carrier that used to export the skips
 #   gate_policy_probe                     # sets GP_REVIEW_OK / GP_VGATE_OK / GP_MISSING
 #   bash gate-policy.sh --probe           # human/CI readable one-liner + exit code
+#   bash gate-policy.sh --unit-veto <f>   # is a scheduled-job DECLARATION carrying a gate bypass?
 #
 # ── WHAT THIS REPLACES, AND WHY IT IS A DEFECT (#2319) ───────────────────────────────────────────
 # Five carriers exported `AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` UNCONDITIONALLY:
@@ -37,6 +38,25 @@
 # could not run passed (an unreadable probe is `not satisfiable`, and says so), and never touches the
 # merge rail — `admin-merge.sh` reads the head-bound record itself and is unaffected by either flag.
 #
+# ── AND THE SECOND HALF: A DECLARATION MAY NOT CARRY THE HATCH (agent-infra#4002) ────────────────
+# `apply_gate_policy` decides the flags for ONE CARRIER'S OWN PROCESS. It cannot see the other way the
+# hatch reaches a lane: a SCHEDULED JOB whose declaration sets it in the environment of everything the
+# job spawns, for ever, with no carrier ever deciding anything. That is not hypothetical — measured
+# 2026-11-10/11, a cell's drainer was started by a hand-written wrapper carrying
+#
+#   export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
+#
+# i.e. an UNATTENDED dispatcher with the review gate, the verification gate and hub-discipline all off.
+# #623 made `task` children unhatched by default precisely so an ambient hatch cannot spread across a
+# fleet; a unit that hands the hatch to every lane it spawns defeats that in one line, and it does so
+# where nothing the carrier does can undo it (a child cannot un-receive an inherited export).
+# So the census has a second half, and it lives HERE, beside the list it is a census of: a rendered
+# unit/service/plist may not name any of these flags in its environment. `gate_policy_unit_veto` is
+# called by the installers that render a declaration (so the install REFUSES, fail-closed) and by
+# `gate-policy.test.sh` (so a template that regrows the hatch is RED before it reaches a box).
+# STATED LIMIT, so no reader over-reads it: this grades the DECLARATION. `EnvironmentFile=`/a sourced
+# rc file/the spawned script's own `export` are outside it — the census sees what the unit itself says.
+#
 # SEAMS (tests): GP_REPO=<path> (harness checkout to probe), GP_LOG=<file> (audit), GP_QUIET=1.
 
 GP_REVIEW_OK=0
@@ -44,6 +64,43 @@ GP_VGATE_OK=0
 GP_MISSING=""
 GP_MODE=""
 GP_AMBIENT_CLEARED=0
+
+# ⛔ THE ONE LIST. Every name here is a hatch that turns a gate OFF for the process it lands in, so a
+# declaration that sets one is handing it to every process the job spawns. `AGENT_ALLOW_MAIN_EDITS` /
+# `ELDATO_ALLOW_MAIN_EDITS` are the hub-discipline hatch (#623) and belong here for the same reason:
+# both were in the measured wrapper, and an unattended job editing a main checkout is the same defect
+# as an unattended job landing unreviewed code. Extend THIS list, never a second copy of it.
+GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS"
+
+# gate_policy_unit_veto <file> [label] — does a DECLARATION carry a gate bypass in its environment?
+#   0  clean (the declaration names none of the flags)
+#   1  VETOED (it names at least one; the names are printed on stderr)
+#   2  cannot answer (no file / not readable) — never a pass: an ungradable declaration is not clean.
+# Grades BOTH declaration dialects, because the fleet ships both from this repo: a systemd
+# `Environment=<NAME>=…` directive and a launchd `<key><NAME></key>` inside EnvironmentVariables.
+gate_policy_unit_veto() {
+  local f="${1:-}" label="${2:-declaration}" flag hit="" envlines=""
+  [ -n "$f" ] || { printf 'unit-veto: no file named — cannot grade '\''%s'\''\n' "$label" >&2; return 2; }
+  [ -r "$f" ] || { printf 'unit-veto: cannot read %s — an ungradable %s is not a clean one\n' "$f" "$label" >&2; return 2; }
+  # ⛔ ONLY `Environment=` DIRECTIVES ARE GRADED, and the flag must be a WHOLE WORD inside them.
+  # `-w` rather than a hand-rolled `[^A-Za-z0-9_]` boundary: GNU and BSD grep disagree about `\b` in
+  # ERE (BSD has no `\b`), and a boundary that silently stops matching is the shape that lets the
+  # hatch back in. A commented-out line is not a declaration, so the `^[[:space:]]*Environment` anchor
+  # deliberately does not see it; `EnvironmentFile=` is not `Environment=` and is outside this census
+  # (the STATED LIMIT in this file's header).
+  envlines="$(grep -E '^[[:space:]]*Environment[[:space:]]*=' "$f" 2>/dev/null || true)"
+  for flag in $GP_UNIT_BYPASS_FLAGS; do
+    if [ -n "$envlines" ] && printf '%s\n' "$envlines" | grep -Fqw -- "$flag"; then
+      hit="$hit $flag"
+    elif grep -Eq "<key>[[:space:]]*${flag}[[:space:]]*</key>" "$f" 2>/dev/null; then
+      hit="$hit $flag"            # launchd: the plist spells the name as its own <key>
+    fi
+  done
+  [ -z "$hit" ] && return 0
+  printf 'unit-veto: %s (%s) carries a GATE BYPASS in its environment:%s\n' "$f" "$label" "$hit" >&2
+  printf 'unit-veto: agent-infra#4002 — a scheduled job must not hand the emergency hatch to every process it spawns; remove it from the declaration (a lane that needs the hatch decides it through gate-policy.sh, per carrier)\n' >&2
+  return 1
+}
 
 gate_policy_probe() {
   local repo="${GP_REPO:-}"
@@ -181,6 +238,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       printf 'review_satisfiable=%s vgate_satisfiable=%s missing=%s note=%s\n' "$GP_REVIEW_OK" "$GP_VGATE_OK" "${GP_MISSING:--}" "${GP_NOTE:-}"
       [ "$GP_REVIEW_OK" -eq 1 ] && [ "$GP_VGATE_OK" -eq 1 ] && exit 0
       exit 1 ;;
-    *) printf 'usage: gate-policy.sh --probe   (or source it and call apply_gate_policy <carrier>)\n' >&2; exit 64 ;;
+    --unit-veto)
+      [ -n "${2:-}" ] || { printf 'usage: gate-policy.sh --unit-veto <declaration-file> [label]\n' >&2; exit 64; }
+      gate_policy_unit_veto "$2" "${3:-declaration}" || exit $? ;;   # 1 vetoed · 2 ungradable
+    *) printf 'usage: gate-policy.sh --probe | --unit-veto <file> [label]   (or source it and call apply_gate_policy <carrier>)\n' >&2; exit 64 ;;
   esac
 fi
