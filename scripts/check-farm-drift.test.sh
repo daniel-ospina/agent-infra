@@ -523,6 +523,22 @@ _old_cite2="setup.sh:10"; _old_cite2="${_old_cite2}61"
 ck $(grep -qF "$_old_cite" "$HERE/check-farm-drift.test.sh" && echo 1 || echo 0) "no citation still points at the pre-patch setup.sh line-56 numbering"
 ck $(grep -qF "$_old_cite2" "$HERE/check-farm-drift.sh" && echo 1 || echo 0) "no citation points at the pre-patch setup.sh line-61 numbering (the --pin-file call moved)"
 
+# 30. ⛔ THE FARM'S OWN SCRATCH IS NOT DRIFT (#3991). `farm_install` writes `<name>.tmp.<pid>` INSIDE
+# the directory this check grades, so the check must not call it UNSOURCED — and an INTERRUPTED install
+# leaves one behind permanently, which made the pre-fix grading a red pass (rc=3) whose printed remedy
+# ("declare it LOCAL, delete it, or retire it") no re-run could clear. Pinned BOTH ways: the scratch
+# shape passes, and a near-miss that is NOT the scratch shape (no pid) still fails, so this is a
+# recognised artifact and not a blanket exemption for anything reading `tmp`.
+C30="$TMP/c30"; mk_farm "$C30/scripts"; mkdir -p "$C30/state"
+printf 'scripts/alpha.py\nscripts/beta.sh\nscripts/fleet/gamma.py\n' > "$C30/state/farm-declared.txt"
+printf 'half a copy\n' > "$C30/scripts/alpha.py.tmp.4242"
+run "$C30/scripts"
+ck $([ "$RC" -eq 0 ] && echo 0 || echo 1) 'an interrupted install leaving NAME.tmp.PID scratch is not graded UNSOURCED (rc='"$RC"')'
+ck $(grep -q 'alpha.py.tmp.4242' "$ERR" && echo 1 || echo 0) '...and the scratch name does not appear in the report at all'
+printf 'not the scratch shape\n' > "$C30/scripts/beta.sh.tmp"
+run "$C30/scripts"
+ck $([ "$RC" -eq 3 ] && echo 0 || echo 1) '...while a tmp name WITHOUT a pid is still UNSOURCED (rc='"$RC"') - the exemption is the shape, not the word'
+
 
 echo ""
 if [ "$fail" -eq 0 ]; then

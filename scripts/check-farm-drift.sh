@@ -419,6 +419,12 @@ decl_rel_norm() {
 
 is_declared_local() {
     case "$1" in
+        *.tmp.[0-9]*)  return 0 ;;   # the farm's OWN scratch (farm_install's `<name>.tmp.<pid>`, #3991):
+                                     # it exists only for the duration of one copy, and an INTERRUPTED
+                                     # install leaves one behind for good. Grading it as UNSOURCED
+                                     # turned every farm red (rc=3) with a remedy no re-run could
+                                     # clear — the very class this walk's own "no temp in the farm"
+                                     # note records for its own scratch file.
         *.bak-*)        return 0 ;;   # a repair path's own backup beside the live script it replaced
         __pycache__/*)  return 0 ;;   # the interpreter's cache, never shipped
         */__pycache__/*) return 0 ;;  # ...at any depth (`fleet/__pycache__/x.pyc`)
@@ -523,12 +529,13 @@ while IFS= read -r rel; do
         matched=$((matched+1))
         # ⛔ THE EXECUTABLE BIT IS PART OF "IS THIS THE CODE?" A byte-identical copy that launchd
         # cannot exec is the same silent no-op class as #10114 (the file that must run, that cannot),
-        # and three of the five farm legs used to swallow the failure (`chmod +x "$dest" 2>/dev/null
-        # || true` in pi-bootstrap/setup.sh), so existence + byte-equality stays green over it. Since
-        # #3991 every leg installs through `farm_install` (chmod the TEMP, then rename), which fails
-        # the leg loudly — but a box farmed by an OLDER setup.sh, or a hand-edited file, still lands
-        # here, so the check grades the bit rather than trusting the installer. Git stores the bit;
-        # the working tree carries it.
+        # and several farm legs used to swallow the failure (a `chmod +x "$dest" 2>/dev/null || true`
+        # in pi-bootstrap/setup.sh — 4 of the 7 script legs plus the spawn-point gate at #3991's
+        # base), so existence + byte-equality stays green over it. Since #3991 every leg installs
+        # through `farm_install` (chmod the TEMP, then rename), which fails the leg loudly — but a
+        # box farmed by an OLDER setup.sh, or a hand-edited file, still lands here, so the check
+        # grades the bit rather than trusting the installer. Git stores the bit; the working tree
+        # carries it.
         src_exec=0
         if [ -n "$SRC_READ" ]; then
             case "$(git -C "$SRC" ls-tree "$SRC_READ" -- "$src" 2>/dev/null | cut -d' ' -f1)" in

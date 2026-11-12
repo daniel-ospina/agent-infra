@@ -2876,8 +2876,12 @@ echo "== farm installs are atomic (#3991)"
 SETUP_SH="$ROOT/pi-bootstrap/setup.sh"
 atomic_calls="$(grep -c 'farm_install "' "$SETUP_SH" || true)"
 # 8 = the seven script farm legs + the $DEST/bin/pi spawn-point gate. `-ge` (never `-eq`) so a leg
-# ADDED later is still installed through the helper; a leg REMOVED or one that stops calling it drops
-# the count below 8 and fails here.
+# ADDED later does not red this arm for the COUNT alone; a leg REMOVED, or one that stops calling the
+# helper, drops the count below 8 and fails here.
+# ⛔ WHAT THIS ARM DOES NOT DO: it counts call sites, so it does not pin a NEW leg that is written
+# with a different spelling (`cp -f "$src" "$dest"`, `install -m 755 …`, `chmod 755 "$dest"`).
+# The three pattern arms below are what bind a literal revert; a ninth leg using other variables is
+# caught by review, not by this count — do not read the count as "future legs are covered".
 if [ "$atomic_calls" -ge 8 ]; then
   echo "ok: $atomic_calls install site(s) go through farm_install (temp + chmod + rename)"
 else

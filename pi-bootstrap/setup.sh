@@ -412,10 +412,20 @@ farm_missing=""
 # deliver is the #1931/#1924 class.
 farm_install() {
   local src="$1" dest="$2" tmp
+  # `mv -f file existing-directory` MOVES INTO it and exits 0, so a directory at `$dest` would
+  # report a successful install while nothing landed at the path (the hazard farm-retire.sh:459
+  # names). Refuse it here rather than trust `mv`'s status.
+  if [ -d "$dest" ]; then
+    echo "    farm_install: $dest is a DIRECTORY — refusing to install over it" >&2
+    return 1
+  fi
   tmp="$dest.tmp.$$"
-  if cp -f "$src" "$tmp" 2>/dev/null \
+  # stderr is NOT discarded on the copy or the rename: a cell running out of disk is a documented
+  # failure mode, and `cp: No space left on device` is the only line that names it — the leg reports
+  # THAT the install failed, not why.
+  if cp -f "$src" "$tmp" \
      && chmod +x "$tmp" 2>/dev/null \
-     && mv -f "$tmp" "$dest" 2>/dev/null; then
+     && mv -f "$tmp" "$dest"; then
     return 0
   fi
   rm -f "$tmp" 2>/dev/null || true
@@ -1256,8 +1266,9 @@ else
 fi
 
 # ── UNFARM leg (#1924) ────────────────────────────────────────────────────
-# Every farm above is COPY-ONLY: `cp -f` writes the names an array lists and does
-# nothing at all to a name it does not list. `[ -f "$f" ] || continue` therefore skips
+# Every farm above is COPY-ONLY: `farm_install` writes the names an array lists (its only
+# undeclared output is its own `<name>.tmp.<pid>` scratch, which `check-farm-drift.sh`
+# recognises) and does nothing at all to a name it does not list. `[ -f "$f" ] || continue` therefore skips
 # a retired name in SILENCE, and the copy already deployed stays in $DEST/scripts —
 # executable, and sitting in the exact directory the fleet launches from
 # (heartbeat-loop.sh resolves its dispatchers there). The repo then says the tool is
@@ -1287,14 +1298,18 @@ fi
 # at the launchd step on a broken target — loud, but it strands the whole sync, which
 # pi-bootstrap/tests/test-farm-unfarm.sh now catches at merge time.
 if [ -n "$farm_missing" ]; then
-  echo "ERROR: this checkout is INCOMPLETE — farm name(s) it DECLARES are not in $INFRA_ROOT:" >&2
+  echo "ERROR: the farm is INCOMPLETE — name(s) this checkout DECLARES were not delivered:" >&2
   while IFS= read -r missed; do
     [ -n "$missed" ] && echo "         $missed" >&2
   done <<<"$farm_missing"
+  echo "       Two causes, and they do NOT have the same fix: a name ABSENT from $INFRA_ROOT (an" >&2
+  echo "       incomplete checkout), or a COPY/RENAME that FAILED — permissions, a full disk, a path" >&2
+  echo "       that is not a regular file — which cp/mv name on their own stderr line above." >&2
   echo "       Nothing below ran: the UNFARM leg, launchd convergence, the shell-profile wiring." >&2
   echo "       A farm that delivers less than it declares is how the repo and the machines drift" >&2
   echo "       apart in silence (#1931) — and, on the UNFARM side, how a file that was never" >&2
-  echo "       deployed comes to look retired. Re-run from a complete checkout (git status)." >&2
+  echo "       deployed comes to look retired. For an absent name: re-run from a complete checkout" >&2
+  echo "       (git status). For a failed install: fix $DEST (space/permissions), then re-run." >&2
   exit 1
 fi
 if [ ! -f "$BOOTSTRAP_DIR/lib/farm-retire.sh" ]; then
