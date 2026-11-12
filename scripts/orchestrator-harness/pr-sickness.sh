@@ -996,8 +996,17 @@ ps_review_cap_hit() { [ "${1:-0}" -ge "$(ps_maxtries "$PS_MAX_TRIES")" ]; }
 # who is not reading this box's log — and the harness's own record of the failure mode (agent-infra
 # #4006's audit) is a stage that was "scheduled and logging" while doing nothing. Tagged, so a repeat
 # pass adds no comment; unreadable comments ⇒ NOT posted (a blind post is a duplicate every pass).
+# ⛔ THE RE-ARM FACT IS AN ARGUMENT, NOT A CONSTANT (fresh-context review, P2, verified). This comment
+# is reached from BOTH bounds, and the two bounds clear by OPPOSITE mechanisms:
+#   * the per-head budget (`psick-<PR>-<sha12>`) is keyed on the TREE, so a push IS the remedy;
+#   * the review-round book (`state/reviewround-<PR>`) is CUMULATIVE ACROSS HEADS by design —
+#     `merge-one.sh`'s own `[rrceiling]` park states it verbatim: "A push does NOT re-arm this book (it is
+#     cumulative across heads); only a CLEAN verdict or the PR leaving the queue clears it."
+# One fixed paragraph saying "a push re-arms both" was FALSE for the ceiling, and it reached a human —
+# the wrong half of a bound-telling. So the caller passes the true remedy for its own bound; `$5` is
+# required, so a future third bound cannot inherit a fact that is not its own.
 ps_review_escalate() {
-  local repo="$1" pr="$2" sha="$3" why="$4" tag seen body ghbin
+  local repo="$1" pr="$2" sha="$3" why="$4" rearm="$5" tag seen body ghbin
   ghbin="${PS_GH:-gh}"
   command -v "$ghbin" >/dev/null 2>&1 || { printf '[prsick] #%s escalate: no usable gh — the reason is only in this log\n' "$pr"; return 1; }
   tag="<!-- prsick-review-fix-cap:${sha:0:12} -->"
@@ -1011,8 +1020,9 @@ $why
 
 **What already happened:** a fresh-context review recorded a \`not-clean\` verdict at \`${sha:0:12}\`, so
 this queue dispatched a fixer lane automatically (no agent decided that) — and the loop is now at its
-bound. **Nothing further will be dispatched for this head**, and the bound clears by itself on a new
-head: a push (by hand or by any lane) re-arms both the per-head attempt budget and the review round.
+bound. **Nothing further will be dispatched for this head.**
+
+**How this bound clears:** $rearm
 
 Recorded by \`scripts/orchestrator-harness/pr-sickness.sh\` (agent-infra#4011)."
   "$ghbin" api -X POST "repos/$repo/issues/$pr/comments" -f body="$body" >/dev/null 2>&1 || {
@@ -1062,9 +1072,9 @@ ps_review_decide() {
     # state this arm exists to end.
     if [ -s "$(ps_state_dir)/parked-$pr" ] && [ "$(cat "$(ps_state_dir)/parked-$pr" 2>/dev/null)" = "$sha" ]; then :; else
       printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
-      printf '%s\n' "a not-clean review at head=$sha is still unfixed after $bcnt fixer attempt(s) (PS_MAX_TRIES=$PS_MAX_TRIES) — a human must decide; a push re-arms it, or: rm -f '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr'" \
+      printf '%s\n' "a not-clean review at head=$sha is still unfixed after $bcnt fixer attempt(s) (PS_MAX_TRIES=$PS_MAX_TRIES) — a human must decide; a push re-arms it (this budget is keyed on the TREE), or: rm -f '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr'" \
         > "$(ps_state_dir)/parkreason-$pr" 2>/dev/null || true
-      ps_review_escalate "$repo" "$pr" "$sha" "**Cap hit:** \`PS_MAX_TRIES=$(ps_maxtries "$PS_MAX_TRIES")\` fixer attempts were spent on this head (\`${sha:0:12}\`) and the recorded verdict is still \`not-clean\` (${rfindings:-?} open finding(s)). A fixer that cannot fix is finite by design: dispatch stops here." >/dev/null
+      ps_review_escalate "$repo" "$pr" "$sha" "**Cap hit:** \`PS_MAX_TRIES=$(ps_maxtries "$PS_MAX_TRIES")\` fixer attempts were spent on this head (\`${sha:0:12}\`) and the recorded verdict is still \`not-clean\` (${rfindings:-?} open finding(s)). A fixer that cannot fix is finite by design: dispatch stops here." "this budget is **keyed on the TREE** (\`psick-$pr-<head12>\`), so a **push re-arms it**: the new head gets its own budget, and any lane that pushes does that for you. Nothing else is needed." >/dev/null
     fi
     return 1
   fi
@@ -1080,9 +1090,12 @@ ps_review_decide() {
       "$pr" "$book" "$max"
     if [ ! -s "$(ps_state_dir)/parked-$pr" ] || [ "$(cat "$(ps_state_dir)/parked-$pr" 2>/dev/null)" != "$sha" ]; then
       printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
-      printf '%s\n' "this PR has spent its review-round ceiling (rounds=$book MAX_REVIEW=$max) at head=$sha, so a fixer here would produce a head no review may be bought for — a human must decide; a push or a raised MAX_REVIEW re-arms it" \
+      # ⛔ THE REMEDY IS `merge-one.sh`'s OWN ([rrceiling]), NOT "a push": the book is CUMULATIVE across
+      # heads, so a push produces a head whose review the same ceiling refuses — the operator would push
+      # and be exactly as stuck, with this parkreason telling them it was the remedy.
+      printf '%s\n' "this PR has spent its review-round ceiling (rounds=$book MAX_REVIEW=$max) at head=$sha, so a fixer here would produce a head no review may be bought for — a human must decide. This book is CUMULATIVE across heads, so a PUSH DOES NOT RE-ARM IT (only a CLEAN verdict or the PR leaving the queue clears it). To re-arm deliberately: rm -rf '$(ps_state_dir)/reviewround-$pr' '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr', or raise MAX_REVIEW" \
         > "$(ps_state_dir)/parkreason-$pr" 2>/dev/null || true
-      ps_review_escalate "$repo" "$pr" "$sha" "**Review-round ceiling:** this PR has already spent \`$book\` of \`$max\` review rounds (\`state/reviewround-$pr\`, agent-infra#3441). A fixer dispatched now would push a NEW head, and the review of that head is refused by the same ceiling — so no fixer is spent." >/dev/null
+      ps_review_escalate "$repo" "$pr" "$sha" "**Review-round ceiling:** this PR has already spent \`$book\` of \`$max\` review rounds (\`state/reviewround-$pr\`, agent-infra#3441). A fixer dispatched now would push a NEW head, and the review of that head is refused by the same ceiling — so no fixer is spent." "**a push does NOT re-arm this one.** \`state/reviewround-$pr\` is CUMULATIVE ACROSS HEADS by design (agent-infra#3441), so only a \`CLEAN\` verdict or the PR leaving the queue clears it. To re-arm deliberately: raise \`MAX_REVIEW\`, or \`rm -rf \$O/state/reviewround-$pr \$O/state/parked-$pr \$O/state/parkreason-$pr\`, or decide this PR by hand." >/dev/null
     fi
     return 1
   fi

@@ -673,6 +673,10 @@ eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "the head is PARKED (the h
 has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "still unfixed after 2 fixer attempt(s)" "the park reason says what happened, in the operator's words"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "exactly ONE escalation comment was posted on the PR"
 has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "prsick-review-fix-cap:$sha12r" "…tagged by head, so a repeat pass cannot duplicate it"
+# ⛔ THE RE-ARM FACT MUST MATCH THE BOUND (fresh-context review, P2, verified against this repo's
+# `merge-one.sh` [rrceiling]: "A push does NOT re-arm this book (it is cumulative across heads)").
+# BOUND 1's budget is keyed on the TREE, so a push IS its remedy — pinned here as the positive half.
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a **push re-arms it**" "BOUND 1's escalation names the push as the remedy (true: this budget is keyed on the tree)"
 out="$(run_pass)"
 has "$out" "skip #77: parked at this head — needs a human" "a later pass reads the park, not the cap"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "and posts NO second comment"
@@ -687,6 +691,14 @@ has "$out" "skip #77: review-round ceiling spent (rounds=10/10)" "a PR at MAX_RE
 eq "$(spawns)" "0" "and nothing is spawned"
 eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "the head is parked, naming the ceiling"
 has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "review-round ceiling" "…in the reason a human reads"
+# ⛔ THE CEILING HALF, WHICH IS WHERE THE FIXED PARAGRAPH WAS FALSE. `state/reviewround-<PR>` is
+# CUMULATIVE ACROSS HEADS, so "a push re-arms it" told the operator to do the one thing that does not
+# work — and the parkreason is the only in-band remedy they see. Both directions pinned: the true
+# remedy present, the false one absent.
+has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "PUSH DOES NOT RE-ARM IT" "…and names the TRUE remedy for THIS bound (the book is cumulative across heads)"
+no  "$(cat "$STATE/parkreason-77" 2>/dev/null)" "re-arms it" "…not the false 'a push re-arms it' (verified against merge-one.sh's [rrceiling] park)"
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a push does NOT re-arm this one" "the ceiling's PR comment says a push does NOT re-arm the review-round book"
+no  "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "re-arms both the per-head attempt budget and the review round" "…and the one fixed paragraph that claimed a push re-arms BOTH bounds is gone"
 # ⛔ MAX_REVIEW=0 IS REPORT-ONLY (the MAX_REVIEW_TRIES idiom), so the ceiling is DISABLED — a box
 # configured to buy no reviews must not refuse a repair on a budget it never configured.
 reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 1
