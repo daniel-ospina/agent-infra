@@ -97,7 +97,10 @@ set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GH="${AGENT_GH_REAL:-gh}"
-REPO=""
+# ⛔ `${REPO:-}` AND NOT `REPO=""`: a bare assignment would DISCARD the box's own `REPO` pin, so the
+# resolver below would never see the value the operator set and every run would refuse. (Measured:
+# `REPO=owner/name ./verify-landing-chain.sh` refused until this line stopped clobbering it.)
+REPO="${REPO:-}"
 PRS=""
 ISSUE=""
 SNAPSHOT_IN=""
@@ -122,19 +125,35 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# ── repo resolution ───────────────────────────────────────────────────────────────────────────────
-# A snapshot may carry no repo; then `--repo` is mandatory rather than guessed, because every gh path
-# is keyed on it and a wrong guess reads another repository's PR and reports PASS.
+# ── repo resolution ──────────────────────────────────────────────────────────────────────────────
+# ⛔ NO PRIVATE PATH DEFAULT IS ASSIGNED TO `REPO` HERE. `check-single-source.sh`'s REPO path-default
+# arm refuses exactly that shape, and it is right to: `REPO` is set ONCE per box (a launchd plist on
+# a Mac, keys.env on a cell) and read through `repo-slug.sh`'s `resolve_repo`, which REFUSES a value
+# by name. A per-script default points every other box at a path it does not have — and `$PWD` is `/`
+# under launchd, which is a real directory that is not a repo. So the ONE resolver is the only default
+# this file takes, and when it cannot prove a slug the script REFUSES and names the fix.
 if [ -z "$REPO" ] && [ -f "${SNAPSHOT_IN:-/nonexistent}/repo.txt" ]; then
   REPO="$(tr -d '\r\n' < "$SNAPSHOT_IN/repo.txt")"
 fi
-if [ -z "$REPO" ]; then
-  REPO="$(git config --get remote.origin.url 2>/dev/null | sed -e 's#^git@github.com:#https://github.com/#' -e 's#\.git$##' -e 's#^.*github.com/##')"
-fi
+# The ONE slug parser, sourced rather than re-implemented: a second URL parse is how the pool and the
+# grading drift apart (#2040). It is used in BOTH directions below — to test a value, and to turn a
+# box's path-form `REPO` pin into a slug.
+[ -f "$HERE/repo-slug.sh" ] && . "$HERE/repo-slug.sh" >/dev/null 2>&1
 case "$REPO" in
-  */*) : ;;
-  *) printf 'verify-landing-chain: cannot resolve owner/repo — pass --repo\n' >&2; exit 3 ;;
+  */*)
+    # a box may pin REPO to a CHECKOUT (that form is supported and must not be mistaken for a slug);
+    # anything that is not already a slug is derived through the same parser, never parsed here.
+    if ! repo_slug_valid "$REPO" 2>/dev/null; then
+      REPO="$(derive_or "$REPO" "" 2>/dev/null)" || REPO=""
+    fi ;;
 esac
+if ! repo_slug_valid "$REPO" 2>/dev/null; then
+  printf 'verify-landing-chain: owner/repo is not resolved — the harness carries NO default for it.\n' >&2
+  printf '  Pass --repo owner/repo, or point a snapshot at a repo.txt, or set REPO the one way this\n' >&2
+  printf '  box has for it (the launchd plist on a Mac, keys.env on a cell; a checkout path is fine —\n' >&2
+  printf '  it is derived through scripts/orchestrator-harness/repo-slug.sh).\n' >&2
+  exit 3
+fi
 OWNER="${REPO%%/*}"; RNAME="${REPO#*/}"
 
 # ── artifact locations (one definition each; --from-snapshot overrides the FETCH, not the names) ──
