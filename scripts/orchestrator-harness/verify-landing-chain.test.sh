@@ -67,8 +67,13 @@ verify() { # verify <root> [extra args]  → sets OUT (text), OUTJ (json), retur
   OUTJ="$(bash "$SCRIPT" --from-snapshot "$root" --repo "$REPO_FIXTURE" --json "$@" 2>&1)"
   return $rc
 }
-has()  { printf '%s' "$OUT"  | grep -qF -- "$1"; }
-hasj() { printf '%s' "$OUTJ" | grep -qF -- "$1"; }
+# ⛔ NO `printf | grep -q` (round 4, F1 — BLOCKING). That shape is the SIGPIPE false-negative idiom
+# `scripts/check-no-sigpipe-grep.sh` exists to refuse (#841/#864): under `pipefail` a quiet grep exits
+# BEFORE the writer finishes, the writer dies of SIGPIPE, and the pipeline reports 141 — so the
+# assertion inverts. The repo's own suite records `sigpipe-grep` as a REQUIRED PR check, so this file
+# would have redded CI. A here-string drops the pipe entirely and keeps every grep flag.
+has()  { grep -qF -- "$1" <<<"$OUT"; }
+hasj() { grep -qF -- "$1" <<<"$OUTJ"; }
 
 # ── case 1: the clean landing — every check PASS, exit 0 ─────────────────────────────────────────
 R="$(mk clean 401)"
@@ -310,6 +315,40 @@ ck "F2c: a QUEUED group at mergedAt FAILs as 'did not wait for it'" "$(has "did 
 ck "F2c: …and it is never described as a group that did not exist yet" "$(has "no run existed by mergedAt" && echo 1 || echo 0)"
 ck "F2c: …so the verdict is NOT-MET (exit 1), not a pass" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
 
+# F3n — round 4's F3: an OLDER green must not outvote a NEWER attempt that never voted. The newest
+# attempt at the merge was in flight, so the landing went ahead without a verdict from the job whose
+# last word was green — the header's invariant ("the newest attempt of EVERY group was GREEN and
+# completed") is false here, and the report used to assert it.
+R="$(mk f3n-older-green-newer-inflight 455)"
+run "$R" 455 9001 "CI" 1
+group "$R" 455 10 9001 "unit-test" completed   success "2026-11-12T04:00:00Z" "2026-11-12T03:59:00Z"
+group "$R" 455 20 9001 "unit-test" in_progress -       "-"                "2026-11-12T05:00:00Z"
+verify "$R"; rc=$?
+ck "F3n: a newer in-flight attempt hides the older green" "$(has "did not wait for"; echo $?)"
+ck "F3n: …and the group is never reported GREEN" "$(has "unit-test.*GREEN"; has "1 group(s) GREEN" && echo 1 || echo 0)"
+ck "F3n: …so the run exits 1 (a FAIL), not 0" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+
+# F2n — round 4's F2 (a FALSE PASS): a standing `not-clean` is not a review record. The marker was
+# admitted and PASSed on the strength of being a marker, so a landing a reviewer REFUSED read as
+# ALL-MET with exit 0 — from the instrument whose exit 0 says the capstone may close.
+R="$(mk f2n-standing-not-clean 456)"
+run "$R" 456 9001 "CI" 1
+group "$R" 456 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ok\n' > "$R/pr-456/rail.out"
+printf '<<<BODY>>>\nreview recorded: reviews/456.json verdict=not-clean @ %s (o/r)\n' "$HEAD" > "$R/pr-456/body.txt"
+verify "$R"; rc=$?
+ck "F2n: a standing not-clean FAILs review_record" "$(has "FAIL  review_record"; echo $?)"
+ck "F2n: …and the run never exits 0" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+ck "F2n: …and the reason names the refusal" "$(has "a reviewer REFUSED this revision"; echo $?)"
+
+# F2o — round 4's F2, the fix_round half: not-clean → not-clean is not a converging round.
+R="$(mk f2o-not-clean-twice 457)"
+run "$R" 457 9001 "CI" 1
+printf '<<<BODY>>>\nreview recorded: reviews/457.json verdict=not-clean @ %s (o/r)\nreview recorded: reviews/457.json verdict=not-clean @ %s (o/r)\n' "$MERGE" "$HEAD" > "$R/pr-457/body.txt"
+verify "$R"
+ck "F2o: not-clean → not-clean is a fix_round FAIL" "$(has "FAIL  fix_round"; echo $?)"
+ck "F2o: …and the reason says the round did not converge" "$(has "the round did not converge"; echo $?)"
+
 # F1r — round 3's F1: a green that completed BEFORE the merge, followed by a NEWER red attempt on the
 # same job, must not be described as a green that arrived "AFTER mergedAt". The verdict (FAIL) is the
 # same either way; the REASON is the part that was assumed instead of measured, and it was assumed in
@@ -420,7 +459,7 @@ verify_with() { # verify_with <script> <root> → sets AOUT (report) and AOUT_RC
 # anything else is a crash. Both are reported as an invalid mutation, never as discrimination.
 mutant_ran() {
   case "${AOUT_RC:-3}" in
-    0|1|2) printf '%s' "$AOUT" | grep -q '^PR #' ;;
+    0|1|2) grep -q '^PR #' <<<"$AOUT" ;;
     *) return 1 ;;
   esac
 }
@@ -435,7 +474,7 @@ mutation_verdict() { # mutation_verdict <label> <needle-the-correct-script-print
     bad "$1: INVALID MUTATION — the mutant did not produce a report (rc=${AOUT_RC:-?}), so nothing is proven"
     return
   fi
-  if printf '%s' "$AOUT" | grep -qF -- "$2"; then
+  if grep -qF -- "$2" <<<"$AOUT"; then
     bad "$1: the mutant STILL printed '$2' — the case is not discriminating"
   else
     ok "$1: $3"
@@ -454,7 +493,7 @@ mutation_verdict M1 "Workflow B/packaging-smoke:failure" \
   "grouping by the job name alone loses the red — case 8 is discriminating"
 
 # M2 — read the newest attempt OVERALL instead of the newest that had finished by mergedAt.
-MS="$(mutant newest-overall '&& done_at <= merged) {' ') {')" || bad "M2 mutation could not be applied"
+MS="$(mutant newest-overall 'if (exists && (!(g in nid) || id > nid[g])) {' 'if (!(g in nid) || id > nid[g]) {')" || bad "M2 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-newest-overall 431)"
 run "$R" 431 9001 "CI" 1
@@ -476,7 +515,7 @@ mutation_verdict M3 "IS the PR's final commit" \
   "tree equality fails a correct landing (the #3996 defect) — case 3 is discriminating"
 
 # M4 — collapse "existing but had not voted by the merge" back into the harmless bucket (round 2's F2).
-MS="$(mutant f1-collapse 'else if ((g in pending) || (g in started)) v = "waited"' 'else if (0) v = "waited"')" \
+MS="$(mutant f1-collapse 'v = (ncls[g] == "pending" ? "waited" : ncls[g])' 'v = (ncls[g] == "pending" ? "later" : ncls[g])')" \
   || bad "M4 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-waited 433)"
@@ -524,6 +563,29 @@ group "$R" 452 20 9001 "unit-test" completed failure "2026-11-12T04:30:00Z"
 verify_with "$MS" "$R"
 mutation_verdict M8 "a green DID complete before mergedAt" \
   "collapsing the green timing blames the clock for a red landing — case F1r is discriminating"
+
+# M10 — PASS a record whose verdict is `not-clean` (round 4's F2): the false PASS.
+MS="$(mutant f2-not-clean-passes '        emit review_record FAIL "the standing record at head' '        emit review_record PASS "the standing record at head')" \
+  || bad "M10 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-not-clean 458)"
+run "$R" 458 9001 "CI" 1; group "$R" 458 10 9001 "unit-test" completed success "$MERGED_AT"
+printf '<<<BODY>>>\nreview recorded: reviews/458.json verdict=not-clean @ %s (o/r)\n' "$HEAD" > "$R/pr-458/body.txt"
+verify_with "$MS" "$R"
+mutation_verdict M10 "FAIL  review_record" \
+  "a standing not-clean is not a review record — case F2n is discriminating"
+
+# M11 — let an older green outvote the newest in-flight attempt (round 4's F3).
+MS="$(mutant f3-newest-voting-wins 'if (exists && (!(g in nid) || id > nid[g])) {' 'if (status == "completed" && (!(g in nid) || id > nid[g])) {')" \
+  || bad "M11 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-newest-voting 459)"
+run "$R" 459 9001 "CI" 1
+group "$R" 459 10 9001 "unit-test" completed   success "2026-11-12T04:00:00Z" "2026-11-12T03:59:00Z"
+group "$R" 459 20 9001 "unit-test" in_progress -       "-"                "2026-11-12T05:00:00Z"
+verify_with "$MS" "$R"
+mutation_verdict M11 "did not wait for" \
+  "counting only voting attempts hides the in-flight newest one — case F3n is discriminating"
 
 # M9 — drop the rail_landed row on the unread-record path (round 3, note 2): a 5-row report.
 MS="$(mutant unread-drops-route '    emit_rail_landed "$dir" "$pr" "$merged"' '    :')" \

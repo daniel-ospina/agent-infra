@@ -461,56 +461,51 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
       if (w == "") w = "app:" app
       g = w "/" name
       seen[g] = 1
-      if (!(g in atid) || id > atid[g]) {
-        # only an attempt that had a VERDICT at or before the merge counts as what the landing saw
-        if (status == "completed" && done_at != "-" && done_at != "" && done_at <= merged) {
-          atid[g] = id; atcls[g] = classify(status, conc); atconc[g] = conc; atdone[g] = done_at
-        }
+      # ⛔ THE NEWEST ATTEMPT THAT EXISTED AT THE MERGE DECIDES WHAT THE LANDING SAW — NOT THE NEWEST ONE
+      # THAT VOTED (fresh-context review, round 4 F3 — measured). The previous rule took the newest
+      # COMPLETED attempt by the merge, so a group with `success@04:00` then a newer `in_progress`
+      # (started 05:00) and a merge at 05:05 was reported GREEN with the detail "newest attempt per
+      # app/workflow/job" — while the newest attempt had not voted at all. That is the header own
+      # invariant ("the newest attempt of EVERY group was GREEN and completed") stated falsely, in the
+      # flattering direction, on the predicate the capstone is closed on.
+      #
+      # "Existed at the merge" is read fail-closed, because the API does not always say:
+      #   completed            → it existed: `completed_at` is when it voted
+      #   NOT completed        → it exists: a `queued` run has a NULL `started_at` by design, so the
+      #                          absence of a timestamp is never read as "it did not exist yet".
+      exists = (status != "completed") ||
+               (done_at != "-" && done_at != "" && done_at <= merged) ||
+               (started_at != "-" && started_at != "" && started_at <= merged)
+      if (exists && (!(g in nid) || id > nid[g])) {
+        nid[g] = id; ncls[g] = classify(status, conc); nconc[g] = conc; ndone[g] = done_at
       }
-      # ⛔ CARRY THE GREEN OWN TIMESTAMP (fresh-context review, round 3 F1 — MEASURED). The flag used
-      # to mean "a green exists somewhere HERE", while the detail line built from it said "green exists
-      # but completed AFTER mergedAt". Those are different facts, and the sentence was the FLATTERING
-      # one: one group, attempt 10 success@04:00 then attempt 20 failure@04:30, merged 05:05 — a red
-      # landing — printed "the green completed AFTER mergedAt", when it completed 55 minutes BEFORE.
-      # The verdict was right either way; the reason printed for it was not, which is this file own
-      # doctrine (the detail names the fact, never a verdict) applied to the one field it assumed.
+      # the green timing is about the whole HISTORY of the job, so it looks at every attempt
       if (classify(status, conc) == "green") {
         egreen[g] = 1
         if (done_at == "-" || done_at == "" || done_at > merged) green_late[g] = 1
         else green_before[g] = 1
       }
-      # ⛔ "STARTED BY THE MERGE" CANNOT BE READ FROM `started_at` ALONE (fresh-context review,
-      # round 2 F2). GitHub leaves `started_at` NULL for a check run whose status is still `queued`,
-      # so a group that was queued at the merge had no timestamp and fell into "no run existed yet",
-      # which is the PASS-eligible bucket — a fail-open door under a sentence that asserted
-      # "no run existed by mergedAt". The rule is the fail-closed one: an attempt that is NOT
-      # completed exists and had not voted, so it is `waited` regardless of its timestamps.
-      if (status != "completed") pending[g] = 1
-      else if (done_at != "-" && done_at != "" && done_at <= merged) voted_by_merge[g] = 1
-      if (started_at != "-" && started_at != "" && started_at <= merged) started[g] = 1
       next
     }
     END {
       n = 0
       for (g in seen) {
-        # ⛔ THREE STATES, NOT TWO (review finding F1). A group with no verdict at `mergedAt` is either
-        #   waited  — at least one attempt had STARTED by then (the landing went ahead without it), or
-        #   later   — no attempt existed yet (a post-merge job; it was never part of this gate).
-        # Collapsing both into one "novote" is what let one green group and two in-flight groups read
-        # as "3 group(s) green", which is false in the direction the capstone is closed on.
-        if (g in atcls)                         v = atcls[g]     # it voted by mergedAt
-        else if ((g in pending) || (g in started)) v = "waited"   # it existed and had not voted
-        else                                    v = "later"      # no attempt completed by mergedAt
+        # ── the standing verdict of the group, three ways, each a fact about the merge ──────────
+        #   green/nonred/red   the newest attempt that existed by mergedAt had that verdict
+        #   waited             such an attempt existed and had NOT voted (in flight, or queued with no
+        #                      start timestamp — the API does not distinguish them, so neither do we)
+        #   later              no attempt existed by mergedAt at all: a post-merge job, not part of
+        #                      this gate
+        if (g in nid) v = (ncls[g] == "pending" ? "waited" : ncls[g])
+        else          v = "later"
         # field 4 is the GREEN TIMING the red bucket is split on — measured, never assumed:
         #   never    no green attempt on this job at all
         #   late     a green attempt exists but completed after mergedAt (it gated nothing here)
         #   earlier  a green completed BEFORE the merge and a NEWER attempt was the red
-        # (round 3 F1: the old flag said "a green exists" and the sentence built from it claimed the
-        # timing; the flattering reading of a red landing was the wrong one.)
-        if (!(g in egreen))                 et = "never"
-        else if (g in green_before)         et = "earlier"
-        else                                et = "late"
-        print g "\t" v "\t" ((g in atconc) ? atconc[g] : "-") "\t" et "\t" ((g in atdone) ? atdone[g] : "-")
+        if (!(g in egreen))          et = "never"
+        else if (g in green_before)  et = "earlier"
+        else                         et = "late"
+        print g "\t" v "\t" ((g in nconc) ? nconc[g] : "-") "\t" et "\t" ((g in ndone) ? ndone[g] : "-")
         n++
       }
       if (n == 0) print "surface\tempty\t-\t-\tno"
@@ -632,12 +627,27 @@ analyse() { # analyse <dir> <pr>
   fi
 
   if [ -z "$rsha" ]; then
-    emit review_record INCONCLUSIVE "no ADMITTED review record for this PR at $REPO${rskipped:+ · refused as naming another repo: $rskipped}${rskipped:- } — the reviewed head is unknown here (a marker that names another repo is not evidence: record-review.sh refuses it, PR numbers collide across repos)"
+    emit review_record INCONCLUSIVE "no ADMITTED review record for this PR at $REPO${rskipped:+ · refused as naming another repo: $rskipped} — the reviewed head is unknown here (a marker that names another repo is not evidence: record-review.sh refuses it, PR numbers collide across repos)"
     emit review_bound INCONCLUSIVE "no reviewed head to bind to the landed tree"
     emit fix_round INCONCLUSIVE "no record history to read a fix round from"
     emit green_gated INCONCLUSIVE "no reviewed head, so no head to read a check surface at"
   else
-    emit review_record PASS "verdict=$rverdict head=${rsha:0:12} source=$rsource sig=$([ "$rsig" = sig ] && echo unverified || echo absent)${rskipped:+ · refused-as-foreign:$rskipped}"
+    # ⛔ THE VERDICT'S POLARITY IS THE POINT OF THIS PREDICATE (round 4 F2 — a FALSE PASS, measured).
+    # It used to PASS on ANY admitted marker, so a landing whose standing record was `not-clean` — the
+    # reviewer REFUSED that revision — reported `VERDICT: ALL-MET`, exit 0, from an instrument whose
+    # exit 0 means the capstone may close. "A record exists" and "that record is clean" are different
+    # facts; this predicate is named for the second one. Polarity is an ALLOW-LIST, the same rule the
+    # check surface uses: an unrecognised verdict is unknown, never clean.
+    case "$rverdict" in
+      clean|clean-micro|clean-low)
+        emit review_record PASS "verdict=$rverdict head=${rsha:0:12} source=$rsource sig=$([ "$rsig" = sig ] && echo unverified || echo absent)${rskipped:+ · refused-as-foreign:$rskipped}" ;;
+      not-clean)
+        emit review_record FAIL "the standing record at head ${rsha:0:12} is NOT-CLEAN (source=$rsource) — a reviewer REFUSED this revision, so no clean review covers the content that landed${rskipped:+ · refused-as-foreign:$rskipped}" ;;
+      "")
+        emit review_record INCONCLUSIVE "a record marker was admitted but carried no verdict word (head ${rsha:0:12}, source=$rsource) — the verdict is unknown, which is never clean" ;;
+      *)
+        emit review_record INCONCLUSIVE "the admitted record's verdict is '$rverdict' (head ${rsha:0:12}) — not a verdict this tool knows (clean|clean-micro|clean-low|not-clean), so it is unknown, never clean" ;;
+    esac
 
     # ── 3 review_bound — the reviewed head is the PR's FINAL commit (base-independent) ─────────
     # ⛔ NOT tree equality — see the header's measured counter-example (#3996).
@@ -674,7 +684,18 @@ analyse() { # analyse <dir> <pr>
         { if (found) { if ($2 != bad) { print $1 "@" substr($2,1,12); exit } } else if ($1 == "not-clean") { found = 1; bad = $2 } }
       ')"
       if [ -n "$superseded" ]; then
-        emit fix_round PASS "not-clean@$firstnc was superseded by $superseded — the verdict triggered a re-record at a new head"
+        # ⛔ A SUPERSEDING `not-clean` IS NOT A FIX ROUND (round 4 F2). The old test was "a LATER marker
+        # at a DIFFERENT head", which `not-clean → not-clean` satisfies — a round in which nothing was
+        # fixed, reported as PASS by a predicate whose name asserts that something was. The superseding
+        # verdict must be a CLEAN tier; anything else means the round did not converge.
+        case "$superseded" in
+          clean@*|clean-micro@*|clean-low@*)
+            emit fix_round PASS "not-clean@$firstnc was superseded by $superseded — the verdict triggered a clean re-record at a new head" ;;
+          not-clean@*)
+            emit fix_round FAIL "not-clean@$firstnc was followed by ANOTHER not-clean ($superseded) — the round did not converge: a reviewer still refuses this PR after the fix" ;;
+          *)
+            emit fix_round INCONCLUSIVE "not-clean@$firstnc was followed by $superseded, whose verdict is not one this tool knows — the round's outcome is unknown" ;;
+        esac
       else
         emit fix_round FAIL "not-clean@$firstnc was never superseded by a record at a different head — no fix round followed the verdict"
       fi
