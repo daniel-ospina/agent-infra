@@ -460,7 +460,70 @@ acquire_lock() {
   return 0
 }
 acquire_lock || exit 0
-trap 'rm -rf "$LOCK.d"' EXIT INT TERM
+# ── ⛔ A STOP MUST BE A STOP, AND THE RELEASE MUST BE OURS (#3547, #4013) ─────────────────────────────
+# MEASURED 2026-12-04 (#4013): `launchctl list` read `com.tortoise.auto-rail  pid 18626  status -9`
+# (elapsed 9d 22h) — launchd ended the actuator with SIGKILL because the shipped trap
+#     trap 'rm -rf "$LOCK.d"' EXIT INT TERM
+# never ENDED it. Bash runs a TERM trap and then RESUMES the script (it only terminates the script if the
+# trap itself exits), so on every stop path the actuator (a) released its lock and (b) kept launching
+# rails — UNGUARDED — while the restart that follows any stop path immediately acquired the now-free
+# lock. Two live copies, which is the exact double-rail this lock exists to prevent; and since #3489 the
+# unguarded copy is also the one that dispatches PAID reviewers. Two independent defects in one line, and
+# each is category A: a gate a restart can defeat, and a lock released by a process that still runs.
+#
+# ⛔ AND THE `-9` IS THE QUIETER HALF OF THE SAME DEFECT: a foreground `sleep` is not interruptible.
+# Bash defers a trap until the FOREGROUND command completes (verified: `sleep 300` + `kill -TERM` → the
+# trap ran 300 s later, rc 143), so a TERM arriving during the pass loop's `sleep "$INTERVAL"` was not
+# handled for up to INTERVAL seconds. launchd's stop grace is far shorter than that, so a
+# perfectly well-behaved actuator was SIGKILLed at every stop and never ran its EXIT arm at all — the
+# status column read -9, and the lock stayed behind for the next instance to reclaim. `interruptible_sleep`
+# is `sleep … & wait`: `wait` is the one primitive a trap interrupts IMMEDIATELY (verified: the same TERM
+# was handled in 6 ms), so a stop lands between passes instead of after one.
+#
+# ⛔ THE RELEASE IS OWNERSHIP-CHECKED, because `acquire_lock` can hand this process a lock it did not
+# `mkdir` (the stale reclaim, `lock_holder_is_live`'s three answers). An unconditional `rm -rf` on exit
+# therefore deletes whatever `$LOCK.d` exists at that moment — which, after a restart, is the
+# SUCCESSOR's lock. So the release removes the directory only when its `pid` file still names THIS
+# process, and the fail-safe direction is the opposite of stealing: an absent or foreign pid file leaves
+# the directory in place for the aged-stale reclaim to judge.
+release_lock() {  # rc is always 0: a release must never mask the exit path's status
+  local pid
+  pid=$(cat "$LOCK.d/pid" 2>/dev/null | tr -cd '0-9')
+  if [ -n "$pid" ] && [ "$pid" = "$$" ]; then
+    rm -rf "$LOCK.d"
+    return 0
+  fi
+  log_line "NOT releasing $LOCK.d — its pid file names '${pid:-<none>}', not this process ($$); a lock handed over by the stale reclaim (or one a successor has since created) belongs to whoever holds it now, and removing it here is how a stop leaves the next instance unguarded (#3547)"
+  return 0
+}
+# `wait` is the one primitive bash lets a trap interrupt, so it is what every long wait in this file idles in.
+# ⛔ THE SLEEP CHILD IS DELIBERATELY NOT KILLED BY THE TRAP: it is a bare `sleep` that holds no lock, no
+# fd a successor needs and no state, and a pid recorded here can be RECYCLED by the time the trap fires —
+# signalling a recycled pid is worse than an orphan that exits on its own within one interval. This is the
+# same rule the rail bound is built on ("no pid is ever recorded or signalled from a file").
+interruptible_sleep() {  # $1 = seconds
+  sleep "$1" & wait $!
+}
+# ⛔ EXIT 0 ON A STOP IS DELIBERATE, and it is the opposite of a swallowed failure: `launchctl list`'s
+# status column is how an operator reads this daemon, and 0 is what "it was told to stop and stopped"
+# looks like there — 143 reads as a crash, and -9 reads as the SIGKILL #4013 was filed for. The reason is
+# not hidden in an exit code: it goes to the same log the pass lines go to, naming the signal.
+stop_on_signal() {  # $1 = signal name
+  log_line "STOPPED by SIG$1 — releasing the lock (only if it still names this process, $$) and exiting 0, so a stop reads as a stop in 'launchctl list' rather than the -9 launchd records when TERM is deferred behind a sleep"
+  exit 0
+}
+# ONE place to install them, so a caller cannot take the EXIT arm without the signal arms or the reverse:
+# the EXIT arm alone is the #3547 defect, and the signal arms alone leak the lock on a normal exit.
+install_stop_traps() {
+  trap 'release_lock' EXIT
+  trap 'stop_on_signal TERM' TERM
+  trap 'stop_on_signal INT' INT
+  trap 'stop_on_signal HUP' HUP
+}
+# ⛔ AFTER `acquire_lock`, NEVER BEFORE: the losing instance exits 0 on the line above and must not
+# install an EXIT arm at all — a release is the winner's to make, and the ownership check must not be the
+# only thing standing between a loser and the winner's lock.
+install_stop_traps
 # ── merge-slot accounting, PER REPO ─────────────────────────────────────────────────────────────────
 # ⛔ THE IDENTITY IS THE FULL `owner/name`, NEVER THE BASENAME (review round 5, measured P0). Both
 # attribution sites used to collapse a slug with `.split("/")[-1]` — the `--repo <owner/name>` argument
@@ -867,7 +930,7 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
     --tag "rail-$(printf '%s' "$repo" | tr '/' '-')-$pr" --log "$out" --verdict-file "$bfile" --grace "$RAIL_BOUND_GRACE_S" \
     -- bash "$RAIL_SCRIPT" "$pr" --repo "$repo" $extra < /dev/null >> "$out" 2>&1 &
   pid=$!
-  sleep "$LAUNCH_VERIFY_S"
+  interruptible_sleep "$LAUNCH_VERIFY_S"
   if kill -0 "$pid" 2>/dev/null || [ -s "$out" ]; then return 0; fi
   log_line "$repo #$pr LAUNCH-FAILED — nothing started within ${LAUNCH_VERIFY_S}s (no live child, empty verdict file $out); cooldown row rolled back so this head is retried next pass instead of being reported as already railed"
   forget_tried "$row"
@@ -1474,7 +1537,7 @@ launch_review() {  # $1 = repo, $2 = PR, $3 = head, $4 = state file, $5 = attemp
   nohup bash -c 'run_review "$@"' _ "$REVIEW_SCRIPT" "$pr" "$repo" "$out" >> "$LOG" 2>&1 < /dev/null &
   pid=$!
   log_line "$repo #$pr no attestation at head $head -> dispatching reviewer (KIND=reviewer, $REVIEW_SCRIPT)"
-  sleep "$LAUNCH_VERIFY_S"
+  interruptible_sleep "$LAUNCH_VERIFY_S"
   if kill -0 "$pid" 2>/dev/null || [ "$(wc -l < "$out")" -gt 1 ]; then
     # ⛔ THE ATTEMPT IS COUNTED **HERE**, NOT AT THE RECORD WRITE (review, P1). A dispatch that never
     # started is rolled back two lines below and must consume NOTHING — otherwise three transient
@@ -1986,5 +2049,7 @@ PY
     done < "$_cand"
     rm -f "$_cand"
   done
-  sleep "$INTERVAL"
+  # ⛔ NOT `sleep "$INTERVAL"` — see `interruptible_sleep`: a foreground sleep defers TERM for up to the
+  # whole interval, which is what made launchd SIGKILL this actuator (status -9) instead of stopping it.
+  interruptible_sleep "$INTERVAL"
 done
