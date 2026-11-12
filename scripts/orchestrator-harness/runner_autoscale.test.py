@@ -2390,6 +2390,189 @@ def t59_adapter_config_error_is_a_failure():
             box.destroy()
 
 
+# ── #4004: a lost race is not an answer, and one unusable slot is not a wall ──────────────────
+
+
+def _slot_provisioner(box: Box, *, race: list[int], ok: list[int]) -> None:
+    """A provisioner whose answer depends on the INDEX it is asked for.
+
+    The real adapter's per-index behaviour is what #4004 is about, and a static `provisioner(rc=…)`
+    cannot express it: the SAME pass gets rc 8 for one index and rc 0 for the next, which is the
+    whole shape of "skip it and keep growing". `race` indexes answer rc 8 (the adapter's
+    slot-unusable code) and, like a peer that won the race, leave the directory WITHOUT `.runner`;
+    `ok` indexes install and register normally.
+    """
+    lines = [
+        "#!/usr/bin/env bash",
+        f'printf "%s\\n" "$*" >> "{box.dir}/provisioner-calls.log"',
+    ]
+    for idx in race:
+        slot = os.path.join(box.root, "gh-runner-x64" if idx == 1 else f"gh-runner-x64-{idx}")
+        lines += [
+            f'if [ "$2" = "{idx}" ]; then',
+            f'  mkdir -p "{slot}"',
+            f'  printf \'name-unavailable path=%s appeared while this add ran (another pass took it) ',
+            f'— use restart\\n\' "{idx}" >&2',
+            "  exit 8",
+            "fi",
+        ]
+    for idx in ok:
+        slot = os.path.join(box.root, "gh-runner-x64" if idx == 1 else f"gh-runner-x64-{idx}")
+        cfg = (
+            '{"agentName":"r-' + str(idx) + '",'
+            '"gitHubUrl":"https://github.com/daniel-ospina/tortoise"}'
+        )
+        lines += [
+            f'if [ "$2" = "{idx}" ]; then',
+            f'  mkdir -p "{slot}"',
+            f"  printf '%s' '{cfg}' > \"{slot}/.runner\"",
+            f'  printf "%s\\n" "{slot}" >> "{box.dir}/alive.txt"',
+            f'  printf "provisioned slot=%s name=r-{idx} added=1\\n" "{idx}"',
+            "  exit 0",
+            "fi",
+        ]
+    lines += ['printf "unexpected index %s\\n" "$2" >&2', "exit 6"]
+    box._write(os.path.join(box.dir, "provisioner.sh"), "\n".join(lines) + "\n", 0o755)
+
+
+@test("T60 a LOST RACE is SKIPPED to the next free index — never `guard-conflict`, never a frozen box")
+def t60_race_is_a_skip_not_a_capacity_answer():
+    """agent-infra#4004, the two P1s in ONE pass — the composing test the issue asks for.
+
+    P1-a: the adapter lost the rc-4 race for slot #2 (a peer took it during the call). That used to
+    exit 2, which this tool reads as `ProvisionerRefused`, i.e. an ANSWER about capacity — so on any
+    box whose disk arm had headroom it recorded `GUARD CONFLICT … a human must decide which number is
+    wrong (#9672)`, paging a human to audit arithmetic the race never answered. It must instead be a
+    NON-ANSWER: a skip, named, never `guard-conflict` and never `provisioner-refused`.
+
+    P1-b: the same fixture leaves a `.runner`-less DIRECTORY at index 2 — exactly what a SIGKILL
+    mid-`cp`/`config.sh` leaves behind, and the field shape on pi-cell-4 where retiring a dead slot by
+    hand was the only thing that let the box converge. `_next_free_slot` tests only `.runner`, so it
+    returned index 2 on every pass for ever and `live` never moved. One such index must cost this pass
+    ONE SLOT, not its whole target: the pass asks for #3 and grows.
+
+    The disk reading is the one that makes the old conflict branch REACHABLE (fits=True), so this is a
+    discriminating fixture rather than a rigged one."""
+    with Env():
+        box = Box("slot-skip")
+        try:
+            first = box.install("gh-runner-x64", "r-1")
+            box.alive([first])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.disk(36_864)  # room for one more BY THIS TOOL'S ARM: the old `fits=True` page
+            box.footprint({"gh-runner-x64": 2000})
+            _slot_provisioner(box, race=[2], ok=[3])
+            record = converge(box, nproc="8", want=2)
+            calls = box.calls("provisioner-calls.log")
+            check(
+                len(calls) == 2 and "--count 2" in calls[0] and "--count 3" in calls[1],
+                f"the race costs ONE index and the pass asks for the NEXT FREE one: {calls}",
+            )
+            check(
+                record.get("problem_kind") is None,
+                "a lost race answers NO capacity question, so it must set no `problem_kind` — "
+                f"`guard-conflict` here is the #9672 page over a race: {record.get('problem_kind')!r}",
+            )
+            check(
+                not any("GUARD CONFLICT" in n for n in record["notes"]),
+                f"…and no note may claim the guards disagree: {record['notes']}",
+            )
+            check(
+                record["verdict"] not in ("guard-conflict", "provisioner-refused", "action-failed"),
+                "the pass grew the box, so its verdict must not be a refusal/conflict/failure: "
+                f"{record['verdict']}",
+            )
+            check(
+                [e["index"] for e in record.get("slots_unusable", [])] == [2],
+                f"the slot is NAMED for a machine reader: {record.get('slots_unusable')}",
+            )
+            check(
+                any("slot #2 is UNUSABLE" in n for n in record["notes"]),
+                f"…and for a human, with the retry-next-pass shape: {record['notes']}",
+            )
+            check(
+                not any("#2" in p for p in record["problems"]),
+                "a pass that grew past the bad index must NOT be an action-failure — promoting the "
+                f"skip there would page on every peer race: {record['problems']}",
+            )
+            check(
+                any("slot #3" in a or "provisioned to 3" in a for a in record["actions"]),
+                f"the addition at the NEXT free index is the pass's own action record: {record['actions']}",
+            )
+            check(
+                record["live"] == 2,
+                f"the box really grew past the unusable slot: live={record['live']}",
+            )
+            # the CLI pass re-classifies what the FIRST pass installed, so the pool the fixture stubs
+            # must now list it — an install the pool does not know is ORPHANED, and the repair arm
+            # would answer for a failure this case is not about (measured: rc 3, `ORPHANED r-3`).
+            box.pool(
+                [
+                    ("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL]),
+                    ("r-3", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL]),
+                ]
+            )
+            rc, out = cli(box, "--want", "2")
+            check(rc == 0, f"a pass that skipped one slot and converged exits 0, got {rc}: {out[:400]}")
+            check("verdict=guard-conflict" not in out, f"…and never prints it: {out[:400]}")
+        finally:
+            box.destroy()
+
+
+@test("T61 a box that CANNOT grow past its unusable slots is LOUD — `slots_unusable` becomes a problem")
+def t61_every_slot_unusable_is_loud():
+    """The other half of the #4004 fix, and the reason the skip is not a silent downgrade.
+
+    A skipped slot is a non-answer, so it must not page on its own (T60). But when the skipped set is
+    what stands between the box and its target, the pass has NOT converged — and `under-target` is
+    exit 0, the documented "converged / nothing to do". A box that can never provision would then
+    report a CLEAN pass, the false-green class this file exists to close. So: below target WITH
+    skipped slots → `problems` → `action-failed` → exit 3, naming the indexes the provisioner
+    refused, and bounded by SLOT_SKIP_BUDGET instead of walking the numbering for ever."""
+    with Env():
+        box = Box("slot-wall")
+        try:
+            first = box.install("gh-runner-x64", "r-1")
+            box.alive([first])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.disk(500_000)
+            budget = ra.SLOT_SKIP_BUDGET
+            # EVERY index refuses, for far more indexes than the pass may walk: the bound is the
+            # pass's own, not the fixture's, so a mutant that drops SLOT_SKIP_BUDGET from the loop
+            # range would walk this numbering to 40 and redden the count below.
+            _slot_provisioner(box, race=list(range(2, 40)), ok=[])
+            record = converge(box, nproc="8", want=3)
+            skipped = [e["index"] for e in record.get("slots_unusable", [])]
+            check(
+                len(skipped) == 3 + budget,
+                f"the walk is BOUNDED by target + SLOT_SKIP_BUDGET ({3 + budget}), not unbounded: "
+                f"{skipped}",
+            )
+            check(
+                len(set(skipped)) == len(skipped),
+                f"…and it never asks twice for the same index: {skipped}",
+            )
+            check(
+                len(box.calls("provisioner-calls.log")) == len(skipped),
+                "one installer call per skipped index, no more: "
+                f"{box.calls('provisioner-calls.log')} for {skipped}",
+            )
+            check(
+                record["problems"] and "#2" in record["problems"][0],
+                f"an un-growable box is a PROBLEM naming the slots: {record['problems']}",
+            )
+            check(
+                record["verdict"] == "action-failed",
+                "…and its verdict is not the exit-0 `under-target` a clean pass reports: "
+                f"{record['verdict']}",
+            )
+            rc, out = cli(box, "--want", "3")
+            check(rc == 3, f"a box that cannot grow must not exit 0 — got {rc}: {out[:400]}")
+            check("verdict=action-failed" in out, f"and it says why: {out[:400]}")
+        finally:
+            box.destroy()
+
+
 # ── 7. THE REVIEW-ROUND-7 FINDINGS ────────────────────────────────────────────────────────────
 @test("T26 a PROVISIONER REFUSAL must not silence the starvation alarm — it is the pass that exits 0")
 def t26_refusal_does_not_silence_the_alarm():
@@ -4845,10 +5028,34 @@ MUTATIONS = [
     ),
     Mutation(
         "T31",
-        '        if not (slot / ".runner").exists():\n            return index\n        index += 1',
+        '        if index not in skipped and not (slot / ".runner").exists():\n            return index\n        index += 1',
         "        return index  # MUTATION: the base slot, never the next FREE one",
         "the slot is not walked for the first FREE one, so an occupied base makes the installer fill "
         "several slots in one call — the measured over-fill the ceiling forbids",
+    ),
+    Mutation(
+        "T60",
+        "        if index not in skipped and not (slot / \".runner\").exists():",
+        "        if not (slot / \".runner\").exists():  # MUTATION: the skip set is ignored",
+        "a slot the provisioner refused to fill this pass is asked for AGAIN inside the same pass, "
+        "so a `.runner`-less directory costs every one of the pass's steps — and the box never "
+        "reaches the next free index (agent-infra#4004 P1-b)",
+    ),
+    Mutation(
+        "T60",
+        '    if rc == 8:',
+        '    if rc == 8 and False:  # MUTATION: rc 8 falls through to ActionFailed',
+        "a slot the provisioner could not fill is reported as an ACTION FAILURE (the pre-#4004 exit-6 "
+        "mapping): the fill loop breaks, so one leftover directory stops the box growing at all — "
+        "the permanent freeze P1-b describes, reached by the other code path",
+    ),
+    Mutation(
+        "T60",
+        '        raise SlotUnusable(f"rc=8 {out[-300:]}")',
+        '        raise ProvisionerRefused(f"rc=8 {out[-300:]}")  # MUTATION: a race is a capacity answer',
+        "the lost race is routed back into the capacity-answer channel: on a box with disk headroom "
+        "the pass records `GUARD CONFLICT … a human must decide which number is wrong (#9672)` over "
+        "a slot a peer had merely taken (agent-infra#4004 P1-a)",
     ),
     Mutation(
         "T32",

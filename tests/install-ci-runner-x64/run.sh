@@ -315,19 +315,21 @@ else
   bad "precondition: the raced slot really carries .runner"
 fi
 
-# 18. ⛔ BUT rc 4 WITH NO `.runner` ON A PATH THAT WAS ALREADY THERE IS A WEDGE, NOT AN ANSWER:
-# `_next_free_slot` tests only `.runner`, so it asks for this same index forever while `add`/`reclaim`
-# refuse the path and `reconcile` never enumerates it. Nothing repairs it automatically, so it is a
-# FAILURE the caller must see (exit 6 -> ActionFailed -> `problems`, exit 3). ⛔ IT WAS `exit 2` UNTIL
-# REVIEW ROUND 16: `ci_runner_pool.sh`'s EXIT block (:174-175) calls rc 4 a NAME verdict ("that name is
-# taken … try another name"), not a capacity verdict — so exit 2 put a leftover DIRECTORY into the
-# caller's answer channel, where it became `GUARD CONFLICT … a human must decide which number is wrong`
-# on a box with disk headroom and `provisioner-refused` -> **exit 0** without, i.e. a box that can never
-# provision reporting a clean pass — the defect the rc-2 split in case 5 exists to close, one code over.
+# 18. ⛔ BUT rc 4 WITH NO `.runner` ON A PATH THAT WAS ALREADY THERE IS NOT AN ANSWER: `_next_free_slot`
+# tests only `.runner`, so it asks for this same index forever while `add`/`reclaim` refuse the path and
+# `reconcile` never enumerates it. ⛔ IT IS exit 8 (SLOT UNUSABLE), NOT exit 6 AND NOT exit 2 — and both
+# halves of that are the agent-infra#4004 fix. `ci_runner_pool.sh`'s EXIT block (:174-175) calls rc 4 a
+# NAME verdict ("that name is taken … try another name"), not a capacity verdict, so exit 2 put a leftover
+# DIRECTORY into the caller's answer channel, where it became `GUARD CONFLICT … a human must decide which
+# number is wrong` on a box with disk headroom and `provisioner-refused` -> **exit 0** without. And exit 6
+# (a failure) ended the caller's fill loop, so one such directory froze the box's growth PERMANENTLY
+# (P1-b: confirmed on pi-cell-4, where retiring a 0-byte `.runner` by hand was the only thing that let the
+# box converge). 8 is the third channel: nothing was added HERE, the caller skips the index and asks for
+# the next free one — so the box keeps growing and the slot is still NAMED in its record.
 # The leftover exists BEFORE the call — that is the fact separating it from the race in case 20.
 mkdir -p "$RUNNER_ROOT/gh-runner-x64-5"
 out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_preclaimed 4) bash "$SUT" --count 5 --fallback auto 2>&1); rc=$?
-check "rc 4 on a PRE-EXISTING path without .runner is a FAILURE, not a capacity answer" 6 "$rc" "guard-refused" "$out"
+check "rc 4 on a PRE-EXISTING path without .runner is SLOT-UNUSABLE (8), not a capacity answer, not a failure" 8 "$rc" "guard-refused" "$out"
 check "…naming both possible causes, not just one" 0 0 "stale leftover from an interrupted add or a peer's add" "$out"
 check "…and telling the operator to retry, not to delete" 0 0 "retry on the next pass" "$out"
 case "$out" in
@@ -341,7 +343,7 @@ esac
 # `skipped` would hide a slot that never counts — a false PASS.
 W="$RUNNER_ROOT/gh-runner-x64-8"; mkdir -p "$W"; ln -s /nonexistent/config.json "$W/.runner"
 out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_preclaimed 4) bash "$SUT" --count 8 --fallback auto 2>&1); rc=$?
-check "a dangling .runner symlink is a FAILURE, not a silent skip" 6 "$rc" "SYMLINK with no target" "$out"
+check "a dangling .runner symlink is SLOT-UNUSABLE (8) — never a silent skip, never a capacity answer" 8 "$rc" "SYMLINK with no target" "$out"
 check "…naming the pool/caller disagreement" 0 0 "reports the slot REGISTERED" "$out"
 case "$out" in
   *added=1*|*added=0*) bad "a disagreement about occupancy never claims a provision";;
@@ -353,7 +355,7 @@ rm -f "$W/.runner"
 # unconditionally, so a reader counting it as evidence for the wedged slot was over-reading the suite.
 # The wedge is exercised again here, on its own run, with the link removed first.
 out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_preclaimed 4) bash "$SUT" --count 8 --fallback auto 2>&1); rc=$?
-check "a wedged slot (link cleared) is still a FAILURE, not a claim of provisioning" 6 "$rc" "existed before this pass without a .runner registration" "$out"
+check "a wedged slot (link cleared) is still SLOT-UNUSABLE, not a claim of provisioning" 8 "$rc" "existed before this pass without a .runner registration" "$out"
 case "$out" in
   *added=1*) bad "a wedged slot never claims to have provisioned";;
   *) ok "a wedged slot never claims to have provisioned";;
@@ -386,14 +388,17 @@ check "rc 2 with a PEER's .runner is a skip, not a claim of `listener=dead`" 0 "
   "provisioned slot=9 name=gh-runner-x64-9 root=$RUNNER_ROOT added=0 skipped=1 already-registered-elsewhere" "$out"
 check "…and it does NOT assert a dead listener over a peer's live one" 0 "$(grep -c 'listener=dead' <<<"$out")"
 
-# 20. ⛔ rc 4 WITH NO `.runner` IS TWO FACTS, AND THE CODE DIFFERS — NOT JUST THE WORDING. A path that
-# PRE-EXISTED is a wedge a human must clear (case 18: exit 6, a FAILURE). A path that APPEARED during
-# the call is a PEER that won the race and may be registering it right now — that genuinely IS another
-# pass's answer about the same slot, so it stays a REFUSAL the next pass retries (exit 2). Printing
-# `rm -rf` for the race would tell an operator to delete a registration in progress. ⛔ THIS CASE IS THE
-# OTHER HALF of case 18's split: without it, widening exit 6 to every rc-4 would pass the suite.
+# 20. ⛔ rc 4 WITH NO `.runner` IS ONE CODE (8) AND THREE SENTENCES — the code is the CALLER'S action
+# (skip this index, ask for the next free one, name the slot in the record), so it is one channel for
+# all three sub-states; the SENTENCE is what separates a wedge a human must clear (case 18) from a peer
+# that won the race. ⛔ IT WAS exit 2 UNTIL agent-infra#4004: that sent a lost race into the caller's
+# capacity-answer channel, which turned it into `GUARD CONFLICT … a human must decide which number is
+# wrong (#9672)` on any box with disk headroom — a page about capacity arithmetic that the race never
+# answered. Printing `rm -rf` for the race would also tell an operator to delete a registration in
+# progress, so the message stays non-destructive. ⛔ THIS CASE IS THE OTHER HALF of case 18: without it,
+# widening exit 8 to every rc-4 would pass the suite without ever exercising the race's wording.
 out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_race) bash "$SUT" --count 7 --fallback auto 2>&1); rc=$?
-check "rc 4 race (path appeared during the call) is a REFUSAL, not a failure" 2 "$rc" "guard-refused" "$out"
+check "rc 4 race (path appeared during the call) is SLOT-UNUSABLE (8) — not a capacity answer, not a failure" 8 "$rc" "guard-refused" "$out"
 check "…naming the RACE" 0 0 "another pass took this slot while this add ran" "$out"
 check "…and offering the pool's own restart" 0 0 "restart --name gh-runner-x64-7" "$out"
 case "$out" in

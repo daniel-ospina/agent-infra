@@ -246,6 +246,16 @@ EXIT  0 converged / nothing to do, or a CAPACITY ANSWER that is not a failure (`
       A pass whose provisioner refuses while THIS tool's disk arm says one more runner fits reports
       the verdict `guard-conflict` (exit 3, both sides' numbers in the notes): the two guards answer
       different questions, and the disagreement is a decision for a human, not an action failure.
+      ⛔ BUT A LOST RACE IS NOT ONE OF THOSE (agent-infra#4004 P1-a). The adapter publishes a slot it
+      could not fill as its OWN code (`install-ci-runner-x64.sh` rc 8 → `SlotUnusable`), and this file
+      SKIPS that index for the next free one instead of reporting a capacity conflict: a peer that
+      took the slot answered nothing about this box's arithmetic. The slot is named in
+      `slots_unusable` and in `notes`, no `problem_kind` is set, and the pass retries it next time.
+      ⛔ AND ONE UNUSABLE SLOT NEVER FREEZES GROWTH (P1-b): `_next_free_slot` is walked with the
+      skipped indexes passed in, so a leftover DIRECTORY without a `.runner` costs this pass one
+      index, not its whole target. Only when the pass ends BELOW target with skipped slots is the
+      skipped set promoted to `problems` (action-failed, exit 3) — a box that cannot grow at all is
+      loud, a box that grew past one bad index is not.
 
       `--install-unit` exits 0 on success, 1 when REFUSED before writing anything (an unusable
       WorkingDirectory or repo), and 3 when the pair could not be installed. 3 is NOT a rollback
@@ -343,6 +353,14 @@ MEM_RESERVE_MB = 2048
 # operator can see which number set the ceiling instead of inferring it.
 DISK_RESERVE_MB = 20480
 FOOTPRINT_MB_DEFAULT = 8192
+# ⛔ HOW MANY UNUSABLE SLOT INDEXES ONE PASS MAY WALK PAST (agent-infra#4004 P1-b). The provisioner
+# answers rc 8 for an index it cannot fill (a peer's in-flight add, a leftover directory, a dangling
+# `.runner` link) and this pass skips it for the next free one. Those skips are NOT charged to the
+# growth budget — a bad slot must never cost the box an addition — but the walk needs its own bound,
+# or a box whose whole numbering is wedged would issue installer calls until the pass timed out. At
+# the bound the pass stops, keeps the target unmet, and the post-loop arm promotes the skipped set to
+# `problems` (action-failed, exit 3): the wedge is then loud, and a human clears the paths.
+SLOT_SKIP_BUDGET = 8
 # ⛔ `_work` GROWTH IS COUNTED, AND IT ONLY EVER LOWERS THE CEILING: the measurement is the largest
 # install's current size, so a runner whose workspace grew to 20 GB raises the per-runner budget to
 # 20 GB and the ceiling drops with it — permanently, until that directory is trimmed. That is the
@@ -383,6 +401,19 @@ class UnitRefused(Exception):
 
 class ProvisionerRefused(ActionFailed):
     """The provisioner's OWN guard refused (exit 2). A refusal is an answer, not a failure."""
+
+
+class SlotUnusable(Exception):
+    """The requested SLOT could not be filled by this call (adapter rc 8) — neither an answer about
+    capacity nor a failure of this box (agent-infra#4004).
+
+    It is deliberately NOT an `ActionFailed`: 6 is spent on the adapter's own CONFIGURATION errors,
+    which must reach `problems` and page. This one means "something is sitting on that index — a peer
+    won the race for it, a peer's add is mid-flight, a stale leftover is there, or `.runner` is a
+    dangling link". The correct response is to SKIP THE INDEX and ask for the next free one, so one
+    unusable slot cannot freeze a box's growth, and to record the slot for a human rather than paging
+    one about capacity arithmetic the race never answered.
+    """
 
 
 # ── measurement ────────────────────────────────────────────────────────────────────────────────
@@ -2846,7 +2877,7 @@ def installed_unit_cwd_problems(
     return problems
 
 
-def _next_free_slot(root: str) -> int:
+def _next_free_slot(root: str, skip: frozenset[int] | None = None) -> int:
     """The first free slot in the provisioner's own numbering: base, base-2, base-3, ...
 
     Not `len(installs) + 1`. The numbering is repo-agnostic and this box carries installs that are
@@ -2861,12 +2892,22 @@ def _next_free_slot(root: str) -> int:
     past it, so the single call filled the gap AND the requested slot — two runners where the
     ceiling allowed one, with the pass then reporting `over-ceiling` for a breach it had just
     created (round 6, finding 1).
+
+    ⛔ AND THAT IS WHY THE SKIP SET EXISTS RATHER THAN A WIDER OCCUPANCY TEST (agent-infra#4004 P1-b).
+    The same predicate that keeps one call one addition also made a `.runner`-less directory a
+    PERMANENT wall: the installer refuses that path (`name is taken`), `discover()`/`reconcile` never
+    enumerate it, nothing retires it, so this function returned the SAME index on every pass for
+    ever and `live` never moved — measured on pi-cell-4, where retiring a 0-byte `.runner` by hand
+    was the only thing that let the box converge. `skip` is the indexes the PROVISIONER itself told
+    us it cannot fill (rc 8) during THIS pass; passing the next free one is still ONE call = ONE
+    addition, because the adapter adds exactly the index it is given.
     """
     base = Path(os.environ.get("RUNNER_AUTOSCALE_BASE") or (Path(root) / "gh-runner-x64"))
+    skipped = skip or frozenset()
     index = 1
     while True:
         slot = base if index == 1 else Path(f"{base}-{index}")
-        if not (slot / ".runner").exists():
+        if index not in skipped and not (slot / ".runner").exists():
             return index
         index += 1
 
@@ -3022,6 +3063,15 @@ def provision(target_count: int, repo: str = "", root: str = "") -> str:
         timeout=1800,
         env=child_env,
     )
+    if rc == 8:
+        # ⛔ THE ADAPTER'S THIRD CHANNEL: "THIS SLOT CANNOT BE FILLED BY THIS CALL" (agent-infra#4004).
+        # It is deliberately neither 2 (a capacity answer — a lost race answered nothing about this
+        # box's arithmetic, and reporting it as one produced the `GUARD CONFLICT … a human must decide
+        # which number is wrong (#9672)` page) nor 6 (a failure — that ended the fill loop, which is
+        # how one leftover DIRECTORY froze a box's growth for ever, P1-b). The pass SKIPS this index
+        # and asks for the next free one; the adapter's own sentence says which of the three sub-states
+        # it is, and that sentence travels in the note unparsed.
+        raise SlotUnusable(f"rc=8 {out[-300:]}")
     if rc == 2:
         # `install-ci-runner-x64.sh` publishes 2 as "A POOL GUARD REFUSED — nothing was attempted".
         # That is the headroom/gate verdict declining, not this tool failing: reported as a REFUSAL in
@@ -3068,6 +3118,12 @@ def converge(
         # real pass would do.
         "would_repair": [],
         "config_lost": [],
+        # ⛔ A SLOT THAT COULD NOT BE FILLED IS ITS OWN CLASS, NOT A PROBLEM AND NOT A CAPACITY
+        # ANSWER (agent-infra#4004). Each entry is `{index, why}` — the index the provisioner refused
+        # to fill and its own sentence about it — so a fleet reader can see the wedge without parsing
+        # notes. It is NOT `problems` (that would be a page on a lost race) and NOT silence (the
+        # slot would then be re-asked for ever, which is the freeze P1-b describes).
+        "slots_unusable": [],
         "plan": [],
         "notes": [],
         "verdict": "",
@@ -3479,7 +3535,13 @@ def converge(
             "cannot report the box as converged"
         )
     installs_seen = len(local)
-    for _step in range(max(1, target)):
+    # ⛔ THE SLOT BUDGET IS NOT THE GROWTH BUDGET (agent-infra#4004 P1-b). A skipped index adds
+    # nothing, so charging it to `target` would mean a box with N bad slots below its ceiling never
+    # grows at all — the freeze this fix removes, one layer up. The extra steps are bounded by
+    # SLOT_SKIP_BUDGET, so a box whose whole numbering is wedged costs at most this many installer
+    # calls before it stops and REPORTS (see the post-loop arm), never a runaway walk.
+    skipped: list[int] = []
+    for _step in range(max(1, target) + SLOT_SKIP_BUDGET):
         if stop_pass or live >= target or disk_free_mb is None:
             break
         try:
@@ -3523,7 +3585,7 @@ def converge(
                 "was added, and this pass cannot report the box as converged"
             )
             break
-        index = _next_free_slot(root)
+        index = _next_free_slot(root, skip=frozenset(skipped))
         if dry_run:
             # A DRY RUN CANNOT MODEL A CONVERGENCE IT CANNOT MEASURE. The old plan assumed +1 per
             # call and printed N steps ending `converged`, while the real pass on the same box
@@ -3569,6 +3631,24 @@ def converge(
                 "this tool does not interpret. Reported as an answer, not a failure (#9672)"
             )
             break
+        except SlotUnusable as exc:
+            # ⛔ NEITHER AN ANSWER NOR A FAILURE, AND NEITHER `break` NOR A `problem_kind`
+            # (agent-infra#4004 P1-a). The adapter said THIS INDEX cannot be filled by this call — a
+            # peer won the race for it, a peer's add is mid-flight, a stale leftover sits on it, or
+            # `.runner` is a dangling link. The box has not answered any capacity question, so this
+            # must NOT become `guard-conflict` (the #9672 page over a lost race) and must not become
+            # `provisioner-refused` (the capacity-answer channel, whose exit is 0). It is a skip: name
+            # the index, ask for the next free one, and let THIS pass still grow the box (P1-b).
+            skipped.append(index)
+            record["slots_unusable"].append({"index": index, "why": str(exc)[:400]})
+            record["notes"].append(
+                f"slot #{index} is UNUSABLE for this pass ({exc}) — nothing was added at #{index}, "
+                "and that is not an answer about capacity: skipping it and asking for the next free "
+                f"index, so one unusable slot does not stop this box from growing. The next pass "
+                f"retries #{index} (a path that persists across passes needs a human — this tool "
+                "never deletes a path it did not create)"
+            )
+            continue
         except ActionFailed as exc:
             record["problems"].append(str(exc))
             record["actions"].append(f"add runner (slot #{index}) FAILED: {exc}")
@@ -3620,6 +3700,22 @@ def converge(
                 "install — the box is at its memory limit"
             )
             break
+
+    # ⛔ A BOX THAT CANNOT GROW AT ALL IS LOUD; ONE THAT GREW PAST A BAD INDEX IS NOT (agent-infra#4004).
+    # A skipped slot is reported in `slots_unusable`/`notes` on every pass, but it is promoted to
+    # `problems` (verdict `action-failed`, exit 3) only when the pass ends BELOW target with slots it
+    # could not fill — i.e. when those unusable indexes are what stands between this box and its
+    # target. Without this arm the wedge would read `under-target`/exit 0: a box that can never
+    # provision reporting a clean pass, the exact false-green class this file exists to close. Without
+    # the OTHER half (the skip itself) it would be a permanent page over one leftover directory.
+    if skipped and live < target:
+        record["problems"].append(
+            f"{len(skipped)} provisioner slot(s) could not be filled this pass "
+            f"({', '.join('#' + str(i) for i in skipped)}) and the box is still BELOW its target "
+            f"(live={live}, target={target}): each of those indexes is held by a path this tool did "
+            "not create and will never delete, so no pass can fill it. A path that persists across "
+            "passes needs a human; see `slots_unusable` for the provisioner's own words about each"
+        )
 
     # 7. VERDICT --------------------------------------------------------------------------------
     # ⛔ THE STARVATION ALARM (agent-infra#2875) IS EVALUATED HERE, ONCE, AND ON EVERY PASS THAT IS

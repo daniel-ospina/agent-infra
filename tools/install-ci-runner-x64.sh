@@ -61,11 +61,19 @@
 #        rc 2  → `ProvisionerRefused` — "GUARD REFUSED, nothing attempted". An ANSWER, reported as
 #                the box's own deliberate no, not as a failure on a 10-minute timer. ⛔ RC 2 IS SPENT
 #                ONLY ON A POOL VERDICT THAT ANSWERS THE REQUEST OR A CAPACITY QUESTION: `add`'s rc 3
-#                gate verdict (the memory floor and the core-aware ceiling), and its rc 4 name verdict
-#                for the ONE sub-state where the box did answer — the slot was taken by a peer during
-#                this call, which the next pass retries. Everything else the pool declines — its rc 2
-#                (`cannot-measure`/`cannot-act`) and the rc-4 states that need a human (a pre-existing
-#                wedge, a dangling `.runner` link) — exits 6 below.
+#                gate verdict (the memory floor and the core-aware ceiling). Nothing else here is 2 —
+#                see rc 8, which is where every rc-4 state went (agent-infra#4004).
+#        rc 8  → `SlotUnusable` — NEITHER AN ANSWER NOR A FAILURE: this SLOT cannot be filled by this
+#                call. Every rc-4-without-`.runner` sub-state is here (a path that appeared during the
+#                call — a peer won the race; a path that pre-existed without `.runner` — a peer's add
+#                mid-flight or a stale leftover; a dangling `.runner` symlink). The caller SKIPS the
+#                index and asks for the next free one, so ONE unusable slot cannot freeze the box's
+#                growth, and it records the index instead of paging a human about capacity arithmetic
+#                (agent-infra#4004: the race used to exit 2, and rc 2 + disk headroom was the
+#                `GUARD CONFLICT … a human must decide which number is wrong (#9672)` page over a
+#                lost race). ⛔ 8 IS THIS FILE'S OWN CODE AND MUST STAY FREE OF THE POOL'S: the
+#                pool's EXIT block numbers 0-6, and the `*)` arm below propagates anything else
+#                verbatim, so a value it does not define is the only one that can be reserved here.
 #        rc 6  → `ActionFailed`. THIS FILE'S OWN CONFIGURATION ERRORS, and they are NOT rc 2.
 #                ⛔ rc 2 IS THE CALLER'S "CAPACITY ANSWER" CHANNEL, and a misconfigured seam is not
 #                an answer about capacity. Measured: with two disagreeing repo seams the caller
@@ -116,16 +124,21 @@
 #          `<root>/gh-runner-x64-2/.runner` and exited 4, and the pass recorded action-failed
 #          although the runner existed. Two passes adding the same index is a REAL condition here —
 #          the caller takes no inter-pass lock and its own docs note passes racing.
-#        · rc 4 with NO `.runner` and NOTHING CAN REPAIR IT → exit 6, a FAILURE. `_next_free_slot` tests
-#          only `.runner`, so a leftover directory or a dangling link makes the caller re-ask this same
-#          index for ever and `live` never moves. Two sub-states: a path that PRE-EXISTED (a stale
-#          leftover never heals; it may also be a peer's add mid-flight, which does — a transient
-#          failure on one pass is cheaper than a permanent silent green) and a `.runner` SYMLINK with
-#          no target (the pool's `[ -e ] || [ -L ]` says REGISTERED, the caller's `Path.exists()`
-#          follows the link and says FREE, so the two tools disagree about the same bytes and only a
-#          human can break the tie).
-#        · rc 4 with NO `.runner` because the path APPEARED during this call → exit 2, a REFUSAL. That
-#          genuinely is another pass's answer about the same slot, and the next pass retries it.
+#        · rc 4 with NO `.runner` → exit 8, SLOT UNUSABLE. All three sub-states land here because the
+#          caller's response is identical for all three — skip this index, ask for the next free one
+#          — and the difference between them is the MESSAGE, never the channel:
+#            – the path APPEARED during this call: a peer won the race for this index.
+#            – the path PRE-EXISTED with no `.runner`: a peer's add mid-flight, or a stale leftover
+#              from an interrupted add. `_next_free_slot` tests only `.runner`, so the caller used to
+#              re-ask this same index for ever and `live` never moved — one unusable slot froze the
+#              box's growth permanently (agent-infra#4004 P1-b, confirmed in the field on pi-cell-4).
+#            – `.runner` is a SYMLINK with no target: the pool's `[ -e ] || [ -L ]` says REGISTERED,
+#              the caller's `Path.exists()` follows the link and says FREE, so the two tools disagree
+#              about the same bytes and only a human can break the tie. The caller still skips it, so
+#              the rest of the box can grow; the slot stays named in the record for that human.
+#          ⛔ NEITHER 2 NOR 6: 2 is the caller's capacity-answer channel (a lost race is not an answer
+#          about capacity — it paged a human about arithmetic), and 6 is a FAILURE, which stopped the
+#          fill loop dead and made one leftover directory a permanent block on the whole box.
 #      ⛔ AND THE MESSAGE PRESCRIBES `rm -rf` FOR NONE OF THEM. `ci_runner_pool.sh::add` creates the
 #      directory, copies the template, runs `config.sh` and only THEN writes `.runner`, so "directory
 #      exists without `.runner`" is the NORMAL state of a peer's in-flight add for its whole window,
@@ -161,11 +174,15 @@ or <root>/gh-runner-x64) because that is where runner_autoscale.py looks for ins
 exit 2 is a POOL GUARD REFUSAL — `add`'s gate verdict (memory floor, core-aware ceiling): nothing
 was attempted, and that IS an answer, so the pass records `provisioner-refused` and exits 0.
 exit 6 is a FAILURE the caller must see: this script's own configuration errors (bad --count,
-unreadable pool tool, disagreeing root/base/repo seams), a pool rc 2 (`cannot-measure` /
-`cannot-act` — the pool could not measure or could not act on THIS box), and the pool rc 4 states
-that nothing here can repair (a pre-existing path with no `.runner` registration, a dangling
-`.runner` link). It is deliberately NOT 2: the caller records a 2 as a capacity answer and exits 0,
-so a misconfiguration or a permanent wedge would read as a clean pass.
+unreadable pool tool, disagreeing root/base/repo seams), and a pool rc 2 (`cannot-measure` /
+`cannot-act` — the pool could not measure or could not act on THIS box). It is deliberately NOT 2:
+the caller records a 2 as a capacity answer and exits 0, so a misconfiguration would read as a clean
+pass.
+exit 8 is SLOT UNUSABLE — neither an answer nor a failure. The pool's rc 4 with no `.runner` (a path
+that appeared during the call, a pre-existing path with no registration, or a dangling `.runner`
+link). Nothing was added at that index and the caller SKIPS it for the next free one, so one
+unusable slot cannot freeze the box's growth, and a lost race is never reported as a capacity
+disagreement (#4004). It is deliberately NOT 2 (not an answer) and NOT 6 (not this box's failure).
 EOF
   exit 1
 }
@@ -348,22 +365,27 @@ case "$rc" in
      # an operator to delete the path would tell them to delete a registration in progress, which is
      # what this file's own header forbids. Report the state, name BOTH possible causes, and give only
      # the non-destructive remedy: the adapter never deletes a directory it did not create.
-     # ⛔ AND THE CODE SPLIT IS THE SAME ONE rc 2/rc 3 GETS, **because rc 4 is not a capacity verdict
-     # either**: `ci_runner_pool.sh`'s EXIT block (:174-175) classifies it as "name not available (that
-     # name is taken; nothing changed, try another name)". The box did not answer a capacity question;
-     # SOMETHING IS SITTING ON THE SLOT THE CALLER WILL ASK FOR AGAIN NEXT PASS. `_next_free_slot`
-     # tests only `.runner`, so a wedge or a dangling link makes the caller re-ask the SAME index for
-     # ever and `live` never moves. Mapping those to 2 put them back in the caller's answer channel:
-     # `GUARD CONFLICT … a human must decide which number is wrong (#9672)` over a leftover DIRECTORY
-     # when the disk arm had headroom, and `provisioner-refused` → **exit 0** when it did not — a box
-     # that can never provision reporting a CLEAN pass, which is the exact defect the rc-2 split above
-     # exists to close, one code over (fresh-context review round 16, P1).
-     #   · dangling `.runner` link  → exit 6. No pass can repair it; a human must.
-     #   · path pre-existed, no `.runner` → exit 6. A stale leftover NEVER heals. It can also be a
-     #     peer's add mid-flight, which does heal — accepted: a transient `action-failed` on one pass
-     #     is cheaper than a permanent silent green, and the message still gives the remedy.
-     #   · path appeared DURING this call → exit 2. That genuinely IS another pass's answer about the
-     #     same slot, so it is a refusal this pass can retry, not a failure of this box.
+     # ⛔ AND THE CODE IS NOT rc 2's, **because rc 4 is not a capacity verdict either**:
+     # `ci_runner_pool.sh`'s EXIT block (:174-175) classifies it as "name not available (that name is
+     # taken; nothing changed, try another name)". The box did not answer a capacity question;
+     # SOMETHING IS SITTING ON THE SLOT THE CALLER WILL ASK FOR. `_next_free_slot` tests only
+     # `.runner`, so a wedge or a dangling link made the caller re-ask the SAME index for ever and
+     # `live` never moved — ONE unusable slot froze the box's growth permanently (agent-infra#4004
+     # P1-b, confirmed in the field: pi-cell-4 carried a 0-byte `.runner` and retiring it by hand was
+     # the only thing that let the box converge). Mapping these to 2 put them in the caller's answer
+     # channel instead: `GUARD CONFLICT … a human must decide which number is wrong (#9672)` over a
+     # slot a peer had merely won the race for, and `provisioner-refused` → **exit 0** when the disk
+     # arm also declined — a box that can never provision reporting a CLEAN pass (agent-infra#4004
+     # P1-a). Exit 8 is the third channel: nothing was added HERE, the caller skips this index and
+     # asks for the next free one, and the sub-state below decides which sentence the human reads.
+     #   · dangling `.runner` link → exit 8. No pass can repair it; a human must, and the caller's
+     #     record names the slot so they can.
+     #   · path pre-existed, no `.runner` → exit 8. A stale leftover NEVER heals; a peer's in-flight
+     #     add does. Both are answered the same way: the caller skips this index and asks for the
+     #     next free one, so the box keeps growing either way (agent-infra#4004 P1-b).
+     #   · path appeared DURING this call → exit 8. A peer won this index — not an answer about this
+     #     box's capacity, and the caller's next free index is a better use of this pass (agent-infra
+     #     #4004 P1-a: this used to be exit 2, which the caller read as a capacity disagreement).
      if [ -L "$DIR/.runner" ]; then
        # ⛔ THE TWO TOOLS DISAGREE ABOUT THESE BYTES, AND THE RECORD MUST SAY SO RATHER THAN PICK A SIDE.
        # The pool's occupancy test is `[ -e ] || [ -L ]`, so it answers "already registered — use
@@ -376,10 +398,11 @@ case "$rc" in
      else
        err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): another pass took this slot while this add ran — $DIR appeared during the call; retry on the next pass, or run: bash $POOL_TOOL restart --name $NAME"
      fi
-     if [ -L "$DIR/.runner" ] || [ "$DIR_EXISTED_BEFORE" -eq 1 ]; then
-       exit 6
-     fi
-     exit 2 ;;
+     # ⛔ ONE CODE FOR ALL THREE, because the caller's action is identical: skip this index, ask for
+     # the next free one. 2 would page a human about capacity arithmetic it never answered; 6 would
+     # end the pass's fill loop, which is how one leftover directory froze a box's growth for ever
+     # (agent-infra#4004 P1-b). The MESSAGES above keep the sub-states apart for the human reader.
+     exit 8 ;;
   *)   # rc 5 (this name could not be registered) and anything unexpected are real failures: the
        # caller's repair/reclaim path must see them, not a refusal it would sit on.
        printf '%s\n' "$out" | tail -5 >&2
