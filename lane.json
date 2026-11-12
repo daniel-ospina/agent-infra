@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12046-1794479194-p3598942-aeabe7d7",
+  "_sha": "0cf6d7f3fe8fb45f2e1122d0a1ae253cd44684ac",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12046.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/12037-frozen-run-census"
+    },
+    {
+      "kind": "sha",
+      "value": "f090e070db062f377f9a930de4273f5e1c08a2c5"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12046"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7229,
+  "ended_at": 1794486423,
+  "exit_code": 143,
+  "heartbeat_at": 1794486423,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12046-1794479194-p3598942-aeabe7d7",
+  "lease_until": 1794494223,
+  "pid": 3598942,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794479194,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-12046",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12046"
+}
