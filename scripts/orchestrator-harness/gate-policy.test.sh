@@ -421,9 +421,26 @@ MUT_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$MUT/units" TEMPLATES_DIR="$MU
   && ok "(5c) mutation: …and nothing was written to the unit dir (a refused install leaves no artefact)" \
   || bad "(5c) mutation: a refused install still wrote $MUT/units/eldato-ai-drainer.service"
 
-# (5d) THE GRADER'S OWN EDGES, both directions — otherwise a scan that matches anything (or nothing)
-# reads as a policy. A quoted multi-variable assignment MUST veto; a longer name that merely CONTAINS a
-# hatch name must NOT (an over-blocking census is what gets a scan weakened instead of fixed).
+# (5c2) THE MISSING-JUDGE REFUSAL, and it must be the RIGHT refusal (fresh review of #4002, P2). This is
+# the one guard in the installer whose WHOLE point is the fail-closed answer when the CHECKER is absent, and
+# nothing exercised it: delete the preflight and every other arm stays green. ⛔ The two states are
+# distinguishable and it matters which one an operator gets — WITHOUT the preflight the install still stops,
+# but `bash ""` exits 127 and `if ! bash "$GP_GUARD" …` reports a GATE BYPASS it never found, i.e. a wrong
+# diagnosis for a missing checker.
+MG="$TMP/nogr"
+MG_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$MG/units" DRAINER="$HERE/ai-drainer.sh" \
+          DRAINER_STATE="$MG/state" DRAINER_O="$MG" GP_GUARD=/nonexistent/absent.sh \
+          bash "$INST" 2>&1)"; MG_RC=$?
+[ "$MG_RC" -ne 0 ] && grep -q 'gate-policy.sh not found' <<<"$MG_OUT" \
+  && ok "(5c2) install path: an unresolvable JUDGE refuses by name — 'cannot vet' is never a silent install" \
+  || bad "(5c2) install path: a missing judge answered rc=$MG_RC · $(printf '%s' "$MG_OUT" | tail -1)"
+grep -q 'GATE BYPASS' <<<"$MG_OUT" \
+  && bad "(5c2) install path: a missing judge was reported as a GATE BYPASS it never found — wrong diagnosis" \
+  || ok "(5c2) install path: …and it does NOT claim a bypass it could not have seen"
+[ ! -f "$MG/units/eldato-ai-drainer.service" ] \
+  && ok "(5c2) install path: …and nothing is written (an unvetted unit is not a clean one)" \
+  || bad "(5c2) install path: a refused install still wrote $MG/units/eldato-ai-drainer.service"
+
 printf '[Service]\nEnvironment="O=/x ELDATO_SKIP_VGATE=1"\nExecStart=/bin/true\n' >"$TMP/quoted.service"
 bash "$POLICY" --unit-veto "$TMP/quoted.service" quoted >/dev/null 2>&1 \
   && bad "(5d) edges: a quoted multi-variable Environment= carrying ELDATO_SKIP_VGATE was NOT vetoed" \
@@ -468,6 +485,10 @@ if [ -f "$PLIST_SRC" ]; then
 else
   bad "(5d) edges: $PLIST_SRC is gone, so the launchd half of the grader has no discriminating arm"
 fi
+printf '[Service]\nEnvironment=ELDATO_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/alias.service"
+bash "$POLICY" --unit-veto "$TMP/alias.service" alias >/dev/null 2>&1 \
+  && bad "(5d) edges: ELDATO_SKIP_REVIEW_GATE=1 was NOT vetoed — the dual-prefix alias bypasses the review gate" \
+  || ok "(5d) edges: the DUAL-PREFIX alias ELDATO_SKIP_REVIEW_GATE (no AGENT_ variable present) IS vetoed"
 # …and an UNREADABLE declaration is not a clean one: rc 2, never 0.
 bash "$POLICY" --unit-veto "$TMP/no-such-declaration" absent >/dev/null 2>&1; ABSENT_RC=$?
 [ "$ABSENT_RC" -eq 2 ] \
@@ -491,6 +512,30 @@ CV_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$CV/units" TEMPLATES_DIR="$CV/t
 [ ! -f "$CV/units/eldato-ai-drainer.service" ] \
   && ok "(5e) install path: …and a refused install leaves no artefact (a refused unit is not on the box)" \
   || bad "(5e) install path: a refused install still wrote $CV/units/eldato-ai-drainer.service"
+
+# ── 5f. THE LIST IS EXACTLY WHAT THE GATES HONOUR (agent-infra#4002, fresh review) ────────────────
+# The list is hand-maintained while two of the three hatches are read through a DUAL-PREFIX lookup
+# (`process.env["AGENT_" + name] ?? process.env["ELDATO_" + name]`). That asymmetry is how the FIRST cut of
+# the list omitted `ELDATO_SKIP_REVIEW_GATE` — a name that needs no `AGENT_` variable present, which bypasses
+# the review gate on its own (measured: the grader answered CLEAN and the installer printed `scheduled` with
+# the line live in the installed unit). ⛔ NO ARM COULD REDDEN ON IT, because every arm exercised a name that
+# was present. So the coupling is asserted instead of the spelling: the DERIVED set is what the extensions
+# actually read, and the declared set must EQUAL it, so the next alias a gate learns reddens here.
+echo
+echo "== the list is what the gates honour (#4002) =="
+DECLARED="$(sed -n 's/^GP_UNIT_BYPASS_FLAGS="\(.*\)"$/\1/p' "$POLICY" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
+DERIVED="$(grep -ohwE '(AGENT|ELDATO)_(SKIP_REVIEW_GATE|SKIP_VGATE|ALLOW_MAIN_EDITS)' "$REPO"/extensions/*/index.ts 2>/dev/null | LC_ALL=C sort -u)"
+DERIVED_N="$(grep -c . <<<"$DERIVED")"
+[ "$DERIVED_N" -ge 2 ] \
+  && ok "(5f) drift: derived the honoured hatch set from the extensions ($DERIVED_N names) — the equality below is not vacuous" \
+  || bad "(5f) drift: derived $DERIVED_N honoured name(s) from extensions/*/index.ts — the equality would pass on an empty set"
+if [ "$DECLARED" = "$DERIVED" ]; then
+  ok "(5f) drift: GP_UNIT_BYPASS_FLAGS EQUALS the set the gates honour — no dual-prefix alias can hide"
+else
+  only_decl="$(comm -23 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$DERIVED") | tr '\n' ' ')"
+  only_hon="$(comm -13 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$DERIVED") | tr '\n' ' ')"
+  bad "(5f) drift: the declared list and the gates disagree — only-declared:[$only_decl] only-honoured:[$only_hon]"
+fi
 
 printf '\ngate-policy.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$(uname -s)"
 [ "$FAIL" -eq 0 ] || exit 1

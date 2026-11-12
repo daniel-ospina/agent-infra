@@ -69,11 +69,20 @@ GP_MODE=""
 GP_AMBIENT_CLEARED=0
 
 # ⛔ THE ONE LIST. Every name here is a hatch that turns a gate OFF for the process it lands in, so a
-# declaration that sets one is handing it to every process the job spawns. `AGENT_ALLOW_MAIN_EDITS` /
-# `ELDATO_ALLOW_MAIN_EDITS` are the hub-discipline hatch (#623) and belong here for the same reason:
-# both were in the measured wrapper, and an unattended job editing a main checkout is the same defect
-# as an unattended job landing unreviewed code. Extend THIS list, never a second copy of it.
-GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS"
+# declaration that sets one is handing it to every process the job spawns.
+# ⛔ THE LIST IS EXACTLY WHAT THE GATES HONOUR, and the dual-prefix lookups are why it is not obvious. Two
+# of the three hatches are read through `process.env[`AGENT_${n}`] ?? process.env[`ELDATO_${n}`]`
+# (`extensions/review-enforcer/index.ts:` `_getEnv`, `extensions/main-worktree-guard/index.ts:` `_getEnv`),
+# so each has TWO spellings and BOTH bypass the gate: `ELDATO_SKIP_REVIEW_GATE=1` with no `AGENT_` variable
+# present answers `"1"` and disables the review gate just as the `AGENT_` form does (that omission was a
+# measured fail-open in the first cut of this list, fresh review of #4002). `ELDATO_SKIP_VGATE` is read
+# directly (`extensions/verification-gate/index.ts`) and has no `AGENT_` sibling.
+# ⛔ `gate-policy.test.sh` §5f derives the honoured set FROM the extensions and requires this list to equal
+# it, so the next alias a gate learns reddens the suite instead of being invisible.
+# `AGENT_ALLOW_MAIN_EDITS` / `ELDATO_ALLOW_MAIN_EDITS` are the hub-discipline hatch (#623) and belong here
+# for the same reason: both were in the measured wrapper, and an unattended job editing a main checkout is
+# the same defect as an unattended job landing unreviewed code. Extend THIS list, never a second copy.
+GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS"
 
 # gate_policy_unit_veto <file> [label] — does a DECLARATION carry a gate bypass in its environment?
 #   0  clean (the declaration names none of the flags)

@@ -46,9 +46,15 @@
 #   TEMPLATES_DIR      template dir (default: this repo's templates/systemd)
 #   GP_GUARD           the declaration census's judge — `gate-policy.sh`, whose
 #                      `--unit-veto <file>` refuses a unit carrying a gate-bypass `Environment=`
-#                      (agent-infra#4002). default: this checkout's copy, else the farmed one. An
-#                      unset OR missing judge REFUSES the install (an unvetted unit is not a clean
-#                      one); there is no "install it anyway" mode.
+#                      (agent-infra#4002). default: this checkout's copy, else a copy under
+#                      $HOME/.pi/agent/scripts. ⛔ `pi-bootstrap/setup.sh`'s farm arrays do NOT carry
+#                      `gate-policy.sh` (nor `ai-drainer.sh`), so on a box with only the farm set
+#                      GP_GUARD explicitly — the documented install path runs this script from a
+#                      checkout (docs/ops/ai-drainer.md), where the sibling resolves. An unset OR
+#                      missing judge REFUSES an install (an unvetted unit is not a clean one); there
+#                      is no "install it anyway" mode. `--status` and `--uninstall` are NOT gated by
+#                      it: vetting is irrelevant to a read and to a REMOVAL, the one path that must
+#                      always work.
 #   SYSTEMD_UNIT_DIR   install dir OVERRIDE (tests: a temp dir with SYSTEMCTL a fake)
 #   SYSTEMCTL          `systemctl` to call  default: user manager if it answers, else `sudo -n systemctl`
 #   SUDO               sudo probe           default: `sudo -n`
@@ -123,10 +129,15 @@ fi
 [ -f "$TEMPLATES_DIR/$UNIT_SRC_TIMER" ] || { err "template not found: $TEMPLATES_DIR/$UNIT_SRC_TIMER"; exit 1; }
 # ⛔ AN UNGRADABLE DECLARATION IS NOT A CLEAN ONE, and it must not be a warning: a checker that is
 # simply missing installs an unvetted unit and prints "scheduled", which is the false PASS class this
-# installer already refuses for a missing ExecStart. Ship the judge beside the script it schedules (the
-# farm delivers both) or pass GP_GUARD explicitly.
-[ -n "$GP_GUARD" ] && [ -f "${GP_GUARD:-}" ] \
-    || { err "gate-policy.sh not found (looked in this checkout and $HOME_DIR/.pi/agent/scripts) — cannot vet the unit's environment for a gate bypass, so it will not be installed unvetted"; exit 1; }
+# installer already refuses for a missing ExecStart.
+# ⛔ SCOPED TO THE MODES THAT RENDER, DELIBERATELY (fresh review of #4002): vetting is irrelevant to a
+# READ (`--status`) and to a REMOVAL (`--uninstall`) — uninstall is the one path that must always work,
+# and gating it on a judge that resolves nothing turns "remove this dispatcher" into an error.
+case "$MODE" in
+    --install | --dry-run)
+        [ -f "${GP_GUARD:-}" ] \
+            || { err "gate-policy.sh not found (looked in this checkout at $INFRA_ROOT/scripts/orchestrator-harness and under $HOME_DIR/.pi/agent/scripts) — cannot vet the unit's environment for a gate bypass, so it will not be installed unvetted. Point GP_GUARD at a gate-policy.sh copy."; exit 1; } ;;
+esac
 
 # ── which systemctl, and therefore which unit dir ─────────────────────────────────────────────
 # System unit first (the cell's normal shape), user unit when systemd's user manager answers but
