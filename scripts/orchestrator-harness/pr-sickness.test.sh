@@ -686,6 +686,24 @@ out="$(run_pass)"
 has "$out" "skip #77: parked at this head — needs a human" "a later pass reads the park, not the cap"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "and posts NO second comment"
 
+# (v4b) A DRY RUN IS READ-ONLY AT THE BOUNDS TOO — it must not park a head and must not post a PR
+# comment (fresh-context review, P2, verified). `report` is documented as "read-only; never spawns", and
+# the bounds are evaluated BEFORE the dispatch's own dry-run guard, so this case is what proves the
+# preview cannot reach the two side effects the cap path owns.
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 2
+printf '2\n' > "$STATE/psick-77-$sha12r"              # the head is ALREADY at its repair cap
+out="$(PS_DRY_RUN=1 run_pass)"
+has "$out" "would-park-and-escalate at the cap (dry-run" "at the cap a dry run ANNOUNCES the park it would do"
+[ -s "$STATE/parked-77" ] && bad "a dry run must not park the head" || ok "the cap path writes NO park in a dry run"
+[ -s "$FIX/comment-posts.log" ] && bad "a dry run must not post an escalation comment" || ok "the cap path posts NO PR comment in a dry run"
+eq "$(spawns)" "0" "…and spawns nothing"
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 1
+printf '10\n' > "$STATE/reviewround-77"
+out="$(PS_DRY_RUN=1 run_pass)"
+has "$out" "would-park-and-escalate at the review-round ceiling" "at the ceiling a dry run ANNOUNCES the park it would do"
+[ -s "$STATE/parked-77" ] && bad "a dry run must not park the head at the ceiling" || ok "the ceiling path writes NO park in a dry run"
+[ -s "$FIX/comment-posts.log" ] && bad "a dry run must not post an escalation comment at the ceiling" || ok "the ceiling path posts NO PR comment in a dry run"
+
 # (v5) THE CEILING IS THE RECORDED ONE (`state/reviewround-<PR>`, agent-infra#3441), not an invented
 # bound: at the ceiling a fixer would push a head whose review is refused by that same ceiling, so no
 # fixer is spent — and it says so.

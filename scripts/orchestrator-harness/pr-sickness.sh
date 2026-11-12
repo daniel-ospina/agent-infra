@@ -1072,6 +1072,16 @@ ps_review_decide() {
   if ps_review_cap_hit "$bcnt"; then
     printf 'skip #%s: review-fix budget exhausted (%s/%s fixer attempts at head=%s) — needs a human\n' \
       "$pr" "$bcnt" "$(ps_maxtries "$PS_MAX_TRIES")" "${sha:0:12}"
+    # ⛔ A DRY RUN WRITES NOTHING AND POSTS NOTHING (fresh-context review, P2, verified). `report` is
+    # documented in this file as "read-only; never spawns" and `ps_select --dry-run` is a preview, but
+    # the bounds are evaluated BEFORE the dispatch's own dry-run guard — so a preview at a capped head
+    # parked the head and POSTED a public "needs a human" comment from a run that booked nothing. The
+    # field's convention for a preview mode is no writes at all (Renovate's `dryRun`), not "no spawns
+    # but everything else proceeds". Announced, so a dry run still TELLS you what it would do.
+    if [ "${PS_DRY_RUN:-0}" = "1" ]; then
+      printf 'REJECTED #%s -> would-park-and-escalate at the cap (dry-run: no park written, no PR comment posted)\n' "$pr"
+      return 1
+    fi
     # ⛔ STOP *AND* ESCALATE. The per-head budget is what makes a fixer that cannot fix finite; without
     # the park the queue re-prints the same skip every pass and the PR looks un-owned, which is the
     # state this arm exists to end.
@@ -1097,6 +1107,12 @@ ps_review_decide() {
     max="$(ps_review_max "${PS_MAX_REVIEW:-${MAX_REVIEW:-10}}")"
     printf 'skip #%s: review-round ceiling spent (rounds=%s/%s) — a fix would produce a head no review can be bought for\n' \
       "$pr" "$book" "$max"
+    # Same dry-run contract as BOUND 1: a preview writes no park and posts no comment.
+    if [ "${PS_DRY_RUN:-0}" = "1" ]; then
+      printf 'REJECTED #%s -> would-park-and-escalate at the review-round ceiling (rounds=%s/%s) (dry-run: no park written, no PR comment posted)\n' \
+        "$pr" "$book" "$max"
+      return 1
+    fi
     if [ ! -s "$(ps_state_dir)/parked-$pr" ] || [ "$(cat "$(ps_state_dir)/parked-$pr" 2>/dev/null)" != "$sha" ]; then
       printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
       # ⛔ THE REMEDY IS `merge-one.sh`'s OWN ([rrceiling]), NOT "a push": the book is CUMULATIVE across
