@@ -346,6 +346,98 @@ else
   skip "behavioural: extensions/review-enforcer/index.test.ts NOT run here — @earendil-works/pi-coding-agent is not installed in a fresh worktree (no node_modules); CI installs it, and the wiring arm above asserts the step exists"
 fi
 
+# ── 5. NO SCHEDULED-JOB DECLARATION MAY CARRY THE HATCH (agent-infra#4002) ─────────────────────
+# §1-4 grade what a CARRIER does to its own process. This one grades the OTHER route the hatch takes:
+# a unit/service/plist whose `Environment=`/`EnvironmentVariables` sets it, which hands the hatch to
+# every process the job ever spawns and which no spawned lane can undo. The measured case (#4002) was a
+# cell's drainer started by a hand-written wrapper exporting all four flags — an UNATTENDED dispatcher
+# with the review gate, the verification gate and hub-discipline off.
+# ⛔ WHY THIS IS A TEMPLATE CENSUS **AND** A RENDER: the templates are clean today, so a
+# templates-only grep is a green that cannot fail until someone reintroduces the line — and the line can
+# also arrive from a SUBSTITUTION, which only the rendered bytes show. So the arms are: every shipped
+# declaration (census), the bytes the installer would actually install (render), and a MUTANT the grader
+# must REFUSE (discrimination). Without the mutant, a scan whose regex silently stopped matching would
+# still print PASS.
+echo
+echo "== unit declarations (#4002) =="
+DECL_LIST="$( { ls "$REPO"/templates/systemd/*.service "$REPO"/templates/systemd/*.timer 2>/dev/null
+               find "$REPO/templates/launchd" -name '*.plist' -type f 2>/dev/null; } | LC_ALL=C sort )"
+DECL_SEEN=0; DECL_VETOED=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  DECL_SEEN=$((DECL_SEEN+1))
+  bash "$POLICY" --unit-veto "$f" "${f#"$REPO"/}" >/dev/null 2>&1 \
+    || DECL_VETOED="$DECL_VETOED ${f#"$REPO"/}"
+done <<EOF
+$DECL_LIST
+EOF
+DECL_FILES="$(printf '%s\n' "$DECL_LIST" | grep -c . || true)"
+# NON-VACUITY FIRST: an empty scan is never a clean scan (the census must have looked at every shipped
+# declaration, and the count is the file count — not a number that can drift from the directory).
+[ "$DECL_SEEN" -gt 0 ] && [ "$DECL_SEEN" -eq "$DECL_FILES" ] \
+  && ok "(5a) census: graded all $DECL_SEEN shipped systemd/launchd declarations (count = file count)" \
+  || bad "(5a) census: graded $DECL_SEEN of $DECL_FILES declarations — the scan is not looking at the tree"
+[ -z "$DECL_VETOED" ] \
+  && ok "(5a) census: none of the $DECL_SEEN declarations names a gate-bypass flag in its environment" \
+  || bad "(5a) census: a shipped declaration hands the hatch to everything it spawns:$DECL_VETOED"
+
+# (5b) THE RENDERED UNIT — the bytes the installer would put on a box, not the template.
+INST="$HERE/install-drainer-timer.sh"
+RD="$TMP/render"; mkdir -p "$RD/bin"
+cat >"$RD/bin/systemctl" <<'RD_SC'
+#!/bin/sh
+case "$*" in *is-active*) echo active ;; esac
+exit 0
+RD_SC
+chmod +x "$RD/bin/systemctl"
+RD_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$RD/units" DRAINER="$HERE/ai-drainer.sh" \
+         DRAINER_STATE="$RD/state" DRAINER_O="$RD" bash "$INST" --dry-run 2>&1)"; RD_RC=$?
+printf '%s\n' "$RD_OUT" >"$RD/rendered.txt"
+# The render must have HAPPENED, or the veto below is grading an error message.
+grep -q '^[[:space:]]*ExecStart=' "$RD/rendered.txt" && [ "$RD_RC" -eq 0 ] \
+  && ok "(5b) render: install-drainer-timer.sh --dry-run produced a real unit (ExecStart present)" \
+  || bad "(5b) render: --dry-run produced no ExecStart (rc=$RD_RC) — the arm below would grade nothing"
+bash "$POLICY" --unit-veto "$RD/rendered.txt" "rendered eldato-ai-drainer.service" >"$RD/veto.log" 2>&1 \
+  && ok "(5b) render: the RENDERED drainer unit carries no gate-bypass Environment= entry" \
+  || bad "(5b) render: the RENDERED drainer unit carries a bypass: $(head -1 "$RD/veto.log")"
+
+# (5c) MUTATION — inject the measured wrapper's hatch into a copy of the template and require the
+# install to REFUSE (and to say which flag), and the census to redden on the same file.
+MUT="$TMP/mutant"; mkdir -p "$MUT/tpl"
+cp "$REPO/templates/systemd/eldato-ai-drainer.service" "$MUT/tpl/"
+cp "$REPO/templates/systemd/eldato-ai-drainer.timer" "$MUT/tpl/"
+printf 'Environment=AGENT_SKIP_REVIEW_GATE=1\n' >>"$MUT/tpl/eldato-ai-drainer.service"
+bash "$POLICY" --unit-veto "$MUT/tpl/eldato-ai-drainer.service" mutant >/dev/null 2>&1; MUT_VETO=$?
+[ "$MUT_VETO" -eq 1 ] \
+  && ok "(5c) mutation: the census VETOES a declaration carrying AGENT_SKIP_REVIEW_GATE=1 (rc=1)" \
+  || bad "(5c) mutation: the census did not veto the injected hatch (rc=$MUT_VETO) — its scan cannot discriminate"
+MUT_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$MUT/units" TEMPLATES_DIR="$MUT/tpl" \
+           DRAINER="$HERE/ai-drainer.sh" DRAINER_STATE="$MUT/state" DRAINER_O="$MUT" \
+           bash "$INST" 2>&1)"; MUT_RC=$?
+[ "$MUT_RC" -ne 0 ] && grep -q 'AGENT_SKIP_REVIEW_GATE' <<<"$MUT_OUT" \
+  && ok "(5c) mutation: the INSTALLER REFUSES it and names the flag (rc=$MUT_RC)" \
+  || bad "(5c) mutation: the installer installed a bypassing unit (rc=$MUT_RC): $(printf '%s' "$MUT_OUT" | tail -1)"
+[ ! -f "$MUT/units/eldato-ai-drainer.service" ] \
+  && ok "(5c) mutation: …and nothing was written to the unit dir (a refused install leaves no artefact)" \
+  || bad "(5c) mutation: a refused install still wrote $MUT/units/eldato-ai-drainer.service"
+
+# (5d) THE GRADER'S OWN EDGES, both directions — otherwise a scan that matches anything (or nothing)
+# reads as a policy. A quoted multi-variable assignment MUST veto; a longer name that merely CONTAINS a
+# hatch name must NOT (an over-blocking census is what gets a scan weakened instead of fixed).
+printf '[Service]\nEnvironment="O=/x ELDATO_SKIP_VGATE=1"\nExecStart=/bin/true\n' >"$TMP/quoted.service"
+bash "$POLICY" --unit-veto "$TMP/quoted.service" quoted >/dev/null 2>&1 \
+  && bad "(5d) edges: a quoted multi-variable Environment= carrying ELDATO_SKIP_VGATE was NOT vetoed" \
+  || ok "(5d) edges: a quoted multi-variable Environment= carrying a hatch IS vetoed"
+printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE_DISABLED=1\nExecStart=/bin/true\n' >"$TMP/superset.service"
+bash "$POLICY" --unit-veto "$TMP/superset.service" superset >/dev/null 2>&1 \
+  && ok "(5d) edges: a LONGER name that only contains a hatch name is not vetoed (whole-word match)" \
+  || bad "(5d) edges: AGENT_SKIP_REVIEW_GATE_DISABLED=1 was vetoed — the match is a substring, not a name"
+# …and an UNREADABLE declaration is not a clean one: rc 2, never 0.
+bash "$POLICY" --unit-veto "$TMP/no-such-declaration" absent >/dev/null 2>&1; ABSENT_RC=$?
+[ "$ABSENT_RC" -eq 2 ] \
+  && ok "(5d) edges: an ungradable declaration answers 2 (not 0) — 'cannot check' is never a pass" \
+  || bad "(5d) edges: an absent declaration answered rc=$ABSENT_RC (a no-op gate reports clean)"
+
 printf '\ngate-policy.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$(uname -s)"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
