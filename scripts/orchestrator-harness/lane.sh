@@ -694,13 +694,17 @@ bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.l
 #     `orch-loop.sh`'s `capacity_yield_live()`.
 #
 # FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
-# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the EIGHT refusal gates
-# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`.
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the NINE refusal gates
+# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`,
+# `stale`.
 # ⛔ THIS SENTENCE USED TO SAY "`load`, `disk` or `land`" AND THAT WAS A TRAP (review P2): the writer has
-# emitted SIX since the fork/capability/skew/key gates were added — and it says SEVEN here because that
+# emitted SIX since the fork/capability/skew/key gates were added — and it said SEVEN here because that
 # stale count is exactly how this comment drifted the first time (review cycle 1, P2: it read "SIX"
-# beside a list of seven). The list and the count are asserted against `cap_refusal_gate` by
-# `lane-outcome.test.sh`, so a gateway added without this line reddens a test instead of a reader.
+# beside a list of seven). ⛔ IT DRIFTED THE SAME WAY TWICE MORE, AND THE SECOND TIME WAS THIS CHANGE:
+# it read SEVEN beside eight names, then EIGHT beside eight names while `#3932` added a NINTH arm
+# (`stale`) to `cap_refusal_gate` — so the count is the part that rots, not the list. The list and the
+# count are asserted against `cap_refusal_gate` by `lane-outcome.test.sh` §4e, which is what turns the
+# next gateway added without this line into a red test instead of a misled reader.
 # `chain-merge.sh` folds an UNRECOGNISED third field to `load` — so a reader implemented from this
 # sentence alone would report a credential stand-down as a load wait, which is the #2991 mislabelling
 # this file is careful to avoid three lines above. The vocabulary lives in `cap_refusal_gate`; this
