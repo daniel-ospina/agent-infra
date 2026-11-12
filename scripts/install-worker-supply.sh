@@ -64,6 +64,14 @@ if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_reso
 # ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT, and this file renders it into a unit.
 [ -n "$CELL_HOME" ] || { printf '  ❌ %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 O="${O:-$CELL_HOME/orchestrator}"
+# ⛔ THE STATE DIR THIS VERB REPORTS ON MUST BE THE ONE ITS CHILD READS (review P1, round 2 on #4017).
+# `O` was a PLAIN assignment, so `"$SCRIPT" status` below ran with its OWN default ($HOME/orchestrator)
+# while this installer had resolved $CELL_HOME/orchestrator — and on a cell `cmux vm exec` hands over
+# HOME=/home/ubuntu (scripts/lib/cell-home.sh's header records it), so the child found no record, called
+# itself STALE and the folded exit code turned a HEALTHY supervisor into `REFUSING`. Export it: the
+# read-backs after --install (225/243) had the same mismatch and always printed the "first pass may
+# still be running" warning for it.
+export O
 SUDO="${SUDO:-sudo -n}"
 INTERVAL_S="${WORKER_SUPPLY_INTERVAL_S:-60}"
 PREFIX="${WORKER_SUPPLY_PREFIX:-prd-}"
@@ -251,7 +259,27 @@ do_status() {
     if [ -f "$dest" ]; then ok "installed: $dest"; else err "not installed: $dest"; rc=1; fi
     if $SYSTEMCTL is-enabled --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "enabled: yes"; else err "enabled: no"; rc=1; fi
     if $SYSTEMCTL is-active --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "active: yes"; else err "active: no"; rc=1; fi
-    [ -n "$SCRIPT" ] && { log_line "supervisor status:"; "$SCRIPT" status 2>&1 | sed 's/^/    /'; }
+    if [ -n "$SCRIPT" ]; then
+        log_line "supervisor status:"
+        "$SCRIPT" status 2>&1 | sed 's/^/    /'
+        # ⛔ THE SUPERVISOR'S OWN VERDICT RIDES ON THIS CODE (agent-infra#4007). `ActiveState=active` is
+        # true of a `--loop` that has STOPPED PASSING: the unit is up, the record is days old, and the
+        # measured shape was a supervisor alive 16 days whose log had stopped 2 days earlier. The
+        # supervisor's `status` answers that question itself (exit 5 = STALE), so folding its code in is
+        # what makes this verb's exit mean "supplying", not "installed". The pipe's status is read from
+        # PIPESTATUS, because `sed`'s exit code is the one a pipeline reports and it is always 0.
+        local src=${PIPESTATUS[0]}
+        case "$src" in
+            0) : ;;
+            5) err "REFUSING: the supervisor is STALE — it is enabled and active but has written no completed pass inside its bound (run: $SCRIPT status)"; rc=1 ;;
+            # ⛔ ANY OTHER NON-ZERO CODE FAILS CLOSED (review P2 on #4017, reproduced). A supervisor that
+            # cannot run (126/127) or dies mid-`status` (1/2) leaves `rc` at 0 under a bare `warn`, so this
+            # verb printed "healthy" over a supervisor that answered nothing -- the same false PASS the
+            # `5` arm above exists to remove, reached by a different exit code. The contract is
+            # `0 installed/healthy`, so "I could not read its verdict" is not healthy; it says WHY instead.
+            *) err "REFUSING: the supervisor's own status could not be read (it exited $src) — run: $SCRIPT status"; rc=1 ;;
+        esac
+    fi
     # ⛔ THE EXIT CODE MUST CARRY THE VERDICT, NOT JUST THE LAST TEST (review #2896 round 3). `--status`
     # printed `❌ not installed` / `❌ enabled: no` / `❌ active: no` and still exited 0 whenever the unit
     # FILE existed — so a caller that reads the code (a lane, a supervisor, `set -e`) was told "healthy"
