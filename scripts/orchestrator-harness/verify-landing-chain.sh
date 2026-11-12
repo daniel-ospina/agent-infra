@@ -467,7 +467,18 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
           atid[g] = id; atcls[g] = classify(status, conc); atconc[g] = conc; atdone[g] = done_at
         }
       }
-      if (classify(status, conc) == "green") evergreen[g] = 1
+      # ⛔ CARRY THE GREEN OWN TIMESTAMP (fresh-context review, round 3 F1 — MEASURED). The flag used
+      # to mean "a green exists somewhere HERE", while the detail line built from it said "green exists
+      # but completed AFTER mergedAt". Those are different facts, and the sentence was the FLATTERING
+      # one: one group, attempt 10 success@04:00 then attempt 20 failure@04:30, merged 05:05 — a red
+      # landing — printed "the green completed AFTER mergedAt", when it completed 55 minutes BEFORE.
+      # The verdict was right either way; the reason printed for it was not, which is this file own
+      # doctrine (the detail names the fact, never a verdict) applied to the one field it assumed.
+      if (classify(status, conc) == "green") {
+        egreen[g] = 1
+        if (done_at == "-" || done_at == "" || done_at > merged) green_late[g] = 1
+        else green_before[g] = 1
+      }
       # ⛔ "STARTED BY THE MERGE" CANNOT BE READ FROM `started_at` ALONE (fresh-context review,
       # round 2 F2). GitHub leaves `started_at` NULL for a check run whose status is still `queued`,
       # so a group that was queued at the merge had no timestamp and fell into "no run existed yet",
@@ -490,7 +501,16 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
         if (g in atcls)                         v = atcls[g]     # it voted by mergedAt
         else if ((g in pending) || (g in started)) v = "waited"   # it existed and had not voted
         else                                    v = "later"      # no attempt completed by mergedAt
-        print g "\t" v "\t" ((g in atconc) ? atconc[g] : "-") "\t" ((g in atdone) ? atdone[g] : "-") "\t" ((g in evergreen) ? "yes" : "no")
+        # field 4 is the GREEN TIMING the red bucket is split on — measured, never assumed:
+        #   never    no green attempt on this job at all
+        #   late     a green attempt exists but completed after mergedAt (it gated nothing here)
+        #   earlier  a green completed BEFORE the merge and a NEWER attempt was the red
+        # (round 3 F1: the old flag said "a green exists" and the sentence built from it claimed the
+        # timing; the flattering reading of a red landing was the wrong one.)
+        if (!(g in egreen))                 et = "never"
+        else if (g in green_before)         et = "earlier"
+        else                                et = "late"
+        print g "\t" v "\t" ((g in atconc) ? atconc[g] : "-") "\t" et "\t" ((g in atdone) ? atdone[g] : "-")
         n++
       }
       if (n == 0) print "surface\tempty\t-\t-\tno"
@@ -517,6 +537,37 @@ emit() { # emit <check> <verdict> <detail>
 tree_of() { # tree_of <commit tsv>
   [ -s "$1" ] || return 0
   awk -F'\t' 'NR == 1 { print $2 }' "$1" 2>/dev/null
+}
+
+# ── 6 rail_landed — artifact-only; an override is a FAIL for this condition ──────────────────────
+# Extracted from `analyse` so the UNREAD-record path can report it too: the route is answerable from
+# this box's own artifacts even when GitHub could not be read, and the early return used to drop the
+# row, leaving a 5-row report against the 6-row shape every other path emits (review round 3, note 2).
+emit_rail_landed() { # emit_rail_landed <dir> <pr> <mergedAt>
+  local dir="$1" pr="$2" merged="$3"
+  local override_found="" f
+  for f in "$dir/rail.out" "$dir/merge.log" "$dir/chain.verdict"; do
+    [ -s "$f" ] || continue
+    if grep -qE 'admin_merge_override|AGENT_ADMIN_MERGE_OVERRIDE' "$f" 2>/dev/null; then
+      override_found="${f##*/}"
+    fi
+  done
+  if [ -n "$override_found" ]; then
+    emit rail_landed FAIL "an admin-merge override is recorded ($override_found) — condition 6 forbids a landing that bypassed the certificate"
+  elif [ -s "$dir/rail.out" ]; then
+    emit rail_landed PASS "the rail's own output for this PR is on disk (rail.out) and carries no override"
+  elif [ -f "$dir/chain.merged" ] || [ -s "$dir/chain.verdict" ]; then
+    emit rail_landed FAIL "landed by the per-PR chain, not by auto-rail — capstone condition 6 requires the rail to land it on its own"
+  elif [ -f "$dir/chain.merged.out-of-window" ] || [ -f "$dir/chain.verdict.out-of-window" ] || [ -f "$dir/merge.log.out-of-window" ]; then
+    # ⛔ THE MARKER EXISTED AND WAS REFUSED (F4). `$O/state` is shared by every repo on this box and
+    # `merged-<PR>.done` carries no repo, so a `tortoise#<same n>` merge would otherwise be attributed
+    # to THIS PR's landing. Outside this PR's own merge window it is not evidence — say so, and keep
+    # the route unknown rather than guessing.
+    emit rail_landed INCONCLUSIVE "a PR-number-keyed chain marker exists but is OUTSIDE this PR's merge window (mergedAt=$merged, window ${CHAIN_MARKER_WINDOW}s) — it is not proof for this repo's landing (chain-merge.sh:246-251 records the same rule), so the route stays unknown"
+  else
+    emit rail_landed INCONCLUSIVE "no rail or chain artifact for this PR on this box — the landing route is not readable here"
+  fi
+  return 0
 }
 
 analyse() { # analyse <dir> <pr>
@@ -557,6 +608,9 @@ analyse() { # analyse <dir> <pr>
     emit review_bound INCONCLUSIVE "no read review record to bind to the PR's final commit"
     emit fix_round INCONCLUSIVE "the record history was not read (${rc_unread}) — a fix round cannot be read from a channel nobody could open"
     emit green_gated INCONCLUSIVE "no reviewed head, so no head to read a check surface at"
+    # `rail_landed` is answerable from this box's own artifacts, so it is reported here too — the early
+    # return used to drop it, leaving a 5-row report against the 6-row shape every other path emits.
+    emit_rail_landed "$dir" "$pr" "$merged"
     return 0
   fi
 
@@ -653,16 +707,18 @@ analyse() { # analyse <dir> <pr>
           # — #3756/#3469), so "a red was visible" is not by itself misconduct. What the CAPSTONE
           # requires is that THE GREEN GATED the landing, and a green that completed after
           # `mergedAt` did not gate anything — that is the sentence this line has to be able to say.
-          local never late
-          never="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "red" && $5 == "no" { print $1 }' | paste -sd ',' -)"
-          late="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "red" && $5 == "yes" { print $1 }' | paste -sd ',' -)"
+          local never late earlier
+          never="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "red" && $4 == "never"   { print $1 }' | paste -sd ',' -)"
+          late="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "red" && $4 == "late"    { print $1 }' | paste -sd ',' -)"
+          earlier="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "red" && $4 == "earlier" { print $1 }' | paste -sd ',' -)"
           local why=""
           [ -n "$never" ] && why="NEVER GREEN on this head before the merge: $never"
-          [ -n "$late" ] && why="${why}${why:+ · }green exists but completed AFTER mergedAt (so it gated nothing here): $late"
+          [ -n "$late" ] && why="${why}${why:+ · }a green exists but completed AFTER mergedAt, so it gated nothing here: $late"
+          [ -n "$earlier" ] && why="${why}${why:+ · }a green DID complete before mergedAt but a NEWER attempt on the same job was RED, so the newest verdict at the merge was not a green: $earlier"
           emit green_gated FAIL "the newest verdict at mergedAt=$merged on ${rsha:0:12} was RED: $reds — the green did not gate this landing. ${why}. (The rail's main-comparison exemption is a likely reason a merge was still permitted; that is a legitimate rail path, but it is not a green.)"
         elif [ -n "$waited" ]; then
           # the check EXISTED when the merge happened and had not voted: the landing did not wait for it
-          emit green_gated FAIL "the landing did not wait for: $waited — these had started by mergedAt=$merged and had no verdict, so the green did not gate this landing"
+          emit green_gated FAIL "the landing did not wait for: $waited — each of these existed at mergedAt=$merged and had NO verdict by then (either it had started and not finished, or it was queued with no start timestamp — the API does not distinguish them), so the green did not gate this landing"
         else
           local ngreen nnonred
           ngreen="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "green" { n++ } END { print n + 0 }')"

@@ -310,6 +310,32 @@ ck "F2c: a QUEUED group at mergedAt FAILs as 'did not wait for it'" "$(has "did 
 ck "F2c: …and it is never described as a group that did not exist yet" "$(has "no run existed by mergedAt" && echo 1 || echo 0)"
 ck "F2c: …so the verdict is NOT-MET (exit 1), not a pass" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
 
+# F1r — round 3's F1: a green that completed BEFORE the merge, followed by a NEWER red attempt on the
+# same job, must not be described as a green that arrived "AFTER mergedAt". The verdict (FAIL) is the
+# same either way; the REASON is the part that was assumed instead of measured, and it was assumed in
+# the flattering direction — a red landing explained away as a timing artifact.
+R="$(mk f1r-green-then-red 450)"
+run "$R" 450 9001 "CI" 1
+group "$R" 450 10 9001 "unit-test" completed success "2026-11-12T04:00:00Z"
+group "$R" 450 450 9001 "unit-test" completed failure "2026-11-12T04:30:00Z"
+verify "$R"
+ck "F1r: a green BEFORE the merge is named as such, not as a late green" \
+  "$(has "a green DID complete before mergedAt but a NEWER attempt on the same job was RED"; echo $?)"
+ck "F1r: …and this shape is NOT described as 'completed AFTER mergedAt'" \
+  "$(has "completed AFTER mergedAt"; has "completed AFTER mergedAt" && echo 1 || echo 0)" 2>/dev/null || true
+
+# F1s — the mirror: a green that really did complete after the merge keeps ITS sentence (case 6 guards
+# the verdict; this guards that the two shapes are not collapsed into one wording).
+R="$(mk f1s-late-green 451)"
+run "$R" 451 9001 "CI" 1
+group "$R" 451 10 9001 "unit-test" completed failure "2026-11-12T04:41:17Z"
+group "$R" 451 20 9001 "unit-test" completed success "2026-11-12T05:24:50Z"
+verify "$R"
+ck "F1s: a genuinely late green is named 'completed AFTER mergedAt'" \
+  "$(has "a green exists but completed AFTER mergedAt"; echo $?)"
+ck "F1s: …and is NOT described as having completed before the merge" \
+  "$(has "a green DID complete before mergedAt" && echo 1 || echo 0)"
+
 # F3c — the `.unread` sentinel on the RECORD channels must be READ (round 2's F3: it was written for
 # body.txt/comments.txt and never consulted, so a failed body read was a measured absence and promoted
 # an older comment marker to "this PR's current record"). Both forms are exercised: body only, and
@@ -331,6 +357,16 @@ run "$R" 449 9001 "CI" 1
 : > "$R/pr-449/comments.txt"; : > "$R/pr-449/comments.txt.unread"
 verify "$R"
 ck "F3c: both channels unread names both of them" "$(has "body.txt,comments.txt"; echo $?)"
+
+# F3c-route — round 3, note 2: the unread early return used to drop `rail_landed`, which artifacts can
+# answer even when GitHub cannot. A 5-row report was the shape, and the row was the one this box knows.
+R="$(mk f3c-unread-route 454)"
+run "$R" 454 9001 "CI" 1; group "$R" 454 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ok\n' > "$R/pr-454/rail.out"
+: > "$R/pr-454/body.txt"; : > "$R/pr-454/body.txt.unread"
+verify "$R"; rc=$?
+ck "F3c-route: the unread path still reports rail_landed" "$(has "PASS  rail_landed"; echo $?)"
+ck "F3c-route: …and still exits 2, because the record is unknown" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
 
 # F3b — a comment-only marker IS admitted, but declared as the weaker source the recorder refuses
 R="$(mk f3-comment-marker 445)"
@@ -475,6 +511,31 @@ run "$R" 435 9001 "CI" 1; group "$R" 435 10 9001 "unit-test" completed success "
 verify_with "$MS" "$R"
 mutation_verdict M6 "refused as naming another repo" \
   "without the repo filter a foreign marker reads as this PR's review — case F3 is discriminating"
+
+# M8 — fold "a green completed before the merge" into "a green arrived late" (round 3's F1): the red
+# landing is explained away as a timing artifact instead of "a newer attempt was RED".
+MS="$(mutant f1r-collapse-green-timing 'else green_before[g] = 1' 'else green_late[g] = 1')" \
+  || bad "M8 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-green-timing 452)"
+run "$R" 452 9001 "CI" 1
+group "$R" 452 10 9001 "unit-test" completed success "2026-11-12T04:00:00Z"
+group "$R" 452 20 9001 "unit-test" completed failure "2026-11-12T04:30:00Z"
+verify_with "$MS" "$R"
+mutation_verdict M8 "a green DID complete before mergedAt" \
+  "collapsing the green timing blames the clock for a red landing — case F1r is discriminating"
+
+# M9 — drop the rail_landed row on the unread-record path (round 3, note 2): a 5-row report.
+MS="$(mutant unread-drops-route '    emit_rail_landed "$dir" "$pr" "$merged"' '    :')" \
+  || bad "M9 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-unread-route 453)"
+run "$R" 453 9001 "CI" 1; group "$R" 453 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ok\n' > "$R/pr-453/rail.out"
+: > "$R/pr-453/body.txt"; : > "$R/pr-453/body.txt.unread"
+verify_with "$MS" "$R"
+mutation_verdict M9 "PASS  rail_landed" \
+  "the unread path still reports the one route artifact can answer — case F3c-route is discriminating"
 
 # M7 — read through the unread RECORD channel (round 2's F3): the comment marker must not be promoted.
 MS="$(mutant record-unread-passthrough '  if [ -n "$rc_unread" ]; then' '  if [ 0 -eq 1 ]; then')" \
