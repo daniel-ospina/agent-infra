@@ -424,7 +424,7 @@ farm_install() {
   # failure mode, and `cp: No space left on device` is the only line that names it — the leg reports
   # THAT the install failed, not why.
   if cp -f "$src" "$tmp" \
-     && chmod +x "$tmp" 2>/dev/null \
+     && chmod +x "$tmp" \
      && mv -f "$tmp" "$dest"; then
     return 0
   fi
@@ -452,8 +452,8 @@ if [ -d "$scripts_dir" ]; then
     if farm_install "$f" "$dest"; then
       copied=$((copied+1))
     else
-      echo "    scripts/checkout-hygiene farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
-      farm_missing+="scripts/checkout-hygiene/$base (copy/chmod failed)"$'\n'
+      echo "    scripts/checkout-hygiene farm: farm_install FAILED for $f — the previous copy (if any) is untouched" >&2
+      farm_missing+="scripts/checkout-hygiene/$base (install failed)"$'\n'
       hygiene_failed=$((hygiene_failed+1))
     fi
   done
@@ -782,8 +782,8 @@ for base in "${fleet_srcs[@]}"; do
   if farm_install "$f" "$dest"; then
     fleet_copied=$((fleet_copied+1))
   else
-    echo "    scripts fleet farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
-    farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
+    echo "    scripts fleet farm: farm_install FAILED for $f — the previous copy (if any) is untouched" >&2
+    farm_missing+="scripts/$base (install failed)"$'\n'
   fi
 done
 
@@ -869,8 +869,8 @@ for base in "${mcp_harness_srcs[@]}"; do
     rm -f "$dest"
   fi
   if ! farm_install "$f" "$dest"; then
-    echo "    scripts mcp-harness farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
-    farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
+    echo "    scripts mcp-harness farm: farm_install FAILED for $f — the previous copy (if any) is untouched" >&2
+    farm_missing+="scripts/$base (install failed)"$'\n'
   fi
 done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner gate, #1719)"
@@ -957,7 +957,7 @@ for base in "${lib_srcs[@]}"; do
   if farm_install "$f" "$dest"; then
     lib_copied=$((lib_copied+1))
   else
-    echo "    scripts lib farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
+    echo "    scripts lib farm: farm_install FAILED for $f — the previous copy (if any) is untouched" >&2
     lib_failed=$((lib_failed+1))
   fi
 done
@@ -1041,8 +1041,8 @@ for base in "${fleet_tools[@]}"; do
   if farm_install "$f" "$dest"; then
     tools_copied=$((tools_copied+1))
   else
-    echo "    scripts/fleet farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
-    farm_missing+="scripts/fleet/$base (copy/chmod failed)"$'\n'
+    echo "    scripts/fleet farm: farm_install FAILED for $f — the previous copy (if any) is untouched" >&2
+    farm_missing+="scripts/fleet/$base (install failed)"$'\n'
   fi
 done
 echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions + pr-state, #1178/#1777/#2866)"
@@ -1183,8 +1183,8 @@ for base in "${merge_gate_srcs[@]}"; do
     merge_gate_copied=$((merge_gate_copied+1))
     merge_gate_names+="${merge_gate_names:+, }$base"
   else
-    echo "    ⚠️  COPY/RENAME FAILED for $f — the lander seam would not be executable" >&2
-    farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
+    echo "    ⚠️  farm_install FAILED for $f — the lander seam stays as it was, never half-delivered" >&2
+    farm_missing+="scripts/$base (install failed)"$'\n'
   fi
 done
 # DERIVED from the array, never hard-coded: a summary that omits a name it farmed misreports the
@@ -1213,8 +1213,8 @@ for base in "${graph_srcs[@]}"; do
   if farm_install "$f" "$dest"; then
     graph_copied=$((graph_copied+1)); graph_names+="${graph_names:+, }$base"
   else
-    echo "    scripts graph farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
-    farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
+    echo "    scripts graph farm: farm_install FAILED for $f — the previous copy (if any) is untouched" >&2
+    farm_missing+="scripts/$base (install failed)"$'\n'
   fi
 done
 echo "    scripts graph farm: $graph_copied copied (${graph_names:-none} — hosted-graph fallback, graph-mcp-provision)"
@@ -1249,8 +1249,8 @@ if [ -f "$SPAWN_GATE_SRC" ]; then
   if farm_install "$SPAWN_GATE_SRC" "$DEST/bin/pi"; then
     echo "    pi spawn-point gate installed at $DEST/bin/pi (#1884)"
   else
-    echo "    ⚠️  COPY/RENAME FAILED for $SPAWN_GATE_SRC — $DEST/bin/pi left exactly as it was" >&2
-    farm_missing+="bin/pi (copy/chmod failed)"$'\n'
+    echo "    ⚠️  farm_install FAILED for $SPAWN_GATE_SRC — $DEST/bin/pi left exactly as it was" >&2
+    farm_missing+="bin/pi (install failed)"$'\n'
   fi
   # A gate that is installed but NOT ahead of the real pi on PATH is a false install: it would report
   # success here while every spawn resolved past it. Say so at install time, when it is cheap to fix.
@@ -1302,14 +1302,18 @@ if [ -n "$farm_missing" ]; then
   while IFS= read -r missed; do
     [ -n "$missed" ] && echo "         $missed" >&2
   done <<<"$farm_missing"
-  echo "       Two causes, and they do NOT have the same fix: a name ABSENT from $INFRA_ROOT (an" >&2
-  echo "       incomplete checkout), or a COPY/RENAME that FAILED — permissions, a full disk, a path" >&2
-  echo "       that is not a regular file — which cp/mv name on their own stderr line above." >&2
+  echo "       THREE causes, and they do NOT have the same fix:" >&2
+  echo "        (a) a name ABSENT from $INFRA_ROOT — an incomplete checkout: re-run from a complete" >&2
+  echo "            checkout (git status)." >&2
+  echo "        (b) a COPY/RENAME that FAILED — permissions, a full disk: fix $DEST, then re-run." >&2
+  echo "        (c) a DIRECTORY sitting at a destination path: move it aside, then re-run." >&2
+  echo "       The failing step names its own cause on the stderr line above (cp or mv, or" >&2
+  echo "       farm_install's own DIRECTORY refusal); the name(s) below carry (install failed) for" >&2
+  echo "       (b)/(c) and no suffix for (a)." >&2
   echo "       Nothing below ran: the UNFARM leg, launchd convergence, the shell-profile wiring." >&2
   echo "       A farm that delivers less than it declares is how the repo and the machines drift" >&2
   echo "       apart in silence (#1931) — and, on the UNFARM side, how a file that was never" >&2
-  echo "       deployed comes to look retired. For an absent name: re-run from a complete checkout" >&2
-  echo "       (git status). For a failed install: fix $DEST (space/permissions), then re-run." >&2
+  echo "       deployed comes to look retired." >&2
   exit 1
 fi
 if [ ! -f "$BOOTSTRAP_DIR/lib/farm-retire.sh" ]; then

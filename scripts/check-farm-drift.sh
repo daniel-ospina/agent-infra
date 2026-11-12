@@ -419,12 +419,6 @@ decl_rel_norm() {
 
 is_declared_local() {
     case "$1" in
-        *.tmp.[0-9]*)  return 0 ;;   # the farm's OWN scratch (farm_install's `<name>.tmp.<pid>`, #3991):
-                                     # it exists only for the duration of one copy, and an INTERRUPTED
-                                     # install leaves one behind for good. Grading it as UNSOURCED
-                                     # turned every farm red (rc=3) with a remedy no re-run could
-                                     # clear — the very class this walk's own "no temp in the farm"
-                                     # note records for its own scratch file.
         *.bak-*)        return 0 ;;   # a repair path's own backup beside the live script it replaced
         __pycache__/*)  return 0 ;;   # the interpreter's cache, never shipped
         */__pycache__/*) return 0 ;;  # ...at any depth (`fleet/__pycache__/x.pyc`)
@@ -432,6 +426,24 @@ is_declared_local() {
         */.DS_Store)    return 0 ;;
         ._*)            return 0 ;;   # AppleDouble resource forks
         */._*)          return 0 ;;
+    esac
+    return 1
+}
+
+# ⛔ THE FARM'S OWN SCRATCH (#3991) — recognised ONLY where no repo file explains the name.
+# `farm_install` writes `<name>.tmp.<pid>` beside the live script, and an INTERRUPTED install leaves
+# one behind for good (`farm_install` only ever removes its own `$$` temp, and the UNFARM leg only
+# removes DECLARED names), so grading it UNSOURCED made every later pass red at rc=3 with a remedy
+# ("declare it LOCAL, delete it, or retire it") that no re-run could clear — the same class this
+# walk's own "NO TEMP FILE IS WRITTEN INTO THE FARM" note records for its own scratch file.
+# ⛔ WHY IT IS NOT AN `is_declared_local` ARM: that function runs BEFORE the source lookup, so a
+# name-based exemption would also mask a REAL repo file that happens to be called `x.tmp.1` — a
+# stale copy and a lost `+x` bit would print `LOCAL (declared)` while the run exited 0 over the
+# #10114 silent no-op this file exists to catch. Applied in the UNSOURCED arm instead, so the name
+# is exempt only when nothing in this repo resolves to it.
+is_farm_scratch() {
+    case "$1" in
+        *.tmp.[0-9]*) return 0 ;;
     esac
     return 1
 }
@@ -560,6 +572,11 @@ while IFS= read -r rel; do
             printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "STALE" >&2
         fi
     else
+        # The farm's own scratch is not drift — but only HERE, where nothing resolves to it (#3991).
+        if is_farm_scratch "$rel"; then
+            [ "$QUIET" -eq 1 ] || printf '%-46s | %-12s | %-12s | %s\n' "$rel" "-" "-" "LOCAL (scratch)"
+            continue
+        fi
         unsourced=$((unsourced+1))
         printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "-" "UNSOURCED" >&2
     fi
