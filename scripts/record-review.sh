@@ -3277,8 +3277,23 @@ $m"
       # its author the claim "states an EMPTY range … names ZERO commits": a false sentence about their
       # own text, the class this file calls worse than the gap. The first arm (equality) IS the three-dot
       # test and stays: a symmetric difference of one commit with itself is empty either way.
-      _esep="${BASH_REMATCH[0]}"; _esep="${_esep//[!.]/}"
-      _eranges="${_eranges#*"${BASH_REMATCH[0]}"}"
+      # ⛔ THE SEPARATOR IS THE DOTS AFTER THE LEFT OPERAND, NOT EVERY DOT IN THE MATCH (round 11 — MEASURED,
+      # a FAIL-OPEN the round-10 gate introduced). Counting dots over `${BASH_REMATCH[0]}` also counted the
+      # match's BOUNDARY character, and that character may itself be a dot (`(^|[^0-9A-Za-z_])`): so
+      # `.HEAD..anc` yielded `_esep="..."`, the ancestry gate saw a three-dot claim in a two-dot one, and a
+      # nought-commit claim minted a signed `clean` — the same fail-open one character of punctuation away
+      # from a fix that had just closed it. Reading the run that FOLLOWS the left operand is exact by
+      # construction: `_elhs` is the captured operand, so everything up to the next non-dot is the separator.
+      _esep="${BASH_REMATCH[0]#*"$_elhs"}"; _esep="${_esep%%[^.]*}"
+      # ⛔ CONSUME THE SEPARATOR, NOT THE WHOLE MATCH (round 11 — MEASURED, a FAIL-OPEN). The right operand
+      # of one range can be the LEFT operand of the next: slicing past the whole match ate it, and the arm
+      # that owns the remaining claim could not recover it (the omitted-left arm excludes a leading char
+      # that ends an operand, by design) — so `read...HEAD..anc` and `anc..HEAD..anc` left `HEAD..anc`
+      # measured by NO arm and minted a signed `clean`. Slicing past `<left operand><separator>` leaves the
+      # right operand at the START of the remaining text, where the `^` alternative of the boundary group
+      # admits it as the next left operand; the separator is consumed either way, so the loop cannot
+      # re-match what it just measured.
+      _eranges="${_eranges#*"${_elhs}${_esep}"}"
       # ⛔ THE REFUSAL QUOTES WHAT WAS WRITTEN, NOT A RECONSTRUCTION OF IT (twenty-second cycle, P2 —
       # MEASURED). The message was rebuilt from the captured TOKENS (`"${_elhs}..${_erhs}"`), and the
       # right-hand capture stopped one selector short of the text — so a claim narrowed to
@@ -3409,9 +3424,11 @@ $m"
       # MEASURED): an identity REFLOG position on the left (`HEAD@{0}..anc`) is the same claim and was
       # still accepted, because the identity was recognised and then thrown away before resolution; that
       # is fixed above. What remains is the interior PAIR: `anc..deltabase` abutting is ACCEPTED, while
-      # the spaced `anc .. deltabase` is refused (by the omitted-RIGHT arm, whose union reads it as
-      # `anc .. deltabase = anc..deltabase..HEAD`); the sentence below therefore states the boundary for
-      # the abutting spelling and does not claim the spaced one.
+      # the spaced `anc .. deltabase` is refused — round 11 corrected WHICH arm answers: it is the MIRROR
+      # arm's written-left-end sentence ('both endpoints are written and deltabase is an ancestor of anc'),
+      # not the omitted-RIGHT arm's union, which `continue`s because its left operand is not the head. The
+      # sentence below therefore states the boundary for the abutting spelling and does not claim the
+      # spaced one.
       # ⛔ AND IT MUST NOT PREEMPT A MORE SPECIFIC, MORE ACCURATE SENTENCE (MEASURED — the first cut of this
       # test did). A claim whose RIGHT end carries a SELECTOR (`HEAD..HEAD~1`) is a tip-relative NARROWING and
       # is refused as one; a claim whose LEFT end names a DESCENDANT (`afterhead..HEAD`) is refused as
