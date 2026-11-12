@@ -229,3 +229,29 @@ erases) and never a checkout the reaper may reclaim. Both new scripts are declar
   capability's activation, and the per-cell state is recorded on #2700.
 - **`systemctl is-active` is a hint, not the proof.** The proof is the journal decision **and** a PR
   whose state changed because of that box (#2709 §1).
+- ⛔ **`activate-harness.sh --check` no longer grades this capability on `ActiveState` alone**
+  (agent-infra#4010). It reads the loop's own pass record (`$O/state/pr-repair.status.json`, the file
+  `pr-repair-loop.sh::write_status` writes every pass) and reports `FAILING` while the decision is
+  `refusing` / `placed-undelivered` / `pass-failed`, and `LATE` while it is `deferred` / `idle` /
+  `skipped`, or when a green record stopped moving. The bound is the **effective** cadence, not
+  `REPAIR_INTERVAL_S` alone: `2 x cadence + 2 x REPAIR_DOCTOR_TIMEOUT_S`, where the cadence is
+  `REPAIR_TRIGGER_BACKSTOP_S` when the unit's `ExecStart` carries `--trigger` (the interval is inert
+  there) and `REPAIR_INTERVAL_S` otherwise. The row PRINTS the number and the directive it came from,
+  and says that `keys.env` overrides the loop's tunables and is not read by the grid — because a pass's
+  worst legitimate gap is cadence **plus its own runtime**, which a bound built from the interval alone
+  treats as a red. The reason is quoted verbatim from the record **and the record's own path is
+  named on the row**, so an operator reads the same artifact the grid read.
+  ⛔ **It does NOT follow that `install-repair-service.sh --status` agrees, and the docs must not say
+  it does** (review round 1, P2). `--status`'s `readback()` checks `is-active`, `is-enabled`,
+  `KillMode` and `ExecStart` and never reads the installed unit's `Environment=`; and the `--status`
+  it delegates to shells `pr-repair-loop.sh --status` with **the operator's** `O`
+  (`O="${O:-$CELL_HOME/orchestrator}"`), not the unit's `Environment=O=`. On a box whose unit renders
+  a different `O=` the two read *different records* — `activate-harness.test.sh` T34 case (d)
+  constructs exactly that — and `--status` can print "no pass has been recorded yet" beneath a row
+  that just quoted a refusing record. Read the path the row names.
+  **Why that had to change:** measured on a cloud cell 2026-11-12, the unit read `active (running)` for
+  three days while every pass wrote `decision: refusing` — `reason:
+  env-file-unreadable:/tmp/cell-home/keys.env`, a pre-#3453 render pointing at a home the box does not
+  have — and the grid printed `OK … active` over it. The loop CONTINUES on a refusal (it does not
+  exit), so the restart policy never fires and `ActiveState` can never see this state. A row that
+  cannot fail is a caption, not a gate.
