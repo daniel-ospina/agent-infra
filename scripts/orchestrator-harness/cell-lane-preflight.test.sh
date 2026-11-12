@@ -464,6 +464,12 @@ assert_has "A21 ...and measured it" "behind=0" "$OUT"
 # tortoise/agent-infra checkouts are `/tmp/cell-t3` and `/tmp/cell-ai` (docs/ops/disk-consumers.md),
 # resolved by `cell-install.sh` / `ci_runner_fleet.sh` through `${CELL_HOME}`. The probe runs from a
 # NEUTRAL cwd, so the cell path is the only way it can find this checkout.
+# ⛔ AND THE ARM IS HERMETIC NOW, WHICH IS WHY `${CELL_HOME}/agent-infra` OUTRANKS THE `/tmp/cell-*`
+# LITERALS in `resolve_repo` (this change's review, P2-3, measured). With the literals first, this arm
+# resolved the LIVE `/tmp/cell-ai` on a cell — red for a value that is CORRECT there, and `git fetch`-ing
+# a production checkout from inside a suite. The fixture below can now only be beaten by `$PWD` (which
+# holds no `.git` here), so the arm proves the cell-layout candidate while being provably unable to reach
+# a live path on any host.
 make_stub "$WORK/a22" answer; make_keys "$WORK/a22"
 mk_repo "$WORK/a22/src" 0 || bad "A22 fixture: could not build a git repo"
 mkdir -p "$WORK/a22/cellhome"
@@ -473,18 +479,35 @@ run_gate_in "$WORK/a22" "$WORK/a22" 20 CELL_HOME="$WORK/a22/cellhome" CELL_PREFL
                 || bad "A22 expected exit 0, got $RC: $OUT"
 assert_has "A22 ...the cell path is in the default candidate list" "repo=agent-infra" "$OUT"
 assert_has "A22 ...and carries its distance" "behind=0" "$OUT"
+assert_not_has "A22 ...and it never falls through to a hard-coded /tmp/cell-* literal (a live production checkout on a cell)" "repo=cell-ai" "$OUT"
 
 # A23 — `HOME` UNSET: the reading must still be ON THE LINE. Pre-fix the bare `$HOME/tortoise` aborted
 # under `set -u` inside `$( )`, so `FRESHNESS` came back EMPTY and the `ok` line carried no `repo=` and
 # no `behind=` at all — the readiness field disappeared rather than saying `unknown`, against this
 # file's own contract that the output is one line and always carries what it read.
+# ⛔ IT NO LONGER ASSERTS `repo=none`, BECAUSE THAT ASSERTION WAS ABOUT THE HOST, NOT ABOUT `$HOME` (this
+# change's review, P2-3, measured). With `HOME` unset and nothing named, the DEFAULT LIST is walked — and
+# on a cell that list reaches the LIVE `/tmp/cell-ai`, so the arm read `repo=cell-ai` (red for a correct
+# value) while `git fetch`-ing a production checkout. The fixture below names, through `CELL_HOME`, a
+# checkout this arm OWNS and that has no `origin` (so the fetch cannot reach anything and the distance is
+# honestly `unknown`); `CELL_HOME` outranks the `/tmp/cell-*` literals, so no live path is reachable here.
+# ⛔ AND IT STILL CARRIES THE BARE-`$HOME` MUTATION: a `for cand in … "$HOME/x"` word list is expanded
+# BEFORE the first iteration, so putting the abort back reddens this arm (the field vanishes) no matter
+# which candidate would have won — the mutation is not weakened by giving the arm a fixture.
 make_stub "$WORK/a23" answer; make_keys "$WORK/a23"
+mk_repo "$WORK/a23/src" 0 || bad "A23 fixture: could not build a git repo"
+g -C "$WORK/a23/src/repo" remote remove origin || bad "A23 fixture: could not drop the remote"
+mkdir -p "$WORK/a23/cellhome"
+cp -a "$WORK/a23/src/repo" "$WORK/a23/cellhome/agent-infra" || bad "A23 fixture: could not place the cell checkout"
 OUT="$( cd "$WORK/a23" && env -u HOME -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS \
-        -u CELL_PREFLIGHT_REPO PATH="$WORK/a23/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        -u CELL_PREFLIGHT_REPO -u CELL_PREFLIGHT_MAX_BEHIND -u CELL_PREFLIGHT_FETCH_BOUND \
+        CELL_HOME="$WORK/a23/cellhome" \
+        PATH="$WORK/a23/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         bash "$TARGET" --keys "$WORK/a23/keys.env" --quiet --bound 20 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "A23 a box with no \$HOME is still measurable (exit 0)" || bad "A23 expected exit 0, got $RC: $OUT"
 assert_has "A23 ...and the readiness field is STILL on the line (it used to vanish)" "behind=" "$OUT"
-assert_has "A23 ...naming that nothing was resolved, rather than reporting nothing at all" "repo=none" "$OUT"
+assert_has "A23 ...naming the checkout it resolved, rather than reporting nothing at all" "repo=agent-infra" "$OUT"
+assert_not_has "A23 ...and it never reaches a hard-coded /tmp/cell-* literal (a live production checkout on a cell)" "repo=cell-ai" "$OUT"
 
 # A24 — `--repo` names the checkout (the caller already knows it), and a NAME THAT IS NOT A CHECKOUT IS
 # REPORTED. The second half is the one a guess would hide: `$PWD` here IS a valid checkout, so a
