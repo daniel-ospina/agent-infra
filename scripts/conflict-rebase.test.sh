@@ -732,6 +732,125 @@ ckn "$OUT" "Rebasing (1/27)fatal" "§22b …and the counter is not what gets rep
 has "$OUT" "|fatal: The pre-rebase hook refused" "§22c a plain fatal line is passed through"
 has "$OUT" "|no output" "§22d an empty blob says so instead of crashing"
 
+# ═════ §23: a GENERATED file is regenerated, never hand-merged (agent-infra#4012) ═════
+# A derived file has no intent to weigh, so "a content conflict is a content decision" (#2698)
+# is simply false for it — and neither side of such a conflict can be right, because the right
+# value did not exist until the generator ran on the tree. Measured on the live queue
+# 2026-11-12: of FIVE `CONFLICTING` PRs, TWO were pure generated files (#3964 the
+# workflow-lock region digest, #3698 `sanctioned-scripts.pin.json`) and ZERO were the
+# "already-landed hunk" class.
+#
+# The fixture is the real shape: `src.txt` is AUTHORED, `gen.txt` is DERIVED from it, and
+# both sides edited `gen.txt` — so the only right answer is the generator's, and it is
+# neither side's text. That is what makes these cases discriminating: a bot that "took ours"
+# or "took theirs" would land `gen:ONE-main` / `gen:ONE-v2`, and both are asserted AGAINST.
+echo "§23 a generated-file conflict is regenerated; an authored one is still refused"
+GEN="$TMP/gen.sh"
+cat >"$GEN" <<'EOS'
+#!/usr/bin/env bash
+# fixture generator: gen.txt is DERIVED from src.txt
+case "${1:-}" in
+  cut)   printf 'gen:%s\n' "$(cat src.txt)" >gen.txt ;;
+  check) [ "$(cat gen.txt)" = "gen:$(cat src.txt)" ] ;;
+  noop)  : ;;
+  *) exit 99 ;;
+esac
+EOS
+chmod +x "$GEN"
+SEAM="$TMP/generated.json"
+printf '[{"match":"gen.txt","cmd":"%s cut","verify":"%s check","why":"fixture"}]\n' "$GEN" "$GEN" >"$SEAM"
+# Build the generated-conflict fixture on top of the standard one, then push it to origin.
+add_generated_fixture() { # "$1" = mixed|pure
+  (
+    cd "$TMP/seed" || exit 1
+    git switch -q main
+    printf 'ONE\n' >src.txt; printf 'gen:ONE\n' >gen.txt
+    git add src.txt gen.txt && git commit -qm "main: add an authored source and its generated file"
+    git switch -q -c feat/gen
+    printf 'gen:ONE-v2\n' >gen.txt && git commit -qam "gen: regenerate for v2"
+    if [ "${1:-pure}" = "mixed" ]; then
+      # ⛔ THE MIXED CASE IS CRITERION 4: one commit conflicts on the derived file AND on
+      # an AUTHORED one. Resolving the derived half would publish a tree in which the
+      # authored change was silently dropped — so the whole commit must be refused.
+      git switch -q -c feat/gen-mixed
+      printf 'gen:ONE-v2\n' >gen.txt; printf 'red\nMIX-conflict\nblue\n' >c.txt
+      git commit -qam "mixed: regenerate + author a change"
+      git switch -q main
+      printf 'gen:ONE-main\n' >gen.txt; printf 'red\nMIX-main\nblue\n' >c.txt
+      git commit -qam "main: regenerate and author the same lines"
+      git push -q origin main feat/gen-mixed
+    else
+      git switch -q main
+      printf 'gen:ONE-main\n' >gen.txt && git commit -qam "main: regenerate gen elsewhere"
+      git push -q origin main feat/gen
+    fi
+  )
+}
+
+# ── (a) the derived conflict is REGENERATED and pushed ──
+seed_fixture; add_generated_fixture pure
+export CONFLICT_REBASE_GENERATED="$SEAM"
+GEN_SHA="$(head_of feat/gen)"
+write_prs "[$(pr_json 1501 feat/gen "$GEN_SHA" CONFLICTING DIRTY)]"
+run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23a the pass exits 0"
+ckn "$(head_of feat/gen)" "$GEN_SHA" "§23b the generated-conflict branch WAS rebased and pushed"
+ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE$' feat/gen -- gen.txt)" "feat/gen:gen.txt:1" \
+   "§23c gen.txt carries the GENERATOR's value for this tree"
+ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE-v2' feat/gen -- gen.txt || echo 0)" "0" \
+   "§23d …NOT the PR's side (a side would have been a content decision)"
+ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE-main' feat/gen -- gen.txt || echo 0)" "0" \
+   "§23e …and NOT main's side either (the right value existed on neither side)"
+has "$(cat "$TMP/fake/comment-1501.md" 2>/dev/null || echo)" "REGENERATED, not hand-merged" \
+   "§23f the comment says what it did"
+has "$(cat "$TMP/fake/comment-1501.md" 2>/dev/null || echo)" "$GEN cut" \
+   "§23g …and names the exact generator a reader can run"
+ckn "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "needs-human-conflict" \
+   "§23h a regenerated conflict is NOT labelled needs-human-conflict"
+
+# ── (b) criterion 4: a MIXED conflict is refused, so the authored change is never dropped ──
+seed_fixture; add_generated_fixture mixed
+MIX_SHA="$(head_of feat/gen-mixed)"
+write_prs "[$(pr_json 1502 feat/gen-mixed "$MIX_SHA" CONFLICTING DIRTY)]"
+run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23i the pass still exits 0 (a refusal is not a pass failure)"
+ck "$(head_of feat/gen-mixed)" "$MIX_SHA" "§23j a MIXED conflict pushes NOTHING"
+has "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "REFUSED" \
+   "§23k …it is refused, not silently half-resolved"
+has "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "c.txt" \
+   "§23l …and the refusal names the AUTHORED path the human must resolve"
+ckn "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "gen.txt," \
+   "§23m …and does not blame the derived file it could have regenerated"
+ck "$(git -C "$TMP/origin.git" grep -c 'MIX-main' feat/gen-mixed -- c.txt || echo 0)" "0" \
+   "§23n the authored change was not dropped in place of a resolution"
+ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE-v2' feat/gen-mixed -- gen.txt || echo 0)" "feat/gen-mixed:gen.txt:1" \
+   "§23o the mixed branch's DERIVED file is untouched too (nothing half-resolved)"
+has "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "1502 ADD needs-human-conflict" \
+   "§23o2 a MIXED conflict gets the label a human needs"
+
+# ── (c) a generator that FAILS is a refusal, never a push ──
+seed_fixture; add_generated_fixture pure
+FAILSEAM="$TMP/generated-fail.json"
+printf '[{"match":"gen.txt","cmd":"false","verify":"true","why":"fixture"}]\n' >"$FAILSEAM"
+GEN_SHA="$(head_of feat/gen)"
+write_prs "[$(pr_json 1503 feat/gen "$GEN_SHA" CONFLICTING DIRTY)]"
+CONFLICT_REBASE_GENERATED="$FAILSEAM" run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23p a failing generator is a refusal, not a pass failure"
+ck "$(head_of feat/gen)" "$GEN_SHA" "§23q …nothing is pushed when the generator fails"
+has "$(cat "$TMP/bot.err")" "generated-regenerate-failed" "§23r …and the refusal is classified as a GENERATOR failure"
+
+# ── (d) a generator that runs but whose OWN check still reds is NOT trusted ──
+seed_fixture; add_generated_fixture pure
+LIESEAM="$TMP/generated-lie.json"
+printf '[{"match":"gen.txt","cmd":"%s noop","verify":"false","why":"fixture"}]\n' "$GEN" >"$LIESEAM"
+GEN_SHA="$(head_of feat/gen)"
+write_prs "[$(pr_json 1504 feat/gen "$GEN_SHA" CONFLICTING DIRTY)]"
+CONFLICT_REBASE_GENERATED="$LIESEAM" run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23s a generator whose result does not verify is a refusal"
+ck "$(head_of feat/gen)" "$GEN_SHA" "§23t …nothing is pushed on an unverified regeneration"
+has "$(cat "$TMP/bot.err")" "its own check still fails" "§23u …and the refusal says the CHECK failed, not the generator"
+unset CONFLICT_REBASE_GENERATED
+
 # ── summary ─────────────────────────────────────────────────────────────────
 printf '\n%s\n' "──────────────────────────────────────────"
 printf 'conflict-rebase.test.sh: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
