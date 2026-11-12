@@ -1507,6 +1507,18 @@ bash ~/orchestrator/check-deployed-drift.sh --o ~/orchestrator --repo <agent-inf
 defect: a box printed `harness=diverged:5712e52776c8` for a state the two questions describe
 differently, so a diagnosis made against the checkout described code the box was not running.
 
+**Question (b) itself has two halves, and they are not interchangeable: the BYTES and the EXEC BIT.** A
+file's mode lives in the git **tree entry**, not in the blob, so `git hash-object` cannot see it: a
+byte-identical copy of a `100755` script can be unrunnable while every byte comparison on the box reports
+it clean — measured (agent-infra#4003): `nonblocking-dispatch.sh`, 36,175 B, `-rw-r--r--`, the dispatch
+path dead and the report green. The check therefore reads the mode from `$REF`'s own tree (`git ls-tree`)
+and tests `[ -x ]` on `$O`, one-way: a source `100755` that `$O` cannot execute is a finding, an
+executable copy of a `100644` source is not (a check that reddens a healthy box is its own failure). That
+state gets its OWN token, `not-executable:<file>` — never `payload-differs`, whose meaning is "the bytes
+differ" and whose remedy names no mode. ⛔ **Scope:** the arm grades `$O`'s depth-1 `*.sh`; a `--surface`
+candidate dir other than `$O` is still compared by **bytes only** (the FARM population is not left
+ungraded — `check-farm-drift.sh` carries its own `NOT-EXECUTABLE` arm over `$DEST/scripts`).
+
 A box that answers **both** questions cleanly carries `harness=current` — the token names the verdict,
 and `current` is a positive statement ("the record names this commit AND `$O` holds exactly those
 bytes"). Every drift token below names a problem; `current` names the absence of one:
@@ -1519,6 +1531,7 @@ bytes"). Every drift token below names a problem; `current` names the absence of
 | `harness=uncommitted-edit:<file>` | (a) | `$O` holds bytes **no deploy wrote** (`<file>` differs from the record) — a hand patch | **recover the patch first**: a redeploy destroys it (§4.1 refusal) |
 | `harness=source-dirty:<sha12>` | (a) | the record names `<sha12>` — **this** commit — but its own `sourceDirty=true` (or, for a legacy *stamp* record, `agentInfraDirty=true`) says the deploy was staged from a checkout with uncommitted changes, so `<sha12>` does **not** describe the bytes on the box | redeploy from a **clean** checkout: that is what makes the box identifiable at all |
 | `harness=incomplete:<file>` | (a) | the record names `<file>` and `$O` does not have it — the deployed tree is **incomplete**; nothing was edited and no byte differs | redeploy: it **creates** the file; nothing you wrote is discarded |
+| `harness=not-executable:<file>` | (b) — the **mode** half | the repo ships `<file>` **100755** at `$REF` and `$O`'s copy is **not executable**. Its bytes may be the ref's exactly — a mode is not in a blob, so no byte comparison can see this, and a bit lost **after** a good deploy (a restore, a `cp` without `-p`, a tarball, an `rsync` without `--perms`, a `core.fileMode=false` checkout) reads clean everywhere else. #4003's silent-disarm class: the loop execs a script the box cannot run | `chmod +x` the file(s) — the report prints the exact path — or redeploy, which writes the mode from git. ⛔ NOT `payload-differs`: nothing about the bytes is wrong, and that token's remedy names no mode |
 | `harness=payload-differs` | (b) | the bytes differ from the checkout but the record still describes `$O` (e.g. the checkout moved on) | redeploy to adopt |
 | `harness=executes:<dir>` | **neither — it is a statement about the PROCESS** | a live controller is **executing** `<dir>/orch-loop.sh` and that directory **cannot be matched to this repo**: it **does not exist**, *or* it exists with **no readable `*.sh`** (the interpreter holds a deleted script open, so the process outlives the file) — the `DRIFT(exec)` line above the token says which of the two (`--surface` reads it from the process's own argv, `ps -eo pid=,command=` with `/proc/<pid>/cmdline` where the kernel keeps it, so it is what the box runs rather than what a record says). The pin record, the deploy record and the unit can all be correct — they describe copies at rest — while the tree that is running is one of those two states (#10114, #3194) | **restart the controller from the pinned tree** (`scripts/harness-up`); redeploying `$O` cannot clear it |
 | `harness=surface` | (b) on a copy — see the two shapes | a **copy at rest that this box carries** has drifted from `$REF`. The body NAMES the dir (`surface: <dir>`), and that dir may be `$O` or another one (`~/orchestrator`, a cell's copy, the running controller's). It appears in **two shapes**: `$O` has **no readable record** — then the token is `surface` for *any* surface drift, `$O`'s included, because `$O` is compared against `$REF` as a surface candidate even without a record (the body prints `identity: SKIPPED`; what that shape cannot answer is **record identity**, and an `$O` that drifted will be the dir named) — **or** `$O` answered all three questions and the drift is another dir | **reseed the dir the body names** (or move the box onto the pin: `scripts/harness-up`). Read the name: if it is `$O`, what a redeploy clears depends on WHICH comparison failed: a file that DIFFERS or is MISSING is overwritten/created, so a redeploy/`apply` clears it (and on the record-less shape it also makes the box identifiable) — but a file that **exists ONLY in that dir** (`DRIFT: <file> — exists ONLY in <dir>`) is NOT removed, because the deploy copies and does not prune (the "Precedence when more than one state is true" subsection below says so: "the deploy does not delete it"), so there the dir must be reseeded or the file removed by hand; if the named dir is another one, redeploying `$O` cannot clear it at all. ⛔ The comparison scope is **top-level `*.sh`** in the harness rel: a hand patch to a non-`.sh` file is invisible on the record-less shape and only the record form (`uncommitted-edit`) catches it |
@@ -1526,10 +1539,11 @@ bytes"). Every drift token below names a problem; `current` names the absence of
 ### Precedence when more than one state is true
 
 `executes:<dir>` › `uncommitted-edit:<file>` › `behind:`/`diverged:` › `incomplete:<file>` ›
-`source-dirty:<sha12>` › (`surface` | `payload-differs`). The token is ONE line, so the order is the
+`not-executable:<file>` › `source-dirty:<sha12>` › (`surface` | `payload-differs`). The token is ONE line, so the order is the
 answer to "which fact does an operator act on first": the code that is RUNNING cannot be matched to this
 repo at all (and no redeploy of `$O` reaches it), then unrecoverable bytes, then where the box sits, then
-code that is missing, then a record that cannot describe the box at all, then the last two.
+code that is missing, then **code that is present and cannot be run**, then a record that cannot describe
+the box at all, then the last two.
 
 **`surface` names a COMPARED COPY, and it has TWO shapes.** It is not a claim about `$O`'s *identity*, but it is not silent about `$O`'s bytes either: `$O` is in the surface candidate list whenever it is a harness dir, and with no readable record it has no exclusion, so an `$O` that drifted IS compared and IS named in the body. The token is printed
 on every **CONCLUDED** exit — 0 (`harness=current`) and 1 (a drift token) — so a clean run is
