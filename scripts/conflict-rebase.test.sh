@@ -37,6 +37,12 @@ ckn()  { if [ "$1" != "$2" ]; then ok "$3"; else bad "$3" "expected NOT '$2'"; f
 # with the haystack plainly containing the needle. Plain bash matching has no pipe
 # and no early exit, so it cannot flake.
 has()  { case "$1" in *"$2"*) ok "$3" ;; *) bad "$3" "missing: $2 | in: $(printf '%s' "$1" | head -c 200 | tr '\n' ' ')" ;; esac; }
+# ⛔ `ckn <artifact> <fragment>` IS A NO-OP, AND THREE ASSERTIONS WERE WRITTEN THAT WAY
+# (#4012 review P1/P2). `ckn` is `[ "$1" != "$2" ]`, so asserting that a MULTI-LINE artifact
+# (a whole comment body) or a generated file (always `<n> ADD <label>`) does not EQUAL a short
+# fragment is true for every possible behaviour of the code under test — it cannot fail, even
+# on the pre-fix tree. "Does not contain" needs its own predicate.
+hasnt() { case "$1" in *"$2"*) bad "$3" "unexpectedly contains: $2 | in: $(printf '%s' "$1" | head -c 200 | tr '\n' ' ')" ;; *) ok "$3" ;; esac; }
 
 TMP="$(mktemp -d /tmp/cr-suite-XXXXXX)"
 KEEP=0
@@ -728,7 +734,7 @@ print("|" + m.replay_fault(""))
 PY
 )"
 has "$OUT" "fatal: unable to auto-detect email address" "§22a a GLUED fatal is still found and named"
-ckn "$OUT" "Rebasing (1/27)fatal" "§22b …and the counter is not what gets reported"
+hasnt "$OUT" "Rebasing" "§22b …and the progress counter never reaches the report"
 has "$OUT" "|fatal: The pre-rebase hook refused" "§22c a plain fatal line is passed through"
 has "$OUT" "|no output" "§22d an empty blob says so instead of crashing"
 
@@ -766,20 +772,23 @@ add_generated_fixture() { # "$1" = mixed|pure
     git switch -q main
     printf 'ONE\n' >src.txt; printf 'gen:ONE\n' >gen.txt
     git add src.txt gen.txt && git commit -qm "main: add an authored source and its generated file"
-    git switch -q -c feat/gen
-    printf 'gen:ONE-v2\n' >gen.txt && git commit -qam "gen: regenerate for v2"
     if [ "${1:-pure}" = "mixed" ]; then
-      # ⛔ THE MIXED CASE IS CRITERION 4: one commit conflicts on the derived file AND on
-      # an AUTHORED one. Resolving the derived half would publish a tree in which the
-      # authored change was silently dropped — so the whole commit must be refused.
+      # ⛔ ONE COMMIT, BOTH FILES (#4012 review P2). The first version of this fixture put the
+      # derived change in an EARLIER commit, so the two conflicts stopped the rebase in two
+      # DIFFERENT rounds and the refusal only ever saw the authored path — which left §23m true
+      # for every possible behaviour of the code under test. Branched from main BEFORE main's own
+      # rewrite, so the single commit really does carry both, which is exactly the property
+      # criterion 4 names.
       git switch -q -c feat/gen-mixed
-      printf 'gen:ONE-v2\n' >gen.txt; printf 'red\nMIX-conflict\nblue\n' >c.txt
-      git commit -qam "mixed: regenerate + author a change"
+      printf 'gen:ONE-v3\n' >gen.txt; printf 'red\nMIX-conflict\nblue\n' >c.txt
+      git commit -qam "mixed: regenerate a derived file AND author a change, in one commit"
       git switch -q main
       printf 'gen:ONE-main\n' >gen.txt; printf 'red\nMIX-main\nblue\n' >c.txt
       git commit -qam "main: regenerate and author the same lines"
       git push -q origin main feat/gen-mixed
     else
+      git switch -q -c feat/gen
+      printf 'gen:ONE-v2\n' >gen.txt && git commit -qam "gen: regenerate for v2"
       git switch -q main
       printf 'gen:ONE-main\n' >gen.txt && git commit -qam "main: regenerate gen elsewhere"
       git push -q origin main feat/gen
@@ -805,7 +814,7 @@ has "$(cat "$TMP/fake/comment-1501.md" 2>/dev/null || echo)" "REGENERATED, not h
    "§23f the comment says what it did"
 has "$(cat "$TMP/fake/comment-1501.md" 2>/dev/null || echo)" "$GEN cut" \
    "§23g …and names the exact generator a reader can run"
-ckn "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "needs-human-conflict" \
+ckn "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "1501 ADD needs-human-conflict" \
    "§23h a regenerated conflict is NOT labelled needs-human-conflict"
 
 # ── (b) criterion 4: a MIXED conflict is refused, so the authored change is never dropped ──
@@ -819,11 +828,11 @@ has "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "REFUSED" \
    "§23k …it is refused, not silently half-resolved"
 has "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "c.txt" \
    "§23l …and the refusal names the AUTHORED path the human must resolve"
-ckn "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "gen.txt," \
+hasnt "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "gen.txt" \
    "§23m …and does not blame the derived file it could have regenerated"
 ck "$(git -C "$TMP/origin.git" grep -c 'MIX-main' feat/gen-mixed -- c.txt || echo 0)" "0" \
    "§23n the authored change was not dropped in place of a resolution"
-ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE-v2' feat/gen-mixed -- gen.txt || echo 0)" "feat/gen-mixed:gen.txt:1" \
+ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE-v3' feat/gen-mixed -- gen.txt || echo 0)" "feat/gen-mixed:gen.txt:1" \
    "§23o the mixed branch's DERIVED file is untouched too (nothing half-resolved)"
 has "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "1502 ADD needs-human-conflict" \
    "§23o2 a MIXED conflict gets the label a human needs"
@@ -877,6 +886,21 @@ PY
 has "$OUT" "pin: None" "§24a the conflicted-pin path is AUTHORED for this bot (its --cut cannot parse it)"
 has "$OUT" "lock: node scripts/check-workflow-lock.mjs --update-lock" "§24b …while the region digest IS declared"
 has "$OUT" "authored: None" "§24c …and ordinary source is never declared"
+
+# ── (f) BOTH replay invocations carry the SAME guards (#4012 review, P1) ──
+# The replay is started once and RESUMED after each regeneration, and `-c` is a per-process
+# override — so a resume that dropped them would read AMBIENT `rerere.*`/`rebase.autoSquash` for
+# the rest of the replay. That is the invariant the module header states and the one an ambient
+# `rerere.enabled/autoUpdate` pair defeats: a recorded resolution is applied during a later pick,
+# the pick completes with no conflict stop, and the resume returns 0 over a tree carrying a
+# content decision a robot made. The guards are therefore ONE list, asserted structurally — a
+# behavioural test cannot see it, because a clean ambient config is the benign case.
+echo "§25 the replay's guards are one list, used by the start AND by the resume"
+has "$(cat "$BOT")" "REPLAY_GUARDS = [" "§25a the guards are one declared list"
+ck "$(grep -c '\*REPLAY_GUARDS' "$BOT")" "2" "§25b both invocations (start + resume) use it"
+ck "$(grep -oE '\"-c\", \"(rerere|rebase)\.' "$BOT" | grep -c .)" "3" \
+   "§25c …and no invocation hardcodes a guard, so the two cannot drift apart again"
+has "$(cat "$BOT")" '"--continue" if staged else "--skip"' "§25d the resume is the mixed-shape call (continue or skip)"
 
 # ── summary ─────────────────────────────────────────────────────────────────
 printf '\n%s\n' "──────────────────────────────────────────"

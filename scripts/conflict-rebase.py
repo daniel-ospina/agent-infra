@@ -213,9 +213,26 @@ GENERATED_FILES = (
 # a `--cut` that does not depend on the file it rewrites — and that is guarded code (it is the
 # pin that makes a sanctioned script's byte-identity unforgeable), so it is not changed here.
 
-# Bounded so a generator that keeps re-conflicting cannot hold a cap slot forever. Each round
+# Bound so a generator that keeps re-conflicting cannot hold a cap slot forever. Each round
 # resolves one stopped commit, so this is generous for a real replay and finite for a loop.
 MAX_REGENERATE_ROUNDS = 25
+
+# ⛔ THE REPLAY'S GUARDS ARE ONE LIST, BECAUSE THERE ARE NOW TWO INVOCATIONS (#4012 review, P1).
+# `git rebase` is started once and then RESUMED (`--continue` / `--skip`) after each regeneration,
+# and each resume is a NEW PROCESS: `-c` is a per-process override, so a resume that did not
+# repeat them would read AMBIENT config for the rest of the replay. That is the exact thing the
+# module header forbids ("relying on the ambient config being off is not a guarantee, it is a
+# hope"): an ambient `rerere.enabled`/`rerere.autoUpdate` pair lets a RECORDED resolution be
+# applied during a later pick, the pick completes with no conflict stop, and a resume that
+# returned 0 would let the bot push a tree carrying a content decision a robot made.
+# `rebase.autoSquash=false` was set on the first call for the same reason and was being dropped
+# by the resume too (an ambient `true` lets a later fixup be squashed by the continued replay).
+# ⛔ `--no-rerere-autoupdate` is NOT in this list: git 2.43 REJECTS it on `--continue` (measured —
+# `usage: git rebase …` and no rebase state is touched), so it can only ride the first invocation.
+# The config arm is the one that must hold everywhere, and `rerere.enabled=false` makes rerere
+# inert on its own — the flag was always the belt to that braces.
+REPLAY_GUARDS = ["-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
+                 "-c", "rebase.autoSquash=false"]
 
 
 _GENERATED_CACHE: tuple[dict, ...] | None = None
@@ -227,10 +244,16 @@ def _generated() -> tuple[dict, ...]:
     The seam exists so this file's resolution arm can be driven hermetically by its own
     suite (a fixture generator that writes a fixture file) and so another repo can declare
     its own generators without forking. It is APPEND-ONLY on purpose: it cannot REMOVE a
-    built-in, so a stray env var can never make an authored file look derived. A seam file
-    that cannot be read is `Unreadable` — never silently ignored, because "the registry I
-    declared did not load" reads exactly like "this file is not generated", and that
-    difference is a pushed tree versus a refusal.
+    built-in entry, so a stray env var can never DISABLE the protections above. ⛔ BUT
+    APPEND-ONLY IS NOT THE SAFETY PROPERTY — a seam entry can still ADD an arbitrary path with
+    an arbitrary `cmd`/`verify`, i.e. it can declare an authored file derived (measured
+    correction, #4012 review P2). What makes a regeneration safe is (i) the result must pass
+    that entry's own check IN THE REBASE WORKTREE before it is staged, and (ii) ONE authored
+    path refuses the whole commit. The seam is therefore treated as operator-controlled input,
+    exactly like the unit's `CONFLICT_REBASE_STATE`/`CHECKOUT` exports, and not as a fence.
+    A seam file that cannot be read is `Unreadable` — never silently ignored, because "the
+    registry I declared did not load" reads exactly like "this file is not generated", and
+    that difference is a pushed tree versus a refusal.
     """
     global _GENERATED_CACHE
     if _GENERATED_CACHE is None:
@@ -914,9 +937,7 @@ def _rebase_pr(scratch: Path, pr: dict, args) -> dict:
     regenerated: list[tuple[str, str]] = []
     try:
         git(scratch, "worktree", "add", "--detach", str(wt), head)
-        rb = run(["git", *IDENT_ARGS,
-                  "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
-                  "-c", "rebase.autoSquash=false", "-C", str(wt),
+        rb = run(["git", *IDENT_ARGS, *REPLAY_GUARDS, "-C", str(wt),
                   "rebase", "--no-rerere-autoupdate", "--onto", "refs/remotes/origin/main", mb])
         # ⛔ THE REPLAY IS A LOOP, NOT ONE SHOT (#4012). A conflict on a GENERATED file is
         # resolved by REGENERATING it from the tree being replayed and continuing; the next
@@ -986,7 +1007,7 @@ def _rebase_pr(scratch: Path, pr: dict, args) -> dict:
                 raise
             # An empty result is the legitimate shrink: the replayed tree already carries it.
             staged = run(["git", "-C", str(wt), "diff", "--cached", "--quiet", "HEAD"]).returncode != 0
-            rb = run(["git", *IDENT_ARGS, "-C", str(wt), "rebase",
+            rb = run(["git", *IDENT_ARGS, *REPLAY_GUARDS, "-C", str(wt), "rebase",
                       "--continue" if staged else "--skip"],
                      env={**os.environ, "GIT_EDITOR": "true"})
         new_head = git(wt, "rev-parse", "HEAD").strip()
