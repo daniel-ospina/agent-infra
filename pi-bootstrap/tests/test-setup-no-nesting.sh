@@ -2971,6 +2971,18 @@ else
       echo "ok: a failed install leaves the previous copy byte-identical AND executable, and does not write through it"
     fi
   fi
+  # ARM 4: a DIRECTORY at the destination is REFUSED, not installed into. `mv -f file existing-dir`
+  # MOVES INTO it and exits 0, so without the helper's guard this path reports SUCCESS while nothing
+  # landed at the path the array declared — the "a farm that reports success over a file it did not
+  # deliver" class (#1931/#1924), and one a `cp -f` implementation cannot fail either.
+  mkdir -p "$ATOM_DIR/dirgate.sh"
+  if farm_install "$TMP/atomic-src.sh" "$ATOM_DIR/dirgate.sh" 2>/dev/null; then
+    fail "farm_install reported SUCCESS with a DIRECTORY at the destination ($ATOM_DIR/dirgate.sh) — 'mv -f file dir' moves the file INTO it and exits 0, so the leg would count a copy it never delivered (#3991)"
+  elif [ -e "$ATOM_DIR/dirgate.sh/atomic-src.sh" ]; then
+    fail "farm_install moved the source INTO the destination directory ($ATOM_DIR/dirgate.sh/atomic-src.sh) instead of refusing — the declared path stays empty while the leg reports a failure for the wrong reason"
+  else
+    echo "ok: a DIRECTORY at the destination is REFUSED, never silently moved into"
+  fi
 fi
 
 # --- done -----------------------------------------------------------------
