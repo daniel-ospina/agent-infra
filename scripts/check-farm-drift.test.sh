@@ -536,7 +536,12 @@ printf 'scripts/alpha.py\nscripts/beta.sh\nscripts/fleet/gamma.py\n' > "$C30/sta
 printf 'half a copy\n' > "$C30/scripts/alpha.py.tmp.4242"
 run "$C30/scripts"
 ck $([ "$RC" -eq 0 ] && echo 0 || echo 1) 'an interrupted install leaving NAME.tmp.PID scratch is not graded UNSOURCED (rc='"$RC"')'
-ck $(grep -q 'alpha.py.tmp.4242' "$OUT" && grep 'alpha.py.tmp.4242' "$OUT" | grep -q 'LOCAL (scratch)' && echo 0 || echo 1) '...it is reported as LOCAL (scratch) rather than silently dropped'
+# no pipe into `grep -q` (scripts/check-no-sigpipe-grep.sh, #841/#864): capture, then test in the shell.
+c30_row="$(grep 'alpha.py.tmp.4242' "$OUT" || true)"
+case "$c30_row" in
+  *'LOCAL (scratch)'*) ck 0 '...it is reported as LOCAL (scratch) rather than silently dropped' ;;
+  *) ck 1 '...it is reported as LOCAL (scratch) rather than silently dropped (got: '"$c30_row"')' ;;
+esac
 ck $(grep -q 'alpha.py.tmp.4242' "$ERR" && echo 1 || echo 0) '...and it is never reported as drift'
 rm -f "$C30/scripts/alpha.py.tmp.4242"
 printf 'not the scratch shape\n' > "$C30/scripts/beta.sh.tmp"
@@ -558,7 +563,11 @@ printf 'scripts/alpha.py\nscripts/beta.sh\nscripts/fleet/gamma.py\nscripts/shado
 printf '#!/bin/bash\necho shadow-STALE\n' > "$C30/scripts/shadow.tmp.7"
 run "$C30/scripts"
 ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) '...and a REAL repo file named NAME.tmp.PID is still graded, not exempted (rc='"$RC"')'
-ck $(grep -q 'shadow.tmp.7' "$ERR" && grep 'shadow.tmp.7' "$ERR" | grep -q 'STALE' && echo 0 || echo 1) '...its stale bytes are reported as STALE'
+c30_stale="$(grep 'shadow.tmp.7' "$ERR" || true)"
+case "$c30_stale" in
+  *STALE*) ck 0 '...its stale bytes are reported as STALE' ;;
+  *) ck 1 '...its stale bytes are reported as STALE (got: '"$c30_stale"')' ;;
+esac
 
 
 echo ""
