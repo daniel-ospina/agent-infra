@@ -2569,6 +2569,51 @@ def t61_every_slot_unusable_is_loud():
             rc, out = cli(box, "--want", "3")
             check(rc == 3, f"a box that cannot grow must not exit 0 — got {rc}: {out[:400]}")
             check("verdict=action-failed" in out, f"and it says why: {out[:400]}")
+            # ⛔ AND THE PROMOTION MUST NOT OVERRIDE A CLASSIFIED STOP (review P2-2). A skip followed
+            # by a provisioner REFUSAL is the ordinary shape of "this pass could not grow" — the
+            # refusal is an ANSWER about capacity (its own verdict, both numbers in the notes) and it
+            # was already classified before this arm existed. Promoting the skip on top of it replaced
+            # `provisioner-refused`/`guard-conflict` with a generic `action-failed`, which is the
+            # exit-3 page over a lost race that P1-a removes, one layer up — and it also masked
+            # `unverified` and `starvation`. `stop_reason` is what keeps the two apart.
+            race_then_refusal = Box("slot-race-then-refusal")
+            try:
+                race_then_refusal.install("gh-runner-x64", "r-1")
+                race_then_refusal.alive([race_then_refusal.installs["gh-runner-x64"]])
+                race_then_refusal.pool(
+                    [("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])]
+                )
+                race_then_refusal.disk(36_864)  # fits=True: the refusal is a CONFLICT, not a failure
+                race_then_refusal.footprint({"gh-runner-x64": 2000})
+                _slot_provisioner(race_then_refusal, race=[2], ok=[])
+                # #3 answers with the pool's gate refusal (rc 2) instead of an install
+                with open(os.path.join(race_then_refusal.dir, "provisioner.sh")) as fh:
+                    prog = fh.read()
+                prog = prog.replace(
+                    'printf "unexpected index %s\\n" "$2" >&2',
+                    'printf "REFUSED add why=memory-floor 21G free against 44G needed\\n" >&2\n'
+                    "  exit 2",
+                )
+                race_then_refusal._write(
+                    os.path.join(race_then_refusal.dir, "provisioner.sh"), prog, 0o755
+                )
+                refusal = converge(race_then_refusal, nproc="8", want=3)
+                check(
+                    refusal.get("problem_kind") == "guard-conflict",
+                    "a skipped slot must not turn a later REFUSAL into a failure: the refusal keep"
+                    f"s its own channel — {refusal.get('problem_kind')!r}",
+                )
+                check(
+                    refusal["problems"] == [],
+                    "…and the skip must not be promoted on top of it: "
+                    f"{refusal['problems']}",
+                )
+                check(
+                    refusal["verdict"] == "guard-conflict",
+                    f"the classified verdict stands: {refusal['verdict']}",
+                )
+            finally:
+                race_then_refusal.destroy()
         finally:
             box.destroy()
 
@@ -2616,6 +2661,23 @@ def t62_cross_box_duplicate_is_flagged():
                 "it is report-only: nothing was changed, so it must not become a `problem` (that "
                 f"would mask `starvation`): {record['problems']}",
             )
+            # ⛔ THE SECOND DISCRIMINATOR: the pool says BUSY and the work is OURS — a local worker
+            # of this install is running. Nothing may be flagged: this is the box serving its own
+            # registration, which is the normal state of a busy runner, and the note's remedy
+            # ("retire or rename this copy") would be advice to kill a running job.
+            # ⛔ THIS ARM EXISTS BECAUSE THE FIXTURE COULD NOT EXPRESS IT (review P3-3): `Box` always
+            # sets `RUNNER_AUTOSCALE_BUSY_DIRS`, `_worker_alive` therefore answers from the seam, and
+            # no case ever wrote a NON-EMPTY one — so the `not _worker_alive(r)` term was unreachable
+            # here and a mutant dropping it stayed green.
+            box.busy([inst])
+            box.pool([("r-shared", "online", True, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            ours = converge(box, nproc="4", want=1, dry_run=True)
+            check(
+                ours.get("shared_registrations") == [],
+                "a BUSY registration this box IS serving must never be flagged — the worker term is "
+                f"half the discriminator: {ours.get('shared_registrations')}",
+            )
+            box.busy([])
             # ⛔ THE FALSE-POSITIVE ARM: online but IDLE, no local listener — an ordinary DEAD slot.
             # Flagging this would call a repair a duplicate, on every pass of every box.
             box.pool([("r-shared", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
@@ -5098,8 +5160,25 @@ MUTATIONS = [
         "reaches the next free index (agent-infra#4004 P1-b)",
     ),
     Mutation(
+        "T61",
+        '    if skipped and live < target and stop_reason == "budget":',
+        "    if skipped and live < target:  # MUTATION: the stop reason is ignored",
+        "the skip is promoted whatever stopped the pass, so a provisioner refusal, a guard conflict, "
+        "an `Unmeasurable` measurement or the memory reserve is overridden by a generic "
+        "`action-failed` — the exit-3 page over a lost race that P1-a removes, one layer up — and it "
+        "mutes `starvation`/`config-lost` on the way (review P2-2)",
+    ),
+    Mutation(
         "T62",
-        "        if entry is not None and entry.busy and r.name and not _worker_alive(r):",
+        "        if state == \"BUSY\" and entry is not None and entry.busy and r.name and not worker:",
+        "        if state == \"BUSY\" and entry is not None and entry.busy and r.name:  # MUTATION: no worker term",
+        "the `not worker` half of the discriminator is dropped, so a BUSY registration this box IS "
+        "serving is flagged as another box's — a positive claim from a negative measurement, and a "
+        "note that tells an operator to retire a copy while a job runs on it",
+    ),
+    Mutation(
+        "T62",
+        "        if state == \"BUSY\" and entry is not None and entry.busy and r.name and not worker:",
         "        if False:  # MUTATION: the cross-box duplicate is never flagged",
         "a registration two boxes share is served SILENTLY: the pass counts a job it is not running "
         "as this box's capacity — the measured cell-4 shape, where a busy registration served by "

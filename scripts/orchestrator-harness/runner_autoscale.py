@@ -3182,11 +3182,12 @@ def converge(
         #     runner the pool does not list at all — a listener that lost its broker connection
         #     can be executing while the API says nothing about it, and `--replace` would kill it.
         #  3. Only then the pool's own view.
+        worker = _worker_alive(r)
         if r.config_lost:
             state = "CONFIG-LOST"
         elif _repo_slug(r.repo) != _repo_slug(repo):
             state = "OTHER-REPO"
-        elif _worker_alive(r) or (entry is not None and entry.busy):
+        elif worker or (entry is not None and entry.busy):
             state = "BUSY"
         elif entry is None:
             state = "ORPHANED"
@@ -3209,7 +3210,17 @@ def converge(
         # says a JOB is executing: if no worker of THIS install is running, it is executing
         # somewhere else, under a name this install also carries. Reported, never repaired: the
         # registration is not ours to touch, and the destructive arms here take a name.
-        if entry is not None and entry.busy and r.name and not _worker_alive(r):
+        # ⛔ GATED ON `state == "BUSY"` AND NOT ON THE BARE CONDITION (review P2-1). `discover()`
+        # enumerates EVERY `<root>/gh-runner*` whatever repo it belongs to, while `read_pool(repo)` is
+        # ONE repo's pool — so an OTHER-REPO install keeps its `agentName` and `pool.get(name)` can be
+        # busy from a name COLLISION between the two repos (the default base name makes that
+        # structural on a multi-repo box). Asserting "two boxes share this registration" there would
+        # be false — different registrations, different repos — and the note it carries tells an
+        # operator to retire a copy of ANOTHER repo's LIVE runner, which is exactly what the
+        # OTHER-REPO branch above exists to prevent. `state == "BUSY"` is reached only after the
+        # CONFIG-LOST and OTHER-REPO arms, so it is the one place this fact can be true; `worker`
+        # false inside it means the busy flag came from the pool alone.
+        if state == "BUSY" and entry is not None and entry.busy and r.name and not worker:
             served_elsewhere.append(
                 {
                     "name": r.name,
@@ -3590,8 +3601,18 @@ def converge(
     # SLOT_SKIP_BUDGET, so a box whose whole numbering is wedged costs at most this many installer
     # calls before it stops and REPORTS (see the post-loop arm), never a runaway walk.
     skipped: list[int] = []
+    # ⛔ WHY THE FILL LOOP ENDED, because the promotion below must not guess (review P2-2). The
+    # loop exits for several legitimate reasons that are ALREADY classified — a provisioner refusal,
+    # a guard conflict, an action failure, the memory/disk reserve, an `Unmeasurable` measurement,
+    # `--dry-run`, or reaching the target — and a `problem` added on top of any of them would
+    # OVERRIDE it (`problems` is the first branch of the verdict chain): a refusal (exit 0) or a
+    # conflict (exit 3, both numbers in the notes) or `unverified` (unmeasurable, exit 2) would be
+    # replaced by a generic action-failure, and `problems` also sits above `starvation` and
+    # `config-lost`. So the reason is recorded at every exit, and the post-loop arm reads it.
+    stop_reason = "budget"
     for _step in range(max(1, target) + SLOT_SKIP_BUDGET):
         if stop_pass or live >= target or disk_free_mb is None:
+            stop_reason = "target" if live >= target else "stopped"
             break
         try:
             before = mem_available_mb(meminfo)
@@ -3603,12 +3624,14 @@ def converge(
                 f"stopped: memory could not be read mid-pass ({exc}) — the actions above were "
                 "already performed; nothing further was done"
             )
+            stop_reason = "measure"
             break
         if before - MEM_PER_RUNNER_MB < MEM_RESERVE_MB:
             record["notes"].append(
                 f"stop: mem_available_mb={before} - per_runner_mb={MEM_PER_RUNNER_MB} "
                 f"< reserve_mb={MEM_RESERVE_MB} — one more would starve a shard"
             )
+            stop_reason = "memory-reserve"
             break
         # ⛔ THE DISK IS RE-MEASURED EVERY STEP, like the memory above. The pass bounds its ceiling
         # ONCE, so a fill that installs two runners would otherwise budget both against the space it
@@ -3633,6 +3656,7 @@ def converge(
                 f"stop: the disk free space could not be re-read mid-pass ({exc}) — nothing further "
                 "was added, and this pass cannot report the box as converged"
             )
+            stop_reason = "measure"
             break
         index = _next_free_slot(root, skip=frozenset(skipped))
         if dry_run:
@@ -3644,6 +3668,7 @@ def converge(
                 f"would ask the provisioner for install slot #{index} (mem_available_mb={before}); "
                 "how many listeners that yields is MEASURED by a real pass, not predicted here"
             )
+            stop_reason = "dry-run"
             break
         try:
             note = provision(index, repo=repo, root=root)
@@ -3670,6 +3695,7 @@ def converge(
                     "about whether capacity can be added here, and a human must decide which number "
                     "is wrong (#9672)"
                 )
+                stop_reason = "guard-conflict"
                 break
             record["problem_kind"] = "refusal"
             record["notes"].append(
@@ -3679,6 +3705,7 @@ def converge(
                 "was left on the table HERE; the refusal's own reason is whatever it quoted, which "
                 "this tool does not interpret. Reported as an answer, not a failure (#9672)"
             )
+            stop_reason = "refusal"
             break
         except SlotUnusable as exc:
             # ⛔ NEITHER AN ANSWER NOR A FAILURE, AND NEITHER `break` NOR A `problem_kind`
@@ -3701,6 +3728,7 @@ def converge(
         except ActionFailed as exc:
             record["problems"].append(str(exc))
             record["actions"].append(f"add runner (slot #{index}) FAILED: {exc}")
+            stop_reason = "action-failed"
             break
         try:
             after = mem_available_mb(meminfo)
@@ -3713,6 +3741,7 @@ def converge(
                 "stopped: the box could not be re-measured after an install — the action above "
                 "already happened; nothing further was done"
             )
+            stop_reason = "measure"
             break
         previous_live, live = live, _live(measured)
         record["actions"].append(
@@ -3741,6 +3770,7 @@ def converge(
                     "another call would repeat the same result — stopping instead of reporting a "
                     "convergence that did not happen"
                 )
+            stop_reason = "no-listener"
             break
         installs_seen = len(measured)
         if after < MEM_RESERVE_MB:
@@ -3748,22 +3778,30 @@ def converge(
                 f"stop: mem_available_mb={after} is below reserve_mb={MEM_RESERVE_MB} after this "
                 "install — the box is at its memory limit"
             )
+            stop_reason = "memory-reserve"
             break
 
     # ⛔ A BOX THAT CANNOT GROW AT ALL IS LOUD; ONE THAT GREW PAST A BAD INDEX IS NOT (agent-infra#4004).
     # A skipped slot is reported in `slots_unusable`/`notes` on every pass, but it is promoted to
-    # `problems` (verdict `action-failed`, exit 3) only when the pass ends BELOW target with slots it
-    # could not fill — i.e. when those unusable indexes are what stands between this box and its
-    # target. Without this arm the wedge would read `under-target`/exit 0: a box that can never
-    # provision reporting a clean pass, the exact false-green class this file exists to close. Without
-    # the OTHER half (the skip itself) it would be a permanent page over one leftover directory.
-    if skipped and live < target:
+    # `problems` (verdict `action-failed`, exit 3) only when the SKIP WALK is what ended the pass below
+    # target — `stop_reason == "budget"`, i.e. the loop ran out of steps with no other exit taken.
+    # ⛔ THE `stop_reason` TERM IS NOT DECORATION (review P2-2). With only `skipped and live < target`,
+    # a pass that skipped a RACED index and then correctly stopped on a provisioner refusal, a guard
+    # conflict, a memory reserve or an `Unmeasurable` measurement was promoted to `action-failed` — the
+    # exit-3 page over a lost race that P1-a exists to remove, one layer up, and it also masked
+    # `unverified` and `starvation`. The skipped slots are still named in `slots_unusable`/`notes` in
+    # that case; they are simply not the reason the box is short.
+    # ⛔ AND THE WORDING MUST NOT CLAIM PERSISTENCE: only the leftover-directory sub-state persists. A
+    # raced index holds a PEER's registration and heals by itself, so the note points at
+    # `slots_unusable[*].why` for the provisioner's own words about each index instead of asserting one.
+    if skipped and live < target and stop_reason == "budget":
         record["problems"].append(
-            f"{len(skipped)} provisioner slot(s) could not be filled this pass "
-            f"({', '.join('#' + str(i) for i in skipped)}) and the box is still BELOW its target "
-            f"(live={live}, target={target}): each of those indexes is held by a path this tool did "
-            "not create and will never delete, so no pass can fill it. A path that persists across "
-            "passes needs a human; see `slots_unusable` for the provisioner's own words about each"
+            f"the pass spent all {len(skipped) + 0} of its usable steps on slots the provisioner "
+            f"refused to fill ({', '.join('#' + str(i) for i in skipped)}) and the box is still "
+            f"BELOW its target (live={live}, target={target}): every index it was allowed to ask for "
+            "came back unusable, so this pass could not grow the box. Each refusal's own reason is in "
+            "`slots_unusable` — a peer's in-flight add heals by itself, a leftover path or a dangling "
+            ".runner` link needs a human (this tool never deletes a path it did not create)"
         )
 
     # 7. VERDICT --------------------------------------------------------------------------------
