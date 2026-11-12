@@ -1300,24 +1300,35 @@ export function decideM2({
 export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey, stateOpCount = 1, isBare = false, hiddenStateSubst = false, renameDstExists = false, ownedBranches }) {
   if (!branchOp) return null;
   const op = branchOp.op;
-  // #594 Finding 1: `git <word>` where <word> is not a builtin and not a
-  // statically-visible alias — git resolves it as a persisted-config alias or
-  // as the external `git-<word>` command, expanding it inside its own process
-  // after every gate has decided. Nothing about it can be verified here, so a
-  // shared main checkout refuses it (fail closed; a worktree-scoped command is
-  // exempted by the caller before this point, so ordinary work is unaffected).
+  // #594 Finding 1: `git <word>` where <word> is not a builtin, not an
+  // installed `git-<word>` command, and not a statically-visible alias — git
+  // resolves it as a persisted-config alias, expanding it inside its own process
+  // after every gate has decided. Nothing about it can be verified here, so the
+  // gate refuses it (fail closed).
+  // ⛔ THIS CLASS IS NOT WORKTREE-EXEMPT, so it must not be described as if it
+  // were: `index.ts` deliberately WITHHOLDS the worktree exemption for
+  // `alias-opaque` (the hidden command may carry `-C <hub>` / `--git-dir=<hub>`,
+  // so the resolved worktree proves nothing about where git writes). It is
+  // therefore refused in a LINKED WORKTREE TOO — the class cannot establish the
+  // locality the exemption rests on. (An installed `git-<word>` is NOT this
+  // class: it outranks an alias in git's lookup, so no alias can win for it and
+  // calling it opaque refused `git lfs pull` / `git submodule …` for a shadowing
+  // that cannot happen.)
   if (op === "alias-opaque") {
     return {
       block: true,
       reason: [
-        `⛔ git alias / unknown-verb invocation blocked in the MAIN checkout (#594).`,
-        `   Why: "git ${branchOp.name ?? "?"}" is not a git command the guard knows, so git`,
-        "   resolves it as an ALIAS (persisted config) or as the external `git-" +
-          String(branchOp.name ?? "?") + "` command. Either way the real command is",
-        `   expanded inside git's own process, after every gate has decided — a`,
-        `   shared main checkout cannot be protected against a command nobody can read.`,
-        `   → Spell the underlying git command out, or run it in an isolated worktree`,
-        `     (using-git-worktrees skill), where branch state is local to that worktree.`,
+        `⛔ git alias / unknown-verb invocation blocked (#594).`,
+        `   Why: "git ${branchOp.name ?? "?"}" is not a git command the guard knows and no`,
+        "   `git-" + String(branchOp.name ?? "?") + "` command is installed, so git resolves it as an",
+        "   ALIAS from persisted config. git expands an alias inside its own process,",
+        `   after every gate has decided — a shared checkout cannot be protected`,
+        `   against a command nobody can read.`,
+        `   → Spell the underlying git command out, or repeat it as a VISIBLE`,
+        `     \`-c alias.<name>=…\` in the same command so the guard can read it.`,
+        `   (Working in a linked worktree does NOT exempt this: the hidden command may`,
+        `   carry \`-C <hub>\`, so it cannot prove where git writes. An INSTALLED`,
+        `   \`git-<name>\` command is a different case and is not refused.)`,
       ].join("\n"),
     };
   }

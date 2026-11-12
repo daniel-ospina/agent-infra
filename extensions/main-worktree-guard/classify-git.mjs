@@ -10,7 +10,7 @@
 import { execSync, execFileSync } from "node:child_process";
 import { resolve, join, dirname, relative, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync } from "node:fs";
+import { existsSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync, accessSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 //
@@ -2383,7 +2383,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
  * {verb, args} are unchanged for existing consumers.
  * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, indexFileHint: string|null, objDirsHint: string|null, configOverrides: string[], vars: object}>}
  */
-export function allGitInvocations(command, seedVars = {}) {
+export function allGitInvocations(command, seedVars = {}, opts = {}) {
   const invocations = [];
   _walkShell(command, {
     onGitEnd: (inv) => invocations.push(inv),
@@ -2394,6 +2394,15 @@ export function allGitInvocations(command, seedVars = {}) {
   // command that runs. Expansion happens HERE, once, so every consumer of the
   // walk (the detailed classifier, the discard family, the script arms) sees
   // the same resolved command.
+  // ⛔ `expandAliases: false` returns the SPELLED walk. Exactly one consumer
+  // needs it: `_aliasValueMutates` must find the CALL SITE by its alias NAME
+  // (`git -c alias.x=… x -Mq victim main`) to read the args the user typed after
+  // the alias. Expansion rewrites that invocation's verb to `x`'s target and
+  // PREPENDS the alias value's own words to its args, so a name-keyed search over
+  // the expanded list finds nothing and the call-site args silently vanish —
+  // measured: `hiddenStateMutation` went FALSE for a force-rename, i.e. the
+  // merge of the alias expansion with #607's arg-aware judging lost a detection.
+  if (opts && opts.expandAliases === false) return invocations;
   return _expandAliasInvocations(invocations);
 }
 
@@ -4414,6 +4423,90 @@ function _splitAliasValue(value) {
 }
 
 /**
+ * #594 P1 (measured FALSE REFUSAL): could an ALIAS win `git <verb>`'s lookup at
+ * all?
+ *
+ * git's precedence, MEASURED (git 2.50.1, `git --list-cmds=builtins`, 144 names),
+ * is **builtin > `git-<verb>` on the exec path > alias**: once an executable
+ * `git-<verb>` is resolvable the alias is NEVER consulted, whatever persisted
+ * config says. So for every INSTALLED git extension — `git-lfs`, `git-submodule`,
+ * `git-subtree`, `git-flow`, `git-annex`, `git-remote-*` — an alias cannot shadow
+ * the command, and calling the invocation `aliasOpaque` refuses a command nobody
+ * can read but nobody can alias. That net covered a far larger class than the
+ * persisted-alias cost it was written for: `git lfs pull` and a post-clone
+ * `git submodule update --init --recursive` were refused in EVERY checkout.
+ *
+ * The lookup mirrors git's own search: `GIT_EXEC_PATH` — where `git-submodule`,
+ * `git-subtree` and a `git-lfs` installed with git actually live, and which git
+ * PREPENDS to its own `PATH` before resolving `git-<cmd>` (measured on this box:
+ * `git submodule` resolves to `/Library/Developer/CommandLineTools/usr/libexec/
+ * git-core/git-submodule`, a directory that is on NO shell `PATH`) — then `PATH`.
+ * `X_OK`, not mere existence — a non-executable `git-foo` never wins a lookup, so
+ * it must not buy an exemption.
+ *
+ * ⛔ FAIL-CLOSED ON AN UNREADABLE PATH — an error here returns `false`, which
+ * leaves the verb `aliasOpaque` (the over-block), never a silent admission. The
+ * inverse direction would be a bypass: a `PATH` the guard cannot read must not be
+ * allowed to buy an alias exemption.
+ * @param {string} verb the spelled subcommand word
+ * @returns {boolean} true iff a `git-<verb>` executable is resolvable
+ */
+const _gitExternalPathCache = new Map();
+// The exec-path list is probed ONCE per process: it needs a `git` call, and it
+// cannot change inside a session (a `GIT_EXEC_PATH` prefix on ONE command is the
+// command's own env, not the guard's — and not reading it is the fail-closed
+// direction, since the verb then stays opaque).
+let _gitExecPathDirsCache;
+function _gitExecPathDirs() {
+  if (_gitExecPathDirsCache !== undefined) return _gitExecPathDirsCache;
+  const dirs = [];
+  const fromEnv = String(process.env.GIT_EXEC_PATH ?? "");
+  if (fromEnv.length > 0) dirs.push(...fromEnv.split(":"));
+  try {
+    const probed = execFileSync("git", ["--exec-path"], {
+      encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (probed.length > 0) dirs.push(probed);
+  } catch {
+    // No usable git: the PATH half of the search still stands.
+  }
+  _gitExecPathDirsCache = dirs.filter((d) => d.length > 0);
+  return _gitExecPathDirsCache;
+}
+function _gitExternalOnPath(verb) {
+  const name = String(verb ?? "");
+  // git looks up `git-<word>` as a FILE NAME: a word carrying a separator, a
+  // leading `-`, or shell syntax cannot name one, so it is never external.
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) return false;
+  const searchDirs = [..._gitExecPathDirs(), ...String(process.env.PATH ?? "").split(":")];
+  const cacheKey = searchDirs.join(":") + "\u0000" + name;
+  const cached = _gitExternalPathCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  let found = false;
+  try {
+    for (const dir of searchDirs) {
+      if (dir.length === 0) continue;
+      // git appends the platform's executable suffix on Windows; probing both
+      // costs nothing and keeps the answer right off this box too.
+      for (const candidate of [`git-${name}`, `git-${name}.exe`]) {
+        try {
+          accessSync(join(dir, candidate), fsConstants.X_OK);
+          found = true;
+          break;
+        } catch { /* not in this directory */ }
+      }
+      if (found) break;
+    }
+  } catch {
+    return false; // unreadable PATH/env → stay fail-closed (verb stays opaque)
+  }
+  // Bounded: a long-lived session sees a handful of distinct (PATH, verb) pairs.
+  if (_gitExternalPathCache.size > 512) _gitExternalPathCache.clear();
+  _gitExternalPathCache.set(cacheKey, found);
+  return found;
+}
+
+/**
  * #594: follow the ALIAS indirection layer, which git applies inside its own
  * process and the token walk therefore cannot see.
  *
@@ -4421,11 +4514,14 @@ function _splitAliasValue(value) {
  * EXPANDED into the command it names (bounded depth, cycle-safe), so the rest
  * of the classifier — the legacy verdict patterns, branchState/stateMutations,
  * stateOpCount, the hub-recovery allowlist — sees the real verb and args. Every
- * invocation whose verb is NEITHER a builtin NOR a visible alias is marked
- * `aliasOpaque`: it may be a persisted-config alias, a `git-foo` external
- * subcommand, or a typo, and in all three cases the guard cannot know what it
- * runs (fail closed — the M3 gate refuses it in a shared main checkout, and the
- * command can never launder a benign-force carve-out).
+ * invocation whose verb is NEITHER a builtin NOR a visible alias NOR an
+ * installed `git-<verb>` command is marked `aliasOpaque`: it may be a
+ * persisted-config alias or a typo, and in both cases the guard cannot know what
+ * it runs (fail closed — the M3 gate refuses it, and the command can never
+ * launder a benign-force carve-out). An INSTALLED `git-<verb>` is deliberately
+ * NOT opaque: it outranks the alias in git's lookup, so no alias can win for it
+ * (P1 — refusing those refused `git lfs pull` / `git submodule …` in every
+ * checkout, for a shadowing that cannot happen).
  *
  * NAMED RESIDUAL: a visible alias is expanded even though an INSTALLED
  * `git-<name>` would win over it (git's measured precedence is builtin >
@@ -4441,15 +4537,31 @@ function _expandAliasInvocations(invocations) {
   const expandOne = (inv, depth, res) => {
     const verb = inv.verb;
     if (!verb) return inv;
+    // ⛔ THE CLASSIFIER'S OWN SENTINEL IS NOT A SPELLED VERB (P1, second
+    // measured shape). `__unverifiable__` is emitted by `_walkShell` when the
+    // command word is a multiword `$VAR` (`G="git log --oneline"; $G`) — it is a
+    // MARKER that the word was not visible, never a name git receives. git can
+    // therefore never consult `alias.__unverifiable__` for it, and the #607 class
+    // is a RECORDED decision that these are ADMITTED (read-only `$VAR` command
+    // words are ordinary lane traffic; the conservative flags refused them with a
+    // remedy the agent had already followed — see test-module-load.mjs's
+    // "`$VAR` command word holding a read is ALLOWED" rows, and
+    // `_hasHiddenStateSubst`, which treats the sentinel fail-closed on its own).
+    // Inheriting `aliasOpaque` here re-refused that whole class through a rule
+    // about alias LOOKUP, which is not what the sentinel is about. Passed through
+    // unchanged, exactly as before #594.
+    if (verb === "__unverifiable__") return inv;
     // ⛔ AN UNREADABLE `GIT_CONFIG_PARAMETERS` MAKES EVERY ALIAS-RESOLVABLE VERB
     // OPAQUE (review round 10). The channel is parsed LAST, so a definition in it
     // shadows whatever a lower-precedence source said — and that includes the
     // expansion THIS function would otherwise make. Fail-closed scope: a verb an
     // alias can actually win for is (a) anything that is not a builtin, and
-    // (b) a DEPRECATED builtin, whose alias git consults first. A plain builtin
-    // is unaffected (git's precedence is builtin > alias), so it is classified
-    // as before rather than over-blocked.
-    const aliasMayApply = !GIT_BUILTIN_COMMANDS.has(verb) || GIT_ALIAS_PRECEDES_BUILTIN.has(verb);
+    // (b) a DEPRECATED builtin, whose alias git consults first — and NOT an
+    // installed `git-<verb>`, which outranks the alias outright (P1). A plain
+    // builtin is unaffected (git's precedence is builtin > alias), so it is
+    // classified as before rather than over-blocked.
+    const aliasMayApply = GIT_ALIAS_PRECEDES_BUILTIN.has(verb) ||
+      (!GIT_BUILTIN_COMMANDS.has(verb) && !_gitExternalOnPath(verb));
     if (res.unreadableAliases && aliasMayApply) return { ...inv, aliasName: verb, aliasOpaque: true };
     // ⛔ THE LOOKUP IS CASE-INSENSITIVE, because git's alias lookup keys the
     // command name into the config key `alias.<cmd>`, whose name part is
@@ -4471,7 +4583,18 @@ function _expandAliasInvocations(invocations) {
         aliasName: verb,
       }, depth + 1, res);
     }
-    if (!GIT_BUILTIN_COMMANDS.has(verb)) return { ...inv, aliasName: verb, aliasOpaque: true };
+    // ⛔ P1 (measured FALSE REFUSAL): the last clause is NOT "not a builtin ⇒
+    // opaque". An INSTALLED `git-<verb>` sits ABOVE the alias in git's lookup, so
+    // for a resident extension (`git-lfs`, `git-submodule`, `git-subtree`,
+    // `git-flow`, `git-annex`, every `git-remote-*`) NO alias can ever win and
+    // this invocation is not alias-opaque — it is an external command, which is
+    // what it was before #594 and is what `git <verb>` actually runs. The
+    // persisted-alias residual below is unchanged: with no `git-<verb>` on the
+    // exec path an unreadable name stays opaque and still fails closed.
+    if (!GIT_BUILTIN_COMMANDS.has(verb)) {
+      if (_gitExternalOnPath(verb)) return inv;
+      return { ...inv, aliasName: verb, aliasOpaque: true };
+    }
     return inv;
   };
   // ⛔ ONLY THIS INVOCATION'S OWN, PROCESS-LOCAL DEFINITIONS ARE EXPANDED, and
@@ -7015,7 +7138,12 @@ function _aliasValueMutates(val, aliasName, source) {
   if (!BRANCH_STATE_VERBS.has(verb)) return false; // incl. "git" — scan() owns those
   let callArgs = [];
   if (aliasName && source) {
-    const inv = allGitInvocations(String(source)).find((iv) => iv.verb === aliasName);
+    // ⛔ THE SPELLED WALK, not the expanded one: the call site is the invocation
+    // whose verb is still the alias NAME. See `allGitInvocations`'s
+    // `expandAliases: false` note — expansion renames that verb and merges the
+    // value's own words into its args, so the name-keyed find misses it entirely.
+    const inv = allGitInvocations(String(source), {}, { expandAliases: false })
+      .find((iv) => iv.verb === aliasName);
     if (inv && Array.isArray(inv.args)) callArgs = inv.args;
   }
   return _argAwareBranchStateMutation({ verb, args: [...toks.slice(1), ...callArgs] });

@@ -1111,8 +1111,16 @@ dexpect("#594 a BENIGN visible alias expands (log) and stays harmless",
 // it is a `!` shell alias, or its env value cannot be resolved.
 dexpect("#594 persisted-config alias invocation → opaque + branchState (fail closed)",
   `git br`, { branchState: true });
-dexpect("#594 external subcommand (`git lfs`) → opaque (git resolves git-lfs)",
-  `git lfs pull`, { branchState: true });
+// ⛔ P1 (measured false refusal): this row used `git lfs` as its "external
+// subcommand" probe and that probe is ENVIRONMENT-DEPENDENT — `git lfs` is
+// alias-opaque only when NO `git-lfs` is installed, so the row would flip on any
+// box that ships git-lfs. Worse, its stated reason inverted the rule the P1
+// corrected: a RESIDENT `git-<cmd>` outranks the alias, so it is NOT opaque. The
+// probe is now a verb with no `git-<verb>` anywhere — the case an alias CAN win,
+// which is deterministic. (The resident case is pinned in test-module-load.mjs
+// B10p1a/B10p1b, which create the executable and drive the real handler.)
+dexpect("#594 unresolvable non-builtin verb (no `git-<verb>` installed) → opaque + branchState (fail closed)",
+  `git fx594noext pull`, { branchState: true });
 dexpect("#594 `!` shell-command alias → opaque (arbitrary shell text)",
   `git -c alias.s='!git checkout main' s`, { branchState: true });
 dexpect("#594 unresolvable --config-env alias value → opaque (fail closed)",
@@ -1294,8 +1302,20 @@ dexpect("#594-R5e control — a NON-deprecated builtin name is still the builtin
 dexpect("#594-R4e a non-builtin `main` command name EXPANDS its alias (`filter-branch`)",
   `git -c alias.filter-branch='branch -fq v1 main' filter-branch`,
   { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "v1", "main"] });
-dexpect("#594-R4e2 `git subtree …` (an external command, not a builtin) is opaque",
-  `git subtree add -P x y`, { branchState: true });
+// ⛔ P1 (measured FALSE REFUSAL) — and the census argument above is only HALF the
+// rule, so it is stated fully here: a `main` command is not a builtin, which is why
+// it must not be LISTED as one (that would DROP a defined alias — `#594-R4e`
+// above). It is also a RESIDENT `git-<name>` in `<git --exec-path>` (`git-subtree`,
+// `git-submodule` are both installed there on this box), and git's precedence is
+// builtin > external > alias: no alias can win its lookup. Treating it as
+// alias-OPAQUE therefore refused a legitimate command — `git subtree pull`, a
+// post-clone `git submodule update --init` — in EVERY checkout, for a shadowing
+// that cannot happen. The row now pins the correct direction, and `#594-R4e3` pins
+// the fail-closed half for a name nothing can resolve.
+dexpect("#594-R4e2 a resident non-builtin (`git subtree`) is NOT alias-opaque — no alias can shadow it (P1)",
+  `git subtree add -P x y`, { branchState: false });
+dexpect("#594-R4e3 a non-resident non-builtin (no `git-<verb>` anywhere) IS opaque + branchState (fail closed)",
+  `git fx594noext add -P x y`, { branchState: true });
 // The SAME two defects reachable through spellings the round-3 rows above do not walk: a
 // duplicated prefix handed through `env` (its assignments are argv, not the shell's), and the
 // SPACE form of `--config-env`. Both were measured FAIL-OPEN at `bd0ecbeca` (bState=false) and

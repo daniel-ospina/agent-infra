@@ -6335,15 +6335,16 @@ export default function (pi: ExtensionAPI) {
         const freedNames = new Map<string, Set<string>>();
         for (const mu of mutations) {
           const branchOp = branchOwnership.classifyBranchOp(mu.verb ?? det.verb, mu.args ?? det.verbArgs, {
-            // #594 Finding 1: the invocation is an ALIAS/external-subcommand
-            // indirection whose definition is not statically visible (`git br`
-            // from persisted config, `git -c alias.x=$VAR x`, a `git-foo`
-            // command). git expands it inside its own process, so no arm here
-            // can name the command that runs — decideM3 refuses it in a shared
-            // main checkout (fail closed). classifyBranchOp is TOLD, rather
-            // than the refusal living here, so there is still ONE verdict
-            // function and the worktree exemption below still applies (a
-            // worktree-scoped invocation is exempted before decideM3 runs).
+            // #594 Finding 1: the invocation is an ALIAS indirection whose
+            // definition is not statically visible (`git br` from persisted
+            // config, `git -c alias.x=$VAR x`). git expands it inside its own
+            // process, so no arm here can name the command that runs — decideM3
+            // refuses it (fail closed). classifyBranchOp is TOLD, rather than the
+            // refusal living here, so there is still ONE verdict function.
+            // ⛔ The worktree exemption below does NOT apply to this op (see the
+            // arm there): a hidden command may carry `-C <hub>`, so it cannot
+            // establish the locality the exemption rests on. An installed
+            // `git-<name>` command is NOT this op — it is not alias-shadowable.
             aliasOpaque: mu.aliasOpaque === true,
           });
           if (!branchOp || branchOp.op === "other") continue;

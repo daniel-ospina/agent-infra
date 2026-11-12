@@ -35,7 +35,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-module-load.mjs
 import { execSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, realpathSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, realpathSync, rmSync, existsSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -419,6 +419,51 @@ async function partB() {
     const aliasShadow = await callBash("git -c alias.reset=status reset --hard");
     expectTrue("B10d2: #594 a builtin-named alias CANNOT mask `reset --hard` (still BLOCKED)",
       !!aliasShadow && aliasShadow.block === true, `handler returned ${JSON.stringify(aliasShadow)}`);
+    // ── B10p1: review P1 — MEASURED FALSE REFUSAL. The alias net may cover only
+    //    a verb an ALIAS CAN WIN. git's precedence (probe-verified) is builtin >
+    //    `git-<cmd>` on the exec path/PATH > alias, so a RESIDENT git extension
+    //    can NEVER be shadowed by an alias — yet it was classified `aliasOpaque`,
+    //    which refused `git lfs pull` and a post-clone `git submodule update
+    //    --init` in EVERY checkout, in every repo, though neither moves branch
+    //    state. The controls below are load-bearing: without them this would be a
+    //    deletion of the class rather than a narrowing of it.
+    const extDir = mkdtempSync(join(tmpdir(), "mwg594-ext-"));
+    const prevPath = process.env.PATH;
+    try {
+      const fakeExt = join(extDir, "git-fx594ext");
+      writeFileSync(fakeExt, "#!/bin/sh\nexit 0\n");
+      chmodSync(fakeExt, 0o755);
+      process.env.PATH = extDir + ":" + prevPath;
+      const resident = await callBash("git fx594ext pull");
+      expectTrue("B10p1a: #594 a RESIDENT `git-<cmd>` invocation is ALLOWED — no alias can shadow it (P1 false refusal)",
+        resident === undefined, `handler returned ${JSON.stringify(resident)}`);
+      // A REAL resident extension, resolved through git's EXEC PATH rather than
+      // PATH: `git-submodule` lives in `<git --exec-path>`, which is on no shell
+      // PATH and which git prepends to its own lookup before `git-<cmd>`.
+      const submodule = await callBash("git submodule update --init --recursive");
+      expectTrue("B10p1b: …and a real one too — `git submodule update --init` (resident in git's exec path) is not alias-shadowable",
+        submodule === undefined, `handler returned ${JSON.stringify(submodule)}`);
+      // CONTROL: an uninstalled verb HAS no `git-<verb>` anywhere, so a persisted
+      // alias could be what git resolves — the class must still fail closed.
+      const absent = await callBash("git fx594absent pull");
+      expectTrue("B10p1c: control — a verb with NO `git-<verb>` on PATH stays alias-opaque BLOCKED (an alias could win it)",
+        !!absent && absent.block === true && /alias/i.test(String(absent.reason ?? absent.message ?? "")),
+        `handler returned ${JSON.stringify(absent)}`);
+    } finally {
+      process.env.PATH = prevPath;
+      try { rmSync(extDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    // CONTROL: where an alias genuinely CAN win, the destructive shape is still
+    // gated exactly as it was (the review's verified `branch(op=force)` case).
+    const aliasWins = await callBash("git -c alias.x='branch -fq victim main' x");
+    expectTrue("B10p1d: control — where an alias CAN win, `git -c alias.x='branch -fq victim main' x` is still a force BLOCK",
+      !!aliasWins && aliasWins.block === true, `handler returned ${JSON.stringify(aliasWins)}`);
+    // The classifier's OWN sentinel is not a spelled verb: `__unverifiable__` marks a
+    // multiword `$VAR` command word, which git never receives as a name, so an alias
+    // lookup cannot apply to it. #607 (a recorded decision) admits the read form.
+    const varWord = await callBash('G="git log --oneline"; $G');
+    expectTrue("B10p1e: …and a `$VAR` command word holding a READ is ALLOWED again (the `__unverifiable__` sentinel is not an alias candidate, #607)",
+      varWord === undefined, `handler returned ${JSON.stringify(varWord)}`);
     const symRefWrite = await callBash("git symbolic-ref refs/heads/victim2 refs/heads/main");
     expectTrue("B10e: #594 `git symbolic-ref refs/heads/<b> <target>` is BLOCKED",
       !!symRefWrite && symRefWrite.block === true && /Ref write blocked/.test(String(symRefWrite.reason ?? "")),
@@ -442,8 +487,15 @@ async function partB() {
     const clusteredM = await callBash("git symbolic-ref -qm why refs/heads/v2 refs/heads/main");
     expectTrue("B10k: #594 `-qm why` (clustered -m value slot) is BLOCKED",
       !!clusteredM && clusteredM.block === true, `handler returned ${JSON.stringify(clusteredM)}`);
-    const nonBuiltin = await callBash("git p4");
-    expectTrue("B10l: #594 a non-builtin verb with no visible definition (`git p4`) is BLOCKED, not trusted",
+    // ⛔ P1 (measured false refusal): `git p4` was this row's probe and it is the
+    // WRONG probe — `git-p4` IS a resident executable in `<git --exec-path>`
+    // (172866 bytes, mode 755, in the same directory as `git-submodule`), so git
+    // resolves it ahead of any alias and no alias can shadow it. Refusing it was
+    // the over-block the review measured, not a fail-closed win. The row's INTENT
+    // — a verb NOTHING can resolve is never trusted — is unchanged; the probe is
+    // now a name with no `git-<name>` anywhere, i.e. the case an alias CAN win.
+    const nonBuiltin = await callBash("git fx594absent");
+    expectTrue("B10l: #594 a verb with no `git-<verb>` resolvable and no visible definition (`git fx594absent`) is BLOCKED, not trusted",
       !!nonBuiltin && nonBuiltin.block === true, `handler returned ${JSON.stringify(nonBuiltin)}`);
     const transientLeak = await callBash("git -c alias.br=status br && git br");
     expectTrue("B10m: #594 a transient `-c` does not license a later segment's persisted alias",
