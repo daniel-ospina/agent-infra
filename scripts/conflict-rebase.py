@@ -140,6 +140,31 @@ BACKOFF_REFUSE_BASE = 24 * 3600
 BACKOFF_REFUSE_CAP = 14 * 24 * 3600
 BACKOFF_OK = 6 * 3600
 
+# ⛔ THE REPLAY NEEDS A COMMITTER, AND HAD NONE (agent-infra#4012).
+# A rebase REWRITES commits, so git must author a new committer on every one of them.
+# It resolves one from the repo config, then `~/.gitconfig`, then the system config —
+# and the scratch repo (`$STATE/scratch.git`, `git init --bare`) is not a clone of this
+# checkout, so THIS REPO'S LOCAL IDENTITY DOES NOT REACH IT. Measured on a cell
+# 2026-11-12 whose only identity lived in `<checkout>/.git/config` while `~/.gitconfig`
+# carried none:
+#
+#     $ git -C scratch.git/… rebase --onto origin/main <mb>
+#     Rebasing (1/27)Committer identity unknown / fatal: unable to auto-detect email address
+#
+# i.e. the replay died on commit ONE, with an EMPTY unmerged set, and was therefore
+# classified `rebase-failed` — the one outcome that publishes nothing (no label, no
+# comment, no diagnosis), takes a short backoff, and re-occupies a cap slot every pass
+# forever. Net effect: the bot had never rebased a single PR on any box, and every
+# CONFLICTING PR looked like a content conflict. A launchd/systemd pass inherits no
+# login shell, so relying on the ambient identity was never going to hold either.
+#
+# The identity is explicit, therefore, and it is the FLEET's own bot identity (the same
+# one `lane.sh` commits with) — a replay is genuinely committed by the bot, and the
+# ORIGINAL AUTHOR of each commit is preserved by `git rebase` regardless. `-c` on the
+# command keeps it out of any file: it applies to exactly the replay it is given.
+BOT_IDENT = ("pi orchestrator", "orchestrator@premiselabs.co")
+IDENT_ARGS = ["-c", f"user.name={BOT_IDENT[0]}", "-c", f"user.email={BOT_IDENT[1]}"]
+
 
 class Unreadable(Exception):
     """A surface could not be read. NEVER the same as an empty surface."""
@@ -155,8 +180,10 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def git(repo: Path | str, *args: str, check: bool = True, stdin: str | None = None) -> str:
-    p = run(["git", "-C", str(repo), *args], input=stdin)
+def git(repo: Path | str, *args: str, check: bool = True, stdin: str | None = None,
+        ident: bool = False) -> str:
+    """`git -C <repo> <args>`. `ident=True` adds the bot committer (see BOT_IDENT)."""
+    p = run(["git", *(IDENT_ARGS if ident else []), "-C", str(repo), *args], input=stdin)
     if check and p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed ({p.returncode}): {p.stderr.strip()[:400]}")
     return p.stdout
@@ -698,6 +725,27 @@ def scratch_repo(repo: str) -> Path:
     return path
 
 
+def replay_fault(blob: str) -> str:
+    """The line that actually explains a failed replay (agent-infra#4012).
+
+    ⛔ NAME THE FAULT, NOT THE PROGRESS COUNTER. `git rebase` writes "Rebasing (1/27)"
+    to stdout WITHOUT a trailing newline and only then fails, so the first line of
+    `stdout + stderr` is the counter with the diagnosis GLUED to it:
+
+        Rebasing (1/27)fatal: unable to auto-detect email address (got 'x@y.(none)')
+
+    Taking "the first non-empty line" therefore reported `the replay failed without a
+    conflict: Rebasing (1/27)` for every PR the bot touched — a diagnosis that named no
+    cause, on the defect that made the bot inert — and the real `fatal:` was never shown.
+    Prefer a `fatal:`/`error:` occurrence wherever it sits in the blob; fall back to the
+    first non-empty line only when git printed neither.
+    """
+    m = re.search(r"(fatal|error):\s*([^\n]*)", blob)
+    if m:
+        return f"{m.group(1)}: {m.group(2).strip()}"[:300]
+    return next((ln.strip() for ln in blob.splitlines() if ln.strip()), "no output")[:300]
+
+
 def rebase_pr(scratch: Path, pr: dict, args) -> dict:
     """Do the whole safe thing for ONE PR. Raises Refused with a kind + detail.
 
@@ -752,7 +800,8 @@ def _rebase_pr(scratch: Path, pr: dict, args) -> dict:
     shutil.rmtree(wt)
     try:
         git(scratch, "worktree", "add", "--detach", str(wt), head)
-        rb = run(["git", "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
+        rb = run(["git", *IDENT_ARGS,
+                  "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
                   "-c", "rebase.autoSquash=false", "-C", str(wt),
                   "rebase", "--no-rerere-autoupdate", "--onto", "refs/remotes/origin/main", mb])
         if rb.returncode != 0:
@@ -773,8 +822,7 @@ def _rebase_pr(scratch: Path, pr: dict, args) -> dict:
             run(["git", "-C", str(wt), "rebase", "--abort"])
             blob = rb.stdout + rb.stderr
             if not unmerged:
-                first = next((ln for ln in blob.splitlines() if ln.strip()), "no output")
-                raise Refused("rebase-failed", f"the replay failed without a conflict: {first[:300]}")
+                raise Refused("rebase-failed", f"the replay failed without a conflict: {replay_fault(blob)}")
             # The conflicting commit is the one the rebase stopped on; name it.
             m = re.search(r"could not apply ([0-9a-f]{7,40})", blob)
             stuck = m.group(1) if m else ""
