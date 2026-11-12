@@ -716,6 +716,11 @@ printf '2\n' > "$STATE/psick-77-$sha12r"              # the head is ALREADY at i
 touch "$FIX/fail-post"
 out="$(run_pass)"
 has "$out" "the escalation could NOT be posted" "a failed POST is NAMED, not swallowed"
+# ⛔ AND THE CAUSE ITSELF REACHES THE LOG (fresh-context review, P3, verified): both call sites used to
+# pipe `ps_review_escalate` to `/dev/null`, and the reorder means no parkreason is written on this path,
+# so the cause existed NOWHERE — while the failure line told the operator to "see above" for a line that
+# was never printed. Asserting the CAUSE (not just the verdict) is what pins it.
+has "$out" "escalate: the comment could not be posted" "the failure's OWN cause reaches the log, not just a 'could not post' verdict"
 [ -s "$STATE/parked-77" ] && bad "a head must NOT be parked when the escalation could not be posted" \
   || ok "the head stays UNPARKED, so the next pass can retry the escalation"
 rm -f "$FIX/fail-post"
