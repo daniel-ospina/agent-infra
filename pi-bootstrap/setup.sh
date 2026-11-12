@@ -394,10 +394,39 @@ farm_declared_rel=""
 # So missing names are collected here and the run FAILS before the UNFARM leg.
 farm_missing=""
 
+# ⛔ ATOMIC FARM INSTALL (#3991). `$DEST/scripts` is the directory the box EXECUTES, and a lane
+# invokes its gates (`record-review.sh`, `admin-merge.sh`, `review-pr.sh`) WHILE a farm runs — this
+# farm runs at session_start, and a re-run also happens during merges. A plain
+# `cp -f "$src" "$dest"` opens the destination `O_TRUNC` and only then writes, so a concurrent
+# reader can observe a zero-byte or half-written script: an attestation minted from half a file, or
+# a rail that exits before it grades. A following `chmod +x "$dest"` on the DESTINATION leaves a
+# second window in which the file exists but cannot be executed at all — the class
+# `scripts/check-farm-drift.sh` names "NOT-EXECUTABLE … the same silent no-op".
+# Copy to a sibling temp, make the TEMP executable, then `mv` it into place: same directory ⇒
+# rename(2), so a reader sees either the previous complete file or the new one, never a torn one,
+# and the `x` bit is already set at the instant the name appears. The `lib_srcs` leg has done
+# exactly this since #1362 for exactly this reason; #3991 found that the six legs delivering the
+# merge gates themselves were the ones that did not.
+# Returns non-zero and leaves any previous copy UNTOUCHED (its temp removed), so every caller
+# records the failure in `farm_missing` — a farm that reports success over a file it did not
+# deliver is the #1931/#1924 class.
+farm_install() {
+  local src="$1" dest="$2" tmp
+  tmp="$dest.tmp.$$"
+  if cp -f "$src" "$tmp" 2>/dev/null \
+     && chmod +x "$tmp" 2>/dev/null \
+     && mv -f "$tmp" "$dest" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
 scripts_dir="$INFRA_ROOT/scripts/checkout-hygiene"
 if [ -d "$scripts_dir" ]; then
   mkdir -p "$DEST/scripts/checkout-hygiene"
   copied=0
+  hygiene_failed=0
   for f in "$scripts_dir"/*; do
     [ -f "$f" ] || continue
     base="$(basename "$f")"
@@ -410,11 +439,17 @@ if [ -d "$scripts_dir" ]; then
       echo "    replacing farm symlink with real copy: $base"
       rm -f "$dest"
     fi
-    cp -f "$f" "$dest"
-    chmod +x "$dest" 2>/dev/null || true
-    copied=$((copied+1))
+    if farm_install "$f" "$dest"; then
+      copied=$((copied+1))
+    else
+      echo "    scripts/checkout-hygiene farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
+      farm_missing+="scripts/checkout-hygiene/$base (copy/chmod failed)"$'\n'
+      hygiene_failed=$((hygiene_failed+1))
+    fi
   done
-  if [ "$copied" -eq 0 ]; then
+  # Only a directory that declared NOTHING is "holds no farmable file"; when files declared and
+  # every one failed, the per-file COPY/RENAME lines above are the diagnosis (#3991).
+  if [ "$copied" -eq 0 ] && [ "$hygiene_failed" -eq 0 ]; then
     farm_missing+="scripts/checkout-hygiene/* (the directory exists but holds no farmable file)"$'\n'
   fi
   echo "    scripts/checkout-hygiene farm: $copied copied (real files, #427)"
@@ -734,9 +769,12 @@ for base in "${fleet_srcs[@]}"; do
     echo "    replacing farm symlink with real copy: $base"
     rm -f "$dest"
   fi
-  cp -f "$f" "$dest"
-  chmod +x "$dest" 2>/dev/null || true
-  fleet_copied=$((fleet_copied+1))
+  if farm_install "$f" "$dest"; then
+    fleet_copied=$((fleet_copied+1))
+  else
+    echo "    scripts fleet farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
+    farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
+  fi
 done
 
 # ── the orchestrator MCP's own harness module ────────────────────────────────────────────────
@@ -820,8 +858,10 @@ for base in "${mcp_harness_srcs[@]}"; do
   if [ -L "$dest" ]; then
     rm -f "$dest"
   fi
-  cp -f "$f" "$dest"
-  chmod +x "$dest" 2>/dev/null || true
+  if ! farm_install "$f" "$dest"; then
+    echo "    scripts mcp-harness farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
+    farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
+  fi
 done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner gate, #1719)"
 
@@ -899,18 +939,15 @@ for base in "${lib_srcs[@]}"; do
     echo "    replacing farm symlink with real copy: lib/$base"
     rm -f "$dest"
   fi
-  # Atomic install (#1362 review): copy to a sibling temp then rename, so a
-  # concurrent reader (record-review.sh runs during merges; this farm runs at
-  # session_start) can NEVER observe a truncated/zero-byte lib. An empty
-  # normalizer exits 0 printing nothing, which would hash the EMPTY string into
-  # a constant digest — a false accept — so the reader also guards `[ -s ]`.
-  if cp -f "$f" "$dest.tmp.$$" 2>/dev/null \
-     && chmod +x "$dest.tmp.$$" 2>/dev/null \
-     && mv -f "$dest.tmp.$$" "$dest" 2>/dev/null; then
+  # Atomic install (#1362 review, now `farm_install` for every leg — #3991): copy to a sibling
+  # temp then rename, so a concurrent reader (record-review.sh runs during merges; this farm runs
+  # at session_start) can NEVER observe a truncated/zero-byte lib. An empty normalizer exits 0
+  # printing nothing, which would hash the EMPTY string into a constant digest — a false accept —
+  # so the reader also guards `[ -s ]`.
+  if farm_install "$f" "$dest"; then
     lib_copied=$((lib_copied+1))
   else
     echo "    scripts lib farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
-    rm -f "$dest.tmp.$$"
     lib_failed=$((lib_failed+1))
   fi
 done
@@ -991,9 +1028,12 @@ for base in "${fleet_tools[@]}"; do
     echo "    replacing farm symlink with real copy: scripts/fleet/$base"
     rm -f "$dest"
   fi
-  cp -f "$f" "$dest"
-  chmod +x "$dest" 2>/dev/null || true
-  tools_copied=$((tools_copied+1))
+  if farm_install "$f" "$dest"; then
+    tools_copied=$((tools_copied+1))
+  else
+    echo "    scripts/fleet farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
+    farm_missing+="scripts/fleet/$base (copy/chmod failed)"$'\n'
+  fi
 done
 echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions + pr-state, #1178/#1777/#2866)"
 
@@ -1121,18 +1161,21 @@ for base in "${merge_gate_srcs[@]}"; do
     echo "    replacing farm symlink with real copy: $base"
     rm -f "$dest"
   fi
-  cp -f "$f" "$dest"
   # ⛔ A SWALLOWED `chmod` FAILURE IS A SILENTLY NON-EXECUTABLE LANDER SEAM (P3, fresh review of
   # #2288). The lane brief and the code-review skill tell a lander to TYPE this path
-  # (`~/.pi/agent/scripts/review-pr.sh <PR>`, no `bash`), so a `cp -f` that inherits a restrictive
+  # (`~/.pi/agent/scripts/review-pr.sh <PR>`, no `bash`), so a copy that inherits a restrictive
   # umask without `x` — with the failure discarded by `|| true` — ships a seam nobody can invoke,
-  # and the farm test (existence + byte-equality only) stays green. Assert it instead.
-  if ! chmod +x "$dest" 2>/dev/null; then
-    echo "    ⚠️  could not chmod +x $dest — the lander seam would not be executable" >&2
-    farm_missing+="scripts/$base (chmod +x failed)"$'\n'
+  # and the farm test (existence + byte-equality only) stays green. Assert it instead: since #3991
+  # `farm_install` sets the bit on the TEMP before the rename, so a failed `chmod` fails the whole
+  # install and the previous copy stays in place (and a lane merging at that instant keeps a
+  # runnable gate rather than this PR's half-delivered one).
+  if farm_install "$f" "$dest"; then
+    merge_gate_copied=$((merge_gate_copied+1))
+    merge_gate_names+="${merge_gate_names:+, }$base"
+  else
+    echo "    ⚠️  COPY/RENAME FAILED for $f — the lander seam would not be executable" >&2
+    farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
   fi
-  merge_gate_copied=$((merge_gate_copied+1))
-  merge_gate_names+="${merge_gate_names:+, }$base"
 done
 # DERIVED from the array, never hard-coded: a summary that omits a name it farmed misreports the
 # farm, and the suite pins every declared entry against this line (#1897 precedent).
@@ -1157,10 +1200,10 @@ for base in "${graph_srcs[@]}"; do
   fi
   dest="$DEST/scripts/$base"
   if [ -L "$dest" ]; then rm -f "$dest"; fi
-  if cp -f "$f" "$dest" && chmod +x "$dest" 2>/dev/null; then
+  if farm_install "$f" "$dest"; then
     graph_copied=$((graph_copied+1)); graph_names+="${graph_names:+, }$base"
   else
-    echo "    scripts graph farm: COPY FAILED for $f" >&2
+    echo "    scripts graph farm: COPY/RENAME FAILED for $f — leaving any previous copy in place" >&2
     farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
   fi
 done
@@ -1190,9 +1233,15 @@ if [ -f "$SPAWN_GATE_SRC" ]; then
     cp -f "$DEST/bin/pi" "$DEST/bin/pi.bak-bootstrap" 2>/dev/null || true
     echo "    backed up a pre-existing $DEST/bin/pi to pi.bak-bootstrap (it is not this repo's gate)"
   fi
-  cp -f "$SPAWN_GATE_SRC" "$DEST/bin/pi"
-  chmod +x "$DEST/bin/pi" 2>/dev/null || true
-  echo "    pi spawn-point gate installed at $DEST/bin/pi (#1884)"
+  # Atomic like the script farm (#3991): `$DEST/bin/pi` is the name EVERY lane spawn resolves to
+  # (it is first on PATH), so a truncated or not-yet-executable copy here is a broken `pi` for any
+  # session starting at that instant — the same two windows, on the binary that starts every lane.
+  if farm_install "$SPAWN_GATE_SRC" "$DEST/bin/pi"; then
+    echo "    pi spawn-point gate installed at $DEST/bin/pi (#1884)"
+  else
+    echo "    ⚠️  COPY/RENAME FAILED for $SPAWN_GATE_SRC — $DEST/bin/pi left exactly as it was" >&2
+    farm_missing+="bin/pi (copy/chmod failed)"$'\n'
+  fi
   # A gate that is installed but NOT ahead of the real pi on PATH is a false install: it would report
   # success here while every spawn resolved past it. Say so at install time, when it is cheap to fix.
   case ":$PATH:" in

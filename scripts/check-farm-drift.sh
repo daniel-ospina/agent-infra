@@ -523,9 +523,12 @@ while IFS= read -r rel; do
         matched=$((matched+1))
         # ⛔ THE EXECUTABLE BIT IS PART OF "IS THIS THE CODE?" A byte-identical copy that launchd
         # cannot exec is the same silent no-op class as #10114 (the file that must run, that cannot),
-        # and three of the five farm legs swallow the failure (`chmod +x "$dest" 2>/dev/null || true`
-        # in pi-bootstrap/setup.sh), so existence + byte-equality stays green over it. Git stores the
-        # bit; the working tree carries it.
+        # and three of the five farm legs used to swallow the failure (`chmod +x "$dest" 2>/dev/null
+        # || true` in pi-bootstrap/setup.sh), so existence + byte-equality stays green over it. Since
+        # #3991 every leg installs through `farm_install` (chmod the TEMP, then rename), which fails
+        # the leg loudly — but a box farmed by an OLDER setup.sh, or a hand-edited file, still lands
+        # here, so the check grades the bit rather than trusting the installer. Git stores the bit;
+        # the working tree carries it.
         src_exec=0
         if [ -n "$SRC_READ" ]; then
             case "$(git -C "$SRC" ls-tree "$SRC_READ" -- "$src" 2>/dev/null | cut -d' ' -f1)" in
