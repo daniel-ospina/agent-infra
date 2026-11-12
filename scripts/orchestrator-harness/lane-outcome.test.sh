@@ -567,13 +567,13 @@ done
 # its name in the contract reddens here rather than in an operator's misread.
 _gates="$(sed -n '/^cap_refusal_gate()/,/^}/p' "$(dirname "$LANE")/chain-merge.sh" \
           | sed -n 's/^[[:space:]]*\([a-z][a-z-]*\))[[:space:]]*printf.*/\1/p' | sort -u | paste -sd ',' -)"
-eqv "$_gates" "capability,disk,fork,key,land,mem,skew" \
-    "4e the normaliser's own vocabulary is the expected named arms — eight of them, load being the FOLD and not an arm"
+eqv "$_gates" "capability,disk,fork,key,land,mem,skew,stale" \
+    "4e the normaliser's own vocabulary is the expected named arms — all of them but \`load\`, which is the FOLD and not an arm"
 _fmt="$(sed -n '/^# FORMAT — one line/,/^# (`land` is the CREATION/p' "$LANE")"
-for _g in load disk land fork capability skew key mem; do
+for _g in load disk land fork capability skew key mem stale; do
   has "$_fmt" "\`$_g\`" "4e …and the FORMAT contract names the \`$_g\` gate (a consumer built from it cannot fold it)"
 done
-has "$_fmt" "EIGHT refusal gates" "4e …and the COUNT agrees with the list (it said SIX beside seven names, then SEVEN beside eight)"
+has "$_fmt" "NINE refusal gates" "4e …and the COUNT agrees with the list (it said SIX beside seven names, then SEVEN beside eight, then EIGHT beside the nine #3932 added)"
 # ⛔ LOCATE THE DECLARATION BY NAME, NOT BY LINE NUMBER (agent-infra#2095). This read used to be
 # `head -n 80 … | grep -n '^cap_refusal_gate()'`, which gave the three arms below a SECOND, unstated
 # precondition: that no unrelated change ever pushes the function past line 80. #2095 adds lines of
@@ -584,7 +584,7 @@ has "$_fmt" "EIGHT refusal gates" "4e …and the COUNT agrees with the list (it 
 # and the contract lives ON the declaration line; position was never part of it. Same class as the
 # #2095 P0: an assertion that silently encoded a positional assumption the diff never mentioned.
 _ret="$(grep -n '^cap_refusal_gate()' "$(dirname "$LANE")/chain-merge.sh" | head -1)"
-for _g in key skew mem; do
+for _g in key skew mem stale; do
   has "$_ret" "$_g" "4e …and chain-merge's return contract names \`$_g\`, which its case arm dispatches on"
 done
 
