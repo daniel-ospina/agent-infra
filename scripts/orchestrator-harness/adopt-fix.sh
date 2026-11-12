@@ -136,6 +136,24 @@ elif [ "$rc" = "77" ]; then
   # call "the log a manual operator reads (#1720)". The `_c77` arm in disk-admission.test.sh PINNED
   # the conflation rather than noticing it, so it is extended to assert the distinction.
   echo "[adopt-fix $PR] remedy follows the cause, not this line: for (a), (b) and 'REFUSED-DISK' it is space -- run 'cloud-cell-supervisor.sh prune --caches' (and --scratch to clear /tmp). For 'REFUSED-UNKNOWN' it is NOT a full disk -- the free-space probe could not answer, or this box's \$O is missing spawn-gate.sh or carries a copy that predates \`disk_admit\` (a half-deployed or skewed box fails closed, #2033) -- so pruning will NOT clear it and the fix is to check that \`df\` is on PATH and that \$O carries spawn-gate.sh WITH \`disk_admit\` defined in it. Waiting clears none of them." >> "$O/logs/adopt-$PR.log"
+# ⛔ THE STALE-CHECKOUT REFUSAL (85) IS NAMED HERE FOR THE REASON THE 71 ARM BELOW RECORDS (#3932's
+# review, P2). `fix-one.sh` propagates the gate's own code, so 85 reached the manual operator's log as
+# NO LINE — a run that did nothing, silently — exactly the defect this file's 71 arm was added to end.
+# ⛔ AND THE REMEDY NAMES THE ARTIFACT THE READING WAS TAKEN IN (#3932's review, P2-4). `spawn-gate.sh`
+# names `WIP_PATH` here, and on THIS path `WIP_PATH` is the FIXER'S WORKTREE — a worktree on the PR
+# BRANCH, not a base cut from `origin/main`. The base-path remedy ("cut the worktree from origin/main")
+# is DESTRUCTIVE on that artifact: it discards the very PR the fixer was dispatched to repair, and a PR
+# branch >MAX_BEHIND behind is precisely the state that gets a fixer dispatched. So the sentence below
+# says merge, never re-cut. Tolerant default for the same $O-skew reason as the arms above.
+elif [ "$rc" = "${AGENT_STALE_CODE_REFUSED:-85}" ]; then
+  echo "[adopt-fix $PR] fixer NOT started (STALE-CODE gate) — this box completed the model call but the checkout it measured is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (#3932), so work done from it produces a plausible log and a WRONG diff. The repo and the distance are on the [capability-gate] REFUSED line in $O/logs/fix-$PR.log. Waiting will NOT clear it and, in the measured fleet state (every cell hundreds of commits behind), a PEER will not either — so do NOT dispatch the PR elsewhere. On this path the measured artifact is the FIXER's worktree, which is the PR BRANCH: bring the branch up to date (`git -C <that worktree> merge origin/main`, resolve, push) and re-run. Do NOT re-cut the worktree from origin/main — that discards the PR's own commits. Nothing was consumed." >> "$O/logs/adopt-$PR.log"
+# ⛔ THE HARNESS/MISMATCH REFUSAL (83) IS THE OTHER CODE THIS FILE DROPPED SILENTLY (#3932's review, P2
+# measured 83 to have the same pre-existing gap; closed here rather than filed, because it is one `elif`
+# in the shape of its neighbours and the operator's log is the artifact the gap costs). `fix-one.sh`
+# classes 83 as a HARNESS defect — a caller/deployed-helper disagreement, or an unresolvable capacity.sh —
+# and its remedy is a verified redeploy, which is neither a box repair nor a peer hand-off.
+elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
+  echo "[adopt-fix $PR] fixer NOT started (HARNESS/MISMATCH gate) — this fixer's caller and the deployed cell-lane-preflight.sh do not agree (usage/version skew, or a corrupt copy), so no measurement was possible (agent-infra#2991), OR the spawn gate could not resolve capacity.sh at all. This is a HARNESS defect on every box that runs the pair, not a property of this box and not a finding about this PR: do NOT dispatch the PR elsewhere. Sync the helper pair with a VERIFIED redeploy — bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O — and re-run. Nothing was consumed; see $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
 # ⛔ THE 79 DEFERRALS ARE NAMED IN THE LOG THE OPERATOR READS (#2333 cycle 6 review, P2).
 # `fix-one.sh` exits 0 for each of them ON PURPOSE — a deferral is not an error the controller should
 # retry, and the controller books the refund through the bail marker — so `adopt-fix <PR>` would return
