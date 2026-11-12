@@ -2314,6 +2314,30 @@ run_req 'lint' 306 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-p
 ck "a '<caller> / <job>' name matches its required bare parent (and is therefore a fix round)" \
    $([ "$RC" = 10 ] && grep -q "required checks are RED: agent-infra-ci / lint$" <<<"$OUT" && echo 0 || echo 1)
 
+# 4014-g. THE SAME NAME, GREEN — the half the RED case cannot cover (review P1 on #4039).
+# The first revision's `missing` test asked `n not in names` while `is_required` accepted a
+# `<caller> / <job>` rendering, so a required check that was PRESENT and GREEN as
+# `agent-infra-ci / lint` was simultaneously reported as "not published yet": `_eff` never reached 0,
+# the loop waited out the whole bound on a complete green required surface, and it printed
+# `(0) in flight` over a cause that was never a count. Both readers now share one rule.
+printf 'agent-infra-ci / lint\tcompleted\tsuccess\t72\n' > "$T/checks-prefixed-green.tsv"
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'lint' 307 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-prefixed-green.tsv"
+sleep 1
+ck "a '<caller> / <job>' REQUIRED check that is GREEN satisfies the surface — the chain is reached, not a full dead wait" \
+   $([ "$RC" = 11 ] && ! grep -q 'NOT PUBLISHED YET' <<<"$OUT" && grep -q "launched the merge chain" <<<"$OUT" && echo 0 || echo 1)
+ck "…and it never reports the required check as MISSING in the verdict (the two readers agree)" \
+   $(! grep -q 'required and unpublished' <<<"$OUT" && echo 0 || echo 1)
+
+# 4014-h. A BOUND REACHED ONLY BECAUSE A REQUIRED CHECK IS UNPUBLISHED NAMES IT (review P1 on #4039):
+# quoting `0` in flight over a real cause sends the reader after a slow CI run that does not exist.
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'python-ci-gate' 308 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-prefixed-green.tsv"
+ck "the bound verdict NAMES the unpublished required check instead of reporting an unexplained 0 in flight" \
+   $([ "$RC" = 11 ] && grep -q 'the ONLY thing outstanding is required check(s) not published' <<<"$OUT" && grep -q 'required and unpublished: python-ci-gate' <<<"$(verdict_of 308)" && echo 0 || echo 1)
+
 echo
 if [ "$fail" -eq 0 ]; then
   printf '\033[32mALL %d lane-merge checks passed\033[0m\n' "$pass"

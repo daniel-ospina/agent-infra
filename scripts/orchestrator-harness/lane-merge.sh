@@ -747,9 +747,24 @@ printf '%s %s\n' "${ISSUE:-}" "$(date +%s)" > "$PHASE_F" 2>/dev/null || true
 # on this box at all — `LM_REQ_TRUSTED=0` and EVERY check on the surface counts as required, which is
 # exactly this script's behaviour before this change. A box whose protection read fails today behaves
 # as it did yesterday, loudly.
+# ⛔ THE COST IS ONE REST READ PER INVOCATION, NOT PER POLL. `required_checks` hits
+# `branches/main/protection/required_status_checks` once, before the wait loop starts — the poll inside
+# the loop is unchanged (and its un-paginated shape answers 304 free). 22 landers share one rate-limited
+# account, so one extra read at startup is the price of not waiting on 24 checks nobody requires; it is
+# the same read `merge-one.sh` already pays once per chain.
 LM_REQ=""; LM_REQ_SRC=""; LM_REQ_TRUSTED=0
+# ⛔ `--watch` MUST NOT PAY FOR IT (review P2, #4039 — verified). `--watch` never classifies a
+# check-run surface (it reads the chain's LOCAL state; the only `WATCH` tests in this file are the
+# `WAIT_S` cap guard and the `--watch` branch, both BELOW this block), so every `--watch` chunk would
+# spend one `branches/main/protection` read — the one read the harness flags ESSENTIAL and lets breach
+# the REST reserve — for a value nothing on that path consumes. `--watch` is also the highest-frequency
+# invocation (`MAX_WATCH` chunks per lane, ~22 lanes). The order is the guard, exactly as the `WAIT_S`
+# cap is deliberately ordered below the `--status` exit (`:699`). Leaving the surface unresolved here is
+# fail-closed by construction: `LM_REQ_TRUSTED` stays 0, so anything that DID classify on this path would
+# treat every check as required.
 lm_resolve_required_surface() {
   local _ra="" _d="" _c=""
+  [ "${WATCH:-0}" -eq 0 ] || return 0
   [ -n "${OR:-}" ] || return 0
   _d="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || _d=""
   for _c in "${O_WORK:-}" "${O:-}" "$_d"; do
@@ -902,14 +917,29 @@ def is_required(name):
     """Is THIS surface check one of the repo's required contexts?"""
     if not trusted or not required:
         return True
-    if name in required:
+    return any(_bare_is(name, r) for r in required)
+
+
+def _bare_is(name, wanted):
+    """Does THIS surface name name the required context `wanted`?
+
+    GitHub renders a reusable workflow's job as `<caller> / <job>` (measured: `agent-infra-ci / lint`
+    on tortoise). The REQUIRED CONTEXT is the bare name branch protection declares, so a suffixed
+    name must still match its required parent — the same normalisation `merge-one.sh` and
+    `admin-merge.sh` apply to a gate row. The direction matters: this makes MORE names count as
+    required, never fewer.
+    """
+    if name == wanted:
         return True
-    # GitHub renders a reusable workflow's job as `<caller> / <job>` (measured: `agent-infra-ci / lint`
-    # on tortoise). The REQUIRED CONTEXT is the bare name branch protection declares, so a suffixed
-    # name must still match its required parent — the same normalisation `merge-one.sh` applies to the
-    # gate row. The direction matters: this makes MORE names required, never fewer.
     i = name.rfind(" / ")
-    return i > 0 and name[i + 3:] in required
+    return i > 0 and name[i + 3:] == wanted
+
+
+def is_required(name):
+    """Is THIS surface check one of the repo's required contexts?"""
+    if not trusted or not required:
+        return True
+    return any(_bare_is(name, r) for r in required)
 
 
 inflight_req, red, red_req, red_adv, names = 0, [], [], [], set()
@@ -929,7 +959,13 @@ for (app, name), (status, conclusion, _cid) in sorted(newest.items()):
 # (tortoise's `python-ci-gate` appears only once its whole needs-graph finishes). It is reported
 # separately so the caller can treat it as in flight; a missing required check must never be read
 # as "nothing left to wait for".
-missing = [n for n in required if n not in names] if (trusted and required) else []
+# ⛔ THE PRESENCE TEST IS THE *SAME* TEST AS `is_required` (review P1, #4039). The first revision
+# asked `n not in names`, so for the very shape 4014-f declares supported — required `lint`, surface
+# row `agent-infra-ci / lint` — the bare name was never in `names` and the check was reported BOTH as
+# required-and-green AND as "not published yet": `_eff` never reached 0, the loop waited out the whole
+# bound on a complete green required surface and exited `WAITING_CHECKS`, printing `(0) in flight`. Two
+# harness readers disagreed about one head. One rule now decides both questions.
+missing = [n for n in required if not any(_bare_is(x, n) for x in names)] if (trusted and required) else []
 print("INFLIGHT %d" % inflight_req)
 print("RED %s" % ",".join(red))
 if trusted and required:
@@ -2206,8 +2242,14 @@ while :; do
       exit 11
     fi
     log_line "… checks still IN FLIGHT (${IF}) after ${_waited}s — re-run this script; nothing was merged"
+    # ⛔ QUOTING `0` IN FLIGHT OVER A REAL CAUSE IS THE SILENCE THIS FILE ABOLISHES (review P1, #4039).
+    # An unpublished required check is an IN FLIGHT reason, not an in-flight COUNT, so a bound reached
+    # solely because it is missing would otherwise print `(0)` and send the reader after a slow CI run.
+    if [ -n "${REQ_MISSING:-}" ]; then
+      log_line "… the ONLY thing outstanding is required check(s) not published at this head: $(printf '%s' "$REQ_MISSING" | tr ',' ' ') — a required check that GitHub never reports leaves the merge blocked, so waiting is the correct direction"
+    fi
     disposition WAITING_CHECKS
-    verdict WAITING_CHECKS "checks still in flight after ${_waited}s"
+    verdict WAITING_CHECKS "checks still in flight after ${_waited}s${REQ_MISSING:+ (required and unpublished: $(printf '%s' "$REQ_MISSING" | tr ',' ' '))}"
     exit 11
   fi
   # ⛔ WATCHDOG-VISIBLE PROGRESS, EVERY POLL (#3584 review, P1 — measured). `lane_bound`'s only working
