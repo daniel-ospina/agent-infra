@@ -95,6 +95,7 @@ RAIL_DIR=$(mktemp -d)
 LANE_BOUND="$HERE/lane-bound.sh"
 RAIL_MAX_S=60
 RAIL_BOUND_POLL_S=1
+RAIL_BOUND_GRACE_S=15
 COOLDOWN_S=21600
 COOLDOWN_TRANSIENT_S=900
 LOCK_AGE_GRACE=120
@@ -236,6 +237,37 @@ read -r p_a_own _p2 _p3 <<< "$(rails_for_repo daniel-ospina/agent-infra $REPOS)"
   || bad "--repo must take precedence over the script path (tortoise=$p_t_own agent-infra=$p_a_own)"
 
 # ══ THE DUPLICATE-RAIL GUARD: three answers, and per REPO ════════════════════════════════════════════
+# ⛔ A WRAPPED RAIL IS ONE OCCUPIED SLOT, NOT TWO (measured 2026-11-12, review of #4001 P1). `launch_rail`
+# runs the rail as an ARGUMENT of `lane-bound.sh`, so ONE live attempt appears in the process table as the
+# wrapper line PLUS its child line — and both match `rail_rows` token rule. Counted twice, `MAX`/`MAX_TOTAL`
+# defer candidates at HALF the configured capacity and every pass line over-reports the population.
+TABLE="sh /r/lane-bound.sh run --wall 3600 --idle 0 --poll 30 --tag rail-daniel-ospina-tortoise-3973 --log /x/out --verdict-file /x/bf -- bash /r/scripts/admin-merge.sh 3973 --repo daniel-ospina/tortoise
+bash /r/scripts/admin-merge.sh 3973 --repo daniel-ospina/tortoise"
+read -r w_own w_total w_unk <<< "$(rails_for_repo daniel-ospina/tortoise $REPOS)"
+[ "$w_own" -eq 1 ] && [ "$w_total" -eq 1 ] && [ "$w_unk" -eq 0 ] \
+  || bad "a rail launched under its lifetime bound must count ONCE (got own=$w_own total=$w_total unk=$w_unk, want 1 1 0) — the wrapper argv CONTAINS the child argv, so without the collapse MAX is effectively halved and the pass line doubles the population"
+# …and the collapse must be WRAPPER-vs-CHILD ONLY: the #3136 pair below is TWO independent rails on one PR
+# (the duplicate launch the guard exists to prevent) — two OS processes, two pieces of load. Collapsing that
+# would make the counter lie about exactly the population it exists to report.
+TABLE="bash /r/scripts/admin-merge.sh 3136 --repo daniel-ospina/agent-infra
+bash /r/scripts/admin-merge.sh 3136 --repo daniel-ospina/agent-infra"
+read -r d_own d_total _dunk <<< "$(rails_for_repo daniel-ospina/agent-infra $REPOS)"
+[ "$d_own" -eq 2 ] && [ "$d_total" -eq 2 ] \
+  || bad "TWO independent rails on one PR must stay TWO (got own=$d_own total=$d_total) — that pair is the duplicate launch the guard prevents, not a wrapper/child pair"
+# …and two wrapped rails on DIFFERENT PRs are two slots.
+TABLE="sh /r/lane-bound.sh run --wall 3600 --idle 0 --poll 30 --tag x --log /x/o --verdict-file /x/b -- bash /r/scripts/admin-merge.sh 3973 --repo daniel-ospina/tortoise
+bash /r/scripts/admin-merge.sh 3973 --repo daniel-ospina/tortoise
+sh /r/lane-bound.sh run --wall 3600 --idle 0 --poll 30 --tag y --log /x/o2 --verdict-file /x/b2 -- bash /r/scripts/admin-merge.sh 3974 --repo daniel-ospina/tortoise
+bash /r/scripts/admin-merge.sh 3974 --repo daniel-ospina/tortoise"
+read -r w2_own w2_total _w2 <<< "$(rails_for_repo daniel-ospina/tortoise $REPOS)"
+[ "$w2_own" -eq 2 ] && [ "$w2_total" -eq 2 ] \
+  || bad "the collapse must be per (repo, PR): two bound-wrapped rails on two PRs must count 2 (got own=$w2_own total=$w2_total)"
+TABLE="bash /r/scripts/admin-merge.sh --repo daniel-ospina/tortoise
+bash /r/scripts/admin-merge.sh --repo daniel-ospina/tortoise"
+read -r w3_own w3_total _w3u <<< "$(rails_for_repo daniel-ospina/tortoise $REPOS)"
+[ "$w3_total" -eq 2 ] \
+  || bad "two processes that name NO PR must stay TWO pieces of load (got total=$w3_total) — collapsing them under-counts exactly the population the UNKNOWN bucket exists to keep visible"
+
 TABLE="bash /r/scripts/admin-merge.sh 3136 --repo daniel-ospina/agent-infra
 bash /r/scripts/admin-merge.sh 3136 --repo daniel-ospina/agent-infra"
 rail_already_running daniel-ospina/agent-infra 3136; [ $? -eq 0 ] || bad "a live rail for #3136 must be DETECTED (rc 0)"
@@ -1856,8 +1888,8 @@ REVIEW_SCRIPT=$_revsave
   || bad "a dispatch whose reviewer READS STDIN must not consume the loop's candidate list — the loop saw '$(cat "$_seenf" 2>/dev/null)', want 3 rows: with an inherited fd 0 one review drains every remaining candidate of the repo (abandoned silently) and feeds their rows into the reviewer's prompt"
 grep -qF '2>&1 < /dev/null &' "$SUT" \
   || bad "the review launch must DETACH stdin ('< /dev/null') — the loop body's fd 0 is the candidate list, and a reviewer that reads it silently drops every later candidate of the repo for that pass"
-grep -qF '$extra < /dev/null > "$out" 2>&1 &' "$SUT" \
-  || bad "the rail launch must DETACH stdin too — same inherited fd 0, same abandoned candidates, and it is the same file's shape"
+grep -qF '$extra < /dev/null >> "$out" 2>&1 &' "$SUT" \
+  || bad "the rail launch must DETACH stdin too — same inherited fd 0, same abandoned candidates, and it is the same file's shape (the redirect is APPEND plus an explicit truncation before the launch, #4001 P2: a truncating redirect lets the child overwrite the bound's appended verdict)"
 rm -f "$_stdinrev"
 rm -f "$_rev_issues" "$_rev_clean" "$_rev_load"
 # ⛔ THE EXIT LINE MUST START ITS OWN LINE (P2, measured). `run_review` appends `REVIEW-EXIT rc=N` to the
@@ -2539,6 +2571,7 @@ LANE_BOUND="$(dirname "$SUT")/lane-bound.sh"
 [ -f "$LANE_BOUND" ] || bad "the shipped lane-bound.sh must sit beside auto-rail.sh — the bound resolves as \$(dirname \$0)/lane-bound.sh and the farm delivers the harness as ONE directory, so a bound that resolves only from a developer checkout is absent on the box that runs it"
 RAIL_MAX_S=2            # a 2s ceiling: the shipped 3600s would make this arm untestable
 RAIL_BOUND_POLL_S=1
+RAIL_BOUND_GRACE_S=1    # and a 1s TERM->KILL grace, so the ESCALATION is exercised, not just the TERM
 LAUNCH_VERIFY_S=1
 LOG=$(mktemp)
 TRIED=$(mktemp)
@@ -2548,7 +2581,25 @@ _bf=$(rail_bound_file daniel-ospina/tortoise 9101 feedface)
 case "$_bf" in "$_bdir"/bound-daniel-ospina-tortoise-9101-feedface.out) : ;; *) bad "rail_bound_file must key the bound's verdict by (repo, PR, HEAD) under \$RAIL_DIR (got '$_bf')";; esac
 # The stub records ITS OWN pid (so the kill is proven against a pid nobody in this suite chose) and then
 # never exits. `sleep 600` is the wedge in its simplest form: no verdict, no output growth, no exit.
-printf '#!/bin/bash\nprintf "%%s\\n" "$$" > "%s"\necho "rail started $*"\nsleep 600\n' "$_bpid" > "$_bstub"
+# ⛔ THE STUB IGNORES TERM AND THEN WRITES 4 KB, AND BOTH HALVES ARE THE POINT (measured 2026-11-12,
+# review of #4001 P2). `lane-bound.sh` emits the VERDICT *before* it signals (its own header says so), so a
+# child that survives TERM writes at its own LAGGING descriptor offset immediately AFTER the appended
+# verdict. Under a TRUNCATING redirect that write lands ON the verdict and the operator loses the reason the
+# rail died — the exact blindness #4001 is about — while the machine-readable `--verdict-file` still
+# answers. 4 KB is not an order-of-magnitude accident: it OVERWRITES. With both writers on `O_APPEND` the
+# verdict survives, which is what the arm below asserts on the RAIL's log, not on the bound's file.
+cat > "$_bstub" <<STUB
+#!/bin/bash
+printf '%s\n' "\$\$" > "$_bpid"
+trap '' TERM
+echo "rail started \$*"
+# Wait for the bound to WRITE ITS VERDICT first: the clobber this arm exists to catch can only happen to a
+# verdict that is already on disk. `lane-bound.sh` emits the verdict BEFORE it signals, so this is the real
+# order of events, not a contrivance.
+while [ ! -s "$_bf" ]; do sleep 0.1; done
+head -c 4096 /dev/zero | tr '\\0' x
+sleep 600
+STUB
 chmod +x "$_bstub"
 RAIL_SCRIPT="$_bstub" launch_rail daniel-ospina/tortoise 9101 feedface "$_bdir/auto-x-9101.out" \
   || bad "a bounded launch whose child is alive must be recorded as started"
@@ -2566,6 +2617,24 @@ case "${_bel:-}" in ''|*[!0-9]*) bad "the bound's verdict must carry a measured 
 # ⛔ THE KILL, NOT JUST THE VERDICT. The stub's own pid must be gone: `lane-bound.sh`'s verdict is written
 # BEFORE the kill, so a verdict with a live child is exactly the half-fix this assertion exists to refuse.
 _sp=$(cat "$_bpid" 2>/dev/null)
+# The stub IGNORES TERM on purpose (see its header), so the kill is the subtree walk plus the KILL
+# escalation — give it a bounded window to complete instead of reading the first instant after the verdict.
+_si=0
+while [ "$_si" -lt 40 ] && kill -0 "${_sp:-0}" 2>/dev/null; do sleep 0.25; _si=$(( _si + 1 )); done
+# ⛔ THE OPERATOR'S COPY OF *WHY* — DECLARED AS A TEXT PIN, AND HERE IS WHY IT CANNOT BE DRIVEN (measured
+# 2026-11-12, review of #4001 P2). The concern is real: `--log "$out"` and the wrapper stdout are two file
+# descriptions on one path, and under a TRUNCATING redirect a child write at a lagging offset lands ON the
+# appended verdict. Driven against the shipped `lane-bound.sh` with a TERM-ignoring child that writes 4 KB
+# AFTER the verdict is on disk, the verdict SURVIVES either way — because `emit_line` writes each line to
+# stdout as well as to the log, and those stdout writes travel through the very description the child
+# inherits, so the child offset cannot fall behind by more than the appended copy. An arm here would be
+# GREEN ON BOTH FORMS, i.e. a vacuous arm, which is worse than a declared text pin.
+# The shipped form is nevertheless TRUNCATE-THEN-APPEND (never `>`): it removes the class instead of
+# relying on that offset accident holding under a future change to `emit_line`.
+grep -qF '>> "$out" 2>&1 &' "$SUT" \
+  || bad "the rail launch must APPEND to its log ('>> \"\$out\" 2>&1 &') with an explicit truncation before it — a truncating redirect puts the child write offset behind the appended bound verdict (#4001 P2)"
+grep -qF ': > "$out" 2>/dev/null || true' "$SUT" \
+  || bad "the rail log must be TRUNCATED EXPLICITLY before the launch (': > \"\$out\"') — with append-as-redirect and no truncation, a re-railed head reads the PREVIOUS attempt's BLOCK verdict through cooldown_for and takes the 6 h cooldown"
 case "${_sp:-}" in ''|*[!0-9]*) bad "the rail stub never ran (no pid recorded) — the bound was proven against nothing";; *)
   if kill -0 "$_sp" 2>/dev/null; then
     bad "the bound wrote a verdict but did NOT kill the rail (stub pid $_sp still alive): an enforcer that reports and does not terminate is inert"

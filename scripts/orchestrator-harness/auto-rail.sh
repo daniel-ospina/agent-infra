@@ -165,6 +165,14 @@ case "${RAIL_BOUND_POLL_S}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: RAIL_BOUND_POLL_S='${RAIL_BOUND_POLL_S}' is not a positive integer" >> "$LOG"; exit 3;; esac
 knob_fits RAIL_BOUND_POLL_S "$RAIL_BOUND_POLL_S"
 [ "$RAIL_BOUND_POLL_S" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: RAIL_BOUND_POLL_S='${RAIL_BOUND_POLL_S}' is not a POSITIVE integer — a zero poll makes 'sleep 0' spin the bound's own sample loop" >> "$LOG"; exit 3; }
+# TERM -> KILL grace, handed straight to `lane-bound.sh` (whose own default is the same 15s). A NAMED SEAM
+# for the reason `LAUNCH_VERIFY_S` is one: the escalation path (a rail that IGNORES TERM) is otherwise
+# 15 seconds of dead wait in every suite that wants to assert it, and an untested escalation path is where
+# a "killed" rail quietly survives its bound.
+RAIL_BOUND_GRACE_S=${RAIL_BOUND_GRACE_S:-15}
+case "${RAIL_BOUND_GRACE_S}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: RAIL_BOUND_GRACE_S='${RAIL_BOUND_GRACE_S}' is not a non-negative integer" >> "$LOG"; exit 3;; esac
+knob_fits RAIL_BOUND_GRACE_S "$RAIL_BOUND_GRACE_S"
 # The bound's implementation, beside this file because the farm delivers the harness as ONE directory
 # (`~/.pi/agent/scripts/`, `$HOME/orchestrator/`): a path that resolves only on a developer's box would
 # make the bound silently absent on the box that runs it. Absence is REFUSED AT LAUNCH (see
@@ -483,6 +491,7 @@ def slug_from_clone(path):
     return None
 
 known = [k for k in (slug_of(a) for a in sys.argv[1:]) if k]
+rows_out = []         # (slug, pr, is_wrapper) — see the WRAPPER-AND-CHILD rule at the print
 for raw in sys.stdin.buffer:
     # a single non-UTF-8 byte in any argv would otherwise kill this whole read (UnicodeDecodeError),
     # the function would print nothing, and the caller would see an unreadable population.
@@ -506,6 +515,7 @@ for raw in sys.stdin.buffer:
     # and matching ANY of them counts as a live rail. That is deliberately the FAIL-CLOSED direction: an
     # option value that happens to equal an open PR number makes one candidate skip for one pass, which
     # costs a wait; a missed rail costs a duplicate merge attempt and a slot.
+    wrapped = bool(re.search(r"(?:^|\s)\S*lane-bound\.sh(?:\s|$)", line))
     pr = ",".join(t for t in args if t.isdigit()) or "-"
     slug = None
     for j, t in enumerate(args):
@@ -519,7 +529,26 @@ for raw in sys.stdin.buffer:
             if "/%s/" % k in line:
                 slug = k
                 break
-    print("%s\t%s" % (slug or "UNKNOWN", pr))
+    # ⛔ A WRAPPER AND ITS CHILD ARE ONE OCCUPIED SLOT — AND A DUPLICATE LAUNCH IS STILL TWO (measured
+    # 2026-11-12, review of #4001 P1). `launch_rail` runs the rail as an ARGUMENT of `lane-bound.sh`, so
+    # the argv of the wrapper CONTAINS the argv of the child and BOTH lines match above, producing the same
+    # row twice: driven against this function with one live wrapped rail, `rails_for_repo` returned `2 2 0`
+    # where the truth is `1 1 0`, and because `MAX` and `MAX_TOTAL` are compared against these counts the
+    # slotted capacity HALVED while every pass line doubled the population.
+    # ⛔ SO THE COLLAPSE IS NARROWER THAN (slug, pr) — it is WRAPPER-vs-CHILD only, and that distinction is
+    # load-bearing in the other direction too. Two independent rails on the SAME PR (the #3136 duplicate
+    # launch the guard in this file exists to prevent) hold two OS processes and represent TWO pieces of load:
+    # collapsing them would make the counter lie about the very population it is here to report. The
+    # wrapper is identified by a `lane-bound.sh` TOKEN in its own argv, which the argv of the child does not
+    # carry — so a wrapper row is dropped only when a non-wrapper row exists for the same (slug, pr), and
+    # nothing else is ever collapsed. Emitted after the scan, because "is there a child row?" is not
+    # knowable while streaming.
+    rows_out.append((slug or "UNKNOWN", pr, wrapped))
+_children = set((_s, _p) for (_s, _p, _w) in rows_out if not _w)
+for _slug, _pr, _wrapped in rows_out:
+    if _wrapped and (_slug, _pr) in _children:
+        continue
+    print("%s\t%s" % (_slug, _pr))
 ' "$@"
 }
 # $1 = the repo asked about; $2.. = every repo driven. Prints "<own> <total> <unknown>".
@@ -748,9 +777,20 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
   # `reap_bounded_rail` reads. `--idle 0` disables the PROGRESS axis deliberately: a rail waiting on CI is
   # legitimately CPU-quiet, and killing a rail mid-merge on a stalled-reading `ps` sample is the
   # false-kill `lane-bound.sh`'s two-sample rule exists to avoid. This bound is ELAPSED-only, and says so.
+  # ⛔ TRUNCATE FIRST, THEN APPEND — NEVER `>` (measured 2026-11-12, review of #4001 P2). `--log "$out"` and
+  # the wrapper's own stdout are TWO file descriptions on ONE path: `lane-bound.sh`'s `emit_line` writes
+  # through an `O_APPEND` fd (EOF), while the fd this launch hands to it — inherited by the rail child —
+  # writes at its OWN LAGGING offset whenever the child prints. Under `> "$out"` the lagging writer lands ON
+  # the appended verdict: reproduced by writing 4 KB from the child after the verdict was emitted, the
+  # bound's `verdict=` line is GONE from the rail's log, while the machine-readable `--verdict-file` and the
+  # actuator's own RAIL-BOUND line survive. The operator's copy of WHY a rail died is not a cosmetic
+  # surface — it is the blindness #4001 is about — so both writers are `O_APPEND` here. The truncation is
+  # therefore explicit and happens FIRST, which also keeps `cooldown_for`'s read of this file free of the
+  # PREVIOUS attempt's verdict.
+  : > "$out" 2>/dev/null || true
   RAIL_SCRIPT="$RAIL_SCRIPT" nohup sh "$LANE_BOUND" run --wall "$RAIL_MAX_S" --idle 0 --poll "$RAIL_BOUND_POLL_S" \
-    --tag "rail-$(printf '%s' "$repo" | tr '/' '-')-$pr" --log "$out" --verdict-file "$bfile" \
-    -- bash "$RAIL_SCRIPT" "$pr" --repo "$repo" $extra < /dev/null > "$out" 2>&1 &
+    --tag "rail-$(printf '%s' "$repo" | tr '/' '-')-$pr" --log "$out" --verdict-file "$bfile" --grace "$RAIL_BOUND_GRACE_S" \
+    -- bash "$RAIL_SCRIPT" "$pr" --repo "$repo" $extra < /dev/null >> "$out" 2>&1 &
   pid=$!
   sleep "$LAUNCH_VERIFY_S"
   if kill -0 "$pid" 2>/dev/null || [ -s "$out" ]; then return 0; fi
