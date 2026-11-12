@@ -1108,13 +1108,17 @@ echo "── #2344: a scan window that is entirely ghosts, with more queue behin
 # The page carries AS MANY ghost rows as the shipped bound (agent-infra#3995: a hardcoded five would
 # no longer exhaust a 25-run window), then one row that HAS demand.
 GW_FIXTURE="$(ghost_window_fixture "$QUEUE_HEAD_SCAN_SHIPPED")"
+# ⛔ THE DEMAND ROW'S ID IS DERIVED, NOT ASSUMED (agent-infra#3995): the generator's ids are
+# `4000+i`, so at a bound of 100 they reach 4100 — a hardcoded `4100:` demand row becomes ANOTHER
+# ghost and the arms silently stop testing "ghosts then demand".
+GW_DEMAND=$((4000 + QUEUE_HEAD_SCAN_SHIPPED + 100))
 # ⛔ THE DEPTH MUST SCALE WITH THE BOUND TOO (agent-infra#3995 review cycle 2, finding 1): at a fixed
 # 40, a bound of 100 reads more rows than the page reports as deep, which is the INCONSISTENT refusal
 # — `RC` is 2 in both branches, so only the message assertions noticed, and the natural repair for a
 # future raise would be to edit the expected string and leave the arm pinning INCONSISTENT instead of
 # the window. `shipped + 15` is 40 today (no arm changes) and stays genuinely deeper at any bound.
 run_gate ghost-window GH_QUEUED="$((QUEUE_HEAD_SCAN_SHIPPED + 15))" GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="${GW_FIXTURE%%|*}" \
-  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}4100:120" \
+  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}${GW_DEMAND}:120" \
   CI_GATE_QUEUE_THRESHOLD=100 --
 assert_eq "$RC" "2" "a ghost-only scan window with real queue behind it → exit 2"
 assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the refusal names the bound it ran out of"
@@ -1200,7 +1204,7 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "the all-ghosts contradiction ad
 echo "── #2344: a bound-limited scan is never mistaken for a complete one ──"
 run_gate ghost-bound-truncated GH_QUEUED="$QUEUE_HEAD_SCAN_SHIPPED" GH_INPROGRESS=0 \
   GH_DEMAND_GHOST_IDS="${GW_FIXTURE%%|*}" \
-  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}4100:2592000" --
+  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}${GW_DEMAND}:2592000" --
 assert_eq "$RC" "2" "a bound break over a deeper page → exit 2 (could-not-measure), not 'no demand'"
 assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the refusal names the bound that stopped it"
 assert_not_contains "$OUT" "nothing is waiting for a runner" "it is NOT read as a complete measurement"
@@ -1288,10 +1292,12 @@ run_gate page-saturated GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_
   CI_GATE_QUEUE_THRESHOLD=200 --
 assert_eq "$RC" "2" "a queue deeper than the page (threshold above the page size) → exit 2"
 assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the saturation, not just a count"
-# …and at the SHIPPED bound the page-ceiling note is absent: the ceiling claim is about a bound that is
-# already at the page, and printing it at 25 would assert something false (agent-infra#3995 review
-# cycle 3, finding 1). This arm is what keeps that conditional two-sided.
-assert_not_contains "$OUT" "ONE page of" "the page-ceiling note is absent at a bound BELOW the page"
+# …and this branch carries NO page-ceiling note at all, at any bound: measured, it is only reachable
+# when the scan found a head, so `scanned` is small there and the clause could never be true — it once
+# read "the candidate list is ONE page of 100 runs" over a one-row synthesised list (agent-infra#3995
+# review cycles 3-4). The assertion below is a TRIPWIRE on that, not a two-sided pin: it would only
+# fail if the clause were reintroduced here.
+assert_not_contains "$OUT" "ONE page of" "the saturated refusal carries no page-ceiling note"
 assert_contains "$OUT" "lower bound" "the refusal says WHY the head age is unusable"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated queue read advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated queue read relabelled no runner"

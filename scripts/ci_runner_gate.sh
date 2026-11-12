@@ -850,7 +850,6 @@ print(comp, len(inc))
     0)            log "queue head scan bound is ZERO ('${QUEUE_HEAD_SCAN_MAX}') — a non-empty queue could never be measured, so this would disarm the leg rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
   QUEUE_GHOSTS=0
-  scanned=0
   queued_demanding="$queued"
   DEMAND_LABELS=""
   demand_head_id=""; demand_head_created=""
