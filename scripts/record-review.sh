@@ -3368,7 +3368,28 @@ $m"
           _ersha="$(delta_git "$root" rev-parse --verify "${_tosha}${_rrest}^{commit}" 2>/dev/null || true)" ;;
         *) _ersha="$(delta_git "$root" rev-parse --verify "${_erhs}^{commit}" 2>/dev/null || true)" ;;
       esac
-      if [ "$_elsha" = "$_ersha" ] && [ "$_elsha" = "$to" ]; then
+      # ⛔ A TWO-ENDPOINT RANGE IS EMPTY WHEN ITS RIGHT END IS AN ANCESTOR OF ITS LEFT (thirtieth review
+      # cycle, round 8 — MEASURED, a FAIL-OPEN the equality test left open, and the LAST spelling in this
+      # class): the test was `left == right == attested head`, so a claim that WROTE both endpoints and
+      # named an ancestor on the right — `HEAD..anc`, `anc..deltabase`, and the same through a sha — names
+      # NOUGHT commits and passed every arm. gitrevisions(7) semantics, not an extra spelling: `L..R` is
+      # the commits reachable from R but not from L, so it is empty whenever R is an ancestor of L or is
+      # L. What made this urgent rather than theoretical is that the round-7 fix already refuses the
+      # DECORATED spelling of the identical claim, so the verdict hung on a backtick: `` `HEAD` .. anc ``
+      # refused, `HEAD..anc` minted. Same test as every sibling arm (`merge-base --is-ancestor R L`), and
+      # it cannot refuse a real claim: an empty `L..R` never has commits to be evidence for.
+      # ⛔ AND IT MUST NOT PREEMPT A MORE SPECIFIC, MORE ACCURATE SENTENCE (MEASURED — the first cut of this
+      # test did). A claim whose RIGHT end carries a SELECTOR (`HEAD..HEAD~1`) is a tip-relative NARROWING and
+      # is refused as one; a claim whose LEFT end names a DESCENDANT (`afterhead..HEAD`) is refused as
+      # starting PAST the head; and a claim between interior commits is not this arm's business at all.
+      # Telling any of those authors their claim "states an EMPTY range" would be a false sentence about
+      # their own text — and the verdict alone cannot separate the populations, so the phrasing is the
+      # pin (20h75, 20h93, M87). The population that IS new here is narrow and exact: the attested head is
+      # WRITTEN on the left and an ANCESTOR of it on the right.
+      if [ "$_ersha" = "$_elsha" ] && [ "$_elsha" = "$to" ]; then
+        _emptyrange=1; _emptystated="${_estated:-${_elhs}..${_erhs}}"; break
+      elif [ "$_elsha" = "$to" ] && [ "$_tiprel" = 0 ] && [ "$_afterhead" = 0 ] \
+           && delta_git "$root" merge-base --is-ancestor "$_ersha" "$_elsha" 2>/dev/null; then
         _emptyrange=1; _emptystated="${_estated:-${_elhs}..${_erhs}}"; break
       fi
     done
