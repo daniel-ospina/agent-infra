@@ -1670,7 +1670,7 @@ _tiproot() { # <token> -> the token re-rooted on the attested head, or ""
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _elres="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -3311,8 +3311,21 @@ $m"
       # about — the same text with the opposite verdict, decided by where a clone happens to be. Both
       # endpoints are TIp SPELLINGS with identity-only chains ⇒ they denote the attested head itself,
       # so the range is empty in EVERY frame, and this test needs no checkout at all.
+      # ⛔ AN IDENTITY REFLOG POSITION ON THE HEAD IS STILL THE HEAD ON THE LEFT (thirtieth review cycle,
+      # round 9 — MEASURED, a FAIL-OPEN this arm's own equality test hid). `HEAD@{0}`/`@{0}`/`HEAD@{now}`
+      # are identity spellings of the attested head — the MIRROR arm already says so in as many words
+      # ("AN IDENTITY REFLOG POSITION ON A SHA IS STILL THE SAME COMMIT") — but here the token missed the
+      # identity regex as written, the split below handed `@{0}` to `rev-parse` as `<sha>@{0}` (which git
+      # REFUSES: a reflog position needs a ref), and `[ -n "$_elsha" ] || continue` DROPPED the claim
+      # before any emptiness test could see it. So `HEAD@{0}..anc`, `@{0}..anc` and `HEAD@{now}..anc` —
+      # nought commits each — minted a signed `clean`, while `@{0}..HEAD` and the SPACED
+      # `HEAD@{0} .. anc` were refused: the same claim, decided by how it was spelled and spaced. Strip
+      # the identity position into a RESOLUTION copy (the raw text stays for the message, so a refusal
+      # never quotes the author's claim as something they did not write).
+      _elres="$_elhs"
+      while [[ "$_elres" =~ ^(.+)@\{0+\}$ ]]; do _elres="${BASH_REMATCH[1]}"; done
       _lid=0; _rid=0
-      [[ "$_elhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _lid=1
+      [[ "$_elres" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _lid=1
       [[ "$_erhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _rid=1
       if [ "$_lid" = 1 ] && [ "$_rid" = 1 ]; then
         _emptyrange=1; _emptystated="${_estated:-${_elhs}..${_erhs}}"; break
@@ -3326,6 +3339,12 @@ $m"
       # the word (`_lrest` stayed `headroom` because `#HEAD` cannot strip lowercase), the resolve of
       # `${to}headroom` failed, and the `continue` walked past the range again. The selector
       # characters are what makes the split meaningful; everything else is resolved as a TOKEN.
+      if [ "$_lid" = 1 ]; then
+        # ⛔ DECIDED ABOVE, SO RESOLVE IT HERE: an identity spelling denotes the attested head in EVERY
+        # frame, which is exactly why the equality test can answer without a checkout — and leaving
+        # `_elsha` unset sent the claim down the `continue` instead.
+        _elsha="$_tosha"
+      else
       case "$_elhs" in
         HEAD|HEAD[~^]*|HEAD@\{*|@|@\{*)
           # Split the tip token off and resolve only the REST against the attested head.
@@ -3349,6 +3368,7 @@ $m"
           _elsha="$(delta_git "$root" rev-parse --verify "${_tosha}${_lrest}^{commit}" 2>/dev/null || true)" ;;
         *) _elsha="$(delta_git "$root" rev-parse --verify "${_elhs}^{commit}" 2>/dev/null || true)" ;;
       esac
+      fi
       [ -n "$_elsha" ] || continue
       # ⛔ THE RIGHT ENDPOINT IS READ IN THE ATTESTED FRAME TOO (twenty-first cycle, P2 — reviewed).
       # The LEFT endpoint had split the tip token off and resolved only its remainder against the
@@ -3369,8 +3389,8 @@ $m"
         *) _ersha="$(delta_git "$root" rev-parse --verify "${_erhs}^{commit}" 2>/dev/null || true)" ;;
       esac
       # ⛔ A TWO-ENDPOINT RANGE IS EMPTY WHEN ITS RIGHT END IS AN ANCESTOR OF ITS LEFT (thirtieth review
-      # cycle, round 8 — MEASURED, a FAIL-OPEN the equality test left open, and the LAST spelling in this
-      # class): the test was `left == right == attested head`, so a claim that WROTE both endpoints and
+      # cycle, round 8 — MEASURED, a FAIL-OPEN the equality test left open): the test was
+      # `left == right == attested head`, so a claim that WROTE both endpoints and
       # named an ancestor on the right — `HEAD..anc`, `anc..deltabase`, and the same through a sha — names
       # NOUGHT commits and passed every arm. gitrevisions(7) semantics, not an extra spelling: `L..R` is
       # the commits reachable from R but not from L, so it is empty whenever R is an ancestor of L or is
@@ -3378,6 +3398,13 @@ $m"
       # DECORATED spelling of the identical claim, so the verdict hung on a backtick: `` `HEAD` .. anc ``
       # refused, `HEAD..anc` minted. Same test as every sibling arm (`merge-base --is-ancestor R L`), and
       # it cannot refuse a real claim: an empty `L..R` never has commits to be evidence for.
+      # ⛔ NOT THE LAST SPELLING, AND THE REMAINDER IS ASYMMETRIC BY SPELLING (round 9 — reviewed, then
+      # MEASURED): an identity REFLOG position on the left (`HEAD@{0}..anc`) is the same claim and was
+      # still accepted, because the identity was recognised and then thrown away before resolution; that
+      # is fixed above. What remains is the interior PAIR: `anc..deltabase` abutting is ACCEPTED, while
+      # the spaced `anc .. deltabase` is refused (by the omitted-RIGHT arm, whose union reads it as
+      # `anc .. deltabase = anc..deltabase..HEAD`); the sentence below therefore states the boundary for
+      # the abutting spelling and does not claim the spaced one.
       # ⛔ AND IT MUST NOT PREEMPT A MORE SPECIFIC, MORE ACCURATE SENTENCE (MEASURED — the first cut of this
       # test did). A claim whose RIGHT end carries a SELECTOR (`HEAD..HEAD~1`) is a tip-relative NARROWING and
       # is refused as one; a claim whose LEFT end names a DESCENDANT (`afterhead..HEAD`) is refused as
