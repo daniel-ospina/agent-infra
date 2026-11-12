@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kreviewer-0-1794467179-p1139371-018c8fd1",
+  "_sha": "a94c8abf5f3cadda45c93f15174e853e56847e2f",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/mandate-preflight.I6drfV/seam.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/3991-atomic-farm"
+    },
+    {
+      "kind": "sha",
+      "value": "e8a6abc1c2ad9ae5d0966b4fb34071e8a1091d43"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/.worktrees/af-3991"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 30,
+  "ended_at": 1794467209,
+  "exit_code": 0,
+  "heartbeat_at": 1794467209,
+  "host": "cmux",
+  "issue": 0,
+  "kind": "reviewer",
+  "lane_id": "cmux.kreviewer-0-1794467179-p1139371-018c8fd1",
+  "lease_until": 1794467814,
+  "pid": 1139371,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794467179,
+  "state": "DONE",
+  "tag": "0",
+  "worktree": "/home/cmux/.worktrees/af-3991"
+}
