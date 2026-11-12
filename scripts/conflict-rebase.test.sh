@@ -667,7 +667,13 @@ NOSYS=("CONFLICT_REBASE_SYSTEMCTL=$TMP/no-such-systemctl" "CONFLICT_REBASE_PLIST
 OUT="$(env "${NOSYS[@]}" CONFLICT_REBASE_STATE="$S" \
   python3 "$LAUNCHER" --script "$TIMER" status 2>&1)"; RC=$?
 ck "$RC" "0" "§20a the launcher's own --script shape exits 0 (was: rc 2 every interval)"
-ckn "$OUT" "is missing" "§20b …and never refuses for a sibling resolved against \$PWD"
+# ⛔ `§20b …never refuses for a sibling resolved against $PWD` WAS HERE AND IS DELETED (#4012 review
+# cycle 2, P2). It could not fail: this run's OUT is a multi-line capture, so `ckn`/`hasnt` against a
+# short fragment holds whichever way the resolver behaves, and under the $PWD-fallback mutant the
+# launcher's own export still resolves correctly, so the mutant is unreachable from this case. The
+# property it named is carried by the pair that CAN fail — §20a (rc 0) and §20g (the vague
+# "bounded.sh is missing" cannot come back, which reds under exactly that mutant). An assertion that
+# cannot fail is the class this PR exists to close; the answer is to delete it, not to reword it.
 has "$OUT" "state dir: $S" "§20c …and it ran far enough to resolve real state"
 # (b) the launcher exports the ABSOLUTE path — the CLASS fix, not one script's workaround
 OUT="$(cd / && python3 - "$LAUNCHER" "$TMP" <<'PY'
@@ -687,7 +693,7 @@ ck "$OUT" "$TMP/child.sh" "§20d the launcher exports an ABSOLUTE HARNESS_SCRIPT
 OUT="$(cd / && env -u HARNESS_SCRIPT_PATH /bin/bash -s -- status <"$TIMER" 2>&1)"; RC=$?
 ck "$RC" "2" "§20e with no path source the timer refuses instead of guessing"
 has "$OUT" "HARNESS_SCRIPT_PATH" "§20f …and the refusal names the mechanism (a pre-#3778 launcher)"
-ckn "$OUT" "is missing" "§20g …so the vague 'bounded.sh is missing' cannot come back"
+hasnt "$OUT" "is missing" "§20g …so the vague 'bounded.sh is missing' cannot come back"
 
 # ═════════ §21: the replay carries a committer (agent-infra#4012, measured) ═══════
 # A rebase REWRITES commits, so git must author a committer on each one. The scratch repo is
@@ -714,7 +720,7 @@ OUT="$("${UNSET_IDENT[@]}" CONFLICT_REBASE_STATE="$TMP/state" GIT_CONFIG_GLOBAL=
   PATH="$TMP/fake:$PATH" python3 "$BOT" --repo "$REPO" --max 1 --interval-s 0 2>"$TMP/bot.err")"; RC=$?
 ck "$RC" "0" "§21a the pass exits 0 on an identity-less box"
 ckn "$(head_of feat/clean)" "$NOID_SHA" "§21b …and the clean branch was actually REBASED"
-ckn "$(cat "$TMP/bot.err")" "REFUSED" "§21c …and nothing was refused (no 'rebase-failed' wear a conflict's clothes)"
+hasnt "$(cat "$TMP/bot.err")" "REFUSED" "§21c …and nothing was refused (no 'rebase-failed' wear a conflict's clothes)"
 ck "$(GIT_CONFIG_GLOBAL="$NOID" git -C "$TMP/state/scratch.git" config user.email 2>/dev/null)" "" \
    "§21d precondition: that scratch repo has no committer identity of its own"
 ck "$("${UNSET_IDENT[@]}" GIT_CONFIG_GLOBAL="$NOID" git -C "$TMP/state/scratch.git" var GIT_COMMITTER_IDENT 2>/dev/null || true)" "" \
