@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12090-1794473247-p3549584-21e22717",
+  "_sha": "a38badeeba706ab4e2e30efaf13538d94cb6e8ca",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12090.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/12019-seam-guard-dedaration"
+    },
+    {
+      "kind": "sha",
+      "value": "cf17774840c44e4511e1520c82e2179a1cdfe9a4"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12090"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7232,
+  "ended_at": 1794480479,
+  "exit_code": 143,
+  "heartbeat_at": 1794480479,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12090-1794473247-p3549584-21e22717",
+  "lease_until": 1794488279,
+  "pid": 3549584,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794473247,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-12090",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12090"
+}
