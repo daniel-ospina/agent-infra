@@ -966,7 +966,14 @@ unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled
 write_repair_record dispatched pass-complete
 RUN --check
 assert_eq "$RC" 0 "T34 a unit that declares no Environment= is still gradeable"
-assert_contains "$OUT" 'cadence UNREADABLE' "T34 an assumed cadence is DISCLOSED, never presented as measured"
+# ⛔ THE ASSERTION MUST CARRY A SUFFIX ONLY THIS ROW CAN PRODUCE (review round 3, P2). A bare
+# `cadence UNREADABLE` is satisfied by the CONFLICT-REBASE row on every `arm_all` grid (`unit()`
+# truncates the unit file, so `FragmentPath` is gone and that row correctly discloses `assumed 1800 s`),
+# which made this assertion unable to fail even with the repair row's disclosure deleted — the exact
+# defect class this suite's own `row_field` header names, committed inside a test written to prevent
+# it. The two rows differ in the suffix: this probe prints `assumed 900s` (no space, the value it
+# applied) and the sibling prints `assumed 1800 s`. Pin the repair row's own spelling.
+assert_contains "$OUT" 'cadence UNREADABLE from the unit — assumed 900s' "T34 an assumed cadence is DISCLOSED on THIS row, not inherited from the sibling"
 assert_contains "$OUT" 'declares no O=' "T34 and so is the fallback state directory"
 
 arm_all
