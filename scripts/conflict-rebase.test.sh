@@ -908,6 +908,32 @@ ck "$(grep -oE '\"-c\", \"(rerere|rebase)\.' "$BOT" | grep -c .)" "3" \
    "§25c …and no invocation hardcodes a guard, so the two cannot drift apart again"
 has "$(cat "$BOT")" '"--continue" if staged else "--skip"' "§25d the resume is the mixed-shape call (continue or skip)"
 
+# ── (e2) a MALFORMED seam entry is a refusal, never a crash (review cycle 3, P2) ──
+# `shlex.split` raises `ValueError` on an unbalanced quote. With it outside the guard, a valid-JSON
+# seam entry carrying an unparseable `cmd` escaped as a ValueError all the way out: the pass died
+# with a traceback and exit 1, the report was never written, and every remaining candidate was
+# abandoned. A malformed entry must be an rc like any other failed generator.
+echo "§23v a seam entry the shell cannot even parse is a published refusal, not a crash"
+seed_fixture; add_generated_fixture pure
+BADSEAM="$TMP/generated-badquote.json"
+# ⛔ WRITTEN BY python, NOT BY printf: the point of this case is a seam entry that is VALID JSON
+# with a shell-UNPARSEABLE `cmd`. A hand-rolled printf that emits a bare quote produces invalid JSON
+# instead, which takes the other documented path (`_generated()` → Unreadable → exit 2) and would
+# leave the crash this case exists to catch untested.
+python3 -c 'import json,sys; json.dump([{"match":"gen.txt","cmd":sys.argv[1]+" \"cut","verify":"true","why":"fixture"}], open(sys.argv[2],"w"))' "$GEN" "$BADSEAM"
+GEN_SHA="$(head_of feat/gen)"
+write_prs "[$(pr_json 1505 feat/gen "$GEN_SHA" CONFLICTING DIRTY)]"
+CONFLICT_REBASE_GENERATED="$BADSEAM" run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23v the pass still exits 0 (a malformed entry is a refusal, not a traceback)"
+# ⛔ THE REAL CONSEQUENCE IS "THE PASS ABANDONED ITS REMAINING WORK", not "a traceback was seen" —
+# a crash exits before the census line, so the summary is what proves the loop survived (#4012
+# review cycle 3). Asserting on the word "Traceback" was a shape, not the property.
+has "$(cat "$TMP/bot.err")" "done: acted=" "§23w …and the pass reached its census line (nothing was abandoned)"
+has "$(cat "$TMP/bot.err")" "generated-regenerate-failed" "§23x …it is classified as a generator failure"
+ck "$(head_of feat/gen)" "$GEN_SHA" "§23y …nothing is pushed"
+has "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "1505 ADD needs-human-conflict" \
+   "§23z …and the refusal is published, not silently dropped"
+
 # ── summary ─────────────────────────────────────────────────────────────────
 printf '\n%s\n' "──────────────────────────────────────────"
 printf 'conflict-rebase.test.sh: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"

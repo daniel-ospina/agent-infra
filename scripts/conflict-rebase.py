@@ -294,12 +294,28 @@ def generated_entry(path: str) -> dict | None:
 
 
 def _run_generated(wt: Path, entry: dict, which: str) -> subprocess.CompletedProcess:
-    """Run the entry's `cmd` (regen) or `verify`, in the rebase worktree. Never raises."""
-    argv = shlex.split(entry[which])
+    """Run the entry's `cmd` (regen) or `verify`, in the rebase worktree. Never raises.
+
+    ⛔ `shlex.split` IS INSIDE THE GUARD, AND THE DOCSTRING WAS LYING UNTIL IT WAS (#4012 review,
+    cycle 3 P2). It raises `ValueError` on an unbalanced quote or escape, and the first version had
+    it OUTSIDE the `try`, which guarded `OSError` only. A seam entry that is valid JSON with an
+    unparseable `cmd` (the shape a hand-written JSON string produces by accident — and the seam
+    exists precisely so operators write these) then escaped as a `ValueError` through
+    `_run_generated` → the `Refused`-only `try` at the call site → `rebase_pr`, which translates
+    `RuntimeError` only → `main`, which catches `(Refused, Unreadable)`. Result: the pass died with
+    a traceback and exit 1, the `--report` was never written, and every remaining candidate was
+    abandoned — a crash on the path whose whole purpose is to make failures OBSERVABLE.
+    A malformed entry is now an rc like any other failed generator: it is classified
+    `generated-regenerate-failed`, published on the PR, and the pass continues.
+    """
+    raw = str(entry[which])
     try:
+        argv = shlex.split(raw)
+        if not argv:
+            raise ValueError("the command is empty")
         return run(argv, cwd=str(wt))
-    except OSError as e:  # the generator's interpreter is not installed on this box
-        return subprocess.CompletedProcess(argv, 127, "", str(e))
+    except (OSError, ValueError) as e:
+        return subprocess.CompletedProcess([raw], 127, "", f"cannot run {raw!r}: {e}")
 
 
 class Unreadable(Exception):
