@@ -64,6 +64,9 @@ case "${1:-}" in
     [ "${1:-}" = "--allow-escape-sequences" ] && shift
     ep="${1:-}"
     if [ "$method" = "POST" ]; then
+      # `fail-post` makes the POST FAIL, which is how the suite proves the escalation's ORDER: a head
+      # must not be parked on a failed post, or `ps_gates` refuses it and the comment is lost for ever.
+      [ -f "$F/fail-post" ] && { echo "gh: HTTP 502 from the API" >&2; exit 1; }
       case "$ep" in
         *"/issues/"*)
           body=""
@@ -703,6 +706,22 @@ out="$(PS_DRY_RUN=1 run_pass)"
 has "$out" "would-park-and-escalate at the review-round ceiling" "at the ceiling a dry run ANNOUNCES the park it would do"
 [ -s "$STATE/parked-77" ] && bad "a dry run must not park the head at the ceiling" || ok "the ceiling path writes NO park in a dry run"
 [ -s "$FIX/comment-posts.log" ] && bad "a dry run must not post an escalation comment at the ceiling" || ok "the ceiling path posts NO PR comment in a dry run"
+
+# (v4c) THE ESCALATION IS POSTED **BEFORE** THE HEAD IS PARKED (fresh-context review, P2, verified).
+# `ps_gates` refuses a head parked at this sha, so parking first meant one failed POST lost the only
+# PR-visible artifact for ever. Proved by a POST that fails: the head must stay UNPARKED, and a later
+# pass (post restored) must then escalate AND park. The tag check is what makes the retry duplicate-free.
+reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 2
+printf '2\n' > "$STATE/psick-77-$sha12r"              # the head is ALREADY at its repair cap
+touch "$FIX/fail-post"
+out="$(run_pass)"
+has "$out" "the escalation could NOT be posted" "a failed POST is NAMED, not swallowed"
+[ -s "$STATE/parked-77" ] && bad "a head must NOT be parked when the escalation could not be posted" \
+  || ok "the head stays UNPARKED, so the next pass can retry the escalation"
+rm -f "$FIX/fail-post"
+out="$(run_pass)"
+eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "the retry posts the escalation exactly once"
+eq "$(cat "$STATE/parked-77" 2>/dev/null)" "$sha_red" "…and only THEN is the head parked"
 
 # (v5) THE CEILING IS THE RECORDED ONE (`state/reviewround-<PR>`, agent-infra#3441), not an invented
 # bound: at the ceiling a fixer would push a head whose review is refused by that same ceiling, so no
