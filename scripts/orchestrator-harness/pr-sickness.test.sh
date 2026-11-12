@@ -677,6 +677,11 @@ has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "prsick-review-fix-cap:$sha12r
 # `merge-one.sh` [rrceiling]: "A push does NOT re-arm this book (it is cumulative across heads)").
 # BOUND 1's budget is keyed on the TREE, so a push IS its remedy — pinned here as the positive half.
 has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a **push re-arms it**" "BOUND 1's escalation names the push as the remedy (true: this budget is keyed on the tree)"
+# ⛔ THE MANUAL REMEDY MUST NAME THE COUNTER THAT HOLDS THE BOUND (fresh-context review, P2, verified):
+# the bound is `psick-<PR>-<sha12>`, so a remedy that removed only the park pair re-parks on the very
+# next pass. Both the parkreason and the PR comment must carry the counter path.
+has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "psick-77-$sha12r" "BOUND 1's parkreason names the counter that actually holds the bound"
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "psick-77-$sha12r" "…and so does the PR comment, so following it actually clears the bound"
 out="$(run_pass)"
 has "$out" "skip #77: parked at this head — needs a human" "a later pass reads the park, not the cap"
 eq "$(grep -c 'prsick-review-fix-cap' "$FIX/comment-posts.log" 2>/dev/null)" "1" "and posts NO second comment"
@@ -699,6 +704,12 @@ has "$(cat "$STATE/parkreason-77" 2>/dev/null)" "PUSH DOES NOT RE-ARM IT" "…an
 no  "$(cat "$STATE/parkreason-77" 2>/dev/null)" "re-arms it" "…not the false 'a push re-arms it' (verified against merge-one.sh's [rrceiling] park)"
 has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "a push does NOT re-arm this one" "the ceiling's PR comment says a push does NOT re-arm the review-round book"
 no  "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "re-arms both the per-head attempt budget and the review round" "…and the one fixed paragraph that claimed a push re-arms BOTH bounds is gone"
+# ⛔ THE "WHAT HAPPENED" SENTENCE MUST MATCH THIS BOUND TOO (fresh-context review, P2, verified). The
+# ceiling returns BEFORE the brief and before the spawn — this very case asserts `spawns=0` two lines
+# above — so a comment still saying "this queue dispatched a fixer lane automatically" contradicts the
+# run that posted it and reads a spent ROUND as a fixer that could not fix.
+has "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "No fixer was dispatched for this head" "the ceiling's comment says what actually happened (no fixer was spent)"
+no  "$(cat "$FIX/comment-posts.log" 2>/dev/null)" "dispatched a fixer lane automatically" "…and does NOT claim a fixer ran (the constant paragraph that lied to the operator is gone)"
 # ⛔ MAX_REVIEW=0 IS REPORT-ONLY (the MAX_REVIEW_TRIES idiom), so the ceiling is DISABLED — a box
 # configured to buy no reviews must not refuse a repair on a budget it never configured.
 reset_all; pulls_one 77 "$sha_red"; rec_write 77 "$sha_red" not-clean 1

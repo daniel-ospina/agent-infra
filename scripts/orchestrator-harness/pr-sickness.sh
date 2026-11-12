@@ -1005,8 +1005,15 @@ ps_review_cap_hit() { [ "${1:-0}" -ge "$(ps_maxtries "$PS_MAX_TRIES")" ]; }
 # One fixed paragraph saying "a push re-arms both" was FALSE for the ceiling, and it reached a human —
 # the wrong half of a bound-telling. So the caller passes the true remedy for its own bound; `$5` is
 # required, so a future third bound cannot inherit a fact that is not its own.
+# ⛔ AND THE "WHAT HAPPENED" SENTENCE IS ARGUMENT `$6` FOR THE SAME REASON (fresh-context review, P2,
+# verified): it used to be a constant saying "this queue dispatched a fixer lane automatically", which
+# BOUND 2's path DISPROVES — the ceiling check returns before the brief and before `ps_spawn_fixer`, so
+# at the ceiling no fixer was dispatched at all (the suite's (v5) asserts `spawns=0` and still posts
+# the comment). One comment told the operator both that a lane ran and that no lane was spent, so a
+# spent ROUND was readable as a fixer that could not fix. Same rule as `$5`: required, so no bound can
+# inherit another bound's story.
 ps_review_escalate() {
-  local repo="$1" pr="$2" sha="$3" why="$4" rearm="$5" tag seen body ghbin
+  local repo="$1" pr="$2" sha="$3" why="$4" happened="$5" rearm="$6" tag seen body ghbin
   ghbin="${PS_GH:-gh}"
   command -v "$ghbin" >/dev/null 2>&1 || { printf '[prsick] #%s escalate: no usable gh — the reason is only in this log\n' "$pr"; return 1; }
   tag="<!-- prsick-review-fix-cap:${sha:0:12} -->"
@@ -1018,11 +1025,9 @@ ps_review_escalate() {
 
 $why
 
-**What already happened:** a fresh-context review recorded a \`not-clean\` verdict at \`${sha:0:12}\`, so
-this queue dispatched a fixer lane automatically (no agent decided that) — and the loop is now at its
-bound. **Nothing further will be dispatched for this head.**
+**What already happened:** a fresh-context review recorded a \`not-clean\` verdict at \`${sha:0:12}\`. $happened
 
-**How this bound clears:** $rearm
+**Nothing further will be dispatched for this head. How this bound clears:** $rearm
 
 Recorded by \`scripts/orchestrator-harness/pr-sickness.sh\` (agent-infra#4011)."
   "$ghbin" api -X POST "repos/$repo/issues/$pr/comments" -f body="$body" >/dev/null 2>&1 || {
@@ -1072,9 +1077,13 @@ ps_review_decide() {
     # state this arm exists to end.
     if [ -s "$(ps_state_dir)/parked-$pr" ] && [ "$(cat "$(ps_state_dir)/parked-$pr" 2>/dev/null)" = "$sha" ]; then :; else
       printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
-      printf '%s\n' "a not-clean review at head=$sha is still unfixed after $bcnt fixer attempt(s) (PS_MAX_TRIES=$PS_MAX_TRIES) — a human must decide; a push re-arms it (this budget is keyed on the TREE), or: rm -f '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr'" \
+      printf '%s\n' "a not-clean review at head=$sha is still unfixed after $bcnt fixer attempt(s) (PS_MAX_TRIES=$PS_MAX_TRIES) — a human must decide. This budget is keyed on the TREE, so a push re-arms it; to re-arm deliberately: rm -f '$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)' '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr'" \
         > "$(ps_state_dir)/parkreason-$pr" 2>/dev/null || true
-      ps_review_escalate "$repo" "$pr" "$sha" "**Cap hit:** \`PS_MAX_TRIES=$(ps_maxtries "$PS_MAX_TRIES")\` fixer attempts were spent on this head (\`${sha:0:12}\`) and the recorded verdict is still \`not-clean\` (${rfindings:-?} open finding(s)). A fixer that cannot fix is finite by design: dispatch stops here." "this budget is **keyed on the TREE** (\`psick-$pr-<head12>\`), so a **push re-arms it**: the new head gets its own budget, and any lane that pushes does that for you. Nothing else is needed." >/dev/null
+      # ⛔ THE REMEDY MUST NAME THE COUNTER THAT HOLDS THE BOUND (fresh-context review, P2, verified):
+      # the bound is `psick-<PR>-<sha12>` (`ps_gates` reads it, `ps_review_cap_hit` compares it). A remedy
+      # that removed only the park pair left the counter, so the very next pass re-parked with the same
+      # reason — an escape that does not escape, printed to the only operator who reads this file.
+      ps_review_escalate "$repo" "$pr" "$sha" "**Cap hit:** \`PS_MAX_TRIES=$(ps_maxtries "$PS_MAX_TRIES")\` fixer attempts were spent on this head (\`${sha:0:12}\`) and the recorded verdict is still \`not-clean\` (${rfindings:-?} open finding(s)). A fixer that cannot fix is finite by design: dispatch stops here." "This queue booked \`$bcnt\` fixer attempt(s) against head \`${sha:0:12}\` — this budget is SHARED with the red-check source — and the recorded verdict is still \`not-clean\`, so a fixer that cannot fix is finite by design." "this budget is **keyed on the TREE** (\`psick-$pr-<head12>\`), so a **push re-arms it**: the new head gets its own budget, and any lane that pushes does that for you. To re-arm the head in place instead: \`rm -f \$O/state/psick-$pr-${sha:0:12} \$O/state/parked-$pr \$O/state/parkreason-$pr\`." >/dev/null
     fi
     return 1
   fi
@@ -1095,7 +1104,7 @@ ps_review_decide() {
       # and be exactly as stuck, with this parkreason telling them it was the remedy.
       printf '%s\n' "this PR has spent its review-round ceiling (rounds=$book MAX_REVIEW=$max) at head=$sha, so a fixer here would produce a head no review may be bought for — a human must decide. This book is CUMULATIVE across heads, so a PUSH DOES NOT RE-ARM IT (only a CLEAN verdict or the PR leaving the queue clears it). To re-arm deliberately: rm -rf '$(ps_state_dir)/reviewround-$pr' '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr', or raise MAX_REVIEW" \
         > "$(ps_state_dir)/parkreason-$pr" 2>/dev/null || true
-      ps_review_escalate "$repo" "$pr" "$sha" "**Review-round ceiling:** this PR has already spent \`$book\` of \`$max\` review rounds (\`state/reviewround-$pr\`, agent-infra#3441). A fixer dispatched now would push a NEW head, and the review of that head is refused by the same ceiling — so no fixer is spent." "**a push does NOT re-arm this one.** \`state/reviewround-$pr\` is CUMULATIVE ACROSS HEADS by design (agent-infra#3441), so only a \`CLEAN\` verdict or the PR leaving the queue clears it. To re-arm deliberately: raise \`MAX_REVIEW\`, or \`rm -rf \$O/state/reviewround-$pr \$O/state/parked-$pr \$O/state/parkreason-$pr\`, or decide this PR by hand." >/dev/null
+      ps_review_escalate "$repo" "$pr" "$sha" "**Review-round ceiling:** this PR has already spent \`$book\` of \`$max\` review rounds (\`state/reviewround-$pr\`, agent-infra#3441). A fixer dispatched now would push a NEW head, and the review of that head is refused by the same ceiling — so no fixer is spent." "**No fixer was dispatched for this head.** The review-round book was already spent when the verdict arrived, so a fix would buy a head whose review the same ceiling refuses — nothing was spent and nothing ran." "**a push does NOT re-arm this one.** \`state/reviewround-$pr\` is CUMULATIVE ACROSS HEADS by design (agent-infra#3441), so only a \`CLEAN\` verdict or the PR leaving the queue clears it. To re-arm deliberately: raise \`MAX_REVIEW\`, or \`rm -rf \$O/state/reviewround-$pr \$O/state/parked-$pr \$O/state/parkreason-$pr\`, or decide this PR by hand." >/dev/null
     fi
     return 1
   fi
@@ -1132,13 +1141,27 @@ ps_review_decide() {
   return 0
 }
 
-# brief_gate_probe -> 0 when the fixer contract renders on this box. Resolved the way fix-one.sh
-# resolves it (`brief_gate_lib` lives in brief-gate.sh itself), and probed BESIDE this module first so a
-# lane running from its own checkout tests the copy it will dispatch with.
+# brief_gate_probe -> 0 when the fixer contract renders on this box. ⛔ IT MUST RESOLVE THE **SAME COPY** THE
+# FIXER WILL LOAD (fresh-context review, P3, verified). `ps_spawn_fixer` spawns `$O/fix-one.sh`, and
+# fix-one.sh resolves its validator with `brief_gate_lib` (`spawn-gate.sh:3984-3997`), which searches
+# `${O:-}/brief-gate.sh` FIRST. A probe searching this module's sibling first would PASS on a checkout
+# copy while the dispatched fixer loaded `$O`'s and exited 78 at the validator step — BEFORE it can write
+# `fixgate-`/`fixbail-` (`fix-one.sh:86-89`), so `ps_spawn_fixer`'s booking is never refunded and the head
+# is finally parked and escalated for attempts that did no work. So: use `brief_gate_lib` itself when it
+# is loaded (it is, in every controller/lane context — `fix-one.sh:62` requires it), and otherwise keep a
+# fallback list whose ORDER MATCHES ITS OWN (`$O` first).
 brief_gate_probe() {
   local d c
-  for c in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/brief-gate.sh" \
-           "${O:-$HOME/orchestrator}/brief-gate.sh" \
+  if declare -f brief_gate_lib >/dev/null 2>&1; then
+    c="$(brief_gate_lib 2>/dev/null)" || c=""
+    if [ -n "$c" ] && [ -f "$c" ]; then
+      bash "$c" --section fixer >/dev/null 2>&1
+      return $?
+    fi
+  fi
+  for c in "${O:-$HOME/orchestrator}/brief-gate.sh" \
+           "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/brief-gate.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh" \
            "${HOME:-}/.pi/agent/scripts/orchestrator-harness/brief-gate.sh" \
            "${HOME:-}/.pi/agent/scripts/brief-gate.sh"; do
     [ -n "$c" ] && [ -f "$c" ] || continue
