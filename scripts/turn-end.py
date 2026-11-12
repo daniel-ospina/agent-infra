@@ -465,6 +465,30 @@ def lanes_with_open_question(known_lanes=None) -> set:
     return out
 
 
+def route_gate(row, session_path=None):
+    """`(may_nudge, Route)` for a `lane-status.py` row — the ONE place this file asks the router.
+
+    ⛔ EXTRACTED SO THE GATE CAN BE TESTED AS A GATE (fresh-context review round 3, #4046 P2). While
+    this lived inline in `main()`'s loop, a change that stopped calling it — or that built the Evidence
+    differently from what `scripts/lane-route.py` builds — left every suite green, because `main()`
+    shells out to `lane-status.py` and cannot be driven hermetically. The loop still owns the `continue`;
+    `tests`/`tools/fleet/triage.test.py` drives THIS with real rows.
+
+    ⛔ `steerable` IS PASSED (sid, ws, session_path), NOT `sid` ALONE. A live `pi` on this fleet has argv
+    exactly `pi`, so the argv probe alone answers `None` for every ordinary lane — which made this file
+    nudge nobody. See `triage.steerable`'s docstring for the second, affirmative proof (an interactive
+    session bound to a workspace) and why a `pi -p --no-session` lane cannot satisfy either.
+    """
+    ev = _triage.Evidence(
+        lane=row.get("lane") or "",
+        turn=_liveness.turn_from_jsonl(session_path) if session_path else None,
+        last_text=_triage.last_text_from_jsonl(session_path) if session_path else "",
+        lane_verdict=row.get("verdict") or "",
+        steerable=_triage.steerable(row.get("sid"), ws=row.get("ws"), session_path=session_path),
+    )
+    return _triage.may_continue(ev)
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -556,20 +580,7 @@ def main(argv: list[str]) -> int:
             #     reconsidered next pass), never the lane. `scripts/lane-route.py` prints the
             #     aggregate `router=refuse:N` line those refusals would otherwise be invisible in.
             if _triage is not None:
-                _ev = _triage.Evidence(
-                    lane=lane,
-                    turn=_liveness.turn_from_jsonl(f) if f else None,
-                    last_text=_triage.last_text_from_jsonl(f),
-                    lane_verdict=r.get("verdict") or "",
-                    # ⛔ (sid, ws, session_path) — NOT `sid` alone. Five freshly-context-reviewed
-                    # live `pi` processes on this fleet have argv exactly `pi`, so the argv probe finds
-                    # no candidate and the one-argument form answered `None` for every ordinary lane:
-                    # the router then refused `idle-continue` and this file nudged NOBODY. See
-                    # `triage.steerable` — an interactive session bound to a workspace is the second,
-                    # affirmative proof. `r.get("ws")` is the row's own workspace id.
-                    steerable=_triage.steerable(sid, ws=r.get("ws"), session_path=f),
-                )
-                _may, _route = _triage.may_continue(_ev)
+                _may, _route = route_gate(r, f)
                 if not _may:
                     log(f"SKIP {lane}: route={_route.route}"
                         f"{('/' + _route.subcase) if _route.subcase else ''}"

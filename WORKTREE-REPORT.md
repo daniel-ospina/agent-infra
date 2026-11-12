@@ -13,9 +13,9 @@ command is quoted verbatim so it can be re-run.
 
 | command | result |
 |---|---|
-| `python3.12 tools/fleet/triage.test.py` | `PASS=242 FAIL=0` |
+| `python3.12 tools/fleet/triage.test.py` | `PASS=254 FAIL=0` |
 | `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (12 RED controls, all fired) |
-| `/tmp/pyenv4046/bin/python -m pytest scripts/test_bounce_state.py scripts/test_dispatch_wiring.py scripts/test_turn_classify_state.py scripts/test_lane_relaunch.py -q --timeout=180` | `137 passed in 14.64s` |
+| `/tmp/pyenv4046/bin/python -m pytest scripts/test_bounce_state.py scripts/test_dispatch_wiring.py scripts/test_turn_classify_state.py scripts/test_lane_relaunch.py -q --timeout=180` | `137 passed in 14.51s` |
 | `python3.12 tools/fleet/liveness.test.py` | `PASS=58 FAIL=0` (+ `every stated count matches the suite (58 tests, 113 mutations)`) |
 | `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | `FAILURES: 1` — **PRE-EXISTING, base-owned** (see below) |
 | `bash scripts/check-farm-drift.sh` | `UNKNOWN — COMPARING AGAINST THE WRONG TREE` (rc 0): the box is pinned at `d5c6dc7530` and this worktree is at `330ac09c0`. Not a red, and not a green — it refuses to compare across a pin, which is the behaviour it documents. |
@@ -68,7 +68,7 @@ open turn + retry tail → `model-retry`/`rerun` (the positive control, still re
 ```
 tools/fleet/triage.py          NEW  the router: precedence, wedged subcases, remedies, proof table
 tools/fleet/triage_arms.py     NEW  the three arms, each proving its effect at its artifact
-tools/fleet/triage.test.py     NEW  hermetic suite, 223 assertions, 12 RED controls
+tools/fleet/triage.test.py     NEW  hermetic suite, 254 assertions, 12 RED controls
 scripts/lane-route.py          NEW  operator CLI (route / --json / --apply)
 scripts/turn-end.py            MOD  gates its WIP nudge on triage.may_continue()
 pi-bootstrap/setup.sh          MOD  farms triage.py + triage_arms.py into $DEST/scripts/fleet
