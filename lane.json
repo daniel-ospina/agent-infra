@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-2834-1794486068-p2773023-ed3d7b46",
+  "_sha": "84e727fe38fc4625d20861be8cae68db6e0c99fb",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.tN82OooMRd/O/logs/lane.log"
+    },
+    {
+      "kind": "branch",
+      "value": "work"
+    },
+    {
+      "kind": "sha",
+      "value": "5cf764522d03a8199f75216b92a01c3a77f94305"
+    },
+    {
+      "kind": "worktree",
+      "value": "/tmp/tmp.tN82OooMRd/wt"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 900,
+  "duration_s": 30,
+  "ended_at": 1794486098,
+  "exit_code": 0,
+  "heartbeat_at": 1794486098,
+  "host": "cmux",
+  "issue": 2834,
+  "kind": "lane",
+  "lane_id": "cmux.klane-2834-1794486068-p2773023-ed3d7b46",
+  "lease_until": 1794486998,
+  "pid": 2773023,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1794486068,
+  "state": "DONE",
+  "tag": "2834",
+  "worktree": "/tmp/tmp.tN82OooMRd/wt"
+}
