@@ -507,10 +507,66 @@ printf '[Service]\nEnvironment=FOO=1 \\\n    AGENT_SKIP_REVIEW_GATE_DISABLED=1\n
 bash "$POLICY" --unit-veto "$TMP/cleancont.service" cleancont >/dev/null 2>&1 \
   && ok "(5d) edges: a clean continuation whose value only CONTAINS a hatch name is still clean (a name, not a substring — and the fold is not matching everything)" \
   || bad "(5d) edges: the continued superset name AGENT_SKIP_REVIEW_GATE_DISABLED was vetoed — the match is a substring, not a name"
+# ⛔ THIS ARM USED TO ASSERT THE DEFECT (fresh review of #4002, P1 — reproduced end-to-end: the hatch was
+# INSTALLED, `ai-drainer scheduled`, rc=0). It pinned "a comment line that wraps is folded too, so the
+# joined line still STARTS with `#`" — which is the opposite of systemd. `conf-parser.c:359-361` checks a
+# line's first non-blank character against `#;` and `continue`s BEFORE the escape scan, so a comment line
+# can never START a continuation: line 2 below is a live `Environment=` directive and systemd sets the
+# hatch. Requiring rc=1 here is the correct verdict; as written the arm would have RED a correct fix, and
+# the cheapest green for the next fixer would be to restore the fail-open.
 printf '[Service]\n# a comment wrapping \\\nEnvironment=AGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/commentwrap.service"
-bash "$POLICY" --unit-veto "$TMP/commentwrap.service" commentwrap >/dev/null 2>&1 \
-  && ok "(5d) edges: a WRAPPED COMMENT swallows its continuation (systemd's rule) and is not a declaration" \
-  || bad "(5d) edges: a wrapped comment's continuation was graded — the fold is not faithful to systemd"
+CW_RC=0; bash "$POLICY" --unit-veto "$TMP/commentwrap.service" commentwrap >/dev/null 2>&1 || CW_RC=$?
+[ "$CW_RC" -eq 1 ] \
+  && ok "(5d) edges: a WRAPPED COMMENT never starts a continuation — the line after it IS a declaration (systemd's rule), so it is vetoed" \
+  || bad "(5d) edges: a wrapped comment swallowed the declaration after it (rc=$CW_RC, want 1) — this is the fail-open the review reproduced"
+# ⛔ A COMMENT INSIDE A CONTINUATION DOES NOT CLOSE IT (fresh review of #4002, P1 — the fail-open direction).
+# `conf-parser.c:359-361` skips the comment line WITHOUT touching `continuation`, and `:372-387` then appends
+# the next real line to it, so this is ONE `Environment=` directive in which the hatch IS set
+# (`systemd.syntax(7)` `[Section C]`). The awk fold printed on the comment and ended the join, leaving the
+# hatch on a physical line that no longer started with `Environment=` — CLEAN, and the installer installed it.
+# All three comment spellings (`#`, `;`, and a multi-line block) are the same rule, so all three are graded.
+for cshape in hash semi block; do
+  case "$cshape" in
+    hash) note='# hatch deliberately disabled below' ;;
+    semi) note='; hatch deliberately disabled below' ;;
+    block) note='# first ignored line' ;;
+  esac
+  if [ "$cshape" = block ]; then
+    printf '[Service]\nEnvironment=FOO=1 \\\n# first ignored line\n; second ignored line\n    # third, indented\nAGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/comment-inside.service"
+  else
+    printf '[Service]\nEnvironment=FOO=1 \\\n%s\nAGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' "$note" >"$TMP/comment-inside.service"
+  fi
+  CIN_RC=0; bash "$POLICY" --unit-veto "$TMP/comment-inside.service" "comment-inside-$cshape" >/dev/null 2>&1 || CIN_RC=$?
+  [ "$CIN_RC" -eq 1 ] \
+    && ok "(5d) edges: a '$cshape' comment INSIDE a continued Environment= does not close it — the hatch on the next line IS set, so it is vetoed" \
+    || bad "(5d) edges: a '$cshape' comment inside a continuation ended the join (rc=$CIN_RC, want 1) — the hatch lands on a line that no longer starts with Environment="
+done
+# …and the BLANK line is the same trap with the opposite rule: a blank line is NOT a comment, so the pending
+# continuation ENDS there (`conf-parser.c:372-409` — the accumulator's last character is the space the `\`
+# became). Skipping it instead joins the FOLLOWING line into the previous directive, and
+# `ExecStart=/bin/true \` + (blank) + `Environment=<hatch>` is a hatch systemd DOES set — buried in an
+# `ExecStart=` the judge never extracts. This arm is what separates a faithful flush from the sibling
+# `logical_lines()` accumulator, which skips blank lines: substituting that convention verbatim answers CLEAN here.
+printf '[Service]\nExecStart=/bin/true \\\n\nEnvironment=AGENT_SKIP_REVIEW_GATE=1\n' >"$TMP/blank-inside.service"
+BLK_RC=0; bash "$POLICY" --unit-veto "$TMP/blank-inside.service" blank-inside >/dev/null 2>&1 || BLK_RC=$?
+[ "$BLK_RC" -eq 1 ] \
+  && ok "(5d) edges: a BLANK line ends a pending continuation, so the Environment= after it is a live declaration — vetoed" \
+  || bad "(5d) edges: a blank line did not end the continuation (rc=$BLK_RC, want 1) — the next line was swallowed into ExecStart= and the hatch read CLEAN"
+# ⛔ ONLY AN UNESCAPED BACKSLASH CONTINUES (fresh review of #4002, P2 — the over-block direction, reproduced).
+# systemd's `escaped` flag is the PARITY of the trailing run (`conf-parser.c:389-399`), so `\\` ends the
+# line: this unit sets PATH with a literal backslash and mentions the hatch in a comment, and systemd reads
+# it as clean. The awk fold joined it anyway and VETOED it, i.e. the operator could not install a correct
+# unit. The twin below is the same fixture with ONE trailing backslash (a real continuation), so the pair
+# pins parity rather than "the fold stopped folding".
+printf '[Service]\nEnvironment=PATH=/opt/bin\\\\\n# AGENT_SKIP_REVIEW_GATE is deliberately NOT set here\nExecStart=/bin/true\n' >"$TMP/escaped.service"
+bash "$POLICY" --unit-veto "$TMP/escaped.service" escaped >/dev/null 2>&1 \
+  && ok "(5d) edges: a line ending in an ESCAPED backslash does not continue (systemd's parity rule), so its following comment is not part of the declaration" \
+  || bad "(5d) edges: an escaped trailing backslash was joined with the next line — a clean unit is refused on the install path"
+printf '[Service]\nEnvironment=PATH=/opt/bin\\\n# AGENT_SKIP_REVIEW_GATE is deliberately NOT set here\nExecStart=/bin/true\n' >"$TMP/escaped-twin.service"
+ESC_TWIN_RC=0; bash "$POLICY" --unit-veto "$TMP/escaped-twin.service" escaped-twin >/dev/null 2>&1 || ESC_TWIN_RC=$?
+[ "$ESC_TWIN_RC" -eq 0 ] \
+  && ok "(5d) edges: …and the ONE-backslash twin of that fixture is also clean (the comment is dropped, so no hatch reaches the declaration)" \
+  || bad "(5d) edges: the one-backslash twin answered rc=$ESC_TWIN_RC (want 0) — the parity arm is not measuring parity"
 # …and the LAUNCHD half of the grader must be able to REDDEN (fresh review of #4002, P2). 5a passes if the
 # `<key>` branch does nothing at all — no shipped plist carries a hatch — so without a mutated copy the
 # "grades BOTH declaration dialects" claim is proven for one dialect only. Mutated in $TMP, never the

@@ -114,7 +114,10 @@ GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP
 gate_policy_unit_veto() {
   local f="${1:-}" label="${2:-declaration}" flag hit="" folded="" envlines=""
   [ -n "$f" ] || { printf 'unit-veto: no file named — cannot grade '\''%s'\''\n' "$label" >&2; return 2; }
-  [ -r "$f" ] || { printf 'unit-veto: cannot read %s — an ungradable %s is not a clean one\n' "$f" "$label" >&2; return 2; }
+  [ -r "$f" ] && [ ! -d "$f" ] || {
+    printf 'unit-veto: cannot read %s — an ungradable %s is not a clean one\n' "$f" "$label" >&2
+    return 2
+  }
   # ⛔ FOLD BACKSLASH CONTINUATIONS *BEFORE* EXTRACTING DIRECTIVES (fresh review of #4002, P1 — reproduced).
   # systemd joins a line ending in an unescaped `\` with the following one and replaces the backslash with
   # a space (`systemd.syntax(7)`), so this is ONE valid declaration that sets the hatch:
@@ -124,15 +127,54 @@ gate_policy_unit_veto() {
   # the exact "silently stopped matching" fail-open this function exists to prevent. Wrapping is the
   # documented use of the continuation (`Environment=PATH={{PATH}}` is exactly the long line someone
   # wraps), so this was reachable, not theoretical.
-  # The fold is faithful rather than conservative: a comment line that wraps is folded too, so the joined
-  # line still STARTS with `#` and is not extracted — matching systemd, where a comment swallows its
-  # continuation. Only a backslash as the LAST character continues (a backslash followed by spaces does
-  # not, which is systemd's rule: trailing whitespace breaks it).
-  folded="$(awk '{ if ($0 ~ /\\$/) { sub(/\\$/,""); buf = buf $0 " "; next } print buf $0; buf="" }
-                END { if (buf != "") print buf }' "$f" 2>/dev/null)" || {
-    printf 'unit-veto: could not fold the continuations of %s — an ungradable %s is not a clean one\n' "$f" "$label" >&2
-    return 2
-  }
+  # ⛔ THE FOLD MUST BE `systemd`'S SCANNER, NOT A PER-PHYSICAL-LINE "does it end with a backslash"
+  # (fresh review of #4002, P1 + P2 — BOTH reproduced against this function at the review head). The
+  # previous awk fold was wrong in four ways, and the first two are FAIL-OPEN — a hatch installed with
+  # the judge's blessing, which is the exact #4002 class this function exists to close. Verified against
+  # the parser itself (`src/shared/conf-parser.c:355-409`, systemd main; `systemd.syntax(7)` `[Section C]`):
+  #  1. A COMMENT LINE IS SKIPPED AND TOUCHES NOTHING — it neither starts a continuation (its own trailing
+  #     `\` counts for nothing) nor CLOSES a pending one (the accumulator survives it). So
+  #     `Environment=FOO=1 \` + `# note` + `AGENT_SKIP_REVIEW_GATE=1` is ONE `Environment=` directive and
+  #     systemd sets the hatch. The fold ended the join at the comment, leaving the hatch on a line that
+  #     no longer started with `Environment=` — CLEAN, and `install-drainer-timer.sh --install` installed it.
+  #     The old comment here claimed the opposite ("a comment swallows its continuation") and the arm that
+  #     pinned it (`§5d` wrapped-comment) asserted the DEFECT; both are corrected.
+  #  2. A BLANK LINE IS NOT A COMMENT: systemd appends it and the pending continuation then ENDS (the
+  #     accumulator's last character is the space the `\` became), so this fold FLUSHES on it. Skipping it
+  #     instead joins the line AFTER it into the previous directive: `ExecStart=/bin/true \` + (blank) +
+  #     `Environment=AGENT_SKIP_REVIEW_GATE=1` is a hatch systemd DOES set, and the join would bury it in an
+  #     `ExecStart=` this function never extracts — the same fail-open by another route.
+  #  3. ONLY AN UNESCAPED BACKSLASH CONTINUES: systemd's `escaped` flag is the PARITY of the trailing run,
+  #     so a line ending in `\\` ends the line. Joining it anyway VETOED a clean unit (`PATH=/opt/bin\\`
+  #     then a commented mention of the hatch) that installs fine — an over-block on the operator path.
+  #  4. TRAILING BLANKS ARE NOT TRIMMED BEFORE THE SCAN (systemd uses the raw line), so `\` followed by a
+  #     space does NOT continue. Trimming would join two directives systemd keeps apart — hiding the
+  #     declaration that follows, i.e. fail-open again.
+  # The continuation is replaced by a SPACE, which is what systemd writes into its buffer.
+  # The accumulator is the convention this tree already uses twice for the same man-page rule:
+  # `scripts/harness-apply-pass.sh`'s `logical_lines()` (whose own comment cites `systemd.syntax(7)`).
+  local _ln _cmt _tail _bs _acc=""
+  folded=""
+  while IFS= read -r _ln || [ -n "$_ln" ]; do
+    # The comment test skips LEADING blanks (systemd does), and the line is then dropped whole.
+    _cmt="$_ln"
+    while :; do case "$_cmt" in [[:space:]]*) _cmt="${_cmt#?}" ;; *) break ;; esac; done
+    case "$_cmt" in '#'*|';'*) continue ;; esac
+    # Parity of the trailing backslash run: odd -> escaped (continuation), even -> the line ends here.
+    _bs=0; _tail="$_ln"
+    while :; do case "$_tail" in *\\ ) _bs=$(( _bs + 1 )); _tail="${_tail%?}" ;; *) break ;; esac; done
+    if [ $(( _bs % 2 )) -eq 1 ]; then
+      _acc="$_acc${_ln%?} "   # the backslash becomes a SPACE (systemd.syntax(7))
+      continue
+    fi
+    folded="$folded$_acc$_ln"$'\n'
+    _acc=""
+  done <"$f" 2>/dev/null
+  # ⛔ NO `|| return 2` HERE: a `while` whose read fails on the first iteration still exits 0, so an error
+  # branch on this loop would be a NO-OP GATE — it could never fire. The ungradable cases are refused by
+  # the preflight above (absent, unreadable, or a directory), which is where they are actually reachable.
+  # An accumulator still pending at EOF is a logical line too (a file may end on a continuation).
+  [ -n "$_acc" ] && folded="$folded$_acc"$'\n'
   # ⛔ ONLY `Environment=` / `PassEnvironment=` DIRECTIVES ARE GRADED, and the flag must be a WHOLE WORD
   # inside them. `PassEnvironment=<NAME>` names a variable in the unit's OWN text (it forwards one the
   # managing systemd instance holds), so it is a declaration that names the hatch and belongs here — it
