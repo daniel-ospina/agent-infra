@@ -161,6 +161,31 @@ O="${O:-$HOME/orchestrator}"
 RAIL_DIR="${RAIL_DIR:-$HOME/.pi/agent/state/rails}"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
+# Time helpers — the `mergedAt` window is the ONE repo-scoped fact this file can use to attribute a
+# PR-number-keyed artifact (F4). Two spellings, because `date -d` is GNU and `date -j -f` is BSD, and
+# a silent empty answer from either must read as "unusable" rather than as "in window".
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+CHAIN_MARKER_WINDOW="${CHAIN_MARKER_WINDOW:-21600}"   # 6h: generous for a slow chain, tight enough
+                                                      # that another repo's merge of the same number
+                                                      # (days or weeks away) can never fall inside it
+iso_epoch() { # iso_epoch <2026-11-12T05:05:55Z> → seconds since epoch, or EMPTY
+  local t="${1:-}"
+  case "$t" in ""|-) return 1 ;; esac
+  case "$t" in
+    *Z) : ;;
+    *) return 1 ;;
+  esac
+  date -u -d "$t" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$t" +%s 2>/dev/null || printf ''
+}
+
+file_mtime() { # file_mtime <path> → ISO-8601 UTC, or EMPTY (GNU stat, then BSD stat)
+  local p="${1:-}" e=""
+  e="$(stat -c %Y "$p" 2>/dev/null || stat -f %m "$p" 2>/dev/null)" || return 1
+  case "$e" in ''|*[!0-9]*) return 1 ;; esac
+  date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf ''
+}
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
 # Fetch — everything a predicate needs becomes a FILE, so gh is touched at most once per head and
 # the analysis is a pure function of a directory. That is also what makes the suite hermetic: a
 # fixture directory is the same shape as a fetched one.
@@ -181,15 +206,17 @@ fetch_one() { # fetch_one <dir> <pr>
   local dir="$1" pr="$2" sha rail rec legacy
   mkdir -p "$dir" || return 2
   printf '%s\n' "$REPO" > "$dir/repo.txt"
-  if ! "$GH" pr view "$pr" --repo "$REPO" --json number,state,mergedAt,mergeCommit \
-        --jq '[.number, .state, (.mergedAt // "-"), (.mergeCommit.oid // "-")] | @tsv' \
-        > "$dir/pr.meta" 2>"$dir/pr.err"; then
-    return 1
-  fi
-  "$GH" pr view "$pr" --repo "$REPO" --json body --jq '.body // ""' > "$dir/body.txt" 2>/dev/null || : > "$dir/body.txt"
+  store_read "$dir" pr.meta \
+    "$GH" pr view "$pr" --repo "$REPO" --json number,state,mergedAt,mergeCommit \
+      --jq '[.number, .state, (.mergedAt // "-"), (.mergeCommit.oid // "-")] | @tsv' || return 1
+  # an unreadable BODY is not an empty one: it would read as "no record marker exists" (F2 the third
+  # time). The `.unread` sentinel keeps that distinguishable at the review_record predicate.
+  store_read "$dir" body.txt \
+    "$GH" pr view "$pr" --repo "$REPO" --json body --jq '.body // ""'
   # markers ACCUMULATE in the comments across a fix round; that is where the round's history lives
-  "$GH" pr view "$pr" --repo "$REPO" --json comments \
-        --jq '.comments[] | "<<<COMMENT>>>\n" + (.body // "")' > "$dir/comments.txt" 2>/dev/null || : > "$dir/comments.txt"
+  store_read "$dir" comments.txt \
+    "$GH" pr view "$pr" --repo "$REPO" --json comments \
+      --jq '.comments[] | "<<<COMMENT>>>\n" + (.body // "")'
 
   rec="$HOME/.pi/agent/reviews/${OWNER}-${RNAME}-${pr}.json"
   legacy="$HOME/.pi/agent/reviews/${pr}.json"
@@ -198,9 +225,43 @@ fetch_one() { # fetch_one <dir> <pr>
 
   rail="$RAIL_DIR/auto-${OWNER}-${RNAME}-${pr}.out"
   [ -s "$rail" ] && cp "$rail" "$dir/rail.out" 2>/dev/null
-  [ -f "$O/state/merged-${pr}.done" ] && : > "$dir/chain.merged"
-  [ -s "$O/state/lanemerge-${pr}.verdict" ] && cp "$O/state/lanemerge-${pr}.verdict" "$dir/chain.verdict" 2>/dev/null
-  [ -s "$O/logs/merge-${pr}.log" ] && cp "$O/logs/merge-${pr}.log" "$dir/merge.log" 2>/dev/null
+
+  # ⛔ A PR-NUMBER-KEYED MARKER IS NOT PROOF FOR *THIS* REPO (review finding F4, and the ruling this
+  # repo already recorded at `chain-merge.sh:246-251`): `state/merged-<PR>.done` and
+  # `logs/merge-<PR>.log` carry NO repo and `$O/state` is shared by every repo on the box, so a merge
+  # of `tortoise#<same n>` reads as this PR's landing. The confirmation `chain-merge.sh` uses is a
+  # repo-scoped read of the PR itself — which this file already holds (`mergedAt` in pr.meta). So the
+  # marker is admitted only when its own mtime is consistent with THAT merge: outside the window it is
+  # ignored and the route stays unknown rather than being attributed to the wrong landing.
+  local mt mt_s mt_e
+  mt="$(awk -F'\t' 'NR == 1 { print $3 }' "$dir/pr.meta" 2>/dev/null)"
+  mt_s="$(iso_epoch "$mt")"
+  if [ -n "$mt_s" ]; then
+    mt_e=$((mt_s + CHAIN_MARKER_WINDOW))
+    mt_s=$((mt_s - CHAIN_MARKER_WINDOW))
+  fi
+  chain_artifact() { # chain_artifact <path> <store-name>
+    [ -f "$1" ] || return 1
+    local f_ts f_s
+    f_s=""
+    if [ -n "${mt_s:-}" ]; then
+      f_ts="$(file_mtime "$1")"
+      f_s="$(iso_epoch "$f_ts")"
+      [ -n "$f_s" ] || return 1
+      if [ "$f_s" -lt "$mt_s" ] || [ "$f_s" -gt "$mt_e" ]; then
+        : > "$dir/${2}.out-of-window"
+        return 1
+      fi
+    fi
+    case "$2" in
+      chain.merged) : > "$dir/chain.merged" ;;
+      *) cp "$1" "$dir/$2" 2>/dev/null || return 1 ;;
+    esac
+    return 0
+  }
+  chain_artifact "$O/state/merged-${pr}.done" chain.merged
+  chain_artifact "$O/state/lanemerge-${pr}.verdict" chain.verdict
+  chain_artifact "$O/logs/merge-${pr}.log" merge.log
 
   sha="$(awk -F'\t' 'NR == 1 { print $4 }' "$dir/pr.meta" 2>/dev/null)"
   case "$sha" in
@@ -209,31 +270,56 @@ fetch_one() { # fetch_one <dir> <pr>
   esac
   # the PR's own commit list: the LAST line is its tip, and that is what "nothing was pushed after
   # the review" is anchored on (a TREE comparison is not — see the header's #3996 counter-example).
-  "$GH" api "repos/$REPO/pulls/$pr/commits?per_page=100" --paginate --jq '.[].sha' \
-    > "$dir/pr-commits.tsv" 2>/dev/null || :
+  store_read "$dir" pr-commits.tsv \
+    "$GH" api "repos/$REPO/pulls/$pr/commits?per_page=100" --paginate --jq '.[].sha' || :
   return 0
+}
+
+# ⛔ NOTHING IS REDIRECTED STRAIGHT ONTO AN ARTIFACT PATH (review finding F2). The shell creates and
+# truncates the target BEFORE `gh` runs, so a 403 left a 0-byte file that every reader below scored as
+# a MEASURED fact — a failed read became "the head carried no check-run". Writes go to `.tmp` and are
+# `mv`d only on rc 0; a failed read leaves an explicit `<name>.unread` and NO artifact, so "did not
+# read" and "read, and it was empty" stay distinguishable in every direction.
+store_read() { # store_read <dir> <name> <command…>  → 0 stored · 1 STORED but empty-ish · 2 UNREAD
+  local dir="$1" name="$2"; shift 2
+  local tmp="$dir/.tmp-$name"
+  : > "$tmp" 2>/dev/null || return 2
+  if "$@" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$dir/$name" 2>/dev/null || return 2
+    rm -f "$dir/$name.unread" 2>/dev/null
+    return 0
+  fi
+  rm -f "$tmp" "$dir/$name" 2>/dev/null
+  : > "$dir/$name.unread"
+  return 2
 }
 
 fetch_commit() { # fetch_commit <dir> <sha>
   local dir="$1" sha="$2"
-  "$GH" api "repos/$REPO/commits/$sha" \
-    --jq '[.sha, .commit.tree.sha, ([.parents[].sha] | join(","))] | @tsv' \
-    > "$dir/commit-${sha}.tsv" 2>/dev/null || return 1
-  return 0
+  store_read "$dir" "commit-${sha}.tsv" \
+    "$GH" api "repos/$REPO/commits/$sha" \
+      --jq '[.sha, .commit.tree.sha, ([.parents[].sha] | join(","))] | @tsv'
 }
 
 fetch_head_surface() { # fetch_head_surface <dir> <head_sha>
-  local dir="$1" sha="$2"
+  local dir="$1" sha="$2" rc_runs=0
   case "$sha" in ""|"-") return 1 ;; esac
   fetch_commit "$dir" "$sha" || return 1
-  # run id -> WORKFLOW NAME and attempt number, ONE read per head (see the grouping note above)
-  "$GH" api "repos/$REPO/actions/runs?head_sha=${sha}&per_page=100" --paginate \
-    --jq '.workflow_runs[] | [.id, .name, .run_attempt] | @tsv' > "$dir/runs-${sha}.tsv" 2>/dev/null || :
+  # run id -> WORKFLOW NAME and attempt number, ONE read per head (see the grouping note above).
+  # ⛔ A FAILED RUNS READ IS NOT AN EMPTY ONE (review finding F2/A): without the run ids every group
+  # falls back to `app:<slug>`, which merges two workflows that publish the same job name — so the
+  # masking case 8 exists for would become reachable through a rate limit, in the GREEN direction.
+  store_read "$dir" "runs-${sha}.tsv" \
+    "$GH" api "repos/$REPO/actions/runs?head_sha=${sha}&per_page=100" --paginate \
+      --jq '.workflow_runs[] | [.id, .name, .run_attempt] | @tsv' || rc_runs=$?
   # `filter=all` is PINNED: the endpoint's default is not all (measured: 26 of 40 on a real commit),
   # so a bare read silently drops every re-run and can report a red head green.
-  "$GH" api "repos/$REPO/commits/$sha/check-runs?per_page=100&filter=all" --paginate \
-    --jq '.check_runs[] | [.id, (.app.slug // "-"), .name, .status, (.conclusion // "-"), (.completed_at // "-"), (.details_url // "-")] | @tsv' \
-    > "$dir/checkruns-${sha}.tsv" 2>/dev/null || return 1
+  # `started_at` is captured because it is what separates "this check had not voted yet when the
+  # landing happened" from "this check did not exist until after the merge" (review finding F1).
+  store_read "$dir" "checkruns-${sha}.tsv" \
+    "$GH" api "repos/$REPO/commits/$sha/check-runs?per_page=100&filter=all" --paginate \
+      --jq '.check_runs[] | [.id, (.app.slug // "-"), .name, .status, (.conclusion // "-"), (.completed_at // "-"), (.details_url // "-"), (.started_at // "-")] | @tsv' || return 1
+  [ "$rc_runs" -eq 0 ] || return 1
   return 0
 }
 
@@ -246,23 +332,77 @@ fetch_head_surface() { # fetch_head_surface <dir> <head_sha>
 # file the recorder appended to (verified on PR #4025, whose body holds both the `not-clean` and the
 # later `clean` line).
 # ════════════════════════════════════════════════════════════════════════════════════════════════
-record_markers() { # record_markers <dir> <pr>  -> "<verdict> TAB <sha>" per marker, oldest first
+# ⛔ A MARKER MUST NAME *THIS* REPO (review finding F3). The canonical recorder refuses a marker that
+# names another repo — `scripts/record-review.sh:4889`: "PR numbers collide across repos, so this is
+# refused rather than adopted" — and the first cut of this reader stopped at the sha, so a marker for
+# `(someone-else/other-repo)` made an UNREVIEWED head read as reviewed at exactly the right head. The
+# `(<owner/repo>)` group is therefore REQUIRED and compared folded (GitHub slugs are case-insensitive);
+# a marker that names no repo, or another repo, is not evidence — it is SKIPPED and REPORTED, never
+# silently dropped.
+# The CHANNEL is tagged because the recorder treats the two differently: the BODY is its own CURRENT
+# statement (record-review.sh:4896-4899, "the poster APPENDS … keep the LAST"), while a marker found
+# only in a COMMENT is a weaker source (record-review.sh:1092-1094 does not accept a comment marker as
+# an artifact). `sig=` is recorded but NOT verified here, and every detail line says so.
+record_markers() { # record_markers <dir> <pr>
+  #   MARK <channel> <verdict> <sha> <repo> <sig?>   ·   SKIP <channel> <sha> <repo-or-(none)>
   local dir="$1" pr="$2"
   {
-    [ -s "$dir/comments.txt" ] && cat "$dir/comments.txt"
-    printf '\n<<<COMMENT>>>\n'
-    [ -s "$dir/body.txt" ] && cat "$dir/body.txt"
-  } | awk -v pr="$pr" '
-    BEGIN { pat = "^[[:space:]>*+-]*review recorded: reviews/" pr "\\.json verdict=(clean|clean-micro|clean-low|not-clean) @ ([0-9a-f]{40})" }
-    $0 ~ pat {
-      v = $0; sub(/^.*verdict=/, "", v); sub(/[ ]+@.*$/, "", v)
-      s = $0; sub(/^.*@ /, "", s); sub(/[ ].*$/, "", s)
-      printf "%s\t%s\n", v, s
+    # the BODY last, and tagged, so "the recorder's current word" is distinguishable from history
+    [ -s "$dir/comments.txt" ] && sed 's/^/COMMENT\t/' "$dir/comments.txt"
+    printf 'BODY\t\n'
+    [ -s "$dir/body.txt" ] && sed 's/^/BODY\t/' "$dir/body.txt"
+  } | awk -F'\t' -v pr="$pr" -v want="$REPO" '
+    BEGIN { fold = tolower(want) }
+    {
+      chan = $1
+      line = $0
+      sub(/^[^\t]*\t/, "", line)
+      sub(/^[[:space:]>*+\x2d]+/, "", line)
+      # the recorder writes: review recorded: reviews/<pr>.json verdict=V @ <40hex> (owner/repo)
+      if (index(line, "review recorded: reviews/" pr ".json verdict=") != 1) next
+      rest = line
+      sub(/^review recorded: reviews\/[^ ]* verdict=/, "", rest)
+      v = rest; sub(/ .*$/, "", v)
+      if (v != "clean" && v != "clean-micro" && v != "clean-low" && v != "not-clean") next
+      if (rest !~ / @ [0-9a-f]+( |$)/) next
+      s = rest; sub(/^.* @ /, "", s); sub(/ .*$/, "", s)
+      if (length(s) != 40 || tolower(s) !~ /^[0-9a-f]+$/) next
+      sig = (line ~ / sig=[0-9a-f]+$/) ? "sig" : "nosig"
+      repo = ""
+      # the FIRST parenthesised slug-shaped group is the marker repo; text after it (findings=, sig=)
+      # cannot match, because a slug-shaped group has no spaces
+      if (match(line, /\([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\)/)) {
+        repo = substr(line, RSTART + 1, RLENGTH - 2)
+      }
+      if (repo == "")            { printf "SKIP\t%s\t%s\t(none)\n", chan, substr(s, 1, 12); next }
+      if (tolower(repo) != fold) { printf "SKIP\t%s\t%s\t%s\n",     chan, substr(s, 1, 12), repo; next }
+      printf "MARK\t%s\t%s\t%s\t%s\t%s\n", chan, v, s, repo, sig
     }
   '
 }
 
-last_marker() { record_markers "$1" "$2" | tail -1; }
+# this repo, one channel: "verdict TAB sha TAB sig", oldest first
+markers_from() {
+  record_markers "$1" "$2" | awk -F'\t' -v ch="$3" \
+    '$1 == "MARK" && (ch == "*" || $2 == ch) { print $3 "\t" $4 "\t" $6 }'
+}
+
+# the recorder's CURRENT word is the body; a comment-only marker is a declared weaker source
+last_marker() { # → "verdict TAB sha TAB source TAB sig"; empty when nothing admitted
+  local dir="$1" pr="$2" v s sig
+  v="$(markers_from "$dir" "$pr" BODY | tail -1)"
+  if [ -n "$v" ]; then
+    printf '%s\t%s\tbody\t%s\n' "$(printf '%s' "$v" | cut -f1)" "$(printf '%s' "$v" | cut -f2)" "$(printf '%s' "$v" | cut -f3)"
+    return 0
+  fi
+  v="$(markers_from "$dir" "$pr" COMMENT | tail -1)"
+  [ -n "$v" ] || return 1
+  printf '%s\t%s\tcomment\t%s\n' "$(printf '%s' "$v" | cut -f1)" "$(printf '%s' "$v" | cut -f2)" "$(printf '%s' "$v" | cut -f3)"
+}
+
+skipped_markers() { # → "channel:sha:repo" for the markers refused as foreign, or empty
+  record_markers "$1" "$2" | awk -F'\t' '$1 == "SKIP" { print $2 ":" $3 ":" $4 }' | paste -sd ',' -
+}
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # The as-of-merge surface. awk, not bash: a composite group key is an awk associative array, and
@@ -295,8 +435,8 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
     $0 == "==RUNS==" { sect = "runs"; next }
     $0 == "==CHECKS==" { sect = "checks"; next }
     sect == "runs" && NF >= 2 { wf[$1] = $2; next }
-    sect == "checks" && NF >= 6 {
-      id = $1 + 0; app = $2; name = $3; status = $4; conc = $5; done_at = $6; url = $7
+    sect == "checks" && NF >= 7 {
+      id = $1 + 0; app = $2; name = $3; status = $4; conc = $5; done_at = $6; url = $7; started_at = $8
       rid = runid_of(url); w = (rid != "" ? wf[rid] : "")
       if (w == "") w = "app:" app
       g = w "/" name
@@ -308,12 +448,21 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
         }
       }
       if (classify(status, conc) == "green") evergreen[g] = 1
+      # did this group have an attempt IN FLIGHT when the landing happened?
+      if (started_at != "-" && started_at != "" && started_at <= merged) started[g] = 1
       next
     }
     END {
       n = 0
       for (g in seen) {
-        v = (g in atcls) ? atcls[g] : "novote"
+        # ⛔ THREE STATES, NOT TWO (review finding F1). A group with no verdict at `mergedAt` is either
+        #   waited  — at least one attempt had STARTED by then (the landing went ahead without it), or
+        #   later   — no attempt existed yet (a post-merge job; it was never part of this gate).
+        # Collapsing both into one "novote" is what let one green group and two in-flight groups read
+        # as "3 group(s) green", which is false in the direction the capstone is closed on.
+        if (g in atcls)            v = atcls[g]
+        else if (g in started)     v = "waited"
+        else                       v = "later"
         print g "\t" v "\t" ((g in atconc) ? atconc[g] : "-") "\t" ((g in atdone) ? atdone[g] : "-") "\t" ((g in evergreen) ? "yes" : "no")
         n++
       }
@@ -366,23 +515,30 @@ analyse() { # analyse <dir> <pr>
   emit merged PASS "mergedAt=$merged merge=${merge_sha:0:12} landed_tree=${landed_tree:0:12}"
 
   # ── 2 review_record ──────────────────────────────────────────────────────────────────────────
-  local marker rverdict rsha rsource="marker"
+  # ⛔ THE SOURCE IS PART OF THE VERDICT, NOT A FOOTNOTE (review finding F3). A body marker is the
+  # recorder's current word; a comment-only marker is a WEAKER source the recorder itself does not
+  # accept as an artifact, and a box-local record file is weaker still (it is not in the PR). Every
+  # one of those prints its own `source=` so a reader cannot mistake the strength of the evidence.
+  local marker rverdict rsha rsource="marker-body" rsig="" rskipped
   marker="$(last_marker "$dir" "$pr")"
   rverdict="$(printf '%s' "$marker" | cut -f1)"
   rsha="$(printf '%s' "$marker" | cut -f2)"
+  rsource="marker-$(printf '%s' "$marker" | cut -f3)"
+  rsig="$(printf '%s' "$marker" | cut -f4)"
+  rskipped="$(skipped_markers "$dir" "$pr")"
   if [ -z "$rsha" ] && [ -s "$dir/record.json" ]; then
     rverdict="$(sed -nE 's/.*"verdict"[[:space:]]*:[[:space:]]*"([a-z-]+)".*/\1/p' "$dir/record.json" | head -1)"
     rsha="$(sed -nE 's/.*"head_sha"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "$dir/record.json" | head -1)"
-    rsource="record-file"
+    rsource="record-file(weaker: not in the PR)"
   fi
 
   if [ -z "$rsha" ]; then
-    emit review_record INCONCLUSIVE "no review record marker in the PR body/comments and no local record — the reviewed head is unknown here"
+    emit review_record INCONCLUSIVE "no ADMITTED review record for this PR at $REPO${rskipped:+ · refused as naming another repo: $rskipped}${rskipped:- } — the reviewed head is unknown here (a marker that names another repo is not evidence: record-review.sh refuses it, PR numbers collide across repos)"
     emit review_bound INCONCLUSIVE "no reviewed head to bind to the landed tree"
     emit fix_round INCONCLUSIVE "no record history to read a fix round from"
     emit green_gated INCONCLUSIVE "no reviewed head, so no head to read a check surface at"
   else
-    emit review_record PASS "verdict=$rverdict head=${rsha:0:12} source=$rsource"
+    emit review_record PASS "verdict=$rverdict head=${rsha:0:12} source=$rsource sig=$([ "$rsig" = sig ] && echo unverified || echo absent)${rskipped:+ · refused-as-foreign:$rskipped}"
 
     # ── 3 review_bound — the reviewed head is the PR's FINAL commit (base-independent) ─────────
     # ⛔ NOT tree equality — see the header's measured counter-example (#3996).
@@ -404,21 +560,32 @@ analyse() { # analyse <dir> <pr>
     fi
 
     # ── 4 fix_round — a not-clean must be superseded at a DIFFERENT head, LATER in the record ──
-    local superseded
-    superseded="$(record_markers "$dir" "$pr" | awk -F'\t' '
-      { if (found) { if ($2 != bad) { print; exit } } else if ($1 == "not-clean") { found = 1; bad = $2 } }
-    ')"
-    if ! record_markers "$dir" "$pr" | awk -F'\t' '$1 == "not-clean" { f = 1 } END { exit(f ? 0 : 1) }'; then
+    # the PR's whole admitted record history, both channels, oldest first: this is HISTORY, so the
+    # weaker channel is legitimate here even though it is not for the current verdict (F3).
+    local hist superseded firstnc
+    hist="$(markers_from "$dir" "$pr" '*')"
+    firstnc="$(printf '%s\n' "$hist" | awk -F'\t' '$1 == "not-clean" { print substr($2,1,12); exit }')"
+    if [ -z "$hist" ]; then
+      emit fix_round INCONCLUSIVE "no admitted record history for this PR on this box — a fix round cannot be read from nothing"
+    elif [ -z "$firstnc" ]; then
       emit fix_round N/A "no not-clean verdict in this PR's record history — no fix round was owed"
-    elif [ -n "$superseded" ]; then
-      emit fix_round PASS "not-clean was superseded by $(printf '%s' "$superseded" | cut -f1)@$(printf '%s' "$superseded" | cut -f2 | cut -c1-12) — the verdict triggered a re-record at a new head"
     else
-      emit fix_round FAIL "$(record_markers "$dir" "$pr" | awk -F'\t' '$1 == "not-clean" { print "not-clean@" substr($2,1,12); exit }') was never superseded by a record at a different head — no fix round followed the verdict"
+      # the FIRST later marker whose head differs from the not-clean one — later, not merely different
+      superseded="$(printf '%s\n' "$hist" | awk -F'\t' '
+        { if (found) { if ($2 != bad) { print $1 "@" substr($2,1,12); exit } } else if ($1 == "not-clean") { found = 1; bad = $2 } }
+      ')"
+      if [ -n "$superseded" ]; then
+        emit fix_round PASS "not-clean@$firstnc was superseded by $superseded — the verdict triggered a re-record at a new head"
+      else
+        emit fix_round FAIL "not-clean@$firstnc was never superseded by a record at a different head — no fix round followed the verdict"
+      fi
     fi
 
     # ── 5 green_gated — the surface AS THE LANDING SAW IT ──────────────────────────────────────
-    if [ ! -f "$dir/checkruns-${rsha}.tsv" ]; then
-      emit green_gated INCONCLUSIVE "check-runs at ${rsha:0:12} were not read (no snapshot file / gh refused) — the gating surface is unknown"
+    if [ -f "$dir/checkruns-${rsha}.tsv.unread" ] || [ -f "$dir/runs-${rsha}.tsv.unread" ]; then
+      emit green_gated INCONCLUSIVE "the surface at ${rsha:0:12} was NOT READ (gh refused / rate-limited, sentinel on disk) — an unread surface is unknown and is never a pass or a FAIL"
+    elif [ ! -f "$dir/checkruns-${rsha}.tsv" ]; then
+      emit green_gated INCONCLUSIVE "check-runs at ${rsha:0:12} were not read (no snapshot file) — the gating surface is unknown"
     elif [ ! -s "$dir/checkruns-${rsha}.tsv" ]; then
       # the read SUCCEEDED and the head carried no check-run at all: that is a measured zero, not an
       # unknown. Nothing was attached, so nothing gated the landing.
@@ -430,6 +597,9 @@ analyse() { # analyse <dir> <pr>
         emit green_gated INCONCLUSIVE "the surface read produced no groups — an empty read is unknown, never green"
       else
         reds="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "red" { print $1 ":" $3 }' | paste -sd ',' -)"
+        local waited later
+        waited="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "waited" { print $1 }' | paste -sd ',' -)"
+        later="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "later" { print $1 }' | paste -sd ',' -)"
         if [ -n "$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "empty" { print; exit }')" ]; then
           emit green_gated FAIL "NOTHING had attached a verdict to ${rsha:0:12} by mergedAt=$merged — the landing was not gated by a run at that head"
         elif [ -n "$reds" ]; then
@@ -445,14 +615,17 @@ analyse() { # analyse <dir> <pr>
           [ -n "$never" ] && why="NEVER GREEN on this head before the merge: $never"
           [ -n "$late" ] && why="${why}${why:+ · }green exists but completed AFTER mergedAt (so it gated nothing here): $late"
           emit green_gated FAIL "the newest verdict at mergedAt=$merged on ${rsha:0:12} was RED: $reds — the green did not gate this landing. ${why}. (The rail's main-comparison exemption is a likely reason a merge was still permitted; that is a legitimate rail path, but it is not a green.)"
+        elif [ -n "$waited" ]; then
+          # the check EXISTED when the merge happened and had not voted: the landing did not wait for it
+          emit green_gated FAIL "the landing did not wait for: $waited — these had started by mergedAt=$merged and had no verdict, so the green did not gate this landing"
         else
-          ngrp="$(printf '%s\n' "$surf" | grep -c .)"
-          nvote="$(printf '%s\n' "$surf" | awk -F'\t' '$2 != "novote" && $2 != "empty" { n++ } END { print n + 0 }')"
-          nnov="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "novote" { n++ } END { print n + 0 }')"
-          if [ "$nvote" -eq 0 ]; then
-            emit green_gated FAIL "all $ngrp group(s) on ${rsha:0:12} had no completed verdict at mergedAt=$merged — nothing gated the landing"
+          local ngreen nnonred
+          ngreen="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "green" { n++ } END { print n + 0 }')"
+          nnonred="$(printf '%s\n' "$surf" | awk -F'\t' '$2 == "nonred" { n++ } END { print n + 0 }')"
+          if [ "$ngreen" -eq 0 ]; then
+            emit green_gated FAIL "no group was GREEN at mergedAt=$merged on ${rsha:0:12} ($nnonred non-red only) — no green gated this landing"
           else
-            emit green_gated PASS "$ngrp group(s) green as-of mergedAt=$merged on ${rsha:0:12} (newest attempt per app/workflow/job); $nnov had no prior verdict"
+            emit green_gated PASS "$ngreen group(s) GREEN at mergedAt=$merged on ${rsha:0:12} (newest attempt per app/workflow/job)${nnonred:+ · $nnonred non-red}${later:+ · not part of this gate (no run existed by mergedAt): $later}"
           fi
         fi
       fi
@@ -473,6 +646,12 @@ analyse() { # analyse <dir> <pr>
     emit rail_landed PASS "the rail's own output for this PR is on disk (rail.out) and carries no override"
   elif [ -f "$dir/chain.merged" ] || [ -s "$dir/chain.verdict" ]; then
     emit rail_landed FAIL "landed by the per-PR chain, not by auto-rail — capstone condition 6 requires the rail to land it on its own"
+  elif [ -f "$dir/chain.merged.out-of-window" ] || [ -f "$dir/chain.verdict.out-of-window" ] || [ -f "$dir/merge.log.out-of-window" ]; then
+    # ⛔ THE MARKER EXISTED AND WAS REFUSED (F4). `$O/state` is shared by every repo on this box and
+    # `merged-<PR>.done` carries no repo, so a `tortoise#<same n>` merge would otherwise be attributed
+    # to THIS PR's landing. Outside this PR's own merge window it is not evidence — say so, and keep
+    # the route unknown rather than guessing.
+    emit rail_landed INCONCLUSIVE "a PR-number-keyed chain marker exists but is OUTSIDE this PR's merge window (mergedAt=$merged, window ${CHAIN_MARKER_WINDOW}s) — it is not proof for this repo's landing (chain-merge.sh:246-251 records the same rule), so the route stays unknown"
   else
     emit rail_landed INCONCLUSIVE "no rail or chain artifact for this PR on this box — the landing route is not readable here"
   fi

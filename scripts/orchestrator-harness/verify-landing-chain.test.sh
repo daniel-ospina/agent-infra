@@ -101,8 +101,8 @@ ck "squash-main-moved exits 0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
 # ── case 4: a not-clean verdict superseded at a new head — the fix round DID happen ───────────────
 R="$(mk fix-round 404)"
 {
-  printf 'review recorded: reviews/404.json verdict=not-clean @ %s findings=1\n' "$HEAD"
-  printf 'review recorded: reviews/404.json verdict=clean @ %s\n' "4444444444444444444444444444444444444444"
+  printf 'review recorded: reviews/404.json verdict=not-clean @ %s (o/r) findings=1\n' "$HEAD"
+  printf 'review recorded: reviews/404.json verdict=clean @ %s (o/r)\n' "4444444444444444444444444444444444444444"
 } > "$R/pr-404/body.txt"
 printf '%s\n%s\n' "$HEAD" "4444444444444444444444444444444444444444" > "$R/pr-404/pr-commits.tsv"
 run "$R" 404 9001 "CI" 1; group "$R" 404 10 9001 "unit-test" completed success "$MERGED_AT"
@@ -111,7 +111,7 @@ ck "fix-round: fix_round PASS (not-clean superseded at a new head)" "$(has "was 
 
 # ── case 5: a not-clean that was never superseded — condition 4 unmet ────────────────────────────
 R="$(mk no-fix-round 405)"
-printf 'review recorded: reviews/405.json verdict=not-clean @ %s findings=2\n' "$HEAD" > "$R/pr-405/body.txt"
+printf 'review recorded: reviews/405.json verdict=not-clean @ %s (o/r) findings=2\n' "$HEAD" > "$R/pr-405/body.txt"
 run "$R" 405 9001 "CI" 1; group "$R" 405 10 9001 "unit-test" completed success "$MERGED_AT"
 verify "$R"; rc=$?
 ck "no-fix-round: fix_round FAIL" "$(has "was never superseded by a record at a different head"; echo $?)"
@@ -233,6 +233,87 @@ OUT="$(bash "$SCRIPT" --from-snapshot "$ROOT" --repo "$REPO_FIXTURE" 2>&1)"
 n="$(printf '%s\n' "$OUT" | grep -c '^PR #')"
 ck "snapshot-auto: every PR in the snapshot is verified (saw $n of 2)" "$([ "$n" -eq 2 ] && echo 0 || echo 1)"
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# THE FOUR FINDINGS FROM THE FRESH-CONTEXT REVIEW AT 4d23b74b2 — one case each, because each was a
+# defect this file shipped and each was reachable in ONE of the two directions that matter.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+# F1 — a group that had STARTED but not voted when the merge happened is not a green.
+# Before the fix, one green + two such groups printed "3 group(s) green" and PASSed.
+R="$(mk f1-waited 440)"
+run "$R" 440 9001 "CI" 1
+group "$R" 440 10 9001 "unit-test"           completed success "2026-11-12T04:00:00Z"
+group "$R" 440 20 9001 "vendor-drift"        in_progress -     "-"
+group "$R" 440 30 9001 "pipeline-compliance" in_progress -     "-"
+# started_at is field 8; rewrite the two in-flight rows so they began BEFORE the merge
+awk -F'\t' 'BEGIN{OFS="\t"} $3=="vendor-drift" || $3=="pipeline-compliance" { $8="2026-11-12T04:30:00Z" } { print }' \
+  "$R/pr-440/checkruns-$HEAD.tsv" > "$R/pr-440/c2" && mv "$R/pr-440/c2" "$R/pr-440/checkruns-$HEAD.tsv"
+verify "$R"; rc=$?
+ck "F1: an in-flight-at-merge group is not a green (no '3 group(s) green')" "$(has "did not wait for"; echo $?)"
+if has "3 group(s) GREEN"; then
+  bad "F1: the report still claims 3 green when only 1 group voted"
+else
+  ok "F1: no 3-green claim — the count is of groups that actually voted green"
+fi
+
+# F1b — a group with NO run at all by mergedAt (a post-merge job) is excluded, not counted
+R="$(mk f1-later 441)"
+run "$R" 441 9001 "CI" 1
+group "$R" 441 10 9001 "unit-test" completed success "2026-11-12T04:00:00Z"
+group "$R" 441 20 9001 "post-merge" completed success "2026-11-12T06:00:00Z"   # started after mergedAt
+awk -F'\t' 'BEGIN{OFS="\t"} $3=="post-merge" { $8="2026-11-12T05:40:00Z" } { print }' \
+  "$R/pr-441/checkruns-$HEAD.tsv" > "$R/pr-441/c2" && mv "$R/pr-441/c2" "$R/pr-441/checkruns-$HEAD.tsv"
+printf 'admin-merge: ok\n' > "$R/pr-441/rail.out"
+verify "$R"
+ck "F1b: a post-merge-only group is excluded and the GREEN count is the measured 1" "$(has "1 group(s) GREEN"; echo $?)"
+
+# F2a — an UNREAD surface is INCONCLUSIVE, never a measured zero (the fail-closed direction)
+R="$(mk f2-unread 442)"
+run "$R" 442 9001 "CI" 1
+# the ORIGINAL bug left the truncated 0-byte artifact behind; both are present here on purpose, so a
+# regression that stops honouring the sentinel lands on "measured zero" (FAIL) and this case flips.
+: > "$R/pr-442/checkruns-$HEAD.tsv"
+: > "$R/pr-442/checkruns-$HEAD.tsv.unread"
+verify "$R"; rc=$?
+ck "F2a: a rate-limited check-runs read is INCONCLUSIVE, not FAIL" "$(has "was NOT READ" ; echo $?)"
+ck "F2a: …and the run exits 2 (unknown), not 1" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
+
+# F2b — an UNREAD runs list is INCONCLUSIVE too: without run ids the app-only fallback merges two
+# workflows that publish the same job name, so a failed read could mask a red in the GREEN direction.
+R="$(mk f2-unread-runs 443)"
+printf '9001\tWorkflow A\t1\n' > "$R/pr-443/runs-$HEAD.tsv"
+: > "$R/pr-443/runs-$HEAD.tsv.unread"
+run "$R" 443 9001 "CI" 1
+group "$R" 443 10 9001 "unit-test" completed success "2026-11-12T04:00:00Z"
+verify "$R"
+ck "F2b: an unread workflow list is INCONCLUSIVE (grouping would be unsound)" "$(has "was NOT READ"; echo $?)"
+
+# F3 — a marker naming ANOTHER repo is not evidence for this head
+R="$(mk f3-foreign-marker 444)"
+: > "$R/pr-444/body.txt"
+printf '<<<COMMENT>>>\nreview recorded: reviews/444.json verdict=clean @ %s (someone-else/other-repo)\n' "$HEAD" \
+  > "$R/pr-444/comments.txt"
+run "$R" 444 9001 "CI" 1; group "$R" 444 10 9001 "unit-test" completed success "$MERGED_AT"
+verify "$R"
+ck "F3: a foreign-repo marker is REFUSED, not adopted (review_record INCONCLUSIVE)" "$(hasj '"check":"review_record","verdict":"INCONCLUSIVE"'; echo $?)"
+ck "F3: …and the refusal is named" "$(has "refused as naming another repo"; echo $?)"
+
+# F3b — a comment-only marker IS admitted, but declared as the weaker source the recorder refuses
+R="$(mk f3-comment-marker 445)"
+: > "$R/pr-445/body.txt"
+printf '<<<COMMENT>>>\nreview recorded: reviews/445.json verdict=clean @ %s (o/r)\n' "$HEAD" > "$R/pr-445/comments.txt"
+run "$R" 445 9001 "CI" 1; group "$R" 445 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ok\n' > "$R/pr-445/rail.out"
+verify "$R"
+ck "F3b: a comment-only marker is admitted as source=marker-comment (declared weaker)" "$(has "source=marker-comment"; echo $?)"
+
+# F4 — a PR-number-keyed chain marker outside this PR's merge window is not proof (chain-merge.sh:246)
+R="$(mk f4-out-of-window 446)"
+run "$R" 446 9001 "CI" 1; group "$R" 446 10 9001 "unit-test" completed success "$MERGED_AT"
+: > "$R/pr-446/chain.merged.out-of-window"
+verify "$R"
+ck "F4: an out-of-window chain marker leaves the route UNKNOWN, not chain-attributed" "$(has "OUTSIDE this PR's merge window"; echo $?)"
+
 # ── MUTATIONS: prove every case above is DISCRIMINATING, not merely green ───────────────────────
 # ⛔ A suite that passes over BOTH the real script and a deliberately wrong one asserts nothing. Each
 # mutation below breaks exactly the decision one case exists for; the case must then FLIP. This is the
@@ -299,6 +380,48 @@ if printf '%s' "$AOUT" | grep -qF "IS the PR's final commit"; then
   bad "M3: the tree-equality mutant still PASSED — case 3 is not discriminating"
 else
   ok "M3: tree equality fails a correct landing (the #3996 defect) — case 3 is discriminating"
+fi
+
+# M4 — collapse "started but had not voted by the merge" back into an innocent bucket (the F1 defect).
+MS="$(mutant f1-collapse 'else if (g in started)     v = "waited"' 'else if (g in started)     v = "later"')" \
+  || bad "M4 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+verify_with "$MS" "$R"
+if printf '%s' "$AOUT" | grep -qF "did not wait for"; then
+  bad "M4: the collapsed mutant STILL reported the non-waiting check — case F1 is not discriminating"
+else
+  ok "M4: treating an in-flight group as 'not part of the gate' green-lights the landing — F1 is discriminating"
+fi
+
+# M5 — keep the truncated artifact when the read fails (the F2 defect): an unread surface becomes a
+# measured zero, i.e. a FAIL against a landing nobody could read.
+MS="$(mutant f2-not-atomic '  : > "$dir/$name.unread"' '  : > "$dir/${name%%.*}.unread"')" \
+  || bad "M5 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R2="$(mk f2-unread-mut 447)"
+run "$R2" 447 9001 "CI" 1
+: > "$R2/pr-447/checkruns-$HEAD.tsv"
+: > "$R2/pr-447/checkruns-$HEAD.tsv.unread"
+verify_with "$MS" "$R2"
+if printf '%s' "$AOUT" | grep -qF "was NOT READ"; then
+  bad "M5: the non-atomic mutant STILL honoured the sentinel — case F2a is not discriminating"
+else
+  ok "M5: a read sentinel written to the wrong name degrades to 'measured zero' — F2a is discriminating"
+fi
+
+# M6 — admit a marker that names ANOTHER repo (the F3 defect): PR numbers collide across repos.
+MS="$(mutant f3-no-repo-filter 'if (tolower(repo) != fold) { printf "SKIP\t%s\t%s\t%s\n",     chan, substr(s, 1, 12), repo; next }' 'if (0) { printf "SKIP\t%s\t%s\t%s\n",     chan, substr(s, 1, 12), repo; next }')" \
+  || bad "M6 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R3="$(mk f3-foreign-mut 448)"
+: > "$R3/pr-448/body.txt"
+printf '<<<COMMENT>>>\nreview recorded: reviews/448.json verdict=clean @ %s (someone-else/other-repo)\n' "$HEAD" > "$R3/pr-448/comments.txt"
+run "$R3" 448 9001 "CI" 1; group "$R3" 448 10 9001 "unit-test" completed success "$MERGED_AT"
+verify_with "$MS" "$R3"
+if printf '%s' "$AOUT" | grep -qF "refused as naming another repo"; then
+  bad "M6: the unfiltered mutant STILL refused the foreign marker — case F3 is not discriminating"
+else
+  ok "M6: without the repo filter a foreign marker reads as this PR's review — F3 is discriminating"
 fi
 
 # ── summary ──────────────────────────────────────────────────────────────────────────────────────
