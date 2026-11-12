@@ -1183,6 +1183,17 @@ grep -q 'NOT started: STALE-CODE' "$O/logs/lane-120.log"; rc=$?
 ck "§SC …and the lane log names STALE-CODE rather than the capability text" $rc
 { ! grep -q 'or dispatch the issue to another box' "$O/logs/lane-120.log"; }; rc=$?
 ck "§SC …and does NOT hand the item to a peer, which is the circulation this PR exists to stop" $rc
+# ⛔ AND THE REMEDY FOLLOWS THE ARTIFACT MEASURED, NOT THE PATH THIS READER HAPPENS TO BE (#3932's review,
+# P2-4). The probe measures the checkout named by its caller: on the LANE path that is the lane's own base
+# worktree, on the FIXER path it is a worktree on the PR BRANCH. Both emit the SAME refusal, so a reader
+# that publishes one unconditional instruction is wrong on one of them — and the base instruction ("cut
+# the worktree from origin/main") is DESTRUCTIVE on a PR branch. The row above removes the peer hand-off;
+# this one removes the re-cut, and requires the branch-shaped remedy to be present so the line cannot
+# simply drop the instruction and leave the operator with a number.
+grep -q 'merge origin/main' "$O/logs/lane-120.log" || { echo "DEBUGLOG-START"; grep -o 'STALE-CODE gate refused.\{0,2000\}' "$O/logs/lane-120.log" | tail -c 700; echo "|WC=$(grep -c 'origin/main' "$O/logs/lane-120.log")"; echo "DEBUGLOG-END"; }; grep -q 'merge origin/main' "$O/logs/lane-120.log"; rc=$?
+ck "§SC …and its remedy carries the PR-BRANCH shape (integrate origin/main), which is what the fixer path measures" $rc
+{ ! grep -q 'then cut the worktree from origin/main' "$O/logs/lane-120.log"; }; rc=$?
+ck "§SC …and no longer publishes the unconditional RE-CUT, which discards a fixer's PR (review P2-4)" $rc
 { ! grep -q 'capacity transfer' "$O/logs/lane-120.log" && grep -q 'does NOT free the item for a peer' "$O/logs/lane-120.log"; }; rc=$?
 ck "§SC …and its stand-down line does not claim a capacity transfer" $rc
 { read -r _se _su sgate < "$O/state/capacity-refused-120" 2>/dev/null; [ "${sgate:-}" = "stale" ]; }; rc=$?
