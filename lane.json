@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-issue-11747-1794450576-p2920475-70495abe",
+  "_sha": "21f8c05ea54493e69e75209f8899219ba73eb5e8",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/cell-home/orchestrator/bg/issue-11747.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/11747-unserved-session-vector"
+    },
+    {
+      "kind": "sha",
+      "value": "a2adb8ccff14e5b701ca098bc3feb579eae87b46"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/wt-11747"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 1097,
+  "ended_at": 1794451673,
+  "exit_code": 0,
+  "heartbeat_at": 1794451673,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-issue-11747-1794450576-p2920475-70495abe",
+  "lease_until": 1794459473,
+  "pid": 2920475,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794450576,
+  "state": "DONE",
+  "tag": "issue-11747",
+  "worktree": "/home/cmux/wt-11747"
+}
