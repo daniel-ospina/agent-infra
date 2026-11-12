@@ -809,6 +809,13 @@ EOS
   # was told `healthy` about a unit that is not running — while this installer's own header promises
   # `0 installed/healthy`. Both directions are pinned, so the assertion cannot be satisfied by a
   # hard-coded 1.
+  # ⛔ "HEALTHY" NOW INCLUDES A SUPERVISOR THAT IS ACTUALLY PASSING (agent-infra#4007). `ActiveState`
+  # is true of a `--loop` that stopped passing — the measured supervisor was alive 16 days with a log
+  # that had stopped 2 days earlier — so this verb folds in the supervisor's own heartbeat verdict.
+  # Both directions are pinned here: a completed pass inside the bound is 0, and the SAME unit with a
+  # record older than the bound is 1 with STALE named (a hard-coded verdict cannot satisfy both).
+  reset
+  O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
   SC_DEAD="$TMP/systemctl-dead"
   printf '#!/usr/bin/env bash\nexit 1\n' > "$SC_DEAD"; chmod +x "$SC_DEAD"
   O="$O" SUDO=false ELDATO_PLATFORM=Linux UNIT_DIR="$TMP/units2" SYSTEMCTL="$SC_DEAD" \
@@ -817,8 +824,15 @@ EOS
     || bad "--status exited $rcs_dead for a disabled, inactive unit — a false PASS from a status verb"
   O="$O" SUDO=false ELDATO_PLATFORM=Linux UNIT_DIR="$TMP/units2" SYSTEMCTL="$SC" \
     WORKER_SUPPLY_SCRIPT="$SUPPLY" bash "$INSTALLER" --status >"$TMP/status-ok.out" 2>&1; rcs_ok=$?
-  [ "$rcs_ok" = "0" ] && ok "…and 0 when it is installed, enabled and active (the assertion is not vacuous)" \
+  [ "$rcs_ok" = "0" ] && ok "…and 0 when it is installed, enabled, active AND its last pass is inside the bound (the assertion is not vacuous)" \
     || bad "--status exited $rcs_ok for a healthy unit: $(tail -2 "$TMP/status-ok.out")"
+  # …and the measured failure: the unit is up, the record is old. `active: yes` must NOT outvote it.
+  touch -t 202601010000 "$ST/worker-supply.state"
+  O="$O" SUDO=false ELDATO_PLATFORM=Linux UNIT_DIR="$TMP/units2" SYSTEMCTL="$SC" \
+    WORKER_SUPPLY_SCRIPT="$SUPPLY" bash "$INSTALLER" --status >"$TMP/status-stale.out" 2>&1; rcs_stale=$?
+  [ "$rcs_stale" = "1" ] && grep -q 'STALE' "$TMP/status-stale.out" \
+    && ok "…and 1 (STALE named) for an ACTIVE unit whose supervisor has written no completed pass inside the bound — the 16-day-alive/2-day-silent shape" \
+    || bad "--status exited $rcs_stale for an active-but-stale supervisor (a stopped log must not read as healthy): $(tail -2 "$TMP/status-stale.out")"
 else
   bad "missing $INSTALLER"
 fi
@@ -914,6 +928,101 @@ if [ -n "$WS_DEFAULT" ] && [ "$WS_DEFAULT" = "$LOOP_DEFAULT" ]; then
 else
   bad "-- DEFAULT_MAX_REVIEW='${WS_DEFAULT:-<not found>}' != orch-loop.sh's '${LOOP_DEFAULT:-<not found>}' — a box with no plist would budget a different number than the loop runs"
 fi
+
+# ── (k) A FOSSIL IS RETIRED, NOT DEFERRED FOR EVER (agent-infra#4007) ────────────────────────────
+# ⛔ THE DEFECT THIS GRADES, MEASURED 2026-12-04: the order population only ever grows, so a box held
+# orders for PRs that had long since merged (105 distinct order PR numbers, 105 not open, 0 orders for
+# the 18 live PRs). Every pass walked them, the gate refused 72 of them, and the pass ended `deferred`
+# for ever -- so `live=` could never become non-zero and the pool could not say anything at all. The
+# assertions are BEHAVIOURAL: what left the population, what was NOT spawned, and what a fresh order
+# does on the very next pass (the composer un-retires it by rewriting its record).
+echo "-- (k) an un-actionable fossil is RETIRED; new work is still supplied"
+reset
+fossil_fixture() { # two dead orders whose refills are spent; only prd-41 is older than the TTL
+  for _n in 41 42; do
+    mkwt "$TMP/wt/prd-$_n" "fix/$_n"
+    mkbrief "$TMP/briefs/prd-$_n.txt"
+    mkorder "prd-$_n" "$TMP/wt/prd-$_n" "fix/$_n" "$TMP/briefs/prd-$_n.txt" 2400 "2026-10-27 01:00:00"
+    printf '%s\t%s\t%s\t%s\n' 1 "prd-$_n" s1 accepted >> "$ST/worker-supply-offers.tsv"
+    printf '%s\t%s\t%s\t%s\n' 2 "prd-$_n" s2 accepted >> "$ST/worker-supply-offers.tsv"
+  done
+  touch -t 202601010000 "$BG/prd-41.started"      # the FOSSIL: older than the 7-day TTL
+}
+fossil_fixture
+O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/k1.out" 2>&1; rck=$?
+[ "$(record_field retired)" = "1" ] && ok "the un-actionable FOSSIL is RETIRED (record retired=1) — it leaves the pool instead of being deferred for ever" \
+                                    || bad "record retired='$(record_field retired)', expected 1"
+[ "$(spawns_for prd-41)" = "0" ] && ok "…and it was NOT re-offered (a retired order costs no spawn and no gate call)" \
+                                  || bad "the retired order was re-offered: $(spawns_for prd-41) spawn(s)"
+[ "$(awk -F'\t' '$2=="prd-41"' "$ST/worker-supply-retired.tsv" 2>/dev/null | wc -l | tr -d ' ')" = "1" ] \
+  && ok "the retirement is a durable RECORD (one row in worker-supply-retired.tsv naming the order)" \
+  || bad "the retired ledger does not hold exactly one row for prd-41"
+[ "$(awk -F'\t' '$2=="prd-42"' "$ST/worker-supply-retired.tsv" 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+  && ok "…and the FRESH order of the same shape is NOT retired (the TTL is the discriminator, not the deadness)" \
+  || bad "a fresh un-actionable order was retired — retirement would lose work the composer has not expired"
+[ "$rck" = "6" ] && ok "rc=6 DEFERRED — the pass still refuses to call itself clean over the order it could not supply" \
+                 || bad "rc=$rck, expected 6 (the fresh un-actionable order is still dead)"
+# ⛔ THE COMPOSER UN-RETIRES WITHOUT A HUMAN: pr-doctor rewrites `.started` on every spawn, so a
+# re-ordered PR produces a NEW record instance and the retirement row stops matching. Then NEW work
+# appears — and that is the acceptance criterion this case exists for: `live` becomes non-zero.
+mkorder prd-41 "$TMP/wt/prd-41" fix/41 "$TMP/briefs/prd-41.txt" 2400 "$(date '+%Y-%m-%d %H:%M:%S')"
+mkwt "$TMP/wt/prd-43" fix/43
+mkbrief "$TMP/briefs/prd-43.txt"
+mkorder prd-43 "$TMP/wt/prd-43" fix/43 "$TMP/briefs/prd-43.txt"
+O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/k2.out" 2>&1
+[ "$(record_field retired)" = "0" ] && ok "a RE-ORDERED record un-retires itself (retired=0) — retirement never shadows live work" \
+                                    || bad "record retired='$(record_field retired)' after the composer re-ordered it, expected 0"
+[ "$(spawns_for prd-43)" = "1" ] && ok "NEW work is supplied on the same pass (prd-43 spawned once)" \
+                                  || bad "new work was not supplied: $(spawns_for prd-43) spawn(s)"
+[ "$(record_field live)" = "1" ] && ok "…and the pool's live count becomes NON-ZERO with the new work (record live=1) — the reading that could not happen over a 100 %-fossil pool" \
+                                  || bad "record live='$(record_field live)', expected 1"
+
+# ── (k2) MUTATION: neuter retirement, and (k) must redden ──────────────────────────────────────
+echo "-- (k2) mutation: no retirement must redden (k)"
+MUT4="$TMP/worker-supply.noretire.sh"
+sed 's|^retire_order() {|retire_order() { return 1   # MUTATION: retirement is gone|' "$SUPPLY" > "$MUT4"
+if cmp -s "$SUPPLY" "$MUT4"; then
+  bad "the retirement mutation did not apply (\`retire_order() {\` was not found) — a mutation that cannot mutate proves nothing"
+else
+  reset
+  fossil_fixture
+  O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 bash "$MUT4" refill >"$TMP/k2mut.out" 2>&1; rck2=$?
+  if [ "$(record_field retired)" != "1" ] && [ "$rck2" = "6" ]; then
+    ok "with retirement neutered the (k) assertion REDDENS: retired='$(record_field retired)', rc=$rck2 — (k) really grades retirement and not the fixture"
+  else
+    bad "the mutation did NOT redden (k): retired='$(record_field retired)', rc=$rck2 — the case would pass on a supervisor that defers a fossil for ever"
+  fi
+fi
+
+# ── (m) THE HEARTBEAT: A STOPPED SUPERVISOR IS STALE, NOT QUIET (agent-infra#4007) ──────────────
+# ⛔ THE MEASURED SHAPE: a supervisor alive 16 days whose log had stopped two days earlier. Every
+# derived number read "quiet" and NOTHING reported the absence, so the silence was indistinguishable
+# from health. `status` now grades the AGE of the last completed pass and exits 5 on STALE. Both
+# directions are asserted (a bound that can never be exceeded is not a bound) and so is the knob.
+echo "-- (m) status reports STALE when the last completed pass is older than the bound"
+# one reader for the heartbeat line, so no assertion below has to nest quotes inside an interpolation
+beat_line_of() { grep -m1 'beat:' "$1" 2>/dev/null || echo '<no beat line>'; }
+reset
+mkwt "$TMP/wt/prd-51" fix/51
+mkbrief "$TMP/briefs/prd-51.txt"
+mkorder prd-51 "$TMP/wt/prd-51" fix/51 "$TMP/briefs/prd-51.txt"
+O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m0.out" 2>&1; rcm0=$?
+[ "$rcm0" = "5" ] && grep -q 'beat:  STALE' "$TMP/m0.out" \
+  && ok "a box whose record was NEVER written reports STALE (rc=5), not silence — this is the 2-day-stale log" \
+  || bad "an absent pass record reported rc=$rcm0 / '$(beat_line_of "$TMP/m0.out")', expected STALE + 5"
+O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
+O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m1.out" 2>&1; rcm1=$?
+[ "$rcm1" = "0" ] && grep -q 'beat:  ok' "$TMP/m1.out" \
+  && ok "…and a pass that just completed reads ok (rc=0) — the assertion is not vacuous" \
+  || bad "a fresh record reported rc=$rcm1 / '$(beat_line_of "$TMP/m1.out")', expected ok + 0"
+touch -t 202601010000 "$ST/worker-supply.state"
+O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m2.out" 2>&1; rcm2=$?
+[ "$rcm2" = "5" ] && grep -q 'beat:  STALE' "$TMP/m2.out" \
+  && ok "…and the SAME box with a record older than the bound reports STALE (rc=5): the process being up is not the question" \
+  || bad "an aged record reported rc=$rcm2, expected STALE + 5"
+O="$O" WORKER_SUPPLY_STALE_AFTER_S=999999999 MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m3.out" 2>&1; rcm3=$?
+[ "$rcm3" = "0" ] && ok "the BOUND is what decides: the same record is inside a 999999999s bound (rc=0)" \
+  || bad "the staleness knob is inert: rc=$rcm3 with a bound of 999999999s"
 
 # ── (h) THE WALL-CLOCK BOUND ──────────────────────────────────────────────────────────────────────────
 # ⛔ THIS IS A TEST, NOT A COMMENT. The first attempt at this fix died inside its own suite: 45 minutes

@@ -251,7 +251,22 @@ do_status() {
     if [ -f "$dest" ]; then ok "installed: $dest"; else err "not installed: $dest"; rc=1; fi
     if $SYSTEMCTL is-enabled --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "enabled: yes"; else err "enabled: no"; rc=1; fi
     if $SYSTEMCTL is-active --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "active: yes"; else err "active: no"; rc=1; fi
-    [ -n "$SCRIPT" ] && { log_line "supervisor status:"; "$SCRIPT" status 2>&1 | sed 's/^/    /'; }
+    if [ -n "$SCRIPT" ]; then
+        log_line "supervisor status:"
+        "$SCRIPT" status 2>&1 | sed 's/^/    /'
+        # ⛔ THE SUPERVISOR'S OWN VERDICT RIDES ON THIS CODE (agent-infra#4007). `ActiveState=active` is
+        # true of a `--loop` that has STOPPED PASSING: the unit is up, the record is days old, and the
+        # measured shape was a supervisor alive 16 days whose log had stopped 2 days earlier. The
+        # supervisor's `status` answers that question itself (exit 5 = STALE), so folding its code in is
+        # what makes this verb's exit mean "supplying", not "installed". The pipe's status is read from
+        # PIPESTATUS, because `sed`'s exit code is the one a pipeline reports and it is always 0.
+        local src=${PIPESTATUS[0]}
+        case "$src" in
+            0) : ;;
+            5) err "REFUSING: the supervisor is STALE — it is enabled and active but has written no completed pass inside its bound (run: $SCRIPT status)"; rc=1 ;;
+            *) warn "the supervisor's status exited $src — its own verdict could not be read (run: $SCRIPT status)" ;;
+        esac
+    fi
     # ⛔ THE EXIT CODE MUST CARRY THE VERDICT, NOT JUST THE LAST TEST (review #2896 round 3). `--status`
     # printed `❌ not installed` / `❌ enabled: no` / `❌ active: no` and still exited 0 whenever the unit
     # FILE existed — so a caller that reads the code (a lane, a supervisor, `set -e`) was told "healthy"
