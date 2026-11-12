@@ -498,10 +498,15 @@ bash "$POLICY" --unit-veto "$TMP/continued.service" continued >/dev/null 2>&1; C
   || bad "(5d) edges: a backslash-continued Environment= answered rc=$CONT_RC — the fold is gone and the census fails OPEN"
 # …and the fold must not create false positives in either direction: a clean continuation is clean, and a
 # WRAPPED COMMENT swallows its continuation exactly as systemd does (so the flag below is not a declaration).
-printf '[Service]\nEnvironment=FOO=1 \\\n    BAR=2\nExecStart=/bin/true\n' >"$TMP/cleancont.service"
+# ⛔ THE CONTINUATION LINE CARRIES A HATCH-SHAPED NAME ON PURPOSE (fresh review of #4002, P2). A fixture
+# whose value names no hatch at all (`BAR=2`) answers rc=0 under EVERY mutant — the judge could drop the
+# whole-word match, or veto any name it merely spots, and this arm still printed `ok`. `_DISABLED` is the
+# name that must NOT be graded: `-w` treats `_` as a word character, so this is a real over-block control
+# on a real continuation, and it reddens when the match degrades from a name to a substring.
+printf '[Service]\nEnvironment=FOO=1 \\\n    AGENT_SKIP_REVIEW_GATE_DISABLED=1\nExecStart=/bin/true\n' >"$TMP/cleancont.service"
 bash "$POLICY" --unit-veto "$TMP/cleancont.service" cleancont >/dev/null 2>&1 \
-  && ok "(5d) edges: a clean continued Environment= is still clean (the fold is not matching everything)" \
-  || bad "(5d) edges: a clean continued Environment= was vetoed — the fold over-matches"
+  && ok "(5d) edges: a clean continuation whose value only CONTAINS a hatch name is still clean (a name, not a substring — and the fold is not matching everything)" \
+  || bad "(5d) edges: the continued superset name AGENT_SKIP_REVIEW_GATE_DISABLED was vetoed — the match is a substring, not a name"
 printf '[Service]\n# a comment wrapping \\\nEnvironment=AGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/commentwrap.service"
 bash "$POLICY" --unit-veto "$TMP/commentwrap.service" commentwrap >/dev/null 2>&1 \
   && ok "(5d) edges: a WRAPPED COMMENT swallows its continuation (systemd's rule) and is not a declaration" \
@@ -535,7 +540,13 @@ PASSENV_RC=0; bash "$POLICY" --unit-veto "$TMP/passenv.service" passenv >/dev/nu
 [ "$PASSENV_RC" -eq 1 ] \
   && ok "(5d) edges: PassEnvironment= naming a hatch IS vetoed (and EnvironmentFile= stays out by design)" \
   || bad "(5d) edges: PassEnvironment=AGENT_SKIP_REVIEW_GATE answered rc=$PASSENV_RC (want 1) — the unit's own text names the hatch"
-printf '[Service]\nEnvironmentFile=/etc/some.env\nExecStart=/bin/true\n' >"$TMP/envfile.service"
+# ⛔ THE FIXTURE'S PATH NAMES THE HATCH ON PURPOSE (fresh review of #4002, P2). With a hatch-free path
+# (`/etc/some.env`) this row answered rc=0 whether `EnvironmentFile=` was excluded or graded — the two
+# states were identical to it, so the arm pinned nothing while the PR body claimed it pinned the exclusion.
+# `EnvironmentFile=` takes a FILENAME, never a variable name (`systemd.exec(5)`), so the path is the only
+# place a hatch-shaped token could appear without being a declaration: exempt ⇒ rc=0, accidentally graded ⇒
+# `-w` matches inside the path (`/` and `.` are non-word) ⇒ rc=1 and this arm reddens.
+printf '[Service]\nEnvironmentFile=/etc/AGENT_SKIP_REVIEW_GATE.env\nExecStart=/bin/true\n' >"$TMP/envfile.service"
 bash "$POLICY" --unit-veto "$TMP/envfile.service" envfile >/dev/null 2>&1 \
   && ok "(5d) edges: EnvironmentFile= is NOT graded (the declared limit: the unit names a file, not a variable)" \
   || bad "(5d) edges: EnvironmentFile= was graded — the declared limit and the code disagree"
