@@ -61,10 +61,22 @@
 # install-lane-arm-timer.sh` writes its `Environment=` lines from a heredoc (`service_body`) and is farmed,
 # so it is a live install path that no template census sees. A generated declaration is graded like any
 # other — the bytes the installer would write are what the veto reads.
-# STATED LIMIT, so no reader over-reads it: this grades the DECLARATION. `EnvironmentFile=` (a file the unit
-# names but whose CONTENTS we cannot read), a sourced rc file and the spawned script's own `export` are
-# outside it. `PassEnvironment=` IS inside it — it names a variable in the unit's own text, so it is graded
-# like `Environment=` (fresh review of #4002, round 4: it used to answer CLEAN while naming two hatches).
+# ⛔ AND THE SAME WAS TRUE OF THE SECOND GENERATOR (fresh review of PR #4020, finding 2):
+# `install-conflict-rebase-timer.sh` appends `Environment=CONFLICT_REBASE_DRY_RUN=1` AFTER a render and
+# writes the plist's `EnvironmentVariables` with python, and it too is farmed — so this paragraph's claim
+# was again wider than the coverage behind it. It now calls `gate_policy_unit_veto` on both rendered
+# artifacts (`--dry-run` included, so the preview cannot show what an install would refuse), and its own
+# suite carries the arm that reddens when that call is deleted. The claim is therefore true by
+# construction, not by a census that happens to be complete today.
+# STATED LIMIT, so no reader over-reads it: this grades the DECLARATION TEXT of the unit. `EnvironmentFile=`
+# (a file the unit names but whose CONTENTS we cannot read), a sourced rc file and the spawned script's own
+# `export` are outside it. `PassEnvironment=` IS inside it — it names a variable in the unit's own text, so
+# it is graded like `Environment=` (fresh review of #4002, round 4: it used to answer CLEAN while naming two
+# hatches). ⛔ ALSO OUTSIDE, and stated because it is the one a reader would otherwise assume covered: an
+# EXEC-PREFIX assignment — `ExecStart=/usr/bin/env AGENT_SKIP_REVIEW_GATE=1 /path` on systemd, and the same
+# shape in a launchd `ProgramArguments` array — is not an `Environment=`/`PassEnvironment=` directive, so it
+# is not read here (fresh review of PR #4020, note b). Closing it means grading the exec line, which is a
+# different declaration and a larger surface; it is recorded rather than silently assumed.
 #
 # SEAMS (tests): GP_REPO=<path> (harness checkout to probe), GP_LOG=<file> (audit), GP_QUIET=1.
 
