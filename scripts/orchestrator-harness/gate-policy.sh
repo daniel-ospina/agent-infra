@@ -90,7 +90,10 @@ gate_policy_unit_veto() {
   # (the STATED LIMIT in this file's header).
   envlines="$(grep -E '^[[:space:]]*Environment[[:space:]]*=' "$f" 2>/dev/null || true)"
   for flag in $GP_UNIT_BYPASS_FLAGS; do
-    if [ -n "$envlines" ] && printf '%s\n' "$envlines" | grep -Fqw -- "$flag"; then
+    # ⛔ HERE-STRING, NOT `printf … | grep -q` (#841/#864): under `set -o pipefail` a quiet grep exits at
+    # its first match, the still-writing printf takes SIGPIPE (141), pipefail promotes it, and this
+    # function would answer CLEAN for a declaration whose hatch is right there.
+    if [ -n "$envlines" ] && grep -Fqw -- "$flag" <<<"$envlines"; then
       hit="$hit $flag"
     elif grep -Eq "<key>[[:space:]]*${flag}[[:space:]]*</key>" "$f" 2>/dev/null; then
       hit="$hit $flag"            # launchd: the plist spells the name as its own <key>
