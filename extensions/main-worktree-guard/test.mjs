@@ -5567,6 +5567,37 @@ try {
     allows(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n -- +1; popd; echo x > tracked.md", "P1 control: treating `-n -- +1` as a ROTATION lands on a — the a resolution must NOT be graded, bash stays in b");
     has("cd a; pushd ../docs; pushd -n -- ../b; echo x > tracked.md", "redirect:H/docs/tracked.md", "P1 control: `-n` itself never cds — only the NEXT popd moves, so this write stays in docs");
     has("cd a; pushd ../docs; pushd -n --; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "P1 control: a bare `pushd -n --` (no operand) changes nothing — the popd still lands on a");
+    // ── #3955 review ROUND 2 (#3973): round 1 closed `pushd -n -- <dir>` but its
+    // hunk dropped the INSERT's existence gate, and a later round-2 review measured
+    // the false refusal that opens. The gate bash actually applies is at the
+    // CONSUMER, not the insert: `pushd -n` stores the operand STRING verbatim, so an
+    // absent entry can sit in the stack, and every form that cd's to it fails.
+    // Measured on bash 3.2.57 here (stack [b, +1, docs, a], cwd b):
+    //   popd      rc 1  NOTHING removed, cwd b      (and a SECOND popd fails too)
+    //   popd +0   rc 1  NOTHING removed, cwd b
+    //   pushd +1  rc 1  the rotation STAYS, cwd b   (a later popd then lands on docs)
+    //   pushd     rc 1  the SWAP stays, cwd b
+    //   popd -n +1 rc 0 the entry is REMOVED without any cd
+    // So a model that consumes-then-fails grades `docs` where bash writes `b` — the
+    // FALSE REFUSAL — and is one entry off for the rest of the walk.
+    const poisoned = "cd a; pushd ../docs; pushd ../b; pushd -n -- +1";
+    has(`${poisoned}; popd; popd; echo x > tracked.md`, "redirect:H/b/tracked.md", "R2a: `-n` inserts a LITERAL `+1` and each popd FAILS — bash keeps the entry and the cwd (b)");
+    blocks(["b/tracked.md"], `${poisoned}; popd; popd; echo x > tracked.md`, "R2a gate: TRACKED b/tracked.md → BLOCK (bash really writes it)");
+    allows(["docs/tracked.md"], `${poisoned}; popd; popd; echo x > tracked.md`, "R2a FALSE-REFUSAL control: the head 8394e93ba resolved docs here and BLOCKED a directory bash never enters");
+    allows(["a/tracked.md"], `${poisoned}; popd; popd; echo x > tracked.md`, "R2a anti-narrowing: a retained stack must not drift the other way either — `a` is not graded");
+    // `popd +0` names ELEMENT 0, so removing it forces a cd to the new top; that cd
+    // fails on the absent entry and bash removes NOTHING (rc 1, dirs unchanged).
+    has(`${poisoned}; popd +0; popd; echo x > tracked.md`, "redirect:H/b/tracked.md", "R2b: `popd +0` whose new top is the absent `+1` is rc 1 and splices NOTHING — the next popd still fails, cwd b");
+    blocks(["b/tracked.md"], `${poisoned}; popd +0; popd; echo x > tracked.md`, "R2b gate: TRACKED b/tracked.md → BLOCK (a spliced stack resolves docs)");
+    // Every OTHER popd index removes WITHOUT a cd, so an absent entry IS removable.
+    has(`${poisoned}; popd -n +1; popd; echo x > tracked.md`, "redirect:H/docs/tracked.md", "R2b control: `popd -n +1` removes the absent entry with no cd at all — the retention rule must not leak into the -n arm");
+    // The rotation/swap SURVIVES the failed cd; only the cd is conditional.
+    has(`${poisoned}; pushd +1; echo x > tracked.md`, "redirect:H/b/tracked.md", "R2c: `pushd +1` onto the absent entry fails its cd but KEEPS the rotation — cwd stays b");
+    has(`${poisoned}; pushd +1; popd; echo x > tracked.md`, "redirect:H/docs/tracked.md", "R2c gate: …and the KEPT rotation is real — the popd after it lands on docs, so a dropped rotation would resolve b");
+    has(`${poisoned}; popd; pushd; echo x > tracked.md`, "redirect:H/b/tracked.md", "R2d: a bare `pushd` (swap) onto the absent entry also fails its cd — the swap stays but the cwd does not move (b)");
+    // A never-popped absent `-n` operand is not a landing: `-n` never cds.
+    has("cd a; pushd -n -- ../no-such-dir-xyz; echo x > tracked.md", "redirect:H/a/tracked.md", "R2e control: an absent `-n` operand that is never popped is never graded as a landing (the cwd stays a)");
+    allows(["b/tracked.md"], "cd a; pushd -n -- ../no-such-dir-xyz; echo x > tracked.md", "R2e control gate: the absent operand is not a landing, so nothing grades b either (only the a write is graded)");
   }
 
 

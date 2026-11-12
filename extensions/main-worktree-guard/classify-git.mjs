@@ -8258,6 +8258,28 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
                                // orientation (#3955).
   const vstack = (top) => [top, ...dirStack.slice().reverse()];
   const setVStack = (S) => { dirStack = S.slice(1).reverse(); return S[0]; };
+  // ⛔ A STACK ENTRY IS NOT A PROMISE THAT ITS DIRECTORY EXISTS, so every stack
+  // form that ends in a `cd` must model WHICH HALF of the operation survives when
+  // that `cd` fails. This is not theory: `pushd -n` inserts its operand STRING
+  // verbatim (bash: `add_dirstack_element(savestring(list->word->word))`), so an
+  // absent path can sit in `DIRSTACK` and the very next form that consumes it
+  // cd's to nothing. MEASURED, bash 3.2.57 on this host, stack `[b, +1, docs, a]`
+  // (cwd `b`, `+1` inserted by `pushd -n -- +1`):
+  //   `popd`       rc 1  "popd: +1: No such file or directory"  NOTHING removed, cwd b
+  //   `popd +0`    rc 1  same error                              NOTHING removed, cwd b
+  //   `popd -3`    rc 1  same error                              NOTHING removed, cwd b
+  //   `popd +1`    rc 0  the entry is removed, no cd            `[b, docs, a]`, cwd b
+  //   `popd -n +1` rc 0  the entry is removed, no cd            `[b, docs, a]`, cwd b
+  //   `pushd`      rc 1  the SWAP stays, its cd fails            `[b, b, docs, a]`, cwd b
+  //   `pushd +1`   rc 1  the ROTATION stays, its cd fails        `[b, docs, a, b]`, cwd b
+  // The rule that reproduces all seven: the STACK mutation an arm performs is
+  // unconditional and only its `cd` is conditional on the target existing —
+  // EXCEPT the two forms whose removal IS the entry being cd'd to (a bare
+  // `popd`, and `popd ±N` naming element 0), where a failed cd removes NOTHING.
+  // Getting this wrong in either direction is a grading bug, not cosmetics: a
+  // cwd bash never entered grades a directory the write never touches (a FALSE
+  // REFUSAL) and desynchronises every later stack form (a fail-OPEN).
+  const cdTo = (x) => (x !== undefined && x !== null && existsSync(x) ? x : null);
   let dirStackSnapshots = [];  // FULL copy per ( - restored at ) (cycle-24 P1 r29 D1-D3:
                                // a subshell gets a COPY — ( popd ) must not eat an inherited entry)
   const SPAWNER_FLAG_OPERANDS = {
@@ -9532,9 +9554,12 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           const n = Number(numeric[2]);
           const k = numeric[1] === "+" ? n : n + 1;              // left by N · right by N+1
           if (k > 0 && k < S.length) {                           // k===0 → identity; k>=len → bash error
-            f().pending = setVStack(numeric[1] === "+"
+            // ⛔ THE ROTATION SURVIVES A FAILED `cd` (measured above: `pushd +1`
+            // over `[b, +1, docs, a]` leaves `[b, docs, a, b]` at cwd `b`), so
+            // `cdTo` gates ONLY the pending cd — never the rotation itself.
+            f().pending = cdTo(setVStack(numeric[1] === "+"
               ? S.slice(k).concat(S.slice(0, k))                    // rotate left
-              : S.slice(S.length - k).concat(S.slice(0, S.length - k))); // rotate right
+              : S.slice(S.length - k).concat(S.slice(0, S.length - k)))); // rotate right
           }
           continue;
         }
@@ -9601,6 +9626,13 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           // ⚠️ The words this walker cannot resolve (`~`, `~/…`, `-` = OLDPWD, and
           // an unexpanded `$VAR`/`$(…)`) stay no-ops — `pushd -n $EMPTY` IS bash's
           // bare `pushd -n` (a silent no-op) and must not insert a bogus entry.
+          // ⛔ THE EXISTENCE GATE THAT USED TO LIVE HERE IS NOT LOST — it MOVED to
+          // where bash applies it (`cdTo` at every stack-consuming form, above).
+          // Dropping it here while popping unconditionally there is the pair that
+          // produced the FALSE REFUSAL the round-2 rows pin: `pushd -n -- +1`
+          // inserts a literal `+1`, the NEXT `popd` cannot cd to it and removes
+          // NOTHING, so real bash stays where it was while a consume-then-fail
+          // model moves one entry and grades a directory the shell never entered.
           const ins = nw.w && nw.w !== "~" && !nw.w.startsWith("~/") && nw.w !== "-" && !/^[$`]/.test(nw.w)
             ? resolve(cwd, nw.w) : null;
           if (ins) { const S = vstack(f().cwd); S.splice(1, 0, ins); setVStack(S); }
@@ -9617,7 +9649,10 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         // not), so it is modelled rather than only commented on.
         if (!tgt.w) {
           const S = vstack(f().cwd);
-          f().pending = S.length > 1 ? setVStack([S[1], S[0], ...S.slice(2)]) : null;
+          // Same rule as the rotation above: the SWAP is unconditional (measured —
+          // `[b, +1, docs, a]` becomes `[b, b, docs, a]` when the cd to `+1`
+          // fails), only the cd is gated.
+          f().pending = S.length > 1 ? cdTo(setVStack([S[1], S[0], ...S.slice(2)])) : null;
           continue;
         }
         // remaining flag forms (`-` = OLDPWD, #2177's recorded residual; a bare `-x`)
@@ -9666,7 +9701,17 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (sel) {
         const S = vstack(f().cwd);
         const idx = sel[1] === "+" ? Number(sel[2]) : S.length - 1 - Number(sel[2]);
-        if (idx >= 0 && idx < S.length) f().pending = setVStack(S.slice(0, idx).concat(S.slice(idx + 1)));
+        if (idx >= 0 && idx < S.length) {
+          const rest = S.slice(0, idx).concat(S.slice(idx + 1));
+          // ⛔ ELEMENT 0 IS THE CURRENT DIRECTORY, so removing it forces a cd to
+          // the new top (`popd +0`, and `popd -N` whose index lands on 0). When
+          // THAT cd fails bash removes nothing (measured above: `popd +0` and
+          // `popd -3` over `[b, +1, docs, a]` are rc 1 with `dirs` unchanged) —
+          // so this arm must not splice the stack either. Every other index
+          // removes WITHOUT a cd, which is why an absent entry is removable there.
+          if (idx === 0 && cdTo(rest[0]) === null) continue;
+          f().pending = setVStack(rest);
+        }
         continue;                                              // out of range → bash error, no change
       }
       if (tgt.w === "-n") {                                    // `-n` + its OWN operand — see the pushd block
@@ -9735,7 +9780,20 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (tgt.w && tgt.w !== "--" && !unprovable) continue;   // bash error → no change
       const keepCwd = f().cwd;
       const d = dirStack.pop();
-      const popTo = d !== undefined && existsSync(d) ? d : null;
+      // ⛔ THE REMOVAL IS CONDITIONAL HERE, UNLIKE EVERY OTHER FORM (#3955 review
+      // round 2 P1, measured on bash 3.2.57): a bare `popd` removes the entry it
+      // cd's to, so when that cd FAILS the entry STAYS and every later `popd`
+      // fails on the SAME entry — `cd a; pushd ../docs; pushd ../b; pushd -n --
+      // +1; popd; popd` ⇒ both rc 1, `dirs` unchanged, cwd stays `b`. Consuming
+      // it anyway desynchronises the model permanently (every later stack form is
+      // then one entry off) and makes the gate grade a directory the shell never
+      // entered — a FALSE REFUSAL on `docs/tracked.md` where bash writes `b`.
+      if (d !== undefined && cdTo(d) === null) {
+        dirStack.push(d);                                     // retained, not consumed
+        f().pending = null;                                   // the cd failed — cwd unchanged
+        continue;
+      }
+      const popTo = d !== undefined ? d : null;
       if (unprovable && popTo !== null && popTo !== keepCwd) {
         // the "the expansion was a path ⇒ bash errored, nothing changed" reality
         f().forkCwd = f().forkCwd || popTo;
