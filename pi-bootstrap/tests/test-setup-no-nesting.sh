@@ -2971,17 +2971,25 @@ else
       echo "ok: a failed install leaves the previous copy byte-identical AND executable, and does not write through it"
     fi
   fi
-  # ARM 4: a DIRECTORY at the destination is REFUSED, not installed into. `mv -f file existing-dir`
-  # MOVES INTO it and exits 0, so without the helper's guard this path reports SUCCESS while nothing
-  # landed at the path the array declared — the "a farm that reports success over a file it did not
-  # deliver" class (#1931/#1924), and one a `cp -f` implementation cannot fail either.
+  # ARM 4: a DIRECTORY at the destination is REFUSED, in its own words, with nothing delivered.
+  # `mv -f file existing-dir` MOVES INTO it and exits 0, so without the helper's guard this path
+  # reports SUCCESS while the declared path stays empty — "a farm that reports success over a file it
+  # did not deliver" (#1931/#1924), a shape a `cp -f` implementation cannot fail either. Measured
+  # against the real helper, not assumed: with the `[ -d "$dest" ]` guard deleted this arm reds on
+  # "reported SUCCESS". The refusal's OWN words are asserted as well, so `mv` failing for an
+  # unrelated reason cannot satisfy this arm in the guard's place (the poison ARM 3b names).
+  rm -rf "$ATOM_DIR/dirgate.sh"
   mkdir -p "$ATOM_DIR/dirgate.sh"
-  if farm_install "$TMP/atomic-src.sh" "$ATOM_DIR/dirgate.sh" 2>/dev/null; then
+  dirgate_rc=0
+  dirgate_err="$(farm_install "$TMP/atomic-src.sh" "$ATOM_DIR/dirgate.sh" 2>&1)" || dirgate_rc=$?
+  if [ "$dirgate_rc" -eq 0 ]; then
     fail "farm_install reported SUCCESS with a DIRECTORY at the destination ($ATOM_DIR/dirgate.sh) — 'mv -f file dir' moves the file INTO it and exits 0, so the leg would count a copy it never delivered (#3991)"
   elif [ -e "$ATOM_DIR/dirgate.sh/atomic-src.sh" ]; then
     fail "farm_install moved the source INTO the destination directory ($ATOM_DIR/dirgate.sh/atomic-src.sh) instead of refusing — the declared path stays empty while the leg reports a failure for the wrong reason"
+  elif ! grep -q 'refusing to install over it' <<<"$dirgate_err"; then
+    fail "the destination-directory refusal did not say so in its own words (got: $dirgate_err) — mv's own refusal would satisfy this arm just as well"
   else
-    echo "ok: a DIRECTORY at the destination is REFUSED, never silently moved into"
+    echo "ok: a DIRECTORY at the destination is REFUSED in its own words, with nothing delivered"
   fi
 fi
 
