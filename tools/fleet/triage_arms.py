@@ -326,11 +326,14 @@ def arm_child(lane: str, child: dict) -> Proof:
     from the state word, which reported `verified=True` off `{'name': 'stuck'}`. `call_id` is the
     child's identity in the harness's own records, so it is the one that proves a record was READ.
     """
-    named = [k for k in ("call_id", "agent", "task", "label", "pid", "sid", "name")
-             if (child or {}).get(k)]
-    known = bool(child) and bool(named)
-    who = ((child or {}).get("call_id") or (child or {}).get("agent") or (child or {}).get("label")
-           or (child or {}).get("pid") or (child or {}).get("sid") or (child or {}).get("name"))
+    # ⛔ ONLY THE KEYS THE PRODUCER ACTUALLY EMITS. `name` / `pid` / `sid` / `label` are NOT among
+    # them, so accepting them left a false-PASS door open: measured after the round-3 fix,
+    # `arm_child("L", {"name": "stuck"}).verified` was still `True` — the synthesis was gone from
+    # `execute()`, but the arm would still certify a dict no producer can produce. The proof is that a
+    # RECORD was read, so it must be keyed on a field only a real record carries.
+    named = [k for k in ("call_id", "agent", "task") if (child or {}).get(k)]
+    known = bool(named)
+    who = ((child or {}).get("call_id") or (child or {}).get("agent") or (child or {}).get("task"))
     return Proof("repair-child", triage.PROOFS["repair-child"], known,
                  ("child record READ and handed over (%s; fields=%s) — this arm signals nothing"
                   % (who, ",".join(named))) if known else

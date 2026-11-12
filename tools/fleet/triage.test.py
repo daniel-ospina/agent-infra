@@ -634,6 +634,16 @@ def leg_arm_wedged_remedies() -> None:
     ok("child-stuck with ONLY a state word is NOT verified", not p_state.verified, p_state.detail)
     ok("…and names no fabricated child", p_state.artifact.get("child") == {},
        repr(p_state.artifact))
+    # ⛔ AND THE DOOR THE SYNTHESIS USED TO WALK THROUGH (round 4, author fix). Deleting the
+    # synthesis from `execute()` closed the production path, but the ARM still accepted `name` /
+    # `pid` / `sid` / `label` — keys `lane-status.py` never emits — so `arm_child("L", {"name":
+    # "stuck"}).verified` was still True: a caller could certify a "hand-off" of a dict no producer
+    # can produce. Measured before this leg: True, and it PASSED through every other assertion here.
+    for fake in ({"name": "stuck"}, {"pid": 4242}, {"sid": "s"}, {"label": "kid"},
+                 {"pid": 4242, "label": "kid", "name": "kid"}):
+        ok("a child dict keyed only on a key no producer emits is NOT verified: %r" % (fake,),
+           not triage_arms.arm_child("L", fake).verified,
+           triage_arms.arm_child("L", fake).detail)
 
     # rerun: lane-relaunch.py's own exit code IS the proof
     e = ev(lane_verdict="WEDGED", turn=TURN_OPEN)
