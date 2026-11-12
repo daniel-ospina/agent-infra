@@ -63,12 +63,17 @@ eval "$(sed -n '/^rail_says_skip() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^denied() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^cooldown_for() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^forget_tried() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^rail_bound_file() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^rail_bound_state() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^rail_bound_elapsed() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^reap_bounded_rail() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^launch_rail() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^lock_holder_is_live() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^acquire_lock() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^report_search() {/,/^}$/p' "$SUT")"
 for _fn in rail_rows rails_for_repo rails_should_defer candidate_deferred max_total_for \
-           rail_already_running rail_says_skip denied cooldown_for forget_tried launch_rail \
+           rail_already_running rail_says_skip denied cooldown_for forget_tried \
+           rail_bound_file rail_bound_state rail_bound_elapsed reap_bounded_rail launch_rail \
            lock_holder_is_live acquire_lock report_search; do
   command -v "$_fn" >/dev/null || { echo "FATAL: $_fn not found in $SUT"; exit 2; }
 done
@@ -82,6 +87,14 @@ log_line() { printf '%s\n' "$*" >> "$LOG"; }
 LOG=$(mktemp)
 LOCK=$(mktemp -d)/lock
 TRIED=$(mktemp)
+# ⛔ THE LIFETIME BOUND'S FOUR KNOBS ARE PART OF `launch_rail`'s CONTRACT NOW (#4001), so every arm that
+# drives a launch must have them bound — under `set -u` an unset one is a FATAL, not a default. 60s is the
+# fixture's ceiling (long enough that no arm here is killed at it by accident; the bound's OWN arms re-arm
+# it at 2s), and the shipped `lane-bound.sh` beside the SUT is the real enforcer.
+RAIL_DIR=$(mktemp -d)
+LANE_BOUND="$HERE/lane-bound.sh"
+RAIL_MAX_S=60
+RAIL_BOUND_POLL_S=1
 COOLDOWN_S=21600
 COOLDOWN_TRANSIENT_S=900
 LOCK_AGE_GRACE=120
@@ -2505,6 +2518,93 @@ else
   echo "SKIP: cannot make a ledger unwritable as $(id -un) — the unwritable-ledger arms are INERT on this host"
 fi
 chmod 600 "$_ROL" 2>/dev/null; rm -f "$_ROL"
+
+# ══ THE RAIL'S LIFETIME BOUND (#4001) ═════════════════════════════════════════════════════════════
+# MEASURED 2026-11-12 on the mac box: rails live #3973 7h03m and #3902 14h41m, each with a re-entrant
+# child of the same script on the same PR, while the actuator held one of eight slots for most of a
+# working day and logged `#3902 skipped (rail already running)` — a line that reads like healthy
+# de-duplication. The rail's own whole-attempt deadline (`RAIL_DEADLINE` in scripts/admin-merge.sh) is
+# enforced from `rail_guard_poll`, which runs at the head of the rail's POLL loops, so a rail parked in a
+# BLOCKING child wait never reaches one — which is why the bound has to be OUTSIDE the rail.
+#
+# What is DRIVEN here is the shipped launch and the shipped reaction, end to end: a rail stub that never
+# exits (`sleep 600`) is launched through `launch_rail`, the fleet's own `lane-bound.sh` kills it at the
+# ceiling, the ACTUATOR's log names the PR and the elapsed seconds, and the cooldown row is rolled back
+# so the head is retried next pass. The kill is proven by the STUB's OWN PID being gone, not by the
+# verdict file alone (a bound that writes a verdict and kills nothing is the inert enforcer this whole
+# issue is about).
+_bdir=$(mktemp -d)
+RAIL_DIR="$_bdir"
+LANE_BOUND="$(dirname "$SUT")/lane-bound.sh"
+[ -f "$LANE_BOUND" ] || bad "the shipped lane-bound.sh must sit beside auto-rail.sh — the bound resolves as \$(dirname \$0)/lane-bound.sh and the farm delivers the harness as ONE directory, so a bound that resolves only from a developer checkout is absent on the box that runs it"
+RAIL_MAX_S=2            # a 2s ceiling: the shipped 3600s would make this arm untestable
+RAIL_BOUND_POLL_S=1
+LAUNCH_VERIFY_S=1
+LOG=$(mktemp)
+TRIED=$(mktemp)
+_bstub="$_bdir/stub-rail.sh"
+_bpid="$_bdir/stub.pid"
+_bf=$(rail_bound_file daniel-ospina/tortoise 9101 feedface)
+case "$_bf" in "$_bdir"/bound-daniel-ospina-tortoise-9101-feedface.out) : ;; *) bad "rail_bound_file must key the bound's verdict by (repo, PR, HEAD) under \$RAIL_DIR (got '$_bf')";; esac
+# The stub records ITS OWN pid (so the kill is proven against a pid nobody in this suite chose) and then
+# never exits. `sleep 600` is the wedge in its simplest form: no verdict, no output growth, no exit.
+printf '#!/bin/bash\nprintf "%%s\\n" "$$" > "%s"\necho "rail started $*"\nsleep 600\n' "$_bpid" > "$_bstub"
+chmod +x "$_bstub"
+RAIL_SCRIPT="$_bstub" launch_rail daniel-ospina/tortoise 9101 feedface "$_bdir/auto-x-9101.out" \
+  || bad "a bounded launch whose child is alive must be recorded as started"
+grep -q '^9101	feedface	' "$TRIED" || bad "a started launch must leave its cooldown row"
+_bi=0
+while [ "$_bi" -lt 40 ]; do
+  [ "$(rail_bound_state "$_bf")" = bounded ] && break
+  sleep 0.5; _bi=$(( _bi + 1 ))
+done
+[ "$(rail_bound_state "$_bf")" = bounded ] \
+  || bad "a rail that never exits must be KILLED at the documented bound — the bound's verdict file reads '$(rail_bound_state "$_bf")', not 'bounded' (a rail that outlives its bound IS the defect #4001)"
+_bel=$(rail_bound_elapsed "$_bf")
+case "${_bel:-}" in ''|*[!0-9]*) bad "the bound's verdict must carry a measured elapsed time (got '${_bel:-<empty>}')";; *)
+  [ "$_bel" -ge 2 ] || bad "the elapsed time in the verdict must be at least the ceiling (got ${_bel}s, ceiling ${RAIL_MAX_S}s)";; esac
+# ⛔ THE KILL, NOT JUST THE VERDICT. The stub's own pid must be gone: `lane-bound.sh`'s verdict is written
+# BEFORE the kill, so a verdict with a live child is exactly the half-fix this assertion exists to refuse.
+_sp=$(cat "$_bpid" 2>/dev/null)
+case "${_sp:-}" in ''|*[!0-9]*) bad "the rail stub never ran (no pid recorded) — the bound was proven against nothing";; *)
+  if kill -0 "$_sp" 2>/dev/null; then
+    bad "the bound wrote a verdict but did NOT kill the rail (stub pid $_sp still alive): an enforcer that reports and does not terminate is inert"
+    kill -9 "$_sp" 2>/dev/null
+  fi;; esac
+# ⛔ THE LOG NAMES IT — THE PR AND THE ELAPSED TIME. That is the half of the acceptance the actuator's log
+# could never answer for a 14-hour rail: `skipped (rail already running)` says the machinery is busy and
+# nothing about the work.
+reap_bounded_rail daniel-ospina/tortoise 9101 feedface "$_bf" \
+  || bad "reap_bounded_rail must REPORT a bound kill (rc 1 means the actuator meets a killed attempt with silence, which is the blindness #4001 is about)"
+grep -q "RAIL-BOUND at feedface" "$LOG" || bad "the actuator's log must name the bound kill and the head (no 'RAIL-BOUND at feedface' line in $LOG)"
+grep -q "#9101 RAIL-BOUND" "$LOG" || bad "the actuator's log must name the PR (no '#9101 RAIL-BOUND' line)"
+grep -q "KILLED at ${_bel}s" "$LOG" || bad "the actuator's log must carry the ELAPSED time the bound measured (want 'KILLED at ${_bel}s')"
+# ⛔ RETRIED, NOT PARKED: the killed attempt decided nothing, so its cooldown row is rolled back and the
+# next pass rails the same head again. Leaving the row would skip it for COOLDOWN_TRANSIENT_S with a
+# sentence about a rail that no longer exists.
+grep -q '^9101	feedface	' "$TRIED" && bad "a bound-killed attempt must ROLL BACK its cooldown row — otherwise the head sits out the transient window over an attempt that reached no verdict"
+[ -f "$_bf" ] && bad "the bound's verdict file must be consumed by the reap, so the same kill is not re-reported every pass for ever"
+reap_bounded_rail daniel-ospina/tortoise 9101 feedface "$_bf" \
+  && bad "a consumed bound verdict must not report a SECOND kill — one killed attempt is one line, not one per pass"
+# ── a rail that FINISHED inside its bound is the RAIL's verdict, not the bound's: the row stays ────────
+printf '[lane-bound] VERDICT verdict=finished tag=rail-x-9102 pid=1 rc=1 elapsed=9s wall_bound=2s idle_bound=0s signal=none log=x\n' > "$_bf"
+[ "$(rail_bound_state "$_bf")" = finished ] || bad "a verdict line with verdict=finished must read 'finished', not '$(rail_bound_state "$_bf")'"
+printf '9102	feedface	111\n' >> "$TRIED"
+reap_bounded_rail daniel-ospina/tortoise 9102 feedface "$_bf" \
+  && bad "a rail that reached its own verdict must NOT be reported as bound-killed"
+grep -q '^9102	feedface	111$' "$TRIED" || bad "a rail that exited by itself owns its head's cooldown — its row must survive"
+[ -f "$_bf" ] && bad "an idle bound verdict file must be dropped so \$RAIL_DIR does not accumulate one per finished attempt"
+# ── and a bound that is ABSENT refuses the launch, rather than launching unbounded ──────────────────────
+TRIED=$(mktemp); rm -f "$_bpid"
+_bad_bound="$LANE_BOUND"
+LANE_BOUND=/dev/null/no-such/lane-bound.sh
+RAIL_SCRIPT="$_bstub" launch_rail daniel-ospina/tortoise 9103 feedface "$_bdir/auto-x-9103.out" \
+  && bad "a launch with NO usable lifetime bound must be REFUSED — launching unbounded is the #4001 defect, not a degraded mode"
+LANE_BOUND="$_bad_bound"
+grep -q '^9103	feedface	' "$TRIED" && bad "a refused launch must not leave a cooldown row (nothing ran)"
+grep -q '#9103 NOT LAUNCHED' "$LOG" || bad "a refused launch must SAY WHY in the log (no '#9103 NOT LAUNCHED' line)"
+[ -f "$_bpid" ] && { bad "the rail stub RAN despite the missing bound — the refusal is not wired to the launch"; kill -9 "$(cat "$_bpid")" 2>/dev/null; }
+rm -rf "$_bdir"
 
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"

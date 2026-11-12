@@ -120,6 +120,56 @@ case "${RED_CAP}" in ''|*[!0-9]*)
 LAUNCH_VERIFY_S=${LAUNCH_VERIFY_S:-3}
 case "${LAUNCH_VERIFY_S}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: LAUNCH_VERIFY_S='${LAUNCH_VERIFY_S}' is not a non-negative integer" >> "$LOG"; exit 3;; esac
+# ── ⛔ THE RAIL'S LIFETIME BOUND (#4001) — THE ATTEMPT MUST END EVEN IF THE RAIL CANNOT END ITSELF ─────
+# MEASURED 2026-11-12 on the mac box: rails were live `#3973` 7h03m and `#3902` 14h41m, each with a
+# RE-ENTRANT child of the same script on the same PR (`└─ <same script> <pr>`), while the actuator held
+# one of its eight slots for most of a working day and logged `#3902 skipped (rail already running)` —
+# a line that reads like healthy de-duplication. So the slot is held FOREVER by the actuator's own
+# fail-closed guard, which is the correct behaviour given what it can see.
+#
+# ⛔ THE RAIL HAS A WHOLE-ATTEMPT DEADLINE AND IT IS INERT FOR EXACTLY THIS CLASS, WHICH IS WHY THE
+# BOUND BELONGS HERE AND NOT (ONLY) THERE. `scripts/admin-merge.sh` derives `RAIL_DEADLINE` from its own
+# phase bounds (`rail_deadline_default`) and refuses at it — but ONLY from `rail_guard_poll`, which is
+# called at the head of the rail's POLL loops. A rail parked in a BLOCKING child wait — the re-entrant
+# child above is precisely that shape — reaches no poll loop, so no comparison is ever evaluated and a
+# 19,864s ceiling held a live process for 52,860s. That is the `inert enforcer` class (AGENTS.md:
+# "a runner whose termination condition can never fire while it appears to protect something"): the
+# guard is right and unreachable. The actuator is the only actor that CAN end that attempt, because it
+# owns the slot, the count AND the dedupe guard that is currently waiting on it.
+#
+# ⛔ NOT RE-IMPLEMENTED: the kill is the fleet's own lifetime bound, `lane-bound.sh` — the file that
+# already kills a stuck process TREE (TERM, grace, KILL, children first) and writes one greppable
+# verdict line carrying `elapsed=`. A second "kill a stuck tree and say what it was" is a second thing to
+# keep right, and the two would drift. This file only DECIDES the bound and REACTS to the verdict.
+#
+# ⛔ 3600s is a POLICY bound, not a stall claim, and it is deliberately the actuator's own number: the
+# issue's targets (7h03m and 14h41m) are both bounded at 60m, the rail's slowest measured honest phase
+# is well below it, and an attempt that needs an hour to reach a verdict has wedged. It is an ELAPSED
+# bound, so a healthy rail doing real work is killed at it — stated rather than implied: the outcome is
+# a killed attempt, NO verdict, and (below) a rolled-back cooldown row so the SAME head is retried next
+# pass. Never a false green, never a lost merge.
+#
+# ⛔ `0` IS REFUSED, not "disabled". Every other knob here treats a zero as a stall rather than a bound;
+# for THIS one an unbounded rail is the defect the knob exists to remove, so a zero is the defect spelled
+# as a setting. An operator who truly wants no bound has to say so with a non-default value.
+RAIL_MAX_S=${RAIL_MAX_S:-3600}
+case "${RAIL_MAX_S}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: RAIL_MAX_S='${RAIL_MAX_S}' is not a positive integer — a non-number makes the bound's own comparison ERROR, which reads as FALSE, i.e. no bound at all" >> "$LOG"; exit 3;; esac
+knob_fits RAIL_MAX_S "$RAIL_MAX_S"
+[ "$RAIL_MAX_S" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: RAIL_MAX_S='${RAIL_MAX_S}' is not a POSITIVE integer — 0 leaves a rail unbounded, which is the #4001 defect this bound removes" >> "$LOG"; exit 3; }
+# How often the bound samples the process table. `lane-bound.sh` derives 1s from `--idle 0`, and 1s of
+# `ps -Ao pid=,ppid=,time=` per live rail is real load on the box that IS the fleet (`docs/ops/load-policy.md`);
+# 30s bounds the overshoot to half a minute on a one-hour ceiling, and the ceiling is exact to the poll.
+RAIL_BOUND_POLL_S=${RAIL_BOUND_POLL_S:-30}
+case "${RAIL_BOUND_POLL_S}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: RAIL_BOUND_POLL_S='${RAIL_BOUND_POLL_S}' is not a positive integer" >> "$LOG"; exit 3;; esac
+knob_fits RAIL_BOUND_POLL_S "$RAIL_BOUND_POLL_S"
+[ "$RAIL_BOUND_POLL_S" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: RAIL_BOUND_POLL_S='${RAIL_BOUND_POLL_S}' is not a POSITIVE integer — a zero poll makes 'sleep 0' spin the bound's own sample loop" >> "$LOG"; exit 3; }
+# The bound's implementation, beside this file because the farm delivers the harness as ONE directory
+# (`~/.pi/agent/scripts/`, `$HOME/orchestrator/`): a path that resolves only on a developer's box would
+# make the bound silently absent on the box that runs it. Absence is REFUSED AT LAUNCH (see
+# `launch_rail`), never degraded to an unbounded rail.
+LANE_BOUND=${LANE_BOUND:-$(dirname "$0")/lane-bound.sh}
 COOLDOWN_TRANSIENT_S=${COOLDOWN_TRANSIENT_S:-900}
 case "${COOLDOWN_TRANSIENT_S}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: COOLDOWN_TRANSIENT_S='${COOLDOWN_TRANSIENT_S}' is not a positive integer" >> "$LOG"; exit 3;; esac
@@ -588,6 +638,70 @@ forget_tried() {  # $1 = the exact ledger row (tab-separated); rc 0 = the row is
   [ "$rc" -le 1 ] || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$TRIED"
 }
+# ── THE RAIL'S LIFETIME BOUND, AS DRIVEN FUNCTIONS (#4001) ──────────────────────────────────────────
+# The bound itself is `lane-bound.sh` (see the `RAIL_MAX_S` block at the top). What lives here is the
+# DECISION and the REACTION, both as functions, for the same reason every other rule in this file is one:
+# a test must drive the SHIPPED predicate instead of a copy of it, and a bound nobody can test is a bound
+# nobody knows is armed.
+#
+# ⛔ THE BOOKKEEPING IS A FILE PER (repo, PR, HEAD), NOT A PID. A pid recorded at launch is a pid that can
+# be RECYCLED by a later pass, and killing a recycled pid is the one failure mode worse than the wedge.
+# `lane-bound.sh` holds its own child for the whole attempt, so the killer never needs a pid from a file;
+# this side only ever READS its verdict. Nothing here signals anything.
+#
+# ⛔ AND IT IS PER HEAD, like every other key in this file: a push during the attempt is a new attempt, and
+# a bound verdict written against the old head must not be read as the new head's outcome.
+rail_bound_file() {  # $1 = repo, $2 = PR, $3 = head; prints the bound's own verdict path
+  printf '%s/bound-%s-%s-%s.out\n' "$RAIL_DIR" "$(printf '%s' "$1" | tr '/' '-')" "$2" "$3"
+}
+# none      no verdict line yet: the attempt is still running, or it never started (both are `wait`)
+# finished  the rail exited on its own, inside its bound — the RAIL's verdict owns this head, not us
+# bounded   the bound killed it at the ceiling — no verdict was reached, so the attempt decided NOTHING
+rail_bound_state() {  # $1 = the bound's verdict file; prints none|finished|bounded
+  [ -f "$1" ] || { printf 'none\n'; return 0; }
+  local v
+  # FIRST `verdict=` match: `lane-bound.sh` emits the verdict BEFORE the kill and appends the TERM→KILL
+  # outcome after it, and its own header says a reader takes the first match.
+  v=$(sed -n 's/.*\[lane-bound\] VERDICT verdict=\([a-z][a-z-]*\).*/\1/p' "$1" 2>/dev/null | head -1)
+  case "$v" in
+    exceeded-wallclock|stalled) printf 'bounded\n' ;;
+    '')                         printf 'none\n' ;;
+    *)                          printf 'finished\n' ;;
+  esac
+}
+# The elapsed seconds the bound reported. NOT recomputed from a start stamp of our own: the number in the
+# log line must be the one the bound MEASURED, or the operator has two clocks to reconcile.
+rail_bound_elapsed() {  # $1 = the bound's verdict file; prints the seconds, or nothing
+  sed -n 's/.*\[lane-bound\] VERDICT .* elapsed=\([0-9][0-9]*\)s .*/\1/p' "$1" 2>/dev/null | head -1
+}
+# ⛔ THE REACTION THE ISSUE ASKS FOR, IN ONE PLACE: when the bound fired, the attempt reached NO verdict,
+# so (a) the log says so BY NAME — the PR and the elapsed time, which is what the actuator's log could
+# never say about a 14-hour rail — and (b) the cooldown row is ROLLED BACK so the head is retried on the
+# next pass instead of sitting out the transient window over an attempt that was killed.
+# ⛔ A KILL IS NOT A VERDICT ABOUT THE PR. Treating it as one is how a wedged rail hands a head a 15-minute
+# wait it never earned; the retry is bounded by the same ceiling, so the worst case is one killed attempt
+# per pass cycle, each one NAMED in the log rather than silently holding a slot.
+reap_bounded_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = bound verdict file; rc 0 = a bound kill was handled
+  local repo=$1 pr=$2 head=$3 bf=$4 st el row
+  st=$(rail_bound_state "$bf")
+  case "$st" in
+    bounded)
+      el=$(rail_bound_elapsed "$bf"); [ -n "$el" ] || el=unknown
+      # THE LAST matching row is the newest attempt (a head can be launched more than once); `awk` on the
+      # tab-separated ledger rather than a `grep` pattern built from two variables, so neither a PR number
+      # nor a SHA is ever read as a regex.
+      row=$(awk -F'\t' -v p="$pr" -v h="$head" '$1==p && $2==h {r=$0} END{if (r != "") print r}' "$TRIED" 2>/dev/null)
+      [ -n "$row" ] && forget_tried "$row"
+      log_line "$repo #$pr RAIL-BOUND at $head — the rail attempt was KILLED at ${el}s (bound ${RAIL_MAX_S}s, enforced by $LANE_BOUND; rail output $RAIL_DIR/auto-$(printf '%s' "$repo" | tr '/' '-')-$pr.out) because it reached no verdict; its cooldown row is rolled back so this head is RETRIED next pass instead of holding a MAX slot and reading as 'rail already running'"
+      rm -f "$bf" 2>/dev/null
+      return 0 ;;
+    finished)
+      # The attempt ended by itself; whatever it decided is in the rail's own verdict file, which is what
+      # `cooldown_for` reads. The bound's file has nothing left to say, so it is dropped.
+      rm -f "$bf" 2>/dev/null ;;
+  esac
+  return 1
+}
 # ── THE LAUNCH, AS A FUNCTION ──────────────────────────────────────────────────────────────────────
 # ⛔ THE LEDGER RECORDS AN ATTEMPT, AND THE ATTEMPT IS NOW VERIFIED — both halves matter (review round 5).
 # Recording only AFTER a verified start was proposed in review and rejected: a rail may refuse in two
@@ -603,7 +717,7 @@ forget_tried() {  # $1 = the exact ledger row (tab-separated); rc 0 = the row is
 # why the script's presence is a startup precondition (checked above) rather than something this
 # verification could discover.
 launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an attempt started
-  local repo=$1 pr=$2 head=$3 out=$4 row extra="" pid
+  local repo=$1 pr=$2 head=$3 out=$4 row extra="" pid bfile
   # ⛔ agent-infra SPLITS ITS LANES BY TRIGGER (agent-infra #1257): `ci.yml` is pull_request-only and
   # `ci-main.yml` is push:[main]-only, so no single `--workflow` spans both sides and the rail's own
   # BLOCK line tells the operator to add `--any-workflow`. Without it every agent-infra launch from here
@@ -611,15 +725,38 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
   # check: `--any-workflow` widens the MAIN baseline (compare against every lane on main), it does not
   # skip the comparison.
   [ "$repo" = "daniel-ospina/agent-infra" ] && extra="--any-workflow"
+  # ⛔ A BOUND THAT IS NOT THERE IS A REFUSAL, NOT AN UNBOUNDED LAUNCH (#4001). Every other missing
+  # dependency in this file is fatal at start; this one is worse, because it is missing only on the path
+  # that holds a slot for ever. So the launch is refused, the cooldown row is NOT written (nothing ran),
+  # and the candidate is retried next pass — an actuator that launches nothing is diagnosable, one that
+  # launches an unbounded rail is the defect. EXISTENCE IS NOT CAPABILITY (`gate-policy.sh`, and the
+  # `REVIEW_SCRIPT` check above uses the same bar): a zero-byte `lane-bound.sh` is valid shell that exits
+  # 0, and the rail would then be launched completely unbounded with a clean log.
+  if [ ! -f "$LANE_BOUND" ] || [ ! -s "$LANE_BOUND" ] || ! bash -n "$LANE_BOUND" 2>/dev/null; then
+    log_line "$repo #$pr NOT LAUNCHED — no usable rail lifetime bound at $LANE_BOUND (needs to exist, be non-empty and parse); an unbounded rail is the #4001 defect, so nothing is launched and this head is retried next pass"
+    return 1
+  fi
   row="$pr	$head	$(date +%s)"
   printf '%s\n' "$row" >> "$TRIED"
-  log_line "$repo #$pr GREEN+terminal -> launching rail (head $head)"
-  RAIL_SCRIPT="$RAIL_SCRIPT" nohup bash "$RAIL_SCRIPT" "$pr" --repo "$repo" $extra < /dev/null > "$out" 2>&1 &
+  bfile=$(rail_bound_file "$repo" "$pr" "$head")
+  rm -f "$bfile" 2>/dev/null
+  log_line "$repo #$pr GREEN+terminal -> launching rail (head $head, lifetime bound ${RAIL_MAX_S}s)"
+  # ⛔ THE RAIL RUNS UNDER THE BOUND, NOT NAKED. `run` owns the child tree, so the kill reaches the
+  # RE-ENTRANT child the wedge is made of — a pid-only kill would leave that child alive and the actuator
+  # would keep skipping the PR for it. `--log` is the rail's own output (the file it writes its BLOCK/rail
+  # verdict into, which `cooldown_for` reads); `--verdict-file` is the bound's own line, which is what
+  # `reap_bounded_rail` reads. `--idle 0` disables the PROGRESS axis deliberately: a rail waiting on CI is
+  # legitimately CPU-quiet, and killing a rail mid-merge on a stalled-reading `ps` sample is the
+  # false-kill `lane-bound.sh`'s two-sample rule exists to avoid. This bound is ELAPSED-only, and says so.
+  RAIL_SCRIPT="$RAIL_SCRIPT" nohup sh "$LANE_BOUND" run --wall "$RAIL_MAX_S" --idle 0 --poll "$RAIL_BOUND_POLL_S" \
+    --tag "rail-$(printf '%s' "$repo" | tr '/' '-')-$pr" --log "$out" --verdict-file "$bfile" \
+    -- bash "$RAIL_SCRIPT" "$pr" --repo "$repo" $extra < /dev/null > "$out" 2>&1 &
   pid=$!
   sleep "$LAUNCH_VERIFY_S"
   if kill -0 "$pid" 2>/dev/null || [ -s "$out" ]; then return 0; fi
   log_line "$repo #$pr LAUNCH-FAILED — nothing started within ${LAUNCH_VERIFY_S}s (no live child, empty verdict file $out); cooldown row rolled back so this head is retried next pass instead of being reported as already railed"
   forget_tried "$row"
+  rm -f "$bfile" 2>/dev/null
   return 1
 }
 # ── THE REVIEW STEP: THE PRODUCER OF ATTESTATIONS (#3489) ─────────────────────────────────────────
@@ -1701,6 +1838,12 @@ PY
       # cooldown read AND before the launch, so the file the cooldown judges and the file the launch
       # writes are the same file by construction (they were two separate expressions).
       _out="$RAIL_DIR/auto-$(printf '%s' "$repo" | tr '/' '-')-$pr.out"
+      # ⛔ THE BOUND'S VERDICT IS RESOLVED *BEFORE* THE COOLDOWN IS READ (#4001). This is the pass that
+      # meets a killed attempt: the rail is gone, so `rail_already_running` said "no rail for this PR" and
+      # the candidate reaches here — which makes this the one place where "the attempt was killed at its
+      # bound, it decided nothing, retry it" can be both SAID and ACTED ON. Doing it after the cooldown
+      # read would log the kill and then skip the head for the transient window anyway.
+      reap_bounded_rail "$repo" "$pr" "$head" "$(rail_bound_file "$repo" "$pr" "$head")"
       now=$(date +%s)
       if grep -q "^$pr[[:space:]]$head[[:space:]]" "$TRIED" 2>/dev/null; then
         ts=$(grep "^$pr[[:space:]]$head[[:space:]]" "$TRIED" | tail -1 | awk '{print $3}')
