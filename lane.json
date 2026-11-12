@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-4012-1794517547-p1613353-c41b2720",
+  "_sha": "9390d9241251f28ffd7d4dc419ca895dc8507ac6",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-4012.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix-4012-lane"
+    },
+    {
+      "kind": "sha",
+      "value": "b644fc636587729af8d5a09e72e4a65d76bf255e"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-4012-lane"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 119,
+  "ended_at": 1794517666,
+  "exit_code": 0,
+  "heartbeat_at": 1794517666,
+  "host": "cmux",
+  "issue": 4012,
+  "kind": "lane",
+  "lane_id": "cmux.klane-4012-1794517547-p1613353-c41b2720",
+  "lease_until": 1794554266,
+  "pid": 1613353,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794517547,
+  "state": "DONE",
+  "tag": "4012",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-4012-lane"
+}
