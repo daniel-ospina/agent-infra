@@ -249,7 +249,13 @@ arm_all() { # [stamp] — the stamp must be rendered in the ZONE the box prints 
     # Both enabled is a real finding (the pair is a race), so the fully-armed fixture must not have it.
     unit system "cell-self-pin.timer" "LoadState=loaded" "UnitFileState=disabled" "ActiveState=inactive" ""
     unit system "eldato-orchestrator.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
-    unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
+    # AND ITS ENVIRONMENT IS RENDERED, BECAUSE A REAL ONE IS: `install-repair-service.sh` always emits
+    # `Environment=O=... REPAIR_INTERVAL_S=...`. A fixture that omitted them made this row print its
+    # assumed-cadence disclosure on EVERY green grid, which reddened T31d (the sibling conflict-rebase
+    # row's "no note when the period WAS read" absence pin) from a DIFFERENT capability. Cross-row
+    # pollution is a fixture defect, not a finding.
+    unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" \
+        "Result=success" "Environment=O=$FHOME/orchestrator REPAIR_INTERVAL_S=900"
     # ⛔ AND ITS OWN PASS RECORD, because that row is graded on it and not on `ActiveState` (#4010).
     # Without this line the row correctly reads LATE ("active but has NEVER written a pass record") and
     # a fully-armed cell fixture cannot reach a green grid — the same reason the conflict-rebase beacon
@@ -916,24 +922,52 @@ RUN --check
 assert_eq "$RC" 1 "T34 an active loop that has never written a pass record fails the run"
 assert_contains "$OUT" 'NEVER written a pass record' "T34 and it says which fact is missing"
 
-# (c) the freshness axis: a green record that stopped moving is LATE, and the bound is 3 x the
-# unit's own REPAIR_INTERVAL_S with an 1800 s floor — pinned here because a row that only reads the
-# DECISION would call a dead loop green for ever.
+# (c) the freshness axis: a green record that stopped moving is LATE, and the bound is the
+# EFFECTIVE cadence (review round 2, F1): 2 x cadence + 2 x the pass's own runtime budget
+# (`REPAIR_DOCTOR_TIMEOUT_S`, default 1800). A row that only read the DECISION would call a dead
+# loop green for ever; a row that read only `3 x REPAIR_INTERVAL_S` redsin a HEALTHY one, because
+# the producer's worst legitimate gap is cadence + pass runtime (900 + 1800 = 2700 = the old bound).
 write_repair_record dispatched pass-complete "$(( $(date +%s) - 100000 ))"
 RUN --check
 assert_eq "$RC" 1 "T34 a STALE dispatched record fails the run"
-assert_contains "$OUT" 'bound 2700s' "T34 the bound is 3 x the default 900 s interval"
+assert_contains "$OUT" 'bound 5400s' "T34 the bound is 2 x 900 + 2 x 1800 (the shipped runtime budget), not 3 x 900"
 
 # (d) the state dir is the UNIT's, never this launcher's default. A box rendered with O= elsewhere
 # writes its record there; reading $O_RES instead would red a HEALTHY box for ever (the two-paths
-# defect the conflict-rebase row already carries a fix for).
+# defect the conflict-rebase row already carries a fix for). The unit's OWN cadence must also be
+# what the bound is built from, so a value far from the 900 default is used here — a shared default
+# would make this case unable to discriminate.
 rm -f "$FHOME/orchestrator/state/pr-repair.status.json"
 unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" \
-    "Result=success" "Environment=O=$FX/alt-o REPAIR_INTERVAL_S=60"
+    "Result=success" "Environment=O=$FX/alt-o REPAIR_INTERVAL_S=3000"
 write_repair_record dispatched pass-complete "" "$FX/alt-o/state"
 RUN --check
 assert_eq "$RC" 0 "T34 a record in the unit's OWN O= directory is read from there"
-assert_contains "$OUT" 'bound 1800s' "T34 and the unit's own REPAIR_INTERVAL_S is honoured (a 60 s interval floors at the 1800 s bound)"
+assert_contains "$OUT" 'bound 9600s' "T34 and the bound uses the unit's REPAIR_INTERVAL_S=3000 (2 x 3000 + 2 x 1800)"
+
+# (e) TRIGGER MODE makes REPAIR_INTERVAL_S INERT (review round 2, F1 #2). The unit renders
+# `--trigger`, whose front end schedules on REPAIR_TRIGGER_BACKSTOP_S; a bound built from the
+# interval reds a healthy trigger-mode box for part of every window. The discriminator is that
+# 2400 (backstop) and 900 (interval) give different bounds, so only the backstop can produce 8400.
+unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" \
+    "Result=success" "ExecStart={ path=/x/pr-repair-loop.sh ; argv[]=/x/pr-repair-loop.sh --trigger ; }" \
+    "Environment=O=$FX/alt-o REPAIR_INTERVAL_S=900 REPAIR_TRIGGER_BACKSTOP_S=2400"
+write_repair_record dispatched pass-complete "" "$FX/alt-o/state"
+RUN --check
+assert_eq "$RC" 0 "T34 a trigger-mode unit is graded on its backstop, not on the inert interval"
+assert_contains "$OUT" 'bound 8400s' "T34 the bound is 2 x REPAIR_TRIGGER_BACKSTOP_S=2400 + 2 x 1800 (not the 900 interval)"
+assert_contains "$OUT" 'REPAIR_TRIGGER_BACKSTOP_S=2400' "T34 and the row says WHICH cadence it read"
+
+# (f) a unit that declares NO Environment= at all: BOTH fallbacks must be DISCLOSED — the record path
+# falls back to this launcher's $O_RES and the cadence to 900 s. An assumed bound printed identically
+# to a measured one is the defect the sibling row's T31/T31d pair exists to prevent one capability
+# over, so the same discipline is applied here rather than taken on trust.
+unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
+write_repair_record dispatched pass-complete
+RUN --check
+assert_eq "$RC" 0 "T34 a unit that declares no Environment= is still gradeable"
+assert_contains "$OUT" 'cadence UNREADABLE' "T34 an assumed cadence is DISCLOSED, never presented as measured"
+assert_contains "$OUT" 'declares no O=' "T34 and so is the fallback state directory"
 
 arm_all
 RUN --check

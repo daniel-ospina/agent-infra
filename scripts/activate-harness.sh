@@ -436,7 +436,7 @@ probe_systemd_service() { # <unit> <class> <beacon-path|-> <max_age_s> <note>
 # in their own words rather than folded into one verdict.
 probe_repair_service() { # <unit> <class> <note>
     local unit="$1" class="$2" note="${3:-}"
-    local en act env_str o_dir interval bound rec py_out decision reason ep cap now age assumed remedy
+    local en act env_str exec_str o_dir bound rec py_out decision reason ep cap now age assumed remedy cadence cad_src cad_note runtime
     if ! sc_available; then
         emit "$unit" "$class" UNKNOWN "$SYSTEMCTL_BIN is not executable — this service cannot be read on this box (a failed read, not an absence)"
         return 0
@@ -461,15 +461,56 @@ probe_repair_service() { # <unit> <class> <note>
     # instead would grade a HEALTHY box LATE for ever — two paths that look alike, one of them wrong.
     # An unreadable Environment is not evidence of the default, so the fallback SAYS it fell back.
     env_str="$(sysd_show "$unit" Environment 2>/dev/null)"
+    exec_str="$(sysd_show "$unit" ExecStart 2>/dev/null)"
+    # ⛔ NO HELPER FUNCTION FOR THE THREE READS BELOW, AND THAT IS DELIBERATE: a nested `fn() { … }` in
+    # bash defines a GLOBAL, so a helper here would be a shared name in a 1300-line file that already
+    # has one of everything. Three inline reads cost three pipes and cannot collide.
     o_dir="$(printf '%s' "$env_str" | tr ' ' '\n' | sed -n 's/^O=//p' | head -1)"
-    interval="$(printf '%s' "$env_str" | tr ' ' '\n' | sed -n 's/^REPAIR_INTERVAL_S=//p' | head -1)"
     assumed=""
     if [ -z "$o_dir" ]; then o_dir="$O_RES"; assumed=" (the unit declares no O=, so the record was read from this launcher's $O_RES)"; fi
-    case "$interval" in ''|*[!0-9]*) interval=900 ;; esac
-    [ "$interval" -ge 1 ] || interval=900
-    # 3 x the period: one completed pass, the journal between two, and one missed slot. Floored at 1800 s
-    # so a sub-minute cadence cannot turn a normal pass into an instant red.
-    bound=$(( interval * 3 )); [ "$bound" -ge 1800 ] || bound=1800
+    # ── THE FRESHNESS BOUND, FROM THE EFFECTIVE CADENCE (review round 2, F1) ────────────────────────
+    # ⛔ `REPAIR_INTERVAL_S` IS NOT THE PASS CADENCE IN THREE SHIPPED SHAPES, and a bound built on it
+    # reds a HEALTHY box — this file's own "a check that reddens a healthy box is its own failure"
+    # rule, and the same class the conflict-rebase row already fixed one row up (`cr_period * 2 + 4800`
+    # exists precisely so "a legitimately slow pass is not its own red", :996-1000):
+    #   1. THE PASS'S OWN RUNTIME IS NOT BUDGETED. `pr-repair-loop.sh:475` dispatches through
+    #      `timeout "${REPAIR_DOCTOR_TIMEOUT_S:-1800}" python3 "$doctor" --max "$cap"` and
+    #      `write_status` runs only AFTER it returns; the loop arm then `sleep "$INTERVAL_S"` (:671).
+    #      Worst legitimate gap between two records = cadence + pass runtime = 900 + 1800 = 2700 s,
+    #      which was exactly the old `3 x interval` bound — so a pass that ran to its own timeout, or
+    #      an interval raised above 900, read LATE with nothing wrong at all.
+    #   2. `REPAIR_MODE=trigger` MAKES `REPAIR_INTERVAL_S` INERT. The unit then renders
+    #      `pr-repair-loop.sh --trigger`, whose front end schedules on `REPAIR_TRIGGER_BACKSTOP_S`
+    #      (`pr-doctor-trigger.py` gates a backstop pass on `now - last_pass >= backstop`); the
+    #      installer defaults that to 1800 s and renders it unvalidated, so any backstop above the
+    #      bound reddened a healthy trigger-mode box for part of every window.
+    #   3. `keys.env` IS AUTHORITATIVE OVER THE UNIT FOR TUNABLES and this grid cannot source it
+    #      (`pr-repair-loop.sh:594` re-derives `INTERVAL_S` AFTER the source). So the row DISCLOSES
+    #      the cadence it read and that an override is not consulted, rather than presenting a
+    #      possibly-overridden default as a measurement.
+    # The shape is the sibling's: 2 x cadence (one completed pass, then one missed slot) + 2 x the
+    # pass's own runtime budget. Floored at 1800 s so a sub-minute cadence is not an instant red.
+    local cadence cad_src runtime
+    cadence=""; cad_src=""
+    runtime="$(printf '%s' "$env_str" | tr ' ' '\n' | sed -n 's/^REPAIR_DOCTOR_TIMEOUT_S=//p' | head -1)"
+    case "$exec_str" in
+        *--trigger*)
+            cad_src="REPAIR_TRIGGER_BACKSTOP_S"
+            cadence="$(printf '%s' "$env_str" | tr ' ' '\n' | sed -n 's/^REPAIR_TRIGGER_BACKSTOP_S=//p' | head -1)" ;;
+    esac
+    if [ -z "$cad_src" ]; then
+        cad_src="REPAIR_INTERVAL_S"
+        cadence="$(printf '%s' "$env_str" | tr ' ' '\n' | sed -n 's/^REPAIR_INTERVAL_S=//p' | head -1)"
+    fi
+    cad_note=""
+    case "$cadence" in
+        ''|*[!0-9]*) cadence=900; cad_note=" (cadence UNREADABLE from the unit — assumed ${cadence}s)" ;;
+    esac
+    [ "$cadence" -ge 1 ] || { cadence=900; cad_note=" (cadence UNREADABLE from the unit — assumed 900s)"; }
+    case "$runtime" in ''|*[!0-9]*) runtime=1800 ;; esac
+    [ "$runtime" -ge 1 ] || runtime=1800
+    bound=$(( cadence * 2 + runtime * 2 )); [ "$bound" -ge 1800 ] || bound=1800
+    cad_note="$cad_note; bound ${bound}s = 2 x ${cad_src}=${cadence} + 2 x REPAIR_DOCTOR_TIMEOUT_S=${runtime} (keys.env overrides the loop's tunables and is NOT read here)"
     rec="$o_dir/state/pr-repair.status.json"
     if [ ! -f "$rec" ]; then
         emit "$unit" "$class" LATE "$unit is active but has NEVER written a pass record at $rec — enabled and running proves the loop was STARTED, not that a pass ever ran$assumed"
@@ -521,9 +562,9 @@ print("%s\t%s\t%d\t%s" % (dec, why.replace("\t", " "), int(ep), cap))' "$rec" 2>
     case "$decision" in
         dispatched|ok)
             if [ "$age" -gt "$bound" ]; then
-                emit "$unit" "$class" LATE "$unit is active but its last pass DISPATCHED ${age}s ago (bound ${bound}s = 3 x ${interval}s) — the review stage has stopped passing$assumed"
+                emit "$unit" "$class" LATE "$unit is active but its last pass DISPATCHED ${age}s ago$cad_note — the review stage has stopped passing$assumed"
             else
-                emit "$unit" "$class" OK "$unit active; last pass dispatched ${age}s ago (bound ${bound}s), cap=${cap:-?}${assumed}"
+                emit "$unit" "$class" OK "$unit active; last pass dispatched ${age}s ago, cap=${cap:-?}$cad_note$assumed"
             fi ;;
         refusing)
             # ⛔ FAILING, NOT LATE: a refusal does NOT clear by waiting. The loop continues on it, so the

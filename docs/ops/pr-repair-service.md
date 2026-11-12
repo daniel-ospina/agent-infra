@@ -181,8 +181,13 @@ erases) and never a checkout the reaper may reclaim. Both new scripts are declar
   (agent-infra#4010). It reads the loop's own pass record (`$O/state/pr-repair.status.json`, the file
   `pr-repair-loop.sh::write_status` writes every pass) and reports `FAILING` while the decision is
   `refusing` / `placed-undelivered` / `pass-failed`, and `LATE` while it is `deferred` / `idle` /
-  `skipped`, or when a green record stopped moving (bound: 3 x the unit's own `REPAIR_INTERVAL_S`,
-  floored at 1800 s). The reason is quoted verbatim from the record **and the record's own path is
+  `skipped`, or when a green record stopped moving. The bound is the **effective** cadence, not
+  `REPAIR_INTERVAL_S` alone: `2 x cadence + 2 x REPAIR_DOCTOR_TIMEOUT_S`, where the cadence is
+  `REPAIR_TRIGGER_BACKSTOP_S` when the unit's `ExecStart` carries `--trigger` (the interval is inert
+  there) and `REPAIR_INTERVAL_S` otherwise. The row PRINTS the number and the directive it came from,
+  and says that `keys.env` overrides the loop's tunables and is not read by the grid — because a pass's
+  worst legitimate gap is cadence **plus its own runtime**, which a bound built from the interval alone
+  treats as a red. The reason is quoted verbatim from the record **and the record's own path is
   named on the row**, so an operator reads the same artifact the grid read.
   ⛔ **It does NOT follow that `install-repair-service.sh --status` agrees, and the docs must not say
   it does** (review round 1, P2). `--status`'s `readback()` checks `is-active`, `is-enabled`,
