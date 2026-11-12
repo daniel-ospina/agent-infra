@@ -432,30 +432,53 @@ printf '[Service]\nEnvironment=AGENT_SKIP_REVIEW_GATE_DISABLED=1\nExecStart=/bin
 bash "$POLICY" --unit-veto "$TMP/superset.service" superset >/dev/null 2>&1 \
   && ok "(5d) edges: a LONGER name that only contains a hatch name is not vetoed (whole-word match)" \
   || bad "(5d) edges: AGENT_SKIP_REVIEW_GATE_DISABLED=1 was vetoed — the match is a substring, not a name"
+# ⛔ A BACKSLASH-CONTINUED `Environment=` IS ONE DIRECTIVE (fresh review of #4002, P1 — reproduced as a
+# fail-open on the evidence head). systemd joins a line ending in an unescaped `\` with the following one
+# (`systemd.syntax(7)`), so this sets the hatch while every PHYSICAL line looks innocent:
+#     Environment=FOO=1 \
+#         AGENT_SKIP_REVIEW_GATE=1
+# The census answered CLEAN for it until the fold was added — in the census AND on the install path. This
+# arm is the regression guard, and it is the reason §5c's mutation had to move off a single physical line.
+printf '[Service]\nEnvironment=FOO=1 \\\n    AGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/continued.service"
+bash "$POLICY" --unit-veto "$TMP/continued.service" continued >/dev/null 2>&1; CONT_RC=$?
+[ "$CONT_RC" -eq 1 ] \
+  && ok "(5d) edges: a BACKSLASH-CONTINUED Environment= carrying a hatch IS vetoed (one logical directive, not one physical line)" \
+  || bad "(5d) edges: a backslash-continued Environment= answered rc=$CONT_RC — the fold is gone and the census fails OPEN"
+# …and the fold must not create false positives in either direction: a clean continuation is clean, and a
+# WRAPPED COMMENT swallows its continuation exactly as systemd does (so the flag below is not a declaration).
+printf '[Service]\nEnvironment=FOO=1 \\\n    BAR=2\nExecStart=/bin/true\n' >"$TMP/cleancont.service"
+bash "$POLICY" --unit-veto "$TMP/cleancont.service" cleancont >/dev/null 2>&1 \
+  && ok "(5d) edges: a clean continued Environment= is still clean (the fold is not matching everything)" \
+  || bad "(5d) edges: a clean continued Environment= was vetoed — the fold over-matches"
+printf '[Service]\n# a comment wrapping \\\nEnvironment=AGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/commentwrap.service"
+bash "$POLICY" --unit-veto "$TMP/commentwrap.service" commentwrap >/dev/null 2>&1 \
+  && ok "(5d) edges: a WRAPPED COMMENT swallows its continuation (systemd's rule) and is not a declaration" \
+  || bad "(5d) edges: a wrapped comment's continuation was graded — the fold is not faithful to systemd"
+# …and the LAUNCHD half of the grader must be able to REDDEN (fresh review of #4002, P2). 5a passes if the
+# `<key>` branch does nothing at all — no shipped plist carries a hatch — so without a mutated copy the
+# "grades BOTH declaration dialects" claim is proven for one dialect only. Mutated in $TMP, never the
+# template: the census above grades the real ones.
+PLIST_SRC="$REPO/templates/launchd/com.eldato.pi-cache-reap.plist"
+if [ -f "$PLIST_SRC" ]; then
+  sed 's|<key>PATH</key>|<key>AGENT_SKIP_REVIEW_GATE</key>|' "$PLIST_SRC" >"$TMP/mut.plist"
+  MUTPLIST_RC=0; bash "$POLICY" --unit-veto "$TMP/mut.plist" mutplist >/dev/null 2>&1 || MUTPLIST_RC=$?
+  [ "$MUTPLIST_RC" -eq 1 ] \
+    && ok "(5d) edges: a launchd plist carrying the hatch as its own <key> IS vetoed (a shipped plist mutated in \$TMP)" \
+    || bad "(5d) edges: the plist branch answered rc=$MUTPLIST_RC for a hatch-bearing plist — that half of the grader cannot redden"
+else
+  bad "(5d) edges: $PLIST_SRC is gone, so the launchd half of the grader has no discriminating arm"
+fi
 # …and an UNREADABLE declaration is not a clean one: rc 2, never 0.
 bash "$POLICY" --unit-veto "$TMP/no-such-declaration" absent >/dev/null 2>&1; ABSENT_RC=$?
 [ "$ABSENT_RC" -eq 2 ] \
   && ok "(5d) edges: an ungradable declaration answers 2 (not 0) — 'cannot check' is never a pass" \
   || bad "(5d) edges: an absent declaration answered rc=$ABSENT_RC (a no-op gate reports clean)"
 
-# (5e) CONTINUATION LINES — the hatch on the CONTINUED line, which is the SAME `Environment=` to the
-# parser that executes it. systemd.syntax(5): "Lines ending in a backslash are concatenated with the
-# following line while reading and the backslash is replaced by a space character." So a census that
-# greps PHYSICAL lines alone answers CLEAN for a job that starts with the review gate off — measured
-# before this arm existed: that unit returned rc=0. It is the exact defect #4002 exists to refuse,
-# arriving in syntax the parser honours, so it is graded, not assumed.
-printf '[Service]\nEnvironment=NORMAL=1 \\\n            AGENT_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n' >"$TMP/continuation.service"
-bash "$POLICY" --unit-veto "$TMP/continuation.service" continuation >/dev/null 2>&1; CONT_RC=$?
-[ "$CONT_RC" -eq 1 ] \
-  && ok "(5e) continuation: a hatch on a \\\\-continued Environment= line IS vetoed (rc=1)" \
-  || bad "(5e) continuation: a hatch on a continued line answered rc=$CONT_RC (0 = the census read physical lines only, so the hatch ships)"
-# …and the JOIN must not become an over-block: a continuation that carries no hatch stays clean.
-printf '[Service]\nEnvironment=NORMAL=1 \\\n            OTHER=2\nExecStart=/bin/true\n' >"$TMP/continuation-clean.service"
-bash "$POLICY" --unit-veto "$TMP/continuation-clean.service" continuation-clean >/dev/null 2>&1 \
-  && ok "(5e) continuation: a hatch-free continued Environment= is still clean (the join does not over-block)" \
-  || bad "(5e) continuation: a hatch-free continued Environment= was vetoed — the join fabricated a hit"
-# …and the INSTALLER refuses it too: the census is one function, but the install is the refusal an
-# operator actually experiences, and a render-time hatch can arrive from a SUBSTITUTION.
+# (5e) THE INSTALL PATH, NOT JUST THE CENSUS — because the installer is where the refusal is FELT, and
+# a hatch can arrive on the RENDERED bytes from a substitution while the template stays clean. §5d
+# proves the grader discriminates; this proves the thing that would put the unit on a box refuses it.
+# Measured pre-fold on the reviewed head: the installer returned 0 and printed "ai-drainer scheduled",
+# i.e. it installed a dispatcher that hands the review gate to every lane it spawns.
 CV="$TMP/continuation-install"; mkdir -p "$CV/tpl"
 cp "$REPO/templates/systemd/eldato-ai-drainer.service" "$REPO/templates/systemd/eldato-ai-drainer.timer" "$CV/tpl/"
 printf 'Environment=NORMAL=1 \\\n            AGENT_SKIP_REVIEW_GATE=1\n' >>"$CV/tpl/eldato-ai-drainer.service"
@@ -463,11 +486,11 @@ CV_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$CV/units" TEMPLATES_DIR="$CV/t
           DRAINER="$HERE/ai-drainer.sh" DRAINER_STATE="$CV/state" DRAINER_O="$CV" \
           bash "$INST" 2>&1)"; CV_RC=$?
 [ "$CV_RC" -ne 0 ] && grep -q 'AGENT_SKIP_REVIEW_GATE' <<<"$CV_OUT" \
-  && ok "(5e) continuation: the INSTALLER REFUSES a continued-byte hatch and names the flag" \
-  || bad "(5e) continuation: the installer installed a unit whose hatch is on a continued line (rc=$CV_RC): $(printf '%s' "$CV_OUT" | tail -1)"
+  && ok "(5e) install path: the INSTALLER REFUSES rendered bytes whose hatch is on a continued line, and names the flag" \
+  || bad "(5e) install path: the installer installed a unit whose hatch is on a continued line (rc=$CV_RC): $(printf '%s' "$CV_OUT" | tail -1)"
 [ ! -f "$CV/units/eldato-ai-drainer.service" ] \
-  && ok "(5e) continuation: …and a refused install leaves no artefact" \
-  || bad "(5e) continuation: a refused install still wrote $CV/units/eldato-ai-drainer.service"
+  && ok "(5e) install path: …and a refused install leaves no artefact (a refused unit is not on the box)" \
+  || bad "(5e) install path: a refused install still wrote $CV/units/eldato-ai-drainer.service"
 
 printf '\ngate-policy.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$(uname -s)"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -52,16 +52,13 @@
 # where nothing the carrier does can undo it (a child cannot un-receive an inherited export).
 # So the census has a second half, and it lives HERE, beside the list it is a census of: a rendered
 # unit/service/plist may not name any of these flags in its environment. `gate_policy_unit_veto` is
-# called by the installers that render a declaration (so the install REFUSES, fail-closed) and by
+# called by `install-drainer-timer.sh` (so the install REFUSES, fail-closed) and by
 # `gate-policy.test.sh` (so a template that regrows the hatch is RED before it reaches a box).
+# Wired into the drainer's installer because that is the unit the measured defect ran; the other
+# installers' templates are graded by the same function through the test's census, so a bypass can
+# only reach a box through a template, and a template is what §5a reddens on.
 # STATED LIMIT, so no reader over-reads it: this grades the DECLARATION. `EnvironmentFile=`/a sourced
 # rc file/the spawned script's own `export` are outside it — the census sees what the unit itself says.
-# What it DOES grade includes `\`-continued `Environment=` lines, joined the way systemd joins them
-# (systemd.syntax(5): the backslash "is replaced by a space character"), because a hatch on the
-# continued line is the same directive to the process that runs. That join makes ONE over-block
-# possible, declared here rather than discovered later: a comment block following a continuation is
-# joined too, so a bypass flag NAMED IN SUCH A COMMENT is vetoed although systemd ignores it. That is
-# the fail-closed direction (a false refusal, never a false pass), and it is not worth a parser.
 #
 # SEAMS (tests): GP_REPO=<path> (harness checkout to probe), GP_LOG=<file> (audit), GP_QUIET=1.
 
@@ -81,40 +78,44 @@ GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ALLOW_MAIN_
 # gate_policy_unit_veto <file> [label] — does a DECLARATION carry a gate bypass in its environment?
 #   0  clean (the declaration names none of the flags)
 #   1  VETOED (it names at least one; the names are printed on stderr)
-#   2  cannot answer (no file / not readable) — never a pass: an ungradable declaration is not clean.
+#   2  cannot answer (no file / not readable / an ungradable continuation)
+#      ⛔ NEVER a pass: an ungradable declaration is not a clean one.
 # Grades BOTH declaration dialects, because the fleet ships both from this repo: a systemd
 # `Environment=<NAME>=…` directive and a launchd `<key><NAME></key>` inside EnvironmentVariables.
 gate_policy_unit_veto() {
-  local f="${1:-}" label="${2:-declaration}" flag hit="" envlines=""
+  local f="${1:-}" label="${2:-declaration}" flag hit="" folded="" envlines=""
   [ -n "$f" ] || { printf 'unit-veto: no file named — cannot grade '\''%s'\''\n' "$label" >&2; return 2; }
   [ -r "$f" ] || { printf 'unit-veto: cannot read %s — an ungradable %s is not a clean one\n' "$f" "$label" >&2; return 2; }
+  # ⛔ FOLD BACKSLASH CONTINUATIONS *BEFORE* EXTRACTING DIRECTIVES (fresh review of #4002, P1 — reproduced).
+  # systemd joins a line ending in an unescaped `\` with the following one and replaces the backslash with
+  # a space (`systemd.syntax(7)`), so this is ONE valid declaration that sets the hatch:
+  #     Environment=FOO=1 \
+  #         AGENT_SKIP_REVIEW_GATE=1
+  # Extracting physical lines missed it and answered CLEAN — in the census AND on the install path, i.e.
+  # the exact "silently stopped matching" fail-open this function exists to prevent. Wrapping is the
+  # documented use of the continuation (`Environment=PATH={{PATH}}` is exactly the long line someone
+  # wraps), so this was reachable, not theoretical.
+  # The fold is faithful rather than conservative: a comment line that wraps is folded too, so the joined
+  # line still STARTS with `#` and is not extracted — matching systemd, where a comment swallows its
+  # continuation. Only a backslash as the LAST character continues (a backslash followed by spaces does
+  # not, which is systemd's rule: trailing whitespace breaks it).
+  folded="$(awk '{ if ($0 ~ /\\$/) { sub(/\\$/,""); buf = buf $0 " "; next } print buf $0; buf="" }
+                END { if (buf != "") print buf }' "$f" 2>/dev/null)" || {
+    printf 'unit-veto: could not fold the continuations of %s — an ungradable %s is not a clean one\n' "$f" "$label" >&2
+    return 2
+  }
   # ⛔ ONLY `Environment=` DIRECTIVES ARE GRADED, and the flag must be a WHOLE WORD inside them.
   # `-w` rather than a hand-rolled `[^A-Za-z0-9_]` boundary: GNU and BSD grep disagree about `\b` in
   # ERE (BSD has no `\b`), and a boundary that silently stops matching is the shape that lets the
   # hatch back in. A commented-out line is not a declaration, so the `^[[:space:]]*Environment` anchor
   # deliberately does not see it; `EnvironmentFile=` is not `Environment=` and is outside this census
   # (the STATED LIMIT in this file's header).
-  # ⛔ JOIN CONTINUATION LINES FIRST, BECAUSE THE PARSER DOES (agent-infra#4002). systemd.syntax(5):
-  # "Lines ending in a backslash are concatenated with the following line while reading and the
-  # backslash is replaced by a space character." So this declaration is ONE `Environment=` to the
-  # process that ends up running, and a census that greps PHYSICAL lines alone answers CLEAN for a job
-  # that starts with the review gate off — MEASURED at fix time: a unit with
-  #   Environment=NORMAL=1 \
-  #               AGENT_SKIP_REVIEW_GATE=1
-  # returned rc=0 (clean) before this join existed, and the installer installed it. That is the exact
-  # defect this census exists to refuse, in syntax the parser honours.
-  # The replacement is a SPACE, not an empty string, because systemd replaces the backslash with a
-  # space: `AGENT_SKIP_\` + `REVIEW_GATE=1` therefore resolves to `AGENT_SKIP_ REVIEW_GATE=1` — an
-  # invalid name that is correctly NOT a hit (a split name sets no flag).
-  # Applied to the systemd arm only: a plist is XML with no continuation syntax, and joining it could
-  # fuse a `<string>` value that legitimately ends in a backslash.
-  local joined=""
-  joined="$(awk '{ while (sub(/\\[[:space:]]*$/, "")) { if ((getline nxt) <= 0) break; $0 = $0 " " nxt } print }' "$f" 2>/dev/null || true)"
-  envlines="$(grep -E '^[[:space:]]*Environment[[:space:]]*=' <<<"$joined" 2>/dev/null || true)"
+  envlines="$(grep -E '^[[:space:]]*Environment[[:space:]]*=' <<<"$folded" 2>/dev/null || true)"
   for flag in $GP_UNIT_BYPASS_FLAGS; do
-    # ⛔ HERE-STRING, NOT `printf … | grep -q` (#841/#864): under `set -o pipefail` a quiet grep exits at
-    # its first match, the still-writing printf takes SIGPIPE (141), pipefail promotes it, and this
-    # function would answer CLEAN for a declaration whose hatch is right there.
+    # ⛔ HERE-STRING, NOT `printf … | grep -q` (#841/#864): the recognised idiom is a producer piped into a
+    # QUIET grep, where the producer can take SIGPIPE under `pipefail` and a present match reads as absent.
+    # One producer and no pipe removes the shape entirely. (This file sets no `set -o pipefail` — the guard
+    # flags the SHAPE, and the shape is what keeps being reintroduced elsewhere.)
     if [ -n "$envlines" ] && grep -Fqw -- "$flag" <<<"$envlines"; then
       hit="$hit $flag"
     elif grep -Eq "<key>[[:space:]]*${flag}[[:space:]]*</key>" "$f" 2>/dev/null; then
