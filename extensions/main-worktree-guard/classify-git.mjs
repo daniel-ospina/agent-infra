@@ -9543,14 +9543,37 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           i = tgt.k;
         }
         if (tgt.w === "-n") {
-          const nw = readWord(skipWsNl(tgt.k));
+          let nw = readWord(skipWsNl(tgt.k));
           i = nw.k;
+          // ⛔ `pushd -n -- <operand>` — the marker is NOT the operand, and under
+          // `-n` this arm used to read exactly one word, so the operand after
+          // `--` was never seen: `--` became `resolve(cwd, "--")`, which does not
+          // exist, and the insert was dropped. A later `popd` then ran one entry
+          // off bash's stack (#3955 review P1, measured fail-OPEN).
+          // Re-read past the marker, exactly as the plain `pushd` arm above does
+          // (`pushd -- <dir>`: the marker is not the operand).
+          // ⛔ BUT THE MARKER ALSO SUPPRESSES THE NUMERIC FORM — measured, bash
+          // 3.2.57 here AND the 5.2.21 rows in the review, which agree on all
+          // three: after `--`, a `+N`/`-N` word is a LITERAL directory name, not
+          // a rotation. From the stack [b, docs, a] (cwd b):
+          //   `pushd -n +1`   ⇒ [b, a, b]      (rotation, no cd)
+          //   `pushd -n -- +1; popd` ⇒ cwd STAYS b — `+1` is inserted literally, the
+          //   `popd` cannot resolve it, errors, and changes nothing (the review's
+          //   own row 3 measures real bash landing in `b`, not in `a`).
+          // So the re-read word is tested as an INSERT only, never as `rot` —
+          // otherwise the same `+1` spelling would rotate where bash inserts.
+          let afterMarker = false;
+          if (nw.w === "--") {
+            nw = readWord(skipWsNl(nw.k));
+            i = nw.k;
+            afterMarker = true;
+          }
           // `pushd -n [+N | -N]` rotates the stack WITHOUT cd'ing, and the entry
           // rotated in is REPLACED by the current dir (measured above). Modelling
           // it as a failed path (the previous behaviour) left the stack
           // unrotated, so a later bare `popd` landed one entry too deep — the
           // same fail-open shape as `pushd +N`.
-          const rot = /^([+-])([0-9]+)$/.exec(nw.w || "");
+          const rot = afterMarker ? null : /^([+-])([0-9]+)$/.exec(nw.w || "");
           if (rot) {
             const S = vstack(f().cwd);
             const rn = Number(rot[2]);
@@ -9564,9 +9587,23 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
             }
             continue;
           }
-          // -n <dir>: insert below the top, no cd
-          const ins = nw.w && nw.w !== "~" && !nw.w.startsWith("~/") && nw.w !== "-" ? resolve(cwd, nw.w) : null;
-          if (ins && existsSync(ins)) { const S = vstack(f().cwd); S.splice(1, 0, ins); setVStack(S); }
+          // -n <dir>: insert below the top, no cd.
+          // ⛔ `-n` NEVER stat()s THE OPERAND — bash inserts the operand STRING
+          // verbatim (`add_dirstack_element(savestring(list->word->word))`) and
+          // the validation happens at the LATER `popd`, which errors and leaves
+          // the cwd alone (measured: `pushd -n /nonexistent; popd` ⇒ cwd
+          // unchanged; likewise `pushd -n -- +1; popd`). The old `existsSync(ins)`
+          // gate dropped the entry at pushd time, so the walker's `popd` consumed
+          // the NEXT real entry and landed in a directory bash never enters — the
+          // third measured fail-open in this family (`cd a; pushd ../docs; pushd
+          // ../b; pushd -n -- +1; popd` ⇒ bash `b`, walker `docs`). Inserting
+          // unconditionally matches bash at the pushd AND at the popd that fails.
+          // ⚠️ The words this walker cannot resolve (`~`, `~/…`, `-` = OLDPWD, and
+          // an unexpanded `$VAR`/`$(…)`) stay no-ops — `pushd -n $EMPTY` IS bash's
+          // bare `pushd -n` (a silent no-op) and must not insert a bogus entry.
+          const ins = nw.w && nw.w !== "~" && !nw.w.startsWith("~/") && nw.w !== "-" && !/^[$`]/.test(nw.w)
+            ? resolve(cwd, nw.w) : null;
+          if (ins) { const S = vstack(f().cwd); S.splice(1, 0, ins); setVStack(S); }
           continue;
         }
         // ⛔ BARE `pushd` IS NOT A NO-OP — MEASURED, bash 5.2.21 (#3955 review, the

@@ -5543,6 +5543,30 @@ try {
     blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd --; echo x > tracked.md", "P0 gate: TRACKED a/tracked.md → BLOCK");
     has("cd a; pushd; echo x > tracked.md", "redirect:H/a/tracked.md", "P0 ANTI-NARROWING: a 1-deep stack is 'no other directory' (rc 1) — the cwd must NOT move");
     allows(["docs/tracked.md"], "cd a; pushd; echo x > tracked.md", "P0 ANTI-NARROWING gate: the write is in a, so a docs resolution would be a false positive");
+    // ── #3955 review P1: `pushd -n -- <operand>`, the one member of this family
+    // still unmodelled. Under `-n` the arm read EXACTLY one word, so the operand
+    // after the marker was never seen — `--` became `resolve(cwd, "--")`, which
+    // does not exist, and the insert was dropped. The stack then lacked the entry
+    // bash had and the next `popd` resolved one entry off. THREE measured
+    // fail-OPENs (real bash writes a TRACKED hub file, the walker ALLOWs):
+    //   `cd a; pushd -n -- ../b; popd`                        ⇒ bash b, walker a
+    //   `cd a; pushd ../docs; pushd -n -- ../b; popd`          ⇒ bash b, walker a
+    //   `cd a; pushd ../docs; pushd ../b; pushd -n -- +1; popd` ⇒ bash b, walker docs
+    // Re-measured HERE on bash 3.2.57 against the review's 5.2.21 rows: both
+    // versions agree on all three landings. ⛔ Row 3 also pins that `--`
+    // SUPPRESSES the numeric form — after the marker `+1` is a literal directory
+    // NAME, not a rotation (`pushd -n +1` from [b,docs,a] gives [b,a,b] and its
+    // popd lands on `a`; with `--` bash stays in `b`), so re-reading past the
+    // marker must NOT hand the word to the `rot` test.
+    has("cd a; pushd -n -- ../b; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "P1: pushd -n -- <dir> inserts the operand past the marker — the next popd lands on b");
+    blocks(["b/tracked.md"], "cd a; pushd -n -- ../b; popd; echo x > tracked.md", "P1 gate: TRACKED b/tracked.md → BLOCK (pre-fix resolved a/tracked.md → ALLOW)");
+    has("cd a; pushd ../docs; pushd -n -- ../b; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "P1: …on a 2-deep stack the marker form still lands on the INSERTED dir (b), not the stack bottom (a)");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd -n -- ../b; popd; echo x > tracked.md", "P1 gate: TRACKED b/tracked.md → BLOCK (pre-fix popped the stack bottom, a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n -- +1; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "P1: after `--` a `+1` is a LITERAL dir, not a rotation — bash's popd errors and keeps the cwd at b");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n -- +1; popd; echo x > tracked.md", "P1 gate: TRACKED b/tracked.md → BLOCK (pre-fix popped to docs, and a rotate-on-`--` model pops to a → both ALLOW)");
+    allows(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n -- +1; popd; echo x > tracked.md", "P1 control: treating `-n -- +1` as a ROTATION lands on a — the a resolution must NOT be graded, bash stays in b");
+    has("cd a; pushd ../docs; pushd -n -- ../b; echo x > tracked.md", "redirect:H/docs/tracked.md", "P1 control: `-n` itself never cds — only the NEXT popd moves, so this write stays in docs");
+    has("cd a; pushd ../docs; pushd -n --; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "P1 control: a bare `pushd -n --` (no operand) changes nothing — the popd still lands on a");
   }
 
 
