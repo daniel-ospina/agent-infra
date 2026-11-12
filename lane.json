@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12003-1794459707-p387928-c087b944",
+  "_sha": "215c2d4282b7b2824a732e6b30eeca1cec40901b",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12003.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/11981-main-lint-metering"
+    },
+    {
+      "kind": "sha",
+      "value": "9212ef2f456bafd3daeeb01e9ae546f491c8504d"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12003"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 2545,
+  "ended_at": 1794462252,
+  "exit_code": 0,
+  "heartbeat_at": 1794462252,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12003-1794459707-p387928-c087b944",
+  "lease_until": 1794470052,
+  "pid": 387928,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794459707,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-12003",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12003"
+}
