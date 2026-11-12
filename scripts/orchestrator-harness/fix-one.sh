@@ -899,7 +899,13 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # (installed pi/extension set, provider credential) or dispatch the PR elsewhere" — and all three are
     # wrong: the model call SUCCEEDED (that is how the reading was taken), and the measured wave had every
     # cell hundreds of commits behind, so the peer refuses identically. The fix is on THIS box's checkout.
-    why="STALE-CODE gate: this box completed the model call but its checkout is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (#3932) — a fix cut from it produces a plausible log and a WRONG diff. The [capability-gate] REFUSED line in the log names the repo and the distance: advance THAT checkout (git fetch, then cut the worktree from origin/main, or the cell's own sync path) and re-run. Do NOT dispatch the PR elsewhere, and waiting cannot clear it. Nothing was consumed"
+    # ⛔ AND THE REMEDY NAMES THE ARTIFACT THIS PATH MEASURED, WHICH IS NOT A BASE (this change's review,
+    # P2-4, source-certain). `run_agent` is given `WIP_PATH="$WT"` above, so the probe measures the
+    # FIXER'S WORKTREE — a worktree on the PR BRANCH. The base-path sentence ("git fetch, then cut the
+    # worktree from origin/main") is DESTRUCTIVE here: it discards the PR's own commits, and a PR branch
+    # >MAX_BEHIND behind is exactly the state a fixer gets dispatched to repair. So the remedy is MERGE
+    # INTO the branch, and it says explicitly that re-cutting is not the action.
+    why="STALE-CODE gate: this box completed the model call but the checkout it measured is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (#3932) — work done from it produces a plausible log and a WRONG diff. On THIS path the measured artifact is the FIXER's worktree, which is the PR BRANCH: bring the branch up to date (git -C $WT merge origin/main, resolve, push) and re-run; do NOT re-cut that worktree from origin/main, which would discard the PR's own commits. Do NOT dispatch the PR elsewhere — the measured fleet state was every cell hundreds of commits behind, so a peer is likely stale too. Waiting cannot clear it. Nothing was consumed"
   elif [ "$ar" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ A FIFTH REMEDY, AND THE ONE THAT IS NEITHER "wait" NOR "reclaim" (review of #2991, P1): the
     # box could not complete one model call and RETURN (agent-infra#2935). It does NOT clear by waiting
