@@ -489,6 +489,12 @@ printf '[Service]\nEnvironment=ELDATO_SKIP_REVIEW_GATE=1\nExecStart=/bin/true\n'
 bash "$POLICY" --unit-veto "$TMP/alias.service" alias >/dev/null 2>&1 \
   && bad "(5d) edges: ELDATO_SKIP_REVIEW_GATE=1 was NOT vetoed — the dual-prefix alias bypasses the review gate" \
   || ok "(5d) edges: the DUAL-PREFIX alias ELDATO_SKIP_REVIEW_GATE (no AGENT_ variable present) IS vetoed"
+# …and the FOURTH hatch, which skips the head-bound admin-merge evidence gate. It is a bypass of a certifying
+# gate, which is the same #4002 shape as the other three (fresh review of #4002, round 3).
+printf '[Service]\nEnvironment=AGENT_ADMIN_MERGE_OVERRIDE=1\nExecStart=/bin/true\n' >"$TMP/adminovr.service"
+bash "$POLICY" --unit-veto "$TMP/adminovr.service" adminovr >/dev/null 2>&1 \
+  && bad "(5d) edges: AGENT_ADMIN_MERGE_OVERRIDE=1 was NOT vetoed — it skips the head-bound admin-merge evidence gate" \
+  || ok "(5d) edges: AGENT_ADMIN_MERGE_OVERRIDE (skips the admin-merge evidence gate) IS vetoed"
 # …and an UNREADABLE declaration is not a clean one: rc 2, never 0.
 bash "$POLICY" --unit-veto "$TMP/no-such-declaration" absent >/dev/null 2>&1; ABSENT_RC=$?
 [ "$ABSENT_RC" -eq 2 ] \
@@ -513,29 +519,77 @@ CV_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$CV/units" TEMPLATES_DIR="$CV/t
   && ok "(5e) install path: …and a refused install leaves no artefact (a refused unit is not on the box)" \
   || bad "(5e) install path: a refused install still wrote $CV/units/eldato-ai-drainer.service"
 
-# ── 5f. THE LIST IS EXACTLY WHAT THE GATES HONOUR (agent-infra#4002, fresh review) ────────────────
-# The list is hand-maintained while two of the three hatches are read through a DUAL-PREFIX lookup
-# (`process.env["AGENT_" + name] ?? process.env["ELDATO_" + name]`). That asymmetry is how the FIRST cut of
-# the list omitted `ELDATO_SKIP_REVIEW_GATE` — a name that needs no `AGENT_` variable present, which bypasses
-# the review gate on its own (measured: the grader answered CLEAN and the installer printed `scheduled` with
-# the line live in the installed unit). ⛔ NO ARM COULD REDDEN ON IT, because every arm exercised a name that
-# was present. So the coupling is asserted instead of the spelling: the DERIVED set is what the extensions
-# actually read, and the declared set must EQUAL it, so the next alias a gate learns reddens here.
+# ── 5f. THE LIST IS EXACTLY WHAT THE GATES HONOUR (agent-infra#4002, fresh reviews) ────────────────
+# The list is hand-maintained, and the honoured set is NOT a fixed vocabulary: two hatches are read through
+# `process.env["AGENT_" + n] ?? process.env["ELDATO_" + n]`, so each has two spellings and BOTH bypass the
+# gate. That is how the earlier cuts of the list missed `ELDATO_SKIP_REVIEW_GATE` (rounds 1-2) and then
+# `ADMIN_MERGE_OVERRIDE` entirely (round 3) — each a measured fail-open: the grader answered CLEAN for a unit
+# whose hatch was live, and the installer printed `scheduled`. ⛔ AND NO ARM COULD REDDEN ON EITHER, because
+# every arm exercised a name that was present.
+# ⛔ SO THE DERIVATION IS FROM THE CALL SITES, NOT FROM A HAND-WRITTEN ALTERNATION (a fixed
+# `(AGENT|ELDATO)_(SKIP_REVIEW_GATE|SKIP_VGATE|ALLOW_MAIN_EDITS)` pattern cannot see a stem it was not told
+# about — that was round 3's finding against the first version of this arm):
+#   * every `_getEnv("STEM")` call site, expanded to BOTH prefixes;
+#   * plus every direct `process.env.(AGENT|ELDATO)_*` read whose name carries the hatch vocabulary
+#     (SKIP|ALLOW|OVERRIDE|BYPASS) — direct reads are unpaired, so they are matched on the vocabulary.
+# The declared non-hatch stems are subtracted BY NAME with a reason, so a config variable cannot be mistaken
+# for a hatch and a new hatch cannot hide behind "it looked like config".
+# STATED LIMIT: a hatch whose stem carries none of the vocabulary words AND is read without `_getEnv` would
+# still be invisible here. That is the one shape this arm cannot see, and it is written down rather than
+# implied — the `_getEnv` convention is what the gates actually use, so the first half is the load-bearing one.
 echo
 echo "== the list is what the gates honour (#4002) =="
+NON_HATCH_STEMS="SESSION_TEAM"   # selects a team (`extensions/loop-enforcer`); it disables no gate
 DECLARED="$(sed -n 's/^GP_UNIT_BYPASS_FLAGS="\(.*\)"$/\1/p' "$POLICY" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
-DERIVED="$(grep -ohwE '(AGENT|ELDATO)_(SKIP_REVIEW_GATE|SKIP_VGATE|ALLOW_MAIN_EDITS)' "$REPO"/extensions/*/index.ts 2>/dev/null | LC_ALL=C sort -u)"
+STEMS="$(grep -ohE '_getEnv\("[A-Z_]+"\)' "$REPO"/extensions/*/index.ts 2>/dev/null | sed -E 's/.*"([A-Z_]+)".*/\1/' | LC_ALL=C sort -u)"
+DUAL=""
+for _s in $STEMS; do
+  case " $NON_HATCH_STEMS " in *" $_s "*) continue ;; esac
+  DUAL="$DUAL$(printf 'AGENT_%s\nELDATO_%s\n' "$_s" "$_s")
+"
+done
+DIRECT="$(grep -ohE 'process\.env\.(AGENT|ELDATO)_[A-Z_]*(SKIP|ALLOW|OVERRIDE|BYPASS)[A-Z_]*' "$REPO"/extensions/*/index.ts 2>/dev/null | sed 's/.*process\.env\.//' | LC_ALL=C sort -u)"
+DERIVED="$(printf '%s%s\n' "$DUAL" "$DIRECT" | sed '/^$/d' | LC_ALL=C sort -u)"
 DERIVED_N="$(grep -c . <<<"$DERIVED")"
-[ "$DERIVED_N" -ge 2 ] \
-  && ok "(5f) drift: derived the honoured hatch set from the extensions ($DERIVED_N names) — the equality below is not vacuous" \
-  || bad "(5f) drift: derived $DERIVED_N honoured name(s) from extensions/*/index.ts — the equality would pass on an empty set"
+[ -n "$STEMS" ] && [ "$DERIVED_N" -ge 2 ] \
+  && ok "(5f) drift: derived the honoured hatch set from the extensions ($DERIVED_N names across $(printf '%s\n' $STEMS | grep -c .) _getEnv stems) — the equality is not vacuous" \
+  || bad "(5f) drift: derived only $DERIVED_N honoured name(s) — the equality would pass on an empty set"
 if [ "$DECLARED" = "$DERIVED" ]; then
   ok "(5f) drift: GP_UNIT_BYPASS_FLAGS EQUALS the set the gates honour — no dual-prefix alias can hide"
 else
   only_decl="$(comm -23 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$DERIVED") | tr '\n' ' ')"
   only_hon="$(comm -13 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$DERIVED") | tr '\n' ' ')"
-  bad "(5f) drift: the declared list and the gates disagree — only-declared:[$only_decl] only-honoured:[$only_hon]"
+  bad "(5f) drift: the declared list and the gates disagree — declared-but-not-honoured:[$only_decl] honoured-but-not-declared:[$only_hon]"
 fi
+
+# ── 5g. A DECLARATION THAT IS GENERATED INLINE IS GRADED TOO (fresh review of #4002, round 3) ──────
+# `scripts/install-lane-arm-timer.sh` does not render a template: `service_body()` is a heredoc that writes
+# the `Environment=` lines itself, and the installer IS farmed (`pi-bootstrap/setup.sh`'s fleet set), so it
+# is a LIVE install path on cells that no template census can see. An earlier revision of the census claimed
+# the opposite in prose. The bytes it would install are gradeable through its own `--dry-run`, so they are
+# graded here — and then a hatch is injected into those SAME bytes to prove the arm is reading a declaration
+# and not an error message.
+LARM="$REPO/scripts/install-lane-arm-timer.sh"
+LG="$TMP/lanearm"; mkdir -p "$LG/scripts" "$LG/home"
+cp "$REPO/scripts/lane-arm.sh" "$LG/scripts/" 2>/dev/null || true
+LG_OUT="$(LANE_ARM_SCRIPTS_DIR="$LG/scripts" LANE_ARM_STATE_DIR="$LG/state" HOME="$LG/home" \
+          SYSTEMD_UNIT_DIR="$LG/units" bash "$LARM" --dry-run 2>&1)"; LG_RC=$?
+printf '%s\n' "$LG_OUT" >"$LG/rendered.txt"
+# NON-VACUITY FIRST: a declaration was actually rendered (an Environment= and an ExecStart=), or the veto
+# below would be grading a usage message and the mutation would be mutating prose.
+if [ "$LG_RC" -eq 0 ] && grep -q '^[[:space:]]*Environment=' "$LG/rendered.txt" \
+   && grep -q '^[[:space:]]*ExecStart=' "$LG/rendered.txt"; then
+  ok "(5g) inline generator: install-lane-arm-timer.sh --dry-run rendered a real declaration (Environment= + ExecStart=)"
+else
+  bad "(5g) inline generator: --dry-run produced no gradeable declaration (rc=$LG_RC) — the arm below grades nothing"
+fi
+bash "$POLICY" --unit-veto "$LG/rendered.txt" "install-lane-arm-timer service_body" >/dev/null 2>&1 \
+  && ok "(5g) inline generator: its GENERATED declaration carries no gate-bypass Environment= entry" \
+  || bad "(5g) inline generator: the declaration install-lane-arm-timer.sh generates carries a bypass"
+{ cat "$LG/rendered.txt"; printf 'Environment=AGENT_ADMIN_MERGE_OVERRIDE=1\n'; } >"$LG/mutated.txt"
+bash "$POLICY" --unit-veto "$LG/mutated.txt" "install-lane-arm-timer mutant" >/dev/null 2>&1 \
+  && bad "(5g) inline generator: a hatch injected into those SAME bytes was NOT vetoed — the arm cannot redden" \
+  || ok "(5g) inline generator: a hatch injected into those same bytes IS vetoed (the arm reads a declaration, not an error message)"
 
 printf '\ngate-policy.test: %d passed, %d failed, %d skipped (%s)\n' "$PASS" "$FAIL" "$SKIP" "$(uname -s)"
 [ "$FAIL" -eq 0 ] || exit 1

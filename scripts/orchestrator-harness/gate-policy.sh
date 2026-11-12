@@ -54,11 +54,17 @@
 # unit/service/plist may not name any of these flags in its environment. `gate_policy_unit_veto` is
 # called by `install-drainer-timer.sh` (so the install REFUSES, fail-closed) and by
 # `gate-policy.test.sh` (so a template that regrows the hatch is RED before it reaches a box).
-# Wired into the drainer's installer because that is the unit the measured defect ran; the other
-# installers' templates are graded by the same function through the test's census, so a bypass can
-# only reach a box through a template, and a template is what §5a reddens on.
+# Wired into the drainer's installer because that is the unit the measured defect ran, and into the test's
+# census — which grades EVERY shipped template AND the declarations that are GENERATED INLINE by an
+# installer rather than rendered from `templates/` (§5a, §5b, §5e, §5g). ⛔ An earlier revision of this
+# paragraph said a bypass "can only reach a box through a template", and that was FALSE: `scripts/
+# install-lane-arm-timer.sh` writes its `Environment=` lines from a heredoc (`service_body`) and is farmed,
+# so it is a live install path that no template census sees. A generated declaration is graded like any
+# other — the bytes the installer would write are what the veto reads.
 # STATED LIMIT, so no reader over-reads it: this grades the DECLARATION. `EnvironmentFile=`/a sourced
 # rc file/the spawned script's own `export` are outside it — the census sees what the unit itself says.
+# So is any generator that is NOT shipped here (a wrapper written by hand on a box exists in no file we can
+# read, which is why the rendered path is the one we can close).
 #
 # SEAMS (tests): GP_REPO=<path> (harness checkout to probe), GP_LOG=<file> (audit), GP_QUIET=1.
 
@@ -70,19 +76,21 @@ GP_AMBIENT_CLEARED=0
 
 # ⛔ THE ONE LIST. Every name here is a hatch that turns a gate OFF for the process it lands in, so a
 # declaration that sets one is handing it to every process the job spawns.
-# ⛔ THE LIST IS EXACTLY WHAT THE GATES HONOUR, and the dual-prefix lookups are why it is not obvious. Two
-# of the three hatches are read through `process.env[`AGENT_${n}`] ?? process.env[`ELDATO_${n}`]`
+# ⛔ THE LIST IS EXACTLY WHAT THE GATES HONOUR, and the dual-prefix lookups are why it is not obvious. Every
+# hatch except VGATE is read through `process.env[`AGENT_${n}`] ?? process.env[`ELDATO_${n}`]`
 # (`extensions/review-enforcer/index.ts:` `_getEnv`, `extensions/main-worktree-guard/index.ts:` `_getEnv`),
 # so each has TWO spellings and BOTH bypass the gate: `ELDATO_SKIP_REVIEW_GATE=1` with no `AGENT_` variable
-# present answers `"1"` and disables the review gate just as the `AGENT_` form does (that omission was a
-# measured fail-open in the first cut of this list, fresh review of #4002). `ELDATO_SKIP_VGATE` is read
-# directly (`extensions/verification-gate/index.ts`) and has no `AGENT_` sibling.
-# ⛔ `gate-policy.test.sh` §5f derives the honoured set FROM the extensions and requires this list to equal
-# it, so the next alias a gate learns reddens the suite instead of being invisible.
-# `AGENT_ALLOW_MAIN_EDITS` / `ELDATO_ALLOW_MAIN_EDITS` are the hub-discipline hatch (#623) and belong here
-# for the same reason: both were in the measured wrapper, and an unattended job editing a main checkout is
-# the same defect as an unattended job landing unreviewed code. Extend THIS list, never a second copy.
-GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS"
+# present answers `"1"` and disables the review gate just as the `AGENT_` form does. `ELDATO_SKIP_VGATE` is
+# read directly (`extensions/verification-gate/index.ts`) and has no `AGENT_` sibling.
+# ⛔ FOUR HATCHES, not three (a measured fail-open in the second cut of this list, fresh review of #4002):
+# `ADMIN_MERGE_OVERRIDE` is the same kind of switch — `_getEnv("ADMIN_MERGE_OVERRIDE")` skips the head-bound
+# admin-merge evidence gate (`the head-bound evidence gate was bypassed by AGENT_ADMIN_MERGE_OVERRIDE=1`).
+# A unit setting it hands every lane it spawns the un-certified landing route, which is precisely the #4002
+# shape. It belongs here for the same reason the other three do.
+# ⛔ `gate-policy.test.sh` §5f derives the honoured set FROM the extensions — every `_getEnv("STEM")` call
+# site expanded to both prefixes, plus direct `process.env` hatch reads — and requires this list to equal
+# it, so a new hatch stem reddens the suite instead of being invisible. Extend THIS list, never a second copy.
+GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ADMIN_MERGE_OVERRIDE ELDATO_ADMIN_MERGE_OVERRIDE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS"
 
 # gate_policy_unit_veto <file> [label] — does a DECLARATION carry a gate bypass in its environment?
 #   0  clean (the declaration names none of the flags)
