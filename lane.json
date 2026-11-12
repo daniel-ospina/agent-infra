@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12167-1794499114-p2938450-457487f3",
+  "_sha": "483beaa22247bfe43293f7335e9eae54d90ab8bb",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12167.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/9018-scan-name-arm-fail-open"
+    },
+    {
+      "kind": "sha",
+      "value": "486844c43978bc5d686c55ecd0a95a9eef6d7342"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-9018-scan-failopen"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 4105,
+  "ended_at": 1794503219,
+  "exit_code": 0,
+  "heartbeat_at": 1794503219,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12167-1794499114-p2938450-457487f3",
+  "lease_until": 1794511019,
+  "pid": 2938450,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794499114,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-12167",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-9018-scan-failopen"
+}
