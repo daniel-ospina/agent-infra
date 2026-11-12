@@ -30,6 +30,7 @@ that cannot fail is a suite that certifies nothing.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -95,6 +96,15 @@ QUESTION_TEXTS = [
     "Blocked on your decision.",
     # same, with a status the phrase list learned from the same finding
     "The options are written up.\n\nWaiting on you.",
+    # ⛔ THE ADDRESSED APPROVAL ASK, WRITTEN WITHOUT A QUESTION MARK (round 3, #4046 P1). All five
+    # escaped `_HANDOFF` and routed a lane awaiting the owner to `idle-continue`/`send-continue` — the
+    # headline harm, through the class that exists to catch exactly this shape.
+    "The PR is green.\n\nWaiting for your approval to merge.",
+    "The PR is green and I'll merge on your approval.",
+    "Please approve the merge so I can land it.",
+    "I need approval before merging.",
+    "Everything is green. I'll land it once you approve.",
+    "Done. Tell me if the merge should wait.",
 ]
 
 
@@ -392,9 +402,19 @@ def run_red_control() -> bool:
     good &= _red("R5 an action carrying someone else's proof is not executable", not bad.complete)
 
     # (R6) the detector must fail CLOSED on a question mark in a fence — a detector that read it as
-    # the lane asking would route every code-reading lane to the owner.
-    good &= _red("R6 a fence-blind detector would call a pasted command a question",
-                 triage.asks_owner("Run it:\n```\n# ok?\n```\nThen verified.") == "not-asked")
+    # the lane asking would route every code-reading lane to the owner. ⛔ A MUTATION, NOT A FIXED
+    # STRING (round 3, #4046 P2): asserting one input's answer observes nothing about the stripper,
+    # so the control now disables the stripper and requires the SAME input's answer to CHANGE.
+    _fence = triage._FENCE_RE
+    fenced = "Landed it.\n\n```\nshall i merge?\n```"
+    clean_answer = triage.asks_owner(fenced)
+    triage._FENCE_RE = re.compile(r"(?!x)x")          # fence-blind mutant
+    try:
+        blind_answer = triage.asks_owner(fenced)
+    finally:
+        triage._FENCE_RE = _fence
+    good &= _red("R6 a fence-blind detector WOULD call a fenced question an ask",
+                 clean_answer == "not-asked" and blind_answer == "asked")
 
     # (R7) the router must not become a second verdict function.
     good &= _red("R7 a router that republished 'dead' would be a second liveness verdict",
@@ -589,16 +609,31 @@ def leg_arm_wedged_remedies() -> None:
     ok("boot-prompt: NOT verified while the prompt is still on the pane", not p2.verified, p2.detail)
 
     # child subcases: a named hand-off, never a kill from this arm
+    # ⛔ THE FIXTURE IS THE PRODUCER'S OWN SHAPE (round 3, #4046 P1). `lane-status.py:1586-1590`
+    # emits `call_id / ts / age / abandoned / cwd / task / agent` — the earlier fixture invented
+    # `{"pid": 4242}` and so certified a hand-off the real record could never satisfy.
+    REAL_CHILD = {"call_id": "c-4242", "ts": 1, "age": 12, "abandoned": False,
+                  "cwd": "/tmp/wt", "task": "build the thing", "agent": "worker"}
     for subcase, verdict in (("child-stuck", "CHILD-STUCK"), ("child-overdue", "CHILD-OVERDUE")):
         e = ev(lane_verdict=verdict)
         r = triage.route(e)
         eq("%s: subcase" % subcase, r.subcase, subcase)
-        p = triage_arms.execute(r, e, FakeSurface(), ws="ws_c", child={"pid": 4242, "label": "kid"})
+        p = triage_arms.execute(r, e, FakeSurface(), ws="ws_c", child=REAL_CHILD)
         eq("%s: action" % subcase, p.action, "repair-child")
-        ok("%s: the child is NAMED in the artifact" % subcase, p.artifact["child"].get("pid") == 4242)
+        ok("%s: a REAL lane-status child record VERIFIES the hand-off" % subcase, p.verified,
+           p.detail)
+        ok("%s: the child is NAMED in the artifact" % subcase,
+           p.artifact["child"].get("call_id") == "c-4242")
         ok("%s: nothing was killed and nothing was typed" % subcase, not p.sent)
         unnamed = triage_arms.execute(r, e, FakeSurface(), ws="ws_c", child={})
         ok("%s: an unread child is not verified and not killed" % subcase, not unnamed.verified)
+    # ⛔ A STATE WORD IS NOT A RECORD (round 3, #4046 P1): with no child dict, the arm must NOT
+    # verify off `child_state` — that was a false PASS on a proof that was never read.
+    e_stuck = ev(lane_verdict="CHILD-STUCK", child_state="stuck")
+    p_state = triage_arms.execute(triage.route(e_stuck), e_stuck, FakeSurface(), ws="ws_c")
+    ok("child-stuck with ONLY a state word is NOT verified", not p_state.verified, p_state.detail)
+    ok("…and names no fabricated child", p_state.artifact.get("child") == {},
+       repr(p_state.artifact))
 
     # rerun: lane-relaunch.py's own exit code IS the proof
     e = ev(lane_verdict="WEDGED", turn=TURN_OPEN)
@@ -655,6 +690,7 @@ def leg_wiring() -> None:
     # The farm declaration: turn-end.py is farmed FLAT and imports `$SCRIPTS/fleet/triage.py`, so a
     # farm entry that names only one of the pair ships a router whose arms nobody has.
     repo = os.path.dirname(HERE)
+    import importlib.util as _ilu
     setup = os.path.join(os.path.dirname(repo), "pi-bootstrap", "setup.sh")
     if os.path.exists(setup):
         import re as _re
@@ -680,13 +716,25 @@ def leg_wiring() -> None:
     te = os.path.join(os.path.dirname(repo), "scripts", "turn-end.py")
     if os.path.exists(te):
         blob = open(te, encoding="utf-8", errors="replace").read()
-        i = blob.find("_may, _route = _triage.may_continue(")
-        ok("turn-end.py consults may_continue()", i != -1)
-        window = blob[i:i + 700] if i != -1 else ""
+        # The gate is the extracted seam (`route_gate`), and the LOOP must call it and gate a real
+        # `continue` on the answer. Both halves are asserted: the seam alone would be a function
+        # nobody calls, and the call site alone would not prove the answer is consulted.
+        i = blob.find("_may, _route = route_gate(r, f)")
+        ok("turn-end.py's loop calls the router gate", i != -1)
+        window = blob[i:i + 500] if i != -1 else ""
         ok("…and GATES a `continue` on the answer", "if not _may:" in window and "continue" in window,
            window[-200:])
+        j = blob.find("return _triage.may_continue(ev)")
+        ok("…and route_gate() is where may_continue() is asked", j != -1)
         ok("turn-end.py says so when the router is absent",
            "router unavailable" in blob, "a silent degrade looks like a quiet fleet")
+        # ⛔ THE ARGUMENTS ARE HALF THE GATE (round 3, #4046 P2). The P0 fixed in 228699917 WAS a wrong
+        # call to `steerable()` at this very call site, and this leg was green through it: the guard
+        # body was correct, the evidence handed to it was not. Pin the evidence too.
+        j = blob.find("_triage.steerable(")
+        call = blob[j:j + 200] if j != -1 else ""
+        for frag in ("sid", "ws=", "session_path="):
+            ok("turn-end.py passes %r to the steerability probe" % frag, frag in call, call[:160])
     else:
         ok("scripts/turn-end.py is present to be wired", False, te)
 
@@ -698,12 +746,48 @@ def leg_wiring() -> None:
     ok("the BOOT-PROMPT payload carries NO mandate", bool(triage_arms.mandate_missing(b)), b[:90])
     ok("the two payloads differ", q != b)
 
+    # ⛔ AND THE PRODUCTION GATE ITSELF (round 3, #4046 P2). While `may_continue` lived inline in
+    # `turn-end.py`'s loop, its correctness was pinned but the CONSUMER that suppresses the nudge was
+    # not, because `main()` shells out to lane-status and cannot be driven hermetically. `route_gate()`
+    # is the extracted seam, and these legs drive it with real rows.
+    te2 = os.path.join(os.path.dirname(repo), "scripts", "turn-end.py")
+    spec2 = _ilu.spec_from_file_location("turn_end_under_test", te2)
+    te_mod = _ilu.module_from_spec(spec2)
+    spec2.loader.exec_module(te_mod)
+    ok("turn-end.py's gate is present and wired to the real router",
+       callable(getattr(te_mod, "route_gate", None)) and te_mod._triage is not None)
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        for rec in (
+            {"type": "message", "message": {"role": "user", "content": "go"}},
+            {"type": "message", "message": {"role": "assistant", "stopReason": "stop",
+                                            "content": "Should I merge?\n\nBlocked on your decision."}},
+        ):
+            fh.write(__import__("json").dumps(rec) + "\n")
+        qpath = fh.name
+    with _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        for rec in (
+            {"type": "message", "message": {"role": "user", "content": "go"}},
+            {"type": "message", "message": {"role": "assistant", "stopReason": "stop",
+                                            "content": "Landed it; tests green."}},
+        ):
+            fh.write(__import__("json").dumps(rec) + "\n")
+        npath = fh.name
+    row_q = {"lane": "L", "verdict": "WIP-IDLE", "sid": None, "ws": "ws", "cwd": "/tmp"}
+    may_q, route_q = te_mod.route_gate(row_q, qpath)
+    may_n, route_n = te_mod.route_gate(row_q, npath)
+    ok("the REAL gate refuses a lane whose tail asks the owner", not may_q, route_q.reason)
+    eq("…and names it a user-question", route_q.route, "user-question")
+    ok("the REAL gate allows a lane whose tail does not", may_n, route_n.reason)
+    eq("…and names it idle-continue", route_n.route, "idle-continue")
+    os.unlink(qpath)
+    os.unlink(npath)
+
     # ⛔ THE `tool-in-flight` SUBCASE MUST BE REACHABLE FROM THE REAL ACQUIRER (fresh-context review,
     # #4046 P1). `lane-status.py` emits `tool` as a DICT (name/timeout/age); the first version read
     # OBJECT attributes, so the subcase was permanently unreachable in production while its fixture
     # passed on hand-built evidence.
     sys.path.insert(0, os.path.join(os.path.dirname(repo), "scripts"))
-    import importlib.util as _ilu
     spec = _ilu.spec_from_file_location("lane_route_under_test",
                                         os.path.join(os.path.dirname(repo), "scripts",
                                                      "lane-route.py"))
@@ -728,6 +812,39 @@ def leg_wiring() -> None:
        lr.evidence_for(dict(row, tool=None), read_text=False)[0].model_retry is False)
     eq("retry_signature recognises a rate-limit tail", triage.retry_signature("HTTP 429 rate limit, retrying in 30s"), True)
     eq("retry_signature does not fire on ordinary prose", triage.retry_signature("Merged the PR."), False)
+
+    # ⛔ THE RETRY SIGNATURE'S OWN P0 (round 3, #4046): a bare `429` matched any number CONTAINING
+    # those digits, and the branch was ungated, so a WORKING lane that merely mentioned a ticket routed
+    # `wedged/model-retry` whose remedy is `rerun` — a relaunch of a lane that was working.
+    for prose in ("Merged PR #14290 and verified all checks.",
+                  "Closed issue #34290."):
+        eq("retry_signature does NOT fire on %r" % prose[:34], triage.retry_signature(prose), False)
+    # A sentence that mentions a 429 it FIXED still carries the word, so the signature may read it —
+    # the guard that matters is that the ROUTE does not act on a lane that is working or has closed
+    # its turn (asserted immediately below). A detector that had to be perfect here would be a second
+    # judge of prose; the router's job is to refuse to LAUNCH on it.
+    eq("a 429 mentioned in a fix report does not relaunch a WORKING lane",
+       (triage.retry_signature("Fixed the 429 handling in the retry loop."),
+        triage.route(ev(turn=TURN_OPEN, lane_verdict="WORKING", model_retry=True)).action),
+       (True, "none"))
+    for tail in ("HTTP 429 Too Many Requests — retrying.", "rate limit hit; retrying in 30s",
+                 "provider error: upstream timeout"):
+        eq("retry_signature DOES fire on %r" % tail[:34], triage.retry_signature(tail), True)
+
+    # …and a genuine retry signature must not override a WORKING lane, nor a lane with no open turn.
+    for verdict in triage.WORKING_VERDICTS:
+        e_r = ev(turn=TURN_OPEN, last_text="HTTP 429 Too Many Requests — retrying.",
+                 lane_verdict=verdict, model_retry=True)
+        eq("a retry signature on a %s lane is NOT routed to model-retry" % verdict,
+           triage.route(e_r).subcase != "model-retry", True)
+    e_closed = ev(turn=TURN_ENDED, last_text="HTTP 429 Too Many Requests — retrying.",
+                  lane_verdict="WEDGED", model_retry=True)
+    ok("a retry signature with NO positively open turn is not a confirmed wedge",
+       triage.route(e_closed).subcase != "model-retry", triage.route(e_closed).subcase)
+    e_open = ev(turn=TURN_OPEN, last_text="HTTP 429 Too Many Requests — retrying.",
+                lane_verdict="WEDGED", model_retry=True)
+    eq("…and the positive control: open turn + retry tail IS the subcase",
+       triage.route(e_open).subcase, "model-retry")
 
 
 LEGS = (

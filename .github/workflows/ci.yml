@@ -617,7 +617,7 @@ jobs:
         # ZERO "continue" sent in reply to a question — so it cannot be reviewed into existence; it
         # is a matrix assertion over question shape x verdict x steerability x turn boundary, with
         # the positive control that the idle arm still fires for a genuine non-question. Its RED
-        # controls run by default: seven ways of removing the property, each required to turn the
+        # controls run by default: twelve ways of removing the property, each required to turn the
         # suite red. Zero-dep (no cmux, no gh, no network, no clock) — the arms are driven through a
         # fake `Surface`, which is what lets the user-question arm be proved END-TO-END here.
         run: python3.12 tools/fleet/triage.test.py

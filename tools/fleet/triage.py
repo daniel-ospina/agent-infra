@@ -165,11 +165,14 @@ _ASK_FRAME = (
     "on to the next", "is that ok", "is that okay",
 )
 _HANDOFF = (
-    "let me know", "say the word", "tell me if you want", "blocked on your",
-    "waiting on you", "waiting on your", "awaiting your", "over to you",
-    "your decision", "up to you", "need your", "once you decide",
-    "please confirm", "your confirmation", "needs your approval", "needs approval",
-    "awaiting approval", "awaiting a decision",
+    "let me know", "say the word", "tell me if", "tell me whether", "blocked on your",
+    "waiting on you", "waiting on your", "waiting for your", "waiting for approval",
+    "awaiting your", "awaiting approval", "awaiting a decision", "over to you",
+    "your decision", "up to you", "need your", "need approval", "needs approval",
+    "needs your approval", "once you decide", "once you approve", "if you approve",
+    "once you've approved", "on your approval", "for your approval", "pending your approval",
+    "pending your decision", "please confirm", "please approve", "your confirmation",
+    "your approval", "on your go",
 )
 
 ASKED = "asked"
@@ -238,14 +241,25 @@ def asks_owner(text: str) -> str:
 # reachability the acquirer could not produce. The signature is mechanical and narrow: the lane's own
 # last words name a provider/transport retry, which is the thing a `continue` cannot fix and a
 # re-dispatch can.
+# ⛔ THE NUMERIC IS WORD-ANCHORED (round 3, #4046 P0). A bare `429` matched any issue/PR number that
+# CONTAINS those digits — measured: `retry_signature("Merged PR #14290 and verified all checks.")` was
+# True, so a WORKING lane routed `wedged/model-retry` whose remedy is `rerun` (a relaunch) and was
+# re-dispatched for having mentioned a ticket. `\b429\b` still matches `HTTP 429`, `429 Too Many
+# Requests`, and `got 429`, and cannot match inside `#14290` (no boundary between `1` and `4`).
 _RETRY_RE = re.compile(
-    r"(rate[ -]?limit|429|too many requests|overloaded|retrying|retry in |"
+    r"(rate[ -]?limit|\b429\b|too many requests|overloaded|retrying|retry in |"
     r"temporarily unavailable|upstream (error|timeout)|provider (error|unavailable))", re.I)
 
 
 def retry_signature(text: str) -> bool:
-    """Does the lane's tail say it is RETRYING the model rather than progressing?"""
-    return bool(_RETRY_RE.search(text or ""))
+    """Does the lane's tail say it is RETRYING the model rather than progressing?
+
+    Scoped to the LAST PARAGRAPH, not the whole message: a long report that mentions a rate-limit fix
+    somewhere in the middle is a report about a bug the lane FIXED, not a lane that is retrying. The
+    remedy for this verdict is `rerun` (a relaunch), so the signature may only read what the lane is
+    saying as it stops.
+    """
+    return bool(_RETRY_RE.search(last_paragraph(text)))
 
 
 def last_text_from_jsonl(path: Optional[str]) -> str:
@@ -347,6 +361,12 @@ class Route:
                 "action": self.action, "proof": self.proof, "reason": self.reason}
 
 
+# Verdicts that are THEMSELVES proof the lane is working. Each is a veto against every `wedged`
+# subcase whose remedy acts on the lane (a re-dispatch, a relaunch): the instrument saw it consume CPU,
+# hold a child, or run a declared tool, so nothing downstream may be told it has stopped.
+WORKING_VERDICTS = ("WORKING", "WAITING-CHILD", "LONG-TOOL", "UNATTRIBUTED-WORKING")
+
+
 def _turn_open(ev: Evidence) -> bool:
     """POSITIVELY open — `liveness.Turn.stalled`, and never an abstention (#1254)."""
     return bool(ev.turn is not None and getattr(ev.turn, "stalled", False)
@@ -434,11 +454,18 @@ def route(ev: Evidence) -> Route:
                      reason="pi is sitting on its boot-block prompt; the send was EATEN, not ignored",
                      evidence="boot_prompt=True")
 
-    if ev.model_retry:
+    # ⛔ A RETRY SIGNATURE IS NOT ON ITS OWN A WEDGE (round 3, #4046 P0). The remedy here is `rerun` —
+    # a RELAUNCH — so the branch may only fire where the module's own rule holds: a POSITIVELY OPEN
+    # turn (the retry is happening now, so the turn never closed) and no proven-working signal (every
+    # "still working" signal is a veto, per the docstring). Measured without these two guards: a lane
+    # reading `WORKING` that merely MENTIONED a 429 routed to `wedged/model-retry` → `rerun`, i.e. a
+    # working lane re-dispatched and its work discarded. Veto beats evidence, and abstention is not
+    # progress: an unreadable verdict is not a working signal, but an open turn still has to be there.
+    if ev.model_retry and _turn_open(ev) and ev.lane_verdict not in WORKING_VERDICTS:
         sc = "model-retry"
         return Route(route="wedged", subcase=sc, action=REMEDIES[sc], proof=PROOFS[REMEDIES[sc]],
-                     reason="the transcript shows the lane retrying the model, not progressing",
-                     evidence="model_retry=True")
+                     reason="an OPEN turn whose tail says it is retrying the model — not progressing",
+                     evidence="model_retry=True verdict=%r" % (ev.lane_verdict,))
 
     if ev.tool_in_flight:
         # In flight with NO readable budget: nothing proves it late either. `wait` — the subcase exists

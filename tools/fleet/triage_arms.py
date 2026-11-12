@@ -318,14 +318,25 @@ def arm_child(lane: str, child: dict) -> Proof:
     a named hand-off: the child's own record, so `pi-done-not-exited.py` (the audited reaper) or the
     operator inherits a diagnosis instead of a mystery. The proof is that the record is READ and
     NAMED — an artifact, not an intention.
+
+    ⛔ THE PRODUCER'S OWN KEY SET, NOT A GUESSED ONE (round 3, #4046 P1). `lane-status.py:1586-1590`
+    emits `dict(call_id=…, ts=…, age=…, abandoned=…, cwd=…, task=…, agent=…)`. The first version read
+    `pid` / `sid` / `name`, NONE of which the producer emits, so the arm answered "the child could not
+    be named" 100% of the time on a record that DID name it — and its sibling path synthesised a name
+    from the state word, which reported `verified=True` off `{'name': 'stuck'}`. `call_id` is the
+    child's identity in the harness's own records, so it is the one that proves a record was READ.
     """
-    known = bool(child) and bool(child.get("pid") or child.get("sid") or child.get("name"))
+    named = [k for k in ("call_id", "agent", "task", "label", "pid", "sid", "name")
+             if (child or {}).get(k)]
+    known = bool(child) and bool(named)
+    who = ((child or {}).get("call_id") or (child or {}).get("agent") or (child or {}).get("label")
+           or (child or {}).get("pid") or (child or {}).get("sid") or (child or {}).get("name"))
     return Proof("repair-child", triage.PROOFS["repair-child"], known,
-                 ("child record named (%s) and handed to the audited reaper — this arm signals nothing"
-                  % (child.get("label") or child.get("sid") or child.get("pid"),)) if known else
+                 ("child record READ and handed over (%s; fields=%s) — this arm signals nothing"
+                  % (who, ",".join(named))) if known else
                  "the child could not be named from the evidence — nothing to hand off, and no kill "
                  "is authorised on an unread child",
-                 {"lane": lane, "child": dict(child or {})})
+                 {"lane": lane, "child": dict(child or {}), "fields": named})
 
 
 def arm_rerun(lane: str, ws: str, relaunch) -> Proof:
@@ -374,15 +385,12 @@ def execute(route, ev, surface: Surface, *, ws: str = "", dispatch=None, relaunc
     if action == "repair-boot-prompt":
         return arm_boot_prompt(ws, ev.lane, surface, dispatch)
     if action == "repair-child":
-        # ⛔ AN EXPLICIT BRANCH, NOT A ONE-LINER. The first version read
-        # `child or {"name": ev.child_state} if ev.child_state else {}`, in which the conditional
-        # binds looser than `or` — so a caller that HAD the child record (`child={'pid': 4242}`) and
-        # an evidence record with no `child_state` got `{}`, i.e. the arm reported "the child could not
-        # be named" while holding the child's pid. Caught by the suite, which is why the arm asserts a
-        # NAMED record rather than merely a successful call: a hand-off that names nothing is not a
-        # hand-off.
-        rec = child if child else ({"name": ev.child_state} if ev.child_state else {})
-        return arm_child(ev.lane, rec)
+        # ⛔ A STATE WORD IS NOT A CHILD RECORD (round 3, #4046 P1). This branch used to synthesise
+        # `{"name": ev.child_state}` when the caller had no record, which made the arm report
+        # `verified=True` off the literal string `'stuck'` — a false PASS on a proof (`child-record`)
+        # that was never read. An absent record is now absent: the arm says so, and verification
+        # requires a field the producer actually emits.
+        return arm_child(ev.lane, child or {})
     if action == "rerun":
         return arm_rerun(ev.lane, ws, relaunch)
     return arm_reading(action, route.reason,
