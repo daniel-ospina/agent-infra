@@ -126,6 +126,27 @@ D="$(new_o a4)"; stub "$D" "$STUB_OK_TOUCH"
 run_sh "$D" 3 3
 [ -f "$D/stub-called" ]; ck $? "the on-bound stalled pass (3 of 3) DOES call the dispatcher"
 
+# ── §A2 a dispatcher that cannot be EXECUTED is two different faults (#4003) ────────────────────
+# ⛔ THE MEASURED FAILURE: `~/orchestrator/nonblocking-dispatch.sh` was THERE — 36,175 bytes, mode
+# `-rw-r--r--`, a deployment that had lost the bit — and the one line the script wrote said
+# "no executable $DISP", which reads as a configuration note. Both states produced that same sentence,
+# so nothing told an operator whether to redeploy or to `chmod`. These two legs pin the states apart;
+# the disjunction is what makes each of them load-bearing (a single message satisfies either one).
+D="$(new_o a5)"
+rm -f "$D/nonblocking-dispatch.sh"
+run_sh "$D" 3 3
+has "is ABSENT" && ck 0 "a MISSING dispatcher is named ABSENT" || ck 1 "a MISSING dispatcher is named ABSENT"
+has "redeploy the harness" && ck 0 "…and the absent arm names the remedy that fixes it" || ck 1 "…and the absent arm names the remedy that fixes it"
+lacks "NOT EXECUTABLE" && ck 0 "…and never claims the present-but-unrunnable state" || ck 1 "…and never claims the present-but-unrunnable state"
+
+D="$(new_o a6)"; stub "$D" "$STUB_OK_TOUCH"; chmod -x "$D/nonblocking-dispatch.sh"
+run_sh "$D" 3 3
+has "EXISTS but is NOT EXECUTABLE" && ck 0 "a PRESENT-but-chmod-x dispatcher is named as exactly that" || ck 1 "a PRESENT-but-chmod-x dispatcher is named as exactly that"
+has "chmod +x" && ck 0 "…and names the remedy, so the operator does not re-deploy to no effect" || ck 1 "…and names the remedy, so the operator does not re-deploy to no effect"
+has "-rw-" && ck 0 "…and quotes the mode it actually found" || ck 1 "…and quotes the mode it actually found"
+lacks "is ABSENT" && ck 0 "…and never reports it as missing (the pre-#4003 conflation)" || ck 1 "…and never reports it as missing (the pre-#4003 conflation)"
+[ ! -f "$D/stub-called" ]; ck $? "…and an unrunnable dispatcher is never reported as dispatched"
+
 echo
 echo "── §B the verdict — evidence, not the dispatcher's exit status ─────────────────────────────"
 # ⛔ THE #3181 P1 REGRESSION. The real dispatcher exits 0 here (it reached the launch) and the gate
