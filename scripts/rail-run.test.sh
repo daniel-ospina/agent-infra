@@ -231,12 +231,24 @@ assert_rc 1 "$N" "DUPLICATE: exactly ONE rail invocation ever reached the rail"
 # this shell's own fork/exec cost. That is what keeps the arm able to catch a claim-less
 # (check-then-act) rewrite — both probes must be able to see NO run, or the mutant escapes by reading
 # the winner's `latest` and being refused for the right answer.
-: > "$T/race-go"
+# ⛔ THE GO FILE MUST NOT EXIST WHEN THE WAITERS FORK. An earlier revision CREATED it here
+# (`: > "$T/race-go"`), which PRE-RELEASED both subshells on their first test — the barrier was
+# inert, the release was still fork-ordered, and no edit could ever redden it (review P2-1 at
+# a35ad9570f). The write belongs on the RELEASE line below and nowhere else.
+rm -f "$T/race-go"
 ( while [ ! -f "$T/race-go" ]; do sleep 0.01; done
   FAKE_RAIL_SLEEP=6 RAIL_RUN_RAIL="$T/bin/rail" "$BASH_BIN" "$RR" start 301 > "$T/c1.out" 2>&1; echo $? > "$T/c1.rc" ) &
 ( while [ ! -f "$T/race-go" ]; do sleep 0.01; done
   FAKE_RAIL_SLEEP=6 RAIL_RUN_RAIL="$T/bin/rail" "$BASH_BIN" "$RR" start 301 > "$T/c2.out" 2>&1; echo $? > "$T/c2.rc" ) &
-sleep 0.2; : > "$T/race-go"
+sleep 0.2
+# ⛔ THE BARRIER IS ASSERTED, NOT ASSUMED: while it is still CLOSED, no launcher may have reached the
+# rail. On the pre-released form the two starts ran at fork time and this row counted invocations
+# already, so the arm now discriminates the construct it is built on.
+BARR="$(rail_invocations 301)"
+if [ "$BARR" = 0 ]; then
+  ok "CONCURRENT: the start barrier HELD — neither launcher reached the rail before release"
+else bad "CONCURRENT: the start barrier did NOT hold — $BARR rail invocation(s) before release"; fi
+: > "$T/race-go"
 wait
 CONC="$(rail_invocations 301)"
 assert_rc 1 "$CONC" "CONCURRENT: two racing starts reach the rail exactly ONCE"

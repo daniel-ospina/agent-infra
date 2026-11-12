@@ -3554,10 +3554,13 @@ def converge(
     #   * what a call ADDED is measured, never assumed, and compared like with like (installs with
     #     installs, listeners with listeners) — mixing populations produced a negative delta whose
     #     note contradicted the action line above it (round 4, finding 1);
-    #   * the loop is bounded twice: by `target` iterations and by LISTENER progress. Installs can
-    #     appear while no listener stays up (a rejected registration, a unit that exits), and
-    #     measuring only the install count made that state loop forever — hundreds of installer
-    #     calls in one pass (round 5, finding 2).
+    #   * the loop is bounded twice: by `max(1, target) + SLOT_SKIP_BUDGET` iterations (see the range
+    #     below — the skip budget is NOT charged to `target`, #4004 P1-b) and by LISTENER progress.
+    #     Installs can appear while no listener stays up (a rejected registration, a unit that exits),
+    #     and measuring only the install count made that state loop forever — hundreds of installer
+    #     calls in one pass (round 5, finding 2). ⛔ This sentence said "by `target` iterations" until
+    #     this same diff changed the bound; a reader who takes the number from here takes a bound the
+    #     code no longer has (review P3-2 at a35ad9570f).
     def _found() -> list[LocalRunner]:
         return discover(root)
 
