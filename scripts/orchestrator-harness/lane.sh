@@ -694,13 +694,17 @@ bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.l
 #     `orch-loop.sh`'s `capacity_yield_live()`.
 #
 # FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
-# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the EIGHT refusal gates
-# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`.
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the NINE refusal gates
+# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`,
+# `stale`.
 # ⛔ THIS SENTENCE USED TO SAY "`load`, `disk` or `land`" AND THAT WAS A TRAP (review P2): the writer has
-# emitted SIX since the fork/capability/skew/key gates were added — and it says SEVEN here because that
+# emitted SIX since the fork/capability/skew/key gates were added — and it said SEVEN here because that
 # stale count is exactly how this comment drifted the first time (review cycle 1, P2: it read "SIX"
-# beside a list of seven). The list and the count are asserted against `cap_refusal_gate` by
-# `lane-outcome.test.sh`, so a gateway added without this line reddens a test instead of a reader.
+# beside a list of seven). ⛔ IT DRIFTED THE SAME WAY TWICE MORE, AND THE SECOND TIME WAS THIS CHANGE:
+# it read SEVEN beside eight names, then EIGHT beside eight names while `#3932` added a NINTH arm
+# (`stale`) to `cap_refusal_gate` — so the count is the part that rots, not the list. The list and the
+# count are asserted against `cap_refusal_gate` by `lane-outcome.test.sh` §4e, which is what turns the
+# next gateway added without this line into a red test instead of a misled reader.
 # `chain-merge.sh` folds an UNRECOGNISED third field to `load` — so a reader implemented from this
 # sentence alone would report a credential stand-down as a load wait, which is the #2991 mislabelling
 # this file is careful to avoid three lines above. The vocabulary lives in `cap_refusal_gate`; this
@@ -1118,7 +1122,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # and all three remedies are wrong for it: the model call SUCCEEDED (that is how the reading was
     # taken), and the fleet was measured stale on every cell, so the peer refuses identically. Two
     # surfaces publishing contradictory instructions for one refusal is the harm this arm removes.
-    echo "[lane $N] NOT started: STALE-CODE gate refused — this box completed the model call but its checkout is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (agent-infra#3932), so a lane cut from it produces a plausible log and a WRONG diff: it re-derives what main already fixed, or reverts it. Waiting will NOT clear it and load has nothing to do with it, and do NOT dispatch the issue to another box — the measured fleet state was every cell hundreds of commits behind, so a peer is likely stale too. The repo and the distance are on the [capability-gate] REFUSED line in this log: advance THAT checkout (git fetch, then cut the worktree from origin/main, or the cell's own sync path) and re-dispatch. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
+    # ⛔ AND THE REMEDY NAMES THE ARTIFACT THE READING CAME FROM (this change's review, P2-4): the probe
+    # measures `$PWD` on THIS path (`WIP_PATH` is unset in lane.sh), which is the lane's own WORKTREE — a
+    # base cut from origin/main. So the base remedy is right here, but it must be the BASE's advice and
+    # say so, because the same refusal text is published on the FIXER path where the measured artifact is
+    # a PR branch and re-cutting it would discard the PR (fix-one.sh's arm carries that shape).
+    echo "[lane $N] NOT started: STALE-CODE gate refused — this box completed the model call but the checkout it measured is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (agent-infra#3932), so a lane cut from it produces a plausible log and a WRONG diff: it re-derives what main already fixed, or reverts it. Waiting will NOT clear it and load has nothing to do with it, and do NOT dispatch the issue to another box — the measured fleet state was every cell hundreds of commits behind, so a peer is likely stale too. The repo and the distance are on the [capability-gate] REFUSED line in this log, and it names the checkout that was measured: advance THAT one — for a BASE checkout (this lane's worktree, or the shared checkout) `git -C <repo> pull --ff-only origin main` or the cell's own sync path; for a PR-BRANCH worktree integrate origin/main INTO the branch (`git -C <repo> merge origin/main`) and never re-cut one that carries commits. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ NAMED, BECAUSE THE REMEDY IS THE ONE THING WAITING CANNOT BUY (review of #2991, P1). Without
     # this arm a capability refusal fell into the `else` below and the operator read "load gate refused
