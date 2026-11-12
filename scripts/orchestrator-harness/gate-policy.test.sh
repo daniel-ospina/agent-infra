@@ -491,6 +491,17 @@ bash "$POLICY" --unit-veto "$TMP/alias.service" alias >/dev/null 2>&1 \
   || ok "(5d) edges: the DUAL-PREFIX alias ELDATO_SKIP_REVIEW_GATE (no AGENT_ variable present) IS vetoed"
 # …and the FOURTH hatch, which skips the head-bound admin-merge evidence gate. It is a bypass of a certifying
 # gate, which is the same #4002 shape as the other three (fresh review of #4002, round 3).
+# …and `PassEnvironment=`, which names a variable in the unit's OWN text rather than assigning it. It
+# forwards one the managing systemd instance holds, so it is the ambient-hatch route by another spelling, and
+# it answered CLEAN before this arm existed (fresh review of #4002, round 4).
+printf '[Service]\nPassEnvironment=AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE\nExecStart=/bin/true\n' >"$TMP/passenv.service"
+bash "$POLICY" --unit-veto "$TMP/passenv.service" passenv >/dev/null 2>&1 \
+  && bad "(5d) edges: PassEnvironment=AGENT_SKIP_REVIEW_GATE was NOT vetoed — the unit's own text names the hatch" \
+  || ok "(5d) edges: PassEnvironment= naming a hatch IS vetoed (and EnvironmentFile= stays out by design)"
+printf '[Service]\nEnvironmentFile=/etc/some.env\nExecStart=/bin/true\n' >"$TMP/envfile.service"
+bash "$POLICY" --unit-veto "$TMP/envfile.service" envfile >/dev/null 2>&1 \
+  && ok "(5d) edges: EnvironmentFile= is NOT graded (the declared limit: the unit names a file, not a variable)" \
+  || bad "(5d) edges: EnvironmentFile= was graded — the declared limit and the code disagree"
 printf '[Service]\nEnvironment=AGENT_ADMIN_MERGE_OVERRIDE=1\nExecStart=/bin/true\n' >"$TMP/adminovr.service"
 bash "$POLICY" --unit-veto "$TMP/adminovr.service" adminovr >/dev/null 2>&1 \
   && bad "(5d) edges: AGENT_ADMIN_MERGE_OVERRIDE=1 was NOT vetoed — it skips the head-bound admin-merge evidence gate" \
@@ -539,21 +550,32 @@ CV_OUT="$(PATH="$RD/bin:$PATH" SYSTEMD_UNIT_DIR="$CV/units" TEMPLATES_DIR="$CV/t
 # implied — the `_getEnv` convention is what the gates actually use, so the first half is the load-bearing one.
 echo
 echo "== the list is what the gates honour (#4002) =="
-NON_HATCH_STEMS="SESSION_TEAM"   # selects a team (`extensions/loop-enforcer`); it disables no gate
+# ⛔ THE SCAN SET IS EVERY EXTENSION, NOT JUST THE SUBDIRECTORY INDEX FILES (fresh review of #4002, round 4):
+# `extensions/*/index.ts` is 18 files, and this repo carries top-level `extensions/*.ts` beside them — one of
+# which, `extensions/skill-enforcer.ts`, honours `_getEnv("ALLOW_MAIN_EDITS")`, a name in the list. A hatch
+# introduced only in a top-level extension was honoured by a real gate and INVISIBLE here, while the arm still
+# printed PASS. `.test.ts` is excluded on purpose: a test that mentions a variable is not a reader.
+NON_HATCH_STEMS="SESSION_TEAM SKILLS_PREFIX"   # select a team / a skills path (`loop-enforcer`, `skill-enforcer`); neither disables a gate
+FILES=""
+for _f in "$REPO"/extensions/*/index.ts "$REPO"/extensions/*.ts; do
+  [ -f "$_f" ] || continue
+  case "$_f" in *.test.ts) continue ;; esac
+  FILES="$FILES $_f"
+done
 DECLARED="$(sed -n 's/^GP_UNIT_BYPASS_FLAGS="\(.*\)"$/\1/p' "$POLICY" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -u)"
-STEMS="$(grep -ohE '_getEnv\("[A-Z_]+"\)' "$REPO"/extensions/*/index.ts 2>/dev/null | sed -E 's/.*"([A-Z_]+)".*/\1/' | LC_ALL=C sort -u)"
+STEMS="$(grep -ohE '_getEnv\("[A-Z_]+"\)' $FILES 2>/dev/null | sed -E 's/.*"([A-Z_]+)".*/\1/' | LC_ALL=C sort -u)"
 DUAL=""
 for _s in $STEMS; do
   case " $NON_HATCH_STEMS " in *" $_s "*) continue ;; esac
   DUAL="$DUAL$(printf 'AGENT_%s\nELDATO_%s\n' "$_s" "$_s")
 "
 done
-DIRECT="$(grep -ohE 'process\.env\.(AGENT|ELDATO)_[A-Z_]*(SKIP|ALLOW|OVERRIDE|BYPASS)[A-Z_]*' "$REPO"/extensions/*/index.ts 2>/dev/null | sed 's/.*process\.env\.//' | LC_ALL=C sort -u)"
+DIRECT="$(grep -ohE 'process\.env\.(AGENT|ELDATO)_[A-Z_]*(SKIP|ALLOW|OVERRIDE|BYPASS)[A-Z_]*' $FILES 2>/dev/null | sed 's/.*process\.env\.//' | LC_ALL=C sort -u)"
 DERIVED="$(printf '%s%s\n' "$DUAL" "$DIRECT" | sed '/^$/d' | LC_ALL=C sort -u)"
 DERIVED_N="$(grep -c . <<<"$DERIVED")"
 [ -n "$STEMS" ] && [ "$DERIVED_N" -ge 2 ] \
-  && ok "(5f) drift: derived the honoured hatch set from the extensions ($DERIVED_N names across $(printf '%s\n' $STEMS | grep -c .) _getEnv stems) — the equality is not vacuous" \
-  || bad "(5f) drift: derived only $DERIVED_N honoured name(s) — the equality would pass on an empty set"
+  && ok "(5f) drift: derived the honoured hatch set from ALL $(printf '%s\n' $FILES | grep -c .) extension files ($DERIVED_N names across $(printf '%s\n' $STEMS | grep -c .) _getEnv stems) — the equality is not vacuous" \
+  || bad "(5f) drift: derived only $DERIVED_N honoured name(s) from $(printf '%s\n' $FILES | grep -c .) files — the equality would pass on an empty set"
 if [ "$DECLARED" = "$DERIVED" ]; then
   ok "(5f) drift: GP_UNIT_BYPASS_FLAGS EQUALS the set the gates honour — no dual-prefix alias can hide"
 else

@@ -61,10 +61,10 @@
 # install-lane-arm-timer.sh` writes its `Environment=` lines from a heredoc (`service_body`) and is farmed,
 # so it is a live install path that no template census sees. A generated declaration is graded like any
 # other — the bytes the installer would write are what the veto reads.
-# STATED LIMIT, so no reader over-reads it: this grades the DECLARATION. `EnvironmentFile=`/a sourced
-# rc file/the spawned script's own `export` are outside it — the census sees what the unit itself says.
-# So is any generator that is NOT shipped here (a wrapper written by hand on a box exists in no file we can
-# read, which is why the rendered path is the one we can close).
+# STATED LIMIT, so no reader over-reads it: this grades the DECLARATION. `EnvironmentFile=` (a file the unit
+# names but whose CONTENTS we cannot read), a sourced rc file and the spawned script's own `export` are
+# outside it. `PassEnvironment=` IS inside it — it names a variable in the unit's own text, so it is graded
+# like `Environment=` (fresh review of #4002, round 4: it used to answer CLEAN while naming two hatches).
 #
 # SEAMS (tests): GP_REPO=<path> (harness checkout to probe), GP_LOG=<file> (audit), GP_QUIET=1.
 
@@ -121,13 +121,16 @@ gate_policy_unit_veto() {
     printf 'unit-veto: could not fold the continuations of %s — an ungradable %s is not a clean one\n' "$f" "$label" >&2
     return 2
   }
-  # ⛔ ONLY `Environment=` DIRECTIVES ARE GRADED, and the flag must be a WHOLE WORD inside them.
+  # ⛔ ONLY `Environment=` / `PassEnvironment=` DIRECTIVES ARE GRADED, and the flag must be a WHOLE WORD
+  # inside them. `PassEnvironment=<NAME>` names a variable in the unit's OWN text (it forwards one the
+  # managing systemd instance holds), so it is a declaration that names the hatch and belongs here — it
+  # used to answer CLEAN (fresh review of #4002, round 4). `EnvironmentFile=` deliberately does NOT match:
+  # the unit names a file, not a variable, and its contents are outside what this function can read.
   # `-w` rather than a hand-rolled `[^A-Za-z0-9_]` boundary: GNU and BSD grep disagree about `\b` in
   # ERE (BSD has no `\b`), and a boundary that silently stops matching is the shape that lets the
-  # hatch back in. A commented-out line is not a declaration, so the `^[[:space:]]*Environment` anchor
-  # deliberately does not see it; `EnvironmentFile=` is not `Environment=` and is outside this census
-  # (the STATED LIMIT in this file's header).
-  envlines="$(grep -E '^[[:space:]]*Environment[[:space:]]*=' <<<"$folded" 2>/dev/null || true)"
+  # hatch back in. A commented-out line is not a declaration, so the `^[[:space:]]*` anchor
+  # deliberately does not see it.
+  envlines="$(grep -E '^[[:space:]]*(Environment|PassEnvironment)[[:space:]]*=' <<<"$folded" 2>/dev/null || true)"
   for flag in $GP_UNIT_BYPASS_FLAGS; do
     # ⛔ HERE-STRING, NOT `printf … | grep -q` (#841/#864): the recognised idiom is a producer piped into a
     # QUIET grep, where the producer can take SIGPIPE under `pipefail` and a present match reads as absent.
