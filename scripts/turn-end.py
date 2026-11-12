@@ -97,6 +97,28 @@ os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 HOME = os.path.expanduser("~")
 STATE = f"{HOME}/.pi/agent/state"
 SCRIPTS = f"{HOME}/.pi/agent/scripts"
+
+# ── THE TRIAGE ROUTER (agent-infra#4046) ──────────────────────────────────────────────────────
+# This box's only other question guard, above, keys on the ISSUE LABEL — so a lane that asked the
+# owner in its PANE and never posted the labelled comment is invisible to it, reads `WIP-IDLE`, and
+# receives "CONTINUE IT". The router closes that hole: it decides from the lane's OWN last turn, and
+# its precedence puts `user-question` above `idle-continue` so the nudge cannot be the answer to a
+# question. `may_continue()` is the one predicate this file gates on.
+#
+# The import is GUARDED and its absence is LOGGED, never silent: `triage.py` is farmed into
+# `$SCRIPTS/fleet` beside `liveness.py` (pi-bootstrap `fleet_tools`), and on a box that predates that
+# farm this script must keep nudging exactly as it did rather than stop the fleet — but it must also
+# SAY so, because a router that is absent looks identical to a wave of lanes that need nothing.
+sys.path.insert(0, os.path.join(SCRIPTS, "fleet"))
+try:
+    import liveness as _liveness        # noqa: E402  the #1254 open-turn contract
+    import triage as _triage            # noqa: E402  the precedence router
+    _ROUTER = ""
+except Exception as _exc:                 # noqa: BLE001  — a missing/broken router must not stop the nudge path
+    _liveness = None
+    _triage = None
+    _ROUTER = f"{_exc.__class__.__name__}: {_exc}"
+
 LOG = f"{STATE}/turn-end.log"
 MARK_DIR = f"{STATE}/turn-end"
 KILL = f"{STATE}/HEARTBEAT-OFF"
@@ -489,6 +511,13 @@ def main(argv: list[str]) -> int:
         if holds_question:
             log(f"guard: {len(holds_question)} lane(s) hold a question: "
                 + ", ".join(sorted(holds_question)))
+        if _ROUTER:
+            # ⛔ AN ABSENT ROUTER MUST NOT LOOK LIKE A QUIET FLEET. #4046's guard is the thing that
+            # stops "continue" reaching a lane that asked its question in its PANE; without it this
+            # pass is back to the pre-#4046 behaviour, and a reader of the log has to be able to tell
+            # those two states apart in one line.
+            log(f"NOTE router unavailable ({_ROUTER}) — the label guard above is the ONLY question "
+                f"guard this pass; a pane-asked question can still be nudged")
         for r in rows:
             if r.get("verdict") != "WIP-IDLE":
                 continue
@@ -514,6 +543,31 @@ def main(argv: list[str]) -> int:
                 log(f"SKIP {lane} holds a question ({issue_label} carries a CURRENT "
                     f"owner-decision/question-bounced)")
                 continue
+
+            # ── THE ROUTER'S GATE (#4046) ────────────────────────────────────────────────────
+            # ⛔ NEVER SEND "continue" TO A LANE WHOSE LAST TURN ASKS A QUESTION. Two rejections
+            # carry that rule here, and neither is the generic one:
+            #   * the route is not `idle-continue` (a question, a wedge subcase, or a refusal) —
+            #     logged with the route AND the reason, so a lane that goes un-nudged has a visible
+            #     cause rather than looking idle;
+            #   * the incarnation is not provably steerable. A `pi -p` lane cannot take a second
+            #     turn at all, so a send is a no-op that still writes a marker this fleet reads back
+            #     as BUSY. An UNREAD probe refuses too, and the refusal is logged once per pass by
+            #     the `router=` NOTE below — a withheld nudge costs one tick, never the lane.
+            if _triage is not None:
+                _ev = _triage.Evidence(
+                    lane=lane,
+                    turn=_liveness.turn_from_jsonl(f) if f else None,
+                    last_text=_triage.last_text_from_jsonl(f),
+                    lane_verdict=r.get("verdict") or "",
+                    steerable=_triage.steerable(sid),
+                )
+                _may, _route = _triage.may_continue(_ev)
+                if not _may:
+                    log(f"SKIP {lane}: route={_route.route}"
+                        f"{('/' + _route.subcase) if _route.subcase else ''}"
+                        f" action={_route.action} — {_route.reason}")
+                    continue
 
             msg = build_wip_nudge(lane, r.get("issue_label") or "",
                                   int(stale // 60), r.get("recent") or [])

@@ -194,6 +194,36 @@ def asks_owner(text: str) -> str:
     return NOT_ASKED
 
 
+def last_text_from_jsonl(path: Optional[str]) -> str:
+    """The last assistant message's TEXT from a session JSONL, or "". Bounded, never whole-file.
+
+    THE one implementation of "what did this lane last say", shared by the operator CLI and by
+    `scripts/turn-end.py` — a second reader would be a second answer to a question the router's
+    whole precedence depends on, and the two would eventually disagree about a question mark.
+    """
+    if not path:
+        return ""
+    try:
+        entry, _last, _size = liveness._last_message_entry(path)
+    except Exception:                                             # noqa: BLE001
+        return ""
+    if not isinstance(entry, dict):
+        return ""
+    msg = entry.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    parts = []
+    for c in content or []:
+        if isinstance(c, dict) and c.get("type") == "text":
+            parts.append(c.get("text") or "")
+        elif isinstance(c, str):
+            parts.append(c)
+    return "\n".join(p for p in parts if p)
+
+
 # ── evidence and route ──────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Evidence:
@@ -393,6 +423,47 @@ def route(ev: Evidence) -> Route:
                  evidence="verdict=%r" % (ev.lane_verdict,))
 
 
+# ── acquisition: can this incarnation be steered at all? ──────────────────────────────────────
+# ⛔ A `pi -p` LANE CANNOT BE STEERED — one turn, no stdin, exits — so a "continue" typed at it is a
+# no-op that still writes a SENT marker, and the fleet reads that marker back as BUSY for an hour.
+# This lives here (beside `route`, like `gather()` beside `evaluate()` in `liveness.py`) so the
+# operator CLI and the nudge path measure it the SAME way instead of each guessing from a verdict.
+#
+# ⛔ `None` IS A FIRST-CLASS ANSWER AND MUST NOT BE READ AS "STEERABLE". The pid probe is the fleet's
+# own identity CLI (`scripts/lib/pid-identity.sh argv-candidates`), and an unread probe is the one
+# case where "just send it" would put a claim with no effect behind it into the marker dir.
+_PRINT_MODE = ("-p", "--print")
+
+
+def steerable(sid: Optional[str]) -> Optional[bool]:
+    """`True` (interactive) / `False` (print mode) / `None` (unread).
+
+    Read from the PROCESS'S OWN ARGV via the identity CLI — never inferred from a verdict, because a
+    verdict is what got this wrong: `WIP-IDLE` describes the turn, not the incarnation's ability to
+    receive the next one.
+    """
+    if not sid:
+        return None
+    try:
+        pids, ok = liveness.argv_candidates(sid)
+    except Exception:                                             # noqa: BLE001
+        return None
+    if not ok or not pids:
+        return None
+    import subprocess
+    for pid in pids:
+        try:
+            p = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                               capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        argv = (p.stdout or "").strip()
+        if not argv:
+            continue
+        return not any(tok in _PRINT_MODE for tok in argv.split())
+    return None
+
+
 def route_rows(rows: Sequence[dict]) -> list:
     """Route a whole `lane-status.py --json` population, preserving its evidence into each result.
 
@@ -419,6 +490,18 @@ def route_rows(rows: Sequence[dict]) -> list:
         d["lane"] = ev.lane
         out.append(d)
     return out
+
+
+def may_continue(ev: Evidence) -> tuple:
+    """`(may_send_continue, Route)` — the ONE question a nudger has to ask before it types.
+
+    Extracted so the nudge path (`scripts/turn-end.py`) and the suite ask the router the SAME
+    question instead of each re-deriving it. A caller that wants to send "continue" MUST gate on the
+    first element; the Route comes back too so the caller can record WHAT it decided and why — a
+    suppression with no reason is a lane that goes quiet for no visible cause.
+    """
+    r = route(ev)
+    return (r.route == "idle-continue" and r.action == "send-continue"), r
 
 
 def summary(routes: Sequence[dict]) -> str:

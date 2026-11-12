@@ -1029,7 +1029,20 @@ fi
 # (`pr-sickness.sh`, `lane-merge.sh`, via `scripts/orchestrator-harness/pr-state.sh`) live in `$O`,
 # which is NOT a checkout of this repo: without the farm the seam resolves nothing there and every
 # actor prints `router unavailable` — the wiring would exist and never run.
-fleet_tools=(liveness.py lane_liveness.py claim_lanes.py fleet-health.py map-sessions.py pr_state.py)
+# triage.py + triage_arms.py (#4046): the lane TRIAGE ROUTER and its three arms. Farmed for exactly
+# the reason pr_state.py is: their consumer `scripts/turn-end.py` is farmed FLAT to `$DEST/scripts`,
+# which is not a checkout — so without this entry its `$SCRIPTS/fleet/triage.py` import fails and the
+# one guard that stops "continue" reaching a lane that asked its question in its PANE silently
+# degrades to the pre-#4046 behaviour (it says so in the log rather than going quiet, but a declared
+# gap is still a gap). `triage_arms.py` rides along because `triage.py` is the decision and the arms
+# are the only consumer of `PROOFS`/`REMEDIES`: separating them would leave the farm holding a router
+# whose route table no shipped file implements.
+# ⛔ ONE LINE, AND THE CLOSING PAREN MUST END IT (#1899). `pi-bootstrap/tests/test-setup-no-nesting.sh`
+# derives this array with `sed -n 's/^fleet_tools=(\(.*\))$/\1/p'`, so a WRAPPED array reads as EMPTY and
+# the farm's whole disposition check reports "could not read the fleet_tools array" — measured on the
+# first version of this very entry, which wrapped after `pr_state.py \`. The comment at the top of this
+# block says the same thing; this is the second time it has bitten, which is why it is repeated here.
+fleet_tools=(liveness.py lane_liveness.py claim_lanes.py fleet-health.py map-sessions.py pr_state.py triage.py triage_arms.py)
 mkdir -p "$DEST/scripts/fleet"
 tools_copied=0
 for base in "${fleet_tools[@]}"; do
@@ -1051,7 +1064,7 @@ for base in "${fleet_tools[@]}"; do
     farm_missing+="scripts/fleet/$base (install failed)"$'\n'
   fi
 done
-echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions + pr-state, #1178/#1777/#2866)"
+echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions + pr-state + triage/triage-arms, #1178/#1777/#2866/#4046)"
 
 # Migration off the deprecated location (#1277). The farm used to write
 # $DEST/tools/fleet/, one of the very paths pi's startup scan rejects — so a

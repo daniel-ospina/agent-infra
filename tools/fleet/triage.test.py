@@ -582,6 +582,46 @@ def leg_records() -> None:
     ok("the record carries the evidence that decided it", bool(row["reason"]))
 
 
+def leg_wiring() -> None:
+    print("\n── WIRING — the router is CONSUMED, and its consumer cannot lose it silently ──")
+    # `may_continue` is the one predicate a nudger gates on. Pin both directions, because an arm
+    # that never fires satisfies "never nudges a question" just as well as a correct one.
+    may, r = triage.may_continue(ev(last_text="Should I merge?"))
+    ok("a question may NOT be continued", not may)
+    eq("…and the route says why", r.route, "user-question")
+    may, r = triage.may_continue(ev(last_text="Landing it now."))
+    ok("a clean idle lane MAY be continued", may)
+    may, _ = triage.may_continue(ev(last_text="Landing it now.", steerable=False))
+    ok("a `pi -p` lane may NOT be continued even when it looks idle", not may)
+    may, _ = triage.may_continue(ev(last_text="", lane_verdict="DONE-IDLE"))
+    ok("an unread tail may NOT be continued", not may)
+
+    # The farm declaration: turn-end.py is farmed FLAT and imports `$SCRIPTS/fleet/triage.py`, so a
+    # farm entry that names only one of the pair ships a router whose arms nobody has.
+    repo = os.path.dirname(HERE)
+    setup = os.path.join(os.path.dirname(repo), "pi-bootstrap", "setup.sh")
+    if os.path.exists(setup):
+        blob = open(setup, encoding="utf-8", errors="replace").read()
+        m = blob.split("fleet_tools=(", 1)
+        decl = m[1].split(")", 1)[0] if len(m) == 2 else ""
+        for needed in ("triage.py", "triage_arms.py"):
+            ok("pi-bootstrap farms %s (turn-end.py imports it from $SCRIPTS/fleet)" % needed,
+               needed in decl, decl[:120])
+    else:
+        ok("pi-bootstrap/setup.sh is present to declare the farm", False, setup)
+
+    # The consumer: turn-end.py must actually CALL the predicate. A guard that exists but is not
+    # consulted is the inert-enforcer class, and it looks identical to a working one in review.
+    te = os.path.join(os.path.dirname(repo), "scripts", "turn-end.py")
+    if os.path.exists(te):
+        blob = open(te, encoding="utf-8", errors="replace").read()
+        ok("turn-end.py consults may_continue()", "may_continue(" in blob)
+        ok("turn-end.py says so when the router is absent",
+           "router unavailable" in blob, "a silent degrade looks like a quiet fleet")
+    else:
+        ok("scripts/turn-end.py is present to be wired", False, te)
+
+
 LEGS = (
     ("precedence", leg_precedence),
     ("no-continue", leg_no_continue_to_question),
@@ -595,6 +635,7 @@ LEGS = (
     ("arm-continue", leg_arm_continue_proves_resumption),
     ("arm-wedged", leg_arm_wedged_remedies),
     ("records", leg_records),
+    ("wiring", leg_wiring),
 )
 
 
