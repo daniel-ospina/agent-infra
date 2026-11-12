@@ -2614,6 +2614,36 @@ def t61_every_slot_unusable_is_loud():
                 )
             finally:
                 race_then_refusal.destroy()
+            # ⛔ AND THE PROMOTION MESSAGE MUST BE TRUE ON THE SHAPE THAT MIXES BOTH (review P3-1): a
+            # pass that SKIPPED ten indexes and then INSTALLED one still exhausts its range with `live`
+            # below target, so this arm fires — and the first version of it claimed "every index it was
+            # allowed to ask for came back unusable, so this pass could not grow the box", while the
+            # pass had just grown it. The numbers are counted now, and this fixture is the one that
+            # reddens the old wording: 11 steps = 10 skips + 1 add.
+            mixed = Box("slot-mixed")
+            try:
+                first = mixed.install("gh-runner-x64", "r-1")
+                mixed.alive([first])
+                mixed.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+                mixed.disk(500_000)
+                _slot_provisioner(mixed, race=list(range(2, 12)), ok=[12])
+                grew = converge(mixed, nproc="8", want=3)
+                msg = next(p for p in grew["problems"] if "step budget" in p)
+                check(
+                    "grew by 1" in msg and "could not grow" not in msg,
+                    "the page must say what the pass DID, not that it could not grow: " + msg,
+                )
+                check(
+                    "11 step(s)" in msg,
+                    "…and the step count is the pass's, not the skip count: " + msg,
+                )
+                check(
+                    grew["verdict"] == "action-failed" and grew["live"] == 2,
+                    "the verdict is still loud (below target, budget spent) — and the box grew: "
+                    f"{grew['verdict']} live={grew['live']}",
+                )
+            finally:
+                mixed.destroy()
         finally:
             box.destroy()
 
@@ -5158,6 +5188,14 @@ MUTATIONS = [
         "a slot the provisioner refused to fill this pass is asked for AGAIN inside the same pass, "
         "so a `.runner`-less directory costs every one of the pass's steps — and the box never "
         "reaches the next free index (agent-infra#4004 P1-b)",
+    ),
+    Mutation(
+        "T61",
+        '            f"the fill loop exhausted its step budget ({steps_taken} step(s)) with the box still "',
+        '            f"the pass could not grow the box: {len(skipped)} of its usable steps went to unusable slots "  # MUTATION: claims what it cannot guarantee',
+        "the promotion page claims `could not grow the box` and quotes the SKIP count as the step "
+        "count, while the pass may have installed a runner before the range ran out — the shape the "
+        "review measured (review P3-1: the message must be TRUE, as T14/T18 pin elsewhere)",
     ),
     Mutation(
         "T61",

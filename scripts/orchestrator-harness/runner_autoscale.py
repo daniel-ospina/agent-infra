@@ -3610,6 +3610,8 @@ def converge(
     # replaced by a generic action-failure, and `problems` also sits above `starvation` and
     # `config-lost`. So the reason is recorded at every exit, and the post-loop arm reads it.
     stop_reason = "budget"
+    steps_taken = 0
+    live_before_fill = live
     for _step in range(max(1, target) + SLOT_SKIP_BUDGET):
         if stop_pass or live >= target or disk_free_mb is None:
             stop_reason = "target" if live >= target else "stopped"
@@ -3671,6 +3673,8 @@ def converge(
             stop_reason = "dry-run"
             break
         try:
+            steps_taken += 1  # one count per step that actually reaches the provisioner — a
+            # `--dry-run` breaks above this (it plans, it does not call), so it is not a step
             note = provision(index, repo=repo, root=root)
         except ProvisionerRefused as exc:
             # ⛔ TWO ANSWERS TO TWO DIFFERENT QUESTIONS. The installer budgets space for the WHOLE
@@ -3795,13 +3799,20 @@ def converge(
     # raced index holds a PEER's registration and heals by itself, so the note points at
     # `slots_unusable[*].why` for the provisioner's own words about each index instead of asserting one.
     if skipped and live < target and stop_reason == "budget":
+        # ⛔ THE MESSAGE MUST BE TRUE IN BOTH SHAPES (review P3-1). The first version said "spent all
+        # {len(skipped)} of its usable steps … every index it was allowed to ask for came back
+        # unusable … could not grow the box", and each of those is false on a reachable path: the
+        # step budget is `max(1, target) + SLOT_SKIP_BUDGET` (not the skip count), and a pass that
+        # skipped ten indexes and then INSTALLED one has still exhausted its range with `live` below
+        # target — it grew the box and the arm still fires. So the numbers are counted, not inferred.
         record["problems"].append(
-            f"the pass spent all {len(skipped) + 0} of its usable steps on slots the provisioner "
-            f"refused to fill ({', '.join('#' + str(i) for i in skipped)}) and the box is still "
-            f"BELOW its target (live={live}, target={target}): every index it was allowed to ask for "
-            "came back unusable, so this pass could not grow the box. Each refusal's own reason is in "
-            "`slots_unusable` — a peer's in-flight add heals by itself, a leftover path or a dangling "
-            ".runner` link needs a human (this tool never deletes a path it did not create)"
+            f"the fill loop exhausted its step budget ({steps_taken} step(s)) with the box still "
+            f"BELOW its target (live={live}, target={target}, grew by {live - live_before_fill}): "
+            f"{len(skipped)} index(es) came back unusable "
+            f"({', '.join('#' + str(i) for i in skipped)}), and the rest of the budget was not "
+            "enough to reach the target. Each refusal's own reason is in `slots_unusable` — a "
+            "peer's in-flight add heals by itself, a leftover path or a dangling `.runner` link "
+            "needs a human (this tool never deletes a path it did not create)"
         )
 
     # 7. VERDICT --------------------------------------------------------------------------------
