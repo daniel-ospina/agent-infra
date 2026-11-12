@@ -264,7 +264,12 @@ do_status() {
         case "$src" in
             0) : ;;
             5) err "REFUSING: the supervisor is STALE — it is enabled and active but has written no completed pass inside its bound (run: $SCRIPT status)"; rc=1 ;;
-            *) warn "the supervisor's status exited $src — its own verdict could not be read (run: $SCRIPT status)" ;;
+            # ⛔ ANY OTHER NON-ZERO CODE FAILS CLOSED (review P2 on #4017, reproduced). A supervisor that
+            # cannot run (126/127) or dies mid-`status` (1/2) leaves `rc` at 0 under a bare `warn`, so this
+            # verb printed "healthy" over a supervisor that answered nothing -- the same false PASS the
+            # `5` arm above exists to remove, reached by a different exit code. The contract is
+            # `0 installed/healthy`, so "I could not read its verdict" is not healthy; it says WHY instead.
+            *) err "REFUSING: the supervisor's own status could not be read (it exited $src) — run: $SCRIPT status"; rc=1 ;;
         esac
     fi
     # ⛔ THE EXIT CODE MUST CARRY THE VERDICT, NOT JUST THE LAST TEST (review #2896 round 3). `--status`

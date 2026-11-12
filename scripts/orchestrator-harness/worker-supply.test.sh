@@ -827,6 +827,14 @@ EOS
   [ "$rcs_ok" = "0" ] && ok "…and 0 when it is installed, enabled, active AND its last pass is inside the bound (the assertion is not vacuous)" \
     || bad "--status exited $rcs_ok for a healthy unit: $(tail -2 "$TMP/status-ok.out")"
   # …and the measured failure: the unit is up, the record is old. `active: yes` must NOT outvote it.
+  # …and ANY other non-zero supervisor verdict fails closed too (review P2 on #4017): a supervisor that
+  # cannot run (126/127) or dies mid-`status` used to leave the verb at 0 — "healthy" over a supervisor
+  # that answered nothing, the same false PASS the STALE arm removes, reached by a different code.
+  printf '#!/usr/bin/env bash\nexit 7\n' > "$TMP/sup-broken.sh"; chmod +x "$TMP/sup-broken.sh"
+  O="$O" SUDO=false ELDATO_PLATFORM=Linux UNIT_DIR="$TMP/units2" SYSTEMCTL="$SC" \
+    WORKER_SUPPLY_SCRIPT="$TMP/sup-broken.sh" bash "$INSTALLER" --status >"$TMP/status-broken.out" 2>&1; rcs_broken=$?
+  [ "$rcs_broken" = "1" ] && ok "…and an UNREADABLE supervisor verdict (status exited 7) fails closed (rc=1), not healthy" \
+    || bad "--status exited $rcs_broken for a supervisor whose own status could not be read (a false PASS): $(tail -2 "$TMP/status-broken.out")"
   touch -t 202601010000 "$ST/worker-supply.state"
   O="$O" SUDO=false ELDATO_PLATFORM=Linux UNIT_DIR="$TMP/units2" SYSTEMCTL="$SC" \
     WORKER_SUPPLY_SCRIPT="$SUPPLY" bash "$INSTALLER" --status >"$TMP/status-stale.out" 2>&1; rcs_stale=$?
@@ -997,12 +1005,44 @@ else
   reset
   fossil_fixture
   O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 bash "$MUT4" refill >"$TMP/k2mut.out" 2>&1; rck2=$?
-  if [ "$(record_field retired)" != "1" ] && [ "$rck2" = "6" ]; then
+  # ⛔ THE PREDICATE MUST NAME THE DISCRIMINATING VALUE (review P2 on #4017, reproduced). `!= "1"` was
+  # TRUE on the unmutated script too (it prints retired=2), so this arm reported `ok` even for a mutation
+  # that changed no behaviour at all — the `cmp -s` guard above proves the FILE changed, never that the
+  # BEHAVIOUR did. The mutant retires NOTHING, so `= "0"` is the value only it can produce.
+  if [ "$(record_field retired)" = "0" ] && [ "$rck2" = "6" ]; then
     ok "with retirement neutered the (k) assertion REDDENS: retired='$(record_field retired)', rc=$rck2 — (k) really grades retirement and not the fixture"
   else
     bad "the mutation did NOT redden (k): retired='$(record_field retired)', rc=$rck2 — the case would pass on a supervisor that defers a fossil for ever"
   fi
 fi
+
+# ── (k3) A RETIREMENT MAY NOT LAUNDER AN UNREADABLE POOL (review P1 on #4017) ────────────────────
+# ⛔ REPRODUCED BY REVIEW: the `retired` arm sat above the `unreadable` arm, so a pool of unanswerable
+# probes plus ONE retirable fossil printed `decision=retired` and exited 0 — "nothing supplied, two reads
+# not taken" reported as a healthy pass, which is the #2896 round-3 defect one decision arm over.
+echo "-- (k3) retirement does not launder an unreadable pool"
+reset
+cat > "$O/nonblocking-dispatch.sh" <<'EOS'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--status" ]; then
+  case "${2:-}" in prd-61) echo "garbage-answer-that-parses-to-nothing"; exit 0 ;; esac
+  echo "${2:-} lost (no process)"; exit 0
+fi
+exit 1
+EOS
+chmod +x "$O/nonblocking-dispatch.sh"
+mkwt "$TMP/wt/prd-61" fix/61
+mkbrief "$TMP/briefs/prd-61.txt"
+mkorder prd-61 "$TMP/wt/prd-61" fix/61 "$TMP/briefs/prd-61.txt" 2400 "2026-10-27 01:00:00"
+# the retirable one: its recorded worktree is gone, and it is older than the TTL
+mkorder prd-62 "$TMP/wt/prd-62-reaped" fix/62 "$TMP/briefs/prd-61.txt" 2400 "2026-10-27 01:00:00"
+touch -t 202601010000 "$BG/prd-61.started" "$BG/prd-62.started"
+O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >"$TMP/k3.out" 2>&1; rck3=$?
+[ "$(record_field retired)" = "1" ] && ok "the retirable fossil was still retired and counted (retired=1)" \
+                                   || bad "record retired='$(record_field retired)', expected 1"
+[ "$(record_field decision)" != "retired" ] && [ "$rck3" = "2" ] \
+  && ok "…and the pass does NOT call itself clean over the read it could not take (decision=$(record_field decision), rc=$rck3)" \
+  || bad "an unreadable pool was laundered by a retirement: decision='$(record_field decision)', rc=$rck3 (expected unreadable + 2)"
 
 # ── (m) THE HEARTBEAT: A STOPPED SUPERVISOR IS STALE, NOT QUIET (agent-infra#4007) ──────────────
 # ⛔ THE MEASURED SHAPE: a supervisor alive 16 days whose log had stopped two days earlier. Every

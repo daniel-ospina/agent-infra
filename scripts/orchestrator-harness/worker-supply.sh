@@ -729,6 +729,11 @@ pass() {
       elif retire_order "$name" "$f" "$ret_reason"; then
         retired_new=$(( retired_new + 1 )); retired=$(( retired + 1 )); dead=$(( dead - 1 ))
         log_line "$name: RETIRED (reason=$ret_reason) — its record is ${age}s old (TTL ${RETIRE_TTL_S}s) and no pass can act on it again. It leaves the pool. The composer (pr-doctor.py) re-orders the PR with a fresh record and a fresh worktree/brief if it is still open, which un-retires it (agent-infra#4007)"
+      else
+        # ⛔ AN UNWRITABLE RETIREMENT IS SAID OUT LOUD (review P2 on #4017): the order stays `dead` from the
+        # census walk, so the pass stays `deferred` -- conservative, but the REASON the fossil is still
+        # there was invisible, which is the "state nobody can act on" class this file keeps re-learning.
+        log_once "$name:retire-failed" "$name: RETIREMENT FAILED (reason=$ret_reason) — $RETIRED could not be written; the order stays dead and the pass stays DEFERRED until the state dir is writable"
       fi
       continue
     fi
@@ -876,10 +881,15 @@ pass() {
     [ "$no_record" -gt 0 ] && held="$held, $no_record had no replayable record"
     [ "$stale_brief" -gt 0 ] && held="$held, $stale_note"
     why="$refilled of $n_dead_total re-offered; $dead still dead${held}"
-  elif [ "$retired_new" -gt 0 ] && [ "$refilled" -eq 0 ]; then
+  elif [ "$retired_new" -gt 0 ] && [ "$refilled" -eq 0 ] && [ "$unknown" -eq 0 ]; then
     # ⛔ RETIRING IS A SUPPLY OUTCOME, NOT A NO-OP: the pool it walked is now action-free, so the pass is
     # clean (rc=0) and SAYS what it did. Before #4007 this same pass was `deferred` (rc=6) for ever and
     # `live=` could never become non-zero, which is the "quiet" a stopped log also produces.
+    # ⛔ AND A RETIREMENT MAY NOT BUY A CLEAN PASS OVER READS THAT FAILED (review P1 on #4017, reproduced):
+    # this arm sat ABOVE the `unreadable` arm, so a pool of two unanswerable probes plus ONE retirable
+    # fossil printed `decision=retired` and exited 0 — "nothing supplied, two reads not taken" reported as
+    # healthy, which is exactly the #2896 round-3 defect the `unreadable` arm exists to refuse. Retirement
+    # is a fact about orders we COULD read, so it only decides the verdict when every read was taken.
     decision=retired; why="$retired_new un-actionable order(s) retired; nothing left to supply ($live/$cap live, $retired retired${stale_note:+; $stale_note})"
   elif [ "$refilled" -gt 0 ]; then
     decision=refilled; why="$refilled of $n_dead_total dead order(s) re-offered${stale_note:+; $stale_note}"
