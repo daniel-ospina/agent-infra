@@ -1125,6 +1125,26 @@ assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "
 assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "the refusal names the KNOB an operator can raise (agent-infra#3995)"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a refused head scan advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a refused head scan relabelled no runner"
+# ⛔ THE WINDOW REFUSAL CARRIES THE CEILING TOO, AND IT IS THE BRANCH AN OPERATOR ACTUALLY HITS
+# (agent-infra#3995 review, F1). Only the TRUNCATED branch's note was asserted after cycle 4 deleted
+# `ghost-window-at-page` — whose 101-row page the API cannot produce — so DELETING this branch's
+# clause, or breaking either operand, left the whole suite GREEN: no surviving arm executes that line.
+# Re-fixtured to the REAL shape: the shipped bound (25), a FULL page of 100 ghosts, a queue deeper than
+# the page. The note is ungated here BY CONSTRUCTION (a bound break proves the list is longer than the
+# bound, and any list is at most one page, so a bound at or above QUEUE_PAGE cannot see past it), and
+# `scanned` is 25 in this arm — well below the page — so this arm also proves the note is NOT the
+# `scanned >= QUEUE_PAGE` conditional the TRUNCATED branch uses.
+GW_WIN="$(ghost_window_fixture "$QUEUE_PAGE_SHIPPED")"
+run_gate ghost-window-at-page GH_QUEUED="$((QUEUE_PAGE_SHIPPED + 5))" GH_INPROGRESS=0 \
+  GH_DEMAND_GHOST_IDS="${GW_WIN%%|*}" \
+  GH_QUEUE_ROWS_SPEC="${GW_WIN#*|}" \
+  CI_GATE_QUEUE_THRESHOLD=200 --
+assert_eq "$RC" "2" "a full ghost page scanned to the SHIPPED bound → exit 2 (could-not-measure)"
+assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the window refusal names its bound"
+assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound cannot pass"
+assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "…and the knob, so the operator sees both facts on one line"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a window-limited scan advanced no state file"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a window-limited scan relabelled no runner"
 # …and the bound is an OPERAND like every other one here: a zero or non-numeric value would silently
 # disarm the leg (every non-empty queue unmeasurable), so it is refused instead of defaulted.
 echo "── #2344: the head-scan bound is shape-checked like every other operand ──"
@@ -1292,15 +1312,36 @@ run_gate page-saturated GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_
   CI_GATE_QUEUE_THRESHOLD=200 --
 assert_eq "$RC" "2" "a queue deeper than the page (threshold above the page size) → exit 2"
 assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the saturation, not just a count"
-# …and this branch carries NO page-ceiling note at all, at any bound: measured, it is only reachable
-# when the scan found a head, so `scanned` is small there and the clause could never be true — it once
-# read "the candidate list is ONE page of 100 runs" over a one-row synthesised list (agent-infra#3995
-# review cycles 3-4). The assertion below is a TRIPWIRE on that, not a two-sided pin: it would only
-# fail if the clause were reintroduced here.
-assert_not_contains "$OUT" "ONE page of" "the saturated refusal carries no page-ceiling note"
+# ⛔ THIS BRANCH'S NOTE IS RESTORED, GATED ON THE BOUND — the review's option (a) (agent-infra#3995,
+# F2), chosen over option (b) "document that it was dropped". Two corrections are folded in here and
+# neither should be lost again: 4304f70c4 was right that the previous "two-sidedly pinned" claim was
+# FALSE (the branch carried no note at all, so no arm could hold the other side), and cycle 4's reason
+# for deleting it was wrong — it defended a `scanned` gate, but the clause is BOUND-gated and
+# `queued > QUEUE_PAGE` makes "no bound can see past this page" true BY CONSTRUCTION (`per_page` caps
+# at 100 and silently reduces above it). So the statement was CORRECT and its coverage was missing;
+# restoring the note is what makes the pin two-sided, rather than a tripwire over an absence.
+# Below the page the knob still has room, so the note is absent:
+assert_not_contains "$OUT" "ONE page of" "the page-ceiling note is absent at a bound BELOW the page"
 assert_contains "$OUT" "lower bound" "the refusal says WHY the head age is unusable"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated queue read advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated queue read relabelled no runner"
+# ⛔ …AND PRESENT AT THE CEILING — the half that REDS when the note is DELETED (agent-infra#3995 review,
+# F2 + F4). It is this pair, with the absence assertion above, that makes the conditional TWO-SIDED:
+# this arm reds if the bound-gated clause is removed from the refusal, and the arm above reds if it is
+# emitted UNGATED. An operator facing a queue deeper than one page needs to be told the knob cannot
+# help — `per_page` is capped at 100 and larger values are silently reduced, so no bound reads past the
+# page. ⛔ NOTE what does NOT guard it (measured in cycle 4): `page-saturated` alone cannot — the
+# clause's plain absence, and a `scanned`-gated rewrite, both leave it green because that arm refuses
+# at the same line whatever the note says.
+echo "── #3995: a SATURATED read at the page ceiling NAMES the ceiling the knob cannot pass ──"
+run_gate page-saturated-at-page GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 \
+  CI_GATE_QUEUE_THRESHOLD=200 CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_PAGE_SHIPPED" --
+assert_eq "$RC" "2" "a saturated read at the ceiling → exit 2 (still could-not-measure)"
+assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the saturation, not just a count"
+assert_contains "$OUT" "ONE page of" "a saturated read at the ceiling NAMES the ceiling"
+assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "…and the knob, so the operator sees both facts on one line"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated read at the ceiling advanced no state file"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated read at the ceiling relabelled no runner"
 # …and the saturation is NOT a new way to red the normal path: with the SHIPPED threshold the length
 # leg decides a 150-deep queue first (unhealthy -> fallback), which is the state it always was.
 run_gate page-saturated-shipped GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 --

@@ -850,6 +850,13 @@ print(comp, len(inc))
     0)            log "queue head scan bound is ZERO ('${QUEUE_HEAD_SCAN_MAX}') — a non-empty queue could never be measured, so this would disarm the leg rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
   QUEUE_GHOSTS=0
+  # ⛔ `scanned` IS INITIALISED BESIDE THE SCAN, NOT HERE (agent-infra#3995 review, F3 — the line that
+  # sat here is gone, removed by 4304f70c4). It was DEAD: every read of `$scanned` is inside the `else`
+  # block below, which assigns it (`scanned=0; scan_exhausted=1`) before its first use, and the degraded
+  # no-candidate path never expands it. The reason recorded for ADDING it — "so the degraded
+  # no-candidate path cannot hit `set -u`" — was false on both counts (it is `local`-declared at the top
+  # of `evaluate`, and nothing reads it on that path), so the durable record is corrected HERE, where
+  # the next reader looks, because that commit message is append-only.
   queued_demanding="$queued"
   DEMAND_LABELS=""
   demand_head_id=""; demand_head_created=""
@@ -1097,8 +1104,16 @@ print(age)
   # healthy and strip the pool during a full stop. Could-not-measure (2) is this script's answer for
   # every other unread operand; it is the answer here too, and the message names BOTH values so the
   # misconfiguration is visible instead of silent.
+  # ⛔ THE PAGE-CEILING NOTE BELONGS ON THIS SURFACE TOO, AND ITS GATE IS THE BOUND (agent-infra#3995
+  # review, F2 — restored, with a presence arm, after the record asserted coverage that had been
+  # deleted). `queued > QUEUE_PAGE` means the single read that produced these rows could not carry the
+  # whole queue, and `per_page` is capped at 100 with larger values SILENTLY REDUCED — so when the
+  # bound is already at the page, no bound can read past it: raising the knob is not a remedy, and an
+  # operator must be told that before concluding the refusal is a knob problem. The gate is the BOUND
+  # because below the page the ceiling is not yet what stopped the pass (the knob still has room) —
+  # the same distinction the TRUNCATED branch pins from the other side with its `scanned` gate.
   if [ "$queued" -gt "$QUEUE_PAGE" ]; then
-    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing"
+    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"
     return 2
   fi
 
