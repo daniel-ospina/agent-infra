@@ -209,6 +209,17 @@ REPO_ARG=""
 # ⛔ IT SETS `REPO_FOUND` RATHER THAN PRINTING THE PATH: the note that says WHY nothing was measured has
 # to survive the call, and a `$( )` would drop it (measured — the arm read the generic
 # `reason=no-checkout` over the specific `reason=not-a-checkout path=…` it had just produced).
+# ⛔ AND `${CELL_HOME}/agent-infra` OUTRANKS THE HARD-CODED `/tmp/cell-*` GUESSES (this change's review,
+# P2-3). Two independent reasons, one rule — an EXPLICITLY CONFIGURED location beats a literal this file
+# guessed:
+#   • correctness — `CELL_HOME` is what `cell-install.sh` sets and what the rest of this repo resolves a
+#     cell's tree with, so when it names a checkout that IS the cell's tree and it must win over a
+#     `/tmp/cell-ai` that may belong to the other repo — measuring the harness repo while the lane builds
+#     tortoise is the wrong-checkout reading this whole list exists to avoid;
+#   • hermeticity — the absolute cell paths are true on EVERY CELL, so no test arm that sets `CELL_HOME`
+#     to a fixture and expects that fixture to be measured could hold while the literals came first: it
+#     resolved the LIVE `/tmp/cell-ai` instead — a red on the boxes this gate runs on, and a `git fetch`
+#     of a live checkout from inside a suite (this change's review, P2-3, measured).
 resolve_repo() { # -> 0 and REPO_FOUND set; 1 with REPO_NOTE naming why nothing was measured
   local cand
   REPO_FOUND=""
@@ -218,13 +229,14 @@ resolve_repo() { # -> 0 and REPO_FOUND set; 1 with REPO_NOTE naming why nothing 
     REPO_NOTE="reason=not-a-checkout path=$cand"
     return 1
   done
-  for cand in "$PWD" /tmp/cell-ai /tmp/cell-t3 \
+  for cand in "$PWD" \
               "${CELL_HOME:-}${CELL_HOME:+/agent-infra}" \
+              /tmp/cell-ai /tmp/cell-t3 \
               "${HOME:-}${HOME:+/tortoise}" "${HOME:-}${HOME:+/agent-infra}"; do
     [ -n "$cand" ] || continue
     [ -e "$cand/.git" ] && { REPO_FOUND="$cand"; return 0; }
   done
-  REPO_NOTE="reason=no-checkout tried=pwd,/tmp/cell-ai,/tmp/cell-t3,CELL_HOME/agent-infra,HOME/tortoise,HOME/agent-infra"
+  REPO_NOTE="reason=no-checkout tried=pwd,CELL_HOME/agent-infra,/tmp/cell-ai,/tmp/cell-t3,HOME/tortoise,HOME/agent-infra"
   return 1
 }
 
@@ -443,7 +455,7 @@ while [ "$n" -le "$ATTEMPTS" ]; do
             # stale box as "no probe ran" and dispatched anyway.
             emit "refused why=stale-code" "answered_ms=$A_FIRST_MS attempts=$n bound=${BOUND}s $FRESHNESS max_behind=$MAX_BEHIND"
             [ "$QUIET" = "1" ] || printf '%s\n' \
-              "[$PROG] the box can complete a model call, but its checkout is more than ${MAX_BEHIND} commits behind origin/main. A lane cut from that base produces a plausible log and a WRONG diff — it re-derives what main already fixed, or reverts it (#3932). Advance the checkout (git -C <repo> pull --ff-only origin main, or the cell's deploy path) before dispatching; the reading above names the repo and the distance. Override with CELL_PREFLIGHT_MAX_BEHIND=<n> only if a stale base is genuinely intended." >&2
+              "[$PROG] the box can complete a model call, but its checkout is more than ${MAX_BEHIND} commits behind origin/main. A lane cut from that base produces a plausible log and a WRONG diff — it re-derives what main already fixed, or reverts it (#3932). Advance the checkout NAMED ON THE READING LINE, according to what it IS: a BASE checkout (a lane's worktree, a shared checkout) with `git -C <repo> pull --ff-only origin main` (or the cell's deploy path); a PR-BRANCH worktree — the fixer path — by integrating origin/main INTO the branch (`git -C <repo> merge origin/main`) and pushing. ⛔ NEVER re-cut a worktree that carries commits: on a fixer that discards the very PR it was dispatched to repair (this change's review, P2-4). Override with CELL_PREFLIGHT_MAX_BEHIND=<n> only if a stale base is genuinely intended." >&2
             exit 3
           fi
           ;;
