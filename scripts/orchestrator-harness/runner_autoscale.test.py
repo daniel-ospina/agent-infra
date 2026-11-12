@@ -2515,6 +2515,32 @@ def t60_race_is_a_skip_not_a_capacity_answer():
             rc, out = cli(box, "--want", "2")
             check(rc == 0, f"a pass that skipped one slot and converged exits 0, got {rc}: {out[:400]}")
             check("verdict=guard-conflict" not in out, f"…and never prints it: {out[:400]}")
+            # ⛔ THE SHAPE THIS FIX IS *NOT* ABOUT, pinned so the record (and the three comments that
+            # once cited it) cannot drift back to it: a 0-byte `.runner` is PRESENT to `Path.exists()`,
+            # so `_next_free_slot` SKIPS that index instead of re-asking it — the state costs ONE slot
+            # and never freezes growth. It is the CONFIG-LOST class (#3355: reported, deliberately
+            # never repaired), NOT P1-b's `.runner`-less wall. The unlink below is the non-vacuity
+            # half: the SAME path reads free once the file is gone, so the assertion is about the
+            # file's PRESENCE and not about the fixture.
+            zero_root = os.path.join(box.dir, "zerocfg")
+            zero_base = os.path.join(zero_root, "gh-runner-x64")
+            os.makedirs(zero_base, exist_ok=True)
+            box._write(os.path.join(zero_base, ".runner"), "")
+            check(
+                os.path.getsize(os.path.join(zero_base, ".runner")) == 0,
+                "fixture precondition: the `.runner` really is 0 bytes",
+            )
+            check(
+                ra._next_free_slot(zero_root) != 1,
+                "a 0-byte `.runner` reads OCCUPIED to the caller's own predicate, so its index is "
+                "SKIPPED, never re-asked — it is the CONFIG-LOST class, not P1-b's permanent wall",
+            )
+            os.unlink(os.path.join(zero_base, ".runner"))
+            check(
+                ra._next_free_slot(zero_root) == 1,
+                "non-vacuity: with the `.runner` REMOVED the same path reads FREE — so the assertion "
+                "above is about the file, not about the fixture",
+            )
         finally:
             box.destroy()
 

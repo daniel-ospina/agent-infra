@@ -323,9 +323,12 @@ fi
 # DIRECTORY into the caller's answer channel, where it became `GUARD CONFLICT … a human must decide which
 # number is wrong` on a box with disk headroom and `provisioner-refused` -> **exit 0** without. And exit 6
 # (a failure) ended the caller's fill loop, so one such directory froze the box's growth PERMANENTLY
-# (P1-b: confirmed on pi-cell-4, where retiring a 0-byte `.runner` by hand was the only thing that let the
-# box converge). 8 is the third channel: nothing was added HERE, the caller skips the index and asks for
-# the next free one — so the box keeps growing and the slot is still NAMED in its record.
+# (P1-b). 8 is the third channel: nothing was added HERE, the caller skips the index and asks for the next
+# free one — so the box keeps growing and the slot is still NAMED in its record.
+# ⛔ THE FREEZE STATE IS A `.runner`-LESS PATH (case 18) OR A DANGLING `.runner` LINK (18b) — NOT a 0-byte
+# `.runner`, which reads PRESENT to this file's `-e` guard and PRESENT to the caller's `exists()`, so it
+# costs that one slot and never loops. Its class is CONFIG-LOST (#3355: reported, deliberately never
+# repaired), and case 18c PINS that boundary so the two shapes cannot be conflated again.
 # The leftover exists BEFORE the call — that is the fact separating it from the race in case 20.
 mkdir -p "$RUNNER_ROOT/gh-runner-x64-5"
 out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_preclaimed 4) bash "$SUT" --count 5 --fallback auto 2>&1); rc=$?
@@ -359,6 +362,25 @@ check "a wedged slot (link cleared) is still SLOT-UNUSABLE, not a claim of provi
 case "$out" in
   *added=1*) bad "a wedged slot never claims to have provisioned";;
   *) ok "a wedged slot never claims to have provisioned";;
+esac
+
+# 18c. ⛔ THE BOUNDARY THE FIELD HISTORY IS ABOUT, PINNED EXECUTABLY: a 0-byte `.runner` is NOT
+# slot-unusable. It is PRESENT to this file's `-e` pre-call guard, so the requested slot is the idempotent
+# skip (exit 0, added=0) and the POOL TOOL IS NEVER CALLED — it cannot reach the rc-4 arm that exits 8,
+# so it cannot be the freeze P1-b fixes (18's `.runner`-less directory, or 18b's dangling link). Its own
+# class is CONFIG-LOST (#3355): `discover()` reports it, nothing repairs it. ⛔ THE ASSERTION IS THE POINT:
+# a change that read an EMPTY `.runner` as ABSENT here would keep 18/18b green while turning a dead slot
+# into a SECOND install over the top, and it would restore exactly the misattribution this case documents.
+ZERO="$RUNNER_ROOT/gh-runner-x64-10"; mkdir -p "$ZERO"; : > "$ZERO/.runner"
+: > "$TMP/calls.log"
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 10 --fallback auto 2>&1); rc=$?
+check "a 0-byte .runner is the idempotent skip (0) — never SLOT-UNUSABLE (8), never a provision" 0 "$rc" \
+  "provisioned slot=10 name=gh-runner-x64-10 root=$RUNNER_ROOT added=0 skipped=1 already-registered" "$out"
+calls=$(wc -l < "$TMP/calls.log" | tr -d ' ')
+check "…the pool tool is NEVER CALLED for it (that is WHY rc 8 is unreachable for this shape)" 0 "$calls"
+case "$out" in
+  *guard-refused*|*added=1*) bad "a 0-byte .runner must never be named a refused slot or a provision — it is CONFIG-LOST (#3355), not P1-b's freeze";;
+  *) ok "a 0-byte .runner is never named a refused slot or a provision (CONFIG-LOST, not P1-b's freeze)";;
 esac
 
 # 19. ⛔ rc 2 IS NOT ONLY "nothing attempted". The pool returns 2 from `add` in TWO states, and one of

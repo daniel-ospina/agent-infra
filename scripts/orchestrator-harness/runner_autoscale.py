@@ -2906,10 +2906,18 @@ def _next_free_slot(root: str, skip: frozenset[int] | None = None) -> int:
     The same predicate that keeps one call one addition also made a `.runner`-less directory a
     PERMANENT wall: the installer refuses that path (`name is taken`), `discover()`/`reconcile` never
     enumerate it, nothing retires it, so this function returned the SAME index on every pass for
-    ever and `live` never moved — measured on pi-cell-4, where retiring a 0-byte `.runner` by hand
-    was the only thing that let the box converge. `skip` is the indexes the PROVISIONER itself told
-    us it cannot fill (rc 8) during THIS pass; passing the next free one is still ONE call = ONE
+    ever and `live` never moved. TWO states are invisible to this predicate, and both loop: a
+    leftover DIRECTORY with no `.runner` (a SIGKILLed `add`), and a DANGLING `.runner` symlink —
+    `Path.exists()` follows the link and answers False, so the index reads FREE here while the pool
+    tool's own `[ -e ] || [ -L ]` calls it REGISTERED. `skip` is the indexes the PROVISIONER itself
+    told us it cannot fill (rc 8) during THIS pass; passing the next free one is still ONE call = ONE
     addition, because the adapter adds exactly the index it is given.
+
+    ⛔ A 0-BYTE `.runner` IS NOT ONE OF THEM, and the field history must not be read as if it were.
+    `Path.exists()` is True for a zero-length REGULAR file, so such an index is SKIPPED, never
+    re-asked: one slot costs one slot and the pass moves on. Its class is CONFIG-LOST (a `.runner`
+    whose configuration was destroyed — reported, and deliberately never repaired, #3355), so
+    neither this function nor P1-b's skip set reaches it, and this change does not repair it.
     """
     base = Path(os.environ.get("RUNNER_AUTOSCALE_BASE") or (Path(root) / "gh-runner-x64"))
     skipped = skip or frozenset()

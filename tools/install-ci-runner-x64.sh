@@ -369,11 +369,15 @@ case "$rc" in
      # `ci_runner_pool.sh`'s EXIT block (:174-175) classifies it as "name not available (that name is
      # taken; nothing changed, try another name)". The box did not answer a capacity question;
      # SOMETHING IS SITTING ON THE SLOT THE CALLER WILL ASK FOR. `_next_free_slot` tests only
-     # `.runner`, so a wedge or a dangling link made the caller re-ask the SAME index for ever and
-     # `live` never moved — ONE unusable slot froze the box's growth permanently (agent-infra#4004
-     # P1-b, confirmed in the field: pi-cell-4 carried a 0-byte `.runner` and retiring it by hand was
-     # the only thing that let the box converge). Mapping these to 2 put them in the caller's answer
-     # channel instead: `GUARD CONFLICT … a human must decide which number is wrong (#9672)` over a
+     # `.runner`, so a `.runner`-less DIRECTORY or a DANGLING link made the caller re-ask the SAME
+     # index for ever and `live` never moved — ONE unusable slot froze the box's growth permanently
+     # (agent-infra#4004 P1-b; those are the two shapes the rc-4 arms below answer).
+     # ⛔ A 0-BYTE `.runner` IS NOT ONE OF THEM, and the field history must not be read as if it were:
+     # the `-e` pre-call guard ABOVE answers `already-registered` for that shape before the pool tool is
+     # even invoked, so this arm is UNREACHABLE for it. Its class is CONFIG-LOST (a `.runner` whose
+     # configuration was destroyed — reported, deliberately never repaired, #3355), and this change does
+     # not repair it; a zero-length `.runner` costs that ONE slot and the pass moves on.
+     # Mapping these to 2 put them in the caller's answer channel instead: `GUARD CONFLICT … a human must decide which number is wrong (#9672)` over a
      # slot a peer had merely won the race for, and `provisioner-refused` → **exit 0** when the disk
      # arm also declined — a box that can never provision reporting a CLEAN pass (agent-infra#4004
      # P1-a). Exit 8 is the third channel: nothing was added HERE, the caller skips this index and
