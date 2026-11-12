@@ -465,6 +465,58 @@ def lanes_with_open_question(known_lanes=None) -> set:
     return out
 
 
+def suppress_and_route(lane: str, route) -> None:
+    """The loop's non-nudge branch, extracted so it can be TESTED as the branch it is.
+
+    ⛔ SUPPRESSING THE NUDGE IS NOT ROUTING THE QUESTION (round 4, #4046 P1). Until this branch
+    existed, every arm was reachable only by a hand-run CLI and a test fixture: nothing in production
+    ever created the question lane, so the issue's second requirement was delivered by no running code
+    and a lane that asked was silently un-nudged — which looks exactly like a lane that needs nothing.
+
+    Extracted from the loop for the same reason `route_gate` was: `main()` shells out to
+    `lane-status.py` and cannot be driven hermetically, so a branch left inline is a branch no test
+    can fail. The suite drives THIS and asserts that only a `user-question` route reaches the arms.
+    """
+    log(f"SKIP {lane}: route={route.route}"
+        f"{('/' + route.subcase) if route.subcase else ''}"
+        f" action={route.action} — {route.reason}")
+    if route.route == "user-question":
+        _apply_question_route(lane)
+
+
+def _apply_question_route(lane: str, timeout: int = 300) -> None:
+    """Route ONE lane's question through `scripts/lane-route.py --apply`, bounded, and log the result.
+
+    ⛔ ONE LANE, NOT THE FLEET. `--lane` scopes the CLI to this row, so a tick cannot re-route every
+    other asking lane as a side effect of one decision, and the CLI's own record makes a repeat call
+    a no-op (`already-routed`), so a lane that keeps asking is not re-sent every tick.
+
+    ⛔ IT CANNOT RAISE INTO THE TICK. A routing failure must not stop the nudger — the worst case is
+    the previous behaviour (suppress the nudge and log), and it is LOGGED with the reason so a
+    question that never reaches the panel has a visible cause.
+    """
+    cli = os.path.join(SCRIPTS, "lane-route.py")
+    if not os.path.exists(cli):
+        log(f"ROUTE-SKIP {lane}: lane-route.py is not on this box ({cli}) — the question was NOT "
+            f"routed, and this nudge is suppressed rather than sent")
+        return
+    try:
+        p = subprocess.run([sys.executable or "python3", cli, "--apply", "--json", "--lane", lane],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"ROUTE-SKIP {lane}: lane-route.py failed ({exc.__class__.__name__}) — question NOT routed")
+        return
+    res = {}
+    try:
+        blob = json.loads(p.stdout or "[]")
+        res = (blob[0].get("result") or {}) if isinstance(blob, list) and blob else {}
+    except (ValueError, AttributeError):
+        res = {}
+    ok = bool(res.get("verified"))
+    log(f"ROUTE {lane}: {res.get('action') or '?'} verified={str(ok).lower()} "
+        f"rc={p.returncode} — {(res.get('detail') or '')[:160]}")
+
+
 def route_gate(row, session_path=None):
     """`(may_nudge, Route)` for a `lane-status.py` row — the ONE place this file asks the router.
 
@@ -582,9 +634,7 @@ def main(argv: list[str]) -> int:
             if _triage is not None:
                 _may, _route = route_gate(r, f)
                 if not _may:
-                    log(f"SKIP {lane}: route={_route.route}"
-                        f"{('/' + _route.subcase) if _route.subcase else ''}"
-                        f" action={_route.action} — {_route.reason}")
+                    suppress_and_route(lane, _route)
                     continue
 
             msg = build_wip_nudge(lane, r.get("issue_label") or "",

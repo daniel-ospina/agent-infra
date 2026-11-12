@@ -38,7 +38,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
+import time
 
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
@@ -112,10 +114,30 @@ class Proof:
     detail: str = ""
     artifact: dict = field(default_factory=dict)
     sent: bool = False          # whether anything was typed — never a substitute for `verified`
+    # ⛔ `verified` MEANS TWO DIFFERENT THINGS, SO SAY WHICH (round 4, #4046 P2). For an effect arm it
+    # is "the artifact shows the effect"; for a reading arm (`wait`/`inspect`/`refuse`/`none`) it is
+    # only "the reading was produced", which is true of every lane including one that was never read.
+    # A reader grepping `verified: true` could not tell them apart, so the record carries the
+    # distinction instead of relying on the reader having opened this module.
+    asserts_lane: bool = True
 
     def as_dict(self) -> dict:
         return {"action": self.action, "proof": self.proof, "verified": self.verified,
+                "asserts_lane": self.asserts_lane,
                 "detail": self.detail, "sent": self.sent, "artifact": self.artifact}
+
+
+def _sent_to(surface: Surface, ws: str) -> bool:
+    """Did this surface type ANYTHING into the owning lane's workspace? A fact, not a constant.
+
+    ⛔ (round 4, #4046 P1). The artifact used to hardcode `owner_lane_sent_anything: False`, so the
+    one property the issue is most explicit about — the owning lane WAITS — was documented in the
+    record by a constant that could never read `True`. It is derived from the surface's own send
+    record now, so a future change that "helpfully" nudges the owner lane turns this field true
+    instead of leaving the record asserting the opposite.
+    """
+    last = getattr(surface, "last_sent", None)
+    return bool(last) and ws in last
 
 
 def _digest(text: str) -> str:
@@ -193,7 +215,8 @@ def mandate_missing(brief: str) -> list:
 
 
 # ── arm 1: the user-question lane ──────────────────────────────────────────────────────────────
-def arm_user_question(ws: str, lane: str, question: str, surface: Surface) -> Proof:
+def arm_user_question(ws: str, lane: str, question: str, surface: Surface,
+                      poll=None) -> Proof:
     """Route a waiting lane's question to the dedicated question lane, and prove it landed ROUTED.
 
     The proof is `question-lane-ack`, and it is taken at the artifact in three parts:
@@ -232,28 +255,58 @@ def arm_user_question(ws: str, lane: str, question: str, surface: Surface) -> Pr
                      "could not resolve or create the question workspace %r" % QUESTION_LANE,
                      {"lane": lane, "owner_ws": ws})
 
-    moved = surface.move_workspace(qws, QUESTION_LANE_INDEX)
+    moved_rc = surface.move_workspace(qws, QUESTION_LANE_INDEX)
     sent = surface.send(qws, brief)
 
-    # (2) the mandate, read back at the artifact: the SENT text is what counts, and the surface
-    # reports the text it typed (a transport that silently truncated is the #1187 class).
-    # ⛔ THE RESIDUAL, STATED RATHER THAN IMPLIED (round 2, #4046 P2): this is a real read-back only for
-    # a surface that records what it typed. `CmuxSurface.send` does (`last_sent`), so production takes
-    # the honest path; a surface that keeps no record falls back to the composed brief, i.e. the check
-    # degenerates to a self-check — which is why the surface is REQUIRED to record it and
-    # `test_the_surface_records_what_it_typed` pins `CmuxSurface.send` to do so.
-    sent_text = getattr(surface, "last_sent", {}).get(qws, brief)
-    still_missing = mandate_missing(sent_text)
-    verified = bool(sent and moved and not still_missing)
-    reason = ("landed with the full mandate" if verified else
-              "move failed" if not moved else
+    # (1) ⛔ THE INDEX IS RE-READ, NOT INFERRED FROM THE MOVE'S RETURN CODE (round 4, #4046 P0).
+    # `move_workspace` is `rc == 0` from `cmux workspace move`. A move that reports success and a
+    # listing that still shows the lane at index 3 are exactly the pair this proof has to be able to
+    # tell apart, and the first version could not: measured, deleting the `moved` term from the
+    # predicate left the suite at its exact baseline. So the artifact is the LISTING.
+    after = surface.list_workspaces()
+    idx = None
+    if after:
+        for sp in after:
+            if sp.get("id") == qws:
+                idx = sp.get("index")
+                break
+
+    # (2) ⛔ THE PANE IS READ BACK, NOT THE TEXT THIS FUNCTION JUST TYPED (round 4, #4046 P0). The
+    # declared artifact is `question-lane-ack`: the pane the owner will READ carries the mandate. The
+    # first version read `surface.last_sent`, which is the flattened string `send` passed to cmux —
+    # a transport that truncated on the way in still records the full text, so the check could not
+    # fail for the reason it exists (#1187 class). `sent_text` stays as a CROSS-CHECK, never as the
+    # artifact: a pane that shows the mandate and a send that typed a different body is also a
+    # defect, and the record names both.
+    sent_text = getattr(surface, "last_sent", {}).get(qws, "")
+    pane_missing = ["(pane unreadable)"]
+    pane = None
+    for attempt in range(3):
+        pane = surface.screen_tail(qws, 60)
+        if pane is not None:
+            pane_missing = mandate_missing(pane)
+            if not pane_missing:
+                break
+        if attempt < 2:
+            (poll or time.sleep)(1.0)
+
+    moved = bool(moved_rc) and idx == QUESTION_LANE_INDEX
+    verified = bool(sent and moved and pane is not None and not pane_missing)
+    reason = ("landed at index %d with the full mandate visible on the pane" % (idx,)
+              if verified else
+              "move reported %r but the listing puts the lane at index %r (want %d)"
+              % (moved_rc, idx, QUESTION_LANE_INDEX) if not moved else
               "send failed" if not sent else
-              "the text received lacks mandate tokens: %s" % ", ".join(still_missing))
+              "the question pane could not be read — a lane nothing can read is not a routed "
+              "question" if pane is None else
+              "the PANE lacks mandate tokens: %s" % ", ".join(pane_missing))
     return Proof("route-to-question-lane", triage.PROOFS["route-to-question-lane"], verified, reason,
                  {"lane": lane, "owner_ws": ws, "question_ws": qws, "created": created,
-                  "index": QUESTION_LANE_INDEX, "moved": moved, "sent": sent,
-                  "brief_sha": _digest(brief), "mandate_missing": still_missing,
-                  "owner_lane_sent_anything": False},
+                  "index": idx, "index_want": QUESTION_LANE_INDEX, "move_rc": moved_rc,
+                  "moved": moved, "sent": sent, "brief_sha": _digest(brief),
+                  "pane_missing": pane_missing,
+                  "sent_text_missing": mandate_missing(sent_text),
+                  "owner_lane_sent_anything": _sent_to(surface, ws)},
                  sent=sent)
 
 
@@ -285,6 +338,32 @@ def arm_continue(ws: str, lane: str, surface: Surface, bound_s: float = RESUME_B
 
 
 # ── arm 3: the wedged subcases ────────────────────────────────────────────────────────────────
+# ⛔ THE PROMPT IS DETECTED BY ORDER, NOT BY PRESENCE (round 4, #4046 P1). `cmux_dispatch.py:723-757`
+# (`boot_blocked`) is the tool this arm claims to reuse, and it documents the trap the presence test
+# walks into: pi renders inline, so once the prompt has been SATISFIED the line stays visible above
+# the input box for the life of the session ("observed live: 62 lines from the end of an 80-line
+# capture on a healthy pane"). A presence test therefore reports "the boot prompt is STILL on the
+# pane" for every REPAIRED lane, forever — a false negative on the arm that is supposed to prove the
+# repair. The rule is the dispatcher's: blocked iff the marker exists with NO status bar after it,
+# because the bar is drawn only once the prompt has been satisfied, for the CURRENT process.
+BOOT_BLOCK_MARKER = "Press any key to continue"
+# pi's stats line is `42.0%/700k (auto)`-shaped; only its ORDER against the marker is used.
+_STATS_RE = re.compile(r"\d+(?:\.\d+)?\s*%\s*/\s*\d")
+
+
+def _boot_blocked(screen: Optional[str]):
+    """`True` blocked, `False` ready, `None` unreadable. None is never a green light."""
+    if screen is None:
+        return None
+    marker_at = screen.rfind(BOOT_BLOCK_MARKER)
+    if marker_at < 0:
+        return False
+    last_bar = None
+    for m in _STATS_RE.finditer(screen):
+        last_bar = m.start()
+    return last_bar is None or last_bar < marker_at
+
+
 def arm_boot_prompt(ws: str, lane: str, surface: Surface, dispatch) -> Proof:
     """The boot-prompt subcase: REUSE the dispatcher's own dismiss-and-resend, then read the pane.
 
@@ -294,9 +373,8 @@ def arm_boot_prompt(ws: str, lane: str, surface: Surface, dispatch) -> Proof:
     status, and the PROOF is the pane no longer showing the prompt.
     """
     rc = dispatch(ws, lane)
-    screen = surface.screen_tail(ws, 40)
-    blocked = None if screen is None else ("press any key" in screen.lower()
-                                           or "boot-block" in screen.lower())
+    screen = surface.screen_tail(ws, 60)
+    blocked = _boot_blocked(screen)
     verified = bool(rc in (0, 4)) and blocked is False
     return Proof("repair-boot-prompt", triage.PROOFS["repair-boot-prompt"], verified,
                  ("dispatcher rc=%s and the prompt is gone" % (rc,)) if verified else
@@ -309,37 +387,66 @@ def arm_boot_prompt(ws: str, lane: str, surface: Surface, dispatch) -> Proof:
                  sent=rc in (0, 4))
 
 
-def arm_child(lane: str, child: dict) -> Proof:
-    """The child subcases: name the child record and hand it to its own owner — never kill here.
+def handoff_path(state_dir: str, lane: str) -> str:
+    return os.path.join(state_dir, "%s-child-handoff.json" % (lane or "lane",))
+
+
+def arm_child(lane: str, child: dict, state_dir: Optional[str] = None) -> Proof:
+    """The child subcases: WRITE the child's record down and hand it over — never kill here.
 
     ⛔ THE KILL IS NOT THIS ARM'S. `lane-status.py`'s CHILD-STUCK is measured twice on record as a
     false positive (a merge rail, a nested-worktree child writing at 0.0m/0.1m), and the fleet's
     reaping rule is three gates plus *"report, do not reap"* when a read is unclear. So the remedy is
-    a named hand-off: the child's own record, so `pi-done-not-exited.py` (the audited reaper) or the
-    operator inherits a diagnosis instead of a mystery. The proof is that the record is READ and
-    NAMED — an artifact, not an intention.
+    a named hand-off, so `pi-done-not-exited.py` (the audited reaper) or the operator inherits a
+    diagnosis instead of a mystery.
 
-    ⛔ THE PRODUCER'S OWN KEY SET, NOT A GUESSED ONE (round 3, #4046 P1). `lane-status.py:1586-1590`
-    emits `dict(call_id=…, ts=…, age=…, abandoned=…, cwd=…, task=…, agent=…)`. The first version read
-    `pid` / `sid` / `name`, NONE of which the producer emits, so the arm answered "the child could not
-    be named" 100% of the time on a record that DID name it — and its sibling path synthesised a name
-    from the state word, which reported `verified=True` off `{'name': 'stuck'}`. `call_id` is the
-    child's identity in the harness's own records, so it is the one that proves a record was READ.
+    ⛔ THE PROOF IS THE WRITTEN RECORD, NOT THE PRESENCE OF A FIELD (round 4, #4046 P0). This arm was
+    reporting `verified=True` off `bool(named)` — a field's PRESENCE in a dict the arm never touched —
+    while `PROOFS["repair-child"]` promised `child-record`, "the child's own record changed". Nothing
+    changed, nothing was written, and the artifact was byte-identical afterwards: a claim presented as
+    an effect, which is the one class this whole module exists to remove. The artifact is now a file
+    this arm WRITES and RE-READS, and `verified` requires the re-read to carry the same child.
+
+    ⛔ THE PRODUCER'S OWN KEY SET (round 3, #4046 P1). `lane-status.py:1586-1590` emits
+    `call_id / ts / age / abandoned / cwd / task / agent`; `name` / `pid` / `sid` / `label` are not
+    among them, so accepting those let a caller certify a dict no producer can produce.
     """
-    # ⛔ ONLY THE KEYS THE PRODUCER ACTUALLY EMITS. `name` / `pid` / `sid` / `label` are NOT among
-    # them, so accepting them left a false-PASS door open: measured after the round-3 fix,
-    # `arm_child("L", {"name": "stuck"}).verified` was still `True` — the synthesis was gone from
-    # `execute()`, but the arm would still certify a dict no producer can produce. The proof is that a
-    # RECORD was read, so it must be keyed on a field only a real record carries.
     named = [k for k in ("call_id", "agent", "task") if (child or {}).get(k)]
-    known = bool(named)
-    who = ((child or {}).get("call_id") or (child or {}).get("agent") or (child or {}).get("task"))
-    return Proof("repair-child", triage.PROOFS["repair-child"], known,
-                 ("child record READ and handed over (%s; fields=%s) — this arm signals nothing"
-                  % (who, ",".join(named))) if known else
-                 "the child could not be named from the evidence — nothing to hand off, and no kill "
-                 "is authorised on an unread child",
-                 {"lane": lane, "child": dict(child or {}), "fields": named})
+    if not named:
+        return Proof("repair-child", triage.PROOFS["repair-child"], False,
+                     "the child could not be named from the evidence — nothing to hand off, and no "
+                     "kill is authorised on an unread child",
+                     {"lane": lane, "child": dict(child or {}), "fields": []})
+    if not state_dir:
+        return Proof("repair-child", triage.PROOFS["repair-child"], False,
+                     "no state directory — a hand-off that is not WRITTEN is not a hand-off",
+                     {"lane": lane, "child": dict(child or {}), "fields": named})
+    who = child.get("call_id") or child.get("agent") or child.get("task")
+    path = handoff_path(state_dir, lane)
+    os.makedirs(state_dir, exist_ok=True)
+    row = {"kind": "child-handoff", "lane": lane, "child": dict(child or {}), "named": named}
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(row, fh, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+    # RE-READ: the written file is the artifact, so its CONTENT is what verifies — not the write call.
+    try:
+        with open(path) as fh:
+            back = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return Proof("repair-child", triage.PROOFS["repair-child"], False,
+                     "the hand-off record could not be read back: %s" % (exc,),
+                     {"lane": lane, "child": dict(child or {}), "fields": named, "path": path})
+    got = (back.get("child") or {})
+    same = all(got.get(k) == child.get(k) for k in named)
+    return Proof("repair-child", triage.PROOFS["repair-child"], bool(same),
+                 ("child record WRITTEN and re-read from %s (%s; fields=%s) — this arm signals "
+                  "nothing and kills nothing" % (path, who, ",".join(named))) if same else
+                 "the hand-off record at %s does not carry the child it claims — read %r"
+                 % (path, got),
+                 {"lane": lane, "child": dict(child or {}), "fields": named, "path": path,
+                  "read_back": got})
 
 
 def arm_rerun(lane: str, ws: str, relaunch) -> Proof:
@@ -369,20 +476,24 @@ def arm_reading(action: str, reason: str, extra: Optional[dict] = None) -> Proof
     produced — it never asserts anything about the lane.
     """
     ok = bool((reason or "").strip())
+    # ⛔ `asserts_lane=False` (round 4, #4046 P2): `verified` here means the READING was produced,
+    # and every path in this module produces one — including `refuse`, which is what an unread lane
+    # gets. Without the flag, `verified: true` on a lane nothing was done to reads as an effect.
     return Proof(action, triage.PROOFS.get(action, "written-reading"), ok,
                  (reason or "NO REASON GIVEN — a withheld arm must say why"),
-                 dict(extra or {}))
+                 dict(extra or {}), asserts_lane=False)
 
 
 def execute(route, ev, surface: Surface, *, ws: str = "", dispatch=None, relaunch=None,
-            poll=None, bound_s: float = RESUME_BOUND_S, child: Optional[dict] = None) -> Proof:
+            poll=None, bound_s: float = RESUME_BOUND_S, child: Optional[dict] = None,
+            state_dir: Optional[str] = None) -> Proof:
     """Dispatch one Route to its arm. Total over `triage.REMEDIES` + the router's own actions."""
     if not route.complete:
         return arm_reading("refuse", "route is not executable: route=%r action=%r proof=%r"
                            % (route.route, route.action, route.proof))
     action = route.action
     if action == "route-to-question-lane":
-        return arm_user_question(ws, ev.lane, ev.last_text, surface)
+        return arm_user_question(ws, ev.lane, ev.last_text, surface, poll=poll)
     if action == "send-continue":
         return arm_continue(ws, ev.lane, surface, bound_s=bound_s, poll=poll)
     if action == "repair-boot-prompt":
@@ -393,7 +504,7 @@ def execute(route, ev, surface: Surface, *, ws: str = "", dispatch=None, relaunc
         # `verified=True` off the literal string `'stuck'` — a false PASS on a proof (`child-record`)
         # that was never read. An absent record is now absent: the arm says so, and verification
         # requires a field the producer actually emits.
-        return arm_child(ev.lane, child or {})
+        return arm_child(ev.lane, child or {}, state_dir=state_dir)
     if action == "rerun":
         return arm_rerun(ev.lane, ws, relaunch)
     return arm_reading(action, route.reason,

@@ -668,7 +668,8 @@ script:cloud-cell-supervisor.sh script:cmux_dispatch.py script:conflict-rebase-t
 script:conflict-rebase.py script:disk-reaper-run.sh script:disk-reaper.sh script:fleet-cost-report.sh
 script:fleet-schedule.py script:goal-state.py script:harness-apply-pass.sh script:heartbeat-loop.sh
 script:install-ci-runner-x64.sh script:install-controller-service.sh script:lane-actions.py
-script:lane-guard.py script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py
+script:lane-guard.py script:lane-relaunch.py script:lane-route.py script:lane-scan-fallback.sh
+script:lane-status.py script:lane-watchdog.py
 script:merge-queue.py script:objective.py script:orchestrator-heartbeat.sh script:pi-cache-reap.sh
 script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh script:pr-doctor-trigger.py
 script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py script:reap-lane-venvs.sh

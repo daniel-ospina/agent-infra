@@ -206,10 +206,14 @@ def evidence_for(row, read_text=True, read_screen=False, surface=None):
         child_state = "overdue"
     boot = None
     if read_screen and surface is not None and row.get("ws"):
-        screen = surface.screen_tail(row["ws"], 40)
-        if screen is not None:
-            low = screen.lower()
-            boot = ("press any key" in low) or ("boot-block" in low)
+        # ⛔ ORDER, NOT PRESENCE (round 4, #4046 P1) — the SAME rule the arm applies, imported from the
+        # module that owns it rather than re-derived. The first version tested presence of "press any
+        # key", which `cmux_dispatch.boot_blocked` explicitly documents as wrong (a satisfied prompt
+        # stays in scrollback for the life of the session), and it also looked for "boot-block", a
+        # string pi never prints. A presence test here classifies every healthy lane as blocked.
+        boot = triage_arms._boot_blocked(surface.screen_tail(row["ws"], 60))
+        if boot is None:
+            boot = None
     last_text = triage.last_text_from_jsonl(path) if read_text else ""
     return triage.Evidence(
         lane=row.get("lane") or "",
@@ -355,13 +359,36 @@ def main(argv):
             # line, because what it is recovering is a lane, not a decision.
             os.makedirs(os.path.join(a.state, "lane-route"), exist_ok=True)
             payload = triage_arms.payload_for(r, ev, extra["ws"])
+            # ⛔ A ROUTE IS APPLIED ONCE, NOT ONCE PER TICK (round 4, #4046 P1). `turn-end.py` now
+            # invokes this CLI for a lane that asked, and it ticks — so without this guard the same
+            # brief would be typed into the question lane every tick, and the owner's panel would
+            # fill with duplicates of one question. The record on disk is the guard: same lane, same
+            # route, same payload digest => already routed, and the second call says so.
+            prev = triage_arms.record_path(a.state, ev.lane)
+            if r.action == "route-to-question-lane" and os.path.exists(prev):
+                try:
+                    with open(prev) as fh:
+                        old = json.load(fh)
+                except (OSError, ValueError):
+                    old = {}
+                old_res = (old.get("result") or {})
+                if (old.get("route") == r.route
+                        and (old_res.get("artifact") or {}).get("brief_sha")
+                        == triage_arms._digest(payload)):
+                    item["result"] = {"action": "already-routed", "proof": r.proof,
+                                      "verified": True, "asserts_lane": False,
+                                      "detail": "this exact brief is already on the question lane "
+                                                "(%s) — not re-sent" % (old_res.get("detail") or ""),
+                                      "sent": False, "artifact": {"dedupe": "brief_sha"}}
+                    out.append(item)
+                    continue
             brief = os.path.join(a.state, "lane-route", "payload.txt")
             with open(brief, "w") as fh:
                 fh.write(payload)
             proof = triage_arms.execute(
                 r, ev, surface, ws=extra["ws"], child=extra["child"],
                 dispatch=_make_dispatch(brief), relaunch=_make_relaunch(),
-                poll=_make_poll(surface),
+                poll=_make_poll(surface), state_dir=a.state,
             )
             triage_arms.write_record(a.state, ev.lane, r, proof)
             item["result"] = proof.as_dict()

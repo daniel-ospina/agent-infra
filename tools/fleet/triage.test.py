@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -105,6 +106,13 @@ QUESTION_TEXTS = [
     "I need approval before merging.",
     "Everything is green. I'll land it once you approve.",
     "Done. Tell me if the merge should wait.",
+    # ⛔ THE GO-AHEAD FAMILY (round 4, #4046 P0). Measured through `route_gate` before the fix, 10 of
+    # 10 realistic approval asks returned `may_nudge=True` and `turn-end.py` typed "continue" into a
+    # lane waiting on the owner. These four are the ones that were still open after round 3.
+    "Migration written and tested. I'll wait for your go-ahead before applying it to prod.",
+    "Blocked on your decision.\n\nEverything else is green.",
+    "Let me know if you want the migration run.\n\nSuite is green.",
+    "The rollout is staged.\n\nWaiting to hear whether to proceed.",
 ]
 
 
@@ -125,6 +133,24 @@ def leg_precedence() -> None:
 
     wedged_and_idle = ev(lane_verdict="CHILD-STUCK", steerable=True)
     eq("wedged beats idle", triage.route(wedged_and_idle).route, "wedged")
+
+    # ⛔ A QUESTION ON AN OPEN TURN MUST NOT BE RELAUNCHED (round 4, #4046 P1). `liveness.Turn(True,
+    # "turn-open:no-terminal-stop")` — a turn that carries text but no terminal stop, the
+    # crash/hang-mid-write shape — falls through the question arm (which requires a RESTING boundary)
+    # into the wedge ladder, and `open-turn-never-closes`'s remedy is `rerun`. Measured before the
+    # veto: 27 of 468 enumerated combinations reached a lane-destroying action from a lane that had
+    # asked. A relaunch destroys the question exactly as a "continue" answers it wrongly.
+    for verdict in ("WEDGED", "DONE-IDLE", "", "UNKNOWN"):
+        q_open = ev(turn=TURN_OPEN, last_text="Should I merge, or wait?", lane_verdict=verdict,
+                    steerable=True)
+        rq = triage.route(q_open)
+        ok("an open turn that ASKS is never rerun (verdict=%r)" % (verdict,),
+           rq.action != "rerun", "%s/%s" % (rq.route, rq.action))
+    # and the positive control: no question, same evidence, the wedge remedy is still reachable
+    nq_open = ev(turn=TURN_OPEN, last_text="Working through the ladder.", lane_verdict="WEDGED",
+                 steerable=True)
+    eq("…while a non-questioning open wedge still routes to its own remedy",
+       triage.route(nq_open).action, "rerun")
 
     # and the ordering's own edge: an OPEN turn is not a resting question, so a mid-flight question
     # mark must NOT be promoted over the wedge evidence.
@@ -293,6 +319,10 @@ def leg_ask_detector() -> None:
         "Rebuilt and re-ran.\n\nConfirmed: 210 pass, 0 fail.",
         "The rail approved the merge.\n\nConfirmed on main at 2286999.",
         "Everything landed.\n\nApproved and confirmed by the merge rail.",
+        # ⛔ A `?` INSIDE A TOKEN IS NOT AN ASK (round 4, #4046 P2). Both of these routed a FINISHED
+        # lane to the owner's question lane and suppressed its nudge before the token rule.
+        "Deployed to https://ops.example.com/health?full=1 and it returned 200.\n\nAll green.",
+        "Wrote the rule to docs/faq?/README.md and confirmed it lands.",
     ]
     for text in NOT_Q:
         eq("asks_owner(not-asked): %r" % text[:38], triage.asks_owner(text), "not-asked")
@@ -348,6 +378,32 @@ def leg_rows() -> None:
     line = triage.summary(out)
     ok("the summary names the question lane", "A" in line, line)
     ok("the summary is one line", "\n" not in line, line)
+
+    # ⛔ THE PRODUCER'S OWN TOOL KEY (round 4, #4046 P2). `lane-status.py` emits the in-flight call as
+    # a DICT under `tool`; it never emits `tool_in_flight`. Reading only the invented key left the
+    # expired-budget branch UNREACHABLE through `route_rows` — the same producer-key-set defect fixed
+    # in `lane-route.evidence_for` in round 3, standing in the sibling function because nothing in
+    # production called it. Both sides of the budget are now driven through the real row shape.
+    tool_rows = [
+        {"lane": "T1", "verdict": "WEDGED", "tool": {"name": "bash", "timeout": 3000, "age": 60}},
+        {"lane": "T2", "verdict": "WEDGED", "tool": {"name": "bash", "timeout": 3000, "age": 9000}},
+    ]
+    tout = triage.route_rows(tool_rows)
+    eq("a tool INSIDE its declared budget is not a wedge", tout[0]["action"], "wait")
+    eq("a tool that OVERRAN its own budget is inspected", tout[1]["action"], "inspect")
+    ok("…and both are reached through the producer's `tool` dict, not an invented key",
+       tout[0]["subcase"] == "tool-in-flight" and tout[1]["subcase"] == "tool-in-flight",
+       repr([t["subcase"] for t in tout]))
+
+    # ⛔ AND A READING ARM SAYS SO (round 4, #4046 P2): `verified` on `wait`/`inspect`/`refuse`/`none`
+    # means only that the reading was produced, which is true of a lane nothing was done to. The
+    # record carries the distinction so a reader cannot grep `verified: true` and conclude an effect.
+    for action in ("wait", "inspect", "refuse", "none"):
+        pr = triage_arms.arm_reading(action, "a reason")
+        ok("a reading arm is NOT an assertion about the lane: %s" % action,
+           pr.verified and pr.asserts_lane is False, pr.as_dict())
+    pe = triage_arms.arm_rerun("L", "ws", lambda ws: 0)
+    ok("…while an effect arm DOES assert the lane", pe.asserts_lane is True, pe.as_dict())
 
 
 # ── RED CONTROLS ───────────────────────────────────────────────────────────────────────────────
@@ -475,7 +531,8 @@ class FakeSurface(triage_arms.Surface):
     leg distinguish "we sent" from "the lane advanced", which is the whole point of the arms.
     """
 
-    def __init__(self, spaces=None, sizes=None, screens=None, fail_send=False):
+    def __init__(self, spaces=None, sizes=None, screens=None, fail_send=False,
+                 move_ignored=False, screen_unreadable=False):
         self.spaces = list(spaces or [])          # [{id, name, index}]
         self.sizes = dict(sizes or {})
         self.screens = dict(screens or {})
@@ -483,6 +540,8 @@ class FakeSurface(triage_arms.Surface):
         self.moves = []
         self.last_sent = {}
         self.fail_send = fail_send
+        self.move_ignored = move_ignored
+        self.screen_unreadable = screen_unreadable
 
     def list_workspaces(self):
         return list(self.spaces)
@@ -494,6 +553,8 @@ class FakeSurface(triage_arms.Surface):
 
     def move_workspace(self, ws, index):
         self.moves.append((ws, index))
+        if self.move_ignored:          # rc 0, listing unchanged — the pair the proof must separate
+            return True
         for sp in self.spaces:
             if sp["id"] == ws:
                 sp["index"] = index
@@ -506,12 +567,18 @@ class FakeSurface(triage_arms.Surface):
         self.last_sent[ws] = text
         # a send that lands grows the transcript, which is what an honest surface does
         self.sizes[ws] = self.sizes.get(ws, 0) + len(text)
+        # ⛔ AND IT APPEARS ON THE PANE (round 4, #4046 P0). The question arm reads the PANE back, so a
+        # fake that recorded only `last_sent` would model a surface whose screen never shows what it
+        # typed — i.e. a surface that cannot be verified at all.
+        self.screens[ws] = (self.screens.get(ws, "") + "\n" + text).strip()
         return True
 
     def transcript_size(self, ws):
         return self.sizes.get(ws)
 
     def screen_tail(self, ws, lines=40):
+        if self.screen_unreadable:
+            return None
         return self.screens.get(ws)
 
 
@@ -557,6 +624,41 @@ def leg_user_question_end_to_end() -> None:
     # and the answer comes back the other way: the question lane is told to post the decision back.
     ok("the brief tells the question lane to answer the waiting lane",
        "answer" in brief.lower() or "resume" in brief.lower())
+
+    # ⛔ THE PROOF MUST BE ABLE TO FAIL THE WAY IT CLAIMS TO (round 4, #4046 P0). The first version
+    # read `move_workspace`'s RETURN CODE and the text the surface itself passed to `send`, so neither
+    # half could fail for the reason the proof exists. Measured before this leg: deleting the `moved`
+    # term from the predicate left the suite at its exact baseline. These three are the failures it
+    # now catches, and each one is INVISIBLE to a send/rc reading.
+    for label, bad in (
+        ("a move that reports success but leaves the lane at index 3",
+         FakeSurface(spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}],
+                     screens={"ws_new_1": "ready"}, move_ignored=True)),
+        ("a surface whose pane cannot be read", FakeSurface(
+            spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}], screen_unreadable=True)),
+    ):
+        pb = triage_arms.execute(r, e, bad, ws="ws_owner", poll=lambda _s: None)
+        ok("NOT verified: %s" % label, not pb.verified, pb.detail)
+    empty = FakeSurface(spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}],
+                        screens={"ws_new_1": "composer ready"})
+    # a pane that shows SOMETHING ELSE is a transport that did not deliver the mandate
+    empty.send = lambda ws, text: (empty.sent.setdefault(ws, []).append(text)
+                                   or empty.last_sent.__setitem__(ws, text) or True)
+    pb = triage_arms.execute(r, e, empty, ws="ws_owner", poll=lambda _s: None)
+    ok("NOT verified when the pane shows no mandate at all", not pb.verified, pb.detail)
+    # and the owner-message fact is DERIVED, so it can read True (round 4, #4046 P1)
+    noisy = FakeSurface(spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}],
+                        screens={"ws_new_1": "ready"})
+    pm = triage_arms.execute(r, e, noisy, ws="ws_owner", poll=lambda _s: None)
+    ok("the record says the owning lane was not messaged", pm.verified)
+    eq("…and that field is False when nothing was sent to it",
+       pm.artifact.get("owner_lane_sent_anything"), False)
+    noisy_owner = FakeSurface(spaces=[{"id": "ws_owner", "name": "lane-7", "index": 3}],
+                              screens={"ws_new_1": "ready"})
+    noisy_owner.send("ws_owner", "continue")
+    pn = triage_arms.execute(r, e, noisy_owner, ws="ws_owner", poll=lambda _s: None)
+    eq("…and TRUE the moment anything is sent to the owning lane",
+       pn.artifact.get("owner_lane_sent_anything"), True)
 
 
 def leg_arm_continue_proves_resumption() -> None:
@@ -607,7 +709,26 @@ def leg_arm_wedged_remedies() -> None:
     still = FakeSurface(screens={"ws_bp": "Press any key to continue..."})
     p2 = triage_arms.execute(r, e, still, ws="ws_bp", dispatch=lambda ws, lane: 0)
     ok("boot-prompt: NOT verified while the prompt is still on the pane", not p2.verified, p2.detail)
+    # ⛔ THE FALSE NEGATIVE THE PRESENCE TEST PRODUCED (round 4, #4046 P1). pi renders inline, so a
+    # SATISFIED prompt stays in the scrollback above the input box for the life of the session
+    # (`cmux_dispatch.py:723-757`, "observed live: 62 lines from the end of an 80-line capture on a
+    # healthy pane"). A presence test therefore reported "the prompt is STILL on the pane" for every
+    # REPAIRED lane, forever — the arm could never verify the repair it exists to verify.
+    healthy = FakeSurface(screens={"ws_bp": "Press any key to continue...\n"
+                                           "booted in 1.2s\n$ /home/cmux \n42.0%/700k (auto)"})
+    p3 = triage_arms.execute(r, e, healthy, ws="ws_bp", dispatch=lambda ws, lane: 0)
+    ok("boot-prompt: a HEALTHY pane with the marker in scrollback verifies", p3.verified, p3.detail)
+    ok("…and the record says the prompt is gone", p3.artifact.get("boot_prompt") is False,
+       repr(p3.artifact))
+    # the stale-footer case the same docstring names: the bar ABOVE the marker is a dead session's
+    dead = FakeSurface(screens={"ws_bp": "42.0%/700k (auto)\nPress any key to continue..."})
+    p4 = triage_arms.execute(r, e, dead, ws="ws_bp", dispatch=lambda ws, lane: 0)
+    ok("boot-prompt: a bar ABOVE the marker is still a block", not p4.verified, p4.detail)
+    unread = FakeSurface(screen_unreadable=True)
+    p5 = triage_arms.execute(r, e, unread, ws="ws_bp", dispatch=lambda ws, lane: 0)
+    ok("boot-prompt: an unreadable pane is NOT verified", not p5.verified, p5.detail)
 
+    tmpd = tempfile.mkdtemp(prefix="triage-test-handoff-")
     # child subcases: a named hand-off, never a kill from this arm
     # ⛔ THE FIXTURE IS THE PRODUCER'S OWN SHAPE (round 3, #4046 P1). `lane-status.py:1586-1590`
     # emits `call_id / ts / age / abandoned / cwd / task / agent` — the earlier fixture invented
@@ -618,19 +739,22 @@ def leg_arm_wedged_remedies() -> None:
         e = ev(lane_verdict=verdict)
         r = triage.route(e)
         eq("%s: subcase" % subcase, r.subcase, subcase)
-        p = triage_arms.execute(r, e, FakeSurface(), ws="ws_c", child=REAL_CHILD)
+        p = triage_arms.execute(r, e, FakeSurface(), ws="ws_c", child=REAL_CHILD,
+                                state_dir=tmpd)
         eq("%s: action" % subcase, p.action, "repair-child")
         ok("%s: a REAL lane-status child record VERIFIES the hand-off" % subcase, p.verified,
            p.detail)
         ok("%s: the child is NAMED in the artifact" % subcase,
            p.artifact["child"].get("call_id") == "c-4242")
         ok("%s: nothing was killed and nothing was typed" % subcase, not p.sent)
-        unnamed = triage_arms.execute(r, e, FakeSurface(), ws="ws_c", child={})
+        unnamed = triage_arms.execute(r, e, FakeSurface(), ws="ws_c", child={},
+                                     state_dir=tmpd)
         ok("%s: an unread child is not verified and not killed" % subcase, not unnamed.verified)
     # ⛔ A STATE WORD IS NOT A RECORD (round 3, #4046 P1): with no child dict, the arm must NOT
     # verify off `child_state` — that was a false PASS on a proof that was never read.
     e_stuck = ev(lane_verdict="CHILD-STUCK", child_state="stuck")
-    p_state = triage_arms.execute(triage.route(e_stuck), e_stuck, FakeSurface(), ws="ws_c")
+    p_state = triage_arms.execute(triage.route(e_stuck), e_stuck, FakeSurface(), ws="ws_c",
+                                  state_dir=tmpd)
     ok("child-stuck with ONLY a state word is NOT verified", not p_state.verified, p_state.detail)
     ok("…and names no fabricated child", p_state.artifact.get("child") == {},
        repr(p_state.artifact))
@@ -642,8 +766,15 @@ def leg_arm_wedged_remedies() -> None:
     for fake in ({"name": "stuck"}, {"pid": 4242}, {"sid": "s"}, {"label": "kid"},
                  {"pid": 4242, "label": "kid", "name": "kid"}):
         ok("a child dict keyed only on a key no producer emits is NOT verified: %r" % (fake,),
-           not triage_arms.arm_child("L", fake).verified,
-           triage_arms.arm_child("L", fake).detail)
+           not triage_arms.arm_child("L", fake, state_dir=tmpd).verified,
+           triage_arms.arm_child("L", fake, state_dir=tmpd).detail)
+    # ⛔ AND THE WRITTEN RECORD IS THE ARTIFACT (round 4, #4046 P0). Before this leg the arm returned
+    # `verified=True` off a field's presence with nothing written and the input dict untouched — the
+    # claim this module exists to refuse. The file must exist, carry the child, and be RE-READ.
+    hp = triage_arms.handoff_path(tmpd, "L")
+    ok("the hand-off record is a REAL file on disk", os.path.exists(hp), hp)
+    p_nostate = triage_arms.arm_child("L", REAL_CHILD)
+    ok("a hand-off with nowhere to write is NOT verified", not p_nostate.verified, p_nostate.detail)
 
     # rerun: lane-relaunch.py's own exit code IS the proof
     e = ev(lane_verdict="WEDGED", turn=TURN_OPEN)
@@ -792,6 +923,67 @@ def leg_wiring() -> None:
     eq("…and names it idle-continue", route_n.route, "idle-continue")
     os.unlink(qpath)
     os.unlink(npath)
+
+    # ⛔ THE BRANCH, NOT JUST THE PREDICATE (round 4, #4046 P1). Suppressing the nudge without routing
+    # the question is the defect: every arm was reachable only from the CLI and a fixture, so the
+    # issue's second requirement was delivered by no running code. The loop now calls THIS, and the
+    # arm is invoked for a question route and for nothing else.
+    calls = []
+    te_mod.log = lambda msg: calls.append(msg)
+    te_mod._apply_question_route = lambda lane: calls.append("APPLIED:" + lane)
+    route_q = triage.route(ev(lane="lane-q", last_text="Should I merge?",
+                              lane_verdict="WIP-IDLE", steerable=True))
+    te_mod.suppress_and_route("lane-q", route_q)
+    ok("a user-question route APPLIES the arms (creates the question lane)",
+       "APPLIED:lane-q" in calls, repr(calls))
+    ok("…and the skip is logged with its reason", any(c.startswith("SKIP lane-q") for c in calls),
+       repr(calls))
+    calls.clear()
+    te_mod.suppress_and_route("lane-w", triage.route(ev(lane="lane-w", lane_verdict="CHILD-STUCK",
+                                                        steerable=True)))
+    ok("a WEDGED route does NOT reach the question arms", "APPLIED:lane-w" not in calls, repr(calls))
+
+    # ⛔ THE FARM IS LOAD-BEARING, SO THE TEST MUST NOT READ THE CHECKOUT (round 4, #4046 P2). This
+    # leg used to assert `te_mod._triage is not None` in THIS process, where `triage` was already
+    # imported from `tools/fleet` — so a farm entry that no longer shipped `triage.py` left the suite
+    # green while a farmed box (no checkout) had `_ROUTER = ModuleNotFoundError` and nudged nobody.
+    # Measured in a fresh interpreter before this leg: `_triage = None`, suite PASS.
+    import shutil as _sh
+    import subprocess as _sp
+    # ⛔ THE FARM IS SIMULATED THROUGH `HOME`, because `turn-end.py:99` resolves `SCRIPTS` as
+    # `$HOME/.pi/agent/scripts` and takes NO override. A test that sets `SCRIPTS` in the env would be
+    # testing an environment variable the consumer never reads — green while the box it models is
+    # broken. The leg therefore builds a throwaway HOME with and without the farmed fleet dir.
+    farm = _tf.mkdtemp(prefix="triage-farm-")
+    fleetdir = os.path.join(farm, ".pi", "agent", "scripts", "fleet")
+    os.makedirs(fleetdir, exist_ok=True)
+    _probe = ("import importlib.util, sys\n"
+              "spec = importlib.util.spec_from_file_location('te', %r)\n"
+              "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+              "print('TRIAGE', m._triage is not None)\n"
+              "print('ROUTER', repr(m._ROUTER))\n" % (te2,))
+    empty = _sp.run([sys.executable, "-c", _probe], capture_output=True, text=True,
+                    env=dict(os.environ, HOME=farm), cwd="/tmp")
+    ok("with an EMPTY farm the router is absent AND says so",
+       "TRIAGE False" in empty.stdout and "ModuleNotFoundError" in empty.stdout,
+       (empty.stdout + empty.stderr)[-300:])
+    for name in ("triage.py", "triage_arms.py", "liveness.py"):
+        _sh.copy(os.path.join(os.path.dirname(repo), "tools", "fleet", name),
+                 os.path.join(fleetdir, name))
+    full = _sp.run([sys.executable, "-c", _probe], capture_output=True, text=True,
+                   env=dict(os.environ, HOME=farm), cwd="/tmp")
+    ok("with the farmed router present the consumer LOADS it (the farm line is load-bearing)",
+       "TRIAGE True" in full.stdout, (full.stdout + full.stderr)[-300:])
+    # and the farm itself must name every file the consumer needs, or the box above is production
+    setup = open(os.path.join(os.path.dirname(repo), "pi-bootstrap", "setup.sh")).read()
+    srcs = re.search(r"(?m)^fleet_srcs=\(([^)]*)\)", setup)
+    tools = re.search(r"(?m)^fleet_tools=\(([^)]*)\)", setup)
+    ok("the farm ships triage.py + triage_arms.py",
+       "triage.py" in (tools.group(1) if tools else "")
+       and "triage_arms.py" in (tools.group(1) if tools else ""), "fleet_tools missing the pair")
+    ok("the farm ships the CLI that APPLIES a route (lane-route.py)",
+       "lane-route.py" in (srcs.group(1) if srcs else ""),
+       "lane-route.py missing from fleet_srcs — the arms would have no production caller")
 
     # ⛔ THE `tool-in-flight` SUBCASE MUST BE REACHABLE FROM THE REAL ACQUIRER (fresh-context review,
     # #4046 P1). `lane-status.py` emits `tool` as a DICT (name/timeout/age); the first version read

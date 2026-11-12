@@ -115,10 +115,13 @@ REMEDIES = {
 #   * `transcript-growth` — the lane's own session file grew, or its turn count advanced, inside the
 #     resumption bound. "accepted" is not "advanced" (see the evidence ladder: accepted · persisted ·
 #     claimed · ADVANCED · completed · delivered).
-#   * `question-lane-ack` — the question lane was resolved/created AND its brief landed there AND it
-#     carries the research mandate + the USER QUESTIONS PROTOCOL four parts. A question forwarded raw
-#     has not been routed.
-#   * `child-record` — the child's own record changed (gone, re-dispatched with a new id).
+#   * `question-lane-ack` — the question lane was resolved/created, the WORKSPACE LISTING puts it at
+#     index 0, and the PANE the owner will read carries the research mandate + the USER QUESTIONS
+#     PROTOCOL four parts. Both readings are re-taken after the action; the move's return code and
+#     the text this module typed are NOT the artifact. A question forwarded raw has not been routed.
+#   * `child-handoff-record` — a hand-off record was WRITTEN and RE-READ, carrying the child's own
+#     `call_id`. The child's own record does not change (nothing is killed or restarted here), so a
+#     proof that promised a change certified a presence test as an effect.
 #   * `pane-ready` — the boot prompt is gone and the composer accepts a line.
 #   * `commit-or-turn` — a new commit or a new turn exists; a re-dispatch that produced neither did not
 #     happen.
@@ -127,7 +130,10 @@ REMEDIES = {
 PROOFS = {
     "send-continue": "transcript-growth",
     "route-to-question-lane": "question-lane-ack",
-    "repair-child": "child-record",
+    # ⛔ NOT "the child's record CHANGED" (round 4, #4046 P0): the arm writes a hand-off and re-reads
+    # it; nothing about the child changes, and claiming otherwise certified a presence test as an
+    # effect for a whole review round.
+    "repair-child": "child-handoff-record",
     "repair-boot-prompt": "pane-ready",
     "rerun": "commit-or-turn",
     "wait": "written-reading",
@@ -173,8 +179,16 @@ _HANDOFF = (
     "once you've approved", "on your approval", "for your approval", "pending your approval",
     "pending your decision", "please confirm", "please approve", "your confirmation",
     "your approval", "on your go",
+    # ⛔ THE GO-AHEAD FAMILY (round 4, #4046 P0). Measured through the real consumer before this
+    # line: "Migration written and tested. I'll wait for your go-ahead before applying it to prod."
+    # returned `not-asked`, so `route_gate` said `may_nudge=True` and `turn-end.py` typed
+    # "continue" into a lane waiting on the owner — the exact harm the module exists to prevent,
+    # arriving through the phrase list rather than the `?` rule. The approval/authorisation asks are
+    # the shape a merged-and-waiting lane actually writes.
+    "go-ahead", "go ahead from you", "for your go", "waiting to hear", "ready for your",
+    "hold here until", "until you confirm", "until you approve", "wait for your word",
+    "your call on", "in your hands", "needs your sign", "for sign-off", "for your sign-off",
 )
-
 ASKED = "asked"
 NOT_ASKED = "not-asked"
 UNREAD = "unread"
@@ -202,6 +216,39 @@ def last_paragraph(text: str) -> str:
     return parts[-1] if parts else ""
 
 
+_WS = re.compile(r"\s")
+
+
+def _has_ask_mark(body: str) -> bool:
+    """Is there a `?` that is an ASK rather than part of a token? (round 4, #4046 P2)
+
+    A `?` in a URL, a query string or a filename is not a question addressed to the reader, and
+    treating it as one routes a FINISHED lane to the owner's question lane and suppresses its nudge —
+    measured before this helper: `Deployed to https://ops.example.com/health?full=1 and it returned
+    200.` and `Wrote the rule to docs/faq?/README.md and confirmed it lands.` both read `asked`.
+
+    The rule is deliberately narrow: only a `?` that is INSIDE a token with a URL/path shape is
+    discounted. Anything else — including the rhetorical question inside a report, which is a
+    disclosed cost — still reads as an ask, because the opposite error sends "continue" to a lane
+    waiting on the owner.
+    """
+    for m in re.finditer(r"\?", body):
+        i = m.start()
+        start = i
+        while start > 0 and not _WS.match(body[start - 1]):
+            start -= 1
+        end = i + 1
+        while end < len(body) and not _WS.match(body[end]):
+            end += 1
+        word = body[start:end]
+        if "://" in word or word.endswith("/") or re.search(r"\?[A-Za-z_]+=", word):
+            continue
+        if re.search(r"[A-Za-z0-9]\?/", word):
+            continue
+        return True
+    return False
+
+
 def asks_owner(text: str) -> str:
     """Does this assistant message END by asking the OWNER something? `asked | not-asked | unread`.
 
@@ -225,10 +272,16 @@ def asks_owner(text: str) -> str:
     body = readable_tail(text)
     if not body.strip():
         return UNREAD
-    if "?" in body:
+    if _has_ask_mark(body):
         return ASKED
-    para = last_paragraph(body)
-    low = " ".join(para.lower().split())
+    # ⛔ THE WHOLE BODY, FOR BOTH CLASSES (round 4, #4046 P0). Round 2 removed the paragraph WINDOW
+    # for `?` and left it in place for the phrase classes, so half the detector still read only the
+    # last paragraph — and measured through the real consumer, "Blocked on your decision.\n\n
+    # Everything else is green." returned `not-asked` (may_nudge=True) while the SAME sentence as the
+    # final paragraph returned `asked`. A hand-off followed by a status paragraph is the ordinary
+    # shape of a lane that has finished everything except the thing it is waiting on, so the
+    # asymmetry had no defensible side: both classes now read the whole readable tail.
+    low = " ".join(body.lower().split())
     for phrase in _ASK_FRAME + _HANDOFF:
         if phrase in low:
             return ASKED
@@ -401,10 +454,34 @@ def _question(ev: Evidence) -> str:
 def route(ev: Evidence) -> Route:
     """Decide the lane's ROUTE. Total, pure, and ordered by the precedence safety property.
 
-    The order of the checks below IS the contract. Do not reorder them to make a case read better:
-    each inversion has a measured harm, named in the module docstring.
+    The order of the checks inside `_route_ladder` IS the contract. Do not reorder them to make a
+    case read better: each inversion has a measured harm, named in the module docstring.
+
+    ⛔ ONE POST-PASS, AND ONLY ONE (round 4, #4046 P1). The ladder decides from the VERDICT and the
+    TURN; it does not, on its own, know that the turn's text asks the owner. So a question on an
+    OPEN turn — `liveness.Turn(True, "turn-open:no-terminal-stop")`, the crash/hang-mid-write shape —
+    fell through to `wedged/open-turn-never-closes` whose remedy is `rerun`, i.e. a RELAUNCH of a
+    lane that is sitting on a question. Measured: 27 of 468 enumerated combinations reached a
+    lane-destroying action from a lane that had asked. A relaunch destroys the question just as
+    surely as a "continue" answers it wrongly, so the veto is applied to the DECIDED route rather
+    than re-ordering the ladder: the wedge verdict may still be right (an open turn that never
+    closes IS worth inspecting), but the action may not be the destructive one.
     """
     ask = _question(ev)
+    r = _route_ladder(ev, ask)
+    if ask == ASKED and r.action == "rerun":
+        return Route(
+            route="wedged", subcase=r.subcase, action="inspect", proof=PROOFS["inspect"],
+            reason="the wedge reading and the tail disagree: the turn is still open AND its last "
+                   "words ask the owner, so a relaunch would destroy the question before it is "
+                   "answered — inspect the lane and route the question instead",
+            evidence=(r.evidence or "") + " ask=asked",
+        )
+    return r
+
+
+def _route_ladder(ev: Evidence, ask: str) -> Route:
+    """The ordered ladder. Called only by `route()`, which owns the one post-pass above."""
 
     # ── 1. user-question — before everything, and never on a positively OPEN turn ────────────────
     # An open turn means pi is still working; the text at its tail is what it is saying mid-flight,
@@ -581,6 +658,37 @@ def steerable(sid: Optional[str] = None, *, ws: Optional[str] = None,
     return None
 
 
+def _tool_row(row):
+    """The in-flight tool dict, if the row names one (the producer's own key)."""
+    tok = row.get("tool")
+    return tok if isinstance(tok, dict) else None
+
+
+def _tool_in_flight(row) -> bool:
+    return bool(row.get("tool_in_flight") or _tool_row(row))
+
+
+def _tool_budget_read(row) -> bool:
+    """Was the call's DECLARED budget actually read? True when a timeout is on the record."""
+    if "tool_budget_read" in row:
+        return bool(row.get("tool_budget_read"))
+    tok = _tool_row(row)
+    return bool(tok) and isinstance(tok.get("timeout"), (int, float))
+
+
+def _tool_budget_open(row) -> bool:
+    """Is the declared budget still open? Only a READ budget can be open; an unread one is not."""
+    if "tool_budget_open" in row:
+        return bool(row.get("tool_budget_open"))
+    tok = _tool_row(row)
+    if not tok:
+        return False
+    timeout, age = tok.get("timeout"), tok.get("age")
+    if isinstance(timeout, (int, float)) and isinstance(age, (int, float)):
+        return age < timeout
+    return False
+
+
 def route_rows(rows: Sequence[dict]) -> list:
     """Route a whole `lane-status.py --json` population, preserving its evidence into each result.
 
@@ -599,8 +707,16 @@ def route_rows(rows: Sequence[dict]) -> list:
             steerable=row.get("steerable"),
             boot_prompt=row.get("boot_prompt"),
             model_retry=row.get("model_retry"),
-            tool_in_flight=bool(row.get("tool_in_flight")),
-            tool_budget_open=bool(row.get("tool_budget_open")),
+            # ⛔ THE PRODUCER'S OWN KEY (round 4, #4046 P2). `lane-status.py` emits the in-flight call
+            # as a DICT under `tool` (`lane-status.py:1533` `dict(name=…, timeout=…, age=…)`, set at
+            # `:2439`); it never emits `tool_in_flight`. Reading only the invented key meant the
+            # expired-budget branch (`triage.py`'s `tool_budget_read and not tool_budget_open`) was
+            # UNREACHABLE through this function — the same producer-key-set defect the round-3 commit
+            # fixed in `lane-route.evidence_for`, left standing here. Nothing in production called
+            # `route_rows`, which is exactly why it went unnoticed; the suite now drives it.
+            tool_in_flight=_tool_in_flight(row),
+            tool_budget_open=_tool_budget_open(row),
+            tool_budget_read=_tool_budget_read(row),
         )
         r = route(ev)
         d = r.as_dict()

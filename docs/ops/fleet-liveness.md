@@ -86,10 +86,13 @@ Three things about it are load-bearing here, because each is a way a second clas
 
 The router's arms are [`tools/fleet/triage_arms.py`](../../tools/fleet/triage_arms.py) — one per route,
 and **each owes a proof taken at its artifact**: a `SENT` marker is a claim, not an effect. The continue
-arm proves *transcript growth inside a bound*; the question arm proves the question lane exists at
-index 0 AND that the brief it received carries the research mandate; the child arms hand off a NAMED
-record and signal nothing (the reaping rule is three gates, and *"report, do not reap"* when a read is
-unclear); the boot-prompt arm reuses `cmux_dispatch.py`'s own dismiss-and-resend and reads the pane.
+arm proves *transcript growth inside a bound*; the question arm re-lists the workspaces and requires
+the question lane at index 0, then reads the PANE back and requires it to carry the research mandate
+(the move's return code and the text the arm typed are not artifacts); the child arms WRITE a
+hand-off record and re-read it, and signal nothing (the reaping rule is three gates, and *"report,
+do not reap"* when a read is unclear); the boot-prompt arm reuses `cmux_dispatch.py`'s own
+dismiss-and-resend and reads the pane, deciding the prompt by ORDER — a satisfied marker stays in
+scrollback for the life of the session, so presence alone reports a repaired lane as blocked.
 Every route carries `Route.proof`, and an arm naming no artifact is refused before it can run.
 
 **Where it is wired.** `scripts/turn-end.py` gates its WIP nudge on `triage.may_continue()` — the lane
