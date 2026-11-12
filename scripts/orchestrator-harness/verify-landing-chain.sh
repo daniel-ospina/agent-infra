@@ -138,16 +138,36 @@ fi
 # The ONE slug parser, sourced rather than re-implemented: a second URL parse is how the pool and the
 # grading drift apart (#2040). It is used in BOTH directions below — to test a value, and to turn a
 # box's path-form `REPO` pin into a slug.
-[ -f "$HERE/repo-slug.sh" ] && . "$HERE/repo-slug.sh" >/dev/null 2>&1
+#
+# ⛔ BUT A MISSING MODULE MUST NOT REFUSE AN EXPLICIT `--repo` (fresh-context review, round 2 F1 —
+# measured: a lone copy of this script in a directory without `repo-slug.sh` called the undefined
+# `repo_slug_valid`, clobbered the caller's `--repo o/r` with the empty result, and exited 3 BEFORE
+# any predicate ran. That also made this file's own mutation suite vacuous, because every mutant is
+# exactly such a copy: each asserted on an empty report and "passed" by absence). So when the module
+# is absent the shape rule below stands in — it is the same rule the module applies for the SLUG form,
+# and it never derives a path. The module, when present, is still the only thing that parses a URL.
+if [ -f "$HERE/repo-slug.sh" ]; then
+  # shellcheck source=orchestrator-harness/repo-slug.sh
+  . "$HERE/repo-slug.sh" >/dev/null 2>&1 || :
+fi
+slug_shaped() { # an owner/name with no path, scheme or extra segment — the module's slug rule
+  case "${1:-}" in ''|*/*/*|/*|*:*) return 1 ;; */*) : ;; *) return 1 ;; esac
+  case "${1%%/*}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "${1#*/}"  in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  return 0
+}
+slug_ok() { # the module's rule when it is loaded, the local shape rule otherwise
+  if command -v repo_slug_valid >/dev/null 2>&1; then repo_slug_valid "$1" 2>/dev/null; else slug_shaped "$1"; fi
+}
 case "$REPO" in
   */*)
     # a box may pin REPO to a CHECKOUT (that form is supported and must not be mistaken for a slug);
     # anything that is not already a slug is derived through the same parser, never parsed here.
-    if ! repo_slug_valid "$REPO" 2>/dev/null; then
+    if ! slug_ok "$REPO" && command -v derive_or >/dev/null 2>&1; then
       REPO="$(derive_or "$REPO" "" 2>/dev/null)" || REPO=""
     fi ;;
 esac
-if ! repo_slug_valid "$REPO" 2>/dev/null; then
+if ! slug_ok "$REPO"; then
   printf 'verify-landing-chain: owner/repo is not resolved — the harness carries NO default for it.\n' >&2
   printf '  Pass --repo owner/repo, or point a snapshot at a repo.txt, or set REPO the one way this\n' >&2
   printf '  box has for it (the launchd plist on a Mac, keys.env on a cell; a checkout path is fine —\n' >&2
@@ -448,7 +468,14 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
         }
       }
       if (classify(status, conc) == "green") evergreen[g] = 1
-      # did this group have an attempt IN FLIGHT when the landing happened?
+      # ⛔ "STARTED BY THE MERGE" CANNOT BE READ FROM `started_at` ALONE (fresh-context review,
+      # round 2 F2). GitHub leaves `started_at` NULL for a check run whose status is still `queued`,
+      # so a group that was queued at the merge had no timestamp and fell into "no run existed yet",
+      # which is the PASS-eligible bucket — a fail-open door under a sentence that asserted
+      # "no run existed by mergedAt". The rule is the fail-closed one: an attempt that is NOT
+      # completed exists and had not voted, so it is `waited` regardless of its timestamps.
+      if (status != "completed") pending[g] = 1
+      else if (done_at != "-" && done_at != "" && done_at <= merged) voted_by_merge[g] = 1
       if (started_at != "-" && started_at != "" && started_at <= merged) started[g] = 1
       next
     }
@@ -460,9 +487,9 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
         #   later   — no attempt existed yet (a post-merge job; it was never part of this gate).
         # Collapsing both into one "novote" is what let one green group and two in-flight groups read
         # as "3 group(s) green", which is false in the direction the capstone is closed on.
-        if (g in atcls)            v = atcls[g]
-        else if (g in started)     v = "waited"
-        else                       v = "later"
+        if (g in atcls)                         v = atcls[g]     # it voted by mergedAt
+        else if ((g in pending) || (g in started)) v = "waited"   # it existed and had not voted
+        else                                    v = "later"      # no attempt completed by mergedAt
         print g "\t" v "\t" ((g in atconc) ? atconc[g] : "-") "\t" ((g in atdone) ? atdone[g] : "-") "\t" ((g in evergreen) ? "yes" : "no")
         n++
       }
@@ -515,6 +542,24 @@ analyse() { # analyse <dir> <pr>
   emit merged PASS "mergedAt=$merged merge=${merge_sha:0:12} landed_tree=${landed_tree:0:12}"
 
   # ── 2 review_record ──────────────────────────────────────────────────────────────────────────
+  # ⛔ AN UNREAD RECORD CHANNEL IS NOT AN ABSENT ONE (fresh-context review, round 2 F3). The body is
+  # the recorder's CURRENT word and a comment is the weaker source, so reading through a failed `pr
+  # view --json body` promotes an older comment marker to "this PR's current record" and deletes the
+  # `not-clean` history `fix_round` needs — a fail-open on the two predicates the capstone is closed
+  # on. The sentinel `store_read` writes is therefore CONSULTED here; without this, the sentinel was
+  # an inert guard, which is worse than no guard because the comment claimed protection it gave none.
+  local rc_unread=""
+  for _rs in body.txt comments.txt; do
+    [ -f "$dir/${_rs}.unread" ] && rc_unread="${rc_unread}${rc_unread:+,}${_rs}"
+  done
+  if [ -n "$rc_unread" ]; then
+    emit review_record INCONCLUSIVE "the record channel(s) ${rc_unread} were NOT READ (gh refused / rate-limited) — the reviewed head of this PR is unknown here, and an unread body must not fall through to a weaker source"
+    emit review_bound INCONCLUSIVE "no read review record to bind to the PR's final commit"
+    emit fix_round INCONCLUSIVE "the record history was not read (${rc_unread}) — a fix round cannot be read from a channel nobody could open"
+    emit green_gated INCONCLUSIVE "no reviewed head, so no head to read a check surface at"
+    return 0
+  fi
+
   # ⛔ THE SOURCE IS PART OF THE VERDICT, NOT A FOOTNOTE (review finding F3). A body marker is the
   # recorder's current word; a comment-only marker is a WEAKER source the recorder itself does not
   # accept as an artifact, and a box-local record file is weaker still (it is not in the PR). Every

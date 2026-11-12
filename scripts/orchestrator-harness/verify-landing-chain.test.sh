@@ -298,6 +298,40 @@ verify "$R"
 ck "F3: a foreign-repo marker is REFUSED, not adopted (review_record INCONCLUSIVE)" "$(hasj '"check":"review_record","verdict":"INCONCLUSIVE"'; echo $?)"
 ck "F3: …and the refusal is named" "$(has "refused as naming another repo"; echo $?)"
 
+# F2c — a group still `queued` at the merge has a NULL `started_at`, so neither "started" nor "voted"
+# is readable from timestamps; round 2's F2 found it falling into the PASS-eligible bucket while the
+# report claimed "no run existed by mergedAt". It exists and did not vote, so it is `waited` → FAIL.
+R="$(mk f2-queued-at-merge 447)"
+run "$R" 447 9001 "CI" 1
+group "$R" 447 10 9001 "unit-test"    completed success "2026-11-12T05:00:00Z"
+group "$R" 447 20 9001 "vendor-drift" queued    -       "-"
+verify "$R"; rc=$?
+ck "F2c: a QUEUED group at mergedAt FAILs as 'did not wait for it'" "$(has "did not wait for"; echo $?)"
+ck "F2c: …and it is never described as a group that did not exist yet" "$(has "no run existed by mergedAt" && echo 1 || echo 0)"
+ck "F2c: …so the verdict is NOT-MET (exit 1), not a pass" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+
+# F3c — the `.unread` sentinel on the RECORD channels must be READ (round 2's F3: it was written for
+# body.txt/comments.txt and never consulted, so a failed body read was a measured absence and promoted
+# an older comment marker to "this PR's current record"). Both forms are exercised: body only, and
+# body+comments.
+R="$(mk f3c-unread-body 448)"
+run "$R" 448 9001 "CI" 1
+group "$R" 448 10 9001 "unit-test" completed success "$MERGED_AT"
+: > "$R/pr-448/body.txt"
+: > "$R/pr-448/body.txt.unread"
+printf '<<<COMMENT>>>\nreview recorded: reviews/448.json verdict=clean @ %s (o/r)\n' "$HEAD" > "$R/pr-448/comments.txt"
+verify "$R"; rc=$?
+ck "F3c: an unread body makes review_record INCONCLUSIVE" "$(has "the record channel(s) body.txt were NOT READ"; echo $?)"
+ck "F3c: …and it does NOT promote the comment marker to PASS" "$(has "PASS  review_record" && echo 1 || echo 0)"
+ck "F3c: …and the run exits 2 (unknown), never 0" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
+
+R="$(mk f3c-unread-both 449)"
+run "$R" 449 9001 "CI" 1
+: > "$R/pr-449/body.txt";    : > "$R/pr-449/body.txt.unread"
+: > "$R/pr-449/comments.txt"; : > "$R/pr-449/comments.txt.unread"
+verify "$R"
+ck "F3c: both channels unread names both of them" "$(has "body.txt,comments.txt"; echo $?)"
+
 # F3b — a comment-only marker IS admitted, but declared as the weaker source the recorder refuses
 R="$(mk f3-comment-marker 445)"
 : > "$R/pr-445/body.txt"
@@ -320,10 +354,18 @@ ck "F4: an out-of-window chain marker leaves the route UNKNOWN, not chain-attrib
 # same non-vacuity discipline `tools/fleet/outcome_canary.test.py --mutations` applies, and the reason
 # it is here: two of the three mutations are defects this file actually shipped with for one round
 # (tree equality instead of final-commit binding; the re-run read as "newest overall").
+# ⛔ THE MUTANT MUST BE ABLE TO RUN (fresh-context review, round 2 F1 — MEASURED). The first cut copied
+# ONE file into a fresh directory, so the copy could not source its sibling `repo-slug.sh`, refused
+# with exit 3 BEFORE any predicate, and every mutation below "passed" by ABSENCE — a non-vacuity proof
+# that proved nothing, which is the same class as the defect it was written to rule out. The sibling
+# module comes with it now, and `verify_with` reports the mutant's EXIT STATUS so a mutant that cannot
+# run is a FAILED mutation rather than a discriminating one.
 mutant() { # mutant <name> <python-old> <python-new> → prints the path of a mutated copy
   local d="$MUT/$1"
   mkdir -p "$d"
   cp "$SCRIPT" "$d/verify-landing-chain.sh"
+  # everything the script sources or reads from its own directory
+  for sib in "$HERE"/repo-slug.sh; do [ -f "$sib" ] && cp "$sib" "$d/"; done
   python3 - "$d/verify-landing-chain.sh" "$2" "$3" <<'PYEOF' || return 1
 import sys
 path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -334,39 +376,57 @@ open(path, "w").write(s.replace(old, new))
 PYEOF
   printf '%s\n' "$d/verify-landing-chain.sh"
 }
-verify_with() { # verify_with <script> <root> → prints the report, sets the exit code
+verify_with() { # verify_with <script> <root> → sets AOUT (report) and AOUT_RC (the mutant's exit)
   AOUT="$(bash "$1" --from-snapshot "$2" --repo "$REPO_FIXTURE" 2>&1)"
+  AOUT_RC=$?
+}
+# A mutant that did not produce a REPORT proves nothing. 0/1/2 are the verdict ladder; 3 is usage and
+# anything else is a crash. Both are reported as an invalid mutation, never as discrimination.
+mutant_ran() {
+  case "${AOUT_RC:-3}" in
+    0|1|2) printf '%s' "$AOUT" | grep -q '^PR #' ;;
+    *) return 1 ;;
+  esac
+}
+
+# ⛔ ONE SHAPE FOR EVERY MUTATION, AND IT CANNOT PASS BY ABSENCE. `mutation_verdict` refuses a mutant
+# that did not run (rc outside the 0/1/2 verdict ladder, or no `PR #` header in its output) as an
+# INVALID mutation — that is exactly how round 1's six mutations came to prove nothing, so the guard
+# is not optional here.
+# The needle is a string the CORRECT script prints in this scenario; the mutant must lose it.
+mutation_verdict() { # mutation_verdict <label> <needle-the-correct-script-prints> <what-broke>
+  if ! mutant_ran; then
+    bad "$1: INVALID MUTATION — the mutant did not produce a report (rc=${AOUT_RC:-?}), so nothing is proven"
+    return
+  fi
+  if printf '%s' "$AOUT" | grep -qF -- "$2"; then
+    bad "$1: the mutant STILL printed '$2' — the case is not discriminating"
+  else
+    ok "$1: $3"
+  fi
 }
 
 # M1 — group by JOB NAME alone (drop the workflow). Case 8 must stop seeing the red.
-MS="$(mutant name-only 'g = w "/" name' 'g = name')" \
-  || bad "M1 mutation could not be applied"
+MS="$(mutant name-only 'g = w "/" name' 'g = name')" || bad "M1 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-name-only 430)"
 run "$R" 430 9001 "Workflow A" 1; run "$R" 430 9002 "Workflow B" 1
 group "$R" 430 20 9002 "packaging-smoke" completed failure "2026-11-12T04:00:00Z"
 group "$R" 430 30 9001 "packaging-smoke" completed success "2026-11-12T04:10:00Z"
 verify_with "$MS" "$R"
-if printf '%s' "$AOUT" | grep -qF "Workflow B/packaging-smoke:failure"; then
-  bad "M1: the name-only mutant STILL saw the red — case 8 is not discriminating"
-else
-  ok "M1: grouping by the job name alone loses the red — case 8 is discriminating"
-fi
+mutation_verdict M1 "Workflow B/packaging-smoke:failure" \
+  "grouping by the job name alone loses the red — case 8 is discriminating"
 
 # M2 — read the newest attempt OVERALL instead of the newest that had finished by mergedAt.
-MS="$(mutant newest-overall '&& done_at <= merged) {' ') {')" \
-  || bad "M2 mutation could not be applied"
+MS="$(mutant newest-overall '&& done_at <= merged) {' ') {')" || bad "M2 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-newest-overall 431)"
 run "$R" 431 9001 "CI" 1
 group "$R" 431 10 9001 "pipeline-compliance" completed failure "2026-11-12T04:41:17Z"
 group "$R" 431 20 9001 "pipeline-compliance" completed success "2026-11-12T05:24:50Z"
 verify_with "$MS" "$R"
-if printf '%s' "$AOUT" | grep -qF "completed AFTER mergedAt"; then
-  bad "M2: the newest-overall mutant STILL caught the late green — case 6 is not discriminating"
-else
-  ok "M2: reading the newest attempt overall launders the red — case 6 is discriminating"
-fi
+mutation_verdict M2 "completed AFTER mergedAt" \
+  "reading the newest attempt overall launders the red — case 6 is discriminating"
 
 # M3 — bind on TREE EQUALITY instead of the PR's final commit (the #3996 FALSE FAIL).
 MS="$(mutant tree-equality 'if [ "$last_commit" = "$rsha" ]; then' 'if [ "$(tree_of "$dir/commit-${rsha}.tsv")" = "$landed_tree" ]; then')" \
@@ -376,53 +436,59 @@ R="$(mk mut-tree-equality 432)"
 run "$R" 432 9001 "CI" 1; group "$R" 432 10 9001 "unit-test" completed success "$MERGED_AT"
 printf 'admin-merge: ok\n' > "$R/pr-432/rail.out"
 verify_with "$MS" "$R"
-if printf '%s' "$AOUT" | grep -qF "IS the PR's final commit"; then
-  bad "M3: the tree-equality mutant still PASSED — case 3 is not discriminating"
-else
-  ok "M3: tree equality fails a correct landing (the #3996 defect) — case 3 is discriminating"
-fi
+mutation_verdict M3 "IS the PR's final commit" \
+  "tree equality fails a correct landing (the #3996 defect) — case 3 is discriminating"
 
-# M4 — collapse "started but had not voted by the merge" back into an innocent bucket (the F1 defect).
-MS="$(mutant f1-collapse 'else if (g in started)     v = "waited"' 'else if (g in started)     v = "later"')" \
+# M4 — collapse "existing but had not voted by the merge" back into the harmless bucket (round 2's F2).
+MS="$(mutant f1-collapse 'else if ((g in pending) || (g in started)) v = "waited"' 'else if (0) v = "waited"')" \
   || bad "M4 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-waited 433)"
+run "$R" 433 9001 "CI" 1
+group "$R" 433 10 9001 "unit-test"    completed success "2026-11-12T04:00:00Z"
+group "$R" 433 20 9001 "vendor-drift" in_progress -     "-"
 verify_with "$MS" "$R"
-if printf '%s' "$AOUT" | grep -qF "did not wait for"; then
-  bad "M4: the collapsed mutant STILL reported the non-waiting check — case F1 is not discriminating"
-else
-  ok "M4: treating an in-flight group as 'not part of the gate' green-lights the landing — F1 is discriminating"
-fi
+mutation_verdict M4 "did not wait for" \
+  "a queued/in-flight group becomes PASS-eligible and green-lights the landing — F1/round-2-F2 is discriminating"
 
-# M5 — keep the truncated artifact when the read fails (the F2 defect): an unread surface becomes a
-# measured zero, i.e. a FAIL against a landing nobody could read.
-MS="$(mutant f2-not-atomic '  : > "$dir/$name.unread"' '  : > "$dir/${name%%.*}.unread"')" \
+# M5 — do not HONOUR the sentinel (round 1's F2): an unread surface degrades to a measured zero.
+MS="$(mutant f2-ignore-sentinel 'if [ -f "$dir/checkruns-${rsha}.tsv.unread" ] || [ -f "$dir/runs-${rsha}.tsv.unread" ]; then' 'if [ 0 -eq 1 ]; then')" \
   || bad "M5 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
-R2="$(mk f2-unread-mut 447)"
-run "$R2" 447 9001 "CI" 1
-: > "$R2/pr-447/checkruns-$HEAD.tsv"
-: > "$R2/pr-447/checkruns-$HEAD.tsv.unread"
-verify_with "$MS" "$R2"
-if printf '%s' "$AOUT" | grep -qF "was NOT READ"; then
-  bad "M5: the non-atomic mutant STILL honoured the sentinel — case F2a is not discriminating"
-else
-  ok "M5: a read sentinel written to the wrong name degrades to 'measured zero' — F2a is discriminating"
-fi
+R="$(mk mut-unread 434)"
+run "$R" 434 9001 "CI" 1
+: > "$R/pr-434/checkruns-$HEAD.tsv"
+: > "$R/pr-434/checkruns-$HEAD.tsv.unread"
+verify_with "$MS" "$R"
+mutation_verdict M5 "was NOT READ" \
+  "ignoring the sentinel degrades an unread surface to 'measured zero' — case F2a is discriminating"
 
-# M6 — admit a marker that names ANOTHER repo (the F3 defect): PR numbers collide across repos.
-MS="$(mutant f3-no-repo-filter 'if (tolower(repo) != fold) { printf "SKIP\t%s\t%s\t%s\n",     chan, substr(s, 1, 12), repo; next }' 'if (0) { printf "SKIP\t%s\t%s\t%s\n",     chan, substr(s, 1, 12), repo; next }')" \
+# M6 — admit a marker that names ANOTHER repo (round 1's F3): PR numbers collide across repos.
+MS="$(mutant f3-no-repo-filter 'if (tolower(repo) != fold) { printf "SKIP' 'if (0) { printf "SKIP')" \
   || bad "M6 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
-R3="$(mk f3-foreign-mut 448)"
-: > "$R3/pr-448/body.txt"
-printf '<<<COMMENT>>>\nreview recorded: reviews/448.json verdict=clean @ %s (someone-else/other-repo)\n' "$HEAD" > "$R3/pr-448/comments.txt"
-run "$R3" 448 9001 "CI" 1; group "$R3" 448 10 9001 "unit-test" completed success "$MERGED_AT"
-verify_with "$MS" "$R3"
-if printf '%s' "$AOUT" | grep -qF "refused as naming another repo"; then
-  bad "M6: the unfiltered mutant STILL refused the foreign marker — case F3 is not discriminating"
-else
-  ok "M6: without the repo filter a foreign marker reads as this PR's review — F3 is discriminating"
-fi
+R="$(mk mut-foreign-marker 435)"
+: > "$R/pr-435/body.txt"
+printf '<<<COMMENT>>>\nreview recorded: reviews/435.json verdict=clean @ %s (someone-else/other-repo)\n' "$HEAD" \
+  > "$R/pr-435/comments.txt"
+run "$R" 435 9001 "CI" 1; group "$R" 435 10 9001 "unit-test" completed success "$MERGED_AT"
+verify_with "$MS" "$R"
+mutation_verdict M6 "refused as naming another repo" \
+  "without the repo filter a foreign marker reads as this PR's review — case F3 is discriminating"
+
+# M7 — read through the unread RECORD channel (round 2's F3): the comment marker must not be promoted.
+MS="$(mutant record-unread-passthrough '  if [ -n "$rc_unread" ]; then' '  if [ 0 -eq 1 ]; then')" \
+  || bad "M7 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-record-unread 436)"
+printf 'admin-merge: ok\n' > "$R/pr-436/rail.out"
+run "$R" 436 9001 "CI" 1; group "$R" 436 10 9001 "unit-test" completed success "$MERGED_AT"
+: > "$R/pr-436/body.txt"
+: > "$R/pr-436/body.txt.unread"
+printf '<<<COMMENT>>>\nreview recorded: reviews/436.json verdict=clean @ %s (o/r)\n' "$HEAD" > "$R/pr-436/comments.txt"
+verify_with "$MS" "$R"
+mutation_verdict M7 "were NOT READ" \
+  "reading through an unread body promotes a weaker comment marker — case F3b-2 is discriminating"
 
 # ── summary ──────────────────────────────────────────────────────────────────────────────────────
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
