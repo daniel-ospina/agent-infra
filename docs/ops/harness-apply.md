@@ -273,7 +273,7 @@ because every other test on this arm fires only on something it can positively r
 each named in the journal as an unclassifiable summary or row
 (with a `remedy=` pointing at the checker's vocabulary, not at the farm): a pipe-free line carrying two
 of the three label words with no parsable total, and a per-file row whose trailing token is neither benign
-(`verdict`, `ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) nor a class this pass knows —
+(`verdict`, `ok`, `LOCAL (declared)`, `LOCAL (scratch)`, `SYMLINK (graded via its target)`) nor a class this pass knows —
 scanned on any **row** of two or more fields, because a vocabulary that drifts by a suffix (`drift_v2`,
 `drift.v2`, `drift:2`, `DRIFTED!`) or a report that prints two-field rows is exactly the class this check
 exists for. A row is *a first field that is a path*: the instrument right-pads that field, so

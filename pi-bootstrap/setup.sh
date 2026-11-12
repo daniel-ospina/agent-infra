@@ -420,6 +420,12 @@ farm_install() {
     return 1
   fi
   tmp="$dest.tmp.$$"
+  # The scratch name is predictable, so a DIRECTORY left at it would make `cp` copy INTO it and `mv`
+  # rename the directory onto `$dest` — a "successful" install with the wrong object and no file.
+  if [ -d "$tmp" ]; then
+    echo "    farm_install: $tmp is a DIRECTORY — refusing to use it as scratch" >&2
+    return 1
+  fi
   # stderr is NOT discarded on the copy or the rename: a cell running out of disk is a documented
   # failure mode, and `cp: No space left on device` is the only line that names it — the leg reports
   # THAT the install failed, not why.
@@ -1307,9 +1313,10 @@ if [ -n "$farm_missing" ]; then
   echo "            checkout (git status)." >&2
   echo "        (b) a COPY/RENAME that FAILED — permissions, a full disk: fix $DEST, then re-run." >&2
   echo "        (c) a DIRECTORY sitting at a destination path: move it aside, then re-run." >&2
-  echo "       The failing step names its own cause on the stderr line above (cp or mv, or" >&2
-  echo "       farm_install's own DIRECTORY refusal); the name(s) below carry (install failed) for" >&2
-  echo "       (b)/(c) and no suffix for (a)." >&2
+  echo "       The failing step names its own cause on the stderr line above — cp, mv or chmod, or" >&2
+  echo "       farm_install's own DIRECTORY refusal. A name below carrying (install failed) is a failed" >&2
+  echo "       install; an aggregate line (scripts/lib/, checkout-hygiene) or one reading" >&2
+  echo "       (cannot create …) names its own cause instead." >&2
   echo "       Nothing below ran: the UNFARM leg, launchd convergence, the shell-profile wiring." >&2
   echo "       A farm that delivers less than it declares is how the repo and the machines drift" >&2
   echo "       apart in silence (#1931) — and, on the UNFARM side, how a file that was never" >&2

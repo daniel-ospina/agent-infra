@@ -2928,6 +2928,29 @@ else
   else
     echo "ok: a successful install leaves no temp file behind"
   fi
+  # ARM 3b: a DIRECTORY at the predictable scratch name. On a FRESH destination an unguarded install
+  # would `cp` into that directory and `mv` it onto `$dest` — rc=0, the leg counts a copy, and
+  # `$DEST/scripts/<gate>` is a DIRECTORY. Two details make this arm honest, and both were measured
+  # against the real helper: (1) the destination must NOT pre-exist — with an existing regular file
+  # `mv` refuses on its own (`cannot overwrite non-directory ... with directory`), returning the same
+  # rc=1 and the same untouched destination as the guard, so the arm would pass with the guard deleted;
+  # (2) the refusal's OWN words must be seen, or `mv`'s message impersonates it.
+  rm -f "$ATOM_DIR/fresh.sh"
+  rm -rf "$ATOM_DIR/fresh.sh.tmp.$$"
+  mkdir -p "$ATOM_DIR/fresh.sh.tmp.$$"
+  scratch_rc=0
+  scratch_err="$(farm_install "$TMP/atomic-src.sh" "$ATOM_DIR/fresh.sh" 2>&1)" || scratch_rc=$?
+  if [ "$scratch_rc" -eq 0 ]; then
+    fail "farm_install reported SUCCESS with a DIRECTORY at its scratch name — nothing was delivered at $ATOM_DIR/fresh.sh"
+  elif [ -e "$ATOM_DIR/fresh.sh" ]; then
+    fail "the scratch-directory refusal still left something at $ATOM_DIR/fresh.sh"
+  elif ! grep -q 'refusing to use it as scratch' <<<"$scratch_err"; then
+    fail "the scratch-directory refusal did not say so in its own words (got: $scratch_err) — mv's refusal would satisfy this arm just as well"
+  else
+    echo "ok: a directory at the scratch name is refused, in its own words, with nothing delivered"
+  fi
+  rm -rf "$ATOM_DIR/fresh.sh.tmp.$$"
+
   # ARM 2: the discriminator. A write-through install succeeds here; a temp+rename cannot.
   printf '#!/bin/bash\necho OLD\n' > "$ATOM_DIR/gate.sh"
   chmod 755 "$ATOM_DIR/gate.sh"

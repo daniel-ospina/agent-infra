@@ -543,6 +543,12 @@ printf 'not the scratch shape\n' > "$C30/scripts/beta.sh.tmp"
 run "$C30/scripts"
 ck $([ "$RC" -eq 3 ] && echo 0 || echo 1) '...while a tmp name WITHOUT a pid is still UNSOURCED (rc='"$RC"') - the exemption is the shape, not the word'
 rm -f "$C30/scripts/beta.sh.tmp"
+# the pid suffix must be ALL digits: `foo.tmp.1-old` is a box-local file nothing explains, and grading
+# it benign would certify an UNSOURCED file at rc=0 — the one outcome this instrument must not produce.
+printf 'not a pid\n' > "$C30/scripts/foo.tmp.1-old"
+run "$C30/scripts"
+ck $([ "$RC" -eq 3 ] && echo 0 || echo 1) '...and a suffix that only STARTS with a digit is still UNSOURCED (rc='"$RC"')'
+rm -f "$C30/scripts/foo.tmp.1-old"
 # a REAL repo file named like the scratch: the source must win, so its stale bytes are STALE (rc=1),
 # never exempted. Committed here because case 30 runs after every case that uses $SEED.
 printf '#!/bin/bash\necho shadow-v1\n' > "$SRC/scripts/shadow.tmp.7"
