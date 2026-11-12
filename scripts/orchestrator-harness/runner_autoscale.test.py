@@ -2573,6 +2573,62 @@ def t61_every_slot_unusable_is_loud():
             box.destroy()
 
 
+@test("T62 a SHARED registration is FLAGGED — a busy name this box does not serve is not its capacity")
+def t62_cross_box_duplicate_is_flagged():
+    """agent-infra#4004, the cross-box acceptance item.
+
+    Measured: cell-2 owned `pi-runner-x64-1..4`; cell-4 held a STALE COPY registered under
+    `pi-runner-x64-1` — a LIVE registration served by cell-2 — reported `online busy=true` while
+    cell-4's listener crash-looped. An `agentName` is a REGISTRATION identity (actions/runner's
+    ConfigurationManager refuses or `--replace`s a duplicate name), so both boxes answer to one
+    registration and a per-box audit counted the job as cell-4's capacity, forever.
+
+    ⛔ THE PAIR IS THE ASSERTION. `busy` plus NO local worker is the discriminator; a listener that
+    merely died reads `online` at GitHub until its session times out, and that is the ordinary DEAD
+    slot this tool repairs — flagging THAT as "another box's" would be a positive claim from a
+    negative measurement. So the second half of this case pins the false positive away."""
+    with Env():
+        box = Box("shared-name")
+        try:
+            inst = box.install("gh-runner-x64", "r-shared")
+            box.alive([])  # no listener of ours: its session is being served elsewhere
+            box.disk(500_000)
+            box.pool([("r-shared", "online", True, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            # a DRY RUN: this case is about the CLASSIFICATION, and a real pass would also try to
+            # fill the box (its target is above `live`), which is a different subject.
+            record = converge(box, nproc="4", want=1, dry_run=True)
+            names = [e["name"] for e in record.get("shared_registrations", [])]
+            check(
+                names == ["r-shared"],
+                f"a BUSY registration with no worker of ours must be flagged: "
+                f"{record.get('shared_registrations')}",
+            )
+            check(
+                record["shared_registrations"][0]["dir"] == inst,
+                f"…naming the install to retire: {record['shared_registrations']}",
+            )
+            check(
+                any("SHARED REGISTRATION r-shared" in n for n in record["notes"]),
+                f"…and for a human, never silent: {record['notes']}",
+            )
+            check(
+                record["problems"] == [],
+                "it is report-only: nothing was changed, so it must not become a `problem` (that "
+                f"would mask `starvation`): {record['problems']}",
+            )
+            # ⛔ THE FALSE-POSITIVE ARM: online but IDLE, no local listener — an ordinary DEAD slot.
+            # Flagging this would call a repair a duplicate, on every pass of every box.
+            box.pool([("r-shared", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            dead = converge(box, nproc="4", want=1, dry_run=True)
+            check(
+                dead.get("shared_registrations") == [],
+                "an ONLINE-but-IDLE slot with no listener is DEAD, not another box's: "
+                f"{dead.get('shared_registrations')}",
+            )
+        finally:
+            box.destroy()
+
+
 # ── 7. THE REVIEW-ROUND-7 FINDINGS ────────────────────────────────────────────────────────────
 @test("T26 a PROVISIONER REFUSAL must not silence the starvation alarm — it is the pass that exits 0")
 def t26_refusal_does_not_silence_the_alarm():
@@ -5040,6 +5096,14 @@ MUTATIONS = [
         "a slot the provisioner refused to fill this pass is asked for AGAIN inside the same pass, "
         "so a `.runner`-less directory costs every one of the pass's steps — and the box never "
         "reaches the next free index (agent-infra#4004 P1-b)",
+    ),
+    Mutation(
+        "T62",
+        "        if entry is not None and entry.busy and r.name and not _worker_alive(r):",
+        "        if False:  # MUTATION: the cross-box duplicate is never flagged",
+        "a registration two boxes share is served SILENTLY: the pass counts a job it is not running "
+        "as this box's capacity — the measured cell-4 shape, where a busy registration served by "
+        "cell-2 read as cell-4's runner while cell-4's own listener crash-looped (agent-infra#4004)",
     ),
     Mutation(
         "T60",

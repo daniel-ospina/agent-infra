@@ -204,6 +204,15 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
   human re-registers it", not as "the box is short a runner": its listener may still be live and
   still counted in `running`/`live`.
 
+  ⛔ `--json` CONSUMERS: `shared_registrations` is the CROSS-BOX channel (agent-infra#4004). It is a
+  LIST of `{name, dir, state, why}`, one entry per install whose `agentName` the pool reports BUSY
+  while NO worker of that install is running on this box — i.e. one GitHub registration carried by two
+  boxes, with the job being served elsewhere. Read it as "this slot is not this box's capacity", and
+  as a name to retire or rename by hand: nothing here repairs it (a destructive arm takes a name, and
+  that name belongs to the other box too). It is deliberately report-only and NOT a `problem`: the
+  pass changed nothing it should not have, so it must not mask `starvation` (exit 4). It is derived
+  from the classification, so it is published on passes that stop early.
+
   ⛔ `--json` CONSUMERS: `starvation` is THREE-VALUED and the healthy value is `"ok"`. `"starved"` is
   the alarm; `"unmeasured"` means the queue could not be read and the invariant was NOT evaluated —
   never read that as healthy (a monitor whose test is `starvation != "starved"` treats blindness as
@@ -3149,6 +3158,7 @@ def converge(
 
     # 4. CLASSIFY ------------------------------------------------------------------------------
     classified: list[dict] = []
+    served_elsewhere: list[dict] = []
     for r in local:
         entry = pool.get(r.name)
         # ⛔ THE ORDER OF THESE BRANCHES IS THE SAFETY PROPERTY (review rounds 1–2).
@@ -3184,6 +3194,32 @@ def converge(
             state = "SERVING"
         else:
             state = "DEAD"
+        # ⛔ A REGISTRATION THIS BOX DOES NOT SERVE — the CROSS-BOX duplicate (agent-infra#4004).
+        # An `agentName` is a REGISTRATION identity, not a per-box label: two boxes holding the same
+        # name share ONE registration (actions/runner's ConfigurationManager refuses or `--replace`s
+        # a duplicate name), so a stale copy on box B can be "online, busy=true" while box A serves
+        # the job. Measured: cell-4 held a stale copy of `pi-runner-x64-1` — a registration served by
+        # cell-2 — reported `online busy=true` while cell-4's own listener crash-looped, so a
+        # per-box audit counted a job it was not running as this box's capacity and nothing ever
+        # flagged it.
+        # ⛔ THE DISCRIMINATOR IS `busy` PLUS "NO LOCAL WORKER", NOT "online with no listener". A
+        # listener that merely died reads online at GitHub for a while (the session has not timed
+        # out yet), and that is the ordinary DEAD slot this tool repairs — calling it "another
+        # box's" would be a positive claim from a negative measurement (`ps` saw no Worker). `busy`
+        # says a JOB is executing: if no worker of THIS install is running, it is executing
+        # somewhere else, under a name this install also carries. Reported, never repaired: the
+        # registration is not ours to touch, and the destructive arms here take a name.
+        if entry is not None and entry.busy and r.name and not _worker_alive(r):
+            served_elsewhere.append(
+                {
+                    "name": r.name,
+                    "dir": str(r.directory),
+                    "state": state,
+                    "why": "the pool reports this registration BUSY while no worker of this "
+                    "install is running — the job is being served under a name this box also "
+                    "carries, so this slot is not this box's capacity",
+                }
+            )
         classified.append(
             {
                 "name": r.name,
@@ -3234,6 +3270,14 @@ def converge(
             "makes this slot look FREE to the provisioner — it then installs a SECOND runner into "
             "the directory that listener is still running from."
         )
+    for entry in served_elsewhere:
+        record["notes"].append(
+            f"SHARED REGISTRATION {entry['name']} ({entry['dir']}): {entry['why']}. Two boxes "
+            "carrying one `agentName` share ONE GitHub registration, so a per-box audit counts a "
+            "job it is not running as this box's capacity. Nothing was changed here (that name is "
+            "the other box's too): retire or rename this copy deliberately, then re-register it "
+            "under this box's own prefix (agent-infra#4004)"
+        )
     record.update(
         ncpu=ncpu,
         mem_available_mb=mem_mb,
@@ -3251,6 +3295,11 @@ def converge(
         # deliberately not a `problem`. Appending there published `"config_lost": []`, a
         # positive claim that nothing is lost, on exactly the passes that stopped early.
         config_lost=[str(c["dir"]) for c in classified if c["state"] == "CONFIG-LOST"],
+        # ⛔ THE CROSS-BOX CHANNEL (agent-infra#4004). A registration whose job is being served by a
+        # box OTHER than this one, because both boxes carry the same `agentName`. Derived from the
+        # classification, never appended in a repair loop — so it is published on passes that stop
+        # early too. Report-only by design (see the classify branch for the discriminator).
+        shared_registrations=served_elsewhere,
         local=[{"dir": str(r.directory), "name": r.name} for r in local],
         pool_total=len(pool),
         pool_online=sum(1 for e in pool.values() if e.online),
