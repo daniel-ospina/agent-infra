@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12195-1794512935-p3798148-ba48c131",
+  "_sha": "f15a2dafc9194d754812e4594817d480646cba1c",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12195.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/12051-pgdg-own-apt-paths"
+    },
+    {
+      "kind": "sha",
+      "value": "af06c42d51346551796d6439cf32f47ec8f25d27"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/rev12117"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 4551,
+  "ended_at": 1794517486,
+  "exit_code": 0,
+  "heartbeat_at": 1794517486,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12195-1794512935-p3798148-ba48c131",
+  "lease_until": 1794525286,
+  "pid": 3798148,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794512935,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-12195",
+  "worktree": "/home/cmux/tortoise/.worktrees/rev12117"
+}
