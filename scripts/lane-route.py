@@ -91,6 +91,12 @@ class CmuxSurface(triage_arms.Surface):
 
     def __init__(self, sessions=None):
         self.sessions = dict(sessions or {})
+        # ⛔ WHAT WAS ACTUALLY TYPED, PER WORKSPACE (round 2 review, #4046 P2). `triage_arms`
+        # verifies the QUESTION MANDATE against the text the lane received, not against the text the arm
+        # composed — a transport that silently truncated is the #1187 class. Without this record that
+        # check degenerates into a self-check in production while reading as a property.
+        # The payload is the FLATTENED form (one line: a newline in `cmux send` submits its own turn).
+        self.last_sent = {}
 
 
     def list_workspaces(self):
@@ -125,6 +131,10 @@ class CmuxSurface(triage_arms.Surface):
         # several separate turns (`cadence-nudge.sh` records the owner's "it's a mess" report).
         flat = " ".join((text or "").split())
         rc, _, _ = _cmux(["send", "--workspace", ws, flat + "\n"])
+        if rc == 0:
+            # Recorded only on a successful send: a refused send typed nothing, and claiming a record
+            # for it would let the mandate check read text the lane never received.
+            self.last_sent[ws] = flat
         return rc == 0
 
     def transcript_size(self, ws):
@@ -185,8 +195,9 @@ def evidence_for(row, read_text=True, read_screen=False, surface=None):
     age = tool.get("age") if tool else None
     cap_s = tool.get("timeout") if tool else None
     # `timeout` is declared in SECONDS and `age` in seconds too — compare like with like.
-    budget_open = bool(tool_in_flight and isinstance(age, int) and isinstance(cap_s, (int, float))
-                       and cap_s > 0 and age < cap_s)
+    budget_read = bool(tool_in_flight and isinstance(age, int)
+                       and isinstance(cap_s, (int, float)) and cap_s > 0)
+    budget_open = bool(budget_read and age < cap_s)
     child = row.get("child") or {}
     child_state = ""
     if row.get("verdict") == "CHILD-STUCK":
@@ -216,6 +227,7 @@ def evidence_for(row, read_text=True, read_screen=False, surface=None):
         model_retry=triage.retry_signature(last_text),
         tool_in_flight=tool_in_flight,
         tool_budget_open=budget_open,
+        tool_budget_read=budget_read,
     ), {"ws": row.get("ws") or "", "child": child, "sid": sid}
 
 

@@ -147,18 +147,29 @@ PROOFS = {
 # ("A turn that reports finished work and then adds 'tell me if you want more' still ENDED by
 # asking"), and it reads only the last paragraph for that reason.
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
-_ASK_PHRASES = (
+# ⛔ TWO PHRASE CLASSES, NOT ONE (fresh-context review round 2, #4046 P1). The first cut matched
+# `confirm` / `approve` as BARE SUBSTRINGS, so ordinary completion prose — "Confirmed: 210 pass, 0
+# fail.", "Approved by the rail and green." — read as the lane ASKING THE OWNER. Measured: five of six
+# realistic completion endings misclassified, each one routing a finished lane to the question lane
+# and SUPPRESSING its nudge. A detector that fires on "Confirmed" is worse than no detector: it fills
+# the owner's queue with lanes that have nothing to ask.
+#   * `_ASK_FRAME`  — interrogative or a direct offer. Safe in the paragraph that ends the turn.
+#   * `_HANDOFF`    — a declarative hand-off ("blocked on your decision"). Safe in the FINAL paragraph
+#                    only; it is the sentence a lane writes INSTEAD of a question mark.
+# `confirm`/`approve` appear ONLY in their ADDRESSED forms ("please confirm", "needs your approval"),
+# because the bare stem is a report of something already done.
+_ASK_FRAME = (
     "shall i", "should i", "do you want", "want me to", "would you like",
-    "let me know", "say the word", "your call", "which one", "which option",
-    "give me the go", "go ahead?", "proceed?", "ready?", "confirm", "approve",
-    "tell me if you want", "on to the next", "does that look right",
-    # ⛔ REPORTED SHAPES THAT WERE MISSED (fresh-context review, #4046). A question is very often
-    # followed by a one-line STATUS that says the same thing in the declarative — and the first
-    # version read only the LAST paragraph, so `…Should I build the router next?\n\nBlocked on your
-    # decision.` classified as `not-asked` and `may_continue()` returned True. That is the exact
-    # harmful message this module exists to prevent, reached through its own detector.
-    "blocked on your", "waiting on you", "waiting on your", "awaiting your",
-    "over to you", "your decision", "up to you", "need your", "once you decide",
+    "your call", "which one", "which option", "which would you",
+    "give me the go", "go ahead?", "proceed?", "ready?", "does that look right",
+    "on to the next", "is that ok", "is that okay",
+)
+_HANDOFF = (
+    "let me know", "say the word", "tell me if you want", "blocked on your",
+    "waiting on you", "waiting on your", "awaiting your", "over to you",
+    "your decision", "up to you", "need your", "once you decide",
+    "please confirm", "your confirmation", "needs your approval", "needs approval",
+    "awaiting approval", "awaiting a decision",
 )
 
 ASKED = "asked"
@@ -173,17 +184,19 @@ UNREAD = "unread"
 _QUOTE_RE = re.compile(r"(?m)^\s*>.*$")
 
 
-def ending_paragraphs(text: str, n: int = 2) -> str:
-    """The assistant text's last `n` paragraphs, with fenced code and QUOTED lines removed.
+def readable_tail(text: str) -> str:
+    """The assistant text with fenced code and QUOTED lines removed.
 
-    ⛔ TWO PARAGRAPHS, NOT ONE. A question is routinely followed by a one-line declarative that
-    restates it ("Blocked on your decision.", "Waiting on you."), and reading only the final
-    paragraph classified that shape as `not-asked` — see the REPORTED SHAPES note above. The Jev
-    criteria in `scripts/turn-classify.py` say the same thing from the other side: judge the ENDING.
+    A question mark inside a code block or a quoted tool error is not the lane asking the owner
+    anything. Stripping `>` lines is what keeps `> Invalid config: which option did you mean?` out of
+    the detector while the surrounding prose is still read.
     """
-    body = _QUOTE_RE.sub("", _FENCE_RE.sub("\n\n", text or ""))
-    parts = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
-    return "\n\n".join(parts[-n:]) if parts else ""
+    return _QUOTE_RE.sub("", _FENCE_RE.sub("\n\n", text or ""))
+
+
+def last_paragraph(text: str) -> str:
+    parts = [p.strip() for p in re.split(r"\n\s*\n", readable_tail(text)) if p.strip()]
+    return parts[-1] if parts else ""
 
 
 def asks_owner(text: str) -> str:
@@ -193,23 +206,29 @@ def asks_owner(text: str) -> str:
     discipline `liveness.py` applies to an unreadable turn boundary. An empty or unparseable read
     cannot be read as `not-asked`, because that reading is the one that licenses the harmful message.
 
-    Reads the last TWO paragraphs (a question is often restated declaratively straight after it) and
-    ignores fenced code and blockquote lines (a `?` in a pasted command or a quoted tool error is not
-    the lane asking anything).
+    ⛔ A QUESTION MARK ANYWHERE IN THE READABLE TAIL IS THE SIGNAL (round 2, #4046 P1). Round 1 read
+    only the last paragraph and then only the last two; both windows were falsified by the same shape —
+    a question followed by one or two status paragraphs ("Should I merge?\n\nI checked the diff.\n\n
+    Nothing else moved."), which read `not-asked` and produced `send-continue`. Widening a paragraph
+    window only moves the boundary, so the window is gone: in an agent's own report, a `?` outside a
+    fence or a quote is addressed to the reader. The two phrase classes then cover the ASK THAT IS
+    WRITTEN WITHOUT ONE — `_ASK_FRAME` in the closing paragraph, `_HANDOFF` in the final paragraph only.
+
+    THE TRADE IS DELIBERATE AND ONE-DIRECTIONAL: a `?` quoted in prose (not blockquoted) can make a
+    comment read as a question, which costs a question-lane wake-up and one pass of nudge suppression.
+    The opposite error sends "continue" to a lane that is waiting on the owner, which is the harm this
+    entire module exists to prevent. Fail towards the cheap error.
     """
-    para = ending_paragraphs(text, 2)
-    if not para:
+    body = readable_tail(text)
+    if not body.strip():
         return UNREAD
-    low = " ".join(para.lower().split())
-    if para.rstrip().endswith("?"):
+    if "?" in body:
         return ASKED
-    for phrase in _ASK_PHRASES:
+    para = last_paragraph(body)
+    low = " ".join(para.lower().split())
+    for phrase in _ASK_FRAME + _HANDOFF:
         if phrase in low:
-            # A phrase alone is not the ending — "I asked whether the option was viable" is a
-            # statement ABOUT a question. Require it to sit in the final three sentences.
-            tail = " ".join(re.split(r"(?<=[.!?])\s+", low)[-3:])
-            if phrase in tail:
-                return ASKED
+            return ASKED
     return NOT_ASKED
 
 
@@ -267,10 +286,11 @@ class Evidence:
     ``turn``            — ``liveness.Turn`` from ``turn_from_jsonl`` (#1254). The ONLY source of
                           "positively open"; `None` means the boundary could not be read.
     ``last_text``       — the last assistant message's text, from the same tail read.
-    ``ask_signal``      — ``asked``/``not-asked``/``unread``. Supplied by a caller that ran the Jev
-                          classifier, else computed from ``last_text`` by ``asks_owner``. A supplied
-                          ``asked`` is NEVER downgraded; a supplied ``not-asked`` is NOT allowed to
-                          overrule a mechanical ``asked`` (the harm is one-directional).
+    ``ask_signal``      — ``asked``/``not-asked``/``unread``, a SEAM for a caller that has run the Jev
+                          classifier (`scripts/turn-classify.py`'s `asked_the_owner`). ⚠️ No
+                          production caller supplies it today (round 2 review, #4046): the mechanical
+                          `asks_owner` is the operative detector, and this field is tested but not
+                          wired. It may only ever PROMOTE, never demote.
     ``lane_verdict``    — a PUBLISHED ``lane-status.py`` verdict string, or ``""`` when unread. It is
                           the only source of CHILD-STUCK / CHILD-OVERDUE / LONG-TOOL / WEDGED.
     ``child_state``     — the child's own recorded state (``""``, ``stuck``, ``overdue``, ``healthy``).
@@ -295,6 +315,11 @@ class Evidence:
     model_retry: Optional[bool] = None
     tool_in_flight: bool = False
     tool_budget_open: bool = False
+    # ⛔ "UNREADABLE" AND "EXPIRED" ARE DIFFERENT EVIDENCE (round 2, #4046 P2). The first cut folded
+    # both into `tool_budget_open=False`, so a tool past its DECLARED timeout was parked at `wait` with
+    # a reason that MISSTATED the reading ("not late on evidence"). A late call is the opposite: the
+    # budget is read and gone, which is a positive reason to look.
+    tool_budget_read: bool = False
 
 
 @dataclass(frozen=True)
@@ -380,7 +405,16 @@ def route(ev: Evidence) -> Route:
         return Route(route="wedged", subcase="tool-in-flight", action=REMEDIES["tool-in-flight"],
                      proof=PROOFS[REMEDIES["tool-in-flight"]],
                      reason="a tool is in flight inside its own DECLARED budget — it is not late yet",
-                     evidence="lane-status verdict=%r" % (ev.lane_verdict,))
+                     evidence="lane-status verdict=%r budget=read-open" % (ev.lane_verdict,))
+
+    if ev.tool_in_flight and ev.tool_budget_read and not ev.tool_budget_open:
+        # The budget was READ and is GONE. That is not "not late on evidence" — it is late, and
+        # pretending otherwise is how a lane that overran its own declared timeout sits parked.
+        sc = "tool-in-flight"
+        return Route(route="wedged", subcase=sc, action="inspect", proof=PROOFS["inspect"],
+                     reason="the in-flight tool has OVERRUN its own declared budget — inspect before "
+                            "acting, because a long tool is still not proof of a stall",
+                     evidence="lane-status verdict=%r budget=read-expired" % (ev.lane_verdict,))
 
     if ev.lane_verdict == "CHILD-STUCK" or ev.child_state == "stuck":
         sc = "child-stuck"
@@ -407,12 +441,12 @@ def route(ev: Evidence) -> Route:
                      evidence="model_retry=True")
 
     if ev.tool_in_flight:
-        # In flight with NO declared budget still open: nothing proves it late either. `wait` — the
-        # subcase exists so that "I saw a tool" can never become "kill it".
+        # In flight with NO readable budget: nothing proves it late either. `wait` — the subcase exists
+        # so that "I saw a tool" can never become "kill it".
         sc = "tool-in-flight"
         return Route(route="wedged", subcase=sc, action=REMEDIES[sc], proof=PROOFS[REMEDIES[sc]],
                      reason="a tool is in flight and its budget is not readable — not late on evidence",
-                     evidence="tool_budget_open=False")
+                     evidence="tool_budget_read=False")
 
     if ev.lane_verdict == "WEDGED":
         if _turn_open(ev):

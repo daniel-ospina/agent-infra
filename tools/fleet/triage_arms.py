@@ -237,7 +237,12 @@ def arm_user_question(ws: str, lane: str, question: str, surface: Surface) -> Pr
 
     # (2) the mandate, read back at the artifact: the SENT text is what counts, and the surface
     # reports the text it typed (a transport that silently truncated is the #1187 class).
-    sent_text = getattr(surface, "last_sent", {}).get(qws, brief) if hasattr(surface, "last_sent") else brief
+    # ⛔ THE RESIDUAL, STATED RATHER THAN IMPLIED (round 2, #4046 P2): this is a real read-back only for
+    # a surface that records what it typed. `CmuxSurface.send` does (`last_sent`), so production takes
+    # the honest path; a surface that keeps no record falls back to the composed brief, i.e. the check
+    # degenerates to a self-check — which is why the surface is REQUIRED to record it and
+    # `test_the_surface_records_what_it_typed` pins `CmuxSurface.send` to do so.
+    sent_text = getattr(surface, "last_sent", {}).get(qws, brief)
     still_missing = mandate_missing(sent_text)
     verified = bool(sent and moved and not still_missing)
     reason = ("landed with the full mandate" if verified else
@@ -298,7 +303,10 @@ def arm_boot_prompt(ws: str, lane: str, surface: Surface, dispatch) -> Proof:
                  ("dispatcher rc=%s" % (rc,)) if blocked is None else
                  "the boot prompt is STILL on the pane",
                  {"lane": lane, "ws": ws, "dispatch_rc": rc, "boot_prompt": blocked},
-                 sent=True)
+                 # ⛔ `sent` IS A FACT, NOT A CONSTANT (round 2, #4046 P2). `3` is the dispatcher's
+                 # REFUSED (nothing sent), so a hardcoded `True` made the record contradict its own
+                 # detail — and `sent` is what a reader uses to tell "we tried" from "we did not".
+                 sent=rc in (0, 4))
 
 
 def arm_child(lane: str, child: dict) -> Proof:

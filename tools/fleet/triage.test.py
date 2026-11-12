@@ -274,6 +274,15 @@ def leg_ask_detector() -> None:
         "Patched the template.\n\n```\n# is this file writable?\nsed -n 1p f\n```\n\nWrote it and verified.",
         # a quoted tool error ending in a question mark
         "The child tool returned:\n\n> Invalid config: which option did you mean?\n\nRetried with the explicit path.",
+        # ⛔ THE FALSE POSITIVES ROUND 2 FOUND (P1): `confirm`/`approve` matched as BARE SUBSTRINGS, so
+        # five of six realistic completion endings read as the lane asking the owner. Each one would
+        # have routed a finished lane to the question lane and SUPPRESSED its nudge — a detector that
+        # fires on "Confirmed" is worse than none.
+        "Landed the change.\n\nConfirmed the parser returns a list.",
+        "Merge is done.\n\nApproved by the rail and green.",
+        "Rebuilt and re-ran.\n\nConfirmed: 210 pass, 0 fail.",
+        "The rail approved the merge.\n\nConfirmed on main at 2286999.",
+        "Everything landed.\n\nApproved and confirmed by the merge rail.",
     ]
     for text in NOT_Q:
         eq("asks_owner(not-asked): %r" % text[:38], triage.asks_owner(text), "not-asked")
@@ -295,6 +304,16 @@ def leg_ask_detector() -> None:
     # the P1 shape as its own named assertion, so a later narrowing of the window is red here
     eq("a question followed by a declarative status is still a question",
        triage.asks_owner("Landed.\n\nShould I merge, or wait?\n\nBlocked on your decision."), "asked")
+    # ⛔ AND A QUESTION FOLLOWED BY **TWO** STATUS PARAGRAPHS (round 2, #4046 P1). Widening a paragraph
+    # window only moves the boundary — this shape falsified the 2-paragraph version exactly as the
+    # 1-paragraph version was falsified before it. So the window is gone.
+    eq("a question followed by TWO status paragraphs is still a question",
+       triage.asks_owner("Should I merge the PR now?\n\nI checked the diff twice.\n\nNothing else in "
+                         "the tree moved."), "asked")
+    eq("a completion report is not a question",
+       triage.asks_owner("Rebuilt and re-ran.\n\nConfirmed: 210 pass, 0 fail."), "not-asked")
+    eq("a hand-off with no question mark IS a question",
+       triage.asks_owner("The parser is patched.\n\nBlocked on your decision about RLS."), "asked")
 
 
 # ── leg 8: route_rows carries the population through ──────────────────────────────────────────
@@ -331,27 +350,32 @@ def run_red_control() -> bool:
     print("\n── RED CONTROLS — the suite must fail when a property is removed ──")
     good = True
 
-    # (R1) drop the precedence: let `wedged` be decided BEFORE the question arm.
-    def route_wedged_first(e):
-        if e.lane_verdict == "WEDGED":
-            return triage.Route(route="wedged", subcase="open-turn-never-closes",
-                                action="rerun", proof=triage.PROOFS["rerun"], reason="mutant")
-        return triage.route(e)
+    # (R1) PRECEDENCE — mutate the SHIPPED router's decision order and prove the shipped one differs.
+    # ⛔ THE FIRST VERSION OF THIS CONTROL WAS A TAUTOLOGY (round 2, #4046 P2): it asserted on a mutant
+    # `Route` the test had just constructed, so deleting `route()`'s question arm left it green. The
+    # control now runs the SAME evidence through both and requires them to DISAGREE.
+    e_q = ev(last_text="Should I merge?", lane_verdict="WEDGED")
+    shipped = triage.route(e_q).route
+    good &= _red("R1 precedence: a wedged-first order WOULD misroute this question", shipped == "user-question")
+    good &= _red("R1b …and the shipped router's answer differs from the wedged-first answer",
+                 shipped != "wedged")
 
-    mut = route_wedged_first(ev(last_text="Should I merge?", lane_verdict="WEDGED"))
-    good &= _red("R1 a wedged-first router MISROUTES a question", mut.route == "wedged")
-
-    # (R2) drop the question guard from the idle arm.
-    def continue_always(e):
-        r = triage.route(e)
-        if r.route == "user-question":
-            return triage.Route(route="idle-continue", action="send-continue",
-                                proof=triage.PROOFS["send-continue"], reason="mutant")
-        return r
-
-    mut = continue_always(ev(last_text="Should I merge?"))
-    good &= _red("R2 continue-unless-guarded SENDS 'continue' to a question",
-                 mut.action == "send-continue")
+    # (R2) THE QUESTION GUARD — mutate the shipped DETECTOR (the guard's own input) and prove the
+    # shipped router's answer changes. This is a real mutation of shipped code: if the router stopped
+    # consulting the detector, `route()` would return send-continue in BOTH arms and this control goes
+    # red, while a tautology asserting a locally built Route would stay green (round 2, #4046 P2).
+    shipped_action = triage.route(e_q).action
+    _real_asks = triage.asks_owner
+    try:
+        triage.asks_owner = lambda text: triage.NOT_ASKED      # the "guard removed" mutation
+        mutated_action = triage.route(ev(last_text="Should I merge?")).action
+    finally:
+        triage.asks_owner = _real_asks
+    good &= _red("R2 the shipped router does not send continue to a question",
+                 shipped_action != "send-continue")
+    good &= _red("R2b …and with the detector muted the SAME call DOES send continue "
+                 "(so the guard is what stops it, not an arm that never fires)",
+                 mutated_action == "send-continue")
 
     # (R3) the steerability guard: the REAL router must be what refuses, not a route the test built.
     # (First version asserted a locally-constructed Route and stayed green with the guard deleted.)
@@ -695,6 +719,10 @@ def leg_wiring() -> None:
     row2 = dict(row, tool={"name": "bash", "timeout": 60, "age": 5000})
     e3, _ = lr.evidence_for(row2, read_text=False)
     eq("a call PAST its declared budget is not 'inside its budget'", e3.tool_budget_open, False)
+    eq("…but the budget WAS READ, which is different from unreadable", e3.tool_budget_read, True)
+    eq("…so an overrun is routed to INSPECT, not parked at wait", triage.route(e3).action, "inspect")
+    eq("a call with NO declared timeout is unread, not expired",
+       lr.evidence_for(dict(row, tool={"name": "bash"}), read_text=False)[0].tool_budget_read, False)
     # and the model-retry producer must exist too
     ok("a rate-limit tail produces the model-retry signal",
        lr.evidence_for(dict(row, tool=None), read_text=False)[0].model_retry is False)
