@@ -2764,7 +2764,15 @@ rm -rf "$_ghdir" "$_rdir"
 # through a PATH FILE rather than by expanding them into its own body: an expansion here would pin this
 # file's copy of the traps instead of the script's, which is the failure mode the whole suite is built to
 # avoid. What each arm can and cannot see is stated at the arm.
-_asut="$HERE/auto-rail.sh"
+# ⛔ THE CHILD IS POINTED AT THE **RESOLVED** SUT, NEVER AT THE TRACKED PATH (review finding, P2 — and the
+# reviewer supplied the reproduction below, which this file now runs). `SUT=${AUTO_RAIL_SCRIPT:-…}` at the
+# top is this suite's documented way to test a COPY; hardcoding `$HERE/auto-rail.sh` here meant that with an
+# override set, arms 1-3 drove the PRISTINE file while every text pin read the copy — so the three
+# behaviours they exist to prove (`interruptible_sleep`'s body, `release_lock`'s ownership check,
+# `stop_on_signal`'s `exit 0`) could be mutated in the copy and this section would still report green.
+# Reproduced at the fix's head: with AUTO_RAIL_SCRIPT pointing at a copy whose `interruptible_sleep` body was
+# reverted to a foreground sleep, the suite returned rc=0 (a false PASS) before this line and rc=1 after it.
+_asut="$SUT"
 _ad=$(mktemp -d)
 printf '%s\n' "$_asut" > "$_ad/sut"
 # ⛔ THE CHILD LOOPS IN `interruptible_sleep 300`, NOT A SHORTER SLEEP: the arm's point is that a stop
@@ -2779,11 +2787,15 @@ eval "$(sed -n '/^release_lock() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^interruptible_sleep() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^stop_on_signal() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^install_stop_traps() {/,/^}$/p' "$SUT")"
+# ⛔ THE ARGUMENTS ARE BOUND **BEFORE** THE PRESENCE CHECK (review finding, P3): under `set -u` the
+# `>> "$LOG"` in the branch below was an unbound-variable error, so the shell died writing nothing and
+# arm 1's MISSING-FN assertion could never fire — an inert diagnostic on the one path an operator needs it
+# (a reformatted function header, which breaks the `sed` extraction silently).
+LOCK=$1; LOG=$2; MODE=$3
 for _f in release_lock interruptible_sleep stop_on_signal install_stop_traps; do
   command -v "$_f" >/dev/null || { echo "MISSING-FN $_f" >> "$LOG"; exit 9; }
 done
 log_line() { printf '%s\n' "$*" >> "$LOG"; }
-LOCK=$1; LOG=$2; MODE=$3
 mkdir "$LOCK.d"
 case "$MODE" in
   own)     printf '%s\n' "$$" > "$LOCK.d/pid" ;;
