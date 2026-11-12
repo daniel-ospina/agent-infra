@@ -64,6 +64,14 @@ if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_reso
 # ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT, and this file renders it into a unit.
 [ -n "$CELL_HOME" ] || { printf '  ❌ %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 O="${O:-$CELL_HOME/orchestrator}"
+# ⛔ THE STATE DIR THIS VERB REPORTS ON MUST BE THE ONE ITS CHILD READS (review P1, round 2 on #4017).
+# `O` was a PLAIN assignment, so `"$SCRIPT" status` below ran with its OWN default ($HOME/orchestrator)
+# while this installer had resolved $CELL_HOME/orchestrator — and on a cell `cmux vm exec` hands over
+# HOME=/home/ubuntu (scripts/lib/cell-home.sh's header records it), so the child found no record, called
+# itself STALE and the folded exit code turned a HEALTHY supervisor into `REFUSING`. Export it: the
+# read-backs after --install (225/243) had the same mismatch and always printed the "first pass may
+# still be running" warning for it.
+export O
 SUDO="${SUDO:-sudo -n}"
 INTERVAL_S="${WORKER_SUPPLY_INTERVAL_S:-60}"
 PREFIX="${WORKER_SUPPLY_PREFIX:-prd-}"

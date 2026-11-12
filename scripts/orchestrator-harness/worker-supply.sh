@@ -190,6 +190,13 @@ LOCK_DIR="$STATE_DIR/worker-supply.lock"
 LEDGER="$STATE_DIR/worker-supply-offers.tsv"
 RETIRED="$STATE_DIR/worker-supply-retired.tsv"
 RECORD="$STATE_DIR/worker-supply.state"
+# ⛔ A PASS THAT IS STILL WORKING MUST NOT READ AS DEAD (review P2, round 2 on #4017). `$RECORD` only
+# advances at pass END, so a legitimately long pass (up to `cap x SPAWN_CALL_TIMEOUT` on the re-offer
+# walk, plus one PROBE_TIMEOUT per order on the census walk) left the previous pass's mtime on disk for
+# its whole duration and `status` called it STALE. The START of a real pass is therefore its own marker:
+# `status` reads the newest of the two, and a start marker that is ITSELF older than the bound is a
+# WEDGED pass, not a working one. Written by real passes only — `--dry-run` still writes NOTHING.
+PASS_BEAT="$STATE_DIR/worker-supply.pass-start"
 LOG="$STATE_DIR/worker-supply.log"
 
 # ── bounded probes: perl's alarm survives `exec`, which is why it is the bound ──────────────────
@@ -660,6 +667,10 @@ pass() {
   local wt_now prompt_now ret_reason
 
   mkdir -p "$STATE_DIR" 2>/dev/null || { log_line "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
+  # see PASS_BEAT: stamped BEFORE the walks, so a long pass is visibly working rather than silent
+  if [ "$DRY" = 0 ]; then
+    { date +%s > "$PASS_BEAT.tmp"; } 2>/dev/null && mv -f "$PASS_BEAT.tmp" "$PASS_BEAT" 2>/dev/null || true
+  fi
   plenv="$STATE_DIR/.worker-supply.plistenv"
   plist_env_dump "$ORCH_PLIST" "$plenv"
   fix="$(limit_of MAX_FIX "$DEFAULT_MAX_FIX" "$plenv")"
@@ -806,6 +817,13 @@ pass() {
         elif retire_order "$name" "$f" brief-refused; then
           retired_new=$(( retired_new + 1 )); retired=$(( retired + 1 )); dead=$(( dead - 1 ))
           log_line "$name: RETIRED — the brief recorded for the order is REFUSED by the brief gate (rc=80) and the record is ${age}s old (TTL ${RETIRE_TTL_S}s), so this supervisor has been unable to re-offer it for longer than the TTL. It leaves the pool. The composer (pr-doctor.py) writes a fresh brief and a fresh record if the PR is still open, which un-retires it (agent-infra#3958, #4007): $BRIEF_GATE_USED says: $(printf '%s' "$BRIEF_GATE_WHY" | cut -c1-300)"
+        else
+          # ⛔ AN UNWRITABLE RETIREMENT IS SAID OUT LOUD HERE TOO (review P3, round 2 on #4017): without
+          # this arm the order was skipped SILENTLY -- no log line, and the `continue` also skipped the
+          # `stale_brief` count, so the record's durable `stale_briefs=` lost a fossil the previous
+          # release reported as `REGENERATION REQUIRED`. A failed retirement is still a REFUSED BRIEF.
+          stale_brief=$(( stale_brief + 1 ))
+          log_once "$name:retire-failed" "$name: RETIREMENT FAILED (reason=brief-refused) — $RETIRED could not be written, so this fossil stays in the pool; it is counted in stale_briefs= and still needs REGENERATION by pr-doctor: $(printf '%s' "$BRIEF_GATE_WHY" | cut -c1-200)"
         fi
         continue
       fi
@@ -972,16 +990,28 @@ show_status() {
   # bound is what a DEAD or WEDGED supervisor looks like from outside, so it is named `STALE` and it
   # EXITS 5 -- a monitor that reads the code (a lane, `set -e`, an activation grid) gets a verdict rather
   # than an `ActiveState=active` over a loop that stopped passing.
-  if m_age="$(mtime_of "$RECORD")" && [ -n "$m_age" ]; then
-    age=$(( $(date +%s) - m_age ))
+  local rec_m pass_m newest
+  rec_m="$(mtime_of "$RECORD")"; pass_m="$(mtime_of "$PASS_BEAT")"
+  case "${rec_m:-}" in ''|*[!0-9]*) rec_m="" ;; esac
+  case "${pass_m:-}" in ''|*[!0-9]*) pass_m="" ;; esac
+  newest="${rec_m:-}"
+  if [ -n "$pass_m" ] && { [ -z "$newest" ] || [ "$pass_m" -gt "$newest" ]; }; then newest="$pass_m"; fi
+  if [ -n "$newest" ]; then
+    age=$(( $(date +%s) - newest ))
     if [ "$age" -gt "$STALE_AFTER_S" ]; then
-      beat="STALE — the last completed pass was ${age}s ago, over the ${STALE_AFTER_S}s bound: the process that should be passing is DEAD or WEDGED, not idle"
+      if [ -n "$pass_m" ] && [ "$pass_m" = "$newest" ]; then
+        beat="STALE — a pass STARTED ${age}s ago and has not finished, over the ${STALE_AFTER_S}s bound: the process is WEDGED (or died mid-pass), not working"
+      else
+        beat="STALE — the last completed pass was ${age}s ago, over the ${STALE_AFTER_S}s bound: the process that should be passing is DEAD or WEDGED, not idle"
+      fi
       rc=5
+    elif [ -n "$pass_m" ] && [ "$pass_m" = "$newest" ]; then
+      beat="ok — a pass is IN PROGRESS (started ${age}s ago; the completed-pass record updates when it ends, bound ${STALE_AFTER_S}s)"
     else
       beat="ok — last completed pass ${age}s ago (bound ${STALE_AFTER_S}s)"
     fi
   else
-    beat="STALE — no completed pass has EVER written $RECORD here (bound ${STALE_AFTER_S}s); a supervisor whose record is absent has supplied nothing, and this box cannot tell a first boot from a death"
+    beat="STALE — no pass has EVER written $RECORD or $PASS_BEAT here (bound ${STALE_AFTER_S}s); a supervisor whose record is absent has supplied nothing, and this box cannot tell a first boot from a death"
     rc=5
   fi
   echo "beat:  $beat"

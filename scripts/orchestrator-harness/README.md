@@ -3435,9 +3435,14 @@ shape was a process alive **16 days** whose log had stopped **2 days** earlier �
 the last completed pass record against `WORKER_SUPPLY_STALE_AFTER_S` (default `5 x INTERVAL_S`, floored at
 300 s), prints `beat:  ok` / `beat:  STALE`, and **exits 5** on STALE — including when no pass has EVER
 written a record here, which is the first-boot/death ambiguity a monitor must not have to guess.
-`install-worker-supply.sh --status` folds that code in, so `active: yes` can no longer outvote a
-supervisor that stopped passing. `worker-supply.test.sh` case (m) pins both directions and the knob as
-the discriminator.
+`install-worker-supply.sh --status` folds that code in (and **exports** the `O` it resolved, so the child
+it judges reads the same state dir — unexported, a cell's `cmux vm exec` HOME made a HEALTHY supervisor
+read `STALE`), so `active: yes` can no longer outvote a supervisor that stopped passing. ⛔ **A pass that
+is still WORKING is not a dead one**: `$RECORD` only advances at pass END, so every real pass also stamps
+its START into `worker-supply.pass-start` and `status` grades the NEWEST of the two — `beat:  ok — a pass
+is IN PROGRESS` while it walks the pool, and `STALE … WEDGED` when that start marker itself passes the
+bound (so the in-progress arm cannot be inert). `worker-supply.test.sh` case (m) pins every direction and
+the knob as the discriminator.
 
 ```bash
 bash worker-supply.sh status     # the last pass record + a FRESH live count + the heartbeat verdict (exit 5 = STALE)

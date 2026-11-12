@@ -835,7 +835,23 @@ EOS
     WORKER_SUPPLY_SCRIPT="$TMP/sup-broken.sh" bash "$INSTALLER" --status >"$TMP/status-broken.out" 2>&1; rcs_broken=$?
   [ "$rcs_broken" = "1" ] && ok "…and an UNREADABLE supervisor verdict (status exited 7) fails closed (rc=1), not healthy" \
     || bad "--status exited $rcs_broken for a supervisor whose own status could not be read (a false PASS): $(tail -2 "$TMP/status-broken.out")"
-  touch -t 202601010000 "$ST/worker-supply.state"
+  # ⛔ TWO HOMES, ONE STATE DIR (review P1, round 2 on #4017). The installer resolves its OWN `O` from
+  # `$CELL_HOME`, so if that is not EXPORTED the child it judges reads `$HOME/orchestrator` instead —
+  # and on a cell `cmux vm exec` hands over a HOME the image does not create, so the child found no
+  # record, said STALE, and the folded code turned a HEALTHY supervisor into `REFUSING`. This arm runs
+  # the installer WITHOUT `O` in its environment, which is the shape that was broken.
+  # ⛔ HOME AND CELL_HOME MUST DIFFER, or the arm proves nothing: with HOME == CELL_HOME both resolutions
+  # land on the SAME path and the missing export is invisible (measured while building this case — the
+  # first version passed on the buggy installer). A cell's `cmux vm exec` hands over HOME=/home/ubuntu,
+  # which is the shape below.
+  CELLD="$TMP/cellhome"; OTHER_HOME="$TMP/home-other"; mkdir -p "$CELLD" "$OTHER_HOME"
+  O="$CELLD/orchestrator" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1
+  env -u O HOME="$OTHER_HOME" CELL_HOME="$CELLD" SUDO=false ELDATO_PLATFORM=Linux UNIT_DIR="$TMP/units2" \
+    SYSTEMCTL="$SC" WORKER_SUPPLY_SCRIPT="$SUPPLY" bash "$INSTALLER" --status >"$TMP/status-twohome.out" 2>&1; rcs_2h=$?
+  [ "$rcs_2h" = "0" ] && grep -q 'beat:  ok' "$TMP/status-twohome.out" \
+    && ok "…and a healthy supervisor is NOT refused when the installer resolves its state dir from \$CELL_HOME and the caller exported no O (the child reads the same dir)" \
+    || bad "--status exited $rcs_2h for a healthy supervisor under a two-home shell (O unexported): $(grep -m1 'beat:' "$TMP/status-twohome.out")"
+  touch -t 202601010000 "$ST/worker-supply.state" "$ST/worker-supply.pass-start"
   O="$O" SUDO=false ELDATO_PLATFORM=Linux UNIT_DIR="$TMP/units2" SYSTEMCTL="$SC" \
     WORKER_SUPPLY_SCRIPT="$SUPPLY" bash "$INSTALLER" --status >"$TMP/status-stale.out" 2>&1; rcs_stale=$?
   [ "$rcs_stale" = "1" ] && grep -q 'STALE' "$TMP/status-stale.out" \
@@ -1065,7 +1081,7 @@ O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m1.out" 2>&1; rcm1=$?
 [ "$rcm1" = "0" ] && grep -q 'beat:  ok' "$TMP/m1.out" \
   && ok "…and a pass that just completed reads ok (rc=0) — the assertion is not vacuous" \
   || bad "a fresh record reported rc=$rcm1 / '$(beat_line_of "$TMP/m1.out")', expected ok + 0"
-touch -t 202601010000 "$ST/worker-supply.state"
+touch -t 202601010000 "$ST/worker-supply.state" "$ST/worker-supply.pass-start"
 O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m2.out" 2>&1; rcm2=$?
 [ "$rcm2" = "5" ] && grep -q 'beat:  STALE' "$TMP/m2.out" \
   && ok "…and the SAME box with a record older than the bound reports STALE (rc=5): the process being up is not the question" \
@@ -1073,6 +1089,21 @@ O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m2.out" 2>&1; rcm2=$?
 O="$O" WORKER_SUPPLY_STALE_AFTER_S=999999999 MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m3.out" 2>&1; rcm3=$?
 [ "$rcm3" = "0" ] && ok "the BOUND is what decides: the same record is inside a 999999999s bound (rc=0)" \
   || bad "the staleness knob is inert: rc=$rcm3 with a bound of 999999999s"
+# ⛔ AND A LIVE, LONG PASS IS NOT A DEAD ONE (review P2, round 2 on #4017): the record only advances at
+# pass END, so grading the record alone called a pass that is still walking 29–105 orders "DEAD or
+# WEDGED". A real pass stamps its START, and the newest of the two decides — while a START that is
+# itself older than the bound is a WEDGED pass and must still read STALE.
+O="$O" SPAWNS="$SPAWNS" MAX_FIX=3 MAX_REVIEW=4 sup refill >/dev/null 2>&1   # fresh record + fresh start
+touch -t 202601010000 "$ST/worker-supply.state"                            # the record is old …
+O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m4.out" 2>&1; rcm4=$?
+[ "$rcm4" = "0" ] && grep -q 'IN PROGRESS' "$TMP/m4.out" \
+  && ok "…a pass that is still RUNNING reads IN PROGRESS (rc=0), not STALE (its start marker is fresh)" \
+  || bad "a live pass read rc=$rcm4 / '$(beat_line_of "$TMP/m4.out")', expected IN PROGRESS + 0"
+touch -t 202601010000 "$ST/worker-supply.state" "$ST/worker-supply.pass-start"
+O="$O" MAX_FIX=3 MAX_REVIEW=4 sup status >"$TMP/m5.out" 2>&1; rcm5=$?
+[ "$rcm5" = "5" ] && grep -q 'WEDGED' "$TMP/m5.out" \
+  && ok "…and a pass whose START is also past the bound reads STALE (WEDGED, rc=5) — the in-progress arm cannot be inert" \
+  || bad "a wedged pass read rc=$rcm5 / '$(beat_line_of "$TMP/m5.out")', expected STALE/WEDGED + 5"
 
 # ── (h) THE WALL-CLOCK BOUND ──────────────────────────────────────────────────────────────────────────
 # ⛔ THIS IS A TEST, NOT A COMMENT. The first attempt at this fix died inside its own suite: 45 minutes
