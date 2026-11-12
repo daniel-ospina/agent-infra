@@ -40,7 +40,49 @@ set -uo pipefail
 # never executed once. The repo already owns the one bounded-execution helper; use it
 # instead of a bare call, and REFUSE to start when the helper itself is missing (a
 # silent unbounded pass is the fail-open shape, not a degraded one).
-BOUNDED="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/bounded.sh"
+# ⛔ THIS FILE MUST RESOLVE ITS OWN DIRECTORY WITHOUT `BASH_SOURCE` (agent-infra#3778, #4012).
+# The ONLY launchd entry point that works on a Mac hands the script to bash on STDIN
+# (`bash -s`, pi-reap-worktrees-launchd.py — TCC is per-binary, so a launchd-spawned bash
+# cannot read a script under ~/Documents and the venv interpreter must do the read). Under
+# `bash -s` there IS no file: `BASH_SOURCE[0]` is UNSET, and with `set -u` this file died on
+# it —
+#
+#     bash: line 43: BASH_SOURCE[0]: unbound variable
+#     conflict-rebase-timer: /tmp/lib/bounded.sh is missing — refusing to schedule a pass …
+#
+# — so the scheduled pass exited 2 every 30 minutes, `launchctl list` read `exit=2`, and the
+# state dir was empty (no beacon, no log, no `last-failure`), i.e. NOTHING on the box could
+# tell "never executed" from "executed and refused". Measured 2026-11-12: the shipped plist's
+# own ProgramArguments reproduced rc 2 in one command.
+#
+# The resolver is ordered by how close each source is to the truth:
+#   1. `HARNESS_SCRIPT_PATH` — the launcher exports the ABSOLUTE path it read. The exact file.
+#   2. `${BASH_SOURCE[0]}`     — executed or sourced from a file. The normal case.
+# ⛔ `$0` IS DELIBERATELY NOT A SOURCE. Under `bash -s` it is the INTERPRETER (`/bin/bash`), which
+# passes `[ -f ]` and would resolve this file's directory to `/bin` — a guess that reads as a
+# resolution and then fails on a sibling nobody ships. Every case `$0` could help (`bash script`,
+# `./script`) already sets `BASH_SOURCE`, so the arm buys nothing and costs the one thing this
+# resolver exists to prevent. When nothing resolves the file REFUSES, naming the mechanism.
+_resolve_self_dir() {
+  local cand="" dir=""
+  for cand in "${HARNESS_SCRIPT_PATH:-}" "${BASH_SOURCE[0]:-}"; do
+    [ -n "$cand" ] || continue
+    case "$cand" in */*) ;; *) continue ;; esac  # a bare name has no directory
+    [ -f "$cand" ] || continue
+    dir="$(cd "$(dirname "$cand")" 2>/dev/null && pwd)" || dir=""
+    [ -n "$dir" ] && { printf '%s\n' "$dir"; return 0; }
+  done
+  return 1
+}
+SELF_DIR="$(_resolve_self_dir)" || SELF_DIR=""
+if [ -z "$SELF_DIR" ]; then
+  echo "conflict-rebase-timer: cannot resolve my own directory — HARNESS_SCRIPT_PATH is unset and" >&2
+  echo "  BASH_SOURCE[0] names no readable file, so the sibling lib/bounded.sh cannot be located." >&2
+  echo "  Under the launchd launcher this means the launcher predates agent-infra#3778 (it must" >&2
+  echo "  export HARNESS_SCRIPT_PATH); otherwise run this file from its own path." >&2
+  exit 2
+fi
+BOUNDED="$SELF_DIR/lib/bounded.sh"
 if [ ! -r "$BOUNDED" ]; then
   echo "conflict-rebase-timer: $BOUNDED is missing — refusing to schedule a pass I cannot bound" >&2
   exit 2
@@ -84,8 +126,8 @@ _iso() { # <epoch> -> ISO-8601Z on stdout, or the raw epoch when no mechanism co
   printf '%s\n' "${out:-$e}"
 }
 
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-BOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/conflict-rebase.py"
+SELF="$SELF_DIR/$(basename "${HARNESS_SCRIPT_PATH:-${BASH_SOURCE[0]:-conflict-rebase-timer.sh}}")"
+BOT="$SELF_DIR/conflict-rebase.py"
 # ⛔ THE STATE DIR IS A SEAM, NOT A CONSTANT. The systemd unit and the launchd plist both EXPORT
 # CONFLICT_REBASE_STATE (so the scheduled pass, `status`, and activate-harness.sh read one directory),
 # and before this line the wrapper ignored it: the artifact said one path while the beacon, log, brake

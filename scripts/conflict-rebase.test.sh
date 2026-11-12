@@ -37,6 +37,12 @@ ckn()  { if [ "$1" != "$2" ]; then ok "$3"; else bad "$3" "expected NOT '$2'"; f
 # with the haystack plainly containing the needle. Plain bash matching has no pipe
 # and no early exit, so it cannot flake.
 has()  { case "$1" in *"$2"*) ok "$3" ;; *) bad "$3" "missing: $2 | in: $(printf '%s' "$1" | head -c 200 | tr '\n' ' ')" ;; esac; }
+# ⛔ `ckn <artifact> <fragment>` IS A NO-OP, AND THREE ASSERTIONS WERE WRITTEN THAT WAY
+# (#4012 review P1/P2). `ckn` is `[ "$1" != "$2" ]`, so asserting that a MULTI-LINE artifact
+# (a whole comment body) or a generated file (always `<n> ADD <label>`) does not EQUAL a short
+# fragment is true for every possible behaviour of the code under test — it cannot fail, even
+# on the pre-fix tree. "Does not contain" needs its own predicate.
+hasnt() { case "$1" in *"$2"*) bad "$3" "unexpectedly contains: $2 | in: $(printf '%s' "$1" | head -c 200 | tr '\n' ' ')" ;; *) ok "$3" ;; esac; }
 
 TMP="$(mktemp -d /tmp/cr-suite-XXXXXX)"
 KEEP=0
@@ -638,6 +644,295 @@ write_prs "[$(pr_json 1303 feat/clean "$H_SHA" MERGEABLE BEHIND '[]' false true)
 FAKE_API_FAIL=1 run_bot --dry-run --max 1 --interval-s 0 --include-behind; RC=$?
 ck "$RC" "2" "§17d an unreadable required-contexts read is exit 2"
 has "$(cat "$TMP/bot.err")" "UNREADABLE required contexts" "§17e …and says which surface"
+
+# ═══════════ §20: the scheduled pass can actually START (agent-infra#4012) ═══
+# The ONLY launchd entry point that works on a Mac hands the script to bash on STDIN
+# (`bash -s`), where `BASH_SOURCE[0]` is UNSET and `$0` is the INTERPRETER (`/bin/bash`).
+# This file resolved its own directory from `BASH_SOURCE[0]`, so under that launcher it died
+# on `set -u` and refused:
+#
+#     bash: line 43: BASH_SOURCE[0]: unbound variable
+#     conflict-rebase-timer: /tmp/lib/bounded.sh is missing — refusing to schedule …
+#
+# rc 2 every 30 minutes, an EMPTY state dir (no beacon, no log, no `last-failure`), and
+# `launchctl list` reading `exit=2` over a bot that had never run once. These cases drive the
+# real launcher's shape, so a regression is the defect coming back, not a wording change.
+# ⛔ The brake-dir resolution is NEUTRALISED here (both seams point at nothing present) so the
+# case cannot turn box-dependent on a host that happens to have the unit installed.
+echo "§20 the timer resolves its own directory under the launcher's bash -s"
+LAUNCHER="$(dirname "$BOT")/pi-reap-worktrees-launchd.py"
+S="$TMP/cr-state"; rm -rf "$S"; mkdir -p "$S"
+NOSYS=("CONFLICT_REBASE_SYSTEMCTL=$TMP/no-such-systemctl" "CONFLICT_REBASE_PLIST=$TMP/no-such.plist")
+# (a) the exact plist ProgramArguments shape, through the real launcher
+OUT="$(env "${NOSYS[@]}" CONFLICT_REBASE_STATE="$S" \
+  python3 "$LAUNCHER" --script "$TIMER" status 2>&1)"; RC=$?
+ck "$RC" "0" "§20a the launcher's own --script shape exits 0 (was: rc 2 every interval)"
+# ⛔ `§20b …never refuses for a sibling resolved against $PWD` WAS HERE AND IS DELETED (#4012 review
+# cycle 2, P2). It could not fail: this run's OUT is a multi-line capture, so `ckn`/`hasnt` against a
+# short fragment holds whichever way the resolver behaves, and under the $PWD-fallback mutant the
+# launcher's own export still resolves correctly, so the mutant is unreachable from this case. The
+# property it named is carried by the pair that CAN fail — §20a (rc 0) and §20g (the vague
+# "bounded.sh is missing" cannot come back, which reds under exactly that mutant). An assertion that
+# cannot fail is the class this PR exists to close; the answer is to delete it, not to reword it.
+has "$OUT" "state dir: $S" "§20c …and it ran far enough to resolve real state"
+# (b) the launcher exports the ABSOLUTE path — the CLASS fix, not one script's workaround
+OUT="$(cd / && python3 - "$LAUNCHER" "$TMP" <<'PY'
+import importlib.util, os, subprocess, sys
+launcher, d = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("lch", launcher)
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+child = os.path.join(d, "child.sh")
+open(child, "w").write('printf "%s\\n" "${HARNESS_SCRIPT_PATH:-UNSET}"\n')
+# cwd is `/`, so a value that is not ABSOLUTE could not round-trip to the real file.
+print(subprocess.run([sys.executable, launcher, "--script", child],
+                     capture_output=True, text=True, cwd="/").stdout.strip())
+PY
+)"
+ck "$OUT" "$TMP/child.sh" "§20d the launcher exports an ABSOLUTE HARNESS_SCRIPT_PATH to the child"
+# (c) NO path source at all: a REFUSAL that names the mechanism — never a $PWD/$0 guess
+OUT="$(cd / && env -u HARNESS_SCRIPT_PATH /bin/bash -s -- status <"$TIMER" 2>&1)"; RC=$?
+ck "$RC" "2" "§20e with no path source the timer refuses instead of guessing"
+has "$OUT" "HARNESS_SCRIPT_PATH" "§20f …and the refusal names the mechanism (a pre-#3778 launcher)"
+hasnt "$OUT" "is missing" "§20g …so the vague 'bounded.sh is missing' cannot come back"
+
+# ═════════ §21: the replay carries a committer (agent-infra#4012, measured) ═══════
+# A rebase REWRITES commits, so git must author a committer on each one. The scratch repo is
+# `git init --bare`, NOT a clone of this checkout, so `<checkout>/.git/config`'s identity never
+# reaches it. Measured 2026-11-12 on a cell whose ONLY identity was that local one, while
+# `~/.gitconfig` carried none: every replay died at commit ONE with `fatal: unable to
+# auto-detect email address`, an EMPTY unmerged set, and the mis-classification
+# `rebase-failed` (no label, no comment, no diagnosis, short backoff) — so the bot had never
+# rebased a single PR on any box, and every CONFLICTING PR looked like a content decision.
+echo "§21 the replay supplies its own committer, so an identity-less box still rebases"
+NOID="$TMP/gitconfig-noid"
+printf '[commit]\n\tgpgsign = false\n[init]\n\tdefaultBranch = main\n' >"$NOID"
+seed_fixture
+NOID_SHA="$(head_of feat/clean)"
+write_prs "[$(pr_json 1401 feat/clean "$NOID_SHA" CONFLICTING CLEAN)]"
+# Prove the PRECONDITION in the same run, or the case silently stops discriminating on a box
+# that happens to have an identity: the scratch repo the bot just built must have none.
+# ⛔ THE SUITE EXPORTS `GIT_COMMITTER_NAME/EMAIL` (seed_fixture needs them to build commits),
+# AND GIT HONOURS THOSE BEFORE ANY CONFIG FILE. Leaving them set made this case pass with the
+# identity arm REMOVED — a test that could not fail. The bot runs with them stripped, which is
+# the scheduled pass's own condition: a launchd/systemd job inherits no login shell.
+UNSET_IDENT=(env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL)
+OUT="$("${UNSET_IDENT[@]}" CONFLICT_REBASE_STATE="$TMP/state" GIT_CONFIG_GLOBAL="$NOID" \
+  PATH="$TMP/fake:$PATH" python3 "$BOT" --repo "$REPO" --max 1 --interval-s 0 2>"$TMP/bot.err")"; RC=$?
+ck "$RC" "0" "§21a the pass exits 0 on an identity-less box"
+ckn "$(head_of feat/clean)" "$NOID_SHA" "§21b …and the clean branch was actually REBASED"
+hasnt "$(cat "$TMP/bot.err")" "REFUSED" "§21c …and nothing was refused (no 'rebase-failed' wear a conflict's clothes)"
+ck "$(GIT_CONFIG_GLOBAL="$NOID" git -C "$TMP/state/scratch.git" config user.email 2>/dev/null)" "" \
+   "§21d precondition: that scratch repo has no committer identity of its own"
+ck "$("${UNSET_IDENT[@]}" GIT_CONFIG_GLOBAL="$NOID" git -C "$TMP/state/scratch.git" var GIT_COMMITTER_IDENT 2>/dev/null || true)" "" \
+   "§21e precondition: and NO identity env var is left to rescue the replay"
+
+# ── the diagnosis names the fault, not the progress counter ──
+echo "§22 a failed replay reports the fatal line, not 'Rebasing (n/m)'"
+OUT="$(python3 - "$BOT" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+# The measured blob: the counter has NO trailing newline, so the fatal is GLUED to it.
+glued = "Rebasing (1/27)fatal: unable to auto-detect email address (got 'x@y.(none)')\n"
+print(m.replay_fault(glued))
+print("|" + m.replay_fault("Running some hook\nfatal: The pre-rebase hook refused to rebase.\n"))
+print("|" + m.replay_fault(""))
+PY
+)"
+has "$OUT" "fatal: unable to auto-detect email address" "§22a a GLUED fatal is still found and named"
+hasnt "$OUT" "Rebasing" "§22b …and the progress counter never reaches the report"
+has "$OUT" "|fatal: The pre-rebase hook refused" "§22c a plain fatal line is passed through"
+has "$OUT" "|no output" "§22d an empty blob says so instead of crashing"
+
+# ═════ §23: a GENERATED file is regenerated, never hand-merged (agent-infra#4012) ═════
+# A derived file has no intent to weigh, so "a content conflict is a content decision" (#2698)
+# is simply false for it — and neither side of such a conflict can be right, because the right
+# value did not exist until the generator ran on the tree. Measured on the live queue
+# 2026-11-12: of FIVE `CONFLICTING` PRs, TWO were pure generated files (#3964 the
+# workflow-lock region digest, #3698 `sanctioned-scripts.pin.json`) and ZERO were the
+# "already-landed hunk" class.
+#
+# The fixture is the real shape: `src.txt` is AUTHORED, `gen.txt` is DERIVED from it, and
+# both sides edited `gen.txt` — so the only right answer is the generator's, and it is
+# neither side's text. That is what makes these cases discriminating: a bot that "took ours"
+# or "took theirs" would land `gen:ONE-main` / `gen:ONE-v2`, and both are asserted AGAINST.
+echo "§23 a generated-file conflict is regenerated; an authored one is still refused"
+GEN="$TMP/gen.sh"
+cat >"$GEN" <<'EOS'
+#!/usr/bin/env bash
+# fixture generator: gen.txt is DERIVED from src.txt
+case "${1:-}" in
+  cut)   printf 'gen:%s\n' "$(cat src.txt)" >gen.txt ;;
+  check) [ "$(cat gen.txt)" = "gen:$(cat src.txt)" ] ;;
+  noop)  : ;;
+  *) exit 99 ;;
+esac
+EOS
+chmod +x "$GEN"
+SEAM="$TMP/generated.json"
+printf '[{"match":"gen.txt","cmd":"%s cut","verify":"%s check","why":"fixture"}]\n' "$GEN" "$GEN" >"$SEAM"
+# Build the generated-conflict fixture on top of the standard one, then push it to origin.
+add_generated_fixture() { # "$1" = mixed|pure
+  (
+    cd "$TMP/seed" || exit 1
+    git switch -q main
+    printf 'ONE\n' >src.txt; printf 'gen:ONE\n' >gen.txt
+    git add src.txt gen.txt && git commit -qm "main: add an authored source and its generated file"
+    if [ "${1:-pure}" = "mixed" ]; then
+      # ⛔ ONE COMMIT, BOTH FILES (#4012 review P2). The first version of this fixture put the
+      # derived change in an EARLIER commit, so the two conflicts stopped the rebase in two
+      # DIFFERENT rounds and the refusal only ever saw the authored path — which left §23m true
+      # for every possible behaviour of the code under test. Branched from main BEFORE main's own
+      # rewrite, so the single commit really does carry both, which is exactly the property
+      # criterion 4 names.
+      git switch -q -c feat/gen-mixed
+      printf 'gen:ONE-v3\n' >gen.txt; printf 'red\nMIX-conflict\nblue\n' >c.txt
+      git commit -qam "mixed: regenerate a derived file AND author a change, in one commit"
+      git switch -q main
+      printf 'gen:ONE-main\n' >gen.txt; printf 'red\nMIX-main\nblue\n' >c.txt
+      git commit -qam "main: regenerate and author the same lines"
+      git push -q origin main feat/gen-mixed
+    else
+      git switch -q -c feat/gen
+      printf 'gen:ONE-v2\n' >gen.txt && git commit -qam "gen: regenerate for v2"
+      git switch -q main
+      printf 'gen:ONE-main\n' >gen.txt && git commit -qam "main: regenerate gen elsewhere"
+      git push -q origin main feat/gen
+    fi
+  )
+}
+
+# ── (a) the derived conflict is REGENERATED and pushed ──
+seed_fixture; add_generated_fixture pure
+export CONFLICT_REBASE_GENERATED="$SEAM"
+GEN_SHA="$(head_of feat/gen)"
+write_prs "[$(pr_json 1501 feat/gen "$GEN_SHA" CONFLICTING DIRTY)]"
+run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23a the pass exits 0"
+ckn "$(head_of feat/gen)" "$GEN_SHA" "§23b the generated-conflict branch WAS rebased and pushed"
+ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE$' feat/gen -- gen.txt)" "feat/gen:gen.txt:1" \
+   "§23c gen.txt carries the GENERATOR's value for this tree"
+ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE-v2' feat/gen -- gen.txt || echo 0)" "0" \
+   "§23d …NOT the PR's side (a side would have been a content decision)"
+ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE-main' feat/gen -- gen.txt || echo 0)" "0" \
+   "§23e …and NOT main's side either (the right value existed on neither side)"
+has "$(cat "$TMP/fake/comment-1501.md" 2>/dev/null || echo)" "REGENERATED, not hand-merged" \
+   "§23f the comment says what it did"
+has "$(cat "$TMP/fake/comment-1501.md" 2>/dev/null || echo)" "$GEN cut" \
+   "§23g …and names the exact generator a reader can run"
+ckn "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "1501 ADD needs-human-conflict" \
+   "§23h a regenerated conflict is NOT labelled needs-human-conflict"
+
+# ── (b) criterion 4: a MIXED conflict is refused, so the authored change is never dropped ──
+seed_fixture; add_generated_fixture mixed
+MIX_SHA="$(head_of feat/gen-mixed)"
+write_prs "[$(pr_json 1502 feat/gen-mixed "$MIX_SHA" CONFLICTING DIRTY)]"
+run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23i the pass still exits 0 (a refusal is not a pass failure)"
+ck "$(head_of feat/gen-mixed)" "$MIX_SHA" "§23j a MIXED conflict pushes NOTHING"
+has "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "REFUSED" \
+   "§23k …it is refused, not silently half-resolved"
+has "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "c.txt" \
+   "§23l …and the refusal names the AUTHORED path the human must resolve"
+hasnt "$(cat "$TMP/fake/comment-1502.md" 2>/dev/null || echo)" "gen.txt" \
+   "§23m …and does not blame the derived file it could have regenerated"
+ck "$(git -C "$TMP/origin.git" grep -c 'MIX-main' feat/gen-mixed -- c.txt || echo 0)" "0" \
+   "§23n the authored change was not dropped in place of a resolution"
+ck "$(git -C "$TMP/origin.git" grep -c 'gen:ONE-v3' feat/gen-mixed -- gen.txt || echo 0)" "feat/gen-mixed:gen.txt:1" \
+   "§23o the mixed branch's DERIVED file is untouched too (nothing half-resolved)"
+has "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "1502 ADD needs-human-conflict" \
+   "§23o2 a MIXED conflict gets the label a human needs"
+
+# ── (c) a generator that FAILS is a refusal, never a push ──
+seed_fixture; add_generated_fixture pure
+FAILSEAM="$TMP/generated-fail.json"
+printf '[{"match":"gen.txt","cmd":"false","verify":"true","why":"fixture"}]\n' >"$FAILSEAM"
+GEN_SHA="$(head_of feat/gen)"
+write_prs "[$(pr_json 1503 feat/gen "$GEN_SHA" CONFLICTING DIRTY)]"
+CONFLICT_REBASE_GENERATED="$FAILSEAM" run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23p a failing generator is a refusal, not a pass failure"
+ck "$(head_of feat/gen)" "$GEN_SHA" "§23q …nothing is pushed when the generator fails"
+has "$(cat "$TMP/bot.err")" "generated-regenerate-failed" "§23r …and the refusal is classified as a GENERATOR failure"
+# ⛔ A REFUSAL NOBODY SEES IS NOT A REFUSAL. A generator failure takes no `content-conflict`
+# label under the old arm, so it published NOTHING and backed off for 6 h — a PR that needed a
+# human, silently dropped. Both halves are asserted, and the body must not blame a conflict.
+has "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "1503 ADD needs-human-conflict" \
+   "§23r2 …a generator failure is PUBLISHED like a refusal (label)"
+has "$(cat "$TMP/fake/comment-1503.md" 2>/dev/null || echo)" "could not be regenerated" \
+   "§23r3 …and its comment names a regeneration failure, not a conflict between two intents"
+
+# ── (d) a generator that runs but whose OWN check still reds is NOT trusted ──
+seed_fixture; add_generated_fixture pure
+LIESEAM="$TMP/generated-lie.json"
+printf '[{"match":"gen.txt","cmd":"%s noop","verify":"false","why":"fixture"}]\n' "$GEN" >"$LIESEAM"
+GEN_SHA="$(head_of feat/gen)"
+write_prs "[$(pr_json 1504 feat/gen "$GEN_SHA" CONFLICTING DIRTY)]"
+CONFLICT_REBASE_GENERATED="$LIESEAM" run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23s a generator whose result does not verify is a refusal"
+ck "$(head_of feat/gen)" "$GEN_SHA" "§23t …nothing is pushed on an unverified regeneration"
+has "$(cat "$TMP/bot.err")" "its own check still fails" "§23u …and the refusal says the CHECK failed, not the generator"
+unset CONFLICT_REBASE_GENERATED
+
+# ── (e) the sanctioned-scripts PIN is NOT declared, and must not be — measured ──
+# Its own `--cut` PARSES the pin it is about to rewrite, so on a CONFLICTED pin it cannot run at
+# all (`❌ cut: Expected double-quoted property name in JSON at position 1151` — measured on
+# #3698's replay, 2026-11-12). Declaring it would refuse every time while saying so obscurely,
+# so the entry is withdrawn and a pin conflict stays a content conflict — refused, published,
+# and handed to a human. This case pins that decision so a future "helpful" addition re-opens it.
+echo "§24 the sanctioned-scripts pin is deliberately NOT a generated entry"
+OUT="$(python3 - "$BOT" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print("pin:", m.generated_entry("extensions/main-worktree-guard/sanctioned-scripts.pin.json"))
+print("lock:", (m.generated_entry("scripts/workflow-lock.d/.github/workflows/ci.yml/jobs.verify.sha256") or {}).get("cmd"))
+print("authored:", m.generated_entry("scripts/install-launchd.sh"))
+PY
+)"
+has "$OUT" "pin: None" "§24a the conflicted-pin path is AUTHORED for this bot (its --cut cannot parse it)"
+has "$OUT" "lock: node scripts/check-workflow-lock.mjs --update-lock" "§24b …while the region digest IS declared"
+has "$OUT" "authored: None" "§24c …and ordinary source is never declared"
+
+# ── (f) BOTH replay invocations carry the SAME guards (#4012 review, P1) ──
+# The replay is started once and RESUMED after each regeneration, and `-c` is a per-process
+# override — so a resume that dropped them would read AMBIENT `rerere.*`/`rebase.autoSquash` for
+# the rest of the replay. That is the invariant the module header states and the one an ambient
+# `rerere.enabled/autoUpdate` pair defeats: a recorded resolution is applied during a later pick,
+# the pick completes with no conflict stop, and the resume returns 0 over a tree carrying a
+# content decision a robot made. The guards are therefore ONE list, asserted structurally — a
+# behavioural test cannot see it, because a clean ambient config is the benign case.
+echo "§25 the replay's guards are one list, used by the start AND by the resume"
+has "$(cat "$BOT")" "REPLAY_GUARDS = [" "§25a the guards are one declared list"
+ck "$(grep -c '\*REPLAY_GUARDS' "$BOT")" "2" "§25b both invocations (start + resume) use it"
+ck "$(grep -oE '\"-c\", \"(rerere|rebase)\.' "$BOT" | grep -c .)" "3" \
+   "§25c …and no invocation hardcodes a guard, so the two cannot drift apart again"
+has "$(cat "$BOT")" '"--continue" if staged else "--skip"' "§25d the resume is the mixed-shape call (continue or skip)"
+
+# ── (e2) a MALFORMED seam entry is a refusal, never a crash (review cycle 3, P2) ──
+# `shlex.split` raises `ValueError` on an unbalanced quote. With it outside the guard, a valid-JSON
+# seam entry carrying an unparseable `cmd` escaped as a ValueError all the way out: the pass died
+# with a traceback and exit 1, the report was never written, and every remaining candidate was
+# abandoned. A malformed entry must be an rc like any other failed generator.
+echo "§23v a seam entry the shell cannot even parse is a published refusal, not a crash"
+seed_fixture; add_generated_fixture pure
+BADSEAM="$TMP/generated-badquote.json"
+# ⛔ WRITTEN BY python, NOT BY printf: the point of this case is a seam entry that is VALID JSON
+# with a shell-UNPARSEABLE `cmd`. A hand-rolled printf that emits a bare quote produces invalid JSON
+# instead, which takes the other documented path (`_generated()` → Unreadable → exit 2) and would
+# leave the crash this case exists to catch untested.
+python3 -c 'import json,sys; json.dump([{"match":"gen.txt","cmd":sys.argv[1]+" \"cut","verify":"true","why":"fixture"}], open(sys.argv[2],"w"))' "$GEN" "$BADSEAM"
+GEN_SHA="$(head_of feat/gen)"
+write_prs "[$(pr_json 1505 feat/gen "$GEN_SHA" CONFLICTING DIRTY)]"
+CONFLICT_REBASE_GENERATED="$BADSEAM" run_bot --max 1 --interval-s 0; RC=$?
+ck "$RC" "0" "§23v the pass still exits 0 (a malformed entry is a refusal, not a traceback)"
+# ⛔ THE REAL CONSEQUENCE IS "THE PASS ABANDONED ITS REMAINING WORK", not "a traceback was seen" —
+# a crash exits before the census line, so the summary is what proves the loop survived (#4012
+# review cycle 3). Asserting on the word "Traceback" was a shape, not the property.
+has "$(cat "$TMP/bot.err")" "done: acted=" "§23w …and the pass reached its census line (nothing was abandoned)"
+has "$(cat "$TMP/bot.err")" "generated-regenerate-failed" "§23x …it is classified as a generator failure"
+ck "$(head_of feat/gen)" "$GEN_SHA" "§23y …nothing is pushed"
+has "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "1505 ADD needs-human-conflict" \
+   "§23z …and the refusal is published, not silently dropped"
 
 # ── summary ─────────────────────────────────────────────────────────────────
 printf '\n%s\n' "──────────────────────────────────────────"
