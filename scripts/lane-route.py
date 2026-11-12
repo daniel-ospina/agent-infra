@@ -173,11 +173,20 @@ def evidence_for(row, read_text=True, read_screen=False, surface=None):
     cwd = row.get("cwd") or ""
     path = liveness.session_file_for(sid, cwd) if sid else None
     turn = liveness.turn_from_jsonl(path) if path else None
-    tool = row.get("tool")
-    tool_in_flight = bool(tool and getattr(tool, "tools_in_flight", 0))
-    age = getattr(tool, "tool_age_ms", None) if tool else None
-    cap = getattr(tool, "hard_cap_ms", None) if tool else None
-    budget_open = bool(tool_in_flight and isinstance(age, int) and isinstance(cap, int) and age < cap)
+    # ⛔ `row["tool"]` IS A DICT, NOT A `liveness.Tool` (fresh-context review, #4046).
+    # `lane-status.py:in_flight_tool()` returns `dict(name=…, timeout=…, age=…)`, so the first version's
+    # `getattr(tool, "tools_in_flight", 0)` / `getattr(tool, "hard_cap_ms", None)` were reading
+    # ATTRIBUTES a dict does not have: `tool_in_flight` was permanently `False` and the
+    # `tool-in-flight`/`wait` subcase was UNREACHABLE from the only acquirer — a subcase that existed
+    # in the router, had a fixture, and could never fire in production. `timeout` is the call's own
+    # DECLARED budget (lane-status's LONG-TOOL note: `timeout 3000s` observed sitting 38 minutes).
+    tool = row.get("tool") if isinstance(row.get("tool"), dict) else None
+    tool_in_flight = bool(tool)
+    age = tool.get("age") if tool else None
+    cap_s = tool.get("timeout") if tool else None
+    # `timeout` is declared in SECONDS and `age` in seconds too — compare like with like.
+    budget_open = bool(tool_in_flight and isinstance(age, int) and isinstance(cap_s, (int, float))
+                       and cap_s > 0 and age < cap_s)
     child = row.get("child") or {}
     child_state = ""
     if row.get("verdict") == "CHILD-STUCK":
@@ -190,14 +199,21 @@ def evidence_for(row, read_text=True, read_screen=False, surface=None):
         if screen is not None:
             low = screen.lower()
             boot = ("press any key" in low) or ("boot-block" in low)
+    last_text = triage.last_text_from_jsonl(path) if read_text else ""
     return triage.Evidence(
         lane=row.get("lane") or "",
         turn=turn,
-        last_text=triage.last_text_from_jsonl(path) if read_text else "",
+        last_text=last_text,
         lane_verdict=row.get("verdict") or "",
         child_state=child_state,
-        steerable=triage.steerable(sid),
+        # ⛔ (sid, ws, path) — the THREE-PART probe. The argv-only form returned `None` for every
+        # ordinary lane (a live `pi` has argv exactly `pi`, measured), which would have made
+        # `turn-end.py` nudge nobody. See `triage.steerable`'s docstring.
+        steerable=triage.steerable(sid, ws=row.get("ws"), session_path=path),
         boot_prompt=boot,
+        # The `model-retry` subcase's PRODUCER — a declared subcase with no producer is a fixture
+        # certifying a reachability production cannot supply (fresh-context review, #4046).
+        model_retry=triage.retry_signature(last_text),
         tool_in_flight=tool_in_flight,
         tool_budget_open=budget_open,
     ), {"ws": row.get("ws") or "", "child": child, "sid": sid}
@@ -310,17 +326,26 @@ def main(argv):
 
     surface = CmuxSurface(sessions=_session_paths(rows)) if a.apply else None
     out = []
+    suppressed = {}
     for row in rows:
         ev, extra = evidence_for(row, read_screen=a.apply, surface=surface)
         r = triage.route(ev)
         item = r.as_dict()
         item["lane"] = ev.lane
         item["verdict"] = ev.lane_verdict
+        if r.action == "refuse":
+            suppressed[r.reason.split(" — ")[0]] = suppressed.get(r.reason.split(" — ")[0], 0) + 1
         if a.apply:
-            brief = os.path.join(a.state, "lane-route", "brief.txt")
-            os.makedirs(os.path.dirname(brief), exist_ok=True)
+            # ⛔ ONE PAYLOAD PER ROUTE, NOT ONE BRIEF FOR ALL OF THEM (fresh-context review, #4046).
+            # The first version always wrote the USER-QUESTION brief and handed it to every arm, so a
+            # BOOT-PROMPT repair typed the question-lane mandate into the lane being repaired. The
+            # question arm is the only one that needs a brief at all; the boot repair needs a resume
+            # line, because what it is recovering is a lane, not a decision.
+            os.makedirs(os.path.join(a.state, "lane-route"), exist_ok=True)
+            payload = triage_arms.payload_for(r, ev, extra["ws"])
+            brief = os.path.join(a.state, "lane-route", "payload.txt")
             with open(brief, "w") as fh:
-                fh.write(triage_arms.question_brief(ev.lane, ev.last_text, extra["ws"]))
+                fh.write(payload)
             proof = triage_arms.execute(
                 r, ev, surface, ws=extra["ws"], child=extra["child"],
                 dispatch=_make_dispatch(brief), relaunch=_make_relaunch(),
@@ -329,6 +354,15 @@ def main(argv):
             triage_arms.write_record(a.state, ev.lane, r, proof)
             item["result"] = proof.as_dict()
         out.append(item)
+
+    if suppressed:
+        # ⛔ A WITHHELD ARM MUST BE COUNTED, NOT PER-LANE ONLY. A per-lane SKIP line is invisible in a
+        # beat, and a fleet-wide refusal reads as a quiet fleet — the same defect the router exists to
+        # remove, one layer up. One line, with the reasons.
+        print("router=refuse:%d (%s)" % (sum(suppressed.values()),
+                                         "; ".join("%s x%d" % (k, v)
+                                                   for k, v in sorted(suppressed.items()))),
+              file=sys.stderr)
 
     if a.json:
         print(json.dumps(out, indent=2, default=str))

@@ -88,6 +88,13 @@ QUESTION_TEXTS = [
     "Research is done.\n\nReady?",
     # a question whose topic is code
     "The bug is in `parse()`.\n\nWhich option do you want: rewrite the parser, or patch the caller?",
+    # ⛔ THE SHAPE THE FIRST VERSION MISSED (fresh-context review, #4046 P1): the question, then a
+    # one-line declarative restatement. Reading only the FINAL paragraph read this as `not-asked` and
+    # sent "continue" — the exact harmful message, through the detector's own blind spot.
+    "Detection is landed and green.\n\nShould I build the router next, or wait for your ruling?\n\n"
+    "Blocked on your decision.",
+    # same, with a status the phrase list learned from the same finding
+    "The options are written up.\n\nWaiting on you.",
 ]
 
 
@@ -280,6 +287,14 @@ def leg_ask_detector() -> None:
     eq("a supplied `not-asked` cannot talk down a mechanical asked",
        triage.route(ev(last_text="All done.\n\nReady?", ask_signal="not-asked")).route,
        "user-question")
+    # ⛔ AND AN UNREAD TAIL BEATS A SUPPLIED `not-asked` (fresh-context review, #4046 P2).
+    eq("an unread tail is UNREAD even when a caller asserts `not-asked`",
+       triage.route(ev(last_text="", ask_signal="not-asked", lane_verdict="WIP-IDLE")).action,
+       "refuse")
+
+    # the P1 shape as its own named assertion, so a later narrowing of the window is red here
+    eq("a question followed by a declarative status is still a question",
+       triage.asks_owner("Landed.\n\nShould I merge, or wait?\n\nBlocked on your decision."), "asked")
 
 
 # ── leg 8: route_rows carries the population through ──────────────────────────────────────────
@@ -338,11 +353,10 @@ def run_red_control() -> bool:
     good &= _red("R2 continue-unless-guarded SENDS 'continue' to a question",
                  mut.action == "send-continue")
 
-    # (R3) drop the unsteerable guard.
-    mut = triage.Route(route="idle-continue", action="send-continue",
-                       proof=triage.PROOFS["send-continue"], reason="mutant")
-    good &= _red("R3 a route that ignores steerability would nudge a `pi -p` lane",
-                 mut.action == "send-continue")
+    # (R3) the steerability guard: the REAL router must be what refuses, not a route the test built.
+    # (First version asserted a locally-constructed Route and stayed green with the guard deleted.)
+    good &= _red("R3 the router refuses a `pi -p` lane (guard deleted would send)",
+                 triage.route(ev(lane_verdict="WIP-IDLE", steerable=False)).action != "send-continue")
 
     # (R4) an arm with no proof must be REFUSED as unexecutable.
     bad = triage.Route(route="idle-continue", action="send-continue", proof="", reason="mutant")
@@ -368,10 +382,20 @@ def run_red_control() -> bool:
     good &= _red("R8 a mandate-free brief is refused before it is sent",
                  bool(triage_arms.mandate_missing(relayed)))
 
-    # (R9) an arm that reports a SEND as an effect must be refused.
-    liar = triage_arms.Proof("send-continue", "transcript-growth", True, "sent fine", sent=True)
-    good &= _red("R9 'sent' alone never earns a transcript-growth proof",
-                 not (liar.proof == "transcript-growth" and liar.artifact.get("after") is not None))
+    # (R9) the CONTINUE arm's own predicate: a lane that did not grow must not verify. The first
+    # version asserted a locally-built Proof and proved nothing about the arm.
+    class _Frozen(FakeSurface):
+        def __init__(self):
+            super().__init__(sizes={"ws_z": 5})
+
+        def send(self, ws, text):
+            self.sent.setdefault(ws, []).append(text)
+            return True                      # sent, but the transcript NEVER moves
+
+    p = triage_arms.execute(triage.route(ev(lane_verdict="WIP-IDLE")), ev(lane_verdict="WIP-IDLE"),
+                            _Frozen(), ws="ws_z")
+    good &= _red("R9 a send whose transcript did not move is NOT verified",
+                 (p.sent is True) and (p.verified is False))
 
     # (R10) a question routed through the OWNING lane would be the exact harm.
     class _OwnerOnly(FakeSurface):
@@ -595,6 +619,14 @@ def leg_wiring() -> None:
     ok("a `pi -p` lane may NOT be continued even when it looks idle", not may)
     may, _ = triage.may_continue(ev(last_text="", lane_verdict="DONE-IDLE"))
     ok("an unread tail may NOT be continued", not may)
+    # ⛔ AND THE POSITIVE PATH MUST EXIST (fresh-context review, #4046 P0). The first version's
+    # steerability probe answered `None` for every ordinary lane — a live `pi` has argv exactly `pi`,
+    # so `argv-candidates` finds nothing — and since a `None` refuses the send, `turn-end.py` nudged
+    # NOBODY. That is a fleet-wide nudging stop dressed as a refusal, so it gets its own assertion.
+    eq("an interactive lane (session bound to a workspace) IS steerable",
+       triage.steerable(None, ws="ws_x", session_path="/tmp/session.jsonl"), True)
+    eq("no session and no workspace is UNKNOWN, never steerable",
+       triage.steerable(None), None)
 
     # The farm declaration: turn-end.py is farmed FLAT and imports `$SCRIPTS/fleet/triage.py`, so a
     # farm entry that names only one of the pair ships a router whose arms nobody has.
@@ -617,16 +649,57 @@ def leg_wiring() -> None:
     else:
         ok("pi-bootstrap/setup.sh is present to declare the farm", False, setup)
 
-    # The consumer: turn-end.py must actually CALL the predicate. A guard that exists but is not
-    # consulted is the inert-enforcer class, and it looks identical to a working one in review.
+    # The consumer: turn-end.py must actually CALL the predicate AND gate its `continue` on it. A
+    # guard that exists but is not consulted — or is consulted and then ignored — is the
+    # inert-enforcer class, and both look identical to a working one in review (fresh-context review,
+    # #4046 P2: `"may_continue(" in blob` was green for `if False: may_continue(...)`).
     te = os.path.join(os.path.dirname(repo), "scripts", "turn-end.py")
     if os.path.exists(te):
         blob = open(te, encoding="utf-8", errors="replace").read()
-        ok("turn-end.py consults may_continue()", "may_continue(" in blob)
+        i = blob.find("_may, _route = _triage.may_continue(")
+        ok("turn-end.py consults may_continue()", i != -1)
+        window = blob[i:i + 700] if i != -1 else ""
+        ok("…and GATES a `continue` on the answer", "if not _may:" in window and "continue" in window,
+           window[-200:])
         ok("turn-end.py says so when the router is absent",
            "router unavailable" in blob, "a silent degrade looks like a quiet fleet")
     else:
         ok("scripts/turn-end.py is present to be wired", False, te)
+
+    # ⛔ ONE PAYLOAD PER ROUTE (fresh-context review, #4046 P1): the boot-prompt repair must NOT be
+    # handed the question-lane mandate.
+    q = triage_arms.payload_for(triage.route(ev(last_text="Should I merge?")), ev(last_text="Ask"))
+    b = triage_arms.payload_for(triage.route(ev(lane_verdict="DONE-IDLE", boot_prompt=True)), ev())
+    ok("the question arm's payload carries the mandate", not triage_arms.mandate_missing(q))
+    ok("the BOOT-PROMPT payload carries NO mandate", bool(triage_arms.mandate_missing(b)), b[:90])
+    ok("the two payloads differ", q != b)
+
+    # ⛔ THE `tool-in-flight` SUBCASE MUST BE REACHABLE FROM THE REAL ACQUIRER (fresh-context review,
+    # #4046 P1). `lane-status.py` emits `tool` as a DICT (name/timeout/age); the first version read
+    # OBJECT attributes, so the subcase was permanently unreachable in production while its fixture
+    # passed on hand-built evidence.
+    sys.path.insert(0, os.path.join(os.path.dirname(repo), "scripts"))
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location("lane_route_under_test",
+                                        os.path.join(os.path.dirname(repo), "scripts",
+                                                     "lane-route.py"))
+    lr = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(lr)
+    row = {"lane": "L", "verdict": "LONG-TOOL", "sid": None, "ws": "ws", "cwd": "/tmp",
+           "tool": {"name": "bash", "timeout": 3000, "age": 500}}
+    e2, _ = lr.evidence_for(row, read_text=False)
+    ok("a declared tool budget inside its timeout reads as tool_in_flight", e2.tool_in_flight)
+    ok("…and its budget reads as OPEN (age < declared timeout)", e2.tool_budget_open)
+    eq("…so the route is the tool-in-flight subcase with the WAIT remedy",
+       (triage.route(e2).subcase, triage.route(e2).action), ("tool-in-flight", "wait"))
+    row2 = dict(row, tool={"name": "bash", "timeout": 60, "age": 5000})
+    e3, _ = lr.evidence_for(row2, read_text=False)
+    eq("a call PAST its declared budget is not 'inside its budget'", e3.tool_budget_open, False)
+    # and the model-retry producer must exist too
+    ok("a rate-limit tail produces the model-retry signal",
+       lr.evidence_for(dict(row, tool=None), read_text=False)[0].model_retry is False)
+    eq("retry_signature recognises a rate-limit tail", triage.retry_signature("HTTP 429 rate limit, retrying in 30s"), True)
+    eq("retry_signature does not fire on ordinary prose", triage.retry_signature("Merged the PR."), False)
 
 
 LEGS = (

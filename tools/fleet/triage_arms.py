@@ -154,6 +154,38 @@ def question_brief(lane: str, question: str, ws: str = "") -> str:
     )
 
 
+def boot_brief(lane: str) -> str:
+    """What a BOOT-PROMPT repair types: a resume line, never the question-lane mandate.
+
+    ⛔ ONE PAYLOAD PER ROUTE (fresh-context review, #4046). The first version handed the
+    `question_brief` to every arm, so repairing a boot-blocked pane TYPED THE QUESTION-LANE MANDATE
+    into the lane being repaired — a lane that was never asked anything would have been ordered to run
+    the research skill and raise a question with the owner. The two arms want opposite messages, so
+    they get separate composers and a test pins that they differ.
+
+    The original payload is genuinely lost (the boot prompt ate it), so this says what is true: pi
+    booted, and the lane's own in-flight task stands.
+    """
+    return ("Lane %s — pi has finished booting and the send that was eaten by the boot prompt is gone. "
+            "Continue the task already in flight; do not start a new one. If you were waiting on the "
+            "owner, say so in one line and carry on with the part that is not blocked." % (lane,))
+
+
+def payload_for(route, ev, ws: str = "") -> str:
+    """The ONE payload a route's arm may type. Empty for the arms that type nothing at all.
+
+    A single source so a route can never borrow another arm's message — the defect this function was
+    extracted to remove, and the reason it is not inlined at the call site.
+    """
+    if route.action == "route-to-question-lane":
+        return question_brief(ev.lane, ev.last_text, ws)
+    if route.action == "repair-boot-prompt":
+        return boot_brief(ev.lane)
+    if route.action == "send-continue":
+        return "continue"
+    return ""
+
+
 def mandate_missing(brief: str) -> list:
     """Which mandate tokens the brief does NOT carry. Empty list = the brief is routed, not relayed."""
     low = " ".join((brief or "").lower().split())

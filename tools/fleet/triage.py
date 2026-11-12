@@ -152,6 +152,13 @@ _ASK_PHRASES = (
     "let me know", "say the word", "your call", "which one", "which option",
     "give me the go", "go ahead?", "proceed?", "ready?", "confirm", "approve",
     "tell me if you want", "on to the next", "does that look right",
+    # ⛔ REPORTED SHAPES THAT WERE MISSED (fresh-context review, #4046). A question is very often
+    # followed by a one-line STATUS that says the same thing in the declarative — and the first
+    # version read only the LAST paragraph, so `…Should I build the router next?\n\nBlocked on your
+    # decision.` classified as `not-asked` and `may_continue()` returned True. That is the exact
+    # harmful message this module exists to prevent, reached through its own detector.
+    "blocked on your", "waiting on you", "waiting on your", "awaiting your",
+    "over to you", "your decision", "up to you", "need your", "once you decide",
 )
 
 ASKED = "asked"
@@ -159,16 +166,24 @@ NOT_ASKED = "not-asked"
 UNREAD = "unread"
 
 
-def last_paragraph(text: str) -> str:
-    """The assistant text's last paragraph, with fenced code removed.
+# A QUOTED line — a blockquote — is material the lane is REPORTING, not the lane speaking. Stripping
+# it is what keeps `> Invalid config: which option did you mean?` out of the detector while still
+# letting the surrounding prose be read (that fixture's own closing line is "Retried with the
+# explicit path.").
+_QUOTE_RE = re.compile(r"(?m)^\s*>.*$")
 
-    A question mark inside a code block or a quoted tool error is not the lane asking the owner
-    anything, and a turn that ends with a pasted stack trace ends with no paragraph of its own — so
-    the fence is stripped BEFORE the split, and an empty result is `UNREAD`, never `NOT_ASKED`.
+
+def ending_paragraphs(text: str, n: int = 2) -> str:
+    """The assistant text's last `n` paragraphs, with fenced code and QUOTED lines removed.
+
+    ⛔ TWO PARAGRAPHS, NOT ONE. A question is routinely followed by a one-line declarative that
+    restates it ("Blocked on your decision.", "Waiting on you."), and reading only the final
+    paragraph classified that shape as `not-asked` — see the REPORTED SHAPES note above. The Jev
+    criteria in `scripts/turn-classify.py` say the same thing from the other side: judge the ENDING.
     """
-    body = _FENCE_RE.sub("\n\n", text or "")
+    body = _QUOTE_RE.sub("", _FENCE_RE.sub("\n\n", text or ""))
     parts = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
-    return parts[-1] if parts else ""
+    return "\n\n".join(parts[-n:]) if parts else ""
 
 
 def asks_owner(text: str) -> str:
@@ -177,8 +192,12 @@ def asks_owner(text: str) -> str:
     `unread` is a first-class answer, and the caller must treat it as "not proven clean" — the same
     discipline `liveness.py` applies to an unreadable turn boundary. An empty or unparseable read
     cannot be read as `not-asked`, because that reading is the one that licenses the harmful message.
+
+    Reads the last TWO paragraphs (a question is often restated declaratively straight after it) and
+    ignores fenced code and blockquote lines (a `?` in a pasted command or a quoted tool error is not
+    the lane asking anything).
     """
-    para = last_paragraph(text)
+    para = ending_paragraphs(text, 2)
     if not para:
         return UNREAD
     low = " ".join(para.lower().split())
@@ -187,11 +206,27 @@ def asks_owner(text: str) -> str:
     for phrase in _ASK_PHRASES:
         if phrase in low:
             # A phrase alone is not the ending — "I asked whether the option was viable" is a
-            # statement ABOUT a question. Require it to sit in the final two sentences.
-            tail = " ".join(re.split(r"(?<=[.!?])\s+", low)[-2:])
+            # statement ABOUT a question. Require it to sit in the final three sentences.
+            tail = " ".join(re.split(r"(?<=[.!?])\s+", low)[-3:])
             if phrase in tail:
                 return ASKED
     return NOT_ASKED
+
+
+# ── a lane RETRYING the model is a wedge subcase with its own remedy ──────────────────────────
+# ⛔ THIS NEEDED A PRODUCER (fresh-context review, #4046). The subcase was DECLARED and reached only
+# by a hand-built fixture — `grep -rn model_retry` found nothing that set it — so it certified a
+# reachability the acquirer could not produce. The signature is mechanical and narrow: the lane's own
+# last words name a provider/transport retry, which is the thing a `continue` cannot fix and a
+# re-dispatch can.
+_RETRY_RE = re.compile(
+    r"(rate[ -]?limit|429|too many requests|overloaded|retrying|retry in |"
+    r"temporarily unavailable|upstream (error|timeout)|provider (error|unavailable))", re.I)
+
+
+def retry_signature(text: str) -> bool:
+    """Does the lane's tail say it is RETRYING the model rather than progressing?"""
+    return bool(_RETRY_RE.search(text or ""))
 
 
 def last_text_from_jsonl(path: Optional[str]) -> str:
@@ -305,6 +340,14 @@ def _question(ev: Evidence) -> str:
     supplied = (ev.ask_signal or "").strip().lower()
     if supplied == ASKED or mech == ASKED:
         return ASKED          # never downgrade: the mechanical answer may not be talked out of it
+    # ⛔ `UNREAD` BEATS A SUPPLIED `not-asked` TOO (fresh-context review, #4046). An empty tail is an
+    # empty tail whoever asserts otherwise: `asks_owner`'s own docstring says an unreadable read
+    # cannot be read as `not-asked`, and honouring a caller's `not-asked` over it let
+    # `Evidence(last_text="", ask_signal="not-asked")` reach `send-continue` — the one message the
+    # module exists to prevent. Latent when fixed (nothing set `ask_signal`), which is exactly how a
+    # fail-open survives until the day a caller starts using the field.
+    if mech == UNREAD:
+        return UNREAD
     if supplied in (NOT_ASKED, UNREAD):
         return supplied
     return mech
@@ -435,32 +478,45 @@ def route(ev: Evidence) -> Route:
 _PRINT_MODE = ("-p", "--print")
 
 
-def steerable(sid: Optional[str]) -> Optional[bool]:
-    """`True` (interactive) / `False` (print mode) / `None` (unread).
+def steerable(sid: Optional[str] = None, *, ws: Optional[str] = None,
+              session_path: Optional[str] = None) -> Optional[bool]:
+    """Can this incarnation be sent input at all? `True` / `False` / `None` (no evidence).
 
-    Read from the PROCESS'S OWN ARGV via the identity CLI — never inferred from a verdict, because a
-    verdict is what got this wrong: `WIP-IDLE` describes the turn, not the incarnation's ability to
-    receive the next one.
+    ⛔ TWO AFFIRMATIVE PATHS, BECAUSE THE FIRST ONE ALONE STOPS THE WHOLE FLEET FROM BEING NUDGED
+    (fresh-context review finding P0, measured). `argv_candidates` finds pids whose argv carries the
+    session in a RESUME form (`--session <sid>` / `-r` / `--resume`, `scripts/lib/pid-identity.sh`).
+    A live interactive `pi` on this fleet has argv exactly `pi` — measured on five of them — so the
+    argv read returns EMPTY for every ordinary lane, this function answered `None`, the router refused
+    `idle-continue`, and `scripts/turn-end.py` therefore nudged NOBODY. A refusal that fires on every
+    lane is not the safe direction; it is the inert-enforcer class the change exists to remove.
+
+    The second path is the honest affirmative the fleet already relies on: A LANE WHOSE SESSION
+    TRANSCRIPT IS BOUND TO A CMUX WORKSPACE IS INTERACTIVE. It can be typed into and it takes a next
+    turn. This is not a guess from a verdict — it is the construction of the population: an
+    orchestrator lane runs `pi -p --no-session` (`lane.sh`), so it has NEITHER a session file NOR a
+    bound workspace, and cannot satisfy this branch. `False` still requires POSITIVE proof of print
+    mode (a readable argv carrying `-p` / `--print`), and `None` remains "no evidence" — the caller
+    may refuse on it, and the router does.
     """
-    if not sid:
-        return None
-    try:
-        pids, ok = liveness.argv_candidates(sid)
-    except Exception:                                             # noqa: BLE001
-        return None
-    if not ok or not pids:
-        return None
-    import subprocess
-    for pid in pids:
+    if sid:
         try:
-            p = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
-                               capture_output=True, text=True, timeout=15)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        argv = (p.stdout or "").strip()
-        if not argv:
-            continue
-        return not any(tok in _PRINT_MODE for tok in argv.split())
+            pids, ok = liveness.argv_candidates(sid)
+        except Exception:                                         # noqa: BLE001
+            pids, ok = [], False
+        if ok and pids:
+            import subprocess
+            for pid in pids:
+                try:
+                    p = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                                       capture_output=True, text=True, timeout=15)
+                except (OSError, subprocess.SubprocessError):
+                    continue
+                argv = (p.stdout or "").strip()
+                if not argv:
+                    continue
+                return not any(tok in _PRINT_MODE for tok in argv.split())
+    if ws and session_path:
+        return True
     return None
 
 

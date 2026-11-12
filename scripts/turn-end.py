@@ -552,15 +552,22 @@ def main(argv: list[str]) -> int:
             #     cause rather than looking idle;
             #   * the incarnation is not provably steerable. A `pi -p` lane cannot take a second
             #     turn at all, so a send is a no-op that still writes a marker this fleet reads back
-            #     as BUSY. An UNREAD probe refuses too, and the refusal is logged once per pass by
-            #     the `router=` NOTE below — a withheld nudge costs one tick, never the lane.
+            #     as BUSY. An UNREAD probe refuses too — a withheld nudge costs one tick (the lane is
+            #     reconsidered next pass), never the lane. `scripts/lane-route.py` prints the
+            #     aggregate `router=refuse:N` line those refusals would otherwise be invisible in.
             if _triage is not None:
                 _ev = _triage.Evidence(
                     lane=lane,
                     turn=_liveness.turn_from_jsonl(f) if f else None,
                     last_text=_triage.last_text_from_jsonl(f),
                     lane_verdict=r.get("verdict") or "",
-                    steerable=_triage.steerable(sid),
+                    # ⛔ (sid, ws, session_path) — NOT `sid` alone. Five freshly-context-reviewed
+                    # live `pi` processes on this fleet have argv exactly `pi`, so the argv probe finds
+                    # no candidate and the one-argument form answered `None` for every ordinary lane:
+                    # the router then refused `idle-continue` and this file nudged NOBODY. See
+                    # `triage.steerable` — an interactive session bound to a workspace is the second,
+                    # affirmative proof. `r.get("ws")` is the row's own workspace id.
+                    steerable=_triage.steerable(sid, ws=r.get("ws"), session_path=f),
                 )
                 _may, _route = _triage.may_continue(_ev)
                 if not _may:
