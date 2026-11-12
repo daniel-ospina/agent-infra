@@ -1468,6 +1468,9 @@ ck "…and the chain did not launch" \
 reset_stub_knobs; CHECKS_STUB="$T/checks-150-short.tsv"; FULL_CHECKS_STUB="$T/checks-150-full.tsv"
 new_o "$T/pr638c.tsv"
 run_stub 65 --repo o/r --pr-tsv "$T/pr638c.tsv"
+# The chain is launched DETACHED, so its log is written after this returns — the same 1 s settle the
+# green-launch cases above use. Without it this case is a race on the stub's write, not a verdict.
+sleep 1
 ck "a COMPLETE full read (150 of 150 rows) is still GREEN and the chain IS launched — the assertion does not over-block" \
    $([ "$RC" = 11 ] && grep -q "MERGED via the rail" "$OT/logs/lane-merge-65.log" 2>/dev/null && echo 0 || echo 1)
 ck "…and no truncated-read line was emitted for it" \
@@ -2233,6 +2236,83 @@ disown "$SPID3" 2>/dev/null; kill "$SPID3" 2>/dev/null; wait "$SPID3" 2>/dev/nul
 marker2="$(sed -n 's/.*lane-merge-handoff: \([^ ]*\) -->.*/\1/p' "$T/gh2.log" 2>/dev/null | tail -1)"
 ck "…and the handoff marker still names that head, not 'unknown' (per-head dedup survives)" \
    $([ "$marker2" = head123 ] && echo 0 || echo 1)
+
+# ══════════════ #4014 — THE WAIT AND THE FIX FOLLOW THE REPO'S REQUIRED SURFACE ══════════════
+# MEASURED SYMPTOM (tortoise #12171, head 49840e6e): 57 check names, 24 queued for 70 minutes, and
+# ONE red — `agent-infra-ci / lint` — that is not one of tortoise's 7 required contexts. The loop spent
+# a FIX round on it and waited out the queue behind it, so the lane burned its cap on work the merge
+# contract does not gate on and the owner admin-merged past CI instead.
+# ⛔ THE FAIL-CLOSED HALF IS THE ONE THAT MATTERS: with NO readable contract (this suite's `gh` stub
+# answers nothing for `branches/main/protection`, so `REQ_SOURCE=fallback`) every red is still a fix
+# round — that is case 5 above, unchanged and passing. The cases below inject a REAL contract through
+# the resolver's own operator override (`REQ`), so the new path is exercised through shipped code and
+# not through a second seam invented for the test.
+run_req() { # run_req <required-set> <pr> <args…> — `run` with the REQUIRED set pinned
+  local _req="$1"; shift
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REQ="$_req" \
+        REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+        LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT="${WAIT_S:-0}" LANE_MERGE_POLL="${POLL_S:-0}" \
+        LANE_MERGE_ELAPSED_S="${LANE_MERGE_ELAPSED_S:-}" \
+        bash "$SCRIPT" "$@" 2>&1)"; RC=$?
+}
+
+# 4014-a. an ADVISORY red spends NO fix round — and is REPORTED, never hidden.
+# ⛔ A FRESH FIXTURE PER CASE: the stub chain REWRITES the fixture it is handed, so a shared file
+# carries "closed|merged" into the next case and every later assertion reads a MERGED PR.
+pr_open_4014() { printf 'open||abc123|clean\n' > "$T/pr4014.tsv"; }
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'unit' 301 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-red.tsv"
+sleep 1
+ck "an ADVISORY red (lint, not required) spends NO fix round and does NOT block — the chain is reached" \
+   $([ "$RC" != 10 ] && [ ! -f "$OT/state/lanemerge-301.round" ] && grep -q "launched the merge chain" <<<"$OUT" && echo 0 || echo 1)
+ck "…and the advisory red is NAMED in the output rather than silently dropped" \
+   $(grep -q "ADVISORY (not in o/r's required set: unit)" <<<"$OUT" && grep -q "lint" <<<"$OUT" && echo 0 || echo 1)
+
+# 4014-b. a REQUIRED red is STILL a fix round (the change must not weaken the gate).
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'lint' 302 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-red.tsv"
+ck "a REQUIRED red is still exit 10 FIX_REQUIRED naming it (the gate is not weakened)" \
+   $([ "$RC" = 10 ] && grep -qE "required checks are RED: lint$" <<<"$OUT" && [ "$(cat "$OT/state/lanemerge-302.round")" = 1 ] && echo 0 || echo 1)
+
+# 4014-c. an ADVISORY in-flight job is NOT waited for; a REQUIRED one is.
+printf 'lint\tqueued\t\t51\nunit\tcompleted\tsuccess\t52\n' > "$T/checks-advq.tsv"
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'unit' 303 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-advq.tsv"
+sleep 1
+ck "a REQUIRED set that is COMPLETE is not held by an ADVISORY job still queued (the 24-queued-checks tax)" \
+   $([ "$RC" = 11 ] && grep -q "launched the merge chain" <<<"$OUT" && echo 0 || echo 1)
+
+# 4014-d. a REQUIRED name that is not published YET is IN FLIGHT, never green.
+# Tortoise's `python-ci-gate` appears only when its whole needs-graph finishes, so its absence is
+# the normal state for most of a PR's life — and reading it as "nothing left to wait for" would
+# merge past the repo's own gate.
+printf 'lint\tcompleted\tsuccess\t61\n' > "$T/checks-nogate.tsv"
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'python-ci-gate' 304 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-nogate.tsv"
+ck "a required check NOT YET PUBLISHED is in flight (WAITING_CHECKS), and the chain is NOT launched" \
+   $([ "$RC" = 11 ] && grep -q "NOT PUBLISHED YET" <<<"$OUT" && [ ! -f "$OT/logs/lane-merge-304.log" ] && echo 0 || echo 1)
+
+# 4014-e. THE CONTRACT IS UNREADABLE → EVERY check is required (this suite's default stub).
+# The same red that 4014-a ignored must BLOCK here, or the fail-closed direction is broken.
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run 305 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-red.tsv"
+ck "an UNREADABLE contract makes every red a fix round again (fail-closed, source=fallback)" \
+   $([ "$RC" = 10 ] && grep -q "UNREADABLE" <<<"$OUT" && grep -qE "required checks are RED: lint$" <<<"$OUT" && echo 0 || echo 1)
+
+# 4014-f. a `<caller> / <job>` surface name still matches its required parent.
+# GitHub renders a reusable workflow's job that way (`agent-infra-ci / lint`), so a required bare
+# name must not be silently demoted to advisory by the prefix alone.
+printf 'agent-infra-ci / lint\tcompleted\tfailure\t71\n' > "$T/checks-prefixed.tsv"
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'lint' 306 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-prefixed.tsv"
+ck "a '<caller> / <job>' name matches its required bare parent (and is therefore a fix round)" \
+   $([ "$RC" = 10 ] && grep -q "required checks are RED: agent-infra-ci / lint$" <<<"$OUT" && echo 0 || echo 1)
 
 echo
 if [ "$fail" -eq 0 ]; then

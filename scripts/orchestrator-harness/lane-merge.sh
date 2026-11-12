@@ -714,6 +714,81 @@ if [ "$WATCH" -eq 0 ] && [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT
 fi
 printf '%s %s\n' "${ISSUE:-}" "$(date +%s)" > "$PHASE_F" 2>/dev/null || true
 
+# ── THE REPO'S REQUIRED SURFACE IS THE GATE THIS LOOP WAITS ON (#4014) ──────────────────────────
+# THE DEFECT. This loop classified EVERY check on the head's surface: any red spent a FIX round, and
+# any non-terminal attempt was waited out to the 5400 s bound — regardless of whether the repo's own
+# branch protection gates on that check at all. MEASURED on a live tortoise PR (#12171, head
+# 49840e6e): 57 check names, 24 of them still queued after 70 minutes, and exactly ONE red —
+# `agent-infra-ci / lint` — which is NOT one of tortoise's 7 required contexts, and which main cannot
+# even be compared against, because main publishes the same ruff program under a DIFFERENT name
+# (`main-lint / lint`). So a lane was told to FIX a red it had not caused and could not fix, spent
+# its rounds on it, and the owner then did the only thing the loop left open: admin-merged past CI.
+# That is the measured mechanism behind "CI is too slow to gate a merge, so merges bypass it".
+#
+# THE RULE, and it is NOT a weakening of the gate — it is the repo's OWN gate, read from the ONE home
+# that already resolves it (`repo-authority.sh::resolve_required_checks`, the same resolver
+# `merge-one.sh` and `orch-loop.sh` use, so a third opinion cannot appear here):
+#   * a REQUIRED red is a FIX_REQUIRED round, exactly as before;
+#   * a REQUIRED name that is not on the surface YET is IN FLIGHT, never green. Tortoise's
+#     `python-ci-gate` is published only when its whole needs-graph finishes, so its absence is the
+#     normal state for most of a PR's life — and a missing required check must never read as
+#     "nothing left to wait for";
+#   * a NON-required red is REPORTED (never hidden) and does not spend a round;
+#   * a NON-required in-flight job is REPORTED and is not waited for.
+# WHO MERGES IS UNCHANGED, and that is why this cannot land anything the repo's contract refuses:
+# this script never merges. `merge-one.sh` runs the repo's own authority — a gate repo merges through
+# a plain `gh pr merge`, where GitHub enforces exactly this required set (so an advisory red still
+# cannot be bypassed INTO main by anything this loop does); a rail repo goes through
+# `admin-merge.sh`, which re-reads the WHOLE surface and refuses on its own rules. What changes here
+# is only that the loop stops *fixing* and *waiting on* checks the merge contract does not gate on.
+# ⛔ FAIL-CLOSED, AND THE UNREADABLE CASE IS THE ONE THAT MATTERS. A contract that could not be read
+# is NOT treated as "nothing is required": the resolver's own fail-closed fallback is tortoise's name
+# list and is FOREIGN to every other repo, so on `REQ_SOURCE=fallback` — or with no `repo-authority.sh`
+# on this box at all — `LM_REQ_TRUSTED=0` and EVERY check on the surface counts as required, which is
+# exactly this script's behaviour before this change. A box whose protection read fails today behaves
+# as it did yesterday, loudly.
+LM_REQ=""; LM_REQ_SRC=""; LM_REQ_TRUSTED=0
+lm_resolve_required_surface() {
+  local _ra="" _d="" _c=""
+  [ -n "${OR:-}" ] || return 0
+  _d="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || _d=""
+  for _c in "${O_WORK:-}" "${O:-}" "$_d"; do
+    [ -n "$_c" ] || continue
+    if [ -f "$_c/repo-authority.sh" ]; then _ra="$_c/repo-authority.sh"; break; fi
+  done
+  if [ -z "$_ra" ]; then
+    say_err "lane-merge: no repo-authority.sh beside this script or in \$O — the required-check contract cannot be read, so EVERY check on this head counts as required (fail-closed)"
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  . "$_ra" 2>/dev/null || {
+    say_err "lane-merge: $_ra did not source — EVERY check on this head counts as required (fail-closed)"
+    return 0
+  }
+  if ! command -v resolve_required_checks >/dev/null 2>&1; then
+    say_err "lane-merge: $_ra is stale (no resolve_required_checks) — EVERY check on this head counts as required (fail-closed)"
+    return 0
+  fi
+  # `REQ` in the environment is the operator/controller override the other consumers honour; capture
+  # it ONCE here because `resolve_required_checks` overwrites `REQ` with the resolved value in THIS
+  # shell (that in-place contract is what makes REQ_SOURCE readable — a command substitution would
+  # subshell it away).
+  REQ_OVERRIDE="${REQ:-}"; REQ=""
+  resolve_required_checks "$OR" >/dev/null 2>&1 || true
+  LM_REQ="${REQ:-}"; LM_REQ_SRC="${REQ_SOURCE:-}"
+  case "$LM_REQ_SRC" in
+    protection|env)
+      if [ -n "$LM_REQ" ]; then LM_REQ_TRUSTED=1; fi ;;
+  esac
+  if [ "$LM_REQ_TRUSTED" = 1 ]; then
+    say_err "lane-merge: required surface for $OR (source=$LM_REQ_SRC): $LM_REQ"
+  else
+    say_err "lane-merge: the required-check contract for $OR is UNREADABLE (source=${LM_REQ_SRC:-none}) — every check on this head is treated as required (fail-closed)"
+  fi
+  return 0
+}
+lm_resolve_required_surface
+
 # ── the two reads (injectable) ───────────────────────────────────────────────────────────────────
 # pr_read → "<state>|<merged_at>|<head_sha>|<mergeable_state>"
 # ⛔ PIPE, NOT TAB. Tab is WHITESPACE to the shell, so `IFS=<tab> read` COLLAPSES empty fields — an
@@ -791,8 +866,8 @@ checks_read() { # checks_read <head> [--full]
 # conclusion must never fall through a gap. Newest attempt per **(app, name)** by id — a job name
 # shared across two workflows must not let one mask the other; `started_at` is nullable and is only a
 # tiebreak, and grouping by check_suite would shatter one check per re-run.
-classify() {
-  python3 - "$1" <<'PY'
+classify() { # classify <tsv-file> [required-set] [1=trusted]
+  python3 - "$1" "${2:-}" "${3:-0}" <<'PY'
 import sys
 GREEN = {"success", "neutral", "skipped"}
 NONRED = GREEN | {"cancelled", "stale"}
@@ -815,14 +890,52 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     cur = newest.get(key)
     if cur is None or cid > cur[2]:
         newest[key] = (status, conclusion, cid)
-inflight, red = 0, []
+# ── NUMBER 4014: THE REQUIRED SURFACE DECIDES WHAT IS WAITED FOR AND WHAT IS FIXED ────────────
+# `required` is the repo's own branch-protection set (space-separated) and `trusted` says whether it
+# was actually READ. Untrusted => EVERY name is required, i.e. the pre-#4014 behaviour, which is the
+# fail-closed default (see `lm_resolve_required_surface`).
+required = sys.argv[2].split() if len(sys.argv) > 2 and sys.argv[2] else []
+trusted = (len(sys.argv) > 3 and sys.argv[3] == "1")
+
+
+def is_required(name):
+    """Is THIS surface check one of the repo's required contexts?"""
+    if not trusted or not required:
+        return True
+    if name in required:
+        return True
+    # GitHub renders a reusable workflow's job as `<caller> / <job>` (measured: `agent-infra-ci / lint`
+    # on tortoise). The REQUIRED CONTEXT is the bare name branch protection declares, so a suffixed
+    # name must still match its required parent — the same normalisation `merge-one.sh` applies to the
+    # gate row. The direction matters: this makes MORE names required, never fewer.
+    i = name.rfind(" / ")
+    return i > 0 and name[i + 3:] in required
+
+
+inflight_req, red, red_req, red_adv, names = 0, [], [], [], set()
 for (app, name), (status, conclusion, _cid) in sorted(newest.items()):
+    names.add(name)
+    disp = "%s:%s" % (app, name) if app else name
+    req = is_required(name)
     if status != "completed":
-        inflight += 1
+        # Only a REQUIRED in-flight job is waited for. An advisory job still queued behind the
+        # queue is a fact about the queue, not about whether this head may proceed.
+        if req:
+            inflight_req += 1
     elif conclusion not in NONRED:
-        red.append("%s:%s" % (app, name) if app else name)
-print("INFLIGHT %d" % inflight)
+        red.append(disp)
+        (red_req if req else red_adv).append(disp)
+# A REQUIRED NAME WITH NO ROW AT ALL is neither green nor red — it has not been published yet
+# (tortoise's `python-ci-gate` appears only once its whole needs-graph finishes). It is reported
+# separately so the caller can treat it as in flight; a missing required check must never be read
+# as "nothing left to wait for".
+missing = [n for n in required if n not in names] if (trusted and required) else []
+print("INFLIGHT %d" % inflight_req)
 print("RED %s" % ",".join(red))
+if trusted and required:
+    print("REQRED %s" % ",".join(red_req))
+    print("ADVRED %s" % ",".join(red_adv))
+    print("REQMISSING %s" % ",".join(missing))
 PY
 }
 
@@ -1983,7 +2096,7 @@ while :; do
     IF=1; RED=""
   else
     printf '%s\n' "$rows" > "$CHECK_TMP"
-    classified="$(classify "$CHECK_TMP")"
+    classified="$(classify "$CHECK_TMP" "${LM_REQ:-}" "$LM_REQ_TRUSTED")"
     # ⛔ FAIL CLOSED ON AN UNREADABLE CLASSIFICATION. A missing/broken python3 yields EMPTY output,
     # which would read as "no red, no inflight" — i.e. GREEN — and launch a merge on a head nobody
     # classified. The classifier's own contract is two lines; anything else is "I cannot judge".
@@ -1999,10 +2112,36 @@ while :; do
     fi
     IF="$(printf '%s' "$classified" | awk '/^INFLIGHT /{print $2}')"
     RED="$(printf '%s' "$classified" | awk '/^RED /{sub(/^RED /,""); print}')"
+    # ── THE REQUIRED / ADVISORY SPLIT (#4014). Only present when the contract was READ; when it
+    # was not, the classifier prints neither line and `RED_REQ` falls back to the WHOLE red set —
+    # the fail-closed default (every check required). A `REQMISSING` name is a required check that
+    # has not been published yet, and it is counted as in flight below.
+    RED_REQ="$(printf '%s' "$classified" | awk '/^REQRED /{sub(/^REQRED /,""); print}')"
+    RED_ADV="$(printf '%s' "$classified" | awk '/^ADVRED /{sub(/^ADVRED /,""); print}')"
+    REQ_MISSING="$(printf '%s' "$classified" | awk '/^REQMISSING /{sub(/^REQMISSING /,""); print}')"
+    # ⛔ A TRUNCATED SPLIT MUST NOT READ AS "EVERYTHING IS ADVISORY". The two lines above were the
+    # classifier's whole contract before #4014, so the guard below still only demands them; the SPLIT
+    # is elected here instead — absent, `RED_REQ` reverts to the WHOLE red set, which is the fail-closed
+    # direction (every red is a fix round). A crash between the prints lands here, not in a false green.
+    if [ "$LM_REQ_TRUSTED" = 1 ] && ! grep -q '^REQRED ' <<<"$classified"; then
+      say_err "lane-merge: the classifier printed no required/advisory split — treating EVERY red as required (fail-closed)"
+      LM_REQ_TRUSTED=0
+    fi
+    if [ "$LM_REQ_TRUSTED" != 1 ]; then RED_REQ="${RED:-}"; RED_ADV=""; REQ_MISSING=""; fi
   fi
   [ -n "$RED" ] && { printf '%s\n' "$(printf '%s' "$RED" | tr ',' '\n')" > "$LAST_F"
                      printf '%s\n' "${HD:-${HEAD:-}}" > "$LASTHEAD_F" 2>/dev/null || true; }
-  if [ -n "${RED:-}" ]; then
+  # ⛔ AN ADVISORY RED IS REPORTED, NEVER HIDDEN (#4014). It spends no fix round and is not waited
+  # for, but a lane that was told nothing would be the silence this file exists to abolish — and the
+  # MERGE decision is still not made here: the chain re-reads the surface through the repo's own
+  # authority (see the block that resolves `LM_REQ` above).
+  if [ -n "${RED_ADV:-}" ]; then
+    log_line "… ADVISORY (not in $OR's required set: ${LM_REQ:-none}) — reported, NOT a fix round and NOT waited for: $(printf '%s' "$RED_ADV" | tr ',' ' ')"
+  fi
+  if [ -n "${REQ_MISSING:-}" ]; then
+    log_line "… required check(s) NOT PUBLISHED YET at head ${HEAD:0:12} — a missing required check is in flight, never green: $(printf '%s' "$REQ_MISSING" | tr ',' ' ')"
+  fi
+  if [ -n "${RED_REQ:-}" ]; then
     # ── A FLAKE IS NOT A FIX (#2866) ──────────────────────────────────────────────────────────
     # Before this round spends a FIX on the red, ask the router whether the red is a red at all.
     # `RERUN-FLAKE` = the same (app, workflow, job) PASSED on an earlier attempt at THIS SAME head:
@@ -2030,9 +2169,15 @@ while :; do
       esac
     fi
     [ "${lsick_action:-}" = "RERUN-FLAKE" ] && exit 11
-    emit_fix FIX_REQUIRED "this head's own checks are RED: $(printf '%s' "$RED" | tr ',' ' ')"
+    emit_fix FIX_REQUIRED "this head's own required checks are RED: $(printf '%s' "$RED_REQ" | tr ',' ' ')"
   fi
-  [ "${IF:-0}" = "0" ] && break
+  # ⛔ THE WAIT IS ON THE REQUIRED SURFACE (#4014). `IF` is already required-only when the contract
+  # was read (untouched otherwise), and an UNPUBLISHED required name is in flight too. Continuing to
+  # sit through advisory jobs is the 24-queued-checks tax measured on #12171, and it buys nothing:
+  # no merge decision is made here.
+  _eff="${IF:-0}"
+  if [ -n "${REQ_MISSING:-}" ]; then _eff=$(( _eff + 1 )); fi
+  [ "$_eff" = "0" ] && break
   # ⛔ SAY SOMETHING WHILE YOU WAIT (measured live on this change's own PR). With every required
   # check in flight the loop printed NOTHING for up to WAIT_S — and to every liveness instrument we
   # have, a lane that has produced no output for 15 minutes is indistinguishable from a wedged one.
