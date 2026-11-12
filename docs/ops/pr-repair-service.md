@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-10-24
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-2716, issue-2709, issue-2700, issue-2721, issue-1974, systemd, cloud-cell, pr-doctor
+aboutObjects: agent-infra, issue-2716, issue-2709, issue-2700, issue-2721, issue-1974, issue-4009, issue-2518, systemd, cloud-cell, pr-doctor
 ---
 
 # PR-repair service (#2716, #2709)
@@ -73,9 +73,61 @@ class of lifetime #2402 removed for the controller and this unit removes for rep
    | `dispatched` | the dispatcher ran and returned 0 — work was placed, or the queue was genuinely empty |
    | `deferred` | the machine said not now; the reason carries the measurement (`disk-floor:3481<4096`, `load-ceiling:…`, `cap-zero`) |
    | `refusing` | a read a pass needs could not be taken, or the dispatcher itself refused (rc=2) — **never** "nothing to do" |
-   | `placed-undelivered` | legible work, **none of it out** (pr-doctor rc=3): no worker took an order that was placed, **or** a durable refusal stopped the order before delivery (`agent-infra#2710` — a dirty worktree, a queue parked under the 45-min cooldown the refusal created; measured for #2708). The pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted. ⚠️ The `reason` token on this row is still `no-worker-took-it` for both causes; the human line on stderr names both, and renaming the token is left to a change that can verify every reader |
+   | `placed-undelivered` | legible work, **none of it out** (pr-doctor rc=3): no worker took an order that was placed, **or** a durable refusal stopped the order before delivery (`agent-infra#2710` — a dirty worktree, a queue parked under the 45-min cooldown the refusal created; measured for #2708), **or** the pass holds no rubric for this repo and never reached the chain at all (`agent-infra#4009` — see **The dispatch chain** below; `VERDICT=RUBRIC next=supply-rubric`). The pass exits **3** too, so a monitor keyed on the exit code cannot read green over work nobody accepted. ⚠️ The `reason` token on this row is still `no-worker-took-it` for all three causes; the human line on stderr names them and pr-doctor's own `verdict` field distinguishes them — renaming the token is left to a change that can verify every reader |
    | `idle` | a `--dry-run` pass: measured and derived, dispatched nothing |
    | `skipped` | another pass held the lock, so this one attempted nothing. Written to its **own** file (`pr-repair.skip.json`) so a skipping process can never replace the lock holder's verdict; `--status` prints both |
+
+## The dispatch chain: what `next=repair-chain` resolves to (#4009)
+
+A pass that places nothing must say **which component** refused, because the remedies are not
+interchangeable and one of them is a wasted budget. Until `#4009` it did not: every refusal that
+was not a box boundary collapsed into
+
+```
+dispatched 0 of 17 queued — VERDICT=UNDELIVERED next=repair-chain; repair the dispatch chain
+named on the line above -- this does NOT clear by waiting; 17 order(s) no worker accepted
+```
+
+⛔ **MEASURED 2026-11-07 → 2026-11-12: the dispatch chain was healthy and was NEVER INVOKED.**
+`pr-doctor.py` returned at its `contract_note()` guard — before any worktree was materialised and
+before `$O/nonblocking-dispatch.sh` was exec'd — because `OBJECTIVE_REQUIRED` / `OBJECTIVE_SURFACE`
+had not been supplied for the repo being graded (`agent-infra#2518`). `grep -c 'rubric: REFUSING TO
+DISPATCH' $STATE/pr-doctor.log` → **2920** lines, one per pass, for days; and the same box answered
+`bash ~/orchestrator/nonblocking-dispatch.sh --status <name>` in one call, rc 0. "The line above"
+named no chain either, so even the right reader had nothing to open.
+
+So the verdict now carries the chain **resolved**, and only when the chain is actually implicated:
+
+| verdict | means | next |
+|---|---|---|
+| `RUBRIC` (rc 3) | this pass holds no rubric for the repo it grades, so **no order could be placed** and the chain was never reached | `supply-rubric` — set the `OBJECTIVE_REQUIRED` / `OBJECTIVE_SURFACE` seams the same pass's `rubric:` line names |
+| `UNDELIVERED` (rc 3) | an order was **placed** and the transport would not take it | `repair-chain`, with `chain=<resolved path>` on the same line — `(MISSING)` when deploying is the repair |
+| `REFUSED` (rc 3) | the order was refused on durable grounds (a dirty worktree, commits the head does not have) | `fix-worktree` |
+| `NO-CAPACITY` (rc 6) | the box's own spawn gate refused; nothing was consumed | `wait` / `prune-disk` / `land-prs` / `restart-box` / `finish-lanes`, per the axis |
+
+⛔ **`RUBRIC` IS STILL A REFUSAL (rc 3), never `0`.** `#3105`'s ruling stands: a pass that delivers
+nothing may not read as a quiet queue. Only the **attribution** changed.
+
+### What the chain resolves on each box
+
+`pr-doctor.py` execs exactly one thing — `NONBLOCKING_DISPATCH` = `os.path.join(ORCH_DIR,
+"nonblocking-dispatch.sh")`, where `ORCH_DIR` is `$O` or `$HOME/orchestrator`. That value is the one
+thing that differs between the two boxes the verdict is read on, which is why the verdict prints the
+expanded path rather than the variable:
+
+| | Mac (launchd / operator shell) | cell (`eldato-pr-repair.service`) |
+|---|---|---|
+| `ORCH_DIR` (`$O`) | `~/orchestrator` by default; the controller exports its own state dir | the cell home's `$O`, seeded by `cell-install.sh` |
+| the chain it execs | `~/orchestrator/nonblocking-dispatch.sh` | `$O/nonblocking-dispatch.sh` |
+| `--status` / `.rc` / `.pid` | `$ORCH_DIR/bg/<name>.{rc,pid,started,log}` | same, under the cell's `$O/bg` |
+| what the chain itself sources | `spawn-gate.sh` — from `$O` (or `$O_WORK`), else the copy beside the script; refuses `78` if neither | same, and this is the path `O_WORK` exists for (`#2095`: the controller exports `O` = STATE dir, `O_WORK` = harness root) |
+| the brief validator | `brief-gate.sh` — `$O`, `$HARNESS`, `$AGENT_INFRA_PATH/scripts/orchestrator-harness`, `~/.pi/agent/scripts`; refuses `80` if none | same four homes |
+| what the chain does with a worker | backgrounds `run_agent()` and returns at once | same |
+
+A `chain=…(MISSING)` verdict therefore means: deploy the harness to that path (`deploy-harness.sh
+--src . --o <that dir>`, or the farm installer on a symlink farm). Anything else about the chain —
+stale, predating the `prfix` kind — is refused loudly by `dispatcher_kind_support()` at the refusal
+it causes, so `chain=` deliberately reports presence only and not a second opinion.
 
 ## Credentials are sourced, not inherited (#1852)
 
