@@ -74,11 +74,16 @@ eval "$(sed -n '/^launch_rail() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^lock_holder_is_live() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^acquire_lock() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^report_search() {/,/^}$/p' "$SUT")"
+# ⛔ `interruptible_sleep` IS PART OF `launch_rail`'s AND `launch_review`'s CONTRACT NOW (#4013): both
+# verify a dispatch by waiting `LAUNCH_VERIFY_S` first, and under `set -u` an unextracted helper is a
+# 127 on the same line that would otherwise have been a wait. Extracted, so the arms below drive the
+# SHIPPED wait rather than a copy of it.
+eval "$(sed -n '/^interruptible_sleep() {/,/^}$/p' "$SUT")"
 for _fn in rail_rows rails_for_repo rails_should_defer candidate_deferred max_total_for \
            rail_already_running rail_says_skip denied cooldown_for forget_tried \
            rail_bound_file rail_bound_state rail_bound_elapsed rail_bound_kills_file \
            rail_bound_kills lane_bound_path reap_bounded_rail launch_rail \
-           lock_holder_is_live acquire_lock report_search; do
+           lock_holder_is_live acquire_lock report_search interruptible_sleep; do
   command -v "$_fn" >/dev/null || { echo "FATAL: $_fn not found in $SUT"; exit 2; }
 done
 # ⛔ `rails_should_defer` calls `log_line`, which the SCRIPT defines and this file does not — so without
@@ -2743,5 +2748,146 @@ rm -rf "$_bdir"
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"
 
-[ "$fail" = 0 ] && echo "PASS: per-repo accounting launches a starved repo's candidate, identifies repos by owner/name, still bounds one repo, counts unknown load against everyone, and verifies its launches"
+# ══ A STOP MUST BE A STOP, AND THE RELEASE MUST BE OURS (#3547, #4013) ═════════════════════════════════
+# The shipped trap was `trap 'rm -rf "$LOCK.d"' EXIT INT TERM`, and it is wrong in TWO directions at
+# once, both measured:
+#   * bash runs a TERM trap and then RESUMES the script (it only terminates if the trap itself exits), so
+#     a stopped actuator released its lock and went on launching rails UNGUARDED while the restart that
+#     follows any stop path took the freed lock — the double-rail the lock exists to prevent;
+#   * the release is unconditional, and `acquire_lock` can legitimately hand this process a lock it did
+#     not create (the stale reclaim), so an EXIT `rm -rf` can delete a SUCCESSOR's lock.
+# And a third, which is why launchd recorded status -9: bash defers a trap behind a FOREGROUND command,
+# so the pass loop's `sleep "$INTERVAL"` (180s shipped) held a TERM for the whole interval — longer than
+# launchd's stop grace, so the actuator was SIGKILLed at every stop and its EXIT arm never ran.
+#
+# ⛔ THESE ARMS DRIVE THE SHIPPED FUNCTIONS IN A REAL CHILD PROCESS, and the child is told where they live
+# through a PATH FILE rather than by expanding them into its own body: an expansion here would pin this
+# file's copy of the traps instead of the script's, which is the failure mode the whole suite is built to
+# avoid. What each arm can and cannot see is stated at the arm.
+# ⛔ THE CHILD IS POINTED AT THE **RESOLVED** SUT, NEVER AT THE TRACKED PATH (review finding, P2 — and the
+# reviewer supplied the reproduction below, which this file now runs). `SUT=${AUTO_RAIL_SCRIPT:-…}` at the
+# top is this suite's documented way to test a COPY; hardcoding `$HERE/auto-rail.sh` here meant that with an
+# override set, arms 1-3 drove the PRISTINE file while every text pin read the copy — so the three
+# behaviours they exist to prove (`interruptible_sleep`'s body, `release_lock`'s ownership check,
+# `stop_on_signal`'s `exit 0`) could be mutated in the copy and this section would still report green.
+# Reproduced at the fix's head: with AUTO_RAIL_SCRIPT pointing at a copy whose `interruptible_sleep` body was
+# reverted to a foreground sleep, the suite returned rc=0 (a false PASS) before this line and rc=1 after it.
+_asut="$SUT"
+_ad=$(mktemp -d)
+printf '%s\n' "$_asut" > "$_ad/sut"
+# ⛔ THE CHILD LOOPS IN `interruptible_sleep 300`, NOT A SHORTER SLEEP: the arm's point is that a stop
+# interrupts a wait that is FAR longer than the harness's patience. A 300s sleep is what makes "still
+# running after 5s" a real measurement rather than an assertion about timing luck.
+cat > "$_ad/child.sh" <<'CHILD'
+#!/bin/bash
+# A stand-in for the actuator's pass loop: the SHIPPED traps, the SHIPPED wait, one lock.
+set -u
+SUT=$(cat "$WORK/sut")
+eval "$(sed -n '/^release_lock() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^interruptible_sleep() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^stop_on_signal() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^install_stop_traps() {/,/^}$/p' "$SUT")"
+# ⛔ THE ARGUMENTS ARE BOUND **BEFORE** THE PRESENCE CHECK (review finding, P3): under `set -u` the
+# `>> "$LOG"` in the branch below was an unbound-variable error, so the shell died writing nothing and
+# arm 1's MISSING-FN assertion could never fire — an inert diagnostic on the one path an operator needs it
+# (a reformatted function header, which breaks the `sed` extraction silently).
+LOCK=$1; LOG=$2; MODE=$3
+for _f in release_lock interruptible_sleep stop_on_signal install_stop_traps; do
+  command -v "$_f" >/dev/null || { echo "MISSING-FN $_f" >> "$LOG"; exit 9; }
+done
+log_line() { printf '%s\n' "$*" >> "$LOG"; }
+mkdir "$LOCK.d"
+case "$MODE" in
+  own)     printf '%s\n' "$$" > "$LOCK.d/pid" ;;
+  foreign) printf '%s\n' "$4" > "$LOCK.d/pid" ;;
+  nopid)   : ;;   # the successor's mkdir->pid window: a lock dir this process must not judge
+  *)       echo "BAD-MODE $MODE" >> "$LOG"; exit 9 ;;
+esac
+install_stop_traps
+echo READY >> "$WORK/ready.$MODE"
+while :; do interruptible_sleep 300; done
+CHILD
+# Send TERM to one arm's child and report how it ended. rc 0 = the child ended by itself inside the
+# window; rc 1 = it had to be killed (the deferral defect), which is asserted at the call site.
+_ad_stop() {  # $1 = child pid, $2 = the mode's ready marker; rc 0 = stopped by itself
+  local i alive=1
+  i=0
+  while [ "$i" -lt 40 ]; do
+    [ -f "$2" ] && break
+    i=$(( i + 1 )); sleep 0.1
+  done
+  [ -f "$2" ] || return 2               # the child never reached the loop: the arm proves nothing
+  sleep 0.3                              # …and it is now inside the 300 s wait
+  kill -TERM "$1" 2>/dev/null
+  i=0
+  while [ "$i" -lt 50 ]; do              # 5s ceiling
+    kill -0 "$1" 2>/dev/null || { alive=0; break; }
+    i=$(( i + 1 )); sleep 0.1
+  done
+  [ "$alive" = 0 ] && return 0
+  kill -9 "$1" 2>/dev/null
+  return 1
+}
+
+# ── ARM 1: a TERM stops the actuator promptly, exits 0, and releases the lock it OWNS ─────────────────
+# SEES: the process table, the exit status, the lock directory and the log. CANNOT SEE: that the trap ran
+# before the sleep ended *by itself* — the 5s ceiling against a 300s wait is what makes that inference
+# sound, and it is stated rather than implied.
+rm -f "$_ad/ready.own"
+WORK="$_ad" bash "$_ad/child.sh" "$_ad/lock1" "$_ad/log1" own & _ac=$!
+_ad_stop "$_ac" "$_ad/ready.own"; _astop=$?
+[ "$_astop" = 2 ] && bad "#3547/#4013 arm 1: the child never reached its loop, so nothing about a stop was proven"
+[ "$_astop" = 1 ] && bad "#3547/#4013: a TERM must STOP the actuator — it was still running 5s after the signal. Bash defers a trap behind a FOREGROUND command, so the pass loop must idle in 'sleep … & wait' (the shipped form held a TERM for the WHOLE interval, and that deferral is why launchd SIGKILLed a compliant daemon: status -9)"
+wait "$_ac" 2>/dev/null; _arc=$?
+[ "$_arc" = 0 ] || bad "#4013 criterion 1: a stop must exit 0 (got $_arc) — 'launchctl list' shows this status, and 0-not--9 is the criterion"
+[ -d "$_ad/lock1.d" ] && bad "#3547: the stop must RELEASE the lock this process owns (still there) — leaving it makes every later instance wait out LOCK_AGE_GRACE for nothing"
+grep -q 'STOPPED by SIGTERM' "$_ad/log1" || bad "#3547: the stop must NAME its signal in the log an operator reads; a daemon that exits 0 with no reason is the 'dead with a clean log' state this file's lock comments exist to rule out"
+grep -q 'MISSING-FN' "$_ad/log1" && bad "the child could not extract one of the shipped trap functions from $SUT — this arm would then be testing nothing"
+
+# ── ARM 2: a lock whose pid file names ANOTHER process is NOT released ────────────────────────────────
+# `acquire_lock` can hand over a lock it did not create (the stale reclaim), and after a restart the
+# directory at $LOCK.d belongs to the SUCCESSOR. Removing it here is how a stop deletes a live instance's
+# guard — the same double-rail, from the other end.
+sleep 300 & _aforeign=$!
+rm -f "$_ad/ready.foreign"
+WORK="$_ad" bash "$_ad/child.sh" "$_ad/lock2" "$_ad/log2" foreign "$_aforeign" & _ac2=$!
+_ad_stop "$_ac2" "$_ad/ready.foreign"
+wait "$_ac2" 2>/dev/null
+[ -d "$_ad/lock2.d" ] || bad "#3547: a lock whose pid file names a DIFFERENT process must NOT be removed on exit — that directory belongs to whoever holds it now, and an unconditional 'rm -rf' is exactly the defect"
+grep -q 'NOT releasing' "$_ad/log2" || bad "#3547: declining to release a foreign lock must be SAID, not done silently — an operator reading the log has to be able to tell 'released' from 'left alone'"
+
+# ── ARM 3: a lock dir with NO pid file is left alone (the successor's mkdir->pid window) ─────────────
+# ⛔ THE FAIL-CLOSED DIRECTION IS THE OPPOSITE OF STEALING: an absent pid file is indistinguishable from a
+# successor that has `mkdir`ed but not yet written its pid, so the arm asserts the lock SURVIVES. A stale
+# lock dir is reclaimed by `lock_holder_is_live` after LOCK_AGE_GRACE; a deleted live one is a double-rail.
+rm -f "$_ad/ready.nopid"
+WORK="$_ad" bash "$_ad/child.sh" "$_ad/lock3" "$_ad/log3" nopid & _ac3=$!
+_ad_stop "$_ac3" "$_ad/ready.nopid"
+wait "$_ac3" 2>/dev/null
+[ -d "$_ad/lock3.d" ] || bad "#3547: a lock dir with NO pid file must NOT be removed on exit — that state is the successor's mkdir->pid window, and deleting it is the lock-steal the three-answer reclaim was written to end"
+kill "$_aforeign" 2>/dev/null || true
+rm -rf "$_ad"
+
+# ── …and the SHIPPED lines themselves are pinned, because an arm cannot see a line it never reaches ───
+# ⛔ DECLARED AS TEXT, like the rest of this suite's loop pins: the arms above drive the functions, so they
+# cannot see the TRAP INSTALLATION being replaced by the defect (a child that re-extracts and installs its
+# own traps would still pass). These literals are what the script actually executes.
+grep -qE "^trap 'rm -rf" "$SUT" \
+  && bad "#3547: the defect line is back — that single trap releases the lock and then RESUMES the script, so a stopped actuator keeps launching rails unguarded and deletes its successor's lock"
+grep -qF "trap 'release_lock' EXIT" "$SUT" || bad "#3547: the EXIT arm must go through the OWNERSHIP-CHECKED release ('release_lock'), not a bare 'rm -rf'"
+grep -qF "trap 'stop_on_signal TERM' TERM" "$SUT" || bad "#3547: the TERM arm must EXIT (via 'stop_on_signal'), not merely release the lock — a trap that returns is the defect"
+grep -qE '^[[:space:]]*sleep[[:space:]]+"\$INTERVAL"' "$SUT" \
+  && bad "#4013: the pass loop must idle in 'interruptible_sleep \"\$INTERVAL\"' — a foreground sleep defers TERM for the whole interval, which is the deferral that made launchd SIGKILL this daemon (status -9)"
+grep -qF 'interruptible_sleep "$INTERVAL"' "$SUT" || bad "#4013: the pass loop must idle in the interruptible wait"
+# …and the traps are installed AFTER the lock is acquired: the losing instance exits 0 at that line and
+# must never install an EXIT arm, or a loser's exit could release the winner's lock.
+_alk=$(grep -n '^acquire_lock || exit 0$' "$SUT" | cut -d: -f1)
+_atr=$(grep -n '^install_stop_traps$' "$SUT" | cut -d: -f1)
+if [ -z "$_alk" ] || [ -z "$_atr" ]; then
+  bad "#3547: could not locate 'acquire_lock || exit 0' and the 'install_stop_traps' call in $SUT — the ordering arm cannot run"
+elif [ "$_atr" -le "$_alk" ]; then
+  bad "#3547: the traps must be installed AFTER the lock is acquired (acquire_lock at line $_alk, install_stop_traps at $_atr) — installed first, the LOSING instance would carry an EXIT arm that can release the winner's lock"
+fi
+
+[ "$fail" = 0 ] && echo "PASS: per-repo accounting launches a starved repo's candidate, identifies repos by owner/name, still bounds one repo, counts unknown load against everyone, verifies its launches, and a stop is a stop (#3547/#4013)"
 exit "$fail"
