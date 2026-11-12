@@ -109,15 +109,34 @@
 #      record's) — that is the shape that silently ate a fix. With only a stamp there is no manifest,
 #      so the aggregate `payloadSha256` fold is compared instead and the report SAYS it cannot name
 #      the file.
-#   4. BYTES (question (b)). Every `*.sh` the repo ships at the ref (depth 1 of the harness dir — what
-#      README §4 and `cp <harness>/*.sh $O/` put there) must be present in $O with the SAME git blob
-#      sha1, and $O must carry no `*.sh` the repo does not ship. This is check-port-drift.sh's
-#      primitive — blob shas read from the ref's tree — applied to the DEPLOYED copy, and it is what
-#      separates "behind" from "edited". A file already named by half 3 is not repeated here (one
-#      defect, one line).
+#   4. BYTES (question (b)). Every file the repo ships at the ref — depth 1 of the harness dir, in
+#      EVERY extension the harness is written in (`*.sh` OR `*.py` OR `*.mjs`, HARNESS_EXTS below) —
+#      must be present in $O with the SAME git blob sha1, and $O must carry no such file the repo
+#      does not ship. This is check-port-drift.sh's primitive — blob shas read from the ref's tree —
+#      applied to the DEPLOYED copy, and it is what separates "behind" from "edited". A file
+#      already named by half 3 is not repeated here (one defect, one line).
+#
+# ⛔ THE SET OF EXTENSIONS IS A DECLARED CONSTANT, NOT A GLOB WRITTEN OUT AT EACH SITE (agent-infra
+# #4015 / #3016). Half 4 compared `*.sh` ONLY, so the python drivers behind all three fleet outages
+# were never compared: a stale `$O/gh-limit.py`, `$O/gh-cred.py` or `$O/objective.py` read clean while
+# the box ran code main does not carry — the same false green, one extension over, and `install.sh`
+# itself calls `gh-limit.py` out as the file whose absence silently unserialised every harness `gh`
+# call (#2041). A glob repeated at 5 sites is how that happened, so every site reads HARNESS_EXTS.
+# ⛔ THE AGGREGATE PAYLOAD FOLD (`o_payload_hash`, below) DELIBERATELY STAYS `*.sh`-ONLY: it is a
+# digest CONTRACT with two writers (`install.sh`'s `prov_payload_hash`, `cloud-cell-supervisor.sh`'s
+# `o_payload_hash`), and widening it here alone would make every existing stamp disagree with its own
+# live fold — a false DRIFT on every legacy box. `.py`/`.mjs` coverage comes from the per-file
+# manifest (half 3, the preferred record) and from this byte comparison (half 4), both of which name
+# the file instead of an opaque digest.
+# ⛔ DEPTH 1 ONLY, deliberately: the `gh-rest/gh` and `gh-limit/gh` shims sit one level down. They ARE
+# covered by half 3 whenever the box carries a provenance record (its manifest is written from a
+# recursive source walk), and widening this byte arm to a recursive listing would change the "$O and
+# the checkout are the same tree" contract that README §4's `cp <harness>/* $O/` shape defines.
 #
 #   4a. MODE (the other half of question (b) — agent-infra#4003's post-deploy case). Every depth-1
-#      `*.sh` the ref carries as `100755` must be EXECUTABLE in $O. A mode is not a byte and a blob
+#      file the ref carries as `100755` — in EVERY extension of HARNESS_EXTS, because `gh-rest/gh`
+#      execs `../gh-limit.py` and a lost exec bit there is the same failure one mode over — must be
+#      EXECUTABLE in $O. A mode is not a byte and a blob
 #      cannot carry one: `git hash-object` hashes CONTENT, so a 0644 copy of a 0755 script hashes
 #      identically and this whole half graded GREEN over a script the box cannot exec (measured on this
 #      fleet: `nonblocking-dispatch.sh`, 36,175 B, `-rw-r--r--`, dispatch path dead while every
@@ -454,7 +473,35 @@ else
 fi
 fi
 
-# ── shared: the digest tools, the temp area, and every `*.sh` the repo ships at the ref ──────────
+# ── THE DECLARED SHIPPED SURFACE (agent-infra#4015 / #3016) ────────────────────────────────────
+# The ONE place that decides which file kinds are "the harness". Every site that used to spell out a
+# `*.sh` glob reads this instead, so a new extension is added once and is covered by the byte arm, the
+# "present in $O but not shipped" arm, and the `--surface` candidate arm — in BOTH directions, which
+# is what makes it a comparison rather than a one-way copy check. (Canonical drift detection compares
+# the WHOLE declared artifact set and classifies modified / missing / unshipped; comparing one file
+# suffix measures the suffix, not the deployment. Cross-checked externally: Microsoft APM's
+# drift-detection doc, Pulumi's stack-drift doc, the Git-Ape drift page — all four classify a full
+# file-set difference, not a script-suffix difference.)
+# ⛔ `mjs` is in the set with no member in this directory TODAY: the pipeline's other wrappers
+# (`scripts/check-*.mjs`) are `.mjs`, and a harness wrapper added later must not need this line
+# changed before it can be compared. A declared set that only names today's files is the #4015 defect.
+HARNESS_EXTS="sh py mjs"
+HARNESS_EXT_RE='sh|py|mjs'
+# The same set as an operator-facing LIST (`*.sh, *.py, *.mjs`), for the two messages that have to say
+# what was looked for. Derived from HARNESS_EXTS so the line an operator reads cannot drift from the
+# set the comparison actually used — a message naming fewer extensions than the check covers is the
+# #4015 defect in prose form.
+HARNESS_EXTS_GLOB="*.${HARNESS_EXTS// /*.}"
+# Every shipped harness file at depth 1 of <dir>, as bare basenames. Empty when the dir carries none
+# of the extensions — the CALLER decides whether emptiness is an answer or a cannot-verify, because
+# those are opposite reports (see the surface arm's "a RUNNING dir is never dropped" guard).
+# ⛔ THIS IS A BOUNDED `ls`, NOT A WALK: a recursive listing here would descend into a deployment's
+# own subdirectories and change what the depth-1 contract compares.
+ship_list_dir() { # ship_list_dir <dir>
+  ( cd "$1" 2>/dev/null || exit 0; ls -1 2>/dev/null ) | grep -E "^[^/]+\.(${HARNESS_EXT_RE})$"
+}
+
+# ── shared: the digest tools, the temp area, and every shipped file the repo carries at the ref ──
 PROV_SHA="sha256sum"
 command -v sha256sum >/dev/null 2>&1 || PROV_SHA="shasum -a 256"
 # sha256 over the `*.sh` in $O, folded exactly as install.sh's prov_payload_hash and the cell's
@@ -462,6 +509,13 @@ command -v sha256sum >/dev/null 2>&1 || PROV_SHA="shasum -a 256"
 # must not hash a PARTIAL file set and read as a post-install hand edit. An EMPTY $O is a different
 # case — it hashes to the empty-input digest and then fails the blob comparison as MISSING files,
 # which is the truthful DRIFT verdict (we CAN verify: the repo ships scripts, $O has none).
+# ⛔ `*.sh` ONLY **BY CONTRACT**, AND THAT IS NOT AN OVERSIGHT (#4015). Two other writers fold this
+# exact set — install.sh's `prov_payload_hash` and cloud-cell-supervisor.sh's `o_payload_hash` — and
+# the fold is a DIGEST, so a wider set here would disagree with every record those writers already
+# wrote and turn each legacy stamp into a false `post-install hand edit`. Widening it is a THREE-SITE
+# change with a format version on the record, not a one-line change here. Until then `.py`/`.mjs`
+# are covered by the manifest (half 3) and by the byte comparison (half 4) — which NAME the file,
+# where this digest cannot. `HARNESS_EXTS` governs the comparison; this fold keeps its contract.
 o_payload_hash() {
   [ -d "$O" ] || return 1
   local out rc
@@ -510,8 +564,12 @@ UNREC_N=0
 # Files that are byte-identical (or not) but NOT EXECUTABLE where the ref ships them 100755, kept so the
 # one-line token can NAME one — a token that says only "a mode differs" is a count, and counts are not
 # actionable at 3 a.m.
+# ⛔ AND THIS ARM IS DRIVEN BY THE SAME DECLARED SET AS THE BYTE ARM (#4015): a `100755` `.py` driver the
+# deployed copy cannot exec is the same failure class as an unrunnable `.sh` — `gh-rest/gh` execs
+# `../gh-limit.py`, so a lost exec bit there is the unserialised-`gh` incident (#2041) one mode over.
+# The arm is ONE-WAY (a 100644 source is never reported), so shipping a `.py` at 100644 costs nothing.
 : > "$TMPD/mode-names"
-git -C "$REPO" ls-tree -r --name-only "$TIP" -- "$REL" 2>/dev/null | grep -E "^${REL}/[^/]+\.sh\$" > "$TMPD/repo-sh" || unknown "cannot read the harness tree at $TIP"
+git -C "$REPO" ls-tree -r --name-only "$TIP" -- "$REL" 2>/dev/null | grep -E "^${REL}/[^/]+\.(${HARNESS_EXT_RE})$" > "$TMPD/repo-ship" || unknown "cannot read the harness tree at $TIP"
 
 # ── 3. QUESTION (a) — does $O still hold the bytes its OWN RECORD says were deployed? ────────────
 # THE SHAPE THAT SILENTLY ATE A FIX (2026-10-28): a hand patch to `$O/merge-one.sh` was overwritten by
@@ -625,7 +683,14 @@ fi
 # knows which side changed), and repeating it as a byte difference inflates the count a reader uses to
 # judge whether the box is one bad file or many.
 if [ "$O_ABSENT" -eq 0 ]; then
-( cd "$O" && ls -1 *.sh 2>/dev/null || true ) > "$TMPD/deployed-sh" || unknown "cannot list the deployed copy at $O"
+# ⛔ AN UNREADABLE $O IS CANNOT-VERIFY (exit 2), NOT "nothing to report": the two arms below read
+# this list, and an unreadable directory would make BOTH of them run zero iterations and the run
+# would print OK. An EMPTY list is a different answer — $O is readable and carries no shipped file,
+# which the second arm reports truthfully as a MISSING file for every one the repo ships.
+if [ ! -r "$O" ]; then
+  unknown "cannot list the deployed copy at $O (unreadable directory) — cannot verify"
+fi
+ship_list_dir "$O" > "$TMPD/deployed-ship" 2>/dev/null || : # grep's 1 (no match) is not a failure here
 
 while IFS= read -r f; do
   [ -n "$f" ] || continue
@@ -680,18 +745,18 @@ while IFS= read -r f; do
     else SIDE="the two sides share a timestamp (this filesystem cannot order them)"; fi
     drift_q checkout "$d — the deployed copy DIFFERS from the repo at $REF ($want); $SIDE"
   fi
-done < "$TMPD/repo-sh"
+done < "$TMPD/repo-ship"
 
 while IFS= read -r d; do
   [ -n "$d" ] || continue
   if grep -qxF -- "$d" "$TMPD/edit-names" 2>/dev/null; then continue; fi
   if grep -qxF -- "$d" "$TMPD/missing-names" 2>/dev/null; then continue; fi
   if grep -qxF -- "$d" "$TMPD/unrec-names" 2>/dev/null; then continue; fi
-  if ! grep -qxF "$REL/$d" "$TMPD/repo-sh"; then
+  if ! grep -qxF "$REL/$d" "$TMPD/repo-ship"; then
     Q_BYTES=1
     drift_q checkout "$d — present in $O but NOT shipped by the repo at $REF (a hand-placed or retired script)"
   fi
-done < "$TMPD/deployed-sh"
+done < "$TMPD/deployed-ship"
 fi
 
 # ── 4. SURFACE (--surface): every harness dir this BOX carries, not just $O (#2231) ──────────────
@@ -1213,7 +1278,10 @@ if [ "$SURFACE" -eq 1 ]; then
       brk "candidate harness dir $_r exists but cannot be LISTED (unreadable directory) — cannot verify it, and a dir this box carries is never 'nothing to report'"
       continue
     fi
-    ls "$_r"/*.sh >/dev/null 2>&1 || { [ -f "$_r/orch-loop.sh" ] || {
+    # ⛔ THE DECLARED EXTENSION SET, NOT A `*.sh` GLOB (#4015/#3016): a candidate carrying only
+    # `*.py`/`*.mjs` was dropped here as "not a harness dir" even when a live controller executed it.
+    ship_list_dir "$_r" > "$TMPD/ship-here" 2>/dev/null || :
+    [ -s "$TMPD/ship-here" ] || { [ -f "$_r/orch-loop.sh" ] || {
       # ⛔ A RUNNING DIR IS NEVER DROPPED BY THE GENERIC "is this a harness dir?" FILTER (#10114, review
       # finding 1). The measured sibling of the vanished-dir case: the process still executes
       # `<dir>/orch-loop.sh` while the directory remains and its scripts are GONE (a deleted script is
@@ -1223,7 +1291,7 @@ if [ "$SURFACE" -eq 1 ]; then
       if grep -qxF "$_r" "$TMPD/running-real" 2>/dev/null; then
         EXEC_N=$((EXEC_N + 1))
         [ -n "$EXEC_FIRST" ] || EXEC_FIRST="$_r"
-        drift_q exec "the controller executes $_r, and it carries NO readable *.sh at all — the script the live process was started from is GONE. Nothing in the tree that is executing can be compared with $REF"
+        drift_q exec "the controller executes $_r, and it carries NO readable shipped file ($HARNESS_EXTS_GLOB) at all — the script the live process was started from is GONE. Nothing in the tree that is executing can be compared with $REF"
       fi
       continue; }; }
     grep -qxF "$_r" "$TMPD/cand" 2>/dev/null || printf '%s\n' "$_r" >> "$TMPD/cand"
@@ -1269,13 +1337,17 @@ if [ "$SURFACE" -eq 1 ]; then
     _who=""; _rtag=""
     grep -qxF "$_dir" "$TMPD/running" 2>/dev/null && { _who="the RUNNING controller executes this dir: "; _rtag="  (RUNNING)"; }
     note "surface: $_dir$_rtag"
-    if ! ls "$_dir"/*.sh >/dev/null 2>&1; then
-      brk "${_who}$_dir — a component directory with no readable *.sh (permission denied?) — cannot verify it"
+    # ⛔ THE LISTABILITY OF $_dir WAS ALREADY SETTLED ABOVE, so an EMPTY list here means exactly one
+    # thing — the directory carries none of the shipped extensions — and that is cannot-verify.
+    ship_list_dir "$_dir" > "$TMPD/ship-dir" 2>/dev/null || : # grep's 1 (no match) is that empty case
+    if [ ! -s "$TMPD/ship-dir" ]; then
+      brk "${_who}$_dir — a component directory with no readable shipped file ($HARNESS_EXTS_GLOB) — cannot verify it"
       continue
     fi
-    for _p in "$_dir"/*.sh; do
+    while IFS= read -r _b; do
+      [ -n "$_b" ] || continue
+      _p="$_dir/$_b"
       [ -e "$_p" ] || continue
-      _b="$(basename "$_p")"
       _have="$(git hash-object -- "$_p" 2>/dev/null || true)"
       if [ -z "$_have" ]; then
         brk "${_who}$_b — UNREADABLE in $_dir (cannot hash it) — cannot verify, so this is a failure, not an absence"
@@ -1287,14 +1359,14 @@ if [ "$SURFACE" -eq 1 ]; then
       elif [ "$_have" != "$_want" ]; then
         drift "${_who}$_b — DIFFERS in $_dir from $REF ($_want) — this box carries bytes main does not"
       fi
-    done
+    done < "$TMPD/ship-dir"
     # The other direction: a harness script main ships that this component dir does NOT carry. A
     # running controller on a partial tree calls a helper that is missing at the moment it needs it.
     while IFS= read -r _f; do
       [ -n "$_f" ] || continue
       _b="${_f#"$REL"/}"
       [ -f "$_dir/$_b" ] || drift "${_who}$_b — shipped at $REF but MISSING from $_dir"
-    done < "$TMPD/repo-sh"
+    done < "$TMPD/repo-ship"
   done < "$TMPD/cand"
 fi
 
@@ -1447,7 +1519,7 @@ if [ "$problems" -gt 0 ]; then
   fi
   if [ "$EXEC_N" -gt 0 ]; then
     # ⛔ SHAPE-NEUTRAL (review of #3202): this arm fires for BOTH executing shapes — the directory is GONE
-    # (`absent`), and the directory still EXISTS carrying no readable `*.sh` (`dir` whose scripts the live
+    # (`absent`), and the directory still EXISTS carrying no readable shipped file (`dir` whose scripts the live
     # interpreter holds open after deletion). Saying "NOT THERE" for both made the summary state a falsehood
     # about the box for the second, and the `executes:` row is the doc a lane reads to decide whether the
     # token applies. The DRIFT line above names which of the two it is.

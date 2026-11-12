@@ -170,8 +170,9 @@ mode_of() {
 
 # ⛔ THE LEDGER IS THE EVIDENCE, and it is written from THIS run's observations only. It is written
 # to a temp file in the target directory and renamed, so a concurrent reader sees a whole ledger or
-# none — never a half-written one. `check-deployed-drift.sh` hashes only `*.sh`, so this file is
-# invisible to it by construction and cannot perturb the drift answer.
+# none — never a half-written one. `check-deployed-drift.sh` compares `*.sh`, `*.py` and `*.mjs` but
+# its aggregate payload fold hashes only `*.sh`, so a `.json`/`.txt` ledger is invisible to it either
+# way by construction and cannot perturb the drift answer.
 # Returns non-zero when the ledger could NOT be installed, so the success path can say so instead of
 # pointing an operator at evidence that does not exist. `fatal` (stderr, never `say`) so `--quiet`
 # cannot suppress the one line that matters.
