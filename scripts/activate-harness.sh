@@ -504,7 +504,20 @@ print("%s\t%s\t%d\t%s" % (dec, why.replace("\t", " "), int(ep), cap))' "$rec" 2>
     case "$ep" in ''|*[!0-9]*) ep=0 ;; esac
     now="$(date +%s)"; age=$(( now - ep )); [ "$age" -lt 0 ] && age=0
     [ -n "$reason" ] || reason="(the record names no reason)"
-    remedy="Re-render the unit (bash scripts/install-repair-service.sh --install) and read --status, which names the rendered directives it disagrees with"
+    # ⛔ THE REMEDY NAMES ONLY WHAT THE INSTRUMENTS ACTUALLY PRINT (review round 1, P2). An earlier
+    # version said `--status` "names the rendered directives it disagrees with", which is FALSE and was
+    # the one unverifiable promise in an otherwise measured row: `install-repair-service.sh::readback()`
+    # reads `is-active`, `is-enabled`, `KillMode` and `ExecStart` and NEVER the installed unit's
+    # `Environment=` — so on the very box this row exists for (a pre-#3453 render with
+    # `HOME=/tmp/cell-home`, `ENV_FILE=/tmp/cell-home/keys.env`, `O=/tmp/cell-home/orchestrator`,
+    # `PR_DOCTOR_REPO_DIR=/tmp/cell-t3`) all four things it checks AGREE and `--status` names no
+    # disagreement at all. Worse, the `--status` it delegates to shells `pr-repair-loop.sh --status`
+    # with the OPERATOR's `O` (`O="${O:-$CELL_HOME/orchestrator}"`), not the unit's `Environment=O=`,
+    # so it can print "no pass has been recorded yet" beneath a row that just quoted a refusing record.
+    # So the remedy points at the RECORD PATH this row actually read — an operator can `cat` it — plus
+    # the one verb that fixes the measured class. Naming a diagnostic that does not exist is how a
+    # correct FAILING row gets waved away as spurious.
+    remedy="The pass record this row read is $rec — re-render the unit with 'bash scripts/install-repair-service.sh --install' (it rewrites every rendered directive from THIS box's state) and confirm with '--status', which reads is-active/is-enabled/KillMode/ExecStart"
     case "$decision" in
         dispatched|ok)
             if [ "$age" -gt "$bound" ]; then
@@ -525,6 +538,12 @@ print("%s\t%s\t%d\t%s" % (dec, why.replace("\t", " "), int(ep), cap))' "$rec" 2>
         idle)
             emit "$unit" "$class" LATE "$unit is ACTIVE but its last pass was a DRY RUN — reason=$reason: nothing is dispatched while the unit is armed this way$assumed" ;;
         skipped)
+            # ⛔ DEFENSIVE, AND SAID SO RATHER THAN LEFT TO BE REDISCOVERED. The shipped producer writes
+            # `skipped` to a SEPARATE file (`pr-repair.skip.json`, written by `write_skip_row` by a
+            # process that does NOT hold the pass lock), so this arm is unreachable from the shipped
+            # code — but `pr-repair-loop.sh`'s own decision comment lists `skipped(own file)` as a value
+            # of THIS record, so a future producer that writes it here must not fall through to
+            # UNKNOWN-and-therefore-unreadable.
             emit "$unit" "$class" LATE "$unit is ACTIVE but its last pass skipped itself — reason=$reason$assumed" ;;
         *)
             emit "$unit" "$class" UNKNOWN "$unit is active and its last pass reported an UNRECOGNISED decision '$decision' — cannot verify, which is never a pass$assumed" ;;

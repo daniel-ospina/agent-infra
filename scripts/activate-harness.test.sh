@@ -899,6 +899,15 @@ assert_eq "$(row_field "$OUT" eldato-pr-repair.service 3)" FAILING "T34 graded F
 RUN --check
 assert_contains "$OUT" 'env-file-unreadable:/tmp/cell-home/keys.env' "T34 and it names the loop's OWN reason"
 assert_contains "$OUT" 'install-repair-service.sh --install' "T34 with a remedy an operator can paste"
+assert_contains "$OUT" 'pass record this row read is' "T34 the remedy names the artifact the row ACTUALLY read"
+# ⛔ AND IT MUST NOT PROMISE A DIAGNOSTIC THAT DOES NOT EXIST (review round 1, P2).
+# `install-repair-service.sh::readback()` reads `is-active`/`is-enabled`/`KillMode`/`ExecStart` and
+# never the installed unit's `Environment=`, so on the very box this row exists for (a pre-#3453
+# render with HOME/ENV_FILE/O/PR_DOCTOR_REPO_DIR pointing at `/tmp/cell-home`) ALL FOUR it checks
+# agree and `--status` names no disagreement. The old sentence promised the opposite, and an operator
+# who follows a promise that cannot be kept concludes a correct `FAILING` row is spurious — the same
+# false reassurance this PR removes from the grid, relocated into its own remedy. ABSENCE is the pin.
+assert_absent "$OUT" 'names the rendered directives it disagrees with' "T34 the remedy makes no claim --status cannot keep"
 assert_contains "$OUT" 'NOT ARMED: eldato-pr-repair.service' "T34 and the summary names the row"
 
 # (b) enabled + active + NEVER PASSED: running proves the loop was started, not that a pass ran.
