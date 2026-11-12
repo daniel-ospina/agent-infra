@@ -1670,7 +1670,7 @@ _tiproot() { # <token> -> the token re-rooted on the attested head, or ""
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -3616,9 +3616,21 @@ $m"
             if [ -n "$_omdsha" ]; then _omw="$_omdec"; _omwsha="$_omdsha"; fi
           fi
         fi
+        # ⛔ A WRITTEN LEFT END IS NOT AN EXCUSE TO STOP MEASURING (thirtieth review cycle, round 7 —
+        # MEASURED, a FAIL-OPEN this round's own fallback widened). This arm skips a claim whose left end
+        # is a revision, because that claim belongs to the two-endpoint arm — but that arm needs the
+        # operand to ABUT the dots, and once the left end carries the sentence's decoration (`` `HEAD` ``,
+        # `HEAD,`, `HEAD.`) NO arm matches it: the two-endpoint arm cannot, this arm skipped, and the
+        # omitted-RIGHT arm needs the dots to FOLLOW the operand. So `` `HEAD` .. HEAD `` — `HEAD..HEAD`,
+        # nought commits — minted a signed `clean` while the SAME claim undecorated was refused, and the
+        # decorated spellings were refused at the parent before this round's fallback made them resolve.
+        # The skip therefore REMEMBERS the resolved left end instead of leaving the claim unmeasured, and
+        # the emptiness test below runs on both populations: `L..R` is empty when R is an ANCESTOR of L
+        # (or is L), which is the same `merge-base --is-ancestor` every sibling arm uses.
+        _omleft=''
         if [ -n "$_omwsha" ]; then
-          _opends="${_opends#*"${BASH_REMATCH[0]}"}"
-          continue
+          _omleft="$_omwsha"
+          _omleftstated="$_omw"
         fi
       fi
       _opends="${_opends#*"${BASH_REMATCH[0]}"}"
@@ -3650,6 +3662,17 @@ $m"
         esac
       fi
       [ -n "$_osha" ] || continue
+      # ⛔ THE WRITTEN-LEFT-END CLAIM IS MEASURED HERE (round 7 — MEASURED): `L..R` names nought commits
+      # when R is an ancestor of L or is L itself, so a claim that WRITES the head on the left and the head
+      # (or one of its ancestors) on the right is the narrowest claim there is and cannot be the evidence
+      # for a range with commits. Then the arm skips, exactly as before: a non-empty `L..R` is the
+      # two-endpoint arm's population, not this one.
+      if [ -n "$_omleft" ]; then
+        if [ "$_osha" = "$_omleft" ] || delta_git "$root" merge-base --is-ancestor "$_osha" "$_omleft" 2>/dev/null; then
+          _emptyrange=1; _emptystated="${_omleftstated}..${_orhs} (both endpoints are written and '${_orhs}' is an ancestor of '${_omleftstated}', so the claim is EMPTY)"; break
+        fi
+        continue
+      fi
       # ⛔ `..X` IS `HEAD..X`, SO THE CLAIM IS EMPTY WHENEVER X IS THE HEAD **OR AN ANCESTOR OF IT**
       # (thirtieth review cycle, round 2 — MEASURED, a fail-open this arm's equality test left open):
       # `..<base>` and `..<head>~1` name ZERO commits — `HEAD..X` counts the commits reachable from X but
