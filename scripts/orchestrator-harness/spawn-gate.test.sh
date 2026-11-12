@@ -3955,6 +3955,27 @@ while IFS= read -r _row; do
   _armwhy=""
   [ "$rc" -eq 0 ] || _armwhy=" | fixer said: $(tail -2 "$_armdir/arm-$_ac.out" 2>/dev/null | tr '\n' ' ' | cut -c1-240)"
   ck "fix-one.sh NAMES '$_aw' when the gate returns $_ac ($_av) and REPUBLISHES that code (read: '${_armgot:-<no refusal line>}', rc=$_arc)$_armwhy" $rc
+  # ⛔ AND ON THE STALE-CODE ROW, THE REMEDY MUST MATCH THE ARTIFACT THIS PATH MEASURED (#3932's review,
+  # P2-4). `run_agent` is given `WIP_PATH="$WT"` above, so the probe measured the FIXER'S WORKTREE — a
+  # worktree on the PR BRANCH. The base-path sentence ("git fetch, then cut the worktree from origin/main")
+  # is DESTRUCTIVE there: it discards the very PR the fixer was dispatched to repair, for the state (a PR
+  # branch far behind main) that gets a fixer dispatched in the first place. So this row asserts the SHAPE
+  # of the advice, not just its presence: the fixer is told to MERGE origin/main into the branch, and the
+  # re-cut instruction is absent. Both needles are absent from every other arm's text, so the pair cannot
+  # be satisfied by a different gate's wording.
+  if [ "$_ac" = "AGENT_STALE_CODE_REFUSED" ]; then
+    _stale_txt="$(cat "$RO/logs/fix-7.log" 2>/dev/null)"
+    case "$_stale_txt" in
+      *"merge origin/main"*) rc=0 ;;
+      *) rc=1 ;;
+    esac
+    ck "fix-one.sh's STALE-CODE remedy tells the FIXER to integrate origin/main into the PR BRANCH — the artifact this path actually measured (read: '$(printf '%s' "$_stale_txt" | grep -o 'bring the branch up to date[^;]*' | head -1)')" $rc
+    case "$_stale_txt" in
+      *"cut the worktree from origin/main"*) rc=1 ;;
+      *) rc=0 ;;
+    esac
+    ck "…and it does NOT tell the operator to RE-CUT that worktree from origin/main, which on a fixer discards the PR's own commits (#3932 review P2-4)" $rc
+  fi
   _armseen="$_armseen ${_ac}=driven"
 done <<< "$_fixer_arms"
 # The assertion `_armseen` exists for. One token per row, so `wc -w` counts rows; a row that falls
@@ -3968,6 +3989,30 @@ _armacct="$(printf '%s' "$_armseen" | wc -w | tr -d ' ')"
 case " $_armseen " in *"=driven "*) _armdriven=1 ;; *) _armdriven=0 ;; esac
 { [ "$_armacct" -eq "$_armrows" ] && [ "$_armdriven" -eq 1 ]; }; rc=$?
 ck "every arm-table row is ACCOUNTED FOR after the drive — driven or explicitly forward-declared, and at least ONE driven (rows: $_armrows, accounted: $_armacct —$_armseen)" $rc
+
+# ⛔ AND EVERY CODE THE FIXER CLASSIFIES MUST HAVE AN ARM IN `adopt-fix.sh`, WHICH IS A SEPARATE READER
+# (#3932's review, P2). `fix-one.sh` PROPAGATES the gate's own status, and `adopt-fix.sh` is the log a
+# MANUAL operator reads (#1720): an unclassified code reaches that log as NO LINE — a run that did nothing,
+# silently — which is the defect `adopt-fix.sh`'s own 71 arm records, and the one 85 landed in when it was
+# added (measured: adopt-fix had arms for 81/73/75/71/72/77 and none for 83, 85 or 80). The census is
+# DERIVED from this file's own arm table, so a future gate cannot be added to the classifier and left
+# unclassified here without a red — which is the property, not the three arms it currently buys.
+_af_logok=1; _af_missing=""
+while IFS= read -r _row; do
+  [ -n "$_row" ] || continue
+  _ac="${_row%%:*}"
+  _av="$(codes_for_name "$_ac")"
+  [ -n "$_av" ] || continue          # forward-declared: the gate is not on this tree yet
+  # Either form is a real arm: the tolerant constant (`${AGENT_X:-NN}`) or the bare literal the older
+  # arms use (`[ "$rc" = "77" ]`). The literal form is NOT rewritten here on purpose — the disk census
+  # in `disk-admission.test.sh` slices that arm by its literal — so this guard accepts both rather than
+  # forcing a cosmetic edit through a live test.
+  if ! grep -qE "(${_ac}|= \"${_av}\")" "$HERE/adopt-fix.sh"; then
+    _af_logok=0; _af_missing="$_af_missing ${_ac}=${_av}"
+  fi
+done <<< "$_fixer_arms"
+{ [ "$_af_logok" -eq 1 ]; }; rc=$?
+ck "every code the FIXER classifies has an arm in adopt-fix.sh, the log a manual operator reads — an unclassified code writes NO LINE there (missing:${_af_missing:- none})" $rc
 
 # ── 11) the DISK gate (#1765) ─────────────────────────────────────────────
 # The measured incident: pi-lane-1 hit 100% twice — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`,
