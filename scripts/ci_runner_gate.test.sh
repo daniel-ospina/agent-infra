@@ -537,15 +537,25 @@ if [ -z "$QUEUE_HEAD_SCAN_SHIPPED" ]; then
   exit 3
 fi
 
+# ⛔ THE CANDIDATE PAGE SIZE IS DERIVED FOR THE SAME REASON, and it is what the page-ceiling note is
+# ABOUT (#3995 review cycle 3): the scan can never see past ONE page of `QUEUE_PAGE` rows, so an arm
+# that pins that note must build a FULL page — and must not hardcode 100 in a way that drifts from the
+# gate. Fatal when unreadable, like the bound above.
+QUEUE_PAGE_SHIPPED="$(sed -n 's/^QUEUE_PAGE=\([0-9][0-9]*\).*/\1/p' "$GATE" | head -1)"
+if [ -z "$QUEUE_PAGE_SHIPPED" ]; then
+  echo "❌ FATAL: cannot read QUEUE_PAGE out of $GATE — the page-ceiling arm refuses to guess it" >&2
+  exit 3
+fi
+
 # ghost_window_fixture <n> — a queue page whose head holds EXACTLY <n> ghost rows and a real demand
 # row behind them. `ids` and `rows` are returned `|`-separated so the caller can hand them to
 # `GH_DEMAND_GHOST_IDS` and `GH_QUEUE_ROWS_SPEC` without a second read. The two arms below pin what a
 # scan stopped by the BOUND does, so they must be fed the SHIPPED bound rather than a hardcoded 5:
 # with the shipped bound at 25 a five-ghost page no longer exhausts the window, and those arms no
 # longer refuse at all — the scan reaches the demand row behind the five ghosts (measured: both exit 0
-# and write a verdict). They RED in that state rather than passing quietly (measured against a 5-ghost
-# page: 7 assertions), and the shipped value itself is ALSO pinned literally at the `#3995` arm
-# (agent-infra#3995).
+# and write a verdict). They RED in that state rather than passing quietly (measured: the RC assertion
+# and both message assertions on each arm), and the shipped value itself is ALSO pinned literally at
+# the `#3995` arm (agent-infra#3995).
 ghost_window_fixture() {
   local n="$1" ids="" rows="" i id
   for i in $(seq 1 "$n"); do
@@ -1210,13 +1220,35 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "a truncated page advanced no st
 # bound AT the page size can never read past the page, so the TRUNCATED refusal must say so. Without
 # this arm the `-ge` in that conditional could be flipped to `-le` and the whole suite stayed green
 # (measured, agent-infra#3995 review cycle 2, finding 4).
-echo "── #3995: a scan bound at the page ceiling NAMES the ceiling the knob cannot pass ──"
-run_gate ghost-truncated-ceiling GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
-  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000" CI_GATE_QUEUE_HEAD_SCAN_MAX=100 --
-assert_eq "$RC" "2" "a truncated page with the bound at the ceiling → exit 2"
-assert_contains "$OUT" "TRUNCATED" "it is still reported as truncation"
+echo "── #3995: a scan bound AT the page ceiling NAMES the ceiling the knob cannot pass ──"
+# A FULL page of ghosts (the production shape): the generator's ids end at 4000+n, so the demand row
+# sits past them at 4200 — a hardcoded 4100 would collide at n=100. The bound equals the page size, so
+# the scan breaks on the BOUND before it reaches the demand row: the window refusal, with the ceiling.
+GW_FULL="$(ghost_window_fixture "$QUEUE_PAGE_SHIPPED")"
+run_gate ghost-window-at-page GH_QUEUED="$((QUEUE_PAGE_SHIPPED + 5))" GH_INPROGRESS=0 \
+  GH_DEMAND_GHOST_IDS="${GW_FULL%%|*}" \
+  GH_QUEUE_ROWS_SPEC="${GW_FULL#*|}4200:2592000" CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_PAGE_SHIPPED" --
+assert_eq "$RC" "2" "a window that runs out at the page ceiling → exit 2"
+assert_contains "$OUT" "beyond the ${QUEUE_PAGE_SHIPPED}-run scan window" "the window refusal names its bound"
 assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound cannot pass"
 assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "…and the knob, so the operator sees both facts on one line"
+# …and the OTHER surface where the page is the ceiling is the saturated read: a queue deeper than the
+# page while the length leg did not decide. The note belongs there too (it is the same fact), and it
+# must be gated on the bound actually being at the ceiling — the shipped 25 is not.
+echo "── #3995: a SATURATED read names the page ceiling only when the bound is at it ──"
+run_gate page-saturated-at-page GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 \
+  CI_GATE_QUEUE_THRESHOLD=200 CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_PAGE_SHIPPED" --
+assert_contains "$OUT" "ONE page of" "a saturated read at the ceiling names the ceiling"
+# ⛔ …AND THE NOTE IS ABOUT A FULL PAGE, NOT ABOUT THE BOUND (agent-infra#3995 review cycle 3, finding
+# 1). Keyed on the bound alone it fired on a DEGRADED body (a synthesised single candidate) and on any
+# short page, blaming the page cap for a list no bound could have widened — advice that cannot help.
+# Measured: bound 100 over a TWO-row page used to print it; it must not.
+echo "── #3995: a SHORT page is not blamed on the page ceiling, even at the ceiling ──"
+run_gate ghost-truncated-shortpage GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000" CI_GATE_QUEUE_HEAD_SCAN_MAX=100 --
+assert_eq "$RC" "2" "a short page at the ceiling → exit 2 (still could-not-measure)"
+assert_contains "$OUT" "TRUNCATED" "it is reported as truncation"
+assert_not_contains "$OUT" "ONE page of" "a short page is NOT blamed on the page ceiling"
 
 # ⛔ A LEG THAT ERRORS is neither healthy NOR unhealthy-but-act (#2904): every unreadable input below
 # must exit 2, leave the mode alone, notify nothing and relabel nothing.
@@ -1265,6 +1297,10 @@ run_gate page-saturated GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_
   CI_GATE_QUEUE_THRESHOLD=200 --
 assert_eq "$RC" "2" "a queue deeper than the page (threshold above the page size) → exit 2"
 assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the saturation, not just a count"
+# …and at the SHIPPED bound the page-ceiling note is absent: the ceiling claim is about a bound that is
+# already at the page, and printing it at 25 would assert something false (agent-infra#3995 review
+# cycle 3, finding 1). This arm is what keeps that conditional two-sided.
+assert_not_contains "$OUT" "ONE page of" "the page-ceiling note is absent at a bound BELOW the page"
 assert_contains "$OUT" "lower bound" "the refusal says WHY the head age is unusable"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated queue read advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated queue read relabelled no runner"

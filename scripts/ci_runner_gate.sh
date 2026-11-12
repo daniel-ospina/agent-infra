@@ -128,13 +128,22 @@ QUEUE_PAGE=100
 # Ghosts accumulate at the OLD end (they never start while newer runs come and go), which is both
 # where they are and where the age comes from — so the bound must exceed the LIVE ghost population or
 # every pass refuses. ⛔ IT WAS 5, ON THE MEASUREMENT "3 on agent-infra, 3 on tortoise with headroom",
-# AND THAT MEASUREMENT DID NOT HOLD (agent-infra#3995, measured 2026-11-12T03:43Z): tortoise's queue
-# carried **14 consecutive job-less runs** at the head of the gate's own candidate list (2026-11-11
-# 20:49:45Z…20:53:24Z, `jobs: 0` on every one), so a 5-run window refused on EVERY pass —
-# `beyond the 5-run scan window`, no verdict written for 15 h (the verdict file still said `queued=83`
-# against a live queue of 238), and the `local → github` release unreachable. The SAME script with
-# `CI_GATE_QUEUE_HEAD_SCAN_MAX=25` measured the queue on the same minute. 25 is that population with
-# ~1.8x headroom; the cost is one jobs read per skipped ghost, on a pass whose cadence is minutes.
+# AND THAT MEASUREMENT DID NOT HOLD (agent-infra#3995, measured 2026-11-12T03:43–03:47Z). Two readings of
+# the SAME queue head, kept separate because they are different measurements:
+#   * a walk of page 1 of `status=queued` (oldest-first, this gate's own `jobs[].status == "queued"`
+#     predicate) found **14 consecutive rows with ZERO jobs created at all**, 2026-11-11
+#     20:49:45Z…20:53:24Z, with real demand at index 15 (run 43130574723, 30 jobs, 1 queued);
+#   * the gate's own 25-row pass one minute earlier discounted **10** ghosts before reaching demand
+#     (`probe: queued=238 queued_demanding=228 ghost_runs=10 queue_head_run=43128807199
+#     oldest_queued_s=11178 in_progress=9`) — the head moves as new runs arrive, so the two counts
+#     differ by WHEN they were taken, not by method.
+# Either way a 5-run window cannot reach demand, and the pass refuses: measured twice by hand on
+# 2026-11-12 (`beyond the 5-run scan window`, exit 2 — and `--dry-run` writes no verdict, so a box
+# that only ever hand-runs this gate keeps an arbitrarily old verdict file; this box's said
+# `queued=83`). 25 is the 14 with ~1.8x headroom; the cost is one jobs read per skipped ghost, on a
+# pass whose cadence is minutes. WHICH COPY ACTUALLY RUNS ON THE OWNER'S MAC IS NOT MEASURED HERE
+# (tortoise#3936: the farm/plist chain can sit behind the repo) — this constant is what the repo
+# ships, and the fix reaches an executed copy by sync, not by an env var (see the next paragraph).
 # ⛔ THE POPULATION GROWS (3 a week earlier → 14), so if this refuses again the answer is to raise the
 # bound HERE — the default — and never to treat the refusal as "no demand". ⛔ AND NOT BY SETTING THE
 # ENV KNOB ON THE DEPLOYED COPY: the farmed `~/.pi/agent/scripts/ci_runner_gate.sh` is overwritten by
@@ -923,7 +932,7 @@ print(comp, len(inc))
         # The candidate list ENDED before the queue did: a truncated read, not an empty one. The
         # wording is "readable run row(s)" because the list may be the PAGE's rows or the single
         # candidate synthesised from a body that carried only a head id.
-        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
+        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing"; return 2
       else
         log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"; return 2
       fi
@@ -1088,7 +1097,7 @@ print(age)
   # every other unread operand; it is the answer here too, and the message names BOTH values so the
   # misconfiguration is visible instead of silent.
   if [ "$queued" -gt "$QUEUE_PAGE" ]; then
-    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing"
+    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs and the bound (%s) is already at or above it, so no bound can see past this page — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_HEAD_SCAN_MAX"; fi)"
     return 2
   fi
 
