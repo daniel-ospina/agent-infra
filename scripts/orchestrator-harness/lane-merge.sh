@@ -913,13 +913,6 @@ required = sys.argv[2].split() if len(sys.argv) > 2 and sys.argv[2] else []
 trusted = (len(sys.argv) > 3 and sys.argv[3] == "1")
 
 
-def is_required(name):
-    """Is THIS surface check one of the repo's required contexts?"""
-    if not trusted or not required:
-        return True
-    return any(_bare_is(name, r) for r in required)
-
-
 def _bare_is(name, wanted):
     """Does THIS surface name name the required context `wanted`?
 
@@ -2220,9 +2213,16 @@ while :; do
   # The header promises progress; this is it. Printed when the count CHANGES (so a stable wait does
   # not spam 45 identical lines) and at least once a minute otherwise.
   now="$(date +%s)"
-  if [ "${IF:-}" != "${_last_if:-}" ] || [ $(( now - ${_last_say:-0} )) -ge 60 ]; then
-    log_line "… ${IF} check(s) in flight at head ${HEAD:0:12} — waiting ($(( deadline - now ))s left in this bound)"
-    _last_if="$IF"; _last_say="$now"
+  # ⛔ THE COUNT QUOTED HERE IS THE ONE THE LOOP WAITS ON (review P3-3, #4039). `IF` is required-only
+  # and `_eff` adds the unpublished-required reason, so a line rendered from `${IF}` said
+  # `0 check(s) in flight` in the state this change creates — every present required check terminal and
+  # green, with the ONLY outstanding thing an unpublished required name. That is the same
+  # "quote the wrong operand" defect the bound line names, in the one surface a reader and the watchdog
+  # see DURING the wait — and it is the normal state for most of a wait, not a corner. The unpublished
+  # names travel with it because a reason of `0` is not a count.
+  if [ "${_eff:-}" != "${_last_if:-}" ] || [ $(( now - ${_last_say:-0} )) -ge 60 ]; then
+    log_line "… ${_eff} required check(s) outstanding at head ${HEAD:0:12}${REQ_MISSING:+ (${REQ_MISSING} not published yet)} — waiting ($(( deadline - now ))s left in this bound)"
+    _last_if="$_eff"; _last_say="$now"
   fi
   if [ "$now" -ge "$deadline" ]; then
     # In flight at the bound is NOT a failure of the lane and NOT a green: it is an unexplained
@@ -2258,8 +2258,9 @@ while :; do
   # sleep so the first poll is already covered, and unconditionally (not only when the count changes),
   # because an unchanged count is exactly the case the watchdog would read as silence.
   if [ -n "$HB_F" ]; then
-    printf '[lane-merge] heartbeat %s: %s check(s) in flight at head %s (%ss left in this bound)\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "${IF:-?}" "${HEAD:0:12}" \
+    printf '[lane-merge] heartbeat %s: %s required check(s) outstanding at head %s%s (%ss left in this bound)\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "${_eff:-?}" "${HEAD:0:12}" \
+      "${REQ_MISSING:+ (${REQ_MISSING} not published yet)}" \
       "$(( deadline - $(date +%s) ))" >> "$HB_F" 2>/dev/null || {
         say_err "lane-merge: the heartbeat target '$HB_F' became unwritable — progress is no longer visible to lane-bound.sh's ${IDLE_BOUND_S}s allowance; re-run with LANE_MERGE_HB pointing at the lane log."
         HB_F=""
