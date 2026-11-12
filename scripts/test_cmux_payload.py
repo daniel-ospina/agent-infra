@@ -25,6 +25,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import textwrap
 import time
 
@@ -1463,48 +1464,41 @@ def _lock(state, pid=None, age_s=None, pid_inside=False):
 
 
 def _live_holder_that_is_not_a_nudge(tmp_path):
-    """A live pid whose argv does NOT name cadence-nudge.sh — a recycled or foreign pid."""
-    return subprocess.Popen(["sleep", "120"])
+    """A live pid whose argv does NOT name cadence-nudge.sh — a recycled or foreign pid.
+
+    ⛔ SPAWNED FROM THE TEST'S OWN INTERPRETER, NOT FROM A BARE `sleep` ON PATH. `sleep` is not a
+    process this suite can rely on: on a runner whose `sleep` is a guarded multi-call shim the holder
+    exits at once, and a DEAD holder proves the DEAD arm (a 10-min bound) rather than the live-and-
+    unrelated arm this test is about — so the assertion would be about the wrong branch on that box
+    and about the right one everywhere else. See the sibling helper below for the measurement.
+    """
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
 
 
 def _live_holder_named_like_the_floor(tmp_path):
     """A live process whose argv NAMES cadence-nudge.sh — what the identity check must accept.
 
-    `ps -o args=` must show the script name, so the holder runs a SCRIPT of that name rather than
-    re-exec'ing with a patched argv (bash 3.2 on macOS has no `exec -a`).
+    ⛔ NOT A COPY OF THE `sleep` BINARY. That is what this used to be, and it silently required the
+    host's `sleep` to be a REAL per-binary executable. On a runner whose `sleep` is a guarded
+    multi-call shim, the copy refuses to start under a different name —
 
-    ⛔ NOT A COPY OF A COREUTILS BINARY (measured on the `test` job of PR #4020's CI, run 43222627700).
-    Copying `sleep` to `<tmp>/cadence-nudge.sh` and executing it made the runner's hardened coreutils
-    wrapper refuse at exec -- "Security violation: Requested utility 'cadence-nudge' does not match
-    executable name: /tmp/pytest-of-runner/.../cadence-nudge.sh" -- so the pid was alive with a
-    non-matching argv, the floor took its FOREIGN arm, and the tick logged `bound=6m` where a genuine
-    holder (the ceiling) was required.
+      Security violation: Requested utility `cadence-nudge` does not match executable name:
+        .../cadence-nudge.sh
 
-    ⛔ AND ITS INTERPRETER MUST NOT BE A SHELL (this is what keeps the two AGE-fence arms non-vacuous).
-    `_nudge_holder_is_ours` short-circuits on the SHAPE arm -- `<bash|sh|dash|zsh|ksh> <.../cadence-nudge.sh>`
-    answers "ours" BEFORE the age fence runs -- so a `#!/bin/sh` holder would make
-    `test_cadence_nudge_holds_the_lock_when_the_holder_AGE_cannot_be_read` green without its `PS_BIN`
-    discriminator ever being consulted. A python shebang keeps the SHAPE arm out of the way, so the
-    NAME arm and the fence are what grade the pid -- exactly what the binary copy used to do, without
-    the copy. The holder blocks in ONE process: `time.sleep` spawns nothing to leak into other tests.
+    — so the "live holder" was dead on arrival, an UNRELATED process recycled its pid, and the floor
+    correctly logged `bound=6m — pid N is alive but is not this script (recycled or foreign)`. Measured
+    on CI (run 43195539277, `python-ci / test`) and reproduced on a box with that shim first on PATH.
+
+    ⛔ THE ARGV SHAPE MATTERS AS MUCH AS THE LIFETIME: argv[0] must NOT be a shell, with the name in
+    argv, so this exercises the NAME arm and the AGE FENCE behind it. A `<shell> <…/cadence-nudge.sh>`
+    spelling (a shebang script) takes the SHAPE short-circuit instead, which would make the
+    `pid_began_after` arms vacuous. `sys.executable` gives `<python> <…/cadence-nudge.sh> 300`: not a
+    shell, the name in argv, and a process nothing on the host can refuse to run.
+    (bash 3.2 on macOS still has no `exec -a`; this spelling needs none.)
     """
     fake = tmp_path / "cadence-nudge.sh"
-    fake.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(300)\n", encoding="utf-8")
-    fake.chmod(0o755)
-    proc = subprocess.Popen([str(fake)])
-    # ⛔ AND WAIT FOR THE ARGV TO BE ITS OWN: `Popen` returns after the FORK, and until the child
-    # execs, `ps -o args=` reports the PARENT's argv (pytest) -- a read in that window is a genuine
-    # "foreign pid" and would take the 6-min arm for a reason the test never meant to exercise. The
-    # floor's own contract is that a holder IS a process whose argv names this script, so this waits
-    # for exactly that fact (bounded: if it never appears the assertion below fails as before).
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        args = subprocess.run(["ps", "-p", str(proc.pid), "-o", "args="],
-                              capture_output=True, text=True).stdout
-        if "cadence-nudge.sh" in args:
-            break
-        time.sleep(0.05)
-    return proc
+    fake.write_text("import time\ntime.sleep(300)\n", encoding="utf-8")
+    return subprocess.Popen([sys.executable, str(fake), "300"])
 
 
 def test_a_failed_surface_read_that_still_prints_an_id_is_not_qualified(P):

@@ -552,19 +552,32 @@ _fleet_watchdog_label() {
   printf 'com.eldato.controller-watchdog\n'
 }
 
+# _fleet_systemd_system_dir — the SYSTEM-scope unit ROOT this file looks in.
+# ⛔ `/etc/systemd/system` IS HOST STATE, and HOME does not isolate it. A box (or a CI runner that ran
+# `install-cell-timers.sh --install` earlier in the SAME shard) carrying `eldato-controller-watchdog.timer`
+# made `orchestrator-bringup.sh start` exit 1 inside a fixture that starts no other component — reported
+# as "LATE ... has never been written" about a timer the fixture never installed (measured:
+# `scripts/orchestrator-bringup.test.sh` §7, CI run 43195539277 shard 7; reproduced on a Linux cell whose
+# `/etc/systemd/system/eldato-controller-watchdog.timer` is root-owned and long installed).
+# The seam is the ROOT, not the unit name: `FLEET_SYSTEMCTL` already redirects the BINARY, but a
+# redirected binary still answers `-f` about the HOST's unit files, so the two must move together or
+# the read stays half-isolated. Default is unchanged.
+_fleet_systemd_system_dir() { printf '%s\n' "${FLEET_SYSTEMD_SYSTEM_DIR:-/etc/systemd/system}"; }
+
 # _fleet_row_watchdog_cell <state-dir> — the cell's arm: one systemd timer, and the verdict its own
 # bounded log last wrote. The timer is judged by ITS OWN period (5 min, `OnUnitActiveSec=5min`), not by
 # a bound copied from the Mac's 300 s job — the two are the same today, and the READ should not depend
 # on that staying true.
 _fleet_row_watchdog_cell() {
-  local o="${1:-}" unit="eldato-controller-watchdog.timer" dir="" active="" log verdict age bound
-  if [ -f "/etc/systemd/system/$unit" ]; then dir="/etc/systemd/system"; active="$(${FLEET_SYSTEMCTL:-systemctl} is-active "$unit" 2>/dev/null || true)"
+  local o="${1:-}" unit="eldato-controller-watchdog.timer" dir="" active="" log verdict age bound sysdir
+  sysdir="$(_fleet_systemd_system_dir)"
+  if [ -f "$sysdir/$unit" ]; then dir="$sysdir"; active="$(${FLEET_SYSTEMCTL:-systemctl} is-active "$unit" 2>/dev/null || true)"
   elif [ -f "$FLEET_HOME/.config/systemd/user/$unit" ]; then dir="$FLEET_HOME/.config/systemd/user"; active="$(${FLEET_SYSTEMCTL:-systemctl} --user is-active "$unit" 2>/dev/null || true)"
   fi
   if [ -z "$dir" ]; then
     if [ -f "${FLEET_INFRA_ROOT:-}/scripts/orchestrator-harness/watchdog-loop.sh" ]; then
       fleet_row controller-watchdog "1 watchdog timer" "no timer unit" MISSING \
-        "the watchdog's code IS on this box but no systemd timer installs it (looked for /etc/systemd/system/$unit and ~/.config/systemd/user/$unit) — a watchdog with no clock protects nothing; install with scripts/install-cell-timers.sh --install"; return 0
+        "the watchdog's code IS on this box but no systemd timer installs it (looked for $sysdir/$unit and ~/.config/systemd/user/$unit) — a watchdog with no clock protects nothing; install with scripts/install-cell-timers.sh --install"; return 0
     fi
     fleet_row controller-watchdog "1 watchdog timer" "not installed" SKIPPED \
       "neither the timer unit nor the watchdog script exists on this box — nothing to check (this is NOT a healthy watchdog)"; return 0
@@ -992,15 +1005,16 @@ fleet_row_objective_reminder() {
       # A cell has no launchd: both passes are systemd timers (install-cell-timers.sh), on the same
       # mechanism the cell already uses for its disk reaper. The unit is judged by ITS OWN declaration
       # (`OnUnitActiveSec=10min`), not by a constant invented here.
-      local unit="eldato-objective-reminder.timer" dir active="unknown"
-      if [ -f "/etc/systemd/system/$unit" ]; then
+      local unit="eldato-objective-reminder.timer" dir active="unknown" sysdir
+      sysdir="$(_fleet_systemd_system_dir)"
+      if [ -f "$sysdir/$unit" ]; then
         active="$(${FLEET_SYSTEMCTL:-systemctl} is-active "$unit" 2>/dev/null || true)"
       elif [ -f "$FLEET_HOME/.config/systemd/user/$unit" ]; then
         active="$(${FLEET_SYSTEMCTL:-systemctl} --user is-active "$unit" 2>/dev/null || true)"
       else
         if [ -f "${FLEET_INFRA_ROOT:-}/scripts/objective-reminder.sh" ] || [ -f "$FLEET_AGENT_SCRIPTS/objective-reminder.sh" ]; then
           fleet_row objective-reminder "timer active, fresh verdict" "no timer unit" MISSING \
-            "the reminder's code IS on this box but no systemd timer installs it (looked for /etc/systemd/system/$unit and ~/.config/systemd/user/$unit) — nothing runs it; install with scripts/install-cell-timers.sh --install"; return 0
+            "the reminder's code IS on this box but no systemd timer installs it (looked for $sysdir/$unit and ~/.config/systemd/user/$unit) — nothing runs it; install with scripts/install-cell-timers.sh --install"; return 0
         fi
         fleet_row objective-reminder "timer active, fresh verdict" "not installed" SKIPPED \
           "neither the timer unit nor the reminder script exists on this box — this component does not exist here (NOT a healthy reminder)"; return 0
