@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-42-1794444696-p2537543-47d79c5a",
+  "_sha": "473ab7ac50333f1eec42e6baedd2d9c613c98852",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.met4mavrn0/fix.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/3932-preflight-stale-code"
+    },
+    {
+      "kind": "sha",
+      "value": "c7906cb13f918cf2c0a779b9809fec7101b1ba32"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-3986"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 36,
+  "ended_at": 1794444732,
+  "exit_code": 0,
+  "heartbeat_at": 1794444732,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1794444696-p2537543-47d79c5a",
+  "lease_until": 1794445337,
+  "pid": 2537543,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794444696,
+  "state": "DONE",
+  "tag": "42",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-3986"
+}
