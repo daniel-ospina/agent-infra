@@ -397,6 +397,15 @@ def arm_boot_prompt(ws: str, lane: str, surface: Surface, dispatch) -> Proof:
                  sent=rc in (0, 4))
 
 
+class RecordWriteError(RuntimeError):
+    """A route record could not be written. Raised, never swallowed — the caller must LOG it.
+
+    ⛔ NOT A `Proof`. `write_record` returns a path, and a failed write is not a verification result:
+    returning a `Proof` from a `-> str` function was the shape that hid a `NameError` behind a
+    plausible-looking return type (round 6, #4046 P1).
+    """
+
+
 def handoff_path(state_dir: str, lane: str) -> str:
     return os.path.join(state_dir, "%s-child-handoff.json" % (lane or "lane",))
 
@@ -482,7 +491,13 @@ def arm_rerun(lane: str, ws: str, relaunch) -> Proof:
     verified = rc == 0
     why = {0: "CONFIRMED — the lane came back", 3: "REFUSED by lane-relaunch's own guard (nothing sent)",
            4: "UNCONFIRMED — sent, the proof did not fire", 5: "DRY-RUN — nothing sent",
-           1: "ERROR — lane-relaunch raised"}.get(rc, "unrecognised exit %r" % (rc,))
+           1: "ERROR — lane-relaunch raised",
+           # ⛔ "NO TOOL" IS NOT "REFUSED BY THE TOOL" (round 6, #4046 P2). The absence of
+           # `lane-relaunch.py` on a farmed box (it is deliberately not farmed — it needs
+           # `lane-status.py`, withheld by #1553) was reported as the tool's own guard refusing, a
+           # false cause in a durable record. `None` is the caller's "I could not even find it".
+           None: "UNAVAILABLE — no lane-relaunch.py on this box, so nothing was attempted",
+           }.get(rc, "unrecognised exit %r" % (rc,))
     return Proof("rerun", triage.PROOFS["rerun"], verified, why,
                  {"lane": lane, "ws": ws, "relaunch_rc": rc}, sent=rc in (0, 4))
 
@@ -553,11 +568,11 @@ def write_record(state_dir: str, lane: str, route, proof: Proof) -> str:
             fh.write("\n")
         os.replace(tmp, path)
     except OSError as exc:
-        # ⛔ A WRITE THAT FAILED IS NOT A HAND-OFF. Pathological (an unwritable state dir, a directory
-        # where the record should be) but cheap to answer honestly — the alternative is an exception
-        # out of `lane-route.main()` and no record at all, which is what the previous round's `poll`
-        # arity bug did on the normal path.
-        return Proof("repair-child", triage.PROOFS["repair-child"], False,
-                     "the hand-off record could not be written: %s" % (exc,),
-                     {"lane": lane, "child": dict(child or {}), "fields": named, "path": path})
+        # ⛔ THIS BRANCH WAS A `NameError` (round 6, #4046 P1): it was written by copying `arm_child`'s
+        # error path, so it referenced `child`/`named` — undefined here — and every failed write RAISED
+        # instead of answering. That matters because it runs AFTER the arm has typed the question: the
+        # CLI aborted with the question already delivered and no dedupe record, so the next tick
+        # re-sent it. It now raises a TYPED error the caller can log without losing the fact that the
+        # action happened, and `lane-route.main` reports it as `ROUTE-RECORD-FAILED`.
+        raise RecordWriteError("the route record could not be written at %s: %s" % (path, exc)) from exc
     return path

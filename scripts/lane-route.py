@@ -60,6 +60,13 @@ def _resolve(name):
     return ""
 
 
+# ⛔ THE FARMED COPY MUST FIND ITS DEPENDENCIES (round 6, #4046 P1). `pi-bootstrap/setup.sh` farms
+# `triage.py`/`triage_arms.py`/`liveness.py` into `$SCRIPTS/fleet`, and `AGENT_INFRA_PATH` is UNSET in
+# the population that runs this (measured on this box, and absent from both the launchd plist template
+# and `heartbeat-loop.sh`). Without this entry a farmed CLI died at import with
+# `ModuleNotFoundError: No module named 'liveness'` and routed nothing.
+if os.path.join(SCRIPTS, "fleet") not in sys.path:
+    sys.path.insert(0, os.path.join(SCRIPTS, "fleet"))
 FLEET = os.path.join(os.environ.get("AGENT_INFRA_PATH", ""), "tools", "fleet")
 if not os.path.isdir(FLEET):
     # A lane runs from a checkout. Fall back to this file's own repo so a worktree run works too.
@@ -148,15 +155,18 @@ class CmuxSurface(triage_arms.Surface):
             return None
 
     def _terminal_for(self, ws):
-        """Resolve a workspace to a TERMINAL id. `read-screen` does not take a workspace (#4046).
+        """Resolve a workspace to the TERMINAL id of its active pane. `read-screen` takes no workspace.
 
-        ⛔ MEASURED (round 5, #4046 P1): `cmux read-screen --workspace <ws> --lines 5` is a USAGE
-        error on this cmux build — `cmux: usage: cmux read-screen [--terminal <id>] [--json]`, rc=2 —
-        while `--terminal <id>` returns the screen. Without `--lines` the same argv exits 0 with EMPTY
-        stdout, which a naive `rc != 0` check reads as a blank pane, so every pane proof silently
-        answered "no boot prompt" from a read that never happened. Resolved from `cmux tree --json`
-        each call: the pane's terminal changes when a workspace is re-opened, and a cached id would
-        read a dead terminal as the live one.
+        ⛔ THE REAL SHAPE, MEASURED (round 5/6, #4046 P0). `cmux tree --json` on this build carries
+        `workspaces[]` as `{focused,id,index,name,session_id}` — it has NO `terminal`/`tabs`/`panes`
+        field, so the first version of this method answered `None` for every workspace on the box,
+        which made `screen_tail` permanently unreadable: the question arm could never verify, the
+        dedupe never armed (the same brief was re-sent every tick), and `boot-prompt` was unreachable
+        from the only acquirer. The join that does exist — and that `cloud-cell-supervisor.test.sh`'s
+        fixture models — is
+            workspaces[].id → screens[].workspace_id → screens[].layout.active_pane_id
+            → tabs[].pane_id → tabs[].content_id (content_kind == "terminal")
+        resolved here against the SAME blob, never a cached id (a workspace's active pane moves).
         """
         rc, out, _ = _cmux(["tree", "--json"])
         if rc != 0 or not out.strip():
@@ -165,20 +175,44 @@ class CmuxSurface(triage_arms.Surface):
             blob = json.loads(out)
         except ValueError:
             return None
+        if not isinstance(blob, dict):
+            return None
+
+        # a workspace already exposing a terminal (older/newer shapes) is taken at its word
         for space in (blob.get("workspaces") or []):
-            if not isinstance(space, dict) or space.get("id") != ws:
+            if isinstance(space, dict) and space.get("id") == ws:
+                for key in ("terminal", "terminal_id"):
+                    if isinstance(space.get(key), str) and space.get(key):
+                        return space[key]
+
+        tab_by_id = {}
+        for tab in (blob.get("tabs") or []):
+            if isinstance(tab, dict) and tab.get("id"):
+                tab_by_id[tab["id"]] = tab
+        pane_ids = set()
+        for tab in tab_by_id.values():
+            if tab.get("pane_id"):
+                pane_ids.add(tab["pane_id"])
+
+        for screen in (blob.get("screens") or []):
+            if not isinstance(screen, dict) or screen.get("workspace_id") != ws:
                 continue
-            for key in ("terminal", "terminal_id"):
-                if isinstance(space.get(key), str) and space.get(key):
-                    return space[key]
-            for arr in ("terminals", "tabs", "panes"):
-                for item in (space.get(arr) or []):
-                    if not isinstance(item, dict):
-                        continue
-                    for key in ("terminal", "terminal_id", "id"):
-                        val = item.get(key)
-                        if isinstance(val, str) and val.startswith("term"):
-                            return val
+            layout = screen.get("layout") or {}
+            root = layout.get("root") or {}
+            # the active pane first, then any pane the layout names, then any tab the screen owns
+            candidates = [layout.get("active_pane_id"), root.get("active_pane_id"),
+                          root.get("pane_id"), layout.get("zoomed_pane_id")]
+            for pid in candidates:
+                if not pid:
+                    continue
+                for tab in tab_by_id.values():
+                    if tab.get("pane_id") == pid and tab.get("content_kind") == "terminal" \
+                            and tab.get("content_id"):
+                        return tab["content_id"]
+            for tid in (root.get("tab_ids") or []):
+                tab = tab_by_id.get(tid)
+                if tab and tab.get("content_kind") == "terminal" and tab.get("content_id"):
+                    return tab["content_id"]
         return None
 
     def screen_tail(self, ws, lines=40):
@@ -319,7 +353,11 @@ def _make_relaunch():
 
     def _run(ws):
         if not os.path.exists(tool):
-            return 3                        # refused: no relaunch tool on this box
+            # ⛔ `None`, NOT `3` (round 6, #4046 P2). `3` is lane-relaunch's OWN "my guard refused"
+            # verdict, so an absent tool was recorded as a refusal by a tool that was never run — a
+            # false cause in a durable record. `None` is "could not even find it", and `arm_rerun`
+            # reports UNAVAILABLE.
+            return None
         try:
             p = subprocess.run([sys.executable or "python3", tool, "--ws", ws],
                                capture_output=True, text=True, timeout=600)
@@ -348,6 +386,10 @@ def main(argv):
     ap.add_argument("--stdin", default="")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--apply", action="store_true")
+    # ⛔ (round 6, #4046 P2): a BATCHED caller hands over rows for one purpose. Applying anything else
+    # they happen to earn (a `send-continue` whose arm polls for up to 120 s) would outlive the
+    # caller's own budget. An empty value means "no filter", which is the operator default.
+    ap.add_argument("--only-route", default="")
     # ⛔ REPEATABLE (round 5, #4046 P2): `turn-end.py` routes every asking lane in ONE call, so a
     # tick pays for ONE `lane-status.py` scan rather than one per asking lane.
     ap.add_argument("--lane", action="append", default=[])
@@ -393,6 +435,8 @@ def main(argv):
     for row in rows:
         ev, extra = evidence_for(row, read_screen=a.apply, surface=surface)
         r = triage.route(ev)
+        if a.only_route and r.route != a.only_route:
+            continue
         item = r.as_dict()
         item["lane"] = ev.lane
         item["verdict"] = ev.lane_verdict
@@ -478,8 +522,12 @@ def main(argv):
             (item.get("subcase") or "-"), item["action"])
         if "result" in item:
             res = item["result"]
-            line += "  [%s%s]" % ("VERIFIED" if res["verified"] else "unverified",
-                                  "" if res["verified"] else (": " + res["detail"][:90]))
+            # ⛔ `verified` ON A READING ARM IS NOT AN EFFECT (round 6, #4046 P2).
+            if res.get("asserts_lane") is False:
+                line += "  [READ]"
+            else:
+                line += "  [%s%s]" % ("VERIFIED" if res["verified"] else "unverified",
+                                      "" if res["verified"] else (": " + res["detail"][:90]))
         print(line)
     print(triage.summary(out))
     return 0

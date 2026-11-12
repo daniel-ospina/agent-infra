@@ -465,7 +465,7 @@ def lanes_with_open_question(known_lanes=None) -> set:
     return out
 
 
-def suppress_and_route(lane: str, route, pending=None) -> None:
+def suppress_and_route(lane: str, route, pending=None, row=None) -> None:
     """The loop's non-nudge branch, extracted so it can be TESTED as the branch it is.
 
     ⛔ SUPPRESSING THE NUDGE IS NOT ROUTING THE QUESTION (round 4, #4046 P1). Until this branch
@@ -482,7 +482,12 @@ def suppress_and_route(lane: str, route, pending=None) -> None:
         f" action={route.action} — {route.reason}")
     if route.route == "user-question":
         if pending is not None:
-            pending.append({"lane": lane})
+            # ⛔ THE FULL ROW, NOT A LANE NAME (round 6, #4046 P0). This appended `{"lane": lane}`, and
+            # the CLI rebuilds `Evidence` from the row it is handed — so every batched lane arrived
+            # with no `sid`/`ws`/`verdict`, re-decided to `none`/`none`, and was logged as
+            # `verified=true` for an action nothing took. Deliverable 2 was delivered by no running
+            # code, one layer below the fix that was supposed to deliver it.
+            pending.append(dict(row or {"lane": lane}))
         else:
             _apply_question_route(lane)
 
@@ -504,9 +509,16 @@ def _apply_question_routes(rows, timeout: int = 120) -> None:
     and log), and a routing failure is LOGGED with its reason, so a question that never reaches the
     panel has a visible cause instead of reading as a lane that wants nothing.
     """
-    lanes = [r for r in (rows or []) if isinstance(r, dict)][:MAX_PER_TICK]
+    lanes = [r for r in (rows or []) if isinstance(r, dict)]
     if not lanes:
         return
+    if len(lanes) > MAX_PER_TICK:
+        # ⛔ A DROPPED LANE MUST BE VISIBLE (round 6, #4046 P2). Slicing silently starved the 4th+
+        # asking lane forever when the first three stayed `user-question` in a stable order — the
+        # delivery path already logs its own cap, so this one does too.
+        log(f"CAP reached at {MAX_PER_TICK}; {len(lanes) - MAX_PER_TICK} asking lane(s) deferred to "
+            f"next tick: " + ", ".join((r.get("lane") or "?") for r in lanes[MAX_PER_TICK:]))
+        lanes = lanes[:MAX_PER_TICK]
     cli = os.path.join(SCRIPTS, "lane-route.py")
     if not os.path.exists(cli):
         log(f"ROUTE-SKIP {len(lanes)} lane(s): lane-route.py is not on this box ({cli}) — the "
@@ -517,8 +529,13 @@ def _apply_question_routes(rows, timeout: int = 120) -> None:
         os.makedirs(STATE, exist_ok=True)
         with open(payload_file, "w") as fh:
             json.dump(lanes, fh)
+        # ⛔ `--only-route user-question` (round 6, #4046 P2). Handing the rows over means the CLI
+        # RE-DECIDES from them, and a lane that resumed mid-tick could decide `send-continue` — whose
+        # arm then polls for up to `RESUME_BOUND_S` (120 s) INSIDE this 120 s budget, so the parent
+        # kills a child that was working. This batch exists to route questions; anything else the
+        # fresh evidence earns is the CLI's job on its own schedule, not this tick's.
         p = subprocess.run([sys.executable or "python3", cli, "--apply", "--json",
-                            "--stdin", payload_file],
+                            "--only-route", "user-question", "--stdin", payload_file],
                            capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         log(f"ROUTE-SKIP: lane-route.py failed ({exc.__class__.__name__}) — question(s) NOT routed")
@@ -536,8 +553,14 @@ def _apply_question_routes(rows, timeout: int = 120) -> None:
     for item in (blob if isinstance(blob, list) else []):
         res = (item.get("result") or {})
         routed += 1
-        log(f"ROUTE {item.get('lane') or '?'}: {res.get('action') or '?'} "
-            f"verified={str(bool(res.get('verified'))).lower()} "
+        # ⛔ A READING ARM IS NOT AN EFFECT (round 6, #4046 P2): `verified` on `wait`/`inspect`/
+        # `refuse`/`none` means "the reading was produced", so printing `verified=true` for it is the
+        # conflation `asserts_lane` was added to remove.
+        if res.get("asserts_lane") is False:
+            state = "read"
+        else:
+            state = "verified=" + str(bool(res.get("verified"))).lower()
+        log(f"ROUTE {item.get('lane') or '?'}: {res.get('action') or '?'} {state} "
             f"— {(res.get('detail') or '')[:140]}")
     if routed == 0:
         log(f"ROUTE-SKIP rc={p.returncode}: lane-route.py returned no route for "
@@ -671,7 +694,7 @@ def main(argv: list[str]) -> int:
                 _may, _route = route_gate(r, f)
                 if not _may:
                     suppress_and_route(lane, _route, pending=asking_rows if
-                                       _route.route == "user-question" else None)
+                                       _route.route == "user-question" else None, row=r)
                     continue
 
             msg = build_wip_nudge(lane, r.get("issue_label") or "",

@@ -191,13 +191,36 @@ _PAST_HARD = re.compile(
     r"nothing needs your|no need for your|doesn'?t need your|does not need your|never needed your)\b")
 _PAST_SOFT = re.compile(
     r"\b(?:matched your|recorded your|went through|was your call|had approved|has approved|"
-    r"on your approval)\b")
+    # ⛔ NOT "on your approval" (round 6, #4046 P0). It is the ASK in "I'm blocked on your approval",
+    # and the past-tense case it was added for ("Merged it on your approval at 14:02") is carried by
+    # the HARD temporal anchor. In a soft list it silenced a live hand-off inside its own clause.
+    r"thanks for your|for your approval step|was the right call)\b")
 _FUTURE_CUE = re.compile(
     r"\b(?:i'?ll|i will|we'?ll|will|shall|should|would|waiting|await|until|once|before|please|"
     r"need|needs|let me|go-ahead|your call on)\b")
 
 
+_CLAUSE_SPLIT = re.compile(r"[,;]|\s[—–]\s|\s-\s|\b(?:but|however|although|yet|whereas)\b",
+                           re.IGNORECASE)
+
+
+def _clauses(sent: str) -> list:
+    """Split a sentence at CLAUSE boundaries, so a cue cannot disarm a different clause's ask.
+
+    ⛔ (round 6, #4046 P0). Whole-SENTENCE disarming let a temporal anchor or a denial silence a LIVE
+    ask in the same sentence — measured, four real hand-offs read `not-asked` and routed
+    `send-continue` on a settled turn, and `rerun` on an open one:
+      * "I'm blocked on your approval, unlike yesterday."        (anchor is in the OTHER clause)
+      * "Nothing needs your input on the schema, but I do need your approval on the deploy."
+      * "Awaiting your decision — I'll be at 14:02 standup and then free."
+      * "The migration is written. I'll hold the deploy until you confirm; I'm back at 14:02."
+    Each clause is judged on its own, so the cue has to belong to the phrase it disarms.
+    """
+    return [c for c in _CLAUSE_SPLIT.split(sent or "") if c and c.strip()]
+
+
 def _disarmed(low: str) -> bool:
+    """Does THIS CLAUSE report something already decided? (see `_PAST_HARD`/`_PAST_SOFT`)"""
     if _PAST_HARD.search(low):
         return True
     return bool(_PAST_SOFT.search(low)) and not _FUTURE_CUE.search(low)
@@ -268,16 +291,21 @@ UNREAD = "unread"
 # letting the surrounding prose be read (that fixture's own closing line is "Retried with the
 # explicit path.").
 _QUOTE_RE = re.compile(r"(?m)^\s*>.*$")
+# ⛔ INLINE CODE IS REPORTED MATERIAL TOO (round 6, #4046 P2). The round-5 corpus measured
+# `Ran \`grep -c '?' file\` and got 0.` and ``sh shall i merge?`` as an ASK, because only FENCED
+# blocks and blockquotes were stripped. A backticked span is a command/output a lane is quoting, so it
+# is removed with them — the same reasoning `_QUOTE_RE` carries.
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 
 
 def readable_tail(text: str) -> str:
-    """The assistant text with fenced code and QUOTED lines removed.
+    """The assistant text with fenced code, inline code spans and QUOTED lines removed.
 
     A question mark inside a code block or a quoted tool error is not the lane asking the owner
     anything. Stripping `>` lines is what keeps `> Invalid config: which option did you mean?` out of
     the detector while the surrounding prose is still read.
     """
-    return _QUOTE_RE.sub("", _FENCE_RE.sub("\n\n", text or ""))
+    return _QUOTE_RE.sub("", _INLINE_CODE_RE.sub(" ", _FENCE_RE.sub("\n\n", text or "")))
 
 
 def last_paragraph(text: str) -> str:
@@ -351,12 +379,13 @@ def asks_owner(text: str) -> str:
     # shape of a lane that has finished everything except the thing it is waiting on, so the
     # asymmetry had no defensible side: both classes now read the whole readable tail.
     for sent in _sentences(body):
-        low = " ".join(sent.lower().split())
-        if not low:
-            continue
-        if not (any(phrase in low for phrase in _ASK_FRAME + _HANDOFF)
-                or _HANDOFF_SHAPE.match(sent.strip().lower())):
-            continue
+        for clause in _clauses(sent):
+            low = " ".join(clause.lower().split())
+            if not low:
+                continue
+            if not (any(phrase in low for phrase in _ASK_FRAME + _HANDOFF)
+                    or _HANDOFF_SHAPE.match(clause.strip().lower())):
+                continue
         # ⛔ A PAST-TENSE COMPLETION CUE DISARMS THE PHRASE (round 5, #4046 P1). Widening the phrase
         # classes to the whole tail (round 4) made ordinary completion prose read as an ask —
         # measured, 7 of 8 of "Merged the PR on your approval at 14:02, checks green.", "Everything
@@ -365,9 +394,9 @@ def asks_owner(text: str) -> str:
         # question lane and suppressed its nudge — a regression of a fix this same change made in
         # round 2. The cue is per SENTENCE, so a tail whose FIRST sentence is a hand-off and
         # whose second reports a past merge still reads as an ask.
-        if _disarmed(low):
-            continue
-        return ASKED
+            if _disarmed(low):
+                continue
+            return ASKED
     return NOT_ASKED
 
 

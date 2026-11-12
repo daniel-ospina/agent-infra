@@ -138,6 +138,13 @@ QUESTION_TEXTS = [
     "Is the cache warm enough for the load test?",
     "Any reason the rail would refuse this one?",
     "Can the migration be re-applied without dropping the index?",
+    # ⛔ THE CLAUSE-SCOPED DISARM (round 6, #4046 P0). Whole-sentence disarming let a temporal anchor
+    # or a denial in a NEIGHBOURING clause silence a live ask in the same sentence: measured, these
+    # four read `not-asked` and routed `send-continue` on a settled turn and `rerun` on an open one.
+    "I'm blocked on your approval, unlike yesterday.",
+    "Nothing needs your input on the schema, but I do need your approval on the deploy.",
+    "Awaiting your decision — I'll be at 14:02 standup and then free.",
+    "The migration is written. I'll hold the deploy until you confirm; I'm back at 14:02.",
 ]
 
 
@@ -370,6 +377,11 @@ def leg_ask_detector() -> None:
         "The plan matched your approval exactly.",
         "Landed it pending your approval from Monday.",
         "Rebased onto main and merged. Nothing needs your input now.",
+        # the same rule's other side: a cue in the SAME clause still disarms, and a quoted command is
+        # reported material (round 6, #4046 P2 — inline code was read as prose)
+        "Thanks for your approval.",
+        "Holding the deploy was the right call.",
+        "Ran `grep -c '?' file` and got 0.",
     ]
     for text in NOT_Q:
         eq("asks_owner(not-asked): %r" % text[:38], triage.asks_owner(text), "not-asked")
@@ -771,6 +783,13 @@ def leg_arm_wedged_remedies() -> None:
     dead = FakeSurface(screens={"ws_bp": "42.0%/700k (auto)\nPress any key to continue..."})
     p4 = triage_arms.execute(r, e, dead, ws="ws_bp", dispatch=lambda ws, lane: 0)
     ok("boot-prompt: a bar ABOVE the marker is still a block", not p4.verified, p4.detail)
+    # ⛔ THE UNKNOWN-PERCENTAGE FORM (round 6, #4046 P2). `?/700k` is what the stats line shows right
+    # after boot — exactly when this arm reads it — and `cmux_dispatch.READY_RE` accepts it. Reverting
+    # `_STATS_RE` to percentage-only left the suite green before this fixture.
+    nopercent = FakeSurface(screens={"ws_bp": "Press any key to continue\n?/700k (auto)\n> "})
+    p6 = triage_arms.execute(r, e, nopercent, ws="ws_bp", dispatch=lambda ws, lane: 0)
+    ok("boot-prompt: a stats line with an UNKNOWN percentage still reads as repaired", p6.verified,
+       p6.detail)
     unread = FakeSurface(screen_unreadable=True)
     p5 = triage_arms.execute(r, e, unread, ws="ws_bp", dispatch=lambda ws, lane: 0)
     ok("boot-prompt: an unreadable pane is NOT verified", not p5.verified, p5.detail)
@@ -1031,6 +1050,54 @@ def leg_wiring() -> None:
                                                         steerable=True)))
     ok("a WEDGED route does NOT reach the question arms", "APPLIED:lane-w" not in calls, repr(calls))
 
+    # ⛔ THE BATCH MUST CARRY THE FULL ROW (round 6, #4046 P0). The first version appended
+    # `{"lane": lane}`, and the CLI rebuilds `Evidence` from what it is handed — so every batched lane
+    # arrived with no `sid`/`ws`/`verdict`, re-decided to `none`/`none`, and was logged as
+    # `verified=true` for an action nothing took. Measured here through the real `_apply_question_routes`.
+    te_mod.SCRIPTS = os.path.join(os.path.dirname(repo), "scripts")
+    te_mod.STATE = tempfile.mkdtemp(prefix="te-batch-state-")
+    captured = {}
+
+    class _P:
+        returncode = 0
+        stdout = "[]"
+        stderr = ""
+
+    real_run = te_mod.subprocess.run
+
+    def _fake_run(argv, **kw):
+        if "--stdin" in argv:
+            with open(argv[argv.index("--stdin") + 1]) as fh:
+                captured["payload"] = json.load(fh)
+            captured["argv"] = list(argv)
+        return _P()
+
+    logs = []
+    te_mod.subprocess.run = _fake_run
+    te_mod.log = lambda m: logs.append(m)
+    try:
+        row_full = {"lane": "lane-7", "verdict": "WIP-IDLE", "sid": "s1", "cwd": "/tmp",
+                    "ws": "w1", "stale_s": 9999}
+        pend = []
+        te_mod.suppress_and_route("lane-7", route_q, pending=pend, row=row_full)
+        eq("the batch collects ONE row for the asking lane", len(pend), 1)
+        te_mod._apply_question_routes(pend)
+        got = (captured.get("payload") or [{}])[0]
+        ok("the payload carries the row's OWN evidence keys (a lane name alone re-decides to `none`)",
+           all(k in got for k in ("verdict", "sid", "cwd", "ws")), repr(got))
+        ok("…and the CLI is told to apply ONLY question routes (a `send-continue` arm would poll "
+           "past the parent's budget)", "--only-route" in (captured.get("argv") or []),
+           repr(captured.get("argv")))
+        # the cap must be VISIBLE, or the 4th+ asking lane starves silently
+        logs.clear()
+        te_mod._apply_question_routes([{"lane": "lane-%d" % i, "verdict": "WIP-IDLE"}
+                                       for i in range(1, 6)])
+        ok("asking lanes beyond the cap are LOGGED as deferred, not dropped",
+           any("deferred to next tick" in m and "lane-4" in m for m in logs), repr(logs))
+    finally:
+        te_mod.subprocess.run = real_run
+        te_mod.log = lambda msg: calls.append(msg)
+
     # ⛔ THE FARM IS LOAD-BEARING, SO THE TEST MUST NOT READ THE CHECKOUT (round 4, #4046 P2). This
     # leg used to assert `te_mod._triage is not None` in THIS process, where `triage` was already
     # imported from `tools/fleet` — so a farm entry that no longer shipped `triage.py` left the suite
@@ -1213,7 +1280,7 @@ def leg_cli_apply() -> None:
         ok("an UNVERIFIED prior route is RETRIED, not replayed as already-routed", after > before,
            "sends %d -> %d" % (before, after))
 
-        # and once verified, the repeat is a no-op (the tick guard must still work)
+    # and once verified, the repeat is a no-op (the tick guard must still work)
         with contextlib.redirect_stdout(io.StringIO()):
             lr.main(["--apply", "--json", "--stdin", rows_file, "--state", state])
         resend = len(surf.sent.get(blob["result"]["artifact"]["question_ws"], []))
@@ -1233,6 +1300,76 @@ def leg_cli_apply() -> None:
         triage_arms.time = nap_saved
 
 
+def leg_surface_terminal() -> None:
+    """The workspace→TERMINAL join, against the REAL `cmux tree --json` shape (round 6, #4046 P0).
+
+    ⛔ WHY. `workspaces[]` on this build is `{focused,id,index,name,session_id}` — it has NO terminal
+    field — so the first implementation of `_terminal_for` answered `None` for every workspace on the
+    box. `screen_tail` was therefore permanently unreadable: the question arm could never verify, the
+    dedupe never armed (the same brief re-sent every tick), and the `boot-prompt` subcase was
+    unreachable from the only acquirer. Mutation-measured: `_terminal_for → None` left the suite at
+    PASS, so this leg is the thing that makes the join a gate.
+
+    The join that exists: workspaces[].id → screens[].workspace_id → layout.active_pane_id →
+    tabs[].pane_id → tabs[].content_id (content_kind == "terminal").
+    """
+    print("\n── SURFACE — the workspace→terminal join and what a failed read means ──")
+    lr_path = os.path.join(os.path.dirname(os.path.dirname(HERE)), "scripts", "lane-route.py")
+    import importlib.util as _ilu3
+    spec = _ilu3.spec_from_file_location("lane_route_surface_under_test", lr_path)
+    lr = _ilu3.module_from_spec(spec)
+    spec.loader.exec_module(lr)
+
+    tree = {"workspaces": [{"focused": False, "id": "ws_l9", "index": 0, "name": "wt-lane-9",
+                            "session_id": "session_x"}],
+            "screens": [{"id": "s9", "workspace_id": "ws_l9",
+                         "layout": {"active_pane_id": "pane_l9",
+                                    "root": {"kind": "leaf", "pane_id": "pane_l9",
+                                             "active_tab_id": "tab_l9",
+                                             "tab_ids": ["tab_l9"]}}}],
+            "tabs": [{"id": "tab_b9", "pane_id": "pane_l9", "content_kind": "browser",
+                      "content_id": "br_l9"},
+                     {"id": "tab_l9", "pane_id": "pane_l9", "content_kind": "terminal",
+                      "content_id": "term_l9"}],
+            "terminals": [{"id": "term_l9"}]}
+    calls = []
+
+    def _fake_cmux(argv, timeout=45):
+        calls.append(list(argv))
+        if argv[:2] == ["tree", "--json"]:
+            return 0, json.dumps(tree), ""
+        if argv[:1] == ["read-screen"] and "--terminal" in argv:
+            return 0, "pi footer\n> ", ""
+        return 2, "", "usage"
+
+    real = lr._cmux
+    try:
+        lr._cmux = _fake_cmux
+        surf = lr.CmuxSurface()
+        eq("the workspace resolves to its ACTIVE PANE's terminal (the real tree shape)",
+           surf._terminal_for("ws_l9"), "term_l9")
+        ok("…and a browser tab on the same pane is not mistaken for it",
+           surf._terminal_for("ws_l9") != "br_l9")
+        eq("an unknown workspace resolves to None — never a guessed terminal",
+           surf._terminal_for("ws_nope"), None)
+        ok("the pane is readable through the resolved terminal", surf.screen_tail("ws_l9") is not None)
+        reads = [c for c in calls if c[:1] == ["read-screen"]]
+        ok("`read-screen` is given --terminal, never --workspace (a usage error on this build)",
+           bool(reads) and all("--terminal" in c for c in reads)
+           and not any("--workspace" in c for c in reads), repr(reads[:2]))
+
+        lr._cmux = lambda argv, timeout=45: ((0, "", "") if argv[:2] == ["tree", "--json"]
+                                             else (0, "   \n", ""))
+        ok("an EMPTY capture is UNREADABLE (None), not a blank pane",
+           lr.CmuxSurface().screen_tail("ws_l9") is None)
+        lr._cmux = lambda argv, timeout=45: ((2, "", "usage") if argv[:2] == ["tree", "--json"]
+                                             else (0, "x", ""))
+        ok("a tree read that FAILED is unreadable, not a missing terminal",
+           lr.CmuxSurface().screen_tail("ws_l9") is None)
+    finally:
+        lr._cmux = real
+
+
 LEGS = (
     ("precedence", leg_precedence),
     ("no-continue", leg_no_continue_to_question),
@@ -1248,6 +1385,7 @@ LEGS = (
     ("records", leg_records),
     ("wiring", leg_wiring),
     ("cli-apply", leg_cli_apply),
+    ("surface", leg_surface_terminal),
 )
 
 
