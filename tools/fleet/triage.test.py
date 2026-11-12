@@ -567,6 +567,50 @@ def run_red_control() -> bool:
     good &= _red("R10 the question arm must never type into the owning lane",
                  "ws_owner" not in s.sent)
 
+    # (R11) ⛔ THE COMPLETION GATE ON A TEMPORAL ANCHOR IS LOAD-BEARING (round 7, #4046 P0). Without
+    # it any clause carrying a date disarms, and an ask whose OBJECT merely dates — "Please approve
+    # yesterday's expense report." — reads as a report. A MUTATION: restore the unconditional anchor
+    # and require the SAME input's answer to change.
+    dated = "Please approve yesterday's expense report."
+    shipped_ask = triage.asks_owner(dated)
+    _real_disarmed = triage._disarmed
+    triage._disarmed = (lambda low: bool(triage._PAST_HARD_ANCHOR.search(low))
+                        or _real_disarmed(low))
+    try:
+        anchored_ask = triage.asks_owner(dated)
+    finally:
+        triage._disarmed = _real_disarmed
+    good &= _red("R11 an unconditional date anchor WOULD silence a dated ask",
+                 shipped_ask == "asked" and anchored_ask == "not-asked")
+
+    # (R12) ⛔ THE PER-QUESTION ID IS WHAT DEFEATS A STALE PANE (round 7, #4046 P0). The question
+    # lane is persistent, so its tail still shows the PREVIOUS brief, and both briefs carry the same
+    # mandate tokens. Mutant: drop the id and the stale pane certifies the new question.
+    prior7 = triage_arms.question_brief("lane-7", "Shall I merge the old thing?")
+
+    class _NeverPaints(FakeSurface):
+        def send(self, ws, text):
+            self.last_sent[ws] = text
+            return True
+
+    def _stale_surface():
+        return _NeverPaints(spaces=[{"id": "own", "name": "lane-7", "index": 1},
+                                    {"id": "ws_q", "name": triage_arms.QUESTION_LANE,
+                                     "index": 3}],
+                            screens={"ws_q": prior7})
+
+    _real_qid = triage_arms.question_qid
+    triage_arms.question_qid = lambda lane, q: ""        # the "no nonce" mutation
+    try:
+        blind = triage_arms.arm_user_question("own", "lane-7", "Shall I merge the new thing?",
+                                                _stale_surface(), nap=lambda _s: None)
+    finally:
+        triage_arms.question_qid = _real_qid
+    honest = triage_arms.arm_user_question("own", "lane-7", "Shall I merge the new thing?",
+                                           _stale_surface(), nap=lambda _s: None)
+    good &= _red("R12 without the per-question id a STALE pane certifies the new question",
+                 blind.verified is True and honest.verified is False)
+
     print("\n  RED controls: %s" % ("all fired" if good else "SOME DID NOT FIRE"))
     return good
 
@@ -1370,6 +1414,94 @@ def leg_surface_terminal() -> None:
         lr._cmux = real
 
 
+def leg_round7() -> None:
+    print("\n── ROUND 7 — a stale pane, a dated ask, and an unread tail ──")
+
+    # (1) ⛔ THE STALE PANE (P0). The question lane is persistent at index 0, so its tail normally
+    # still shows the PREVIOUS question's brief — and every brief carries the same mandate tokens by
+    # construction. Before `question_qid`, the prior brief satisfied the pane check: `verified: true`
+    # off a question that never landed, and the dedupe (which honours only a prior `verified: true`)
+    # then reported `already-routed` on every later tick — permanently. The fake is the #1187 class:
+    # rc 0 from the transport, nothing painted.
+    def spaces():
+        return [{"id": "own", "name": "lane-7", "index": 1},
+                {"id": "ws_q", "name": triage_arms.QUESTION_LANE, "index": 3}]
+
+    prior = triage_arms.question_brief("lane-7", "Shall I merge the old thing?")
+
+    class NeverPaints(FakeSurface):
+        def send(self, ws, text):
+            self.last_sent[ws] = text
+            return True
+
+    qid = triage_arms.question_qid("lane-7", "Shall I merge the new thing?")
+    ok("the id is stable for one question",
+       qid == triage_arms.question_qid("lane-7", "Shall I merge the new thing?"))
+    ok("…and differs for another question",
+       qid != triage_arms.question_qid("lane-7", "Shall I land the other thing?"))
+    stale = NeverPaints(spaces=spaces(), screens={"ws_q": prior})
+    p = triage_arms.arm_user_question("own", "lane-7", "Shall I merge the new thing?", stale,
+                                      nap=lambda _s: None)
+    ok("a PRIOR question's brief does not certify this one", p.verified is False, p.detail)
+    ok("…and the missing token names THIS question's id",
+       qid in (p.artifact.get("pane_missing") or []), str(p.artifact.get("pane_missing")))
+    ok("…so nothing is asserted as delivered", p.as_dict()["verified"] is False)
+    # Positive control: the SAME call, with a pane that does paint, must verify — otherwise the new
+    # requirement is a blanket refusal rather than a proof.
+    fresh = FakeSurface(spaces=spaces(), screens={"ws_q": ""})
+    p2 = triage_arms.arm_user_question("own", "lane-7", "Shall I merge the new thing?", fresh,
+                                       nap=lambda _s: None)
+    ok("…while the SAME call verifies once the pane paints", p2.verified is True, p2.detail)
+
+    # (2) ⛔ A LIVE ASK WEARING A DATE (P0). `_PAST_HARD` disarmed any clause carrying a temporal
+    # anchor, so the ask's own OBJECT silenced it: seven real approval asks read `not-asked` and
+    # routed `send-continue` into a lane waiting on its owner.
+    for txt in ("Please approve yesterday's expense report.",
+                "Please sign off on the invoice from last week.",
+                "Please confirm the plan from Monday.",
+                "I need your approval for the migration we discussed this morning.",
+                "Awaiting your approval on the vendor quote from last month.",
+                "Please confirm we ship at 14:02.",
+                "Your call on the schema we reviewed last week.",
+                "I'll merge after your approval."):
+        e = ev(lane="lane-7", last_text=txt, lane_verdict="WIP-IDLE", steerable=True)
+        may, r = triage.may_continue(e)
+        ok("a dated ask is still an ask: %r" % txt[:38],
+           triage.asks_owner(txt) == triage.ASKED and may is False, "%s %s" % (may, r.action))
+    # …and the reports the anchor exists for are STILL reports (the split must not over-fire).
+    for txt in ("Merged the PR on your approval at 14:02.",
+                "Per your decision last week, the schema is closed.",
+                "Approved by the rail yesterday.",
+                "As you decided, shipped yesterday.",
+                "Signed off by legal, so it went out."):
+        e = ev(lane="lane-7", last_text=txt, lane_verdict="WIP-IDLE", steerable=True)
+        may, r = triage.may_continue(e)
+        ok("a completed report is not an ask: %r" % txt[:38], may is True,
+           "%s %s" % (may, r.action))
+
+    # (3) ⛔ AN UNREAD TAIL MAY NOT REACH THE DESTRUCTIVE ACTION (P2). `send-continue` was already
+    # refused on UNREAD; `rerun` — the more destructive of the two — was not, so an unreadable tail on
+    # a positively OPEN turn relaunched the lane.
+    r = triage.route(ev(lane="lane-7", last_text="", turn=TURN_OPEN, lane_verdict="WEDGED",
+                        steerable=True))
+    ok("an unreadable tail does not relaunch a lane", r.action == "inspect", r.action)
+    ok("…and the evidence names which ask state it was", "ask=unread" in r.evidence, r.evidence)
+
+    # (4) ⛔ `execute()` WITH NO RELAUNCHER IS A PROOF GAP, NOT A CRASH (P2).
+    rt = triage.Route(route="wedged", subcase="open-turn-never-closes", action="rerun",
+                      proof=triage.PROOFS["rerun"], reason="fixture")
+    raised = None
+    pr = None
+    try:
+        pr = triage_arms.execute(rt, ev(lane="lane-7"), FakeSurface(spaces=spaces()), ws="ws_q")
+    except TypeError as exc:                     # the failure mode under test
+        raised = exc
+    ok("a rerun with no relauncher does not raise", raised is None, str(raised))
+    ok("…and it reports the tool's absence",
+       pr is not None and pr.verified is False and "UNAVAILABLE" in pr.detail,
+       pr.detail if pr else "")
+
+
 LEGS = (
     ("precedence", leg_precedence),
     ("no-continue", leg_no_continue_to_question),
@@ -1386,6 +1518,7 @@ LEGS = (
     ("wiring", leg_wiring),
     ("cli-apply", leg_cli_apply),
     ("surface", leg_surface_terminal),
+    ("round7", leg_round7),
 )
 
 

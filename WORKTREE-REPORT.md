@@ -13,18 +13,19 @@ command is quoted verbatim so it can be re-run.
 
 | command | result |
 |---|---|
-| `python3.12 tools/fleet/triage.test.py` | `PASS=354 FAIL=0` |
-| `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (12 RED controls, all fired) |
-| `/tmp/pyenv4046/bin/python -m pytest scripts/ -q --timeout=300` | `1436 passed, 3 skipped, 1 xpassed in 216.67s` |
+| `python3.12 tools/fleet/triage.test.py` | `PASS=379 FAIL=0` |
+| `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (14 RED controls, all fired) |
+| `uv run --quiet --with pytest --with pytest-timeout python -m pytest scripts/ -q --timeout=180` | `1436 passed, 3 skipped, 1 xpassed in 216.96s` |
 | `python3.12 tools/fleet/liveness.test.py` | `PASS=58 FAIL=0` (+ `every stated count matches the suite (58 tests, 113 mutations)`) |
 | `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | `FAILURES: 1` — **PRE-EXISTING, base-owned** (see below) |
 | `bash scripts/check-farm-drift.sh` | `UNKNOWN — COMPARING AGAINST THE WRONG TREE` (rc 0): the box is pinned at `d5c6dc7530` and this worktree is at `330ac09c0`. Not a red, and not a green — it refuses to compare across a pin, which is the behaviour it documents. |
 
 **pytest was not installed on this box** (`python3.12 -m pip install pytest` → `Errno 13: Permission
 denied: /opt/freestyle/python/lib/python3.12/site-packages/iniconfig`; a `--user` install is refused
-because the interpreter is already a virtualenv). Rather than skip the Python suites, a throwaway venv
-was created at `/tmp/pyenv4046` and pytest/pytest-timeout installed there — that is the interpreter
-behind every `pytest` row above. No repo file was changed to work around it.
+because the interpreter is already a virtualenv). The suites above run through `uv run --with pytest`,
+which needs no install and no repo change. (An earlier version of this table used a throwaway venv at
+`/tmp/pyenv4046`; that path was swept — a `/tmp` interpreter is not a durable way to state a result, so
+the command was replaced with one that can be re-run.)
 
 ## The one red, and why it is not this branch's
 
@@ -63,12 +64,39 @@ open turn + a retry tail → `route=none`; a closed turn + retry tail → `wedge
 open turn + retry tail → `model-retry`/`rerun` (the positive control, still reachable); a real
 `lane-status` child record → `verified=True`; `child_state` alone → `verified=False`, no fabricated child.
 
+## Round 7 — the confirmation review, and two P0s it found in the shipped fixes
+
+A seventh fresh-context reviewer (`71de0a7e2`) was asked to FALSIFY five claims with its own inputs
+rather than re-read the suite. Four claims held; it reproduced two P0s, both in code the earlier rounds
+had written, both re-verified here before anything was applied:
+
+| finding | verdict | evidence |
+|---|---|---|
+| **[P0]** `question-lane-ack` verified off a **stale pane**: the question lane is persistent at index 0, so its tail still showed the PREVIOUS question's brief, and every brief carries the same six mandate tokens by construction. The dedupe honours only a prior `verified: true`, so the non-delivery was then permanent. | **CONFIRMED, FIXED** | measured through `lane-route.py --apply` with a transport that returns rc 0 and never paints: tick 1 `verified: true` off the prior brief, ticks 2–3 `already-routed, verified: true`, and the new question never on the pane. Now `question_qid(lane, question)` emits `qid=<8 hex>` in the brief and `mandate_missing(pane, qid)` requires THAT token, so the retry loop actually waits for this paint. |
+| **[P0]** `_PAST_HARD`'s temporal anchors disarmed a **live** approval ask whose object merely dates → `not-asked` → `send-continue` into a lane waiting on its owner | **CONFIRMED, FIXED** | 7 of 7 measured: "Please approve yesterday's expense report.", "Please sign off on the invoice from last week.", "Please confirm the plan from Monday.", "I need your approval for the migration we discussed this morning.", "Awaiting your approval on the vendor quote from last month.", "Please confirm we ship at 14:02.", "Your call on the schema we reviewed last week." — all `not-asked`, all `may_continue=True`. The anchor now disarms only with a COMPLETION verb in the same clause and no future cue; a denial stays unconditional; a past-decision frame (`per your decision`, `as you decided`, `approved by`, `already approved`) is a report on its own. The cue list also gained the addressed `sign off` (it had only `for sign-off`). |
+| **[P2]** the `rerun`→`inspect` post-pass was keyed on `ASKED` only, so an **UNREAD** tail still reached the destructive action | **CONFIRMED, FIXED** | `Evidence(turn=open, last_text="", lane_verdict="WEDGED")` → `rerun`. Now `inspect`, and the reason names `ask=unread`. `lane-relaunch.py` refused it downstream, which is why it is P2 — but a router may not outsource its own stated safety property. |
+| **[P2]** `execute()` (the documented fixture entry point) raised `TypeError` for `rerun` with its default `relaunch=None` | **CONFIRMED, FIXED** | `arm_rerun` already had the right answer for a box with no tool (`None` → UNAVAILABLE, verified False); `execute()` now supplies it instead of crashing. |
+| **[P2]** `test-setup-no-nesting.sh` exits 1 at this head | **PRE-EXISTING, base-owned** | the reviewer reproduced it against `git archive origin/main` (`MAIN_EXIT=1`, same single `REMOVED: script:conflict-rebase.py`); this branch's two farm entries are on the right side of the pin and appear as neither `ADDED` nor `REMOVED`. |
+
+Claims that HELD under the reviewer's own inputs: `send-continue` unreachable for every ask shape it
+invented (approval ask with no `?`, question + several status paragraphs, `?` inside a URL/path token
+correctly NOT counted, and every turn state); the other three arms' proofs (`child-handoff-record`
+written-then-re-read, `transcript-growth` with no baseline, order-based `pane-ready`); no kill/terminate
+call site anywhere in the three files; the consumer non-inert (router absence logged every tick, and
+three consecutive ticks produced exactly ONE send, then `already-routed`); and the farm decision
+(`lane-relaunch.py` correctly withheld — it hard-requires `lane-status.py`, itself withheld by #1553).
+
+Both P0 fixes are pinned by RED controls that prove them load-bearing: **R11** restores the
+unconditional date anchor and requires the same input's answer to change to `not-asked`; **R12** removes
+the nonce and requires the stale pane to certify the new question (`verified: true`). With the fixes in
+place both mutants are caught.
+
 ## What changed
 
 ```
 tools/fleet/triage.py          NEW  the router: precedence, wedged subcases, remedies, proof table
 tools/fleet/triage_arms.py     NEW  the three arms, each proving its effect at its artifact
-tools/fleet/triage.test.py     NEW  hermetic suite, 354 assertions, 12 RED controls
+tools/fleet/triage.test.py     NEW  hermetic suite, 379 assertions, 14 RED controls
 scripts/lane-route.py          NEW  operator CLI (route / --json / --apply)
 scripts/turn-end.py            MOD  gates its WIP nudge on route_gate(), and APPLIES a
                                     user-question route (batched, capped, bounded, logged)

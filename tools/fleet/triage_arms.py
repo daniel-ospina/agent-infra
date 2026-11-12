@@ -144,6 +144,22 @@ def _digest(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def question_qid(lane: str, question: str) -> str:
+    """A short, stable id for ONE question — the token that binds a pane read to THIS brief.
+
+    ⛔ WHY A NONCE AND NOT JUST THE MANDATE TOKENS (fresh-context review round 7, #4046 P0). The
+    question lane is PERSISTENT and pinned at index 0, so its 60-line tail normally still shows the
+    PREVIOUS question's brief — and every brief carries the same six mandate tokens by construction,
+    which means `mandate_missing(pane)` was satisfied by the question before this one. Measured
+    through the shipped CLI with a transport that returns rc 0 but never paints: tick 1 was recorded
+    `verified: true` off the stale pane, and the dedupe (which only honours a prior `verified: true`)
+    then reported `already-routed, verified: true` on every later tick — the question never reached
+    the owner and NOTHING would ever retry it. Derived from (lane, question) so it is stable across
+    ticks (the dedupe depends on that) and different for every question.
+    """
+    return "qid=%s" % _digest((lane or "") + "\x00" + (question or ""))[:8]
+
+
 # ── the question brief ──────────────────────────────────────────────────────────────────────────
 def question_brief(lane: str, question: str, ws: str = "") -> str:
     """Compose the question-lane brief: the research mandate, the contradiction test, the four parts.
@@ -154,6 +170,10 @@ def question_brief(lane: str, question: str, ws: str = "") -> str:
     q = " ".join((question or "").split())
     return (
         "USER-QUESTION LANE — a lane is waiting on a decision, and you own getting it answered. "
+        # ⛔ THE ID IS EARLY ON PURPOSE (round 7, #4046 P0): a transport that truncates still shows
+        # it, and `mandate_missing` separately requires the mandate tokens, so truncation is caught
+        # by the other check and staleness by this one.
+        "%s " % question_qid(lane, question) +
         "Lane: %s%s. It is WAITING: do not tell it to continue, do not kill it, and do not count it "
         "as capacity. "
         "RESEARCH FIRST — mandatory, before the question reaches the owner: run the `research` skill. "
@@ -208,10 +228,18 @@ def payload_for(route, ev, ws: str = "") -> str:
     return ""
 
 
-def mandate_missing(brief: str) -> list:
-    """Which mandate tokens the brief does NOT carry. Empty list = the brief is routed, not relayed."""
+def mandate_missing(brief: str, qid: str = "") -> list:
+    """Which mandate tokens the brief does NOT carry. Empty list = the brief is routed, not relayed.
+
+    `qid` is the per-question nonce (`question_qid`). When given, the artifact must ALSO show THAT
+    token: the mandate tokens alone are satisfied by any brief this arm ever sent, so on the
+    persistent question lane they are a *relayed* proof at best (round 7, #4046 P0).
+    """
     low = " ".join((brief or "").lower().split())
-    return [tok for tok in QUESTION_MANDATE if tok.lower() not in low]
+    missing = [tok for tok in QUESTION_MANDATE if tok.lower() not in low]
+    if qid and qid.lower() not in low:
+        missing.append(qid)
+    return missing
 
 
 # ── arm 1: the user-question lane ──────────────────────────────────────────────────────────────
@@ -228,6 +256,7 @@ def arm_user_question(ws: str, lane: str, question: str, surface: Surface,
          change that "helpfully" nudges the owner lane is visible here rather than only in review.
     """
     brief = question_brief(lane, question, ws)
+    qid = question_qid(lane, question)
     missing = mandate_missing(brief)
     if missing:
         # Compose-time failure: never send a brief that cannot be shown to carry the mandate.
@@ -284,7 +313,10 @@ def arm_user_question(ws: str, lane: str, question: str, surface: Surface,
     for attempt in range(3):
         pane = surface.screen_tail(qws, 60)
         if pane is not None:
-            pane_missing = mandate_missing(pane)
+            # ⛔ BOUND TO *THIS* QUESTION (round 7, #4046 P0). See `question_qid`: without it the
+            # previous question's brief certifies this one, and the dedupe makes the non-delivery
+            # permanent. With it, the retry loop actually waits for THIS paint to appear.
+            pane_missing = mandate_missing(pane, qid)
             if not pane_missing:
                 break
         if attempt < 2:
@@ -310,7 +342,7 @@ def arm_user_question(ws: str, lane: str, question: str, surface: Surface,
                  {"lane": lane, "owner_ws": ws, "question_ws": qws, "created": created,
                   "index": idx, "index_want": QUESTION_LANE_INDEX, "move_rc": moved_rc,
                   "moved": moved, "sent": sent, "brief_sha": _digest(brief),
-                  "pane_missing": pane_missing,
+                  "pane_missing": pane_missing, "qid": qid,
                   "sent_text_missing": mandate_missing(sent_text),
                   "owner_lane_sent_anything": _sent_to(surface, ws)},
                  sent=sent)
@@ -540,7 +572,12 @@ def execute(route, ev, surface: Surface, *, ws: str = "", dispatch=None, relaunc
         # requires a field the producer actually emits.
         return arm_child(ev.lane, child or {}, state_dir=state_dir)
     if action == "rerun":
-        return arm_rerun(ev.lane, ws, relaunch)
+        # ⛔ `execute()` IS THE FIXTURE ENTRY POINT AND MUST BE TOTAL (round 7, #4046 P2). With the
+        # default `relaunch=None` this raised `TypeError: 'NoneType' object is not callable` out of
+        # the documented entry point, when `arm_rerun` already has the right answer for a box with no
+        # tool (`None` -> UNAVAILABLE, verified False). A fixture that omits the injected relauncher
+        # should get a proof GAP, not a crash the suite reports as an error.
+        return arm_rerun(ev.lane, ws, relaunch or (lambda _ws: None))
     return arm_reading(action, route.reason,
                        {"lane": ev.lane, "route": route.route, "subcase": route.subcase})
 

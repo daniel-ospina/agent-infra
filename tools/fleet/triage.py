@@ -184,11 +184,34 @@ _HANDOFF_I18N = ("quedo a la espera", "esperando tu", "espero tu", "avísame", "
 #     approval." is an ask, "Merged the PR on your approval at 14:02." is a report. Measured before
 #     this split: adding `on your approval` to a single cue list read the FIRST as `not-asked` and
 #     routed a waiting lane to `send-continue` — the harm, introduced by the fix for its mirror.
-_PAST_HARD = re.compile(
+# ⛔ A TEMPORAL ANCHOR IS NOT A DISARM ON ITS OWN (fresh-context review round 7, #4046 P0).
+# The anchor is scoped to the CLAUSE, but the decision an ask refers to is not: "Please approve
+# yesterday's expense report." carries `yesterday`, and an unconditional `_PAST_HARD` read it as a
+# report — measured, SEVEN live approval asks ("Please sign off on the invoice from last week.",
+# "Please confirm the plan from Monday.", "Awaiting your approval on the vendor quote from last
+# month.", "Please confirm we ship at 14:02.", …) all returned `not-asked` and routed
+# `idle-continue`/`send-continue` into a lane waiting on its owner. The fix for the report's mirror
+# had created the ask false-negative, in the one direction this module says it must never fail.
+# So the anchor disarms only when the same clause ALSO reports a COMPLETION, and carries no future
+# cue: "Merged the PR on your approval at 14:02." is still a report, "Please approve yesterday's
+# expense report." is an ask. A DENIAL denies the cue itself, so it stays unconditional.
+_PAST_HARD_DENIAL = re.compile(
+    r"\b(?:nothing needs your|no need for your|doesn'?t need your|does not need your|"
+    r"never needed your)\b")
+# ⛔ A PAST-DECISION FRAME IS A REPORT ON ITS OWN (fresh-context review round 7, #4046 P2). "Per your
+# decision last week" / "As you decided" / "already approved" / "approved by" name a decision
+# already taken and cannot BE an ask. Kept separate from `_PAST_HARD_ANCHOR` because that list also
+# holds "after your approval", which is a live ASK in the future tense ("I'll merge after your
+# approval.") and so must stay completion-gated.
+_PAST_HARD_FRAME = re.compile(
+    r"\b(?:already approved|approved by|as you decided|per your decision|"
+    r"your decision (?:was|stood))\b")
+_PAST_HARD_ANCHOR = re.compile(
     r"\b(?:yesterday|last (?:night|week|month)|this morning|on monday|from monday|earlier today|"
-    r"after your (?:approval|decision|call)|at \d{1,2}:\d{2}|previously|already approved|"
-    r"approved by|as you decided|per your decision|your decision (?:was|stood)|"
-    r"nothing needs your|no need for your|doesn'?t need your|does not need your|never needed your)\b")
+    r"after your (?:approval|decision|call)|at \d{1,2}:\d{2}|previously)\b")
+_COMPLETION = re.compile(
+    r"\b(?:merged|shipped|approved|decided|landed|closed|pushed|deployed|committed|completed|"
+    r"finished|done|went through|ran|wrote|sent|opened|removed|added|fixed|recorded|signed)\b")
 _PAST_SOFT = re.compile(
     r"\b(?:matched your|recorded your|went through|was your call|had approved|has approved|"
     # ⛔ NOT "on your approval" (round 6, #4046 P0). It is the ASK in "I'm blocked on your approval",
@@ -220,9 +243,12 @@ def _clauses(sent: str) -> list:
 
 
 def _disarmed(low: str) -> bool:
-    """Does THIS CLAUSE report something already decided? (see `_PAST_HARD`/`_PAST_SOFT`)"""
-    if _PAST_HARD.search(low):
+    """Does THIS CLAUSE report something already decided? (see `_PAST_SOFT`/`_PAST_HARD_*`)"""
+    if _PAST_HARD_DENIAL.search(low) or _PAST_HARD_FRAME.search(low):
         return True
+    if _PAST_HARD_ANCHOR.search(low):
+        # An anchor needs a COMPLETION to be a report — and a future cue vetoes even that.
+        return bool(_COMPLETION.search(low)) and not _FUTURE_CUE.search(low)
     return bool(_PAST_SOFT.search(low)) and not _FUTURE_CUE.search(low)
 
 
@@ -265,6 +291,10 @@ _HANDOFF = (
     "once you've approved", "on your approval", "for your approval", "pending your approval",
     "pending your decision", "please confirm", "please approve", "your confirmation",
     "your approval", "on your go",
+    # ⛔ "sign off" (round 7, #4046 P0). "Please sign off on the invoice from last week." read
+    # `not-asked`: the list had `for sign-off` / `for your sign-off` but not the ADDRESSED verb, so a
+    # live approval ask routed `send-continue`. Spaced form only — "signed off by legal" is a report.
+    "sign off",
     # ⛔ THE GO-AHEAD FAMILY (round 4, #4046 P0). Measured through the real consumer before this
     # line: "Migration written and tested. I'll wait for your go-ahead before applying it to prod."
     # returned `not-asked`, so `route_gate` said `may_nudge=True` and `turn-end.py` typed
@@ -581,13 +611,20 @@ def route(ev: Evidence) -> Route:
     """
     ask = _question(ev)
     r = _route_ladder(ev, ask)
-    if ask == ASKED and r.action == "rerun":
+    # ⛔ `UNREAD` BELONGS IN THE VETO TOO (fresh-context review round 7, #4046 P2). The tail could not
+    # be read, so it is not a clean one — the same rule that already refuses `send-continue` on
+    # `UNREAD` in the ladder (`:685`). Measured before this: an empty tail on a positively OPEN turn
+    # with a `WEDGED` verdict reached `wedged/open-turn-never-closes` -> `rerun`, i.e. the MORE
+    # destructive of the two actions was the one the unread state still licensed. It was not
+    # destructive only because `lane-relaunch.py` re-checks the pane itself; a router may not rely on
+    # a downstream tool for its own stated safety property.
+    if ask in (ASKED, UNREAD) and r.action == "rerun":
         return Route(
             route="wedged", subcase=r.subcase, action="inspect", proof=PROOFS["inspect"],
             reason="the wedge reading and the tail disagree: the turn is still open AND its last "
-                   "words ask the owner, so a relaunch would destroy the question before it is "
-                   "answered — inspect the lane and route the question instead",
-            evidence=(r.evidence or "") + " ask=asked",
+                   "words ask the owner (ask=%s), so a relaunch would destroy the question before "
+                   "it is answered — inspect the lane and route the question instead" % (ask,),
+            evidence=(r.evidence or "") + " ask=" + ask,
         )
     return r
 
