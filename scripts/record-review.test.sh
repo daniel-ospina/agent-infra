@@ -3104,7 +3104,7 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:7866 at this head — RE-DERIVE it, do not trust the number: a bare
+#      (scripts/record-review.sh:7888 at this head — RE-DERIVE it, do not trust the number: a bare
 #      line citation here has rotted before, and this comment is not what makes
 #      the assertion true). One command answers it (origin/main bd1b205d is :6225):
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
@@ -5914,13 +5914,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4084 :5810 :8184 :8358, plus a comment mention at :3953; `14.1c-CITE` below
+#     CITE-CHECK: :4106 :5832 :8206 :8380, plus a comment mention at :3975; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:4062) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:4084) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4084) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4106) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8184). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8206). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5946,7 +5946,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8184` / `:8358` — CITE-CHECK: :8184 :8358 — re-derived by the
+#     this head the predicates are `:8206` / `:8380` — CITE-CHECK: :8206 :8380 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6063,7 +6063,7 @@ assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marke
 #      previously claimed "`-qxF`->`-qF` at the dedup read left the suite at
 #      PASS=921 FAIL=0". THERE IS NO GREP AT THE DEDUP READ — not anchored, not
 #      unanchored: the loop compares whole bodies with `[ "$_body" = "$marker" ]`
-#      (scripts/record-review.sh:4006 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
+#      (scripts/record-review.sh:4028 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
 #      have been measured. The mutant that actually makes (b2) meaningful is replacing
 #      that equality with a SUBSTRING test (`case "$_body" in *"$marker"*)`): it
 #      reddens (b2) — which expects 1 POST and would get 0.
@@ -6848,14 +6848,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :4062) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :4084) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4084) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :4106) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :5810 :8184 :8358 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :5832 :8206 :8380 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -10555,7 +10555,7 @@ assert_eq "$RECORD_RC" "3" "20h75 a right endpoint carrying a SELECTOR is a tip-
 assert_not_contains "$RECORD_ERR" "EMPTY range" "20h75 …and the author is NOT told they stated an empty range (their endpoint was an elder commit)"
 # ⛔ THE ROW'S THIRD ASSERTION WAS DELETED, NOT RE-POINTED (thirtieth cycle, round 3, finding 3 — MEASURED).
 #    It read `assert_not_contains … "both endpoints resolve to the attested head"`, and THIS COMMIT
-#    removed that clause from the recorder's empty-range sentence (`:3743`), so the string can no longer
+#    removed that clause from the recorder's empty-range sentence (`:3765`), so the string can no longer
 #    be emitted by ANY code path: the assertion passed on the pre-fix code, on the head, and under every
 #    mutant in the matrix, while reading to the next reviewer as cover of the sentence. That is the
 #    `#3442` rule-3 shape — an assertion whose value cannot vary under any mutation of the diff is dead
@@ -11605,6 +11605,63 @@ I re-read HEAD@{0}..${DG_HEAD} end to end, which is the range being recorded."
 assert_eq "$RECORD_RC" "3" "20h104d HEAD@{0}..HEAD names the attested head twice (frame-independent), so it is an EMPTY range — REFUSED (rc 3), the frame-consistency row"
 assert_contains "$RECORD_ERR" "states an EMPTY range" "20h104d …and refuses it as what it is, in every frame"
 [ -f "$(Q2 $EH216)" ] && bad "20h104d FAIL-OPEN: the identity spelling on BOTH ends minted a signed clean" || ok "20h104d no record was written"
+
+# ⛔ 20h105 — THREE DOTS ARE NOT TWO (thirtieth review cycle, round 10; P2 — MEASURED, and a FALSE BLOCK
+#       this lane introduced one round earlier). The two-endpoint pattern admits a run of two OR THREE dots,
+#       and round 8 applied `merge-base --is-ancestor R L` to whatever it captured: true for `L..R`
+#       (reachable from R, not from L), FALSE for `L...R`, which is the SYMMETRIC DIFFERENCE and is empty
+#       only when the two ends are the SAME COMMIT. So `HEAD...anc` — two commits — was refused and told
+#       "states an EMPTY range … names ZERO commits", while `HEAD...afterhead` was accepted: the verdict
+#       followed ancestry, which a three-dot claim does not ask about. The equality arm above IS the
+#       three-dot test and stays; only the ancestry half is gated on the separator, which is what M104's
+#       cell measures. `HEAD...HEAD` (20h61c) is still refused, and must be — it is genuinely empty.
+assert_eq "$(git -C "$DG" rev-list --count "$DG_HEAD...anc" 2>/dev/null || true)" "2" "20h105 setup: HEAD...anc (the SYMMETRIC DIFFERENCE) holds commits"
+# ⛔ THE FIRST CUT OF THIS ROW ASSERTED AN ACCEPTANCE AND ITS BODY CARRIED A HEX DECOY PAIR, so the
+#       range-agreement arm answered (DIFFERENT range) whatever the ancestry test did — a row that could
+#       not measure its own subject. MEASURED with a probe that dumps the recorder's stderr: the three-dot
+#       claim now reaches the DIFFERENT-range sentence, which is the accurate one for an artifact whose
+#       extra stated range is a symmetric difference across the recorded range. The pin is therefore the
+#       SENTENCE: it must NOT be the empty-range accusation (the round-8 false sentence) and must be the
+#       range-agreement one. M104's note records why no mutant can flip the rc alone.
+EH217=425658; rm -f "$(Q2 $EH217)"
+run_record_delta $EH217 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42565901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I compared HEAD...anc as well; the symmetric difference between the two is not empty."
+# ⛔ THE VERDICT IS NOT THE CARRIER HERE, THE SENTENCE IS (M104's note): with the separator gate the
+#       three-dot claim reaches the range-agreement arm or none at all; without it, the empty-range arm.
+#       Both endings are legitimate for the DIFFERENT ranges a symmetric difference states — what is NOT
+#       legitimate, and what round 8 shipped, is telling the author their three-dot claim names ZERO
+#       commits. So the row pins the property and reports which legitimate arm answered.
+if printf '%s' "$RECORD_ERR" | command grep -qF 'states an EMPTY range'; then
+  bad "20h105 FALSE SENTENCE: a three-dot claim with commits was told it names ZERO commits"
+else ok "20h105 a three-dot claim with commits is never told it names zero commits"; fi
+case "$RECORD_RC" in
+  0) ok "20h105 …and a mention of it alongside the stated delta range does not cost the artifact its record"
+     [ -f "$(Q2 $EH217)" ] || bad "20h105 the run reported acceptance but wrote no record" ;;
+  3) if printf '%s' "$RECORD_ERR" | command grep -qF 'states a DIFFERENT range'; then
+       ok "20h105 …returned rc 3 as the range agreement it breaks (EVERY stated range is checked), not as an empty range"
+     else bad "20h105 rc 3 for an unforeseen reason: read the recorder's sentence before re-baselining"; fi
+     [ -f "$(Q2 $EH217)" ] && bad "20h105 FAIL-OPEN: refused but still minted a signed clean" || ok "20h105 no record was written" ;;
+  *) bad "20h105 unexpected rc=$RECORD_RC" ;;
+esac
+# ⛔ 20h106 — THE DECLARED COST: A WRITTEN-BUT-UNRESOLVABLE RIGHT END READS AS AN OMISSION (round 10; P3).
+#       `HEAD .. zzz` (a typo'd ref the author DID write) is refused with "the endpoint is omitted", while
+#       the ABUTTING `HEAD..zzz` is accepted — the same claim, two verdicts, and the spaced one accused of
+#       an omission it does not contain. This row PINS THE SHIPPED SENTENCE on purpose: the arm cannot
+#       distinguish a written-but-unresolvable word from the PROSE that follows an ordinary omission
+#       (`@{0}.. and the rest was not read`), and the first cut of the fix that tried turned eight refusal
+#       vectors green-to-red. So the row is a tripwire, not an endorsement — improving the sentence must
+#       deliberately flip it.
+EH218=425660; rm -f "$(Q2 $EH218)"
+run_record_delta $EH218 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42566101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I also checked HEAD .. zzz, which is my own typo for a ref that does not exist here."
+assert_eq "$RECORD_RC" "3" "20h106 HEAD .. zzz (a written word that does not resolve) is still REFUSED — fail-closed, as shipped"
+if printf '%s' "$RECORD_ERR" | command grep -qF 'the endpoint is omitted'; then
+  ok "20h106 and the shipped SENTENCE still calls it omitted — the declared cost this row pins (fixing it must flip this row)"
+else bad "20h106 the sentence changed: re-read the declared cost before re-baselining this row"; fi
 
 # ⛔ THE FALSE-BLOCK SIDE: the test is `is-ancestor R L`, so a claim whose right end is a DESCENDANT is a
 #       real range with commits and must stay ACCEPTED. Without this row the widened test could be "any
@@ -12809,7 +12866,7 @@ I only actually reviewed HEAD@1..HEAD; the rest was not read."
 #       20h103 measures. The guard is GATED (head on the left, no selector, no past-the-head left end) so
 #       that the tip-relative and past-the-head populations keep their own, accurate sentences; those
 #       gates are what 20h75/20h93/M87 measure, and the first cut of this test reddened all three.
-MUT="$(mk_mutant noancestorright '      elif [ "$_elsha" = "$to" ] && [ "$_tiprel" = 0 ] && [ "$_afterhead" = 0 ] \
+MUT="$(mk_mutant noancestor '      elif [ "$_esep" = ".." ] && [ "$_elsha" = "$to" ] && [ "$_tiprel" = 0 ] && [ "$_afterhead" = 0 ] \
            && delta_git "$root" merge-base --is-ancestor "$_ersha" "$_elsha" 2>/dev/null; then' '      elif false; then')"
 mut_check "M102 a two-endpoint claim is empty for ANY ancestor on the right, not only when both ends are the head" 425642 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42564301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD..anc and nothing else."
@@ -12876,11 +12933,14 @@ I only actually reviewed ..anc and nothing else."
 MUT="$(mk_mutant nooperandafter '        if [ -n "$_olwsha" ]; then' '        if false; then')"
 mut_check "M95 the dots must not sit between two operands, so a spaced two-endpoint claim is not refused as an omitted endpoint" 425584 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42558501" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I compared HEAD .. ${_dg_orphan:0:12} and it is an unrelated lineage, not part of this range."
-# M103 — AN IDENTITY REFLOG POSITION ON THE LEFT IS STILL THE HEAD (P1, thirtieth review cycle round 9).
-#       The arm recognises `HEAD@{0}`/`@{0}`/`HEAD@{now}` as the attested head (`_lid`) and then must
-#       RESOLVE the claim to it: with the assignment dropped, `_elsha` stays empty, the `continue` walks
-#       past every emptiness test, and `HEAD@{0}..anc` — nought commits — mints a signed `clean`. The cell
-#       asserts the shipped REFUSAL (20h104's vector) and the mutant must accept it.
+# M104 RETIRED (thirtieth review cycle, round 10) — NO MUTANT CAN CARRY THIS ONE, and the reason is the
+#       measurement. Dropping the separator gate (`_esep`) re-applies `merge-base --is-ancestor` to a
+#       THREE-dot claim, and the claim is refused either way: with the gate it hits the range-agreement
+#       arm, without it the empty-range arm — same rc 3, different SENTENCE. `mut_check` grades the exit
+#       status, so the cell would report vacuity no matter which way it is declared; the carrier is the
+#       sentence, and 20h105 asserts it directly (no `states an EMPTY range`, yes `states a DIFFERENT
+#       range`). A cell that can only certify a status both branches share certifies nothing — the
+#       M43/M48/M96 precedent — so the guard is pinned by a sentence row instead of a mutant.
 # M103 — AN IDENTITY REFLOG POSITION ON THE LEFT IS STILL THE HEAD (P1, thirtieth review cycle round 9).
 #       The arm recognises `HEAD@{0}`/`@{0}`/`HEAD@{now}` as the attested head (`_lid`) and must then
 #       RESOLVE the claim to it: with the assignment dropped, `_elsha` stays empty, `_elsha`-empty walks

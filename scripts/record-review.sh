@@ -1670,7 +1670,7 @@ _tiproot() { # <token> -> the token re-rooted on the attested head, or ""
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _elres="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _esep="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -3269,6 +3269,15 @@ $m"
     while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})(${_dident}*)[[:space:]]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@|${_dref})((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})*) ]]; do
       _elhs="${BASH_REMATCH[$_g_op1]}${BASH_REMATCH[$_g_dident1]}"
       _erhs="${BASH_REMATCH[$_g_op2]}${BASH_REMATCH[$_g_chain2]}"
+      # ⛔ THE DOTS ARE NOT ALL THE SAME SEPARATOR (thirtieth review cycle, round 10 — MEASURED, a FALSE
+      # BLOCK this lane introduced in round 8). The pattern admits a run of two OR THREE dots, and the
+      # ancestry test below is the TWO-DOT predicate: `L..R` is empty when R is an ancestor of L, but
+      # `L...R` is the SYMMETRIC DIFFERENCE, empty only when L and R are the same commit. Applying
+      # `merge-base --is-ancestor` to a three-dot claim refused `HEAD...anc` — which has commits — and told
+      # its author the claim "states an EMPTY range … names ZERO commits": a false sentence about their
+      # own text, the class this file calls worse than the gap. The first arm (equality) IS the three-dot
+      # test and stays: a symmetric difference of one commit with itself is empty either way.
+      _esep="${BASH_REMATCH[0]}"; _esep="${_esep//[!.]/}"
       _eranges="${_eranges#*"${BASH_REMATCH[0]}"}"
       # ⛔ THE REFUSAL QUOTES WHAT WAS WRITTEN, NOT A RECONSTRUCTION OF IT (twenty-second cycle, P2 —
       # MEASURED). The message was rebuilt from the captured TOKENS (`"${_elhs}..${_erhs}"`), and the
@@ -3313,19 +3322,17 @@ $m"
       # so the range is empty in EVERY frame, and this test needs no checkout at all.
       # ⛔ AN IDENTITY REFLOG POSITION ON THE HEAD IS STILL THE HEAD ON THE LEFT (thirtieth review cycle,
       # round 9 — MEASURED, a FAIL-OPEN this arm's own equality test hid). `HEAD@{0}`/`@{0}`/`HEAD@{now}`
-      # are identity spellings of the attested head — the MIRROR arm already says so in as many words
-      # ("AN IDENTITY REFLOG POSITION ON A SHA IS STILL THE SAME COMMIT") — but here the token missed the
-      # identity regex as written, the split below handed `@{0}` to `rev-parse` as `<sha>@{0}` (which git
-      # REFUSES: a reflog position needs a ref), and `[ -n "$_elsha" ] || continue` DROPPED the claim
-      # before any emptiness test could see it. So `HEAD@{0}..anc`, `@{0}..anc` and `HEAD@{now}..anc` —
-      # nought commits each — minted a signed `clean`, while `@{0}..HEAD` and the SPACED
-      # `HEAD@{0} .. anc` were refused: the same claim, decided by how it was spelled and spaced. Strip
-      # the identity position into a RESOLUTION copy (the raw text stays for the message, so a refusal
-      # never quotes the author's claim as something they did not write).
-      _elres="$_elhs"
-      while [[ "$_elres" =~ ^(.+)@\{0+\}$ ]]; do _elres="${BASH_REMATCH[1]}"; done
+      # are identity spellings of the attested head and `_dident` already matches them, so `_lid` was
+      # ALREADY 1 — the knowledge was simply thrown away: the split below handed `@{0}` to `rev-parse` as
+      # `<sha>@{0}` (which git REFUSES: a reflog position needs a ref), and `[ -n "$_elsha" ] || continue`
+      # DROPPED the claim before any emptiness test could see it. So `HEAD@{0}..anc`, `@{0}..anc` and
+      # `HEAD@{now}..anc` — nought commits each — minted a signed `clean`, while `@{0}..HEAD` and the
+      # SPACED `HEAD@{0} .. anc` were refused: the same claim, decided by how it was spelled and spaced.
+      # The load-bearing half of the fix is therefore the RESOLUTION below, not the recognition: an earlier
+      # cut of this comment claimed the identity regex MISSED the token and added a strip loop for it —
+      # MEASURED, `_lid` is 1 PRE-strip for all three spellings, the loop was a no-op, and it is gone.
       _lid=0; _rid=0
-      [[ "$_elres" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _lid=1
+      [[ "$_elhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _lid=1
       [[ "$_erhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _rid=1
       if [ "$_lid" = 1 ] && [ "$_rid" = 1 ]; then
         _emptyrange=1; _emptystated="${_estated:-${_elhs}..${_erhs}}"; break
@@ -3415,7 +3422,7 @@ $m"
       # WRITTEN on the left and an ANCESTOR of it on the right.
       if [ "$_ersha" = "$_elsha" ] && [ "$_elsha" = "$to" ]; then
         _emptyrange=1; _emptystated="${_estated:-${_elhs}..${_erhs}}"; break
-      elif [ "$_elsha" = "$to" ] && [ "$_tiprel" = 0 ] && [ "$_afterhead" = 0 ] \
+      elif [ "$_esep" = ".." ] && [ "$_elsha" = "$to" ] && [ "$_tiprel" = 0 ] && [ "$_afterhead" = 0 ] \
            && delta_git "$root" merge-base --is-ancestor "$_ersha" "$_elsha" 2>/dev/null; then
         _emptyrange=1; _emptystated="${_estated:-${_elhs}..${_erhs}}"; break
       fi
@@ -3473,6 +3480,11 @@ $m"
       _opends="$_olpost"
       _olpost="${_olpost#"${_olpost%%[![:space:]]*}"}"
       _olword="${_olpost%%[[:space:]]*}"
+      # ⛔ RESET THE RESOLVED WORD WITH IT: `_olw`/`_olwsha` are assigned only when a word was written, so a
+      # previous iteration's value would otherwise survive into an iteration that wrote none — and the
+      # omission guard below reads exactly that pair. (MEASURED as a latent staleness, not a live defect:
+      # the guard is keyed on `_olword` for the same reason.)
+      _olw=""; _olwsha=""
       # The same word-or-word-plus-selector rule as the two-endpoint arm above, and the same git-decided
       # case variant (`Head..` with a tag `Head` at another commit is not `HEAD..`): `_tipvariant`
       # normalises only when the repo has no ref of that exact name (twenty-third cycle, P2).
@@ -3581,6 +3593,16 @@ $m"
       # end is an INTERIOR ancestor (`<midref>..HEAD` — a strictly narrower claim) is not refused by
       # either arm; only EMPTY ranges and tip-relative narrowings are, and a "narrower" test here would
       # have to refuse the legitimate `<base>~1..HEAD` population the tip arm deliberately accepts.
+      # ⛔ A WRITTEN-BUT-UNRESOLVABLE WORD READS AS AN OMISSION HERE, AND THAT IS A DECLARED COST, NOT A
+      # FIX (round 10 — MEASURED, and the fix measured WORSE). `HEAD .. zzz` (a typo'd ref the author DID
+      # write) is refused with "the endpoint is omitted, so it defaults to the head", while the ABUTTING
+      # `HEAD..zzz` is accepted: the same claim, two verdicts, and the spaced one accused of an omission
+      # it does not contain. The obvious discriminator — skip when a word was written — CANNOT be used:
+      # in this arm the text after the dots is PROSE for the ordinary omission (`@{0}.. and the rest was
+      # not read`), so "a word follows" is true for EVERY vector the arm exists for. Trying it anyway
+      # (round 10, first cut) turned eight refusal vectors green-to-red (20h72/72b/76/76b/78/78b/97, M68/
+      # M95/M97/M100 vacuous) — a fail-CLOSED sentence traded for eight fail-OPEN verdicts. The verdict is
+      # fail-closed and the sentence is the cost; stated here rather than rediscovered.
       if [ "$_osha" = "$to" ]; then
         _emptyrange=1; _emptystated="${_olhs}..HEAD (the endpoint is omitted, so it defaults to the head)"; break
       fi
