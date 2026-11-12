@@ -196,13 +196,22 @@ GENERATED_FILES = (
         "verify": "node scripts/check-workflow-lock.mjs",
         "why": "a region digest of the workflow it describes (the check's own UPDATE_COMMAND)",
     },
-    {
-        "match": "extensions/main-worktree-guard/sanctioned-scripts.pin.json",
-        "cmd": "node extensions/main-worktree-guard/test-sanctioned-identity.mjs --cut",
-        "verify": "node extensions/main-worktree-guard/test-sanctioned-identity.mjs",
-        "why": "sha256 of the audited bytes of each sanctioned script (the suite's own --cut)",
-    },
 )
+
+# ⛔ MEASURED AND DELIBERATELY EXCLUDED: `extensions/main-worktree-guard/sanctioned-scripts.pin.json`.
+# It is a generated file by every definition above, and #4012 names it as the conflict that
+# "matched neither side". But its own `--cut` CANNOT regenerate a CONFLICTED pin, because it
+# PARSES the pin it is about to rewrite:
+#
+#     $ node extensions/main-worktree-guard/test-sanctioned-identity.mjs --cut
+#     ❌ cut: Expected double-quoted property name in JSON at position 1151 (line 8 column 1)
+#
+# (measured on #3698's replay, 2026-11-12 — the conflict markers themselves are the unparseable
+# bytes). Declaring it here would therefore refuse every time while publishing NOTHING (a
+# generator failure is not a `content-conflict`, so it takes no label and writes no comment):
+# a refusal nobody sees, on a PR that needed a human. The correct repair is in the GENERATOR —
+# a `--cut` that does not depend on the file it rewrites — and that is guarded code (it is the
+# pin that makes a sanctioned script's byte-identity unforgeable), so it is not changed here.
 
 # Bounded so a generator that keeps re-conflicting cannot hold a cap slot forever. Each round
 # resolves one stopped commit, so this is generous for a real replay and finite for a loop.
@@ -1186,7 +1195,12 @@ def main(argv: list[str]) -> int:
                             "kind": r.kind, "detail": r.detail})
             if args.dry_run:
                 continue
-            if r.kind == "content-conflict":
+            # ⛔ EVERY REFUSAL THAT NEEDS A HUMAN MUST BE PUBLISHED — a generator that could not
+            # produce a value is the SAME demand on a human as a content conflict, and leaving it
+            # out took no label and wrote no comment: a refusal nobody sees, on a PR that needed
+            # someone. (Measured while wiring the pin entry: `--cut` cannot regenerate a CONFLICTED
+            # pin, so that entry was withdrawn — see GENERATED_FILES — but the class stays covered.)
+            if r.kind in ("content-conflict", "generated-regenerate-failed"):
                 try:
                     add_label(n, args.repo, LABEL)
                 except Unreadable as e:
@@ -1426,17 +1440,33 @@ def _success_body(n: int, res: dict, before: tuple[str, str], after: tuple[str, 
 
 
 def _refusal_body(n: int, pr: dict, r: Refused) -> str:
+    # ⛔ THE HEADLINE MUST MATCH THE KIND. A generator failure is not "two intents disagree" —
+    # telling a reader to resolve a conflict that is really a broken regeneration sends them to
+    # the wrong place, and the detail line is the only thing that names the real fault.
+    generated = r.kind == "generated-regenerate-failed"
+    head = (
+        f"The rebase of `{pr['headRefName']}` onto `main` stopped on a **generated file that could "
+        f"not be regenerated**, so this bot stops." if generated else
+        f"The rebase of `{pr['headRefName']}` onto `main` hits a **content conflict**, so this bot stops."
+    )
+    tail = (
+        "A generated file has no intent to weigh — its content is a function of the tree — so this "
+        "bot regenerates it with its declared generator and verifies the result. That failed here, "
+        "which means the generator or its check needs attention; the bot will not push a derived "
+        "value it could not verify." if generated else
+        "A conflict means two intents disagree. Picking a side mechanically is how a tree lands that "
+        "compiles and is wrong, so the resolution is a human decision."
+    )
     return "\n".join([
         "## 🤖 conflict-rebase — REFUSED (`needs-human-conflict`)",
         "",
-        f"The rebase of `{pr['headRefName']}` onto `main` hits a **content conflict**, so this bot stops.",
+        head,
         "",
         f"- {r.detail}",
         f"- head left untouched at `{pr['headRefOid'][:12]}` — nothing was pushed.",
         "",
-        "A conflict means two intents disagree. Picking a side mechanically is how a tree lands that "
-        "compiles and is wrong, so the resolution is a human decision. Please resolve it, push, and "
-        f"remove the `{LABEL}` label (this bot will not touch the PR again while it is set).",
+        f"{tail} Please resolve it, push, and remove the `{LABEL}` label (this bot will not touch "
+        "the PR again while it is set).",
         "",
     ]) + "\n"
 

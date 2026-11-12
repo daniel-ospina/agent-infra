@@ -838,6 +838,13 @@ CONFLICT_REBASE_GENERATED="$FAILSEAM" run_bot --max 1 --interval-s 0; RC=$?
 ck "$RC" "0" "§23p a failing generator is a refusal, not a pass failure"
 ck "$(head_of feat/gen)" "$GEN_SHA" "§23q …nothing is pushed when the generator fails"
 has "$(cat "$TMP/bot.err")" "generated-regenerate-failed" "§23r …and the refusal is classified as a GENERATOR failure"
+# ⛔ A REFUSAL NOBODY SEES IS NOT A REFUSAL. A generator failure takes no `content-conflict`
+# label under the old arm, so it published NOTHING and backed off for 6 h — a PR that needed a
+# human, silently dropped. Both halves are asserted, and the body must not blame a conflict.
+has "$(cat "$TMP/fake/labels.txt" 2>/dev/null || echo)" "1503 ADD needs-human-conflict" \
+   "§23r2 …a generator failure is PUBLISHED like a refusal (label)"
+has "$(cat "$TMP/fake/comment-1503.md" 2>/dev/null || echo)" "could not be regenerated" \
+   "§23r3 …and its comment names a regeneration failure, not a conflict between two intents"
 
 # ── (d) a generator that runs but whose OWN check still reds is NOT trusted ──
 seed_fixture; add_generated_fixture pure
@@ -850,6 +857,26 @@ ck "$RC" "0" "§23s a generator whose result does not verify is a refusal"
 ck "$(head_of feat/gen)" "$GEN_SHA" "§23t …nothing is pushed on an unverified regeneration"
 has "$(cat "$TMP/bot.err")" "its own check still fails" "§23u …and the refusal says the CHECK failed, not the generator"
 unset CONFLICT_REBASE_GENERATED
+
+# ── (e) the sanctioned-scripts PIN is NOT declared, and must not be — measured ──
+# Its own `--cut` PARSES the pin it is about to rewrite, so on a CONFLICTED pin it cannot run at
+# all (`❌ cut: Expected double-quoted property name in JSON at position 1151` — measured on
+# #3698's replay, 2026-11-12). Declaring it would refuse every time while saying so obscurely,
+# so the entry is withdrawn and a pin conflict stays a content conflict — refused, published,
+# and handed to a human. This case pins that decision so a future "helpful" addition re-opens it.
+echo "§24 the sanctioned-scripts pin is deliberately NOT a generated entry"
+OUT="$(python3 - "$BOT" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print("pin:", m.generated_entry("extensions/main-worktree-guard/sanctioned-scripts.pin.json"))
+print("lock:", (m.generated_entry("scripts/workflow-lock.d/.github/workflows/ci.yml/jobs.verify.sha256") or {}).get("cmd"))
+print("authored:", m.generated_entry("scripts/install-launchd.sh"))
+PY
+)"
+has "$OUT" "pin: None" "§24a the conflicted-pin path is AUTHORED for this bot (its --cut cannot parse it)"
+has "$OUT" "lock: node scripts/check-workflow-lock.mjs --update-lock" "§24b …while the region digest IS declared"
+has "$OUT" "authored: None" "§24c …and ordinary source is never declared"
 
 # ── summary ─────────────────────────────────────────────────────────────────
 printf '\n%s\n' "──────────────────────────────────────────"
