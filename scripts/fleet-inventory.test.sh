@@ -969,6 +969,33 @@ LBL="$(run_rows '_fleet_label_for controller-watchdog')"
 [ "$LBL" = "com.eldato.orchestrator-watchdog" ] && ok "§9g2 …and the retired label remains the fallback where only it exists" \
                                                || bad "§9g2 the retired-label fallback resolved [$LBL]"
 
+# §9g3 ⛔ THE CELL'S UNIT ROOT IS A SEAM, NOT A HARDCODED `/etc/systemd/system`. This row's state reaches
+# `orchestrator-bringup.sh start`'s EXIT CODE, so a HOST — or a CI runner that ran
+# `install-cell-timers.sh --install` earlier in the same shard — carrying this timer made `start` exit 1
+# inside a hermetic fixture that starts no other component, reported as LATE about a timer the fixture
+# never installed (measured: CI run 43195539277 shard 7). `env -i`/HOME cannot isolate `/etc/systemd/system`,
+# and `FLEET_SYSTEMCTL` alone does not either: a redirected BINARY still answers `-f` about the HOST's
+# unit FILES, so the root and the binary must be redirectable together or the read stays half-isolated.
+say_case "§9g3 the cell's systemd unit ROOT is redirectable (a hermetic fixture cannot inherit the host's)"
+mkdir -p "$T/srvcell" "$T/sysroot"; : > "$T/srvcell/keys.env"
+printf '[Unit]\nDescription=fixture\n' > "$T/sysroot/eldato-controller-watchdog.timer"
+ROWS="$(run_rows 'FLEET_PLATFORM=cell; FLEET_CELL_HOME="'"$T"'/srvcell"; FLEET_CELL_SUPERVISOR=""; \
+  FLEET_SYSTEMD_SYSTEM_DIR="'"$T"'/sysroot"; FLEET_SYSTEMCTL=/bin/false; fleet_rows ""')"
+st="$(state_of "$ROWS" controller-watchdog)"; d="$(detail_of "$ROWS" controller-watchdog)"
+case "$d" in
+  *"$T/sysroot"*) ok "§9g3 the unit is read from FLEET_SYSTEMD_SYSTEM_DIR, not from the host's /etc" ;;
+  *) bad "§9g3 the unit root is still hardcoded — the row read [$d], not the $T/sysroot unit" ;;
+esac
+[ "$st" = "MISSING" ] && ok "§9g3 …and a unit found there that is NOT active is MISSING (never a green row)" \
+                       || bad "§9g3 a fixture unit that is not active should read MISSING, got [$st]"
+# …and the seam must also be able to say NOTHING IS INSTALLED, or a fixture can never express the
+# "nothing else on this box" environment the bringup arms need: the host's copy must not resurrect.
+ROWS="$(run_rows 'FLEET_PLATFORM=cell; FLEET_CELL_HOME="'"$T"'/srvcell"; FLEET_CELL_SUPERVISOR=""; \
+  FLEET_SYSTEMD_SYSTEM_DIR="'"$T"'/no-units-here"; fleet_rows ""')"
+st="$(state_of "$ROWS" controller-watchdog)"; d="$(detail_of "$ROWS" controller-watchdog)"
+[ "$st" != "LATE" ] && ok "§9g3 an EMPTY seam root does not resurrect the host's unit (state [$st])" \
+                     || bad "§9g3 the host's own unit leaked through the seam — [$st] [$d]"
+
 # §9h (E-8) a bootstrapped job must be KICKED, or "start" produces no evidence at all. A job that is
 # not RunAtLoad reads "loaded, last exit 0" without ever having run under this start.
 say_case "§9h start kicks a job it bootstraps, so the verdict is about a RUN"
