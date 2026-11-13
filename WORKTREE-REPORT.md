@@ -73,6 +73,22 @@ One lane was killed mid-`git push` holding 12 commits and four review rounds.
 3. The lane-bound timing arm in the flake note above.
 4. No MCP/SDK surface changed; no Tortoise graph read or written; no cell `keys.env` touched.
 
+## CI failures this change does NOT cause (measured, with the evidence)
+
+`bash-suites` and `sigpipe-grep` were red on this head. Two of the three failing shards are not this
+change, and one WAS — it is fixed in the last commit:
+
+| check | failing arm | verdict |
+|---|---|---|
+| `bash-suites (4)` → `lane-reap.test.sh` | `EVIDENCE-TEE-LSOF` census (`want lanes=0/1, got 1/1`), `COUNT`/`COUNT-NO-EVIDENCE`/`FALLBACK` (`want lanes=1/2, got 2/2`) | **CAUSED HERE.** The suite hardcoded 3 h / 6 h "stale" fixture ages; `LIVE_MIN` moved 125 → 601 min, so those ages fell INSIDE the live window. Fixed by deriving the age from the shipped window (`(LIVE_MIN + 60) * 60`), same discipline as `lane-bound.test.sh` (i0). Re-run: **233 passed, 0 failed** (and 233/0 at `origin/main`). |
+| `bash-suites (5)` → `rail-run.test.sh` | `CONCURRENT: two racing starts reach the rail exactly ONCE (want rc=1, got rc=2)`, `want one rc=0 and one rc=3, got rc=0 and rc=0` | **NOT caused here.** `250 passed, 0 failed` locally on THIS tree and on a scratch worktree at `origin/main` — the legs race two launchers and are load-sensitive. |
+| `bash-suites (4)` → `mac-pin-parity.test.sh`, `pi-bootstrap/tests/test-setup-no-nesting.sh` | `daemon PATH cannot run cmux …` | **NOT caused here.** No mac-pin / bootstrap file is touched by this PR; the arms need a `cmux` on the runner's PATH. |
+| `sigpipe-grep` | `scripts/record-review.test.sh — 3 occurrence(s), undeclared` | **NOT caused here.** Identical failure on `origin/main`'s own head `319c82526` (run 43449271686, job 131966848513), in a file this PR does not touch. |
+| `pipeline-compliance` | `[b] no scoping comment`, `[c] no head-bound code-review record` | `[b]` fixed by posting the scoping record on #4034; `[c]` is the **harness reviewer's** artifact (`record-review.sh` at the final head) — not self-certified here. |
+
+⚠️ **`origin/main` is red on `sigpipe-grep-guard` as of `319c82526`** — recorded here because it makes
+every PR that touches `scripts/` look red for a reason unrelated to it.
+
 ## Not done here (by instruction)
 
 - **No merge.** The final head is pushed and left for the harness reviewer (`merge-one.sh`) to mint the

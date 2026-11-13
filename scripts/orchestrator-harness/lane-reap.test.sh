@@ -187,6 +187,16 @@ newlog() {
   printf '%s' "$f"
 }
 
+# ⛔ A "STALE" FIXTURE MUST BE STALE AGAINST THE SHIPPED LIVE WINDOW, NOT A HARDCODED AGE
+# (agent-infra#4034). `LIVE_MIN` moved 125 → 601 min WITH the lane backstop (it must stay above it), and
+# the 3 h / 6 h ages the legs below used fell INSIDE the new window: a lane meant to be "resident but not
+# live" became LIVE, so `lanes=` grew a numerator — and four arms (EVIDENCE-TEE-LSOF's census, COUNT,
+# COUNT-NO-EVIDENCE, FALLBACK) went red on a CORRECT change to the code. The age is DERIVED from the
+# shipped file exactly the way lane-bound.test.sh (i0) derives it, so raising the window again cannot
+# silently invert these legs: a leg that must read "resident, not live" ages its log past the window.
+LIVE_MIN_SHIPPED="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$REAPER" | head -1)"
+STALE_S=$(( (${LIVE_MIN_SHIPPED:-601} + 60) * 60 ))   # one hour past the LIVE window (11 h 1 m at the defaults)
+
 # run_reap <table1> [table2] -- <args…>
 # REAP_PROC_ROOT_OVERRIDE — set to "" to exercise the lsof branch (macOS shape) on a fixture that
 # has no fake /proc; every other leg keeps the /proc root, so this seam changes nothing for them.
@@ -534,7 +544,7 @@ exit 0
 SH
 chmod +x "$T/bin/lsof-tee"
 echo "== EVIDENCE-TEE-LSOF (an ADDRESS both sides reproduce identifies the lane's own tee)"
-TEE2_LOG="$(newlog L-tee2.log $((3 * 3600)))"
+TEE2_LOG="$(newlog L-tee2.log "$STALE_S")"      # same reason: the census leg needs resident-but-not-live
 : > "$T/t-tee2"; psinit >> "$T/t-tee2"
 psrow 960 400 Ss 00:00:00 05:00:00 "bash -c 'pi | tee $TEE2_LOG'" >> "$T/t-tee2"
 psrow 961 960 Sl 00:00:05 05:00:00 pi >> "$T/t-tee2"
@@ -1072,7 +1082,7 @@ eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "ACTIVE: no signal"
 # ── COUNT: evidence, not a string ───────────────────────────────────────────────────────────────
 echo "== COUNT (lanes=<live>/<total>, zombie=<n>)"
 FRESH="$(newlog L-fresh.log 30)"
-OLD="$(newlog L-stale.log $((6 * 3600)))"
+OLD="$(newlog L-stale.log "$STALE_S")"          # NOT live, but RESIDENT: past the LIVE window, still a lane
 : > "$T/t-count"; psinit >> "$T/t-count"
 psrow 500 1 Ss 00:00:00 05:00:00 "bash -c pi > $FRESH 2>&1" >> "$T/t-count"
 psrow 501 500 Sl 00:00:01 05:00:00 pi >> "$T/t-count"
