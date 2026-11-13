@@ -5728,8 +5728,15 @@ try {
       has("cd a; pushd -n ~/sub; popd; echo x > tracked.md", "redirect:H/sub/tracked.md", "R6e: `pushd -n ~/sub` inserts $HOME/sub, so the popd cd's there");
       process.env.HOME = savedHome;
     }
-    has("cd a; pushd ../docs; pushd $NOPE +1; echo x > tracked.md", "redirect:H/a/tracked.md", "R6f: `pushd $NOPE +1` — the empty expansion is REMOVED, so bash runs `pushd +1` (rotation WITH its cd)");
-    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd $NOPE +1; echo x > tracked.md", "R6f gate: TRACKED a/tracked.md → BLOCK (the 'too many arguments' model stayed in docs → ALLOW)");
+    // ⛔ R6f PINS A DECLARED RESIDUAL, not a truth claim: bash's answer for
+    // `pushd $VAR +N` depends on the VALUE (an empty expansion is removed ⇒ a
+    // rotation WITH its cd; a non-empty one is "too many arguments" ⇒ nothing
+    // changes). The two realities differ in the DIR STACK, so a cwd-only fork was
+    // measured WORSE than no fork (it rotated the one stack and published a cwd
+    // that stack no longer supports). This row pins the LITERAL reading — the
+    // same one `origin/main` produced — and the other half is declared in the
+    // module. Do NOT "fix" this row by expecting `a`.
+    has("cd a; pushd ../docs; pushd $NOPE +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R6f (DECLARED RESIDUAL): `pushd $VAR +N` keeps the 'too many arguments' reality — see the module's residual note before changing it");
   }
 
 

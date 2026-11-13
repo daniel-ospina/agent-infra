@@ -8545,7 +8545,6 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const pushdArgv = (args, fr, cwd, tildes) => {
     let nFlag = false, sawDD = false, mode = null, nums = null, dirWord = null, extra = 0;
     let dirTilde = false;                            // dirWord was a BARE (unquoted) `~`
-    const lateNums = [];                             // numeric operands AFTER a directory operand
     // ⛔ `-n` IS POSITION-SENSITIVE (#3955 review round 4, measured on bash
     // 5.2.21): option scanning stops at the first NON-NUMERIC argument, so
     //   `pushd +1 -n`      HONOURS it (rc 0, rotation without cd)
@@ -8568,7 +8567,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (m) {
         if (mode === null) { mode = "numeric"; nums = [m]; }
         else if (mode === "numeric") nums.push(m);   // LAST wins, but every one is range-checked
-        else { if (mode === "dir" && nFlag) continue; extra++; if (mode === "dir") lateNums.push(m); }
+        else { if (mode === "dir" && nFlag) continue; extra++; }
         continue;
       }
       if (w === "-n") {
@@ -8640,24 +8639,19 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       return null;
     }
     // mode === "dir"
-    // ⛔ An UNQUOTED `$VAR` operand can be REMOVED, which is why `pushd $NOPE +N`
-    // is NOT "too many arguments": bash sees `pushd +N` — a rotation WITH its cd
-    // (measured, 2-entry stack `[docs, a]`: `pushd $NOPE +1` ⇒ cwd `a`). Both
-    // realities are emitted: the rotation landing as the primary and the
-    // unchanged cwd as the alt.
-    if (extra > 0 && !nFlag) {
-      if (dirWord && /^[$`]/.test(dirWord) && lateNums.length) {
-        const keep = fr.cwd;
-        runNumeric(lateNums);
-        const landing = fr.pending;
-        if (landing && landing !== keep) {
-          fr.forkCwd = fr.forkCwd || landing;
-          fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== landing).slice(0, 64);
-        }
-        return null;
-      }
-      return null;                        // "too many arguments" — nothing changes
-    }
+    // ⛔ DECLARED RESIDUAL — `pushd $VAR +N`. bash's answer depends on the VALUE:
+    // an unquoted empty expansion is REMOVED, so bash runs `pushd +N` (a rotation
+    // WITH its cd); a non-empty one is a second argument ("too many arguments",
+    // rc 1, NOTHING changes). The two realities differ in the DIR STACK, not only
+    // in the cwd, and `forkAlts` carries cwds — a cwd-only fork here is WORSE than
+    // no fork: it rotates the single stack and publishes a cwd the stack no longer
+    // supports, so the NEXT stack verb lands where neither reality does (measured,
+    // 3-entry stack, `NOPE=../b` real: `pushd $NOPE +1; popd` ⇒ bash `docs`,
+    // cwd-fork model `a`/`b`, ALLOWing the tracked `docs/tracked.md`). So this
+    // models the LITERAL reading (a second argument) and declares the other half,
+    // which is what `origin/main` did — non-regressive. Carrying stacks in the
+    // fork (`forkStackAlts`) is the honest fix; it is its own change.
+    if (extra > 0 && !nFlag) return null;  // "too many arguments" — nothing changes
     if (nFlag) {
       // -n <dir>: insert below the top, no cd. ⛔ `-n` NEVER stat()s the operand —
       // bash inserts the operand STRING verbatim and the validation happens at the
@@ -8667,7 +8661,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // leaving `~` uninserted skewed the stack by one).
       const home = typeof process !== "undefined" && process.env ? process.env.HOME : null;
       const tilde = dirWord && dirTilde && home
-        ? (dirWord === "~" ? home : resolve(home, dirWord.slice(2)))
+        ? (dirWord === "~" ? home : resolve(home, dirWord.slice(1).replace(/^\/+/, "")))   // `~//x` too
         : undefined;
       const ins = dirWord && dirWord !== "-" && !/^[$`]/.test(dirWord)
         ? (tilde !== undefined ? tilde : resolve(cwd, dirWord)) : null;
@@ -8682,7 +8676,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // undecidable (declared residual, same as `cd ~user`).
     if (dirTilde && dirWord && (dirWord === "~" || dirWord.startsWith("~/"))) {
       const home = typeof process !== "undefined" && process.env ? process.env.HOME : null;
-      if (home) return { dirWord: dirWord === "~" ? home : resolve(home, dirWord.slice(2)) };   // `~` → HOME, `~/x` → HOME/x (`slice(2)`, NOT `slice(1)`: the latter keeps the `/` and resolve() then discards HOME → the ROOT)
+      if (home) return { dirWord: dirWord === "~" ? home : resolve(home, dirWord.slice(1).replace(/^\/+/, "")) };   // `~` → HOME, `~/x` → HOME/x. ⛔ STRIP the separators, do not slice a fixed count: `slice(1)` keeps the `/` and `resolve()` then DISCARDS HOME (the ROOT path), and `slice(2)` still does it for `~//x`.
       return null;                                                        // declared residual: no HOME
     }
     // ⛔ AN UNQUOTED `$VAR`/BACKTICK OPERAND IS *REMOVED* WHEN EMPTY, so bash runs
