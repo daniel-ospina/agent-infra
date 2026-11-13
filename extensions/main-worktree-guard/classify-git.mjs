@@ -8377,6 +8377,188 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     return { w, k };
   };
   const readShellArg = readWord;   // alias (same shell-argument semantics)
+  // ── EVERY remaining operand word of this simple command, for the dir-stack
+  // verbs ONLY (#3955 review round 3). bash's `pushd`/`popd` scan the WHOLE
+  // argv, so a single-word read models the first operand and silently DROPS the
+  // rest — measured fail-OPENs, e.g. `popd +0 -n` (bash: NOCD, cwd unchanged;
+  // one-word model: cd's to the new top) and `popd +0 extra` (bash: rc 2,
+  // nothing changes). Stops exactly where `readWord` stops (`;|&()<>`, `>`/`<`,
+  // whitespace, newline), so a following redirect is left for the caller.
+  // An all-digits word IMMEDIATELY followed by `>`/`<` is an FD PREFIX
+  // (`2>/dev/null`), which bash never passes to the builtin — skip it.
+  const readOperandWords = (k) => {
+    const out = [];
+    for (;;) {
+      const p = skipWsNl(k);
+      const w = readWord(p);
+      if (!w.w) return { args: out, k: p };
+      if (!(/^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<"))) out.push(w.w);
+      k = w.k;
+      if (out.length >= 64) return { args: out, k };   // bounded
+    }
+  };
+  // ── THE DIR-STACK VERBS' ARGV MODEL (#3955 review round 3), MEASURED on
+  // bash 5.2.21, stack `[b, docs, a]` (cwd `b`) unless a row says otherwise.
+  // The single-operand arms in the walker body stay as they were (they are
+  // verified); these two helpers take over ONLY when the verb carries TWO OR
+  // MORE operand words — the shape that used to be read as "the first word, and
+  // nothing else":
+  //   `-n` is an OPTION anywhere before `--` (getopt), and repeats harmlessly;
+  //   `--` ends option parsing. After it the first word is a LITERAL directory
+  //        operand — `pushd -n -- +1` INSERTS the string "+1" and `pushd -- +1`
+  //        tries to cd to a directory by that name — while for `popd`
+  //        EVERYTHING after `--` is IGNORED (`popd -- +1` and `popd -- -n` are
+  //        exactly a bare `popd`);
+  //   among numeric operands the LAST one wins — `pushd +1 +2` ⇒ +2,
+  //        `pushd +2 +1` ⇒ +1, `pushd -n +1 +2` ⇒ rotate by 2 and replace the
+  //        rotated-in entry with the cwd, `popd +0 +1` ⇒ element 1 removed,
+  //        `popd +0 -1` on a 2-entry stack ⇒ element 0 removed AND a cd;
+  //   for `pushd` the FIRST operand picks the MODE (numeric ⇒ rotation, else a
+  //        directory) — so `pushd -n extra +1` INSERTS `extra` and ignores `+1`,
+  //        while `pushd -n +1 ../c` rotates by 1 — and with `-n` the trailing
+  //        words are IGNORED (`pushd -n ../c extra` inserts ../c); WITHOUT `-n`
+  //        a trailing word is bash's "too many arguments" (rc 1, NOTHING
+  //        changes: `pushd ../c extra`, `pushd -- ../c extra`);
+  //   for `popd` ANY other word is "invalid argument" (rc 2) with the stack AND
+  //        the cwd untouched — `popd +1 extra`, `popd extra +1`, `popd -n extra`
+  //        — so it must never be read as the bare form.
+  const popdArgv = (args, fr) => {
+    let nFlag = false, sel = null, sawDD = false, unprovable = false, invalid = false;
+    for (const w of args) {
+      if (sawDD) continue;                        // everything after `--` is ignored
+      if (w === "--") { sawDD = true; continue; }
+      if (w === "-n") { nFlag = true; continue; }
+      const m = /^([+-])([0-9]+)$/.exec(w);
+      if (m) { sel = m; continue; }               // LAST numeric wins
+      if (/^[$`]/.test(w)) { unprovable = true; continue; }
+      invalid = true;
+    }
+    if (invalid) return;                          // bash rc 2 — nothing changes
+    const S = vstack(fr.cwd);
+    const keep = fr.cwd;
+    if (sel) {
+      const idx0 = sel[1] === "+" ? Number(sel[2]) : S.length - 1 - Number(sel[2]);
+      if (nFlag) {
+        // `-n` never cds, so an absent entry is REMOVABLE and no cd can fail.
+        // `+0` names element 0 (the current directory), so bash drops element 1
+        // instead (measured: `popd -n +0` ⇒ [b, a]).
+        const idx = idx0 === 0 ? 1 : idx0;
+        if (idx >= 0 && idx < S.length && S.length > 1) {
+          setVStack(S.slice(0, idx).concat(S.slice(idx + 1)));
+        }
+        return;
+      }
+      if (idx0 < 0 || idx0 >= S.length) return;   // out of range → bash error, no change
+      const rest = S.slice(0, idx0).concat(S.slice(idx0 + 1));
+      // ⛔ ELEMENT 0 IS THE CURRENT DIRECTORY, so removing it forces a cd to the
+      // new top; when THAT cd fails bash removes nothing (measured: `popd +0`
+      // and `popd -3` over `[b, +1, docs, a]` are rc 1 with `dirs` unchanged).
+      if (idx0 === 0 && cdTo(rest[0]) === null) return;
+      const landing = setVStack(rest);
+      fr.pending = landing;
+      if (unprovable && landing !== keep) {
+        fr.forkCwd = fr.forkCwd || landing;
+        fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== landing).slice(0, 64);
+      }
+      return;
+    }
+    if (nFlag) {                                  // bare `popd -n` — drop element 1, keep the cwd
+      if (S.length > 1) setVStack(S.slice(0, 1).concat(S.slice(2)));
+      return;
+    }
+    // bare `popd` (with `--`, or with an operand this walker cannot expand)
+    const d = dirStack.pop();
+    if (d !== undefined && cdTo(d) === null) {
+      dirStack.push(d);                           // retained, not consumed (round-2 rule)
+      fr.pending = null;
+      return;
+    }
+    const popTo = d !== undefined ? d : null;
+    if (unprovable && popTo !== null && popTo !== keep) {
+      fr.forkCwd = fr.forkCwd || popTo;
+      fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== popTo).slice(0, 64);
+    }
+    fr.pending = popTo;
+  };
+  // Returns null when the whole form is modelled here, or `{ dirWord }` when the
+  // form reduces to a PLAIN directory operand (`pushd -- <dir>`) that the shared
+  // cd path in the walker body must run — one cd implementation, not two.
+  const pushdArgv = (args, fr, cwd) => {
+    let nFlag = false, sawDD = false, mode = null, nums = null, dirWord = null, extra = 0;
+    for (const w of args) {
+      if (sawDD) {
+        if (mode === null) { mode = "dir"; dirWord = w; } else extra++;
+        continue;
+      }
+      if (w === "--") { sawDD = true; continue; }
+      if (w === "-n") { nFlag = true; continue; }
+      const m = /^([+-])([0-9]+)$/.exec(w);
+      if (mode === null) {
+        if (m) { mode = "numeric"; nums = [m]; }
+        else if (w.startsWith("-")) mode = "flag";      // `-x` / `-` (OLDPWD, #2177's residual)
+        else { mode = "dir"; dirWord = w; }
+        continue;
+      }
+      if (mode === "numeric" && m) { nums.push(m); continue; }   // LAST wins, but every one is checked
+      extra++;
+    }
+    if (mode === "numeric") {
+      const S = vstack(fr.cwd);
+      // ⛔ EVERY NUMERIC OPERAND IS RANGE-CHECKED, and the LAST one is the one
+      // APPLIED — measured: `pushd +1 +1` on a 3-entry stack rotates ONCE (not
+      // twice), `pushd +0 +2` rotates by 2, and `pushd +2 +9` / `pushd +9 +2`
+      // both error (naming the out-of-range operand) with the stack and cwd
+      // untouched — even on a 2-entry stack where the LAST operand (`+1`) was
+      // in range: `pushd +2 +1` errors on `+2`. An identity index (`+0` in the
+      // cd arm, `+0`/`-0` landing on element 0 under `-n`) is rc 0 and changes
+      // NOTHING, never an error (measured).
+      const rotOf = (m) => (m[1] === "+" ? Number(m[2]) : S.length - 1 - Number(m[2]));
+      const cdOf = (m) => (m[1] === "+" ? Number(m[2]) : Number(m[2]) + 1);
+      const idxOf = nFlag ? rotOf : cdOf;
+      for (const m of nums) if (idxOf(m) >= S.length) return null;   // out of range → bash error, nothing changes
+      const last = nums[nums.length - 1];
+      const n = Number(last[2]);
+      if (nFlag) {
+        // No cd ever happens. bash REPLACES the rotated-in entry with the
+        // current dir; that entry is element 0 of the stack, which `vstack`
+        // always derives from `fr.cwd`, so only the tail is stored.
+        const rk = rotOf(last);                                  // left by N · left by len-1-N
+        if (rk > 0 && rk < S.length) setVStack(S.slice(rk).concat(S.slice(0, rk)));
+        return null;
+      }
+      const k = cdOf(last);                                      // left by N · right by N+1
+      if (k > 0 && k < S.length) {                               // k===0 → identity
+        // ⛔ THE ROTATION SURVIVES A FAILED `cd` (measured: `pushd +1` over
+        // `[b, +1, docs, a]` leaves `[b, docs, a, b]` at cwd `b`), so `cdTo`
+        // gates ONLY the pending cd — never the rotation itself.
+        fr.pending = cdTo(setVStack(last[1] === "+"
+          ? S.slice(k).concat(S.slice(0, k))                        // rotate left
+          : S.slice(S.length - k).concat(S.slice(0, S.length - k)))); // rotate right
+      }
+      return null;
+    }
+    if (mode === "flag") { fr.pending = null; return null; }      // conservative no-op
+    if (mode === null) {
+      if (nFlag) return null;                                    // `pushd -n --` — nothing changes
+      // bare `pushd` / `pushd --`: swap the top two entries and cd to the new
+      // top; a 1-deep stack is "no other directory" (rc 1) and moves nothing.
+      const S = vstack(fr.cwd);
+      fr.pending = S.length > 1 ? cdTo(setVStack([S[1], S[0], ...S.slice(2)])) : null;
+      return null;
+    }
+    // mode === "dir"
+    if (extra > 0 && !nFlag) return null;                        // "too many arguments" — nothing changes
+    if (nFlag) {
+      // -n <dir>: insert below the top, no cd. ⛔ `-n` NEVER stat()s the operand —
+      // bash inserts the operand STRING verbatim and the validation happens at the
+      // LATER `popd`, which errors and leaves the cwd alone.
+      const ins = dirWord && dirWord !== "~" && !dirWord.startsWith("~/") && dirWord !== "-" && !/^[$`]/.test(dirWord)
+        ? resolve(cwd, dirWord) : null;
+      if (ins) { const S = vstack(fr.cwd); S.splice(1, 0, ins); setVStack(S); }
+      return null;
+    }
+    return { dirWord };                                          // `pushd -- <dir>` — the shared cd path
+  };
   // #625: in-place OVERWRITE verb targets — a write with no primitive token.
   // Command-position only (the caller dispatches on the simple-command word,
   // mirroring the `tee` branch): `git mv a b` / `echo cp a b` are ARG
@@ -9516,6 +9698,20 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       let tgt = readWord(nxt);
       i = tgt.k;
       const isPushd = w0.w === "pushd";
+      // ⛔ TWO OR MORE OPERAND WORDS — the shape the single-word arms below
+      // cannot see. bash scans the WHOLE argv, so reading one word modelled
+      // the first operand and DROPPED the rest: `pushd -n +1 +2` rotated by 1
+      // where bash rotates by 2, and `pushd ../c extra` cds where bash errors.
+      // See the measured argv table at `pushdArgv`.
+      if (isPushd) {
+        const argv = readOperandWords(nxt);
+        if (argv.args.length > 1) {
+          i = argv.k;
+          const onlyDir = pushdArgv(argv.args, f(), cwd);
+          if (!onlyDir) continue;
+          tgt = { w: onlyDir.dirWord, k: i };   // `pushd -- <dir>` — the shared cd path below
+        }
+      }
       // ── The dir stack's INDEXED forms (#3955's "flag/+N" half). Real bash
       // (measured, bash 5.2.21) indexes a stack whose element 0 is the CURRENT
       // directory:
@@ -9694,6 +9890,13 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       continue;
     }
     if (w0.w === "popd") {
+      // ⛔ TWO OR MORE OPERAND WORDS — the same argv scan as the pushd arm (see
+      // `popdArgv`). A measured fail-OPEN lived here: `popd +0 -n`,
+      // `popd +0 extra` and `popd -n +1 extra` all left the walker in `a` while
+      // real bash never leaves `docs`, so the gate ALLOWed a tracked
+      // `docs/tracked.md` overwrite that bash really performs.
+      const argv = readOperandWords(i);
+      if (argv.args.length > 1) { i = argv.k; popdArgv(argv.args, f()); continue; }
       const tgt = readWord(skipWsNl(i));
       i = tgt.k;
       // Indexed / filtered forms — see the vstack block in the pushd handler.

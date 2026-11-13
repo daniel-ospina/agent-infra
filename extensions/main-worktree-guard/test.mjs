@@ -5598,6 +5598,51 @@ try {
     // A never-popped absent `-n` operand is not a landing: `-n` never cds.
     has("cd a; pushd -n -- ../no-such-dir-xyz; echo x > tracked.md", "redirect:H/a/tracked.md", "R2e control: an absent `-n` operand that is never popped is never graded as a landing (the cwd stays a)");
     allows(["b/tracked.md"], "cd a; pushd -n -- ../no-such-dir-xyz; echo x > tracked.md", "R2e control gate: the absent operand is not a landing, so nothing grades b either (only the a write is graded)");
+    // ── #3955 review ROUND 3 (this fix): bash scans the WHOLE argv. Every form
+    // below carries a SECOND operand word, and the one-word model read it as
+    // "the first word, and nothing else" — a measured fail-OPEN on `popd`
+    // (`popd +0 -n`, `popd +0 extra`, `popd -n +1 extra` all left the walker in
+    // `a` while bash never leaves `docs`) and a measured divergence on `pushd`.
+    // Measured on bash 5.2.21 (the argv table lives at `popdArgv`/`pushdArgv`),
+    // and each row tracks ONE file (the #3957 NOTE 1 lesson).
+    // `popd +0 -n` on a 2-entry stack: `-n` wins, element 1 is dropped, NO cd.
+    has("cd a; pushd ../docs; popd +0 -n; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3a: `popd +0 -n` is NOCD — the cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +0 -n; echo x > tracked.md", "R3a gate: TRACKED docs/tracked.md → BLOCK (pre-fix resolved a → ALLOW)");
+    allows(["a/tracked.md"], "cd a; pushd ../docs; popd +0 -n; echo x > tracked.md", "R3a anti-narrowing: the a resolution must NOT be graded — bash never enters a");
+    // ANY other word is bash's "invalid argument" (rc 2): stack and cwd untouched,
+    // wherever it sits.
+    has("cd a; pushd ../docs; popd +0 extra; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3b: `popd +0 extra` is an ERROR — the cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +0 extra; echo x > tracked.md", "R3b gate: TRACKED docs/tracked.md → BLOCK (pre-fix cd'd to a → ALLOW)");
+    has("cd a; pushd ../docs; popd extra +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3b control: an invalid word errors wherever it sits — `popd extra +1` changes nothing");
+    // The LAST numeric operand wins: `popd +0 +1` is `popd +1` (element 1 gone, no
+    // cd); `popd +0 -1` on a 2-entry stack is `popd -1` (element 0 gone, cd to a).
+    has("cd a; pushd ../docs; popd +0 +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3c: `popd +0 +1` — the LAST operand wins (+1: element 1 removed, no cd)");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +0 +1; echo x > tracked.md", "R3c gate: TRACKED docs/tracked.md → BLOCK (pre-fix resolved a → ALLOW)");
+    has("cd a; pushd ../docs; popd +0 -1; echo x > tracked.md", "redirect:H/a/tracked.md", "R3c: `popd +0 -1` — the last operand (-1) names element 0, so bash cds to a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd +0 -1; echo x > tracked.md", "R3c gate: TRACKED a/tracked.md → BLOCK");
+    // `popd -- <anything>` is exactly a bare popd — everything after the marker is
+    // IGNORED (so `-- +1` is NOT a rotation).
+    has("cd a; pushd ../docs; popd -- +1; echo x > tracked.md", "redirect:H/a/tracked.md", "R3d: `popd -- +1` is a BARE popd — the marker ends the scan");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd -- +1; echo x > tracked.md", "R3d gate: TRACKED a/tracked.md → BLOCK (a rotation model would stay in docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd -n +1 extra; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3e: `popd -n +1 extra` errors (nothing changes), so the NEXT popd lands on docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n +1 extra; popd; echo x > tracked.md", "R3e gate: TRACKED docs/tracked.md → BLOCK (pre-fix dropped element 1 and cd'd to a → ALLOW)");
+    // pushd: the FIRST operand picks the MODE, EVERY numeric operand is range
+    // checked, the LAST numeric is APPLIED, and under `-n` trailing words are
+    // ignored (without `-n` they are "too many arguments" — nothing changes).
+    has("cd a; pushd ../docs; pushd ../b; pushd -n +1 +2; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "R3f: `pushd -n +1 +2` rotates by the LAST operand (2) — the next popd lands on b");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n +1 +2; popd; echo x > tracked.md", "R3f gate: TRACKED b/tracked.md → BLOCK (a first-operand model left the popd on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n +2 +1; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R3f control: `pushd -n +2 +1` rotates by 1 — the other direction of the same rule");
+    has("cd a; pushd ../docs; pushd ../b; pushd +1 +2; echo x > tracked.md", "redirect:H/a/tracked.md", "R3g: `pushd +1 +2` (cd arm) rotates by the LAST operand (2) and cds to a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd +1 +2; echo x > tracked.md", "R3g gate: TRACKED a/tracked.md → BLOCK (a first-operand model stays in docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd +0 +2; echo x > tracked.md", "redirect:H/a/tracked.md", "R3g control: identity +0 then +2 is ONE rotation of 2 — the last operand is applied ONCE, not composed");
+    has("cd a; pushd ../docs; pushd ../b; pushd +2 +9; echo x > tracked.md", "redirect:H/b/tracked.md", "R3h: `pushd +2 +9` — an out-of-range operand ERRORS and nothing changes (cwd stays b)");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd +2 +9; echo x > tracked.md", "R3h gate: TRACKED b/tracked.md → BLOCK (validating only the LAST operand would cd to a)");
+    has("cd a; pushd -n ../c extra; popd; echo x > tracked.md", "redirect:H/c/tracked.md", "R3i: `pushd -n ../c extra` INSERTS c (trailing words are ignored under -n) — the popd lands on c");
+    blocks(["c/tracked.md"], "cd a; pushd -n ../c extra; popd; echo x > tracked.md", "R3i gate: TRACKED c/tracked.md → BLOCK (a model that errors on the extra word leaves the popd on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd ../c extra; echo x > tracked.md", "redirect:H/b/tracked.md", "R3j: `pushd ../c extra` is 'too many arguments' — bash changes NOTHING (cwd stays b)");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd ../c extra; echo x > tracked.md", "R3j gate: TRACKED b/tracked.md → BLOCK (a model that cds to c resolves c → ALLOW)");
+    has("cd a; pushd ../docs; pushd -n ../c +1; popd; echo x > tracked.md", "redirect:H/c/tracked.md", "R3k: `pushd -n ../c +1` — the FIRST operand picks the mode, so this INSERTS c; the popd lands on c");
+    blocks(["c/tracked.md"], "cd a; pushd ../docs; pushd -n ../c +1; popd; echo x > tracked.md", "R3k gate: TRACKED c/tracked.md → BLOCK (reading it as a rotation lands on docs instead → ALLOW)");
   }
 
 
