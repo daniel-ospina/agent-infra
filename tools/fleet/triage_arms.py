@@ -157,7 +157,12 @@ def question_qid(lane: str, question: str) -> str:
     the owner and NOTHING would ever retry it. Derived from (lane, question) so it is stable across
     ticks (the dedupe depends on that) and different for every question.
     """
-    return "qid=%s" % _digest((lane or "") + "\x00" + (question or ""))[:8]
+    return "qid=%s" % _qnonce(lane, question)
+
+
+def _qnonce(lane: str, question: str) -> str:
+    """The 8-hex nonce for one (lane, question) pair — the shared part of the id and the end marker."""
+    return _digest((lane or "") + "\x00" + (question or ""))[:8]
 
 
 # ── the question brief ──────────────────────────────────────────────────────────────────────────
@@ -192,7 +197,14 @@ def question_brief(lane: str, question: str, ws: str = "") -> str:
         "Then run the gate that puts it in the owner's queue: "
         "python3 ~/.pi/agent/scripts/ask-owner.py <owner>/<repo> <issue-number>. "
         "Finish by posting the ANSWERED decision back onto the waiting lane, so it can resume. "
-        "The lane's own words: %s" % (lane, ("(%s)" % ws) if ws else "", q)
+        "The lane's own words: %s "
+        # ⛔ A CLOSING SENTINEL, BECAUSE THE MANDATE DOES NOT COVER THE QUESTION (round 9, #4046 P0).
+        # The six mandate tokens all sit BEFORE the question body and the `ask-owner.py` step, so the
+        # smallest prefix that passed the check was 1061 of ~1400 chars — a paint cut there lost the
+        # QUESTION while the record said "the full mandate visible on the pane", and the dedupe then
+        # made the loss permanent. `end=` is the last thing in the payload, so requiring it means the
+        # payload landed whole.
+        "end=%s" % (lane, ("(%s)" % ws) if ws else "", q, _qnonce(lane, question))
     )
 
 
@@ -245,12 +257,19 @@ def mandate_missing(brief: str, qid: str = "") -> list:
     make the proof unverifiable (which would re-send the brief every tick, forever).
     """
     low = " ".join((brief or "").lower().split())
+    missing = []
     if qid:
         matches = list(re.finditer(r"\s*".join(re.escape(c) for c in qid.lower()), low))
         if not matches:
             return [qid]
         low = low[matches[-1].end():]
-    return [tok for tok in QUESTION_MANDATE if tok.lower() not in low]
+        # ⛔ THE PAYLOAD MUST HAVE LANDED WHOLE (round 9, #4046 P0): the mandate tokens precede the
+        # question, so on their own they certify a brief whose question never arrived. The closing
+        # sentinel is the last bytes of the payload, so it cannot coexist with a truncated paint.
+        end = "end=" + qid.split("=", 1)[-1]
+        if end not in low:
+            missing.append(end)
+    return missing + [tok for tok in QUESTION_MANDATE if tok.lower() not in low]
 
 
 # ── arm 1: the user-question lane ──────────────────────────────────────────────────────────────

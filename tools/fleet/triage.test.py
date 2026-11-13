@@ -579,8 +579,8 @@ def run_red_control() -> bool:
     dated = "Your confirmation on the plan we decided yesterday."
     shipped_ask = triage.asks_owner(dated)
     _real_disarmed = triage._disarmed
-    triage._disarmed = (lambda low: bool(triage._PAST_HARD_ANCHOR.search(low))
-                        or _real_disarmed(low))
+    triage._disarmed = (lambda low, *a, **kw: bool(triage._PAST_HARD_ANCHOR.search(low))
+                        or _real_disarmed(low, *a, **kw))
     try:
         anchored_ask = triage.asks_owner(dated)
     finally:
@@ -595,14 +595,25 @@ def run_red_control() -> bool:
     _real_addressed = triage._ADDRESSED
     # The fixture carries an addressed cue that is NOT a `_FUTURE_CUE` ("your confirmation") and a
     # completion inside the ask's object ("we decided"), so the position rule is the only thing
-    # standing between it and the disarm — which is what makes the mutant discriminating.
+    # standing between it and the disarm — which is what makes the mutant discriminating. The mutant
+    # is the round-8 `_disarmed` body verbatim (position rule absent): R13 has to mutate the RULE,
+    # because no second cue list is consulted any more (that is R15's mutation).
     obj_ask = "Your confirmation on the plan we decided yesterday."
-    triage._ADDRESSED = re.compile(r"(?!x)x")            # never matches
+
+    def _round8_disarmed(low, cue_at=None):            # the previous body, position rule removed
+        if _real_disarmed.__globals__["_PAST_HARD_DENIAL"].search(low) or \
+                triage._PAST_HARD_FRAME.search(low):
+            return True
+        if triage._PAST_HARD_ANCHOR.search(low):
+            return bool(triage._COMPLETION.search(low)) and not triage._FUTURE_CUE.search(low)
+        return bool(triage._PAST_SOFT.search(low)) and not triage._FUTURE_CUE.search(low)
+
+    triage._disarmed = _round8_disarmed
     try:
         blind_ask = triage.asks_owner(obj_ask)
     finally:
-        triage._ADDRESSED = _real_addressed
-    good &= _red("R13 without the addressed cue a completion IN THE OBJECT silences the ask",
+        triage._disarmed = _real_disarmed
+    good &= _red("R13 without the position rule a completion IN THE OBJECT silences the ask",
                  blind_ask == "not-asked" and triage.asks_owner(obj_ask) == "asked")
 
     # (R14) ⛔ THE COMPLETION LIST IS LOAD-BEARING ON THE REPORT SIDE (round 8, #4046 P1). A closed
@@ -621,6 +632,48 @@ def run_red_control() -> bool:
         triage._COMPLETION = _real_completion
     good &= _red("R14b …and the round-7 list WOULD have read that same ending as a question",
                  narrow_report == "asked")
+
+    # (R15) ⛔ THE CUE OFFSET MUST COME FROM THE PHRASE THAT ADMITTED THE CLAUSE, NOT A SECOND LIST
+    # (round 9, #4046 P0). The round-8 position rule used a private `_ADDRESSED` regex covering 25 of
+    # the module's 59 hand-off phrases, so an ask phrased with any of the other 34 ("awaiting
+    # approval", "over to you", "ping me", "your read on", …) had no offset and the completion gate
+    # silently did not apply: measured 14 of 14 read `not-asked`. Mutant: stop passing the offset, so
+    # the narrow fallback list is all there is.
+    uncovered = "Awaiting approval on the hotfix we released yesterday."
+    _real_disarmed2 = triage._disarmed
+    triage._disarmed = lambda low, cue_at=None: _real_disarmed2(low, None)
+    try:
+        fallback_ask = triage.asks_owner(uncovered)
+    finally:
+        triage._disarmed = _real_disarmed2
+    good &= _red("R15 an ask whose hand-off phrase is outside the fallback list would be silenced",
+                 triage.asks_owner(uncovered) == "asked" and fallback_ask == "not-asked")
+
+    # (R16) ⛔ THE CLOSING SENTINEL IS WHAT PROVES THE QUESTION ARRIVED (round 9, #4046 P0). The six
+    # mandate tokens all precede the question body, so a paint cut after them certified a brief whose
+    # question never landed (the smallest such prefix was 1061 of 1409 chars). Mutant: drop the end
+    # marker from the brief, and require the same truncated paint to verify.
+    q_full = triage_arms.question_brief("lane-7", "Shall I merge the new thing?")
+    q_id = triage_arms.question_qid("lane-7", "Shall I merge the new thing?")
+    cut_after_mandate = q_full[:1067]                 # past `recommendation`, before the question
+    good &= _red("R16 a paint truncated after the mandate does not verify",
+                 bool(triage_arms.mandate_missing(cut_after_mandate, q_id))
+                 and triage_arms.mandate_missing(q_full, q_id) == [])
+    # The mutant is the round-8 `mandate_missing` body verbatim: qid high-water mark + mandate, no
+    # closing sentinel. It must call the truncated paint a PASS, or the sentinel is decoration.
+    def _pre_delta_mandate(brief, qid=""):
+        low = " ".join((brief or "").lower().split())
+        if qid:
+            ms = list(re.finditer(r"\s*".join(re.escape(c) for c in qid.lower()), low))
+            if not ms:
+                return [qid]
+            low = low[ms[-1].end():]
+        return [tok for tok in triage_arms.QUESTION_MANDATE if tok.lower() not in low]
+
+    cut_1200 = q_full[:1200]                          # header + mandate present, the QUESTION gone
+    good &= _red("R16b …and the pre-sentinel predicate WOULD have verified that paint",
+                 _pre_delta_mandate(cut_1200, q_id) == []
+                 and bool(triage_arms.mandate_missing(cut_1200, q_id)))
 
     # (R12) ⛔ THE PER-QUESTION ID IS WHAT DEFEATS A STALE PANE (round 7, #4046 P0). The question
     # lane is persistent, so its tail still shows the PREVIOUS brief, and both briefs carry the same
@@ -1523,8 +1576,17 @@ def leg_round7() -> None:
             self.screens[ws] = self.screens.get(ws, "") + "\n" + body
             return True
 
+    # ⛔ AND NOT AFTER THE MANDATE EITHER (round 9, #4046 P0): the six mandate tokens precede the
+    # question body, so the smallest prefix that passed was 1061 of 1409 chars — the question and the
+    # ask-owner step were gone while the record said "the full mandate visible on the pane", and the
+    # dedupe then made the loss permanent. `end=` is the payload's last bytes.
     for cut, want_verified, label in ((118, False, "truncated at 118"),
                                       (400, False, "truncated at 400"),
+                                      (1067, False, "truncated after the mandate (1067)"),
+                                      (1200, False, "truncated at 1200"),
+                                      (len(triage_arms.question_brief(
+                                          "lane-7", "Shall I merge the new thing?")) - 20,
+                                       False, "truncated 20 chars short"),
                                       (None, True, "a full paint")):
         pc = triage_arms.arm_user_question("own", "lane-7", "Shall I merge the new thing?",
                                            Paints(cut=cut), nap=lambda _s: None)
@@ -1532,9 +1594,8 @@ def leg_round7() -> None:
            else "…and a %s verifies" % label,
            pc.verified is want_verified, "%s %s" % (pc.verified, pc.artifact.get("pane_missing")))
         if not want_verified:
-            ok("…because the mandate AFTER the id is what is missing (%s)" % label,
-               any(t in (pc.artifact.get("pane_missing") or []) for t in
-                   ("RESEARCH FIRST", "recommendation")),
+            ok("…and the gap is NAMED, not merely failed (%s)" % label,
+               bool(pc.artifact.get("pane_missing")),
                str(pc.artifact.get("pane_missing")))
     pw = triage_arms.arm_user_question("own", "lane-7", "Shall I merge the new thing?",
                                        Paints(wrap=True), nap=lambda _s: None)
@@ -1548,7 +1609,19 @@ def leg_round7() -> None:
     # only "is there a completion in this clause", so "…the invoice I SENT last week" and "…the plan
     # we DECIDED yesterday" gated themselves off — 7 of 7 fresh inputs. The completion must start
     # before the addressed cue to be the LANE's.
-    for txt in ("Awaiting your sign off on the invoice I sent last week.",
+    # ⛔ AND A CUE THE FALLBACK LIST DOES NOT KNOW (round 9, #4046 P0). The position rule was keyed on
+    # a private 25-phrase regex while the module has 59 hand-off phrases, so asks phrased with the
+    # other 34 had no offset and the completion gate did not apply — 14 of 14 read `not-asked`. The
+    # offset now comes from the phrase that admitted the clause.
+    for txt in ("Awaiting approval on the hotfix we released yesterday.",
+                "Awaiting instruction on the numbers you verified yesterday.",
+                "Over to you on the rollback we applied yesterday.",
+                "Your read on the numbers we verified last week.",
+                "Tell me if the deploy that went green yesterday is the one you want.",
+                "Ping me when the report you verified last week is applied.",
+                "Two of three tasks are done.\n\nAwaiting instruction on the deploy we applied "
+                "yesterday.",
+                "Awaiting your sign off on the invoice I sent last week.",
                 "Awaiting your approval on the report I signed yesterday.",
                 "Blocked on your approval of the contract we finished last week.",
                 "Your confirmation on the plan we decided yesterday.",
@@ -1585,7 +1658,18 @@ def leg_round7() -> None:
                 "The migration is applied; it went out at 14:02 after your approval.",
                 "Nothing was blocked on your approval yesterday.",
                 "Verified at 14:02 after your approval.",
-                "The release went out at 14:02 after your approval."):
+                "The release went out at 14:02 after your approval.",
+                # ⛔ AND THE MIRROR (round 9, #4046 P1): applying the position rule to DENIALS and to
+                # possessive cues let 11 of 11 finished reports read `asked`. A denial denies the cue
+                # wherever it sits; a possessive noun is a subject, not an addressed verb.
+                "Your sign off came in and nothing needs your input.",
+                "Your approval came through and nothing needs your input now.",
+                "Your decision stands and nothing needs your input.",
+                "Your approval is recorded and nothing needs your input on the schema.",
+                "Your go-ahead landed and nothing needs your input now.",
+                "Your call matched the plan already approved.",
+                "Your call on the schema came out as you decided.",
+                "Your decision aligned with the spec approved by legal."):
         e = ev(lane="lane-7", last_text=txt, lane_verdict="WIP-IDLE", steerable=True)
         may, r = triage.may_continue(e)
         ok("a completed report is not an ask: %r" % txt[:38], may is True,

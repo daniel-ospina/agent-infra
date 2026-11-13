@@ -242,6 +242,16 @@ _FUTURE_CUE = re.compile(
 # plan we decided yesterday." / "Awaiting your sign off on the fix approved by legal." — all seven
 # measured as `not-asked`, all routed `send-continue` into a lane waiting on its owner. A completion
 # that starts AFTER the addressed cue belongs to the thing being asked about, not to the lane's work.
+# ⛔ A HOLD CUE IS A VERB THE LANE ADDRESSES; A POSSESSIVE NOUN IS NOT (round 9, #4046 P1). Applying
+# the position rule to a possessive over-fired on ordinary reports — "Your sign off came in and nothing
+# needs your input.", "Your call matched the plan already approved." — 11 of 11 measured, each one a
+# FINISHED lane losing its nudge and being queued as a question. "Awaiting your sign off on the fix
+# approved by legal." is the shape the rule exists for; "Your decision aligned with the spec approved by
+# legal." is a report.
+_HOLD_CUE = re.compile(
+    r"\b(?:awaiting your|awaiting a|awaiting approval|awaiting instruction|awaiting a steer|"
+    r"waiting (?:on|for) your|pending your|blocked on your|please (?:confirm|approve|sign)|"
+    r"sign off|hold here until)\b")
 _ADDRESSED = re.compile(
     r"\b(?:awaiting your|awaiting a|waiting (?:on|for) your|pending your|blocked on your|"
     r"please (?:confirm|approve|sign)|sign off|your (?:approval|confirmation|decision|call|"
@@ -267,24 +277,37 @@ def _clauses(sent: str) -> list:
     return [c for c in _CLAUSE_SPLIT.split(sent or "") if c and c.strip()]
 
 
-def _disarmed(low: str) -> bool:
-    """Does THIS CLAUSE report something already decided? (see `_PAST_SOFT`/`_PAST_HARD_*`)"""
-    cue = _ADDRESSED.search(low)
+def _disarmed(low: str, cue_at=None) -> bool:
+    """Does THIS CLAUSE report something already decided? (see `_PAST_SOFT`/`_PAST_HARD_*`)
 
-    def _before_the_cue(rx) -> bool:
-        """A frame/denial term counts when the lane did not ADDRESS it to the owner first."""
-        m = rx.search(low)
-        return bool(m) and not (cue is not None and m.start() > cue.start())
-
-    if _before_the_cue(_PAST_HARD_DENIAL) or _before_the_cue(_PAST_HARD_FRAME):
+    `cue_at` is the offset of the hand-off phrase that ADMITTED this clause, as `asks_owner` matched
+    it. ⛔ IT IS PASSED IN, NOT RE-DERIVED (round 9, #4046 P0). The position rule against a private
+    `_ADDRESSED` list covered 25 of the module's own 59 hand-off phrases, so the other 34 — "awaiting
+    approval", "awaiting instruction", "over to you", "up to you", "tell me if", "ping me", "your move",
+    "your read on", "say the word", "in your hands", the Spanish entries — had no cue offset at all and
+    the completion gate silently did not apply to them. Measured: 14 of 14 asks written that way read
+    `not-asked` and routed `send-continue`. The caller already knows which phrase admitted the clause;
+    asking a second list to guess it is how the two lists drift apart.
+    """
+    if cue_at is None:
+        m = _ADDRESSED.search(low)
+        cue_at = m.start() if m else None
+    # A DENIAL denies the cue itself, wherever it sits: "…and nothing needs your input now."
+    if _PAST_HARD_DENIAL.search(low):
         return True
+    frame = _PAST_HARD_FRAME.search(low)
+    if frame:
+        hold = _HOLD_CUE.search(low)
+        # "…the fix approved by legal" modifies the hold's object; "…as you decided" reports a decision.
+        if not (hold is not None and frame.start() > hold.start()):
+            return True
     if _PAST_HARD_ANCHOR.search(low):
         # An anchor needs a COMPLETION to be a report — one that is the LANE's, not the ask's object —
         # and a future cue vetoes even that.
         done = _COMPLETION.search(low)
         if not done:
             return False
-        if cue is not None and done.start() > cue.start():
+        if cue_at is not None and done.start() > cue_at:
             return False
         return not _FUTURE_CUE.search(low)
     return bool(_PAST_SOFT.search(low)) and not _FUTURE_CUE.search(low)
@@ -451,9 +474,12 @@ def asks_owner(text: str) -> str:
             low = " ".join(clause.lower().split())
             if not low:
                 continue
-            if not (any(phrase in low for phrase in _ASK_FRAME + _HANDOFF)
-                    or _HANDOFF_SHAPE.match(clause.strip().lower())):
+            at = [low.find(phrase) for phrase in _ASK_FRAME + _HANDOFF]
+            at = [i for i in at if i >= 0]
+            shaped = _HANDOFF_SHAPE.match(clause.strip().lower())
+            if not at and not shaped:
                 continue
+            cue_at = min(at) if at else 0
         # ⛔ A PAST-TENSE COMPLETION CUE DISARMS THE PHRASE (round 5, #4046 P1). Widening the phrase
         # classes to the whole tail (round 4) made ordinary completion prose read as an ask —
         # measured, 7 of 8 of "Merged the PR on your approval at 14:02, checks green.", "Everything
@@ -462,7 +488,7 @@ def asks_owner(text: str) -> str:
         # question lane and suppressed its nudge — a regression of a fix this same change made in
         # round 2. The cue is per SENTENCE, so a tail whose FIRST sentence is a hand-off and
         # whose second reports a past merge still reads as an ask.
-            if _disarmed(low):
+            if _disarmed(low, cue_at):
                 continue
             return ASKED
     return NOT_ASKED
