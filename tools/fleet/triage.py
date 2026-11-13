@@ -166,7 +166,7 @@ _HANDOFF_SHAPE = re.compile(
     r"(?m)^\s*(?:awaiting|waiting on|waiting for your|pending your|tell me|ping me|reply|your move|"
     r"your input|i'?ll (?:wait|hold|pause)|i am (?:holding|waiting)|i'?m (?:holding|waiting|pausing)|"
     r"this needs your|needs your|blocked on your|holding (?:the|this|it)|over to you|"
-    r"blocked on you|waiting on you|pending approval|holding here|"
+    r"blocked on you|waiting on you|pending approval|holding here|waiting for you|standing by|"
     r"(?:i )?will wait)\b")
 
 # ⛔ NON-ENGLISH, DELIBERATELY MINIMAL (round 5, #4046 P1). The fleet's lanes write in Spanish when the
@@ -472,8 +472,24 @@ _HANDOFF = (
     # absolutely. Same hole, same position: "I need a decision from you.", "Holding here until you
     # weigh in.", "Pending approval.", "Blocked until approval."
     "blocked on you", "blocked by you", "blocked until approval", "awaiting you",
-    "from you", "pending approval", "need a decision", "needs a decision", "need a call",
+    # ⛔ NOT a bare `from you` (round 14, #4046 P2): that is a preposition plus a pronoun, i.e. the
+    # owner as a SOURCE — "Confirmations from you are already in the thread; I merged it." read
+    # `asked` and a finished lane lost its nudge. The deferral is the NOUN the owner owes.
+    "decision from you", "approval from you", "sign-off from you", "word from you",
+    "answer from you", "call from you",
+    "pending approval", "need a decision", "needs a decision", "need a call",
     "holding here", "hold here until", "until you weigh in", "until you have",
+    # ⛔ THE POSITION, ONE STEP FURTHER (round 14, #4046 P0). A reviewer measured 17 of 50 hand-written
+    # live asks still reaching `send-continue`, all of them deferrals in this same position — the owner
+    # named, the deferral named, neither in the possessive constructions. These are the forms it
+    # measured. The vocabulary is a heuristic and is now documented as such (see the issue linked from
+    # the PR): the structural close is a real `ask_signal` producer, not a longer list.
+    "waiting for you", "waiting on you to", "for you to", "standing by", "ready when you are",
+    "on hold for you", "held for approval", "on you", "the choice is yours", "yours to make",
+    "blocked on the owner", "needs the owner", "needs an owner", "owner decision",
+    "decision — yours", "decision - yours", "but your sign-off", "but your approval",
+    "owner's decision", "owner's call", "until you answer", "until you rule",
+    "decision for you", "stop here", "stopped here", "parked here", "at the gate",
 )
 ASKED = "asked"
 NOT_ASKED = "not-asked"
