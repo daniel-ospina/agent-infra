@@ -97,8 +97,8 @@
 #     N DISJOINT windows. Rotation is capped at the number of distinct slices
 #     (`SLICE_TOTAL/SLICE_WIDTH`), because a 13th lane on 7 windows would land on lane 6's: fewer
 #     lanes is the correct answer, not overlapping ones. ⛔ AND ACROSS TICKS: a lane keeps its window
-#     for up to LANE_TIMEOUT (the 2 h backstop, ~6 ticks at the shipped cadence), so the windows LIVE
-#     lanes hold are read from their records and skipped — a tick whose ring is fully held dispatches
+#     for up to LANE_TIMEOUT (the 10 h backstop, ~30 ticks at the shipped 20 m cadence), so the windows
+#     LIVE lanes hold are read from their records and skipped — a tick whose ring is fully held dispatches
 #     nothing and says so.
 #   * NO RUN-AWAY — the tick can never start more than `target − alive`, `target` is bounded by memory
 #     AND by the cpu ceiling, and each lane is one dispatcher call (not a fork fan-out).
@@ -1577,7 +1577,7 @@ _census_launcher() { # <dispatcher-overlap> — prints the count, or nothing whe
 # ── WHICH SLICES ARE ALREADY BEING WORKED ────────────────────────────────────────────────────
 # ⛔ THE RING CLAMP ALONE DOES NOT PREVENT A DOUBLE-DISPATCH ACROSS TICKS. `n` is capped at the
 # number of distinct windows (SLICE_TOTAL/SLICE_WIDTH = 7 at the shipped defaults), but a LIVE lane
-# keeps its window for up to LANE_TIMEOUT (~2 backstop-hours ≈ 6 ticks at the shipped 20 m cadence):
+# keeps its window for up to LANE_TIMEOUT (~10 backstop-hours ≈ 30 ticks at the shipped 20 m cadence):
 # tick 1 takes offsets 0…60, tick 2
 # walks the ring from cursor=7 back to 0 and hands 0/10/20 to NEW lanes while the first lanes are
 # still on them — two lanes per window, two reviews per head, two merge attempts per PR. So the

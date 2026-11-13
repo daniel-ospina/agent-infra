@@ -273,7 +273,7 @@ _claim_floor_term="$CLAIM_ISSUE_TTL"
 # ⛔ AND A CEILING, OR THE BOUND IS DECORATIVE (review, agent-infra#3203). A 9-digit value is ~31
 # years: `CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999` in an ambient environment re-creates the exact
 # eternal block this arm exists to end, while looking like a configured bound. 7 days is far past
-# every shipped lease (1800-14400 s) and still bounded, so a typo cannot put the gate back.
+# every shipped lease (1800-48000 s) and still bounded, so a typo cannot put the gate back.
 CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL="${CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL:-604800}"
 case "${CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL:-}" in
   ''|*[!0123456789]*|0*) CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=604800 ;;

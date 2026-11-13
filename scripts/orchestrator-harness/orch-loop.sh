@@ -6510,7 +6510,11 @@ while true; do
          # — a peer's declared window", asserting the one fact this reader has just said it cannot
          # know. Name the class, print the reason, and never invent a deadline.
          if [ "$CLAIM_SEL_VERDICT" = "claim-lease-unreadable" ]; then
-           echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head with a lease this box CANNOT READ — an ABSTENTION, not a window; claim_prune reaps it once the claim commit passes ${CLAIM_UNREADABLE_LEASE_MAX_AGE:-18000}s)" >>"$LOG"
+           # ⛔ THE FALLBACK LITERAL IS THE SEAM'S OWN VALUE (agent-infra#4034). `claims.sh` always sets
+           # `CLAIM_UNREADABLE_LEASE_MAX_AGE`, so this `:-` arm only fires when the library was not sourced —
+           # and a stale 18000 here would then NAME a bound the reaper does not use. It was the one literal in
+           # the loop the 5x sweep missed.
+           echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head with a lease this box CANNOT READ — an ABSTENTION, not a window; claim_prune reaps it once the claim commit passes ${CLAIM_UNREADABLE_LEASE_MAX_AGE:-48000}s)" >>"$LOG"
            disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} lease unreadable — abstaining (bounded reap, not a window)"
          else
            echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?} — a peer's declared window, not this box's work)" >>"$LOG"
