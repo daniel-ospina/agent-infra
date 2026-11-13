@@ -1119,9 +1119,12 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 #         cannot refuse a clean review (13n25).
 #       * PERSISTENCE — a persistence qualifier in that same clause (`remain|remaining|open|
 #         outstanding|unresolved|unfixed|unaddressed|deferred|pending|still|yet|known|carried|
-#         waived|left|partial|some|most|several|half|rest`). Kept as a BELT, not the mechanism:
-#         (b) already refuses anything that is not an affirmative totality, so an unlisted
-#         persistence word falls through to the veto rather than through it.
+#         waived|left|partial|some|most|several|half|rest`). ⛔ IT IS A BELT, NOT A PROOF, and the
+#         honest statement is the narrow one: an unlisted persistence phrase that is ALSO
+#         unaccompanied by any count -- `... were fixed except the socket leak`, `... were largely
+#         fixed` -- reaches no belt at all and ESCAPES, because once (b) has matched there is
+#         nothing left to refuse it. Stated as a residual rather than papered over with another
+#         synonym: this arm reads a declared COUNT, a totality, and an arithmetic remainder.
 #       * A SECOND COUNT — any other count token ANYWHERE on the line (`[1-9][0-9]*` or a spelled
 #         `one|two|...|ten|half|some|most|several|rest`), scanned after masking the declared
 #         `[N] blocking` phrases, the priority tags `(P0..P3)` and `N non-blocking`. THIS is what
@@ -1140,8 +1143,19 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # An affirmative TOTAL resolution: declared count, or an explicit totality word, as the subject.
   local _OC_TAIL='([[:space:]]+([[:alpha:]-]+|\(p[0-3]\))){0,3}[[:space:]]+((were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2})?(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)'
   local _OC_TOTAL="(^|[^0-9])[1-9][0-9]*[[:space:]_-]*block(ing|ers?)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}"
-  # Any count token that is not a declared blocking count / a priority tag / a negated mention.
-  local _OC_SECOND_COUNT='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten|half|some|most|several|rest)([^[:alpha:]]|$)|[1-9][0-9]*'
+  # A SECOND COUNT -- read as a GOVERNING count, never as any stray digit (agent-infra#2661 fifth
+  # review, F2): a bare `[1-9][0-9]*` scan refused honest CLEAN lines that merely cite a reference
+  # (`... in cycle 2`, `... see #3902`, `... (commit 30ce585)`, `... 2 P3 follow-ups filed`). A count
+  # is this arm's business only when it GOVERNS something relevant: a remainder reference
+  # (`1 of them`, `1 blocking`), a resolution (`2 were fixed`), a persistence word (`2 still open`),
+  # or -- for a SPELLED count -- anywhere at all, because a clean review rarely spells one and the
+  # spelled form is what a digit-only scan misses (13n30).
+  local _OC_COUNT='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten|[1-9][0-9]*)'
+  local _OC_GOVERNS='[[:space:]]+(of[[:space:]]+(them|the|these|those)|block(ing|ers?))'
+  local _OC_RESOLVES='[[:space:]]+(of[[:space:]]+(them|the|these|those)[[:space:]]+)?([[:alpha:]-]+[[:space:]]+){0,2}(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)'
+  local _OC_STILL='[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending)'
+  local _OC_SELLED='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)([^[:alpha:]]|$)'
+  local _OC_SECOND_COUNT="${_OC_COUNT}(${_OC_GOVERNS}|${_OC_RESOLVES}|${_OC_STILL})|${_OC_SELLED}"
   local _OC_ZEROED='(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)'
   decoded="$(tsv_decode "$1")"
   while IFS= read -r line; do
@@ -1167,8 +1181,14 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
       return 0
     fi
     # (c) a SECOND count, with the declared counts / priority tags / negated mentions masked out.
+    # ⛔ MASK ONLY THE **FIRST** `N blocking` — the DECLARED count. Masking every one erased the
+    # operand the arithmetic exists to compare against, so `... were fixed; 1 blocking finding
+    # remains open` left no digit on the line and escaped (agent-infra#2661 fifth review, F1 — a
+    # regression the previous head did not have, because it still counted live mentions). A LATER
+    # `N blocking` is a REMAINDER and must stay countable. `N non-blocking` mentions are masked
+    # globally: a negated mention is not a blocker (13n28).
     _rest="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' \
-      | sed -E 's/[1-9][0-9]*[[:space:]_-]*(non-)?block(ing|ers?)/ BLKDECL /g; s/\(p[0-3]\)/ PTAG /g')"
+      | sed -E 's/[1-9][0-9]*[[:space:]_-]*non-block(ing|ers?)/ BLKDECL /g; s/[1-9][0-9]*[[:space:]_-]*block(ing|ers?)/ BLKDECL /g; s/\(p[0-3]\)/ PTAG /g')"
     if grep -qE "$_OC_SECOND_COUNT" <<<"$_rest"; then
       OUTCOME_BLOCKING_LINE="$line"
       return 0
