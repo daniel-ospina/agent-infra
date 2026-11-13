@@ -46,6 +46,37 @@
 # own CI-spending steps. See `ci-queue.sh`'s header for the class rule; do NOT reintroduce the gate
 # here on a tuning pretext — that re-opens #2927.
 #
+# ── THE SECOND SOURCE: A `not-clean` REVIEW VERDICT IS WORK (agent-infra#4011) ─────────────────
+# ⛔ MEASURED 2026-11-10 ON PR #3698 (this repo, live): a reviewer posted `REVIEW-VERDICT: ISSUES (2)`
+# at the head; an agent NOTICED and dispatched a fixer by hand; the fix pushed; another review ran. Two
+# of those four steps were agent-driven, because NOTHING WATCHES THE VERDICT:
+#   * `auto-rail.sh` classifies a head-bound `not-clean` record as `rejected` and deliberately SKIPS it
+#     (`the remedy is a fix`), so the actuator that reads the record store will not act on it;
+#   * the controller's fixer arm acts only on `needsfix-<PR>-<head>`, which `merge-one.sh` writes and
+#     NO OTHER review ingress does (it is the only caller that mints a record at all, and only a
+#     `clean` one);
+#   * `ps_decide` reached a PR only through its CHECK SURFACE, so a rejected head that was green — or
+#     whose checks could not be read — was invisible here too.
+# So a `not-clean` record minted by anything else (a lane's `code-review` cap exit, `review-pr.sh` +
+# `record-review.sh not-clean`, a hand run) reached nobody. This file now reads that record.
+# ⛔ IT COSTS THE PASS NO API CALL, WHICH IS WHY IT BELONGS HERE AND NOT IN A NEW ACTUATOR. The record
+# is a LOCAL file (`~/.pi/agent/reviews/<owner>-<repo>-<PR>.json`, written by `record-review.sh`) and a
+# verdict is about a HEAD — and the enumeration row already carries the LIVE head sha. So the test is a
+# local file read plus one string compare. A record whose head is not the live head is STALE and is NOT
+# acted on: a push re-arms, and the new head gets its own verdict.
+#   * A `clean` verdict (or `clean-micro`/`clean-low`) is never this source's work. Criterion pinned in
+#     the suite: a clean record at the live head starts NO fixer.
+#   * THE SAME GATES BIND as for a red head — one live fixer, a parked head, and the SAME per-head
+#     attempt budget — because the cap is on a TREE, not on a reason. Two sources may not spend one
+#     head twice.
+#   * THE CEILING IS THE RECORDED ONE, NOT A NEW ONE. A fix round's product is a new head, whose review
+#     is refused once the PR's cumulative review rounds (`state/reviewround-<PR>`, agent-infra#3441)
+#     reach `MAX_REVIEW`. Dispatching a fixer there buys a head nobody may review, so the arm refuses
+#     and escalates naming the ceiling instead of inventing a second, silently-different bound.
+#   * AT A CAP IT STOPS AND ESCALATES — a `parked-<PR>` / `parkreason-<PR>` pair (the harness's own
+#     "needs a human" state) plus ONE PR comment per head, tagged so a repeat pass adds none. An
+#     unbounded review→fix→review loop is worse than the stall it replaces.
+#
 # ── POLARITY, ON THE NEWEST ATTEMPT PER (app, name) ─────────────────────────────────────────────
 # One surface read per PR, from the CHECK-RUNS API (`commits/<sha>/check-runs?filter=all`), which —
 # unlike `gh pr checks` — carries `app.slug`, the attempt `id` and the job id. Grouping is by
@@ -505,6 +536,63 @@ psick_refund_head() {
   return 1
 }
 
+# ps_gates <or> <pr> <sha> -> 0 FREE (PS_BCNT = attempts already booked at this head) | 1 not free
+# ⛔ ONE HOME, TWO SOURCES (#4011): a red head and a rejected-review head ask the SAME three questions
+# before a fixer may be spent — is a worker on it, is this head parked for a human, and how much of
+# this head's repair budget is gone. The answers do not depend on WHY the head needs repair, so a
+# second copy would be a second rule; the refusal LINES are this function's, so both sources say the
+# same thing about the same state.
+# ⛔ NO AGENT RAN IS NOT AN ATTEMPT, and there are TWO markers that mean it:
+#   fixgate-<PR>-<HEAD>  a load/disk gate refused the agent (fix-one.sh)
+#   fixbail-<PR>-<HEAD>  the cross-box CAS refused (another box owned the head; fix-one.sh exits 0)
+# This role booked a head-keyed attempt for both, so it refunds both. See psick_refund_head.
+ps_gates() {
+  local repo="$1" pr="$2" sha="$3" holder hrc bf budget bcnt
+  holder="$(ps_held "$repo" "$pr" "$sha")"; hrc=$?
+  if [ "$hrc" -eq 0 ] || [ "$hrc" -eq 2 ]; then
+    printf 'skip #%s: held by %s\n' "$pr" "${holder:-an unreadable claim}"
+    PS_BCNT=0
+    return 1
+  fi
+  bf="$(ps_state_dir)/parked-$pr"
+  if [ -s "$bf" ] && [ "$(cat "$bf" 2>/dev/null)" = "$sha" ]; then
+    printf 'skip #%s: parked at this head — needs a human\n' "$pr"
+    PS_BCNT=0
+    return 1
+  fi
+  psick_refund_head "$(ps_state_dir)" "$pr" "$sha"
+  budget="$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)"
+  bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
+  PS_BCNT="$bcnt"
+  return 0
+}
+
+# ps_spawn_fixer <or> <pr> <sha> <br> <bcnt> <tag> -> 0 spawned
+# The argv file is the SAME 4-line contract every other fixer call site uses (no PR-derived value ever
+# reaches `sh -c`). ⛔ BOOK THE ATTEMPT ONLY AFTER THE SPAWN (the fix-one.sh contract: a killed spawn
+# must not burn an attempt, and the fixer refunds it when a load/disk gate refused the agent).
+ps_spawn_fixer() {
+  local repo="$1" pr="$2" sha="$3" br="$4" bcnt="$5" tag="$6" cmd dir f
+  printf '%s\n' "${PS_REPO_PATH:-${REPO:-}}" "$repo" "$pr" "$br" > "$(ps_state_dir)/argv-$pr" 2>/dev/null || {
+    printf 'skip #%s: argv record could not be written (state/ unwritable) — nothing spawned\n' "$pr"; return 1; }
+  cmd="bash '${O:-$HOME/orchestrator}/fix-one.sh' --argv '$(ps_state_dir)/argv-$pr'"
+  if ! ps_spawn "$tag" "${PS_SPAWN_CWD:-${PS_REPO_PATH:-${REPO:-$PWD}}}" "$cmd"; then
+    printf 'skip #%s: spawn FAILED for %s (attempt not consumed)\n' "$pr" "$tag"
+    return 1
+  fi
+  printf '%s\n' "$((bcnt + 1))" > "$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)" 2>/dev/null || true
+  ps_defer_drop "$repo" "$pr" "$sha"
+  # Prune THIS PR's superseded per-head counters (a new head is new work; the old tree's counter can
+  # never be reached again). Listed and matched EXACTLY rather than globbed, so the module stays
+  # statically readable by the checkout guard.
+  dir="$(ps_state_dir)"
+  for f in $(ls -1 "$dir" 2>/dev/null | grep -x "psick-$pr-[0-9a-f][0-9a-f]*" 2>/dev/null); do
+    [ "psick-$pr-$(printf '%s' "$sha" | cut -c1-12)" = "$f" ] && continue
+    rm -f "$dir/$f" 2>/dev/null || true
+  done
+  return 0
+}
+
 # ps_decide <or> <pr> <sha> <branch> [fork] -> prints ONE decision line; rc 0 = dispatched.
 # The three shapes (the operator's grep) — `backpressure(q=…,r=…)` used to be a fourth and was
 # removed with the queue gate itself (#2927):
@@ -534,6 +622,16 @@ ps_decide() {
     printf 'skip #%s: branch name %s is not a valid ref in this repo — not acted on\n' "$pr" "$br"
     return 1
   fi
+  # ── THE REVIEW-REJECTION SOURCE (#4011) RUNS BEFORE THE CHECK SURFACE ─────────────────────────
+  # A `not-clean` verdict at THIS head is the actionable fact about it whether the checks are green,
+  # red, or unreadable — and the fixer's own brief reads both (fix-one.sh pulls the failing checks
+  # and the reviewer's comment). rc 2 means "not a rejected head": fall through, silently, to the
+  # surface path below. The gates are NOT paid for on that path: the arm reads one local file.
+  ps_review_decide "$repo" "$pr" "$sha" "$br"; _rfd=$?
+  case "$_rfd" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
   tok="$(ps_verdict "$repo" "$sha")"; rc=$?
   case "$tok" in
     NOREAD*)
@@ -555,23 +653,13 @@ ps_decide() {
   jid="$(printf '%s' "$tok" | cut -f4)"; cc="$(printf '%s' "$tok" | cut -f5)"; reds="$(printf '%s' "$tok" | cut -f6)"
 
   # ── the four gates that are NOT about the surface ──────────────────────────────────────────
-  holder="$(ps_held "$repo" "$pr" "$sha")"; hrc=$?
-  if [ "$hrc" -eq 0 ] || [ "$hrc" -eq 2 ]; then
-    printf 'skip #%s: held by %s\n' "$pr" "${holder:-an unreadable claim}"
-    return 1
-  fi
-  bf="$(ps_state_dir)/parked-$pr"
-  if [ -s "$bf" ] && [ "$(cat "$bf" 2>/dev/null)" = "$sha" ]; then
-    printf 'skip #%s: parked at this head — needs a human\n' "$pr"
-    return 1
-  fi
-  budget="$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)"
-  # ⛔ NO AGENT RAN IS NOT AN ATTEMPT, and there are TWO markers that mean it:
-  #   fixgate-<PR>-<HEAD>  a load/disk gate refused the agent (fix-one.sh)
-  #   fixbail-<PR>-<HEAD>  the cross-box CAS refused (another box owned the head; fix-one.sh exits 0)
-  # This role booked a head-keyed attempt for both, so it refunds both. See psick_refund_head.
-  psick_refund_head "$(ps_state_dir)" "$pr" "$sha"
-  bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
+  # ⛔ ONE HOME FOR THE THREE GATES, BECAUSE THERE ARE NOW TWO SOURCES (#4011). The review-rejection
+  # arm asks the identical questions (is a fixer on it, is the head parked, how much of this head's
+  # budget is spent), so a second copy of these four tests would be a second RULE — the class this
+  # file's header bans for the queue gate. `ps_gates` prints the refusal line and returns 1 when the
+  # head is not free; on 0 it publishes the booked count as PS_BCNT.
+  ps_gates "$repo" "$pr" "$sha" || return 1
+  bcnt="${PS_BCNT:-0}"
   if [ "$bcnt" -ge "$(ps_maxtries "$PS_MAX_TRIES")" ]; then
     printf 'skip #%s: budget exhausted (%s/%s fixer attempts at head=%s) — needs a human\n' \
       "$pr" "$bcnt" "$(ps_maxtries "$PS_MAX_TRIES")" "${sha:0:12}"
@@ -617,31 +705,14 @@ ps_decide() {
     printf 'RED #%s %s -> would-dispatch %s (dry-run: work item + brief written, no spawn)\n' "$pr" "$group" "$tag"
     return 0
   fi
-  # The argv file is the SAME 4-line contract every other fixer call site uses (no PR-derived value
-  # ever reaches `sh -c`).
-  printf '%s\n' "${PS_REPO_PATH:-${REPO:-}}" "$repo" "$pr" "$br" > "$(ps_state_dir)/argv-$pr" 2>/dev/null || {
-    printf 'skip #%s: argv record could not be written (state/ unwritable) — nothing spawned\n' "$pr"; return 1; }
-  cmd="bash '${O:-$HOME/orchestrator}/fix-one.sh' --argv '$(ps_state_dir)/argv-$pr'"
-  if ! ps_spawn "$tag" "${PS_SPAWN_CWD:-${PS_REPO_PATH:-${REPO:-$PWD}}}" "$cmd"; then
-    printf 'skip #%s: spawn FAILED for %s (attempt not consumed)\n' "$pr" "$tag"
-    return 1
-  fi
-  # ⛔ BOOK THE ATTEMPT ONLY AFTER THE SPAWN (the fix-one.sh contract: a killed spawn must not burn
-  # an attempt, and the fixer refunds it when a load/disk gate refused the agent).
-  printf '%s\n' "$((bcnt + 1))" > "$budget" 2>/dev/null || true
-  ps_defer_drop "$repo" "$pr" "$sha"
+  # ⛔ ONE SPAWN CONTRACT FOR BOTH SOURCES (#4011): the argv file, the spawn, the booking, the ledger
+  # row and the per-head counter prune live in `ps_spawn_fixer`. A second call site that wrote the
+  # argv file itself is exactly how the 4-line contract drifts.
+  ps_spawn_fixer "$repo" "$pr" "$sha" "$br" "$bcnt" "$tag" || return 1
   # tell the loop's ledger the LATER fact (one row per PR per cycle; dispreplace is its own writer)
   if declare -f dispreplace >/dev/null 2>&1; then
     dispreplace "$pr" "$sha" "SICK:$group" act "sickness fixer spawned from the failure itself ($group)"
   fi
-  # Prune THIS PR's superseded per-head counters (a new head is new work; the old tree's counter can
-  # never be reached again). Listed and matched EXACTLY rather than globbed, so the module stays
-  # statically readable by the checkout guard.
-  _ps_dir="$(ps_state_dir)"
-  for _ps_f in $(ls -1 "$_ps_dir" 2>/dev/null | grep -x "psick-$pr-[0-9a-f][0-9a-f]*" 2>/dev/null); do
-    [ "psick-$pr-$(printf '%s' "$sha" | cut -c1-12)" = "$_ps_f" ] && continue
-    rm -f "$_ps_dir/$_ps_f" 2>/dev/null || true
-  done
   printf 'RED #%s %s -> dispatch %s\n' "$pr" "$group" "$tag"
   return 0
 }
@@ -805,6 +876,332 @@ EOF
     "$seen" "$dispatched" "$(ps_defer_list | wc -l | tr -d ' ')"
   return 0
 }
+
+# ── 9. THE REVIEW-REJECTION SOURCE (agent-infra#4011) — see the header ─────────────────────────────
+# [reviewfix:begin] (extracted and DRIVEN by pr-sickness.test.sh — keep the marker)
+# The record STORE, not a seam: `record-review.sh` writes `$HOME/.pi/agent/reviews` and every reader in
+# the fleet (the rail, auto-rail, record-review's own --check-carry) reads it there.
+PS_RECORD_DIR="${PS_RECORD_DIR:-${HOME:-}/.pi/agent/reviews}"
+# ps_record_for <or> <pr> -> TSV "verdict<TAB>head<TAB>findings<TAB>evidence<TAB>note"; rc 1 = none
+# ⛔ THE FILENAME IS CONSTRUCTED, NOT GLOBBED: `record-review.sh` names the record
+# `<owner>-<repo>-<PR>.json` (slashes to dashes), so one `-f` test finds it and no OTHER PR's record can
+# be mistaken for this one. A file that is present but does not parse is NOT "no record" — it returns a
+# named UNREADABLE row, because "the record I could not read" and "there is no record" are different
+# facts and a silent absence reads as the second.
+ps_record_for() {
+  local repo="$1" pr="$2" f slug
+  case "${pr:-}" in ''|*[!0-9]*) return 1 ;; esac
+  slug="$(printf '%s' "${repo:-}" | tr '/' '-')"
+  [ -n "$slug" ] || return 1
+  f="$PS_RECORD_DIR/$slug-$pr.json"
+  [ -f "$f" ] || return 1
+  python3 - "$f" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8", errors="replace"))
+except Exception:
+    raise SystemExit(2)
+if not isinstance(d, dict) or not str(d.get("verdict") or ""):
+    raise SystemExit(2)
+def clean(v):
+    return str(v if v is not None else "").replace("\t", " ").replace("\n", " ")
+print("\t".join([clean(d.get("verdict")), clean(d.get("head_sha")), clean(d.get("findings")),
+                clean(d.get("evidence")), clean(d.get("findings_note"))]))
+PY
+  case "$?" in
+    0) return 0 ;;
+    # 2 = PRESENT BUT UNREADABLE (or no usable verdict field). Named by the caller; never "absent".
+    2) printf 'UNREADABLE\t\t\t\t\n'; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ps_review_max <candidate> -> the MAX_REVIEW value to apply, coerced exactly like the two existing
+# readers of that knob (`merge-one.sh::_rr_coerce_max`, `orch-loop.sh`): unusable ⇒ the documented
+# default 10, `0` ⇒ report-only, every other leading-zero spelling ⇒ the default. A DIFFERENT coercion
+# here would be a second rule for one knob — the divergence those two comments exist to prevent.
+ps_review_max() {
+  case "${1:-}" in
+    ''|*[!0-9]*) printf '10\n' ;;
+    0) printf '0\n' ;;
+    0*) printf '10\n' ;;
+    *) if [ "${#1}" -le 9 ]; then printf '%s\n' "$(( 10#$1 ))"; else printf '10\n'; fi ;;
+  esac
+}
+# ps_review_rounds <state-dir> <pr> -> the PR's cumulative review-rounds book (absent ⇒ 0;
+# exists-but-unreadable ⇒ 999999999, the writer's own fail-closed ceiling — never 0, which would hand a
+# corrupt book a full budget and RESET the ceiling). ⛔ THE ARGUMENT IS THE STATE DIR (what
+# `ps_state_dir` returns), not the harness root: every other record this module reads is joined the
+# same way, and a `$O`-shaped argument here would silently read `.../state/state/reviewround-<PR>` and
+# a missing book reads as a FULL budget — a fail-open on the one bound that makes this loop finite.
+ps_review_rounds() {
+  local f="$1/reviewround-$2" v=""
+  [ -e "$f" ] || { printf '0\n'; return 0; }
+  # ⛔ `-e` FIRST, `-f` SECOND, AND THE FIFO MATTERS: `read -r v < fifo` BLOCKS until a writer appears,
+  # which on the controller's own pass is a wedge with no log line. Only a genuinely MISSING path may
+  # read as a full budget; a non-regular one takes the unreadable arm.
+  [ -f "$f" ] || { printf '999999999\n'; return 0; }
+  read -r v < "$f" 2>/dev/null || true
+  case "${v:-}" in
+    ''|*[!0-9]*) printf '999999999\n' ;;
+    *) if [ "${#v}" -le 9 ]; then printf '%s\n' "$(( 10#$v ))"; else printf '999999999\n'; fi ;;
+  esac
+}
+# ps_review_ceiling_hit <state-dir> <pr> <max-ish> -> 0 when the NEXT review round must be REFUSED
+ps_review_ceiling_hit() {
+  local book max
+  book="$(ps_review_rounds "${1:-}" "${2:-}")"; ps_is_num "${book:-}" || book=999999999
+  max="$(ps_review_max "${3:-}")"; ps_is_num "${max:-}" || max=10
+  [ "$max" -ge 1 ] || return 1      # 0 is REPORT-ONLY, not a ceiling (the MAX_REVIEW_TRIES idiom)
+  [ "$book" -ge "$max" ]
+}
+
+# ps_review_brief <or> <pr> <sha> <findings> <evidence> <note> -> prints the brief's path
+# ⛔ FROM THE VERDICT, NOT FROM A TEMPLATE — the same rule the CI brief follows. It names the head it
+# was generated at (`head12:`), the count the recorder carried and the reviewer's OWN artifact, so a
+# fixer that pushes can tell a brief from an earlier head from its own.
+ps_review_brief() {
+  local repo="$1" pr="$2" sha="$3" n="$4" ev="$5" note="$6" f
+  f="$(ps_state_dir)/reviewbrief-$pr.md"
+  mkdir -p "$(ps_state_dir)" 2>/dev/null || true
+  {
+    printf '# Review-rejection brief — PR #%s at %s\n\n' "$pr" "${sha:0:12}"
+    printf 'head12: %s\n' "${sha:0:12}"
+    printf 'Generated from the REVIEW VERDICT (not from a template): %s\n\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'repo: %s\n' "$repo"
+    printf 'verdict: not-clean\n'
+    printf 'open findings: %s\n' "${n:-?}"
+    printf 'review artifact: %s\n' "${ev:-<none recorded>}"
+    if [ -n "${note:-}" ]; then printf 'recorder note: %s\n' "$note"; fi
+    printf '\n## Why this lane was dispatched\n'
+    printf 'A fresh-context review was RECORDED against this exact head and its verdict was not\n'
+    printf 'clean: a review record is a claim about ONE revision, and this is that revision. No\n'
+    printf 'harness arm turned that verdict into work, so this queue did.\n\n'
+    printf 'The review is the artifact named above (a PR review, or a comment on this PR); read it\n'
+    printf 'in full before you change anything, and fix EVERY open finding. The findings are not\n'
+    printf 'reproduced here on purpose: a summary of a review is not the review.\n'
+  } > "$f" 2>/dev/null || return 1
+  printf '%s' "$f"
+}
+
+# ps_review_cap_hit <booked-at-this-head> -> 0 when this head's repair budget is spent
+# One home for the comparison, so the mutation that proves the cap binds has exactly one target: the
+# suite flips `-ge` to `-gt` here and requires the third pass to spawn a fourth fixer. `-ge` and not
+# `-gt` because PS_MAX_TRIES is the number of attempts a TREE may spend, so AT the number the next
+# dispatch is the one that must be refused.
+ps_review_cap_hit() { [ "${1:-0}" -ge "$(ps_maxtries "$PS_MAX_TRIES")" ]; }
+
+# ps_review_escalate <or> <pr> <sha> <why> -> posts at most ONE comment per (PR, head); never fatal
+# ⛔ THE ESCALATION HAS TO BE ON THE PR. A cap that only prints a `skip` line is invisible to everyone
+# who is not reading this box's log — and the harness's own record of the failure mode (agent-infra
+# #4006's audit) is a stage that was "scheduled and logging" while doing nothing. Tagged, so a repeat
+# pass adds no comment; unreadable comments ⇒ NOT posted (a blind post is a duplicate every pass).
+# ⛔ THE RE-ARM FACT IS AN ARGUMENT, NOT A CONSTANT (fresh-context review, P2, verified). This comment
+# is reached from BOTH bounds, and the two bounds clear by OPPOSITE mechanisms:
+#   * the per-head budget (`psick-<PR>-<sha12>`) is keyed on the TREE, so a push IS the remedy;
+#   * the review-round book (`state/reviewround-<PR>`) is CUMULATIVE ACROSS HEADS by design —
+#     `merge-one.sh`'s own `[rrceiling]` park states it verbatim: "A push does NOT re-arm this book (it is
+#     cumulative across heads); only a CLEAN verdict or the PR leaving the queue clears it."
+# One fixed paragraph saying "a push re-arms both" was FALSE for the ceiling, and it reached a human —
+# the wrong half of a bound-telling. So the caller passes the true remedy for its own bound; `$6` is
+# required, so a future third bound cannot inherit a fact that is not its own.
+# ⛔ AND THE "WHAT HAPPENED" SENTENCE IS ARGUMENT `$5` FOR THE SAME REASON (fresh-context review, P2,
+# verified): it used to be a constant saying "this queue dispatched a fixer lane automatically", which
+# BOUND 2's path DISPROVES — the ceiling check returns before the brief and before `ps_spawn_fixer`, so
+# at the ceiling no fixer was dispatched at all (the suite's (v5) asserts `spawns=0` and still posts
+# the comment). One comment told the operator both that a lane ran and that no lane was spent, so a
+# spent ROUND was readable as a fixer that could not fix. Same rule as `$6`: required, so no bound can
+# inherit another bound's story.
+# ⛔ ARGUMENT ORDER, STATED ONCE SO IT CANNOT DRIFT AGAIN: $4 = the bound's finding, $5 = what happened
+# at THIS bound, $6 = how THIS bound clears. (A reviewer found these two paragraphs' numbers swapped
+# against the `local` declaration — exactly the doc/code divergence a third bound would have inherited.)
+ps_review_escalate() {
+  local repo="$1" pr="$2" sha="$3" why="$4" happened="$5" rearm="$6" tag seen body ghbin
+  ghbin="${PS_GH:-gh}"
+  command -v "$ghbin" >/dev/null 2>&1 || { printf '[prsick] #%s escalate: no usable gh — the reason is only in this log\n' "$pr"; return 1; }
+  tag="<!-- prsick-review-fix-cap:${sha:0:12} -->"
+  seen="$("$ghbin" api "repos/$repo/issues/$pr/comments?per_page=100" --paginate 2>/dev/null)" || {
+    printf '[prsick] #%s escalate: the PR comments are UNREADABLE — NOT posting (a blind post duplicates on every pass)\n' "$pr"; return 1; }
+  case "$seen" in *"$tag"*) return 0 ;; esac
+  body="$tag
+⛔ **pr-sickness: the review-fix loop for this head has STOPPED and needs a human.**
+
+$why
+
+**What already happened:** a fresh-context review recorded a \`not-clean\` verdict at \`${sha:0:12}\`. $happened
+
+**Nothing further will be dispatched for this head. How this bound clears:** $rearm
+
+Recorded by \`scripts/orchestrator-harness/pr-sickness.sh\` (agent-infra#4011)."
+  "$ghbin" api -X POST "repos/$repo/issues/$pr/comments" -f body="$body" >/dev/null 2>&1 || {
+    # ⛔ NO parkreason ON THIS PATH (fresh-context review, P3, verified): the caller deliberately does NOT
+    # park on a failed post (a parked head is refused by `ps_gates`, which is how a failed post used to
+    # lose the escalation for ever), so pointing the operator at `parkreason-<PR>` named a file this path
+    # never writes. The cause is THIS line, and the callers no longer discard it.
+    printf '[prsick] #%s escalate: the comment could not be posted (gh api POST failed) — the head is NOT parked, so a later pass retries; this line is the cause\n' "$pr"; return 1; }
+  printf '[prsick] #%s escalated on the PR: %s\n' "$pr" "$why"
+  return 0
+}
+
+# ps_review_decide <or> <pr> <sha> <br> -> 0 dispatched | 1 refused/skipped | 2 NOT a rejected head
+# ⛔ rc 2 IS THE FALL-THROUGH AND IT IS SILENT: the overwhelming majority of PRs have no record, a clean
+# record, or a record for an older head, and none of those may print a line on every pass. The arm
+# speaks only when it acts or refuses.
+ps_review_decide() {
+  local repo="$1" pr="$2" sha="$3" br="$4" rec rverdict rhead rfindings revidence rnote brief tag bcnt max book
+  rec="$(ps_record_for "$repo" "$pr")" || return 2
+  rverdict="$(printf '%s' "$rec" | cut -f1)"
+  case "${rverdict:-}" in
+    not-clean) : ;;
+    UNREADABLE)
+      # ⛔ REPORT IT AND FALL THROUGH (rc 2), DO NOT REFUSE THE PR. A corrupt record is not a verdict,
+      # so it may not authorise a fixer — and it may not SUPPRESS the other repair reasons either: a
+      # refusal here would let one unparseable file freeze a red PR's repair for ever, which is the
+      # fail-closed direction that costs real work rather than protecting any.
+      printf 'skip #%s: the review record is present but UNREADABLE (unparseable JSON, or no verdict field) — it authorises NO fixer; the check surface decides instead\n' "$pr"
+      return 2 ;;
+    # ⛔ CRITERION: A CLEAN VERDICT STARTS NOTHING. And neither does any other spelling: this arm's
+    # whole trigger is the negative verdict, so a value it does not recognise falls through to the
+    # surface path rather than being read as "not clean enough".
+    *) return 2 ;;
+  esac
+  rhead="$(printf '%s' "$rec" | cut -f2)"
+  [ "${rhead:-}" = "$sha" ] || return 2   # STALE: a push re-arms, and the new head gets its own verdict
+  rfindings="$(printf '%s' "$rec" | cut -f3)"
+  revidence="$(printf '%s' "$rec" | cut -f4)"
+  rnote="$(printf '%s' "$rec" | cut -f5)"
+
+  # ── the SAME three gates as a red head, from the one home ─────────────────────────────────────
+  ps_gates "$repo" "$pr" "$sha" || return 1
+  bcnt="${PS_BCNT:-0}"
+
+  # ── BOUND 1: this HEAD's repair budget (shared with the red path — a cap on a TREE, not a reason) ─
+  if ps_review_cap_hit "$bcnt"; then
+    printf 'skip #%s: review-fix budget exhausted (%s/%s fixer attempts at head=%s) — needs a human\n' \
+      "$pr" "$bcnt" "$(ps_maxtries "$PS_MAX_TRIES")" "${sha:0:12}"
+    # ⛔ A DRY RUN WRITES NOTHING AND POSTS NOTHING (fresh-context review, P2, verified). `report` is
+    # documented in this file as "read-only; never spawns" and `ps_select --dry-run` is a preview, but
+    # the bounds are evaluated BEFORE the dispatch's own dry-run guard — so a preview at a capped head
+    # parked the head and POSTED a public "needs a human" comment from a run that booked nothing. The
+    # field's convention for a preview mode is no writes at all (Renovate's `dryRun`), not "no spawns
+    # but everything else proceeds". Announced, so a dry run still TELLS you what it would do.
+    if [ "${PS_DRY_RUN:-0}" = "1" ]; then
+      printf 'REJECTED #%s -> would-park-and-escalate at the cap (dry-run: no park written, no PR comment posted)\n' "$pr"
+      return 1
+    fi
+    # ⛔ STOP *AND* ESCALATE — AND **POST BEFORE PARKING** (fresh-context review, P2, verified).
+    # `ps_gates` REFUSES a head parked at this sha, so parking first meant one failed POST (a transient gh
+    # failure, or this function's own `no usable gh` / `comments UNREADABLE` arms) LOST the PR-visible
+    # escalation for ever — and the README row promises one. The tag check is what makes a retry safe
+    # (a repeat pass finds the tag and posts nothing), so the order is: escalate, and park only on 0.
+    if ps_review_escalate "$repo" "$pr" "$sha" "**Cap hit:** \`PS_MAX_TRIES=$(ps_maxtries "$PS_MAX_TRIES")\` fixer attempts were spent on this head (\`${sha:0:12}\`) and the recorded verdict is still \`not-clean\` (${rfindings:-?} open finding(s)). A fixer that cannot fix is finite by design: dispatch stops here." "This queue booked \`$bcnt\` fixer attempt(s) against head \`${sha:0:12}\` — this budget is SHARED with the red-check source — and the recorded verdict is still \`not-clean\`, so a fixer that cannot fix is finite by design." "this budget is **keyed on the TREE** (\`psick-$pr-<head12>\`), so a **push re-arms it**: the new head gets its own budget, and any lane that pushes does that for you. To re-arm the head in place instead: \`rm -f \$O/state/psick-$pr-${sha:0:12} \$O/state/parked-$pr \$O/state/parkreason-$pr\`."; then
+      printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
+      # ⛔ THE REMEDY MUST NAME THE COUNTER THAT HOLDS THE BOUND (fresh-context review, P2, verified):
+      # the bound is `psick-<PR>-<sha12>` (`ps_gates` reads it, `ps_review_cap_hit` compares it). A remedy
+      # that removed only the park pair left the counter, so the very next pass re-parked with the same
+      # reason — an escape that does not escape, printed to the only operator who reads this file.
+      printf '%s\n' "a not-clean review at head=$sha is still unfixed after $bcnt fixer attempt(s) (PS_MAX_TRIES=$PS_MAX_TRIES) — a human must decide. This budget is keyed on the TREE, so a push re-arms it; to re-arm deliberately: rm -f '$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)' '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr'" \
+        > "$(ps_state_dir)/parkreason-$pr" 2>/dev/null || true
+    else
+      # NOT PARKED ON PURPOSE: the bound is still true, so the next pass re-reads it and retries the
+      # escalation instead of reading a park and giving up.
+      printf 'skip #%s: the escalation could NOT be posted (see above) — the head is NOT parked, so a later pass retries it\n' "$pr"
+    fi
+    return 1
+  fi
+
+  # ── BOUND 2: THE RECORDED REVIEW-ROUND CEILING (#3441), not a new one ──────────────────────────
+  # A fix round's product is a NEW HEAD whose review is refused once the PR has spent MAX_REVIEW
+  # rounds, so dispatching here buys a head nobody may review. Refuse and name it; the park keeps the
+  # queue from re-deciding this PR every pass.
+  if ps_review_ceiling_hit "$(ps_state_dir)" "$pr" "${PS_MAX_REVIEW:-${MAX_REVIEW:-10}}"; then
+    book="$(ps_review_rounds "$(ps_state_dir)" "$pr")"
+    max="$(ps_review_max "${PS_MAX_REVIEW:-${MAX_REVIEW:-10}}")"
+    printf 'skip #%s: review-round ceiling spent (rounds=%s/%s) — a fix would produce a head no review can be bought for\n' \
+      "$pr" "$book" "$max"
+    # Same dry-run contract as BOUND 1: a preview writes no park and posts no comment.
+    if [ "${PS_DRY_RUN:-0}" = "1" ]; then
+      printf 'REJECTED #%s -> would-park-and-escalate at the review-round ceiling (rounds=%s/%s) (dry-run: no park written, no PR comment posted)\n' \
+        "$pr" "$book" "$max"
+      return 1
+    fi
+    # Same ordering rule as BOUND 1: escalate FIRST, park only on success — a parked head is refused by
+    # `ps_gates`, so a failed POST must not be recorded as a park that loses the escalation for ever.
+    if ps_review_escalate "$repo" "$pr" "$sha" "**Review-round ceiling:** this PR has already spent \`$book\` of \`$max\` review rounds (\`state/reviewround-$pr\`, agent-infra#3441). A fixer dispatched now would push a NEW head, and the review of that head is refused by the same ceiling — so no fixer is spent." "**No fixer was dispatched for this head.** The review-round book was already spent when the verdict arrived, so a fix would buy a head whose review the same ceiling refuses — nothing was spent and nothing ran." "**a push does NOT re-arm this one.** \`state/reviewround-$pr\` is CUMULATIVE ACROSS HEADS by design (agent-infra#3441), so only a \`CLEAN\` verdict or the PR leaving the queue clears it. To re-arm deliberately: raise \`MAX_REVIEW\`, or \`rm -rf \$O/state/reviewround-$pr \$O/state/parked-$pr \$O/state/parkreason-$pr\`, or decide this PR by hand."; then
+      printf '%s\n' "$sha" > "$(ps_state_dir)/parked-$pr" 2>/dev/null || true
+      # ⛔ THE REMEDY IS `merge-one.sh`'s OWN ([rrceiling]), NOT "a push": the book is CUMULATIVE across
+      # heads, so a push produces a head whose review the same ceiling refuses — the operator would push
+      # and be exactly as stuck, with this parkreason telling them it was the remedy.
+      printf '%s\n' "this PR has spent its review-round ceiling (rounds=$book MAX_REVIEW=$max) at head=$sha, so a fixer here would produce a head no review may be bought for — a human must decide. This book is CUMULATIVE across heads, so a PUSH DOES NOT RE-ARM IT (only a CLEAN verdict or the PR leaving the queue clears it). To re-arm deliberately: rm -rf '$(ps_state_dir)/reviewround-$pr' '$(ps_state_dir)/parked-$pr' '$(ps_state_dir)/parkreason-$pr', or raise MAX_REVIEW" \
+        > "$(ps_state_dir)/parkreason-$pr" 2>/dev/null || true
+    else
+      printf 'skip #%s: the escalation could NOT be posted (see above) — the head is NOT parked, so a later pass retries it\n' "$pr"
+    fi
+    return 1
+  fi
+
+  # ── THE BRIEF CONTRACT IS CHECKED BEFORE THE SPAWN (#2258 / agent-infra#4011 criterion 4) ──────
+  # The fix lane's brief carries the RESEARCH-FIRST + PREVIOUS-WORK blocks; `fix-one.sh` refuses to run
+  # without them and validates the brief it GENERATES with `brief-gate.sh --check`. This is the second
+  # half: the CONTRACT itself must render on this box (a stale or missing copy is exactly the inert
+  # layer of inert-capability-effects §4), so a box that cannot produce it refuses HERE, by name,
+  # instead of spending a lane on a fixer whose brief lost its mandate.
+  local bgrc
+  brief_gate_probe >/dev/null 2>&1
+  bgrc=$?
+  if [ "$bgrc" -ne 0 ]; then
+    printf 'skip #%s: brief-gate.sh --section fixer REFUSED (exit %s) — the fix lane would have no research contract, so nothing was dispatched\n' "$pr" "$bgrc"
+    return 1
+  fi
+
+  brief="$(ps_review_brief "$repo" "$pr" "$sha" "$rfindings" "$revidence" "$rnote")" || {
+    printf 'skip #%s: review brief could not be written (state/ unwritable) — nothing spawned\n' "$pr"
+    return 1
+  }
+  tag="fix-$pr"
+  if [ "${PS_DRY_RUN:-0}" = "1" ]; then
+    printf 'REJECTED #%s findings=%s -> would-dispatch %s (dry-run: work item + brief written, no spawn)\n' \
+      "$pr" "${rfindings:-?}" "$tag"
+    return 0
+  fi
+  ps_spawn_fixer "$repo" "$pr" "$sha" "$br" "$bcnt" "$tag" || return 1
+  if declare -f dispreplace >/dev/null 2>&1; then
+    dispreplace "$pr" "$sha" "REJECTED" act "fixer spawned from a recorded not-clean verdict (${rfindings:-?} open finding(s), ${revidence:-no artifact named})"
+  fi
+  printf 'REJECTED #%s findings=%s -> dispatch %s\n' "$pr" "${rfindings:-?}" "$tag"
+  return 0
+}
+
+# brief_gate_probe -> 0 when the fixer contract renders on this box. ⛔ IT MUST RESOLVE THE **SAME COPY** THE
+# FIXER WILL LOAD (fresh-context review, P3, verified). `ps_spawn_fixer` spawns `$O/fix-one.sh`, and
+# fix-one.sh resolves its validator with `brief_gate_lib` (`spawn-gate.sh:3984-3997`), which searches
+# `${O:-}/brief-gate.sh` FIRST. A probe searching this module's sibling first would PASS on a checkout
+# copy while the dispatched fixer loaded `$O`'s and exited 78 at the validator step — BEFORE it can write
+# `fixgate-`/`fixbail-` (`fix-one.sh:86-89`), so `ps_spawn_fixer`'s booking is never refunded and the head
+# is finally parked and escalated for attempts that did no work. So: use `brief_gate_lib` itself when it
+# is loaded (it is, in every controller/lane context — `fix-one.sh:62` requires it), and otherwise keep a
+# fallback list whose ORDER MATCHES ITS OWN (`$O` first).
+brief_gate_probe() {
+  local d c
+  if declare -f brief_gate_lib >/dev/null 2>&1; then
+    c="$(brief_gate_lib 2>/dev/null)" || c=""
+    if [ -n "$c" ] && [ -f "$c" ]; then
+      bash "$c" --section fixer >/dev/null 2>&1
+      return $?
+    fi
+  fi
+  for c in "${O:-$HOME/orchestrator}/brief-gate.sh" \
+           "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/brief-gate.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh" \
+           "${HOME:-}/.pi/agent/scripts/orchestrator-harness/brief-gate.sh" \
+           "${HOME:-}/.pi/agent/scripts/brief-gate.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    bash "$c" --section fixer >/dev/null 2>&1 || return $?
+    return 0
+  done
+  return 80   # nothing rendered a contract: treated exactly like the gate's own refusal
+}
+# [reviewfix:end]
 
 # ── standalone report (read-only; never spawns) ──────────────────────────────────────────────
 ps_cli() {

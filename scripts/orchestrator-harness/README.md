@@ -433,7 +433,7 @@ a killed worker cannot take the controller down with it.
 | `chain-<N>` | `chain-merge.sh` | — | wait for the PR **and for the lane's merge-phase verdict**, then delegate to `merge-one.sh` if the lane did not merge it |
 | `review-<PR>` | `merge-one.sh` | — | **the review ORDER** for a `(PR, head)`: a fresh-context reviewer → evidence comment → signed record, then the same landing path as `merge-<PR>` if it came back CLEAN. Dispatched by the PR path on `NEEDS-REVIEW` (agent-infra#2971) — it was spawned under the `merge-<PR>` tag until then, so a pass that REVIEWED read in the log as another merge worker and `merge-10213` was re-spawned pass after pass |
 | `merge-<PR>` | `merge-one.sh` | — | **repo-authority-dependent**: gate mode = fresh review → signed record → wait green → squash-merge; rail mode = (a head-bound record already at the head, else the same fresh review → signed record first) → the repo's own `scripts/admin-merge.sh` (#1825) |
-| `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings, **a failing required check**, or **a rail refusal that names a red tree** (agent-infra#2223 — the RED-FIXER role in the sweep), push, re-run the merge chain. ONE fixer per PR by construction: all three reasons spawn under this session name, so a second reason while a fixer lives finds the session and spawns nothing |
+| `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings, **a failing required check**, **a rail refusal that names a red tree** (agent-infra#2223 — the RED-FIXER role in the sweep), or **a `not-clean` REVIEW RECORD at the live head** (`pr-sickness.sh`'s review-rejection source, agent-infra#4011: the record store is local, so a recorded verdict becomes a fixer with no agent noticing — bounded by the same per-head `psick-<PR>-<sha12>` tree budget and by the PR's `reviewround-<PR>` ceiling, and at a cap it PARKS the head and posts ONE tagged comment naming the cap), push, re-run the merge chain. ONE fixer per PR by construction: every reason spawns under this session name, so a second reason while a fixer lives finds the session and spawns nothing |
 | `cell-doctor` | `cloud-cell-doctor.sh loop` | `state/roles/`, `logs/doctor.log` | the cell's **own** scheduled roles — `doctor` (reap + restart a missing controller), `merge` (land attested PRs on the standard rail), `hygiene` (caches/worktrees **+ the cross-box review-record registry**: `registry-sync.sh union`, hourly, from a dedicated throwaway worktree of the agent-infra checkout, and **best-effort** — a failed sync logs the box/store/exit code and the pass continues, so a dark or rate-limited store can never fail a hygiene pass or block a merge decision; agent-infra#2577). Started by `cloud-cell-supervisor.sh start`; see §6.5.7 |
 
 ### State files (`$O/`)
@@ -3330,7 +3330,14 @@ repo=daniel-ospina/tortoise             open_prs=0     unplaced=0     dispatched
 The verdict words are the exit codes' own vocabulary and stay distinct: `clean` (`0`), `REFUSING`
 (`2` — I could not READ the queue), `UNPLACED` (`3` — I read it, placed the work, no worker took it),
 `CRASH` (`4`), `NO-CAPACITY` (`6` — the BOX's own spawn gate refused the order, so nothing was
-consumed; never `RED`, which is the generic unknown-code fallback). Each entry is `owner/name`, or
+consumed; never `RED`, which is the generic unknown-code fallback). Within the `3` family the
+record's own `verdict` field names the cause, because the remedies differ: `UNDELIVERED` (the
+transport refused — the same line carries `chain=<resolved path>`, `(MISSING)` when deploying is
+the repair), `REFUSED` (a worktree, `next=fix-worktree`), and `RUBRIC` (this pass holds no rubric
+for the repo it grades, so **no order could be placed and the chain was never invoked** —
+`next=supply-rubric`). Until `agent-infra#4009` all three read `next=repair-chain` and named no
+chain at all — measured over 2920 passes against a chain that answered `--status` in one call.
+Each entry is `owner/name`, or
 `owner/name=<checkout>` when the checkout is not the one
 `REPO` names; `?` in a column means the pass never got far enough to count it. Repeated `--repo`
 flags REPLACE the `PR_DOCTOR_REPOS` default rather than joining it (a named list is the narrower
