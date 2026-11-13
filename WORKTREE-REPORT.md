@@ -13,8 +13,8 @@ command is quoted verbatim so it can be re-run.
 
 | command | result |
 |---|---|
-| `python3.12 tools/fleet/triage.test.py` | `PASS=439 FAIL=0` |
-| `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (17 RED controls, all fired) |
+| `python3.12 tools/fleet/triage.test.py` | `PASS=454 FAIL=0` |
+| `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (20 RED controls, all fired) |
 | `uv run --quiet --with pytest --with pytest-timeout python -m pytest scripts/ -q --timeout=180` | `1436 passed, 3 skipped, 1 xpassed in 216.96s` |
 | `python3.12 tools/fleet/liveness.test.py` | `PASS=58 FAIL=0` (+ `every stated count matches the suite (58 tests, 113 mutations)`) |
 | `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | `FAILURES: 1` — **PRE-EXISTING, base-owned** (see below) |
@@ -117,12 +117,14 @@ then a hold (*"Checks passed at 14:02 and I'm blocked on your approval."*) is no
 (*"It was blocked on your approval yesterday, then it went through."*) still reads as an ask — the
 consequence is a paused finished lane and a bogus question, which is the cheap direction.
 
+| 11 (`123dc6cf7`) | **[P1]** the round-10 `_FRAME_FUTURE` was a second, hand-listed regex beside `_HOLD_CUE`: it fired on past-tense prose (*"Already approved by legal **before** your approval window closed, so I merged it."* read `asked`, suppressing a finished lane's nudge) and MISSED the deferral that matters most, `pending your word`, which routed `send-continue` into a lane waiting on its owner; **[P1]** `_DEPENDENCY` fired on position alone, so a REPORTED dependency (*"…had been blocked on your approval since Tuesday"*) re-armed the ask; **[P1]** the denial carve-out keyed on any hold, so *"Waiting on your approval held the release for a day and nothing needs your input now."* read `asked`; **[P2]** `_pane_lines` sized the read once, so a narrow pane or a >24k brief made the proof permanently unreachable (re-send every tick) | one deferral list decides both orders (a frame is a report unless the clause defers, and `pending your word` is now a cue); the denial carve-out is scoped to an IMPERATIVE (`please …`), which is what the two P0 asks actually were; a `_PAST_STATE` marker between the completion and the dependency means a clause reporting a finished block is not an ask; the pane window doubles on each retry (cap 2000 rows) instead of being sized once |
+
 ## What changed
 
 ```
 tools/fleet/triage.py          NEW  the router: precedence, wedged subcases, remedies, proof table
 tools/fleet/triage_arms.py     NEW  the three arms, each proving its effect at its artifact
-tools/fleet/triage.test.py     NEW  hermetic suite, 439 assertions, 17 RED controls
+tools/fleet/triage.test.py     NEW  hermetic suite, 454 assertions, 20 RED controls
 scripts/lane-route.py          NEW  operator CLI (route / --json / --apply)
 scripts/turn-end.py            MOD  gates its WIP nudge on route_gate(), and APPLIES a
                                     user-question route (batched, capped, bounded, logged)

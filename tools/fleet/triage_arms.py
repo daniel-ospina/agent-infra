@@ -356,7 +356,13 @@ def arm_user_question(ws: str, lane: str, question: str, surface: Surface,
     pane_missing = ["(pane unreadable)"]
     pane = None
     for attempt in range(3):
-        pane = surface.screen_tail(qws, _pane_lines(brief))
+        # ⛔ THE WINDOW GROWS ON EACH RETRY (round 11, #4046 P2). A single size cannot be right: the
+        # pane's column width decides how many ROWS a wrapped payload occupies, and nothing reads the
+        # width, so on a narrow pane the derived window is short — and above a ~24k brief the ceiling
+        # binds. In both cases the proof would be unreachable, and the dedupe (which honours only a
+        # prior `verified: true`) would re-send the brief every tick, forever. Retrying wider turns a
+        # permanent false FAIL into one extra read.
+        pane = surface.screen_tail(qws, min(2000, _pane_lines(brief) * (2 ** attempt)))
         if pane is not None:
             # ⛔ BOUND TO *THIS* QUESTION (round 7, #4046 P0). See `question_qid`: without it the
             # previous question's brief certifies this one, and the dedupe makes the non-delivery

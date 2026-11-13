@@ -680,14 +680,53 @@ def run_red_control() -> bool:
     # before I promote." — an imperative ask whose object is a negative. Mutant: make the denial
     # unconditional again and require the SAME sentence's answer to change.
     denial_ask = ("Please confirm nothing needs your attention on the staging config before I promote.")
-    _real_hold_denial = triage._HOLD_CUE_DENIAL
-    triage._HOLD_CUE_DENIAL = re.compile(r"(?!x)x")          # never matches
+    _real_imperative = triage._IMPERATIVE
+    triage._IMPERATIVE = re.compile(r"(?!x)x")               # no imperative ⇒ unconditional denial
     try:
         blind_denial = triage.asks_owner(denial_ask)
     finally:
-        triage._HOLD_CUE_DENIAL = _real_hold_denial
+        triage._IMPERATIVE = _real_imperative
     good &= _red("R17 an unconditional denial WOULD silence an ask whose object is negative",
                  blind_denial == "not-asked" and triage.asks_owner(denial_ask) == "asked")
+
+    # (R18) ⛔ ONE DEFERRAL LIST, AND IT DECIDES BOTH ORDERS (round 11, #4046 P1). Round 10 put a
+    # hand-listed `_FRAME_FUTURE` next to `_HOLD_CUE`; it fired on past-tense prose ("…before your
+    # approval window closed, so I merged it." read `asked`, suppressing a finished lane's nudge) and
+    # missed `pending your word`, which routed `send-continue` into a lane waiting on its owner.
+    frame_report = ("Already approved by legal before your approval window closed, so I merged it.")
+    # ⛔ THE NO-COMMA FORM IS THE REAL TEST: the comma variant passes on the clause splitter, i.e. on
+    # punctuation rather than on the rule. Both must read `asked`.
+    frame_ask = "Per your decision last week the release stays parked pending your word."
+    good &= _red("R18 a past-tense frame report is not disarmed by a temporal word",
+                 triage.asks_owner(frame_report) == "not-asked")
+    good &= _red("R18b …and a frame followed by a DEFERRAL is an ask",
+                 triage.asks_owner(frame_ask) == "asked")
+    _real_hold = triage._HOLD_CUE
+    triage._HOLD_CUE = re.compile(r"(?!x)x")                 # no deferral vocabulary at all
+    try:
+        blind_frame = triage.asks_owner(frame_ask)
+    finally:
+        triage._HOLD_CUE = _real_hold
+    good &= _red("R18c without the deferral list that ask would be disarmed",
+                 blind_frame == "not-asked")
+
+    # (R19) ⛔ A DEPENDENCY THE CLAUSE IS *REPORTING* IS NOT THE ONE IT ENDS ON (round 11, #4046 P1).
+    # "Deploy finished at 14:02 and the release had been blocked on your approval since Tuesday." was
+    # read as an ask by position alone, suppressing a finished lane's nudge.
+    past_dep = ("Deploy finished at 14:02 and the release had been blocked on your approval since "
+                "Tuesday.")
+    present_dep = "Checks passed at 14:02 and I'm blocked on your approval."
+    good &= _red("R19 a reported past dependency is not an ask",
+                 triage.asks_owner(past_dep) == "not-asked"
+                 and triage.asks_owner(present_dep) == "asked")
+    _real_past_state = triage._PAST_STATE
+    triage._PAST_STATE = re.compile(r"(?!x)x")               # position alone again
+    try:
+        blind_dep = triage.asks_owner(past_dep)
+    finally:
+        triage._PAST_STATE = _real_past_state
+    good &= _red("R19b …and without the past-state gate that same report WOULD read as an ask",
+                 blind_dep == "asked")
 
     # (R12) ⛔ THE PER-QUESTION ID IS WHAT DEFEATS A STALE PANE (round 7, #4046 P0). The question
     # lane is persistent, so its tail still shows the PREVIOUS brief, and both briefs carry the same
@@ -1631,7 +1670,14 @@ def leg_round7() -> None:
     # ("Please confirm nothing needs your attention…"), the negative dependency ("I can't proceed
     # without sign-off."), a completion and its hold joined by `and` in ONE clause, and a past-decision
     # frame followed by a deferral.
-    for txt in ("Please confirm nothing needs your attention on the staging config before I promote.",
+    # ⛔ ROUND 11 (regressions in the round-10 predicates, plus the deferral it missed). Every one of
+    # these was measured through `may_continue()` — the predicate `turn-end.py` gates on.
+    for txt in ("Per your decision last week, the release stays parked pending your word.",
+                "Per your decision last week the release stays parked pending your word.",
+                "Per your decision last week I'll wait for your go-ahead.",
+                "As you decided I'll wait for your word before landing it.",
+                "Given the plan already approved I'll hold the deploy for your steer.",
+                "Please confirm nothing needs your attention on the staging config before I promote.",
                 "Please confirm nothing is blocked on the deploy.",
                 "I can't proceed without sign-off.",
                 "I cannot proceed without your sign-off.",
@@ -1697,7 +1743,15 @@ def leg_round7() -> None:
                 "Your go-ahead landed and nothing needs your input now.",
                 "Your call matched the plan already approved.",
                 "Your call on the schema came out as you decided.",
-                "Your decision aligned with the spec approved by legal."):
+                "Your decision aligned with the spec approved by legal.",
+                # ⛔ ROUND 11: the round-10 predicates over-fired on past-tense prose.
+                "Already approved by legal before your approval window closed, so I merged it.",
+                "Deploy finished at 14:02 and the release had been blocked on your approval since "
+                "Tuesday.",
+                "All 439 tests passed at 14:02 and the queue had been blocked on your approval all "
+                "morning.",
+                "Waiting on your approval held the release for a day and nothing needs your input now.",
+                "Awaiting approval blocked us for a day and nothing needs your input now."):
         e = ev(lane="lane-7", last_text=txt, lane_verdict="WIP-IDLE", steerable=True)
         may, r = triage.may_continue(e)
         ok("a completed report is not an ask: %r" % txt[:38], may is True,

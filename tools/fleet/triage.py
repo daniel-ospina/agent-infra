@@ -248,19 +248,27 @@ _FUTURE_CUE = re.compile(
 # FINISHED lane losing its nudge and being queued as a question. "Awaiting your sign off on the fix
 # approved by legal." is the shape the rule exists for; "Your decision aligned with the spec approved by
 # legal." is a report.
+# ⛔ ONE LIST OF DEFERRALS, USED BY EVERY BRANCH (round 11, #4046 P1). Round 10 added a second,
+# hand-listed `_FRAME_FUTURE` next to this one and it fired on ordinary past-tense prose — "Already
+# approved by legal BEFORE your approval window closed, so I merged it." read `asked`, suppressing a
+# finished lane's nudge — while MISSING the deferral that matters most, `pending your word`, which this
+# list already knew as a hold. The deferral forms below are the verb/preposition shapes ("wait for
+# your", "hold the", "for your word"); bare possessives ("your approval") are deliberately absent —
+# they are subjects in reports and were the cause of the round-9 over-fire.
 _HOLD_CUE = re.compile(
     r"\b(?:awaiting your|awaiting a|awaiting approval|awaiting instruction|awaiting a steer|"
-    r"waiting (?:on|for) your|pending your|blocked on your|please (?:confirm|approve|sign)|"
-    r"sign off|hold here until)\b")
-# `_HOLD_CUE` minus bare "sign off": a report can OPEN with "Your sign off came in and …".
-_HOLD_CUE_DENIAL = re.compile(
-    r"\b(?:awaiting your|awaiting a|awaiting approval|awaiting instruction|awaiting a steer|"
-    r"waiting (?:on|for) your|pending your|blocked on your|please (?:confirm|approve|sign)|"
-    r"hold here until)\b")
-# A STRONG deferral marker for the frame branch. `_FUTURE_CUE` cannot be reused: it carries
-# `your call on`, which is how ordinary reports open ("Your call on the schema came out as you decided.").
-_FRAME_FUTURE = re.compile(
-    r"\b(?:i'?ll|i will|we'?ll|shall|until|once|before|please|need|waiting|await|hold)\b")
+    r"waiting (?:on|for) your|wait(?:ing)? for your|pending your|blocked on your|"
+    r"please (?:confirm|approve|sign)|sign off|hold here until|hold(?:ing)? (?:the|this|it)|"
+    r"for your (?:word|steer|go-ahead|nod|call on)|(?:stays|stayed|is) parked|parked pending)\b")
+# An IMPERATIVE to the owner: everything after it is the thing being asked about.
+_IMPERATIVE = re.compile(
+    r"\b(?:please\b|tell me (?:if|whether|when)|let me know (?:if|whether|when)|"
+    r"confirm (?:that|whether)|check (?:that|whether))\b")
+# A state the clause REPORTS rather than one it ends on — used to keep a past-tense dependency
+# ("…had been blocked on your approval since Tuesday") out of the ask's way.
+_PAST_STATE = re.compile(
+    r"\b(?:had been|has been|was|were|since|cleared|ended|resolved|last (?:night|week|month)|"
+    r"yesterday|all morning|for a day)\b")
 # A dependency PREDICATE — the owner is what the clause ends on.
 _DEPENDENCY = re.compile(
     # ⛔ NOT `pending your` (round 10): it is the MODIFIER form — "Landed it pending your approval from
@@ -317,21 +325,22 @@ def _disarmed(low: str, cue_at=None) -> bool:
     # your input." — which is why `_HOLD_CUE_DENIAL` is `_HOLD_CUE` minus it.
     denied = _PAST_HARD_DENIAL.search(low)
     if denied:
-        held = _HOLD_CUE_DENIAL.search(low)
-        if not (held is not None and denied.start() > held.start()):
+        # ⛔ A DENIAL IS UNCONDITIONAL — UNLESS AN IMPERATIVE PRECEDES IT (round 11, #4046 P1). Round
+        # 10 carved the denial out on any preceding HOLD, which let past-tense reports through:
+        # "Waiting on your approval held the release for a day and nothing needs your input now." read
+        # `asked`, pausing a finished lane. The two asks the carve-out exists for are imperatives
+        # ("Please confirm nothing needs your attention …"), so the imperative IS the discriminator.
+        imp = _IMPERATIVE.search(low)
+        if not (imp is not None and denied.start() > imp.start()):
             return True
     frame = _PAST_HARD_FRAME.search(low)
     if frame:
-        hold = _HOLD_CUE.search(low)
-        # "…the fix approved by legal" modifies the hold's object; "…as you decided" reports a decision.
-        if hold is not None and frame.start() > hold.start():
-            pass
-        elif _FRAME_FUTURE.search(low):
-            # ⛔ A FRAME CAN BE FOLLOWED BY A DEFERRAL (round 10, #4046 P2): "Per your decision last
-            # week I'll wait for your go-ahead." defers to the owner AFTER naming a past decision, and
-            # the only thing separating it from the report ("…, the schema is closed.") was a comma.
-            pass
-        else:
+        # ⛔ A FRAME IS A REPORT UNLESS THE CLAUSE DEFERS TO THE OWNER (round 11, #4046 P1). "Per your
+        # decision last week I'll wait for your go-ahead." defers AFTER naming the decision; "…, the
+        # schema is closed." reports. One list decides both orders, so this cannot drift from the
+        # vocabulary the way a hand-listed second regex did (and `pending your word` — a miss in round
+        # 10 that routed `send-continue` into a lane waiting on its owner — is already in this list).
+        if _HOLD_CUE.search(low) is None:
             return True
     if _PAST_HARD_ANCHOR.search(low):
         # An anchor needs a COMPLETION to be a report — one that is the LANE's, not the ask's object —
@@ -347,7 +356,13 @@ def _disarmed(low: str, cue_at=None) -> bool:
         # starts after the completion is what the clause leaves the owner with.
         dep = _DEPENDENCY.search(low)
         if dep is not None and dep.start() > done.start():
-            return False
+            # ⛔ …A DEPENDENCY THE CLAUSE IS *REPORTING* IS NOT THE ONE IT ENDS ON (round 11, #4046
+            # P1). "Deploy finished at 14:02 and the release had been blocked on your approval since
+            # Tuesday." is a report of a block that is over; position alone read it as an ask and
+            # suppressed the finished lane's nudge. A past-state marker between the completion and the
+            # predicate is what separates "had been blocked" from "I'm blocked".
+            if not _PAST_STATE.search(low[done.start():dep.start()]):
+                return False
         return not _FUTURE_CUE.search(low)
     return bool(_PAST_SOFT.search(low)) and not _FUTURE_CUE.search(low)
 
@@ -389,6 +404,12 @@ _HANDOFF = (
     "your decision", "up to you", "need your", "need approval", "needs approval",
     "needs your approval", "once you decide", "once you approve", "if you approve",
     "once you've approved", "on your approval", "for your approval", "pending your approval",
+    # ⛔ `pending your word` (round 11, #4046 P1): the deferral form the round-10 fix missed while it
+    # carried "I'll wait for your go-ahead" — measured, "Per your decision last week, the release stays
+    # parked pending your word." read `not-asked` and routed `send-continue` into a lane waiting on its
+    # owner. The list had `pending your approval`/`pending your decision` and `on your word`, never the
+    # cross product.
+    "pending your word", "pending your go", "pending your sign", "pending your call on",
     "pending your decision", "please confirm", "please approve", "your confirmation",
     "your approval", "on your go",
     # ⛔ "sign off" (round 7, #4046 P0). "Please sign off on the invoice from last week." read
