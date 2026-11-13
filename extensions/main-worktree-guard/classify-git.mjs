@@ -8390,6 +8390,12 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     const out = [];
     for (;;) {
       const p = skipWsNl(k);
+      // ⛔ A `#` AT WORD START IS A COMMENT, and it must stop the scan: consuming
+      // it as an operand word swallowed the comment (so a command AFTER it — which
+      // bash never runs — was modelled as running: a measured FALSE REFUSAL). The
+      // main walker's own comment skip ("# starts a comment at a word boundary")
+      // then takes over from `p`.
+      if (s[p] === "#") return { args: out, k: p };
       const w = readWord(p);
       if (!w.w) return { args: out, k: p };
       if (!(/^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<"))) out.push(w.w);

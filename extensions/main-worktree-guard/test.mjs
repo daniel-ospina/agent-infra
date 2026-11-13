@@ -5643,6 +5643,16 @@ try {
     blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd ../c extra; echo x > tracked.md", "R3j gate: TRACKED b/tracked.md → BLOCK (a model that cds to c resolves c → ALLOW)");
     has("cd a; pushd ../docs; pushd -n ../c +1; popd; echo x > tracked.md", "redirect:H/c/tracked.md", "R3k: `pushd -n ../c +1` — the FIRST operand picks the mode, so this INSERTS c; the popd lands on c");
     blocks(["c/tracked.md"], "cd a; pushd ../docs; pushd -n ../c +1; popd; echo x > tracked.md", "R3k gate: TRACKED c/tracked.md → BLOCK (reading it as a rotation lands on docs instead → ALLOW)");
+    // ⛔ A `#` AT WORD START IS A COMMENT, and the argv scan must not eat it as an
+    // operand word (#3955 review round 4 — a regression the scan introduced).
+    // Swallowing it made the command AFTER it — `; echo x > tracked.md`, which bash
+    // NEVER runs — look like a live write (a measured false refusal).
+    expectBool("C437r47: R3l: a `#` at word start ENDS the operand scan — the commented-out write is not modelled",
+      cands("cd a; pushd ../docs; popd -n # comment; echo x > tracked.md").length, 0);
+    // …and the operands BEFORE the comment still apply: `popd -n +1 # c` drops
+    // element 1 (real bash), so the next popd lands on a, not on docs.
+    has("cd a; pushd ../docs; pushd ../b; popd -n +1 # c\npopd; echo x > tracked.md", "redirect:H/a/tracked.md", "R3l: operands before a `#` comment still apply — `popd -n +1 # c` drops element 1");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n +1 # c\npopd; echo x > tracked.md", "R3l gate: TRACKED a/tracked.md → BLOCK (a scan that ate the comment as words changed nothing, leaving the popd on docs → ALLOW)");
   }
 
 
