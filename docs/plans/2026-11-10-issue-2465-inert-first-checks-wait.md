@@ -42,7 +42,7 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 | B | Change the #2862 re-derive budget to "spend on outcome, not attempt" | **Reverses a recorded in-code decision** (`scripts/admin-merge.sh`: "THE BUDGET IS SPENT ON THE ATTEMPT, NOT ON THE OUTCOME", with its reason — an unreadable probe must not retry per poll) and its pinned arm (e). Not adopted. |
 | C | **Refuse** instead of falling back when the lane is structurally inapplicable | Turns an inert wait into a false block on a green PR. |
 | D ✅ | Classify ONCE (§0b) and let the wait consume that decision; the probe is consulted for **EVERY** inapplicable class — `none` → widen, `has-run` → keep the lane (#1614), `unreadable` → widen **only** for `STRUCTURAL` | The issue's own suggested direction; keeps `paths-excluded` (where "did it run?" IS information) on the probe; unfiltered ⊇ filtered, and §4.5 still grades every workflow. ⛔ **NOT "skip the run probe for the structural class"** — that was the first cut, it reversed the recorded #1614 dead-end gate, and it was rejected as a review P0 (`09d19b159`). The probe is called unconditionally (`admin-merge.sh`, `lane_head_run_state` before the `case`). |
-| E ✅ | Carry `--no-wait` to the land step as `ADMIN_MERGE_FIRST_CHECKS_WAIT=0`, **and clear an inherited `STALL`/`CEILING`** | The rail has no `--no-wait` flag; its 0 seam already means "one observation, no waiting". ⛔ The seam is CONDITIONAL on neither progress bound being set, so carrying the window alone lets an inherited `STALL`/`CEILING` re-enable the wait and bound it there (8760 s / 18064 s) — the same defect one layer down. An explicit `ADMIN_MERGE_FIRST_CHECKS_WAIT` in the environment still wins; the bounds are cleared loudly, never silently. |
+| E ✅ | Carry `--no-wait` to the land step as `ADMIN_MERGE_FIRST_CHECKS_WAIT=0` **plus the rail's dedicated `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` seam** | The rail has no `--no-wait` flag; its 0 seam already means "one observation, no waiting". ⛔ The seam is CONDITIONAL on neither progress bound being set, so carrying the window alone lets an inherited `STALL`/`CEILING` re-enable the wait and bound it there (8760 s / 18064 s) — the same defect one layer down. ⛔ **Clearing those bounds is the WRONG remedy**: `ADMIN_MERGE_FIRST_CHECKS_CEILING` is also a TERM of the derived whole-attempt bound (`rail_deadline_default`) that `rail_attempt_start` ties to `ADMIN_MERGE_LOCK_TTL`, so emptying it RAISES the bound (CEILING 600 → 18064 is 3990 s → 21454 s) and a legal `LOCK_TTL=6000` is refused with exit 2 — a working land invocation turned into a hard failure by the flag that exists to stop waiting. `ONESHOT` carries the intent without touching the arithmetic. An explicit `ADMIN_MERGE_FIRST_CHECKS_WAIT` in the environment still wins. |
 
 ## Integration Surface Map
 
@@ -52,7 +52,7 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 | `admin-merge.sh` §0b `unknown` arm | was silent → prints reason + escape | same suite A(d) |
 | `admin-merge.sh` `lane_no_pr_trigger` (new helper) | reason classifier — which class §0b is in | unit: arm (a) is the attributable row, plus the single-definition guard and mutant (h) (`tests/issue-2465-inert-wait/run.sh`); integration: `tests/admin-merge/run.sh` §#1614 **arm (f)** — a `no-pr-trigger` lane whose single probe read FAILED |
 | `admin-merge.sh` FIRST-CHECKS wait | **unchanged** (contract intact) | `tests/first-checks-lane-rederive/run.sh` (37 arms, re-run) |
-| `atomic-land.sh` `do_land` | env carry to the land step | `tests/issue-2465-inert-wait/run.sh` B1-B5 |
+| `atomic-land.sh` `do_land` | env carry to the land step | `tests/issue-2465-inert-wait/run.sh` B1-B6, `tests/admin-merge/run.sh` §79 (g1)-(g3) |
 | `tests/*/run.sh` discovery | new suite auto-wired by the glob (`scripts/run-bash-shards.sh:203`) | shard runner |
 
 ## Wiring
@@ -93,8 +93,14 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
    failure named, lane dropped from the certificate).
 2. Print the `unknown` arm's reason + the `--any-workflow` escape (it was `:` — quiet by design).
    Test: A(d) asserts the line; deleting it reds A(d).
-3. Carry `--no-wait` into the land step as `ADMIN_MERGE_FIRST_CHECKS_WAIT=0`, never overriding an
-   explicit knob. Test: B1-B5 against a fake land step that reports its own environment.
+3. Carry `--no-wait` into the land step as `ADMIN_MERGE_FIRST_CHECKS_WAIT=0` plus
+   `ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1`, never overriding an explicit knob and never
+   touching the `STALL`/`CEILING` bounds (they are inputs to the derived whole-attempt
+   bound, so clearing them can refuse a legal `ADMIN_MERGE_LOCK_TTL`). Test: B1-B6 against a
+   fake land step that reports its own environment, plus §79 (g1)-(g3) driving the real
+   wait: bounds set + no seam reaches a CEILING verdict and polls; the same bounds with the
+   seam take ONE observation and name `(window 0s)`; an explicit `STALL` with no seam still
+   re-enables the wait.
 4. PROVE: run the new suite, the #2862 wait suite (unchanged contract) and the bash-3.2 parse guard.
 
 ## Rounds

@@ -765,7 +765,21 @@
 #                                         yet, or the run list cannot be read.
 #                                         0 disables the wait (the pre-#2090
 #                                         instant refusal) when neither of the
-#                                         two progress bounds below is set.
+#                                         two progress bounds below is set, or
+#                                        when ONESHOT is set (see below).
+#   ADMIN_MERGE_FIRST_CHECKS_ONESHOT     non-empty asks for "one observation, no
+#                                        waiting" WITHOUT touching the progress
+#                                        bounds. `ADMIN_MERGE_FIRST_CHECKS_WAIT=0`
+#                                        alone cannot do that: the 0 seam is
+#                                        conditional on STALL/CEILING being unset,
+#                                        and CEILING is a TERM of the derived
+#                                        whole-attempt bound (`rail_deadline_default`)
+#                                        that `rail_attempt_start` ties to
+#                                        ADMIN_MERGE_LOCK_TTL — so a caller that
+#                                        cleared the bounds to get one observation
+#                                        would RAISE the reachable deadline (600 to
+#                                        18064) and be refused with exit 2. This seam
+#                                        carries the intent, not the arithmetic (#2465).
 #   ADMIN_MERGE_FIRST_CHECKS_STALL       the STALL period (seconds, default 8760 =
 #                                         2 × the longest MEASURED single step,
 #                                         4380s): the wait gives up only when
@@ -5434,10 +5448,22 @@ wait_for_first_checks() {
   # nobody asked for. An explicit STALL/CEILING re-enables it (that is how the
   # suite drives the new arms in seconds), which is why the test for the seam is
   # "0 and nothing else set", not "0".
+  # ⛔ AND ONE-SHOT NEEDS ITS OWN SEAM (#2465, review round 2 P2). The condition
+  # here is on the BOUND KNOBS, and `ADMIN_MERGE_FIRST_CHECKS_CEILING` is ALSO a term
+  # of the derived whole-attempt bound (`rail_deadline_default`) that
+  # `rail_attempt_start` ties to `ADMIN_MERGE_LOCK_TTL` (the TTL must EXCEED it, or
+  # exit 2). So a caller that bought "one observation" by CLEARING the bounds would
+  # silently RAISE the reachable deadline (CEILING 600 -> 18064 takes the bound from
+  # 3990s to 21454s) and get REFUSED — a legal land invocation turned into exit 2 by
+  # a flag whose whole job is to stop waiting. `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` asks
+  # for the one-shot behaviour WITHOUT touching the bounds, so the deadline and the
+  # lease relation stay exactly what the operator's own knobs imply. The explicit
+  # STALL/CEILING re-enable path is preserved unchanged.
   local wait_enabled=1
   if [ "$((10#$FIRST_CHECKS_WAIT))" -eq 0 ] \
-     && [ -z "${ADMIN_MERGE_FIRST_CHECKS_STALL:-}" ] \
-     && [ -z "${ADMIN_MERGE_FIRST_CHECKS_CEILING:-}" ]; then
+     && { [ -n "${ADMIN_MERGE_FIRST_CHECKS_ONESHOT:-}" ] \
+          || { [ -z "${ADMIN_MERGE_FIRST_CHECKS_STALL:-}" ] \
+               && [ -z "${ADMIN_MERGE_FIRST_CHECKS_CEILING:-}" ]; }; }; then
     wait_enabled=0
   fi
   local args=()

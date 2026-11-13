@@ -1114,6 +1114,7 @@ run_admin() {
     "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
     "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
     "ADMIN_MERGE_FIRST_CHECKS_STALL=${SUITE_FIRST_CHECKS_STALL:-}"
+    "ADMIN_MERGE_FIRST_CHECKS_ONESHOT=${SUITE_FIRST_CHECKS_ONESHOT:-}"
     "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
     # #gh-quota: the backoff ceiling DEFAULTS to the poll step here, so every
     # scenario written before the backoff existed keeps its exact poll count. A
@@ -1144,6 +1145,7 @@ run_admin_here() {
     "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
     "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
     "ADMIN_MERGE_FIRST_CHECKS_STALL=${SUITE_FIRST_CHECKS_STALL:-}"
+    "ADMIN_MERGE_FIRST_CHECKS_ONESHOT=${SUITE_FIRST_CHECKS_ONESHOT:-}"
     "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
     # #gh-quota: see run_admin's copy — the backoff ceiling defaults to the poll
     # step, so a pre-existing scenario's poll count is unchanged unless it opts in.
@@ -2614,6 +2616,7 @@ run_admin_repro() {
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
     "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
     "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
+    "ADMIN_MERGE_FIRST_CHECKS_ONESHOT=${SUITE_FIRST_CHECKS_ONESHOT:-}"
     "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
     "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
   )
@@ -16962,6 +16965,74 @@ fi
 # ⛔ `set +e` MUST PRECEDE every arm added below this line. A future block that wants
 # `set -e` must scope it with its own `set +e` on exit, not leave it latched.
 set +e
+
+# ── 79 (g). #2465 THE ONE-SHOT SEAM: it disables the wait with the BOUNDS STILL SET ──
+# `ADMIN_MERGE_FIRST_CHECKS_WAIT=0` is not enough on its own: the 0 seam is conditional
+# on the two progress bounds being UNSET, so a caller with an inherited
+# ADMIN_MERGE_FIRST_CHECKS_STALL/CEILING keeps a live, bounded wait. #2465's second
+# mechanism (`atomic-land.sh --no-wait`) therefore needs a way to say "one observation"
+# WITHOUT clearing those knobs — clearing them is the WRONG remedy, because
+# ADMIN_MERGE_FIRST_CHECKS_CEILING is a TERM of the derived whole-attempt bound
+# (`rail_deadline_default`) that `rail_attempt_start` ties to ADMIN_MERGE_LOCK_TTL: a
+# caller with CEILING=600 and LOCK_TTL=6000 lands fine (the bound is 3990s), and emptying
+# CEILING raises the bound to 21454s so the SAME invocation is refused with exit 2.
+# Both arms below drive the identical scenario; only ONESHOT differs.
+echo "== 79 (g). #2465 the ONE-SHOT seam disables the wait while the progress bounds stay SET =="
+new_scen fq-oneshot
+HEAD_OS="f7fb000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_OS" > "$SCEN/head"
+# A run that is never terminal: without the seam this wait can only reach its ceiling.
+lane_queued "$HEAD_OS" 9821 > "$SCEN/runs-$HEAD_OS"
+first_checks_line queued "" "$HEAD_OS" 9821 2026-11-03T01:00:00Z > "$SCEN/first-checks-gen-1"
+first_checks_jobs_gen 9821 1 0 0
+lane_fail osmain 9822 > "$SCEN/runs-main"
+# (g1) THE CONTRAST: bounds set, NO seam — the 0 seam does NOT fire and the wait RUNS
+# to its ceiling. This is the behaviour the flag has to defeat, measured, not asserted.
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9821"
+SUITE_FIRST_CHECKS_WAIT=0 SUITE_FIRST_CHECKS_CEILING=2 SUITE_FIRST_CHECKS_STALL=900 \
+  SUITE_FIRST_CHECKS_POLL=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+os_polls_no="$(cat "$SCEN/first-checks-list-count" 2>/dev/null || echo 0)"
+# ⛔ THE DISCRIMINATOR IS THE VERDICT WORD AND THE POLL COUNT, NOT THE WORD "expired".
+# The 0-seam's refusal and the ceiling timeout BOTH say "expired after" (the 0-seam
+# falls to `block_on_first_checks`'s `*)` arm and prints "… (window 0s)"), so grepping
+# "expired" here would be a check that cannot tell the two apart — an earlier draft of
+# this arm did exactly that and reported a FALSE failure. The signals that actually
+# differ: the ceiling verdict names `(ceiling Ns)`, the 0-seam names `(window 0s)`, the
+# stall verdict says `STALLED`, and only an ENABLED wait polls more than once.
+grep -q 'FIRST-CHECKS wait expired after' "$SCEN/err" && grep -q '(ceiling' "$SCEN/err" \
+  && pass "(g1) WITHOUT the seam, bounds set + WAIT=0 still reaches a CEILING verdict — the 0 seam is conditional, so the flag needs a seam of its own" \
+  || fail "(g1) the contrast arm did not reach a ceiling verdict (and/or did not expand the wait) — then (g2) proves nothing (fixture drift)"
+[ "${os_polls_no:-0}" -ge 2 ] \
+  && pass "(g1) …and it really POLLED (${os_polls_no} run-list reads), so the comparison in (g2) is not vacuous" \
+  || fail "(g1) the contrast arm made only ${os_polls_no} poll(s) — an enabled wait must poll"
+# (g2) THE FIX: identical bounds, ONESHOT set — ONE observation, no ceiling burn.
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9821"
+_os_t0="$(date -u +%s)"
+SUITE_FIRST_CHECKS_WAIT=0 SUITE_FIRST_CHECKS_CEILING=2 SUITE_FIRST_CHECKS_STALL=900 \
+  SUITE_FIRST_CHECKS_ONESHOT=1 SUITE_FIRST_CHECKS_POLL=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+_os_t1="$(date -u +%s)"
+os_polls="$(cat "$SCEN/first-checks-list-count" 2>/dev/null || echo 0)"
+grep -q '(ceiling' "$SCEN/err" \
+  && fail "(g2) the seam did not disable the wait: a CEILING verdict still fired with the bounds set" \
+  || pass "(g2) WITH the seam the same bounds do NOT produce a ceiling verdict — the wait was disabled, not shortened"
+grep -q '(window 0s)' "$SCEN/err" \
+  && pass "(g2) …the refusal names the 0 seam (window 0s), i.e. it took the ONE-OBSERVATION path" \
+  || fail "(g2) the refusal did not name the 0 seam — the seam did not reach the wait"
+[ "${os_polls:-0}" -le 1 ] \
+  && pass "(g2) …and it took ONE observation (${os_polls} run-list read(s) in $(( _os_t1 - _os_t0 ))s) — one observation, no waiting" \
+  || fail "(g2) the seam still polled ${os_polls} times — it shortened the wait instead of disabling it"
+# (g3) NO GRATUITOUS CHANGE: an explicit STALL/CEILING with no seam still re-enables the
+# wait (the documented suite seam), so the new knob did not quietly replace it.
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9821"
+SUITE_FIRST_CHECKS_WAIT=0 SUITE_FIRST_CHECKS_CEILING=2 SUITE_FIRST_CHECKS_STALL=1 \
+  SUITE_FIRST_CHECKS_POLL=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+grep -q 'STALLED' "$SCEN/err" \
+  && pass "(g3) an explicit STALL with NO seam still re-enables the wait — the documented path is untouched" \
+  || fail "(g3) the explicit-bound path no longer waits — the new seam changed pre-existing behaviour"
+
 
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`

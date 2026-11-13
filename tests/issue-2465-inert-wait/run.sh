@@ -322,6 +322,7 @@ cat > "$FAKE_LAND" <<'LANDEOF'
 # own report and is discarded), so a fake that printed to stdout would assert NOTHING —
 # which is exactly how arm B first came out green-with-empty-values.
 printf 'LAND_SAW_WAIT=[%s]\n' "${ADMIN_MERGE_FIRST_CHECKS_WAIT-<unset>}" >&2
+printf 'LAND_SAW_ONESHOT=[%s]\n' "${ADMIN_MERGE_FIRST_CHECKS_ONESHOT-<unset>}" >&2
 printf 'LAND_SAW_STALL=[%s]\n' "${ADMIN_MERGE_FIRST_CHECKS_STALL-<unset>}" >&2
 printf 'LAND_SAW_CEILING=[%s]\n' "${ADMIN_MERGE_FIRST_CHECKS_CEILING-<unset>}" >&2
 printf 'LAND_ARGV=%s\n' "$*" >&2
@@ -336,7 +337,7 @@ chmod +x "$FAKE_LAND"
 # own environment would otherwise decide an arm, which is how a test passes on one box and
 # fails on another.
 land_err() {
-  local pre=() wipe=(-u ADMIN_MERGE_FIRST_CHECKS_WAIT -u ADMIN_MERGE_FIRST_CHECKS_STALL -u ADMIN_MERGE_FIRST_CHECKS_CEILING)
+  local pre=() wipe=(-u ADMIN_MERGE_FIRST_CHECKS_WAIT -u ADMIN_MERGE_FIRST_CHECKS_ONESHOT -u ADMIN_MERGE_FIRST_CHECKS_STALL -u ADMIN_MERGE_FIRST_CHECKS_CEILING)
   [ -n "${2:-}" ] && pre=("ADMIN_MERGE_FIRST_CHECKS_WAIT=$2")
   [ -n "${5:-}" ] && pre+=("ADMIN_MERGE_FIRST_CHECKS_STALL=$5")
   [ -n "${6:-}" ] && pre+=("ADMIN_MERGE_FIRST_CHECKS_CEILING=$6")
@@ -378,28 +379,33 @@ E="$(land_err 1 '' 0 1)"
 ck "(B5) queue mode called the queue step, not the land step (no LAND_SAW_WAIT at all)" \
    "$(grep -q 'LAND_SAW_WAIT' <<<"$E" && echo 1 || echo 0)"
 
-# ── (B6) the rail's 0 seam is CONDITIONAL: an inherited STALL/CEILING re-enables the wait ──
+# ── (B6) the rail's 0 seam is CONDITIONAL: an inherited STALL/CEILING re-enables it ──
 # `admin-merge.sh` only takes the "one observation" path when the legacy window is 0 AND
 # neither progress bound is set. So carrying `ADMIN_MERGE_FIRST_CHECKS_WAIT=0` alone is NOT
 # enough: with `ADMIN_MERGE_FIRST_CHECKS_STALL=600` inherited, `wait_enabled` stays 1 and the
 # caller who declined to wait waits until the STALL bound instead — #2465's own defect, one
-# layer down. This arm is RED against the version that carried only the window.
-echo "(B6) --no-wait also clears an INHERITED STALL/CEILING — the rail's 0 seam is conditional (review P2)"
+# layer down. The rail's dedicated `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` seam is what carries the
+# intent, because CLEARING the bounds is the wrong remedy: `ADMIN_MERGE_FIRST_CHECKS_CEILING`
+# is a term of the derived whole-attempt bound, so emptying it RAISES `RAIL_DEADLINE`
+# (CEILING 600 -> 18064 is 3990s -> 21454s) and a legal `ADMIN_MERGE_LOCK_TTL` then refuses
+# with exit 2. This arm is RED against the version that carried only the window AND against
+# the version that cleared the bounds.
+echo "(B6) --no-wait carries the ONE-SHOT seam and leaves an INHERITED STALL/CEILING untouched (review P2)"
 E="$(land_err 1 '' 0 0 600 1200)"
 ck "(B6) the 0 seam is still carried (saw '$(saw "$E")')" \
    "$([ "$(saw "$E")" = 0 ] && echo 0 || echo 1)"
-ck "(B6) the inherited STALL is cleared, not left to bound the wait (saw '$(sawk "$E" STALL)')" \
-   "$([ "$(sawk "$E" STALL)" = '' ] && echo 0 || echo 1)"
-ck "(B6) the inherited CEILING is cleared too (saw '$(sawk "$E" CEILING)')" \
-   "$([ "$(sawk "$E" CEILING)" = '' ] && echo 0 || echo 1)"
-ck "(B6) ⛔ the clearing is SAID OUT LOUD, never silent" \
-   "$(grep -q 'CLEARED an inherited' <<<"$E" && echo 0 || echo 1)"
-ck "(B6) and the reason names the conditional 0 seam (a reader can check it)" \
-   "$(grep -q '0 seam only means' <<<"$E" && echo 0 || echo 1)"
-# ⛔ NO gratuitous clearing: with neither bound inherited, nothing is cleared and nothing
-# is said — the default path in (B1) must stay byte-identical.
-ck "(B6) without an inherited bound nothing is cleared (no CLEARED line on B1's path)" \
-   "$(grep -q 'CLEARED an inherited' <<<"$(land_err 1 '')" && echo 1 || echo 0)"
+ck "(B6) the rail is handed the dedicated ONESHOT seam (saw '$(sawk "$E" ONESHOT)')" \
+   "$([ "$(sawk "$E" ONESHOT)" = 1 ] && echo 0 || echo 1)"
+ck "(B6) ⛔ the inherited STALL is PRESERVED, not cleared (saw '$(sawk "$E" STALL)')" \
+   "$([ "$(sawk "$E" STALL)" = 600 ] && echo 0 || echo 1)"
+ck "(B6) ⛔ the inherited CEILING is PRESERVED — clearing it moves the derived whole-attempt bound and can exit 2 (saw '$(sawk "$E" CEILING)')" \
+   "$([ "$(sawk "$E" CEILING)" = 1200 ] && echo 0 || echo 1)"
+ck "(B6) the carry is SAID OUT LOUD, and names the deadline hazard as the reason not to clear" \
+   "$(grep -q 'ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1' <<<"$E" && grep -q 'whole-attempt deadline' <<<"$E" && echo 0 || echo 1)"
+ck "(B6) the ONESHOT seam is carried on the DEFAULT path too, not only when a bound is inherited" \
+   "$([ "$(sawk "$(land_err 1 '')" ONESHOT)" = 1 ] && echo 0 || echo 1)"
+ck "(B6) and nothing is carried without --no-wait (no ONESHOT on the B2 path)" \
+   "$([ "$(sawk "$(land_err 0 '')" ONESHOT)" = '<unset>' ] && echo 0 || echo 1)"
 
 echo
 printf 'issue #2465 inert wait: %s passed, %s failed\n' "$PASS" "$FAIL"
