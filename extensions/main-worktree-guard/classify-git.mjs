@@ -8279,7 +8279,19 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   // Getting this wrong in either direction is a grading bug, not cosmetics: a
   // cwd bash never entered grades a directory the write never touches (a FALSE
   // REFUSAL) and desynchronises every later stack form (a fail-OPEN).
-  const cdTo = (x) => (x !== undefined && x !== null && existsSync(x) ? x : null);
+  // ⛔ A RAW STACK ENTRY (`pushd -n <relative>`, see the insert site) is resolved AT
+  // THE CONSUMING cd, from the cwd holding THEN — that is what bash does: it stores
+  // the operand STRING. Resolving eagerly published a path bash never wrote
+  // (measured: `pushd sub; pushd -n ../docs; cd ..; popd` — bash's popd fails from
+  // `hub` and stays there, the eager model landed in `docs`).
+  const RAWSTACK = "\u0000raw:";
+  const cdTo = (x) => {
+    if (typeof x === "string" && x.startsWith(RAWSTACK)) {
+      const at = resolve(f().cwd, x.slice(RAWSTACK.length));
+      return existsSync(at) ? at : null;
+    }
+    return x !== undefined && x !== null && existsSync(x) ? x : null;
+  };
   let dirStackSnapshots = [];  // FULL copy per ( - restored at ) (cycle-24 P1 r29 D1-D3:
                                // a subshell gets a COPY — ( popd ) must not eat an inherited entry)
   const SPAWNER_FLAG_OPERANDS = {
@@ -8396,6 +8408,21 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const readOperandWords = (k) => {
     const out = [];
     const tildes = [];                        // per operand: is the SOURCE word a BARE `~`?
+    // ⛔ bash expands the tilde PREFIX — everything up to the first UNQUOTED `/` — and
+    // only when nothing in that prefix is quoted. So `~"/docs"` and `~\//docs` are
+    // LITERAL `~` words (pushd errors, nothing moves), while `~/"/docs"` and
+    // `"~"/docs` are decided by the first character alone. `readWord` returns the
+    // DE-QUOTED text, so the RAW source is the only place this survives.
+    const bareTildeAt = (p0) => {
+      if (s[p0] !== "~") return false;
+      for (let j = p0 + 1; j < n; j++) {
+        const c = s[j];
+        if (c === "\\" || c === "'" || c === '"') return false;   // quoting inside the prefix
+        if (c === "/") return true;                              // first unquoted slash ends the prefix
+        if (/[\s;&|()<>`$]/.test(c)) return true;                // the word ended before any slash
+      }
+      return true;
+    };
     let resumeAt = null;                     // where the MAIN walker must resume (a redirect)
     const skipRedirect = (at) => {           // at = index of the `>`/`<` operator
       let r = at;
@@ -8429,7 +8456,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // hand pushd a LITERAL `~` that does not exist — rc 1, NOTHING changes.
       // `readWord` returns the DE-QUOTED text, so the raw start character is the
       // only place that distinction survives.
-      tildes.push(s[p] === "~");
+      tildes.push(bareTildeAt(p));
       k = w.k;
       if (out.length >= 64) return { args: out, tildes, k: resumeAt !== null ? resumeAt : k };   // bounded
     }
@@ -8459,8 +8486,8 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //   for `popd` ANY other word is "invalid argument" (rc 2) with the stack AND
   //        the cwd untouched — `popd +1 extra`, `popd extra +1`, `popd -n extra`
   //        — so it must never be read as the bare form.
-  // ⛔ DECLARED RESIDUALS (not modelled here, and pre-existing for every verb in
-  // this walker):
+  // ⛔ DECLARED RESIDUALS (not modelled here). The first two are PRE-EXISTING
+  // for every verb in this walker; the others say so where they differ:
   //  • EXIT STATUS — when a dir-stack verb ERRORS, bash marks the command failed,
   //    so it skips a following `&&` list AND it SKIPS a following `||` list when
   //    the verb SUCCEEDED (both directions are unmodelled). This walker runs
@@ -8469,17 +8496,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //    keeps `a`, the model reaches the hub root) and `cd a; pushd ../docs ||
   //    popd; …` (bash stays in docs, the model pops to `a`). Inert while
   //    `pushd -n <dir>` was a no-op; visible now that the form really inserts.
-  //    Fixing it means gating `&&`, `||` AND `;` on the previous command's status
-  //    for the WHOLE walker — a different change than #3955.
-  //  • LAZY OPERAND RESOLUTION for `pushd -n <relative>`. bash stores the operand
-  //    STRING and resolves it at the LATER cd, from whatever cwd holds then; this
-  //    model stores the eager `resolve(cwd, word)`. The two differ only when a
-  //    `cd`/`pushd` intervenes before the entry is consumed (measured, cwd `hub`:
-  //    `pushd sub; pushd -n ../a; cd ..; popd --` — bash's popd fails from `hub`
-  //    and stays there, the model lands in `a`). Both realities share ONE cwd at
-  //    insert time, so the cwd-fork machinery cannot carry them; the fix is to
-  //    store the raw word and resolve it in `cdTo` at use time, which changes the
-  //    meaning of every stack entry and is therefore its own change.
+  //    Fixing it means TRACKING the previous command's status across the whole
+  //    walk and gating ONLY the `&&` / `||` RHS on it. ⛔ NOT `;` — a `;` list is
+  //    UNCONDITIONAL in bash (`false; echo x > f` still writes), so gating it
+  //    would drop a write bash performs, the opposite failure. A different
+  //    change than #3955.
   //  • `pushd -n $VAR +N`: same cwd, two stacks — see the note at the dir arm.
   const popdArgv = (args, fr) => {
     let nFlag = false, sel = null, sawDD = false, unprovable = false, invalid = false;
@@ -8513,8 +8534,10 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // new top; when THAT cd fails bash removes nothing (measured: `popd +0`
       // and `popd -3` over `[b, +1, docs, a]` are rc 1 with `dirs` unchanged).
       if (idx0 === 0 && cdTo(rest[0]) === null) return;
-      const landing = setVStack(rest);
-      fr.pending = landing;
+      // ⛔ `rest[0]` may be a RAW entry (`pushd -n <relative>`): resolve it HERE, or the
+      // sentinel becomes the cwd and every later resolution is garbage.
+      const landing = cdTo(setVStack(rest));
+      fr.pending = landing === null ? keep : landing;   // idx0 > 0 never cds — stay put
       if (unprovable && landing !== keep) {
         fr.forkCwd = fr.forkCwd || landing;
         fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== landing).slice(0, 64);
@@ -8532,7 +8555,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       fr.pending = null;
       return;
     }
-    const popTo = d !== undefined ? d : null;
+    const popTo = d !== undefined ? cdTo(d) : null;   // a RAW entry resolves here, not at insert
     if (unprovable && popTo !== null && popTo !== keep) {
       fr.forkCwd = fr.forkCwd || popTo;
       fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== popTo).slice(0, 64);
@@ -8664,7 +8687,9 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         ? (dirWord === "~" ? home : resolve(home, dirWord.slice(1).replace(/^\/+/, "")))   // `~//x` too
         : undefined;
       const ins = dirWord && dirWord !== "-" && !/^[$`]/.test(dirWord)
-        ? (tilde !== undefined ? tilde : resolve(cwd, dirWord)) : null;
+        ? (tilde !== undefined ? tilde
+          : (isAbsolute(dirWord) ? dirWord : RAWSTACK + dirWord))   // RELATIVE ⇒ raw, resolved at the cd
+        : null;
       if (ins) { const S = vstack(fr.cwd); S.splice(1, 0, ins); setVStack(S); }
       return null;
     }

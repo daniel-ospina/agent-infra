@@ -5726,6 +5726,8 @@ try {
       has("cd a; pushd ~/docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "R6d: `pushd ~/docs` cds to $HOME/docs (slice(2) — slice(1) kept the `/` and resolved the ROOT)");
       blocks(["docs/tracked.md"], "cd a; pushd ~/docs; echo x > tracked.md", "R6d gate: TRACKED docs/tracked.md → BLOCK (`/docs` does not exist, so the no-cd model stayed in a → ALLOW)");
       has("cd a; pushd -n ~/sub; popd; echo x > tracked.md", "redirect:H/sub/tracked.md", "R6e: `pushd -n ~/sub` inserts $HOME/sub, so the popd cd's there");
+      has(`cd a; pushd ~/"/docs"; echo x > tracked.md`, "redirect:H/docs/tracked.md", "R8a control: `~/\"/docs\"` — the FIRST unquoted / ends the prefix, so the tilde IS expanded");
+      has("cd a; pushd ~//docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "R8b: a DOUBLED separator still resolves under $HOME (strip separators, don't slice a fixed count)");
       process.env.HOME = savedHome;
     }
     // ⛔ R6f PINS A DECLARED RESIDUAL, not a truth claim: bash's answer for
@@ -5737,6 +5739,23 @@ try {
     // same one `origin/main` produced — and the other half is declared in the
     // module. Do NOT "fix" this row by expecting `a`.
     has("cd a; pushd ../docs; pushd $NOPE +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R6f (DECLARED RESIDUAL): `pushd $VAR +N` keeps the 'too many arguments' reality — see the module's residual note before changing it");
+    // ⛔ THE PAIR of the row above: the round-6 cwd-only fork emitted BOTH `a` and
+    // `docs`, and `has()` alone cannot tell that apart from the reverted model. This
+    // control is what reddens if the fork comes back.
+    allows(["a/tracked.md"], "cd a; pushd ../docs; pushd $NOPE +1; echo x > tracked.md", "R6f control: the empty-expansion rotation is DECLARED-unmodelled — the model must NOT emit a (a cwd-only fork did)");
+    // ── #3955 review round 8. `pushd -n <relative>` stores the operand STRING in
+    // bash, so a `cd` between the insert and the popd changes where the popd
+    // lands; the eager `resolve(cwd, word)` published a path bash never wrote.
+    // MEASURED (cwd `H`): `pushd sub; pushd -n ../docs; cd ..; popd` — bash's popd
+    // fails from `H` and stays there; the eager model landed in `docs`.
+    has("pushd sub; pushd -n ../docs; cd ..; popd; echo x > tracked.md", "redirect:H/tracked.md", "R7a: a RELATIVE `pushd -n` operand is resolved at the LATER cd, not at insert time");
+    blocks(["tracked.md"], "pushd sub; pushd -n ../docs; cd ..; popd; echo x > tracked.md", "R7a gate: TRACKED H/tracked.md → BLOCK (the eager model landed in docs → ALLOW)");
+    allows(["docs/tracked.md"], "pushd sub; pushd -n ../docs; cd ..; popd; echo x > tracked.md", "R7a control: …and the eager landing must NOT be graded");
+    has("cd a; pushd -n ../docs; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R7b control: with NO intervening cd the raw operand resolves exactly as the eager model did (docs)");
+    has("pushd sub; pushd -n ../a; cd ..; popd; echo x > tracked.md", "redirect:H/tracked.md", "R7b: same, with a different relative operand (`../a`)");
+    // `~` is expanded only when its PREFIX (up to the first UNQUOTED `/`) is unquoted.
+    has(`cd a; pushd ~"/docs"; echo x > tracked.md`, "redirect:H/a/tracked.md", "R8a: `~\"/docs\"` — the separator is QUOTED, so the tilde is literal and pushd fails");
+    blocks(["a/tracked.md"], `cd a; pushd ~"/docs"; echo x > tracked.md`, "R8a gate: TRACKED a/tracked.md → BLOCK (expanding it moved the write to $HOME/docs → ALLOW)");
   }
 
 
