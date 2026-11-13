@@ -587,6 +587,19 @@ async function partB() {
     // read (fail-OPEN, `main` behaves the same: pre-existing, closed here).
     expectTrue("B7v (#523 round-5 F2a): `bash <<\\EOF` opens a real body → BLOCKED",
       blocked(await bash(`bash <<\\EOF\necho hi\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-6 F1 (measured ALLOWED on the pre-fix head, BLOCKED on `main`): a
+    // redirect may stand BEFORE the command word (`2>/dev/null ./x.sh`) and bash
+    // still executes that command. The body walk took the OPERATOR as the command
+    // word, resolved nothing, and skipped to the next command boundary — so the
+    // hub-mutating script the body really runs was never read.
+    expectTrue("B7w (#523 round-6 F1): a body line whose command word follows a REDIRECT → BLOCKED",
+      blocked(await bash(`bash <<EOF\n2>/dev/null "${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-6 F2 (measured ALLOWED on the pre-fix head, BLOCKED on `main`): the
+    // delimiter is one shell WORD; `<<'E F'` delimits on the line `E F`, so spaces
+    // stay INSIDE it. Re-emitting the quote-removed word unquoted split it into
+    // two tokens, the body was mis-classified as DATA, and nothing in it was read.
+    expectTrue("B7x (#523 round-6 F2): a delimiter containing a SPACE still walks its body → BLOCKED",
+      blocked(await bash(`bash <<'E F'\necho hi\n"${bodyEvil}"\nE F`, hub)), "was allowed");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });

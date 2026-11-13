@@ -4415,6 +4415,58 @@ try {
       extractScriptPath(`bash <<EOF\n${body}`) === sBodyHub &&
       extractScriptPath(`cat <<EOF\n${body}`) === null;
   })(), true);
+  // ⛔ ROUND-6 F1 (blocking, fail-OPEN — a REGRESSION against `main`): the command
+  // word of a simple command is the first NON-REDIRECT token, so a redirect may
+  // stand BEFORE it (`2>/dev/null ./x.sh`) and bash still executes that command.
+  // The body walk started at the operator, `_scriptInvocationAt` resolved
+  // nothing, and its `next` jumped to the FOLLOWING command boundary — so every
+  // token after the redirect on that line was never visited. Measured `[]` on
+  // this arm while `main` resolved the file (its accidental first-token scan) and
+  // BLOCKED it. The rule is the one tree-sitter-bash (`redirect` nodes precede
+  // `command_name`) and mvdan.cc/sh (a redirect attaches to the `CallExpr` before
+  // its `Args`) both encode.
+  expectBool("B52s: a body line whose COMMAND WORD follows a redirect still resolves the script it runs (round-6 F1)", (() => {
+    const p = `"${sBodyHub}"`;
+    const body = (line) => extractScriptPaths(`bash <<EOF\n${line}\nEOF`).join("|");
+    return body(`2>/dev/null ${p}`) === sBodyHub &&
+      body(`>/dev/null ${p}`) === sBodyHub &&
+      body(`>>/dev/null ${p}`) === sBodyHub &&
+      body(`2>>/dev/null ${p}`) === sBodyHub &&
+      body(`</dev/null ${p}`) === sBodyHub &&
+      body(`&>/dev/null ${p}`) === sBodyHub &&
+      // a redirect in FRONT of an interpreter still resolves its operand
+      body(`2>/dev/null bash ${p}`) === sBodyHub &&
+      // the already-green controls: a redirect AFTER the script, and an fd-DUP
+      // (no operand) in front of it, were never affected by the gap
+      body(`${p} >/dev/null`) === sBodyHub &&
+      body(`2>&1 ${p}`) === sBodyHub &&
+      // a body line that is ONLY a redirect runs nothing — and a redirect must
+      // not turn a non-script command word into one
+      body(`2>/dev/null`) === "" &&
+      body(`echo ${p}`) === "";
+  })(), true);
+  // ⛔ ROUND-6 F2 (blocking, fail-OPEN — a REGRESSION against `main`): the
+  // delimiter is ONE shell WORD whose quotes/backslashes are removed by quote
+  // removal and whose SPACES STAY INSIDE IT, so `<<'E F'` and `<<E\ F` both
+  // delimit on the line `E F`. Re-emitting the removed word unquoted produced
+  // `<< E F` — TWO tokens — so the redirect branch consumed `<<` + `E` and left
+  // `F` as a POSITIONAL, `stdinProgram` came out false, the body was classified
+  // DATA and never walked, and the only resolved path was the phantom `F` (a
+  // non-file, so the content gate no-opped). Measured `["F"]` while `main`
+  // resolved the body's file and BLOCKED it.
+  expectBool("B52t: a delimiter containing a SPACE stays ONE word, so its body is still walked (round-6 F2)", (() => {
+    const p = `"${sBodyHub}"`;
+    return extractScriptPaths(`bash <<'E F'\n${p}\nE F`).join("|") === sBodyHub &&
+      extractScriptPaths(`bash <<E\\ F\n${p}\nE F`).join("|") === sBodyHub &&
+      extractHeredocProgramScriptPaths(`bash <<'E F'\n${p}\nE F`).join("|") === sBodyHub &&
+      // a space-bearing delimiter is still a DELIMITER, never a script path
+      !extractScriptPaths(`bash <<'E F'\n${p}\nE F`).includes("F") &&
+      !extractScriptPaths(`bash <<'E F'\n${p}\nE F`).includes("E") &&
+      // the ordinary spellings keep their plain emitted form (no behaviour change)
+      extractScriptPaths(`bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      // a DATA consumer with a spaced delimiter is still not walked
+      extractScriptPaths(`cat <<'E F'\n${p}\nE F`).length === 0;
+  })(), true);
 
   // ── Write gate (W) — resolveTargetTopLevel predicate ──
   const hubTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: hubR, encoding: "utf-8" }).trim());

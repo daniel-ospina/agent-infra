@@ -2827,6 +2827,28 @@ function _wtLinePipesToInterpreter(line) {
  *  payloads — so `)` is left as it was and the whole class is tracked on #2161
  *  rather than half-closed here.
  */
+/** Re-emit a heredoc delimiter WORD for the downstream tokenizer, as ONE token.
+ *
+ *  bash's quote removal collapses `'E F'`, `E\ F` and `"E F"` to the single
+ *  word `E F`, and the body is delimited on a line that IS that word. Emitting
+ *  the removed word unquoted let `_tokenize` split it on the space, so the
+ *  redirect branch consumed `<<` + the first fragment and the remaining
+ *  fragment became a POSITIONAL — the body was then mis-classified as DATA and
+ *  never walked (#523 round-6 F2, measured).
+ *
+ *  A plain word is returned VERBATIM so every existing consumer's emitted text
+ *  is unchanged; anything containing a space or a shell metacharacter is
+ *  double-quoted (`_tokenize` removes the quotes and unescapes `\\`/`"` inside
+ *  them, yielding the one word bash computed).
+ * @param {string} word
+ * @returns {string}
+ */
+function _emitDelimiterWord(word) {
+  const w = String(word ?? "");
+  if (/^[A-Za-z0-9_./:=+-]+$/.test(w)) return w;
+  return `"${w.replace(/[\\"]/g, "\\$&")}"`;
+}
+
 function _wtScanLine(line, carry) {
   let i = 0;
   let out = "";
@@ -2905,7 +2927,19 @@ function _wtScanLine(line, carry) {
       // Re-emit the delimiter so the walker's `<<` + operand skip consumes the
       // placeholder, never the next real command token. An opener with no
       // delimiter (`<<` in arithmetic) emits bare `<<`.
-      out += d ? `<< ${d}` : "<<";
+      //
+      // ⛔ THE DELIMITER IS ONE SHELL WORD. It is a word whose quotes and
+      // backslashes are removed by QUOTE REMOVAL, and the spaces it contained
+      // stay inside it — `<<'E F'` and `<<E\ F` both delimit on the line `E F`.
+      // Re-emitting the quote-removed word UNQUOTED produced `<< E F`, i.e. TWO
+      // tokens, so `_scriptInvocationAt`'s redirect branch consumed `<<` + `E`
+      // and left `F` as a POSITIONAL — `stdinProgram` came out false, the body
+      // was never walked, and the only path resolved was the phantom `F` (a
+      // non-file, so the content gate no-opped): measured `[]` for a body that
+      // real bash executes, while `main` resolved the body's file and BLOCKED it
+      // (#523 round-6 F2). `_emitDelimiterWord` keeps a plain word byte-identical
+      // to the old emission and quotes only the forms that used to split.
+      out += d ? `<< ${_emitDelimiterWord(d)}` : "<<";
       i = j;
       continue;
     }
@@ -10670,6 +10704,17 @@ function _isScriptCommandBoundary(t) {
   return t === ";" || t === "&&" || t === "||" || t === "|" || t === "&" || t === "(" || t === ")";
 }
 
+/** Does this redirect operator CONSUME the next token as its operand?
+ *  `>`, `>>`, `2>`, `<`, `&>`, `&>>`, `>&` do (`> out`, `< in`, `&> log`).
+ *  An fd-DUP / fd-CLOSE form (`2>&1`, `1>&2`, `2>&-`, `<&0`) names an fd that
+ *  is already open and takes NO operand. The distinction decides how far the
+ *  program walk steps over a leading redirect (#523 round-6 F1). */
+function _redirectTakesOperand(t) {
+  if (!_isRedirectOperator(t)) return false;
+  if (/^[0-9]*[<>]&(?:[0-9]+-?|-)$/.test(t)) return false; // fd-dup / fd-close
+  return true;
+}
+
 /** Index a program walk resumes from after the simple command starting at
  *  `from`: the next boundary token, or tokens.length when the command runs to
  *  the end. */
@@ -11086,13 +11131,31 @@ function _programScriptInvocations(bodyText, depth = 0) {
   while (i < tokens.length) {
     while (i < tokens.length && (_isScriptCommandBoundary(tokens[i]) || _PROGRAM_FRAME_WORDS.has(tokens[i]))) i++;
     if (i >= tokens.length) break;
+    // ⛔ THE COMMAND WORD IS THE FIRST NON-REDIRECT TOKEN of the simple command.
+    // A redirect may stand BEFORE it (`2>/dev/null ./x.sh`, `</dev/null cmd`) and
+    // bash still executes that command — the redirect is not a command position.
+    // Without stepping over the operator AND its operand, `_scriptInvocationAt`
+    // took the operator as the command word, resolved nothing, and `next`
+    // jumped to the FOLLOWING command boundary — so every token after the
+    // redirect on that line was never visited at all. Measured: `bash <<EOF` +
+    // a body line `2>/dev/null /tmp/evil.sh` resolved `[]` on this walk while
+    // `main` resolved the file (through its accidental first-token scan) and
+    // BLOCKED it — a fail-OPEN and a regression against `main`, and no arm
+    // covered the shape (#523 round-6 F1). The rule is the one tree-sitter-bash
+    // (`redirect` nodes precede `command_name`) and mvdan.cc/sh (a
+    // `*syntax.Redirect` attaches to the `CallExpr` before its `Args`) both
+    // encode: redirects are not part of the command name.
+    while (i < tokens.length && _isRedirectOperator(tokens[i])) {
+      i += _redirectTakesOperand(tokens[i]) ? 2 : 1;
+    }
+    if (i >= tokens.length) break;
     const { path, next, interpreted } = _scriptInvocationAt(tokens, i);
     if (path) out.push({ path, interpreted: interpreted === true });
     i = next > i ? next : i + 1; // never spin on a zero-width advance
   }
   if (depth < 2) {
     for (const b of bodies) {
-      if (b.kind === "shell" && b.program) out.push(..._programScriptInvocations(b.text, depth + 1));
+      if (b.program) out.push(..._programScriptInvocations(b.text, depth + 1));
     }
   }
   return out;
@@ -11126,7 +11189,7 @@ export function extractHeredocProgramScriptInvocations(command) {
   const out = [];
   const { bodies } = _heredocSplitForScripts(command);
   for (const b of bodies) {
-    if (b.kind === "shell" && b.program) out.push(..._programScriptInvocations(b.text));
+    if (b.program) out.push(..._programScriptInvocations(b.text));
   }
   return _dedupeScriptInvocations(out);
 }
@@ -11157,7 +11220,7 @@ export function extractScriptPaths(command) {
   const lead = _scriptInvocationAt(_tokenize(header), 0).path;
   if (lead) out.push(lead);
   for (const b of bodies) {
-    if (b.kind === "shell" && b.program) out.push(..._programScriptInvocations(b.text).map((inv) => inv.path));
+    if (b.program) out.push(..._programScriptInvocations(b.text).map((inv) => inv.path));
   }
   return [...new Set(out)];
 }
