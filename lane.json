@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-4009.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix-4009-lane"
+    },
+    {
+      "kind": "sha",
+      "value": "5474cbccd4051eb29717808efbd6b267684fb467"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-4009-lane"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 36600,
+  "duration_s": 219,
+  "ended_at": 1794539410,
+  "exit_code": 0,
+  "heartbeat_at": 1794539410,
+  "host": "cmux",
+  "issue": 4009,
+  "kind": "lane",
+  "lane_id": "cmux.klane-4009-1794539191-p3373367-6650bee3",
+  "lease_until": 1794576010,
+  "pid": 3373367,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794539191,
+  "state": "DONE",
+  "tag": "4009",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-4009-lane"
+}
