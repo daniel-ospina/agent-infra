@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/Users/danielospina/orchestrator/bg/prd-daniel-ospina-agent-infra-3986.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/3932-preflight-stale-code"
+    },
+    {
+      "kind": "sha",
+      "value": "92ec5cd6729adc2e6d7fdcf97b0396edf0e37980"
+    },
+    {
+      "kind": "worktree",
+      "value": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/prd-3986"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 358,
+  "ended_at": 1794585279,
+  "exit_code": 76,
+  "heartbeat_at": 1794585279,
+  "host": "192",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "192.kprfix-prd-daniel-ospina-agent-infra-3986-1794584921-p85002-7f0f8593",
+  "lease_until": 1794593079,
+  "pid": 85002,
+  "reason": "agent-never-started:rc=76",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794584921,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-agent-infra-3986",
+  "worktree": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/prd-3986"
+}
