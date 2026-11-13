@@ -751,8 +751,19 @@ set +e
 STATUS_OUT="$(run_installer "$HOME2" --status 2>&1)"
 STATUS_RC=$?
 set -e
-assert_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins) — DRIFTED" \
-    "--status reports a surviving installed copy of a retired label as DRIFT, not as a clean status"
+assert_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins) — an installed copy ALSO survives" \
+    "--status reports a surviving installed copy of a retired label, not a clean status"
+assert_eq "$STATUS_RC" "1" \
+    "...and the exit code carries it (the row below is the one that counts it)"
+# ⛔ ONE JOB, ONE MARKER (round 12). This row must NOT carry a marker word of its own: the set-level
+# `⛔ RETIRED-INSTALLED` pass owns both the marker and the exit code for this state, and a second
+# matched line made `fleet-schedule.py --verify` print "2 launchd job(s)" over ONE job (measured).
+assert_not_contains "$STATUS_OUT" "com.eldato.hub-state-check: RETIRED (manifest wins) — DRIFTED" \
+    "...and it does not print a second job MARKER for the same job (the count is a count of jobs)"
+assert_contains "$STATUS_OUT" "⛔ RETIRED-INSTALLED   com.eldato.hub-state-check" \
+    "...the marker for that state is the set-level RETIRED-INSTALLED row"
+assert_eq "$(printf '%s\n' "$STATUS_OUT" | grep -c 'hub-state-check.*DRIFTED')" "0" \
+    "...and no line about it mentions DRIFTED, so the marker scan counts this job once"
 rm -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 rm -f "$TEMPLATES/com.eldato.hub-state-check.plist"
 
@@ -3067,6 +3078,47 @@ OUT="$(run_stray_status)"; RC=$?
 set -e
 assert_eq "$RC" "0" "§18 control: once the retired job is removed, --status is 0 again (transient by construction)"
 assert_not_contains "$OUT" "RETIRED-INSTALLED" "§18 ... and no longer reports a retired-installed row"
+
+# ── 18e. THE RETIRED MANIFEST RESOLVES LIKE THE OTHER TWO (#1867 review, round 12) ────────────────
+# `retired_labels` read `$TEMPLATES_DIR/RETIRED` and NOTHING else, so an env-overridden or sparse
+# TEMPLATES_DIR that carried templates but no RETIRED made `is_retired` answer `no` for every label.
+# The row a retired job then produced was `⛔ UNMANAGED` plus `launchctl bootout … && rm -f …` — the
+# deletion advice aimed at a live job, which is verbatim the harm
+# `templates/launchd/OWNED-BY-OTHER-INSTALLERS:28-31` exists to prevent ("A missing entry therefore
+# does not merely print a false alarm — it hands the operator the command that DELETES a live job").
+# `cmux_manifest` and `foreign_manifest` already fall back to the checkout's own copy for exactly this
+# reason; RETIRED is the third manifest in that directory and resolves the same way now.
+# MEASURED pre-fix on this fixture minus RETIRED: `⛔ UNMANAGED   com.tortoise.heartbeat-loop` and the
+# bootout command, over the one job this change exists to REMOVE rather than hand-delete.
+NO_RETIRED_TEMPLATES="$T/no-retired-templates"; mkdir -p "$NO_RETIRED_TEMPLATES"
+cp "$TEMPLATES"/*.plist "$NO_RETIRED_TEMPLATES"/ 2>/dev/null || true
+if [ -f "$NO_RETIRED_TEMPLATES/RETIRED" ]; then
+    bad "§18e fixture: RETIRED was copied in — this arm would be vacuous"
+else
+    ok "§18e fixture: the declared set is present and the RETIRED manifest is NOT ($(ls "$NO_RETIRED_TEMPLATES"/*.plist 2>/dev/null | wc -l | tr -d ' ') template(s))"
+fi
+cat > "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.tortoise.heartbeat-loop</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/heartbeat-loop.sh</string></array>
+<key>StartInterval</key><integer>120</integer>
+</dict></plist>
+PLIST
+STRAY_TEMPLATES="$NO_RETIRED_TEMPLATES"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+unset STRAY_TEMPLATES
+assert_eq "$RC" "1" "§18e a retired job is STILL a failing state when TEMPLATES_DIR carries no RETIRED"
+assert_contains "$OUT" "⛔ RETIRED-INSTALLED   com.tortoise.heartbeat-loop" \
+    "§18e ... resolved through the checkout's own copy, so it is still a known retired label"
+assert_not_contains "$OUT" "⛔ UNMANAGED   com.tortoise.heartbeat-loop" \
+    "§18e ... and is NOT reclassified as a stray"
+assert_not_contains "$OUT" 'heartbeat-loop.plist" && rm -f' \
+    "§18e ... so no delete command is aimed at a job this repo has declared retired"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist"
 
 # ⛔ A JOB ANOTHER INSTALLER OF THIS REPO OWNS IS NOT UNMANAGED (#1867 review P1). The harness
 # controller `com.eldato.orchestrator-loop` is rendered by scripts/orchestrator-harness/install.sh

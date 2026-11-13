@@ -29,9 +29,9 @@
 # rather than `NOT INSTALLED`, so `fleet-schedule.py --verify` (which delegates
 # to that verb) certifies the layer instead of reporting it broken — a retired
 # job is deliberately never installed, and an absence is not a failure. A copy
-# still installed after retirement is reported `DRIFTED`, so closing that false
-# FAIL does not launder a stale job into a clean status: re-run the installer
-# and it is unloaded + removed.
+# still installed after retirement is reported `⛔ RETIRED-INSTALLED` and the
+# verb exits 1, so closing that false FAIL does not launder a stale job into a
+# clean status: re-run the installer and it is unloaded + removed.
 #
 # Corruption-canary + provider-latency-tripwire REMAIN launchd jobs: the
 # canary watches ~/swarm (unprotected), the tripwire touches no protected

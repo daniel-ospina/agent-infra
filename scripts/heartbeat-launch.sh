@@ -62,7 +62,23 @@
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PI_AGENT_DIR="${HEARTBEAT_PI_AGENT_DIR:-$HOME/.pi/agent}"
+# ⛔ `HOME` UNSET IS "CANNOT ANSWER", NOT "DRIFT" (#1867 review, round 12). This expansion was the
+# FIRST unbound variable under `set -u`, so an env with no `HOME` (a scrubbed `env -i`, a cron/`su`
+# context, a supervisor that does not pass it) killed the script AT PARSE TIME with rc 1 — which this
+# file's own contract defines as DRIFT, i.e. "the fleet's heartbeat is stale" — and printed no verdict
+# word at all. Not even `--help` survived it, because this line runs before argument parsing. The
+# probe had not looked at the fleet and could not; that is UNKNOWN (2), and `heartbeat-loop.sh` — the
+# other half of the same change — already answers this case that way. So the path is computed without
+# dying, the missing input is recorded, and the verbs that need it refuse with 2.
+_home_unset=0
+if [ -n "${HEARTBEAT_PI_AGENT_DIR:-}" ]; then
+    PI_AGENT_DIR="$HEARTBEAT_PI_AGENT_DIR"
+elif [ -n "${HOME:-}" ]; then
+    PI_AGENT_DIR="$HOME/.pi/agent"
+else
+    PI_AGENT_DIR=""
+    _home_unset=1
+fi
 STATE="$PI_AGENT_DIR/state"
 PIDFILE="$STATE/heartbeat-loop.pid"
 KILLFILE="$STATE/HEARTBEAT-OFF"
@@ -625,11 +641,22 @@ cmd_check() {
     return "$rc"
 }
 
+# ⛔ THE VERBS THAT NEED A STATE DIRECTORY REFUSE WHEN THEY CANNOT NAME ONE (#1867 review, round 12).
+# 2 is this file's "could not answer" code; letting the shim of `set -u` pick rc 1 instead would report
+# a configuration gap as a fleet finding, which is the misattribution this file already fixes one
+# variable over for a malformed `HEARTBEAT_CHECK_MAX_AGE`. `--help` does not come through here.
+require_state_root() {
+    [ "$_home_unset" -eq 0 ] && return 0
+    note "UNKNOWN — neither HEARTBEAT_PI_AGENT_DIR nor HOME is set, so no state directory can be named."
+    note "          This is NOT a fleet verdict: the probe could not answer (rc 2)."
+    return 2
+}
+
 case "${1:-}" in
-    start)  shift; cmd_start "${1:-}" ;;
-    stop)   cmd_stop ;;
-    status) cmd_status ;;
-    check)  cmd_check ;;
+    start)  shift; require_state_root || exit $?; cmd_start "${1:-}" ;;
+    stop)   require_state_root || exit $?; cmd_stop ;;
+    status) require_state_root || exit $?; cmd_status ;;
+    check)  require_state_root || exit $?; cmd_check ;;
     -h|--help|help) usage 0 ;;
     "")     usage ;;
     *)      printf 'ERROR: unknown argument: %s\n' "$1" >&2; usage ;;

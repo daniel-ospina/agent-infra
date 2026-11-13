@@ -1792,6 +1792,15 @@ unmanaged_plists() {
     if [ -z "$(declared_labels 2>/dev/null)" ]; then
         return 3
     fi
+    # ⛔ AND THE EXEMPTION LISTS ARE THE SAME KIND OF INPUT (#1867 review, round 12). `is_retired` and
+    # `is_foreign` are asked for EVERY installed label, and both answer "no" when their manifest could
+    # not be read — so the same fail-open the guard above closes for the template walk is still open
+    # one call away, on the two lists whose whole job is to KEEP a live job out of the `bootout && rm -f`
+    # advice. A tree that ships templates but no readable RETIRED is mutilated, not clean; refuse to
+    # classify rather than hand an operator a deletion command on the strength of a list it never read.
+    if [ -z "$(retired_manifest)" ] || { [ -z "$(foreign_manifest)" ] && [ -d "$INFRA_ROOT/templates/launchd" ]; }; then
+        return 3
+    fi
     for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
         [ -f "$installed" ] || continue
         label="$(basename "$installed" .plist)"
@@ -1869,9 +1878,27 @@ uninstall_job() {
 # where it is authored instead — `scripts/fleet-schedule.py --check`, which
 # exits 1 for every label listed here that still has a template. Both backends
 # follow that split: the declaration gate refuses, the machine honours.
+# ⛔ FAIL-CLOSED RESOLUTION, and the fallback is the point (#1867 review, round 12). `TEMPLATES_DIR` is
+# an env override (the test suite isolates through it), so reading the manifest ONLY from there made the
+# exemption a no-op on any box where the override points at a directory without it — and the observable
+# of "I could not read the retirement list" is identical to "nothing is retired", which turns every
+# retired label into an UNMANAGED row carrying `launchctl bootout … && rm -f …` aimed at a live job.
+# That is verbatim the harm `OWNED-BY-OTHER-INSTALLERS` exists to prevent (its header, `:28-31`:
+# "A missing entry therefore does not merely print a false alarm — it hands the operator the command
+# that DELETES a live job"). `cmux_manifest` and `foreign_manifest` already resolve this way; RETIRED
+# is the third manifest in the same directory and must not be the one that reads differently.
+retired_manifest() {
+    if [ -r "$TEMPLATES_DIR/RETIRED" ]; then
+        printf '%s\n' "$TEMPLATES_DIR/RETIRED"
+    elif [ -r "$INFRA_ROOT/templates/launchd/RETIRED" ]; then
+        printf '%s\n' "$INFRA_ROOT/templates/launchd/RETIRED"
+    fi
+}
+
 retired_labels() {
-    local manifest="$TEMPLATES_DIR/RETIRED" label
-    [ -f "$manifest" ] || return 0
+    local manifest label
+    manifest="$(retired_manifest)"
+    [ -n "$manifest" ] || return 0
     while IFS= read -r label; do
         case "$label" in
             ""|"#"*) continue ;;
@@ -2116,10 +2143,18 @@ if [ "${1:-}" = "--status" ]; then
         # ⛔ AND IT NOW CARRIES THE EXIT CODE (#1867 rounds 8/9): the set-level `RETIRED-INSTALLED`
         # pass below names every retired label still on disk — template or not — and raises status_rc,
         # so this row and that one agree rather than one of them printing a caveat behind an rc=0.
+        # ⛔ AND IT DOES NOT CARRY THE WORD `DRIFTED` (round 12). `fleet-schedule.py --verify` counts
+        # JOB MARKERS, so a retired label that had BOTH a surviving template and an installed copy
+        # produced two marked lines for ONE job (this row's `DRIFTED` and the set-level
+        # `⛔ RETIRED-INSTALLED`) and the verdict said "2 launchd job(s)" over one — the same
+        # not-a-count-of-jobs lie round 5 fixed in the other direction. The FAILURE row for this state
+        # is the set-level one, which owns both the marker and the exit code; this row states the fact
+        # without competing to be counted. The template-present, nothing-installed case keeps its
+        # wording (#2908: a retired job is deliberately never installed, so that is not a failure).
         label="$(job_label "$template")"
         if is_retired "$label"; then
             if [ -f "$AGENTS_DIR/$label.plist" ]; then
-                echo "  $label: RETIRED (manifest wins) — DRIFTED: an installed copy survives; re-run the installer to unload + remove it"
+                echo "  $label: RETIRED (manifest wins) — an installed copy ALSO survives; re-run the installer to unload + remove it"
             else
                 echo "  $label: RETIRED (manifest wins — template present; remove the template in the repo)"
             fi
@@ -2150,7 +2185,8 @@ if [ "${1:-}" = "--status" ]; then
             # aimed at this repo's own armed jobs. MEASURED pre-fix with `TEMPLATES_DIR` empty (and
             # again with it chmod 000): `com.eldato.ai-drainer` was reported UNMANAGED with the delete
             # command, on a box where its template was present and merely unreadable.
-            echo "  ⛔ UNKNOWN — the DECLARED SET under $TEMPLATES_DIR could NOT be read, so every" >&2
+            echo "  ⛔ UNKNOWN — the DECLARED SET (or its exemption lists: RETIRED," >&2
+            echo "     OWNED-BY-OTHER-INSTALLERS) under $TEMPLATES_DIR could NOT be read, so every" >&2
             echo "     installed job would be classified against an EMPTY set. Nothing was classified:" >&2
             echo "     this is an unanswered question, not a box full of strays. Re-run with a readable" >&2
             echo "     $TEMPLATES_DIR before trusting any green — or any deletion it advises." >&2
