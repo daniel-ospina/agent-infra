@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/192.kprfix-prd-daniel-ospina-agent-infra-3909-1794579868-p79252-7e523815",
+  "_sha": "641ba436185b5d91f74e2e4d964605558dfcc51d",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/Users/danielospina/orchestrator/bg/prd-daniel-ospina-agent-infra-3909.log"
+    },
+    {
+      "kind": "branch",
+      "value": "cascade-ladder"
+    },
+    {
+      "kind": "sha",
+      "value": "a4b116bc0e6de94e3541d80c932615279ad98bfa"
+    },
+    {
+      "kind": "worktree",
+      "value": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/cascade-ladder"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 1032,
+  "ended_at": 1794580900,
+  "exit_code": 76,
+  "heartbeat_at": 1794580900,
+  "host": "192",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "192.kprfix-prd-daniel-ospina-agent-infra-3909-1794579868-p79252-7e523815",
+  "lease_until": 1794588700,
+  "pid": 79252,
+  "reason": "agent-never-started:rc=76",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794579868,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-agent-infra-3909",
+  "worktree": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/cascade-ladder"
+}
