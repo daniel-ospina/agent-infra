@@ -77,7 +77,7 @@ FALSE-CLEAN class this fleet keeps paying for (#3382 invariant 1: *unknown ≠ z
   "started_at": 1762000000,
   "heartbeat_at": 1762000060,
   "budget_s": 36000,
-  "lease_until": 1762035400,
+  "lease_until": 1762036060,
   "artifacts": [{"kind": "pr", "value": "3419"}, {"kind": "sha", "value": "..."}],
   "reason": null, "exit_code": 0, "ended_at": 1762000800, "duration_s": 800
 }
