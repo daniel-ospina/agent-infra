@@ -1,0 +1,1111 @@
+// Regression tests for #506 — a push-delete spelling in a compound must not
+// LAUNDER an unrelated legacy destructive verdict.
+//
+// THE DEFECT (measured, pre-fix). `classifyGitCommandDetailed`'s push matcher
+// detected a delete spelling and then OVERWROTE the verdict unconditionally:
+//
+//     if (deleteIdx !== -1 || hasColonTargets || legacyVerdict === "block:push-delete") {
+//       out.verdict = "block:push-delete";     // ← even when legacyVerdict was block:reset
+//
+// The legacy string verdict is assigned from the WHOLE command, so a compound
+// `git reset --hard && git push origin --delete stale` classified
+// `block:reset` in the frozen classifier and `block:push-delete` in the detailed
+// one. The full path (index.ts) then handed the command to the #73
+// coordinated-delete arm, whose allow-when-no-sibling-checkout return is
+// `admitAfterM3()` — a return that SKIPS the LEGACY_BLOCK arm below it. Net
+// effect, probe-verified before the fix: the hard reset RAN in the shared hub
+// main checkout whenever the delete target happened to be checked out nowhere.
+// `block:push-delete` is also the one verdict the ownership allowance would
+// admit outright, so the laundering was wider than the #73 arm.
+//
+// The override predates #443; #443 (clean-hub `-d`/`--del`/`--del`-family parity)
+// only extended the same laundering to the new spellings.
+//
+// THE FIX, in two halves — each pinned INDEPENDENTLY below:
+//   (1) classify-git.mjs: a legacy destructive verdict is never overridden by a
+//       delete spelling (the push family is unchanged — block:push-delete and
+//       block:force-push still resolve to block:push-delete). The delete FACTS
+//       (`isPushDelete` + `pushTargets`) are still recorded.
+//   (2) index.ts: because the verdict is now the legacy one, the push-family
+//       arms below can no longer see the delete targets — so the #73
+//       sibling-checked-out block is run on them in an arm of its own, which can
+//       only ADD a block and never returns an allow. Without it, part (1) alone
+//       would silently WEAKEN #73 inside linked worktrees (where the legacy arm
+//       is exempt by design).
+//   (3) classify-git.mjs (review round 8, P1): the SKIMMED re-test — the pass
+//       that reconstructs each invocation because `-C`/`-c`/`GIT_DIR` prefixes
+//       defeat the raw regexes' `git <verb>` adjacency — used to run only when
+//       the raw pass found NOTHING. A delete spelling IS a raw hit, so it made
+//       that pass unreachable: `git -C . reset --hard && git push origin --delete
+//       stale` kept `block:push-delete`, whose #73 arm allows when the target is
+//       held nowhere, and the hard reset RAN in the shared hub (measured). Both
+//       passes now run and are combined by PRIORITY (the pattern array is a
+//       priority list), so the verdict always names the compound's most severe
+//       verb — the prefix class, not one spelling of it (`-C .` reset + `-f`
+//       force-push was laundered identically).
+//
+// Run: node extensions/main-worktree-guard/test-506-legacy-delete-compound.mjs
+//      node extensions/main-worktree-guard/test-506-legacy-delete-compound.mjs --mutations
+import {
+  cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { execSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { register, registerHooks, stripTypeScriptTypes } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
+
+const HERE = fileURLToPath(new URL(".", import.meta.url));
+const INDEX_TS = join(HERE, "index.ts");
+const REPO_EXTENSIONS = join(HERE, "..");
+const MUTATIONS = process.argv.includes("--mutations");
+
+let pass = 0, fail = 0, skip = 0;
+function expectTrue(name, cond, detail = "") {
+  console.log(`${cond ? "✅" : "❌"} ${name}${cond || !detail ? "" : ` — ${detail}`}`);
+  cond ? pass++ : fail++;
+}
+function skipped(name, why) {
+  console.log(`⏭️  ${name}: SKIPPED — ${why}`);
+  skip++;
+}
+const show = (r) => (r === undefined ? "allowed" : `blocked: ${String(r?.reason ?? "").split("\n")[0]}`);
+const blocked = (r) => !!r && r.block === true;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part A — CLASSIFIER: the legacy verdict survives the delete spelling.
+// ─────────────────────────────────────────────────────────────────────────
+console.log("── Part A: classifyGitCommandDetailed keeps the legacy verdict ──");
+const cg = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
+const { classifyGitCommandDetailed, classifyGitCommand } = cg;
+
+/** [label, command, want.verdict, want.isPushDelete, want.pushTargets?] */
+const CLASSIFIER_PINS = [
+  // #506 — the laundered compounds. `stale` is a delete target that the classifier
+  // must still report (part 2 needs it) while the verdict stays the severe verb.
+  ["A1 reset + --delete", "git reset --hard && git push origin --delete stale", "block:reset", true, ["stale"]],
+  ["A2 reset + -d (#443 spelling)", "git reset --hard && git push origin -d stale", "block:reset", true, ["stale"]],
+  ["A3 reset + :stale (colon spelling)", "git reset --hard && git push origin :stale", "block:reset", true, ["stale"]],
+  ["A4 clean -fd + --delete", "git clean -fd && git push origin --delete stale", "block:clean", true, ["stale"]],
+  ["A5 stash pop + -d", "git stash pop && git push origin -d stale", "block:stash-pop", true, ["stale"]],
+  // The PATTERN-ORDER class: `push-delete` used to sit above force-checkout /
+  // checkout-discard-all / checkout-branch / restore / stash-pop in the shared
+  // priority list, so a compound LED by one of those five classified
+  // `block:push-delete` in BOTH layers — a less severe verdict than the verb it
+  // contains, and the #73 arm then returned its allow verdict. Fixed by moving
+  // `push-delete` to the END of DESTRUCTIVE_GIT_PATTERNS (the array is a
+  // priority list).
+  ["A5b stash pop + --delete (pattern-order class)", "git stash pop && git push origin --delete stale", "block:stash-pop", true, ["stale"]],
+  ["A6 checkout -f + --delete (pattern-order class)", "git checkout -f && git push origin --delete stale", "block:force-checkout", true, ["stale"]],
+  ["A6b restore + --delete (pattern-order class)", "git restore . && git push origin --delete stale", "block:restore", true, ["stale"]],
+  ["A6c checkout <branch> + --delete (pattern-order class)", "git checkout main && git push origin --delete stale", "block:checkout-branch", true, ["stale"]],
+  ["A7 pull + :stale", "git pull && git push origin :stale", "block:pull", true, ["stale"]],
+  // The push family is UNCHANGED by #506 — both push verdicts still resolve to
+  // block:push-delete, and the #73 arm still owns them.
+  ["A8 plain --delete", "git push origin --delete stale", "block:push-delete", true, ["stale"]],
+  ["A9 plain -d", "git push origin -d stale", "block:push-delete", true, ["stale"]],
+  ["A10 force-push + --delete", "git push -f origin --delete stale", "block:push-delete", true, ["stale"]],
+  // Controls: no delete spelling ⇒ nothing about #506 may change these.
+  ["A11 reset alone", "git reset --hard", "block:reset", false, []],
+  ["A12 plain push", "git push origin main", "block:push", false, ["main"]],
+  ["A13 merge + plain push", "git merge origin/main && git push origin main", "block:merge", false, []],
+  // #506 review finding 1: `block:commit` is only produced when the classifier
+  // PROVED there is no push invocation, so a delete spelling inside a commit
+  // MESSAGE is text only. `hasPush` is the flag the consumer gates on; the
+  // extractor's echo/comment over-match is why `pushTargets` stays empty here
+  // while the string extractor still finds `main`.
+  ["A16 commit message mentioning a -d delete",
+    'git commit -m "revert: stop running git push origin -d main"', "block:commit", false, []],
+  // A17 is the OTHER half of the same edge, and it is PRE-EXISTING, not #506's:
+  // the frozen `push-delete` pattern is string-matched, so a `--delete` inside a
+  // commit MESSAGE still yields the legacy verdict `block:push-delete` (the
+  // documented echo/comment over-match). The detailed verdict therefore cannot
+  // be `block:commit`, and index.ts's push-delete arm needs a non-empty
+  // `pushTargets` — empty here, because there is no push invocation — so the
+  // command is ALLOWED, matching the `-d` twin (B13/B13b).
+  ["A17 commit message mentioning a --delete (pre-existing echo over-match)",
+    'git commit -m "revert: stop running git push origin --delete main"', "block:push-delete", false, []],
+  // ── review round 8 (P1): the PREFIX-DEFEATED spelling of the lead verb ──
+  // The raw pass cannot see `git -C . reset --hard` (the `-C`/`-c`/`GIT_DIR`
+  // prefix defeats the patterns' `git <verb>` adjacency), and it USED to gate
+  // the skimmed re-test on `verdict === "allow"` — so a delete spelling that
+  // the raw pass DID match made the skimmed pass unreachable and the compound
+  // kept the LEAST severe verdict. These rows pin the combined-by-priority
+  // rule: the verdict names the compound's most severe verb, while the delete
+  // FACTS are still reported.
+  ["A23 -C-prefixed reset + --delete", "git -C . reset --hard && git push origin --delete stale",
+    "block:reset", true, ["stale"]],
+  ["A24 -C-prefixed stash pop + --delete", "git -C . stash pop && git push origin --delete stale",
+    "block:stash-pop", true, ["stale"]],
+  // The delete FIRST: the skimmed pass must not STOP at the delete segment (its
+  // own `push-delete` hit) when the raw verdict already was `push-delete` — the
+  // prefix-hidden verb lives in a LATER segment.
+  ["A25 --delete FIRST, -C-prefixed reset SECOND",
+    "git push origin --delete stale && git -C . reset --hard", "block:reset", true, ["stale"]],
+  // The force-push twin: same class, one verdict over. Raw matches `force-push`
+  // (also a LESS severe owner than the hidden reset — index.ts's ownership
+  // allowance admits `block:force-push` on the baseline), so the same rule keeps
+  // the reset either way. This row is why the fix is stated as a PRIORITY rule
+  // rather than a `push-delete`-only exception.
+  ["A26 -C-prefixed reset + force-push (force-push twin)",
+    "git -C . reset --hard && git push -f origin main", "block:reset", false, []],
+];
+for (const [label, cmd, verdict, isPushDelete, targets] of CLASSIFIER_PINS) {
+  const d = classifyGitCommandDetailed(cmd);
+  const ok = d.verdict === verdict && d.isPushDelete === isPushDelete &&
+    (targets === undefined || JSON.stringify(d.pushTargets) === JSON.stringify(targets));
+  expectTrue(`${label} → ${verdict}`, ok,
+    `got verdict=${d.verdict} isPushDelete=${d.isPushDelete} pushTargets=${JSON.stringify(d.pushTargets)}`);
+}
+// ── review round 11 (P0): `promotedFrom` — WHAT THE PROMOTION REPLACED ──
+// Priority is not restrictiveness. index.ts's ownership ALLOWANCE admits a fixed
+// set of kinds and never admits reset/clean/force-checkout/checkout-discard-all/
+// checkout-branch/restore/stash-pop, so a promotion that moves a compound from
+// the second set into the first hands the WHOLE command to a gate that covers
+// only the admitted kind. `promotedFrom` is the fact that closes it: it carries
+// the verdict the PRE-#506 classifier produced, so the consumer can restore it
+// and take exactly the base path.
+//
+// `null` is as load-bearing as the value: a row whose promotion is `null` proves
+// the fix's gate CANNOT fire on it, so a legitimate command (r-* in the
+// differential) is untouched by the P0 fix. Every realistic-hub row below is
+// therefore a CONTROL, not padding.
+for (const [label, cmd, want] of [
+  // The measured fail-open class: raw pass holds the un-admitted verb, the
+  // skimmed pass promotes it onto an ADMITTED one.
+  ["A29 stash drop + -C-prefixed force-push → promotedFrom stash-pop",
+    "git stash drop && git -C . push -f origin main", "stash-pop"],
+  ["A30 stash pop + -C-prefixed force-push → promotedFrom stash-pop",
+    "git stash pop && git -C . push -f origin main", "stash-pop"],
+  ["A31 restore + -C-prefixed force-push → promotedFrom restore",
+    "git restore . && git -C . push -f origin main", "restore"],
+  ["A32 checkout . + -C-prefixed force-push → promotedFrom checkout-discard-all",
+    "git checkout . && git -C . push -f origin main", "checkout-discard-all"],
+  ["A33 checkout <branch> + -C-prefixed force-push → promotedFrom checkout-branch",
+    "git checkout main && git -C . push -f origin main", "checkout-branch"],
+  ["A34 -C-prefixed branch -D + checkout . → promotedFrom checkout-discard-all",
+    "git -C . branch -D main && git checkout .", "checkout-discard-all"],
+  // The OTHER prefix spellings that defeat the adjacency (the class, not one
+  // spelling): `-c k=v` and a `-C ..` parent path.
+  ["A35 -c-prefixed force-push → promotedFrom stash-pop",
+    "git stash drop && git -c core.pager=cat push -f origin main", "stash-pop"],
+  ["A36 -C ..-prefixed force-push → promotedFrom stash-pop",
+    "git stash apply && git -C .. push -f origin main", "stash-pop"],
+  // CONTROLS — no promotion, so the P0 gate must NOT fire. The first two are the
+  // NON-prefixed twins of A29/A30: there the raw pass already sees the
+  // force-push, so nothing is replaced and the pre-#506 decision (allow) holds,
+  // which is why the fix does not widen the guard onto them.
+  ["A37 CONTROL non-prefixed twin: no promotion",
+    "git stash drop && git push -f origin main", null],
+  ["A38 CONTROL non-prefixed twin: no promotion",
+    "git stash pop && git push -f origin main", null],
+  // CONTROL: a lower-priority verb the skimmed pass sees but that does NOT
+  // out-rank the raw winner is not a promotion, so `git checkout main && git pull`
+  // keeps its base verdict (`pull`) rather than being rewritten to
+  // `checkout-branch` — which would be a NEW refusal of a realistic command.
+  ["A39 CONTROL the skimmed lower-priority verb does not promote (checkout main && pull)",
+    "git checkout main && git pull", null],
+  ["A40 CONTROL plain hub sync: no promotion", "git -C . pull --ff-only", null],
+  // NOT a control, and deliberately so — measured, after the first expectation for
+  // this row was WRONG. The #506 headline compound DOES promote now, because the
+  // reorder put `push-delete` LAST: the raw pass wins `push-delete` (13), the
+  // skimmed pass reads `git reset --hard` and promotes to `reset` (0). So
+  // `promotedFrom` is `push-delete` — an ADMITTED kind — which is exactly the case
+  // the P0 gate must NOT act on: restoring `push-delete` would put the compound
+  // back on the verdict #506 exists to remove, and the promoted `reset` is already
+  // refused by LEGACY_BLOCK. This row is the "the P0 fix must not weaken #506"
+  // half, and it reds if the gate is ever widened to restore an admitted kind.
+  ["A41 the #506 headline compound promotes FROM the admitted push-delete (gate must not fire)",
+    "git -C . reset --hard && git push origin --delete stale", "push-delete"],
+  // CONTROL: promotion onto a MORE SEVERE verdict keeps that verdict — the
+  // restored kind would be the admitted `pull`, which must not win.
+  ["A42 promotion AWAY from an admitted verb still reports promotedFrom pull",
+    "git pull && git -C . reset --hard", "pull"],
+]) {
+  const got = classifyGitCommandDetailed(cmd).promotedFrom ?? null;
+  expectTrue(`${label}`, got === want, `got promotedFrom=${JSON.stringify(got)}`);
+}
+// `hasPush` — the flag index.ts's #506 arm is gated on (review finding 1). It is
+// derived from the INVOCATION WALK, never from the string extractor, so it is
+// the only thing that can tell a real push compound from a message that talks
+// about one.
+for (const [label, cmd, want] of [
+  ["A18 hasPush TRUE for a real delete compound", "git reset --hard && git push origin --delete stale", true],
+  ["A19 hasPush TRUE for a plain push", "git push origin main", true],
+  ["A20 hasPush FALSE for a commit whose MESSAGE names a -d delete",
+    'git commit -m "revert: stop running git push origin -d main"', false],
+  ["A21 hasPush FALSE for a commit whose MESSAGE names a --delete",
+    'git commit -m "revert: stop running git push origin --delete main"', false],
+  ["A22 hasPush FALSE for a non-git command", "echo hi", false],
+]) {
+  const got = classifyGitCommandDetailed(cmd).hasPush === true;
+  expectTrue(`${label} (hasPush=${want})`, got === want, `got hasPush=${got}`);
+}
+// The frozen string classifier — the layer part 2 of the fix DID change (the
+// priority list is shared). A14 is a CONTROL, not a pin of that reorder: `reset`
+// out-ranks `push-delete` in both orders, so no mutation of this diff can flip
+// it. The reorder's real pins are A5b/A6/A6b/A6c and the behavioural B5.
+for (const [label, cmd, want] of [
+  ["A14 CONTROL (invariant under the reorder): frozen classifier says block:reset for the compound",
+    "git reset --hard && git push origin --delete stale", "block:reset"],
+  ["A15 frozen classifier still says block:push-delete for a plain delete",
+    "git push origin --delete stale", "block:push-delete"],
+  ["A15b PIN of the reorder: the frozen classifier names the LEAD verb, not the delete",
+    "git stash pop && git push origin --delete stale", "block:stash-pop"],
+  // The frozen classifier is byte-FROZEN (back-compat) and its raw whole-command
+  // scan cannot see a prefix-defeated verb, so it still reports the delete for
+  // A23's command. That is DECLARED, not fixed here: `classifyGitCommandDetailed`
+  // is the classifier index.ts consumes EXCLUSIVELY (plan deviation 8), and the
+  // degraded fallback (which does read this one) only runs when classify-git.mjs
+  // itself failed to load. This row makes the residual visible instead of
+  // letting a reader assume the frozen layer was fixed too.
+  ["A28 DECLARED residual: the FROZEN classifier still launders the -C-prefixed lead verb",
+    "git -C . reset --hard && git push origin --delete stale", "block:push-delete"],
+]) {
+  expectTrue(label, classifyGitCommand(cmd) === want, `got ${classifyGitCommand(cmd)}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part B — BEHAVIORAL: the real index.ts handler against a hermetic hub.
+// ─────────────────────────────────────────────────────────────────────────
+// The full path is where the laundering lands (a verdict is only a string; the
+// harm is the hub command that RUNS), so the fixtures are a real hub, a real
+// sibling worktree holding a branch, and a real session worktree.
+if (typeof stripTypeScriptTypes !== "function" ||
+    (typeof register !== "function" && typeof registerHooks !== "function")) {
+  if (MUTATIONS) {
+    expectTrue("M: the mutation leg REQUIRES the real index.ts loader", false,
+      `node ${process.versions.node} lacks module.stripTypeScriptTypes (needs Node >= 22.13)`);
+  } else {
+    skipped("Part B/M: real index.ts load",
+      `node ${process.versions.node} lacks module.stripTypeScriptTypes (needs Node >= 22.13)`);
+  }
+} else {
+  const hooks = await import(new URL("./module-load-hooks.mjs", import.meta.url).href);
+  if (typeof registerHooks === "function") registerHooks({ resolve: hooks.resolve, load: hooks.load });
+  else register(new URL("./module-load-hooks.mjs", import.meta.url), import.meta.url);
+  process.removeAllListeners("warning");
+
+  const HATCH_VARS = ["AGENT_ALLOW_MAIN_EDITS", "ELDATO_ALLOW_MAIN_EDITS"];
+  const savedEnv = new Map([...HATCH_VARS, "AGENT_INFRA_PATH", "AGENT_LOCKS_DIR"]
+    .map((v) => [v, process.env[v]]));
+
+  const tmp = realpathSync(mkdtempSync(join(tmpdir(), "guard-506-")));
+  const hub = join(tmp, "hub");
+  const wtHeld = join(tmp, "wt-held");
+  const wtSession = join(tmp, "wt-session");
+  const git = (args, cwd) => execSync(`git ${args}`, { cwd, stdio: "ignore" });
+  const quiet = async (fn) => { const w = console.warn; console.warn = () => {}; try { return await fn(); } finally { console.warn = w; } };
+
+  /** Load ONE copy of the extension (the real one, or a mutant copy) and return a
+   *  `bash(dir, command)` driver. */
+  async function loadGuard(indexPath) {
+    const warnings = [];
+    const realWarn = console.warn;
+    console.warn = (...a) => warnings.push(a.map(String).join(" "));
+    let mod;
+    try { mod = await import(pathToFileURL(indexPath).href); } finally { console.warn = realWarn; }
+    const handlers = new Map();
+    mod.default({ on(name, fn) { if (!handlers.has(name)) handlers.set(name, []); handlers.get(name).push(fn); } });
+    const toolCall = handlers.get("tool_call")?.[0];
+    const sessionStart = handlers.get("session_start")?.[0];
+    return {
+      degradation: warnings.filter((w) => w.includes("[main-worktree-guard]") && w.includes("failed to load")),
+      loaded: typeof toolCall === "function" && typeof sessionStart === "function",
+      sessionStart: async (dir) => {
+        const prev = process.cwd();
+        process.chdir(dir);
+        try { return await quiet(() => sessionStart({}, undefined)); } finally { process.chdir(prev); }
+      },
+      bash: async (dir, command) => {
+        const prev = process.cwd();
+        process.chdir(dir);
+        try { return await quiet(() => toolCall({ toolName: "bash", input: { command } }, undefined)); }
+        finally { process.chdir(prev); }
+      },
+    };
+  }
+
+  /** The pinned command set. `dir` selects the session's root (the shared hub or
+   *  a linked worktree). `marker` is the guard-specific text the refusal must
+   *  carry, so each row proves WHICH arm fired (the whole point of #506 — the
+   *  legacy verdict and the #73 arm are different guards on the same command). */
+  const PINS = [
+    // ── the reported defect: hub session, delete target held NOWHERE ──
+    { id: "B1", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git reset --hard && git push origin --delete stale",
+      why: "#506: the hard reset must not be laundered by the delete spelling (--delete)" },
+    { id: "B2", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git reset --hard && git push origin -d stale",
+      why: "#506: the same laundering through the #443 -d spelling" },
+    { id: "B3", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git reset --hard && git push origin :stale",
+      why: "#506: the same laundering through the colon spelling" },
+    { id: "B4", dir: "hub", expect: "block", marker: "(clean)",
+      cmd: "git clean -fd && git push origin -d stale",
+      why: "#506: any legacy destructive, not just reset" },
+    { id: "B5", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git stash pop && git push origin --delete stale",
+      why: "#506: the stash family launders identically (pattern-order class)" },
+    { id: "B5b", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git stash pop && git push origin -d stale",
+      why: "#506: … and through the #443 -d spelling (verdict-override class)" },
+    // ⚠️ DECLARED NON-DISCRIMINATING (review round 3, measured): M3's branch-state
+    // arm precedes every push arm and reads no verdict, so this row is INVARIANT
+    // under both the override revert and the reorder revert. It is kept as
+    // COVERAGE (that arm must keep firing ahead of the push arms) and is
+    // deliberately absent from every expectRed list — the reorder's real pins are
+    // A15b and B5.
+    { id: "B5c", dir: "hub", expect: "block", marker: "Branch-state change blocked",
+      cmd: "git checkout -f && git push origin --delete stale",
+      why: "coverage: a force-checkout lead is refused by M3 before any push arm is consulted" },
+    { id: "B6", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git reset --hard && git push origin main && git push origin --delete stale",
+      why: "#506: the delete in a LATER segment must not launder either (extractor attribution)" },
+    // ── controls: the fix must not become a blanket refusal ──
+    { id: "B7", dir: "hub", expect: "allow",
+      cmd: "git push origin --delete stale",
+      why: "control: a delete of a branch held nowhere is still allowed (unchanged #73 semantics)" },
+    { id: "B8", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git reset --hard",
+      why: "control: the legacy arm itself is unchanged without a delete spelling" },
+    { id: "B9", dir: "wt", expect: "allow",
+      cmd: "git reset --hard",
+      why: "control: the legacy arm's WORKTREE exemption is unchanged (a worktree is isolated)" },
+    // ── part 2: the #73 sibling check survives inside a worktree ──
+    { id: "B10", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git reset --hard && git push origin --delete held",
+      why: "part 2: in a worktree the legacy arm is exempt, so the delete half must still hit #73" },
+    { id: "B11", dir: "wt", expect: "allow",
+      cmd: "git reset --hard && git push origin --delete stale",
+      why: "part 2 control: the SAME compound with an unheld target stays allowed (B10 is #73, not a blanket)" },
+    // ── review finding 1: a commit MESSAGE must not manufacture delete evidence ──
+    { id: "B13", dir: "wt", expect: "allow",
+      cmd: 'git commit -m "revert: stop running git push origin -d main"',
+      why: "review finding 1: the extractor's only evidence is the MESSAGE text, and there is no push " +
+           "invocation (`hasPush` false), so the #73 arm must not fire — and the `--delete` twin must " +
+           "behave identically (B13b). CONTROL: B1 is the same session geometry with a REAL delete " +
+           "compound and it still blocks, so an allow here is the arm's absence, not a dead guard" },
+    { id: "B13b", dir: "wt", expect: "allow",
+      cmd: 'git commit -m "revert: stop running git push origin --delete main"',
+      why: "review finding 1: the spellings must not split — the `--delete` twin stays allowed too" },
+    // ── review round 4: the arm must sit ABOVE the ownership allowance's admit ──
+    // A `block:branch-force-delete` compound is admitted by the allowance
+    // (targets ⊆ baseline ∪ pid-owned) before any arm below it can run, so while
+    // the #506 arm sat lower, the delete half lost #73 entirely. These two rows
+    // are the reachable discriminator: the hub session's OWN baseline name is a
+    // target the allowance admits, and the hub holding it is exactly what #73
+    // exists to refuse.
+    { id: "B15", dir: "hub", expect: "block", marker: "checked out in",
+      cmd: "git branch -D main; git push origin --delete main",
+      why: "ordering pin: the delete half must reach #73 BEFORE the allowance admits the compound " +
+           "(pre-hoist this was ADMITTED and the hub's own branch lost its upstream)" },
+    { id: "B15b", dir: "hub", expect: "block", marker: "(branch-force-delete)",
+      cmd: "git branch -D stale; git push origin --delete stale",
+      why: "ordering control: with a target held NOWHERE the #73 check adds nothing and the legacy " +
+           "arm still owns the verdict — the hoist did not turn the class into a #73 block" },
+    // ── the EXTRACTOR FALLBACK's own pin (mutant 5) ──
+    { id: "B14", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git reset --hard && git push origin main && git push origin --delete held",
+      why: "#506: the delete lives in the SECOND push invocation, so `pushTargets` is empty and ONLY " +
+           "the whole-command extractor can attribute it — the one row that pins that fallback" },
+    // ── review round 6, FINDING 1: EVERY delete push in the compound ──
+    // The delete lives in the FIRST push invocation here, so the classifier's
+    // later-segment fold-in does NOT run and `pushTargets` is just ["stale"].
+    // Pre-fix the second delete's target was therefore dropped and this row was
+    // ADMITTED (measured), destroying `held`'s upstream from a worktree.
+    { id: "B16", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git reset --hard && git push origin --delete stale && git push origin --delete held",
+      why: "round-6 finding 1: the FIRST push carries the delete, so only the whole-command " +
+           "extractor attributes the SECOND push's held target — preferring `pushTargets` lost it" },
+    { id: "B16b", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git reset --hard && git push origin -d stale && git push origin -d held",
+      why: "…and the #443 `-d` twin runs the same attribution path (the spellings must not split)" },
+    { id: "B16c", dir: "wt", expect: "allow",
+      cmd: "git reset --hard && git push origin --delete stale && git push origin --delete stale2",
+      why: "control: BOTH targets held nowhere ⇒ still WORKTREE-EXEMPT — the union is an " +
+           "attribution fix, not a blanket refusal of a multi-delete compound" },
+    { id: "B17", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git reset --hard && git push origin -do held --delete stale",
+      why: "union-NOT-replace: `pushTargets` is [held,stale] while the extractor sees only " +
+           "[stale] (the documented -o value over-capture). Adopting the extractor wholesale " +
+           "would ALLOW this; the union keeps `held` attributed" },
+    // ── review round 8, P1: the PREFIX-DEFEATED spelling ──
+    // The classifier's skimmed re-test exists BECAUSE `-C`/`-c`/`GIT_DIR` prefixes
+    // defeat the raw regexes' `git <verb>` adjacency, and it used to run only when
+    // the raw pass found NOTHING. A delete spelling IS a raw hit, so it made the
+    // skimmed pass unreachable and the compound kept `block:push-delete` — the one
+    // verdict whose #73 arm returns an ALLOW when the target is checked out
+    // nowhere. These rows drive the real handler, because the verdict is only a
+    // string and the harm is the hub command that RUNS.
+    { id: "P1", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git -C . reset --hard && git push origin --delete stale",
+      why: "round 8 P1: a `-C`-prefixed hard reset must not be laundered by the delete spelling " +
+           "(measured pre-fix: ALLOWED, so the reset ran in the shared hub)" },
+    { id: "P2", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git -C . stash pop && git push origin --delete stale",
+      why: "round 8 P1: the same laundering through the stash family (it fails identically)" },
+    { id: "P3", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git -C . reset --hard && git push origin --delete held",
+      why: "round 8 P1: in a worktree the legacy arm is exempt by design, so the delete half must " +
+           "still hit #73 — the fix must not trade the sibling check for the legacy verdict" },
+    { id: "P4", dir: "hub", expect: "block", marker: "Working-tree discard blocked",
+      cmd: "git --git-dir=$PWD/.git reset --hard && git push origin --delete stale",
+      why: "round 8 CONTROL: this prefix spelling ALREADY blocked pre-fix (the raw reset pattern " +
+           "matches `\\.git reset` — `.` is a non-word char, so `\\bgit` holds) — and M5's discard " +
+           "gate owns the refusal here, which is exactly the point: the P1/P2 spellings are the class, " +
+           "not a blanket over the word `git`" },
+    { id: "P5", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git -C . reset --hard",
+      why: "round 8 CONTROL + attribution: the prefixed reset ALONE already blocks (the skimmed pass " +
+           "fires when the raw pass finds nothing), so P1's pre-fix allow was attributable to the " +
+           "delete spelling making that pass unreachable — not to the prefix defeating the guard" },
+    { id: "P6", dir: "hub", expect: "block", marker: "(reset)",
+      cmd: "git -C . reset --hard && git push -f origin main",
+      why: "round 8: the FORCE-PUSH twin of the same class. `block:force-push` is also admitted by " +
+           "the ownership allowance on the baseline, so the hidden reset ran pre-fix here too — " +
+           "which is why the fix is a PRIORITY rule, not a push-delete-only exception" },
+    // ── review round 11 (P0): THE PROMOTION ONTO AN ADMITTED KIND ──
+    // Different class from P1–P6, and it needed a different fix. P1–P6 are a
+    // prefix-hidden verb laundered by a DELETE spelling; these are a prefix-hidden
+    // verb laundered by the ownership ALLOWANCE, whose admitted set
+    // (pull/merge/rebase/push/force-push/push-delete/branch-force-delete) does not
+    // overlap the five kinds below. The skimmed pass promotes the compound onto
+    // `force-push`, the allowance admits `force-push` on the baseline, and the
+    // hidden verb runs. MEASURED against pristine `origin/main` `319c82526` with
+    // the real handler: base BLOCKED all six of P7–P12 and the pre-fix head
+    // ALLOWED all six. `git stash drop` is the sharpest of them — it destroys a
+    // shared stashed changeset and is NOT mitigated by M4, because a stash is not
+    // working-tree dirt, so a CLEAN hub admitted it.
+    // The refusal names the HIDDEN verb, not the promoted one, because the
+    // consumer restores the pre-#506 verdict — so the message is byte-identical to
+    // what base printed for the same command.
+    { id: "P7", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git stash drop && git -C . push -f origin main",
+      why: "round 11 P0: `stash-pop` promoted onto the ADMITTED `force-push` — the allowance then " +
+           "admitted the compound and the stash drop ran in the hub (measured: base BLOCK, pre-fix ALLOW)" },
+    { id: "P8", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git stash pop && git -C . push -f origin main",
+      why: "round 11 P0: the apply/pop spelling of the same promotion" },
+    { id: "P9", dir: "hub", expect: "block", marker: "(restore)",
+      cmd: "git restore . && git -C . push -f origin main",
+      why: "round 11 P0: `restore` promoted onto `force-push`" },
+    { id: "P10", dir: "hub", expect: "block", marker: "(checkout-discard-all)",
+      cmd: "git checkout . && git -C . push -f origin main",
+      why: "round 11 P0: `checkout-discard-all` promoted onto `force-push`" },
+    { id: "P11", dir: "hub", expect: "block", marker: "(checkout-discard-all)",
+      cmd: "git -C . branch -D main && git checkout .",
+      why: "round 11 P0: the promotion runs the OTHER way here — `branch-force-delete` is the winner " +
+           "and IS allowance-admitted (its target is the baseline), so `checkout-discard-all` was " +
+           "swallowed. The only one of the six whose promoted verdict is not a push kind, which is " +
+           "why a fix at the allowance alone would have closed this row and left the other five open" },
+    { id: "P12", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git stash drop && git -c core.pager=cat push -f origin main",
+      why: "round 11 P0: the `-c k=v` prefix spelling — the CLASS, not `-C` alone (`git -C .. …` is " +
+           "pinned at the classifier level as A36)" },
+    // The worktree half: base ADMITTED these (the legacy arm's worktree exemption is
+    // by design, and no sibling holds `main`), so the P0 fix must not tighten them.
+    // Without these two rows the fix could "pass" by refusing worktrees too.
+    { id: "P13", dir: "wt", expect: "allow",
+      cmd: "git stash drop && git -C . push -f origin main",
+      why: "round 11 CONTROL: base ALLOWED this in a worktree (measured), so the fix must not turn a " +
+           "worktree into a refusal — the restored verdict is the legacy one, whose exemption holds" },
+    { id: "P14", dir: "wt", expect: "allow",
+      cmd: "git checkout . && git -C . push -f origin main",
+      why: "round 11 CONTROL: the same parity for the checkout family" },
+    // CONTROL: the NON-prefixed twins are NOT promoted (the raw pass already sees
+    // the force-push), so the pre-#506 decision — allow — must be preserved. This
+    // is what bounds the fix: it restores base, it does not widen the guard.
+    { id: "P15", dir: "hub", expect: "allow",
+      cmd: "git stash drop && git push -f origin main",
+      why: "round 11 CONTROL: no promotion here (raw sees the force-push), so base ALLOWED it and " +
+           "so must we — P7 differs ONLY by the prefix, which is what makes the pair a discriminator" },
+    // ── review round 12 (P0): THE RESTORE REMOVED THE VERDICT'S PUSH-NESS ──
+    // The round-11 restore turns `block:force-push` into `block:stash-pop`, and
+    // EVERY delete-coordination arm keys on the verdict being a push kind — so on
+    // a THREE-segment compound whose second push is a real delete, all of them were
+    // skipped and the command landed on LEGACY_BLOCK, which is EXEMPT in a linked
+    // worktree. Base refused these via #73 and the pre-probe head ALLOWED them:
+    // a sibling worktree's checked-out branch lost its upstream, irreversibly.
+    // The fix (index.ts) runs the delete check BEFORE the restore, on every row
+    // where the restore can fire and a real push exists (`promoteTo !== null &&
+    // det.hasPush`). ⚠️ Round 13 corrected this comment: it used to say "scoped to
+    // exactly the rows where the restore fires", which was FALSE — the first draft
+    // gated it on `block:push`/`block:force-push` while the restore ALSO fires on
+    // `block:push-delete`, leaving four worktree rows open (base BLOCK via #73,
+    // pre-fix ALLOW). P20/P21 are those rows.
+    // ⛔ The attribution is TWO-SURFACE and verdict-dependent, because no single
+    // surface sees every shape: `wholeCommandDeleteTargets` returns `[]` for a
+    // `block:push-delete` verdict (it is gated on push/force-push), and
+    // `extractPushDeleteBranch` is null for the `-C .`-prefixed spelling. For
+    // `block:push-delete` the targets are the parsed `pushTargets` UNION the
+    // extractor; for the push/force-push verdicts the extractor sees a delete in a
+    // LATER segment. P16's second push is the later-segment case, P20's is the
+    // first-push case.
+    { id: "P16", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push -f origin main && git push origin --delete held",
+      why: "round 12 P0: the restore must not skip #73 — base BLOCKED this via the sibling check " +
+           "and the pre-probe head ALLOWED it (measured, worktree session)" },
+    { id: "P17", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git checkout . && git -C . push -f origin main && git push origin --delete main",
+      why: "round 12 P0: the same shape whose delete target is the HUB's checked-out main" },
+    // ⚠️ DECLARED TIGHTENING, not a base-parity row: base ALLOWED the `-d` spelling
+    // of this compound because its later-segment `-d` attribution is conditional —
+    // the same residue the PR body's t-9 row records. Pinning it means nobody can
+    // "fix" the extractor's scope by weakening #73 for this spelling.
+    { id: "P18", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push -f origin main && git push origin -d held",
+      why: "round 12: the #443 `-d` spelling of the same compound — base ALLOWED it (a base gap), so " +
+           "this row is a declared TIGHTENING and reds if #73 is ever narrowed back to `--delete`" },
+    // CONTROL: same compound, target held NOWHERE — the pre-gate probe must not
+    // become a blanket refusal of every 3-segment push compound.
+    { id: "P19", dir: "wt", expect: "allow",
+      cmd: "git stash pop && git -C . push -f origin main && git push origin --delete stale",
+      why: "round 12 CONTROL: base ALLOWED this (no sibling holds `stale`), so the probe must fall " +
+           "through — P16 differs ONLY by whether a sibling holds the target" },
+    // ── review round 13 (P0): THE PROBE'S ROWS WERE A SUBSET OF THE REWRITE'S ──
+    // The round-12 probe was gated on `block:push`/`block:force-push`, but the
+    // restore also fires when the compound's FIRST push itself carries the delete
+    // spelling: the classifier's push block rewrites the verdict to
+    // `block:push-delete` AFTER the promotion bookkeeping, and `block:push-delete`
+    // IS in ALLOWANCE. So the probe was skipped, the restore turned the verdict
+    // into a legacy kind, and LEGACY_BLOCK exempted the worktree. MEASURED — base
+    // BLOCK via #73, pre-fix head ALLOW.
+    // ⛔ P20 is why the attribution is TWO-SURFACE: `wholeCommandDeleteTargets`
+    // returns `[]` for a `block:push-delete` verdict (it is gated on
+    // push/force-push) and `extractPushDeleteBranch` is null for the `-C .`
+    // spelling, so ONLY their union finds `held`.
+    { id: "P20", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push -f --delete held",
+      why: "round 13 P0: the delete spelling is in the FIRST push, so the verdict is " +
+           "block:push-delete — the one restore-firing kind the round-12 probe did not cover" },
+    { id: "P21", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git push origin :held && git -C . push -f origin main",
+      why: "round 13 P0: the delete FIRST and prefix-defeated, the promotion second — the " +
+           "union is the only attribution that sees `held`" },
+    { id: "P22", dir: "wt", expect: "allow",
+      cmd: "git stash pop && git -C . push -f --delete stale",
+      why: "round 13 CONTROL: the same push-delete shape with an UNHELD target must stay " +
+           "allowed — P20 differs only by which branch is checked out somewhere" },
+    // ── review round 13 (P2): the push half's #805 refusal after a promotion ──
+    // When the REPLACED kind is admitted (`force-push`), nothing is restored — so
+    // the verdict becomes a legacy verb and every push arm is skipped. LEGACY_BLOCK
+    // is worktree-exempt, and with it went #805's fail-closed refusal for a push
+    // whose target repository cannot be resolved. MEASURED: base BLOCK, pre-fix
+    // head ALLOW.
+    { id: "P23", dir: "wt", expect: "block", marker: "target repository is unresolved",
+      cmd: "git -C . reset --hard && git --git-dir=$PWD/.git push -f origin main",
+      why: "round 13 P2: #805 — a gate that cannot determine the target REFUSES; the promotion " +
+           "must not carry the push half past that refusal" },
+    { id: "P24", dir: "wt", expect: "allow",
+      cmd: "git -C . reset --hard && git -C . push -f origin main",
+      why: "round 13 CONTROL: the same compound with a RESOLVABLE push target is not #805, and " +
+           "base ALLOWED it — P23 differs only by the unresolvable repo" },
+  ];
+
+  /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
+   *  arm (`!branchOwnership || !classifierLoaded`) is a DIFFERENT guard with its
+   *  own #73 clause, and nothing in the full-path rows above can reach it — so it
+   *  gets its own tree (a copy WITHOUT `shared/branch-ownership.mjs`) and its own
+   *  rows, and the load MUST report the degradation (asserted, so the rows cannot
+   *  silently execute the full path and still read green). */
+  const DEGRADED_PINS = [
+    { id: "D1", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git push origin --delete held",
+      why: "degraded arm: post-#506 the frozen verdict is block:stash-pop, so the #73 check must be " +
+           "run by the new clause instead of the old block:push-delete arm" },
+    { id: "D2", dir: "wt", expect: "allow",
+      cmd: "git stash pop && git push origin --delete stale",
+      why: "degraded arm control: the same compound with an UNHELD target is still worktree-exempt" },
+    { id: "D3", dir: "hub", expect: "block", marker: "Destructive git command blocked",
+      cmd: "git stash pop && git push origin --delete stale",
+      why: "degraded arm control: in the hub the generic legacy block still fires" },
+  ];
+
+  const real = await loadGuard(INDEX_TS);
+  expectTrue("B0: the real index.ts loads with no degradation warning and registers both handlers",
+    real.loaded && real.degradation.length === 0,
+    real.degradation.length > 0 ? real.degradation.join(" | ") : "tool_call/session_start handler missing");
+
+  try {
+    git(`init -q -b main "${hub}"`, tmp);
+    git("config user.email t@t && git config user.name t", hub);
+    writeFileSync(join(hub, "tracked.txt"), "x\n");
+    git("add -A && git commit -qm init", hub);
+    // `stale` is checked out NOWHERE (the laundering precondition: the #73 arm
+    // finds no holder and returns its allow verdict).
+    git("branch stale", hub);
+    // `held` is checked out in a SIBLING worktree — the #73 hazard.
+    git(`worktree add -q -b held "${wtHeld}"`, hub);
+    // The session's own linked worktree.
+    git(`worktree add -q -b feat/session "${wtSession}"`, hub);
+    for (const v of HATCH_VARS) delete process.env[v];
+    process.env.AGENT_INFRA_PATH = hub;
+    process.env.AGENT_LOCKS_DIR = join(tmp, "locks");
+    // Hub stays on main and CLEAN — the only legal hub state (M4).
+    git("checkout -q main", hub);
+
+    if (real.loaded) {
+      await real.sessionStart(hub);       // hub session: baseline = main
+      await real.sessionStart(wtSession); // linked-worktree session
+    }
+    const dirs = { hub, wt: wtSession };
+
+    const results = new Map();
+    for (const p of PINS) results.set(p.id, await real.bash(dirs[p.dir], p.cmd));
+
+    for (const p of PINS) {
+      const r = results.get(p.id);
+      const ok = p.expect === "block" ? blocked(r) : r === undefined;
+      expectTrue(`${p.id} ${p.expect === "block" ? "BLOCKED" : "ALLOWED"} — ${p.why}`,
+        ok, `${JSON.stringify(p.cmd)} → ${show(r)}`);
+      if (p.marker && blocked(r)) {
+        expectTrue(`${p.id}: the refusal is the ${p.marker} arm (which guard fired)`,
+          String(r.reason ?? "").includes(p.marker), show(r));
+      }
+    }
+    // B10/B11 as a PAIR: same compound, same session, only the target differs —
+    // so B10's block cannot be a blanket refusal of the compound.
+    expectTrue("B12: B10/B11 differ ONLY by the delete target's checked-out state",
+      blocked(results.get("B10")) && results.get("B11") === undefined,
+      `B10 → ${show(results.get("B10"))}; B11 → ${show(results.get("B11"))}`);
+
+    // ── the ORDERING implemented above is pinned structurally too ──
+    // The behavioural B15 row pins the outcome; this pins the placement that
+    // produces it, because a later edit can move one arm without changing any
+    // row's answer on the day (the allowance's kind map is the thing that would
+    // have to grow first). Read from the source text, not from behaviour.
+    {
+      const src = readFileSync(INDEX_TS, "utf8");
+      const armAt = src.indexOf("// ── #506: delete spelling inside a LEGACY-DESTRUCTIVE compound ──");
+      const allowAt = src.indexOf("// ── Ownership allowance (agent-infra main, own baseline branch) ──");
+      const admitAt = src.indexOf("return admitAfterM3(); // on-baseline or unverifiable-but-exempt");
+      expectTrue("O1: the #506 arm is placed ABOVE the ownership-allowance block (deny-wins order)",
+        armAt !== -1 && allowAt !== -1 && armAt < allowAt,
+        `arm@${armAt} allowance@${allowAt} — an admit is a RETURN, so anything below it is unreachable`);
+      expectTrue("O2: the allowance's admit still sits below both (the pin reads the real arm)",
+        admitAt !== -1 && armAt < admitAt, `arm@${armAt} admit@${admitAt}`);
+    }
+
+    // ── The DEGRADED path (#506 review finding 2) ──
+    // A tree WITHOUT shared/branch-ownership.mjs: `branchOwnership` stays null, so
+    // the `!branchOwnership || !classifierLoaded` arm owns the decision and the
+    // full-path rows above cannot reach it. The degradation MUST be reported —
+    // that assertion is what keeps these rows from silently re-testing the full
+    // path (and it is the non-vacuity floor for the whole block).
+    console.log("\n── Part D: the degradation-fallback arm (#506 finding 2) ──");
+
+    /** Copy this extension (plus the shared modules index.ts imports) into a
+     *  temp tree. `omit` drops a module (the degraded fixtures), `file`+`revert`
+     *  applies ONE textual revert (the mutants). */
+    function buildTree(label, { omit = [], file = null, revert = null } = {}) {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), `legacy-delete-${label}-`)));
+      const ext = join(root, "extensions");
+      mkdirSync(join(ext, "main-worktree-guard"), { recursive: true });
+      mkdirSync(join(ext, "shared"), { recursive: true });
+      for (const f of ["index.ts", "classify-git.mjs", "module-load-hooks.mjs"]) {
+        cpSync(join(HERE, f), join(ext, "main-worktree-guard", f));
+      }
+      for (const f of ["print-mode.ts", "audit-log.ts", "tool-call-event.ts", "branch-ownership.mjs"]) {
+        if (omit.includes(`shared/${f}`)) continue;
+        cpSync(join(REPO_EXTENSIONS, "shared", f), join(ext, "shared", f));
+      }
+      let applied = false;
+      if (file && revert) {
+        const target = join(ext, "main-worktree-guard", file);
+        const src = readFileSync(target, "utf8");
+        const mutated = revert(src);
+        applied = mutated !== src;
+        writeFileSync(target, mutated);
+      }
+      return { root, index: join(ext, "main-worktree-guard", "index.ts"), applied };
+    }
+
+    /** Drive the DEGRADED_PINS against one tree and report each row. */
+    async function runDegradedRows(built, label, { redCheck = null } = {}) {
+      const guard = await loadGuard(built.index);
+      expectTrue(`D0: [${label}] the tree really IS degraded (an extension warning was reported)`,
+        guard.degradation.length > 0 || !guard.loaded,
+        "no degradation was reported — the rows below would exercise the FULL path");
+      if (!guard.loaded) return false;
+      await guard.sessionStart(hub);
+      await guard.sessionStart(wtSession);
+      let allOk = true;
+      for (const p of DEGRADED_PINS) {
+        const r = await guard.bash(dirs[p.dir], p.cmd);
+        const ok = p.expect === "block" ? blocked(r) : r === undefined;
+        if (redCheck) {
+          expectTrue(`M: [${label}] ${p.id} goes RED — ${p.why}`, redCheck(r), `under the mutant: ${show(r)}`);
+          continue;
+        }
+        expectTrue(`${p.id} ${p.expect === "block" ? "BLOCKED" : "ALLOWED"} — ${p.why}`,
+          ok, `${JSON.stringify(p.cmd)} → ${show(r)}`);
+        if (!ok) allOk = false;
+        if (p.marker && blocked(r)) {
+          expectTrue(`${p.id}: the refusal is the ${p.marker} arm (which guard fired)`,
+            String(r.reason ?? "").includes(p.marker), show(r));
+        }
+      }
+      return allOk;
+    }
+    {
+      const plain = buildTree("degraded-no-branch-ownership", { omit: ["shared/branch-ownership.mjs"] });
+      try { await runDegradedRows(plain, "no branch-ownership"); }
+      finally { rmSync(plain.root, { recursive: true, force: true }); }
+    }
+
+    // ── Part M — MUTATION EVIDENCE: each half of the fix is load-bearing ──
+    if (MUTATIONS) {
+      console.log("\n── Part M: mutation evidence (#506) ──");
+
+      const MUTANT_PAIRS = [
+        {
+          // (1) the pre-fix override: the delete spelling overwrites ANY legacy
+          // verdict again. Every hub pin must go from BLOCKED to allowed.
+          label: "pre-fix verdict override",
+          file: "classify-git.mjs",
+          revert: (src) => src.replace(
+            "      if (!legacyIsOtherDestructive) out.verdict = \"block:push-delete\";",
+            "      out.verdict = \"block:push-delete\"; // MUTANT: pre-fix unconditional override",
+          ),
+          expectRed: ["B1", "B2", "B3", "B4", "B5"],
+          // RED means "the hub command is ALLOWED again" — the laundering.
+          redCheck: (r) => !blocked(r),
+          // Measured non-discriminating rows, held here rather than claimed as
+          // evidence: B6 (a reset lead out-ranks push-delete in the frozen
+          // pattern list, so it never entered the override branch and LEGACY_BLOCK
+          // caught it pre-fix too) and B10/B11 (a worktree reach region where the
+          // pre-fix `block:push-delete` verdict still ran the #73 arm — that is
+          // exactly the protection part 2 must not lose).
+          expectGreen: ["B6", "B7", "B8", "B10", "B11", "B13", "B13b", "B14"],
+          classifier: ["git reset --hard && git push origin --delete stale", "block:push-delete"],
+        },
+        {
+          // (2) the index.ts arm removed: the legacy pins still block (LEGACY_BLOCK
+          // is untouched), and the #73 worktree pin goes RED. Both directions are
+          // asserted, so the two halves are shown to be INDEPENDENTLY load-bearing
+          // rather than one arm standing in for the other.
+          label: "#506 delete-target arm removed",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            '      if (det.hasPush === true &&\n          det.verdict !== "block:push-delete" &&',
+            '      if (false && det.hasPush === true &&\n          det.verdict !== "block:push-delete" &&',
+          ),
+          expectRed: ["B10", "B14"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B11", "B13", "B13b"],
+        },
+        {
+          // (3) THE REORDER REVERTED: `push-delete` back above `force-checkout` in
+          // the shared priority list. This is the half that has no other mutant;
+          // its pins are the frozen-layer A15b and the behavioural B5 (a `stash
+          // pop` lead, which the old order swallowed into `block:push-delete`).
+          label: "push-delete restored above force-checkout",
+          file: "classify-git.mjs",
+          revert: (src) => {
+            const line = '  { name: "push-delete", re: /\\bgit\\s+push\\b[^;&|]*(--delete\\b|\\s:\\S+)/ },';
+            const at = src.indexOf(line);
+            if (at === -1) return src; // anchor dead → `applied` false, reported as a stale anchor
+            const without = src.slice(0, at) + src.slice(at + line.length);
+            const anchor = '  { name: "force-checkout", re: /\\bgit\\s+(checkout|switch)\\s+(-f|--force)\\b/ },\n';
+            return without.replace(anchor, line + "\n" + anchor); // MUTANT: pre-#506 order
+          },
+          expectRed: ["B5"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B1", "B2", "B3", "B4", "B6", "B10", "B11", "B13", "B14"],
+          classifier: ["git stash pop && git push origin --delete stale", "block:push-delete"],
+        },
+        {
+          // (4) THE DEGRADED CLAUSE REMOVED (#506 review finding 2). Runs on its
+          // OWN tree (no branch-ownership) because the clause only exists in the
+          // degradation arm; D1 must go RED — allowed — the moment it is gone.
+          label: "degraded #73 clause removed",
+          file: "index.ts",
+          omit: ["shared/branch-ownership.mjs"],
+          revert: (src) => src.replace(
+            '          (verdict.startsWith("block:") && rawDeleteNames.length > 0);',
+            '          false; // MUTANT: #506 degraded clause removed',
+          ),
+          expectDegradedRed: ["D1"],
+          expectDegradedGreen: ["D2", "D3"],
+        },
+        {
+          // (6) THE hasPush GATE REMOVED (#506 review round 3, finding 2). Without
+          // it the arm re-enters for a `block:commit`, the extractor supplies the
+          // delete target from the commit MESSAGE, and B13/B13b go RED.
+          label: "hasPush gate removed",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "      if (det.hasPush === true &&\n          det.verdict !== \"block:push-delete\" &&",
+            "      if (det.verdict !== \"block:push-delete\" &&",
+          ),
+          // MEASURED, and it corrects the review's prediction: only B13 (`-d`)
+          // reddens. The `--delete` twin (B13b) is INVARIANT under this mutant —
+          // the frozen echo over-match returns `block:push-delete` for it, which
+          // the arm excludes by family, so the gate was never what kept B13b
+          // green. Its partner is the parity assertion, not the gate.
+          expectRed: ["B13"],
+          // RED here means the commit was REFUSED on message text alone.
+          redCheck: (r) => blocked(r) && String(r.reason ?? "").includes("checked out in"),
+          expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B10", "B11", "B13b", "B14"],
+        },
+        {
+          // (8) THE HOIST REVERTED (review round 4): the arm is moved back below
+          // the ownership-allowance block, i.e. exactly where it sat when the
+          // bypass was measured. B15 must go RED — the compound is ADMITTED — and
+          // B15b stays green (the legacy arm still blocks it).
+          label: "delete arm moved below the ownership allowance",
+          file: "index.ts",
+          revert: (src) => {
+            const H = "      // ── #506: delete spelling inside a LEGACY-DESTRUCTIVE compound ──";
+            const E = "      // ── Ownership allowance (agent-infra main, own baseline branch) ──";
+            const D = "      // ── push --delete: retained #73 coordinated check (foreign targets) ──";
+            const a = src.indexOf(H), b = src.indexOf(E), c = src.indexOf(D);
+            if (a === -1 || b === -1 || c === -1 || !(a < b && b < c)) return src;
+            const block = src.slice(a, b);
+            return src.slice(0, a) + src.slice(b, c) + block + src.slice(c); // MUTANT: below the allowance
+          },
+          expectRed: ["B15"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B10", "B11", "B14", "B15b"],
+        },
+        {
+          // (7) THE hasPush FLAG NEVER SET (classifier half of finding 2): the flag
+          // is asserted on the mutant MODULE, and the arm it gates goes quiet —
+          // which reds the two worktree #73 pins it exists to drive.
+          label: "hasPush flag never set",
+          file: "classify-git.mjs",
+          revert: (src) => src.replace(
+            "    out.hasPush = true; // #506: \"a real push invocation exists\" — see the doc block",
+            "    // MUTANT: hasPush never set",
+          ),
+          classifierHasPush: ["git reset --hard && git push origin --delete stale", false],
+          expectRed: ["B10", "B14"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B1", "B2", "B3", "B4", "B5", "B6", "B11", "B13", "B13b"],
+        },
+        {
+          // (5) THE EXTRACTOR FALLBACK DELETED: a delete that lives in a LATER
+          // compound segment loses its attribution, so B6 (reset → push main →
+          // push --delete) stops running the #73 check. B6 was deliberately NOT
+          // discriminating for the override mutant (it blocks either way), so
+          // this is the mutant that pins the fallback itself.
+          label: "extractor fallback removed",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)\n          ? (extractPushDeleteBranch(localCommand) ?? [])\n          : [];\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];",
+            "        const legacyDeletes = det.pushTargets; // MUTANT: no extractor fallback",
+          ),
+          // B6 still BLOCKS (LEGACY_BLOCK owns the reset) — the fallback's loss is
+          // only visible where the legacy arm exempts, so the pin is B10's
+          // later-segment analogue: a worktree compound whose delete is in the
+          // SECOND push invocation (B14). B16/B16b redden here TOO — round 6's row
+          // also depends on the extractor, so removing it re-opens that hole
+          // (measured: under this mutant B16 is ALLOWED again). B17 stays green
+          // because its `held` target comes from `pushTargets` itself.
+          expectRed: ["B14", "B16", "B16b"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B6", "B10", "B17"],
+        },
+        {
+          // (9) THE ROUND-6 DEFECT REINTRODUCED: `pushTargets` preferred outright
+          // whenever it is non-empty, so a SECOND delete push in the same
+          // compound loses its attribution. B16/B16b go RED (allowed); B16c
+          // stays green (it was a control either way) and B14 stays green —
+          // its delete is in the second push, which takes the empty-list path.
+          label: "first push's targets only (round-6 finding 1 reintroduced)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)\n          ? (extractPushDeleteBranch(localCommand) ?? [])\n          : [];\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];",
+            "        const legacyDeletes = det.pushTargets.length > 0\n          ? det.pushTargets\n          : (extractPushDeleteBranch(localCommand) ?? []); // MUTANT: first push only",
+          ),
+          expectRed: ["B16", "B16b"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B6", "B10", "B14", "B16c", "B17"],
+        },
+        {
+          // (10) THE UNION COLLAPSED TO A REPLACE: when the extractor finds
+          // anything it is used ALONE, discarding the parsed targets it does not
+          // see (the `-o` value over-capture). B17 goes RED — the held target in
+          // `pushTargets` vanishes — while B16 stays green (the extractor is a
+          // superset for a pure delete compound). This is the row that pins the
+          // UNION choice over the narrower replace.
+          label: "extractor replaces the parsed targets (union collapsed)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "          : [];\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];",
+            "          : [];\n        const legacyDeletes = extractedDeletes.length > 0 ? extractedDeletes : det.pushTargets; // MUTANT: replace, not union",
+          ),
+          expectRed: ["B17"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["B6", "B10", "B14", "B16"],
+        },
+        {
+          // (11) THE SKIMMED PASS RE-GATED ON `allow` — the round-8 defect put
+          // back. The raw pass's hit (a delete spelling, or a force-push) makes
+          // the skimmed re-test unreachable again, so the prefix-defeated lead
+          // verb keeps the LESS severe verdict and P1/P2/P6 return to ALLOWED.
+          // The three controls are what keep this from being a claim: P5 (the
+          // prefixed verb alone) still blocks — the skimmed pass still runs when
+          // the raw pass finds nothing, exactly as before this fix — and P3/P4
+          // were already blocked pre-fix and stay blocked.
+          label: "skimmed pass gated on allow again (pre-fix short-circuit)",
+          file: "classify-git.mjs",
+          revert: (src) => src.replace(
+            "  for (const inv of invocations) {\n    if (patternIdx === 0) break; // already the highest-priority pattern",
+            "  for (const inv of (patternIdx === -1 ? invocations : [])) { // MUTANT: pre-fix short-circuit\n    if (patternIdx === 0) break;",
+          ),
+          expectRed: ["P1", "P2", "P6"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P3", "P4", "P5", "B1"],
+          classifier: ["git -C . reset --hard && git push origin --delete stale", "block:push-delete"],
+        },
+        {
+          // (12) THE PROMOTION GATE REMOVED — the round-11 P0 put back. The
+          // skimmed pass still promotes (the classifier is untouched), but the
+          // consumer no longer restores the pre-#506 verdict, so the promoted
+          // `force-push` / `branch-force-delete` reaches the ownership allowance
+          // and the HIDDEN verb runs in the hub. Exactly the six measured
+          // fail-opens go red, and the three controls prove the rows are
+          // discriminating rather than blanket refusals: P13/P14 (the WORKTREE
+          // parity rows — base admitted those, so a mutant that reddens them too
+          // would be proving an over-block, not this fix) and P15 (the
+          // NON-prefixed twin, which was never promoted and was always allowed).
+          label: "round-11 promotion gate removed (index.ts)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "      if (promoteTo !== null) det.verdict = promoteTo;",
+            "      if (false) det.verdict = promoteTo; // MUTANT: round-11 promotion gate removed",
+          ),
+          expectRed: ["P7", "P8", "P9", "P10", "P11", "P12"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P13", "P14", "P15", "B1"],
+        },
+        {
+          // (14) THE PRE-RESTORE DELETE CHECK REMOVED — the round-12 P0 put back.
+          // The restore still fires, so the hub half (P7–P12) stays GREEN and only
+          // the three-segment WORKTREE rows go red: that split is exactly why this
+          // needed its own mutant. The restore rewrites the verdict onto a
+          // non-push kind, every delete-coordination arm below keys on a push
+          // kind, and LEGACY_BLOCK exempts a worktree — so a sibling's branch lost
+          // its upstream while every round-11 row stayed green. P19 (no sibling
+          // holds the target) must stay ALLOW either way: it is the control that
+          // keeps this from being a blanket refusal.
+          label: "round-12 pre-restore delete check removed (index.ts)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "        if (probeDeletes.length > 0) {",
+            "        if (false) { // MUTANT: round-12 pre-restore delete check removed",
+          ),
+          expectRed: ["P16", "P17", "P18", "P20", "P21"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P19", "P22", "P7", "P13"],
+        },
+        {
+          // (15) THE PUSH-HALF GATE REMOVED — the round-13 P2 put back. Only P23
+          // should redden; P24 is its control (a resolvable target is not #805),
+          // and the round-11/12 rows are untouched because that arm only runs when
+          // a promotion replaced a PUSH kind with a legacy one.
+          label: "round-13 push-half #805 gate removed (index.ts)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "      if (pushHalfUngated) {",
+            "      if (false) { // MUTANT: round-13 push-half gate removed",
+          ),
+          expectRed: ["P23"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P24", "P7", "P16"],
+        },
+        {
+          // (13) THE FACT NEVER RECORDED — the classifier stops reporting what the
+          // promotion replaced. The consumer's gate is intact but has nothing to
+          // act on, so the same six rows go red. This is the OTHER half of mutant
+          // 12: neither the fact nor the consumer alone is the fix, and pinning
+          // only one of them would let the other rot silently.
+          label: "promotedFrom never recorded (classify-git.mjs)",
+          file: "classify-git.mjs",
+          revert: (src) => src.replace(
+            "        if (patternIdx !== -1 && out.promotedFrom === null) {\n          out.promotedFrom = DESTRUCTIVE_GIT_PATTERNS[patternIdx].name;\n        }",
+            "        if (false) { // MUTANT: the replaced verdict is never recorded\n          out.promotedFrom = DESTRUCTIVE_GIT_PATTERNS[patternIdx].name;\n        }",
+          ),
+          expectRed: ["P7", "P10", "P11"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P13", "P15", "B1"],
+        },
+      ];
+
+      for (const mut of MUTANT_PAIRS) {
+        const built = buildTree(mut.label.replace(/[^a-z0-9]+/gi, "-"), mut);
+        try {
+          expectTrue(`M: [${mut.label}] the revert was actually applied (anchor is live)`, built.applied,
+            "the anchor did not match — a stale anchor proves less than it claims");
+          if (!built.applied) continue;
+          if (mut.classifierHasPush) {
+            const mutCg2 = await import(pathToFileURL(join(built.root, "extensions/main-worktree-guard/classify-git.mjs")).href);
+            const got = mutCg2.classifyGitCommandDetailed(mut.classifierHasPush[0]).hasPush === true;
+            expectTrue(`M: [${mut.label}] the mutant reports hasPush=${mut.classifierHasPush[1]} for a REAL push (defect reintroduced)`,
+              got === mut.classifierHasPush[1], `got hasPush=${got}`);
+          }
+          if (mut.classifier) {
+            // The classifier half is asserted on the mutant MODULE (the unit the
+            // revert changes), so it holds even if the loader leg is unavailable.
+            const mutCg = await import(pathToFileURL(join(built.root, "extensions/main-worktree-guard/classify-git.mjs")).href);
+            const got = mutCg.classifyGitCommandDetailed(mut.classifier[0]).verdict;
+            expectTrue(`M: [${mut.label}] the mutant classifies the compound ${mut.classifier[1]} (defect reintroduced)`,
+              got === mut.classifier[1], `got ${got}`);
+          }
+          if (mut.expectDegradedRed) {
+            const guard = await loadGuard(built.index);
+            expectTrue(`M: [${mut.label}] the mutant extension loads ${mut.omit ? "DEGRADED" : "clean"}`,
+              guard.loaded && (mut.omit ? guard.degradation.length > 0 : guard.degradation.length === 0),
+              guard.degradation.join(" | ") || "no degradation reported");
+            if (!guard.loaded) continue;
+            await guard.sessionStart(hub);
+            await guard.sessionStart(wtSession);
+            for (const id of mut.expectDegradedRed) {
+              const p = DEGRADED_PINS.find((x) => x.id === id);
+              const r = await guard.bash(dirs[p.dir], p.cmd);
+              expectTrue(`M: [${mut.label}] ${id} goes RED — ${p.why}`, !blocked(r), `under the mutant: ${show(r)}`);
+            }
+            for (const id of mut.expectDegradedGreen ?? []) {
+              const p = DEGRADED_PINS.find((x) => x.id === id);
+              const r = await guard.bash(dirs[p.dir], p.cmd);
+              const ok = p.expect === "block" ? blocked(r) : r === undefined;
+              expectTrue(`M: [${mut.label}] ${id} is unaffected`, ok, `under the mutant: ${show(r)}`);
+            }
+            continue;
+          }
+          const mutant = await loadGuard(built.index);
+          expectTrue(`M: [${mut.label}] the mutant extension loads without degradation`,
+            mutant.loaded && mutant.degradation.length === 0, mutant.degradation.join(" | "));
+          if (!mutant.loaded) continue;
+          await mutant.sessionStart(hub);
+          await mutant.sessionStart(wtSession);
+          for (const id of mut.expectRed) {
+            const p = PINS.find((x) => x.id === id);
+            const r = await mutant.bash(dirs[p.dir], p.cmd);
+            expectTrue(`M: [${mut.label}] ${id} goes RED — ${p.why}`, mut.redCheck(r),
+              `under the mutant: ${show(r)}`);
+          }
+          for (const id of mut.expectGreen ?? []) {
+            const p = PINS.find((x) => x.id === id);
+            const r = await mutant.bash(dirs[p.dir], p.cmd);
+            const ok = p.expect === "block" ? blocked(r) : r === undefined;
+            expectTrue(`M: [${mut.label}] ${id} is unaffected (the other half still holds)`, ok,
+              `under the mutant: ${show(r)}`);
+          }
+        } finally {
+          rmSync(built.root, { recursive: true, force: true });
+        }
+      }
+    }
+  } finally {
+    for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+process.removeAllListeners("warning");
+reportVerdict("test-506-legacy-delete-compound", pass, fail, { skip });
+process.exit(fail === 0 ? 0 : 1);

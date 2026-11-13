@@ -87,7 +87,6 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   // classifies it separately (branch-state mutation, ownership-gated).
   { name: "branch-force-delete", re: /\bgit\s+branch\b(?=[^;&|]*[ \t](?:["']?--d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|["']?-(?![A-Za-z]*u)[A-Za-z]*[dD]))(?=[^;&|]*[ \t](?:["']?--forc(?:e)?(?![A-Za-z0-9])|["']?-(?![A-Za-z]*u)[A-Za-z]*f))[^;&|]*/ },
   { name: "force-push", re: /\bgit\s+push\b[^;&|]*(-f|--force)\b/ },
-  { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
   { name: "force-checkout", re: /\bgit\s+(checkout|switch)\s+(-f|--force)\b/ },
   { name: "checkout-discard-all", re: /\bgit\s+(checkout|switch)\s+-{0,2}\s*\.(\s|$|[;&|])/ },
   // Bare-ref or -b branch switch: `git checkout main`, `git checkout -b feat/x`,
@@ -97,6 +96,23 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "checkout-branch", re: /\bgit\s+(checkout|switch)\s+(-b\s+)?(?!--)(?!-\w)(\S+)/ },
   { name: "restore", re: /\bgit\s+restore\b/ },
   { name: "stash-pop", re: /\bgit\s+stash\s+(pop|apply|drop|clear)\b/ },
+  // #506 — the ARRAY IS A PRIORITY LIST, and `push-delete` used to sit ABOVE
+  // force-checkout / checkout-discard-all / checkout-branch / restore /
+  // stash-pop. Because `classifyGitCommand` returns the FIRST match on the WHOLE
+  // command string, a compound whose lead verb is one of those five classified
+  // `block:push-delete` — a LESS severe verdict than the verb it contains — and
+  // the full path's #73 arm then returned allow whenever the delete target was
+  // checked out nowhere, so the lead verb RAN in the hub main checkout
+  // (`git stash pop && git push origin --delete stale` — probe-verified). The
+  // verbs above (reset/clean/merge/rebase/pull/branch-force-delete/force-push)
+  // never had this shape: they out-rank push-delete and reached the full path as
+  // themselves, where the DETAILED classifier's unconditional override (#506's
+  // main defect) laundered them instead.
+  // A remote-branch delete is the LEAST destructive entry in this family, so it
+  // belongs LAST: a compound now names its most severe verb, exactly as the
+  // guard's contract says. Pure delete pushes are unaffected (nothing else
+  // matches), and `force-push` still out-ranks it (`git push -f … --delete`).
+  { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
 ];
 
 /**
@@ -4007,11 +4023,38 @@ export function _branchInvMutatesBranchState(args) {
  * Detailed classification of a shell command (consumed EXCLUSIVELY by
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
- *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete,
+ *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete, hasPush,
+ *     promotedFrom,
  *     renameFrom, renameTo, syncSource, stateVerb, stateArgs, stateOpCount }
  * - verdict: legacy `block:*` strings for destructive patterns (verb-anchored),
  *   plus NEW `block:commit` / `block:push` / `block:force-push`; `allow` /
  *   `allow-non-git` otherwise.
+ * - promotedFrom: the pattern NAME whose verdict the always-run skimmed pass
+ *   REPLACED with a higher-priority one (null when no promotion happened).
+ *   #506 round 11 (P0) — it is a FACT the consumer must not lose:
+ *   `git stash drop && git -C . push -f origin main` holds `stash-pop` in the raw
+ *   pass and promotes to `force-push` from the skimmed pass, and `force-push` is
+ *   a kind the ownership allowance ADMITS while `stash-pop` is one it never did.
+ *   So a promotion can move a compound onto a MORE admitted verdict, and the
+ *   replaced verb is still an EFFECT of the command. Reported, never acted on,
+ *   here: index.ts owns the admission map and decides what to do with it.
+ *   ⚠️ It is the raw pass's winner under the CURRENT (post-#506) array order, NOT
+ *   under the pre-#506 order — round 12 corrected that claim after measuring it.
+ *   This PR moved `push-delete` from index 8 to 13, so when a delete spelling is
+ *   present the raw winner here is `push-delete` while the pre-#506 winner was one
+ *   of its less-severe neighbours; a 4608-compound sweep found 48 such rows. So
+ *   the consumer's restore is DENY-WINS restitution, never a reproduction of the
+ *   old verdict: where base would have run the #73 delete check on a
+ *   `block:push-delete` verdict, this field alone would skip it — which is why
+ *   index.ts runs that check BEFORE it acts on this field.
+ * - hasPush: true iff the command contains a PUSH INVOCATION (any verdict).
+ *   #506 — index.ts's delete-target arm must run the #73 sibling check on a
+ *   compound the verdict did not name a push for, but a `block:commit` verdict
+ *   PROVES there is no push invocation at all, so the only "evidence" there is
+ *   the string extractor matching a commit MESSAGE
+ *   (`git commit -m "… git push origin -d main"`). Even the documented
+ *   echo/comment over-match class needs a real push somewhere; this flag is
+ *   what lets the consumer tell the two apart without re-deriving the walk.
  * - branchState: true for checkout/switch/symbolic-ref/update-ref/branch ops
  *   that mutate the checkout's branch (M3 gate runs on these regardless of
  *   verdict — symbolic-ref/update-ref/branch -f have NO legacy pattern).
@@ -4039,6 +4082,8 @@ export function classifyGitCommandDetailed(command) {
     verdict: "allow", repoHint, gitDirHint, verb: invocations[0]?.verb ?? null,
     verbArgs: invocations[0]?.args ?? [], branchState: false, newBranch: null,
     deleteTargets: [], pushDst: null, pushTargets: [], isPushDelete: false,
+    hasPush: false,
+    promotedFrom: null,
     renameFrom: null, renameTo: null, syncSource: null,
   };
   // #1144 follow-up (P0-1): a hidden shell substitution (`eval "git rebase …"`,
@@ -4091,8 +4136,9 @@ export function classifyGitCommandDetailed(command) {
   }
 
   // ── verb-anchored legacy destructive patterns ──
-  // Run on the RAW command (compound chains: `git pull && git merge`), and if
-  // that misses, on EVERY invocation's SKIMMED reconstruction (`git -C x
+  // Run on the RAW command (compound chains: `git pull && git merge`), and —
+  // ALWAYS, never only when the raw pass misses (#506 review round 8, P1) — on
+  // EVERY invocation's SKIMMED reconstruction (`git -C x
   // checkout main` ≡ `git checkout main` — the -C/-c/GIT_DIR prefixes defeat
   // the raw regexes' `git\s+branch` adjacency, which is exactly why they were
   // verified bypasses). #587 (review fold-in): the re-test covers every
@@ -4101,18 +4147,65 @@ export function classifyGitCommandDetailed(command) {
   // escaped both passes. index.ts resolves the effective repo from the STATE
   // invocation, so worktree/foreign-targeted deletes stay exempt downstream.
   const raw = String(command ?? "").trim();
-  for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
-    if (re.test(raw)) { out.verdict = `block:${name}`; break; }
+  // The INDEX of the winning pattern in the priority list (-1 = nothing matched
+  // yet). Both passes share it, so a later pass can only ever move the verdict
+  // to a STRICTLY HIGHER-priority verb — never weaken it.
+  // ⛔ "HIGHER PRIORITY" IS NOT "MORE RESTRICTIVE", AND THAT DISTINCTION IS A
+  // SECURITY PROPERTY (see `promotedFrom` in the shape doc above, #506 round 11
+  // P0). The consumer's ownership allowance admits a FIXED SET of kinds
+  // (pull/merge/rebase/push/force-push/push-delete/branch-force-delete) and
+  // never admits reset/clean/force-checkout/checkout-discard-all/
+  // checkout-branch/restore/stash-pop. Promotion therefore moves a compound
+  // ACROSS that line in the unsafe direction: the raw pass sees `stash-pop`,
+  // the skimmed pass promotes to `force-push`, and the allowance — which the
+  // pre-#506 verdict would never have reached — then admits the whole command.
+  // So a raise records what it replaced.
+  let patternIdx = -1;
+  for (let i = 0; i < DESTRUCTIVE_GIT_PATTERNS.length; i++) {
+    if (DESTRUCTIVE_GIT_PATTERNS[i].re.test(raw)) {
+      out.verdict = `block:${DESTRUCTIVE_GIT_PATTERNS[i].name}`;
+      patternIdx = i;
+      break;
+    }
   }
-  if (out.verdict === "allow") {
-    for (const inv of invocations) {
-      const skimmed = `git ${inv.verb ?? ""} ${(inv.args || []).join(" ")}`.trim();
-      if (skimmed === "git") continue;
-      let hit = false;
-      for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
-        if (re.test(skimmed)) { out.verdict = `block:${name}`; hit = true; break; }
+  // ⛔ THE SKIMMED PASS RUNS **ALWAYS** — it is not conditional on the raw pass
+  // having found nothing (#506 review round 8, P1; measured end-to-end). It
+  // exists because the `-C`/`-c`/`GIT_DIR` prefixes defeat the raw regexes'
+  // `git <verb>` adjacency, so a raw hit is evidence about the raw TEXT, not
+  // about the verbs the command contains. Gating it on `verdict === "allow"`
+  // left the prefix class open one spelling over: for
+  // `git -C . reset --hard && git push origin --delete stale` the raw pass
+  // matches ONLY `push-delete` (the reset is prefix-defeated), the skimmed pass
+  // never ran, and the compound reached index.ts as `block:push-delete` — whose
+  // #73 arm returns its allow-when-no-sibling-checkout verdict — so the hard
+  // reset RAN in the shared hub main checkout. That is exactly the laundering
+  // #506 exists to close, through the one spelling the raw pass cannot see.
+  // The two passes are therefore combined by PRIORITY (`DESTRUCTIVE_GIT_PATTERNS`
+  // is a priority list, #506): whichever pass names the more severe verb wins,
+  // and the skimmed pass cannot lower a raw verdict. The delete FACTS
+  // (`isPushDelete`/`pushTargets`) are unaffected — they are computed from the
+  // push invocation below, not from the verdict.
+  for (const inv of invocations) {
+    if (patternIdx === 0) break; // already the highest-priority pattern
+    const skimmed = `git ${inv.verb ?? ""} ${(inv.args || []).join(" ")}`.trim();
+    if (skimmed === "git") continue;
+    for (let i = 0; i < DESTRUCTIVE_GIT_PATTERNS.length; i++) {
+      if (!DESTRUCTIVE_GIT_PATTERNS[i].re.test(skimmed)) continue;
+      if (patternIdx === -1 || i < patternIdx) {
+        // #506 round 11 (P0): a raise that REPLACES an already-held verdict is a
+        // PROMOTION, and the replaced name is retained. The FIRST replaced value
+        // is what the pre-#506 classifier produced WHENEVER THE RAW PASS MATCHED
+        // NOTHING (there, base's verdict WAS the first skimmed hit); when the raw
+        // pass did match it is the raw winner under the CURRENT order. Those two
+        // coincide only when no delete spelling is present, because this PR moved
+        // `push-delete` to the end — see the warning in the shape doc above.
+        if (patternIdx !== -1 && out.promotedFrom === null) {
+          out.promotedFrom = DESTRUCTIVE_GIT_PATTERNS[patternIdx].name;
+        }
+        out.verdict = `block:${DESTRUCTIVE_GIT_PATTERNS[i].name}`;
+        patternIdx = i;
       }
-      if (hit) break;
+      break; // the first matching pattern for THIS invocation is its own verdict
     }
   }
 
@@ -4164,6 +4257,7 @@ export function classifyGitCommandDetailed(command) {
     const legacyVerdict = out.verdict;
     const args = pushInv.args;
     const joined = `git push ${args.join(" ")}`;
+    out.hasPush = true; // #506: "a real push invocation exists" — see the doc block
     // #443 clean-hub parity (mirrors the #439 disordered-hub closure): delete
     // detection was exact-only (`--delete` / `:branch`), so the documented
     // `-d` short form, merged no-arg short clusters containing `d` (`-dq`), and
@@ -4180,9 +4274,28 @@ export function classifyGitCommandDetailed(command) {
     const optSlots = _markOptionValueSlots(args);
     const deleteIdx = args.findIndex((a, i) => !optSlots[i] && _isPushDeleteFlagToken(a));
     const hasColonTargets = args.some((a, i) => !optSlots[i] && /^:/.test(a));
+    // #506 — a delete spelling must NEVER override an UNRELATED legacy
+    // destructive verdict. The legacy verdict is assigned from the WHOLE
+    // command string (`git reset --hard && git push origin --delete b` ⇒
+    // block:reset), i.e. it names the most severe effect of the compound. The
+    // override handed such a compound to index.ts's #73 coordinated arm as
+    // `block:push-delete`; when the delete target is not checked out anywhere
+    // that arm returns its allow-when-no-sibling-checkout verdict and the
+    // LEGACY_BLOCK arm is never reached — so the hard reset RAN in the shared
+    // hub main checkout (the laundering this issue records; it predates #443,
+    // which only extended it to the `-d`/`--del` spellings). Keep the legacy
+    // verdict, and keep the delete FACTS (`isPushDelete` + `pushTargets`) so
+    // index.ts can still run the #73 sibling check on the delete targets
+    // independently of the verdict — the delete is a real effect of the
+    // compound even when it is not the verdict's verb.
+    // The push family is unchanged: `block:push-delete` and
+    // `block:force-push` verdicts resolve to block:push-delete exactly as
+    // before (both are push verdicts, and the coordinated arm owns both).
+    const legacyIsOtherDestructive = legacyVerdict.startsWith("block:") &&
+      legacyVerdict !== "block:push-delete" && legacyVerdict !== "block:force-push";
     if (deleteIdx !== -1 || hasColonTargets || legacyVerdict === "block:push-delete") {
       out.isPushDelete = true;
-      out.verdict = "block:push-delete";
+      if (!legacyIsOtherDestructive) out.verdict = "block:push-delete";
       // git treats the FIRST positional as the repository and every further
       // positional as a delete refspec when a delete form is present
       // (`git push --delete origin a b` deletes a AND b — probe-verified;
@@ -4238,7 +4351,8 @@ export function classifyGitCommandDetailed(command) {
         else out.verdict = "block:push"; // legacy --force\b false-matched lease/includes
       }
     }
-    // legacyVerdict was some other destructive (reset etc.) → keep it
+    // legacyVerdict was some other destructive (reset etc.) → keep it —
+    // with or without a delete spelling in the compound (#506).
   }
 
   // ── commit matcher (excludes commit-graph/commit-tree) — only when no
