@@ -2505,13 +2505,17 @@ as the command word, nothing resolved, and the rest of the line was skipped
 (B52s, B7w) — and when the redirect it stepped over is a fd-0 FILE and the shell
 has no script operand, that FILE is the program, read by the interpreter (B52v).
 A here-string is `<<< word` — ONE operand, and the word is data (B52v). The same
-rule governs the HEADER line: `&` is a list operator only when it is not part of a
-redirection, so `2>&1`/`>&2`/`<&0`/`&>log` do not end the simple command and the
-heredoc's consumer is still found (B52u, B7y); a CODE opener keeps its body SOURCE
-through that prefix too (B7z).
-**Declared residuals of this arm** (declared in #523's scope; ⛔ NOT all of them
-fail toward gating — two are measured fail-AWAY and are listed as such rather
-than as a comfort): the command LINE itself still contributes ONE script (the
+rule governs the HEADER line's PRE-COMMAND position: `&` is a list operator only
+when it is not part of a redirection, so `2>&1 bash <<EOF` / `&>log bash <<EOF` /
+`2>/dev/null bash <<EOF` do not lose the heredoc's consumer (B52u, B7y), and a
+CODE opener keeps its body SOURCE through that prefix too (B7z). ⛔ The
+POST-command fd-DUP spelling (`bash >&2 <<EOF`) is NOT closed — `&` itself is
+handled, but the bare `>&` is not matched by `_scriptInvocationAt`'s one-token
+fd-DUP branch, so the digit `2` is read as a script positional and the body is
+classified DATA (see the residual list below and **#4069**).
+**Declared residuals of this arm** (declared in #523's scope, or measured and filed
+with its own issue — each entry names which; ⛔ NOT all of them fail toward gating,
+the measured fail-AWAY ones are listed as such rather than as a comfort): the command LINE itself still contributes ONE script (the
 one-script-per-command-line class is #3538, unchanged here); two heredocs on ONE
 header line are handled one at a time (the
 `_wtScanLine` one-heredoc-per-line contract), so `bash <<A; bash <<B` runs B's
@@ -2532,6 +2536,26 @@ the mechanism was `_wtOpenerSegment` splitting on the `&` (a different seam), an
 the polarity was a fail-OPEN **regression**: `main` resolved that body's file and
 BLOCKED it while this arm allowed it. The header line is now handled and the claim
 is gone rather than re-worded.
+
+⛔ **Declared residual — the redirect OPERATOR SET is incomplete (#4069),
+pre-existing, measured fail-AWAY on BOTH builds.** Three spellings are split into
+tokens that mean something else, so the body a shell really executes is
+classified DATA and the gate reads nothing:
+
+| shape | this arm | `origin/main` | real bash |
+|---|---|---|---|
+| `bash >&2 <<EOF` + a mutating body (`>&1`, `>& 2`, `<<-`, `<<'EOF'` too) | `["2"]` — a non-file | `["2"]` | body RUNS |
+| `bash >\|/dev/null <<EOF` / `>\|/dev/null bash <<EOF` | `/dev/null` / `[]` | same | body RUNS |
+| `bash <>/dev/null <<EOF` / `< >/dev/null bash <<EOF` | `/dev/null` / `[]` | same | body RUNS |
+
+All three are IDENTICAL at `main`, so none is a regression from this change, and
+none can be closed here: the `>&digit` arm is `_scriptInvocationAt`'s **leading
+scan**, whose command-line behaviour is frozen byte-identical to `main` by #523's
+recorded design (the same decision that files #3970) — changing it is a reopen,
+not a fix — and the `>|` / `<>` arms are `_tokenize`'s **shared operator set**,
+which every classifier consumer reads (this change's safety proof is the
+8,819-command census above, which would have to be re-established). Filed with
+the measurements as **#4069**, not chased here.
 
 ## What it does NOT fix
 
