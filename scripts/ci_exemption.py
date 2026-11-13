@@ -1470,12 +1470,15 @@ def _mask_mkdtemp_tail(m: re.Match[str]) -> str:
     return f"{m.group('prefix')}-<TMP>"
 
 
-#: The TEMP-ROOT ANCHOR, spelled as fixed-width alternatives because Python's
-#: ``re`` refuses a variable-width lookbehind (measured). ``(?<=<TMP>/)`` is the
-#: COMPOSABILITY arm: a parent this group already masked. It is what makes a
-#: NESTED layout reachable — without it ``/tmp/<TMP>/collision-preflight-…`` keeps
-#: its random second component raw — and why the pass below runs to a fixed point.
-_TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=/var/tmp/)|(?<=/private/tmp/)|(?<=<TMP>/))"
+#: The TEMP-ROOT ANCHOR. ``(?<=/tmp/)`` is a five-character SUFFIX lookbehind, so
+#: it covers ``/var/tmp/`` and ``/private/tmp/`` without an arm of their own — and
+#: equally a repo-relative ``tmp/`` segment (this repo's ``.gitignore`` carries
+#: ``tmp/`` for transient e2e markers, which is the same intent: those names are
+#: transient). ``(?<=<TMP>/)`` is the COMPOSABILITY arm: a parent this group already
+#: masked. It is what makes a NESTED layout reachable — without it
+#: ``/tmp/<TMP>/collision-preflight-…`` keeps its random second component raw — and
+#: why the pass below runs to a fixed point.
+_TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=<TMP>/))"
 
 #: THE PER-RUN TEMP IDENTIFIERS (#1424) — the same class as the hex run ids in
 #: the list above: a token the RUN generated, so main can never have measured
@@ -1496,18 +1499,24 @@ _TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=/var/tmp/)|(?<=/private/tmp/)|(?<=<TMP>/))"
 #: ⛔ AND A TAIL MUST LOOK GENERATED, not merely long: ``tempfile`` draws from
 #: ``[a-z0-9_]`` with no hyphen, so a hyphenated component under a temp root is a
 #: test's own LABEL (``expected-workflow``, ``run-integration``) unless its tail
-#: carries a digit. The digit requirement costs a declared fail-CLOSED residual
-#: (an all-letter draw, ~5.6% at 8 characters, stays raw) and buys the property
-#: that two different labels never collapse into one signature.
+#: carries a digit. The digit requirement costs a declared fail-CLOSED residual —
+#: an all-letter draw, measured at **8.04%** of 8-character draws
+#: (``(27/37)**8``, 200 000 draws → 7.93%), stays raw — and buys the property that
+#: two different labels never collapse into one signature.
+#:
+#: ⛔ AND THE WIDTH IS ``{8}``, NOT ``{8,}``: ``_RandomNameSequence`` emits EXACTLY
+#: 8 characters, so a longer run is not a draw at all (it is a stable name that
+#: begins with digits/letters), and masking it collapsed ``/tmp/tmpcache2024``
+#: with ``/tmp/tmpdata2024`` — the fail-OPEN direction (review round 3).
 _TEMP_NORMALIZERS: tuple[
     tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...
 ] = (
     # ``tempfile`` / ``tmp_path``: the prefix is exactly ``tmp`` followed by
-    # ``_RandomNameSequence``'s 8-character draw off ``[a-z0-9_]``. The 8-char
-    # floor (tempfile's exact width) keeps ``tmpfiles`` / ``tmp_utils`` — prose or
-    # a stable directory — out; ``tmpnnjrgwic`` and ``tmpyhd2_vfw`` (an
+    # ``_RandomNameSequence``'s 8-character draw off ``[a-z0-9_]``. The EXACT width
+    # keeps ``tmpfiles`` / ``tmp_utils`` / ``tmpcache2024`` — prose, a stable
+    # directory, a cache bucket — out; ``tmpnnjrgwic`` and ``tmpyhd2_vfw`` (an
     # underscore draw, ~14% of real runs) are both masked.
-    (re.compile(_TEMP_ROOT + r"tmp[A-Za-z0-9_]{8,}(?![0-9A-Za-z_])"), "<TMP>"),
+    (re.compile(_TEMP_ROOT + r"tmp[A-Za-z0-9_]{8}(?![0-9A-Za-z_])"), "<TMP>"),
     # pytest's basetemp ``tt_<draw>``, with the digit requirement described above:
     # ``tt_valid_key`` is ALSO the consumer repo's semantic API-key fixture family,
     # and conflating "valid key rejected" with "rate-limited" under one id is the
@@ -1521,14 +1530,16 @@ _TEMP_NORMALIZERS: tuple[
     ),
     # ``mkdtemp(prefix=…)``: the PREFIX is the test's own stable label and only the
     # generated TAIL is masked, so ``collision-preflight-…`` and ``pi-census-…``
-    # stay distinguishable while two draws of the same prefix converge. The tail
-    # must carry a digit (see above) and be 8+ characters; the delimiter lookahead
-    # keeps a FILENAME's stem out (``build-zx81kq2.yaml`` is a file, not a dir).
+    # stay distinguishable while two draws of the same prefix converge. The tail is
+    # EXACTLY 8 characters (the generator's width — a longer tail is not a draw, and
+    # ``{8,}`` let the prefix boundary slide, collapsing ``pi-cache…`` with
+    # ``pi-census…``), must carry a digit (see above), and the delimiter lookahead
+    # keeps a FILENAME's stem out (``build-zx81kq2p.yaml`` is a file, not a dir).
     (
         re.compile(
             _TEMP_ROOT
             + r"(?P<prefix>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)"
-            r"-(?=[a-z0-9_]*\d)[a-z0-9_]{8,}(?=[/\s\"'`,;:)\]]|$)"
+            r"-(?=[a-z0-9_]*\d)[a-z0-9_]{8}(?=[/\s\"'`,;:)\]]|$)"
         ),
         _mask_mkdtemp_tail,
     ),
@@ -1588,8 +1599,9 @@ def normalize_signature(text: str | None) -> str:
     # re-scans a replacement, so one pass per nesting level is required —
     # ``/tmp/tt_a1b2c3d4/tmpXy12Zz9q/…`` is two levels. Masks cannot feed
     # themselves (no mask token matches a rule's shape), so this terminates; the
-    # bound is a guard, not the stopping condition.
-    for _ in range(3):
+    # bound is a guard for pathological depth, and a layout deeper than it stays
+    # RAW — fail-CLOSED, the direction an honest gate errs.
+    for _ in range(4):
         before = out
         for pattern, replacement in _TEMP_NORMALIZERS:
             out = pattern.sub(replacement, out)

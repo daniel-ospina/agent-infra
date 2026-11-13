@@ -27,7 +27,6 @@ import pytest
 import importlib.util
 import itertools
 import re
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -3724,7 +3723,7 @@ def test_1424_a_labelled_directory_under_a_temp_root_stays_SIGNAL():
     # …and the stable PREFIX survives when the tail IS generated, so two
     # different mkdtemp prefixes stay distinguishable across runs.
     one = ci_exemption.normalize_signature("/tmp/tmpabc12345/collision-preflight-iis0g3yc/repo")
-    two = ci_exemption.normalize_signature("/tmp/tmpabc12345/pi-census-zz9q8w7e6r/repo")
+    two = ci_exemption.normalize_signature("/tmp/tmpabc12345/pi-census-zz9q8w7e/repo")
     assert one == "/tmp/<TMP>/collision-preflight-<TMP>/repo", one
     assert two == "/tmp/<TMP>/pi-census-<TMP>/repo", two
 
@@ -3750,6 +3749,36 @@ def test_1424_each_floor_and_anchor_is_pinned():
     # ``mkdtemp`` 8-character floor on the tail.
     assert n("/tmp/tmpABCD1234/ab-cd1234 broken") == "/tmp/<TMP>/ab-cd1234 broken"
     assert n("/tmp/tmpABCD1234/ab-zx81kq2p broken") == "/tmp/<TMP>/ab-<TMP> broken"
+
+    # ``tmp`` EXACT width (round 3): ``_RandomNameSequence`` emits 8, so a longer
+    # run is a stable name — masking it collapsed ``/tmp/tmpcache2024`` with
+    # ``/tmp/tmpdata2024``. A 7-character name stays raw too.
+    assert n("/tmp/tmpcache2024/state.json") == "/tmp/tmpcache2024/state.json"
+    assert n("/tmp/tmpabc1d2e/x") == "/tmp/tmpabc1d2e/x"
+    assert n("/tmp/tmpabcd1d2e/x") == "/tmp/<TMP>/x"
+
+    # ``mkdtemp`` tail EXACT width, with a NON-HEX tail so the pre-existing
+    # ``<HEX>`` mask cannot be what leaves it raw.
+    assert n("/tmp/pi-census-zz9q8w7e6/x") == "/tmp/pi-census-zz9q8w7e6/x", (
+        "a 9-character tail is not a draw — masking it slides the prefix boundary"
+    )
+
+    # ``tt_`` 6-character floor.
+    assert n("/tmp/tt_ab1/x") == "/tmp/tt_ab1/x"
+
+    # The mkdtemp TEMP-ROOT ANCHOR (round 3, mutant M5): without it a deploy name
+    # outside a temp tree is masked and two environments converge.
+    assert (
+        n("deploy preview-deploy-zz88qq11 failed")
+        == "deploy preview-deploy-zz88qq11 failed"
+    )
+
+    # The fixed-point pass at THREE levels: each mask makes the next child's anchor
+    # true, and ``re.sub`` never re-scans a replacement.
+    assert (
+        n("/tmp/tt_a9b0c3/tt_a9b1c3/tt_a9b2c3/repo/x")
+        == "/tmp/<TMP>/<TMP>/<TMP>/repo/x"
+    )
 
     # Delimiter lookahead: a FILENAME's stem is not a directory component. The
     # tail here is 8 characters, so the floor cannot be what keeps it raw.
@@ -3878,29 +3907,55 @@ def test_1424_a_stable_lookalike_is_never_temp_masked():
     assert "signature differs" in decision.blocked[0].reason
 
 
-def test_1424_no_tracked_directory_of_this_repo_is_temp_masked():
+def test_1424_no_TRACKED_directory_of_this_repo_is_temp_masked():
     """Breadth invariant, so the next shape rule cannot re-open the hole quietly.
 
-    Reads the checkout itself rather than a hand-picked list: a normaliser that
-    newly masks a directory NAME fails here even if no fixture above names it.
+    Reads the INDEX, not the working tree: the name says *tracked*, and a dev or
+    fixer checkout legitimately carries transient untracked markers under a
+    gitignored ``tmp/`` (``.gitignore`` lists it), which would red this for a
+    reason that says nothing about the product (review round 3).
     """
     root = Path(__file__).resolve().parents[1]
-    skip = {".git", ".worktrees", "node_modules", ".venv", "__pycache__"}
-    # ``os.walk`` with PRUNED dirnames, not ``rglob``: rglob descends into ``.git``
-    # before any filter can reject it, and the hub checkout carries ~10⁵ entries
-    # there (measured 10.6 s in review round 2). Pruning skips the descent itself.
-    dirs: list[str] = []
-    for dirpath, dirnames, _files in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in skip)
-        rel = Path(dirpath).relative_to(root).as_posix()
-        if rel != ".":
-            dirs.append(rel)
-    assert len(dirs) > 50, f"the scan found {len(dirs)} directories — it is not reading the tree"
-    masked = [
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            capture_output=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):  # not a git checkout → not ours to grade
+        pytest.skip("no git index here; the breadth invariant needs the index")
+    dirs = {
+        Path(p.decode()).parent.as_posix()
+        for p in out.split(b"\0")
+        if p and Path(p.decode()).parent.as_posix() != "."
+    }
+    assert len(dirs) > 50, f"the index scan found {len(dirs)} directories — it is not reading the tree"
+    masked = sorted(
         d for d in dirs
         if ci_exemption.normalize_signature(f"/repo/{d}") != f"/repo/{d}"
-    ]
+    )
     assert masked == [], f"stable repo paths must stay SIGNAL: {masked[:5]}"
+
+
+def test_1424_the_all_letter_draw_residual_is_DECLARED():
+    """The digit requirement's cost, pinned so it is declared rather than rediscovered.
+
+    ``tempfile`` draws from 37 characters, 27 of them non-digits, so an 8-character
+    draw is all letters ~8% of the time (``(27/37)**8``). Such a draw stays raw and
+    the id simply does not exempt — fail-CLOSED, and the price of never collapsing
+    two different labels. Dropping the requirement is NOT the fix: it masks
+    ``expected-workflow`` / ``build-workflow``-style 8-character FINAL segments.
+    """
+    a = ci_exemption.normalize_signature(
+        "/tmp/tt_a1b2c3d4/collision-preflight-abcdefgh/repo/x"
+    )
+    b = ci_exemption.normalize_signature(
+        "/tmp/tt_a1b2c3d4/collision-preflight-zzzzyyyy/repo/x"
+    )
+
+    assert a == "/tmp/<TMP>/collision-preflight-abcdefgh/repo/x", a
+    assert b == "/tmp/<TMP>/collision-preflight-zzzzyyyy/repo/x", b
+    assert a != b, "a declared residual must not silently become a mask"
 
 
 def test_1424_a_semantic_tt_label_stays_signal_even_under_a_temp_root():
