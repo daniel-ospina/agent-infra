@@ -702,7 +702,8 @@ _hb_margin=$(( INTERVAL * 2 )); [ "$_hb_margin" -ge 10 ] || _hb_margin=10
 # loop-restructure on a gate path and deserves its own review: test the deadline BEFORE the read on
 # iterations after the first, keeping "one last look" while taking the read off the critical path — or run
 # `checks_read` under a bounded runner. ⛔ AND THE MARGIN CANNOT SIMPLY GROW TO 60 s+: it is spent out of
-# the SAME 60 s of slack (`7140 + 60 = 7200`), so the fix is the read's placement, not the number.
+# the SAME 60 s of slack (`35940 + 60 = 36000` since agent-infra#4034 took the design clock to 36000; it was
+# `7140 + 60 = 7200` before), so the fix is the read's placement, not the number.
 # ⛔ THIS IS A RUNTIME LIMIT ON A REAL WAIT, SO `--status` MUST NOT PAY FOR IT (review finding, P3 —
 # verified). `--status` is documented "no network, no writes" and exits ABOVE this block, so a read-only
 # status query never emits the cap's multi-line `say_err` about a wait it was never going to sit
