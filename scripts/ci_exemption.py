@@ -1496,13 +1496,18 @@ _TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=<TMP>/))"
 #: branch slugs (``fix/issue-3429-gh-credential``), so a PR's NEW failure in one
 #: would be exempted by main's red in another.
 #:
-#: ⛔ AND A TAIL MUST LOOK GENERATED, not merely long: ``tempfile`` draws from
-#: ``[a-z0-9_]`` with no hyphen, so a hyphenated component under a temp root is a
-#: test's own LABEL (``expected-workflow``, ``run-integration``) unless its tail
-#: carries a digit. The digit requirement costs a declared fail-CLOSED residual —
-#: an all-letter draw, measured at **8.04%** of 8-character draws
-#: (``(27/37)**8``, 200 000 draws → 7.93%), stays raw — and buys the property that
-#: two different labels never collapse into one signature.
+#: ⛔ AND A TAIL MUST LOOK GENERATED, not merely long: a generator's draw carries a
+#: DIGIT or an UPPERCASE letter, while a test's own label is a lowercase word —
+#: ``expected-workflow`` / ``run-integration`` / ``build-cache`` stay raw, and that
+#: is what stops two different labels collapsing into one signature. Two generators
+#: are covered because the fleet runs both: Python's ``tempfile`` (width 8,
+#: ``[a-z0-9_]``) and Node's ``fs.mkdtempSync`` (width 6, mixed case).
+#:
+#: The fingerprint costs a declared fail-CLOSED residual: a DIGIT-FREE lowercase
+#: ``tempfile`` draw — measured at **7.97%** of 8-character draws over 200 000 real
+#: draws (``(27/37)**8 = 8.04%``; the all-LETTER subset is ~5.87%) — stays raw, and
+#: an all-lowercase Node draw is ~18% at width 6. Both merely block; neither can
+#: exempt a failure main never had.
 #:
 #: ⛔ AND THE WIDTH IS ``{8}``, NOT ``{8,}``: ``_RandomNameSequence`` emits EXACTLY
 #: 8 characters, so a longer run is not a draw at all (it is a stable name that
@@ -1511,6 +1516,12 @@ _TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=<TMP>/))"
 _TEMP_NORMALIZERS: tuple[
     tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...
 ] = (
+    # pytest's DEFAULT basetemp (no ``--basetemp``): ``pytest-of-<user>/pytest-<N>``.
+    # ``<user>`` differs between a hosted runner and a cell, and ``N`` increments per
+    # SESSION, so both components are volatile and both must go — this repo sets no
+    # ``--basetemp`` anywhere in ``.github/workflows/``, so this is ITS ``tmp_path``
+    # shape (review round 4).
+    (re.compile(r"(?<=/)pytest-of-[^/\s]+/pytest-\d+"), "<TMP>"),
     # ``tempfile`` / ``tmp_path``: the prefix is exactly ``tmp`` followed by
     # ``_RandomNameSequence``'s 8-character draw off ``[a-z0-9_]``. The EXACT width
     # keeps ``tmpfiles`` / ``tmp_utils`` / ``tmpcache2024`` — prose, a stable
@@ -1524,7 +1535,7 @@ _TEMP_NORMALIZERS: tuple[
     (
         re.compile(
             _TEMP_ROOT
-            + r"tt_(?=[A-Za-z0-9_]*\d)[A-Za-z0-9_]{6,}(?![0-9A-Za-z_])"
+            + r"tt_(?=[A-Za-z0-9_]*\d)[A-Za-z0-9_]{8}(?![0-9A-Za-z_])"
         ),
         "<TMP>",
     ),
@@ -1538,8 +1549,9 @@ _TEMP_NORMALIZERS: tuple[
     (
         re.compile(
             _TEMP_ROOT
-            + r"(?P<prefix>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)"
-            r"-(?=[a-z0-9_]*\d)[a-z0-9_]{8}(?=[/\s\"'`,;:)\]]|$)"
+            + r"(?P<prefix>[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*)"
+            r"-(?=[A-Za-z0-9_]*[\dA-Z])[A-Za-z0-9_]{6,8}"
+            r"(?=[/\s\"'`,;:)\]]|\.(?:tmp|last|lock|pid)(?![A-Za-z0-9])|$)"
         ),
         _mask_mkdtemp_tail,
     ),

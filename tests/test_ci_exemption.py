@@ -3746,8 +3746,9 @@ def test_1424_each_floor_and_anchor_is_pinned():
     # ``tt_`` temp-root anchor: the same shape OUTSIDE a temp tree is a label.
     assert n("api_key=tt_valid_key_v2 rejected") == "api_key=tt_valid_key_v2 rejected"
 
-    # ``mkdtemp`` 8-character floor on the tail.
-    assert n("/tmp/tmpABCD1234/ab-cd1234 broken") == "/tmp/<TMP>/ab-cd1234 broken"
+    # ``mkdtemp`` tail widths: 6 (Node's ``fs.mkdtempSync``) and 8 (Python's
+    # ``tempfile``) are generators; 9+ is not a draw at all. Both directions.
+    assert n("/tmp/tmpABCD1234/ab-cd1234 broken") == "/tmp/<TMP>/ab-<TMP> broken"
     assert n("/tmp/tmpABCD1234/ab-zx81kq2p broken") == "/tmp/<TMP>/ab-<TMP> broken"
 
     # ``tmp`` EXACT width (round 3): ``_RandomNameSequence`` emits 8, so a longer
@@ -3776,7 +3777,7 @@ def test_1424_each_floor_and_anchor_is_pinned():
     # The fixed-point pass at THREE levels: each mask makes the next child's anchor
     # true, and ``re.sub`` never re-scans a replacement.
     assert (
-        n("/tmp/tt_a9b0c3/tt_a9b1c3/tt_a9b2c3/repo/x")
+        n("/tmp/tt_a9b0c300/tt_a9b1c300/tt_a9b2c300/repo/x")
         == "/tmp/<TMP>/<TMP>/<TMP>/repo/x"
     )
 
@@ -3924,10 +3925,15 @@ def test_1424_no_TRACKED_directory_of_this_repo_is_temp_masked():
         ).stdout
     except (OSError, subprocess.CalledProcessError):  # not a git checkout → not ours to grade
         pytest.skip("no git index here; the breadth invariant needs the index")
+    # EVERY ancestor, not only the immediate parent: an empty directory that holds
+    # no file directly is otherwise never graded, and 93 of this repo's 430 were
+    # invisible that way (review round 4) — a widened rule inside one would ship
+    # green.
     dirs = {
-        Path(p.decode()).parent.as_posix()
-        for p in out.split(b"\0")
-        if p and Path(p.decode()).parent.as_posix() != "."
+        par.as_posix()
+        for p in (q.decode() for q in out.split(b"\0") if q)
+        for par in Path(p).parents
+        if par.as_posix() != "."
     }
     assert len(dirs) > 50, f"the index scan found {len(dirs)} directories — it is not reading the tree"
     masked = sorted(
@@ -3935,6 +3941,39 @@ def test_1424_no_TRACKED_directory_of_this_repo_is_temp_masked():
         if ci_exemption.normalize_signature(f"/repo/{d}") != f"/repo/{d}"
     )
     assert masked == [], f"stable repo paths must stay SIGNAL: {masked[:5]}"
+
+
+def test_1424_every_fleet_temp_generator_shape_is_covered():
+    """The masks follow the two generators the fleet actually runs (review round 4).
+
+    * pytest's DEFAULT basetemp ``pytest-of-<user>/pytest-<N>`` — ``<user>`` differs
+      between a hosted runner and a cell and ``N`` increments per session, so both
+      components are volatile. This repo sets no ``--basetemp``, so this is its own
+      ``tmp_path`` shape.
+    * Node's ``fs.mkdtempSync`` — width 6, MIXED case (libuv), which the
+      lowercase-only classes missed entirely even though 85 files here call it.
+    * ``mkstemp(prefix=…, suffix=…)`` — a ``.last`` / ``.tmp`` suffix is part of the
+      call, not of the draw, so the lookahead must still see it as a component.
+    * the ``tt_`` ceiling: an 8-character draw, so two differently-named stable
+      directories one character apart must never collapse.
+    """
+    n = ci_exemption.normalize_signature
+
+    assert (
+        n("/tmp/pytest-of-cmux/pytest-2727/test_x0/redis.socket")
+        == n("/tmp/pytest-of-cell/pytest-2729/test_x0/redis.socket")
+        == "/tmp/<TMP>/test_x0/redis.socket"
+    )
+    assert (
+        n("/tmp/auto-sync-pin-b7vSrb/x") == n("/tmp/auto-sync-pin-pVxkIu/x")
+        == "/tmp/auto-sync-pin-<TMP>/x"
+    )
+    assert (
+        n("/tmp/obj-cache-abcdef12.last") == n("/tmp/obj-cache-zzzz9999.last")
+        == "/tmp/obj-cache-<TMP>.last"
+    )
+    assert n("/tmp/tt_bigcache_2024/x") != n("/tmp/tt_bigcache_2025/x")
+    assert n("/tmp/tt_valid_key_1/x") != n("/tmp/tt_valid_key_2/x")
 
 
 def test_1424_the_all_letter_draw_residual_is_DECLARED():
