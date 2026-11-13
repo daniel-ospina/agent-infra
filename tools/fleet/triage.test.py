@@ -571,7 +571,12 @@ def run_red_control() -> bool:
     # it any clause carrying a date disarms, and an ask whose OBJECT merely dates — "Please approve
     # yesterday's expense report." — reads as a report. A MUTATION: restore the unconditional anchor
     # and require the SAME input's answer to change.
-    dated = "Please approve yesterday's expense report."
+    # ⛔ THE FIXTURE MUST CARRY NO `_FUTURE_CUE` (round 8, #4046 P2). The first version used
+    # "Please approve yesterday's expense report." — whose `Please` is itself a future cue — so a
+    # MUCH WEAKER rule ("an anchor disarms unless a future cue is present", with no completion gate)
+    # also passed it, and no longer silenced it. That is how a completion gate that did not gate
+    # survived a round: the control could not tell the fix from a weaker rule that also failed.
+    dated = "Your confirmation on the plan we decided yesterday."
     shipped_ask = triage.asks_owner(dated)
     _real_disarmed = triage._disarmed
     triage._disarmed = (lambda low: bool(triage._PAST_HARD_ANCHOR.search(low))
@@ -582,6 +587,40 @@ def run_red_control() -> bool:
         triage._disarmed = _real_disarmed
     good &= _red("R11 an unconditional date anchor WOULD silence a dated ask",
                  shipped_ask == "asked" and anchored_ask == "not-asked")
+
+    # (R13) ⛔ THE CUE'S POSITION IS WHAT DOES THE WORK (round 8, #4046 P0). The round-7 gate asked
+    # only whether a completion verb was present in the clause, and the ASK's own object supplies one
+    # ("the invoice I sent last week", "the plan we decided yesterday"). Mutant: drop the addressed
+    # cue, so the completion can no longer be attributed to the object.
+    _real_addressed = triage._ADDRESSED
+    # The fixture carries an addressed cue that is NOT a `_FUTURE_CUE` ("your confirmation") and a
+    # completion inside the ask's object ("we decided"), so the position rule is the only thing
+    # standing between it and the disarm — which is what makes the mutant discriminating.
+    obj_ask = "Your confirmation on the plan we decided yesterday."
+    triage._ADDRESSED = re.compile(r"(?!x)x")            # never matches
+    try:
+        blind_ask = triage.asks_owner(obj_ask)
+    finally:
+        triage._ADDRESSED = _real_addressed
+    good &= _red("R13 without the addressed cue a completion IN THE OBJECT silences the ask",
+                 blind_ask == "not-asked" and triage.asks_owner(obj_ask) == "asked")
+
+    # (R14) ⛔ THE COMPLETION LIST IS LOAD-BEARING ON THE REPORT SIDE (round 8, #4046 P1). A closed
+    # list of completions let a finished lane's ending read `asked`, suppressing its nudge. Mutant:
+    # restore the round-7 list (no `passed`) and require the answer to change.
+    _real_completion = triage._COMPLETION
+    report = "All 1436 tests passed at 14:02 after your approval."
+    good &= _red("R14 the shipped completion list reads a finished lane as finished",
+                 triage.asks_owner(report) == "not-asked")
+    triage._COMPLETION = re.compile(
+        r"\b(?:merged|shipped|approved|decided|landed|closed|pushed|deployed|committed|completed|"
+        r"finished|done|went through|ran|wrote|sent|opened|removed|added|fixed|recorded|signed)\b")
+    try:
+        narrow_report = triage.asks_owner(report)
+    finally:
+        triage._COMPLETION = _real_completion
+    good &= _red("R14b …and the round-7 list WOULD have read that same ending as a question",
+                 narrow_report == "asked")
 
     # (R12) ⛔ THE PER-QUESTION ID IS WHAT DEFEATS A STALE PANE (round 7, #4046 P0). The question
     # lane is persistent, so its tail still shows the PREVIOUS brief, and both briefs carry the same
@@ -1453,10 +1492,70 @@ def leg_round7() -> None:
                                        nap=lambda _s: None)
     ok("…while the SAME call verifies once the pane paints", p2.verified is True, p2.detail)
 
+    # ⛔ AND A TRUNCATED PAINT IS NOT AN ACK EITHER (round 8, #4046 P0). Co-presence was enough for the
+    # round-7 check: the current qid appears at char ~89, so a paint cut anywhere after it "had" the id
+    # while the tail's mandate tokens belonged to the PREVIOUS brief. The three rows below are that
+    # class: cut-118 and cut-400 must fail; a wrap landing inside the id must still verify (the id is
+    # matched with optional whitespace, because the payload is sent flattened and the pane wraps it).
+    cur_qid = triage_arms.question_qid("lane-7", "Shall I merge the new thing?")
+
+    class Paints(FakeSurface):
+        def __init__(self, cut=None, wrap=False, *a, **kw):
+            super().__init__(*a, **kw)
+            self.cut, self.wrap = cut, wrap
+            self.spaces = [{"id": "own", "name": "lane-7", "index": 1},
+                           {"id": "ws_q", "name": triage_arms.QUESTION_LANE, "index": 3}]
+            self.screens = {"ws_q": prior}
+
+        def move_workspace(self, ws, index):
+            for sp in self.spaces:
+                if sp["id"] == ws:
+                    sp["index"] = index
+            return True
+
+        def send(self, ws, text):
+            self.last_sent[ws] = text
+            body = text if self.cut is None else text[:self.cut]
+            if self.wrap:
+                i = body.find(cur_qid)
+                if i >= 0:
+                    body = body[:i + 5] + "\n" + body[i + 5:]
+            self.screens[ws] = self.screens.get(ws, "") + "\n" + body
+            return True
+
+    for cut, want_verified, label in ((118, False, "truncated at 118"),
+                                      (400, False, "truncated at 400"),
+                                      (None, True, "a full paint")):
+        pc = triage_arms.arm_user_question("own", "lane-7", "Shall I merge the new thing?",
+                                           Paints(cut=cut), nap=lambda _s: None)
+        ok("a %s is not a routed question" % label if not want_verified
+           else "…and a %s verifies" % label,
+           pc.verified is want_verified, "%s %s" % (pc.verified, pc.artifact.get("pane_missing")))
+        if not want_verified:
+            ok("…because the mandate AFTER the id is what is missing (%s)" % label,
+               any(t in (pc.artifact.get("pane_missing") or []) for t in
+                   ("RESEARCH FIRST", "recommendation")),
+               str(pc.artifact.get("pane_missing")))
+    pw = triage_arms.arm_user_question("own", "lane-7", "Shall I merge the new thing?",
+                                       Paints(wrap=True), nap=lambda _s: None)
+    ok("…and a wrap landing INSIDE the id still verifies", pw.verified is True,
+       str(pw.artifact.get("pane_missing")))
+
     # (2) ⛔ A LIVE ASK WEARING A DATE (P0). `_PAST_HARD` disarmed any clause carrying a temporal
     # anchor, so the ask's own OBJECT silenced it: seven real approval asks read `not-asked` and
     # routed `send-continue` into a lane waiting on its owner.
-    for txt in ("Please approve yesterday's expense report.",
+    # ⛔ AND (round 8, #4046 P0) THE OBJECT CARRIES THE COMPLETION VERB TOO. The round-7 gate asked
+    # only "is there a completion in this clause", so "…the invoice I SENT last week" and "…the plan
+    # we DECIDED yesterday" gated themselves off — 7 of 7 fresh inputs. The completion must start
+    # before the addressed cue to be the LANE's.
+    for txt in ("Awaiting your sign off on the invoice I sent last week.",
+                "Awaiting your approval on the report I signed yesterday.",
+                "Blocked on your approval of the contract we finished last week.",
+                "Your confirmation on the plan we decided yesterday.",
+                "Pending your approval of the fixed invoice from last week.",
+                "Awaiting your decision on the design we closed yesterday.",
+                "Awaiting your sign off on the fix approved by legal.",
+                "Please approve yesterday's expense report.",
                 "Please sign off on the invoice from last week.",
                 "Please confirm the plan from Monday.",
                 "I need your approval for the migration we discussed this morning.",
@@ -1469,11 +1568,24 @@ def leg_round7() -> None:
         ok("a dated ask is still an ask: %r" % txt[:38],
            triage.asks_owner(txt) == triage.ASKED and may is False, "%s %s" % (may, r.action))
     # …and the reports the anchor exists for are STILL reports (the split must not over-fire).
+    # ⛔ THE MIRROR FAILURE WAS A REGRESSION OF THIS FIX (round 8, #4046 P1): a closed list of
+    # completions let 9 of 10 plausible endings read `asked`, so a FINISHED lane lost its nudge and
+    # was woken into the question lane. These inputs deliberately avoid the words the fix was written
+    # from.
     for txt in ("Merged the PR on your approval at 14:02.",
                 "Per your decision last week, the schema is closed.",
                 "Approved by the rail yesterday.",
                 "As you decided, shipped yesterday.",
-                "Signed off by legal, so it went out."):
+                "Signed off by legal, so it went out.",
+                "All 1436 tests passed at 14:02 after your approval.",
+                "The suite went green at 14:02 after your approval.",
+                "The deploy is live as of 14:02 after your approval.",
+                "Checks came back clean at 14:02 after your approval.",
+                "Everything is on prod after your approval at 14:02.",
+                "The migration is applied; it went out at 14:02 after your approval.",
+                "Nothing was blocked on your approval yesterday.",
+                "Verified at 14:02 after your approval.",
+                "The release went out at 14:02 after your approval."):
         e = ev(lane="lane-7", last_text=txt, lane_verdict="WIP-IDLE", steerable=True)
         may, r = triage.may_continue(e)
         ok("a completed report is not an ask: %r" % txt[:38], may is True,

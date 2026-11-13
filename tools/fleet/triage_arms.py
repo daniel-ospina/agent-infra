@@ -231,15 +231,26 @@ def payload_for(route, ev, ws: str = "") -> str:
 def mandate_missing(brief: str, qid: str = "") -> list:
     """Which mandate tokens the brief does NOT carry. Empty list = the brief is routed, not relayed.
 
-    `qid` is the per-question nonce (`question_qid`). When given, the artifact must ALSO show THAT
-    token: the mandate tokens alone are satisfied by any brief this arm ever sent, so on the
-    persistent question lane they are a *relayed* proof at best (round 7, #4046 P0).
+    `qid` is the per-question nonce (`question_qid`). When given, the artifact must show THAT token
+    and — ⛔ this is the part that took a third attempt — the mandate tokens must appear AFTER it.
+    Co-presence is not enough: on a persistent question lane the tail still holds the PREVIOUS brief,
+    whose mandate tokens sat before the current qid and satisfied the check while the current paint
+    was TRUNCATED mid-brief. Measured (round 8, #4046 P0): a paint cut at 118 or 400 chars verified
+    `True` with `pane_missing=[]` and the detail "the full mandate visible on the pane", while the
+    owner's pane showed only the header and the id. The id is therefore a HIGH-WATER MARK: everything
+    before its last occurrence is evidence about a different question.
+
+    The id is matched with optional whitespace between its characters: the payload is sent flattened
+    to one logical line, so the pane renders it wrapped, and a wrap landing inside the id must not
+    make the proof unverifiable (which would re-send the brief every tick, forever).
     """
     low = " ".join((brief or "").lower().split())
-    missing = [tok for tok in QUESTION_MANDATE if tok.lower() not in low]
-    if qid and qid.lower() not in low:
-        missing.append(qid)
-    return missing
+    if qid:
+        matches = list(re.finditer(r"\s*".join(re.escape(c) for c in qid.lower()), low))
+        if not matches:
+            return [qid]
+        low = low[matches[-1].end():]
+    return [tok for tok in QUESTION_MANDATE if tok.lower() not in low]
 
 
 # ── arm 1: the user-question lane ──────────────────────────────────────────────────────────────

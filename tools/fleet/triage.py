@@ -197,7 +197,7 @@ _HANDOFF_I18N = ("quedo a la espera", "esperando tu", "espero tu", "avísame", "
 # expense report." is an ask. A DENIAL denies the cue itself, so it stays unconditional.
 _PAST_HARD_DENIAL = re.compile(
     r"\b(?:nothing needs your|no need for your|doesn'?t need your|does not need your|"
-    r"never needed your)\b")
+    r"never needed your|nothing (?:is|was) blocked)\b")
 # ⛔ A PAST-DECISION FRAME IS A REPORT ON ITS OWN (fresh-context review round 7, #4046 P2). "Per your
 # decision last week" / "As you decided" / "already approved" / "approved by" name a decision
 # already taken and cannot BE an ask. Kept separate from `_PAST_HARD_ANCHOR` because that list also
@@ -209,9 +209,17 @@ _PAST_HARD_FRAME = re.compile(
 _PAST_HARD_ANCHOR = re.compile(
     r"\b(?:yesterday|last (?:night|week|month)|this morning|on monday|from monday|earlier today|"
     r"after your (?:approval|decision|call)|at \d{1,2}:\d{2}|previously)\b")
+# ⛔ A CLOSED LIST OF COMPLETIONS LEAKS THE REPORT SIDE (round 8, #4046 P1). Nine of ten plausible
+# completion endings — "All 1436 tests passed at 14:02 after your approval.", "The suite went green at
+# 14:02 after your approval.", "Verified at 14:02 after your approval." — read `asked`, so a FINISHED
+# lane lost its nudge and was woken into the question lane. The list now covers the past-tense
+# completions the fleet actually writes. Both directions are pinned by controls built from inputs the
+# list does NOT already contain, because the round-7 corpus was written from the same words as the fix.
 _COMPLETION = re.compile(
     r"\b(?:merged|shipped|approved|decided|landed|closed|pushed|deployed|committed|completed|"
-    r"finished|done|went through|ran|wrote|sent|opened|removed|added|fixed|recorded|signed)\b")
+    r"finished|done|went through|went (?:green|out|live)|ran|wrote|sent|opened|removed|added|fixed|"
+    r"recorded|signed|passed|applied|verified|came back|replied|responded|is live|on prod|"
+    r"landed green|released)\b")
 _PAST_SOFT = re.compile(
     r"\b(?:matched your|recorded your|went through|was your call|had approved|has approved|"
     # ⛔ NOT "on your approval" (round 6, #4046 P0). It is the ASK in "I'm blocked on your approval",
@@ -221,6 +229,23 @@ _PAST_SOFT = re.compile(
 _FUTURE_CUE = re.compile(
     r"\b(?:i'?ll|i will|we'?ll|will|shall|should|would|waiting|await|until|once|before|please|"
     r"need|needs|let me|go-ahead|your call on)\b")
+# ⛔ THE HOLD VERBS ARE **NOT** FUTURE CUES (round 8). The prototype that produced `_ADDRESSED` also
+# proposed adding `awaiting|pending|blocked|holding` here, and measured against THIS corpus that
+# over-fires two ordinary reports — "Landed it pending your approval from Monday." and "Holding the
+# deploy was the right call." — because a hold verb is also how a lane describes a hold that ENDED.
+# The position rule below fixes the same seven asks without touching the cue list.
+
+
+# ⛔ THE CUE'S POSITION IN THE CLAUSE IS WHAT DECIDES WHOSE VERB THE COMPLETION IS (round 8, #4046
+# P0). The round-7 gate asked only "is there a completion in this clause", and the ASK's own object
+# supplies one: "Awaiting your sign off on the invoice I sent last week." / "Your confirmation on the
+# plan we decided yesterday." / "Awaiting your sign off on the fix approved by legal." — all seven
+# measured as `not-asked`, all routed `send-continue` into a lane waiting on its owner. A completion
+# that starts AFTER the addressed cue belongs to the thing being asked about, not to the lane's work.
+_ADDRESSED = re.compile(
+    r"\b(?:awaiting your|awaiting a|waiting (?:on|for) your|pending your|blocked on your|"
+    r"please (?:confirm|approve|sign)|sign off|your (?:approval|confirmation|decision|call|"
+    r"go-ahead|input|word|sign[- ]?off))\b")
 
 
 _CLAUSE_SPLIT = re.compile(r"[,;]|\s[—–]\s|\s-\s|\b(?:but|however|although|yet|whereas)\b",
@@ -244,11 +269,24 @@ def _clauses(sent: str) -> list:
 
 def _disarmed(low: str) -> bool:
     """Does THIS CLAUSE report something already decided? (see `_PAST_SOFT`/`_PAST_HARD_*`)"""
-    if _PAST_HARD_DENIAL.search(low) or _PAST_HARD_FRAME.search(low):
+    cue = _ADDRESSED.search(low)
+
+    def _before_the_cue(rx) -> bool:
+        """A frame/denial term counts when the lane did not ADDRESS it to the owner first."""
+        m = rx.search(low)
+        return bool(m) and not (cue is not None and m.start() > cue.start())
+
+    if _before_the_cue(_PAST_HARD_DENIAL) or _before_the_cue(_PAST_HARD_FRAME):
         return True
     if _PAST_HARD_ANCHOR.search(low):
-        # An anchor needs a COMPLETION to be a report — and a future cue vetoes even that.
-        return bool(_COMPLETION.search(low)) and not _FUTURE_CUE.search(low)
+        # An anchor needs a COMPLETION to be a report — one that is the LANE's, not the ask's object —
+        # and a future cue vetoes even that.
+        done = _COMPLETION.search(low)
+        if not done:
+            return False
+        if cue is not None and done.start() > cue.start():
+            return False
+        return not _FUTURE_CUE.search(low)
     return bool(_PAST_SOFT.search(low)) and not _FUTURE_CUE.search(low)
 
 
