@@ -307,7 +307,8 @@ ck "(i0) chain-merge's stale-marker fallback (${CHAIN_FB:-?}s) is the harness BA
 # home while the child reads the compiled default (the "knob that does nothing" shape again).
 grep -q '^export LANE_BACKSTOP_S$' "$GATE"; ck "(i0) spawn-gate.sh EXPORTS LANE_BACKSTOP_S, so a lane's children agree with the clock it runs under" $?
 # ⛔ THE DERIVED LEASE MUST STILL FIT UNDER ITS CEILING (agent-infra#4034). `fix-one.sh` leases a PR
-# claim for `LANE_BACKSTOP_S + 1200` (`FIX_LEASE`) and `claims.sh` clamps at `CLAIM_TTL_MAX`. A clamp is
+# claim for `FIX_BOUND + 1200` (`FIX_LEASE`, and that addend is READ from `fix-one.sh` below, not restated
+# here) and `claims.sh` clamps at `CLAIM_TTL_MAX`. A clamp is
 # not a cosmetic truncation: it expires the claim UNDER a worker still inside its own bound, a peer
 # reads the head as free and runs a SECOND fixer on the same branch — the duplicate-paid-work class
 # #2888 exists to close. So the two files are asserted against each other as ARITHMETIC: raise the
@@ -315,10 +316,26 @@ grep -q '^export LANE_BACKSTOP_S$' "$GATE"; ck "(i0) spawn-gate.sh EXPORTS LANE_
 # 7200 s sat behind a 9600 s ceiling (37200 vs 9600 is a 7 h 40 m gap); the strict `-lt` is deliberate,
 # because `_claim_acquire_at` clamps at the ceiling value and a lease AT the ceiling spends the whole
 # post-review headroom.
-FIX_LEASE_S=$(( ${SEAM:-0} + 1200 ))
+# ⛔ AND THE ADDEND IS READ FROM THE FILE THAT OWNS THE LEASE, NEVER RESTATED HERE (agent-infra#4034
+# review). This arm used to read `FIX_LEASE_S=$(( ${SEAM:-0} + 1200 ))` while its comment claimed the two
+# files were "asserted against each other as ARITHMETIC" — but the ONE file that computes the lease is
+# `fix-one.sh` (`FIX_LEASE=$(( FIX_BOUND + 1200 ))`) and it was never read, so changing that addend moved the
+# REAL lease and left this arm green. A test that re-implements the derivation it claims to assert can only
+# ever agree with itself. ⛔ AND AN UNREADABLE ADDEND FAILS the arm rather than falling back to a number:
+# a default here is the same defect wearing a default's clothes. The literal is matched as `FIX_BOUND + N`
+# so a re-ordered or renamed derivation reads as UNREADABLE (red) instead of being silently accepted.
+FIX_ADD="$(sed -n 's/^[[:space:]]*FIX_LEASE=\$(([[:space:]]*FIX_BOUND[[:space:]]*+[[:space:]]*\([0-9][0-9]*\)[[:space:]]*)).*/\1/p' "$HERE/fix-one.sh" | head -1)"
+case "${FIX_ADD:-}" in ''|*[!0-9]*|0) FIX_ADD="" ;; esac
+[ -n "${FIX_ADD:-}" ]; rc=$?
+FIX_ADD_DESC="${FIX_ADD:+FIX_BOUND + ${FIX_ADD}}"
+FIX_ADD_DESC="${FIX_ADD_DESC:-UNREADABLE — the arm cannot assert a lease it cannot derive}"
+ck "(i0) fix-one.sh's FIX_LEASE addend is READ out of fix-one.sh (${FIX_ADD_DESC}) — the lease is not restated in this suite" $rc
+FIX_LEASE_S=$(( ${SEAM:-0} + ${FIX_ADD:-0} ))
 CTM="$(sed -n 's/^CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/claims.sh" | head -1)"
-[ -n "${CTM:-}" ] && [ "$FIX_LEASE_S" -lt "$CTM" ]; rc=$?
-ck "(i0) the derived fix-one lease (LANE_BACKSTOP_S ${SEAM:-?} + 1200 = ${FIX_LEASE_S}s) sits UNDER CLAIM_TTL_MAX (${CTM:-?}s), so it is never CLAMPED under a live worker (#4034/#2888)" $rc
+# The readability result is folded into this arm as well, so an unreadable addend cannot leave a
+# `${SEAM} + 0` lease passing the strict `-lt` and reporting a green ceiling check.
+[ -n "${FIX_ADD:-}" ] && [ -n "${CTM:-}" ] && [ "$FIX_LEASE_S" -lt "$CTM" ]; rc=$?
+ck "(i0) the derived fix-one lease (LANE_BACKSTOP_S ${SEAM:-?} + ${FIX_ADD:-?} = ${FIX_LEASE_S}s) sits UNDER CLAIM_TTL_MAX (${CTM:-?}s), so it is never CLAMPED under a live worker (#4034/#2888)" $rc
 # ⛔ AND THE VALUE MUST BE IN #4034's TARGET RANGE, NOT MERELY ABOVE THE ALLOWANCE (agent-infra#4034).
 # The ordering arm above is satisfied by 7201 as well as by 36000 — and 7201 pre-empts the progress rule
 # on every lane that is slow rather than stuck, which is exactly what was measured: 20 `exceeded-wallclock`
