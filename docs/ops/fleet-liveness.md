@@ -1534,8 +1534,10 @@ lane-reap.sh reap [--dry-run]       report what WOULD be reaped (the default)
 lane-reap.sh reap --apply           signal the lanes that pass all three gates
 ```
 
-**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (125 min — above the
-lane's wall BACKSTOP (`LANE_BACKSTOP_S` = 7200 s), so a long silent tool call is not read as death;
+**live** = the tree exists AND its log advanced inside `LANE_REAP_LIVE_MIN` (601 min since
+agent-infra#4034, 125 min before it — above the
+lane's wall BACKSTOP (`LANE_BACKSTOP_S` = 36000 s since #4034, 7200 s before it), so a long silent
+tool call is not read as death;
 when the wall was the PRIMARY bound of a lane this window followed the wall, and `agent-infra#2888`
 demoted the wall to a backstop without demoting the window's reason), OR its log was
 deleted while the tree lives (a prune can do that to a working lane; a possibly-live lane must not
@@ -1780,12 +1782,13 @@ no-progress allowance**, copied rather than invented: `lane-bound.sh`'s `--idle`
 declared it, not because the two agree — `--idle` resets its clock on EITHER signal, so the two
 instruments CAN disagree (the consequence is stated below), and `frozen` is not a licence to kill.
 
-**It is NOT `LANE_REAP_LIVE_MIN`** (125 min, `agent-infra#2888`), and an earlier revision of this
-paragraph said it was. That window is decided on log **mtime alone**, so it must sit *above* the 2 h
-wall backstop or a live lane inside one silent tool call reads as dead. This axis is decided on CPU as
-well, so its analogue is the **progress** bound; re-pointing it at 125 min would make `frozen`
+**It is NOT `LANE_REAP_LIVE_MIN`** (601 min since `agent-infra#4034`; 125 min since `#2888`), and an
+earlier revision of this
+paragraph said it was. That window is decided on log **mtime alone**, so it must sit *above* the wall
+backstop (10 h since #4034) or a live lane inside one silent tool call reads as dead. This axis is decided on CPU as
+well, so its analogue is the **progress** bound; re-pointing it at that mtime window (601 min since agent-infra#4034) would make `frozen`
 unreachable on exactly the wedge class it exists to name. **And it sits below the wall clock on
-purpose:** `--wall` (`LANE_BACKSTOP_S` = 7200 s) is a BACKSTOP, and since `agent-infra#2888` the
+purpose:** `--wall` (`LANE_BACKSTOP_S` = 36000 s since agent-infra#4034, 7200 s before it) is a BACKSTOP, and since `agent-infra#2888` the
 progress bound is PRIMARY — it must fire first, otherwise the wall pre-empts it and a lane that is
 still working is killed by elapsed time, which is the measured defect #2888 fixes. (That earlier
 revision called this ordering a defect and cited stale literals — `lane.sh`'s `3300`, a `--wall`

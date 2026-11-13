@@ -306,6 +306,28 @@ ck "(i0) chain-merge's stale-marker fallback (${CHAIN_FB:-?}s) is the harness BA
 # The seam itself must REACH those children: an unexported variable leaves an operator's override at
 # home while the child reads the compiled default (the "knob that does nothing" shape again).
 grep -q '^export LANE_BACKSTOP_S$' "$GATE"; ck "(i0) spawn-gate.sh EXPORTS LANE_BACKSTOP_S, so a lane's children agree with the clock it runs under" $?
+# ⛔ THE DERIVED LEASE MUST STILL FIT UNDER ITS CEILING (agent-infra#4034). `fix-one.sh` leases a PR
+# claim for `LANE_BACKSTOP_S + 1200` (`FIX_LEASE`) and `claims.sh` clamps at `CLAIM_TTL_MAX`. A clamp is
+# not a cosmetic truncation: it expires the claim UNDER a worker still inside its own bound, a peer
+# reads the head as free and runs a SECOND fixer on the same branch — the duplicate-paid-work class
+# #2888 exists to close. So the two files are asserted against each other as ARITHMETIC: raise the
+# backstop without raising the ceiling and this arm reds. ⛔ THIS IS THE ARM THAT WAS MISSING when
+# 7200 s sat behind a 9600 s ceiling (37200 vs 9600 is a 7 h 40 m gap); the strict `-lt` is deliberate,
+# because `_claim_acquire_at` clamps at the ceiling value and a lease AT the ceiling spends the whole
+# post-review headroom.
+FIX_LEASE_S=$(( ${SEAM:-0} + 1200 ))
+CTM="$(sed -n 's/^CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/claims.sh" | head -1)"
+[ -n "${CTM:-}" ] && [ "$FIX_LEASE_S" -lt "$CTM" ]; rc=$?
+ck "(i0) the derived fix-one lease (LANE_BACKSTOP_S ${SEAM:-?} + 1200 = ${FIX_LEASE_S}s) sits UNDER CLAIM_TTL_MAX (${CTM:-?}s), so it is never CLAMPED under a live worker (#4034/#2888)" $rc
+# ⛔ AND THE VALUE MUST BE IN #4034's TARGET RANGE, NOT MERELY ABOVE THE ALLOWANCE (agent-infra#4034).
+# The ordering arm above is satisfied by 7201 as well as by 36000 — and 7201 pre-empts the progress rule
+# on every lane that is slow rather than stuck, which is exactly what was measured: 20 `exceeded-wallclock`
+# against 2 `stalled`, 12 of the 20 with `silent=0s` (i.e. NOT idle when the clock ended them). #4034's
+# target is "3-5x today's" 7200 s, so the FLOOR is 21600 s and this arm reds on the old default (7200).
+# ⚠️ 36000/2700 is 13.3x the allowance and 5x the OLD backstop: #4034's "5x" is 5x 7200, NOT 5x the
+# allowance. Both ratios are true and they are different numbers — do not "correct" one into the other.
+[ "${SEAM:-0}" -ge 21600 ]; rc=$?
+ck "(i0) the backstop (${SEAM:-?}s) is at least the LOW END of #4034's 3-5x target (21600 s = 3 x the 7200 it replaced; shipped ${SEAM:-?}s = $(( ${SEAM:-0} / ${DOC_ALLOW_S:-1} ))x the allowance) — 'above the allowance' is not enough, or the wall pre-empts the rule it backs up" $rc
 
 # A literal-substring replacement, so no regex/`$` quoting can silently no-op the mutation, and the
 # replacement is ASSERTED to have landed: a mutant identical to the original would make every
@@ -484,7 +506,8 @@ ck "(h3) …and the override is NAMED in the lane log, so the bound that ran and
 
 # ── (l) THE OVERRIDE MAY SHORTEN A RUN, NEVER LENGTHEN IT (review P1) ──────────────────────────
 # ⛔ THE DEFECT THIS CLOSES. `run_agent` honoured `LANE_BOUND_WALL_S` for EVERY caller, so setting the
-# documented knob to the documented backstop (7200) let a caller that had declared a short bound run
+# documented knob to the documented backstop (7200 at the time; 36000 since agent-infra#4034) let a
+# caller that had declared a short bound run
 # PAST the cross-box claim lease derived from that bound — `fix-one.sh` leases `FIX_BOUND + 1200`, and
 # `merge-one.sh` `REVIEW_TIMEOUT + gate-wait + 300` — and a peer would read the claim as expired and
 # start a SECOND fixer/reviewer on the same head. That is the duplicate-paid-work class this PR's own

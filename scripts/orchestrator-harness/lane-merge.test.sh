@@ -1520,7 +1520,7 @@ _ps="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 # lane.sh invokes it as `run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" …` (agent-infra#2888: the wall
 # became a BACKSTOP, so the lane's default is now the harness seam).
 # ⛔ READ BOTH SIDES FROM THE FILES THAT COMPUTE THEM (review finding, P3 — verified). The previous
-# version resolved `_lt` from lane.sh (7200, via the seam) and asserted the arithmetic against it while
+# version resolved `_lt` from lane.sh (7200 in that tree, via the seam) and asserted the arithmetic against it while
 # the arithmetic that actually RAN was still clamped by lane-merge.sh's own `${LANE_TIMEOUT:-3300}`
 # literal — so the check passed on a wider margin and would ALSO have passed if that default drifted,
 # which is exactly the property it exists to protect. Now `_lt` is lane-merge.sh's OWN resolved
@@ -1583,21 +1583,25 @@ ck "the per-round check wait ($_ws s) is not back under the measured distributio
    $([ -n "$_ws" ] && [ "${_ws:-0}" -ge 4800 ] && echo 0 || echo 1)
 # ⛔ AND THE OTHER SIDE MUST NOT BE STARVED IN THE SAME EDIT (round-2 review, P2). The two bounds are paid
 # out of ONE clock, so raising the wait without a floor on what it leaves would trade a wait that cannot
-# finish for a supervision budget that cannot supervise: `MAX_WATCH` floors at 1 chunk, so a wait raised
-# to 6100 s would still pass the arithmetic arm above (`_mw` = 1, 6100 + 120 + 900 = 7120 ≤ 7200) while
-# leaving a single 120 s `--watch` call — a supervision allowance that exists only formally. 7 chunks is
-# the FLOOR (it is the allowance the retired 3300 s clock afforded at a 1500 s wait, and what the 7200 s
-# clock affords at the 5400 s wait — ⛔ NOT "the SHIPPED allowance": `origin/main` derives 40, because
-# `(7200-1500-900)/120 = 40` there; a label that read as a claim about main was false and is corrected
-# in place — review cycle 7, P3), so it is the regression floor: a future edit that eats it must raise
+# finish for a supervision budget that cannot supervise: `MAX_WATCH` floors at 1 chunk, so a wait that
+# eats the clock still passes the arithmetic arm above while leaving a supervision allowance that exists
+# only formally. 7 chunks is the FLOOR (it is the allowance the retired 3300 s clock afforded at a 1500 s
+# wait, and what the 7200 s clock afforded at the 5400 s wait — ⛔ NOT "the SHIPPED allowance": the
+# shipped tree derives 247 on agent-infra#4034's 36000 s clock, `(36000-5400-900)/120`, and derived 40 on
+# the old 7200 s one, `(7200-1500-900)/120 = 40`; a label that read as a claim about the shipped tree was
+# false and is corrected in place — review cycle 7, P3), so it is the regression floor: a future edit that
+# eats it must raise
 # LANE_BACKSTOP_S (which raises `_mw`) rather than quietly convert supervision into waiting.
 # ⛔ THE EXAMPLE VALUES ARE CHECKED, NOT ASSUMED — AND BOTH EARLIER DRAFTS WERE WRONG (review cycles 2 and
-# 3, verified by mutation on copies): 6300 s reds this arm's own ARITHMETIC sibling (`_mw` = 0, which its
-# `-ge 1` refuses), so 6300 demonstrates nothing at all. 6100 s passes the arithmetic and this arm is the
-# one that NAMES the cause — but it does NOT isolate it: at `_mw` = 1 several chunk-accounting arms (the
-# WAITING_API refund, the LOAD-overwrite case, the charged-chunk case) also red, because they need more
-# than one chunk to exercise. That is the suite being STRICTER than a single-arm claim, and what is
-# corrected here is the claim, not the arm.
+# 3, verified by mutation on copies). ⛔ AND THEY WERE RE-DERIVED WHEN THE CLOCK MOVED (agent-infra#4034:
+# 7200 -> 36000), because an example that no longer reds anything is the same defect as a number that
+# was never recomputed with its operand. On the 36000 s clock: 35100 s reds this arm's own ARITHMETIC
+# sibling (`_mw` = 0, which its `-ge 1` refuses; `35100 + 120 + 900 = 36120 > 36000`), so 35100
+# demonstrates nothing at all. 34500 s passes the arithmetic (34500 + 120 + 900 = 35520 ≤ 36000) with
+# `_mw` = 5, and this arm is the one that NAMES the cause — but it does NOT isolate it: at `_mw` = 5
+# several chunk-accounting arms (the WAITING_API refund, the LOAD-overwrite case, the charged-chunk case)
+# also red, because they need more than one chunk to exercise. That is the suite being STRICTER than a
+# single-arm claim, and what is corrected here is the claim, not the arm.
 ck "the derived supervision allowance ($_mw chunks) is not starved — raising the check wait on one clock must not reduce --watch to a single chunk" \
    $([ -n "$_mw" ] && [ "${_mw:-0}" -ge 7 ] && echo 0 || echo 1)
 # ⛔ AND THE ARITHMETIC IS NOT THE RUNTIME (this suite's own lesson: a source-shape assertion passes on a
@@ -1626,21 +1630,27 @@ ck "…and one chunk EARLIER the derived cap does NOT refuse it (the bound is RE
 # `REVIEW_TIMEOUT` = 1800 s and leases the PR claim for 3000 s (`claims.sh:166`), and `chain-merge.sh` waits
 # 1890 s for the merge phase — so the lane handed off `BLOCKED_ATTEMPTS … chain was STILL RUNNING` over a
 # chain that was legitimately still reviewing, and `WATCH_F` only rewinds on a fix round or a head move.
-# The arm drives the DERIVED-FLOOR path first: 7 chunks seeded, chunk 8 arrives with an UNRESOLVABLE lane
-# clock (no `--issue`, no seam) — the design floor must still refuse it, or supervision becomes unbounded
-# for a controller re-run that is not under a lane at all. This row PASSES PRE-FIX and is here as the
-# regression guard that keeps the raise below honest.
+# The arm drives the DERIVED-FLOOR path first: the floor's chunks seeded, the next one arrives with an
+# UNRESOLVABLE lane clock (no `--issue`, no seam) — the allowance must still refuse it, or supervision
+# becomes unbounded for a controller re-run that is not under a lane at all. ⛔ THE NUMBER IS 22, NOT 7,
+# SINCE agent-infra#4034 RAISED THE DESIGN CLOCK 7200 -> 36000: the design operand is now 247 chunks
+# ((36000-5400-900)/120), which is ABOVE the watchdog's own allowance, so the binding floor on this path
+# is `_idle_fit` = (2700 - margin)/120 = 22. The property this arm exists for is unchanged and still
+# load-bearing — a re-run with no clock gets a BOUNDED number of chunks — and it now rides the watchdog
+# clamp rather than the design operand. This row PASSES PRE-FIX and is here as the regression guard that
+# keeps the raise below honest.
 new_o "$T/pr-fit.tsv"
-printf '7\n' > "$OT/state/lanemerge-46.watch"
+printf '22\n' > "$OT/state/lanemerge-46.watch"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
       LANE_MERGE_WAIT=5400 LANE_MERGE_POLL=120 \
       bash "$SCRIPT" 46 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
-ck "with NO resolvable lane clock the supervision allowance stays the 7-chunk design floor — chunk 8 is still refused (a controller re-run is not granted unbounded supervision)" \
+ck "with NO resolvable lane clock the supervision allowance is BOUNDED by the watchdog's 22-chunk allowance — chunk 23 is still refused (a controller re-run is not granted unbounded supervision)" \
    $([ "$RC" = 13 ] && [ "$(verdict_of 46 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && echo 0 || echo 1)
 # …and with the SAME 7 spent chunks and a RESOLVED clock, chunk 8 must be ADMITTED: at elapsed 1000 s the
-# remaining-clock fit is `(7200 − 1000 − 120)/120 = 50`, clamped by the watchdog's 2700 s allowance to 22 —
+# remaining-clock fit is `(36000 − 1000 − 120)/120 = 290`, clamped by the watchdog's 2700 s allowance to 22 —
 # still far above 7, and still inside both bounds. Pre-fix this row reds (MAX_WATCH stayed 7 → exit 13),
-# which is the non-vacuity of the raise.
+# which is the non-vacuity of the raise. ⛔ #4034's 5x did not change this row's outcome (the watchdog clamps
+# both clocks to 22); the ARITHMETIC is restated so it is not read as being about the old 7200.
 new_o "$T/pr-fit.tsv"
 printf '7\n' > "$OT/state/lanemerge-47.watch"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
@@ -1651,7 +1661,7 @@ ck "a lane whose checks settled EARLY gets supervision sized to the clock it has
 # ⛔ AND THE RAISE MUST NOT OUT-REACH THE WATCHDOG (#3850 review, P2 — the second of the two bounds).
 # `--watch` writes NO heartbeat, so a chunk sequence longer than `IDLE_BOUND_S` is killed as `stalled` with
 # no verdict; the smaller bound therefore WINS. `(200 − 10)/120 = 1` chunk here, against a design floor of
-# `(7200 − 0 − 900)/120 = 52`: the watchdog's 1 must be taken, not the floor's 52.
+# `(36000 − 0 − 900)/120 = 247` since agent-infra#4034: the watchdog's 1 must be taken, not the floor's 247.
 new_o "$T/pr-fit.tsv"
 printf '1\n' > "$OT/state/lanemerge-48.watch"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
@@ -1732,9 +1742,9 @@ ck "with NO heartbeat target the check wait CAPS itself below lane-bound.sh's al
 # no hand-off — strictly worse than the 1500 s bound this change replaces. `LANE_MERGE_ELAPSED_S` is the
 # seam for "how long has this lane been running"; the token path is what a real lane uses.
 new_o "$T/pr4.tsv"
-WAIT_S=60 POLL_S=5 LANE_MERGE_ELAPSED_S=7180 run 35 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
-ck "a lane that has already spent 7180 s of its 7200 s clock CAPS the check wait to the 10 s that is left (still WAITING_CHECKS, still a verdict) instead of waiting to be WALL-TERMed with none" \
-   $([ "$RC" = 11 ] && [ "$(verdict_of 35 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 7180s' <<<"$OUT" && echo 0 || echo 1)
+WAIT_S=60 POLL_S=5 LANE_MERGE_ELAPSED_S=35980 run 35 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a lane that has already spent 35980 s of its 36000 s clock CAPS the check wait to the 10 s that is left (still WAITING_CHECKS, still a verdict) instead of waiting to be WALL-TERMed with none" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 35 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 35980s' <<<"$OUT" && echo 0 || echo 1)
 # …and the clock it clamps against is the ARMED one, including the ceiling-reducer seam (review, P3 —
 # verified against spawn-gate.sh's `lane_wall_bound`, which arms `min(caller, LANE_BOUND_WALL_S)` for a
 # POSITIVE value and REFUSES to reduce to a `0`). Mirroring only LANE_TIMEOUT/LANE_BACKSTOP_S clamped
@@ -1770,12 +1780,15 @@ ck "LANE_BOUND_WALL_S=3630 (the documented CEILING REDUCER) is the clock the wai
 ck "the WALL clamp ATTRIBUTES its armed wall to LANE_BOUND_WALL_S (the knob that armed it) instead of hard-coding 'LANE_TIMEOUT=<n>s', which this run never set" \
    $(grep -q "the $(( ${_cap39:-0} + 3610 ))s wall this lane is armed with (from LANE_BOUND_WALL_S" <<<"$OUT" && ! grep -q 'lane-bound.sh.s .*wall ceiling' <<<"$OUT" && echo 0 || echo 1)
 # …and the same misattribution in the MAX_WATCH invariant warning, which is the OTHER line that renders
-# `LANE_WALL_S` as an operator instruction. Reachable with no elapsed clock at all: the armed wall is 3600 s,
-# which is below `WAIT_S_DESIGN + IMPL_RESERVE_S` (5400 + 900), so `MAX_WATCH_FIT` floors at 1 chunk and any
-# override above it warns.
+# `LANE_WALL_S` as an operator instruction. Reachable with no elapsed clock at all: the design allowance
+# must be SMALLER than the override, and since agent-infra#4034 raised the caller bound to 36000 s that
+# means a check wait large enough to leave fewer than 15 chunks — `(36000 − 34500 − 900)/120 = 5`.
+# ⛔ THE OPERANDS ARE THE POINT, NOT THE ARMED WALL: a 3600 s armed wall is below `WAIT_S_DESIGN +
+# IMPL_RESERVE_S`, which used to force `MAX_WATCH_FIT` to 1 by itself; at a 36000 s caller bound that is
+# no longer true, so the WAIT is what shrinks the design fit here.
 new_o "$T/pr4.tsv"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
-      LANE_MERGE_MAX_WATCH=15 LANE_BOUND_WALL_S=3600 LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=3590 \
+      LANE_MERGE_MAX_WATCH=15 LANE_BOUND_WALL_S=3600 LANE_MERGE_WAIT=34500 LANE_MERGE_ELAPSED_S=3590 \
       bash "$SCRIPT" 40 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
 ck "the LANE_MERGE_MAX_WATCH warning names the lane's ARMED wall and its source (LANE_BOUND_WALL_S), not a LANE_TIMEOUT this run never set — an operator line must never send you to the wrong knob" \
    $(grep -q 'but the lane.s 3600s wall clock (from LANE_BOUND_WALL_S' <<<"$OUT" && ! grep -q 'exceeds what LANE_TIMEOUT=' <<<"$OUT" && echo 0 || echo 1)
@@ -1811,14 +1824,14 @@ ck "LANE_BOUND_WALL_S=03630 (leading zero — the form lane_wall_bound ACCEPTS) 
 # larger than the lane has: the unlabelled kill from the other side).
 # A reducer LARGER than the caller bound must not be applied: the armed wall stays the caller's 7200.
 new_o "$T/pr4.tsv"
-WAIT_S=60 POLL_S=5 LANE_BOUND_WALL_S=99999 LANE_MERGE_ELAPSED_S=7180 run 71 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
-ck "a LANE_BOUND_WALL_S LARGER than the caller bound (99999 > 7200) is NOT applied — the clamp still sizes itself off 7200, so 7180 spent leaves 10 s" \
-   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'of its 7200s clock' <<<"$OUT" && echo 0 || echo 1)
+WAIT_S=60 POLL_S=5 LANE_BOUND_WALL_S=99999 LANE_MERGE_ELAPSED_S=35980 run 71 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a LANE_BOUND_WALL_S LARGER than the caller bound (99999 > 36000) is NOT applied — the clamp still sizes itself off 36000, so 35980 spent leaves 10 s" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'of its 36000s clock' <<<"$OUT" && echo 0 || echo 1)
 # A reducer of 0 is "wall axis OFF", which `lane_wall_bound` refuses to reduce to — so it must not be applied either.
 new_o "$T/pr4.tsv"
-WAIT_S=60 POLL_S=5 LANE_BOUND_WALL_S=0 LANE_MERGE_ELAPSED_S=7180 run 72 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
-ck "LANE_BOUND_WALL_S=0 is 'wall axis OFF', not a zero-second clock — it is NOT applied, so the caller's 7200 s clock still caps the wait at 10 s (a zero clock would take the unbounded branch)" \
-   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'of its 7200s clock' <<<"$OUT" && echo 0 || echo 1)
+WAIT_S=60 POLL_S=5 LANE_BOUND_WALL_S=0 LANE_MERGE_ELAPSED_S=35980 run 72 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "LANE_BOUND_WALL_S=0 is 'wall axis OFF', not a zero-second clock — it is NOT applied, so the caller's 36000 s clock still caps the wait at 10 s (a zero clock would take the unbounded branch)" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'of its 36000s clock' <<<"$OUT" && echo 0 || echo 1)
 # ⛔ THE CEILING REDUCER MUST NOT RESIZE THE *DESIGN* ALLOWANCE (review, P2 — verified by mutation: pointing
 # `MAX_WATCH_FIT` back at the ARMED `LANE_WALL_S` reddened NOTHING, 164/164 still green, so the fix was
 # unguarded and only prose held it). That mutant is a live false block, not a theory: with a 3600 s ceiling and
@@ -1833,9 +1846,9 @@ ck "LANE_BOUND_WALL_S=0 is 'wall axis OFF', not a zero-second clock — it is NO
 # red). The fit is only the shipped 7 at WAIT_S_DESIGN=5400 with POLL_S=120. The positive pattern is anchored on
 # the message's own em-dash so `— 7 chunk(s) fit` cannot match `— 17 chunk(s) fit`.
 new_o "$T/pr4.tsv"
-WAIT_S=5400 POLL_S=120 LANE_BOUND_WALL_S=3600 LANE_MERGE_ELAPSED_S=7180 LANE_MERGE_MAX_WATCH=50 run 73 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
-ck "a CEILING REDUCER does not shrink the DESIGN supervision allowance: with LANE_BOUND_WALL_S=3600 the fit is still the shipped 7 chunks off the 7200 s caller bound (computing it from the armed 3600 s would floor to 1, which is one 120 s chunk for a chain whose median reviewer run is 316 s)" \
-   $(grep -q "the 7200s DESIGN allowance" <<<"$OUT" && grep -q -- '— 7 chunk(s) fit' <<<"$OUT" && ! grep -q -- '— 1 chunk(s) fit' <<<"$OUT" && echo 0 || echo 1)
+WAIT_S=5400 POLL_S=120 LANE_BOUND_WALL_S=3600 LANE_MERGE_ELAPSED_S=35980 LANE_MERGE_MAX_WATCH=250 run 73 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a CEILING REDUCER does not shrink the DESIGN supervision allowance: with LANE_BOUND_WALL_S=3600 the fit is still the shipped 247 chunks off the 36000 s caller bound (computing it from the armed 3600 s would floor to 1, which is one 120 s chunk for a chain whose median reviewer run is 316 s)" \
+   $(grep -q "the 36000s DESIGN allowance" <<<"$OUT" && grep -q -- '— 247 chunk(s) fit' <<<"$OUT" && ! grep -q -- '— 1 chunk(s) fit' <<<"$OUT" && echo 0 || echo 1)
 # ⛔ THE BACKSTOP'S LEADING-ZERO FORM IS NORMALISED, AND NOTHING ELSE PINNED IT (review, P3 — verified by
 # mutation: deleting the normalisation left the suite red the SAME way, delta = zero arms).
 # `lane_wall_bound` ACCEPTS `03600`, and POSIX `test` reads it as DECIMAL 3600, so the lane IS armed at
@@ -1879,29 +1892,35 @@ ck "wall axis OFF via LANE_BACKSTOP_S=0 names THAT knob (never a LANE_TIMEOUT th
 # arms the lane with — so a non-numeric `LANE_TIMEOUT` wins the masking and `LANE_BACKSTOP_S=3600` is never read;
 # the pre-fix line said "no usable LANE_TIMEOUT or LANE_BACKSTOP_S", sending an operator to inspect two knobs
 # when exactly one is at fault and the other is a valid bound. ⛔ THE ARM ALSO PINS THE NO-FALL-THROUGH: the
-# wall must stay the shipped 7200 s default, because silently consulting the backstop would make this file's
-# clock disagree with the armed one. Cheap run: elapsed 7190 of 7200 leaves a 0 s clamp.
+# wall must stay the shipped 36000 s default (agent-infra#4034; 7200 s before it), because silently
+# consulting the backstop would make this file's clock disagree with the armed one. ⛔ THE WARNING THAT
+# CARRIES THE PROVENANCE IS THE `MAX_WATCH` ONE, so the design allowance must be SMALLER than the
+# override: `(36000 − 34500 − 900)/120 = 5` chunks against `LANE_MERGE_MAX_WATCH=15`. (On the old 7200 s
+# clock a 5400 s wait sufficed, because the design fit was 7.) Cheap run: elapsed 35990 of 36000 leaves a
+# 0 s clamp.
 new_o "$T/pr4.tsv"
 OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
-      LANE_MERGE_MAX_WATCH=15 LANE_TIMEOUT=abc LANE_BACKSTOP_S=3600 LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=7190 \
+      LANE_MERGE_MAX_WATCH=15 LANE_TIMEOUT=abc LANE_BACKSTOP_S=3600 LANE_MERGE_WAIT=34500 LANE_MERGE_ELAPSED_S=35990 \
       bash "$SCRIPT" 45 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
-ck "a MALFORMED LANE_TIMEOUT is named as the knob at fault, LANE_BACKSTOP_S=3600 is reported as NOT consulted (the arming path masks it with the same expression), and the wall stays the 7200 s default instead of silently falling through to the backstop" \
-   $([ "$RC" = 11 ] && grep -q "LANE_TIMEOUT='abc' is not a bounded integer" <<<"$OUT" && grep -q 'LANE_BACKSTOP_S=3600 was NOT consulted' <<<"$OUT" && grep -q "the lane's 7200s wall clock" <<<"$OUT" && ! grep -q 'from LANE_BACKSTOP_S' <<<"$OUT" && echo 0 || echo 1)
+ck "a MALFORMED LANE_TIMEOUT is named as the knob at fault, LANE_BACKSTOP_S=3600 is reported as NOT consulted (the arming path masks it with the same expression), and the wall stays the 36000 s default instead of silently falling through to the backstop" \
+   $([ "$RC" = 11 ] && grep -q "LANE_TIMEOUT='abc' is not a bounded integer" <<<"$OUT" && grep -q 'LANE_BACKSTOP_S=3600 was NOT consulted' <<<"$OUT" && grep -q "the lane's 36000s wall clock" <<<"$OUT" && ! grep -q 'from LANE_BACKSTOP_S' <<<"$OUT" && echo 0 || echo 1)
 # ⛔ THE SAME MALFORMED `LANE_TIMEOUT` WITH THE BACKSTOP AT ITS SHIPPED VALUE (MEASURED — this is the arm the
 # value-equality source test reds on, and it is the DEFAULT configuration rather than an exotic one): every
-# lane carries `LANE_BACKSTOP_S=7200` because `spawn-gate.sh:3419` defaults it, so a `LANE_TIMEOUT` typo in any
-# lane pairs `abc` with `7200` — the exact value the shipped default resolves to. The source test therefore
+# lane carries `LANE_BACKSTOP_S` because `spawn-gate.sh` defaults it (36000 since #4034, 7200 before), so a
+# `LANE_TIMEOUT` typo in any lane pairs `abc` with a valid backstop — which is exactly the masking this arm
+# pins. The source test therefore
 # matched on the NUMBER while the arming expression `${LANE_TIMEOUT:-…}` never read the backstop at all, and
 # every operator line rendered "from LANE_BACKSTOP_S" — the wrong knob, and the malformed one named nowhere.
-# ⛔ THE SOURCE IS DERIVED FROM THE RESOLUTION RULE, NEVER FROM VALUE EQUALITY: which arm can produce 7200 is
-# not the question; whether `${LANE_TIMEOUT:-…}` falls THROUGH to the backstop is. Cheap run: elapsed 7190 of
-# 7200 leaves a 0 s clamp, the same shape as the arm above.
+# ⛔ THE SOURCE IS DERIVED FROM THE RESOLUTION RULE, NEVER FROM VALUE EQUALITY: which arm can produce the
+# default is not the question; whether `${LANE_TIMEOUT:-…}` falls THROUGH to the backstop is. Cheap run:
+# 36000 leaves a 0 s clamp, the same shape as the arm above (and the same `MAX_WATCH` warning carries the
+# provenance).
 new_o "$T/pr4.tsv"
 OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
-      LANE_MERGE_MAX_WATCH=15 LANE_TIMEOUT=abc LANE_BACKSTOP_S=7200 LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=7190 \
+      LANE_MERGE_MAX_WATCH=15 LANE_TIMEOUT=abc LANE_BACKSTOP_S=7200 LANE_MERGE_WAIT=34500 LANE_MERGE_ELAPSED_S=35990 \
       bash "$SCRIPT" 46 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
-ck "…and it STILL names the malformed LANE_TIMEOUT when LANE_BACKSTOP_S holds the shipped 7200 s value: provenance comes from the arming expression, not from a number that happens to match, so the backstop is never credited with a clock it was masked out of" \
-   $([ "$RC" = 11 ] && grep -q "LANE_TIMEOUT='abc' is not a bounded integer" <<<"$OUT" && grep -q 'LANE_BACKSTOP_S=7200 was NOT consulted' <<<"$OUT" && grep -q "the lane's 7200s wall clock" <<<"$OUT" && ! grep -q 'from LANE_BACKSTOP_S' <<<"$OUT" && echo 0 || echo 1)
+ck "…and it STILL names the malformed LANE_TIMEOUT when LANE_BACKSTOP_S holds a value that happens to match a clock: provenance comes from the arming expression, not from a number that matches by coincidence, so the backstop is never credited with a clock it was masked out of" \
+   $([ "$RC" = 11 ] && grep -q "LANE_TIMEOUT='abc' is not a bounded integer" <<<"$OUT" && grep -q 'LANE_BACKSTOP_S=7200 was NOT consulted' <<<"$OUT" && grep -q "the lane's 36000s wall clock" <<<"$OUT" && ! grep -q 'from LANE_BACKSTOP_S' <<<"$OUT" && echo 0 || echo 1)
 # …and a lane's elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
 new_o "$T/pr4.tsv"
 WAIT_S=0 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
@@ -1929,11 +1948,11 @@ ck "…and its rendered disclosure really contains the word --watch and emits no
    $(grep -qF -- '--watch supervision allowance' <<<"$OUT" && ! grep -q 'command not found' <<<"$OUT" && echo 0 || echo 1)
 # …and the PRODUCTION path is the token, not the seam, so it is pinned too: `lane.sh` stamps
 # `<issue>.<pid>.<epoch>` into `$O/logs/lane-<issue>.owner` before spawning the agent. A live pid (`$$`,
-# this suite) plus an epoch 7180 s ago must clamp exactly as the seam does — the earlier draft wrote this
+# this suite) plus an epoch 35980 s ago must clamp exactly as the seam does — the earlier draft wrote this
 # reader with `is_limit` on the epoch, which refuses anything over NINE digits and would have left the
 # whole clamp permanently inert on the only path that feeds it in production.
 new_o "$T/pr4.tsv"
-printf '%s.%s.%s\n' 41 "$$" "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-41.owner"
+printf '%s.%s.%s\n' 41 "$$" "$(( $(date +%s) - 35980 ))" > "$OT/logs/lane-41.owner"
 WAIT_S=60 POLL_S=5 run 41 --issue 41 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
 # ⛔ ASSERT THE RELATION, NEVER TWO STAMPED INTEGERS (review cycle 12, P2 — MEASURED). The epoch
 # below is stamped with the SUITE's `date`, but the script recomputes `elapsed = date - epoch` after its own
@@ -1941,16 +1960,16 @@ WAIT_S=60 POLL_S=5 run 41 --issue 41 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-t
 # `already spent 7181s` and an exact-match arm REDS ON A CORRECT TREE. Measured on an idle box: 1 in 24
 # runs (4 %) rendered 7181; on a loaded CI runner the window exceeds a second and it reds nearly always —
 # and this suite is a CI shard, so that is a false red for EVERY PR, not a local annoyance. The invariant
-# is arithmetic and does not drift: `elapsed + cap == LANE_WALL_S - _hb_margin` (7200 − 10 = 7190).
+# is arithmetic and does not drift: `elapsed + cap == LANE_WALL_S - _hb_margin` (36000 − 10 = 35990).
 _cap41="$(sed -n 's/.*CAPPED at \([0-9][0-9]*\)s.*/\1/p' <<<"$OUT" | head -1)"
 _spent41="$(sed -n 's/.*already spent \([0-9][0-9]*\)s.*/\1/p' <<<"$OUT" | head -1)"
-ck "the RUN TOKEN lane.sh stamps is read as the lane's elapsed (10-digit epoch accepted, live pid accepted) → cap ${_cap41:-?}s + spent ${_spent41:-?}s = 7190, the clock minus the hand-off margin" \
-   $([ "$RC" = 11 ] && [ "$(verdict_of 41 | cut -d' ' -f1)" = WAITING_CHECKS ] && [ -n "${_cap41:-}" ] && [ -n "${_spent41:-}" ] && [ $(( ${_cap41:-0} + ${_spent41:-0} )) -eq 7190 ] && echo 0 || echo 1)
+ck "the RUN TOKEN lane.sh stamps is read as the lane's elapsed (10-digit epoch accepted, live pid accepted) → cap ${_cap41:-?}s + spent ${_spent41:-?}s = 35990, the clock minus the hand-off margin" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 41 | cut -d' ' -f1)" = WAITING_CHECKS ] && [ -n "${_cap41:-}" ] && [ -n "${_spent41:-}" ] && [ $(( ${_cap41:-0} + ${_spent41:-0} )) -eq 35990 ] && echo 0 || echo 1)
 # …and a token from a run that is OVER must not clamp a later invocation to 0 (the file is per-ISSUE and
 # outlives the run that wrote it), so the pid in it is required to be THIS run's ANCESTOR — not merely
 # a live process. Two arms: a DEAD pid, and a LIVE pid that is not in the chain that leads here.
 new_o "$T/pr4.tsv"
-printf '%s.%s.%s\n' 44 999999 "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-44.owner"
+printf '%s.%s.%s\n' 44 999999 "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-44.owner"  # any age; this arm asserts UNCLAMPED
 WAIT_S=0 POLL_S=5 run 44 --issue 44 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
 ck "a STALE run token (its pid is dead) is not read as this lane's elapsed — the wait is disclosed as unclamped instead of being clamped to 0 by a finished run" \
    $([ "$RC" = 11 ] && grep -q 'NOT clamped to what is left of LANE_WALL_S' <<<"$OUT" && echo 0 || echo 1)

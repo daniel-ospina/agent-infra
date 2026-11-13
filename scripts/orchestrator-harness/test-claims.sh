@@ -781,7 +781,8 @@ echo "=== P4. an UNPARSEABLE lease is an ABSTENTION with a BOUNDED expiry, never
 # PRs inherits it N times. The fix must hold in BOTH directions at once, so this section asserts both
 # and a mutant for each is quoted in the PR:
 #   (i)  it must NOT hold forever -> `claim_prune` reaps it once the claim's own COMMIT is older than
-#        CLAIM_UNREADABLE_LEASE_MAX_AGE (18000s = CLAIM_ISSUE_TTL, the longest shipped lease);
+#        CLAIM_UNREADABLE_LEASE_MAX_AGE (48000s = CLAIM_ISSUE_TTL, the longest shipped lease;
+#        18000s before agent-infra#4034 raised the lane term 5x);
 #   (ii) it must NOT silently grant the claim -> every READER still refuses while the ref exists —
 #        never CLEAN, never `claim-held`, never rc 0 — and STILL refuses past that bound, because
 #        the bound is the REAPER's schedule, not a reader's licence. The state change is a DELETION
@@ -816,7 +817,7 @@ p4_verdict() { # <ref-name> -> "RC=<n> WORD=<word>" from a FRESH snapshot of the
 }
 # ── (ii) THE READERS. `pr-3203` is ALSO older than the reap bound, so A4 is the "never granted by
 # age" assertion: a "fix" that let a reader expire an unparseable lease by its commit age reddens it.
-P4C="$(p4_seed pr-3203 weird3203 HAVOC 40000)"; echo "  seeded an unparseable-lease claim (lease_until=HAVOC, commit 40000s old): $P4C"
+P4C="$(p4_seed pr-3203 weird3203 HAVOC 60000)"; echo "  seeded an unparseable-lease claim (lease_until=HAVOC, commit 60000s old — past the 48000 s bound since agent-infra#4034; 40000 was past the old 18000): $P4C"
 outP4=$(p4_run claim_pr_acquire "" 3203); rcP4=$?
 echo "  acquire rc=$rcP4 :: $outP4"
 ck "A1 [RED→GREEN] an unparseable lease is NOT stolen (rc=1)" "^1$" "$rcP4"
@@ -871,11 +872,11 @@ ck "A18 [RED→GREEN] after the DELETION the key reads free (claim-absent, rc=0)
 # `date` used to be read as epoch 0 and reported as clock SKEW — the wrong cause for a clock this box
 # could not read at all. (The `12:34:56` shape, whose arithmetic error aborts the pass, is guarded by
 # the same top-of-function check; these assertions pin the two that are reachable through the test seam.)
-p4_seed pr-3205 weird3203 HAVOC 40000 >/dev/null
+p4_seed pr-3205 weird3203 HAVOC 60000 >/dev/null
 outP4BG=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA CLAIM_UNREADABLE_LEASE_MAX_AGE=abc \
               && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
-ck "A21 [RED→GREEN] a GARBAGE CLAIM_UNREADABLE_LEASE_MAX_AGE is clamped to the shipped 18000s (asserted on the bound the line NAMES: unclamped, the -le test ERRORS on 'abc', an errored test is FALSE, and the arm reaps on a value it never validated — the fail-OPEN direction)" "PAST the 18000s bound" "$outP4BG"
-p4_seed pr-3206 weird3203 HAVOC 40000 >/dev/null
+ck "A21 [RED→GREEN] a GARBAGE CLAIM_UNREADABLE_LEASE_MAX_AGE is clamped to the shipped 48000s (asserted on the bound the line NAMES: unclamped, the -le test ERRORS on 'abc', an errored test is FALSE, and the arm reaps on a value it never validated — the fail-OPEN direction)" "PAST the 48000s bound" "$outP4BG"
+p4_seed pr-3206 weird3203 HAVOC 60000 >/dev/null
 # A NON-EMPTY, NON-NUMERIC CLOCK ("12:34:56") IS THE DISCRIMINATING SEAM. An empty one is caught by
 # the `[ -z "$now" ]` branch even WITHOUT the top-of-function normalisation; a value that is invalid
 # arithmetic syntax makes the age arithmetic a SYNTAX ERROR that kills the subshell, so the pass stops
@@ -941,7 +942,7 @@ ck "A32 [RED→GREEN] ...and the ref SURVIVES (no stamp, no age, no reap)" "^0$"
 ( cd "$P4BOX" && git push -q --force origin refs/heads/crafted:refs/claims/pr-3211 ) 2>/dev/null
 p4_has pr-3211 && P4CRAFT=0 || P4CRAFT=1
 ck "A33a (setup) a claim commit with a LEADING-ZERO committer stamp is planted" "^0$" "$P4CRAFT"
-p4_seed pr-3299 weird3203 HAVOC 40000 >/dev/null
+p4_seed pr-3299 weird3203 HAVOC 60000 >/dev/null
 outP4CZ=$( p4_prune )   # NOTE: no `date` seam here — the crafted stamp alone must not stop the pass
 echo "  prune output (crafted stamp):"; printf '%s\n' "$outP4CZ" | sed 's/^/    /'
 ck "A33 [RED→GREEN] a leading-zero committer stamp is refused as unmeasurable, so the pass never dies on it" "kept unreadable-lease refs/claims/pr-3211" "$outP4CZ"
@@ -963,7 +964,7 @@ for P4BAD in 0 0000009999 18446744073709551616 99999999999999999999; do
   ck "A37 [RED→GREEN] ...and nothing was pushed for that shape (no already-expired claim to be stolen)" "^0$" "$P4ZM"
   P4ZREF=$(( P4ZREF + 1 ))
 done
-p4_seed pr-3213 weird3203 HAVOC 40000 >/dev/null
+p4_seed pr-3213 weird3203 HAVOC 60000 >/dev/null
 p4_seed pr-3214 weird3203 HAVOC 0      >/dev/null
 outP4OC=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
              && date() { printf '0000009999\n'; } && claim_prune ) 2>&1 )
@@ -1185,16 +1186,16 @@ ck "A67 [PINNED] a comparison that cannot be performed answers 'unknown', never 
 # the steal direction this arm exists to refuse.
 # ⛔ AND THE FLOOR IS CALIBRATED ON THE LONGEST MINTABLE TERM (review round 20, agent-infra#3203):
 # `CLAIM_BRANCH_TTL` and `CLAIM_TTL_MAX` are each overrides that can be raised PAST `CLAIM_ISSUE_TTL`,
-# and a floor nailed to 18000 would then fire INSIDE a live 40000 s branch term — the same steal, one
+# and a floor nailed to CLAIM_ISSUE_TTL would then fire INSIDE a live branch term longer than it — the same steal, one
 # knob over. Both arms are pinned below, so a future simplification back to one knob goes RED.
 outP4FLOOR=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
                 && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
 echo "  CLAIM_UNREADABLE_LEASE_MAX_AGE=1 resolves to: $outP4FLOOR"
-ck "A68 [RED→GREEN] a sub-lease bound is clamped UP to the longest mintable term, never below it" "^18000$" "$outP4FLOOR"
+ck "A68 [RED→GREEN] a sub-lease bound is clamped UP to the longest mintable term, never below it" "^48000$" "$outP4FLOOR"
 outP4FLOORB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
-                   CLAIM_BRANCH_TTL=40000 && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
-echo "  ...and with CLAIM_BRANCH_TTL=40000 it resolves to: $outP4FLOORB"
-ck "A69 [RED→GREEN] ...and the floor FOLLOWS a raised branch term, so it cannot fire inside a live branch claim" "^40000$" "$outP4FLOORB"
+                   CLAIM_BRANCH_TTL=60000 && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
+echo "  ...and with CLAIM_BRANCH_TTL=60000 (ABOVE CLAIM_ISSUE_TTL=48000, which is what makes the max() move) it resolves to: $outP4FLOORB"
+ck "A69 [RED→GREEN] ...and the floor FOLLOWS a raised branch term, so it cannot fire inside a live branch claim" "^60000$" "$outP4FLOORB"
 # The VALUE clamp is not the behaviour it exists for, so the decision itself is asserted: a 2-SECOND-old
 # unparseable claim under a bound of 1 must be KEPT and NAMED — not deleted. This is the literal
 # measurement behind the floor, promoted to a gate: a future refactor that hoists the bound into a local
@@ -1222,11 +1223,11 @@ ck "A71 [RED→GREEN] ...and the ref is really still there (the bound is a bound
 outP4CEIL1=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
                  CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=1 && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
 echo "  MAXAGE=1 CEIL=1 resolves to: $outP4CEIL1"
-ck "A72 [RED→GREEN] a CEILING below the floor term cannot undercut it (a sub-term ceiling is a scheduled steal)" "^18000$" "$outP4CEIL1"
+ck "A72 [RED→GREEN] a CEILING below the floor term cannot undercut it (a sub-term ceiling is a scheduled steal)" "^48000$" "$outP4CEIL1"
 outP4CEIL2=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=3600 \
                  && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
 echo "  CEIL=3600 alone resolves to: $outP4CEIL2"
-ck "A73 [RED→GREEN] ...and it cannot undercut the DEFAULT bound either (3600 s is inside a 18000 s lease)" "^18000$" "$outP4CEIL2"
+ck "A73 [RED→GREEN] ...and it cannot undercut the DEFAULT bound either (3600 s is inside a 48000 s lease)" "^48000$" "$outP4CEIL2"
 ck "A72a (setup) a 2 s-old unparseable claim is MINTED for the ceiling case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3232 weird3203 HAVOC 2 2>/dev/null )"
 outP4CEILB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
                   CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=1 && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
@@ -1380,7 +1381,7 @@ if [ -n "$P4UTF8" ]; then
   echo "  _claim_commit_time over a committer name with a 0xFF byte, under UTF-8 ambient locale '$P4UTF8': '$P4NONUTFV'"
   ck "A86 [RED→GREEN] a non-UTF-8 byte in the committer NAME does not stop the stamp being measured (the parse is byte-oriented)" "^${P4NOW}$" "$P4NONUTFV"
   outP4NONUTFP=$( p4_prune )
-  ck "A87 [RED→GREEN] ...so the claim is AGED from that stamp (INSIDE the bound), not reported unmeasurable" "kept unreadable-lease refs/claims/pr-3237 (owner weird3203 .*INSIDE the 18000s bound" "$outP4NONUTFP"
+  ck "A87 [RED→GREEN] ...so the claim is AGED from that stamp (INSIDE the bound), not reported unmeasurable" "kept unreadable-lease refs/claims/pr-3237 (owner weird3203 .*INSIDE the 48000s bound" "$outP4NONUTFP"
 else
   echo "  ⏭️ A86/A87 SKIPPED — this box has no UTF-8 locale, so the byte-orientation pin is INERT and cannot"
   echo "     measure the mutation. Counted as SKIPPED, never as a pass (an inert pin that increments PASS is"

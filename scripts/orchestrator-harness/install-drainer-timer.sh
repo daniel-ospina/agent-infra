@@ -128,7 +128,7 @@ resolve_target || {
 # ⛔ THE LANE'S BOUND IS RENDERED FROM THE SEAM, NOT FROM A LOCAL LITERAL (agent-infra#2888 review,
 # P2 — verified). This used to render `${LANE_TIMEOUT:-3000}` at INSTALL time into an `Environment=` PIN,
 # and a pin WINS over the script's own default — so on every box this installer touched,
-# `ai-drainer.sh`'s `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` could never take effect and drainer
+# `ai-drainer.sh`'s `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-36000}}` could never take effect and drainer
 # lanes stayed killed at 50 min: 300 s above the 2700 s progress allowance, i.e. the censoring survived
 # on the box whose job is to drain the backlog, and raising `LANE_BACKSTOP_S` changed nothing there.
 # Resolved ONCE here, from the harness copy being installed, so the two cannot drift.
@@ -137,7 +137,7 @@ if [ -z "$DRAINER_LANE_TIMEOUT" ]; then
     DRAINER_LANE_TIMEOUT="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' \
                               "$(dirname "${BASH_SOURCE[0]}")/spawn-gate.sh" 2>/dev/null | head -1)"
 fi
-case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=7200 ;; esac
+case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=36000 ;; esac
 
 render() { # <template> <dest>
     local v tmp

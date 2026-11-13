@@ -478,8 +478,8 @@ esac
 # ⛔ THE BOUND IS PER KEYING AND IT IS A CEILING, NOT THE DEFAULT. The shipped callers lease a PR
 # claim for MORE than `CLAIM_TTL`: merge-one.sh asks REVIEW_TIMEOUT + _gw + 300 (=3000s at the
 # default 900s gate wait; more when GATE_POLL_SECS raises `_gw`) and fix-one.sh asks FIX_TIMEOUT+1200
-# (=8400s at the current 7200s LANE_BACKSTOP_S, not the 3600s this sentence carried from before
-# agent-infra#2888 raised the backstop), both deliberately, because the lease has to cover the
+# (=37200s at the current 36000s LANE_BACKSTOP_S — 8400s at the 7200s one agent-infra#2888 landed, and
+# 3600s in the sentence this line carried before that), both deliberately, because the lease has to cover the
 # review+merge the claim is taken for. So "term <= 1800" is NOT the invariant — an assertion of it
 # would redden the merge path. What must hold, and what the incident actually violated, is that no
 # lease can exceed the DOCUMENTED CEILING for its keying (`CLAIM_TTL_MAX` for the per-head/PR keys,

@@ -2918,8 +2918,9 @@ later.
   `env` when some other environment did, `derived:cores` when the loop computed it. A ceiling in
   force that no unit set is now visible in the line that reports it.
 
-* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (125 min,
-  deliberately ABOVE the lane's wall BACKSTOP `LANE_BACKSTOP_S` = 7200 s: a live lane inside one long
+* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (601 min
+  since agent-infra#4034, 125 min before it, deliberately ABOVE the lane's wall BACKSTOP
+  `LANE_BACKSTOP_S` = 36000 s since #4034, 7200 s before it: a live lane inside one long
   silent tool call must not read as dead and license extra dispatch. It followed the wall limit while
   the wall was the primary bound; since agent-infra#2888 the wall is only the backstop, so the window
   follows the backstop). A lane whose log was **deleted** (a `/tmp` prune can
@@ -4403,7 +4404,7 @@ this box's own dead claim — for every keying — and the local-pid rule then p
 reads a local absence, and calls a LIVE remote worker's PR claim orphaned: the steal direction, from a
 name that is no longer ours. The self-limiting claim holds only while the name is exclusive to this
 box. Remedy: once no outstanding claim can still carry the name (after the LONGEST ceiling across every
-keying — `CLAIM_TTL_MAX` 9600 / `CLAIM_ISSUE_TTL` 18000 / `CLAIM_BRANCH_TTL` 14400 — so 18000), delete the
+keying — `CLAIM_TTL_MAX` 43200 / `CLAIM_ISSUE_TTL` 48000 / `CLAIM_BRANCH_TTL` 14400 — so 48000), delete the
 line from `state/claim-hosts` before the name is reused elsewhere.
 
 ⚠️ **The roster is an allow list, so an INCOMPLETE one over-reaps**: a roster that names this box and merely omits a live peer declares that peer dead and re-dispatches its unexpired work across two boxes — the failure this registry exists to prevent, reached from the opposite direction. It must be COMPLETE and authoritative, which is why the deny list (`CLAIM_DEAD_HOSTS`) is the safer knob for a one-off dead host and is checked first.
@@ -4480,12 +4481,15 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(18000s — raised 10800s -> 14400s by #2029, whose merge phase lengthened the wait the lease must
-outlive, and 14400s -> 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s, raised from 7200s by
-#2999) and `CLAIM_ISSUE_TTL` bound what a caller may stamp. The **branch keying is its own ceiling**:
-`CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch, deliberately above
-`CLAIM_TTL_MAX` — a batch legitimately outlives the PR/merge ceiling, and clamping it to 9600 would
-expire a live batch mid-flight (the loss #3328 exists to prevent; pinned by `branch-claim.test.sh`
+(48000s — raised 10800s -> 14400s by #2029, whose merge phase lengthened the wait the lease must
+outlive, 14400s -> 18000s by #2999, and 18000s -> 48000s by agent-infra#4034 when the lane backstop went
+7200s -> 36000s) are *defaults* for their keying; `CLAIM_TTL_MAX` (43200s, raised from 7200s by
+#2999 and from 9600s by agent-infra#4034) and `CLAIM_ISSUE_TTL` bound what a caller may stamp. The **branch keying is its own ceiling**:
+`CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch — a batch
+legitimately outlives the PR/merge ceiling, and clamping it to the PR claim's 1800s default would
+expire a live batch mid-flight. (It was written as "deliberately above `CLAIM_TTL_MAX`" when that was
+9600 and clamping it to 9600 was the hazard; #4034 raised `CLAIM_TTL_MAX` to 43200, above this term,
+so the separation is structural now rather than a numeric ordering) (the loss #3328 exists to prevent; pinned by `branch-claim.test.sh`
 case 10). *(Corrected in a later round: this paragraph said 14400s for `CLAIM_ISSUE_TTL` and 7200s
 for `CLAIM_TTL_MAX`, and the branch keying was absent rather than stale — `CLAIM_TTL` (1800s) was
 never wrong.)*
@@ -4493,7 +4497,8 @@ Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
 stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300` (merge-one; `_gw` is the gate wait, 900 s at
 the defaults, so that lease is 3000 s and the clamp threshold — `CLAIM_TTL_MAX - (_gw + 300)` — is
-8400 s) and `FIX_LEASE = FIX_TIMEOUT + 1200` (fix-one): raising either timeout past its own threshold
+42000 s at the defaults) and `FIX_LEASE = FIX_TIMEOUT + 1200` (fix-one, 37200 s at the shipped
+36000 s backstop — the number that forced `CLAIM_TTL_MAX` to 43200 in agent-infra#4034): raising either timeout past its own threshold
 requires raising `CLAIM_TTL_MAX` in the same change, or the claim is clamped below the term the worker
 asked for — and past `CLAIM_TTL_MAX` itself it expires before the review it was taken for. *(Corrected: this sentence
 said `REVIEW_TIMEOUT + 1200` and a flat `CLAIM_TTL_MAX - 1200`, which was right only for the fixer and

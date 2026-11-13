@@ -178,7 +178,7 @@ CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"
 # ── release the cross-box ISSUE claim (#1850) ────────────────────────────────────────────────
 # `orch-loop.sh` claimed `refs/claims/issue-<N>` when it dispatched this issue, and that claim is
 # this box's declaration that the issue is IN FLIGHT. Holding it after the chain is over would keep
-# a FREE issue undispatchable by every box until the lease ran out — up to CLAIM_ISSUE_TTL (4h) — so
+# a FREE issue undispatchable by every box until the lease ran out — up to CLAIM_ISSUE_TTL (13 h 20 m since agent-infra#4034; 4-5 h before it) — so
 # it is released on EVERY exit path: a clean merge, a failed one, and the "no PR appeared" timeout.
 #
 # ⛔ THE RELEASE IS FENCED (`--force-with-lease=<ref>:<own>`), so it refuses to delete a ref that no
@@ -206,7 +206,7 @@ release_issue_claim() {
   # "released" line. The reason lives in CLAIM_RESULT, which a subshell discards.
   CLAIM_REPO="$REPO"
   if ! . "$csh" 2>/dev/null; then
-    echo "[chain $N] ⚠️ $csh failed to source — the issue claim is NOT released (it runs to its lease, CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-14400}s)" >> "$LOG"
+    echo "[chain $N] ⚠️ $csh failed to source — the issue claim is NOT released (it runs to its lease, CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-48000}s)" >> "$LOG"
     return 0
   fi
   if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
@@ -223,14 +223,14 @@ release_issue_claim() {
   # box one lease; deleting the wrong claim duplicates work on two boxes, so this is the fail-closed
   # side of the same asymmetry as the pre-flight. Loud, and the lease still reaps it.
   if [ -z "${CHAIN_CLAIM_COMMIT:-}" ]; then
-    echo "[chain $N] ⚠️ no captured claim generation (the handover record was absent at chain start) — NOT releasing refs/claims/issue-$N: a stale chain must never delete a NEWER claim. It runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-14400}s)." >> "$LOG"
+    echo "[chain $N] ⚠️ no captured claim generation (the handover record was absent at chain start) — NOT releasing refs/claims/issue-$N: a stale chain must never delete a NEWER claim. It runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-48000}s)." >> "$LOG"
     return 0
   fi
   if out="$(claim_issue_release_record "$O" "$REPO" "$N" "${CHAIN_CLAIM_COMMIT:-}")"; then
     echo "[chain $N] released refs/claims/issue-$N" >> "$LOG"
   else
     rc=$?
-    echo "[chain $N] ⚠️ the issue claim was NOT released (rc=$rc): ${out:-${CLAIM_RESULT:-no reason given}} — it runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-14400}s)" >> "$LOG"
+    echo "[chain $N] ⚠️ the issue claim was NOT released (rc=$rc): ${out:-${CLAIM_RESULT:-no reason given}} — it runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-48000}s)" >> "$LOG"
   fi
   return 0
 }

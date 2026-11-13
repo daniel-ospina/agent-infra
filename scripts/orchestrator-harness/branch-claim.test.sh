@@ -26,8 +26,9 @@
 #                          STDIN and its ARGV, so a chain written `while read …; do validate; done`
 #                          validates the real lines instead of silently validating nothing.
 #  10 THE TERM             the DEFAULT branch lease is `CLAIM_BRANCH_TTL` (14400s), that same value is
-#                          the CEILING (a caller cannot mint a longer one), `CLAIM_TTL_MAX` (9600)
-#                          does NOT clamp it, an over-ceiling clamp is LOUD on stderr, and raising the
+#                          the CEILING (a caller cannot mint a longer one), `CLAIM_TTL_MAX` (43200
+#                          since agent-infra#4034) does NOT clamp it — this keying's ceiling is its own
+#                          term — an over-ceiling clamp is LOUD on stderr, and raising the
 #                          env var raises default AND ceiling together (one knob, not two). Added by
 #                          later rounds on the same case: an UNPARSEABLE ttl falls back to the BRANCH
 #                          default — never the PR claim's 1800s — the printed ceiling FOLLOWS the knob,
@@ -72,7 +73,7 @@ export O="$T/orch" CLAIM_STATE_DIR="$T/orch/state"
 # added: round 1 wrote "2 failures" here, by round 5 the same experiment reddened 3, the round-12
 # fallback arm made it 4, and the round-13 boundary arm made it 5 — so a reader re-running it must
 # compare SUBJECTS, not a number. Empty is safe: `claims.sh`
-# falls back to 14400 / 9600 on an empty or unparseable value.
+# falls back to 14400 / 43200 (9600 before agent-infra#4034) on an empty or unparseable value.
 unset CLAIM_REPO CLAIM_OWNER_HOST CLAIM_BRANCH_TTL CLAIM_TTL_MAX
 
 BR=integration/land-batch-2
@@ -274,7 +275,7 @@ lease_arm() { # <label> <expected-seconds> <lease_until-epoch>
   # immediately before EVERY acquire (see each arm), so the delta can only exceed the term by that one
   # acquire's own duration — a bare-repo CAS under a loaded fleet is not sub-second, and a tighter
   # bound would be a flake rather than a gate. ±15 s still discriminates every value that matters here:
-  # 1800 and 9600 are 1000 s+ away.
+  # 1800, 14400 and 43200 are 1000 s+ apart.
   local want="$2" d
   d=$(( $3 - NOW ))
   if [ "$d" -ge "$(( want - 15 ))" ] && [ "$d" -le "$(( want + 15 ))" ]; then
@@ -335,7 +336,10 @@ acquire_from owner "$BR_LEASE_FALLBACK" 07
 L1B="$(lease_of refs/claims/branch-integration-lease-fallback)"
 if [ -n "$L1B" ]; then lease_arm "an UNPARSEABLE ttl falls back to the BRANCH default (14400s), never the PR claim's 1800s" 14400 "$L1B"; else bad "no lease_until on the unparseable-ttl claim ref"; fi
 # ⛔ THE CEILING ARM. An explicit over-ceiling request must clamp to THIS KEY's ceiling (14400) and say
-# so — not to CLAIM_TTL_MAX (9600). A clamp to 9600 shreds 33 % of a batch's term (14400 -> 9600).
+# so — not to CLAIM_TTL_MAX (43200 since agent-infra#4034; 9600 before it, when a clamp to it shredded
+# 33 % of a batch's term, 14400 -> 9600). The separation is this keying's own ceiling, not an ordering:
+# the arm stays load-bearing at any CLAIM_TTL_MAX value, which is what makes it safe to have moved the
+# ceiling past this term.
 NOW=$(date +%s)
 # ⛔ THE WARNING MUST BE ON STDERR, AND THAT IS ASSERTED ON THE STREAM ITSELF (review of this change,
 # P3). `acquire_from` merges `2>&1` into `$T/acq.out`, so it proves only that SOME stream carries the
@@ -350,7 +354,7 @@ grep -q 'exceeds this keying ceiling' "$T/acq.stderr" && ok "an over-ceiling ttl
   || bad "the clamp warning is NOT on stderr — merge-one runs the acquire with stdout discarded, so it would be silent: $(cat "$T/acq.stdout")"
 # ⛔ AND IT MUST NOT NAME ANOTHER KEYING'S KNOB AS THE CEILING (review round 2, P2; round 5 widened
 # it). The warning used to read "(CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = 14400s)" — for a branch key BOTH
-# names are wrong (9600 / 18000), so a fixer was sent to raise a knob that is not the ceiling. Two
+# names are wrong (43200 / 48000 since agent-infra#4034; 9600 / 18000 then), so a fixer was sent to raise a knob that is not the ceiling. Two
 # literal greps (the exact former string, then a positive mention of this keying's name) were each
 # defeated by a respelling — "ceiling (CLAIM_ISSUE_TTL = 14400s) — clamped. Candidates: … CLAIM_BRANCH_TTL"
 # mentions this keying AND avoids the old spelling while still naming the wrong ceiling. So the
@@ -453,7 +457,7 @@ else
   bad "the clamp warning does not name CLAIM_BRANCH_TTL as a ceiling candidate: $(cat "$T/acq.out")"
 fi
 L2="$(lease_of refs/claims/branch-integration-lease-ceiling)"
-if [ -n "$L2" ]; then lease_arm "an over-ceiling request clamps to CLAIM_BRANCH_TTL (14400), NOT to CLAIM_TTL_MAX (9600)" 14400 "$L2"; else bad "no lease_until on the over-ceiling claim ref"; fi
+if [ -n "$L2" ]; then lease_arm "an over-ceiling request clamps to CLAIM_BRANCH_TTL (14400), NOT to CLAIM_TTL_MAX (43200 since agent-infra#4034)" 14400 "$L2"; else bad "no lease_until on the over-ceiling claim ref"; fi
 # ⛔ THE KNOB ARM — ONE KNOB, NOT TWO (review round 2, P2). The comment in `claims.sh` claims that
 # raising the env var raises the DEFAULT and the CEILING together. Two literals cannot prove that: a
 # mutant that hardcodes the ceiling (`_claim_acquire_at … "14400"`) leaves every arm above green,
