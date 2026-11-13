@@ -1604,6 +1604,23 @@ delta_git_neutral() { # <root> <git args…>
 # `HEAD@{0}` still arrives as the operand `HEAD` plus the brace. The earlier note here said `@`-bearing
 # names "still do not enter the two ref-name arms" — measurably false after the widening, and a false
 # sentence in a declared-residual is the one a later reader trusts.
+# ⛔ THE MIRROR ARM RESOLVES ITS LEFT WORD IN THE ATTESTED FRAME (round 13 — MEASURED, a FRAME-DEPENDENT
+# verdict this lane introduced in round 7). The written left end was resolved with `rev-parse` in the
+# DELTA CHECKOUT, so a decorated `HEAD` meant "whatever that clone happens to have checked out": `HEAD`
+# with a fence around it (backtick or comma or period) is `HEAD..anc`, nought commits, and it was
+# REFUSED at the attested head while a base-parked checkout — the ORDINARY frame a recorder runs in —
+# MINTED a signed `clean`. The tip's own word denotes the attested head in every frame, and a selector
+# hangs off it in that frame too; everything else (a sha, a ref name) is frame-independent by
+# construction and goes to `rev-parse` unchanged.
+_attres() { # <word> -> sha in the ATTESTED frame
+  case "$1" in
+    HEAD|@|@\{0+\}|@\{now\}) _attres_r='' ;;
+    HEAD[~^]*|HEAD@\{*) _attres_r="${1#HEAD}" ;;
+    @*) _attres_r="${1#@}" ;;
+    *) delta_git "$root" rev-parse --verify "$1^{commit}" 2>/dev/null || true; return 0 ;;
+  esac
+  delta_git "$root" rev-parse --verify "${_tosha}${_attres_r}^{commit}" 2>/dev/null || true
+}
 _tipvariant() { # <token> -> the token, with a tip-word case variant normalised to HEAD when no such ref
   case "$1" in
     HEAD|@) printf '%s' "$1" ;;
@@ -1670,7 +1687,7 @@ _tiproot() { # <token> -> the token re-rooted on the attested head, or ""
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _esep="" _elsha="" _ersha="" _eranges="" _erangesprev="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _esep="" _elsha="" _ersha="" _eranges="" _erangesprev="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _attres_r="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -3266,7 +3283,17 @@ $m"
     # identically. Leading digits are not a declared remainder; they were an undeclared hole, and a
     # digit-initial alternative closes it for the whole class rather than for the examples measured.
     _eranges="$_claim"
-    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})(${_dident}*)[[:space:]]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@|${_dref})((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})*) ]]; do
+    # ⛔ THE SENTENCE'S DECORATION IS NOT PART OF THE TOKEN (round 13 — MEASURED, the class the earlier
+    # rounds each closed ONE spelling of). A claim fences, quotes, punctuates and markdown-emphasises its
+    # operands: `` `HEAD`..anc ``, `**HEAD**..`, `HEAD,..anc`. Those runs sit BETWEEN the operand and the
+    # dots, where both scans demanded whitespace only, so no arm matched and a nought-commit claim minted
+    # a signed `clean` in EVERY frame. The run admitted here is `[^0-9A-Za-z_.~^@{}]*` — punctuation and
+    # space, never a word character (which would end the operand), never a dot (which would make the
+    # SEPARATOR ambiguous), and never a SELECTOR character (`~ ^ @ { }`): those are the revision's own
+    # syntax, and folding them into the decoration would read `<sha>^{commit}..HEAD` as `<sha>..HEAD` and
+    # re-classify a claim by accident of punctuation (MEASURED: the caret spelling stopped reaching the
+    # tip-relative arm, 20h50b). So it is exactly the decoration and nothing that could be part of a revision.
+    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})(${_dident}*)[^0-9A-Za-z_.~^@{}]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@|${_dref})((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})*) ]]; do
       _elhs="${BASH_REMATCH[$_g_op1]}${BASH_REMATCH[$_g_dident1]}"
       _erhs="${BASH_REMATCH[$_g_op2]}${BASH_REMATCH[$_g_chain2]}"
       # ⛔ THE DOTS ARE NOT ALL THE SAME SEPARATOR (thirtieth review cycle, round 10 — MEASURED, a FALSE
@@ -3292,7 +3319,7 @@ $m"
       # same claim minted a signed `clean` when the recorder ran from a base-parked checkout and was
       # refused when it ran at the attested head: a verdict decided by where a clone happens to be, which
       # is the failure this file has closed twice before. Skip the whitespace, then read the dots.
-      _esep="${BASH_REMATCH[0]#*"$_elhs"}"; _esep="${_esep#"${_esep%%[![:space:]]*}"}"; _esep="${_esep%%[^.]*}"
+      _esep="${BASH_REMATCH[0]#*"$_elhs"}"; _esep="${_esep//[!.]/}"
       # ⛔ CONSUME THE SEPARATOR, NOT THE WHOLE MATCH (round 11 — MEASURED, a FAIL-OPEN). The right operand
       # of one range can be the LEFT operand of the next: slicing past the whole match ate it, and the arm
       # that owns the remaining claim could not recover it (the omitted-left arm excludes a leading char
@@ -3307,8 +3334,14 @@ $m"
       # that killed the suite at the first honest spaced two-endpoint claim. Slice past the LEFT OPERAND
       # only, which is a substring of the match by construction, and prove the slice moved before
       # continuing: the right operand then sits at the start of the remaining text for the next iteration.
+      # ⛔ AND RE-FEED THE RIGHT OPERAND RATHER THAN RESCANNING THE PREFIX (round 13 — MEASURED, an 11×
+      # cost regression): slicing past the left operand alone re-matched the same range once per EARLIER
+      # occurrence of that operand (`anc ` ×800 + one `anc..anc` cost 12.7 s against 1.2 s at the parent,
+      # and a 14 KB artifact of that shape ran 73 s). Prepending the captured right end to the remainder
+      # keeps the progress guarantee (the text strictly shrinks by at least the separator) AND gives the
+      # next iteration exactly what the old whole-match slice gave it, with no rescan.
       _erangesprev="$_eranges"
-      _eranges="${_eranges#*"${_elhs}"}"
+      _eranges="${_erhs}${_eranges#*"${BASH_REMATCH[0]}"}"
       [ "$_eranges" = "$_erangesprev" ] && break
       # ⛔ THE REFUSAL QUOTES WHAT WAS WRITTEN, NOT A RECONSTRUCTION OF IT (twenty-second cycle, P2 —
       # MEASURED). The message was rebuilt from the captured TOKENS (`"${_elhs}..${_erhs}"`), and the
@@ -3496,7 +3529,7 @@ $m"
     # MEASURED): the two-endpoint arm reads `[[:space:]]*` on both sides of its dots while this arm
     # required them to ABUT the operand, so `HEAD ..` — `HEAD..HEAD`, nought commits — matched no arm at
     # all and minted a signed `clean`. One grammar for every reader of the same operator.
-    while [[ "$_opends" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})(${_dident}*)[[:space:]]*\.\.([^0-9A-Za-z_.]|$) ]]; do
+    while [[ "$_opends" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})(${_dident}*)[^0-9A-Za-z_.~^@{}]*\.\.([^0-9A-Za-z_.]|$) ]]; do
       _olhs="${BASH_REMATCH[$_g_op1]}${BASH_REMATCH[$_g_dident1]}"
       # ⛔ THE DOTS MUST NOT SIT BETWEEN TWO OPERANDS (thirtieth review cycle, round 2 — MEASURED, a
       # FALSE BLOCK this round's separator tolerance introduced). `HEAD .. <other>` is a TWO-endpoint
@@ -3624,7 +3657,10 @@ $m"
       # (MEASURED, `afterhead ..` is rc 3), and a non-empty `X..HEAD` is not this arm's population.
       # DECLARED REMAINDER, symmetric with the mirror's: a range with BOTH ends written where the left
       # end is an INTERIOR ancestor (`<midref>..HEAD` — a strictly narrower claim) is not refused by
-      # either arm; only EMPTY ranges and tip-relative narrowings are, and a "narrower" test here would
+      # either arm — and NEITHER is an empty range between two interior refs (`anc..anc`, `anc..deltabase`,
+      # MEASURED: both mint; round 13 corrected this sentence, which said the opposite). Only ranges whose
+      # LEFT END IS THE ATTESTED HEAD and tip-relative narrowings are refused here, and a "narrower" test
+      # would
       # have to refuse the legitimate `<base>~1..HEAD` population the tip arm deliberately accepts.
       # ⛔ A WRITTEN-BUT-UNRESOLVABLE WORD READS AS AN OMISSION HERE, AND THAT IS A DECLARED COST, NOT A
       # FIX (round 10 — MEASURED, and the fix measured WORSE). `HEAD .. zzz` (a typo'd ref the author DID
@@ -3701,7 +3737,7 @@ $m"
       _omword="${_ompre##*[[:space:]]}"
       if [ -n "$_omword" ]; then
         _omw="$(_tipvariant "$_omword")"
-        _omwsha="$(delta_git "$root" rev-parse --verify "${_omw}^{commit}" 2>/dev/null || true)"
+        _omwsha="$(_attres "$_omw")"
         if [ -z "$_omwsha" ]; then
           # ⛔ TRAILING IS NOT ENOUGH: AN INLINE-CODE FENCE IS LEADING (thirtieth review cycle, round 6 —
           # MEASURED). `` `<BASE>` `` puts the decoration at BOTH ends, so a trim that only removes the
@@ -3721,7 +3757,7 @@ $m"
           _omdec="${_omdec%"${_omdec##*[$_omkeep]}"}"
           if [ -n "$_omdec" ] && [ "$_omdec" != "$_omw" ]; then
             _omdec="$(_tipvariant "$_omdec")"
-            _omdsha="$(delta_git "$root" rev-parse --verify "${_omdec}^{commit}" 2>/dev/null || true)"
+            _omdsha="$(_attres "$_omdec")"
             if [ -n "$_omdsha" ]; then _omw="$_omdec"; _omwsha="$_omdsha"; fi
           fi
         fi

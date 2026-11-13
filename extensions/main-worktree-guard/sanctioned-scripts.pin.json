@@ -5,7 +5,7 @@
     "scripts/check-pipeline-compliance.sh": "a95d557c8ab1941bb1b5d4234367efdd83cff13eb474a841d987a5ee3164fd62",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
-    "scripts/record-review.sh": "9c379733c1a2700867c567169478ff541eb3bee33106c27157d4b02c200796a0",
+    "scripts/record-review.sh": "551add8086676f6ab6e80794478e2973e9eda771bcaee168b6720d6f59387a84",
     "scripts/admin-merge.sh": "b6049b6c669416e59c20af0c0e2bef9d6c1626d18dabb1391e40637e34e5ac9a",
     "scripts/gh-shim/gh": "e1505380fd89eed4340ea393898ef5bf7b94d4bf1eba34bd3e323b3684d775e9"
   },
@@ -20,7 +20,7 @@
     "scripts/ci_exemption.py": "ec1090e60a6841ef83171e2f1485bd82f41814a29c077c7612e9e6d9d847ac07",
     "scripts/gh-shim/gh": "e1505380fd89eed4340ea393898ef5bf7b94d4bf1eba34bd3e323b3684d775e9",
     "scripts/lib/diff-normalize.py": "b62b90d6588dfee446a7034f415c13d0e9a4a366222144db0b89922988febe7c",
-    "scripts/record-review.sh": "9c379733c1a2700867c567169478ff541eb3bee33106c27157d4b02c200796a0",
+    "scripts/record-review.sh": "551add8086676f6ab6e80794478e2973e9eda771bcaee168b6720d6f59387a84",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/verify-admin-merge-evidence.sh": "cc32da5d99e2a02939d2c4fdf73c1c96c8dd1cc59d447bff13e75ad31d0f5f53"
   }
