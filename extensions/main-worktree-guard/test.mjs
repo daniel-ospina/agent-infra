@@ -1142,7 +1142,7 @@ wcdt("command-substitution OPENER keeps the flag and target", "block:push", "git
 wcdt("substitution in an option VALUE keeps the flag and target", "block:push", "git push -o $(date) origin -d b", ["b"]);
 wcdt("BACKTICK substitution opener keeps the flag and target", "block:push", "git push origin `date` -d b", ["$(…)", "b"]);
 // ⛔ NO fd-dup ROW HERE (fresh-context review round 2, finding 2). `segRe`'s capture is `[^;&|]*`, so
-// it stops at the `&` inside `>&2` / `2>&1`: those tokens can NEVER reach `_redirectTakesOperand`, and
+// it stops at the `&` inside `>&2` / `2>&1`: those tokens can NEVER reach the redirect handler, and
 // with the target placed BEFORE the redirect the row could not redden under any mutation (observed 0/13).
 // The unreachable `&>`/`&>>`/fd-dup branches were dropped from the helper for the same reason.
 // Nor a "redirect after the target" row (round 3, finding 3): the target precedes the redirect there, so

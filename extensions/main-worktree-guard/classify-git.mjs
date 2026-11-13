@@ -4803,9 +4803,11 @@ export function unresolvableDeleteTargets(targets) {
  * Collapse BACKTICK command substitutions in a segment body to an opaque word.
  *
  * An unquoted backtick is a substitution delimiter, but `_tokenize` keeps it inside the word, so
- * the extractor used to report the phantom target `b`+backtick (`echo `git push origin -d b``): no
- * ref by that name is ever checked out, `_coordinatedDeleteBlock` finds nothing, and the #73 hazard
- * is allowed. Pre-existing on origin/main (measured), closed here.
+ * the extractor used to report the phantom target `b`+backtick (`echo `git push origin -d b``). That
+ * phantom names no ref, so the #73 lookup found nothing. ⛔ IT WAS NEVER AN ALLOW ON THE REBASED BASE —
+ * `DELETE_TARGET_UNRESOLVABLE_RE` includes the backtick, so #653 already refused it (on the fragment),
+ * and an earlier revision of this comment claimed otherwise. What this change buys is the REAL target
+ * `b` instead of a fragment: the #73 lookup now runs on a name that exists (#504 round-8 review, P3).
  *
  * ⛔ AN OPENER IS NOT A TERMINATOR (fresh-context review round 2, P2). A first attempt truncated at
  * the first unquoted backtick, which is only right for a CLOSER. `git push `date` origin -d
@@ -4845,7 +4847,7 @@ function _foldBacktickSubstitutions(body) {
     if (close === undefined) {
       // ⛔ AN UNPAIRED BACKTICK IS A TRUNCATED SPAN, NOT SILENCE (round-7 review, P0). This dropped
       // everything from the opener onward, so a substitution whose body contains `;`/`&`/`|` — which
-      // `segRe`'s `[^;&|]*` capture cuts BEFORE the closer — lost the delete flag AND its target with no
+      // `segRe`'s `([^;&|\n]*)` capture cuts BEFORE the closer — lost the delete flag AND its target with no
       // refusable token left behind: `git push origin -d `echo a && echo b`` extracted `null` and the #73
       // arm was never consulted. `origin/main` REFUSED that shape (its tokenizer left the fragment
       // `` `echo ``), so dropping it was a regression, the same one finding 1 measured for the paren
@@ -4875,6 +4877,101 @@ function _foldBacktickSubstitutions(body) {
  *  placeholder as a target would put a phantom into `_coordinatedDeleteBlock` (the pre-existing base
  *  behaviour reported `["$(echo"]`, equally phantom). */
 const _SUBST_PLACEHOLDER = "\u0000SUBST";
+
+/** Sentinel for a NEWLINE that is DATA, not a list separator (`_maskQuotedNewlines`).
+ *
+ * ⛔ A NEWLINE ENDS A COMMAND ONLY WHEN IT IS UNQUOTED AND OUTSIDE ANY SPAN (round-8 review, P0). The
+ * capture below stops at `\n`, which is right for the round-7 shape (`git push x⏎( git push origin -d
+ * b )`) — but bash does NOT end a command at a newline inside `"…"`, `'…'`, `$( … )`, backticks or
+ * `${ … }`; there it is ordinary DATA. Cutting the capture there loses the `-d` and its real target:
+ *
+ *   git push origin -o "a<LF>b" -d held/branch          origin/main → LOOKUP [b, held/branch]
+ *   git push origin -o $(echo a<LF>) -d held/branch      this branch → ALLOW (null)
+ *
+ * `-o merge_request.description="line1<LF>line2"`-style push options are ordinary usage, and the
+ * module's OWN parser agrees: `classifyGitCommandDetailed(...).verbArgs` returns
+ * `["origin","-o","a\nb","-d","held/branch"]` on BOTH trees — only this capture disagreed. So the
+ * newline is masked to one character before the scan and unmasked on the targets, which keeps every
+ * index relation (including `_maskDataParens`'s 1:1 sentinels) intact.
+ * ⛔ It cannot collide with `_SUBST_PLACEHOLDER` (`\u0000`) or `_QP_L`/`_QP_R` (`\u0001`/`\u0002`). */
+const _NL_DATA = "\u0003";
+
+/** Mask every newline that bash treats as DATA — inside `'…'`, `"…"`, `$( … )`, backticks or
+ * `${ … }` — and only those. A `\`-escaped newline is a LINE CONTINUATION and is already gone before
+ * this runs. Unbalanced state is handled the way bash's own parse would leave it: everything after an
+ * unterminated quote/span stays inside it, so no later newline is a separator.
+ * @param {string} text
+ * @returns {string}
+ */
+function _maskQuotedNewlines(text) {
+  const s = String(text ?? "");
+  const out = [];
+  let quote = null; // ' or "
+  let span = 0;     // depth of $( … ) / ${ … } opened outside quotes
+  let btick = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const push = (v) => out.push(v === "\n" && (quote !== null || span > 0 || btick) ? _NL_DATA : v);
+    if (quote !== null) {
+      if (ch === "\\" && quote === '"' && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
+      if (ch === quote) quote = null;
+      push(ch);
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; out.push(ch); continue; }
+    if (ch === "`") { btick = !btick; out.push(ch); continue; }
+    if (ch === "$" && s[i + 1] === "(") { span++; out.push("$("); i++; continue; }
+    if (ch === "$" && s[i + 1] === "{") { span++; out.push("${"); i++; continue; }
+    if (span > 0 && ch === "(") { span++; out.push(ch); continue; }
+    if (span > 0 && ch === ")") { span--; out.push(ch); continue; }
+    if (span > 0 && ch === "}") { span--; out.push(ch); continue; }
+    push(ch);
+  }
+  return out.join("");
+}
+
+/** Fold a bash ANSI-C string (`$'…'`) to ONE placeholder word.
+ *
+ * ⛔ `_tokenize` HAS NO ANSI-C QUOTING (round-8 review, P0), and this extractor's dependence on it is
+ * what makes its gap a #73 hole rather than a cosmetic one: `$'…'` is a QUOTED string to bash (nothing
+ * inside expands except its own escapes), but `_tokenize` opens a plain `'…'` at the `$`, where `\` is
+ * literal — so the `\'` inside `$'don\'t'` CLOSES the quote and the following `'` opens one that runs
+ * to the end of the segment, swallowing the delete:
+ *
+ *   git push -o $'don\'t' origin -d held/branch     origin/main → LOOKUP [held/branch]
+ *   git push -o $'don\'t' origin -d held/branch     this branch → ALLOW (null)
+ *
+ * `-o merge_request.title=$'don\'t merge'` reaches it. Folding the whole literal to the span placeholder
+ * keeps the POSITIONAL count faithful (it is one argv word) and makes a delete target in that slot
+ * unresolvable instead of silently swallowed — the same treatment every other expansion gets.
+ * @param {string} body
+ * @returns {string}
+ */
+function _foldAnsiCStrings(body) {
+  const s = String(body ?? "");
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote !== null) {
+      if (ch === "\\" && quote === '"' && i + 1 < s.length) { out += ch + s[i + 1]; i++; continue; }
+      if (ch === quote) quote = null;
+      out += ch;
+      continue;
+    }
+    if (ch === "$" && s[i + 1] === "'") {
+      let j = i + 2;
+      while (j < s.length && s[j] !== "'") { if (s[j] === "\\") j++; j++; }
+      out += _SUBST_PLACEHOLDER; // one word; `$'…'` contents are not the argv text
+      i = j < s.length ? j : s.length;
+      continue;
+    }
+    if (ch === "'" || ch === '"') quote = ch;
+    out += ch;
+  }
+  return out;
+}
 
 /** Sentinels for a parenthesis that is DATA — QUOTED, ESCAPED, or inside a `${ … }` parameter
  * expansion (`_maskDataParens`).
@@ -4967,20 +5064,6 @@ function _unmaskDataParens(tok) {
 }
 
 /**
- * Does this redirect operator CONSUME the next shell word as its operand?
- * `>`, `>>`, `<`, `<<` and their fd-prefixed forms take a filename. Only these are REACHABLE here:
- * `segRe`'s `[^;&|]*` capture stops at `&`, so the `&>`/`&>>` family and the fd-dup/fd-close forms
- * (`2>&1`, `>&2`, `2>&-`) can never reach this helper — they used to be listed with branches that
- * no input could exercise (fresh-context review round 2, finding 2: a row asserting them could not
- * redden under any mutation). The unreachable forms are dropped rather than pinned by a test.
- * @param {string} tok
- * @returns {boolean}
- */
-function _redirectTakesOperand(tok) {
-  return /^(?:[0-9]+)?(?:>>?|<<?)$/.test(tok);
-}
-
-/**
  * Tokenize ONE `git push` segment body, stopping where BASH ENDS THE COMMAND.
  *
  * #504 residual (parenthesized later segment). The segment body used to be `split(/\s+/)`, which
@@ -5033,7 +5116,9 @@ function _redirectTakesOperand(tok) {
  * @returns {string[]}
  */
 function _pushSegmentTokens(body) {
-  const toks = _tokenize(_foldBacktickSubstitutions(_maskDataParens(body)));
+  // ANSI-C strings are folded FIRST (see `_foldAnsiCStrings`) — `_tokenize` has no `$'…'` quoting, and
+  // leaving it to guess is what let a `\'` inside one swallow the rest of the segment.
+  const toks = _tokenize(_foldBacktickSubstitutions(_maskDataParens(_foldAnsiCStrings(body))));
   const tokens = [];
   let depth = 0; // parens OPENED inside this segment: their span is one WORD, not a boundary
   for (let i = 0; i < toks.length; i++) {
@@ -5060,7 +5145,18 @@ function _pushSegmentTokens(body) {
       // redirect's filename ate the span OPENER, depth stayed 0, and the span's `)` then terminated
       // the segment: `git push origin <(cat f) -d held/branch` returned null where origin/main
       // returned the target. Leave `(` alone and let the span rule above handle it.
-      if (_redirectTakesOperand(t) && toks[i + 1] !== "(") i++; // the filename is not an argv word
+      // The redirect's FILENAME is not an argv word, so it is skipped with its operator. ⛔ NO
+      // `_redirectTakesOperand` CONJUNCT HERE (round-8 review, P3) — it was a predicate whose FALSE arm
+      // could never fire on this body, so it is deleted rather than left as a branch no input reaches.
+      // The argument is structural, not a count of shapes: `_isRedirectOperator` accepts exactly two
+      // classes this branch cannot see, (a) the `&`-bearing forms (`&>`, `&>>`, `>&`, `2>&1`, `>&2`,
+      // `2>&-`, `<&1`, `>&-`) — every one contains `&`, which the segment capture excludes — and (b) the
+      // `>|` noclobber form, which contains `|`, also excluded. What survives both filters is
+      // `[N]{>,>>,<,<<}`: `_tokenize` splits the operator from its operand (`2>/dev/null` arrives as `2>`
+      // + `/dev/null`), so no attached-operand spelling reaches here either. Every surviving token is one
+      // `_redirectTakesOperand` ACCEPTS. Verified empirically on the survivor set: restoring the conjunct
+      // leaves test-653-delete-target (77 rows, every redirect shape in it) unchanged.
+      if (toks[i + 1] !== "(") i++;
       continue;
     }
     if (depth > 0) continue; // inside a substitution span — its words are not this command's argv
@@ -5136,7 +5232,7 @@ export function extractPushDeleteBranch(command) {
   // been cut at the newline, losing the delete entirely (extractor `["origin","\"]` → no flag → ALLOW)
   // where `origin/main` refused it. Replacing the pair with the EMPTY string is what the shell does
   // (nothing is inserted; the surrounding spaces do the word separation).
-  const c = String(command ?? "").trim().replace(/\\\r?\n/g, "");
+  const c = _maskQuotedNewlines(String(command ?? "").trim().replace(/\\\r?\n/g, ""));
   if (!/\bgit\s+push\b/.test(c)) return null;
   // Compound commands carry several `git push` segments (`a && git push … ;
   // git push …`) — detect deletes per segment, stopping at shell operators
@@ -5218,7 +5314,11 @@ export function extractPushDeleteBranch(command) {
   // Dedupe: `-d :old/x` is counted by the flag path AND the colon path for
   // the SAME refspec (git deletes it once). Distinct targets stay distinct.
   const uniq = [...new Set(out)];
-  return uniq.length > 0 ? uniq : null;
+  // Unmask the newlines that were DATA: they are part of the ref TEXT the shell would pass, so a target
+  // carrying one is reported as written. It stays unresolvable to #653 only when it ALSO carries an
+  // expansion — a newline is legal inside a ref name, so this is not a silent widening either way.
+  const restored = uniq.map((t) => t.split(_NL_DATA).join("\n"));
+  return restored.length > 0 ? restored : null;
 }
 
 /**

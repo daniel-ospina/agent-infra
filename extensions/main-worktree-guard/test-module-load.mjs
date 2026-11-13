@@ -422,12 +422,15 @@ async function partB() {
       const d1 = await coord("d1", "git push origin HEAD:refs/heads/feat && git push origin --delete held/branch");
       // ⚠️ B73a is a WIRING PIN, not a discriminator (#3442 rule 3, round-3 review): it stays green on
       // origin/main too — it proves the loaded extension still routes the body-delete repro through the
-      // #73 arm, the same role B6b plays above. The DISCRIMINATING rows are B73b/c/d/g (base) and
-      // B73e/f/h/i (intermediate revisions this PR itself shipped).
+      // #73 arm, the same role B6b plays above. ⛔ B73b IS A CONTROL TOO (round-8 review, P2): measured
+      // GREEN on `origin/main` at `319c82526` — base blocks it through a different seam (the `--delete`
+      // spelling resolves to a clean target via `pushMutations`), so the parenthesis is not what base
+      // failed at, and it stays green under a full revert of the segment helper. The discriminating rows
+      // are B73c/B73d/B73g/B73k-b (base) and B73e/f/h/i (intermediate revisions this PR itself shipped).
       expectTrue("B73a: later-segment `--delete` of a sibling-held branch is BLOCKED by the #73 arm (#504; wiring pin, not a discriminator)",
         isCoordBlock(d1, "held/branch"), `handler returned ${JSON.stringify(d1)?.slice(0, 200)}`);
       const d2 = await coord("d2", "git push origin HEAD:refs/heads/feat && (git push origin --delete held/branch)");
-      expectTrue("B73b: the PARENTHESIZED later segment is BLOCKED too (#504 residual; the target is not `held/branch)`)",
+      expectTrue("B73b: the PARENTHESIZED later segment is BLOCKED too (#504 residual; CONTROL — base blocks it through the `--delete` seam, see above)",
         isCoordBlock(d2, "held/branch"), `handler returned ${JSON.stringify(d2)?.slice(0, 200)}`);
       const d3 = await coord("d3", "git push origin HEAD:refs/heads/feat && (git push origin -d held/branch)");
       expectTrue("B73c: the parenthesized `-d` twin is BLOCKED (whole-command arm, no frozen legacy evidence)",
