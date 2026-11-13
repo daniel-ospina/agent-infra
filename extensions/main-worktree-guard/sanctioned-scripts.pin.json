@@ -17,7 +17,7 @@
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
     "scripts/ci-failure-set.sh": "97072b9fb111030dfec0e45416892bb68ae70428755aa21fc757f86b7a54adfb",
     "scripts/ci-workflow-pr-evaluable.sh": "9db2703be4442e2cd11ccb983d5312cb62934e9cbfd51d20e7fd6fb5c0430bb3",
-    "scripts/ci_exemption.py": "ec1090e60a6841ef83171e2f1485bd82f41814a29c077c7612e9e6d9d847ac07",
+    "scripts/ci_exemption.py": "b0fdd26b97dc4d2c820869c670e5e48b4eae7a185199da353abfca772bb0cc68",
     "scripts/gh-shim/gh": "e1505380fd89eed4340ea393898ef5bf7b94d4bf1eba34bd3e323b3684d775e9",
     "scripts/lib/diff-normalize.py": "b62b90d6588dfee446a7034f415c13d0e9a4a366222144db0b89922988febe7c",
     "scripts/record-review.sh": "551add8086676f6ab6e80794478e2973e9eda771bcaee168b6720d6f59387a84",
