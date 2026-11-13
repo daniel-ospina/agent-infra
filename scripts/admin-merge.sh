@@ -769,7 +769,19 @@
 #                                        when ONESHOT is set (see below).
 #   ADMIN_MERGE_FIRST_CHECKS_ONESHOT     non-empty asks for "one observation, no
 #                                        waiting" WITHOUT touching the progress
-#                                        bounds. `ADMIN_MERGE_FIRST_CHECKS_WAIT=0`
+#                                        bounds. ⛔ IT IS HONOURED ONLY WHEN
+#                                        `ADMIN_MERGE_FIRST_CHECKS_WAIT` IS `0`:
+#                                        the seam ANDs the ask with the legacy
+#                                        window, because a non-zero window is the
+#                                        operator asking for a bounded wait, and a
+#                                        pass-through flag must not silently
+#                                        outrank it. With a non-zero window this
+#                                        knob is INERT — use the window knob, or
+#                                        `--any-workflow` to skip the lane.
+#                                        SHIPPED IN PRODUCTION: `atomic-land.sh
+#                                        --no-wait` carries it, which is why it is
+#                                        not listed under "tests only" below.
+#                                        `ADMIN_MERGE_FIRST_CHECKS_WAIT=0`
 #                                        alone cannot do that: the 0 seam is
 #                                        conditional on STALL/CEILING being unset,
 #                                        and CEILING is a TERM of the derived
@@ -6002,19 +6014,47 @@ block_on_first_checks() {
       say_err "   so nothing was compared, no evidence was posted and nothing was merged."
       say_err "   Next: check gh auth/--repo/network, then re-run the rail." ;;
     *)
-      # still-running, with the Jobs surface unreadable for the legacy window.
+      # ⛔ TWO DIFFERENT STATES SHARE THIS ARM, AND THEY MUST NOT SHARE A VERDICT
+      # (review round 3, P2). `still-running` with a READABLE Jobs surface (missing=0)
+      # means "the lane had not finished when this observation was taken";
+      # `unobservable` — or `still-running` whose Jobs never answered — means "slow and
+      # wedged could not be told apart". The old text asserted the SECOND for BOTH, so the
+      # ONE-SHOT path — which takes exactly one observation of a readable, still-pending
+      # surface — refused with "the Jobs API did not answer for 0s in total, 0s
+      # consecutively", a sentence that refutes itself, on the very flag (`--no-wait`)
+      # whose job is to make the rail readable. Same defect class as §0b's "nothing may
+      # claim a measurement the code did not take".
       say_err "admin-merge: ✗ BLOCK — the FIRST-CHECKS wait expired after ${FIRST_CHECKS_WAITED}s (window ${FIRST_CHECKS_WAIT}s) — no classification attempted."
       say_err "   waited for: the lane's runs on head $head to APPEAR and reach status=completed"
       say_err "   last observed: ${FIRST_CHECKS_OBSERVED:-nothing readable}"
-      say_err "   what was missing: the lane's checks were still queued/in progress when the window"
-      say_err "   closed, and their per-job/per-step PROGRESS could not be read (the Jobs API did not"
-      say_err "   answer for ${FIRST_CHECKS_MISSING}s in total, ${FIRST_CHECKS_MISSING_STREAK}s consecutively), so slow and wedged could not be told apart."
-      say_err "   A running job is not a failure, and this is NOT a stall claim: an unread instrument"
-      say_err "   is not a stalled run."
-      say_err "   An unfinished (or absent) lane yields an EMPTY failing set, which proves nothing,"
-      say_err "   so nothing was compared, no evidence was posted and nothing was merged."
-      say_err "   Next: re-run the rail once those checks complete (its progress signal is re-read then),"
-      say_err "   or raise ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)." ;;
+      if [ "${FIRST_CHECKS_MISSING:-0}" -gt 0 ]; then
+        say_err "   what was missing: the lane's checks were still queued/in progress when the window"
+        say_err "   closed, and their per-job/per-step PROGRESS could not be read (the Jobs API did not"
+        say_err "   answer for ${FIRST_CHECKS_MISSING}s in total, ${FIRST_CHECKS_MISSING_STREAK}s consecutively), so slow and wedged could not be told apart."
+        say_err "   A running job is not a failure, and this is NOT a stall claim: an unread instrument"
+        say_err "   is not a stalled run."
+        say_err "   Next: re-run the rail once those checks complete (its progress signal is re-read then),"
+        say_err "   or raise ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)."
+      else
+        # THE SURFACE WAS READ. Only the MEASUREMENT claim is branched — never the
+        # "not a stall" clarification, which is apt in both cases and is pinned by
+        # §39 (i)/(ii) and (P2-4). What was wrong before was the Jobs-API sentence below:
+        # with `missing=0` it printed "did not answer for 0s in total, 0s consecutively".
+        say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
+        say_err "   status=completed when this observation was taken. NOTHING was unreadable, so no"
+        say_err "   slow-vs-wedged claim is made here."
+        say_err "   A running job is not a failure, and this is NOT a stall claim."
+        say_err "   An unfinished (or absent) lane yields an EMPTY failing set, which proves nothing,"
+        say_err "   so nothing was compared, no evidence was posted and nothing was merged."
+        if [ -n "${ADMIN_MERGE_FIRST_CHECKS_ONESHOT:-}" ]; then
+          say_err "   why only ONE observation: ADMIN_MERGE_FIRST_CHECKS_ONESHOT is set (atomic-land"
+          say_err "   --no-wait carries it), so this wait was asked NOT to wait."
+          say_err "   Next: re-run WITHOUT --no-wait once those checks complete."
+        else
+          say_err "   Next: re-run the rail once those checks complete (its progress signal is re-read then),"
+          say_err "   or raise ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)."
+        fi
+      fi ;;
   esac
 }
 

@@ -407,6 +407,25 @@ ck "(B6) the ONESHOT seam is carried on the DEFAULT path too, not only when a bo
 ck "(B6) and nothing is carried without --no-wait (no ONESHOT on the B2 path)" \
    "$([ "$(sawk "$(land_err 0 '')" ONESHOT)" = '<unset>' ] && echo 0 || echo 1)"
 
+# ── (B7) an explicit WAIT=0 is the SAME instruction as --no-wait, not an override ──
+# The carry used to be gated on WAIT being UNSET, so `ADMIN_MERGE_FIRST_CHECKS_WAIT=0`
+# in the environment made `--no-wait` a SILENT no-op: no ONESHOT, no log line — and with
+# an inherited STALL/CEILING the rail kept a LIVE bounded wait (8760s / 18064s) for a
+# caller who had declined to wait TWICE. B3 (an explicit 600) still wins; 0 is the same
+# intent expressed a second way, so the carry must proceed.
+echo "(B7) --no-wait with an explicit WAIT=0 still carries the ONESHOT seam (not a silent no-op)"
+E="$(land_err 1 0 0 0 600 1200)"
+ck "(B7) the 0 window is preserved (saw '$(saw "$E")')" \
+   "$([ "$(saw "$E")" = 0 ] && echo 0 || echo 1)"
+ck "(B7) the ONESHOT seam IS carried — WAIT=0 does not suppress the flag's carry (saw '$(sawk "$E" ONESHOT)')" \
+   "$([ "$(sawk "$E" ONESHOT)" = 1 ] && echo 0 || echo 1)"
+ck "(B7) the inherited bounds stay untouched (STALL='$(sawk "$E" STALL)', CEILING='$(sawk "$E" CEILING)')" \
+   "$([ "$(sawk "$E" STALL)" = 600 ] && [ "$(sawk "$E" CEILING)" = 1200 ] && echo 0 || echo 1)"
+ck "(B7) and the carry is still SAID OUT LOUD (an ignored flag must never be silent)" \
+   "$(grep -q 'ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1' <<<"$E" && echo 0 || echo 1)"
+ck "(B7) but an explicit NON-ZERO window still wins, carrying nothing (B3 unchanged)" \
+   "$([ "$(sawk "$(land_err 1 600)" ONESHOT)" = '<unset>' ] && echo 0 || echo 1)"
+
 echo
 printf 'issue #2465 inert wait: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

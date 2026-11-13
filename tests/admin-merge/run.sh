@@ -16977,6 +16977,8 @@ set +e
 # caller with CEILING=600 and LOCK_TTL=6000 lands fine (the bound is 3990s), and emptying
 # CEILING raises the bound to 21454s so the SAME invocation is refused with exit 2.
 # Both arms below drive the identical scenario; only ONESHOT differs.
+# (g1)/(g2) drive the identical scenario and differ only in ONESHOT; (g3)/(g4) pin the
+# two documented NON-seam configurations instead.
 echo "== 79 (g). #2465 the ONE-SHOT seam disables the wait while the progress bounds stay SET =="
 new_scen fq-oneshot
 HEAD_OS="f7fb000000000000000000000000000000000000"
@@ -17032,6 +17034,19 @@ SUITE_FIRST_CHECKS_WAIT=0 SUITE_FIRST_CHECKS_CEILING=2 SUITE_FIRST_CHECKS_STALL=
 grep -q 'STALLED' "$SCEN/err" \
   && pass "(g3) an explicit STALL with NO seam still re-enables the wait — the documented path is untouched" \
   || fail "(g3) the explicit-bound path no longer waits — the new seam changed pre-existing behaviour"
+# (g4) THE SEAM IS HONOURED ONLY WITH A ZERO WINDOW. A non-zero
+# ADMIN_MERGE_FIRST_CHECKS_WAIT is the operator asking for a bounded wait, so ONESHOT must
+# NOT silently outrank it — and the documented bullet says so. Pin BOTH halves, or a future
+# change could make the knob authoritative (or fatal) with nothing to catch it: an
+# unexercised conjunction is an accidental behaviour, not a specified one.
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9821"
+SUITE_FIRST_CHECKS_WAIT=2 SUITE_FIRST_CHECKS_ONESHOT=1 SUITE_FIRST_CHECKS_POLL=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+grep -q 'FIRST-CHECKS wait expired after' "$SCEN/err" \
+  && pass "(g4) ONESHOT with a NON-ZERO window is INERT (the bounded wait still runs) — the knob does not outrank an explicit window" \
+  || fail "(g4) ONESHOT overrode an explicit non-zero window — the documented conjunction is not what the code does"
+# …and the zero-window half of the conjunction is (g2): WAIT=0 + bounds + ONESHOT takes one
+# observation. Pinning it again here would only duplicate (g2), so it is not re-run.
 
 
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
