@@ -259,16 +259,33 @@ _HOLD_CUE = re.compile(
     r"\b(?:awaiting your|awaiting a|awaiting approval|awaiting instruction|awaiting a steer|"
     r"waiting (?:on|for) your|wait(?:ing)? for your|pending your|blocked on your|"
     r"please (?:confirm|approve|sign)|sign off|hold here until|hold(?:ing)? (?:the|this|it)|"
-    r"for your (?:word|steer|go-ahead|nod|call on)|(?:stays|stayed|is) parked|parked pending)\b")
+    # ⛔ `need your` is here so a FUTURE dependency after a past-decision frame still defers — "Per your
+    # decision I will need your approval before landing it." read `not-asked` without it (round 12,
+    # #4046 P2). ⛔ `is/stays parked` was REMOVED: it made "Per your decision last week the release is
+    # parked." — a plain report — read `asked`, and `pending your` already covers the deferral it was
+    # added for.
+    r"for your (?:word|steer|go-ahead|nod|call on)|need(?:s)? your)\b")
 # An IMPERATIVE to the owner: everything after it is the thing being asked about.
+# ⛔ THE VERB AFTER "PLEASE" IS THE SIGNAL, NOT "PLEASE" (round 12, #4046 P1). A bare `please`
+# admitted nothing as an ask (so "Please review the vendor invoice." read `not-asked` ->
+# `send-continue`) while it was strong enough to defeat a denial, which turned every report opening
+# with an imperative of ATTENTION into an ask ("Please note the deploy finished at 14:02 and nothing
+# needs your input now."). One list of request verbs is used by BOTH paths: it admits a clause, and a
+# denial that follows one is the ask's object.
 _IMPERATIVE = re.compile(
-    r"\b(?:please\b|tell me (?:if|whether|when)|let me know (?:if|whether|when)|"
-    r"confirm (?:that|whether)|check (?:that|whether))\b")
+    r"\b(?:please (?:confirm|approve|sign|review|check|advise|tell|decide|choose|pick|look|"
+    r"land|merge|ship|say|rule|steer|ok|okay)|tell me (?:if|whether|when)|"
+    r"let me know (?:if|whether|when)|confirm (?:that|whether)|check (?:that|whether))\b")
 # A state the clause REPORTS rather than one it ends on — used to keep a past-tense dependency
 # ("…had been blocked on your approval since Tuesday") out of the ask's way.
-_PAST_STATE = re.compile(
-    r"\b(?:had been|has been|was|were|since|cleared|ended|resolved|last (?:night|week|month)|"
-    r"yesterday|all morning|for a day)\b")
+# ⛔ IT TESTS THE PREDICATE'S OWN TENSE, NOT A BAG OF WORDS (round 12, #4046 P1). The first version
+# matched `has been|since|yesterday|all morning|for a day` ANYWHERE between the completion and the
+# dependency — but those mark when a block STARTED, i.e. evidence it is still running: "…the release
+# HAS BEEN blocked on your approval since Tuesday." is a live block, and it read `not-asked` ->
+# `send-continue` into a lane waiting on its owner. `was` also matched an unrelated subordinate clause
+# ("I was told the merge is blocked"). Only the auxiliaries immediately before the predicate make it a
+# report of a finished state.
+_PAST_STATE = re.compile(r"\b(?:had|was|were)\s+(?:been\s+|all\s+)?$")
 # A dependency PREDICATE — the owner is what the clause ends on.
 _DEPENDENCY = re.compile(
     # ⛔ NOT `pending your` (round 10): it is the MODIFIER form — "Landed it pending your approval from
@@ -404,12 +421,6 @@ _HANDOFF = (
     "your decision", "up to you", "need your", "need approval", "needs approval",
     "needs your approval", "once you decide", "once you approve", "if you approve",
     "once you've approved", "on your approval", "for your approval", "pending your approval",
-    # ⛔ `pending your word` (round 11, #4046 P1): the deferral form the round-10 fix missed while it
-    # carried "I'll wait for your go-ahead" — measured, "Per your decision last week, the release stays
-    # parked pending your word." read `not-asked` and routed `send-continue` into a lane waiting on its
-    # owner. The list had `pending your approval`/`pending your decision` and `on your word`, never the
-    # cross product.
-    "pending your word", "pending your go", "pending your sign", "pending your call on",
     "pending your decision", "please confirm", "please approve", "your confirmation",
     "your approval", "on your go",
     # ⛔ "sign off" (round 7, #4046 P0). "Please sign off on the invoice from last week." read
@@ -438,7 +449,20 @@ _HANDOFF = (
     "awaiting a steer", "tell me to proceed", "reply and i", "ping me", "your move",
     "needs your input", "before i go further", "pause here", "holding the deploy", "holding this",
     "on your word", "your steer", "your read on", "wait for your input",
-) + _HANDOFF_I18N
+) + _HANDOFF_I18N + (
+    # ⛔ THE CONSTRUCTION, NOT THE NOUNS (round 12, #4046 P1). Three rounds added one noun at a time
+    # ("pending your word", "pending your go", "pending your sign") and each round a fresh reviewer
+    # found the next noun: "pending your blessing", "waits for your OK". Enumerating a noun slot is a
+    # hole with a name. These are the deferral CONSTRUCTIONS, so the noun is whatever the lane wrote.
+    "pending your ", "awaiting your ", "waiting for your ", "wait for your ", "waits for your ",
+    "blocked on your ", "need your ", "needs your ", "for your blessing", "for your ok",
+    # ⛔ AND THE SPANISH SLICE IS THE SAME CONSTRUCTION (round 12, #4046 P1). The fleet's lanes write
+    # Spanish when the owner does, and the I18N list above carries only whole phrases: 4 of 4 invented
+    # Spanish declarative asks missed. A `?` would have caught them, which is exactly why the phrase
+    # path must not depend on the owner's punctuation.
+    "necesito tu ", "necesita tu ", "quedo pendiente", "pendiente de tu ", "a la espera de tu ",
+    "espero tu ", "esperando tu ", "espera tu ", "requiere tu ", "requiero tu ",
+)
 ASKED = "asked"
 NOT_ASKED = "not-asked"
 UNREAD = "unread"
@@ -543,6 +567,12 @@ def asks_owner(text: str) -> str:
                 continue
             at = [low.find(phrase) for phrase in _ASK_FRAME + _HANDOFF]
             at = [i for i in at if i >= 0]
+            # ⛔ A REQUEST TO THE OWNER ADMITS THE CLAUSE (round 12, #4046 P1): "Please review the vendor
+            # invoice." has no `_HANDOFF` phrase and no `?`, so it was never even a candidate while
+            # `please confirm …` (also an imperative) was. Same predicate as the denial carve-out.
+            imp = _IMPERATIVE.search(low)
+            if imp is not None:
+                at.append(imp.start())
             shaped = _HANDOFF_SHAPE.match(clause.strip().lower())
             if not at and not shaped:
                 continue

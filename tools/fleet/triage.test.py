@@ -728,6 +728,46 @@ def run_red_control() -> bool:
     good &= _red("R19b …and without the past-state gate that same report WOULD read as an ask",
                  blind_dep == "asked")
 
+    # (R20) ⛔ THE PANE WINDOW MUST GROW ON RETRY, AND THAT CLAIM HAS TO BE OBSERVABLE (round 12,
+    # #4046 P2). The suite's fake ignored `lines`, so reverting the doubling left the suite at its
+    # exact baseline — an artifact asserting a mechanism nothing pins. This fake RECORDS the window
+    # and paints only what a window that size would show, so a one-shot window cannot verify.
+    class WindowRecorder(FakeSurface):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.asked_for = []
+
+        def move_workspace(self, ws, index):
+            for sp in self.spaces:
+                if sp["id"] == ws:
+                    sp["index"] = index
+            return True
+
+        def send(self, ws, text):
+            self.last_sent[ws] = text
+            return True
+
+        def screen_tail(self, ws, lines=40):
+            self.asked_for.append(lines)
+            body = self.last_sent.get(ws) or ""
+            # one row per 60 chars, as a narrow pane wraps it
+            rows = [body[i:i + 60] for i in range(0, len(body), 60)]
+            return "\n".join(rows[-(lines // 60):]) if lines < len(rows) * 60 else "\n".join(rows)
+
+    wr = WindowRecorder(spaces=[{"id": "own", "name": "lane-7", "index": 1},
+                                {"id": "ws_q", "name": triage_arms.QUESTION_LANE, "index": 3}])
+    pw2 = triage_arms.arm_user_question("own", "lane-7", "Shall I merge the new thing?", wr,
+                                        nap=lambda _s: None)
+    ok("the pane read window GROWS across retries", len(set(wr.asked_for)) > 1, str(wr.asked_for))
+    first = wr.asked_for[0]
+    body = wr.last_sent.get("ws_q", "")
+    rows = [body[i:i + 60] for i in range(0, len(body), 60)]
+    first_pane = "\n".join(rows[-(first // 60):])
+    ok("…and the FIRST window alone could not have verified this payload",
+       bool(triage_arms.mandate_missing(
+           first_pane, triage_arms.question_qid("lane-7", "Shall I merge the new thing?"))),
+       "%d rows asked, %d rows in payload" % (first // 60, len(rows)))
+
     # (R12) ⛔ THE PER-QUESTION ID IS WHAT DEFEATS A STALE PANE (round 7, #4046 P0). The question
     # lane is persistent, so its tail still shows the PREVIOUS brief, and both briefs carry the same
     # mandate tokens. Mutant: drop the id and the stale pane certifies the new question.
@@ -1672,7 +1712,20 @@ def leg_round7() -> None:
     # frame followed by a deferral.
     # ⛔ ROUND 11 (regressions in the round-10 predicates, plus the deferral it missed). Every one of
     # these was measured through `may_continue()` — the predicate `turn-end.py` gates on.
-    for txt in ("Per your decision last week, the release stays parked pending your word.",
+    # ⛔ ROUND 12: the CONSTRUCTION, not the nouns (this corpus is written with nouns the list did not
+    # already carry), the Spanish slice, requests to the owner that carry no hand-off phrase, and the
+    # tense bug in `_PAST_STATE` (a block that is STILL RUNNING).
+    for txt in ("The schema is ready and pending your blessing.",
+                "The release waits for your OK.",
+                "Necesito tu aprobación para el deploy.",
+                "Quedo pendiente de tu aprobación.",
+                "Please review the vendor invoice.",
+                "Please look at the vendor invoice.",
+                "Per your decision I will need your approval before landing it.",
+                "Deploy finished at 14:02 and the release has been blocked on your approval since "
+                "Tuesday.",
+                "Checks passed at 14:02 and since then the release is blocked on your approval.",
+                "Per your decision last week, the release stays parked pending your word.",
                 "Per your decision last week the release stays parked pending your word.",
                 "Per your decision last week I'll wait for your go-ahead.",
                 "As you decided I'll wait for your word before landing it.",
@@ -1751,7 +1804,12 @@ def leg_round7() -> None:
                 "All 439 tests passed at 14:02 and the queue had been blocked on your approval all "
                 "morning.",
                 "Waiting on your approval held the release for a day and nothing needs your input now.",
-                "Awaiting approval blocked us for a day and nothing needs your input now."):
+                "Awaiting approval blocked us for a day and nothing needs your input now.",
+                "Please note the deploy finished at 14:02 and nothing needs your input now.",
+                "Please see the run log and nothing needs your input now.",
+                "Please find the diff attached and nothing needs your input now.",
+                "Please note nothing needs your input now.",
+                "Per your decision last week the release is parked."):
         e = ev(lane="lane-7", last_text=txt, lane_verdict="WIP-IDLE", steerable=True)
         may, r = triage.may_continue(e)
         ok("a completed report is not an ask: %r" % txt[:38], may is True,
