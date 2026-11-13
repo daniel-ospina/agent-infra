@@ -96,3 +96,80 @@ every PR that touches `scripts/` look red for a reason unrelated to it.
 - The constants take effect on the **next dispatch**; this lane's own bound was fixed at spawn, so nothing
   in this run could verify 36000 empirically end-to-end. The `cap=` field on the `launched` line is the
   field that reads it back.
+
+---
+
+# Fixer lane — review round 1 (4 findings) · 2026-11-13
+
+Worktree: `/home/cmux/agent-infra/.worktrees/4034-backstop` · branch `fix/4034-backstop-5x`
+Base for this round: `17391124f` (the reviewed head) → `408800115`/`197ae83c7`.
+`tools/worktree_report.py` / `scripts/worktree_report.py` still do not exist in this repository (see the
+top of this file); the counts below are hand-copied from the logs named in each row, all under
+`~/.pi/agent/state/lane-4034-fix/`.
+
+## The four findings → what changed
+
+| # | finding | files changed |
+|---|---|---|
+| 1 | `lane-registry.md:80` violated its own invariant I1 | `docs/ops/lane-registry.md:80` — `lease_until` `1762035400` → `1762036060` (= `heartbeat_at 1762000060` + `budget_s 36000`) |
+| 2 | the install-time `LANE_TIMEOUT` pin was invisible to `--status` | **option (b)**: `install-drainer-timer.sh` `say_status()` prints the installed `Environment=LANE_TIMEOUT` beside the value it would render now and exits **3** on a mismatch; 3 new arms in `ai-drainer.test.sh`; `docs/ops/ai-drainer.md` |
+| 3 | the prose sweep was incomplete | `README.md` ×7 sites (`:1722`, `:2266`+table, `:2978`, `:4444`, `:4519`, `:4549`, `:4688`), `ARCHITECTURE.md:184`, `heartbeat-progress-edges.ts:912`+`:718`, `orch-loop.sh:6513`, `ai-drainer.sh:100`+`:1580`, `claims.sh:276`, `lane-reap.test.sh:307`; same-class extras found by sweep: `lane-merge.sh:705`, `claim-orphan.test.sh:1161` |
+| 4 | `lane-bound.test.sh:318` re-implemented the lease derivation | `lane-bound.test.sh` — addend READ from `fix-one.sh:695`, arm fails when unreadable, and that result is folded into the arithmetic arm |
+
+## Suite results (verbatim commands, this tree, head `197ae83c7` before the report commit)
+
+| # | command | result | log |
+|---|---|---|---|
+| 1 | `bash scripts/orchestrator-harness/lane-bound.test.sh` | **78 passed, 0 failed** (was 77 — one new arm) | `~/.pi/agent/state/lane-4034-fix/…` (stdout, see below) |
+| 2 | `bash scripts/orchestrator-harness/lane-merge.test.sh` | **ALL 207 lane-merge checks passed** (run twice: after the prose sweep, and after `lane-merge.sh:705`) | `lane-merge.test.sh.log`, `lane-merge.test.sh.rerun.log` |
+| 3 | `bash scripts/orchestrator-harness/ai-drainer.test.sh` | **197 passed, 0 failed** (was 194 — three new `--status` arms) | `ai-drainer.test.sh.log` |
+| 4 | `bash scripts/orchestrator-harness/claim-orphan.test.sh` | **150 passed, 0 failed** | `claim-orphan.test.sh.log` |
+| 5 | `bash scripts/orchestrator-harness/branch-claim.test.sh` | **53 passed, 0 failed** | `branch-claim.test.sh.log` |
+| 6 | `bash scripts/orchestrator-harness/test-claims.sh` | **301 passed, 0 failed** (run 2; run 1 flaked, below) | `test-claims.sh.log`, `test-claims.sh.rerun.log` |
+| 7 | `bash scripts/orchestrator-harness/lane-reap.test.sh` | **233 passed, 0 failed** | `lane-reap.test.sh.log` |
+| 8 | `uv run --with pytest --with pytest-timeout python3.12 -m pytest scripts/test_pr_doctor.py scripts/test_lane_registry.py -x --timeout=60 -q` | **375 passed** | `pytest.log` |
+| 9 | `npx tsx extensions/shared/heartbeat-progress-edges.test.ts` | **33 passed, 0 failed** | stdout (registry notes edited; the value scan agrees) |
+| 10 | `bash -n` over every shell file changed in this round | **OK** | — |
+
+### Flake, stated rather than hidden
+
+Run 1 of `test-claims.sh` reported **300 passed, 1 failed** on its FIRST arm, before any fixture exists:
+
+```
+❌ I0: the foreign claim was minted (by a different pid) — expected /^[0-9a-f]\{40\}$/ in:
+```
+
+That arm mints a claim in a separate process against the shared origin and then reads it back with
+`git ls-remote`; the read-back came back empty once. An immediate solo re-run on the same tree is
+**301 passed, 0 failed** (`test-claims.sh.rerun.log`), matching the pre-review measurement in the PR body.
+The arm my change touches (`CLAIM_TTL_MAX` ordering / ceilings) passed in both runs. Not repaired here.
+
+## Proof that finding 4's arm can now fail (local mutation, reverted)
+
+`fix-one.sh:695` mutated, suite re-run, tree restored (`git status` clean, `git diff` empty for that file):
+
+| mutation | result |
+|---|---|
+| `FIX_BOUND + 1200` → `FIX_BOUND + 9000` | ❌ `(i0) the derived fix-one lease (LANE_BACKSTOP_S 36000 + 9000 = 45000s) sits UNDER CLAIM_TTL_MAX (43200s)` — 77 passed, 1 failed |
+| `FIX_BOUND + 1200` → `${FIX_BOUND} + 1200` (derivation unreadable) | ❌ both arms red — `addend is … UNREADABLE — the arm cannot assert a lease it cannot derive` — 76 passed, 2 failed |
+| restored | 78 passed, 0 failed |
+
+Before this change the first mutation left the arm GREEN (the hardcoded `+1200` never moved), which is the
+coverage gap the review named.
+
+## Residuals for this round, stated
+
+1. **Installed drainer units still carry the old pin until re-rendered.** Finding 2 was fixed on the
+   detection side (option b): `--status` now prints the installed `Environment=LANE_TIMEOUT` beside the
+   value the checkout would render and exits **3** on a mismatch. The per-cell re-install remains an
+   operator step — no cell was touched from this lane, and no `keys.env` was read or written.
+2. `CLAIM_ISSUE_TTL` vs a `GATE_POLL_SECS=60` box (49290 vs 48000) — unchanged, pre-existing, stated.
+3. `claim-reaper.sh`'s `CR_MIN_AGE` (10800) is a belt, not the longest lease — unchanged.
+4. The `lane-bound.test.sh` `(i1)` timing arm flakes under concurrent load (see the first report section);
+   neither new arm is a timing assertion.
+5. No MCP/SDK surface changed; no Tortoise graph read or written.
+
+## Not done here (by instruction)
+
+**No merge, no attestation.** The final head is pushed and left for the harness reviewer
+(`merge-one.sh` → `record-review.sh <PR> <HEAD> clean …` then `scripts/admin-merge.sh <PR>`).
