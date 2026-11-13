@@ -8442,7 +8442,25 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         continue;
       }
       const w = readWord(p);
-      if (!w.w) return { args: out, tildes, k: resumeAt !== null ? resumeAt : p };
+      // ⛔ AN EXPLICITLY EMPTY WORD IS STILL AN OPERAND (#3955 review round 9).
+      // `readWord` returns `""` both for "no word here" AND for a QUOTED EMPTY
+      // string, and treating the second as the first DROPPED the operand — which
+      // turned `pushd ""` into a BARE `pushd` (the one form that swaps the top
+      // two) while bash runs `pushd .`. MEASURED (bash 5.2.21), stack `[H, H/a]`
+      // cwd `H`: `pushd ""` ⇒ rc 0, dirs `H H H/a`, cwd `H` (a duplicate of the
+      // cwd inserted below the top, NO cd) — while a bare `pushd` really swaps to
+      // `H/a`. So the drop was a REGRESSION: `cd a; pushd ..; pushd ""` grades the
+      // TRACKED `H/tracked.md` write as `a/tracked.md` → ALLOW, where `origin/main`
+      // BLOCKed. The raw source character is the only place this survives
+      // (`readWord` has already stripped the quotes).
+      if (!w.w) {
+        if ((s[p] === '"' || s[p] === "'") && w.k > p) {
+          out.push(""); tildes.push(false); k = w.k;
+          if (out.length >= 64) return { args: out, tildes, k: resumeAt !== null ? resumeAt : k };
+          continue;
+        }
+        return { args: out, tildes, k: resumeAt !== null ? resumeAt : p };
+      }
       if (/^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<")) {   // `2>/dev/null` — an FD prefix
         if (resumeAt === null) resumeAt = p;
         const r = skipRedirect(w.k);
@@ -8504,15 +8522,33 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //  • `pushd -n $VAR +N`: same cwd, two stacks — see the note at the dir arm.
   const popdArgv = (args, fr) => {
     let nFlag = false, sel = null, sawDD = false, unprovable = false, invalid = false;
+    let emptySel = false;                         // an explicitly EMPTY operand
     for (const w of args) {
       if (sawDD) continue;                        // everything after `--` is ignored
       if (w === "--") { sawDD = true; continue; }
       if (w === "-n") { nFlag = true; continue; }
+      // ⛔ `popd ""` IS AN INDEX OPERAND, not an absent one and not "invalid"
+      // (#3955 review round 9). MEASURED (bash 5.2.21), stack `[a, docs, a]` cwd
+      // `a`: `popd ""` ⇒ rc 0, dirs `[a, docs]` — the LAST element removed and NO
+      // cd, i.e. exactly `popd -0`; likewise `popd -n ""`, `popd "" ""`, and
+      // `popd -- ""` after the marker is a plain bare popd. Reading it as the
+      // bare form instead cd'd to element 1 (`popd ""` on `[H, H/a]` really keeps
+      // the cwd at `H` and overwrites the TRACKED `H/tracked.md`).
+      // COMPOSITION RESIDUAL (declared, measured): an empty operand TOGETHER with
+      // a numeric one keeps the cwd unchanged in every measured row (`+0 ""`,
+      // `+1 ""`, `+2 ""`, `-0 ""`, `-1 ""`, `"" +0`, `"" +1`, `"" +2`,
+      // `"" -1` — all nine leave the cwd at `a`), but WHICH entry is removed is
+      // NOT a single rule (`+1 ""`/`+2 ""`/`-1 ""` remove element 1, the others
+      // remove the last). The empty operand therefore WINS as `-0` (correct cwd on
+      // all nine rows, correct element on six); the three divergent spellings can
+      // desynchronise the stack for a LATER form and are not modelled.
+      if (w === "") { emptySel = true; continue; }
       const m = /^([+-])([0-9]+)$/.exec(w);
       if (m) { sel = m; continue; }               // LAST numeric wins
       if (/^[$`]/.test(w)) { unprovable = true; continue; }
       invalid = true;
     }
+    if (emptySel) sel = ["-", "0"];              // `popd ""` ⇒ `-0`: drop the LAST entry, no cd
     if (invalid) return;                          // bash rc 2 — nothing changes
     const S = vstack(fr.cwd);
     const keep = fr.cwd;
@@ -8662,6 +8698,14 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       return null;
     }
     // mode === "dir"
+    // ⛔ AN EMPTY OPERAND IS `pushd .` (#3955 review round 9): bash's `cd ""` is a
+    // successful no-op, so `pushd ""` / `pushd ''` / `pushd -- ""` insert a
+    // DUPLICATE of the cwd below the top without moving — MEASURED (bash 5.2.21),
+    // stack `[H, H/a]` cwd `H`: dirs becomes `H H H/a`, cwd stays `H`, whereas a
+    // BARE `pushd` swaps to `H/a`. It is returned as the plain directory operand
+    // `""` and the SHARED cd path does the work: `resolve(cwd, "")` IS the cwd, so
+    // the stack gets the duplicate and the landing is the cwd — one cd
+    // implementation, exactly as `pushd .` behaves.
     // ⛔ DECLARED RESIDUAL — `pushd $VAR +N`. bash's answer depends on the VALUE:
     // an unquoted empty expansion is REMOVED, so bash runs `pushd +N` (a rotation
     // WITH its cd); a non-empty one is a second argument ("too many arguments",
@@ -8686,7 +8730,15 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       const tilde = dirWord && dirTilde && home
         ? (dirWord === "~" ? home : resolve(home, dirWord.slice(1).replace(/^\/+/, "")))   // `~//x` too
         : undefined;
-      const ins = dirWord && dirWord !== "-" && !/^[$`]/.test(dirWord)
+      // ⛔ `dirWord !== null`, NOT `dirWord &&` — an EMPTY operand still INSERTS
+      // (#3955 review round 9). MEASURED (bash 5.2.21), stack `[docs, a]` cwd
+      // `docs`: `pushd -n ""` ⇒ rc 0, dirs `docs '' a` — bash splices the operand
+      // STRING (empty) in at index 1, and because `cd ""` is a successful NO-OP
+      // the later `popd` consumes that entry and leaves the cwd where it was. The
+      // empty string is a RELATIVE operand, so it takes the RAWSTACK path and
+      // resolves at the consuming cd to whatever the cwd then is — which is what
+      // bash does.
+      const ins = dirWord !== null && dirWord !== "-" && !/^[$`]/.test(dirWord)
         ? (tilde !== undefined ? tilde
           : (isAbsolute(dirWord) ? dirWord : RAWSTACK + dirWord))   // RELATIVE ⇒ raw, resolved at the cd
         : null;
@@ -8706,13 +8758,25 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }
     // ⛔ AN UNQUOTED `$VAR`/BACKTICK OPERAND IS *REMOVED* WHEN EMPTY, so bash runs
     // a BARE `pushd` (swap the top two, cd to the new top) — a bare `pushd` on a
-    // 1-deep stack is "no other directory" (rc 1, nothing changes). The expansion
-    // may also be a real directory this walker cannot read. BOTH realities are
-    // emitted, exactly as the `popd` arm above does it: the swap landing as the
-    // primary cwd and the unchanged cwd as the alt. The old no-cd/no-push model
-    // was a measured fail-open on any stack deeper than one —
+    // 1-deep stack is "no other directory" (rc 1, nothing changes). BOTH of the
+    // cwds that depend on the EXPANSION-BEING-EMPTY fact are emitted, exactly as
+    // the `popd` arm above does it: the swap landing as the primary cwd and the
+    // unchanged cwd as the alt. The old no-cd/no-push model was a measured
+    // fail-open on any stack deeper than one —
     //   `cd a; pushd ../docs; pushd $NOPE; echo x > tracked.md`
     //   bash cwd=docs (wrote docs/tracked.md), the no-op model read a/tracked.md.
+    // ⛔ DECLARED RESIDUAL, and NOT the superset this comment used to claim: when
+    // the expansion is a REAL DIRECTORY, bash cds to it, and that landing is NOT
+    // emitted (the two alts above are the empty-expansion reality and the
+    // unchanged one). MEASURED (bash 5.2.21): `cd docs; E=..; pushd $E` ⇒ cwd `H`,
+    // so `… pushd $E; echo x > tracked.md` overwrites the TRACKED `H/tracked.md`
+    // while this arm resolves `docs/tracked.md` → ALLOW. That is NOT introduced
+    // here: the PLAIN `cd $VAR` arm has the identical hole on this head and on
+    // `origin/main` (measured: `cd docs; E=..; cd $E; echo x > tracked.md` also
+    // resolves `docs/tracked.md`), so closing it needs a walker-wide "unknown cwd"
+    // reality — its own change, filed separately. `popd $VAR` and the
+    // bare-`pushd`-on-empty-expansion arm ARE supersets (their one landing is the
+    // unchanged cwd, which is emitted).
     if (dirWord && /^[$`]/.test(dirWord)) {
       const S = vstack(fr.cwd);
       const keep = fr.cwd;
@@ -9921,7 +9985,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // fail-OPEN of the #437/#3955 shape, and the arm `origin/main` graded
       // right only by accident (it no-opped the whole form) (#3955 review 1).
       let next = null;
-      if (tgt.w && tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
+      // ⛔ `!== ""` is deliberately ALLOWED THROUGH: an explicitly empty operand
+      // is `cd ""` (a successful no-op for `cd`, and `pushd .` for `pushd`) — the
+      // shared path below resolves it to the cwd, so a `pushd ""` still records
+      // the duplicate entry its bare-`pushd` sibling must not lose (#3955 round 9).
+      if (tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
         const cand = resolve(cwd, tgt.w);
         if (existsSync(cand)) next = cand;                  // failed cd — unchanged
       }

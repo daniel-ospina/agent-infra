@@ -5756,6 +5756,41 @@ try {
     // `~` is expanded only when its PREFIX (up to the first UNQUOTED `/`) is unquoted.
     has(`cd a; pushd ~"/docs"; echo x > tracked.md`, "redirect:H/a/tracked.md", "R8a: `~\"/docs\"` — the separator is QUOTED, so the tilde is literal and pushd fails");
     blocks(["a/tracked.md"], `cd a; pushd ~"/docs"; echo x > tracked.md`, "R8a gate: TRACKED a/tracked.md → BLOCK (expanding it moved the write to $HOME/docs → ALLOW)");
+    // ── #3955 review ROUND 9: an EXPLICITLY EMPTY operand (`""` / `''`).
+    // `readOperandWords` treated the empty de-quoted word as "no word here", which
+    // DROPPED the operand and collapsed every one of these forms onto a different
+    // bash form — `pushd ""` became a BARE `pushd` (the swap), `popd ""` became a
+    // BARE `popd` (the cd to element 1), and `pushd "" ../b` lost its "too many
+    // arguments" error. MEASURED (bash 5.2.21), and each row below is graded by
+    // the tracked file real bash overwrites. ⛔ The E1 family is a REGRESSION this
+    // head introduced (origin/main BLOCKed it): the bare-`pushd` collapse moved the
+    // write from the TRACKED hub root to `a/` → ALLOW.
+    has("cd a; pushd ..; pushd \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E1: `pushd \"\"` is `pushd .` — bash inserts a duplicate of the cwd and does NOT swap");
+    blocks(["tracked.md"], "cd a; pushd ..; pushd \"\"; echo x > tracked.md", "E1 gate: TRACKED H/tracked.md → BLOCK (reading the empty word as ABSENT runs a bare pushd → a → ALLOW)");
+    allows(["a/tracked.md"], "cd a; pushd ..; pushd \"\"; echo x > tracked.md", "E1 anti-narrowing: …so the a resolution must NOT be graded either (no swap happened)");
+    has("cd a; pushd ..; pushd ''; echo x > tracked.md", "redirect:H/tracked.md", "E1b: single-quoted empty is the same word (bash: `cd \"\"` is a successful no-op)");
+    has("cd a; pushd ..; pushd -- \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E1c: the `--` marker does not change it — after it the empty word is still a LITERAL directory operand");
+    has("cd a; pushd ..; pushd ../b; pushd \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E1d: the empty operand INSERTS on a 3-entry stack too — the cwd stays at the hub root");
+    has("cd a; pushd ..; pushd \"\" ../b; echo x > tracked.md", "redirect:H/tracked.md", "E2: `pushd \"\" ../b` is still 'too many arguments' — bash changes NOTHING (cwd stays the hub root)");
+    blocks(["tracked.md"], "cd a; pushd ..; pushd \"\" ../b; echo x > tracked.md", "E2 gate: TRACKED H/tracked.md → BLOCK (dropping the empty word left ONE operand, so the model cd'd to b → ALLOW)");
+    // ⛔ A PIN, NOT A DISCRIMINATOR: this row already passed on the pre-fix head
+    // (the dropped word left the main walker on the `""` token, which it read as an
+    // empty command word — landing on the hub root by accident). It is kept so the
+    // rule stays pinned from the other side, and it is NOT counted as non-vacuity.
+    has("cd a; pushd ..; pushd ../b \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E2b (pin): the empty word LAST is still 'too many arguments' — cwd stays the hub root");
+    has("cd a; pushd ..; popd \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E3: `popd \"\"` is an INDEX operand equal to `-0` — the LAST entry is dropped with NO cd, so the cwd stays at the hub root");
+    blocks(["tracked.md"], "cd a; pushd ..; popd \"\"; echo x > tracked.md", "E3 gate: TRACKED H/tracked.md → BLOCK (reading it as the bare form cd'd to a → ALLOW)");
+    has("cd a; pushd ..; popd -n \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E3b: `popd -n \"\"` drops the same entry (`-n` adds nothing: `\"\"` already never cds)");
+    // `pushd -n ""` splices the operand STRING (empty) in at index 1; `cd ""` is a
+    // successful no-op, so the consuming popd eats that entry and the cwd stays put.
+    has("cd a; pushd ../docs; pushd -n \"\"; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "E4: `pushd -n \"\"` inserts the EMPTY STRING (never stat'd) — the popd consumes it, cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd -n \"\"; popd; echo x > tracked.md", "E4 gate: TRACKED docs/tracked.md → BLOCK (never inserting skewed the stack by one, so the popd landed on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd -n ../b \"\"; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "E4 control: under `-n` a TRAILING empty word is ignored — the FIRST operand (../b) is what gets inserted");
+    // Positive controls: the empty word must not be confused with ABSENCE.
+    has("cd a; pushd ..; pushd; echo x > tracked.md", "redirect:H/a/tracked.md", "E5 control: a genuinely BARE `pushd` still SWAPS to a — the empty-operand fix must not eat it");
+    blocks(["a/tracked.md"], "cd a; pushd ..; pushd; echo x > tracked.md", "E5 control gate: TRACKED a/tracked.md → BLOCK (the swap resolution is real)");
+    has("cd a; pushd ..; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "E5 control: a genuinely BARE `popd` still cd's to element 1 (a)");
+    has("cd a; pushd ..; pushd \"\" \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E5 control: TWO empty words are still 'too many arguments' (the empty operand is a word, not a no-op)");
   }
 
 
