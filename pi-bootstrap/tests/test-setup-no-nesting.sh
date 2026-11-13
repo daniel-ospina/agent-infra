@@ -534,7 +534,7 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="orch-loop.sh:#2413"
 # `setup.sh` then delivers. That was the in-file "natural remedy for a false block is to widen the
 # exemption list, i.e. to weaken the gate" hazard firing for real. The branch now consults every flat
 # array `FARM_ARRAYS` names.
-LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174 ai_pr_status.py:#2413 cmux_dispatch.py:#1957"
+LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 lane-relaunch.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174 ai_pr_status.py:#2413 cmux_dispatch.py:#1957"
 # A ROOT of the derivation rather than a producer found by it: `heartbeat-loop.sh` is run by a launchd job
 # on the owner's box (no plist template in this repo names it; the label `com.tortoise.heartbeat-loop`
 # appears only in a comment at scripts/lane-status.py:41) and NO farmed consumer execs it (measured at
@@ -668,7 +668,8 @@ script:cloud-cell-supervisor.sh script:cmux_dispatch.py script:conflict-rebase-t
 script:conflict-rebase.py script:disk-reaper-run.sh script:disk-reaper.sh script:fleet-cost-report.sh
 script:fleet-schedule.py script:goal-state.py script:harness-apply-pass.sh script:heartbeat-loop.sh
 script:install-ci-runner-x64.sh script:install-controller-service.sh script:lane-actions.py
-script:lane-guard.py script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py
+script:lane-guard.py script:lane-relaunch.py script:lane-route.py script:lane-scan-fallback.sh
+script:lane-status.py script:lane-watchdog.py
 script:merge-queue.py script:objective.py script:orchestrator-heartbeat.sh script:pi-cache-reap.sh
 script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh script:pr-doctor-trigger.py
 script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py script:reap-lane-venvs.sh
