@@ -808,6 +808,13 @@ ck "10e: …and it says the script the live process started from is GONE" \
    "$(qF "NO readable shipped file" "$OUT" && echo 0 || echo 1)"
 ck "10e: …and the message NAMES the extensions it looked for (not a bare '*.sh')" \
    "$(qF "*.py" "$OUT" && echo 0 || echo 1)"
+# ⛔ AND THE REMEDY ROW, WHICH IS THE LINE AN OPERATOR ACTUALLY ACTS ON (review finding 2, PR #4038).
+# `DRIFT(exec)` was widened while the `(c) executing tree` remedy beneath it still said "NO readable
+# *.sh" — the same defect (a message naming fewer extensions than the check covers) one paragraph
+# down, in the row that tells the reader what to do about it. Pinned here so it cannot silently
+# regress to a single-suffix claim.
+ck "10e: …and the (c) REMEDY row names the same set, not a bare '*.sh'" \
+   "$(qF '(c) executing tree' "$OUT" && qF 'NO readable shipped file (*.sh, *.py, *.mjs)' "$OUT" && echo 0 || echo 1)"
 
 # (10f) THE ARGV SPELLINGS THE POSITIONAL READ DROPPED (review of #3202). `ps -eo command=` writes the
 # `/usr/bin/env` form for a wrapped controller, and the parse this replaces required the shell at `t[1]`
@@ -1099,6 +1106,60 @@ OUT="$( cd "$TMP" && HOME="$EMPTYHOME6" CELL_HOME="" HARNESS="$D11" HARNESS_PIN_
         bash "$DRIFT" --o "$TMP/no-such-deployed" --repo "$R11" --ref main \
              --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
 ck "12d: …and restoring the ref's .py returns rc 0 (the .py was the only difference)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+
+# 12e — THE DECLARATION DECIDES THE COMPARISON, PROVEN BEHAVIOURALLY (review finding 1, PR #4038).
+# ⛔ THE FALSE PASS THIS PINS, MEASURED ON THE FIRST VERSION OF THIS PR: `HARNESS_EXTS` was declared as
+# "the ONE place", but the three comparisons read a HAND-WRITTEN `HARNESS_EXT_RE='sh|py|mjs'` beside it
+# while only the human-readable message was derived from the declaration. Adding `ts` to the one line
+# the file points at would have widened the MESSAGES and left the comparison at three extensions — the
+# check would state it looked for a set it did not look for, and pass. That is #4015's own defect one
+# level down, so it is graded by BEHAVIOUR rather than by reading the constants: patch ONE line of a
+# copy of the script to declare a fourth extension the fixture actually ships, and require the stale
+# file of that kind to be caught. On the diverged text this arm is rc 0 (the `.ts` is never compared) —
+# i.e. the arm discriminates the defect, not merely the presence of the constants.
+R12="$TMPR/repo12"; D12="$TMPR/run12"
+git init -q -b main "$R12" >/dev/null 2>&1 || { echo "❌ git init failed for fixture12"; exit 2; }
+mkdir -p "$R12/scripts/orchestrator-harness" "$D12"
+printf '#!/usr/bin/env bash\necho loop\n' > "$R12/scripts/orchestrator-harness/a.sh"
+printf 'export const v = 1\n' > "$R12/scripts/orchestrator-harness/wrapper.ts"
+( cd "$R12" && $G add -A && $G commit -q -m fixture12 ) >/dev/null 2>&1 || { echo "❌ fixture12 commit failed"; exit 2; }
+cp "$R12/scripts/orchestrator-harness/a.sh" "$R12/scripts/orchestrator-harness/wrapper.ts" "$D12/"
+# A truthful stamp, or the run answers UNKNOWN (2) for lack of a record and grades nothing. Its fold is
+# `*.sh`-only by contract, exactly as in `deploy()` — so the `.ts` can only be seen by the byte arm.
+{ _pay="$( ( cd "$D12" && for f in *.sh; do $SHA_CMD "$f"; done ) | $SHA_CMD | awk '{print $1}' )"
+  printf '{\n "commit": "%s",\n "payloadSha256": "%s",\n "agentInfraDirty": false\n}\n' \
+    "$(git -C "$R12" rev-parse HEAD)" "$_pay" > "$D12/.agent-infra-stamp.json"; }
+# The patch touches the DECLARATION ONLY — if one line is not enough, the declaration is not the place.
+WIDENED="$TMP/widened-drift.sh"
+sed 's/^HARNESS_EXTS="sh py mjs"$/HARNESS_EXTS="sh py mjs ts"/' "$DRIFT" > "$WIDENED" \
+  || { echo "❌ could not build the widened copy"; exit 2; }
+ck "12e: the widened copy really declares the fourth extension (the patch landed)" \
+   "$(qF 'HARNESS_EXTS="sh py mjs ts"' "$(cat "$WIDENED")" && echo 0 || echo 1)"
+printf 'export const v = 2\n' > "$D12/wrapper.ts"       # ONE stale file of the newly declared kind
+OUT="$( bash "$WIDENED" --o "$D12" --repo "$R12" --ref main \
+        --rel scripts/orchestrator-harness --no-fetch 2>&1 )"; RC=$?
+ck "12e: a stale file of a DECLARED extension is caught (rc=$RC; diverged text = rc 0, never compared)" \
+   "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "12e: …and it is NAMED, so the widened set is the one that answered" \
+   "$(qF 'wrapper.ts — the deployed copy DIFFERS' "$OUT" && echo 0 || echo 1)"
+# ⛔ THE MESSAGE IS GRADED THROUGH A REAL MESSAGE PATH, not by re-reading the constants: the byte arm's
+# report names the FILE and never the set, so a text assertion here would pin nothing an operator sees.
+# The `DRIFT(exec)` line is where the set is spoken — so run the WIDENED copy's `--surface` arm over a
+# running dir carrying no shipped file, and require the derived glob to carry the fourth extension.
+D12e="$TMPR/run12e"; mkdir -p "$D12e"
+printf '4250 bash %s/orch-loop.sh\n' "$D12e" > "$TMP/ps-ts"
+OUT="$( cd "$TMP" && HOME="$EMPTYHOME6" CELL_HOME="" HARNESS="$D12e" HARNESS_PIN_DIR="" HARNESS_PIN_FILE="" \
+        DRIFT_PS="$PSH" PS_TABLE="$TMP/ps-ts" \
+        bash "$WIDENED" --o "$TMP/no-such-deployed" --repo "$R12" --ref main \
+             --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
+ck "12e: …and the operator message names the WIDENED set, derived from the one declaration" \
+   "$(qF '*.sh, *.py, *.mjs, *.ts' "$OUT" && echo 0 || echo 1)"
+# The control: the UNPATCHED script must NOT see the `.ts`, so this arm is proven to be about the
+# declaration and not about `.ts` happening to be noticed anyway.
+OUT="$( bash "$DRIFT" --o "$D12" --repo "$R12" --ref main \
+        --rel scripts/orchestrator-harness --no-fetch 2>&1 )"; RC=$?
+ck "12e: …and the SHIPPED declaration does not compare .ts (rc=$RC — the fix is the declaration)" \
    "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 
 echo
