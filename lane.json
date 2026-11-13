@@ -1,0 +1,36 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.SazxnvMTYu/fix.log"
+    },
+    {
+      "kind": "sha",
+      "value": "92ec5cd6729adc2e6d7fdcf97b0396edf0e37980"
+    },
+    {
+      "kind": "worktree",
+      "value": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/review/rv3909-3917/.worktrees/review/rv3986/scripts/orchestrator-harness"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 37,
+  "ended_at": 1794604161,
+  "exit_code": 0,
+  "heartbeat_at": 1794604161,
+  "host": "192",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "192.kfixer-42-1794604124-p20017-0ad716ee",
+  "lease_until": 1794604766,
+  "pid": 20017,
+  "reason": "cap-hit:rc=0",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794604124,
+  "state": "FAILED",
+  "tag": "42",
+  "worktree": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/review/rv3909-3917/.worktrees/review/rv3986/scripts/orchestrator-harness"
+}
