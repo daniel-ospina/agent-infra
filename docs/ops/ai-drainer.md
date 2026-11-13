@@ -348,6 +348,15 @@ that schedules nothing. `cloud-cell-bringup.sh` does **not** install it: a lane 
 and costs model spend, so it is an explicit, per-cell operator step — the same shape as the disk
 reaper's arming.
 
+⛔ `--status` ALSO PRINTS THE INSTALLED `Environment=LANE_TIMEOUT` PIN beside the value this checkout
+would render now, and exits **3** when they disagree. The unit is rendered ONCE, at install time, and an
+installed pin WINS over `ai-drainer.sh`'s compiled default (`LANE_TIMEOUT="${LANE_TIMEOUT:-...}"`, passed
+straight to the dispatcher): so a cell whose unit predates a seam change keeps dispatching lanes at the
+OLD cap while the checkout, the docs and the tests all say the new one — verbatim #4034's defect one
+layer out, in a rendered artifact. `--status` used to report only installed/MISSING + timer state, so
+such a box read **healthy**. After any seam change, re-run the installer (no arguments) on every cell,
+then `--status` to prove the pin actually moved.
+
 The second controller on a cell is the cell supervisor's business (`cloud-cell-supervisor.sh start`
 with `OR`/`O` for that repo); it needs no timer at all, and its inventory row says so
 (`no launchctl` → SKIPPED on a cell) rather than pretending to check a launchd job. ⛔ That split is
