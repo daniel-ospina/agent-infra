@@ -517,13 +517,13 @@ jobs:
     # #2055 — this job carries NO job-level bound on purpose. ⛔ THE REASON IS NOT ARITHMETIC, and saying
     # it was arithmetic was FALSE (review finding, P2): this change's FIRST draft had 66 steps of which 65
     # carried a bound, summing 381 min — above the platform's 360-minute ceiling — so no bound could satisfy
-    # `job-bound > Σ step-bounds`, and "a 66-step job cannot" was true THEN. It is not true now: Σ is 334
-    # (68 bounded steps — measured by summing every `timeout-minutes` inside this job's region), so a job
-    # bound in 335..359 WOULD satisfy it. The step-only shape is kept deliberately, because a job
+    # `job-bound > Σ step-bounds`, and "a 66-step job cannot" was true THEN. It is not true now: Σ is 353
+    # (73 bounded steps — measured by summing every `timeout-minutes` inside this job's region), so a job
+    # bound in 354..359 WOULD satisfy it. The step-only shape is kept deliberately, because a job
     # bound above Σ can never fire (the last step bound always arrives first) and therefore buys nothing —
     # while it would relabel this job from step-bounded to job-bounded, i.e. to the shape whose trip is
     # `cancelled`, NON-RED to the rail, which pre-empts the red step that actually hung. So EVERY step
-    # below carries its own bound (sum 334 min), sized from that STEP's measured max over 12 completed
+    # below carries its own bound (sum 353 min), sized from that STEP's measured max over 12 completed
     # runs (2026-11-09; the two heavy ones are the finished-lane reaper's mutation control at 7.3 min and
     # its suite at 2.2 min) — with THREE stated exceptions, each sized from its OWN documented wall clock
     # instead because none has a 12-run series: the #718 hub-sweep step (it landed on main after that
@@ -539,6 +539,14 @@ jobs:
     # few step bounds UNREACHABLE, so a cumulative overrun would land on the non-red conclusion while
     # every individual bound looked like the red one. `scripts/check-workflow-bounds.mjs` now refuses
     # that shape (a job bounded only by its steps must have Σ < 360), and its suite pins the refusal.
+    # ⚠️ MEASURED HEADROOM IS NOW THIN, AND THIS IS THE HONEST STATEMENT OF IT: Σ is 353 of the 360
+    # ceiling — 7 minutes, and the satisfiable job-bound window is only 354..359. Two of those minutes
+    # belong to the #506 steps this PR adds (+8 over `main`'s 345), and the rest is main's own growth
+    # (345 at `319c82526`, up from the 326 this comment first measured). The next step added by ANY
+    # lane that cannot share an existing bound will cross 360 and `check-workflow-bounds.mjs` will
+    # refuse this job — which is the gate working, not a surprise, but the remedy is then to SPLIT the
+    # verify job rather than to trim a measured bound. Recorded here so that lane reads a number
+    # instead of rediscovering it.
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 10
