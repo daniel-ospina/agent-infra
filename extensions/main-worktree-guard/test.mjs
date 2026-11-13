@@ -5358,6 +5358,521 @@ try {
     blocks(["tracked.md"], "true | cd docs; echo x > tracked.md", "F1 gate (tightened, NOTE 1): only the ROOT tracked.md is tracked, so the mutant's docs/ resolution cannot pass");
   }
 
+  // ── #3955 (C) round-47: the dir stack's INDEXED and FILTERED forms. Real bash
+  // (measured, bash 5.2.21) indexes a stack whose element 0 is the CURRENT
+  // directory: `pushd +N` rotates LEFT by N then cds; `pushd -N` rotates RIGHT
+  // by N+1 then cds; `popd +N` REMOVEs element N without cd (`+0` is a bare
+  // popd, so it cd's to the new top); `popd -N` removes element len-1-N;
+  // `popd --` is exactly a bare popd; `popd -n` drops the element a bare popd
+  // would have cd'd to; `pushd -n <dir>` INSERTS <dir> at index 1 without cd;
+  // and an out-of-range index is a bash ERROR (stack and cwd both untouched).
+  //
+  // The walker treated EVERY one of those as "no cd AND no stack change", which
+  // drifts its cwd off bash's in BOTH directions. The four `R*` rows were
+  // measured FAIL-OPENs (the gate ALLOWed a tracked hub write real bash
+  // performs) and `C2` was a measured FALSE POSITIVE; each family tracks ONE
+  // file (the #3957 review NOTE 1 lesson — a fixture tracking both candidate
+  // paths cannot grade the gate, since the right and wrong resolutions both
+  // BLOCK). ⚠️ These rows are #3955's own "flag/+N form" target, whose body
+  // asserted `+N` does NOT cd; RE-MEASURED here it does, so the target's remedy
+  // is to MODEL the rotation rather than to ignore it.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r47-"));
+    for (const d of ["a", "b", "c", "docs", "sub"]) mkdirSync(join(H, d));
+    const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
+    const pluck = (cmd) => cands(cmd).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r47: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const verdict = (tracked, cmd) =>
+      firstHubTrackedWrite(cands(cmd).map((x) => ({ rel: x.resolvedPath.slice(H.length + 1) })), tracked) !== null;
+    const blocks = (tracked, cmd, label) => expectBool(`C437r47: ${label}`, verdict(tracked, cmd), true);
+    const allows = (tracked, cmd, label) => expectBool(`C437r47: ${label}`, verdict(tracked, cmd), false);
+
+    // `pushd +1` — the measured #3955 fail-open. From `a` with the stack
+    // [a, docs, a], `+1` makes docs the top; real bash overwrites TRACKED
+    // docs/tracked.md, while "no stack change" left the walker in `a` → ALLOW.
+    has("cd a; pushd ../docs; pushd ../a; pushd +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R+1: pushd +1 rotates left by N and cds");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../a; pushd +1; echo x > tracked.md", "R+1 gate: TRACKED docs/tracked.md → BLOCK");
+    // `pushd -1` — rotate RIGHT by N+1 (`-0` ⇒ right by 1).
+    has("cd a; pushd ../docs; pushd ../a; pushd -1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R-1: pushd -1 rotates right by N+1 and cds");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../a; pushd -1; echo x > tracked.md", "R-1 gate: TRACKED docs/tracked.md → BLOCK");
+    // `popd +0` removes the TOP, i.e. exactly a bare popd — it cd's to the new top.
+    has("cd a; pushd ../docs; pushd ../a; popd +0; echo x > tracked.md", "redirect:H/docs/tracked.md", "R+0: popd +0 removes element 0 and cd's to the new top");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../a; popd +0; echo x > tracked.md", "R+0 gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd a; pushd ../docs; pushd ../a; popd +1; echo x > tracked.md", "redirect:H/a/tracked.md", "R+0 control: popd +1 removes a NON-top element — the cwd does not move");
+    // `pushd -n <dir>` inserts at index 1 WITHOUT cd, so the next bare popd cd's
+    // there. "No stack change" lost that entry entirely → ALLOW.
+    has("cd a; pushd -n ../docs; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R-n: pushd -n inserts below the top without cd; the popd lands on it");
+    blocks(["docs/tracked.md"], "cd a; pushd -n ../docs; popd; echo x > tracked.md", "R-n gate: TRACKED docs/tracked.md → BLOCK");
+    // Positive control: the SAME rotation in the other direction must not block.
+    has("cd docs; pushd ../a; pushd ../docs; pushd +1; echo x > tracked.md", "redirect:H/a/tracked.md", "C1 control: a rotation AWAY from docs lands in a");
+    blocks(["a/tracked.md"], "cd docs; pushd ../a; pushd ../docs; pushd +1; echo x > tracked.md", "C1 control gate: only a/tracked.md is tracked — the a resolution is graded, not assumed");
+    // `popd --` is exactly a bare popd (measured) — treating it as a flag no-op
+    // FALSE-POSITIVEd on docs/tracked.md.
+    has("cd a; pushd ../docs; popd --; echo x > tracked.md", "redirect:H/a/tracked.md", "C2 control: popd -- behaves exactly like a bare popd (a)");
+    allows(["docs/tracked.md"], "cd a; pushd ../docs; popd --; echo x > tracked.md", "C2 control gate: the a write is untracked → ALLOW (no false positive on docs)");
+    // Out-of-range index = bash ERROR, nothing changes. ⛔ THESE TWO ROWS DO NOT
+    // PIN EACH GUARD'S OWN BOUND (a C3/C4 label that claimed to was falsified in
+    // the #3955 review): `pushd +9` and `popd -9` stay green with the range guards
+    // deleted, because slice(9) on a 3-entry stack is the identity and popd -9's
+    // `idx = -7` gives two empty slices either way. The bounds that ARE
+    // load-bearing have their own rows below (`I2d`); these two keep the
+    // four out-of-range forms honest about "bash errors and nothing changes".
+    has("cd a; pushd ../docs; pushd ../a; pushd +9; echo x > tracked.md", "redirect:H/a/tracked.md", "C3 control: pushd +9 is out of range — bash errors, cwd stays a");
+    has("cd a; pushd ../docs; pushd ../a; popd -9; echo x > tracked.md", "redirect:H/a/tracked.md", "C4 control: popd -9 is out of range — bash errors, cwd stays a");
+    // ── #3955 review ISSUE 2(b): NO `popd -n` row existed, so the branch ISSUE 1
+    // lives in could be deleted outright without reddening anything. A bare `-n`
+    // drops element 1 and keeps the cwd, so its effect is only visible on the
+    // NEXT bare popd — that is what these rows drive.
+    has("cd a; pushd ../docs; pushd ../b; popd -n; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "I2b: a bare popd -n drops element 1, so the next popd lands on a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n; popd; echo x > tracked.md", "I2b gate: TRACKED a/tracked.md → BLOCK (deleting the -n arm lands on docs instead)");
+    // `popd -n --` is exactly a bare `popd -n` (measured); a NON-numeric operand
+    // that is not `--` is bash's "invalid number" error and changes nothing, so a
+    // model that read any non-numeric word as the bare form would be wrong.
+    has("cd a; pushd ../docs; pushd ../b; popd -n --; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "I2b control: popd -n -- == a bare popd -n (the marker is not an operand)");
+    has("cd a; pushd ../docs; pushd ../b; popd -n foo; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I2b control: popd -n foo is bash's 'invalid number' — the whole form changes NOTHING");
+    // ── #3955 review ISSUE 1 (P1 FAIL-OPEN): `-n` COMBINES with the numeric
+    // operand (`popd [-n] [+N | -N]`, GNU bash manual §6.8.1) — the operand picks
+    // WHICH entry is dropped. Measured bash 5.2.21 on stack [b, docs, a] (cwd b):
+    // `-n +2`/`-n -0` ⇒ [b, docs], `-n +0` ⇒ [b, a] (== bare), `-n +9` ⇒ error.
+    // The pre-fix handler removed element 1 for EVERY operand, so the next bare
+    // popd landed in `a` while real bash landed in `docs` → the gate ALLOWed the
+    // TRACKED hub write bash performs (`origin/main` graded this right only by
+    // accident: it no-opped the whole form).
+    has("cd a; pushd ../docs; pushd ../b; popd -n +2; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1: popd -n +2 drops element 2, so the next bare popd lands on docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n +2; popd; echo x > tracked.md", "I1 gate: TRACKED docs/tracked.md → BLOCK (pre-fix resolved a/tracked.md → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd -n -0; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1: popd -n -0 drops index len-1-N (the deepest), same landing as +2");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n -0; popd; echo x > tracked.md", "I1 gate: the -N translation is asserted too, not only the +N one");
+    has("cd a; pushd ../docs; pushd ../b; popd -n +0; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "I1 control: popd -n +0 IS the bare -n target — element 1, so the next popd lands on a");
+    has("cd a; pushd ../docs; pushd ../b; popd -n +9; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I1 control: an out-of-range operand is a bash ERROR — the stack is untouched, so the popd still lands on docs");
+    // ── #3955 review ISSUE 2(a): the in-range `popd -N` translation
+    // (`S.length - 1 - N`) had NO row — the only `-N` row was `popd -9`, out of
+    // range under both formulas. `popd -0` removes the DEEPEST entry and keeps
+    // the cwd, so a walker that read `-0` as `+0` would cd to docs instead.
+    has("cd a; pushd ../docs; pushd ../b; popd -0; echo x > tracked.md", "redirect:H/b/tracked.md", "I2a: popd -0 removes the stack bottom and does NOT cd — the write stays in b");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -0; echo x > tracked.md", "I2a gate: TRACKED b/tracked.md → BLOCK (the mutant `idx = Number(sel[2])` cd's to docs and ALLOWs)");
+    // ── #3955 review ISSUE 2(c): `R-n` reaches `pushd -n` with a 1-deep stack,
+    // where `S.splice(1, 0, ins)` and `S.push(ins)` are the same array — so the
+    // INSERT POSITION was unasserted. A 2-deep stack with a DISTINCT inserted dir
+    // makes the two disagree on which entry the next popd consumes.
+    has("cd a; pushd ../docs; pushd -n ../b; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "I2c: pushd -n inserts at index 1 — the next popd lands on b, not on the stack bottom");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd -n ../b; popd; echo x > tracked.md", "I2c gate: TRACKED b/tracked.md → BLOCK (the mutant `S.push(ins)` pops a and ALLOWs)");
+    // ── #3955 review ISSUE 2(d): the bounds. `pushd -N`'s UPPER edge (`k <
+    // S.length`) IS load-bearing — deleting it rotates in a directory bash never
+    // enters, so the walker's cwd (and therefore the graded write) moves. The
+    // `popd` side is belt-and-braces by construction (`slice(0, idx)` past the end
+    // is the whole array, so a dropped `idx < S.length` cannot mis-remove —
+    // measured as a surviving mutant); its row pins the BEHAVIOUR bash promises
+    // (out of range = an error that changes nothing) rather than the guard.
+    has("cd a; pushd ../docs; pushd ../b; pushd -4; echo x > tracked.md", "redirect:H/b/tracked.md", "I2d: pushd -4 is out of range on a 3-entry stack — bash errors and the cwd stays b");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -4; echo x > tracked.md", "I2d gate: TRACKED b/tracked.md → BLOCK (the mutant `if (k > 0)` rotates in docs and ALLOWs)");
+    has("cd a; pushd ../docs; pushd ../b; popd +9; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "I2d: popd +9 is out of range — nothing changes, so the next popd still lands on docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd +9; popd; echo x > tracked.md", "I2d gate: TRACKED docs/tracked.md → BLOCK (an out-of-range popd must not shift the stack)");
+    // ── #3955 review ISSUE 2(e): `T+` used a 1-entry stack, where the push/pop
+    // pair nets back to the same directory under EVERY implementation — it could
+    // not vary under any mutation of this diff. Give the stack a SECOND, distinct
+    // directory so the rotation is observable through the next popd.
+    has("cd a; pushd ../docs; pushd +1; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "T+: pushd +1 on a 2-entry stack rotates, so the next popd lands back on docs");
+    // ── #3955 review (sibling arm): `pushd -n +N` is LEGAL (`pushd [-n] [+N | -N
+    // | dir]`) and is NOT a path: measured, bash rotates exactly as `pushd +N`
+    // would and REPLACES the rotated-in entry with the cwd — never cd'ing. Reading
+    // it as a failed path left the stack unrotated, so the next popd went one
+    // entry too deep: the same fail-open shape as `pushd +N`.
+    has("cd a; pushd ../docs; pushd ../b; pushd -n +1; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "I3: pushd -n +1 rotates without cd'ing — the next popd lands on a, not on docs");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n +1; popd; echo x > tracked.md", "I3 gate: TRACKED a/tracked.md → BLOCK (a failed-path no-op leaves the popd on docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n +2; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "I3 control: pushd -n +2 rotates in the cwd itself, so the popd stays in b");
+    // ── #3955 review NOTE: `pushd -- <dir>` DOES cd (measured: cwd docs, stack
+    // pushed) — the `:9475` comment claiming every remaining flag form never cds
+    // was false for `--`. `cd --` is #2177's recorded root and is untouched here.
+    has("cd a; pushd -- ../docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "N1: pushd -- <dir> is the MARKER plus a real operand — bash cds to docs");
+    blocks(["docs/tracked.md"], "cd a; pushd -- ../docs; echo x > tracked.md", "N1 gate: TRACKED docs/tracked.md → BLOCK (the no-op model resolved a/tracked.md → ALLOW)");
+    // ── #3955 review NOTE: `popd <path>` / `popd 1` / `popd -x` are bash ERRORS
+    // (`invalid argument` / `invalid number`, rc 2, nothing changes — measured),
+    // and `origin/main` POPPED and cd'd on them. Pinned here because this is the
+    // block that touches the handler.
+    has("cd a; pushd ../docs; popd foo; echo x > tracked.md", "redirect:H/docs/tracked.md", "N2: popd <path> is an error — the stack is untouched, so the write stays in docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd foo; echo x > tracked.md", "N2 gate: TRACKED docs/tracked.md → BLOCK (a pop-on-path model cd's to a and ALLOWs)");
+    has("cd a; pushd ../docs; popd -x; echo x > tracked.md", "redirect:H/docs/tracked.md", "N2 control: an UNKNOWN popd flag is an error too, not a bare popd");
+    // #3955's own Targets line: the forms whose `pushd` does NOT cd must leave the
+    // dir stack untouched, so a later bare popd cannot consume an entry bash never
+    // created. The model is deliberately self-consistent for the unprovable ones
+    // (`$VAR`/`~`): no cd AND no push, which is where bash also lands.
+    has("pushd $NOPE; cd a; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T$: an unresolved $VAR pushd neither cd's nor pushes — the popd is a bash no-op");
+    has("cd a; pushd ~; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "T~: pushd ~ is modelled no-cd/no-push and stays self-consistent (bash also lands back in a)");
+    // ── #3955 review Finding 1 (net-new P1, MEASURED fail-open REGRESSION): an
+    // UNEXPANDED operand. This walker never expands, so `popd $EMPTY` / `popd "$1"`
+    // reach the handler as literal text and the `/^[^+-]/` guard swallowed them as
+    // "bash error ⇒ no change". Real bash expands them, and an empty expansion IS a
+    // bare popd: measured on the fixture below, `popd $EMPTY` leaves the shell in
+    // `a`, so `echo pwn > tracked.md` really overwrites TRACKED `a/tracked.md`.
+    // ⛔ BOTH realities are pinned, in opposite fixtures, because either model alone
+    // is a fail-open in the other direction (origin/main popped, so it ALLOWed the
+    // docs reality; the pre-fix no-change model ALLOWed the a reality).
+    has("cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "redirect:H/a/tracked.md", "F1: a `$VAR` operand emits the POP reality (bash pops on an empty expansion)");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "F1 gate: TRACKED a/tracked.md → BLOCK (the pre-fix walker resolved docs/ and ALLOWed a measured overwrite)");
+    has("cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "redirect:H/docs/tracked.md", "F1: …AND the unchanged-cwd reality (the expansion could be a path ⇒ bash errors)");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "F1 gate: TRACKED docs/tracked.md → BLOCK too (a pop-ONLY model, i.e. origin/main, ALLOWs this one)");
+    // ⛔ CORRECTED in round 11. This pair used to assert that the QUOTED spelling
+    // behaves like the unquoted one ("readWord strips the quotes, not the
+    // expansion") — that claim is FALSE and was measured to be false: bash decides
+    // the EMPTY case on the quoting. `popd "$1"` with `$1` unset keeps an empty
+    // word ⇒ `popd ""` = `-0`, which drops the LAST entry and does NOT cd (bash
+    // 5.2.21: dirs unchanged, cwd stays docs), while the UNQUOTED `popd $EMPTY`
+    // above has its word REMOVED ⇒ a bare `popd` that really cds to `a`. Both
+    // realities are still pinned — they belong to different SPELLINGS, not to one.
+    has("cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "redirect:H/docs/tracked.md", "F1 CORRECTED: a QUOTED empty expansion is KEPT ⇒ `popd \"\"` = `-0` — no cd, the cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "F1 CORRECTED gate: TRACKED docs/tracked.md → BLOCK");
+    allows(["a/tracked.md"], "cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "F1 CORRECTED control: the QUOTED spelling must NOT emit a (it never cds) — only the UNQUOTED `popd $EMPTY` row pops");
+    // `popd -n $VAR` has the same shape one branch over: `-n` never cds, so an empty
+    // expansion is the bare `-n` (drop element 1) and a path is an error. The
+    // stack-side divergence a LATER bare popd exposes is the declared residual.
+    has("cd a; pushd ../docs; pushd ../b; popd -n $EMPTY; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "F1: popd -n $VAR is the bare `-n` — the next popd lands on a, not on docs");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n $EMPTY; popd; echo x > tracked.md", "F1 gate: TRACKED a/tracked.md → BLOCK (the pre-fix no-op left the popd on docs → ALLOW)");
+    // ── #3955 review Finding 4 (still open, re-measured): once `sel` and `-n` are
+    // consumed, EVERY other operand is a bash error RC 2 that changes neither the
+    // stack nor the cwd — including a `+`-prefixed non-numeric one. The previous
+    // guards let `+x`/`+1x`/`+` fall through to a bare popd, so the walker cd'd to
+    // `a` while bash stayed in docs: a measured fail-open (`+1x`) AND a regression
+    // against origin/main (which popped nothing there).
+    has("cd a; pushd ../docs; popd +1x; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4: popd +1x is 'invalid number' — the cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +1x; echo x > tracked.md", "F4 gate: TRACKED docs/tracked.md → BLOCK (the pre-fix fall-through popped to a and ALLOWed)");
+    has("cd a; pushd ../docs; popd +x; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4: popd +x is an error too — nothing changes");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +x; echo x > tracked.md", "F4 gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd a; pushd ../docs; popd +; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4: a bare `+` operand is an error, not a bare popd");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +; echo x > tracked.md", "F4 gate: TRACKED docs/tracked.md → BLOCK");
+    // ── #3955 review (the note filed as pre-existing): bare `pushd` / `pushd --` are
+    // NOT no-ops. Measured on bash 5.2.21: `[docs, a]` ⇒ `[a, docs]` with cwd `a`;
+    // `[b, docs, a]` ⇒ `[docs, b, a]` with cwd `docs`; a 1-deep stack errors and
+    // changes nothing. The old model no-opped both, so the walker stayed somewhere
+    // bash had left — the same fail-OPEN shape as `pushd +N`.
+    has("cd a; pushd ../docs; pushd; echo x > tracked.md", "redirect:H/a/tracked.md", "P0: a bare `pushd` swaps the top two entries and cd's to the new top (a)");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd; echo x > tracked.md", "P0 gate: TRACKED a/tracked.md → BLOCK (the no-op model stayed in docs and ALLOWed)");
+    has("cd a; pushd ../docs; pushd ../b; pushd; echo x > tracked.md", "redirect:H/docs/tracked.md", "P0: …and on a 3-entry stack the swap still moves exactly ONE entry (docs)");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd; echo x > tracked.md", "P0 gate: TRACKED docs/tracked.md → BLOCK");
+    has("cd a; pushd ../docs; pushd --; echo x > tracked.md", "redirect:H/a/tracked.md", "P0: `pushd --` is the SAME swap — the marker is not an operand");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd --; echo x > tracked.md", "P0 gate: TRACKED a/tracked.md → BLOCK");
+    has("cd a; pushd; echo x > tracked.md", "redirect:H/a/tracked.md", "P0 ANTI-NARROWING: a 1-deep stack is 'no other directory' (rc 1) — the cwd must NOT move");
+    allows(["docs/tracked.md"], "cd a; pushd; echo x > tracked.md", "P0 ANTI-NARROWING gate: the write is in a, so a docs resolution would be a false positive");
+    // ── #3955 review P1: `pushd -n -- <operand>`, the one member of this family
+    // still unmodelled. Under `-n` the arm read EXACTLY one word, so the operand
+    // after the marker was never seen — `--` became `resolve(cwd, "--")`, which
+    // does not exist, and the insert was dropped. The stack then lacked the entry
+    // bash had and the next `popd` resolved one entry off. THREE measured
+    // fail-OPENs (real bash writes a TRACKED hub file, the walker ALLOWs):
+    //   `cd a; pushd -n -- ../b; popd`                        ⇒ bash b, walker a
+    //   `cd a; pushd ../docs; pushd -n -- ../b; popd`          ⇒ bash b, walker a
+    //   `cd a; pushd ../docs; pushd ../b; pushd -n -- +1; popd` ⇒ bash b, walker docs
+    // Re-measured HERE on bash 3.2.57 against the review's 5.2.21 rows: both
+    // versions agree on all three landings. ⛔ Row 3 also pins that `--`
+    // SUPPRESSES the numeric form — after the marker `+1` is a literal directory
+    // NAME, not a rotation (`pushd -n +1` from [b,docs,a] gives [b,a,b] and its
+    // popd lands on `a`; with `--` bash stays in `b`), so re-reading past the
+    // marker must NOT hand the word to the `rot` test.
+    has("cd a; pushd -n -- ../b; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "P1: pushd -n -- <dir> inserts the operand past the marker — the next popd lands on b");
+    blocks(["b/tracked.md"], "cd a; pushd -n -- ../b; popd; echo x > tracked.md", "P1 gate: TRACKED b/tracked.md → BLOCK (pre-fix resolved a/tracked.md → ALLOW)");
+    has("cd a; pushd ../docs; pushd -n -- ../b; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "P1: …on a 2-deep stack the marker form still lands on the INSERTED dir (b), not the stack bottom (a)");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd -n -- ../b; popd; echo x > tracked.md", "P1 gate: TRACKED b/tracked.md → BLOCK (pre-fix popped the stack bottom, a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n -- +1; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "P1: after `--` a `+1` is a LITERAL dir, not a rotation — bash's popd errors and keeps the cwd at b");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n -- +1; popd; echo x > tracked.md", "P1 gate: TRACKED b/tracked.md → BLOCK (pre-fix popped to docs, and a rotate-on-`--` model pops to a → both ALLOW)");
+    allows(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n -- +1; popd; echo x > tracked.md", "P1 control: treating `-n -- +1` as a ROTATION lands on a — the a resolution must NOT be graded, bash stays in b");
+    has("cd a; pushd ../docs; pushd -n -- ../b; echo x > tracked.md", "redirect:H/docs/tracked.md", "P1 control: `-n` itself never cds — only the NEXT popd moves, so this write stays in docs");
+    has("cd a; pushd ../docs; pushd -n --; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "P1 control: a bare `pushd -n --` (no operand) changes nothing — the popd still lands on a");
+    // ── #3955 review ROUND 2 (#3973): round 1 closed `pushd -n -- <dir>` but its
+    // hunk dropped the INSERT's existence gate, and a later round-2 review measured
+    // the false refusal that opens. The gate bash actually applies is at the
+    // CONSUMER, not the insert: `pushd -n` stores the operand STRING verbatim, so an
+    // absent entry can sit in the stack, and every form that cd's to it fails.
+    // Measured on bash 3.2.57 here (stack [b, +1, docs, a], cwd b):
+    //   popd      rc 1  NOTHING removed, cwd b      (and a SECOND popd fails too)
+    //   popd +0   rc 1  NOTHING removed, cwd b
+    //   pushd +1  rc 1  the rotation STAYS, cwd b   (a later popd then lands on docs)
+    //   pushd     rc 1  the SWAP stays, cwd b
+    //   popd -n +1 rc 0 the entry is REMOVED without any cd
+    // So a model that consumes-then-fails grades `docs` where bash writes `b` — the
+    // FALSE REFUSAL — and is one entry off for the rest of the walk.
+    const poisoned = "cd a; pushd ../docs; pushd ../b; pushd -n -- +1";
+    has(`${poisoned}; popd; popd; echo x > tracked.md`, "redirect:H/b/tracked.md", "R2a: `-n` inserts a LITERAL `+1` and each popd FAILS — bash keeps the entry and the cwd (b)");
+    blocks(["b/tracked.md"], `${poisoned}; popd; popd; echo x > tracked.md`, "R2a gate: TRACKED b/tracked.md → BLOCK (bash really writes it)");
+    allows(["docs/tracked.md"], `${poisoned}; popd; popd; echo x > tracked.md`, "R2a FALSE-REFUSAL control: the head 8394e93ba resolved docs here and BLOCKED a directory bash never enters");
+    allows(["a/tracked.md"], `${poisoned}; popd; popd; echo x > tracked.md`, "R2a anti-narrowing: a retained stack must not drift the other way either — `a` is not graded");
+    // `popd +0` names ELEMENT 0, so removing it forces a cd to the new top; that cd
+    // fails on the absent entry and bash removes NOTHING (rc 1, dirs unchanged).
+    has(`${poisoned}; popd +0; popd; echo x > tracked.md`, "redirect:H/b/tracked.md", "R2b: `popd +0` whose new top is the absent `+1` is rc 1 and splices NOTHING — the next popd still fails, cwd b");
+    blocks(["b/tracked.md"], `${poisoned}; popd +0; popd; echo x > tracked.md`, "R2b gate: TRACKED b/tracked.md → BLOCK (a spliced stack resolves docs)");
+    // Every OTHER popd index removes WITHOUT a cd, so an absent entry IS removable.
+    has(`${poisoned}; popd -n +1; popd; echo x > tracked.md`, "redirect:H/docs/tracked.md", "R2b control: `popd -n +1` removes the absent entry with no cd at all — the retention rule must not leak into the -n arm");
+    // The rotation/swap SURVIVES the failed cd; only the cd is conditional.
+    has(`${poisoned}; pushd +1; echo x > tracked.md`, "redirect:H/b/tracked.md", "R2c: `pushd +1` onto the absent entry fails its cd but KEEPS the rotation — cwd stays b");
+    has(`${poisoned}; pushd +1; popd; echo x > tracked.md`, "redirect:H/docs/tracked.md", "R2c gate: …and the KEPT rotation is real — the popd after it lands on docs, so a dropped rotation would resolve b");
+    has(`${poisoned}; popd; pushd; echo x > tracked.md`, "redirect:H/b/tracked.md", "R2d: a bare `pushd` (swap) onto the absent entry also fails its cd — the swap stays but the cwd does not move (b)");
+    // A never-popped absent `-n` operand is not a landing: `-n` never cds.
+    has("cd a; pushd -n -- ../no-such-dir-xyz; echo x > tracked.md", "redirect:H/a/tracked.md", "R2e control: an absent `-n` operand that is never popped is never graded as a landing (the cwd stays a)");
+    allows(["b/tracked.md"], "cd a; pushd -n -- ../no-such-dir-xyz; echo x > tracked.md", "R2e control gate: the absent operand is not a landing, so nothing grades b either (only the a write is graded)");
+    // ── #3955 review ROUND 3 (this fix): bash scans the WHOLE argv. Every form
+    // below carries a SECOND operand word, and the one-word model read it as
+    // "the first word, and nothing else" — a measured fail-OPEN on `popd`
+    // (`popd +0 -n`, `popd +0 extra`, `popd -n +1 extra` all left the walker in
+    // `a` while bash never leaves `docs`) and a measured divergence on `pushd`.
+    // Measured on bash 5.2.21 (the argv table lives at `popdArgv`/`pushdArgv`),
+    // and each row tracks ONE file (the #3957 NOTE 1 lesson).
+    // `popd +0 -n` on a 2-entry stack: `-n` wins, element 1 is dropped, NO cd.
+    has("cd a; pushd ../docs; popd +0 -n; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3a: `popd +0 -n` is NOCD — the cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +0 -n; echo x > tracked.md", "R3a gate: TRACKED docs/tracked.md → BLOCK (pre-fix resolved a → ALLOW)");
+    allows(["a/tracked.md"], "cd a; pushd ../docs; popd +0 -n; echo x > tracked.md", "R3a anti-narrowing: the a resolution must NOT be graded — bash never enters a");
+    // ANY other word is bash's "invalid argument" (rc 2): stack and cwd untouched,
+    // wherever it sits.
+    has("cd a; pushd ../docs; popd +0 extra; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3b: `popd +0 extra` is an ERROR — the cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +0 extra; echo x > tracked.md", "R3b gate: TRACKED docs/tracked.md → BLOCK (pre-fix cd'd to a → ALLOW)");
+    has("cd a; pushd ../docs; popd extra +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3b control: an invalid word errors wherever it sits — `popd extra +1` changes nothing");
+    // The LAST numeric operand wins: `popd +0 +1` is `popd +1` (element 1 gone, no
+    // cd); `popd +0 -1` on a 2-entry stack is `popd -1` (element 0 gone, cd to a).
+    has("cd a; pushd ../docs; popd +0 +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3c: `popd +0 +1` — the LAST operand wins (+1: element 1 removed, no cd)");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd +0 +1; echo x > tracked.md", "R3c gate: TRACKED docs/tracked.md → BLOCK (pre-fix resolved a → ALLOW)");
+    has("cd a; pushd ../docs; popd +0 -1; echo x > tracked.md", "redirect:H/a/tracked.md", "R3c: `popd +0 -1` — the last operand (-1) names element 0, so bash cds to a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd +0 -1; echo x > tracked.md", "R3c gate: TRACKED a/tracked.md → BLOCK");
+    // `popd -- <anything>` is exactly a bare popd — everything after the marker is
+    // IGNORED (so `-- +1` is NOT a rotation).
+    has("cd a; pushd ../docs; popd -- +1; echo x > tracked.md", "redirect:H/a/tracked.md", "R3d: `popd -- +1` is a BARE popd — the marker ends the scan");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd -- +1; echo x > tracked.md", "R3d gate: TRACKED a/tracked.md → BLOCK (a rotation model would stay in docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd -n +1 extra; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R3e: `popd -n +1 extra` errors (nothing changes), so the NEXT popd lands on docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n +1 extra; popd; echo x > tracked.md", "R3e gate: TRACKED docs/tracked.md → BLOCK (pre-fix dropped element 1 and cd'd to a → ALLOW)");
+    // pushd: the FIRST operand picks the MODE, EVERY numeric operand is range
+    // checked, the LAST numeric is APPLIED, and under `-n` trailing words are
+    // ignored (without `-n` they are "too many arguments" — nothing changes).
+    has("cd a; pushd ../docs; pushd ../b; pushd -n +1 +2; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "R3f: `pushd -n +1 +2` rotates by the LAST operand (2) — the next popd lands on b");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n +1 +2; popd; echo x > tracked.md", "R3f gate: TRACKED b/tracked.md → BLOCK (a first-operand model left the popd on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n +2 +1; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R3f control: `pushd -n +2 +1` rotates by 1 — the other direction of the same rule");
+    has("cd a; pushd ../docs; pushd ../b; pushd +1 +2; echo x > tracked.md", "redirect:H/a/tracked.md", "R3g: `pushd +1 +2` (cd arm) rotates by the LAST operand (2) and cds to a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd +1 +2; echo x > tracked.md", "R3g gate: TRACKED a/tracked.md → BLOCK (a first-operand model stays in docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd +0 +2; echo x > tracked.md", "redirect:H/a/tracked.md", "R3g control: identity +0 then +2 is ONE rotation of 2 — the last operand is applied ONCE, not composed");
+    has("cd a; pushd ../docs; pushd ../b; pushd +2 +9; echo x > tracked.md", "redirect:H/b/tracked.md", "R3h: `pushd +2 +9` — an out-of-range operand ERRORS and nothing changes (cwd stays b)");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd +2 +9; echo x > tracked.md", "R3h gate: TRACKED b/tracked.md → BLOCK (validating only the LAST operand would cd to a)");
+    has("cd a; pushd -n ../c extra; popd; echo x > tracked.md", "redirect:H/c/tracked.md", "R3i: `pushd -n ../c extra` INSERTS c (trailing words are ignored under -n) — the popd lands on c");
+    blocks(["c/tracked.md"], "cd a; pushd -n ../c extra; popd; echo x > tracked.md", "R3i gate: TRACKED c/tracked.md → BLOCK (a model that errors on the extra word leaves the popd on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd ../c extra; echo x > tracked.md", "redirect:H/b/tracked.md", "R3j: `pushd ../c extra` is 'too many arguments' — bash changes NOTHING (cwd stays b)");
+    blocks(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd ../c extra; echo x > tracked.md", "R3j gate: TRACKED b/tracked.md → BLOCK (a model that cds to c resolves c → ALLOW)");
+    has("cd a; pushd ../docs; pushd -n ../c +1; popd; echo x > tracked.md", "redirect:H/c/tracked.md", "R3k: `pushd -n ../c +1` — the FIRST operand picks the mode, so this INSERTS c; the popd lands on c");
+    blocks(["c/tracked.md"], "cd a; pushd ../docs; pushd -n ../c +1; popd; echo x > tracked.md", "R3k gate: TRACKED c/tracked.md → BLOCK (reading it as a rotation lands on docs instead → ALLOW)");
+    // ⛔ A `#` AT WORD START IS A COMMENT, and the argv scan must not eat it as an
+    // operand word (#3955 review round 4 — a regression the scan introduced).
+    // Swallowing it made the command AFTER it — `; echo x > tracked.md`, which bash
+    // NEVER runs — look like a live write (a measured false refusal).
+    expectBool("C437r47: R3l: a `#` at word start ENDS the operand scan — the commented-out write is not modelled",
+      cands("cd a; pushd ../docs; popd -n # comment; echo x > tracked.md").length, 0);
+    // …and the operands BEFORE the comment still apply: `popd -n +1 # c` drops
+    // element 1 (real bash), so the next popd lands on a, not on docs.
+    has("cd a; pushd ../docs; pushd ../b; popd -n +1 # c\npopd; echo x > tracked.md", "redirect:H/a/tracked.md", "R3l: operands before a `#` comment still apply — `popd -n +1 # c` drops element 1");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n +1 # c\npopd; echo x > tracked.md", "R3l gate: TRACKED a/tracked.md → BLOCK (a scan that ate the comment as words changed nothing, leaving the popd on docs → ALLOW)");
+    // ── #3955 review ROUND 4: a REDIRECT on the verb, and `-n`'s POSITION. Both
+    // were measured fail-OPENs of the round-3 SPLIT (the helpers describe the
+    // rules; see `readOperandWords`): the old single-operand arms had no FD notion
+    // (`2>/dev/null`'s `2` became the operand, so bash's bare `popd` was modelled
+    // as a bash ERROR), and `-n` was accepted after a directory operand where bash
+    // is "too many arguments".
+    has("cd a; pushd ../docs; popd 2>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "R4a: `popd 2>/dev/null` is a BARE popd — the FD prefix is not an operand");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd 2>/dev/null; echo x > tracked.md", "R4a gate: TRACKED a/tracked.md → BLOCK (reading the `2` as the operand changed nothing → docs → ALLOW)");
+    allows(["docs/tracked.md"], "cd a; pushd ../docs; popd 2>/dev/null; echo x > tracked.md", "R4a anti-narrowing: the docs resolution must NOT be graded");
+    has("cd a; pushd ../docs; pushd -n 2>/dev/null; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R4a control: `pushd -n 2>/dev/null` inserts NOTHING (the FD prefix is not its operand), so the popd lands on a");
+    has("cd a; pushd ../docs; pushd ../b; popd 2>/dev/null; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R4a: …and on a 3-entry stack the redirect still leaves a BARE popd, so the second popd lands on a");
+    has("cd a; pushd ../docs; popd 2>/dev/null +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R4b: an operand AFTER the redirect still applies — `popd 2>/dev/null +1` removes element 1 with no cd");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd 2>/dev/null +1; echo x > tracked.md", "R4b gate: TRACKED docs/tracked.md → BLOCK (a scan that STOPPED at the redirect modelled a bare popd → a → ALLOW)");
+    has("cd b; pushd ../docs -n; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "R4c: `pushd <dir> -n` is 'too many arguments' — bash changes NOTHING (the cwd stays b)");
+    blocks(["b/tracked.md"], "cd b; pushd ../docs -n; popd; echo x > tracked.md", "R4c gate: TRACKED b/tracked.md → BLOCK (reading the trailing -n as an option INSERTS docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd ../c -n; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R4c control: on a 3-entry stack the same error leaves the stack alone, so the next popd lands on docs");
+    has("cd a; pushd ../docs; pushd ../b; pushd +1 extra -n; echo x > tracked.md", "redirect:H/docs/tracked.md", "R4c control: `-n` after a NON-NUMERIC operand is NOT an option — the rotation happens WITH its cd (docs)");
+    has("cd a; pushd ../docs; pushd ../b; pushd +1 -n; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R4c control: `-n` after a NUMERIC operand IS an option — rotate without cd, so the popd lands on a");
+    // the redirect itself is still a WRITE TARGET — the scan hands it back to the
+    // main walker instead of consuming it.
+    has("cd a; pushd ../docs > tracked.md", "redirect:H/a/tracked.md", "R4d: a redirect attached to the verb is still a write target (`pushd ../docs > tracked.md`)");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs > tracked.md", "R4d gate: TRACKED a/tracked.md → BLOCK (the argv scan must not swallow the redirect)");
+    // ── #3955 review round 5. Two rules were wrong in the round-4 code:
+    //  • the RANGE CHECK ran on the TRANSFORMED index instead of the source `N`
+    //    (bash: error iff `N >= len`, same for both signs and both modes) — so a
+    //    too-deep `-N` under `-n` was accepted AND a later in-range operand was
+    //    applied (`pushd -n -3 +1`), while a LEGAL identity `-N` (N = len-1) was
+    //    rejected and the form dropped (`pushd -2 +1` on a 3-entry stack);
+    //  • an unprovable `$VAR` operand was modelled as "no cd AND no push", which
+    //    is where bash lands only on a 1-ENTRY stack — an unquoted empty
+    //    expansion is REMOVED, so bash runs a BARE `pushd` (swap), and `~`
+    //    always cds to $HOME.
+    // MEASURED (bash 5.2.21), 3-entry stack `[b, docs, a]`:
+    //   `pushd -2 +1`      rc 0, applies +1 ⇒ cwd docs (the IDENTITY -2 is legal)
+    //   `pushd -n -3 +1`   rc 1 "-3: index out of range" ⇒ NOTHING changes, cwd b
+    //   `pushd -n -2`      rc 0, identity ⇒ cwd b, stack unchanged
+    //   `cd a; pushd ../docs; pushd $NOPE`  ⇒ bare pushd swap ⇒ cwd a
+    //   `cd a; pushd ../docs; pushd ~; popd` ⇒ cwd docs
+    has("cd a; pushd ../docs; pushd ../b; pushd -2 +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R5a: `pushd -2 +1` — `-2` is a legal IDENTITY on a 3-entry stack, so the LAST operand (+1) still applies");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -2 +1; echo x > tracked.md", "R5a gate: TRACKED docs/tracked.md → BLOCK (bounding the transformed index rejected `-2` and dropped the form → b → ALLOW)");
+    allows(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -2 +1; echo x > tracked.md", "R5a control: …so the b resolution must NOT be graded either (the rotation really happens)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n -3 +1; echo x > tracked.md", "redirect:H/b/tracked.md", "R5b: `pushd -n -3 +1` — `-3` is out of range on a 3-entry stack, so bash applies NOTHING (the later +1 is never reached)");
+    // …and the STACK is the observable: `-n` never cds, so the error is only
+    // visible through the NEXT popd (an unchecked `-3` rotates, and the popd
+    // then lands on `a` instead of `docs`).
+    has("cd a; pushd ../docs; pushd ../b; pushd -n -3 +1; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R5b: …the skipped rotation is visible in the next popd — it lands on docs, not a");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n -3 +1; popd; echo x > tracked.md", "R5b gate: TRACKED docs/tracked.md → BLOCK (an unchecked `-3` rotated anyway and the popd landed on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n -2; echo x > tracked.md", "redirect:H/b/tracked.md", "R5b control: `pushd -n -2` is a legal IDENTITY under -n — rc 0, stack and cwd unchanged");
+    has("cd a; pushd ../docs; pushd $NOPE; echo x > tracked.md", "redirect:H/a/tracked.md", "R5c: `pushd $NOPE` — an unquoted empty expansion is REMOVED, so bash runs a BARE pushd and swaps to a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd $NOPE; echo x > tracked.md", "R5c gate: TRACKED a/tracked.md → BLOCK (the no-cd/no-push model stayed in docs → ALLOW)");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd $NOPE; echo x > tracked.md", "R5c control: the OTHER reality (a real directory expansion) must be graded too — both are emitted");
+    has("cd a; pushd ../docs; pushd ~; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R5d: `pushd ~` cds to $HOME (an unquoted tilde is never removed), so the popd lands back on docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ~; popd; echo x > tracked.md", "R5d gate: TRACKED docs/tracked.md → BLOCK (the no-cd/no-push model landed on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd -n ~; popd; echo x > tracked.md", `redirect:${join(process.env.HOME || "/root", "tracked.md")}`, "R5e: `pushd -n ~` inserts $HOME, so the popd cd's THERE (the stack is skewed by one otherwise)");
+    // ── #3955 review round 6. The round-5 tilde branch keyed on the DE-QUOTED
+    // word (`readWord` strips quotes) and sliced `~/x` wrongly:
+    //  • bash expands `~` LEXICALLY, so a QUOTED or ESCAPED `~` reaches pushd
+    //    literally — `pushd "~"` / `'~'` / `\~` are rc 1 with nothing changed,
+    //    while the round-5 model cd'd to $HOME (meas FOPEN, a regression vs round 4);
+    //  • `resolve(HOME, "~/x".slice(1))` keeps the leading `/`, so resolve()
+    //    DISCARDED HOME and produced the ROOT path — `/docs`, not `$HOME/docs`.
+    has("cd a; pushd \"~\"; echo x > tracked.md", "redirect:H/a/tracked.md", "R6a: a QUOTED tilde is a literal `~` — bash errors and changes nothing");
+    blocks(["a/tracked.md"], "cd a; pushd \"~\"; echo x > tracked.md", "R6a gate: TRACKED a/tracked.md → BLOCK (expanding the de-quoted `~` moved the write to $HOME → ALLOW)");
+    has("cd a; pushd '~'; echo x > tracked.md", "redirect:H/a/tracked.md", "R6b: single-quoted `~` is literal too");
+    has("cd a; pushd \\~; echo x > tracked.md", "redirect:H/a/tracked.md", "R6b control: an ESCAPED `~` is literal (#3955 review round 6)");
+    has("cd a; pushd -n \"~\"; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R6c: `pushd -n \"~\"` inserts the literal string, so the popd's cd FAILS and the cwd stays a");
+    // `~/sub` needs HOME to point INSIDE the fixture, where the directory exists.
+    {
+      const savedHome = process.env.HOME;
+      process.env.HOME = H;
+      has("cd a; pushd ~/docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "R6d: `pushd ~/docs` cds to $HOME/docs (slice(2) — slice(1) kept the `/` and resolved the ROOT)");
+      blocks(["docs/tracked.md"], "cd a; pushd ~/docs; echo x > tracked.md", "R6d gate: TRACKED docs/tracked.md → BLOCK (`/docs` does not exist, so the no-cd model stayed in a → ALLOW)");
+      has("cd a; pushd -n ~/sub; popd; echo x > tracked.md", "redirect:H/sub/tracked.md", "R6e: `pushd -n ~/sub` inserts $HOME/sub, so the popd cd's there");
+      has(`cd a; pushd ~/"/docs"; echo x > tracked.md`, "redirect:H/docs/tracked.md", "R8a control: `~/\"/docs\"` — the FIRST unquoted / ends the prefix, so the tilde IS expanded");
+      has("cd a; pushd ~//docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "R8b: a DOUBLED separator still resolves under $HOME (strip separators, don't slice a fixed count)");
+      process.env.HOME = savedHome;
+    }
+    // ⛔ R6f PINS A DECLARED RESIDUAL, not a truth claim: bash's answer for
+    // `pushd $VAR +N` depends on the VALUE (an empty expansion is removed ⇒ a
+    // rotation WITH its cd; a non-empty one is "too many arguments" ⇒ nothing
+    // changes). The two realities differ in the DIR STACK, so a cwd-only fork was
+    // measured WORSE than no fork (it rotated the one stack and published a cwd
+    // that stack no longer supports). This row pins the LITERAL reading — the
+    // same one `origin/main` produced — and the other half is declared in the
+    // module. Do NOT "fix" this row by expecting `a`.
+    has("cd a; pushd ../docs; pushd $NOPE +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R6f (DECLARED RESIDUAL): `pushd $VAR +N` keeps the 'too many arguments' reality — see the module's residual note before changing it");
+    // ⛔ THE PAIR of the row above: the round-6 cwd-only fork emitted BOTH `a` and
+    // `docs`, and `has()` alone cannot tell that apart from the reverted model. This
+    // control is what reddens if the fork comes back.
+    allows(["a/tracked.md"], "cd a; pushd ../docs; pushd $NOPE +1; echo x > tracked.md", "R6f control: the empty-expansion rotation is DECLARED-unmodelled — the model must NOT emit a (a cwd-only fork did)");
+    // ── #3955 review round 8. `pushd -n <relative>` stores the operand STRING in
+    // bash, so a `cd` between the insert and the popd changes where the popd
+    // lands; the eager `resolve(cwd, word)` published a path bash never wrote.
+    // MEASURED (cwd `H`): `pushd sub; pushd -n ../docs; cd ..; popd` — bash's popd
+    // fails from `H` and stays there; the eager model landed in `docs`.
+    has("pushd sub; pushd -n ../docs; cd ..; popd; echo x > tracked.md", "redirect:H/tracked.md", "R7a: a RELATIVE `pushd -n` operand is resolved at the LATER cd, not at insert time");
+    blocks(["tracked.md"], "pushd sub; pushd -n ../docs; cd ..; popd; echo x > tracked.md", "R7a gate: TRACKED H/tracked.md → BLOCK (the eager model landed in docs → ALLOW)");
+    allows(["docs/tracked.md"], "pushd sub; pushd -n ../docs; cd ..; popd; echo x > tracked.md", "R7a control: …and the eager landing must NOT be graded");
+    has("cd a; pushd -n ../docs; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R7b control: with NO intervening cd the raw operand resolves exactly as the eager model did (docs)");
+    has("pushd sub; pushd -n ../a; cd ..; popd; echo x > tracked.md", "redirect:H/tracked.md", "R7b: same, with a different relative operand (`../a`)");
+    // `~` is expanded only when its PREFIX (up to the first UNQUOTED `/`) is unquoted.
+    has(`cd a; pushd ~"/docs"; echo x > tracked.md`, "redirect:H/a/tracked.md", "R8a: `~\"/docs\"` — the separator is QUOTED, so the tilde is literal and pushd fails");
+    blocks(["a/tracked.md"], `cd a; pushd ~"/docs"; echo x > tracked.md`, "R8a gate: TRACKED a/tracked.md → BLOCK (expanding it moved the write to $HOME/docs → ALLOW)");
+    // ── #3955 review ROUND 9: an EXPLICITLY EMPTY operand (`""` / `''`).
+    // `readOperandWords` treated the empty de-quoted word as "no word here", which
+    // DROPPED the operand and collapsed every one of these forms onto a different
+    // bash form — `pushd ""` became a BARE `pushd` (the swap), `popd ""` became a
+    // BARE `popd` (the cd to element 1), and `pushd "" ../b` lost its "too many
+    // arguments" error. MEASURED (bash 5.2.21), and each row below is graded by
+    // the tracked file real bash overwrites. ⛔ The E1 family is a REGRESSION this
+    // head introduced (origin/main BLOCKed it): the bare-`pushd` collapse moved the
+    // write from the TRACKED hub root to `a/` → ALLOW.
+    has("cd a; pushd ..; pushd \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E1: `pushd \"\"` is `pushd .` — bash inserts a duplicate of the cwd and does NOT swap");
+    blocks(["tracked.md"], "cd a; pushd ..; pushd \"\"; echo x > tracked.md", "E1 gate: TRACKED H/tracked.md → BLOCK (reading the empty word as ABSENT runs a bare pushd → a → ALLOW)");
+    allows(["a/tracked.md"], "cd a; pushd ..; pushd \"\"; echo x > tracked.md", "E1 anti-narrowing: …so the a resolution must NOT be graded either (no swap happened)");
+    has("cd a; pushd ..; pushd ''; echo x > tracked.md", "redirect:H/tracked.md", "E1b: single-quoted empty is the same word (bash: `cd \"\"` is a successful no-op)");
+    has("cd a; pushd ..; pushd -- \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E1c: the `--` marker does not change it — after it the empty word is still a LITERAL directory operand");
+    has("cd a; pushd ..; pushd ../b; pushd \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E1d: the empty operand INSERTS on a 3-entry stack too — the cwd stays at the hub root");
+    has("cd a; pushd ..; pushd \"\" ../b; echo x > tracked.md", "redirect:H/tracked.md", "E2: `pushd \"\" ../b` is still 'too many arguments' — bash changes NOTHING (cwd stays the hub root)");
+    blocks(["tracked.md"], "cd a; pushd ..; pushd \"\" ../b; echo x > tracked.md", "E2 gate: TRACKED H/tracked.md → BLOCK (dropping the empty word left ONE operand, so the model cd'd to b → ALLOW)");
+    // ⛔ A PIN, NOT A DISCRIMINATOR: this row already passed on the pre-fix head
+    // (the dropped word left the main walker on the `""` token, which it read as an
+    // empty command word — landing on the hub root by accident). It is kept so the
+    // rule stays pinned from the other side, and it is NOT counted as non-vacuity.
+    has("cd a; pushd ..; pushd ../b \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E2b (pin): the empty word LAST is still 'too many arguments' — cwd stays the hub root");
+    has("cd a; pushd ..; popd \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E3: `popd \"\"` is an INDEX operand equal to `-0` — the LAST entry is dropped with NO cd, so the cwd stays at the hub root");
+    blocks(["tracked.md"], "cd a; pushd ..; popd \"\"; echo x > tracked.md", "E3 gate: TRACKED H/tracked.md → BLOCK (reading it as the bare form cd'd to a → ALLOW)");
+    has("cd a; pushd ..; popd -n \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E3b: `popd -n \"\"` drops the same entry (`-n` adds nothing: `\"\"` already never cds)");
+    // `pushd -n ""` splices the operand STRING (empty) in at index 1; `cd ""` is a
+    // successful no-op, so the consuming popd eats that entry and the cwd stays put.
+    has("cd a; pushd ../docs; pushd -n \"\"; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "E4: `pushd -n \"\"` inserts the EMPTY STRING (never stat'd) — the popd consumes it, cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd -n \"\"; popd; echo x > tracked.md", "E4 gate: TRACKED docs/tracked.md → BLOCK (never inserting skewed the stack by one, so the popd landed on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd -n ../b \"\"; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "E4 control: under `-n` a TRAILING empty word is ignored — the FIRST operand (../b) is what gets inserted");
+    // Positive controls: the empty word must not be confused with ABSENCE.
+    has("cd a; pushd ..; pushd; echo x > tracked.md", "redirect:H/a/tracked.md", "E5 control: a genuinely BARE `pushd` still SWAPS to a — the empty-operand fix must not eat it");
+    blocks(["a/tracked.md"], "cd a; pushd ..; pushd; echo x > tracked.md", "E5 control gate: TRACKED a/tracked.md → BLOCK (the swap resolution is real)");
+    has("cd a; pushd ..; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "E5 control: a genuinely BARE `popd` still cd's to element 1 (a)");
+    has("cd a; pushd ..; pushd \"\" \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E5 control: TWO empty words are still 'too many arguments' (the empty operand is a word, not a no-op)");
+    // ── #3955 review ROUND 10. Three defects in the ROUND-9 fix itself, each a
+    // REGRESSION against `origin/main` (which landed on the hub root BY ACCIDENT:
+    // `resolve(cwd, "")` is the cwd, so returning the empty word to the shared cd
+    // path was right there). They are the same provenance class — a rule keyed on
+    // the DE-QUOTED word — at three different sites.
+    //  • the quoted-empty spelling is FOUR forms: `$''` and `$""` reach pushd as a
+    //    KEPT empty operand exactly like `""`, but the round-9 raw test matched only
+    //    the bare quote characters, so those two collapsed onto the bare-`pushd`
+    //    SWAP (measured: `pushd $''` ⇒ dirs `H H H/a`, cwd `H`).
+    has("cd a; pushd ..; pushd $''; echo x > tracked.md", "redirect:H/tracked.md", "F1: `pushd $''` is an explicitly EMPTY operand — bash keeps it, so this is `pushd .`");
+    blocks(["tracked.md"], "cd a; pushd ..; pushd $''; echo x > tracked.md", "F1 gate: TRACKED H/tracked.md → BLOCK (only the bare quote chars matched, so `$''` collapsed onto the SWAP → a → ALLOW)");
+    has("cd a; pushd ..; pushd $\"\"; echo x > tracked.md", "redirect:H/tracked.md", "F1b: `$\"\"` (locale-quoting) is the same empty operand");
+    has("cd a; pushd ..; pushd -- $\"\"; echo x > tracked.md", "redirect:H/tracked.md", "F1c: …and after the `--` marker too");
+    has("cd a; pushd ..; pushd $'' ../b; echo x > tracked.md", "redirect:H/tracked.md", "F1d: `pushd $'' ../b` is 'too many arguments' — a dropped `$''` left ONE valid operand and cd'd to b");
+    //  • an FD prefix is an **UNQUOTED** digit run. bash demotes `N>` to an io-number
+    //    only when the digits reach it unquoted; a quoted/escaped `2` is an ordinary
+    //    operand (and `pushd 2` really FAILS — no such directory), so the cwd stays.
+    has("cd a; pushd ..; pushd '2'>/dev/null; echo x > tracked.md", "redirect:H/tracked.md", "F2: `pushd '2'>/dev/null` — the QUOTED 2 is an operand, not an FD prefix, and the cd fails");
+    blocks(["tracked.md"], "cd a; pushd ..; pushd '2'>/dev/null; echo x > tracked.md", "F2 gate: TRACKED H/tracked.md → BLOCK (testing the DE-QUOTED word swallowed the operand ⇒ zero operands ⇒ the bare SWAP → a → ALLOW)");
+    has("cd a; pushd ..; pushd \"\"2>/dev/null; echo x > tracked.md", "redirect:H/tracked.md", "F2b: a QUOTED-EMPTY prefix does not make the 2 an io-number either — the operand is the word `2`");
+    has("cd a; pushd ..; pushd \\2>/dev/null; echo x > tracked.md", "redirect:H/tracked.md", "F2c: an ESCAPED 2 is an operand too");
+    has("cd a; pushd ..; pushd 2>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "F2 control: an UNQUOTED `2>` IS an FD prefix — zero operands is a genuine BARE pushd (swap to a)");
+    //  • `popd ""`'s `-0` must actually REMOVE an entry. `sel` is regexp-match-shaped
+    //    (`sel[1]` sign, `sel[2]` digits), and writing `["-", "0"]` left `sel[2]`
+    //    undefined ⇒ `idx0` NaN ⇒ `S.slice(0,NaN)` is the WHOLE array ⇒ NO removal,
+    //    while the cwd (the only thing E3 observes) still looked right. These rows
+    //    observe the STACK through the next verb.
+    has("cd a; pushd ../docs; pushd ../b; popd \"\"; popd -1; echo x > tracked.md", "redirect:H/docs/tracked.md", "F3: `popd \"\"` really DROPS the last entry — the following `popd -1` lands in docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd \"\"; popd -1; echo x > tracked.md", "F3 gate: TRACKED docs/tracked.md → BLOCK (a NaN index removed nothing, so the next popd stayed one entry off in b → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd \"\" \"\"; popd -1; echo x > tracked.md", "redirect:H/docs/tracked.md", "F3b: a repeated empty operand is still ONE `-0` (bash: the same single removal)");
+    has("cd a; pushd ..; popd \"\"; popd; echo x > tracked.md", "redirect:H/tracked.md", "F3c: …and on a 2-entry stack the dropped entry leaves the bare popd with nothing to cd to (bash: 'no other directory', cwd stays)");
+    //  • `popd "$VAR"` — an unprovable operand has THREE realities and only ONE
+    //    moves the cwd (an UNQUOTED empty expansion is removed ⇒ bare popd). The
+    //    other two (`-0` for the quoted-empty spelling, `invalid argument` for a
+    //    non-empty value) keep the cwd AND the stack, so applying the bare mutation
+    //    as the primary desynchronised the stack for every LATER verb. Measured, and
+    //    each of these three reddened before the fix.
+    has("cd a; pushd ../b; pushd ../docs; pushd -n ../a; popd \"$E\"; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "F4: `popd \"$E\"` (E unset) leaves the stack alone, so the next popd cd's to the retained ../a entry (a)");
+    blocks(["a/tracked.md"], "cd a; pushd ../b; pushd ../docs; pushd -n ../a; popd \"$E\"; popd; echo x > tracked.md", "F4 gate: TRACKED a/tracked.md → BLOCK (consuming ../a at the unprovable popd left the next one resolving b/docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd \"$E\"; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4b: …same on a plain 3-entry stack — the next popd lands in docs");
+    has("cd a; pushd ../docs; pushd -n ../b; popd \"$E\"; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "F4c: …and on the `-n` insert, where the retained entry IS the inserted b");
+    has("cd a; pushd ../docs; popd $NOPE; echo x > tracked.md", "redirect:H/a/tracked.md", "F4 control: the ONE moving reality is still emitted — an UNQUOTED `$NOPE` is removed, so bash runs a bare popd (a)");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd $NOPE; echo x > tracked.md", "F4 control gate: TRACKED a/tracked.md → BLOCK (the bare-popd landing must stay in the emitted set, not be replaced by the no-move one)");
+    has("cd a; pushd ../docs; popd \"$E\"; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4 control: the IMMEDIATE write after a quoted unprovable operand keeps the cwd (docs) — the no-move reality is the primary");
+    // ── #3955 review ROUND 11. Three defects in ROUND 10's fixes, each measured
+    // against real bash 5.2.21 before it was written.
+    //  • `popd "$VAR"` vs `popd $VAR`: the QUOTING decides the empty-word reality, so
+    //    there is no single "no move" answer. `readWord` strips the quoting, so
+    //    `readOperandWords` now records it. Unquoted + empty ⇒ the word is REMOVED ⇒ a
+    //    BARE `popd` (element 0 moves AND it cds); quoted + empty ⇒ kept ⇒ `-0` (drop
+    //    the LAST entry, no cd). Round 10 left the stack untouched for both, which
+    //    fixed the quoted chains and BROKE the unquoted one — the moving reality lost
+    //    its stack effect, so the next popd landed in docs where bash is in a.
+    has("cd a; pushd ../docs; pushd ../b; popd $NOPE; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "G1: `popd $NOPE` (UNQUOTED, empty) is the word REMOVED ⇒ a bare popd — the next popd lands in a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd $NOPE; popd; echo x > tracked.md", "G1 gate: TRACKED a/tracked.md → BLOCK (leaving the stack untouched for both spellings resolved docs → ALLOW)");
+    has("cd a; pushd ../docs; popd $NOPE; echo x > tracked.md", "redirect:H/a/tracked.md", "G1b: the immediate write after the bare popd really moves the cwd to a");
+    has("cd a; pushd ../docs; popd \"$E\"; echo x > tracked.md", "redirect:H/docs/tracked.md", "G1 control: the QUOTED spelling is `-0` — no cd, the cwd stays docs");
+    //  • `-n` COMBINES with an unprovable operand, and the unprovable fork must run
+    //    BEFORE the bare-`popd -n` branch (it used to sit after it, so the operand was
+    //    ignored). QUOTED + `-n` + empty ⇒ drop the LAST entry (`popd -n ""`).
+    has("cd a; pushd ../docs; pushd ../b; popd \"$E\" -n; popd -1; echo x > tracked.md", "redirect:H/docs/tracked.md", "G2: `popd \"$E\" -n` drops the LAST entry, so the following `popd -1` lands in docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd \"$E\" -n; popd -1; echo x > tracked.md", "G2 gate: TRACKED docs/tracked.md → BLOCK (the bare-`-n` branch ran first and dropped element 1, leaving the next popd in a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd -n $NOPE; popd -1; echo x > tracked.md", "redirect:H/a/tracked.md", "G2b: …and UNQUOTED + `-n` is the bare `popd -n` reality — element 1 moves, so the next `popd -1` lands in a");
+    //  • a LINE CONTINUATION does not un-quote an FD prefix: bash deletes `\`+newline
+    //    BEFORE tokenising, so `2\<NL>3>` is the io-number 23 (0 operands ⇒ a bare
+    //    `pushd`). The raw-source test rejected it and kept "23" as an operand.
+    has("cd a; pushd ..; pushd 2\\\n3>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "G3: `pushd 2\\<NL>3>/dev/null` is the io-number 23 — a genuine FD prefix, so the operand count is ZERO and this is a bare pushd (swap to a)");
+    blocks(["a/tracked.md"], "cd a; pushd ..; pushd 2\\\n3>/dev/null; echo x > tracked.md", "G3 gate: TRACKED a/tracked.md → BLOCK (the continuation made the raw test fail, so `23` became an operand, its cd failed and the cwd stayed at the hub root → ALLOW)");
+    has("cd a; pushd ..; pushd 1\\\n2>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "G3b: same with a two-digit io-number split after the FIRST digit");
+    has("cd a; pushd ..; pushd 2>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "G3 control: the unsplit spelling stays an FD prefix (bare pushd)");
+
+  }
+
 
   // walk (`>`/`>>`/`tee`/python open) never surfaced `sed -i`/`cp`/`mv`/
   // `truncate`/`dd of=`/`perl -pi`/`awk -i inplace` onto a tracked hub file,
