@@ -1715,7 +1715,16 @@ def leg_round7() -> None:
     # ⛔ ROUND 12: the CONSTRUCTION, not the nouns (this corpus is written with nouns the list did not
     # already carry), the Spanish slice, requests to the owner that carry no hand-off phrase, and the
     # tense bug in `_PAST_STATE` (a block that is STILL RUNNING).
-    for txt in ("The schema is ready and pending your blessing.",
+    # ⛔ ROUND 13: the owner as a PRONOUN OBJECT, not a possessive determiner. Every construction the
+    # previous round added was anchored on the literal token `your`, so a deferral that ENDS ON the
+    # owner had no member at all — "…and the suite is green.\n\nBlocked on you." read `not-asked` and
+    # `turn-end.py` typed "continue" into a lane waiting on its owner.
+    for txt in ("The schema change is written and the suite is green.\n\nBlocked on you.",
+                "I need a decision from you.",
+                "Holding here until you weigh in.",
+                "Pending approval.",
+                "Blocked until approval.",
+                "The schema is ready and pending your blessing.",
                 "The release waits for your OK.",
                 "Necesito tu aprobación para el deploy.",
                 "Quedo pendiente de tu aprobación.",

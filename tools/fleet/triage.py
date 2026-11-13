@@ -166,6 +166,7 @@ _HANDOFF_SHAPE = re.compile(
     r"(?m)^\s*(?:awaiting|waiting on|waiting for your|pending your|tell me|ping me|reply|your move|"
     r"your input|i'?ll (?:wait|hold|pause)|i am (?:holding|waiting)|i'?m (?:holding|waiting|pausing)|"
     r"this needs your|needs your|blocked on your|holding (?:the|this|it)|over to you|"
+    r"blocked on you|waiting on you|pending approval|holding here|"
     r"(?:i )?will wait)\b")
 
 # ⛔ NON-ENGLISH, DELIBERATELY MINIMAL (round 5, #4046 P1). The fleet's lanes write in Spanish when the
@@ -462,6 +463,17 @@ _HANDOFF = (
     # path must not depend on the owner's punctuation.
     "necesito tu ", "necesita tu ", "quedo pendiente", "pendiente de tu ", "a la espera de tu ",
     "espero tu ", "esperando tu ", "espera tu ", "requiere tu ", "requiero tu ",
+    # ⛔ THE OWNER AS A PRONOUN OBJECT, NOT A POSSESSIVE DETERMINER (fresh-context review round 13,
+    # #4046 P1). Every construction above is anchored on the literal token `your`, so a deferral that
+    # ENDS ON the owner had no member at all — and the inconsistency was already inside the list:
+    # `waiting on you` was present while `blocked on you` was not. Measured through the real reader:
+    # the tail "Blocked on you." read `not-asked` and `turn-end.py` typed "continue" into a lane
+    # waiting on its owner — the expensive error, in the direction this module's docstring forbids
+    # absolutely. Same hole, same position: "I need a decision from you.", "Holding here until you
+    # weigh in.", "Pending approval.", "Blocked until approval."
+    "blocked on you", "blocked by you", "blocked until approval", "awaiting you",
+    "from you", "pending approval", "need a decision", "needs a decision", "need a call",
+    "holding here", "hold here until", "until you weigh in", "until you have",
 )
 ASKED = "asked"
 NOT_ASKED = "not-asked"

@@ -13,7 +13,7 @@ command is quoted verbatim so it can be re-run.
 
 | command | result |
 |---|---|
-| `python3.12 tools/fleet/triage.test.py` | `PASS=470 FAIL=0` |
+| `python3.12 tools/fleet/triage.test.py` | `PASS=475 FAIL=0` |
 | `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (21 RED controls, all fired) |
 | `uv run --quiet --with pytest --with pytest-timeout python -m pytest scripts/ -q --timeout=180` | `1436 passed, 3 skipped, 1 xpassed in 216.96s` |
 | `python3.12 tools/fleet/liveness.test.py` | `PASS=58 FAIL=0` (+ `every stated count matches the suite (58 tests, 113 mutations)`) |
@@ -121,12 +121,14 @@ consequence is a paused finished lane and a bogus question, which is the cheap d
 
 | 12 (`d914e06c7`) | **[P1]** round 11's `_PAST_STATE` matched a BAG OF WORDS between the completion and the dependency, including `has been`/`since`/`yesterday` — which mark a block that is STILL RUNNING, so *"…the release **has been** blocked on your approval since Tuesday."* read `not-asked` → `send-continue`; **[P1]** the deferral vocabulary was still enumerated **per noun** despite the commit saying otherwise (*"pending your blessing"*, *"waits for your OK"*, and 4 of 4 invented SPANISH declarative asks all missed); **[P1]** `please` was broad where it suppressed asks and narrow where it would admit them (*"Please review the vendor invoice."* read `not-asked`); **[P2]** the `_pane_lines` doubling was pinned by NOTHING — reverting it left the suite at its exact baseline; **[P2]** `is/stays parked` in `_HOLD_CUE` made *"Per your decision last week the release is parked."* an ask | `_PAST_STATE` now tests the PREDICATE's own auxiliary (`had|was|were` immediately before it); the deferral **construction** replaced the noun list (`pending your \w+`, `awaiting your \w+`, `need your \w+`, plus the Spanish `necesito tu`, `quedo pendiente`, `a la espera de tu`); ONE `_IMPERATIVE` request-verb list both admits a clause and gates the denial carve-out; `parked` removed; **R20** pins the pane-window doubling with a fake that records the window and shows that the first window alone could not verify |
 
+| 13 (`66250f215`) | **[P1]** every deferral construction the previous round added was anchored on the possessive `your`, so a deferral that ENDS ON the owner had no member at all — *"The schema change is written and the suite is green.\n\n**Blocked on you.**"* read `not-asked` and `turn-end.py` typed "continue" into a lane waiting on its owner; the inconsistency was already inside the list (`waiting on you` present, `blocked on you` absent). Same position: *"I need a decision from you."*, *"Holding here until you weigh in."*, *"Pending approval."*, *"Blocked until approval."* | `_HANDOFF` gained the pronoun-object constructions and `_HANDOFF_SHAPE` the same forms, so the shape catcher stops missing the position the closed list missed |
+
 ## What changed
 
 ```
 tools/fleet/triage.py          NEW  the router: precedence, wedged subcases, remedies, proof table
 tools/fleet/triage_arms.py     NEW  the three arms, each proving its effect at its artifact
-tools/fleet/triage.test.py     NEW  hermetic suite, 470 assertions, 21 RED controls
+tools/fleet/triage.test.py     NEW  hermetic suite, 475 assertions, 21 RED controls
 scripts/lane-route.py          NEW  operator CLI (route / --json / --apply)
 scripts/turn-end.py            MOD  gates its WIP nudge on route_gate(), and APPLIES a
                                     user-question route (batched, capped, bounded, logged)
