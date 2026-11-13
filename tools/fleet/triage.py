@@ -563,6 +563,18 @@ def asks_owner(text: str) -> str:
     discipline `liveness.py` applies to an unreadable turn boundary. An empty or unparseable read
     cannot be read as `not-asked`, because that reading is the one that licenses the harmful message.
 
+    ⛔ THIS FUNCTION IS A HEURISTIC, AND ITS DEFAULT IS THE WRONG WAY ROUND. Fourteen fresh-context
+    reviews each falsified the previous one's vocabulary: the detector asks "does a listed phrase
+    appear?", so a deferral phrased outside the list reads `not-asked` and the nudger types
+    "continue" into a lane waiting on its owner. Enumerating more phrases moves the hole one
+    construction over — measured across rounds 7-14, every single finding was in this function and
+    none in `route()`, the arms or the proofs (663,552 enumerated combinations, zero violations).
+    The structural close is therefore NOT a longer list: it is a caller that already knows the answer.
+    `Evidence.ask_signal` exists for exactly that, and a Jev-covered caller (`turn-classify.py`
+    classifies the same turn) should always supply it. A readable tail this function cannot classify
+    positively is a `not-asked` it has not earned — that is the residual recorded on the issue this
+    change links to, and it is stated here rather than left for the next reviewer to rediscover.
+
     ⛔ A QUESTION MARK ANYWHERE IN THE READABLE TAIL IS THE SIGNAL (round 2, #4046 P1). Round 1 read
     only the last paragraph and then only the last two; both windows were falsified by the same shape —
     a question followed by one or two status paragraphs ("Should I merge?\n\nI checked the diff.\n\n
