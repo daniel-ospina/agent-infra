@@ -5675,6 +5675,38 @@ try {
     // main walker instead of consuming it.
     has("cd a; pushd ../docs > tracked.md", "redirect:H/a/tracked.md", "R4d: a redirect attached to the verb is still a write target (`pushd ../docs > tracked.md`)");
     blocks(["a/tracked.md"], "cd a; pushd ../docs > tracked.md", "R4d gate: TRACKED a/tracked.md → BLOCK (the argv scan must not swallow the redirect)");
+    // ── #3955 review round 5. Two rules were wrong in the round-4 code:
+    //  • the RANGE CHECK ran on the TRANSFORMED index instead of the source `N`
+    //    (bash: error iff `N >= len`, same for both signs and both modes) — so a
+    //    too-deep `-N` under `-n` was accepted AND a later in-range operand was
+    //    applied (`pushd -n -3 +1`), while a LEGAL identity `-N` (N = len-1) was
+    //    rejected and the form dropped (`pushd -2 +1` on a 3-entry stack);
+    //  • an unprovable `$VAR` operand was modelled as "no cd AND no push", which
+    //    is where bash lands only on a 1-ENTRY stack — an unquoted empty
+    //    expansion is REMOVED, so bash runs a BARE `pushd` (swap), and `~`
+    //    always cds to $HOME.
+    // MEASURED (bash 5.2.21), 3-entry stack `[b, docs, a]`:
+    //   `pushd -2 +1`      rc 0, applies +1 ⇒ cwd docs (the IDENTITY -2 is legal)
+    //   `pushd -n -3 +1`   rc 1 "-3: index out of range" ⇒ NOTHING changes, cwd b
+    //   `pushd -n -2`      rc 0, identity ⇒ cwd b, stack unchanged
+    //   `cd a; pushd ../docs; pushd $NOPE`  ⇒ bare pushd swap ⇒ cwd a
+    //   `cd a; pushd ../docs; pushd ~; popd` ⇒ cwd docs
+    has("cd a; pushd ../docs; pushd ../b; pushd -2 +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R5a: `pushd -2 +1` — `-2` is a legal IDENTITY on a 3-entry stack, so the LAST operand (+1) still applies");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -2 +1; echo x > tracked.md", "R5a gate: TRACKED docs/tracked.md → BLOCK (bounding the transformed index rejected `-2` and dropped the form → b → ALLOW)");
+    allows(["b/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -2 +1; echo x > tracked.md", "R5a control: …so the b resolution must NOT be graded either (the rotation really happens)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n -3 +1; echo x > tracked.md", "redirect:H/b/tracked.md", "R5b: `pushd -n -3 +1` — `-3` is out of range on a 3-entry stack, so bash applies NOTHING (the later +1 is never reached)");
+    // …and the STACK is the observable: `-n` never cds, so the error is only
+    // visible through the NEXT popd (an unchecked `-3` rotates, and the popd
+    // then lands on `a` instead of `docs`).
+    has("cd a; pushd ../docs; pushd ../b; pushd -n -3 +1; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R5b: …the skipped rotation is visible in the next popd — it lands on docs, not a");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; pushd -n -3 +1; popd; echo x > tracked.md", "R5b gate: TRACKED docs/tracked.md → BLOCK (an unchecked `-3` rotated anyway and the popd landed on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd -n -2; echo x > tracked.md", "redirect:H/b/tracked.md", "R5b control: `pushd -n -2` is a legal IDENTITY under -n — rc 0, stack and cwd unchanged");
+    has("cd a; pushd ../docs; pushd $NOPE; echo x > tracked.md", "redirect:H/a/tracked.md", "R5c: `pushd $NOPE` — an unquoted empty expansion is REMOVED, so bash runs a BARE pushd and swaps to a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd $NOPE; echo x > tracked.md", "R5c gate: TRACKED a/tracked.md → BLOCK (the no-cd/no-push model stayed in docs → ALLOW)");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd $NOPE; echo x > tracked.md", "R5c control: the OTHER reality (a real directory expansion) must be graded too — both are emitted");
+    has("cd a; pushd ../docs; pushd ~; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R5d: `pushd ~` cds to $HOME (an unquoted tilde is never removed), so the popd lands back on docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ~; popd; echo x > tracked.md", "R5d gate: TRACKED docs/tracked.md → BLOCK (the no-cd/no-push model landed on a → ALLOW)");
+    has("cd a; pushd ../docs; pushd -n ~; popd; echo x > tracked.md", `redirect:${join(process.env.HOME || "/root", "tracked.md")}`, "R5e: `pushd -n ~` inserts $HOME, so the popd cd's THERE (the stack is skewed by one otherwise)");
   }
 
 

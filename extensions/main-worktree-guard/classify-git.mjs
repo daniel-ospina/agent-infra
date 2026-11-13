@@ -8452,6 +8452,15 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //   for `popd` ANY other word is "invalid argument" (rc 2) with the stack AND
   //        the cwd untouched — `popd +1 extra`, `popd extra +1`, `popd -n extra`
   //        — so it must never be read as the bare form.
+  // ⛔ DECLARED RESIDUAL (not modelled here, and pre-existing for every verb in
+  // this walker): EXIT STATUS. When a dir-stack verb ERRORS, bash marks the
+  // command failed and skips a following `&&` list; this walker runs the RHS
+  // anyway, because `&&` is handled as a plain segment separator. It was inert
+  // while `pushd -n <dir>` was a no-op and became visible once that form really
+  // inserts (measured: `cd a; pushd -- && pushd -n .. ; popd; …` — bash keeps
+  // `a`, the model lands at the hub root). Correcting it means gating `&&` on
+  // the previous command's status for the WHOLE walker, which is a different
+  // change than #3955.
   const popdArgv = (args, fr) => {
     let nFlag = false, sel = null, sawDD = false, unprovable = false, invalid = false;
     for (const w of args) {
@@ -8562,12 +8571,21 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // in range: `pushd +2 +1` errors on `+2`. An identity index (`+0` in the
       // cd arm, `+0`/`-0` landing on element 0 under `-n`) is rc 0 and changes
       // NOTHING, never an error (measured).
+      // ⛔ THE BOUND IS ON THE SOURCE NUMBER `N`, NOT on the transformed index —
+      // and it is the SAME for both signs and both modes: bash errors iff
+      // `N >= len` (measured on 5.2.21, 3-entry stack `[b, docs, a]`:
+      //   `pushd -3` / `pushd -n -3`  rc 1 "-3: index out of range", nothing changes
+      //   `pushd -2` / `pushd -n -2`  rc 0, IDENTITY (dirs unchanged)
+      //   `pushd +3` / `pushd -n +3`  rc 1 ; `pushd +2` rotates
+      // ). Bounding the transformed index was wrong in BOTH directions: `-N`
+      // maps to `len-1-N` under `-n` (a too-deep `-3` slipped through and a
+      // LATER in-range operand was still applied) and to `N+1` in the cd arm
+      // (`-2` on a 3-entry stack is a LEGAL identity, yet was rejected —
+      // dropping the form AND the later operand).
       const rotOf = (m) => (m[1] === "+" ? Number(m[2]) : S.length - 1 - Number(m[2]));
       const cdOf = (m) => (m[1] === "+" ? Number(m[2]) : Number(m[2]) + 1);
-      const idxOf = nFlag ? rotOf : cdOf;
-      for (const m of nums) if (idxOf(m) >= S.length) return null;   // out of range → bash error, nothing changes
+      for (const m of nums) if (Number(m[2]) >= S.length) return null;   // out of range → bash error, nothing changes
       const last = nums[nums.length - 1];
-      const n = Number(last[2]);
       if (nFlag) {
         // No cd ever happens. bash REPLACES the rotated-in entry with the
         // current dir; that entry is element 0 of the stack, which `vstack`
@@ -8601,12 +8619,58 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     if (nFlag) {
       // -n <dir>: insert below the top, no cd. ⛔ `-n` NEVER stat()s the operand —
       // bash inserts the operand STRING verbatim and the validation happens at the
-      // LATER `popd`, which errors and leaves the cwd alone.
-      const ins = dirWord && dirWord !== "~" && !dirWord.startsWith("~/") && dirWord !== "-" && !/^[$`]/.test(dirWord)
-        ? resolve(cwd, dirWord) : null;
+      // LATER `popd`, which errors and leaves the cwd alone. `~` is expanded here
+      // because bash expands it BEFORE `pushd` sees it (measured on a 2-deep
+      // stack: `pushd -n ~; popd` lands in $HOME, not on the previous top —
+      // leaving `~` uninserted skewed the stack by one).
+      const tilde = dirWord && (dirWord === "~" || dirWord.startsWith("~/"))
+        ? (typeof process !== "undefined" && process.env && process.env.HOME ? resolve(process.env.HOME, dirWord.slice(1)) : null)
+        : undefined;
+      const ins = dirWord && dirWord !== "-" && !/^[$`]/.test(dirWord)
+        ? (tilde !== undefined ? tilde : resolve(cwd, dirWord)) : null;
       if (ins) { const S = vstack(fr.cwd); S.splice(1, 0, ins); setVStack(S); }
       return null;
     }
+    // `~` / `~/…` is NOT unprovable: bash expands it to `$HOME` before `pushd`
+    // runs, and an UNQUOTED tilde is never removed (unlike `$VAR`), so it ALWAYS
+    // cds. Leaving it a no-op was a measured fail-open — on a 2-deep stack
+    //   `cd a; pushd ../docs; pushd ~; popd; …`  bash cds to $HOME and the popd
+    // lands back in `docs`, which the no-op model read as `a`. `~user` stays
+    // undecidable (declared residual, same as `cd ~user`).
+    if (dirWord === "~" || dirWord.startsWith("~/")) {
+      const home = typeof process !== "undefined" && process.env ? process.env.HOME : null;
+      if (home) return { dirWord: resolve(home, dirWord.slice(1)) };   // `~` → HOME, `~/x` → HOME/x
+      return null;                                                        // declared residual: no HOME
+    }
+    // ⛔ AN UNQUOTED `$VAR`/BACKTICK OPERAND IS *REMOVED* WHEN EMPTY, so bash runs
+    // a BARE `pushd` (swap the top two, cd to the new top) — a bare `pushd` on a
+    // 1-deep stack is "no other directory" (rc 1, nothing changes). The expansion
+    // may also be a real directory this walker cannot read. BOTH realities are
+    // emitted, exactly as the `popd` arm above does it: the swap landing as the
+    // primary cwd and the unchanged cwd as the alt. The old no-cd/no-push model
+    // was a measured fail-open on any stack deeper than one —
+    //   `cd a; pushd ../docs; pushd $NOPE; echo x > tracked.md`
+    //   bash cwd=docs (wrote docs/tracked.md), the no-op model read a/tracked.md.
+    if (dirWord && /^[$`]/.test(dirWord)) {
+      const S = vstack(fr.cwd);
+      const keep = fr.cwd;
+      const swap = S.length > 1 ? cdTo(setVStack([S[1], S[0], ...S.slice(2)])) : null;
+      fr.pending = swap;                          // reality 1: the empty expansion ⇒ bare `pushd`
+      if (swap !== null && swap !== keep) {       // reality 2 (alt): the expansion is a real directory
+        fr.forkCwd = fr.forkCwd || swap;
+        fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== swap).slice(0, 64);
+      }
+      return null;
+    }
+    // ⛔ DECLARED RESIDUAL: `pushd -n $VAR +N` (and `pushd -n $VAR` generally).
+    // bash REMOVES the empty word, so the numeric operand then applies (`pushd -n
+    // $NOPE +1` rotates); this model drops the form entirely. Both realities share
+    // ONE cwd (`-n` never cds), so they differ only in the DIR STACK — and the
+    // fork machinery carries cwd realities, not stack realities, so this cannot
+    // be forked honestly. Measured, 3-entry stack `[b, docs, a]`:
+    //   `pushd -n $NOPE +1; popd` ⇒ bash pops to `a`, this model pops to `docs`.
+    // Exotic (a `-n` insert of an UNQUOTED variable AND a numeric operand); it is
+    // not a regression against `origin/main`, which no-opped every `-n` form.
     return { dirWord };                                          // `pushd -- <dir>` — the shared cd path
   };
   // #625: in-place OVERWRITE verb targets — a write with no primitive token.
