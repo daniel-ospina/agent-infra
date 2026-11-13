@@ -5511,8 +5511,17 @@ try {
     blocks(["a/tracked.md"], "cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "F1 gate: TRACKED a/tracked.md → BLOCK (the pre-fix walker resolved docs/ and ALLOWed a measured overwrite)");
     has("cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "redirect:H/docs/tracked.md", "F1: …AND the unchanged-cwd reality (the expansion could be a path ⇒ bash errors)");
     blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd $EMPTY; echo pwn > tracked.md", "F1 gate: TRACKED docs/tracked.md → BLOCK too (a pop-ONLY model, i.e. origin/main, ALLOWs this one)");
-    has("cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "redirect:H/a/tracked.md", "F1: the QUOTED expansion is the same class — readWord strips the quotes, not the expansion");
-    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "F1 gate: quoted `$1` → BLOCK");
+    // ⛔ CORRECTED in round 11. This pair used to assert that the QUOTED spelling
+    // behaves like the unquoted one ("readWord strips the quotes, not the
+    // expansion") — that claim is FALSE and was measured to be false: bash decides
+    // the EMPTY case on the quoting. `popd "$1"` with `$1` unset keeps an empty
+    // word ⇒ `popd ""` = `-0`, which drops the LAST entry and does NOT cd (bash
+    // 5.2.21: dirs unchanged, cwd stays docs), while the UNQUOTED `popd $EMPTY`
+    // above has its word REMOVED ⇒ a bare `popd` that really cds to `a`. Both
+    // realities are still pinned — they belong to different SPELLINGS, not to one.
+    has("cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "redirect:H/docs/tracked.md", "F1 CORRECTED: a QUOTED empty expansion is KEPT ⇒ `popd \"\"` = `-0` — no cd, the cwd stays docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "F1 CORRECTED gate: TRACKED docs/tracked.md → BLOCK");
+    allows(["a/tracked.md"], "cd a; pushd ../docs; popd \"$1\"; echo pwn > tracked.md", "F1 CORRECTED control: the QUOTED spelling must NOT emit a (it never cds) — only the UNQUOTED `popd $EMPTY` row pops");
     // `popd -n $VAR` has the same shape one branch over: `-n` never cds, so an empty
     // expansion is the bare `-n` (drop element 1) and a path is an error. The
     // stack-side divergence a LATER bare popd exposes is the declared residual.
@@ -5835,6 +5844,33 @@ try {
     has("cd a; pushd ../docs; popd $NOPE; echo x > tracked.md", "redirect:H/a/tracked.md", "F4 control: the ONE moving reality is still emitted — an UNQUOTED `$NOPE` is removed, so bash runs a bare popd (a)");
     blocks(["a/tracked.md"], "cd a; pushd ../docs; popd $NOPE; echo x > tracked.md", "F4 control gate: TRACKED a/tracked.md → BLOCK (the bare-popd landing must stay in the emitted set, not be replaced by the no-move one)");
     has("cd a; pushd ../docs; popd \"$E\"; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4 control: the IMMEDIATE write after a quoted unprovable operand keeps the cwd (docs) — the no-move reality is the primary");
+    // ── #3955 review ROUND 11. Three defects in ROUND 10's fixes, each measured
+    // against real bash 5.2.21 before it was written.
+    //  • `popd "$VAR"` vs `popd $VAR`: the QUOTING decides the empty-word reality, so
+    //    there is no single "no move" answer. `readWord` strips the quoting, so
+    //    `readOperandWords` now records it. Unquoted + empty ⇒ the word is REMOVED ⇒ a
+    //    BARE `popd` (element 0 moves AND it cds); quoted + empty ⇒ kept ⇒ `-0` (drop
+    //    the LAST entry, no cd). Round 10 left the stack untouched for both, which
+    //    fixed the quoted chains and BROKE the unquoted one — the moving reality lost
+    //    its stack effect, so the next popd landed in docs where bash is in a.
+    has("cd a; pushd ../docs; pushd ../b; popd $NOPE; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "G1: `popd $NOPE` (UNQUOTED, empty) is the word REMOVED ⇒ a bare popd — the next popd lands in a");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd $NOPE; popd; echo x > tracked.md", "G1 gate: TRACKED a/tracked.md → BLOCK (leaving the stack untouched for both spellings resolved docs → ALLOW)");
+    has("cd a; pushd ../docs; popd $NOPE; echo x > tracked.md", "redirect:H/a/tracked.md", "G1b: the immediate write after the bare popd really moves the cwd to a");
+    has("cd a; pushd ../docs; popd \"$E\"; echo x > tracked.md", "redirect:H/docs/tracked.md", "G1 control: the QUOTED spelling is `-0` — no cd, the cwd stays docs");
+    //  • `-n` COMBINES with an unprovable operand, and the unprovable fork must run
+    //    BEFORE the bare-`popd -n` branch (it used to sit after it, so the operand was
+    //    ignored). QUOTED + `-n` + empty ⇒ drop the LAST entry (`popd -n ""`).
+    has("cd a; pushd ../docs; pushd ../b; popd \"$E\" -n; popd -1; echo x > tracked.md", "redirect:H/docs/tracked.md", "G2: `popd \"$E\" -n` drops the LAST entry, so the following `popd -1` lands in docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd \"$E\" -n; popd -1; echo x > tracked.md", "G2 gate: TRACKED docs/tracked.md → BLOCK (the bare-`-n` branch ran first and dropped element 1, leaving the next popd in a → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd -n $NOPE; popd -1; echo x > tracked.md", "redirect:H/a/tracked.md", "G2b: …and UNQUOTED + `-n` is the bare `popd -n` reality — element 1 moves, so the next `popd -1` lands in a");
+    //  • a LINE CONTINUATION does not un-quote an FD prefix: bash deletes `\`+newline
+    //    BEFORE tokenising, so `2\<NL>3>` is the io-number 23 (0 operands ⇒ a bare
+    //    `pushd`). The raw-source test rejected it and kept "23" as an operand.
+    has("cd a; pushd ..; pushd 2\\\n3>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "G3: `pushd 2\\<NL>3>/dev/null` is the io-number 23 — a genuine FD prefix, so the operand count is ZERO and this is a bare pushd (swap to a)");
+    blocks(["a/tracked.md"], "cd a; pushd ..; pushd 2\\\n3>/dev/null; echo x > tracked.md", "G3 gate: TRACKED a/tracked.md → BLOCK (the continuation made the raw test fail, so `23` became an operand, its cd failed and the cwd stayed at the hub root → ALLOW)");
+    has("cd a; pushd ..; pushd 1\\\n2>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "G3b: same with a two-digit io-number split after the FIRST digit");
+    has("cd a; pushd ..; pushd 2>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "G3 control: the unsplit spelling stays an FD prefix (bare pushd)");
+
   }
 
 

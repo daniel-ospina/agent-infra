@@ -8408,6 +8408,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const readOperandWords = (k) => {
     const out = [];
     const tildes = [];                        // per operand: is the SOURCE word a BARE `~`?
+    const quoted = [];                        // per operand: was the SOURCE word QUOTED/ESCAPED? (popd's `$VAR` reality)
     // ⛔ bash expands the tilde PREFIX — everything up to the first UNQUOTED `/` — and
     // only when nothing in that prefix is quoted. So `~"/docs"` and `~\//docs` are
     // LITERAL `~` words (pushd errors, nothing moves), while `~/"/docs"` and
@@ -8433,11 +8434,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     };
     for (;;) {
       const p = skipWsNl(k);
-      if (s[p] === "#") return { args: out, tildes, k: resumeAt !== null ? resumeAt : p };
+      if (s[p] === "#") return { args: out, tildes, quoted, k: resumeAt !== null ? resumeAt : p };
       if (s[p] === ">" || s[p] === "<") {
         if (resumeAt === null) resumeAt = p;
         const r = skipRedirect(p);
-        if (r.stop) return { args: out, tildes, k: resumeAt };
+        if (r.stop) return { args: out, tildes, quoted, k: resumeAt };
         k = r.at;
         continue;
       }
@@ -8467,11 +8468,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         (s[p] === "$" && (s[p + 1] === '"' || s[p + 1] === "'"));
       if (!w.w) {
         if (emptyQuoted && w.k > p) {
-          out.push(""); tildes.push(false); k = w.k;
-          if (out.length >= 64) return { args: out, tildes, k: resumeAt !== null ? resumeAt : k };
+          out.push(""); tildes.push(false); quoted.push(true); k = w.k;
+          if (out.length >= 64) return { args: out, tildes, quoted, k: resumeAt !== null ? resumeAt : k };
           continue;
         }
-        return { args: out, tildes, k: resumeAt !== null ? resumeAt : p };
+        return { args: out, tildes, quoted, k: resumeAt !== null ? resumeAt : p };
       }
       // ⛔ AN FD PREFIX IS AN **UNQUOTED** DIGIT RUN (#3955 review round 10). bash
       // demotes `N>` to an io-number only when the digits reach it UNQUOTED; a
@@ -8481,11 +8482,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // MEASURED (bash 5.2.21) that is a regression: `pushd '2'` really fails
       // (a directory named `2` does not exist), the cwd stays put and the write
       // hits the TRACKED hub root, while the collapsed model resolved `a/` → ALLOW.
-      const rawDigits = /^[0-9]+$/.test(s.slice(p, w.k));
+      const rawDigits = /^[0-9]+$/.test(s.slice(p, w.k).replace(/\\\r?\n/g, ""));
       if (rawDigits && /^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<")) {   // `2>/dev/null` — an FD prefix
         if (resumeAt === null) resumeAt = p;
         const r = skipRedirect(w.k);
-        if (r.stop) return { args: out, tildes, k: resumeAt };
+        if (r.stop) return { args: out, tildes, quoted, k: resumeAt };
         k = r.at;
         continue;
       }
@@ -8496,8 +8497,17 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // `readWord` returns the DE-QUOTED text, so the raw start character is the
       // only place that distinction survives.
       tildes.push(bareTildeAt(p));
+      // ⛔ WAS THIS OPERAND **QUOTED** AT THE SOURCE? The `popd` arm needs it: an
+      // UNQUOTED `$VAR` that expands empty has its word REMOVED by the shell (so bash
+      // runs a BARE `popd`), while a QUOTED `"$VAR"` that expands empty KEEPS an empty
+      // word (so bash runs `popd ""` ⇒ `-0`). `readWord` has already stripped the
+      // quoting, so the RAW span is the only place this survives — MEASURED (bash
+      // 5.2.21), stack `[docs, a]` cwd `docs`: `popd $E` ⇒ dirs `[docs, a]` cwd `docs`
+      // (a bare popd), `popd "$E"` ⇒ dirs `[a, docs]` cwd `a` (`-0`, NO cd). Opposite
+      // cwds from one de-quoted word (#3955 review round 11).
+      quoted.push(/["'\\]/.test(s.slice(p, w.k)));
       k = w.k;
-      if (out.length >= 64) return { args: out, tildes, k: resumeAt !== null ? resumeAt : k };   // bounded
+      if (out.length >= 64) return { args: out, tildes, quoted, k: resumeAt !== null ? resumeAt : k };   // bounded
     }
   };
   // ── THE DIR-STACK VERBS' ARGV MODEL (#3955 review round 3), MEASURED on
@@ -8541,10 +8551,12 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //    would drop a write bash performs, the opposite failure. A different
   //    change than #3955.
   //  • `pushd -n $VAR +N`: same cwd, two stacks — see the note at the dir arm.
-  const popdArgv = (args, fr) => {
+  const popdArgv = (args, fr, quoted) => {
     let nFlag = false, sel = null, sawDD = false, unprovable = false, invalid = false;
     let emptySel = false;                         // an explicitly EMPTY operand
-    for (const w of args) {
+    let unprovableQuoted = false;                  // …and it was QUOTED at the source (see the fork)
+    for (let ai = 0; ai < args.length; ai++) {
+      const w = args[ai];
       if (sawDD) continue;                        // everything after `--` is ignored
       if (w === "--") { sawDD = true; continue; }
       if (w === "-n") { nFlag = true; continue; }
@@ -8566,7 +8578,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (w === "") { emptySel = true; continue; }
       const m = /^([+-])([0-9]+)$/.exec(w);
       if (m) { sel = m; continue; }               // LAST numeric wins
-      if (/^[$`]/.test(w)) { unprovable = true; continue; }
+      if (/^[$`]/.test(w)) {
+        unprovable = true;
+        if (quoted && quoted[ai] === true) unprovableQuoted = true;
+        continue;
+      }
       invalid = true;
     }
     // ⛔ `sel` IS REGEXP-MATCH-SHAPED — `sel[1]` is the SIGN and `sel[2]` the
@@ -8608,6 +8624,49 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       }
       return;
     }
+    // ⛔ THE QUOTING IS WHAT DECIDES WHICH REALITY THE EMPTY CASE IS (#3955 review
+    // round 11) — there is no single "no move" answer:
+    //   QUOTED   `popd "$VAR"` / `popd -n "$VAR"` — the empty word is KEPT, so bash
+    //            runs `popd ""` = `-0`: drop the LAST entry, NO cd. A non-empty value
+    //            is `invalid argument` (nothing changes).
+    //   UNQUOTED `popd $VAR` / `popd -n $VAR` — the empty word is REMOVED, so bash
+    //            runs a BARE `popd` (or bare `popd -n`): element 0/1 really moves and
+    //            a bare `popd` really cds. A non-empty value is `invalid argument`.
+    // MEASURED (bash 5.2.21), stack `[a, docs, a]` cwd `a`, `E` unset:
+    //   `popd "$E"`  ⇒ dirs `[a, docs]` cwd `a`   (`-0`)
+    //   `popd $E`    ⇒ dirs `[docs, a]` cwd `docs` (bare popd — the cwd MOVES)
+    //   `popd -n "$E"`⇒ dirs `[a, docs]`        `popd -n $E` ⇒ dirs `[a, a]`
+    // Getting the unquoted branch wrong (round 10 left the stack untouched for BOTH)
+    // is a measured fail-OPEN: `cd a; pushd ../docs; pushd ../b; popd $NOPE; popd`
+    // really ends in `a` and the untouched-stack model resolved `docs`.
+    // ⛔ REMAINING RESIDUAL (declared): the empty/non-empty split WITHIN one spelling is
+    // still a STACK divergence (the fork carries CWDs, not STACKs — `forkStackAlts`),
+    // so a LATER stack verb can still diverge on the non-empty value.
+    if (unprovable && !sel) {
+      if (unprovableQuoted) {                     // KEPT empty word ⇒ `-0` (drop LAST, no cd)
+        if (S.length > 1) setVStack(S.slice(0, S.length - 1));
+        fr.pending = keep;
+        return;
+      }
+      if (nFlag) {                                // REMOVED empty word ⇒ a BARE `popd -n`: drop element 1
+        if (S.length > 1) setVStack(S.slice(0, 1).concat(S.slice(2)));
+        fr.pending = keep;
+        return;
+      }
+      const du = dirStack.pop();                  // REMOVED empty word ⇒ a BARE `popd`: mutate AND cd
+      if (du !== undefined && cdTo(du) === null) {
+        dirStack.push(du);
+        fr.pending = null;
+        return;
+      }
+      const popUnprov = du !== undefined ? cdTo(du) : null;
+      fr.pending = popUnprov;
+      if (popUnprov !== null && popUnprov !== keep) {
+        fr.forkCwd = fr.forkCwd || popUnprov;
+        fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== popUnprov).slice(0, 64);
+      }
+      return;
+    }
     if (nFlag) {                                  // bare `popd -n` — drop element 1, keep the cwd
       if (S.length > 1) setVStack(S.slice(0, 1).concat(S.slice(2)));
       return;
@@ -8631,20 +8690,9 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     //   bash ⇒ the next popd cds to `a` (the retained `../a` entry) and the write
     //   hits `a/tracked.md`; the bare-primary model consumed `../a` HERE and left
     //   the next popd resolving {`H/b`, `H/docs`} ⇒ the tracked `a/tracked.md`
-    //   overwrite was ALLOWed. Leaving the stack alone reproduces bash exactly.
-    // ⛔ REMAINING RESIDUAL (declared, same missing machinery as `pushd $VAR +N`):
-    // the `-0` reality DROPS an entry where this keeps it, so a LATER stack verb can
-    // still diverge — the fork carries CWDs, not STACKs (`forkStackAlts`).
-    if (unprovable) {
-      const S2 = vstack(fr.cwd);
-      const bareLanding = S2.length > 1 ? cdTo(S2[1]) : null;
-      fr.pending = keep;
-      if (bareLanding !== null && bareLanding !== keep) {
-        fr.forkCwd = fr.forkCwd || keep;
-        fr.forkAlts = [...new Set([...(fr.forkAlts || []), bareLanding])].filter((x) => x !== keep).slice(0, 64);
-      }
-      return;
-    }
+    //   overwrite was ALLOWed. ⛔ THAT ROW IS THE **QUOTED** SPELLING: round 10 read it
+    //   as "leaving the stack alone reproduces bash exactly", which MEASUREMENT
+    //   FALSIFIED for the unquoted spelling — see the quoting fork below.
     const d = dirStack.pop();
     if (d !== undefined && cdTo(d) === null) {
       dirStack.push(d);                           // retained, not consumed (round-2 rule)
@@ -10090,7 +10138,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // ALLOWed.
       const argv = readOperandWords(i);
       i = argv.k;
-      popdArgv(argv.args, f());
+      popdArgv(argv.args, f(), argv.quoted);
       continue;
     }
     if (w0.w === "python" || w0.w.startsWith("python")) {
