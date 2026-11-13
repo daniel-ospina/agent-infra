@@ -3860,11 +3860,15 @@ def test_1424_the_mask_does_not_swallow_a_short_or_generic_token():
 
 
 #: Pairs that LOOK like the volatile shapes and are NOT — each one is a real
-#: identifier from this fleet. An unanchored shape rule masks every one of them,
-#: which is the fail-OPEN direction: main red in one repo directory would exempt a
-#: PR's NEW failure in another. Measured before the temp-root anchor: 107 of this
-#: repo's 430 tracked directories (`skills/commit-workflow` — `workflow` is 8
-#: characters) and 119 of 402 branch slugs matched.
+#: identifier from this fleet. A rule without the fingerprint masks every one of
+#: them, which is the fail-OPEN direction: main red in one repo directory would
+#: exempt a PR's NEW failure in another. Measured on this repo's own tree, a rule
+#: that is BOTH unanchored AND fingerprint-free masks 271 of 430 tracked
+#: directories (`docs/epics/917-lean-workflow`, `extensions/loop-enforcer`) and 119
+#: of 402 branch slugs; unanchored ALONE masks 0 today, because the digit/uppercase
+#: fingerprint is what excludes `commit-workflow`-style names (review round 5
+#: corrected this comment's earlier 107/430 claim, which was no longer
+#: reproducible).
 _STABLE_LOOKALIKES = (
     (
         "pnpm pack: /repo/skills/commit-workflow/SKILL.md missing",
