@@ -460,6 +460,158 @@ async function partB() {
     sh('git add -A && git commit -qm "committed rail"', hub);
     expectTrue("B5e (b): a script COMMITTED in the session's own repo that runs `eval '<destructive op>'` → BLOCKED",
       blocked(await bash("bash scripts/eval-rail.sh", hub)), "was allowed");
+
+    // ── agent-infra#523: a heredoc-fed interpreter runs its BODY as a program ──
+    // MEASURED RED before the fix (2026-11 on this box): every shape below was
+    // ALLOWED while the direct control `bash <file>` was BLOCKED, because
+    // `extractScriptPath` tokenized the raw text — so the FIRST BODY TOKEN was
+    // read as the script operand (`echo`, a non-file), the content walk ran on
+    // nothing, and the file the body actually executed was never read. Each arm
+    // is a real bash shape (probe-verified: a heredoc body line executes, and a
+    // script operand on the header line makes the body its stdin DATA).
+    const bodyEvil = join(work, "body-evil.sh");
+    writeFileSync(bodyEvil, `#!/bin/bash\ngit -C "${hub}" ${RESET_VERB}\n`);
+    const bodyClean = join(work, "body-clean.sh");
+    writeFileSync(bodyClean, "#!/bin/bash\necho hi\n");
+    // A script that only DRAINS its stdin: with it as the header's operand the
+    // heredoc is that script's DATA, so the body must not be walked (#523's
+    // both-directions arm — a body is a program only when the interpreter has no
+    // script operand).
+    const layoutDump = join(work, "layout-dump.sh");
+    writeFileSync(layoutDump, "#!/bin/bash\ncat >/dev/null\n");
+    expectTrue("B7a (#523): heredoc body whose FIRST line is the script → BLOCKED",
+      blocked(await bash(`bash <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7b (#523): heredoc body with a BENIGN first line → BLOCKED (the reported defect)",
+      blocked(await bash(`bash <<EOF\necho hi\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7c (#523): quoted delimiter + benign first line → BLOCKED",
+      blocked(await bash(`sh <<'X'\necho hi\n"${bodyEvil}"\nX`, hub)), "was allowed");
+    expectTrue("B7d (#523): the body PIPED into the interpreter → BLOCKED",
+      blocked(await bash(`cat <<'EOF' | bash\necho hi\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7e (#523): `<<-` tab-stripped body → BLOCKED",
+      blocked(await bash(`bash <<-EOF\n\techo hi\n\t"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7f (#523): a nested interpreter inside the body → BLOCKED",
+      blocked(await bash(`bash <<EOF\nbash "${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7g (#523): TWO files in one body — the SECOND is dirtied → BLOCKED (one path per command was not enough)",
+      blocked(await bash(`bash <<EOF\ntrue\n"${bodyClean}"\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7h (#523) control: a body that executes a HARMLESS script stays ALLOWED",
+      allowed(await bash(`bash <<EOF\necho hi\n"${bodyClean}"\nEOF`, hub)), "was blocked");
+    expectTrue("B7i (#523) control: a DATA body (`cat`, no interpreter) stays ALLOWED",
+      allowed(await bash(`cat <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was blocked");
+    expectTrue("B7j (#523) control: `bash <<EOF script.sh` — the body is the script's STDIN DATA, not a program",
+      allowed(await bash(`bash "${layoutDump}" <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was blocked");
+    // ⛔ THE ARGV-ONLY-BRANCH HOLE (found auditing this change, measured fail-OPEN).
+    // A body-resolved path's argv is NOT on the command line: the raw tokens after it are the
+    // heredoc DELIMITER and the rest of the program, so `extractScriptArgs` reported `$1 = "EOF"`
+    // — which pruned a `case "$1" in "")` branch as UNREACHABLE while the body really calls the
+    // script with NO args and runs it. The verdict must not depend on argv the shell never sees.
+    const caseEvil = join(work, "body-case-evil.sh");
+    writeFileSync(caseEvil, `#!/bin/bash\ncase "$1" in\n  "") git -C "${hub}" ${RESET_VERB} ;;\nesac\n`);
+    expectTrue("B7k (#523): a body-executed script whose mutation is an argv branch does NOT ride a phantom `$1`",
+      blocked(await bash(`bash <<EOF\n"${caseEvil}"\nEOF`, hub)), "was allowed");
+    expectTrue("B7l (#523) control: the SAME script run with an explicit non-matching arg stays ALLOWED (reachability still works)",
+      allowed(await bash(`bash "${caseEvil}" --status`, hub)), "was blocked");
+    // ⛔ ROUND-2 P1 — the `< file <<EOF` REGRESSION (measured ALLOWED on the pre-fix
+    // head, BLOCKED on `main`): bash processes redirections LEFT TO RIGHT, so the
+    // HEREDOC wins fd 0, the body executes, and the earlier `<` file is never read
+    // as a script. The predicate read only that first operand, so the body went
+    // unwalked and the only gated path was `/dev/null` (a char device the content
+    // walk skips). `bash < /dev/null <<EOF` is an ordinary idiom, so this was
+    // reachable by accident as well as deliberately.
+    expectTrue("B7m (#523 round-2 P1): `bash < /dev/null <<EOF` — the HEREDOC wins fd 0, so the body is the program → BLOCKED",
+      blocked(await bash(`bash < /dev/null <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-2 P2 — the over-block direction of the same predicate: a `-c`
+    // program's heredoc is its stdin DATA (nothing in it executes), so walking it
+    // would only gate a file that is never run. Paired with B7m, the two arms are
+    // what prove the predicate keys on WHERE THE PROGRAM COMES FROM, not on
+    // "is there a redirect".
+    expectTrue("B7n (#523 round-2 P2) control: a `-c` program's heredoc body is its stdin DATA → ALLOWED",
+      allowed(await bash(`bash -c 'cat >/dev/null' <<EOF\n"${bodyEvil}"\nEOF`, hub)), "was blocked");
+    // ⛔ ROUND-3 F1 (measured ALLOWED on the pre-fix head): a pipe to the RIGHT of
+    // the heredoc is NOT the heredoc's consumer — the LEFT shell executes the body
+    // as its program and only its STDOUT travels down the pipe. Returning the pipe
+    // consumer's verdict vetoed the body, the walk resolved nothing, and the
+    // hub-mutating script the body runs was never read (the #523 defect, reopened).
+    expectTrue("B7o (#523 round-3 F1): `bash <<EOF | bash -c …` — the OPENER executes the body → BLOCKED",
+      blocked(await bash(`bash <<EOF | bash -c 'cat >/dev/null'\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // The over-block half: when the OPENER is not a stdin-program shell the body
+    // is piped INTO the consumer, and a `-c` consumer's body is DATA — nothing in
+    // it executes, so it must stay ALLOWED.
+    expectTrue("B7p (#523 round-3 F1) control: `cat <<'X' | bash -c 'cat'` — a piped `-c` body is DATA → ALLOWED",
+      allowed(await bash(`cat <<'X' | bash -c 'cat >/dev/null'\n"${bodyEvil}"\nX`, hub)), "was blocked");
+    // ⛔ ROUND-3 F2 (measured ALLOWED on the pre-fix head): bash wants the
+    // delimiter EXACTLY, so a space-padded `   EOF` is a BODY line, not the
+    // terminator. `trim()` ended the body there and the command-line scan then
+    // resolved the benign first token (`true`) — the rest of the program, the hub
+    // mutation included, was never read.
+    expectTrue("B7q (#523 round-3 F2): a space-padded `   EOF` does not end the body → BLOCKED",
+      blocked(await bash(`bash <<EOF\n   EOF\ntrue\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-4 (blocking, an OVER-BLOCK — measured `main` ALLOW → head BLOCK):
+    // the body walk reported WHICH paths came from a body but not HOW each one
+    // runs, and the handler forced `viaInterpreter` for ALL of them. A bare body
+    // line is a DIRECT execution — the shell `execve`s it, the kernel runs the
+    // ELF/Mach-O, and bash's ENOEXEC→shell-script fallback never happens for a
+    // valid binary — so forcing the interpreter verdict re-created the #1485
+    // false block: an opaque executable whose bytes merely CONTAIN git-shaped
+    // prose was refused for the operation that prose mentions. The fixture is
+    // the SAME `fakeBin` arm B4 uses as a direct command (opaque magic + the
+    // blocked op in its bytes), so the pair proves the verdict is keyed on the
+    // INVOCATION, not on the bytes: same file, ALLOWED from a body line, and
+    // BLOCKED when a body line hands it to `bash`.
+    expectTrue("B7r (#523 round-4) control: a body line that DIRECTLY executes an opaque binary → ALLOWED (the #1485 stand-down)",
+      allowed(await bash(`bash <<EOF\n"${fakeBin}" issue list --repo o/r\nEOF`, hub)), "was blocked");
+    expectTrue("B7s (#523 round-4): the SAME binary handed to `bash` FROM THE BODY is read as text → BLOCKED",
+      blocked(await bash(`bash <<EOF\nbash "${fakeBin}"\nEOF`, hub)), "was allowed");
+    // …and the provenance term is LOAD-BEARING, not decoration: the pre-#523
+    // `scriptIsInterpreted` back-scan walks at most FOUR tokens toward the
+    // command word, so an interpreter with more than four flags in front of the
+    // script is not located and it answers FALSE (measured on `bash -e -x -u -v
+    // -f <file>`). Only the body walk's per-invocation `interpreted` sees the
+    // reader there — without that term this shape fails OPEN (the binary's bytes
+    // are read by `bash`, which runs the operation, while the gate stands down).
+    expectTrue("B7t (#523 round-4): a body line with a >4-flag interpreter still counts as INTERPRETED → BLOCKED",
+      blocked(await bash(`bash <<EOF\nbash -e -x -u -v -f "${fakeBin}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-5 F1 (blocking, an OVER-BLOCK — a REGRESSION against `main`): a
+    // heredoc attached to a CODE interpreter is that interpreter's SOURCE and the
+    // pipe carries its STDOUT, so the shell on the right NEVER sees the body.
+    // `python3 <<PY | bash` is the generator idiom. The walk fell through to the
+    // pipe consumer and resolved the path inside the python `print(...)` string as
+    // a DIRECT execution, so the hub-mutating file named in a PYTHON LITERAL was
+    // read and content-gated — `main` allows it (it resolves nothing).
+    expectTrue("B7u (#523 round-5 F1) control: a CODE opener's body piped into a shell is not walked → ALLOWED",
+      allowed(await bash(`python3 <<PY | bash\nprint("${bodyEvil}")\nPY`, hub)), "was blocked");
+    // ⛔ ROUND-5 F2a (a live #523 fail-open ONE CHARACTER away, measured): bash
+    // removes the backslash by quote removal, so `<<\EOF` is the delimiter `EOF`
+    // and the body IS a body. Ending the delimiter word at `\` opened NO body,
+    // the raw body text fell into the command-line scan, which resolved the benign
+    // first token (`echo`) — the hub mutation the body really executes was never
+    // read (fail-OPEN, `main` behaves the same: pre-existing, closed here).
+    expectTrue("B7v (#523 round-5 F2a): `bash <<\\EOF` opens a real body → BLOCKED",
+      blocked(await bash(`bash <<\\EOF\necho hi\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-6 F1 (measured ALLOWED on the pre-fix head, BLOCKED on `main`): a
+    // redirect may stand BEFORE the command word (`2>/dev/null ./x.sh`) and bash
+    // still executes that command. The body walk took the OPERATOR as the command
+    // word, resolved nothing, and skipped to the next command boundary — so the
+    // hub-mutating script the body really runs was never read.
+    expectTrue("B7w (#523 round-6 F1): a body line whose command word follows a REDIRECT → BLOCKED",
+      blocked(await bash(`bash <<EOF\n2>/dev/null "${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // ⛔ ROUND-6 F2 (measured ALLOWED on the pre-fix head, BLOCKED on `main`): the
+    // delimiter is one shell WORD; `<<'E F'` delimits on the line `E F`, so spaces
+    // stay INSIDE it. Re-emitting the quote-removed word unquoted split it into
+    // two tokens, the body was mis-classified as DATA, and nothing in it was read.
+    expectTrue("B7x (#523 round-6 F2): a delimiter containing a SPACE still walks its body → BLOCKED",
+      blocked(await bash(`bash <<'E F'\necho hi\n"${bodyEvil}"\nE F`, hub)), "was allowed");
+    // ⛔ ROUND-7 F1 (measured ALLOWED on the pre-fix head, BLOCKED on `main`): `&`
+    // is a list operator only when it is NOT part of a redirection, so `2>&1` does
+    // not end the simple command — it was split at the `&`, the opener segment's
+    // head became the fd DIGIT, the heredoc was classified DATA, and the body the
+    // shell really executes was never read.
+    expectTrue("B7y (#523 round-7 F1): a HEADER-line fd-DUP (`2>&1 bash <<EOF`) does not hide the body → BLOCKED",
+      blocked(await bash(`2>&1 bash <<EOF\necho hi\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // The mirror half: the same prefix in front of a CODE opener must NOT resurrect
+    // round-5 F1's over-block — a python body piped into a shell is SOURCE, and a
+    // path inside its `print(…)` string is not a program anything runs.
+    expectTrue("B7z (#523 round-7 F1) control: `2>&1 python3 <<PY | bash` stays SOURCE → ALLOWED",
+      allowed(await bash(`2>&1 python3 <<PY | bash\nprint("${bodyEvil}")\nPY`, hub)), "was blocked");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });
