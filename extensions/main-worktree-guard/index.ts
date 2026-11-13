@@ -6598,6 +6598,57 @@ export default function (pi: ExtensionAPI) {
         "block:push-delete": "push-delete",
         "block:branch-force-delete": "branch-force-delete",
       };
+      // ── #506 round 11 (P0): A PROMOTION MUST NOT SWALLOW AN ADMITTED-SET HOLE ──
+      // The comment above says the skimmed pass "can only RAISE a verdict", and
+      // that is true of PRIORITY — but priority is not restrictiveness, and the
+      // map right above is where the two disagree. This map ADMITS
+      // pull/merge/rebase/push/force-push/push-delete/branch-force-delete and
+      // NEVER admits reset/clean/force-checkout/checkout-discard-all/
+      // checkout-branch/restore/stash-pop. A promotion that moves a compound
+      // from the second set into the first therefore hands the WHOLE command —
+      // the un-admitted verb included — to `ownershipAllowed`, which gates only
+      // the admitted kind and then returns `admitAfterM3()`.
+      //
+      // MEASURED end-to-end against the real handler (hermetic hub, session on
+      // baseline `main`, hub clean) — base `319c82526` vs the pre-fix head, each
+      // BLOCKED on base and ALLOWED on head, in the hub:
+      //   git stash drop      && git -C . push -f origin main
+      //   git stash pop       && git -C . push -f origin main
+      //   git stash apply     && git -C .. push -f origin main
+      //   git restore .       && git -C . push -f origin main
+      //   git checkout .      && git -C . push -f origin main
+      //   git checkout main   && git -C . push -f origin main
+      //   git -C . branch -D main && git checkout .
+      // (base blocked every one via LEGACY_BLOCK on the un-admitted verdict it
+      // saw; the skimmed pass promoted them onto `force-push` /
+      // `branch-force-delete`, both admitted). `git stash drop` in particular
+      // destroys a shared stashed changeset and is NOT mitigated by M4 — a stash
+      // is not working-tree dirt, so a clean hub admitted it.
+      //
+      // The fix is DENY-WINS and is base-faithful BY CONSTRUCTION: `promotedFrom`
+      // is the verdict the pre-#506 classifier produced (the raw pass's winner,
+      // or the first skimmed hit when the raw pass matched nothing), so restoring
+      // it as the verdict makes every arm below take exactly the path it took on
+      // base — the allowance declines (the restored kind is not in the map), the
+      // push-family arms do not match, and LEGACY_BLOCK refuses in the hub with
+      // the SAME message text base printed, worktree exemption unchanged.
+      // ⛔ It is deliberately NOT "skip the allowance when promoted": that would
+      // NOT have blocked this class. `block:force-push` (7 of the 8 rows) falls
+      // through to the `block:push || block:force-push` arm below, whose
+      // `return admitAfterM3()` admits — so a fix at the allowance alone closes
+      // only the `branch-force-delete` row and leaves seven open (measured).
+      // ⛔ And when the restored kind IS itself admitted (`git pull` promoted to
+      // `git reset` by a prefixed lead verb), nothing is restored: the promoted
+      // verdict is the more severe one, it is not admitted, and the existing
+      // LEGACY_BLOCK arm already refuses it — rewriting there would WEAKEN the
+      // #506 fix.
+      if (det.promotedFrom !== null && det.promotedFrom !== undefined) {
+        const promotedFromVerdict = `block:${det.promotedFrom}`;
+        if (ALLOWANCE[promotedFromVerdict] === undefined &&
+            ALLOWANCE[det.verdict] !== undefined) {
+          det.verdict = promotedFromVerdict;
+        }
+      }
       // ── M2 mutation list (#605) — built BEFORE the ownership-allowance arm and
       // the push-delete arm, because BOTH used to close the whole command on one
       // segment's evidence and return (reviews F1, I1).

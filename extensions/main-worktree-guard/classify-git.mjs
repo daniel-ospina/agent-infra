@@ -3949,10 +3949,22 @@ export function _branchInvMutatesBranchState(args) {
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
  *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete, hasPush,
+ *     promotedFrom,
  *     renameFrom, renameTo, syncSource, stateVerb, stateArgs, stateOpCount }
  * - verdict: legacy `block:*` strings for destructive patterns (verb-anchored),
  *   plus NEW `block:commit` / `block:push` / `block:force-push`; `allow` /
  *   `allow-non-git` otherwise.
+ * - promotedFrom: the pattern NAME whose verdict the always-run skimmed pass
+ *   REPLACED with a higher-priority one (null when no promotion happened).
+ *   #506 round 11 (P0) — this is the verdict the classifier produced BEFORE
+ *   #506 part 4, i.e. the one the consumer's prior decisions were made on, and
+ *   it is a FACT the consumer must not lose: `git stash drop && git -C . push -f
+ *   origin main` holds `stash-pop` in the raw pass and promotes to `force-push`
+ *   from the skimmed pass, and `force-push` is a kind the ownership allowance
+ *   ADMITS while `stash-pop` is one it never did. So a promotion can move a
+ *   compound onto a MORE admitted verdict, and the replaced verb is still an
+ *   EFFECT of the command. Reported, never acted on, here: index.ts owns the
+ *   admission map and decides what to do with it.
  * - hasPush: true iff the command contains a PUSH INVOCATION (any verdict).
  *   #506 — index.ts's delete-target arm must run the #73 sibling check on a
  *   compound the verdict did not name a push for, but a `block:commit` verdict
@@ -3989,6 +4001,7 @@ export function classifyGitCommandDetailed(command) {
     verbArgs: invocations[0]?.args ?? [], branchState: false, newBranch: null,
     deleteTargets: [], pushDst: null, pushTargets: [], isPushDelete: false,
     hasPush: false,
+    promotedFrom: null,
     renameFrom: null, renameTo: null, syncSource: null,
   };
   // #1144 follow-up (P0-1): a hidden shell substitution (`eval "git rebase …"`,
@@ -4055,6 +4068,16 @@ export function classifyGitCommandDetailed(command) {
   // The INDEX of the winning pattern in the priority list (-1 = nothing matched
   // yet). Both passes share it, so a later pass can only ever move the verdict
   // to a STRICTLY HIGHER-priority verb — never weaken it.
+  // ⛔ "HIGHER PRIORITY" IS NOT "MORE RESTRICTIVE", AND THAT DISTINCTION IS A
+  // SECURITY PROPERTY (see `promotedFrom` in the shape doc above, #506 round 11
+  // P0). The consumer's ownership allowance admits a FIXED SET of kinds
+  // (pull/merge/rebase/push/force-push/push-delete/branch-force-delete) and
+  // never admits reset/clean/force-checkout/checkout-discard-all/
+  // checkout-branch/restore/stash-pop. Promotion therefore moves a compound
+  // ACROSS that line in the unsafe direction: the raw pass sees `stash-pop`,
+  // the skimmed pass promotes to `force-push`, and the allowance — which the
+  // pre-#506 verdict would never have reached — then admits the whole command.
+  // So a raise records what it replaced.
   let patternIdx = -1;
   for (let i = 0; i < DESTRUCTIVE_GIT_PATTERNS.length; i++) {
     if (DESTRUCTIVE_GIT_PATTERNS[i].re.test(raw)) {
@@ -4087,6 +4110,15 @@ export function classifyGitCommandDetailed(command) {
     for (let i = 0; i < DESTRUCTIVE_GIT_PATTERNS.length; i++) {
       if (!DESTRUCTIVE_GIT_PATTERNS[i].re.test(skimmed)) continue;
       if (patternIdx === -1 || i < patternIdx) {
+        // #506 round 11 (P0): a raise that REPLACES an already-held verdict is a
+        // PROMOTION, and the replaced name is retained. The FIRST replaced value
+        // is the one that matters — it is exactly the verdict the pre-#506
+        // classifier produced (the raw winner when the raw pass matched, else
+        // the first skimmed hit), so a consumer gating on it reproduces the
+        // base decision BY CONSTRUCTION rather than by re-deriving the walk.
+        if (patternIdx !== -1 && out.promotedFrom === null) {
+          out.promotedFrom = DESTRUCTIVE_GIT_PATTERNS[patternIdx].name;
+        }
         out.verdict = `block:${DESTRUCTIVE_GIT_PATTERNS[i].name}`;
         patternIdx = i;
       }

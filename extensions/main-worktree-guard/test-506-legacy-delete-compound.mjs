@@ -158,6 +158,74 @@ for (const [label, cmd, verdict, isPushDelete, targets] of CLASSIFIER_PINS) {
   expectTrue(`${label} → ${verdict}`, ok,
     `got verdict=${d.verdict} isPushDelete=${d.isPushDelete} pushTargets=${JSON.stringify(d.pushTargets)}`);
 }
+// ── review round 11 (P0): `promotedFrom` — WHAT THE PROMOTION REPLACED ──
+// Priority is not restrictiveness. index.ts's ownership ALLOWANCE admits a fixed
+// set of kinds and never admits reset/clean/force-checkout/checkout-discard-all/
+// checkout-branch/restore/stash-pop, so a promotion that moves a compound from
+// the second set into the first hands the WHOLE command to a gate that covers
+// only the admitted kind. `promotedFrom` is the fact that closes it: it carries
+// the verdict the PRE-#506 classifier produced, so the consumer can restore it
+// and take exactly the base path.
+//
+// `null` is as load-bearing as the value: a row whose promotion is `null` proves
+// the fix's gate CANNOT fire on it, so a legitimate command (r-* in the
+// differential) is untouched by the P0 fix. Every realistic-hub row below is
+// therefore a CONTROL, not padding.
+for (const [label, cmd, want] of [
+  // The measured fail-open class: raw pass holds the un-admitted verb, the
+  // skimmed pass promotes it onto an ADMITTED one.
+  ["A29 stash drop + -C-prefixed force-push → promotedFrom stash-pop",
+    "git stash drop && git -C . push -f origin main", "stash-pop"],
+  ["A30 stash pop + -C-prefixed force-push → promotedFrom stash-pop",
+    "git stash pop && git -C . push -f origin main", "stash-pop"],
+  ["A31 restore + -C-prefixed force-push → promotedFrom restore",
+    "git restore . && git -C . push -f origin main", "restore"],
+  ["A32 checkout . + -C-prefixed force-push → promotedFrom checkout-discard-all",
+    "git checkout . && git -C . push -f origin main", "checkout-discard-all"],
+  ["A33 checkout <branch> + -C-prefixed force-push → promotedFrom checkout-branch",
+    "git checkout main && git -C . push -f origin main", "checkout-branch"],
+  ["A34 -C-prefixed branch -D + checkout . → promotedFrom checkout-discard-all",
+    "git -C . branch -D main && git checkout .", "checkout-discard-all"],
+  // The OTHER prefix spellings that defeat the adjacency (the class, not one
+  // spelling): `-c k=v` and a `-C ..` parent path.
+  ["A35 -c-prefixed force-push → promotedFrom stash-pop",
+    "git stash drop && git -c core.pager=cat push -f origin main", "stash-pop"],
+  ["A36 -C ..-prefixed force-push → promotedFrom stash-pop",
+    "git stash apply && git -C .. push -f origin main", "stash-pop"],
+  // CONTROLS — no promotion, so the P0 gate must NOT fire. The first two are the
+  // NON-prefixed twins of A29/A30: there the raw pass already sees the
+  // force-push, so nothing is replaced and the pre-#506 decision (allow) holds,
+  // which is why the fix does not widen the guard onto them.
+  ["A37 CONTROL non-prefixed twin: no promotion",
+    "git stash drop && git push -f origin main", null],
+  ["A38 CONTROL non-prefixed twin: no promotion",
+    "git stash pop && git push -f origin main", null],
+  // CONTROL: a lower-priority verb the skimmed pass sees but that does NOT
+  // out-rank the raw winner is not a promotion, so `git checkout main && git pull`
+  // keeps its base verdict (`pull`) rather than being rewritten to
+  // `checkout-branch` — which would be a NEW refusal of a realistic command.
+  ["A39 CONTROL the skimmed lower-priority verb does not promote (checkout main && pull)",
+    "git checkout main && git pull", null],
+  ["A40 CONTROL plain hub sync: no promotion", "git -C . pull --ff-only", null],
+  // NOT a control, and deliberately so — measured, after the first expectation for
+  // this row was WRONG. The #506 headline compound DOES promote now, because the
+  // reorder put `push-delete` LAST: the raw pass wins `push-delete` (13), the
+  // skimmed pass reads `git reset --hard` and promotes to `reset` (0). So
+  // `promotedFrom` is `push-delete` — an ADMITTED kind — which is exactly the case
+  // the P0 gate must NOT act on: restoring `push-delete` would put the compound
+  // back on the verdict #506 exists to remove, and the promoted `reset` is already
+  // refused by LEGACY_BLOCK. This row is the "the P0 fix must not weaken #506"
+  // half, and it reds if the gate is ever widened to restore an admitted kind.
+  ["A41 the #506 headline compound promotes FROM the admitted push-delete (gate must not fire)",
+    "git -C . reset --hard && git push origin --delete stale", "push-delete"],
+  // CONTROL: promotion onto a MORE SEVERE verdict keeps that verdict — the
+  // restored kind would be the admitted `pull`, which must not win.
+  ["A42 promotion AWAY from an admitted verb still reports promotedFrom pull",
+    "git pull && git -C . reset --hard", "pull"],
+]) {
+  const got = classifyGitCommandDetailed(cmd).promotedFrom ?? null;
+  expectTrue(`${label}`, got === want, `got promotedFrom=${JSON.stringify(got)}`);
+}
 // `hasPush` — the flag index.ts's #506 arm is gated on (review finding 1). It is
 // derived from the INVOCATION WALK, never from the string extractor, so it is
 // the only thing that can tell a real push compound from a message that talks
@@ -398,6 +466,61 @@ if (typeof stripTypeScriptTypes !== "function" ||
       why: "round 8: the FORCE-PUSH twin of the same class. `block:force-push` is also admitted by " +
            "the ownership allowance on the baseline, so the hidden reset ran pre-fix here too — " +
            "which is why the fix is a PRIORITY rule, not a push-delete-only exception" },
+    // ── review round 11 (P0): THE PROMOTION ONTO AN ADMITTED KIND ──
+    // Different class from P1–P6, and it needed a different fix. P1–P6 are a
+    // prefix-hidden verb laundered by a DELETE spelling; these are a prefix-hidden
+    // verb laundered by the ownership ALLOWANCE, whose admitted set
+    // (pull/merge/rebase/push/force-push/push-delete/branch-force-delete) does not
+    // overlap the five kinds below. The skimmed pass promotes the compound onto
+    // `force-push`, the allowance admits `force-push` on the baseline, and the
+    // hidden verb runs. MEASURED against pristine `origin/main` `319c82526` with
+    // the real handler: base BLOCKED all six of P7–P12 and the pre-fix head
+    // ALLOWED all six. `git stash drop` is the sharpest of them — it destroys a
+    // shared stashed changeset and is NOT mitigated by M4, because a stash is not
+    // working-tree dirt, so a CLEAN hub admitted it.
+    // The refusal names the HIDDEN verb, not the promoted one, because the
+    // consumer restores the pre-#506 verdict — so the message is byte-identical to
+    // what base printed for the same command.
+    { id: "P7", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git stash drop && git -C . push -f origin main",
+      why: "round 11 P0: `stash-pop` promoted onto the ADMITTED `force-push` — the allowance then " +
+           "admitted the compound and the stash drop ran in the hub (measured: base BLOCK, pre-fix ALLOW)" },
+    { id: "P8", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git stash pop && git -C . push -f origin main",
+      why: "round 11 P0: the apply/pop spelling of the same promotion" },
+    { id: "P9", dir: "hub", expect: "block", marker: "(restore)",
+      cmd: "git restore . && git -C . push -f origin main",
+      why: "round 11 P0: `restore` promoted onto `force-push`" },
+    { id: "P10", dir: "hub", expect: "block", marker: "(checkout-discard-all)",
+      cmd: "git checkout . && git -C . push -f origin main",
+      why: "round 11 P0: `checkout-discard-all` promoted onto `force-push`" },
+    { id: "P11", dir: "hub", expect: "block", marker: "(checkout-discard-all)",
+      cmd: "git -C . branch -D main && git checkout .",
+      why: "round 11 P0: the promotion runs the OTHER way here — `branch-force-delete` is the winner " +
+           "and IS allowance-admitted (its target is the baseline), so `checkout-discard-all` was " +
+           "swallowed. The only one of the six whose promoted verdict is not a push kind, which is " +
+           "why a fix at the allowance alone would have closed this row and left the other five open" },
+    { id: "P12", dir: "hub", expect: "block", marker: "(stash-pop)",
+      cmd: "git stash drop && git -c core.pager=cat push -f origin main",
+      why: "round 11 P0: the `-c k=v` prefix spelling — the CLASS, not `-C` alone (`git -C .. …` is " +
+           "pinned at the classifier level as A36)" },
+    // The worktree half: base ADMITTED these (the legacy arm's worktree exemption is
+    // by design, and no sibling holds `main`), so the P0 fix must not tighten them.
+    // Without these two rows the fix could "pass" by refusing worktrees too.
+    { id: "P13", dir: "wt", expect: "allow",
+      cmd: "git stash drop && git -C . push -f origin main",
+      why: "round 11 CONTROL: base ALLOWED this in a worktree (measured), so the fix must not turn a " +
+           "worktree into a refusal — the restored verdict is the legacy one, whose exemption holds" },
+    { id: "P14", dir: "wt", expect: "allow",
+      cmd: "git checkout . && git -C . push -f origin main",
+      why: "round 11 CONTROL: the same parity for the checkout family" },
+    // CONTROL: the NON-prefixed twins are NOT promoted (the raw pass already sees
+    // the force-push), so the pre-#506 decision — allow — must be preserved. This
+    // is what bounds the fix: it restores base, it does not widen the guard.
+    { id: "P15", dir: "hub", expect: "allow",
+      cmd: "git stash drop && git push -f origin main",
+      why: "round 11 CONTROL: no promotion here (raw sees the force-push), so base ALLOWED it and " +
+           "so must we — P7 differs ONLY by the prefix, which is what makes the pair a discriminator" },
   ];
 
   /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
@@ -756,6 +879,43 @@ if (typeof stripTypeScriptTypes !== "function" ||
           redCheck: (r) => !blocked(r),
           expectGreen: ["P3", "P4", "P5", "B1"],
           classifier: ["git -C . reset --hard && git push origin --delete stale", "block:push-delete"],
+        },
+        {
+          // (12) THE PROMOTION GATE REMOVED — the round-11 P0 put back. The
+          // skimmed pass still promotes (the classifier is untouched), but the
+          // consumer no longer restores the pre-#506 verdict, so the promoted
+          // `force-push` / `branch-force-delete` reaches the ownership allowance
+          // and the HIDDEN verb runs in the hub. Exactly the six measured
+          // fail-opens go red, and the three controls prove the rows are
+          // discriminating rather than blanket refusals: P13/P14 (the WORKTREE
+          // parity rows — base admitted those, so a mutant that reddens them too
+          // would be proving an over-block, not this fix) and P15 (the
+          // NON-prefixed twin, which was never promoted and was always allowed).
+          label: "round-11 promotion gate removed (index.ts)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "        if (ALLOWANCE[promotedFromVerdict] === undefined &&\n            ALLOWANCE[det.verdict] !== undefined) {\n          det.verdict = promotedFromVerdict;\n        }",
+            "        if (false) { // MUTANT: round-11 promotion gate removed\n          det.verdict = promotedFromVerdict;\n        }",
+          ),
+          expectRed: ["P7", "P8", "P9", "P10", "P11", "P12"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P13", "P14", "P15", "B1"],
+        },
+        {
+          // (13) THE FACT NEVER RECORDED — the classifier stops reporting what the
+          // promotion replaced. The consumer's gate is intact but has nothing to
+          // act on, so the same six rows go red. This is the OTHER half of mutant
+          // 12: neither the fact nor the consumer alone is the fix, and pinning
+          // only one of them would let the other rot silently.
+          label: "promotedFrom never recorded (classify-git.mjs)",
+          file: "classify-git.mjs",
+          revert: (src) => src.replace(
+            "        if (patternIdx !== -1 && out.promotedFrom === null) {\n          out.promotedFrom = DESTRUCTIVE_GIT_PATTERNS[patternIdx].name;\n        }",
+            "        if (false) { // MUTANT: the replaced verdict is never recorded\n          out.promotedFrom = DESTRUCTIVE_GIT_PATTERNS[patternIdx].name;\n        }",
+          ),
+          expectRed: ["P7", "P10", "P11"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P13", "P15", "B1"],
         },
       ];
 
