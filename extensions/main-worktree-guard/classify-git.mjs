@@ -8378,29 +8378,53 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   };
   const readShellArg = readWord;   // alias (same shell-argument semantics)
   // ── EVERY remaining operand word of this simple command, for the dir-stack
-  // verbs ONLY (#3955 review round 3). bash's `pushd`/`popd` scan the WHOLE
+  // verbs ONLY (#3955 review rounds 3-4). bash's `pushd`/`popd` scan the WHOLE
   // argv, so a single-word read models the first operand and silently DROPS the
   // rest — measured fail-OPENs, e.g. `popd +0 -n` (bash: NOCD, cwd unchanged;
   // one-word model: cd's to the new top) and `popd +0 extra` (bash: rc 2,
-  // nothing changes). Stops exactly where `readWord` stops (`;|&()<>`, `>`/`<`,
-  // whitespace, newline), so a following redirect is left for the caller.
-  // An all-digits word IMMEDIATELY followed by `>`/`<` is an FD PREFIX
-  // (`2>/dev/null`), which bash never passes to the builtin — skip it.
+  // nothing changes).
+  // ⛔ TWO separate rules keep this honest, and both are MEASURED:
+  //  • a REDIRECT (with or without an FD prefix — `2>/dev/null`, `>f`, `2>&1`) is
+  //    not an operand, and bash still reads the operands AFTER it
+  //    (`popd 2>/dev/null +1` removes element 1). So the scan SKIPS it and keeps
+  //    going — but it does NOT consume it: `k` is handed back pointing at the
+  //    redirect, so the MAIN walker still attributes a write target like
+  //    `pushd ../docs > tracked.md` (skipping it here would drop that write);
+  //  • a `#` AT WORD START IS A COMMENT and ends the scan — consuming it made a
+  //    command AFTER it (`; echo x > tracked.md`, which bash never runs) look
+  //    like a live write (a measured false refusal).
   const readOperandWords = (k) => {
     const out = [];
+    let resumeAt = null;                     // where the MAIN walker must resume (a redirect)
+    const skipRedirect = (at) => {           // at = index of the `>`/`<` operator
+      let r = at;
+      while (r < n && "<>&|".includes(s[r])) r++;
+      if (s.slice(at, r).includes("<<")) return { stop: true, at };   // heredoc BODY is data — stop
+      const opnd = readWord(skipWsNl(r));
+      return { stop: false, at: opnd.k > r ? opnd.k : r + 1 };
+    };
     for (;;) {
       const p = skipWsNl(k);
-      // ⛔ A `#` AT WORD START IS A COMMENT, and it must stop the scan: consuming
-      // it as an operand word swallowed the comment (so a command AFTER it — which
-      // bash never runs — was modelled as running: a measured FALSE REFUSAL). The
-      // main walker's own comment skip ("# starts a comment at a word boundary")
-      // then takes over from `p`.
-      if (s[p] === "#") return { args: out, k: p };
+      if (s[p] === "#") return { args: out, k: resumeAt !== null ? resumeAt : p };
+      if (s[p] === ">" || s[p] === "<") {
+        if (resumeAt === null) resumeAt = p;
+        const r = skipRedirect(p);
+        if (r.stop) return { args: out, k: resumeAt };
+        k = r.at;
+        continue;
+      }
       const w = readWord(p);
-      if (!w.w) return { args: out, k: p };
-      if (!(/^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<"))) out.push(w.w);
+      if (!w.w) return { args: out, k: resumeAt !== null ? resumeAt : p };
+      if (/^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<")) {   // `2>/dev/null` — an FD prefix
+        if (resumeAt === null) resumeAt = p;
+        const r = skipRedirect(w.k);
+        if (r.stop) return { args: out, k: resumeAt };
+        k = r.at;
+        continue;
+      }
+      out.push(w.w);
       k = w.k;
-      if (out.length >= 64) return { args: out, k };   // bounded
+      if (out.length >= 64) return { args: out, k: resumeAt !== null ? resumeAt : k };   // bounded
     }
   };
   // ── THE DIR-STACK VERBS' ARGV MODEL (#3955 review round 3), MEASURED on
@@ -8491,22 +8515,42 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   // cd path in the walker body must run — one cd implementation, not two.
   const pushdArgv = (args, fr, cwd) => {
     let nFlag = false, sawDD = false, mode = null, nums = null, dirWord = null, extra = 0;
+    // ⛔ `-n` IS POSITION-SENSITIVE (#3955 review round 4, measured on bash
+    // 5.2.21): option scanning stops at the first NON-NUMERIC argument, so
+    //   `pushd +1 -n`      HONOURS it (rc 0, rotation without cd)
+    //   `pushd +1 -n +2`   HONOURS it (last numeric wins, no cd)
+    //   `pushd +1 extra -n` does NOT — the rotation happens WITH its cd
+    //   `pushd ../c -n`    is `too many arguments` (rc 1, NOTHING changes: the
+    //                      dir operand closed the scan, so `-n` is a 2nd arg)
+    //   `pushd -n ../c -n` INSERTS (harmless once `-n` is already in effect)
+    // Numeric operands do NOT close the scan; any other word does.
+    let optClosed = false;
     for (const w of args) {
-      if (sawDD) {
+      if (sawDD) {                                   // after `--` every word is a LITERAL operand
         if (mode === null) { mode = "dir"; dirWord = w; } else extra++;
         continue;
       }
-      if (w === "--") { sawDD = true; continue; }
-      if (w === "-n") { nFlag = true; continue; }
+      if (w === "--") { sawDD = true; optClosed = true; continue; }
       const m = /^([+-])([0-9]+)$/.exec(w);
-      if (mode === null) {
-        if (m) { mode = "numeric"; nums = [m]; }
-        else if (w.startsWith("-")) mode = "flag";      // `-x` / `-` (OLDPWD, #2177's residual)
-        else { mode = "dir"; dirWord = w; }
+      if (m) {
+        if (mode === null) { mode = "numeric"; nums = [m]; }
+        else if (mode === "numeric") nums.push(m);   // LAST wins, but every one is range-checked
+        else { if (mode === "dir" && nFlag) continue; extra++; }
         continue;
       }
-      if (mode === "numeric" && m) { nums.push(m); continue; }   // LAST wins, but every one is checked
-      extra++;
+      if (w === "-n") {
+        if ((mode === null || mode === "numeric") && !optClosed) { nFlag = true; continue; }
+        if (mode === "dir" && nFlag) continue;       // harmless — `-n` is already in effect
+        extra++;                                     // a second argument in dir mode → "too many arguments"
+        continue;
+      }
+      if (mode === null) {
+        if (w.startsWith("-")) { mode = "flag"; optClosed = true; continue; }   // `-x` / `-` (OLDPWD, #2177's residual)
+        mode = "dir"; dirWord = w;
+        continue;
+      }
+      if (mode === "dir") { if (nFlag) continue; extra++; continue; }
+      optClosed = true; extra++;                     // non-numeric in numeric mode: ignored, scan closed
     }
     if (mode === "numeric") {
       const S = vstack(fr.cwd);
@@ -9704,19 +9748,20 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       let tgt = readWord(nxt);
       i = tgt.k;
       const isPushd = w0.w === "pushd";
-      // ⛔ TWO OR MORE OPERAND WORDS — the shape the single-word arms below
-      // cannot see. bash scans the WHOLE argv, so reading one word modelled
-      // the first operand and DROPPED the rest: `pushd -n +1 +2` rotated by 1
-      // where bash rotates by 2, and `pushd ../c extra` cds where bash errors.
-      // See the measured argv table at `pushdArgv`.
+      // ⛔ THE WHOLE ARGV, ALWAYS — and ONE model (#3955 review rounds 3-4).
+      // bash scans every operand word of these verbs; a single-word read dropped
+      // the rest (`pushd -n +1 +2` rotated by 1 where bash rotates by 2), and a
+      // SPLIT (new scanner for >=2 words, old arms below for 0-1) left the old
+      // arms with no FD notion at all — `pushd 2>/dev/null` read the redirect's
+      // `2` as an operand on that arm only. Routing ALWAYS is what makes the
+      // model single: the old single-operand arms are GONE rather than kept as a
+      // second, disagreeing definition.
       if (isPushd) {
         const argv = readOperandWords(nxt);
-        if (argv.args.length > 1) {
-          i = argv.k;
-          const onlyDir = pushdArgv(argv.args, f(), cwd);
-          if (!onlyDir) continue;
-          tgt = { w: onlyDir.dirWord, k: i };   // `pushd -- <dir>` — the shared cd path below
-        }
+        i = argv.k;
+        const onlyDir = pushdArgv(argv.args, f(), cwd);
+        if (!onlyDir) continue;
+        tgt = { w: onlyDir.dirWord, k: i };   // a plain directory operand — the shared cd path below
       }
       // ── The dir stack's INDEXED forms (#3955's "flag/+N" half). Real bash
       // (measured, bash 5.2.21) indexes a stack whose element 0 is the CURRENT
@@ -9749,118 +9794,6 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // deep and the gate ALLOWed the tracked write real bash performs — a
       // fail-OPEN of the #437/#3955 shape, and the arm `origin/main` graded
       // right only by accident (it no-opped the whole form) (#3955 review 1).
-      if (isPushd) {
-        const numeric = /^([+-])([0-9]+)$/.exec(tgt.w || "");
-        if (numeric) {
-          const S = vstack(f().cwd);
-          const n = Number(numeric[2]);
-          const k = numeric[1] === "+" ? n : n + 1;              // left by N · right by N+1
-          if (k > 0 && k < S.length) {                           // k===0 → identity; k>=len → bash error
-            // ⛔ THE ROTATION SURVIVES A FAILED `cd` (measured above: `pushd +1`
-            // over `[b, +1, docs, a]` leaves `[b, docs, a, b]` at cwd `b`), so
-            // `cdTo` gates ONLY the pending cd — never the rotation itself.
-            f().pending = cdTo(setVStack(numeric[1] === "+"
-              ? S.slice(k).concat(S.slice(0, k))                    // rotate left
-              : S.slice(S.length - k).concat(S.slice(0, S.length - k)))); // rotate right
-          }
-          continue;
-        }
-        if (tgt.w === "--") {                                   // `pushd -- <dir>` DOES cd — the marker is not the operand
-          tgt = readWord(skipWsNl(tgt.k));
-          i = tgt.k;
-        }
-        if (tgt.w === "-n") {
-          let nw = readWord(skipWsNl(tgt.k));
-          i = nw.k;
-          // ⛔ `pushd -n -- <operand>` — the marker is NOT the operand, and under
-          // `-n` this arm used to read exactly one word, so the operand after
-          // `--` was never seen: `--` became `resolve(cwd, "--")`, which does not
-          // exist, and the insert was dropped. A later `popd` then ran one entry
-          // off bash's stack (#3955 review P1, measured fail-OPEN).
-          // Re-read past the marker, exactly as the plain `pushd` arm above does
-          // (`pushd -- <dir>`: the marker is not the operand).
-          // ⛔ BUT THE MARKER ALSO SUPPRESSES THE NUMERIC FORM — measured, bash
-          // 3.2.57 here AND the 5.2.21 rows in the review, which agree on all
-          // three: after `--`, a `+N`/`-N` word is a LITERAL directory name, not
-          // a rotation. From the stack [b, docs, a] (cwd b):
-          //   `pushd -n +1`   ⇒ [b, a, b]      (rotation, no cd)
-          //   `pushd -n -- +1; popd` ⇒ cwd STAYS b — `+1` is inserted literally, the
-          //   `popd` cannot resolve it, errors, and changes nothing (the review's
-          //   own row 3 measures real bash landing in `b`, not in `a`).
-          // So the re-read word is tested as an INSERT only, never as `rot` —
-          // otherwise the same `+1` spelling would rotate where bash inserts.
-          let afterMarker = false;
-          if (nw.w === "--") {
-            nw = readWord(skipWsNl(nw.k));
-            i = nw.k;
-            afterMarker = true;
-          }
-          // `pushd -n [+N | -N]` rotates the stack WITHOUT cd'ing, and the entry
-          // rotated in is REPLACED by the current dir (measured above). Modelling
-          // it as a failed path (the previous behaviour) left the stack
-          // unrotated, so a later bare `popd` landed one entry too deep — the
-          // same fail-open shape as `pushd +N`.
-          const rot = afterMarker ? null : /^([+-])([0-9]+)$/.exec(nw.w || "");
-          if (rot) {
-            const S = vstack(f().cwd);
-            const rn = Number(rot[2]);
-            const rk = rot[1] === "+" ? rn : S.length - 1 - rn;   // left by N · left by len-1-N
-            if (rk > 0 && rk < S.length) {                        // rk===0 → identity; out of range → bash error
-              // No cd ever happens. bash REPLACES the rotated-in entry with the
-              // current dir; that entry is element 0 of the stack, which
-              // `vstack` always derives from `f().cwd`, so only the tail is
-              // stored — the rotation is the whole model.
-              setVStack(S.slice(rk).concat(S.slice(0, rk)));
-            }
-            continue;
-          }
-          // -n <dir>: insert below the top, no cd.
-          // ⛔ `-n` NEVER stat()s THE OPERAND — bash inserts the operand STRING
-          // verbatim (`add_dirstack_element(savestring(list->word->word))`) and
-          // the validation happens at the LATER `popd`, which errors and leaves
-          // the cwd alone (measured: `pushd -n /nonexistent; popd` ⇒ cwd
-          // unchanged; likewise `pushd -n -- +1; popd`). The old `existsSync(ins)`
-          // gate dropped the entry at pushd time, so the walker's `popd` consumed
-          // the NEXT real entry and landed in a directory bash never enters — the
-          // third measured fail-open in this family (`cd a; pushd ../docs; pushd
-          // ../b; pushd -n -- +1; popd` ⇒ bash `b`, walker `docs`). Inserting
-          // unconditionally matches bash at the pushd AND at the popd that fails.
-          // ⚠️ The words this walker cannot resolve (`~`, `~/…`, `-` = OLDPWD, and
-          // an unexpanded `$VAR`/`$(…)`) stay no-ops — `pushd -n $EMPTY` IS bash's
-          // bare `pushd -n` (a silent no-op) and must not insert a bogus entry.
-          // ⛔ THE EXISTENCE GATE THAT USED TO LIVE HERE IS NOT LOST — it MOVED to
-          // where bash applies it (`cdTo` at every stack-consuming form, above).
-          // Dropping it here while popping unconditionally there is the pair that
-          // produced the FALSE REFUSAL the round-2 rows pin: `pushd -n -- +1`
-          // inserts a literal `+1`, the NEXT `popd` cannot cd to it and removes
-          // NOTHING, so real bash stays where it was while a consume-then-fail
-          // model moves one entry and grades a directory the shell never entered.
-          const ins = nw.w && nw.w !== "~" && !nw.w.startsWith("~/") && nw.w !== "-" && !/^[$`]/.test(nw.w)
-            ? resolve(cwd, nw.w) : null;
-          if (ins) { const S = vstack(f().cwd); S.splice(1, 0, ins); setVStack(S); }
-          continue;
-        }
-        // ⛔ BARE `pushd` IS NOT A NO-OP — MEASURED, bash 5.2.21 (#3955 review, the
-        // note the reviewer filed as pre-existing): with a 2+-entry stack bash SWAPS
-        // the top two entries and cd's to the new top — `[docs, a]` ⇒ `[a, docs]`,
-        // cwd `a`; `[b, docs, a]` ⇒ `[docs, b, a]`, cwd `docs` — and `pushd --` does
-        // exactly the same (the marker is not an operand). On a 1-deep stack bash
-        // prints "pushd: no other directory", rc 1, and changes NOTHING. The old
-        // model no-opped both, drifting the walker's cwd off bash's — the same
-        // craftable fail-OPEN shape as `pushd +N` (real bash moves, the gate does
-        // not), so it is modelled rather than only commented on.
-        if (!tgt.w) {
-          const S = vstack(f().cwd);
-          // Same rule as the rotation above: the SWAP is unconditional (measured —
-          // `[b, +1, docs, a]` becomes `[b, b, docs, a]` when the cd to `+1`
-          // fails), only the cd is gated.
-          f().pending = S.length > 1 ? cdTo(setVStack([S[1], S[0], ...S.slice(2)])) : null;
-          continue;
-        }
-        // remaining flag forms (`-` = OLDPWD, #2177's recorded residual; a bare `-x`)
-        // never cd — conservative no-op
-        if (tgt.w.startsWith("-")) { f().pending = null; continue; }
-      }
       let next = null;
       if (tgt.w && tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
         const cand = resolve(cwd, tgt.w);
@@ -9896,120 +9829,18 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       continue;
     }
     if (w0.w === "popd") {
-      // ⛔ TWO OR MORE OPERAND WORDS — the same argv scan as the pushd arm (see
-      // `popdArgv`). A measured fail-OPEN lived here: `popd +0 -n`,
-      // `popd +0 extra` and `popd -n +1 extra` all left the walker in `a` while
-      // real bash never leaves `docs`, so the gate ALLOWed a tracked
-      // `docs/tracked.md` overwrite that bash really performs.
+      // ⛔ THE WHOLE ARGV, ALWAYS — one model (see `popdArgv`; same reason as the
+      // pushd arm: a split between a new multi-word scanner and the old
+      // single-word arms let the two disagree, and the old arms had no FD notion —
+      // `popd 2>/dev/null` read the redirect's `2` as an operand, so bash's bare
+      // `popd` was modelled as a bash ERROR and the walker stayed one entry off).
+      // The multi-word fail-OPENs of the single-word read are measured: `popd +0
+      // -n`, `popd +0 extra` and `popd -n +1 extra` left the walker in `a` while
+      // bash never leaves `docs`, so a tracked `docs/tracked.md` overwrite was
+      // ALLOWed.
       const argv = readOperandWords(i);
-      if (argv.args.length > 1) { i = argv.k; popdArgv(argv.args, f()); continue; }
-      const tgt = readWord(skipWsNl(i));
-      i = tgt.k;
-      // Indexed / filtered forms — see the vstack block in the pushd handler.
-      const sel = /^([+-])([0-9]+)$/.exec(tgt.w || "");
-      if (sel) {
-        const S = vstack(f().cwd);
-        const idx = sel[1] === "+" ? Number(sel[2]) : S.length - 1 - Number(sel[2]);
-        if (idx >= 0 && idx < S.length) {
-          const rest = S.slice(0, idx).concat(S.slice(idx + 1));
-          // ⛔ ELEMENT 0 IS THE CURRENT DIRECTORY, so removing it forces a cd to
-          // the new top (`popd +0`, and `popd -N` whose index lands on 0). When
-          // THAT cd fails bash removes nothing (measured above: `popd +0` and
-          // `popd -3` over `[b, +1, docs, a]` are rc 1 with `dirs` unchanged) —
-          // so this arm must not splice the stack either. Every other index
-          // removes WITHOUT a cd, which is why an absent entry is removable there.
-          if (idx === 0 && cdTo(rest[0]) === null) continue;
-          f().pending = setVStack(rest);
-        }
-        continue;                                              // out of range → bash error, no change
-      }
-      if (tgt.w === "-n") {                                    // `-n` + its OWN operand — see the pushd block
-        const S = vstack(f().cwd);
-        const opw = readWord(skipWsNl(tgt.k));
-        const nSel = /^([+-])([0-9]+)$/.exec(opw.w || "");
-        // `-n --` is exactly a bare `popd -n` (measured); any OTHER non-numeric
-        // operand is bash's "invalid number"/"invalid argument" error (rc 2), which
-        // changes nothing — so it must not be read as the bare form either.
-        // ⛔ EXCEPT an unexpandable operand (#3955 review Finding 1, same class as
-        // the bare-popd path below): `popd -n $EMPTY` IS a bare `popd -n` and the
-        // previous model swallowed it as a no-op. `-n` never cds, so the two
-        // realities differ only in the STACK, not in the cwd; the empty-expansion
-        // reading (the dominant one) is taken. ⚠️ Declared residual: if the
-        // expansion is a path, bash errors and the stack is untouched, so a LATER
-        // bare `popd` is modelled one entry off — representable only by forking the
-        // stack, which this walker has no representation for.
-        const nUnprovable = /^[$`]/.test(opw.w || "");
-        if (!nSel && opw.w && opw.w !== "--" && !nUnprovable) continue;
-        i = opw.k;
-        let idx = 1;                                            // bare `-n`: the entry a bare popd would cd to
-        if (nSel) {
-          const n = Number(nSel[2]);
-          idx = nSel[1] === "+" ? n : S.length - 1 - n;
-          // `+0` names element 0, which IS the current directory, so bash drops
-          // element 1 instead (measured, [b,docs,a] … `popd -n +0` ⇒ [b,a]).
-          // ⛔ THIS LINE CANNOT BE PINNED BY ANY ROW, and saying so is the point
-          // (#3955 review Finding 5): `vstack` re-derives element 0 from
-          // `f().cwd`, and this arm never assigns `pending`, so dropping index 0
-          // and dropping index 1 store the SAME tail at every depth — disabling
-          // it (`if (false) idx = 1;`) reddens nothing, `I1 control` included.
-          // Kept because it states bash's real rule, NOT because a test covers it.
-          if (idx === 0) idx = 1;
-          // An out-of-range operand is a bash error and nothing changes. (For `+N`
-          // the bound is BELT-AND-BRACES: `slice(0, idx)` beyond the end is the
-          // whole array, so a dropped `idx < S.length` cannot mis-remove — measured
-          // as a surviving mutant, so no row pretends to kill it.)
-          if (idx < 0 || idx >= S.length) continue;
-        }
-        if (S.length > 1) setVStack(S.slice(0, idx).concat(S.slice(idx + 1)));
-        continue;
-      }
-      // ⛔ EVERY OTHER OPERAND IS A BASH ERROR (#3955 review Finding 4). Once `sel`
-      // and `-n` are consumed, `popd foo` / `popd 1` / `popd +x` / `popd +` /
-      // `popd +1x` / `popd -x` all print "invalid argument"/"invalid number"
-      // (rc 2) and change NEITHER the stack nor the cwd (bash 5.2.21, measured).
-      // `--` stays exempt — it IS a bare popd. The previous pair of guards let any
-      // `+`-prefixed non-numeric operand fall through to a bare popd: a measured
-      // fail-OPEN (`cd a; pushd ../docs; popd +1x; echo x > tracked.md` really
-      // writes TRACKED `docs/tracked.md`; the walker resolved `a/tracked.md` →
-      // ALLOW) and a REGRESSION against origin/main, which popped nothing there.
-      // ⛔ AN UNEXPANDED OPERAND IS A DIFFERENT CLASS, and it is NOT an error
-      // (#3955 review Finding 1). This walker never expands, so `popd $VAR`,
-      // `popd "$1"`, `popd $(…)` and `popd \`…\`` arrive here as literal text.
-      // Real bash resolves them to ONE of: a bare `popd` (empty, or `--`), an
-      // indexed form, or the error above — and the two CWD outcomes are different
-      // directories, so picking either alone is a fail-open in the other. That is
-      // measured, not theoretical: `cd a; pushd ../docs; popd $EMPTY; echo pwn >
-      // tracked.md` really overwrites TRACKED `a/tracked.md`, while the no-change
-      // model resolved `docs/` → ALLOW (origin/main popped and graded it right —
-      // so this guard was a regression). Popping alone is equally wrong whenever
-      // the variable holds a path. BOTH realities are therefore emitted: continue
-      // in the POP reality and carry the unchanged cwd as an arm-alt, which every
-      // later write site already unions through `forkTwins`.
-      const unprovable = /^[$`]/.test(tgt.w || "");
-      if (tgt.w && tgt.w !== "--" && !unprovable) continue;   // bash error → no change
-      const keepCwd = f().cwd;
-      const d = dirStack.pop();
-      // ⛔ THE REMOVAL IS CONDITIONAL HERE, UNLIKE EVERY OTHER FORM (#3955 review
-      // round 2 P1, measured on bash 3.2.57): a bare `popd` removes the entry it
-      // cd's to, so when that cd FAILS the entry STAYS and every later `popd`
-      // fails on the SAME entry — `cd a; pushd ../docs; pushd ../b; pushd -n --
-      // +1; popd; popd` ⇒ both rc 1, `dirs` unchanged, cwd stays `b`. Consuming
-      // it anyway desynchronises the model permanently (every later stack form is
-      // then one entry off) and makes the gate grade a directory the shell never
-      // entered — a FALSE REFUSAL on `docs/tracked.md` where bash writes `b`.
-      if (d !== undefined && cdTo(d) === null) {
-        dirStack.push(d);                                     // retained, not consumed
-        f().pending = null;                                   // the cd failed — cwd unchanged
-        continue;
-      }
-      const popTo = d !== undefined ? d : null;
-      if (unprovable && popTo !== null && popTo !== keepCwd) {
-        // the "the expansion was a path ⇒ bash errored, nothing changed" reality
-        f().forkCwd = f().forkCwd || popTo;
-        f().forkAlts = [...new Set([...(f().forkAlts || []), keepCwd])]
-          .filter((x) => x !== popTo).slice(0, 64);
-      }
-      f().pending = popTo;                                    // empty stack → bash no-op
+      i = argv.k;
+      popdArgv(argv.args, f());
       continue;
     }
     if (w0.w === "python" || w0.w.startsWith("python")) {

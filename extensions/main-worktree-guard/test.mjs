@@ -5653,6 +5653,28 @@ try {
     // element 1 (real bash), so the next popd lands on a, not on docs.
     has("cd a; pushd ../docs; pushd ../b; popd -n +1 # c\npopd; echo x > tracked.md", "redirect:H/a/tracked.md", "R3l: operands before a `#` comment still apply — `popd -n +1 # c` drops element 1");
     blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd -n +1 # c\npopd; echo x > tracked.md", "R3l gate: TRACKED a/tracked.md → BLOCK (a scan that ate the comment as words changed nothing, leaving the popd on docs → ALLOW)");
+    // ── #3955 review ROUND 4: a REDIRECT on the verb, and `-n`'s POSITION. Both
+    // were measured fail-OPENs of the round-3 SPLIT (the helpers describe the
+    // rules; see `readOperandWords`): the old single-operand arms had no FD notion
+    // (`2>/dev/null`'s `2` became the operand, so bash's bare `popd` was modelled
+    // as a bash ERROR), and `-n` was accepted after a directory operand where bash
+    // is "too many arguments".
+    has("cd a; pushd ../docs; popd 2>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "R4a: `popd 2>/dev/null` is a BARE popd — the FD prefix is not an operand");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd 2>/dev/null; echo x > tracked.md", "R4a gate: TRACKED a/tracked.md → BLOCK (reading the `2` as the operand changed nothing → docs → ALLOW)");
+    allows(["docs/tracked.md"], "cd a; pushd ../docs; popd 2>/dev/null; echo x > tracked.md", "R4a anti-narrowing: the docs resolution must NOT be graded");
+    has("cd a; pushd ../docs; pushd -n 2>/dev/null; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R4a control: `pushd -n 2>/dev/null` inserts NOTHING (the FD prefix is not its operand), so the popd lands on a");
+    has("cd a; pushd ../docs; pushd ../b; popd 2>/dev/null; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R4a: …and on a 3-entry stack the redirect still leaves a BARE popd, so the second popd lands on a");
+    has("cd a; pushd ../docs; popd 2>/dev/null +1; echo x > tracked.md", "redirect:H/docs/tracked.md", "R4b: an operand AFTER the redirect still applies — `popd 2>/dev/null +1` removes element 1 with no cd");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; popd 2>/dev/null +1; echo x > tracked.md", "R4b gate: TRACKED docs/tracked.md → BLOCK (a scan that STOPPED at the redirect modelled a bare popd → a → ALLOW)");
+    has("cd b; pushd ../docs -n; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "R4c: `pushd <dir> -n` is 'too many arguments' — bash changes NOTHING (the cwd stays b)");
+    blocks(["b/tracked.md"], "cd b; pushd ../docs -n; popd; echo x > tracked.md", "R4c gate: TRACKED b/tracked.md → BLOCK (reading the trailing -n as an option INSERTS docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; pushd ../c -n; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R4c control: on a 3-entry stack the same error leaves the stack alone, so the next popd lands on docs");
+    has("cd a; pushd ../docs; pushd ../b; pushd +1 extra -n; echo x > tracked.md", "redirect:H/docs/tracked.md", "R4c control: `-n` after a NON-NUMERIC operand is NOT an option — the rotation happens WITH its cd (docs)");
+    has("cd a; pushd ../docs; pushd ../b; pushd +1 -n; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R4c control: `-n` after a NUMERIC operand IS an option — rotate without cd, so the popd lands on a");
+    // the redirect itself is still a WRITE TARGET — the scan hands it back to the
+    // main walker instead of consuming it.
+    has("cd a; pushd ../docs > tracked.md", "redirect:H/a/tracked.md", "R4d: a redirect attached to the verb is still a write target (`pushd ../docs > tracked.md`)");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs > tracked.md", "R4d gate: TRACKED a/tracked.md → BLOCK (the argv scan must not swallow the redirect)");
   }
 
 
