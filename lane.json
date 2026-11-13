@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/Users/danielospina/orchestrator/bg/prd-daniel-ospina-agent-infra-3966.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/594-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "923d9e29756730ecac27236ce523fe31e77585f1"
+    },
+    {
+      "kind": "worktree",
+      "value": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fx3966"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 354,
+  "ended_at": 1794585275,
+  "exit_code": 76,
+  "heartbeat_at": 1794585275,
+  "host": "192",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "192.kprfix-prd-daniel-ospina-agent-infra-3966-1794584921-p82113-ea0f1fd6",
+  "lease_until": 1794593075,
+  "pid": 82113,
+  "reason": "agent-never-started:rc=76",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794584921,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-agent-infra-3966",
+  "worktree": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fx3966"
+}
