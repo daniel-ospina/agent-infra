@@ -8453,15 +8453,36 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // TRACKED `H/tracked.md` write as `a/tracked.md` → ALLOW, where `origin/main`
       // BLOCKed. The raw source character is the only place this survives
       // (`readWord` has already stripped the quotes).
+      // ⛔ THE QUOTED-EMPTY SPELLING IS FOUR FORMS, not two (#3955 review round 10):
+      // `""`, `''`, `$''` (ANSI-C) and `$""` (locale) all reach pushd as an empty
+      // operand KEPT by the shell — MEASURED (bash 5.2.21): `pushd $''` and
+      // `pushd $""` both give dirs `H H H/a` with the cwd unmoved, exactly like
+      // `pushd ""`, and `pushd $'' ../b` is `too many arguments`. Testing only the
+      // bare quote characters dropped the `$`-prefixed pair, so those collapsed
+      // onto the bare-`pushd` SWAP — the same regression, one spelling over
+      // (measured: `cd a; pushd ..; pushd $''` graded `a/tracked.md` → ALLOW).
+      // An UNQUOTED `$VAR` that expands empty is a DIFFERENT, correct thing: the
+      // shell REMOVES that word, which is why the bare-form path must keep it.
+      const emptyQuoted = s[p] === '"' || s[p] === "'" ||
+        (s[p] === "$" && (s[p + 1] === '"' || s[p + 1] === "'"));
       if (!w.w) {
-        if ((s[p] === '"' || s[p] === "'") && w.k > p) {
+        if (emptyQuoted && w.k > p) {
           out.push(""); tildes.push(false); k = w.k;
           if (out.length >= 64) return { args: out, tildes, k: resumeAt !== null ? resumeAt : k };
           continue;
         }
         return { args: out, tildes, k: resumeAt !== null ? resumeAt : p };
       }
-      if (/^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<")) {   // `2>/dev/null` — an FD prefix
+      // ⛔ AN FD PREFIX IS AN **UNQUOTED** DIGIT RUN (#3955 review round 10). bash
+      // demotes `N>` to an io-number only when the digits reach it UNQUOTED; a
+      // quoted or escaped `2` is an ordinary operand. Testing the DE-QUOTED word
+      // (`w.w`) conflated the two, so `pushd '2'>/dev/null` / `pushd \\2>/dev/null`
+      // lost their operand entirely — zero operands is the bare `pushd` SWAP, and
+      // MEASURED (bash 5.2.21) that is a regression: `pushd '2'` really fails
+      // (a directory named `2` does not exist), the cwd stays put and the write
+      // hits the TRACKED hub root, while the collapsed model resolved `a/` → ALLOW.
+      const rawDigits = /^[0-9]+$/.test(s.slice(p, w.k));
+      if (rawDigits && /^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<")) {   // `2>/dev/null` — an FD prefix
         if (resumeAt === null) resumeAt = p;
         const r = skipRedirect(w.k);
         if (r.stop) return { args: out, tildes, k: resumeAt };
@@ -8548,7 +8569,14 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (/^[$`]/.test(w)) { unprovable = true; continue; }
       invalid = true;
     }
-    if (emptySel) sel = ["-", "0"];              // `popd ""` ⇒ `-0`: drop the LAST entry, no cd
+    // ⛔ `sel` IS REGEXP-MATCH-SHAPED — `sel[1]` is the SIGN and `sel[2]` the
+    // DIGITS (it is the `exec` result below). Writing `["-", "0"]` put the sign at
+    // index 0 and left `sel[2]` undefined, so `idx0` was **NaN**: `popd ""` then
+    // removed NOTHING (`S.slice(0,NaN)` is the whole array) while still scoring the
+    // cwd right, which is why the cwd-only rows could not see it (#3955 review
+    // round 10). MEASURED consequence on `[b, docs, a]`: `popd ""` must drop the
+    // last entry, so the NEXT `popd -1` lands in docs — with NaN it landed in b.
+    if (emptySel) sel = ["-0", "-", "0"];        // `popd ""` ⇒ `-0`: drop the LAST entry, no cd
     if (invalid) return;                          // bash rc 2 — nothing changes
     const S = vstack(fr.cwd);
     const keep = fr.cwd;
@@ -8585,6 +8613,38 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       return;
     }
     // bare `popd` (with `--`, or with an operand this walker cannot expand)
+    // ⛔ AN UNPROVABLE OPERAND (`popd "$VAR"` / `popd $VAR`) — the three realities,
+    // and why the cwd is now the UNCHANGED one (#3955 review round 10). `readWord`
+    // cannot tell `"$VAR"` from `$VAR`, and the spellings differ:
+    //   • `popd "$VAR"` with an EMPTY expansion is `popd ""` ⇒ `-0`: drop the last
+    //     entry, NO cd — cwd unchanged.
+    //   • EITHER spelling with a NON-EMPTY value is bash's `invalid argument`
+    //     (rc 2) — stack and cwd untouched.
+    //   • `popd $VAR` UNQUOTED with an empty expansion has the word REMOVED, so bash
+    //     runs a BARE `popd` and cds to element 1 — the ONLY reality that moves.
+    // Two of the three keep the cwd, so the cwd is unambiguous and belongs in
+    // `pending`; the bare-popd landing is the fork ALT so the write set is still a
+    // superset. Applying the bare mutation as the PRIMARY (what this arm used to
+    // do) made the STACK diverge on the two realities that never move it — MEASURED
+    // (bash 5.2.21, `E` unset), a regression vs `origin/main`:
+    //   `cd a; pushd ../b; pushd ../docs; pushd -n ../a; popd "$E"; popd; …`
+    //   bash ⇒ the next popd cds to `a` (the retained `../a` entry) and the write
+    //   hits `a/tracked.md`; the bare-primary model consumed `../a` HERE and left
+    //   the next popd resolving {`H/b`, `H/docs`} ⇒ the tracked `a/tracked.md`
+    //   overwrite was ALLOWed. Leaving the stack alone reproduces bash exactly.
+    // ⛔ REMAINING RESIDUAL (declared, same missing machinery as `pushd $VAR +N`):
+    // the `-0` reality DROPS an entry where this keeps it, so a LATER stack verb can
+    // still diverge — the fork carries CWDs, not STACKs (`forkStackAlts`).
+    if (unprovable) {
+      const S2 = vstack(fr.cwd);
+      const bareLanding = S2.length > 1 ? cdTo(S2[1]) : null;
+      fr.pending = keep;
+      if (bareLanding !== null && bareLanding !== keep) {
+        fr.forkCwd = fr.forkCwd || keep;
+        fr.forkAlts = [...new Set([...(fr.forkAlts || []), bareLanding])].filter((x) => x !== keep).slice(0, 64);
+      }
+      return;
+    }
     const d = dirStack.pop();
     if (d !== undefined && cdTo(d) === null) {
       dirStack.push(d);                           // retained, not consumed (round-2 rule)
@@ -8592,10 +8652,6 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       return;
     }
     const popTo = d !== undefined ? cdTo(d) : null;   // a RAW entry resolves here, not at insert
-    if (unprovable && popTo !== null && popTo !== keep) {
-      fr.forkCwd = fr.forkCwd || popTo;
-      fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== popTo).slice(0, 64);
-    }
     fr.pending = popTo;
   };
   // Returns null when the whole form is modelled here, or `{ dirWord }` when the

@@ -5791,6 +5791,50 @@ try {
     blocks(["a/tracked.md"], "cd a; pushd ..; pushd; echo x > tracked.md", "E5 control gate: TRACKED a/tracked.md → BLOCK (the swap resolution is real)");
     has("cd a; pushd ..; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "E5 control: a genuinely BARE `popd` still cd's to element 1 (a)");
     has("cd a; pushd ..; pushd \"\" \"\"; echo x > tracked.md", "redirect:H/tracked.md", "E5 control: TWO empty words are still 'too many arguments' (the empty operand is a word, not a no-op)");
+    // ── #3955 review ROUND 10. Three defects in the ROUND-9 fix itself, each a
+    // REGRESSION against `origin/main` (which landed on the hub root BY ACCIDENT:
+    // `resolve(cwd, "")` is the cwd, so returning the empty word to the shared cd
+    // path was right there). They are the same provenance class — a rule keyed on
+    // the DE-QUOTED word — at three different sites.
+    //  • the quoted-empty spelling is FOUR forms: `$''` and `$""` reach pushd as a
+    //    KEPT empty operand exactly like `""`, but the round-9 raw test matched only
+    //    the bare quote characters, so those two collapsed onto the bare-`pushd`
+    //    SWAP (measured: `pushd $''` ⇒ dirs `H H H/a`, cwd `H`).
+    has("cd a; pushd ..; pushd $''; echo x > tracked.md", "redirect:H/tracked.md", "F1: `pushd $''` is an explicitly EMPTY operand — bash keeps it, so this is `pushd .`");
+    blocks(["tracked.md"], "cd a; pushd ..; pushd $''; echo x > tracked.md", "F1 gate: TRACKED H/tracked.md → BLOCK (only the bare quote chars matched, so `$''` collapsed onto the SWAP → a → ALLOW)");
+    has("cd a; pushd ..; pushd $\"\"; echo x > tracked.md", "redirect:H/tracked.md", "F1b: `$\"\"` (locale-quoting) is the same empty operand");
+    has("cd a; pushd ..; pushd -- $\"\"; echo x > tracked.md", "redirect:H/tracked.md", "F1c: …and after the `--` marker too");
+    has("cd a; pushd ..; pushd $'' ../b; echo x > tracked.md", "redirect:H/tracked.md", "F1d: `pushd $'' ../b` is 'too many arguments' — a dropped `$''` left ONE valid operand and cd'd to b");
+    //  • an FD prefix is an **UNQUOTED** digit run. bash demotes `N>` to an io-number
+    //    only when the digits reach it unquoted; a quoted/escaped `2` is an ordinary
+    //    operand (and `pushd 2` really FAILS — no such directory), so the cwd stays.
+    has("cd a; pushd ..; pushd '2'>/dev/null; echo x > tracked.md", "redirect:H/tracked.md", "F2: `pushd '2'>/dev/null` — the QUOTED 2 is an operand, not an FD prefix, and the cd fails");
+    blocks(["tracked.md"], "cd a; pushd ..; pushd '2'>/dev/null; echo x > tracked.md", "F2 gate: TRACKED H/tracked.md → BLOCK (testing the DE-QUOTED word swallowed the operand ⇒ zero operands ⇒ the bare SWAP → a → ALLOW)");
+    has("cd a; pushd ..; pushd \"\"2>/dev/null; echo x > tracked.md", "redirect:H/tracked.md", "F2b: a QUOTED-EMPTY prefix does not make the 2 an io-number either — the operand is the word `2`");
+    has("cd a; pushd ..; pushd \\2>/dev/null; echo x > tracked.md", "redirect:H/tracked.md", "F2c: an ESCAPED 2 is an operand too");
+    has("cd a; pushd ..; pushd 2>/dev/null; echo x > tracked.md", "redirect:H/a/tracked.md", "F2 control: an UNQUOTED `2>` IS an FD prefix — zero operands is a genuine BARE pushd (swap to a)");
+    //  • `popd ""`'s `-0` must actually REMOVE an entry. `sel` is regexp-match-shaped
+    //    (`sel[1]` sign, `sel[2]` digits), and writing `["-", "0"]` left `sel[2]`
+    //    undefined ⇒ `idx0` NaN ⇒ `S.slice(0,NaN)` is the WHOLE array ⇒ NO removal,
+    //    while the cwd (the only thing E3 observes) still looked right. These rows
+    //    observe the STACK through the next verb.
+    has("cd a; pushd ../docs; pushd ../b; popd \"\"; popd -1; echo x > tracked.md", "redirect:H/docs/tracked.md", "F3: `popd \"\"` really DROPS the last entry — the following `popd -1` lands in docs");
+    blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ../b; popd \"\"; popd -1; echo x > tracked.md", "F3 gate: TRACKED docs/tracked.md → BLOCK (a NaN index removed nothing, so the next popd stayed one entry off in b → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd \"\" \"\"; popd -1; echo x > tracked.md", "redirect:H/docs/tracked.md", "F3b: a repeated empty operand is still ONE `-0` (bash: the same single removal)");
+    has("cd a; pushd ..; popd \"\"; popd; echo x > tracked.md", "redirect:H/tracked.md", "F3c: …and on a 2-entry stack the dropped entry leaves the bare popd with nothing to cd to (bash: 'no other directory', cwd stays)");
+    //  • `popd "$VAR"` — an unprovable operand has THREE realities and only ONE
+    //    moves the cwd (an UNQUOTED empty expansion is removed ⇒ bare popd). The
+    //    other two (`-0` for the quoted-empty spelling, `invalid argument` for a
+    //    non-empty value) keep the cwd AND the stack, so applying the bare mutation
+    //    as the primary desynchronised the stack for every LATER verb. Measured, and
+    //    each of these three reddened before the fix.
+    has("cd a; pushd ../b; pushd ../docs; pushd -n ../a; popd \"$E\"; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "F4: `popd \"$E\"` (E unset) leaves the stack alone, so the next popd cd's to the retained ../a entry (a)");
+    blocks(["a/tracked.md"], "cd a; pushd ../b; pushd ../docs; pushd -n ../a; popd \"$E\"; popd; echo x > tracked.md", "F4 gate: TRACKED a/tracked.md → BLOCK (consuming ../a at the unprovable popd left the next one resolving b/docs → ALLOW)");
+    has("cd a; pushd ../docs; pushd ../b; popd \"$E\"; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4b: …same on a plain 3-entry stack — the next popd lands in docs");
+    has("cd a; pushd ../docs; pushd -n ../b; popd \"$E\"; popd; echo x > tracked.md", "redirect:H/b/tracked.md", "F4c: …and on the `-n` insert, where the retained entry IS the inserted b");
+    has("cd a; pushd ../docs; popd $NOPE; echo x > tracked.md", "redirect:H/a/tracked.md", "F4 control: the ONE moving reality is still emitted — an UNQUOTED `$NOPE` is removed, so bash runs a bare popd (a)");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; popd $NOPE; echo x > tracked.md", "F4 control gate: TRACKED a/tracked.md → BLOCK (the bare-popd landing must stay in the emitted set, not be replaced by the no-move one)");
+    has("cd a; pushd ../docs; popd \"$E\"; echo x > tracked.md", "redirect:H/docs/tracked.md", "F4 control: the IMMEDIATE write after a quoted unprovable operand keeps the cwd (docs) — the no-move reality is the primary");
   }
 
 
