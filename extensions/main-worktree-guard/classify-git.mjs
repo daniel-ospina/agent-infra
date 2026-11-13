@@ -5040,15 +5040,32 @@ function _pushSegmentTokens(body) {
   }
   // An UNCLOSED span stays dropped: its closer is outside anything this segment can see, so no word
   // after it could be attributed. Words collected BEFORE the span are kept (the flag/target survive).
+  // A CLOSED span survives as `_SUBST_PLACEHOLDER` (one positional word) so the caller's positional
+  // arithmetic stays faithful — the REMOTE slot may legitimately be a substitution. Only when it lands
+  // in a TARGET slot does `_cleanDeleteTarget` turn it into the unresolvable marker #653 refuses;
+  // dropping it there instead is the fail-open that function documents.
   return tokens;
 }
 
 /** Short-name a raw delete target token (`:refs/heads/feat/x` → `feat/x`). */
 function _cleanDeleteTarget(x) {
-  // A collapsed substitution (see _SUBST_PLACEHOLDER) is not a branch name we can resolve — drop it
-  // rather than hand a phantom to `_coordinatedDeleteBlock` (see the jsdoc there and the follow-up
-  // issue for the unresolvable-target residual).
-  if (x === _SUBST_PLACEHOLDER) return "";
+  // ⛔ A COLLAPSED SUBSTITUTION IN A TARGET SLOT IS *UNRESOLVABLE*, NOT EMPTY (#504 × #653). This
+  // returned `""` when the placeholder was introduced, back when a target the guard could not
+  // resolve simply fell out of the list — and dropping it then was the honest reading of "this is
+  // not a ref name". #653 has since made that reading a FAIL-OPEN: `_coordinatedDeleteBlock` refuses
+  // an unresolvable target, so a target that never REACHES it is never refused either, and
+  // `git push origin -d $(echo held/branch)` came back `null` → the arm was never consulted → the
+  // delete of a sibling-held branch was ALLOWED. MEASURED on the rebase base: `origin/main` refused
+  // this shape (on a fragment), so dropping it here would have been a REGRESSION against main, not a
+  // residual. The placeholder therefore becomes a marker that is (a) non-empty, so it reaches the
+  // block, and (b) shell-shaped, so `DELETE_TARGET_UNRESOLVABLE_RE` refuses it and the refusal NAMES
+  // it. The exact span text is deliberately NOT reconstructed: it feeds a REFUSAL, never a lookup,
+  // and `_foldBacktickSubstitutions` has already replaced a backtick span's text with the sentinel,
+  // so a reconstruction would be faithful for `$( … )` and impossible for `` `…` `` — one marker for
+  // both keeps the rule (and the message) the same shape. Two distinct substitutions in one delete
+  // therefore collapse to ONE marker under the caller's dedupe; that loses which spans they were and
+  // changes no verdict: every one of them is still refused.
+  if (x === _SUBST_PLACEHOLDER) return "$(…)";
   return x
     .replace(/^["']|["']$/g, "")   // strip surrounding quotes
     .replace(/^:+/, "")             // leading empty-source colon(s)

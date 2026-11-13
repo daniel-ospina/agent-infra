@@ -1129,9 +1129,18 @@ wcdt("redirect between push and the --delete spelling", "block:push", "git push 
 // target, so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was allowed again. A
 // span that OPENS inside the segment is one WORD of the command, so its contents are skipped and the
 // scan continues; only a `)`/backtick with no opener inside the segment ends the body.
-wcdt("command-substitution OPENER keeps the flag and target", "block:push", "git push $(cat .remote) origin -d b", ["b"]);
+// ⛔ THE EXPECTATION IS BOTH POSITIONALS (#509, merged after round 6): a substitution span is ONE WORD,
+// so it takes the REPOSITORY slot and the `origin` that follows it is a second — deleted — refspec. The
+// every-refspec contract returns both; the row still reddens under the round-2 mutant (`(` → break),
+// which drops the flag and returns `[]`.
+// ⛔ AND RESTORED AFTER THE REBASE, deliberately: this row's expected value came from the merge commit
+// `d0328a8f4` that resolved it against #509's every-refspec contract, and a plain `git rebase` DROPS
+// merge commits — so replaying the branch silently reverted the row to its pre-#509 `["b"]` and turned a
+// resolved conflict back into a red suite. #509 is in `main`, so the merge's reading is still the
+// correct one; it is the resolution that is load-bearing, not the commit that carried it.
+wcdt("command-substitution OPENER keeps the flag and target", "block:push", "git push $(cat .remote) origin -d b", ["origin", "b"]);
 wcdt("substitution in an option VALUE keeps the flag and target", "block:push", "git push -o $(date) origin -d b", ["b"]);
-wcdt("BACKTICK substitution opener keeps the flag and target", "block:push", "git push origin `date` -d b", ["b"]);
+wcdt("BACKTICK substitution opener keeps the flag and target", "block:push", "git push origin `date` -d b", ["$(…)", "b"]);
 // ⛔ NO fd-dup ROW HERE (fresh-context review round 2, finding 2). `segRe`'s capture is `[^;&|]*`, so
 // it stops at the `&` inside `>&2` / `2>&1`: those tokens can NEVER reach `_redirectTakesOperand`, and
 // with the target placed BEFORE the redirect the row could not redden under any mutation (observed 0/13).
@@ -1143,8 +1152,13 @@ wcdt("the redirect's filename is not an argv word", "block:push", "git push orig
 // WORD (bash manual §5.1) but `_tokenize` emits `<` + `(` as separate tokens, so consuming the next
 // token as the redirect's filename ate the span OPENER and the span's `)` then terminated the segment:
 // `git push origin <(cat f) -d b` → null where origin/main → ["b"].
-wcdt("a process-substitution WORD before the flag", "block:push", "git push origin <(cat f) -d b", ["b"]);
-wcdt("an OUTPUT process-substitution WORD before the flag", "block:push", "git push origin >(cat f) -d b", ["b"]);
+// ⚠️ THE EXPECTED LIST NOW ALSO CARRIES THE UNRESOLVABLE MARKER: `origin` is the repository, so
+// `<(cat f)` and `b` are BOTH refspecs, and with a push-wide `-d` git deletes both. #653 refuses an
+// unknowable target, so the span is reported as `$(…)` rather than dropped — the property this row
+// pins (the `)` did not end the segment, so `b` is still attributed) is unchanged, and the row still
+// reddens under the round-3 mutant, which retargets the whole list.
+wcdt("a process-substitution WORD before the flag", "block:push", "git push origin <(cat f) -d b", ["$(…)", "b"]);
+wcdt("an OUTPUT process-substitution WORD before the flag", "block:push", "git push origin >(cat f) -d b", ["$(…)", "b"]);
 // ⛔ A QUOTED PAREN IS DATA, NOT AN OPERATOR (fresh-context review round 4, P2). `_tokenize` is
 // quote-aware for WORD CONTENTS but it STRIPS the quotes, so a word that is exactly `")"` arrives as the
 // token `)` — indistinguishable from the shell operator. It then hit the span-closer leg with depth 0 and
@@ -1155,7 +1169,7 @@ wcdt("an OUTPUT process-substitution WORD before the flag", "block:push", "git p
 wcdt("a QUOTED close-paren before the flag is data", "block:push", `git push origin -o ")" -d b`, ["b"]);
 wcdt("a QUOTED open-paren before the flag is data", "block:push", `git push origin -o "(" -d b`, ["b"]);
 wcdt("an ESCAPED close-paren before the flag is data", "block:push", "git push origin -o \\) -d b", ["b"]);
-wcdt("a quoted paren INSIDE a span keeps the flag", "block:push", `git push $(echo ")") origin -d b`, ["b"]);
+wcdt("a quoted paren INSIDE a span keeps the flag", "block:push", `git push $(echo ")") origin -d b`, ["origin", "b"]);
 // …and the masking must be REVERSIBLE: a ref name that legitimately contains a (quoted) paren is
 // restored, not mangled by the sentinel.
 wcdt("a QUOTED paren in the TARGET survives masking", "block:push", `git push origin -d "x)"`, ["x)"]);
@@ -1174,11 +1188,18 @@ wcdt("a NESTED parameter expansion's data paren", "block:push", "git push origin
 wcdt("a QUOTED brace does not close the expansion", "block:push", "git push origin -o ${R:-'}'x)} -d b", ["b"]);
 wcdt("a parameter expansion before the remote", "block:push", "git push -o ${R:-)} origin -d b", ["b"]);
 wcdt("a parameter expansion before the --delete spelling", "block:push", "git push origin -o ${R:-x)} --delete b", ["b"]);
-wcdt("a substitution span INSIDE a parameter expansion", "block:push", "git push $(echo ${R:-)}) origin -d b", ["b"]);
-// An UNRESOLVABLE target (a substitution in the delete-target position names no ref) must not become a
-// PHANTOM target: origin/main reported `["$(echo"]` / `["`cat"]`, which no ref can match either. The
-// placeholder is dropped, so the extractor says "nothing resolvable" instead of inventing a name.
-wcdt("substitution in the TARGET position yields no target (not a phantom)", "block:push", "git push origin -d $(echo b)", []);
+wcdt("a substitution span INSIDE a parameter expansion", "block:push", "git push $(echo ${R:-)}) origin -d b", ["origin", "b"]);
+// A substitution in a TARGET position must be reported UNRESOLVABLE, never as a phantom ref AND never
+// silently dropped. Both wrong answers were shipped here at some point and each is a fail-open:
+//   * `split(/\s+/)` reported the FRAGMENT `["$(echo"]`, which names no ref either — so
+//     `_coordinatedDeleteBlock` found nothing checked out under it and ALLOWED the delete (this is
+//     #653's root, fixed there);
+//   * dropping the collapsed span reported `[]`, which #653 can no more refuse than a phantom — an
+//     UNRESOLVABLE target only fails closed if it REACHES the block. MEASURED against `origin/main`:
+//     `-d $(echo held/branch)` / `` -d `date` `` / `--delete $(echo …)` were all REFUSED there (on the
+//     fragment) and came back ALLOWED from the drop, i.e. the drop was a REGRESSION against main, not a
+//     residual. The marker `$(…)` is what keeps #653's refusal reachable.
+wcdt("substitution in the TARGET position is reported UNRESOLVABLE — not a phantom ref, and not dropped", "block:push", "git push origin -d $(echo b)", ["$(…)"]);
 // The fold-in path (frozen legacy evidence in a LATER segment) overrides
 // pushTargets with the SAME extractor — the parenthesized twin must attribute
 // the real target there too, not the phantom `b)`.

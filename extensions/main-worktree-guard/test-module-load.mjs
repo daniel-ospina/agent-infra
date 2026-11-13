@@ -455,14 +455,30 @@ async function partB() {
       expectTrue("B73h: a `$( … )` OPENER before the delete flag does not hide the delete",
         isCoordBlock(d8, "held/branch"), `handler returned ${JSON.stringify(d8)?.slice(0, 200)}`);
       const d9 = await coord("d9", "git push origin HEAD:refs/heads/feat && git push origin `date` -d held/branch");
-      expectTrue("B73i: a backtick-substitution OPENER before the delete flag does not hide the delete",
-        isCoordBlock(d9, "held/branch"), `handler returned ${JSON.stringify(d9)?.slice(0, 200)}`);
+      // ⛔ THE OPENER PROPERTY AND THE REFUSAL ARE PINNED SEPARATELY (this row's original single assertion
+      // stopped holding the day #653 landed alongside #3962's segment helper). The block reason used to be
+      // `checked out in held/branch`; now the push's FIRST positional is the repository and `` `date` `` /
+      // `<(cat f)` are further REFSPECS — with a push-wide `-d` git would delete them too — so the span is
+      // reported as the unresolvable `$(…)` and #653 refuses on THAT, ahead of the checkout lookup. The
+      // shape is still refused (row a), and the property the row exists for — the span OPENER did not end
+      // the segment, so the real `-d held/branch` is still attributed (row b) — is asserted directly
+      // instead of being inferred from which reason won. Both redden under the round-2/round-3 mutants.
+      const cg9 = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
+      expectTrue("B73i: a backtick-substitution OPENER before the delete flag does not hide the delete (still REFUSED)",
+        !!d9 && d9.block === true, `handler returned ${JSON.stringify(d9)?.slice(0, 200)}`);
+      expectTrue("B73i-b: …and the real target is still ATTRIBUTED after the span (the two refusals are not interchangeable)",
+        (cg9.extractPushDeleteBranch("git push origin `date` -d held/branch") ?? []).includes("held/branch"),
+        JSON.stringify(cg9.extractPushDeleteBranch("git push origin `date` -d held/branch")));
       // ⛔ A PROCESS-SUBSTITUTION WORD IS NOT A FILENAME (round-3 review, P2): `<( list )` is one word,
       // so consuming the token after `<` as a redirect filename ate the span opener and the span's `)`
       // then ended the segment.
       const d10 = await coord("d10", "git push origin HEAD:refs/heads/feat && git push origin <(cat f) -d held/branch");
-      expectTrue("B73j: a `<( … )` WORD before the delete flag does not hide the delete",
-        isCoordBlock(d10, "held/branch"), `handler returned ${JSON.stringify(d10)?.slice(0, 200)}`);
+      const cg10 = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
+      expectTrue("B73j: a `<( … )` WORD before the delete flag does not hide the delete (still REFUSED)",
+        !!d10 && d10.block === true, `handler returned ${JSON.stringify(d10)?.slice(0, 200)}`);
+      expectTrue("B73j-b: …and the real target is still ATTRIBUTED after the process-substitution word",
+        (cg10.extractPushDeleteBranch("git push origin <(cat f) -d held/branch") ?? []).includes("held/branch"),
+        JSON.stringify(cg10.extractPushDeleteBranch("git push origin <(cat f) -d held/branch")));
       const d11 = await coord("d11", "git push origin HEAD:refs/heads/feat && git push origin -d 2>/dev/null held/branch");
       expectTrue("B73k: a redirect BETWEEN the delete flag and its target keeps the target",
         isCoordBlock(d11, "held/branch"), `handler returned ${JSON.stringify(d11)?.slice(0, 200)}`);

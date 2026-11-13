@@ -27,9 +27,16 @@
 // (the degradation arm, the push-delete arm, and the later-segment delete arm)
 // and does not depend on a state read that may itself fail.
 //
-// ⛔ PR #3962 (open) is NOT this fix and must not be read as one: it stops the
-// extractor reporting a substitution FRAGMENT (`$(echo`) as a ref name, but the
-// arm still ALLOWS because the root is the unresolved TARGET.
+// ⛔ PR #3962 IS NOT THIS FIX, but after it the arm no longer ALLOWS either — and the difference matters
+// to a reader deciding which change to trust. #3962 stops the extractor reporting a substitution
+// FRAGMENT (`$(echo`) as a ref name; on its own it used to DROP the collapsed span, and a dropped
+// target never reaches `_coordinatedDeleteBlock`, so the #73 arm was still never consulted (measured:
+// `-d $(echo held/branch)` → `null` → ALLOW). That made #3962 a REGRESSION against `main`'s
+// fragment-based refusal once #653 landed, so #3962's collision with this file was resolved by having
+// the collapsed span report a shell-shaped MARKER (`$(…)`) instead of nothing: unresolvable, therefore
+// refused by the SAME #653 decision, and the refusal names it. The two changes are complementary —
+// #653 decides "an unknowable target fails closed", #3962 makes the attribution able to SAY it is
+// unknowable instead of inventing `$(echo` or discarding the target.
 //
 // Run: node extensions/main-worktree-guard/test-653-delete-target.mjs
 //      node extensions/main-worktree-guard/test-653-delete-target.mjs --mutations
@@ -107,13 +114,15 @@ expect("A: an all-literal set yields nothing to refuse", unresolvableDeleteTarge
 expect("A: a non-array is inert (never throws into the gate)", unresolvableDeleteTargets(undefined), []);
 
 // The EXTRACTION half — why the lookup never matched. These rows are the
-// MEASURED pre-fix attribution, and they must keep showing that a substitution
-// reaches the guard as text (a fragment for `$(…)`/backticks, the expansion
-// source for `$VAR`). They are the reason the policy layer is needed even after
-// #3962's fragment collapse: `null` targets would still ALLOW.
+// MEASURED PRE-FIX attribution (the tree before #504/#3962's segment helper): a substitution reached the
+// guard as a token fragment. ⛔ THEY ARE HISTORY, NOT CURRENT BEHAVIOUR: after #3962 a collapsed span in
+// a TARGET slot is reported as the unresolvable marker `$(…)` (see `_cleanDeleteTarget`), because a
+// `null`/empty target list ALLOWS — which is what makes the policy layer load-bearing.
+// HARNESS-SENSITIVE: they changed once already when `main` merged the file that introduced them, so
+// treat a red here as "the attribution moved", and read the block's marker comment before "fixing" it.
 expect("A: $VAR extract", extractPushDeleteBranch(`git push origin --delete "$PR_BRANCH"`), ["$PR_BRANCH"]);
-expect("A: $(…) extract (a FRAGMENT, not a ref)", extractPushDeleteBranch("git push origin -d $(echo held/branch)"), ["$(echo", "held/branch)"]);
-expect("A: backtick extract (a FRAGMENT, not a ref)", extractPushDeleteBranch("git push origin -d `cat list`"), ["`cat", "list`"]);
+expect("A: $(…) extract (UNRESOLVABLE marker, not a ref)", extractPushDeleteBranch("git push origin -d $(echo held/branch)"), ["$(…)"]);
+expect("A: backtick extract (UNRESOLVABLE marker, not a ref)", extractPushDeleteBranch("git push origin -d `cat list`"), ["$(…)"]);
 expect("A: brace expansion extract (ONE token, shell makes TWO words)", extractPushDeleteBranch("git push origin -d {held,other}"), ["{held,other}"]);
 
 // ── Part B — the SHIPPED gate (real index.ts tool_call handler) ───────────
