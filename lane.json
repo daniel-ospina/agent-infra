@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12279-1794525625-p341973-95d38c8a",
+  "_sha": "a4fb48f4be424b9bc886eb4dde7d87714270625d",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12279.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/12271-pin-guard-fail-opens"
+    },
+    {
+      "kind": "sha",
+      "value": "85320158b1d4d3c46a82ebda383bc4bafe5e0dcf"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12279"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 6362,
+  "ended_at": 1794531987,
+  "exit_code": 0,
+  "heartbeat_at": 1794531987,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12279-1794525625-p341973-95d38c8a",
+  "lease_until": 1794539787,
+  "pid": 341973,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794525625,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-12279",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12279"
+}
