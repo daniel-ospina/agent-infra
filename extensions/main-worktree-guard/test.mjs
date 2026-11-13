@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptPaths, extractHeredocProgramScriptPaths, extractHeredocProgramScriptInvocations, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords, isResolvableDeleteTarget, unresolvableDeleteTargets } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -4213,6 +4213,312 @@ try {
   expectBool("B26: script shared-ref branch -D → block", scriptGitVerdict(sBranchD, "main", hubR, hubR) === "block", true);
   expectBool("B27: script push of the wt's OWN branch → allow (wt-HEAD carve-out)", scriptGitVerdict(sPushOwn, "main", hubR, hubR) === "allow", true);
   expectBool("B28: script crafted gitdir attack → block (two-way validation)", scriptGitVerdict(sCrafted, "main", wtR, hubR) === "block", true);
+
+  // ── #523: a heredoc BODY is a PROGRAM, not command-line tokens ───────────
+  // A heredoc-fed interpreter reads its body as stdin, so bash executes the
+  // body's commands while the body's tokens are NOT on the command line. The
+  // old walk tokenized the raw text, so the FIRST body token looked like the
+  // script: `bash <<EOF` + a body whose first line is `echo hi` resolved
+  // `echo` (a non-file) and the content gate no-opped, while the file the body
+  // actually executed went unread. Every arm below is a MEASURED bash shape.
+  const sBodyHub = mkS("body-hub.sh", `git -C "${hubR}" reset --hard\n`);
+  expectBool("B52: heredoc body — no first-token path (old resolved `echo`)",
+    extractScriptPath(`bash <<EOF\necho hi\n"${sBodyHub}"\nEOF`) === sBodyHub, true);
+  expectBool("B52b: heredoc body — the body's file is CONTENT-GATED (hub mutation → block)", (() => {
+    const q = extractScriptPath(`bash <<EOF\necho hi\n"${sBodyHub}"\nEOF`);
+    return q === sBodyHub && scriptGitVerdict(q, "main", hubR, hubR) === "block";
+  })(), true);
+  expectBool("B52c: heredoc body — every script it executes, not just the first", (() => {
+    const clean = mkS("body-clean.sh", `echo hi\n`);
+    const got = extractScriptPaths(`bash <<EOF\ntrue\n"${clean}"\n"${sBodyHub}"\nEOF`);
+    return got.length === 2 && got[0] === clean && got[1] === sBodyHub;
+  })(), true);
+  expectBool("B52d: heredoc body — quoted delimiter / piped / <<- / nested interpreter all resolve", (() => {
+    const p = `\"${sBodyHub}\"`;
+    return extractScriptPath(`sh <<'X'\necho hi\n${p}\nX`) === sBodyHub &&
+      extractScriptPath(`cat <<'EOF' | bash\necho hi\n${p}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<-EOF\n\techo hi\n\t${p}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF\nbash ${p}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF\nif true; then ${p}; else echo no; fi\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF\necho hi; ${p}\nEOF`) === sBodyHub;
+  })(), true);
+  // Both DIRECTORIES of the rule, so each fix has an arm that goes red when it
+  // is textually reverted: a body that is DATA (no interpreter operand, a code
+  // interpreter, a script operand on the header line) must NOT be walked.
+  expectBool("B52e: a DATA heredoc body is not a program (`cat`, no interpreter)",
+    extractScriptPath(`cat <<EOF\n${sBodyHub}\nEOF`) === null &&
+    extractScriptPath(`python3 <<PY\n"${sBodyHub}"\nPY`) === null, true);
+  expectBool("B52f: `bash <<EOF script.sh` — the OPERAND is the script, the body is stdin DATA",
+    extractScriptPath(`bash <<EOF script.sh\n"${sBodyHub}"\nEOF`) === "script.sh", true);
+  expectBool("B52g: a heredoc delimiter is never a script path (old resolved `EOF`)",
+    extractScriptPath(`bash <<EOF\necho hi\nEOF`) === null && extractScriptPath(`sh <<X\nX`) === null, true);
+  expectBool("B52h: `bash < file` (a REAL stdin file) still resolves the program",
+    extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash -s < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B52i: here-string is not a heredoc (body stays on the command line)",
+    extractScriptPath(`bash <<< '/tmp/evil.sh'`) === "/tmp/evil.sh", true);
+  expectBool("B52j: the body walk reports WHICH paths came from a body (opaque-binary stand-down)",
+    extractHeredocProgramScriptPaths(`bash <<EOF\necho hi\n"${sBodyHub}"\nEOF`).join("|") === sBodyHub &&
+    extractHeredocProgramScriptPaths(`bash "${sBodyHub}"`).length === 0, true);
+  // ⛔ ROUND-2 P1 (blocking, and a REGRESSION against `main`): LAST fd-0 REDIRECT
+  // WINS. bash processes redirections LEFT TO RIGHT, so in `bash < /dev/null
+  // <<EOF` the HEREDOC replaces the earlier `<` as fd 0 — the body IS the
+  // program and `/dev/null` is never read as a script. The predicate read only
+  // the first `<` operand, so `program` was false, the body went unwalked, and
+  // the only path gated was `/dev/null` (a char device the content gate skips):
+  // measured ALLOWED for `bash < /dev/null <<EOF` + a hub-mutating body while
+  // `main` BLOCKED it (main resolved the body token by accident). Probes below
+  // are bash-verified: every one of them EXECUTES the body.
+  expectBool("B52k: `bash < file <<EOF` — the heredoc wins fd 0, so the BODY is the program (round-2 P1)", (() => {
+    const body = `echo hi\n"${sBodyHub}"`;
+    const clean = mkS("body-null.sh", "echo hi\n");
+    return extractScriptPath(`bash < /dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash 0</dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash -x < /dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash -s < /dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`sudo bash < /dev/null <<EOF\n${body}\nEOF`) === sBodyHub &&
+      // …and the SUPERSEDED `<` operand is not a script at all: the clean file
+      // is never read, so it must not appear in the resolved set.
+      !extractScriptPaths(`bash < ${clean} <<EOF\n${body}\nEOF`).includes(clean) &&
+      extractScriptPath(`bash < ${clean} <<EOF\n${body}\nEOF`) === sBodyHub;
+  })(), true);
+  // The MIRROR shape is the other direction of the same rule, and it must NOT
+  // move: there the FILE is the later redirect, so it is the program and the
+  // body is data.
+  expectBool("B52k-ii: `bash <<EOF < file` — the FILE is the later redirect, so the body is DATA (mirror control)",
+    extractScriptPath(`bash <<EOF < /dev/null\necho hi\n"${sBodyHub}"\nEOF`) === "/dev/null" &&
+    !extractHeredocProgramScriptPaths(`bash <<EOF < /dev/null\necho hi\n"${sBodyHub}"\nEOF`).includes(sBodyHub), true);
+  // ⛔ ROUND-2 P2 (new false-block, narrow): `bash -c '…' <<EOF` — the body is
+  // the `-c` PROGRAM's stdin DATA; nothing in it executes, so walking it can only
+  // over-block. `sawInline` returned a null path, and the old predicate read a
+  // null path as "no operand → the body is the program".
+  expectBool("B52l: an INLINE `-c` program's heredoc body is stdin DATA, not a program (round-2 P2)",
+    extractScriptPath(`bash -c 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`) === null &&
+    extractScriptPath(`bash -ec 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`) === null &&
+    extractScriptPath(`bash --command 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`) === null &&
+    extractScriptPaths(`bash -c 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`).length === 0 &&
+    extractHeredocProgramScriptPaths(`bash -c 'echo hi' <<EOF\n"${sBodyHub}"\nEOF`).length === 0, true);
+  // …the SAME rule through a PIPE, where the consumer is after the `|` and the
+  // head is the data writer: a piped `-c` is DATA, a piped plain interpreter is
+  // a program (the pair is what makes each half discriminating).
+  expectBool("B52m: a PIPED `-c` consumer's body is DATA, while a piped interpreter's body is a program (round-2 P2)",
+    extractScriptPath(`cat <<'X' | bash -c 'cat >/dev/null'\necho hi\n"${sBodyHub}"\nX`) === null &&
+    extractScriptPath(`cat <<'X' | bash\necho hi\n"${sBodyHub}"\nX`) === sBodyHub, true);
+  // ⛔ ROUND-3 F1 (blocking, fail-OPEN): a pipe to the RIGHT of the heredoc is
+  // NOT the heredoc's consumer. The predicate returned the pipe consumer's
+  // verdict unconditionally, so `bash <<EOF | bash helper.sh` resolved `[]`
+  // while real bash runs the body as the LEFT shell's program — a fail-open
+  // introduced inside this change (commits 1-2 resolved the shape; the round-2
+  // P2 fix generalised "the consumer decides" to pipes that never see the
+  // heredoc). The rule: the segment that OWNS the `<<` decides FIRST; only when
+  // that segment is not an interpreter does the pipe consumer decide.
+  expectBool("B52n: a pipe AFTER the heredoc does not veto the body its OWN opener executes (round-3 F1)", (() => {
+    const body = `echo hi\n"${sBodyHub}"`;
+    return extractScriptPath(`bash <<EOF | bash helper.sh\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF | bash -c 'true'\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF | python3 -c 'pass'\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF | tee /tmp/x\n${body}\nEOF`) === sBodyHub &&
+      // …and the resolved set carries the BODY's file, never the pipe consumer's
+      !extractScriptPaths(`bash <<EOF | bash helper.sh\n${body}\nEOF`).includes("helper.sh");
+  })(), true);
+  // The over-block half of the same predicate: an opener that is NOT a
+  // stdin-program shell (a `-c` string, a script operand) makes the body that
+  // program's stdin DATA even when its stdout is piped into another shell.
+  expectBool("B52n-ii: a `-c`/script-operand OPENER keeps the body DATA through a pipe (round-3 F1, over-block half)", (() => {
+    const body = `"${sBodyHub}"`;
+    return extractScriptPath(`bash -c 'echo hi' <<EOF | bash\n${body}\nEOF`) === null &&
+      extractScriptPath(`bash layout.sh <<EOF | bash\n${body}\nEOF`) === "layout.sh" &&
+      extractHeredocProgramScriptPaths(`bash -c 'echo hi' <<EOF | bash\n${body}\nEOF`).length === 0;
+  })(), true);
+  // ⛔ ROUND-3 F2 (blocking, fail-OPEN): bash ends a heredoc on a line that IS
+  // the delimiter — no leading or trailing blanks — and `<<-` strips leading
+  // TABS only. The split used `trim()`, so `   EOF` ended the body early and
+  // routed the REST of the program into the COMMAND-LINE scan, which resolves
+  // ONE path: it resolved the benign `true` and never read the file the body
+  // really executes (measured ALLOWED while real bash runs the marker line and
+  // continues). The trim() precedent is the M5 DISCARD walk's, where ending a
+  // body early exposes MORE text — here the polarity is reversed.
+  expectBool("B52o: the heredoc TERMINATOR is matched exactly, as bash does (round-3 F2)", (() => {
+    const body = `true\n"${sBodyHub}"`;
+    return extractScriptPath(`bash <<EOF\n   EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<EOF\nEOF   \n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<-EOF\n  EOF\n${body}\nEOF`) === sBodyHub && // `<<-` strips TABS, not spaces
+      // positive `<<-` control: a TAB-indented terminator still ends the body
+      extractScriptPath(`bash <<-EOF\n\ttrue\n\t"${sBodyHub}"\n\tEOF`) === sBodyHub;
+  })(), true);
+  // ⛔ ROUND-4 (blocking, an OVER-BLOCK — a regression against `main`): the
+  // body walk reported WHICH paths came from a body but not HOW each one runs,
+  // and the handler then forced `viaInterpreter` for all of them. A bare body
+  // line is a DIRECT execution (`execve` — the kernel runs the ELF/Mach-O and
+  // no interpreter reads the bytes), so forcing the interpreter verdict
+  // re-created the #1485 false block on every opaque binary a body runs:
+  // measured BLOCK on the head for a body line `/usr/bin/git status` that
+  // `main` ALLOWS. The provenance is per INVOCATION: a body line that hands the
+  // path to a READER (`bash x.sh`, `bash < x.sh`, `source x.sh`, `. x.sh`) is
+  // `interpreted`, a bare `/abs/x.sh` / `./x.sh` is not.
+  expectBool("B52p: a body-resolved path carries HOW it runs — direct exec vs an interpreter reading it (round-4)", (() => {
+    const p = `"${sBodyHub}"`;
+    const flags = (cmd) => extractHeredocProgramScriptInvocations(cmd).map((i) => `${i.path}:${i.interpreted}`);
+    return flags(`bash <<EOF\n${p}\nEOF`).join("|") === `${sBodyHub}:false` &&
+      flags(`bash <<EOF\ntrue\n${p}\nEOF`).join("|") === `${sBodyHub}:false` && // a benign first line does not change it
+      flags(`bash <<EOF\nbash ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      flags(`bash <<EOF\nbash < ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      flags(`bash <<EOF\nsource ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      flags(`bash <<EOF\n. ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      // per INVOCATION, not per command: the same path used both ways reports the
+      // READER (the conservative direction — one occurrence does read the bytes)
+      flags(`bash <<EOF\n${p}\nbash ${p}\nEOF`).join("|") === `${sBodyHub}:true` &&
+      // the command LINE is not a body invocation, so it contributes nothing here
+      // (it keeps its own `scriptIsInterpreted` answer in the handler)
+      extractHeredocProgramScriptInvocations(`bash ${p}`).length === 0 &&
+      // and the bare-path export is the same set (membership consumers unchanged)
+      extractHeredocProgramScriptPaths(`bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub;
+  })(), true);
+  // ⛔ ROUND-5 F1 (blocking, an OVER-BLOCK — a REGRESSION against `main`): a
+  // heredoc that belongs to a CODE interpreter is that interpreter's SOURCE, and
+  // the pipe to its right carries that interpreter's STDOUT — the shell
+  // downstream never sees the body. `python3 <<PY | bash` is the ordinary generator idiom.
+  // The opener branch answered only for a SHELL head and then FELL THROUGH to the
+  // pipe loop, so the shell on the right walked a python body as a PROGRAM:
+  // measured `["…/body-hub.sh"]` on the head for a path inside a
+  // `print("…")` string (resolved as a DIRECT execution, hence content-gated)
+  // while `main` resolves nothing. A parser answers this from the grammar — a
+  // heredoc belongs to the simple command it is attached to
+  // (tree-sitter-bash's `heredoc_redirect`, mvdan.cc/sh's redirect node) — and
+  // that is the rule the branch now follows.
+  expectBool("B52q: a CODE interpreter's heredoc is its SOURCE, not a shell program — a pipe does not change that (round-5 F1)", (() => {
+    const py = `import os\nprint("${sBodyHub}")\n`;
+    return extractScriptPaths(`python3 <<PY | bash\n${py}\nPY`).length === 0 &&
+      extractHeredocProgramScriptPaths(`python3 <<PY | bash\n${py}\nPY`).length === 0 &&
+      extractScriptPaths(`python3 <<PY | tee /tmp/o | bash\n${py}\nPY`).length === 0 &&
+      extractScriptPath(`python3 <<PY | bash\n${py}\nPY`) === null &&
+      // the positive twin (round-3 F1's shape): a SHELL opener still owns its
+      // body through the pipe — so the arm is about the OPENER, not about pipes
+      extractScriptPaths(`bash <<EOF | bash helper.sh\ntrue\n"${sBodyHub}"\nEOF`).join("|") === sBodyHub;
+  })(), true);
+  // ⛔ ROUND-5 F2a (a live #523 fail-open one character away) + F2b (an
+  // unasserted behaviour whose only documentation said the opposite): bash
+  // REMOVES a backslash during quote removal, so `bash <<\EOF` is the delimiter
+  // `EOF` and the body is a real body — ending the delimiter word at `\` opened
+  // NO body, so the raw body fell into the command-line scan and resolved `echo`
+  // while real bash runs the body's file. And an UNTERMINATED body is walked
+  // (bash feeds the rest of the text to the interpreter), which the README
+  // claimed was not walked.
+  expectBool("B52r: a BACKSLASH-ESCAPED delimiter opens the body (`<<\\EOF`), and an UNTERMINATED body is walked (round-5 F2)", (() => {
+    const body = `echo hi\n"${sBodyHub}"`;
+    return extractScriptPath(`bash <<\\EOF\n${body}\nEOF`) === sBodyHub &&
+      extractScriptPath(`bash <<-\\EOF\n${body}\nEOF`) === sBodyHub &&
+      // the operand is still the script, exactly as for a plain `<<EOF`
+      extractScriptPath(`bash <<\\EOF script.sh\n${body}\nEOF`) === "script.sh" &&
+      // a DATA consumer stays unwalked — the fix opens the body, it does not
+      // widen WHICH bodies are programs
+      extractScriptPath(`cat <<\\EOF\n${body}\nEOF`) === null &&
+      extractScriptPath(`bash <<EOF\n${body}`) === sBodyHub &&
+      extractScriptPath(`cat <<EOF\n${body}`) === null;
+  })(), true);
+  // ⛔ ROUND-6 F1 (blocking, fail-OPEN — a REGRESSION against `main`): the command
+  // word of a simple command is the first NON-REDIRECT token, so a redirect may
+  // stand BEFORE it (`2>/dev/null ./x.sh`) and bash still executes that command.
+  // The body walk started at the operator, `_scriptInvocationAt` resolved
+  // nothing, and its `next` jumped to the FOLLOWING command boundary — so every
+  // token after the redirect on that line was never visited. Measured `[]` on
+  // this arm while `main` resolved the file (its accidental first-token scan) and
+  // BLOCKED it. The rule is the one tree-sitter-bash (`redirect` nodes precede
+  // `command_name`) and mvdan.cc/sh (a redirect attaches to the `CallExpr` before
+  // its `Args`) both encode.
+  expectBool("B52s: a body line whose COMMAND WORD follows a redirect still resolves the script it runs (round-6 F1)", (() => {
+    const p = `"${sBodyHub}"`;
+    const body = (line) => extractScriptPaths(`bash <<EOF\n${line}\nEOF`).join("|");
+    return body(`2>/dev/null ${p}`) === sBodyHub &&
+      body(`>/dev/null ${p}`) === sBodyHub &&
+      body(`>>/dev/null ${p}`) === sBodyHub &&
+      body(`2>>/dev/null ${p}`) === sBodyHub &&
+      body(`</dev/null ${p}`) === sBodyHub &&
+      body(`&>/dev/null ${p}`) === sBodyHub &&
+      // a redirect in FRONT of an interpreter still resolves its operand
+      body(`2>/dev/null bash ${p}`) === sBodyHub &&
+      // the already-green controls: a redirect AFTER the script, and an fd-DUP
+      // (no operand) in front of it, were never affected by the gap
+      body(`${p} >/dev/null`) === sBodyHub &&
+      body(`2>&1 ${p}`) === sBodyHub &&
+      // a body line that is ONLY a redirect runs nothing — and a redirect must
+      // not turn a non-script command word into one
+      body(`2>/dev/null`) === "" &&
+      body(`echo ${p}`) === "";
+  })(), true);
+  // ⛔ ROUND-6 F2 (blocking, fail-OPEN — a REGRESSION against `main`): the
+  // delimiter is ONE shell WORD whose quotes/backslashes are removed by quote
+  // removal and whose SPACES STAY INSIDE IT, so `<<'E F'` and `<<E\ F` both
+  // delimit on the line `E F`. Re-emitting the removed word unquoted produced
+  // `<< E F` — TWO tokens — so the redirect branch consumed `<<` + `E` and left
+  // `F` as a POSITIONAL, `stdinProgram` came out false, the body was classified
+  // DATA and never walked, and the only resolved path was the phantom `F` (a
+  // non-file, so the content gate no-opped). Measured `["F"]` while `main`
+  // resolved the body's file and BLOCKED it.
+  expectBool("B52t: a delimiter containing a SPACE stays ONE word, so its body is still walked (round-6 F2)", (() => {
+    const p = `"${sBodyHub}"`;
+    return extractScriptPaths(`bash <<'E F'\n${p}\nE F`).join("|") === sBodyHub &&
+      extractScriptPaths(`bash <<E\\ F\n${p}\nE F`).join("|") === sBodyHub &&
+      extractHeredocProgramScriptPaths(`bash <<'E F'\n${p}\nE F`).join("|") === sBodyHub &&
+      // a space-bearing delimiter is still a DELIMITER, never a script path
+      !extractScriptPaths(`bash <<'E F'\n${p}\nE F`).includes("F") &&
+      !extractScriptPaths(`bash <<'E F'\n${p}\nE F`).includes("E") &&
+      // the ordinary spellings keep their plain emitted form (no behaviour change)
+      extractScriptPaths(`bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      // a DATA consumer with a spaced delimiter is still not walked
+      extractScriptPaths(`cat <<'E F'\n${p}\nE F`).length === 0;
+  })(), true);
+  // ⛔ ROUND-7 F1 (blocking, fail-OPEN — a REGRESSION against `main`): `&` is a
+  // list operator ONLY when it is not part of a redirection. `2>&1`/`>&2`/`<&0`
+  // carry it inside the fd-DUP operator and `&>word` is a both-streams redirect,
+  // so none of them ends a simple command. Splitting on them cut the opener
+  // segment's head to the fd DIGIT (`"1 bash << EOF"`), `_wtHeadInterpreter`
+  // answered null, `_wtHeredocKind` fell to `null` (DATA) and the body was never
+  // walked: measured `[]` while `main` resolved the body's file and BLOCKED it.
+  // The mirror (over-block) half: with the `&` split, the opener of
+  // `2>&1 python3 <<PY | bash` was unresolvable, so the walk fell through to the
+  // pipe consumer and gated a path inside a PYTHON literal — round-5 F1 reopened
+  // behind one prefix token.
+  expectBool("B52u: a HEADER-line redirection does not hide the heredoc's consumer (round-7 F1)", (() => {
+    const p = `"${sBodyHub}"`;
+    const res = (cmd) => extractScriptPaths(cmd);
+    const py = `import os\nprint("${sBodyHub}")\n`;
+    return res(`2>&1 bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      res(`2>&1 sh <<X\n${p}\nX`).join("|") === sBodyHub &&
+      res(`2>&1 bash <<-EOF\n\t${p}\n\tEOF`).join("|") === sBodyHub &&
+      // the `&>` / leading-file spellings are the same rule (#3970's root, closed
+      // here for the heredoc seam only — the command-line lead scan is untouched)
+      res(`&>/dev/null bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      res(`2>/dev/null bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      res(`</dev/null bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      // the over-block control: a CODE opener's body stays SOURCE through a pipe
+      res(`2>&1 python3 <<PY | bash\n${py}\nPY`).length === 0 &&
+      // an fd-DUP is still not a command separator when it precedes a real one
+      res(`true && 2>&1 bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub;
+  })(), true);
+  // ⛔ ROUND-7 F2 (P2, fail-OPEN residue of round-6): stepping over a leading
+  // redirect (a) must not DISCARD the fd-0 FILE when the command has no script
+  // positional — `<evil.sh bash` makes evil.sh BASH'S PROGRAM, read by the
+  // interpreter, so #1485's stand-down must not apply — and (b) must not treat a
+  // here-string as operator+operand: `<<<` tokenizes as `<<` + `<` and takes ONE
+  // word, so consuming two land the "command word" on that word and the real
+  // command went unvisited. Measured `[]` for both body lines while real bash
+  // executes the file the line names.
+  expectBool("B52v: a body line's stdin FILE and a here-string operand are not lost by the redirect step-over (round-7 F2)", (() => {
+    const p = sBodyHub;
+    const inv = (cmd) => extractHeredocProgramScriptInvocations(cmd).map((i) => `${i.path}:${i.interpreted}`);
+    return extractScriptPaths(`bash <<EOF\n< ${p} bash\nEOF`).join("|") === p &&
+      extractScriptPaths(`bash <<EOF\n0<${p} bash\nEOF`).join("|") === p &&
+      // a stdin FILE is READ by the shell → interpreted (the #1485 stand-down must
+      // not exempt an opaque file the interpreter is asked to run)
+      inv(`bash <<EOF\n< ${p} bash\nEOF`).join("|") === `${p}:true` &&
+      extractScriptPaths(`bash <<EOF\n<<< data ${p}\nEOF`).join("|") === p &&
+      // a here-string's WORD is data, never a script path
+      !extractScriptPaths(`bash <<EOF\n<<< ${p} true\nEOF`).includes("data") &&
+      // controls: the redirect step-over still resolves the plain shapes, and a
+      // `bash < file` on a BODY line keeps handing the file to the reader
+      extractScriptPaths(`bash <<EOF\n2>/dev/null ${p}\nEOF`).join("|") === p &&
+      extractScriptPaths(`bash <<EOF\nbash < ${p}\nEOF`).join("|") === p;
+  })(), true);
 
   // ── Write gate (W) — resolveTargetTopLevel predicate ──
   const hubTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: hubR, encoding: "utf-8" }).trim());
