@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12313-1794535575-p434438-7ba3cf2f",
+  "_sha": "67af8c401a1ab4dde1611a33cb63b3c06c03721b",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12313.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/12237-cut-removal-gate"
+    },
+    {
+      "kind": "sha",
+      "value": "568842bf6339d4407057080183fc26de26915c0f"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12313"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7231,
+  "ended_at": 1794542806,
+  "exit_code": 143,
+  "heartbeat_at": 1794542806,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12313-1794535575-p434438-7ba3cf2f",
+  "lease_until": 1794550606,
+  "pid": 434438,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794535575,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-12313",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12313"
+}
