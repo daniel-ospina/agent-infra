@@ -153,12 +153,19 @@
 #                       hand the head to the rail as-is (its own "the head must
 #                       have been tested" precondition then decides). ⛔ AND the
 #                       flag is CARRIED to the land step (#2465): it sets
-#                       ADMIN_MERGE_FIRST_CHECKS_WAIT=0 for that invocation, so the
+#                       ADMIN_MERGE_FIRST_CHECKS_WAIT=0 and
+#                       ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1 for that invocation, so the
 #                       rail's FIRST-CHECKS wait takes ONE observation and refuses by
 #                       name — instead of silently waiting its full 3900s window on a
 #                       head that a `--no-wait` caller explicitly declined to wait for.
-#                       An ADMIN_MERGE_FIRST_CHECKS_WAIT already in the environment is
-#                       never overridden.
+#                       The ONESHOT seam (not clearing the bounds) is what makes this
+#                       work with an inherited STALL/CEILING PRESENT: those bounds are
+#                       also terms of the rail's derived whole-attempt deadline, so
+#                       emptying them could refuse a legal ADMIN_MERGE_LOCK_TTL.
+#                       An explicit NON-ZERO ADMIN_MERGE_FIRST_CHECKS_WAIT in the
+#                       environment is never overridden (it asks for a bounded wait);
+#                       an explicit `0` already says what `--no-wait` says, so the carry
+#                       proceeds rather than making the flag a silent no-op.
 #   --wait-timeout S    bound on the terminal-CI wait (default 5400)
 #   --poll S            poll interval for the waits (default 30)
 #   --max-rounds N      rounds of update→verify→record→land (default 2, max 5):
@@ -2043,8 +2050,15 @@ do_land() {
   # ⛔ An ADMIN_MERGE_FIRST_CHECKS_WAIT ALREADY IN THE ENVIRONMENT WINS: the operator's
   # explicit knob is a more specific instruction than a pass-through flag, and
   # overriding it here would make the flag silently outrank the documentation.
+  # ⛔ EXCEPT WHEN IT ALREADY SAYS `0` (review round 3, P2). `WAIT=0` is the SAME
+  # instruction as `--no-wait`, so skipping the carry there made the flag a SILENT
+  # no-op: no ONESHOT, no log line, and — when a STALL/CEILING was inherited — the rail
+  # kept a LIVE bounded wait (8760s / 18064s) for a caller who declined to wait twice.
+  # Treating `0` as equivalent is not an override: it is the same intent, expressed
+  # twice, and it is what makes the one-shot seam reach the wait in every configuration.
   local land_env=()
-  if [ "$NO_WAIT" -eq 1 ] && [ -z "${ADMIN_MERGE_FIRST_CHECKS_WAIT:-}" ]; then
+  if [ "$NO_WAIT" -eq 1 ] \
+     && { [ -z "${ADMIN_MERGE_FIRST_CHECKS_WAIT:-}" ] || [ "${ADMIN_MERGE_FIRST_CHECKS_WAIT}" = 0 ]; }; then
     land_env+=("ADMIN_MERGE_FIRST_CHECKS_WAIT=0")
     log_line "atomic-land:     --no-wait carried to the rail: ADMIN_MERGE_FIRST_CHECKS_WAIT=0 (its FIRST-CHECKS wait takes ONE observation and refuses by name, instead of waiting up to 3900s on a head you declined to wait for)"
     # ⛔ THE RAIL'S 0 SEAM IS CONDITIONAL — CARRYING THE WINDOW ALONE IS NOT ENOUGH
