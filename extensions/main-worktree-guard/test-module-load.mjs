@@ -480,8 +480,18 @@ async function partB() {
         (cg10.extractPushDeleteBranch("git push origin <(cat f) -d held/branch") ?? []).includes("held/branch"),
         JSON.stringify(cg10.extractPushDeleteBranch("git push origin <(cat f) -d held/branch")));
       const d11 = await coord("d11", "git push origin HEAD:refs/heads/feat && git push origin -d 2>/dev/null held/branch");
-      expectTrue("B73k: a redirect BETWEEN the delete flag and its target keeps the target",
+      // ⛔ B73k WAS A NON-DISCRIMINATOR UNTIL ROUND-7 REVIEW (P2), and the PR body claimed the opposite.
+      // It asserted only that the handler BLOCKED, and without the operand skip the target list becomes
+      // `["/dev/null","held/branch"]` — the held ref is STILL in it, so the block still fires and the row
+      // stayed green under the mutant it was said to pin (measured: `test.mjs`'s `wcdt` row reddens, this
+      // one did not). Same remedy as B73i-b/B73j-b: assert the extracted list, which `["/dev/null",…]`
+      // reddens, and keep the handler half as the end-to-end control.
+      const cg11 = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
+      expectTrue("B73k: a redirect BETWEEN the delete flag and its target keeps the target (end-to-end)",
         isCoordBlock(d11, "held/branch"), `handler returned ${JSON.stringify(d11)?.slice(0, 200)}`);
+      expectTrue("B73k-b: …and the redirect's OPERAND is not an argv word (this is the half that reddens under the no-skip mutant)",
+        JSON.stringify(cg11.extractPushDeleteBranch("git push origin -d 2>/dev/null held/branch")) === JSON.stringify(["held/branch"]),
+        JSON.stringify(cg11.extractPushDeleteBranch("git push origin -d 2>/dev/null held/branch")));
       // ⛔ A QUOTED PAREN IS DATA, NOT AN OPERATOR (round-4 review, P2): `_tokenize` strips the quotes, so
       // a word that is exactly `")"` reached the segment helper as the token `)` and ended the segment
       // before the delete flag — the #73 arm never fired and the sibling-held branch was deletable.

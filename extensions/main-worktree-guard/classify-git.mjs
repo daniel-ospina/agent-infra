@@ -4842,7 +4842,25 @@ function _foldBacktickSubstitutions(body) {
   for (let k = 0; k < marks.length; k += 2) {
     const open = marks[k];
     const close = marks[k + 1];
-    if (close === undefined) return out + body.slice(prev, open); // unpaired → ends the body
+    if (close === undefined) {
+      // ⛔ AN UNPAIRED BACKTICK IS A TRUNCATED SPAN, NOT SILENCE (round-7 review, P0). This dropped
+      // everything from the opener onward, so a substitution whose body contains `;`/`&`/`|` — which
+      // `segRe`'s `[^;&|]*` capture cuts BEFORE the closer — lost the delete flag AND its target with no
+      // refusable token left behind: `git push origin -d `echo a && echo b`` extracted `null` and the #73
+      // arm was never consulted. `origin/main` REFUSED that shape (its tokenizer left the fragment
+      // `` `echo ``), so dropping it was a regression, the same one finding 1 measured for the paren
+      // twin.
+      // The tail is UNKNOWABLE either way, so the whole span becomes ONE placeholder word.
+      // ⛔ THE SEPARATOR IS LOAD-BEARING: without it the placeholder GLUES onto the preceding word
+      // (`… -d b` + `\u0000SUBST` is the single token `b\u0000SUBST`), which would corrupt a real
+      // target. With it, `echo `git push origin -d b` x` reports `["b","$(…)"]` — refused for the
+      // unknowable word, with the real target still attributed — which is the same verdict
+      // `origin/main` reaches on its own `` b` `` fragment.
+      // A backtick with NOTHING after it in this segment is the #504 CLOSER (`echo `git push origin -d
+      // held/branch``), whose closer belongs to an outer command; it still ENDS the body, unchanged.
+      const tail = body.slice(prev, open);
+      return body.slice(open + 1).trim() === "" ? out + tail : `${out}${tail} ${_SUBST_PLACEHOLDER}`;
+    }
     out += body.slice(prev, open) + _SUBST_PLACEHOLDER;
     prev = close + 1;
   }
@@ -4978,12 +4996,18 @@ function _redirectTakesOperand(tok) {
  * against a fail-open this helper shipped or inherited:
  *
  *   1. NO LIST SEPARATOR CAN REACH THIS HELPER (round-6 review, P3: an earlier revision described a
- *      `_SHELL_OPS` separator break HERE as live; it was dead). `segRe`'s capture is `([^;&|]*)`, so
- *      `;`, `&` and `|` — and therefore `&&`, `||`, `&>` — are never in the body, and `_tokenize` is
- *      called WITHOUT `newlineIsSeparator`, so it never synthesises a `;` from a newline either. The
- *      only `_SHELL_OPS` members that can arrive, `(`/`)`, are intercepted by rule 3. The dead line was
- *      deleted rather than pinned by a test — the standard rounds 2 and 3 applied to
- *      `_redirectTakesOperand`'s unreachable branches.
+ *      `_SHELL_OPS` separator break HERE as live; it was dead). `segRe`'s capture is `([^;&|\n]*)`, so
+ *      `;`, `&` and `|` — and therefore `&&`, `||`, `&>` — are never in the body, and neither is a
+ *      NEWLINE; `_tokenize` is called WITHOUT `newlineIsSeparator`, so it never synthesises a `;`
+ *      either. ⛔ THE NEWLINE HALF IS ROUND-7 REVIEW, P0, AND IT IS A CAPTURE CHANGE, NOT A BREAK
+ *      INSIDE THIS HELPER: the capture used to span a newline, so two commands arrived as one body and
+ *      the second command's `(` became a span OPENER under rule 3 — `git push origin HEAD:feat\n( git
+ *      push origin -d held/branch )` extracted `[]` and the #73 arm was never consulted, where
+ *      `origin/main` blocked it. A `;`-break here was tried FIRST and was wrong twice over: it cannot
+ *      see the second `git push` at all (the `g` scan had already consumed it into the first match), and
+ *      it would have needed a rule for a separator the capture no longer admits. The only `_SHELL_OPS`
+ *      members that can arrive, `(`/`)`, are intercepted by rule 3. There is deliberately no
+ *      separator branch below to go dead.
  *   2. A REDIRECT is NOT a boundary (round-1 review P1): `_isRedirectOperator` states that a
  *      redirect may appear ANYWHERE in a simple command, so breaking at `>` truncated the argument
  *      list being scanned — `git push origin 2>/dev/null -d held/branch` gave `[]` where origin/main
@@ -4993,8 +5017,12 @@ function _redirectTakesOperand(tok) {
  *      and target after it survive (round-2 review P2 — truncating at the opener returned null
  *      where origin/main returned the target). A `)` with no matching opener in the segment closes
  *      something started before `git push` (`… && (git push origin -d b)`) and DOES end it, which is
- *      #504 itself.
- *      Backticks are folded first by `_foldBacktickSubstitutions` (rule 3's string-level twin).
+ *      #504 itself. A span that never CLOSES is still reported as ONE unknowable word (round-7 review,
+ *      P0) — dropping it was the same regression as the newline gap, on the other side of the capture:
+ *      `segRe` cuts a substitution body at its own `;`/`&`/`|`, so `-d $(cat f | head -1)` lost the
+ *      target entirely.
+ *      Backticks are folded first by `_foldBacktickSubstitutions` (rule 3's string-level twin), which
+ *      reports a truncated backtick span the same way.
  *   4. Only an UNQUOTED, UNEXPANDED paren is an operator (round-4 review P2; round-6 P2).
  *      `_tokenize` strips quotes, so a word that is exactly `")"` reached rules 1-3 as the token `)`
  *      and ended the segment — and so did the `)` of a `${ … }` word, whose closer is a BRACE, not a
@@ -5038,12 +5066,16 @@ function _pushSegmentTokens(body) {
     if (depth > 0) continue; // inside a substitution span — its words are not this command's argv
     tokens.push(_unmaskDataParens(t));
   }
-  // An UNCLOSED span stays dropped: its closer is outside anything this segment can see, so no word
-  // after it could be attributed. Words collected BEFORE the span are kept (the flag/target survive).
-  // A CLOSED span survives as `_SUBST_PLACEHOLDER` (one positional word) so the caller's positional
-  // arithmetic stays faithful — the REMOTE slot may legitimately be a substitution. Only when it lands
-  // in a TARGET slot does `_cleanDeleteTarget` turn it into the unresolvable marker #653 refuses;
-  // dropping it there instead is the fail-open that function documents.
+  // An UNCLOSED span is TRUNCATED, not empty (round-7 review, P0). It used to be dropped, so a
+  // substitution whose body contains `;`/`&`/`|` — cut by `segRe` BEFORE the closer — left no word
+  // behind that `_cleanDeleteTarget` could mark: `git push origin -d $(cat f | head -1)` extracted
+  // `null` and the #73 arm was never consulted, where `origin/main` REFUSED it. The span is ONE
+  // unknowable word either way, so it becomes the same placeholder a CLOSED span gets; words collected
+  // BEFORE it are kept (the flag/target survive).
+  // ⛔ This is also why the placeholder must survive into a TARGET slot: `_cleanDeleteTarget` turns it
+  // into the unresolvable marker #653 refuses; dropping it there instead is the fail-open that
+  // function documents.
+  if (depth > 0) tokens.push(_SUBST_PLACEHOLDER);
   return tokens;
 }
 
@@ -5097,13 +5129,26 @@ function _cleanDeleteTarget(x) {
  *   result does NOT prove git will delete it (review P3-1).
  */
 export function extractPushDeleteBranch(command) {
-  const c = String(command ?? "").trim();
+  // ⛔ A BACKSLASH-NEWLINE IS A LINE CONTINUATION AND MUST BE RESOLVED **BEFORE** THE SEGMENT SCAN
+  // (round-7 review, P0 — found while fixing the newline boundary below). `segRe` now stops the capture at
+  // a newline, which is right for two separate COMMANDS — but a continuation is ONE command, and bash
+  // joins the lines before it parses words, so `git push origin \\<newline> -d held/branch` would have
+  // been cut at the newline, losing the delete entirely (extractor `["origin","\"]` → no flag → ALLOW)
+  // where `origin/main` refused it. Replacing the pair with the EMPTY string is what the shell does
+  // (nothing is inserted; the surrounding spaces do the word separation).
+  const c = String(command ?? "").trim().replace(/\\\r?\n/g, "");
   if (!/\bgit\s+push\b/.test(c)) return null;
   // Compound commands carry several `git push` segments (`a && git push … ;
   // git push …`) — detect deletes per segment, stopping at shell operators
-  // (the original regex's [^;&|]* contract).
+  // (the original regex's [^;&|]* contract) AND at a NEWLINE, which is a list separator in bash exactly
+  // like `;` (agent-infra#1158). ⛔ THE NEWLINE IS EXCLUDED FROM THE CAPTURE, NOT SPLIT LATER: a body
+  // that kept it (`git push origin HEAD:feat\n( git push origin -d held/branch )`) made the SECOND
+  // command's `(` look like a span OPENER under rule 3, so the `-d` and its target were skipped as span
+  // content, the extractor returned `[]`, and the #73 arm was never consulted — while `origin/main`
+  // BLOCKED that shape, so it was a regression. Ending the capture makes the `g` scan find the second
+  // `git push` as its OWN segment, which is the attribution the shell actually has.
   const branches = [];
-  const segRe = /\bgit\s+push\b([^;&|]*)/g;
+  const segRe = /\bgit\s+push\b([^;&|\n]*)/g;
   let sm;
   while ((sm = segRe.exec(c)) !== null) {
     // #504 residual: bound the segment at the first shell BOUNDARY token using

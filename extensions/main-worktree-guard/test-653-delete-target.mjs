@@ -125,6 +125,47 @@ expect("A: $(…) extract (UNRESOLVABLE marker, not a ref)", extractPushDeleteBr
 expect("A: backtick extract (UNRESOLVABLE marker, not a ref)", extractPushDeleteBranch("git push origin -d `cat list`"), ["$(…)"]);
 expect("A: brace expansion extract (ONE token, shell makes TWO words)", extractPushDeleteBranch("git push origin -d {held,other}"), ["{held,other}"]);
 
+// ── Round-7 review (P0 ×2): the two capture-level gaps that made the segment helper WORSE than
+// `origin/main`, both measured as `extractPushDeleteBranch → null` = the #73 arm never consulted. ──
+// 1. A NEWLINE is a list separator ("a bare NEWLINE ends a simple command exactly like `;`", the
+//    module's own `_tokenize` doc, agent-infra#1158). `segRe`'s capture spanned it, so the SECOND
+//    command arrived inside the first body and its `(` was read as a span OPENER — the `-d` and its
+//    target were skipped as span content. `origin/main` blocked these; the extractor returned `null`.
+// ⛔ EVERY ONE OF THESE MUST NAME THE REAL TARGET, not merely `$(…)`: the point is that the second
+//    command was ATTRIBUTED, which is what the #73 lookup needs.
+for (const [name, cmd, want] of [
+  ["a NEWLINE + parenthesized later segment", "git push origin HEAD:feat\n( git push origin -d held/branch )", ["held/branch"]],
+  ["a CRLF later segment", "git push origin HEAD:feat\r\n( git push origin -d held/branch )", ["held/branch"]],
+  ["a TAB-indented later segment", "git push origin origin/HEAD\n\t( git push origin -d held/branch )", ["held/branch"]],
+  ["a NEWLINE + `--delete` later segment", "git push origin HEAD:feat\n( git push origin --delete held/branch )", ["held/branch"]],
+  ["a bare NEWLINE-separated delete (no parens)", "git push origin HEAD:feat\n git push origin -d held/branch", ["held/branch"]],
+  // 2. A BACKSLASH-NEWLINE is a LINE CONTINUATION: bash joins the lines before parsing words, so the
+  //    capture must NOT be cut there. Resolved before the scan, so the delete survives.
+  ["a BACKSLASH-NEWLINE continuation keeps the delete", "git push origin \\\n-d held/branch", ["held/branch"]],
+]) {
+  expect(`A: ${name} → the real target is ATTRIBUTED`, extractPushDeleteBranch(cmd), want);
+}
+
+// ── The TRUNCATED SPAN (round-7 review, P0): a substitution whose BODY contains `;`/`&`/`|` is cut by
+// the capture before its closer, so the span never closes. Dropping an unclosed span is the same
+// fail-open on the other side: `origin/main` refused these on a fragment, this branch returned `null`.
+// The truncated span is ONE unknowable word, so it reports the same `$(…)` marker a closed one does.
+for (const [name, cmd] of [
+  ["a pipe inside the substitution body", "git push origin -d $(cat f | head -1)"],
+  ["a semicolon inside the substitution body", "git push origin -d $(echo a; echo b)"],
+  ["an `&&` inside the substitution body", "git push origin -d $(echo a && echo b)"],
+  ["a pipe inside a BACKTICK body", "git push origin -d `echo a && echo b`"],
+  ["a truncated span in a compound's later segment", "git push origin HEAD:refs/heads/feat && git push origin -d $(cat f | head -1)"],
+]) {
+  expect(`A: ${name} → UNRESOLVABLE marker`, extractPushDeleteBranch(cmd), ["$(…)"]);
+}
+// …and the marker really is what #653 refuses, end-to-end at the seam these rows live in.
+for (const t of ["$(…)"]) expect(`A: #653 refuses the truncated-span marker ${t}`, unresolvableDeleteTargets([t]), [t]);
+// ⚠️ CONTROL (not a discriminator): a backtick with NOTHING after it in the segment is the #504
+// CLOSER, whose partner belongs to an outer command — it still ends the body, so the real target
+// survives and is NOT replaced by a marker.
+expect("A: an unpaired CLOSING backtick keeps the real target", extractPushDeleteBranch("echo `git push origin -d held/branch`"), ["held/branch"]);
+
 // ── Part B — the SHIPPED gate (real index.ts tool_call handler) ───────────
 if (typeof stripTypeScriptTypes !== "function" ||
     (typeof register !== "function" && typeof registerHooks !== "function")) {
@@ -237,6 +278,10 @@ if (typeof stripTypeScriptTypes !== "function" ||
       ["B10 #653: an assignment in the SAME command is NOT resolved (the fix judges TEXT, it does not emulate the shell)", `BRANCH=stale && git push origin --delete "$BRANCH"`],
       ["B11 #653: LATER-SEGMENT delete in a compound (the wholeCommandDeleteTargets arm)", `git push origin main && git push origin -d "$PR_BRANCH"`],
       ["B12 #653: a benign lead segment must not launder the delete", `git status && git push origin --delete "$PR_BRANCH"`],
+      // #3962 round-7 review P0: the substitution's OWN body carries a pipe, so the segment capture cuts
+      // before the closer and the span never closes. It used to be DROPPED, which left no refusable
+      // token: the extractor said `null` and this arm was never consulted (ALLOWED end-to-end).
+      ["B13 #3962: a TRUNCATED span (a pipe inside the substitution body)", `git push origin -d $(printf held/branch | head -1)`],
     ];
     for (const [name, cmd] of deny) {
       expectTrue(`${name} → REFUSED`, refusedBy(await quiet(() => real.bash(cmd)), FAIL_CLOSED),
@@ -265,6 +310,15 @@ if (typeof stripTypeScriptTypes !== "function" ||
       refusedBy(await quiet(() => real.bash("git push origin :held")), HOLDS));
     expectTrue("D3: an UNRESOLVABLE delete of the same held branch is refused by #653's arm (not silently allowed)",
       refusedBy(await quiet(() => real.bash(`git push origin --delete "$(printf held)"`)), FAIL_CLOSED));
+    // #3962 round-7 review P0: a NEWLINE is a list separator exactly like `;`, so the second command is
+    // its OWN push segment. The capture used to span the newline, the second segment's `(` was read as a
+    // span OPENER, and the `-d` + target were skipped — ALLOWED end-to-end, where `origin/main` blocked it.
+    // ⚠️ Asserted against #73's OWN reason text (`currently checked out`), not a bare `block === true`, so
+    // an unrelated refusal cannot satisfy it — and not against FAIL_CLOSED, because the correct answer
+    // here is the #73 lookup on the REAL target, which is a different arm.
+    expectTrue("D4 #3962: a NEWLINE-separated later segment is #73-blocked on the REAL target (the newline ends the segment)",
+      refusedBy(await quiet(() => real.bash("git push origin HEAD:refs/heads/feat\n( git push origin -d held )")), HOLDS),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash("git push origin HEAD:refs/heads/feat\n( git push origin -d held )")))?.slice(0, 200)}`);
 
     // ── Part E: a WORKTREE session is NOT exempt ────────────────────────────
     // The #73 arm has never been worktree-exempt, and the fleet's lanes run from
