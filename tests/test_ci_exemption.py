@@ -3864,11 +3864,13 @@ def test_1424_the_mask_does_not_swallow_a_short_or_generic_token():
 #: them, which is the fail-OPEN direction: main red in one repo directory would
 #: exempt a PR's NEW failure in another. Measured on this repo's own tree, a rule
 #: that is BOTH unanchored AND fingerprint-free masks 271 of 430 tracked
-#: directories (`docs/epics/917-lean-workflow`, `extensions/loop-enforcer`) and 119
-#: of 402 branch slugs; unanchored ALONE masks 0 today, because the digit/uppercase
-#: fingerprint is what excludes `commit-workflow`-style names (review round 5
-#: corrected this comment's earlier 107/430 claim, which was no longer
-#: reproducible).
+#: directories (`docs/epics/917-lean-workflow`, `extensions/loop-enforcer`);
+#: unanchored ALONE masks 0 tracked DIRECTORIES today, because the
+#: digit/uppercase fingerprint is what excludes `commit-workflow`-style names.
+#: (Slug figures must be quoted with their population — round 6 measured 184 of
+#: 398 origin-tracking refs for the same shape, and the ref set drifts.) Review
+#: rounds 5 and 6 corrected this comment's earlier claims, which were no longer
+#: reproducible.
 _STABLE_LOOKALIKES = (
     (
         "pnpm pack: /repo/skills/commit-workflow/SKILL.md missing",
@@ -4006,16 +4008,33 @@ def test_1424_a_semantic_tt_label_stays_signal_even_under_a_temp_root():
 
     ``tt_`` is BOTH a generated basetemp prefix and the consumer repo's API-key
     fixture family. Anchoring to ``/tmp/`` separates the common case, but a
-    fixture labelled ``tt_valid_key`` can also be a directory NAME, so the tail
-    must look generated (it must carry a digit) before it is masked. The cost is
-    the fail-CLOSED residual named in the mask's comment: an all-letter random
-    suffix stays raw and merely blocks.
+    fixture labelled ``tt_expected`` can also be a directory NAME, so the tail
+    must look generated (it must carry a digit) before it is masked.
+
+    ⛔ The labels here are EIGHT characters ON PURPOSE. The first version of this
+    test used ``tt_valid_key`` (11) and ``tt_ratelimited`` (13) — both already
+    excluded by the width arm — so deleting the fingerprint kept the suite green
+    (review round 6 residual 1; the round-5 commit claimed this was fixed and it
+    was not, corrected here).
     """
-    a = ci_exemption.normalize_signature("/tmp/tt_valid_key/repo/socket missing")
-    b = ci_exemption.normalize_signature("/tmp/tt_ratelimited/repo/socket missing")
+    a = ci_exemption.normalize_signature("/tmp/tt_expected/repo/socket missing")
+    b = ci_exemption.normalize_signature("/tmp/tt_rejected/repo/socket missing")
 
     assert "<TMP>" not in a, f"a semantic label must stay SIGNAL: {a!r}"
-    assert a != b, f"two different fixture labels collapsed: {a!r}"
+    assert a != b, f"two 8-character labels collapsed: {a!r}"
+
+    # …the FINGERPRINT, at the width the mask actually operates on, is what
+    # separates an 8-character label from an 8-character draw.
+    assert (
+        ci_exemption.normalize_signature("/tmp/tt_a1b2c3d4/repo/socket")
+        == "/tmp/<TMP>/repo/socket"
+    )
+
+    # …and a long-form semantic fixture is excluded by the WIDTH arm, not this one.
+    assert (
+        ci_exemption.normalize_signature("/tmp/tt_valid_key/repo/x")
+        == "/tmp/tt_valid_key/repo/x"
+    )
 
 
 def test_1424_a_temp_mask_before_a_duration_does_not_read_as_a_bound_operator():

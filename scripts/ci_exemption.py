@@ -1488,15 +1488,23 @@ _TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=<TMP>/))"
 #:   /tmp/tmpnnjrgwic/redis.socket                  ``tempfile`` / ``tmp_path``
 #:   /tmp/tt_s9k6lwdc/collision-preflight-iis0g3yc  pytest basetemp + mkdtemp
 #:
-#: ⛔ EVERY RULE HERE IS ANCHORED TO A TEMP PATH, and the anchor is load-bearing
+#: ⛔ EVERY RULE HERE IS ANCHORED TO A TEMP PATH — with ONE deliberate exception,
+#: the ``pytest-of-<user>/pytest-<N>`` pair below, which is anchored to its own
+#: two-component GENERATOR shape because that path can live outside a temp root
+#: (a per-user basetemp) and both of its components are per-run. The anchor is
+#: load-bearing
 #: rather than tidy. A shape-only rule masks STABLE identifiers that happen to
 #: look random, which is the fail-OPEN direction: measured on this repo's own
 #: tree, a rule that is BOTH unanchored and fingerprint-free masks 271 of 430
 #: tracked directories (``docs/epics/917-lean-workflow``,
 #: ``extensions/loop-enforcer``) and 119 of 402 branch slugs
 #: (``fix/issue-3429-gh-credential``), so a PR's NEW failure in one would be
-#: exempted by main's red in another. Unanchored ALONE masks 0 today — the
-#: digit/uppercase fingerprint is what excludes ``commit-workflow``-style names.
+#: exempted by main's red in another. Unanchored ALONE masks 0 tracked
+#: DIRECTORIES today (the digit/uppercase fingerprint is what excludes
+#: ``commit-workflow``-style names) while still masking 87 of 398 origin-tracking
+#: branch slugs — so a slug is only safe where it carries no fingerprint. Both
+#: slug figures must be quoted with their population: the ref set drifts
+#: (review round 6 residual 4 re-measured 184 of 398 for the same shape).
 #:
 #: ⛔ AND A TAIL MUST LOOK GENERATED, not merely long: a generator's draw carries a
 #: DIGIT or an UPPERCASE letter, while a test's own label is a lowercase word —
@@ -1511,13 +1519,22 @@ _TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=<TMP>/))"
 #: an all-lowercase Node draw is ~18% at width 6. Both merely block; neither can
 #: exempt a failure main never had.
 #:
-#: TWO FURTHER DECLARED FAIL-CLOSED COSTS, both measured in review round 5: a
-#: stable component of 6–8 digit-bearing characters directly under a temp root is
-#: indistinguishable from a draw by shape and IS masked (``/tmp/wt-regsync2`` ->
-#: ``/tmp/wt-<TMP>``; no pair of different failures at one id was found that
-#: differs ONLY there); and macOS ``$TMPDIR`` layouts
-#: (``/var/folders/…/T/…``) and an underscore-containing ``mkdtemp`` prefix stay
-#: raw, so such an id keeps blocking.
+#: DECLARED COSTS, each measured rather than assumed:
+#:
+#:  * the ``tmp`` rule has NO fingerprint at all — a tempfile draw is exactly 8
+#:    characters from ``[a-z0-9_]``, so ``/tmp/tmparchives`` is a legal draw and is
+#:    masked while ``/tmp/tmpbackups`` (7) is not. Shape-correct, and stated here
+#:    because the class is wider than "digit-bearing".
+#:  * a stable component of 6–8 DIGIT-BEARING characters directly under a temp
+#:    root is indistinguishable from a draw and IS masked (``/tmp/wt-regsync2`` ->
+#:    ``/tmp/wt-<TMP>``). That is the fail-OPEN DIRECTION, so it is recorded as
+#:    such, defended only by the measurement that no pair of different failures at
+#:    one id was found differing ONLY there.
+#:  * FAIL-CLOSED: macOS ``$TMPDIR`` layouts (``/var/folders/…/T/…``) and an
+#:    underscore-containing ``mkdtemp`` prefix stay raw, so such an id keeps
+#:    blocking — except where the draw happens to be all-hex, which the
+#:    pre-existing ``<HEX>`` rule masks (~0.1% of draws), so that id's fate is
+#:    run-dependent.
 #:
 #: ⛔ AND THE WIDTH IS ``{8}``, NOT ``{8,}``: ``_RandomNameSequence`` emits EXACTLY
 #: 8 characters, so a longer run is not a draw at all (it is a stable name that
