@@ -1452,72 +1452,86 @@ _VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str
     # declared interpolation; the stable part is its shape.
     (re.compile(r"\bteam_[A-Za-z0-9][A-Za-z0-9_]{0,63}\b"), "team_<X>"),
     (re.compile(r"\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d{2,5}\b"), "<HOSTPORT>"),
-    # THE PER-RUN TEMP IDENTIFIERS (#1424) — the same class as the hex run ids
-    # above: a token the RUN generated, so main can never have measured THIS
-    # token, and leaving it raw makes the SUBSET rule unsatisfiable for an id
-    # main itself measures red. Measured shapes:
-    #
-    #   /tmp/tmpnnjrgwic/redis.socket                  ``tempfile`` / ``tmp_path``
-    #   /tmp/tt_s9k6lwdc/collision-preflight-iis0g3yc  pytest basetemp + mkdtemp
-    #
-    # ``tmp[A-Za-z0-9]{6,}`` is NOT the existing ``<HEX>`` rule wearing a second
-    # hat: ``tmpnnjrgwic`` and ``tt_esyk5btg`` contain letters outside
-    # ``[0-9a-f]``, which is why the hex rule correctly refuses them and the
-    # signature stayed volatile.
-    #
-    # ⛔ EVERY RULE IN THIS GROUP IS ANCHORED TO A TEMP PATH, and that anchor is
-    # load-bearing rather than tidy. A shape-only rule masks STABLE identifiers
-    # that happen to look random, which is the fail-OPEN direction: measured on
-    # this repo's own tree, an unanchored hyphens+8-char-tail rule masks 107 of
-    # 430 tracked directories (``skills/commit-workflow``, ``extensions/loop-
-    # enforcer`` — ``workflow`` is 8 characters) and 119 of 402 branch slugs
-    # (``fix/issue-3429-gh-credential``), so a PR's NEW failure in one of them
-    # would be exempted by main's red in another. The same holds for ``tt_``,
-    # which is ALSO the consumer repo's semantic fixture family
-    # (``tt_valid_key`` / ``tt_ratelimited``): hence the temp-root anchor AND
-    # the digit requirement on the tail. Both are fail-CLOSED if the anchor ever
-    # misses a real layout — the signature stays volatile and the id simply
-    # blocks, which is the direction an unexemptable-but-honest gate errs.
-    (re.compile(r"(?<=/)tmp[A-Za-z0-9]{6,}(?![0-9A-Za-z])"), "<TMP>"),
-    (
-        # The ``(?=[A-Za-z0-9_]*\d)`` digit requirement is a SECOND anchor, and it
-        # costs a declared fail-CLOSED residual: a random suffix drawn without a
-        # digit (~5.6% of 8-character draws off ``[a-z0-9]``) stays raw and the id
-        # simply blocks. What it buys is that a SEMANTIC ``tt_`` label — the
-        # consumer repo's ``tt_valid_key`` / ``tt_ratelimited`` API-key fixtures —
-        # is never masked even when it sits under a temp root.
-        #
-        # Fixed-width alternatives because Python's ``re`` refuses a
-        # variable-width lookbehind (measured). ``(?<=<TMP>/)`` is the arm that
-        # makes this composable: rules in this group run left to right, so a
-        # ``tt_*`` root has ALREADY become ``<TMP>`` when a deeper component is
-        # examined — without it ``/tmp/<TMP>/collision-preflight-…`` would keep
-        # its random second component raw.
-        re.compile(
-            r"(?:(?<=/tmp/)|(?<=/var/tmp/)|(?<=/private/tmp/)|(?<=<TMP>/))"
-            r"tt_(?=[A-Za-z0-9_]*\d)[A-Za-z0-9_]{6,}(?![0-9A-Za-z])"
-        ),
-        "<TMP>",
-    ),
-    # A ``mkdtemp(prefix=...)`` DIRECTORY NAME: the test's own prefix is stable,
-    # everything after the last hyphen is random. Anchored to a TEMP ROOT (or to
-    # a parent this group already masked), so a repo directory, a branch slug
-    # and a filename are never touched however hyphenated they are — and the
-    # mask is the COMPONENT, never the whole path, so ``…/tmp/…/packs/good`` vs
-    # ``…/tmp/…/packs/broken`` still differs. The 8+ floor is the length at
-    # which a generated tail stops looking like an English word.
-    (
-        re.compile(
-            r"(?:(?<=/tmp/)|(?<=/var/tmp/)|(?<=/private/tmp/)|(?<=<TMP>/))"
-            r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*-[a-z0-9]{8,}"
-            r"(?=[/\s\"'`,;:)\]]|$)"
-        ),
-        "<TMP>",
-    ),
     # Last, and context-aware: a fractional duration that is a MEASUREMENT is the
     # machine's, not the assertion's (#9331); an operator-prefixed bound is
     # signal. The unit and the slot ride the token so SCALE and COUNT stay signal.
     (_MEASURED_DURATION_RE, _mask_measured_duration),
+)
+
+
+def _mask_mkdtemp_tail(m: re.Match[str]) -> str:
+    """Keep the test's own stable prefix; mask only the generated tail.
+
+    ``collision-preflight-iis0g3yc`` -> ``collision-preflight-<TMP>``. Replacing
+    the WHOLE component (the first draft) destroyed the prefix and collapsed
+    ``expected-…`` with ``rejected-…`` — the fail-OPEN direction, measured in
+    review round 2.
+    """
+    return f"{m.group('prefix')}-<TMP>"
+
+
+#: The TEMP-ROOT ANCHOR, spelled as fixed-width alternatives because Python's
+#: ``re`` refuses a variable-width lookbehind (measured). ``(?<=<TMP>/)`` is the
+#: COMPOSABILITY arm: a parent this group already masked. It is what makes a
+#: NESTED layout reachable — without it ``/tmp/<TMP>/collision-preflight-…`` keeps
+#: its random second component raw — and why the pass below runs to a fixed point.
+_TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=/var/tmp/)|(?<=/private/tmp/)|(?<=<TMP>/))"
+
+#: THE PER-RUN TEMP IDENTIFIERS (#1424) — the same class as the hex run ids in
+#: the list above: a token the RUN generated, so main can never have measured
+#: THIS token, and leaving it raw makes the SUBSET rule unsatisfiable for an id
+#: main itself measures red. Measured shapes:
+#:
+#:   /tmp/tmpnnjrgwic/redis.socket                  ``tempfile`` / ``tmp_path``
+#:   /tmp/tt_s9k6lwdc/collision-preflight-iis0g3yc  pytest basetemp + mkdtemp
+#:
+#: ⛔ EVERY RULE HERE IS ANCHORED TO A TEMP PATH, and the anchor is load-bearing
+#: rather than tidy. A shape-only rule masks STABLE identifiers that happen to
+#: look random, which is the fail-OPEN direction: measured on this repo's own
+#: tree, an unanchored rule masks 107 of 430 tracked directories
+#: (``skills/commit-workflow`` — ``workflow`` is 8 characters) and 119 of 402
+#: branch slugs (``fix/issue-3429-gh-credential``), so a PR's NEW failure in one
+#: would be exempted by main's red in another.
+#:
+#: ⛔ AND A TAIL MUST LOOK GENERATED, not merely long: ``tempfile`` draws from
+#: ``[a-z0-9_]`` with no hyphen, so a hyphenated component under a temp root is a
+#: test's own LABEL (``expected-workflow``, ``run-integration``) unless its tail
+#: carries a digit. The digit requirement costs a declared fail-CLOSED residual
+#: (an all-letter draw, ~5.6% at 8 characters, stays raw) and buys the property
+#: that two different labels never collapse into one signature.
+_TEMP_NORMALIZERS: tuple[
+    tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...
+] = (
+    # ``tempfile`` / ``tmp_path``: the prefix is exactly ``tmp`` followed by
+    # ``_RandomNameSequence``'s 8-character draw off ``[a-z0-9_]``. The 8-char
+    # floor (tempfile's exact width) keeps ``tmpfiles`` / ``tmp_utils`` — prose or
+    # a stable directory — out; ``tmpnnjrgwic`` and ``tmpyhd2_vfw`` (an
+    # underscore draw, ~14% of real runs) are both masked.
+    (re.compile(_TEMP_ROOT + r"tmp[A-Za-z0-9_]{8,}(?![0-9A-Za-z_])"), "<TMP>"),
+    # pytest's basetemp ``tt_<draw>``, with the digit requirement described above:
+    # ``tt_valid_key`` is ALSO the consumer repo's semantic API-key fixture family,
+    # and conflating "valid key rejected" with "rate-limited" under one id is the
+    # fail-OPEN outcome this gate exists to refuse.
+    (
+        re.compile(
+            _TEMP_ROOT
+            + r"tt_(?=[A-Za-z0-9_]*\d)[A-Za-z0-9_]{6,}(?![0-9A-Za-z_])"
+        ),
+        "<TMP>",
+    ),
+    # ``mkdtemp(prefix=…)``: the PREFIX is the test's own stable label and only the
+    # generated TAIL is masked, so ``collision-preflight-…`` and ``pi-census-…``
+    # stay distinguishable while two draws of the same prefix converge. The tail
+    # must carry a digit (see above) and be 8+ characters; the delimiter lookahead
+    # keeps a FILENAME's stem out (``build-zx81kq2.yaml`` is a file, not a dir).
+    (
+        re.compile(
+            _TEMP_ROOT
+            + r"(?P<prefix>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)"
+            r"-(?=[a-z0-9_]*\d)[a-z0-9_]{8,}(?=[/\s\"'`,;:)\]]|$)"
+        ),
+        _mask_mkdtemp_tail,
+    ),
 )
 
 
@@ -1562,13 +1576,29 @@ def normalize_signature(text: str | None) -> str:
     """Reduce raw failure text to the STABLE part, or ``''`` if nothing survives.
 
     Whitespace is collapsed first (the same assertion is rendered at different
-    prefix widths between runs), then the closed volatile-identifier list above
-    is masked. A result of ``''`` is a REJECTION — callers must never store it as
+    prefix widths between runs), then the closed volatile-identifier lists above
+    are masked. A result of ``''`` is a REJECTION — callers must never store it as
     a signature, because an empty signature makes the subset rule vacuous.
     """
     if not text:
         return ""
     out = " ".join(str(text).split())
+    # The TEMP group runs to a FIXED POINT (bounded): masking a parent is what
+    # makes a NESTED child's ``(?<=<TMP>/)`` anchor true, and ``re.sub`` never
+    # re-scans a replacement, so one pass per nesting level is required —
+    # ``/tmp/tt_a1b2c3d4/tmpXy12Zz9q/…`` is two levels. Masks cannot feed
+    # themselves (no mask token matches a rule's shape), so this terminates; the
+    # bound is a guard, not the stopping condition.
+    for _ in range(3):
+        before = out
+        for pattern, replacement in _TEMP_NORMALIZERS:
+            out = pattern.sub(replacement, out)
+        if out == before:
+            break
+    # …and only THEN the ids and measurements, so an all-hex random draw is
+    # masked as a temp component (<TMP>) rather than as <HEX>: the two shapes
+    # would otherwise disagree between runs and the SUBSET rule would refuse a
+    # genuinely shared red (review round 2).
     for pattern, replacement in _VOLATILE_NORMALIZERS:
         out = pattern.sub(replacement, out)
     return out.strip()

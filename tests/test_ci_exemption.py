@@ -27,6 +27,7 @@ import pytest
 import importlib.util
 import itertools
 import re
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -3669,6 +3670,27 @@ def test_1424_a_per_run_temp_directory_is_one_signature():
     for left, right in [
         (_REDIS_SOCKET_A, _REDIS_SOCKET_B),
         (_COLLISION_A, _COLLISION_B),
+        # ``tempfile`` draws from ``[a-z0-9_]``, so ~14% of real runs carry an
+        # underscore in the random name. A class of ``[A-Za-z0-9]`` leaves those
+        # raw and the block returns intermittently (review round 2, finding 1).
+        (
+            "/tmp/tmpyhd2_vfw/redis.socket: No such file or directory.",
+            "/tmp/tmpkrc_c_8v/redis.socket: No such file or directory.",
+        ),
+        # An ALL-HEX draw must land on the same mask as an alphanumeric one: when
+        # the ``<HEX>`` rule ran first, one run normalised to ``pi-census-<HEX>``
+        # and the other to ``pi-census-<TMP>`` and the pair never converged.
+        (
+            "/tmp/tt_a1b2c3d4/pi-census-a1b2c3d4/repo/pi",
+            "/tmp/tt_q2w3e4r5/pi-census-q7w8e9r0/repo/pi",
+        ),
+        # NESTED roots (a ``tempfile`` dir under pytest's basetemp): masking the
+        # parent is what makes the child's anchor true, so the group needs a pass
+        # per level.
+        (
+            "/tmp/tt_a1b2c3d4/tmpXy12Zz9q/repo/x",
+            "/tmp/tt_q2w3e4r5/tmpAb34Cd56/repo/x",
+        ),
     ]:
         a = ci_exemption.normalize_signature(left)
         b = ci_exemption.normalize_signature(right)
@@ -3681,6 +3703,67 @@ def test_1424_a_per_run_temp_directory_is_one_signature():
             "a per-run temp directory must not be part of the signature — "
             f"main's {left!r} and the PR's {right!r} are ONE failure"
         )
+
+
+def test_1424_a_labelled_directory_under_a_temp_root_stays_SIGNAL():
+    """The random TAIL is masked; the test's own LABEL is not.
+
+    ``tempfile`` draws carry no hyphen, so a hyphenated component under a temp
+    root is a label unless its tail looks generated (carries a digit). Replacing
+    the whole component (review round 2, finding 2) collapsed these pairs — a
+    fail-OPEN exemption for a failure main never had.
+    """
+    for left, right in [
+        ("/tmp/tmpabc12345/run-integration failed", "/tmp/tmpabc12345/run-migrations failed"),
+        ("/tmp/tmpabc12345/expected-workflow failed", "/tmp/tmpabc12345/rejected-workflow failed"),
+    ]:
+        a = ci_exemption.normalize_signature(left)
+        b = ci_exemption.normalize_signature(right)
+        assert a != b, f"two different labels collapsed into one signature: {a!r}"
+
+    # …and the stable PREFIX survives when the tail IS generated, so two
+    # different mkdtemp prefixes stay distinguishable across runs.
+    one = ci_exemption.normalize_signature("/tmp/tmpabc12345/collision-preflight-iis0g3yc/repo")
+    two = ci_exemption.normalize_signature("/tmp/tmpabc12345/pi-census-zz9q8w7e6r/repo")
+    assert one == "/tmp/<TMP>/collision-preflight-<TMP>/repo", one
+    assert two == "/tmp/<TMP>/pi-census-<TMP>/repo", two
+
+
+def test_1424_each_floor_and_anchor_is_pinned():
+    """Every live conjunct of the temp rules reddens here when it is removed.
+
+    Review round 2 measured four conjuncts with NO discriminating test: the
+    ``tmp`` 8-character floor, the ``tt_`` temp-root anchor, the ``mkdtemp``
+    8-character floor and the delimiter lookahead. Each removal widened masking
+    without reddening anything, which is the fail-OPEN delta these pin.
+    """
+    n = ci_exemption.normalize_signature
+
+    # ``tmp`` floor: tempfile's draw is exactly 8, so a short ``tmp…`` token is a
+    # stable name (a directory, a prose word), not a generated one.
+    assert n("/tmp/tmpfiles/x broken") == "/tmp/tmpfiles/x broken"
+    assert n("/tmp/tmpabcd1d2e/x broken") == "/tmp/<TMP>/x broken"
+
+    # ``tt_`` temp-root anchor: the same shape OUTSIDE a temp tree is a label.
+    assert n("api_key=tt_valid_key_v2 rejected") == "api_key=tt_valid_key_v2 rejected"
+
+    # ``mkdtemp`` 8-character floor on the tail.
+    assert n("/tmp/tmpABCD1234/ab-cd1234 broken") == "/tmp/<TMP>/ab-cd1234 broken"
+    assert n("/tmp/tmpABCD1234/ab-zx81kq2p broken") == "/tmp/<TMP>/ab-<TMP> broken"
+
+    # Delimiter lookahead: a FILENAME's stem is not a directory component. The
+    # tail here is 8 characters, so the floor cannot be what keeps it raw.
+    assert (
+        n("/tmp/tmpABCD1234/build-zx81kq2p.yaml missing")
+        == "/tmp/<TMP>/build-zx81kq2p.yaml missing"
+    )
+
+    # ``tmp`` temp-root anchor (round 2, finding 3): a stable directory that
+    # merely starts with ``tmp`` is untouched outside a temp tree, and — the
+    # amplification the reviewer measured — it cannot emit a ``<TMP>`` that then
+    # satisfies a sibling rule's ``(?<=<TMP>/)`` arm.
+    assert n("config /home/user/tmpmanager/x.yml") == "config /home/user/tmpmanager/x.yml"
+    assert n("/home/user/tmpmanagers/commit-workflow") == "/home/user/tmpmanagers/commit-workflow"
 
 
 def test_1424_the_temp_directory_case_is_EXEMPT_end_to_end():
@@ -3803,11 +3886,15 @@ def test_1424_no_tracked_directory_of_this_repo_is_temp_masked():
     """
     root = Path(__file__).resolve().parents[1]
     skip = {".git", ".worktrees", "node_modules", ".venv", "__pycache__"}
-    dirs = [
-        p.relative_to(root).as_posix()
-        for p in root.rglob("*")
-        if p.is_dir() and not (skip & set(p.relative_to(root).parts))
-    ]
+    # ``os.walk`` with PRUNED dirnames, not ``rglob``: rglob descends into ``.git``
+    # before any filter can reject it, and the hub checkout carries ~10⁵ entries
+    # there (measured 10.6 s in review round 2). Pruning skips the descent itself.
+    dirs: list[str] = []
+    for dirpath, dirnames, _files in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in skip)
+        rel = Path(dirpath).relative_to(root).as_posix()
+        if rel != ".":
+            dirs.append(rel)
     assert len(dirs) > 50, f"the scan found {len(dirs)} directories — it is not reading the tree"
     masked = [
         d for d in dirs
