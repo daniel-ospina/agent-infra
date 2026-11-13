@@ -439,7 +439,16 @@ IFS=':'
 # against the cwd — the same reason `pid_is_loop` does it in `heartbeat-launch.sh`.
 set -f
 for _pin_dir in $_pin_prefix $_pin_rest /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
-    [ -n "$_pin_dir" ] || continue
+    # ⛔ `''`, `.` AND `..` ARE THE SAME HAZARD, SPELLED THREE WAYS (#1867 review, round 12). This prune
+    # dropped only the EMPTY component, so a caller's literal `.` came through verbatim (measured:
+    # `PATH='/opt/homebrew/bin:/usr/bin:.:/bin'` → `…:/opt/homebrew/bin:/usr/bin:.:/bin:/usr/local/bin:…`).
+    # That is NEW with this change and not a pre-existing hole: on main this block REPLACED PATH with one
+    # literal and never inherited a caller's entries, so no `.` could survive it. Now the loop lives for
+    # days, detaches, and its children `cd` into worktrees and run bare commands — so a `.` on PATH is
+    # the block's own stated concern ("`.` on a PATH is a hazard, not a setting") executing whatever the
+    # child's cwd happens to hold. `.` and `..` are the non-empty spellings of the cwd entry; they are
+    # dropped with the empty one, and the system tail keeps the resulting PATH usable.
+    case "$_pin_dir" in ''|.|..) continue ;; esac
     _pin_path="${_pin_path:+$_pin_path:}$_pin_dir"
 done
 set +f

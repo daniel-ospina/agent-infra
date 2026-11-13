@@ -84,11 +84,17 @@ the exit column is not a flat `0`.
   or its last read is DEGRADED. A **recycled** pid (alive, but not the loop) is DRIFT too: it says
   `recycled pid` rather than `OK loop alive`.
 - **2 UNKNOWN** — the probe could not answer (no `python3`, no state dir, unreadable process
-  table, or a `HEARTBEAT_CHECK_MAX_AGE` that is not a positive whole number of seconds). **Never a
+  table, neither `HOME` nor `HEARTBEAT_PI_AGENT_DIR` set, or a `HEARTBEAT_CHECK_MAX_AGE` that is not a
+  positive whole number of seconds). **Never a
   pass** — and a malformed bound is reported as what it is: a typo in the VARIABLE, named by name.
   Before that check existed the bound went straight into the reader's `int(...)`, the traceback was
   captured onto the same stream as the verdict, and rc 1 was accepted as a genuine **DRIFT** — so an
-  operator who mistyped a number was told the fleet read was stale.
+  operator who mistyped a number was told the fleet read was stale. The same misattribution was
+  available one variable over: the state root is `${HEARTBEAT_PI_AGENT_DIR:-$HOME/.pi/agent}`, so an
+  environment with **no `HOME`** (a scrubbed `env -i`, a `su`/cron context) died at parse time with
+  `HOME: unbound variable` and rc **1** — the DRIFT code — printing no verdict at all, and taking
+  `--help` with it. Every verb that needs a state root now refuses with **2** and a sentence, and
+  `--help` still works because a usage request needs no state directory.
 
 An empty snapshot is **not** a healthy fleet: `degraded` is a *per-row* flag, so on zero rows
 `any(...)` is vacuously false — the same trap `lane-status.py`'s own publisher documents.
@@ -175,8 +181,13 @@ old wording opened each line with the command, and for `com.eldato.lane-arm` and
 
 `fleet-schedule.py --verify` counts the verdict **markers** (`NOT INSTALLED`, `DRIFTED`, `not loaded`,
 `⛔ UNMANAGED`, `⛔ RETIRED-INSTALLED`, `⛔ UNKNOWN`), not bare words — the bare-word scan matched the
-section intro too, so three undeclared jobs and one both read as `1`. A run that fails only on one of
-the classes that arrived with this change (`UNMANAGED`, `RETIRED-INSTALLED`, `UNKNOWN`) prints
+section intro too, so three undeclared jobs and one both read as `1`. **One job carries exactly ONE
+marker**, which is why the `RETIRED (manifest wins) — an installed copy ALSO survives` row does *not*
+use the word `DRIFTED`: a retired label with both a surviving template and an installed copy would
+otherwise produce two counted lines for one job and the verdict would say `2 launchd job(s)` over it.
+The failure for that state is the set-level `⛔ RETIRED-INSTALLED` row, which owns the marker and the
+exit code. A run that fails only on one of
+ the classes that arrived with this change (`UNMANAGED`, `RETIRED-INSTALLED`, `UNKNOWN`) prints
 `SCHEDULE NOT VERIFIED — N launchd job(s) …` with a truthful N instead of `0`, and the delegate's own
 exit code now agrees with those rows (`--status` is non-zero whenever any job row is a failure).
 
@@ -231,6 +242,17 @@ against it would conclude the heartbeat was running there.
 
 The loop's **code** is the same file with the same contract on both platforms; the difference is
 where it can be started from, and whether anything schedules it (nothing does).
+
+⛔ **THE TWO EXEMPTION MANIFESTS RESOLVE THROUGH THE CHECKOUT, AND AN UNREADABLE ONE IS UNKNOWN —
+NEVER "NOTHING IS EXEMPT"** (`RETIRED` and `OWNED-BY-OTHER-INSTALLERS`). `TEMPLATES_DIR` is an
+environment override (the suite isolates through it), so reading either manifest from that directory
+alone made the exemption a no-op wherever the override pointed elsewhere: `is_retired` answered `no`
+for every label, a retired job fell through to **`⛔ UNMANAGED`**, and the row it printed carried
+`launchctl bootout … && rm -f …` — a delete command aimed at a live job, which is precisely what the
+`OWNED-BY-OTHER-INSTALLERS` header exists to prevent. Both resolve `$TEMPLATES_DIR` first and the
+checkout's `templates/launchd/` second (the same rule `LAUNCHD-INCOMPATIBLE` uses), and if neither is
+readable `--status` answers **2 (UNKNOWN)** rather than classifying every installed job against a
+list it never read.
 
 **Reboot does not restart the loop** on either platform. Re-run `heartbeat-launch.sh start` after a
 reboot; that is a property of "detached launched-once loop" and it is why `check` exists — a loop

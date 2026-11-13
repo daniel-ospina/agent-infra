@@ -617,6 +617,27 @@ assert_eq "$RC" "2" "§17 an unknown verb still exits 2 (the error case keeps it
 assert_contains "$OUT" "unknown argument" "§17 …and says which argument it did not understand"
 
 echo ""
+echo '── 18. an unset HOME is "cannot answer", not "drift" ──'
+
+# ⛔ `set -u` PICKED THIS FILE'S DRIFT CODE FOR IT (#1867 review, round 12). `PI_AGENT_DIR` was
+# `${HEARTBEAT_PI_AGENT_DIR:-$HOME/.pi/agent}` at the top, so an environment with no `HOME` — a
+# scrubbed `env -i`, a `su`/cron context, a supervisor that does not pass it — died AT PARSE TIME with
+# `HOME: unbound variable` and rc 1, which this file's own legend defines as DRIFT. The probe had not
+# looked at the fleet and could not; the answer is UNKNOWN (2), and `heartbeat-loop.sh` — the other
+# half of the same change — already refuses this case with rc 2 and a sentence. MEASURED pre-fix: rc 1,
+# no verdict word on either stream; `--help` died the same way (rc 1, no header).
+OUT="$(env -i PATH=/usr/bin:/bin bash "$LAUNCH" check 2>&1)"; RC=$?
+assert_eq "$RC" "2" "§18 check with no HOME at all is UNKNOWN (2), never the DRIFT code"
+assert_contains "$OUT" "UNKNOWN" "§18 …and says UNKNOWN rather than arriving as a bare shell error"
+assert_contains "$OUT" "could not answer" "§18 …naming it as a probe that could not answer, not a fleet finding"
+assert_not_contains "$OUT" "DRIFT" "§18 …and never reports DRIFT, which would be a claim it did not measure"
+OUT="$(env -i PATH=/usr/bin:/bin bash "$LAUNCH" --help 2>&1)"; RC=$?
+assert_eq "$RC" "0" "§18 --help still works with no HOME (a usage request needs no state dir)"
+assert_contains "$OUT" "THE launch path for the fleet heartbeat" "§18 …and still prints the header"
+OUT="$(env -i PATH=/usr/bin:/bin HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "§18 an explicit HEARTBEAT_PI_AGENT_DIR needs no HOME (the env seam is the documented escape)"
+
+echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "✅ heartbeat-launch suite passed ($PASS assertions)"
     exit 0

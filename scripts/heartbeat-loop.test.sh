@@ -930,6 +930,30 @@ else
   pass "15e. an inherited INTERIOR '::' is dropped — the prune is no longer conditional on a pinned dir existing"
 fi
 
+# ── 15f. THE OTHER TWO SPELLINGS OF THE cwd ENTRY (round 12) ─────────────────────────────────
+# Dropping the EMPTY component only covers `::`. A caller can equally write `.` or `..`, and both name
+# the child's cwd just as surely. This is NEW with the PATH inheritance: on main the block REPLACED
+# PATH with one literal and inherited nothing, so neither spelling could survive it. The loop now runs
+# for days, detached, and its children `cd` into worktrees and run bare commands — so a literal `.`
+# executing whatever the cwd holds is the hazard the block's own comment names. MEASURED pre-fix:
+# `PATH='/opt/homebrew/bin:/usr/bin:.:/bin'` → `…:/usr/bin:.:/bin:/usr/local/bin:…`.
+RUN_PASS_PATH="/opt/homebrew/bin:/usr/bin:.:/bin:..:/sbin"
+run_pass "$FIX15D"
+P15F="$(cat "$FIX15D/path" 2>/dev/null)"
+rm -f "$FIX15D/path"
+unset RUN_PASS_PATH
+if [ -z "$P15F" ]; then
+  fail "15f. the literal-dot row produced no PATH to inspect — nothing was measured"
+elif [ "${P15F#*:.}" != "$P15F" ] || [ "${P15F#*.}" != "$P15F" ] || [ "${P15F#*..}" != "$P15F" ]; then
+  fail "15f. a literal '.' or '..' survived the pin (the cwd on PATH): $P15F"
+else
+  pass "15f. a literal '.' and '..' are dropped from an inherited PATH — the cwd cannot be executed from"
+fi
+case ":$P15F:" in
+  *:/usr/bin:*) pass "15f. ... and the system tail is still appended (dropping them does not empty the PATH)" ;;
+  *) fail "15f. the system tail is MISSING from the assembled PATH: ${P15F:-<none>}" ;;
+esac
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-loop suite passed (${checks} assertions)"
   exit 0
