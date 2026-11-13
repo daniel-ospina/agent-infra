@@ -1670,7 +1670,7 @@ _tiproot() { # <token> -> the token re-rooted on the attested head, or ""
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _esep="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _esep="" _elsha="" _ersha="" _eranges="" _erangesprev="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -3284,7 +3284,15 @@ $m"
       # nought-commit claim minted a signed `clean` — the same fail-open one character of punctuation away
       # from a fix that had just closed it. Reading the run that FOLLOWS the left operand is exact by
       # construction: `_elhs` is the captured operand, so everything up to the next non-dot is the separator.
-      _esep="${BASH_REMATCH[0]#*"$_elhs"}"; _esep="${_esep%%[^.]*}"
+      # ⛔ THE SEPARATOR TOLERATES WHITESPACE, SO THE READ MUST SKIP IT (round 12 — MEASURED, a FAIL-OPEN
+      # whose exposure is a FRAME, not just a spelling). The arity pattern is `[[:space:]]*\.{2,3}`, so in
+      # `HEAD ..anc` the text after the left operand begins with a SPACE; truncating at the first non-dot
+      # made `_esep` EMPTY, the two-dot ancestry gate never ran, and the only remaining catcher was the
+      # mirror arm's written-left test — which resolves the operand in the DELTA CHECKOUT's frame. So the
+      # same claim minted a signed `clean` when the recorder ran from a base-parked checkout and was
+      # refused when it ran at the attested head: a verdict decided by where a clone happens to be, which
+      # is the failure this file has closed twice before. Skip the whitespace, then read the dots.
+      _esep="${BASH_REMATCH[0]#*"$_elhs"}"; _esep="${_esep#"${_esep%%[![:space:]]*}"}"; _esep="${_esep%%[^.]*}"
       # ⛔ CONSUME THE SEPARATOR, NOT THE WHOLE MATCH (round 11 — MEASURED, a FAIL-OPEN). The right operand
       # of one range can be the LEFT operand of the next: slicing past the whole match ate it, and the arm
       # that owns the remaining claim could not recover it (the omitted-left arm excludes a leading char
@@ -3293,7 +3301,15 @@ $m"
       # right operand at the START of the remaining text, where the `^` alternative of the boundary group
       # admits it as the next left operand; the separator is consumed either way, so the loop cannot
       # re-match what it just measured.
-      _eranges="${_eranges#*"${_elhs}${_esep}"}"
+      # ⛔ PROGRESS IS A PRECONDITION, NOT A HOPE (round 12 — MEASURED: the first cut sliced past
+      # `<left><separator>` CONCATENATED, and the separator tolerates whitespace, so in `Delta: <base> .. <head>`
+      # the pattern `<base>..` did not occur in `<base> ..` and the slice removed NOTHING — an infinite loop
+      # that killed the suite at the first honest spaced two-endpoint claim. Slice past the LEFT OPERAND
+      # only, which is a substring of the match by construction, and prove the slice moved before
+      # continuing: the right operand then sits at the start of the remaining text for the next iteration.
+      _erangesprev="$_eranges"
+      _eranges="${_eranges#*"${_elhs}"}"
+      [ "$_eranges" = "$_erangesprev" ] && break
       # ⛔ THE REFUSAL QUOTES WHAT WAS WRITTEN, NOT A RECONSTRUCTION OF IT (twenty-second cycle, P2 —
       # MEASURED). The message was rebuilt from the captured TOKENS (`"${_elhs}..${_erhs}"`), and the
       # right-hand capture stopped one selector short of the text — so a claim narrowed to
@@ -3618,6 +3634,12 @@ $m"
       # in this arm the text after the dots is PROSE for the ordinary omission (`@{0}.. and the rest was
       # not read`), so "a word follows" is true for EVERY vector the arm exists for. Trying it anyway
       # (round 10, first cut) turned eight refusal vectors green-to-red (20h72/72b/76/76b/78/78b/97, M68/
+      # ⛔ AND A ONE-CHARACTER RIGHT END REACHES THE SAME SENTENCE BY A DIFFERENT ROUTE (round 12, MEASURED,
+      # P3): this arm's terminator class is `([^0-9A-Za-z_.]|$)`, so in `HEAD..@` — where `@` IS the tip and
+      # the claim is genuinely empty — the `@` is consumed AS the terminator, `_olword` comes out empty, and
+      # the author is told the endpoint was omitted. Same fail-CLOSED family as the paragraph above, same
+      # declared cost, and the same reason it is not chased: every discriminator tried here costs the
+      # ordinary omission its meaning.
       # M95/M97/M100 vacuous) — a fail-CLOSED sentence traded for eight fail-OPEN verdicts. The verdict is
       # fail-closed and the sentence is the cost; stated here rather than rediscovered.
       if [ "$_osha" = "$to" ]; then
