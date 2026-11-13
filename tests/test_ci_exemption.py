@@ -3743,13 +3743,23 @@ def test_1424_each_floor_and_anchor_is_pinned():
     assert n("/tmp/tmpfiles/x broken") == "/tmp/tmpfiles/x broken"
     assert n("/tmp/tmpabcd1d2e/x broken") == "/tmp/<TMP>/x broken"
 
-    # ``tt_`` temp-root anchor: the same shape OUTSIDE a temp tree is a label.
+    # ``tt_`` temp-root ANCHOR: the same shape OUTSIDE a temp tree is a label.
+    # ⛔ These tokens are 8 characters, digit-bearing and NON-HEX on purpose: an
+    # 11-character label is excluded by the WIDTH arm, and an all-hex draw is
+    # already masked by the pre-existing ``<HEX>`` rule — either would leave the
+    # anchor unpinned (review round 7).
     assert n("api_key=tt_valid_key_v2 rejected") == "api_key=tt_valid_key_v2 rejected"
+    assert n("api_key=tt_q9w8e7r6 rejected") == "api_key=tt_q9w8e7r6 rejected"
+    assert n("api_key=tt_z2x3c4v5 rejected") == "api_key=tt_z2x3c4v5 rejected"
 
     # ``mkdtemp`` tail widths: 6 (Node's ``fs.mkdtempSync``) and 8 (Python's
     # ``tempfile``) are generators; 9+ is not a draw at all. Both directions.
     assert n("/tmp/tmpABCD1234/ab-cd1234 broken") == "/tmp/<TMP>/ab-<TMP> broken"
     assert n("/tmp/tmpABCD1234/ab-zx81kq2p broken") == "/tmp/<TMP>/ab-<TMP> broken"
+    # …and the FLOOR at 6: a 5-character digit-bearing tail is not a draw, so
+    # lowering ``{6,8}`` must red here (round 7 measured it green before this).
+    assert n("/tmp/tt_a1b2c3d4/ab-c1234/x") == "/tmp/<TMP>/ab-c1234/x"
+    assert n("/tmp/tt_a1b2c3d4/ab-d5679/x") == "/tmp/<TMP>/ab-d5679/x"
 
     # ``tmp`` EXACT width (round 3): ``_RandomNameSequence`` emits 8, so a longer
     # run is a stable name — masking it collapsed ``/tmp/tmpcache2024`` with
@@ -3980,6 +3990,15 @@ def test_1424_every_fleet_temp_generator_shape_is_covered():
     )
     assert n("/tmp/tt_bigcache_2024/x") != n("/tmp/tt_bigcache_2025/x")
     assert n("/tmp/tt_valid_key_1/x") != n("/tmp/tt_valid_key_2/x")
+    # …and the CEILING lookahead ``(?![0-9A-Za-z_])``, which only bites when the
+    # 9th character is part of the same word: without it these two collapse
+    # (round 7 measured the suite green with the lookahead deleted).
+    assert (
+        n("/tmp/tt_z2x3c4v5_shared/x") == "/tmp/tt_z2x3c4v5_shared/x"
+    ), "a 9th character means this is not an 8-character draw"
+    assert (
+        n("/tmp/tt_q9w8e7r6_shared/x") == "/tmp/tt_q9w8e7r6_shared/x"
+    )
 
 
 def test_1424_the_all_letter_draw_residual_is_DECLARED():

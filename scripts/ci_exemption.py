@@ -1502,9 +1502,9 @@ _TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=<TMP>/))"
 #: exempted by main's red in another. Unanchored ALONE masks 0 tracked
 #: DIRECTORIES today (the digit/uppercase fingerprint is what excludes
 #: ``commit-workflow``-style names) while still masking 87 of 398 origin-tracking
-#: branch slugs — so a slug is only safe where it carries no fingerprint. Both
-#: slug figures must be quoted with their population: the ref set drifts
-#: (review round 6 residual 4 re-measured 184 of 398 for the same shape).
+#: branch slugs; unanchored AND fingerprint-free masks 184 of 398 — the round-6
+#: figure of 119 was not reproducible and is withdrawn (review round 7). Quote a
+#: slug number with its population: the ref set drifts.
 #:
 #: ⛔ AND A TAIL MUST LOOK GENERATED, not merely long: a generator's draw carries a
 #: DIGIT or an UPPERCASE letter, while a test's own label is a lowercase word —
@@ -1532,9 +1532,13 @@ _TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=<TMP>/))"
 #:    one id was found differing ONLY there.
 #:  * FAIL-CLOSED: macOS ``$TMPDIR`` layouts (``/var/folders/…/T/…``) and an
 #:    underscore-containing ``mkdtemp`` prefix stay raw, so such an id keeps
-#:    blocking — except where the draw happens to be all-hex, which the
-#:    pre-existing ``<HEX>`` rule masks (~0.1% of draws), so that id's fate is
-#:    run-dependent.
+#:    blocking — except where the draw is GLUED to a letter prefix and happens to
+#:    be all-hex (``tt_abcdef12``, ``pre-a1b2c3d4.last``), which the pre-existing
+#:    ``<HEX>`` rule turns into ``<HEX>``, so that id's fate is run-dependent. A
+#:    ``tmp``-glued ``/var/folders`` draw cannot flip (the ``<HEX>`` rule's own
+#:    left guard blocks it). Also undeclared by that rule's list: an ``mkstemp``
+#:    ``suffix`` outside ``{tmp,last,lock,pid}`` (``.log``, ``.json``) stays raw and
+#:    keeps blocking.
 #:
 #: ⛔ AND THE WIDTH IS ``{8}``, NOT ``{8,}``: ``_RandomNameSequence`` emits EXACTLY
 #: 8 characters, so a longer run is not a draw at all (it is a stable name that
