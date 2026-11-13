@@ -528,11 +528,21 @@ if (typeof stripTypeScriptTypes !== "function" ||
     // skipped and the command landed on LEGACY_BLOCK, which is EXEMPT in a linked
     // worktree. Base refused these via #73 and the pre-probe head ALLOWED them:
     // a sibling worktree's checked-out branch lost its upstream, irreversibly.
-    // The fix (index.ts) runs the whole-command delete check BEFORE the restore,
-    // scoped to exactly the rows where the restore fires.
-    // ⛔ The second push's targets are NOT in `det.pushTargets` (that holds the
-    // FIRST push's refspecs — `["main"]`, `isPushDelete === false`), so the #506
-    // arm's union could not have found `held` either; only the extractor sees it.
+    // The fix (index.ts) runs the delete check BEFORE the restore, on every row
+    // where the restore can fire and a real push exists (`promoteTo !== null &&
+    // det.hasPush`). ⚠️ Round 13 corrected this comment: it used to say "scoped to
+    // exactly the rows where the restore fires", which was FALSE — the first draft
+    // gated it on `block:push`/`block:force-push` while the restore ALSO fires on
+    // `block:push-delete`, leaving four worktree rows open (base BLOCK via #73,
+    // pre-fix ALLOW). P20/P21 are those rows.
+    // ⛔ The attribution is TWO-SURFACE and verdict-dependent, because no single
+    // surface sees every shape: `wholeCommandDeleteTargets` returns `[]` for a
+    // `block:push-delete` verdict (it is gated on push/force-push), and
+    // `extractPushDeleteBranch` is null for the `-C .`-prefixed spelling. For
+    // `block:push-delete` the targets are the parsed `pushTargets` UNION the
+    // extractor; for the push/force-push verdicts the extractor sees a delete in a
+    // LATER segment. P16's second push is the later-segment case, P20's is the
+    // first-push case.
     { id: "P16", dir: "wt", expect: "block", marker: "checked out in",
       cmd: "git stash pop && git -C . push -f origin main && git push origin --delete held",
       why: "round 12 P0: the restore must not skip #73 — base BLOCKED this via the sibling check " +
@@ -554,6 +564,44 @@ if (typeof stripTypeScriptTypes !== "function" ||
       cmd: "git stash pop && git -C . push -f origin main && git push origin --delete stale",
       why: "round 12 CONTROL: base ALLOWED this (no sibling holds `stale`), so the probe must fall " +
            "through — P16 differs ONLY by whether a sibling holds the target" },
+    // ── review round 13 (P0): THE PROBE'S ROWS WERE A SUBSET OF THE REWRITE'S ──
+    // The round-12 probe was gated on `block:push`/`block:force-push`, but the
+    // restore also fires when the compound's FIRST push itself carries the delete
+    // spelling: the classifier's push block rewrites the verdict to
+    // `block:push-delete` AFTER the promotion bookkeeping, and `block:push-delete`
+    // IS in ALLOWANCE. So the probe was skipped, the restore turned the verdict
+    // into a legacy kind, and LEGACY_BLOCK exempted the worktree. MEASURED — base
+    // BLOCK via #73, pre-fix head ALLOW.
+    // ⛔ P20 is why the attribution is TWO-SURFACE: `wholeCommandDeleteTargets`
+    // returns `[]` for a `block:push-delete` verdict (it is gated on
+    // push/force-push) and `extractPushDeleteBranch` is null for the `-C .`
+    // spelling, so ONLY their union finds `held`.
+    { id: "P20", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push -f --delete held",
+      why: "round 13 P0: the delete spelling is in the FIRST push, so the verdict is " +
+           "block:push-delete — the one restore-firing kind the round-12 probe did not cover" },
+    { id: "P21", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git push origin :held && git -C . push -f origin main",
+      why: "round 13 P0: the delete FIRST and prefix-defeated, the promotion second — the " +
+           "union is the only attribution that sees `held`" },
+    { id: "P22", dir: "wt", expect: "allow",
+      cmd: "git stash pop && git -C . push -f --delete stale",
+      why: "round 13 CONTROL: the same push-delete shape with an UNHELD target must stay " +
+           "allowed — P20 differs only by which branch is checked out somewhere" },
+    // ── review round 13 (P2): the push half's #805 refusal after a promotion ──
+    // When the REPLACED kind is admitted (`force-push`), nothing is restored — so
+    // the verdict becomes a legacy verb and every push arm is skipped. LEGACY_BLOCK
+    // is worktree-exempt, and with it went #805's fail-closed refusal for a push
+    // whose target repository cannot be resolved. MEASURED: base BLOCK, pre-fix
+    // head ALLOW.
+    { id: "P23", dir: "wt", expect: "block", marker: "target repository is unresolved",
+      cmd: "git -C . reset --hard && git --git-dir=$PWD/.git push -f origin main",
+      why: "round 13 P2: #805 — a gate that cannot determine the target REFUSES; the promotion " +
+           "must not carry the push half past that refusal" },
+    { id: "P24", dir: "wt", expect: "allow",
+      cmd: "git -C . reset --hard && git -C . push -f origin main",
+      why: "round 13 CONTROL: the same compound with a RESOLVABLE push target is not #805, and " +
+           "base ALLOWED it — P23 differs only by the unresolvable repo" },
   ];
 
   /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
@@ -947,12 +995,27 @@ if (typeof stripTypeScriptTypes !== "function" ||
           label: "round-12 pre-restore delete check removed (index.ts)",
           file: "index.ts",
           revert: (src) => src.replace(
-            "        const probeDeletes = wholeCommandDeleteTargets(det.verdict, localCommand);",
-            "        const probeDeletes = []; // MUTANT: round-12 pre-restore delete check removed",
+            "        if (probeDeletes.length > 0) {",
+            "        if (false) { // MUTANT: round-12 pre-restore delete check removed",
           ),
-          expectRed: ["P16", "P17", "P18"],
+          expectRed: ["P16", "P17", "P18", "P20", "P21"],
           redCheck: (r) => !blocked(r),
-          expectGreen: ["P19", "P7", "P13"],
+          expectGreen: ["P19", "P22", "P7", "P13"],
+        },
+        {
+          // (15) THE PUSH-HALF GATE REMOVED — the round-13 P2 put back. Only P23
+          // should redden; P24 is its control (a resolvable target is not #805),
+          // and the round-11/12 rows are untouched because that arm only runs when
+          // a promotion replaced a PUSH kind with a legacy one.
+          label: "round-13 push-half #805 gate removed (index.ts)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "      if (pushHalfUngated) {",
+            "      if (false) { // MUTANT: round-13 push-half gate removed",
+          ),
+          expectRed: ["P23"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P24", "P7", "P16"],
         },
         {
           // (13) THE FACT NEVER RECORDED — the classifier stops reporting what the
