@@ -4467,6 +4467,58 @@ try {
       // a DATA consumer with a spaced delimiter is still not walked
       extractScriptPaths(`cat <<'E F'\n${p}\nE F`).length === 0;
   })(), true);
+  // ⛔ ROUND-7 F1 (blocking, fail-OPEN — a REGRESSION against `main`): `&` is a
+  // list operator ONLY when it is not part of a redirection. `2>&1`/`>&2`/`<&0`
+  // carry it inside the fd-DUP operator and `&>word` is a both-streams redirect,
+  // so none of them ends a simple command. Splitting on them cut the opener
+  // segment's head to the fd DIGIT (`"1 bash << EOF"`), `_wtHeadInterpreter`
+  // answered null, `_wtHeredocKind` fell to `null` (DATA) and the body was never
+  // walked: measured `[]` while `main` resolved the body's file and BLOCKED it.
+  // The mirror (over-block) half: with the `&` split, the opener of
+  // `2>&1 python3 <<PY | bash` was unresolvable, so the walk fell through to the
+  // pipe consumer and gated a path inside a PYTHON literal — round-5 F1 reopened
+  // behind one prefix token.
+  expectBool("B52u: a HEADER-line redirection does not hide the heredoc's consumer (round-7 F1)", (() => {
+    const p = `"${sBodyHub}"`;
+    const res = (cmd) => extractScriptPaths(cmd);
+    const py = `import os\nprint("${sBodyHub}")\n`;
+    return res(`2>&1 bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      res(`2>&1 sh <<X\n${p}\nX`).join("|") === sBodyHub &&
+      res(`2>&1 bash <<-EOF\n\t${p}\n\tEOF`).join("|") === sBodyHub &&
+      // the `&>` / leading-file spellings are the same rule (#3970's root, closed
+      // here for the heredoc seam only — the command-line lead scan is untouched)
+      res(`&>/dev/null bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      res(`2>/dev/null bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      res(`</dev/null bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub &&
+      // the over-block control: a CODE opener's body stays SOURCE through a pipe
+      res(`2>&1 python3 <<PY | bash\n${py}\nPY`).length === 0 &&
+      // an fd-DUP is still not a command separator when it precedes a real one
+      res(`true && 2>&1 bash <<EOF\n${p}\nEOF`).join("|") === sBodyHub;
+  })(), true);
+  // ⛔ ROUND-7 F2 (P2, fail-OPEN residue of round-6): stepping over a leading
+  // redirect (a) must not DISCARD the fd-0 FILE when the command has no script
+  // positional — `<evil.sh bash` makes evil.sh BASH'S PROGRAM, read by the
+  // interpreter, so #1485's stand-down must not apply — and (b) must not treat a
+  // here-string as operator+operand: `<<<` tokenizes as `<<` + `<` and takes ONE
+  // word, so consuming two land the "command word" on that word and the real
+  // command went unvisited. Measured `[]` for both body lines while real bash
+  // executes the file the line names.
+  expectBool("B52v: a body line's stdin FILE and a here-string operand are not lost by the redirect step-over (round-7 F2)", (() => {
+    const p = sBodyHub;
+    const inv = (cmd) => extractHeredocProgramScriptInvocations(cmd).map((i) => `${i.path}:${i.interpreted}`);
+    return extractScriptPaths(`bash <<EOF\n< ${p} bash\nEOF`).join("|") === p &&
+      extractScriptPaths(`bash <<EOF\n0<${p} bash\nEOF`).join("|") === p &&
+      // a stdin FILE is READ by the shell → interpreted (the #1485 stand-down must
+      // not exempt an opaque file the interpreter is asked to run)
+      inv(`bash <<EOF\n< ${p} bash\nEOF`).join("|") === `${p}:true` &&
+      extractScriptPaths(`bash <<EOF\n<<< data ${p}\nEOF`).join("|") === p &&
+      // a here-string's WORD is data, never a script path
+      !extractScriptPaths(`bash <<EOF\n<<< ${p} true\nEOF`).includes("data") &&
+      // controls: the redirect step-over still resolves the plain shapes, and a
+      // `bash < file` on a BODY line keeps handing the file to the reader
+      extractScriptPaths(`bash <<EOF\n2>/dev/null ${p}\nEOF`).join("|") === p &&
+      extractScriptPaths(`bash <<EOF\nbash < ${p}\nEOF`).join("|") === p;
+  })(), true);
 
   // ── Write gate (W) — resolveTargetTopLevel predicate ──
   const hubTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: hubR, encoding: "utf-8" }).trim());

@@ -2763,7 +2763,20 @@ function _wtOpenerSegment(line) {
     // that demoted the real shell heredoc to data and blanked its body
     // (reviewer round-5 P1).
     if (ch === "<" && s[i + 1] === "<" && opened === -1) { opened = segs.length; cur += "<<"; i++; continue; }
-    if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "{" || ch === "}" || ch === ")") {
+    // ⛔ `&` IS A LIST OPERATOR ONLY WHEN IT IS NOT PART OF A REDIRECTION.
+    // `2>&1`, `>&2`, `<&0` carry the `&` INSIDE the fd-DUP operator, and
+    // `&>word` / `&>>word` are the both-streams redirects — neither ends a
+    // simple command. Splitting on them cut the opener segment's head down to
+    // the fd DIGIT (`"1 bash << EOF"`), so `_wtHeadInterpreter` answered null,
+    // `_wtHeredocKind` fell to `null` (DATA) and the body was never walked:
+    // measured `[]` for `2>&1 bash <<EOF` + a hub-mutating body while `main`
+    // resolved that body and BLOCKED it — a fail-OPEN and a regression
+    // (#523 round-7 F1). A `&` that is NOT adjacent to `<`/`>` is still the
+    // list operator it always was (`cmd &`, `cmd && cmd`).
+    if (ch === "&" && !(s[i - 1] === ">" || s[i - 1] === "<" || s[i + 1] === ">")) {
+      segs.push(cur); cur = ""; continue;
+    }
+    if (ch === ";" || ch === "|" || ch === "(" || ch === "{" || ch === "}" || ch === ")") {
       segs.push(cur); cur = ""; continue;
     }
     cur += ch;
@@ -10715,6 +10728,53 @@ function _redirectTakesOperand(t) {
   return true;
 }
 
+/**
+ * `_scriptInvocationAt` for a simple command that may begin with REDIRECTS.
+ *
+ * The command word of a simple command is its first NON-REDIRECT token, and a
+ * redirect may stand IN FRONT of it (`2>/dev/null ./x.sh`, `&> log sh <<X`,
+ * `<evil.sh bash`) — tree-sitter-bash models `redirect` nodes before
+ * `command_name`, and mvdan.cc/sh attaches a redirect to the `CallExpr` ahead of
+ * its `Args`. `_scriptInvocationAt`'s own leading scan steps over fd-DUP/close
+ * forms only, so it stopped at a redirect WITH an operand, resolved nothing, and
+ * `next` jumped to the FOLLOWING command boundary — the rest of the simple
+ * command was then never visited (#523 round-6 F1 inside a body, round-7 F1 on an
+ * opener line).
+ *
+ * Also reports `stdinFile`: the fd-0 FILE a leading `<`/`0<` named. That operand
+ * IS the program when the invocation has no script positional (`<evil.sh bash` —
+ * bash reads evil.sh as its program), so it must be gated even though it is not
+ * the token the command word resolves to (#523 round-7 F2a).
+ * @param {string[]} tokens
+ * @param {number} i0
+ * @returns {{path: string|null, next: number|undefined, interpreted: boolean, stdinProgram: boolean, stdinFile: string|null}}
+ */
+function _leadingScriptInvocationAt(tokens, i0) {
+  let i = i0;
+  let stdinFile = null;
+  while (i < tokens.length && _isRedirectOperator(tokens[i])) {
+    const op = tokens[i];
+    // `<<<` (a here-string) is tokenized as the operator PAIR `<<` + `<` and
+    // takes ONE operand — the here-string word. Consuming it as operator +
+    // operand landed the "command word" on that word, so the real command was
+    // never resolved (`<<< data /tmp/x.sh` in a body executes x.sh; measured
+    // `[]`, #523 round-7 F2b). The word is DATA written on the line, never a
+    // program file.
+    if (op === "<<" && tokens[i + 1] === "<") { i += 3; continue; }
+    if (!_redirectTakesOperand(op)) { i += 1; continue; } // fd-dup / fd-close: no operand
+    if (op === "<" || op === "0<") stdinFile = tokens[i + 1] ?? null;
+    i += 2;
+  }
+  if (i >= tokens.length) return { path: null, next: tokens.length, interpreted: false, stdinProgram: false, stdinFile: null };
+  const inv = _scriptInvocationAt(tokens, i);
+  return { ...inv, stdinFile: inv.stdinProgram ? stdinFile : null };
+}
+
+/** The `stdinProgram` verdict for a text segment that may begin with redirects. */
+function _stdinProgramOf(text) {
+  return _leadingScriptInvocationAt(_tokenize(String(text ?? "")), 0).stdinProgram === true;
+}
+
 /** Index a program walk resumes from after the simple command starting at
  *  `from`: the next boundary token, or tokens.length when the command runs to
  *  the end. */
@@ -10997,7 +11057,7 @@ function _heredocBodyIsProgram(code, kind) {
   const openerInterp = _wtHeadInterpreter(opener);
   if (openerInterp !== null) {
     if (_WT_SHELL_WORDS.test(basename(String(openerInterp)))) {
-      return _scriptInvocationAt(_tokenize(opener), 0).stdinProgram === true;
+      return _stdinProgramOf(opener);
     }
     // ⛔ A NON-SHELL INTERPRETER OPENER CONSUMES THE BODY ITSELF — the pipe
     // carries that interpreter's STDOUT to whatever is on the right, and the
@@ -11024,9 +11084,9 @@ function _heredocBodyIsProgram(code, kind) {
     const interp = _wtHeadInterpreter(segs[k]);
     if (interp === null) continue;
     if (!_WT_SHELL_WORDS.test(basename(String(interp)))) return false; // CODE consumer → #627 surface
-    return _scriptInvocationAt(_tokenize(segs[k]), 0).stdinProgram === true;
+    return _stdinProgramOf(segs[k]);
   }
-  return _scriptInvocationAt(_tokenize(code), 0).stdinProgram === true;
+  return _stdinProgramOf(code);
 }
 
 /**
@@ -11132,26 +11192,17 @@ function _programScriptInvocations(bodyText, depth = 0) {
     while (i < tokens.length && (_isScriptCommandBoundary(tokens[i]) || _PROGRAM_FRAME_WORDS.has(tokens[i]))) i++;
     if (i >= tokens.length) break;
     // ⛔ THE COMMAND WORD IS THE FIRST NON-REDIRECT TOKEN of the simple command.
-    // A redirect may stand BEFORE it (`2>/dev/null ./x.sh`, `</dev/null cmd`) and
-    // bash still executes that command — the redirect is not a command position.
-    // Without stepping over the operator AND its operand, `_scriptInvocationAt`
-    // took the operator as the command word, resolved nothing, and `next`
-    // jumped to the FOLLOWING command boundary — so every token after the
-    // redirect on that line was never visited at all. Measured: `bash <<EOF` +
-    // a body line `2>/dev/null /tmp/evil.sh` resolved `[]` on this walk while
-    // `main` resolved the file (through its accidental first-token scan) and
-    // BLOCKED it — a fail-OPEN and a regression against `main`, and no arm
-    // covered the shape (#523 round-6 F1). The rule is the one tree-sitter-bash
-    // (`redirect` nodes precede `command_name`) and mvdan.cc/sh (a
-    // `*syntax.Redirect` attaches to the `CallExpr` before its `Args`) both
-    // encode: redirects are not part of the command name.
-    while (i < tokens.length && _isRedirectOperator(tokens[i])) {
-      i += _redirectTakesOperand(tokens[i]) ? 2 : 1;
-    }
-    if (i >= tokens.length) break;
-    const { path, next, interpreted } = _scriptInvocationAt(tokens, i);
-    if (path) out.push({ path, interpreted: interpreted === true });
-    i = next > i ? next : i + 1; // never spin on a zero-width advance
+    // A redirect may stand BEFORE it (`2>/dev/null ./x.sh`, `<evil.sh bash`) and
+    // bash still executes/reads what it names. `_leadingScriptInvocationAt` steps
+    // over the operator AND its operand (and over a here-string's single word),
+    // so the remaining tokens of the line are not silently skipped; the fd-0 FILE
+    // a leading `<`/`0<` named is reported back as `stdinFile` because `<evil.sh
+    // bash` makes evil.sh BASH'S PROGRAM — measured `[]` for that body line while
+    // real bash executes the file (#523 round-6 F1, round-7 F2a).
+    const inv = _leadingScriptInvocationAt(tokens, i);
+    if (inv.stdinFile) out.push({ path: inv.stdinFile, interpreted: true });
+    if (inv.path) out.push({ path: inv.path, interpreted: inv.interpreted === true });
+    i = inv.next > i ? inv.next : i + 1; // never spin on a zero-width advance
   }
   if (depth < 2) {
     for (const b of bodies) {

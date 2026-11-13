@@ -2494,7 +2494,21 @@ the outer shell expanding the body. Ending the word at the backslash opened NO
 body, dropped the raw body text into the command-line scan and resolved a benign
 first token (`echo`) while real bash executes the body's file — a live #523
 fail-open one character away (pinned by `test.mjs` B52r, `test-script-backdoor`
-B7v).
+B7v). The delimiter is also ONE shell word: quote removal strips its quotes and
+backslash and leaves its SPACES inside the word, so `<<'E F'` and `<<E\ F` both
+delimit on the line `E F` — re-emitting the removed word unquoted split it in two,
+the body was classified DATA and never walked (B52t, B7x). Inside a body, a
+REDIRECT may stand in front of the command word (`2>/dev/null ./x.sh`,
+`<evil.sh bash`): the walk steps over the operator AND its operand, because the
+command word is the first NON-REDIRECT token — without that the operator was taken
+as the command word, nothing resolved, and the rest of the line was skipped
+(B52s, B7w) — and when the redirect it stepped over is a fd-0 FILE and the shell
+has no script operand, that FILE is the program, read by the interpreter (B52v).
+A here-string is `<<< word` — ONE operand, and the word is data (B52v). The same
+rule governs the HEADER line: `&` is a list operator only when it is not part of a
+redirection, so `2>&1`/`>&2`/`<&0`/`&>log` do not end the simple command and the
+heredoc's consumer is still found (B52u, B7y); a CODE opener keeps its body SOURCE
+through that prefix too (B7z).
 **Declared residuals of this arm** (declared in #523's scope; ⛔ NOT all of them
 fail toward gating — two are measured fail-AWAY and are listed as such rather
 than as a comfort): the command LINE itself still contributes ONE script (the
@@ -2505,12 +2519,19 @@ body while this walk resolves no path for it — **fail-AWAY, measured**; the
 nested-body walk is depth-bounded at two levels (`_programScriptInvocations`), so a
 four-level heredoc nest runs and resolves nothing — **fail-AWAY, measured**; and
 a body that WRITES a script and then executes it is not statically followable
-(the same class as Residual 1/3 in the discard section); and a LEADING
-REDIRECTION on the header line (`2>&1 bash <<EOF`, `>/dev/null bash <<EOF`) is
-not resolved by the leading-position scan, so the body is never walked — **the
-same root as #3970** (two resolvers disagreeing about a leading redirection),
-**fail-AWAY, measured** (`extractScriptPaths("2>&1 bash <<EOF\n/tmp/x.sh\nEOF")`
-→ `[]`).
+(the same class as Residual 1/3 in the discard section). ⛔ The COMMAND LINE's
+leading-position scan is still untouched, so `2>/dev/null bash /tmp/evil.sh` on the
+command line resolves nothing — the pre-existing **#3970** root (two resolvers
+disagreeing about a leading redirection), deliberately frozen byte-identical to
+`main` because the 0-changed-resolutions census depends on it (measured: 8,129
+commands from this repo's own `extensions/` + `scripts/` trees give an identical
+`classifyGitCommandDetailed` and an identical lead path). ⛔ An earlier version of
+this paragraph claimed that same gap also covered a HEADER-line redirection before
+a heredoc (`2>&1 bash <<EOF`) and called it **fail-AWAY**; BOTH parts were wrong —
+the mechanism was `_wtOpenerSegment` splitting on the `&` (a different seam), and
+the polarity was a fail-OPEN **regression**: `main` resolved that body's file and
+BLOCKED it while this arm allowed it. The header line is now handled and the claim
+is gone rather than re-worded.
 
 ## What it does NOT fix
 

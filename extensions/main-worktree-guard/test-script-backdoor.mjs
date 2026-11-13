@@ -600,6 +600,18 @@ async function partB() {
     // two tokens, the body was mis-classified as DATA, and nothing in it was read.
     expectTrue("B7x (#523 round-6 F2): a delimiter containing a SPACE still walks its body → BLOCKED",
       blocked(await bash(`bash <<'E F'\necho hi\n"${bodyEvil}"\nE F`, hub)), "was allowed");
+    // ⛔ ROUND-7 F1 (measured ALLOWED on the pre-fix head, BLOCKED on `main`): `&`
+    // is a list operator only when it is NOT part of a redirection, so `2>&1` does
+    // not end the simple command — it was split at the `&`, the opener segment's
+    // head became the fd DIGIT, the heredoc was classified DATA, and the body the
+    // shell really executes was never read.
+    expectTrue("B7y (#523 round-7 F1): a HEADER-line fd-DUP (`2>&1 bash <<EOF`) does not hide the body → BLOCKED",
+      blocked(await bash(`2>&1 bash <<EOF\necho hi\n"${bodyEvil}"\nEOF`, hub)), "was allowed");
+    // The mirror half: the same prefix in front of a CODE opener must NOT resurrect
+    // round-5 F1's over-block — a python body piped into a shell is SOURCE, and a
+    // path inside its `print(…)` string is not a program anything runs.
+    expectTrue("B7z (#523 round-7 F1) control: `2>&1 python3 <<PY | bash` stays SOURCE → ALLOWED",
+      allowed(await bash(`2>&1 python3 <<PY | bash\nprint("${bodyEvil}")\nPY`, hub)), "was blocked");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });
