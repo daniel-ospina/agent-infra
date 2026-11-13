@@ -27,9 +27,16 @@
 // (the degradation arm, the push-delete arm, and the later-segment delete arm)
 // and does not depend on a state read that may itself fail.
 //
-// ⛔ PR #3962 (open) is NOT this fix and must not be read as one: it stops the
-// extractor reporting a substitution FRAGMENT (`$(echo`) as a ref name, but the
-// arm still ALLOWS because the root is the unresolved TARGET.
+// ⛔ PR #3962 IS NOT THIS FIX, but after it the arm no longer ALLOWS either — and the difference matters
+// to a reader deciding which change to trust. #3962 stops the extractor reporting a substitution
+// FRAGMENT (`$(echo`) as a ref name; on its own it used to DROP the collapsed span, and a dropped
+// target never reaches `_coordinatedDeleteBlock`, so the #73 arm was still never consulted (measured:
+// `-d $(echo held/branch)` → `null` → ALLOW). That made #3962 a REGRESSION against `main`'s
+// fragment-based refusal once #653 landed, so #3962's collision with this file was resolved by having
+// the collapsed span report a shell-shaped MARKER (`$(…)`) instead of nothing: unresolvable, therefore
+// refused by the SAME #653 decision, and the refusal names it. The two changes are complementary —
+// #653 decides "an unknowable target fails closed", #3962 makes the attribution able to SAY it is
+// unknowable instead of inventing `$(echo` or discarding the target.
 //
 // Run: node extensions/main-worktree-guard/test-653-delete-target.mjs
 //      node extensions/main-worktree-guard/test-653-delete-target.mjs --mutations
@@ -107,14 +114,77 @@ expect("A: an all-literal set yields nothing to refuse", unresolvableDeleteTarge
 expect("A: a non-array is inert (never throws into the gate)", unresolvableDeleteTargets(undefined), []);
 
 // The EXTRACTION half — why the lookup never matched. These rows are the
-// MEASURED pre-fix attribution, and they must keep showing that a substitution
-// reaches the guard as text (a fragment for `$(…)`/backticks, the expansion
-// source for `$VAR`). They are the reason the policy layer is needed even after
-// #3962's fragment collapse: `null` targets would still ALLOW.
+// MEASURED PRE-FIX attribution (the tree before #504/#3962's segment helper): a substitution reached the
+// guard as a token fragment. ⛔ THEY ARE HISTORY, NOT CURRENT BEHAVIOUR: after #3962 a collapsed span in
+// a TARGET slot is reported as the unresolvable marker `$(…)` (see `_cleanDeleteTarget`), because a
+// `null`/empty target list ALLOWS — which is what makes the policy layer load-bearing.
+// HARNESS-SENSITIVE: they changed once already when `main` merged the file that introduced them, so
+// treat a red here as "the attribution moved", and read the block's marker comment before "fixing" it.
 expect("A: $VAR extract", extractPushDeleteBranch(`git push origin --delete "$PR_BRANCH"`), ["$PR_BRANCH"]);
-expect("A: $(…) extract (a FRAGMENT, not a ref)", extractPushDeleteBranch("git push origin -d $(echo held/branch)"), ["$(echo", "held/branch)"]);
-expect("A: backtick extract (a FRAGMENT, not a ref)", extractPushDeleteBranch("git push origin -d `cat list`"), ["`cat", "list`"]);
+expect("A: $(…) extract (UNRESOLVABLE marker, not a ref)", extractPushDeleteBranch("git push origin -d $(echo held/branch)"), ["$(…)"]);
+expect("A: backtick extract (UNRESOLVABLE marker, not a ref)", extractPushDeleteBranch("git push origin -d `cat list`"), ["$(…)"]);
 expect("A: brace expansion extract (ONE token, shell makes TWO words)", extractPushDeleteBranch("git push origin -d {held,other}"), ["{held,other}"]);
+
+// ── Round-7 review (P0 ×2): the two capture-level gaps that made the segment helper WORSE than
+// `origin/main`, both measured as `extractPushDeleteBranch → null` = the #73 arm never consulted. ──
+// 1. A NEWLINE is a list separator ("a bare NEWLINE ends a simple command exactly like `;`", the
+//    module's own `_tokenize` doc, agent-infra#1158). `segRe`'s capture spanned it, so the SECOND
+//    command arrived inside the first body and its `(` was read as a span OPENER — the `-d` and its
+//    target were skipped as span content. `origin/main` blocked these; the extractor returned `null`.
+// ⛔ EVERY ONE OF THESE MUST NAME THE REAL TARGET, not merely `$(…)`: the point is that the second
+//    command was ATTRIBUTED, which is what the #73 lookup needs.
+for (const [name, cmd, want] of [
+  ["a NEWLINE + parenthesized later segment", "git push origin HEAD:feat\n( git push origin -d held/branch )", ["held/branch"]],
+  ["a CRLF later segment", "git push origin HEAD:feat\r\n( git push origin -d held/branch )", ["held/branch"]],
+  ["a TAB-indented later segment", "git push origin origin/HEAD\n\t( git push origin -d held/branch )", ["held/branch"]],
+  ["a NEWLINE + `--delete` later segment", "git push origin HEAD:feat\n( git push origin --delete held/branch )", ["held/branch"]],
+  ["a bare NEWLINE-separated delete (no parens)", "git push origin HEAD:feat\n git push origin -d held/branch", ["held/branch"]],
+  // 2. A BACKSLASH-NEWLINE is a LINE CONTINUATION: bash joins the lines before parsing words, so the
+  //    capture must NOT be cut there. Resolved before the scan, so the delete survives.
+  ["a BACKSLASH-NEWLINE continuation keeps the delete", "git push origin \\\n-d held/branch", ["held/branch"]],
+]) {
+  expect(`A: ${name} → the real target is ATTRIBUTED`, extractPushDeleteBranch(cmd), want);
+}
+
+// ── The TRUNCATED SPAN (round-7 review, P0): a substitution whose BODY contains `;`/`&`/`|` is cut by
+// the capture before its closer, so the span never closes. Dropping an unclosed span is the same
+// fail-open on the other side: `origin/main` refused these on a fragment, this branch returned `null`.
+// The truncated span is ONE unknowable word, so it reports the same `$(…)` marker a closed one does.
+for (const [name, cmd] of [
+  ["a pipe inside the substitution body", "git push origin -d $(cat f | head -1)"],
+  ["a semicolon inside the substitution body", "git push origin -d $(echo a; echo b)"],
+  ["an `&&` inside the substitution body", "git push origin -d $(echo a && echo b)"],
+  ["a pipe inside a BACKTICK body", "git push origin -d `echo a && echo b`"],
+  ["a truncated span in a compound's later segment", "git push origin HEAD:refs/heads/feat && git push origin -d $(cat f | head -1)"],
+]) {
+  expect(`A: ${name} → UNRESOLVABLE marker`, extractPushDeleteBranch(cmd), ["$(…)"]);
+}
+// ── Round-8 review (P0 ×2): the newline rule must be QUOTE/SPAN AWARE, and `$'…'` is a QUOTED string
+// to bash but not to `_tokenize`. Both were measured as `null` here = the #73 arm never consulted,
+// where `origin/main` reported a real target — i.e. regressions this PR introduced by taking the target
+// list from the tokenizer/capture rather than from `split(/\s+/)`. ──
+// ⛔ EVERY ROW ASSERTS `held/branch`: the point is that the delete is still ATTRIBUTED after a newline
+// that only LOOKS like a boundary, or after an ANSI-C literal that only LOOKS like an open quote.
+for (const [name, cmd] of [
+  ["a newline inside a DOUBLE-quoted push option", 'git push origin -o "a\nb" -d held/branch'],
+  ["a newline inside a SINGLE-quoted push option", "git push origin -o 'a\nb' -d held/branch"],
+  ["a newline inside a command substitution", "git push origin -o $(echo a\n) -d held/branch"],
+  ["a newline inside a backtick substitution", "git push origin -o `echo a\n` -d held/branch"],
+  ["a newline inside a ${…} expansion", "git push origin -o ${R:-a\nb} -d held/branch"],
+  ["an ANSI-C literal whose escaped quote must NOT close it", "git push -o $'don\\'t' origin -d held/branch"],
+  ["an ANSI-C literal before the flag, later segment", "git push origin HEAD:refs/heads/feat && git push -o $'don\\'t' origin -d held/branch"],
+]) {
+  expect(`A: ${name} → the real target is ATTRIBUTED`, extractPushDeleteBranch(cmd), ["held/branch"]);
+}
+// …and the unquoted twin really is still a boundary (the control for the rows above).
+expect("A: an UNQUOTED newline between two commands is still a boundary", extractPushDeleteBranch("git push origin HEAD:feat\ngit push origin -d held/branch"), ["held/branch"]);
+
+// …and the marker really is what #653 refuses, end-to-end at the seam these rows live in.
+for (const t of ["$(…)"]) expect(`A: #653 refuses the truncated-span marker ${t}`, unresolvableDeleteTargets([t]), [t]);
+// ⚠️ CONTROL (not a discriminator): a backtick with NOTHING after it in the segment is the #504
+// CLOSER, whose partner belongs to an outer command — it still ends the body, so the real target
+// survives and is NOT replaced by a marker.
+expect("A: an unpaired CLOSING backtick keeps the real target", extractPushDeleteBranch("echo `git push origin -d held/branch`"), ["held/branch"]);
 
 // ── Part B — the SHIPPED gate (real index.ts tool_call handler) ───────────
 if (typeof stripTypeScriptTypes !== "function" ||
@@ -228,6 +298,14 @@ if (typeof stripTypeScriptTypes !== "function" ||
       ["B10 #653: an assignment in the SAME command is NOT resolved (the fix judges TEXT, it does not emulate the shell)", `BRANCH=stale && git push origin --delete "$BRANCH"`],
       ["B11 #653: LATER-SEGMENT delete in a compound (the wholeCommandDeleteTargets arm)", `git push origin main && git push origin -d "$PR_BRANCH"`],
       ["B12 #653: a benign lead segment must not launder the delete", `git status && git push origin --delete "$PR_BRANCH"`],
+      // #3962 round-7 review P0: the substitution's OWN body carries a pipe, so the segment capture cuts
+      // before the closer and the span never closes. It used to be DROPPED, which left no refusable
+      // token: the extractor said `null` and this arm was never consulted (ALLOWED end-to-end).
+      ["B13 #3962: a TRUNCATED span (a pipe inside the substitution body)", `git push origin -d $(printf held/branch | head -1)`],
+      // #3962 round-8 review P0: `$'…'` is a QUOTED string to bash, but `_tokenize` has no ANSI-C
+      // quoting — it opened a plain `'…'` at the `$`, the `\'` inside CLOSED it, and the rest of the
+      // segment was swallowed, so the delete vanished and the arm was never consulted.
+      ["B14 #3962: an ANSI-C literal with an escaped quote before the delete", `git push -o $'don\\'t' origin -d "$PR_BRANCH"`],
     ];
     for (const [name, cmd] of deny) {
       expectTrue(`${name} → REFUSED`, refusedBy(await quiet(() => real.bash(cmd)), FAIL_CLOSED),
@@ -256,6 +334,28 @@ if (typeof stripTypeScriptTypes !== "function" ||
       refusedBy(await quiet(() => real.bash("git push origin :held")), HOLDS));
     expectTrue("D3: an UNRESOLVABLE delete of the same held branch is refused by #653's arm (not silently allowed)",
       refusedBy(await quiet(() => real.bash(`git push origin --delete "$(printf held)"`)), FAIL_CLOSED));
+    // #3962 round-7 review P0: a NEWLINE is a list separator exactly like `;`, so the second command is
+    // its OWN push segment. The capture used to span the newline, the second segment's `(` was read as a
+    // span OPENER, and the `-d` + target were skipped — ALLOWED end-to-end, where `origin/main` blocked it.
+    // ⚠️ Asserted against #73's OWN reason text (`currently checked out`), not a bare `block === true`, so
+    // an unrelated refusal cannot satisfy it — and not against FAIL_CLOSED, because the correct answer
+    // here is the #73 lookup on the REAL target, which is a different arm.
+    expectTrue("D4 #3962: a NEWLINE-separated later segment is #73-blocked on the REAL target (the newline ends the segment)",
+      refusedBy(await quiet(() => real.bash("git push origin HEAD:refs/heads/feat\n( git push origin -d held )")), HOLDS),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash("git push origin HEAD:refs/heads/feat\n( git push origin -d held )")))?.slice(0, 200)}`);
+    // ⛔ #3962 round-8 review P0, the OTHER half of the newline rule: bash does NOT end a command at a
+    // newline that sits inside quotes or a span — there it is DATA. Cutting the capture on every `\n`
+    // lost the delete after `-o "a<LF>b"` (a real push-option form), so this row is the boundary's
+    // CONTROL: same target, newline present, and it must still reach #73 on the REAL name.
+    // ⛔ D5 IS AN END-TO-END CONTROL, NOT A DISCRIMINATOR — and it says so (round-8 review P2, the same
+    // class as B73b). MEASURED: with `_maskQuotedNewlines` reverted the row stays GREEN while
+    // `extractPushDeleteBranch` returns null and `wholeCommandDeleteTargets` returns [] — so another arm
+    // of the handler refuses this shape end-to-end. The rows that actually redden for this fix are
+    // Part A's quoted-newline rows (6 failures with the mask reverted); this one only asserts that the
+    // user-visible outcome is still a refusal, which is worth pinning but proves nothing about the mechanism.
+    expectTrue("D5 #3962: a newline inside QUOTES is DATA, not a separator — the delete after it still reaches #73 (CONTROL: stays green under the mask mutant)",
+      refusedBy(await quiet(() => real.bash('git push origin -o "a\nb" -d held')), HOLDS),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash('git push origin -o "a\nb" -d held')))?.slice(0, 200)}`);
 
     // ── Part E: a WORKTREE session is NOT exempt ────────────────────────────
     // The #73 arm has never been worktree-exempt, and the fleet's lanes run from

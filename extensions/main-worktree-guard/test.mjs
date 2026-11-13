@@ -1079,6 +1079,143 @@ wcdt("src:dst refspec → none", "block:push", "git push origin main && git push
 wcdt("push-delete verdict → none (fold-in already carries targets)", "block:push-delete", "git push origin main && git push origin --delete b", []);
 wcdt("allow verdict → none", "allow", "git push origin main && git push origin -d b", []);
 wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -d b", []);
+
+// ── #504 residual: a delete in a PARENTHESIZED later segment ──────────────
+// The whole-command extractor walked segments with `split(/\s+/)`, which keeps
+// a subshell/substitution CLOSER that is attached to the last word. The target
+// came back as `b)` — a phantom that names no ref, so `_coordinatedDeleteBlock`
+// looked up `refs/heads/b)` and found nothing checked out: the #73 block that
+// protects a sibling-held branch ALLOWED the delete (probe-verified end-to-end
+// from a linked worktree, where M2 is exempt). The segment is now tokenized
+// with the module's quote-aware splitter (`_tokenize`) and bounded by four rules:
+//   1. NO LIST SEPARATOR can reach the helper (`segRe`'s `[^;&|]*` capture cannot contain `;`/`&`/`|`,
+//      and `_tokenize` runs without `newlineIsSeparator`), so there is no separator arm to test; the
+//      set's `(`/`)` members are intercepted by rule 3 — an unquoted closer with no opener DOES end
+//      the segment there.
+//   2. a redirect is NOT a boundary — the token is skipped with its filename operand;
+//   3. a span that OPENS inside the segment (`$( … )`, `<( … )`, `<backtick>…<backtick>`) is one WORD:
+//      its contents are skipped and the scan CONTINUES, while a `)` / unpaired backtick with no
+//      opener inside the segment ends it (that is the #504 case itself);
+//   4. only an UNQUOTED paren is an operator — quoted/escaped ones are DATA (`_tokenize` strips
+//      quotes, so `-o ")"` used to arrive as the operator token `)` and end the segment: round-4
+//      fail-open, the same #73 hazard). See `_maskDataParens`.
+// (An earlier revision of this comment named `_truncateAtUnquotedBacktick` and claimed `(` ends a
+// segment; that function no longer exists and the claim was backwards — it described exactly the
+// round-2 fail-open. Corrected in place, see round-3 review finding.)
+wcdt("parenthesized later-segment -d under block:push", "block:push", "git push origin main && (git push origin -d b)", ["b"]);
+wcdt("parenthesized later-segment --delete under block:push", "block:push", "git push origin main && (git push origin --delete b)", ["b"]);
+wcdt("command-substitution later-segment -d", "block:push", "git push origin main && echo $(git push origin -d b)", ["b"]);
+// ⛔ NO `{ …; }` GROUP ROW HERE. `segRe`'s capture contract is `[^;&|]*` and a
+// brace group REQUIRES the `;` before `}`, so the capture is exactly
+// ` origin -d b` — there is no boundary token left for this helper to act on and
+// the row read `["b"]` before and after the fix (fresh-context review P2): an
+// assertion that cannot redden under any mutation of the change it accompanies is
+// decoration, not coverage.
+// Backtick substitution: an UNQUOTED backtick closes a substitution exactly like
+// `)`, and `_tokenize` keeps it inside the word (measured on origin/main:
+// `["b`"]` — the same phantom class).
+wcdt("unquoted-backtick later-segment -d", "block:push", "git push origin main && echo `git push origin -d b`", ["b"]);
+// ⛔ A REDIRECT IS NOT A BOUNDARY (fresh-context review P1). A redirect may appear ANYWHERE in a
+// simple command (`_isRedirectOperator`'s own rule), so ending the segment at `>` dropped the very
+// argument list being scanned: `git push origin 2>/dev/null -d b` returned `[]`, `_coordinatedDeleteBlock`
+// was never consulted, and the delete was ALLOWED where origin/main BLOCKED — in both the full path and
+// the degraded (classifier-unavailable) arm. The redirect token is skipped WITH its filename operand.
+wcdt("redirect BEFORE the remote consumes its filename", "block:push", "git push 2>/dev/null origin -d b", ["b"]);
+wcdt("redirect attached before the delete flag", "block:push", "git push origin >/dev/null -d b", ["b"]);
+wcdt("redirect between push and the --delete spelling", "block:push", "git push origin -q 2>/dev/null --delete b", ["b"]);
+// ⛔ A SUBSTITUTION OPENER IS NOT A TERMINATOR (fresh-context review round 2, P2). The round-1 fix
+// truncated the segment at the first `_SHELL_OPS`/backtick token — correct for a CLOSER, wrong for an
+// OPENER: `git push $(cat .remote) origin -d b` then returned null where origin/main returned the
+// target, so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was allowed again. A
+// span that OPENS inside the segment is one WORD of the command, so its contents are skipped and the
+// scan continues; only a `)`/backtick with no opener inside the segment ends the body.
+// ⛔ THE EXPECTATION IS BOTH POSITIONALS (#509, merged after round 6): a substitution span is ONE WORD,
+// so it takes the REPOSITORY slot and the `origin` that follows it is a second — deleted — refspec. The
+// every-refspec contract returns both; the row still reddens under the round-2 mutant (`(` → break),
+// which drops the flag and returns `[]`.
+// ⛔ AND RESTORED AFTER THE REBASE, deliberately: this row's expected value came from the merge commit
+// `d0328a8f4` that resolved it against #509's every-refspec contract, and a plain `git rebase` DROPS
+// merge commits — so replaying the branch silently reverted the row to its pre-#509 `["b"]` and turned a
+// resolved conflict back into a red suite. #509 is in `main`, so the merge's reading is still the
+// correct one; it is the resolution that is load-bearing, not the commit that carried it.
+wcdt("command-substitution OPENER keeps the flag and target", "block:push", "git push $(cat .remote) origin -d b", ["origin", "b"]);
+wcdt("substitution in an option VALUE keeps the flag and target", "block:push", "git push -o $(date) origin -d b", ["b"]);
+wcdt("BACKTICK substitution opener keeps the flag and target", "block:push", "git push origin `date` -d b", ["$(…)", "b"]);
+// ⛔ NO fd-dup ROW HERE (fresh-context review round 2, finding 2). `segRe`'s capture is `[^;&|]*`, so
+// it stops at the `&` inside `>&2` / `2>&1`: those tokens can NEVER reach the redirect handler, and
+// with the target placed BEFORE the redirect the row could not redden under any mutation (observed 0/13).
+// The unreachable `&>`/`&>>`/fd-dup branches were dropped from the helper for the same reason.
+// Nor a "redirect after the target" row (round 3, finding 3): the target precedes the redirect there, so
+// no mutant of this change can move it — the shape that PINS the operand-skip is the one below.
+wcdt("the redirect's filename is not an argv word", "block:push", "git push origin -d 2>/dev/null b", ["b"]);
+// ⛔ A PROCESS-SUBSTITUTION WORD IS NOT A FILENAME (fresh-context review round 3, P2). `<( list )` is one
+// WORD (bash manual §5.1) but `_tokenize` emits `<` + `(` as separate tokens, so consuming the next
+// token as the redirect's filename ate the span OPENER and the span's `)` then terminated the segment:
+// `git push origin <(cat f) -d b` → null where origin/main → ["b"].
+// ⚠️ THE EXPECTED LIST NOW ALSO CARRIES THE UNRESOLVABLE MARKER: `origin` is the repository, so
+// `<(cat f)` and `b` are BOTH refspecs, and with a push-wide `-d` git deletes both. #653 refuses an
+// unknowable target, so the span is reported as `$(…)` rather than dropped — the property this row
+// pins (the `)` did not end the segment, so `b` is still attributed) is unchanged, and the row still
+// reddens under the round-3 mutant, which retargets the whole list.
+wcdt("a process-substitution WORD before the flag", "block:push", "git push origin <(cat f) -d b", ["$(…)", "b"]);
+wcdt("an OUTPUT process-substitution WORD before the flag", "block:push", "git push origin >(cat f) -d b", ["$(…)", "b"]);
+// ⛔ A QUOTED PAREN IS DATA, NOT AN OPERATOR (fresh-context review round 4, P2). `_tokenize` is
+// quote-aware for WORD CONTENTS but it STRIPS the quotes, so a word that is exactly `")"` arrives as the
+// token `)` — indistinguishable from the shell operator. It then hit the span-closer leg with depth 0 and
+// ENDED the segment while the delete flag was still ahead of it: `git push origin -o ")" -d b` → []
+// where origin/main → ["b"], so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was
+// allowed in BOTH the full path and the degraded arm. Fourth mirror-shape of the rounds 1-3 class.
+// Quote-state is now carried through tokenization by masking quoted/escaped parens (`_maskDataParens`).
+wcdt("a QUOTED close-paren before the flag is data", "block:push", `git push origin -o ")" -d b`, ["b"]);
+wcdt("a QUOTED open-paren before the flag is data", "block:push", `git push origin -o "(" -d b`, ["b"]);
+wcdt("an ESCAPED close-paren before the flag is data", "block:push", "git push origin -o \\) -d b", ["b"]);
+wcdt("a quoted paren INSIDE a span keeps the flag", "block:push", `git push $(echo ")") origin -d b`, ["origin", "b"]);
+// …and the masking must be REVERSIBLE: a ref name that legitimately contains a (quoted) paren is
+// restored, not mangled by the sentinel.
+wcdt("a QUOTED paren in the TARGET survives masking", "block:push", `git push origin -d "x)"`, ["x)"]);
+wcdt("an ESCAPED paren in the TARGET survives masking", "block:push", "git push origin -d b\\)", ["b)"]);
+// ⛔ A `${ … }` WORD'S PAREN IS DATA, NOT AN OPERATOR (fresh-context review round 6, P2). A parameter
+// expansion's `)` is not a closer of anything — bash ends the span at a BRACE. It was neither quoted nor
+// escaped, so the mask left it as the operator token `)`, which hit the span-closer leg with depth 0 and
+// ENDED the segment before the delete flag: `git push origin -o ${R:-)} -d held/branch` → [] where
+// origin/main → ["held/branch"], so `_coordinatedDeleteBlock` was never consulted and the #73 hazard was
+// allowed (reproduced end-to-end: the remote deleted the branch). Sixth mirror-shape of the same class.
+// Every row below reads `[]` on the pre-fix module and `["b"]` here (measured, both modules).
+wcdt("a data paren inside a parameter expansion before the flag", "block:push", "git push origin -o ${R:-)} -d b", ["b"]);
+wcdt("a NESTED parameter expansion's data paren", "block:push", "git push origin -o ${A:-${B:-)}} -d b", ["b"]);
+// …and the `}` scan is quote-AWARE: a brace inside single quotes does not close the span, so the
+// UNQUOTED paren after it must still be masked (bash: `${R:-'}'x)}` → `}x)`).
+wcdt("a QUOTED brace does not close the expansion", "block:push", "git push origin -o ${R:-'}'x)} -d b", ["b"]);
+wcdt("a parameter expansion before the remote", "block:push", "git push -o ${R:-)} origin -d b", ["b"]);
+wcdt("a parameter expansion before the --delete spelling", "block:push", "git push origin -o ${R:-x)} --delete b", ["b"]);
+wcdt("a substitution span INSIDE a parameter expansion", "block:push", "git push $(echo ${R:-)}) origin -d b", ["origin", "b"]);
+// A substitution in a TARGET position must be reported UNRESOLVABLE, never as a phantom ref AND never
+// silently dropped. Both wrong answers were shipped here at some point and each is a fail-open:
+//   * `split(/\s+/)` reported the FRAGMENT `["$(echo"]`, which names no ref either — so
+//     `_coordinatedDeleteBlock` found nothing checked out under it and ALLOWED the delete (this is
+//     #653's root, fixed there);
+//   * dropping the collapsed span reported `[]`, which #653 can no more refuse than a phantom — an
+//     UNRESOLVABLE target only fails closed if it REACHES the block. MEASURED against `origin/main`:
+//     `-d $(echo held/branch)` / `` -d `date` `` / `--delete $(echo …)` were all REFUSED there (on the
+//     fragment) and came back ALLOWED from the drop, i.e. the drop was a REGRESSION against main, not a
+//     residual. The marker `$(…)` is what keeps #653's refusal reachable.
+wcdt("substitution in the TARGET position is reported UNRESOLVABLE — not a phantom ref, and not dropped", "block:push", "git push origin -d $(echo b)", ["$(…)"]);
+// The fold-in path (frozen legacy evidence in a LATER segment) overrides
+// pushTargets with the SAME extractor — the parenthesized twin must attribute
+// the real target there too, not the phantom `b)`.
+dexpect("parenthesized later-segment --delete → real target only", `git push origin HEAD:refs/heads/feat && (git push origin --delete b)`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
+// The fold-in path carries the SAME surface: a `${ … }` word in the -o slot used to empty pushTargets
+// on a verdict that DID block, so the target was protected only by luck of the fallback (#504).
+dexpect("parameter-expansion later-segment --delete → real target only", "git push origin HEAD:feat && git push origin -o ${R:-)} --delete b", { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
+// QUOTED text is data, not a shell operator: a ref legitimately named `b)`
+// must survive (git ref names allow parentheses), so the boundary rule must be
+// quote-AWARE — a blanket trailing-`)` strip would corrupt it. Same for a quoted
+// backtick. This row reddens under the quote-unaware fold (round-3 attribution table).
+wcdt("a QUOTED paren stays part of the ref name", "block:push", "git push origin main && git push origin -d 'feat/x)'", ["feat/x)"]);
+wcdt("a QUOTED backtick stays part of the ref name", "block:push", "git push origin main && git push origin -d 'feat/x`'", ["feat/x`"]);
+// ⚠️ CONTROL, NOT A DISCRIMINATOR (round-3 review, finding 3): this row cannot redden under any mutant of
+// this change — it can only catch a GROSS over-block that refuses a plain push outright.
+wcdt("CONTROL: parenthesized segment with a plain push → none", "block:push", "git push origin main && (git push origin main)", []);
 // --d is AMBIGUOUS with --dry-run — git rejects it (rc 129, probe-verified);
 // it never deletes, so it stays a plain block:push (never block:push-delete).
 dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });

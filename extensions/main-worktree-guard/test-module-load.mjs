@@ -402,6 +402,121 @@ async function partB() {
     expect("B9pre: factory registered a session_start handler", typeof sessionStart, "function");
     if (typeof sessionStart === "function") await sessionStart({});
 
+    // ── B73: #504 — the #73 coordinated-delete block, end-to-end ──
+    // The defect was only reachable through the FULL path: the parser produced a
+    // phantom target and index.ts's #73 arm looked up a ref nobody can check
+    // out, so a WORKTREE session (M2-exempt) could delete a branch a sibling
+    // still had checked out. `test.mjs` pins the extractor alone; this pins the
+    // block an agent actually meets. It must run HERE — while the hermetic hub is
+    // clean and on `main` — because the later B9 cases move the hub's branch.
+    const sib73 = join(tmp, "wt-73-sibling");
+    const mine73 = join(tmp, "wt-73-mine");
+    execSync(`git worktree add -q "${sib73}" -b held/branch HEAD`, { cwd: repo, stdio: "ignore" });
+    execSync(`git worktree add -q "${mine73}" -b feat/mine HEAD`, { cwd: repo, stdio: "ignore" });
+    process.chdir(mine73); // a linked-worktree session: M2 does not gate it
+    if (typeof sessionStart === "function") await sessionStart({});
+    try {
+      const coord = (name, command) => callBash(command);
+      const isCoordBlock = (r, branch) => !!r && r.block === true &&
+        /checked out in/.test(r.reason ?? "") && (r.reason ?? "").includes(branch);
+      const d1 = await coord("d1", "git push origin HEAD:refs/heads/feat && git push origin --delete held/branch");
+      // ⚠️ B73a is a WIRING PIN, not a discriminator (#3442 rule 3, round-3 review): it stays green on
+      // origin/main too — it proves the loaded extension still routes the body-delete repro through the
+      // #73 arm, the same role B6b plays above. ⛔ B73b IS A CONTROL TOO (round-8 review, P2): measured
+      // GREEN on `origin/main` at `319c82526` — base blocks it through a different seam (the `--delete`
+      // spelling resolves to a clean target via `pushMutations`), so the parenthesis is not what base
+      // failed at, and it stays green under a full revert of the segment helper. The discriminating rows
+      // are B73c/B73d/B73g/B73k-b (base) and B73e/f/h/i (intermediate revisions this PR itself shipped).
+      expectTrue("B73a: later-segment `--delete` of a sibling-held branch is BLOCKED by the #73 arm (#504; wiring pin, not a discriminator)",
+        isCoordBlock(d1, "held/branch"), `handler returned ${JSON.stringify(d1)?.slice(0, 200)}`);
+      const d2 = await coord("d2", "git push origin HEAD:refs/heads/feat && (git push origin --delete held/branch)");
+      expectTrue("B73b: the PARENTHESIZED later segment is BLOCKED too (#504 residual; CONTROL — base blocks it through the `--delete` seam, see above)",
+        isCoordBlock(d2, "held/branch"), `handler returned ${JSON.stringify(d2)?.slice(0, 200)}`);
+      const d3 = await coord("d3", "git push origin HEAD:refs/heads/feat && (git push origin -d held/branch)");
+      expectTrue("B73c: the parenthesized `-d` twin is BLOCKED (whole-command arm, no frozen legacy evidence)",
+        isCoordBlock(d3, "held/branch"), `handler returned ${JSON.stringify(d3)?.slice(0, 200)}`);
+      const d4 = await coord("d4", "git push origin HEAD:refs/heads/feat && echo $(git push origin -d held/branch)");
+      expectTrue("B73d: a command-substituted later segment is BLOCKED (same boundary rule)",
+        isCoordBlock(d4, "held/branch"), `handler returned ${JSON.stringify(d4)?.slice(0, 200)}`);
+      // ⛔ A REDIRECT IS NOT A BOUNDARY (fresh-context review P1). `2>/dev/null` is what an agent adds
+      // for ordinary noise suppression, and it sits BETWEEN push and the delete spelling — so a
+      // boundary rule that broke at `>` silently emptied the target list and this #73 block stopped
+      // firing on the very command it exists for.
+      const d5 = await coord("d5", "git push origin HEAD:refs/heads/feat && git push origin 2>/dev/null -d held/branch");
+      expectTrue("B73e: a redirect between `push` and `-d` does NOT hide the delete (redirect ≠ boundary)",
+        isCoordBlock(d5, "held/branch"), `handler returned ${JSON.stringify(d5)?.slice(0, 200)}`);
+      const d6 = await coord("d6", "git push origin HEAD:refs/heads/feat && git push origin >/dev/null --delete held/branch");
+      expectTrue("B73f: an attached redirect before `--delete` does not hide it either",
+        isCoordBlock(d6, "held/branch"), `handler returned ${JSON.stringify(d6)?.slice(0, 200)}`);
+      const d7 = await coord("d7", "git push origin HEAD:refs/heads/feat && echo `git push origin -d held/branch`");
+      expectTrue("B73g: an unquoted-backtick later segment is BLOCKED (not the phantom `held/branch`+backtick)",
+        isCoordBlock(d7, "held/branch"), `handler returned ${JSON.stringify(d7)?.slice(0, 200)}`);
+      // ⛔ A SUBSTITUTION OPENER IS NOT A TERMINATOR (fresh-context review round 2). Truncating at the
+      // opener dropped `-d held/branch` and the block silently stopped firing — the same fail-open,
+      // reached by a spelling an agent writes whenever it needs the remote from a file or a date stamp.
+      const d8 = await coord("d8", "git push origin HEAD:refs/heads/feat && git push $(cat .remote) origin -d held/branch");
+      expectTrue("B73h: a `$( … )` OPENER before the delete flag does not hide the delete",
+        isCoordBlock(d8, "held/branch"), `handler returned ${JSON.stringify(d8)?.slice(0, 200)}`);
+      const d9 = await coord("d9", "git push origin HEAD:refs/heads/feat && git push origin `date` -d held/branch");
+      // ⛔ THE OPENER PROPERTY AND THE REFUSAL ARE PINNED SEPARATELY (this row's original single assertion
+      // stopped holding the day #653 landed alongside #3962's segment helper). The block reason used to be
+      // `checked out in held/branch`; now the push's FIRST positional is the repository and `` `date` `` /
+      // `<(cat f)` are further REFSPECS — with a push-wide `-d` git would delete them too — so the span is
+      // reported as the unresolvable `$(…)` and #653 refuses on THAT, ahead of the checkout lookup. The
+      // shape is still refused (row a), and the property the row exists for — the span OPENER did not end
+      // the segment, so the real `-d held/branch` is still attributed (row b) — is asserted directly
+      // instead of being inferred from which reason won. Both redden under the round-2/round-3 mutants.
+      const cg9 = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
+      expectTrue("B73i: a backtick-substitution OPENER before the delete flag does not hide the delete (still REFUSED)",
+        !!d9 && d9.block === true, `handler returned ${JSON.stringify(d9)?.slice(0, 200)}`);
+      expectTrue("B73i-b: …and the real target is still ATTRIBUTED after the span (the two refusals are not interchangeable)",
+        (cg9.extractPushDeleteBranch("git push origin `date` -d held/branch") ?? []).includes("held/branch"),
+        JSON.stringify(cg9.extractPushDeleteBranch("git push origin `date` -d held/branch")));
+      // ⛔ A PROCESS-SUBSTITUTION WORD IS NOT A FILENAME (round-3 review, P2): `<( list )` is one word,
+      // so consuming the token after `<` as a redirect filename ate the span opener and the span's `)`
+      // then ended the segment.
+      const d10 = await coord("d10", "git push origin HEAD:refs/heads/feat && git push origin <(cat f) -d held/branch");
+      const cg10 = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
+      expectTrue("B73j: a `<( … )` WORD before the delete flag does not hide the delete (still REFUSED)",
+        !!d10 && d10.block === true, `handler returned ${JSON.stringify(d10)?.slice(0, 200)}`);
+      expectTrue("B73j-b: …and the real target is still ATTRIBUTED after the process-substitution word",
+        (cg10.extractPushDeleteBranch("git push origin <(cat f) -d held/branch") ?? []).includes("held/branch"),
+        JSON.stringify(cg10.extractPushDeleteBranch("git push origin <(cat f) -d held/branch")));
+      const d11 = await coord("d11", "git push origin HEAD:refs/heads/feat && git push origin -d 2>/dev/null held/branch");
+      // ⛔ B73k WAS A NON-DISCRIMINATOR UNTIL ROUND-7 REVIEW (P2), and the PR body claimed the opposite.
+      // It asserted only that the handler BLOCKED, and without the operand skip the target list becomes
+      // `["/dev/null","held/branch"]` — the held ref is STILL in it, so the block still fires and the row
+      // stayed green under the mutant it was said to pin (measured: `test.mjs`'s `wcdt` row reddens, this
+      // one did not). Same remedy as B73i-b/B73j-b: assert the extracted list, which `["/dev/null",…]`
+      // reddens, and keep the handler half as the end-to-end control.
+      const cg11 = await import(pathToFileURL(join(HERE, "classify-git.mjs")).href);
+      expectTrue("B73k: a redirect BETWEEN the delete flag and its target keeps the target (end-to-end)",
+        isCoordBlock(d11, "held/branch"), `handler returned ${JSON.stringify(d11)?.slice(0, 200)}`);
+      expectTrue("B73k-b: …and the redirect's OPERAND is not an argv word (this is the half that reddens under the no-skip mutant)",
+        JSON.stringify(cg11.extractPushDeleteBranch("git push origin -d 2>/dev/null held/branch")) === JSON.stringify(["held/branch"]),
+        JSON.stringify(cg11.extractPushDeleteBranch("git push origin -d 2>/dev/null held/branch")));
+      // ⛔ A QUOTED PAREN IS DATA, NOT AN OPERATOR (round-4 review, P2): `_tokenize` strips the quotes, so
+      // a word that is exactly `")"` reached the segment helper as the token `)` and ended the segment
+      // before the delete flag — the #73 arm never fired and the sibling-held branch was deletable.
+      const d12 = await coord("d12", "git push origin HEAD:refs/heads/feat && git push origin -o \")\" -d held/branch");
+      expectTrue("B73l: a QUOTED `)` before the delete flag does not hide the delete (quote erasure)",
+        isCoordBlock(d12, "held/branch"), `handler returned ${JSON.stringify(d12)?.slice(0, 200)}`);
+      // Positive controls — the boundary fix must not invent targets: a delete of
+      // a branch NOBODY has checked out stays allowed, and so does a plain
+      // compound push (the #73 arm must not fire on it).
+      const ok1 = await coord("ok1", "git push origin HEAD:refs/heads/feat && (git push origin -d never/checked-out)");
+      expectTrue("B73-cont1: deleting a branch nobody has checked out stays ALLOWED (no over-block)",
+        ok1 === undefined, `handler returned ${JSON.stringify(ok1)?.slice(0, 200)}`);
+      const ok2 = await coord("ok2", "git push origin HEAD:refs/heads/feat && (git push origin HEAD:refs/heads/feat)");
+      expectTrue("B73-cont2: a parenthesized plain push stays ALLOWED (the #73 arm is delete-keyed)",
+        ok2 === undefined, `handler returned ${JSON.stringify(ok2)?.slice(0, 200)}`);
+    } finally {
+      // Restore the hub session state the B9 cases expect: cwd = the hub, and a
+      // baseline recorded from it (main).
+      process.chdir(repo);
+      if (typeof sessionStart === "function") await sessionStart({});
+    }
+
     // B9a — the reported defect, end-to-end through the loaded extension.
     // Before the #1144 fix the allowance consulted the VERB first and returned
     // undefined (ALLOWED): a `rebase` moved the SHARED baseline branch with no
