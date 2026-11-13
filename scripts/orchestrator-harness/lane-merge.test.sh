@@ -84,6 +84,11 @@ mk_chain() { # mk_chain <fixture-path>   (writes into the CURRENT case's $OT)
 printf '%s\\n' "\$1" >> "${T:?}/chain-repo.txt" 2>/dev/null || true
 # …and its whole argv, so a suite can assert the BRANCH the chain was handed (arg 4).
 printf '%s\\n' "\$*" >> "${T:?}/chain-argv.txt" 2>/dev/null || true
+# …and what it INHERITED as REQ. lane-merge must hand the chain the contract the OPERATOR supplied,
+# never the one lane-merge resolved for itself (#4039 review P2). Bracketed so an unset and an empty
+# value both print as an empty pair of brackets — the arms below assert exactly that, and a laundered
+# fallback set does not.
+printf '[%s]\\n' "\${REQ:-}" >> "${T:?}/chain-env.txt" 2>/dev/null || true
 printf 'rail: MERGED via the rail (stub)\\n'
 printf 'closed|2026-10-18T00:00:00Z|head123|clean\\n' > "$1"
 # MK_MERGED makes this stub behave like merge-one.sh on a real merge: it writes the marker the
@@ -2337,6 +2342,60 @@ new_o "$T/pr4014.tsv"
 run_req 'python-ci-gate' 308 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-prefixed-green.tsv"
 ck "the bound verdict NAMES the unpublished required check instead of reporting an unexplained 0 in flight" \
    $([ "$RC" = 11 ] && grep -q 'the ONLY thing outstanding is required check(s) not published' <<<"$OUT" && grep -q 'required and unpublished: python-ci-gate' <<<"$(verdict_of 308)" && echo 0 || echo 1)
+
+# 4014-i. THE RESOLVED CONTRACT MUST NOT REACH THE CHAIN AS AN OPERATOR OVERRIDE (review P2, #4039).
+# `REQ` is the documented override the other consumers honour, the fleet launcher EXPORTS it
+# (`multi-repo-controller.sh:145`), and in bash an assignment does not clear the export attribute — so
+# lane-merge's own `REQ` (here: the FALLBACK list, because the override below is unusable and the
+# protection read is unreadable) was inherited by the detached chain, read there as `REQ_SOURCE=env`,
+# which disarms merge-one.sh's UNKNOWN-contract refusal (:983) and lets `merge_authority` answer `gate`
+# on a rail repo. Pre-fix the chain records the fallback list here; the fix hands it nothing.
+pr_open_4014
+new_o "$T/pr4014.tsv"
+: > "$T/chain-env.txt"
+run_req 'a,b' 309 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-ok.tsv"
+sleep 1
+ck "a discarded/unreadable contract is NOT laundered into the chain's REQ (merge-one.sh's own refusal stays armed)" \
+   $([ "$(cat "$T/chain-env.txt" 2>/dev/null)" = '[]' ] && echo 0 || echo 1)
+
+# 4014-j. …AND A USABLE OVERRIDE STILL PASSES THROUGH UNCHANGED (the fix must not just blank it).
+# The controller hands a frozen contract on purpose; only the RESOLVED value is forbidden.
+# ⛔ `unit` IS GREEN IN checks-red.tsv, so with REQ=unit the required set is COMPLETE and the chain is
+# reached — the observable is the chain's own env, not a wait.
+pr_open_4014
+new_o "$T/pr4014.tsv"
+: > "$T/chain-env.txt"
+run_req 'unit' 310 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-red.tsv"
+sleep 1
+ck "…while the operator's own usable override still reaches the chain verbatim (source=env)" \
+   $([ "$(cat "$T/chain-env.txt" 2>/dev/null)" = '[unit]' ] && echo 0 || echo 1)
+
+# 4014-k. THE CONTRACT IS READ FROM THE MERGE PATH'S HOME, AND THE FILE IS NAMED IN THE LOG (review P3,
+# #4039). `merge-one.sh:170` resolves `_M1_MOD="${O_WORK:-$O}"` first, so the WORK ROOT governs and
+# this loop must read the same file or its wait-and-fix list describes a contract the merge does not
+# use; `orch-loop.sh:471` orders `$O` first, which is the cross-reader divergence the finding is about
+# — the remedy this file owes is that the choice is VISIBLE (`contract=<path>`), not silent. Two copies
+# with different sets: the run must report the WORK ROOT's, and must name that file.
+WR="$T/workroot"
+rm -rf "$WR"; mkdir -p "$WR"
+cat > "$WR/repo-authority.sh" <<'EOF'
+FALLBACK_REQ="workroot-required"
+resolve_required_checks() { REQ="workroot-required"; REQ_SOURCE=protection; return 0; }
+merge_authority() { printf 'gate\n'; }
+EOF
+pr_open_4014
+new_o "$T/pr4014.tsv"
+# The state dir's copy answers something ELSE, so the two arms cannot both be satisfied.
+printf '%s\n' 'resolve_required_checks() { REQ="statedir-required"; REQ_SOURCE=protection; return 0; }' \
+  > "$OT/repo-authority.sh"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" O_WORK="$WR" HOME="$T/home" REQ= \
+      REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 311 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-ok.tsv" 2>&1)"; RC=$?
+ck "the contract comes from \$O_WORK — the file merge-one.sh will source — not from another copy" \
+   $(grep -q 'workroot-required' <<<"$OUT" && ! grep -q 'statedir-required' <<<"$OUT" && echo 0 || echo 1)
+ck "…and the log NAMES the file it read, so a cross-reader divergence is visible instead of silent" \
+   $(grep -q "contract=$WR/repo-authority.sh" <<<"$OUT" && echo 0 || echo 1)
 
 echo
 if [ "$fail" -eq 0 ]; then

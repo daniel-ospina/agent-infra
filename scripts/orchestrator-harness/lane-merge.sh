@@ -767,12 +767,25 @@ lm_resolve_required_surface() {
   [ "${WATCH:-0}" -eq 0 ] || return 0
   [ -n "${OR:-}" ] || return 0
   _d="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || _d=""
+  # ⛔ THE CONTRACT HOME IS THE ONE THE MERGE PATH WILL SOURCE, AND `O_WORK` IS FIRST (review P3,
+  # round 3 on #4039 — the suggested reorder was CHECKED AND REFUSED, evidence below). This loop WAITS
+  # and FIXES on the names it resolves here; the merge itself is decided by `merge-one.sh`, so its home
+  # is the one that governs. `merge-one.sh:170` resolves `_M1_MOD="${O_WORK:-$O}"` and falls back to
+  # `_M1_HERE` (the directory that script lives in) — i.e. the WORK ROOT first, the script's own dir
+  # second — which is this same order. The reviewer's P3 read `merge-one.sh:149` as `$O` first, but that
+  # line is the `LANE_REPORT_GATE` source (`. "$SELF/lane-report-gate.sh"`); the repo-authority source
+  # is `:170-173`, and it prefers `O_WORK`. Reordering to `$O` first would therefore BUY exactly the
+  # cross-reader disagreement the finding is about, in the ordinary state where both copies exist and
+  # differ (a rolling deploy). `orch-loop.sh:471` does order `$O` first — that is the CONTROLLER's own
+  # copy and it is a pre-existing divergence between the two consumers, not one this file introduces;
+  # what this file owes is (a) the merge path's order and (b) NOT SILENCE, so the file it used is
+  # printed in the line below and can be compared against the controller's without reading code.
   for _c in "${O_WORK:-}" "${O:-}" "$_d"; do
     [ -n "$_c" ] || continue
     if [ -f "$_c/repo-authority.sh" ]; then _ra="$_c/repo-authority.sh"; break; fi
   done
   if [ -z "$_ra" ]; then
-    say_err "lane-merge: no repo-authority.sh beside this script or in \$O — the required-check contract cannot be read, so EVERY check on this head counts as required (fail-closed)"
+    say_err "lane-merge: no repo-authority.sh beside this script or in \$O or \${O_WORK:-} — the required-check contract cannot be read, so EVERY check on this head counts as required (fail-closed)"
     return 0
   fi
   # shellcheck source=/dev/null
@@ -796,10 +809,31 @@ lm_resolve_required_surface() {
       if [ -n "$LM_REQ" ]; then LM_REQ_TRUSTED=1; fi ;;
   esac
   if [ "$LM_REQ_TRUSTED" = 1 ]; then
-    say_err "lane-merge: required surface for $OR (source=$LM_REQ_SRC): $LM_REQ"
+    say_err "lane-merge: required surface for $OR (source=$LM_REQ_SRC, contract=$_ra): $LM_REQ"
   else
-    say_err "lane-merge: the required-check contract for $OR is UNREADABLE (source=${LM_REQ_SRC:-none}) — every check on this head is treated as required (fail-closed)"
+    say_err "lane-merge: the required-check contract for $OR is UNREADABLE (source=${LM_REQ_SRC:-none}, contract=$_ra) — every check on this head is treated as required (fail-closed)"
   fi
+  # ⛔ THE RESOLVED SET MUST NOT REACH THE CHILD AS AN OPERATOR OVERRIDE (review P2, round 3 on #4039 —
+  # reachable, not theoretical). `REQ` is the documented override variable (`repo-authority.sh:16`,
+  # `merge-one.sh:155`) and the fleet launcher EXPORTS it (`multi-repo-controller.sh:145`), and in bash
+  # an ASSIGNMENT DOES NOT CLEAR THE EXPORT ATTRIBUTE (`export FOO=bar; FOO=""; bash -c 'echo "[$FOO]"'`
+  # prints `[]`). So `REQ=""` above and the resolver's in-place `REQ="$FALLBACK_REQ"` both leave `REQ`
+  # exported, and `launch_chain` spawns the chain DETACHED with this whole environment (`nohup bash -c …`).
+  # merge-one.sh then reads OUR ANSWER as the operator's INPUT: `REQ_OVERRIDE` non-empty,
+  # `REQ_SOURCE=env`, so its UNKNOWN-contract refusal — which fires only on `fallback` with NO override
+  # (`merge-one.sh:983`) — cannot fire, and `merge_authority` answers `gate` from the fallback list (it
+  # carries `ai-review-gate`). On a RAIL repo that skips the rail and can land the change on required
+  # checks alone with no head-bound evidence: the §5.1 bypass merge-one.sh exists to prevent, reached
+  # through the parent instead of an ambient export. Hand the child what the OPERATOR supplied, never
+  # what we resolved: a usable override passes through unchanged (the controller's frozen-contract
+  # intent), and an absent/discarded one stays ABSENT so the child re-resolves — or refuses — on its own
+  # read. `REQ_OVERRIDE` is cleared for the same reason; `REQ_SOURCE` needs no handling because
+  # merge-one.sh re-resolves before it reads it.
+  case "$LM_REQ_SRC" in
+    env) REQ="${REQ_OVERRIDE:-}" ;;
+    *)   REQ="" ;;
+  esac
+  REQ_OVERRIDE=""
   return 0
 }
 lm_resolve_required_surface
