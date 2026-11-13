@@ -948,6 +948,58 @@ lane_transport_rotations() {
   n="$(printf '%s' "${n:-0}" | tr -dc '0-9')"
   printf '%s\n' "${n:-0}"
 }
+# ── DID ANYTHING LEAVE THE BOX? (agent-infra#4047) ─────────────────────────────────────────────────
+# MEASURED, and the reason this function exists: ten lanes were dispatched to deliver children of
+# #4006 and FOUR exited 0 having delivered nothing — #4009 (1 commit) and #4012 (6 commits) committed
+# and never pushed; #4011 left four files staged and never committed; #4016 produced nothing at all.
+# All four wrote the same terminal line, `outcome=done reason=agent-exit-0`, indistinguishable from
+# the six that DID deliver. `done` was therefore true of the exit and false of the lane: **a lane's
+# product is a pushed head (and the PR on it), never the agent's status.**
+#
+# ⛔ THE VOCABULARY IS NOT EXTENDED. The four words are a closed set that readers match with an
+# allow-list (`grep -L '^outcome=\(done\|refused\|failed\|died\)'`), so a fifth word would make a lane
+# read as UNREPORTED — a worse lie than the one being fixed, and the same class #2833 refused when it
+# declined a new exit code. The state rides in the REASON, which keeps `reason=agent-exit-0` as a
+# prefix, so every existing reader and every existing test arm still matches.
+#
+# ⛔ A READ THAT CANNOT ANSWER SAYS SO. If the worktree, the repo, or any origin ref cannot be read,
+# the state is `unknown` — never `delivered`. The defect being fixed is precisely that an ABSENCE of
+# evidence was reported as evidence of delivery; defaulting to the old answer here would rebuild that
+# defect inside its own fix.
+#
+# States: delivered | unpushed-<N> | uncommitted-<N> | nochange | unknown
+lane_delivery_state() {
+  local wt="${LANE_WT:-}" cur origin_ref ahead dirty
+  [ -n "$wt" ] && [ -d "$wt" ] || { printf 'unknown'; return 0; }
+  command -v git >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  cur="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  case "$cur" in ''|HEAD) printf 'unknown'; return 0 ;; esac
+  dirty="$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -dc '0-9')"
+  dirty="${dirty:-0}"
+  origin_ref="refs/remotes/origin/$cur"
+  # (1) The branch IS on origin: `ahead` is exactly the undelivered work.
+  if git -C "$wt" rev-parse --verify -q "$origin_ref" >/dev/null 2>&1; then
+    ahead="$(git -C "$wt" rev-list --count "$origin_ref..HEAD" 2>/dev/null | tr -dc '0-9')"
+    ahead="${ahead:-0}"
+    if [ "$ahead" != "0" ]; then printf 'unpushed-%s' "$ahead"; return 0; fi
+    if [ "$dirty" != "0" ]; then printf 'uncommitted-%s' "$dirty"; return 0; fi
+    printf 'delivered'; return 0
+  fi
+  # (2) No `origin/$cur` at all: nothing was pushed under this branch name — the #4009/#4012 shape.
+  #     Count what sits on top of the fetched main, because "no remote ref" alone cannot tell three
+  #     commits apart from none, and those are different reports.
+  if ! git -C "$wt" rev-parse --verify -q refs/remotes/origin/main >/dev/null 2>&1; then
+    printf 'unknown'; return 0
+  fi
+  ahead="$(git -C "$wt" rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null | tr -dc '0-9')"
+  [ -n "$ahead" ] || { printf 'unknown'; return 0; }
+  if [ "$ahead" != "0" ]; then printf 'unpushed-%s' "$ahead"; return 0; fi
+  if [ "$dirty" != "0" ]; then printf 'uncommitted-%s' "$dirty"; return 0; fi
+  # (3) Nothing beyond main and a clean tree: the agent produced NO change. That is a legitimate end
+  #     for a lane dispatched to CHECK something, and a silent no-op for one dispatched to CHANGE
+  #     something — so it is named rather than being folded into either neighbour.
+  printf 'nochange'
+}
 # The killer, read back from the run's own bound verdict file — and, when `run_agent` could not hand
 # it over (a pre-change `$O` helper under the tolerant-reference rule), from the `[lane-bound]
 # VERDICT` line `lane-bound.sh` writes into the same log. Run-scoped for the same reason the rotation
@@ -1034,7 +1086,24 @@ if [ "$AGENT_STARTED" = "0" ]; then
     *)                                    lane_outcome refused "agent-not-started:rc$rc" ;;
   esac
 elif [ "$rc" = "0" ]; then
-  lane_outcome done "agent-exit-0"
+  # ⛔ `rc=0` IS THE AGENT'S STATUS, NOT THE LANE'S PRODUCT (agent-infra#4047; MEASURED — 4 of 10 lanes
+  # exited 0 having delivered nothing, all four reading as `done`). The delivery read is what turns
+  # "the agent stopped cleanly" into "the lane delivered", and it is the difference the census needs.
+  LANE_DELIVERY="$(lane_delivery_state)"
+  case "$LANE_DELIVERY" in
+    delivered)
+      lane_outcome done "agent-exit-0" ;;
+    nochange)
+      lane_outcome done "agent-exit-0-nochange"
+      echo "[lane $N] DELIVERY: the agent exited 0 and produced NO CHANGE — no commit beyond origin/main, clean tree. If this lane was dispatched to CHANGE something it delivered nothing; if it was dispatched to CHECK something, the check itself is the product and this line is its record. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+    unpushed-*|uncommitted-*)
+      lane_outcome done "agent-exit-0-undelivered:$LANE_DELIVERY"
+      echo "[lane $N] DELIVERY: the agent exited 0 and NOTHING LEFT THE BOX (state=$LANE_DELIVERY). The work may exist in the worktree but no pushed head carries it, so the issue is not delivered and no PR can be opened from what the fleet can see. Re-dispatch rather than reading this as done. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+    *)
+      # The read could not answer. Reported as such, never as `delivered` — see the function's comment.
+      lane_outcome done "agent-exit-0-delivery-unknown"
+      echo "[lane $N] DELIVERY: state could not be determined (worktree=$LANE_WT branch=$BR) — reporting the read failure instead of assuming delivery. (agent-infra#4047)" >> "$O/logs/lane-$N.log" ;;
+  esac
 else
   # ── ATTRIBUTION (#2833): WHO ended this lane, before calling it a work failure ──────────────────
   # Order matters and is not interchangeable. A bound that ended the lane is a fact about the
