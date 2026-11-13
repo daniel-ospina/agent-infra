@@ -521,6 +521,39 @@ if (typeof stripTypeScriptTypes !== "function" ||
       cmd: "git stash drop && git push -f origin main",
       why: "round 11 CONTROL: no promotion here (raw sees the force-push), so base ALLOWED it and " +
            "so must we — P7 differs ONLY by the prefix, which is what makes the pair a discriminator" },
+    // ── review round 12 (P0): THE RESTORE REMOVED THE VERDICT'S PUSH-NESS ──
+    // The round-11 restore turns `block:force-push` into `block:stash-pop`, and
+    // EVERY delete-coordination arm keys on the verdict being a push kind — so on
+    // a THREE-segment compound whose second push is a real delete, all of them were
+    // skipped and the command landed on LEGACY_BLOCK, which is EXEMPT in a linked
+    // worktree. Base refused these via #73 and the pre-probe head ALLOWED them:
+    // a sibling worktree's checked-out branch lost its upstream, irreversibly.
+    // The fix (index.ts) runs the whole-command delete check BEFORE the restore,
+    // scoped to exactly the rows where the restore fires.
+    // ⛔ The second push's targets are NOT in `det.pushTargets` (that holds the
+    // FIRST push's refspecs — `["main"]`, `isPushDelete === false`), so the #506
+    // arm's union could not have found `held` either; only the extractor sees it.
+    { id: "P16", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push -f origin main && git push origin --delete held",
+      why: "round 12 P0: the restore must not skip #73 — base BLOCKED this via the sibling check " +
+           "and the pre-probe head ALLOWED it (measured, worktree session)" },
+    { id: "P17", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git checkout . && git -C . push -f origin main && git push origin --delete main",
+      why: "round 12 P0: the same shape whose delete target is the HUB's checked-out main" },
+    // ⚠️ DECLARED TIGHTENING, not a base-parity row: base ALLOWED the `-d` spelling
+    // of this compound because its later-segment `-d` attribution is conditional —
+    // the same residue the PR body's t-9 row records. Pinning it means nobody can
+    // "fix" the extractor's scope by weakening #73 for this spelling.
+    { id: "P18", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push -f origin main && git push origin -d held",
+      why: "round 12: the #443 `-d` spelling of the same compound — base ALLOWED it (a base gap), so " +
+           "this row is a declared TIGHTENING and reds if #73 is ever narrowed back to `--delete`" },
+    // CONTROL: same compound, target held NOWHERE — the pre-gate probe must not
+    // become a blanket refusal of every 3-segment push compound.
+    { id: "P19", dir: "wt", expect: "allow",
+      cmd: "git stash pop && git -C . push -f origin main && git push origin --delete stale",
+      why: "round 12 CONTROL: base ALLOWED this (no sibling holds `stale`), so the probe must fall " +
+           "through — P16 differs ONLY by whether a sibling holds the target" },
   ];
 
   /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
@@ -894,12 +927,32 @@ if (typeof stripTypeScriptTypes !== "function" ||
           label: "round-11 promotion gate removed (index.ts)",
           file: "index.ts",
           revert: (src) => src.replace(
-            "        if (ALLOWANCE[promotedFromVerdict] === undefined &&\n            ALLOWANCE[det.verdict] !== undefined) {\n          det.verdict = promotedFromVerdict;\n        }",
-            "        if (false) { // MUTANT: round-11 promotion gate removed\n          det.verdict = promotedFromVerdict;\n        }",
+            "      if (promoteTo !== null) det.verdict = promoteTo;",
+            "      if (false) det.verdict = promoteTo; // MUTANT: round-11 promotion gate removed",
           ),
           expectRed: ["P7", "P8", "P9", "P10", "P11", "P12"],
           redCheck: (r) => !blocked(r),
           expectGreen: ["P13", "P14", "P15", "B1"],
+        },
+        {
+          // (14) THE PRE-RESTORE DELETE CHECK REMOVED — the round-12 P0 put back.
+          // The restore still fires, so the hub half (P7–P12) stays GREEN and only
+          // the three-segment WORKTREE rows go red: that split is exactly why this
+          // needed its own mutant. The restore rewrites the verdict onto a
+          // non-push kind, every delete-coordination arm below keys on a push
+          // kind, and LEGACY_BLOCK exempts a worktree — so a sibling's branch lost
+          // its upstream while every round-11 row stayed green. P19 (no sibling
+          // holds the target) must stay ALLOW either way: it is the control that
+          // keeps this from being a blanket refusal.
+          label: "round-12 pre-restore delete check removed (index.ts)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "        const probeDeletes = wholeCommandDeleteTargets(det.verdict, localCommand);",
+            "        const probeDeletes = []; // MUTANT: round-12 pre-restore delete check removed",
+          ),
+          expectRed: ["P16", "P17", "P18"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P19", "P7", "P13"],
         },
         {
           // (13) THE FACT NEVER RECORDED — the classifier stops reporting what the

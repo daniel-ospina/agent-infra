@@ -3956,15 +3956,22 @@ export function _branchInvMutatesBranchState(args) {
  *   `allow-non-git` otherwise.
  * - promotedFrom: the pattern NAME whose verdict the always-run skimmed pass
  *   REPLACED with a higher-priority one (null when no promotion happened).
- *   #506 round 11 (P0) — this is the verdict the classifier produced BEFORE
- *   #506 part 4, i.e. the one the consumer's prior decisions were made on, and
- *   it is a FACT the consumer must not lose: `git stash drop && git -C . push -f
- *   origin main` holds `stash-pop` in the raw pass and promotes to `force-push`
- *   from the skimmed pass, and `force-push` is a kind the ownership allowance
- *   ADMITS while `stash-pop` is one it never did. So a promotion can move a
- *   compound onto a MORE admitted verdict, and the replaced verb is still an
- *   EFFECT of the command. Reported, never acted on, here: index.ts owns the
- *   admission map and decides what to do with it.
+ *   #506 round 11 (P0) — it is a FACT the consumer must not lose:
+ *   `git stash drop && git -C . push -f origin main` holds `stash-pop` in the raw
+ *   pass and promotes to `force-push` from the skimmed pass, and `force-push` is
+ *   a kind the ownership allowance ADMITS while `stash-pop` is one it never did.
+ *   So a promotion can move a compound onto a MORE admitted verdict, and the
+ *   replaced verb is still an EFFECT of the command. Reported, never acted on,
+ *   here: index.ts owns the admission map and decides what to do with it.
+ *   ⚠️ It is the raw pass's winner under the CURRENT (post-#506) array order, NOT
+ *   under the pre-#506 order — round 12 corrected that claim after measuring it.
+ *   This PR moved `push-delete` from index 8 to 13, so when a delete spelling is
+ *   present the raw winner here is `push-delete` while the pre-#506 winner was one
+ *   of its less-severe neighbours; a 4608-compound sweep found 48 such rows. So
+ *   the consumer's restore is DENY-WINS restitution, never a reproduction of the
+ *   old verdict: where base would have run the #73 delete check on a
+ *   `block:push-delete` verdict, this field alone would skip it — which is why
+ *   index.ts runs that check BEFORE it acts on this field.
  * - hasPush: true iff the command contains a PUSH INVOCATION (any verdict).
  *   #506 — index.ts's delete-target arm must run the #73 sibling check on a
  *   compound the verdict did not name a push for, but a `block:commit` verdict
@@ -4112,10 +4119,11 @@ export function classifyGitCommandDetailed(command) {
       if (patternIdx === -1 || i < patternIdx) {
         // #506 round 11 (P0): a raise that REPLACES an already-held verdict is a
         // PROMOTION, and the replaced name is retained. The FIRST replaced value
-        // is the one that matters — it is exactly the verdict the pre-#506
-        // classifier produced (the raw winner when the raw pass matched, else
-        // the first skimmed hit), so a consumer gating on it reproduces the
-        // base decision BY CONSTRUCTION rather than by re-deriving the walk.
+        // is what the pre-#506 classifier produced WHENEVER THE RAW PASS MATCHED
+        // NOTHING (there, base's verdict WAS the first skimmed hit); when the raw
+        // pass did match it is the raw winner under the CURRENT order. Those two
+        // coincide only when no delete spelling is present, because this PR moved
+        // `push-delete` to the end — see the warning in the shape doc above.
         if (patternIdx !== -1 && out.promotedFrom === null) {
           out.promotedFrom = DESTRUCTIVE_GIT_PATTERNS[patternIdx].name;
         }

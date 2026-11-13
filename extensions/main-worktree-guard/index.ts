@@ -6642,13 +6642,42 @@ export default function (pi: ExtensionAPI) {
       // verdict is the more severe one, it is not admitted, and the existing
       // LEGACY_BLOCK arm already refuses it — rewriting there would WEAKEN the
       // #506 fix.
+      // ⛔ THE RESTORE REMOVES THE VERDICT'S *PUSH-NESS*, SO THE #73 DELETE CHECK
+      // MUST RUN FIRST (round 12, P0 — measured). Every delete-coordination arm
+      // below keys on the verdict being a push kind: the #506 arm above, and the
+      // `block:push-delete` / `block:push` / `block:force-push` arms below. Once
+      // this rewrite turns `block:force-push` into `block:stash-pop`, all of them
+      // are skipped and the command lands on LEGACY_BLOCK — which is EXEMPT in a
+      // linked worktree. So a compound BASE refused via #73 became ALLOWED in a
+      // worktree, i.e. a sibling worktree's checked-out branch lost its upstream
+      // (irreversible). MEASURED, worktree session, `held` checked out in a
+      // sibling — base BLOCK via #73, pre-probe head ALLOW, for all of:
+      //   git stash pop|drop  && git -C . push -f origin main && git push origin --delete held
+      //   git checkout .      && git -C . push -f origin main && git push origin --delete held
+      //   git stash pop       && git -C . push -f origin main && git push origin --delete main
+      // The probe therefore runs ONLY where the rewrite would fire (so its blast
+      // radius is exactly those rows) and uses the WHOLE-COMMAND extractor, not
+      // the #506 arm's union: on these compounds `det.pushTargets` holds the FIRST
+      // push's refspecs (`["main"]`, `isPushDelete === false`), so that arm's
+      // attribution could not have found `held` either. Hoisting the rewrite above
+      // the #506 arm would NOT be sufficient on its own — `held` is only visible
+      // to the extractor. The check can only ADD a block: when no sibling holds a
+      // target it falls through unchanged.
+      let promoteTo = null;
       if (det.promotedFrom !== null && det.promotedFrom !== undefined) {
         const promotedFromVerdict = `block:${det.promotedFrom}`;
         if (ALLOWANCE[promotedFromVerdict] === undefined &&
-            ALLOWANCE[det.verdict] !== undefined) {
-          det.verdict = promotedFromVerdict;
+            ALLOWANCE[det.verdict] !== undefined) promoteTo = promotedFromVerdict;
+      }
+      if (promoteTo !== null &&
+          (det.verdict === "block:push" || det.verdict === "block:force-push")) {
+        const probeDeletes = wholeCommandDeleteTargets(det.verdict, localCommand);
+        if (probeDeletes.length > 0) {
+          const blocked = _coordinatedDeleteBlock(probeDeletes);
+          if (blocked) return blocked;
         }
       }
+      if (promoteTo !== null) det.verdict = promoteTo;
       // ── M2 mutation list (#605) — built BEFORE the ownership-allowance arm and
       // the push-delete arm, because BOTH used to close the whole command on one
       // segment's evidence and return (reviews F1, I1).
