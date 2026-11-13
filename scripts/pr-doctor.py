@@ -1222,6 +1222,15 @@ SPAWN_CALL_TIMEOUT_S = 120
 # lands after the row is written; `void_refused_rows()` re-reads the same durable artifact on the
 # next pass and drops such a row, so the cooldown and the class slot are not burnt for 90 minutes.
 CONFIRM_WINDOW_S = 1.0
+# ⛔ THE DISPATCHER'S PID IS NOT THE AGENT (agent-infra#4047, MEASURED). `_confirm()` used to treat a
+# live `--status` pid as "launched, running", but the process `--status` names is the BG DISPATCHER —
+# alive through preflight and uv-env, BEFORE the load gate decides. Measured on this fleet: the gate's
+# refusal lands ~35 ms after spawn on an idle box but SECONDS later at load 100+, i.e. outside
+# CONFIRM_WINDOW_S — so a spawn the gate then refused was reported `launched, running`, and the pass
+# printed `dispatched 9 of 16 queued — VERDICT=OK` over nine `rc=75`s (checked afterwards in
+# `$O/bg/*.rc`). The line that proves an AGENT started is the one lane-exec.sh / merge-one.sh write:
+# `[agent] provider=… model=…`. That is the artifact; the pid is the errand runner.
+AGENT_CONFIRM_S = 5.0
 # The box measurement is one `capacity.sh probe` (a handful of forks, measured <1 s on a quiet box)
 # and it is read ONLY on a pass the box has already refused. It is bounded because the pass runs
 # under `run_bounded`, and a probe that cannot answer must be reported as unreadable, not waited on.
@@ -4019,6 +4028,33 @@ def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
     return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S), "prfix"]
 
 
+def _agent_started(name: str) -> bool:
+    """True only when the worker's OWN log carries the agent-start line (agent-infra#4047).
+
+    `lane-exec.sh` and `merge-one.sh` append `[agent] provider=… model=…` the moment the agent is
+    actually launched, i.e. AFTER the load/capability/capacity gates have let it through. That line is
+    the launch artifact; a live dispatcher pid is not.
+
+    BOUNDED (AGENT_CONFIRM_S) and CHEAP: the line is written early, so only the first 64 KiB is read,
+    and the poll sleeps 100 ms. A worker whose log cannot be read returns False -- an unreadable
+    artifact is never evidence of a launch.
+    """
+    try:
+        log_path = bg_path(name, "log")
+    except Exception:
+        return False
+    deadline = time.monotonic() + AGENT_CONFIRM_S
+    while time.monotonic() < deadline:
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                if "[agent] provider=" in f.read(65536):
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.1)
+    return False
+
+
 def _confirm(name: str) -> tuple[str, str]:
     """('launched' | 'refused' | 'unconfirmed', detail) for a just-spawned worker -- BOUNDED.
 
@@ -4052,7 +4088,18 @@ def _confirm(name: str) -> tuple[str, str]:
     if gate_refused(name, code):
         return "refused", "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
     if st == "running":
-        return "launched", "launched, running"
+        # ⛔ A LIVE PID IS PROOF THE DISPATCHER IS ALIVE, NOT THAT AN AGENT STARTED (agent-infra#4047).
+        # Poll for the agent-start line the worker writes only once the gates have let the agent
+        # through; if it never appears and no exit status landed, this is NOT a launch and must not
+        # be counted as one. Returning `unconfirmed` costs a re-check next pass (liveness is read
+        # before every spawn), while returning `launched` corrupts the only number an operator reads.
+        if _agent_started(name):
+            return "launched", "launched, agent started"
+        code = read_rc(rc_file)
+        if gate_refused(name, code):
+            return "refused", "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
+        return "unconfirmed", ("the dispatcher pid is alive but no agent-start line appeared and no "
+                              "exit status was recorded -- NOT counted as a launch")
     if code is not None:
         return "launched", "worker exited rc=%d" % code
     if st in ("done", "failed"):
