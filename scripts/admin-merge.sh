@@ -9902,7 +9902,7 @@ main() {
         #                   §1b refuse exactly as before (fail closed).
         # The lane is classified ONCE, here, and the FIRST-CHECKS wait consumes THAT
         # decision (via ANY_WORKFLOW) instead of re-deriving it per poll.
-        local lane_dead_end=0 lane_structural=0 lane_probe_state=""
+        local lane_dead_end=0 lane_structural=0 lane_probe_state="" lane_kept_why=""
         local LANE_HEAD_RUN_STATE="unreadable"
         if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then lane_structural=1; fi
         lane_head_run_state "$head"
@@ -9954,8 +9954,13 @@ main() {
             say_err "   dead-end class: NOT-RUN — the lane declares a PR trigger this changed set does not match,"
             say_err "   and it has NO run for head $head (measured; an unreadable probe would have failed closed)."
           fi
-          say_err "   Why: the lane's own 'on:' block cannot fire for THIS PR's changed set, and"
-          say_err "   $lane_run_clause. The lane is INAPPLICABLE here, not missing."
+          # ⛔ THE CLAUSE IS NOT REPEATED HERE (review P2). It is already the payload of the
+          # class lines above — the STRUCTURAL arm ends on it and the NOT-RUN arm states the
+          # same measurement in its own words — so printing it a second time only padded the
+          # 65-minute-burn diagnostic this PR exists to make readable. The `Why:` line is the
+          # one-line summary; the measurement belongs to the class line, once.
+          say_err "   Why: the lane's own 'on:' block cannot fire for THIS PR's changed set."
+          say_err "   The lane is INAPPLICABLE here, not missing."
           if [ -n "$WF_PR_CHANGED_PATHS" ]; then
             say_err "   changed file(s) consulted ($(printf '%s' "$WF_PR_CHANGED_PATHS" | grep -c '[^[:space:]]') total):"
             printf '%s\n' "$WF_PR_CHANGED_PATHS" | sed -n '1,10p' | sed 's/^/      /' >&2
@@ -9985,6 +9990,25 @@ main() {
           # terminal. ⛔ The wording must not contain the sequence "LANE INAPPLICABLE":
           # that string means "the lane was DROPPED" to a reader and to arm (e).
           info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: its 'on:' block declares no pull_request trigger, but the lane HAS a run for this head, so the filtered wait can clear and widening would drop an evidenced lane (#1614 dead-end gate, not a #2465 dead end)."
+        elif [ "$lane_probe_state" != has-run ]; then
+          # ── THE FAIL-CLOSED PATH, SAID OUT LOUD (review P2) ───────────────────
+          # This is the ONLY path that keeps the lane filter on a probe answer that is not
+          # a measured run and still lets the bounded FIRST-CHECKS wait apply in full — so
+          # it is the one remaining place #2465's symptom (a 65-minute wait that blames CI
+          # and never names the classification) is still reachable. §0b de-silenced the
+          # `unknown` arm for exactly this reason and left its sibling quiet.
+          # ⛔ It must stay FAIL-CLOSED: this class CAN start a run while the wait runs, so
+          # an unread answer is not an exemption (#1614 / §1b). Only the MESSAGE is added.
+          # ⛔ The wording must NOT contain the sequence "LANE INAPPLICABLE": that string
+          # means "the lane was DROPPED" to a reader and to `tests/admin-merge/run.sh`
+          # arm (e). This branch drops nothing — the filter is kept.
+          case "$lane_probe_state" in
+            unreadable)
+              lane_kept_why="its single 'gh run list' read FAILED for head $head, so no run can be CLAIMED either way" ;;
+            *)
+              lane_kept_why="the run probe's answer for head $head did not resolve ('$lane_probe_state')" ;;
+          esac
+          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: it declares a PR trigger this changed set does not match, and $lane_kept_why. This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears. Pass --any-workflow to compare against every workflow instead."
         fi
         ;;
       unknown)

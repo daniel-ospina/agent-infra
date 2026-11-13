@@ -2047,6 +2047,23 @@ do_land() {
   if [ "$NO_WAIT" -eq 1 ] && [ -z "${ADMIN_MERGE_FIRST_CHECKS_WAIT:-}" ]; then
     land_env+=("ADMIN_MERGE_FIRST_CHECKS_WAIT=0")
     log_line "atomic-land:     --no-wait carried to the rail: ADMIN_MERGE_FIRST_CHECKS_WAIT=0 (its FIRST-CHECKS wait takes ONE observation and refuses by name, instead of waiting up to 3900s on a head you declined to wait for)"
+    # ⛔ THE RAIL'S 0 SEAM IS CONDITIONAL — CARRYING THE WINDOW ALONE IS NOT ENOUGH
+    # (review P2). `admin-merge.sh` takes the "one observation" path only when the
+    # legacy window is 0 AND NEITHER progress bound is set:
+    #     if [ "$((10#$FIRST_CHECKS_WAIT))" -eq 0 ] \
+    #        && [ -z "${ADMIN_MERGE_FIRST_CHECKS_STALL:-}" ] \
+    #        && [ -z "${ADMIN_MERGE_FIRST_CHECKS_CEILING:-}" ]; then wait_enabled=0; fi
+    # so an INHERITED STALL/CEILING leaves the wait ENABLED and bounds it there instead
+    # (defaults 8760 s / 18064 s) — a caller who explicitly declined to wait would still
+    # wait, under a log line promising the opposite. That is #2465's own defect one layer
+    # down. Clear both for THIS invocation and SAY SO, so the flag means what it says.
+    # ⛔ Only when neither was set explicitly? No: `--no-wait` is the more specific,
+    # per-invocation instruction, and a bound that re-enables the wait defeats it. The
+    # clearing is never silent, which is what makes it reviewable.
+    if [ -n "${ADMIN_MERGE_FIRST_CHECKS_STALL:-}" ] || [ -n "${ADMIN_MERGE_FIRST_CHECKS_CEILING:-}" ]; then
+      land_env+=("ADMIN_MERGE_FIRST_CHECKS_STALL=" "ADMIN_MERGE_FIRST_CHECKS_CEILING=")
+      log_line "atomic-land:     --no-wait also CLEARED an inherited ADMIN_MERGE_FIRST_CHECKS_STALL/CEILING: the rail's 0 seam only means 'one observation' when neither progress bound is set, so leaving either in place would have bounded the wait there instead (up to 8760s/18064s) on a head you declined to wait for"
+    fi
   fi
   env ${land_env[@]+"${land_env[@]}"} bash "$ADMIN_MERGE" "$PR" ${repo_args[@]+"${repo_args[@]}"} ${flags[@]+"${flags[@]}"}
   return $?
