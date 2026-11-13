@@ -195,7 +195,11 @@ iso_epoch() { # iso_epoch <2026-11-12T05:05:55Z> → seconds since epoch, or EMP
     *Z) : ;;
     *) return 1 ;;
   esac
-  date -u -d "$t" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$t" +%s 2>/dev/null || printf ''
+  # The BSD arm is `date -j -f`, which the detector's mechanism table has no row for (it knows `date -r`
+  # as BSD's mechanism, and `-j` is two known mechanisms only when the second one is `-r`/`-d`), so this
+  # PAIR never reaches the "two mechanisms ⇒ guarded" carve-out. Declared rather than baselined: the
+  # suppression sits on the line it describes, so it cannot outlive the code it excuses (F1, PR #4043).
+  date -u -d "$t" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$t" +%s 2>/dev/null || printf ''  # portability-ok: GNU `date -d` and BSD `date -j -f` in one `||` chain — portable as written; the detector has no `date -j` mechanism row, so the guarded-pair carve-out cannot see it (a baseline row would instead be deletable without touching this code)
 }
 
 file_mtime() { # file_mtime <path> → ISO-8601 UTC, or EMPTY (GNU stat, then BSD stat)
