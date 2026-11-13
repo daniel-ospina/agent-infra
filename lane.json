@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/Users/danielospina/orchestrator/bg/prd-daniel-ospina-agent-infra-3892.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/2465-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "720c1075a32318898f7e146ae8377d7e67f46bf6"
+    },
+    {
+      "kind": "worktree",
+      "value": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/prd-3892"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 357,
+  "ended_at": 1794585277,
+  "exit_code": 76,
+  "heartbeat_at": 1794585277,
+  "host": "192",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "192.kprfix-prd-daniel-ospina-agent-infra-3892-1794584920-p67462-43b9f650",
+  "lease_until": 1794593077,
+  "pid": 67462,
+  "reason": "agent-never-started:rc=76",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794584920,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-agent-infra-3892",
+  "worktree": "/Users/danielospina/Documents/GitHub/agent-infra/.worktrees/prd-3892"
+}
