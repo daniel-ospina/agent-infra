@@ -99,10 +99,11 @@ esac
 # duplicate dispatch this file exists to prevent happens anyway. The arithmetic, from the shipped
 # defaults (orch-loop.sh's LANE_TIMEOUT is orch-loop.sh's own variable and is NOT readable here):
 #
-#   lane (LANE_BACKSTOP_S)        7200s   (~2 h — spawn-gate.sh's ABSOLUTE BACKSTOP; the lane's
+#   lane (LANE_BACKSTOP_S)       36000s   (10 h — spawn-gate.sh's ABSOLUTE BACKSTOP; the lane's
 #                                            PRIMARY bound is lane-bound.sh's 2700 s progress
 #                                            allowance. This term was 3300s until agent-infra#2888
-#                                            demoted the wall clock to a backstop)
+#                                            demoted the wall clock to a backstop, 7200s until
+#                                            agent-infra#4034 raised it 5x)
 #   chain-merge.sh waits for the PR 5400s  (90 x 60s) — it exits AT ONCE when the lane recorded a
 #                                           capacity refusal, releasing this claim within a poll
 #                                           interval (agent-infra#1909), so the ceiling below is a
@@ -113,13 +114,19 @@ esac
 #                                           1200, and the `REVIEW_TIMEOUT + 1200` form that stood
 #                                           here was right only at that default)
 #                                 ------  =======
-#                                 17490s  -> 18000s (5 h)
+#                                 46290s  -> 48000s (13 h 20 m)
 #
 #   ⛔ THIS SUM IS THE DEFAULT-GATE-WAIT SUM, AND THE ROW ABOVE IS WHY IT IS STATED AS A FORMULA.
-#   `_gw` is `GATE_POLL_TRIES x GATE_POLL_SECS` clamped to [900, 86400] (merge-one.sh), so on a box
-#   running `GATE_POLL_SECS=60` the merge term is 3900 s and this sum is 18390 s — OVER the 18000 s
-#   default below. Nothing here raises that default (it is a behaviour change, not a prose fix); the
-#   arithmetic is written out so the operator who raises the gate wait sees which default it crosses.
+#   `_gw` is `GATE_POLL_TRIES x GATE_POLL_SECS` clamped to [900, 86400] (merge-one.sh), so the sum is
+#   `45390 + _gw` and the merge-one term at a NON-default gate wait is `1800 + _gw + 300`.
+#   ⛔ THE ARITHMETIC IS RE-DONE HERE BECAUSE THE PREVIOUS SENTENCE GOT IT WRONG: it said "on a box
+#   running `GATE_POLL_SECS=60` the merge term is 3900 s and this sum is 18390 s", substituting the
+#   gate wait for the WHOLE merge term and losing the 1800 + 300 either side of it. At `_gw` = 3900 the
+#   merge term is 6000 s and the sum is 49290 s — OVER the 48000 s default below by 1290 s, exactly as
+#   it was OVER the old 18000 s default by 2490 s. ⚠️ THAT RESIDUAL IS PRE-EXISTING AND IS NOT CLOSED
+#   HERE: the shipped default gate wait (`_gw` = 900) gives 46290 s, which 48000 s covers with 810 s to
+#   spare, and an operator who RAISES the gate wait must raise this default with it (`CLAIM_ISSUE_TTL`
+#   is the override). At the defaults the margin is 810 s.
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
@@ -130,27 +137,35 @@ esac
 # same commit; any future change to one of the four must do the same, or override CLAIM_ISSUE_TTL
 # (env, or the cell's keys.env). ⛔ #2888 RAISED THE FIRST TERM (3300 -> 7200) and this default moved
 # with it in the same commit (14400 -> 18000) — the review caught it moving WITHOUT the default, which
-# is exactly the mid-flight expiry this paragraph predicts.
+# is exactly the mid-flight expiry this paragraph predicts. ⛔ AND agent-infra#4034 RAISED IT AGAIN
+# (7200 -> 36000) with this default moving in the same commit (18000 -> 48000): a 10 h lane behind a 5 h
+# issue claim would let a peer reclaim the issue FIVE HOURS before the lane's own bound, which is the
+# duplicate dispatch above. The test that enforces it is `claim-orphan.test.sh` O7, which re-derives
+# this sum from spawn-gate.sh and reds if the two part company.
 # The same digit clamp as CLAIM_TTL: an unparseable lease is worse than the default (see above).
-CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-18000}"
+CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-48000}"
 case "${CLAIM_ISSUE_TTL:-}" in
-  ''|*[!0123456789]*|0*) CLAIM_ISSUE_TTL=18000 ;;
-  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=18000 ;;
+  ''|*[!0123456789]*|0*) CLAIM_ISSUE_TTL=48000 ;;
+  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=48000 ;;
 esac
 
 # ── THE BRANCH CLAIM'S LEASE (agent-infra#3328) ─────────────────────────────────────────────
 # ⛔ THE CEILING IS THIS KEY'S OWN TERM (14400), AND `CLAIM_TTL_MAX` DOES NOT APPLY TO IT.
 # `claim_branch_acquire` passes `CLAIM_BRANCH_TTL` as BOTH the default and the ceiling (its 3rd and 4th
 # args to `_claim_acquire_at`), so a caller cannot mint a longer term while a batch legitimately
-# outlives the PR/merge ceiling: 14400 is ABOVE `CLAIM_TTL_MAX`'s 9600 default, deliberately, and a
-# clamp to `CLAIM_TTL_MAX` would expire a live batch mid-flight.
+# outlives the PR/merge ceiling: the batch's ceiling is its OWN term, not `CLAIM_TTL_MAX`, so a clamp
+# to the PR/merge ceiling cannot expire a live batch mid-flight. (When this block was written 14400 sat
+# ABOVE `CLAIM_TTL_MAX`'s 9600 default, so the separation was visible as a number; agent-infra#4034 has
+# since raised `CLAIM_TTL_MAX` to 43200, above this term, so the ordering no longer demonstrates
+# anything — the separation is STRUCTURAL, which is the stronger statement and the one the tests pin.)
 # A BATCH BRANCH is held for the whole batch, which is longer than any single lane: the owner takes
 # it before the first lane pushes and releases it after the last one lands. Its term is therefore its
 # own, not the PR claim's 1800s — a batch claim that expires MID-BATCH lets a peer reclaim it and
 # push, which is the exact loss this key exists to prevent. Raising the env var raises the default and
 # the ceiling together, so the term stays a single knob and never splits into "longer than its own
 # clamp". *(This block is the one #3328 comment that contradicted ITSELF: it said "not CLAIM_TTL_MAX"
-# and then "capped by CLAIM_TTL_MAX", and it cited CLAIM_TTL_MAX as 7200 when the value is 9600. The
+# and then "capped by CLAIM_TTL_MAX", and it cited CLAIM_TTL_MAX as 7200 when the value was 9600 at the
+# time (43200 since agent-infra#4034). The
 # assertions that pin the real behaviour are `branch-claim.test.sh` case 10.)*
 # ⛔ THE HOLDER RELEASES ON COMPLETION, so the full term is only ever spent by a box that died.
 CLAIM_BRANCH_TTL="${CLAIM_BRANCH_TTL:-14400}"
@@ -165,8 +180,11 @@ esac
 # the review+merge the claim is taken for:
 #     merge-one.sh   CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + _gw + 300 ))  -> 3000s at the defaults
 #                    (`_gw` is the gate wait, 900 s at the defaults — NOT a constant 1200)
-#     fix-one.sh     FIX_LEASE=$(( ${FIX_TIMEOUT:-$LANE_BACKSTOP_S} + 1200 )) -> 8400s
-#                    (3600s before agent-infra#2888: the fixer ran 2400 s, now the 7200 s backstop)
+#     fix-one.sh     FIX_LEASE=$(( ${FIX_TIMEOUT:-$LANE_BACKSTOP_S} + 1200 )) -> 37200s
+#                    (3600s before agent-infra#2888: the fixer ran 2400 s; 8400s at the 7200 s backstop
+#                    #2888 landed; 37200s at agent-infra#4034's 36000 s one. THIS is the number the
+#                    ceiling below must clear, and it is the reason #4034 had to move the ceiling in
+#                    the same commit as the bound.)
 # So a clamp at 1800 would expire a claim MID-MERGE and hand the same head to a peer — the duplicate
 # work this registry exists to prevent. But before this bound there was no ceiling at ALL: the only
 # check was "at most 9 digits", so a caller could mint `lease_until = now + 999999999` (31 years) —
@@ -174,18 +192,22 @@ esac
 # ⚠️ THE CEILING IS COUPLED TO THOSE TWO CALLERS, exactly as CLAIM_ISSUE_TTL is coupled to LANE_TIMEOUT.
 # A caller's lease is `timeout + 1200` (`FIX_LEASE`, fix-one) or `timeout + _gw + 300` (`CLAIM_LEASE`,
 # merge-one — `_gw` is the gate wait, 900 s at the defaults, so that lease is 3000 s and the clamp
-# threshold is `CLAIM_TTL_MAX - (_gw + 300)` = 8400 s), so raising either timeout past
-# `CLAIM_TTL_MAX - 1200` (the fixer) or `CLAIM_TTL_MAX - (_gw + 300)` (the reviewer) makes
+# threshold is `CLAIM_TTL_MAX - (_gw + 300)` = 42000 s at the defaults), so raising either timeout past
+# `CLAIM_TTL_MAX - 1200` (the fixer, 42000 s) or `CLAIM_TTL_MAX - (_gw + 300)` (the reviewer) makes
 # `_claim_acquire_at` CLAMP the lease below what the worker asked for, spending the post-review
 # headroom — and above `CLAIM_TTL_MAX` itself the claim expires under a worker that is still running,
 # which is the mid-review expiry this block exists to prevent. So raise CLAIM_TTL_MAX at the same
 # time. The clamp is not silent: it reports itself on stderr. ⛔ The single `- 1200` form that used to
 # stand here was right only for the fixer and only at the default gate wait.
+# ⛔ #4034 MOVED THIS CEILING FOR THE DERIVED REASON, NOT TO MAKE THE NUMBER LOOK ROUND: the fixer's
+# lease became 37200 s when the backstop went to 36000 s, so a 9600 s ceiling would have CLAMPED it to
+# 9600 — a claim expiring 7 h 40 m under a worker still inside its own bound, which is the
+# second-worker-on-the-same-head hazard of #2888, reached by omission rather than by override.
 # Same digit clamp as the two TTLs above: an unparseable ceiling is worse than the default.
-CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-9600}"   # 2 h 40 m — above fix-one's 8400s lease, the longest shipped one
+CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-43200}"   # 12 h — above fix-one's 37200s lease, the longest shipped one
 case "${CLAIM_TTL_MAX:-}" in
-  ''|*[!0123456789]*|0*) CLAIM_TTL_MAX=9600 ;;
-  *) [ "${#CLAIM_TTL_MAX}" -le 9 ] || CLAIM_TTL_MAX=9600 ;;
+  ''|*[!0123456789]*|0*) CLAIM_TTL_MAX=43200 ;;
+  *) [ "${#CLAIM_TTL_MAX}" -le 9 ] || CLAIM_TTL_MAX=43200 ;;
 esac
 [ "$CLAIM_TTL_MAX" -ge "$CLAIM_TTL" ] || CLAIM_TTL_MAX="$CLAIM_TTL"
 
@@ -202,8 +224,11 @@ esac
 #
 # The bound is on the claim COMMIT's own committer time — NOT on the lease (the very datum that
 # cannot be read) and NOT on a ref mtime (`claim_prune` already says why for its temp-ref arm: an
-# mtime is when THIS checkout last touched the ref). 18000 = `CLAIM_ISSUE_TTL`, the LONGEST lease any
-# shipped caller mints (see the arithmetic above), so a claim whose commit is older than this has
+# mtime is when THIS checkout last touched the ref). 48000 = `CLAIM_ISSUE_TTL`, the LONGEST lease any
+# shipped caller mints (see the arithmetic above; it was 18000 = the `CLAIM_ISSUE_TTL` of the day until
+# agent-infra#4034 raised the lane term 5x — this literal must follow the longest term or it reaps a
+# claim inside its own lease, which is the scheduled steal the FLOOR below refuses anyway), so a claim
+# whose commit is older than this has
 # outlived every term it could possibly have carried.
 # ⛔ IT IS A BOUND ON WAITING, NOT A LICENCE TO STEAL. Only `claim_prune` acts on it, and only by
 # DELETING a ref on an output line that names the fault; every READER keeps answering ABSTENTION, so
@@ -212,10 +237,10 @@ esac
 # ⛔ AND AN UNMEASURABLE AGE IS NOT EVIDENCE OF EXPIRY: no committer line, an unparseable stamp, or a
 # stamp AHEAD of this box's clock keeps the claim and NAMES it on every pass. That is the honest
 # floor: the operator sees the class instead of having it guessed away.
-CLAIM_UNREADABLE_LEASE_MAX_AGE="${CLAIM_UNREADABLE_LEASE_MAX_AGE:-18000}"
+CLAIM_UNREADABLE_LEASE_MAX_AGE="${CLAIM_UNREADABLE_LEASE_MAX_AGE:-48000}"
 case "${CLAIM_UNREADABLE_LEASE_MAX_AGE:-}" in
-  ''|*[!0123456789]*|0*) CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;
-  *) [ "${#CLAIM_UNREADABLE_LEASE_MAX_AGE}" -le 9 ] || CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;
+  ''|*[!0123456789]*|0*) CLAIM_UNREADABLE_LEASE_MAX_AGE=48000 ;;
+  *) [ "${#CLAIM_UNREADABLE_LEASE_MAX_AGE}" -le 9 ] || CLAIM_UNREADABLE_LEASE_MAX_AGE=48000 ;;
 esac
 # ⛔ AND A FLOOR, OR THE BOUND IS A SCHEDULED STEAL (review round 19, agent-infra#3203). The ceiling
 # below stops a ~31-year bound from re-creating the eternal block; WITHOUT a floor the same knob does
@@ -230,7 +255,7 @@ esac
 # (PR/fix leases) are each first-class overrides with their own digit clamps above, and either can be
 # raised PAST `CLAIM_ISSUE_TTL` — measured, `CLAIM_BRANCH_TTL=40000` mints `lease_until = now + 40000`
 # (a `until - now` delta reads 39996 only because it is taken seconds after the mint; the mint site is
-# `_claim_acquire_at`'s `until=$(( now + ttl ))`), while a floor nailed to 18000 would reap that live
+# `_claim_acquire_at`'s `until=$(( now + ttl ))`), while a floor nailed to 18000 (the old default) would reap that live
 # branch claim ~22 000 s inside its own term,
 # re-creating exactly the bug this block closes, one knob over. So the FLOOR TERM is the max of all
 # three, computed once into an internal (`_claim_`-prefixed like the helpers, never a knob): the ceiling
@@ -621,8 +646,8 @@ claim_former_hosts() { # -> space-separated host names this box has used, EXCLUD
 #      rename leaves every peer's roster stale in exactly that way, so abstaining is what keeps a
 #      rename from turning into a fleet-wide STEAL (under-reap: the lease still bounds it).
 # ⛔ PID REUSE IS AN UNDER-REAP, ON PURPOSE: a recycled pid reads alive and the claim simply runs to
-# its lease (bounded by THAT KEYING'S OWN ceiling — CLAIM_TTL_MAX for the per-head/PR keys, 9600;
-# CLAIM_ISSUE_TTL for issue keys, 18000; CLAIM_BRANCH_TTL for branch keys, 14400). Naming only the
+# its lease (bounded by THAT KEYING'S OWN ceiling — CLAIM_TTL_MAX for the per-head/PR keys, 43200;
+# CLAIM_ISSUE_TTL for issue keys, 48000; CLAIM_BRANCH_TTL for branch keys, 14400). Naming only the
 # first two was wrong for branch keys, whose ceiling is neither. The opposite polarity steals live work.
 # ⛔ `ps -p` NOT `kill -0`: `kill -0` reports EPERM for a LIVE pid owned by another user, i.e. it
 # reads a running lane as dead and reclaims its claim.
@@ -1464,7 +1489,7 @@ _claim_acquire_at() {
     # ⛔ THE MESSAGE NAMES NO SINGLE KNOB AS THE CEILING, BECAUSE `max` IS NOT ALWAYS ONE (review
     # round 2, P2; the headline was over-stated until round 5). It used to read
     # "(CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = %ss)" — and for a BRANCH key `max` is CLAIM_BRANCH_TTL
-    # (14400), which is neither of those two variables (9600 / 18000). Measured on the real code, a
+    # (14400), which is neither of those two variables (43200 / 48000). Measured on the real code, a
     # branch-key clamp printed "CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = 14400s", sending a fixer to raise a
     # knob that is not the ceiling. The number was right and the two names were wrong — the same
     # misdirection this block's own prose correction exists to remove. What the message now does: it

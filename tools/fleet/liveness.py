@@ -326,13 +326,14 @@ LOG_WINDOW_MS = 30_000
 # and this is NOT "the same question" (§13.3). The duration is taken because the
 # fleet already declared that allowance — not because the two agree.
 # ⛔ IT IS **NOT** ``LANE_REAP_LIVE_MIN``, and an earlier revision of this comment
-# said it was. That constant is 125 min since agent-infra#2888, because it is an
+# said it was. That constant is 601 min since agent-infra#4034 (125 min since
+# #2888), because it is an
 # MTIME-ONLY window and must sit ABOVE the wall backstop so a live lane inside one
 # silent tool call does not read as dead. This axis is decided on CPU as well, so
 # its analogue is the PROGRESS bound, not the mtime window; re-pointing this at
-# 125 min would make ``frozen`` unreachable on exactly the wedge class it names.
+# that window would make ``frozen`` unreachable on exactly the wedge class it names.
 # ⛔ AND IT SITS BELOW THE WALL ON PURPOSE. ``lane-bound.sh``'s ``--wall``
-# (``LANE_BACKSTOP_S`` = 7200 s) is a BACKSTOP; since #2888 the PROGRESS bound is
+# (``LANE_BACKSTOP_S`` = 36000 s since agent-infra#4034; 7200 s before it) is a BACKSTOP; since #2888 the PROGRESS bound is
 # primary, so it must fire FIRST — otherwise the wall pre-empts it and a lane that
 # is still working is killed by elapsed time, which is the measured defect #2888
 # fixes. An earlier revision called this ordering a defect and cited stale

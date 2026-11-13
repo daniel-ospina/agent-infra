@@ -247,12 +247,15 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # whole clock. A re-run is still permitted and still cheap (one PR read) — the bound is a runaway guard,
 # never a reason to call a head green.
 #
-# HONEST RESIDUAL, stated because it is not fixed here, and ARITHMETIC rather than taste: keeping the
-# shipped 7 supervision chunks costs `IMPL_RESERVE_S + 7*POLL_S = 900 + 840 = 1740 s`, so the largest wait
-# this clock can carry is `7200 - 1740 = 5460 s`. The measured LANE-VISIBLE p90 (9825 s) and p95 (17185 s)
-# are FAR above that ceiling (as is the run-duration p95 5612 s), so NO value of `WAIT_S` that fits this
-# lane's clock can cover the tail — the 29 runs that exceeded 7200 s on the lane-visible clock could not
-# have been waited out by ANY setting of this constant, and raising `WAIT_S` past 5460 s would only eat the
+# HONEST RESIDUAL, stated because it is not fixed here, and ARITHMETIC rather than taste: the design
+# allowance derived below costs `IMPL_RESERVE_S + MAX_WATCH x POLL_S` — at the shipped defaults
+# `900 + 247 x 120 = 30540 s` on the 36000 s clock agent-infra#4034 set — so the largest check wait this
+# clock can carry is `36000 - 30540 = 5460 s`. ⛔ THAT CEILING IS UNCHANGED BY THE 5x, and the reason is
+# the derivation itself: `MAX_WATCH` is what the wait LEAVES, so a bigger clock buys supervision chunks,
+# not wait. The measured LANE-VISIBLE p90 (9825 s) and p95 (17185 s) are FAR above 5460 s (as is the
+# run-duration p95 5612 s), so NO value of `WAIT_S` that fits this lane's clock can cover the tail — the
+# 29 runs that exceeded the OLD 7200 s clock could not have been waited out by ANY setting of this
+# constant, and raising `WAIT_S` past 5460 s would only eat the
 # supervision it hands off to. Raising the ceiling is the remedy, and it is not this constant's to make:
 # raise `LANE_BACKSTOP_S`, which raises the derived supervision budget with it (see below). The tail case
 # hands off as `WAITING_CHECKS` (exit 11) and the
@@ -283,21 +286,28 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # measured 5400s (#3584) — the old row read `3300 - 1500 - 900 = 900s / 120s = 7 chunks`, and an
 # arithmetic row that is not recomputed with its operand is the same stale-measurement defect one layer
 # down:
-#     7200 - 5400 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
-# i.e. the merge phase is bounded at 6240s of the 7200s clock, and a lane that implements within its
-# reserve reaches BOTH bounds. A cycle that needs longer is not a lane failure: it hands off as
+#     36000 - 5400 (check wait) - 900 (implementation reserve) = 29700s / 120s = 247 chunks (29640s)
+# i.e. the merge phase is bounded at 35940s of the 36000s clock (60 s of slack), and a lane that
+# implements within its reserve reaches BOTH bounds. The 36000 s is agent-infra#4034's 5x raise of the
+# backstop, and the ROW is recomputed with it because a row that is not recomputed with its operand is
+# the same stale-measurement defect one layer down. The row is a DESIGN ceiling, not a plan: a real
+# lane's `--watch` sequence is clamped at runtime to the watchdog's 2700 s allowance (≈22 chunks) and to
+# the clock it has LEFT, both of which bind first.
+# A cycle that needs longer is not a lane failure: it hands off as
 # WAITING_* (exit 11) and the next invocation resumes the SAME counter.
 # ⛔ AND THE CLOCK ITSELF IS THE LANE'S, READ FROM THE SAME SEAM (#2888 review, P2/P3 — verified). It
-# said `${LANE_TIMEOUT:-3300}` while `lane.sh` hands the lane `${LANE_TIMEOUT:-$LANE_BACKSTOP_S}` = 7200 s
+# said `${LANE_TIMEOUT:-3300}` while `lane.sh` hands the lane `${LANE_TIMEOUT:-$LANE_BACKSTOP_S}` = 36000 s
 # — and `lane.sh` does not export `LANE_TIMEOUT`, so the merge phase permanently spent ~45% of the clock
 # the lane now owns. That is the opposite of what the paragraph above claims ("DERIVED from the lane's own
 # wall clock"). `LANE_BACKSTOP_S` IS exported by spawn-gate.sh, so this child reads the lane's real bound:
-#     7200 - 5400 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks
+#     36000 - 5400 (check wait) - 900 (implementation reserve) = 29700s / 120s = 247 chunks
 # ⛔ AND THAT IS THE COST OF SIZING THE WAIT HONESTLY, SAID OUT LOUD: at the measured 5400s check wait the
-# supervision allowance is 7 chunks, not 40 — the same 7 the 3300s clock used to afford at a 1500s wait.
+# supervision allowance was 7 chunks on the 7200 s clock (#3584) and is 247 on agent-infra#4034's
+# 36000 s one — the same 7 the 3300s clock used to afford at a 1500s wait at the time.
 # The trade is deliberate. 40 chunks of supervision over a check wait that can never be satisfied is
 # supervision of a phase that never starts; 7 chunks over a wait that reaches the merge phase is
-# supervision that actually runs. Raising LANE_BACKSTOP_S buys more chunks without touching this bound.
+# supervision that actually runs. Raising LANE_BACKSTOP_S buys more chunks without touching this bound —
+# which is exactly what #4034 did, and why this number moved while the wait did not.
 # ⛔ AND THE COST IS A MEASURED FALSE-BLOCK TAIL, NOT A HYPOTHETICAL (review, P3 — verified against this
 # box's `state/walltime.tsv`). The 840 s is CUMULATIVE per PR (`state/lanemerge-<pr>.watch`), and the chain
 # it now supervises dispatches a fresh reviewer under `REVIEW_TIMEOUT=1800`. Measured over n=54 reviewer
@@ -342,7 +352,7 @@ case "${LANE_BOUND_WALL_S:-}" in
   ''|*[!0-9]*) : ;;
   *) LANE_BOUND_WALL_S="${LANE_BOUND_WALL_S#"${LANE_BOUND_WALL_S%%[!0]*}"}"; LANE_BOUND_WALL_S="${LANE_BOUND_WALL_S:-0}" ;;
 esac
-LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
+LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-36000}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=36000
 # ⛔ THE NUMBER NOW HAS THREE POSSIBLE SOURCES, SO IT CARRIES THE ONE IT GOT (P3, verified by running the
 # message): `LANE_WALL_S` is no longer necessarily `LANE_TIMEOUT`. An operator who set only
 # `LANE_BOUND_WALL_S` was told "LANE_MERGE_MAX_WATCH exceeds what LANE_TIMEOUT=3600s affords" — naming a
@@ -502,10 +512,10 @@ MAX_WATCH_FIT=$(( (LANE_WALL_CALLER_S - WAIT_S_DESIGN - IMPL_RESERVE_S) / _fit_p
 [ "$MAX_WATCH_FIT" -ge 1 ] || MAX_WATCH_FIT=1          # a tiny LANE_TIMEOUT still supervises once
 # ⛔ THE CLAMP ABOVE IS A FLOOR, AND A FLOOR CAN MASK AN OVERSPENT CLOCK (review cycle 3, P3 — verified, not
 # fixed here so the diff stays to its own defect). If an ENV override makes `LANE_WALL_S - WAIT_S -
-# IMPL_RESERVE_S` zero or negative — `LANE_MERGE_WAIT=6300` gives `(7200-6300-900)/120 = 0` — the clamp
-# hands back 1 chunk and the merge phase becomes `6300 + 120 + 900 = 7320 > 7200`: the lane's own wall clock
+# IMPL_RESERVE_S` zero or negative — `LANE_MERGE_WAIT=35100` gives `(36000-35100-900)/120 = 0` — the clamp
+# hands back 1 chunk and the merge phase becomes `35100 + 120 + 900 = 36120 > 36000`: the lane's own wall clock
 # kills it mid-supervision, which is the #2888 shape the three-term invariant exists to prevent. The SHIPPED
-# default is safe (7140 of 7200, 60 s of slack) and the suite's arithmetic arm pins it, which is why this is
+# default is safe (35940 of 36000, 60 s of slack) and the suite's arithmetic arm pins it, which is why this is
 # a regression-guard question and not a live defect. ⛔ AND THE SAFETY NET IS NARROWER THAN IT LOOKS (review
 # cycle 5, P2 — verified by running this block under each override): the suite's arm catches a DEFAULT change,
 # and the ONLY override that warns is `LANE_MERGE_MAX_WATCH` (below). An env override of `LANE_MERGE_WAIT`,
@@ -515,9 +525,13 @@ MAX_WATCH_FIT=$(( (LANE_WALL_CALLER_S - WAIT_S_DESIGN - IMPL_RESERVE_S) / _fit_p
 # tell them. The honest fix, when someone owns it, is a `say_err` in this branch.
 MAX_WATCH="$MAX_WATCH_FIT"
 # ⛔ THE `--watch` LAYER NEEDS NO HEARTBEAT, and that is a measured statement rather than an omission: with
-# the DESIGN operand it is bounded by `MAX_WATCH x POLL` (7 x 120 = 840 s at the shipped defaults, and
-# 840 < the 2700 s progress allowance), so it reaches its own verdict before the watchdog can fire. Only the
-# check wait above can outlive the watchdog, which is why only the check wait is capped/hearted.
+# the DESIGN operand it is bounded by `MAX_WATCH x POLL` — 247 x 120 = 29640 s at the shipped defaults on
+# agent-infra#4034's 36000 s clock, which is far ABOVE the 2700 s progress allowance, so the guarantee is
+# NOT the design operand's: it is the `_idle_fit` clamp below, which takes the watchdog's allowance
+# (≈22 chunks) whenever that is the smaller bound, and it applies on EVERY path including the
+# unresolvable-clock one. Before #4034 raised the clock the design operand (7 x 120 = 840 s) fitted under
+# the allowance by itself; it no longer does, so that runtime clamp is the whole of the guarantee now.
+# Only the check wait above can outlive the watchdog, which is why only the check wait is capped/hearted.
 # ⛔ AND THE ALLOWANCE IS RE-DERIVED FROM THE CLOCK THAT IS ACTUALLY LEFT, WHEN `--watch` RUNS (#3850
 # review, P2 — verified by arithmetic against this repo's own declared chain budgets). The design operand
 # above sizes the allowance against the WORST-CASE check wait, which is the right FLOOR — but supervision

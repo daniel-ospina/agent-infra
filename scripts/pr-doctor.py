@@ -1165,10 +1165,14 @@ WORKTREE_ROOT = ""
 # only the ABSOLUTE ceiling for a lane that creeps forward for ever, and it MUST sit above the
 # allowance or it pre-empts it (the shipped pair was 2400 < 2700, and that ordering WAS the defect).
 #
-# ⛔ 7200 s (2 h) IS PROVISIONAL, and saying so is part of the change: today's prfix distribution is
-# CENSORED BY THE VERY VALUE BEING REPLACED, so the ceiling cannot be sized from it. Landing the seam
-# first is what makes the real distribution observable; agent-infra#2888 owns the re-measure and the
-# re-size. It also lifts the observed `bg` p90 of 5401 s, so it does not trim that population either.
+# ⛔ 36000 s (10 h) IS MEASURED, NOT PROVISIONAL (agent-infra#4034), and it moves in the same commit as
+# the seam it mirrors. The 7200 it replaces was provisional because the `prfix` distribution was CENSORED
+# BY THE VERY VALUE BEING REPLACED, so the ceiling could not be sized from it; agent-infra#2888 landed
+# the seam to make the real distribution observable, and the re-measurement that retired the round number
+# is 2,033 lane logs on `pi-cell-4` (2026-11-12): 20 `exceeded-wallclock` vs 2 `stalled`, 12 of the 20
+# killed with `silent=0s`, i.e. this bound was ending lanes the progress rule said were still working.
+# `scripts/orchestrator-harness/lane-bound.test.sh` (i0) pins this literal to spawn-gate.sh's
+# `LANE_BACKSTOP_S`, so the two cannot drift again.
 #
 # ⛔ A TYPO MUST NEVER DISARM IT. Blank / non-numeric / `0` take the default: an unbounded default for
 # every repair lane on the box is indistinguishable from a typo'd one, and this is a DEFAULT rather
@@ -1176,7 +1180,7 @@ WORKTREE_ROOT = ""
 # old name because `worker_live()` also uses it as the age of a recycled pid, and one constant for one
 # duration is the point.
 SPAWN_BACKSTOP_ENV = "PRD_SPAWN_BACKSTOP_S"
-DEFAULT_SPAWN_BACKSTOP_S = 7200
+DEFAULT_SPAWN_BACKSTOP_S = 36000
 
 
 def _positive_int_env(name: str, default: int) -> int:

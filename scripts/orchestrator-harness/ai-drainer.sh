@@ -131,7 +131,7 @@
 #                     An unusable value warns and falls back to 2, never silently.
 #   LPC_CEILING       load-per-cpu at which no lane is added          default: 8
 #   LANE_TIMEOUT      the lane's BACKSTOP (seconds) — the absolute ceiling, not the primary bound
-#                                                            default: $LANE_BACKSTOP_S (7200)
+#                                                            default: $LANE_BACKSTOP_S (36000)
 #   RC_GRACE_S        grace after a lane's pid dies for its status file (s)  default: 30
 #   PR_BUDGET         PRs one lane may process                        default: 6
 #   SLICE_WIDTH       PRs per slice                                   default: 10
@@ -194,8 +194,9 @@ LPC_CEILING="${LPC_CEILING:-8}"
 #   * it is the window a LIVE lane holds its rotation window for (§ rotation), so a lane allowed to run
 #     past it gets its slice re-dispatched to a second lane — duplicate work on the same PRs.
 # `LANE_BACKSTOP_S` is spawn-gate.sh's one default; it is not sourced here, so the literal fallback is
-# pinned to that seam by `lane-bound.test.sh` (i0).
-LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"
+# pinned to that seam by `lane-bound.test.sh` (i0) — both here and in the coercion below, because
+# agent-infra#4034 raised the seam 5x and a stale literal here would re-shorten the window it moved.
+LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-36000}}"
 PR_BUDGET="${PR_BUDGET:-6}"
 SLICE_WIDTH="${SLICE_WIDTH:-10}"
 SLICE_TOTAL="${SLICE_TOTAL:-70}"
@@ -323,7 +324,7 @@ MEM_BUDGET_PCT="$(_num MEM_BUDGET_PCT "$MEM_BUDGET_PCT" 75)"
 [ "$MEM_BUDGET_PCT" -le 100 ] || { log_line "WARN: MEM_BUDGET_PCT=$MEM_BUDGET_PCT > 100 — using 100"; MEM_BUDGET_PCT=100; }
 LPC_CEILING="$(_num LPC_CEILING "$LPC_CEILING" 8)"
 [ "$LPC_CEILING" -ge 1 ] || { log_line "WARN: LPC_CEILING=0 — using 1"; LPC_CEILING=1; }
-LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 7200)"
+LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 36000)"
 # (No LANE_WAIT_MAX any more — but `LANE_TIMEOUT` still feeds the dispatcher, so it still gets the
 # validation that `30m` used to defeat: an unvalidated value made bash print "value too great for
 # base" and left a variable UNSET, which under `set -u` killed the tick mid-lock.)
