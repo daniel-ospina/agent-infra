@@ -1382,10 +1382,10 @@ _BOUND_OPERATOR_RE = re.compile(r"(?<![-=>])(?:[<>≤≥]=?|==)\s*$")
 #: ``<b and p99 >`` starts with a letter, so it was stripped, the operator with it,
 #: and a MOVED bound was masked into one signature — the fail-OPEN direction this
 #: strip exists to prevent. An explicit alternation of the masks actually emitted
-#: (``<ADDR>``, ``<UUID>``, ``<HEX>``, ``<HOSTPORT>``, ``<N>``, ``team_<X>``,
+#: (``<ADDR>``, ``<UUID>``, ``<HEX>``, ``<HOSTPORT>``, ``<TMP>``, ``<N>``, ``team_<X>``,
 #: ``<MEAS<n>:<unit>>``) is closed, so comparison text can never match it.
 _MASKED_TOKEN_RE = re.compile(
-    r"<(?:ADDR|UUID|HEX|HOSTPORT|N|X|MEAS\d+:[A-Za-zµμ]+)>"
+    r"<(?:ADDR|UUID|HEX|HOSTPORT|TMP|N|X|MEAS\d+:[A-Za-zµμ]+)>"
 )
 
 
@@ -1452,6 +1452,68 @@ _VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str
     # declared interpolation; the stable part is its shape.
     (re.compile(r"\bteam_[A-Za-z0-9][A-Za-z0-9_]{0,63}\b"), "team_<X>"),
     (re.compile(r"\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d{2,5}\b"), "<HOSTPORT>"),
+    # THE PER-RUN TEMP IDENTIFIERS (#1424) — the same class as the hex run ids
+    # above: a token the RUN generated, so main can never have measured THIS
+    # token, and leaving it raw makes the SUBSET rule unsatisfiable for an id
+    # main itself measures red. Measured shapes:
+    #
+    #   /tmp/tmpnnjrgwic/redis.socket                  ``tempfile`` / ``tmp_path``
+    #   /tmp/tt_s9k6lwdc/collision-preflight-iis0g3yc  pytest basetemp + mkdtemp
+    #
+    # ``tmp[A-Za-z0-9]{6,}`` is NOT the existing ``<HEX>`` rule wearing a second
+    # hat: ``tmpnnjrgwic`` and ``tt_esyk5btg`` contain letters outside
+    # ``[0-9a-f]``, which is why the hex rule correctly refuses them and the
+    # signature stayed volatile.
+    #
+    # ⛔ EVERY RULE IN THIS GROUP IS ANCHORED TO A TEMP PATH, and that anchor is
+    # load-bearing rather than tidy. A shape-only rule masks STABLE identifiers
+    # that happen to look random, which is the fail-OPEN direction: measured on
+    # this repo's own tree, an unanchored hyphens+8-char-tail rule masks 107 of
+    # 430 tracked directories (``skills/commit-workflow``, ``extensions/loop-
+    # enforcer`` — ``workflow`` is 8 characters) and 119 of 402 branch slugs
+    # (``fix/issue-3429-gh-credential``), so a PR's NEW failure in one of them
+    # would be exempted by main's red in another. The same holds for ``tt_``,
+    # which is ALSO the consumer repo's semantic fixture family
+    # (``tt_valid_key`` / ``tt_ratelimited``): hence the temp-root anchor AND
+    # the digit requirement on the tail. Both are fail-CLOSED if the anchor ever
+    # misses a real layout — the signature stays volatile and the id simply
+    # blocks, which is the direction an unexemptable-but-honest gate errs.
+    (re.compile(r"(?<=/)tmp[A-Za-z0-9]{6,}(?![0-9A-Za-z])"), "<TMP>"),
+    (
+        # The ``(?=[A-Za-z0-9_]*\d)`` digit requirement is a SECOND anchor, and it
+        # costs a declared fail-CLOSED residual: a random suffix drawn without a
+        # digit (~5.6% of 8-character draws off ``[a-z0-9]``) stays raw and the id
+        # simply blocks. What it buys is that a SEMANTIC ``tt_`` label — the
+        # consumer repo's ``tt_valid_key`` / ``tt_ratelimited`` API-key fixtures —
+        # is never masked even when it sits under a temp root.
+        #
+        # Fixed-width alternatives because Python's ``re`` refuses a
+        # variable-width lookbehind (measured). ``(?<=<TMP>/)`` is the arm that
+        # makes this composable: rules in this group run left to right, so a
+        # ``tt_*`` root has ALREADY become ``<TMP>`` when a deeper component is
+        # examined — without it ``/tmp/<TMP>/collision-preflight-…`` would keep
+        # its random second component raw.
+        re.compile(
+            r"(?:(?<=/tmp/)|(?<=/var/tmp/)|(?<=/private/tmp/)|(?<=<TMP>/))"
+            r"tt_(?=[A-Za-z0-9_]*\d)[A-Za-z0-9_]{6,}(?![0-9A-Za-z])"
+        ),
+        "<TMP>",
+    ),
+    # A ``mkdtemp(prefix=...)`` DIRECTORY NAME: the test's own prefix is stable,
+    # everything after the last hyphen is random. Anchored to a TEMP ROOT (or to
+    # a parent this group already masked), so a repo directory, a branch slug
+    # and a filename are never touched however hyphenated they are — and the
+    # mask is the COMPONENT, never the whole path, so ``…/tmp/…/packs/good`` vs
+    # ``…/tmp/…/packs/broken`` still differs. The 8+ floor is the length at
+    # which a generated tail stops looking like an English word.
+    (
+        re.compile(
+            r"(?:(?<=/tmp/)|(?<=/var/tmp/)|(?<=/private/tmp/)|(?<=<TMP>/))"
+            r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*-[a-z0-9]{8,}"
+            r"(?=[/\s\"'`,;:)\]]|$)"
+        ),
+        "<TMP>",
+    ),
     # Last, and context-aware: a fractional duration that is a MEASUREMENT is the
     # machine's, not the assertion's (#9331); an operator-prefixed bound is
     # signal. The unit and the slot ride the token so SCALE and COUNT stay signal.

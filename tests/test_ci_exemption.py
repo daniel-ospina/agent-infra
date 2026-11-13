@@ -3628,6 +3628,227 @@ def test_bash_shard_recap_identity_is_compared_not_dropped():
     assert blocked.blocked and blocked.blocked[0].nodeid == key
 
 
+# ── THE PER-RUN TEMP DIRECTORY (#1424) ──────────────────────────────────────
+#
+# The closed mask list already excluded the run's ADDRESSES, UUIDs, hex run ids,
+# tenants (``team_*``) and measured durations. It did NOT exclude the run's TEMP
+# DIRECTORY — so a failure whose assertion interpolates ``tmp_path`` (or pytest's
+# ``tt_*`` basetemp) carried a per-run path into its signature, and
+# ``_signatures_overlap``'s SUBSET rule could never hold for it. An id main itself
+# measures red is then BLOCKed on every PR as "a DIFFERENT failure":
+#
+#   BLOCK : tests/test_pack_state.py::TestBackfillScript::test_apply_writes_to_introspection_read_target
+#           signature differs from main's (1/1 (100%) vs 10/10 (100%))
+#           — same id, a DIFFERENT failure is not exempt
+#
+# Both sides are 100% red. They differ ONLY in the random directory name, which no
+# run can ever reproduce, so the match is unsatisfiable BY CONSTRUCTION rather than
+# by novelty. The fix masks the PER-RUN COMPONENT, never the whole path, because
+# over-masking is the fail-OPEN direction (see the normaliser list's own comment).
+
+#: The pair from #1424's body: ``tempfile``/``tmp_path`` shape, 100% red both sides.
+_REDIS_SOCKET_A = (
+    "Error 111 connecting to /tmp/tmpnnjrgwic/redis.socket. No such file or directory."
+)
+_REDIS_SOCKET_B = (
+    "Error 111 connecting to /tmp/tmpieuczgoo/redis.socket. No such file or directory."
+)
+
+#: The pair measured on tortoise #12342 (agent-infra #1424, comment 09:24Z): pytest's
+#: ``tt_*`` basetemp AND a ``mkdtemp(prefix=…)`` component, both random per run.
+_COLLISION_A = (
+    "local checkout: /tmp/tt_s9k6lwdc/collision-preflight-iis0g3yc/repo/.worktrees/asker-3061"
+)
+_COLLISION_B = (
+    "local checkout: /tmp/tt_asj7_8mx/collision-preflight-ps6x5yrr/repo/.worktrees/asker-3061"
+)
+
+
+def test_1424_a_per_run_temp_directory_is_one_signature():
+    """RED before the fix: each text normalises to itself, so the SUBSET rule fails."""
+    for left, right in [
+        (_REDIS_SOCKET_A, _REDIS_SOCKET_B),
+        (_COLLISION_A, _COLLISION_B),
+    ]:
+        a = ci_exemption.normalize_signature(left)
+        b = ci_exemption.normalize_signature(right)
+
+        # The mask is APPLIED, not merely absent from both sides — equality alone
+        # would pass on an unfixed tree where both stayed raw.
+        assert "<TMP>" in a, a
+        assert "tt_" not in a and "tmpn" not in a, a
+        assert a == b, (
+            "a per-run temp directory must not be part of the signature — "
+            f"main's {left!r} and the PR's {right!r} are ONE failure"
+        )
+
+
+def test_1424_the_temp_directory_case_is_EXEMPT_end_to_end():
+    """#1424's acceptance: the rail's own decision, not just the mask.
+
+    main measured this id red 10/10 with a signature carrying ITS run's temp dir;
+    the PR's run carries a different one. Same id, same assertion — the exemption
+    must be available, or no PR that touches this surface can land.
+    """
+    main_sig = ci_exemption.normalize_signature(f"AssertionError: {_REDIS_SOCKET_A}")
+    pr_sig = ci_exemption.normalize_signature(f"AssertionError: {_REDIS_SOCKET_B}")
+
+    decision = decide(
+        {ID: _f(1, 1, pr_sig)},
+        {ID: Rate(10, 10)},
+        main_signatures={ID: frozenset({main_sig})},
+        k_pr=1,
+    )
+
+    assert not decision.any_blocked, (
+        "same id + same assertion + main's own 10/10 measurement must EXEMPT; got "
+        f"{[b.reason for b in decision.blocked]}"
+    )
+    assert len(decision.exempt) == 1
+
+
+def test_1424_a_MEANINGFUL_path_still_BLOCKs():
+    """The other direction: the mask is the COMPONENT, not the whole path.
+
+    If it swallowed everything from ``/tmp/`` onward, two genuinely different
+    failures that happen to live under a temp root would compare equal and the
+    exemption would be handed to a failure main never had — the fail-OPEN
+    direction the SUBSET rule exists to close.
+    """
+    left = f"{_COLLISION_A}/packs/good-is-not-broken"
+    right = f"{_COLLISION_B}/packs/broken-is-not-good"
+    a = ci_exemption.normalize_signature(left)
+    b = ci_exemption.normalize_signature(right)
+
+    assert "good-is-not-broken" in a and "broken-is-not-good" in b
+    assert a != b, "a stable path component must stay SIGNAL"
+
+    decision = decide(
+        {ID: _f(1, 1, b)},
+        {ID: Rate(10, 10)},
+        main_signatures={ID: frozenset({a})},
+        k_pr=1,
+    )
+    assert decision.any_blocked, "a different failure must never be exempted"
+    assert "signature differs" in decision.blocked[0].reason
+
+
+def test_1424_the_mask_does_not_swallow_a_short_or_generic_token():
+    """The mask list is closed: nothing is masked that the evidence does not demand."""
+    for text in (
+        "tmpdir",  # generic prose, not a generated id
+        "tt_id",
+        "assert 3 == 2",  # a COUNT is signal (the <HEX> rule's own guard)
+        "tortoise/packs/a.yml != tortoise/packs/b.yml",  # a repo-relative path is signal
+        "fix/12266-carve-out",  # a branch slug is not a mkdtemp component
+        "/tmp/fixtures/packs/good.yaml",  # a temp path with NO per-run component
+    ):
+        assert ci_exemption.normalize_signature(text) == text, text
+
+
+#: Pairs that LOOK like the volatile shapes and are NOT — each one is a real
+#: identifier from this fleet. An unanchored shape rule masks every one of them,
+#: which is the fail-OPEN direction: main red in one repo directory would exempt a
+#: PR's NEW failure in another. Measured before the temp-root anchor: 107 of this
+#: repo's 430 tracked directories (`skills/commit-workflow` — `workflow` is 8
+#: characters) and 119 of 402 branch slugs matched.
+_STABLE_LOOKALIKES = (
+    (
+        "pnpm pack: /repo/skills/commit-workflow/SKILL.md missing",
+        "pnpm pack: /repo/skills/debug-workflow/SKILL.md missing",
+    ),
+    (
+        "unregistered worktree /repo/.worktrees/fix/issue-3429-gh-credential",
+        "unregistered worktree /repo/.worktrees/fix/issue-9999-gh-credential",
+    ),
+    (
+        "changed files: modified\\extensions/loop-enforcer/termination.ts",
+        "changed files: modified\\extensions/secret-redactor/termination.ts",
+    ),
+    (
+        # ``tt_`` is ALSO the consumer repo's semantic API-key fixture family:
+        # masking it by shape alone conflates "valid key rejected" with
+        # "rate-limited", two different diagnoses under one id.
+        "AssertionError: status 401 for api_key=tt_valid_key expected 200",
+        "AssertionError: status 401 for api_key=tt_ratelimited expected 200",
+    ),
+)
+
+
+def test_1424_a_stable_lookalike_is_never_temp_masked():
+    """The masks are anchored to a TEMP PATH, not to a shape alone."""
+    for left, right in _STABLE_LOOKALIKES:
+        a = ci_exemption.normalize_signature(left)
+        b = ci_exemption.normalize_signature(right)
+        assert "<TMP>" not in a, f"a stable identifier was masked: {a!r}"
+        assert a != b, f"two genuinely different failures collapsed: {a!r}"
+
+    # …and the same pairs still BLOCK end-to-end, not merely in the string.
+    left, right = _STABLE_LOOKALIKES[0]
+    decision = decide(
+        {ID: _f(1, 1, ci_exemption.normalize_signature(right))},
+        {ID: Rate(10, 10)},
+        main_signatures={ID: frozenset({ci_exemption.normalize_signature(left)})},
+        k_pr=1,
+    )
+    assert decision.any_blocked, "a different failure must never be exempted"
+    assert "signature differs" in decision.blocked[0].reason
+
+
+def test_1424_no_tracked_directory_of_this_repo_is_temp_masked():
+    """Breadth invariant, so the next shape rule cannot re-open the hole quietly.
+
+    Reads the checkout itself rather than a hand-picked list: a normaliser that
+    newly masks a directory NAME fails here even if no fixture above names it.
+    """
+    root = Path(__file__).resolve().parents[1]
+    skip = {".git", ".worktrees", "node_modules", ".venv", "__pycache__"}
+    dirs = [
+        p.relative_to(root).as_posix()
+        for p in root.rglob("*")
+        if p.is_dir() and not (skip & set(p.relative_to(root).parts))
+    ]
+    assert len(dirs) > 50, f"the scan found {len(dirs)} directories — it is not reading the tree"
+    masked = [
+        d for d in dirs
+        if ci_exemption.normalize_signature(f"/repo/{d}") != f"/repo/{d}"
+    ]
+    assert masked == [], f"stable repo paths must stay SIGNAL: {masked[:5]}"
+
+
+def test_1424_a_semantic_tt_label_stays_signal_even_under_a_temp_root():
+    """The digit requirement on the ``tt_`` tail is the arm the anchor cannot give.
+
+    ``tt_`` is BOTH a generated basetemp prefix and the consumer repo's API-key
+    fixture family. Anchoring to ``/tmp/`` separates the common case, but a
+    fixture labelled ``tt_valid_key`` can also be a directory NAME, so the tail
+    must look generated (it must carry a digit) before it is masked. The cost is
+    the fail-CLOSED residual named in the mask's comment: an all-letter random
+    suffix stays raw and merely blocks.
+    """
+    a = ci_exemption.normalize_signature("/tmp/tt_valid_key/repo/socket missing")
+    b = ci_exemption.normalize_signature("/tmp/tt_ratelimited/repo/socket missing")
+
+    assert "<TMP>" not in a, f"a semantic label must stay SIGNAL: {a!r}"
+    assert a != b, f"two different fixture labels collapsed: {a!r}"
+
+
+def test_1424_a_temp_mask_before_a_duration_does_not_read_as_a_bound_operator():
+    """``<TMP>`` must join ``_MASKED_TOKEN_RE``, or it becomes a phantom ``>`` bound.
+
+    The measurement rule reads the text to the LEFT of a duration and honours a
+    comparison operator there. Every mask token ends in ``>``, so an unmasked-in-
+    the-alternation token would make the mask's own closing delimiter look like a
+    bound and leave the following duration RAW — the #9331 block returning through
+    the new mask (the same defect cycles 6 and 9 closed for the other tokens).
+    """
+    a = ci_exemption.normalize_signature("wrote /tmp/tmpabcd1234 1.21s after start")
+    b = ci_exemption.normalize_signature("wrote /tmp/tmpzzzz9999 1.47s after start")
+
+    assert "<MEAS1:s>" in a, a
+    assert a == b, f"a duration after a <TMP> mask stayed volatile: {a!r} vs {b!r}"
+
+
 # ── THE ROW DOOR, DERIVED FROM THE PRODUCERS (#6798, raised in #2648 review) ─
 #
 # `_NON_NODEID_KEY_RE` is hand-enumerated, and that enumeration went stale TWICE in the
