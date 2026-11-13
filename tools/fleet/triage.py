@@ -252,6 +252,22 @@ _HOLD_CUE = re.compile(
     r"\b(?:awaiting your|awaiting a|awaiting approval|awaiting instruction|awaiting a steer|"
     r"waiting (?:on|for) your|pending your|blocked on your|please (?:confirm|approve|sign)|"
     r"sign off|hold here until)\b")
+# `_HOLD_CUE` minus bare "sign off": a report can OPEN with "Your sign off came in and …".
+_HOLD_CUE_DENIAL = re.compile(
+    r"\b(?:awaiting your|awaiting a|awaiting approval|awaiting instruction|awaiting a steer|"
+    r"waiting (?:on|for) your|pending your|blocked on your|please (?:confirm|approve|sign)|"
+    r"hold here until)\b")
+# A STRONG deferral marker for the frame branch. `_FUTURE_CUE` cannot be reused: it carries
+# `your call on`, which is how ordinary reports open ("Your call on the schema came out as you decided.").
+_FRAME_FUTURE = re.compile(
+    r"\b(?:i'?ll|i will|we'?ll|shall|until|once|before|please|need|waiting|await|hold)\b")
+# A dependency PREDICATE — the owner is what the clause ends on.
+_DEPENDENCY = re.compile(
+    # ⛔ NOT `pending your` (round 10): it is the MODIFIER form — "Landed it pending your approval from
+    # Monday." — and including it read that report as an ask. `blocked on` / `waiting on` / `awaiting`
+    # are predicates the clause can END on; `pending` modifies what precedes it.
+    r"\b(?:blocked on|blocked by|waiting on|waiting for|awaiting|only thing left|"
+    r"all that'?s left|is the only blocker|need your (?:approval|decision|call|go-ahead|input))\b")
 _ADDRESSED = re.compile(
     r"\b(?:awaiting your|awaiting a|waiting (?:on|for) your|pending your|blocked on your|"
     r"please (?:confirm|approve|sign)|sign off|your (?:approval|confirmation|decision|call|"
@@ -292,14 +308,30 @@ def _disarmed(low: str, cue_at=None) -> bool:
     if cue_at is None:
         m = _ADDRESSED.search(low)
         cue_at = m.start() if m else None
-    # A DENIAL denies the cue itself, wherever it sits: "…and nothing needs your input now."
-    if _PAST_HARD_DENIAL.search(low):
-        return True
+    # ⛔ A DENIAL DENIES THE CUE — UNLESS IT IS THE ASK'S OBJECT (round 10, #4046 P0). Unconditional
+    # was wrong in the other direction: "Please confirm nothing needs your attention on the staging
+    # config before I promote." / "Please confirm nothing is blocked on the deploy." are imperative
+    # asks whose OBJECT is a negative, and both read `not-asked` -> `send-continue` into a lane waiting
+    # on its owner. A denial that starts AFTER an ADDRESSED HOLD is that object. Bare `sign off` is not
+    # a hold for this purpose — it opens the ordinary report "Your sign off came in and nothing needs
+    # your input." — which is why `_HOLD_CUE_DENIAL` is `_HOLD_CUE` minus it.
+    denied = _PAST_HARD_DENIAL.search(low)
+    if denied:
+        held = _HOLD_CUE_DENIAL.search(low)
+        if not (held is not None and denied.start() > held.start()):
+            return True
     frame = _PAST_HARD_FRAME.search(low)
     if frame:
         hold = _HOLD_CUE.search(low)
         # "…the fix approved by legal" modifies the hold's object; "…as you decided" reports a decision.
-        if not (hold is not None and frame.start() > hold.start()):
+        if hold is not None and frame.start() > hold.start():
+            pass
+        elif _FRAME_FUTURE.search(low):
+            # ⛔ A FRAME CAN BE FOLLOWED BY A DEFERRAL (round 10, #4046 P2): "Per your decision last
+            # week I'll wait for your go-ahead." defers to the owner AFTER naming a past decision, and
+            # the only thing separating it from the report ("…, the schema is closed.") was a comma.
+            pass
+        else:
             return True
     if _PAST_HARD_ANCHOR.search(low):
         # An anchor needs a COMPLETION to be a report — one that is the LANE's, not the ask's object —
@@ -308,6 +340,13 @@ def _disarmed(low: str, cue_at=None) -> bool:
         if not done:
             return False
         if cue_at is not None and done.start() > cue_at:
+            return False
+        # ⛔ AND THE CLAUSE MAY END ON A DEPENDENCY (round 10, #4046 P1): "Checks passed at 14:02 and
+        # I'm blocked on your approval." is one clause (the splitter does not split on `and`), so the
+        # lane's own completion sits BEFORE the hold and disarmed the ask. A dependency predicate that
+        # starts after the completion is what the clause leaves the owner with.
+        dep = _DEPENDENCY.search(low)
+        if dep is not None and dep.start() > done.start():
             return False
         return not _FUTURE_CUE.search(low)
     return bool(_PAST_SOFT.search(low)) and not _FUTURE_CUE.search(low)
@@ -367,6 +406,13 @@ _HANDOFF = (
     "your call on", "in your hands", "needs your sign", "for sign-off", "for your sign-off",
     # ⛔ THE SHAPES THE ROUND-5 CORPUS MEASURED AS MISSES (see `_HANDOFF_SHAPE` for the open-ended
     # ones). Each was `not-asked` and routed `send-continue` at 502fa170a.
+    # ⛔ THE NEGATIVE DEPENDENCY (round 10, #4046 P1). "I can't proceed without sign-off." is the
+    # shortest possible statement of a named dependency on the owner and it read `not-asked`, because
+    # the list only carried the affirmative forms ("for sign-off", "needs your sign") and the
+    # `_HANDOFF_SHAPE` list is line-anchored on hand-off WORDS, not on `I can't`. Cost, in the cheap
+    # direction: "Merged it without your approval, as you'd said." now reads `asked`.
+    "without sign-off", "without your sign", "without your approval", "without your go",
+    "cannot proceed", "can't proceed", "cant proceed", "cannot move", "can't move",
     "say otherwise", "until you say", "for your input", "your input", "awaiting instruction",
     "awaiting a steer", "tell me to proceed", "reply and i", "ping me", "your move",
     "needs your input", "before i go further", "pause here", "holding the deploy", "holding this",

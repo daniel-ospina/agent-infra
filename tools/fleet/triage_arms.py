@@ -272,6 +272,21 @@ def mandate_missing(brief: str, qid: str = "") -> list:
     return missing + [tok for tok in QUESTION_MANDATE if tok.lower() not in low]
 
 
+def _pane_lines(brief: str) -> int:
+    """How much of the question pane to read back, derived from the payload it must contain.
+
+    ⛔ A FIXED 60-LINE WINDOW IS A PERMANENT-FAILURE TRAP (fresh-context review round 10, #4046).
+    The artifact requires the payload's FIRST bytes (`qid=`) and its LAST (`end=`) to be visible
+    together, so a window shorter than the payload makes the proof unreachable: the pane scrolls the
+    header out, `verified` stays False, and `lane-route.py`'s dedupe (which honours only a prior
+    `verified: true`) re-sends the brief every tick, forever. The lane's own message lengths measured
+    over local session JSONLs run to 7.6 k chars (p50 2.4 k, p99 5.6 k), which is more than 60 rows on
+    a narrow pane. The window is therefore sized from the brief, with a floor (a short brief still
+    needs room for the prompt above it) and a ceiling (a read is not free).
+    """
+    return max(60, min(400, (len(brief or "") // 60) + 20))
+
+
 # ── arm 1: the user-question lane ──────────────────────────────────────────────────────────────
 def arm_user_question(ws: str, lane: str, question: str, surface: Surface,
                       nap=None) -> Proof:
@@ -341,7 +356,7 @@ def arm_user_question(ws: str, lane: str, question: str, surface: Surface,
     pane_missing = ["(pane unreadable)"]
     pane = None
     for attempt in range(3):
-        pane = surface.screen_tail(qws, 60)
+        pane = surface.screen_tail(qws, _pane_lines(brief))
         if pane is not None:
             # ⛔ BOUND TO *THIS* QUESTION (round 7, #4046 P0). See `question_qid`: without it the
             # previous question's brief certifies this one, and the dedupe makes the non-delivery

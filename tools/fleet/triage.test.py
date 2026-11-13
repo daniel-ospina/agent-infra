@@ -675,6 +675,20 @@ def run_red_control() -> bool:
                  _pre_delta_mandate(cut_1200, q_id) == []
                  and bool(triage_arms.mandate_missing(cut_1200, q_id)))
 
+    # (R17) ⛔ A DENIAL INSIDE THE ASK'S OBJECT IS NOT A DENIAL OF THE ASK (round 10, #4046 P0).
+    # Unconditional denial silenced "Please confirm nothing needs your attention on the staging config
+    # before I promote." — an imperative ask whose object is a negative. Mutant: make the denial
+    # unconditional again and require the SAME sentence's answer to change.
+    denial_ask = ("Please confirm nothing needs your attention on the staging config before I promote.")
+    _real_hold_denial = triage._HOLD_CUE_DENIAL
+    triage._HOLD_CUE_DENIAL = re.compile(r"(?!x)x")          # never matches
+    try:
+        blind_denial = triage.asks_owner(denial_ask)
+    finally:
+        triage._HOLD_CUE_DENIAL = _real_hold_denial
+    good &= _red("R17 an unconditional denial WOULD silence an ask whose object is negative",
+                 blind_denial == "not-asked" and triage.asks_owner(denial_ask) == "asked")
+
     # (R12) ⛔ THE PER-QUESTION ID IS WHAT DEFEATS A STALE PANE (round 7, #4046 P0). The question
     # lane is persistent, so its tail still shows the PREVIOUS brief, and both briefs carry the same
     # mandate tokens. Mutant: drop the id and the stale pane certifies the new question.
@@ -1613,7 +1627,21 @@ def leg_round7() -> None:
     # a private 25-phrase regex while the module has 59 hand-off phrases, so asks phrased with the
     # other 34 had no offset and the completion gate did not apply — 14 of 14 read `not-asked`. The
     # offset now comes from the phrase that admitted the clause.
-    for txt in ("Awaiting approval on the hotfix we released yesterday.",
+    # ⛔ AND THE NEGATIVE FORMS (round 10, #4046 P0/P1): a denial inside the ask's OBJECT
+    # ("Please confirm nothing needs your attention…"), the negative dependency ("I can't proceed
+    # without sign-off."), a completion and its hold joined by `and` in ONE clause, and a past-decision
+    # frame followed by a deferral.
+    for txt in ("Please confirm nothing needs your attention on the staging config before I promote.",
+                "Please confirm nothing is blocked on the deploy.",
+                "I can't proceed without sign-off.",
+                "I cannot proceed without your sign-off.",
+                "Checks passed at 14:02 and I'm blocked on your approval.",
+                "The fix is pushed at 14:02 and I'm blocked on your decision.",
+                "All tests passed at 14:02 and your approval is the only thing left.",
+                "Per your decision last week I'll wait for your go-ahead.",
+                "As you decided I'll wait for your word before landing it.",
+                "Given the plan already approved I'll hold the deploy for your steer.",
+                "Awaiting approval on the hotfix we released yesterday.",
                 "Awaiting instruction on the numbers you verified yesterday.",
                 "Over to you on the rollback we applied yesterday.",
                 "Your read on the numbers we verified last week.",

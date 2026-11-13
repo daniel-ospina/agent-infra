@@ -13,8 +13,8 @@ command is quoted verbatim so it can be re-run.
 
 | command | result |
 |---|---|
-| `python3.12 tools/fleet/triage.test.py` | `PASS=379 FAIL=0` |
-| `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (14 RED controls, all fired) |
+| `python3.12 tools/fleet/triage.test.py` | `PASS=439 FAIL=0` |
+| `python3.12 tools/fleet/triage.test.py --red-control` | `exit=0` (17 RED controls, all fired) |
 | `uv run --quiet --with pytest --with pytest-timeout python -m pytest scripts/ -q --timeout=180` | `1436 passed, 3 skipped, 1 xpassed in 216.96s` |
 | `python3.12 tools/fleet/liveness.test.py` | `PASS=58 FAIL=0` (+ `every stated count matches the suite (58 tests, 113 mutations)`) |
 | `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | `FAILURES: 1` — **PRE-EXISTING, base-owned** (see below) |
@@ -91,12 +91,38 @@ unconditional date anchor and requires the same input's answer to change to `not
 the nonce and requires the stale pane to certify the new question (`verified: true`). With the fixes in
 place both mutants are caught.
 
+## Rounds 8–10 — three more fresh-context reviewers, all against the guard
+
+Rounds 8, 9 and 10 each falsified the PREVIOUS round's fix with inputs that round's corpus did not
+contain. Every finding was reproduced against the shipped code before anything was applied; the two
+items that could not be reproduced were dropped rather than re-worded.
+
+| round | the finding that mattered | outcome |
+|---|---|---|
+| 8 (`78ce2098f`) | **[P0]** the completion gate was defeated by the ask's own OBJECT — a relative clause supplies the completion verb (*"…the invoice I **sent** last week"*), 7 of 7 read `not-asked`; **[P0]** `question-lane-ack` passed on a paint **truncated** after the mandate (the qid at char ~89 and the mandate after ~200 merely co-existed, so a cut of 118 or 400 chars was certified by the PREVIOUS brief's tokens); **[P1]** the mirror — a closed `_COMPLETION` list made 9 of 10 plausible completion reports read `asked`, pausing finished lanes | a completion that starts AFTER the clause's addressed cue does not disarm; the qid became a **high-water mark** (`verified` judges only what follows it) and is matched with optional whitespace so a wrap inside it still verifies; `_COMPLETION` broadened |
+| 9 (`f19ce64f7`) | **[P0]** the position rule consulted its OWN 25-phrase cue list while the module has 59 hand-off phrases, so asks phrased outside it (*"Awaiting approval on the hotfix we released yesterday."*) had no offset at all — 14 of 14 read `not-asked`; **[P0]** the proof still passed on a paint cut at **1061 of 1409 chars** (after `recommendation`, before the question): the question was gone and the record said *"the full mandate visible on the pane"*; **[P1]** applying the position rule to denials and possessives made 11 of 11 finished reports read `asked` | `asks_owner()` passes the offset of the phrase that ADMITTED the clause, so the rule cannot drift from the vocabulary; the brief ends with `end=<8>` and the artifact requires that sentinel after the qid — it is the payload's last bytes, so truncation anywhere fails; denials unconditional again, position rule scoped to the anchor branch |
+| 10 (`158724eb9`) | **[P0]** the now-unconditional denial silenced an ask whose OBJECT is a negative (*"Please confirm nothing needs your attention on the staging config before I promote."* → `send-continue`); **[P1]** *"I can't proceed without sign-off."* had no cue at all; **[P1]** a completion and its hold joined by `and` in one clause (*"Checks passed at 14:02 and I'm blocked on your approval."*) disarmed the ask; **[P2]** a past-decision frame followed by a deferral (*"Per your decision last week I'll wait for your go-ahead."*, no comma) disarmed it | a denial is gated on an addressed hold before it; the negative-dependency forms joined `_HANDOFF`; a `_DEPENDENCY` predicate after the completion keeps the clause an ask; the frame branch gained a scoped future veto (`_FUTURE_CUE` cannot be reused — it carries `your call on`). The pane read window is now sized from the payload (`_pane_lines`), because requiring the first AND last bytes of the brief within a fixed 60 rows would make a long question's proof unreachable — and therefore re-send it every tick forever |
+
+The shape is consistent enough to be worth recording: **every finding from round 5 onward was in the
+guard, never in the router** — a detector read one paragraph of the tail, a signature that matched a
+ticket number, a pane read that never happened, a proof satisfied by the previous question, a
+completion list that named the wrong subject. Each fix is pinned by a RED control that MUTATES the
+shipped mechanism and requires the answer to change, and the corpora are rebuilt from inputs the fix
+was not written from — twice a fixture that already contained the answer was the only reason a
+non-gating gate looked green.
+
+Named residual from round 10, stated rather than absorbed: a single clause that reports a completion and
+then a hold (*"Checks passed at 14:02 and I'm blocked on your approval."*) is now an ask via
+`_DEPENDENCY`, but a clause where the completion and the possessive are the SAME phrase
+(*"It was blocked on your approval yesterday, then it went through."*) still reads as an ask — the
+consequence is a paused finished lane and a bogus question, which is the cheap direction.
+
 ## What changed
 
 ```
 tools/fleet/triage.py          NEW  the router: precedence, wedged subcases, remedies, proof table
 tools/fleet/triage_arms.py     NEW  the three arms, each proving its effect at its artifact
-tools/fleet/triage.test.py     NEW  hermetic suite, 379 assertions, 14 RED controls
+tools/fleet/triage.test.py     NEW  hermetic suite, 439 assertions, 17 RED controls
 scripts/lane-route.py          NEW  operator CLI (route / --json / --apply)
 scripts/turn-end.py            MOD  gates its WIP nudge on route_gate(), and APPLIES a
                                     user-question route (batched, capped, bounded, logged)
