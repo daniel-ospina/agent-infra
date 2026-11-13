@@ -8395,6 +8395,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //    like a live write (a measured false refusal).
   const readOperandWords = (k) => {
     const out = [];
+    const tildes = [];                        // per operand: is the SOURCE word a BARE `~`?
     let resumeAt = null;                     // where the MAIN walker must resume (a redirect)
     const skipRedirect = (at) => {           // at = index of the `>`/`<` operator
       let r = at;
@@ -8405,26 +8406,32 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     };
     for (;;) {
       const p = skipWsNl(k);
-      if (s[p] === "#") return { args: out, k: resumeAt !== null ? resumeAt : p };
+      if (s[p] === "#") return { args: out, tildes, k: resumeAt !== null ? resumeAt : p };
       if (s[p] === ">" || s[p] === "<") {
         if (resumeAt === null) resumeAt = p;
         const r = skipRedirect(p);
-        if (r.stop) return { args: out, k: resumeAt };
+        if (r.stop) return { args: out, tildes, k: resumeAt };
         k = r.at;
         continue;
       }
       const w = readWord(p);
-      if (!w.w) return { args: out, k: resumeAt !== null ? resumeAt : p };
+      if (!w.w) return { args: out, tildes, k: resumeAt !== null ? resumeAt : p };
       if (/^[0-9]+$/.test(w.w) && (s[w.k] === ">" || s[w.k] === "<")) {   // `2>/dev/null` — an FD prefix
         if (resumeAt === null) resumeAt = p;
         const r = skipRedirect(w.k);
-        if (r.stop) return { args: out, k: resumeAt };
+        if (r.stop) return { args: out, tildes, k: resumeAt };
         k = r.at;
         continue;
       }
       out.push(w.w);
+      // ⛔ A QUOTED OR ESCAPED `~` IS NOT A TILDE WORD: bash expands `~` LEXICALLY,
+      // before quoting is stripped, so `pushd "~"` / `pushd '~'` / `pushd \~`
+      // hand pushd a LITERAL `~` that does not exist — rc 1, NOTHING changes.
+      // `readWord` returns the DE-QUOTED text, so the raw start character is the
+      // only place that distinction survives.
+      tildes.push(s[p] === "~");
       k = w.k;
-      if (out.length >= 64) return { args: out, k: resumeAt !== null ? resumeAt : k };   // bounded
+      if (out.length >= 64) return { args: out, tildes, k: resumeAt !== null ? resumeAt : k };   // bounded
     }
   };
   // ── THE DIR-STACK VERBS' ARGV MODEL (#3955 review round 3), MEASURED on
@@ -8452,15 +8459,28 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   //   for `popd` ANY other word is "invalid argument" (rc 2) with the stack AND
   //        the cwd untouched — `popd +1 extra`, `popd extra +1`, `popd -n extra`
   //        — so it must never be read as the bare form.
-  // ⛔ DECLARED RESIDUAL (not modelled here, and pre-existing for every verb in
-  // this walker): EXIT STATUS. When a dir-stack verb ERRORS, bash marks the
-  // command failed and skips a following `&&` list; this walker runs the RHS
-  // anyway, because `&&` is handled as a plain segment separator. It was inert
-  // while `pushd -n <dir>` was a no-op and became visible once that form really
-  // inserts (measured: `cd a; pushd -- && pushd -n .. ; popd; …` — bash keeps
-  // `a`, the model lands at the hub root). Correcting it means gating `&&` on
-  // the previous command's status for the WHOLE walker, which is a different
-  // change than #3955.
+  // ⛔ DECLARED RESIDUALS (not modelled here, and pre-existing for every verb in
+  // this walker):
+  //  • EXIT STATUS — when a dir-stack verb ERRORS, bash marks the command failed,
+  //    so it skips a following `&&` list AND it SKIPS a following `||` list when
+  //    the verb SUCCEEDED (both directions are unmodelled). This walker runs
+  //    whichever RHS follows, because `&&`/`||` are handled as plain segment
+  //    separators. Measured: `cd a; pushd -- && pushd -n .. ; popd; …` (bash
+  //    keeps `a`, the model reaches the hub root) and `cd a; pushd ../docs ||
+  //    popd; …` (bash stays in docs, the model pops to `a`). Inert while
+  //    `pushd -n <dir>` was a no-op; visible now that the form really inserts.
+  //    Fixing it means gating `&&`, `||` AND `;` on the previous command's status
+  //    for the WHOLE walker — a different change than #3955.
+  //  • LAZY OPERAND RESOLUTION for `pushd -n <relative>`. bash stores the operand
+  //    STRING and resolves it at the LATER cd, from whatever cwd holds then; this
+  //    model stores the eager `resolve(cwd, word)`. The two differ only when a
+  //    `cd`/`pushd` intervenes before the entry is consumed (measured, cwd `hub`:
+  //    `pushd sub; pushd -n ../a; cd ..; popd --` — bash's popd fails from `hub`
+  //    and stays there, the model lands in `a`). Both realities share ONE cwd at
+  //    insert time, so the cwd-fork machinery cannot carry them; the fix is to
+  //    store the raw word and resolve it in `cdTo` at use time, which changes the
+  //    meaning of every stack entry and is therefore its own change.
+  //  • `pushd -n $VAR +N`: same cwd, two stacks — see the note at the dir arm.
   const popdArgv = (args, fr) => {
     let nFlag = false, sel = null, sawDD = false, unprovable = false, invalid = false;
     for (const w of args) {
@@ -8522,8 +8542,10 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   // Returns null when the whole form is modelled here, or `{ dirWord }` when the
   // form reduces to a PLAIN directory operand (`pushd -- <dir>`) that the shared
   // cd path in the walker body must run — one cd implementation, not two.
-  const pushdArgv = (args, fr, cwd) => {
+  const pushdArgv = (args, fr, cwd, tildes) => {
     let nFlag = false, sawDD = false, mode = null, nums = null, dirWord = null, extra = 0;
+    let dirTilde = false;                            // dirWord was a BARE (unquoted) `~`
+    const lateNums = [];                             // numeric operands AFTER a directory operand
     // ⛔ `-n` IS POSITION-SENSITIVE (#3955 review round 4, measured on bash
     // 5.2.21): option scanning stops at the first NON-NUMERIC argument, so
     //   `pushd +1 -n`      HONOURS it (rc 0, rotation without cd)
@@ -8534,9 +8556,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     //   `pushd -n ../c -n` INSERTS (harmless once `-n` is already in effect)
     // Numeric operands do NOT close the scan; any other word does.
     let optClosed = false;
-    for (const w of args) {
+    for (let ai = 0; ai < args.length; ai++) {
+      const w = args[ai];
+      const isTilde = tildes ? tildes[ai] === true : false;
       if (sawDD) {                                   // after `--` every word is a LITERAL operand
-        if (mode === null) { mode = "dir"; dirWord = w; } else extra++;
+        if (mode === null) { mode = "dir"; dirWord = w; dirTilde = isTilde; } else extra++;
         continue;
       }
       if (w === "--") { sawDD = true; optClosed = true; continue; }
@@ -8544,7 +8568,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (m) {
         if (mode === null) { mode = "numeric"; nums = [m]; }
         else if (mode === "numeric") nums.push(m);   // LAST wins, but every one is range-checked
-        else { if (mode === "dir" && nFlag) continue; extra++; }
+        else { if (mode === "dir" && nFlag) continue; extra++; if (mode === "dir") lateNums.push(m); }
         continue;
       }
       if (w === "-n") {
@@ -8555,13 +8579,13 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       }
       if (mode === null) {
         if (w.startsWith("-")) { mode = "flag"; optClosed = true; continue; }   // `-x` / `-` (OLDPWD, #2177's residual)
-        mode = "dir"; dirWord = w;
+        mode = "dir"; dirWord = w; dirTilde = isTilde;
         continue;
       }
       if (mode === "dir") { if (nFlag) continue; extra++; continue; }
       optClosed = true; extra++;                     // non-numeric in numeric mode: ignored, scan closed
     }
-    if (mode === "numeric") {
+    const runNumeric = (numsArr) => {
       const S = vstack(fr.cwd);
       // ⛔ EVERY NUMERIC OPERAND IS RANGE-CHECKED, and the LAST one is the one
       // APPLIED — measured: `pushd +1 +1` on a 3-entry stack rotates ONCE (not
@@ -8584,8 +8608,8 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // dropping the form AND the later operand).
       const rotOf = (m) => (m[1] === "+" ? Number(m[2]) : S.length - 1 - Number(m[2]));
       const cdOf = (m) => (m[1] === "+" ? Number(m[2]) : Number(m[2]) + 1);
-      for (const m of nums) if (Number(m[2]) >= S.length) return null;   // out of range → bash error, nothing changes
-      const last = nums[nums.length - 1];
+      for (const m of numsArr) if (Number(m[2]) >= S.length) return null;   // out of range → bash error, nothing changes
+      const last = numsArr[numsArr.length - 1];
       if (nFlag) {
         // No cd ever happens. bash REPLACES the rotated-in entry with the
         // current dir; that entry is element 0 of the stack, which `vstack`
@@ -8604,7 +8628,8 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           : S.slice(S.length - k).concat(S.slice(0, S.length - k)))); // rotate right
       }
       return null;
-    }
+    };
+    if (mode === "numeric") return runNumeric(nums);
     if (mode === "flag") { fr.pending = null; return null; }      // conservative no-op
     if (mode === null) {
       if (nFlag) return null;                                    // `pushd -n --` — nothing changes
@@ -8615,7 +8640,24 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       return null;
     }
     // mode === "dir"
-    if (extra > 0 && !nFlag) return null;                        // "too many arguments" — nothing changes
+    // ⛔ An UNQUOTED `$VAR` operand can be REMOVED, which is why `pushd $NOPE +N`
+    // is NOT "too many arguments": bash sees `pushd +N` — a rotation WITH its cd
+    // (measured, 2-entry stack `[docs, a]`: `pushd $NOPE +1` ⇒ cwd `a`). Both
+    // realities are emitted: the rotation landing as the primary and the
+    // unchanged cwd as the alt.
+    if (extra > 0 && !nFlag) {
+      if (dirWord && /^[$`]/.test(dirWord) && lateNums.length) {
+        const keep = fr.cwd;
+        runNumeric(lateNums);
+        const landing = fr.pending;
+        if (landing && landing !== keep) {
+          fr.forkCwd = fr.forkCwd || landing;
+          fr.forkAlts = [...new Set([...(fr.forkAlts || []), keep])].filter((x) => x !== landing).slice(0, 64);
+        }
+        return null;
+      }
+      return null;                        // "too many arguments" — nothing changes
+    }
     if (nFlag) {
       // -n <dir>: insert below the top, no cd. ⛔ `-n` NEVER stat()s the operand —
       // bash inserts the operand STRING verbatim and the validation happens at the
@@ -8623,8 +8665,9 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // because bash expands it BEFORE `pushd` sees it (measured on a 2-deep
       // stack: `pushd -n ~; popd` lands in $HOME, not on the previous top —
       // leaving `~` uninserted skewed the stack by one).
-      const tilde = dirWord && (dirWord === "~" || dirWord.startsWith("~/"))
-        ? (typeof process !== "undefined" && process.env && process.env.HOME ? resolve(process.env.HOME, dirWord.slice(1)) : null)
+      const home = typeof process !== "undefined" && process.env ? process.env.HOME : null;
+      const tilde = dirWord && dirTilde && home
+        ? (dirWord === "~" ? home : resolve(home, dirWord.slice(2)))
         : undefined;
       const ins = dirWord && dirWord !== "-" && !/^[$`]/.test(dirWord)
         ? (tilde !== undefined ? tilde : resolve(cwd, dirWord)) : null;
@@ -8637,9 +8680,9 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     //   `cd a; pushd ../docs; pushd ~; popd; …`  bash cds to $HOME and the popd
     // lands back in `docs`, which the no-op model read as `a`. `~user` stays
     // undecidable (declared residual, same as `cd ~user`).
-    if (dirWord === "~" || dirWord.startsWith("~/")) {
+    if (dirTilde && dirWord && (dirWord === "~" || dirWord.startsWith("~/"))) {
       const home = typeof process !== "undefined" && process.env ? process.env.HOME : null;
-      if (home) return { dirWord: resolve(home, dirWord.slice(1)) };   // `~` → HOME, `~/x` → HOME/x
+      if (home) return { dirWord: dirWord === "~" ? home : resolve(home, dirWord.slice(2)) };   // `~` → HOME, `~/x` → HOME/x (`slice(2)`, NOT `slice(1)`: the latter keeps the `/` and resolve() then discards HOME → the ROOT)
       return null;                                                        // declared residual: no HOME
     }
     // ⛔ AN UNQUOTED `$VAR`/BACKTICK OPERAND IS *REMOVED* WHEN EMPTY, so bash runs
@@ -9823,7 +9866,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (isPushd) {
         const argv = readOperandWords(nxt);
         i = argv.k;
-        const onlyDir = pushdArgv(argv.args, f(), cwd);
+        const onlyDir = pushdArgv(argv.args, f(), cwd, argv.tildes);
         if (!onlyDir) continue;
         tgt = { w: onlyDir.dirWord, k: i };   // a plain directory operand — the shared cd path below
       }

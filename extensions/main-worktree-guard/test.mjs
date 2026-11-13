@@ -5378,7 +5378,7 @@ try {
   // is to MODEL the rotation rather than to ignore it.
   {
     const H = mkdtempSync(join(tmpdir(), "bwt437r47-"));
-    for (const d of ["a", "b", "c", "docs"]) mkdirSync(join(H, d));
+    for (const d of ["a", "b", "c", "docs", "sub"]) mkdirSync(join(H, d));
     const cands = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath);
     const pluck = (cmd) => cands(cmd).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
     const has = (cmd, needle, label) => expectBool(`C437r47: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
@@ -5707,6 +5707,29 @@ try {
     has("cd a; pushd ../docs; pushd ~; popd; echo x > tracked.md", "redirect:H/docs/tracked.md", "R5d: `pushd ~` cds to $HOME (an unquoted tilde is never removed), so the popd lands back on docs");
     blocks(["docs/tracked.md"], "cd a; pushd ../docs; pushd ~; popd; echo x > tracked.md", "R5d gate: TRACKED docs/tracked.md → BLOCK (the no-cd/no-push model landed on a → ALLOW)");
     has("cd a; pushd ../docs; pushd -n ~; popd; echo x > tracked.md", `redirect:${join(process.env.HOME || "/root", "tracked.md")}`, "R5e: `pushd -n ~` inserts $HOME, so the popd cd's THERE (the stack is skewed by one otherwise)");
+    // ── #3955 review round 6. The round-5 tilde branch keyed on the DE-QUOTED
+    // word (`readWord` strips quotes) and sliced `~/x` wrongly:
+    //  • bash expands `~` LEXICALLY, so a QUOTED or ESCAPED `~` reaches pushd
+    //    literally — `pushd "~"` / `'~'` / `\~` are rc 1 with nothing changed,
+    //    while the round-5 model cd'd to $HOME (meas FOPEN, a regression vs round 4);
+    //  • `resolve(HOME, "~/x".slice(1))` keeps the leading `/`, so resolve()
+    //    DISCARDED HOME and produced the ROOT path — `/docs`, not `$HOME/docs`.
+    has("cd a; pushd \"~\"; echo x > tracked.md", "redirect:H/a/tracked.md", "R6a: a QUOTED tilde is a literal `~` — bash errors and changes nothing");
+    blocks(["a/tracked.md"], "cd a; pushd \"~\"; echo x > tracked.md", "R6a gate: TRACKED a/tracked.md → BLOCK (expanding the de-quoted `~` moved the write to $HOME → ALLOW)");
+    has("cd a; pushd '~'; echo x > tracked.md", "redirect:H/a/tracked.md", "R6b: single-quoted `~` is literal too");
+    has("cd a; pushd \\~; echo x > tracked.md", "redirect:H/a/tracked.md", "R6b control: an ESCAPED `~` is literal (#3955 review round 6)");
+    has("cd a; pushd -n \"~\"; popd; echo x > tracked.md", "redirect:H/a/tracked.md", "R6c: `pushd -n \"~\"` inserts the literal string, so the popd's cd FAILS and the cwd stays a");
+    // `~/sub` needs HOME to point INSIDE the fixture, where the directory exists.
+    {
+      const savedHome = process.env.HOME;
+      process.env.HOME = H;
+      has("cd a; pushd ~/docs; echo x > tracked.md", "redirect:H/docs/tracked.md", "R6d: `pushd ~/docs` cds to $HOME/docs (slice(2) — slice(1) kept the `/` and resolved the ROOT)");
+      blocks(["docs/tracked.md"], "cd a; pushd ~/docs; echo x > tracked.md", "R6d gate: TRACKED docs/tracked.md → BLOCK (`/docs` does not exist, so the no-cd model stayed in a → ALLOW)");
+      has("cd a; pushd -n ~/sub; popd; echo x > tracked.md", "redirect:H/sub/tracked.md", "R6e: `pushd -n ~/sub` inserts $HOME/sub, so the popd cd's there");
+      process.env.HOME = savedHome;
+    }
+    has("cd a; pushd ../docs; pushd $NOPE +1; echo x > tracked.md", "redirect:H/a/tracked.md", "R6f: `pushd $NOPE +1` — the empty expansion is REMOVED, so bash runs `pushd +1` (rotation WITH its cd)");
+    blocks(["a/tracked.md"], "cd a; pushd ../docs; pushd $NOPE +1; echo x > tracked.md", "R6f gate: TRACKED a/tracked.md → BLOCK (the 'too many arguments' model stayed in docs → ALLOW)");
   }
 
 
