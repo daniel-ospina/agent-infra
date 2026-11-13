@@ -84,6 +84,11 @@ mk_chain() { # mk_chain <fixture-path>   (writes into the CURRENT case's $OT)
 printf '%s\\n' "\$1" >> "${T:?}/chain-repo.txt" 2>/dev/null || true
 # …and its whole argv, so a suite can assert the BRANCH the chain was handed (arg 4).
 printf '%s\\n' "\$*" >> "${T:?}/chain-argv.txt" 2>/dev/null || true
+# …and what it INHERITED as REQ. lane-merge must hand the chain the contract the OPERATOR supplied,
+# never the one lane-merge resolved for itself (#4039 review P2). Bracketed so an unset and an empty
+# value both print as an empty pair of brackets — the arms below assert exactly that, and a laundered
+# fallback set does not.
+printf '[%s]\\n' "\${REQ:-}" >> "${T:?}/chain-env.txt" 2>/dev/null || true
 printf 'rail: MERGED via the rail (stub)\\n'
 printf 'closed|2026-10-18T00:00:00Z|head123|clean\\n' > "$1"
 # MK_MERGED makes this stub behave like merge-one.sh on a real merge: it writes the marker the
@@ -1468,6 +1473,9 @@ ck "…and the chain did not launch" \
 reset_stub_knobs; CHECKS_STUB="$T/checks-150-short.tsv"; FULL_CHECKS_STUB="$T/checks-150-full.tsv"
 new_o "$T/pr638c.tsv"
 run_stub 65 --repo o/r --pr-tsv "$T/pr638c.tsv"
+# The chain is launched DETACHED, so its log is written after this returns — the same 1 s settle the
+# green-launch cases above use. Without it this case is a race on the stub's write, not a verdict.
+sleep 1
 ck "a COMPLETE full read (150 of 150 rows) is still GREEN and the chain IS launched — the assertion does not over-block" \
    $([ "$RC" = 11 ] && grep -q "MERGED via the rail" "$OT/logs/lane-merge-65.log" 2>/dev/null && echo 0 || echo 1)
 ck "…and no truncated-read line was emitted for it" \
@@ -2233,6 +2241,161 @@ disown "$SPID3" 2>/dev/null; kill "$SPID3" 2>/dev/null; wait "$SPID3" 2>/dev/nul
 marker2="$(sed -n 's/.*lane-merge-handoff: \([^ ]*\) -->.*/\1/p' "$T/gh2.log" 2>/dev/null | tail -1)"
 ck "…and the handoff marker still names that head, not 'unknown' (per-head dedup survives)" \
    $([ "$marker2" = head123 ] && echo 0 || echo 1)
+
+# ══════════════ #4014 — THE WAIT AND THE FIX FOLLOW THE REPO'S REQUIRED SURFACE ══════════════
+# MEASURED SYMPTOM (tortoise #12171, head 49840e6e): 57 check names, 24 queued for 70 minutes, and
+# ONE red — `agent-infra-ci / lint` — that is not one of tortoise's 7 required contexts. The loop spent
+# a FIX round on it and waited out the queue behind it, so the lane burned its cap on work the merge
+# contract does not gate on and the owner admin-merged past CI instead.
+# ⛔ THE FAIL-CLOSED HALF IS THE ONE THAT MATTERS: with NO readable contract (this suite's `gh` stub
+# answers nothing for `branches/main/protection`, so `REQ_SOURCE=fallback`) every red is still a fix
+# round — that is case 5 above, unchanged and passing. The cases below inject a REAL contract through
+# the resolver's own operator override (`REQ`), so the new path is exercised through shipped code and
+# not through a second seam invented for the test.
+run_req() { # run_req <required-set> <pr> <args…> — `run` with the REQUIRED set pinned
+  local _req="$1"; shift
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REQ="$_req" \
+        REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+        LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT="${WAIT_S:-0}" LANE_MERGE_POLL="${POLL_S:-0}" \
+        LANE_MERGE_ELAPSED_S="${LANE_MERGE_ELAPSED_S:-}" \
+        bash "$SCRIPT" "$@" 2>&1)"; RC=$?
+}
+
+# 4014-a. an ADVISORY red spends NO fix round — and is REPORTED, never hidden.
+# ⛔ A FRESH FIXTURE PER CASE: the stub chain REWRITES the fixture it is handed, so a shared file
+# carries "closed|merged" into the next case and every later assertion reads a MERGED PR.
+pr_open_4014() { printf 'open||abc123|clean\n' > "$T/pr4014.tsv"; }
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'unit' 301 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-red.tsv"
+sleep 1
+ck "an ADVISORY red (lint, not required) spends NO fix round and does NOT block — the chain is reached" \
+   $([ "$RC" != 10 ] && [ ! -f "$OT/state/lanemerge-301.round" ] && grep -q "launched the merge chain" <<<"$OUT" && echo 0 || echo 1)
+ck "…and the advisory red is NAMED in the output rather than silently dropped" \
+   $(grep -q "ADVISORY (not in o/r's required set: unit)" <<<"$OUT" && grep -q "lint" <<<"$OUT" && echo 0 || echo 1)
+
+# 4014-b. a REQUIRED red is STILL a fix round (the change must not weaken the gate).
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'lint' 302 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-red.tsv"
+ck "a REQUIRED red is still exit 10 FIX_REQUIRED naming it (the gate is not weakened)" \
+   $([ "$RC" = 10 ] && grep -qE "required checks are RED: lint$" <<<"$OUT" && [ "$(cat "$OT/state/lanemerge-302.round")" = 1 ] && echo 0 || echo 1)
+
+# 4014-c. an ADVISORY in-flight job is NOT waited for; a REQUIRED one is.
+printf 'lint\tqueued\t\t51\nunit\tcompleted\tsuccess\t52\n' > "$T/checks-advq.tsv"
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'unit' 303 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-advq.tsv"
+sleep 1
+ck "a REQUIRED set that is COMPLETE is not held by an ADVISORY job still queued (the 24-queued-checks tax)" \
+   $([ "$RC" = 11 ] && grep -q "launched the merge chain" <<<"$OUT" && echo 0 || echo 1)
+
+# 4014-d. a REQUIRED name that is not published YET is IN FLIGHT, never green.
+# Tortoise's `python-ci-gate` appears only when its whole needs-graph finishes, so its absence is
+# the normal state for most of a PR's life — and reading it as "nothing left to wait for" would
+# merge past the repo's own gate.
+printf 'lint\tcompleted\tsuccess\t61\n' > "$T/checks-nogate.tsv"
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'python-ci-gate' 304 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-nogate.tsv"
+ck "a required check NOT YET PUBLISHED is in flight (WAITING_CHECKS), and the chain is NOT launched" \
+   $([ "$RC" = 11 ] && grep -q "NOT PUBLISHED YET" <<<"$OUT" && [ ! -f "$OT/logs/lane-merge-304.log" ] && echo 0 || echo 1)
+
+# 4014-e. THE CONTRACT IS UNREADABLE → EVERY check is required (this suite's default stub).
+# The same red that 4014-a ignored must BLOCK here, or the fail-closed direction is broken.
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run 305 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-red.tsv"
+ck "an UNREADABLE contract makes every red a fix round again (fail-closed, source=fallback)" \
+   $([ "$RC" = 10 ] && grep -q "UNREADABLE" <<<"$OUT" && grep -qE "required checks are RED: lint$" <<<"$OUT" && echo 0 || echo 1)
+
+# 4014-f. a `<caller> / <job>` surface name still matches its required parent.
+# GitHub renders a reusable workflow's job that way (`agent-infra-ci / lint`), so a required bare
+# name must not be silently demoted to advisory by the prefix alone.
+printf 'agent-infra-ci / lint\tcompleted\tfailure\t71\n' > "$T/checks-prefixed.tsv"
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'lint' 306 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-prefixed.tsv"
+ck "a '<caller> / <job>' name matches its required bare parent (and is therefore a fix round)" \
+   $([ "$RC" = 10 ] && grep -q "required checks are RED: agent-infra-ci / lint$" <<<"$OUT" && echo 0 || echo 1)
+
+# 4014-g. THE SAME NAME, GREEN — the half the RED case cannot cover (review P1 on #4039).
+# The first revision's `missing` test asked `n not in names` while `is_required` accepted a
+# `<caller> / <job>` rendering, so a required check that was PRESENT and GREEN as
+# `agent-infra-ci / lint` was simultaneously reported as "not published yet": `_eff` never reached 0,
+# the loop waited out the whole bound on a complete green required surface, and it printed
+# `(0) in flight` over a cause that was never a count. Both readers now share one rule.
+printf 'agent-infra-ci / lint\tcompleted\tsuccess\t72\n' > "$T/checks-prefixed-green.tsv"
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'lint' 307 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-prefixed-green.tsv"
+sleep 1
+ck "a '<caller> / <job>' REQUIRED check that is GREEN satisfies the surface — the chain is reached, not a full dead wait" \
+   $([ "$RC" = 11 ] && ! grep -q 'NOT PUBLISHED YET' <<<"$OUT" && grep -q "launched the merge chain" <<<"$OUT" && echo 0 || echo 1)
+ck "…and it never reports the required check as MISSING in the verdict (the two readers agree)" \
+   $(! grep -q 'required and unpublished' <<<"$OUT" && echo 0 || echo 1)
+
+# 4014-h. A BOUND REACHED ONLY BECAUSE A REQUIRED CHECK IS UNPUBLISHED NAMES IT (review P1 on #4039):
+# quoting `0` in flight over a real cause sends the reader after a slow CI run that does not exist.
+pr_open_4014
+new_o "$T/pr4014.tsv"
+run_req 'python-ci-gate' 308 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-prefixed-green.tsv"
+ck "the bound verdict NAMES the unpublished required check instead of reporting an unexplained 0 in flight" \
+   $([ "$RC" = 11 ] && grep -q 'the ONLY thing outstanding is required check(s) not published' <<<"$OUT" && grep -q 'required and unpublished: python-ci-gate' <<<"$(verdict_of 308)" && echo 0 || echo 1)
+
+# 4014-i. THE RESOLVED CONTRACT MUST NOT REACH THE CHAIN AS AN OPERATOR OVERRIDE (review P2, #4039).
+# `REQ` is the documented override the other consumers honour, the fleet launcher EXPORTS it
+# (`multi-repo-controller.sh:145`), and in bash an assignment does not clear the export attribute — so
+# lane-merge's own `REQ` (here: the FALLBACK list, because the override below is unusable and the
+# protection read is unreadable) was inherited by the detached chain, read there as `REQ_SOURCE=env`,
+# which disarms merge-one.sh's UNKNOWN-contract refusal (:983) and lets `merge_authority` answer `gate`
+# on a rail repo. Pre-fix the chain records the fallback list here; the fix hands it nothing.
+pr_open_4014
+new_o "$T/pr4014.tsv"
+: > "$T/chain-env.txt"
+run_req 'a,b' 309 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-ok.tsv"
+sleep 1
+ck "a discarded/unreadable contract is NOT laundered into the chain's REQ (merge-one.sh's own refusal stays armed)" \
+   $([ "$(cat "$T/chain-env.txt" 2>/dev/null)" = '[]' ] && echo 0 || echo 1)
+
+# 4014-j. …AND A USABLE OVERRIDE STILL PASSES THROUGH UNCHANGED (the fix must not just blank it).
+# The controller hands a frozen contract on purpose; only the RESOLVED value is forbidden.
+# ⛔ `unit` IS GREEN IN checks-red.tsv, so with REQ=unit the required set is COMPLETE and the chain is
+# reached — the observable is the chain's own env, not a wait.
+pr_open_4014
+new_o "$T/pr4014.tsv"
+: > "$T/chain-env.txt"
+run_req 'unit' 310 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-red.tsv"
+sleep 1
+ck "…while the operator's own usable override still reaches the chain verbatim (source=env)" \
+   $([ "$(cat "$T/chain-env.txt" 2>/dev/null)" = '[unit]' ] && echo 0 || echo 1)
+
+# 4014-k. THE CONTRACT IS READ FROM THE MERGE PATH'S HOME, AND THE FILE IS NAMED IN THE LOG (review P3,
+# #4039). `merge-one.sh:170` resolves `_M1_MOD="${O_WORK:-$O}"` first, so the WORK ROOT governs and
+# this loop must read the same file or its wait-and-fix list describes a contract the merge does not
+# use; `orch-loop.sh:471` orders `$O` first, which is the cross-reader divergence the finding is about
+# — the remedy this file owes is that the choice is VISIBLE (`contract=<path>`), not silent. Two copies
+# with different sets: the run must report the WORK ROOT's, and must name that file.
+WR="$T/workroot"
+rm -rf "$WR"; mkdir -p "$WR"
+cat > "$WR/repo-authority.sh" <<'EOF'
+FALLBACK_REQ="workroot-required"
+resolve_required_checks() { REQ="workroot-required"; REQ_SOURCE=protection; return 0; }
+merge_authority() { printf 'gate\n'; }
+EOF
+pr_open_4014
+new_o "$T/pr4014.tsv"
+# The state dir's copy answers something ELSE, so the two arms cannot both be satisfied.
+printf '%s\n' 'resolve_required_checks() { REQ="statedir-required"; REQ_SOURCE=protection; return 0; }' \
+  > "$OT/repo-authority.sh"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" O_WORK="$WR" HOME="$T/home" REQ= \
+      REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 311 --repo o/r --pr-tsv "$T/pr4014.tsv" --checks-tsv "$T/checks-ok.tsv" 2>&1)"; RC=$?
+ck "the contract comes from \$O_WORK — the file merge-one.sh will source — not from another copy" \
+   $(grep -q 'workroot-required' <<<"$OUT" && ! grep -q 'statedir-required' <<<"$OUT" && echo 0 || echo 1)
+ck "…and the log NAMES the file it read, so a cross-reader divergence is visible instead of silent" \
+   $(grep -q "contract=$WR/repo-authority.sh" <<<"$OUT" && echo 0 || echo 1)
 
 echo
 if [ "$fail" -eq 0 ]; then
