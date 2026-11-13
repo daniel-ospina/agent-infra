@@ -204,6 +204,15 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
   human re-registers it", not as "the box is short a runner": its listener may still be live and
   still counted in `running`/`live`.
 
+  ⛔ `--json` CONSUMERS: `shared_registrations` is the CROSS-BOX channel (agent-infra#4004). It is a
+  LIST of `{name, dir, state, why}`, one entry per install whose `agentName` the pool reports BUSY
+  while NO worker of that install is running on this box — i.e. one GitHub registration carried by two
+  boxes, with the job being served elsewhere. Read it as "this slot is not this box's capacity", and
+  as a name to retire or rename by hand: nothing here repairs it (a destructive arm takes a name, and
+  that name belongs to the other box too). It is deliberately report-only and NOT a `problem`: the
+  pass changed nothing it should not have, so it must not mask `starvation` (exit 4). It is derived
+  from the classification, so it is published on passes that stop early.
+
   ⛔ `--json` CONSUMERS: `starvation` is THREE-VALUED and the healthy value is `"ok"`. `"starved"` is
   the alarm; `"unmeasured"` means the queue could not be read and the invariant was NOT evaluated —
   never read that as healthy (a monitor whose test is `starvation != "starved"` treats blindness as
@@ -246,6 +255,16 @@ EXIT  0 converged / nothing to do, or a CAPACITY ANSWER that is not a failure (`
       A pass whose provisioner refuses while THIS tool's disk arm says one more runner fits reports
       the verdict `guard-conflict` (exit 3, both sides' numbers in the notes): the two guards answer
       different questions, and the disagreement is a decision for a human, not an action failure.
+      ⛔ BUT A LOST RACE IS NOT ONE OF THOSE (agent-infra#4004 P1-a). The adapter publishes a slot it
+      could not fill as its OWN code (`install-ci-runner-x64.sh` rc 8 → `SlotUnusable`), and this file
+      SKIPS that index for the next free one instead of reporting a capacity conflict: a peer that
+      took the slot answered nothing about this box's arithmetic. The slot is named in
+      `slots_unusable` and in `notes`, no `problem_kind` is set, and the pass retries it next time.
+      ⛔ AND ONE UNUSABLE SLOT NEVER FREEZES GROWTH (P1-b): `_next_free_slot` is walked with the
+      skipped indexes passed in, so a leftover DIRECTORY without a `.runner` costs this pass one
+      index, not its whole target. Only when the pass ends BELOW target with skipped slots is the
+      skipped set promoted to `problems` (action-failed, exit 3) — a box that cannot grow at all is
+      loud, a box that grew past one bad index is not.
 
       `--install-unit` exits 0 on success, 1 when REFUSED before writing anything (an unusable
       WorkingDirectory or repo), and 3 when the pair could not be installed. 3 is NOT a rollback
@@ -343,6 +362,14 @@ MEM_RESERVE_MB = 2048
 # operator can see which number set the ceiling instead of inferring it.
 DISK_RESERVE_MB = 20480
 FOOTPRINT_MB_DEFAULT = 8192
+# ⛔ HOW MANY UNUSABLE SLOT INDEXES ONE PASS MAY WALK PAST (agent-infra#4004 P1-b). The provisioner
+# answers rc 8 for an index it cannot fill (a peer's in-flight add, a leftover directory, a dangling
+# `.runner` link) and this pass skips it for the next free one. Those skips are NOT charged to the
+# growth budget — a bad slot must never cost the box an addition — but the walk needs its own bound,
+# or a box whose whole numbering is wedged would issue installer calls until the pass timed out. At
+# the bound the pass stops, keeps the target unmet, and the post-loop arm promotes the skipped set to
+# `problems` (action-failed, exit 3): the wedge is then loud, and a human clears the paths.
+SLOT_SKIP_BUDGET = 8
 # ⛔ `_work` GROWTH IS COUNTED, AND IT ONLY EVER LOWERS THE CEILING: the measurement is the largest
 # install's current size, so a runner whose workspace grew to 20 GB raises the per-runner budget to
 # 20 GB and the ceiling drops with it — permanently, until that directory is trimmed. That is the
@@ -383,6 +410,19 @@ class UnitRefused(Exception):
 
 class ProvisionerRefused(ActionFailed):
     """The provisioner's OWN guard refused (exit 2). A refusal is an answer, not a failure."""
+
+
+class SlotUnusable(Exception):
+    """The requested SLOT could not be filled by this call (adapter rc 8) — neither an answer about
+    capacity nor a failure of this box (agent-infra#4004).
+
+    It is deliberately NOT an `ActionFailed`: 6 is spent on the adapter's own CONFIGURATION errors,
+    which must reach `problems` and page. This one means "something is sitting on that index — a peer
+    won the race for it, a peer's add is mid-flight, a stale leftover is there, or `.runner` is a
+    dangling link". The correct response is to SKIP THE INDEX and ask for the next free one, so one
+    unusable slot cannot freeze a box's growth, and to record the slot for a human rather than paging
+    one about capacity arithmetic the race never answered.
+    """
 
 
 # ── measurement ────────────────────────────────────────────────────────────────────────────────
@@ -2846,7 +2886,7 @@ def installed_unit_cwd_problems(
     return problems
 
 
-def _next_free_slot(root: str) -> int:
+def _next_free_slot(root: str, skip: frozenset[int] | None = None) -> int:
     """The first free slot in the provisioner's own numbering: base, base-2, base-3, ...
 
     Not `len(installs) + 1`. The numbering is repo-agnostic and this box carries installs that are
@@ -2861,12 +2901,30 @@ def _next_free_slot(root: str) -> int:
     past it, so the single call filled the gap AND the requested slot — two runners where the
     ceiling allowed one, with the pass then reporting `over-ceiling` for a breach it had just
     created (round 6, finding 1).
+
+    ⛔ AND THAT IS WHY THE SKIP SET EXISTS RATHER THAN A WIDER OCCUPANCY TEST (agent-infra#4004 P1-b).
+    The same predicate that keeps one call one addition also made a `.runner`-less directory a
+    PERMANENT wall: the installer refuses that path (`name is taken`), `discover()`/`reconcile` never
+    enumerate it, nothing retires it, so this function returned the SAME index on every pass for
+    ever and `live` never moved. TWO states are invisible to this predicate, and both loop: a
+    leftover DIRECTORY with no `.runner` (a SIGKILLed `add`), and a DANGLING `.runner` symlink —
+    `Path.exists()` follows the link and answers False, so the index reads FREE here while the pool
+    tool's own `[ -e ] || [ -L ]` calls it REGISTERED. `skip` is the indexes the PROVISIONER itself
+    told us it cannot fill (rc 8) during THIS pass; passing the next free one is still ONE call = ONE
+    addition, because the adapter adds exactly the index it is given.
+
+    ⛔ A 0-BYTE `.runner` IS NOT ONE OF THEM, and the field history must not be read as if it were.
+    `Path.exists()` is True for a zero-length REGULAR file, so such an index is SKIPPED, never
+    re-asked: one slot costs one slot and the pass moves on. Its class is CONFIG-LOST (a `.runner`
+    whose configuration was destroyed — reported, and deliberately never repaired, #3355), so
+    neither this function nor P1-b's skip set reaches it, and this change does not repair it.
     """
     base = Path(os.environ.get("RUNNER_AUTOSCALE_BASE") or (Path(root) / "gh-runner-x64"))
+    skipped = skip or frozenset()
     index = 1
     while True:
         slot = base if index == 1 else Path(f"{base}-{index}")
-        if not (slot / ".runner").exists():
+        if index not in skipped and not (slot / ".runner").exists():
             return index
         index += 1
 
@@ -3022,6 +3080,15 @@ def provision(target_count: int, repo: str = "", root: str = "") -> str:
         timeout=1800,
         env=child_env,
     )
+    if rc == 8:
+        # ⛔ THE ADAPTER'S THIRD CHANNEL: "THIS SLOT CANNOT BE FILLED BY THIS CALL" (agent-infra#4004).
+        # It is deliberately neither 2 (a capacity answer — a lost race answered nothing about this
+        # box's arithmetic, and reporting it as one produced the `GUARD CONFLICT … a human must decide
+        # which number is wrong (#9672)` page) nor 6 (a failure — that ended the fill loop, which is
+        # how one leftover DIRECTORY froze a box's growth for ever, P1-b). The pass SKIPS this index
+        # and asks for the next free one; the adapter's own sentence says which of the three sub-states
+        # it is, and that sentence travels in the note unparsed.
+        raise SlotUnusable(f"rc=8 {out[-300:]}")
     if rc == 2:
         # `install-ci-runner-x64.sh` publishes 2 as "A POOL GUARD REFUSED — nothing was attempted".
         # That is the headroom/gate verdict declining, not this tool failing: reported as a REFUSAL in
@@ -3068,6 +3135,12 @@ def converge(
         # real pass would do.
         "would_repair": [],
         "config_lost": [],
+        # ⛔ A SLOT THAT COULD NOT BE FILLED IS ITS OWN CLASS, NOT A PROBLEM AND NOT A CAPACITY
+        # ANSWER (agent-infra#4004). Each entry is `{index, why}` — the index the provisioner refused
+        # to fill and its own sentence about it — so a fleet reader can see the wedge without parsing
+        # notes. It is NOT `problems` (that would be a page on a lost race) and NOT silence (the
+        # slot would then be re-asked for ever, which is the freeze P1-b describes).
+        "slots_unusable": [],
         "plan": [],
         "notes": [],
         "verdict": "",
@@ -3093,6 +3166,7 @@ def converge(
 
     # 4. CLASSIFY ------------------------------------------------------------------------------
     classified: list[dict] = []
+    served_elsewhere: list[dict] = []
     for r in local:
         entry = pool.get(r.name)
         # ⛔ THE ORDER OF THESE BRANCHES IS THE SAFETY PROPERTY (review rounds 1–2).
@@ -3116,11 +3190,12 @@ def converge(
         #     runner the pool does not list at all — a listener that lost its broker connection
         #     can be executing while the API says nothing about it, and `--replace` would kill it.
         #  3. Only then the pool's own view.
+        worker = _worker_alive(r)
         if r.config_lost:
             state = "CONFIG-LOST"
         elif _repo_slug(r.repo) != _repo_slug(repo):
             state = "OTHER-REPO"
-        elif _worker_alive(r) or (entry is not None and entry.busy):
+        elif worker or (entry is not None and entry.busy):
             state = "BUSY"
         elif entry is None:
             state = "ORPHANED"
@@ -3128,6 +3203,42 @@ def converge(
             state = "SERVING"
         else:
             state = "DEAD"
+        # ⛔ A REGISTRATION THIS BOX DOES NOT SERVE — the CROSS-BOX duplicate (agent-infra#4004).
+        # An `agentName` is a REGISTRATION identity, not a per-box label: two boxes holding the same
+        # name share ONE registration (actions/runner's ConfigurationManager refuses or `--replace`s
+        # a duplicate name), so a stale copy on box B can be "online, busy=true" while box A serves
+        # the job. Measured: cell-4 held a stale copy of `pi-runner-x64-1` — a registration served by
+        # cell-2 — reported `online busy=true` while cell-4's own listener crash-looped, so a
+        # per-box audit counted a job it was not running as this box's capacity and nothing ever
+        # flagged it.
+        # ⛔ THE DISCRIMINATOR IS `busy` PLUS "NO LOCAL WORKER", NOT "online with no listener". A
+        # listener that merely died reads online at GitHub for a while (the session has not timed
+        # out yet), and that is the ordinary DEAD slot this tool repairs — calling it "another
+        # box's" would be a positive claim from a negative measurement (`ps` saw no Worker). `busy`
+        # says a JOB is executing: if no worker of THIS install is running, it is executing
+        # somewhere else, under a name this install also carries. Reported, never repaired: the
+        # registration is not ours to touch, and the destructive arms here take a name.
+        # ⛔ GATED ON `state == "BUSY"` AND NOT ON THE BARE CONDITION (review P2-1). `discover()`
+        # enumerates EVERY `<root>/gh-runner*` whatever repo it belongs to, while `read_pool(repo)` is
+        # ONE repo's pool — so an OTHER-REPO install keeps its `agentName` and `pool.get(name)` can be
+        # busy from a name COLLISION between the two repos (the default base name makes that
+        # structural on a multi-repo box). Asserting "two boxes share this registration" there would
+        # be false — different registrations, different repos — and the note it carries tells an
+        # operator to retire a copy of ANOTHER repo's LIVE runner, which is exactly what the
+        # OTHER-REPO branch above exists to prevent. `state == "BUSY"` is reached only after the
+        # CONFIG-LOST and OTHER-REPO arms, so it is the one place this fact can be true; `worker`
+        # false inside it means the busy flag came from the pool alone.
+        if state == "BUSY" and entry is not None and entry.busy and r.name and not worker:
+            served_elsewhere.append(
+                {
+                    "name": r.name,
+                    "dir": str(r.directory),
+                    "state": state,
+                    "why": "the pool reports this registration BUSY while no worker of this "
+                    "install is running — the job is being served under a name this box also "
+                    "carries, so this slot is not this box's capacity",
+                }
+            )
         classified.append(
             {
                 "name": r.name,
@@ -3178,6 +3289,14 @@ def converge(
             "makes this slot look FREE to the provisioner — it then installs a SECOND runner into "
             "the directory that listener is still running from."
         )
+    for entry in served_elsewhere:
+        record["notes"].append(
+            f"SHARED REGISTRATION {entry['name']} ({entry['dir']}): {entry['why']}. Two boxes "
+            "carrying one `agentName` share ONE GitHub registration, so a per-box audit counts a "
+            "job it is not running as this box's capacity. Nothing was changed here (that name is "
+            "the other box's too): retire or rename this copy deliberately, then re-register it "
+            "under this box's own prefix (agent-infra#4004)"
+        )
     record.update(
         ncpu=ncpu,
         mem_available_mb=mem_mb,
@@ -3195,6 +3314,11 @@ def converge(
         # deliberately not a `problem`. Appending there published `"config_lost": []`, a
         # positive claim that nothing is lost, on exactly the passes that stopped early.
         config_lost=[str(c["dir"]) for c in classified if c["state"] == "CONFIG-LOST"],
+        # ⛔ THE CROSS-BOX CHANNEL (agent-infra#4004). A registration whose job is being served by a
+        # box OTHER than this one, because both boxes carry the same `agentName`. Derived from the
+        # classification, never appended in a repair loop — so it is published on passes that stop
+        # early too. Report-only by design (see the classify branch for the discriminator).
+        shared_registrations=served_elsewhere,
         local=[{"dir": str(r.directory), "name": r.name} for r in local],
         pool_total=len(pool),
         pool_online=sum(1 for e in pool.values() if e.online),
@@ -3438,10 +3562,13 @@ def converge(
     #   * what a call ADDED is measured, never assumed, and compared like with like (installs with
     #     installs, listeners with listeners) — mixing populations produced a negative delta whose
     #     note contradicted the action line above it (round 4, finding 1);
-    #   * the loop is bounded twice: by `target` iterations and by LISTENER progress. Installs can
-    #     appear while no listener stays up (a rejected registration, a unit that exits), and
-    #     measuring only the install count made that state loop forever — hundreds of installer
-    #     calls in one pass (round 5, finding 2).
+    #   * the loop is bounded twice: by `max(1, target) + SLOT_SKIP_BUDGET` iterations (see the range
+    #     below — the skip budget is NOT charged to `target`, #4004 P1-b) and by LISTENER progress.
+    #     Installs can appear while no listener stays up (a rejected registration, a unit that exits),
+    #     and measuring only the install count made that state loop forever — hundreds of installer
+    #     calls in one pass (round 5, finding 2). ⛔ This sentence said "by `target` iterations" until
+    #     this same diff changed the bound; a reader who takes the number from here takes a bound the
+    #     code no longer has (review P3-2 at a35ad9570f).
     def _found() -> list[LocalRunner]:
         return discover(root)
 
@@ -3479,8 +3606,26 @@ def converge(
             "cannot report the box as converged"
         )
     installs_seen = len(local)
-    for _step in range(max(1, target)):
+    # ⛔ THE SLOT BUDGET IS NOT THE GROWTH BUDGET (agent-infra#4004 P1-b). A skipped index adds
+    # nothing, so charging it to `target` would mean a box with N bad slots below its ceiling never
+    # grows at all — the freeze this fix removes, one layer up. The extra steps are bounded by
+    # SLOT_SKIP_BUDGET, so a box whose whole numbering is wedged costs at most this many installer
+    # calls before it stops and REPORTS (see the post-loop arm), never a runaway walk.
+    skipped: list[int] = []
+    # ⛔ WHY THE FILL LOOP ENDED, because the promotion below must not guess (review P2-2). The
+    # loop exits for several legitimate reasons that are ALREADY classified — a provisioner refusal,
+    # a guard conflict, an action failure, the memory/disk reserve, an `Unmeasurable` measurement,
+    # `--dry-run`, or reaching the target — and a `problem` added on top of any of them would
+    # OVERRIDE it (`problems` is the first branch of the verdict chain): a refusal (exit 0) or a
+    # conflict (exit 3, both numbers in the notes) or `unverified` (unmeasurable, exit 2) would be
+    # replaced by a generic action-failure, and `problems` also sits above `starvation` and
+    # `config-lost`. So the reason is recorded at every exit, and the post-loop arm reads it.
+    stop_reason = "budget"
+    steps_taken = 0
+    live_before_fill = live
+    for _step in range(max(1, target) + SLOT_SKIP_BUDGET):
         if stop_pass or live >= target or disk_free_mb is None:
+            stop_reason = "target" if live >= target else "stopped"
             break
         try:
             before = mem_available_mb(meminfo)
@@ -3492,12 +3637,14 @@ def converge(
                 f"stopped: memory could not be read mid-pass ({exc}) — the actions above were "
                 "already performed; nothing further was done"
             )
+            stop_reason = "measure"
             break
         if before - MEM_PER_RUNNER_MB < MEM_RESERVE_MB:
             record["notes"].append(
                 f"stop: mem_available_mb={before} - per_runner_mb={MEM_PER_RUNNER_MB} "
                 f"< reserve_mb={MEM_RESERVE_MB} — one more would starve a shard"
             )
+            stop_reason = "memory-reserve"
             break
         # ⛔ THE DISK IS RE-MEASURED EVERY STEP, like the memory above. The pass bounds its ceiling
         # ONCE, so a fill that installs two runners would otherwise budget both against the space it
@@ -3522,8 +3669,9 @@ def converge(
                 f"stop: the disk free space could not be re-read mid-pass ({exc}) — nothing further "
                 "was added, and this pass cannot report the box as converged"
             )
+            stop_reason = "measure"
             break
-        index = _next_free_slot(root)
+        index = _next_free_slot(root, skip=frozenset(skipped))
         if dry_run:
             # A DRY RUN CANNOT MODEL A CONVERGENCE IT CANNOT MEASURE. The old plan assumed +1 per
             # call and printed N steps ending `converged`, while the real pass on the same box
@@ -3533,8 +3681,11 @@ def converge(
                 f"would ask the provisioner for install slot #{index} (mem_available_mb={before}); "
                 "how many listeners that yields is MEASURED by a real pass, not predicted here"
             )
+            stop_reason = "dry-run"
             break
         try:
+            steps_taken += 1  # one count per step that actually reaches the provisioner — a
+            # `--dry-run` breaks above this (it plans, it does not call), so it is not a step
             note = provision(index, repo=repo, root=root)
         except ProvisionerRefused as exc:
             # ⛔ TWO ANSWERS TO TWO DIFFERENT QUESTIONS. The installer budgets space for the WHOLE
@@ -3559,6 +3710,7 @@ def converge(
                     "about whether capacity can be added here, and a human must decide which number "
                     "is wrong (#9672)"
                 )
+                stop_reason = "guard-conflict"
                 break
             record["problem_kind"] = "refusal"
             record["notes"].append(
@@ -3568,10 +3720,30 @@ def converge(
                 "was left on the table HERE; the refusal's own reason is whatever it quoted, which "
                 "this tool does not interpret. Reported as an answer, not a failure (#9672)"
             )
+            stop_reason = "refusal"
             break
+        except SlotUnusable as exc:
+            # ⛔ NEITHER AN ANSWER NOR A FAILURE, AND NEITHER `break` NOR A `problem_kind`
+            # (agent-infra#4004 P1-a). The adapter said THIS INDEX cannot be filled by this call — a
+            # peer won the race for it, a peer's add is mid-flight, a stale leftover sits on it, or
+            # `.runner` is a dangling link. The box has not answered any capacity question, so this
+            # must NOT become `guard-conflict` (the #9672 page over a lost race) and must not become
+            # `provisioner-refused` (the capacity-answer channel, whose exit is 0). It is a skip: name
+            # the index, ask for the next free one, and let THIS pass still grow the box (P1-b).
+            skipped.append(index)
+            record["slots_unusable"].append({"index": index, "why": str(exc)[:400]})
+            record["notes"].append(
+                f"slot #{index} is UNUSABLE for this pass ({exc}) — nothing was added at #{index}, "
+                "and that is not an answer about capacity: skipping it and asking for the next free "
+                f"index, so one unusable slot does not stop this box from growing. The next pass "
+                f"retries #{index} (a path that persists across passes needs a human — this tool "
+                "never deletes a path it did not create)"
+            )
+            continue
         except ActionFailed as exc:
             record["problems"].append(str(exc))
             record["actions"].append(f"add runner (slot #{index}) FAILED: {exc}")
+            stop_reason = "action-failed"
             break
         try:
             after = mem_available_mb(meminfo)
@@ -3584,6 +3756,7 @@ def converge(
                 "stopped: the box could not be re-measured after an install — the action above "
                 "already happened; nothing further was done"
             )
+            stop_reason = "measure"
             break
         previous_live, live = live, _live(measured)
         record["actions"].append(
@@ -3612,6 +3785,7 @@ def converge(
                     "another call would repeat the same result — stopping instead of reporting a "
                     "convergence that did not happen"
                 )
+            stop_reason = "no-listener"
             break
         installs_seen = len(measured)
         if after < MEM_RESERVE_MB:
@@ -3619,7 +3793,38 @@ def converge(
                 f"stop: mem_available_mb={after} is below reserve_mb={MEM_RESERVE_MB} after this "
                 "install — the box is at its memory limit"
             )
+            stop_reason = "memory-reserve"
             break
+
+    # ⛔ A BOX THAT CANNOT GROW AT ALL IS LOUD; ONE THAT GREW PAST A BAD INDEX IS NOT (agent-infra#4004).
+    # A skipped slot is reported in `slots_unusable`/`notes` on every pass, but it is promoted to
+    # `problems` (verdict `action-failed`, exit 3) only when the SKIP WALK is what ended the pass below
+    # target — `stop_reason == "budget"`, i.e. the loop ran out of steps with no other exit taken.
+    # ⛔ THE `stop_reason` TERM IS NOT DECORATION (review P2-2). With only `skipped and live < target`,
+    # a pass that skipped a RACED index and then correctly stopped on a provisioner refusal, a guard
+    # conflict, a memory reserve or an `Unmeasurable` measurement was promoted to `action-failed` — the
+    # exit-3 page over a lost race that P1-a exists to remove, one layer up, and it also masked
+    # `unverified` and `starvation`. The skipped slots are still named in `slots_unusable`/`notes` in
+    # that case; they are simply not the reason the box is short.
+    # ⛔ AND THE WORDING MUST NOT CLAIM PERSISTENCE: only the leftover-directory sub-state persists. A
+    # raced index holds a PEER's registration and heals by itself, so the note points at
+    # `slots_unusable[*].why` for the provisioner's own words about each index instead of asserting one.
+    if skipped and live < target and stop_reason == "budget":
+        # ⛔ THE MESSAGE MUST BE TRUE IN BOTH SHAPES (review P3-1). The first version said "spent all
+        # {len(skipped)} of its usable steps … every index it was allowed to ask for came back
+        # unusable … could not grow the box", and each of those is false on a reachable path: the
+        # step budget is `max(1, target) + SLOT_SKIP_BUDGET` (not the skip count), and a pass that
+        # skipped ten indexes and then INSTALLED one has still exhausted its range with `live` below
+        # target — it grew the box and the arm still fires. So the numbers are counted, not inferred.
+        record["problems"].append(
+            f"the fill loop exhausted its step budget ({steps_taken} step(s)) with the box still "
+            f"BELOW its target (live={live}, target={target}, grew by {live - live_before_fill}): "
+            f"{len(skipped)} index(es) came back unusable "
+            f"({', '.join('#' + str(i) for i in skipped)}), and the rest of the budget was not "
+            "enough to reach the target. Each refusal's own reason is in `slots_unusable` — a "
+            "peer's in-flight add heals by itself, a leftover path or a dangling `.runner` link "
+            "needs a human (this tool never deletes a path it did not create)"
+        )
 
     # 7. VERDICT --------------------------------------------------------------------------------
     # ⛔ THE STARVATION ALARM (agent-infra#2875) IS EVALUATED HERE, ONCE, AND ON EVERY PASS THAT IS

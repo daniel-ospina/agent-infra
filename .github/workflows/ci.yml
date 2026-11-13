@@ -610,6 +610,22 @@ jobs:
         # catch it. python3 + bash only; its own step so one
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
+      - name: Lane triage router suite (#4046, zero-dep)
+        timeout-minutes: 4
+        # #4046 — the ROUTER that decides which remedy a waiting lane earns, with precedence
+        # user-question > wedged > idle-continue. The property it exists for is a NEGATIVE one —
+        # ZERO "continue" sent in reply to a question — so it cannot be reviewed into existence; it
+        # is a matrix assertion over question shape x verdict x steerability x turn boundary, with
+        # the positive control that the idle arm still fires for a genuine non-question. Its RED
+        # controls run by default: twelve ways of removing the property, each required to turn the
+        # suite red. Zero-dep (no cmux, no gh, no network, no clock) — the arms are driven through a
+        # fake `Surface`, which is what lets the user-question arm be proved END-TO-END here.
+        run: python3.12 tools/fleet/triage.test.py
+      - name: Lane triage router RED controls (#4046, zero-dep)
+        timeout-minutes: 3
+        # The suite is only a pin if it can FAIL. `--red-control` runs the mutation legs ALONE, so a
+        # future edit that deletes them from the default run cannot silently disarm them.
+        run: python3.12 tools/fleet/triage.test.py --red-control
       - name: PR state router suite (#2866, zero-dep)
         timeout-minutes: 4
         # #2866 — the router is the ONE answer to "what does this PR need next, and should anything

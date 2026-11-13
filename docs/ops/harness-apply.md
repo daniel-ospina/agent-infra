@@ -431,7 +431,7 @@ Only one token reds a pass this way:
 | token | pass result |
 |---|---|
 | **`executes:<dir>`** — a live controller executes a directory the box does not have | **exit 1**, `action=deployed-drift` |
-| `behind:<sha>`, `diverged:<sha>`, `payload-differs`, `uncommitted-edit:<path>`, `incomplete:<path>`, `source-dirty:<sha>`, `surface` | reported in `drift=`, pass stays green |
+| `behind:<sha>`, `diverged:<sha>`, `payload-differs`, `uncommitted-edit:<path>`, `incomplete:<path>`, `not-executable:<path>`, `source-dirty:<sha>`, `surface` | reported in `drift=`, pass stays green |
 | `UNKNOWN:` / exit 2 from the checker | reported, pass stays green (`cannot-verify-rc2`) |
 
 Scoped deliberately: the other tokens legitimately describe a developer box mid-edit or a
