@@ -1079,78 +1079,107 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 # must be scoped to the match it excepts, never to the line it happens to share (the rule Semgrep's
 # `pattern-not`, OPA's negation and Apache Traffic Server's regex guidance all state).
 #
-# THREE ESCAPES, each a spelling a genuinely clean outcome uses:
-#   (a) ZEROED / NEGATED — "no blocking", "non-blocking", "0 blocking", "zero blocking",
-#       "none blocking". This is `Outcome: CLEAN — no blocking issues found` (tortoise#8866), the
-#       measured false-refusal case that must stay ACCEPTED. ⛔ IT DOES NOT APPLY WHEN THE SAME LINE
-#       DECLARES A LIVE POSITIVE COUNT: `2 blocking (P1), 2 non-blocking (P3)` is a live blocker with
-#       a negated follow-up clause, not a clean review, and `... all 4 findings non-blocking` (no
-#       count) still escapes.
-#   (b) RESOLVED — the count is declared CLOSED: "3 blocking findings were fixed and re-verified".
-#       Five predicates, each of which a MEASURED vector defeated when it was missing:
-#         * a POSITIVE COUNT precedes the noun;
-#         * a COPULA/AUXILIARY (`were|was|are|is|being|been|now|all|both`) sits between the noun and
-#           the verb, because "closed the socket too early" is a description, not a resolution;
-#         * the verb is LEFT word-anchored (`[^[:alpha:]]`, so `unclosed` is not `closed`) and its
-#           RIGHT boundary excludes `-` (so `fixed-width` is not `fixed`);
-#         * NO NEGATION qualifier between the count's copula and the verb, because "were NOT fixed"
-#           is the same count with the OPPOSITE TRUTH VALUE — `were not fixed`, `are not yet
-#           resolved`, `were being addressed` and `were never resolved` were all MEASURED admitted at
-#           c33ae248b (review F1), where this window spanned the `not` and never read it.
-#         * EXACTLY ONE LIVE BLOCKING MENTION on the declaration line. (b) answers ONE count; a line
-#           carrying a SECOND live mention has a blocker (b) never accounted for, and the resolved
-#           half must not answer for it. `… 2 blocking (P1) findings were fixed, 1 blocking (P1)
-#           deferred to a follow-up` / `… filed as a follow-up` / `… waived` / `… accepted as a known
-#           risk` / `… left for a later cycle` / `… out of scope` were ALL MEASURED admitted at
-#           233982af4 (review F3). ⛔ THE FIX IS A RELATIONSHIP, NOT A WIDER SYNONYM LIST: deferral,
-#           filing and waiving are an OPEN-ENDED family, so (c) can never enumerate them; what CAN
-#           be counted is how many live blockers the line declares. A NEGATED mention (`no`/`non`/
-#           `zero`/`none`, or `0`) is not a live one, so `2 blocking were fixed; 4 non-blocking (P3)
-#           filed` still escapes (13n28).
-#       The window is bounded and `;`/`.`/`:`-terminated so an unrelated later clause cannot supply
-#       the verb.
-#   (c) NOT RESOLVED — a persistence qualifier inside the SAME window cancels (b):
-#       "2 blocking were fixed, 1 blocking remain" is still a live blocker, and exiting (b) on the
-#       wrong half was the whole point of adding it. ⛔ (c) IS NOT MADE REDUNDANT BY THE COUNT
-#       PREDICATE: a line with ONE live mention and a persistence word outside it (`2 blocking were
-#       fixed, 1 of them remains`) is reachable only through (c) — that is 13n29.
-# What the arm deliberately does NOT judge is whether a declared blocker was later fixed: `(b)` and
-# `(c)` read only the vocabulary of persistence, and `(b)`'s count predicate reads only the NUMBER of
-# live mentions — exactly as every other arm in this file reads shape and never substance.
+# ESCAPES — and the polarity is DEFAULT-DENY (agent-infra#2661 fourth review, F1+F2).
+#
+# The arm's question is "does this declaration say the gate cleared?" A declaration that names
+# blocking findings is NOT clean evidence unless it AFFIRMATIVELY says the whole declared set is
+# resolved. So: (a) zeroed/negated -> escape; a negated or in-progress resolution -> VETO; an
+# affirmative TOTAL resolution with nothing left over -> escape; EVERYTHING ELSE -> VETO. Unknown
+# vocabulary vetoes, which is the right direction for an evidence gate: a false PASS merges
+# unreviewed code, a false refusal costs a reworded re-run of the recorder.
+#
+# WHY DEFAULT-DENY, MEASURED. Three review rounds each widened a regex here and each was defeated by
+# one more word, because an ENUMERATED exception list can never be complete:
+#   * round 2 added the copula->verb negation conjunct. `none were fixed`, `nothing was resolved`,
+#     `neither was resolved` are negative SUBJECTS — they sit BEFORE the copula — so the conjunct
+#     never read them and all four bodies were ADMITTED (F1, at 233982af4).
+#   * round 3 made (b) answer ONE live blocking mention. `3 blocking (P1) — 2 were fixed`,
+#     `4 blocking (P1) — 3 were fixed`, `2 blocking (P1) — only one was fixed` and
+#     `2 blocking findings were fixed; 1 of them is still with us` were ADMITTED (F2): the count
+#     predicate bounded MENTIONS and never the DECLARED COUNT, and the persistence cancel could not
+#     catch the last one because `is still with us` / `was deferred` / `is a known risk` /
+#     `is carried to #1234` are an OPEN-ENDED family — enumerating it is the same mistake one word
+#     later.
+# So the escapes are no longer "not known to be open", they are "affirmatively closed":
+#
+#   (a) ZEROED / NEGATED — `no blocking`, `non-blocking`, `0 blocking`, `zero blocking`,
+#       `none blocking`, and ONLY with no live positive count on the line. This is
+#       `Outcome: CLEAN — no blocking issues found` (tortoise#8866), the measured false-refusal case
+#       that must stay ACCEPTED. It does NOT apply to `2 blocking (P1), 2 non-blocking (P3)`.
+#   (b) AFFIRMATIVE TOTAL RESOLUTION — the declared blockers are the SUBJECT of an affirmative
+#       resolution. The subject is the declared count (`3 blocking findings were fixed and
+#       re-verified`) or an explicit totality word (`all blocking findings resolved`,
+#       `both blockers were fixed`, `the blocking finding was fixed`). The verb stays left
+#       word-anchored (`[^[:alpha:]-]`, so `unclosed` is not `closed` and `fixed-width` is not
+#       `fixed`).
+#   (c) AND NOTHING LEFT OVER — otherwise the affirmative half is not the whole story:
+#       * NOT_RESOLVED — a negated resolution (`none|nothing|neither|not|never` ... verb) or an
+#         in-progress one (`being|partially|partly|pending|in progress` ... verb). Read inside the
+#         `;`-bounded clause that carries the declaration, so a `not` in an UNRELATED later clause
+#         cannot refuse a clean review (13n25).
+#       * PERSISTENCE — a persistence qualifier in that same clause (`remain|remaining|open|
+#         outstanding|unresolved|unfixed|unaddressed|deferred|pending|still|yet|known|carried|
+#         waived|left|partial|some|most|several|half|rest`). Kept as a BELT, not the mechanism:
+#         (b) already refuses anything that is not an affirmative totality, so an unlisted
+#         persistence word falls through to the veto rather than through it.
+#       * A SECOND COUNT — any other count token ANYWHERE on the line (`[1-9][0-9]*` or a spelled
+#         `one|two|...|ten|half|some|most|several|rest`), scanned after masking the declared
+#         `[N] blocking` phrases, the priority tags `(P0..P3)` and `N non-blocking`. THIS is what
+#         makes `— 2 were fixed` (declared 3), `— only one was fixed` and `; 1 of them is still
+#         with us` vetoes by ARITHMETIC rather than by vocabulary. Line-wide on purpose: a
+#         remainder must not be able to hide behind a `;`.
+# What the arm deliberately does NOT judge is whether a declared blocker WAS later fixed: it reads
+# only shape — a declared count, a totality, an arithmetic remainder — never substance.
 outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line names blocking findings
-  local decoded line live_count live_mentions _mentions _negated
+  local decoded line live_count _clause _rest
+  # A negated or in-progress resolution is not a resolution.
+  local _OC_NOT_RESOLVED='(^|[^[:alpha:]])(none|nothing|neither|not|never)[[:space:]]+[^.;:]{0,30}(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)'
+  local _OC_IN_PROGRESS='(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(being|partially|partly|pending|in[[:space:]]+progress)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)'
+  # A persistence qualifier anywhere after the declaration, inside the declaration's own clause.
+  local _OC_PERSIST='block(ing|ers?)[^.;:]{0,60}(remain|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|still|yet|known|carried|waived|left|partial|some|most|several|half|rest)'
+  # An affirmative TOTAL resolution: declared count, or an explicit totality word, as the subject.
+  local _OC_TAIL='([[:space:]]+([[:alpha:]-]+|\(p[0-3]\))){0,3}[[:space:]]+((were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2})?(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)'
+  local _OC_TOTAL="(^|[^0-9])[1-9][0-9]*[[:space:]_-]*block(ing|ers?)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}"
+  # Any count token that is not a declared blocking count / a priority tag / a negated mention.
+  local _OC_SECOND_COUNT='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten|half|some|most|several|rest)([^[:alpha:]]|$)|[1-9][0-9]*'
+  local _OC_ZEROED='(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)'
   decoded="$(tsv_decode "$1")"
   while IFS= read -r line; do
     # Only an `Outcome:` DECLARATION is this arm's question — anchored the way arm (1b) anchors it,
     # so prose that discusses an outcome is untouched.
     grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*[*[:space:]]*' <<<"$line" || continue
-    # A LIVE POSITIVE COUNT. The escapes may ANSWER it; none of them may CANCEL it.
+    # ...and it must NAME blocking findings. A declaration that does not mention them is not this
+    # arm's business at all, so it is SKIPPED — never vetoed (13n10: `Outcome: CLEAN — verified`
+    # with the blocking note in a separate line/blocks below it stays ACCEPTED).
+    grep -qiE 'block(ing|ers?)' <<<"$line" || continue
+    # A LIVE POSITIVE COUNT — the number that qualifies `blocking`, as opposed to a negated mention.
     live_count=0
-    grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)' <<<"$line" && live_count=1
-    # HOW MANY LIVE BLOCKING MENTIONS. (b) may answer ONE of them; a SECOND belongs to no escape.
-    # A NEGATED mention is not live (`non-blocking`, `no blocking`, `0 blocking`) — that is the
-    # tortoise#8866 class (a) exists for, and it must not be counted against (b) either.
-    _mentions="$(grep -oiE 'block(ing|ers?)' <<<"$line" | wc -l | tr -d '[:space:]')"
-    _negated="$(grep -oiE '(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)' <<<"$line" | wc -l | tr -d '[:space:]')"
-    live_mentions=$(( _mentions - _negated ))
-    # (a) zeroed / negated, and ONLY with no live count on the line.
-    if [ "$live_count" -eq 0 ] \
-       && grep -qiE '(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)' <<<"$line"; then
+    grep -qiE '(^|[^0-9])[1-9][0-9]*[[:space:]_-]*block(ing|ers?)' <<<"$line" && live_count=1
+    # (a) ZEROED / NEGATED, and ONLY with no live positive count on the line.
+    if [ "$live_count" -eq 0 ] && grep -qiE "$_OC_ZEROED" <<<"$line"; then
       continue
     fi
-    # (b) resolved — ONE live mention, then count, then copula, then a word-anchored verb, with NO
-    # negation qualifier between the copula and the verb, and (c) not a live blocker.
-    if [ "$live_mentions" -eq 1 ] \
-       && grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)[^.;:]{0,40}(were|was|are|is|being|been|now|all|both)[^.;:]{0,15}[^[:alpha:]](fixed|resolved|closed|addressed|re-verified)([[:space:],.;:!?)]|$)' <<<"$line" \
-       && ! grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)[^.;:]{0,40}(were|was|are|is|being|been|now|all|both)[^.;:]{0,15}[^[:alpha:]](not|never|yet|still|partially|pending|being)([^[:alpha:]]|$)' <<<"$line" \
-       && ! grep -qiE 'block(ing|ers?)[^.;:]{0,60}(remain|remaining|open|outstanding|unresolved|unfixed|unaddressed)' <<<"$line"; then
-      continue
-    fi
-    # Anything else that NAMES blocking findings declares the gate did not clear.
-    if grep -qiE 'block(ing|ers?)' <<<"$line"; then
+    # Everything below reads a LOWERCASED copy; the clause boundary is the first `;`.
+    _clause="$(printf '%s' "${line%%;*}" | tr '[:upper:]' '[:lower:]')"
+    # (c) NOTHING LEFT OVER — a negated/in-progress resolution, or a persistence qualifier.
+    if grep -qE "$_OC_NOT_RESOLVED|$_OC_IN_PROGRESS|$_OC_PERSIST" <<<"$_clause"; then
       OUTCOME_BLOCKING_LINE="$line"
       return 0
     fi
+    # (c) a SECOND count, with the declared counts / priority tags / negated mentions masked out.
+    _rest="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' \
+      | sed -E 's/[1-9][0-9]*[[:space:]_-]*(non-)?block(ing|ers?)/ BLKDECL /g; s/\(p[0-3]\)/ PTAG /g')"
+    if grep -qE "$_OC_SECOND_COUNT" <<<"$_rest"; then
+      OUTCOME_BLOCKING_LINE="$line"
+      return 0
+    fi
+    # (b) AFFIRMATIVE TOTAL RESOLUTION — the only shape that escapes.
+    if grep -qE "$_OC_TOTAL" <<<"$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"; then
+      continue
+    fi
+    # Anything else that NAMES blocking findings declares the gate did not clear.
+    OUTCOME_BLOCKING_LINE="$line"
+    return 0
   done <<<"$decoded"
   return 1
 }
