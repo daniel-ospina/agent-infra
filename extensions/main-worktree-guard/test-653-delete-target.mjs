@@ -357,6 +357,52 @@ for (const [name, cmd] of [
   expect(`A: ${name} → DATA, the real target survives`, extractPushDeleteBranch(cmd), ["held/branch"]);
 }
 
+// ── Round-17 review (P1 fail-open + P2 false block): a QUOTED substitution is ONE opaque WORD ─────
+// `_maskDataParens` masks a quoted span's parens (right for the parenthesis rules), and that was ALL it
+// did — so the token came back as literal text `$(echo -d)` and the segment walk never recognised it as
+// a span. Two consequences, both measured against `origin/main` with a stub-`git` argv probe:
+//
+//   (a) FAIL-OPEN: `git push origin -o "x -d y" "$(echo -d)" held/branch` → bash argv
+//       `push origin -o x -d y -d held/branch`, i.e. a REAL delete of `held/branch`. This branch
+//       returned `null` (no flag attributed → #73 never consulted → ALLOWED) where `origin/main` refused
+//       it. gnu.org *Command Substitution*: "If the substitution appears within double quotes, word
+//       splitting and pathname expansion are not performed on the results" — the span is exactly ONE
+//       argv word, so it belongs in `_SUBST_PLACEHOLDER` like its bare twin, and `_spanCarriesDeleteSpelling`
+//       must descend into `"…"` to see the spelling at all. A backtick inside `"…"` expands the same way
+//       (that shape was mis-allowed on BOTH trees before this round — a pre-existing gap, now closed).
+//   (b) FALSE BLOCK: `git push origin -o $(echo -d) HEAD:feat` → argv `push origin -o -d HEAD:feat`,
+//       where `-d` is `-o`'s VALUE and nothing is deleted (`origin/main` allowed). The arm now skips a
+//       span that sits in an option-value slot, using the module's own `_markOptionValueSlots`.
+for (const [name, cmd, want] of [
+  ["quoted `$( … )` flag word after quoted option text (the P1 fail-open)",
+    `git push origin -o "x -d y" "$(echo -d)" held/branch`, ["$(…)", "held/branch"]],
+  ["quoted `$( … )` flag word, bare twin", `git push origin "$(echo -d)" held/branch`, ["$(…)", "held/branch"]],
+  ["quoted BACKTICK flag word after quoted option text", "git push origin -o \"x -d y\" \"`echo -d`\" held/branch", ["$(…)"]],
+  ["quoted BACKTICK flag word, bare twin", "git push origin \"`echo -d`\" held/branch", ["$(…)"]],
+  ["a BARE span in a flag slot still fires (control: the value-slot narrowing must not disarm it)",
+    "git push origin $(echo -d) held/branch", ["$(…)", "held/branch"]],
+  ["a value-slot span AND a flag-slot span in one segment (only the flag slot fires)",
+    "git push origin -o $(echo -d) $(echo -d) held/branch", ["$(…)", "held/branch"]],
+]) {
+  expect(`A: ${name} → the delete spelling is UNATTRIBUTABLE, never absent`, extractPushDeleteBranch(cmd), want);
+}
+// ⚠️ CONTROLS (not discriminators in the fail-open direction): a span in an `-o`/`--push-option` VALUE
+// slot is a VALUE — `-o` takes exactly one argument (real git 2.43: `git push -o -d origin` is a plain
+// push) — so a delete spelling inside it must not become a flag. `origin/main` allowed all four; this
+// branch refused three of them before the narrowing, which is the P2 false block.
+for (const [name, cmd] of [
+  ["`-o $(echo -d)`", "git push origin -o $(echo -d) main"],
+  ["`--push-option $(echo -d)`", "git push origin --push-option $(echo -d) main"],
+  ["`-o \"$(echo -d)\"` (quoted span in the value slot)", `git push origin -o "$(echo -d)" main`],
+  ["`-o $(echo \"-d held/branch\")` (a multi-word expansion still lands in the value slot)",
+    `git push origin -o $(echo "-d held/branch") HEAD:feat`],
+]) {
+  expect(`A: a span in an option VALUE slot (${name}) → nothing deleted`, extractPushDeleteBranch(cmd), null);
+}
+// …and the same slot must not launder a REAL delete elsewhere in the segment.
+expect("A: `-o <literal> <span> -d held/branch` → the real target survives beside the marker",
+  extractPushDeleteBranch(`git push origin -o "title" "$(cat f)" -d held/branch`), ["$(…)", "held/branch"]);
+
 // ── Part B — the SHIPPED gate (real index.ts tool_call handler) ───────────
 if (typeof stripTypeScriptTypes !== "function" ||
     (typeof register !== "function" && typeof registerHooks !== "function")) {
@@ -477,6 +523,11 @@ if (typeof stripTypeScriptTypes !== "function" ||
       // quoting — it opened a plain `'…'` at the `$`, the `\'` inside CLOSED it, and the rest of the
       // segment was swallowed, so the delete vanished and the arm was never consulted.
       ["B14 #3962: an ANSI-C literal with an escaped quote before the delete", `git push -o $'don\\'t' origin -d "$PR_BRANCH"`],
+      // #3962 round-17 review P1 — a delete spelling carried by a QUOTED substitution, beside quoted
+      // OPTION TEXT. End-to-end: before this round the extractor returned `null`, so this arm was never
+      // consulted and the handler ALLOWED the delete of the sibling-held `held`.
+      ["B15 #3962: a delete flag supplied by a QUOTED substitution", `git push origin -o "x -d y" "$(echo -d)" held`],
+      ["B16 #3962: the same, QUOTED BACKTICK spelling", "git push origin -o \"x -d y\" \"`echo -d`\" held"],
     ];
     for (const [name, cmd] of deny) {
       expectTrue(`${name} → REFUSED`, refusedBy(await quiet(() => real.bash(cmd)), FAIL_CLOSED),
@@ -494,6 +545,27 @@ if (typeof stripTypeScriptTypes !== "function" ||
     ]) {
       const r = await quiet(() => real.bash(cmd));
       expectTrue(`${name} → ALLOWED (fail-closed must not become over-block)`, r === undefined,
+        `handler returned ${JSON.stringify(r)?.slice(0, 200)}`);
+    }
+
+    // ── Part C2: the round-17 P2 FALSE BLOCK is gone (scoped to the DELETE arm) ────────
+    // #3962 round-17 review P2 — `-o`/`--push-option` takes exactly ONE argument, so a span in that slot
+    // is the VALUE (bash argv `push origin -o -d main`; real git 2.43 accepts it as a plain push). The
+    // pre-narrowing head refused all four with #653's refusal (`$(…)`); `origin/main` deleted nothing.
+    // ⛔ THESE ROWS CANNOT EXPECT A FULL ALLOW. M2 (the off-baseline push gate, a DIFFERENT arm) refuses
+    // any push whose refspec list is a substitution — its reason says `Push target(s): $` — and that is
+    // pre-existing behaviour on both trees, not this change's. So the assertion is scoped to what this
+    // fix owns: the DELETE arm must not fire. That is the whole claim.
+    for (const [name, cmd] of [
+      ["C6 #3962: `-o $(echo -d)` — the span is the OPTION VALUE, nothing is deleted", "git push origin -o $(echo -d) main"],
+      ["C7 #3962: `--push-option $(echo -d)`, the long spelling", "git push origin --push-option $(echo -d) main"],
+      ["C8 #3962: `-o \"$(echo -d)\"` — a QUOTED span in the value slot", `git push origin -o "$(echo -d)" main`],
+      ["C9 #3962: `-o $(echo \"-d stale\")` — a multi-word expansion still lands in the value slot", `git push origin -o $(echo "-d stale") main`],
+    ]) {
+      const r = await quiet(() => real.bash(cmd));
+      const why = reasons(r);
+      expectTrue(`${name} → NOT refused by the delete arm (no #653, no #73)`,
+        !why.includes(FAIL_CLOSED) && !why.includes(HOLDS),
         `handler returned ${JSON.stringify(r)?.slice(0, 200)}`);
     }
 
@@ -527,6 +599,15 @@ if (typeof stripTypeScriptTypes !== "function" ||
     expectTrue("D5 #3962: a newline inside QUOTES is DATA, not a separator — the delete after it still reaches #73 (CONTROL: stays green under the mask mutant)",
       refusedBy(await quiet(() => real.bash('git push origin -o "a\nb" -d held')), HOLDS),
       `handler returned ${JSON.stringify(await quiet(() => real.bash('git push origin -o "a\nb" -d held')))?.slice(0, 200)}`);
+    // ⛔ D5b IS A DISCRIMINATOR (unlike D5 above), and it is the round-17 P1's end-to-end row: the
+    // spelling is carried by a QUOTED substitution, so `_maskDataParens`' `_QS_MARK` is the only thing
+    // that turns this word into a placeholder. Reverting that one line makes the extractor return `null`
+    // and the handler ALLOWS the delete — the mutant below measures exactly that.
+    // ⚠️ Asserted against #653's OWN reason text (`not a literal ref name`): the marker `$(…)` is in a
+    // refspec slot, so the correct answer is the refusal that NAMES it, not the #73 lookup.
+    expectTrue("D5b round-17 P1: a delete flag inside a QUOTED substitution is REFUSED, not dropped",
+      refusedBy(await quiet(() => real.bash(`git push origin -o "x -d y" "$(echo -d)" held`)), FAIL_CLOSED),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash(`git push origin -o "x -d y" "$(echo -d)" held`)))?.slice(0, 200)}`);
 
     // ── Part D (round 10): the four P0 classes from the round-10 adversarial review ──────────
     // Each row is END-TO-END through the shipped handler, and each is a shape where the pre-fix head
@@ -703,6 +784,67 @@ if (typeof stripTypeScriptTypes !== "function" ||
           (await quiet(() => mut.bash("git push origin -d stale"))) === undefined);
         expectTrue("M8 mutant control: #73's own literal protection stays BLOCKED under the mutant",
           refusedBy(await quiet(() => mut.bash("git push origin --delete held")), HOLDS));
+      }
+
+      // ── M12/M13 — the round-17 pins can FAIL (both directions) ─────────
+      // Two mutants over the round-17 code, each reverting EXACTLY one decision in a temp copy:
+      //   M12 reverts the QUOTED-SUBSTITUTION marker (`_QS_MARK` → a masked paren, i.e. literal text),
+      //       which is the P1 fail-open — the residual-1 shape must then be ALLOWED by the delete arm;
+      //   M13 reverts the OPTION-VALUE-SLOT narrowing, which is the P2 false block — the C6–C9 shapes
+      //       must then be REFUSED with #653's text again.
+      // Both are measured against the REAL handler in the same run, so a mutant that "passes" because
+      // the fixture broke cannot be mistaken for evidence.
+      {
+        const qsNeedle = 'quote = null; out += ch + _QS_MARK; i++; continue;';
+        const qsReplacement = 'quote = null; out += ch + swap("("); i++; continue;';
+        const vsNeedle = 'return tokens.some((t, i) => t.includes(_SUBST_PLACEHOLDER) && !valueSlot[i]);';
+        const vsReplacement = 'return tokens.includes(_SUBST_PLACEHOLDER);';
+        const cgPath = join(HERE, "classify-git.mjs");
+        const cgSrc = readFileSync(cgPath, "utf-8");
+        for (const [name, needle] of [["M12", qsNeedle], ["M13", vsNeedle]]) {
+          expectTrue(`${name}: the mutation anchor is present (a stale anchor is a FAILURE, never a green)`,
+            cgSrc.includes(needle), `missing ${JSON.stringify(needle)}`);
+        }
+        if (cgSrc.includes(qsNeedle) && cgSrc.includes(vsNeedle)) {
+          const mutQDir = join(tmp, "ext-mut-qs");
+          cpSync(join(HERE, ".."), mutQDir, {
+            recursive: true,
+            filter: (p2) => !p2.includes("node_modules") && !p2.endsWith(".git"),
+          });
+          const mutQClassify = join(mutQDir, "main-worktree-guard", "classify-git.mjs");
+          writeFileSync(mutQClassify, cgSrc.replace(qsNeedle, qsReplacement));
+          const mutQ = await loadGuard(join(mutQDir, "main-worktree-guard", "index.ts"), hub);
+          expectTrue("M12b: the quoted-substitution mutant loaded", mutQ.loaded);
+          await quiet(() => mutQ.start(hub));
+          const RESIDUAL1 = `git push origin -o "x -d y" "$(echo -d)" held`;
+          const mutQr = await quiet(() => mutQ.bash(RESIDUAL1));
+          const realQr = await quiet(() => real.bash(RESIDUAL1));
+          expectTrue("M12 (P1, DISCRIMINATING): with the quoted-span marker reverted the delete arm NO LONGER fires " +
+            "— so the shipped row is measuring the marker, not the fixture",
+            !reasons(mutQr).includes(FAIL_CLOSED) && refusedBy(realQr, FAIL_CLOSED),
+            `mutant ${JSON.stringify(mutQr)?.slice(0, 160)} / real ${JSON.stringify(realQr)?.slice(0, 160)}`);
+
+          const mutVDir = join(tmp, "ext-mut-vs");
+          cpSync(join(HERE, ".."), mutVDir, {
+            recursive: true,
+            filter: (p2) => !p2.includes("node_modules") && !p2.endsWith(".git"),
+          });
+          const mutVClassify = join(mutVDir, "main-worktree-guard", "classify-git.mjs");
+          writeFileSync(mutVClassify, cgSrc.replace(vsNeedle, vsReplacement));
+          const mutV = await loadGuard(join(mutVDir, "main-worktree-guard", "index.ts"), hub);
+          expectTrue("M13b: the value-slot mutant loaded", mutV.loaded);
+          await quiet(() => mutV.start(hub));
+          for (const [name, cmd] of [
+            ["M13", "git push origin -o $(echo -d) main"],
+            ["M13c", "git push origin --push-option $(echo -d) main"],
+          ]) {
+            const mv = await quiet(() => mutV.bash(cmd));
+            const rv = await quiet(() => real.bash(cmd));
+            expectTrue(`${name} (P2, DISCRIMINATING): without the value-slot narrowing "${cmd.slice(0, 40)}" is REFUSED by #653 again`,
+              refusedBy(mv, FAIL_CLOSED) && !reasons(rv).includes(FAIL_CLOSED),
+              `mutant ${JSON.stringify(mv)?.slice(0, 160)} / real ${JSON.stringify(rv)?.slice(0, 160)}`);
+          }
+        }
       }
     }
   } catch (e) {

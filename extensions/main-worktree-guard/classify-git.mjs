@@ -4920,14 +4920,22 @@ function _spanCarriesDeleteSpelling(body) {
   let i = 0, quote = null;
   while (i < s.length) {
     const ch = s[i];
-    if (quote) {
-      if (ch === "\\" && quote === '"' && i + 1 < s.length) { i += 2; continue; }
-      if (ch === quote) quote = null;
-      i++;
-      continue;
+    // ⛔ SINGLE QUOTES SUPPRESS EVERYTHING; DOUBLE QUOTES DO NOT SUPPRESS A SUBSTITUTION (round-17
+    // review, P1). This used to skip the whole of `"…"`, so the body of a QUOTED `$( … )`/backtick was
+    // never scanned and the arm could not fire for the residual-1 family — which is why the fix above
+    // has to land together with this: a detector that cannot see the spelling and a walk that produces
+    // no placeholder fail in the SAME direction (allow).  Outside double quotes the escape and quote
+    // arms are unchanged.
+    if (quote === "'") { i++; continue; }
+    if (quote === '"') {
+      // A backslash escapes the next char only inside double quotes (POSIX) — so `\`` is a LITERAL
+      // backtick and must not open a span.
+      if (ch === "\\" && i + 1 < s.length) { i += 2; continue; }
+      if (ch === '"') { quote = null; i++; continue; }
+    } else {
+      if (ch === "\\" && i + 1 < s.length) { i += 2; continue; }
+      if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
     }
-    if (ch === "\\" && i + 1 < s.length) { i += 2; continue; }
-    if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
     let start = -1, closer = ")";
     if (ch === "$" && s[i + 1] === "(") start = i + 2;
     else if (ch === "`") { start = i + 1; closer = "`"; }
@@ -5254,6 +5262,23 @@ function _ansiCIsProgramOperand(before) {
 const _QP_L = "\u0001";
 const _QP_R = "\u0002";
 
+/** Marks a COMMAND SUBSTITUTION that opens inside `"…"` (`$(` or a backtick), so the segment walk can
+ * fold the one word it contributes into `_SUBST_PLACEHOLDER`.
+ *
+ * ⛔ WITHOUT IT A QUOTED SUBSTITUTION IS INVISIBLE TO THE WALK (round-17 review, P1 — a measured
+ * FAIL-OPEN on the GUARDED ref). `_maskDataParens` masks a quoted span's parens, which is right for the
+ * parenthesis rules, but the resulting token was then ordinary TEXT to `_pushSegmentTokens`: no
+ * placeholder, so its "a delete spelling arrived inside a collapsed span" arm could not fire and the
+ * word was handed on as a plain refspec. gnu.org, *Command Substitution*: "If the substitution appears
+ * within double quotes, word splitting and pathname expansion are not performed on the results" — so
+ * the span is exactly ONE argv word, which is precisely what the placeholder means.
+ * One mark for both spellings because the walk's treatment is identical; it is masked to a space by
+ * `_spanCarriesDeleteSpelling`/`_rawCarriesDeleteSpelling` (they normalise `[\u0000-\u0008]`), so it
+ * cannot glue a spelling onto a neighbouring word there either.
+ * ⛔ It cannot collide with `_SUBST_PLACEHOLDER` (`\u0000`), `_QP_L`/`_QP_R` (`\u0001`/`\u0002`),
+ * `_NL_DATA` (`\u0003`) or `_NL_SPAN` (`\u0004`). */
+const _QS_MARK = "\u0005";
+
 /** Replace `(`/`)` that are DATA with sentinels, mirroring `_tokenize`'s own rules EXACTLY: a
  * backslash escapes the next char always outside quotes and only inside DOUBLE quotes (POSIX), and
  * inside single quotes it is literal. LENGTH-PRESERVING: every masked character becomes exactly one
@@ -5323,10 +5348,30 @@ function _maskDataParens(body) {
       if (quote === '"' && ch === "}" && top()?.kind === "{" && expDepth > quoteExpDepth) { spans.pop(); expDepth--; out += ch; continue; }
       // A `$(` inside DOUBLE quotes starts a substitution: enter it in a NEUTRAL quoting context and
       // remember the quote we must return to. The `(` stays masked, so a quoted span contributes no
-      // operator token — the established contract for `"$( … )"` (which already BLOCKED correctly).
+      // operator token.
+      // ⛔ IT IS MARKED `_QS` AS WELL, BECAUSE A QUOTED SPAN IS OTHERWISE INVISIBLE TO THE WALK (round-17
+      // review, P1 — measured as a FAIL-OPEN against `origin/main`). Masking alone left the token as the
+      // literal text `$(echo -d)`: not the placeholder, so `_pushSegmentTokens`' "a spelling arrived
+      // inside a collapsed span" arm could not fire, and the word fell through to
+      // `_cleanDeleteTarget` as an ordinary refspec. The shape below is a REAL delete of a ref a
+      // sibling worktree holds (bash argv, stub-`git` probe: `push origin -o x -d y -d held/branch`):
+      //
+      //   git push origin -o "x -d y" "$(echo -d)" held/branch
+      //     origin/main → REFUSE (on the accidental fragment `$(echo`)   before this → ALLOW (null)
+      //
+      // gnu.org, *Command Substitution*: "If the substitution appears within double quotes, word
+      // splitting and pathname expansion are not performed on the results" — a quoted `$( … )` is
+      // therefore exactly ONE argv word, which is what `_SUBST_PLACEHOLDER` models. The bare twin
+      // (`"$(echo -d)"` → `$(echo -d)`) already reached the arm; quoting changed nothing but visibility.
       if (quote === '"' && ch === "$" && body[i + 1] === "(") {
-        spans.push({ kind: "(", restore: quote, inExp: false }); quote = null; out += ch + swap("("); i++; continue;
+        spans.push({ kind: "(", restore: quote, inExp: false }); quote = null; out += ch + _QS_MARK; i++; continue;
       }
+      // ⛔ A BACKTICK INSIDE `"…"` IS A SUBSTITUTION TOO (same round-17 finding, same class). Bash
+      // expands it and no word splitting applies, so the word is one opaque argv word; the old path
+      // left it literal, so `` git push origin -o "x -d y" "`echo -d`" held/branch `` was ALLOWED on
+      // BOTH trees (a pre-existing gap, measured) and neither the arm nor #653 could see it. Marking
+      // it here is the same one-line treatment as the `$(` above; `\`` keeps its literal meaning.
+      if (quote === '"' && ch === "`") { out += _QS_MARK; i++; continue; }
       out += swap(ch);
       continue;
     }
@@ -5568,6 +5613,11 @@ function _pushSegmentTokens(body) {
       continue;
     }
     if (depth > 0) continue; // inside a substitution span — its words are not this command's argv
+    // ⛔ A `$( … )` / backtick that OPENED INSIDE `"…"` IS STILL ONE OPAQUE WORD (round-17 review, P1).
+    // `_maskDataParens` marks it (`_QS_MARK`) instead of letting it fall through as literal text; the
+    // shell neither splits nor globs a quoted substitution's result, so the word's content is unknowable
+    // here and belongs in the placeholder — the same treatment the BARE twin already got.
+    if (t.includes(_QS_MARK)) { tokens.push(_SUBST_PLACEHOLDER); continue; }
     tokens.push(_unmaskDataParens(t));
   }
   // An UNCLOSED span is TRUNCATED, not empty (round-7 review, P0). It used to be dropped, so a
@@ -5600,8 +5650,28 @@ function _pushSegmentTokens(body) {
   // spelling. A plain `git push origin HEAD:feat` has no placeholder; `git push origin -o $(date) -d
   // feat/x` has its flag; and a command whose only `-d` is ordinary option TEXT still needs a span to
   // be in the same segment, which is the ambiguous shape this is meant to catch.
+  const _opaqueInFlagSlot = (() => {
+    const valueSlot = _markOptionValueSlots(tokens);
+    return tokens.some((t, i) => t.includes(_SUBST_PLACEHOLDER) && !valueSlot[i]);
+  })();
   if (!tokens.some((x) => _isPushDeleteFlagToken(x)) &&
-      tokens.includes(_SUBST_PLACEHOLDER) &&
+      _opaqueInFlagSlot &&
+      // ⛔ A SPAN IN AN OPTION-VALUE SLOT IS A VALUE, NEVER A FLAG (round-17 review, P2 — a FALSE BLOCK
+      // this PR introduced in `8e4cef824`). `git push`'s `-o`/`--push-option` takes exactly ONE argument,
+      // so a span that IS that argument cannot expand into a delete flag — its first word is consumed as
+      // the value (probe-verified against real git 2.43: `git push -o -d origin` is a plain push):
+      //
+      //   git push origin -o $(echo -d) HEAD:feat
+      //     bash argv → push origin -o -d HEAD:feat   (no delete)   origin/main → allow
+      //     this head (before) → REFUSE "$(…)" → a false block on an ordinary push-option
+      //
+      // Each remaining case is reachable in the same shape and behaves identically: `--push-option`, a
+      // quoted span (`-o "$(echo -d)"`), and a multi-word expansion (`-o $(echo "-d held/branch")` →
+      // `-o -d held/branch`, where `-d` is the VALUE and `held/branch` is a plain refspec). Where the
+      // SAME segment also holds a span OUTSIDE a value slot, the arm still fires — the flag could be
+      // there — so this narrows the arm only over the one slot that provably cannot carry a flag.
+      // `_markOptionValueSlots` is the module's existing definition of that slot (the same one the
+      // target scan in `extractPushDeleteBranch` uses), so the two cannot drift.
       _spanCarriesDeleteSpelling(body)) {
     // The marker must be REACHABLE, and `extractPushDeleteBranch` only reports targets AFTER a delete
     // flag — so the flag goes in with it. That is not an invention: the raw text carries a delete
