@@ -5369,9 +5369,22 @@ function _maskDataParens(body) {
       // ⛔ A BACKTICK INSIDE `"…"` IS A SUBSTITUTION TOO (same round-17 finding, same class). Bash
       // expands it and no word splitting applies, so the word is one opaque argv word; the old path
       // left it literal, so `` git push origin -o "x -d y" "`echo -d`" held/branch `` was ALLOWED on
-      // BOTH trees (a pre-existing gap, measured) and neither the arm nor #653 could see it. Marking
-      // it here is the same one-line treatment as the `$(` above; `\`` keeps its literal meaning.
-      if (quote === '"' && ch === "`") { out += _QS_MARK; i++; continue; }
+      // BOTH trees (a pre-existing gap, measured) and neither the arm nor #653 could see it.
+      // ⛔ IT EMITS ONE CHARACTER, SO IT MUST NOT `i++` (round-17 review P0, and this was MINE). The
+      // `$(` branch above consumes TWO source characters (`$` and `(`) and emits two, so its `i++` is
+      // correct; copying that idiom here advanced 2 while emitting 1 and ATE THE NEXT CHARACTER —
+      // which for a quoted backtick span is the span's own first letter, followed by the rest of the
+      // segment once the closing quote was eaten too:
+      //
+      //   git push origin -o -d "`echo -d`" -d held/branch
+      //     masked →  origin -o -d "<QS>cho -d<QS> -d held/branch   ('e' and the closing `"` gone)
+      //     → one quoted word swallows `-d held/branch` → extractor null → #73 never consulted → ALLOW
+      //   bash argv → push origin -o -d -d held/branch  (the `-o` value is the FIRST `-d`, the second
+      //     is a real delete flag) → REAL delete of the sibling-held ref
+      //
+      // One character in, one sentinel out, so no index adjustment is needed — the enclosing `for`
+      // already advances past it. `\`` keeps its literal meaning (the escape arm above runs first).
+      if (quote === '"' && ch === "`") { out += _QS_MARK; continue; }
       out += swap(ch);
       continue;
     }
@@ -5650,11 +5663,23 @@ function _pushSegmentTokens(body) {
   // spelling. A plain `git push origin HEAD:feat` has no placeholder; `git push origin -o $(date) -d
   // feat/x` has its flag; and a command whose only `-d` is ordinary option TEXT still needs a span to
   // be in the same segment, which is the ambiguous shape this is meant to catch.
-  const _opaqueInFlagSlot = (() => {
-    const valueSlot = _markOptionValueSlots(tokens);
-    return tokens.some((t, i) => t.includes(_SUBST_PLACEHOLDER) && !valueSlot[i]);
-  })();
-  if (!tokens.some((x) => _isPushDeleteFlagToken(x)) &&
+  const _valueSlot = _markOptionValueSlots(tokens);
+  const _opaqueInFlagSlot = tokens.some((t, i) => t.includes(_SUBST_PLACEHOLDER) && !_valueSlot[i]);
+  // ⛔ "THIS SEGMENT ALREADY HAS ITS OWN DELETE FLAG" MUST BE VALUE-SLOT AWARE (round-17 review, NOTE
+  // promoted — a PRE-EXISTING fail-open on the guarded ref, measured with real git on all three trees).
+  // `-o`/`--push-option` consumes its argument, so an `-o -d` supplies no flag — but the raw token list
+  // is indistinguishable from a real one, and the scan in `extractPushDeleteBranch` correctly SKIPS the
+  // value. Both halves then declined, and nothing was attributed at all:
+  //
+  //   git push origin -o -d $(echo -d) held/branch
+  //     bash argv → push origin -o -d -d held/branch   (the second `-d` IS a delete flag) → real git
+  //     DELETES the sibling-held ref;  origin/main, the previous head and this head all returned null.
+  //
+  // Reading the flag through `_markOptionValueSlots` (the same definition used everywhere else) makes
+  // the arm fire for the span that really carries the flag, and leaves a plain `-o -d $(date) HEAD:feat`
+  // alone — its span body carries no spelling, so `_spanCarriesDeleteSpelling` is false.
+  const _ownFlag = tokens.some((t, i) => !_valueSlot[i] && _isPushDeleteFlagToken(t));
+  if (!_ownFlag &&
       _opaqueInFlagSlot &&
       // ⛔ A SPAN IN AN OPTION-VALUE SLOT IS A VALUE, NEVER A FLAG (round-17 review, P2 — a FALSE BLOCK
       // this PR introduced in `8e4cef824`). `git push`'s `-o`/`--push-option` takes exactly ONE argument,

@@ -377,8 +377,29 @@ for (const [name, cmd, want] of [
   ["quoted `$( … )` flag word after quoted option text (the P1 fail-open)",
     `git push origin -o "x -d y" "$(echo -d)" held/branch`, ["$(…)", "held/branch"]],
   ["quoted `$( … )` flag word, bare twin", `git push origin "$(echo -d)" held/branch`, ["$(…)", "held/branch"]],
-  ["quoted BACKTICK flag word after quoted option text", "git push origin -o \"x -d y\" \"`echo -d`\" held/branch", ["$(…)"]],
-  ["quoted BACKTICK flag word, bare twin", "git push origin \"`echo -d`\" held/branch", ["$(…)"]],
+  ["quoted BACKTICK flag word after quoted option text", "git push origin -o \"x -d y\" \"`echo -d`\" held/branch", ["$(…)", "held/branch"]],
+  ["quoted BACKTICK flag word, bare twin", "git push origin \"`echo -d`\" held/branch", ["$(…)", "held/branch"]],
+  // ⛔ ROUND-17 REVIEW P0 — MY OWN OFF-BY-ONE, and the two rows above are what HID it. The backtick branch
+  // emitted ONE character while also doing `i++`, so it ate the span's first letter and then the closing
+  // quote; the rest of the segment fell inside the quoted word. Their first revision asserted `["$(…)"]`
+  // — the CORRUPTED output — so the suite stayed green over a real delete of the sibling-held ref
+  // (`-o -d "`echo -d`" -d held/branch`: bash argv `push origin -o -d -d held/branch`, where the second
+  // `-d` is a real flag). `held/branch` in the expected value IS the pin: it can only be attributed if
+  // the segment AFTER the span survives the mask.
+  ["a quoted BACKTICK span does not eat the delete AFTER it (the P0 shape)",
+    "git push origin -o -d \"`echo -d`\" -d held/branch", ["$(…)", "held/branch"]],
+  ["a quoted `$( … )` span does not eat the delete after it (the same shape, paren spelling)",
+    `git push origin -o -d "$(echo -d)" -d held/branch`, ["$(…)", "held/branch"]],
+  // ⛔ PRE-EXISTING FAIL-OPEN promoted to a pin (round-17 review NOTE; real git on all three trees): an
+  // `-o -d` supplies no flag, but it LOOKED like one to the arm's "this segment already has its own
+  // delete" test while the target scan correctly skipped it as a VALUE — so BOTH halves declined and
+  // nothing was attributed:
+  //   git push origin -o -d $(echo -d) held/branch
+  //     bash argv → push origin -o -d -d held/branch → the SECOND `-d` is a flag → real git DELETES the
+  //     sibling-held ref, and `origin/main`, the previous head and the shipped head all returned null.
+  // That test now reads through `_markOptionValueSlots`, so the arm fires for the span that carries it.
+  ["an `-o -d` VALUE does not disarm the arm (the pre-existing fail-open)",
+    `git push origin -o -d $(echo -d) held/branch`, ["$(…)", "held/branch"]],
   ["a BARE span in a flag slot still fires (control: the value-slot narrowing must not disarm it)",
     "git push origin $(echo -d) held/branch", ["$(…)", "held/branch"]],
   ["a value-slot span AND a flag-slot span in one segment (only the flag slot fires)",
@@ -396,6 +417,12 @@ for (const [name, cmd] of [
   ["`-o \"$(echo -d)\"` (quoted span in the value slot)", `git push origin -o "$(echo -d)" main`],
   ["`-o $(echo \"-d held/branch\")` (a multi-word expansion still lands in the value slot)",
     `git push origin -o $(echo "-d held/branch") HEAD:feat`],
+  // ⛔ CONTROL for the value-slot-aware own-flag test (round-17 review NOTE): `-o -d` supplies no flag
+  // AND the segment's only span carries no spelling, so there is no delete to refuse — the arm must NOT
+  // fire merely because a `-d`-shaped VALUE exists. bash argv: `push origin -o -d <date> held/branch`
+  // = a plain push (the `-o` value is `-d`; nothing deletes).
+  ["`-o -d $(date) held/branch` (an `-o -d` value is not a delete, and its span has no spelling)",
+    `git push origin -o -d $(date) held/branch`],
 ]) {
   expect(`A: a span in an option VALUE slot (${name}) → nothing deleted`, extractPushDeleteBranch(cmd), null);
 }
@@ -786,63 +813,74 @@ if (typeof stripTypeScriptTypes !== "function" ||
           refusedBy(await quiet(() => mut.bash("git push origin --delete held")), HOLDS));
       }
 
-      // ── M12/M13 — the round-17 pins can FAIL (both directions) ─────────
-      // Two mutants over the round-17 code, each reverting EXACTLY one decision in a temp copy:
-      //   M12 reverts the QUOTED-SUBSTITUTION marker (`_QS_MARK` → a masked paren, i.e. literal text),
-      //       which is the P1 fail-open — the residual-1 shape must then be ALLOWED by the delete arm;
-      //   M13 reverts the OPTION-VALUE-SLOT narrowing, which is the P2 false block — the C6–C9 shapes
-      //       must then be REFUSED with #653's text again.
-      // Both are measured against the REAL handler in the same run, so a mutant that "passes" because
-      // the fixture broke cannot be mistaken for evidence.
+      // ── M12–M15 — the round-17 pins can FAIL (both directions) ─────────
+      // Each mutant reverts EXACTLY ONE decision in a temp copy, and each is asserted on the PURE
+      // extractor (`extractPushDeleteBranch`) rather than through the handler. That is deliberate and it
+      // was measured: M2's branch-ownership arm refuses ANY argv carrying a substitution (`Push
+      // target(s): $`), on both trees, so an end-to-end assertion cannot see which arm fired — the first
+      // revision of M13 asserted the handler and reported a false failure for exactly that reason. The
+      // module-level value has no such ambiguity, and the handler consequence is already pinned
+      // end-to-end by D5b/B15/B16 (refused) and C6–C9 (delete arm silent).
+      // ⛔ M12's FIRST VERSION COVERED ONLY THE `$(` EMISSION (round-17 review P2.3, MEASURED): the
+      // backtick branch is a second, independent decision on its own line, so reverting one left the
+      // other unpinned — and the off-by-one P0 lived in exactly that uncovered branch. Each emission now
+      // gets its own mutant, and M15 reverts the off-by-one itself.
       {
         const qsNeedle = 'quote = null; out += ch + _QS_MARK; i++; continue;';
         const qsReplacement = 'quote = null; out += ch + swap("("); i++; continue;';
-        const vsNeedle = 'return tokens.some((t, i) => t.includes(_SUBST_PLACEHOLDER) && !valueSlot[i]);';
-        const vsReplacement = 'return tokens.includes(_SUBST_PLACEHOLDER);';
+        const btNeedle = 'if (quote === \'"\' && ch === "`") { out += _QS_MARK; continue; }';
+        const btReplacement = 'if (quote === \'"\' && ch === "`") { out += swap(ch); continue; }';
+        const btOffByOne = 'if (quote === \'"\' && ch === "`") { out += _QS_MARK; i++; continue; }';
+        const spanNeedle = 'const _opaqueInFlagSlot = tokens.some((t, i) => t.includes(_SUBST_PLACEHOLDER) && !_valueSlot[i]);';
+        const spanReplacement = 'const _opaqueInFlagSlot = tokens.includes(_SUBST_PLACEHOLDER);';
+        const ownNeedle = 'const _ownFlag = tokens.some((t, i) => !_valueSlot[i] && _isPushDeleteFlagToken(t));';
+        const ownReplacement = 'const _ownFlag = tokens.some((t) => _isPushDeleteFlagToken(t));';
         const cgPath = join(HERE, "classify-git.mjs");
         const cgSrc = readFileSync(cgPath, "utf-8");
-        for (const [name, needle] of [["M12", qsNeedle], ["M13", vsNeedle]]) {
+        // (M15 mutates the SAME line M14 does, in the other direction, so btNeedle covers both anchors.)
+        for (const [name, needle] of [["M12", qsNeedle], ["M14/M15", btNeedle],
+                                      ["M13", spanNeedle], ["M13d", ownNeedle]]) {
           expectTrue(`${name}: the mutation anchor is present (a stale anchor is a FAILURE, never a green)`,
             cgSrc.includes(needle), `missing ${JSON.stringify(needle)}`);
         }
-        if (cgSrc.includes(qsNeedle) && cgSrc.includes(vsNeedle)) {
-          const mutQDir = join(tmp, "ext-mut-qs");
-          cpSync(join(HERE, ".."), mutQDir, {
+        /** Build a temp copy with ONE replacement and return its pure classifier. */
+        const mutantExtractor = async (tag, from, to) => {
+          const d = join(tmp, `ext-mut-${tag}`);
+          cpSync(join(HERE, ".."), d, {
             recursive: true,
             filter: (p2) => !p2.includes("node_modules") && !p2.endsWith(".git"),
           });
-          const mutQClassify = join(mutQDir, "main-worktree-guard", "classify-git.mjs");
-          writeFileSync(mutQClassify, cgSrc.replace(qsNeedle, qsReplacement));
-          const mutQ = await loadGuard(join(mutQDir, "main-worktree-guard", "index.ts"), hub);
-          expectTrue("M12b: the quoted-substitution mutant loaded", mutQ.loaded);
-          await quiet(() => mutQ.start(hub));
-          const RESIDUAL1 = `git push origin -o "x -d y" "$(echo -d)" held`;
-          const mutQr = await quiet(() => mutQ.bash(RESIDUAL1));
-          const realQr = await quiet(() => real.bash(RESIDUAL1));
-          expectTrue("M12 (P1, DISCRIMINATING): with the quoted-span marker reverted the delete arm NO LONGER fires " +
-            "— so the shipped row is measuring the marker, not the fixture",
-            !reasons(mutQr).includes(FAIL_CLOSED) && refusedBy(realQr, FAIL_CLOSED),
-            `mutant ${JSON.stringify(mutQr)?.slice(0, 160)} / real ${JSON.stringify(realQr)?.slice(0, 160)}`);
-
-          const mutVDir = join(tmp, "ext-mut-vs");
-          cpSync(join(HERE, ".."), mutVDir, {
-            recursive: true,
-            filter: (p2) => !p2.includes("node_modules") && !p2.endsWith(".git"),
-          });
-          const mutVClassify = join(mutVDir, "main-worktree-guard", "classify-git.mjs");
-          writeFileSync(mutVClassify, cgSrc.replace(vsNeedle, vsReplacement));
-          const mutV = await loadGuard(join(mutVDir, "main-worktree-guard", "index.ts"), hub);
-          expectTrue("M13b: the value-slot mutant loaded", mutV.loaded);
-          await quiet(() => mutV.start(hub));
-          for (const [name, cmd] of [
-            ["M13", "git push origin -o $(echo -d) main"],
-            ["M13c", "git push origin --push-option $(echo -d) main"],
-          ]) {
-            const mv = await quiet(() => mutV.bash(cmd));
-            const rv = await quiet(() => real.bash(cmd));
-            expectTrue(`${name} (P2, DISCRIMINATING): without the value-slot narrowing "${cmd.slice(0, 40)}" is REFUSED by #653 again`,
-              refusedBy(mv, FAIL_CLOSED) && !reasons(rv).includes(FAIL_CLOSED),
-              `mutant ${JSON.stringify(mv)?.slice(0, 160)} / real ${JSON.stringify(rv)?.slice(0, 160)}`);
+          writeFileSync(join(d, "main-worktree-guard", "classify-git.mjs"), cgSrc.replace(from, to));
+          return import(pathToFileURL(join(d, "main-worktree-guard", "classify-git.mjs")).href);
+        };
+        const allPresent = cgSrc.includes(qsNeedle) && cgSrc.includes(btNeedle)
+          && cgSrc.includes(spanNeedle) && cgSrc.includes(ownNeedle);
+        if (allPresent) {
+          const cases = [
+            ["M12", "qs", qsNeedle, qsReplacement,
+              `git push origin -o "x -d y" "$(echo -d)" held/branch`, null,
+              "the quoted-`$( )` marker reverted → the delete spelling is INVISIBLE again (a fail-open)"],
+            ["M14", "bt", btNeedle, btReplacement,
+              "git push origin -o \"x -d y\" \"`echo -d`\" held/branch", null,
+              "the quoted-BACKTICK marker reverted → the backtick half is invisible (pinned independently of `$(`)"],
+            ["M15", "btoff", btNeedle, btOffByOne,
+              "git push origin -o -d \"`echo -d`\" -d held/branch", ["$(…)"],
+              "the off-by-one restored → the real target AFTER the span is SWALLOWED (only the marker survives)"],
+            ["M13", "span", spanNeedle, spanReplacement,
+              "git push origin -o $(echo -d) HEAD:feat", ["HEAD:feat", "$(…)"],
+              "the value-slot narrowing reverted → the false block is back"],
+            ["M13d", "own", ownNeedle, ownReplacement,
+              "git push origin -o -d $(echo -d) held/branch", null,
+              "the naive own-flag test restored → the PRE-EXISTING fail-open is back (all three trees said null)"],
+          ];
+          for (const [name, tag, from, to, cmd, wantMutant, why] of cases) {
+            const ext = await mutantExtractor(tag, from, to);
+            const gotMutant = ext.extractPushDeleteBranch(cmd);
+            const gotReal = extractPushDeleteBranch(cmd);
+            expect(`${name} (DISCRIMINATING): ${why}`, gotMutant, wantMutant);
+            expectTrue(`${name}b: …and the SHIPPED module disagrees on the same input (the row measures the code, not the fixture)`,
+              JSON.stringify(gotReal) !== JSON.stringify(gotMutant),
+              `shipped ${JSON.stringify(gotReal)} vs mutant ${JSON.stringify(gotMutant)}`);
           }
         }
       }
