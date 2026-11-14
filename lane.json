@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-agent-infra-3986-1794656913-p3136627-119df66b",
+  "_sha": "b09488d9653b52833dfa02ac4fc9b6699055b0b0",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-agent-infra-3986.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/3932-preflight-stale-code"
+    },
+    {
+      "kind": "sha",
+      "value": "38f24c074b6f105ade9df1832e3e8a6aca275107"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-3986"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7233,
+  "ended_at": 1794664146,
+  "exit_code": 143,
+  "heartbeat_at": 1794664146,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-agent-infra-3986-1794656913-p3136627-119df66b",
+  "lease_until": 1794671946,
+  "pid": 3136627,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794656913,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-agent-infra-3986",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-3986"
+}
