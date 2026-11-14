@@ -4932,6 +4932,27 @@ const _SUBST_PLACEHOLDER = "\u0000SUBST";
  * ⛔ It cannot collide with `_SUBST_PLACEHOLDER` (`\u0000`) or `_QP_L`/`_QP_R` (`\u0001`/`\u0002`). */
 const _NL_DATA = "\u0003";
 
+/** Sentinel for a NEWLINE that is a COMMAND SEPARATOR even though it sits inside a SPAN.
+ *
+ * ⛔ "INSIDE A SPAN" IS NOT "DATA" (round-13 review, P1 — measured as a FAIL-OPEN against
+ * `origin/main`). `_maskQuotedNewlines` masks a newline to keep the segment CAPTURE from cutting at
+ * it, which is right for every span. But a newline inside `$( … )`, `<( … )`, backticks or the body of
+ * a `-c` operand is ALSO a list separator for the shell that parses that span — bash runs the commands
+ * on both sides. Masking it to `_NL_DATA` (a DATA character, which must stay inside its word for
+ * `-o "a<LF>b"`) GLUED it onto the next word, so the target the delete would really use stopped
+ * being a ref name:
+ *
+ *   bash -c "git push origin -d held/branch<LF>echo done"
+ *     origin/main → ["held/branch","echo","done"] → refs/heads/held/branch → BLOCK
+ *     before this → ["held/branch\necho","done"]   → no such ref → #73 finds nothing → ALLOW
+ *
+ * `isResolvableDeleteTarget` accepts the glued token (a newline is not in the unresolvable class), so
+ * #653 does not fire either — the delete of a sibling-held branch proceeds in a linked-worktree
+ * session, where M2 is exempt. The two origins therefore need two sentinels: this one is a WORD
+ * SEPARATOR and `_pushSegmentTokens` splits on it after the capture has been taken.
+ * ⛔ It cannot collide with `\u0000`/`\u0001`/`\u0002`/`\u0003`. */
+const _NL_SPAN = "\u0004";
+
 /** Mask every newline that bash treats as DATA — inside `'…'`, `"…"`, `$( … )`, backticks, `${ … }`
  * or an ANSI-C `$'…'` literal — and only those. A `\`-escaped newline is a LINE CONTINUATION and is
  * already gone before this runs. Unbalanced state is handled the way bash's own parse would leave it:
@@ -4986,11 +5007,25 @@ function _maskQuotedNewlines(text) {
   // `_maskDataParens` already models exactly this (`substQuotes`); the two passes disagreed on bash's
   // quoting model and this one lost. Keeping the model in ONE place (this stack) is the fix.
   const spans = [];  // { kind: "(" | "{", restore: "'" | '"' | null }
-  const openSpan = (kind, restore) => spans.push({ kind, restore });
+  const openSpan = (kind, restore) => spans.push({ kind, restore, prog: quoteIsProgram });
   let btick = false;
+  // ⛔ A QUOTE THAT IS A `-c` PROGRAM OPERAND IS A PROGRAM AT THE INNER LEVEL (round-13 review, P1).
+  // `bash -c "git push origin -d held/branch<LF>echo done"` keeps the newline INSIDE a double quote at
+  // THIS level, but the inner shell receives the de-quoted text and parses the newline as a list
+  // separator — bash really runs both commands. Masking it as DATA glued `echo` onto the ref
+  // (`held/branch\necho`), which names no ref, so #73 found nothing and ALLOWED a sibling-held delete.
+  // So a newline inside such a quote is `_NL_SPAN` (a word separator), not `_NL_DATA` (data).
+  let quoteIsProgram = false;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    const push = (v) => out.push(v === "\n" && (quote !== null || spans.length > 0 || btick) ? _NL_DATA : v);
+    const inCmdSpan = () => btick || spans.some((sp) => sp.kind === "(");
+    const push = (v) => {
+      if (v !== "\n") { out.push(v); return; }
+      if (quote !== null) { out.push(quoteIsProgram ? _NL_SPAN : _NL_DATA); return; }
+      if (inCmdSpan()) { out.push(_NL_SPAN); return; }        // `$(`/`<(`/backtick: a real separator
+      if (spans.length > 0) { out.push(_NL_DATA); return; }   // only `${ … }`: DATA, and must stay masked
+      out.push(v);                                            // a real list separator (capture already cut)
+    };
     const top = spans[spans.length - 1];
     if (quote !== null) {
       if (ch === "\\" && quote === '"' && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
@@ -5015,7 +5050,7 @@ function _maskQuotedNewlines(text) {
       i = end - 1;
       continue;
     }
-    if (ch === "'" || ch === '"') { quote = ch; out.push(ch); continue; }
+    if (ch === "'" || ch === '"') { quote = ch; quoteIsProgram = _ansiCIsProgramOperand(s.slice(0, i)); out.push(ch); continue; }
     if (ch === "`") { btick = !btick; out.push(ch); continue; }
     if (ch === "$" && s[i + 1] === "(") { openSpan("(", null); out.push("$("); i++; continue; }
     if (ch === "$" && s[i + 1] === "{") { openSpan("{", null); out.push("${"); i++; continue; }
@@ -5034,7 +5069,7 @@ function _maskQuotedNewlines(text) {
     if (ch === "(" && (top?.kind === "(" || s[i - 1] === "<" || s[i - 1] === ">")) { openSpan("(", null); out.push(ch); continue; }
     if (ch === ")" && top?.kind === "(") {
       const done = spans.pop();
-      if (done.restore) quote = done.restore; // back to the quote the span was opened in (F4)
+      if (done.restore) { quote = done.restore; quoteIsProgram = !!done.prog; } // back to the quote (and its kind) the span was opened in (F4)
       out.push(ch);
       continue;
     }
@@ -5387,7 +5422,15 @@ function _pushSegmentTokens(body) {
   // ANSI-C strings are folded FIRST (see `_foldAnsiCStrings`) — `_tokenize` has no `$'…'` quoting, and
   // leaving it to guess is what let a `\'` inside one swallow the rest of the segment. The unmatched
   // quote is dropped NEXT, so every later pass works on quote-balanced text (rule 5).
-  const toks = _tokenize(_foldBacktickSubstitutions(_maskDataParens(_dropUnmatchedQuote(_foldAnsiCStrings(body)))));
+  const toks = _tokenize(_foldBacktickSubstitutions(_maskDataParens(_dropUnmatchedQuote(_foldAnsiCStrings(body)))))
+    // ⛔ A SPAN'S NEWLINE SEPARATES WORDS (round-13 review, P1). `_NL_SPAN` marks a newline that is a
+    // list separator for the shell parsing that span, so it must end the word it was masked into —
+    // otherwise `held/branch` + `echo` arrive as the single token `held/branch\necho`, which names no
+    // ref, so #73 looks it up, finds nothing and ALLOWS. Splitting here (after `segRe` took the
+    // capture, so the segment itself is still whole) restores the real target while the command on
+    // the other side of the newline stays in the same body — which is what `origin/main` reports too.
+    // `_NL_DATA` is NOT split: a newline inside `"…"`/`'…'` is data and belongs inside its word.
+    .flatMap((t) => (t.includes(_NL_SPAN) ? t.split(_NL_SPAN).filter(Boolean) : [t]));
   const tokens = [];
   let depth = 0; // parens OPENED inside this segment: their span is one WORD, not a boundary
   for (let i = 0; i < toks.length; i++) {

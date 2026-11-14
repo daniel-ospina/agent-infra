@@ -328,6 +328,35 @@ for (const [name, cmd] of [
 // `origin/main` reports a target here, and that report is an over-capture of a non-runnable command.
 expect("A: CONTROL — a BARE ANSI-C literal is a word, not a program", extractPushDeleteBranch("$'git push origin -d held/branch'"), null);
 
+// ── Round-13 review (P1): a newline inside a SPAN is a COMMAND SEPARATOR, not data ────────────────
+// `_maskQuotedNewlines` masks a newline so the segment CAPTURE is not cut at it — right for every span.
+// But inside `$( … )`, `<( … )`, backticks, or the body of a `-c` operand the shell ALSO parses that
+// newline as a list separator, and bash runs both sides. Masking it as DATA glued the next command's
+// first word onto the ref (`held/branch\necho`), which names no ref and is NOT in the unresolvable
+// class (so #653 did not fire either) — #73 looked it up, found nothing and ALLOWED. `origin/main`
+// reported the real `held/branch`. The mask now distinguishes the two ORIGINS (`_NL_DATA` for `"…"` /
+// `${ … }`, `_NL_SPAN` for a command-list span), and `_pushSegmentTokens` splits on the latter.
+for (const [name, cmd] of [
+  ["a newline inside a `bash -c` program", 'bash -c "git push origin -d held/branch\necho done"'],
+  ["a newline inside a `sh -c --delete` program", 'sh -c "git push origin --delete held/branch\ntrue"'],
+  ["a newline inside a `bash -lc` program", 'bash -lc "git push origin -d held/branch\ncd /tmp"'],
+  ["a newline inside an `eval` program", 'eval "git push origin -d held/branch\ntrue"'],
+  ["a newline inside a command substitution", "$( git push origin -d held/branch\nsleep 1 )"],
+]) {
+  const got = extractPushDeleteBranch(cmd);
+  expectTrue(`A: ${name} → the real target is ATTRIBUTED`, Array.isArray(got) && got.includes("held/branch"), JSON.stringify(got));
+}
+// ⚠️ CONTROLS (not discriminators): a newline inside `"…"`, `'…'`, a backtick or a `${…}` is DATA —
+// it must NOT become a word break, or an option VALUE would be shredded into fake targets.
+for (const [name, cmd] of [
+  ["a newline inside a DOUBLE-quoted push option", 'git push origin -o "a\nb" -d held/branch'],
+  ["a newline inside a SINGLE-quoted push option", "git push origin -o 'a\nb' -d held/branch"],
+  ["a newline inside a backtick substitution", "git push origin -o `echo a\n` -d held/branch"],
+  ["a newline inside a ${…} expansion", "git push origin -o ${R:-a\nb} -d held/branch"],
+]) {
+  expect(`A: ${name} → DATA, the real target survives`, extractPushDeleteBranch(cmd), ["held/branch"]);
+}
+
 // ── Part B — the SHIPPED gate (real index.ts tool_call handler) ───────────
 if (typeof stripTypeScriptTypes !== "function" ||
     (typeof register !== "function" && typeof registerHooks !== "function")) {
