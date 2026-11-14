@@ -3303,11 +3303,14 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 #
 # ⛔ AND THE ZERO-BACKLOG CAUSE NEEDS ONE MORE STEP THAN "IS IT EMPTY" (agent-infra#3909 review, 5th
 # cycle P2). `READ(n)` is a SUCCESSFUL read and `PARTIAL(x)` a NAMED partial read: both are MEASUREMENTS,
-# so a zero backlog beside one is a DRAINED queue — never the "absence of attribution" the single
-# `backlog_unreadable` token claimed. That pair is ROUTINE, not exotic: the refresh records its state and
-# only then reaps consumed candidates, so `queue=READ(7)` beside a zero backlog is healthy housekeeping.
-# Publishing "unreadable" there denies a measurement the record holds, which is the same "the record could
-# not distinguish" class one field over — and it is a FOURTH state, not a second.
+# so a zero backlog beside one must not be called blind. That pair is ROUTINE because the CONTROLLER
+# prunes dispatched ids out of `candidates.txt` (`orch-loop.sh:8147`), while the refresh only ever
+# APPENDS, DEDUPES or RE-ORDERS the queue and never drops a row
+# (`refresh-candidates.sh:5776`, `:6247`, `:4531`; the file states it: "ORDER, NEVER MEMBERSHIP … never
+# adds or drops a row", `:4371`). (⛔ An earlier revision credited the REAP to the refresh — it is not
+# the refresh's; review P2, 9th cycle.) Publishing "unreadable" there denies a measurement the record
+# holds, which is the same "the record could not distinguish" class one field over — and it is a FOURTH
+# state, not a second.
 # ⛔ BUT IT IS THE POOL READING, NOT PROOF THE QUEUE WAS SPENT (agent-infra#3909 review, 6th cycle P1).
 # `queue_state_write` runs when the LISTING completes (`refresh-candidates.sh:4257`); `candidates.txt` is
 # only replaced much later (:6247, the `mv` that puts the deduped backlog in place). THREE states
@@ -3342,9 +3345,12 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # the "may this be called EMPTY" phrasing, but nothing called it and nothing graded it, so it was dead
 # code advertising a second consumer that did not exist.
 # ⛔ AND IT IS NOT THE SAME RULE AS THE DISPLAY TOKEN ON A FUTURE STAMP (agent-infra#3909 review, 6th
-# cycle P2). `queue_state_token` clamps a future `at` to `age=0`, so the heartbeat line prints
-# `queue=EMPTY(0s)` for a clock step-back while this classifier answers `blind` — deliberately, because
-# an unverifiable stamp must not buy a reading a longer life. Two answers to one question would be the
+# cycle P2). `queue_state_token` clamps the AGE to 0, not the token: a future `at` prints the record's
+# OWN token with a `(0s)` age — `EMPTY(0s)` for an `EMPTY` record, `READ(7)(0s)` for a `READ` one — while
+# this classifier answers `blind`, deliberately, because an unverifiable stamp must not buy a reading a
+# longer life. (⛔ It is the AGE that is clamped; an earlier revision said the token was clamped to
+# `EMPTY(0s)`, which is only true when the record is already `EMPTY` — review P2, 9th cycle.) Two
+# answers to one question would be the
 # drift this header forbids, so say which is which: the TOKEN is display-only (it reports what the
 # record literally says plus its age, and its unit suffix is for a human reading a log line), and the
 # CLASS is the decision input. Anything that GATES must ask the class, never the token.
