@@ -501,6 +501,24 @@ async function partB() {
       const d12 = await coord("d12", "git push origin HEAD:refs/heads/feat && git push origin -o \")\" -d held/branch");
       expectTrue("B73l: a QUOTED `)` before the delete flag does not hide the delete (quote erasure)",
         isCoordBlock(d12, "held/branch"), `handler returned ${JSON.stringify(d12)?.slice(0, 200)}`);
+      // ⛔ ROUND-9 REVIEW (P0 ×4): the newline/paren MASKING hid a REAL separator in four shapes, so
+      // the second command landed in the first body, its `(`/`$(` was read as a span OPENER, `-d` and
+      // its target were skipped, and `_coordinatedDeleteBlock` was NEVER CONSULTED (index.ts:605
+      // returns null on an empty list). Measured end-to-end: ALLOWED here, BLOCKED on `origin/main`.
+      // These are end-to-end twins of the Part-A rows in `test-653-delete-target.mjs`; they exist
+      // because the extractor alone is not what an agent meets.
+      const d13 = await coord("d13", "git push origin HEAD:feat # don't\ngit push origin -d held/branch");
+      expectTrue("B73m: an apostrophe inside a `#` COMMENT does not hide a later line's delete",
+        isCoordBlock(d13, "held/branch"), `handler returned ${JSON.stringify(d13)?.slice(0, 200)}`);
+      const d14 = await coord("d14", "git push origin -o $'don\\'t'\n( git push origin -d held/branch )");
+      expectTrue("B73n: an ANSI-C literal before a later line does not hide the delete (its `\\'` does not close it)",
+        isCoordBlock(d14, "held/branch"), `handler returned ${JSON.stringify(d14)?.slice(0, 200)}`);
+      const d15 = await coord("d15", "git push origin -o ${R:-(}\n( git push origin -d held/branch )");
+      expectTrue("B73o: a `${…}`'s `}` does not close a `$(` span and hide the next line's delete",
+        isCoordBlock(d15, "held/branch"), `handler returned ${JSON.stringify(d15)?.slice(0, 200)}`);
+      const d16 = await coord("d16", 'git push origin -o "title=$(echo "fix) bug")" -d held/branch');
+      expectTrue("B73p: a `\"` INSIDE `$( … )` does not close the enclosing quote and hide the delete",
+        isCoordBlock(d16, "held/branch"), `handler returned ${JSON.stringify(d16)?.slice(0, 200)}`);
       // Positive controls — the boundary fix must not invent targets: a delete of
       // a branch NOBODY has checked out stays allowed, and so does a plain
       // compound push (the #73 arm must not fire on it).

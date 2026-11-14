@@ -4872,10 +4872,14 @@ function _foldBacktickSubstitutions(body) {
 /** One opaque word standing in for a collapsed command substitution (`$( … )` / backticks).
  *  NUL cannot occur in a shell word (bash words are NUL-terminated C strings) and it matches no
  *  flag/target shape, so consumers treat it as an ordinary positional — exactly what the
- *  substitution's WORD is. `_cleanDeleteTarget` maps it to "" so it can never be reported as a
- *  BRANCH NAME: `git push origin -d $(cat list)` names no ref we can resolve, and reporting the
- *  placeholder as a target would put a phantom into `_coordinatedDeleteBlock` (the pre-existing base
- *  behaviour reported `["$(echo"]`, equally phantom). */
+ *  substitution's WORD is. In a DELETE-TARGET slot `_cleanDeleteTarget` maps it to the UNRESOLVABLE
+ *  MARKER `$(…)`, which #653 REFUSES — never to `""`.
+ *  ⛔ IT USED TO SAY `""` HERE, AND THAT SENTENCE DESCRIBED THE FAIL-OPEN (#504 × #653). Dropping the
+ *  placeholder was the honest reading of "this is not a ref name" *before* #653 existed; after #653 a
+ *  target that never REACHES the refusing block is never refused either, so
+ *  `git push origin -d $(echo held/branch)` extracted `null` → the #73 arm was never consulted → the
+ *  delete of a sibling-held branch was ALLOWED. Do not "restore" the `""` mapping on the strength of
+ *  that old sentence: the arm of `_cleanDeleteTarget` that implements it says why it is wrong. */
 const _SUBST_PLACEHOLDER = "\u0000SUBST";
 
 /** Sentinel for a NEWLINE that is DATA, not a list separator (`_maskQuotedNewlines`).
@@ -4896,22 +4900,45 @@ const _SUBST_PLACEHOLDER = "\u0000SUBST";
  * ⛔ It cannot collide with `_SUBST_PLACEHOLDER` (`\u0000`) or `_QP_L`/`_QP_R` (`\u0001`/`\u0002`). */
 const _NL_DATA = "\u0003";
 
-/** Mask every newline that bash treats as DATA — inside `'…'`, `"…"`, `$( … )`, backticks or
- * `${ … }` — and only those. A `\`-escaped newline is a LINE CONTINUATION and is already gone before
- * this runs. Unbalanced state is handled the way bash's own parse would leave it: everything after an
- * unterminated quote/span stays inside it, so no later newline is a separator.
+/** Mask every newline that bash treats as DATA — inside `'…'`, `"…"`, `$( … )`, backticks, `${ … }`
+ * or an ANSI-C `$'…'` literal — and only those. A `\`-escaped newline is a LINE CONTINUATION and is
+ * already gone before this runs. Unbalanced state is handled the way bash's own parse would leave it:
+ * everything after an unterminated quote/span stays inside it, so no later newline is a separator.
+ *
+ * ⛔ THREE WAYS THIS MASK USED TO HIDE A REAL SEPARATOR, EACH A FAIL-OPEN (round-9 review, P0 ×3).
+ * Masking a newline that bash treats as a SEPARATOR merges two commands into one body; the second
+ * command's `(`/`$(` is then read as a span OPENER, its `-d` and target are skipped as span content,
+ * `extractPushDeleteBranch` returns null — and a delete of a sibling-held branch is ALLOWED. Measured
+ * against `origin/main` over a 644-row shape corpus: 12 rows where main BLOCKS and this mask ALLOWED.
+ *
+ *   (a) `$'…'` — bash has a dedicated ANSI-C quoting context in which `\` escapes (so `\'` does NOT
+ *       close it). Reading the `'` as a plain single quote closed the literal at the escape and
+ *       re-opened one that never closed, so every later newline was masked:
+ *         git push origin -o $'don\'t'⏎( git push origin -d held/branch )   → ALLOWED, main BLOCKS
+ *       Fixed by folding the literal BEFORE the scan (`_foldAnsiCStrings`), which is already the rule
+ *       `_pushSegmentTokens` applies per segment; here it must happen on the WHOLE command, because
+ *       this pass runs before segmentation.
+ *   (b) `# …` — a `#` that BEGINS A WORD starts a comment (bash: that word and the rest of the line are
+ *       ignored, and the newline that ends it IS a separator). There was no comment tracking, so an
+ *       APOSTROPHE inside a comment opened a quote that never closed:
+ *         git push origin HEAD:feat # don't⏎git push origin -d held/branch   → ALLOWED, main BLOCKS
+ *   (c) `}` closed a `$(`-opened span — one shared `span` counter for two different span kinds. The
+ *       `}` of `${R:-(}` therefore left `span === 1`, masking the newline after it:
+ *         git push origin -o ${R:-(}⏎( git push origin -d held/branch )      → ALLOWED, main BLOCKS
+ *       Fixed by a STACK: `}` only closes a `${`, `)` only closes a `$(`, and inside `${ … }` a bare
+ *       `(` is DATA, not a nesting level (bash: `${R:-(}` is the complete expansion yielding `(`).
  * @param {string} text
  * @returns {string}
  */
 function _maskQuotedNewlines(text) {
-  const s = String(text ?? "");
+  const s = _foldAnsiCStrings(String(text ?? ""));
   const out = [];
-  let quote = null; // ' or "
-  let span = 0;     // depth of $( … ) / ${ … } opened outside quotes
+  let quote = null;  // ' or "
+  const spans = [];  // stack of "(" ($( … )) | "{" (${ … }) open OUTSIDE quotes
   let btick = false;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    const push = (v) => out.push(v === "\n" && (quote !== null || span > 0 || btick) ? _NL_DATA : v);
+    const push = (v) => out.push(v === "\n" && (quote !== null || spans.length > 0 || btick) ? _NL_DATA : v);
     if (quote !== null) {
       if (ch === "\\" && quote === '"' && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
       if (ch === quote) quote = null;
@@ -4919,13 +4946,25 @@ function _maskQuotedNewlines(text) {
       continue;
     }
     if (ch === "\\" && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
+    // A `#` BEGINNING A WORD starts a comment. The terminating newline is NOT part of it — it ends the
+    // comment and is a real separator, which is the whole point of masking only genuine data newlines.
+    if (ch === "#" && (i === 0 || /[\s;&|(]/.test(s[i - 1]))) {
+      const nl = s.indexOf("\n", i);
+      const end = nl === -1 ? s.length : nl;
+      out.push(s.slice(i, end));
+      i = end - 1;
+      continue;
+    }
     if (ch === "'" || ch === '"') { quote = ch; out.push(ch); continue; }
     if (ch === "`") { btick = !btick; out.push(ch); continue; }
-    if (ch === "$" && s[i + 1] === "(") { span++; out.push("$("); i++; continue; }
-    if (ch === "$" && s[i + 1] === "{") { span++; out.push("${"); i++; continue; }
-    if (span > 0 && ch === "(") { span++; out.push(ch); continue; }
-    if (span > 0 && ch === ")") { span--; out.push(ch); continue; }
-    if (span > 0 && ch === "}") { span--; out.push(ch); continue; }
+    if (ch === "$" && s[i + 1] === "(") { spans.push("("); out.push("$("); i++; continue; }
+    if (ch === "$" && s[i + 1] === "{") { spans.push("{"); out.push("${"); i++; continue; }
+    const top = spans[spans.length - 1];
+    // ⛔ A BARE `(` NESTS ONLY INSIDE `$( … )`. Inside `${ … }` it is literal text, so pushing a level
+    // there would make the expansion's own `}` fail to close and mask the next newline (defect (c)).
+    if (top === "(" && ch === "(") { spans.push("("); out.push(ch); continue; }
+    if (top === "(" && ch === ")") { spans.pop(); out.push(ch); continue; }
+    if (top === "{" && ch === "}") { spans.pop(); out.push(ch); continue; }
     push(ch);
   }
   return out.join("");
@@ -5025,6 +5064,16 @@ function _maskDataParens(body) {
   let out = "";
   let quote = null;
   let expDepth = 0; // `${ … }` spans OPEN in this segment: their parens are DATA
+  // ⛔ A `$( … )` INSIDE `"…"` OPENS A NEW QUOTING CONTEXT (round-9 review, P0). Bash re-enters the
+  // substitution's own quoting context and returns to the enclosing one at the matching `)`, so a `"`
+  // INSIDE the span must not close the ENCLOSING quote. A single flat `quote` let it, and the span's
+  // inner `)` then arrived UNMASKED — where `_pushSegmentTokens` reads a `)` with `depth === 0` as the
+  // #504 segment boundary and BREAKS, discarding the `-d` and its target:
+  //   git push origin -o "title=$(echo "fix) bug")" -d held/branch  → ALLOWED here, BLOCKED on origin/main
+  // (measured 4/4 shapes; the `-o "plain"` control BLOCKS on both, so the fixture is valid).
+  // `substQuotes` is one entry per `$(` level — the enclosing quote to RESTORE at that level's `)`,
+  // or `null` for a level opened outside any quote (nothing to restore).
+  const substQuotes = [];
   for (let i = 0; i < body.length; i++) {
     const ch = body[i];
     if (quote) {
@@ -5036,6 +5085,12 @@ function _maskDataParens(body) {
       // quotes it is literal text, so the single-quote path below never touches `expDepth`.
       if (quote === '"' && ch === "$" && body[i + 1] === "{") { expDepth++; out += ch + "{"; i++; continue; }
       if (quote === '"' && ch === "}" && expDepth > 0) { expDepth--; out += ch; continue; }
+      // A `$(` inside DOUBLE quotes starts a substitution: enter it in a NEUTRAL quoting context and
+      // remember the quote we must return to. The `(` stays masked, so a quoted span contributes no
+      // operator token — the established contract for `"$( … )"` (which already BLOCKED correctly).
+      if (quote === '"' && ch === "$" && body[i + 1] === "(") {
+        substQuotes.push(quote); quote = null; out += ch + swap("("); i++; continue;
+      }
       out += swap(ch);
       continue;
     }
@@ -5045,6 +5100,21 @@ function _maskDataParens(body) {
     if (ch === "'" || ch === '"') { quote = ch; out += ch; continue; }
     if (ch === "$" && body[i + 1] === "{") { expDepth++; out += ch + "{"; i++; continue; }
     if (ch === "}" && expDepth > 0) { expDepth--; out += ch; continue; }
+    if (ch === "$" && body[i + 1] === "(" && expDepth === 0) { substQuotes.push(quote); out += ch + "("; i++; continue; }
+    if (ch === "(" && expDepth === 0 && substQuotes.length > 0) { substQuotes.push(quote); out += ch; continue; }
+    if (ch === ")" && expDepth === 0 && substQuotes.length > 0) {
+      const restore = substQuotes.pop();
+      // At the OUTERMOST `)` the substitution returns to the context that opened it. A `)` that
+      // closes a level opened inside `"…"` is itself DATA there, so it is masked.
+      // ⚠️ STATED RESIDUAL (round-9 review): this mask is NOT independently observable — the closer
+      // always lands INSIDE the restored quote for `_tokenize` too, so unmasking it changes 0 rows of
+      // the 644-row differential and reddens no test. It is kept because MASKING IS THE FAIL-SAFE
+      // DIRECTION for a gate: a masked paren can never become an operator token, whereas an unmasked
+      // one can become the #504 `break` — and this function exists to stop exactly that. Do not
+      // "simplify" it away on the strength of it having no test; the asymmetry is the reason.
+      if (restore) { quote = restore; out += swap(ch); } else { out += ch; }
+      continue;
+    }
     out += expDepth > 0 ? swap(ch) : ch; // inside `${ … }` BOTH parens are data
   }
   return out;

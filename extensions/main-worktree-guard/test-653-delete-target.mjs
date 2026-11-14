@@ -179,6 +179,50 @@ for (const [name, cmd] of [
 // …and the unquoted twin really is still a boundary (the control for the rows above).
 expect("A: an UNQUOTED newline between two commands is still a boundary", extractPushDeleteBranch("git push origin HEAD:feat\ngit push origin -d held/branch"), ["held/branch"]);
 
+// ── Round-9 review (P0 ×3): the newline mask hid a REAL separator in three shapes, and one quote
+// tracker let an inner `"` close an enclosing one. Each masked a separator, so the second command
+// landed in the first body and its `(`/`$(` was read as a span OPENER — the `-d` and its target were
+// skipped and the #73 arm was never consulted. Measured against `origin/main` over a 644-row shape
+// corpus: 12 rows where main BLOCKS and this branch ALLOWED, in exactly these classes. ──
+for (const [name, cmd] of [
+  ["an apostrophe inside a `#` COMMENT before a later newline",
+    "git push origin HEAD:feat # don't\ngit push origin -d held/branch"],
+  ["an apostrophe inside a `#` COMMENT before a parenthesized later segment",
+    "git push origin HEAD:feat # don't\n( git push origin -d held/branch )"],
+  // `$'…'` is its OWN quoting context in bash (`\'` does not close it). Reading the `'` as a plain
+  // single quote closed the literal at the escape and re-opened one that never closed.
+  ["an ANSI-C literal before a later newline",
+    "git push origin -o $'don\\'t'\n( git push origin -d held/branch )"],
+  // ONE shared span counter meant the `}` of `${R:-(}` left the counter non-zero and masked the
+  // next newline. `}` must close only a `${`, and inside `${ … }` a bare `(` is DATA (bash:
+  // `${R:-(}` is the complete expansion yielding `(`).
+  ["a `${…}` whose `}` must not close a `$(` span",
+    "git push origin -o ${R:-(}\n( git push origin -d held/branch )"],
+]) {
+  expect(`A: ${name} → the real target is ATTRIBUTED`, extractPushDeleteBranch(cmd), ["held/branch"]);
+}
+// ⛔ A `"` INSIDE `$( … )` OPENS A NEW QUOTING CONTEXT (bash re-enters the enclosing one at the
+// matching `)`). With a single flat `quote`, the inner `"` CLOSED the enclosing one, so the span's
+// `)` arrived unmasked and `_pushSegmentTokens` read it as the #504 boundary and broke — dropping the
+// `-d` and its target. Measured: all four ALLOWED here, BLOCKED on `origin/main`.
+for (const [name, cmd, want] of [
+  ["a double quote inside a substitution in a double-quoted option",
+    'git push origin -o "title=$(echo "fix) bug")" -d held/branch', ["bug)", "held/branch"]],
+  ["a quoted close-paren inside a substitution",
+    'git push origin -o "$(echo ")" )" -d held/branch', ["held/branch"]],
+  ["a nested substitution carrying a quoted paren before the flag",
+    'git push -o "x=$(echo "a)")" origin -d held/branch', ["held/branch"]],
+]) {
+  expect(`A: ${name} → the real target survives the span`, extractPushDeleteBranch(cmd), want);
+}
+// CONTROLS for the `#`-comment rule — every one pins a state where `#` is NOT a comment, so the skip
+// cannot be widened to swallow a real delete.
+expect("A: a QUOTED `#` is data, not a comment", extractPushDeleteBranch('git push origin -o "a#b" -d held/branch'), ["held/branch"]);
+expect("A: an unquoted `#` MID-WORD is not a comment", extractPushDeleteBranch("git push origin -o a#b -d held/branch"), ["held/branch"]);
+// CONTROLS for the span stack — the `${…}` handling must not have been weakened in either direction.
+expect("A: a quoted brace does not close the expansion", extractPushDeleteBranch("git push origin -o ${R:-'}'x)} -d b"), ["b"]);
+expect("A: a substitution span inside a parameter expansion", extractPushDeleteBranch("git push $(echo ${R:-)}) origin -d b"), ["origin", "b"]);
+
 // …and the marker really is what #653 refuses, end-to-end at the seam these rows live in.
 for (const t of ["$(…)"]) expect(`A: #653 refuses the truncated-span marker ${t}`, unresolvableDeleteTargets([t]), [t]);
 // ⚠️ CONTROL (not a discriminator): a backtick with NOTHING after it in the segment is the #504
