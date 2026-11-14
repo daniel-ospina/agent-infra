@@ -1201,21 +1201,33 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # spelled form is what a digit-only scan misses (13n30).
   local _OC_COUNT='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten|[1-9][0-9]*)'
   local _OC_GOVERNS="[[:space:]]+(of[[:space:]]+(them|the|these|those)|block(ing|ers?))"
-  local _OC_RESOLVES="[[:space:]]+(of[[:space:]]+(them|the|these|those)[[:space:]]+)?(${_OC_TOK}[[:space:]]+){0,2}(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)"
-  # ⛔ A COUNT FOLLOWED BY A BLOCKING SEVERITY IS A REMAINDER (agent-infra#3902 SECOND review, F1).
-  # Making the token runs severity-aware closed only the phrasings this file happened to test
-  # (`… 1 P1 remains open`), and the reviewers' SECOND pass MEASURED that the class was still open
-  # through a resolution or in-progress VERB, which reaches neither `_OC_STILL` nor `_OC_RESOLVES`:
-  # `1 P0 (security) was not addressed`, `1 P1 was not addressed`, `1 P1 partially resolved`,
-  # `1 P1 not yet fixed`, `1 P1 being fixed`, `1 P1 was not re-verified` — six, all escaping.
-  # Enumerating those verbs is the mistake every earlier round made one word later, so this arm reads
-  # SHAPE instead: after the DECLARED count is masked out, any surviving `<count> <P0|P1>` on the line
-  # is by definition a remainder — the declaration's own count is the only one that may stand.
-  # ⛔ P0|P1 ONLY, never P2|P3: `… 2 P3 nits filed` is a non-blocking follow-up and must not refuse an
-  # honest clean line. `blocking` is P0/P1 by this repo's own convention, so a P2/P3 count is not a
-  # blocking remainder at all.
+  # ⛔ `_OC_BSEV` MUST BE DECLARED BEFORE EVERY READER. `_OC_RESOLVES` reads it ~14 lines
+  # below, and a `local` that appears after its reader leaves the variable UNSET at use —
+  # under `set -u` that aborts the recorder mid-run and took the whole suite's summary with
+  # it (the harness reported 'aborted BEFORE its summary'), which is how this ordering got
+  # measured rather than reasoned about.
   local _OC_BSEV='\(?p[01]\)?'
-  local _OC_SEVREMAINDER="(^|[^[:alnum:]])${_OC_COUNT}[[:space:]]+${_OC_BSEV}"
+  # ⛔ ONLY A **BLOCKING** severity governs a blocking remainder here (third review, P2). Reading the
+  # full `_OC_TOK` (which spans P0..P3) made `1 P2 nit was not addressed, filed as #999` look like a
+  # governing second count and refused an honest clean review that merely notes a non-blocking
+  # follow-up. A P2/P3 mention is not a blocking remainder at all.
+  local _OC_RESOLVES="[[:space:]]+(of[[:space:]]+(them|the|these|those)[[:space:]]+)?(${_OC_BSEV}[[:space:]]+){0,2}(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)"
+  # ⛔ A COUNT IS NOT REQUIRED — THE SEVERITY CARRIES THE VETO, NOT THE DIGIT (agent-infra#3902 THIRD
+  # review, F1). The first shape rule gated the severity on `${_OC_COUNT}[[:space:]]+`, so the MOST
+  # natural phrasing of all — with no digit — was the one shape it could not read. MEASURED escaping
+  # at 7efcb2d75: `… were fixed; P0 remains open`, `… ; P1 remains open`, `… ; P1 still open`,
+  # `… ; the P1 remains open`, `… ; P0 (security) remains open`, `… ; P1 outstanding`,
+  # `… ; P1 unresolved`. Eight rows in all, all minting a `clean` record over a live blocker.
+  # ⛔ AND "ANY SURVIVING `<count> <P0|P1>` IS A REMAINDER" WAS SIMPLY FALSE (same review, P2): a
+  # RESOLVED severity is a CLOSURE, and pure shape cannot tell the two apart. MEASURED ESCAPE→VETO on
+  # `… the 1 P1 was fixed too`, `… 1 P1 in an unrelated file was closed earlier`,
+  # `… 2 P1s were closed in cycle 1` — honest clean lines the arm refused.
+  # Both directions are the SAME missing conjunct: a segment whose verb is PERSISTENCE, IN-PROGRESS or
+  # NEGATED is a remainder, and a segment whose verb is a plain resolution is not. Reading that context
+  # rather than the count closes the fail-open and the false block together, which is why the count is
+  # now OPTIONAL and the context is what is required.
+  local _OC_SEVREM_CTX='[^.;:]{0,40}(remain|remains|remaining|still|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|partial|being[[:space:]]+(fixed|addressed|resolved)|not[[:space:]]+(yet[[:space:]]+)?(fixed|resolved|closed|addressed|re-verified))'
+  local _OC_SEVREMAINDER="(^|[^[:alnum:]])((${_OC_COUNT}[[:space:]]+)?${_OC_BSEV})${_OC_SEVREM_CTX}"
   local _OC_STILL="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending)"
   local _OC_SELLED='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)([^[:alpha:]]|$)'
   local _OC_SECOND_COUNT="${_OC_COUNT}(${_OC_GOVERNS}|${_OC_RESOLVES}|${_OC_STILL})|${_OC_SELLED}"
@@ -1271,16 +1283,14 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # no-op gate; the suite caught it only because those four rows pin the belt from the other side.
     _rest="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' \
       | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?non-block(ing|ers?)/\1 NEGDECL /g; s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)/\1 BLKDECL/; s/\(p[0-3]\)/ PTAG /g")"
-    # ⛔ THE NEGATION/IN-PROGRESS BELTS ARE READ LINE-WIDE (second review, F1). They were
-    # `_clause`-scoped, so a remainder after the declaration's own `;` — the shape an agent actually
-    # writes — reached none of them. 13n25 still holds under the widening because its negation is
-    # `is not covered`, and `covered` is not in this verb set; the widening adds reach without
-    # re-introducing the unpredicated-scope error 13n25 pins.
-    if grep -qE "$_OC_NOT_RESOLVED|$_OC_IN_PROGRESS" <<<"$_rest"; then
-      OUTCOME_BLOCKING_LINE="$line"
-      return 0
-    fi
-    if grep -qE "$_OC_PERSIST" <<<"$_clause"; then
+    # ⛔ THE NEGATION/IN-PROGRESS BELTS ARE CLAUSE-SCOPED, AND THE WIDENING WAS REVERTED (third
+    # review, P2 — a MEASURED false block). Reading them line-wide refused honest clean reviews that
+    # merely NOTE an unfixed non-blocking item: `… 2 blocking findings were fixed and re-verified;
+    # 1 P2 nit was not addressed, filed as #999` → VETO, and the same for a P3 nit and for
+    # `the docs gap was not addressed`. The belt has no SUBJECT requirement, so widening it widened
+    # the false blocks too. The severity-tagged remainder after a `;` is covered instead by
+    # `_OC_SEVREMAINDER`, which carries the subject (P0|P1) in the pattern itself.
+    if grep -qE "$_OC_NOT_RESOLVED|$_OC_IN_PROGRESS|$_OC_PERSIST" <<<"$_clause"; then
       OUTCOME_BLOCKING_LINE="$line"
       return 0
     fi
