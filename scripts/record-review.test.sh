@@ -6157,6 +6157,73 @@ EV_REF="comment:42612201" run_record_ev 426122 STUB_EVIDENCE_BODY="**Outcome: CL
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13n113 a P2 count in a SEPARATE sentence does not reach the arm (rc 0)"
 
+# 13n114-13n116 — THREE MORE DECLARED REMAINDERS THAT MINTED A SIGNED `clean` (P1 fail-opens, from
+# the review of this branch's own round). Two of them are the parity guard's blind spot: 13n87 enforces
+# `_OC_PERSIST` ⊆ `_OC_STILL`, so it can prove the two lists AGREE but never that BOTH are missing a
+# word. `re-opened` was doubly invisible — the list had `open`, but `_OC_TOK` lets `-` join it into one
+# token, so `re-opened` never equalled `open`. MEASURED at 2e5defd2a: all three ADMITTED.
+rm -f "$(Q2 426123)"
+EV_REF="comment:42612301" run_record_ev 426123 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, less 2.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n114 'all … fixed, LESS 2' is a declared remainder (rc 3)"
+
+rm -f "$(Q2 426124)"
+EV_REF="comment:42612401" run_record_ev 426124 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed; 1 was re-opened.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n115 '; 1 was RE-OPENED' is a live remainder (rc 3)"
+
+rm -f "$(Q2 426125)"
+EV_REF="comment:42612501" run_record_ev 426125 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed; 1 was skipped.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n116 '; 1 was SKIPPED' is a live remainder (rc 3)"
+
+# 13n117 — THE REGRESSION THE BOUND-REMOVAL INTRODUCED (P2 false refusal), and the reason the exception
+# is now SCOPED to the match it excepts instead of merely being distance-free. Unbounding
+# `[^.;:]{0,80}` closed the distance fail-open but let the exception attach to a DIFFERENT noun phrase
+# in the same clause, so an honest closure was REFUSED at 8b244281c:
+#   `all blocking findings were fixed and re-verified against each reviewer note, and the whole
+#    documentation set in the handbook was updated except 1 typo.`   (137 chars, `except 1 typo`)
+# `1 typo` is not an exception of the BLOCKING FINDINGS, so nothing remains. The rule now reads
+# grammar, not width: the excepted count must not name its OWN population noun — a preposition,
+# an auxiliary, a persistence word, punctuation or end-of-clause must follow it. So
+# `except 1` / `except 1 in the retry path` refuse (13n79/13n97), and `except 1 typo` records.
+rm -f "$(Q2 426126)"
+EV_REF="comment:42612601" run_record_ev 426126 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed and re-verified against each reviewer note, and the whole documentation set in the handbook was updated except 1 typo.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n117 an exception that names its OWN population ('except 1 typo') is not an exception of the findings (rc 0)"
+[ -f "$(Q2 426126)" ] && ok "13n117 …and the honest closure still records" || bad "13n117 refused an honest closure whose 'except' attaches to another noun phrase"
+
+# 13n118 — MUTATION PIN for the scoping (13n117's own). Remove the scope suffix and the honest closure
+# must REFUSE again, otherwise 13n117 could be green because the connective never matched at all.
+N_SCOPE_MUT="$T/mutant-except-unscoped.sh"
+sed 's#\${_OC_EXCEPT_SCOPE}#)#' "$RECORD" > "$N_SCOPE_MUT"
+if cmp -s "$RECORD" "$N_SCOPE_MUT"; then
+    bad "13n118 MUTANT: the _OC_EXCEPT_SCOPE sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_SCOPE_MUT" && ok "13n118 MUTANT: the unscoped-exception mutant still parses" || bad "13n118 MUTANT: the mutant does not parse"
+    NS_SAVE="$RECORD"
+    RECORD="$N_SCOPE_MUT"
+    rm -f "$(Q2 426127)"
+    EV_REF="comment:42612701" run_record_ev 426127 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed and re-verified against each reviewer note, and the whole documentation set in the handbook was updated except 1 typo.**
+
+$VACUITY_BLOCK"
+    RECORD="$NS_SAVE"
+    assert_eq "$RECORD_RC" "3" "13n118 MUTATION PIN: with the exception unscoped, 13n117's honest closure is REFUSED (rc 3) — the scoping is load-bearing"
+fi
+
+# 13n119 — THE OVER-BLOCK CONTROL for the two persistence words. `skipped` and `re-opened` are read
+# CLAUSE-scoped inside _OC_PERSIST and line-wide inside _OC_STILL, so the control is that neither fires
+# without a blocking mention: a CLEAN line about skipped TESTS records.
+rm -f "$(Q2 426128)"
+EV_REF="comment:42612801" run_record_ev 426128 STUB_EVIDENCE_BODY="**Outcome: CLEAN — no blocking issues found; 2 flaky tests were skipped and 1 doc page was re-opened.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n119 'skipped'/'re-opened' with NO blocking mention is not a remainder (rc 0)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
