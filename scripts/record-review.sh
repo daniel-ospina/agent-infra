@@ -1198,7 +1198,7 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 # What the arm deliberately does NOT judge is whether a declared blocker WAS later fixed: it reads
 # only shape — a declared count, a totality, an arithmetic remainder — never substance.
 outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line names blocking findings
-  local decoded line live_count _clause _rest _live _bline
+  local decoded line live_count _clause _rest _live _bline _shine
   # A negated or in-progress resolution is not a resolution.
   local _OC_NOT_RESOLVED='(^|[^[:alpha:]])(none|nothing|neither|not|never)[[:space:]]+[^.;:]{0,30}(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)'
   local _OC_IN_PROGRESS='(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(being|partially|partly|pending|in[[:space:]]+progress)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)'
@@ -1548,7 +1548,17 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     fi
     # ...and the SHAPE belt above (see `_OC_COPULA`): a surviving count governed by a copula that
     # does not resolve is a remainder, whatever verb it used. This is what closes the open set.
-    if grep -qE "$_OC_COPULA" <<<"$_rest" && ! grep -qE "$_OC_ANYRESOLVE" <<<"$_rest"; then
+    # ⛔ AND IT MUST NOT BE ARMED BY A P2/P3 COUNT (agent-infra#3902 review, P2 — MEASURED false
+    # refusal; 13n113). The belt is line-wide on purpose (a remainder usually sits after the
+    # declaration's own `;`), but the tsv-framed body is ONE line, so "line-wide" also spans a `.` —
+    # and a count qualified by a NON-BLOCKING severity is not a blocking remainder at all, which is
+    # exactly why `_OC_SEVREMAINDER` reads P0|P1 and never P2|P3. MEASURED: with the belt unscoped,
+    #   `Outcome: CLEAN — all blocking findings were fixed. Separately, 1 P2 nit was filed.`
+    # was REFUSED. Masking the P2/P3 count is predicated on the match it excepts, the same shape
+    # `_bline` already uses for escape (b), and it leaves P0/P1 counts fully armed.
+    _shine="$(printf '%s' "$_rest" | tr '[:upper:]' '[:lower:]' \
+      | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]]+\\(?p[23]\\)?/\\1 NONBLK/g")"
+    if grep -qE "$_OC_COPULA" <<<"$_shine" && ! grep -qE "$_OC_ANYRESOLVE" <<<"$_shine"; then
       OUTCOME_BLOCKING_LINE="$line"
       return 0
     fi

@@ -5928,6 +5928,11 @@ fi
 
 # 13n89 — MUTATION PIN for the twin's parity words (13n80's own): restore the SHORT list and the waived
 # remainder must ADMIT again. This is the row that would have caught the omission before a reviewer did.
+# ⛔ ITS VECTOR IS THE CO-PULA-FREE FORM (`1 waived`, not `1 was waived`), AND THAT IS DELIBERATE.
+# The SHAPE belt (`_OC_COPULA`) now refuses `1 was waived` on its own, so the copula form would go red
+# on the mutant for a reason that has nothing to do with `_OC_STILL` — a mutation pin that cannot
+# attribute its own red proves nothing about the belt it names. `1 waived` has no copula, so the ONLY
+# thing that can refuse it is the twin's word list: restoring the short list must make it ADMIT.
 N_TWIN_MUT="$T/mutant-still-short.sh"
 sed 's@^  local _OC_STILL=.*$@  local _OC_STILL='"'"'[[:space:]]+([[][:space:]]*([[:alpha:]/._-]+[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending)'"'"'@' "$RECORD" > "$N_TWIN_MUT"
 if cmp -s "$RECORD" "$N_TWIN_MUT"; then
@@ -5937,11 +5942,11 @@ else
     NT_SAVE="$RECORD"
     RECORD="$N_TWIN_MUT"
     rm -f "$(Q2 426010)"
-    EV_REF="comment:42601001" run_record_ev 426010 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 was waived.**
+    EV_REF="comment:42601001" run_record_ev 426010 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 waived.**
 
 $VACUITY_BLOCK"
     RECORD="$NT_SAVE"
-    assert_eq "$RECORD_RC" "0" "13n89 MUTATION PIN: with the twin's list back to its short form, 13n80's body is ADMITTED (rc 0) — the parity is load-bearing"
+    assert_eq "$RECORD_RC" "0" "13n89 MUTATION PIN: with the twin's list back to its short form, '1 waived' is ADMITTED (rc 0) — the parity is load-bearing"
 fi
 
 # 13n90-13n91 — THE OVER-BLOCK CONTROLS these predicates must NOT break. Both are honest CLEAN
@@ -7381,13 +7386,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4787 :6513 :8887 :9061, plus a comment mention at :4576; `14.1c-CITE` below
+#     CITE-CHECK: :4797 :6523 :8897 :9071, plus a comment mention at :4576; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4619) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4787) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4797) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8887). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8897). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -7413,7 +7418,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8887` / `:9061` — CITE-CHECK: :8887 :9061 — re-derived by the
+#     this head the predicates are `:8897` / `:9071` — CITE-CHECK: :8897 :9071 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -8322,7 +8327,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6513 :8887 :9061 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6523 :8897 :9071 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
