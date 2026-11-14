@@ -112,7 +112,17 @@ expect("A: a non-array is inert (never throws into the gate)", unresolvableDelet
 // source for `$VAR`). They are the reason the policy layer is needed even after
 // #3962's fragment collapse: `null` targets would still ALLOW.
 expect("A: $VAR extract", extractPushDeleteBranch(`git push origin --delete "$PR_BRANCH"`), ["$PR_BRANCH"]);
-expect("A: $(…) extract (a FRAGMENT, not a ref)", extractPushDeleteBranch("git push origin -d $(echo held/branch)"), ["$(echo", "held/branch)"]);
+expect("A: $(…) extract (a FRAGMENT, not a ref)", extractPushDeleteBranch("git push origin -d $(echo held/branch)"), ["$", "$(echo", "held/branch)"]);
+// ⚠️ ROUND 17: the array above gained the `"$"` element, and this is why it is
+// still a pin rather than a loosened assertion. The extractor now reads the
+// PARSER's invocations AND its historical text segments, so this command is
+// attributed twice: the parser represents a command substitution as the single
+// marker token `$` (`allGitInvocations` yields args `["origin","--delete","$"]`),
+// while the text surface keeps the space-split fragments `$(echo` / `held/branch)`.
+// The union is fail-closed by construction — every one of the three names is
+// unresolvable, so #653's policy layer refuses — and the end-to-end rows (B4, M4)
+// are unchanged: this command is still BLOCKED. What changed is only how COMPLETE
+// the attribution is, which is the direction the whole PR moves in.
 expect("A: backtick extract (a FRAGMENT, not a ref)", extractPushDeleteBranch("git push origin -d `cat list`"), ["`cat", "list`"]);
 expect("A: brace expansion extract (ONE token, shell makes TWO words)", extractPushDeleteBranch("git push origin -d {held,other}"), ["{held,other}"]);
 

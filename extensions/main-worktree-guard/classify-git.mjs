@@ -5013,43 +5013,36 @@ function _cleanDeleteTarget(x) {
  *   leaves the delete unguarded. So `null` ⇒ nothing deleted, but a NON-null
  *   result does NOT prove git will delete it (review P3-1).
  */
-// ⛔ THE ADJACENCY PREFIX, AND WHY IT EXISTS (review round 16, P1). This
-// extractor used to require the literal adjacency `git push`, i.e. it was
-// SEGMENT-MATCHED on `/\bgit\s+push\b/`. Git accepts a global option cluster
-// between the two (`git -C . push`, `git -c core.pager=cat push`,
-// `git --git-dir=$PWD/.git push`), and the classifier PARSES those forms
-// correctly — so the extractor was a STRICT SUBSET of the rows the delete
-// attribution must cover. Two consumers inherited the hole and both were
-// measured ADMITTING a sibling-held delete from a worktree session:
-//   · `wholeCommandDeleteTargets` (this function is its only implementation),
-//     whose `[]` made the force-push/push allowance read `foreignDelete=false`
-//     and `return admitAfterM3()` — for
-//     `git -C . push -f origin main && git -C . push origin --delete held`;
-//   · the DEGRADED fallback arm, which has no parsed classifier at all and
-//     therefore had NO surface that could see
-//     `git stash pop && git -C . push origin --delete held`.
-// Widening THIS one predicate closes both, which is why the fix is here and not
-// two unions at the two call sites: a consumer that attributes delete targets
-// from the extractor is now correct by construction.
-// STATED LIMIT: a prefix whose value contains whitespace (`-C "my dir"`) and a
-// push reached only through `eval`/`xargs` remain invisible — the same class of
-// gap the classifier's own hint machinery exists for, declared rather than
-// assumed covered.
-const _PUSH_ADJ_SRC = String.raw`\bgit(?:\s+(?:-[Cc]\s*\S+|--git-dir(?:=\S+|\s+\S+)|--work-tree(?:=\S+|\s+\S+)))*\s+push\b`;
-const _RE_PUSH_ADJ = new RegExp(_PUSH_ADJ_SRC);
-
+// ⛔ NO HAND-MAINTAINED OPTION LIST LIVES HERE ANY MORE (review round 17, P0).
+// Round 16 taught this extractor an adjacency prefix by hand — `-C`/`-c`,
+// `--git-dir`, `--work-tree` — and the very next review found `git --no-pager
+// push …` still invisible, because git's GLOBAL-OPTION SET is larger than any
+// list a lane maintains by hand (`--no-pager`, `-p`, `--paginate`,
+// `--namespace`, `--cd`, `--config`, `--config-env`, `GIT_*=` …). Every miss is
+// the same fail-open: this function is the ONLY implementation behind
+// `wholeCommandDeleteTargets`, so an unseen target makes the push-family
+// allowance read `foreignDelete=false` and ADMIT a compound that deletes a
+// sibling worktree's branch; and in DEGRADED mode it is the only surface at all.
+// So the prefix regex is DELETED. The extractor now reads the PARSER's own
+// invocations (`allGitInvocations`, the same walk `classifyGitCommandDetailed`
+// uses), which is the surface that already understands every global option and
+// every quoting form — one implementation, no second list to drift.
+// The TEXT surface is kept beside it, deliberately: a command that merely
+// MENTIONS a push (`echo git push origin -d b`, a commit message) must keep
+// over-matching, because that is the documented fail-closed over-capture
+// (`hasPush`/`promotedFrom` are what keep it off the full path — see index.ts).
 export function extractPushDeleteBranch(command) {
   const c = String(command ?? "").trim();
-  if (!_RE_PUSH_ADJ.test(c)) return null;
-  // Compound commands carry several `git push` segments (`a && git push … ;
-  // git push …`) — detect deletes per segment, stopping at shell operators
-  // (the original regex's [^;&|]* contract).
+  // CHEAP COST GATE, not a semantic one: every spelling this guard can reach
+  // carries the literal `push` token, and the shell walk below is far more
+  // expensive than one regex test on a hot `tool_call` path.
+  if (c === "" || !/\bpush\b/.test(c)) return null;
   const branches = [];
-  const segRe = new RegExp(String.raw`${_PUSH_ADJ_SRC}([^;&|]*)`, "g");
-  let sm;
-  while ((sm = segRe.exec(c)) !== null) {
-    const tokens = sm[1].trim().split(/\s+/).filter(Boolean);
-    if (tokens.length === 0) continue;
+
+  /** Attribute every delete refspec these PUSH ARGUMENT TOKENS carry.
+   *  One implementation, driven by BOTH surfaces below. */
+  const collectFromArgTokens = (tokens) => {
+    if (tokens.length === 0) return;
     // Arg-taking options consume a value (`-o draft`, `--push-option draft`,
     // merged `-do draft` = -d -o draft; inline `-doDraft`/`--push-option=x`
     // carry their value in-token). A consumed value is NOT a flag and NOT a
@@ -5108,7 +5101,29 @@ export function extractPushDeleteBranch(command) {
         branches.push(_cleanDeleteTarget(tq));
       }
     }
+  };
+
+  // ── SURFACE A — the PARSED invocations (round 17): every git invocation the
+  // shell walk produced, with git's global options already consumed by the
+  // parser. This is what makes `git --no-pager push`, `git -C dir push`,
+  // `git -c k=v push`, `git --namespace=ns push` and their quoted values
+  // attribut­able without a second option list.
+  let invs = [];
+  try { invs = allGitInvocations(c) ?? []; } catch { invs = []; }
+  for (const inv of invs) {
+    if (inv?.verb === "push" && Array.isArray(inv.args)) collectFromArgTokens(inv.args);
   }
+
+  // ── SURFACE B — the TEXT segments, unchanged in contract: a delete spelling
+  // that merely MENTIONS a push still over-matches (fail-closed), and the
+  // literal adjacency is all this surface needs — the prefixed real commands are
+  // surface A's business now.
+  const segRe = /\bgit\s+push\b([^;&|]*)/g;
+  let sm;
+  while ((sm = segRe.exec(c)) !== null) {
+    collectFromArgTokens(sm[1].trim().split(/\s+/).filter(Boolean));
+  }
+
   const out = branches.filter(Boolean);
   // Dedupe: `-d :old/x` is counted by the flag path AND the colon path for
   // the SAME refspec (git deletes it once). Distinct targets stay distinct.

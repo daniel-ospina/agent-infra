@@ -6182,7 +6182,8 @@ export default function (pi: ExtensionAPI) {
         // allow-when-no-sibling-checkout return.
         const rawDeleteNames = extractPushDeleteBranch(localCommand) ?? [];
         // `allow-non-git` is intentionally absent: a non-empty extractor
-        // requires a literal `git push` token, so the legacy verdict for any
+        // requires a `git … push` token (global options may sit between the two —
+        // round 17), so the legacy verdict for any
         // such command is `allow` or a `block:*` — never `allow-non-git`.
         // The extractor is string-matched, so a command that merely MENTIONS a
         // delete push (`echo git push origin -d b`, comments) is conservatively
@@ -6667,15 +6668,20 @@ export default function (pi: ExtensionAPI) {
       // the extractor wholesale would trade this hole for a narrower one.
       // ⛔ AND THE PARSED INVOCATION SURFACE IS A THIRD ONE (review round 14, P0).
       // `det.pushTargets` is FIRST-invocation-scoped, so on its own it is a strict
-      // subset of the rows an arm must attribute. ⚠️ The extractor half of this
-      // paragraph is HISTORICAL: until round 16 `extractPushDeleteBranch` required
-      // the literal `git push` adjacency, so a later push carrying a `-C`/`-c`
-      // prefix was invisible to BOTH surfaces — and `det.pushMutations` was the
-      // only one that saw it. Round 16 taught the extractor that adjacency
-      // (`classify-git.mjs`'s `_PUSH_ADJ_SRC`), so the parsed surface is no longer
-      // the only reader of these rows; it is kept because it is the surface that
-      // parses rather than matches, and it remains the only one that sees a form
-      // the regex cannot express (a quoted `-C "my dir"`, an eval/xargs payload).
+      // subset of the rows an arm must attribute — which is why the parsed
+      // `det.pushMutations` entries are unioned in below.
+      // ⚠️ HISTORY, because this paragraph has already been wrong once: until
+      // round 16 `extractPushDeleteBranch` required the literal `git push`
+      // adjacency (`git -C . push` was invisible), and round 16 hand-taught it a
+      // list of prefixes — which round 17 then found incomplete (`--no-pager`) and
+      // REPLACED with a read of the parser's own invocations. The two surfaces now
+      // agree on every real command (measured on P33–P40), so the union below is
+      // defence in depth rather than two different answers.
+      // They are NOT identical, and the difference is kept deliberately: the
+      // extractor also over-matches plain TEXT (`echo git push origin -d b`, a
+      // commit message), which is the fail-closed direction for attribution but is
+      // not evidence that a push exists — that is what `det.hasPush` gates, and why
+      // a `git commit -m "… git push origin -d main"` row stays ALLOWED (B13).
       // Every `det.pushMutations` entry carries its own
       // `targets` and its own `isDelete`.
       // MEASURED at `5bac9475b` against base `e4716a058`, worktree session with
@@ -6810,9 +6816,11 @@ export default function (pi: ExtensionAPI) {
         // Round 14 fixed exactly this omission in the `#506` arm above and left it
         // here, one arm over: this probe's `block:push-delete` branch attributed
         // from `pushTargets ∪ extractor`, which is the same strict subset
-        // (`pushTargets` is FIRST-invocation-scoped and the extractor is
-        // segment-matched on `/\bgit\s+push\b/`, so a LATER `-C`/`-c`-prefixed
-        // push is invisible to both). Because the verdict is `block:push-delete`
+        // (`pushTargets` is FIRST-invocation-scoped and — ⚠️ HISTORICAL, fixed by
+        // round 17 — the extractor was segment-matched on `/\bgit\s+push\b/`, so
+        // a LATER `-C`/`-c`-prefixed push was invisible to both; the extractor now
+        // reads the parser's invocations, so it sees those rows too). Because the
+        // verdict is `block:push-delete`
         // there, the `#506` arm is skipped by its own exclusion, so this probe is
         // the ONLY thing standing between the compound and the restore — it missed
         // `held`, the restore rewrote the verdict onto a legacy kind, and
