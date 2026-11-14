@@ -3303,11 +3303,31 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # only then reaps consumed candidates, so `queue=READ(7)` beside a zero backlog is healthy housekeeping.
 # Publishing "unreadable" there denies a measurement the record holds, which is the same "the record could
 # not distinguish" class one field over — and it is a FOURTH state, not a second.
+# ⛔ BUT IT IS THE POOL READING, NOT PROOF THE QUEUE WAS SPENT (agent-infra#3909 review, 6th cycle P1).
+# `queue_state_write` runs when the LISTING completes (`refresh-candidates.sh:4257`); `candidates.txt` is
+# only rewritten much later (:6242). A pass that listed the pool and then exited BEFORE that rewrite —
+# the budget refusal (`:4077`) or the pre-flight's INCOMPLETE abort (`:6206`), both of which say of
+# themselves "an empty backlog would be a false report" — leaves a FRESH `READ(n)` beside the old,
+# possibly empty, queue file. That is not hypothetical: it is the MEASURED 2026-10-18 state this file
+# already records (`refresh-candidates.sh:778`: `candidates.txt: 0`, `checked.txt: 310`, pool READ(203)),
+# and the age bound cannot see it because the aborting pass re-writes the record every cycle. So these
+# two tokens name WHAT THE RECORD SAYS — the read succeeded, the queue file holds nothing — and not why.
+# Telling "spent" from "refused before writing" needs the pass's own completed outcome
+# (`state/refresh-last`, written by `refresh_record_write`), which this arm does not consult: a DECLARED
+# LIMIT, stated here rather than assumed away, and the reason the tokens are named for the reading rather
+# than for a cause the fields cannot prove.
 #
 # ⛔ ONE PRIMITIVE, ONE READ. The class is derived from ONE read of the record, and it is the only
 # question this loop actually asks — an earlier revision also shipped a `queue_state_fresh` wrapper for
 # the "may this be called EMPTY" phrasing, but nothing called it and nothing graded it, so it was dead
 # code advertising a second consumer that did not exist.
+# ⛔ AND IT IS NOT THE SAME RULE AS THE DISPLAY TOKEN ON A FUTURE STAMP (agent-infra#3909 review, 6th
+# cycle P2). `queue_state_token` clamps a future `at` to `age=0`, so the heartbeat line prints
+# `queue=EMPTY(0s)` for a clock step-back while this classifier answers `blind` — deliberately, because
+# an unverifiable stamp must not buy a reading a longer life. Two answers to one question would be the
+# drift this header forbids, so say which is which: the TOKEN is display-only (it reports what the
+# record literally says plus its age, and its unit suffix is for a human reading a log line), and the
+# CLASS is the decision input. Anything that GATES must ask the class, never the token.
 queue_state_class() { # -> empty | drained | partial | blind (always prints exactly one)
   # ⛔ THE BOUND IS DEFAULTED HERE, NOT JUST IN THE CONFIG BLOCK (rig, first run). A helper that
   # refuses whenever its own limit is unreadable looks identical to "the record is stale" from every

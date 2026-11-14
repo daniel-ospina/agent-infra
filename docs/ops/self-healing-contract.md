@@ -256,14 +256,25 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   ⛔ **AND A DRAINED QUEUE IS NOT A BLIND ONE** (5th review cycle of #3909). The zero-backlog states
   that are *not* a measured `EMPTY` are **three** facts, not one absence, because `READ(n)` is a
   **successful** read and `PARTIAL(x)` a **named** partial read — both are measurements the record holds:
-  `backlog_drained` (`READ(n)` with the queue now spent; the routine reap-after-read pair, since the
-  refresh records its state and only *then* reaps consumed candidates), `backlog_partial`
-  (`PARTIAL(x)` — a subset, but still a measurement), and `backlog_unreadable` (`UNREADABLE` /
-  `UNKNOWN` / a stale stamp / an ungradeable one — the only genuinely blind states). Collapsing a
-  drained queue into `backlog_unreadable` would deny a measurement the record holds, which is the same
-  "the record could not distinguish" class in the opposite direction. The three are split **after**
-  `listing_unreadable`, which is the PR listing's own measured unreadability and can zero the grant on
-  its own;
+  `backlog_drained` (`READ(n)` beside a zero backlog), `backlog_partial` (`PARTIAL(x)` — a subset, but
+  still a measurement), and `backlog_unreadable` (`UNREADABLE` / `UNKNOWN` / a stale stamp / an
+  ungradeable one — the only genuinely blind states). Collapsing a read pool into `backlog_unreadable`
+  would deny a measurement the record holds, which is the same "the record could not distinguish" class
+  in the opposite direction. The three are split **after** `listing_unreadable`, which is the PR
+  listing's own measured unreadability and can zero the grant on its own.
+  ⛔ **AND THEY NAME THE READING, NOT THE CAUSE** (corrected by the 6th review cycle of #3909).
+  `queue_state_write` runs when the *listing* completes, and `candidates.txt` is only rewritten much
+  later, so `READ(n)` beside a zero queue file is equally **"the queue was spent"** and **"the pass
+  listed the pool and then exited before writing the queue"** — a refused pass (budget, or the
+  pre-flight's `INCOMPLETE`) leaves precisely that pair, and the record is re-written each cycle so the
+  age bound cannot see it. The measured instance is `refresh-candidates.sh:778` (2026-10-18:
+  `candidates.txt: 0`, `checked.txt: 310`, pool `READ(203)`). Telling those two apart needs the pass's
+  own completed outcome (`state/refresh-last`), which this field does not consult — a declared limit,
+  not an assumption. So `backlog_drained` means "the record says the read succeeded and the queue holds
+  nothing", and a reader must not take it as proof the queue was consumed. ⛔ Relatedly, the display
+  token `queue=` and this decision input differ deliberately on one stamp: a FUTURE `at` is clamped to
+  `EMPTY(0s)` by `queue_state_token` (it reports what the record literally says) while
+  `queue_state_class` answers blind (unverifiable is not fresh). Anything that gates asks the class;
 - `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room, and a measured
   `0` on every pass the valve did not fire. ⛔ It is computed in the **drain-escape block**, not the
   cascade block — that separation is the whole point of it being its own token;
