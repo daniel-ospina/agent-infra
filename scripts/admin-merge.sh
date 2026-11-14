@@ -5176,6 +5176,13 @@ FIRST_CHECKS_STALL_BOUND=0
 FIRST_CHECKS_CEILING_BOUND=0
 FIRST_CHECKS_MISSING=0
 FIRST_CHECKS_MISSING_STREAK=0
+# ⛔ WHY `signal_ok` WAS CLEARED, not just that it was (review round 5, P2). The
+# `unobservable` state has TWO producers: a Jobs read that FAILED, and the
+# `> FIRST_CHECKS_JOBS_MAX` cap below, where the read is DELIBERATELY NOT ATTEMPTED. A
+# refusal that derives its cause from the STATE therefore guesses, and one of the two
+# guesses is false. This carries the measured ground to the refusal: `cap` | `unreadable`
+# | empty (the surface was read).
+FIRST_CHECKS_SIGNAL_REASON=""
 
 # first_checks_digest <jobs-json-file>... — ONE python pass over the pending runs'
 # job listings, emitting ONE line per input, in argv order:
@@ -5439,6 +5446,7 @@ wait_for_first_checks() {
   FIRST_CHECKS_REDERIVED=""; FIRST_CHECKS_HEAD_CHECKS=""
   FIRST_CHECKS_STATE=""; FIRST_CHECKS_LAST_CHANGE=""; FIRST_CHECKS_TRANSITIONS=0
   FIRST_CHECKS_FINGERPRINT=""; FIRST_CHECKS_MISSING=0; FIRST_CHECKS_MISSING_STREAK=0
+  FIRST_CHECKS_SIGNAL_REASON=""
   FIRST_CHECKS_UNRESOLVED=""; FIRST_CHECKS_UNRESOLVED_UNREADABLE=0
   stall_bound="$FIRST_CHECKS_STALL"
   ceiling_bound="$FIRST_CHECKS_CEILING"
@@ -5631,7 +5639,7 @@ wait_for_first_checks() {
         # (fail-closed, as before) and the signal is marked missing, so the state
         # below can never fall through to `pending == 0` and CLEAR the wait on an
         # unreadable surface.
-        [ "$read_ok" -eq 1 ] || pending="${#pending_ids[@]}"
+        [ "$read_ok" -eq 1 ] || { pending="${#pending_ids[@]}"; FIRST_CHECKS_SIGNAL_REASON="unreadable"; }
         if [ "$read_ok" -eq 1 ]; then
           # ONE parser call for every run actually read this poll; each line is
           # filed against its OWN run id, so the skipped (cached) runs keep the
@@ -5652,7 +5660,7 @@ wait_for_first_checks() {
             # pending and marks the signal missing, exactly as the previous
             # whole-digest length check did.
             line="$(cat "$fcdir/line.$id" 2>/dev/null)"
-            if [ -z "$line" ]; then signal_ok=0; pending=$((pending + 1)); continue; fi
+            if [ -z "$line" ]; then signal_ok=0; FIRST_CHECKS_SIGNAL_REASON="unreadable"; pending=$((pending + 1)); continue; fi
             IFS=$'\t' read -r jobs max_step_run fp_run summary_run <<< "$line"
             jobs="${jobs:-unknown}"
             max_step_run="${max_step_run:-0}"
@@ -5661,7 +5669,7 @@ wait_for_first_checks() {
             # never expanded it, so it must not hold this wait. An UNREADABLE
             # count is not zero — it stays pending, fail-closed.
             [ "$jobs" = "0" ] && continue
-            [ "$jobs" = "unknown" ] && signal_ok=0
+            [ "$jobs" = "unknown" ] && { signal_ok=0; FIRST_CHECKS_SIGNAL_REASON="unreadable"; }
             pending=$((pending + 1))
             [ "$max_step_run" -gt "$max_step" ] && max_step="$max_step_run"
             [ -n "$fp" ] && fp="$fp || "
@@ -5673,6 +5681,7 @@ wait_for_first_checks() {
       elif [ "${#pending_ids[@]}" -gt "$FIRST_CHECKS_JOBS_MAX" ]; then
         pending="${#pending_ids[@]}"
         signal_ok=0
+        FIRST_CHECKS_SIGNAL_REASON="cap"
         summary="${#pending_ids[@]} run(s) still pending — more than the ${FIRST_CHECKS_JOBS_MAX} this wait observes"
       fi
     fi
@@ -6038,7 +6047,19 @@ block_on_first_checks() {
       # quoted — and a measured 0s is not one.
       if [ "${FIRST_CHECKS_STATE:-}" != "still-running" ]; then
         say_err "   what was missing: the lane's checks were still queued/in progress when the window"
-        if [ "${FIRST_CHECKS_MISSING:-0}" -gt 0 ]; then
+        # ⛔ `unobservable` HAS TWO PRODUCERS, SO THE STATE IS NOT THE CAUSE (review
+        # round 5, P2). `signal_ok` is cleared by a FAILED Jobs read AND by the
+        # >FIRST_CHECKS_JOBS_MAX cap, where the read is deliberately NOT ATTEMPTED —
+        # the surface is perfectly readable there and the cap's own explanation used to
+        # sit in `$summary`, which this path never printed. The ground is recorded where
+        # `signal_ok` is cleared, not re-guessed here.
+        if [ "${FIRST_CHECKS_SIGNAL_REASON:-}" = "cap" ]; then
+          say_err "   closed, and MORE THAN ${FIRST_CHECKS_JOBS_MAX} run(s) were pending at once, so their per-job/"
+          say_err "   per-step PROGRESS was deliberately NOT read: at that width a partially observed surface"
+          say_err "   can report a false 'no change', which would be a false stall. The Jobs surface itself"
+          say_err "   was READABLE — this wait declined to poll it — so no duration is quoted for it and"
+          say_err "   slow and wedged could not be told apart."
+        elif [ "${FIRST_CHECKS_MISSING:-0}" -gt 0 ]; then
           say_err "   closed, and their per-job/per-step PROGRESS could not be read (the Jobs API did not"
           say_err "   answer for ${FIRST_CHECKS_MISSING}s in total, ${FIRST_CHECKS_MISSING_STREAK}s consecutively), so slow and wedged could not be told apart."
         else
@@ -6051,13 +6072,21 @@ block_on_first_checks() {
         say_err "   Next: re-run the rail once those checks complete (its progress signal is re-read then),"
         say_err "   or raise ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)."
       else
-        # THE SURFACE WAS READ. Only the MEASUREMENT claim is branched — never the
-        # "not a stall" clarification, which is apt in both cases and is pinned by
-        # §39 (i)/(ii) and (P2-4). What was wrong before was the Jobs-API sentence below:
-        # with `missing=0` it printed "did not answer for 0s in total, 0s consecutively".
-        say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
-        say_err "   status=completed when this observation was taken. NOTHING was unreadable, so no"
-        say_err "   slow-vs-wedged claim is made here."
+        # THE SURFACE WAS READ **NOW**. ⛔ AND "NOTHING was unreadable" IS A CLAIM ABOUT
+        # THE WHOLE WAIT, not about this observation (review round 5, P2): a wait that
+        # recovered from an `unobservable` poll keeps its accumulated `missing` (only
+        # `missing_streak` is reset), so asserting the absence of any unreadable second
+        # would be false about a wait that spent N of them blind.
+        if [ "${FIRST_CHECKS_MISSING:-0}" -gt 0 ]; then
+          say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
+          say_err "   status=completed when this observation was taken. This surface is READABLE now, but"
+          say_err "   ${FIRST_CHECKS_MISSING}s of this wait went by with it UNREADABLE, so no stronger"
+          say_err "   slow-vs-wedged claim is made than that."
+        else
+          say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
+          say_err "   status=completed when this observation was taken. NOTHING was unreadable, so no"
+          say_err "   slow-vs-wedged claim is made here."
+        fi
         say_err "   A running job is not a failure, and this is NOT a stall claim."
         say_err "   An unfinished (or absent) lane yields an EMPTY failing set, which proves nothing,"
         say_err "   so nothing was compared, no evidence was posted and nothing was merged."
