@@ -119,14 +119,16 @@ esac
 #   ⛔ THIS SUM IS THE DEFAULT-GATE-WAIT SUM, AND THE ROW ABOVE IS WHY IT IS STATED AS A FORMULA.
 #   `_gw` is `GATE_POLL_TRIES x GATE_POLL_SECS` clamped to [900, 86400] (merge-one.sh), so the sum is
 #   `45390 + _gw` and the merge-one term at a NON-default gate wait is `1800 + _gw + 300`.
-#   ⛔ THE ARITHMETIC IS RE-DONE HERE BECAUSE THE PREVIOUS SENTENCE GOT IT WRONG: it said "on a box
-#   running `GATE_POLL_SECS=60` the merge term is 3900 s and this sum is 18390 s", substituting the
-#   gate wait for the WHOLE merge term and losing the 1800 + 300 either side of it. At `_gw` = 3900 the
-#   merge term is 6000 s and the sum is 49290 s — OVER the 48000 s default below by 1290 s, exactly as
-#   it was OVER the old 18000 s default by 2490 s. ⚠️ THAT RESIDUAL IS PRE-EXISTING AND IS NOT CLOSED
-#   HERE: the shipped default gate wait (`_gw` = 900) gives 46290 s, which 48000 s covers with 810 s to
-#   spare, and an operator who RAISES the gate wait must raise this default with it (`CLAIM_ISSUE_TTL`
-#   is the override). At the defaults the margin is 810 s.
+#   ⛔ THE RESIDUAL IS STATED BY THRESHOLD, NOT BY AN EXAMPLE — an example is where this went wrong.
+#   `_gw` = 900 (`GATE_POLL_SECS=30`, the default) gives 46290 s, which 48000 s covers with **1710 s**
+#   to spare; `_gw` = 1800 (`GATE_POLL_SECS=60`) gives 47190 s, covered with **810 s**. ⛔ DO NOT READ
+#   3900 AS `_gw`: 3900 is the WHOLE merge TERM at `GATE_POLL_SECS=60` (`1800 + 1800 + 300`) — the
+#   other side of the formula above — and substituting it for `_gw` yields 49290 s and a residual no
+#   shipped configuration reaches. The 48000 s default stops covering the sum at
+#   `_gw` > 48000 - 45390 = 2610 s (`GATE_POLL_SECS` > 87 at 30 tries); an operator who raises the gate
+#   wait THAT far must raise this default with it (`CLAIM_ISSUE_TTL` is the override). The pre-#4034
+#   pair was 17490 s against a 18000 s default, which `GATE_POLL_SECS=60` pushed to 18390 s — 390 s
+#   OVER; at 48000 s that same box is 810 s UNDER, so the 5x closed that residual rather than moving it.
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the

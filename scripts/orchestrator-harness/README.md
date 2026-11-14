@@ -2271,21 +2271,23 @@ agent-infra#4034 took `LANE_TIMEOUT` to 36000 s the chunk count moved with it �
 120 = 247` — and an arithmetic row still reading `7 × 120` was the 7200 s clock's residue: the same
 stale-measurement defect this paragraph is otherwise about, one layer down. `lane-merge.sh:286-300`
 carries the same recomputation at the source.
-⛔ **The trade is stated, because the arithmetic does not make it small — and the FIRST version of this
-paragraph got it backwards** (review cycle 7, P2 — recomputed from both trees instead of carried): it
-compared 1500 s + 7 chunks against 5400 s + 7 chunks and concluded the implementation reserve fell
-"4860 s → 960 s". Main does not ship 7 chunks; it derives **40** (`(7200−1500−900)/120`, the same
-invariant one paragraph up), so the honest row is:
+⛔ **The trade is stated, because the arithmetic does not make it small — and BOTH the first version of
+this paragraph and its first "correction" got it wrong** (review cycle 7, P2; then the #4065 rebase
+review, which recomputed the base column against `origin/main` instead of against a remembered 1500 s
+wait): `WAIT_S` is **5400 on BOTH sides** — `origin/main` ships `LANE_MERGE_WAIT:-5400` too
+(`lane-merge.sh:266`) — so the only thing the 5× clock changes is the chunk count,
+`(clock − 5400 − 900) / 120`: **7** at 7200 s, **247** at 36000 s. The honest row is:
 
 | | `origin/main` (7200 s clock) | this tree (36000 s clock) |
 |---|---|---|
-| `WAIT_S` | 1500 | 5400 |
-| derived `MAX_WATCH` × `POLL` | 40 × 120 = 4800 | 247 × 120 = 29640 |
-| merge phase's share of the clock | 6300 | 35040 |
-| left for implement → commit → push → open PR | 900 | 960 |
+| `WAIT_S` | 5400 | 5400 |
+| derived `MAX_WATCH` × `POLL` | 7 × 120 = 840 | 247 × 120 = 29640 |
+| merge phase's share of the clock | 7140 | 35940 |
+| left for implement → commit → push → open PR | 60 | 60 |
 
-The implementation reserve goes **up** by 60 s, so this constant does not starve implementation, and
-what the 5× clock buys is **supervision chunks, 40 → 247**: the merge phase can out-watch its own check
+The implementation reserve is **unchanged** — 900 s declared, 60 s of slack over it on BOTH clocks — so
+this constant neither starves implementation nor gains from the 5×, and what the 5× clock buys is
+**supervision chunks, 7 → 247**: the merge phase can out-watch its own check
 wait instead of being sized out of it. That is the deliberate trade — a wait that reaches the merge phase,
 with enough clock left to supervise it — and at the pre-#4034 7200 s clock the same change bought only
 **7** chunks (840 s of `--watch` over a 5400 s wait), which is why raising `LANE_BACKSTOP_S` was the
