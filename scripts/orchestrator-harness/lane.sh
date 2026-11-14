@@ -923,8 +923,8 @@ if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/
 fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
 # AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71), AGENT_HARNESS_SKEW_REFUSED (83),
-# AGENT_MEM_REFUSED (81)
-# or AGENT_DISK_REFUSED (77);
+# AGENT_MEM_REFUSED (81), AGENT_DISK_REFUSED (77)
+# or AGENT_STALE_CODE_REFUSED (85);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
 # ── THE OUTCOME, RECORDED ONCE, IN THE SAME BREATH AS THE STATUS IT IS DERIVED FROM (#3331) ──────
@@ -975,8 +975,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `mem`, `disk`,
-  # `capability`, `skew` and `land` are the seven values the gate can refuse on, and each is chosen by the
+  # CAPACITY TRANSFER block above for the format and its two readers. There are NINE values the gate can
+  # refuse on — `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`, `stale`, and the `load` FOLD
+  # that absorbs anything unrecognised (see `cap_refusal_gate`; this line said "seven" and listed seven
+  # while the writer emitted nine — review P3, agent-infra#3932) — and each is chosen by the
   # code its own caller already distinguishes, so the record can never disagree with the exit status.
   # `mem` (#2387) is transferable like `load` — a peer box with free RAM can run the work this box's
   # memory floor refused — which is why it takes the capacity-transfer branch below and not the `land`
