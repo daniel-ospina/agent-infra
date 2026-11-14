@@ -350,16 +350,24 @@ ck "(a7) …and the UNRECOGNISED value names NO mechanism (no assumed push, no a
 # widened on shapes it never parsed. Widening is the LOOSENING direction, so the shape
 # gate is what makes the recorded guarantee true — pinned here on the two shapes a
 # producer-side change would actually produce.
-echo "(a8) STRUCTURAL + a PRESENT but UNPARSEABLE clause + UNREADABLE — must KEEP the filter"
+echo "(a8) STRUCTURAL + a PRESENT but UNCLASSIFIABLE clause + UNREADABLE — must KEEP the filter"
 for bad_clause in \
   'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: push workflow_dispatch)' \
-  'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: push-to-fork)'
+  'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: push-to-fork)' \
+  'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: PUSH)' \
+  'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: )' \
+  'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: schedule,)'
 do
   drive inapplicable "$bad_clause" unreadable
   ck "(a8) NO widening on an unclassifiable list [${bad_clause##*(declared triggers: }]" \
      "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
-  ck "(a8) …and the message says the list could not be READ, not a trigger it never parsed" \
-     "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 0 || echo 1)"
+  # ⛔ THREE GROUNDS, THREE STATEMENTS (round 4, P2). This list WAS read — the rail rejected
+  # its SHAPE — so "could not be READ" would be a false claim about the code's own
+  # behaviour, the mirror of the round-2 P2. The ground must be named as unclassifiable.
+  ck "(a8) …and the message says the LIST SHAPE could not be CLASSIFIED — not that it could not be read" \
+     "$(grep -q 'not a shape this rail can CLASSIFY' <<<"$R_ERR" && echo 0 || echo 1)"
+  ck "(a8) ⛔ and it does NOT claim the list 'could not be READ' — the code read it" \
+     "$(grep -q 'could not be READ' <<<"$R_ERR" && echo 1 || echo 0)"
 done
 ck "(a8) CONTROL: a WELL-FORMED inert list ('workflow_call') still WIDENS — the shape gate tightens the unreadable shape only, not the #2465 narrowing" \
    "$(drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_call)' unreadable >/dev/null 2>&1; [ "$R_ANY" = 1 ] && echo 0 || echo 1)"

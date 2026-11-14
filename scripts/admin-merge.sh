@@ -6756,10 +6756,22 @@ lane_no_pr_trigger() {
 # whatever it contained, so a shape this helper cannot classify was read as "no
 # attachable trigger" and WIDENED — the fail-open direction, from a list it never
 # actually parsed (`(declared triggers: push workflow_dispatch)` collapsed to one token
-# `pushworkflowdispatch`; `push-to-fork` matched nothing). The shape gate below is what
-# makes the sentence true: the producer emits a `", "`-joined list of `on:` keys
-# (scripts/ci-workflow-pr-evaluable.sh:831), so every member MUST be `[a-z0-9_]+`. Any
-# other shape is treated exactly like an ABSENT one — `unread`, fail closed.
+# `pushworkflowdispatch`; `push-to-fork` matched nothing). The shape check below is what
+# makes the sentence true.
+#
+# ⛔ THE SHAPE CHECK IS DELIBERATELY STRICTER THAN THE PRODUCER, AND THAT IS THE POINT
+# (round 4, P2 — the first version of this comment claimed a producer guarantee that does
+# NOT exist). `scripts/ci-workflow-pr-evaluable.sh:111` accepts a key matching
+# `^[A-Za-z0-9_\-\.]+$` (enforced at `:772`), so `-`, `.` and UPPERCASE are PRODUCIBLE —
+# `push-to-fork` is not a hypothetical. This helper withdraws to `[a-z0-9_]` anyway,
+# because GitHub's event names are lowercase: a member outside that set is a name this
+# rail cannot CLASSIFY, and the fail-closed answer for "cannot classify" is to keep the
+# filter, never to widen. So the tightening is the safe direction even where the
+# producer is looser, and it costs nothing on a workflow GitHub would actually run.
+#
+# ⛔ AND AN EMPTY MEMBER IS NOT A MEMBER (`(declared triggers: ,)`, `(schedule,)`, `(,,)`).
+# Those shapes parsed as `measured`, matched no attachable trigger and WIDENED — an empty
+# list treated as evidence. They are `unclassifiable` too.
 #
 # ⛔ AND IT MUST NOT LOOK LIKE A MEASUREMENT (round 2, P2). The two grounds for "can
 # attach" are NOT the same claim — one PARSED `push`/`workflow_dispatch` out of the
@@ -6783,13 +6795,23 @@ lane_own_run_can_attach() {
       ;;
     *) return 0 ;;
   esac
-  # ⛔ THE SHAPE GATE (round 3, P2). Normalise ONLY the documented delimiter, then
-  # refuse to classify anything that is not a plain `on:` key. `return 0` here is the
-  # fail-CLOSED answer (keep the filter) and leaves LANE_RUN_ATTACH_SOURCE at `unread`,
-  # so §0b's message says the list was unread instead of naming a trigger it invented.
+  # ⛔ THE SHAPE CHECK (round 3/4, P2). Normalise ONLY the documented delimiter, then
+  # refuse to classify anything that is not a plain `on:` key or that carries an EMPTY
+  # member. `return 0` here is the fail-CLOSED answer (keep the filter), and the source is
+  # recorded as `unclassifiable` — NOT `unread`, because this list WAS read: saying it
+  # "could not be READ" would be a false statement about the code's own behaviour, which
+  # is the same class of defect this helper exists to remove (§0b's message picks its
+  # wording per ground).
   norm="$(printf '%s' "$triggers" | sed -e 's/,[[:space:]]*/,/g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   case "$norm" in
-    ''|*[!a-z0-9_,]*) return 0 ;;
+    ''|*[!a-z0-9_,]*)
+      LANE_RUN_ATTACH_SOURCE="unclassifiable"
+      return 0 ;;
+  esac
+  case ",$norm," in
+    *",,"*)
+      LANE_RUN_ATTACH_SOURCE="unclassifiable"
+      return 0 ;;
   esac
   LANE_RUN_ATTACH_SOURCE="measured"
   list=",$norm,"
@@ -10363,7 +10385,17 @@ main() {
               # scripts/ci-workflow-pr-evaluable.sh:106,829-836), and a `pull_request_review`-
               # only lane belongs to it while a PR event (a submitted review) genuinely
               # STARTS it. The narrower, MEASURED claim is the one that belongs here.
-              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it, and its declared trigger list could not be READ from the applicability reason — so the filter is kept because an unreadable answer is not an exemption, not because a run was measured absent"
+              # ⛔ AND THREE GROUNDS, THREE STATEMENTS (round 4, P2). The round-3 version said
+              # "could not be READ" for BOTH an absent clause and a present-but-UNCLASSIFIABLE
+              # one — but on the second the code READ the list and rejected its SHAPE, so
+              # "could not be read" is a false claim about its own behaviour (the mirror of the
+              # round-2 P2 this block fixes). Decision and verdict are identical on every
+              # ground; only the ground named changes.
+              if [ "$LANE_RUN_ATTACH_SOURCE" = unclassifiable ]; then
+                lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it, and its declared trigger list is not a shape this rail can CLASSIFY (it expects a comma-joined list of `on:` keys) — so the filter is kept because an unreadable answer is not an exemption, not because a run was measured absent"
+              else
+                lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it, and its declared trigger list could not be READ from the applicability reason — so the filter is kept because an unreadable answer is not an exemption, not because a run was measured absent"
+              fi
               # ⛔ AND THE TAIL MUST NOT RE-ASSERT WHAT THE CLAUSE JUST CALLED UNREAD (round 3,
               # P2). "This class CAN still start a run while the wait runs" is the fact this arm
               # has just said it could not establish, and it repeats the "not an exemption"
