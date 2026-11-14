@@ -214,6 +214,30 @@ The three states a caller must read apart live in the *fields*, not the verdict:
 `capacity-placement(bound=…)`, `gate:merge-priority(<n> un-owned of <m> open PR(s))`,
 `fork_headroom`); `dispatched=0 nothing=placed_elsewhere:<n>` = the work went to a **peer box** (not a
 refusal and not idle — the placement seam did its job).
+
+⛔ **WHICH RUNG IDLED, AND WHY THAT RUNG WAS EMPTY (#3009 requirement 1).** `nothing=` carries
+`GATE_WHY` — the **first** capacity arm that fired — so on its own it cannot separate "a higher level of
+the five-level cascade holds the room" from "capacity refused before any rung was resolved". Five
+additive fields carry the cascade's own resolution; every value is computed in the cascade block and
+only *recorded* here (no new measurement):
+
+- `level=` — the rung the pass idled on (`FIX_MAIN` | `MERGE` | `FIX_PR` | `REVIEW_PR` | `ISSUES`), or
+  `UNMEASURED` (the cascade ran and classified nothing) — distinct from `NOT-MEASURED`, which means the
+  emit ran on a path the cascade block never reached;
+- `slots=` — the slot count **that rung resolved**, captured where the cascade decides it;
+- `slots_why=` — why a zero is a zero, in the order the allocator decides: `granted` (a non-zero
+  grant), `capacity` (the probe refused, so no rung resolved at all), `level` (a higher level holds the
+  room), `no_room`, `empty_backlog`, `listing_unreadable`;
+- `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room, and a measured
+  `0` on every pass the valve did not fire;
+- `can_spawn=` — the capacity probe's own answer.
+
+⛔ **`slots=` and `escape=` are DIFFERENT measurements and must never be read as one**: `slots=` is the
+rung's grant, `escape=` is what the valve spent. ⛔ Every one of them is emitted as `${VAR-absent}` —
+never `${VAR:-absent}` — so a measured **`0` stays `0`** and cannot collapse into `absent`, which is
+reserved for "this emit ran on a path the cascade block never reached". A zero published as `absent` is
+the defect this whole paragraph exists to prevent.
+
 ⛔ **`nothing=none` is the ALIVE marker, never the IDLE one** — the writer states the rule in its own
 comment: *"`nothing=none` is printed only when something WAS dispatched, so an idle cycle can never read
 as a working one."* An earlier draft of this document had that backwards (it read IDLE from
