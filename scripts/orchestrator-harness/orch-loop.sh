@@ -435,6 +435,21 @@ LANDING_FLOOR="${LANDING_FLOOR:-25}"
 # too, and has since that age latch landed, agent-infra#2019); past that, an old pass's numbers beside
 # a newer `queue=` are a contradiction, not a measurement.
 FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
+# How old a `state/queue-state` record may be before it stops being a MEASUREMENT of the pool. It
+# answers one question — "did this box read the pool recently enough that `empty_backlog` may be
+# published" — and it exists because `queue_state_token`'s own contract (:1931) says the age is part of
+# the reading so a value frozen by a dead refresh cannot pass as current, while a consumer that reads
+# only the STATE PREFIX throws exactly that component away. The ratio to state is the REFRESH's, not a
+# guess (review P2, 7th cycle — an earlier revision said "four refresh intervals" and was off by 3.75x):
+# at the default `CYC=240` (4 min) one hour is **fifteen** refresh intervals, and on a long queue the
+# refresh is latched on age instead (`LATCH_MAX_AGE_MIN`, 30 min) so one hour is two. Fifteen is the
+# number that matters here, because `empty_backlog` requires a ZERO candidate backlog and `BL < 6` runs
+# the refresh on every cycle — so the bound tolerates fifteen consecutive missed refreshes before it
+# stops calling the reading a measurement. That is deliberately generous: the cost of being generous is
+# one stale `EMPTY` surviving an hour, and the cost of being tight is a healthy box reading `blind`.
+# Past it the cause is `backlog_unreadable`, because an unverifiable reading is not a
+# measurement (the same polarity `dispatch_funnel` takes for its own record).
+QUEUE_STATE_MAX_AGE_MIN="${QUEUE_STATE_MAX_AGE_MIN:-60}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
 # so a swap-only gate does not see it. See the gate chain below.
@@ -840,6 +855,7 @@ is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 # count), rather than on a bare `[ … -ge 1 ]` test a mutation could delete unseen.
 is_limit "${MERGE_PRIORITY_MAX_AGE_MIN:-}" || MERGE_PRIORITY_MAX_AGE_MIN=180; [ "${MERGE_PRIORITY_MAX_AGE_MIN:-0}" -ge 1 ] || MERGE_PRIORITY_MAX_AGE_MIN=180
 is_limit "${FUNNEL_MAX_AGE_MIN:-}" || FUNNEL_MAX_AGE_MIN=30; [ "${FUNNEL_MAX_AGE_MIN:-0}" -ge 1 ] || FUNNEL_MAX_AGE_MIN=30
+is_limit "${QUEUE_STATE_MAX_AGE_MIN:-}" || QUEUE_STATE_MAX_AGE_MIN=60; [ "${QUEUE_STATE_MAX_AGE_MIN:-0}" -ge 1 ] || QUEUE_STATE_MAX_AGE_MIN=60
 # The landing floor follows the same bounded-shape rule. An unreadable value falls back to the
 # owner's existing 25 (never to 0, which would disarm the gate silently, and never to empty, which
 # would make the `-ge` test error and read FALSE — an errored test OPENS a gate).
@@ -3257,6 +3273,92 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
   if   [ "$age" -lt 90 ];   then printf '%s(%ss)' "$tok" "$age"
   elif [ "$age" -lt 5400 ]; then printf '%s(%sm)' "$tok" "$(( age / 60 ))"
   else                            printf '%s(%sh)' "$tok" "$(( age / 3600 ))"; fi
+}
+
+# queue_state_class -> empty | drained | partial | blind — the last pool READ, graded for CURRENCY.
+#
+# ⛔ WHY A SIBLING RATHER THAN A PREFIX MATCH (agent-infra#3909 review, 5th cycle P2).
+# `queue_state_token` returns `EMPTY(<age>)` ON PURPOSE, and this file states the reason exactly once:
+# "The age of the reading is part of the token, so a value frozen by a dead refresh cannot pass as a
+# fresh one (this is a STATE RECORD, and a state record with no age is a stale flag waiting to be read
+# as current)". A consumer that matches `EMPTY*` therefore discards the very component that makes the
+# reading honest — and staleness is a DESIGNED state here, not an accident: `refresh-candidates.sh`
+# deliberately does NOT re-write the record when a pass aborts on its REST budget, leaving the previous
+# reading to stand BECAUSE its age travels with it. So on a box whose refresh died hours ago the last
+# read was `EMPTY`, `candidates.txt` stays empty, and every cycle would publish "the pool is empty"
+# from a reading nobody re-took — the same "a cause that is not this pass's measurement" defect that
+# field exists to end, one layer out.
+#
+# ⛔ AGE POLARITY IS THE RECORD READER'S POLARITY, NOT AN INNOVATION: an absent/unparseable `at` is
+# STALE (unverifiable is not fresh), and a FUTURE `at` is STALE too (a clock step-back must not buy a
+# reading a longer life) — the two rules `dispatch_funnel` records for its own record, applied to this
+# one. Both the `empty` and the two attributed classes require a CURRENT reading: `READ(n)`/
+# `PARTIAL(x)` describe a pool that was READ, and `UNREADABLE` is not a reading at all — a STALE
+# `READ(n)` is just as much not-this-pass's-measurement as a stale `EMPTY`.
+#
+# ⛔ AND THE ZERO-BACKLOG CAUSE NEEDS ONE MORE STEP THAN "IS IT EMPTY" (agent-infra#3909 review, 5th
+# cycle P2). `READ(n)` is a SUCCESSFUL read and `PARTIAL(x)` a NAMED partial read: both are MEASUREMENTS,
+# so a zero backlog beside one is a DRAINED queue — never the "absence of attribution" the single
+# `backlog_unreadable` token claimed. That pair is ROUTINE, not exotic: the refresh records its state and
+# only then reaps consumed candidates, so `queue=READ(7)` beside a zero backlog is healthy housekeeping.
+# Publishing "unreadable" there denies a measurement the record holds, which is the same "the record could
+# not distinguish" class one field over — and it is a FOURTH state, not a second.
+# ⛔ BUT IT IS THE POOL READING, NOT PROOF THE QUEUE WAS SPENT (agent-infra#3909 review, 6th cycle P1).
+# `queue_state_write` runs when the LISTING completes (`refresh-candidates.sh:4257`); `candidates.txt` is
+# only rewritten much later (:6242). A pass that listed the pool and then exited BEFORE that rewrite —
+# the budget refusal (`:4077`) or the pre-flight's INCOMPLETE abort (`:6206`), both of which say of
+# themselves "an empty backlog would be a false report" — leaves a FRESH `READ(n)` beside the old,
+# possibly empty, queue file. That is not hypothetical: it is the MEASURED 2026-10-18 state this file
+# already records (`refresh-candidates.sh:778`: `candidates.txt: 0`, `checked.txt: 310`, pool READ(203)),
+# and the age bound cannot see it because the aborting pass re-writes the record every cycle. So these
+# two tokens name WHAT THE RECORD SAYS — the read succeeded, the queue file holds nothing — and not why.
+# Telling "spent" from "refused before writing" needs the pass's own completed outcome
+# (`state/refresh-last`, written by `refresh_record_write`), which this arm does not consult: a DECLARED
+# LIMIT, stated here rather than assumed away, and the reason the tokens are named for the reading rather
+# than for a cause the fields cannot prove.
+#
+# ⛔ ONE PRIMITIVE, ONE READ. The class is derived from ONE read of the record, and it is the only
+# question this loop actually asks — an earlier revision also shipped a `queue_state_fresh` wrapper for
+# the "may this be called EMPTY" phrasing, but nothing called it and nothing graded it, so it was dead
+# code advertising a second consumer that did not exist.
+# ⛔ AND IT IS NOT THE SAME RULE AS THE DISPLAY TOKEN ON A FUTURE STAMP (agent-infra#3909 review, 6th
+# cycle P2). `queue_state_token` clamps a future `at` to `age=0`, so the heartbeat line prints
+# `queue=EMPTY(0s)` for a clock step-back while this classifier answers `blind` — deliberately, because
+# an unverifiable stamp must not buy a reading a longer life. Two answers to one question would be the
+# drift this header forbids, so say which is which: the TOKEN is display-only (it reports what the
+# record literally says plus its age, and its unit suffix is for a human reading a log line), and the
+# CLASS is the decision input. Anything that GATES must ask the class, never the token.
+queue_state_class() { # -> empty | drained | partial | blind (always prints exactly one)
+  # ⛔ THE BOUND IS DEFAULTED HERE, NOT JUST IN THE CONFIG BLOCK (rig, first run). A helper that
+  # refuses whenever its own limit is unreadable looks identical to "the record is stale" from every
+  # call site — the arm would answer `backlog_unreadable` on a perfectly fresh record and no test could
+  # tell the two apart. So an unset/unparseable bound falls back to the same 60 the config block
+  # coerces to, which is the CONSERVATIVE direction: a bound cannot be widened by losing it.
+  local tok="" at="" now age bound="${QUEUE_STATE_MAX_AGE_MIN:-60}"
+  is_num "$bound" || bound=60
+  [ "$bound" -ge 1 ] || bound=60
+  { read -r tok at < "$O/state/queue-state"; } 2>/dev/null || true
+  # ⛔ ABSENT / UNPARSEABLE / FUTURE `at` IS STALE — unverifiable is never fresh, and a clock step-back
+  # must not buy a reading a longer life (`dispatch_funnel` records the same two rules for its record).
+  is_num "${at:-}" || { printf 'blind'; return 0; }
+  now="$(date +%s)" || { printf 'blind'; return 0; }
+  is_num "${now:-}" || { printf 'blind'; return 0; }
+  # ⛔ COMPARED AS DIGITS IN `[ ]`, NOT IN `$(( ))` (review P2, 6th cycle). A stamp at or above 2^63
+  # wraps NEGATIVE inside arithmetic, so it PASSES a "not in the future" test; the age then wraps
+  # negative too and clears the bound — one corrupt record would publish `empty_backlog` forever.
+  # Measured: `at=9223372036854775808` read FRESH under the arithmetic form. `[` ERRORS on an
+  # out-of-range operand and an errored test is FALSE, so `||` takes the blind arm: fail-closed. (No
+  # octal concern: `is_num` above already rejects a leading-zero spelling.)
+  [ "$at" -le "$now" ] 2>/dev/null || { printf 'blind'; return 0; }
+  age=$(( (now - at) / 60 ))
+  [ "$age" -le "$bound" ] 2>/dev/null || { printf 'blind'; return 0; }
+  case "${tok:-}" in
+    EMPTY)        printf 'empty' ;;
+    READ\(*\))    printf 'drained' ;;
+    PARTIAL\(*\)) printf 'partial' ;;
+    *)            printf 'blind' ;;
+  esac
+  return 0
 }
 # ── THE DISPATCH FUNNEL (agent-infra#2040) ──────────────────────────────────────────────────────
 # `[dispatch] backlog empty queue=READ(223)` is a CONTRADICTION: 223 candidates were READ and zero
@@ -8364,6 +8466,79 @@ PY
   elif [ -n "${MP_PRIORITY:-}" ]; then CASCADE_PRW=1; CASCADE_PRW_WHY="priority"
   fi
   if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] && [ "${CASCADE_PRW:-0}" = "1" ]; then CASCADE_PR_WAITING=1; fi
+  # ── THE RUNG'S OWN GRANT, FROZEN HERE (agent-infra#3909 review P1) ────────────────────────────
+  # ⛔ `CASCADE_ISSUE_SLOTS` IS NOT THE RUNG'S ANSWER BY THE TIME THE CYCLE RECORD IS WRITTEN. The
+  # drain escape (see the [drain-escape] block ~600 lines below) RE-ASSIGNS it after this block when a
+  # level held the room: `_egrant` is granted and `CASCADE_ISSUE_SLOTS="$_egrant"`. Its guard requires
+  # `CASCADE_ISSUE_SLOTS <= 0`, so the ONLY state the escape can fire in is exactly a level-HOLDS pass
+  # — meaning a record that reads `CASCADE_ISSUE_SLOTS` at emit time prints
+  # `level=MERGE slots=2`, a pair whose own documentation says cannot exist ("a level holds ⇒ slots=0"),
+  # on EVERY cycle the valve exists for. A reader then cannot tell "the ISSUES rung was granted two"
+  # from "a higher level held the room and the escape overrode it" — the same "the record could not
+  # distinguish" class this field addition exists to end. So the rung's answer is captured HERE, where
+  # it is resolved, and the escape reports its own grant under its own token (`CASCADE_ESCAPE_SLOTS`).
+  CASCADE_RUNG_SLOTS="${CASCADE_ISSUE_SLOTS:-0}"
+  # ⛔ AND A ZERO NEEDS ITS CAUSE, OR THE FIELD IS A RORSCHACH TEST (review P2). `slots=0` with the
+  # capacity probe GRANTING is reached by FOUR different states, and before this token the record named
+  # NONE of them: `level=NOT-MEASURED slots=0 can_spawn=1` was documented as "capacity refused", but
+  # with `can_spawn=1` that is equally a full box (`cascade_issue_slots`: `room > 0 || 0`), a zero
+  # candidate backlog (the grant is ceilinged by it) or an UNREADABLE PR listing (`CASCADE_UPN_UNREADABLE`).
+  # A cycle idling with an empty pool therefore read as a capacity refusal — a wrong cause on the very
+  # artifact a lane is briefed from. The arms are ordered CAUSE-FIRST (the earliest gate that decided
+  # the outcome wins), and `granted` is stated rather than left to inference from a non-zero `slots=`.
+  # ⛔ `level` can only be the cause when the rung HAD slots and a higher level took them (`slots > 0`
+  # reaches `cascade_level`; the zeroing arm sets `CASCADE_LEVEL_HOLDS`), never when the cascade never
+  # ran — so it is tested after the arm that can stop it from running at all (`capacity`).
+  # ⛔ AND AN ARM THAT ONLY RE-STATES A ZERO THE ALLOCATOR ALREADY PRODUCED GOES LAST (agent-infra#3909
+  # review, 3rd cycle P2). `cascade_issue_slots` runs BEFORE this block's listing arm, and its zero does
+  # NOT depend on the PR listing: it withholds on `room <= 0` and is ceilinged by the candidate backlog.
+  # So on a FULL box or a ZERO backlog the listing arm re-states a zero that was already decided — it
+  # decided nothing. Testing it first published `listing_unreadable` for a box whose measured cause was
+  # `no_room`, i.e. the same "a wrong cause on the artifact a lane is briefed from" defect this token
+  # exists to end, one arm over. It still wins on the one state it does decide — room AND backlog both
+  # free, so every arm above it is false and the listing is the only zero left.
+  # ⛔ AND A ZERO BACKLOG IS TWO DIFFERENT FACTS, ONLY ONE OF WHICH MAY BE CALLED `empty_backlog`
+  # (agent-infra#3909 review, 4th cycle P1; the ruling is #1931). `CASCADE_QUEUE_DEPTH` is
+  # `wc -l < candidates.txt` coerced to 0 when that file cannot be read, so a zero ALSO arrives from a
+  # refresh whose POOL LISTING FAILED — and an empty file is byte-identical to a fleet with nothing to
+  # do. This loop already settled that conflation in its own vocabulary (`queue_state_token`, :1931):
+  # EMPTY is "read and genuinely empty — the only answer that may mean 'no work'", UNREADABLE is "the
+  # fleet is BLIND", UNKNOWN is "no pass ever recorded a read — never EMPTY". Publishing
+  # `empty_backlog` for a pool nobody read would be that same defect reborn one field over, and it
+  # MIS-AIMS THE REMEDY: `empty_backlog` is the diagnosis whose fix is #3009 requirement 2 (widen the
+  # pool to P3/unlabelled), so a lane briefed from it would go and widen a pool that is perfectly fine.
+  # So the `empty_backlog` arm is gated on the refresh's own MEASURED EMPTY. Exactly ONE other
+  # zero-backlog state is an absence of attribution — `backlog_unreadable` — and it ranks BELOW the
+  # listing's own measured unreadability (both can hold at once: the 2026-10-17 incident had both
+  # listings refused for 131 consecutive passes). Order: measured-empty → measured-blind → blind.
+  # ⛔ AND "MEASURED" MEANS "MEASURED RECENTLY" (agent-infra#3909 review, 5th cycle P2), which is why the
+  # gate is `queue_state_class` and NOT an `EMPTY*` prefix match on the token: the token carries the age
+  # precisely so a frozen reading cannot pass as current, so a prefix match discards exactly the
+  # component that makes the reading honest — and staleness is a DESIGNED state here (the refresh leaves
+  # the previous record standing when a pass aborts early, justified by the age that travels with it).
+  # See that function's header for the polarity (absent / unparseable / future `at` = STALE).
+  # ⛔ AND A DRAINED QUEUE IS NOT A BLIND ONE (same review). `READ(n)` is a SUCCESSFUL read and
+  # `PARTIAL(x)` a NAMED one, so the remaining zero-backlog states are three facts, not one absence: a
+  # spent queue that WAS read, a named subset that WAS read, and a genuinely blind pool.
+  CASCADE_POOL_CLASS="$(queue_state_class 2>/dev/null || true)"
+  case "$CASCADE_POOL_CLASS" in empty|drained|partial) ;; *) CASCADE_POOL_CLASS=blind ;; esac
+  CASCADE_POOL_EMPTY=0
+  [ "$CASCADE_POOL_CLASS" = "empty" ] && CASCADE_POOL_EMPTY=1
+  CASCADE_SLOTS_WHY=""
+  if [ "${CASCADE_RUNG_SLOTS:-0}" -gt 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="granted"
+  elif [ "${CASCADE_CAN:-1}" = "0" ]; then CASCADE_SLOTS_WHY="capacity"
+  elif [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ]; then CASCADE_SLOTS_WHY="level"
+  elif [ "${CASCADE_ROOM:-0}" -le 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="no_room"
+  elif [ "${CASCADE_QUEUE_DEPTH:-0}" -le 0 ] 2>/dev/null && [ "${CASCADE_POOL_EMPTY:-0}" = "1" ]; then
+    CASCADE_SLOTS_WHY="empty_backlog"
+  elif [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; then CASCADE_SLOTS_WHY="listing_unreadable"
+  elif [ "${CASCADE_QUEUE_DEPTH:-0}" -le 0 ] 2>/dev/null; then
+    case "$CASCADE_POOL_CLASS" in
+      drained) CASCADE_SLOTS_WHY="backlog_drained" ;;
+      partial) CASCADE_SLOTS_WHY="backlog_partial" ;;
+      *)       CASCADE_SLOTS_WHY="backlog_unreadable" ;;
+    esac
+  else CASCADE_SLOTS_WHY="unknown"; fi
   # [cascade:end]
   echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) list=${CASCADE_LIST:-?} level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_QUEUE_DEPTH:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
   # ── THE GATE VECTOR, AND WHY THE ARMS STOPPED BEING ONE `elif` CHAIN (#2924, #2927) ──────────────
@@ -8891,6 +9066,19 @@ PY
   # state only, bounded and logged here with the counts the decision was taken from.
   # ⛔ ONE ESCAPE PER N INERT PASSES, NOT ONE PER PASS: `pl_escape_record` resets the streak on a
   # successful write, so the loop cannot spin, and it reports when the record could NOT be written.
+  # ⛔ THE ESCAPE'S TOKEN IS RESET HERE, ON EVERY PASS, BEFORE THE ARM THAT MAY SET IT (review P1,
+  # 2nd cycle). `CASCADE_ESCAPE_SLOTS` is assigned by the arm below, which runs ONLY when
+  # `LO_CHOICE=pr` AND `pl_escape_open` answers YES — a minority of passes. The cycle body is ONE
+  # shell for the whole process (`while true; do` above, its `done` below), so a variable assigned
+  # inside that arm PERSISTS into the next iteration: cycle N fires and publishes 2; cycle N+1 skips
+  # the arm and re-published that stale `escape=2` as though the valve had spent two slots again, on
+  # a pass where it did not fire at all. `escape=` is documented as a MEASUREMENT of this pass, and
+  # the whole point of the field is that the record distinguishes exactly these states — so the token
+  # must be zeroed where the block runs unconditionally, and the arm below is its only override.
+  # Resetting HERE (not in the cascade block) also keeps the reset INSIDE the block test-cascade.sh
+  # extracts and drives, so the two-pass arm below grades the shipped assignment rather than a
+  # fixture that supplies what production does not (§6).
+  CASCADE_ESCAPE_SLOTS=0
   _eb=${DRAIN_ESCAPE_PASSES:-3}
   if [ "${PL_MOD:-0}" = "1" ]; then _eb="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}" 2>/dev/null)" || _eb=3; fi
   if [ "${LO_CHOICE:-none}" != "pr" ]; then
@@ -8987,6 +9175,13 @@ PY
       # not see it: its grep matched the prefix BEFORE the backtick.
       [ "${_egrant:-0}" -ge 1 ] && echo "[dispatch] DRAIN ESCAPE GRANTS ${_egrant} issue slot(s) — the issue path was granted none while ${CASCADE_ROOM} lane(s) were free, so the escape spends the room the allocator would have granted (room/2, backlog ${CASCADE_QUEUE_DEPTH:-?}) instead of opening a path with nothing to queue into" >> "$LOG"
     fi
+    # ⛔ THE ESCAPE PUBLISHES ITS OWN GRANT, SEPARATELY FROM THE RUNG'S (agent-infra#3909 review P1).
+    # It RE-ASSIGNS `CASCADE_ISSUE_SLOTS` above, so a record that reads that global at emit time carries
+    # the escape's number under the rung's name — guaranteed, because the escape can only fire on a
+    # level-HOLDS pass. This assignment is the OVERRIDE, not the measurement: the token is zeroed at
+    # the TOP of this block on every pass (see the reset there), so `escape=0` means "the valve did not
+    # fire" and cannot be confused with "the previous cycle's grant, still lying in the variable".
+    CASCADE_ESCAPE_SLOTS="${_egrant:-0}"
     # DOES THIS PASS ACTUALLY HAVE A SLOT TO SPEND? UNSET is the driver-rig/older-caller contract (the
     # escape keeps its pre-change behaviour); an explicit 0, or a grant that produced 0 because the
     # backlog is empty, means the batch WILL break and nothing may be recorded.
@@ -9628,12 +9823,70 @@ PY
     # `stg_mark l5_issue` measures ~0 and drops the preparation from the tiled partition entirely.
     stg_mark record
     stg_field STG_FIELD
+    # ── THE RUNG, IN THE DURABLE RECORD (agent-infra#3009, its requirement 1) ────────────────────
+    # ⛔ THE RECORD COULD NOT NAME THE RUNG IT IDLED ON, AND THAT COST A WHOLE LANE ITS DIAGNOSIS.
+    # `nothing=` carries `GATE_WHY`, which is the FIRST capacity arm that fired — and on a box whose
+    # PR path was refused by the load gate it read `gate:merge-priority_(8_un-owned_of_8_open_PR(s)…)`
+    # for 120 consecutive cycles, because a pre-cascade build set that string and nothing else. A lane
+    # briefed from those records concluded the merge-priority threshold was "the only thing blocking
+    # dispatch" and set out to implement the ladder — which had ALREADY landed (`9047814a6`, #3594)
+    # and could not have been executing. The fields below separate the states that one `nothing=`
+    # could not, and they are what requirement 1 of #3009 actually asks for:
+    #   level=MERGE          slots=0 slots_why=level        can_spawn=1 → a HIGHER LEVEL holds the room (the ladder working)
+    #   level=NOT-MEASURED   slots=0 slots_why=capacity     can_spawn=0 → capacity refused, so the cascade never ran AT ALL
+    #   level=NOT-MEASURED   slots=0 slots_why=no_room|empty_backlog|backlog_drained|backlog_partial|backlog_unreadable|listing_unreadable
+    #                                                                  → nothing above holds the room; the GRANT itself was 0
+    #     ⛔ `empty_backlog` REQUIRES A MEASURED **AND CURRENT** EMPTY POOL (`state/queue-state` = `EMPTY`
+    #     with a readable, recent age — `queue_state_class`, #1931). A zero backlog arrives equally from a
+    #     refresh whose pool listing FAILED, and calling THAT empty would be the #1931 conflation in a new
+    #     field — and would mis-aim its remedy (#3009 req 2, "widen the pool") at a pool nobody read.
+    #     ⛔ AND THE REST OF THE ZERO-BACKLOG STATES ARE THREE FACTS, NOT ONE ABSENCE: `backlog_drained`
+    #     (`READ(n)` — the read SUCCEEDED and the queue is spent; the routine reap-after-read pair),
+    #     `backlog_partial` (`PARTIAL(x)` — a NAMED subset, still a measurement), and only then
+    #     `backlog_unreadable` (`UNREADABLE`/`UNKNOWN`/stale/unageable — genuinely blind), which ranks
+    #     below the listing's measured unreadability because both can hold at once.
+    #   level=ISSUES         slots=2 slots_why=granted      can_spawn=1 → the issue rung was granted two slots
+    #   …plus escape=N on any of them → the drain escape re-granted N after the cascade withheld the room
+    # ⛔ `slots_why=` EXISTS BECAUSE `slots=0` ALONE IS AMBIGUOUS (review P2). With the capacity probe
+    # GRANTING, a zero is equally a full box, a zero candidate backlog (MEASURED empty or never read —
+    # two different facts, two different tokens) or an unreadable PR listing —
+    # and glossing all of those as "capacity refused" put a WRONG CAUSE on the artifact a lane is
+    # briefed from (an empty pool idling read as a throttle). The token is computed where each of those
+    # conditions is decided, in the cascade block above; this emit only carries it.
+    # ⛔ `slots=` IS THE RUNG'S OWN GRANT, CAPTURED IN THE CASCADE BLOCK — NOT `CASCADE_ISSUE_SLOTS`,
+    # WHICH THE DRAIN ESCAPE RE-ASSIGNS ~650 LINES ABOVE THIS EMIT (review P1). The escape's guard
+    # requires `CASCADE_ISSUE_SLOTS <= 0`, so it can ONLY fire on a level-HOLDS pass; reading the global
+    # here therefore printed `level=MERGE slots=N≥1` on exactly those cycles — a pair these comments
+    # call impossible — and a reader could not tell a rung's grant from the escape's override. The two
+    # are now separate fields: `slots=` is what the cascade resolved, `escape=` is what the valve spent.
+    # ⛔ THEY ARE RECORDED, NOT RE-DERIVED — WITH ONE NAMED EXCEPTION (agent-infra#3909 review, 5th cycle
+    # P2). `level=`, `slots=`, `escape=` and `can_spawn=` add no measurement: every value was already
+    # computed by the cascade block ~1,200 lines above this emit (and by the drain-escape block between
+    # them). The `slots_why=` POOL gate is the exception and is stated rather than glossed: telling a
+    # measured empty pool from a blind one costs ONE `state/queue-state` read per pass
+    # (`queue_state_class`, plus that function's own `date +%s`) — two forks on the every-cycle path, in
+    # a file where the fork budget is itself a dispatch gate (#2293). A reader sizing the budget from
+    # this artifact is told where those two forks come from instead of being told there are none. The
+    # rest is why this is a field addition and not a scope change — and it is precisely what the OPEN OWNER DECISION
+    # in docs/ops/self-healing-contract.md §6 does NOT cover: making the levels actionability-bounded is
+    # still the owner's call, and `level=` merely makes the current behaviour visible instead of inferred.
+    # ⛔ `${VAR-absent}`, NEVER `${VAR:-absent}`: `slots=0` is a MEASUREMENT (the room was withheld) and
+    # must not be rewritten as an absence — the same polarity the batch's own `${CASCADE_ISSUE_SLOTS-1}`
+    # guards take. ⛔ AND `absent` IS A FALLBACK, NOT A STATE A READER WILL EVER SEE (agent-infra#3909
+    # review, 5th cycle P2): this emit is reached only AFTER the cascade block assigned all four
+    # variables, so `${VAR-absent}` never fires here — and the records that genuinely skip the block
+    # (the fork-held and disk-held emissions above) pass NONE of these tokens, exactly as they pass no
+    # `level=`. Stating it the other way round named a signal that cannot occur and omitted the one that
+    # does, on the artifact a lane is briefed from.
     cycle_record_write "$O" \
       start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
       selected="$_cr_sel" selected_n="${SEL_TOTAL:-0}" dispatched="${K:-0}" ids="${_cr_ids:--}" \
       nothing="$_cr_nothing" placement="${CAP_STATE:-unavailable}" placed_on="${CAP_PLACE:-none}" \
       bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
       spawned_pr="${PRDISP_SPAWNS:-UNMEASURED}" spawn_tags="$_cr_tags" \
+      level="${CASCADE_LEVEL_NAME:-NOT-MEASURED}" slots="${CASCADE_RUNG_SLOTS-absent}" \
+      slots_why="${CASCADE_SLOTS_WHY-absent}" escape="${CASCADE_ESCAPE_SLOTS-absent}" \
+      can_spawn="${CASCADE_CAN-absent}" \
       stages="${STG_FIELD:-}" \
       drain="$_cr_drain" \
       || echo "[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable or the module is absent) — an absent record is NOT a healthy box: harness status reads it ABSENT/DEGRADED" >> "$LOG"
