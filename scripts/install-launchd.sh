@@ -1714,34 +1714,15 @@ status_job() {
     # ⛔ IT REPORTS A SKIP, NOT A PASS: the installed-copy variant keeps a counted marker, so a box
     # still holding one is disclosed to the verdict sentence rather than certified clean.
     local _tcc_tmp _tcc_vrc _cmux_target=""
-    # ⛔ THE CMUX VERDICT IS ASKED BEFORE — AND INDEPENDENTLY OF — `mktemp` (#3826 review P2).
-    # `plist_cmux_gated_target` reads the RENDERED TEXT and needs no temp file, so leaving it inside
-    # the `mktemp` guard made a box whose TMPDIR is unwritable fall straight through to the content
-    # comparison: a byte-identical BLIND job then read `installed=loaded version=v (in sync)` and the
-    # verb exited 0 — the round-14 P2 re-opened under a different precondition. MEASURED with
-    # `TMPDIR=/tmp/fx/nonexistent`: row `in sync`, rc=0, while the same fixture reds `⛔ CMUX-GATED`
-    # rc=1 with a working TMPDIR. A temp-file failure now cannot hide a gated job.
-    _cmux_target="$(plist_cmux_gated_target <(printf '%s' "$rendered") || true)"
-    # ⛔ A cmux-GATED TEMPLATE IS NEVER `in sync` (#3826 review P2 — a fail-open on the exact
-    # defect this change exists to catch). `verify_targets` returns 1 here, so the arms below
-    # graded its CONTENT: a byte-identical template and plist agreed, the row read
-    # `installed=loaded version=v… (in sync)`, and `--status` exited 0 — certifying a job that
-    # installs, loads, ticks and delivers NOTHING. This is not hypothetical: the blind job in
-    # #1867's own body was installed and `--status`-clean for its whole life. It is now a row of
-    # its own and a non-zero exit, so the two verbs agree about one file.
-    if [ -n "$_cmux_target" ]; then
-        echo "  ⛔ CMUX-GATED   $label: this job installs, loads and ticks, and is BLIND under launchd ($_cmux_target)"
-        echo "        the cmux socket (socketControlMode = cmuxOnly) gates on launch-chain attribution,"
-        echo "        which a launchd job never has, so it delivers NOTHING while its log reads as"
-        echo "        activity (#1867). This template is listed in templates/launchd/LAUNCHD-INCOMPATIBLE"
-        echo "        — remove it from the set; no install step makes it work."
-        echo "        Documented launch path: bash scripts/heartbeat-launch.sh start"
-        return 1
-    fi
     if _tcc_tmp="$(mktemp 2>/dev/null)"; then
         printf '%s' "$rendered" > "$_tcc_tmp"
         _tcc_vrc=0
         verify_targets "$_tcc_tmp" >/dev/null 2>&1 || _tcc_vrc=$?
+        # ⛔ ASKED AGAIN, DELIBERATELY — NOT DERIVED FROM `_tcc_vrc` (#3826 review P2). See
+        # `plist_cmux_gated_target`'s own note: a shared `1` cannot say whether the target was MISSING
+        # (a farm gap, which --status must not turn into a permanent red) or cmux-GATED (the blind job
+        # this whole change exists to refuse). Captured before the temp file is removed.
+        _cmux_target="$(plist_cmux_gated_target "$_tcc_tmp" || true)"
         rm -f "$_tcc_tmp"
         if [ "$_tcc_vrc" -eq 2 ]; then
             if [ -f "$installed" ]; then
@@ -1750,6 +1731,22 @@ status_job() {
                 echo "  $label: NOT APPLICABLE (launchd cannot READ this unit's target — a macOS TCC root, #427; no install step changes this box's layout)"
             fi
             return 0
+        fi
+        # ⛔ A cmux-GATED TEMPLATE IS NEVER `in sync` (#3826 review P2 — a fail-open on the exact
+        # defect this change exists to catch). `verify_targets` returns 1 here, so the arms below
+        # graded its CONTENT: a byte-identical template and plist agreed, the row read
+        # `installed=loaded version=v… (in sync)`, and `--status` exited 0 — certifying a job that
+        # installs, loads, ticks and delivers NOTHING. This is not hypothetical: the blind job in
+        # #1867's own body was installed and `--status`-clean for its whole life. It is now a row of
+        # its own and a non-zero exit, so the two verbs agree about one file.
+        if [ -n "$_cmux_target" ]; then
+            echo "  ⛔ CMUX-GATED   $label: this job installs, loads and ticks, and is BLIND under launchd ($_cmux_target)"
+            echo "        the cmux socket (socketControlMode = cmuxOnly) gates on launch-chain attribution,"
+            echo "        which a launchd job never has, so it delivers NOTHING while its log reads as"
+            echo "        activity (#1867). This template is listed in templates/launchd/LAUNCHD-INCOMPATIBLE"
+            echo "        — remove it from the set; no install step makes it work."
+            echo "        Documented launch path: bash scripts/heartbeat-launch.sh start"
+            return 1
         fi
     fi
     if [ ! -f "$installed" ]; then
@@ -2284,12 +2281,10 @@ if [ "${1:-}" = "--status" ]; then
     # (`NOT INSTALLED (template v0.2.0)` beside `DELEGATED — … installed and graded by another
     # installer`), asserting a false ownership and a false state for an absent job while
     # `fleet-schedule.py --verify` counted the 23 disclosures over 19 jobs it had just graded.
-    # ⛔ NOT `local` — THIS RUNS AT SCRIPT TOP LEVEL (#3826 review P2/P3). `local` outside a
-    # function prints `local: can only be used in a function` to STDERR on every `--status` run,
-    # which is the stream `scripts/fleet-schedule.py --verify` parses (`text = out.stdout +
-    # out.stderr`) — a red-looking line in an otherwise green run, the pattern this file spends
-    # hundreds of lines removing. Harmless to the exit code, which is exactly why only reading the
-    # stderr shows it (the 610-assertion suite and `bash -n` are both green with it present).
+    # ⛔ NOT `local` — THIS RUNS AT SCRIPT TOP LEVEL (#3826 review P3). `local` outside a function
+    # prints `local: can only be used in a function` to STDERR on every `--status` run, which is the
+    # stream `scripts/fleet-schedule.py --verify` parses (`out.stdout + out.stderr`). Harmless to the
+    # exit code, which is why only reading the stderr shows it. Measured: 1 error line before, 0 now.
     _own_dir="$(cd "$TEMPLATES_DIR" 2>/dev/null && pwd -P)" || _own_dir="${TEMPLATES_DIR%/}"
     while IFS= read -r template; do
         [ -n "$template" ] || continue
