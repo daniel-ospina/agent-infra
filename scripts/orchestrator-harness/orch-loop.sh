@@ -439,9 +439,15 @@ FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 # answers one question — "did this box read the pool recently enough that `empty_backlog` may be
 # published" — and it exists because `queue_state_token`'s own contract (:1931) says the age is part of
 # the reading so a value frozen by a dead refresh cannot pass as current, while a consumer that reads
-# only the STATE PREFIX throws exactly that component away. One hour is four refresh intervals (CYC=240s)
-# and well inside the "refresh is dead" territory a controller should not need to diagnose from this
-# field; past it the cause is `backlog_unreadable`, because an unverifiable reading is not a
+# only the STATE PREFIX throws exactly that component away. The ratio to state is the REFRESH's, not a
+# guess (review P2, 7th cycle — an earlier revision said "four refresh intervals" and was off by 3.75x):
+# at the default `CYC=240` (4 min) one hour is **fifteen** refresh intervals, and on a long queue the
+# refresh is latched on age instead (`LATCH_MAX_AGE_MIN`, 30 min) so one hour is two. Fifteen is the
+# number that matters here, because `empty_backlog` requires a ZERO candidate backlog and `BL < 6` runs
+# the refresh on every cycle — so the bound tolerates fifteen consecutive missed refreshes before it
+# stops calling the reading a measurement. That is deliberately generous: the cost of being generous is
+# one stale `EMPTY` surviving an hour, and the cost of being tight is a healthy box reading `blind`.
+# Past it the cause is `backlog_unreadable`, because an unverifiable reading is not a
 # measurement (the same polarity `dispatch_funnel` takes for its own record).
 QUEUE_STATE_MAX_AGE_MIN="${QUEUE_STATE_MAX_AGE_MIN:-60}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
