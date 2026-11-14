@@ -1183,14 +1183,23 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # re-run on every honest agent — and this class was avoidable by WIDTH, not by adding vocabulary.
   local _OC_TOK="(${_OC_SEV}|\\(?[[:alnum:]/._-]+\\)?)"
   # An affirmative TOTAL resolution: declared count, or an explicit totality word, as the subject.
-  local _OC_TAIL="([[:space:]]+${_OC_TOK}){0,6}[[:space:]]+((were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2})?(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)"
+  local _OC_TAIL="([[:space:]]+${_OC_TOK}){0,10}[[:space:]]+((were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2})?(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)"
   local _OC_CNT='([1-9][0-9]*|one|two|three|four|five|six|seven|eight|nine|ten)'
   # ⛔ `BLKDECL` IS A TOTAL SUBJECT TOO (agent-infra#3902 review, F2+F4). The DECLARED count is
   # MASKED out before the second-count arithmetic runs, which is right — but the masked text is then
   # all the TOTAL arm can see, so `_OC_TOTAL` could never match the very declaration it exists to
   # accept, and the digit form recorded only by accident of the mask not firing. Accepting the mask
   # token makes the escape independent of which form (digit or spelled) the declaration used.
-  local _OC_TOTAL="(^|[^0-9])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)${_OC_TAIL}|(^|[^0-9])${_OC_CNT}[[:space:]]+\(?p[01]\)?${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?\(?p[01]\)?${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}|BLKDECL${_OC_TAIL}"
+  # ⛔ THE `BLKDECL` ALTERNATIVE IS GONE, AND THE COMMENT THAT JUSTIFIED IT WAS WRONG (agent-infra#3902
+  # THIRD review, P2). It read "the masked text is then all the TOTAL arm can see, so `_OC_TOTAL`
+  # could never match the very declaration it exists to accept" — but the call site greps `_OC_TOTAL`
+  # against the UNMASKED `$line`, and `BLKDECL` is only ever written into `_rest`. So
+  # `BLKDECL${_OC_TAIL}` could match only a body containing the literal token `blkdecl`: DEAD CODE
+  # reasoned about from a stale comment. That is the same comment-vs-code divergence that produced
+  # this function's own no-op belt (`_rest` read before it was assigned), so the alternative is
+  # DELETED rather than re-worded, and the comment now says what the code does: the TOTAL arm reads
+  # the raw declaration, which is why it can accept the very count it exists to excuse.
+  local _OC_TOTAL="(^|[^0-9])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)${_OC_TAIL}|(^|[^0-9])${_OC_CNT}[[:space:]]+\(?p[01]\)?${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?\(?p[01]\)?${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}"
   # ⛔ A COLLECTIVE REMAINDER — `the rest`, `some`, `most`, `half` (agent-infra#3902 review, F3).
   # The header below CLAIMED these were counted; they were not, because they lived only in
   # `_OC_PERSIST`, which is `;`-SCOPED and so unreachable after the clause boundary. MEASURED at
@@ -1234,7 +1243,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # #3902`, `... (commit 30ce585)` are references, not counts); the arithmetic simply had no mask for
   # it. Masked BEFORE the `<count> <P0|P1>` remainder read, so a reference never becomes a remainder
   # either — and only the NOUN+number pair, so `2 were fixed` keeps its count.
-  local _OC_REFMASK='s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]]+#?[0-9]+/\1 REFCNT /g'
+  local _OC_REFMASK='s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]-]*#?[0-9]+/\1 REFCNT /g'
   local _OC_SEVREMAINDER="(^|[^[:alnum:]])${_OC_COUNT}[[:space:]]+${_OC_BSEV}"
   local _OC_STILL="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending)"
   local _OC_SELLED='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)([^[:alpha:]]|$)'
@@ -1263,7 +1272,18 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # recognised. That gap is PRE-EXISTING (measured escaping at 49d3c9780 too), and it is a
     # fail-open in an evidence gate, so the class is widened to "not alphanumeric": a declaration
     # may be bolded, quoted, bulleted or wrapped and must still be READ.
-    grep -qiE '(^|[^[:alnum:]])outcome:[[:space:]]*[*[:space:]]*' <<<"$line" || continue
+    # ⛔ THE LEAD WAS WIDENED AND THE COLON WAS LEFT BEHIND (agent-infra#3902 THIRD review, P1 —
+    # MEASURED fail-open). The class above admits ANY non-alnum lead, precisely because a declaration
+    # may be bolded, quoted or bulleted — but the COLON stayed glued to the word, so moving the
+    # emphasis one character inward skipped the arm entirely and a `clean` record was MINTED:
+    #   `**Outcome**: 3 findings — 2 blocking (P1), 1 documentation (P2).`   => ADMITTED
+    #   `**Outcome**: CLEAN — 1 P1 (dispatch guard) remains open.`         => ADMITTED
+    #   `**Outcome : 2 blocking findings remain open.**`                   => ADMITTED
+    # The field is FREE-FORM — no skill template pins the colon inside the emphasis — so the anchor
+    # reads `Outcome`, any emphasis/spacing, the colon, then the trailing emphasis. 13n66 pins the
+    # closed form; 1a/1b keep their own anchors untouched (this arm is the one that can MINT a clean
+    # verdict, and it is the one being widened).
+    grep -qiE '(^|[^[:alnum:]])outcome[[:space:]]*[*_[[:space:]]*:[[:space:]]*[*[:space:]]*' <<<"$line" || continue
     # ...and it must NAME blocking findings — by the NOUN (`blocking`, `blockers`) or by the HOUSE
     # SEVERITY that means the same thing. A declaration that does neither is not this arm's business
     # at all, so it is SKIPPED — never vetoed (13n10: `Outcome: CLEAN — verified` with the blocking
@@ -1290,8 +1310,21 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # A LIVE POSITIVE COUNT — the number that qualifies a blocking NOUN or a P0/P1 severity, as
     # opposed to a negated mention. Reading the severity form here too is what lets escape (a) tell
     # `Outcome: CLEAN — 2 P1 were fixed` (live count: no escape (a)) from `… 0 P1 findings` (zeroed).
+    # ⛔ AND THE COUNT IS SPELLED-AWARE (agent-infra#3902 THIRD review, P0 — MEASURED fail-open).
+    # A DIGIT-ONLY predicate here is a bypass of the whole arm, not a cosmetic gap: escape (a)
+    # (`_OC_ZEROED`) fires on any `non-blocking` / `no blocking` mention and `continue`s BEFORE every
+    # belt, and its ONLY guard is `live_count = 0`. So writing the SAME live count in words turned
+    # every one of these into a minted `clean` record:
+    #   `**Outcome: three findings — two blocking (P1), one non-blocking (P2).**`      => ADMITTED
+    #   `**Outcome: two blocking findings remain open; no blocking findings were fixed.**` => ADMITTED
+    #   `**Outcome: two blocking findings remain open, plus three non-blocking nits.**`  => ADMITTED
+    # while the digit form of the first (`3 findings — 2 blocking (P1), 1 non-blocking (P2)`) was
+    # refused — the arm read the same sentence differently depending on how the number was written.
+    # The rest of this function is spelled-aware throughout (`_OC_CNT`, `_OC_SELLED`, and 13n30's own
+    # comment: "the spelled form is what a digit-only scan misses"); this predicate was the one place
+    # it was not, and it guarded the arm's ONLY exit. 13n65 pins all three.
     live_count=0
-    grep -qiE '(^|[^0-9])[1-9][0-9]*[[:space:]_-]*(block(ing|ers?)|\(?p[01]\)?)' <<<"$line" && live_count=1
+    grep -qiE '(^|[^[:alnum:]])([1-9][0-9]*|one|two|three|four|five|six|seven|eight|nine|ten)[[:space:]_-]*(block(ing|ers?)|\(?p[01]\)?)' <<<"$line" && live_count=1
     # (a) ZEROED / NEGATED, and ONLY with no live positive count on the line.
     if [ "$live_count" -eq 0 ] && grep -qiE "$_OC_ZEROED" <<<"$line"; then
       continue

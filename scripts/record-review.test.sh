@@ -5628,6 +5628,64 @@ EV_REF="comment:42507201" run_record_ev 425072 STUB_EVIDENCE_BODY="**Outcome: 2 
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "13n64 a declared severity resolution does NOT cover the severity that REMAINS (rc 3)"
 
+# 13n65-13n68 — SPELLED COUNTS, A MOVED COLON, A HYPHEN, AND A PARENTHETICAL WHERE-CLAUSE
+# (agent-infra#3902 THIRD review, second pass — P0 + P1 + 2 x P2, all MEASURED through the shipped
+# recorder before the fix, and every one of them a shape an agent actually writes).
+#   * 13n65 is the P0. `live_count` was DIGIT-ONLY, and it is the ONLY guard on escape (a) — which
+#     `continue`s BEFORE every belt. So spelling the same live count in words let a `non-blocking`
+#     mention cancel a standing blocker and MINT a clean record, while the digit form of the very
+#     same sentence was refused. Three separate spellings are pinned because they failed for three
+#     different downstream reasons once the predicate was made spelled-aware (a second count, the
+#     persistence belt, and the spelled-count arm).
+#   * 13n66 is the P1: the anchor's LEAD was widened in the previous commit and the COLON was left
+#     glued to the word, so `**Outcome**: …` skipped the arm entirely and minted. The field is
+#     free-form — no template pins the colon inside the emphasis — so both the moved-before-colon
+#     and the spaced-before-colon forms are pinned.
+#   * 13n67/13n68 are the over-block controls for the two width fixes: a hyphenated `cycle-1`
+#     reference, and a parenthetical WHERE-clause that pushes the resolution six tokens out.
+rm -f "$(Q2 425073)"
+EV_REF="comment:42507301" run_record_ev 425073 STUB_EVIDENCE_BODY="**Outcome: three findings — two blocking (P1), one non-blocking (P2).**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n65 a SPELLED live count is not cancelled by a 'non-blocking' mention — the digit-only live-count predicate was a fail-open (rc 3)"
+[ ! -f "$(Q2 425073)" ] && ok "13n65 no clean record minted over 'two blocking (P1)' written in words" || bad "13n65 minted a record — spelling the count bypassed escape (a)'s only guard"
+
+rm -f "$(Q2 425074)"
+EV_REF="comment:42507401" run_record_ev 425074 STUB_EVIDENCE_BODY="**Outcome: two blocking findings remain open; no blocking findings were fixed.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n65b a SPELLED count survives the 'no blocking findings were fixed' clause in the same line (rc 3)"
+
+rm -f "$(Q2 425075)"
+EV_REF="comment:42507501" run_record_ev 425075 STUB_EVIDENCE_BODY="**Outcome: two blocking findings remain open, plus three non-blocking nits.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n65c a SPELLED count survives a trailing 'non-blocking nits' clause (rc 3)"
+
+rm -f "$(Q2 425076)"
+EV_REF="comment:42507601" run_record_ev 425076 STUB_EVIDENCE_BODY="**Outcome**: 3 findings — 2 blocking (P1), 1 documentation (P2).**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n66 '**Outcome**:' (the colon moved inside the emphasis) is still READ — refused (rc 3)"
+
+rm -f "$(Q2 425077)"
+EV_REF="comment:42507701" run_record_ev 425077 STUB_EVIDENCE_BODY="**Outcome : 2 blocking findings remain open.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n66b 'Outcome :' (a spaced colon) is still READ — refused (rc 3)"
+
+rm -f "$(Q2 425078)"
+EV_REF="comment:42507801" run_record_ev 425078 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings from cycle-1 were fixed and re-verified.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n67 OVER-BLOCK GUARD: a HYPHENATED reference ('cycle-1') is a reference, not a second count (rc 0)"
+
+rm -f "$(Q2 425079)"
+EV_REF="comment:42507901" run_record_ev 425079 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings (a leaked fd and an unset var) were fixed and re-verified.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n68 OVER-BLOCK GUARD: a parenthetical WHERE-clause between the noun and the resolution still records (rc 0)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
@@ -6694,13 +6752,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4576 :6302 :8676 :8850, plus a comment mention at :4445; `14.1c-CITE` below
+#     CITE-CHECK: :4609 :6335 :8709 :8883, plus a comment mention at :4478; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:4398) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:4587) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4576) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4609) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8676). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8709). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -6726,7 +6784,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8676` / `:8850` — CITE-CHECK: :8676 :8850 — re-derived by the
+#     this head the predicates are `:8709` / `:8883` — CITE-CHECK: :8709 :8883 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -7630,12 +7688,12 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
 #       and in #3168's diff the only hunk at `post_marker()` (head :4398) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4576) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :4609) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6302 :8676 :8850 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6335 :8709 :8883 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
