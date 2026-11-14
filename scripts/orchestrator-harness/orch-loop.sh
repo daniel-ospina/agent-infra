@@ -9246,9 +9246,9 @@ PY
     # NOTHING — ⛔ NOT that it did not fire (review P2, 9th cycle). The fire-with-zero that exists is a
     # pass where the cascade ALREADY granted: the valve opens and records, the grant guard fails, and the
     # record carries `escape=0` beside `slots=N>=1` — a real, measured state. (⛔ A zero BACKLOG is NOT a
-    # second one: that outcome fails `_ecan` and takes the WITHHELD arm below, which writes no record at
-    # all — an earlier revision of this comment named it and was wrong, 10th cycle P1.) Only `escape>0`
-    # proves a grant, and the zeroing at the top of the block is what keeps a previous cycle's grant from
+    # second one: that outcome fails `_ecan` and takes the WITHHELD arm below, which writes no *escape*
+    # record at all — `state/drain-escape` is untouched, though the cycle record still reads `escape=0`.)
+    # Only `escape>0` proves a grant, and the zeroing at the top of the block is what keeps a previous cycle's grant from
     # being read as this one's.
     CASCADE_ESCAPE_SLOTS="${_egrant:-0}"
     # DOES THIS PASS ACTUALLY HAVE A SLOT TO SPEND? UNSET is the driver-rig/older-caller contract (the
@@ -9941,9 +9941,9 @@ PY
     # rest is why this is a field addition and not a scope change — and it is precisely what the OPEN OWNER DECISION
     # in docs/ops/self-healing-contract.md §6 does NOT cover: making the levels actionability-bounded is
     # still the owner's call, and `level=` merely makes the current behaviour visible instead of inferred.
-    # ⛔ `${VAR-absent}`, NEVER `${VAR:-absent}`: `slots=0` is a MEASUREMENT (the room was withheld) and
-    # must not be rewritten as an absence — the same polarity the batch's own `${CASCADE_ISSUE_SLOTS-1}`
-    # guards take. ⛔ AND `absent` IS A FALLBACK, NOT A STATE A READER WILL EVER SEE (agent-infra#3909
+    # ⛔ `${VAR-absent}` RATHER THAN `${VAR:-absent}` — NOT because it protects a zero: both spellings
+    # print `0` for a set `0`; they differ only for a set-but-EMPTY value, which the terse form keeps
+    # visible. ⛔ AND `absent` IS A FALLBACK, NOT A STATE A READER WILL EVER SEE (agent-infra#3909
     # review, 5th cycle P2): this emit is reached only AFTER the cascade block assigned all four
     # variables, so `${VAR-absent}` never fires here — and the records that genuinely skip the block
     # (the fork-held and disk-held emissions above) pass NONE of these tokens, exactly as they pass no
