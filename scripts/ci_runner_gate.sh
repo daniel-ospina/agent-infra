@@ -942,7 +942,21 @@ print(comp, len(inc))
         # candidate synthesised from a body that carried only a head id.
         log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing$(if [ "$scanned" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
       else
-        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap); the candidate list is ONE page of ${QUEUE_PAGE} runs, so a bound at or above ${QUEUE_PAGE} cannot see past it"; return 2
+        # ⛔ THE PAGE-CEILING NOTE IS GATED ON THE QUEUE BEING DEEPER THAN A PAGE, NOT LEFT UNGATED
+        # (agent-infra#3995 review cycle 7, P1 — MEASURED defect). A bound break proves the candidate
+        # list is LONGER THAN THE BOUND; it does NOT prove the list is a page (a 30-deep queue read at
+        # the shipped bound of 25 breaks the window with a 30-ROW list). Emitted ungated, the clause
+        # stated "the candidate list is ONE page of 100 runs" about that 30-row list AND told the
+        # operator a bound at or above 100 could not see past it — when raising the bound is exactly
+        # the remedy (measured: the same fixture at bound 30 measures the demand head and writes a
+        # verdict). `queued > QUEUE_PAGE` is the fact that makes BOTH halves true: the request is
+        # `per_page=QUEUE_PAGE` (:775), `per_page` caps at 100 and silently reduces larger values
+        # (GitHub pagination docs), and a queue deeper than the page cannot be enumerated by ANY knob.
+        # ⛔ AND IT CLAIMS NOTHING ABOUT THE CANDIDATE LIST'S LENGTH (review cycle 8, F1): the list may
+        # be the page's rows or the SINGLE candidate synthesised from a body that carried only a head
+        # id (see the degrade path above), so the sentence is about the READ REQUEST and the QUEUE
+        # DEPTH — the two facts this branch actually establishes.
+        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap)$(if [ "$queued" -gt "$QUEUE_PAGE" ]; then printf '; this read asks for at most ONE page of %s runs and the queue is deeper than that, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
       fi
     fi
     # No ghost/depth re-check here: the contradiction was refused above for both outcomes, and the
@@ -1112,8 +1126,15 @@ print(age)
   # operator must be told that before concluding the refusal is a knob problem. The gate is the BOUND
   # because below the page the ceiling is not yet what stopped the pass (the knob still has room) —
   # the same distinction the TRUNCATED branch pins from the other side with its `scanned` gate.
+  # ⛔ AND IT DOES NOT CLAIM HOW MANY ROWS THE CANDIDATE LIST HELD (agent-infra#3995 review cycle 8,
+  # F1). `queued > QUEUE_PAGE` proves the PAGE REQUEST could not carry the queue; it says nothing about
+  # the list the scan read, which on this branch can be ONE synthesised candidate (`queue_rows` absent
+  # but `head_run_id` present ⇒ `candidates="$head_run_id,$oldest_created"` above). Measured: the
+  # cycle-7 arm `page-saturated-at-page` drove exactly that shape and the old wording asserted "the
+  # candidate list is ONE page of 100 runs" over a ONE-row list — the misdiagnosis class this change
+  # exists to remove. The sentence now names the READ REQUEST and the QUEUE DEPTH, both established.
   if [ "$queued" -gt "$QUEUE_PAGE" ]; then
-    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; the candidate list is ONE page of %s runs, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"
+    log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; this read asks for at most ONE page of %s runs and the queue is deeper than that, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"
     return 2
   fi
 
