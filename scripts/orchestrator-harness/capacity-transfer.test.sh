@@ -1204,6 +1204,16 @@ ck "§SC …and the durable record carries gate='stale' (got '${sgate:-<none>}')
     bash "$CHAIN" "$LBWT" daniel-ospina/agent-infra 120 fix/120-tm ) >/dev/null 2>&1; schain=$?
 [ "$schain" -eq 85 ]; rc=$?
 ck "§SC chain-merge stops the wait with the SAME code 85, not a normalised 75/71 (rc=$schain)" $rc
+# ⛔ AND THE THIRD READER MUST NAME THE REMEDY TOO (review of 92ec5cd67, P2-1). `cap_refusal_gate`
+# gained its `stale` arm while the message dispatcher below it did not, so `gate=stale` took the
+# generic `else` and the CHAIN — the reader whose whole job is to report the remedy — told the operator
+# "a peer with capacity can claim it": the circulation this change removes everywhere else. The row
+# above discards the chain's output, so that mutant was green; these two read the chain's own log.
+CLOG="$O/logs/chain-120.log"
+grep -q 'stale checkout:' "$CLOG" 2>/dev/null; rc=$?
+ck "§SC …and the chain's own message names the stale refusal instead of the generic capacity arm" $rc
+{ ! grep -qi 'peer with capacity can claim it' "$CLOG" 2>/dev/null; }; rc=$?
+ck "§SC …and the chain does NOT hand the item to a peer either, so all three readers agree" $rc
 rm -f "$O/state/capacity-refused-120"
 
 echo
