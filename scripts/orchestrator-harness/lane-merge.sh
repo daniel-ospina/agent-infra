@@ -223,7 +223,7 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 #
 # ⛔ AND ITS COVERAGE IS STATED, NOT ROUNDED UP TO 100 %: **79.9 % of the LANE-VISIBLE population (167 of
 # 209) completes inside 5400 s, and 94.3 % of the run-duration population (197 of 209).** FORTY-TWO runs
-# exceed 5400 s on the lane-visible clock and TWENTY-NINE of those exceed the lane's whole 7200 s clock —
+# exceed 5400 s on the lane-visible clock and TWENTY-NINE of those exceed the then-7200 s clock —
 # i.e. one run in five, and one in seven that no setting of this constant could ever have waited out. That
 # is the number to hold onto when reading what follows: this change turns a bound that could never be
 # reached into one that is reached 4 times in 5, and it does NOT fix the queue that makes the fifth slow.
@@ -365,7 +365,9 @@ if is_limit "${LANE_TIMEOUT:-}" && [ "${LANE_TIMEOUT}" = "${LANE_WALL_S}" ]; the
 # the same defect one configuration over from the one below). The test here used to be VALUE EQUALITY alone,
 # which attributes by coincidence and not by the rule: `LANE_WALL_S` is `${LANE_TIMEOUT:-…}`, so a NON-EMPTY
 # `LANE_TIMEOUT` wins the mask and the backstop is never read — yet with `LANE_TIMEOUT=abc
-# LANE_BACKSTOP_S=7200` (7200 is spawn-gate.sh:3419's own default, i.e. the value in EVERY lane's env) the
+# LANE_BACKSTOP_S=7200` (the value the seam shipped when this was measured — read the default out of
+# `spawn-gate.sh`, never from this line: agent-infra#4034 raised it to 36000, and the fixture's POINT is
+# that its value coincided with the then-shipped default, not that 7200 is still the default) the
 # backstop happens to equal the shipped default, so the elif matched and every message rendered "from
 # LANE_BACKSTOP_S" while naming no malformed knob at all. `-z ${LANE_TIMEOUT}` is the resolution rule
 # itself, not a second opinion about the number: it is empty exactly when `${LANE_TIMEOUT:-…}` falls through.
@@ -1997,7 +1999,8 @@ trap 'rm -f "$CHECK_TMP" "$CHECK_ERR_TMP"' EXIT
 # ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S **REMAINING** WALL CLOCK, NOT JUST THE WHOLE OF IT
 # (#3584 review, P1 — verified). `deadline` was `now + WAIT_S` and nothing compared it with how much of
 # `LANE_WALL_S` THIS lane had already spent. At the shipped numbers a lane entering its merge phase more
-# than ~1800 s into its run (7200 - 5400) was TERMed by `lane-bound.sh`'s WALL ceiling MID-wait: the
+# than ~1800 s into its run (7200 - 5400, the clock of the day: at the shipped 36000 s seam this margin
+# is 30600 s) was TERMed by `lane-bound.sh`'s WALL ceiling MID-wait: the
 # `now >= deadline` arm never ran, so `WAITING_CHECKS` was never emitted, no `lanemerge-<pr>.verdict`
 # was written, and `lane.sh` printed "NO merge-phase verdict" over a lane that HAD a labelled hand-off
 # available. ⛔ THAT IS STRICTLY WORSE THAN THE 1500 s BOUND THIS CHANGE REPLACES (which reached its own
