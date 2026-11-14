@@ -1967,12 +1967,15 @@ REV_STARTED=1
 # that keying's ceiling `CLAIM_TTL_MAX` (43200 since agent-infra#4034; 9600 before it), and its test is
 # a STRICT `-gt`, so a lease of exactly
 # the ceiling is never clamped. The reviewer bound therefore stays un-clamped only while
-# `REVIEW_TIMEOUT + _gw + 300 <= 43200` — 42000 s at the default 900 s gate wait, and 39000 s on a
-# box running `GATE_POLL_SECS=60`. Past that threshold the lease is pinned at 43200 and the clamp
-# erodes the post-review headroom, reaching ZERO at `REVIEW_TIMEOUT` = 43200; only ABOVE 43200 does
+# `REVIEW_TIMEOUT + _gw + 300 <= 43200` — 42000 s at the default 900 s gate wait, and 41100 s on a
+# box running `GATE_POLL_SECS=60` (`43200 - 1800 - 300`; 3900 is the whole merge TERM there, not `_gw`).
+# Past that threshold the lease is pinned at 43200 and the clamp
+# erodes the post-review headroom, reaching ZERO at `REVIEW_TIMEOUT` = 42000; only ABOVE 42000 does
 # the
 # claim actually expire under a reviewer that is still running — a second lane free to take the claim
-# mid-review, which is the exact silent-park `claims.sh` guards against.
+# mid-review, which is the exact silent-park `claims.sh` guards against. (The threshold and the
+# zero-headroom point are the SAME number: the lease stops tracking `REVIEW_TIMEOUT` exactly where the
+# headroom runs out.)
 # ⛔ NO LINE NUMBERS IN THIS PARAGRAPH, ON PURPOSE. Round 8 cited `:364` and `claims.sh:1151`; they
 # were exact when written, and the round-8 review then found that round 7 had shipped four stale line
 # references by inserting two lines above them. A reference that has to be re-counted is a reference
