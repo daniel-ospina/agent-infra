@@ -592,9 +592,18 @@ ck "a FULL box (lanes == max) names the ROOM as the cause — it is not a capaci
    "$(drive_block 0 25 25 10 1 '' '' - - 0 x | cut -d' ' -f5,6)" "0 no_room"
 ck "an EMPTY candidate backlog names the BACKLOG as the cause (the grant is ceilinged by it)" \
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x | cut -d' ' -f5,6)" "0 empty_backlog"
-ck "an UNREADABLE PR listing names the LISTING as the cause (the fail-closed arm above it)" \
+ck "an UNREADABLE PR listing names the LISTING as the cause (the fail-closed arm, on the one state it decides)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
 ' - - 1 x 1 | cut -d' ' -f5,6)" "0 listing_unreadable"
+# ⛔ THE ARM THAT RE-STATES A ZERO GOES LAST (agent-infra#3909 review, 3rd cycle P2). The listing arm is
+# applied AFTER `cascade_issue_slots` ran, and the allocator's zero does not depend on the PR listing — so
+# on a full box or an empty backlog the listing arm decides NOTHING and must not publish itself as the
+# cause. These two arms are the falsifiers: both satisfy the unreadable listing AND an earlier gate, and
+# before the reorder each read `listing_unreadable`. Without them the combined states are unpinned.
+ck "…but it does NOT outrank a cause the ALLOCATOR already measured: a FULL box still names no_room" \
+   "$(drive_block 0 25 25 10 1 '' '' - - 1 x 1 | cut -d' ' -f5,6)" "0 no_room"
+ck "…and an EMPTY backlog still names empty_backlog, not the listing it also could not read" \
+   "$(drive_block 0 2 25 0 1 '' '' - - 1 x 1 | cut -d' ' -f5,6)" "0 empty_backlog"
 ck "a rung that WAS granted states it, rather than leaving it to be inferred from a non-zero count" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
 ' 9001 - 1 x | cut -d' ' -f5,6)" "10 granted"

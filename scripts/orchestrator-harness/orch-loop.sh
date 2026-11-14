@@ -8386,14 +8386,23 @@ PY
   # the outcome wins), and `granted` is stated rather than left to inference from a non-zero `slots=`.
   # ⛔ `level` can only be the cause when the rung HAD slots and a higher level took them (`slots > 0`
   # reaches `cascade_level`; the zeroing arm sets `CASCADE_LEVEL_HOLDS`), never when the cascade never
-  # ran — so it is tested after the arms that stop it from running at all.
+  # ran — so it is tested after the arm that can stop it from running at all (`capacity`).
+  # ⛔ AND AN ARM THAT ONLY RE-STATES A ZERO THE ALLOCATOR ALREADY PRODUCED GOES LAST (agent-infra#3909
+  # review, 3rd cycle P2). `cascade_issue_slots` runs BEFORE this block's listing arm, and its zero does
+  # NOT depend on the PR listing: it withholds on `room <= 0` and is ceilinged by the (local, always
+  # readable) candidate backlog. So on a FULL box or an EMPTY backlog the listing arm re-states a zero
+  # that was already decided — it decided nothing. Testing it first published `listing_unreadable` for a
+  # box whose measured cause was `no_room`, i.e. the same "a wrong cause on the artifact a lane is
+  # briefed from" defect this token exists to end, one arm over. It still wins on the one state it does
+  # decide — room AND backlog both free, so every arm above it is false and the listing is the only
+  # zero left.
   CASCADE_SLOTS_WHY=""
   if [ "${CASCADE_RUNG_SLOTS:-0}" -gt 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="granted"
   elif [ "${CASCADE_CAN:-1}" = "0" ]; then CASCADE_SLOTS_WHY="capacity"
-  elif [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; then CASCADE_SLOTS_WHY="listing_unreadable"
   elif [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ]; then CASCADE_SLOTS_WHY="level"
   elif [ "${CASCADE_ROOM:-0}" -le 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="no_room"
   elif [ "${CASCADE_QUEUE_DEPTH:-0}" -le 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="empty_backlog"
+  elif [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; then CASCADE_SLOTS_WHY="listing_unreadable"
   else CASCADE_SLOTS_WHY="unknown"; fi
   # [cascade:end]
   echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) list=${CASCADE_LIST:-?} level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_QUEUE_DEPTH:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
