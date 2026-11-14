@@ -2589,6 +2589,20 @@ mkfake '[cell-lane-preflight] LANE_CAPABILITY=ok host=x answered_ms=900 returned
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
 { [ "$CRC" -eq 0 ] && ! grep -q 'UNMEASURABLE' "$LOG"; }; rc=$?
 ck "...while a MEASURED reading (behind=3) is admitted with no such WARN (control)" $rc
+# ⛔ ABSENCE OF THE FIELD IS THE OTHER UNMEASURABLE SHAPE, AND IT WAS THE SILENT ONE (this change's
+# review, P2-2). A probe deployed before this field existed emits `ok … key=env` with no `behind=` at
+# all; it matched nothing, so the spawn was admitted with ZERO log lines while the property (g2c) is
+# named for held only on the `behind=unknown` path. And the skew direction is the LIKELY one: `$O` is
+# seeded FILE BY FILE, so a caller here routinely runs against a probe older than itself.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=ok host=x answered_ms=900 returned_ms=950 attempts=1 bound=45s key=env' 0
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "an OLD probe with NO staleness field still ADMITS the spawn (rc=$CRC, agent ran) — it is a WARN, not a refusal" $rc
+grep -q 'NO staleness field at all' "$LOG"; rc=$?
+ck "...but it is ANNOUNCED too, so the second unmeasurable shape is not silent either" $rc
+grep -q 'reason=no-reading-field' "$LOG"; rc=$?
+ck "...naming the missing field, and that the cause is HELPER/CONSUMER SKEW rather than a reading" $rc
 # (g3) A REFUSAL'S READING IS NOT ITS VERDICT (follow-up to #2991, P3, measured). `why=no-return` and
 # `why=call-failed` end in `tail=<last 240 bytes of pi's own output>`, and the arms above were chosen
 # by a substring test over the WHOLE line — so a deterministic refusal whose tail happened to embed
