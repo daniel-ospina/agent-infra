@@ -10305,20 +10305,39 @@ main() {
           # "this lane cannot run" and "this lane did not run" look the same again — which
           # is the ONE confusion #2465 exists to remove. Derived from `lane_structural`,
           # never re-read from the reason text.
-          local lane_trigger_clause
+          local lane_trigger_clause lane_kept_tail
           if [ "$lane_structural" -eq 1 ]; then
             if [ "$LANE_RUN_ATTACH_SOURCE" = measured ] && [ -n "$LANE_RUN_ATTACH_TRIGGERS" ]; then
-              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no PR event can START it — but it declares '$LANE_RUN_ATTACH_TRIGGERS', which CAN attach a run of it to head $head while the wait runs (a push whose tip is $head, a 'gh workflow run --ref', or a rerun of a CANCELLED run)"
+              # ⛔ AND THE MECHANISM LIST MUST MATCH THE TRIGGER NAMED (round 3, P2). The clause
+              # quotes exactly what the helper FOUND, so a fixed parenthetical re-introduces the
+              # claim this commit removed one level up: telling a `workflow_dispatch`-only lane
+              # that "a push whose tip is $head" can start it asserts a mechanism its own `on:`
+              # block cannot provide. Derived from the same value, per arm.
+              local lane_attach_how
+              case "$LANE_RUN_ATTACH_TRIGGERS" in
+                push) lane_attach_how="a push whose tip is $head, or a rerun of a CANCELLED run" ;;
+                workflow_dispatch) lane_attach_how="a 'gh workflow run --ref', or a rerun of a CANCELLED run" ;;
+                *) lane_attach_how="a push whose tip is $head, a 'gh workflow run --ref', or a rerun of a CANCELLED run" ;;
+              esac
+              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no PR event can START it — but it declares '$LANE_RUN_ATTACH_TRIGGERS', which CAN attach a run of it to head $head while the wait runs ($lane_attach_how)"
+              lane_kept_tail="This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
             else
               # ⛔ NOT "it declares a trigger" (round 2, P2): on this path the code could not
               # READ the trigger list, so the only honest statement is that the answer is
               # unread and the filter is kept fail-closed.
               lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no PR event can START it, and its declared trigger list could not be READ from the applicability reason — so the filter is kept because an unreadable answer is not an exemption, not because a run was measured absent"
+              # ⛔ AND THE TAIL MUST NOT RE-ASSERT WHAT THE CLAUSE JUST CALLED UNREAD (round 3,
+              # P2). "This class CAN still start a run while the wait runs" is the fact this arm
+              # has just said it could not establish, and it repeats the "not an exemption"
+              # rationale a second time in the same sentence. On this arm the honest tail states
+              # only the consequence.
+              lane_kept_tail="The bounded wait applies, and §1b refuses if no run appears."
             fi
           else
             lane_trigger_clause="it declares a PR trigger this changed set does not match"
+            lane_kept_tail="This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
           fi
-          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: $lane_trigger_clause, and $lane_kept_why. This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears. Pass --any-workflow to compare against every workflow instead."
+          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: $lane_trigger_clause, and $lane_kept_why. $lane_kept_tail Pass --any-workflow to compare against every workflow instead."
         fi
         ;;
       unknown)
