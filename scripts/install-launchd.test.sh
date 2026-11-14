@@ -2931,7 +2931,14 @@ assert_not_contains "$OUT" "missing or unreachable from launchd" "§17c ... and 
 # and exited 0, certifying the blind job as healthy, while `install-launchd.sh` refused the SAME file
 # loudly. MEASURED pre-fix: rc 0, row `in sync`.
 cmux_status_probe() { # <home> <gated-script-path> → installer --status stdout+stderr; rc is the installer's
-    local home="$1" gated="$2"
+    cmux_status_probe_env "$1" "$2" ""
+}
+
+# ⛔ THE SAME FIXTURE WITH A TMPDIR OVERRIDE (§17c). Set separately rather than as a default so the
+# §17b call site is untouched: these two rows must differ in exactly ONE variable (the temp dir), or a
+# green cannot be attributed to the property under test.
+cmux_status_probe_env() { # <home> <gated-script-path> <TMPDIR or "">
+    local home="$1" gated="$2" tmpdir_override="$3"
     rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR" "$home/Library/LaunchAgents"
     cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2964,8 +2971,15 @@ PLIST
       export TEMPLATES_DIR="$PROBE_DIR"
       export AGENTS_DIR="$home/Library/LaunchAgents"
       export ELDATO_ALLOW_TEST_HOME=1
+      [ -n "$tmpdir_override" ] && export TMPDIR="$tmpdir_override"
       unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
       bash "$INSTALLER" --status 2>&1 )
+}
+
+# `cmux_status_probe_nowrite <home> <gated> <nonexistent-tmpdir>` — §17c's entry point, named for what
+# it proves: a temp dir that does not exist, so `mktemp` cannot succeed.
+cmux_status_probe_nowrite() {
+    cmux_status_probe_env "$1" "$2" "$3"
 }
 set +e
 OUT="$(cmux_status_probe "$PROBE_HOME" "$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh")"; RC=$?
@@ -2983,6 +2997,28 @@ OUT="$(cmux_status_probe "$PROBE_HOME" "$PROBE_HOME/.pi/agent/scripts/probe-ok.s
 set -e
 assert_contains "$OUT" "com.eldato.tccprobe" "§17b control: a NON-gated template in the same fixture is still reported"
 assert_not_contains "$OUT" "⛔ CMUX-GATED" "§17b control: ... and is NOT refused as cmux-gated (the arm is about the script, not the directory)"
+
+# ── 17c. A BROKEN TMPDIR IS "COULD NOT GRADE", NEVER "in sync" (#3826 review P1, round 17) ──────
+# ⛔ THIS IS THE ROW THAT WOULD HAVE CAUGHT THE ROUND-16 REGRESSION, and §17b is the row that DID.
+# Round 16 removed the cmux probe's temp file to stop an unwritable TMPDIR from hiding a gated job, and
+# handed `plist_cmux_gated_target` a PROCESS SUBSTITUTION — a pipe, which `plistlib` cannot read
+# (`UnsupportedOperation: File or stream is not seekable`), so the reader exited 3, the probe answered
+# "no gated target", and the row fell through to the CONTENT comparison. MEASURED at `8aade2a1c`: a
+# byte-identical install of this same gated fixture read `installed=loaded version=v0.0.1 (in sync)`,
+# rc 0 — the certify-the-blind-job fail-open, re-opened by its own fix.
+# The probe now uses ONE real temp file for BOTH arms, so an unwritable TMPDIR is answered as
+# `2 UNKNOWN` — which is the property round 16 was actually after: a broken TMPDIR can never produce
+# `in sync`. Red under the mutant that lets a temp-file failure fall through to the content verdict.
+PROBE_NOWRITE="$T/no-such-tmpdir"
+rm -rf "$PROBE_NOWRITE"
+set +e
+OUT="$(cmux_status_probe_nowrite "$PROBE_HOME" "$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh" "$PROBE_NOWRITE")"; RC=$?
+set -e
+assert_eq "$RC" "2" "§17c an unwritable TMPDIR answers 2 UNKNOWN for a cmux-gated template (not 0, not 1)"
+assert_contains "$OUT" "⛔ UNKNOWN   com.eldato.tccprobe" "§17c ... with an UNKNOWN row of its own, naming the unit it could not grade"
+assert_contains "$OUT" "cannot create a temp file" "§17c ... and the reason, so the operator fixes TMPDIR and not the plist"
+assert_not_contains "$OUT" "in sync" "§17c ... and NEVER 'in sync': a unit that cannot be graded is not certified"
+assert_not_contains "$OUT" "installed=loaded" "§17c ... and no installed=loaded content verdict at all"
 
 
 # ── §18: an installed plist with NO template is UNMANAGED (#1867) ──────────────────────────────────
@@ -3261,6 +3297,44 @@ for _owned in com.eldato.lane-arm com.eldato.orchestrator-stack; do
     set -e
     assert_eq "$RC" "0" "§18 control: removing '$_owned' leaves the box clean (the row above was not a stuck red)"
 done
+
+# ── 18f. AN EMPTY EXEMPTION MANIFEST IS A REFUSAL, NOT A BLANKET RE-CLASSIFICATION (#3826 P2) ─────
+# ⛔ THE GUARD TESTED THE MANIFEST'S *PATH*, NOT ITS ENTRIES. `retired_manifest`/`foreign_manifest`
+# answer a path when the file is `-r`/`-f`, so a manifest that EXISTS and is EMPTY — a truncated file,
+# a mangled merge, a copy whose entries were lost — passed the guard, `is_foreign` then answered "no"
+# for every label, and the loop handed the operator `launchctl bootout … && rm -f …` for a live job
+# another installer of THIS repo owns. That is verbatim the harm
+# `templates/launchd/OWNED-BY-OTHER-INSTALLERS:28-31` exists to prevent, and the identical sentence
+# `cmux_gate_required` already refuses on the install path ("an EMPTY gate is the same no-op as a
+# missing one"). MEASURED at `8aade2a1c` with the label below seeded and OWNED-BY-OTHER-INSTALLERS
+# truncated to 0 bytes: `⛔ UNMANAGED com.eldato.orchestrator-loop` plus the bootout+rm remedy, rc 1;
+# with the entries restored, 0 UNMANAGED rows. Red under the mutant that restores the path-only guard.
+EMPTY_OWNED_TEMPLATES="$T/empty-owned-templates"; mkdir -p "$EMPTY_OWNED_TEMPLATES"
+cp "$TEMPLATES"/*.plist "$EMPTY_OWNED_TEMPLATES"/ 2>/dev/null || true
+cp "$TEMPLATES/RETIRED" "$EMPTY_OWNED_TEMPLATES"/ 2>/dev/null || true
+: > "$EMPTY_OWNED_TEMPLATES/OWNED-BY-OTHER-INSTALLERS"
+if [ -f "$EMPTY_OWNED_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" ] && [ ! -s "$EMPTY_OWNED_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" ]; then
+    ok "§18f fixture: the declared set is present and OWNED-BY-OTHER-INSTALLERS exists but holds no entry"
+else
+    bad "§18f fixture: the emptiness this arm tests was not produced"
+fi
+seed_stray_plist com.eldato.orchestrator-loop
+STRAY_TEMPLATES="$EMPTY_OWNED_TEMPLATES"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+unset STRAY_TEMPLATES
+assert_eq "$RC" "2" "§18f an EMPTY exemption manifest answers 2 UNKNOWN, not a per-job verdict"
+assert_contains "$OUT" "⛔ UNKNOWN" "§18f ... with a row that says the set could not be read"
+assert_not_contains "$OUT" "⛔ UNMANAGED   com.eldato.orchestrator-loop" \
+    "§18f ... and never re-classifies a job another installer of this repo owns as a stray"
+assert_not_contains "$OUT" 'launchctl bootout gui/' \
+    "§18f ... so NO delete command is aimed at a live job on the strength of a list it never read"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18f control: with a readable manifest and nothing unmanaged, the box is clean again"
 
 # ⛔ AND THE DECLARATION IS DRIFT-GATED, not a second hardcoded list, IN BOTH DIRECTIONS, and
 # against EVERY SPELLING an installer in this repo uses (#1867 review P1/P2, round 4).

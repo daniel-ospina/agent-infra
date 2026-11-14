@@ -987,6 +987,57 @@ else
 fi
 rmdir "$FIX15D/home/.pi/agent/bin" 2>/dev/null || true
 
+# ── 16. THE LEGACY SELF-DETACH MUST NOT CLAIM A START IT DID NOT GET (#3826 review P3) ────────────
+# ⛔ The detach arm slept one second and then printed
+#   `heartbeat loop started (pid $(cat "$PIDFILE" 2>/dev/null || echo '?'))`   … exit 0
+# so a FIRST run — `$STATE` absent, which is the documented start case — printed `started (pid ?)`
+# with a green status while the child's `echo $$ > "$PIDFILE"` was failing silently and no loop ran.
+# That is the same false PASS `heartbeat-launch.sh start` was written to remove (its §16c asserts the
+# identical property one file over), left standing on the path the loop itself documents.
+# The arm now POLLS for a live pidfile and fails loudly. Discriminating shape: the loop is made to exit
+# at the top of its pass (the kill file), so a correct arm prints REFUSING rc 1 and a pre-fix arm prints
+# `started (pid ?)` rc 0 — the two assertions below cannot both hold on the old code.
+FIX16="$TMP/legacy16"
+mkdir -p "$FIX16/home" "$FIX16/agent/state"
+touch "$FIX16/agent/state/HEARTBEAT-OFF"
+set +e
+OUT16="$(HOME="$FIX16/home" HEARTBEAT_PI_AGENT_DIR="$FIX16/agent" /bin/bash "$LOOP" 2>&1)"
+RC16=$?
+set -e
+if [ "$RC16" -eq 1 ]; then
+  pass "16. a self-detach that leaves no live loop exits 1 (pre-fix: 0, with 'started (pid ?)')"
+else
+  fail "16. the self-detach exited $RC16 for a loop that is NOT running — a launch nobody verified"
+fi
+# ⛔ NO `printf … | grep -q` (#841/#864, and this repo's own guard reds it): under `pipefail` the
+# writer takes SIGPIPE and the `if` takes its ELSE branch, so the assertion passes without reading the
+# line. `case` tests the string directly — the pipe was never needed.
+case "$OUT16" in
+    *'REFUSING: the loop left no live pidfile'*)
+        pass "16. …and names the artefact it looked for, so the operator knows what failed" ;;
+    *)
+        fail "16. the refusal did not name the missing pidfile: $OUT16" ;;
+esac
+case "$OUT16" in
+    *'started (pid'*)
+        fail "16. …and it still printed 'started (pid …)' over a loop that is not running: $OUT16" ;;
+    *)
+        pass "16. …and NEVER prints 'started' over an unverified launch" ;;
+esac
+# The other direction, so the row above cannot be green on a BROKEN FIXTURE: the same shape of layout,
+# run the way every other case runs it (`LOOP_DETACHED=1`, one pass), must complete and exit 0. If the
+# fixture itself could not run a loop, the refusal above would prove nothing about the detach arm.
+FIX16C="$(mkfix legacy16c 0)"
+set +e
+run_pass "$FIX16C"
+RC16C=$?
+set -e
+if [ "$RC16C" -eq 0 ]; then
+  pass "16. control: the same fixture runs a real pass cleanly, so the refusal is the detach arm's own"
+else
+  fail "16. control: the fixture cannot run a pass (rc $RC16C) — the detach row above proves nothing"
+fi
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-loop suite passed (${checks} assertions)"
   exit 0

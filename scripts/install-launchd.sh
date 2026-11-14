@@ -1713,41 +1713,77 @@ status_job() {
     # and demanded by `--status`", which this arm is what makes true.
     # ⛔ IT REPORTS A SKIP, NOT A PASS: the installed-copy variant keeps a counted marker, so a box
     # still holding one is disclosed to the verdict sentence rather than certified clean.
-    local _tcc_tmp _tcc_vrc _cmux_target=""
-    if _tcc_tmp="$(mktemp 2>/dev/null)"; then
-        printf '%s' "$rendered" > "$_tcc_tmp"
-        _tcc_vrc=0
-        verify_targets "$_tcc_tmp" >/dev/null 2>&1 || _tcc_vrc=$?
-        # ⛔ ASKED AGAIN, DELIBERATELY — NOT DERIVED FROM `_tcc_vrc` (#3826 review P2). See
-        # `plist_cmux_gated_target`'s own note: a shared `1` cannot say whether the target was MISSING
-        # (a farm gap, which --status must not turn into a permanent red) or cmux-GATED (the blind job
-        # this whole change exists to refuse). Captured before the temp file is removed.
-        _cmux_target="$(plist_cmux_gated_target "$_tcc_tmp" || true)"
-        rm -f "$_tcc_tmp"
-        if [ "$_tcc_vrc" -eq 2 ]; then
-            if [ -f "$installed" ]; then
-                echo "  ⚠️ INSTALLED-SKIPPED   $label: INSTALLED, but SKIPPED now (launchd cannot READ this unit's target — a macOS TCC root, #427; the installer SKIPs this template and DISARMS the copy, so what runs is not what the template describes)"
-            else
-                echo "  $label: NOT APPLICABLE (launchd cannot READ this unit's target — a macOS TCC root, #427; no install step changes this box's layout)"
-            fi
-            return 0
-        fi
-        # ⛔ A cmux-GATED TEMPLATE IS NEVER `in sync` (#3826 review P2 — a fail-open on the exact
-        # defect this change exists to catch). `verify_targets` returns 1 here, so the arms below
-        # graded its CONTENT: a byte-identical template and plist agreed, the row read
-        # `installed=loaded version=v… (in sync)`, and `--status` exited 0 — certifying a job that
-        # installs, loads, ticks and delivers NOTHING. This is not hypothetical: the blind job in
-        # #1867's own body was installed and `--status`-clean for its whole life. It is now a row of
-        # its own and a non-zero exit, so the two verbs agree about one file.
-        if [ -n "$_cmux_target" ]; then
+    local _tmp _tcc_vrc _cmux_target="" _cmux_rc=0
+    # ⛔ THE RENDERED PLIST IS MATERIALISED IN A REAL TEMP FILE, AND A TEMP-FILE FAILURE IS ITS OWN
+    # FAIL-CLOSED ANSWER — never a content verdict (#3826 review P1, round 17).
+    # Round 16 took the cmux question out of the `mktemp` guard to stop an unwritable TMPDIR from
+    # hiding a gated job, and handed it a PROCESS SUBSTITUTION instead. That reads as a path and is a
+    # PIPE: `plist_program_args` → `plist_reader_py` does `plistlib.load(open(sys.argv[1], "rb"))`,
+    # `plistlib` requires a SEEKABLE stream, and `/dev/fd/N` raises
+    # `UnsupportedOperation: File or stream is not seekable` → the reader exits 3, the PlistBuddy
+    # fallback does not exist off macOS, so `_cmux_target` came back EMPTY for a GATED job, this arm
+    # was skipped, and the row fell through to the content comparison below. MEASURED at `8aade2a1c`
+    # on a byte-identical install of a template naming `scripts/heartbeat-loop.sh` (both readers
+    # isolated on a real file vs a process substitution): `installed=loaded version=v0.0.1 (in sync)`,
+    # rc **0** — the certify-the-blind-job fail-open this whole change exists to remove, re-opened by
+    # its own fix, with the repo's own §17b red on it (5 assertions).
+    # ⛔ SO: ONE real temp file serves BOTH probes (the TCC arm already needed one), and `mktemp`
+    # failing is answered as `2 UNKNOWN` — which is what round 16's goal actually required ("a broken
+    # TMPDIR must not be able to hide a gated job") without asserting that a pipe is a file.
+    # `plist_program_args` writes its READER to a temp file too, so the same broken TMPDIR surfaces
+    # one call in as rc=3 ("could not read") rather than as "not gated" — see `plist_cmux_gated_target`.
+    # ⛔ ASKED FROM THE MANIFEST AGAIN, DELIBERATELY — NOT DERIVED FROM `verify_targets`'s exit code
+    # (#3826 review P2, and the concurrent lane's note on this same block): a shared `1` cannot say
+    # whether a target was MISSING (a farm gap, which --status must not turn into a permanent red) or
+    # cmux-GATED (the blind job this change exists to refuse).
+    if ! _tmp="$(mktemp 2>/dev/null)"; then
+        echo "  ⛔ UNKNOWN   $label: cannot create a temp file (TMPDIR/TMP/TEMP unwritable), so neither the cmux launch-path gate nor the TCC target check can be evaluated — a unit that cannot be graded is NOT certified"
+        return 2
+    fi
+    if ! printf '%s' "$rendered" > "$_tmp"; then
+        rm -f "$_tmp"
+        echo "  ⛔ UNKNOWN   $label: cannot write the rendered plist to a temp file, so neither the cmux launch-path gate nor the TCC target check can be evaluated — a unit that cannot be graded is NOT certified"
+        return 2
+    fi
+    # ⛔ A cmux-GATED TEMPLATE IS NEVER `in sync` (#3826 review P2 — a fail-open on the exact
+    # defect this change exists to catch). `verify_targets` returns 1 here, so the arms below
+    # graded its CONTENT: a byte-identical template and plist agreed, the row read
+    # `installed=loaded version=v… (in sync)`, and `--status` exited 0 — certifying a job that
+    # installs, loads, ticks and delivers NOTHING. This is not hypothetical: the blind job in
+    # #1867's own body was installed and `--status`-clean for its whole life. It is now a row of
+    # its own and a non-zero exit, so the two verbs agree about one file.
+    # ⛔ AND "COULD NOT READ" IS NOT "NOT GATED" (round 17): `plist_cmux_gated_target` answers 3 for
+    # an unreadable rendered plist, so a reader that could not look is UNKNOWN here instead of being
+    # read as a clean classification. Collapsing the two is how the pipe above became invisible.
+    _cmux_target="$(plist_cmux_gated_target "$_tmp")" || _cmux_rc=$?
+    case "$_cmux_rc" in
+        1) : ;;                       # read, and it names no cmux-gated script
+        0)
             echo "  ⛔ CMUX-GATED   $label: this job installs, loads and ticks, and is BLIND under launchd ($_cmux_target)"
             echo "        the cmux socket (socketControlMode = cmuxOnly) gates on launch-chain attribution,"
             echo "        which a launchd job never has, so it delivers NOTHING while its log reads as"
             echo "        activity (#1867). This template is listed in templates/launchd/LAUNCHD-INCOMPATIBLE"
             echo "        — remove it from the set; no install step makes it work."
             echo "        Documented launch path: bash scripts/heartbeat-launch.sh start"
+            rm -f "$_tmp"
             return 1
+            ;;
+        *)
+            rm -f "$_tmp"
+            echo "  ⛔ UNKNOWN   $label: the rendered plist could not be READ (rc=$_cmux_rc), so whether it names a cmux-gated script cannot be answered — an unreadable unit is never a clean one"
+            return 2
+            ;;
+    esac
+    _tcc_vrc=0
+    verify_targets "$_tmp" >/dev/null 2>&1 || _tcc_vrc=$?
+    rm -f "$_tmp"
+    if [ "$_tcc_vrc" -eq 2 ]; then
+        if [ -f "$installed" ]; then
+            echo "  ⚠️ INSTALLED-SKIPPED   $label: INSTALLED, but SKIPPED now (launchd cannot READ this unit's target — a macOS TCC root, #427; the installer SKIPs this template and DISARMS the copy, so what runs is not what the template describes)"
+        else
+            echo "  $label: NOT APPLICABLE (launchd cannot READ this unit's target — a macOS TCC root, #427; no install step changes this box's layout)"
         fi
+        return 0
     fi
     if [ ! -f "$installed" ]; then
         # ⛔ AND AN INSTALLABLE TEMPLATE THAT IS NOT THERE IS A FAILURE ROW WITH A FAILURE CODE
@@ -1865,7 +1901,23 @@ unmanaged_plists() {
     # one call away, on the two lists whose whole job is to KEEP a live job out of the `bootout && rm -f`
     # advice. A tree that ships templates but no readable RETIRED is mutilated, not clean; refuse to
     # classify rather than hand an operator a deletion command on the strength of a list it never read.
-    if [ -z "$(retired_manifest)" ] || { [ -z "$(foreign_manifest)" ] && [ -d "$INFRA_ROOT/templates/launchd" ]; }; then
+    # ⛔ AND AN EMPTY EXEMPTION LIST IS THE SAME NO-OP AS A MISSING ONE (#3826 review P2, round 17).
+    # The guard below tested a manifest's PATH only (`-r` / `-f`), so a manifest that EXISTS and is
+    # EMPTY — a truncated file, a mangled merge, a copy whose entries were lost — passed it;
+    # `is_retired` and `is_foreign` then answered "no" for EVERY label, and the loop handed an
+    # operator `launchctl bootout … && rm -f …` for a live job another installer of THIS repo owns.
+    # That is the identical sentence `cmux_gate_required` already refuses on the install path ("an
+    # EMPTY gate is the same no-op as a missing one"), one file over. MEASURED at `8aade2a1c` with
+    # `com.eldato.orchestrator-loop` installed and `OWNED-BY-OTHER-INSTALLERS` truncated to 0 bytes:
+    # `⛔ UNMANAGED com.eldato.orchestrator-loop` PLUS the bootout+rm remedy, rc 1; with the manifest's
+    # entries restored the same box printed 0 UNMANAGED rows. rc 3 = the declared set could not
+    # answer, which the caller reports as UNKNOWN — never as a deletion instruction.
+    # The third clause keeps the fixture carve-out: a TEMPLATES_DIR override that ships no manifest of
+    # its own falls back to the checkout's copy, and only a box with NO declarations anywhere (no
+    # manifest AND no repo template tree) is allowed an empty foreign list.
+    _rl="$(retired_labels || true)"
+    _fl="$(foreign_labels || true)"
+    if [ -z "$_rl" ] || { [ -z "$_fl" ] && { [ -n "$(foreign_manifest)" ] || [ -d "$INFRA_ROOT/templates/launchd" ]; }; }; then
         return 3
     fi
     for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
@@ -2099,7 +2151,10 @@ is_cmux_gated() {
     return 1
 }
 
-# plist_cmux_gated_target <plist> → prints the FIRST cmux-gated program argument; 0 when there is one.
+# plist_cmux_gated_target <plist> → prints the FIRST cmux-gated program argument; 0 when there is one,
+# 1 when the plist was READ and names none, 3 when it could NOT be read. The three answers are distinct
+# on purpose — collapsing "could not read" into "not gated" is exactly how a pipe handed to plistlib
+# certified a blind job `in sync` (#3826 review P1, round 17).
 #
 # ⛔ THE ONE PREDICATE `install` AND `--status` BOTH CONSULT (#3826 review P2). They used to disagree
 # about the same file by construction: `verify_targets` answers `1` for BOTH "a target is missing" and
@@ -2110,8 +2165,15 @@ is_cmux_gated() {
 # byte-identically, printed `in sync` and STATUS_RC=0, while `install-launchd.sh` refused the SAME file
 # loudly. A shared integer cannot carry "why"; asking the manifest again can.
 plist_cmux_gated_target() {
-    local args_out kind arg
-    args_out="$(plist_program_args "$1")" || return 1
+    local args_out kind arg _rc=0
+    # ⛔ "COULD NOT READ" MUST NOT ARRIVE AS "NOT GATED" (#3826 review P1, round 17). Both used to be
+    # `return 1`, so a reader that failed — an unreadable plist, a temp file it could not create, or
+    # (the measured regression) a PROCESS SUBSTITUTION, which plistlib cannot read because it needs a
+    # seekable stream — was indistinguishable from "read it, nothing gated", and `status_job` graded
+    # the CONTENT of a blind job and certified it `in sync` rc 0. 0 = gated (target printed), 1 = read
+    # and not gated, 3 = could not read — the same three codes `plist_reader_py` already uses.
+    args_out="$(plist_program_args "$1")" || _rc=$?
+    [ "$_rc" -eq 0 ] || return 3
     while IFS=$'\t' read -r kind arg; do
         [ -n "$arg" ] || continue
         if is_cmux_gated "$arg"; then
@@ -2250,9 +2312,15 @@ if [ "${1:-}" = "--status" ]; then
             fi
             continue
         fi
-        if ! status_job "$template"; then
-            [ "$status_rc" -eq 0 ] && status_rc=1
-        fi
+        # ⛔ THE HIGHER ANSWER WINS (#3826 review P1, round 17). `status_job` can now answer 2
+        # (UNKNOWN — a temp file it cannot create, a rendered plist it cannot read), and this arm
+        # collapsed every non-zero into 1, so the sentence above ("A 2 (UNKNOWN) is never downgraded
+        # to 1") described an intent the code did not implement. Fail-closed either way; the
+        # difference is whether the exit status says "this box is wrong" (1) or "nobody could
+        # look" (2). NOT `local` — this runs at script top level (round-16 P3).
+        _jrc=0
+        status_job "$template" || _jrc=$?
+        [ "$_jrc" -gt "$status_rc" ] && status_rc="$_jrc"
     done
     # ── DECLARED BUT NOT OWNED HERE: NAMED, NOT SILENT (#3826 review P2) ──────────────────────────
     # ⛔ TWO SETS, ONE NAME. `declared_labels` is a WALK (any depth), and `is_declared` uses it to

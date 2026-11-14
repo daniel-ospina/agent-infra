@@ -448,6 +448,17 @@ printf '[{"lane":"a","degraded":false},{"lane":"b","degraded":false}]\n' > "$R/a
 OUT="$(run "$R" -- check)"; RC=$?
 assert_eq "$RC" "0" "§13b a LIVE loop with a FRESH, non-degenerate read is OK (0)"
 assert_contains "$OUT" "0 degraded" "§13b …and the green line states the counts it read"
+# ⛔ THE VERDICT LINE'S SEPARATOR IS A SPACE ON EVERY PLATFORM (#3826 review P3). The reader emits
+# `<VERDICT>\t<detail>` and the tab was flattened with `sed 's/\t/ /'`, justified in the comment by
+# portability — while BSD/macOS `sed` does not interpret `\t` in a BRE (it matches a literal `t`), so
+# on the only platform this file exists for the substitute neither removed the tab nor left the rest of
+# the line alone. `tr '\t' ' '` is POSIX and both implementations agree about it. Discriminating shape:
+# the pre-fix code leaves the `\t` in the string, so this row reds on macOS and a naive `sed` fix would
+# red here too (it would rewrite every `t`).
+case "$OUT" in
+    *$'\t'*) bad "§13b …and its verdict line carries no TAB (a space separator on every platform)" ;;
+    *)        ok "§13b …and its verdict line carries no TAB (a space separator on every platform)" ;;
+esac
 
 # ⛔ A MALFORMED BOUND IS A CONFIGURATION ANSWER, NOT A DRIFT VERDICT (#1867 review P3).
 # `HEARTBEAT_CHECK_MAX_AGE=15m` reached `int(sys.argv[2])`, raised, and the TRACEBACK was printed as

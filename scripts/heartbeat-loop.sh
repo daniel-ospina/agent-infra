@@ -92,14 +92,24 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 # Nothing about it needs to be inside cmux interactively — it only has to have
 # been started there, once.
 #
-# LIFECYCLE
-#   start:  bash ~/.pi/agent/scripts/heartbeat-loop.sh        (idempotent)
-#   stop:   touch ~/.pi/agent/state/HEARTBEAT-OFF             (loop exits)
-#   pause:  touch ~/.pi/agent/state/HEARTBEAT-OFF            (exits at the top of the next pass)
-#   resume: rm -f ~/.pi/agent/state/HEARTBEAT-OFF && bash ~/.pi/agent/scripts/heartbeat-loop.sh
-#           (a start WITHOUT the rm prints "heartbeat loop started" and then exits on its own
-#            kill file in that same pass — the resume is the rm AND the start)
-#   status: cat ~/.pi/agent/state/heartbeat-loop.pid && kill -0 $(cat ...)
+# LIFECYCLE — the VERSIONED ENTRY POINT IS THE LAUNCHER, not this file (scripts/heartbeat-launch.sh):
+#   start:  bash scripts/heartbeat-launch.sh start             (idempotent; verifies the pid it reports)
+#   stop:   bash scripts/heartbeat-launch.sh stop              (writes ~/.pi/agent/state/HEARTBEAT-OFF)
+#   pause:  touch ~/.pi/agent/state/HEARTBEAT-OFF             (exits at the top of the next pass)
+#   resume: bash scripts/heartbeat-launch.sh start             (refuses while the kill file is present and
+#                                                              names the `rm -f` that clears it, so the
+#                                                              resume is one command and not a remembered
+#                                                              pair)
+#   status: bash scripts/heartbeat-launch.sh status            (pid + last pass + fleet-read mtimes)
+#   check:  bash scripts/heartbeat-launch.sh check             (0 OK · 1 DRIFT · 2 UNKNOWN — behaviour)
+# ⛔ THIS BLOCK USED TO DOCUMENT `bash ~/.pi/agent/scripts/heartbeat-loop.sh` AND NOTHING ELSE (#3826
+# review P3): that path is the FARMED copy, and this file is deliberately NOT farmed — `pi-bootstrap/
+# setup.sh` holds it back pending #1553 (`lane_root_srcs`) — so on a fresh farm the only documented
+# start command named a file that does not exist on the box. Two entry points is the divergence #1867
+# exists to remove; the path below still works and is a legacy fallback, not the documented one.
+#   legacy: bash scripts/heartbeat-loop.sh                     (self-detaches; proves liveness only — see
+#                                                              the detach block at the bottom for the
+#                                                              residual it declares)
 #
 # ⛔ REBOOT: the loop does not survive one, and it CANNOT be restarted by launchd
 # (that is the whole point above). Re-run the start command after a reboot, or set
@@ -355,9 +365,36 @@ if [ -z "${LOOP_DETACHED:-}" ]; then
     fi
   fi
   LOOP_DETACHED=1 nohup /bin/bash "$0" >/dev/null 2>&1 &
-  sleep 1
-  echo "heartbeat loop started (pid $(cat "$PIDFILE" 2>/dev/null || echo '?'))"
-  exit 0
+  # ⛔ THE LAUNCH IS PROVED BY THE ARTEFACT THE LOOP LEAVES, NEVER BY THIS SHELL'S EXIT CODE (#3826
+  # review P3, round 17). This arm slept one second, printed
+  # `heartbeat loop started (pid $(cat "$PIDFILE" 2>/dev/null || echo '?'))` and exited **0** — so on a
+  # first run, where `$STATE` does not exist yet, the child's own `echo $$ > "$PIDFILE"` failed
+  # silently, the pidfile was never written, and the operator was told `heartbeat loop started (pid ?)`
+  # with a green status: the launched-once heartbeat dead and reported as running. It is the same
+  # false PASS `heartbeat-launch.sh start` was written to remove, one file over. The poll below is
+  # bounded (5s) and fails LOUDLY instead.
+  # ⛔ DECLARED RESIDUAL: this proves LIVENESS, not IDENTITY. A stale pidfile naming a LIVE stranger
+  # would satisfy `kill -0` — which is why this path is no longer the documented entry point:
+  # `heartbeat-launch.sh start` answers that with `pid_is_loop` (a recycled pid is named as such and
+  # the stale record is removed before the fork). Not duplicated here; declared instead of implied.
+  _detach_waited=0
+  _detach_pid=""
+  while [ "$_detach_waited" -lt 10 ]; do
+      sleep 0.5
+      # `-f` BEFORE the redirect: a bare `< "$PIDFILE"` on a missing file makes bash print its own
+      # "No such file or directory" on stderr every iteration — a first run, which is exactly the
+      # case this poll exists for, would have sprayed the operator's terminal with 10 of them.
+      if [ -f "$PIDFILE" ]; then
+          _detach_pid="$(tr -dc '0-9' < "$PIDFILE" 2>/dev/null)" || true
+      fi
+      if [ -n "$_detach_pid" ] && kill -0 "$_detach_pid" 2>/dev/null; then
+          echo "heartbeat loop started (pid $_detach_pid)"
+          exit 0
+      fi
+      _detach_waited=$((_detach_waited + 1))
+  done
+  echo "REFUSING: the loop left no live pidfile at $PIDFILE after 5s — it is NOT running (see $LOG)" >&2
+  exit 1
 fi
 
 # launchd is not involved, but a detached process still inherits the environment it

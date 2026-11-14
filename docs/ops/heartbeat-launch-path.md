@@ -99,6 +99,16 @@ the exit column is not a flat `0`.
 An empty snapshot is **not** a healthy fleet: `degraded` is a *per-row* flag, so on zero rows
 `any(...)` is vacuously false — the same trap `lane-status.py`'s own publisher documents.
 
+⛔ **WHO RUNS `check`, AND WHEN — stated because nothing automated runs it today.** `check` is a
+**verb an operator or an agent types**, on macOS and on a cell alike; it is not called by
+`install-launchd.sh --status` (which grades the *plist* and the cmux gate, not the beat),
+`fleet-schedule.py --verify` (which consumes that verb's output), `activate-harness.sh`, CI, or any
+scheduled unit. **That is a declared gap, not a satisfied criterion**: #1867 asked for a behaviour
+the divergence instrument can check, and a probe nobody invokes leaves a blind-but-correct install
+passing every *automated* surface. `#4074` owns the wiring (and the disposition of `2 UNKNOWN` on a
+box that has never started the heartbeat — it must not become a permanent red). Until it lands, the
+honest statement is: **checked on demand, and the on-demand answer is the one the docs table names.**
+
 ## The install honesty gate
 
 `scripts/install-launchd.sh` **refuses, hard and non-zero,** any template whose `ProgramArguments`
@@ -122,6 +132,19 @@ by its own installer) are its **own** jobs, not strays. Counting only the flat t
 reference Mac. And `--status` exits **2 (UNKNOWN)** when `~/Library/LaunchAgents` exists but cannot
 be enumerated: "I could not look" is a different answer from "nothing to report", and it is never
 reported as clean.
+
+Two more `2 UNKNOWN` arms exist for the same reason — a unit this command cannot **grade** is never
+certified, and a list it could not **read** never becomes a deletion instruction:
+
+- **A temp file it cannot create** (an unwritable `TMPDIR`/`TMP`/`TEMP`) answers a row of its own and
+  rc **2**, because both the cmux launch-path gate and the TCC target check grade the *rendered
+  plist* and neither can run without one. It used to fall through to the content comparison, where a
+  byte-identical **blind** job read `installed=loaded … (in sync)` and exited **0**.
+- **An exemption manifest that exists but holds NO entry** (`RETIRED`,
+  `OWNED-BY-OTHER-INSTALLERS`) is read as a mutilated list, not as "nothing is exempt": rc **2**, and
+  no `bootout … && rm -f …` is printed for anything. An empty list would otherwise re-classify every
+  job another installer of this repo owns as `UNMANAGED` and hand the operator the command that
+  **deletes** it — the exact harm `OWNED-BY-OTHER-INSTALLERS` exists to prevent.
 
 Two label classes are **declared** and therefore never reported as `UNMANAGED`, because an alarm that
 is red on a healthy box is one operators learn to ignore:

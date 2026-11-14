@@ -654,8 +654,12 @@ cmd_check() {
         *) note "UNKNOWN: the snapshot reader did not run (rc=$prc)"; return 2 ;;
     esac
     # `cut --output-delimiter` is GNU-only and this file must run on macOS too, so the verdict
-    # column is turned into a space with sed instead of relying on a GNU long option.
-    note "$(printf '%s' "$report" | sed 's/\t/ /')"
+    # column is turned into a space with `tr` instead — and `tr`, not `sed 's/\t/ /'` (#3826 review
+    # P3). BSD/macOS `sed` does not interpret `\t` in a BRE: it treats the escape as its literal
+    # character, so on the one platform this file exists for the substitute is not portable either
+    # and would ALSO rewrite every `t` in the line. `tr` is POSIX, both seds agree about it, and the
+    # here-string form keeps it a single command unit with no pipe for the SIGPIPE guard to read.
+    note "$(tr '\t' ' ' <<<"$report")"
     [ "$prc" -gt "$rc" ] && rc="$prc"
     return "$rc"
 }
