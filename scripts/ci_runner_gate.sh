@@ -1132,11 +1132,23 @@ print(age)
   # ⛔ THE PAGE-CEILING NOTE BELONGS ON THIS SURFACE TOO, AND ITS GATE IS THE BOUND (agent-infra#3995
   # review, F2 — restored, with a presence arm, after the record asserted coverage that had been
   # deleted). `queued > QUEUE_PAGE` means the single read that produced these rows could not carry the
-  # whole queue, and `per_page` is capped at 100 with larger values SILENTLY REDUCED — so when the
-  # bound is already at the page, no bound can read past it: raising the knob is not a remedy, and an
-  # operator must be told that before concluding the refusal is a knob problem. The gate is the BOUND
-  # because below the page the ceiling is not yet what stopped the pass (the knob still has room) —
-  # the same distinction the TRUNCATED branch pins from the other side with its `scanned` gate.
+  # whole queue, and `per_page` is capped at 100 with larger values SILENTLY REDUCED — so no bound can
+  # read past it: raising the knob is not a remedy, and an operator must be told that before concluding
+  # the refusal is a knob problem.
+  # ⛔ THE GATE IS NOT WHAT MAKES THAT SENTENCE TRUE (cycle 9, P3 — the justification this line used to
+  # carry, "below the page the ceiling is not yet what stopped the pass (the knob still has room)", was
+  # FALSE HERE, and is corrected in place rather than deleted). This refusal's own condition
+  # (`queued > QUEUE_PAGE`, below) carries NO reference to the bound, so raising QUEUE_HEAD_SCAN_MAX
+  # cannot change it at ANY bound — the ceiling stops the pass at 25 exactly as it does at 100, and the
+  # suite measures the SAME refusal at both (`page-saturated` at the shipped bound,
+  # `page-saturated-at-page` at the ceiling). What the bound gate decides is therefore ADDRESS, not
+  # truth: the note names the ceiling only for an operator whose knob is VISIBLY maxed, i.e. who has
+  # already spent the obvious remedy. Below the page the identical advice is equally true and
+  # deliberately withheld, because there the brief legitimately says the knob IS a knob.
+  # ⛔ Do NOT read this as licence to relax the gate: the presence/absence pair is cycle-5 F2's restored
+  # two-sidedness and a recorded prescription on this PR, so changing the gate is a reopen, not a
+  # repair. (The TRUNCATED sibling's `scanned` gate is not an analogue: that one pins a fact about the
+  # LIST, this one a fact about the KNOB.)
   # ⛔ AND IT DOES NOT CLAIM HOW MANY ROWS THE CANDIDATE LIST HELD (agent-infra#3995 review cycle 8,
   # F1). `queued > QUEUE_PAGE` proves the PAGE REQUEST could not carry the queue; it says nothing about
   # the list the scan read, which on this branch may be as little as ONE ROW. Measured: the cycle-7 arm
