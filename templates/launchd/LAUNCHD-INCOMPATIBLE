@@ -47,6 +47,19 @@
 # contradicting docs/ops/heartbeat-launch-path.md and the launcher's own `--help` header (which were
 # corrected first — round 9 — and this manifest was missed).
 #
+# ⛔ DECLARED RESIDUAL — ONE KNOWN CMUX-GATED LAUNCHD TEMPLATE IS NOT IN THIS LIST (#3826 review P2).
+# `templates/launchd/com.eldato.objective-reminder.plist` names
+# `{{HOME}}/.pi/agent/scripts/objective-reminder.sh`, which is cmux-gated in exactly the way this file
+# exists to catch: its `resolve_backend` picks `cmux` whenever the binary is executable (its plist pins
+# `WS`/`SURFACE` but NOT `BACKEND`, while the systemd twin pins `Environment=BACKEND=tmux`), so on the
+# Mac this template ships to it takes the refused backend on every tick. It is NOT listed here on
+# purpose, and the reason is a product decision this file must not take on its own: adding the entry
+# makes the installer REFUSE `com.eldato.objective-reminder`, which changes whether an unrelated job of
+# this repo's own can be installed at all. That is argued on its own issue, like the socket change is.
+# The harm differs from the heartbeat's in kind: this job LOGS `FAIL: send refused by the cmux backend`
+# on each tick, so it fails visibly rather than reading as activity. Stated here so the omission is a
+# declared residual a reader can predict, not a silent gap in the gate.
+#
 # ── MATCHING RULE (stated so a reader can predict the refusal) ──────────────────────────────────
 # A ProgramArguments entry matches when its path ends with `/<entry>`. Repo-relative suffix, not
 # absolute prefix: the farmed deployment copy (`$HOME/.pi/agent/scripts/<name>`) and a worktree copy

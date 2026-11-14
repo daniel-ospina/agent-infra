@@ -3625,6 +3625,24 @@ def cmd_stop():
     return 1
 
 
+def _delegated_clause(delegated):
+    """The scope clause appended to a macOS verdict when a DELEGATED scope was disclosed.
+
+    ⛔ ONE DEFINITION, EVERY ARM (#3826 review P3). The clause was inlined on the fully-clean arm
+    only, so the CAVEATS arm never named the delegated scope and a reader could not tell that four
+    declarations had gone ungraded. It is EMPTY when nothing is delegated, so every pre-existing
+    sentence stays byte-identical on the boxes that were already correct — no consumer and no test
+    pinned to the plain wording has to move.
+    """
+    if not delegated:
+        return ""
+    return (
+        " (install-launchd.sh --status; %d template(s) are DELEGATED and named above — their own "
+        "installers render, load and grade them, so this verdict does not cover their content)"
+        % len(delegated)
+    )
+
+
 def darwin_delegate(argv):
     installer = os.path.join(INFRA_ROOT, "scripts", "install-launchd.sh")
     if not os.path.isfile(installer):
@@ -3702,6 +3720,14 @@ def cmd_darwin(mode):
         # `SCHEDULE VERIFIED — launchd job set matches templates/launchd`, a claim about content
         # agreement that nothing in this scan had checked.
         skipped = [line for line in text.splitlines() if "⚠️ INSTALLED-SKIPPED" in line]
+        # ⛔ THE DELEGATED DISCLOSURE IS COMPUTED HERE, NOT ONLY ON THE CLEAN ARM (#3826 review P3).
+        # It used to be derived after the caveats arm below, so the two disclosures were MUTUALLY
+        # EXCLUSIVE: whenever an INSTALLED-SKIPPED row existed — the ordinary state on a Mac with
+        # `SWARM_ROOT` unset, which this repo's own suite treats as legitimate — the caveats arm
+        # returned first and the verdict never mentioned that the four subdirectory templates had not
+        # been graded at all. That is the exact over-claim the delegated arm was added to remove, left
+        # standing one branch above it.
+        delegated = [line for line in text.splitlines() if ": DELEGATED —" in line]
         # ⛔ THE DELEGATE'S EXIT STATUS IS THE SECOND HALF OF THE GATE, not an implementation
         # detail: the substring scan catches only three wordings, so any OTHER failure of
         # install-launchd.sh --status (a missing template dir, an unset HOME, a syntax death)
@@ -3716,12 +3742,12 @@ def cmd_darwin(mode):
             for line in skipped:
                 print("  CAVEAT %s" % line.strip(), file=sys.stderr)
             print(
-                "SCHEDULE VERIFIED WITH CAVEATS — every job that is counted here is in sync with "
+                "SCHEDULE VERIFIED WITH CAVEATS — the jobs this verdict counts are in sync with "
                 "templates/launchd, but %d installed job(s) are SKIPPED by their template now "
                 "(the placeholder stopped resolving on this box): they are neither refreshed nor "
                 "removed, so the copies on disk are not what their templates describe. Restore the "
-                "environment and re-install to refresh them, or --uninstall to remove them."
-                % len(skipped),
+                "environment and re-install to refresh them, or --uninstall to remove them.%s"
+                % (len(skipped), _delegated_clause(delegated)),
                 file=sys.stderr,
             )
             return 0
@@ -3775,7 +3801,6 @@ def cmd_darwin(mode):
         # it is NOT a CAVEAT (a permanent amber on every Mac is the round-10 defect) — the sentence
         # names the scope instead, and the plain wording is preserved verbatim when nothing is
         # delegated so no consumer and no test has to move.
-        delegated = [line for line in text.splitlines() if ": DELEGATED —" in line]
         if delegated:
             print(
                 "SCHEDULE VERIFIED — launchd job set matches templates/launchd "

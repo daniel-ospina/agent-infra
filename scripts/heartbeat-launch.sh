@@ -676,11 +676,34 @@ require_state_root() {
     return 2
 }
 
+# ⛔ A RELATIVE ROOT IS A CONFIGURATION ANSWER, NOT A FLEET VERDICT (#3826 review P3).
+# `$PI_AGENT_DIR` is used verbatim as the base of `$STATE`, and `cmd_start` forks the loop from inside
+# `( cd "$SELF_DIR" && … )` — so a relative root re-bases itself against `scripts/` at the one moment
+# that matters: the log redirect cannot open, no pidfile is written, and the verb then reports
+# `DRIFT: the loop did not leave a live pidfile … after 5s`, which is the FLEET verdict for a stale
+# heartbeat. MEASURED pre-fix: `HEARTBEAT_PI_AGENT_DIR=agent heartbeat-launch.sh start` →
+#   `line 437: agent/state/heartbeat-launch.log: No such file or directory`
+#   `DRIFT: the loop did not leave a live pidfile at agent/state/heartbeat-loop.pid after 5s`
+# The operator's fleet is fine; their env is not. `scripts/fleet-schedule.py` already resolves its own
+# state root with `os.path.abspath` for exactly this reason (a relative spelling "would resolve against
+# the CALLER's cwd"), so refusing here matches the repo rather than inventing a rule — and rc 2 keeps
+# it in the same class as the missing-HOME answer, which is what this file's contract says UNKNOWN is.
+require_absolute_root() {
+    [ "$_home_unset" -eq 0 ] || return 0
+    case "$PI_AGENT_DIR" in
+        /*) return 0 ;;
+    esac
+    note "UNKNOWN — HEARTBEAT_PI_AGENT_DIR must be an ABSOLUTE path; got '$PI_AGENT_DIR'."
+    note "          A relative root re-bases against scripts/ when the loop is forked, so the log and"
+    note "          the pidfile would land somewhere else. This is NOT a fleet verdict (rc 2)."
+    return 2
+}
+
 case "${1:-}" in
-    start)  shift; require_state_root || exit $?; cmd_start "${1:-}" ;;
-    stop)   require_state_root || exit $?; cmd_stop ;;
-    status) require_state_root || exit $?; cmd_status ;;
-    check)  require_state_root || exit $?; cmd_check ;;
+    start)  shift; require_state_root || exit $?; require_absolute_root || exit $?; cmd_start "${1:-}" ;;
+    stop)   require_state_root || exit $?; require_absolute_root || exit $?; cmd_stop ;;
+    status) require_state_root || exit $?; require_absolute_root || exit $?; cmd_status ;;
+    check)  require_state_root || exit $?; require_absolute_root || exit $?; cmd_check ;;
     -h|--help|help) usage 0 ;;
     "")     usage ;;
     *)      printf 'ERROR: unknown argument: %s\n' "$1" >&2; usage ;;

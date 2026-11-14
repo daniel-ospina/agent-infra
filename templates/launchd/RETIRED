@@ -62,7 +62,7 @@ com.eldato.orchestrator-watchdog
 # ── THE BLIND HEARTBEAT (#1867) — RETIRED, and this entry IS the remediation ──────────────────────
 # `com.tortoise.heartbeat-loop` is the launchd job that ran scripts/heartbeat-loop.sh on the Mac. NO
 # template in this directory ever named it (`pi-bootstrap/tests/test-setup-no-nesting.sh` records the
-# same fact, and `scripts/lane-status.py:41` names the label in a comment about its empty
+# same fact, and `scripts/lane-status.py:42` names the label in a comment about its empty
 # environment), so it was installed by hand — which is exactly why the UNMANAGED instrument exists
 # and exactly why it could not be removed by any command in this repo: `--uninstall` iterates
 # TEMPLATES, and no template describes a hand-installed job.

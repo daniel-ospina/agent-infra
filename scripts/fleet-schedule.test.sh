@@ -1292,6 +1292,48 @@ grep -qF "$PLAIN_VERDICT" <<<"$out" \
   || bad "the control lost the plain verdict: $out"
 [ "$rc" -eq 0 ] && ok "control: ...and rc 0" || bad "the control returned $rc"
 
+# ⛔ AND THE TWO DISCLOSURES ARE NOT MUTUALLY EXCLUSIVE (#3826 review P3). The `delegated` list used
+# to be computed AFTER this caveats arm, so a box that had BOTH an INSTALLED-SKIPPED row (the ordinary
+# state when `SWARM_ROOT` is unset — the fixture above) and the four DELEGATED templates never heard
+# about the delegated scope at all: the caveats arm returned first. That is the over-claim the
+# delegated arm was added to remove, left standing one branch above it. The delegate below emits both
+# rows, which is what a real Mac actually does.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⚠️ INSTALLED-SKIPPED   com.eldato.corruption-canary: INSTALLED, but SKIPPED now (needs {{SWARM_ROOT}}, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)" >&2
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+echo "  com.eldato.disk-reaper: DELEGATED — declared here, installed and graded by another installer ($TEMPLATES/../launchd/reaper/com.eldato.disk-reaper.plist)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'SCHEDULE VERIFIED WITH CAVEATS' <<<"$out" \
+  && ok "caveats + DELEGATED: the caveats verdict still fires" \
+  || bad "the caveats verdict vanished when a DELEGATED row was present: $out"
+grep -q '1 template(s) are DELEGATED' <<<"$out" \
+  && ok "...and STILL names the delegated scope, so the two disclosures are not exclusive" \
+  || bad "the CAVEATS arm swallowed the DELEGATED disclosure — the verdict claims coverage over 4 ungraded templates: $out"
+grep -q 'does not cover their content' <<<"$out" \
+  && ok "...saying what it does not cover, not just that something is delegated" \
+  || bad "the delegated clause did not state its scope: $out"
+[ "$rc" -eq 0 ] && ok "...and the extra disclosure does not change the exit code" \
+  || bad "caveats + DELEGATED returned $rc, not 0"
+# CONTROL: with NO delegated row the caveats sentence must stay byte-identical to what it was, so the
+# clause above cannot be passing by having been folded into the sentence unconditionally.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⚠️ INSTALLED-SKIPPED   com.eldato.corruption-canary: INSTALLED, but SKIPPED now (needs {{SWARM_ROOT}}, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)" >&2
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'DELEGATED' <<<"$out" \
+  && bad "control: a delegate with no DELEGATED row still produced a delegated clause: $out" \
+  || ok "control: with nothing delegated the caveats sentence is unchanged (no empty clause)"
+
 # ⛔ AND A DELEGATED TEMPLATE IS NOT A MATCH EITHER (#3826 review P2). `install-launchd.sh --status`
 # grades a FLAT `templates/launchd/*.plist` set; this repo ships FOUR templates in SUBdirectories
 # (`reaper/`, `conflict-rebase/`, `harness-apply/`, `runner-autoscale/`), each graded by its own

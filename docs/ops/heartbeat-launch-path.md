@@ -46,7 +46,7 @@ activity**. That is the false PASS this change exists to make impossible.
 |---|---|---|
 | `heartbeat-launch.sh start` | start the detached loop, once | 0 started or already running · 1 refused |
 | `heartbeat-launch.sh start --dry-run` | print the exact command, run nothing | 0 printed · 1 refused |
-| `heartbeat-launch.sh stop` | write the loop's own kill file | 0 |
+| `heartbeat-launch.sh stop` | write the loop's own kill file | 0 written · 1 cannot write the kill file |
 | `heartbeat-launch.sh status` | running? how stale is the last pass and the last fleet read? | 0 |
 | `heartbeat-launch.sh check` | **behaviour probe** — see below | 0 OK · 1 DRIFT · 2 UNKNOWN |
 
@@ -58,7 +58,9 @@ what this doc's table means everywhere else.
 ⛔ **AND NEITHER IS THE LOOP — it has never been farmed either.** `heartbeat-loop.sh` is one of the
 two files `pi-bootstrap/setup.sh` **deliberately withholds**: it is absent from `fleet_srcs`, and the
 array meant to carry it (`lane_root_srcs`) is #1553 and **does not exist yet** (measured:
-`grep -c heartbeat` over `fleet_srcs` → 0; `rg 'lane_root_srcs='` → only the comment naming it). So
+`grep -c 'heartbeat-loop\.sh'` over `fleet_srcs` → 0 — the array DOES carry
+`orchestrator-heartbeat.sh`, a different script, so the weaker `grep -c heartbeat` reads 1 and is not
+the measurement to re-run; `rg 'lane_root_srcs='` → only the comment naming it). So
 the launcher's **farmed-copy preference is dormant**, the checkout sibling is the copy that actually
 runs today, and a box driven entirely from `$HOME/.pi/agent` has **neither** the loop nor the
 launcher and cannot launch anything. This paragraph used to assert the reverse — that the farm
@@ -126,12 +128,12 @@ so `$HOME/.pi/agent/scripts/heartbeat-loop.sh` (the farmed copy a plist would ac
 
 The declared set is resolved **recursively**: `templates/launchd/<subdir>/<label>.plist` is a
 template too, so the four jobs this repo ships one directory down (`conflict-rebase`,
-`harness-apply`, `disk-reaper`, `runner-autoscale` — each installed into `~/Library/LaunchAgents`
-by its own installer) are its **own** jobs, not strays. Counting only the flat templates made
-`--status` exit 1 and print the `bootout && rm -f` remedy for three owner-armed jobs on the
-reference Mac. And `--status` exits **2 (UNKNOWN)** when `~/Library/LaunchAgents` exists but cannot
-be enumerated: "I could not look" is a different answer from "nothing to report", and it is never
-reported as clean.
+`harness-apply`, `reaper`, `runner-autoscale` — each installed into `~/Library/LaunchAgents`
+by its own installer) are **declared here but graded elsewhere** (see the `DELEGATED` row class
+below). Counting only the flat templates made `--status` exit 1 and print the `bootout && rm -f`
+remedy for three owner-armed jobs on the reference Mac. And `--status` exits **2 (UNKNOWN)** when
+`~/Library/LaunchAgents` exists but cannot be enumerated: "I could not look" is a different answer
+from "nothing to report", and it is never reported as clean.
 
 Two more `2 UNKNOWN` arms exist for the same reason — a unit this command cannot **grade** is never
 certified, and a list it could not **read** never becomes a deletion instruction:
@@ -199,6 +201,16 @@ is red on a healthy box is one operators learn to ignore:
   must be a template, RETIRED, or listed here. The second direction is the one that does harm: a
   gate that only catches a *stale* entry cannot notice a **missing** one, and the missing one is
   the entry that turns a live job of this repo's own into a delete advice.
+
+⛔ **`DELEGATED` — declared here, graded by someone else.** The four subdirectory templates
+(`conflict-rebase/`, `harness-apply/`, `reaper/`, `runner-autoscale/`) are rendered, loaded and
+graded by their own `scripts/install-*-timer.sh`, which reads the same
+`templates/launchd/<subdir>/` file. `--status` therefore emits one `DELEGATED` row per such
+template and **does not grade their content** — the row is a disclosure, not a verdict, so it is not
+a failure marker and it does not move the exit code. This is the third row class, and leaving it out
+of this list was a real cost: readers concluded those four declarations were content-checked by the
+pass below, when both `install-launchd.sh` and `fleet-schedule.py --verify` say the opposite in
+their own sentences.
 
 A job **nobody** declares is still `UNMANAGED` — but the report is no longer a delete order. It names
 the four answers in order (add a template / declare it in `OWNED-BY-OTHER-INSTALLERS` / retire it /

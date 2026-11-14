@@ -2063,7 +2063,15 @@ retired_labels() {
 # env-overridden template dir — the test fixture — still finds it, and a farmed run still falls back to
 # the tree it came from.
 foreign_manifest() {
-    if [ -f "$TEMPLATES_DIR/OWNED-BY-OTHER-INSTALLERS" ]; then
+    # ⛔ `-r`, NOT `-f` (#3826 review P3). `retired_manifest` tests readability and this one tested only
+    # existence, so an EXISTING-but-UNREADABLE OWNED-BY-OTHER-INSTALLERS was treated as read: `is_foreign`
+    # greps a file it cannot open, matches nothing, and the four labels the manifest exists to exempt
+    # fall through to `⛔ UNMANAGED` — with the `launchctl bootout … && rm -f …` remedy printed beside
+    # them. MEASURED (copy of the manifest at mode 000, two exempt jobs installed): two `⛔ UNMANAGED`
+    # rows, each carrying its delete remedy, rc 1, and no refusal. An unreadable exemption list answers
+    # "nothing is exempt", which is the "mutilated, not clean" case the round-12 note above already
+    # states for RETIRED — it just was not applied to this sibling.
+    if [ -r "$TEMPLATES_DIR/OWNED-BY-OTHER-INSTALLERS" ]; then
         printf '%s\n' "$TEMPLATES_DIR/OWNED-BY-OTHER-INSTALLERS"
     elif [ -f "$INFRA_ROOT/templates/launchd/OWNED-BY-OTHER-INSTALLERS" ]; then
         printf '%s\n' "$INFRA_ROOT/templates/launchd/OWNED-BY-OTHER-INSTALLERS"
@@ -2115,7 +2123,12 @@ cmux_gated_scripts() {
 # run where NEITHER exists is refused outright by `cmux_gate_required` below rather than proceeding
 # ungated.
 cmux_manifest() {
-    if [ -f "$TEMPLATES_DIR/LAUNCHD-INCOMPATIBLE" ]; then
+    # `-r` for the same reason as `foreign_manifest` (#3826 review P3): `cmux_gate_required` catches a
+    # MISSING manifest, but a path test that only checks existence lets an UNREADABLE one through and
+    # the gate then evaluates an empty listing. The install refuses on that emptiness, so this is
+    # symmetry rather than a live hole — one predicate for all three manifests instead of two
+    # behaviours, which is the only way the next reader can predict it.
+    if [ -r "$TEMPLATES_DIR/LAUNCHD-INCOMPATIBLE" ]; then
         printf '%s\n' "$TEMPLATES_DIR/LAUNCHD-INCOMPATIBLE"
     elif [ -f "$INFRA_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE" ]; then
         printf '%s\n' "$INFRA_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE"

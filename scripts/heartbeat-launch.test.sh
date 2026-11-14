@@ -725,6 +725,31 @@ assert_contains "$OUT" "THE launch path for the fleet heartbeat" "§18 …and st
 OUT="$(env -i PATH=/usr/bin:/bin HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"; RC=$?
 assert_eq "$RC" "0" "§18 an explicit HEARTBEAT_PI_AGENT_DIR needs no HOME (the env seam is the documented escape)"
 
+# ── §19: A RELATIVE ROOT IS A CONFIGURATION ANSWER, NOT A FLEET VERDICT (#3826 review P3) ─────────
+# `start` forks the loop from inside `( cd "$SELF_DIR" && … )`, so a relative root re-bases against
+# `scripts/` at the one moment that matters: the log redirect cannot open, no pidfile is written, and
+# the verb used to report `DRIFT: the loop did not leave a live pidfile … after 5s`. That is the FLEET
+# verdict — "your heartbeat is stale" — for a typo in the operator's env, and it is the same
+# misattribution this file already fixes for a missing HOME.
+# MEASURED pre-fix: `HEARTBEAT_PI_AGENT_DIR=agent … start` →
+#   `line 437: agent/state/heartbeat-launch.log: No such file or directory`
+#   `DRIFT: the loop did not leave a live pidfile at agent/state/heartbeat-loop.pid after 5s`
+REL="$(mktemp -d)"; mkdir -p "$REL/agent"
+OUT="$( cd "$REL" && HEARTBEAT_PI_AGENT_DIR=agent bash "$LAUNCH" start 2>&1)"; RC=$?
+assert_eq "$RC" "2" "§19 a RELATIVE HEARTBEAT_PI_AGENT_DIR is UNKNOWN (2), not a fleet verdict"
+assert_contains "$OUT" "ABSOLUTE" "§19 …and says what the input must be, so the operator can fix it"
+assert_not_contains "$OUT" "DRIFT" "§19 …and never reports DRIFT, which would blame the fleet for an env typo"
+assert_not_contains "$OUT" "did not leave a live pidfile" "§19 …and never reports the launch-poll failure it cannot reach"
+for _v in status check; do
+    OUT="$( cd "$REL" && HEARTBEAT_PI_AGENT_DIR=agent bash "$LAUNCH" "$_v" 2>&1)"; RC=$?
+    assert_eq "$RC" "2" "§19 …$_v refuses the same input the same way (one rule, every verb)"
+done
+# FALSE-RED CONTROL: the ABSOLUTE spelling of the same tree must still be accepted, so the rows above
+# are about the SPELLING and not about a launcher that refuses everything under a temp dir.
+OUT="$( cd "$REL" && HEARTBEAT_PI_AGENT_DIR="$REL/agent" bash "$LAUNCH" status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "§19 control: the ABSOLUTE spelling of the same tree is accepted"
+rm -rf "$REL"
+
 echo ""
 REACHED_SUMMARY=1
 if [ "$FAIL" -eq 0 ]; then
