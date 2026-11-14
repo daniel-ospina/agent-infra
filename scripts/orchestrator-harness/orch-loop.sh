@@ -3269,7 +3269,7 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
   else                            printf '%s(%sh)' "$tok" "$(( age / 3600 ))"; fi
 }
 
-# queue_state_fresh -> 0 only when the last recorded pool READ was EMPTY and is STILL CURRENT.
+# queue_state_class -> empty | drained | partial | blind — the last pool READ, graded for CURRENCY.
 #
 # ⛔ WHY A SIBLING RATHER THAN A PREFIX MATCH (agent-infra#3909 review, 5th cycle P2).
 # `queue_state_token` returns `EMPTY(<age>)` ON PURPOSE, and this file states the reason exactly once:
@@ -3286,8 +3286,9 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # ⛔ AGE POLARITY IS THE RECORD READER'S POLARITY, NOT AN INNOVATION: an absent/unparseable `at` is
 # STALE (unverifiable is not fresh), and a FUTURE `at` is STALE too (a clock step-back must not buy a
 # reading a longer life) — the two rules `dispatch_funnel` records for its own record, applied to this
-# one. Only `EMPTY` qualifies: `READ(n)`/`PARTIAL(x)` describe a pool with work in it, and `UNREADABLE`
-# is not a reading at all.
+# one. Both the `empty` and the two attributed classes require a CURRENT reading: `READ(n)`/
+# `PARTIAL(x)` describe a pool that was READ, and `UNREADABLE` is not a reading at all — a STALE
+# `READ(n)` is just as much not-this-pass's-measurement as a stale `EMPTY`.
 #
 # ⛔ AND THE ZERO-BACKLOG CAUSE NEEDS ONE MORE STEP THAN "IS IT EMPTY" (agent-infra#3909 review, 5th
 # cycle P2). `READ(n)` is a SUCCESSFUL read and `PARTIAL(x)` a NAMED partial read: both are MEASUREMENTS,
@@ -3297,9 +3298,10 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # Publishing "unreadable" there denies a measurement the record holds, which is the same "the record could
 # not distinguish" class one field over — and it is a FOURTH state, not a second.
 #
-# ⛔ ONE PRIMITIVE, BOTH QUESTIONS. The class is derived from ONE read of the record, and
-# `queue_state_fresh` is a thin wrapper over it: a second reader would be a second definition of
-# "current", which is the drift this file's one-derivation rule forbids.
+# ⛔ ONE PRIMITIVE, ONE READ. The class is derived from ONE read of the record, and it is the only
+# question this loop actually asks — an earlier revision also shipped a `queue_state_fresh` wrapper for
+# the "may this be called EMPTY" phrasing, but nothing called it and nothing graded it, so it was dead
+# code advertising a second consumer that did not exist.
 queue_state_class() { # -> empty | drained | partial | blind (always prints exactly one)
   # ⛔ THE BOUND IS DEFAULTED HERE, NOT JUST IN THE CONFIG BLOCK (rig, first run). A helper that
   # refuses whenever its own limit is unreadable looks identical to "the record is stale" from every
@@ -3315,9 +3317,15 @@ queue_state_class() { # -> empty | drained | partial | blind (always prints exac
   is_num "${at:-}" || { printf 'blind'; return 0; }
   now="$(date +%s)" || { printf 'blind'; return 0; }
   is_num "${now:-}" || { printf 'blind'; return 0; }
-  [ "$(( 10#$at ))" -le "$(( 10#$now ))" ] || { printf 'blind'; return 0; }
-  age=$(( (now - (10#$at)) / 60 ))
-  [ "$age" -le "$bound" ] || { printf 'blind'; return 0; }
+  # ⛔ COMPARED AS DIGITS IN `[ ]`, NOT IN `$(( ))` (review P2, 6th cycle). A stamp at or above 2^63
+  # wraps NEGATIVE inside arithmetic, so it PASSES a "not in the future" test; the age then wraps
+  # negative too and clears the bound — one corrupt record would publish `empty_backlog` forever.
+  # Measured: `at=9223372036854775808` read FRESH under the arithmetic form. `[` ERRORS on an
+  # out-of-range operand and an errored test is FALSE, so `||` takes the blind arm: fail-closed. (No
+  # octal concern: `is_num` above already rejects a leading-zero spelling.)
+  [ "$at" -le "$now" ] 2>/dev/null || { printf 'blind'; return 0; }
+  age=$(( (now - at) / 60 ))
+  [ "$age" -le "$bound" ] 2>/dev/null || { printf 'blind'; return 0; }
   case "${tok:-}" in
     EMPTY)        printf 'empty' ;;
     READ\(*\))    printf 'drained' ;;
@@ -3326,7 +3334,6 @@ queue_state_class() { # -> empty | drained | partial | blind (always prints exac
   esac
   return 0
 }
-queue_state_fresh() { [ "$(queue_state_class)" = "empty" ]; }
 # ── THE DISPATCH FUNNEL (agent-infra#2040) ──────────────────────────────────────────────────────
 # `[dispatch] backlog empty queue=READ(223)` is a CONTRADICTION: 223 candidates were READ and zero
 # were dispatchable, and the line said "empty". Measured 2026-10-18 on all three cloud cells, for

@@ -248,7 +248,11 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   current age (`QUEUE_STATE_MAX_AGE_MIN`, default 60), because a frozen reading is not this pass's
   measurement — the refresh deliberately leaves the previous record standing when a pass aborts early, and
   its age is what keeps that honest. Past the bound, or with an absent/unparseable/future stamp, the cause
-  is `backlog_unreadable` (unverifiable is stale, never fresh);
+  is `backlog_unreadable` (unverifiable is stale, never fresh). ⛔ That "future" test is a **digit
+  comparison**, not arithmetic: an epoch at or above 2^63 wraps negative inside `$(( ))`, which would
+  pass a "not in the future" test and then a negative age below the bound — reading a corrupt stamp as
+  FRESH forever. `[` errors on an out-of-range operand and an errored test is false, so the guard
+  falls to `backlog_unreadable`; the safe direction.
   ⛔ **AND A DRAINED QUEUE IS NOT A BLIND ONE** (5th review cycle of #3909). The zero-backlog states
   that are *not* a measured `EMPTY` are **three** facts, not one absence, because `READ(n)` is a
   **successful** read and `PARTIAL(x)` a **named** partial read — both are measurements the record holds:
@@ -267,8 +271,15 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
 
 ⛔ **`slots=` and `escape=` are DIFFERENT measurements and must never be read as one**: `slots=` is the
 rung's grant, `escape=` is what the valve spent. ⛔ The four **measurement** fields — `slots=`,
-`slots_why=`, `escape=`, `can_spawn=` — are emitted as `${VAR-absent}`, never `${VAR:-absent}`, so a
-measured **`0` stays `0`** and cannot collapse into `absent`.
+`slots_why=`, `escape=`, `can_spawn=` — are emitted in the terse form `${VAR-absent}`.
+⛔ **WHAT THAT SPELLING DOES AND DOES NOT BUY** (corrected 2026-11-14, review P2 of #3909 — an earlier
+revision of this paragraph stated the reason wrongly). `${VAR-absent}` and `${VAR:-absent}` behave
+**identically** for a set `0`: the colon tests for unset-or-null, and `0` is neither, so *both* yield
+`0` (measured; GNU Bash §3.5.3 — *"Omitting the colon results in a test only for a parameter that is
+unset"*). The two differ only for a value that is set and **empty**: `-` keeps the empty string, `:-`
+replaces it with the word. The terse form is used so that a set-but-empty value stays visibly empty
+instead of masquerading as `absent`; it is **not** what protects a measured `0`, and an editor who
+switches the spelling will not thereby start losing zeros.
 ⛔ **`absent` is the emitter's FALLBACK, not a value production produces** (corrected 2026-11-14, review
 P2 of #3909). The only emitter of those four keys is reached *after* the cascade block assigned all of
 them, so `absent` never appears in a written record. The records that genuinely skip the block — the

@@ -76,7 +76,7 @@ for _f in is_num is_limit pr_in_set _wedge_min measure_ownership_sets measure_ci
           worker_log_name pr_owned \
           unowned_scan mp_reason cascade_issue_slots cascade_wait \
           cascade_level_name cascade_main_red cascade_level cascade_main_probe \
-          queue_state_token queue_state_class queue_state_fresh; do
+          queue_state_token queue_state_class; do
   _body="$(ex "$_f" "$ORCH")"
   if [ -z "$_body" ]; then echo "❌ could not extract $_f() from $ORCH — it moved or was reformatted"; exit 1; fi
   printf '%s\n' "$_body" >> "$FNS"
@@ -492,7 +492,17 @@ drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <o
     # ⛔ `<poolstate-age>` (14) BACKDATES the stamp, because the record's AGE is part of its contract
     # (#1931): a frozen `EMPTY` must not pass as this pass's measurement, and an arm that can only write
     # a fresh one cannot grade that rule at all.
-    [ -n "${13:-}" ] && printf '%s %s\n' "${13}" "$(( $(date +%s) - ${14:-0} ))" > "$w/state/queue-state"
+    # ⛔ TWO SENTINELS, because two states cannot be expressed as "N seconds ago": `noepoch` writes the
+    # state with NO stamp at all (ungradeable), and `wrap` writes 2^63 — which wraps NEGATIVE inside
+    # `$(( ))`, so an arithmetic future-test PASSES it and the age wraps negative too. Both are
+    # fail-OPEN reads of a record no writer produces but any corruption can, so both must be graded.
+    if [ -n "${13:-}" ]; then
+      case "${14:-0}" in
+        noepoch) printf '%s\n' "${13}" > "$w/state/queue-state" ;;
+        wrap)    printf '%s 9223372036854775808\n' "${13}" > "$w/state/queue-state" ;;
+        *)       printf '%s %s\n' "${13}" "$(( $(date +%s) - ${14:-0} ))" > "$w/state/queue-state" ;;
+      esac
+    fi
     . "$TMP/cascade-block.sh"
     if [ -n "${11:-}" ]; then
       printf '%s %s %s %s %s %s\n' "$CASCADE_ISSUE_SLOTS" "$CASCADE_PR_WAITING" "$CASCADE_WAIT" "${CASCADE_LEVEL:--}" \
@@ -630,6 +640,18 @@ ck "a READ pool with a zero backlog is DRAINED, not unreadable — the read SUCC
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 'READ(7)' | cut -d' ' -f5,6)" "0 backlog_drained"
 ck "…and a PARTIAL read with a zero backlog says so too — a named subset is still a measurement" \
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 'PARTIAL(P0-blocker)' | cut -d' ' -f5,6)" "0 backlog_partial"
+# ⛔ THE AGE GUARD APPLIES TO THE ATTRIBUTED CLASSES TOO (review P2, 6th cycle): a STALE `READ(n)` is
+# just as much not-this-pass's-measurement as a stale `EMPTY`, so it must not be called `drained`.
+ck "…but a STALE READ record is NOT drained — a reading nobody re-took is not this pass's measurement" \
+   "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 'READ(7)' 21600 | cut -d' ' -f5,6)" "0 backlog_unreadable"
+# ⛔ AND AN UNSTAMPED RECORD IS UNGRADEABLE, NOT FRESH (review P2, 6th cycle).
+ck "…and an EMPTY record with NO stamp at all is ungradeable, so never a measured empty" \
+   "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY noepoch | cut -d' ' -f5,6)" "0 backlog_unreadable"
+# ⛔ AND THE FUTURE-TEST MUST FAIL CLOSED ON A CORRUPT STAMP (review P2, 6th cycle). A stamp at or above
+# 2^63 wraps negative in arithmetic, passing a "not in the future" test and clearing the bound — so the
+# record would read FRESH forever and `empty_backlog` would be publishable permanently from one bad write.
+ck "a stamp at 2^63 (which wraps negative in arithmetic) fails CLOSED — never read as fresh" \
+   "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY wrap | cut -d' ' -f5,6)" "0 backlog_unreadable"
 ck "an UNREADABLE PR listing names the LISTING as the cause (the fail-closed arm, on the one state it decides)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
 ' - - 1 x 1 | cut -d' ' -f5,6)" "0 listing_unreadable"
@@ -1495,7 +1517,6 @@ ckin "…and a zero backlog is only called empty when the refresh MEASURED an em
 ckin "…measured RECENTLY, by the age-bounded sibling — an 'EMPTY*' prefix match would discard the age" "$SRC_CODE" '[ "$CASCADE_POOL_CLASS" = "empty" ] && CASCADE_POOL_EMPTY=1'
 ckin "…and a drained pool gets its OWN token, never the blind one" "$SRC_CODE" 'CASCADE_SLOTS_WHY="backlog_drained"'
 ckin "…as does a named partial read — a subset is still a measurement" "$SRC_CODE" 'CASCADE_SLOTS_WHY="backlog_partial"'
-ckin "…and only a genuinely blind pool falls to the unreadable token" "$SRC_CODE" 'CASCADE_SLOTS_WHY="backlog_unreadable"'
 ckin "…never on a pool nobody read — that state has its own token" "$SRC_CODE" 'CASCADE_SLOTS_WHY="backlog_unreadable"'
 
 printf '\n%s\n' "──────────────────────────────────────────────"
