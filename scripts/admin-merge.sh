@@ -5889,8 +5889,18 @@ wait_for_first_checks() {
         # assertion the PR exists to remove survives on the more frequently printed surface.
         if [ "$FIRST_CHECKS_SIGNAL_REASON" = cap ]; then
           info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress — MORE than the ${FIRST_CHECKS_JOBS_MAX} this wait observes, so PROGRESS was deliberately NOT read (${waited}s of the ${FIRST_CHECKS_WAIT}s fallback window) $wait_word That is a WIDTH cap, not an unreadability finding: no duration is quoted for an observation this wait declined to take."
-        else
+        elif [ "$FIRST_CHECKS_SIGNAL_REASON" = unreadable ]; then
           info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing_unreadable}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${streak_unreadable}s consecutively) $wait_word This wait does NOT call it a stall: an unread instrument is not a stalled run."
+        else
+          # ⛔ A THIRD ARM, MIRRORING THE REFUSAL (review round 9, P2). Without it an
+          # unrecognised producer fell into the `unreadable` text above, and since these
+          # counters advance ONLY under that reason it printed "the Jobs API unreadable for
+          # 0s in total, 0s consecutively" — asserting a read nothing recorded, the exact
+          # self-refutation round 8 removed from the cap arm. No producer reaches this today
+          # (every signal_ok=0 site writes `unreadable` or `cap` first); it is here so a
+          # producer ADDED LATER cannot inherit a claim by falling through, which is the same
+          # fail-closed shape the refusal's third arm already uses.
+          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable for a ground this wait did not record ('${FIRST_CHECKS_SIGNAL_REASON:-none}') — no Jobs read is claimed either way (${waited}s of the ${FIRST_CHECKS_WAIT}s fallback window) $wait_word"
         fi ;;
       *)
         if [ "$FIRST_CHECKS_TRANSITIONS" -eq 0 ]; then
@@ -6717,10 +6727,16 @@ lane_applicable() {
 #
 # WHAT THE CLASS DOES CHANGE is the policy on ONE probe answer, `unreadable`:
 #   * the STRUCTURAL class widens on it. No run of this lane can be STARTED by this
-#     PR, so the filtered wait is INERT — it can only ever clear on a run that cannot
-#     appear — and #2465's measured 3900 s burn was caused by exactly ONE failed
-#     `gh run list` (§0b runs the probe once), not by a probe that answered "has a
-#     run". Waiting longer cannot outlast a failed read.
+#     PR's changed set, and the probe could not tell whether a push (or a rerun of a
+#     cancelled run) has attached one to this head, so the filtered wait is no SIGNAL
+#     here rather than provably inert, and #2465's measured 3900 s burn was caused by
+#     exactly ONE failed `gh run list` (§0b runs the probe once), not by a probe that
+#     answered "has a run".
+#     ⛔ THE OLD WORDING CLAIMED "NO RUN CAN APPEAR" AND "waiting cannot outlast a failed
+#     read" (review round 9, P2). Both are wrong here, and the second refutes itself: the
+#     wait's bounds (FIRST_CHECKS_WAIT / CEILING / STALL) are not keyed to a read outcome,
+#     so a failed read neither shortens nor extends it — 3900 s of waiting IS the wait
+#     outlasting the failed read. State only what was measured.
 #   * every other class keeps the filter on it (fail closed): there a run CAN appear,
 #     so an unread answer is not an exemption.
 # The merge decision is NOT loosened either way: §4.5 grades the evaluated tree across
@@ -10154,8 +10170,7 @@ main() {
               # precisely what would have cleared it.
               say_err "   For this class this PR's own changed set cannot start it, and the probe could not"
               say_err "   tell whether a push to the branch (or a rerun of a cancelled run) has attached one to"
-              say_err "   head $head. So the filtered wait is no SIGNAL here rather than provably inert, and it"
-              say_err "   cannot outlast a failed read (#2465: one failed read cost 3900 s)."
+              say_err "   head $head. So the filtered wait is no SIGNAL here rather than provably inert."
             fi
           else
             say_err "   dead-end class: NOT-RUN — the lane declares a PR trigger this changed set does not match,"
