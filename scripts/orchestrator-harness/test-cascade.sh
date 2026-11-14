@@ -654,7 +654,7 @@ ck "…and a WIDENED knob is refused as the config block refuses it (a bound can
 # ⛔ AND A DRAINED QUEUE IS NOT A BLIND ONE (agent-infra#3909 review, 5th cycle P2). `READ(n)` is a
 # SUCCESSFUL read and `PARTIAL(x)` a NAMED one, so `queue=READ(7)` beside a zero backlog must not be
 # published as an "absence of attribution" — that was the #1931 conflation reborn backwards. The pair is
-# routine because the CONTROLLER prunes dispatched ids (`orch-loop.sh:8161-8170`) while the refresh only
+# routine because the CONTROLLER prunes dispatched ids (`orch-loop.sh:8164-8173`) while the refresh only
 # appends/dedupes/re-orders the queue and never drops a row (`refresh-candidates.sh:5776`,`:6247`,`:4371`).
 ck "a READ pool with a zero backlog is DRAINED, not unreadable — the read SUCCEEDED" \
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 'READ(7)' | cut -d' ' -f5,6)" "0 backlog_drained"

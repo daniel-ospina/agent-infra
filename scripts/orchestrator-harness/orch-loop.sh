@@ -9943,9 +9943,15 @@ PY
     # rest is why this is a field addition and not a scope change — and it is precisely what the OPEN OWNER DECISION
     # in docs/ops/self-healing-contract.md §6 does NOT cover: making the levels actionability-bounded is
     # still the owner's call, and `level=` merely makes the current behaviour visible instead of inferred.
-    # ⛔ `${VAR-absent}`, NEVER `${VAR:-absent}`: `slots=0` is a MEASUREMENT (the room was withheld) and
-    # must not be rewritten as an absence — the same polarity the batch's own `${CASCADE_ISSUE_SLOTS-1}`
-    # guards take. ⛔ AND `absent` IS A FALLBACK, NOT A STATE A READER WILL EVER SEE (agent-infra#3909
+    # ⛔ TERSE-MINUS, NOT `${VAR:-absent}` — AND THE REASON IS NOT THAT `:-` WOULD LOSE A ZERO (review P2,
+    # 12th cycle; the doc was corrected cycles ago and this comment was not). Measured: a set `0` yields
+    # `0` under BOTH spellings (`${X-absent}` and `${X:-absent}`), because a colon tests for
+    # unset-or-NULL and `0` is neither. They differ only for a value that is set and EMPTY: `-` keeps the
+    # empty string, `:-` replaces it with the word. So the terse form is used because it keeps a
+    # set-but-empty value visibly empty instead of masquerading as `absent` — it is NOT what protects a
+    # measured `0`, and an editor who switched the spelling would not thereby start losing zeros. (The
+    # earlier wording here said `slots=0` "must not be rewritten as an absence", which `:-` never did.)
+    # ⛔ AND `absent` IS A FALLBACK, NOT A STATE A READER WILL EVER SEE (agent-infra#3909
     # review, 5th cycle P2): this emit is reached only AFTER the cascade block assigned all four
     # variables, so `${VAR-absent}` never fires here — and the records that genuinely skip the block
     # (the fork-held and disk-held emissions above) pass NONE of these tokens, exactly as they pass no
