@@ -5778,6 +5778,177 @@ $VACUITY_BLOCK"
     assert_eq "$RECORD_RC" "0" "13n78 MUTATION PIN: with the refmask unscoped, 13n71's body is ADMITTED (rc 0) — the scoping is load-bearing"
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# 13n79-13n91 — THE THREE HOLES agent-infra#3902's SIXTH review MEASURED, AND THE PARITY GUARD THAT
+# STOPS THE SECOND ONE RECURRING. Every row below is a vector that was RE-RUN against the shipped arm
+# at 61b9e7ee0 and ADMITTED (or, for 13n85, FALSE-REFUSED) before the fix it now pins.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+# 13n79 — A TOTALITY CLAIM WITH AN EXCEPTION IS NOT A TOTALITY CLAIM (P1 fail-open, the exception
+# belt). `all blocking findings were fixed` escapes; carving an exception out of the SAME sentence
+# declares the live blocker this arm exists to refuse. Its SPELLED twin was already vetoed by
+# `_OC_SELLED`, which is the "closed for one spelling and open for the other" class #2661 names.
+rm -f "$(Q2 426001)"
+EV_REF="comment:42600101" run_record_ev 426001 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed except 1 in the retry path.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n79 'all … were fixed EXCEPT 1' declares a live blocker and is REFUSED (rc 3)"
+[ ! -f "$(Q2 426001)" ] && ok "13n79 no record minted over an exception carved out of a totality claim" || bad "13n79 minted a record over 'all … except 1' — the totality was believed with an exception in it"
+
+# 13n80-13n82 — THE PERSISTENCE TWIN'S OWN WORD LIST WAS SHORT (P1 fail-open). `_OC_PERSIST` is
+# `;`-SCOPED, so a remainder after the declaration's own `;` is its sibling's job — and the sibling was
+# missing six of the parent's words. All three of these ADMITTED at 61b9e7ee0 while their spelled twins
+# (`one was waived`, …) were vetoed, so the hole was one spelling wide.
+rm -f "$(Q2 426002)"
+EV_REF="comment:42600201" run_record_ev 426002 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 was waived.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n80 '; 1 was WAIVED' is a live remainder, not a resolution (rc 3)"
+[ ! -f "$(Q2 426002)" ] && ok "13n80 no record minted while one declared blocker was waived" || bad "13n80 minted a record over '1 was waived'"
+
+rm -f "$(Q2 426003)"
+EV_REF="comment:42600301" run_record_ev 426003 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 is a known risk.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n81 '; 1 is a KNOWN RISK' is a live remainder (rc 3)"
+[ ! -f "$(Q2 426003)" ] && ok "13n81 no record minted while one declared blocker is a known risk" || bad "13n81 minted a record over '1 is a known risk'"
+
+rm -f "$(Q2 426004)"
+EV_REF="comment:42600401" run_record_ev 426004 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 was carried to #1234.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n82 '; 1 was CARRIED TO #1234' is a live remainder (rc 3)"
+[ ! -f "$(Q2 426004)" ] && ok "13n82 no record minted while one declared blocker was carried to a follow-up issue" || bad "13n82 minted a record over '1 was carried to #1234'"
+
+# 13n83 — A COUNT HANDED ONWARD IS A REMAINDER (P1 fail-open, the hand-off predicate). `needs` is
+# neither a resolution verb nor a persistence word, and the declaration's own `blocking` noun had
+# already been masked, so `_OC_GOVERNS` had nothing to anchor on: the surviving count reached NO belt.
+rm -f "$(Q2 426005)"
+EV_REF="comment:42600501" run_record_ev 426005 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 needs a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n83 '; 1 needs a FOLLOW-UP' is a remainder, not a resolution (rc 3)"
+[ ! -f "$(Q2 426005)" ] && ok "13n83 no record minted while one declared blocker needs a follow-up" || bad "13n83 minted a record over '1 needs a follow-up'"
+
+# 13n84 — MUTATION PIN for the hand-off predicate. 13n83 could be red for another belt's reason, so the
+# predicate is removed from a copy and the same body must then be ADMITTED.
+N_HANDOFF_MUT="$T/mutant-handoff-removed.sh"
+sed 's#^  local _OC_HANDOFF=.*$#  local _OC_HANDOFF='"'"'@@NEVERMATCH@@'"'"'#' "$RECORD" > "$N_HANDOFF_MUT"
+if cmp -s "$RECORD" "$N_HANDOFF_MUT"; then
+    bad "13n84 MUTANT: the _OC_HANDOFF sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_HANDOFF_MUT" && ok "13n84 MUTANT: the hand-off-removed mutant still parses" || bad "13n84 MUTANT: the mutant does not parse"
+    NH_SAVE="$RECORD"
+    RECORD="$N_HANDOFF_MUT"
+    rm -f "$(Q2 426006)"
+    EV_REF="comment:42600601" run_record_ev 426006 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 needs a follow-up.**
+
+$VACUITY_BLOCK"
+    RECORD="$NH_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n84 MUTATION PIN: with the hand-off predicate removed, 13n83's body is ADMITTED (rc 0) — it is load-bearing"
+fi
+
+# 13n85 — THE FALSE REFUSAL THIS FIX MUST NOT CREATE (P2, the (b) token budget). An honest CLEAN
+# closure that also counts its NON-BLOCKING findings was REFUSED at 61b9e7ee0, while its near-twin
+# without the extra noun recorded: the second needs SEVEN intervening tokens against `_OC_TAIL`'s
+# `{0,6}`, so a P2/P3 count — findings that are not blockers at all — spent the escape's budget.
+rm -f "$(Q2 426007)"
+EV_REF="comment:42600701" run_record_ev 426007 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings and 3 non-blocking (P3) findings were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n85 an honest closure that ALSO counts its non-blocking findings RECORDS (rc 0)"
+R13N85="$(cat "$(Q2 426007)" 2>/dev/null || true)"
+assert_contains "$R13N85" '"verdict":"clean"' "13n85 …and the record it mints is a clean one"
+
+# 13n86 — MUTATION PIN for the (b) mask. 13n85 could be green because a WIDER tail bound admitted it, so
+# the non-blocking mask is removed from a copy and the same body must be REFUSED again.
+N_BLINE_MUT="$T/mutant-bline-unmasked.sh"
+sed 's#^      | sed -E "s/.*NONBLK .*")"#      | cat)#' "$RECORD" > "$N_BLINE_MUT"
+if cmp -s "$RECORD" "$N_BLINE_MUT"; then
+    bad "13n86 MUTANT: the _bline sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_BLINE_MUT" && ok "13n86 MUTANT: the unmasked-(b) mutant still parses" || bad "13n86 MUTANT: the mutant does not parse"
+    NB_SAVE="$RECORD"
+    RECORD="$N_BLINE_MUT"
+    rm -f "$(Q2 426008)"
+    EV_REF="comment:42600801" run_record_ev 426008 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings and 3 non-blocking (P3) findings were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+    RECORD="$NB_SAVE"
+    assert_eq "$RECORD_RC" "3" "13n86 MUTATION PIN: with the non-blocking mask removed, 13n85's honest closure is REFUSED (rc 3) — the mask is load-bearing"
+fi
+
+# 13n87 — THE PARITY GUARD, and it is the direct answer to HOW 13n80-13n82 happened. `_OC_PERSIST` is
+# `;`-scoped and `_OC_STILL` is its line-wide twin; the defect was not a missing insight but an OMISSION
+# between two lists maintained by hand, so the lists are now PARSED OUT OF THE SHIPPED SCRIPT and
+# compared. This reds the day someone adds a word to one and not the other, which no behavioural vector
+# would catch (a new word in `_OC_PERSIST` alone changes no existing row).
+PARENT_WORDS="$(command grep -E '^  local _OC_PERSIST=' "$RECORD" | command sed -E 's/.*\(([^()]*)\)[^()]*$/\1/' | tr '|' '\n' | sort -u)"
+TWIN_WORDS="$(command grep -E '^  local _OC_STILL=' "$RECORD" | command sed -E 's/.*\(([^()]*)\)[^()]*$/\1/' | tr '|' '\n' | sort -u)"
+if [ -z "$PARENT_WORDS" ] || [ -z "$TWIN_WORDS" ]; then
+    bad "13n87 PARITY: could not parse the two word lists out of the shipped script — re-anchor, do not drop"
+else
+    MISSING_WORDS="$(comm -23 <(printf '%s\n' "$PARENT_WORDS") <(printf '%s\n' "$TWIN_WORDS") \
+        | grep -vxE 'remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|still|some|most|several|half|rest')"
+    if [ -z "$MISSING_WORDS" ]; then
+        ok "13n87 PARITY: every non-collective word in _OC_PERSIST is also read by its line-wide twin _OC_STILL"
+    else
+        bad "13n87 PARITY: _OC_STILL is missing $(printf '%s' "$MISSING_WORDS" | tr '\n' ' ')— a remainder using it escapes after the declaration's own ';' (the 13n80-13n82 class)"
+    fi
+fi
+
+# 13n88 — MUTATION PIN for the exception predicate (13n79's own).
+N_EXCEPT_MUT="$T/mutant-except-removed.sh"
+sed 's#^  local _OC_EXCEPT=.*$#  local _OC_EXCEPT='"'"'@@NEVERMATCH@@'"'"'#' "$RECORD" > "$N_EXCEPT_MUT"
+if cmp -s "$RECORD" "$N_EXCEPT_MUT"; then
+    bad "13n88 MUTANT: the _OC_EXCEPT sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_EXCEPT_MUT" && ok "13n88 MUTANT: the exception-removed mutant still parses" || bad "13n88 MUTANT: the mutant does not parse"
+    NE_SAVE="$RECORD"
+    RECORD="$N_EXCEPT_MUT"
+    rm -f "$(Q2 426009)"
+    EV_REF="comment:42600901" run_record_ev 426009 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed except 1 in the retry path.**
+
+$VACUITY_BLOCK"
+    RECORD="$NE_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n88 MUTATION PIN: with the exception predicate removed, 13n79's body is ADMITTED (rc 0) — it is load-bearing"
+fi
+
+# 13n89 — MUTATION PIN for the twin's parity words (13n80's own): restore the SHORT list and the waived
+# remainder must ADMIT again. This is the row that would have caught the omission before a reviewer did.
+N_TWIN_MUT="$T/mutant-still-short.sh"
+sed 's@^  local _OC_STILL=.*$@  local _OC_STILL='"'"'[[:space:]]+([[][:space:]]*([[:alpha:]/._-]+[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending)'"'"'@' "$RECORD" > "$N_TWIN_MUT"
+if cmp -s "$RECORD" "$N_TWIN_MUT"; then
+    bad "13n89 MUTANT: the _OC_STILL sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_TWIN_MUT" && ok "13n89 MUTANT: the short-twin mutant still parses" || bad "13n89 MUTANT: the mutant does not parse"
+    NT_SAVE="$RECORD"
+    RECORD="$N_TWIN_MUT"
+    rm -f "$(Q2 426010)"
+    EV_REF="comment:42601001" run_record_ev 426010 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 was waived.**
+
+$VACUITY_BLOCK"
+    RECORD="$NT_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n89 MUTATION PIN: with the twin's list back to its short form, 13n80's body is ADMITTED (rc 0) — the parity is load-bearing"
+fi
+
+# 13n90-13n91 — THE OVER-BLOCK CONTROLS these predicates must NOT break. Both are honest CLEAN
+# closures the earlier rounds' widening was FOR, and each is one token away from a vector above: the
+# `#N` form is a reference, not a count, and `need a follow-up` with no count is docs work, not a
+# declared blocker. Without these, closing 13n79/13n83 by widening would be indistinguishable from
+# refusing every clean line that mentions a number.
+rm -f "$(Q2 426011)"
+EV_REF="comment:42601101" run_record_ev 426011 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed and re-verified, see #3902.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n90 a '#'-referenced issue is a REFERENCE, not a live count (rc 0)"
+
+rm -f "$(Q2 426012)"
+EV_REF="comment:42601201" run_record_ev 426012 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed; the docs need a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n91 a hand-off with NO count in it is not a declared blocking remainder (rc 0)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
@@ -6844,13 +7015,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4641 :6367 :8741 :8915, plus a comment mention at :4510; `14.1c-CITE` below
+#     CITE-CHECK: :4707 :6433 :8807 :8981, plus a comment mention at :4576; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4619) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4641) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4707) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8741). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8807). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -6876,7 +7047,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8741` / `:8915` — CITE-CHECK: :8741 :8915 — re-derived by the
+#     this head the predicates are `:8807` / `:8981` — CITE-CHECK: :8807 :8981 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -7785,7 +7956,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6367 :8741 :8915 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6433 :8807 :8981 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
