@@ -3369,7 +3369,14 @@ queue_state_class() { # -> empty | drained | partial | blind (always prints exac
   # tell the two apart. So an unset/unparseable bound falls back to the same 60 the config block
   # coerces to, which is the CONSERVATIVE direction: a bound cannot be widened by losing it.
   local tok="" at="" now age bound="${QUEUE_STATE_MAX_AGE_MIN:-60}"
-  is_num "$bound" || bound=60
+  # ⛔ `is_limit`, NOT `is_num` (review P3, 8th cycle): the config block coerces this knob with
+  # `is_limit` (`is_num` AND at most 9 digits at :293), so a bare `is_num` here makes this helper
+  # disagree with that block about the same knob. Measured: `QUEUE_STATE_MAX_AGE_MIN=1000000000` is
+  # REFUSED by the block (10 digits) and coerced to 60, while `is_num` accepts it — and the helper then
+  # called a six-hour-old `EMPTY` current, widening the bound with a value production refuses. Every rig
+  # reads this function WITHOUT the config block (test-cascade.sh extracts it into `fns.sh`), so the two
+  # answers were reachable, not merely theoretical.
+  is_limit "$bound" || bound=60
   [ "$bound" -ge 1 ] || bound=60
   { read -r tok at < "$O/state/queue-state"; } 2>/dev/null || true
   # ⛔ ABSENT / UNPARSEABLE / FUTURE `at` IS STALE — unverifiable is never fresh, and a clock step-back
@@ -8578,6 +8585,15 @@ PY
       partial) CASCADE_SLOTS_WHY="backlog_partial" ;;
       *)       CASCADE_SLOTS_WHY="backlog_unreadable" ;;
     esac
+  # ⛔ THIS `else` IS AN UNREACHABLE INVARIANT GUARD, NOT A VOCABULARY MEMBER (review P2, 8th cycle;
+  # verified by a 5,760-state sweep of the shipped block, in which every token fires except this one).
+  # `cascade_issue_slots` returns `min(max(room/2,1), bl)` once `can=1` and `room>0`, so with a readable
+  # listing and `bl>0` the grant is at least 1 and the `granted` arm wins; every way to reach `slots=0`
+  # is already named ABOVE this line (`capacity`, `level`, `no_room`, then the backlog arms). It is kept
+  # rather than deleted because deleting it would leave `CASCADE_SLOTS_WHY` EMPTY on a future path that
+  # breaks those invariants — an empty token in the artifact a lane is briefed from, which is worse than
+  # a name. ⛔ SO IF THIS EVER FIRES, AN INVARIANT BROKE — that is what the token means.
+  # docs/ops/self-healing-contract.md §3.1 says the same, so the vocabulary is not silently short.
   else CASCADE_SLOTS_WHY="unknown"; fi
   # [cascade:end]
   echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) list=${CASCADE_LIST:-?} level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_QUEUE_DEPTH:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"

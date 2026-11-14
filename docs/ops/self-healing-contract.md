@@ -221,7 +221,10 @@ the five-level cascade holds the room" from "capacity refused before any rung wa
 additive fields carry the cascade's own resolution. Four of them are pure *measurements* computed where
 their condition is decided and only *recorded* at the emit; the fifth (`level=`) is the rung's name:
 
-- `level=` — the rung the pass idled on (`FIX_MAIN` | `MERGE` | `FIX_PR` | `REVIEW_PR` | `ISSUES`). Two
+- `level=` — the rung the pass **resolved** (for an idle pass, the rung it idled on; when `slots=` is
+  non-zero, the rung that DISPATCHED — `level=ISSUES slots=2 slots_why=granted` is a working pass, not
+  an idle one, so `level=` must be read with `slots=`/`slots_why=` and never as an idle marker alone).
+  It is one of (`FIX_MAIN` | `MERGE` | `FIX_PR` | `REVIEW_PR` | `ISSUES`). Two
   non-rung tokens, and they mean different things: `UNMEASURED` = the level walk **ran** and classified
   nothing; `NOT-MEASURED` = the cascade block **ran** but left the rung unmeasured because `slots=0` made
   the level walk moot (a full box reports *why it has no room*, not its level). ⛔ The "cascade block
@@ -232,7 +235,12 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
 - `slots_why=` — why a zero is a zero, in the order the allocator decides: `granted` (a non-zero
   grant), `capacity` (the probe refused, so no rung resolved at all), `level` (a higher level holds the
   room), `no_room`, `empty_backlog`, `listing_unreadable`, then the three zero-backlog tokens
-  `backlog_drained`, `backlog_partial`, `backlog_unreadable`.
+  `backlog_drained`, `backlog_partial`, `backlog_unreadable`. A final `unknown` exists in the code as an
+  **unreachable invariant guard**, not a vocabulary member: `cascade_issue_slots` returns at least 1 once
+  `can=1`, `room>0` and a readable listing make a grant possible, so every way to reach `slots=0` is
+  already named above it (verified by a 5,760-state sweep in which every token fires except `unknown`).
+  It is kept rather than deleted so a broken invariant yields a NAME instead of an empty token —
+  ⛔ so if `slots_why=unknown` is ever observed, an invariant broke; a new cause has not appeared.
   ⛔ **`empty_backlog` REQUIRES A MEASURED EMPTY POOL** (#1931; added by the 4th review cycle of
   #3909). The backlog count is `wc -l < candidates.txt` coerced to `0` when that file cannot be read, so
   the **same zero** also arrives from a refresh whose pool listing failed — where an empty file is
@@ -254,8 +262,11 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   they fall to `backlog_unreadable` (unverifiable is stale, never fresh). ⛔ THAT DEMOTION APPLIES ONLY
   WHERE THE ARM IS REACHED: the class decides *within* the zero-backlog arms, it does not override the
   arms above them. A non-zero grant still reads `granted` (`CASCADE_RUNG_SLOTS > 0` is the first arm and
-  never consults the class; the class is not read at all when `backlog=10`), and an unreadable PR listing
-  still reads `listing_unreadable`, because that arm precedes the backlog ones. Whether the pool was
+  consults no class), and an unreadable PR listing still reads `listing_unreadable`, because that arm
+  precedes the backlog ones. ⛔ "DOES NOT DECIDE" IS NOT "IS NOT READ": `queue_state_class` is invoked
+  unconditionally just above the arm chain, so its file read and its own `date +%s` are spent on EVERY
+  pass, `backlog=10` included — it simply cannot change the token there. Two forks on the every-cycle
+  path, disclosed at the emit and absorbed by the fork budget (#2293). Whether the pool was
   read at all is one fact among several, not a verdict that overrides them. ⛔ That "future" test is a **digit
   comparison**, not arithmetic: an epoch at or above 2^63 wraps negative inside `$(( ))`, which would
   pass a "not in the future" test and then a negative age below the bound — reading a corrupt stamp as
