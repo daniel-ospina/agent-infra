@@ -435,6 +435,15 @@ LANDING_FLOOR="${LANDING_FLOOR:-25}"
 # too, and has since that age latch landed, agent-infra#2019); past that, an old pass's numbers beside
 # a newer `queue=` are a contradiction, not a measurement.
 FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
+# How old a `state/queue-state` record may be before it stops being a MEASUREMENT of the pool. It
+# answers one question — "did this box read the pool recently enough that `empty_backlog` may be
+# published" — and it exists because `queue_state_token`'s own contract (:1931) says the age is part of
+# the reading so a value frozen by a dead refresh cannot pass as current, while a consumer that reads
+# only the STATE PREFIX throws exactly that component away. One hour is four refresh intervals (CYC=240s)
+# and well inside the "refresh is dead" territory a controller should not need to diagnose from this
+# field; past it the cause is `backlog_unreadable`, because an unverifiable reading is not a
+# measurement (the same polarity `dispatch_funnel` takes for its own record).
+QUEUE_STATE_MAX_AGE_MIN="${QUEUE_STATE_MAX_AGE_MIN:-60}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
 # so a swap-only gate does not see it. See the gate chain below.
@@ -840,6 +849,7 @@ is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 # count), rather than on a bare `[ … -ge 1 ]` test a mutation could delete unseen.
 is_limit "${MERGE_PRIORITY_MAX_AGE_MIN:-}" || MERGE_PRIORITY_MAX_AGE_MIN=180; [ "${MERGE_PRIORITY_MAX_AGE_MIN:-0}" -ge 1 ] || MERGE_PRIORITY_MAX_AGE_MIN=180
 is_limit "${FUNNEL_MAX_AGE_MIN:-}" || FUNNEL_MAX_AGE_MIN=30; [ "${FUNNEL_MAX_AGE_MIN:-0}" -ge 1 ] || FUNNEL_MAX_AGE_MIN=30
+is_limit "${QUEUE_STATE_MAX_AGE_MIN:-}" || QUEUE_STATE_MAX_AGE_MIN=60; [ "${QUEUE_STATE_MAX_AGE_MIN:-0}" -ge 1 ] || QUEUE_STATE_MAX_AGE_MIN=60
 # The landing floor follows the same bounded-shape rule. An unreadable value falls back to the
 # owner's existing 25 (never to 0, which would disarm the gate silently, and never to empty, which
 # would make the `-ge` test error and read FALSE — an errored test OPENS a gate).
@@ -3257,6 +3267,45 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
   if   [ "$age" -lt 90 ];   then printf '%s(%ss)' "$tok" "$age"
   elif [ "$age" -lt 5400 ]; then printf '%s(%sm)' "$tok" "$(( age / 60 ))"
   else                            printf '%s(%sh)' "$tok" "$(( age / 3600 ))"; fi
+}
+
+# queue_state_fresh -> 0 only when the last recorded pool READ was EMPTY and is STILL CURRENT.
+#
+# ⛔ WHY A SIBLING RATHER THAN A PREFIX MATCH (agent-infra#3909 review, 5th cycle P2).
+# `queue_state_token` returns `EMPTY(<age>)` ON PURPOSE, and this file states the reason exactly once:
+# "The age of the reading is part of the token, so a value frozen by a dead refresh cannot pass as a
+# fresh one (this is a STATE RECORD, and a state record with no age is a stale flag waiting to be read
+# as current)". A consumer that matches `EMPTY*` therefore discards the very component that makes the
+# reading honest — and staleness is a DESIGNED state here, not an accident: `refresh-candidates.sh`
+# deliberately does NOT re-write the record when a pass aborts on its REST budget, leaving the previous
+# reading to stand BECAUSE its age travels with it. So on a box whose refresh died hours ago the last
+# read was `EMPTY`, `candidates.txt` stays empty, and every cycle would publish "the pool is empty"
+# from a reading nobody re-took — the same "a cause that is not this pass's measurement" defect that
+# field exists to end, one layer out.
+#
+# ⛔ AGE POLARITY IS THE RECORD READER'S POLARITY, NOT AN INNOVATION: an absent/unparseable `at` is
+# STALE (unverifiable is not fresh), and a FUTURE `at` is STALE too (a clock step-back must not buy a
+# reading a longer life) — the two rules `dispatch_funnel` records for its own record, applied to this
+# one. Only `EMPTY` qualifies: `READ(n)`/`PARTIAL(x)` describe a pool with work in it, and `UNREADABLE`
+# is not a reading at all.
+queue_state_fresh() { # -> 0 EMPTY and current · 1 otherwise (no output)
+  # ⛔ THE BOUND IS DEFAULTED HERE, NOT JUST IN THE CONFIG BLOCK (rig, first run). A helper that
+  # refuses whenever its own limit is unreadable looks identical to "the record is stale" from every
+  # call site — the arm would answer `backlog_unreadable` on a perfectly fresh record and no test could
+  # tell the two apart. So an unset/unparseable bound falls back to the same 60 the config block
+  # coerces to, which is the CONSERVATIVE direction: a bound cannot be widened by losing it.
+  local tok="" at="" now age bound="${QUEUE_STATE_MAX_AGE_MIN:-60}"
+  is_num "$bound" || bound=60
+  [ "$bound" -ge 1 ] || bound=60
+  { read -r tok at < "$O/state/queue-state"; } 2>/dev/null || true
+  [ "${tok:-}" = "EMPTY" ] || return 1
+  is_num "${at:-}" || return 1
+  now="$(date +%s)" || return 1
+  is_num "${now:-}" || return 1
+  [ "$(( 10#$at ))" -le "$(( 10#$now ))" ] || return 1
+  age=$(( (now - (10#$at)) / 60 ))
+  [ "$age" -le "$bound" ] || return 1
+  return 0
 }
 # ── THE DISPATCH FUNNEL (agent-infra#2040) ──────────────────────────────────────────────────────
 # `[dispatch] backlog empty queue=READ(223)` is a CONTRADICTION: 223 candidates were READ and zero
@@ -8409,8 +8458,14 @@ PY
   # state is `backlog_unreadable` — an ABSENCE of attribution, not a measurement — and an absence ranks
   # BELOW the listing's own measured unreadability (both can hold at once: the 2026-10-17 incident had
   # both listings refused for 131 consecutive passes). Order: measured-empty → measured-blind → blind.
+  # ⛔ AND "MEASURED" MEANS "MEASURED RECENTLY" (agent-infra#3909 review, 5th cycle P2), which is why the
+  # gate is `queue_state_fresh` and NOT an `EMPTY*` prefix match on the token: the token carries the age
+  # precisely so a frozen reading cannot pass as current, so a prefix match discards exactly the
+  # component that makes the reading honest — and staleness is a DESIGNED state here (the refresh leaves
+  # the previous record standing when a pass aborts early, justified by the age that travels with it).
+  # See that function's header for the polarity (absent / unparseable / future `at` = STALE).
   CASCADE_POOL_EMPTY=0
-  case "$(queue_state_token 2>/dev/null)" in EMPTY*) CASCADE_POOL_EMPTY=1 ;; esac
+  queue_state_fresh && CASCADE_POOL_EMPTY=1
   CASCADE_SLOTS_WHY=""
   if [ "${CASCADE_RUNG_SLOTS:-0}" -gt 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="granted"
   elif [ "${CASCADE_CAN:-1}" = "0" ]; then CASCADE_SLOTS_WHY="capacity"
@@ -9744,8 +9799,12 @@ PY
     # still the owner's call, and `level=` merely makes the current behaviour visible instead of inferred.
     # ⛔ `${VAR-absent}`, NEVER `${VAR:-absent}`: `slots=0` is a MEASUREMENT (the room was withheld) and
     # must not be rewritten as an absence — the same polarity the batch's own `${CASCADE_ISSUE_SLOTS-1}`
-    # guards take. `absent` is then reserved for "this emit ran on a path the cascade block never
-    # reached", which is a different fact from both `0` and `NOT-MEASURED`.
+    # guards take. ⛔ AND `absent` IS A FALLBACK, NOT A STATE A READER WILL EVER SEE (agent-infra#3909
+    # review, 5th cycle P2): this emit is reached only AFTER the cascade block assigned all four
+    # variables, so `${VAR-absent}` never fires here — and the records that genuinely skip the block
+    # (the fork-held and disk-held emissions above) pass NONE of these tokens, exactly as they pass no
+    # `level=`. Stating it the other way round named a signal that cannot occur and omitted the one that
+    # does, on the artifact a lane is briefed from.
     cycle_record_write "$O" \
       start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
       selected="$_cr_sel" selected_n="${SEL_TOTAL:-0}" dispatched="${K:-0}" ids="${_cr_ids:--}" \
