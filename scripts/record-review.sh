@@ -1165,16 +1165,26 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 #       * The persistence BELT is negation-guarded for the same reason: `No blocking findings remain
 #         open` is the most natural closure sentence there is, and the belt's `blocking … remain`
 #         shape read it as a remainder until the guard was added.
-#       ⛔ THE RESIDUAL, stated narrowly: an unlisted, NON-NEGATED persistence phrase with NO blocking
-#         mention of its own — `... were fixed except the socket leak`, `... the socket leak was left`
-#         — reaches no arm at all and ESCAPES, because once (b) has matched nothing is left to refuse
-#         it. That is the declared cost of reading a COUNT / a totality / an arithmetic remainder
-#         rather than enumerating persistence vocabulary, which is the mistake every earlier round
-#         made one word later. It is not a licence to add a synonym list.
+#       ⛔ THE RESIDUAL, stated narrowly — AND IT WAS UNDERSTATED UNTIL agent-infra#3902's review, which
+#         measured the difference between what this paragraph claimed and what the code did. It used to
+#         say the escapes were an **unlisted** persistence phrase. That was FALSE: `_OC_PERSIST` is
+#         `;`-SCOPED and `_OC_STILL`, its line-wide twin, was missing six of its words, so LISTED
+#         vocabulary (`1 was waived`, `1 is a known risk`, `1 was carried to #1234`) escaped too. The
+#         twin now carries the parent's whole non-collective set, and 13n87 asserts the parity so the two
+#         manually-maintained lists cannot drift again. The residual that ACTUALLY remains is:
+#           * a persistence phrase that carries NO COUNT AT ALL of its own, and is not in the belt's own
+#             vocabulary — `... were fixed except the socket leak`, `... the socket leak was left`,
+#             `... ; the outstanding item is with the vendor` (no count -> no belt can anchor on it);
+#           * and a remainder whose predicate is outside the closed grammatical classes this arm reads
+#             (a count, a totality, an arithmetic remainder, an exception of a totality, a hand-off).
+#         That is the declared cost of reading SHAPE rather than enumerating persistence vocabulary,
+#         which is the mistake every earlier round made one word later. Adding a SYNONYM stays forbidden;
+#         adding a closed grammatical PREDICATE (as `_OC_EXCEPT` and `_OC_HANDOFF` now are) is the
+#         sanctioned move, because a predicate is what makes the defect class closed instead of a list.
 # What the arm deliberately does NOT judge is whether a declared blocker WAS later fixed: it reads
 # only shape — a declared count, a totality, an arithmetic remainder — never substance.
 outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line names blocking findings
-  local decoded line live_count _clause _rest _live
+  local decoded line live_count _clause _rest _live _bline
   # A negated or in-progress resolution is not a resolution.
   local _OC_NOT_RESOLVED='(^|[^[:alpha:]])(none|nothing|neither|not|never)[[:space:]]+[^.;:]{0,30}(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)'
   local _OC_IN_PROGRESS='(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(being|partially|partly|pending|in[[:space:]]+progress)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)'
@@ -1272,9 +1282,49 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # or exception is scoped to the match it excepts) applied to its own exception.
   local _OC_REFMASK='s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]]+#?[0-9]+([[:space:]]+([[:alpha:]-]+[[:space:]]+){0,3}(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified))/\1REFCNT\3/g'
   local _OC_SEVREMAINDER="(^|[^[:alnum:]])${_OC_COUNT}[[:space:]]+${_OC_BSEV}"
-  local _OC_STILL="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending)"
+  # ⛔ THIS LIST MUST CARRY EVERY NON-COLLECTIVE WORD `_OC_PERSIST` CARRIES, AND IT DID NOT
+  # (agent-infra#3902 review, P1 — MEASURED fail-open, and a FALSE residual claim). `_OC_PERSIST` is
+  # `;`-SCOPED (`_clause` = `${line%%;*}`), so after the declaration's own `;` — the shape an agent
+  # actually writes — IT CANNOT REACH AT ALL; `_OC_STILL` is the line-wide twin that is supposed to
+  # cover that remainder, and it was missing six of the parent's words. MEASURED at 61b9e7ee0, every
+  # one of these ESCAPED and minted a signed `clean` while its SPELLED twin was vetoed by
+  # `_OC_SELLED` — the #2661 "closed for one spelling and open for the other" class, one belt over:
+  #   `2 blocking (P1) findings were fixed; 1 was waived.`                 -> ADMIT (…`one was waived.` VETO)
+  #   `2 blocking (P1) findings were fixed; 1 is a known risk.`           -> ADMIT
+  #   `2 blocking (P1) findings were fixed; 1 was carried to #1234.`      -> ADMIT
+  # `yet|known|carried|waived|left|partial` are therefore read HERE too, exactly as `_OC_PERSIST`
+  # reads them. The `13n87` parity cell parses both lists and reds if they drift again, because the
+  # defect was an OMISSION between two manually-maintained lists, not a missing insight.
+  local _OC_STILL="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|yet|known|carried|waived|left|partial)"
   local _OC_SELLED='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)([^[:alpha:]]|$)'
-  local _OC_SECOND_COUNT="${_OC_COUNT}(${_OC_GOVERNS}|${_OC_RESOLVES}|${_OC_STILL})|${_OC_SELLED}"
+  # ⛔ A TOTALITY CLAIM WITH AN EXCEPTION IS NOT A TOTALITY CLAIM (agent-infra#3902 review, P1 —
+  # MEASURED fail-open). Escape (b) accepts `all blocking findings were fixed`; the SAME sentence with
+  # an exception carved out of it (`… except 1 in the retry path`) declares exactly the live blocker
+  # this arm exists to refuse, and it was ADMITTED — while its SPELLED twin (`except one`) was vetoed
+  # by `_OC_SELLED`. MEASURED at 61b9e7ee0:
+  #   `Outcome: CLEAN — all blocking findings were fixed except 1 in the retry path.`   -> ADMIT
+  #   `Outcome: CLEAN — all blocking findings were fixed except one in the retry path.` -> VETO
+  # This is a grammatical CLOSED class (the English prepositions/conjunctions of exception), not an
+  # open vocabulary list — the same shape as `_OC_GOVERNS`/`_OC_RESOLVES`, and deliberately NOT a
+  # widening of the persistence belt. A COUNT is required in the exception slot, so the declared
+  # residual (`… except the socket leak`, no count) still behaves exactly as the header says.
+  local _OC_EXCEPT="(all|both|every)[^.;:]{0,80}(except|excluding|barring|other[[:space:]]+than|save[[:space:]]+for|apart[[:space:]]+from|minus)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|the[[:space:]]+)?${_OC_CNT}"
+  # ⛔ A COUNT HANDED ONWARD IS A REMAINDER, NOT A RESOLUTION (agent-infra#3902 review, P1 — MEASURED
+  # fail-open). The surviving count is the SUBJECT of a hand-off predicate — it needs a follow-up, its
+  # own issue, another PR — which says the finding was NOT closed. It reached no belt: `needs` is not a
+  # resolution verb, not a persistence word, and (the declaration having been masked) `_OC_GOVERNS` had
+  # no `blocking` noun left to anchor on. MEASURED at 61b9e7ee0:
+  #   `Outcome: 2 blocking (P1) findings were fixed; 1 needs a follow-up.`   -> ADMIT
+  #   `Outcome: 2 blocking (P1) findings were fixed; one needs a follow-up.` -> VETO
+  # Count-anchored, so an honest `… were fixed; the docs need a follow-up` (no count) is untouched.
+  # ⛔ IT CARRIES NO LEADING BOUNDARY OF ITS OWN, because it is CONCATENATED after `_OC_COUNT` inside
+  # `_OC_SECOND_COUNT` — the shape `_OC_GOVERNS`/`_OC_RESOLVES`/`_OC_STILL` already use. It first
+  # shipped with `(^|[^[:alnum:]])` in front, which is right for a STANDALONE alternative and dead
+  # code here: after the count has been consumed, that class ate the separating space and the required
+  # `[[:space:]]` then had to match the `n` of `needs`. MEASURED: the vector still ADMITTED. Caught by
+  # running the belt, not by reading it — which is why the vector is committed as 13n84.
+  local _OC_HANDOFF="[[:space:]][^.;:]{0,25}(needs?|requires?|awaits?)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|as[[:space:]]+an?[[:space:]]+|its[[:space:]]+own[[:space:]]+|into[[:space:]]+)?(follow[-[:space:]]?up|separate|another|its[[:space:]]+own|new[[:space:]]+(issue|pr|ticket))"
+  local _OC_SECOND_COUNT="${_OC_COUNT}(${_OC_GOVERNS}|${_OC_RESOLVES}|${_OC_STILL}|${_OC_HANDOFF})|${_OC_SELLED}|${_OC_EXCEPT}"
   # ⛔ ESCAPE (a) READS A NEGATOR WITH SCOPE, not only a negator glued to `blocking`
   # (agent-infra#3902 review, F4 — MEASURED over-block). Every form here required the negation to be
   # ADJACENT to the noun, so the most natural English closure shapes reached no escape and fell
@@ -1465,7 +1515,23 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
       return 0
     fi
     # (b) AFFIRMATIVE TOTAL RESOLUTION — the only shape that escapes.
-    if grep -qE "$_OC_TOTAL" <<<"$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"; then
+    # ⛔ THE NON-BLOCKING MENTIONS ARE MASKED BEFORE (b) READS, AND THE TOKEN BUDGET IS WHY
+    # (agent-infra#3902 review, P2 — MEASURED false refusal). `_OC_TAIL`'s `{0,6}` token run is the
+    # width that lets an honest closure name WHERE or WHICH cycle it fixed something; a NON-BLOCKING
+    # count in the same clause spends that budget on findings that are not blockers at all, and the
+    # arm then cannot distinguish the two bodies below — one records, its near-twin is refused:
+    #   `… 2 blocking (P1) and 3 non-blocking (P3) findings were fixed and re-verified.`      -> ADMIT
+    #   `… 2 blocking (P1) findings and 3 non-blocking (P3) findings were fixed and re-verified.` -> VETO
+    # MEASURED at 61b9e7ee0: the second needs SEVEN intervening tokens against `{0,6}`, so it fell
+    # through to the default-deny veto while the first matched at exactly six. Widening the bound
+    # would be one more width to be defeated by one more noun; masking the non-blocking mention is
+    # predicated on the match it excepts — a P2/P3 count is not a blocking remainder (`_OC_SEVREMAINDER`
+    # is P0|P1 for the same reason) — so the budget is spent only on tokens that matter. The two
+    # resolved/UNRESOLVED twins of the same shape now differ for the right reason: 13n13 (unresolved)
+    # is still vetoed by the arithmetic, 13n85 (resolved) records.
+    _bline="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' \
+      | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?non-block(ing|ers?)/\1 NONBLK /g; s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]]+\(?p[23]\)?/\1 NONBLK/g; s/\(p[23]\)/ NONBLK /g")"
+    if grep -qE "$_OC_TOTAL" <<<"$_bline"; then
       continue
     fi
     # Anything else that NAMES blocking findings declares the gate did not clear.
