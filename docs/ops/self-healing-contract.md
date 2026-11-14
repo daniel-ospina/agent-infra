@@ -243,7 +243,11 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   (both can hold at once — the 2026-10-17 incident had both listings refused for 131 consecutive
   passes). ⛔ The distinction is not cosmetic: `empty_backlog` is the diagnosis whose remedy is #3009
   requirement 2 (widen the pool), so publishing it for a blind refresh aims that remedy at a pool that
-  was never read;
+  was never read. ⛔ And "measured" means **measured recently**: the gate is the record's `EMPTY` **plus** a
+  current age (`QUEUE_STATE_MAX_AGE_MIN`, default 60), because a frozen reading is not this pass's
+  measurement — the refresh deliberately leaves the previous record standing when a pass aborts early, and
+  its age is what keeps that honest. Past the bound, or with an absent/unparseable/future stamp, the cause
+  is `backlog_unreadable` (unverifiable is stale, never fresh);
 - `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room, and a measured
   `0` on every pass the valve did not fire. ⛔ It is computed in the **drain-escape block**, not the
   cascade block — that separation is the whole point of it being its own token;
@@ -252,9 +256,14 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
 ⛔ **`slots=` and `escape=` are DIFFERENT measurements and must never be read as one**: `slots=` is the
 rung's grant, `escape=` is what the valve spent. ⛔ The four **measurement** fields — `slots=`,
 `slots_why=`, `escape=`, `can_spawn=` — are emitted as `${VAR-absent}`, never `${VAR:-absent}`, so a
-measured **`0` stays `0`** and cannot collapse into `absent`; for those four, `absent` means only "this
-emit ran on a path the cascade block never reached". `level=` is the exception and cannot be `absent`: it
-is a name token emitted as `${CASCADE_LEVEL_NAME:-NOT-MEASURED}`, whose fallback is `NOT-MEASURED`.
+measured **`0` stays `0`** and cannot collapse into `absent`.
+⛔ **`absent` is the emitter's FALLBACK, not a value production produces** (corrected 2026-11-14, review
+P2 of #3909). The only emitter of those four keys is reached *after* the cascade block assigned all of
+them, so `absent` never appears in a written record. The records that genuinely skip the block — the
+**fork-held** and **disk-held** emissions, written before it — carry **none** of the four tokens, exactly
+as they carry no `level=`; that is the signal a reader sees, and an earlier draft of this paragraph named
+the one they will never see instead. `level=` is the one token that cannot be `absent` because it is a
+name emitted as `${CASCADE_LEVEL_NAME:-NOT-MEASURED}`, whose fallback is `NOT-MEASURED`.
 
 ⛔ **`nothing=none` is the ALIVE marker, never the IDLE one** — the writer states the rule in its own
 comment: *"`nothing=none` is printed only when something WAS dispatched, so an idle cycle can never read
