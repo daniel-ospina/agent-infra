@@ -1342,7 +1342,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # PR fixed by PREDICATE rather than by width. The real scoping here is the clause boundary
   # (`[^.;:]`, which no connective can cross), so the bound is removed rather than raised. Polarity
   # decides the trade: a false PASS merges unreviewed code, a false refusal costs a reworded re-run.
-  local _OC_EXCEPT="(all|both|every)[^.;:]*(excepting|except[[:space:]]+for|except|excluding|barring|other[[:space:]]+than|save([[:space:]]+for)?|apart[[:space:]]+from|aside[[:space:]]+from|but[[:space:]]+for|with[[:space:]]+the[[:space:]]+exception[[:space:]]+of|minus)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|the[[:space:]]+)?${_OC_CNT}"
+  local _OC_EXCEPT="(all|both|every)[^.;:]*((excepting|except[[:space:]]+for|except|excluding|barring|(^|[^[:alpha:]])bar|other[[:space:]]+than|save([[:space:]]+for)?|apart[[:space:]]+from|aside[[:space:]]+from|but[[:space:]]+for|short[[:space:]]+of|with[[:space:]]+the[[:space:]]+exception[[:space:]]+of|minus)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|the[[:space:]]+)?${_OC_CNT}|${_OC_CNT}[[:space:]]+exception)"
   # ⛔ A COUNT HANDED ONWARD IS A REMAINDER, NOT A RESOLUTION (agent-infra#3902 review, P1 — MEASURED
   # fail-open). The surviving count is the SUBJECT of a hand-off predicate — it needs a follow-up, its
   # own issue, another PR — which says the finding was NOT closed. It reached no belt: `needs` is not a

@@ -6121,6 +6121,42 @@ EV_REF="comment:42611801" run_record_ev 426118 STUB_EVIDENCE_BODY="**Outcome: CL
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13n109 the token run does not fire without a count (rc 0)"
 
+# 13n110-13n112 — THE EXCEPTION CLASS WAS STILL A LIST, NOT A CLASS (P1 fail-opens, again found by
+# attacking this round's own fix). Three more members of the same grammatical closed class were
+# absent, and one of them was not a CONNECTIVE at all — `_OC_EXCEPT` could only see
+# `<connective> <count>`, so the equally natural `<count> exception(s)` was structurally invisible to
+# it. MEASURED on the arm as pushed in 92a6a2fe7: all three ADMITTED.
+#   `all blockers were fixed, short of 1.`            -> ADMIT   (connective absent)
+#   `all blocking findings were fixed, bar 1.`        -> ADMIT   (connective absent)
+#   `… were fixed, with 2 exceptions.`                -> ADMIT   (NOUN form, not connective+count)
+rm -f "$(Q2 426119)"
+EV_REF="comment:42611901" run_record_ev 426119 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blockers were fixed, short of 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n110 'all … fixed, SHORT OF 1' is a declared remainder (rc 3)"
+
+rm -f "$(Q2 426120)"
+EV_REF="comment:42612001" run_record_ev 426120 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, bar 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n111 'all … fixed, BAR 1' is a declared remainder (rc 3)"
+
+rm -f "$(Q2 426121)"
+EV_REF="comment:42612101" run_record_ev 426121 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, with 2 exceptions.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n112 the NOUN form '<count> exceptions' declares a remainder (rc 3)"
+
+# 13n113 — THE OVER-BLOCK CONTROL for the noun alternative 13n112 added, and the line-scoping guard
+# for the whole belt: a P2 count in a SEPARATE SENTENCE after a `.` is a different declaration, and
+# must not reach the arm (the tsv-framed body is ONE line to grep, so a predicate that crossed `.`
+# would refuse every honest closure that mentions a follow-up afterwards).
+rm -f "$(Q2 426122)"
+EV_REF="comment:42612201" run_record_ev 426122 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed. Separately, 1 P2 nit was filed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n113 a P2 count in a SEPARATE sentence does not reach the arm (rc 0)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
