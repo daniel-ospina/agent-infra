@@ -437,7 +437,7 @@ LANDING_FLOOR="${LANDING_FLOOR:-25}"
 FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 # How old a `state/queue-state` record may be before it stops being a MEASUREMENT of the pool. It
 # answers one question — "did this box read the pool recently enough that `empty_backlog` may be
-# published" — and it exists because `queue_state_token`'s own contract (:1931) says the age is part of
+# published" — and it exists because `queue_state_token`'s own contract (:3086) says the age is part of
 # the reading so a value frozen by a dead refresh cannot pass as current, while a consumer that reads
 # only the STATE PREFIX throws exactly that component away. The ratio to state is the REFRESH's, not a
 # guess (review P2, 7th cycle — an earlier revision said "four refresh intervals" and was off by 3.75x):
@@ -3304,7 +3304,7 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # ⛔ AND THE ZERO-BACKLOG CAUSE NEEDS ONE MORE STEP THAN "IS IT EMPTY" (agent-infra#3909 review, 5th
 # cycle P2). `READ(n)` is a SUCCESSFUL read and `PARTIAL(x)` a NAMED partial read: both are MEASUREMENTS,
 # so a zero backlog beside one must not be called blind. That pair is ROUTINE because the CONTROLLER
-# prunes dispatched ids out of `candidates.txt` (`orch-loop.sh:8147`), while the refresh only ever
+# prunes dispatched ids out of `candidates.txt` (`orch-loop.sh:8159-8167`), while the refresh only ever
 # APPENDS, DEDUPES or RE-ORDERS the queue and never drops a row
 # (`refresh-candidates.sh:5776`, `:6247`, `:4531`; the file states it: "ORDER, NEVER MEMBERSHIP … never
 # adds or drops a row", `:4371`). (⛔ An earlier revision credited the REAP to the refresh — it is not
@@ -8547,7 +8547,7 @@ PY
   # (agent-infra#3909 review, 4th cycle P1; the ruling is #1931). `CASCADE_QUEUE_DEPTH` is
   # `wc -l < candidates.txt` coerced to 0 when that file cannot be read, so a zero ALSO arrives from a
   # refresh whose POOL LISTING FAILED — and an empty file is byte-identical to a fleet with nothing to
-  # do. This loop already settled that conflation in its own vocabulary (`queue_state_token`, :1931):
+  # do. This loop already settled that conflation in its own vocabulary (`queue_state_token`, :3086):
   # EMPTY is "read and genuinely empty — the only answer that may mean 'no work'", UNREADABLE is "the
   # fleet is BLIND", UNKNOWN is "no pass ever recorded a read — never EMPTY". Publishing
   # `empty_backlog` for a pool nobody read would be that same defect reborn one field over, and it
@@ -8586,7 +8586,7 @@ PY
       *)       CASCADE_SLOTS_WHY="backlog_unreadable" ;;
     esac
   # ⛔ THIS `else` IS AN UNREACHABLE INVARIANT GUARD, NOT A VOCABULARY MEMBER (review P2, 8th cycle;
-  # verified by a 5,760-state sweep of the shipped block, in which every token fires except this one).
+  # a one-off 5,760-state sweep fires every other token — the suite pins the arms, not the sweep).
   # `cascade_issue_slots` returns `min(max(room/2,1), bl)` once `can=1` and `room>0`, so with a readable
   # listing and `bl>0` the grant is at least 1 and the `granted` arm wins; every way to reach `slots=0`
   # is already named ABOVE this line (`capacity`, `level`, `no_room`, then the backlog arms). It is kept

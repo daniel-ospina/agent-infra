@@ -241,7 +241,8 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   `backlog_drained`, `backlog_partial`, `backlog_unreadable`. A final `unknown` exists in the code as an
   **unreachable invariant guard**, not a vocabulary member: `cascade_issue_slots` returns at least 1 once
   `can=1`, `room>0` and a readable listing make a grant possible, so every way to reach `slots=0` is
-  already named above it (verified by a 5,760-state sweep in which every token fires except `unknown`).
+  already named above it (verified by a 5,760-state sweep in which every token fires except `unknown` —
+  a one-off measurement, not an artifact in this repo: `test-cascade.sh` pins the reachable arms, not the sweep).
   It is kept rather than deleted so a broken invariant yields a NAME instead of an empty token —
   ⛔ so if `slots_why=unknown` is ever observed, an invariant broke; a new cause has not appeared.
   ⛔ **`empty_backlog` REQUIRES A MEASURED EMPTY POOL** (#1931; added by the 4th review cycle of
@@ -269,8 +270,8 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   precedes the backlog ones. ⛔ "DOES NOT DECIDE" IS NOT "IS NOT READ": `queue_state_class` is invoked
   unconditionally just above the arm chain, so its file read is paid on EVERY pass, `backlog=10`
   included — it simply cannot change the token there. ⛔ AND THE CLOCK IS NOT PAID ON EVERY PASS: the
-  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (:3378 precedes
-  :3380), so the cost is one fork (the command substitution) on a record with no parseable stamp and
+  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (:3384 precedes
+  :3385), so the cost is one fork (the command substitution) on a record with no parseable stamp and
   TWO when the stamp is usable. Fork headroom is a dispatch gate here (#2293), so the count is stated
   rather than rounded up. Whether the pool was
   read at all is one fact among several, not a verdict that overrides them. ⛔ That "future" test is a **digit
@@ -294,11 +295,12 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   leaves a fresh record every cycle — the measured instance, `refresh-candidates.sh:778`, 2026-10-18:
   `candidates.txt: 0`, `checked.txt: 310`, pool `READ(203)`); and the plain mid-cycle window, because the
   refresh is spawned in the background, so the record can be a fresh `READ(n)` while the queue still
-  holds the previous, drained one. ⛔ **The age bound covers only the THIRD case.** It cannot rescue the
-  second: an abort that runs after the write but before the replace (the pre-flight `INCOMPLETE` abort,
+  holds the previous, drained one. ⛔ **The age bound tells NONE of these three apart from a spent
+  queue.** It cannot rescue the second: an abort that runs after the write but before the replace (the pre-flight `INCOMPLETE` abort,
   `refresh-candidates.sh:6206`, and the post-listing budget reserve check, `:6175-6177`) re-writes a FRESH
   stamp every cycle, so the bound never elapses. Nor the mid-cycle window, whose stamp is fresh by
-  construction. (The pre-listing budget gate, `:4075-4077`, is NOT one of the three: it exits before the
+  construction. On the first it fires only once the *producing* refresh is itself older than the bound —
+  and there it still does not name the queue spent, it demotes the reading to `blind`. (The pre-listing budget gate, `:4075-4077`, is NOT one of the three: it exits before the
   write and never re-writes `queue_state`, deliberately — `refresh-candidates.sh:4054-4059` — so that box
   ages out and the classifier does answer `blind`, which is the bound working. An earlier revision
   offered it as the limit and thereby contradicted itself.) Telling "spent" from "refused before
