@@ -283,6 +283,14 @@ PRD="$HERE/../pr-doctor.py"
 PRD_DEF="$(sed -n 's/^DEFAULT_SPAWN_BACKSTOP_S = \([0-9][0-9]*\).*/\1/p' "$PRD" | head -1)"
 [ -n "${PRD_DEF:-}" ] && [ "$PRD_DEF" = "$SEAM" ]; rc=$?
 ck "(i0) pr-doctor's backstop default (${PRD_DEF:-?}s) equals the harness seam (${SEAM:-?}s) — a python/branch literal pair that CANNOT drift" $rc
+# ⛔ THE REGISTRY'S OWN COPY, WHICH NOTHING PINNED (review finding, P2 — verified: `git grep DEFAULT_BUDGET_S`
+# found it only in `lane_registry.py`, and `test_lane_registry.py` never mentions it, so the group above
+# covered every copy of the seam EXCEPT this one while the lane report claimed the set was complete).
+# It is the default `--budget` of a MANUAL CLI invocation, so a drift here budgets a hand-run lane at a
+# stale clock — quieter than the launcher path, which passes the bound explicitly.
+REG_DEF="$(sed -n 's/^DEFAULT_BUDGET_S = \([0-9][0-9]*\).*/\1/p' "$HERE/lane_registry.py" | head -1)"
+[ -n "${REG_DEF:-}" ] && [ "$REG_DEF" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) lane_registry.py's DEFAULT_BUDGET_S (${REG_DEF:-?}s) equals the harness seam (${SEAM:-?}s) — its manual --budget default cannot drift below the lane it budgets" $rc
 REAP_LIVE="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/lane-reap.sh" | head -1)"
 [ -n "${REAP_LIVE:-}" ] && [ $(( REAP_LIVE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
 ck "(i0) the reaper's LIVE window (${REAP_LIVE:-?} min) stays above the BACKSTOP (${SEAM:-?}s) — a live lane is not counted dead for capacity" $rc
