@@ -4891,6 +4891,65 @@ function _foldBacktickSubstitutions(body) {
  * @param {string} body
  * @returns {boolean}
  */
+/** Does a COMMAND SUBSTITUTION's own text carry a delete spelling?
+ *
+ * ⛔ THE WHOLE-SEGMENT TEST IS TOO BROAD, AND IT WAS A MEASURED FALSE BLOCK (round-15 review, P1).
+ * The end-of-walk arm needs to know whether the delete spelling it cannot attribute came OUT OF the
+ * substituted text — because that is the only place an opaque placeholder can hide a flag. Asking the
+ * whole segment instead fires on ordinary push-option TEXT plus an unrelated substitution:
+ *
+ *   git push origin -o "x -d y" -o $(cat f) HEAD:feat
+ *     bash argv → [push][origin][-o][x -d y][-o][feat/from-file][HEAD:feat]   (NO delete)
+ *     origin/main → allow        this head, whole-segment test → REFUSE ("$(…)")   ← FALSE BLOCK
+ *
+ * (2,005 rows of one class in the review's sweep.) Scanning only `${ … }`/`$( … )`/backtick BODIES
+ * keeps every real case — `$(echo -d<LF>)`, `$(echo --delete<LF>)`, `` `echo -d` `` all carry the
+ * spelling INSIDE the span — while text outside a span stops counting.
+ * Quoting is tracked so a backtick inside `"…"` is not read as a span opener, and the mask control
+ * sentinels are normalised to spaces (a command-list newline is glued inside the word otherwise).
+ * @param {string} body
+ * @returns {boolean}
+ */
+function _spanCarriesDeleteSpelling(body) {
+  const s = String(body ?? "");
+  const hit = (inner) => inner.replace(/[\u0000-\u0008]/g, " ").split(/\s+/).filter(Boolean)
+    .some((w) => {
+      const bare = w.replace(/^["']+/, "").replace(/["']+$/, "");
+      return _isPushDeleteFlagToken(bare) || (bare.startsWith(":") && bare.length > 1);
+    });
+  let i = 0, quote = null;
+  while (i < s.length) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < s.length) { i += 2; continue; }
+      if (ch === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < s.length) { i += 2; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
+    let start = -1, closer = ")";
+    if (ch === "$" && s[i + 1] === "(") start = i + 2;
+    else if (ch === "`") { start = i + 1; closer = "`"; }
+    if (start >= 0) {
+      let end = -1;
+      if (closer === "`") end = s.indexOf("`", start);
+      else {
+        let depth = 1;
+        for (let j = start; j < s.length; j++) {
+          if (s[j] === "(") depth++;
+          else if (s[j] === ")" && --depth === 0) { end = j; break; }
+        }
+      }
+      if (hit(s.slice(start, end === -1 ? s.length : end))) return true;
+      i = end === -1 ? s.length : end + 1;
+      continue;
+    }
+    i++;
+  }
+  return false;
+}
+
 function _rawCarriesDeleteSpelling(body) {
   // ⛔ THE MASK SENTINELS ARE WORD BREAKS HERE (round-14 review). `_maskQuotedNewlines` replaces a
   // command-list newline with `_NL_SPAN` (\u0004) so the CAPTURE survives, which means the raw text
@@ -5543,7 +5602,7 @@ function _pushSegmentTokens(body) {
   // be in the same segment, which is the ambiguous shape this is meant to catch.
   if (!tokens.some((x) => _isPushDeleteFlagToken(x)) &&
       tokens.includes(_SUBST_PLACEHOLDER) &&
-      _rawCarriesDeleteSpelling(body)) {
+      _spanCarriesDeleteSpelling(body)) {
     // The marker must be REACHABLE, and `extractPushDeleteBranch` only reports targets AFTER a delete
     // flag — so the flag goes in with it. That is not an invention: the raw text carries a delete
     // spelling and the shell may well expand the span into that same flag (bash: `$(echo -d)` IS
