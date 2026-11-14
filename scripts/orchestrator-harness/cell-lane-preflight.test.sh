@@ -91,6 +91,21 @@
 #                                            which needs a configured `remote.origin.fetch`; without it
 #                                            the fetch exits 0 and leaves the stale ref, so the gate
 #                                            printed `behind=0` on a 3-behind checkout. Measured.
+# A26 the SUITE is hermetic against the     → the probe runs OUTSIDE the checkout the suite was
+#     checkout it was STARTED IN               STARTED IN. THE ARM THAT WAS RED IN CI: `resolve_repo`
+#                                            tries `$PWD` FIRST, so any arm invoking the probe without
+#                                            controlling its cwd measured the caller's checkout —
+#                                            `bash-suites (7)` failed with `A13 … why=stale-code …
+#                                            repo=agent-infra behind=2024`, and the suite `git fetch`-ed
+#                                            (and here `pull`-ed) a live worktree as a side effect.
+# A27 `behind == MAX_BEHIND` is READY      → the documented semantics are "refuse when MORE than", so
+#                                            the boundary itself must not refuse. `-gt` → `-ge` left the
+#                                            whole suite green, so nothing pinned it (review of
+#                                            92ec5cd67, P2-1).
+#
+# ⛔ EVERY PROBE INVOCATION IN THIS FILE CONTROLS ITS CWD. Read `from_neutral` before adding an arm:
+# an arm that runs the probe from the suite's own cwd measures whatever checkout the SUITE lives in
+# (see A26 and the incident it pins), and a suite whose greenness depends on the box is not evidence.
 #
 # ── MUTATION ────────────────────────────────────────────────────────────────────────────────────
 # Every count below is what THIS file printed, measured by running it. Two mutations, because two
@@ -115,6 +130,11 @@
 #      3-behind box). Measured on that fixture before the destination was made explicit.
 # (M5) drop `$PWD` from the default candidate list: A21 goes red (`repo=none`). Drop the cell paths:
 #      A22 goes red. Read `$HOME` bare again: A23 goes red on the MISSING FIELD, not on a wrong value.
+# (M6) drop the `cd "$NEUTRAL" &&` from `from_neutral` (an arm inherits the caller's cwd again — the
+#      CI red this file shipped once): A26 goes red, and with the stale fixture as the caller's cwd
+#      A13 goes red too (`expected exit 0, got 3 … why=stale-code … behind=60`).
+# (M7) `-gt` → `-ge` on the threshold comparison: A27 goes red (`behind == max_behind` refuses).
+#      Measured: pre-A27 that edit left the suite 85/0 green.
 # ⚠️ THE EARLIER HEADER ON THIS FILE NAMED A DIFFERENT MUTATION WITH COUNTS THAT BELONGED TO A THIRD
 # ONE (review of #2991, P2, reproduced by the reviewer). The old counts are deleted rather than
 # restated: a number that does not reproduce under the mutation it names is a claim about process
@@ -250,6 +270,21 @@ run_gate_cell() {
   local d="$1" bound="$2"; shift 2
   run_gate_in "$d" "$d" "$bound" "$@"
 }
+# ── THE CWD CONTROL FOR EVERY PROBE INVOCATION THAT IS NOT ONE OF THE THREE HELPERS ABOVE ────────
+# ⛔ A DIRECT `bash "$TARGET"` INHERITS THE CWD THE SUITE WAS STARTED IN, AND `resolve_repo` TRIES
+# `$PWD` FIRST — so such an arm measures the checkout the SUITE lives in. That is not cosmetic on
+# either side of it: `bash-suites (7)` went RED on a runner whose checkout was 2024 commits behind
+# (`FAIL A13 expected exit 0, got 3 … why=stale-code … repo=agent-infra behind=2024 max_behind=50`,
+# reproduced from a fixture clone 60 behind), and every such arm made the suite `git fetch` — and, via
+# the harness that keeps a checkout synced, `git pull` — a LIVE worktree as a side effect of running a
+# test. `$NEUTRAL` holds no `.git`, and it is deliberately NOT under any fixture that has one, so an
+# arm routed here takes the documented "no checkout to measure" path deterministically.
+# Arms that need the staleness read to be POSITIVE name a fixture through `CELL_PREFLIGHT_REPO`
+# (A13), which short-circuits the candidate list entirely — so no arm can reach a live path on a cell
+# either. `from_neutral <cmd…>` sets RC and OUT.
+NEUTRAL="$WORK/neutral"
+mkdir -p "$NEUTRAL"
+from_neutral() { OUT="$( cd "$NEUTRAL" && "$@" 2>&1 )"; RC=$?; }
 
 # ── A1: answer + return → ok ────────────────────────────────────────────────────────────────────
 make_stub "$WORK/a1" answer; make_keys "$WORK/a1"
@@ -286,15 +321,17 @@ assert_not_has "A4 is never reported ok" "LANE_CAPABILITY=ok" "$OUT"
 # ── A5: no key anywhere → CANNOT MEASURE ──────────────────────────────────────────────────────
 make_stub "$WORK/a5" answer
 mkdir -p "$WORK/a5/home"
-OUT="$(env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS PATH="$WORK/a5/bin:$PATH" \
-        HOME="$WORK/a5/home" bash "$TARGET" --bound 5 2>&1)"; RC=$?
+from_neutral env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS \
+  CELL_PREFLIGHT_REPO="$WORK/a5/no-checkout" \
+  PATH="$WORK/a5/bin:$PATH" HOME="$WORK/a5/home" bash "$TARGET" --bound 5
 [ "$RC" -eq 2 ] && ok "A5 exit 2 when nothing can be measured" || bad "A5 expected exit 2, got $RC: $OUT"
 assert_has "A5 names the unreadable keys" "why=keys-unreadable" "$OUT"
 
 # ── A6: pi absent → CANNOT MEASURE ────────────────────────────────────────────────────────────
 mkdir -p "$WORK/a6/bin"; make_keys "$WORK/a6"
-OUT="$(env -u DEEPSEEK_API_KEY -u CELL_HOME PATH="$WORK/a6/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-        HOME="$WORK/a6/home" bash "$TARGET" --keys "$WORK/a6/keys.env" --bound 5 2>&1)"; RC=$?
+from_neutral env -u DEEPSEEK_API_KEY -u CELL_HOME CELL_PREFLIGHT_REPO="$WORK/a6/no-checkout" \
+  PATH="$WORK/a6/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  HOME="$WORK/a6/home" bash "$TARGET" --keys "$WORK/a6/keys.env" --bound 5
 case "$RC" in
   2) ok "A6 exit 2 when pi is absent" ;;
   0) bad "A6 must not pass a box with no pi: $OUT" ;;
@@ -311,7 +348,7 @@ case "$OUT" in
 esac
 
 # ── A9: usage refusals are explicit, never a silent default ───────────────────────────────────
-OUT="$(bash "$TARGET" --bound zero 2>&1)"; RC=$?
+from_neutral bash "$TARGET" --bound zero
 [ "$RC" -eq 2 ] && ok "A9 a non-numeric --bound is refused" || bad "A9 expected exit 2, got $RC: $OUT"
 
 # ── A10: hangs BEFORE the answer → no-return (the permanent pre-answer failure) ────────────────
@@ -349,16 +386,25 @@ else
 fi
 
 # ── A13: the credential follows --provider, not a hardcoded deepseek variable ─────────────────
+# ⛔ THIS ARM IS THE ONE CI WENT RED ON, AND ONLY BECAUSE IT DID NOT CONTROL ITS CWD (see A26): the
+# probe answered, then read `$PWD` for the staleness field, and the runner's checkout was 2024 commits
+# behind — so a GREEN capability reading became a `why=stale-code` refusal. It names its OWN current
+# checkout now: the reading is still exercised (`behind=0` below), no live path is reachable, and the
+# verdict no longer depends on where the suite was launched.
 make_stub "$WORK/a13" answer; mkdir -p "$WORK/a13/home"
+mk_repo "$WORK/a13" 0 || bad "A13 fixture: could not build a git repo"
 echo 'export VENICE_API_KEY=sk-venice-stub' >"$WORK/a13/keys.env"; chmod 600 "$WORK/a13/keys.env"
-OUT="$(env -u DEEPSEEK_API_KEY -u VENICE_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS PATH="$WORK/a13/bin:$PATH" \
-        HOME="$WORK/a13/home" bash "$TARGET" --keys "$WORK/a13/keys.env" --provider venice \
-        --model deepseek-v4-flash --bound 10 2>&1)"; RC=$?
+from_neutral env -u DEEPSEEK_API_KEY -u VENICE_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS \
+  CELL_PREFLIGHT_REPO="$WORK/a13/repo" PATH="$WORK/a13/bin:$PATH" \
+  HOME="$WORK/a13/home" bash "$TARGET" --keys "$WORK/a13/keys.env" --provider venice \
+  --model deepseek-v4-flash --bound 10
 [ "$RC" -eq 0 ] && ok "A13 a venice lane on a box holding only VENICE_API_KEY is measurable" || bad "A13 expected exit 0, got $RC: $OUT"
 assert_has "A13 reports the provider it actually measured" "model=venice/" "$OUT"
+assert_has "A13 ...and a CAPABLE box is never refused on where the suite was launched" "LANE_CAPABILITY=ok" "$OUT"
+assert_not_has "A13 ...never the caller's checkout as a refusal" "why=stale-code" "$OUT"
 
 # ── A14: an empty model id is a MISCONFIGURATION, not an absent answer ─────────────────────────
-OUT="$(bash "$TARGET" --model "" --bound 5 2>&1)"; RC=$?
+from_neutral bash "$TARGET" --model "" --bound 5
 [ "$RC" -eq 2 ] && ok "A14 an empty --model exits 2" || bad "A14 expected exit 2, got $RC: $OUT"
 assert_has "A14 names the misconfiguration" "why=misconfigured" "$OUT"
 assert_not_has "A14 is never reported as a network arm" "why=no-answer" "$OUT"
@@ -369,19 +415,19 @@ assert_not_has "A14 is never reported as a network arm" "why=no-answer" "$OUT"
 # `probe rc=2 stdout=<>` and then `run_agent rc=0, agent launched`. Against this file's own EXIT
 # table ("2 CANNOT MEASURE — EVERY caller must refuse too"). A refusal that cannot be read is an
 # inert refusal, so the assertion is on the LINE, not on the exit code: the code was always 2.
-OUT="$(bash "$TARGET" --quiet --bound 45s 2>/dev/null)"; RC=$?
+from_neutral bash "$TARGET" --quiet --bound 45s
 [ "$RC" -eq 2 ] && ok "A15 a non-numeric --bound still exits 2 (CANNOT MEASURE)" || bad "A15 expected exit 2, got $RC: $OUT"
 assert_has "A15 ...but it now carries a READABLE verdict on stdout" "LANE_CAPABILITY=refused why=usage" "$OUT"
 assert_has "A15 ...with the reading that caused it, not a bare 'invalid'" "usage-error=--bound" "$OUT"
 assert_not_has "A15 ...and it is never confused with the transient arm" "why=no-answer" "$OUT"
 # The unknown-argument path is the one PRODUCTION hits: a consumer newer than this helper passes a flag
 # this copy predates. It must be readable for the same reason.
-OUT="$(bash "$TARGET" --quiet --line 2>/dev/null)"; RC=$?
+from_neutral bash "$TARGET" --quiet --line
 [ "$RC" -eq 2 ] && ok "A15 an unknown argument exits 2" || bad "A15 expected exit 2, got $RC: $OUT"
 assert_has "A15 ...and is readable as a refusal too (helper/consumer skew)" "why=usage" "$OUT"
 assert_has "A15 ...naming the argument it rejected" "usage-error=unknown argument: --line" "$OUT"
 # `-h` must NOT become a refusal: it is the one path that exits before measuring on purpose.
-OUT="$(bash "$TARGET" --help 2>/dev/null)"; RC=$?
+from_neutral bash "$TARGET" --help
 [ "$RC" -eq 0 ] && ok "A15 --help still exits 0 and is not a refusal" || bad "A15 --help exited $RC"
 assert_not_has "A15 ...emitting no verdict at all" "LANE_CAPABILITY" "$OUT"
 
@@ -440,7 +486,7 @@ assert_has "A19 says the reading is unknown" "behind=unknown" "$OUT"
 
 # A20 — a non-numeric threshold is a MISCONFIGURATION, not a silent `ok`. `[ "$n" -gt "abc" ]` returns
 # FALSE, so an unvalidated bound is an inert enforcer: the staleness refusal could never fire again.
-OUT="$(CELL_PREFLIGHT_MAX_BEHIND=lots bash "$TARGET" --quiet --bound 5 2>&1)"; RC=$?
+from_neutral env CELL_PREFLIGHT_MAX_BEHIND=lots bash "$TARGET" --quiet --bound 5
 [ "$RC" -eq 2 ] && ok "A20 a non-numeric CELL_PREFLIGHT_MAX_BEHIND exits 2" || bad "A20 expected exit 2, got $RC: $OUT"
 assert_has "A20 ...naming the variable it rejected" "CELL_PREFLIGHT_MAX_BEHIND" "$OUT"
 assert_not_has "A20 ...instead of reading ok on an unappliable bound" "LANE_CAPABILITY=ok" "$OUT"
@@ -539,6 +585,45 @@ run_gate_cell "$WORK/a25" 20 CELL_PREFLIGHT_REPO="$WORK/a25/repo" CELL_PREFLIGHT
                 || bad "A25 expected exit 3, got $RC: $OUT"
 assert_has "A25 ...the explicit destination refreshed origin/main, so the distance is real" "behind=3" "$OUT"
 assert_not_has "A25 ...never publishes the stale ref's 0 as a measurement" "behind=0" "$OUT"
+
+# ── A26–A27: THE TWO PROPERTIES THE SUITE ITSELF LACKED ─────────────────────────────────────────
+
+# A26 — THE SUITE MUST NOT MEASURE THE CHECKOUT IT WAS STARTED IN. This is the CI red, made
+# executable: a fixture clone 60 commits behind (> the 50 default), the SUITE's cwd moved into it, and
+# a capability probe that reaches the staleness read with NOTHING named. Pre-fix this arm inherits that
+# cwd and reads `repo=repo behind=60` → refused; post-fix the probe runs from `$NEUTRAL` and answers
+# `ok`. ⛔ `git` IS SHIMMED TO ALWAYS FAIL so the arm cannot fetch anything on ANY host, including a
+# cell whose live `/tmp/cell-ai` the default candidate list would otherwise reach — the resolved
+# checkout is still visible as `repo=<name>` on the line, which is what this arm asserts on, so the
+# shim costs the assertion nothing and buys hermeticity everywhere.
+mk_repo "$WORK/a26" 60 || bad "A26 fixture: could not build a git repo"
+mkdir -p "$WORK/a26/shim" "$WORK/a26/home"
+printf '#!/bin/sh\nexit 1\n' >"$WORK/a26/shim/git"; chmod +x "$WORK/a26/shim/git"
+make_stub "$WORK/a26" answer; make_keys "$WORK/a26"
+a26_here="$PWD"
+cd "$WORK/a26/repo" || bad "A26 fixture: could not enter the stale checkout"
+from_neutral env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS \
+  -u CELL_PREFLIGHT_REPO -u CELL_PREFLIGHT_MAX_BEHIND -u CELL_PREFLIGHT_FETCH_BOUND \
+  PATH="$WORK/a26/bin:$WORK/a26/shim:$PATH" HOME="$WORK/a26/home" \
+  bash "$TARGET" --keys "$WORK/a26/keys.env" --quiet --bound 20
+a26_rc="$RC"; a26_out="$OUT"
+cd "$a26_here" || bad "A26 could not restore the suite's cwd"
+[ "$a26_rc" -eq 0 ] && ok "A26 a >MAX_BEHIND caller cwd does not refuse a capability arm (exit 0)" \
+                 || bad "A26 expected exit 0 with the suite started inside a stale checkout, got $a26_rc: $a26_out"
+assert_not_has "A26 ...because the probe did NOT measure the checkout the SUITE was started in" "repo=repo" "$a26_out"
+assert_not_has "A26 ...so the suite can never red on the box (or worktree) it runs on" "why=stale-code" "$a26_out"
+
+# A27 — THE BOUNDARY. The documented semantics are "refuse when MORE than CELL_PREFLIGHT_MAX_BEHIND",
+# so `behind == MAX_BEHIND` is READY. A17 pins a refusal with slack and A17b an acceptance with slack;
+# neither covers the boundary, and `-gt` → `-ge` left the suite green (review of 92ec5cd67, P2-1) — so
+# an edit to that one comparison could change the verdict at the exact point the knob is set to.
+mk_repo "$WORK/a27" 3 || bad "A27 fixture: could not build a git repo"
+make_stub "$WORK/a27" answer; make_keys "$WORK/a27"
+run_gate_cell "$WORK/a27" 20 CELL_PREFLIGHT_REPO="$WORK/a27/repo" CELL_PREFLIGHT_MAX_BEHIND=3
+[ "$RC" -eq 0 ] && ok "A27 behind == MAX_BEHIND is READY (the bound is 'more than', not 'at least')" \
+                || bad "A27 expected exit 0 at behind=3 max_behind=3, got $RC: $OUT"
+assert_has "A27 ...and reports the boundary it accepted" "behind=3" "$OUT"
+assert_not_has "A27 ...and never refuses at the boundary itself" "why=stale-code" "$OUT"
 
 printf '\ncell-lane-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
