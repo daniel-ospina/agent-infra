@@ -503,11 +503,23 @@ ck "(C) CONTROL: a READABLE still-pending surface still says 'NOTHING was unread
    "$(grep -q 'NOTHING was unreadable' <<<"$C_READ" && echo 0 || echo 1)"
 ck "(C) CONTROL: …and does NOT claim the Jobs read failed" \
    "$(grep -q 'the Jobs read FAILED' <<<"$C_READ" && echo 1 || echo 0)"
-C_RECOVER="$(bofc still-running '' 3 0 still-running)"
+C_RECOVER="$(bofc still-running '' 3 0 still-running 3 0)"
 ck "(C) a RECOVERED surface (readable NOW, but N seconds of this wait were blind) does NOT claim 'NOTHING was unreadable' (round 5 P2)" \
    "$(grep -q 'NOTHING was unreadable' <<<"$C_RECOVER" && echo 1 || echo 0)"
 ck "(C) …and it states the 3s it spent unreadable instead of denying it" \
    "$(grep -q '3s of this wait went by with it UNREADABLE' <<<"$C_RECOVER" && echo 0 || echo 1)"
+# ⛔ AND A RECOVERED SURFACE THAT WAS **NEVER** UNREADABLE MUST SAY SO (review round 7,
+# P2). `missing` also counts `never-started` seconds (no run to read yet) and cap polls
+# (read deliberately not attempted). Quoting it as "N s … UNREADABLE" printed a false
+# claim of blindness about the fresh-PR race.
+C_RECOVER_FRESH="$(bofc still-running '' 30 0 still-running 0 0)"
+ck "(C) a RECOVERED surface that was never blind does NOT claim 30s of unreadable time (round 7 P2)" \
+   "$(grep -q '30s of this wait went by with it UNREADABLE' <<<"$C_RECOVER_FRESH" && echo 1 || echo 0)"
+ck "(C) …and it says NOTHING was unreadable (a fresh-PR race is not a blind instrument)" \
+   "$(grep -q 'NOTHING was unreadable' <<<"$C_RECOVER_FRESH" && echo 0 || echo 1)"
+C_RECOVER_CAP="$(bofc still-running '' 3 0 still-running 0 0)"
+ck "(C) …and a recovered surface whose only `missing` was CAP polls is not called unreadable either (round 7 P2)" \
+   "$(grep -q 'UNREADABLE' <<<"$C_RECOVER_CAP" && echo 1 || echo 0)"
 C_SLOW="$(bofc unobservable unreadable 3 1 unobservable)"
 ck "(C) CONTROL: a MEASURED 3s of unreadable reads is still quoted as a duration" \
    "$(grep -q 'answer for 3s in total, 1s consecutively' <<<"$C_SLOW" && echo 0 || echo 1)"
@@ -519,6 +531,19 @@ ck "(C) CONTROL: a MEASURED 3s of unreadable reads is still quoted as a duration
 C_MIX="$(bofc unobservable unreadable 5 2 unobservable 3 1)"
 ck "(C) a MIXED wait (cap polls + failed-read polls) quotes ONLY the unreadable-attributable seconds (round 6 P2)" \
    "$(grep -q 'answer for 3s in total, 1s consecutively' <<<"$C_MIX" && ! grep -q 'answer for 5s' <<<"$C_MIX" && echo 0 || echo 1)"
+# ⛔ THE OTHER ORDERING (review round 7, P2). A cap poll is the LAST observation, not the
+# only one — a mixed wait that ENDED on a cap poll used to take the cap branch and deny the
+# seconds it had really spent blind, so which ground the operator learned about still
+# depended on which poll landed last.
+C_MIXCAP="$(bofc unobservable cap 5 2 unobservable 3 1)"
+ck "(C) a MIXED wait that ENDS on a cap poll still states the seconds it spent blind (round 7 P2)" \
+   "$(grep -q '3s of this wait DID go by with the Jobs read failing' <<<"$C_MIXCAP" && grep -q '1s consecutively' <<<"$C_MIXCAP" && echo 0 || echo 1)"
+ck "(C) …and still names the CAP as the ground of the refusal (both grounds, not one)" \
+   "$(grep -q 'MORE THAN 8 run' <<<"$C_MIXCAP" && echo 0 || echo 1)"
+# ⛔ THE CONTROL: a PURE cap wait (nothing ever blind) must not acquire the unreadable
+# sentence — the fix must not make every cap refusal talk about a read failure.
+ck "(C) CONTROL: a PURE cap wait does NOT claim any seconds were spent blind (round 7 P2)" \
+   "$(grep -q 'DID go by with the Jobs read failing' <<<"$C_CAP" && echo 1 || echo 0)"
 # ⛔ AND THE CATCH-ALL MUST NOT INVENT A GROUND (review round 6, P2). With a reason that
 # is neither `cap` nor `unreadable`, the old text asserted "the Jobs read FAILED" — a
 # measurement the code did not take, the exact class this block exists to stop.

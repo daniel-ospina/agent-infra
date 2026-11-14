@@ -96,6 +96,11 @@ ck "extracted the FIRST_CHECKS_REDERIVE_MAX derivation (the env NAME is pinned, 
   # Stubs for the two collaborators the arms do not exercise: a TERMINAL listing
   # never reaches either, and the arms that do reach them are about clocks, not jobs.
   printf '%s\n' 'fetch_run_jobs() { cat "$FC_JOBS_JSON" 2>/dev/null || :; }'
+  # The whole-attempt deadline guard is ORTHOGONAL to this wait's own clocks (it bounds
+  # the ATTEMPT, not the poll), and every arm here sets a window that expires long before
+  # it. Stubbed so the arms below do not read a "command not found" into the output they
+  # grep; arm (g) is the one that would otherwise surface it.
+  printf '%s\n' 'rail_guard_poll() { :; }'
   printf '%s\n' 'first_checks_digest() { printf "%s\n" "${FC_DIGEST:-1	0	fp	1 job(s)}"; }'
   printf '%s\n' "$KNOB"
   printf '%s\n\n' "$PROBE"
@@ -153,9 +158,11 @@ drive_wait() {
     FC_GH_LOG="$SCEN/gh.log" FC_RUNS="$SCEN/runs" FC_HAVE_WF="${FC_HAVE_WF:-}" \
     FC_CHECKS_TOTAL="${FC_CHECKS_TOTAL:-0}" \
     FC_CHECKS_FAIL="${FC_CHECKS_FAIL:-}" FC_RUNLIST_FAIL="${FC_RUNLIST_FAIL:-}" \
+    FC_JOBS_JSON="${FC_JOBS_JSON:-}" \
     TMP="$SCEN" GH="$GHF" HEAD="deadbeef" REPO="o/r" LIB="$LIB" \
     WORKFLOW="${W_WORKFLOW-python-ci.yml}" ANY_WORKFLOW="${W_ANY:-0}" \
     FIRST_CHECKS_WAIT="${W_WAIT:-2}" FIRST_CHECKS_STALL="${W_STALL:-8760}" \
+    FIRST_CHECKS_JOBS_MAX="${W_JOBS_MAX:-8}" \
     FIRST_CHECKS_CEILING="${W_CEIL:-18064}" FIRST_CHECKS_POLL=1 \
     ADMIN_MERGE_FIRST_CHECKS_REDERIVE_MAX="${REDERIVE_MAX_OVERRIDE:-${W_REDERIVE_MAX:-1}}" \
     bash -c 'source "$LIB"; wait_for_first_checks "$1"; rc=$?;
@@ -275,6 +282,47 @@ ck "(f) STRUCTURAL: this patch added/modified no probe line" \
    "$(cd "$ROOT" && git diff -U0 -- scripts/admin-merge.sh 2>/dev/null \
         | grep -E '^[+-][^+-]' | grep -vE '^[+-][[:space:]]*#' \
         | grep -qE 'MAIN_HEALTH_|check_surface_probe\(|TREE_' && echo 1 || echo 0)"
+
+# ── (g) the UNREADABLE-ATTRIBUTABLE seconds are MEASURED, not merely consumed ─
+# (#2465 review round 7, P2 — this pins the PRODUCER.) `tests/issue-2465-inert-wait`
+# drives the refusal with the two counters INJECTED as inputs, so on its own it cannot
+# tell whether the wait still MEASURES them: replacing the producer's condition with
+# `if false` left every one of its rows green. Here the REAL `wait_for_first_checks`
+# runs against a fixture whose Jobs read fails, so the counter has to be produced by the
+# shipping code — and the MUTATION arm below proves this row is load-bearing rather
+# than decorative.
+echo "(g) the wait MEASURES the unreadable-attributable seconds (the #2465 producer)"
+printf 'in_progress||5001|2026-10-26T05:00:00Z\n' > "$SCEN/runs"
+# The Jobs fetch fails ⇒ `read_ok=0` ⇒ `signal_ok=0` with reason `unreadable` ⇒ the
+# `unobservable` arm. Every poll is unobservable, so by expiry `missing_unreadable`
+# equals the whole window — which makes the "quotes a duration" assertion deterministic
+# rather than a race against the whole-second clock.
+FC_JOBS_JSON="/nonexistent/never" W_WORKFLOW=python-ci.yml FC_HAVE_WF=python-ci.yml \
+  FC_CHECKS_TOTAL=12 W_WAIT=3 drive_wait
+ck "(g) the failed Jobs read lands in the unobservable state ('$W_STATE')" \
+   "$([ "$W_STATE" = unobservable ] && echo 0 || echo 1)"
+ck "(g) the refusal QUOTES the seconds the Jobs API did not answer for — the producer ADVANCED" \
+   "$(grep -qE 'answer for [1-9][0-9]*s in total' <<<"$W_ERR" && echo 0 || echo 1)"
+ck "(g) …and does NOT fall through to 'no elapsed time was measured against it'" \
+   "$(grep -q 'no elapsed time was measured against it' <<<"$W_ERR" && echo 1 || echo 0)"
+
+# MUTATION: disable the producer in the EXTRACTED text and require THIS arm to go RED.
+# A row that stays green under the mutation pins nothing — which was exactly the gap.
+LIB_MUT="$TMP/lib-mut.sh"
+sed -E 's/^( *)if \[ "\$\{FIRST_CHECKS_SIGNAL_REASON:-\}" = "unreadable" \]; then$/\1if false; then/' \
+    "$LIB" > "$LIB_MUT"
+ck "(g) MUTATION seam applied: the producer's condition is now \`if false\` (exactly one line)" \
+   "$([ "$(grep -cE '^ *if false; then$' "$LIB_MUT")" -eq 1 ] \
+      && [ "$(grep -cE '^ *if \[ "\$\{FIRST_CHECKS_SIGNAL_REASON:-\}" = "unreadable" \]; then$' "$LIB_MUT")" -eq 0 ] \
+      && echo 0 || echo 1)"
+LIB_REAL="$LIB"; LIB="$LIB_MUT"
+FC_JOBS_JSON="/nonexistent/never" W_WORKFLOW=python-ci.yml FC_HAVE_WF=python-ci.yml \
+  FC_CHECKS_TOTAL=12 W_WAIT=3 drive_wait
+LIB="$LIB_REAL"
+ck "(g) MUTATION: with the producer disabled the same wait quotes NO duration (the arm is load-bearing)" \
+   "$(grep -qE 'answer for [1-9][0-9]*s in total' <<<"$W_ERR" && echo 1 || echo 0)"
+ck "(g) MUTATION: …it falls to the 'no elapsed time was measured against it' arm instead" \
+   "$(grep -q 'no elapsed time was measured against it' <<<"$W_ERR" && echo 0 || echo 1)"
 
 echo
 printf 'first-checks lane re-derive: %s passed, %s failed\n' "$PASS" "$FAIL"

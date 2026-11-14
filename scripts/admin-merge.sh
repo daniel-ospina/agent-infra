@@ -5708,6 +5708,11 @@ wait_for_first_checks() {
       FIRST_CHECKS_STATE="unreadable"
       [ -n "$obs" ] || obs="the head's run list could not be read (gh error)"
       missing=$((missing + dt)); missing_streak=$((missing_streak + dt))
+      # ⛔ THE JOBS SURFACE WAS NEVER CONSULTED THIS POLL (review round 7, P2). The
+      # unreadable-UNINTERRUPTED run must break here too, or "…s consecutively" spans a
+      # poll on which the Jobs API was never asked — an over-claim about the one word
+      # that figure exists to carry.
+      streak_unreadable=0
     elif [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
       # A TERMINAL LISTING WITH AT LEAST ONE RUN CLEARS THE WAIT.
       FIRST_CHECKS_WAITED="$waited"
@@ -5715,6 +5720,10 @@ wait_for_first_checks() {
     elif [ "$total" -eq 0 ]; then
       FIRST_CHECKS_STATE="never-started"
       missing=$((missing + dt)); missing_streak=$((missing_streak + dt))
+      # ⛔ NOTHING HAS ATTACHED YET, SO NOTHING WAS UNREADABLE (review round 7, P2) —
+      # same reason as the run-list arm above: the unreadable run cannot span a poll
+      # where there was no Jobs read to fail.
+      streak_unreadable=0
     elif [ "$signal_ok" -ne 1 ]; then
       # ⛔ A MISSING SIGNAL IS NOT A STALL. The stall clock does NOT advance: the
       # absence of an observation is the absence of evidence, and reading it as
@@ -6078,10 +6087,21 @@ block_on_first_checks() {
         # `signal_ok` is cleared, not re-guessed here.
         if [ "${FIRST_CHECKS_SIGNAL_REASON:-}" = "cap" ]; then
           say_err "   closed, and MORE THAN ${FIRST_CHECKS_JOBS_MAX} run(s) were pending at once, so their per-job/"
-          say_err "   per-step PROGRESS was deliberately NOT read: at that width a partially observed surface"
-          say_err "   can report a false 'no change', which would be a false stall. The Jobs surface itself"
-          say_err "   was READABLE — this wait declined to poll it — so no duration is quoted for it and"
-          say_err "   slow and wedged could not be told apart."
+          say_err "   per-step PROGRESS was deliberately NOT read on the LAST observation: at that width a"
+          say_err "   partially observed surface can report a false 'no change', which would be a false stall."
+          say_err "   The Jobs surface was READABLE on that observation — this wait declined to poll it — so"
+          say_err "   no duration is quoted for it."
+          # ⛔ A CAP POLL IS THE LAST OBSERVATION, NOT THE ONLY ONE (review round 7, P2).
+          # The cap branch used to be tested first and never consulted the unreadable
+          # seconds, so a MIXED wait that happened to END on a cap poll denied the time
+          # it had really spent blind — the round-5 defect ("whichever branch fired last
+          # decides what the operator learns") surviving in the other ordering. The
+          # number is in hand, so state it.
+          if [ "${FIRST_CHECKS_MISSING_UNREADABLE:-0}" -gt 0 ]; then
+            say_err "   ⛔ …but ${FIRST_CHECKS_MISSING_UNREADABLE}s of this wait DID go by with the Jobs read failing"
+            say_err "   (${FIRST_CHECKS_STREAK_UNREADABLE:-0}s consecutively), so it was NOT readable throughout."
+          fi
+          say_err "   Either way slow and wedged could not be told apart."
         elif [ "${FIRST_CHECKS_MISSING_UNREADABLE:-0}" -gt 0 ]; then
           # ⛔ THE QUOTED SECONDS ARE THE UNREADABLE-ATTRIBUTABLE ONES, never `missing`
           # (review round 6, P2). A wait that spent some polls over the >JOBS_MAX cap and
@@ -6115,10 +6135,15 @@ block_on_first_checks() {
         # recovered from an `unobservable` poll keeps its accumulated `missing` (only
         # `missing_streak` is reset), so asserting the absence of any unreadable second
         # would be false about a wait that spent N of them blind.
-        if [ "${FIRST_CHECKS_MISSING:-0}" -gt 0 ]; then
+        # ⛔ AND THE NUMBER MUST BE THE UNREADABLE-ATTRIBUTABLE ONE (review round 7, P2).
+        # `missing` also counts cap polls (read deliberately not attempted) and
+        # never-started seconds (no run to read yet), so quoting it here printed
+        # "30s … UNREADABLE" about a fresh-PR race in which NOTHING was unreadable — the
+        # same two-grounds defect this block corrects ten lines above.
+        if [ "${FIRST_CHECKS_MISSING_UNREADABLE:-0}" -gt 0 ]; then
           say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
           say_err "   status=completed when this observation was taken. This surface is READABLE now, but"
-          say_err "   ${FIRST_CHECKS_MISSING}s of this wait went by with it UNREADABLE, so no stronger"
+          say_err "   ${FIRST_CHECKS_MISSING_UNREADABLE}s of this wait went by with it UNREADABLE, so no stronger"
           say_err "   slow-vs-wedged claim is made than that."
         else
           say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
