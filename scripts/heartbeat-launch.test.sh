@@ -260,6 +260,16 @@ assert_eq "$RC" "0" "§6 a DEAD pid is named as a stale record (the launch is no
 assert_contains "$OUT" "stale pidfile" "§6 …and the word 'stale' appears, so the record is not trusted"
 assert_contains "$OUT" "DRY RUN" "§6 …and --dry-run prints the command it WOULD run"
 assert_contains "$OUT" "LOOP_DETACHED=1" "§6 …including LOOP_DETACHED=1, so the loop is not forked twice"
+# ⛔ THE PRINTED COMMAND MUST BE THE COMMAND THAT RUNS (#3826 review P3). It was not: the dry-run
+# string omitted the `mkdir -p "$STATE"` and the `cd "$SELF_DIR"`, so copying it verbatim on a FIRST
+# run (the state dir does not exist yet — the documented `start` case) failed with
+#   /bin/bash: line 2: …/state/heartbeat-launch.log: No such file or directory
+# and nothing started. The `cd` matters in the other direction too: with a RELATIVE
+# HEARTBEAT_PI_AGENT_DIR the real `cd` changes what `$LOOP` resolves to, so a cd-less command is a
+# DIFFERENT command, not a tidier one. Asserted as a property of the STRING, so a future edit that
+# drops either half reds here rather than in an operator's terminal.
+assert_contains "$OUT" "mkdir -p" "§6 …and the printed command CREATES the state dir it logs into (verbatim-copyable on a first run)"
+assert_contains "$OUT" "cd " "§6 …and it cd's to the launcher's own dir, as the real launch does (a relative LOOP would break otherwise)"
 [ -f "$R/agent/state/heartbeat-launch.log" ] \
     && bad "§6 …and launched NOTHING (no log file was created)" \
     || ok "§6 …and launched NOTHING (no log file was created)"
@@ -449,6 +459,24 @@ assert_not_contains "$(grep -n '/Users/' "$LAUNCH" | grep -v '^[0-9]*:#' || true
 OUT="$(env -u HOME -u XPC_SERVICE_NAME HEARTBEAT_PI_AGENT_DIR="$T/nohome/agent" bash "$LOOP" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "§14 an unset HOME makes the loop REFUSE (2) instead of silently exiting 0"
 assert_contains "$OUT" "REFUSING" "§14 …and the refusal says so on stderr"
+# ⛔ AND THE OTHER HALF: a HOME that EXISTS but cannot be ENTERED (#3826 review P3). The guard above
+# tests `[ -d "$HOME" ]`, which needs only SEARCH on the parent — a mode-000 directory passes it — and
+# the `cd "$HOME" || exit 0` further down then exited 0 having written no pidfile and no log, i.e. the
+# exact "green having logged nothing" shape the guard's own header says it removed. The `su` /
+# systemd `User=` leftover `HOME=/root` is the same shape. Both halves now answer with the same code.
+UNENTERABLE="$T/unenterablehome"
+mkdir -p "$UNENTERABLE/home"
+chmod 000 "$UNENTERABLE/home"
+if [ "$(id -u)" = "0" ]; then
+    # root ignores the mode bits, so the fixture cannot produce the state at all. Declared, not skipped
+    # silently — an unmeasurable arm that reads as a pass is the defect this suite exists to catch.
+    ok "§14 an UNENTERABLE HOME is UNPROVEN here (running as root — mode bits do not deny root; the arm is declared, not silently green)"
+else
+    OUT="$(env -u XPC_SERVICE_NAME HOME="$UNENTERABLE/home" HEARTBEAT_PI_AGENT_DIR="$T/unenterable/agent" bash "$LOOP" 2>&1)"; RC=$?
+    assert_eq "$RC" "2" "§14 a HOME that exists but cannot be ENTERED also REFUSES (2), not exit 0 having logged nothing"
+    assert_contains "$OUT" "cannot enter HOME" "§14 …naming the cd's own failure, so the two halves of 'which home am I in' answer identically"
+fi
+chmod 755 "$UNENTERABLE/home" 2>/dev/null || true
 
 echo ""
 echo "── 15. status timestamps are READABLE on macOS too ──"

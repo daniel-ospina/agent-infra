@@ -2164,6 +2164,42 @@ if [ "${1:-}" = "--status" ]; then
             [ "$status_rc" -eq 0 ] && status_rc=1
         fi
     done
+    # ── DECLARED BUT NOT OWNED HERE: NAMED, NOT SILENT (#3826 review P2) ──────────────────────────
+    # ⛔ TWO SETS, ONE NAME. `declared_labels` is a WALK (any depth), and `is_declared` uses it to
+    # EXEMPT a template from the UNMANAGED alarm — while this per-job pass (and the install loop, and
+    # `--uninstall`) are a FLAT `$TEMPLATES_DIR/*.plist` glob. A template in a SUBDIRECTORY therefore
+    # produced NO ROW AT ALL: declared, therefore not reported as a stray, and never inspected. This
+    # repo ships four of them — `reaper/`, `conflict-rebase/`, `harness-apply/`, `runner-autoscale/`
+    # — each installed and verified by its own `install-*-timer.sh` with a DIFFERENT placeholder set.
+    # MEASURED pre-fix on a fixture (one flat template installed in sync + `reaper/<label>.plist`
+    # with nothing installed): rc=0, and the nested label appeared NOWHERE in the output — while
+    # `scripts/fleet-schedule.py --verify` printed `SCHEDULE VERIFIED — launchd job set matches
+    # templates/launchd` over declarations nothing had looked at. Silent, correct-looking and blind is
+    # the exact shape this file exists to remove.
+    # ⛔ THEY ARE NOT GRADED BY `status_job` — deliberately. Their placeholder set differs on purpose
+    # (that is WHY they live in a subdirectory: `install-*-timer.sh`'s own headers say so, 4x), so a
+    # content comparison here would invent a DRIFT for a correct install — a new false FAIL traded for
+    # the false PASS. The honest row STATES the delegation and NAMES the template, so "declared" and
+    # "visible" are the same set in both directions and the verdict sentence below is not a claim
+    # about files nothing read.
+    delegated=0
+    while IFS= read -r template; do
+        [ -n "$template" ] || continue
+        # Anything DIRECTLY in TEMPLATES_DIR is this installer's own set — already graded above.
+        [ "$(dirname "$template")" = "$TEMPLATES_DIR" ] && continue
+        label="$(job_label "$template")"
+        if is_retired "$label"; then
+            echo "  $label: RETIRED (manifest wins — template in a subdirectory; remove the template in the repo)"
+        else
+            echo "  $label: DELEGATED — declared here, installed and graded by another installer ($template)"
+        fi
+        delegated=$((delegated + 1))
+    done < <(find "$TEMPLATES_DIR" -type f -name '*.plist' 2>/dev/null | LC_ALL=C sort)
+    if [ "$delegated" -gt 0 ]; then
+        echo "    DELEGATED is a NAMED state, not a failure and not a green: these templates are this"
+        echo "    repo's own declarations but another installer renders, loads and verifies them, so this"
+        echo "    command does not grade their content (and never aims a bootout at them)."
+    fi
     # ⛔ AN INSTALLED JOB WITH NO TEMPLATE IS NOT "NOTHING TO REPORT" (#1867). It is a job on the
     # box the declared set does not describe, so neither this pass nor the content comparison can
     # say anything about it — the blind heartbeat sat in exactly that hole. Named loudly, and the

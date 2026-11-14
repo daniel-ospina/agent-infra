@@ -386,8 +386,16 @@ EOF
     # DRIFT. `( … ) &` is the portable detach that rule names, and it is exactly what
     # `heartbeat-loop.sh`'s own self-detach already uses. `LOOP_DETACHED=1` is what makes one fork
     # correct here, so no session leader is needed.
-    # The dry-run string must print EXACTLY this command, or it prints one that fails.
-    printf -v cmd '%s' "LOOP_DETACHED=1 nohup bash \"$LOOP\" >>\"$STATE/heartbeat-launch.log\" 2>&1 &"
+    # The dry-run string must print EXACTLY what the real path runs, or it prints one that fails.
+    # ⛔ IT DID PRINT ONE THAT FAILS (#3826 review P3). The string omitted the `mkdir -p "$STATE"`
+    # (line below, after the dry-run return) and the `cd "$SELF_DIR"`, so copying it verbatim on a
+    # FIRST run — the state dir does not exist yet, which is the documented `start` case — gave
+    #   /bin/bash: line 2: …/state/heartbeat-launch.log: No such file or directory
+    # and nothing started. The missing `cd` is load-bearing in the other direction too: with a
+    # RELATIVE `HEARTBEAT_PI_AGENT_DIR`, `$LOOP` is relative, `[ -f "$LOOP" ]` passes from the
+    # caller's cwd, and the real `cd` would then break the path — so a cd-less command is not a
+    # harmless simplification, it is a DIFFERENT command with a different outcome.
+    printf -v cmd '%s' "mkdir -p \"$STATE\" && ( cd \"$SELF_DIR\" && LOOP_DETACHED=1 nohup bash \"$LOOP\" >>\"$STATE/heartbeat-launch.log\" 2>&1 & )"
 
     if [ "$dry" = 1 ]; then
         note "DRY RUN — would execute (from a cmux-attributed shell):"

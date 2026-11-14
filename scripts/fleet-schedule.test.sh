@@ -1210,6 +1210,50 @@ grep -qF "$PLAIN_VERDICT" <<<"$out" \
   || bad "the control lost the plain verdict: $out"
 [ "$rc" -eq 0 ] && ok "control: ...and rc 0" || bad "the control returned $rc"
 
+# ⛔ AND A DELEGATED TEMPLATE IS NOT A MATCH EITHER (#3826 review P2). `install-launchd.sh --status`
+# grades a FLAT `templates/launchd/*.plist` set; this repo ships FOUR templates in SUBdirectories
+# (`reaper/`, `conflict-rebase/`, `harness-apply/`, `runner-autoscale/`), each graded by its own
+# `install-*-timer.sh`. Before the disclosure those four produced NO ROW AT ALL, so this repository's
+# own `--verify` printed `launchd job set matches templates/launchd` over declarations no pass had
+# read — a verdict that was true about 20 of 24 jobs and silent about the rest.
+# DELEGATED is a NAMED state, not a defect, so it must NOT become a CAVEAT (a permanent amber on the
+# reference Mac is the round-10 defect this section already fixes once) — the sentence names its
+# scope instead. Asserted in BOTH directions, because a fix that simply renamed the plain verdict
+# would pass the first arm and lie in the control.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  com.eldato.disk-reaper: DELEGATED — declared here, installed and graded by another installer ($TEMPLATES/../launchd/reaper/com.eldato.disk-reaper.plist)" >&2
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q '1 template(s) are DELEGATED' <<<"$out" \
+  && ok "a DELEGATED template narrows the verdict to what was actually graded — it no longer claims the whole set matches" \
+  || bad "the verdict did not name the DELEGATED template, so it still claims a match over files nothing read: $out"
+grep -q 'CAVEAT.*disk-reaper' <<<"$out" \
+  && bad "a DELEGATED row became a CAVEAT — a legitimate named state must not be a permanent amber: $out" \
+  || ok "...and it is NOT a CAVEAT (a legitimate named state, not a defect)"
+[ "$rc" -eq 0 ] && ok "...and rc 0 — the delegation is a disclosure, not a failure" \
+  || bad "the DELEGATED row changed the exit code to $rc"
+# The CONTROL: the same delegate without a DELEGATED row keeps the ORIGINAL sentence verbatim, so the
+# arm above cannot pass by a sentence that was rewritten for every box.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -qF "$PLAIN_VERDICT (install-launchd.sh --status)" <<<"$out" \
+  && ok "control: with nothing delegated the plain MATCH verdict is unchanged, word for word" \
+  || bad "the plain verdict moved for a box with no delegated template: $out"
+grep -q 'DELEGATED' <<<"$out" \
+  && bad "the control mentioned DELEGATED over a delegate that emitted none: $out" \
+  || ok "control: ...and names no delegation that was not disclosed"
+
 
 # ── 11. a Label is a PATH COMPONENT, so it is validated before it is used as one ─────────────
 case_ "11. a Label that is not a safe file name is refused, and cannot escape the state dir"

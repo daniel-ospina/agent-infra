@@ -3320,7 +3320,15 @@ for _tpl in "$REPO_TEMPLATES"/*/*.plist; do
     OUT="$(run_stray_status)"; RC=$?
     set -e
     assert_eq "$RC" "0" "§18 a template in a SUB-directory ($_lbl) is DECLARED — not unmanaged"
-    assert_not_contains "$OUT" "$_lbl" "§18 ... and is not named as a stray, so no bootout advice for the repo's own job"
+    # ⛔ DECLARED IS NOT THE SAME AS VISIBLE (#3826 review P2). Before this arm, a declared template in
+    # a sub-directory produced NO ROW AT ALL: `declared_labels` is a walk (so `is_declared` exempted
+    # it from the UNMANAGED alarm) while the per-job pass is a FLAT glob — so `--status` exited 0 over
+    # a job nothing had inspected, and `fleet-schedule.py --verify` certified the job set as matching
+    # templates/launchd. It is now disclosed as DELEGATED (the installer that owns it renders and
+    # grades it), which keeps the section's real property — no `bootout` advice for a live job — while
+    # making "declared" observable in both directions.
+    assert_contains "$OUT" "$_lbl: DELEGATED" "§18 ... and IS disclosed as DELEGATED — a declared template --status never looks at is the blind-install false PASS"
+    assert_not_contains "$OUT" "⛔ UNMANAGED   $_lbl" "§18 ... but never as a stray, so no bootout advice for the repo's own job"
     rm -f "$STRAY_HOME/Library/LaunchAgents/$_lbl.plist"
 done
 if [ "$SUBDIR_TEMPLATES" -gt 0 ]; then
@@ -3356,7 +3364,8 @@ set +e
 OUT="$(run_stray_status)"; RC=$?
 set -e
 assert_eq "$RC" "0" "§18b a template THREE levels down is DECLARED — the declared set is a walk, not two globs"
-assert_not_contains "$OUT" "com.eldato.nested" "§18b ...so no bootout+rm advice is aimed at a job this repo ships"
+assert_contains "$OUT" "com.eldato.nested: DELEGATED" "§18b ... and the walk is OBSERVABLE: a declared-but-not-owned template is disclosed, never invisible (#3826 review P2)"
+assert_not_contains "$OUT" "⛔ UNMANAGED   com.eldato.nested" "§18b ... so no bootout+rm advice is aimed at a job this repo ships"
 rm -f "$TEMPLATES/group/sub/com.eldato.nested.plist" "$STRAY_HOME/Library/LaunchAgents/com.eldato.nested.plist"
 rmdir "$TEMPLATES/group/sub" "$TEMPLATES/group" 2>/dev/null || true
 

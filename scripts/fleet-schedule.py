@@ -3711,6 +3711,24 @@ def cmd_darwin(mode):
                 file=sys.stderr,
             )
             return 1
+        # ⛔ THE VERDICT MUST NOT CLAIM A MATCH OVER FILES NOTHING GRADED (#3826 review P2).
+        # `install-launchd.sh --status` grades a FLAT `templates/launchd/*.plist` set and now DISCLOSES
+        # every template in a SUBDIRECTORY as `DELEGATED` (their own `install-*-timer.sh` renders,
+        # loads and grades them). Before that disclosure those rows did not exist at all, so this
+        # sentence — "launchd job set matches templates/launchd" — was printed over four of this
+        # repo's declarations that no pass had looked at. DELEGATED is a NAMED state, not a defect, so
+        # it is NOT a CAVEAT (a permanent amber on every Mac is the round-10 defect) — the sentence
+        # names the scope instead, and the plain wording is preserved verbatim when nothing is
+        # delegated so no consumer and no test has to move.
+        delegated = [line for line in text.splitlines() if ": DELEGATED —" in line]
+        if delegated:
+            print(
+                "SCHEDULE VERIFIED — launchd job set matches templates/launchd "
+                "(install-launchd.sh --status; %d template(s) are DELEGATED and named above — their "
+                "own installers render, load and grade them, so this verdict does not cover their "
+                "content)" % len(delegated)
+            )
+            return 0
         print("SCHEDULE VERIFIED — launchd job set matches templates/launchd (install-launchd.sh --status)")
         return 0
     if mode == "--status":

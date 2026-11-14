@@ -942,9 +942,20 @@ run_pass "$FIX15D"
 P15F="$(cat "$FIX15D/path" 2>/dev/null)"
 rm -f "$FIX15D/path"
 unset RUN_PASS_PATH
+# ⛔ A CHARACTER TEST IS NOT A COMPONENT TEST (#3826 review P2). This row asked `${P15F#*.}` —
+# "strip the shortest prefix ending at ANY dot" — so a PATH whose DIRECTORY NAMES merely contain a
+# dot failed while the property held. The pinned dirs necessarily carry dots on macOS:
+# `heartbeat-loop.sh` pins `/Applications/cmux.app/Contents/Resources/bin` and `$HOME/.pi/agent/bin`,
+# so on the ONE platform this change exists for the suite reddened for a non-defect. MEASURED by
+# making a pinned dir exist in the fixture (nothing else changed):
+#   FAIL 15f. a literal '.' or '..' survived the pin …: <fix>/home/.pi/agent/bin:/opt/homebrew/bin:…
+# The property is about a `:`-delimited COMPONENT equal to `.` or `..`, which is what §15c-§15e
+# already assert component-wise. Tested the same way here.
+P15F_dot=0
+case ":$P15F:" in *:.:*|*:..:*) P15F_dot=1 ;; esac
 if [ -z "$P15F" ]; then
   fail "15f. the literal-dot row produced no PATH to inspect — nothing was measured"
-elif [ "${P15F#*:.}" != "$P15F" ] || [ "${P15F#*.}" != "$P15F" ] || [ "${P15F#*..}" != "$P15F" ]; then
+elif [ "$P15F_dot" -eq 1 ]; then
   fail "15f. a literal '.' or '..' survived the pin (the cwd on PATH): $P15F"
 else
   pass "15f. a literal '.' and '..' are dropped from an inherited PATH — the cwd cannot be executed from"
@@ -953,6 +964,28 @@ case ":$P15F:" in
   *:/usr/bin:*) pass "15f. ... and the system tail is still appended (dropping them does not empty the PATH)" ;;
   *) fail "15f. the system tail is MISSING from the assembled PATH: ${P15F:-<none>}" ;;
 esac
+
+# ── 15g. THE FALSE-RED CONTROL FOR THE ROW ABOVE ───────────────────────────────────────────────
+# A row that only asserts the ABSENCE of `.`/`..` cannot tell a correct component test from the
+# character test it replaced: the pre-fix `${P15F#*.}` version passed this suite on Linux too, because
+# no pinned dir carrying a dot EXISTED here. So the discriminating case is the other direction — a
+# pinned dir that exists AND has a dot in its NAME, with no `.`/`..` component anywhere. The old
+# assertion reds on it; the component test does not. `$HOME/.pi/agent/bin` is the real pinned path
+# (`heartbeat-loop.sh`'s own list), so this is the shape macOS has and the Linux runner does not.
+mkdir -p "$FIX15D/home/.pi/agent/bin"
+RUN_PASS_PATH="/opt/homebrew/bin:/usr/bin:/bin"
+run_pass "$FIX15D"
+P15G="$(cat "$FIX15D/path" 2>/dev/null)"
+rm -f "$FIX15D/path"
+unset RUN_PASS_PATH
+if [ -z "$P15G" ]; then
+  fail "15g. the dot-in-a-directory-name row produced no PATH to inspect — nothing was measured"
+elif [ "$(printf '%s' "$P15G" | grep -c '\.pi/agent/bin' || true)" -eq 0 ]; then
+  fail "15g. the fixture's dot-bearing pinned dir is NOT on the assembled PATH, so the row proves nothing: $P15G"
+else
+  pass "15g. a pinned dir whose NAME contains a dot is not read as a '.' component (a component test, not a character test)"
+fi
+rmdir "$FIX15D/home/.pi/agent/bin" 2>/dev/null || true
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-loop suite passed (${checks} assertions)"

@@ -48,6 +48,20 @@ if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
     echo "heartbeat-loop: REFUSING to start: HOME=${HOME:-<unset>} is unset or not a directory" >&2
     exit 2
 fi
+# ⛔ "IS A DIRECTORY" IS NOT "CAN BE ENTERED" (#3826 review P3). `[ -d "$HOME" ]` needs only SEARCH on
+# the PARENT, so a mode-000 home passes this guard and the `cd "$HOME"` far below then hit
+# `|| exit 0` — the loop exiting SUCCESS having written no pidfile and no log, which is precisely the
+# "green having logged nothing" shape this guard's own header says it removed. MEASURED with a mode-000
+# home owned by another user (the `su` / systemd `User=` leftover shape):
+#   heartbeat-loop.sh: line 527: cd: /tmp/htest4/home: Permission denied   →  RC=0
+# ⛔ AND IT IS PROBED HERE, BEFORE THE SELF-DETACH, ON PURPOSE. Probed only at the `cd`, the refusal
+# lands in the DETACHED CHILD while the CALLER's `bash heartbeat-loop.sh` returns 0 — the same lie one
+# process further out. A subshell probe needs no cwd change, so nothing that runs between here and the
+# real `cd` (`_beat_pin_repo_evidence`, which reads the caller's tree) is moved.
+( cd "$HOME" ) 2>/dev/null || {
+    echo "heartbeat-loop: REFUSING to start: cannot enter HOME=$HOME" >&2
+    exit 2
+}
 export HOME
 # RAISE THE CLI DEADLINE. Measured 2026-10-01: `cmux workspace list` takes 0.2-2s on a
 # quiet box but 13.4-15.1s at load 130+, against a fixed 15s CLI deadline — so a slow
@@ -524,7 +538,14 @@ _beat_pin_repo_evidence() {
   fi
 }
 _beat_pin_repo_evidence
-cd "$HOME" || exit 0
+# ⛔ `cd "$HOME" || exit 0` WAS THE SAME FAILURE THE GUARD AT THE TOP CLOSES, ON THE OTHER HALF (#3826
+# review P3). The guard refuses an UNSET or non-directory HOME; a HOME that EXISTS but cannot be
+# ENTERED passes `[ -d "$HOME" ]` (stat needs only search on the parent) and then hit `exit 0` — the
+# loop exiting SUCCESS having logged NOTHING, no pidfile, no state dir. Measured with a mode-000 HOME
+# owned by another user (the `su` / systemd `User=` leftover shape):
+#   heartbeat-loop.sh: line 527: cd: /tmp/htest4/home: Permission denied   →  RC=0
+# A caller reading that rc is told the beat is running. One refusal, one code: 2, at both halves.
+cd "$HOME" || { echo "heartbeat-loop: REFUSING: cannot enter HOME=$HOME" >&2; exit 2; }
 
 echo $$ > "$PIDFILE"
 trap 'rm -f "$PIDFILE"' EXIT
