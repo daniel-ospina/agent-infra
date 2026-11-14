@@ -241,7 +241,8 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   `backlog_drained`, `backlog_partial`, `backlog_unreadable`. A final `unknown` exists in the code as an
   **unreachable invariant guard**, not a vocabulary member: `cascade_issue_slots` returns at least 1 once
   `can=1`, `room>0` and a readable listing make a grant possible, so every way to reach `slots=0` is
-  already named above it (verified by a 5,760-state sweep in which every token fires except `unknown`).
+  already named above it (verified by a 5,760-state sweep in which every token fires except `unknown` —
+  a one-off measurement, not an artifact in this repo: `test-cascade.sh` pins the reachable arms, not the sweep).
   It is kept rather than deleted so a broken invariant yields a NAME instead of an empty token —
   ⛔ so if `slots_why=unknown` is ever observed, an invariant broke; a new cause has not appeared.
   ⛔ **`empty_backlog` REQUIRES A MEASURED EMPTY POOL** (#1931; added by the 4th review cycle of
