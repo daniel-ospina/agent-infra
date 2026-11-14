@@ -4035,11 +4035,17 @@ while IFS= read -r _row; do
   _ac="${_row%%:*}"
   _av="$(codes_for_name "$_ac")"
   [ -n "$_av" ] || continue          # forward-declared: the gate is not on this tree yet
-  # Either form is a real arm: the tolerant constant (`${AGENT_X:-NN}`) or the bare literal the older
-  # arms use (`[ "$rc" = "77" ]`). The literal form is NOT rewritten here on purpose — the disk census
-  # in `disk-admission.test.sh` slices that arm by its literal — so this guard accepts both rather than
-  # forcing a cosmetic edit through a live test.
-  if ! grep -qE "(${_ac}|= \"${_av}\")" "$HERE/adopt-fix.sh"; then
+  # ⛔ MATCH THE ARM FORM, NOT THE CONSTANT'S NAME (this change's review, P2-2). `grep -qE "(${_ac}|= \"${_av}\")"`
+  # accepted the NAME ANYWHERE in the file — a comment mentioning `AGENT_X` satisfied it, and so did any
+  # unrelated `= "85"`. Measured by mutation on a scratch copy of the real adopt-fix.sh: deleting the
+  # `elif [ "$rc" = "${AGENT_STALE_CODE_REFUSED:-85}" ]` arm and leaving only `# NOTE: … (85) still needs
+  # an arm here` left this census GREEN, so adopt-fix would write NO LINE for 85 (the #1720 silence the
+  # census exists to prevent) while claiming every classified code has an arm.
+  # The pattern below is the two real forms and nothing else: the tolerant constant `${NAME:-NN}` or the
+  # bare literal `NN`, both inside a `[ "$rc" = … ]` test. Both are in use (`:99` constant, `:108`
+  # literal) and the literal form is not rewritten here — `disk-admission.test.sh` slices that arm by its
+  # literal — so this guard accepts both rather than forcing a cosmetic edit through a live test.
+  if ! grep -qE "\[ \"\\\$rc\" = \"(\\\$\{${_ac}:-${_av}\}|${_av})\" \]" "$HERE/adopt-fix.sh"; then
     _af_logok=0; _af_missing="$_af_missing ${_ac}=${_av}"
   fi
 done <<< "$_fixer_arms"
