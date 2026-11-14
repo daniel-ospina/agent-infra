@@ -6794,12 +6794,39 @@ export default function (pi: ExtensionAPI) {
             ALLOWANCE[det.verdict] !== undefined) promoteTo = promotedFromVerdict;
       }
       if (promoteTo !== null && det.hasPush === true) {
+        // ⛔ THE PARSED INVOCATION SURFACE IS PART OF BOTH BRANCHES (round 15, P0).
+        // Round 14 fixed exactly this omission in the `#506` arm above and left it
+        // here, one arm over: this probe's `block:push-delete` branch attributed
+        // from `pushTargets ∪ extractor`, which is the same strict subset
+        // (`pushTargets` is FIRST-invocation-scoped and the extractor is
+        // segment-matched on `/\bgit\s+push\b/`, so a LATER `-C`/`-c`-prefixed
+        // push is invisible to both). Because the verdict is `block:push-delete`
+        // there, the `#506` arm is skipped by its own exclusion, so this probe is
+        // the ONLY thing standing between the compound and the restore — it missed
+        // `held`, the restore rewrote the verdict onto a legacy kind, and
+        // `LEGACY_BLOCK` exempted the worktree.
+        // MEASURED at `7053bc29e` against base `e4716a058` (worktree session, `held`
+        // checked out in a sibling): base BLOCKED via #73 and the head ALLOWED for
+        // every prefixed pair — `-f --delete`/`-f -d`/`-f :refspec` first pushes ×
+        // `-C`/`-c`-prefixed later deletes, with `stash pop`, `reset --hard` and
+        // `restore .` leads.
+        // The `else` branch gets it too, and that half is a DECLARED TIGHTENING
+        // against a BASE GAP rather than a regression: on base the same compound
+        // (`git stash pop && git -C . push -f origin main && git -C . push origin
+        // --delete held`) classifies `block:stash-pop`, so no push arm runs at all
+        // and base ALLOWED a sibling-held delete outright. It is closed here because
+        // the harm is identical — a sibling worktree's upstream destroyed — and the
+        // surface can only ADD a target; the unheld control below still allows.
+        const probeParsed = (det.pushMutations ?? [])
+          .filter((mu: any) => mu.verb === "push" && mu.isDelete === true)
+          .flatMap((mu: any) => (Array.isArray(mu.targets) ? mu.targets : []));
         const probeDeletes = det.verdict === "block:push-delete"
           ? [...new Set([
             ...(det.pushTargets ?? []),
             ...(extractPushDeleteBranch(localCommand) ?? []),
+            ...probeParsed,
           ])]
-          : wholeCommandDeleteTargets(det.verdict, localCommand);
+          : [...new Set([...wholeCommandDeleteTargets(det.verdict, localCommand), ...probeParsed])];
         if (probeDeletes.length > 0) {
           const blocked = _coordinatedDeleteBlock(probeDeletes);
           if (blocked) return blocked;

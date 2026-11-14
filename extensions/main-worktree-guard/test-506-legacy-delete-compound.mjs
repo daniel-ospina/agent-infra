@@ -628,6 +628,31 @@ if (typeof stripTypeScriptTypes !== "function" ||
       cmd: "git -C . reset --hard && git push origin -d stale && git -C . push origin --delete stale2",
       why: "round 14 CONTROL: the same prefixed-later-push shape with a target held NOWHERE must stay " +
            "allowed — P25 differs only by whether a sibling holds the target" },
+    // ── review round 15 (P0): THE SAME OMISSION, IN THE OTHER CONSUMER ──
+    // Round 14 added the parsed surface to the `#506` arm and left the
+    // pre-restore PROBE attributing from two surfaces. When the first push itself
+    // carries the delete the verdict is `block:push-delete`, so the `#506` arm is
+    // skipped by its own exclusion and the probe is the only guard before the
+    // restore rewrites the verdict onto a legacy kind — where `LEGACY_BLOCK`
+    // exempts the worktree. MEASURED at `7053bc29e` against base `e4716a058`:
+    // base BLOCKED via #73, the round-14 head ALLOWED, for every prefixed pair and
+    // every lead verb. This is the fifth instance on this PR of the same class.
+    { id: "P29", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push -f --delete stale && git -C . push origin --delete held",
+      why: "round 15 P0: FIRST push deletes (verdict push-delete) and BOTH pushes are prefix-spelled, " +
+           "so the extractor is null and only the parsed invocation targets find `held`" },
+    { id: "P30", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push -f -d stale && git -C . push origin --delete held",
+      why: "round 15 P0: the #443 `-d` first-push spelling of the same class" },
+    { id: "P31", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push -f origin main && git -C . push origin --delete held",
+      why: "round 15 DECLARED TIGHTENING (closes a BASE GAP, not a regression): base classifies this " +
+           "`block:stash-pop`, so NO push arm runs and base ALLOWED a sibling-held delete outright; the " +
+           "parsed surface now blocks it. Pinned so nobody can narrow the probe back by citing base" },
+    { id: "P32", dir: "wt", expect: "allow",
+      cmd: "git stash pop && git -C . push -f --delete stale && git -C . push origin --delete stale2",
+      why: "round 15 CONTROL: both targets held NOWHERE ⇒ still allowed, so P29 is #73 and not a " +
+           "blanket refusal of a prefixed two-push compound" },
   ];
 
   /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
@@ -1063,6 +1088,35 @@ if (typeof stripTypeScriptTypes !== "function" ||
           expectRed: ["P25", "P26", "P27"],
           redCheck: (r) => !blocked(r),
           expectGreen: ["P28", "B16", "B16b", "B17", "P16", "B1"],
+        },
+        {
+          // (17) THE PROBE'S PARSED SURFACE DROPPED — the round-15 P0 put back.
+          // Round 14's mutant 16 covers the `#506` arm; this one isolates the
+          // pre-restore PROBE, which is a DIFFERENT consumer and the only guard on
+          // the `block:push-delete` path (the `#506` arm excludes that verdict).
+          // The split is the evidence: P29/P30/P31 lose `held` and are ALLOWED,
+          // while the round-14 rows P25/P26/P27 stay GREEN because the `#506` arm
+          // is intact — so this mutant cannot be mistaken for a duplicate of 16.
+          label: "round-15 probe parsed-invocation surface dropped (index.ts)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "        const probeDeletes = det.verdict === \"block:push-delete\"\n" +
+            "          ? [...new Set([\n" +
+            "            ...(det.pushTargets ?? []),\n" +
+            "            ...(extractPushDeleteBranch(localCommand) ?? []),\n" +
+            "            ...probeParsed,\n" +
+            "          ])]\n" +
+            "          : [...new Set([...wholeCommandDeleteTargets(det.verdict, localCommand), ...probeParsed])];",
+            "        const probeDeletes = det.verdict === \"block:push-delete\"\n" +
+            "          ? [...new Set([\n" +
+            "            ...(det.pushTargets ?? []),\n" +
+            "            ...(extractPushDeleteBranch(localCommand) ?? []),\n" +
+            "          ])] // MUTANT: probe parsed surface dropped (push-delete branch)\n" +
+            "          : wholeCommandDeleteTargets(det.verdict, localCommand); // MUTANT: … and the else branch",
+          ),
+          expectRed: ["P29", "P30", "P31"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P25", "P26", "P27", "P32", "P16", "P20", "P18", "B16", "B16b"],
         },
         {
           // (13) THE FACT NEVER RECORDED — the classifier stops reporting what the
