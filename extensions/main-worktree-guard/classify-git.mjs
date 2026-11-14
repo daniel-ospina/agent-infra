@@ -5279,6 +5279,32 @@ const _QP_R = "\u0002";
  * `_NL_DATA` (`\u0003`) or `_NL_SPAN` (`\u0004`). */
 const _QS_MARK = "\u0005";
 
+/** Suffix appended to `_SUBST_PLACEHOLDER` for a span that was QUOTED, i.e. one the shell will NOT
+ * word-split.
+ *
+ * ⛔ THE VALUE-SLOT RULE TURNS ON THIS DISTINCTION (round-17 review, P1 — measured as a FAIL-OPEN on the
+ * GUARDED ref, and it is the SECOND time this surface mistook "one word" for "the whole expansion").
+ * `-o`/`--push-option` consumes exactly ONE argv word, so a QUOTED span in that slot is provably the
+ * value and cannot become a flag (gnu.org, *Command Substitution*: no word splitting inside `"…"`):
+ *
+ *   git push origin -o "$(echo "x -d held/branch")"   bash argv → push origin -o 'x -d held/branch'
+ *     (ONE word — the value). Ref only survives; nothing is deleted.
+ *
+ * An UNQUOTED span DOES split, so only its FIRST word is the value and every later word is ordinary
+ * argv — a delete flag among them is a real flag:
+ *
+ *   git push origin -o $(echo "x -d held/branch")
+ *     bash argv → push origin -o x -d held/branch   (`-o` takes `x`; `-d held/branch` DELETES the ref)
+ *     origin/main and the pre-5157 head refused it; a blanket value-slot exemption returned `null`.
+ *
+ * Which word of an expansion carries the spelling is UNKNOWABLE statically, so an unquoted span in a
+ * value slot is treated as able to spill and the arm FIRES (#653's policy: refuse what cannot be
+ * resolved). The cost is a documented over-block on `-o $(echo -d)` — a push-option whose expansion is
+ * exactly `-d` is not a workflow — and the alternative is a deleted sibling branch.
+ * It is a SUFFIX rather than a second placeholder so every containment test (`_cleanDeleteTarget`, the
+ * marker dedupe, `_isPushDeleteFlagToken`) keeps matching `_SUBST_PLACEHOLDER` unchanged. */
+const _QUOTED_SPAN_SUFFIX = "\u0006";
+
 /** Replace `(`/`)` that are DATA with sentinels, mirroring `_tokenize`'s own rules EXACTLY: a
  * backslash escapes the next char always outside quotes and only inside DOUBLE quotes (POSIX), and
  * inside single quotes it is literal. LENGTH-PRESERVING: every masked character becomes exactly one
@@ -5629,8 +5655,10 @@ function _pushSegmentTokens(body) {
     // ⛔ A `$( … )` / backtick that OPENED INSIDE `"…"` IS STILL ONE OPAQUE WORD (round-17 review, P1).
     // `_maskDataParens` marks it (`_QS_MARK`) instead of letting it fall through as literal text; the
     // shell neither splits nor globs a quoted substitution's result, so the word's content is unknowable
-    // here and belongs in the placeholder — the same treatment the BARE twin already got.
-    if (t.includes(_QS_MARK)) { tokens.push(_SUBST_PLACEHOLDER); continue; }
+    // here and belongs in the placeholder — the same treatment the BARE twin already got. The `_QUOTED`
+    // suffix records the ONE thing that distinguishes it from a bare span: it will not word-split, which
+    // is what makes its value-slot exemption sound (see `_QUOTED_SPAN_SUFFIX`).
+    if (t.includes(_QS_MARK)) { tokens.push(_SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX); continue; }
     tokens.push(_unmaskDataParens(t));
   }
   // An UNCLOSED span is TRUNCATED, not empty (round-7 review, P0). It used to be dropped, so a
@@ -5664,7 +5692,23 @@ function _pushSegmentTokens(body) {
   // feat/x` has its flag; and a command whose only `-d` is ordinary option TEXT still needs a span to
   // be in the same segment, which is the ambiguous shape this is meant to catch.
   const _valueSlot = _markOptionValueSlots(tokens);
-  const _opaqueInFlagSlot = tokens.some((t, i) => t.includes(_SUBST_PLACEHOLDER) && !_valueSlot[i]);
+  const _isSpanTok = (t) => t.includes(_SUBST_PLACEHOLDER);
+  const _isQuotedSpanTok = (t) => t.includes(_SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);
+  // ⛔ ONLY A **QUOTED** SPAN CAN BE EXEMPTED FROM A VALUE SLOT (round-17 review, P1 — measured as a
+  // FAIL-OPEN on the GUARDED ref). `-o`/`--push-option` consumes ONE argv word: a quoted span is exactly
+  // one word, so it is provably the value and cannot be a flag — but an UNQUOTED span is word-split, so
+  // only its first word is the value and the REST IS ARGV, where a delete flag is a real flag:
+  //
+  //   git push origin -o $(echo "x -d held/branch")
+  //     bash argv → push origin -o x -d held/branch   (`-o` takes `x`; `-d held/branch` deletes the ref)
+  //     a blanket exemption → null → #73 never consulted → ALLOWED;  origin/main and aa5104539 REFUSED.
+  //
+  // Which expanded word carries the spelling is unknowable statically, so the unquoted case is treated as
+  // ABLE TO SPILL and the arm fires (#653's policy). That is a deliberate, documented over-block on
+  // `-o $(echo -d)` — whose expansion is exactly `-d`, i.e. not a push option anyone writes — and the
+  // alternative is a deleted sibling branch. The quoted spelling (`-o "$(echo -d)"`) stays exempt, which
+  // is the case the exemption was FOR.
+  const _opaqueInFlagSlot = tokens.some((t, i) => _isSpanTok(t) && !(_valueSlot[i] && _isQuotedSpanTok(t)));
   // ⛔ "THIS SEGMENT ALREADY HAS ITS OWN DELETE FLAG" MUST BE VALUE-SLOT AWARE (round-17 review, NOTE
   // promoted — a PRE-EXISTING fail-open on the guarded ref, measured with real git on all three trees).
   // `-o`/`--push-option` consumes its argument, so an `-o -d` supplies no flag — but the raw token list
@@ -5681,22 +5725,30 @@ function _pushSegmentTokens(body) {
   const _ownFlag = tokens.some((t, i) => !_valueSlot[i] && _isPushDeleteFlagToken(t));
   if (!_ownFlag &&
       _opaqueInFlagSlot &&
-      // ⛔ A SPAN IN AN OPTION-VALUE SLOT IS A VALUE, NEVER A FLAG (round-17 review, P2 — a FALSE BLOCK
-      // this PR introduced in `8e4cef824`). `git push`'s `-o`/`--push-option` takes exactly ONE argument,
-      // so a span that IS that argument cannot expand into a delete flag — its first word is consumed as
-      // the value (probe-verified against real git 2.43: `git push -o -d origin` is a plain push):
+      // ⛔ A **QUOTED** SPAN IN AN OPTION-VALUE SLOT IS A VALUE, NEVER A FLAG (round-17 review, P2 — a
+      // FALSE BLOCK this PR introduced in `8e4cef824`). `git push`'s `-o`/`--push-option` takes exactly
+      // ONE argument, and a QUOTED substitution is exactly one word (gnu.org: no word splitting inside
+      // `"…"`), so that word is provably the value (probe-verified against real git 2.43:
+      // `git push -o -d origin` is a plain push):
       //
-      //   git push origin -o $(echo -d) HEAD:feat
+      //   git push origin -o "$(echo -d)" HEAD:feat
       //     bash argv → push origin -o -d HEAD:feat   (no delete)   origin/main → allow
-      //     this head (before) → REFUSE "$(…)" → a false block on an ordinary push-option
+      //     a bare "span outside a value slot" test → REFUSE "$(…)" → a false block on a real push-option
       //
-      // Each remaining case is reachable in the same shape and behaves identically: `--push-option`, a
-      // quoted span (`-o "$(echo -d)"`), and a multi-word expansion (`-o $(echo "-d held/branch")` →
-      // `-o -d held/branch`, where `-d` is the VALUE and `held/branch` is a plain refspec). Where the
-      // SAME segment also holds a span OUTSIDE a value slot, the arm still fires — the flag could be
-      // there — so this narrows the arm only over the one slot that provably cannot carry a flag.
-      // `_markOptionValueSlots` is the module's existing definition of that slot (the same one the
-      // target scan in `extractPushDeleteBranch` uses), so the two cannot drift.
+      // ⛔ THE EXEMPTION IS **QUOTED-ONLY**, AND THE FIRST VERSION OF THIS COMMENT GOT THAT WRONG (round-17
+      // review, P1, MEASURED — it is why `_QUOTED_SPAN_SUFFIX` exists). It claimed "a multi-word expansion
+      // (`-o $(echo "-d held/branch")`) → `-o -d held/branch`, where `-d` is the VALUE", which is false for
+      // every word AFTER the first: `-o` consumes one word, an UNQUOTED span word-SPLITS, and the rest is
+      // ordinary argv — so a flag there is a REAL flag:
+      //
+      //   git push origin -o $(echo "x -d held/branch")
+      //     bash argv → push origin -o x -d held/branch  (`-o` value is `x`; `-d held/branch` DELETES)
+      //     a blanket exemption → null → #73 never consulted → ALLOWED, where `origin/main` and
+      //     `aa5104539` both REFUSED it.
+      // The quoted/unquoted split is exactly the shell's own: a quoted span cannot spill, an unquoted one
+      // can, and which word carries the spelling is unknowable — so the unquoted case fails CLOSED.
+      // `_markOptionValueSlots` is the module's existing definition of the slot (the same one the target
+      // scan in `extractPushDeleteBranch` uses), so the two cannot drift.
       _spanCarriesDeleteSpelling(body)) {
     // The marker must be REACHABLE, and `extractPushDeleteBranch` only reports targets AFTER a delete
     // flag — so the flag goes in with it. That is not an invention: the raw text carries a delete

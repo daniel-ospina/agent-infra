@@ -407,24 +407,49 @@ for (const [name, cmd, want] of [
 ]) {
   expect(`A: ${name} → the delete spelling is UNATTRIBUTABLE, never absent`, extractPushDeleteBranch(cmd), want);
 }
-// ⚠️ CONTROLS (not discriminators in the fail-open direction): a span in an `-o`/`--push-option` VALUE
-// slot is a VALUE — `-o` takes exactly one argument (real git 2.43: `git push -o -d origin` is a plain
-// push) — so a delete spelling inside it must not become a flag. `origin/main` allowed all four; this
-// branch refused three of them before the narrowing, which is the P2 false block.
+// ⚠️ CONTROLS: a QUOTED span in an `-o`/`--push-option` VALUE slot is a VALUE — `-o` takes exactly one
+// argv word and a quoted substitution is exactly one word (gnu.org: no word splitting inside `"…"`), so
+// a delete spelling inside it cannot become a flag (real git 2.43: `git push -o -d origin` is a plain
+// push). These are the case the exemption exists FOR; `origin/main` allowed all of them and so does head.
 for (const [name, cmd] of [
-  ["`-o $(echo -d)`", "git push origin -o $(echo -d) main"],
-  ["`--push-option $(echo -d)`", "git push origin --push-option $(echo -d) main"],
-  ["`-o \"$(echo -d)\"` (quoted span in the value slot)", `git push origin -o "$(echo -d)" main`],
-  ["`-o $(echo \"-d held/branch\")` (a multi-word expansion still lands in the value slot)",
-    `git push origin -o $(echo "-d held/branch") HEAD:feat`],
+  ["`-o \"$(echo -d)\"` (quoted span in the value slot — the case the exemption exists for)", `git push origin -o "$(echo -d)" main`],
+  ["`-o \"pre$(echo -d)post\"` — a quoted span glued into a longer word is still ONE word",
+    `git push origin -o "pre$(echo -d)post" HEAD:feat`],
   // ⛔ CONTROL for the value-slot-aware own-flag test (round-17 review NOTE): `-o -d` supplies no flag
   // AND the segment's only span carries no spelling, so there is no delete to refuse — the arm must NOT
   // fire merely because a `-d`-shaped VALUE exists. bash argv: `push origin -o -d <date> held/branch`
   // = a plain push (the `-o` value is `-d`; nothing deletes).
   ["`-o -d $(date) held/branch` (an `-o -d` value is not a delete, and its span has no spelling)",
     `git push origin -o -d $(date) held/branch`],
+  ["`-o $(date) main` — a span in the value slot with NO spelling in its body", `git push origin -o $(date) main`],
 ]) {
-  expect(`A: a span in an option VALUE slot (${name}) → nothing deleted`, extractPushDeleteBranch(cmd), null);
+  expect(`A: a QUOTED span in an option VALUE slot (${name}) → nothing deleted`, extractPushDeleteBranch(cmd), null);
+}
+// ⛔ AN **UNQUOTED** SPAN IN A VALUE SLOT IS NOT EXEMPT — IT CAN SPILL (round-17 review P1, MEASURED as a
+// FAIL-OPEN on the GUARDED ref, and the first version of the block above asserted the opposite).
+// `-o` consumes ONE argv word; an unquoted substitution WORD-SPLITS, so only its first word is the value
+// and the rest is ordinary argv, where a delete flag is a real flag:
+//   git push origin -o $(echo "x -d held/branch")
+//     bash argv → push origin -o x -d held/branch   (`-o` takes `x`; `-d held/branch` DELETES the ref)
+//     real git on a bare remote: `- [deleted] held/branch`
+// A blanket exemption returned `null` there, so #73 was never consulted — while `origin/main` and
+// `aa5104539` both REFUSED. Which expanded word carries the spelling is unknowable statically, so these
+// fail CLOSED. The cost is a documented over-block on `-o $(echo -d)` (an expansion that is exactly
+// `-d`, i.e. not a push option anyone writes); the alternative is a deleted sibling branch.
+for (const [name, cmd] of [
+  ["the P1 shape: `-o $(echo \"x -d held/branch\")` — the flag is word 2, i.e. REAL argv",
+    `git push origin -o $(echo "x -d held/branch")`],
+  ["`-o $(echo \"x --delete held/branch\")` — the long spelling in the spill", `git push origin -o $(echo "x --delete held/branch")`],
+  ["`--push-option $(echo \"x -d held/branch\")` — the long option in the spill",
+    `git push origin --push-option $(echo "x -d held/branch")`],
+  ["`-o \`echo \"x\" -d\` held/branch` — a BACKTICK spill",
+    "git push origin -o `echo \"x\" -d` held/branch"],
+  ["`-o $(echo -d) main` — the documented fail-closed over-block (expansion is exactly `-d`)",
+    `git push origin -o $(echo -d) main`],
+]) {
+  const got = extractPushDeleteBranch(cmd);
+  expectTrue(`A: an UNQUOTED span in a value slot (${name}) → REFUSED, never dropped`,
+    Array.isArray(got) && got.some((t) => !isResolvableDeleteTarget(t)), JSON.stringify(got));
 }
 // …and the same slot must not launder a REAL delete elsewhere in the segment.
 expect("A: `-o <literal> <span> -d held/branch` → the real target survives beside the marker",
@@ -575,25 +600,34 @@ if (typeof stripTypeScriptTypes !== "function" ||
         `handler returned ${JSON.stringify(r)?.slice(0, 200)}`);
     }
 
-    // ── Part C2: the round-17 P2 FALSE BLOCK is gone (scoped to the DELETE arm) ────────
-    // #3962 round-17 review P2 — `-o`/`--push-option` takes exactly ONE argument, so a span in that slot
-    // is the VALUE (bash argv `push origin -o -d main`; real git 2.43 accepts it as a plain push). The
-    // pre-narrowing head refused all four with #653's refusal (`$(…)`); `origin/main` deleted nothing.
-    // ⛔ THESE ROWS CANNOT EXPECT A FULL ALLOW. M2 (the off-baseline push gate, a DIFFERENT arm) refuses
-    // any push whose refspec list is a substitution — its reason says `Push target(s): $` — and that is
-    // pre-existing behaviour on both trees, not this change's. So the assertion is scoped to what this
-    // fix owns: the DELETE arm must not fire. That is the whole claim.
-    for (const [name, cmd] of [
-      ["C6 #3962: `-o $(echo -d)` — the span is the OPTION VALUE, nothing is deleted", "git push origin -o $(echo -d) main"],
-      ["C7 #3962: `--push-option $(echo -d)`, the long spelling", "git push origin --push-option $(echo -d) main"],
-      ["C8 #3962: `-o \"$(echo -d)\"` — a QUOTED span in the value slot", `git push origin -o "$(echo -d)" main`],
-      ["C9 #3962: `-o $(echo \"-d stale\")` — a multi-word expansion still lands in the value slot", `git push origin -o $(echo "-d stale") main`],
+    // ── Part C2: the round-17 value-slot rule, both halves, end-to-end ──────────────────
+    // ⛔ THESE ROWS MUST BE READ AS A PAIR, because the rule is a PAIR: `-o`/`--push-option` consumes
+    // exactly ONE argv word. A QUOTED substitution is exactly one word, so it IS the value and cannot be
+    // a flag → the delete arm must stay SILENT. An UNQUOTED substitution WORD-SPLITS, so only its first
+    // word is the value and the rest is argv → a spelling there is a REAL flag → the arm must FIRE.
+    // ⛔ THE `$(…)` OUTCOMES CANNOT BE "full allow" rows: M2 (the off-baseline push gate, a DIFFERENT arm)
+    // refuses any push whose refspec list is a substitution — its reason says `Push target(s): $` — and
+    // that is pre-existing behaviour on both trees. So each row asserts what THIS fix owns: the delete
+    // arm's own verdict, identified by #653's reason text.
+    for (const [name, cmd, wantDeleteArm] of [
+      ["C8 #3962: `-o \"$(echo -d)\"` — a QUOTED span in the value slot is ONE word, the value",
+        `git push origin -o "$(echo -d)" main`, "silent"],
+      ["C9 #3962: `-o \"pre$(echo -d)post\"` — a quoted span glued into a longer word is still ONE word",
+        `git push origin -o "pre$(echo -d)post" main`, "silent"],
+      // The P1 fail-open family: bash argv `push origin -o x -d held/branch` — a REAL delete.
+      ["C6 #3962 (P1): `-o $(echo \"x -d held/branch\")` — the flag is word 2, i.e. REAL argv",
+        `git push origin -o $(echo "x -d held/branch")`, "fires"],
+      ["C7 #3962 (P1): `--push-option $(echo \"x -d held/branch\")` — the long option in the spill",
+        `git push origin --push-option $(echo "x -d held/branch")`, "fires"],
+      // …and the documented fail-closed over-block: an expansion that is exactly `-d`.
+      ["C10 #3962 (documented over-block): `-o $(echo -d)` — unknowable, so it fails CLOSED",
+        `git push origin -o $(echo -d) main`, "fires"],
     ]) {
       const r = await quiet(() => real.bash(cmd));
-      const why = reasons(r);
-      expectTrue(`${name} → NOT refused by the delete arm (no #653, no #73)`,
-        !why.includes(FAIL_CLOSED) && !why.includes(HOLDS),
-        `handler returned ${JSON.stringify(r)?.slice(0, 200)}`);
+      const fired = reasons(r).includes(FAIL_CLOSED);
+      expectTrue(`${name} → the delete arm ${wantDeleteArm === "silent" ? "stays SILENT" : "FIRES (#653)"}`,
+        wantDeleteArm === "fires" ? fired : !fired,
+        `handler returned ${JSON.stringify(r)?.slice(0, 220)}`);
     }
 
     // ── Part D: #73 still does its ORIGINAL job (the literal path) ──────────
@@ -831,8 +865,16 @@ if (typeof stripTypeScriptTypes !== "function" ||
         const btNeedle = 'if (quote === \'"\' && ch === "`") { out += _QS_MARK; continue; }';
         const btReplacement = 'if (quote === \'"\' && ch === "`") { out += swap(ch); continue; }';
         const btOffByOne = 'if (quote === \'"\' && ch === "`") { out += _QS_MARK; i++; continue; }';
-        const spanNeedle = 'const _opaqueInFlagSlot = tokens.some((t, i) => t.includes(_SUBST_PLACEHOLDER) && !_valueSlot[i]);';
-        const spanReplacement = 'const _opaqueInFlagSlot = tokens.includes(_SUBST_PLACEHOLDER);';
+        // ⛔ M13 reverts the QUOTED/UNQUOTED split — the ONE line the round-17 P1 turned on — back to the
+        // blanket "a span in a value slot is exempt" rule. That mutant is discriminating in BOTH
+        // directions, which is why it carries two rows: it restores the false block on the quoted form
+        // AND the fail-open on the unquoted spill.
+        const spanNeedle = 'const _opaqueInFlagSlot = tokens.some((t, i) => _isSpanTok(t) && !(_valueSlot[i] && _isQuotedSpanTok(t)));';
+        // Two reverts of the SAME line, because the split has two halves and each has its own failure:
+        //   `always`  — the pre-P2 rule (any span fires)  → the quoted value slot is a false block again;
+        //   `blanket` — a value-slot span is always exempt → the unquoted SPILL is a fail-open again.
+        const spanAlways = 'const _opaqueInFlagSlot = tokens.some((t) => _isSpanTok(t));';
+        const spanBlanket = 'const _opaqueInFlagSlot = tokens.some((t, i) => _isSpanTok(t) && !_valueSlot[i]);';
         const ownNeedle = 'const _ownFlag = tokens.some((t, i) => !_valueSlot[i] && _isPushDeleteFlagToken(t));';
         const ownReplacement = 'const _ownFlag = tokens.some((t) => _isPushDeleteFlagToken(t));';
         const cgPath = join(HERE, "classify-git.mjs");
@@ -866,9 +908,12 @@ if (typeof stripTypeScriptTypes !== "function" ||
             ["M15", "btoff", btNeedle, btOffByOne,
               "git push origin -o -d \"`echo -d`\" -d held/branch", ["$(…)"],
               "the off-by-one restored → the real target AFTER the span is SWALLOWED (only the marker survives)"],
-            ["M13", "span", spanNeedle, spanReplacement,
-              "git push origin -o $(echo -d) HEAD:feat", ["HEAD:feat", "$(…)"],
-              "the value-slot narrowing reverted → the false block is back"],
+            ["M13", "spanAlways", spanNeedle, spanAlways,
+              `git push origin -o "$(echo -d)" main`, ["main", "$(…)"],
+              "the value-slot exemption removed → the FALSE BLOCK is back on a quoted value slot"],
+            ["M13b2", "spanBlanket", spanNeedle, spanBlanket,
+              `git push origin -o $(echo "x -d held/branch")`, null,
+              "the quoted/unquoted split reverted → the SPILL FAIL-OPEN is back (a real delete, attr. nothing)"],
             ["M13d", "own", ownNeedle, ownReplacement,
               "git push origin -o -d $(echo -d) held/branch", null,
               "the naive own-flag test restored → the PRE-EXISTING fail-open is back (all three trees said null)"],
