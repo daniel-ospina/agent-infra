@@ -480,9 +480,16 @@ cp -r "$(lib_src)" "$K/scripts/lib"
 cp "$K/bin/cloud-cell-supervisor-stub.sh" "$K/scripts/cloud-cell-supervisor.sh"
 mkdir -p "$K/scripts/orchestrator-harness"
 CELL_BRINGUP="$K/scripts/orchestrator-bringup.sh"
+# ⛔ THE FIXTURE MUST NOT INHERIT THE HOST'S SYSTEMD UNITS. `env -i` isolates HOME, not `/etc/systemd/system`:
+# a box (or a CI runner that ran `install-cell-timers.sh --install` earlier in the same shard) carrying
+# `eldato-controller-watchdog.timer` made `start` exit 1 here — reporting LATE about a timer THIS fixture
+# never installed and whose log therefore never exists — so the arm below was red on every such host and
+# green elsewhere (measured: CI run 43195539277 shard 7, reproduced on a Linux cell). `FLEET_SYSTEMD_SYSTEM_DIR`
+# points the read at a root that holds no units, which is what "nothing else is installed here" means.
 OUT="$(env -i HOME="$K/home" XDG_STATE_HOME="$K/home/.local/state" \
   PATH="$K/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$K/home" \
   REPO="$K/repo" O="$K/O" HARNESS_PIN_DIR="$K/pin" HARNESS_PIN_FILE="$K/home/.harness-path" \
+  FLEET_SYSTEMD_SYSTEM_DIR="$K/systemd-no-units" \
   bash "$CELL_BRINGUP" start 2>&1)"; RC=$?
 [ "$RC" = 0 ] && ok "start (cell): rc=0" || bad "start (cell): rc=$RC — $OUT"
 grep -qx apply "$K/sup/called" 2>/dev/null && ok "start (cell): called 'apply' before starting (pins the harness)" \
@@ -575,6 +582,7 @@ esac
 OUT="$(env -i HOME="$K/home" XDG_STATE_HOME="$K/home/.local/state" \
   PATH="$K/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" CELL_HOME="$K/home" \
   REPO="$K/repo" O="$K/O" HARNESS_PIN_DIR="$K/pin" HARNESS_PIN_FILE="$K/home/.harness-path" \
+  FLEET_SYSTEMD_SYSTEM_DIR="$K/systemd-no-units" \
   bash "$CELL_BRINGUP" start 2>&1)"; RC=$?
 # pid 4242 is not a real process here, so this case proves the STALE arm (reclaim), not the live one —
 # the live direction is §1. Assert the reclaim is reported and that it did not block.

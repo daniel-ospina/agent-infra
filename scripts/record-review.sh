@@ -1573,10 +1573,121 @@ delta_git_neutral() { # <root> <git args…>
   return "$rc"
 }
 
+# ── A CASE VARIANT OF THE TIP WORD IS A REF NAME WHEN THE REPO HAS ONE (twenty-third review cycle) ──
+# git ref names are case-SENSITIVE, so `head`, `Head` and `hEaD` are three DIFFERENT strings from
+# `HEAD`, and git resolves a lowercase spelling to the tip ONLY because no ref of that name exists.
+# Every endpoint arm in this file normalises a four-character case variant to the tip word, so that an
+# honest `delta:A..head` (the spelling 20h52a recommends) is readable at all — but normalising WITHOUT
+# asking the repo INVENTS an endpoint. MEASURED, the class-5 defect one arm over from where it was
+# already fixed (the parser arm resolves and compares): with a tag `Head` at an orphan-child commit —
+# neither the head nor on its lineage, so `Head..HEAD` spans the whole main line and is emphatically
+# NOT empty — `I re-read Head..HEAD, i.e. from the ref 'Head' up to the head.` was refused rc 3 as
+# "states an EMPTY range (… both endpoints resolve to the attested head)", and `I re-read Head.. end to
+# end.` was refused the same way with `HEAD..HEAD (the endpoint is omitted, so it defaults to the
+# head)`. Both refusals were false about the artifact in two ways at once — the range was not empty,
+# and its left endpoint was not the attested head — which is the false-block-and-false-sentence class
+# this file records as worse than the gap, and it was the one place where the arms still disagreed
+# about what an endpoint is. So the decision is git's, exactly as in the parser arm: resolve the raw
+# token; leave it ALONE when a ref of that exact case-sensitive name exists (the resolution below then
+# reads the ref the author actually wrote), and substitute the tip word when it does not — which is
+# the only case in which the variant means the tip. A case-variant token carrying selectors
+# (`Head^{commit}`, `head~1`) is decided by its FOUR-CHARACTER operand for the same reason: the
+# selectors are git's grammar and a ref name may not contain `~`, `^` or `@{`.
+# DECLARED REMAINDER, stated rather than left to be discovered: this decision covers every token the
+# arms' shared operand class admits (`_dref`: alphanumerics, `_`, `/`, `+`, `=`, `$`, `%`, `&`, `-`,
+# and an INTERIOR `@` segment). A ref name whose name continues with `~` or `^` is not expressible at
+# all (git-check-ref-format forbids both), and a name CONTAINING a dot (`v1.2.3`) stays outside the
+# empty-range arm for the reason declared there — a class that ate `.` would make `a..b` ambiguous.
+# ⛔ `@` IS AN INTERIOR SEGMENT ONLY (twenty-ninth cycle, P1): `@` is also the tip's own BRACE syntax, so
+# a class that ate `@{` would make `HEAD@{1}` indistinguishable from a ref name. `_dref` admits `@`
+# only when a name character follows it, which is why `head@1` (a real name) IS an operand now and
+# `HEAD@{0}` still arrives as the operand `HEAD` plus the brace. The earlier note here said `@`-bearing
+# names "still do not enter the two ref-name arms" — measurably false after the widening, and a false
+# sentence in a declared-residual is the one a later reader trusts.
+# ⛔ THE MIRROR ARM RESOLVES ITS LEFT WORD IN THE ATTESTED FRAME (round 13 — MEASURED, a FRAME-DEPENDENT
+# verdict this lane introduced in round 7). The written left end was resolved with `rev-parse` in the
+# DELTA CHECKOUT, so a decorated `HEAD` meant "whatever that clone happens to have checked out": `HEAD`
+# with a fence around it (backtick or comma or period) is `HEAD..anc`, nought commits, and it was
+# REFUSED at the attested head while a base-parked checkout — the ORDINARY frame a recorder runs in —
+# MINTED a signed `clean`. The tip's own word denotes the attested head in every frame, and a selector
+# hangs off it in that frame too; everything else (a sha, a ref name) is frame-independent by
+# construction and goes to `rev-parse` unchanged.
+_attres() { # <word> -> sha in the ATTESTED frame
+  case "$1" in
+    HEAD|@|@\{0+\}|@\{now\}) _attres_r='' ;;
+    HEAD[~^]*|HEAD@\{*) _attres_r="${1#HEAD}" ;;
+    @*) _attres_r="${1#@}" ;;
+    *) delta_git "$root" rev-parse --verify "$1^{commit}" 2>/dev/null || true; return 0 ;;
+  esac
+  delta_git "$root" rev-parse --verify "${_tosha}${_attres_r}^{commit}" 2>/dev/null || true
+}
+_tipvariant() { # <token> -> the token, with a tip-word case variant normalised to HEAD when no such ref
+  case "$1" in
+    HEAD|@) printf '%s' "$1" ;;
+    [Hh][Ee][Aa][Dd])
+      if delta_git "$root" rev-parse --verify "$1^{commit}" >/dev/null 2>&1; then
+        printf '%s' "$1"
+      else
+        printf 'HEAD'
+      fi ;;
+    [Hh][Ee][Aa][Dd][~^@]*)
+      # ⛔ THE WHOLE TOKEN IS THE QUESTION, NOT ITS FOUR-CHARACTER OPERAND (thirtieth review cycle, P1 —
+      # MEASURED, a fail-open). `${1:0:4}` is the correct test for `head~1` — a name may not contain `~`
+      # or `^`, so such a token can only be the tip's word plus a selector — but a BARE `@` IS a legal
+      # ref-name character: `git check-ref-format refs/heads/head@1` → rc 0, and only the SEQUENCE `@{`
+      # is forbidden. So a branch named `head@1` was normalised to `HEAD@1`, the arms below split it as
+      # the tip plus a reflog position, resolved `<head>@1` (`fatal: Needed a single revision`), and
+      # walked past the only range they exist to refuse: `head@1..HEAD` — nought commits against the
+      # recorded ones — recorded a signed `clean`. The repo decides, exactly as it does for the bare
+      # four-character spelling above: a token that RESOLVES is a NAME, whatever it looks like.
+      if delta_git "$root" rev-parse --verify "$1^{commit}" >/dev/null 2>&1; then
+        printf '%s' "$1"
+      elif delta_git "$root" rev-parse --verify "${1:0:4}^{commit}" >/dev/null 2>&1; then
+        printf '%s' "$1"
+      else
+        printf 'HEAD%s' "${1:4}"
+      fi ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# ── THE TIP'S WORD, RE-ROOTED ON THE ATTESTED HEAD (twenty-ninth review cycle, P2) ───────────────────
+# `_tiproot <token>` prints the token with the tip's word replaced by the ATTESTED head sha, or nothing
+# when the token is not the tip's word (a ref name, a sha, prose).
+#
+# ⛔ WHY THIS EXISTS AS ONE HELPER. The arms need one decision — "is this operand the tip?" — and the
+# parser arm needed it BEFORE it peeled a name-legal run onto the operand. It did not have it, so
+# `delta:<A>..HEAD^{commit}` was peeled to `HEAD^{commit}` (which resolves, in whatever commit the DELTA
+# CHECKOUT happens to sit on), the tip case arm then missed it because it is no longer a tip SPELLING,
+# and the peeled token was resolved through the checkout: the honest artifact was refused as "states a
+# DIFFERENT range" whenever that checkout was not at the attested head — MEASURED rc 3 with a stale
+# worktree, rc 0 for the identical claim spelled with the head's own sha. That is the frame dependence
+# the eighteenth and nineteenth cycles removed everywhere else, re-entering through the peel.
+#
+# ⛔ THE SPLIT IS GIT'S GRAMMAR, NOT A CHARACTER LIST. `git-check-ref-format` forbids `~`, `^` and the
+# sequence `@{` INSIDE a ref name, so those continuations are the ONLY ones that make a `head…` token
+# the tip's word; everything else beginning with those four characters is a REF NAME (`headroom`,
+# `HEADER`, `head+1`), left to the resolution that already decides every token the arm cannot read by
+# spelling. ⛔ AND A CASE VARIANT IS STILL THE REPO'S ANSWER: `_tipvariant` normalises `head`/`Head`/…
+# to the tip ONLY when no ref of that exact case-sensitive name exists, which is what keeps an honest
+# lowercase `..head` accepted (20h73d) while a tag `head` at a mid commit stays a ref name (20h73e).
+_tiproot() { # <token> -> the token re-rooted on the attested head, or ""
+  case "$1" in
+    HEAD|@) printf '%s' "$_tosha" ;;
+    HEAD[~^]*|HEAD@\{*) printf '%s' "${_tosha}${1:4}" ;;
+    @*) printf '%s' "${_tosha}${1:1}" ;;
+    [Hh][Ee][Aa][Dd]|[Hh][Ee][Aa][Dd][~^@]*)
+      case "$(_tipvariant "$1")" in
+        HEAD) printf '%s' "$_tosha" ;;
+        HEAD*) printf '%s' "${_tosha}${1:4}" ;;
+      esac ;;
+  esac
+}
+
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _olbare="" _olbsha="" _olkeep="" _ollead="" _oldec="" _omkeep="" _omlead="" _omdec="" _omdsha="" _omleft="" _omleftstated="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _esep="" _elsha="" _ersha="" _eranges="" _erangesprev="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _dref="" _drefg=1 _didentg=2 _g_op1=2 _g_dref1=3 _g_dident1=4 _g_op2=6 _g_dref2=7 _g_chain1=4 _g_chain2=8 _tiprest="" _srooted="" _afterhead=0 _afterstated="" _sorig="" _srun="" _sbfull="" _sb="" _scand="" _sres="" _spn=0 _sident=0 _sres2="" _ompre="" _omword="" _omw="" _attres_r="" _olpost="" _olword="" _olw="" _olwsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -2113,6 +2224,12 @@ $m"
       { rec = rec $0 "\n" }
       END {
         gsub(/\\n/, "\n", rec)
+        # A TAB ARRIVES AS THE TWO CHARACTERS backslash-t (eighteenth cycle, P2 - MEASURED): the
+        # evidence body is read through `gh --jq @tsv`, which escapes a real tab that way, so the
+        # [[:space:]] tolerance never saw one and a tab-separated `HEAD^0..HEAD` recorded a signed
+        # `clean` while the space-separated spelling was refused. Un-escaping it makes the whitespace
+        # tolerance mean what it says, exactly as the newline un-escape above does for a split range.
+        gsub(/\\t/, "\t", rec)
         n = split(rec, L, "\n")
         # A LINE-BY-LINE STATE MACHINE, mirroring brief-gate.sh s own `ins`/`depth`: open on a
         # heading match, close on a heading at or above that depth (subsections stay inside), and
@@ -2287,14 +2404,321 @@ $m"
     # requirement the ninth cycle added, which is exactly what the skip's own comment promises it
     # does not do ("it is skipped, never silently accepted as a range"). 20h41 could not see it:
     # there a REAL range is stated beside the prose, so it takes the other branch.
-    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}) ]]; do
+    # ⛔ THE RIGHT-HAND ENDPOINT MAY BE THE TIP SPELLED AS A WORD (fourteenth review cycle, P1 —
+    # MEASURED: the body `reviewed delta:<BASE>..<HEAD>; … I only actually reviewed c8a0e0..HEAD`
+    # recorded rc 0 and minted a SIGNED `clean` over the wide range. `HEAD` is not hex, so this
+    # regex matched nothing; `c8a0e0` is 6 chars, so the token scan below never saw it either; and
+    # the 7-floor skip in this loop means the pair was never even a candidate. Both layers missed
+    # the same pair, in concert — the shape the third cycle named.) A tip spelling is RESOLVED here
+    # and compared against the head being attested, which is the only reading under which
+    # `BASE..HEAD` is an honest statement of a range that ends at B. `HEAD` that does not resolve in
+    # this checkout REFUSES: an endpoint this code cannot evaluate is not a verified endpoint, and a
+    # stated range that cannot be checked is the fail-open this arm exists to stop. A symbolic ref
+    # (`main..HEAD`) is still NOT interpreted — that remains the declared residual below, because
+    # resolving prose nouns would refuse honest artifacts.
+    # ⛔ A TIP SPELLING IS A WHOLE TOKEN, NOT A PREFIX (twenty-second review cycle, P1 — MEASURED).
+    # The alternatives above carried NO trailing boundary, so the token was matched by PREFIX and the
+    # rest of it was DISCARDED: `delta:<BASE>..head-mid` / `..HEADER` / `..head/…` captured `head`,
+    # the tip check below then substituted the attested head for it, and the arm compared and
+    # accepted a range the artifact had NARROWED — MEASURED rc 0 with a signed `clean` for a branch `head-mid`
+    # at a mid commit, while the identical claim spelled `..mid-ref` was refused (rc 3). The only
+    # difference between the two rows was the first four characters of a REF NAME, which is the
+    # spelling-enumeration failure this file exists to end — and the token scan below already states
+    # the rule the arm was breaking (a token is a WHOLE token).
+    # ⛔ THE CONTINUATION CLASS IS GIT'S REF-NAME GRAMMAR, NOT "THE WORD CHARACTERS PLUS TWO"
+    # (twenty-third review cycle, P1 — MEASURED, and the first version of the fix was wrong in
+    # exactly the way it accused the old code of being wrong). The class used to be `[^0-9A-Za-z_/-]`,
+    # justified here as "`-` and `/` are the two characters that make a git ref name" — a FALSE
+    # sentence: `git-check-ref-format` forbids only `~`, `^`, `:`, `?`, `*`, `[`, `\`, space and
+    # control characters, so `+ = , ! $ % & ' ( ) ; < > @` are all legal INSIDE a name. MEASURED with a
+    # branch `head+1` at a mid commit: `delta:<BASE>..head+1` recorded rc 0 with
+    # `"delta_range":"<BASE>..<HEAD>"` — a signed `clean` over the commits the artifact excluded —
+    # while the identical claim on a ref not named `head…` (`..mid+2`, same commit) was refused rc 3.
+    # So the class now admits every ref-legal character that can continue a name in running prose
+    # WITHOUT also being able to end one: alphanumerics, `_`, `/`, `-`, and `+ = $ % & @` (the last
+    # closes `head@1`, which had been read as the bare tip word plus a discarded selector). `!` was
+    # added with them and then REMOVED again — it can end a sentence, and the measurement is below.
+    # DECLARED REMAINDER, stated rather than discovered: `, ; : ( ) < > ' " !` still TERMINATE the token,
+    # so a ref whose name continues with one of them (`head,1`, `head'1`) reads as the tip word
+    # followed by punctuation. That is a CHOICE against the other error, not an oversight: those are
+    # precisely the characters that end a sentence or a quoted token, and an artifact that writes
+    # `reviewed delta:<BASE>..HEAD;` / `..HEAD,` / `..HEAD)` / `"delta:<BASE>..HEAD"` is the ordinary
+    # honest form this arm must accept — refusing them would be the false-block class this file
+    # records as worse than the gap. `!` is in that set for the same reason and was measured there
+    # (twenty-fourth cycle, P2): `reviewed delta:<BASE>..HEAD!` is a sentence, and the parent head
+    # accepted it, so leaving `!` a name character turned a widened class into a NEW false block. The
+    # trade is declared rather than hidden: a ref named `head!1` now reads as the tip word followed by
+    # punctuation, which is the gap this file chooses over refusing an honest artifact. A "maximal ref-legal run then resolve" rule cannot split them
+    # either: `;` is ref-legal, so that rule reads `..HEAD;` as a ref named `HEAD;`.
+    # ⛔ A BRACE ON THE TIP IS A SELECTOR, NOT PART OF THE NAME — AND IT IS DECIDED, NOT IGNORED
+    # (twenty-third review cycle, found by the commit verifier, MEASURED). `@` had to join the
+    # continuation class to close `head@1` (a legal ref name), but the tip's OWN reflog syntax starts
+    # with `@` too: `..HEAD@{0}` and `..HEAD@{now}` — the identity spellings this file protects
+    # elsewhere (20h53/20h53b, 20h66: "an honest artifact that merely NAMED one was refused … which is
+    # false about it") — stopped matching at all and were refused as "cannot parse". The boundary
+    # therefore admits `@{…}` as a GROUP, and the group is then decided by the SAME rule the tip arm
+    # above applies to a chain: `@{now}` and a pure-zero count are the attested head itself; any other
+    # POSITION (`@{1}`, `@{00}0…`, a dated brace) is an ELDER commit, i.e. the claim ends somewhere
+    # other than the head and is refused as a different range; a name continuing with `@` and NO brace
+    # (`head@1`) still does not match, which is what keeps that ref name a name.
+    # A symbolic brace (`@{upstream}`, `@{push}`) is refused HERE, unlike the tip arm, and the
+    # asymmetry is deliberate: there the brace is prose the artifact merely mentioned, while here it
+    # is the ENDPOINT of the stated range — an endpoint this code cannot evaluate is not a verified
+    # endpoint, which is the same rule that refuses an unresolvable `HEAD`.
+    # ⛔ A BRACE ON THE BARE OPERAND `@` IS THE SAME BRACE, AND IT WAS NOT REACHED (twenty-fifth review
+    # cycle, P0 — MEASURED, a REGRESSION this branch introduced). The group above starts at `@`, and
+    # the operand alternative `@` is tried BEFORE the brace group, so for `..@{u}` the operand takes
+    # the `@`, the brace group can never begin at `{`, and the boundary class matched the `{` alone —
+    # `_sbrace` stayed EMPTY, `_straw` stayed `@`, and the tip arm read it as the attested head. With
+    # the branch's upstream at a mid commit, `delta:<BASE>..@{u}` recorded rc 0 over `<BASE>..<HEAD>`
+    # while the artifact had stated one commit, and the parent head REFUSED the same text (rc 1, it
+    # could not parse it at all). `@{1}`, `@{yesterday}`, `@{-1}` and `@{2.weeks.ago}` were refused
+    # only because a later arm caught them — the ENDPOINT arm accepted every one of them. The brace
+    # group therefore has a second spelling, `\{…\}`, which is the brace as it arrives when the
+    # operand already ate the `@`; both spellings reconstruct the SAME `@{…}` token and go through the
+    # one position rule above, so `..@{0}` is the tip and `..@{u}` is an endpoint this code will not
+    # evaluate.
+    # ⛔ A NAME-LEGAL RUN AFTER THE TOKEN IS PEELED BY GIT, NOT REFUSED BY THE CLASS (twenty-fifth
+    # cycle, P1 — MEASURED, an undeclared cost of the admitted set). Requiring a non-name character
+    # after the operand refused honest artifacts whose range is immediately followed by name-legal
+    # prose — `delta:<A>..<B>+comment:<id>` (the evidence ref this tool itself teaches, quoted right
+    # after the range), `..<B>/diff.`, `..<B>=3 commits`, `..<B>$3` — every one of them rc 0 at the
+    # parent and rc 1 here as "cannot parse", i.e. the same false-block class the `!` removal was for.
+    # The boundary is now decided by RESOLUTION: the operand plus the whole name-legal run is offered
+    # to git, and when that is not a revision the run is peeled one character at a time from the right
+    # until it is. `head+1` (a real ref) resolves WHOLE, so it is still the ref and not a truncated
+    # tip; `..<B>+comment:…` peels to `<B>`, the commit the artifact actually wrote. DECLARED
+    # REMAINDER of the peel: a name-legal run that resolves to NO revision at all leaves the operand
+    # as written, so a name whose continuation is prose (`..<B>-1`) reads as `<B>` — the same
+    # truncation direction as the class rule it replaces, chosen because git, not a character list,
+    # now answers the question.
+    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|\{[^}]*\}|[^0-9A-Za-z_/+=$%&@~^{}-]|$|[0-9A-Za-z_/+=%$&@~^{}-]+) ]]; do
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       _ss="${BASH_REMATCH[2]}"
-      _st="$(printf '%s' "${BASH_REMATCH[3]}" | command tr 'A-F' 'a-f')"
+      # ⛔ ONE SPELLING, NOT TWO: THE RAW TOKEN IS BOTH WHAT DECIDES AND WHAT THE MESSAGE QUOTES
+      # (fifteenth review cycle, P2 — MEASURED at 2aba1583a: the arm accepts the SIXTEEN case variants
+      # of the tip (`[Hh][Ee][Aa][Dd]`), but resolved the TR'D spelling, which is not a name git has —
+      # `rev-parse 'HEAD^{commit}'` rc 0, `'head^{commit}'` and `'Head^{commit}'` BOTH rc 128 with
+      # "Needed a single revision". So an honest `reviewed delta:<BASE>..head` fell through to
+      # `_ok=0` and was refused as "states a DIFFERENT range", whose only remedy is re-wording an
+      # evidence comment that must postdate the head — i.e. the full re-review the seventh cycle's
+      # P2 names as worse than the gap. The spelling it ACCEPTS and the spelling it can RESOLVE were
+      # two different sets; a case arm that widens one without widening the other is a false block
+      # generator. Eleven cycles of fixes widened the RESOLUTION SET here, and the `tr`'d copy became
+      # the defect below because it is a LOSSIER spelling — it turns `HEAD` into `Head`, a name the
+      # repo may actually carry. So the two sets are now the same one: the arm accepts the raw token
+      # and resolves the raw token, case-SENSITIVELY, and quotes it back in the refusal where
+      # verbatim is the point.
+      _straw="${BASH_REMATCH[3]}"
+      _st="$(printf '%s' "$_straw" | command tr 'A-F' 'a-f')"
       # Advance PAST this match so the next iteration cannot re-match a suffix of it.
       _scan="${_scan#*"${BASH_REMATCH[0]}"}"
       _ok=0
-      case "$to" in "$_st"*) _ok=1 ;; esac
+      _stcmp="$_st"
+      # ⛔ THE TIP CHECK CANNOT KEY ON THE `tr`'d COPY. `tr 'A-F' 'a-f'` above maps E/A/D but NOT
+      # `H` (it is outside A-F), so `HEAD` normalises to `Head` — a `case` arm written `head|@`
+      # matched NOTHING and every honest `BASE..HEAD` artifact was refused with "states a DIFFERENT
+      # range … the body quotes …..Head" (measured while writing 20h52a, which is why that control
+      # exists). The test is on the RAW spelling (see the twenty-third cycle below), which is neither
+      # the `tr`'d copy nor a case-insensitive comparison: `HEAD` is the tip by NAME, and `head` is a
+      # DIFFERENT name that git resolves to the tip only when no ref of its own exists.
+      # ⛔ A TIP SPELLING IS THE ATTESTED HEAD, NOT THIS CHECKOUT\'S (ninteenth cycle, P1 — MEASURED):
+      # resolving `HEAD` through the delta checkout made the arm\'s own recommended spelling
+      # (`reviewed delta:A..HEAD`, 20h52a) be refused as "states a DIFFERENT range" whenever that
+      # checkout sat anywhere but the attested head — a false block whose message accuses the artifact
+      # of a contradiction it never wrote. The tip is `$to` by definition here; no git call needed.
+      # ⛔ THE CANONICAL TIP SPELLINGS ARE THE ATTESTED HEAD BY DEFINITION; A CASE VARIANT IS NOT,
+      # UNLESS THE REPO HAS NO REF OF THAT NAME (twenty-second cycle, P1 — MEASURED). `HEAD` and `@`
+      # are git's own names for the tip, so no resolution is owed. The sixteen case variants are
+      # DIFFERENT strings, and git ref names are case-SENSITIVE: with a tag named `head` at a mid
+      # commit, `delta:<BASE>..head` recorded rc 0 over `..<HEAD>` — a signed `clean` over commits
+      # the artifact had excluded — because the variant was rewritten to the tip without asking the
+      # repo. Resolving it first answers the question git itself would answer, and leaves the
+      # fifteenth cycle's false-block fix intact: where no such ref exists, `rev-parse` fails and the
+      # token IS the tip word (an honest lowercase `..head` stays accepted, 20h73d).
+      # ⛔ THE TIP DECISION IS MADE ON THE RAW SPELLING, CASE-SENSITIVELY (twenty-third review cycle, P1 —
+      # MEASURED). `_stcmp` is the `tr 'A-F' 'a-f'` COPY used for the hex prefix compare below, and the
+      # tip test used to run on it — where `HEAD` normalises to `Head`. So the canonical spelling never
+      # reached the `HEAD|@)` arm and was RESOLVED like a variant instead of being the tip by
+      # definition. With a ref named `Head` anywhere in the delta repo, the ordinary honest artifact
+      # `reviewed delta:<BASE>..HEAD` was refused as "states a DIFFERENT range" — MEASURED rc 3, a false
+      # block whose message accuses the artifact of a contradiction it never wrote, in a repo where git
+      # itself has NO ambiguity (`rev-parse HEAD` reads the pseudo-ref; `rev-parse Head` reads the tag:
+      # they are different, case-sensitive names). The decision therefore runs on `_straw`, the spelling
+      # the artifact actually wrote: `HEAD`/`@` are the tip by definition, and only a genuine VARIANT is
+      # resolved — against its own spelling, never a lowercased copy.
+      _sbrace=""
+      # `:-` because a MUTANT that removes the group must measure the arm, not die on `set -u`: the
+      # matrix's whole value is that a cell which cannot build its mutant REDDENS rather than passing
+      # silently, and an unbound-index abort would have reported "mutant still refused" — a vacuous
+      # pass wearing the shape of a load-bearing one (M60, measured).
+      _srun=""
+      _sbfull=""
+      case "${BASH_REMATCH[4]:-}" in
+        '@{'*) _sbrace="${BASH_REMATCH[4]}"; _sbfull="$_sbrace" ;;
+        # The brace as it arrives after the operand alternative `@` ate the `@`: same token, and it is
+        # kept in its RAW form so the reconstruction below is `${operand}${group}` — `@` + `{u}` — not
+        # `@@{u}` (twenty-sixth review cycle, P2 — MEASURED: the refusal told an author their artifact
+        # read `..@@{u}` because the group had been rewritten to carry an `@` the operand already had).
+        '{'*) if [ "$_straw" = "@" ]; then _sbrace="${BASH_REMATCH[4]}"; _sbfull="@${_sbrace}"; fi ;;
+        *) _srun="${BASH_REMATCH[4]:-}" ;;
+      esac
+      # ⛔ THE TIP'S WORD IS DECIDED BEFORE THE PEEL, AND ITS RUN IS PEELED IN THE ATTESTED FRAME
+      # (twenty-ninth review cycle, P2 — MEASURED, and it was a frame REGRESSION this branch
+      # introduced). The peel below offers `${operand}${run}` to `git` and keeps the longest
+      # right-trimmed prefix that RESOLVES — correct for a token whose meaning is content-addressed
+      # (a sha) or repo-wide (a ref name), and WRONG for the tip's word, whose resolution is
+      # whatever the DELTA CHECKOUT happens to be sitting on. So `delta:<A>..HEAD^{commit}` was
+      # peeled to `HEAD^{commit}`, the tip spelling disappeared behind a selector, the tip case arm
+      # no longer recognised it, the peeled token was resolved THROUGH the checkout, and the claim
+      # was refused as "states a DIFFERENT range" — the honest artifact accused of contradicting a
+      # range it reproduces exactly. MEASURED: rc 3 whenever the checkout's HEAD was not the
+      # attested head, rc 0 for the identical claim spelled with the head's sha. `_tiproot` answers
+      # the frame question once, and the run is then peeled against the attested head instead of
+      # `$root`, so no checkout is consulted for a tip-rooted endpoint (the same rule the empty-range
+      # arm's `_lrest`/`_rrest` split already applies to both of its ends).
+      # ⛔ AND THE ROOT IS SUPPLIED HERE, NOT READ FROM A VARIABLE SET LATER (twenty-ninth cycle, P2 —
+      # MEASURED, and it is the SAME frame bug one layer down): `_tosha` is assigned below for the tip
+      # scan, so at this point it is EMPTY — `_tiproot` then printed `${1:4}` with no root at all,
+      # `^{commit}` was resolved by git in the DELTA CHECKOUT, and frame B refused the honest claim
+      # exactly as before the fix. `${_tosha:-$to}` makes the assignment order irrelevant: `to` IS the
+      # attested head, and `_tosha` is only its `^{commit}` spelling.
+      # ⛔ AND THE TOKEN IS THE WHOLE TOKEN, NOT THE SHORT OPERAND (twenty-ninth cycle, P2 — MEASURED,
+      # and it inverted a refusal into an acceptance the moment the line above started supplying a
+      # root): group 3 captures only `hex | <tip word> | @`, so for `..head-mid` the operand is the
+      # five letters `head` and `-mid` arrives in group 4 as the RUN. Offering `_straw` alone made
+      # `_tiproot` normalise that truncated operand to the tip and the artifact's `head-mid` — a ref at
+      # a MID commit, i.e. a stated range that excludes the head — was ACCEPTED (20h73/20h73b/20h73c
+      # went red). The whole token is the operand plus its brace or its run; the BRACE is the raw
+      # `{...}` group (a bare `@` operand keeps its `@` in `_straw`, so this reconstructs `@{1}`, not
+      # `@@{1}`), and exactly one of brace/run is ever non-empty.
+      _tosha="${_tosha:-$to}"; _srooted="$(_tiproot "${_straw}${_sbrace}${_srun}")"
+      # ⛔ THE BOUNDARY IS GIT'S ANSWER, NOT THIS CLASS'S (see the twenty-fifth cycle above). Offered
+      # whole first — so a real ref that merely CONTINUES like prose (`head+1`) is that ref — then
+      # peeled from the right until it resolves. Bounded, because a pathological token must cost a
+      # bounded number of git calls, and the bare operand is always tried before giving up.
+      if [ -n "$_srun" ] && [ -z "$_srooted" ]; then
+        _scand="${_straw}${_srun}"
+        _sres=""
+        _spn=0
+        while [ "$_spn" -lt 40 ]; do
+          _spn=$((_spn + 1))
+          if [ -n "$(delta_git "$root" rev-parse --verify "${_scand}^{commit}" 2>/dev/null || true)" ]; then
+            _sres="$_scand"
+            break
+          fi
+          [ "$_scand" = "$_straw" ] && break
+          _scand="${_scand%?}"
+        done
+        if [ -n "$_sres" ]; then _straw="$_sres"; fi
+      fi
+      # The run after a TIP ROOT is text until the ATTESTED frame resolves it.
+      if [ -n "$_srooted" ]; then
+        _scand="$_srun"; _sres=""; _spn=0
+        while [ "$_spn" -lt 40 ]; do
+          _spn=$((_spn + 1))
+          if [ -n "$(delta_git "$root" rev-parse --verify "${_srooted}${_scand}^{commit}" 2>/dev/null || true)" ]; then
+            _sres="$_scand"
+            break
+          fi
+          [ -z "$_scand" ] && break
+          _scand="${_scand%?}"
+        done
+        _srun="$_sres"
+      fi
+      if [ -n "$_sbrace" ]; then
+        # The brace is part of the CLAIM (so the refusal quotes it) and it decides the endpoint.
+        # ⛔ THE BRACE DECIDES THE POSITION — THE OPERAND STILL DECIDES THE NAME (twenty-fourth review
+        # cycle, P1 — MEASURED, and it was a REGRESSION against the parent). The first version of this
+        # branch keyed on the SPELLING alone: `…@{0}` and `…@{now}` the attested head, anything else an
+        # elder position. But a reflog position belongs to a NAME, and `head` may BE a ref name at a
+        # mid commit: `delta:<BASE>..head@{0}` is that ref's current tip — the mid commit — and it
+        # recorded rc 0 with `delta_range=<BASE>..<HEAD>`, a signed `clean` over exactly the commits
+        # the artifact excluded, while the parent head refused the same text. So the operand is
+        # decided FIRST, by the same git query every other arm uses (`_tipvariant`), and only the
+        # canonical tip word takes the position rule with no checkout consulted — a variant that is
+        # NOT a ref is the tip word here too, which keeps an honest `..head@{0}` frame-free instead of
+        # resolving it in the delta checkout.
+        _sorig="${_straw}"
+        # ⛔ AN IDENTITY POSITION IS THE COMMIT ITSELF, WHATEVER SPELLS THE OPERAND (twenty-sixth review
+        # cycle, P2 — MEASURED, and it was a REGRESSION against the parent). Only the tip WORD was
+        # special-cased, so `delta:<A>..<head-sha>@{0}` — the head's own sha with the reflog position
+        # that means "this commit" — went to `rev-parse '<sha>@{0}'`, which git REJECTS ("Needed a
+        # single revision": a sha has no reflog), and an honest claim was refused while `..HEAD@{0}`
+        # and `..@{0}` were accepted. The identity is decided on the POSITION, and then the operand is
+        # resolved: the tip's own words are the attested head with no checkout consulted, and every
+        # other operand is resolved like any other endpoint. A symbolic or elder position on a non-tip
+        # operand stays refused — an endpoint this code cannot evaluate is not a verified endpoint.
+        _sin="${_sbfull#@\{}"; _sin="${_sin%\}}"
+        case "$_sin" in
+          now) _sident=1 ;;
+          *[!0-9]*) _sident=0 ;;
+          *[1-9]*) _sident=0 ;;
+          *) _sident=1 ;;
+        esac
+        if [ "$_sident" = 1 ]; then
+          # ⛔ THE TIP'S WORD IS THE ATTESTED HEAD BY DEFINITION, SO ITS IDENTITY POSITION IS THE
+          # COMMIT BEING ATTESTED — no checkout, no resolution. `_tiproot` is the one decision (see
+          # the twenty-ninth cycle above); `_tipvariant` alone could not see a case variant that the
+          # repo DOES have as a ref name, and the two must not disagree here.
+          if [ -n "$_srooted" ]; then
+            _stcmp="$to"
+          else
+            case "$(_tipvariant "$_sorig")" in
+              HEAD|@) _stcmp="$to" ;;
+              *)
+                _sb="$(delta_git "$root" rev-parse --verify "${_sorig}^{commit}" 2>/dev/null || true)"
+                _stcmp="${_sb:-}" ;;
+            esac
+          fi
+        else
+          _stcmp=''
+        fi
+        # What the author WROTE is the operand plus its brace, not the peeled run alone.
+        _straw="${_sorig}${_sbrace}"
+      elif [ -n "$_srooted" ]; then
+        # ⛔ A TIP-ROOTED ENDPOINT IS EVALUATED IN THE ATTESTED FRAME, NEVER IN THE CHECKOUT (twenty-
+        # ninth review cycle, P2). `_srun` has already been peeled against `$_tosha`, so this is the
+        # exact commit the artifact's endpoint denotes: `${to}` for every identity selector
+        # (`^{commit}`, `^{}`, `~0`, `^0` — the honest forms 20h87 pins), and a DIFFERENT commit for a
+        # real selector (`~1`, `^{/…}`), which is then refused rather than accepted.
+        _stcmp="$(delta_git "$root" rev-parse --verify "${_srooted}${_srun}^{commit}" 2>/dev/null || true)"
+        # `_straw` still holds the RAW operand here (the peel was skipped for a tip root), so this is
+        # exactly what the author wrote.
+        _straw="${_straw}${_srun}"
+      else
+        case "$_straw" in
+          HEAD|@) _stcmp="$to" ;;
+          [Hh][Ee][Aa][Dd])
+            _svsh="$(delta_git "$root" rev-parse --verify "${_straw}^{commit}" 2>/dev/null || true)"
+            if [ -n "$_svsh" ]; then _stcmp="$_svsh"; else _stcmp="$to"; fi ;;
+        esac
+      fi
+      if [ -n "$_stcmp" ]; then
+        # ⛔ A RESOLVABLE ENDPOINT IS COMPARED BY CONTENT, NOT BY SPELLING (twenty-sixth review cycle, P1 —
+        # MEASURED; PRE-EXISTING rather than introduced here, and fixed here because this arm is the
+        # one that decides it). The compare below is a SPELLING prefix test, so `delta:<A>..<hex-named
+        # branch>` was accepted as the head whenever the branch's NAME happened to prefix the head's
+        # sha: with a branch `ce41c945` at the range's START, `..ce41c945` states ZERO commits and
+        # recorded a signed `clean` over the whole range — the token scan skips it (an ancestor of
+        # `from`) and nothing resolved the spelling against the repo. Resolving first closes the
+        # opposite error too — a ref that IS the head (`..deltatip`) was refused because its name is
+        # not a hex prefix — and the spelling fallback stays for tokens that resolve to nothing, which
+        # is what an ABBREVIATED sha needs when the abbreviation is too short for `rev-parse`.
+        # ⛔ AND NOT FOR A TIP-ROOTED TOKEN (twenty-ninth review cycle, P2): `_srooted` non-empty means
+        # the operand is the tip's word, which was already evaluated in the ATTESTED frame above. This
+        # re-resolution used to run on the PEELED token and answer in the checkout's frame, which is
+        # the measured false block this cycle fixes.
+        if [ -z "$_sbrace" ] && [ -z "$_srooted" ]; then
+          case "$_straw" in
+            HEAD|@) : ;;
+            *)
+              _sres2="$(delta_git "$root" rev-parse --verify "${_straw}^{commit}" 2>/dev/null || true)"
+              [ -z "$_sres2" ] || _stcmp="$_sres2" ;;
+          esac
+        fi
+        case "$to" in "$_stcmp"*) _ok=1 ;; esac
+      fi
       _sfs="$(delta_git "$root" rev-parse --verify "${_sf}^{commit}" 2>/dev/null || true)"
       # ⛔ ONLY A TOKEN THAT SURVIVED THE SKIP COUNTS AS A STATED RANGE.
       if [ -z "$_sfs" ] && [ "${#_sf}" -lt 7 ]; then
@@ -2310,13 +2734,13 @@ $m"
         fi
       fi
       if [ "$_ok" -ne 1 ]; then
-        stated_from="$_sf"; stated_sep="$_ss"; stated_to="$_st"
+        stated_from="$_sf"; stated_sep="$_ss"; stated_to="$_straw"
         _all_ok=0
         break
       fi
     done
     if [ "$_any" -eq 1 ] && [ "$_all_ok" -ne 1 ]; then
-      echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}${stated_sep}${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts. (EVERY range the artifact states is checked, not just the first.)" >&2
+      echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}${stated_sep}${stated_to} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts. (EVERY range the artifact states is checked, not just the first.)" >&2
       return 1
     fi
     if [ "$_any" -eq 1 ]; then
@@ -2376,10 +2800,26 @@ $m"
     # construction, and a commit LATER than A is refused as a narrowing in whatever notation it
     # was written. Unresolvable runs are prose, not commits, and are ignored (a sha that is not
     # in this repo cannot narrow this range). Alphabet-independent, and it does not need to know the
-    # word "through". Its length floor is 7 for a PROSE token (4-6 hex runs are ordinary words), and
-    # that is not a gap: a dots-adjacent 4-6 run is handled by the parser above at the SAME floor,
-    # which is where a typed abbreviation actually appears (ninth cycle, P1 — the two layers' floors
-    # used to be 12 and 7, leaving 4-6 invisible to both).
+    # word "through".
+    # ⛔ ITS FLOOR IS THE SAME AS THE PARSER'S, AND FOR THE SAME REASON (fourteenth review cycle, P1 —
+    # the sentence here claimed the 4-6 hole was covered "by the parser above at the SAME floor", and
+    # that was TRUE ONLY FOR THE DOTS SPELLING: MEASURED at the previous head, `I only actually
+    # reviewed c65758–a31889` (en dash) and `c65758 through a31889` both recorded rc 0, because a
+    # non-dot separator is not the parser's shape and a 6-char run was below this scan's floor — the
+    # SAME pair invisible to both layers, which is the ninth cycle's P1 one spelling over. A false
+    # sentence is worse than no sentence: it is the sentence a later reader uses to close the hole as
+    # already-covered. So the floor is carried by ONE discriminator for both layers — a 4-40 hex run
+    # is a commit claim when it RESOLVES here — and a run that does not resolve is prose, as before.
+    # ⛔ A PURELY DECIMAL RUN IS NOT AN ABBREVIATED SHA, and it is the one exclusion kept (stated
+    # rather than silent): `1351`, `2024`, `4000` are counts, years and shard indices, every one of
+    # which appears in ordinary review artifacts, and each is a 4-char hex-lookalike whose chance of
+    # colliding with SOME commit prefix in a repo this size is a few percent. Treating those as
+    # commit claims would FALSE-BLOCK honest artifacts — the failure mode the seventh cycle's P2
+    # names as worse than the gap, because its only remedy is the full re-review this feature exists
+    # to avoid. A 4-6 char abbreviation that is genuinely all digits still escapes this scan; that is
+    # the declared residual, and it is the same conservative/gap tradeoff the ambiguous-prefix
+    # residual above already makes. The `rev-parse` discriminator is still the authority: a mixed
+    # run that does not resolve is prose.
     # ⛔ THE UNRELATED-LINEAGE HALF IS NOT SLACK, IT IS THE BOUND OF THE RULE (seventh review
     # cycle, P2 — MEASURED: the sixth cycle refused a commit reachable from NEITHER endpoint, so
     # an artifact quoting another PR's sha, or a base tip that is not in this branch's history,
@@ -2402,7 +2842,14 @@ $m"
     # exists to catch, reached through the guard itself: "the claim names no commits" and "nothing
     # scanned the claim" must not be one value. rc 1 stays a pass; rc >= 2 refuses.
     _toks=""; _tok_rc=0
-    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{7,40}' | command tr 'A-F' 'a-f' | command sort -u)" || _tok_rc=$?
+    # ⛔ THE EXCLUSION IS THE 4-6 WINDOW, NOT "EVERY PURE-DECIMAL RUN" (fifteenth review cycle, P1 —
+    # MEASURED: the fourteenth cycle's filter was `grep -E '[a-fA-F]'`, which drops a PURE-DECIMAL
+    # run of ANY length — so a real 7-char all-decimal sha (`3273726` here resolves to
+    # 3273726111e3…) became invisible to this scan, although the pre-fix 7-floor had covered it.
+    # That is a NEW fail-open in the arm that exists to stop fail-opens, and it contradicted the
+    # residual declared in the comment above, which says "A 4-6 char abbreviation that is genuinely
+    # all digits". The exclusion is therefore written as the WINDOW it was argued for.
+    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{4,40}' | command grep -vE '^[0-9]{4,6}$' | command tr 'A-F' 'a-f' | command sort -u)" || _tok_rc=$?
     if [ "$_tok_rc" -gt 1 ]; then
       echo "   delta: the commit-token scan FAILED (rc $_tok_rc) — a scan that did not run is not evidence that the claim names no commits, so the range is not verified. Retry rather than record." >&2
       return 1
@@ -2476,12 +2923,934 @@ $m"
     # nouns are claims is the spelling-enumeration failure in a new costume. The residual is
     # bounded by the fact that such a ref must still be WRITTEN as a range by the artifact
     # author, and it is named here so a later reader can tell it from an oversight.
-    case "$_claim" in
-      *HEAD~*|*HEAD^*|*head~*|*head^*|*"@~"*|*"@^*")
-        echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (HEAD~N / HEAD^N / @~N) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
+    # ⛔ THE PROPERTY IS NOTATION-INDEPENDENT, SO THE TEST MUST BE TOO (fourteenth review cycle, P1 —
+    # MEASURED: this was a LITERAL list of `HEAD`/`head`/`@`, so the SAME narrowing written with the
+    # head's own sha — `<head>~1..<head>` and `<head>^..<head>` — recorded rc 0 and minted a signed
+    # `clean`. The declared residual below covers SYMBOLIC refs (`main..HEAD`), and `sha~N` is not
+    # symbolic: it resolves, it is fully evaluable, and it is the same claim in another spelling. A
+    # guard that enumerates spellings fails open on the first one nobody listed — for the seventh
+    # time in this arm — so the arm tests the SHAPE, not a list of spellings.
+    # ⛔ BUT A SHAPE IS NOT A CLAIM: OPERATOR AND OPERAND ARE BOTH CLASSIFIED (fifteenth review cycle,
+    # two P1s — BOTH are FALSE BLOCKS the fourteenth cycle's bare `[~^]` introduced, MEASURED at
+    # 2aba1583a). (1) `git rev-parse <BASE>^{commit}` — this repo's OWN vocabulary, spelled throughout
+    # this file and its suite — was refused as "RELATIVE TO THE TIP … always NARROWER", although
+    # `^{…}` PEELS to the SAME commit and narrows nothing, and `^0` is the identity for the same
+    # reason. (2) `0xFF00 ^ 0x0FF0`, `caps at 1024^2 bytes` and `PASS=1351~1450` were all refused,
+    # although none of those runs resolves to a commit — the exact doctrine stated twenty lines
+    # above for `1351`/`2024`/`4000`, broken by the arm that quotes it. So an operator is
+    # tip-relative only when it SELECTS A PARENT/ANCESTOR — not a peel, not `^0` — and an operand is
+    # a ref only when it RESOLVES: `HEAD`/`@` by name, a hex run only when `rev-parse` finds it (the
+    # same authority the parser arm above already uses).
+    # ⛔ THAT FIX WAS STILL A SPELLING TEST IN TWO PLACES, AND THIS IS THE MEANING TEST (sixteenth
+    # review cycle, two P1s + one P2 — MEASURED at 1f32d7571, i.e. in the previous cycle's own fix).
+    # (1) `case "$_top" in '^{'*|'^0') continue ;; esac` abandoned the REST OF THE MATCH, not just the
+    #     peel: for `HEAD^{commit}~1..HEAD` it dropped `HEAD^{commit}`, rescanned from `~1..HEAD`, found
+    #     no left operand, left `_tiprel` at 0 and recorded rc 0 with a SIGNED `clean` — a REGRESSION
+    #     from both 2aba1583a and the pre-fourteenth-cycle arm, which refuse it. The same `continue`
+    #     waved through `^{/<text>}`, which is not a peel at all: gitrevisions(7) — `<rev>^{/<text>}`
+    #     "selects the youngest commit whose message matches … and that is reachable from `<rev>`" —
+    #     i.e. an ANCESTOR (`git rev-parse 'HEAD^{/commit number 2}'` returns the parent; measured), so
+    #     the sentence that called the whole `^{…}` family identity was measurably false, and it was
+    #     the justification a later reader would trust.
+    # (2) `rev-parse "${_tref}^{commit}"` as a SUFFICIENT test re-opened the prose false block the
+    #     fifteenth cycle closed: a literal that merely COLLIDES with a prefix (`0xff63` — measurably
+    #     the base's own 4-char prefix here) refused an artifact that stated the correct range and
+    #     nothing else. And the `@{N}` check made its ref OPTIONAL, so `stash@{0}` — not the tip, not
+    #     even a range — was refused with a sentence saying "RELATIVE TO THE TIP".
+    # So: the operand must be a WHOLE TOKEN (a run inside `stash@{0}`, or after `0x`/`0X`, is not a
+    # ref), a 4-6 char PURE-DECIMAL run is the prose window this file already excludes, and the
+    # SELECTOR CHAIN is joined so a peel cannot hide the `~N`/`^N`/`@{N}` behind it. Only a chain that
+    # ⛔ THE HEX-LETTER HALF OF THAT WINDOW IS A CHOICE, NOT A FACT (twenty-ninth review cycle, P3 —
+    # MEASURED, and the previous sentence here was FALSE). It said "a 7+ run is a real sha and a 4-6
+    # one with a hex letter is a real short sha". The first half holds; the second does not: `dead`,
+    # `added`, `decade`, `facade`, `deface`, `cafe` are ordinary review prose IN THE HEX ALPHABET and
+    # none of them is a sha. MEASURED over this repo (1,891 commits) and the PR worktree: none of the
+    # common set resolves as a prefix; `bade` does, 191 commits behind the head, i.e. an ancestor of
+    # any recent base so not refused. So the class is empirically near-empty TODAY, and the trade is
+    # stated rather than asserted: a 4-6 hex-lettered run IS treated as a possible short sha, because
+    # the alternative — dropping it — re-opens the fifteenth cycle's fail-open (a 4-6 abbreviation is a
+    # real spelling of a real commit claim, and the file's own floor was widened to 4 for exactly
+    # that). The false-block risk is bounded to a run that both IS an English word in that alphabet
+    # AND resolves into the range, which no measured artifact reaches; the fail-open risk is not
+    # bounded at all. Same conservative/gap tradeoff as the pure-decimal window, in the opposite
+    # direction, and it is a DECLARED residual rather than a claim about shas.
+    # (The paragraph above explains the WINDOW; this one explains its other half.)
+    # can select an ELDER commit narrows: `^{<type>}`, `^{}`, `^0`, `~0` and `@{0}` are the identity,
+    # `^{/<text>}` is an ancestor selector, and a reflog position is covered whenever its ref is the
+    # tip, a sha, or any other NAME — `main@{1}` is resolved THROUGH `main` and refused when the
+    # position lands on or after this range (20h77f pins the named-ref case at a mid commit). What
+    # remains residual is the SYMBOLIC braces (`@{u}`, `@{upstream}`, `@{push}`), which cannot be
+    # evaluated without the checkout's branch configuration and are SKIPPED rather than refused — in
+    # both the bare and the tip-anchored spelling (thirtieth review cycle, P2).
+    # `HEAD@{N}` IS no longer residual (the reason the fourteenth cycle gave for that "matching `{`
+    # after a hex run would false-block a hex literal followed by a brace block" is FALSE: a reflog
+    # position needs the `@` BEFORE the brace and `deadbeef{2}` has none); `@{upstream}` still is.
+    # ⛔ THE REFLOG TERM IS ANY BRACE TEXT, NOT JUST DIGITS (seventeenth review cycle, P1 — MEASURED
+    # at 059e1e0e4): `@\{[0-9]+\}` matched only a numeric position, so the SAME elder position written
+    # as a date escaped the arm entirely. In the fixture `HEAD@{1}`, `HEAD@{yesterday}` and
+    # `HEAD@{2.weeks.ago}` all resolve to the same elder commit, so `HEAD@{1}..HEAD` was refused (20h55)
+    # while `HEAD@{yesterday}..HEAD` recorded a SIGNED `clean` — one narrowing, two spellings, opposite
+    # verdicts. The term is now `@\{[^}]+\}`, which covers `{N}`, dated positions and `{upstream}`
+    # alike; `@{upstream}` is not a residual any more because it RESOLVES to a commit like any other.
+    # ⛔ A BRACE GROUP CAN SIT ON A BARE `@` (eighteenth cycle, P1 — MEASURED at e4047ef3): the operand
+    # alternative was `HEAD|@|hex`, so the brace on `@{1}` had nothing to attach to and `@{1}..HEAD`,
+    # `@{yesterday}..HEAD` and `@{0}..HEAD` were INVISIBLE to this loop while the identical narrowing
+    # `HEAD@{1}..HEAD` was refused — one narrowing, two spellings, opposite verdicts, which is exactly
+    # the defect this cycle set out to close. `@{…}` is now an OPERAND and is normalised to `@` with
+    # the brace prepended to the chain, so the chain logic below sees `@{1}` exactly as it sees
+    # `HEAD@{1}`.
+    _tosha="$(delta_git "$root" rev-parse --verify "${to}^{commit}" 2>/dev/null || true)"
+    # ⛔ ONE DISCRIMINATOR FOR "THIS CHAIN SELECTS NOTHING", CARRIED BY BOTH ARMS (twentieth cycle).
+    # The tip arm and the empty-range arm each ENUMERATED the identity notations, and the two lists had
+    # ALREADY DRIFTED — `~0` was in one and not the other (the seventeenth cycle's P1), and `@{now}`
+    # was in the tip arm's identity test and in NEITHER of the other arm's list (found while fixing the
+    # bare-`@` brace split, which had been masking it by treating every `@{…}` as the tip). Two lists
+    # that must be kept in step is the spelling-enumeration failure this PR's own doctrine names, and
+    # the drift is not hypothetical: it happened twice. So the identity notation is stated ONCE here
+    # and both arms read it — adding a notation to one arm adds it to the other by construction.
+    _dident='(~0+|\^0+|\^\{[^}/]*\}|@\{0+\}|@\{now\})'
+    # ⛔ ONE OPERAND CLASS, STATED ONCE (twenty-ninth review cycle, P1 — MEASURED). The parser arm above
+    # had already widened its continuation class to git's ref-name ALPHABET (`git-check-ref-format`
+    # forbids only `~ ^ : ? * [ \` space and controls, so `+ = $ % & @` are legal INSIDE a name), and
+    # its comment says the four sibling scans carry "the same one". They did not: they carried
+    # `[A-Za-z0-9_][A-Za-z0-9_/-]*`, so a ref name whose continuation is one of those five characters
+    # was matched as a SUFFIX of itself, failed to resolve, and was walked past. MEASURED with a
+    # branch `head+1` AT the attested head: `head+1..HEAD` states ZERO commits, and the two-endpoint
+    # arm captured `1..HEAD`, failed to resolve `1`, and ACCEPTED — a signed `clean` over a range the
+    # artifact excluded — while the mirror `..head+1` was refused with a sentence accusing the
+    # artifact of writing `..head`. One root, both directions. Stating the class once is also what
+    # stops the drift the identity notations already suffered twice (`~0`, `@{now}`): two lists that
+    # must be kept in step is the spelling-enumeration failure this file exists to end.
+    # ⛔ `@` IS ADMITTED ONLY AS AN INTERIOR NAME SEGMENT, never as a bare tail, because `@{` is the
+    # tip's OWN reflog syntax and a class that ate `@{` would make `HEAD@{1}` indistinguishable from a
+    # ref name. `(@[name]+)*` cannot match `@{`, so `HEAD@{0}` still arrives as the operand `HEAD`
+    # plus the brace group, exactly as before. A name whose segment after `@` begins with `.` or `{`
+    # (`v1.2.3`, `a@{x}`) stays outside this class — the dot remainder the empty-range arm already
+    # declares, unchanged here.
+    # ⛔ `_dref` CONTAINS ONE CAPTURE GROUP, AND ERE HAS NO NON-CAPTURING FORM — so every arm that
+    # admits it shifts its own field indices by one, and a shift is SILENT: the field is simply read
+    # from the wrong group and reads EMPTY. That already happened once (twenty-ninth review cycle,
+    # P2 — MEASURED): adding this class pushed the chain from group 3 to group 4, so `_top` read the
+    # `@`-segment group (always empty for `HEAD~1`) instead of `~1` — the tip arm then saw a bare
+    # `HEAD`, skipped it as prose, and EVERY tip-relative refusal and every empty-range refusal in
+    # this function became an ACCEPT (PASS=1791 FAIL=75, MEASURED). The group layout is therefore
+    # written down ONCE, here, and each arm below derives its indices from it rather than carrying
+    # bare numbers that cannot be checked against it:
+    #     <operand> = (1) leading context · (2) the token · (3) this class's own `@segment` group
+    #     <chain>   = (n-1) the repeat, (n) its alternative
+    # A reader adding a group to `_dref` must move (3) — and `_drefg` below is the count that says by
+    # how much, so the arms that read past it follow it rather than sitting on a number.
+    _dref='[A-Za-z0-9_][A-Za-z0-9_/+=$%&-]*(@[A-Za-z0-9_/+=$%&-]+)*'
+    _drefg=1   # capture groups `_dref` contributes — see the layout above
+    _didentg=2 # `_dident`'s own group PLUS the arm's wrapper around it: every arm states it as
+               # `(${_dident}*)`, so it occupies the wrapper group and the alternation's own — two.
+    # The layout above, as indices, derived ONCE from those two counts. Every arm below reads its
+    # fields through these names, so widening a class moves them together instead of re-pointing one
+    # field at the wrong group (the empty-chain accept this very change shipped for one cycle).
+    _g_op1=2                                # the first (or only) operand
+    _g_dref1=3                              # `_dref`'s own group inside it
+    _g_dident1=$((_g_dref1 + _drefg))       # the identity chain after it (the WRAPPER group)
+    _g_op2=$((_g_dident1 + _didentg))       # the SECOND operand (two-endpoint arm only)
+    _g_dref2=$((_g_op2 + 1))                # `_dref`'s group inside the second operand
+    _g_chain1=$((_g_dref1 + _drefg))        # the selector chain (single-operand arms)
+    _g_chain2=$((_g_dref2 + _drefg))        # the selector chain (two-endpoint arm)
+    _tipscan="$_claim"; _tiprel=0
+    while [[ "$_tipscan" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})*) ]]; do
+      _tref="${BASH_REMATCH[2]}"; _top="${BASH_REMATCH[$_g_chain1]}"
+      # The operand carried the brace, so the brace IS the chain: keep it in `_top` and empty `_tref`,
+      # which makes `${_tref}${_top}` the exact revision expression (`@{1}`) for the resolution below.
+      case "$_tref" in
+        @\{*\}) _top="${_tref}${_top}"; _tref='' ;;
+      esac
+      # ⛔ WHERE THE MATCH ENDS DECIDES WHETHER THE OPERAND IS BOUNDED BY A RANGE (twenty-ninth review
+      # cycle, P3 — MEASURED). `_tiprest` is what follows this occurrence in the claim, and it is the
+      # only way this arm can tell a token that is the LEFT ENDPOINT of a written range (`afterhead..`)
+      # from a noun that merely appears in the prose. It is what bounds the `rev-parse` below.
+      _tiprest="${_tipscan#*"${BASH_REMATCH[0]}"}"
+      _tipscan="$_tiprest"
+      _tisref=1
+      # `_tref` is EMPTY for a bare-`@` brace group (the brace was moved into `_top` above) — that is
+      # the TIP's own reflog position, not a 4-6 char decimal prose run, so it must not fall into the
+      # skip below (which is what happened first: `@{1}..HEAD` read as prose and recorded a `clean`).
+      case "$_tref" in
+        [Hh][Ee][Aa][Dd]|@|'') : ;;
+        *)
+          # A 4-6 char run that is PURE DECIMAL is prose, exactly as the token scan above decides;
+          # a 7+ run is sha-shaped, and a 4-6 one with a hex letter is treated as a possible short sha
+          # — a DECLARED choice, not a claim that it IS one (see the twenty-ninth cycle's note on the
+          # hex-shaped English words in that alphabet: `dead`, `added`, `facade`, `cafe`).
+          if [ "${#_tref}" -le 6 ]; then
+            case "$_tref" in *[!0-9]*) : ;; *) _tisref=0 ;; esac
+          fi
+          ;;
+      esac
+      [ "$_tisref" = 1 ] || continue
+      # An IDENTITY-ONLY chain narrows nothing and must not be refused (20h53/20h53b) — but the test
+      # is on the WHOLE chain, so the `continue` can no longer abandon the selector behind a peel.
+      # ⛔ GIT'S OWN GRAMMAR, NOT A SPELLING LIST (seventeenth cycle, P2 — MEASURED at 059e1e0e4):
+      # `~0`/`^0`/`@{0}` were the identity but `~00`/`^00`/`@{00}` were not, although
+      # `git rev-parse HEAD^00^{commit}` returns HEAD like any identity. An honest artifact that merely
+      # NAMED one was refused with "RELATIVE TO THE TIP … always NARROWER", which is false about it —
+      # the false-block class this file's own doctrine calls worse than the gap. `0+` states the rule
+      # (a zero count is a zero count) instead of enumerating the spellings that happen to occur.
+      # ⛔ THE OPERAND IS RESOLVED BEFORE THE IDENTITY SKIPS (twenty-seventh review cycle, P1 —
+      # MEASURED, a fail-open the parent did not have). Both `continue`s below returned BEFORE anything
+      # resolved the operand, so a narrowing that hides in the OPERAND rather than in a selector
+      # (`afterhead^{commit}..HEAD`, `afterhead~0..HEAD`, `afterhead^0..HEAD`, `afterhead..HEAD`) was
+      # never classified: the range is EMPTY (nought commits against the recorded ones) and the record
+      # was minted. The parent refused the identity spellings through its literal catch; the bare ones
+      # are a PRE-EXISTING hole recorded here rather than silently kept.
+      case "$_tref" in
+        ''|HEAD|@) : ;;
+        *)
+          # ⛔ RESOLVED ONLY WHERE THE ANSWER CAN CHANGE A VERDICT (twenty-ninth review cycle, P3 —
+          # MEASURED). This test used to run for EVERY token the arm admits, and the operand class
+          # admits every word in the artifact: MEASURED ~3 ms per `git rev-parse` on this box, so a
+          # 1.5k–3k-word evidence artifact — the ordinary size — paid 4.5–9 s on every delta record,
+          # where the parent head's literal `case` arm made no git call at all. It also widened the
+          # "a prose noun that happens to resolve" trade the token scan argues about with no length
+          # floor at all. The answer is only ever consulted in TWO situations, and both are structural:
+          # a SELECTOR CHAIN follows (`afterhead~1`, `afterhead^{commit}` — the narrowing that hides in
+          # the operand), or the token is the LEFT ENDPOINT of a written range (`afterhead..`, an empty
+          # range). Everything else is prose, and a noun that resolves to a descendant commit is not a
+          # claim about this range. The separator test refuses a THREE-dot ELLIPSIS (`afterhead...`),
+          # which is English after a word and not a range: admitting it would resolve a token for no
+          # reason AND route prose into the after-the-head refusal.
+          if [ -n "$_top" ] || [[ "$_tiprest" =~ ^[[:space:]]*\.\.([^.]|$) ]]; then
+            _tbase="$(delta_git "$root" rev-parse --verify "${_tref}^{commit}" 2>/dev/null || true)"
+            if [ -n "$_tbase" ] && [ "$_tbase" != "$_tosha" ]; then
+              if delta_git "$root" merge-base --is-ancestor "$_tosha" "$_tbase" 2>/dev/null; then
+                # ⛔ A CLAIM THAT NAMES A COMMIT AFTER THE HEAD IS NOT "RELATIVE TO THE TIP" (twenty-
+                # ninth review cycle, P3 — MEASURED). `afterhead..HEAD` writes no selector at all, and
+                # it was routed into the tip-relative sentence, whose notation list (`<ref>~N` /
+                # `<ref>^N` / `<ref>@{N}`) is a description of text the author never wrote — the class
+                # the twentieth cycle split these sentences to avoid. A chain narrows the tip; a
+                # descendant OPERAND with an empty chain states a range that starts past the head. Two
+                # populations, two sentences, chosen by what was actually written.
+                if [ -n "$_top" ]; then _tiprel=1; else _afterhead=1; _afterstated="${_tref}${_top}"; fi
+                break
+              fi
+            fi
+          fi ;;
+      esac
+      [[ "$_top" =~ ^(${_dident}+)$ ]] && continue
+      # ⛔ NO SELECTOR, NOTHING TO CLASSIFY. The chain group is `*` because a brace group on a bare `@`
+      # IS the selector and arrives through the operand (normalised above); that also lets a bare
+      # reference match, and a bare `HEAD` — or a sha merely QUOTED in prose — names no narrowing at
+      # all. Only a chain can narrow, so an empty chain is prose by construction.
+      [ -n "$_top" ] || continue
+      # ⛔ NO CHAIN IS RESOLVED THROUGH THE CHECKOUT AT ALL (nineteenth cycle, P1 — MEASURED TWICE).
+      # Resolving a chain with `git rev-parse` answered in the DELTA CHECKOUT frame, so a sha-spelled
+      # endpoint (`<head>~0..HEAD`) and a brace chain (`@{0}~1..HEAD`) flipped between "refused" and
+      # "signed clean" depending on which commit that checkout happened to sit on, while the identical
+      # artifact was refused with it detached at the head. The grammar test above is COMPLETE for
+      # everything this arm must accept (`~0+`, `^0+`, `^{<type>}`, `^{}`, `@{0+}`, `@{now}`), so nothing
+      # needs resolving: a chain that is not the identity narrows, and that verdict now holds in every
+      # frame because no checkout is consulted.
+      # A bare brace group that did NOT resolve to the attested head: a POSITION (numeric or dated)
+      # narrows, while a SYMBOLIC name (`@{upstream}`, `@{push}`) is NOT EVALUATED and must not be
+      # refused as though it were — MEASURED: `@{upstream}` prose was refused "always NARROWER" in every
+      # frame, which the sentence that called it resolved was measurably wrong about.
+      # ⛔ DECLARED REMAINDER, and the previous wording of this comment was FALSE ABOUT IT (twenty-fifth
+      # review cycle, P2 — MEASURED). It said a symbolic name "cannot narrow anything". It CAN: with the
+      # branch upstream at a mid commit, `@{u}` = that commit and `@{u}..HEAD` is 2 commits against the
+      # 3 recorded, so `…; I only actually reviewed @{u}..HEAD.` narrowed and rc was 0 — at the parent
+      # too, so the VERDICT is pre-existing and is not what changed here. What is wrong is the
+      # sentence: the code cannot evaluate `@{upstream}`/`@{push}` without the checkout's branch
+      # configuration, which is the frame this file refuses to consult (`@{u}` means a different commit
+      # in every clone), so the narrowing is SKIPPED rather than resolved — a stated residual, not a
+      # property of the syntax. No vector names these spellings, which is why the trade went unseen.
+      if [ -z "$_tref" ]; then
+        case "$_top" in
+          *[!0-9A-Za-z_].*|*[0-9]*) _tiprel=1; break ;;
+          *upstream*|*push*|*u\}) continue ;;
+          *) _tiprel=1; break ;;
+        esac
+      fi
+      case "$_tref" in
+        HEAD|@)
+          # ⛔ THE SYMBOLIC EXEMPTION APPLIES TO THE TIP-ANCHORED SPELLING TOO (thirtieth review cycle,
+          # P2 — MEASURED, a FALSE BLOCK this branch introduced). The bare `@{u}` form is skipped below
+          # as a DECLARED residual — `@{upstream}`/`@{push}` mean a different commit in every clone, so
+          # this file refuses to consult the checkout's branch config and skips the narrowing instead of
+          # resolving it. But `HEAD@{u}` fell through to the refusal below and told its author they had
+          # written `HEAD~N`/`HEAD^N`/`HEAD@{N}` — the same notation, two spellings, opposite verdicts,
+          # and a refusal whose only remedy is a re-worded evidence comment that must postdate the head.
+          # The parent had no such refusal (its literal list matched `@~`/`@^` only), so this restores
+          # the exemption to the population the sentence below already promises it to.
+          case "$_top" in
+            *upstream*|*push*|*u\}) continue ;;
+          esac
+          _tiprel=1; break ;;
+        [Hh][Ee][Aa][Dd])
+          # a case VARIANT is the tip's word only when the repo has no ref of that exact name — the
+          # same decision `_tipvariant` makes for the other arms (twenty-third review cycle, P2)
+          _tv="$(_tipvariant "$_tref")"
+          case "$_tv" in HEAD) _tiprel=1; break ;; esac ;;
+      esac
+      # ⛔ A RESOLVABLE OPERAND IS NOT A NARROWING — THE COMMIT ITS SELECTS IS (twenty-second review
+      # cycle, TWO P2s — MEASURED, both FALSE BLOCKS with a false sentence). This test used to be
+      # `rev-parse` alone: ANY resolvable operand followed by a non-identity chain set `_tiprel=1`,
+      # so the refusal at the bottom of this function told the author their claim "is always
+      # NARROWER than <range>", which the arm never measured and which is false about two whole
+      # populations the token scan above explicitly says a reviewer MAY name:
+      #   `<base>~1..HEAD`  — the operand is the range's OWN BASE, so the stated range is WIDER than
+      #                       the recorded one; recording `from..to` is conservative and true about
+      #                       it (MEASURED: refused as "always NARROWER").
+      #   `<orphan>~1`      — a root commit that is neither an ancestor of `from` nor a descendant of
+      #                       it, i.e. an UNRELATED LINEAGE; it cannot narrow this range at all
+      #                       (MEASURED: `… quoted <orphan>~1 in its note.` → rc 3, while the same
+      #                       sentence with `<orphan>^{commit}` → rc 0).
+      # What can narrow `from..to` is a commit ON the range or AFTER it, so the verdict comes from
+      # the SAME discriminator the token scan uses — `merge-base --is-ancestor` — applied to the
+      # commit the chain EXPRESSION selects, not to the operand alone (`<child-of-to>~1` selects the
+      # attested head: an empty range, and the operand-only test could not see it). An expression
+      # that resolves to no commit names no narrowing and is prose; where the chain does not resolve,
+      # the operand alone is the conservative reading. This consults no checkout for the chain: a
+      # hex operand is content-addressed, and `HEAD`/`@` — the only frame-dependent operands — were
+      # already decided by the case arm above (the no-checkout frame decision is untouched).
+      _tsel="$(delta_git "$root" rev-parse --verify "${_tref}${_top}^{commit}" 2>/dev/null || true)"
+      [ -n "$_tsel" ] || _tsel="$(delta_git "$root" rev-parse --verify "${_tref}^{commit}" 2>/dev/null || true)"
+      [ -n "$_tsel" ] || continue
+      # ⛔ THE OPERAND CLASS ADMITS REF NAMES (twenty-sixth review cycle, P1 — MEASURED, and it was a
+      # REGRESSION against the parent). This scan's operand alternative was hex | the tip's word | `@` |
+      # a brace group, so a chain written on a REF NAME was invisible here, and the parent's literal
+      # `*HEAD~*|*head~*|*@~*` catch — which this branch replaced with this structured arm — had been
+      # catching it BY SPELLING. The population that fell through: `afterhead~1..HEAD` (a branch on a
+      # descendant of the head), a claim that states an EMPTY range, which recorded a signed `clean`
+      # over the whole range here while the parent refused it (MEASURED, both heads). A ref name is an
+      # operand like any other — `git-check-ref-format` allows no `~`, `^` or `@{` inside one, so a
+      # chain after a name is unambiguous — and the class is the same one the empty-range arm uses
+      # (`_dref`, stated ONCE — twenty-ninth review cycle, P1: the two arms disagreed about `+ = $ % & @`).
+      if [ "$_tsel" = "$_tosha" ]; then _tiprel=1; break; fi
+      delta_git "$root" merge-base --is-ancestor "$_tsel" "$from" 2>/dev/null && continue
+      delta_git "$root" merge-base --is-ancestor "$_tsel" "$_tosha" 2>/dev/null && { _tiprel=1; break; }
+      # ⛔ AFTER THE HEAD IS AFTER THE HEAD, ONE STEP OR TEN (twenty-sixth review cycle, P1 — MEASURED,
+      # and the measurement changed once the operand class above admitted REF NAMES). A selector landing
+      # on a DEEPER DESCENDANT is neither an ancestor of `from` nor of `to`, so it fell through both
+      # tests above and the claim was ACCEPTED — measured as a REGRESSION against the parent, which
+      # refused `afterhead~1..HEAD` (an EMPTY range) through its literal `*head~*` catch: replacing that
+      # catch with this structured arm lost the population, because `_tipscan` could not see a ref name
+      # AT ALL and the commit-token scan reads hex only. A descendant is the discriminator the sentence
+      # above names and did not implement; it separates the AFTER-the-head case from the UNRELATED
+      # lineage this arm must still accept (`<orphan>~1`: the head is not an ancestor of it).
+      # (An earlier version of this fix was withdrawn as unobservable — correctly, for the OPERAND CLASS
+      # of that moment: a hex descendant was refused by the commit-token scan first and a ref-name one
+      # never entered the arm. Admitting ref names is what makes this test the one that decides.)
+      delta_git "$root" merge-base --is-ancestor "$_tosha" "$_tsel" 2>/dev/null && { _tiprel=1; break; }
+    done
+    # ⛔ AN EMPTY RANGE IS THE NARROWEST CLAIM THERE IS, and an identity chain must not launder one: a
+    # peel in FRONT of the dots hides the tip from the loop above, so `<head>^{commit}..<head>`,
+    # `<head>^0..<head>` and plain `<head>..<head>` all state a range whose two endpoints are the SAME
+    # commit — zero commits reviewed, offered as the evidence for a range that has some (MEASURED at
+    # 1f32d7571: rc 0, record written). Resolved and COMPARED rather than spelled out, so no notation
+    # of the endpoint is privileged, and only an empty range AT the attested head is refused (an empty
+    # range elsewhere is the parser's business, not a claim about this head).
+    # ⛔ EVERY STATED RANGE, NOT JUST THE FIRST (measured while writing 20h59: `[[ =~ ]]` yields ONE
+    # match, and the ordinary artifact states the HONEST range first — so a single match measured that
+    # pair and stopped, and the empty range behind it was never resolved at all. The same "check every
+    # occurrence" rule the parser arm above already carries, for the same reason.)
+    # ⛔ THE SEPARATOR IS `..` OR `...`, AND THE IDENTITY CHAIN INCLUDES `~0` (seventeenth cycle, two
+    # P1s — MEASURED at 059e1e0e4). (1) The chain here was `(\^0|\^\{[^}/]*\}|@\{0\})*` while the tip
+    # arm above treats `~0` as the identity, so `HEAD~0..HEAD` matched NO arm and an empty range at the
+    # attested head recorded a signed `clean` — the very payload this arm exists to refuse, and a
+    # direct contradiction of the comment below claiming no endpoint notation is privileged. (2) The
+    # separator was hardcoded `\.\.` while every other range reader in this file accepts `\.{2,3}`, so
+    # `HEAD^0...HEAD` and `HEAD...HEAD` were INVISIBLE to the only arm that can refuse an empty range.
+    # Both are the same lesson as the arm above: a guard that enumerates spellings instead of stating
+    # the grammar leaves a synonym outside it.
+    # ⛔ A SYMBOLIC ENDPOINT IS DECIDED HERE, NOT CARRIED (twentieth cycle — the residual declared at
+    # ff9ededd6 and twice before: "with a branch or tag at the attested head, `tmp3698..HEAD` is an
+    # empty range and is accepted"). The arm's grammar admitted only hex, the tip's word and a brace
+    # group, so a REF NAME never entered it and `tmp3698..HEAD` — an EMPTY range, i.e. the narrowest
+    # claim there is, offered as the evidence for a range that has commits — minted a signed `clean`.
+    # The decision: a ref name is a TOKEN like any other, and the arm already knows how to decide an
+    # endpoint it cannot read by spelling — RESOLVE it and COMPARE (`rev-parse` for a non-tip token is
+    # the existing second path; a sha is frame-independent, and so is the ref name's meaning in the
+    # repo the delta is read from). So the residual does not close by adding a spelling test, it
+    # closes by admitting the token. DECLARED REMAINDER: the token class carries no `.`, because a dot
+    # is the separator's own character and a class that ate it would make `a..b` ambiguous — so a ref
+    # name CONTAINING a dot (`v1.2.3..HEAD`) stays outside this arm. That is a smaller residual than
+    # "any symbolic ref", stated here rather than discovered later.
+    # ⛔ THE OPERAND IS THE WHOLE RUN, LEADING DIGIT INCLUDED (twenty-third review cycle, P1 —
+    # MEASURED). The ref-name alternative was `[A-Za-z][A-Za-z0-9_/-]*` — LETTER-initial — so a ref
+    # name that begins with a digit was never admitted as an operand: the engine skipped past it and
+    # matched a SUFFIX of it (`3698-fix..` → `fix`), `rev-parse fix` found nothing, and the `continue`
+    # walked past the only range this arm can refuse. MEASURED with branch `3698-fix` at the attested
+    # head (i.e. `3698-fix..` is `3698-fix..HEAD`, an EMPTY range, 0 commits against 2 in the recorded
+    # range): rc 0, signed `clean`, while the same claim on a letter-initial ref (`fixtip..`, 20h76)
+    # was refused rc 3. `2026-11-08-notes` — a name shape this repo's own lanes produce — behaved
+    # identically. Leading digits are not a declared remainder; they were an undeclared hole, and a
+    # digit-initial alternative closes it for the whole class rather than for the examples measured.
+    _eranges="$_claim"
+    # ⛔ THE SENTENCE'S DECORATION IS NOT PART OF THE TOKEN (round 13 — MEASURED, the class the earlier
+    # rounds each closed ONE spelling of). A claim fences, quotes, punctuates and markdown-emphasises its
+    # operands: `` `HEAD`..anc ``, `**HEAD**..`, `HEAD,..anc`. Those runs sit BETWEEN the operand and the
+    # dots, where both scans demanded whitespace only, so no arm matched and a nought-commit claim minted
+    # a signed `clean` in EVERY frame. The run admitted here is `[^0-9A-Za-z_.~^@{}]*` — punctuation and
+    # space, never a word character (which would end the operand), never a dot (which would make the
+    # SEPARATOR ambiguous), and never a SELECTOR character (`~ ^ @ { }`): those are the revision's own
+    # syntax, and folding them into the decoration would read `<sha>^{commit}..HEAD` as `<sha>..HEAD` and
+    # re-classify a claim by accident of punctuation (MEASURED: the caret spelling stopped reaching the
+    # tip-relative arm, 20h50b). So it is exactly the decoration and nothing that could be part of a revision.
+    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})(${_dident}*)[^0-9A-Za-z_.~^@{}]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@|${_dref})((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})*) ]]; do
+      _elhs="${BASH_REMATCH[$_g_op1]}${BASH_REMATCH[$_g_dident1]}"
+      _erhs="${BASH_REMATCH[$_g_op2]}${BASH_REMATCH[$_g_chain2]}"
+      # ⛔ THE DOTS ARE NOT ALL THE SAME SEPARATOR (thirtieth review cycle, round 10 — MEASURED, a FALSE
+      # BLOCK this lane introduced in round 8). The pattern admits a run of two OR THREE dots, and the
+      # ancestry test below is the TWO-DOT predicate: `L..R` is empty when R is an ancestor of L, but
+      # `L...R` is the SYMMETRIC DIFFERENCE, empty only when L and R are the same commit. Applying
+      # `merge-base --is-ancestor` to a three-dot claim refused `HEAD...anc` — which has commits — and told
+      # its author the claim "states an EMPTY range … names ZERO commits": a false sentence about their
+      # own text, the class this file calls worse than the gap. The first arm (equality) IS the three-dot
+      # test and stays: a symmetric difference of one commit with itself is empty either way.
+      # ⛔ THE SEPARATOR IS THE DOTS AFTER THE LEFT OPERAND, NOT EVERY DOT IN THE MATCH (round 11 — MEASURED,
+      # a FAIL-OPEN the round-10 gate introduced). Counting dots over `${BASH_REMATCH[0]}` also counted the
+      # match's BOUNDARY character, and that character may itself be a dot (`(^|[^0-9A-Za-z_])`): so
+      # `.HEAD..anc` yielded `_esep="..."`, the ancestry gate saw a three-dot claim in a two-dot one, and a
+      # nought-commit claim minted a signed `clean` — the same fail-open one character of punctuation away
+      # from a fix that had just closed it. Reading the run that FOLLOWS the left operand is exact by
+      # construction: `_elhs` is the captured operand, so everything up to the next non-dot is the separator.
+      # ⛔ THE SEPARATOR TOLERATES WHITESPACE, SO THE READ MUST SKIP IT (round 12 — MEASURED, a FAIL-OPEN
+      # whose exposure is a FRAME, not just a spelling). The arity pattern is `[[:space:]]*\.{2,3}`, so in
+      # `HEAD ..anc` the text after the left operand begins with a SPACE; truncating at the first non-dot
+      # made `_esep` EMPTY, the two-dot ancestry gate never ran, and the only remaining catcher was the
+      # mirror arm's written-left test — which resolves the operand in the DELTA CHECKOUT's frame. So the
+      # same claim minted a signed `clean` when the recorder ran from a base-parked checkout and was
+      # refused when it ran at the attested head: a verdict decided by where a clone happens to be, which
+      # is the failure this file has closed twice before. Skip the whitespace, then read the dots.
+      _esep="${BASH_REMATCH[0]#*"$_elhs"}"; _esep="${_esep//[!.]/}"
+      # ⛔ CONSUME THE SEPARATOR, NOT THE WHOLE MATCH (round 11 — MEASURED, a FAIL-OPEN). The right operand
+      # of one range can be the LEFT operand of the next: slicing past the whole match ate it, and the arm
+      # that owns the remaining claim could not recover it (the omitted-left arm excludes a leading char
+      # that ends an operand, by design) — so `read...HEAD..anc` and `anc..HEAD..anc` left `HEAD..anc`
+      # measured by NO arm and minted a signed `clean`. Slicing past `<left operand><separator>` leaves the
+      # right operand at the START of the remaining text, where the `^` alternative of the boundary group
+      # admits it as the next left operand; the separator is consumed either way, so the loop cannot
+      # re-match what it just measured.
+      # ⛔ PROGRESS IS A PRECONDITION, NOT A HOPE (round 12 — MEASURED: the first cut sliced past
+      # `<left><separator>` CONCATENATED, and the separator tolerates whitespace, so in `Delta: <base> .. <head>`
+      # the pattern `<base>..` did not occur in `<base> ..` and the slice removed NOTHING — an infinite loop
+      # that killed the suite at the first honest spaced two-endpoint claim. Slice past the LEFT OPERAND
+      # only, which is a substring of the match by construction, and prove the slice moved before
+      # continuing: the right operand then sits at the start of the remaining text for the next iteration.
+      # ⛔ AND RE-FEED THE RIGHT OPERAND RATHER THAN RESCANNING THE PREFIX (round 13 — MEASURED, an 11×
+      # cost regression): slicing past the left operand alone re-matched the same range once per EARLIER
+      # occurrence of that operand (`anc ` ×800 + one `anc..anc` cost 12.7 s against 1.2 s at the parent,
+      # and a 14 KB artifact of that shape ran 73 s). Prepending the captured right end to the remainder
+      # keeps the progress guarantee (the text strictly shrinks by at least the separator) AND gives the
+      # next iteration exactly what the old whole-match slice gave it, with no rescan.
+      _erangesprev="$_eranges"
+      _eranges="${_erhs}${_eranges#*"${BASH_REMATCH[0]}"}"
+      [ "$_eranges" = "$_erangesprev" ] && break
+      # ⛔ THE REFUSAL QUOTES WHAT WAS WRITTEN, NOT A RECONSTRUCTION OF IT (twenty-second cycle, P2 —
+      # MEASURED). The message was rebuilt from the captured TOKENS (`"${_elhs}..${_erhs}"`), and the
+      # right-hand capture stopped one selector short of the text — so a claim narrowed to
+      # `HEAD..HEAD~1` was reported as an EMPTY range "between the tip and itself", and its author was
+      # told "both endpoints resolve to the attested head" when their right endpoint was an ELDER
+      # commit. The empty-range refusal below is explicit that a message may not make that accusation,
+      # and the twentieth cycle found this exact misquote for a bare-`@` LEFT operand — it was still
+      # live one end over. (The capture is fixed above as well, so this claim now also REFUSES as what
+      # it is: a tip-relative narrowing. Quoting the text is the belt, the capture is the braces — a
+      # message may only state what its own tests measure, and the text is the one thing that cannot
+      # drift from the artifact.)
+      _estated="${BASH_REMATCH[0]}"
+      [ -n "${BASH_REMATCH[1]}" ] && _estated="${_estated#?}"
+      # ⛔ THE WORD, OR THE WORD PLUS A SELECTOR — NOT ANY TOKEN THAT BEGINS WITH `head`
+      # (twenty-first cycle, P1 — MEASURED). The spelling here was `case "${_elhs:0:4}"`, which
+      # rewrites the FIRST FOUR CHARACTERS of whatever the operand is — so a REF NAME at the attested
+      # head whose name starts with `head` (`headroom`, `headless-*`, `head-3698`) became `HEADroom`,
+      # the split below then stripped `HEAD` leaving `room`, the resolve of `${to}room` failed, and the
+      # `continue` skipped the only range this arm could refuse: `headroom..HEAD` — a branch AT the
+      # attested head, i.e. ZERO commits — recorded a signed `clean` over `<BASE>..<HEAD>`, while the
+      # identical claim spelled with `deltatip` was refused (20h70). A git ref name may not contain
+      # `~`, `^` or `@{` (git-check-ref-format), so a `~`/`^` continuation or a BRACED `@{` one is the
+      # ONLY thing that makes a `head…` token the tip's WORD; every other `head…` token is a REF NAME
+      # and is left to the resolution below, which already decides every token the arm cannot read by
+      # spelling. ⛔ AND THE `@` MUST BE FOLLOWED BY `{` (thirtieth review cycle, P1 — MEASURED): a BARE
+      # `@` is a legal ref-name character (`head@1`), so the split patterns below admit `@\{`, never a
+      # bare `@` — a split that ate it stripped `HEAD` off the NAME, failed to resolve `<head>@1`, and
+      # let an EMPTY range through.
+      # ⛔ A CASE VARIANT IS A REF NAME UNTIL THE REPO SAYS OTHERWISE — the twenty-third cycle's P2,
+      # measured on this arm pair: a tag `Head` at another commit was rewritten to the tip word here
+      # and the claim refused as an EMPTY range that was neither empty nor tip-rooted. `_tipvariant`
+      # asks git, exactly as the parser arm does; the resolution below then reads whatever it returns.
+      _elhs="$(_tipvariant "$_elhs")"
+      _erhs="$(_tipvariant "$_erhs")"
+      # ⛔ THE FRAME IS THE ATTESTED HEAD, NOT THIS CHECKOUT (eighteenth cycle, P1 — MEASURED): the
+      # equality below compared two shas resolved in the DELTA REPO, so when that checkout sat
+      # anywhere other than the attested head, `@{0}` and `HEAD~0` resolved to THAT commit and
+      # `@{0}..HEAD` recorded a signed `clean` over a range that is empty in the frame the artifact is
+      # about — the same text with the opposite verdict, decided by where a clone happens to be. Both
+      # endpoints are TIp SPELLINGS with identity-only chains ⇒ they denote the attested head itself,
+      # so the range is empty in EVERY frame, and this test needs no checkout at all.
+      # ⛔ AN IDENTITY REFLOG POSITION ON THE HEAD IS STILL THE HEAD ON THE LEFT (thirtieth review cycle,
+      # round 9 — MEASURED, a FAIL-OPEN this arm's own equality test hid). `HEAD@{0}`/`@{0}`/`HEAD@{now}`
+      # are identity spellings of the attested head and `_dident` already matches them, so `_lid` was
+      # ALREADY 1 — the knowledge was simply thrown away: the split below handed `@{0}` to `rev-parse` as
+      # `<sha>@{0}` (which git REFUSES: a reflog position needs a ref), and `[ -n "$_elsha" ] || continue`
+      # DROPPED the claim before any emptiness test could see it. So `HEAD@{0}..anc`, `@{0}..anc` and
+      # `HEAD@{now}..anc` — nought commits each — minted a signed `clean`, while `@{0}..HEAD` and the
+      # SPACED `HEAD@{0} .. anc` were refused: the same claim, decided by how it was spelled and spaced.
+      # The load-bearing half of the fix is therefore the RESOLUTION below, not the recognition: an earlier
+      # cut of this comment claimed the identity regex MISSED the token and added a strip loop for it —
+      # MEASURED, `_lid` is 1 PRE-strip for all three spellings, the loop was a no-op, and it is gone.
+      _lid=0; _rid=0
+      [[ "$_elhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _lid=1
+      [[ "$_erhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _rid=1
+      if [ "$_lid" = 1 ] && [ "$_rid" = 1 ]; then
+        _emptyrange=1; _emptystated="${_estated:-${_elhs}..${_erhs}}"; break
+      fi
+      # The attested frame again: a tip-rooted endpoint is `$to`, and only a NON-tip endpoint is
+      # resolved through the checkout (a sha is frame-independent by construction).
+      # ⛔ ONLY THE CANONICAL TIP TOKEN IS THE TIP (twenty-first cycle, P1 — MEASURED: 20h71 stayed
+      # RED with the spelling fix alone). The word `head` is normalised to `HEAD` above, so by here a
+      # `HEAD…` token is the word plus a selector and a `head…` one is a REF NAME — but this case
+      # matched ANY token beginning with the four letters, so the ref name `headroom` was SPLIT like
+      # the word (`_lrest` stayed `headroom` because `#HEAD` cannot strip lowercase), the resolve of
+      # `${to}headroom` failed, and the `continue` walked past the range again. The selector
+      # characters are what makes the split meaningful; everything else is resolved as a TOKEN.
+      if [ "$_lid" = 1 ]; then
+        # ⛔ DECIDED ABOVE, SO RESOLVE IT HERE: an identity spelling denotes the attested head in EVERY
+        # frame, which is exactly why the equality test can answer without a checkout — and leaving
+        # `_elsha` unset sent the claim down the `continue` instead.
+        _elsha="$_tosha"
+      else
+      case "$_elhs" in
+        HEAD|HEAD[~^]*|HEAD@\{*|@|@\{*)
+          # Split the tip token off and resolve only the REST against the attested head.
+          # ⛔ A BRACE ON A BARE `@` IS THE TIP'S OWN REFLOG POSITION, AND ITS CONTENT IS THE
+          # POSITION, NOT DECORATION (twentieth cycle — FOUND BY 20h65b GOING RED). Stripping the
+          # brace left `_lrest` EMPTY, so `@{1}` was resolved as `$to` — the TIP — and the arm
+          # classified `@{1}..HEAD` as an EMPTY range. The verdict happened to stay a refusal (the
+          # TIP arm above refuses the same text as a narrowing), so only the MESSAGE exposed it: the
+          # artifact was told it had stated an empty range when it had stated a range an elder
+          # reflog position starts. A right answer for a wrong reason is what the next cycle finds,
+          # and a false sentence about the author's own text is the class this file calls worse than
+          # the gap. `HEAD@{1}` was already correct here (the `HEAD` split leaves `@{1}` intact); only
+          # the bare-`@` arm discarded it.
+          _lrest="${_elhs}"
+          case "$_lrest" in
+            @\{*\}) continue ;;
+            HEAD[~^]*|HEAD@\{*) _lrest="${_lrest#HEAD}" ;;
+            HEAD) _lrest='' ;;
+            @*) _lrest="${_lrest#@}" ;;
+          esac
+          _elsha="$(delta_git "$root" rev-parse --verify "${_tosha}${_lrest}^{commit}" 2>/dev/null || true)" ;;
+        *) _elsha="$(delta_git "$root" rev-parse --verify "${_elhs}^{commit}" 2>/dev/null || true)" ;;
+      esac
+      fi
+      [ -n "$_elsha" ] || continue
+      # ⛔ THE RIGHT ENDPOINT IS READ IN THE ATTESTED FRAME TOO (twenty-first cycle, P2 — reviewed).
+      # The LEFT endpoint had split the tip token off and resolved only its remainder against the
+      # attested head, while the RIGHT endpoint had no such split: anything that was not the bare
+      # tip word went straight to `rev-parse` in `$root`, i.e. in the DELTA CHECKOUT's `HEAD`. A
+      # token that is not the tip resolves the same in every frame (a sha is content and a ref name
+      # is repo-wide), so this is defence in depth rather than a measured hole — but it is the one
+      # endpoint that could still read the checkout, in the arm whose entire job is to be frame-free.
+      case "$_erhs" in
+        HEAD|HEAD[~^]*|HEAD@\{*|@|@\{*)
+          _rrest="${_erhs}"
+          case "$_rrest" in
+            HEAD[~^]*|HEAD@\{*) _rrest="${_rrest#HEAD}" ;;
+            HEAD) _rrest='' ;;
+            @*) _rrest="${_rrest#@}" ;;
+          esac
+          _ersha="$(delta_git "$root" rev-parse --verify "${_tosha}${_rrest}^{commit}" 2>/dev/null || true)" ;;
+        *) _ersha="$(delta_git "$root" rev-parse --verify "${_erhs}^{commit}" 2>/dev/null || true)" ;;
+      esac
+      # ⛔ A TWO-ENDPOINT RANGE IS EMPTY WHEN ITS RIGHT END IS AN ANCESTOR OF ITS LEFT (thirtieth review
+      # cycle, round 8 — MEASURED, a FAIL-OPEN the equality test left open): the test was
+      # `left == right == attested head`, so a claim that WROTE both endpoints and
+      # named an ancestor on the right — `HEAD..anc`, `anc..deltabase`, and the same through a sha — names
+      # NOUGHT commits and passed every arm. gitrevisions(7) semantics, not an extra spelling: `L..R` is
+      # the commits reachable from R but not from L, so it is empty whenever R is an ancestor of L or is
+      # L. What made this urgent rather than theoretical is that the round-7 fix already refuses the
+      # DECORATED spelling of the identical claim, so the verdict hung on a backtick: `` `HEAD` .. anc ``
+      # refused, `HEAD..anc` minted. Same test as every sibling arm (`merge-base --is-ancestor R L`), and
+      # it cannot refuse a real claim: an empty `L..R` never has commits to be evidence for.
+      # ⛔ NOT THE LAST SPELLING, AND THE REMAINDER IS ASYMMETRIC BY SPELLING (round 9 — reviewed, then
+      # MEASURED): an identity REFLOG position on the left (`HEAD@{0}..anc`) is the same claim and was
+      # still accepted, because the identity was recognised and then thrown away before resolution; that
+      # is fixed above. What remains is the interior PAIR: `anc..deltabase` abutting is ACCEPTED, while
+      # the spaced `anc .. deltabase` is refused — round 11 corrected WHICH arm answers: it is the MIRROR
+      # arm's written-left-end sentence ('both endpoints are written and deltabase is an ancestor of anc'),
+      # not the omitted-RIGHT arm's union, which `continue`s because its left operand is not the head. The
+      # sentence below therefore states the boundary for the abutting spelling and does not claim the
+      # spaced one.
+      # ⛔ AND IT MUST NOT PREEMPT A MORE SPECIFIC, MORE ACCURATE SENTENCE (MEASURED — the first cut of this
+      # test did). A claim whose RIGHT end carries a SELECTOR (`HEAD..HEAD~1`) is a tip-relative NARROWING and
+      # is refused as one; a claim whose LEFT end names a DESCENDANT (`afterhead..HEAD`) is refused as
+      # starting PAST the head; and a claim between interior commits is not this arm's business at all.
+      # Telling any of those authors their claim "states an EMPTY range" would be a false sentence about
+      # their own text — and the verdict alone cannot separate the populations, so the phrasing is the
+      # pin (20h75, 20h93, M87). The population that IS new here is narrow and exact: the attested head is
+      # WRITTEN on the left and an ANCESTOR of it on the right.
+      if [ "$_ersha" = "$_elsha" ] && [ "$_elsha" = "$to" ]; then
+        _emptyrange=1; _emptystated="${_estated:-${_elhs}..${_erhs}}"; break
+      elif [ "$_esep" = ".." ] && [ "$_elsha" = "$to" ] && [ "$_tiprel" = 0 ] && [ "$_afterhead" = 0 ] \
+           && delta_git "$root" merge-base --is-ancestor "$_ersha" "$_elsha" 2>/dev/null; then
+        _emptyrange=1; _emptystated="${_estated:-${_elhs}..${_erhs}}"; break
+      fi
+    done
+    # ⛔ AN OMITTED ENDPOINT DEFAULTS TO THE TIP, SO `<tip>..` IS AN EMPTY RANGE (twenty-first cycle,
+    # P2 — MEASURED, gitrevisions(7): "you can omit one end and let it default to HEAD … `..` would
+    # mean HEAD..HEAD which is an empty range"). `X..` therefore states `X..HEAD`, and when `X`
+    # resolves to the attested head the claim names ZERO commits. It matched NO arm: the loop above
+    # needs an operand on BOTH sides of the dots, the parser needs a hex run adjacent to them, the
+    # token scan skips the run that equals `to` by design, and the tip arm needs a CHAIN. MEASURED at
+    # the pre-fix head: `@{0}..` and `HEAD..` beside the honest range recorded a signed `clean`,
+    # while the same narrowing written `@{0}..HEAD` was refused.
+    # ⛔ TWO DOTS ONLY, AND ONLY WITH THE OPERAND PRESENT — the residuals are DECLARED, not discovered
+    # later. A three-dot run (`the rest was not read...`), a bare `..` (an ellipsis with no operand at
+    # all) and the reversed omission (`..HEAD`) are NOT treated as range statements: english writes an
+    # ellipsis after a word, and a claim that ends `HEAD...` would then be refused with a sentence
+    # about a range its author never wrote — the false-block class this file calls worse than the gap.
+    # git's endpoint omission is written with exactly the two dots kept below, which is the only form
+    # an artifact states as a range — and the arm fires ONLY on the omitted shape (the character after
+    # the dots is not a word character), so a two-endpoint range is left to the arm above rather than
+    # measured twice here.
+    _opends="$_claim"
+    # ⛔ A REF NAME IS AN ENDPOINT HERE TOO (twenty-second cycle, P1 — MEASURED). This arm's operand
+    # class was `hex | HEAD | @{…} | @` while the two-endpoint arm above had already ADMITTED ref
+    # names (the twentieth cycle's fix there), so the SAME claim written with an omitted endpoint
+    # was decided the other way: `deltatip..` — `deltatip` being a branch at the attested head, i.e.
+    # `deltatip..HEAD`, an EMPTY range — passed every arm and minted a signed `clean`, while
+    # `deltatip..HEAD` was refused (20h70). MEASURED with the arms lifted verbatim. `git rev-list
+    # --count deltatip..` = 0 against 2 commits in the recorded range: the narrowest claim there is,
+    # offered as evidence for a range that has commits. The arm already resolves every token it
+    # cannot read by spelling (`*)` below), so admitting the token is the whole fix — the same one the
+    # 20th cycle took one arm over, not another spelling test.
+    # ⛔ THE OPERAND IS THE WHOLE RUN HERE TOO, LEADING DIGIT INCLUDED (twenty-third review cycle, P1 —
+    # MEASURED): letter-initial alternatives left `3698-fix..` (= `3698-fix..HEAD`, an EMPTY range)
+    # matched as the suffix `fix`, unresolved, and walked past by the `continue` below — rc 0 with a
+    # signed `clean`. See the two-endpoint arm above for the measurement and the class argument.
+    # ⛔ THE SEPARATOR TOLERATES WHITESPACE, LIKE THE TWO-ENDPOINT ARM (thirtieth review cycle, P3 —
+    # MEASURED): the two-endpoint arm reads `[[:space:]]*` on both sides of its dots while this arm
+    # required them to ABUT the operand, so `HEAD ..` — `HEAD..HEAD`, nought commits — matched no arm at
+    # all and minted a signed `clean`. One grammar for every reader of the same operator.
+    while [[ "$_opends" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})(${_dident}*)[^0-9A-Za-z_.~^@{}]*\.\.([^0-9A-Za-z_.]|$) ]]; do
+      _olhs="${BASH_REMATCH[$_g_op1]}${BASH_REMATCH[$_g_dident1]}"
+      # ⛔ THE DOTS MUST NOT SIT BETWEEN TWO OPERANDS (thirtieth review cycle, round 2 — MEASURED, a
+      # FALSE BLOCK this round's separator tolerance introduced). `HEAD .. <other>` is a TWO-endpoint
+      # claim whose left operand is the head; with the tolerance this arm matched `HEAD ..` and refused
+      # it as the omitted-RIGHT form, telling the author their endpoint was omitted when they had
+      # WRITTEN it (`HEAD .. <orphan>` — a mention this file deliberately accepts, MEASURED rc 3 where
+      # `git rev-list --count HEAD..<orphan>` is 1). The omission is `<operand>..` with NOTHING after
+      # it, so a RESOLVABLE token after the dots means the range has both ends and belongs to the arm
+      # above. Resolution, not spelling: `and the rest was not read` does not resolve, `<orphan>` does.
+      # ⛔ UNLESS THE LEFT OPERAND IS THE HEAD (thirtieth review cycle, round 3): `HEAD..<right>` is
+      # still a TWO-endpoint claim, but its emptiness is THIS arm's to measure, not the arm above's —
+      # `<right>` an ancestor of the head means nought commits. See the gated guard below.
+      _olpost="${_opends#*"${BASH_REMATCH[0]}"}"
+      _opends="$_olpost"
+      _olpost="${_olpost#"${_olpost%%[![:space:]]*}"}"
+      _olword="${_olpost%%[[:space:]]*}"
+      # ⛔ RESET THE RESOLVED WORD WITH IT: `_olw`/`_olwsha` are assigned only when a word was written, so a
+      # previous iteration's value would otherwise survive into an iteration that wrote none — and the
+      # omission guard below reads exactly that pair. (MEASURED as a latent staleness, not a live defect:
+      # the guard is keyed on `_olword` for the same reason.)
+      _olw=""; _olwsha=""
+      # The same word-or-word-plus-selector rule as the two-endpoint arm above, and the same git-decided
+      # case variant (`Head..` with a tag `Head` at another commit is not `HEAD..`): `_tipvariant`
+      # normalises only when the repo has no ref of that exact name (twenty-third cycle, P2).
+      _olhs="$(_tipvariant "$_olhs")"
+      # The identity test comes first, exactly as in the two-endpoint arm: `HEAD`/`@`/`@{0}`/`@{now}`
+      # WITH an identity-only chain denote the attested head itself, so `@{0}..` — the spelling this
+      # arm was measured on — must not fall into the tip-split below (which strips a leading `@` and
+      # would try to resolve `{0}` against the head).
+      _olid=0
+      [[ "$_olhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _olid=1
+      if [ "$_olid" = 1 ]; then
+        _osha="$to"
+      else
+        case "$_olhs" in
+          HEAD[~^]*|HEAD@\{*) _olrest="${_olhs#HEAD}" ;;
+          HEAD) _olrest='' ;;
+          @\{*\}) continue ;;
+          @*) _olrest="${_olhs#@}" ;;
+          *) _olrest='' ;;
+        esac
+        case "$_olhs" in
+          HEAD|HEAD[~^]*|HEAD@\{*|@|@\{*)
+            _osha="$(delta_git "$root" rev-parse --verify "${_tosha}${_olrest}^{commit}" 2>/dev/null || true)" ;;
+          *)
+            _osha="$(delta_git "$root" rev-parse --verify "${_olhs}^{commit}" 2>/dev/null || true)" ;;
+        esac
+      fi
+      # ⛔ THE LEFT OPERAND IS RESOLVED HERE, BEFORE THE GUARD BELOW USES IT: whether a resolvable word
+      # after the dots is somebody else's range or the RIGHT END of a `HEAD..` claim is decided by
+      # whether the LEFT operand is the attested head, so the guard cannot ask its question first.
+      [ -n "$_osha" ] || continue
+      # ⛔ A RESOLVABLE WORD AFTER THE DOTS IS THE RANGE'S OWN RIGHT END ONLY WHEN THE LEFT OPERAND IS
+      # NOT THE HEAD (thirtieth review cycle, round 3 — MEASURED, a FAIL-OPEN this round's guard left
+      # open, and a REGRESSION against the parent for six spellings). Round 2's guard skipped this arm
+      # whenever the word after the dots resolved, which is right for `HEAD .. <orphan>` (a mention of
+      # another lineage, 20h99) — but `HEAD..` is `HEAD..HEAD`, so for a LEFT operand that IS the head
+      # the same skip waves through `HEAD.. <ancestor>`, `HEAD .. <ancestor>` and `<head-sha> .. anc`:
+      # nought commits, minted as a signed `clean` over the whole recorded range, and refused by the
+      # parent before the guard existed. `X..` is empty when X CONTAINS the head (the asymmetry this
+      # arm's equality test below states); `HEAD..<right>` is empty when `<right>` is an ANCESTOR of
+      # it — the mirror arm's test, applied here for the population the guard routes around.
+      # So the skip is GATED ON THE LEFT OPERAND and, for the head, the emptiness is EVALUATED with
+      # the same `merge-base --is-ancestor` the sibling arm uses. Resolution, not spelling, both ways:
+      # `and the rest was not read` resolves to nothing and is prose; `<orphan>` is a descendant and
+      # is a real two-endpoint claim (20h99, accepted); `<ancestor>` is a nought-commit claim.
+      if [ -n "$_olword" ]; then
+        _olw="$(_tipvariant "$_olword")"
+        _olwsha="$(delta_git "$root" rev-parse --verify "${_olw}^{commit}" 2>/dev/null || true)"
+        # ⛔ THE SENTENCE'S OWN PUNCTUATION IS NOT PART OF THE REVISION (thirtieth review cycle, round 5 —
+        # MEASURED, a FALSE BLOCK in the round-2/round-3 guard). `_olword` is everything up to the next
+        # WHITESPACE, so it carries the prose's punctuation and `rev-parse --verify 'main,^{commit}'`
+        # answers `fatal: Needed a single revision` — so a claim that WROTE its right end and PUNCTUATED
+        # it (`HEAD .. main,`) resolved to nothing, the guard could not answer "this endpoint was
+        # WRITTEN", and control fell to the refusal below telling the author their endpoint (which they
+        # had written, in the spaced spelling this arm was widened to tolerate) was OMITTED. The
+        # discriminator is the one the two sibling arms already use: what git would parse as the
+        # REVISION, not how the sentence spaced and punctuated it. The exact spelling is tried FIRST, so
+        # no token that already resolves changes meaning; the decorated reading is only a FALLBACK.
+        # ⛔ `.` IS TRIMMED TOO, and it is the commonest sentence-final mark: git refuses a ref that ENDS
+        # in `.` (`git check-ref-format refs/heads/main.` → rc 1), so a trailing dot can only be the
+        # sentence's, never the revision's. `.` stays a NAME character everywhere before the end.
+        # ⛔ THIS TIGHTENS THE GUARD, it does not loosen it: a decorated spelling that now resolves feeds
+        # the SAME gated test below, so `HEAD .. anc,` is refused as the empty range it is, and
+        # `HEAD .. <descendant>,` is the written two-endpoint claim it already was (20h99b's population).
+        if [ -z "$_olwsha" ]; then
+          # ⛔ THE KEEP CLASS LIVES IN A VARIABLE BECAUSE ITS `}` CANNOT SIT IN A NESTED EXPANSION:
+          # `${w%"${w##*[0-9A-Za-z_^~@*}]}"}` ends the INNER `${…}` at the `}` inside the bracket and
+          # trims nothing (MEASURED: `HEAD^{commit},` came back unchanged, and the fallback silently did
+          # nought for every decorated tip-selector spelling). The value is the same class either way.
+          # ⛔ AND THE LEADING FENCE, ON THIS SIDE TOO (round 6 — MEASURED, the mirror half's sibling):
+          # `HEAD .. `` `<orphan>` `` ` decorates the FRONT, so a tail-only trim resolves nothing and the
+          # written endpoint is called omitted. Same one-character-at-a-time strip, same class.
+          _olkeep='0-9A-Za-z_^~@*}/'
+          _ollead='0-9A-Za-z_^~@/'
+          _oldec="$_olw"
+          while [ -n "$_oldec" ]; do
+            case "$_oldec" in
+              [!$_ollead]*) _oldec="${_oldec#?}" ;;
+              *) break ;;
+            esac
+          done
+          _olbare="${_oldec%"${_oldec##*[$_olkeep]}"}"
+          if [ -n "$_olbare" ] && [ "$_olbare" != "$_olw" ]; then
+            _olbare="$(_tipvariant "$_olbare")"
+            _olbsha="$(delta_git "$root" rev-parse --verify "${_olbare}^{commit}" 2>/dev/null || true)"
+            if [ -n "$_olbsha" ]; then _olw="$_olbare"; _olwsha="$_olbsha"; fi
+          fi
+        fi
+        if [ -n "$_olwsha" ]; then
+          if [ "$_osha" = "$to" ]; then
+            if [ "$_olwsha" = "$to" ] || delta_git "$root" merge-base --is-ancestor "$_olwsha" "$to" 2>/dev/null; then
+              _emptyrange=1; _emptystated="$_olhs..$_olw (both endpoints are written and the left one is the attested head, so the claim is HEAD..$_olw — an EMPTY range)"; break
+            fi
+          fi
+          continue
+        fi
+      fi
+      # ⛔ THIS DIRECTION COMPARES EQUALITY ONLY, AND THE ASYMMETRY IS THE MEANING, NOT AN OVERSIGHT
+      # (thirtieth review cycle, round 2 — MEASURED BOTH WAYS). `X..` is `X..HEAD`, so it is EMPTY when X
+      # CONTAINS the head, not when X is an ancestor of it: an ANCESTRY test here refused `deltabase..`
+      # and `<base> .. <HEAD>` — honest claims whose range has commits (20h72c, 20h22) — which is the
+      # measured cost of copying the mirror arm's ancestry test into this one. The container case needs
+      # no test here: a descendant operand is already refused by the tip arm's `_afterhead` path
+      # (MEASURED, `afterhead ..` is rc 3), and a non-empty `X..HEAD` is not this arm's population.
+      # DECLARED REMAINDER, symmetric with the mirror's: a range with BOTH ends written where the left
+      # end is an INTERIOR ancestor (`<midref>..HEAD` — a strictly narrower claim) is not refused by
+      # either arm — and NEITHER is an empty range between two interior refs (`anc..anc`, `anc..deltabase`,
+      # MEASURED: both mint; round 13 corrected this sentence, which said the opposite). Only ranges whose
+      # LEFT END IS THE ATTESTED HEAD and tip-relative narrowings are refused here, and a "narrower" test
+      # would
+      # have to refuse the legitimate `<base>~1..HEAD` population the tip arm deliberately accepts.
+      # ⛔ A WRITTEN-BUT-UNRESOLVABLE WORD READS AS AN OMISSION HERE, AND THAT IS A DECLARED COST, NOT A
+      # FIX (round 10 — MEASURED, and the fix measured WORSE). `HEAD .. zzz` (a typo'd ref the author DID
+      # write) is refused with "the endpoint is omitted, so it defaults to the head", while the ABUTTING
+      # `HEAD..zzz` is accepted: the same claim, two verdicts, and the spaced one accused of an omission
+      # it does not contain. The obvious discriminator — skip when a word was written — CANNOT be used:
+      # in this arm the text after the dots is PROSE for the ordinary omission (`@{0}.. and the rest was
+      # not read`), so "a word follows" is true for EVERY vector the arm exists for. Trying it anyway
+      # (round 10, first cut) turned eight refusal vectors green-to-red (20h72/72b/76/76b/78/78b/97, M68/
+      # ⛔ AND A ONE-CHARACTER RIGHT END REACHES THE SAME SENTENCE BY A DIFFERENT ROUTE (round 12, MEASURED,
+      # P3): this arm's terminator class is `([^0-9A-Za-z_.]|$)`, so in `HEAD..@` — where `@` IS the tip and
+      # the claim is genuinely empty — the `@` is consumed AS the terminator, `_olword` comes out empty, and
+      # the author is told the endpoint was omitted. Same fail-CLOSED family as the paragraph above, same
+      # declared cost, and the same reason it is not chased: every discriminator tried here costs the
+      # ordinary omission its meaning.
+      # M95/M97/M100 vacuous) — a fail-CLOSED sentence traded for eight fail-OPEN verdicts. The verdict is
+      # fail-closed and the sentence is the cost; stated here rather than rediscovered.
+      if [ "$_osha" = "$to" ]; then
+        _emptyrange=1; _emptystated="${_olhs}..HEAD (the endpoint is omitted, so it defaults to the head)"; break
+      fi
+    done
+    # ⛔ THE MIRROR OMISSION — `..<tip>` — IS THE SAME CLAIM (twenty-eighth review cycle, P1 —
+    # MEASURED, a fail-open the arm above does not reach). gitrevisions(7) defaults the MISSING end to
+    # HEAD in either direction, so `..X` states `HEAD..X`; when X resolves to the attested head that is
+    # again ZERO commits. It matched no arm: the loop above needs an operand BEFORE the dots, the
+    # parser needs a hex run adjacent to them, and the tip arm needs a CHAIN — so an artifact that
+    # stated the honest range AND `..<head>` beside it minted a signed `clean` over the whole range
+    # while its narrowing sentence named nought commits. MEASURED with the arms lifted verbatim:
+    # `..<head>`, `..@{0}` and `..<head>^{commit}` were all rc 0, in two different checkout frames,
+    # while the mirror `<head>..` was refused by the arm above. Symmetry is the whole argument: the
+    # same claim must not be decided by which end the author left out.
+    # ⛔ LEADING CONTEXT IS NOT AN OPERAND (the false-block side, DECLARED): the dots must not be
+    # preceded by a run that ENDS an operand — `.`, `}`, `*`, `~`, `^`, `@` are excluded
+    # from the leading class, so `A^{commit}..B`, `A@{0}..B` and `A~1..B` are left to the two-endpoint
+    # arm and are never measured twice here. A three-dot ellipsis (`...`) is likewise out: its `..` is
+    # followed by `.`, which the OPERAND-START class refuses.
+    # ⛔ AND A SENTENCE-FINAL PERIOD IS NOT PART OF THE ENDPOINT (thirtieth review cycle, round 6 —
+    # MEASURED, a fail-open this arm's terminator class has left open since it was written): the class was
+    # `([^0-9A-Za-z_.]|$)`, so ONE `.` glued to the endpoint meant the arm NEVER MATCHED and `..HEAD.` —
+    # `HEAD..HEAD`, nought commits — minted a signed `clean`, with the ancestry test below never reached.
+    # One period is the whole attack. A period ends a sentence; it does not end a revision, so the
+    # terminator no longer excludes it. `...` still cannot be read as a range, for a STRUCTURAL reason
+    # rather than that class: an ellipsis's `..` is either preceded by `.` (excluded from the LEADING
+    # class) or followed by `.` where an OPERAND must begin.
+    # ⛔ DECLARED REMAINDER: an omitted RIGHT endpoint whose left side is an INTERIOR ancestor spelled
+    # as a REF NAME (`<midref>..` — a strictly narrower range) is NOT refused here, because this arm
+    # refuses EQUALITY with the head and cannot tell "narrower" from "starts before the recorded from"
+    # without the ancestry test the tip arm uses. Pre-existing, recorded rather than silently kept.
+    # ⛔ AND THE MIRROR READS THE SAME GRAMMAR, WITH ONE GUARD THIS DIRECTION NEEDS (thirtieth cycle,
+    # P3 — MEASURED): tolerating whitespace after the dots is what makes `.. HEAD` a claim, and the
+    # guard below is what keeps `<BASE> .. <HEAD>` (20h22) from being read as one. Without the guard the
+    # tolerance would REFUSE a correct two-endpoint artifact — a false block strictly worse than the gap.
+    _opends="$_claim"
+    while [[ "$_opends" =~ (^|[^0-9A-Za-z_.^~@*}])\.\.[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|${_dref})(${_dident}*)([^0-9A-Za-z_]|$) ]]; do
+      _orhs="${BASH_REMATCH[$_g_op1]}${BASH_REMATCH[$_g_dident1]}"
+      # ⛔ THE DOTS MUST NOT BE THE MIDDLE OF A TWO-ENDPOINT RANGE (thirtieth review cycle, P3 —
+      # MEASURED). Now that the separator tolerates whitespace, this arm would read the RIGHT endpoint of
+      # an honest two-endpoint spelling (`<BASE> .. <HEAD>`, 20h22) as the omitted-LEFT claim `..<HEAD>`
+      # — an empty range — and REFUSE a correct artifact. The left end is absent only when what precedes
+      # the dots (whitespace ignored) is not a revision: a ref name, a sha or the tip's word ENDS an
+      # operand, the word `reviewed` does not. One `rev-parse` per matched occurrence, never per word.
+      _ompre="${_opends%%"${BASH_REMATCH[0]}"*}"
+      _ompre="${_ompre%"${_ompre##*[![:space:]]}"}"
+      # ⛔ THE SAME PUNCTUATION RULE THE OTHER SIDE GOT IN ROUND 5, READ BACKWARD (thirtieth review cycle,
+      # round 6 — MEASURED, the mirror half of a false block the round-5 fix closed only on the right):
+      # `` `<BASE>` .. <HEAD> `` and `<BASE>, .. <HEAD>` WRITE the left endpoint and either FENCE or END the
+      # word. The guard resolved nothing, could not answer "this endpoint was written", and refused a
+      # correct two-endpoint artifact as the omitted-left empty range — a sentence about the author's own
+      # text that was false. Same discriminator as the right-hand side: what git parses as the REVISION.
+      # The exact spelling is tried FIRST so no token that already resolves changes meaning; only on
+      # failure is the sentence's own decoration trimmed and re-resolved. The keep class matches the
+      # right-hand side's (`}` survives so `HEAD^{commit},` keeps its brace) and `.` is trimmed because
+      # git refuses a ref name that ENDS in one.
+      _omword="${_ompre##*[[:space:]]}"
+      if [ -n "$_omword" ]; then
+        _omw="$(_tipvariant "$_omword")"
+        _omwsha="$(_attres "$_omw")"
+        if [ -z "$_omwsha" ]; then
+          # ⛔ TRAILING IS NOT ENOUGH: AN INLINE-CODE FENCE IS LEADING (thirtieth review cycle, round 6 —
+          # MEASURED). `` `<BASE>` `` puts the decoration at BOTH ends, so a trim that only removes the
+          # tail leaves `` `<BAS `` and resolves nothing — the artifact is refused as an omission again, one
+          # spelling over from the one the tail trim fixed. Strip the leading run first (one character at
+          # a time, so a legal first character is never eaten), then the tail, then resolve. The exact
+          # spelling was already tried above, so no token that resolves changes meaning.
+          _omkeep='0-9A-Za-z_^~@*}/'
+          _omlead='0-9A-Za-z_^~@/'
+          _omdec="$_omw"
+          while [ -n "$_omdec" ]; do
+            case "$_omdec" in
+              [!$_omlead]*) _omdec="${_omdec#?}" ;;
+              *) break ;;
+            esac
+          done
+          _omdec="${_omdec%"${_omdec##*[$_omkeep]}"}"
+          if [ -n "$_omdec" ] && [ "$_omdec" != "$_omw" ]; then
+            _omdec="$(_tipvariant "$_omdec")"
+            _omdsha="$(_attres "$_omdec")"
+            if [ -n "$_omdsha" ]; then _omw="$_omdec"; _omwsha="$_omdsha"; fi
+          fi
+        fi
+        # ⛔ A WRITTEN LEFT END IS NOT AN EXCUSE TO STOP MEASURING (thirtieth review cycle, round 7 —
+        # MEASURED, a FAIL-OPEN this round's own fallback widened). This arm skips a claim whose left end
+        # is a revision, because that claim belongs to the two-endpoint arm — but that arm needs the
+        # operand to ABUT the dots, and once the left end carries the sentence's decoration (`` `HEAD` ``,
+        # `HEAD,`, `HEAD.`) NO arm matches it: the two-endpoint arm cannot, this arm skipped, and the
+        # omitted-RIGHT arm needs the dots to FOLLOW the operand. So `` `HEAD` .. HEAD `` — `HEAD..HEAD`,
+        # nought commits — minted a signed `clean` while the SAME claim undecorated was refused, and the
+        # decorated spellings were refused at the parent before this round's fallback made them resolve.
+        # The skip therefore REMEMBERS the resolved left end instead of leaving the claim unmeasured, and
+        # the emptiness test below runs on both populations: `L..R` is empty when R is an ANCESTOR of L
+        # (or is L), which is the same `merge-base --is-ancestor` every sibling arm uses.
+        _omleft=''
+        if [ -n "$_omwsha" ]; then
+          _omleft="$_omwsha"
+          _omleftstated="$_omw"
+        fi
+      fi
+      _opends="${_opends#*"${BASH_REMATCH[0]}"}"
+      _orhs="$(_tipvariant "$_orhs")"
+      # ⛔ AN IDENTITY REFLOG POSITION ON A SHA IS STILL THE SAME COMMIT — and git REFUSES the spelling
+      # (`rev-parse <sha>@{0}` → "fatal: Needed a single revision": a reflog position needs a REF), so
+      # resolving the token whole answered with nothing and the claim was silently DROPPED (MEASURED:
+      # `..<head>@{0}` rc 0 while `..<head>` and `..<head>^{commit}` refused). Identity is decided on
+      # the POSITION, exactly as the two-endpoint arm decides it, and only `@{0}`/`@{00}` (a zero
+      # count) is identity — `@{1}` is an elder position and is not stripped.
+      while [[ "$_orhs" =~ ^(.+)@\{0+\}$ ]]; do _orhs="${BASH_REMATCH[1]}"; done
+      _orid=0
+      [[ "$_orhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _orid=1
+      if [ "$_orid" = 1 ]; then
+        _osha="$to"
+      else
+        case "$_orhs" in
+          HEAD[~^]*|HEAD@\{*) _olrest="${_orhs#HEAD}" ;;
+          HEAD) _olrest='' ;;
+          @\{*\}) continue ;;
+          @*) _olrest="${_orhs#@}" ;;
+          *) _olrest='' ;;
+        esac
+        case "$_orhs" in
+          HEAD|HEAD[~^]*|HEAD@\{*|@|@\{*)
+            _osha="$(delta_git "$root" rev-parse --verify "${_tosha}${_olrest}^{commit}" 2>/dev/null || true)" ;;
+          *)
+            _osha="$(delta_git "$root" rev-parse --verify "${_orhs}^{commit}" 2>/dev/null || true)" ;;
+        esac
+      fi
+      [ -n "$_osha" ] || continue
+      # ⛔ THE WRITTEN-LEFT-END CLAIM IS MEASURED HERE (round 7 — MEASURED): `L..R` names nought commits
+      # when R is an ancestor of L or is L itself, so a claim that WRITES the head on the left and the head
+      # (or one of its ancestors) on the right is the narrowest claim there is and cannot be the evidence
+      # for a range with commits. Then the arm skips, exactly as before: a non-empty `L..R` is the
+      # two-endpoint arm's population, not this one.
+      if [ -n "$_omleft" ]; then
+        if [ "$_osha" = "$_omleft" ] || delta_git "$root" merge-base --is-ancestor "$_osha" "$_omleft" 2>/dev/null; then
+          _emptyrange=1; _emptystated="${_omleftstated}..${_orhs} (both endpoints are written and '${_orhs}' is an ancestor of '${_omleftstated}', so the claim is EMPTY)"; break
+        fi
+        continue
+      fi
+      # ⛔ `..X` IS `HEAD..X`, SO THE CLAIM IS EMPTY WHENEVER X IS THE HEAD **OR AN ANCESTOR OF IT**
+      # (thirtieth review cycle, round 2 — MEASURED, a fail-open this arm's equality test left open):
+      # `..<base>` and `..<head>~1` name ZERO commits — `HEAD..X` counts the commits reachable from X but
+      # not from HEAD, and for any ancestor of the head (the head included) that set is EMPTY — yet the
+      # arm saw only the head itself and minted a signed `clean` over the whole range. The ancestry test
+      # is the MEANING of an empty `HEAD..X`, not an extra spelling. ⛔ IT BELONGS HERE AND NOT IN THE
+      # `<X>..` ARM ONE HUNDRED LINES UP, and that asymmetry is the point: `X..` is `X..HEAD`, which is
+      # empty when X CONTAINS the head — copying this test there refused `deltabase..` and
+      # `<base> .. <HEAD>` (20h72c, 20h22), MEASURED. The container case is the tip arm's `_afterhead`.
+      if [ "$_osha" = "$to" ] || delta_git "$root" merge-base --is-ancestor "$_osha" "$to" 2>/dev/null; then
+        _emptyrange=1; _emptystated="..${_orhs} (the left endpoint is omitted, so it defaults to the head — HEAD..${_orhs} is an EMPTY range)"; break
+      fi
+    done
+    # ⛔ THE REFUSAL NAMES WHICH CLAIM WAS REFUSED (twentieth cycle). An empty range is not
+    # "RELATIVE TO THE TIP" notation: `tmp3698..HEAD` writes two absolute endpoints, and telling its
+    # author the artifact stated a tip-relative narrowing would be a FALSE message about their own
+    # text — the class this file calls worse than the gap, and the one thing a refusing gate must
+    # never do. The two arms now share the flag but not the sentence.
+    if [ "$_emptyrange" = 1 ]; then
+        echo "   delta: the covering artifact '$cover' states an EMPTY range ('$_emptystated'), so it names ZERO commits while the record would assert ${from:0:12}…..${to:0:12}…. An empty range is the narrowest claim there is, and it cannot be the evidence for a range that has commits. Nothing was written." >&2
         echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
-        return 1 ;;
-    esac
+        return 1
+    fi
+    if [ "$_afterhead" = 1 ]; then
+        echo "   delta: the covering artifact '$cover' names '$_afterstated', a commit AFTER the attested head ${to:0:12}… — ${to:0:12}… is an ancestor of it, so a range built on it starts past the head the verdict is written at and cannot be the evidence for ${from:0:12}…..${to:0:12}…. An endpoint past the head is not a narrowing of this range, it is a different one. Nothing was written." >&2
+        echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
+        return 1
+    fi
+    if [ "$_tiprel" = 1 ]; then
+        echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (<ref>~N / <ref>^N / <ref>@{N}) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
+        echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
+        return 1
+    fi
     fi
   fi
   DELTA_FROM="$from"; DELTA_TO="$to"; DELTA_BASE="$base_sha"

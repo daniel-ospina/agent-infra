@@ -273,7 +273,7 @@ because every other test on this arm fires only on something it can positively r
 each named in the journal as an unclassifiable summary or row
 (with a `remedy=` pointing at the checker's vocabulary, not at the farm): a pipe-free line carrying two
 of the three label words with no parsable total, and a per-file row whose trailing token is neither benign
-(`verdict`, `ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) nor a class this pass knows —
+(`verdict`, `ok`, `LOCAL (declared)`, `LOCAL (scratch)`, `SYMLINK (graded via its target)`) nor a class this pass knows —
 scanned on any **row** of two or more fields, because a vocabulary that drifts by a suffix (`drift_v2`,
 `drift.v2`, `drift:2`, `DRIFTED!`) or a report that prints two-field rows is exactly the class this check
 exists for. A row is *a first field that is a path*: the instrument right-pads that field, so
@@ -431,7 +431,7 @@ Only one token reds a pass this way:
 | token | pass result |
 |---|---|
 | **`executes:<dir>`** — a live controller executes a directory the box does not have | **exit 1**, `action=deployed-drift` |
-| `behind:<sha>`, `diverged:<sha>`, `payload-differs`, `uncommitted-edit:<path>`, `incomplete:<path>`, `source-dirty:<sha>`, `surface` | reported in `drift=`, pass stays green |
+| `behind:<sha>`, `diverged:<sha>`, `payload-differs`, `uncommitted-edit:<path>`, `incomplete:<path>`, `not-executable:<path>`, `source-dirty:<sha>`, `surface` | reported in `drift=`, pass stays green |
 | `UNKNOWN:` / exit 2 from the checker | reported, pass stays green (`cannot-verify-rc2`) |
 
 Scoped deliberately: the other tokens legitimately describe a developer box mid-edit or a

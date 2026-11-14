@@ -537,6 +537,25 @@ if [ -z "$QUEUE_HEAD_SCAN_SHIPPED" ]; then
   exit 3
 fi
 
+# ghost_window_fixture <n> — a queue page whose head holds EXACTLY <n> ghost rows and a real demand
+# row behind them. `ids` and `rows` are returned `|`-separated so the caller can hand them to
+# `GH_DEMAND_GHOST_IDS` and `GH_QUEUE_ROWS_SPEC` without a second read. The two arms below pin what a
+# scan stopped by the BOUND does, so they must be fed the SHIPPED bound rather than a hardcoded 5:
+# with the shipped bound at 25 a five-ghost page no longer exhausts the window, and those arms no
+# longer refuse at all — the scan reaches the demand row behind the five ghosts (measured: both exit 0
+# and write a verdict). They RED in that state rather than passing quietly (measured against a 5-ghost
+# page: 7 assertions), and the shipped value itself is ALSO pinned literally at the `#3995` arm
+# (agent-infra#3995).
+ghost_window_fixture() {
+  local n="$1" ids="" rows="" i id
+  for i in $(seq 1 "$n"); do
+    id=$((4000 + i))
+    ids="$ids$id "
+    rows="$rows$id:$((2592000 - i * 1000));"
+  done
+  printf '%s|%s' "$ids" "$rows"
+}
+
 # run_gate <case> [ENV=…]... -- [gate args] — one hermetic invocation.
 # CI_GATE_ORCH_WS="" keeps the cmux leg out of the picture: the durable inbox file is the
 # deterministic notification sink, so "did it notify?" has one readable answer. That claim is only
@@ -578,6 +597,16 @@ PYDROP
     export CI_GATE_REPO="test-org/test-repo"
     # The shipped default, DERIVED above — an arm that pins its own value overrides it via ENV=… .
     export CI_GATE_QUEUE_THRESHOLD="$GH_THRESHOLD_DEFAULT"
+    # ⛔ THE HEAD-SCAN BOUND IS PINNED THE SAME WAY, and it is pinned HERE rather than only derived
+    # (agent-infra#3995 review P1). The two bound-break arms derive their ghost count from the shipped
+    # bound, so they follow a mutant instead of pinning it — measured BEFORE this fix: the whole suite
+    # passed against a gate that reverted the bound to 5, i.e. the 15-hour outage #3995 documents could
+    # return with a green suite. The value itself is pinned two-sided at the `#3995` arm below; this
+    # export is what stops an AMBIENT knob from turning the suite red with no code change — measured
+    # BEFORE it: `CI_GATE_QUEUE_HEAD_SCAN_MAX=5 bash …test.sh` → 2 failures. It does not mask a mutant:
+    # an arm that tests the operand passes `ENV=…` afterwards and still overrides (measured: a gate
+    # mutated to ignore the knob reds `ghost-bound-zero`/`ghost-bound-junk`).
+    export CI_GATE_QUEUE_HEAD_SCAN_MAX="$QUEUE_HEAD_SCAN_SHIPPED"
     # The disengage streak is a PRODUCTION default of 3 (agent-infra#3060): one hostile reading must
     # not strip the label the queue is using. Arms that are not about the streak keep the immediate
     # semantics, or they would all be asserting the same counter; the streak has its own section,
@@ -671,6 +700,14 @@ assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "steady run relabels nothing"
 echo "── #3261: the gate SHIPS the decided backlog threshold (10), and routes on it at the boundary ──"
 assert_eq "$GH_THRESHOLD_DEFAULT" "10" \
   "the gate ships QUEUE_THRESHOLD=10 (owner ruling 2026-11-02, tortoise#9878) — reversing it must redden THIS line"
+# ⛔ AND THE HEAD-SCAN BOUND IS PINNED FOR THE SAME REASON (agent-infra#3995 review P1). The arms below
+# derive their ghost count from this value so they keep testing the bound-break SHAPE at whatever the
+# bound is, which means they cannot catch a REVERSAL of it — measured: with the bound reverted to 5 the
+# whole suite still passes, i.e. the 15 h outage #3995 documents would return green. The literal is the
+# two-sided half, the arms are the wired half; the cost of a deliberate future raise is this one line.
+echo "── #3995: the gate SHIPS the measured head-scan bound (25), not the falsified 5 ──"
+assert_eq "$QUEUE_HEAD_SCAN_SHIPPED" "25" \
+  "the gate ships a head-scan bound above the measured ghost population (14 on tortoise 2026-11-12, agent-infra#3995) — a REVERSAL to 5 must redden THIS line"
 # …and the number is WIRED, not merely present: a queue exactly AT the shipped threshold takes the
 # fallback, one job under it does not. (Threshold-relative on purpose — see (i): this half proves the
 # constant reaches the LENGTH leg, and the literal above proves which constant it is.)
@@ -1058,11 +1095,20 @@ assert_contains "$OUT" "ghost_runs=0" "nothing was discounted"
 # ⛔ THE SCAN IS BOUNDED, and a bound that runs out is a COULD-NOT-MEASURE — never "no demand" (that
 # would strip the pool during a real stall) and never "the ghost's age" (that is the defect).
 echo "── #2344: a scan window that is entirely ghosts, with more queue behind it, REFUSES ──"
-run_gate ghost-window GH_QUEUED=40 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002 4003 4004 4005" \
-  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000;4003:2580000;4004:2570000;4005:2560000;4006:120" \
+# The page carries AS MANY ghost rows as the shipped bound (agent-infra#3995: a hardcoded five would
+# no longer exhaust a 25-run window), then one row that HAS demand.
+GW_FIXTURE="$(ghost_window_fixture "$QUEUE_HEAD_SCAN_SHIPPED")"
+# ⛔ THE DEPTH MUST SCALE WITH THE BOUND TOO (agent-infra#3995 review cycle 2, finding 1): at a fixed
+# 40, a bound of 100 reads more rows than the page reports as deep, which is the INCONSISTENT refusal
+# — `RC` is 2 in both branches, so only the message assertions noticed, and the natural repair for a
+# future raise would be to edit the expected string and leave the arm pinning INCONSISTENT instead of
+# the window. `shipped + 15` is 40 today (no arm changes) and stays genuinely deeper at any bound.
+run_gate ghost-window GH_QUEUED="$((QUEUE_HEAD_SCAN_SHIPPED + 15))" GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="${GW_FIXTURE%%|*}" \
+  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}4100:120" \
   CI_GATE_QUEUE_THRESHOLD=100 --
 assert_eq "$RC" "2" "a ghost-only scan window with real queue behind it → exit 2"
-assert_contains "$OUT" "beyond the 5-run scan window" "the refusal names the bound it ran out of"
+assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the refusal names the bound it ran out of"
+assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "the refusal names the KNOB an operator can raise (agent-infra#3995)"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a refused head scan advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a refused head scan relabelled no runner"
 # …and the bound is an OPERAND like every other one here: a zero or non-numeric value would silently
@@ -1139,11 +1185,12 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "the all-ghosts contradiction ad
 # and the "whole queue was read" branch certified "nothing is waiting" over a page it had NOT read —
 # including a 30-day run WITH a queued job sitting just past the bound, i.e. exactly the stalled shape
 # the leg exists to catch, certified `github` with `oldest_queued_s=0`. The fixture is the shipped
-# bound (5), five ghosts, and a sixth row that HAS demand.
+# bound's worth of ghosts (derived, never the literal 5 — agent-infra#3995), and one more row that HAS
+# demand.
 echo "── #2344: a bound-limited scan is never mistaken for a complete one ──"
 run_gate ghost-bound-truncated GH_QUEUED="$QUEUE_HEAD_SCAN_SHIPPED" GH_INPROGRESS=0 \
-  GH_DEMAND_GHOST_IDS="4001 4002 4003 4004 4005" \
-  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000;4003:2580000;4004:2570000;4005:2560000;4006:2592000" --
+  GH_DEMAND_GHOST_IDS="${GW_FIXTURE%%|*}" \
+  GH_QUEUE_ROWS_SPEC="${GW_FIXTURE#*|}4100:2592000" --
 assert_eq "$RC" "2" "a bound break over a deeper page → exit 2 (could-not-measure), not 'no demand'"
 assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the refusal names the bound that stopped it"
 assert_not_contains "$OUT" "nothing is waiting for a runner" "it is NOT read as a complete measurement"
@@ -1155,7 +1202,21 @@ run_gate ghost-truncated GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4
   GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000" --
 assert_eq "$RC" "2" "a page shorter than its own depth → exit 2"
 assert_contains "$OUT" "TRUNCATED" "the refusal names the truncation"
+# …and at the SHIPPED bound the page-ceiling note is NOT appended: the knob can reach this branch and
+# the ceiling does not apply below QUEUE_PAGE (agent-infra#3995 review cycle 2, finding 4).
+assert_not_contains "$OUT" "ONE page of" "the page-ceiling note is absent below QUEUE_PAGE"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a truncated page advanced no state file"
+# ⛔ THE CEILING NOTE IS WIRED, and it is the half an operator needs when the knob alone cannot help: a
+# bound AT the page size can never read past the page, so the TRUNCATED refusal must say so. Without
+# this arm the `-ge` in that conditional could be flipped to `-le` and the whole suite stayed green
+# (measured, agent-infra#3995 review cycle 2, finding 4).
+echo "── #3995: a scan bound at the page ceiling NAMES the ceiling the knob cannot pass ──"
+run_gate ghost-truncated-ceiling GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000" CI_GATE_QUEUE_HEAD_SCAN_MAX=100 --
+assert_eq "$RC" "2" "a truncated page with the bound at the ceiling → exit 2"
+assert_contains "$OUT" "TRUNCATED" "it is still reported as truncation"
+assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound cannot pass"
+assert_contains "$OUT" "CI_GATE_QUEUE_HEAD_SCAN_MAX" "…and the knob, so the operator sees both facts on one line"
 
 # ⛔ A LEG THAT ERRORS is neither healthy NOR unhealthy-but-act (#2904): every unreadable input below
 # must exit 2, leave the mode alone, notify nothing and relabel nothing.

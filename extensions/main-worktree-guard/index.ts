@@ -210,6 +210,21 @@ let hasDotGitAncestor: (p: string) => boolean = () => false;
 // is spent, which is the pre-#608 behaviour and can never false-block.
 let branchDeleteNames: (verb: string, args?: string[]) => string[] | null = () => null;
 let extractScriptPath: (command: string) => string | null = () => null;
+// #523: EVERY script file a command executes, and the subset a heredoc BODY
+// executes. Defaults DERIVE from `extractScriptPath` (resolved at call time), so
+// a stale/short classify-git degrades to exactly the pre-#523 behaviour instead
+// of gating nothing — never fail-open.
+let extractScriptPaths: (command: string) => string[] = (command) => {
+  const p = extractScriptPath(command);
+  return p ? [p] : [];
+};
+let extractHeredocProgramScriptPaths: (command: string) => string[] = () => [];
+// #523 review round-4: the SAME set, with each path's per-invocation provenance
+// (`interpreted`: the body line hands the file to a reader, vs. executes it
+// directly). Default `[]` — a degraded import then falls back to
+// `scriptIsInterpreted` alone for every body path, which is the pre-#523
+// behaviour and never fail-open.
+let extractHeredocProgramScriptInvocations: (command: string) => { path: string; interpreted: boolean }[] = () => [];
 let extractScriptArgs: (command: string, scriptPath: string) => string[] = () => [];
 let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null, opts?: { viaInterpreter?: boolean }) => "allow" | "block" = () => "allow";
 // #1485: does the invocation hand the file to an INTERPRETER (text) or execute
@@ -412,6 +427,17 @@ try {
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
   if (typeof _m5.extractScriptArgs === "function") extractScriptArgs = _m5.extractScriptArgs;
+  // #523: the heredoc-PROGRAM walk (a heredoc-fed interpreter's BODY is a
+  // program, and its script executions must be content-gated like the command
+  // line's). Same skew contract: a stale module leaves the defaults above,
+  // which are the pre-#523 single-path behaviour.
+  if (typeof _m5.extractScriptPaths === "function") extractScriptPaths = _m5.extractScriptPaths;
+  if (typeof _m5.extractHeredocProgramScriptPaths === "function") {
+    extractHeredocProgramScriptPaths = _m5.extractHeredocProgramScriptPaths;
+  }
+  if (typeof _m5.extractHeredocProgramScriptInvocations === "function") {
+    extractHeredocProgramScriptInvocations = _m5.extractHeredocProgramScriptInvocations;
+  }
   // Stale-classify-git skew guard: a missing export must leave the fail-safe
   // defaults (never overwrite a function with undefined → TypeError on the
   // write branch).
@@ -5061,8 +5087,61 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
       return null; // resolved inline code invocation — no shell script to gate
     }
     if (code) return null; // non-inline code form — out of #627 scope (residual)
-    const scriptPath = extractScriptPath(command);
-    if (!scriptPath) return null;
+    // #523: gate EVERY script FILE the command executes. The command LINE
+    // contributes at most one (unchanged — that class is #3538), but a
+    // heredoc-fed interpreter runs its BODY as a PROGRAM, and a program can
+    // execute several files. Measured before this change: `bash <<EOF` with a
+    // body whose first line is `echo hi` and whose second is `/tmp/evil.sh`
+    // resolved `echo` — a non-file — so the content gate ran on nothing and the
+    // file the body actually executed was never read.
+    const scriptPaths = extractScriptPaths(command);
+    if (scriptPaths.length === 0) return null;
+    // Which of those paths came from a heredoc BODY, and — per invocation —
+    // whether that body line HANDS THE FILE TO A READER (#523 review round-4).
+    //
+    // ⛔ `viaBody` ALONE WAS THE OVER-BLOCK. It forced `viaInterpreter`, and
+    // `viaInterpreter` is exactly what switches off the #1485 stand-down. But a
+    // bare body line is a DIRECT execution: the shell `execve`s it, the kernel
+    // runs the ELF/Mach-O, and no interpreter ever reads the bytes — bash's
+    // ENOEXEC→shell-script fallback applies only to files the kernel CANNOT
+    // exec. Measured on the head that forced it: a `bash` heredoc body whose
+    // single line is `/usr/bin/git status` BLOCKED while `main` ALLOWED it (a Go
+    // binary's bytes contain git-shaped prose) — the exact defect #1485 exists to
+    // prevent, re-created on a new surface, with no assertion to red on it. The
+    // provenance below is what replaces the blanket flag; `bash x.sh` /
+    // `bash < x.sh` / `. x.sh` INSIDE a body still report `interpreted: true`, so
+    // they stay gated.
+    const bodyScriptPaths = new Set(extractHeredocProgramScriptPaths(command));
+    const bodyInterpretedPaths = new Set<string>();
+    for (const inv of extractHeredocProgramScriptInvocations(command)) {
+      if (inv && inv.interpreted === true) bodyInterpretedPaths.add(inv.path);
+    }
+    for (const scriptPath of scriptPaths) {
+      const blocked = _gateScriptPathContent(
+        command,
+        scriptPath,
+        execCwd,
+        bodyScriptPaths.has(scriptPath),
+        bodyInterpretedPaths.has(scriptPath),
+      );
+      if (blocked) return blocked;
+    }
+    return null;
+  } catch {
+    return null; // fail-silent — never block on read/stat errors
+  }
+}
+
+// #523: the per-script content gate. Lifted verbatim out of `_backdoorBlock`
+// (body indentation preserved, so the move is one reviewable hunk rather than a
+// reindent) so it can run once per script the command executes — a heredoc body
+// is a program and may execute several. Returns the block REASON, or null when
+// this script is clean. `viaBody` marks a path a heredoc body resolves, and
+// `bodyInterpreted` marks the SUBSET of those whose body invocation hands the
+// file to a READER (`bash x.sh`, `bash < x.sh`, `. x.sh`) rather than executing
+// it directly — only then is the file's text read, so only then does the
+// opaque-binary stand-down (#1485) not apply.
+function _gateScriptPathContent(command: string, scriptPath: string, execCwd: string | undefined, viaBody: boolean, bodyInterpreted: boolean): string | null {
     // #347: resolve the script path + content gating against the command's
     // EXECUTION cwd (cd-resolved), not the session cwd — a hub session running
     // `cd <wt> && bash x.sh` resolves x.sh inside the worktree.
@@ -5074,7 +5153,14 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // DIFFERENT subcommand reaches cannot gate this one (e.g. `--probe` must
     // not be blocked by a `--reset`-only discard). [] is a real argv (no args)
     // — `$1` is then provably empty; undefined would be "unknown".
-    const scriptArgs = extractScriptArgs(command, scriptPath);
+    // ⛔ #523: a BODY-resolved path's argv is NOT on the command line — the raw
+    // tokens after it are the heredoc DELIMITER and the rest of the program.
+    // Measured fail-OPEN when they were used: `bash <<EOF` + `"/tmp/x.sh"` (no
+    // args) yielded `$1 = "EOF"`, so a `case "$1" in "") git reset --hard`
+    // branch was pruned as UNREACHABLE while the body really calls the script
+    // with NO args and runs it. A body invocation's argv is unknown here, so it
+    // is `null` → the reachability filter bails and the WHOLE script gates.
+    const scriptArgs = viaBody ? null : extractScriptArgs(command, scriptPath);
     // #1129 — the framework's OWN sanctioned scripts are exempted before the
     // content walk (see SANCTIONED_SCRIPT_RELPATHS for why this is a named
     // list keyed on the guard's own checkout). Deliberate gate relaxation →
@@ -5129,7 +5215,13 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // #1485 (review cycle 3): a magic header does not make a file a binary when a
     // SHELL is asked to read it — `bash x` strips the first line and runs the rest,
     // so a `printf`-prefixed script skipped the walk entirely. The invocation decides.
-    const viaInterpreter = scriptIsInterpreted(command, scriptPath);
+    // #523 review round-4: a heredoc BODY no longer forces the interpreter verdict
+    // for every path it resolves — the forcing belongs to the INVOCATION, so the
+    // body's own provenance (`bodyInterpreted`) supplies it, and the pre-#523
+    // command-line scan is kept as the OR so a path named BOTH on the command line
+    // and in a body is still gated for its command-line occurrence (dropping that
+    // OR would be a fail-OPEN against `main` for `bash x.sh <<EOF … x.sh … EOF`).
+    const viaInterpreter = scriptIsInterpreted(command, scriptPath) || (viaBody && bodyInterpreted);
     if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd()), scriptArgs, { viaInterpreter }) === "block") {
       // #743: label the SCRIPT's own checkout, not the session's. A linked
       // worktree's copy is not "the shared main checkout", and the old message
@@ -5163,9 +5255,6 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
       ].join("\n");
     }
     return null;
-  } catch {
-    return null; // fail-silent — never block on read/stat errors
-  }
 }
 
 const WHY = [
@@ -6186,20 +6275,108 @@ export default function (pi: ExtensionAPI) {
       // …` M1 warning). The pending closure is applied exactly once, at the
       // admission returns below — the carve-out's own early return, or any
       // later gate that allows.
-      let pendingRebaseline: (() => void) | null = null;
+      let pendingRebaselines: Array<() => void> = [];
+      // ── #607: an UNENUMERABLE branch-state mutation is a refusal ──
+      // `det.hiddenStateMutation` (classify-git) is true exactly when a shell
+      // substitution / backtick / `eval` / ANSI-C / process-substitution /
+      // git-alias payload CARRIES A MUTATING BRANCH-STATE git invocation
+      // (`_hasHiddenStateSubst`'s hardened collector — the branch-state half of
+      // `hiddenStateSubst`, without that flag's broader unverifiable-git union).
+      // The extractor cannot enumerate such a payload, so the M3 loop below gates
+      // only the VISIBLE mutations: MEASURED at 6f508fc30 through the real handler
+      // on a real hub — `echo "$(git branch -Mq main victim)"` ALLOWED (victim's
+      // tip clobbered, rc 0), and every hidden-payload spelling after an M3-
+      // SANCTIONED lead (`git branch -M main freeL ; echo "$(git branch -Mq freeL
+      // victim)"`, the backtick twin, `eval '…'`) ALSO allowed — the sanctioned
+      // lead changes nothing about the payload being unenumerable (#596's
+      // hiddenStateSubst bound reaches only the #591 benign-force carve-out).
+      // A branch-state mutation the guard cannot attribute to a repo/target must
+      // never be admitted (#805: a gate that cannot determine the target REFUSES).
+      //
+      // WHY THIS IS LAST-RESORT, NOT FIRST: every other arm's refusal is MORE
+      // specific (the sync arm names the permitted fast-forward forms, the legacy
+      // arm names the destructive verb), and those arms doubling as the pin for
+      // their own mechanism is why B9p/B9p3 assert their `#1144` marker. Folding
+      // this into `admitAfterM3()` — the ONE funnel every admission passes through
+      // — keeps each of them ahead of it while still closing the hole on commands
+      // NOTHING else refuses (the measured ones above).
+      //
+      // SCOPE — NOT a blanket substitution block: a substitution carrying a
+      // READ-ONLY git call (`$(git branch --show-current)`, `$(git rev-parse
+      // HEAD)`, `$(git status --porcelain)`) does not set the flag, because
+      // `_hasHiddenStateSubst`'s `mutates()` requires a MUTATING branch-state verb.
+      //
+      // ⛔ NO WORKTREE EXEMPTION, DELIBERATELY — and this is the SECOND attempt at
+      // it. The first one exempted a session whose cwd resolved to a worktree, on
+      // the premise "the payload runs at the shell cwd". That premise is FALSE: a
+      // payload carries its OWN repo hints (`-C`/`--git-dir`/`--work-tree`/`cd`/
+      // `GIT_DIR=`), so from a lane worktree
+      // `echo "$(git -C <hub> branch -Mq main victim)"` executed rc 0 and clobbered
+      // the hub's `victim` tip (MEASURED). The second attempt attributed the
+      // payload's SPANS instead — and a fresh-context reviewer measured THAT open
+      // too: `hiddenStateMutation` fires from arms that produce NO span
+      // (`__unverifiable__` / `eval $VAR`, `$(<file)`, `-c alias.x=…`,
+      // `GIT_CONFIG_PARAMETERS`), so ONE benign substitution anywhere in the
+      // command paid for an exemption of an unattributable payload
+      // (`echo "$(git rev-parse HEAD)"; eval $PAYLOAD` → ADMITTED from a worktree).
+      // A gate whose exemption can be bought by unrelated text is not a gate, so
+      // the exemption is GONE: an unenumerable branch-state mutation is refused in
+      // every session the classifier is LOADED in — with one pre-existing exception
+      // this gate does not close: the `!branchOwnership || !classifierLoaded`
+      // degradation fallback below decides on the frozen legacy classifier, where the
+      // flag does not exist at all (loudly reported; Part C pins the noise). The
+      // remedy is the one that actually works — run the command DIRECTLY (in a
+      // worktree that is then exempt as a visible mutation).
+      //
+      // PROCESS SUBSTITUTION: what actually fires, MEASURED (a review finding
+      // claimed a read-only `<(git log …)` idiom is refused here — it is NOT).
+      // `hiddenStateMutation` is false for `git diff --stat <(git log --oneline -1)`
+      // and true for `git diff --stat <(git branch -Mq a b)`: the PRECISE predicate
+      // judges a git-led body by its ARGUMENTS, so a read-only list resolves to a
+      // non-mutating invocation and the flag stays false. ⛔ Do NOT credit the
+      // conservative `isProcSubst && /\bgit\b/` arm (`_hasHiddenStateSubst`) here —
+      // that flag is not the deciding path for this refusal — and note that both
+      // predicates' `seen` caches are keyed on (CONTEXT, text) precisely because a
+      // text-only key made the verdict depend on segment ORDER (measured: inert-first
+      // admitted, exec-first refused, same two halves). Rows pin both halves, plus the
+      // `)`-in-quotes and nested-`$(…)` spellings.
+      const hiddenBranchStateRefusal = (): { block: true; reason: string } | null => {
+        if (!det || det.hiddenStateMutation !== true) return null;
+        return {
+          block: true,
+          reason: [
+            "⛔ Branch-state command blocked (#607).",
+            "   Why: the command hides a branch-state git invocation inside a shell",
+            "   substitution / backticks / eval / alias / process-substitution payload.",
+            "   The guard cannot see which ref it moves — and a payload can name its OWN",
+            "   repo (-C / --git-dir / cd), so even a worktree session cannot rule out",
+            "   that it clobbers or switches a branch in a SHARED main checkout (#265).",
+            "   → Run the branch-state git command DIRECTLY (outside $(…), backticks,",
+            "     eval and aliases). Direct branch-state commands in an isolated",
+            "     worktree are exempt as before (using-git-worktrees skill).",
+            "   Hatch, if this is deliberate solo work in the hub:",
+            "     AGENT_ALLOW_MAIN_EDITS=1 or ~/.pi/agent/.allow-main-edits (#1239).",
+          ].join("\n"),
+        };
+      };
       // #608: the ownership claims this command DESTROYS, spent at the ONE funnel
       // every admitted arm returns through (#3979 review P1b: the push-delete and
       // push/commit arms admitted a co-spelled `git branch -D` without spending,
       // and a compound naming two local deletes spent only the first). Derived
       // from EVERY mutating invocation, so an arm added later cannot skip it.
       const localDeleteClaims = _localDeleteClaimNames(det);
-      const admitAfterM3 = (): undefined => {
+      const admitAfterM3 = (): undefined | { block: true; reason: string } => {
+        // #607 refusal FIRST: a refused command must move nothing — neither the
+        // session baseline (#1144 F3) nor the ownership claims spent below.
+        const hiddenRefusal = hiddenBranchStateRefusal();
+        if (hiddenRefusal) return hiddenRefusal;
         _spendLocalDeleteClaims(pid, eff?.repoKey ?? null, eff?.effectiveCwd ?? null, localDeleteClaims);
-        if (pendingRebaseline) {
-          const apply = pendingRebaseline;
-          pendingRebaseline = null;
-          apply();
-        }
+        // #607: apply the recorded re-baselines IN COMMAND ORDER — mid-command
+        // propagation lets one compound carry more than one sanctioned move, and
+        // overwriting a single slot dropped the earlier rename's `_markOwned`.
+        const applies = pendingRebaselines;
+        pendingRebaselines = [];
+        for (const apply of applies) apply();
         return undefined;
       };
 
@@ -6219,6 +6396,32 @@ export default function (pi: ExtensionAPI) {
         const mutations = (det.stateMutations && det.stateMutations.length > 0)
           ? det.stateMutations
           : [{ verb: det.stateVerb, args: det.stateArgs, invVisible: det.stateInvVisible !== false, hints: det.stateHints }];
+        // ── #607: MID-COMMAND BASELINE PROPAGATION ──
+        // Each mutation used to be decided against the SESSION baseline — the
+        // branch the session was on BEFORE the command ran — so a sanctioned
+        // lead that MOVES the baseline (own-baseline rename, #376 return) left
+        // every later segment judged against a branch the command itself had
+        // already moved off. MEASURED at 6f508fc30 (real handler, real git):
+        // `git branch -M main tmpA && git branch -M tmpA main` and `… && git
+        // branch -M tmpA done` were BLOCKED — the legitimate two-segment rename
+        // ceremony — because segment 2's source (`tmpA`) is not the session
+        // baseline (`main`). The LAUNDER the pre-#1144 short-circuit allowed is
+        // NOT re-opened by judging against the propagated baseline: the #1144
+        // `stateCarveOutClean` closure is what refuses a mutating tail, and each
+        // later segment still runs its OWN decideM3 (a foreign source or an
+        // existing foreign rename DST still blocks).
+        // Two pieces of prospective state, both REPO-KEYED (a mutation in another
+        // checkout must never inherit this repo's prospective branch — decideM3's
+        // rename arm is repoKey-scoped, and so is this):
+        //   previewBranch — the branch this compound will be ON when the segment runs.
+        //   freedNames    — names an EARLIER sanctioned rename of this compound
+        //                   renames AWAY from, so the #598 dst probe must not read
+        //                   them as "an existing foreign ref" (they are gone by the
+        //                   time the segment runs). Only ever OWN lineage: a name is
+        //                   added only as the `from` of a rename decideM3 already
+        //                   sanctioned, i.e. the branch the session was on.
+        const previewBranch = new Map<string, string>();
+        const freedNames = new Map<string, Set<string>>();
         for (const mu of mutations) {
           const branchOp = branchOwnership.classifyBranchOp(mu.verb ?? det.verb, mu.args ?? det.verbArgs);
           if (!branchOp || branchOp.op === "other") continue;
@@ -6247,7 +6450,15 @@ export default function (pi: ExtensionAPI) {
             };
           }
           if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
-          const baseline = baselines.get(pid);
+          const muRepoKey = muEff.repoKey ?? "";
+          const sessionBaseline = baselines.get(pid);
+          // #607: judge this segment against the baseline the compound will
+          // have reached here, when an earlier segment of the SAME repo moved it.
+          const prospective = previewBranch.get(muRepoKey);
+          const baseline = (sessionBaseline && prospective != null
+            && sessionBaseline.repoKey === muEff.repoKey)
+            ? { ...sessionBaseline, branch: prospective }
+            : sessionBaseline;
           const isInfra = isAgentInfraRepo(muEff.effectiveCwd);
           // #598: a forced rename of the session's own baseline onto an
           // EXISTING branch this session does not own clobbers that foreign
@@ -6257,8 +6468,13 @@ export default function (pi: ExtensionAPI) {
           // `--git-dir=<other>` mutation is never checked against the cwd
           // repo's refs. Only the decideM3 rename arm consumes it (the
           // force/create/switch arms key on branch/currentBranch alone).
+          // #607: a name an EARLIER segment of this same compound renames away
+          // from will not exist when this segment runs (the probe reads the repo
+          // BEFORE the command executes), so a sanctioned rename-back
+          // (`… && git branch -M tmp main`) was refused as a foreign clobber.
           const dstExists = (branchOp.op === "rename" && branchOp.to != null)
-            ? branchOwnership.localBranchExists(muEff.effectiveCwd, branchOp.to, muEff.gitDir) !== false
+            ? (branchOwnership.localBranchExists(muEff.effectiveCwd, branchOp.to, muEff.gitDir) !== false)
+              && !(freedNames.get(muRepoKey)?.has(branchOp.to) ?? false)
             : false;
           const m3 = branchOwnership.decideM3({
             branchOp, isAgentInfra: isInfra, baseline,
@@ -6348,14 +6564,30 @@ export default function (pi: ExtensionAPI) {
             // at classification time, the same way `syncOnlyInvocation` and
             // `_allInvocationsWorktreeScoped` consult it.
             if (det.stateCarveOutClean === true) {
-              applyRebaseline();
-              return undefined;
+              // #607: through the funnel (admitAfterM3), so the order-preserving
+              // apply and the hidden-branch-state gate both run on this path too;
+              // `stateCarveOutClean` folds `hiddenStateSubst`, so it cannot
+              // contradict that gate.
+              pendingRebaselines.push(applyRebaseline);
+              return admitAfterM3();
             }
             // Not closed by the carve-out — the later gates decide. Defer the
             // re-baseline until one of them admits: a REFUSED command must not
             // move the baseline every later M1/M2/M3 decision keys on (#1144
             // F3). `admitAfterM3()` applies it at each admission return.
-            pendingRebaseline = applyRebaseline;
+            // #607: record the PROSPECTIVE baseline + the name this segment frees
+            // for the segments AFTER it. Nothing is applied to session state here
+            // — a refused compound must leave `baselines[pid]` untouched.
+            previewBranch.set(muRepoKey, reBaseline);
+            if (branchOp.op === "rename") {
+              const from = branchOp.from ?? muEff.currentBranch;
+              if (from) {
+                const freed = freedNames.get(muRepoKey) ?? new Set<string>();
+                freed.add(from);
+                freedNames.set(muRepoKey, freed);
+              }
+            }
+            pendingRebaselines.push(applyRebaseline);
           }
         }
       }

@@ -2158,6 +2158,11 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # certified `farm: ok` / `farm_rows=none` / `farm_n=0` with the drifting name durable nowhere. A new
         # class now needs a deliberate edit here rather than another character-class patch.
         # NOTE: no apostrophes in these comments — the awk program is single-quoted, and one closes it.
+        # ⛔ `LOCAL (scratch)` joined the allow-list WITH its producer (#3991): `farm_install` writes
+        # `<name>.tmp.<pid>` inside the graded farm directory, so an interrupted install leaves one
+        # behind for good and the shipped instrument reports it benign. Added here and in
+        # `docs/ops/harness-apply.md` at the same time as the row was introduced — a benign token the
+        # consumer does not know is a farm that MATCHES refused as `farm-unknown` (rc 24) forever.
         [ -n "$FARM_UNC0" ] || FARM_UNC0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '
             NF >= 2 {
                 f1 = $1
@@ -2167,7 +2172,8 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
                 if (v == "") { print "(an empty verdict field)"; exit }
                 if (v == "verdict" || v == "ok") next
-                if (v == "LOCAL (declared)" || v == "SYMLINK (graded via its target)") next
+                if (v == "LOCAL (declared)" || v == "LOCAL (scratch)") next
+                if (v == "SYMLINK (graded via its target)") next
                 if (v == "STALE" || v == "UNSOURCED") next
                 if (v == "NOT-EXECUTABLE" || v == "DECLARED-BUT-ABSENT") next
                 print v; exit

@@ -2839,6 +2839,9 @@ printf '%s\n' 'file | deployed | source | verdict' >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'a.py' aaaa11112222 bbbb33334444 ok >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'b.py' - - 'LOCAL (declared)' >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'c.py' - - 'SYMLINK (graded via its target)' >&2
+# #3991: the installer's own scratch (`<name>.tmp.<pid>`, left by an INTERRUPTED farm) is a benign row
+# the instrument prints; a consumer that does not know the token refuses a farm that MATCHES.
+printf '%-46s | %-12s | %-12s | %s\n' 'd.py.tmp.4242' - - 'LOCAL (scratch)' >&2
 # ⛔ AND ONE LABEL WORD IN PROSE IS NOT A SUMMARY EITHER (VGATE round 32, measured: lowering the
 # summary signal's threshold from two label words to one left the suite green, so nothing pinned the
 # bound that keeps a healthy copy's passing mention of `stale` from being read as an uncountable
@@ -2848,7 +2851,7 @@ exit 0
 FARM
 chmod +x "$T/t24bp/benign-tokens.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bp/benign-tokens.sh" run_pass "$T/t24bp" 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T24 control: the instrument's benign row tokens (ok, LOCAL, SYMLINK, verdict) never refuse a match"
+assert_eq "$RC" "0" "T24 control: the instrument's benign row tokens (ok, LOCAL, LOCAL scratch, SYMLINK, verdict) never refuse a match"
 assert_contains "$(grep '^farm_n=' "$T/t24bp/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
     "T24 control: so a healthy farm with a local file and a symlink still records a proven match"
 assert_absent "$(grep '^farm_n=' "$T/t24bp/state/harness-apply.status" 2>/dev/null || true)" "not-graded" \

@@ -62,8 +62,13 @@
 # either (that arm deadlocked setup.sh: measured 2026-10-31, ONE such file → exit 1, and a second
 # full run left it stale). `UNSOURCED` is the class that lost real fixes (#2231 — three fixes
 # existed only in a home-dir tree). The single
-# exception is a name this script DECLARES local: `*.bak-*` (a repair path's own backup beside the
-# live script it replaced). Declared, never inferred — the same doctrine as #1924's retirement list,
+# exceptions are names this script DECLARES local: `*.bak-*` (a repair path's own backup beside the
+# live script it replaced), and the INSTALLER'S OWN SCRATCH `<name>.tmp.<pid>` (#3991), which
+# `farm_install` writes beside the live script and which an INTERRUPTED install leaves behind for
+# good — `farm_install` removes only its own `$$` temp and the UNFARM leg removes only DECLARED
+# names, so nothing ever reaps it. It prints the row `LOCAL (scratch)` (never `UNSOURCED`), and it is
+# exempt ONLY where no repo file resolves to the name, so a real file that happens to carry the shape
+# is still graded. Declared, never inferred — the same doctrine as #1924's retirement list,
 # because "absent from the repo" and "never shipped" are otherwise indistinguishable.
 #
 # ⛔ NOT A SYMLINK FARM. The obvious "make drift impossible" answer — symlink `~/.pi/agent/scripts`
@@ -430,6 +435,29 @@ is_declared_local() {
     return 1
 }
 
+# ⛔ THE FARM'S OWN SCRATCH (#3991) — recognised ONLY where no repo file explains the name.
+# `farm_install` writes `<name>.tmp.<pid>` beside the live script, and an INTERRUPTED install leaves
+# one behind for good (`farm_install` only ever removes its own `$$` temp, and the UNFARM leg only
+# removes DECLARED names), so grading it UNSOURCED made every later pass red at rc=3 with a remedy
+# ("declare it LOCAL, delete it, or retire it") that no re-run could clear — the same class this
+# walk's own "NO TEMP FILE IS WRITTEN INTO THE FARM" note records for its own scratch file.
+# ⛔ WHY IT IS NOT AN `is_declared_local` ARM: that function runs BEFORE the source lookup, so a
+# name-based exemption would also mask a REAL repo file that happens to be called `x.tmp.1` — a
+# stale copy and a lost `+x` bit would print `LOCAL (declared)` while the run exited 0 over the
+# #10114 silent no-op this file exists to catch. Applied in the UNSOURCED arm instead, so the name
+# is exempt only when nothing in this repo resolves to it.
+is_farm_scratch() {
+    # ⛔ THE SUFFIX MUST BE ALL DIGITS (a pid), not merely START with one: `*.tmp.[0-9]*` also matched
+    # `foo.tmp.1-old`, a box-local file nothing in the repo explains, and certified it `LOCAL (scratch)`
+    # at rc=0 — the one outcome this instrument must never produce. `farm_install` only ever writes
+    # `$$`, so anything else in that shape is NOT its scratch and stays UNSOURCED.
+    case "$1" in
+        *.tmp.[0-9]*[!0-9]*) return 1 ;;
+        *.tmp.[0-9]*)        return 0 ;;
+    esac
+    return 1
+}
+
 # ── 2. THE WHOLE POPULATION ────────────────────────────────────────────────────────────────
 # EVERY regular file under $DEST, at every depth. A depth-1 glob is how the farm's own drift stayed
 # invisible: `fleet/` and `lib/` are half the layer.
@@ -523,9 +551,16 @@ while IFS= read -r rel; do
         matched=$((matched+1))
         # ⛔ THE EXECUTABLE BIT IS PART OF "IS THIS THE CODE?" A byte-identical copy that launchd
         # cannot exec is the same silent no-op class as #10114 (the file that must run, that cannot),
-        # and three of the five farm legs swallow the failure (`chmod +x "$dest" 2>/dev/null || true`
-        # in pi-bootstrap/setup.sh), so existence + byte-equality stays green over it. Git stores the
-        # bit; the working tree carries it.
+        # and several farm legs used to swallow the failure (a `chmod +x "$dest" 2>/dev/null || true`
+        # in pi-bootstrap/setup.sh — 4 of the 7 script legs plus the spawn-point gate at #3991's
+        # base), so existence + byte-equality stays green over it. Since #3991 every leg that delivers
+        # into `$DEST/scripts` — plus the `$DEST/bin/pi` spawn gate — installs through `farm_install`
+        # (chmod the TEMP, then rename), which fails the leg loudly. ⛔ NOT the extensions, `skills/`,
+        # `agents/` or `behavior-control/` legs: those are still in-place copies (the extensions leg
+        # runs `cp "$e" "$dest"`), so this file's own premise — pi EXECUTES that directory at session
+        # start — is NOT yet covered for them. A box farmed by an OLDER setup.sh, or a hand-edited
+        # file, also still lands here, so the check grades the bit rather than trusting the installer.
+        # Git stores the bit; the working tree carries it.
         src_exec=0
         if [ -n "$SRC_READ" ]; then
             case "$(git -C "$SRC" ls-tree "$SRC_READ" -- "$src" 2>/dev/null | cut -d' ' -f1)" in
@@ -550,6 +585,11 @@ while IFS= read -r rel; do
             printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "STALE" >&2
         fi
     else
+        # The farm's own scratch is not drift — but only HERE, where nothing resolves to it (#3991).
+        if is_farm_scratch "$rel"; then
+            [ "$QUIET" -eq 1 ] || printf '%-46s | %-12s | %-12s | %s\n' "$rel" "-" "-" "LOCAL (scratch)"
+            continue
+        fi
         unsourced=$((unsourced+1))
         printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "-" "UNSOURCED" >&2
     fi

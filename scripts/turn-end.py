@@ -97,6 +97,28 @@ os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 HOME = os.path.expanduser("~")
 STATE = f"{HOME}/.pi/agent/state"
 SCRIPTS = f"{HOME}/.pi/agent/scripts"
+
+# ── THE TRIAGE ROUTER (agent-infra#4046) ──────────────────────────────────────────────────────
+# This box's only other question guard, above, keys on the ISSUE LABEL — so a lane that asked the
+# owner in its PANE and never posted the labelled comment is invisible to it, reads `WIP-IDLE`, and
+# receives "CONTINUE IT". The router closes that hole: it decides from the lane's OWN last turn, and
+# its precedence puts `user-question` above `idle-continue` so the nudge cannot be the answer to a
+# question. `may_continue()` is the one predicate this file gates on.
+#
+# The import is GUARDED and its absence is LOGGED, never silent: `triage.py` is farmed into
+# `$SCRIPTS/fleet` beside `liveness.py` (pi-bootstrap `fleet_tools`), and on a box that predates that
+# farm this script must keep nudging exactly as it did rather than stop the fleet — but it must also
+# SAY so, because a router that is absent looks identical to a wave of lanes that need nothing.
+sys.path.insert(0, os.path.join(SCRIPTS, "fleet"))
+try:
+    import liveness as _liveness        # noqa: E402  the #1254 open-turn contract
+    import triage as _triage            # noqa: E402  the precedence router
+    _ROUTER = ""
+except Exception as _exc:                 # noqa: BLE001  — a missing/broken router must not stop the nudge path
+    _liveness = None
+    _triage = None
+    _ROUTER = f"{_exc.__class__.__name__}: {_exc}"
+
 LOG = f"{STATE}/turn-end.log"
 MARK_DIR = f"{STATE}/turn-end"
 KILL = f"{STATE}/HEARTBEAT-OFF"
@@ -443,6 +465,137 @@ def lanes_with_open_question(known_lanes=None) -> set:
     return out
 
 
+def suppress_and_route(lane: str, route, pending=None, row=None) -> None:
+    """The loop's non-nudge branch, extracted so it can be TESTED as the branch it is.
+
+    ⛔ SUPPRESSING THE NUDGE IS NOT ROUTING THE QUESTION (round 4, #4046 P1). Until this branch
+    existed, every arm was reachable only by a hand-run CLI and a test fixture: nothing in production
+    ever created the question lane, so the issue's second requirement was delivered by no running code
+    and a lane that asked was silently un-nudged — which looks exactly like a lane that needs nothing.
+
+    Extracted from the loop for the same reason `route_gate` was: `main()` shells out to
+    `lane-status.py` and cannot be driven hermetically, so a branch left inline is a branch no test
+    can fail. The suite drives THIS and asserts that only a `user-question` route reaches the arms.
+    """
+    log(f"SKIP {lane}: route={route.route}"
+        f"{('/' + route.subcase) if route.subcase else ''}"
+        f" action={route.action} — {route.reason}")
+    if route.route == "user-question":
+        if pending is not None:
+            # ⛔ THE FULL ROW, NOT A LANE NAME (round 6, #4046 P0). This appended `{"lane": lane}`, and
+            # the CLI rebuilds `Evidence` from the row it is handed — so every batched lane arrived
+            # with no `sid`/`ws`/`verdict`, re-decided to `none`/`none`, and was logged as
+            # `verified=true` for an action nothing took. Deliverable 2 was delivered by no running
+            # code, one layer below the fix that was supposed to deliver it.
+            pending.append(dict(row or {"lane": lane}))
+        else:
+            _apply_question_route(lane)
+
+
+def _apply_question_routes(rows, timeout: int = 120) -> None:
+    """Route the asking lanes' questions through `scripts/lane-route.py --apply`, ONCE, bounded.
+
+    ⛔ THE ROWS ARE HANDED OVER, NOT RE-READ (round 5, #4046 P2). This tick already holds the
+    `lane-status.py` rows; letting the CLI re-derive them meant ONE FULL FLEET SCAN PER ASKING LANE,
+    inside a tick whose slack `heartbeat-loop.sh` floors at 20 s. `--stdin` takes the same JSON
+    shape, so the CLI pays no scan at all.
+
+    ⛔ CAPPED AND BOUNDED. At most `MAX_PER_TICK` lanes per pass — the same cap the delivery path
+    honours — so a fleet of asking lanes cannot turn one tick into an unbounded sequence of
+    subprocesses, and a 120 s budget rather than 300 s: the caller runs under that slack floor, so a
+    child outliving the pass is a child killed mid-send.
+
+    ⛔ IT CANNOT RAISE INTO THE TICK. The worst case is the previous behaviour (suppress the nudge
+    and log), and a routing failure is LOGGED with its reason, so a question that never reaches the
+    panel has a visible cause instead of reading as a lane that wants nothing.
+    """
+    lanes = [r for r in (rows or []) if isinstance(r, dict)]
+    if not lanes:
+        return
+    if len(lanes) > MAX_PER_TICK:
+        # ⛔ A DROPPED LANE MUST BE VISIBLE (round 6, #4046 P2). Slicing silently starved the 4th+
+        # asking lane forever when the first three stayed `user-question` in a stable order — the
+        # delivery path already logs its own cap, so this one does too.
+        log(f"CAP reached at {MAX_PER_TICK}; {len(lanes) - MAX_PER_TICK} asking lane(s) deferred to "
+            f"next tick: " + ", ".join((r.get("lane") or "?") for r in lanes[MAX_PER_TICK:]))
+        lanes = lanes[:MAX_PER_TICK]
+    cli = os.path.join(SCRIPTS, "lane-route.py")
+    if not os.path.exists(cli):
+        log(f"ROUTE-SKIP {len(lanes)} lane(s): lane-route.py is not on this box ({cli}) — the "
+            f"question(s) were NOT routed, and their nudges are suppressed rather than sent")
+        return
+    payload_file = os.path.join(STATE, f"triage-apply-{os.getpid()}.json")
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(payload_file, "w") as fh:
+            json.dump(lanes, fh)
+        # ⛔ `--only-route user-question` (round 6, #4046 P2). Handing the rows over means the CLI
+        # RE-DECIDES from them, and a lane that resumed mid-tick could decide `send-continue` — whose
+        # arm then polls for up to `RESUME_BOUND_S` (120 s) INSIDE this 120 s budget, so the parent
+        # kills a child that was working. This batch exists to route questions; anything else the
+        # fresh evidence earns is the CLI's job on its own schedule, not this tick's.
+        p = subprocess.run([sys.executable or "python3", cli, "--apply", "--json",
+                            "--only-route", "user-question", "--stdin", payload_file],
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"ROUTE-SKIP: lane-route.py failed ({exc.__class__.__name__}) — question(s) NOT routed")
+        return
+    finally:
+        try:
+            os.unlink(payload_file)
+        except OSError:
+            pass
+    try:
+        blob = json.loads(p.stdout or "[]")
+    except ValueError:
+        blob = []
+    routed = 0
+    for item in (blob if isinstance(blob, list) else []):
+        res = (item.get("result") or {})
+        routed += 1
+        # ⛔ A READING ARM IS NOT AN EFFECT (round 6, #4046 P2): `verified` on `wait`/`inspect`/
+        # `refuse`/`none` means "the reading was produced", so printing `verified=true` for it is the
+        # conflation `asserts_lane` was added to remove.
+        if res.get("asserts_lane") is False:
+            state = "read"
+        else:
+            state = "verified=" + str(bool(res.get("verified"))).lower()
+        log(f"ROUTE {item.get('lane') or '?'}: {res.get('action') or '?'} {state} "
+            f"— {(res.get('detail') or '')[:140]}")
+    if routed == 0:
+        log(f"ROUTE-SKIP rc={p.returncode}: lane-route.py returned no route for "
+            f"{len(lanes)} asking lane(s) — nothing was routed")
+
+
+def _apply_question_route(lane: str, timeout: int = 120) -> None:
+    """Single-lane form, kept for the suite and for an operator routing one lane by hand."""
+    _apply_question_routes([{"lane": lane}], timeout=timeout)
+
+
+def route_gate(row, session_path=None):
+    """`(may_nudge, Route)` for a `lane-status.py` row — the ONE place this file asks the router.
+
+    ⛔ EXTRACTED SO THE GATE CAN BE TESTED AS A GATE (fresh-context review round 3, #4046 P2). While
+    this lived inline in `main()`'s loop, a change that stopped calling it — or that built the Evidence
+    differently from what `scripts/lane-route.py` builds — left every suite green, because `main()`
+    shells out to `lane-status.py` and cannot be driven hermetically. The loop still owns the `continue`;
+    `tests`/`tools/fleet/triage.test.py` drives THIS with real rows.
+
+    ⛔ `steerable` IS PASSED (sid, ws, session_path), NOT `sid` ALONE. A live `pi` on this fleet has argv
+    exactly `pi`, so the argv probe alone answers `None` for every ordinary lane — which made this file
+    nudge nobody. See `triage.steerable`'s docstring for the second, affirmative proof (an interactive
+    session bound to a workspace) and why a `pi -p --no-session` lane cannot satisfy either.
+    """
+    ev = _triage.Evidence(
+        lane=row.get("lane") or "",
+        turn=_liveness.turn_from_jsonl(session_path) if session_path else None,
+        last_text=_triage.last_text_from_jsonl(session_path) if session_path else "",
+        lane_verdict=row.get("verdict") or "",
+        steerable=_triage.steerable(row.get("sid"), ws=row.get("ws"), session_path=session_path),
+    )
+    return _triage.may_continue(ev)
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -485,10 +638,21 @@ def main(argv: list[str]) -> int:
 
         now = time.time()
         sent = 0
+        # ⛔ ASKING LANES ARE BATCHED (round 5, #4046 P2). Applying a route per lane spawned one
+        # `lane-route.py` per asking lane, each re-running the WHOLE `lane-status.py` scan. The rows
+        # are already in hand, so they are handed to the CLI (`--stdin`) in ONE call after the loop.
+        asking_rows = []
         holds_question = lanes_with_open_question()
         if holds_question:
             log(f"guard: {len(holds_question)} lane(s) hold a question: "
                 + ", ".join(sorted(holds_question)))
+        if _ROUTER:
+            # ⛔ AN ABSENT ROUTER MUST NOT LOOK LIKE A QUIET FLEET. #4046's guard is the thing that
+            # stops "continue" reaching a lane that asked its question in its PANE; without it this
+            # pass is back to the pre-#4046 behaviour, and a reader of the log has to be able to tell
+            # those two states apart in one line.
+            log(f"NOTE router unavailable ({_ROUTER}) — the label guard above is the ONLY question "
+                f"guard this pass; a pane-asked question can still be nudged")
         for r in rows:
             if r.get("verdict") != "WIP-IDLE":
                 continue
@@ -514,6 +678,24 @@ def main(argv: list[str]) -> int:
                 log(f"SKIP {lane} holds a question ({issue_label} carries a CURRENT "
                     f"owner-decision/question-bounced)")
                 continue
+
+            # ── THE ROUTER'S GATE (#4046) ────────────────────────────────────────────────────
+            # ⛔ NEVER SEND "continue" TO A LANE WHOSE LAST TURN ASKS A QUESTION. Two rejections
+            # carry that rule here, and neither is the generic one:
+            #   * the route is not `idle-continue` (a question, a wedge subcase, or a refusal) —
+            #     logged with the route AND the reason, so a lane that goes un-nudged has a visible
+            #     cause rather than looking idle;
+            #   * the incarnation is not provably steerable. A `pi -p` lane cannot take a second
+            #     turn at all, so a send is a no-op that still writes a marker this fleet reads back
+            #     as BUSY. An UNREAD probe refuses too — a withheld nudge costs one tick (the lane is
+            #     reconsidered next pass), never the lane. `scripts/lane-route.py` prints the
+            #     aggregate `router=refuse:N` line those refusals would otherwise be invisible in.
+            if _triage is not None:
+                _may, _route = route_gate(r, f)
+                if not _may:
+                    suppress_and_route(lane, _route, pending=asking_rows if
+                                       _route.route == "user-question" else None, row=r)
+                    continue
 
             msg = build_wip_nudge(lane, r.get("issue_label") or "",
                                   int(stale // 60), r.get("recent") or [])
@@ -572,6 +754,8 @@ def main(argv: list[str]) -> int:
                 sent += 1
             else:
                 log(f"ERR nudge {lane} rc={rc2} :: {out2.strip()[:140]}")
+        if asking_rows:
+            _apply_question_routes(asking_rows)
         if sent == 0:
             log("OK no lane to nudge")
         return 0
