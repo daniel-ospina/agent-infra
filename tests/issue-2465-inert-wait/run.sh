@@ -426,6 +426,58 @@ ck "(B7) and the carry is still SAID OUT LOUD (an ignored flag must never be sil
 ck "(B7) but an explicit NON-ZERO window still wins, carrying nothing (B3 unchanged)" \
    "$([ "$(sawk "$(land_err 1 600)" ONESHOT)" = '<unset>' ] && echo 0 || echo 1)"
 
+# ── (C) the `*)` REFUSAL MUST NOT ASSERT A MEASUREMENT IT DID NOT TAKE ──────
+# Review round 4 (P2). The `*)` arm splits two states that must not share a verdict:
+# "the surface was READ and was still pending" (`still-running`) vs "the Jobs read
+# FAILED" (`unobservable`). It used to split on `FIRST_CHECKS_MISSING`, which advances
+# by `dt` in WHOLE seconds — so on a poll whose work fits inside one second it is 0
+# while the state is `unobservable`, and the refusal reported an unread Jobs API as
+# "NOTHING was unreadable". That is reachable on exactly the `--no-wait` path this PR
+# ships, because the one-shot path returns `$FIRST_CHECKS_STATE` after ONE observation.
+# The arm drives the SHIPPED `block_on_first_checks` (extracted, never copied) with an
+# explicit (state, clock) pair, so it is deterministic: no $SECONDS, no polling, no fake
+# gh. The clock is an INPUT here, which is the whole point — the defect is that the code
+# read it as a measurement.
+BOFC_LIB="$TMP/bofc.sh"
+build_bofc() { # $1 = source path, $2 = output file
+  local src="$1" out="$2" fn
+  fn="$(extract_helper "$src" block_on_first_checks)"
+  {
+    printf '%s\n' 'say_err() { printf "%s\n" "$*" >&2; }'
+    printf '%s\n' "$fn"
+    printf '%s\n' 'block_on_first_checks deadbeef'
+  } > "$out"
+  [ -n "$fn" ]
+}
+ck "extracted block_on_first_checks from $(basename "$SRC") — the star arm is EXECUTED, not assumed" \
+   "$(build_bofc "$SRC" "$BOFC_LIB" && echo 0 || echo 1)"
+# bofc <state> <missing> <missing_streak> <outcome>  → the refusal text on stdout
+bofc() {
+  FIRST_CHECKS_OUTCOME="$4" FIRST_CHECKS_STATE="$1" FIRST_CHECKS_MISSING="$2" \
+  FIRST_CHECKS_MISSING_STREAK="$3" FIRST_CHECKS_WAIT=0 FIRST_CHECKS_WAITED=0 \
+  FIRST_CHECKS_CEILING_BOUND=18064 FIRST_CHECKS_STALL_BOUND=8760 \
+  FIRST_CHECKS_OBSERVED='run 123: 28 job(s): 2 completed, 26 not' \
+  ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1 \
+    bash < "$BOFC_LIB" 2>&1 >/dev/null
+}
+
+echo "(C) the ONE-SHOT refusal on an UNREADABLE Jobs read claims no measurement it did not take"
+C_UNREAD="$(bofc unobservable 0 0 unobservable)"
+ck "(C) an UNREADABLE Jobs read with a 0s clock does NOT claim 'NOTHING was unreadable' (review round 4 P2)" \
+   "$(grep -q 'NOTHING was unreadable' <<<"$C_UNREAD" && echo 1 || echo 0)"
+ck "(C) …and it NAMES the failed read instead (the state is the measurement, not the clock)" \
+   "$(grep -q 'the Jobs read FAILED' <<<"$C_UNREAD" && echo 0 || echo 1)"
+ck "(C) …and it quotes NO duration for a read no time was measured against" \
+   "$(grep -q 'did not answer for [0-9]*s in total' <<<"$C_UNREAD" && echo 1 || echo 0)"
+C_READ="$(bofc still-running 0 0 still-running)"
+ck "(C) CONTROL: a READABLE still-pending surface still says 'NOTHING was unreadable' (the honest branch is still reachable)" \
+   "$(grep -q 'NOTHING was unreadable' <<<"$C_READ" && echo 0 || echo 1)"
+ck "(C) CONTROL: …and does NOT claim the Jobs read failed" \
+   "$(grep -q 'the Jobs read FAILED' <<<"$C_READ" && echo 1 || echo 0)"
+C_SLOW="$(bofc unobservable 3 1 unobservable)"
+ck "(C) CONTROL: a MEASURED 3s of unreadable reads is still quoted as a duration" \
+   "$(grep -q 'answer for 3s in total, 1s consecutively' <<<"$C_SLOW" && echo 0 || echo 1)"
+
 echo
 printf 'issue #2465 inert wait: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

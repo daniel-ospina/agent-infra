@@ -51,7 +51,7 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 | `admin-merge.sh` §0b decision | the THREE-valued probe is consulted for EVERY inapplicable class; `has-run` never widens, `none` widens, `unreadable` widens only for the STRUCTURAL class | `tests/issue-2465-inert-wait/run.sh` A(a)-(e) + mutations (f)/(h); integration in `tests/admin-merge/run.sh` §#1614 arms (e) and (f) |
 | `admin-merge.sh` §0b `unknown` arm | was silent → prints reason + escape | same suite A(d) |
 | `admin-merge.sh` `lane_no_pr_trigger` (new helper) | reason classifier — which class §0b is in | unit: arm (a) is the attributable row, plus the single-definition guard and mutant (h) (`tests/issue-2465-inert-wait/run.sh`); integration: `tests/admin-merge/run.sh` §#1614 **arm (f)** — a `no-pr-trigger` lane whose single probe read FAILED |
-| `admin-merge.sh` FIRST-CHECKS wait | **unchanged** (contract intact) | `tests/first-checks-lane-rederive/run.sh` (37 arms, re-run) |
+| `admin-merge.sh` FIRST-CHECKS wait | `wait_enabled` gains the `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` conjunct (it may disable the wait only with a zero window, and only together with the zero window — never by touching the bounds), and the `*)` refusal is re-cut so its two states do not share a verdict. The POLL/BUDGET contract (`#2862`: spent on the attempt), the stall/ceiling bounds and §4.5 are **unchanged**. | `tests/first-checks-lane-rederive/run.sh` (37 arms, re-run) for the unchanged contract; `tests/admin-merge/run.sh` §79 (g1)-(g4) for the seam; `tests/issue-2465-inert-wait/run.sh` B1-B7 and the state-keyed text arm |
 | `atomic-land.sh` `do_land` | env carry to the land step | `tests/issue-2465-inert-wait/run.sh` B1-B6, `tests/admin-merge/run.sh` §79 (g1)-(g3) |
 | `tests/*/run.sh` discovery | new suite auto-wired by the glob (`scripts/run-bash-shards.sh:203`) | shard runner |
 
@@ -96,11 +96,12 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 3. Carry `--no-wait` into the land step as `ADMIN_MERGE_FIRST_CHECKS_WAIT=0` plus
    `ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1`, never overriding an explicit knob and never
    touching the `STALL`/`CEILING` bounds (they are inputs to the derived whole-attempt
-   bound, so clearing them can refuse a legal `ADMIN_MERGE_LOCK_TTL`). Test: B1-B6 against a
-   fake land step that reports its own environment, plus §79 (g1)-(g3) driving the real
+   bound, so clearing them can refuse a legal `ADMIN_MERGE_LOCK_TTL`). Test: B1-B7 against a
+   fake land step that reports its own environment, plus §79 (g1)-(g4) driving the real
    wait: bounds set + no seam reaches a CEILING verdict and polls; the same bounds with the
    seam take ONE observation and name `(window 0s)`; an explicit `STALL` with no seam still
-   re-enables the wait.
+   re-enables the wait; and a seam carried beside a NON-ZERO window is INERT (the bounded
+   wait runs to its ceiling, so the knob cannot outrank an explicit window).
 4. PROVE: run the new suite, the #2862 wait suite (unchanged contract) and the bash-3.2 parse guard.
 
 ## Rounds
@@ -128,7 +129,10 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 - R4 `--no-wait` overrides an operator's explicit knob → B3.
 - R5 the carry leaks into the default path → B2 (child sees the variable unset).
 - R6 the wait's own contract (budget, stall, ceiling, §4.5) is altered as a side effect →
-  the wait function is **not touched**; `tests/first-checks-lane-rederive/run.sh` re-run green.
+  the poll/budget logic and its bounds are untouched (§2862's "spent on the ATTEMPT" still
+  precedes the probe); what this PR does change is `wait_enabled` (the ONESHOT conjunct) and
+  the `*)` refusal text, and BOTH are pinned — B1-B7 + §79 (g1)-(g4) for the seam,
+  `tests/first-checks-lane-rederive/run.sh` re-run green for the contract.
 - R7 the fallback text asserts a measurement the code did not take (review P2) → the STRUCTURAL
   class widens on TWO grounds (`none` and `unreadable`) and only one of them measured "no run",
   so the class text branches on the probe state; unit arm (a) asserts the `unreadable` case does
@@ -138,6 +142,16 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
   shadowing copy is gone (a counted single-definition guard), mutant (h) proves arm (a)
   discriminates on the classifier, and rail arm (f) produces the only state in which the
   classification changes the outcome (`structural + unreadable`).
+- R9 the `*)` refusal asserts a measurement the code did not take (review round 4, P2) — the
+  branch that decides between "the surface was read" and "the Jobs read FAILED" is keyed on
+  `FIRST_CHECKS_MISSING`, which advances by `dt` in WHOLE seconds, so a sub-second poll leaves
+  it at 0 while `FIRST_CHECKS_STATE` is `unobservable` and an unread Jobs API was reported as
+  "NOTHING was unreadable". Reachable on exactly the `--no-wait` path this PR ships (the
+  one-shot return reports `$FIRST_CHECKS_STATE` after one poll) → the branch is keyed on the
+  STATE and the clock is used only to decide whether a DURATION may be quoted; the arm drives
+  `block_on_first_checks` itself (extracted, no clock) with `STATE=unobservable MISSING=0` and
+  asserts the unread read is named, with the `still-running MISSING=0` control asserting the
+  honest branch is still reachable.
 
 **Threat classes** (`gate-enforcement`): `T1` fail-open by widening the merge surface — must be
 impossible; the only widening is to the surface `--any-workflow` already selects, and §4.5

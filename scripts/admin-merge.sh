@@ -6027,10 +6027,25 @@ block_on_first_checks() {
       say_err "admin-merge: ✗ BLOCK — the FIRST-CHECKS wait expired after ${FIRST_CHECKS_WAITED}s (window ${FIRST_CHECKS_WAIT}s) — no classification attempted."
       say_err "   waited for: the lane's runs on head $head to APPEAR and reach status=completed"
       say_err "   last observed: ${FIRST_CHECKS_OBSERVED:-nothing readable}"
-      if [ "${FIRST_CHECKS_MISSING:-0}" -gt 0 ]; then
+      # ⛔ AND THE SPLIT IS KEYED ON THE STATE, NEVER ON THE CLOCK (review round 4, P2).
+      # `FIRST_CHECKS_MISSING` advances by `dt` in WHOLE seconds (`$SECONDS`), so a poll
+      # whose work fits inside one second leaves it at 0 while `FIRST_CHECKS_STATE` is
+      # still `unobservable` — and branching on the clock then printed "NOTHING was
+      # unreadable" about a Jobs read that FAILED. Reachable exactly where this PR lives:
+      # the ONE-SHOT path returns `OUTCOME=$FIRST_CHECKS_STATE` after one sub-second poll
+      # (above), and the plain 0-window path expires at `missing(0) -ge WAIT(0)`.
+      # The STATE is the measurement; the clock only decides whether a DURATION may be
+      # quoted — and a measured 0s is not one.
+      if [ "${FIRST_CHECKS_STATE:-}" != "still-running" ]; then
         say_err "   what was missing: the lane's checks were still queued/in progress when the window"
-        say_err "   closed, and their per-job/per-step PROGRESS could not be read (the Jobs API did not"
-        say_err "   answer for ${FIRST_CHECKS_MISSING}s in total, ${FIRST_CHECKS_MISSING_STREAK}s consecutively), so slow and wedged could not be told apart."
+        if [ "${FIRST_CHECKS_MISSING:-0}" -gt 0 ]; then
+          say_err "   closed, and their per-job/per-step PROGRESS could not be read (the Jobs API did not"
+          say_err "   answer for ${FIRST_CHECKS_MISSING}s in total, ${FIRST_CHECKS_MISSING_STREAK}s consecutively), so slow and wedged could not be told apart."
+        else
+          say_err "   closed, and their per-job/per-step PROGRESS could not be read: the Jobs read FAILED"
+          say_err "   and no elapsed time was measured against it (this observation fitted inside one"
+          say_err "   second), so no duration is claimed and slow and wedged could not be told apart."
+        fi
         say_err "   A running job is not a failure, and this is NOT a stall claim: an unread instrument"
         say_err "   is not a stalled run."
         say_err "   Next: re-run the rail once those checks complete (its progress signal is re-read then),"

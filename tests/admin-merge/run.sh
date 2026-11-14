@@ -17039,12 +17039,22 @@ grep -q 'STALLED' "$SCEN/err" \
 # NOT silently outrank it — and the documented bullet says so. Pin BOTH halves, or a future
 # change could make the knob authoritative (or fatal) with nothing to catch it: an
 # unexercised conjunction is an accidental behaviour, not a specified one.
+# ⛔ AND THE VERDICT WORD ALONE IS NOT A DISCRIMINATOR (review round 4, P2): FOUR refusal
+# paths print "FIRST-CHECKS wait expired after" — the ceiling, never-started, unreadable
+# and the `*)` arm — and the mutant this arm exists to catch (ONESHOT outranking a
+# non-zero window ⇒ `wait_enabled=0`) lands on `*)`, which prints "… expired after 0s
+# (window 2s)". A `grep` for "expired after" therefore passed on the VERY MUTANT it was
+# written to fail, which is the same flaw (g1) documents 40 lines above. The
+# discriminator is the same one (g1) uses: an ENABLED wait reaches the CEILING verdict.
 rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9821"
 SUITE_FIRST_CHECKS_WAIT=2 SUITE_FIRST_CHECKS_ONESHOT=1 SUITE_FIRST_CHECKS_POLL=1 \
   run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-grep -q 'FIRST-CHECKS wait expired after' "$SCEN/err" \
-  && pass "(g4) ONESHOT with a NON-ZERO window is INERT (the bounded wait still runs) — the knob does not outrank an explicit window" \
+grep -q 'FIRST-CHECKS wait expired after' "$SCEN/err" && grep -q '(ceiling' "$SCEN/err" \
+  && pass "(g4) ONESHOT with a NON-ZERO window is INERT (the bounded wait still runs to its ceiling) — the knob does not outrank an explicit window" \
   || fail "(g4) ONESHOT overrode an explicit non-zero window — the documented conjunction is not what the code does"
+grep -q '(window 0s)' "$SCEN/err" \
+  && fail "(g4) …and the refusal named the 0 seam (window 0s): the one-observation path ran, not the bounded wait (this is what the (ceiling) assertion above is for)" \
+  || pass "(g4) …and it was NOT the one-observation path (no '(window 0s)' verdict)"
 # …and the zero-window half of the conjunction is (g2): WAIT=0 + bounds + ONESHOT takes one
 # observation. Pinning it again here would only duplicate (g2), so it is not re-run.
 
