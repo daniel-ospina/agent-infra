@@ -653,6 +653,40 @@ if (typeof stripTypeScriptTypes !== "function" ||
       cmd: "git stash pop && git -C . push -f --delete stale && git -C . push origin --delete stale2",
       why: "round 15 CONTROL: both targets held NOWHERE ⇒ still allowed, so P29 is #73 and not a " +
            "blanket refusal of a prefixed two-push compound" },
+    // ── review round 16 (P1): THE EXTRACTOR'S OWN ADJACENCY — the sixth instance ──
+    // Rounds 14 and 15 added the PARSED invocation surface to two arms. Both fixes
+    // left `extractPushDeleteBranch` requiring the literal adjacency `git push`
+    // (segment-matched on `/\bgit\s+push\b/`), and TWO consumers of it are not
+    // arms but the SURFACES the arms read:
+    //   · `wholeCommandDeleteTargets` — this extractor is its only implementation.
+    //     Its `[]` made the force-push/push allowance read `foreignDelete=false`
+    //     and `return admitAfterM3()` (:7061 → the admit); the later `block:force-
+    //     push` arm (:7148) got `[]` too, so no delete check ran at all.
+    //   · the DEGRADED fallback arm, which has no parsed classifier at all, so the
+    //     extractor is its ONLY surface and a prefixed delete was invisible.
+    // MEASURED (worktree session, `held` checked out in a sibling, base
+    // `e4716a058` vs pre-fix head `cd5bcfe29`): P33–P35 and D4 ALLOWED while a
+    // sibling's upstream was destroyed; P36/D5 are the controls that keep the
+    // widening from becoming a blanket refusal, and both are ALLOWED on base and
+    // on the fix — so the widening changed the target-attribution, not the
+    // session geometry.
+    { id: "P33", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git -C . push -f origin main && git -C . push origin --delete held",
+      why: "round 16 P1: the push-family ALLOWANCE path — with the extractor blind to `git -C . " +
+           "push`, `wcDeletes` was empty, `foreignDelete` false, and the compound was ADMITTED " +
+           "while a sibling held `held`" },
+    { id: "P34", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git -C . push -f origin main && git -C . push origin -d held",
+      why: "round 16 P1: the #443 `-d` spelling of the same allowance-path hole (the spellings " +
+           "must not split)" },
+    { id: "P35", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git push -f origin main && git -C . push origin --delete held",
+      why: "round 16 P1: FIRST push unprefixed, LATER delete push prefixed — the extractor is " +
+           "segment-matched, so one prefixed segment was enough to lose the target" },
+    { id: "P36", dir: "wt", expect: "allow",
+      cmd: "git -C . push -f origin main && git -C . push origin --delete stale2",
+      why: "round 16 CONTROL: the same prefixed two-push shape with the delete target held " +
+           "NOWHERE stays allowed — P33 differs only by whether a sibling holds it" },
   ];
 
   /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
@@ -672,6 +706,17 @@ if (typeof stripTypeScriptTypes !== "function" ||
     { id: "D3", dir: "hub", expect: "block", marker: "Destructive git command blocked",
       cmd: "git stash pop && git push origin --delete stale",
       why: "degraded arm control: in the hub the generic legacy block still fires" },
+    // ── review round 16 (P1): the degraded arm's ONLY surface is the extractor ──
+    { id: "D4", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git -C . push origin --delete held",
+      why: "round 16 P1: in degraded mode there is no `det`, so the extractor is the only surface " +
+           "that can attribute a delete — and it could not see a `-C`-prefixed push, so the new " +
+           "#73 clause read `rawDeleteNames=[]` and never fired (MEASURED: ALLOWED, sibling upstream " +
+           "destroyed)" },
+    { id: "D5", dir: "wt", expect: "allow",
+      cmd: "git stash pop && git -C . push origin --delete stale",
+      why: "round 16 CONTROL: the prefixed spelling with an UNHELD target is still worktree-exempt " +
+           "(D4 differs only by whether a sibling holds the target)" },
   ];
 
   const real = await loadGuard(INDEX_TS);
@@ -750,7 +795,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
     /** Copy this extension (plus the shared modules index.ts imports) into a
      *  temp tree. `omit` drops a module (the degraded fixtures), `file`+`revert`
      *  applies ONE textual revert (the mutants). */
-    function buildTree(label, { omit = [], file = null, revert = null } = {}) {
+    function buildTree(label, { omit = [], file = null, revert = null, alsoFile = null, alsoRevert = null } = {}) {
       const root = realpathSync(mkdtempSync(join(tmpdir(), `legacy-delete-${label}-`)));
       const ext = join(root, "extensions");
       mkdirSync(join(ext, "main-worktree-guard"), { recursive: true });
@@ -769,6 +814,19 @@ if (typeof stripTypeScriptTypes !== "function" ||
         const mutated = revert(src);
         applied = mutated !== src;
         writeFileSync(target, mutated);
+      }
+      // #506 round 16 — a SECOND revert on a SECOND file. Two surfaces now cover
+      // the prefixed-push spellings (the parsed invocations AND the widened
+      // extractor), so the round-14/15 mutants became non-discriminating on their
+      // own: dropping the parsed surface alone no longer reopens those rows. The
+      // honest mutant therefore has to remove BOTH, and `applied` requires both
+      // anchors to land so a stale second anchor cannot silently prove less.
+      if (alsoFile && alsoRevert) {
+        const target2 = join(ext, "main-worktree-guard", alsoFile);
+        const src2 = readFileSync(target2, "utf8");
+        const mutated2 = alsoRevert(src2);
+        writeFileSync(target2, mutated2);
+        applied = applied && mutated2 !== src2;
       }
       return { root, index: join(ext, "main-worktree-guard", "index.ts"), applied };
     }
@@ -809,6 +867,14 @@ if (typeof stripTypeScriptTypes !== "function" ||
     // ── Part M — MUTATION EVIDENCE: each half of the fix is load-bearing ──
     if (MUTATIONS) {
       console.log("\n── Part M: mutation evidence (#506) ──");
+
+      /** Re-narrow `extractPushDeleteBranch` to the literal `git push` adjacency,
+       *  i.e. the pre-round-16 predicate. Shared by the two surface mutants and
+       *  the round-16 mutant so all three spell the defect ONE way. */
+      const narrowExtractor = (src) => src.replace(
+        /const _PUSH_ADJ_SRC = String\.raw`[^`]*`;/,
+        "const _PUSH_ADJ_SRC = String.raw`\\bgit\\s+push\\b`; // MUTANT: literal adjacency only",
+      );
 
       const MUTANT_PAIRS = [
         {
@@ -1085,6 +1151,15 @@ if (typeof stripTypeScriptTypes !== "function" ||
             "        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes, ...parsedDeletes])];",
             "        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])]; // MUTANT: parsed surface dropped",
           ),
+          // ⛔ ROUND 16 CHANGED WHAT THIS MUTANT CAN SHOW, so it now reverts BOTH
+          // surfaces. P25–P27 survived the parsed-surface removal after round 16,
+          // because the widened extractor sees a prefixed push too — the fix is
+          // deliberately belt-and-braces, and a partial revert therefore no longer
+          // reopens the hole. Removing both is the only revert that still
+          // demonstrates the rows are guarded AT ALL (and mutant 18 measures the
+          // extractor half alone, so neither surface is asserted by proxy).
+          alsoFile: "classify-git.mjs",
+          alsoRevert: narrowExtractor,
           expectRed: ["P25", "P26", "P27"],
           redCheck: (r) => !blocked(r),
           expectGreen: ["P28", "B16", "B16b", "B17", "P16", "B1"],
@@ -1114,6 +1189,12 @@ if (typeof stripTypeScriptTypes !== "function" ||
             "          ])] // MUTANT: probe parsed surface dropped (push-delete branch)\n" +
             "          : wholeCommandDeleteTargets(det.verdict, localCommand); // MUTANT: … and the else branch",
           ),
+          // ⛔ Same round-16 overlap as mutant 16: the widened extractor covers the
+          // prefixed rows, so BOTH surfaces must go for P29–P31 to reopen. The
+          // `expectGreen` list still proves the split from mutant 16 — the round-14
+          // rows depend on the `#506` arm, not on the probe under test.
+          alsoFile: "classify-git.mjs",
+          alsoRevert: narrowExtractor,
           expectRed: ["P29", "P30", "P31"],
           redCheck: (r) => !blocked(r),
           expectGreen: ["P25", "P26", "P27", "P32", "P16", "P20", "P18", "B16", "B16b"],
@@ -1133,6 +1214,30 @@ if (typeof stripTypeScriptTypes !== "function" ||
           expectRed: ["P7", "P10", "P11"],
           redCheck: (r) => !blocked(r),
           expectGreen: ["P13", "P15", "B1"],
+        },
+        {
+          // (18) THE EXTRACTOR'S ADJACENCY RE-NARROWED — the round-16 P1 put back.
+          // Rounds 14 and 15 fixed ARMS; this one isolates the SURFACE both arms
+          // read. `extractPushDeleteBranch` is the only implementation behind
+          // `wholeCommandDeleteTargets` (so the push-family allowance and the
+          // `block:force-push` arm) AND the only surface the DEGRADED arm has.
+          // Reverting the predicate to the literal `git push` adjacency must take
+          // P33–P35 (full path) and D4 (degraded) back to ALLOWED while the two
+          // controls — P36 and D5, unheld targets — stay ALLOWED either way: that
+          // pair is what distinguishes "the target was attributed" from "the
+          // widening made the guard stricter about everything".
+          label: "extractor adjacency re-narrowed to a literal `git push` (classify-git.mjs)",
+          file: "classify-git.mjs",
+          // `omit` is REQUIRED for the degraded legs: without it the mutant tree
+          // loads CLEAN, the D-rows run the FULL path, and D4 stays blocked by the
+          // parsed surface — a green assertion measuring the wrong arm.
+          omit: ["shared/branch-ownership.mjs"],
+          revert: narrowExtractor,
+          expectRed: ["P33", "P34", "P35"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P36", "P31", "P29", "B10", "B7"],
+          expectDegradedRed: ["D4"],
+          expectDegradedGreen: ["D5", "D1", "D2"],
         },
       ];
 

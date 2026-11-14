@@ -5013,14 +5013,39 @@ function _cleanDeleteTarget(x) {
  *   leaves the delete unguarded. So `null` ⇒ nothing deleted, but a NON-null
  *   result does NOT prove git will delete it (review P3-1).
  */
+// ⛔ THE ADJACENCY PREFIX, AND WHY IT EXISTS (review round 16, P1). This
+// extractor used to require the literal adjacency `git push`, i.e. it was
+// SEGMENT-MATCHED on `/\bgit\s+push\b/`. Git accepts a global option cluster
+// between the two (`git -C . push`, `git -c core.pager=cat push`,
+// `git --git-dir=$PWD/.git push`), and the classifier PARSES those forms
+// correctly — so the extractor was a STRICT SUBSET of the rows the delete
+// attribution must cover. Two consumers inherited the hole and both were
+// measured ADMITTING a sibling-held delete from a worktree session:
+//   · `wholeCommandDeleteTargets` (this function is its only implementation),
+//     whose `[]` made the force-push/push allowance read `foreignDelete=false`
+//     and `return admitAfterM3()` — for
+//     `git -C . push -f origin main && git -C . push origin --delete held`;
+//   · the DEGRADED fallback arm, which has no parsed classifier at all and
+//     therefore had NO surface that could see
+//     `git stash pop && git -C . push origin --delete held`.
+// Widening THIS one predicate closes both, which is why the fix is here and not
+// two unions at the two call sites: a consumer that attributes delete targets
+// from the extractor is now correct by construction.
+// STATED LIMIT: a prefix whose value contains whitespace (`-C "my dir"`) and a
+// push reached only through `eval`/`xargs` remain invisible — the same class of
+// gap the classifier's own hint machinery exists for, declared rather than
+// assumed covered.
+const _PUSH_ADJ_SRC = String.raw`\bgit(?:\s+(?:-[Cc]\s*\S+|--git-dir(?:=\S+|\s+\S+)|--work-tree(?:=\S+|\s+\S+)))*\s+push\b`;
+const _RE_PUSH_ADJ = new RegExp(_PUSH_ADJ_SRC);
+
 export function extractPushDeleteBranch(command) {
   const c = String(command ?? "").trim();
-  if (!/\bgit\s+push\b/.test(c)) return null;
+  if (!_RE_PUSH_ADJ.test(c)) return null;
   // Compound commands carry several `git push` segments (`a && git push … ;
   // git push …`) — detect deletes per segment, stopping at shell operators
   // (the original regex's [^;&|]* contract).
   const branches = [];
-  const segRe = /\bgit\s+push\b([^;&|]*)/g;
+  const segRe = new RegExp(String.raw`${_PUSH_ADJ_SRC}([^;&|]*)`, "g");
   let sm;
   while ((sm = segRe.exec(c)) !== null) {
     const tokens = sm[1].trim().split(/\s+/).filter(Boolean);

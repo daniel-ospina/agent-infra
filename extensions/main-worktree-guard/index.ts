@@ -6666,12 +6666,18 @@ export default function (pi: ExtensionAPI) {
       // over-capture documented above, which errs toward BLOCKING), and adopting
       // the extractor wholesale would trade this hole for a narrower one.
       // ⛔ AND THE PARSED INVOCATION SURFACE IS A THIRD ONE (review round 14, P0).
-      // The two surfaces above are STILL a strict subset of what the
-      // `block:push-delete` arm below attributes from: `det.pushTargets` is
-      // FIRST-invocation-scoped, and `extractPushDeleteBranch` is segment-matched
-      // on `/\bgit\s+push\b/`, so a **later** push carrying a `-C`/`-c` prefix is
-      // invisible to BOTH. Every `det.pushMutations` entry carries its own
-      // `targets` and its own `isDelete`, which is the only surface that sees it.
+      // `det.pushTargets` is FIRST-invocation-scoped, so on its own it is a strict
+      // subset of the rows an arm must attribute. ⚠️ The extractor half of this
+      // paragraph is HISTORICAL: until round 16 `extractPushDeleteBranch` required
+      // the literal `git push` adjacency, so a later push carrying a `-C`/`-c`
+      // prefix was invisible to BOTH surfaces — and `det.pushMutations` was the
+      // only one that saw it. Round 16 taught the extractor that adjacency
+      // (`classify-git.mjs`'s `_PUSH_ADJ_SRC`), so the parsed surface is no longer
+      // the only reader of these rows; it is kept because it is the surface that
+      // parses rather than matches, and it remains the only one that sees a form
+      // the regex cannot express (a quoted `-C "my dir"`, an eval/xargs payload).
+      // Every `det.pushMutations` entry carries its own
+      // `targets` and its own `isDelete`.
       // MEASURED at `5bac9475b` against base `e4716a058`, worktree session with
       // `held` checked out in a sibling — base BLOCKED via #73, the two-surface
       // head ALLOWED, for all of `--delete`/`-d`/`-c`-prefixed later pushes and
@@ -6776,10 +6782,16 @@ export default function (pi: ExtensionAPI) {
       //   git stash pop  && git -C . push -f --delete held
       //   git restore .  && git -C . push -f --delete held
       //   git stash pop  && git push origin :held && git -C . push -f origin main
+      // ⚠️ THE `-C`-PREFIX SENTENCE BELOW IS HISTORICAL (round 16): the extractor
+      // used to return null for a `-C .`-prefixed spelling; it no longer does, so
+      // the two surfaces OVERLAP on that class now. The paragraph is kept because
+      // the reason it gives for the two-surface rule is still true — the extractor
+      // is blind to the forms the regex cannot express, and `wholeCommandDeleteTargets`
+      // is still gated on the push/force-push verdict.
       // ⛔ The attribution is TWO-SURFACE and verdict-dependent, because neither
       // single surface sees every shape: `wholeCommandDeleteTargets` returns `[]`
       // for a `block:push-delete` verdict (it is gated on push/force-push), while
-      // `extractPushDeleteBranch` returns null for the `-C .`-prefixed spelling.
+      // the extractor alone cannot express every prefix form.
       // So: for a `block:push-delete` verdict the delete refspecs are the parsed
       // `pushTargets` (the classifier set `isPushDelete`) UNION the extractor's
       // later-segment finds — the same two-surface rule the #506 arm above uses;
