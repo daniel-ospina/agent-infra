@@ -952,10 +952,15 @@ print(comp, len(inc))
         # verdict). `queued > QUEUE_PAGE` is the fact that makes BOTH halves true: the request is
         # `per_page=QUEUE_PAGE` (:775), `per_page` caps at 100 and silently reduces larger values
         # (GitHub pagination docs), and a queue deeper than the page cannot be enumerated by ANY knob.
-        # ⛔ AND IT CLAIMS NOTHING ABOUT THE CANDIDATE LIST'S LENGTH (review cycle 8, F1): the list may
-        # be the page's rows or the SINGLE candidate synthesised from a body that carried only a head
-        # id (see the degrade path above), so the sentence is about the READ REQUEST and the QUEUE
-        # DEPTH — the two facts this branch actually establishes.
+        # ⛔ AND IT CLAIMS NOTHING ABOUT THE CANDIDATE LIST'S LENGTH (review cycle 8, F1; premise
+        # corrected under cycle 9's F2, which measured the one it USED to state as unreachable here):
+        # this branch is reached only when the scan broke the bound, so the list is at least
+        # `bound + 1` rows of the ONE page requested — its LENGTH is therefore not what the note is
+        # about, and the sentence asserts only the READ REQUEST and the QUEUE DEPTH, the two facts the
+        # `queued > QUEUE_PAGE` operand actually establishes. (The single synthesised candidate on the
+        # degrade path above cannot reach here: one candidate means `scanned` tops out at 1, and
+        # `1 > bound` needs a bound of 0, which is refused by name above. The sibling SATURATED
+        # surface's `page-saturated-at-page` arm IS that shape — reachable there, not here.)
         log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap)$(if [ "$queued" -gt "$QUEUE_PAGE" ]; then printf '; this read asks for at most ONE page of %s runs and the queue is deeper than that, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
       fi
     fi
