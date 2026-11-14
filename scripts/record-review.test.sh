@@ -5890,11 +5890,18 @@ fi
 # would catch (a new word in `_OC_PERSIST` alone changes no existing row).
 PARENT_WORDS="$(command grep -E '^  local _OC_PERSIST=' "$RECORD" | command sed -E 's/.*\(([^()]*)\)[^()]*$/\1/' | tr '|' '\n' | sort -u)"
 TWIN_WORDS="$(command grep -E '^  local _OC_STILL=' "$RECORD" | command sed -E 's/.*\(([^()]*)\)[^()]*$/\1/' | tr '|' '\n' | sort -u)"
+#   ⛔ THE `|| true` IS LOAD-BEARING, NOT DEFENSIVE NOISE. This harness runs under `set -euo pipefail`
+#   (line 27), and `grep -vxE` exits **1 when it selects no line** — which is exactly the CLEAN case,
+#   because the only words that ever reach it are the collective quantifiers it excludes. So without
+#   `|| true` the guard ABORTS THE SUITE precisely when parity HOLDS, printing no `ok:` and no `bad`:
+#   the harness then reports `aborted BEFORE its summary`, which reads as a broken test rather than as
+#   a passing one. MEASURED before the fix: `RC=1`, abort immediately after 13n86, no 13n87 line at all.
+#   The emptiness is tested explicitly on the next line, so swallowing the status loses nothing.
 if [ -z "$PARENT_WORDS" ] || [ -z "$TWIN_WORDS" ]; then
     bad "13n87 PARITY: could not parse the two word lists out of the shipped script — re-anchor, do not drop"
 else
     MISSING_WORDS="$(comm -23 <(printf '%s\n' "$PARENT_WORDS") <(printf '%s\n' "$TWIN_WORDS") \
-        | grep -vxE 'remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|still|some|most|several|half|rest')"
+        | { grep -vxE 'remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|still|some|most|several|half|rest' || true; })"
     if [ -z "$MISSING_WORDS" ]; then
         ok "13n87 PARITY: every non-collective word in _OC_PERSIST is also read by its line-wide twin _OC_STILL"
     else
