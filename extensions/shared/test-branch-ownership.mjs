@@ -429,6 +429,134 @@ ok("branchOp: symbolic-ref HEAD", op("symbolic-ref", ["HEAD", "refs/heads/x"]) =
 ok("branchOp: symbolic-ref origin", op("symbolic-ref", ["refs/remotes/origin/HEAD", "refs/heads/main"]) === "other");
 ok("branchOp: update-ref refs/heads", op("update-ref", ["refs/heads/x", "HEAD"]) === "switch-existing");
 ok("branchOp: update-ref tag", op("update-ref", ["refs/tags/v1", "HEAD"]) === "other");
+// ── #594 Finding 2: the WRITE form, positionally precise ──
+// `git symbolic-ref refs/heads/<b> <target>` re-points an existing branch ref
+// rc 0 (probe-verified) without touching any checkout — its own op, because
+// "switch-existing" would let the #376 return-to-original arm RE-BASELINE the
+// session onto a branch it never checked out.
+const symRefOp = (args) => classifyBranchOp("symbolic-ref", args);
+ok("branchOp #594: symbolic-ref refs/heads/<b> <target> → ref-write(b)", (() => {
+  const r = symRefOp(["refs/heads/victim", "refs/heads/main"]);
+  return r.op === "ref-write" && r.target === "victim";
+})());
+ok("branchOp #594: symbolic-ref -d refs/heads/<b> → ref-write(b)", (() => {
+  const r = symRefOp(["-d", "refs/heads/victim"]);
+  return r.op === "ref-write" && r.target === "victim";
+})());
+ok("branchOp #594: symbolic-ref --del prefix → ref-write(b)", (() => {
+  const r = symRefOp(["--del", "refs/heads/victim"]);
+  return r.op === "ref-write" && r.target === "victim";
+})());
+ok("branchOp #594: symbolic-ref refs/heads/<b> alone is a QUERY → other", op("symbolic-ref", ["refs/heads/main"]) === "other");
+ok("branchOp #594: symbolic-ref HEAD alone is a QUERY → other", op("symbolic-ref", ["HEAD"]) === "other");
+ok("branchOp #594: `-m <reason>` is a VALUE slot (refs/heads write still ref-write)", (() => {
+  const r = symRefOp(["-m", "why", "refs/heads/victim", "refs/heads/main"]);
+  return r.op === "ref-write" && r.target === "victim";
+})());
+ok("branchOp #594: `-m <reason>` HEAD form is a state change, not a query of a ref named 'why'",
+  op("symbolic-ref", ["-m", "why", "HEAD", "refs/heads/x"]) === "switch-existing");
+ok("branchOp #594: `-mwhy` inline value keeps HEAD as pos[0] (state change)",
+  op("symbolic-ref", ["-mwhy", "HEAD", "refs/heads/x"]) === "switch-existing");
+ok("branchOp #594: update-ref -m <reason> refs/heads/<b> → switch-existing",
+  op("update-ref", ["-m", "why", "refs/heads/x", "HEAD"]) === "switch-existing");
+ok("branchOp #594: update-ref --stdin names no ref on argv → ref-write(null)", (() => {
+  const r = classifyBranchOp("update-ref", ["--stdin"]);
+  return r.op === "ref-write" && r.target === null;
+})());
+ok("branchOp #594: update-ref --stdi / --s (unambiguous --stdin prefixes) → ref-write(null)",
+  ["--stdi", "--st", "--std", "--s"].every((f) => classifyBranchOp("update-ref", [f]).op === "ref-write"));
+ok("branchOp #594: update-ref --no-stdin is the opposite → other",
+  classifyBranchOp("update-ref", ["--no-stdin"]).op === "other");
+ok("branchOp #594: symbolic-ref -qd / -dq (clustered delete) → ref-write(b)",
+  ["-qd", "-dq"].every((f) => {
+    const r = classifyBranchOp("symbolic-ref", [f, "refs/heads/victim"]);
+    return r.op === "ref-write" && r.target === "victim";
+  }));
+ok("branchOp #594: symbolic-ref -md is `-m d` → not a delete cluster (2 positionals still a write)",
+  classifyBranchOp("symbolic-ref", ["-md", "refs/heads/sym3", "refs/heads/main"]).op === "ref-write");
+ok("branchOp #594: an UNRESOLVED ref operand (`$R`, `$(…)`, the collapsed `$` sentinel) → ref-write(null)",
+  [["$R", "refs/heads/main"], ["$(printf refs/heads/v)", "refs/heads/main"], ["$"]].every((args) => {
+    const r = classifyBranchOp("symbolic-ref", args);
+    return r.op === "ref-write" && r.target === null;
+  }));
+ok("branchOp #594: update-ref with an unresolved ref operand → ref-write(null)",
+  classifyBranchOp("update-ref", ["$R", "HEAD"]).op === "ref-write");
+ok("branchOp #594: a LITERAL non-branch ref (myref) keeps today's 'other' (behaviour unchanged)",
+  classifyBranchOp("symbolic-ref", ["myref", "refs/heads/main"]).op === "other");
+ok("branchOp #594: update-ref -z (stdin NUL mode) → ref-write(null)", (() => {
+  const r = classifyBranchOp("update-ref", ["--stdin", "-z"]);
+  return r.op === "ref-write" && r.target === null;
+})());
+ok("branchOp #594: update-ref -m <reason> refs/tags/v1 stays other (control)",
+  op("update-ref", ["-m", "why", "refs/tags/v1", "HEAD"]) === "other");
+ok("branchOp #594: an opaque alias indirection → alias-opaque", (() => {
+  const r = classifyBranchOp("br", [], { aliasOpaque: true });
+  return r.op === "alias-opaque" && r.name === "br";
+})());
+
+// ── #594 CROSS-LAYER PIN: the CLI classifier and this module must agree ──
+// `symbolic-ref`/`update-ref` WRITE detection exists twice on purpose (this
+// module must not import classify-git.mjs — #99 degradation contract, stated in
+// the module header). The two copies are what determines whether the M3 gate is
+// ENTERED at all (classify-git: branchState/stateMutations) and what it then
+// DECIDES (this module: classifyBranchOp). A lag in either direction is silent:
+// branchState true + op "other" skips the gate, and branchState false never
+// reaches it. So the matrix is asserted against BOTH layers.
+const cg = await import("../main-worktree-guard/classify-git.mjs");
+const REF_MATRIX = [
+  ["symbolic-ref", ["refs/heads/victim", "refs/heads/main"], true],
+  ["symbolic-ref", ["-m", "why", "refs/heads/victim", "refs/heads/main"], true],
+  ["symbolic-ref", ["-d", "refs/heads/victim"], true],
+  ["symbolic-ref", ["--del", "refs/heads/victim"], true],
+  ["symbolic-ref", ["-m", "why", "HEAD", "refs/heads/x"], true],
+  ["symbolic-ref", ["HEAD", "refs/heads/x"], true],
+  ["symbolic-ref", ["refs/heads/main"], false],
+  ["symbolic-ref", ["HEAD"], false],
+  ["symbolic-ref", ["-q", "--short", "HEAD"], false],
+  ["symbolic-ref", ["refs/remotes/origin/HEAD", "refs/heads/main"], false],
+  ["update-ref", ["refs/heads/x", "HEAD"], true],
+  ["update-ref", ["-m", "why", "refs/heads/x", "HEAD"], true],
+  ["update-ref", ["-d", "refs/heads/x"], true],
+  ["update-ref", ["--stdin"], true],
+  ["update-ref", ["--stdin", "-z"], true],
+  ["update-ref", ["refs/tags/v1", "HEAD"], false],
+  ["update-ref", ["-m", "why", "refs/tags/v1", "HEAD"], false],
+  // #594 review round 1 — the five measured shapes the first cut left open.
+  ["symbolic-ref", ["-qd", "refs/heads/victim"], true],
+  ["symbolic-ref", ["-dq", "refs/heads/victim"], true],
+  ["symbolic-ref", ["-md", "refs/heads/sym3", "refs/heads/main"], true],
+  ["symbolic-ref", ["$(printf refs/heads/victim)", "refs/heads/main"], true],
+  ["symbolic-ref", ["$"], true],
+  ["update-ref", ["--stdi"], true],
+  ["update-ref", ["--s"], true],
+  ["update-ref", ["--no-stdin"], false],
+  ["update-ref", ["$R", "HEAD"], true],
+  // #594 review round 2 — the clustered `-m` VALUE slot.
+  ["symbolic-ref", ["-qm", "why", "refs/heads/victim", "refs/heads/main"], true],
+  ["symbolic-ref", ["-qqm", "why", "refs/heads/victim", "refs/heads/main"], true],
+  ["symbolic-ref", ["-md", "refs/heads/P3", "refs/heads/main"], true],
+  ["update-ref", ["-dm", "why", "refs/heads/victimD", "HEAD"], true],
+];
+const cliWrite = (verb, args) => (verb === "symbolic-ref"
+  ? cg.symbolicRefWriteTarget(args)
+  : cg.updateRefWriteTarget(args));
+const cliSaysWrite = (verb, args) => {
+  const w = cliWrite(verb, args);
+  if (!w) return false;
+  if (verb === "update-ref") return true;
+  return w.opaque === true || w.name === "HEAD" || w.branch !== null;
+};
+const opSaysWrite = (verb, args) => {
+  const r = classifyBranchOp(verb, args);
+  return r.op === "ref-write" || r.op === "switch-existing";
+};
+for (const [verb, args, isWrite] of REF_MATRIX) {
+  const label = `${verb} ${args.join(" ")}`;
+  ok(`#594 cross-pin: classify-git sees a write=${isWrite} for \`${label}\``,
+    cliSaysWrite(verb, args) === isWrite);
+  ok(`#594 cross-pin: classifyBranchOp agrees (write=${isWrite}) for \`${label}\``,
+    opSaysWrite(verb, args) === isWrite);
+}
 ok("branchOp: branch -f", op("branch", ["-f", "x", "main"]) === "force");
 // #591: git merges NOARG shorts into one cluster (`-fq` ≡ `-f -q`; force short
 // anywhere in the run) and --force accepts its unambiguous abbreviation --forc.
@@ -944,6 +1072,24 @@ ok("M3 #376: target-less switch-existing (symbolic-ref/update-ref) still blocks"
 ok("M3 #376: prev-branch '-' never equals the original → blocks", (() => {
   const d = decideM3({ branchOp: { op: "switch-existing", target: "-" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
   return d?.block === true;
+})());
+ok("M3 #594: ref-write (symbolic-ref refs/heads/<b>) BLOCKS — no carve-out applies", (() => {
+  const d = decideM3({ branchOp: { op: "ref-write", target: "main" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey, currentBranch: "main" });
+  return d?.block === true && d?.reBaseline === undefined;
+})());
+ok("M3 #594: ref-write never re-baselines even when the target IS the original", (() => {
+  // `symbolic-ref refs/heads/main HEAD` on a session whose original is `main`
+  // must not be mistaken for the #376 return-to-original re-baseline.
+  const d = decideM3({ branchOp: { op: "ref-write", target: "main" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: "feat/2", original: "main" }, repoKey: mainKey, currentBranch: "feat/2" });
+  return d?.block === true && d?.reBaseline === undefined;
+})());
+ok("M3 #594: `update-ref --stdin` ref-write(null) blocks too", (() => {
+  const d = decideM3({ branchOp: { op: "ref-write", target: null }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
+  return d?.block === true;
+})());
+ok("M3 #594: alias-opaque blocks and names the indirection", (() => {
+  const d = decideM3({ branchOp: { op: "alias-opaque", name: "br" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
+  return d?.block === true && /git br/.test(d.reason) && /alias/i.test(d.reason);
 })());
 ok("M3 #376: other branch-state ops stay blocked (agent-infra, force/orphan/detach/force-create)", (() => {
   return ["force", "orphan", "detach", "force-create"]

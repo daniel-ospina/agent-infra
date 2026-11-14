@@ -10,7 +10,7 @@
 import { execSync, execFileSync } from "node:child_process";
 import { resolve, join, dirname, relative, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync } from "node:fs";
+import { existsSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync, accessSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 //
@@ -2264,6 +2264,12 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // Cycle-5 P1: --config-env=<name>=<envvar> is the env-indirection form.
     const configOverrides = [];
     const configEnvOverrides = [];
+    // #594 review round 3: git reads ONE ordered config list, so the RELATIVE
+    // order of `-c` and `--config-env` decides which definition wins
+    // (`--config-env=alias.x=E -c alias.x='…'` → the later `-c` wins, measured
+    // rc 0). The two arrays above are kept for their existing consumers; this
+    // one preserves the argv order the alias resolver needs.
+    const configOps = [];
     // Round-3 P1: a bare per-command prefix WINS over an exported value (bash:
     // `export GIT_DIR=/a; GIT_DIR=/b git …` runs with /b — probe-verified).
     let gitDirHint = pendingHints.gitDirHint ?? frame().persistHints.gitDirHint ?? null;
@@ -2309,9 +2315,9 @@ function _walkShell(command, h = {}, seedVars = {}) {
       if (g === "--namespace") { i += 2; continue; }
       if (g.startsWith("--namespace=")) { i++; continue; }
       if (g === "--no-pager" || g === "-p" || g === "--paginate") { i++; continue; }
-      if (g === "-c" || g === "--config") { configOverrides.push(tokens[i + 1] ?? "\u0000"); i += 2; continue; }
-      if (g === "--config-env") { configEnvOverrides.push(tokens[i + 1] ?? "\u0000"); i += 2; continue; } // cycle-6 P1: space form
-      if (g.startsWith("--config-env=")) { configEnvOverrides.push(g.slice("--config-env=".length)); i++; continue; }
+      if (g === "-c" || g === "--config") { configOverrides.push(tokens[i + 1] ?? "\u0000"); configOps.push({ kind: "c", v: tokens[i + 1] ?? "\u0000" }); i += 2; continue; }
+      if (g === "--config-env") { configEnvOverrides.push(tokens[i + 1] ?? "\u0000"); configOps.push({ kind: "env", v: tokens[i + 1] ?? "\u0000" }); i += 2; continue; } // cycle-6 P1: space form
+      if (g.startsWith("--config-env=")) { configEnvOverrides.push(g.slice("--config-env=".length)); configOps.push({ kind: "env", v: g.slice("--config-env=".length) }); i++; continue; }
       if (g.startsWith("-")) { i++; continue; }
       break;
     }
@@ -2356,7 +2362,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
     }
     h.onGitEnd?.({
       verb, args, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint,
-      configOverrides, configEnvOverrides, envPrefixes,
+      configOverrides, configEnvOverrides, configOps, envPrefixes,
       cdChain: f.pipeActive ? f.chain.slice(0, f.baseLen) : [...f.chain],
       vars: { ...f.vars },
       cmdVisible,
@@ -2377,12 +2383,27 @@ function _walkShell(command, h = {}, seedVars = {}) {
  * {verb, args} are unchanged for existing consumers.
  * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, indexFileHint: string|null, objDirsHint: string|null, configOverrides: string[], vars: object}>}
  */
-export function allGitInvocations(command, seedVars = {}) {
+export function allGitInvocations(command, seedVars = {}, opts = {}) {
   const invocations = [];
   _walkShell(command, {
     onGitEnd: (inv) => invocations.push(inv),
   }, seedVars);
-  return invocations;
+  // #594: the walk sees the SPELLED word, but git resolves aliases (and every
+  // external `git-<word>`) itself — expand the statically-visible ones and flag
+  // the rest opaque, so no consumer ever reasons on a verb that is not the
+  // command that runs. Expansion happens HERE, once, so every consumer of the
+  // walk (the detailed classifier, the discard family, the script arms) sees
+  // the same resolved command.
+  // ⛔ `expandAliases: false` returns the SPELLED walk. Exactly one consumer
+  // needs it: `_aliasValueMutates` must find the CALL SITE by its alias NAME
+  // (`git -c alias.x=… x -Mq victim main`) to read the args the user typed after
+  // the alias. Expansion rewrites that invocation's verb to `x`'s target and
+  // PREPENDS the alias value's own words to its args, so a name-keyed search over
+  // the expanded list finds nothing and the call-site args silently vanish —
+  // measured: `hiddenStateMutation` went FALSE for a force-rename, i.e. the
+  // merge of the alias expansion with #607's arg-aware judging lost a detection.
+  if (opts && opts.expandAliases === false) return invocations;
+  return _expandAliasInvocations(invocations);
 }
 
 // ── #709: working-tree-discard family (command layer) ──────────────────────
@@ -4004,6 +4025,860 @@ export function _branchInvMutatesBranchState(args) {
 }
 
 /**
+ * #594: git's own top-level commands, so the classifier can answer "could this
+ * word be a git builtin?" BY ITSELF.
+ *
+ * Measured with `git --list-cmds=builtins` (140 names, git 2.43.0) — THE WHOLE
+ * LIST AND NOTHING ELSE, and that is the ONLY command that regenerates it. Keep
+ * it COMPLETE rather than minimal: a real builtin missing here is a false block
+ * in a main checkout.
+ *
+ * ⛔ DO NOT regenerate with `--list-cmds=builtins,main` (163). The 23 extra names
+ * are `git-<name>` EXECUTABLES (submodule, subtree, filter-branch, request-pull,
+ * mergetool, instaweb, web--browse, remote-*, shell, …), not builtins, and git
+ * falls back to the ALIAS for one when its external is absent — measured
+ * (git 2.43, no `git-p4` installed): `git -c alias.filter-branch='branch -fq v1
+ * main' filter-branch` created the branch while the classifier read it as a
+ * trusted builtin. Listing one is fail-OPEN; see the R4e/R4e2 pins.
+ *
+ * ⛔ DO NOT ADD the historical contrib commands (cvsimport, archimport, p4, gui,
+ * gitk, citool, cvsexportcommit, cvsserver). They are NOT builtins: git falls
+ * back to `git-<name>` on PATH and THEN TO THE ALIAS, so treating one as a
+ * builtin has two fail-OPEN consequences in one step — a definition of that name
+ * is dropped from the alias map (see _expandAliasInvocations) and the invocation
+ * is trusted instead of being flagged opaque. Measured (git 2.43, no `git-p4`
+ * installed): `git config alias.p4 'branch -fq victimP <sha>'; git p4` moved the
+ * ref rc 0 while the classifier answered branchState:false. A name git does not
+ * know can only cost the alias expansion for that one spelling (git rejects it
+ * rc 129 — probe-verified) — the safe direction. The SAME applies in the other
+ * direction on a git UPGRADE: a builtin a newer git adds is absent here → the
+ * verb is treated as opaque → refused in a main checkout (friction, not a hole:
+ * fail-closed), so a git upgrade that adds commands must regenerate this list in
+ * the same change.
+ *
+ * WHY (issue #594, Finding 1): git resolves `git <word>` as an ALIAS inside its
+ * own process whenever <word> is not a command — `git -c alias.co='checkout
+ * victim' co` flips the shared hub rc 0, and it does so with verb "co", which
+ * every arm downstream reads as "some harmless non-branch verb". The token walk
+ * can never see the expanded command, so every non-builtin verb is treated as
+ * an alias / external-subcommand indirection the guard cannot verify (fail
+ * closed — see _expandAliasInvocations).
+ */
+/**
+ * #594 review round 5: the DEPRECATED builtins, for which git's `run_argv`
+ * consults the ALIAS **before** the builtin (`is_deprecated_command` →
+ * `handle_alias` before `handle_builtin`; `git.c` v2.52.0 lists
+ * `pack-redundant` and `whatchanged`). For these two the alias really does win,
+ * so a definition of that name must be EXPANDED rather than dropped — the
+ * opposite of every other builtin name. (Unreachable on a pre-2.52 git, where
+ * the alias is simply ignored; expanding it there only over-blocks.)
+ *
+ * ⛔ SNAPSHOT HAZARD, recorded deliberately: this list is git >= 2.52's. If a
+ * LATER git marks another builtin deprecated, that name starts consulting its
+ * alias first while this file keeps DROPPING its definition — i.e. the drop rule
+ * becomes fail-OPEN for it, silently. Every one of the 140 census names was
+ * measured on git 2.43.0 (`git -c alias.<n>='branch -fq victim <sha>' <n>`) and
+ * none consults an alias today, so the rule is sound on the running git; a
+ * git upgrade that adds a DEPRECATED row must add it here in the same change.
+ */
+const GIT_ALIAS_PRECEDES_BUILTIN = new Set(["pack-redundant", "whatchanged"]);
+
+const GIT_BUILTIN_COMMANDS = new Set([
+  "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch",
+  "bugreport", "bundle", "cat-file", "check-attr", "check-ignore",
+  "check-mailmap", "check-ref-format", "checkout", "checkout--worker",
+  "checkout-index", "cherry", "cherry-pick", "clean", "clone", "column",
+  "commit", "commit-graph", "commit-tree", "config", "count-objects",
+  "credential", "credential-cache", "credential-cache--daemon",
+  "credential-store", "describe", "diagnose", "diff", "diff-files",
+  "diff-index", "diff-tree", "difftool", "fast-export", "fast-import",
+  "fetch", "fetch-pack", "fmt-merge-msg", "for-each-ref", "for-each-repo",
+  "format-patch", "fsck", "fsck-objects", "fsmonitor--daemon", "gc",
+  "get-tar-commit-id", "grep", "hash-object", "help", "hook", "index-pack",
+  "init", "init-db", "interpret-trailers", "log", "ls-files", "ls-remote",
+  "ls-tree", "mailinfo", "mailsplit", "maintenance", "merge", "merge-base",
+  "merge-file", "merge-index", "merge-ours", "merge-recursive",
+  "merge-recursive-ours", "merge-recursive-theirs", "merge-subtree",
+  "merge-tree", "mktag", "mktree", "multi-pack-index", "mv", "name-rev",
+  "notes", "pack-objects", "pack-redundant", "pack-refs", "patch-id",
+  "pickaxe", "prune", "prune-packed", "pull", "push", "range-diff",
+  "read-tree", "rebase", "receive-pack", "reflog", "remote", "remote-ext",
+  "remote-fd", "repack", "replace", "rerere", "reset", "restore", "rev-list",
+  "rev-parse", "revert", "rm", "send-pack", "shortlog", "show",
+  "show-branch", "show-index", "show-ref", "sparse-checkout", "stage",
+  "stash", "status", "stripspace", "submodule--helper", "switch",
+  "symbolic-ref", "tag", "unpack-file", "unpack-objects", "update-index",
+  "update-ref", "update-server-info", "upload-archive",
+  "upload-archive--writer", "upload-pack", "var", "verify-commit",
+  "verify-pack", "verify-tag", "version", "whatchanged", "worktree",
+  "write-tree",
+]);
+
+/**
+ * #594 review round 10: a FAITHFUL port of git's own reader for the
+ * `GIT_CONFIG_PARAMETERS` channel — `parse_config_env_list` + `sq_dequote_step`
+ * (`config.c:684-713`, `quote.c:121-165` at git v2.43.0) — because this is the
+ * channel git parses LAST, so it SHADOWS the `GIT_CONFIG_COUNT` pairs the
+ * resolver already models. Measured FAIL-OPEN (git 2.43.0, throwaway repo,
+ * rc 0): `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br
+ * GIT_CONFIG_VALUE_0=status GIT_CONFIG_PARAMETERS="'alias.br=branch -fq
+ * victimG main'" git br` created `victimG` while the classifier answered
+ * `verb:status, branchState:false` → M3 never entered → ALLOWED in a shared
+ * main checkout.
+ *
+ * THE FORMAT (git v2.43.0, read from the primary source, not a summary): a
+ * whitespace-separated list of sq-quoted entries in three spellings — OLD
+ * `'key=value'` (the whole pair quoted, split on the FIRST `=`), NEW
+ * `'key'='value'`, and an implicit bool `'key'=`. Inside a quoted run `'\''` and
+ * `'\!'` are escapes for a literal `'` / `!` (`need_bs_quote`, `quote.c`).
+ * Entries apply in LIST ORDER, so the LAST one wins — the same last-wins rule
+ * the count pairs follow by index.
+ *
+ * A list git cannot parse is `fatal: unable to parse command-line config`
+ * (measured rc 128), so nothing runs; this returns `ok:false` and the caller
+ * turns an `alias.`-bearing value into the fail-closed `aliasOpaque` rather
+ * than guessing what it might have defined.
+ * @param {string} raw the channel's value (already shell-dequoted by the walker)
+ * @returns {{ok: boolean, pairs: Array<[string, string|null]>}}
+ */
+function _parseGitConfigParametersEnv(raw) {
+  const s = String(raw ?? "");
+  const n = s.length;
+  // C `isspace` in the C locale — `parse_config_env_list` uses it to separate
+  // entries, so the set must match or the walk splits where git does not.
+  const isSpace = (c) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\v" || c === "\f";
+  // `sq_dequote_step` (quote.c): ONE sq-quoted token. Returns the dequoted text
+  // and the index just past the token, or null for an unterminated run.
+  const dequoteStep = (at) => {
+    if (s[at] !== "'") return null;
+    let out = "";
+    let j = at;
+    for (;;) {
+      j += 1;
+      if (j >= n) return null; // git: a NUL ends the read → bogus format
+      const c = s[j];
+      if (c !== "'") {
+        out += c;
+        continue;
+      }
+      // Stepped out of the quoted run: the next char decides what follows.
+      j += 1;
+      const d = s[j];
+      if (d === undefined) return { text: out, next: n }; // `*next = NULL`
+      if (d === "\\") {
+        const esc = s[j + 1];
+        if ((esc === "'" || esc === "!") && s[j + 2] === "'") {
+          out += esc;
+          j += 2;
+          continue;
+        }
+      }
+      return { text: out, next: j };
+    }
+  };
+  const pairs = [];
+  let i = 0;
+  while (i < n) {
+    const keyTok = dequoteStep(i);
+    if (!keyTok) return { ok: false, pairs: [] };
+    i = keyTok.next;
+    if (i >= n || isSpace(s[i])) {
+      // OLD style: the dequoted token is `key=value` (or a bare bool key).
+      // git splits on the FIRST `=` only, then trims the KEY (`strbuf_trim`)
+      // and leaves the value untouched.
+      const eq = keyTok.text.indexOf("=");
+      const key = (eq < 0 ? keyTok.text : keyTok.text.slice(0, eq)).trim();
+      if (!key) return { ok: false, pairs: [] };
+      pairs.push([key, eq < 0 ? null : keyTok.text.slice(eq + 1)]);
+    } else if (s[i] === "=") {
+      // NEW style: `'key'='value'` or the implicit bool `'key'=`.
+      i += 1;
+      let value = null;
+      if (s[i] === "'") {
+        const valTok = dequoteStep(i);
+        if (!valTok || (valTok.next < n && !isSpace(s[valTok.next]))) return { ok: false, pairs: [] };
+        value = valTok.text;
+        i = valTok.next;
+      } else if (i >= n || isSpace(s[i])) {
+        value = null;
+      } else {
+        return { ok: false, pairs: [] };
+      }
+      if (!keyTok.text) return { ok: false, pairs: [] };
+      pairs.push([keyTok.text, value]);
+    } else {
+      return { ok: false, pairs: [] };
+    }
+    while (i < n && isSpace(s[i])) i += 1;
+  }
+  return { ok: true, pairs };
+}
+
+/**
+ * #594: the `alias.<name>` definitions an invocation carries STATICALLY in its
+ * own argv/env — the only ones the walk can see BEFORE git runs:
+ *   - `-c alias.x=<value>` / `--config alias.x=<value>` (configOverrides)
+ *   - `--config-env alias.x=<ENV>` (configEnvOverrides), resolved against the
+ *     statement's vars → its env prefixes → process.env; an unresolvable name
+ *     is reported as null = "defined, value opaque"
+ *   - `GIT_CONFIG_PARAMETERS`, the channel git itself folds every command-line
+ *     definition INTO and parses LAST (see `_parseGitConfigParametersEnv`), so
+ *     it beats both of the sources around this bullet. A value the walk cannot
+ *     read is reported as `unreadableAliases`, never guessed (round 10).
+ *   - `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs from the statement's
+ *     env PREFIXES (`VAR=value git …`) — the only source that is in the child's
+ *     environment by construction — and ONLY when `GIT_CONFIG_COUNT` is a
+ *     positive integer <= 64 from those same prefixes: git ignores the numbered
+ *     pairs entirely without it (probe-verified rc 0, round 7). They are NOT
+ *     read from `inv.vars`, which cannot tell `A=1` from `export A=1` — an
+ *     invisible pair is ignored by git SILENTLY, so trusting one fails OPEN
+ *     (probe-verified rc 0, round 8).
+ * ⛔ It does NOT read `git config alias.x <value>` writes, and it must not: the
+ * config scope order (system→global→local→worktree→cmdline) means a write the
+ * guard CAN see is still shadowed by a file it cannot, so a persisted definition
+ * is never expanded — the later `git <name>` is `aliasOpaque` and fails closed
+ * (rounds 4-5): `git config alias.x '…' && git x` is therefore BLOCKED, not
+ * expanded.
+ * A `!`-prefixed value (git's shell-command alias) is reported as null: the
+ * value is arbitrary shell text, so "the alias IS this command" is not a claim
+ * the walk may make.
+ * @param {object} inv
+ * @returns {{defs: Array<[string, string|null]>, unreadableAliases: boolean}}
+ */
+function _aliasDefsFromInvocation(inv) {
+  const defs = [];
+  // ⛔ SET WHEN A DEFINITION CHANNEL EXISTS BUT CANNOT BE READ: an
+  // `alias.`-bearing `GIT_CONFIG_PARAMETERS` that is malformed (git dies on it,
+  // measured rc 128) or that comes from an EXPORTED shell assignment the walker
+  // cannot prove git sees (round 8's rule for the count pairs, same channel
+  // class). The caller turns it into `aliasOpaque` for any verb an alias could
+  // actually resolve — fail closed, never a guess about what it defines.
+  let unreadableAliases = false;
+  const splitKw = (s) => {
+    const i = String(s ?? "").indexOf("=");
+    return i <= 0 ? null : [String(s).slice(0, i), String(s).slice(i + 1)];
+  };
+  const takeAlias = (key, value) => {
+    const m = /^alias\.([A-Za-z0-9._/-]+)$/.exec(String(key ?? "").trim());
+    if (!m) return;
+    // ⛔ THE ALIAS NAME IS CASE-FOLDED, BECAUSE GIT'S CONFIG-KEY CANONICALIZATION
+    // IS (review round 10, measured fail-open). For the plain two-level key
+    // `alias.<name>` the SECTION and the NAME are case-insensitive (only a
+    // QUOTED subsection, the three-level `alias."Name"` form, is case-sensitive
+    // — and git REJECTS that in `-c`, measured rc 128). So `alias.BR` and
+    // `alias.br` are the SAME key and the LATER definition wins — measured (git
+    // 2.43.0, rc 0): `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=alias.br
+    // GIT_CONFIG_VALUE_0=status GIT_CONFIG_KEY_1=alias.BR
+    // GIT_CONFIG_VALUE_1='branch -fq victimR main' git br` created `victimR`,
+    // while a case-preserving map held "br"=status and "BR"=destructive, read
+    // the benign one, left `branchState` false and ALLOWED it in a main
+    // checkout. Folding the name makes the map keyed exactly as git keys it.
+    const name = m[1].toLowerCase();
+    const v = value === null || value === undefined ? null : String(value);
+    defs.push([name, v !== null && v.startsWith("!") ? null : v]);
+  };
+  const resolveEnv = (name) => {
+    // ⛔ PER-COMMAND ENV WINS OVER AN EARLIER SHELL ASSIGNMENT (bash semantics,
+    // probe-verified: `E=status; E='branch -fq victimZ <sha>'
+    // git --config-env=alias.x=E x` ran the DESTRUCTIVE alias, rc 0), and the
+    // LAST matching prefix wins when the command sets the name twice
+    // (`E=status E='branch -fq victimDUP main' git …` — measured rc 0). The
+    // order is therefore prefixes (last match) → vars → process.env; reading
+    // vars first, or the FIRST prefix, resolved the stale value and failed OPEN
+    // (review rounds 2 and 3).
+    const prefixes = inv.envPrefixes || [];
+    for (let i = prefixes.length - 1; i >= 0; i--) {
+      const p = String(prefixes[i] ?? "");
+      const e = p.indexOf("=");
+      if (e > 0 && p.slice(0, e) === name) return p.slice(e + 1);
+    }
+    if (name && inv.vars && Object.prototype.hasOwnProperty.call(inv.vars, name)) {
+      const v = inv.vars[name];
+      if (v !== undefined && v !== null) return String(v);
+    }
+    if (name && Object.prototype.hasOwnProperty.call(process.env, name)) return String(process.env[name]);
+    return null;
+  };
+  // ⛔ GIT_CONFIG_KEY_n/VALUE_n ENV PAIRS COME FIRST (review round 5): git
+  // parses the `GIT_CONFIG_COUNT` loop in `git_config_from_parameters` BEFORE it
+  // pushes `-c`/`--config-env` into `GIT_CONFIG_PARAMETERS`, so a `-c` definition
+  // WINS over an env pair with the same key — measured fail-open the other way:
+  // `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=status git -c
+  // alias.x='branch -fq victim main' x` runs the destructive `-c` alias.
+  // ⛔ THE NUMBERED PAIRS ARE INERT WITHOUT `GIT_CONFIG_COUNT` (review round 7):
+  // git reads them ONLY through the `GIT_CONFIG_COUNT` loop, so with the count
+  // unset or 0 the pairs are IGNORED — measured (git 2.43.0, persisted
+  // destructive `alias.br`): `GIT_CONFIG_KEY_0=alias.br
+  // GIT_CONFIG_VALUE_0=status git br` created the victim branch rc 0. Harvesting
+  // them unconditionally therefore fabricated a benign definition and let a
+  // persisted alias run — the exact bypass this issue closes. The gate mirrors
+  // `_effectiveConfig`'s (`Number(GIT_CONFIG_COUNT) > 0`, capped at 64).
+  // ⛔ AND THE PAIRS MUST BE IN THE COMMAND'S OWN ENVIRONMENT (review round 8, measured):
+  // the count and the pairs are read ONLY from `inv.envPrefixes` — the `VAR=value`
+  // prefixes bash puts in THIS child's env — never from `inv.vars`. The walker's
+  // `frame().vars` merges `A=1` and `export A=1` into one map with no export flag,
+  // so a pair it carries may be a plain SHELL variable git cannot see. git ignores
+  // an invisible pair SILENTLY (`--config-env` at least refuses, rc 128), so
+  // trusting it fabricates a benign definition and lets a persisted alias run —
+  // measured (git 2.43.0, persisted destructive `alias.br`):
+  // `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status; git br`
+  // created `victimP` rc 0 while the classifier expanded to the read-only `status`
+  // and answered branchState:false, i.e. M3 never ran. Restricting to prefixes is
+  // the FAIL-CLOSED direction: an EXPORTED pair is no longer expanded, so its verb
+  // is `aliasOpaque` and is refused in a main checkout (an over-block, not a hole).
+  const cfgCount = (() => {
+    const raw = (inv.envPrefixes || []).map((p) => {
+      const e = String(p).indexOf("=");
+      return e > 0 && String(p).slice(0, e) === "GIT_CONFIG_COUNT" ? String(p).slice(e + 1) : null;
+    }).filter((v) => v !== null).pop();
+    const n = Number(raw);
+    return raw !== undefined && Number.isInteger(n) && n > 0 && n <= 64 ? n : 0;
+  })();
+  if (cfgCount > 0) {
+    const cfgPairs = new Map();
+    const collectPair = (k, v) => {
+      const mk = /^GIT_CONFIG_KEY_(\d+)$/.exec(String(k ?? ""));
+      if (mk) cfgPairs.set(mk[1], { ...(cfgPairs.get(mk[1]) || {}), key: v });
+      const mv = /^GIT_CONFIG_VALUE_(\d+)$/.exec(String(k ?? ""));
+      if (mv) cfgPairs.set(mv[1], { ...(cfgPairs.get(mv[1]) || {}), value: v });
+    };
+    for (const p of inv.envPrefixes || []) {
+      const e = String(p).indexOf("=");
+      if (e > 0) collectPair(String(p).slice(0, e), String(p).slice(e + 1));
+    }
+    // ⛔ AND THE PAIRS ARE APPLIED IN **INDEX** ORDER, NOT IN THE ORDER THEY WERE
+    // WRITTEN ON THE SHELL LINE (review round 9, measured fail-open). `cfgPairs` is a
+    // Map keyed by the index STRING, so `for (const [idx, pair] of cfgPairs)` iterates
+    // in INSERTION order — i.e. whichever `GIT_CONFIG_KEY_n` assignment bash happened to
+    // write last — while git's own reader (`config.c`, `git_config_from_parameters`)
+    // loops `for (i = 0; i < count; i++)` ASCENDING, so the HIGHEST index wins. When the
+    // destructive definition sits at the higher index and was written FIRST, the
+    // classifier read the benign one, `branchState` stayed false, and M3 never ran —
+    // measured (git 2.43.0): `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_1=alias.x
+    // GIT_CONFIG_VALUE_1='branch -fq victimR HEAD' GIT_CONFIG_KEY_0=alias.x
+    // GIT_CONFIG_VALUE_0=status git x` created `victimR` rc 0 while this function
+    // answered `verb:status, branchState:false`, i.e. ALLOWED in a shared main checkout.
+    // Iterate the indices ascending instead, bounded by the same `GIT_CONFIG_COUNT`
+    // gate, so entries at or above the count stay inert exactly as before.
+    for (let i = 0; i < cfgCount; i++) {
+      const pair = cfgPairs.get(String(i));
+      if (pair && pair.key !== undefined) takeAlias(pair.key, pair.value ?? null);
+    }
+  }
+  // ⛔ `GIT_CONFIG_PARAMETERS` IS THE THIRD SOURCE AND GIT PARSES IT **AFTER**
+  // THE COUNT PAIRS (review round 10, measured FAIL-OPEN — the round-9 fix in
+  // this delta was correct and this is the one source left unread). git's
+  // `git_config_from_parameters` (`config.c:717`) runs the `GIT_CONFIG_COUNT`
+  // loop first (`:741-770`) and then `parse_config_env_list` on
+  // `CONFIG_DATA_ENVIRONMENT` (`:772-779`), so a definition carried in this
+  // channel SHADOWS a count pair. Measured (git 2.43.0, rc 0):
+  //   GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status \
+  //   GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimG main'" git br
+  // created `victimG`, while the classifier expanded the count pair, answered
+  // `verb:status, branchState:false`, never entered M3 and ALLOWED it in a
+  // shared main checkout.
+  // ⛔ SOURCE ORDER, MEASURED: count pairs → THIS channel → the argv-ordered
+  // `-c`/`--config-env` list. git serializes `-c` into this same channel
+  // (`git_config_push_split_parameter` APPENDS, old value first) so `-c` still
+  // wins — measured: params destructive + `-c alias.br=status` ran `status`.
+  const paramsChannel = (() => {
+    const prefixes = inv.envPrefixes || [];
+    for (let i = prefixes.length - 1; i >= 0; i--) {
+      const p = String(prefixes[i] ?? "");
+      const e = p.indexOf("=");
+      if (e > 0 && p.slice(0, e) === "GIT_CONFIG_PARAMETERS") {
+        // A prefix assignment REPLACES any inherited value for this child, so
+        // this is authoritative even when it is empty (measured: an empty value
+        // parses to no pairs and does NOT fall back to the inherited channel).
+        return { value: p.slice(e + 1), trusted: true };
+      }
+    }
+    if (inv.vars && Object.prototype.hasOwnProperty.call(inv.vars, "GIT_CONFIG_PARAMETERS")) {
+      const v = inv.vars.GIT_CONFIG_PARAMETERS;
+      if (v !== undefined && v !== null) {
+        // EXPORTED-vs-plain is indistinguishable here (round 8's finding, same
+        // shape as the count pairs): a plain shell variable is invisible to git,
+        // so the definitions are UNPROVEN — fail closed rather than trust one.
+        return { value: String(v), trusted: false };
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(process.env, "GIT_CONFIG_PARAMETERS")) {
+      // INHERITED: in the child's environment by construction, and git would
+      // parse it — so the walk must too, or an ambient definition shadows the
+      // count pair exactly as the finding above does.
+      return { value: String(process.env.GIT_CONFIG_PARAMETERS ?? ""), trusted: true };
+    }
+    return null;
+  })();
+  if (paramsChannel) {
+    const parsed = _parseGitConfigParametersEnv(paramsChannel.value);
+    // `i` on the alias probe: the key is case-insensitive (see `takeAlias`), so
+    // `alias.BR` is just as defining as `alias.br`.
+    const mentionsAlias = /alias\./i.test(paramsChannel.value);
+    if (!paramsChannel.trusted) {
+      if (mentionsAlias) unreadableAliases = true;
+    } else if (!parsed.ok) {
+      // git DIES on a malformed list (rc 128), so no definition from it can run
+      // — but what it WOULD have defined is unknown, so an `alias.`-bearing value
+      // leaves every alias-resolvable verb opaque instead of expanding a
+      // definition from a lower-precedence source that git never reached.
+      if (mentionsAlias) unreadableAliases = true;
+    } else {
+      for (const [k, v] of parsed.pairs) takeAlias(k, v);
+    }
+  }
+  // ⛔ ONE ORDERED CONFIG LIST, exactly as git reads it (review round 3): the
+  // RELATIVE argv order of `-c` and `--config-env` decides the winner, so a
+  // pass over `configOverrides` followed by a pass over `configEnvOverrides`
+  // was measured FAIL-OPEN — with `E=status`, `git --config-env=alias.x=E -c
+  // alias.x='branch -fq victimMIX main' mix` runs the DESTRUCTIVE `-c`
+  // definition (rc 0) while an array-by-array pass expanded the benign env one.
+  // `configOps` is the walker's argv-ordered record; the two arrays stay as the
+  // fallback for callers that build an invocation by hand.
+  // ⛔ ORDER, MEASURED (review round 5): git parses the `GIT_CONFIG_COUNT` loop
+  // FIRST (`git_config_from_parameters`) and pushes `-c`/`--config-env` into
+  // `GIT_CONFIG_PARAMETERS` AFTERWARDS, so a `-c` definition BEATS a
+  // `GIT_CONFIG_KEY_n`/`VALUE_n` pair with the same key — the reverse of the
+  // order this function used, which was measured fail-open
+  // (`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=status git
+  // -c alias.x='branch -fq victim main' x` runs the destructive `-c` alias).
+  // So: env pairs first, then the argv-ordered `-c`/`--config-env` list.
+  if (Array.isArray(inv.configOps) && inv.configOps.length > 0) {
+    for (const op of inv.configOps) {
+      const kv = splitKw(op?.v);
+      if (!kv) continue;
+      takeAlias(kv[0], op.kind === "env" ? resolveEnv(kv[1]) : kv[1]);
+    }
+  } else {
+    for (const o of inv.configOverrides || []) {
+      const kv = splitKw(o);
+      if (kv) takeAlias(kv[0], kv[1]);
+    }
+    for (const ce of inv.configEnvOverrides || []) {
+      const kv = splitKw(ce);
+      if (kv) takeAlias(kv[0], resolveEnv(kv[1]));
+    }
+  }
+  return { defs, unreadableAliases };
+}
+
+
+/**
+ * Split a git alias VALUE into words the way git does (whitespace-separated,
+ * with single/double quotes and backslash escapes grouping a word). Git's own
+ * docs: "the arguments are split on whitespace with support for quoting".
+ * @param {string} value
+ * @returns {string[]}
+ */
+function _splitAliasValue(value) {
+  const words = [];
+  let cur = "";
+  let started = false;
+  const s = String(value ?? "");
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === " " || c === "\t" || c === "\n") {
+      if (started) { words.push(cur); cur = ""; started = false; }
+      continue;
+    }
+    if (c === "\\" && i + 1 < s.length) { cur += s[i + 1]; i++; started = true; continue; }
+    if (c === "'" || c === '"') {
+      const close = s.indexOf(c, i + 1);
+      const end = close === -1 ? s.length : close;
+      cur += s.slice(i + 1, end);
+      i = end;
+      started = true;
+      continue;
+    }
+    cur += c;
+    started = true;
+  }
+  if (started) words.push(cur);
+  return words;
+}
+
+/**
+ * #594 P1 (measured FALSE REFUSAL): could an ALIAS win `git <verb>`'s lookup at
+ * all?
+ *
+ * git's precedence, MEASURED (git 2.50.1, `git --list-cmds=builtins`, 144 names),
+ * is **builtin > `git-<verb>` on the exec path > alias**: once an executable
+ * `git-<verb>` is resolvable the alias is NEVER consulted, whatever persisted
+ * config says. So for every INSTALLED git extension — `git-lfs`, `git-submodule`,
+ * `git-subtree`, `git-flow`, `git-annex`, `git-remote-*` — an alias cannot shadow
+ * the command, and calling the invocation `aliasOpaque` refuses a command nobody
+ * can read but nobody can alias. That net covered a far larger class than the
+ * persisted-alias cost it was written for: `git lfs pull` and a post-clone
+ * `git submodule update --init --recursive` were refused in EVERY checkout.
+ *
+ * The lookup mirrors git's own search: `GIT_EXEC_PATH` — where `git-submodule`,
+ * `git-subtree` and a `git-lfs` installed with git actually live, and which git
+ * PREPENDS to its own `PATH` before resolving `git-<cmd>` (measured on this box:
+ * `git submodule` resolves to `/Library/Developer/CommandLineTools/usr/libexec/
+ * git-core/git-submodule`, a directory that is on NO shell `PATH`) — then `PATH`.
+ * `X_OK`, not mere existence — a non-executable `git-foo` never wins a lookup, so
+ * it must not buy an exemption.
+ *
+ * ⛔ FAIL-CLOSED ON AN UNREADABLE PATH — an error here returns `false`, which
+ * leaves the verb `aliasOpaque` (the over-block), never a silent admission. The
+ * inverse direction would be a bypass: a `PATH` the guard cannot read must not be
+ * allowed to buy an alias exemption.
+ * @param {string} verb the spelled subcommand word
+ * @returns {boolean} true iff a `git-<verb>` executable is resolvable
+ */
+const _gitExternalPathCache = new Map();
+// The exec-path list is probed ONCE per process: it needs a `git` call, and it
+// cannot change inside a session (a `GIT_EXEC_PATH` prefix on ONE command is the
+// command's own env, not the guard's — and not reading it is the fail-closed
+// direction, since the verb then stays opaque).
+let _gitExecPathDirsCache;
+function _gitExecPathDirs() {
+  if (_gitExecPathDirsCache !== undefined) return _gitExecPathDirsCache;
+  const dirs = [];
+  const fromEnv = String(process.env.GIT_EXEC_PATH ?? "");
+  if (fromEnv.length > 0) dirs.push(...fromEnv.split(":"));
+  try {
+    const probed = execFileSync("git", ["--exec-path"], {
+      encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (probed.length > 0) dirs.push(probed);
+  } catch {
+    // No usable git: the PATH half of the search still stands.
+  }
+  _gitExecPathDirsCache = dirs.filter((d) => d.length > 0);
+  return _gitExecPathDirsCache;
+}
+function _gitExternalOnPath(verb) {
+  const name = String(verb ?? "");
+  // git looks up `git-<word>` as a FILE NAME: a word carrying a separator, a
+  // leading `-`, or shell syntax cannot name one, so it is never external.
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) return false;
+  const searchDirs = [..._gitExecPathDirs(), ...String(process.env.PATH ?? "").split(":")];
+  const cacheKey = searchDirs.join(":") + "\u0000" + name;
+  const cached = _gitExternalPathCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  let found = false;
+  try {
+    for (const dir of searchDirs) {
+      if (dir.length === 0) continue;
+      // git appends the platform's executable suffix on Windows; probing both
+      // costs nothing and keeps the answer right off this box too.
+      for (const candidate of [`git-${name}`, `git-${name}.exe`]) {
+        try {
+          accessSync(join(dir, candidate), fsConstants.X_OK);
+          found = true;
+          break;
+        } catch { /* not in this directory */ }
+      }
+      if (found) break;
+    }
+  } catch {
+    return false; // unreadable PATH/env → stay fail-closed (verb stays opaque)
+  }
+  // Bounded: a long-lived session sees a handful of distinct (PATH, verb) pairs.
+  if (_gitExternalPathCache.size > 512) _gitExternalPathCache.clear();
+  _gitExternalPathCache.set(cacheKey, found);
+  return found;
+}
+
+/**
+ * #594: follow the ALIAS indirection layer, which git applies inside its own
+ * process and the token walk therefore cannot see.
+ *
+ * Every invocation whose verb is a statically-visible `alias.<name>` is
+ * EXPANDED into the command it names (bounded depth, cycle-safe), so the rest
+ * of the classifier — the legacy verdict patterns, branchState/stateMutations,
+ * stateOpCount, the hub-recovery allowlist — sees the real verb and args. Every
+ * invocation whose verb is NEITHER a builtin NOR a visible alias NOR an
+ * installed `git-<verb>` command is marked `aliasOpaque`: it may be a
+ * persisted-config alias or a typo, and in both cases the guard cannot know what
+ * it runs (fail closed — the M3 gate refuses it, and the command can never
+ * launder a benign-force carve-out). An INSTALLED `git-<verb>` is deliberately
+ * NOT opaque: it outranks the alias in git's lookup, so no alias can win for it
+ * (P1 — refusing those refused `git lfs pull` / `git submodule …` in every
+ * checkout, for a shadowing that cannot happen).
+ *
+ * NAMED RESIDUAL: a visible alias is expanded even though an INSTALLED
+ * `git-<name>` would win over it (git's measured precedence is builtin >
+ * external command > alias). Expansion is the over-approximation that keeps a
+ * benign `git lg` usable; the residual needs an external `git-<name>` whose name
+ * collides with an alias defined in the SAME command. Builtin-named definitions
+ * are the dangerous half of that rule and ARE dropped — see below.
+ * @param {Array<object>} invocations
+ * @returns {Array<object>}
+ */
+function _expandAliasInvocations(invocations) {
+  const MAX_ALIAS_DEPTH = 5;
+  const expandOne = (inv, depth, res) => {
+    const verb = inv.verb;
+    if (!verb) return inv;
+    // ⛔ THE CLASSIFIER'S OWN SENTINEL IS NOT A SPELLED VERB (P1, second
+    // measured shape). `__unverifiable__` is emitted by `_walkShell` when the
+    // command word is a multiword `$VAR` (`G="git log --oneline"; $G`) — it is a
+    // MARKER that the word was not visible, never a name git receives. git can
+    // therefore never consult `alias.__unverifiable__` for it, and the #607 class
+    // is a RECORDED decision that these are ADMITTED (read-only `$VAR` command
+    // words are ordinary lane traffic; the conservative flags refused them with a
+    // remedy the agent had already followed — see test-module-load.mjs's
+    // "`$VAR` command word holding a read is ALLOWED" rows, and
+    // `_hasHiddenStateSubst`, which treats the sentinel fail-closed on its own).
+    // Inheriting `aliasOpaque` here re-refused that whole class through a rule
+    // about alias LOOKUP, which is not what the sentinel is about. Passed through
+    // unchanged, exactly as before #594.
+    if (verb === "__unverifiable__") return inv;
+    // ⛔ AN UNREADABLE `GIT_CONFIG_PARAMETERS` MAKES EVERY ALIAS-RESOLVABLE VERB
+    // OPAQUE (review round 10). The channel is parsed LAST, so a definition in it
+    // shadows whatever a lower-precedence source said — and that includes the
+    // expansion THIS function would otherwise make. Fail-closed scope: a verb an
+    // alias can actually win for is (a) anything that is not a builtin, and
+    // (b) a DEPRECATED builtin, whose alias git consults first — and NOT an
+    // installed `git-<verb>`, which outranks the alias outright (P1). A plain
+    // builtin is unaffected (git's precedence is builtin > alias), so it is
+    // classified as before rather than over-blocked.
+    const aliasMayApply = GIT_ALIAS_PRECEDES_BUILTIN.has(verb) ||
+      (!GIT_BUILTIN_COMMANDS.has(verb) && !_gitExternalOnPath(verb));
+    if (res.unreadableAliases && aliasMayApply) return { ...inv, aliasName: verb, aliasOpaque: true };
+    // ⛔ THE LOOKUP IS CASE-INSENSITIVE, because git's alias lookup keys the
+    // command name into the config key `alias.<cmd>`, whose name part is
+    // case-folded (`alias.BR` IS `alias.br` — measured: `git -c alias.BR='…'
+    // br` ran it), and `defsFor` stores names folded the same way.
+    const defKey = res.defs.has(verb)
+      ? verb
+      : (res.defs.has(String(verb).toLowerCase()) ? String(verb).toLowerCase() : null);
+    if (defKey !== null) {
+      const def = res.defs.get(defKey);
+      if (def === null) return { ...inv, aliasName: verb, aliasOpaque: true };
+      const words = _splitAliasValue(def);
+      const next = words[0];
+      if (!next || depth >= MAX_ALIAS_DEPTH) return { ...inv, aliasName: verb, aliasOpaque: true };
+      return expandOne({
+        ...inv,
+        verb: next,
+        args: [...words.slice(1), ...(inv.args || [])],
+        aliasName: verb,
+      }, depth + 1, res);
+    }
+    // ⛔ P1 (measured FALSE REFUSAL): the last clause is NOT "not a builtin ⇒
+    // opaque". An INSTALLED `git-<verb>` sits ABOVE the alias in git's lookup, so
+    // for a resident extension (`git-lfs`, `git-submodule`, `git-subtree`,
+    // `git-flow`, `git-annex`, every `git-remote-*`) NO alias can ever win and
+    // this invocation is not alias-opaque — it is an external command, which is
+    // what it was before #594 and is what `git <verb>` actually runs. The
+    // persisted-alias residual below is unchanged: with no `git-<verb>` on the
+    // exec path an unreadable name stays opaque and still fails closed.
+    if (!GIT_BUILTIN_COMMANDS.has(verb)) {
+      if (_gitExternalOnPath(verb)) return inv;
+      return { ...inv, aliasName: verb, aliasOpaque: true };
+    }
+    return inv;
+  };
+  // ⛔ ONLY THIS INVOCATION'S OWN, PROCESS-LOCAL DEFINITIONS ARE EXPANDED, and
+  // nothing else — a decision that took four review rounds to get right, each
+  // round measured (git 2.43) as a false ALLOW:
+  //   · a command-global map let a LATER benign redefinition reclassify an
+  //     EARLIER destructive segment (`git -c alias.x='branch -fq victimA …' x &&
+  //     git -c alias.x=status x`);
+  //   · a definition leaked FORWARD past its process's lifetime
+  //     (`git -c alias.br=status br && git br` ran the PERSISTED destructive
+  //     alias.br in segment 2);
+  //   · a `git config alias.x <value>` write was harvested, but git's config
+  //     scope order is system→global→LOCAL→worktree→cmdline, so
+  //     `git config --global alias.br status && git br` still runs a pre-existing
+  //     repo-local `alias.br`, and a `-C <other-repo>`/`GIT_DIR=` write lands in a
+  //     repo the later invocation never reads.
+  // A persisted alias is therefore NOT modelled at all: an invocation of a name
+  // with no process-local definition is `aliasOpaque` and fails closed (see the
+  // decideM3 alias-opaque arm). That costs a benign `git config alias.lg …
+  // && git lg` in a main checkout, which is the fail-closed direction: trusting
+  // a value the guard cannot see IS the bypass #594 is about.
+  const defsFor = (inv) => {
+    const m = new Map();
+    const { defs, unreadableAliases } = _aliasDefsFromInvocation(inv);
+    for (const [name, value] of defs) {
+      // ⛔ GIT'S PRECEDENCE, MEASURED (git 2.43): builtin > `git-<cmd>` on PATH
+      // > alias. `git -c alias.reset=status reset --hard` runs the BUILTIN
+      // `reset --hard` (probe-verified; the alias is never consulted, and an
+      // installed `git-foo` likewise wins over `alias.foo`). A definition with a
+      // BUILTIN name is therefore never used, and expanding it would classify a
+      // destructive command as whatever the ignored alias value says — a false
+      // ALLOW (`reset --hard` read as `status`). Dropped…
+      // …EXCEPT the DEPRECATED builtins: `git.c`'s run_argv consults the ALIAS
+      // FIRST for those (`is_deprecated_command` → handle_alias before
+      // handle_builtin, v2.52.0 — `pack-redundant`, `whatchanged`), so an alias
+      // DOES win there and must be expanded, not dropped.
+      if (GIT_BUILTIN_COMMANDS.has(name) && !GIT_ALIAS_PRECEDES_BUILTIN.has(name)) continue;
+      m.set(name, value);
+    }
+    return { defs: m, unreadableAliases };
+  };
+  return invocations.map((inv) => expandOne(inv, 0, defsFor(inv)));
+}
+
+/**
+ * #594: a ref NAME the classifier can reason about. git's ref grammar allows
+ * `/` `-` `.`; anything carrying shell syntax (`$VAR`, `$(…)`, backticks, `{}`)
+ * is UNRESOLVED at classify time — the operand is whatever the shell expands it
+ * to, and a write to it cannot be named (measured: `R=refs/heads/victimA; git
+ * symbolic-ref $R refs/heads/main` and the `$(printf refs/heads/victim)` twin
+ * both create the symref, rc 0). Such operands FAIL CLOSED, the same doctrine
+ * as the #805 unresolved-target sentinel.
+ */
+const LITERAL_REF_NAME = /^[A-Za-z0-9._/-]+$/;
+
+/**
+ * #594: the shell tokenizer's COLLAPSED-SUBSTITUTION sentinel. An unquoted
+ * `$(…)`/`$((…))` is subject to word splitting, so the walk replaces it AND the
+ * rest of the simple command with one opaque token (measured: `git
+ * symbolic-ref $(printf refs/heads/victim) refs/heads/main` reports args
+ * `["$"]` while git creates the symref). An operand list of exactly this one
+ * token therefore means "there were more operands, and nobody can read them".
+ */
+const COLLAPSED_SUBST_TOKEN = "$";
+
+/**
+ * #594: `--stdin` in every spelling git's parse-options accepts. `--stdin` is
+ * the only `--st…` option on `update-ref`, so git takes any unambiguous prefix
+ * of it (measured rc 0 — the ref moved — for `--s`, `--st`, `--std`, `--stdi`),
+ * while the `--no-stdin` negation means the opposite and takes argv instead.
+ * `-z` (NUL-delimited stdin) implies the same channel.
+ * @param {string} t
+ * @returns {boolean}
+ */
+function _isStdinChannelFlag(t) {
+  const s = String(t ?? "");
+  if (s === "-z") return true;
+  if (!s.startsWith("--")) return false;
+  const name = s.slice(2);
+  if (name.startsWith("no-")) return false; // --no-stdin DISABLES the channel
+  return name.length > 0 && "stdin".startsWith(name);
+}
+
+/**
+ * #594 Finding 2: value-slot-aware positionals for the ref-WRITING verbs
+ * (`symbolic-ref`, `update-ref`).
+ *
+ * Both verbs parse `-m <reason>` through git's parse-options, which CONSUMES
+ * the next argv as the option's VALUE (probe-verified git 2.43: `--reason` /
+ * `--message` do not exist, rc 129 — only `-m`). A naive "non-flag tokens"
+ * scan therefore reads the REASON as the first positional and slides the real
+ * ref operand into pos[1], so the write read as a query of a ref literally
+ * named after the message (probe-verified rc 0, both verbs):
+ *   git symbolic-ref -m why refs/heads/victim refs/heads/main   # re-points victim
+ *   git update-ref  -m why refs/heads/victim HEAD              # moves victim
+ * `-m<inline>` keeps its value in the same token and stays a plain flag.
+ * @param {string[]} args
+ * @returns {string[]} positional operands, option values excluded
+ */
+function _refVerbPositionals(args) {
+  const a = args || [];
+  const out = [];
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i];
+    const s = String(t ?? "");
+    if (s === "--") { // git accepts `--` here; everything after it is an operand
+      for (let j = i + 1; j < a.length; j++) out.push(a[j]);
+      break;
+    }
+    if (/^-[A-Za-z]+$/.test(s)) {
+      // #594 review round 2: git merges NOARG shorts into ONE cluster and a
+      // `m` in that cluster takes a value — `-qm why <name> <ref>` is
+      // `-q -m why …` (measured rc 0, symref re-pointed; `-qqm` likewise). An
+      // `m` with letters AFTER it carries its value INLINE (`-md` = `-m d`,
+      // measured rc 0), so only a TRAILING `m` consumes the next argv.
+      const letters = s.slice(1);
+      const at = letters.indexOf("m");
+      if (at !== -1 && at === letters.length - 1) i++;
+      continue;
+    }
+    if (s.startsWith("-")) continue;
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * #594 Finding 2: is this `symbolic-ref` invocation a WRITE, and to which ref?
+ *
+ * git's grammar (probe-verified git 2.43): `symbolic-ref <name>` with ONE
+ * positional is a QUERY; a second positional, or `-d`/`--delete` (any
+ * unambiguous `--del…` prefix), is a WRITE — `symbolic-ref refs/heads/<b>
+ * refs/heads/<target>` re-points the branch ref `b` rc 0 while the old
+ * classifier only ever named `HEAD` as branch state, so `classifyBranchOp`
+ * returned op "other" and the M3 gate was skipped entirely.
+ * @param {string[]} args
+ * @returns {{name: string, branch: string|null}|null} write target, or null
+ */
+export function symbolicRefWriteTarget(args) {
+  const a = args || [];
+  // `-d` may sit ANYWHERE in a single-dash NOARG cluster (`-qd` ≡ `-q -d`,
+  // `-dq` — probe-verified rc 0, ref deleted), an option-letter hazard this
+  // file already handles for `branch`/`push`. A cluster's `m` is different: it
+  // TAKES ITS VALUE from the rest of the same token (`-md` is `-m d`, NOT a
+  // delete — probe-verified), so the scan stops there.
+  const deletes = a.some((t) => {
+    const s = String(t ?? "");
+    if (s.startsWith("--")) return /^--d(e(?:l(?:e(?:t(?:e)?)?)?)?)?$/.test(s);
+    if (!/^-[A-Za-z]+$/.test(s)) return false;
+    for (const ch of s.slice(1)) {
+      if (ch === "d") return true;
+      if (ch === "m") break; // -m consumes the rest of the token as its value
+    }
+    return false;
+  });
+  const pos = _refVerbPositionals(a);
+  // #594: a collapsed unquoted substitution hides the real operands — a write
+  // whose target cannot be read, so it fails closed.
+  if (pos.length === 1 && pos[0] === COLLAPSED_SUBST_TOKEN) {
+    return { name: null, branch: null, opaque: true };
+  }
+  if (!deletes && pos.length < 2) return null; // one positional = QUERY
+  const name = pos[0];
+  if (!name) return null;
+  const m = /^refs\/heads\/(.+)$/.exec(name);
+  // An UNRESOLVABLE spelling (shell syntax in the operand) is a write whose
+  // target nobody can name → error on the conservative side.
+  return { name, branch: m ? m[1] : null, opaque: !LITERAL_REF_NAME.test(name) };
+}
+
+/**
+ * #594 Finding 2: is this `update-ref` invocation a WRITE, and to which ref?
+ *
+ * Covers the forms a value-blind positional scan missed:
+ *   - `-m <reason>` (see _refVerbPositionals) — pos[0] was the MESSAGE;
+ *   - `--stdin` (and `-z`), where EVERY ref update arrives on stdin and argv
+ *     names none at all (`printf 'update refs/heads/u2 <sha>\n' | git
+ *     update-ref --stdin` moves the branch rc 0, probe-verified) — reported as
+ *     a write with `branch: null` (target unknowable from the command).
+ * A bare `<ref>` with no new value is an rc-129 no-op in git, but it stays
+ * classified as a write: that is today's behaviour and the over-block is free.
+ * @param {string[]} args
+ * @returns {{name: string|null, branch: string|null}|null}
+ */
+export function updateRefWriteTarget(args) {
+  const a = args || [];
+  if (a.some(_isStdinChannelFlag)) return { name: null, branch: null, opaque: true };
+  const deleting = a.some((t) => t === "-d" || /^--delete$/.test(String(t)));
+  const pos = _refVerbPositionals(a);
+  const name = pos[0] ?? null;
+  if (!name) return null;
+  // #594: a collapsed unquoted substitution hides the real operands.
+  if (name === COLLAPSED_SUBST_TOKEN && pos.length === 1) {
+    return { name: null, branch: null, opaque: true };
+  }
+  // An UNRESOLVABLE spelling (`$R`, `$(…)`) names no ref the gate can read.
+  const opaque = !LITERAL_REF_NAME.test(name);
+  if (!deleting && pos.length < 2) {
+    // <ref> alone is an rc-129 no-op in git; keep the historic over-block.
+    return /^refs\/heads\//.test(name) || name === "HEAD" || opaque
+      ? { name, branch: null, opaque }
+      : null;
+  }
+  const m = /^refs\/heads\/(.+)$/.exec(name);
+  if (!m && name !== "HEAD" && !opaque) return null; // tags / notes / remotes — not branch state
+  return { name, branch: m ? m[1] : null, opaque };
+}
+
+/**
  * Detailed classification of a shell command (consumed EXCLUSIVELY by
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
@@ -4138,19 +5013,31 @@ export function classifyGitCommandDetailed(command) {
   // and the arm leaves branchState false). branchState is then true iff the
   // command CONTAINS a branch-state mutation, regardless of segment position;
   // stateVerb/stateArgs point at the mutation the M3 gate must classify.
-  const stateInvs = invocations.filter((v) =>
+  const stateInvs = invocations.filter((v) => v.aliasOpaque === true ||
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb));
   // Round-4 (reviewer P1b follow-up): the MUTATING predicate is reused both
   // for the single selection below AND for stateMutations (every mutating
   // branch-state invocation) — index.ts gates EVERY main-resolving mutation
   // so a leading `-C <wt>` mutation can't blanket-exempt a later MAIN one.
   const _isStateMutating = (v) => {
+    // #594: an alias/external-subcommand indirection is unverifiable — the
+    // command runs SOMETHING the walk cannot name, so it is gated like a
+    // branch-state mutation rather than admitted as harmless.
+    if (v.aliasOpaque === true) return true;
     if (v.verb === "checkout" || v.verb === "switch") return true;
-    if (v.verb === "symbolic-ref" || v.verb === "update-ref") {
-      const pos = (v.args || []).filter((x) => !x.startsWith("-"));
-      return (v.verb === "symbolic-ref" && pos[0] === "HEAD") ||
-        (v.verb === "update-ref" && pos[0] &&
-          (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD"));
+    if (v.verb === "symbolic-ref") {
+      // #594 Finding 2: WRITE-form precise (one positional is a QUERY), and
+      // positional-precise (`-m <reason>` consumes its value), so a
+      // `refs/heads/<b>` re-point and the `-m`-prefixed HEAD form are both
+      // state mutations while `git symbolic-ref refs/heads/x` stays a read.
+      // An UNRESOLVABLE operand (`$R`, `$(…)`) counts too — fail closed.
+      const w = symbolicRefWriteTarget(v.args);
+      return !!w && (w.opaque === true || w.name === "HEAD" || w.branch !== null);
+    }
+    if (v.verb === "update-ref") {
+      // #594: `-m <reason>` value slots, the stdin channel (`--stdin` and every
+      // unambiguous prefix of it) and unresolvable operands.
+      return updateRefWriteTarget(v.args) !== null;
     }
     return v.verb === "branch" && _branchInvMutatesBranchState(v.args);
   };
@@ -4353,11 +5240,28 @@ export function classifyGitCommandDetailed(command) {
       // surface (attached shorts + long forms), not just exact `-b`/`-B` tokens.
       out.newBranch = _checkoutCreateBranch(verb, args);
     } else if (verb === "symbolic-ref" || verb === "update-ref") {
-      const pos = args.filter((x) => !x.startsWith("-"));
-      if ((verb === "symbolic-ref" && pos[0] === "HEAD") ||
-          (verb === "update-ref" && pos[0] && (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD"))) {
+      // #594 Findings 1+2: WRITE-form + option-value-slot + stdin precision
+      // (shared with _isStateMutating above, so selection and arm cannot
+      // drift). branchState now covers `symbolic-ref refs/heads/<b> <target>`
+      // (a branch-REF rewrite the classifier never saw) and the `-m`/`--stdin`
+      // spellings of both verbs.
+      const write = verb === "symbolic-ref"
+        ? symbolicRefWriteTarget(args)
+        : updateRefWriteTarget(args);
+      // Only checkout state, `refs/heads/<b>` and an unresolvable operand are
+      // branch state here; a refs/remotes/… write stays M4's business
+      // (unchanged behaviour).
+      if (write && (verb !== "symbolic-ref" || write.opaque === true ||
+          write.name === "HEAD" || write.branch !== null)) {
         out.branchState = true;
       }
+    } else if (stateInv.aliasOpaque === true) {
+      // #594 Finding 1: a verb that is not a git builtin and not a
+      // statically-visible alias — a persisted-config alias, a `git-<word>`
+      // external command, or a typo. Nothing about it can be verified, so it is
+      // branch state (M3 gates it in a shared main checkout; index.ts names it
+      // precisely).
+      out.branchState = true;
     } else if (verb === "branch") {
       // #592: rename/move arm widened from EXACT-token (-m/-M) to git's full
       // spelling surface (sibling closure: #587 delete clusters, #591
@@ -4544,6 +5448,11 @@ export function classifyGitCommandDetailed(command) {
     out.stateMutations = stateMutations.map((v) => ({
       verb: v.verb,
       args: v.args,
+      // #594: carried so index.ts can refuse an unverifiable indirection with a
+      // reason that names the actual problem instead of a generic branch op.
+      // Added ONLY for the opaque class, so every already-pinned mutation shape
+      // stays byte-identical.
+      ...(v.aliasOpaque === true ? { aliasOpaque: true, aliasName: v.aliasName ?? null } : {}),
       invVisible: v.cmdVisible !== false,
       hints: v.cmdVisible !== false
         ? { cdChain: v.cdChain, cHints: v.cHints, gitDirHint: v.gitDirHint, vars: v.vars }
@@ -4560,7 +5469,7 @@ export function classifyGitCommandDetailed(command) {
   // mutating one — #596; pre-#591 the exact-force segment 1 blocked the whole
   // command). stateOpCount ≥ 2 → decideM3 refuses the carve-out → default
   // block restores pre-#591 compound parity.
-  out.stateOpCount = invocations.filter((v) =>
+  out.stateOpCount = invocations.filter((v) => v.aliasOpaque === true ||
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
   // #591 (round-3→5 fold): `hiddenStateSubst` is computed UP FRONT (see the
   // zero-invocation guard) and already on `out` — it now feeds not only the M3
@@ -5330,12 +6239,12 @@ function _isCarveOutReadOnlyInvocation(v) {
   // stay read-only; a second checkout/switch, any `update-ref`, a ref-writing
   // symbolic-ref, and every branch mutation fall through as non-read-only.
   if (verb === "branch") return !_branchInvMutatesBranchState(args);
-  // A symbolic-ref QUERY is exactly `<name>` with only --quiet/--short; -d
-  // (and every abbreviation of --delete) writes, and any unenumerated flag
-  // fails closed rather than being read as a query.
+  // A symbolic-ref QUERY is whatever the WRITE-form predicate says is not a
+  // write — one authoritative reading (see symbolicRefWriteTarget), so a
+  // clustered `-qd`, an unresolved `$R`/`$(…)` operand or a hidden-operand
+  // sentinel can never be judged read-only here while M3 judges it a write.
   if (verb === "symbolic-ref") {
-    return pos.length === 1 && args.every((a) =>
-      !a.startsWith("-") || a === "-q" || a === "--quiet" || a === "-s" || a === "--short");
+    return symbolicRefWriteTarget(args) === null;
   }
   return false;
 }
@@ -6304,7 +7213,12 @@ function _aliasValueMutates(val, aliasName, source) {
   if (!BRANCH_STATE_VERBS.has(verb)) return false; // incl. "git" — scan() owns those
   let callArgs = [];
   if (aliasName && source) {
-    const inv = allGitInvocations(String(source)).find((iv) => iv.verb === aliasName);
+    // ⛔ THE SPELLED WALK, not the expanded one: the call site is the invocation
+    // whose verb is still the alias NAME. See `allGitInvocations`'s
+    // `expandAliases: false` note — expansion renames that verb and merges the
+    // value's own words into its args, so the name-keyed find misses it entirely.
+    const inv = allGitInvocations(String(source), {}, { expandAliases: false })
+      .find((iv) => iv.verb === aliasName);
     if (inv && Array.isArray(inv.args)) callArgs = inv.args;
   }
   return _argAwareBranchStateMutation({ verb, args: [...toks.slice(1), ...callArgs] });
@@ -7055,8 +7969,10 @@ function _effectiveConfig(inv) {
     const eq = ce.indexOf("=");
     if (eq <= 0) continue;
     const name = ce.slice(0, eq), envName = ce.slice(eq + 1);
-    const val = (inv.vars && inv.vars[envName]) ??
-      (inv.envPrefixes || []).map((p) => { const e = p.indexOf("="); return e > 0 && p.slice(0, e) === envName ? p.slice(e + 1) : null; }).find((v) => v !== null) ??
+    // LAST matching prefix wins (bash applies the later assignment); `find`
+    // returned the FIRST and resolved a stale value (review round 3).
+    const val = (inv.envPrefixes || []).map((p) => { const e = p.indexOf("="); return e > 0 && p.slice(0, e) === envName ? p.slice(e + 1) : null; }).filter((v) => v !== null).pop() ??
+      (inv.vars && inv.vars[envName]) ??
       process.env[envName];
     if (val !== undefined && val !== null) cfgArgs.push("-c", `${name}=${val}`);
   }

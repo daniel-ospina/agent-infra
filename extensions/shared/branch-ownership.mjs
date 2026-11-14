@@ -746,7 +746,122 @@ function _branchPositionals(args) {
   return pos;
 }
 
-export function classifyBranchOp(subcmd, args) {
+/**
+ * #594: option-VALUE-slot-aware positionals for `symbolic-ref` / `update-ref`.
+ * Both verbs take `-m <reason>`, and git's parse-options consumes the NEXT
+ * argv as its value (`--reason`/`--message` do not exist — rc 129,
+ * probe-verified git 2.43). A naive `!startsWith("-")` filter reads the REASON
+ * as the first positional and pushes the real ref operand to pos[1], so
+ * `git symbolic-ref -m why refs/heads/victim refs/heads/main` (re-points
+ * victim rc 0, probe-verified) and `git update-ref -m why refs/heads/v HEAD`
+ * both classified op "other" and skipped M3 entirely.
+ * Kept duplicated here on purpose (this module must not import
+ * classify-git.mjs, #99 degradation contract); test-branch-ownership.mjs
+ * cross-pins it against classify-git's `_refVerbPositionals`.
+ * @param {string[]} args
+ * @returns {string[]}
+ */
+function _refVerbPositionals(args) {
+  const a = args || [];
+  const out = [];
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i];
+    const s = String(t ?? "");
+    if (s === "--") {
+      for (let j = i + 1; j < a.length; j++) out.push(a[j]);
+      break;
+    }
+    if (/^-[A-Za-z]+$/.test(s)) {
+      // git merges NOARG shorts into ONE cluster and a `m` takes a value:
+      // `-qm why <name> <ref>` is `-q -m why …` (measured rc 0, symref
+      // re-pointed), while `-md` carries its value INLINE (`-m d`, rc 0). Only
+      // a TRAILING `m` consumes the next argv. Mirror of classify-git's copy.
+      const letters = s.slice(1);
+      const at = letters.indexOf("m");
+      if (at !== -1 && at === letters.length - 1) i++;
+      continue;
+    }
+    if (s.startsWith("-")) continue;
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * #594: a ref NAME this module can reason about. Anything carrying shell syntax
+ * (`$VAR`, `$(…)`, backticks) is UNRESOLVED at classify time — the operand is
+ * whatever the shell expands it to (measured: `R=refs/heads/victimA; git
+ * symbolic-ref $R refs/heads/main` creates the symref, rc 0) — so such a write
+ * FAILS CLOSED rather than reading as "not branch state" (the #805 doctrine).
+ */
+const LITERAL_REF_NAME = /^[A-Za-z0-9._/-]+$/;
+
+/**
+ * #594: the shell tokenizer's COLLAPSED-SUBSTITUTION sentinel — an unquoted
+ * `$(…)` is subject to word splitting, so the walk replaces it AND the rest of
+ * the simple command with one opaque token (measured: `git symbolic-ref
+ * $(printf refs/heads/victim) refs/heads/main` reports args `["$"]` while git
+ * creates the symref). Mirror of classify-git's constant, cross-pinned in
+ * test-branch-ownership.mjs.
+ */
+const COLLAPSED_SUBST_TOKEN = "$";
+
+/**
+ * #594: the WRITE form of `git symbolic-ref`, positionally precise.
+ * One positional is a QUERY (git prints the symref, or fails rc 128 when the
+ * ref is not symbolic); a second positional, or a `-d`/`--delete` (any
+ * unambiguous `--del…` prefix, or a `d` inside a single-dash NOARG cluster —
+ * `-qd`/`-dq` delete rc 0, probe-verified; a cluster's `m` takes the rest of
+ * the token as its VALUE, so `-md` is NOT a delete).
+ * @param {string[]} args
+ * @returns {{name: string, branch: string|null, opaque: boolean}|null}
+ */
+function _symbolicRefWriteTarget(args) {
+  const a = args || [];
+  const deleting = a.some((t) => {
+    const s = String(t ?? "");
+    if (s.startsWith("--")) return /^--d(e(?:l(?:e(?:t(?:e)?)?)?)?)?$/.test(s);
+    if (!/^-[A-Za-z]+$/.test(s)) return false;
+    for (const ch of s.slice(1)) {
+      if (ch === "d") return true;
+      if (ch === "m") break;
+    }
+    return false;
+  });
+  const pos = _refVerbPositionals(a);
+  if (pos.length === 1 && pos[0] === COLLAPSED_SUBST_TOKEN) {
+    return { name: null, branch: null, opaque: true }; // hidden operands
+  }
+  if (!deleting && pos.length < 2) return null;
+  const name = pos[0];
+  if (!name) return null;
+  const m = /^refs\/heads\/(.+)$/.exec(name);
+  return { name, branch: m ? m[1] : null, opaque: !LITERAL_REF_NAME.test(name) };
+}
+
+/**
+ * #594: `--stdin` in every spelling git's parse-options accepts — `update-ref`
+ * has no other `--st…` option, so an unambiguous prefix works (measured rc 0,
+ * ref moved, for `--s`/`--st`/`--std`/`--stdi`), while `--no-stdin` is the
+ * opposite (argv form, rc 129 with no operands).
+ * @param {string} t
+ * @returns {boolean}
+ */
+function _isStdinChannelFlag(t) {
+  const s = String(t ?? "");
+  if (s === "-z") return true;
+  if (!s.startsWith("--")) return false;
+  const name = s.slice(2);
+  if (name.startsWith("no-")) return false;
+  return name.length > 0 && "stdin".startsWith(name);
+}
+
+export function classifyBranchOp(subcmd, args, opts = {}) {
+  // #594 Finding 1: an alias / external-subcommand indirection the guard cannot
+  // resolve (the CLI classifier marks it `aliasOpaque`). git expands the real
+  // command inside its own process, so there is no operation to classify — the
+  // only sound answer is a refusal that names the indirection.
+  if (opts && opts.aliasOpaque === true) return { op: "alias-opaque", name: subcmd ?? null };
   const a = args || [];
   if (subcmd === "checkout" || subcmd === "switch") {
     const flag = (f) => a.includes(f);
@@ -785,12 +900,33 @@ export function classifyBranchOp(subcmd, args) {
     return { op: "switch-existing", target: pos[0] };
   }
   if (subcmd === "symbolic-ref") {
-    const pos = a.filter((x) => !x.startsWith("-"));
-    if (pos[0] === "HEAD") return { op: "switch-existing" };
-    return { op: "other" }; // e.g. refs/remotes/origin/HEAD — not checkout state
+    // #594 Finding 2: classify the WRITE form, positionally precise.
+    //   `symbolic-ref <name>`                      → QUERY (op "other")
+    //   `symbolic-ref [-m why] HEAD <ref>`         → checkout state
+    //   `symbolic-ref [-m why] refs/heads/<b> <t>` → a branch-REF rewrite: it
+    //     re-points <b> at another ref (rc 0, probe-verified) without touching
+    //     any checkout, so it is NOT "switch-existing" (whose #376
+    //     return-to-original arm would re-baseline) — op "ref-write" blocks.
+    //   `symbolic-ref -d <name>` / `-qd <name>`    → delete (write form)
+    //   `symbolic-ref $R <ref>`                    → unresolvable target: the
+    //     same op, blocked (#805 fail-closed doctrine)
+    const w = _symbolicRefWriteTarget(args);
+    if (!w) return { op: "other" }; // query
+    if (w.opaque === true) return { op: "ref-write", target: null };
+    if (w.name === "HEAD") return { op: "switch-existing" };
+    if (w.branch !== null) return { op: "ref-write", target: w.branch };
+    return { op: "other" }; // refs/remotes/… — not checkout state (M4 owns that)
   }
   if (subcmd === "update-ref") {
-    const pos = a.filter((x) => !x.startsWith("-"));
+    // #594: `--stdin` (`-z`, and every unambiguous prefix of --stdin) names no
+    // ref on argv — every update arrives on stdin (`printf 'update
+    // refs/heads/u2 <sha>\n' | git update-ref --stdin` moves the branch rc 0,
+    // probe-verified) → an unverifiable ref write.
+    if (a.some(_isStdinChannelFlag)) {
+      return { op: "ref-write", target: null };
+    }
+    const pos = _refVerbPositionals(a);
+    if (pos[0] && !LITERAL_REF_NAME.test(pos[0])) return { op: "ref-write", target: null };
     if (pos[0] && (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD")) {
       return { op: "switch-existing" };
     }
@@ -1164,6 +1300,61 @@ export function decideM2({
 export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey, stateOpCount = 1, isBare = false, hiddenStateSubst = false, renameDstExists = false, ownedBranches }) {
   if (!branchOp) return null;
   const op = branchOp.op;
+  // #594 Finding 1: `git <word>` where <word> is not a builtin, not an
+  // installed `git-<word>` command, and not a statically-visible alias — git
+  // resolves it as a persisted-config alias, expanding it inside its own process
+  // after every gate has decided. Nothing about it can be verified here, so the
+  // gate refuses it (fail closed).
+  // ⛔ THIS CLASS IS NOT WORKTREE-EXEMPT, so it must not be described as if it
+  // were: `index.ts` deliberately WITHHOLDS the worktree exemption for
+  // `alias-opaque` (the hidden command may carry `-C <hub>` / `--git-dir=<hub>`,
+  // so the resolved worktree proves nothing about where git writes). It is
+  // therefore refused in a LINKED WORKTREE TOO — the class cannot establish the
+  // locality the exemption rests on. (An installed `git-<word>` is NOT this
+  // class: it outranks an alias in git's lookup, so no alias can win for it and
+  // calling it opaque refused `git lfs pull` / `git submodule …` for a shadowing
+  // that cannot happen.)
+  if (op === "alias-opaque") {
+    return {
+      block: true,
+      reason: [
+        `⛔ git alias / unknown-verb invocation blocked (#594).`,
+        `   Why: "git ${branchOp.name ?? "?"}" is not a git command the guard knows and no`,
+        "   `git-" + String(branchOp.name ?? "?") + "` command is installed, so git resolves it as an",
+        "   ALIAS from persisted config. git expands an alias inside its own process,",
+        `   after every gate has decided — a shared checkout cannot be protected`,
+        `   against a command nobody can read.`,
+        `   → Spell the underlying git command out, or repeat it as a VISIBLE`,
+        `     \`-c alias.<name>=…\` in the same command so the guard can read it.`,
+        `   (Working in a linked worktree does NOT exempt this: the hidden command may`,
+        `   carry \`-C <hub>\`, so it cannot prove where git writes. An INSTALLED`,
+        `   \`git-<name>\` command is a different case and is not refused.)`,
+      ].join("\n"),
+    };
+  }
+  // #594 Finding 2: a ref-WRITE whose target the branch-state gate can never
+  // verify — `git symbolic-ref refs/heads/<b> <target>` (re-points an existing
+  // branch ref at another ref, rc 0) and `git update-ref --stdin` (the refs
+  // arrive on stdin). Neither moves a checkout, so NO carve-out applies: not
+  // the own-baseline rename, not the #376 return-to-original re-baseline
+  // (which would corrupt the guard's own baseline), not the #591 benign-force
+  // pass-through (git's "used by worktree" refusal is about the CHECKED-OUT
+  // branch and does not protect a symref re-point).
+  if (op === "ref-write") {
+    return {
+      block: true,
+      reason: [
+        `⛔ Ref write blocked in the MAIN checkout (#594).`,
+        `   Why: ${branchOp.target
+          ? `re-pointing the branch ref "${branchOp.target}" at another ref`
+          : "a ref write whose target is not on the command line (`--stdin`)"}`,
+        `   rewrites a ref shared by every parallel session without changing this`,
+        `   checkout — no gate can tell where it lands, so it is refused here.`,
+        `   → Do ref surgery inside an isolated worktree (using-git-worktrees),`,
+        `     where branch-state mutations are local to that worktree.`,
+      ].join("\n"),
+    };
+  }
   if (op === "create-new") {
     // #626: the agent-infra create-new authorization is REMOVED. Post-#615 (in-
     // main-work exemption gone, hub = main+clean) no legit flow creates a branch

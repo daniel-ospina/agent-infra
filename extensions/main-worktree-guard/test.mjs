@@ -963,6 +963,373 @@ dexpect("symbolic-ref origin → not branchState", `git symbolic-ref refs/remote
 const updTag = classifyGitCommandDetailed(`git update-ref refs/tags/v1 HEAD`);
 dexpect("update-ref tag → not branchState", `git update-ref refs/tags/v1 HEAD`, { branchState: false });
 
+// ── #594 Finding 1: git ALIAS invocation is an indirection the walk must follow ──
+// Measured bypass (probe-verified rc 0, git 2.43): `git -c alias.br='branch -fq
+// victim main' br` moves a FOREIGN branch while the walk reported verb "br" —
+// unknown, not branch-state → verdict allow, branchState false, M3 never
+// entered. statically-visible aliases are now EXPANDED into the walk; aliases
+// whose VALUE is not visible fail closed.
+dexpect("#594 alias -c: checkout alias EXPANDS → block:checkout-branch + branchState",
+  `git -c alias.co='checkout victim' co`,
+  { verdict: "block:checkout-branch", verb: "checkout", branchState: true });
+dexpect("#594 alias -c: branch force-create alias EXPANDS → branchState, branch args",
+  `git -c alias.br='branch -fq victim main' br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victim", "main"] });
+dexpect("#594 alias via --config: same expansion",
+  `git --config alias.sw='switch --discard-changes main' sw`,
+  { branchState: true, stateVerb: "switch" });
+dexpect("#594 persist-then-invoke in ONE command: `git config alias.x … && git x` is BLOCKED (a persisted write cannot be verified)",
+  `git config alias.x 'branch -fq victim main' && git x`,
+  { branchState: true });
+dexpect("#594 GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n definition EXPANDS — but only WITH GIT_CONFIG_COUNT",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victim main' git br`,
+  { branchState: true, verb: "branch" });
+// git reads the numbered pairs ONLY through the GIT_CONFIG_COUNT loop (measured
+// rc 0, round 7): without it the pair is INERT, so harvesting it fabricated a
+// benign definition and let a persisted alias run.
+dexpect("#594-R7a a GIT_CONFIG_KEY_n pair WITHOUT GIT_CONFIG_COUNT is inert → the verb stays opaque",
+  `GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`, { branchState: true, verb: "br" });
+dexpect("#594-R7b GIT_CONFIG_COUNT=0 is the same (pairs ignored) → opaque",
+  `GIT_CONFIG_COUNT=0 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`,
+  { branchState: true, verb: "br" });
+dexpect("#594-R7c control — with GIT_CONFIG_COUNT=1 the pair IS live and expands",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victim main' git br`,
+  { branchState: true, verb: "branch" });
+// ⛔ AND THE PAIR MUST BE IN *THIS COMMAND'S* ENVIRONMENT (review round 8, measured
+// rc 0): the count gate alone was not enough, because `inv.vars` carries plain SHELL
+// assignments too. git ignores an invisible pair SILENTLY, so expanding one fabricates
+// a benign definition and lets a persisted alias run — the same bypass, one spelling
+// further. Measured (git 2.43.0, persisted destructive `alias.br`): the command below
+// created `victimP` rc 0 while the classifier answered `status` / branchState:false.
+// These two rows are RED on the pre-fix code (verb "status" instead of "br").
+dexpect("#594-R8a a pair set by a SEPARATE shell statement (never exported) is invisible to git → the verb stays opaque",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status; git br`,
+  { branchState: true, verb: "br" });
+dexpect("#594-R8b same through `export` — no export flag exists, so the declared FAIL-CLOSED over-block: opaque, not expanded",
+  `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status; git br`,
+  { branchState: true, verb: "br" });
+dexpect("#594-R8c control — the prefix form (git really sees it) still expands, so R8a/R8b pin the SOURCE and not 'pairs are never read'",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.lg GIT_CONFIG_VALUE_0='log --graph' git lg`,
+  { branchState: false, verb: "log" });
+// ⛔ AND THE PAIRS WIN BY **INDEX**, NOT BY SHELL-LINE ORDER (review round 9, measured
+// rc 0). git loops `for (i = 0; i < count; i++)` in `git_config_from_parameters`
+// (`config.c`), so the HIGHEST index wins; iterating the Map in insertion order made
+// the winner "whichever assignment bash wrote last". Measured (git 2.43.0): the row
+// below created `victimR` rc 0 while the classifier answered `status` /
+// branchState:false → M3 never entered → ALLOWED in a shared main checkout. These two
+// rows are RED on the pre-fix code (verb "status" instead of "branch").
+dexpect("#594-R9a pairs resolve by INDEX order — a destructive index-1 definition written FIRST still wins (git ran it)",
+  `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_1=alias.x GIT_CONFIG_VALUE_1='branch -fq victimR main' GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=status git x`,
+  { branchState: true, stateVerb: "branch" });
+dexpect("#594-R9b control — the SAME assignment order with the destructive value at the LOWER index loses to the benign index-1 (git ran `status`)",
+  `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='branch -fq victimS main' GIT_CONFIG_KEY_1=alias.x GIT_CONFIG_VALUE_1=status git x`,
+  { branchState: false, verb: "status" });
+// ── #594 review round 10: `GIT_CONFIG_PARAMETERS`, the channel git parses LAST ──
+// git's `git_config_from_parameters` (`config.c:717`) runs the `GIT_CONFIG_COUNT`
+// loop FIRST (`:741-770`) and then `parse_config_env_list` on
+// `CONFIG_DATA_ENVIRONMENT` (`:772-779`), so a definition in this channel SHADOWS a
+// count pair — the one definition source the resolver never read. Measured (git
+// 2.43.0, throwaway repo): R10a created `victimJ` rc 0 while the pre-fix classifier
+// answered `status`/branchState:false, i.e. ALLOWED in a shared main checkout; R10b
+// is its control and pins the ORDER in the other direction (git ran `status`, the
+// pre-fix classifier over-blocked on `branch`). Both are RED on the pre-fix module.
+dexpect("#594-R10a GIT_CONFIG_PARAMETERS shadows a GIT_CONFIG_COUNT pair — a destructive definition in the channel git reads LAST wins (git ran it)",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimJ main'" git br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimJ", "main"] });
+dexpect("#594-R10b control — the SAME channel with a BENIGN value beats a destructive count pair (git ran `status`); this is what makes R10a pin the ORDER and not 'params are unreadable'",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='branch -fq victimL main' GIT_CONFIG_PARAMETERS="'alias.br=status'" git br`,
+  { branchState: false, verb: "status" });
+dexpect("#594-R10c `-c` still BEATS the channel — git appends `-c` to the SAME env value, so it is parsed last (git ran `status`) and a params-first order fails OPEN",
+  `GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimM main'" git -c alias.br=status br`,
+  { branchState: false, verb: "status" });
+dexpect("#594-R10d the NEW-style `'key'='value'` spelling of the channel (git's `git_config_push_split_parameter`) expands too",
+  `GIT_CONFIG_PARAMETERS="'alias.br'='branch -fq victimH main'" git br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimH", "main"] });
+dexpect("#594-R10e several entries in ONE channel value apply in LIST order — the LAST wins (git ran `victimI`)",
+  `GIT_CONFIG_PARAMETERS="'alias.br=status' 'alias.br=branch -fq victimI main'" git br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimI", "main"] });
+dexpect("#594-R10f control — a BENIGN channel-only alias EXPANDS (`status`) instead of collapsing to opaque: the channel is MODELLED, not merely refused",
+  `GIT_CONFIG_PARAMETERS="'alias.br=status'" git br`,
+  { branchState: false, verb: "status" });
+// The ESCAPED forms inside a quoted run: `'\''` dequotes to `'` and `'\!'` to `!`
+// (`need_bs_quote`, quote.c), so a `!`-prefixed shell alias is still reported as an
+// OPAQUE definition (never expanded) — the round-2 decision, applied to this channel.
+dexpect("#594-R10g a `!`-shell-command value in the channel stays OPAQUE (defined, value unreadable) — never expanded",
+  `GIT_CONFIG_PARAMETERS="'alias.br'='!git branch -fq victimSH main'" git br`,
+  { branchState: true, stateVerb: "br" });
+// ── #594 review round 10: the EXPORTED assignment, and the malformed value ──
+// `inv.vars` cannot tell `A=x` from `export A=x` (round 8's finding, same shape), and a
+// plain shell variable is INVISIBLE to git — so a channel value from there is UNPROVEN
+// and every alias-resolvable verb goes opaque instead of trusting a count pair that
+// git's parse of the real channel would shadow. Measured fail-open before the fix:
+// `export GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimU main'";
+//  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`
+// ran the DESTRUCTIVE alias (rc 0) while the classifier answered `status`/false.
+dexpect("#594-R10h an EXPORTED channel value is unproven — the alias-resolvable verb is OPAQUE (fail closed), not expanded from the count pair git never reached",
+  `export GIT_CONFIG_PARAMETERS="'alias.br=branch -fq victimU main'"; GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`,
+  { branchState: true, stateVerb: "br" });
+dexpect("#594-R10i a MALFORMED channel value (git: `fatal: unable to parse command-line config`, rc 128) leaves an alias-bearing verb OPAQUE, not expanded from a lower-precedence source",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status GIT_CONFIG_PARAMETERS='alias.br=branch -fq victimX main' git br`,
+  { branchState: true, stateVerb: "br" });
+// An INHERITED channel is in the child's environment by construction and git parses
+// it, so the walk must too — otherwise an ambient definition shadows the count pair
+// exactly as R10a does.
+{
+  const saved = process.env.GIT_CONFIG_PARAMETERS;
+  try {
+    process.env.GIT_CONFIG_PARAMETERS = "'alias.br=branch -fq victimAMB main'";
+    dexpect("#594-R10j an INHERITED (ambient) channel definition shadows the count pair too — it is in the child's env by construction",
+      `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status git br`,
+      { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimAMB", "main"] });
+    dexpect("#594-R10j2 control — the ambient channel does not swallow an ordinary read-only verb",
+      `git status`, { verb: "status", branchState: false });
+  } finally {
+    if (saved === undefined) delete process.env.GIT_CONFIG_PARAMETERS;
+    else process.env.GIT_CONFIG_PARAMETERS = saved;
+  }
+}
+// ── #594 review round 10: the alias NAME is case-folded, as git's key is ──
+// For the plain two-level `alias.<name>` key the section and name are
+// case-INSENSITIVE (a QUOTED subsection — the three-level `alias."Name"` form — is
+// case-sensitive, and git REJECTS it in `-c`: measured rc 128). Measured (git
+// 2.43.0, rc 0): the count-pair spelling below created `victimR`, while a
+// case-preserving map read `alias.br`=status and answered `status`/branchState
+// false — ALLOWED in a shared main checkout.
+dexpect("#594-R10k `alias.BR` and `alias.br` are the SAME config key — the later definition wins (git ran `victimR`)",
+  `GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0=status GIT_CONFIG_KEY_1=alias.BR GIT_CONFIG_VALUE_1='branch -fq victimR main' git br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimR", "main"] });
+dexpect("#594-R10l the `-c` spelling of the case-folded key expands to the command git actually runs (`alias.BR` → `branch`) instead of collapsing to an over-blocked opaque verb",
+  `git -c alias.BR='branch -fq victimQ main' br`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimQ", "main"] });
+dexpect("#594 --config-env resolves against the statement's own env prefix",
+  `AL='checkout victim' git --config-env=alias.co=AL co`,
+  { verdict: "block:checkout-branch", verb: "checkout", branchState: true });
+dexpect("#594 a BENIGN visible alias expands (log) and stays harmless",
+  `git -c alias.lg='log --graph' lg`,
+  { verdict: "allow", verb: "log", branchState: false });
+// fail-closed arms: the definition is NOT statically visible (persisted config),
+// it is a `!` shell alias, or its env value cannot be resolved.
+dexpect("#594 persisted-config alias invocation → opaque + branchState (fail closed)",
+  `git br`, { branchState: true });
+// ⛔ P1 (measured false refusal): this row used `git lfs` as its "external
+// subcommand" probe and that probe is ENVIRONMENT-DEPENDENT — `git lfs` is
+// alias-opaque only when NO `git-lfs` is installed, so the row would flip on any
+// box that ships git-lfs. Worse, its stated reason inverted the rule the P1
+// corrected: a RESIDENT `git-<cmd>` outranks the alias, so it is NOT opaque. The
+// probe is now a verb with no `git-<verb>` anywhere — the case an alias CAN win,
+// which is deterministic. (The resident case is pinned in test-module-load.mjs
+// B10p1a/B10p1b, which create the executable and drive the real handler.)
+dexpect("#594 unresolvable non-builtin verb (no `git-<verb>` installed) → opaque + branchState (fail closed)",
+  `git fx594noext pull`, { branchState: true });
+dexpect("#594 `!` shell-command alias → opaque (arbitrary shell text)",
+  `git -c alias.s='!git checkout main' s`, { branchState: true });
+dexpect("#594 unresolvable --config-env alias value → opaque (fail closed)",
+  `git --config-env=alias.co=SOME_UNSET_VAR_594 co`, { branchState: true });
+dexpect("#594 opaque alias is exposed in stateMutations for the M3 gate",
+  `git br`, { stateMutations: [{ verb: "br", args: [], aliasOpaque: true, aliasName: "br", invVisible: true, hints: { cdChain: [], cHints: [], gitDirHint: null, vars: {} } }] });
+// ⛔ GIT'S PRECEDENCE IS BUILTIN > `git-<cmd>` ON PATH > ALIAS (probe-verified,
+// git 2.43): `git -c alias.reset=status reset --hard` runs the BUILTIN
+// `reset --hard`. Expanding a builtin-named definition would classify the
+// destructive command as the IGNORED alias value — a false ALLOW — so those
+// definitions are dropped.
+dexpect("#594 a builtin-named alias definition is IGNORED (git never uses it) — reset --hard still blocks",
+  `git -c alias.reset=status reset --hard`,
+  { verb: "reset", verdict: "block:reset" });
+dexpect("#594 a builtin-named alias cannot mask `checkout <other>`",
+  `git -c alias.checkout='status' checkout victim`,
+  { verb: "checkout", verdict: "block:checkout-branch", branchState: true });
+
+// ── #594 Finding 2: symbolic-ref refs/heads/<b> + the -m/--stdin channels ──
+// `git symbolic-ref refs/heads/victim refs/heads/main` re-points an EXISTING
+// branch ref rc 0 (probe-verified) while the old classifier only ever named
+// `HEAD` as branch state → op "other" → M3 skipped entirely.
+dexpect("#594 symbolic-ref refs/heads/<b> write → branchState",
+  `git symbolic-ref refs/heads/victim refs/heads/main`,
+  { branchState: true, stateVerb: "symbolic-ref" });
+dexpect("#594 symbolic-ref -d refs/heads/<b> (delete) → branchState",
+  `git symbolic-ref -d refs/heads/victim`, { branchState: true });
+dexpect("#594 symbolic-ref QUERY (one positional) stays non-branch-state",
+  `git symbolic-ref refs/heads/main`, { branchState: false });
+dexpect("#594 symbolic-ref bare HEAD QUERY stays non-branch-state",
+  `git symbolic-ref HEAD`, { branchState: false });
+// `-m <reason>` consumes the NEXT argv: a naive non-flag scan read the REASON as
+// the first positional, so the write looked like a query of a ref named after
+// the message (probe-verified rc 0 for both verbs).
+dexpect("#594 symbolic-ref -m <reason> refs/heads/<b> write → branchState (value slot)",
+  `git symbolic-ref -m why refs/heads/victim refs/heads/main`, { branchState: true });
+dexpect("#594 symbolic-ref -m <reason> HEAD <ref> write → branchState (value slot)",
+  `git symbolic-ref -m why HEAD refs/heads/feat/x`, { branchState: true });
+dexpect("#594 update-ref -m <reason> refs/heads/<b> write → branchState (value slot)",
+  `git update-ref -m why refs/heads/victim HEAD`, { branchState: true });
+dexpect("#594 update-ref --stdin → branchState (refs arrive on stdin)",
+  `git update-ref --stdin`, { branchState: true });
+dexpect("#594 update-ref refs/tags with -m stays non-branch-state (control)",
+  `git update-ref -m why refs/tags/v1 HEAD`, { branchState: false });
+
+// ── #594 review round 1: FIVE measured bypasses the first cut left open ──
+// Each was reproduced against git 2.43 before it was fixed; each is now pinned
+// so the fix cannot be reverted silently.
+dexpect("#594-1 the LAST alias definition wins (a benign early `-c` must not launder a destructive later one)",
+  `git -c alias.yy=status -c alias.yy='branch -fq victim9 main' yy`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victim9", "main"] });
+dexpect("#594-1b and when the LAST definition is benign, that is what runs (git's own precedence)",
+  `git -c alias.zz='branch -fq v m' -c alias.zz=status zz`,
+  { verb: "status", branchState: false });
+// `update-ref` has no other `--st…` option, so git takes any unambiguous prefix
+// of `--stdin` (measured rc 0, ref moved, for --s/--st/--std/--stdi).
+dexpect("#594-2 `update-ref --stdi` (unambiguous prefix of --stdin) → branchState",
+  `git update-ref --stdi`, { branchState: true });
+dexpect("#594-2b `update-ref --s` (shortest accepted prefix) → branchState",
+  `git update-ref --s`, { branchState: true });
+dexpect("#594-2c `update-ref --no-stdin` is the opposite (argv form, rc 129 alone) → not state",
+  `git update-ref --no-stdin`, { branchState: false });
+// git merges NOARG shorts into ONE cluster: `-qd`/`-dq` delete the symref rc 0.
+dexpect("#594-3 `symbolic-ref -qd <ref>` (clustered delete) → branchState",
+  `git symbolic-ref -qd refs/heads/victim`, { branchState: true });
+dexpect("#594-3b `symbolic-ref -dq <ref>` → branchState",
+  `git symbolic-ref -dq refs/heads/victim`, { branchState: true });
+dexpect("#594-3c `-md` is `-m d` (the m VALUE), not a delete — but the 2-positional form is still a write",
+  `git symbolic-ref -md refs/heads/sym3 refs/heads/main`, { branchState: true });
+// An unresolved operand names no ref the gate can read → fail closed.
+dexpect("#594-4 `symbolic-ref $R <target>` (variable ref) → branchState (fail closed)",
+  `RR=refs/heads/victimA; git symbolic-ref $RR refs/heads/main`, { branchState: true });
+dexpect("#594-4b `symbolic-ref $(…) <target>` (unquoted substitution, collapsed to the walk's `$` sentinel) → branchState",
+  `git symbolic-ref $(printf refs/heads/victimB) refs/heads/main`, { branchState: true });
+dexpect("#594-4c `update-ref $R HEAD` (variable ref) → branchState (fail closed)",
+  `RR=refs/heads/x; git update-ref $RR HEAD`, { branchState: true });
+dexpect("#594-4d control — a ONE-positional query of a computed name cannot mutate → not state",
+  `RR=refs/heads/x; git symbolic-ref $RR`, { branchState: false });
+// The carve-out is exempted by IDENTITY and index.ts returns at the first
+// reBaseline, so a sibling the read-only test wrongly admits is never gated
+// (#1144 F1). Read-only-ness must therefore come from the SAME write predicate:
+// an unresolved/collapsed operand is a WRITE, so it can never ride a
+// `git checkout <original> && …` compound.
+dexpect("#594-5 `checkout main && symbolic-ref <refs/heads> <target>` refuses the carve-out",
+  `git checkout main && git symbolic-ref refs/heads/v2 refs/heads/main`,
+  { branchState: true, stateCarveOutClean: false });
+dexpect("#594-5b `checkout main && symbolic-ref $(…) …` refuses the carve-out (hidden operands)",
+  `git checkout main && git symbolic-ref $(printf refs/heads/v) refs/heads/main`,
+  { stateCarveOutClean: false });
+dexpect("#594-5c `checkout main && update-ref --stdin` refuses the carve-out",
+  `git checkout main && git update-ref --stdin`, { stateCarveOutClean: false });
+dexpect("#594-5d control — `checkout main && symbolic-ref HEAD` (a QUERY) keeps the carve-out clean",
+  `git checkout main && git symbolic-ref HEAD`, { stateCarveOutClean: true });
+
+// ── #594 review round 2: FOUR measured fail-opens in the round-1 fix ──
+// (a) a non-builtin verb is NOT a builtin: git falls back to `git-<name>` and
+// then to the alias, so listing those names as builtins both dropped their
+// alias definitions AND trusted the invocation (measured: `git p4` moved a ref
+// rc 0 with no `git-p4` installed).
+dexpect("#594-R2a `git -c alias.p4='branch -fq victimP main' p4` EXPANDS (p4 is not a builtin)",
+  `git -c alias.p4='branch -fq victimP main' p4`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimP", "main"] });
+dexpect("#594-R2a2 a bare non-builtin verb (`git p4`, `git gui`) is opaque, not trusted",
+  `git gui`, { branchState: true });
+// (b) definitions accumulate in SEGMENT ORDER: a benign definition later in the
+// command must not reclassify an earlier destructive invocation.
+dexpect("#594-R2b destructive alias in segment 1, benign redefinition in segment 2 → segment 1 still classified",
+  `git -c alias.x='branch -fq victimA main' x && git -c alias.x=status x`,
+  { branchState: true, stateVerb: "branch" });
+dexpect("#594-R2b2 benign alias in segment 1, destructive redefinition in segment 2 → segment 2 classified",
+  `git -c alias.x=status x && git -c alias.x='branch -fq victimA main' x`,
+  { branchState: true, stateVerb: "branch" });
+// (c) git merges NOARG shorts into ONE cluster and a TRAILING `m` takes the
+// NEXT argv — `-qm why` and `-qqm why` are `-m why` (measured rc 0).
+dexpect("#594-R2c `symbolic-ref -qm why <ref> <target>` → branchState (clustered -m value slot)",
+  `git symbolic-ref -qm why refs/heads/victim refs/heads/main`,
+  { branchState: true, stateVerb: "symbolic-ref" });
+dexpect("#594-R2c2 `symbolic-ref -qqm why …` → branchState",
+  `git symbolic-ref -qqm why refs/heads/qm2 refs/heads/main`, { branchState: true });
+dexpect("#594-R2c3 `update-ref -dm why <ref> HEAD` → branchState (clustered delete + -m value)",
+  `git update-ref -dm why refs/heads/victimD HEAD`, { branchState: true });
+dexpect("#594-R2c4 `symbolic-ref -md <ref> <target>` (= `-m d`) → branchState via its positionals",
+  `git symbolic-ref -md refs/heads/P3 refs/heads/main`, { branchState: true });
+// (d) a per-command env prefix beats an earlier shell assignment (bash
+// semantics, measured: the destructive alias ran).
+dexpect("#594-R2d per-command env prefix wins over the statement var for --config-env",
+  `EE=status; EE='branch -fq victimZ main' git --config-env=alias.q=EE q`,
+  { branchState: true, stateVerb: "branch" });
+
+// ── #594 review round 3: ORDERING inside git's ONE config list ──
+// The LAST matching env prefix wins (bash applies the later assignment), and
+// `-c` / `--config-env` are ONE argv-ordered list — array-by-array passes read
+// the wrong definition in both directions (measured rc 0, ref moved).
+dexpect("#594-R3a the LAST per-command env prefix wins (`E=status E='branch -fq …'`)",
+  `EE=status EE='branch -fq victimDUP main' git --config-env=alias.x=EE x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimDUP", "main"] });
+dexpect("#594-R3b a later `-c` beats an earlier `--config-env` (argv order)",
+  `EE=status git --config-env=alias.x=EE -c alias.x='branch -fq victimMIX main' x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimMIX", "main"] });
+dexpect("#594-R3c control — a later `--config-env` beats an earlier `-c` (benign value wins, as git runs it)",
+  `EE=status git -c alias.x='branch -fq victimMIX2 main' --config-env=alias.x=EE x`,
+  { verb: "status", branchState: false });
+
+// ── #594 review round 4: definition LIFETIMES, and the builtins-only census ──
+// A `-c` ends with its own process, so it must not reclassify a LATER segment —
+// measured: `git -c alias.br=status br && git br` ran the PERSISTED (destructive)
+// alias.br in segment 2, while a command-global map had it as `status`.
+dexpect("#594-R4a a transient `-c` does not leak into the next segment (segment 2 stays opaque)",
+  `git -c alias.br=status br && git br`, { branchState: true });
+dexpect("#594-R4b a `git config -f <other-file>` write is not visible to a later plain `git br`",
+  `git config -f /tmp/pm594-other.cfg alias.br status && git br`, { branchState: true });
+dexpect("#594-R4c a PLAIN `git config alias.br status && git br` is opaque too — a persisted value cannot be shadow-checked",
+  `git config alias.br status && git br`, { branchState: true });
+dexpect("#594-R4d `git config --unset alias.br && git br` leaves definedness unknown → opaque",
+  `git config --unset alias.br && git br`, { branchState: true });
+
+// ── #594 review round 5: SCOPES, the env-pair order, deprecated builtins ──
+// git's config order is system→global→LOCAL→worktree→cmdline, so a `--global`
+// (or a `-C <other-repo>`) write cannot prove what a later plain `git br`
+// resolves — the pre-existing repo-local alias still wins and RUNS.
+dexpect("#594-R5a a `--global` alias write cannot license a later `git br` (local scope still wins)",
+  `git config --global alias.br status && git br`, { branchState: true });
+dexpect("#594-R5b a `-C <other-repo>` alias write lands in another repo → later `git br` opaque",
+  `git -C /tmp/pm594-other-repo config alias.br status && git br`, { branchState: true });
+// git parses the GIT_CONFIG_COUNT loop BEFORE pushing -c into
+// GIT_CONFIG_PARAMETERS, so `-c` beats a GIT_CONFIG_KEY_n pair.
+dexpect("#594-R5c `-c` beats a GIT_CONFIG_KEY_n/VALUE_n pair (git's own parse order)",
+  `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=status git -c alias.x='branch -fq victimQ main' x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimQ", "main"] });
+// git.c consults the ALIAS before the builtin for the DEPRECATED commands.
+dexpect("#594-R5d the DEPRECATED builtin `whatchanged` resolves to its ALIAS (alias wins there)",
+  `git -c alias.whatchanged='branch -fq victimW main' whatchanged`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimW", "main"] });
+dexpect("#594-R5e control — a NON-deprecated builtin name is still the builtin (alias ignored)",
+  `git -c alias.reset=status reset --hard`, { verb: "reset", branchState: false });
+// The census is `git --list-cmds=builtins` and NOTHING else: a `main` command
+// (`filter-branch`, `subtree`, `submodule`, …) is an external `git-<name>` that
+// git can fall back to an alias for, so treating one as a builtin is fail-OPEN.
+dexpect("#594-R4e a non-builtin `main` command name EXPANDS its alias (`filter-branch`)",
+  `git -c alias.filter-branch='branch -fq v1 main' filter-branch`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "v1", "main"] });
+// ⛔ P1 (measured FALSE REFUSAL) — and the census argument above is only HALF the
+// rule, so it is stated fully here: a `main` command is not a builtin, which is why
+// it must not be LISTED as one (that would DROP a defined alias — `#594-R4e`
+// above). It is also a RESIDENT `git-<name>` in `<git --exec-path>` (`git-subtree`,
+// `git-submodule` are both installed there on this box), and git's precedence is
+// builtin > external > alias: no alias can win its lookup. Treating it as
+// alias-OPAQUE therefore refused a legitimate command — `git subtree pull`, a
+// post-clone `git submodule update --init` — in EVERY checkout, for a shadowing
+// that cannot happen. The row now pins the correct direction, and `#594-R4e3` pins
+// the fail-closed half for a name nothing can resolve.
+dexpect("#594-R4e2 a resident non-builtin (`git subtree`) is NOT alias-opaque — no alias can shadow it (P1)",
+  `git subtree add -P x y`, { branchState: false });
+dexpect("#594-R4e3 a non-resident non-builtin (no `git-<verb>` anywhere) IS opaque + branchState (fail closed)",
+  `git fx594noext add -P x y`, { branchState: true });
+// The SAME two defects reachable through spellings the round-3 rows above do not walk: a
+// duplicated prefix handed through `env` (its assignments are argv, not the shell's), and the
+// SPACE form of `--config-env`. Both were measured FAIL-OPEN at `bd0ecbeca` (bState=false) and
+// are green only after the ordered-config fix — so each is a pin the fix must keep, not a
+// restatement of R3a/R3b. (The review's own reproducer spelled the FIRST one with the verb
+// `mix` while defining `alias.x`, which git rejects rc 129; the MECHANISM is real and is what
+// these two rows pin, measured against git 2.43.0 with `x`.)
+dexpect("#594-R3d a duplicated prefix handed through `env` — the LAST one wins too",
+  `env Z=status Z='branch -fq victimENV main' git --config-env=alias.x=Z x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimENV", "main"] });
+dexpect("#594-R3e the SPACE form of `--config-env` keeps its argv position against a later `-c`",
+  `EE=status git --config-env alias.x=EE -c alias.x='branch -fq victimSP main' x`,
+  { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "victimSP", "main"] });
+
 // commit matcher (commit-graph/commit-tree EXCLUDED)
 dexpect("commit → block:commit", `git commit -m x`, { verdict: "block:commit", verb: "commit" });
 dexpect("add+commit → block:commit (detailed)", `git add . && git commit -m 'x'`, { verdict: "block:commit" });
