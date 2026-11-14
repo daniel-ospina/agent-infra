@@ -1112,7 +1112,7 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh|*/key-gate.sh) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh|*/key-gate.sh|*/turn-end.py) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -1221,6 +1221,24 @@ if grep -qE -e "$_kg_flag" <<<"$_kg_code" && grep -qF -- '--no-session' <<<"$_kg
 ck "the excluded key-gate.sh is a NON-launcher in CODE (the pi token pair lives in its printf remedy strings, so what matched is prose), so its census exclusion hides no launch path" $rc
 if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' <<<"$_kg_code"; then rc=1; else rc=0; fi
 ck "the excluded key-gate.sh carries no spawn primitive, so its census exclusion hides no launch path" $rc
+# ⛔ `turn-end.py` IS THE SIXTH OF THAT CLASS, AND IT LANDED ON `main` AFTER THIS CENSUS (#4048,
+# `f0d33db75`) — it made `bash-suites` RED on `main` for every PR that rebased onto it, the fifth time
+# this exact shape has done so. It is the t6-route module: it reads triage EVIDENCE and refuses to
+# nudge a lane it cannot prove steerable, which is why it carries `pi -p --no-session` in its
+# docstrings (`:587`, `:688`) and why that is prose, not a launch. Its spawn primitives are
+# `subprocess.run` for git/JSON CLIs, so neither arm above fits; the assertion is the argv the census
+# keys on — the file must carry NO quoted `pi` command token, which is what any real launch it grew
+# would have to name (a `pi` assembled purely from variables is the detector's own STATED LIMIT,
+# already declared above, not a new one).
+# ⛔ THE PATH IS `../turn-end.py`, NOT `./turn-end.py` (this change's review, P2-1). `turn-end.py`
+# lives in the repo's `scripts/`, not in this harness dir, so the original spelling named a file that
+# does not exist; `sed` with stderr dropped returned EMPTY, `grep -qE` on an empty string returns 1, and
+# the arm therefore passed UNCONDITIONALLY ON ANY TREE — a false PASS in the one census whose job is to
+# be the place a second `pi` launcher cannot hide. Proved by mutation: appending `x = ["pi", "-p"]` to a
+# scratch copy of `scripts/turn-end.py` now reds this arm, where before it stayed green.
+_tn_code="$(sed 's/#.*//' "$HERE/../turn-end.py" 2>/dev/null)"
+if grep -qE "[\"']pi[\"']" <<<"$_tn_code"; then rc=1; else rc=0; fi
+ck "the excluded turn-end.py is a NON-launcher (no quoted 'pi' command token; the pi token pair lives in its docstrings), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -2541,6 +2559,68 @@ grep -q 'VERSION SKEW' "$LOG"; rc=$?
 ck "...and the remedy names what a usage error actually is — helper/consumer skew, not the extension set" $rc
 grep -q 'do NOT dispatch the item elsewhere' "$LOG"; rc=$?
 ck "...and says the refusal is NOT a box property, so a peer must not be handed the item" $rc
+# (g2b) A STALE CHECKOUT IS NOT A CAPACITY SHORTFALL (#3932). The reason had no arm, so it took the
+# generic *"the reading above names the refusal"* arm and the caller published the 71 text — "dispatch
+# the issue to another box" — for a fault the measurement found on EVERY cell (496-7093 commits
+# behind). The item then circulates between cells that refuse identically and is never built. The
+# refusal itself is correct (no agent was started, nothing consumed): it is the REMEDY that was wrong.
+# (g2b) A STALE CHECKOUT IS NOT A CAPACITY SHORTFALL (#3932). The reason had no arm, so it took the
+# generic *"the reading above names the refusal"* arm and the caller published the 71 text — "dispatch
+# the issue to another box" — for a fault the measurement found on EVERY cell (496-7093 commits
+# behind). The item then circulates between cells that refuse identically and is never built. The
+# refusal itself is correct (no agent was started, nothing consumed): it is the REMEDY that was wrong.
+# ⛔ AND THE REMEDY ALONE WAS NOT ENOUGH (this change's review, P1-2): the CODE was still 71, and every
+# reader maps 71 to a property of THIS box — `lane.sh` minted `state/capacity-refused-<N>` and the
+# controller stood down so a PEER could take the item, while this line said "do NOT assume a peer is
+# current". Two surfaces, contradictory instructions, one refusal. So the arm pins the CODE too.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=stale-code host=x answered_ms=900 attempts=1 bound=45s repo=tortoise behind=542 max_behind=50' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 85 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a stale-checkout refusal starts NO agent and exits its OWN code 85, not 71 (rc=$CRC)" $rc
+grep -q 'more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main' "$LOG"; rc=$?
+ck "...and its remedy names the reading instead of the generic one" $rc
+grep -q 'do NOT assume a peer is current' "$LOG"; rc=$?
+ck "...and does not hand the item to a peer, because the measured fleet was stale on every cell" $rc
+# …and its code is DISTINCT from the capability one, which is what makes `lane.sh`/`orch-loop.sh`
+# publish the checkout remedy: a shared code would put the peer-yield text back on a different line.
+{ [ "$CRC" -ne 71 ] && [ "$(printf '%s\n' "$CRC")" != "$(codes_for_name AGENT_CAPABILITY_REFUSED)" ]; }; rc=$?
+ck "...which is NOT the capability code (capability=$(codes_for_name AGENT_CAPABILITY_REFUSED), stale=$CRC)" $rc
+# (g2c) AN UNMEASURABLE STALENESS READ IS ANNOUNCED (this change's review, P2-3). `behind=unknown` is
+# admitted by design — an unanswerable network read is a WARN, the same doctrine as `no-answer` — but it
+# was admitted SILENTLY: no log line, no counter, while `why=no-answer` gets an explicit WARN. So a
+# readiness field that measured nothing looked exactly like one that measured `0`, and every route to
+# `unknown` (no checkout resolved, a failed/killed fetch, no default branch) is a box that is MORE
+# likely stale, not less. The spawn is still ADMITTED: this is loudness, not a new refusal.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=ok host=x answered_ms=900 returned_ms=950 attempts=1 bound=45s key=env repo=none behind=unknown reason=no-checkout tried=pwd,HOME/tortoise' 0
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "an unmeasurable staleness read still ADMITS the spawn (rc=$CRC, agent ran) — it is a WARN, not a refusal" $rc
+grep -q 'staleness reading is UNMEASURABLE' "$LOG"; rc=$?
+ck "...but it is ANNOUNCED, so an inert staleness check is not silent" $rc
+grep -q 'behind=unknown' "$LOG"; rc=$?
+ck "...naming the reading, so the operator can tell 'measured 0' from 'measured nothing'" $rc
+# …and the CONTROL: a MEASURED ok line stays quiet, so the WARN cannot be satisfied by always warning.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=ok host=x answered_ms=900 returned_ms=950 attempts=1 bound=45s key=env repo=tortoise behind=3' 0
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 0 ] && ! grep -q 'UNMEASURABLE' "$LOG"; }; rc=$?
+ck "...while a MEASURED reading (behind=3) is admitted with no such WARN (control)" $rc
+# ⛔ ABSENCE OF THE FIELD IS THE OTHER UNMEASURABLE SHAPE, AND IT WAS THE SILENT ONE (this change's
+# review, P2-2). A probe deployed before this field existed emits `ok … key=env` with no `behind=` at
+# all; it matched nothing, so the spawn was admitted with ZERO log lines while the property (g2c) is
+# named for held only on the `behind=unknown` path. And the skew direction is the LIKELY one: `$O` is
+# seeded FILE BY FILE, so a caller here routinely runs against a probe older than itself.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=ok host=x answered_ms=900 returned_ms=950 attempts=1 bound=45s key=env' 0
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 0 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "an OLD probe with NO staleness field still ADMITS the spawn (rc=$CRC, agent ran) — it is a WARN, not a refusal" $rc
+grep -q 'NO staleness field at all' "$LOG"; rc=$?
+ck "...but it is ANNOUNCED too, so the second unmeasurable shape is not silent either" $rc
+grep -q 'reason=no-reading-field' "$LOG"; rc=$?
+ck "...naming the missing field, and that the cause is HELPER/CONSUMER SKEW rather than a reading" $rc
 # (g3) A REFUSAL'S READING IS NOT ITS VERDICT (follow-up to #2991, P3, measured). `why=no-return` and
 # `why=call-failed` end in `tail=<last 240 bytes of pi's own output>`, and the arms above were chosen
 # by a substring test over the WHOLE line — so a deterministic refusal whose tail happened to embed
@@ -2783,7 +2863,7 @@ chain_probe() { # <gate-word> -> sets CHAIN_RC and CHAIN_REMEDY (the gate the ch
 }
 # `<gate-word>:<CONSTANT-NAME>` — the value is read from the helper, so a RENUMBER here is followed
 # rather than pinned twice, and an absent constant shows up as an empty `want` (red), not as a pass.
-_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED key:KEY_GATE_REFUSED mem:AGENT_MEM_REFUSED"
+_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED key:KEY_GATE_REFUSED mem:AGENT_MEM_REFUSED stale:AGENT_STALE_CODE_REFUSED"
 _seen=""; _exercised=""
 for _pair in $_gate_expected; do
   _g="${_pair%%:*}"; _c="${_pair##*:}"
@@ -3767,6 +3847,7 @@ ck "the REAL deploy unit reports NOTHING unparseable, NO stale reader default an
 # this row drives it, so the collision cannot be merged into main a second time without a red.
 _fixer_arms="AGENT_BRIEF_REFUSED:BRIEF gate
 AGENT_CAPABILITY_REFUSED:CAPABILITY gate
+AGENT_STALE_CODE_REFUSED:STALE-CODE gate
 AGENT_FORK_REFUSED:fork gate
 AGENT_LOAD_REFUSED:load gate
 AGENT_DISK_REFUSED:disk gate
@@ -3906,6 +3987,27 @@ while IFS= read -r _row; do
   _armwhy=""
   [ "$rc" -eq 0 ] || _armwhy=" | fixer said: $(tail -2 "$_armdir/arm-$_ac.out" 2>/dev/null | tr '\n' ' ' | cut -c1-240)"
   ck "fix-one.sh NAMES '$_aw' when the gate returns $_ac ($_av) and REPUBLISHES that code (read: '${_armgot:-<no refusal line>}', rc=$_arc)$_armwhy" $rc
+  # ⛔ AND ON THE STALE-CODE ROW, THE REMEDY MUST MATCH THE ARTIFACT THIS PATH MEASURED (#3932's review,
+  # P2-4). `run_agent` is given `WIP_PATH="$WT"` above, so the probe measured the FIXER'S WORKTREE — a
+  # worktree on the PR BRANCH. The base-path sentence ("git fetch, then cut the worktree from origin/main")
+  # is DESTRUCTIVE there: it discards the very PR the fixer was dispatched to repair, for the state (a PR
+  # branch far behind main) that gets a fixer dispatched in the first place. So this row asserts the SHAPE
+  # of the advice, not just its presence: the fixer is told to MERGE origin/main into the branch, and the
+  # re-cut instruction is absent. Both needles are absent from every other arm's text, so the pair cannot
+  # be satisfied by a different gate's wording.
+  if [ "$_ac" = "AGENT_STALE_CODE_REFUSED" ]; then
+    _stale_txt="$(cat "$RO/logs/fix-7.log" 2>/dev/null)"
+    case "$_stale_txt" in
+      *"merge origin/main"*) rc=0 ;;
+      *) rc=1 ;;
+    esac
+    ck "fix-one.sh's STALE-CODE remedy tells the FIXER to integrate origin/main into the PR BRANCH — the artifact this path actually measured (read: '$(printf '%s' "$_stale_txt" | grep -o 'bring the branch up to date[^;]*' | head -1)')" $rc
+    case "$_stale_txt" in
+      *"cut the worktree from origin/main"*) rc=1 ;;
+      *) rc=0 ;;
+    esac
+    ck "…and it does NOT tell the operator to RE-CUT that worktree from origin/main, which on a fixer discards the PR's own commits (#3932 review P2-4)" $rc
+  fi
   _armseen="$_armseen ${_ac}=driven"
 done <<< "$_fixer_arms"
 # The assertion `_armseen` exists for. One token per row, so `wc -w` counts rows; a row that falls
@@ -3919,6 +4021,36 @@ _armacct="$(printf '%s' "$_armseen" | wc -w | tr -d ' ')"
 case " $_armseen " in *"=driven "*) _armdriven=1 ;; *) _armdriven=0 ;; esac
 { [ "$_armacct" -eq "$_armrows" ] && [ "$_armdriven" -eq 1 ]; }; rc=$?
 ck "every arm-table row is ACCOUNTED FOR after the drive — driven or explicitly forward-declared, and at least ONE driven (rows: $_armrows, accounted: $_armacct —$_armseen)" $rc
+
+# ⛔ AND EVERY CODE THE FIXER CLASSIFIES MUST HAVE AN ARM IN `adopt-fix.sh`, WHICH IS A SEPARATE READER
+# (#3932's review, P2). `fix-one.sh` PROPAGATES the gate's own status, and `adopt-fix.sh` is the log a
+# MANUAL operator reads (#1720): an unclassified code reaches that log as NO LINE — a run that did nothing,
+# silently — which is the defect `adopt-fix.sh`'s own 71 arm records, and the one 85 landed in when it was
+# added (measured: adopt-fix had arms for 81/73/75/71/72/77 and none for 83, 85 or 80). The census is
+# DERIVED from this file's own arm table, so a future gate cannot be added to the classifier and left
+# unclassified here without a red — which is the property, not the three arms it currently buys.
+_af_logok=1; _af_missing=""
+while IFS= read -r _row; do
+  [ -n "$_row" ] || continue
+  _ac="${_row%%:*}"
+  _av="$(codes_for_name "$_ac")"
+  [ -n "$_av" ] || continue          # forward-declared: the gate is not on this tree yet
+  # ⛔ MATCH THE ARM FORM, NOT THE CONSTANT'S NAME (this change's review, P2-2). `grep -qE "(${_ac}|= \"${_av}\")"`
+  # accepted the NAME ANYWHERE in the file — a comment mentioning `AGENT_X` satisfied it, and so did any
+  # unrelated `= "85"`. Measured by mutation on a scratch copy of the real adopt-fix.sh: deleting the
+  # `elif [ "$rc" = "${AGENT_STALE_CODE_REFUSED:-85}" ]` arm and leaving only `# NOTE: … (85) still needs
+  # an arm here` left this census GREEN, so adopt-fix would write NO LINE for 85 (the #1720 silence the
+  # census exists to prevent) while claiming every classified code has an arm.
+  # The pattern below is the two real forms and nothing else: the tolerant constant `${NAME:-NN}` or the
+  # bare literal `NN`, both inside a `[ "$rc" = … ]` test. Both are in use (`:99` constant, `:108`
+  # literal) and the literal form is not rewritten here — `disk-admission.test.sh` slices that arm by its
+  # literal — so this guard accepts both rather than forcing a cosmetic edit through a live test.
+  if ! grep -qE "\[ \"\\\$rc\" = \"(\\\$\{${_ac}:-${_av}\}|${_av})\" \]" "$HERE/adopt-fix.sh"; then
+    _af_logok=0; _af_missing="$_af_missing ${_ac}=${_av}"
+  fi
+done <<< "$_fixer_arms"
+{ [ "$_af_logok" -eq 1 ]; }; rc=$?
+ck "every code the FIXER classifies has an arm in adopt-fix.sh, the log a manual operator reads — an unclassified code writes NO LINE there (missing:${_af_missing:- none})" $rc
 
 # ── 11) the DISK gate (#1765) ─────────────────────────────────────────────
 # The measured incident: pi-lane-1 hit 100% twice — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`,

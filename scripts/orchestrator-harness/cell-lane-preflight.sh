@@ -77,6 +77,32 @@
 #   --model/--provider   mirror the launcher's pair. Default `${PI_LANE_MODEL:-deepseek-flash}` /
 #                   `${PI_LANE_PROVIDER:-deepseek}` — the SAME contract as lane-exec.sh and
 #                   spawn-gate.sh::run_agent, so the probe measures the model the lane will run.
+#   --repo <path>   the checkout to measure for the staleness reading (#3932). Same value as
+#                   `CELL_PREFLIGHT_REPO`, and it wins over it. NOT a way to switch the field off: a
+#                   named path that is not a checkout is reported (`repo=none … reason=not-a-checkout`),
+#                   never silently replaced by a guess. (`spawn-gate.sh`'s own spawn point names the
+#                   checkout through `CELL_PREFLIGHT_REPO` instead of this flag, on purpose: `$O` is
+#                   seeded file by file, so a caller passing a flag a deployed copy predates makes that
+#                   copy exit 2 `why=usage` — a version skew that would refuse every spawn.)
+#
+# ENVIRONMENT (the staleness reading, #3932 — the THRESHOLD and the BOUND have no flag, because they
+# are policy, not a reading: a caller must not be able to turn its own readiness field off. Naming the
+# checkout is a different thing, and it has one):
+#   CELL_PREFLIGHT_REPO        the checkout to measure. Resolution order, first that EXISTS:
+#                              `--repo`, then `${CELL_PREFLIGHT_REPO}`, then `$PWD` (for a lane that is
+#                              the worktree it will build on), then `${CELL_HOME}/agent-infra`, then
+#                              the cell literals (`/tmp/cell-ai`, `/tmp/cell-t3`), then `$HOME/tortoise`,
+#                              `$HOME/agent-infra`. ⛔ THE ORDER IS LOAD-BEARING, so this line states
+#                              the CODE's order and not a tidier one: `${CELL_HOME}/agent-infra` must
+#                              outrank the `/tmp/cell-*` literals, because on a cell BOTH exist and the
+#                              literals name a checkout the lane does not build on — reading them first
+#                              measures the harness repo (or a live tortoise) while the lane builds the
+#                              other. `resolve_repo`'s own `tried=` note reports this same order.
+#                              Nothing found is `repo=none behind=unknown` — reported, never refused.
+#   CELL_PREFLIGHT_MAX_BEHIND  refuse when the checkout is MORE than this many commits behind
+#                              `origin/main`. Default 50.
+#   CELL_PREFLIGHT_FETCH_BOUND the fetch gets this many seconds before it is killed and the reading
+#                              becomes `behind=unknown`. Default 12.
 #
 # EXIT
 #   0  CAPABLE   — answered AND returned within the bound
@@ -96,7 +122,9 @@
 #                      (a caller passing a flag this copy predates), and the remedy says so.
 #   every other refused reason ⇔ deterministic: `exit-hang` / `no-return` (still alive at the bound,
 #                      with or without the answer), `call-failed` (answered, then errored),
-#                      `keys-unreadable`, `pi-missing`, `misconfigured`. A caller must REFUSE on these.
+#                      `keys-unreadable`, `pi-missing`, `misconfigured`, `stale-code` (the box answers,
+#                      but its checkout is more than `CELL_PREFLIGHT_MAX_BEHIND` commits behind
+#                      `origin/main` — #3932). A caller must REFUSE on these.
 #   `no-return` is the one this file had to grow: a box whose provider is blackholed, whose proxy
 #   drops, or whose extension set hangs BEFORE the first token never produces a token, so before it
 #   existed that box could only ever emit `no-answer` — the WARN arm — and the gate was vacuous for
@@ -139,6 +167,118 @@ emit() {
 # `run_agent`, `rc=0, agent launched` — a lane dispatched by a probe that never measured anything,
 # against this file's own EXIT table ("2 CANNOT MEASURE — EVERY caller must refuse too"). The exit
 # code stays 2 (it IS cannot-measure); what changes is that it can now be READ.
+# ⛔ CODE STALENESS IS A READINESS FIELD (agent-infra#3932). This file existed to answer "can this box
+# complete a model call" — and a checkout hundreds of commits behind passes that perfectly. Measured
+# 2026-12-02 on all five cells: c1 496, c2 7093, c3 705, c5 542 commits behind origin/main, and
+# `LANE_CAPABILITY=ok` was emitted on every one. A lane cut from that base produces a PLAUSIBLE LOG AND A
+# WRONG DIFF: it re-derives something main already fixed, or reverts it. That is indistinguishable from a
+# working lane until the work is read, and tortoise is the product this base feeds.
+#
+# The reading is `HEAD..origin/main` AFTER A BOUNDED FETCH, so the number is measured rather than
+# remembered from a possibly-stale ref (the very "flag that records a past state" failure this file's
+# sibling issues describe). A fetch that fails or times out yields `behind=unknown` and does NOT refuse —
+# an unanswerable network read is a WARN, the same doctrine as `no-answer`.
+#
+# ⛔ THE FETCH'S OWN EXIT STATUS IS THE ONLY THING THAT MAKES THAT SENTENCE TRUE (this change's review).
+# The first cut fetched in the background and then read `rev-list` UNCONDITIONALLY. But a failed fetch
+# does not delete `origin/main` — it leaves the last one it saw — so `rev-list` answers, and the gate
+# publishes a number it never measured: a checkout 500 commits behind, last fetched a month ago,
+# reports `behind=8` and is declared READY. That is the same escaped-stale-ref false PASS the header
+# above claims this reading avoided, one line under the claim. The rule is therefore structural: a ref
+# that was NOT refreshed this run is not a measurement, and the status of the fetch (including the
+# watchdog's kill, which surfaces as a non-zero wait status) decides it. `exec` keeps `$!` pointing at
+# `git` itself rather than at a wrapper shell, so the bound's kill reaches the process it bounds.
+MAX_BEHIND="${CELL_PREFLIGHT_MAX_BEHIND:-50}"
+FETCH_BOUND="${CELL_PREFLIGHT_FETCH_BOUND:-12}"
+REPO_ARG=""
+
+# ⛔ WHICH CHECKOUT IS MEASURED IS THE CALLER'S TO NAME, NOT A GUESS (this change's review, P1-1).
+# The first cut guessed `${HOME}/tortoise` and `${HOME}/agent-infra`, and on the boxes the reading was
+# measured on NEITHER EXISTS: a cell runs `HOME=/tmp/cell-home` while the tortoise checkout with all its
+# worktrees is `/tmp/cell-t3` (docs/ops/disk-consumers.md), and the dispatch Mac keeps both checkouts
+# under `Documents/GitHub/`. Every reading was then `repo=none behind=unknown` → `ok`, so the refusal
+# was UNREACHABLE exactly where it was meant to fire — and the suite stayed green because every arm
+# passed `CELL_PREFLIGHT_REPO` explicitly. A readiness field that resolves nothing by default is the
+# no-op-gate class this repo treats as category A.
+# So the order is: what the CALLER named is AUTHORITATIVE (and a named path that is not a checkout does
+# NOT fall through to a guess — looking somewhere other than where you were told is the same defect one
+# step later); then the checkout the probe is RUNNING IN, `$PWD`, which for `run_agent` is the lane's own
+# worktree — the base it will build on; then the paths this repo actually resolves cells with; then the
+# plain `$HOME` layout.
+# ⛔ A `--repo` FLAG DOES NOT LET A CALLER TURN THE FIELD OFF, which is the one thing the first cut's
+# no-flag rule was protecting: naming a checkout can only make the reading MORE specific, a named
+# non-checkout is reported as such, and `CELL_PREFLIGHT_REPO` already had exactly this power.
+# ⛔ `${HOME:-}` THROUGHOUT: the first cut read `$HOME/...` bare under `set -u`, so a caller with no HOME
+# aborted inside `$( )` and the verdict line lost its `repo=`/`behind=` fields ENTIRELY — the readiness
+# field vanished instead of saying `unknown` (this change's review, P2-3).
+# ⛔ IT SETS `REPO_FOUND` RATHER THAN PRINTING THE PATH: the note that says WHY nothing was measured has
+# to survive the call, and a `$( )` would drop it (measured — the arm read the generic
+# `reason=no-checkout` over the specific `reason=not-a-checkout path=…` it had just produced).
+# ⛔ AND `${CELL_HOME}/agent-infra` OUTRANKS THE HARD-CODED `/tmp/cell-*` GUESSES (this change's review,
+# P2-3). Two independent reasons, one rule — an EXPLICITLY CONFIGURED location beats a literal this file
+# guessed:
+#   • correctness — `CELL_HOME` is what `cell-install.sh` sets and what the rest of this repo resolves a
+#     cell's tree with, so when it names a checkout that IS the cell's tree and it must win over a
+#     `/tmp/cell-ai` that may belong to the other repo — measuring the harness repo while the lane builds
+#     tortoise is the wrong-checkout reading this whole list exists to avoid;
+#   • hermeticity — the absolute cell paths are true on EVERY CELL, so no test arm that sets `CELL_HOME`
+#     to a fixture and expects that fixture to be measured could hold while the literals came first: it
+#     resolved the LIVE `/tmp/cell-ai` instead — a red on the boxes this gate runs on, and a `git fetch`
+#     of a live checkout from inside a suite (this change's review, P2-3, measured).
+resolve_repo() { # -> 0 and REPO_FOUND set; 1 with REPO_NOTE naming why nothing was measured
+  local cand
+  REPO_FOUND=""
+  for cand in "${REPO_ARG:-}" "${CELL_PREFLIGHT_REPO:-}"; do
+    [ -n "$cand" ] || continue
+    [ -e "$cand/.git" ] && { REPO_FOUND="$cand"; return 0; }
+    REPO_NOTE="reason=not-a-checkout path=$cand"
+    return 1
+  done
+  for cand in "$PWD" \
+              "${CELL_HOME:-}${CELL_HOME:+/agent-infra}" \
+              /tmp/cell-ai /tmp/cell-t3 \
+              "${HOME:-}${HOME:+/tortoise}" "${HOME:-}${HOME:+/agent-infra}"; do
+    [ -n "$cand" ] || continue
+    [ -e "$cand/.git" ] && { REPO_FOUND="$cand"; return 0; }
+  done
+  REPO_NOTE="reason=no-checkout tried=pwd,CELL_HOME/agent-infra,/tmp/cell-ai,/tmp/cell-t3,HOME/tortoise,HOME/agent-infra"
+  return 1
+}
+
+code_freshness() {
+  local repo="" behind="" fp n fetch_rc
+  REPO_NOTE=""
+  resolve_repo || REPO_FOUND=""
+  repo="$REPO_FOUND"
+  [ -n "$repo" ] || { printf 'repo=none behind=unknown %s' "${REPO_NOTE:-reason=no-checkout}"; return 0; }
+  # Bounded fetch. `timeout` is absent on macOS and this suite runs on both, so the bound is a
+  # background pid + a counted sleep, matching the watchdog form the repo already uses (#2046).
+  # ⛔ THE DESTINATION IS EXPLICIT, AND THAT IS NOT REDUNDANT (this change's review: measured). A
+  # command-line refspec with no `:<dst>` only refreshes `refs/remotes/origin/main` by git's
+  # OPPORTUNISTIC UPDATE, which needs a configured `remote.origin.fetch` that maps `main`. Measured on a
+  # checkout whose fetch refspec had been emptied: `git fetch origin main` exited **0**, left
+  # `origin/main` untouched, and the count printed `behind=0` on a checkout that was 3 commits behind —
+  # the exact false PASS this reading exists to remove, one line under the rule that a ref not refreshed
+  # this run is not a measurement. Naming the destination makes the refresh structural instead of
+  # dependent on a config the probe does not own.
+  ( cd "$repo" 2>/dev/null && exec git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' >/dev/null 2>&1 ) &
+  fp=$! n=0
+  while [ "$n" -lt "$FETCH_BOUND" ] && kill -0 "$fp" 2>/dev/null; do sleep 1; n=$((n+1)); done
+  kill -0 "$fp" 2>/dev/null && kill "$fp" 2>/dev/null
+  # The watchdog's kill, a dead network and a missing remote ALL land here as non-zero, and all three
+  # mean the same thing: whatever `origin/main` now holds was not read from the remote this run.
+  wait "$fp" 2>/dev/null; fetch_rc=$?
+  if [ "${fetch_rc:-1}" -ne 0 ]; then
+    printf 'repo=%s behind=unknown reason=fetch-failed fetch_rc=%s' "$(basename "$repo")" "$fetch_rc"
+    return 0
+  fi
+  behind="$( cd "$repo" 2>/dev/null && git rev-list --count HEAD..origin/main 2>/dev/null )"
+  case "${behind:-}" in
+    ''|*[!0-9]*) printf 'repo=%s behind=unknown reason=rev-list-unreadable' "$(basename "$repo")" ;;
+    *)           printf 'repo=%s behind=%s' "$(basename "$repo")" "$behind" ;;
+  esac
+}
+
 die_usage() { printf '%s: %s\n' "$PROG" "$*" >&2; emit "refused why=usage" "usage-error=$*"; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -147,6 +287,7 @@ while [ $# -gt 0 ]; do
     --model) [ $# -ge 2 ] || die_usage "--model needs a value"; MODEL="$2"; shift 2 ;;
     --provider) [ $# -ge 2 ] || die_usage "--provider needs a value"; PROVIDER="$2"; shift 2 ;;
     --attempts) [ $# -ge 2 ] || die_usage "--attempts needs a number"; ATTEMPTS="$2"; shift 2 ;;
+    --repo) [ $# -ge 2 ] || die_usage "--repo needs a path"; REPO_ARG="$2"; shift 2 ;;
     --quiet) QUIET=1; shift ;;
     # ⛔ UP TO `set -u`, NOT A LINE RANGE: the header grows and a range silently truncates the help
     # (this PR's own USAGE advertised a `--line` flag the parser had no case for, so `--line` exited 2
@@ -159,6 +300,12 @@ case "$BOUND" in ''|*[!0-9]*) die_usage "--bound must be a positive integer (rea
 case "$ATTEMPTS" in ''|*[!0-9]*) die_usage "--attempts must be a positive integer (read '$ATTEMPTS')" ;; esac
 [ "$BOUND" -gt 0 ] || die_usage "--bound must be > 0 (read '$BOUND')"
 [ "$ATTEMPTS" -gt 0 ] || die_usage "--attempts must be > 0 (read '$ATTEMPTS')"
+# ⛔ AN UNVALIDATED REFUSAL BOUND IS AN INERT ENFORCER (this change's review). `[ "$behind" -gt "$MAX" ]`
+# with a non-numeric MAX makes bash print `integer expression expected` and return 2 — i.e. FALSE — so
+# the staleness refusal silently never fires and the gate reads `ok` for ever, which is exactly the
+# failure #3932 exists to catch. Same doctrine as `--bound`/`--attempts`, and the same readable verdict.
+case "$MAX_BEHIND" in ''|*[!0-9]*) die_usage "CELL_PREFLIGHT_MAX_BEHIND must be a non-negative integer (read '$MAX_BEHIND')" ;; esac
+case "$FETCH_BOUND" in ''|*[!0-9]*) die_usage "CELL_PREFLIGHT_FETCH_BOUND must be a non-negative integer (read '$FETCH_BOUND')" ;; esac
 
 HOST="${HOST:-$(hostname 2>/dev/null || echo '?')}"
 PI_VER="$(pi --version 2>/dev/null | tail -1)"
@@ -297,7 +444,28 @@ while [ "$n" -le "$ATTEMPTS" ]; do
   attempts_used=$n
   if grep -qF "$TOKEN" "$TMPD/out.$n" 2>/dev/null; then
     if [ "$A_RC" -eq 0 ] && [ "$A_KILLED" -eq 0 ]; then
-      emit "ok" "answered_ms=$A_FIRST_MS returned_ms=$A_WALL_MS attempts=$n bound=${BOUND}s key=$KEY_SOURCE"
+      # ⛔ THE BOX CAN ANSWER; IS ITS CODE CURRENT? A stale base is the failure this gate was blind to
+      # (#3932): the model call succeeds and the lane then builds on a month-old checkout.
+      FRESHNESS="$(code_freshness)"
+      FRESH_BEHIND="${FRESHNESS##*behind=}"
+      case "$FRESH_BEHIND" in
+        ''|*[!0-9]*) : ;;   # unmeasurable: reported below, never a refusal
+        *)
+          if [ "$FRESH_BEHIND" -gt "$MAX_BEHIND" ]; then
+            # ⛔ EXIT 3, LIKE EVERY OTHER REFUSAL (this change's review). The first cut exited 1, and on
+            # this file's own documented table `1` is not a verdict at all — the caller's "no verdict"
+            # arm exists for exactly `rc=1` ("absent or could not start") and WARNS on it. It happened to
+            # refuse here only because the verdict LINE was also present; a consumer that switches on the
+            # code alone (this repo's own EXIT table is what such a consumer reads) would have treated a
+            # stale box as "no probe ran" and dispatched anyway.
+            emit "refused why=stale-code" "answered_ms=$A_FIRST_MS attempts=$n bound=${BOUND}s $FRESHNESS max_behind=$MAX_BEHIND"
+            [ "$QUIET" = "1" ] || printf '%s\n' \
+              "[$PROG] the box can complete a model call, but its checkout is more than ${MAX_BEHIND} commits behind origin/main. A lane cut from that base produces a plausible log and a WRONG diff — it re-derives what main already fixed, or reverts it (#3932). Advance the checkout NAMED ON THE READING LINE, according to what it IS: a BASE checkout (a lane's worktree, a shared checkout) with 'git -C <repo> pull --ff-only origin main', or the cell's deploy path; a PR-BRANCH worktree — the fixer path — by integrating origin/main INTO the branch ('git -C <repo> merge origin/main') and pushing. NEVER re-cut a worktree that carries commits: on a fixer that discards the very PR it was dispatched to repair (this change's review, P2-4). Override with CELL_PREFLIGHT_MAX_BEHIND=<n> only if a stale base is genuinely intended. ⛔ NO BACKTICKS AND NO NESTED DOUBLE QUOTES IN THIS STRING: it is double-quoted, so a backticked span is a COMMAND SUBSTITUTION — measured on this change, where the first cut wrapped the git commands in backticks, bash RAN them and the remedy printed with those spans deleted, so the operator read an instruction with a hole in it." >&2
+            exit 3
+          fi
+          ;;
+      esac
+      emit "ok" "answered_ms=$A_FIRST_MS returned_ms=$A_WALL_MS attempts=$n bound=${BOUND}s key=$KEY_SOURCE $FRESHNESS"
       exit 0
     fi
     # answered, then failed or hung

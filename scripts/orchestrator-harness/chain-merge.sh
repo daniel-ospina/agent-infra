@@ -78,7 +78,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key` and returns 0 iff THIS dispatch was refused by a gate
+cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key|stale` and returns 0 iff THIS dispatch was refused by a gate
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
@@ -112,7 +112,7 @@ cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key` a
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability /
-  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 memory / 82 key / 83 harness-skew), not a gate: an
+  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 memory / 82 key / 83 harness-skew / 85 stale-code), not a gate: an
   # unrecognised value is reported as
   # `load` because the refusal
   # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
@@ -156,6 +156,11 @@ cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key` a
     # normaliser it folded into `*` -> `load`, which is the #2991 defect exactly: a bool number, a peer
     # yield, and an operator reading "load" about a missing key.
     key) printf 'key' ;;
+    # ⛔ `stale` IS THE STALE-CHECKOUT REFUSAL (agent-infra#3932, this change's review). It is named here
+    # for the reason `capability` and `skew` are: this function's `case` chooses the VALUE the arm below
+    # dispatches on, so folding it into `*` would report a LOAD reading for a box whose model call
+    # succeeded and whose checkout is behind — and the operator would wait for load to fall.
+    stale) printf 'stale' ;;
     *) printf 'load' ;;
   esac
   return 0
@@ -318,6 +323,13 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # "which codes are free" from the tree alone reads 81 as free and re-claims it green. That is the
       # exact failure this PR exists to prevent, so the sentence must not be read as a registry entry.
       skew) _cap_rc=83 ;;
+      # 85 is spawn-gate.sh's AGENT_STALE_CODE_REFUSED (agent-infra#3932, this change's review). ⛔ NOT 71:
+      # every reader treats 71 as a property of THIS box and therefore a PEER's to take, and a stale
+      # checkout is measured stale on every cell of the wave (496-7093 commits behind at the time of
+      # writing) — so the item would circulate between boxes that refuse identically and never be built.
+      # The chain must still STOP here (no PR can appear until the checkout is advanced) and the EXIT
+      # trap still releases refs/claims/issue-$N, because the item is fine and must not stay stranded.
+      stale) _cap_rc="${AGENT_STALE_CODE_REFUSED:-85}" ;;
       # 82 is key-gate.sh's KEY_GATE_REFUSED (#3331): the lane REFUSED before spawning the agent because
       # its environment holds no model credential for the provider. Named rather than folded, for the
       # same reason as every other arm: an operator told 75 waits for load to fall on a box whose
@@ -333,6 +345,14 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       echo "[chain $N] credential refusal: lane-$N was refused before its agent started because the lane's environment holds no model credential for its provider (key-gate.sh, exit ${_cap_rc}), so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N. This IS a capacity transfer in the one sense that matters here: the credential is a property of THIS box, so a peer that HAS one can take the item — the remedy is to put the key in the environment lanes run with ([key-gate] line in logs/lane-$N.log names the variable and every candidate file), not to wait" >> "$LOG"
     elif [ "$_cap_gate" = "skew" ]; then
       echo "[chain $N] harness mismatch: lane-$N was refused because the lane's caller and the deployed cell-lane-preflight.sh disagree (a usage/version skew, or a corrupt copy), so the capability probe measured nothing, OR the spawn gate could not resolve capacity.sh at all (its nodeploy arm, #2293 follow-up) — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N so the item is not stranded on this box. This is NOT a capacity transfer: every box running the same helper pair refuses identically, so handing the issue to a peer would only circulate it — the remedy is a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever lanes run" >> "$LOG"
+    elif [ "$_cap_gate" = "stale" ]; then
+      # ⛔ THE THIRD READER, AND ITS WHOLE JOB IS TO REPORT THE REMEDY (this change's review, P2-1).
+      # `cap_refusal_gate` gained a `stale)` arm and this dispatcher did not, so `gate=stale` fell to
+      # the `else` below and an operator read "a peer with capacity can claim it" — the exact
+      # circulation this change removes from `lane.sh`, `fix-one.sh`, `spawn-gate.sh` and
+      # `orch-loop.sh`. In the measured fleet shape (every cell hundreds of commits behind) the item
+      # would travel between boxes that refuse identically and never be built.
+      echo "[chain $N] stale checkout: lane-$N was refused because the checkout it measured is more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main (#3932), so a lane cut from it would produce a plausible log and a wrong diff — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N so the item is not stranded on this box. This is NOT a capacity transfer: the measured fleet state was every cell hundreds of commits behind, so a peer is likely stale too — do NOT dispatch the issue elsewhere. The repo and the distance are on the [capability-gate] REFUSED line in logs/lane-$N.log, and the remedy is on the artifact it measured: advance a BASE checkout with 'git -C <repo> pull --ff-only origin main', or integrate origin/main INTO the branch ('git -C <repo> merge origin/main') for a PR-branch worktree — never a re-cut, which discards the PR" >> "$LOG"
     else
       echo "[chain $N] capacity transfer: lane-$N was refused at the $_cap_gate gate, so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N, so a peer with capacity can claim it; this box stands down via state/capacity-refused-$N for the record's yield window (agent-infra#1909)" >> "$LOG"
     fi
