@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-12685-1794655704-p2535801-244b0eb2",
+  "_sha": "194bf9626076b2bf4f5f846fe070b03848ef67a7",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-12685.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/12666-dead-heartbeat-ticker"
+    },
+    {
+      "kind": "sha",
+      "value": "e92010f881cf65cf43922bedd4b7ab9114090dbe"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-12685"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 3726,
+  "ended_at": 1794659430,
+  "exit_code": 0,
+  "heartbeat_at": 1794659430,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-12685-1794655704-p2535801-244b0eb2",
+  "lease_until": 1794667230,
+  "pid": 2535801,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794655704,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-12685",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-12685"
+}
