@@ -723,10 +723,14 @@ assert_eq "$QUEUE_HEAD_SCAN_SHIPPED" "25" \
 # `GATE_UNDER_TEST`, exactly as the bound's derivation records above, so that a mutant which merely
 # changes the constant cannot quietly re-point the arms' own fixtures at its value. The consequence is
 # that under `GATE_UNDER_TEST` a `QUEUE_PAGE` mutant does NOT reach this line: measured (cycle 9),
-# `GATE_UNDER_TEST=<gate with QUEUE_PAGE=50>` is 13 failures / 591 passed with this pin GREEN, the reds
-# coming from the arms against their 100-row fixtures (mostly `got: 2, want: 0`, plus
-# `ghost-window-at-exact-page`'s `unexpected: cannot see past it` — the gate's page dropped to 50 while
-# the fixture still built the shipped 100). What the pin protects is the IN-PLACE reversal — the route
+# `GATE_UNDER_TEST=<gate with QUEUE_PAGE=50>` is 13 failures / 591 passed with this pin GREEN. Only ONE
+# of the 13 is a 100-row-fixture arm — `ghost-window-at-exact-page`, `unexpected: cannot see past it`,
+# because its fixture still builds the shipped 100 while the gate's page dropped to 50. The OTHER 12 are
+# the 54-deep queue arms: they pass NO `GH_QUEUE_ROWS_SPEC`, so their page is the stub's default single
+# row, and they are REFUSED at the SATURATED check because `queued (54) > QUEUE_PAGE (50)` — the same
+# mechanism the next paragraph records. (Only 4 of the 13 failure LINES are `got: 2, want: 0`, one per
+# refused arm; the other 9 are that refusal's follow-on `missing:` assertions.) What the pin protects is
+# the IN-PLACE reversal — the route
 # that actually ships — where the derivation and the file move together:
 # MEASURED (cycle 9 re-measured both routes, after the first version of this paragraph contradicted
 # itself): with `s/^QUEUE_PAGE=100/QUEUE_PAGE=50/` in the shipped `ci_runner_gate.sh` the suite is NOT
