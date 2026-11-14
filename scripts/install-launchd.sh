@@ -1919,19 +1919,25 @@ unmanaged_plists() {
     # The third clause keeps the fixture carve-out: a TEMPLATES_DIR override that ships no manifest of
     # its own falls back to the checkout's copy, and only a box with NO declarations anywhere (no
     # manifest AND no repo template tree) is allowed an empty foreign list.
-    # ⛔ AN EMPTY *FOREIGN* LIST IS STILL A REFUSAL, AND AN EMPTY *RETIRED* LIST IS NOT (#3826 review P2,
-    # round 18). Round 17 refused on both emptinesses and that was wrong in one direction:
-    # `RETIRED` is a RECORD OF REMOVALS, so "holds no entry" is its legitimate terminal state — the
-    # moment every retired job is gone. MEASURED at `f17785035` on a clean box with one byte-identical
-    # in-sync job and `RETIRED` carrying comments only: `in sync` printed for the job, THEN
-    # `⛔ UNKNOWN — the DECLARED SET … could NOT be read` and rc **2** — a permanent red, with a
-    # diagnosis that is false (the set WAS read) and a remedy (`re-run with a readable TEMPLATES_DIR`)
-    # that cannot clear it. That is the anti-pattern this file removes everywhere else.
-    # `OWNED-BY-OTHER-INSTALLERS` is the opposite: an empty one re-classifies live jobs another
-    # installer owns as strays and prints the command that DELETES them, so emptiness there is refused.
-    # The RETIRED *presence* check above is unchanged (a tree that ships templates but no readable
-    # RETIRED is mutilated, not clean); only the entry-count refusal was narrowed.
+    # ⛔ AN EMPTY *FOREIGN* LIST IS A REFUSAL, AN EMPTY *RETIRED* LIST IS NOT, AND AN UNREADABLE RETIRED
+    # STILL IS (#3826 review P2 round 18 / P3 round 19). `RETIRED` is a RECORD OF REMOVALS, so "holds no
+    # entry" is its legitimate terminal state — refusing it made a clean in-sync box a PERMANENT red with
+    # a false diagnosis (MEASURED: `in sync` for the job, then `⛔ UNKNOWN … could NOT be read`, rc 2).
+    # `OWNED-BY-OTHER-INSTALLERS` is the opposite: an empty one re-classifies live jobs another installer
+    # owns as strays and prints the command that DELETES them, so emptiness there is refused.
+    # ⛔ BUT NARROWING THAT CLAUSE ALSO DROPPED THE RETIRED *PRESENCE* GUARD, AND THIS COMMENT CLAIMED IT
+    # SURVIVED (#3826 review P3, round 19). `retired_manifest` prints nothing when neither copy is
+    # readable, so `is_retired` answered "no" for every label and a retired-but-installed job was
+    # reported `⛔ UNMANAGED` **with** `launchctl bootout … && rm -f …` — the row class the doc says
+    # cannot be produced. Restored below as its own term, which is what the doc's sentence ("if neither
+    # is readable `--status` answers 2 UNKNOWN") actually describes. The EMPTY case stays permitted, and
+    # that has a declared consequence: `RETIRED`'s entries ARE the declaration, so a manifest emptied by
+    # hand re-classifies what it used to name — `fleet-schedule.py --check` is the authoring gate for a
+    # retirement, not this one.
     _fl="$(foreign_labels || true)"
+    if [ -z "$(retired_manifest)" ]; then
+        return 3
+    fi
     if [ -z "$_fl" ] && { [ -n "$(foreign_manifest)" ] || [ -d "$INFRA_ROOT/templates/launchd" ]; }; then
         return 3
     fi

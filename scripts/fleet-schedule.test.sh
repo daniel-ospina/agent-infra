@@ -1093,6 +1093,54 @@ grep -qE '[0-9]+ launchd job[(]s[)]' <<<"$out" \
   && bad "10b. the verdict claimed a job count over zero classified jobs: $out" \
   || ok "10b. …and claims no job count at all"
 cp "$T/delegate.bak" "$DARWIN_ROOT/scripts/install-launchd.sh"; chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+
+# ── 10c. A SET-LEVEL ROW IS STILL A TEXT-BASED FAILURE, AND IT IS STILL PRINTED (#3826 review P2) ────
+# ⛔ ROUND 18 MADE `bad` THE ONLY TEXT-BASED FAILURE SIGNAL, THEN EXCLUDED SET-LEVEL ROWS FROM IT.
+# That left the two halves of the gate non-independent — the set-level row was load-bearing only
+# through the delegate's exit code, which is exactly the coupling the exit-code arm below was added to
+# remove ("the substring scan catches only three wordings, so any OTHER failure was certified").
+# AND it stopped the row being PRINTED, while the verdict said `(%d row(s), above)`: in the mixed case
+# (one `NOT INSTALLED` + one unreadable-`LaunchAgents` row) the enumeration failure disappeared and a
+# reader never learned the UNMANAGED half was unmeasured. MEASURED at `ee667c3a9` with this exact
+# fixture: `SCHEDULE VERIFIED — launchd job set matches templates/launchd`, rc **0**.
+cp "$DARWIN_ROOT/scripts/install-launchd.sh" "$T/delegate.bak2"
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+printf '%s\n' "  com.eldato.tccprobe: installed=loaded version=v0.0.1 (in sync)"
+printf '%s\n' "  ⛔ UNKNOWN — /tmp/x/Library/LaunchAgents exists but could NOT be enumerated (rc 2)." >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+[ "$rc" -eq 1 ] && ok "10c. a SET-level row FAILS the verdict even when the delegate exits 0" \
+  || bad "a set-level failure with exit 0 was certified VERIFIED (rc=$rc): $out"
+grep -q 'could NOT be enumerated' <<<"$out" \
+  && ok "10c. …and the set-level row is PRINTED, so 'above' points at something" \
+  || bad "10c. the verdict referred to a set-level row it never printed: $out"
+grep -qE '[0-9]+ launchd job[(]s[)]' <<<"$out" \
+  && bad "10c. the verdict claimed a job count for a set-level-only failure: $out" \
+  || ok "10c. …and it still claims no job count"
+# The mixed case: a per-job failure AND a set-level row must BOTH be visible, and the count is a count
+# of the jobs only.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+printf '%s\n' "  com.eldato.tccprobe: NOT INSTALLED (template v0.0.1)"
+printf '%s\n' "  ⛔ UNKNOWN — /tmp/x/Library/LaunchAgents exists but could NOT be enumerated (rc 2)." >&2
+exit 2
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+[ "$rc" -eq 1 ] && ok "10c. the MIXED case (one job + one set-level row) fails" \
+  || bad "the mixed case was certified (rc=$rc): $out"
+grep -q 'could NOT be enumerated' <<<"$out" \
+  && ok "10c. …and the enumeration failure is visible beside the job failure" \
+  || bad "10c. the mixed case hid the set-level row: $out"
+grep -qE '1 launchd job[(]s[)]' <<<"$out" \
+  && ok "10c. …and the count is the JOBS only (1), not jobs + set-level rows" \
+  || bad "10c. the mixed-case count is not a count of jobs: $out"
+cp "$T/delegate.bak2" "$DARWIN_ROOT/scripts/install-launchd.sh"; chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
 grep -q '^--status$' "$DELEGATE_RECORD" && ok "--verify asks install-launchd.sh --status (delegated, not reimplemented)" \
   || bad "--verify did not delegate --status: $(cat "$DELEGATE_RECORD" 2>/dev/null)"
 out="$(darwin_run --status)"; rc=$?

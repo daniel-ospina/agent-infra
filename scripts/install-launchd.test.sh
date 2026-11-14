@@ -3081,6 +3081,33 @@ set -e
 assert_eq "$RC" "1" "§17d control: the real manifest present → the SAME fixture is refused as CMUX-GATED (rc 1)"
 assert_contains "$OUT" "⛔ CMUX-GATED   com.eldato.tccprobe" "§17d ... so the new arm refuses the unanswerable case, not every case"
 
+# ── 17e. AN UNREADABLE `RETIRED` IS A REFUSAL, AND A RETIRED JOB GETS NO DELETE ADVICE (#3826 P3) ─────
+# ⛔ ROUND 18 NARROWED THE EMPTINESS REFUSAL AND DROPPED THE *PRESENCE* GUARD WITH IT, while its own
+# comment said the presence check was "unchanged" (#3826 review P3, round 19). `retired_manifest` prints
+# nothing when neither copy is readable, so `is_retired` answered "no" for every label and a
+# retired-but-installed job was reported `⛔ UNMANAGED` **with** `launchctl bootout … && rm -f …` — the
+# row class the doc says cannot be produced. Reuses §17d's scratch INFRA_ROOT: with RETIRED removed from
+# BOTH resolution sites, the only correct answer is "I could not evaluate the set", with no delete
+# command in it. Red under the mutant that drops the presence term.
+printf '%s\n' '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>com.tortoise.heartbeat-loop</string></dict></plist>' \
+    > "$GATE_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist"
+rm -f "$GATE_ROOT/templates/launchd/RETIRED"
+set +e
+OUT="$(gate_status)"; RC=$?
+set -e
+assert_eq "$RC" "2" "§17e a RETIRED that is unreadable at every resolution site answers 2 UNKNOWN"
+assert_contains "$OUT" "⛔ UNKNOWN" "§17e ... with the set-level UNKNOWN row"
+assert_not_contains "$OUT" "⛔ UNMANAGED   com.tortoise.heartbeat-loop" \
+    "§17e ... and the retired job is NOT reclassified as a stray"
+assert_not_contains "$OUT" 'heartbeat-loop.plist" && rm -f' \
+    "§17e ... so no delete command is aimed at a job this repo has retired (the doc's own invariant)"
+printf 'com.eldato.old\n' > "$GATE_ROOT/templates/launchd/RETIRED"
+rm -f "$GATE_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist"
+set +e
+OUT="$(gate_status)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17e control: restoring RETIRED returns the fixture to its CMUX-GATED refusal (rc 1)"
+
 
 # ── §18: an installed plist with NO template is UNMANAGED (#1867) ──────────────────────────────────
 # The blind heartbeat was installed, loaded and ticking with no template describing it, so neither the

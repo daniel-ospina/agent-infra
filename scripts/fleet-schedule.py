@@ -3692,6 +3692,15 @@ def cmd_darwin(mode):
         ]
         for line in bad:
             print("  FAIL   %s" % line.strip(), file=sys.stderr)
+        # ⛔ THE SET-LEVEL ROWS ARE PRINTED TOO, AND THAT IS NOT COSMETIC (#3826 review P2, round 19).
+        # `bad` is what got echoed, so excluding set-level rows from it ALSO stopped printing them —
+        # while the verdict said `(%d row(s), above)`: it pointed at a row the operator could not see,
+        # and in the MIXED case (one `NOT INSTALLED` + one unreadable-`LaunchAgents` row) the
+        # enumeration failure vanished entirely, so a reader learned one job was absent and never
+        # learned that the UNMANAGED half was never measured. MEASURED at `ee667c3a9`: the row was
+        # absent from stdout+stderr while the count sentence referred to it.
+        for line in set_level:
+            print("  FAIL   %s" % line.strip(), file=sys.stderr)
         # ⛔ AND A DISCLOSURE IS NOT AN "IN SYNC" (#1867 review, round 11). One row class is
         # deliberately NOT a failure — `⚠️ INSTALLED-SKIPPED`: a job installed here whose template the
         # installer would now SKIP (a placeholder stopped resolving, e.g. SWARM_ROOT unset). An install
@@ -3725,7 +3734,17 @@ def cmd_darwin(mode):
                 file=sys.stderr,
             )
             return 0
-        if bad or out.returncode != 0:
+        # ⛔ AND A SET-LEVEL ROW IS STILL A TEXT-BASED FAILURE (#3826 review P2, round 19). Round 18
+        # removed set-level rows from `bad` so they would stop being COUNTED — but `bad` was also the
+        # only text-based failure signal, so a set-level row became load-bearing ONLY through the
+        # delegate's exit code, i.e. the two halves of this gate stopped being independent. That is the
+        # exact false PASS the exit-code arm below exists to prevent ("the substring scan catches only
+        # three wordings, so any OTHER failure … was certified as SCHEDULE VERIFIED"), reintroduced one
+        # layer up. MEASURED at `ee667c3a9` with a delegate that prints one set-level row + one `in sync`
+        # job and exits **0**: `SCHEDULE VERIFIED — launchd job set matches templates/launchd`, rc 0.
+        # Reachability, stated honestly: the SHIPPED delegate raises `status_rc=2` on both set-level
+        # arms, so it exits non-zero today — this was one delegate change away, and nothing pinned it.
+        if bad or set_level or out.returncode != 0:
             # ⛔ ZERO JOBS IS NOT ZERO FAILURES (#3826 review P3). When the delegate DIES without
             # emitting a marker row — a missing `TEMPLATES_DIR`, a syntax death, an unset HOME — this
             # arm fires with `bad == []`, so the sentence read `SCHEDULE NOT VERIFIED — 0 launchd

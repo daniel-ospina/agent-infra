@@ -57,8 +57,11 @@ what this doc's table means everywhere else.
 
 ⛔ **AND NEITHER IS THE LOOP — it has never been farmed either.** `heartbeat-loop.sh` is one of the
 two files `pi-bootstrap/setup.sh` **deliberately withholds**: it is absent from `fleet_srcs`, and the
-array meant to carry it (`lane_root_srcs`) is #1553 and **does not exist yet** (measured:
-`grep -c heartbeat` over `fleet_srcs` → 0; `rg 'lane_root_srcs='` → only the comment naming it). So
+array meant to carry it (`lane_root_srcs`) is #1553 and **does not exist yet** (measured, discriminating
+on the FILENAME rather than the word: `grep -n '^fleet_srcs=' pi-bootstrap/setup.sh | tr ' ' '\n' |
+ grep -c 'heartbeat-loop\.sh$'` → **0**, while `orchestrator-heartbeat.sh` — the TICK, a different file —
+**is** farmed, so a bare `grep -c heartbeat` reads 1 and says nothing about the loop; and
+`rg 'lane_root_srcs='` → only the comment naming it). So
 the launcher's **farmed-copy preference is dormant**, the checkout sibling is the copy that actually
 runs today, and a box driven entirely from `$HOME/.pi/agent` has **neither** the loop nor the
 launcher and cannot launch anything. This paragraph used to assert the reverse — that the farm
@@ -296,6 +299,18 @@ for every label, a retired job fell through to **`⛔ UNMANAGED`**, and the row 
 checkout's `templates/launchd/` second (the same rule `LAUNCHD-INCOMPATIBLE` uses), and if neither is
 readable `--status` answers **2 (UNKNOWN)** rather than classifying every installed job against a
 list it never read.
+
+⛔ **UNREADABLE AND EMPTY ARE DIFFERENT ANSWERS, and only one of them is a refusal.** A list that cannot
+be read at either site is a mutilation, so both lists refuse (2 UNKNOWN, no delete command printed). A
+list that reads fine and holds no entry is a *statement*, and the two lists mean opposite things by it:
+`RETIRED` is a **record of removals**, so "nothing retired" is its legitimate terminal state — refusing
+it made a clean, byte-identical, in-sync box answer **2 UNKNOWN with "could NOT be read", unbounded**
+(measured at `f17785035`), which is a permanent red whose remedy cannot clear it. `OWNED-BY-OTHER-INSTALLERS`
+is the reverse: an empty one re-classifies live jobs another installer owns as strays and prints the
+command that deletes them, so emptiness there **is** refused. The declared consequence of that
+asymmetry: `RETIRED`'s entries are the declaration, so a manifest emptied **by hand** re-classifies what
+it used to name — `fleet-schedule.py --check` is the gate that catches a retirement whose template
+survived, and it governs authoring, not this check.
 
 **Reboot does not restart the loop** on either platform. Re-run `heartbeat-launch.sh start` after a
 reboot; that is a property of "detached launched-once loop" and it is why `check` exists — a loop

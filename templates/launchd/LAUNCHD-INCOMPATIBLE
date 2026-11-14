@@ -40,12 +40,14 @@
 #
 # ⛔ PARITY NOTE — this file governs the LAUNCHD renderer only. On a Linux cell there is no cmux
 # desktop app and therefore no `cmuxOnly` socket, so the same loop is LEGITIMATE there. It is NOT
-# delivered there by anything: `scripts/fleet-schedule.py` (the #1864 runtime) schedules exactly these
+# delivered there by anything: `scripts/fleet-schedule.py` (the #1864 runtime, CLOSED) schedules exactly these
 # `templates/launchd/*.plist` declarations, and THIS FILE is what forbids a template from naming the
-# loop — so on a cell the loop is hand-started or not running at all, and delivering it is #1864's
-# remaining half. Stated this way because this comment used to claim fleet-schedule delivered it,
+# loop — so on a cell the loop is hand-started or not running at all, and delivering it is **#4075**
+# (which owns that divergence; #1864 was closed for the SCHEDULER's portability and cannot carry a
+# launched-once loop). Stated this way because this comment used to claim fleet-schedule delivered it,
 # contradicting docs/ops/heartbeat-launch-path.md and the launcher's own `--help` header (which were
-# corrected first — round 9 — and this manifest was missed).
+# corrected first — round 9 — and this manifest was missed; round 19 found the same class again, this
+# time the OWNER being a closed issue, so grep this file and the doc together for the issue number).
 #
 # ── MATCHING RULE (stated so a reader can predict the refusal) ──────────────────────────────────
 # A ProgramArguments entry matches when its path ends with `/<entry>`. Repo-relative suffix, not
