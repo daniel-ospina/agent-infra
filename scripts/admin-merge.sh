@@ -6751,22 +6751,39 @@ lane_no_pr_trigger() {
 # and let §1b refuse. The other default would let a producer-side change silently
 # re-open the same fail-open (#2465 review P1) with every arm still green.
 #
+# ⛔ AND IT MUST NOT LOOK LIKE A MEASUREMENT (round 2, P2). The two grounds for "can
+# attach" are NOT the same claim — one PARSED `push`/`workflow_dispatch` out of the
+# reason, the other could not read the list at all and defaulted fail-closed. So the
+# helper also records WHICH: LANE_RUN_ATTACH_SOURCE is `measured` only when the clause
+# was present, and LANE_RUN_ATTACH_TRIGGERS names what it found (empty on the default).
+# Without that, §0b's message told an absent-clause lane that it "declares a trigger"
+# — a declaration the code never read, which is the one thing this file forbids in a
+# message (`nothing below may claim a MEASUREMENT the code did not take`).
+#
 # The clause is produced by scripts/ci-workflow-pr-evaluable.sh:829-832 and is already
 # present in LANE_APPLICABILITY_REASON, so this costs no extra `gh` call.
 lane_own_run_can_attach() {
-  local reason="${1:-}" triggers="" list=""
+  local reason="${1:-}" triggers="" list="" found=""
+  LANE_RUN_ATTACH_SOURCE="unread"
+  LANE_RUN_ATTACH_TRIGGERS=""
   case "$reason" in
     *'(declared triggers:'*')'*)
       triggers="${reason##*'(declared triggers:'}"
       triggers="${triggers%%)*}"
+      LANE_RUN_ATTACH_SOURCE="measured"
       ;;
     *) return 0 ;;
   esac
   list=",$(printf '%s' "$triggers" | tr -d '[:space:]'),"
   case "$list" in
-    *,push,*|*,workflow_dispatch,*) return 0 ;;
+    *,push,*) found="push" ;;
   esac
-  return 1
+  case "$list" in
+    *,workflow_dispatch,*) found="${found:+$found }workflow_dispatch" ;;
+  esac
+  [ -n "$found" ] || return 1
+  LANE_RUN_ATTACH_TRIGGERS="$found"
+  return 0
 }
 
 # lane_head_run_state <head> — MEASURE whether the watched lane has a run for
@@ -10149,6 +10166,10 @@ main() {
         # decision (via ANY_WORKFLOW) instead of re-deriving it per poll.
         local lane_dead_end=0 lane_structural=0 lane_probe_state="" lane_kept_why=""
         local LANE_HEAD_RUN_STATE="unreadable"
+        # Dynamic scoping: the helper writes these, and they are READ only by the message
+        # below — so an absent/unparseable trigger list can be described as what it is
+        # (a fail-closed DEFAULT) instead of as a declaration that was never read.
+        local LANE_RUN_ATTACH_SOURCE="" LANE_RUN_ATTACH_TRIGGERS=""
         if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then lane_structural=1; fi
         lane_head_run_state "$head"
         lane_probe_state="$LANE_HEAD_RUN_STATE"
@@ -10286,7 +10307,14 @@ main() {
           # never re-read from the reason text.
           local lane_trigger_clause
           if [ "$lane_structural" -eq 1 ]; then
-            lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no PR event can START it — but it declares a trigger that CAN attach a run of it to head $head while the wait runs (a push whose tip is $head, a 'gh workflow run --ref', or a rerun of a CANCELLED run)"
+            if [ "$LANE_RUN_ATTACH_SOURCE" = measured ] && [ -n "$LANE_RUN_ATTACH_TRIGGERS" ]; then
+              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no PR event can START it — but it declares '$LANE_RUN_ATTACH_TRIGGERS', which CAN attach a run of it to head $head while the wait runs (a push whose tip is $head, a 'gh workflow run --ref', or a rerun of a CANCELLED run)"
+            else
+              # ⛔ NOT "it declares a trigger" (round 2, P2): on this path the code could not
+              # READ the trigger list, so the only honest statement is that the answer is
+              # unread and the filter is kept fail-closed.
+              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no PR event can START it, and its declared trigger list could not be READ from the applicability reason — so the filter is kept because an unreadable answer is not an exemption, not because a run was measured absent"
+            fi
           else
             lane_trigger_clause="it declares a PR trigger this changed set does not match"
           fi

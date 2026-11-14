@@ -184,8 +184,8 @@ ck "(a2) ⛔ it does NOT claim the lane HAS a run — the probe never answered t
 # contradicted by the reason the block just consumed — and that sentence is exactly the
 # "cannot run" vs "did not run" confusion #2465 exists to remove. Pinned, because
 # nothing else in the suite looked at the clause.
-ck "(a2) the class clause names the STRUCTURAL fact (no PR trigger, but a trigger that CAN attach a run), not the NOT-RUN wording" \
-   "$(grep -q "declares no pull_request / pull_request_target, so no PR event can START it" <<<"$R_ERR" && echo 0 || echo 1)"
+ck "(a2) the class clause names the STRUCTURAL fact AND the MEASURED trigger list ('push'), not the NOT-RUN wording" \
+   "$(grep -q "declares no pull_request / pull_request_target, so no PR event can START it" <<<"$R_ERR" && grep -q "declares 'push'" <<<"$R_ERR" && echo 0 || echo 1)"
 ck "(a2) ⛔ it does NOT say 'declares a PR trigger this changed set does not match' — that would contradict the reason it just read" \
    "$(grep -q 'declares a PR trigger this changed set does not match' <<<"$R_ERR" && echo 1 || echo 0)"
 
@@ -198,6 +198,14 @@ echo "(a4) STRUCTURAL + NO parseable trigger clause + UNREADABLE — the CONSERV
 drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request' unreadable
 ck "(a4) an unknown trigger shape KEEPS the filter (fail closed) — a producer-side change must not re-open the fail-open" \
    "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+# ⛔ AND IT MUST NOT BE DESCRIBED AS A MEASUREMENT (round 2, P2). On this path the helper
+# could not READ the trigger list, so "it declares 'push'" would be a declaration the code
+# never read — the exact class the file's own "nothing may claim a measurement the code did
+# not take" rule forbids. The message must say the list was unread instead.
+ck "(a4) the message says the trigger list could not be READ — it does not claim a declared trigger" \
+   "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 0 || echo 1)"
+ck "(a4) ⛔ it does NOT print \"it declares '\" (a declared trigger it never read)" \
+   "$(grep -q "it declares '" <<<"$R_ERR" && echo 1 || echo 0)"
 
 # ── (a5)/(a6) MUTATION PROOFS — (a2)/(a4) must discriminate on the helper ───
 # Both mutations hit ONLY lane_own_run_can_attach, counted so a silent no-op proves
@@ -207,7 +215,7 @@ echo "(a5) MUTATION: 'push' no longer counts as attachable → arm (a2) is RED t
 HMUT="$TMP/helper-mutant-push.sh"
 awk '
   /^lane_own_run_can_attach\(\) \{/ { inh = 1 }
-  inh && /^    \*,push,\*\|/ { print "    __never_matches__) return 0 ;;"; n++; next }
+  inh && /^    \*,push,\*\) found="push" ;;$/ { print "    __never_matches__) found=\"push\" ;;"; n++; next }
   { print }
   inh && /^}$/ { inh = 0 }
   END { exit (n == 1 ? 0 : 1) }
