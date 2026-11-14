@@ -307,16 +307,20 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   not consult — a declared limit, not an assumption, and it holds **within the bound** as well as under
   it. So `backlog_drained` means "the record says the read succeeded and the queue holds nothing", and a
   reader must not take it as proof the queue was consumed. ⛔ Relatedly, the display
-  token `queue=` and this decision input differ deliberately on one stamp: `queue_state_token` clamps the
-  AGE to 0, not the token (an `EMPTY` record prints `EMPTY(0s)`, a `READ(7)` record prints `READ(7)(0s)`),
-  while `queue_state_class` answers blind (unverifiable is not fresh). Anything that gates asks the class;
+  token `queue=` and this decision input differ deliberately on TWO stamps: a FUTURE `at`
+  (`queue_state_token` clamps the AGE to 0, not the token — an `EMPTY` record prints `EMPTY(0s)`, a
+  `READ(7)` record prints `READ(7)(0s)`) and an ABSENT/unparseable `at` (the token prints the bare token
+  with NO age, e.g. `EMPTY`), while `queue_state_class` answers `blind` for both (unverifiable is not
+  fresh). ⛔ The bare-token case matters on its own: `queue=EMPTY` reads like a plain measurement.
+  Anything that gates asks the class;
 - `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room. ⛔ It is
   computed in the **drain-escape block**, not the
   cascade block — that separation is the whole point of it being its own token. ⛔ **A measured `0`
-  means the valve RE-GRANTED NOTHING, not that it did not fire** (review P2, 9th cycle): it can fire and
-  spend zero (the grant is coerced to 0 by a zero backlog), and it can fire on a pass the cascade
-  ALREADY granted (`escape=0` beside `slots=N>=1` is a real, recorded state). Only `escape>0` proves a
-  grant; `escape=0` proves only that the valve added nothing;
+  means the valve RE-GRANTED NOTHING, not that it did not fire** (review P2, 9th cycle): it can fire on a
+  pass the cascade ALREADY granted (`escape=0` beside `slots=N>=1` is a real, recorded state). ⛔ A zero
+  BACKLOG is **not** a second such state — that outcome is WITHHELD before any record is written
+  (*"No escape is taken and no record is written"*), so it publishes no `escape=` at all (10th cycle P1).
+  Only `escape>0` proves a grant; `escape=0` proves only that the valve added nothing;
 - `can_spawn=` — the capacity probe's own answer.
 
 ⛔ **`slots=` and `escape=` are DIFFERENT measurements and must never be read as one**: `slots=` is the

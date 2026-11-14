@@ -437,7 +437,8 @@ LANDING_FLOOR="${LANDING_FLOOR:-25}"
 FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 # How old a `state/queue-state` record may be before it stops being a MEASUREMENT of the pool. It
 # answers one question — "did this box read the pool recently enough that `empty_backlog` may be
-# published" — and it exists because `queue_state_token`'s own contract (:1931) says the age is part of
+# published" — and it exists because `queue_state_token`'s own contract (`:3075-3091`, agent-infra#1931)
+# says the age is part of
 # the reading so a value frozen by a dead refresh cannot pass as current, while a consumer that reads
 # only the STATE PREFIX throws exactly that component away. The ratio to state is the REFRESH's, not a
 # guess (review P2, 7th cycle — an earlier revision said "four refresh intervals" and was off by 3.75x):
@@ -3332,7 +3333,11 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # the heartbeat keeps the PREVIOUS reading together WITH ITS AGE"). On that box the record ages out and
 # this classifier answers `blind` — the bound DOES see it. (⛔ CITE THE ONE IN THE MIDDLE: `:4077` is
 # NOT one of the states above, which is why an earlier revision of this very comment contradicted its
-# own first paragraph by naming it there.) Only (b) and (c) keep a fresh stamp over an empty queue.
+# own first paragraph by naming it there.) ALL THREE keep a fresh stamp over an empty queue — (a)
+# because a zero `candidates.txt` makes `BL < 6` true, so the refresh is spawned every cycle and
+# re-stamps at `refresh-candidates.sh:4257`, and (b)/(c) as described — so the bound sees none of them
+# (the doc states exactly this; an earlier revision here excluded (a) and would have implied the
+# ORDINARY drained state gets demoted to `backlog_unreadable`).
 # So these two tokens name WHAT THE RECORD SAYS — the read succeeded, the queue file holds nothing — and
 # not why.
 # Telling "spent" from "refused before writing" needs the pass's own completed outcome
@@ -8511,8 +8516,9 @@ PY
   # ⛔ `CASCADE_ISSUE_SLOTS` IS NOT THE RUNG'S ANSWER BY THE TIME THE CYCLE RECORD IS WRITTEN. The
   # drain escape (see the [drain-escape] block ~600 lines below) RE-ASSIGNS it after this block when a
   # level held the room: `_egrant` is granted and `CASCADE_ISSUE_SLOTS="$_egrant"`. Its guard requires
-  # `CASCADE_ISSUE_SLOTS <= 0`, so the ONLY state the escape can fire in is exactly a level-HOLDS pass
-  # — meaning a record that reads `CASCADE_ISSUE_SLOTS` at emit time prints
+  # `CASCADE_ISSUE_SLOTS <= 0`, so the ONLY state the escape can GRANT in is exactly a level-HOLDS pass
+  # — ⛔ `CASCADE_ISSUE_SLOTS` is captured here and never re-read at emit time, so a record that read the
+  # global at emit would print
   # `level=MERGE slots=2`, a pair whose own documentation says cannot exist ("a level holds ⇒ slots=0"),
   # on EVERY cycle the valve exists for. A reader then cannot tell "the ISSUES rung was granted two"
   # from "a higher level held the room and the escape overrode it" — the same "the record could not
@@ -8547,7 +8553,7 @@ PY
   # (agent-infra#3909 review, 4th cycle P1; the ruling is #1931). `CASCADE_QUEUE_DEPTH` is
   # `wc -l < candidates.txt` coerced to 0 when that file cannot be read, so a zero ALSO arrives from a
   # refresh whose POOL LISTING FAILED — and an empty file is byte-identical to a fleet with nothing to
-  # do. This loop already settled that conflation in its own vocabulary (`queue_state_token`, :1931):
+  # do. This loop already settled that conflation in its own vocabulary (`queue_state_token`, `:3075-3091`):
   # EMPTY is "read and genuinely empty — the only answer that may mean 'no work'", UNREADABLE is "the
   # fleet is BLIND", UNKNOWN is "no pass ever recorded a read — never EMPTY". Publishing
   # `empty_backlog` for a pool nobody read would be that same defect reborn one field over, and it
@@ -9233,14 +9239,17 @@ PY
     fi
     # ⛔ THE ESCAPE PUBLISHES ITS OWN GRANT, SEPARATELY FROM THE RUNG'S (agent-infra#3909 review P1).
     # It RE-ASSIGNS `CASCADE_ISSUE_SLOTS` above, so a record that reads that global at emit time carries
-    # the escape's number under the rung's name — guaranteed, because the escape can only fire on a
-    # level-HOLDS pass. This assignment is the OVERRIDE, not the measurement: the token is zeroed at
+    # the escape's number under the rung's name — guaranteed, because the escape can only GRANT on a
+    # level-HOLDS pass (it can RECORD on any pass the valve opens; only the grant is gated). This
+    # assignment is the OVERRIDE, not the measurement: the token is zeroed at
     # the TOP of this block on every pass (see the reset there), so `escape=0` means the valve RE-GRANTED
-    # NOTHING — ⛔ NOT that it did not fire (review P2, 9th cycle). The valve can fire and still spend
-    # zero (the grant is coerced to 0 by a zero backlog), and it can fire on a pass the cascade ALREADY
-    # granted, so `escape=0` beside `slots=N>=1` is a real, recorded state. Only `escape>0` proves a
-    # grant, and the zeroing at the top of the block is what keeps a previous cycle's grant from being
-    # read as this one's.
+    # NOTHING — ⛔ NOT that it did not fire (review P2, 9th cycle). The fire-with-zero that exists is a
+    # pass where the cascade ALREADY granted: the valve opens and records, the grant guard fails, and the
+    # record carries `escape=0` beside `slots=N>=1` — a real, measured state. (⛔ A zero BACKLOG is NOT a
+    # second one: that outcome fails `_ecan` and takes the WITHHELD arm below, which writes no record at
+    # all — an earlier revision of this comment named it and was wrong, 10th cycle P1.) Only `escape>0`
+    # proves a grant, and the zeroing at the top of the block is what keeps a previous cycle's grant from
+    # being read as this one's.
     CASCADE_ESCAPE_SLOTS="${_egrant:-0}"
     # DOES THIS PASS ACTUALLY HAVE A SLOT TO SPEND? UNSET is the driver-rig/older-caller contract (the
     # escape keeps its pre-change behaviour); an explicit 0, or a grant that produced 0 because the
@@ -9916,7 +9925,7 @@ PY
     # conditions is decided, in the cascade block above; this emit only carries it.
     # ⛔ `slots=` IS THE RUNG'S OWN GRANT, CAPTURED IN THE CASCADE BLOCK — NOT `CASCADE_ISSUE_SLOTS`,
     # WHICH THE DRAIN ESCAPE RE-ASSIGNS LATER IN THE SAME CYCLE (review P1). The escape's guard
-    # requires `CASCADE_ISSUE_SLOTS <= 0`, so it can ONLY fire on a level-HOLDS pass; reading the global
+    # requires `CASCADE_ISSUE_SLOTS <= 0`, so it can only GRANT on a level-HOLDS pass; reading the global
     # here therefore printed `level=MERGE slots=N≥1` on exactly those cycles — a pair these comments
     # call impossible — and a reader could not tell a rung's grant from the escape's override. The two
     # are now separate fields: `slots=` is what the cascade resolved, `escape=` is what the valve spent.

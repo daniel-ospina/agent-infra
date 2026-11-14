@@ -478,9 +478,12 @@ drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <o
     # for it get the exact four-field answer they always got.
     # ⛔ `<nolisting>` models the UNREADABLE PR LISTING — the file `open_pr_count` deletes on its
     # failure path — which is one of the three causes `slots_why=` has to be able to name. It is
-    # removed BEFORE the block is sourced, never after: sourcing the block twice would run
-    # `cascade_main_probe` twice, and a rig that calls the shipped probe a second time to fix its own
-    # fixture is measuring its own mistake.
+    # removed BEFORE the block is sourced, never after: sourcing the block re-runs the level walk and
+    # re-reads the `state/` fixtures, so a rig that mutated a fixture AFTER a first source would grade a
+    # record built from the previous fixture — measuring its own mistake. (⛔ `cascade_main_probe` is NOT
+    # involved: its only call site sits outside the extracted range, which is why the rig cannot reach
+    # the network — an earlier revision of this comment credited the ordering to the probe, and no probe
+    # exists inside these 200 lines.)
     [ "${12:-}" = "1" ] && rm -f "$w/state/last-open-prs"
     # ⛔ `<poolstate>` (13) models `state/queue-state`, the refresh's OWN record of what its last POOL
     # READ saw (#1931: EMPTY / READ(n) / PARTIAL(x) / UNREADABLE, with UNKNOWN meaning nobody ever
@@ -605,7 +608,7 @@ ck "…and it is the LEVEL holding it, not a FULL box (23 lanes are free, so the
 # ── 11b. THE RUNG'S GRANT, FROZEN WHERE IT IS RESOLVED (agent-infra#3909 review P1) ─────────────
 # ⛔ THE DEFECT THESE ARMS PIN. The cycle record read `CASCADE_ISSUE_SLOTS` AT EMIT TIME, but the drain
 # escape RE-ASSIGNS that global after the cascade block — and its guard (`CASCADE_ISSUE_SLOTS <= 0`)
-# means it can ONLY fire on a level-HOLDS pass. So every record the valve produced carried
+# means it can only GRANT on a level-HOLDS pass. So every record the valve GRANTED ON carried
 # `level=MERGE slots=N≥1`, a pair the field's own documentation calls impossible, and a reader could
 # not tell the ISSUES rung's grant from the escape's override. `CASCADE_RUNG_SLOTS` is the rung's own
 # answer, captured inside the driven block; `CASCADE_ESCAPE_SLOTS` (asserted in 14e) is the valve's.
