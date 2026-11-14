@@ -5507,22 +5507,57 @@ EV_REF="comment:42505901" run_record_ev 425059 STUB_EVIDENCE_BODY="**Outcome: CL
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13n51 a collective that governs no persistence ('some tests were added') still records (rc 0)"
 
-# 13n52 — F5, THE QUOTED DECLARATION. Self-referential, which is how it was found: a clean review
-# that QUOTES the measured artifact was itself refused, so this change could not have been reviewed
-# by a reviewer who cited its evidence. Inline code spans are stripped for the GATE tests only.
-# ⛔ THE BACKTICK IS BUILT, NOT WRITTEN — `20h48b` forbids a live backtick on a non-comment line,
-# and it CAUGHT the first draft of this row. `printf '\140'` is the same no-live-backtick trick the
-# N9859 fixture above uses.
-N52_BT="$(printf '\140')"
-N52_BODY="Verified the arm on the measured artifact: ${N52_BT}**Outcome: 3 findings — 2 blocking (P1), 1 documentation (P2).**${N52_BT} is now refused.
-
-**Outcome: CLEAN — the quote above is a citation, not this review's declaration.**
+# 13n52 — F5, THE QUOTED DECLARATION — A **DECLARED RESIDUAL**, NOT A CLOSED HOLE (second review, F1).
+# The first cut of this row asserted rc 0, because the arm stripped backtick spans so a clean review
+# could QUOTE the measured artifact. That strip was a BYPASS and is DELETED: one backtick removed the
+# arm entirely, MEASURED regressing `**Outcome: 2 `blocking` findings were fixed; 1 P0 remains open.**`
+# and `**`Outcome:` 2 blocking findings were fixed; 1 P0 remains open.**` from VETO to ESCAPE. No
+# syntactic rule separates a quotation from a declaration — they are lexically identical — so the
+# gate keeps the SAFE polarity (refuse), and the cost is stated: a review must not reproduce a
+# blocking `Outcome:` declaration verbatim on an `Outcome:` line; describe it or cite the PR comment.
+rm -f "$(Q2 425060)"
+EV_REF="comment:42506001" run_record_ev 425060 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 P1 remains open.**
 
 $VACUITY_BLOCK"
-rm -f "$(Q2 425060)"
-EV_REF="comment:42506001" run_record_ev 425060 STUB_EVIDENCE_BODY="$N52_BODY"
-assert_eq "$RECORD_RC" "0" "13n52 a QUOTED blocking declaration inside a clean review is a CITATION, not a declaration (rc 0)"
+assert_eq "$RECORD_RC" "3" "13n52 RESIDUAL (documented): a verbatim blocking declaration is REFUSED even where it was meant as a quotation — the safe polarity"
 
+# 13n53-13n56 — THE SECOND REVIEW'S MEASURED F1 CLASS, AND ITS OVER-BLOCK CONTROLS. The first fix made
+# only `_OC_STILL` severity-aware, so a severity-tagged remainder phrased with a RESOLUTION or
+# IN-PROGRESS verb reached no arm at all — six vectors, MEASURED escaping on 2831db382. They are closed
+# by ONE SHAPE rule (a surviving `<count> <P0|P1>` after the declared count is masked), not by six more
+# synonyms, which is the mistake every earlier round made one word later.
+for _v53 in "1 P0 (security) was not addressed" "1 P1 partially resolved" "1 P1 not yet fixed" "1 P1 being fixed"; do
+  rm -f "$(Q2 425061)"
+  EV_REF="comment:42506101" run_record_ev 425061 STUB_EVIDENCE_BODY="**Outcome: 2 blocking findings were fixed; ${_v53}.**
+
+$VACUITY_BLOCK"
+  assert_eq "$RECORD_RC" "3" "13n53 a severity-tagged remainder through any verb ('${_v53}') is a live blocker — refused (rc 3)"
+done
+
+# 13n54 — THE OVER-BLOCK CONTROL for the shape rule: a P2/P3 count is NOT a blocking remainder, and a
+# collective that WAS resolved is not a remainder. Both were MEASURED refused by the first attempt at
+# this fix (`_OC_COLLECTIVE` carried the RESOLUTION verbs), so they are pinned here.
+rm -f "$(Q2 425062)"
+EV_REF="comment:42506201" run_record_ev 425062 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed and re-verified; 2 P3 nits filed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n54 a NON-blocking P3 count is not a remainder — recorded (rc 0)"
+
+rm -f "$(Q2 425063)"
+EV_REF="comment:42506301" run_record_ev 425063 STUB_EVIDENCE_BODY="**Outcome: CLEAN — the 1 blocking finding was fixed; the rest were addressed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n55 a collective that WAS resolved ('the rest were addressed') is not a remainder — recorded (rc 0)"
+
+# 13n56 — THE BYPASS THAT WAS DELETED, PINNED SO IT CANNOT COME BACK. Wrapping a word in inline code
+# must not hide a declaration from the arm.
+rm -f "$(Q2 425064)"
+N56_BT="$(printf '\140')"
+N56_BODY="**Outcome: 2 ${N56_BT}blocking${N56_BT} findings were fixed; 1 P0 remains open.**
+
+$VACUITY_BLOCK"
+EV_REF="comment:42506401" run_record_ev 425064 STUB_EVIDENCE_BODY="$N56_BODY"
+assert_eq "$RECORD_RC" "3" "13n56 inline code cannot hide a declaration ('2 [code-span]blocking findings … 1 P0 remains open') — refused (rc 3)"
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
@@ -6589,13 +6624,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4474 :6200 :8574 :8748, plus a comment mention at :4343; `14.1c-CITE` below
+#     CITE-CHECK: :4521 :6247 :8621 :8795, plus a comment mention at :4390; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4398) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4474) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4521) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8574). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8621). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -6621,7 +6656,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8574` / `:8748` — CITE-CHECK: :8574 :8748 — re-derived by the
+#     this head the predicates are `:8621` / `:8795` — CITE-CHECK: :8621 :8795 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -7525,12 +7560,12 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
 #       and in #3168's diff the only hunk at `post_marker()` (head :4398) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4474) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :4521) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6200 :8574 :8748 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6247 :8621 :8795 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
