@@ -1112,7 +1112,7 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh|*/key-gate.sh) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh|*/key-gate.sh|*/turn-end.py) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -1221,6 +1221,18 @@ if grep -qE -e "$_kg_flag" <<<"$_kg_code" && grep -qF -- '--no-session' <<<"$_kg
 ck "the excluded key-gate.sh is a NON-launcher in CODE (the pi token pair lives in its printf remedy strings, so what matched is prose), so its census exclusion hides no launch path" $rc
 if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' <<<"$_kg_code"; then rc=1; else rc=0; fi
 ck "the excluded key-gate.sh carries no spawn primitive, so its census exclusion hides no launch path" $rc
+# ⛔ `turn-end.py` IS THE SIXTH OF THAT CLASS, AND IT LANDED ON `main` AFTER THIS CENSUS (#4048,
+# `f0d33db75`) — it made `bash-suites` RED on `main` for every PR that rebased onto it, the fifth time
+# this exact shape has done so. It is the t6-route module: it reads triage EVIDENCE and refuses to
+# nudge a lane it cannot prove steerable, which is why it carries `pi -p --no-session` in its
+# docstrings (`:587`, `:688`) and why that is prose, not a launch. Its spawn primitives are
+# `subprocess.run` for git/JSON CLIs, so neither arm above fits; the assertion is the argv the census
+# keys on — the file must carry NO quoted `pi` command token, which is what any real launch it grew
+# would have to name (a `pi` assembled purely from variables is the detector's own STATED LIMIT,
+# already declared above, not a new one).
+_tn_code="$(sed 's/#.*//' "$HERE/turn-end.py" 2>/dev/null)"
+if grep -qE "[\"']pi[\"']" <<<"$_tn_code"; then rc=1; else rc=0; fi
+ck "the excluded turn-end.py is a NON-launcher (no quoted 'pi' command token; the pi token pair lives in its docstrings), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
