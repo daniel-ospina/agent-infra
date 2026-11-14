@@ -933,6 +933,77 @@ export -f pi
 drive "$WT" "$KEYVAR=sk_fixture"
 check_terminal "9h" failed "agent-exit-1" 1
 
+# ═══ 10. THE LANE'S PRODUCT IS A PUSHED HEAD, NOT THE AGENT'S EXIT STATUS (agent-infra#4047) ═══
+# MEASURED: ten lanes were dispatched to deliver children of #4006 and FOUR exited 0 having delivered
+# nothing — #4009 (1 commit) and #4012 (6 commits) committed and never pushed, #4011 left four files
+# staged and never committed, #4016 produced nothing at all. All four wrote the SAME terminal line,
+# `outcome=done reason=agent-exit-0`, which is indistinguishable from the six that did deliver.
+#
+# ⛔ EACH ARM BELOW REDDENS ON THE PRE-CHANGE TREE, and that is the falsifier: before this change no
+# arm's `done` line carried a delivery token at all, so `has "$(lastline)" unpushed-1` fails there.
+# The pre-existing arms stay green because `check_terminal` matches the reason by SUBSTRING and every
+# new token keeps `agent-exit-0` as its prefix — that compatibility is a designed property, not luck.
+
+# 10a DELIVERED — origin carries the lane's own head and the tree is clean: the ONE state that is
+# unchanged. If this arm ever drifts to a suffix, delivered lanes have been silently reclassified.
+mk_arm deliv_ok; WT="$ARMWT"
+pi() { printf 'ran\n'; return 0; }
+export -f pi
+"$REAL_GIT" -C "$ARMWT" update-ref "refs/remotes/origin/$BR" "$("$REAL_GIT" -C "$ARMWT" rev-parse HEAD)"
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10a" done "agent-exit-0" 0
+has "$(lastline)" "reason=agent-exit-0 " "10a2 …and a DELIVERED lane carries NO suffix — the one case that must read exactly as it did before this change"
+
+# 10b UNPUSHED — the #4009/#4012 shape: real commits that origin does not carry.
+# ⛔ THE STUB USES `git`, NOT `$REAL_GIT`, AND THAT IS THE FIX TO THIS ARM'S FIRST CUT (measured
+# 2026-11-12). `export -f pi` carries the function BODY across the process boundary into lane.sh's own
+# `bash`, but `REAL_GIT` is a plain shell variable and is NOT exported — so inside that process it was
+# empty, the command degenerated to `-C <path> add …` with no command word, `pi` returned non-zero,
+# and the lane took the `rc=1` path the delivery read never sees. An exported function inherits an
+# exported ENVIRONMENT, never the caller's unexported locals.
+mk_arm deliv_unpushed; WT="$ARMWT"
+pi() {
+  printf 'work\n' > "$PWD/pushed-later.txt"
+  git -C "$PWD" add -A >/dev/null 2>&1
+  git -C "$PWD" -c user.email=t@t -c user.name=t commit -qm 'lane work' >/dev/null 2>&1
+  printf 'ran\n'; return 0
+}
+export -f pi
+"$REAL_GIT" -C "$ARMWT" update-ref "refs/remotes/origin/$BR" "$("$REAL_GIT" -C "$ARMWT" rev-parse HEAD)"
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10b" done "agent-exit-0-undelivered:unpushed-1" 0
+has "$(cat "$(LOG)" 2>/dev/null)" "NOTHING LEFT THE BOX" \
+    "10b2 …and the log says it in words, not only in a grep key — an operator reads the log, not the census"
+
+# 10c UNCOMMITTED — the #4011 shape: files written, never committed. Distinct from 10b on purpose:
+# a commit needs a push, staged work needs a commit, and one remedy cannot serve both.
+mk_arm deliv_dirty; WT="$ARMWT"
+pi() { printf 'staged\n' > "$PWD/staged.txt"; printf 'ran\n'; return 0; }
+export -f pi
+"$REAL_GIT" -C "$ARMWT" update-ref "refs/remotes/origin/$BR" "$("$REAL_GIT" -C "$ARMWT" rev-parse HEAD)"
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10c" done "agent-exit-0-undelivered:uncommitted-1" 0
+
+# 10d NOCHANGE — the #4016 shape: no commit beyond main, clean tree. Named rather than folded into
+# `undelivered`, because a lane dispatched to CHECK something legitimately ends here while one
+# dispatched to CHANGE something has silently done nothing, and the report must let a reader tell.
+mk_arm deliv_nochange; WT="$ARMWT"
+pi() { printf 'ran\n'; return 0; }
+export -f pi
+"$REAL_GIT" -C "$ARMWT" update-ref refs/remotes/origin/main "$("$REAL_GIT" -C "$ARMWT" rev-parse main)"
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10d" done "agent-exit-0-nochange" 0
+
+# 10e UNKNOWN — the read cannot answer (no origin ref of any kind). It must SAY so rather than
+# assume delivery: reporting an absence of evidence as evidence of delivery is the defect being
+# fixed, and rebuilding it inside its own fix is the failure this arm exists to prevent. Every
+# pre-existing arm in this suite lands here, which is exactly why they needed no edit.
+mk_arm deliv_unknown; WT="$ARMWT"
+pi() { printf 'ran\n'; return 0; }
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "10e" done "agent-exit-0-delivery-unknown" 0
+
 echo
 if [ "$FAIL" -gt 0 ]; then
   printf '❌ lane-outcome suite: %s passed, %s FAILED\n' "$PASS" "$FAIL"
