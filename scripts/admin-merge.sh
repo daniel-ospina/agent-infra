@@ -6734,6 +6734,41 @@ lane_no_pr_trigger() {
   return 1
 }
 
+# lane_own_run_can_attach <reason> — TRUE (0) when the MEASURED applicability reason's
+# `(declared triggers: …)` clause names a trigger that can start a run OF THIS WORKFLOW
+# on an arbitrary branch tip, i.e. a run that can BE this head's run while the wait runs:
+#
+#   push                a push whose tip is $head runs it on $head
+#   workflow_dispatch   `gh workflow run <wf> --ref <branch>` runs it on that branch tip
+#
+# `workflow_call` does NOT count: a reusable workflow's checks attach under the CALLER's
+# workflow name (#1413), so filtering by the lane's OWN name can never match — that is
+# #2465's `python-ci.yml` case, and it is the one that MUST keep widening. `schedule`
+# does NOT count either: it fires on the default branch, never on a PR head.
+#
+# ⛔ AN ABSENT / UNPARSEABLE CLAUSE IS "CAN ATTACH" (returns 0, the fail-closed answer).
+# Widening is the LOOSENING direction, so an unknown trigger shape must keep the filter
+# and let §1b refuse. The other default would let a producer-side change silently
+# re-open the same fail-open (#2465 review P1) with every arm still green.
+#
+# The clause is produced by scripts/ci-workflow-pr-evaluable.sh:829-832 and is already
+# present in LANE_APPLICABILITY_REASON, so this costs no extra `gh` call.
+lane_own_run_can_attach() {
+  local reason="${1:-}" triggers="" list=""
+  case "$reason" in
+    *'(declared triggers:'*')'*)
+      triggers="${reason##*'(declared triggers:'}"
+      triggers="${triggers%%)*}"
+      ;;
+    *) return 0 ;;
+  esac
+  list=",$(printf '%s' "$triggers" | tr -d '[:space:]'),"
+  case "$list" in
+    *,push,*|*,workflow_dispatch,*) return 0 ;;
+  esac
+  return 1
+}
+
 # lane_head_run_state <head> — MEASURE whether the watched lane has a run for
 # <head>, into the THREE-valued global LANE_HEAD_RUN_STATE:
 #
@@ -10087,16 +10122,29 @@ main() {
         #                 filtered wait CAN clear. (A first cut of #2465 skipped the probe
         #                 here and reversed #1614 as a side effect — do not reintroduce it.)
         #   none        → widen, loudly. Waiting cannot create a run that does not exist.
-        #   unreadable  → class-dependent, because the two classes disagree on whether a
-        #                 run can still APPEAR:
-        #                 * STRUCTURAL — it cannot (no PR trigger can start one), so the
-        #                   filtered wait is INERT and one failed `gh run list` is not
-        #                   something waiting can outlast. Widen, loudly. THIS is
-        #                   #2465's measured burn (3900 s decided by one unread REST
-        #                   response), not a probe that answered "has a run".
-        #                 * every other class — a run can appear while the wait runs, so
-        #                   an unread answer is not an exemption: KEEP the filter and let
-        #                   §1b refuse exactly as before (fail closed).
+        #   unreadable  → class- AND TRIGGER-dependent, because the question that decides
+        #                 is not "does it have a PR trigger" but "can a run OF THIS
+        #                 WORKFLOW still appear on THIS head while the wait runs":
+        #                 * STRUCTURAL and the lane declares neither `push` nor
+        #                   `workflow_dispatch` — no run of this workflow can be started
+        #                   on a branch tip, so the filtered wait is INERT and one failed
+        #                   `gh run list` is not something waiting can outlast. Widen,
+        #                   loudly. THIS is #2465's measured burn (3900 s decided by one
+        #                   unread REST response); its `python-ci.yml` is exactly this
+        #                   shape (`workflow_call` only — its checks attach under a
+        #                   CALLER's name, so filtering by its OWN name can never match).
+        #                 * STRUCTURAL WITH `push` / `workflow_dispatch` — such a run CAN
+        #                   attach to this head while the wait runs (a push whose tip is
+        #                   $head, a `gh workflow run --ref`, or a rerun of a CANCELLED
+        #                   run — this repo's own cancel-in-progress produces exactly
+        #                   that), and it carries THIS workflow's name, so the filtered
+        #                   wait is still a SIGNAL. An unread answer is NOT an exemption:
+        #                   KEEP the filter and let §1b refuse — which is what
+        #                   `origin/main` did for EVERY class (#2465 review P1: widening
+        #                   here turned one transient read failure into a merge past the
+        #                   watched lane's fresh-PR race).
+        #                 * every other class — a run can appear while the wait runs: KEEP
+        #                   the filter and let §1b refuse exactly as before (fail closed).
         # The lane is classified ONCE, here, and the FIRST-CHECKS wait consumes THAT
         # decision (via ANY_WORKFLOW) instead of re-deriving it per poll.
         local lane_dead_end=0 lane_structural=0 lane_probe_state="" lane_kept_why=""
@@ -10107,7 +10155,17 @@ main() {
         case "$lane_probe_state" in
           has-run) lane_dead_end=0 ;;
           none)    lane_dead_end=1 ;;
-          *)       lane_dead_end="$lane_structural" ;;
+          *)
+            # `unreadable` is NOT "no run". Widen only when the lane's own run can never
+            # attach to a PR head — see the block comment above and
+            # `lane_own_run_can_attach`. That helper answers TRUE for an absent or
+            # unparseable trigger list, so an unknown trigger shape keeps the filter.
+            if [ "$lane_structural" -eq 1 ] && ! lane_own_run_can_attach "$LANE_APPLICABILITY_REASON"; then
+              lane_dead_end=1
+            else
+              lane_dead_end=0
+            fi
+            ;;
         esac
         if [ "$lane_dead_end" -eq 1 ]; then
           LANE_FALLBACK_FROM="$WORKFLOW"
@@ -10144,18 +10202,20 @@ main() {
             say_err "   pull_request event for head $head can START it (a push-triggered member of the class is"
             say_err "   only started by an actual push to the branch), and $lane_run_clause."
             if [ "$lane_probe_state" = unreadable ]; then
-              # ⛔ NOT "NO RUN CAN APPEAR" (review round 8, P2). The line directly above already says a
-              # push-triggered member of this class is started by a push to the branch — and a push
-              # whose tip is $head, or a `gh run rerun` of a CANCELLED run, attaches a run to THIS head
-              # while the wait runs (this repo's own cancel-in-progress produces exactly that). What the
-              # code established is weaker than the old absolute: the widened read is a superset, and the
-              # width cap bounds it — so the filtered wait is no SIGNAL here rather than provably inert.
-              # An operator told "inert" concludes waiting is pointless when the push-triggered run is
-              # precisely what would have cleared it.
-              say_err "   For this class this PR's own changed set cannot start it, and the probe could not"
-              say_err "   tell whether a push to the branch (or a rerun of a cancelled run) has attached one to"
-              say_err "   head $head. So the filtered wait is no SIGNAL here rather than provably inert, and it"
-              say_err "   cannot outlast a failed read (#2465: one failed read cost 3900 s)."
+              # ⛔ ACCURATE FOR THIS ARM ONLY (review P1). This block is reached on an
+              # UNREADABLE probe AND only when the lane's own `on:` names neither `push`
+              # nor `workflow_dispatch` — the two triggers that can start a run of it on a
+              # branch tip. The class lines just above describe the whole STRUCTURAL class
+              # (and stay true for a `push`-triggered lane that MEASURED no run), but THIS
+              # arm is narrower: the TRIGGER LIST, not the failed read, is what makes the
+              # filtered wait inert here. A `push`/`workflow_dispatch` member never reaches
+              # this line — it KEEPS its filter and fails closed on the same failed read,
+              # because a push whose tip is $head attaches a run to this head while the
+              # wait runs.
+              say_err "   This lane's own 'on:' declares no 'push' and no 'workflow_dispatch', so no run of"
+              say_err "   it can attach to head $head however long the wait runs — the filtered wait"
+              say_err "   cannot outlast the failed read (#2465: one failed read cost 3900 s). A"
+              say_err "   'push'/'workflow_dispatch' lane is NOT widened here: it keeps its filter."
             fi
           else
             say_err "   dead-end class: NOT-RUN — the lane declares a PR trigger this changed set does not match,"
@@ -10182,7 +10242,7 @@ main() {
           ANY_WORKFLOW=1
           wf_args=(--any-workflow)
           lane="any workflow"
-        elif [ "$lane_structural" -eq 1 ]; then
+        elif [ "$lane_structural" -eq 1 ] && [ "$lane_probe_state" = has-run ]; then
           # ── THE #1614 DEAD-END GATE HELD: the lane HAS a run for this head ─────
           # A STRUCTURAL lane is NOT automatically a dead end. `on: push` is a member
           # of this class and it DOES run on the PR head's own commit, so the filtered

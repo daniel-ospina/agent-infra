@@ -69,9 +69,14 @@ extract_helper() { # $1 = source path  $2 = helper name
 }
 
 build_lib() { # $1 = source path, $2 = output file
-  local src="$1" out="$2" block helper
+  local src="$1" out="$2" block helper helper2
   block="$(extract_block "$src")"
   helper="$(extract_helper "$src" lane_no_pr_trigger)"
+  # (#2465 review P1) the SECOND classifier: can this lane's OWN name ever appear on a
+  # run for a PR head? §0b consults it on an `unreadable` probe, so the seam is
+  # incomplete without it — an extraction that dropped it would leave arm (a2) testing
+  # a command-not-found, which reads as "kept" for the wrong reason.
+  helper2="$(extract_helper "$src" lane_own_run_can_attach)"
   {
     printf '%s\n' 'say_err() { printf "%s\n" "$*" >&2; }'
     printf '%s\n' 'info()   { printf "%s\n" "$*" >&2; }'
@@ -100,13 +105,14 @@ build_lib() { # $1 = source path, $2 = output file
     printf '%s\n' '  printf "APLOG=%s\n" "$AP_LOG" >&2'
     printf '%s\n' '}'
     printf '%s\n' "$helper"
+    printf '%s\n' "$helper2"
     # The lib is RUN (`bash < lib`), not SOURCED from a `bash -c` payload: a
     # `source "$1"` token makes the suite's own body unreadable to
     # main-worktree-guard (#1484), which then refuses to run the suite at all. The
     # trailing call is what a `source` used to be paired with in the caller.
     printf '%s\n' 'run_s0b 0 python-ci.yml'
   } > "$out"
-  [ -n "$block" ] && [ -n "$helper" ]
+  [ -n "$block" ] && [ -n "$helper" ] && [ -n "$helper2" ]
 }
 
 LIB="$TMP/lib.sh"
@@ -152,6 +158,82 @@ ck "(a) ⛔ it does NOT claim the lane has no run for the head — the probe nev
    "$(grep -q 'lane has NO run for head' <<<"$R_ERR" && echo 1 || echo 0)"
 ck "(a) it still prints the loud LANE INAPPLICABLE heading and the §4.5 reassurance" \
    "$(grep -q 'LANE INAPPLICABLE' <<<"$R_ERR" && grep -q '§4.5' <<<"$R_ERR" && echo 0 || echo 1)"
+
+# ── (a2)–(a4) THE FAIL-CLOSED DIRECTION (review P1) ────────────────────────
+# `unreadable` is NOT an exemption for a STRUCTURAL lane whose OWN name can still
+# appear on a run for this head. `on: push` is a member of this class and a push whose
+# tip is $head (or a rerun of a CANCELLED run) attaches a run OF THAT WORKFLOW to THIS
+# head while the wait runs — so the filtered wait is still a SIGNAL and the pre-#2465
+# fail-closed behaviour must be preserved. `origin/main` failed closed for EVERY class;
+# widening this subset is a merge-surface loosening nobody asked for (`--any-workflow`
+# is the operator's escape, not a failed read).
+echo "(a2) STRUCTURAL + 'push' + UNREADABLE probe — must KEEP the filter (fail closed)"
+drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: push)' unreadable
+ck "(a2) NO widening on a failed read (ANY_WORKFLOW='$R_ANY', wf_args='$R_WFARGS') — a push-triggered lane CAN clear the filtered wait" \
+   "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+ck "(a2) the certificate still names the requested lane (lane='$R_LANE')" \
+   "$([ "$R_LANE" = "python-ci.yml" ] && echo 0 || echo 1)"
+ck "(a2) it says LANE KEPT and names the FAILED read, so the operator is not left guessing" \
+   "$(grep -q 'LANE KEPT' <<<"$R_ERR" && grep -q 'read FAILED' <<<"$R_ERR" && echo 0 || echo 1)"
+ck "(a2) it does NOT print 'LANE INAPPLICABLE' (that string means the lane was DROPPED)" \
+   "$(grep -q 'LANE INAPPLICABLE' <<<"$R_ERR" && echo 1 || echo 0)"
+ck "(a2) ⛔ it does NOT claim the lane HAS a run — the probe never answered that" \
+   "$(grep -q 'the lane HAS a run' <<<"$R_ERR" && echo 1 || echo 0)"
+
+echo "(a3) STRUCTURAL + 'workflow_dispatch' + UNREADABLE probe — must KEEP the filter"
+drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_dispatch)' unreadable
+ck "(a3) NO widening: 'gh workflow run --ref <branch>' attaches a run of THIS workflow to THIS head" \
+   "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+
+echo "(a4) STRUCTURAL + NO parseable trigger clause + UNREADABLE — the CONSERVATIVE default"
+drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request' unreadable
+ck "(a4) an unknown trigger shape KEEPS the filter (fail closed) — a producer-side change must not re-open the fail-open" \
+   "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+
+# ── (a5)/(a6) MUTATION PROOFS — (a2)/(a4) must discriminate on the helper ───
+# Both mutations hit ONLY lane_own_run_can_attach, counted so a silent no-op proves
+# nothing. (a5) makes the "can attach" answer unreachable for push; (a6) flips the
+# absent-clause default to the LOOSENING one. Each must turn exactly its own arm RED.
+echo "(a5) MUTATION: 'push' no longer counts as attachable → arm (a2) is RED there"
+HMUT="$TMP/helper-mutant-push.sh"
+awk '
+  /^lane_own_run_can_attach\(\) \{/ { inh = 1 }
+  inh && /^    \*,push,\*\|/ { print "    __never_matches__) return 0 ;;"; n++; next }
+  { print }
+  inh && /^}$/ { inh = 0 }
+  END { exit (n == 1 ? 0 : 1) }
+' "$SRC" > "$HMUT"
+ck "(a5) the mutation applied EXACTLY once to the push branch" "$?"
+ck "(a5) the mutant parses (bash -n)" "$(bash -n "$HMUT" 2>/dev/null && echo 0 || echo 1)"
+HMUTLIB="$TMP/helper-mutant-push-lib.sh"
+ck "(a5) the mutant still builds a lib carrying the helper (not testing an empty seam)" \
+   "$(build_lib "$HMUT" "$HMUTLIB" && grep -q 'lane_own_run_can_attach' "$HMUTLIB" && echo 0 || echo 1)"
+HM_ERR="$(AP_VERDICT=inapplicable \
+  AP_REASON='lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: push)' \
+  AP_PROBE_STATE=unreadable bash < "$HMUTLIB" 2>&1 >/dev/null)"
+HM_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$HM_ERR")"
+ck "(a5) against the mutant (a2)'s assertion is RED (ANY_WORKFLOW='$HM_ANY' — the failed read widened the merge surface again)" \
+   "$([ "$HM_ANY" = 1 ] && echo 0 || echo 1)"
+
+echo "(a6) MUTATION: the absent-clause default flipped to 'inert' → arm (a4) is RED there"
+HMUT2="$TMP/helper-mutant-default.sh"
+awk '
+  /^lane_own_run_can_attach\(\) \{/ { inh = 1 }
+  inh && /^    \*\) return 0 ;;$/ { print "    *) return 1 ;;"; n++; next }
+  { print }
+  inh && /^}$/ { inh = 0 }
+  END { exit (n == 1 ? 0 : 1) }
+' "$SRC" > "$HMUT2"
+ck "(a6) the mutation applied EXACTLY once to the absent-clause default" "$?"
+HMUT2LIB="$TMP/helper-mutant-default-lib.sh"
+ck "(a6) the mutant still builds a lib carrying the helper" \
+   "$(build_lib "$HMUT2" "$HMUT2LIB" && grep -q 'lane_own_run_can_attach' "$HMUT2LIB" && echo 0 || echo 1)"
+HM2_ERR="$(AP_VERDICT=inapplicable \
+  AP_REASON='lane-applicable: no-pr-trigger — declares no pull_request' \
+  AP_PROBE_STATE=unreadable bash < "$HMUT2LIB" 2>&1 >/dev/null)"
+HM2_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$HM2_ERR")"
+ck "(a6) against the mutant (a4)'s assertion is RED (ANY_WORKFLOW='$HM2_ANY' — an unparseable trigger list widened)" \
+   "$([ "$HM2_ANY" = 1 ] && echo 0 || echo 1)"
 
 # ── (b) STRUCTURAL class + probe that MEASURED "no run" ────────────────────
 echo "(b) STRUCTURAL (no PR trigger) + the run probe MEASURED no run — dead end on the measurement"
