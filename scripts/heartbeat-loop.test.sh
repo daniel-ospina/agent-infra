@@ -81,6 +81,9 @@
 #      And stopping it leaves NO ORPHAN: the loop is signalled as a PROCESS GROUP, so the
 #      `sleep "$SLP"` it parks in (~540 s) does not outlive the test (review advisory, #1954).
 #  13. `<child>.stderr` IS TRUNCATED AT LAUNCH, so run N's report cannot carry run N-1's line.
+#  15. THE PATH PIN'S RANK (#1867 review P1 residual) — the gh shim must outrank
+#      `/opt/homebrew/bin`, which is where `gh` lives on a brew Mac. Prepending per entry installed
+#      the list REVERSED, so the shim was shadowed and the #984/#1910 gates inert.
 #
 # Run: bash scripts/heartbeat-loop.test.sh
 set -uo pipefail
@@ -150,7 +153,12 @@ mkfix() {
 # one-pass exit is gone and the suite must fail rather than hang CI forever.
 run_pass() {
   local d="$1"
+  # ⛔ `RUN_PASS_PATH` LETS ONE CASE CHOOSE THE INHERITED PATH (#1867 review P2, round 6). The pin's
+  # whole job is to OVERRIDE an inherited rank, so a case that wants to prove it must be able to
+  # hand the loop a PATH of its own; every other case takes `$PATH` unchanged. `-`, not `:-`: an EMPTY
+  # value is a PATH OF ITS OWN (round 8's §15d drives an empty PATH), not a request for the default.
   ( HOME="$d/home" HEARTBEAT_PI_AGENT_DIR="$d/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=1 \
+      PATH="${RUN_PASS_PATH-$PATH}" \
       /bin/bash "$LOOP" >/dev/null 2>&1 ) &
   local pid=$! wd
   # ⛔ KILL THE GROUP, NOT THE SUBSHELL. `kill "$wd"` reaped the watchdog subshell and orphaned the
@@ -750,6 +758,284 @@ if has "$TXT14G" "PR-DOCTOR RED UNREPORTED (verdict is STALE"; then
   pass "14g. …and a stale rc=3 is UNREPORTED too (one ordering, matching objective.py)"
 else
   fail "14g. a stale rc=3 was not reported as UNREPORTED (got: $(grep -m1 'PR-DOCTOR' "$LOG14G" 2>/dev/null | cut -c1-140))"
+fi
+
+echo ""
+echo "15. THE PIN'S RANK: the gh shim must NOT lose to /opt/homebrew/bin (the brew-Mac box)"
+# ⛔ THE DEFECT THIS PINS (#1867 review P1 residual). The pin was TWO loops that each PREPENDED per
+# entry, and prepending in list order installs the list REVERSED — the LAST entry wins the front. So
+# `/opt/homebrew/bin` landed ahead of `$HOME/.pi/agent/shims`: on a brew Mac (`gh` IS
+# `/opt/homebrew/bin/gh`, `scripts/capacity-transfer.test.sh:48`) every child's bare `gh` resolved to
+# the RAW binary, silently disarming the shim's #984 admin-merge guard and #1910 pacing gate for the
+# loop's whole life while the pin looked installed. `MEMORY.md:59` records the same trap.
+#
+# ⛔ THE FIXTURE IS THE SHIPPED FILE, NOT A COPY OF ITS LOGIC. The two macOS-absolute dirs cannot
+# exist on a Linux runner, so they are RE-ROOTED into the fixture and the assertion below proves the
+# relocation changed nothing else. The pass is REAL: the tick stub only reports what the loop's own
+# PATH made `gh` resolve to, so nothing here re-implements the precedence it is grading.
+PINROOT="$TMP/pinrank"
+mkdir -p "$PINROOT/opt/homebrew/bin" "$PINROOT/Applications/cmux.app/Contents/Resources/bin"
+printf '#!/bin/bash\necho SHIM-GH\n' > "$PINROOT/shim-gh"
+printf '#!/bin/bash\necho REAL-GH\n' > "$PINROOT/real-gh"
+chmod +x "$PINROOT/shim-gh" "$PINROOT/real-gh"
+RELOC="$PINROOT/relocated-heartbeat-loop.sh"
+sed -e "s#/Applications/cmux.app#$PINROOT/Applications/cmux.app#g" \
+    -e "s#/opt/homebrew/bin#$PINROOT/opt/homebrew/bin#g" "$LOOP" > "$RELOC"
+BACK="$(sed -e "s#$PINROOT/Applications/cmux.app#/Applications/cmux.app#g" \
+             -e "s#$PINROOT/opt/homebrew/bin#/opt/homebrew/bin#g" "$RELOC" | cksum)"
+if [ "$BACK" = "$(cksum < "$LOOP")" ]; then
+  pass "15. the fixture is the SHIPPED loop with ONLY the two macOS-absolute dirs re-rooted"
+else
+  fail "15. the relocated fixture is not the shipped loop — the arm would be grading a rewrite"
+fi
+FIX15="$(mkfix pinrank 0)"
+# Every directory in the pin's list, all present, so the RANK is observable end to end.
+mkdir -p "$FIX15/home/bin" "$FIX15/home/.pi/agent/bin" "$FIX15/home/.pi/agent/shims" "$FIX15/home/.local/bin"
+cp "$PINROOT/shim-gh" "$FIX15/home/.pi/agent/shims/gh"
+cp "$PINROOT/real-gh" "$PINROOT/opt/homebrew/bin/gh"
+cat > "$FIX15/agent/scripts/orchestrator-heartbeat.sh" <<SH
+#!/bin/bash
+{ command -v gh; printf '%s\n' "\$PATH"; } > "$FIX15/gh-resolved" 2>&1
+exit 0
+SH
+SAVED_LOOP="$LOOP"; LOOP="$RELOC"
+run_pass "$FIX15"
+LOOP="$SAVED_LOOP"
+RESOLVED="$(sed -n 1p "$FIX15/gh-resolved" 2>/dev/null)"
+PINPATH="$(sed -n 2p "$FIX15/gh-resolved" 2>/dev/null)"
+# rank 1 = furthest front; 0 = not on PATH at all (an ABSENT control entry makes the order vacuous)
+rank_of(){ printf '%s' "$1" | tr ':' '\n' | awk -v want="$2" '$0 == want { print NR; f=1 } END { if (!f) print 0 }'; }
+SHIM_RANK="$(rank_of "$PINPATH" "$FIX15/home/.pi/agent/shims")"
+BREW_RANK="$(rank_of "$PINPATH" "$PINROOT/opt/homebrew/bin")"
+if [ "$BREW_RANK" -gt 0 ] && [ "$SHIM_RANK" -gt 0 ]; then
+  pass "15. control: BOTH the shim dir and homebrew are on the pinned PATH (ranks $SHIM_RANK / $BREW_RANK)"
+else
+  fail "15. control: the pinned PATH is missing one of the two dirs (shim=$SHIM_RANK brew=$BREW_RANK) — nothing to rank"
+fi
+if [ "$RESOLVED" = "$FIX15/home/.pi/agent/shims/gh" ]; then
+  pass "15. a child's bare 'gh' resolves to the SHIM, not to /opt/homebrew/bin/gh"
+else
+  fail "15. a child's bare 'gh' resolved to [${RESOLVED:-<none>}] — the shim is SHADOWED on the brew-Mac layout"
+fi
+if [ "$SHIM_RANK" -gt 0 ] && [ "$BREW_RANK" -gt 0 ] && [ "$SHIM_RANK" -lt "$BREW_RANK" ]; then
+  pass "15. the shim dir outranks homebrew ($SHIM_RANK < $BREW_RANK) — list order is not installed reversed"
+else
+  fail "15. the shim dir does NOT outrank homebrew (shim=$SHIM_RANK brew=$BREW_RANK) — the pin is installed REVERSED"
+fi
+
+# ⛔ AND "ALREADY ON PATH" IS NOT "ALREADY IN FRONT" (#1867 review P2, round 6). The pin SKIPPED any
+# entry already present, which preserves that entry's INHERITED rank. So on the very box this pin
+# exists for — a brew Mac whose login PATH already carries /opt/homebrew/bin BEFORE
+# $HOME/.pi/agent/shims — both dirs were skipped, only the absent ones were prepended, and the raw
+# `gh` still won: the #984 admin-merge guard and #1910 pacing gate inert for every child, while the
+# block's own comment said the shim dir "must never be omitted". §15 above cannot see this by
+# construction: it inherits the RUNNER's PATH, which carries neither dir, so both are always absent
+# and only the list order is graded. Here the inherited PATH carries BOTH, brew first.
+FIX15B="$(mkfix pinrank2 0)"
+mkdir -p "$FIX15B/home/bin" "$FIX15B/home/.pi/agent/bin" "$FIX15B/home/.pi/agent/shims" "$FIX15B/home/.local/bin"
+cp "$PINROOT/shim-gh" "$FIX15B/home/.pi/agent/shims/gh"
+cat > "$FIX15B/agent/scripts/orchestrator-heartbeat.sh" <<SH
+#!/bin/bash
+{ command -v gh; printf '%s\n' "\$PATH"; } > "$FIX15B/gh-resolved" 2>&1
+exit 0
+SH
+RUN_PASS_PATH="$PINROOT/opt/homebrew/bin:$FIX15B/home/.pi/agent/shims:/usr/local/bin:/usr/bin:/bin"
+run_pass "$FIX15B"
+unset RUN_PASS_PATH
+RES15B="$(sed -n 1p "$FIX15B/gh-resolved" 2>/dev/null)"
+PATH15B="$(sed -n 2p "$FIX15B/gh-resolved" 2>/dev/null)"
+if [ "$RES15B" = "$FIX15B/home/.pi/agent/shims/gh" ]; then
+  pass "15b. an INHERITED shim dir behind homebrew is MOVED to the front, not skipped — bare 'gh' is the shim"
+else
+  fail "15b. the inherited PATH put homebrew ahead of the shims and the pin skipped both, so bare 'gh' resolved to [${RES15B:-<none>}] — the shim is SHADOWED on the exact box the pin exists for"
+fi
+S15B="$(rank_of "$PATH15B" "$FIX15B/home/.pi/agent/shims")"
+B15B="$(rank_of "$PATH15B" "$PINROOT/opt/homebrew/bin")"
+if [ "$S15B" -gt 0 ] && [ "$B15B" -gt 0 ] && [ "$S15B" -lt "$B15B" ]; then
+  pass "15b. …and each dir appears once, shim ahead of homebrew (ranks $S15B / $B15B) — forced, not inherited"
+else
+  fail "15b. the pinned PATH has the shim dir at rank ${S15B:-0} and homebrew at rank ${B15B:-0} — the pin did not force the order"
+fi
+
+# ⛔ AND AN ALL-PINNED INHERITED PATH MUST NOT REINTRODUCE AN EMPTY COMPONENT (#1867 review P3, round 7).
+# The prefix always ends in `:`; appending an EMPTY tail produced `…shims::/usr/local/bin:…`, and a
+# double colon is an empty PATH component — the CWD — which is the hazard the same block's comment
+# says it drops. The inputs that reach it: a caller whose whole PATH is already the pinned dirs, or
+# an empty PATH.
+FIX15C="$(mkfix pinrank3 0)"
+mkdir -p "$FIX15C/home/bin" "$FIX15C/home/.pi/agent/bin" "$FIX15C/home/.pi/agent/shims" "$FIX15C/home/.local/bin"
+cat > "$FIX15C/agent/scripts/orchestrator-heartbeat.sh" <<SH
+#!/bin/bash
+printf '%s\n' "\$PATH" > "$FIX15C/path"
+exit 0
+SH
+RUN_PASS_PATH="$FIX15C/home/bin:$FIX15C/home/.pi/agent/bin:$FIX15C/home/.pi/agent/shims:$FIX15C/home/.local/bin"
+run_pass "$FIX15C"
+unset RUN_PASS_PATH
+P15C="$(cat "$FIX15C/path" 2>/dev/null)"
+if [ -z "$P15C" ]; then
+  fail "15c. the pin row produced no PATH to inspect — nothing was measured"
+elif [ "${P15C#:}" != "$P15C" ] || [ "${P15C%:}" != "$P15C" ] || [ "${P15C#*::}" != "$P15C" ]; then
+  fail "15c. the pinned PATH carries an EMPTY component (the cwd): $P15C"
+else
+  pass "15c. a PATH made entirely of pinned dirs yields no empty component (the cwd is not silently added)"
+fi
+
+# ⛔ AND THE EMPTY-COMPONENT PRUNE MUST RUN FOR EVERY INPUT, NOT ONLY WHEN A PINNED DIR EXISTS
+# (#1867 review P3, round 8). Round 7 closed the empty TAIL (no trailing `:` when `_pin_rest` is empty)
+# and the comment claimed empty components "are dropped by the same pass" — but that pass lives INSIDE
+# the `for _path_dir` loop, so it only ran when at least one of the six dirs existed, while the system
+# tail was appended unconditionally afterwards. Two shapes slipped through: an EMPTY PATH with no pinned
+# dir (the append built `:/usr/local/bin:…` — a LEADING empty component, i.e. the cwd ranked ahead of
+# every system dir) and an INTERIOR `::` inherited from a caller (nothing pruned it). §15c cannot see
+# either: its PATH is entirely pinned dirs, so the inner pass always runs there.
+# ⚠️ DISCLOSED: this row's failing arm needs NO pinned dir to exist. Four of the six are under the
+# fixture HOME (controlled), but `/Applications/cmux.app/…` and `/opt/homebrew/bin` are literals — on a
+# host where either exists the inner pass runs and its prune covers the interior shape, so the row
+# discriminates for the LEADING arm only there. On the Linux runner (where the suite runs in CI) neither
+# exists, so both arms discriminate. The empty-PATH case is asserted against the leading arm directly.
+FIX15D="$(mkfix pinrank4 0)"
+cat > "$FIX15D/agent/scripts/orchestrator-heartbeat.sh" <<SH
+#!/bin/bash
+printf '%s\n' "\$PATH" > "$FIX15D/path"
+exit 0
+SH
+# Shape 1: an EMPTY inherited PATH (a caller that exported PATH= / an unset-looking environment).
+RUN_PASS_PATH=""
+run_pass "$FIX15D"
+P15D="$(cat "$FIX15D/path" 2>/dev/null)"
+rm -f "$FIX15D/path"
+if [ -z "$P15D" ]; then
+  fail "15d. the empty-PATH row produced no PATH to inspect — nothing was measured"
+elif [ "${P15D#:}" != "$P15D" ] || [ "${P15D%:}" != "$P15D" ] || [ "${P15D#*::}" != "$P15D" ]; then
+  fail "15d. an EMPTY inherited PATH produced an EMPTY component (the cwd on PATH): $P15D"
+else
+  pass "15d. an EMPTY inherited PATH yields no empty component — the system tail is not welded on behind a ':'"
+fi
+case ":$P15D:" in
+  *:/usr/bin:*) pass "15d. ... and the system tail is still appended (an empty PATH is not a broken PATH)" ;;
+  *) fail "15d. the system tail is MISSING from the assembled PATH: ${P15D:-<none>}" ;;
+esac
+# Shape 2: an INTERIOR empty component inherited from the caller.
+RUN_PASS_PATH="/usr/bin::/bin"
+run_pass "$FIX15D"
+P15E="$(cat "$FIX15D/path" 2>/dev/null)"
+rm -f "$FIX15D/path"
+unset RUN_PASS_PATH
+if [ -z "$P15E" ]; then
+  fail "15e. the interior-empty row produced no PATH to inspect — nothing was measured"
+elif [ "${P15E#*::}" != "$P15E" ] || [ "${P15E#:}" != "$P15E" ] || [ "${P15E%:}" != "$P15E" ]; then
+  fail "15e. an inherited INTERIOR empty component survived the pin (the cwd on PATH): $P15E"
+else
+  pass "15e. an inherited INTERIOR '::' is dropped — the prune is no longer conditional on a pinned dir existing"
+fi
+
+# ── 15f. THE OTHER TWO SPELLINGS OF THE cwd ENTRY (round 12) ─────────────────────────────────
+# Dropping the EMPTY component only covers `::`. A caller can equally write `.` or `..`, and both name
+# the child's cwd just as surely. This is NEW with the PATH inheritance: on main the block REPLACED
+# PATH with one literal and inherited nothing, so neither spelling could survive it. The loop now runs
+# for days, detached, and its children `cd` into worktrees and run bare commands — so a literal `.`
+# executing whatever the cwd holds is the hazard the block's own comment names. MEASURED pre-fix:
+# `PATH='/opt/homebrew/bin:/usr/bin:.:/bin'` → `…:/usr/bin:.:/bin:/usr/local/bin:…`.
+RUN_PASS_PATH="/opt/homebrew/bin:/usr/bin:.:/bin:..:/sbin"
+run_pass "$FIX15D"
+P15F="$(cat "$FIX15D/path" 2>/dev/null)"
+rm -f "$FIX15D/path"
+unset RUN_PASS_PATH
+# ⛔ A CHARACTER TEST IS NOT A COMPONENT TEST (#3826 review P2). This row asked `${P15F#*.}` —
+# "strip the shortest prefix ending at ANY dot" — so a PATH whose DIRECTORY NAMES merely contain a
+# dot failed while the property held. The pinned dirs necessarily carry dots on macOS:
+# `heartbeat-loop.sh` pins `/Applications/cmux.app/Contents/Resources/bin` and `$HOME/.pi/agent/bin`,
+# so on the ONE platform this change exists for the suite reddened for a non-defect. MEASURED by
+# making a pinned dir exist in the fixture (nothing else changed):
+#   FAIL 15f. a literal '.' or '..' survived the pin …: <fix>/home/.pi/agent/bin:/opt/homebrew/bin:…
+# The property is about a `:`-delimited COMPONENT equal to `.` or `..`, which is what §15c-§15e
+# already assert component-wise. Tested the same way here.
+P15F_dot=0
+case ":$P15F:" in *:.:*|*:..:*) P15F_dot=1 ;; esac
+if [ -z "$P15F" ]; then
+  fail "15f. the literal-dot row produced no PATH to inspect — nothing was measured"
+elif [ "$P15F_dot" -eq 1 ]; then
+  fail "15f. a literal '.' or '..' survived the pin (the cwd on PATH): $P15F"
+else
+  pass "15f. a literal '.' and '..' are dropped from an inherited PATH — the cwd cannot be executed from"
+fi
+case ":$P15F:" in
+  *:/usr/bin:*) pass "15f. ... and the system tail is still appended (dropping them does not empty the PATH)" ;;
+  *) fail "15f. the system tail is MISSING from the assembled PATH: ${P15F:-<none>}" ;;
+esac
+
+# ── 15g. THE FALSE-RED CONTROL FOR THE ROW ABOVE ───────────────────────────────────────────────
+# A row that only asserts the ABSENCE of `.`/`..` cannot tell a correct component test from the
+# character test it replaced: the pre-fix `${P15F#*.}` version passed this suite on Linux too, because
+# no pinned dir carrying a dot EXISTED here. So the discriminating case is the other direction — a
+# pinned dir that exists AND has a dot in its NAME, with no `.`/`..` component anywhere. The old
+# assertion reds on it; the component test does not. `$HOME/.pi/agent/bin` is the real pinned path
+# (`heartbeat-loop.sh`'s own list), so this is the shape macOS has and the Linux runner does not.
+mkdir -p "$FIX15D/home/.pi/agent/bin"
+RUN_PASS_PATH="/opt/homebrew/bin:/usr/bin:/bin"
+run_pass "$FIX15D"
+P15G="$(cat "$FIX15D/path" 2>/dev/null)"
+rm -f "$FIX15D/path"
+unset RUN_PASS_PATH
+if [ -z "$P15G" ]; then
+  fail "15g. the dot-in-a-directory-name row produced no PATH to inspect — nothing was measured"
+elif [ "$(printf '%s' "$P15G" | grep -c '\.pi/agent/bin' || true)" -eq 0 ]; then
+  fail "15g. the fixture's dot-bearing pinned dir is NOT on the assembled PATH, so the row proves nothing: $P15G"
+else
+  pass "15g. a pinned dir whose NAME contains a dot is not read as a '.' component (a component test, not a character test)"
+fi
+rmdir "$FIX15D/home/.pi/agent/bin" 2>/dev/null || true
+
+# ── 16. THE LEGACY SELF-DETACH MUST NOT CLAIM A START IT DID NOT GET (#3826 review P3) ────────────
+# ⛔ The detach arm slept one second and then printed
+#   `heartbeat loop started (pid $(cat "$PIDFILE" 2>/dev/null || echo '?'))`   … exit 0
+# so a FIRST run — `$STATE` absent, which is the documented start case — printed `started (pid ?)`
+# with a green status while the child's `echo $$ > "$PIDFILE"` was failing silently and no loop ran.
+# That is the same false PASS `heartbeat-launch.sh start` was written to remove (its §16c asserts the
+# identical property one file over), left standing on the path the loop itself documents.
+# The arm now POLLS for a live pidfile and fails loudly. Discriminating shape: the loop is made to exit
+# at the top of its pass (the kill file), so a correct arm prints REFUSING rc 1 and a pre-fix arm prints
+# `started (pid ?)` rc 0 — the two assertions below cannot both hold on the old code.
+FIX16="$TMP/legacy16"
+mkdir -p "$FIX16/home" "$FIX16/agent/state"
+touch "$FIX16/agent/state/HEARTBEAT-OFF"
+set +e
+OUT16="$(HOME="$FIX16/home" HEARTBEAT_PI_AGENT_DIR="$FIX16/agent" /bin/bash "$LOOP" 2>&1)"
+RC16=$?
+set -e
+if [ "$RC16" -eq 1 ]; then
+  pass "16. a self-detach that leaves no live loop exits 1 (pre-fix: 0, with 'started (pid ?)')"
+else
+  fail "16. the self-detach exited $RC16 for a loop that is NOT running — a launch nobody verified"
+fi
+# ⛔ NO `printf … | grep -q` (#841/#864, and this repo's own guard reds it): under `pipefail` the
+# writer takes SIGPIPE and the `if` takes its ELSE branch, so the assertion passes without reading the
+# line. `case` tests the string directly — the pipe was never needed.
+case "$OUT16" in
+    *'REFUSING: the loop left no live pidfile'*)
+        pass "16. …and names the artefact it looked for, so the operator knows what failed" ;;
+    *)
+        fail "16. the refusal did not name the missing pidfile: $OUT16" ;;
+esac
+case "$OUT16" in
+    *'started (pid'*)
+        fail "16. …and it still printed 'started (pid …)' over a loop that is not running: $OUT16" ;;
+    *)
+        pass "16. …and NEVER prints 'started' over an unverified launch" ;;
+esac
+# The other direction, so the row above cannot be green on a BROKEN FIXTURE: the same shape of layout,
+# run the way every other case runs it (`LOOP_DETACHED=1`, one pass), must complete and exit 0. If the
+# fixture itself could not run a loop, the refusal above would prove nothing about the detach arm.
+FIX16C="$(mkfix legacy16c 0)"
+set +e
+run_pass "$FIX16C"
+RC16C=$?
+set -e
+if [ "$RC16C" -eq 0 ]; then
+  pass "16. control: the same fixture runs a real pass cleanly, so the refusal is the detach arm's own"
+else
+  fail "16. control: the fixture cannot run a pass (rc $RC16C) — the detach row above proves nothing"
 fi
 
 if [ "$failures" -eq 0 ]; then

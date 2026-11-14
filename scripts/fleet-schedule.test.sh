@@ -1045,6 +1045,54 @@ out="$(darwin_run --verify)"; rc=$?
   || bad "a failing install-launchd.sh --status was certified VERIFIED on macOS (rc=$rc): $out"
 grep -q 'SCHEDULE NOT VERIFIED' <<<"$out" && ok "the Darwin failure names the verdict" \
   || bad "no NOT VERIFIED verdict on Darwin: $out"
+# ⛔ AND IT MUST NOT SAY `0 launchd job(s)` BESIDE A REAL FAILURE (#3826 review P3). A delegate that
+# DIES without a marker row makes the verdict's job count empty, so the sentence read
+# `SCHEDULE NOT VERIFIED — 0 launchd job(s) … above` next to the FAIL line — a count that says nothing
+# failed beside a failure, which is how a real one gets read as a rounding artefact. The round-11 fix
+# closed exactly this for the marker wordings and left it standing on the arm added for the delegate's
+# own exit code. Reachable without a fixture: install-launchd.sh prints this same message and exits 1
+# when TEMPLATES_DIR is missing.
+grep -q '0 launchd job(s)' <<<"$out" \
+  && bad "the verdict said '0 launchd job(s)' beside a delegate that FAILED — a zero count is an unanswered question, not a clean set: $out" \
+  || ok "a delegate that dies without naming a job does NOT produce '0 launchd job(s)' (the count cannot contradict the exit)"
+grep -q 'named NO job' <<<"$out" \
+  && ok "…it says the delegate named no job, so the operator knows nothing was measured" \
+  || bad "the verdict did not explain that nothing was measured: $out"
+
+# ── 10b. A SET-LEVEL `⛔ UNKNOWN` IS NOT A JOB (#3826 review P3, round 18) ──────────────────
+# ⛔ TWO OF THE DELEGATE'S FAILING ROWS DESCRIBE THE WHOLE SET, not one unit: `⛔ UNKNOWN — the DECLARED
+# SET … could not be evaluated` and `⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated`. Both
+# carry the `⛔ UNKNOWN` marker, and this scan counted them as one launchd JOB each. MEASURED at this
+# head with an unreadable TEMPLATES_DIR (delegate rc=2, ZERO jobs classified):
+#   `SCHEDULE NOT VERIFIED — 1 launchd job(s) not installed/loaded/in sync/declared above`
+# — a count of jobs over a run that classified none, the same lie rounds 5/8 fixed in the other
+# direction. The set-level rows are told apart by the marker's ` — ` suffix; no per-job row uses it
+# (those are `⛔ UNKNOWN   <label>: …`). Excluding it is not a loosening: the delegate's non-zero exit is
+# the second half of the gate, so the verdict still FAILS — through the arm above, which is the honest
+# sentence for it. Red under the mutant that counts set-level rows as jobs.
+cp "$DARWIN_ROOT/scripts/install-launchd.sh" "$T/delegate.bak"
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+printf '%s\n' "  com.eldato.tccprobe: installed=loaded version=v0.0.1 (in sync)"
+printf '%s\n' "  ⛔ UNKNOWN — the DECLARED SET (or its exemption lists: RETIRED," \
+              "     OWNED-BY-OTHER-INSTALLERS) under /tmp/x could NOT be evaluated" >&2
+exit 2
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+[ "$rc" -eq 1 ] && ok "10b. a SET-level UNKNOWN row still FAILS the verdict (through the delegate's rc)" \
+  || bad "a set-level UNKNOWN was certified (rc=$rc): $out"
+grep -q '1 launchd job(s)' <<<"$out" \
+  && bad "a SET-level row was counted as one launchd JOB — zero jobs were classified: $out" \
+  || ok "10b. …and it is NOT counted as a launchd job (no '1 launchd job(s)' over zero classified jobs)"
+grep -q 'SET-LEVEL failure' <<<"$out" \
+  && ok "10b. …and the verdict says the SET-LEVEL row is what failed, which is what happened" \
+  || bad "10b. the verdict did not explain that the set-level row failed: $out"
+grep -qE '[0-9]+ launchd job[(]s[)]' <<<"$out" \
+  && bad "10b. the verdict claimed a job count over zero classified jobs: $out" \
+  || ok "10b. …and claims no job count at all"
+cp "$T/delegate.bak" "$DARWIN_ROOT/scripts/install-launchd.sh"; chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
 grep -q '^--status$' "$DELEGATE_RECORD" && ok "--verify asks install-launchd.sh --status (delegated, not reimplemented)" \
   || bad "--verify did not delegate --status: $(cat "$DELEGATE_RECORD" 2>/dev/null)"
 out="$(darwin_run --status)"; rc=$?
@@ -1104,6 +1152,232 @@ chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
 out="$(darwin_run --verify)"; rc=$?
 [ "$rc" -eq 1 ] && ok "--verify still FAILS a genuine NOT INSTALLED (the scan was not neutered by the fix)" \
   || bad "closing the retired false-FAIL also stopped flagging real absences (rc=$rc): $out"
+
+# ⛔ AND THE NEW WORDINGS ARE COUNTED, NOT JUST CARRIED BY THE EXIT CODE (#1867 review P3).
+# `install-launchd.sh --status` gained `UNMANAGED` (installed with no template) and `UNKNOWN` (the
+# installed set could not be enumerated). Neither was in the count scan, so a run whose ONLY failures
+# were those printed `SCHEDULE NOT VERIFIED — 0 launchd job(s) … above` while returning 1 — the status
+# was right and the count beside it said nothing failed. This delegate isolates the COUNT from the rc:
+# it exits 0 and fails only in the new wording, so a scan that cannot see the wording reports 0.
+# ⛔ TWO JOBS, ONE VERDICT WORD PER LINE (#1867 review P3, round 5). The delegate prints the marker on
+# each JOB line and keeps the word out of its section intro; a scan matching the BARE substring would
+# count the intro as well, so it would report 2 here whether one job was undeclared or twenty. The
+# fixture below mirrors the shipped format exactly, which is what makes this row discriminating.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+# ⛔ THE SHIPPED FORMAT, including round 8's third class: a RETIRED label that is still INSTALLED.
+# `install-launchd.sh --status` reports it as `⛔ RETIRED-INSTALLED` (one line per job) and exits 1,
+# because `retire_pass` — the only remover — runs on an INSTALL and this verb never does. A scan that
+# does not carry the wording counted 0 jobs over a box still ticking the blind heartbeat while the
+# verdict beside it said NOT VERIFIED — the same false count the UNMANAGED wording was fixed for, one
+# class over.
+echo "  ⛔ Installed job(s) with NO template in the declared set — one line per job:" >&2
+echo "  ⛔ UNMANAGED   com.eldato.mystery ($HOME/Library/LaunchAgents/com.eldato.mystery.plist)" >&2
+echo "  ⛔ UNMANAGED   com.eldato.other ($HOME/Library/LaunchAgents/com.eldato.other.plist)" >&2
+echo "  ⛔ RETIRED in this repo, STILL INSTALLED here — one line per job:" >&2
+echo "  ⛔ RETIRED-INSTALLED   com.tortoise.heartbeat-loop ($HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'SCHEDULE NOT VERIFIED — 3 launchd job(s)' <<<"$out" \
+  && ok "the count covers EVERY class per job line (2 UNMANAGED + 1 RETIRED-INSTALLED = 3), never an intro" \
+  || bad "the count is not per job across classes — 2 UNMANAGED + 1 RETIRED-INSTALLED did not read as 3: $out"
+[ "$rc" -eq 1 ] && ok "…and the verdict is still NOT VERIFIED" \
+  || bad "the multi-class failure returned $rc, not 1"
+# ⛔ AND THE RETIRED CLASS IS COUNTED ON ITS OWN (#1867 review, round 8): a run whose ONLY row is a
+# still-installed retired job must read as 1 job, not 0. This is the blind heartbeat's exact shape —
+# the label IS declared, so nothing else in the scan can see it.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⛔ RETIRED in this repo, STILL INSTALLED here — one line per job:" >&2
+echo "  ⛔ RETIRED-INSTALLED   com.tortoise.heartbeat-loop ($HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist)" >&2
+exit 1
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
+  && ok "a RETIRED-INSTALLED-only failure is COUNTED (1 of 1), not reported as 0 jobs" \
+  || bad "a RETIRED-INSTALLED-only failure printed a 0-job verdict: $out"
+# ⛔ AND THE CMUX CLASS IS COUNTED ON ITS OWN (#3826 review P2). `install-launchd.sh --status` now
+# refuses a template that names a cmux-gated script with a row of its own and rc 1 — the blind job #1867
+# is about, and the one that installs, loads, ticks and delivers NOTHING. Left out of this scan, such a
+# box returned 1 while the verdict beside it read `SCHEDULE NOT VERIFIED — 0 launchd job(s)`, the exact
+# false count the UNMANAGED and RETIRED-INSTALLED wordings were each fixed for, one class over.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⛔ CMUX-GATED   com.tortoise.heartbeat-loop: this job installs, loads and ticks, and is BLIND under launchd ($HOME/.pi/agent/scripts/heartbeat-loop.sh)" >&2
+exit 1
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
+  && ok "a CMUX-GATED-only failure is COUNTED (1 of 1), not reported as 0 jobs" \
+  || bad "a CMUX-GATED-only failure printed a 0-job verdict: $out"
+[ "$rc" -eq 1 ] && ok "…and a cmux-gated job is never reported as a verified job set" \
+  || bad "the cmux-gated-only failure returned $rc, not 1"
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⛔ UNKNOWN — $HOME/Library/LaunchAgents exists but could NOT be enumerated (rc 2)." >&2
+exit 2
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+# ⛔ THIS ROW SAID `SCHEDULE NOT VERIFIED — 1 launchd job(s)` AND THAT COUNT WAS FALSE (#3826 review P3,
+# round 18). The delegate above emits ONE set-level row (`⛔ UNKNOWN — …could NOT be enumerated`) and
+# classifies ZERO jobs, so the verdict named a job count over a run that had none — the same family as
+# the `0 launchd job(s)` lie round 9 closed, one order of magnitude smaller. MEASURED at `f17785035`
+# with an unreadable TEMPLATES_DIR: delegate rc=2, zero jobs classified,
+# `SCHEDULE NOT VERIFIED — 1 launchd job(s) …`.
+# The INTENT of the old row is kept, and it is the part that mattered: a set-level UNKNOWN must FAIL and
+# must never read as "nothing failed" (that was round 9's complaint). It now says so in its own
+# sentence, WITH NO COUNT — so this row asserts the intent instead of the false arithmetic. Reversing a
+# recorded assertion is deliberate here and is argued in the PR (#3826, round 18) rather than silently.
+grep -q 'SCHEDULE NOT VERIFIED — the delegate reported a SET-LEVEL failure' <<<"$out" \
+  && ok "an UNKNOWN-only failure is a set-level FAILURE with its own sentence (not a caveat)" \
+  || bad "an UNKNOWN-only failure did not produce the set-level sentence: $out"
+[ "$rc" -eq 1 ] && ok "…and it exits 1 (the enumeration answer is a failure, never a green)" \
+  || bad "the UNKNOWN-only failure returned $rc, not 1"
+grep -qE '[0-9]+ launchd job[(]s[)]' <<<"$out" \
+  && bad "the set-level verdict claims a launchd JOB COUNT over zero classified jobs: $out" \
+  || ok "…and it claims NO job count, because zero jobs were classified"
+
+# ⛔ AN INSTALLED-BUT-SKIPPED JOB IS A CAVEAT, NOT A MATCH (#1867 review, round 11). `--status` reports
+# a job installed here whose template the installer would now SKIP (a placeholder stopped resolving) as
+# `⚠️ INSTALLED-SKIPPED`, deliberately rc 0: an install cannot clear it while the environment stays as
+# it is, so a hard failure would re-create the permanent red round 10 removed. But the copy on disk is
+# NOT what its template describes and will never be refreshed — so the verdict must not claim they
+# MATCH. MEASURED pre-fix (delegate: this row + one `in sync` job): rc 0 and
+# `SCHEDULE VERIFIED — launchd job set matches templates/launchd`, a content claim nothing had checked.
+# The assertion is on the WHOLE plain verdict, not on a phrase inside it: the narrowed sentence also
+# mentions templates/launchd, so a substring grep cannot tell "says they match" from "says what it
+# checked" — the first version of this row failed on its own fix for exactly that reason.
+PLAIN_VERDICT='SCHEDULE VERIFIED — launchd job set matches templates/launchd'
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⚠️ INSTALLED-SKIPPED   com.eldato.corruption-canary: INSTALLED, but SKIPPED now (needs {{SWARM_ROOT}}, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)" >&2
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -qF "$PLAIN_VERDICT" <<<"$out" \
+  && bad "it certified that the job set MATCHES while an installed job is SKIPPED by its template: $out" \
+  || ok "an INSTALLED-SKIPPED row stops the verdict claiming the job set matches"
+grep -q 'SCHEDULE VERIFIED WITH CAVEATS' <<<"$out" \
+  && ok "...the verdict is narrowed to what was actually checked, and names 1 job" \
+  || bad "no narrowed verdict for the skipped-but-installed class: $out"
+grep -q 'CAVEAT.*corruption-canary' <<<"$out" \
+  && ok "...naming the job, so the operator can act" \
+  || bad "the narrowed verdict did not name the job: $out"
+[ "$rc" -eq 0 ] && ok "...and it is NOT a failure code (an install cannot clear it; a permanent red is the round-10 defect)" \
+  || bad "the skipped-but-installed class returned $rc — that is the permanent red round 10 removed"
+# The CONTROL: the same delegate without that row must still print the plain MATCH verdict, so the arm
+# above cannot pass by a verdict that never claims a match.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -qF "$PLAIN_VERDICT" <<<"$out" \
+  && ok "control: a fully in-sync delegate still gets the plain MATCH verdict (rc=0)" \
+  || bad "the control lost the plain verdict: $out"
+[ "$rc" -eq 0 ] && ok "control: ...and rc 0" || bad "the control returned $rc"
+
+# ⛔ AND THE TWO DISCLOSURES ARE NOT MUTUALLY EXCLUSIVE (#3826 review P3). The `delegated` list used
+# to be computed AFTER this caveats arm, so a box that had BOTH an INSTALLED-SKIPPED row (the ordinary
+# state when `SWARM_ROOT` is unset — the fixture above) and the four DELEGATED templates never heard
+# about the delegated scope at all: the caveats arm returned first. That is the over-claim the
+# delegated arm was added to remove, left standing one branch above it. The delegate below emits both
+# rows, which is what a real Mac actually does.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⚠️ INSTALLED-SKIPPED   com.eldato.corruption-canary: INSTALLED, but SKIPPED now (needs {{SWARM_ROOT}}, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)" >&2
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+echo "  com.eldato.disk-reaper: DELEGATED — declared here, installed and graded by another installer ($TEMPLATES/../launchd/reaper/com.eldato.disk-reaper.plist)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'SCHEDULE VERIFIED WITH CAVEATS' <<<"$out" \
+  && ok "caveats + DELEGATED: the caveats verdict still fires" \
+  || bad "the caveats verdict vanished when a DELEGATED row was present: $out"
+grep -q '1 template(s) are DELEGATED' <<<"$out" \
+  && ok "...and STILL names the delegated scope, so the two disclosures are not exclusive" \
+  || bad "the CAVEATS arm swallowed the DELEGATED disclosure — the verdict claims coverage over 4 ungraded templates: $out"
+grep -q 'does not cover their content' <<<"$out" \
+  && ok "...saying what it does not cover, not just that something is delegated" \
+  || bad "the delegated clause did not state its scope: $out"
+[ "$rc" -eq 0 ] && ok "...and the extra disclosure does not change the exit code" \
+  || bad "caveats + DELEGATED returned $rc, not 0"
+# CONTROL: with NO delegated row the caveats sentence must stay byte-identical to what it was, so the
+# clause above cannot be passing by having been folded into the sentence unconditionally.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⚠️ INSTALLED-SKIPPED   com.eldato.corruption-canary: INSTALLED, but SKIPPED now (needs {{SWARM_ROOT}}, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)" >&2
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'DELEGATED' <<<"$out" \
+  && bad "control: a delegate with no DELEGATED row still produced a delegated clause: $out" \
+  || ok "control: with nothing delegated the caveats sentence is unchanged (no empty clause)"
+
+# ⛔ AND A DELEGATED TEMPLATE IS NOT A MATCH EITHER (#3826 review P2). `install-launchd.sh --status`
+# grades a FLAT `templates/launchd/*.plist` set; this repo ships FOUR templates in SUBdirectories
+# (`reaper/`, `conflict-rebase/`, `harness-apply/`, `runner-autoscale/`), each graded by its own
+# `install-*-timer.sh`. Before the disclosure those four produced NO ROW AT ALL, so this repository's
+# own `--verify` printed `launchd job set matches templates/launchd` over declarations no pass had
+# read — a verdict that was true about 20 of 24 jobs and silent about the rest.
+# DELEGATED is a NAMED state, not a defect, so it must NOT become a CAVEAT (a permanent amber on the
+# reference Mac is the round-10 defect this section already fixes once) — the sentence names its
+# scope instead. Asserted in BOTH directions, because a fix that simply renamed the plain verdict
+# would pass the first arm and lie in the control.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  com.eldato.disk-reaper: DELEGATED — declared here, installed and graded by another installer ($TEMPLATES/../launchd/reaper/com.eldato.disk-reaper.plist)" >&2
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q '1 template(s) are DELEGATED' <<<"$out" \
+  && ok "a DELEGATED template narrows the verdict to what was actually graded — it no longer claims the whole set matches" \
+  || bad "the verdict did not name the DELEGATED template, so it still claims a match over files nothing read: $out"
+grep -q 'CAVEAT.*disk-reaper' <<<"$out" \
+  && bad "a DELEGATED row became a CAVEAT — a legitimate named state must not be a permanent amber: $out" \
+  || ok "...and it is NOT a CAVEAT (a legitimate named state, not a defect)"
+[ "$rc" -eq 0 ] && ok "...and rc 0 — the delegation is a disclosure, not a failure" \
+  || bad "the DELEGATED row changed the exit code to $rc"
+# The CONTROL: the same delegate without a DELEGATED row keeps the ORIGINAL sentence verbatim, so the
+# arm above cannot pass by a sentence that was rewritten for every box.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  com.eldato.objective-reminder: installed=loaded version=v0.1.0 (in sync)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -qF "$PLAIN_VERDICT (install-launchd.sh --status)" <<<"$out" \
+  && ok "control: with nothing delegated the plain MATCH verdict is unchanged, word for word" \
+  || bad "the plain verdict moved for a box with no delegated template: $out"
+grep -q 'DELEGATED' <<<"$out" \
+  && bad "the control mentioned DELEGATED over a delegate that emitted none: $out" \
+  || ok "control: ...and names no delegation that was not disclosed"
+
 
 # ── 11. a Label is a PATH COMPONENT, so it is validated before it is used as one ─────────────
 case_ "11. a Label that is not a safe file name is refused, and cannot escape the state dir"

@@ -33,9 +33,46 @@
 # A template whose script target does not resolve (broken symlink / missing
 # file) is a HARD FAILURE — a dead job must never be installed.
 #
+# ⛔ cmux-GATED SCRIPTS REFUSE TO INSTALL (#1867). A template whose ProgramArguments
+# name a script listed in templates/launchd/LAUNCHD-INCOMPATIBLE is a HARD FAILURE:
+# the cmux control socket (`socketControlMode = cmuxOnly`) gates on launch-chain
+# ATTRIBUTION, which a launchd job never has, so such a job would run, log and do
+# nothing — the false PASS measured as 1,695 `lane-status: DEGRADED` reads and 0
+# delivered nudges. The refusal names the documented launch path instead of widening
+# the socket (that is an owner decision, argued on its own issue).
+#
+# `--status` also reports an INSTALLED plist with NO template as UNMANAGED and exits
+# non-zero: that was the blind heartbeat's exact shape — a job on the box that the
+# declared set no longer describes, invisible to every content-drift comparison. The
+# declared set is resolved RECURSIVELY (`templates/launchd/*/label.plist` counts — the
+# four repo templates that ship one directory down are this repo's own jobs, not
+# strays, #1867 review P1). Two classes are declared elsewhere and are NOT reported as
+# UNMANAGED: labels in RETIRED (declared, pending removal by `retire_pass`) and labels
+# in OWNED-BY-OTHER-INSTALLERS (another surface of this repo installs or adopts them —
+# every installer in `scripts/`, and the box's own adopted controller job), so the alarm
+# stays about jobs nobody declares. ⛔ RETIRED IS NOT "GREEN", THOUGH (round 8): an
+# installed RETIRED label is reported as `⛔ RETIRED-INSTALLED` and the verb exits 1
+# until an install removes it — `retire_pass` runs on INSTALL, never on `--status`, so
+# exempting the class from BOTH the row and the exit code certified a box that was
+# still ticking the blind job this change exists to remove.
+# Exit codes for `--status`: 0 clean · 1 something on the box is not what this repo declares —
+# a per-job verdict on an INSTALLABLE template (NOT INSTALLED, `not loaded`, or `DRIFTED`), an
+# installed job with no template (UNMANAGED), or a RETIRED label still installed — · 2 a question
+# could NOT be answered (the installed set, or the declared set, could not be read: UNKNOWN, never a
+# pass — #1867 review P2). A template the installer would SKIP for an unset placeholder prints
+# `NOT APPLICABLE` and is NOT a failure: a Mac with no tortoise checkout is a legitimate box, not a
+# broken one. If such a template is ALREADY INSTALLED it prints `⚠️ INSTALLED-SKIPPED` instead (rc 0
+# as well): the copy on disk is stale — no install will refresh it while the placeholder stays
+# unresolved — but it usually still runs, so it is a disclosure, not a failure. That marker is counted
+# by `scripts/fleet-schedule.py --verify` to narrow its verdict; it never makes this verb exit non-zero.
+# `2` is ALSO the global usage code; see the second Exit-codes line below the env list.
+#
 # Usage:
 #   install-launchd.sh               install/refresh all templates (idempotent)
-#   install-launchd.sh --status      per-job: installed? loaded? version? drift?
+#   install-launchd.sh --status      per-job: installed? loaded? version? drift?  (non-zero if an
+#                                    INSTALLABLE job is absent, unloaded or drifted, or a job is
+#                                    undeclared or retired-installed; NOT APPLICABLE is a skip, not a
+#                                    failure)
 #   install-launchd.sh --uninstall   bootout + remove installed plists
 #   install-launchd.sh --arm-worktree-hygiene [--reason TEXT]
 #                                    ARM the worktree-hygiene sweep on THIS box
@@ -66,6 +103,16 @@
 #                            shim on PATH so nothing reaches the real domain)
 #
 # Exit codes: 0 = ok (or clean skip), 1 = failure (loud), 2 = usage error.
+# ⛔ AND `--status` REUSES 2 FOR A THIRD MEANING, so it is spelled here as well as in the
+# UNMANAGED paragraph above (#1867 review P3): for THAT verb the three codes are 0 clean · 1 something
+# on the box is not what this repo declares (a per-job verdict, UNMANAGED, or RETIRED-INSTALLED) ·
+# 2 a question could not be answered (the installed set or the declared set could not be read —
+# UNKNOWN, never a pass).
+# The two readings of `2` cannot be confused in practice — `usage()` exits before any work
+# starts and never prints a status body, while the UNKNOWN arm prints and exits 2 from a
+# completed run — but a caller reading only this line would be told the wrong thing, and the
+# one caller that gates on the code (`scripts/fleet-schedule.py`) treats any non-zero as
+# `SCHEDULE NOT VERIFIED` either way. Read the VERB's own line when the distinction matters.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -73,9 +120,17 @@ TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/launchd}"
 AGENTS_DIR="${AGENTS_DIR:-${HOME:?HOME is required}/Library/LaunchAgents}"
 DOMAIN="gui/$(id -u)"
 
-# The range is literal and moves with the header: it ends on `set -uo pipefail`,
-# exactly as it did before the {{PATH}} note above was added.
-usage() { sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+# The range is DERIVED, not literal (#1867). It used to be `sed -n '2,64p'` with a comment saying
+# the number "moves with the header" — i.e. every header edit silently truncated `--help`, and an
+# earlier one already had. The block still ends on `set -uo pipefail`; the line number is now read
+# from the file instead of restated, so a header edit cannot desynchronise it.
+usage() {
+    local end
+    end="$(grep -n '^set -uo pipefail' "$0" | head -1 | cut -d: -f1)"
+    [ -n "${end:-}" ] && [ "$end" -gt 2 ] || end=76
+    sed -n "2,$((end - 1))p" "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+}
 
 # ── THE PLACEHOLDER CONTRACT ──────────────────────────────────────────────────────────────────
 # ONE list, TWO consumers: `render` substitutes every name here, and `install_job` SKIPS a template
@@ -1207,6 +1262,22 @@ verify_targets() {
             bad=1
             continue
         fi
+        # ⛔ THE cmux GATE, BEFORE THE TCC AND FILE-TYPE VERDICTS (#1867). A cmux-gated script is
+        # not "protected" and it is not "broken" — it is a job that will install cleanly, load
+        # cleanly, tick cleanly and be BLIND for its whole life. Every other arm here answers "can
+        # launchd execute this file"; this one answers "may the result see anything", which no
+        # content comparison can. Measured cost of not having it: 1,695 degraded reads, 0 nudges.
+        if is_cmux_gated "$arg"; then
+            echo "    cmux-GATED script cannot run under launchd: $arg" >&2
+            echo "        the cmux socket (socketControlMode = cmuxOnly) gates on launch-chain" >&2
+            echo "        attribution, which a launchd job never has — this job would install, load," >&2
+            echo "        tick and deliver NOTHING while its log read as activity (#1867)." >&2
+            echo "        Documented launch path: bash scripts/heartbeat-launch.sh start" >&2
+            echo "        See docs/ops/heartbeat-launch-path.md. Relaxing the socket is an owner" >&2
+            echo "        decision and is NOT the fix." >&2
+            bad=1
+            continue
+        fi
         # ⛔ THE TCC VERDICT COMES FIRST. A 0-byte or non-regular file INSIDE a TCC root is verdict 2
         # (skip that unit, disarm any copy) — the class this whole change exists for — not verdict 1:
         # a FAIL aborts the install and takes `sync.sh` with it.
@@ -1476,6 +1547,13 @@ install_job() {
     printf '%s' "$rendered" > "$tmp"
     verify_targets "$tmp"
     local vrc=$?
+    # ⛔ THE REASON, CAPTURED BEFORE THE TEMP FILE GOES (#3826 review P3). `vrc` cannot distinguish a
+    # cmux refusal from a farm gap, so this arm told the operator to "fix the farm/checkout first (run
+    # sync.sh / pi-bootstrap setup.sh)" for a cmux-gated template — a remedy that provably cannot clear
+    # it, printed directly beneath the correct diagnosis. On `origin/main` that sentence was only ever
+    # emitted for genuinely missing targets.
+    local cmux_target=""
+    cmux_target="$(plist_cmux_gated_target "$tmp" || true)"
     if [ "$vrc" -ne 0 ]; then
         rm -f "$tmp"
         if [ "$vrc" -eq 2 ]; then
@@ -1504,6 +1582,15 @@ install_job() {
                 echo "        Nothing is installed for this unit." >&2
             fi
             return 0
+        fi
+        if [ -n "$cmux_target" ]; then
+            echo "  REFUSING $label: this template names a cmux-gated script ($cmux_target) —" >&2
+            echo "        it is not a farm gap and no install step fixes it: under launchd it would" >&2
+            echo "        install, load, tick and deliver NOTHING (#1867)." >&2
+            echo "        Remove the template from the set (templates/launchd/LAUNCHD-INCOMPATIBLE)," >&2
+            echo "        and run the heartbeat through its documented launch path instead:" >&2
+            echo "        bash scripts/heartbeat-launch.sh start" >&2
+            return 1
         fi
         echo "  FAIL $label: script target(s) above are missing or unreachable from launchd —" >&2
         echo "        fix the farm/checkout first (run sync.sh / pi-bootstrap setup.sh), then re-run." >&2
@@ -1553,15 +1640,167 @@ install_job() {
 }
 
 status_job() {
-    local template="$1" label installed rendered version state drift
+    local template="$1" label installed rendered version state drift ph unset_ph
     label="$(job_label "$template")"
     installed="$AGENTS_DIR/$label.plist"
     rendered="$(render "$template")"
     version="$(version_of "$template" || echo "?")"
 
-    if [ ! -f "$installed" ]; then
-        echo "  $label: NOT INSTALLED (template v$version)"
+    # ⛔ A TEMPLATE THE INSTALLER WOULD SKIP IS `NOT APPLICABLE`, NOT A FAILURE (#1867 review, round 9).
+    # `install_job` deliberately SKIPs a template whose placeholder resolves empty ("is this a swarm
+    # host?") and a {{PATH}} that renders empty. Those boxes are LEGITIMATE — a Mac with no tortoise
+    # checkout is the common case — and calling them failures would make this verb permanently red on
+    # a healthy box, which is the anti-pattern that produced the OWNED-BY-OTHER-INSTALLERS exemption in
+    # the first place. The two guards below are the install path's own, mirrored verbatim; one list,
+    # one meaning, so a template cannot be skipped at install time and demanded by `--status`.
+    unset_ph=""
+    for ph in "${PLIST_PLACEHOLDERS[@]}"; do
+        if grep -q "{{$ph}}" "$template" && [ -z "${!ph:-}" ]; then
+            unset_ph="$unset_ph {{$ph}}"
+        fi
+    done
+    # `install_job`'s SECOND skip guard, tested on the value that will actually be WRITTEN: a PATH
+    # composed only of unreadable entries is non-empty RAW and empty RENDERED, so the loop above passes
+    # and the unit would install with `<key>PATH</key><string></string>` (an installed-but-inert job).
+    if [ -z "$unset_ph" ] && grep -q '{{PATH}}' "$template" && [ -z "$(launchd_path)" ]; then
+        unset_ph=" {{PATH}}"
+    fi
+    if [ -n "$unset_ph" ]; then
+        # ⛔ THE SKIP PREDICATE OUTRANKS "IS IT INSTALLED" (#1867 review, round 10). Round 9 put this
+        # arm inside the `[ ! -f "$installed" ]` branch, so it only fired for an ABSENT plist: a job
+        # installed while the placeholder still resolved, on a box that has since stopped qualifying
+        # (SWARM_ROOT unset, the tortoise checkout removed), fell through to the `cmp` below and was
+        # reported `DRIFTED … re-run installer` — with a remedy that provably cannot clear it, because
+        # the installer SKIPs that very template. MEASURED: install with SWARM_ROOT set → `in sync` rc
+        # 0; unset SWARM_ROOT → `(DRIFTED …)` rc 1; re-run the printed remedy → `SKIP … unresolved
+        # placeholder(s) {{SWARM_ROOT}}`, plist still installed, status still `DRIFTED` rc 1. That is a
+        # PERMANENT red on a legitimate box — the anti-pattern the OWNED-BY-OTHER-INSTALLERS exemption
+        # exists to remove.
+        if [ -f "$installed" ]; then
+            # Still INSTALLED, so say so — this is not silently a clean box: the copy on disk is
+            # neither refreshed nor removed by an install, so whatever renders today is what runs.
+            # rc 0 because the box did not break: it stopped qualifying, which is the documented
+            # SKIP arm of the install path. The row is the disclosure; the exit code is not the place
+            # to keep a red that no install can clear.
+            # ⛔ AND THE ROW NEEDS A MARKER, NOT JUST WORDS (#1867 review, round 11). The ONLY
+            # consumer that gates on this verb is `scripts/fleet-schedule.py --verify`, and it decides
+            # its sentence by COUNTING MARKERS — so a row of plain prose reached it as no row at all
+            # and the verdict said `SCHEDULE VERIFIED — launchd job set matches templates/launchd` over
+            # a box whose installed copy is provably not what the template describes. MEASURED with a
+            # delegate emitting this row plus one `in sync` job: rc 0, `SCHEDULE VERIFIED … matches`.
+            # The state is NOT disarmed on purpose: unlike the TCC arm, the plist on disk still holds
+            # the value it was installed with, so it usually still WORKS — removing it because a
+            # shell forgot a variable would break a healthy job. It is a disclosure, so the marker is
+            # counted for the VERDICT SENTENCE, never for the exit code.
+            echo "  ⚠️ INSTALLED-SKIPPED   $label: INSTALLED, but SKIPPED now (needs$unset_ph, unset on this box — the installer SKIPs this template, so the installed copy is neither refreshed nor removed)"
+            return 0
+        fi
+        echo "  $label: NOT APPLICABLE (needs$unset_ph, unset on this box — the installer SKIPs it)"
         return 0
+    fi
+    # ⛔ THE INSTALL PATH HAS THREE SKIP ARMS, NOT TWO (#3826 review P2, round 2). The guards above
+    # mirror `install_job`'s unresolved-placeholder and empty-`{{PATH}}` arms. `install_job` SKIPs a
+    # THIRD class — a unit whose rendered target sits under a macOS TCC root (`verify_targets` → 2,
+    # #427) — and returns 0 having DISARMED any installed copy. Without the same arm here that
+    # template fell through to `NOT INSTALLED` + rc 1: a PERMANENT red no command can clear, because
+    # re-running the installer SKIPs it again. MEASURED on the suite's own TCC fixture:
+    #   install   → `SKIP … a macOS TCC root (#427)`   rc 0
+    #   --status  → `NOT INSTALLED (template v0.2.0)`  rc 1
+    # and `fleet-schedule.py --verify` turns that rc into `SCHEDULE NOT VERIFIED` → `activate-harness
+    # … FAILING`. That is the "instrument whose healthy state is red" class this file removes for
+    # every OTHER skip arm (rounds 9-11), left standing on the one added for #427 — and the comment
+    # above says the guards are "mirrored verbatim … so a template cannot be skipped at install time
+    # and demanded by `--status`", which this arm is what makes true.
+    # ⛔ IT REPORTS A SKIP, NOT A PASS: the installed-copy variant keeps a counted marker, so a box
+    # still holding one is disclosed to the verdict sentence rather than certified clean.
+    local _tmp _tcc_vrc _cmux_target="" _cmux_rc=0
+    # ⛔ THE RENDERED PLIST IS MATERIALISED IN A REAL TEMP FILE, AND A TEMP-FILE FAILURE IS ITS OWN
+    # FAIL-CLOSED ANSWER — never a content verdict (#3826 review P1, round 17).
+    # Round 16 took the cmux question out of the `mktemp` guard to stop an unwritable TMPDIR from
+    # hiding a gated job, and handed it a PROCESS SUBSTITUTION instead. That reads as a path and is a
+    # PIPE: `plist_program_args` → `plist_reader_py` does `plistlib.load(open(sys.argv[1], "rb"))`,
+    # `plistlib` requires a SEEKABLE stream, and `/dev/fd/N` raises
+    # `UnsupportedOperation: File or stream is not seekable` → the reader exits 3, the PlistBuddy
+    # fallback does not exist off macOS, so `_cmux_target` came back EMPTY for a GATED job, this arm
+    # was skipped, and the row fell through to the content comparison below. MEASURED at `8aade2a1c`
+    # on a byte-identical install of a template naming `scripts/heartbeat-loop.sh` (both readers
+    # isolated on a real file vs a process substitution): `installed=loaded version=v0.0.1 (in sync)`,
+    # rc **0** — the certify-the-blind-job fail-open this whole change exists to remove, re-opened by
+    # its own fix, with the repo's own §17b red on it (5 assertions).
+    # ⛔ SO: ONE real temp file serves BOTH probes (the TCC arm already needed one), and `mktemp`
+    # failing is answered as `2 UNKNOWN` — which is what round 16's goal actually required ("a broken
+    # TMPDIR must not be able to hide a gated job") without asserting that a pipe is a file.
+    # `plist_program_args` writes its READER to a temp file too, so the same broken TMPDIR surfaces
+    # one call in as rc=3 ("could not read") rather than as "not gated" — see `plist_cmux_gated_target`.
+    # ⛔ ASKED FROM THE MANIFEST AGAIN, DELIBERATELY — NOT DERIVED FROM `verify_targets`'s exit code
+    # (#3826 review P2, and the concurrent lane's note on this same block): a shared `1` cannot say
+    # whether a target was MISSING (a farm gap, which --status must not turn into a permanent red) or
+    # cmux-GATED (the blind job this change exists to refuse).
+    if ! _tmp="$(mktemp 2>/dev/null)"; then
+        echo "  ⛔ UNKNOWN   $label: cannot create a temp file (TMPDIR/TMP/TEMP unwritable), so neither the cmux launch-path gate nor the TCC target check can be evaluated — a unit that cannot be graded is NOT certified"
+        return 2
+    fi
+    if ! printf '%s' "$rendered" > "$_tmp"; then
+        rm -f "$_tmp"
+        echo "  ⛔ UNKNOWN   $label: cannot write the rendered plist to a temp file, so neither the cmux launch-path gate nor the TCC target check can be evaluated — a unit that cannot be graded is NOT certified"
+        return 2
+    fi
+    # ⛔ A cmux-GATED TEMPLATE IS NEVER `in sync` (#3826 review P2 — a fail-open on the exact
+    # defect this change exists to catch). `verify_targets` returns 1 here, so the arms below
+    # graded its CONTENT: a byte-identical template and plist agreed, the row read
+    # `installed=loaded version=v… (in sync)`, and `--status` exited 0 — certifying a job that
+    # installs, loads, ticks and delivers NOTHING. This is not hypothetical: the blind job in
+    # #1867's own body was installed and `--status`-clean for its whole life. It is now a row of
+    # its own and a non-zero exit, so the two verbs agree about one file.
+    # ⛔ AND "COULD NOT READ" IS NOT "NOT GATED" (round 17): `plist_cmux_gated_target` answers 3 for
+    # an unreadable rendered plist, so a reader that could not look is UNKNOWN here instead of being
+    # read as a clean classification. Collapsing the two is how the pipe above became invisible.
+    _cmux_target="$(plist_cmux_gated_target "$_tmp")" || _cmux_rc=$?
+    case "$_cmux_rc" in
+        1) : ;;                       # read, and it names no cmux-gated script
+        0)
+            echo "  ⛔ CMUX-GATED   $label: this job installs, loads and ticks, and is BLIND under launchd ($_cmux_target)"
+            echo "        the cmux socket (socketControlMode = cmuxOnly) gates on launch-chain attribution,"
+            echo "        which a launchd job never has, so it delivers NOTHING while its log reads as"
+            echo "        activity (#1867). This template is listed in templates/launchd/LAUNCHD-INCOMPATIBLE"
+            echo "        — remove it from the set; no install step makes it work."
+            echo "        Documented launch path: bash scripts/heartbeat-launch.sh start"
+            rm -f "$_tmp"
+            return 1
+            ;;
+        *)
+            rm -f "$_tmp"
+            if [ "$_cmux_rc" -eq 4 ]; then
+                echo "  ⛔ UNKNOWN   $label: the cmux launch-path GATE could not be evaluated (no LAUNCHD-INCOMPATIBLE manifest, or one holding no entry), so whether this unit is blind under launchd cannot be answered — a gate that cannot open is not a clean unit"
+            else
+                echo "  ⛔ UNKNOWN   $label: the rendered plist could not be READ (rc=$_cmux_rc), so whether it names a cmux-gated script cannot be answered — an unreadable unit is never a clean one"
+            fi
+            return 2
+            ;;
+    esac
+    _tcc_vrc=0
+    verify_targets "$_tmp" >/dev/null 2>&1 || _tcc_vrc=$?
+    rm -f "$_tmp"
+    if [ "$_tcc_vrc" -eq 2 ]; then
+        if [ -f "$installed" ]; then
+            echo "  ⚠️ INSTALLED-SKIPPED   $label: INSTALLED, but SKIPPED now (launchd cannot READ this unit's target — a macOS TCC root, #427; the installer SKIPs this template and DISARMS the copy, so what runs is not what the template describes)"
+        else
+            echo "  $label: NOT APPLICABLE (launchd cannot READ this unit's target — a macOS TCC root, #427; no install step changes this box's layout)"
+        fi
+        return 0
+    fi
+    if [ ! -f "$installed" ]; then
+        # ⛔ AND AN INSTALLABLE TEMPLATE THAT IS NOT THERE IS A FAILURE ROW WITH A FAILURE CODE
+        # (#1867 review, round 9). This function used to print the three failure verdicts and return
+        # 0 for all of them, so `--status` exited 0 on a box whose declared jobs were absent, unloaded
+        # or drifted — while its own header promised "for `--status`: 0 clean". MEASURED pre-fix with a
+        # fake `launchctl`: an absent, installable declared job printed `NOT INSTALLED (template
+        # v0.1.0)` and rc was 0; a drifted one printed `(DRIFTED (template changed — re-run
+        # installer))` and rc was 0. `fleet-schedule.py --verify` was safe only because it ALSO scans
+        # the text for markers, i.e. the verb had two answers to "is this box clean?" and the one a
+        # shell caller reads was the wrong one.
+        echo "  $label: NOT INSTALLED (template v$version)"
+        return 1
     fi
     if job_loaded "$label"; then
         state="loaded"
@@ -1574,6 +1813,168 @@ status_job() {
         drift="DRIFTED (template changed — re-run installer)"
     fi
     echo "  $label: installed=$state version=v$version ($drift)"
+    case "$state/$drift" in
+        "loaded/in sync") return 0 ;;
+    esac
+    return 1
+}
+
+# ── THE DECLARED SET — every template this directory describes, at ANY depth (#1867 review P1) ────
+# ⛔ RECURSIVE, and the recursion is the fix, not a convenience. Counting only the FLAT `*.plist`
+# templates made the four templates this repo ships one directory down — `conflict-rebase/`,
+# `harness-apply/`, `reaper/`, `runner-autoscale/`, each installed into `~/Library/LaunchAgents` by
+# its own installer — read as UNMANAGED on a box that has the repo's OWN jobs armed. `--status` then
+# exited 1 and printed the `launchctl bootout && rm -f` remedy for three owner-armed jobs, so the
+# instrument's healthy state on the reference Mac was a hard FAILING row. A job declared one
+# directory down IS described by this repo; the question the caller asks is "is this label in the
+# declared set?", and the declared set is this directory's templates wherever they sit.
+#
+# ⛔ AND "WHEREVER THEY SIT" MEANS A WALK (#1867 review P2, round 7). Two fixed globs are "flat, or
+# exactly ONE directory down", while this heading, `is_declared`'s comment and
+# docs/ops/heartbeat-launch-path.md all said "ANY depth" / "resolved recursively". A template at
+# `templates/launchd/<group>/<sub>/x.plist` would therefore be reported UNMANAGED — with
+# `launchctl bootout … && rm -f …` printed as its remedy — which is precisely the harm the P1 above
+# was raised for, closed for one level while the comment claimed all of them. The claim and the code
+# now agree, and §18b pins a template THREE levels down so a future narrowing reds.
+declared_labels() {
+    local template
+    while IFS= read -r template; do
+        [ -n "$template" ] || continue
+        basename "$template" .plist
+    done < <(find "$TEMPLATES_DIR" -type f -name '*.plist' 2>/dev/null | LC_ALL=C sort)
+}
+
+is_declared() { # $1 = label → 0 when a template in the declared set (any depth) describes it
+    # Capture, then grep a here-string — never `declared_labels | grep -q` (#864's SIGPIPE shape).
+    [ -n "$1" ] || return 1
+    grep -qxF -- "$1" <<<"$(declared_labels || true)"
+}
+
+# ── UNMANAGED INSTALLED PLISTS (#1867) ─────────────────────────────────────────────────────────────
+# A plist installed on the box that NO template in the declared set describes is invisible to every
+# content comparison this file makes — the loop in `--status` and the install loop both iterate
+# TEMPLATES, so a job that was installed by hand (or by a template that has since been deleted)
+# simply is not looked at. That was the blind heartbeat's exact shape: installed, loaded, ticking
+# on the wrong launch path, and reported by nothing. Behaviour drift is invisible to a drift check
+# on content; a job outside the declared set is invisible to BOTH.
+#
+# Scoped to the labels this repo can plausibly own (`com.eldato.*`, `com.tortoise.*`) so a box's
+# own unrelated LaunchAgents are not this installer's business — the same boundary the rest of the
+# file uses when it probes for an eldato domain.
+#
+# ⛔ TWO DECLARED EXCLUSIONS, both load-bearing and both about NOT crying wolf:
+#   · a label in `RETIRED` is deliberately template-less — it is DECLARED and `retire_pass` removes
+#     it, so it is pending retirement, not unmanaged;
+#   · a label in `OWNED-BY-OTHER-INSTALLERS` is DECLARED by ANOTHER surface of this repo — an
+#     installer in `scripts/install-*.sh`, the harness installer, or (the one shape that is not an
+#     installer at all) the controller job a box already carries and `scripts/orchestrator-bringup.sh`
+#     ADOPTS. None of them is this installer's set to describe.
+# Without the second, the reference Mac layout is red forever (#1867 review P1) — and the remedy
+# this command prints for a stray is a DELETION, so a missing declaration is not a cosmetic false
+# alarm: it aims `launchctl bootout … && rm -f …` at a live job of this repo's own.
+# Returns 0 when the installed set was enumerated (rows on stdout, possibly none), 2 when it could
+# NOT be — "I could not look" is a different answer from "nothing to report", and the caller must be
+# able to tell them apart (see the UNKNOWN arm in --status, #1867 review P2).
+unmanaged_plists() {
+    local installed label
+    # No install dir at all is a known, benign state (nothing was ever installed here).
+    [ -e "$AGENTS_DIR" ] || return 0
+    # ⛔ EXISTS BUT CANNOT BE ENUMERATED IS NOT "NOTHING UNMANAGED" (#1867 review P2). An unreadable
+    # or non-directory AGENTS_DIR produces no rows, empty rows read as a clean box, and `--status`
+    # then exits 0 from an instrument that looked at nothing — the exact fail-open this file guards
+    # three functions away in `cmux_gate_required` ("must not install on the assumption that none
+    # are"). Refuse instead: 2 = UNKNOWN, never a pass.
+    if [ ! -d "$AGENTS_DIR" ] || [ ! -r "$AGENTS_DIR" ] || [ ! -x "$AGENTS_DIR" ]; then
+        return 2
+    fi
+    # ⛔ AND THE DECLARED SET NEEDS THE SAME GUARD (#1867 review, round 9). `is_declared` asks "is this
+    # label in the declared set?", and with an EMPTY declared set the answer for EVERY label is no — so
+    # an unreadable or empty TEMPLATES_DIR turns this function's own output into the delete advice
+    # above, aimed at the repo's armed jobs. MEASURED with a fixture where `com.eldato.ai-drainer` was
+    # installed AND its template was present: declared set intact → `installed=loaded … (DRIFTED)` and
+    # no bootout; TEMPLATES_DIR empty → `⛔ UNMANAGED …` plus `launchctl bootout … && rm -f …`;
+    # TEMPLATES_DIR chmod 000 → the identical row and the identical delete command. `cmux_gate_required`
+    # already refuses an EMPTY gate on the install path ("an EMPTY gate is the same no-op as a missing
+    # one"); this is that rule on the status path. rc 3 = "the declared set could not answer".
+    if [ -z "$(declared_labels 2>/dev/null)" ]; then
+        return 3
+    fi
+    # ⛔ AND THE EXEMPTION LISTS ARE THE SAME KIND OF INPUT (#1867 review, round 12). `is_retired` and
+    # `is_foreign` are asked for EVERY installed label, and both answer "no" when their manifest could
+    # not be read — so the same fail-open the guard above closes for the template walk is still open
+    # one call away, on the two lists whose whole job is to KEEP a live job out of the `bootout && rm -f`
+    # advice. A tree that ships templates but no readable RETIRED is mutilated, not clean; refuse to
+    # classify rather than hand an operator a deletion command on the strength of a list it never read.
+    # ⛔ AND AN EMPTY EXEMPTION LIST IS THE SAME NO-OP AS A MISSING ONE (#3826 review P2, round 17).
+    # The guard below tested a manifest's PATH only (`-r` / `-f`), so a manifest that EXISTS and is
+    # EMPTY — a truncated file, a mangled merge, a copy whose entries were lost — passed it;
+    # `is_retired` and `is_foreign` then answered "no" for EVERY label, and the loop handed an
+    # operator `launchctl bootout … && rm -f …` for a live job another installer of THIS repo owns.
+    # That is the identical sentence `cmux_gate_required` already refuses on the install path ("an
+    # EMPTY gate is the same no-op as a missing one"), one file over. MEASURED at `8aade2a1c` with
+    # `com.eldato.orchestrator-loop` installed and `OWNED-BY-OTHER-INSTALLERS` truncated to 0 bytes:
+    # `⛔ UNMANAGED com.eldato.orchestrator-loop` PLUS the bootout+rm remedy, rc 1; with the manifest's
+    # entries restored the same box printed 0 UNMANAGED rows. rc 3 = the declared set could not
+    # answer, which the caller reports as UNKNOWN — never as a deletion instruction.
+    # The third clause keeps the fixture carve-out: a TEMPLATES_DIR override that ships no manifest of
+    # its own falls back to the checkout's copy, and only a box with NO declarations anywhere (no
+    # manifest AND no repo template tree) is allowed an empty foreign list.
+    # ⛔ AN EMPTY *FOREIGN* LIST IS STILL A REFUSAL, AND AN EMPTY *RETIRED* LIST IS NOT (#3826 review P2,
+    # round 18). Round 17 refused on both emptinesses and that was wrong in one direction:
+    # `RETIRED` is a RECORD OF REMOVALS, so "holds no entry" is its legitimate terminal state — the
+    # moment every retired job is gone. MEASURED at `f17785035` on a clean box with one byte-identical
+    # in-sync job and `RETIRED` carrying comments only: `in sync` printed for the job, THEN
+    # `⛔ UNKNOWN — the DECLARED SET … could NOT be read` and rc **2** — a permanent red, with a
+    # diagnosis that is false (the set WAS read) and a remedy (`re-run with a readable TEMPLATES_DIR`)
+    # that cannot clear it. That is the anti-pattern this file removes everywhere else.
+    # `OWNED-BY-OTHER-INSTALLERS` is the opposite: an empty one re-classifies live jobs another
+    # installer owns as strays and prints the command that DELETES them, so emptiness there is refused.
+    # The RETIRED *presence* check above is unchanged (a tree that ships templates but no readable
+    # RETIRED is mutilated, not clean); only the entry-count refusal was narrowed.
+    _fl="$(foreign_labels || true)"
+    if [ -z "$_fl" ] && { [ -n "$(foreign_manifest)" ] || [ -d "$INFRA_ROOT/templates/launchd" ]; }; then
+        return 3
+    fi
+    for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
+        [ -f "$installed" ] || continue
+        label="$(basename "$installed" .plist)"
+        # Declared anywhere in the template tree — at ANY depth, which `declared_labels` walks — is
+        # declared. (This said "flat, or one directory down" while the walk was two fixed globs; both
+        # the walk and this sentence are the same question, so they move together.)
+        is_declared "$label" && continue
+        # A RETIRED label is deliberately template-less: it is DECLARED and it is removed by
+        # retire_pass on the next install, so it is not "unmanaged" — it is pending retirement.
+        is_retired "$label" && continue
+        # Declared and owned by another installer of THIS repo — not this directory's set, and a
+        # red here would be a permanent false alarm on the reference layout.
+        is_foreign "$label" && continue
+        printf '%s\n' "$label"
+    done
+}
+
+# ── A RETIRED LABEL THAT IS STILL INSTALLED (round 8) ───────────────────────────────────────────
+# ⛔ THE FALSE PASS THIS INSTRUMENT ITSELF WAS HOLDING. `unmanaged_plists` exempts RETIRED labels
+# (they are DECLARED, so "no template" is not "undescribed"), and `retire_pass` — the ONLY remover —
+# runs on an INSTALL, never on `--status`. Exempting the class from the ROW was right; exempting it
+# from the EXIT CODE was not: on a box still carrying `com.tortoise.heartbeat-loop.plist`, `--status`
+# printed the retired list as prose, produced no row, and exited 0 — so `scripts/fleet-schedule.py
+# --verify` printed `SCHEDULE VERIFIED` over the exact blind job this change exists to remove, while
+# that job ticked, logged `Access denied`, and delivered nothing. MEASURED on round 7's code with a
+# fixture holding only that plist: rc=0, zero `UNMANAGED` rows, plist still on disk; with the RETIRED
+# line removed from a copy of the templates, rc=1 and the `bootout && rm -f` remedy.
+# So it gets its OWN row class and its own exit contribution — and NOT the delete remedy, which would
+# be wrong twice over (the label IS declared, and `retire_pass` does the bootout AND the removal, on
+# the next install). The state is transient by construction: any install clears it.
+installed_retired_plists() {
+    local installed label
+    # No install dir at all is a known, benign state (nothing was ever installed here).
+    [ -e "$AGENTS_DIR" ] || return 0
+    for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
+        [ -f "$installed" ] || continue
+        label="$(basename "$installed" .plist)"
+        is_retired "$label" || continue
+        printf '%s\n' "$label"
+    done
 }
 
 uninstall_job() {
@@ -1589,14 +1990,16 @@ uninstall_job() {
     fi
 }
 
-# Retired launchd jobs (#432 — Option C): labels listed in
-# templates/launchd/RETIRED. Their work moved to extensions/session-checks.ts
-# (session_start, age-gated) because launchd cannot run them — macOS TCC
-# blocks launchd-spawned processes from ~/Documents regardless of interpreter
-# (#427/#431). The installer unloads + removes retired jobs on machines that
-# installed them pre-retirement (the template loop only manages PRESENT
-# templates, so a removed template would otherwise strand installed jobs
-# forever).
+# Retired launchd jobs (#432 — Option C): labels listed in templates/launchd/RETIRED. TWO of them
+# (#427/#431) moved to extensions/session-checks.ts (session_start, age-gated) because macOS TCC blocks
+# launchd-spawned processes from ~/Documents regardless of interpreter — and the others were retired
+# for their own reasons, spelled in the manifest beside each label (the #2303 watchdog → the SHIPPED
+# controller-watchdog template; #1867's blind heartbeat → scripts/heartbeat-launch.sh). ⛔ Do NOT state
+# one destination for the CLASS: that sentence was printed to operators and was false for two of the
+# four labels (round 8). The installer unloads + removes retired jobs on machines that installed them
+# pre-retirement (the template loop only manages PRESENT templates, so a removed template would
+# otherwise strand installed jobs forever), and `--status` reports one that is still installed as
+# RETIRED-INSTALLED and exits 1 until that install runs.
 #
 # ⛔ A LABEL HERE RETIRES THE JOB EVEN WHEN ITS TEMPLATE IS STILL PRESENT, AND
 # THAT IS DELIBERATE (#2908). The installer used to ERROR and exit 1 on the
@@ -1609,15 +2012,221 @@ uninstall_job() {
 # where it is authored instead — `scripts/fleet-schedule.py --check`, which
 # exits 1 for every label listed here that still has a template. Both backends
 # follow that split: the declaration gate refuses, the machine honours.
+# ⛔ FAIL-CLOSED RESOLUTION, and the fallback is the point (#1867 review, round 12). `TEMPLATES_DIR` is
+# an env override (the test suite isolates through it), so reading the manifest ONLY from there made the
+# exemption a no-op on any box where the override points at a directory without it — and the observable
+# of "I could not read the retirement list" is identical to "nothing is retired", which turns every
+# retired label into an UNMANAGED row carrying `launchctl bootout … && rm -f …` aimed at a live job.
+# That is verbatim the harm `OWNED-BY-OTHER-INSTALLERS` exists to prevent (its header, `:28-31`:
+# "A missing entry therefore does not merely print a false alarm — it hands the operator the command
+# that DELETES a live job"). `cmux_manifest` and `foreign_manifest` already resolve this way; RETIRED
+# is the third manifest in the same directory and must not be the one that reads differently.
+retired_manifest() {
+    if [ -r "$TEMPLATES_DIR/RETIRED" ]; then
+        printf '%s\n' "$TEMPLATES_DIR/RETIRED"
+    elif [ -r "$INFRA_ROOT/templates/launchd/RETIRED" ]; then
+        printf '%s\n' "$INFRA_ROOT/templates/launchd/RETIRED"
+    fi
+}
+
 retired_labels() {
-    local manifest="$TEMPLATES_DIR/RETIRED" label
-    [ -f "$manifest" ] || return 0
+    local manifest label
+    manifest="$(retired_manifest)"
+    [ -n "$manifest" ] || return 0
     while IFS= read -r label; do
         case "$label" in
             ""|"#"*) continue ;;
         esac
         printf '%s\n' "$label"
     done < "$manifest"
+}
+
+# ── LABELS ANOTHER INSTALLER IN THIS REPO OWNS (#1867 review P1) ────────────────────────────────
+# `unmanaged_plists` asks "is this job described by the declared set?", and the declared set is
+# THIS directory. But this repo installs launchd jobs from a SECOND surface: the harness controller
+# `com.eldato.orchestrator-loop` is rendered by `scripts/orchestrator-harness/install.sh` from its
+# OWN template, outside `templates/launchd/` — deliberately, because that installer owns its
+# lifecycle through `launchd-cycle.sh`. Flagging it made the honest answer on the reference Mac a
+# PERMANENT red: `--status` rc=1 → `scripts/fleet-schedule.py` prints `SCHEDULE NOT VERIFIED` →
+# `activate-harness.sh` reports `fleet-schedule … FAILING`. An instrument whose healthy state is red
+# is one an operator learns to ignore, or "fixes" by deleting a plist the controller needs.
+#
+# ⛔ THE LIST IS DECLARED, NOT GUESSED, and it is drift-gated IN BOTH DIRECTIONS: §18 of
+# `install-launchd.test.sh` asserts (1) that every entry still has a declaring surface in this repo —
+# matched against ALL the spellings those surfaces use, because one of them spells its label ONLY as an
+# inline `<string>com.…</string>` plist body plus a literal `Library/LaunchAgents/<label>.plist` path
+# (`scripts/install-lane-arm-timer.sh`: its `LABEL=eldato-lane-arm` is the systemd unit name) — and (2)
+# the REVERSE, that every label an installer here writes into `LaunchAgents` is a template, RETIRED, or
+# declared here. A gate that can only catch a STALE entry cannot catch the direction that does harm: a
+# MISSING one, which prints a deletion command for a live job.
+# Resolution mirrors `cmux_manifest` (TEMPLATES_DIR first, then the checkout's own copy) so an
+# env-overridden template dir — the test fixture — still finds it, and a farmed run still falls back to
+# the tree it came from.
+foreign_manifest() {
+    # ⛔ `-r`, NOT `-f` (#3826 review P3). `retired_manifest` tests readability and this one tested only
+    # existence, so an EXISTING-but-UNREADABLE OWNED-BY-OTHER-INSTALLERS was treated as read: `is_foreign`
+    # greps a file it cannot open, matches nothing, and the four labels the manifest exists to exempt
+    # fall through to `⛔ UNMANAGED` — with the `launchctl bootout … && rm -f …` remedy printed beside
+    # them. MEASURED (copy of the manifest at mode 000, two exempt jobs installed): two `⛔ UNMANAGED`
+    # rows, each carrying its delete remedy, rc 1, and no refusal. An unreadable exemption list answers
+    # "nothing is exempt", which is the "mutilated, not clean" case the round-12 note above already
+    # states for RETIRED — it just was not applied to this sibling.
+    if [ -r "$TEMPLATES_DIR/OWNED-BY-OTHER-INSTALLERS" ]; then
+        printf '%s\n' "$TEMPLATES_DIR/OWNED-BY-OTHER-INSTALLERS"
+    elif [ -f "$INFRA_ROOT/templates/launchd/OWNED-BY-OTHER-INSTALLERS" ]; then
+        printf '%s\n' "$INFRA_ROOT/templates/launchd/OWNED-BY-OTHER-INSTALLERS"
+    fi
+}
+
+foreign_labels() {
+    local manifest label
+    manifest="$(foreign_manifest)"
+    [ -n "$manifest" ] || return 0
+    while IFS= read -r label; do
+        case "$label" in
+            ""|"#"*) continue ;;
+        esac
+        printf '%s\n' "$label"
+    done < "$manifest"
+}
+
+is_foreign() { # $1 = label → 0 when another installer in this repo owns it
+    # Capture, then grep a here-string — never `foreign_labels | grep -q` (#864's SIGPIPE shape).
+    [ -n "$1" ] || return 1
+    grep -qxF -- "$1" <<<"$(foreign_labels || true)"
+}
+
+# ── THE cmux LAUNCH-PATH GATE (#1867) ────────────────────────────────────────────────────────────
+# Templates/launchd/LAUNCHD-INCOMPATIBLE declares, once and in the repo, the scripts that a
+# launchd job must never run because their whole job is to touch the cmux socket — which refuses a
+# launchd-spawned caller. The check lives HERE, at the renderer, because that is where the wrong
+# launch path was being produced (the installer had NO knowledge of the gate: grep for `cmux` /
+# `socketControlMode` returned nothing, so it installed blindness by design and silently).
+cmux_gated_scripts() {
+    local manifest entry
+    manifest="$(cmux_manifest)"
+    [ -n "$manifest" ] || return 0
+    while IFS= read -r entry; do
+        case "$entry" in
+            ""|\#*) continue ;;
+        esac
+        printf '%s\n' "$entry"
+    done < "$manifest"
+}
+
+# cmux_manifest — the manifest this run will use, or EMPTY when the checkout does not carry one.
+#
+# ⛔ FAIL-CLOSED RESOLUTION, and the fallback is the point. `TEMPLATES_DIR` is an env override (the
+# test suite isolates through it), so reading the manifest ONLY from there made the gate a no-op on
+# any box where the override points at a directory without it — the "a gate that silently does
+# nothing" class this whole change is about. The REPO's own copy is therefore the fallback, and a
+# run where NEITHER exists is refused outright by `cmux_gate_required` below rather than proceeding
+# ungated.
+cmux_manifest() {
+    # `-r` for the same reason as `foreign_manifest` (#3826 review P3): `cmux_gate_required` catches a
+    # MISSING manifest, but a path test that only checks existence lets an UNREADABLE one through and
+    # the gate then evaluates an empty listing. The install refuses on that emptiness, so this is
+    # symmetry rather than a live hole — one predicate for all three manifests instead of two
+    # behaviours, which is the only way the next reader can predict it.
+    if [ -r "$TEMPLATES_DIR/LAUNCHD-INCOMPATIBLE" ]; then
+        printf '%s\n' "$TEMPLATES_DIR/LAUNCHD-INCOMPATIBLE"
+    elif [ -f "$INFRA_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE" ]; then
+        printf '%s\n' "$INFRA_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE"
+    fi
+}
+
+# cmux_gate_required — refuse to install ANYTHING when the gate has no manifest to evaluate.
+# An installer that cannot tell whether a template is cmux-gated must not install on the assumption
+# that none are: that is precisely how the blind heartbeat was installed and reported as success.
+cmux_gate_required() {
+    local manifest listing
+    manifest="$(cmux_manifest)"
+    if [ -z "$manifest" ]; then
+        echo "ERROR: the cmux launch-path gate cannot be evaluated — no LAUNCHD-INCOMPATIBLE manifest" >&2
+        echo "       looked in: $TEMPLATES_DIR/ and $INFRA_ROOT/templates/launchd/" >&2
+        echo "       Without it this installer cannot tell whether a template would install a job that" >&2
+        echo "       is blind under launchd (#1867), so it installs NOTHING." >&2
+        return 1
+    fi
+    listing="$(cmux_gated_scripts || true)"
+    if [ -z "$listing" ]; then
+        echo "ERROR: $manifest lists no scripts — an EMPTY gate is the same no-op as a missing one" >&2
+        return 1
+    fi
+    return 0
+}
+
+# is_cmux_gated <absolute argv path> → 0 when it is a declared cmux-gated script.
+#
+# ⛔ SUFFIX MATCH, NOT PREFIX. The gate is a property of the SCRIPT, not of the directory it was
+# checked out into: `$HOME/.pi/agent/scripts/heartbeat-loop.sh` (the farmed deployment copy that a
+# plist actually names) and `<worktree>/scripts/heartbeat-loop.sh` are the same script and must
+# both refuse. Resolving both sides and comparing the repo-relative tail is what makes the refusal
+# predictable from the manifest alone; the matching rule is stated in the manifest's own header.
+# Capture-then-herestring, never a pipe into `grep -q` — under `pipefail` the producer takes
+# SIGPIPE at grep's first match and the verdict inverts (#864's shape).
+is_cmux_gated() {
+    local arg="$1" entry gated
+    [ -n "$arg" ] || return 1
+    gated="$(cmux_gated_scripts || true)"
+    [ -n "$gated" ] || return 1
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        case "$arg" in
+            "$entry"|*/"$entry") return 0 ;;
+        esac
+    done <<<"$gated"
+    return 1
+}
+
+# plist_cmux_gated_target <plist> → prints the FIRST cmux-gated program argument;
+#   0 when there is one · 1 when the plist was READ and names none · 3 when it could NOT be read ·
+#   4 when the GATE could not be evaluated (no manifest, or an empty one). The answers are distinct on
+#   purpose — collapsing "could not read" or "could not evaluate" into "not gated" is exactly how a pipe
+#   handed to plistlib, and then a missing manifest, each certified a blind job `in sync` (#3826 P1).
+#
+# ⛔ THE ONE PREDICATE `install` AND `--status` BOTH CONSULT (#3826 review P2). They used to disagree
+# about the same file by construction: `verify_targets` answers `1` for BOTH "a target is missing" and
+# "a target is cmux-gated", so `status_job` could not act on the cmux case without also refusing every
+# box whose farm is incomplete — and it acted on `2` ONLY, which let the gated template fall through to
+# the content comparison and be reported `installed=loaded version=v… (in sync)` with rc 0. MEASURED on
+# the round-13 code: the rendered template naming `<repo>/scripts/heartbeat-loop.sh`, installed
+# byte-identically, printed `in sync` and STATUS_RC=0, while `install-launchd.sh` refused the SAME file
+# loudly. A shared integer cannot carry "why"; asking the manifest again can.
+plist_cmux_gated_target() {
+    local args_out kind arg _rc=0
+    # ⛔ "COULD NOT READ" MUST NOT ARRIVE AS "NOT GATED" (#3826 review P1, round 17). Both used to be
+    # `return 1`, so a reader that failed — an unreadable plist, a temp file it could not create, or
+    # (the measured regression) a PROCESS SUBSTITUTION, which plistlib cannot read because it needs a
+    # seekable stream — was indistinguishable from "read it, nothing gated", and `status_job` graded
+    # the CONTENT of a blind job and certified it `in sync` rc 0. Two codes, not one:
+    #   0 = GATED (the target is printed) · 1 = READ, and it names no gated script
+    #   3 = the rendered plist could not be READ (the same code `plist_reader_py` uses)
+    #   4 = the GATE could not be EVALUATED — no LAUNCHD-INCOMPATIBLE manifest, or an EMPTY one
+    # ⛔ AND 4 IS A SEPARATE ANSWER FROM 1 (#3826 review P1, round 18). `is_cmux_gated` answers "not
+    # gated" when the manifest is missing or holds no entry (`[ -n "$gated" ] || return 1`), and on the
+    # INSTALL path that is safe because `cmux_gate_required` refuses the whole run first — but the
+    # `--status` block ENDS before that call, so `--status` inherited the answer without the gate.
+    # MEASURED at `f17785035` on a scratch INFRA_ROOT whose templates/launchd carried a GATED template
+    # and NO manifest (and again with a comments-only one), byte-identical install:
+    #   --status → `com.eldato.tccprobe: installed=loaded version=v0.0.1 (in sync)`   STATUS_RC=0
+    #   install  → `ERROR: the cmux launch-path gate cannot be evaluated`               INSTALL_RC=1
+    # — the two verbs disagreeing about one file, which is the invariant this function exists to keep.
+    # With the real manifest present the same fixture reds `⛔ CMUX-GATED` rc 1, so 4 is the missing arm,
+    # not a new behaviour. "I could not evaluate the gate" is never "this job is clean".
+    if [ -z "$(cmux_gated_scripts || true)" ]; then
+        return 4
+    fi
+    args_out="$(plist_program_args "$1")" || _rc=$?
+    [ "$_rc" -eq 0 ] || return 3
+    while IFS=$'\t' read -r kind arg; do
+        [ -n "$arg" ] || continue
+        if is_cmux_gated "$arg"; then
+            printf '%s' "$arg"
+            return 0
+        fi
+    done <<<"$args_out"
+    return 1
 }
 
 is_retired() { # $1 = label → 0 when it is listed in RETIRED
@@ -1709,6 +2318,12 @@ resolve_env
 
 if [ "${1:-}" = "--status" ]; then
     echo "=== agent-infra launchd status (templates: $TEMPLATES_DIR) ==="
+    # ⛔ THE PER-JOB ROWS CARRY THE EXIT CODE (round 9). `status_rc` used to start at 0 AFTER the loop
+    # and was raised only by the three set-level arms, so a declared job that was absent, unloaded or
+    # drifted printed a failure row and still exited 0 — the "caveat with exit 0 is read as green"
+    # class this file fixes for UNMANAGED and RETIRED-INSTALLED, left unfixed for the three verdicts
+    # that fire on a normal day. A 2 (UNKNOWN) is never downgraded to 1: the higher answer wins.
+    status_rc=0
     for template in "$TEMPLATES_DIR"/*.plist; do
         [ -f "$template" ] || continue
         # ⛔ A RETIRED LABEL IS A NAMED STATE, NEVER AN ABSENCE (#2908 review, P1). A retired job is
@@ -1722,21 +2337,194 @@ if [ "${1:-}" = "--status" ]; then
         # The installed-copy arm stays a FAILURE on purpose: the manifest says retired, so a copy
         # still on disk is DRIFT from the declaration — a false PASS here would be worse than the
         # false FAIL being closed, and `--install` is what clears it (retire_pass unloads + removes).
+        # ⛔ AND IT NOW CARRIES THE EXIT CODE (#1867 rounds 8/9): the set-level `RETIRED-INSTALLED`
+        # pass below names every retired label still on disk — template or not — and raises status_rc,
+        # so this row and that one agree rather than one of them printing a caveat behind an rc=0.
+        # ⛔ AND IT DOES NOT CARRY THE WORD `DRIFTED` (round 12). `fleet-schedule.py --verify` counts
+        # JOB MARKERS, so a retired label that had BOTH a surviving template and an installed copy
+        # produced two marked lines for ONE job (this row's `DRIFTED` and the set-level
+        # `⛔ RETIRED-INSTALLED`) and the verdict said "2 launchd job(s)" over one — the same
+        # not-a-count-of-jobs lie round 5 fixed in the other direction. The FAILURE row for this state
+        # is the set-level one, which owns both the marker and the exit code; this row states the fact
+        # without competing to be counted. The template-present, nothing-installed case keeps its
+        # wording (#2908: a retired job is deliberately never installed, so that is not a failure).
         label="$(job_label "$template")"
         if is_retired "$label"; then
             if [ -f "$AGENTS_DIR/$label.plist" ]; then
-                echo "  $label: RETIRED (manifest wins) — DRIFTED: an installed copy survives; re-run the installer to unload + remove it"
+                echo "  $label: RETIRED (manifest wins) — an installed copy ALSO survives; re-run the installer to unload + remove it"
             else
                 echo "  $label: RETIRED (manifest wins — template present; remove the template in the repo)"
             fi
             continue
         fi
-        status_job "$template"
+        # ⛔ THE HIGHER ANSWER WINS (#3826 review P1, round 17). `status_job` can now answer 2
+        # (UNKNOWN — a temp file it cannot create, a rendered plist it cannot read), and this arm
+        # collapsed every non-zero into 1, so the sentence above ("A 2 (UNKNOWN) is never downgraded
+        # to 1") described an intent the code did not implement. Fail-closed either way; the
+        # difference is whether the exit status says "this box is wrong" (1) or "nobody could
+        # look" (2). NOT `local` — this runs at script top level (round-16 P3).
+        _jrc=0
+        status_job "$template" || _jrc=$?
+        [ "$_jrc" -gt "$status_rc" ] && status_rc="$_jrc"
     done
-    if [ -n "$(retired_labels)" ]; then
-        echo "Retired (moved to session-checks, #432): $(retired_labels | tr '\n' ' ')"
+    # ── DECLARED BUT NOT OWNED HERE: NAMED, NOT SILENT (#3826 review P2) ──────────────────────────
+    # ⛔ TWO SETS, ONE NAME. `declared_labels` is a WALK (any depth), and `is_declared` uses it to
+    # EXEMPT a template from the UNMANAGED alarm — while this per-job pass (and the install loop, and
+    # `--uninstall`) are a FLAT `$TEMPLATES_DIR/*.plist` glob. A template in a SUBDIRECTORY therefore
+    # produced NO ROW AT ALL: declared, therefore not reported as a stray, and never inspected. This
+    # repo ships four of them — `reaper/`, `conflict-rebase/`, `harness-apply/`, `runner-autoscale/`
+    # — each installed and verified by its own `install-*-timer.sh` with a DIFFERENT placeholder set.
+    # MEASURED pre-fix on a fixture (one flat template installed in sync + `reaper/<label>.plist`
+    # with nothing installed): rc=0, and the nested label appeared NOWHERE in the output — while
+    # `scripts/fleet-schedule.py --verify` printed `SCHEDULE VERIFIED — launchd job set matches
+    # templates/launchd` over declarations nothing had looked at. Silent, correct-looking and blind is
+    # the exact shape this file exists to remove.
+    # ⛔ THEY ARE NOT GRADED BY `status_job` — deliberately. Their placeholder set differs on purpose
+    # (that is WHY they live in a subdirectory: `install-*-timer.sh`'s own headers say so, 4x), so a
+    # content comparison here would invent a DRIFT for a correct install — a new false FAIL traded for
+    # the false PASS. The honest row STATES the delegation and NAMES the template, so "declared" and
+    # "visible" are the same set in both directions and the verdict sentence below is not a claim
+    # about files nothing read.
+    delegated=0
+    # ⛔ RESOLVED BEFORE COMPARING (#3826 review P2). `dirname` NEVER emits a trailing slash, so a
+    # TEXTUAL compare against `$TEMPLATES_DIR` classified this installer's own flat set as "another
+    # installer's directory" whenever the spelling differed by a trailing slash — which is exactly what
+    # shell tab-completion inserts. MEASURED with `TEMPLATES_DIR="$PWD/templates/launchd/"`: 23
+    # `DELEGATED —` rows instead of 4, every graded job appearing TWICE with contradictory verdicts
+    # (`NOT INSTALLED (template v0.2.0)` beside `DELEGATED — … installed and graded by another
+    # installer`), asserting a false ownership and a false state for an absent job while
+    # `fleet-schedule.py --verify` counted the 23 disclosures over 19 jobs it had just graded.
+    # ⛔ NOT `local` — THIS RUNS AT SCRIPT TOP LEVEL (#3826 review P3). `local` outside a function
+    # prints `local: can only be used in a function` to STDERR on every `--status` run, which is the
+    # stream `scripts/fleet-schedule.py --verify` parses (`out.stdout + out.stderr`). Harmless to the
+    # exit code, which is why only reading the stderr shows it. Measured: 1 error line before, 0 now.
+    _own_dir="$(cd "$TEMPLATES_DIR" 2>/dev/null && pwd -P)" || _own_dir="${TEMPLATES_DIR%/}"
+    while IFS= read -r template; do
+        [ -n "$template" ] || continue
+        # Anything DIRECTLY in TEMPLATES_DIR is this installer's own set — already graded above.
+        _tpl_dir="$(cd "$(dirname "$template")" 2>/dev/null && pwd -P)" || _tpl_dir="$(dirname "$template")"
+        [ "$_tpl_dir" = "$_own_dir" ] && continue
+        label="$(job_label "$template")"
+        if is_retired "$label"; then
+            echo "  $label: RETIRED (manifest wins — template in a subdirectory; remove the template in the repo)"
+        else
+            echo "  $label: DELEGATED — declared here, installed and graded by another installer ($template)"
+        fi
+        delegated=$((delegated + 1))
+    done < <(find "$TEMPLATES_DIR" -type f -name '*.plist' 2>/dev/null | LC_ALL=C sort)
+    if [ "$delegated" -gt 0 ]; then
+        echo "    DELEGATED is a NAMED state, not a failure and not a green: these templates are this"
+        echo "    repo's own declarations but another installer renders, loads and verifies them, so this"
+        echo "    command does not grade their content (and never aims a bootout at them)."
     fi
-    echo "Env: AGENT_INFRA_PATH=$AGENT_INFRA_PATH"    echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — session-checks will use the sibling tortoise or skip the hub leg>}"
+    # ⛔ AN INSTALLED JOB WITH NO TEMPLATE IS NOT "NOTHING TO REPORT" (#1867). It is a job on the
+    # box the declared set does not describe, so neither this pass nor the content comparison can
+    # say anything about it — the blind heartbeat sat in exactly that hole. Named loudly, and the
+    # EXIT CODE carries it: a status command that prints a caveat and exits 0 is read by every
+    # caller as "green".
+    status_rc=${status_rc:-0}
+    unmanaged=""
+    unr_rc=0
+    unmanaged="$(unmanaged_plists)" || unr_rc=$?
+    if [ "$unr_rc" -ne 0 ] && [ "$unr_rc" -ne 1 ]; then
+        # ⛔ FAIL-CLOSED, like `check`/`cmux_gate_required` above (0 OK · 1 DRIFT · 2 UNKNOWN — never
+        # a pass). A hard failure of `unmanaged_plists` used to be erased by `|| true` into the same
+        # empty string a clean box produces, so an enumeration that failed read as GREEN.
+        echo "" >&2
+        if [ "$unr_rc" -eq 3 ]; then
+            # ⛔ AND "CANNOT READ THE DECLARED SET" GETS ITS OWN SENTENCE (round 9), because its
+            # consequence is worse than a missed alarm: with an empty declared set EVERY installed job
+            # reads UNMANAGED, and the remedy those rows carry is `launchctl bootout … && rm -f …`
+            # aimed at this repo's own armed jobs. MEASURED pre-fix with `TEMPLATES_DIR` empty (and
+            # again with it chmod 000): `com.eldato.ai-drainer` was reported UNMANAGED with the delete
+            # command, on a box where its template was present and merely unreadable.
+            echo "  ⛔ UNKNOWN — the DECLARED SET (or its exemption lists: RETIRED," >&2
+            echo "     OWNED-BY-OTHER-INSTALLERS) under $TEMPLATES_DIR could NOT be evaluated: it could" >&2
+            echo "     not be read, or a list that must name entries holds NONE — a truncated or mangled" >&2
+            echo "     manifest is not a blank exemption list. Every installed job would then be" >&2
+            echo "     classified against an empty set. Nothing was classified: this is an unanswered" >&2
+            echo "     question, not a box full of strays. Restore the manifest(s) under" >&2
+            echo "     $TEMPLATES_DIR before trusting any green — or any deletion it advises." >&2
+        else
+            echo "  ⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated (rc $unr_rc)." >&2
+            echo "     The installed-job set was NOT inspected: this is an unanswered question, not a" >&2
+            echo "     clean box. Re-run with a readable $AGENTS_DIR before trusting any green." >&2
+        fi
+        status_rc=2
+    fi
+    if [ -n "$unmanaged" ]; then
+        echo ""
+        # ⛔ ONE LINE PER JOB, AND EACH ONE CARRIES THE VERDICT WORD (#1867 review P3, round 5). The
+        # intro used to carry `UNMANAGED` and the job lines did not, so a consumer counting occurrences
+        # of the word counted ONE however many jobs there were. `scripts/fleet-schedule.py --verify`
+        # prints that count in its verdict, so it said "1 launchd job(s) …" over three — the same
+        # family of lie as the `0` it replaced, one order of magnitude smaller. The word now appears on
+        # the JOB lines and not in the intro, so counting `⛔ UNMANAGED` is counting jobs.
+        echo "  ⛔ Installed job(s) with NO template in the declared set — one line per job:" >&2
+        while IFS= read -r _lbl; do
+            [ -n "$_lbl" ] || continue
+            echo "  ⛔ UNMANAGED   $_lbl ($AGENTS_DIR/$_lbl.plist)" >&2
+        done <<<"$unmanaged"
+        echo "    None of these is described by this repo, so no template change and no content comparison can" >&2
+        echo "    reach one. DECIDE before acting — three declarations are not a deletion:" >&2
+        echo "      · a job this repo ships        → add a template under templates/launchd/" >&2
+        echo "      · another surface here owns it → templates/launchd/OWNED-BY-OTHER-INSTALLERS" >&2
+        echo "      · a job that should go away    → templates/launchd/RETIRED, which retire_pass" >&2
+        echo "                                       removes on the next install (no hand-deletion)" >&2
+        echo "      · a job nobody declares        → remove it, but ONLY after checking nothing of" >&2
+        echo "                                       yours supervises the label:" >&2
+        while IFS= read -r _lbl; do
+            [ -n "$_lbl" ] || continue
+            echo "          launchctl bootout gui/$(id -u) \"$AGENTS_DIR/$_lbl.plist\" && rm -f \"$AGENTS_DIR/$_lbl.plist\"" >&2
+        done <<<"$unmanaged"
+        # ⛔ THE HIGHER ANSWER WINS, HERE TOO (#3826 review P3, round 18). This arm set 1 unconditionally,
+        # so a per-job `2 (UNKNOWN)` from the temp-file/read arms above was DOWNGRADED to 1 ("this box
+        # is wrong") — indistinguishable from a real DRIFT, and contradicting the invariant stated one
+        # loop up ("A 2 (UNKNOWN) is never downgraded to 1: the higher answer wins"). The neighbouring
+        # RETIRED-INSTALLED arm already does it this way. Fail-closed either way; the difference is
+        # what the exit status claims.
+        [ "$status_rc" -eq 0 ] && status_rc=1
+    fi
+    # ── RETIRED, STILL INSTALLED (round 8) — its own row class, its own exit contribution ────────
+    # One line per job, carrying the verdict word, for the same reason `UNMANAGED` does: a consumer
+    # counting markers must count JOBS. The remedy is an INSTALL (which runs `retire_pass`), never
+    # `rm -f` — the label is declared, so a hand-deletion is the wrong instruction, and it would leave
+    # the launchd registration behind.
+    _retired_installed="$(installed_retired_plists)" || true
+    if [ -n "$_retired_installed" ]; then
+        echo "" >&2
+        echo "  ⛔ RETIRED in this repo, STILL INSTALLED here — one line per job:" >&2
+        while IFS= read -r _lbl; do
+            [ -n "$_lbl" ] || continue
+            echo "  ⛔ RETIRED-INSTALLED   $_lbl ($AGENTS_DIR/$_lbl.plist)" >&2
+        done <<<"$_retired_installed"
+        echo "    Each is declared in templates/launchd/RETIRED and removed by retire_pass, which runs on" >&2
+        echo "    an INSTALL — never on --status. Nothing needs them; run:" >&2
+        # ⛔ THE REMEDY MUST BE A VERB THIS FILE HAS (#1867 review, round 10). It printed
+        # `install-launchd.sh --install`, and there is no `--install` arm — it falls to `*)` and exits 2
+        # with a usage error, so the removal path for the blind heartbeat could not be executed as
+        # instructed: MEASURED, the printed command → rc 2, plist still on disk, RETIRED-INSTALLED still
+        # printed; the SAME command with no argument → `RETIRED (unloaded + removed)`, row gone. The
+        # install path is the bare invocation; `--install` was invented by the string. §18 now runs the
+        # no-argument form and asserts the row clears, so a re-introduced dead verb reds.
+        echo "      bash scripts/install-launchd.sh" >&2
+        if [ "$status_rc" -eq 0 ]; then
+            status_rc=1
+        fi
+    fi
+    unset _retired_installed
+    if [ -n "$(retired_labels)" ]; then
+        # ⛔ THE SENTENCE WAS FALSE FOR TWO OF THE THREE LABELS IT NAMED (round 8). It said every
+        # retired job "moved to session-checks, #432" — true of hub-state-check and skill-lint-oracle,
+        # and false of `com.eldato.orchestrator-watchdog` (retired in favour of the SHIPPED
+        # controller-watchdog template) and of `com.tortoise.heartbeat-loop` (whose work moved to
+        # `scripts/heartbeat-launch.sh`). An operator reading the status of the box's blind heartbeat
+        # was told its work lives in session-checks. The list is what matters — which labels are
+        # retired — so it is stated as that, and the reason each was retired lives in the manifest.
+        echo "Retired in this repo (no template; the next install unloads + removes each): $(retired_labels | tr '\n' ' ')"
+    fi
+    echo "Env: AGENT_INFRA_PATH=$AGENT_INFRA_PATH"
+    echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — session-checks will use the sibling tortoise or skip the hub leg>}"
     echo "     SWARM_ROOT=${SWARM_ROOT:-<unset — canary job skipped>}"
     if [ "$WORKTREE_HYGIENE_MODE" = '--apply' ]; then
         echo "     worktree-hygiene: ARMED ($WT_HYGIENE_ARM_FILE) — the job DELETES on its timer"
@@ -1748,7 +2536,7 @@ if [ "${1:-}" = "--status" ]; then
     else
         echo "     orphan-reaper: DISARMED (report-only; arm with --arm-orphan-reaper)"
     fi
-    exit 0
+    exit "$status_rc"
 fi
 
 if [ $# -gt 0 ]; then
@@ -1801,6 +2589,10 @@ fi
 
 echo "=== Installing agent-infra launchd agents (idempotent) ==="
 fail=0
+# ⛔ THE GATE IS EVALUATED BEFORE THE FIRST TEMPLATE IS TOUCHED. A cmux-gated job that installs is
+# blind for its whole life and reports success; there is nothing to repair afterwards, so this is a
+# precondition of the run rather than a verdict on individual jobs.
+cmux_gate_required || exit 1
 # Retire first (#432): unload jobs whose work moved to session-checks.
 retire_pass || fail=1
 for template in "$TEMPLATES_DIR"/*.plist; do
