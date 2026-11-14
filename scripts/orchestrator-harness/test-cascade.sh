@@ -75,7 +75,8 @@ FNS="$TMP/fns.sh"
 for _f in is_num is_limit pr_in_set _wedge_min measure_ownership_sets measure_ci_inflight \
           worker_log_name pr_owned \
           unowned_scan mp_reason cascade_issue_slots cascade_wait \
-          cascade_level_name cascade_main_red cascade_level cascade_main_probe queue_state_token; do
+          cascade_level_name cascade_main_red cascade_level cascade_main_probe \
+          queue_state_token queue_state_fresh; do
   _body="$(ex "$_f" "$ORCH")"
   if [ -z "$_body" ]; then echo "❌ could not extract $_f() from $ORCH — it moved or was reformatted"; exit 1; fi
   printf '%s\n' "$_body" >> "$FNS"
@@ -488,7 +489,10 @@ drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <o
     # arm that wanted `empty_backlog` would be pinning a fixture that supplies what production does not.
     # ⛔ `${13}`, NOT `$13` — `$13` is `${1}` followed by a literal `3`, so the record would be written
     # as "<arg1>3" and every arm would grade a state no refresh ever emits.
-    [ -n "${13:-}" ] && printf '%s %s\n' "${13}" "$(date +%s)" > "$w/state/queue-state"
+    # ⛔ `<poolstate-age>` (14) BACKDATES the stamp, because the record's AGE is part of its contract
+    # (#1931): a frozen `EMPTY` must not pass as this pass's measurement, and an arm that can only write
+    # a fresh one cannot grade that rule at all.
+    [ -n "${13:-}" ] && printf '%s %s\n' "${13}" "$(( $(date +%s) - ${14:-0} ))" > "$w/state/queue-state"
     . "$TMP/cascade-block.sh"
     if [ -n "${11:-}" ]; then
       printf '%s %s %s %s %s %s\n' "$CASCADE_ISSUE_SLOTS" "$CASCADE_PR_WAITING" "$CASCADE_WAIT" "${CASCADE_LEVEL:--}" \
@@ -609,6 +613,15 @@ ck "…a zero backlog from a pool NOBODY READ is named as an unread backlog, nev
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 UNREADABLE | cut -d' ' -f5,6)" "0 backlog_unreadable"
 ck "…and with NO queue-state record at all (UNKNOWN) it is still not called empty — an absence is not a measurement" \
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 | cut -d' ' -f5,6)" "0 backlog_unreadable"
+# ⛔ AND "MEASURED" MEANS "MEASURED RECENTLY" (agent-infra#3909 review, 5th cycle P2). `state/queue-state`
+# carries its age because the refresh deliberately leaves the PREVIOUS record standing when a pass aborts
+# early — so a six-hour-old EMPTY plus the empty file it left behind is exactly a pool nobody read this
+# cycle, and calling that "empty backlog" aims #3009 req 2 at a pool that may be full. Both polarities are
+# pinned: the fresh EMPTY arm above must still say empty_backlog, so this is a bound, not a blanket refusal.
+ck "a STALE 'EMPTY' record (6h) is NOT this pass's measurement — it names an unread backlog, not an empty pool" \
+   "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY 21600 | cut -d' ' -f5,6)" "0 backlog_unreadable"
+ck "…and a fresh enough EMPTY still says empty_backlog (the bound must not become a blanket refusal)" \
+   "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY 60 | cut -d' ' -f5,6)" "0 empty_backlog"
 ck "an UNREADABLE PR listing names the LISTING as the cause (the fail-closed arm, on the one state it decides)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
 ' - - 1 x 1 | cut -d' ' -f5,6)" "0 listing_unreadable"
@@ -1471,6 +1484,7 @@ ckin "…with the cause computed where each gate is decided, not re-derived at e
 # be satisfied by the defect (the gate without the token reads nothing; the token without the gate is
 # the bug).
 ckin "…and a zero backlog is only called empty when the refresh MEASURED an empty pool (#1931)" "$SRC_CODE" 'CASCADE_POOL_EMPTY=0'
+ckin "…measured RECENTLY, by the age-bounded sibling — an 'EMPTY*' prefix match would discard the age" "$SRC_CODE" 'queue_state_fresh && CASCADE_POOL_EMPTY=1'
 ckin "…never on a pool nobody read — that state has its own token" "$SRC_CODE" 'CASCADE_SLOTS_WHY="backlog_unreadable"'
 
 printf '\n%s\n' "──────────────────────────────────────────────"
