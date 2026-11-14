@@ -5,6 +5,7 @@
 #   apply_gate_policy <carrier-name>      # called by every carrier that used to export the skips
 #   gate_policy_probe                     # sets GP_REVIEW_OK / GP_VGATE_OK / GP_MISSING
 #   bash gate-policy.sh --probe           # human/CI readable one-liner + exit code
+#   bash gate-policy.sh --unit-veto <f>   # is a scheduled-job DECLARATION carrying a gate bypass?
 #
 # ── WHAT THIS REPLACES, AND WHY IT IS A DEFECT (#2319) ───────────────────────────────────────────
 # Five carriers exported `AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` UNCONDITIONALLY:
@@ -37,6 +38,46 @@
 # could not run passed (an unreadable probe is `not satisfiable`, and says so), and never touches the
 # merge rail — `admin-merge.sh` reads the head-bound record itself and is unaffected by either flag.
 #
+# ── AND THE SECOND HALF: A DECLARATION MAY NOT CARRY THE HATCH (agent-infra#4002) ────────────────
+# `apply_gate_policy` decides the flags for ONE CARRIER'S OWN PROCESS. It cannot see the other way the
+# hatch reaches a lane: a SCHEDULED JOB whose declaration sets it in the environment of everything the
+# job spawns, for ever, with no carrier ever deciding anything. That is not hypothetical — measured
+# 2026-11-10/11, a cell's drainer was started by a hand-written wrapper carrying
+#
+#   export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
+#
+# i.e. an UNATTENDED dispatcher with the review gate, the verification gate and hub-discipline all off.
+# #623 made `task` children unhatched by default precisely so an ambient hatch cannot spread across a
+# fleet; a unit that hands the hatch to every lane it spawns defeats that in one line, and it does so
+# where nothing the carrier does can undo it (a child cannot un-receive an inherited export).
+# So the census has a second half, and it lives HERE, beside the list it is a census of: a rendered
+# unit/service/plist may not name any of these flags in its environment. `gate_policy_unit_veto` is
+# called by `install-drainer-timer.sh` (so the install REFUSES, fail-closed) and by
+# `gate-policy.test.sh` (so a template that regrows the hatch is RED before it reaches a box).
+# Wired into the drainer's installer because that is the unit the measured defect ran, and into the test's
+# census — which grades EVERY shipped template AND the declarations that are GENERATED INLINE by an
+# installer rather than rendered from `templates/` (§5a, §5b, §5e, §5g). ⛔ An earlier revision of this
+# paragraph said a bypass "can only reach a box through a template", and that was FALSE: `scripts/
+# install-lane-arm-timer.sh` writes its `Environment=` lines from a heredoc (`service_body`) and is farmed,
+# so it is a live install path that no template census sees. A generated declaration is graded like any
+# other — the bytes the installer would write are what the veto reads.
+# ⛔ AND THE SAME WAS TRUE OF THE SECOND GENERATOR (fresh review of PR #4020, finding 2):
+# `install-conflict-rebase-timer.sh` appends `Environment=CONFLICT_REBASE_DRY_RUN=1` AFTER a render and
+# writes the plist's `EnvironmentVariables` with python, and it too is farmed — so this paragraph's claim
+# was again wider than the coverage behind it. It now calls `gate_policy_unit_veto` on both rendered
+# artifacts (`--dry-run` included, so the preview cannot show what an install would refuse), and its own
+# suite carries the arm that reddens when that call is deleted. The claim is therefore true by
+# construction, not by a census that happens to be complete today.
+# STATED LIMIT, so no reader over-reads it: this grades the DECLARATION TEXT of the unit. `EnvironmentFile=`
+# (a file the unit names but whose CONTENTS we cannot read), a sourced rc file and the spawned script's own
+# `export` are outside it. `PassEnvironment=` IS inside it — it names a variable in the unit's own text, so
+# it is graded like `Environment=` (fresh review of #4002, round 4: it used to answer CLEAN while naming two
+# hatches). ⛔ ALSO OUTSIDE, and stated because it is the one a reader would otherwise assume covered: an
+# EXEC-PREFIX assignment — `ExecStart=/usr/bin/env AGENT_SKIP_REVIEW_GATE=1 /path` on systemd, and the same
+# shape in a launchd `ProgramArguments` array — is not an `Environment=`/`PassEnvironment=` directive, so it
+# is not read here (fresh review of PR #4020, note b). Closing it means grading the exec line, which is a
+# different declaration and a larger surface; it is recorded rather than silently assumed.
+#
 # SEAMS (tests): GP_REPO=<path> (harness checkout to probe), GP_LOG=<file> (audit), GP_QUIET=1.
 
 GP_REVIEW_OK=0
@@ -44,6 +85,122 @@ GP_VGATE_OK=0
 GP_MISSING=""
 GP_MODE=""
 GP_AMBIENT_CLEARED=0
+
+# ⛔ THE ONE LIST. Every name here is a hatch that turns a gate OFF for the process it lands in, so a
+# declaration that sets one is handing it to every process the job spawns.
+# ⛔ THE LIST IS EXACTLY WHAT THE GATES HONOUR, and the dual-prefix lookups are why it is not obvious. Every
+# hatch except VGATE is read through `process.env[`AGENT_${n}`] ?? process.env[`ELDATO_${n}`]`
+# (`extensions/review-enforcer/index.ts:` `_getEnv`, `extensions/main-worktree-guard/index.ts:` `_getEnv`),
+# so each has TWO spellings and BOTH bypass the gate: `ELDATO_SKIP_REVIEW_GATE=1` with no `AGENT_` variable
+# present answers `"1"` and disables the review gate just as the `AGENT_` form does. `ELDATO_SKIP_VGATE` is
+# read directly (`extensions/verification-gate/index.ts`) and has no `AGENT_` sibling.
+# ⛔ FOUR HATCHES, not three (a measured fail-open in the second cut of this list, fresh review of #4002):
+# `ADMIN_MERGE_OVERRIDE` is the same kind of switch — `_getEnv("ADMIN_MERGE_OVERRIDE")` skips the head-bound
+# admin-merge evidence gate (`the head-bound evidence gate was bypassed by AGENT_ADMIN_MERGE_OVERRIDE=1`).
+# A unit setting it hands every lane it spawns the un-certified landing route, which is precisely the #4002
+# shape. It belongs here for the same reason the other three do.
+# ⛔ `gate-policy.test.sh` §5f derives the honoured set FROM the extensions — every `_getEnv("STEM")` call
+# site expanded to both prefixes, plus direct `process.env` hatch reads — and requires this list to equal
+# it, so a new hatch stem reddens the suite instead of being invisible. Extend THIS list, never a second copy.
+GP_UNIT_BYPASS_FLAGS="AGENT_SKIP_REVIEW_GATE ELDATO_SKIP_REVIEW_GATE ELDATO_SKIP_VGATE AGENT_ADMIN_MERGE_OVERRIDE ELDATO_ADMIN_MERGE_OVERRIDE AGENT_ALLOW_MAIN_EDITS ELDATO_ALLOW_MAIN_EDITS"
+
+# gate_policy_unit_veto <file> [label] — does a DECLARATION carry a gate bypass in its environment?
+#   0  clean (the declaration names none of the flags)
+#   1  VETOED (it names at least one; the names are printed on stderr)
+#   2  cannot answer (no file / not readable / an ungradable continuation)
+#      ⛔ NEVER a pass: an ungradable declaration is not a clean one.
+# Grades BOTH declaration dialects, because the fleet ships both from this repo: a systemd
+# `Environment=<NAME>=…` directive and a launchd `<key><NAME></key>` inside EnvironmentVariables.
+gate_policy_unit_veto() {
+  local f="${1:-}" label="${2:-declaration}" flag hit="" folded="" envlines=""
+  [ -n "$f" ] || { printf 'unit-veto: no file named — cannot grade '\''%s'\''\n' "$label" >&2; return 2; }
+  [ -r "$f" ] && [ ! -d "$f" ] || {
+    printf 'unit-veto: cannot read %s — an ungradable %s is not a clean one\n' "$f" "$label" >&2
+    return 2
+  }
+  # ⛔ FOLD BACKSLASH CONTINUATIONS *BEFORE* EXTRACTING DIRECTIVES (fresh review of #4002, P1 — reproduced).
+  # systemd joins a line ending in an unescaped `\` with the following one and replaces the backslash with
+  # a space (`systemd.syntax(7)`), so this is ONE valid declaration that sets the hatch:
+  #     Environment=FOO=1 \
+  #         AGENT_SKIP_REVIEW_GATE=1
+  # Extracting physical lines missed it and answered CLEAN — in the census AND on the install path, i.e.
+  # the exact "silently stopped matching" fail-open this function exists to prevent. Wrapping is the
+  # documented use of the continuation (`Environment=PATH={{PATH}}` is exactly the long line someone
+  # wraps), so this was reachable, not theoretical.
+  # ⛔ THE FOLD MUST BE `systemd`'S SCANNER, NOT A PER-PHYSICAL-LINE "does it end with a backslash"
+  # (fresh review of #4002, P1 + P2 — BOTH reproduced against this function at the review head). The
+  # previous awk fold was wrong in four ways, and the first two are FAIL-OPEN — a hatch installed with
+  # the judge's blessing, which is the exact #4002 class this function exists to close. Verified against
+  # the parser itself (`src/shared/conf-parser.c:355-409`, systemd main; `systemd.syntax(7)` `[Section C]`):
+  #  1. A COMMENT LINE IS SKIPPED AND TOUCHES NOTHING — it neither starts a continuation (its own trailing
+  #     `\` counts for nothing) nor CLOSES a pending one (the accumulator survives it). So
+  #     `Environment=FOO=1 \` + `# note` + `AGENT_SKIP_REVIEW_GATE=1` is ONE `Environment=` directive and
+  #     systemd sets the hatch. The fold ended the join at the comment, leaving the hatch on a line that
+  #     no longer started with `Environment=` — CLEAN, and `install-drainer-timer.sh --install` installed it.
+  #     The old comment here claimed the opposite ("a comment swallows its continuation") and the arm that
+  #     pinned it (`§5d` wrapped-comment) asserted the DEFECT; both are corrected.
+  #  2. A BLANK LINE IS NOT A COMMENT: systemd appends it and the pending continuation then ENDS (the
+  #     accumulator's last character is the space the `\` became), so this fold FLUSHES on it. Skipping it
+  #     instead joins the line AFTER it into the previous directive: `ExecStart=/bin/true \` + (blank) +
+  #     `Environment=AGENT_SKIP_REVIEW_GATE=1` is a hatch systemd DOES set, and the join would bury it in an
+  #     `ExecStart=` this function never extracts — the same fail-open by another route.
+  #  3. ONLY AN UNESCAPED BACKSLASH CONTINUES: systemd's `escaped` flag is the PARITY of the trailing run,
+  #     so a line ending in `\\` ends the line. Joining it anyway VETOED a clean unit (`PATH=/opt/bin\\`
+  #     then a commented mention of the hatch) that installs fine — an over-block on the operator path.
+  #  4. TRAILING BLANKS ARE NOT TRIMMED BEFORE THE SCAN (systemd uses the raw line), so `\` followed by a
+  #     space does NOT continue. Trimming would join two directives systemd keeps apart — hiding the
+  #     declaration that follows, i.e. fail-open again.
+  # The continuation is replaced by a SPACE, which is what systemd writes into its buffer.
+  # The accumulator is the convention this tree already uses twice for the same man-page rule:
+  # `scripts/harness-apply-pass.sh`'s `logical_lines()` (whose own comment cites `systemd.syntax(7)`).
+  local _ln _cmt _tail _bs _acc=""
+  folded=""
+  while IFS= read -r _ln || [ -n "$_ln" ]; do
+    # The comment test skips LEADING blanks (systemd does), and the line is then dropped whole.
+    _cmt="$_ln"
+    while :; do case "$_cmt" in [[:space:]]*) _cmt="${_cmt#?}" ;; *) break ;; esac; done
+    case "$_cmt" in '#'*|';'*) continue ;; esac
+    # Parity of the trailing backslash run: odd -> escaped (continuation), even -> the line ends here.
+    _bs=0; _tail="$_ln"
+    while :; do case "$_tail" in *\\ ) _bs=$(( _bs + 1 )); _tail="${_tail%?}" ;; *) break ;; esac; done
+    if [ $(( _bs % 2 )) -eq 1 ]; then
+      _acc="$_acc${_ln%?} "   # the backslash becomes a SPACE (systemd.syntax(7))
+      continue
+    fi
+    folded="$folded$_acc$_ln"$'\n'
+    _acc=""
+  done <"$f" 2>/dev/null
+  # ⛔ NO `|| return 2` HERE: a `while` whose read fails on the first iteration still exits 0, so an error
+  # branch on this loop would be a NO-OP GATE — it could never fire. The ungradable cases are refused by
+  # the preflight above (absent, unreadable, or a directory), which is where they are actually reachable.
+  # An accumulator still pending at EOF is a logical line too (a file may end on a continuation).
+  [ -n "$_acc" ] && folded="$folded$_acc"$'\n'
+  # ⛔ ONLY `Environment=` / `PassEnvironment=` DIRECTIVES ARE GRADED, and the flag must be a WHOLE WORD
+  # inside them. `PassEnvironment=<NAME>` names a variable in the unit's OWN text (it forwards one the
+  # managing systemd instance holds), so it is a declaration that names the hatch and belongs here — it
+  # used to answer CLEAN (fresh review of #4002, round 4). `EnvironmentFile=` deliberately does NOT match:
+  # the unit names a file, not a variable, and its contents are outside what this function can read.
+  # `-w` rather than a hand-rolled `[^A-Za-z0-9_]` boundary: GNU and BSD grep disagree about `\b` in
+  # ERE (BSD has no `\b`), and a boundary that silently stops matching is the shape that lets the
+  # hatch back in. A commented-out line is not a declaration, so the `^[[:space:]]*` anchor
+  # deliberately does not see it.
+  envlines="$(grep -E '^[[:space:]]*(Environment|PassEnvironment)[[:space:]]*=' <<<"$folded" 2>/dev/null || true)"
+  for flag in $GP_UNIT_BYPASS_FLAGS; do
+    # ⛔ HERE-STRING, NOT `printf … | grep -q` (#841/#864): the recognised idiom is a producer piped into a
+    # QUIET grep, where the producer can take SIGPIPE under `pipefail` and a present match reads as absent.
+    # One producer and no pipe removes the shape entirely. (This file sets no `set -o pipefail` — the guard
+    # flags the SHAPE, and the shape is what keeps being reintroduced elsewhere.)
+    if [ -n "$envlines" ] && grep -Fqw -- "$flag" <<<"$envlines"; then
+      hit="$hit $flag"
+    elif grep -Eq "<key>[[:space:]]*${flag}[[:space:]]*</key>" "$f" 2>/dev/null; then
+      hit="$hit $flag"            # launchd: the plist spells the name as its own <key>
+    fi
+  done
+  [ -z "$hit" ] && return 0
+  printf 'unit-veto: %s (%s) carries a GATE BYPASS in its environment:%s\n' "$f" "$label" "$hit" >&2
+  printf 'unit-veto: agent-infra#4002 — a scheduled job must not hand the emergency hatch to every process it spawns; remove it from the declaration (a lane that needs the hatch decides it through gate-policy.sh, per carrier)\n' >&2
+  return 1
+}
 
 gate_policy_probe() {
   local repo="${GP_REPO:-}"
@@ -181,6 +338,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       printf 'review_satisfiable=%s vgate_satisfiable=%s missing=%s note=%s\n' "$GP_REVIEW_OK" "$GP_VGATE_OK" "${GP_MISSING:--}" "${GP_NOTE:-}"
       [ "$GP_REVIEW_OK" -eq 1 ] && [ "$GP_VGATE_OK" -eq 1 ] && exit 0
       exit 1 ;;
-    *) printf 'usage: gate-policy.sh --probe   (or source it and call apply_gate_policy <carrier>)\n' >&2; exit 64 ;;
+    --unit-veto)
+      [ -n "${2:-}" ] || { printf 'usage: gate-policy.sh --unit-veto <declaration-file> [label]\n' >&2; exit 64; }
+      gate_policy_unit_veto "$2" "${3:-declaration}" || exit $? ;;   # 1 vetoed · 2 ungradable
+    *) printf 'usage: gate-policy.sh --probe | --unit-veto <file> [label]   (or source it and call apply_gate_policy <carrier>)\n' >&2; exit 64 ;;
   esac
 fi
