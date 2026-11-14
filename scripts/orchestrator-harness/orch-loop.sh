@@ -9915,8 +9915,9 @@ PY
     # computed by the cascade block ~1,200 lines above this emit (and by the drain-escape block between
     # them). The `slots_why=` POOL gate is the exception and is stated rather than glossed: telling a
     # measured empty pool from a blind one costs ONE `state/queue-state` read per pass
-    # (`queue_state_class`, plus that function's own `date +%s`) — two forks on the every-cycle path, in
-    # a file where the fork budget is itself a dispatch gate (#2293). A reader sizing the budget from
+    # (`queue_state_class`), plus that function's own `date +%s` ONLY when the record carries a usable
+    # stamp — it returns `blind` before spawning the clock on an absent/unparseable `at`. So one fork on
+    # such a pass and two otherwise, in a file where the fork budget is itself a dispatch gate (#2293). A reader sizing the budget from
     # this artifact is told where those two forks come from instead of being told there are none. The
     # rest is why this is a field addition and not a scope change — and it is precisely what the OPEN OWNER DECISION
     # in docs/ops/self-healing-contract.md §6 does NOT cover: making the levels actionability-bounded is

@@ -222,8 +222,11 @@ additive fields carry the cascade's own resolution. Four of them are pure *measu
 their condition is decided and only *recorded* at the emit; the fifth (`level=`) is the rung's name:
 
 - `level=` — the rung the pass **resolved** (for an idle pass, the rung it idled on; when `slots=` is
-  non-zero, the rung that DISPATCHED — `level=ISSUES slots=2 slots_why=granted` is a working pass, not
-  an idle one, so `level=` must be read with `slots=`/`slots_why=` and never as an idle marker alone).
+  non-zero, the rung that was **OPENED** — `level=ISSUES slots=2 slots_why=granted` means the ISSUES rung
+  was GRANTED two slots, NOT that anything spawned). ⛔ The grant is not a dispatch: the cascade block
+  freezes `slots=` and the gate vector that decides dispatch runs AFTER it, so read `dispatched=` and
+  `nothing=` for whether work went out — `level=ISSUES slots=10 slots_why=granted dispatched=0
+  nothing=gate:landing-floor(…)` is a real, IDLE pass. Read `level=` with `slots=`/`slots_why=`.
   It is one of (`FIX_MAIN` | `MERGE` | `FIX_PR` | `REVIEW_PR` | `ISSUES`). Two
   non-rung tokens, and they mean different things: `UNMEASURED` = the level walk **ran** and classified
   nothing; `NOT-MEASURED` = the cascade block **ran** but left the rung unmeasured because `slots=0` made
@@ -264,9 +267,12 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   arms above them. A non-zero grant still reads `granted` (`CASCADE_RUNG_SLOTS > 0` is the first arm and
   consults no class), and an unreadable PR listing still reads `listing_unreadable`, because that arm
   precedes the backlog ones. ⛔ "DOES NOT DECIDE" IS NOT "IS NOT READ": `queue_state_class` is invoked
-  unconditionally just above the arm chain, so its file read and its own `date +%s` are spent on EVERY
-  pass, `backlog=10` included — it simply cannot change the token there. Two forks on the every-cycle
-  path, disclosed at the emit and absorbed by the fork budget (#2293). Whether the pool was
+  unconditionally just above the arm chain, so its file read is paid on EVERY pass, `backlog=10`
+  included — it simply cannot change the token there. ⛔ AND THE CLOCK IS NOT PAID ON EVERY PASS: the
+  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (:3378 precedes
+  :3380), so the cost is one fork (the command substitution) on a record with no parseable stamp and
+  TWO when the stamp is usable. Fork headroom is a dispatch gate here (#2293), so the count is stated
+  rather than rounded up. Whether the pool was
   read at all is one fact among several, not a verdict that overrides them. ⛔ That "future" test is a **digit
   comparison**, not arithmetic: an epoch at or above 2^63 wraps negative inside `$(( ))`, which would
   pass a "not in the future" test and then a negative age below the bound — reading a corrupt stamp as
@@ -316,8 +322,10 @@ replaces it with the word. The terse form is used so that a set-but-empty value 
 instead of masquerading as `absent`; it is **not** what protects a measured `0`, and an editor who
 switches the spelling will not thereby start losing zeros.
 ⛔ **`absent` is the emitter's FALLBACK, not a value production produces** (corrected 2026-11-14, review
-P2 of #3909). The only emitter of those four keys is reached *after* the cascade block assigned all of
-them, so `absent` never appears in a written record. The records that genuinely skip the block — the
+P2 of #3909). The only emitter of those four keys is reached *after* the cascade block AND the
+**drain-escape** block have assigned all of them (the cascade assigns `level`/`slots`/`slots_why`/
+`can_spawn`; `escape=` is the drain-escape block's own token, see above), so `absent` never appears in a
+written record. The records that genuinely skip the block — the
 **fork-held** and **disk-held** emissions, written before it — carry **none** of the four tokens, exactly
 as they carry no `level=`; that is the signal a reader sees, and an earlier draft of this paragraph named
 the one they will never see instead. `level=` is the one token that cannot be `absent` because it is a
