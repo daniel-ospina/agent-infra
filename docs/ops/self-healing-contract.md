@@ -270,8 +270,8 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   precedes the backlog ones. ⛔ "DOES NOT DECIDE" IS NOT "IS NOT READ": `queue_state_class` is invoked
   unconditionally just above the arm chain, so its file read is paid on EVERY pass, `backlog=10`
   included — it simply cannot change the token there. ⛔ AND THE CLOCK IS NOT PAID ON EVERY PASS: the
-  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (`:3384` precedes
-  `:3385`), so the cost is one fork (the command substitution) on a record with no parseable stamp and
+  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (`:3389` precedes
+  `:3390`), so the cost is one fork (the command substitution) on a record with no parseable stamp and
   TWO when the stamp is usable. Fork headroom is a dispatch gate here (#2293), so the count is stated
   rather than rounded up. Whether the pool was
   read at all is one fact among several, not a verdict that overrides them. ⛔ That "future" test is a **digit
@@ -319,8 +319,12 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   cascade block — that separation is the whole point of it being its own token. ⛔ **A measured `0`
   means the valve RE-GRANTED NOTHING, not that it did not fire** (review P2, 9th cycle): it can fire on a
   pass the cascade ALREADY granted (`escape=0` beside `slots=N>=1` is a real, recorded state). ⛔ A zero
-  BACKLOG is **not** a second such state — that outcome is WITHHELD before any record is written
-  (*"No escape is taken and no record is written"*), so it publishes no `escape=` at all (10th cycle P1).
+  BACKLOG is **not** a second such state — that outcome is WITHHELD: it writes no escape RECORD
+  (`state/drain-escape`, *"No escape is taken and no record is written"*). ⛔ BUT IT STILL PUBLISHES A
+  MEASURED `escape=0` IN THE CYCLE RECORD: the token is reset to `0` at the top of the drain-escape block
+  on EVERY pass and the emit spells it `${CASCADE_ESCAPE_SLOTS-absent}`, so the withhold removes the
+  escape record, not the field (11th cycle P2; the suite arms this — "an EMPTY backlog publishes
+  escape=0"). Read `escape=0` there as "the backlog ceiling produced nothing".
   Only `escape>0` proves a grant; `escape=0` proves only that the valve added nothing;
 - `can_spawn=` — the capacity probe's own answer.
 

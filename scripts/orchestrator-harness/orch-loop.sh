@@ -9246,8 +9246,10 @@ PY
     # NOTHING — ⛔ NOT that it did not fire (review P2, 9th cycle). The fire-with-zero that exists is a
     # pass where the cascade ALREADY granted: the valve opens and records, the grant guard fails, and the
     # record carries `escape=0` beside `slots=N>=1` — a real, measured state. (⛔ A zero BACKLOG is NOT a
-    # second one: that outcome fails `_ecan` and takes the WITHHELD arm below, which writes no record at
-    # all — an earlier revision of this comment named it and was wrong, 10th cycle P1.) Only `escape>0`
+    # second one: that outcome fails `_ecan` and takes the WITHHELD arm below, which writes no ESCAPE
+    # RECORD — but the cycle record still carries a measured `escape=0`, because the token is reset at the
+    # top of this block on every pass and the emit reads it terse-minus. Do not read the withhold as "no
+    # `escape=` field"; an earlier revision did and was wrong, 10th/11th cycles.) Only `escape>0`
     # proves a grant, and the zeroing at the top of the block is what keeps a previous cycle's grant from
     # being read as this one's.
     CASCADE_ESCAPE_SLOTS="${_egrant:-0}"
