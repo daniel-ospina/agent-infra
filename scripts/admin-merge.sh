@@ -6751,6 +6751,16 @@ lane_no_pr_trigger() {
 # and let §1b refuse. The other default would let a producer-side change silently
 # re-open the same fail-open (#2465 review P1) with every arm still green.
 #
+# ⛔ AND "UNPARSEABLE" IS ENFORCED, NOT ASSUMED (round 3, P2). The prose above said an
+# unparseable list answers "can attach"; the code read a PRESENT clause as `measured`
+# whatever it contained, so a shape this helper cannot classify was read as "no
+# attachable trigger" and WIDENED — the fail-open direction, from a list it never
+# actually parsed (`(declared triggers: push workflow_dispatch)` collapsed to one token
+# `pushworkflowdispatch`; `push-to-fork` matched nothing). The shape gate below is what
+# makes the sentence true: the producer emits a `", "`-joined list of `on:` keys
+# (scripts/ci-workflow-pr-evaluable.sh:831), so every member MUST be `[a-z0-9_]+`. Any
+# other shape is treated exactly like an ABSENT one — `unread`, fail closed.
+#
 # ⛔ AND IT MUST NOT LOOK LIKE A MEASUREMENT (round 2, P2). The two grounds for "can
 # attach" are NOT the same claim — one PARSED `push`/`workflow_dispatch` out of the
 # reason, the other could not read the list at all and defaulted fail-closed. So the
@@ -6763,18 +6773,26 @@ lane_no_pr_trigger() {
 # The clause is produced by scripts/ci-workflow-pr-evaluable.sh:829-832 and is already
 # present in LANE_APPLICABILITY_REASON, so this costs no extra `gh` call.
 lane_own_run_can_attach() {
-  local reason="${1:-}" triggers="" list="" found=""
+  local reason="${1:-}" triggers="" norm="" list="" found=""
   LANE_RUN_ATTACH_SOURCE="unread"
   LANE_RUN_ATTACH_TRIGGERS=""
   case "$reason" in
     *'(declared triggers:'*')'*)
       triggers="${reason##*'(declared triggers:'}"
       triggers="${triggers%%)*}"
-      LANE_RUN_ATTACH_SOURCE="measured"
       ;;
     *) return 0 ;;
   esac
-  list=",$(printf '%s' "$triggers" | tr -d '[:space:]'),"
+  # ⛔ THE SHAPE GATE (round 3, P2). Normalise ONLY the documented delimiter, then
+  # refuse to classify anything that is not a plain `on:` key. `return 0` here is the
+  # fail-CLOSED answer (keep the filter) and leaves LANE_RUN_ATTACH_SOURCE at `unread`,
+  # so §0b's message says the list was unread instead of naming a trigger it invented.
+  norm="$(printf '%s' "$triggers" | sed -e 's/,[[:space:]]*/,/g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  case "$norm" in
+    ''|*[!a-z0-9_,]*) return 0 ;;
+  esac
+  LANE_RUN_ATTACH_SOURCE="measured"
+  list=",$norm,"
   case "$list" in
     *,push,*) found="push" ;;
   esac
@@ -10170,6 +10188,9 @@ main() {
         # below — so an absent/unparseable trigger list can be described as what it is
         # (a fail-closed DEFAULT) instead of as a declaration that was never read.
         local LANE_RUN_ATTACH_SOURCE="" LANE_RUN_ATTACH_TRIGGERS=""
+        # …and the MECHANISMS, derived from what was measured. A fixed list would tell a
+        # `workflow_dispatch`-only lane that "a push whose tip is $head" can attach a run
+        # of it, which is false for that lane (round 3, P2) — the same rule as above.
         if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then lane_structural=1; fi
         lane_head_run_state "$head"
         lane_probe_state="$LANE_HEAD_RUN_STATE"

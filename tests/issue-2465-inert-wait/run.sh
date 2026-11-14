@@ -316,6 +316,25 @@ HM3_ERR="$(AP_VERDICT=inapplicable \
   AP_PROBE_STATE=unreadable bash < "$HMUT3LIB" 2>&1 >/dev/null)"
 ck "(a7) against the mutant (a3b)'s assertion is RED (the message names 'workflow_call' as attachable)" \
    "$(grep 'LANE KEPT' <<<"$HM3_ERR" | grep -q 'workflow_call' && echo 0 || echo 1)"
+# ── (a8) a PRESENT but UNCLASSIFIABLE clause must fail CLOSED ──
+# The prose in `lane_own_run_can_attach` (and row D of the plan) said an unparseable
+# clause answers "can attach"; the parser read every PRESENT clause as `measured` and
+# widened on shapes it never parsed. Widening is the LOOSENING direction, so the shape
+# gate is what makes the recorded guarantee true — pinned here on the two shapes a
+# producer-side change would actually produce.
+echo "(a8) STRUCTURAL + a PRESENT but UNPARSEABLE clause + UNREADABLE — must KEEP the filter"
+for bad_clause in \
+  'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: push workflow_dispatch)' \
+  'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: push-to-fork)'
+do
+  drive inapplicable "$bad_clause" unreadable
+  ck "(a8) NO widening on an unclassifiable list [${bad_clause##*(declared triggers: }]" \
+     "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+  ck "(a8) …and the message says the list could not be READ, not a trigger it never parsed" \
+     "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 0 || echo 1)"
+done
+ck "(a8) CONTROL: a WELL-FORMED inert list ('workflow_call') still WIDENS — the shape gate tightens the unreadable shape only, not the #2465 narrowing" \
+   "$(drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_call)' unreadable >/dev/null 2>&1; [ "$R_ANY" = 1 ] && echo 0 || echo 1)"
 
 # ── (b) STRUCTURAL class + probe that MEASURED "no run" ────────────────────
 echo "(b) STRUCTURAL (no PR trigger) + the run probe MEASURED no run — dead end on the measurement"
