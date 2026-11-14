@@ -728,8 +728,10 @@ assert_eq "$QUEUE_HEAD_SCAN_SHIPPED" "25" \
 # because its fixture still builds the shipped 100 while the gate's page dropped to 50. The OTHER 12 are
 # the 54-deep queue arms: they pass NO `GH_QUEUE_ROWS_SPEC`, so their page is the stub's default single
 # row, and they are REFUSED at the SATURATED check because `queued (54) > QUEUE_PAGE (50)` — the same
-# mechanism the next paragraph records. (Only 4 of the 13 failure LINES are `got: 2, want: 0`, one per
-# refused arm; the other 9 are that refusal's follow-on `missing:` assertions.) What the pin protects is
+# mechanism the next paragraph records. (The 13 failure LINES break down as 4 `got: 2, want: 0` — one
+# per refused arm — 7 follow-on `missing:` assertions on those refusals, 1 follow-on
+# `got: , want: github` for the never-written state file, and 1 the `unexpected:` row above.)
+# What the pin protects is
 # the IN-PLACE reversal — the route
 # that actually ships — where the derivation and the file move together:
 # MEASURED (cycle 9 re-measured both routes, after the first version of this paragraph contradicted
@@ -1187,10 +1189,15 @@ assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound c
 # unrelated remedy sentence, and no mutant of this diff could red it (#3442 rule 3). The clause's own
 # wording is `CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it` — it NAMES the knob and then
 # qualifies it — and the token `cannot see past it` appears nowhere else on this output, so the row now
-# reds exactly when the clause is removed. Note the clause QUALIFIES the
-# knob ("at or above %s") instead of dismissing it: below the page the same advice would still be true,
-# but it is withheld on ADDRESS — the gate names the ceiling only where the knob is visibly maxed — and
-# that distinction lives in the base remedy sentence, not here.
+# reds exactly when the clause is removed. Note the clause QUALIFIES the knob ("at or above %s")
+# instead of dismissing it. ⛔ AND THE GATE ON THIS SURFACE IS THE QUEUE DEPTH, NOT THE BOUND: below the
+# page the same advice would be FALSE — a bound at the page reads such a queue whole, so raising the
+# knob IS the remedy there (measured: the same short-list fixture at bound 30 measures the demand head
+# and writes a verdict) — which is why the clause is gated on `queued > QUEUE_PAGE` and this arm reds if
+# that is relaxed to `-ge`. (The ADDRESS rationale — "the gate names the ceiling only where the knob is
+# visibly maxed" — belongs to the SATURATED surface, which IS bound-gated; do not transplant it here:
+# this arm runs at the SHIPPED bound and asserts the note PRESENT, so no bound is maxed on that side.)
+# That distinction lives in the base remedy sentence, not here.
 assert_contains "$OUT" "cannot see past it" "…and what that ceiling will NOT fix: a bound at or above the page cannot see past it"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a window-limited scan advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a window-limited scan relabelled no runner"
