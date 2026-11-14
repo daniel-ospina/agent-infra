@@ -3306,10 +3306,13 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # ⛔ BUT IT IS THE POOL READING, NOT PROOF THE QUEUE WAS SPENT (agent-infra#3909 review, 6th cycle P1).
 # `queue_state_write` runs when the LISTING completes (`refresh-candidates.sh:4257`); `candidates.txt` is
 # only rewritten much later (:6242). A pass that listed the pool and then exited BEFORE that rewrite —
-# the budget refusal (`:4077`) or the pre-flight's INCOMPLETE abort (`:6206`), both of which say of
-# themselves "an empty backlog would be a false report" — leaves a FRESH `READ(n)` beside the old,
-# possibly empty, queue file. That is not hypothetical: it is the MEASURED 2026-10-18 state this file
-# already records (`refresh-candidates.sh:778`: `candidates.txt: 0`, `checked.txt: 310`, pool READ(203)),
+# the budget refusal BETWEEN those two lines (`:6175-6177`) or the pre-flight's INCOMPLETE abort
+# (`:6206`) — leaves a FRESH `READ(n)` beside the old, possibly empty, queue file. ⛔ CITE THE ONE IN THE
+# MIDDLE: the REST-budget gate ABOVE the listing (`:4077`) is NOT this state, because it aborts before
+# `:4257` and therefore writes NO record at all — it leaves the PREVIOUS reading standing to age out,
+# which is exactly what the age bound is for (review P2, 8th cycle: an earlier revision cited `:4077`
+# and thereby contradicted this very header's first paragraph). The measured instance of the real state
+# is `refresh-candidates.sh:778` (2026-10-18: `candidates.txt: 0`, `checked.txt: 310`, pool READ(203)),
 # and the age bound cannot see it because the aborting pass re-writes the record every cycle. So these
 # two tokens name WHAT THE RECORD SAYS — the read succeeded, the queue file holds nothing — and not why.
 # Telling "spent" from "refused before writing" needs the pass's own completed outcome
@@ -8519,7 +8522,8 @@ PY
   # See that function's header for the polarity (absent / unparseable / future `at` = STALE).
   # ⛔ AND A DRAINED QUEUE IS NOT A BLIND ONE (same review). `READ(n)` is a SUCCESSFUL read and
   # `PARTIAL(x)` a NAMED one, so the remaining zero-backlog states are three facts, not one absence: a
-  # spent queue that WAS read, a named subset that WAS read, and a genuinely blind pool.
+  # queue whose read SUCCEEDED and whose file holds nothing, a named subset that WAS read, and a
+  # genuinely blind pool.
   CASCADE_POOL_CLASS="$(queue_state_class 2>/dev/null || true)"
   case "$CASCADE_POOL_CLASS" in empty|drained|partial) ;; *) CASCADE_POOL_CLASS=blind ;; esac
   CASCADE_POOL_EMPTY=0
@@ -9841,7 +9845,8 @@ PY
     #     refresh whose pool listing FAILED, and calling THAT empty would be the #1931 conflation in a new
     #     field — and would mis-aim its remedy (#3009 req 2, "widen the pool") at a pool nobody read.
     #     ⛔ AND THE REST OF THE ZERO-BACKLOG STATES ARE THREE FACTS, NOT ONE ABSENCE: `backlog_drained`
-    #     (`READ(n)` — the read SUCCEEDED and the queue is spent; the routine reap-after-read pair),
+    #     (`READ(n)` beside a zero backlog — the read SUCCEEDED and the queue file holds nothing; see the
+    #     class header for why that is NOT proof the queue was consumed),
     #     `backlog_partial` (`PARTIAL(x)` — a NAMED subset, still a measurement), and only then
     #     `backlog_unreadable` (`UNREADABLE`/`UNKNOWN`/stale/unageable — genuinely blind), which ranks
     #     below the listing's measured unreadability because both can hold at once.
