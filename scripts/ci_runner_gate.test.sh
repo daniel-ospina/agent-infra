@@ -1170,9 +1170,10 @@ assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound c
 # stayed GREEN with the ceiling clause deleted — it claimed to pin the note while pinning the older,
 # unrelated remedy sentence, and no mutant of this diff could red it (#3442 rule 3). The clause's own
 # wording is `a bound at or above %s cannot see past it`, and `cannot see past it` appears nowhere else
-# on this output, so the row now reds exactly when the clause is removed. Note the clause deliberately
-# says "a bound", not the knob name: below the page the knob still has room, and that distinction lives
-# in the base remedy sentence, not here.
+# on this output, so the row now reds exactly when the clause is removed. Note the clause QUALIFIES the
+# knob ("at or above %s") instead of dismissing it: below the page the same advice would still be true,
+# but it is withheld on ADDRESS — the gate names the ceiling only where the knob is visibly maxed — and
+# that distinction lives in the base remedy sentence, not here.
 assert_contains "$OUT" "cannot see past it" "…and what that ceiling will NOT fix: a bound at or above the page cannot see past it"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a window-limited scan advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a window-limited scan relabelled no runner"
@@ -1370,7 +1371,8 @@ assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the satura
 # `queued > QUEUE_PAGE` makes "no bound can see past this page" true BY CONSTRUCTION (`per_page` caps
 # at 100 and silently reduces above it). So the statement was CORRECT and its coverage was missing;
 # restoring the note is what makes the pin two-sided, rather than a tripwire over an absence.
-# Below the page the knob still has room, so the note is absent:
+# Below the page the same advice would still be true; the note is withheld on ADDRESS, not on truth —
+# the gate names the ceiling only where the knob is visibly maxed — so it is absent here:
 assert_not_contains "$OUT" "ONE page of" "the page-ceiling note is absent at a bound BELOW the page"
 assert_contains "$OUT" "lower bound" "the refusal says WHY the head age is unusable"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated queue read advanced no state file"

@@ -1143,8 +1143,8 @@ print(age)
   # suite measures the SAME refusal at both (`page-saturated` at the shipped bound,
   # `page-saturated-at-page` at the ceiling). What the bound gate decides is therefore ADDRESS, not
   # truth: the note names the ceiling only for an operator whose knob is VISIBLY maxed, i.e. who has
-  # already spent the obvious remedy. Below the page the identical advice is equally true and
-  # deliberately withheld, because there the brief legitimately says the knob IS a knob.
+  # already spent the obvious remedy. Below the page the identical advice is equally true and is
+  # withheld on ADDRESS alone, so the gate never implies the advice would be false there.
   # ⛔ Do NOT read this as licence to relax the gate: the presence/absence pair is cycle-5 F2's restored
   # two-sidedness and a recorded prescription on this PR, so changing the gate is a reopen, not a
   # repair. (The TRUNCATED sibling's `scanned` gate is not an analogue: that one pins a fact about the
