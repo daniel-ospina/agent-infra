@@ -319,10 +319,12 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   cascade block — that separation is the whole point of it being its own token. ⛔ **A measured `0`
   means the valve RE-GRANTED NOTHING, not that it did not fire** (review P2, 9th cycle): it can fire on a
   pass the cascade ALREADY granted (`escape=0` beside `slots=N>=1` is a real, recorded state). ⛔ A zero
-  BACKLOG is **not** a second such state — that outcome is WITHHELD before any *escape record* is written
-  (*"No escape is taken and no record is written"*), so `state/drain-escape` is untouched; but the CYCLE
-  record still carries `escape=0`, because that token publishes what the valve SPENT and it spent nothing
-  (the suite pins it: an EMPTY backlog publishes `escape=0` — 10th cycle P1, corrected 11th cycle).
+  BACKLOG is **not** a second such state — that outcome is WITHHELD: it writes no escape RECORD
+  (`state/drain-escape`, *"No escape is taken and no record is written"*). ⛔ BUT IT STILL PUBLISHES A
+  MEASURED `escape=0` IN THE CYCLE RECORD: the token is reset to `0` at the top of the drain-escape block
+  on EVERY pass and the emit spells it `${CASCADE_ESCAPE_SLOTS-absent}`, so the withhold removes the
+  escape record, not the field (11th cycle P2; the suite arms this — "an EMPTY backlog publishes
+  escape=0"). Read `escape=0` there as "the backlog ceiling produced nothing".
   Only `escape>0` proves a grant; `escape=0` proves only that the valve added nothing;
 - `can_spawn=` — the capacity probe's own answer.
 

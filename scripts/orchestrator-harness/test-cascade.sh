@@ -646,8 +646,9 @@ ck "…and a fresh enough EMPTY still says empty_backlog (the bound must not bec
 # coerces `QUEUE_STATE_MAX_AGE_MIN` with `is_limit` (`is_num` AND <= 9 digits); `queue_state_class` used
 # to coerce with bare `is_num`, so a 10-digit bound was REFUSED in production and ACCEPTED by the helper —
 # and a rig reads the helper WITHOUT the config block (it is extracted into `fns.sh`), so the wide bound
-# was reachable there. Without this arm the two spellings are indistinguishable: every other arm runs with
-# the knob unset, where both yield 60. Mutation-checked — reverting to `is_num` reds exactly this line.
+# was reachable there. Without this arm the two spellings are indistinguishable: every other arm either
+# leaves the knob UNSET (both spellings then yield 60) or sets a value both accept, so only a WIDENED one
+# separates them. Mutation-checked — reverting to `is_num` reds exactly this line.
 ck "…and a WIDENED knob is refused as the config block refuses it (a bound cannot be widened by corrupting it)" \
    "$(QUEUE_STATE_MAX_AGE_MIN=1000000000 drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY 21600 | cut -d' ' -f5,6)" "0 backlog_unreadable"
 # ⛔ AND A DRAINED QUEUE IS NOT A BLIND ONE (agent-infra#3909 review, 5th cycle P2). `READ(n)` is a
