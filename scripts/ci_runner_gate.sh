@@ -143,7 +143,7 @@ QUEUE_PAGE=100
 # that only ever hand-runs this gate keeps an arbitrarily old verdict file; this box's said
 # `queued=83`). 25 is the 14 with ~1.8x headroom; the cost is one jobs read per skipped ghost, on a
 # pass whose cadence is minutes. WHICH COPY ACTUALLY RUNS ON THE OWNER'S MAC IS NOT MEASURED HERE
-# (tortoise#3936: the farm/plist chain can sit behind the repo) — this constant is what the repo
+# (agent-infra#3936: the farm/plist chain can sit behind the repo) — this constant is what the repo
 # ships, and the fix reaches an executed copy by sync, not by an env var (see the next paragraph).
 # ⛔ THE POPULATION GROWS (3 a week earlier → 14), so if this refuses again the answer is to raise the
 # bound HERE — the default — and never to treat the refusal as "no demand". ⛔ AND NOT BY SETTING THE

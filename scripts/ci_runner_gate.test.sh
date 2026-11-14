@@ -1193,10 +1193,13 @@ assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound c
 # instead of dismissing it. ⛔ AND THE GATE ON THIS SURFACE IS THE QUEUE DEPTH, NOT THE BOUND: below the
 # page the same advice would be FALSE — a bound at the page reads such a queue whole, so raising the
 # knob IS the remedy there (measured: the same short-list fixture at bound 30 measures the demand head
-# and writes a verdict) — which is why the clause is gated on `queued > QUEUE_PAGE` and this arm reds if
-# that is relaxed to `-ge`. (The ADDRESS rationale — "the gate names the ceiling only where the knob is
-# visibly maxed" — belongs to the SATURATED surface, which IS bound-gated; do not transplant it here:
-# this arm runs at the SHIPPED bound and asserts the note PRESENT, so no bound is maxed on that side.)
+# and writes a verdict) — which is why the clause is gated on `queued > QUEUE_PAGE`. ⛔ BUT THE `-gt`
+# BOUNDARY IS NOT THIS ARM'S: it feeds a queue of PAGE+5, so the clause is emitted under `-ge` too and
+# this arm stays green either way — `ghost-window-at-exact-page` (queue == PAGE) is the side that reds on
+# that relaxation, as its own note records. (The ADDRESS rationale — "the gate names the ceiling only
+# where the knob is visibly maxed" — belongs to the SATURATED surface, which IS bound-gated; do not
+# transplant it here: this arm runs at the SHIPPED bound and asserts the note PRESENT, so no bound is
+# maxed on that side.)
 # That distinction lives in the base remedy sentence, not here.
 assert_contains "$OUT" "cannot see past it" "…and what that ceiling will NOT fix: a bound at or above the page cannot see past it"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a window-limited scan advanced no state file"
