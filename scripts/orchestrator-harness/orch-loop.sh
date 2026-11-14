@@ -439,15 +439,21 @@ FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 # answers one question — "did this box read the pool recently enough that `empty_backlog` may be
 # published" — and it exists because `queue_state_token`'s own contract (:1931) says the age is part of
 # the reading so a value frozen by a dead refresh cannot pass as current, while a consumer that reads
-# only the STATE PREFIX throws exactly that component away. One hour is FIFTEEN refresh intervals
-# (CYC=240s at :469 — fifteen, not four; and two if it is measured against the 30m `LATCH_MAX_AGE_MIN`
-# long-queue refresh instead), so past that bound the reading is genuinely not this pass's and a
-# controller should not need to diagnose a dead refresh out of this field. ⛔ PAST THE BOUND THE CLASS
-# IS `blind`, WHICH IS NOT THE SAME AS THE CAUSE TOKEN: it demotes the three zero-backlog attributions
-# to `backlog_unreadable` *provided the arm is reached at all* — a non-zero grant still says `granted`
-# (`CASCADE_RUNG_SLOTS > 0` is arm one and never consults the class), and an unreadable PR listing still
-# says `listing_unreadable` (that arm precedes the backlog ones). An unverifiable reading is not a
-# measurement (the same polarity `dispatch_funnel` takes for its own record).
+# only the STATE PREFIX throws exactly that component away. The ratio to state is the REFRESH's, not a
+# guess (review P2, 7th cycle — an earlier revision said "four refresh intervals" and was off by 3.75x):
+# at the default `CYC=240` (4 min) one hour is **fifteen** refresh intervals, and on a long queue the
+# refresh is latched on age instead (`LATCH_MAX_AGE_MIN`, 30 min) so one hour is two. Fifteen is the
+# number that matters here, because `empty_backlog` requires a ZERO candidate backlog and `BL < 6` runs
+# the refresh on every cycle — so the bound tolerates fifteen consecutive missed refreshes before it
+# stops calling the reading a measurement. That is deliberately generous: the cost of being generous is
+# one stale `EMPTY` surviving an hour, and the cost of being tight is a healthy box reading `blind`.
+# ⛔ PAST THE BOUND THE CLASS IS `blind`, WHICH IS NOT THE SAME AS THE CAUSE TOKEN (review P2, 7th
+# cycle): it demotes the three zero-backlog attributions to `backlog_unreadable` *provided the arm is
+# reached at all* — a non-zero grant still says `granted` (`CASCADE_RUNG_SLOTS > 0` is arm one and never
+# consults the class), and an unreadable PR listing still says `listing_unreadable` (that arm precedes
+# the backlog ones). The earlier sentence stated it as an unconditional cause; it is a demotion within
+# the backlog arms. An unverifiable reading is not a measurement
+# (the same polarity `dispatch_funnel` takes for its own record).
 QUEUE_STATE_MAX_AGE_MIN="${QUEUE_STATE_MAX_AGE_MIN:-60}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
@@ -3302,11 +3308,31 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # only then reaps consumed candidates, so `queue=READ(7)` beside a zero backlog is healthy housekeeping.
 # Publishing "unreadable" there denies a measurement the record holds, which is the same "the record could
 # not distinguish" class one field over — and it is a FOURTH state, not a second.
+# ⛔ BUT IT IS THE POOL READING, NOT PROOF THE QUEUE WAS SPENT (agent-infra#3909 review, 6th cycle P1).
+# `queue_state_write` runs when the LISTING completes (`refresh-candidates.sh:4257`); `candidates.txt` is
+# only rewritten much later (:6242). A pass that listed the pool and then exited BEFORE that rewrite —
+# the budget refusal (`:4077`) or the pre-flight's INCOMPLETE abort (`:6206`), both of which say of
+# themselves "an empty backlog would be a false report" — leaves a FRESH `READ(n)` beside the old,
+# possibly empty, queue file. That is not hypothetical: it is the MEASURED 2026-10-18 state this file
+# already records (`refresh-candidates.sh:778`: `candidates.txt: 0`, `checked.txt: 310`, pool READ(203)),
+# and the age bound cannot see it because the aborting pass re-writes the record every cycle. So these
+# two tokens name WHAT THE RECORD SAYS — the read succeeded, the queue file holds nothing — and not why.
+# Telling "spent" from "refused before writing" needs the pass's own completed outcome
+# (`state/refresh-last`, written by `refresh_record_write`), which this arm does not consult: a DECLARED
+# LIMIT, stated here rather than assumed away, and the reason the tokens are named for the reading rather
+# than for a cause the fields cannot prove.
 #
 # ⛔ ONE PRIMITIVE, ONE READ. The class is derived from ONE read of the record, and it is the only
 # question this loop actually asks — an earlier revision also shipped a `queue_state_fresh` wrapper for
 # the "may this be called EMPTY" phrasing, but nothing called it and nothing graded it, so it was dead
 # code advertising a second consumer that did not exist.
+# ⛔ AND IT IS NOT THE SAME RULE AS THE DISPLAY TOKEN ON A FUTURE STAMP (agent-infra#3909 review, 6th
+# cycle P2). `queue_state_token` clamps a future `at` to `age=0`, so the heartbeat line prints
+# `queue=EMPTY(0s)` for a clock step-back while this classifier answers `blind` — deliberately, because
+# an unverifiable stamp must not buy a reading a longer life. Two answers to one question would be the
+# drift this header forbids, so say which is which: the TOKEN is display-only (it reports what the
+# record literally says plus its age, and its unit suffix is for a human reading a log line), and the
+# CLASS is the decision input. Anything that GATES must ask the class, never the token.
 queue_state_class() { # -> empty | drained | partial | blind (always prints exactly one)
   # ⛔ THE BOUND IS DEFAULTED HERE, NOT JUST IN THE CONFIG BLOCK (rig, first run). A helper that
   # refuses whenever its own limit is unreadable looks identical to "the record is stale" from every
