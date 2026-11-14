@@ -633,9 +633,10 @@ ck "a STALE 'EMPTY' record (6h) is NOT this pass's measurement — it names an u
 ck "…and a fresh enough EMPTY still says empty_backlog (the bound must not become a blanket refusal)" \
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY 60 | cut -d' ' -f5,6)" "0 empty_backlog"
 # ⛔ AND A DRAINED QUEUE IS NOT A BLIND ONE (agent-infra#3909 review, 5th cycle P2). `READ(n)` is a
-# SUCCESSFUL read and `PARTIAL(x)` a NAMED one, so `queue=READ(7)` beside a zero backlog — the routine
-# reap-after-read pair, since the refresh records its state and only THEN reaps consumed candidates —
-# must not be published as an "absence of attribution". That was the #1931 conflation reborn backwards.
+# SUCCESSFUL read and `PARTIAL(x)` a NAMED one, so `queue=READ(7)` beside a zero backlog must not be
+# published as an "absence of attribution" — that was the #1931 conflation reborn backwards. The pair is
+# routine because the CONTROLLER prunes dispatched ids (`orch-loop.sh:8147`) while the refresh only
+# appends/dedupes/re-orders the queue and never drops a row (`refresh-candidates.sh:5776`,`:6247`,`:4371`).
 ck "a READ pool with a zero backlog is DRAINED, not unreadable — the read SUCCEEDED" \
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 'READ(7)' | cut -d' ' -f5,6)" "0 backlog_drained"
 ck "…and a PARTIAL read with a zero backlog says so too — a named subset is still a measurement" \

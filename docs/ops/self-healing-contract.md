@@ -277,17 +277,21 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   leaves a fresh record every cycle — the measured instance, `refresh-candidates.sh:778`, 2026-10-18:
   `candidates.txt: 0`, `checked.txt: 310`, pool `READ(203)`); and the plain mid-cycle window, because the
   refresh is spawned in the background, so the record can be a fresh `READ(n)` while the queue still
-  holds the previous, drained one. ⛔ **The age bound does NOT cover all three**: the *budget* refusal
-  exits **before** the listing and never re-writes `queue_state`, deliberately — the producer says so at
-  `refresh-candidates.sh:4054-4059` ("the heartbeat keeps the PREVIOUS reading together WITH ITS AGE") —
-  so on that box the record ages out and the classifier answers `blind`. Telling "spent" from "refused
-  before writing" needs the pass's own completed outcome (`state/refresh-last`), which this field does
-  not consult — a declared limit, not an assumption. So `backlog_drained` means "the record says the
-  read succeeded and the queue holds nothing", and a reader must not take it as proof the queue was
-  consumed. ⛔ Relatedly, the display
-  token `queue=` and this decision input differ deliberately on one stamp: a FUTURE `at` is clamped to
-  `EMPTY(0s)` by `queue_state_token` (it reports what the record literally says) while
-  `queue_state_class` answers blind (unverifiable is not fresh). Anything that gates asks the class;
+  holds the previous, drained one. ⛔ **The age bound covers only the THIRD case.** It cannot rescue the
+  second: an abort that runs after the write but before the replace (the pre-flight `INCOMPLETE` abort,
+  `refresh-candidates.sh:6206`, and the post-listing budget reserve check, `:6175-6177`) re-writes a FRESH
+  stamp every cycle, so the bound never elapses. Nor the mid-cycle window, whose stamp is fresh by
+  construction. (The pre-listing budget gate, `:4075-4077`, is NOT one of the three: it exits before the
+  write and never re-writes `queue_state`, deliberately — `refresh-candidates.sh:4054-4059` — so that box
+  ages out and the classifier does answer `blind`, which is the bound working. An earlier revision
+  offered it as the limit and thereby contradicted itself.) Telling "spent" from "refused before
+  writing" therefore needs the pass's own completed outcome (`state/refresh-last`), which this field does
+  not consult — a declared limit, not an assumption, and it holds **within the bound** as well as under
+  it. So `backlog_drained` means "the record says the read succeeded and the queue holds nothing", and a
+  reader must not take it as proof the queue was consumed. ⛔ Relatedly, the display
+  token `queue=` and this decision input differ deliberately on one stamp: `queue_state_token` clamps the
+  AGE to 0, not the token (an `EMPTY` record prints `EMPTY(0s)`, a `READ(7)` record prints `READ(7)(0s)`),
+  while `queue_state_class` answers blind (unverifiable is not fresh). Anything that gates asks the class;
 - `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room, and a measured
   `0` on every pass the valve did not fire. ⛔ It is computed in the **drain-escape block**, not the
   cascade block — that separation is the whole point of it being its own token;
