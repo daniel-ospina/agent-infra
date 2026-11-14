@@ -269,6 +269,33 @@ for (const [name, cmd] of [
 // unmatched quote), so a genuinely quoted ref whose text ends in a paren is still the real ref.
 expect("A: a BALANCED quoted ref is untouched by the unmatched-quote drop", extractPushDeleteBranch("git push origin -d 'feat/x)'"), ["feat/x)"]);
 
+// ⛔ ONE STACK FOR `${ … }`, NOT A COUNTER (round-11 review, P0). A flat `expDepth` + a parallel
+// `substQuotes` modelled neither of bash's two rules for a `}` that is DATA, so 48 of 64 measured
+// shapes returned `null` where `origin/main` reported the real target — the #73 arm was never
+// consulted and the delete of a sibling-held branch was ALLOWED. The two families:
+//   (i)  a `}` inside a QUOTE THAT OPENED INSIDE THE EXPANSION — `${A:-"}"x)}`: the quoted arm fired
+//        on ANY `}` and dropped the level. `quoteExpDepth` (expDepth when the quote opened) fixes it.
+//   (ii) a `}` inside a `$( … )` NESTED IN THE EXPANSION — `${A:-$(printf "}")}`: the `$(` got no
+//        level (`expDepth === 0` gate), so the argument's `}` closed the expansion and the expansion's
+//        own `)` then arrived UNMASKED as the #504 operator token.
+// The `-o` VALUE is the carrier in every row (an ordinary push-option form), and `held/branch` must
+// survive intact — a phantom beside it is fine (it is refused), a MISSING one is the hazard.
+for (const [name, cmd, want] of [
+  ["a quoted `}` inside an expansion does not close it", `git push origin -o ${'${A:-"}"x)}'} -d held/branch`, ["held/branch"]],
+  ["…with text on both sides of the quoted `}`", `git push origin -o ${'${A:-"a}b"x)}'} --delete held/branch`, ["held/branch"]],
+  ["…in the `--del` spelling", `git push origin -o ${'${A:-x"}"x)}'} --del held/branch`, ["held/branch"]],
+  ["…and in the `:ref` spelling", `git push origin -o ${'${A:-"}"x)}'} :held/branch`, ["held/branch"]],
+  ["…in a LATER segment (the wholeCommandDeleteTargets arm)", `git push origin HEAD:feat && git push origin -o ${'${A:-"}"x)}'} -d held/branch`, ["held/branch"]],
+  ["a `}` argument of a `$( … )` nested in the expansion", `git push origin -o ${'${A:-$(echo })}'} -d held/branch`, ["})}", "held/branch"]],
+  ["…quoted inside that nested substitution", `git push origin -o ${'${A:-$(printf "}")}'} -d held/branch`, ["})}", "held/branch"]],
+  // CONTROLS: the pre-existing `${…}` arms must not have been weakened in either direction.
+  ["CONTROL: the data paren of `${R:-)}`", `git push origin -o ${'${R:-)}'} -d held/branch`, ["held/branch"]],
+  ["CONTROL: a SINGLE-quoted `}` in an expansion", `git push origin -o ${'${R:-\'}\'x)}'} -d held/branch`, ["held/branch"]],
+  ["CONTROL: a nested expansion's data paren", `git push origin -o ${'${A:-${B:-)}}'} -d held/branch`, ["held/branch"]],
+]) {
+  expect(`A: ${name} → the real target survives the expansion`, extractPushDeleteBranch(cmd), want);
+}
+
 // …and the marker really is what #653 refuses, end-to-end at the seam these rows live in.
 for (const t of ["$(…)"]) expect(`A: #653 refuses the truncated-span marker ${t}`, unresolvableDeleteTargets([t]), [t]);
 // ⚠️ CONTROL (not a discriminator): a backtick with NOTHING after it in the segment is the #504
@@ -452,9 +479,9 @@ if (typeof stripTypeScriptTypes !== "function" ||
     // ALLOWED a delete of the sibling-held `held` while `origin/main` BLOCKED on the real name.
     // D6 asserts #73's OWN reason text: the correct answer is the lookup on the REAL ref, which is a
     // different arm from #653's refusal — so a mere `block === true` cannot satisfy it.
-    expectTrue("D6 round-10 F1: a `sh -c '…'` closer no longer glues whitespace onto the target → #73 BLOCK on the REAL name",
-      refusedBy(await quiet(() => real.bash("git push origin HEAD:feat && sh -c 'git push origin -d held'")), HOLDS),
-      `handler returned ${JSON.stringify(await quiet(() => real.bash("git push origin HEAD:feat && sh -c 'git push origin -d held'")))?.slice(0, 200)}`);
+    expectTrue("D6 round-10 F1: an `sh -c '…'` closer with a TAIL no longer glues whitespace onto the target → #73 BLOCK on the REAL name",
+      refusedBy(await quiet(() => real.bash("git push origin HEAD:feat && sh -c 'git push origin -d held' && echo done")), HOLDS),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash("git push origin HEAD:feat && sh -c 'git push origin -d held' && echo done")))?.slice(0, 200)}`);
     expectTrue("D7 round-10 F2: a GLUED substitution placeholder in the target slot is REFUSED by #653",
       refusedBy(await quiet(() => real.bash("git push origin HEAD:feat && git push origin -d held$''")), FAIL_CLOSED),
       `handler returned ${JSON.stringify(await quiet(() => real.bash("git push origin HEAD:feat && git push origin -d held$''")))?.slice(0, 200)}`);
@@ -464,6 +491,23 @@ if (typeof stripTypeScriptTypes !== "function" ||
     expectTrue("D9 round-10 F4: a DATA newline inside a `$( … )` in a double quote → #73 BLOCK on the REAL name",
       refusedBy(await quiet(() => real.bash('git push origin HEAD:feat && git push origin -o "$(echo "a\nb")" -d held')), HOLDS),
       `handler returned ${JSON.stringify(await quiet(() => real.bash('git push origin HEAD:feat && git push origin -o "$(echo "a\nb")" -d held')))?.slice(0, 200)}`);
+    // ── Part D (round 11): the `${ … }` family, end-to-end ──────────────────────────────
+    // A `}` that bash treats as DATA used to close the expansion level, so the expansion's own `)`
+    // arrived as the #504 operator token, the segment ended, and the delete was never refused.
+    // Asserted against #73's OWN reason text: the answer here is the lookup on the REAL ref.
+    for (const [name, cmd, needle] of [
+      ["a quoted `}` inside an expansion", "git push origin -o ${A:-\"}\"x)} -d held", HOLDS],
+      // ⚠️ This one is refused by #653 BEFORE the #73 lookup: the nested substitution also yields an
+      // over-captured `})}` word (measured: `["})}","held/branch"]` in Part A), and `}` is in the
+      // refusal class. That is fail-closed and correct; Part A's row pins that `held`/`held/branch` is
+      // still ATTRIBUTED beside it, which is the property this end-to-end row cannot see.
+      ["a `}` inside a `$( … )` nested in the expansion", 'git push origin -o ${A:-$(printf "}")} -d held', FAIL_CLOSED],
+      ["the same in a LATER segment", "git push origin HEAD:feat && git push origin -o ${A:-\"}\"x)} -d held", HOLDS],
+    ]) {
+      expectTrue(`D10 round-11 P0: ${name} → REFUSED (never allowed)`,
+        refusedBy(await quiet(() => real.bash(cmd)), needle),
+        `handler returned ${JSON.stringify(await quiet(() => real.bash(cmd)))?.slice(0, 200)}`);
+    }
 
     // ── Part E: a WORKTREE session is NOT exempt ────────────────────────────
     // The #73 arm has never been worktree-exempt, and the fleet's lanes run from

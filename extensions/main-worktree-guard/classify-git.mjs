@@ -5117,6 +5117,7 @@ function _maskDataParens(body) {
   const swap = (c) => (c === "(" ? _QP_L : c === ")" ? _QP_R : c);
   let out = "";
   let quote = null;
+  let quoteExpDepth = 0; // `expDepth` in force when the CURRENT quote OPENED
   let expDepth = 0; // `${ … }` spans OPEN in this segment: their parens are DATA
   // ⛔ A `$( … )` INSIDE `"…"` OPENS A NEW QUOTING CONTEXT (round-9 review, P0). Bash re-enters the
   // substitution's own quoting context and returns to the enclosing one at the matching `)`, so a `"`
@@ -5125,9 +5126,26 @@ function _maskDataParens(body) {
   // #504 segment boundary and BREAKS, discarding the `-d` and its target:
   //   git push origin -o "title=$(echo "fix) bug")" -d held/branch  → ALLOWED here, BLOCKED on origin/main
   // (measured 4/4 shapes; the `-o "plain"` control BLOCKS on both, so the fixture is valid).
-  // `substQuotes` is one entry per `$(` level — the enclosing quote to RESTORE at that level's `)`,
-  // or `null` for a level opened outside any quote (nothing to restore).
-  const substQuotes = [];
+  //
+  // ⛔ ONE STACK, NOT A COUNTER (round-11 review, P0). A flat `expDepth` + a parallel `substQuotes`
+  // modelled neither of bash's two rules for a `}` that is DATA, and 48 of 64 measured shapes came
+  // back `null` where `origin/main` reported the real target (so `_coordinatedDeleteBlock` was never
+  // consulted and the delete of a sibling-held branch was ALLOWED):
+  //
+  //   (i) a `}` INSIDE A QUOTE THAT OPENED INSIDE THE EXPANSION is data — the counter dropped the
+  //       level anyway, because the quoted arm fired on ANY `}`:
+  //         git push origin -o ${A:-"}"x)} -d held/branch      base ["held/branch"] BLOCK / here ALLOW
+  //       `quoteExpDepth` records `expDepth` at the moment the quote opened, so a quoted `}` closes a
+  //       level only when it is the expansion's OWN `"${A:-x}"` case (`expDepth > quoteExpDepth`).
+  //   (ii) a `}` INSIDE A `$( … )` NESTED IN THE EXPANSION is data — but the `$(` got no level at all
+  //       (`expDepth === 0` gate), so the argument's `}` closed the expansion:
+  //         git push origin -o ${A:-$(printf "}")} -d held/branch  base ["held/branch"] BLOCK / here ALLOW
+  //       A `$(` now pushes a level at ANY depth, so `}` only closes the TOP span and a `(`-kind top
+  //       makes it data. `expDepth` still masks every paren inside `${ … }`; a closer that returns into
+  //       a quote OR into an expansion is masked (fail-safe direction: a masked paren can never become
+  //       the #504 operator token).
+  const spans = []; // { kind: "(" | "{", restore: quote-at-open | null, inExp: boolean }
+  const top = () => spans[spans.length - 1];
   for (let i = 0; i < body.length; i++) {
     const ch = body[i];
     if (quote) {
@@ -5137,13 +5155,13 @@ function _maskDataParens(body) {
       }
       // A `${` inside DOUBLE quotes still opens an expansion (bash expands it there); inside SINGLE
       // quotes it is literal text, so the single-quote path below never touches `expDepth`.
-      if (quote === '"' && ch === "$" && body[i + 1] === "{") { expDepth++; out += ch + "{"; i++; continue; }
-      if (quote === '"' && ch === "}" && expDepth > 0) { expDepth--; out += ch; continue; }
+      if (quote === '"' && ch === "$" && body[i + 1] === "{") { spans.push({ kind: "{", restore: null, inExp: false }); expDepth++; out += ch + "{"; i++; continue; }
+      if (quote === '"' && ch === "}" && top()?.kind === "{" && expDepth > quoteExpDepth) { spans.pop(); expDepth--; out += ch; continue; }
       // A `$(` inside DOUBLE quotes starts a substitution: enter it in a NEUTRAL quoting context and
       // remember the quote we must return to. The `(` stays masked, so a quoted span contributes no
       // operator token — the established contract for `"$( … )"` (which already BLOCKED correctly).
       if (quote === '"' && ch === "$" && body[i + 1] === "(") {
-        substQuotes.push(quote); quote = null; out += ch + swap("("); i++; continue;
+        spans.push({ kind: "(", restore: quote, inExp: false }); quote = null; out += ch + swap("("); i++; continue;
       }
       out += swap(ch);
       continue;
@@ -5151,22 +5169,37 @@ function _maskDataParens(body) {
     if (ch === "\\" && i + 1 < body.length) {
       out += ch + swap(body[i + 1]); i++; continue;
     }
-    if (ch === "'" || ch === '"') { quote = ch; out += ch; continue; }
-    if (ch === "$" && body[i + 1] === "{") { expDepth++; out += ch + "{"; i++; continue; }
-    if (ch === "}" && expDepth > 0) { expDepth--; out += ch; continue; }
-    if (ch === "$" && body[i + 1] === "(" && expDepth === 0) { substQuotes.push(quote); out += ch + "("; i++; continue; }
-    if (ch === "(" && expDepth === 0 && substQuotes.length > 0) { substQuotes.push(quote); out += ch; continue; }
-    if (ch === ")" && expDepth === 0 && substQuotes.length > 0) {
-      const restore = substQuotes.pop();
+    if (ch === "'" || ch === '"') { quote = ch; quoteExpDepth = expDepth; out += ch; continue; }
+    if (ch === "$" && body[i + 1] === "{") { spans.push({ kind: "{", restore: null, inExp: false }); expDepth++; out += ch + "{"; i++; continue; }
+    if (ch === "}" && top()?.kind === "{") { spans.pop(); expDepth--; out += ch; continue; }
+    if (ch === "$" && body[i + 1] === "(") {
+      // Inside an expansion the substitution is DATA (every paren there is masked, as before); it still
+      // needs a LEVEL so its own `}` cannot close the expansion (defect (ii)).
+      const inExp = expDepth > 0;
+      spans.push({ kind: "(", restore: null, inExp });
+      out += inExp ? ch + swap("(") : ch + "("; i++; continue;
+    }
+    if (ch === "(" && top()?.kind === "(") {
+      const inExp = !!top().inExp;
+      spans.push({ kind: "(", restore: null, inExp });
+      out += inExp ? swap(ch) : ch; continue;
+    }
+    if (ch === ")" && top()?.kind === "(") {
+      const done = spans.pop();
       // At the OUTERMOST `)` the substitution returns to the context that opened it. A `)` that
-      // closes a level opened inside `"…"` is itself DATA there, so it is masked.
-      // ⚠️ STATED RESIDUAL (round-9 review): this mask is NOT independently observable — the closer
-      // always lands INSIDE the restored quote for `_tokenize` too, so unmasking it changes 0 rows of
-      // the 644-row differential and reddens no test. It is kept because MASKING IS THE FAIL-SAFE
-      // DIRECTION for a gate: a masked paren can never become an operator token, whereas an unmasked
-      // one can become the #504 `break` — and this function exists to stop exactly that. Do not
-      // "simplify" it away on the strength of it having no test; the asymmetry is the reason.
-      if (restore) { quote = restore; out += swap(ch); } else { out += ch; }
+      // closes a level opened inside `"…"` is itself DATA there, so it is masked. SO IS one that
+      // closes a level opened inside `${ … }` (defect (ii)): an unmasked `)` there reaches
+      // `_pushSegmentTokens` as the #504 operator token.
+      // ⚠️ STATED RESIDUAL (round-9 review): the QUOTE half of this mask is NOT independently
+      // observable — the closer always lands INSIDE the restored quote for `_tokenize` too, so
+      // unmasking it changes 0 rows of the differential and reddens no test. It is kept because
+      // MASKING IS THE FAIL-SAFE DIRECTION for a gate: a masked paren can never become an operator
+      // token, whereas an unmasked one can become the #504 `break` — and this function exists to stop
+      // exactly that. Do not "simplify" it away on the strength of it having no test; the asymmetry
+      // is the reason. (The EXPANSION half is observable and pinned by the round-11 rows.)
+      const maskCloser = done.inExp || done.restore;
+      if (done.restore) quote = done.restore;
+      out += maskCloser ? swap(ch) : ch;
       continue;
     }
     out += expDepth > 0 ? swap(ch) : ch; // inside `${ … }` BOTH parens are data
