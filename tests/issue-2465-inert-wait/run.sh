@@ -498,6 +498,14 @@ ck "(C) …and it names the CAP as the ground, so the refusal says what actually
    "$(grep -q 'MORE THAN 8 run' <<<"$C_CAP" && grep -q 'deliberately NOT read' <<<"$C_CAP" && echo 0 || echo 1)"
 ck "(C) …and it quotes NO duration, because none was measured against a read never attempted" \
    "$(grep -q 'did not answer for' <<<"$C_CAP" && echo 1 || echo 0)"
+# ⛔ A WIDTH CAP MUST NOT CLAIM THE ENDPOINT WAS HEALTHY (review round 8, P2). The cap is a
+# COUNT condition, so on that poll the Jobs endpoint was never asked; "the surface was
+# READABLE" was a measurement the code did not take — false in exactly the outage case that
+# matters (9 pending runs during a 403 storm reproduced it).
+ck "(C) a WIDTH CAP does NOT claim the Jobs surface was READABLE (it never asked) (round 8 P2)" \
+   "$(grep -q 'surface was READABLE' <<<"$C_CAP" && echo 1 || echo 0)"
+ck "(C) …instead it names itself as a WIDTH cap, not an unreadability finding" \
+   "$(grep -q 'not an unreadability finding' <<<"$C_CAP" && echo 0 || echo 1)"
 C_READ="$(bofc still-running '' 0 0 still-running)"
 ck "(C) CONTROL: a READABLE still-pending surface still says 'NOTHING was unreadable' (the honest branch is still reachable)" \
    "$(grep -q 'NOTHING was unreadable' <<<"$C_READ" && echo 0 || echo 1)"
@@ -517,9 +525,13 @@ ck "(C) a RECOVERED surface that was never blind does NOT claim 30s of unreadabl
    "$(grep -q '30s of this wait went by with it UNREADABLE' <<<"$C_RECOVER_FRESH" && echo 1 || echo 0)"
 ck "(C) …and it says NOTHING was unreadable (a fresh-PR race is not a blind instrument)" \
    "$(grep -q 'NOTHING was unreadable' <<<"$C_RECOVER_FRESH" && echo 0 || echo 1)"
-C_RECOVER_CAP="$(bofc still-running '' 3 0 still-running 0 0)"
-ck "(C) …and a recovered surface whose only `missing` was CAP polls is not called unreadable either (round 7 P2)" \
-   "$(grep -q 'UNREADABLE' <<<"$C_RECOVER_CAP" && echo 1 || echo 0)"
+# ⛔ NO SEPARATE "CAP-ONLY RECOVERED" ROW (review round 8, P2). `missing` is ONE scalar with
+# no cause attached, so an injected tuple cannot distinguish "the only `missing` was CAP polls"
+# from "never-started seconds" — the row would be decorative, not a guard. The distinction is
+# carried by `FIRST_CHECKS_MISSING_UNREADABLE`, and `C_RECOVER_FRESH` above already pins the
+# MU=0 case (the only thing an injection can actually express). The CAP-vs-never-started
+# distinction is pinned where it is real: in the PRODUCER, by
+# tests/first-checks-lane-rederive's arm (g) and its mutation.
 C_SLOW="$(bofc unobservable unreadable 3 1 unobservable)"
 ck "(C) CONTROL: a MEASURED 3s of unreadable reads is still quoted as a duration" \
    "$(grep -q 'answer for 3s in total, 1s consecutively' <<<"$C_SLOW" && echo 0 || echo 1)"
@@ -537,13 +549,19 @@ ck "(C) a MIXED wait (cap polls + failed-read polls) quotes ONLY the unreadable-
 # depended on which poll landed last.
 C_MIXCAP="$(bofc unobservable cap 5 2 unobservable 3 1)"
 ck "(C) a MIXED wait that ENDS on a cap poll still states the seconds it spent blind (round 7 P2)" \
-   "$(grep -q '3s of this wait DID go by with the Jobs read failing' <<<"$C_MIXCAP" && grep -q '1s consecutively' <<<"$C_MIXCAP" && echo 0 || echo 1)"
+   "$(grep -qE 'Separately, 3s of this wait DID go by with the Jobs read' <<<"$C_MIXCAP" && echo 0 || echo 1)"
 ck "(C) …and still names the CAP as the ground of the refusal (both grounds, not one)" \
    "$(grep -q 'MORE THAN 8 run' <<<"$C_MIXCAP" && echo 0 || echo 1)"
+# ⛔ AND IT MUST NOT QUOTE A STREAK HERE (review round 8, P2). Reaching this branch means the
+# LAST poll was a cap, and a cap poll ZEROES the unreadable streak — so the figure is
+# structurally 0 and would print beside a non-zero total, which reads as self-refutation.
+# The injected `3 1` below is deliberately an UNREACHABLE streak; the arm must ignore it.
+ck "(C) …but does NOT quote the consecutive figure, which is structurally 0 in this arm (round 8 P2)" \
+   "$(grep -qi 'consecutiv' <<<"$C_MIXCAP" && echo 1 || echo 0)"
 # ⛔ THE CONTROL: a PURE cap wait (nothing ever blind) must not acquire the unreadable
 # sentence — the fix must not make every cap refusal talk about a read failure.
 ck "(C) CONTROL: a PURE cap wait does NOT claim any seconds were spent blind (round 7 P2)" \
-   "$(grep -q 'DID go by with the Jobs read failing' <<<"$C_CAP" && echo 1 || echo 0)"
+   "$(grep -q 'DID go by with the Jobs read' <<<"$C_CAP" && echo 1 || echo 0)"
 # ⛔ AND THE CATCH-ALL MUST NOT INVENT A GROUND (review round 6, P2). With a reason that
 # is neither `cap` nor `unreadable`, the old text asserted "the Jobs read FAILED" — a
 # measurement the code did not take, the exact class this block exists to stop.

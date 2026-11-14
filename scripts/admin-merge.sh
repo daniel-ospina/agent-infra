@@ -6089,17 +6089,28 @@ block_on_first_checks() {
           say_err "   closed, and MORE THAN ${FIRST_CHECKS_JOBS_MAX} run(s) were pending at once, so their per-job/"
           say_err "   per-step PROGRESS was deliberately NOT read on the LAST observation: at that width a"
           say_err "   partially observed surface can report a false 'no change', which would be a false stall."
-          say_err "   The Jobs surface was READABLE on that observation — this wait declined to poll it — so"
-          say_err "   no duration is quoted for it."
+          # ⛔ A WIDTH CAP IS NOT A READABILITY FINDING (review round 8, P2). The cap is a
+          # COUNT condition (`#pending_ids > FIRST_CHECKS_JOBS_MAX`), so on that poll the
+          # Jobs endpoint was never ASKED — and asserting "the surface was READABLE" here
+          # was a measurement the code did not take, false in exactly the outage case that
+          # matters (9 pending runs during a 403 storm reproduced it). State the WIDTH and
+          # decline the read; claim nothing either way about the endpoint's health.
+          say_err "   That is a WIDTH cap, not an unreadability finding — this wait declined to poll it, so"
+          say_err "   no duration is quoted for that observation."
           # ⛔ A CAP POLL IS THE LAST OBSERVATION, NOT THE ONLY ONE (review round 7, P2).
           # The cap branch used to be tested first and never consulted the unreadable
           # seconds, so a MIXED wait that happened to END on a cap poll denied the time
           # it had really spent blind — the round-5 defect ("whichever branch fired last
           # decides what the operator learns") surviving in the other ordering. The
           # number is in hand, so state it.
+          # ⛔ AND DO NOT QUOTE THE STREAK HERE (review round 8, P2): reaching this branch
+          # means the LAST poll was a cap, and a cap poll ZEROES the unreadable streak —
+          # so the figure is structurally 0 and printed beside a non-zero total, which
+          # reads as self-refutation. The total is real; the consecutive figure cannot be
+          # here, so only the total is claimed.
           if [ "${FIRST_CHECKS_MISSING_UNREADABLE:-0}" -gt 0 ]; then
-            say_err "   ⛔ …but ${FIRST_CHECKS_MISSING_UNREADABLE}s of this wait DID go by with the Jobs read failing"
-            say_err "   (${FIRST_CHECKS_STREAK_UNREADABLE:-0}s consecutively), so it was NOT readable throughout."
+            say_err "   ⛔ Separately, ${FIRST_CHECKS_MISSING_UNREADABLE}s of this wait DID go by with the Jobs read"
+            say_err "   failing, so the surface was not observable for that part of the window either."
           fi
           say_err "   Either way slow and wedged could not be told apart."
         elif [ "${FIRST_CHECKS_MISSING_UNREADABLE:-0}" -gt 0 ]; then
