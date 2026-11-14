@@ -5887,10 +5887,23 @@ wait_for_first_checks() {
         # refusal that says the read was not attempted. The refusal was keyed on the
         # unreadable-only counters (R9/R10); this line must use the same attribution, or the
         # assertion the PR exists to remove survives on the more frequently printed surface.
+        # ⛔ AND IT IS THREE-WAY, NOT TWO (review round 10, P2). The `else` used to be the ONLY
+        # non-cap arm, so it named "Jobs API unreadable" for ANY ground that was not `cap` —
+        # including a producer that cleared `signal_ok` without recording one. That is the same
+        # claim-about-an-unmeasured-ground the REFUSAL below the wait already refuses to make
+        # (its own catch-all says "the GROUND was not one this wait measured"), so the report —
+        # printed far more often than the refusal — kept a wording defect the refusal had shed.
+        # The arm shape here mirrors the refusal's: `cap` / `unreadable` / recorded-ground-only.
         if [ "$FIRST_CHECKS_SIGNAL_REASON" = cap ]; then
           info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress — MORE than the ${FIRST_CHECKS_JOBS_MAX} this wait observes, so PROGRESS was deliberately NOT read (${waited}s of the ${FIRST_CHECKS_WAIT}s fallback window) $wait_word That is a WIDTH cap, not an unreadability finding: no duration is quoted for an observation this wait declined to take."
-        else
+        elif [ "$FIRST_CHECKS_SIGNAL_REASON" = unreadable ]; then
           info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing_unreadable}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${streak_unreadable}s consecutively) $wait_word This wait does NOT call it a stall: an unread instrument is not a stalled run."
+        else
+          # ⛔ NO JOBS-READ CLAIM AND NO DURATION HERE. Both producers that clear `signal_ok`
+          # record a ground today (`cap` at the width cap, `unreadable` at the failed read), so
+          # this arm is defence-in-depth for a producer added later — and the one thing it must
+          # NOT do is inherit the previous arm's "unreadable" wording by falling through.
+          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable on a ground this wait did NOT record (${waited}s of the ${FIRST_CHECKS_WAIT}s fallback window) $wait_word No Jobs read is claimed either way and no duration is quoted: the ground was not one this wait measured."
         fi ;;
       *)
         if [ "$FIRST_CHECKS_TRANSITIONS" -eq 0 ]; then
@@ -6715,14 +6728,25 @@ lane_applicable() {
 # filter and its name in the certificate. Widening there is how "every trigger-split
 # repo silently becomes `--any-workflow`".
 #
-# WHAT THE CLASS DOES CHANGE is the policy on ONE probe answer, `unreadable`:
-#   * the STRUCTURAL class widens on it. No run of this lane can be STARTED by this
-#     PR, so the filtered wait is INERT — it can only ever clear on a run that cannot
-#     appear — and #2465's measured 3900 s burn was caused by exactly ONE failed
-#     `gh run list` (§0b runs the probe once), not by a probe that answered "has a
-#     run". Waiting longer cannot outlast a failed read.
-#   * every other class keeps the filter on it (fail closed): there a run CAN appear,
-#     so an unread answer is not an exemption.
+# WHAT THE CLASS DOES CHANGE is the policy on ONE probe answer, `unreadable` — and ⛔ THIS
+# CLASSIFIER ALONE NO LONGER DECIDES IT (review round 10 P1). `lane_no_pr_trigger` answers
+# "the lane declares no PR trigger"; the widening needs a SECOND, narrower fact: that a run
+# OF THIS WORKFLOW cannot attach to an arbitrary branch tip either. That is
+# `lane_own_run_can_attach`, and §0b requires BOTH:
+#   * STRUCTURAL and the lane's `on:` declares neither `push` nor `workflow_dispatch` — no
+#     run of this workflow can start on a branch tip, so the filtered wait is INERT here
+#     (this IS the narrower arm where "inert" is measured, not assumed) and one failed
+#     `gh run list` is not something waiting can outlast. Widen, loudly. #2465's
+#     `python-ci.yml` is exactly this shape (`workflow_call` only).
+#   * STRUCTURAL *with* `push` / `workflow_dispatch` — such a run CAN attach to this head
+#     while the wait runs, so the filtered wait is still a SIGNAL and an unread answer is
+#     NOT an exemption: KEEP the filter and let §1b refuse. This is the fail-open #2465's
+#     first cut shipped and review P1 closed; `origin/main` failed closed for EVERY class,
+#     and `--any-workflow` is the operator's escape, not a transient read failure.
+#   * every other class keeps the filter on it (fail closed): there a run CAN appear, so an
+#     unread answer is not an exemption.
+# ⛔ AN ABSENT / UNPARSEABLE TRIGGER CLAUSE ANSWERS "CAN ATTACH", so an unknown trigger shape
+# keeps the filter — the loosening direction must never be the default (see that helper).
 # The merge decision is NOT loosened either way: §4.5 grades the evaluated tree across
 # EVERY workflow and app, exactly as it does for `--any-workflow` and for the
 # FIRST-CHECKS wait's own #2862 re-derive, whose fixture pins that the dropped filter

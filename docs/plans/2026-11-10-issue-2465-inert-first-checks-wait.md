@@ -73,9 +73,22 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
    consult it for EVERY class:
    - `has-run` → no widening, the certificate keeps the lane's name (the RECORDED #1614 gate);
    - `none` → widen, loudly (waiting cannot create a run that does not exist);
-   - `unreadable` → widen only for `STRUCTURAL` (no PR trigger at all, so the filtered wait is
-     inert and no run can appear while it runs — #2465's measured burn); every other class keeps
-     the filter and lets §1b refuse (fail closed).
+   - `unreadable` → widen only for the NARROWER class `lane_own_run_can_attach` answers NO to:
+     STRUCTURAL **and** the lane's `on:` declares neither `push` nor `workflow_dispatch`, so no run
+     of THIS workflow can start on a branch tip — the filtered wait is inert there and one failed
+     `gh run list` costs the window (#2465's measured burn; its `python-ci.yml` is `workflow_call`
+     only, whose checks attach under the CALLER's name — #1413). Every other class keeps the filter
+     and lets §1b refuse (fail closed), and an ABSENT/unparseable trigger clause answers "can
+     attach" so the loosening direction is never the default.
+   ⛔ **ROUND 10 P1 NARROWED THIS** (the policy, not just the wording): the first cut widened the
+   WHOLE STRUCTURAL class on an unreadable probe, on the premise "no run can appear". STRUCTURAL
+   means "no `pull_request` trigger", NOT "cannot run for this head" — a `push` /
+   `workflow_dispatch` member DOES get a run of ITSELF attached to this head while the wait runs (a
+   push whose tip is $head, `gh workflow run --ref`, or a rerun of a cancelled run — this repo's own
+   cancel-in-progress produces that), so one transient read failure would have merged PAST the
+   watched lane's fresh-PR race. `origin/main` failed closed for every class. The distinction costs
+   no extra `gh` call: the producer already emits `(declared triggers: …)`
+   (`scripts/ci-workflow-pr-evaluable.sh:829-832`).
    ⛔ NOT "skip the probe for STRUCTURAL" — a first cut did that and reversed #1614 (review P0).
    Test: A(a) red before the change (against `origin/main`'s rail) and green after; A(b) the
    measured-`none` half; A(c)/A(c2) `paths-excluded` still probes; A(c3) non-structural

@@ -346,9 +346,15 @@ ck "(h) …quoting NO fallback-window duration for an observation it declined to
    "$(grep -qE 'fallback window in total' <<<"$W_ERR" && echo 1 || echo 0)"
 
 # MUTATION: disable the cap BRANCH in the EXTRACTED text and require the arm to go RED.
-# The branch is the whole fix — mutate the CONDITION, not the else-arm's counter: with the
-# branch disabled the old summed-counter report returns and the cap poll quotes a duration
-# for a read it never attempted, which is precisely the assertion above.
+# The branch is the whole fix — mutate the CONDITION, not the else-arm's counter.
+# ⛔ THE EXPECTED RED MOVED WHEN THE REPORT BECAME THREE-WAY (review round 10, P2). This row
+# used to assert that disabling `cap` brought back a quoted DURATION, because the old `else`
+# WAS the unreadable sentence — the mutation reproduced the pre-fix defect and the row observed
+# it. A three-way split makes that impossible BY CONSTRUCTION: with `cap` disabled, a cap poll
+# falls to the RECORDED-GROUND catch-all, which names no read and quotes no duration. So the
+# rows below assert what is now true and still discriminates in both directions: the WIDTH-cap
+# sentence really came from the mutated branch, and the fall-through it lands in cannot inherit
+# the pre-fix wording — which is the property this round exists to pin.
 LIB_MUT_H="$TMP/lib-mut-h.sh"
 sed -E 's/^( *)if \[ "\$FIRST_CHECKS_SIGNAL_REASON" = cap \]; then$/\1if false; then/' "$LIB" > "$LIB_MUT_H"
 ck "(h) MUTATION seam applied: the cap branch is now \`if false\` (exactly one line)" \
@@ -359,8 +365,12 @@ LIB_REAL_H="$LIB"; LIB="$LIB_MUT_H"
 W_WORKFLOW=python-ci.yml FC_HAVE_WF=python-ci.yml FC_CHECKS_TOTAL=0 \
   W_WAIT=2 W_JOBS_MAX=1 drive_wait
 LIB="$LIB_REAL_H"
-ck "(h) MUTATION: with the cap branch disabled the REPORT quotes a duration again — the arm is load-bearing" \
-   "$(grep -qE 'fallback window in total' <<<"$W_ERR" && echo 0 || echo 1)"
+ck "(h) MUTATION: with the cap branch disabled the WIDTH-cap sentence is GONE — the branch is load-bearing" \
+   "$(grep -q 'MORE than the 1' <<<"$W_ERR" && echo 1 || echo 0)"
+ck "(h) MUTATION: …and the fall-through claims NO Jobs read and quotes NO duration (it cannot inherit the old wording)" \
+   "$(grep -q 'Jobs API unreadable' <<<"$W_ERR" && echo 1 || { grep -qE 'fallback window in total' <<<"$W_ERR" && echo 1 || echo 0; })"
+ck "(h) MUTATION: …it states the ground was not one this wait measured, which is the honest arm" \
+   "$(grep -q 'ground this wait did NOT record' <<<"$W_ERR" && echo 0 || echo 1)"
 
 echo
 printf 'first-checks lane re-derive: %s passed, %s failed\n' "$PASS" "$FAIL"

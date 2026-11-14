@@ -662,6 +662,101 @@ ck "(C) …and a caller who did NOT decline to wait gets no such explanation —
    "$(grep -q 'why only ONE observation' <<<"$C_NOFLAG" && echo 1 || { grep -q 're-run the rail once those checks complete' <<<"$C_NOFLAG" && echo 0 || echo 1; })"
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════
+# (D) THE PER-POLL REPORT — the OTHER surface that describes an `unobservable` poll.
+#
+# `block_on_first_checks` (section C) is printed ONCE, when the wait closes. The report
+# inside `wait_for_first_checks` prints on EVERY POLL, and it was left a TWO-WAY split:
+# `cap` → the width cap, `else` → "Jobs API unreadable for Ns". The refusal twelve lines
+# below the same function had already been cut into four, including a catch-all that says
+# "the GROUND was not one this wait measured" — so the diff asserted twice that a ground
+# which is neither `cap` nor `unreadable` is POSSIBLE, and the more frequently printed
+# surface still guessed at it (review round 10, P2). The arm is EXTRACTED from the real
+# source and EXECUTED, the same discipline as section C: a grep over the source could not
+# tell "the branch ran" from "the branch is there".
+extract_report_arm() { # $1 = source path → the `unobservable)` report arm, `;;` stripped
+  # ⛔ ANCHORED ON THE ARM'S OWN FIRST GUARD, NOT ON `unobservable)`. Four `case
+  # "$FIRST_CHECKS_STATE"` blocks exist in this file and three of them carry an
+  # `unobservable)` arm, so the section name alone extracts a DIFFERENT branch (measured:
+  # the wait's expiry arm, 5 lines) and every row below then asserts over code that is not
+  # the report. The guard line is unique, and `bash -n`-style drift in it is what the
+  # "three-way" precondition row below fails on.
+  awk '
+    /^        if \[ .*FIRST_CHECKS_SIGNAL_REASON" = cap \]; then$/ { ina = 1 }
+    ina && /^        fi ;;$/  { print "        fi"; exit }
+    ina { print }
+  ' "$1"
+}
+REPORT_LIB="$TMP/report.sh"
+build_report() { # $1 = source path, $2 = output file, $3 = optional arm override
+  local src="$1" out="$2" arm="${3:-}"
+  [ -n "$arm" ] || arm="$(extract_report_arm "$src")"
+  {
+    printf '%s\n' 'info() { printf "%s\n" "$*"; }'
+    # The report's own inputs. `waited`/`wait_word`/`pending` are locals of
+    # `wait_for_first_checks`; outside it they simply have to EXIST, with the values the
+    # assertions below name. `missing_unreadable`/`streak_unreadable` are the
+    # unreadable-ATTRIBUTABLE counters (R9/R10), so a non-zero value here is what an
+    # `else` that guesses would leak into a ground it never measured.
+    printf '%s\n' 'FIRST_CHECKS_WAIT=3900 FIRST_CHECKS_JOBS_MAX=8 waited=42 pending=2' \
+                  'wait_word="— waiting." missing_unreadable=7 streak_unreadable=3'
+    printf '%s\n' "$arm"
+  } > "$out"
+  [ -n "$arm" ]
+}
+ck "extracted the per-poll report's \`unobservable\` arm from $(basename "$SRC") — it is EXECUTED, not assumed" \
+   "$(build_report "$SRC" "$REPORT_LIB" && echo 0 || echo 1)"
+ck "the extracted report arm is the three-way one (cap / unreadable / unrecorded ground)" \
+   "$([ "$(grep -c 'FIRST_CHECKS_SIGNAL_REASON" = ' "$REPORT_LIB")" -eq 2 ] && [ "$(grep -c 'info "admin-merge:' "$REPORT_LIB")" -eq 3 ] && echo 0 || echo 1)"
+report_poll() { # <signal-reason> → the per-poll report line for an `unobservable` poll
+  FIRST_CHECKS_SIGNAL_REASON="$1" bash < "$REPORT_LIB" 2>&1
+}
+R_UNK="$(report_poll '')"
+# ⛔ THE PRE-FIX TEXT IS THE FAILING CASE HERE, NOT A HYPOTHETICAL: the old `else` was the
+# unreadable sentence, so an unrecognised ground used to be reported as a failed Jobs read
+# WITH a duration (7s in total, 3s consecutively — values this arm injected and the poll
+# never measured).
+ck "(D) an UNRECOGNISED ground does NOT report a Jobs read failure the poll never measured (round 10 P2)" \
+   "$(grep -q 'Jobs API unreadable' <<<"$R_UNK" && echo 1 || echo 0)"
+ck "(D) …and quotes NO duration for it (the injected 7s/3s must not surface)" \
+   "$(grep -qE '(did not answer for|unreadable for) *[0-9]' <<<"$R_UNK" && echo 1 || echo 0)"
+ck "(D) …and SAYS the ground was not one this wait measured, instead of guessing" \
+   "$(grep -q 'ground this wait did NOT record' <<<"$R_UNK" && echo 0 || echo 1)"
+# MUTATION, the direction that matters most: revert the catch-all to the PRE-FIX two-way text
+# (the honest `else` line is replaced by the unreadable sentence, which is exactly what the old
+# two-arm split printed on any non-`cap` ground) and the UNRECOGNISED-ground row above must go
+# RED. Without this row the three (D) arms could be green only because the mutant was never
+# built — the suite's own standard for a mutation arm elsewhere in this file.
+MUT2_ARM="$(extract_report_arm "$SRC" | awk '
+  /ground this wait did NOT record/ { print "          info \"admin-merge: … FIRST-CHECKS wait: Jobs API unreadable for 7s (pre-fix two-way mutant)\""; next }
+  { print }
+')"
+ck "MUTATION precondition: the two-way mutant really replaced the catch-all (not a no-op)" \
+   "$(grep -q 'pre-fix two-way mutant' <<<"$MUT2_ARM" && echo 0 || echo 1)"
+ck "MUTATION: with the catch-all reverted to the PRE-FIX text, the unrecognised-ground row goes RED" \
+   "$(build_report "$SRC" "$TMP/report-mut2.sh" "$MUT2_ARM" \
+      && FIRST_CHECKS_SIGNAL_REASON='' bash < "$TMP/report-mut2.sh" 2>&1 \
+      | grep -q 'Jobs API unreadable' && echo 0 || echo 1)"
+R_UNREAD="$(report_poll unreadable)"
+ck "(D) CONTROL: a FAILED read IS still named, with its attributable duration" \
+   "$(grep -q 'Jobs API unreadable for 7s' <<<"$R_UNREAD" && echo 0 || echo 1)"
+R_CAP="$(report_poll cap)"
+ck "(D) CONTROL: the width CAP still names itself and declines the read (the fix did not collapse it)" \
+   "$(grep -q 'MORE than the 8 this wait observes' <<<"$R_CAP" && grep -q 'not an unreadability finding' <<<"$R_CAP" && echo 0 || echo 1)"
+ck "(D) CONTROL: …and a CAP poll does NOT claim a failed read either" \
+   "$(grep -q 'Jobs API unreadable' <<<"$R_CAP" && echo 1 || echo 0)"
+# MUTATION: the `elif` guard is what keeps the unreadable sentence off every other ground.
+# Disable it in a mutant and the control above must go RED — i.e. the arm discriminates on
+# the guard, not on the arm's mere presence.
+MUT_ARM="$(extract_report_arm "$SRC" | sed 's/elif \[ "\$FIRST_CHECKS_SIGNAL_REASON" = unreadable \]; then/elif false; then/')"
+ck "MUTATION precondition: the report-arm mutant really re-spelled the guard (not a no-op)" \
+   "$(grep -q 'elif false; then' <<<"$MUT_ARM" && echo 0 || echo 1)"
+ck "MUTATION: with the \`unreadable\` guard disabled, the failed-read control goes RED (the guard is load-bearing)" \
+   "$(build_report "$SRC" "$TMP/report-mut.sh" "$MUT_ARM" \
+      && FIRST_CHECKS_SIGNAL_REASON=unreadable bash < "$TMP/report-mut.sh" 2>&1 \
+      | grep -q 'Jobs API unreadable for 7s' && echo 1 || echo 0)"
+
+
 echo
 printf 'issue #2465 inert wait: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
