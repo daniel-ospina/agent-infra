@@ -6141,26 +6141,27 @@ block_on_first_checks() {
         say_err "   Next: re-run the rail once those checks complete (its progress signal is re-read then),"
         say_err "   or raise ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)."
       else
-        # THE SURFACE WAS READ **NOW**. ⛔ AND "NOTHING was unreadable" IS A CLAIM ABOUT
-        # THE WHOLE WAIT, not about this observation (review round 5, P2): a wait that
-        # recovered from an `unobservable` poll keeps its accumulated `missing` (only
-        # `missing_streak` is reset), so asserting the absence of any unreadable second
-        # would be false about a wait that spent N of them blind.
-        # ⛔ AND THE NUMBER MUST BE THE UNREADABLE-ATTRIBUTABLE ONE (review round 7, P2).
-        # `missing` also counts cap polls (read deliberately not attempted) and
-        # never-started seconds (no run to read yet), so quoting it here printed
-        # "30s … UNREADABLE" about a fresh-PR race in which NOTHING was unreadable — the
-        # same two-grounds defect this block corrects ten lines above.
-        if [ "${FIRST_CHECKS_MISSING_UNREADABLE:-0}" -gt 0 ]; then
-          say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
-          say_err "   status=completed when this observation was taken. This surface is READABLE now, but"
-          say_err "   ${FIRST_CHECKS_MISSING_UNREADABLE}s of this wait went by with it UNREADABLE, so no stronger"
-          say_err "   slow-vs-wedged claim is made than that."
-        else
-          say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
-          say_err "   status=completed when this observation was taken. NOTHING was unreadable, so no"
-          say_err "   slow-vs-wedged claim is made here."
-        fi
+        # THE SURFACE WAS READ **NOW**, and it is READ — so "NOTHING was unreadable" is
+        # TRUE of the whole wait here, and no `missing` figure is quoted.
+        # ⛔ THE `MISSING_UNREADABLE` FIGURE CANNOT BE NON-ZERO IN THIS BRANCH, WHICH IS
+        # WHY THERE IS NO BRANCH FOR IT (review round 9, P2). Round 5 added one on the
+        # premise "a wait that recovered from an `unobservable` poll keeps its accumulated
+        # `missing`" — right in general, but such a wait cannot reach this arm:
+        #   · `OUTCOME=still-running` is assigned in exactly ONE place, the ONE-SHOT return
+        #     (`:5782`), which returns immediately after the first verdict-reaching poll;
+        #   · a multi-poll wait that was ever `unobservable` and later reads fine expires as
+        #     `stalled` or `ceiling`, and each of those has its OWN case arm above;
+        #   · the only poll that skips the verdict is the re-derive `continue`, which
+        #     requires `total == 0` — no Jobs read, so the counter is untouched.
+        # So reaching this arm implies the LAST poll had `signal_ok=1`, and with a single
+        # verdict-reaching poll there is no earlier `unobservable` one to have advanced the
+        # counter. A defensive branch here would be dead code that READS like coverage —
+        # measured by #2465's round-9 review, which reproduced exactly that. If a future
+        # change makes a multi-poll `still-running` outcome reachable, this invariant is
+        # what that change must revisit.
+        say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
+        say_err "   status=completed when this observation was taken. NOTHING was unreadable, so no"
+        say_err "   slow-vs-wedged claim is made here."
         say_err "   A running job is not a failure, and this is NOT a stall claim."
         say_err "   An unfinished (or absent) lane yields an EMPTY failing set, which proves nothing,"
         say_err "   so nothing was compared, no evidence was posted and nothing was merged."

@@ -511,21 +511,20 @@ ck "(C) CONTROL: a READABLE still-pending surface still says 'NOTHING was unread
    "$(grep -q 'NOTHING was unreadable' <<<"$C_READ" && echo 0 || echo 1)"
 ck "(C) CONTROL: …and does NOT claim the Jobs read failed" \
    "$(grep -q 'the Jobs read FAILED' <<<"$C_READ" && echo 1 || echo 0)"
-C_RECOVER="$(bofc still-running '' 3 0 still-running 3 0)"
-ck "(C) a RECOVERED surface (readable NOW, but N seconds of this wait were blind) does NOT claim 'NOTHING was unreadable' (round 5 P2)" \
-   "$(grep -q 'NOTHING was unreadable' <<<"$C_RECOVER" && echo 1 || echo 0)"
-ck "(C) …and it states the 3s it spent unreadable instead of denying it" \
-   "$(grep -q '3s of this wait went by with it UNREADABLE' <<<"$C_RECOVER" && echo 0 || echo 1)"
-# ⛔ AND A RECOVERED SURFACE THAT WAS **NEVER** UNREADABLE MUST SAY SO (review round 7,
-# P2). `missing` also counts `never-started` seconds (no run to read yet) and cap polls
-# (read deliberately not attempted). Quoting it as "N s … UNREADABLE" printed a false
-# claim of blindness about the fresh-PR race.
-C_RECOVER_FRESH="$(bofc still-running '' 30 0 still-running 0 0)"
-ck "(C) a RECOVERED surface that was never blind does NOT claim 30s of unreadable time (round 7 P2)" \
-   "$(grep -q '30s of this wait went by with it UNREADABLE' <<<"$C_RECOVER_FRESH" && echo 1 || echo 0)"
-ck "(C) …and it says NOTHING was unreadable (a fresh-PR race is not a blind instrument)" \
-   "$(grep -q 'NOTHING was unreadable' <<<"$C_RECOVER_FRESH" && echo 0 || echo 1)"
-# ⛔ NO SEPARATE "CAP-ONLY RECOVERED" ROW (review round 8, P2). `missing` is ONE scalar with
+# ⛔ NO "RECOVERED SURFACE" ROWS — THERE IS NO RECOVERED SURFACE (review round 9, P2).
+# Round 5 added a `MISSING_UNREADABLE > 0` branch here on the premise "a wait that
+# recovered from an `unobservable` poll keeps its accumulated `missing`". The premise is
+# right in general and the branch was still DEAD CODE: `OUTCOME=still-running` comes only
+# from the ONE-SHOT return (`admin-merge.sh:5782`), which returns after the first
+# verdict-reaching poll, and a multi-poll wait that was ever `unobservable` expires as
+# `stalled`/`ceiling` — each with its OWN case arm. So this arm is reached only when the
+# last poll read the surface fine, with no earlier poll able to have advanced the counter.
+# The branch is deleted (a dead branch that reads like coverage is worth less than no
+# branch), and the two rows that injected the impossible `MU>0` tuple are deleted with it:
+# they could only fail on an edit to dead text, which is not coverage. What pins the real
+# CAP-vs-unreadable-vs-never-started distinction is the PRODUCER:
+# `tests/first-checks-lane-rederive` arm (g) and its mutation.
+## ⛔ NO SEPARATE "CAP-ONLY RECOVERED" ROW (review round 8, P2). `missing` is ONE scalar with
 # no cause attached, so an injected tuple cannot distinguish "the only `missing` was CAP polls"
 # from "never-started seconds" — the row would be decorative, not a guard. The distinction is
 # carried by `FIRST_CHECKS_MISSING_UNREADABLE`, and `C_RECOVER_FRESH` above already pins the
