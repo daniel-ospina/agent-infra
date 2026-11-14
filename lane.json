@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 900,
+  "exit_code": null,
+  "heartbeat_at": 1794698061,
+  "host": "192",
+  "issue": 2834,
+  "kind": "lane",
+  "lane_id": "192.klane-2834-1794698061-p47417-9270b038",
+  "lease_until": 1794698961,
+  "pid": 47417,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1794698061,
+  "state": "RUNNING",
+  "tag": "2834",
+  "worktree": "/private/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.EQaV0qvy4b/wt"
+}
