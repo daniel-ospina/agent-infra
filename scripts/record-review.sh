@@ -1189,7 +1189,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   local _OC_NOT_RESOLVED='(^|[^[:alpha:]])(none|nothing|neither|not|never)[[:space:]]+[^.;:]{0,30}(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)'
   local _OC_IN_PROGRESS='(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(being|partially|partly|pending|in[[:space:]]+progress)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)'
   # A persistence qualifier anywhere after the declaration, inside the declaration's own clause.
-  local _OC_PERSIST='block(ing|ers?)[^.;:]{0,60}(remain|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|still|yet|known|carried|waived|left|partial|some|most|several|half|rest|skipped|re[-[:space:]]?open|re[-[:space:]]?opens|re[-[:space:]]?opened)'
+  local _OC_PERSIST='block(ing|ers?)[^.;:]{0,60}(remain|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|still|yet|known|carried|waived|left|partial|some|most|several|half|rest|skipped|re[-[:space:]]?open|re[-[:space:]]?opens|re[-[:space:]]?opened|rolled[[:space:]]+back|reverted|withdrawn|withheld|undone|dropped|discarded|scrapped|abandoned|revoked|put)'
   # ⛔ A SEVERITY TOKEN IS PART OF THE DECLARATION'S SUBJECT, AND IT WAS A FAIL-OPEN (agent-infra#3902
   # review, F1). `P0..P3` is this repo's own house vocabulary for a blocking finding, and the token
   # class below was `[[:alpha:]-]+` — which cannot span `P1` (the `1` is not alpha). So the MOST
@@ -1309,7 +1309,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # `yet|known|carried|waived|left|partial` are therefore read HERE too, exactly as `_OC_PERSIST`
   # reads them. The `13n87` parity cell parses both lists and reds if they drift again, because the
   # defect was an OMISSION between two manually-maintained lists, not a missing insight.
-  local _OC_STILL="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|yet|known|carried|waived|left|partial|skipped|re[-[:space:]]?open|re[-[:space:]]?opens|re[-[:space:]]?opened)"
+  local _OC_STILL="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|yet|known|carried|waived|left|partial|skipped|re[-[:space:]]?open|re[-[:space:]]?opens|re[-[:space:]]?opened|rolled[[:space:]]+back|reverted|withdrawn|withheld|undone|dropped|discarded|scrapped|abandoned|revoked|put)"
   local _OC_SELLED='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)([^[:alpha:]]|$)'
   # ⛔ A TOTALITY CLAIM WITH AN EXCEPTION IS NOT A TOTALITY CLAIM (agent-infra#3902 review, P1 —
   # MEASURED fail-open). Escape (b) accepts `all blocking findings were fixed`; the SAME sentence with

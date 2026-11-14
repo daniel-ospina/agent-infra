@@ -6224,6 +6224,36 @@ EV_REF="comment:42612801" run_record_ev 426128 STUB_EVIDENCE_BODY="**Outcome: CL
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13n119 'skipped'/'re-opened' with NO blocking mention is not a remainder (rc 0)"
 
+# 13n120-13n121 — A RESOLUTION THAT WAS REVERSED IS A LIVE REMAINDER (P1 fail-opens, found by
+# attacking this round's own fix). `_OC_STILL` carried persistence words, but not the verbs of
+# UNDOING — so a declared blocker that was rolled back read as resolved. MEASURED at 8ee43a197:
+# `; 1 was rolled back`, `; 1 was reverted`, `; 1 was withheld`, `; 1 got dropped` and
+# `; 1 was put back on the list` ALL ADMITTED and minted a signed `clean`.
+# ⛔ THIS IS A CLOSED GRAMMATICAL CLASS (verbs of undoing/withdrawal), not a synonym list: the same
+# shape that made `_OC_EXCEPT` a class rather than an enumeration. It is added to BOTH lists so
+# 13n87's parity guard still holds, and paren-free so that guard's list parser still parses.
+rm -f "$(Q2 426129)"
+EV_REF="comment:42612901" run_record_ev 426129 STUB_EVIDENCE_BODY="**Outcome: 2 blocking findings were fixed; 1 was rolled back.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n120 '; 1 was ROLLED BACK' is a live remainder — a reversed fix is not a fix (rc 3)"
+[ ! -f "$(Q2 426129)" ] && ok "13n120 no record minted over a rolled-back fix" || bad "13n120 minted a record over '1 was rolled back'"
+
+rm -f "$(Q2 426130)"
+EV_REF="comment:42613001" run_record_ev 426130 STUB_EVIDENCE_BODY="**Outcome: 2 blocking findings were fixed; 1 was put back on the list.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n121 '; 1 was PUT BACK on the list' is a live remainder (rc 3)"
+
+# 13n122 — THE OVER-BLOCK CONTROL for the undo class, and the one that matters most: these words are
+# now read LINE-WIDE by _OC_STILL, so the guard is that they do NOT fire without a blocking mention.
+# A CLEAN line that talks about reverted COMMITS or withdrawn DRAFTS records.
+rm -f "$(Q2 426131)"
+EV_REF="comment:42613101" run_record_ev 426131 STUB_EVIDENCE_BODY="**Outcome: CLEAN — no blocking issues found; 2 reverted commits and 1 withdrawn draft were cleaned up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n122 undo verbs with NO blocking mention do not refuse a clean line (rc 0)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
