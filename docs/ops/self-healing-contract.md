@@ -231,7 +231,19 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   decides it;
 - `slots_why=` — why a zero is a zero, in the order the allocator decides: `granted` (a non-zero
   grant), `capacity` (the probe refused, so no rung resolved at all), `level` (a higher level holds the
-  room), `no_room`, `empty_backlog`, `listing_unreadable`;
+  room), `no_room`, `empty_backlog`, `listing_unreadable`, `backlog_unreadable`.
+  ⛔ **`empty_backlog` REQUIRES A MEASURED EMPTY POOL** (#1931; added by the 4th review cycle of
+  #3909). The backlog count is `wc -l < candidates.txt` coerced to `0` when that file cannot be read, so
+  the **same zero** also arrives from a refresh whose pool listing failed — where an empty file is
+  byte-identical to a fleet with nothing to do. So the arm reads `state/queue-state` (the refresh's own
+  record: `EMPTY` / `READ(n)` / `PARTIAL(x)` / `UNREADABLE` / `UNKNOWN`) and only a measured `EMPTY` may
+  be called empty; every other zero-backlog state is `backlog_unreadable`. That ordering is
+  measured-before-blind on purpose: `empty_backlog` and `listing_unreadable` are each a **measurement**
+  and take precedence, while `backlog_unreadable` is an *absence* of attribution and ranks below them
+  (both can hold at once — the 2026-10-17 incident had both listings refused for 131 consecutive
+  passes). ⛔ The distinction is not cosmetic: `empty_backlog` is the diagnosis whose remedy is #3009
+  requirement 2 (widen the pool), so publishing it for a blind refresh aims that remedy at a pool that
+  was never read;
 - `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room, and a measured
   `0` on every pass the valve did not fire. ⛔ It is computed in the **drain-escape block**, not the
   cascade block — that separation is the whole point of it being its own token;
