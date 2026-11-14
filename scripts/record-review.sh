@@ -1245,7 +1245,21 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # spelled form is what a digit-only scan misses (13n30).
   local _OC_COUNT='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten|[1-9][0-9]*)'
   local _OC_GOVERNS="[[:space:]]+(of[[:space:]]+(them|the|these|those)|block(ing|ers?))"
-  local _OC_RESOLVES="[[:space:]]+(of[[:space:]]+(them|the|these|those)[[:space:]]+)?(${_OC_TOK}[[:space:]]+){0,2}(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)"
+  # ⛔ A RESOLUTION NEEDS ITS SUBJECT TO BE THE DECLARED POPULATION (agent-infra#3902 SEVENTH review,
+  # P2 — MEASURED false refusal). The token run `(${_OC_TOK} ){0,2}` let a surviving count bring its
+  # OWN subject noun, so a second count about something else entirely read as a RESOLUTION of the
+  # blocking findings and vetoed an honest closure:
+  #   `Outcome: CLEAN — 3 blocking findings were fixed; 2 flaky tests were fixed.`        -> VETO (wrong)
+  #   `Outcome: CLEAN — 3 blocking findings were fixed; 2 more tests were fixed too.`    -> VETO (wrong)
+  #   `Outcome: CLEAN — 3 blocking findings were fixed; 3 follow-ups were resolved.`     -> VETO (wrong)
+  # All three are honest: nothing remains. The rule is now SHAPE, not vocabulary — a resolving count is
+  # a remainder only when it is ANAPHORIC (`3 were fixed`, `2 of them were resolved`) and therefore
+  # refers back to the declared findings. A count that introduces its own subject noun has changed
+  # population, so it is not a remainder of THIS declaration. ⛔ NOTHING IS LOST BY THE NARROWING:
+  # every remainder that names its own noun still reaches a belt — `1 finding was left` / `1 blocking
+  # finding remains open` hit `_OC_STILL`, `1 P1 was not addressed` hits `_OC_SEVREMAINDER` — and the
+  # default-deny polarity means a line that escapes here must still survive (b) `_OC_TOTAL`.
+  local _OC_RESOLVES="[[:space:]]+(of[[:space:]]+(them|the|these|those)[[:space:]]+)?(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)"
   # ⛔ A COUNT FOLLOWED BY A BLOCKING SEVERITY IS A REMAINDER (agent-infra#3902 SECOND review, F1).
   # Making the token runs severity-aware closed only the phrasings this file happened to test
   # (`… 1 P1 remains open`), and the reviewers' SECOND pass MEASURED that the class was still open
@@ -1308,7 +1322,27 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # open vocabulary list — the same shape as `_OC_GOVERNS`/`_OC_RESOLVES`, and deliberately NOT a
   # widening of the persistence belt. A COUNT is required in the exception slot, so the declared
   # residual (`… except the socket leak`, no count) still behaves exactly as the header says.
-  local _OC_EXCEPT="(all|both|every)[^.;:]{0,80}(except|excluding|barring|other[[:space:]]+than|save[[:space:]]+for|apart[[:space:]]+from|minus)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|the[[:space:]]+)?${_OC_CNT}"
+  # ⛔ THE CLASS WAS INCOMPLETE, WHICH MADE IT NOT A CLOSED CLASS AT ALL (agent-infra#3902 SEVENTH
+  # review, P1 — MEASURED fail-open, and the #2661 spelled/digit asymmetry one belt over). Five of the
+  # commonest connectives of exception were missing, so the DIGIT form minted a signed `clean` while
+  # its SPELLED twin was vetoed by `_OC_SELLED`: MEASURED at cd640fff8, each ADMITTED, while
+  # `… save one …` / `… with the exception of one …` was refused:
+  #   `all blocking findings were fixed, save 1 in the retry path.`                  -> ADMIT
+  #   `all blocking findings were fixed with the exception of 1.`                     -> ADMIT
+  #   `all blocking findings were fixed excepting 1.`                                 -> ADMIT
+  #   `all blocking findings were fixed aside from 1.`                                -> ADMIT
+  #   `all blocking findings were fixed but for 1.`                                   -> ADMIT
+  # The longer alternatives come FIRST so a leftmost-longest engine never has to backtrack from
+  # `except` into `excepting`/`except for`.
+  # ⛔ AND THE DISTANCE BOUND `{0,80}` WAS ITSELF A FAIL-OPEN (same review, P1 — MEASURED). A totality
+  # claim with the exception pushed past 80 characters ADMITTED while its short twin was refused:
+  #   `… all blocking findings were fixed during the long migration of the dispatcher and the evidence
+  #    reader and the merge rail, except 1 in the retry path.`                        -> ADMIT (118ch)
+  # A width bound is defeated by one more noun — the same mistake `_OC_TAIL`'s `{0,6}` made and this
+  # PR fixed by PREDICATE rather than by width. The real scoping here is the clause boundary
+  # (`[^.;:]`, which no connective can cross), so the bound is removed rather than raised. Polarity
+  # decides the trade: a false PASS merges unreviewed code, a false refusal costs a reworded re-run.
+  local _OC_EXCEPT="(all|both|every)[^.;:]*(excepting|except[[:space:]]+for|except|excluding|barring|other[[:space:]]+than|save([[:space:]]+for)?|apart[[:space:]]+from|aside[[:space:]]+from|but[[:space:]]+for|with[[:space:]]+the[[:space:]]+exception[[:space:]]+of|minus)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|the[[:space:]]+)?${_OC_CNT}"
   # ⛔ A COUNT HANDED ONWARD IS A REMAINDER, NOT A RESOLUTION (agent-infra#3902 review, P1 — MEASURED
   # fail-open). The surviving count is the SUBJECT of a hand-off predicate — it needs a follow-up, its
   # own issue, another PR — which says the finding was NOT closed. It reached no belt: `needs` is not a
@@ -1323,7 +1357,17 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # code here: after the count has been consumed, that class ate the separating space and the required
   # `[[:space:]]` then had to match the `n` of `needs`. MEASURED: the vector still ADMITTED. Caught by
   # running the belt, not by reading it — which is why the vector is committed as 13n84.
-  local _OC_HANDOFF="[[:space:]][^.;:]{0,25}(needs?|requires?|awaits?)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|as[[:space:]]+an?[[:space:]]+|its[[:space:]]+own[[:space:]]+|into[[:space:]]+)?(follow[-[:space:]]?up|separate|another|its[[:space:]]+own|new[[:space:]]+(issue|pr|ticket))"
+  # ⛔ AND IT READ ONLY THE ACTIVE VOICE, WHICH IS THE SAME HOLE ONE VOICE OVER (agent-infra#3902
+  # SEVENTH review, P2 — MEASURED fail-open). `needs|requires|awaits` is what an agent writes when it
+  # speaks in the first person; the PASSIVE hand-off of the same surviving count reached no belt,
+  # because none of `handed|passed|goes|will be` is a resolution verb or a persistence word:
+  #   `Outcome: 2 blocking (P1) findings were fixed; 1 was handed off to #1234.`   -> ADMIT
+  #   `… 1 is handed to another PR.` / `… 1 goes to a separate issue.` / `… 1 will be its own PR.` -> ADMIT
+  # The predicate's own rule (`:1317`) is "A COUNT HANDED ONWARD IS A REMAINDER" — voice is not part of
+  # that rule, so the passive is read too. Closed classes only: the passive auxiliaries, a small set of
+  # hand-off verbs, and the destinations a hand-off names. Still COUNT-ANCHORED (it is concatenated
+  # after `_OC_COUNT`), so `the docs were handed to the vendor` (no count) stays admitted (13n91).
+  local _OC_HANDOFF="([[:space:]]+(needs?|requires?|awaits?)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|as[[:space:]]+an?[[:space:]]+|its[[:space:]]+own[[:space:]]+|into[[:space:]]+)?(follow[-[:space:]]?up|separate|another|its[[:space:]]+own|new[[:space:]]+(issue|pr|ticket))|[[:space:]]+(was|were|is|are|has[[:space:]]+been|have[[:space:]]+been|being)[[:space:]]+(handed([[:space:]]+off)?|passed([[:space:]]+on)?|moved|escalated|deferred|split[[:space:]]+out)[[:space:]]+(to|into|onto)[[:space:]]+(#?[0-9]+|a[[:space:]]+|an[[:space:]]+|another|its[[:space:]]+own|separate)|[[:space:]]+(goes|went|lands?)[[:space:]]+(to|into)[[:space:]]+(#?[0-9]+|a[[:space:]]+|an[[:space:]]+|another|separate)|[[:space:]]+(will[[:space:]]+be|is|becomes?)[[:space:]]+(its[[:space:]]+own|a[[:space:]]+separate|another)[[:space:]]+(issue|pr|ticket|follow[-[:space:]]?up))"
   local _OC_SECOND_COUNT="${_OC_COUNT}(${_OC_GOVERNS}|${_OC_RESOLVES}|${_OC_STILL}|${_OC_HANDOFF})|${_OC_SELLED}|${_OC_EXCEPT}"
   # ⛔ ESCAPE (a) READS A NEGATOR WITH SCOPE, not only a negator glued to `blocking`
   # (agent-infra#3902 review, F4 — MEASURED over-block). Every form here required the negation to be

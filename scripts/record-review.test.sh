@@ -5961,6 +5961,137 @@ EV_REF="comment:42601201" run_record_ev 426012 STUB_EVIDENCE_BODY="**Outcome: CL
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13n91 a hand-off with NO count in it is not a declared blocking remainder (rc 0)"
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# 13n92-13n106 — THE FOUR HOLES agent-infra#3902's SEVENTH review MEASURED, AND THE TWO FALSE
+# REFUSALS ONE OF THEM WAS HIDING. Every row below was RE-RUN against the shipped arm at cd640fff8
+# and did the wrong thing before the fix it now pins. The domain is adversarial: fail-open rows and
+# fail-closed rows are pinned in the SAME block on purpose, because closing one by widening is
+# indistinguishable from refusing every honest line unless both directions are asserted.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+# 13n92-13n96 — THE EXCEPTION CLASS WAS NOT CLOSED (P1 fail-open). `_OC_EXCEPT` carried 8 of the 13
+# commonest English connectives of exception, so the DIGIT form MINTED a signed `clean` while its
+# SPELLED twin was vetoed by `_OC_SELLED` — the #2661 "closed for one spelling and open for the other"
+# class, one belt over. MEASURED at cd640fff8: all five ADMITTED.
+rm -f "$(Q2 426101)"
+EV_REF="comment:42610101" run_record_ev 426101 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, save 1 in the retry path.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n92 'all … were fixed, SAVE 1' declares a live blocker (rc 3)"
+[ ! -f "$(Q2 426101)" ] && ok "13n92 no record minted over 'save 1'" || bad "13n92 minted a record over 'save 1'"
+
+rm -f "$(Q2 426102)"
+EV_REF="comment:42610201" run_record_ev 426102 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed with the exception of 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n93 'WITH THE EXCEPTION OF 1' declares a live blocker (rc 3)"
+
+rm -f "$(Q2 426103)"
+EV_REF="comment:42610301" run_record_ev 426103 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed excepting 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n94 'EXCEPTING 1' declares a live blocker (rc 3)"
+
+rm -f "$(Q2 426104)"
+EV_REF="comment:42610401" run_record_ev 426104 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed aside from 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n95 'ASIDE FROM 1' declares a live blocker (rc 3)"
+
+rm -f "$(Q2 426105)"
+EV_REF="comment:42610501" run_record_ev 426105 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed but for 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n96 'BUT FOR 1' declares a live blocker (rc 3)"
+
+# 13n97 — THE DISTANCE BOUND WAS ITSELF A FAIL-OPEN (P1). `[^.;:]{0,80}` admitted the same sentence
+# once the exception was pushed past 80 characters, which is the "one more noun defeats the width"
+# mistake this PR already fixed once (`_OC_TAIL`'s `{0,6}`). The clause boundary `[^.;:]` is the real
+# scoping, so the bound is gone rather than raised. MEASURED at cd640fff8: 118 characters ADMITTED.
+rm -f "$(Q2 426106)"
+EV_REF="comment:42610601" run_record_ev 426106 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed during the long migration of the dispatcher and the evidence reader and the merge rail, except 1 in the retry path.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n97 an exception 118 characters from its totality is still an exception (rc 3)"
+
+# 13n98-13n101 — THE HAND-OFF WAS READ IN THE ACTIVE VOICE ONLY (P2 fail-open). `needs|requires|awaits`
+# is first-person phrasing; the PASSIVE hand-off of the same surviving count reached no belt, because
+# `handed`/`goes`/`will be` is neither a resolution verb nor a persistence word. MEASURED at
+# cd640fff8: all four ADMITTED. The predicate's rule is "a count handed onward is a remainder" — voice
+# is not part of that rule.
+rm -f "$(Q2 426107)"
+EV_REF="comment:42610701" run_record_ev 426107 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 was handed off to #1234.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n98 '; 1 was HANDED OFF TO #1234' is a remainder (rc 3)"
+[ ! -f "$(Q2 426107)" ] && ok "13n98 no record minted over a passive hand-off" || bad "13n98 minted a record over '1 was handed off to #1234'"
+
+rm -f "$(Q2 426108)"
+EV_REF="comment:42610801" run_record_ev 426108 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 is handed to another PR.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n99 '; 1 is HANDED TO ANOTHER PR' is a remainder (rc 3)"
+
+rm -f "$(Q2 426109)"
+EV_REF="comment:42610901" run_record_ev 426109 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 goes to a separate issue.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n100 '; 1 GOES TO A SEPARATE ISSUE' is a remainder (rc 3)"
+
+rm -f "$(Q2 426110)"
+EV_REF="comment:42611001" run_record_ev 426110 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 will be its own PR.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n101 '; 1 WILL BE ITS OWN PR' is a remainder (rc 3)"
+
+# 13n102-13n104 — THE FALSE REFUSALS THE HAND-OFF WIDENING WAS HIDING (P2). `_OC_RESOLVES` let a
+# surviving count bring its OWN subject noun, so a second count about something else entirely read as
+# a resolution of the blocking findings and vetoed an honest closure. MEASURED at cd640fff8: all three
+# REFUSED. The rule is now SHAPE: a resolving count is a remainder only when it is ANAPHORIC (it
+# refers back to the declared findings); a count that names its own subject has changed population.
+# ⛔ THESE THREE ARE THE OVER-BLOCK CONTROLS FOR 13n98-13n101 — widening the hand-off without them
+# would be indistinguishable from refusing every clean line that mentions a number.
+for _vec in "426111|2 flaky tests were fixed" "426112|2 more tests were fixed too" "426113|3 follow-ups were resolved"; do
+    _id="${_vec%%|*}"; _tail="${_vec#*|}"
+    rm -f "$(Q2 "$_id")"
+    EV_REF="comment:${_id}01" run_record_ev "$_id" STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; ${_tail}.**
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "0" "13n10${_id#42611} a second count about a NON-blocking subject is not a remainder — '${_tail}' (rc 0)"
+done
+
+# 13n105 — MUTATION PIN for the anaphoric narrowing (13n102's own). Restore the wide token run and the
+# honest closure must REFUSE again, otherwise 13n102 could be green for an unrelated reason.
+N_RESOLVES_MUT="$T/mutant-resolves-wide.sh"
+# ⛔ THE ANCHOR IS THE MINIMAL UNIQUE FRAGMENT `)?(were` (grep -c on the shipped script reports 1), not
+# the whole assignment: a long escaped anchor is the thing that goes stale the next time the line is
+# reworded, and a stale mutation anchor is a RED test that reads as the pin holding (13n86 shipped
+# exactly that failure). The replacement re-introduces the wide token run the narrowing removed.
+sed 's#)?(were#)?(${_OC_TOK}[[:space:]]+){0,2}(were#' "$RECORD" > "$N_RESOLVES_MUT"
+if cmp -s "$RECORD" "$N_RESOLVES_MUT"; then
+    bad "13n105 MUTANT: the _OC_RESOLVES sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_RESOLVES_MUT" && ok "13n105 MUTANT: the wide-resolves mutant still parses" || bad "13n105 MUTANT: the mutant does not parse"
+    NR_SAVE="$RECORD"
+    RECORD="$N_RESOLVES_MUT"
+    rm -f "$(Q2 426114)"
+    EV_REF="comment:42611401" run_record_ev 426114 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 2 flaky tests were fixed.**
+
+$VACUITY_BLOCK"
+    RECORD="$NR_SAVE"
+    assert_eq "$RECORD_RC" "3" "13n105 MUTATION PIN: with the wide token run restored, 13n102's honest closure is REFUSED (rc 3) — the narrowing is load-bearing"
+fi
+
+# 13n106 — THE OVER-BLOCK CONTROL FOR THE PASSIVE WIDENING. A hand-off with NO count in it is docs
+# work, not a declared blocking remainder (the same polarity 13n91 pins for the active voice). Without
+# this, closing 13n98-13n101 would be indistinguishable from refusing every sentence containing
+# `handed`.
+rm -f "$(Q2 426115)"
+EV_REF="comment:42611501" run_record_ev 426115 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed; the vendor docs were handed to the team.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n106 a PASSIVE hand-off with NO count is not a declared remainder (rc 0)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
