@@ -1170,16 +1170,27 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # 2 P1 still open` and `… however 1 P1 is still open`. A severity tag is admitted in EVERY token
   # run that can sit between a count and its verb, and between a count and the noun `blocking`.
   local _OC_SEV='\(?p[0-3]\)?'
-  local _OC_TOK="(${_OC_SEV}|\\(?[[:alpha:]-]+\\)?)"
+  # ⛔ A TOKEN MAY CARRY DIGITS, DOTS AND SLASHES, AND THE RUN IS SIX TOKENS WIDE
+  # (agent-infra#3902 THIRD review, P2 — MEASURED false refusal). The class was `[[:alpha:]-]+` with
+  # a THREE-token run, so the sentences a fixer actually writes when it says WHERE or WHICH cycle it
+  # fixed sat more than three tokens from the verb, or carried a digit or a `/`, and were refused
+  # even though they are exactly the honest closure (b) exists to admit:
+  # `3 blocking findings from the review were fixed`, `… from the second cycle were fixed`,
+  # `… in the dispatcher were fixed and re-verified`, `… in scripts/record-review.sh were fixed and
+  # re-verified`, `… from cycle 1 were fixed and re-verified`. MEASURED at 7efcb2d75: all five VETOED
+  # while `origin/main` (which has no arm 1c) admits them, so arm 1c introduced the class. The
+  # over-block direction is the cheaper one, but it is not free — a false refusal costs a reworded
+  # re-run on every honest agent — and this class was avoidable by WIDTH, not by adding vocabulary.
+  local _OC_TOK="(${_OC_SEV}|\\(?[[:alnum:]/._-]+\\)?)"
   # An affirmative TOTAL resolution: declared count, or an explicit totality word, as the subject.
-  local _OC_TAIL="([[:space:]]+${_OC_TOK}){0,3}[[:space:]]+((were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2})?(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)"
+  local _OC_TAIL="([[:space:]]+${_OC_TOK}){0,6}[[:space:]]+((were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2})?(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)"
   local _OC_CNT='([1-9][0-9]*|one|two|three|four|five|six|seven|eight|nine|ten)'
   # ⛔ `BLKDECL` IS A TOTAL SUBJECT TOO (agent-infra#3902 review, F2+F4). The DECLARED count is
   # MASKED out before the second-count arithmetic runs, which is right — but the masked text is then
   # all the TOTAL arm can see, so `_OC_TOTAL` could never match the very declaration it exists to
   # accept, and the digit form recorded only by accident of the mask not firing. Accepting the mask
   # token makes the escape independent of which form (digit or spelled) the declaration used.
-  local _OC_TOTAL="(^|[^0-9])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}|BLKDECL${_OC_TAIL}"
+  local _OC_TOTAL="(^|[^0-9])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)${_OC_TAIL}|(^|[^0-9])${_OC_CNT}[[:space:]]+\(?p[01]\)?${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?\(?p[01]\)?${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}|BLKDECL${_OC_TAIL}"
   # ⛔ A COLLECTIVE REMAINDER — `the rest`, `some`, `most`, `half` (agent-infra#3902 review, F3).
   # The header below CLAIMED these were counted; they were not, because they lived only in
   # `_OC_PERSIST`, which is `;`-SCOPED and so unreachable after the clause boundary. MEASURED at
@@ -1215,11 +1226,20 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # honest clean line. `blocking` is P0/P1 by this repo's own convention, so a P2/P3 count is not a
   # blocking remainder at all.
   local _OC_BSEV='\(?p[01]\)?'
+  # ⛔ A COUNT THAT NAMES A REFERENCE IS NOT A COUNT (agent-infra#3902 THIRD review, P2 — MEASURED
+  # false refusal). `_OC_RESOLVES`/`_OC_STILL` read a surviving count followed by a verb, so an honest
+  # declaration that says WHICH cycle it fixed — `2 blocking (P1) findings from cycle 1 were fixed and
+  # re-verified` — read `1 were fixed` as a SECOND, resolving count and refused its own closure. This
+  # file ALREADY declares that class out of bounds one comment above (`... in cycle 2`, `... see
+  # #3902`, `... (commit 30ce585)` are references, not counts); the arithmetic simply had no mask for
+  # it. Masked BEFORE the `<count> <P0|P1>` remainder read, so a reference never becomes a remainder
+  # either — and only the NOUN+number pair, so `2 were fixed` keeps its count.
+  local _OC_REFMASK='s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]]+#?[0-9]+/\1 REFCNT /g'
   local _OC_SEVREMAINDER="(^|[^[:alnum:]])${_OC_COUNT}[[:space:]]+${_OC_BSEV}"
   local _OC_STILL="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending)"
   local _OC_SELLED='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)([^[:alpha:]]|$)'
   local _OC_SECOND_COUNT="${_OC_COUNT}(${_OC_GOVERNS}|${_OC_RESOLVES}|${_OC_STILL})|${_OC_SELLED}"
-  local _OC_ZEROED='(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)'
+  local _OC_ZEROED='(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)|(^|[^[:alnum:]])(no|non|zero|none)[[:space:]]*\(?p[01]\)?|(^|[^0-9])0[[:space:]]*\(?p[01]\)?'
   decoded="$(tsv_decode "$1")"
   while IFS= read -r line; do
     # Only an `Outcome:` DECLARATION is this arm's question — anchored the way arm (1b) anchors it,
@@ -1244,13 +1264,34 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # fail-open in an evidence gate, so the class is widened to "not alphanumeric": a declaration
     # may be bolded, quoted, bulleted or wrapped and must still be READ.
     grep -qiE '(^|[^[:alnum:]])outcome:[[:space:]]*[*[:space:]]*' <<<"$line" || continue
-    # ...and it must NAME blocking findings. A declaration that does not mention them is not this
-    # arm's business at all, so it is SKIPPED — never vetoed (13n10: `Outcome: CLEAN — verified`
-    # with the blocking note in a separate line/blocks below it stays ACCEPTED).
-    grep -qiE 'block(ing|ers?)' <<<"$line" || continue
-    # A LIVE POSITIVE COUNT — the number that qualifies `blocking`, as opposed to a negated mention.
+    # ...and it must NAME blocking findings — by the NOUN (`blocking`, `blockers`) or by the HOUSE
+    # SEVERITY that means the same thing. A declaration that does neither is not this arm's business
+    # at all, so it is SKIPPED — never vetoed (13n10: `Outcome: CLEAN — verified` with the blocking
+    # note in a separate line/blocks below it stays ACCEPTED).
+    # ⛔ THE NOUN-ONLY GATE WAS A FAIL-OPEN (agent-infra#3902 THIRD review, P1). This arm's own
+    # convention, stated at `_OC_SEVREMAINDER`, is that "`blocking` is P0/P1 by this repo's own
+    # convention" — so a declaration that names the severity and never the noun is the SAME
+    # declaration, and it was invisible here: the arm read `block(ing|ers?)`, the line did not
+    # contain it, and the whole arm was skipped. MEASURED at 7efcb2d75 (arms 1/1a/1b/2 extracted and
+    # framed exactly as `gh --jq @tsv` frames them, then run):
+    #   `**Outcome: 3 findings — 2 P1 (security + evidence), 1 P2.**`            => ADMITTED
+    #   `**Outcome: CLEAN — 1 P1 (dispatch guard) remains open.**`               => ADMITTED
+    # Both declare 2 and 1 live blocking findings by the repo's own convention, and a `clean` record
+    # could be minted over either — the exact class #2661 exists to close. The fix admits a count
+    # QUALIFIED BY a P0/P1 tag (digit or spelled) as a declaration, and everything downstream — the
+    # (a) zero/negation escape, the `_rest` declaration mask, the second-count and severity-remainder
+    # belts, and (b) — then applies to it identically, which is what keeps this a widening of the
+    # ENTRY and not a second implementation. P2/P3 stay out: a P2/P3 count is a non-blocking
+    # follow-up and must not refuse an honest clean line.
+    if ! grep -qiE 'block(ing|ers?)' <<<"$line" \
+       && ! grep -qiE '(^|[^0-9])[1-9][0-9]*[[:space:]]*\(?p[01]\)?|(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)[[:space:]]*\(?p[01]\)?' <<<"$line"; then
+      continue
+    fi
+    # A LIVE POSITIVE COUNT — the number that qualifies a blocking NOUN or a P0/P1 severity, as
+    # opposed to a negated mention. Reading the severity form here too is what lets escape (a) tell
+    # `Outcome: CLEAN — 2 P1 were fixed` (live count: no escape (a)) from `… 0 P1 findings` (zeroed).
     live_count=0
-    grep -qiE '(^|[^0-9])[1-9][0-9]*[[:space:]_-]*block(ing|ers?)' <<<"$line" && live_count=1
+    grep -qiE '(^|[^0-9])[1-9][0-9]*[[:space:]_-]*(block(ing|ers?)|\(?p[01]\)?)' <<<"$line" && live_count=1
     # (a) ZEROED / NEGATED, and ONLY with no live positive count on the line.
     if [ "$live_count" -eq 0 ] && grep -qiE "$_OC_ZEROED" <<<"$line"; then
       continue
@@ -1270,7 +1311,21 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # addressed`, `were NEVER resolved`) all went rc 0. A gate that reads an unset variable is a
     # no-op gate; the suite caught it only because those four rows pin the belt from the other side.
     _rest="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' \
-      | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?non-block(ing|ers?)/\1 NEGDECL /g; s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)/\1 BLKDECL/; s/\(p[0-3]\)/ PTAG /g")"
+      | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?non-block(ing|ers?)/\1 NEGDECL /g; s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)/\1 BLKDECL/; ${_OC_REFMASK}; s/\(p[0-3]\)/ PTAG /g")"
+    # ⛔ A SEVERITY-ONLY DECLARATION MUST BE MASKED AS THE DECLARATION **ONCE**, AND ONLY WHEN THE
+    # NOUN FORM DID NOT ALREADY MASK IT (agent-infra#3902 THIRD review, P1 — the entry gate above now
+    # admits `<count> P0|P1`). Without this, `2 P1 were fixed and re-verified` kept its own count on
+    # `_rest` and the SEVERITY-REMAINDER arm refused the very escape (b) exists to accept. With it
+    # applied UNCONDITIONALLY, the opposite hole opened — measured here: on
+    # `3 blocking (P1) findings were fixed; 2 P1 still open` the noun mask fires first, and a second
+    # mask would then erase the REMAINDER (`2 P1`) instead of the declaration, so the surviving
+    # arithmetic sees nothing and the line ESCAPES. One declaration, one mask: the severity mask runs
+    # only when no `BLKDECL` marker is present, so the mask always lands on the declaration's OWN
+    # count and every later count stays countable — which is the same "exactly one may stand" rule the
+    # live-mention arm enforces from the other side.
+    if ! grep -qE 'BLKDECL' <<<"$_rest"; then
+      _rest="$(printf '%s' "$_rest" | sed -E "s/(^|[^[:alnum:]])${_OC_CNT}[[:space:]]+\(?p[01]\)?/\1 BLKDECL/")"
+    fi
     # ⛔ THE NEGATION/IN-PROGRESS BELTS ARE READ LINE-WIDE (second review, F1). They were
     # `_clause`-scoped, so a remainder after the declaration's own `;` — the shape an agent actually
     # writes — reached none of them. 13n25 still holds under the widening because its negation is
