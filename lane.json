@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-agent-infra-4076-1794656900-p3127978-54cb0918",
+  "_sha": "8fff4df4d4cc8bb76c11141882d78d42d4d81a04",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-agent-infra-4076.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/2465-kept-message-class"
+    },
+    {
+      "kind": "sha",
+      "value": "c6f68122e24bb46774ae4c14c179d81eb849a3b3"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/prd-4076"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7233,
+  "ended_at": 1794664133,
+  "exit_code": 143,
+  "heartbeat_at": 1794664133,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-agent-infra-4076-1794656900-p3127978-54cb0918",
+  "lease_until": 1794671933,
+  "pid": 3127978,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794656900,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-agent-infra-4076",
+  "worktree": "/home/cmux/agent-infra/.worktrees/prd-4076"
+}
