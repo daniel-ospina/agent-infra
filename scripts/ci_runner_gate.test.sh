@@ -731,8 +731,9 @@ assert_eq "$QUEUE_HEAD_SCAN_SHIPPED" "25" \
 # MEASURED (cycle 9 re-measured both routes, after the first version of this paragraph contradicted
 # itself): with `s/^QUEUE_PAGE=100/QUEUE_PAGE=50/` in the shipped `ci_runner_gate.sh` the suite is NOT
 # green — 13 failures / 591 passed — and THIS line is one of the 13, printing exactly
-# `(got: 50, want: 100)`. The OTHER 12 red incidentally: a 60-deep serving queue becomes "deeper than
-# the read page" and refuses, so the idle-capacity and deep-queue arms fail with `got: 2, want: 0`.
+# `(got: 50, want: 100)`. The OTHER 12 red incidentally: a 54-deep serving queue (its threshold pinned
+# at 60) becomes "deeper than the read page" and refuses, so the idle-capacity and deep-queue arms fail
+# with `got: 2, want: 0`.
 # ⛔ THAT SPLIT IS THE POINT, not a detail: without this line the twelve behaviour rows look like
 # fixture drift, and the natural repair for a future reader is to edit their expected values — which is
 # exactly how a read-page reversal would ship. This line is what makes the reversal read as a decision
@@ -1180,8 +1181,9 @@ assert_contains "$OUT" "ONE page of" "it NAMES the page ceiling a larger bound c
 # already carries from #3996 (`…or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> …`), so it
 # stayed GREEN with the ceiling clause deleted — it claimed to pin the note while pinning the older,
 # unrelated remedy sentence, and no mutant of this diff could red it (#3442 rule 3). The clause's own
-# wording is `a bound at or above %s cannot see past it`, and `cannot see past it` appears nowhere else
-# on this output, so the row now reds exactly when the clause is removed. Note the clause QUALIFIES the
+# wording is `CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it` — it NAMES the knob and then
+# qualifies it — and the token `cannot see past it` appears nowhere else on this output, so the row now
+# reds exactly when the clause is removed. Note the clause QUALIFIES the
 # knob ("at or above %s") instead of dismissing it: below the page the same advice would still be true,
 # but it is withheld on ADDRESS — the gate names the ceiling only where the knob is visibly maxed — and
 # that distinction lives in the base remedy sentence, not here.
@@ -1190,8 +1192,8 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "a window-limited scan advanced 
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a window-limited scan relabelled no runner"
 # ⛔ THE BOUNDARY OF THAT GATE: a queue EXACTLY one page deep is MEASURABLE by a bound AT the page, so
 # the ceiling note must be ABSENT (agent-infra#3995 review cycle 7 proposed `queued >= QUEUE_PAGE`;
-# measured, `-ge` prints the note here and tells the operator the knob cannot help — when `--max 100`
-# reads this queue WHOLE and writes a verdict). So the gate is "the queue is DEEPER than a page",
+# measured, `-ge` prints the note here and tells the operator the knob cannot help — when
+# `CI_GATE_QUEUE_HEAD_SCAN_MAX=100` reads this queue WHOLE and writes a verdict). So the gate is "the queue is DEEPER than a page",
 # `-gt`, and this arm is the side that reds if it is relaxed to `-ge`.
 echo "── #3995: a queue EXACTLY one page deep is measurable at the page bound, so NO ceiling note ──"
 run_gate ghost-window-at-exact-page GH_QUEUED="$QUEUE_PAGE_SHIPPED" GH_INPROGRESS=0 \
