@@ -1682,6 +1682,36 @@ status_job() {
         echo "  $label: NOT APPLICABLE (needs$unset_ph, unset on this box — the installer SKIPs it)"
         return 0
     fi
+    # ⛔ THE INSTALL PATH HAS THREE SKIP ARMS, NOT TWO (#3826 review P2, round 2). The guards above
+    # mirror `install_job`'s unresolved-placeholder and empty-`{{PATH}}` arms. `install_job` SKIPs a
+    # THIRD class — a unit whose rendered target sits under a macOS TCC root (`verify_targets` → 2,
+    # #427) — and returns 0 having DISARMED any installed copy. Without the same arm here that
+    # template fell through to `NOT INSTALLED` + rc 1: a PERMANENT red no command can clear, because
+    # re-running the installer SKIPs it again. MEASURED on the suite's own TCC fixture:
+    #   install   → `SKIP … a macOS TCC root (#427)`   rc 0
+    #   --status  → `NOT INSTALLED (template v0.2.0)`  rc 1
+    # and `fleet-schedule.py --verify` turns that rc into `SCHEDULE NOT VERIFIED` → `activate-harness
+    # … FAILING`. That is the "instrument whose healthy state is red" class this file removes for
+    # every OTHER skip arm (rounds 9-11), left standing on the one added for #427 — and the comment
+    # above says the guards are "mirrored verbatim … so a template cannot be skipped at install time
+    # and demanded by `--status`", which this arm is what makes true.
+    # ⛔ IT REPORTS A SKIP, NOT A PASS: the installed-copy variant keeps a counted marker, so a box
+    # still holding one is disclosed to the verdict sentence rather than certified clean.
+    local _tcc_tmp _tcc_vrc
+    if _tcc_tmp="$(mktemp 2>/dev/null)"; then
+        printf '%s' "$rendered" > "$_tcc_tmp"
+        _tcc_vrc=0
+        verify_targets "$_tcc_tmp" >/dev/null 2>&1 || _tcc_vrc=$?
+        rm -f "$_tcc_tmp"
+        if [ "$_tcc_vrc" -eq 2 ]; then
+            if [ -f "$installed" ]; then
+                echo "  ⚠️ INSTALLED-SKIPPED   $label: INSTALLED, but SKIPPED now (launchd cannot READ this unit's target — a macOS TCC root, #427; the installer SKIPs this template and DISARMS the copy, so what runs is not what the template describes)"
+            else
+                echo "  $label: NOT APPLICABLE (launchd cannot READ this unit's target — a macOS TCC root, #427; no install step changes this box's layout)"
+            fi
+            return 0
+        fi
+    fi
     if [ ! -f "$installed" ]; then
         # ⛔ AND AN INSTALLABLE TEMPLATE THAT IS NOT THERE IS A FAILURE ROW WITH A FAILURE CODE
         # (#1867 review, round 9). This function used to print the three failure verdicts and return

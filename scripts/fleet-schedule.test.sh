@@ -1045,6 +1045,19 @@ out="$(darwin_run --verify)"; rc=$?
   || bad "a failing install-launchd.sh --status was certified VERIFIED on macOS (rc=$rc): $out"
 grep -q 'SCHEDULE NOT VERIFIED' <<<"$out" && ok "the Darwin failure names the verdict" \
   || bad "no NOT VERIFIED verdict on Darwin: $out"
+# ⛔ AND IT MUST NOT SAY `0 launchd job(s)` BESIDE A REAL FAILURE (#3826 review P3). A delegate that
+# DIES without a marker row makes the verdict's job count empty, so the sentence read
+# `SCHEDULE NOT VERIFIED — 0 launchd job(s) … above` next to the FAIL line — a count that says nothing
+# failed beside a failure, which is how a real one gets read as a rounding artefact. The round-11 fix
+# closed exactly this for the marker wordings and left it standing on the arm added for the delegate's
+# own exit code. Reachable without a fixture: install-launchd.sh prints this same message and exits 1
+# when TEMPLATES_DIR is missing.
+grep -q '0 launchd job(s)' <<<"$out" \
+  && bad "the verdict said '0 launchd job(s)' beside a delegate that FAILED — a zero count is an unanswered question, not a clean set: $out" \
+  || ok "a delegate that dies without naming a job does NOT produce '0 launchd job(s)' (the count cannot contradict the exit)"
+grep -q 'named NO job' <<<"$out" \
+  && ok "…it says the delegate named no job, so the operator knows nothing was measured" \
+  || bad "the verdict did not explain that nothing was measured: $out"
 grep -q '^--status$' "$DELEGATE_RECORD" && ok "--verify asks install-launchd.sh --status (delegated, not reimplemented)" \
   || bad "--verify did not delegate --status: $(cat "$DELEGATE_RECORD" 2>/dev/null)"
 out="$(darwin_run --status)"; rc=$?

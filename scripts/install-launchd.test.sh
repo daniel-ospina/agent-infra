@@ -939,6 +939,25 @@ else
     ok "the TCC-protected unit is absent afterwards"
 fi
 assert_eq "$(grep -c 'bootstrap.*com\.eldato\.objective-reminder' "$LOG" || true)" "$BOOTSTRAP_OBJ_BEFORE" "no bootstrap for the skipped TCC-protected unit"
+# ⛔ AND `--status` MUST ANSWER THE SAME QUESTION THE SAME WAY (#3826 review P2, round 2). The
+# installer SKIPs a TCC-protected unit and returns 0 having DISARMED it; `status_job` had no matching
+# arm, so the same template fell through to `NOT INSTALLED` + rc 1 — a PERMANENT red no command can
+# clear, because re-running the installer just SKIPs it again, and `fleet-schedule.py --verify` turns
+# that rc into `SCHEDULE NOT VERIFIED`. MEASURED pre-fix on this exact fixture: install `SKIP … rc 0`,
+# then `--status` `NOT INSTALLED (template v…)` rc 1. Asserted in both directions, because a "fix"
+# that simply made every absent template rc 0 would pass the code arm and lie here.
+set +e
+OUT="$(run_installer "$HOME1" --status 2>&1)"
+STATUS_RC=$?
+set -e
+assert_contains "$OUT" "com.eldato.objective-reminder: NOT APPLICABLE" \
+    "the TCC-protected unit is NOT APPLICABLE to --status too — the install path's third skip arm is mirrored"
+# ⛔ THE ASSERTION IS ON *THIS* JOB'S ROW, NOT ON THE EXIT CODE. This fixture home has other declared
+# templates absent, so `--status` rc belongs to them and says nothing about this unit — asserting rc 0
+# here would be measuring the tripwire §7 broke. The discriminating property is that THIS label is
+# never `NOT INSTALLED`, which is what raised the permanent red.
+assert_not_contains "$OUT" "com.eldato.objective-reminder: NOT INSTALLED" \
+    "…and it is never reported NOT INSTALLED (the permanent-red arm the TCC skip would otherwise hit)"
 # Restore the template + fixture so later sections install cleanly.
 # ⛔ NO VERSION-BUMP SED HERE (#3413 review P3). An earlier draft rewrote `agent-infra-plist-version`
 # to force a reinstall and rewrote it back; the `rm -f` above already forces that, and the pairs

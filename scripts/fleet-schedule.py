@@ -3702,14 +3702,31 @@ def cmd_darwin(mode):
             )
             return 0
         if bad or out.returncode != 0:
-            print(
-                "SCHEDULE NOT VERIFIED — %d launchd job(s) not installed/loaded/in sync/declared "
-                "above (UNMANAGED = installed with no template; RETIRED-INSTALLED = retired here but "
-                "still installed, cleared by the next install; UNKNOWN = the installed set could "
-                "not be enumerated)"
-                % len(bad),
-                file=sys.stderr,
-            )
+            # ⛔ ZERO JOBS IS NOT ZERO FAILURES (#3826 review P3). When the delegate DIES without
+            # emitting a marker row — a missing `TEMPLATES_DIR`, a syntax death, an unset HOME — this
+            # arm fires with `bad == []`, so the sentence read `SCHEDULE NOT VERIFIED — 0 launchd
+            # job(s) … above` BESIDE a real FAIL line. A count that says nothing failed next to a
+            # failure is how a real one gets read as a rounding artefact; the round-11 fix closed
+            # exactly this for the marker wordings and left it standing on the arm that was added for
+            # the delegate's own exit code. MEASURED with a delegate that prints `ERROR: template dir
+            # not found` and exits 1: `FAIL install-launchd.sh --status exited 1 …` then `SCHEDULE NOT
+            # VERIFIED — 0 launchd job(s) …`, rc 1. Reachable without a fixture: `install-launchd.sh`
+            # emits that message and `exit 1` for a missing template dir.
+            if bad:
+                print(
+                    "SCHEDULE NOT VERIFIED — %d launchd job(s) not installed/loaded/in sync/declared "
+                    "above (UNMANAGED = installed with no template; RETIRED-INSTALLED = retired here but "
+                    "still installed, cleared by the next install; UNKNOWN = the installed set could "
+                    "not be enumerated)" % len(bad),
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "SCHEDULE NOT VERIFIED — the delegate exited %d and named NO job: it could not "
+                    "complete, so nothing about the launchd job set was measured (0 jobs above is an "
+                    "unanswered question, not a clean set)" % out.returncode,
+                    file=sys.stderr,
+                )
             return 1
         # ⛔ THE VERDICT MUST NOT CLAIM A MATCH OVER FILES NOTHING GRADED (#3826 review P2).
         # `install-launchd.sh --status` grades a FLAT `templates/launchd/*.plist` set and now DISCLOSES
