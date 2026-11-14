@@ -1066,7 +1066,19 @@ evidence_fetch() { # <kind> <id> -> tsv row; non-zero = unreadable
 # `[*[:space:]]`) is the widened anchor arm 1c already required, so a backticked or bulleted
 # declaration is still read.
 OC_NBSP=$'\xc2\xa0'
-OC_DECL_RE="(^|[^[:alnum:]])outcome[[:space:]${OC_NBSP}]*[*_[:space:]${OC_NBSP}]*([:]|[：])"
+# ⛔ ZERO-WIDTH SPACERS, A BACKTICKED LABEL, AND AN ENTITY COLON ARE READ TOO (agent-infra#3902
+# second review, P2 — MEASURED residual). A declaration written `Outcome<U+200B>:`,
+# `Outcome<U+FEFF>:` or `Outcome&#58;` was SKIPPED at the entry gate, so arm (1c) never ran while a
+# `verdict=clean` record could still be minted. `&#58;` is the sharp one: GitHub RENDERS it as `:`
+# in the comment a human reads, while the API's raw body carries the entity — the gate and the
+# reader disagree about whether a declaration exists. The backtick was already required by this
+# block's own words, "a declaration may be bolded, quoted, bulleted or wrapped and must still be
+# READ": `` `Outcome`: `` was ADMITTED before this line. All three shapes are unambiguous, so they
+# are CLOSED rather than declared residual — the cost is reading one more declaration shape, which
+# is the fail-closed direction.
+OC_ZWSP=$'\xe2\x80\x8b'
+OC_BOM=$'\xef\xbb\xbf'
+OC_DECL_RE="(^|[^[:alnum:]])outcome[[:space:]${OC_NBSP}${OC_ZWSP}${OC_BOM}]*[*_\`[:space:]${OC_NBSP}${OC_ZWSP}${OC_BOM}]*([:]|&#0*58;|[：])"
 
 tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
   LC_ALL=C awk '
@@ -1356,11 +1368,29 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # plausibly puts between a count and its noun is admitted here too.
     # Widening this can only DISABLE an escape (it sets `live_count=1`, which turns (a) off), so it is
     # the fail-closed direction: no line that vetoed before is admitted now.
-    grep -qiE "(^|[^[:alnum:]])${_OC_CNT}[[:space:].,:;_-]*(block(ing|ers?)|\(?p[01]\)?)" <<<"$line" && live_count=1
-    # (a) ZEROED / NEGATED, and ONLY with no live positive count on the line.
-    if [ "$live_count" -eq 0 ] && grep -qiE "$_OC_ZEROED" <<<"$line"; then
-      continue
-    fi
+    # ⛔ THE LEAD IS `[^0-9]`, NOT `[^[:alnum:]]` (agent-infra#3902 SECOND review, F1 — MEASURED
+    # REGRESSION introduced by this widening). A non-ALNUM lead made a SEVERITY-PREFIXED count
+    # invisible: in `P1 blocking` the `1` is preceded by `P`, so no lead matched, `live_count` stayed
+    # 0, and escape (a) went live on the line's own negated mention —
+    #   `Outcome: P1 blocking findings remain open; no blocking fix landed`
+    # VETOED at 57d19f3fa and ADMITTED at f48e6db60. `[^0-9]` reads that `1` (the `P` is not a digit)
+    # while still refusing to bite a digit out of a longer number. Widening the VOCABULARY is
+    # fail-closed (it sets `live_count=1`, turning (a) OFF); narrowing the LEAD was the opposite.
+    # ⛔ ESCAPE (a) DOES NOT RUN HERE — IT RUNS AFTER THE REMAINDER BELTS, below (agent-infra#3902
+    # SECOND review, F4 — MEASURED REGRESSION introduced by this widening). It used to `continue`
+    # before the belts, on the theory that `live_count = 0` means "no blocker is declared". That
+    # identity is FALSE: a totality, a collective, or a bare noun phrase declares a blocker with NO
+    # COUNT at all, so `live_count` was 0 on lines that plainly state a live blocker — and a zeroed
+    # negator anywhere on the line then escaped the whole arm:
+    #   `**Outcome: CLEAN — none of the blocking findings were fixed.**`             -> ADMITTED
+    #   `**Outcome: CLEAN — nothing was fixed and blocking findings remain open.**`   -> ADMITTED
+    #   `Outcome: blocking findings remain open; I looked for a fix and found none.`  -> ADMITTED
+    #   `Outcome: nothing blocking the merge was fixed; blocking findings remain`     -> ADMITTED
+    # all VETOED at 57d19f3fa. THE ORDERING IS THE FIX, not more vocabulary: an escape must be the
+    # LAST thing consulted so every belt gets its refusal first. Moving it later cannot change a
+    # verdict a belt already reaches — it is reached only when all of them found nothing. This is
+    # also the file's own rule: a negation may except the MENTION it negates, never the line.
+    grep -qiE "(^|[^0-9])${_OC_CNT}[[:space:].,:;_-]*(block(ing|ers?)|\(?p[01]\)?)" <<<"$line" && live_count=1
     # Everything below reads a LOWERCASED copy; the clause boundary is the first `;`.
     _clause="$(printf '%s' "${line%%;*}" | tr '[:upper:]' '[:lower:]')"
     # A NEGATED block mention is not a blocker for ANY arm below — the persistence BELT included
@@ -1463,6 +1493,17 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     if [ "${_live:-0}" -gt 1 ]; then
       OUTCOME_BLOCKING_LINE="$line"
       return 0
+    fi
+    # (a) ZEROED / NEGATED — the LAST escape consulted, AFTER every belt above (agent-infra#3902
+    # second review, F4). See the ordering note at `live_count`: running it first let a negated
+    # mention anywhere on the line except a blocker the line plainly declares, because
+    # `live_count = 0` does not mean "no blocker is declared" — a totality or a bare noun phrase
+    # writes one with no count. Reached only when NOT_RESOLVED / IN_PROGRESS / PERSIST / a second
+    # count / a severity remainder / a collective / a second live mention has all found nothing, so
+    # it can only ever except the mention it negates. Still gated on `live_count = 0`, so a line
+    # carrying a positive count is not escapable here at all.
+    if [ "$live_count" -eq 0 ] && grep -qiE "$_OC_ZEROED" <<<"$line"; then
+      continue
     fi
     # (b) AFFIRMATIVE TOTAL RESOLUTION — the only shape that escapes.
     if grep -qE "$_OC_TOTAL" <<<"$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"; then
