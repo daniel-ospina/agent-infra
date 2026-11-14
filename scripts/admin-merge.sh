@@ -765,7 +765,33 @@
 #                                         yet, or the run list cannot be read.
 #                                         0 disables the wait (the pre-#2090
 #                                         instant refusal) when neither of the
-#                                         two progress bounds below is set.
+#                                         two progress bounds below is set, or
+#                                        when ONESHOT is set (see below).
+#   ADMIN_MERGE_FIRST_CHECKS_ONESHOT     non-empty asks for "one observation, no
+#                                        waiting" WITHOUT touching the progress
+#                                        bounds. ⛔ IT IS HONOURED ONLY WHEN
+#                                        `ADMIN_MERGE_FIRST_CHECKS_WAIT` IS `0`:
+#                                        the seam ANDs the ask with the legacy
+#                                        window, because a non-zero window is the
+#                                        operator asking for a bounded wait, and a
+#                                        pass-through flag must not silently
+#                                        outrank it. With a non-zero window this
+#                                        knob is INERT — use the window knob, or
+#                                        `--any-workflow` to skip the lane.
+#                                        SHIPPED IN PRODUCTION: `atomic-land.sh
+#                                        --no-wait` carries it, which is why it is
+#                                        not listed under "tests only" below.
+#                                        `ADMIN_MERGE_FIRST_CHECKS_WAIT=0`
+#                                        alone cannot do that: the 0 seam is
+#                                        conditional on STALL/CEILING being unset,
+#                                        and CEILING is a TERM of the derived
+#                                        whole-attempt bound (`rail_deadline_default`)
+#                                        that `rail_attempt_start` ties to
+#                                        ADMIN_MERGE_LOCK_TTL — so a caller that
+#                                        cleared the bounds to get one observation
+#                                        would RAISE the reachable deadline (600 to
+#                                        18064) and be refused with exit 2. This seam
+#                                        carries the intent, not the arithmetic (#2465).
 #   ADMIN_MERGE_FIRST_CHECKS_STALL       the STALL period (seconds, default 8760 =
 #                                         2 × the longest MEASURED single step,
 #                                         4380s): the wait gives up only when
@@ -5150,6 +5176,19 @@ FIRST_CHECKS_STALL_BOUND=0
 FIRST_CHECKS_CEILING_BOUND=0
 FIRST_CHECKS_MISSING=0
 FIRST_CHECKS_MISSING_STREAK=0
+# ⛔ THE UNREADABLE-ATTRIBUTABLE SECONDS, kept apart from `FIRST_CHECKS_MISSING` (review
+# round 6, P2). `missing` sums the `unobservable` time from BOTH of that state's producers,
+# so quoting it as "the Jobs API did not answer for Ns" charges the cap's seconds — where
+# the read was deliberately NOT ATTEMPTED — to a failure that never happened.
+FIRST_CHECKS_MISSING_UNREADABLE=0
+FIRST_CHECKS_STREAK_UNREADABLE=0
+# ⛔ WHY `signal_ok` WAS CLEARED, not just that it was (review round 5, P2). The
+# `unobservable` state has TWO producers: a Jobs read that FAILED, and the
+# `> FIRST_CHECKS_JOBS_MAX` cap below, where the read is DELIBERATELY NOT ATTEMPTED. A
+# refusal that derives its cause from the STATE therefore guesses, and one of the two
+# guesses is false. This carries the measured ground to the refusal: `cap` | `unreadable`
+# | empty (the surface was read).
+FIRST_CHECKS_SIGNAL_REASON=""
 
 # first_checks_digest <jobs-json-file>... — ONE python pass over the pending runs'
 # job listings, emitting ONE line per input, in argv order:
@@ -5384,7 +5423,7 @@ PY
 # `$SECONDS` deltas, not sleep counters, because a counter is not a clock (the
 # #1395 lesson: a rail that outlived its own reported bound).
 wait_for_first_checks() {
-  local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
+  local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 missing_unreadable=0 streak_unreadable=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
   local now last_clock dt fp summary max_step digest jobs cr_slug scan_rc scan_out
   local max_step_run fp_run summary_run read_ok n_lines idx cached
   local stall_bound ceiling_bound signal_ok poll_step poll_max backoff_step remaining adv wait_word expired
@@ -5413,6 +5452,8 @@ wait_for_first_checks() {
   FIRST_CHECKS_REDERIVED=""; FIRST_CHECKS_HEAD_CHECKS=""
   FIRST_CHECKS_STATE=""; FIRST_CHECKS_LAST_CHANGE=""; FIRST_CHECKS_TRANSITIONS=0
   FIRST_CHECKS_FINGERPRINT=""; FIRST_CHECKS_MISSING=0; FIRST_CHECKS_MISSING_STREAK=0
+  FIRST_CHECKS_MISSING_UNREADABLE=0; FIRST_CHECKS_STREAK_UNREADABLE=0
+  FIRST_CHECKS_SIGNAL_REASON=""
   FIRST_CHECKS_UNRESOLVED=""; FIRST_CHECKS_UNRESOLVED_UNREADABLE=0
   stall_bound="$FIRST_CHECKS_STALL"
   ceiling_bound="$FIRST_CHECKS_CEILING"
@@ -5434,10 +5475,22 @@ wait_for_first_checks() {
   # nobody asked for. An explicit STALL/CEILING re-enables it (that is how the
   # suite drives the new arms in seconds), which is why the test for the seam is
   # "0 and nothing else set", not "0".
+  # ⛔ AND ONE-SHOT NEEDS ITS OWN SEAM (#2465, review round 2 P2). The condition
+  # here is on the BOUND KNOBS, and `ADMIN_MERGE_FIRST_CHECKS_CEILING` is ALSO a term
+  # of the derived whole-attempt bound (`rail_deadline_default`) that
+  # `rail_attempt_start` ties to `ADMIN_MERGE_LOCK_TTL` (the TTL must EXCEED it, or
+  # exit 2). So a caller that bought "one observation" by CLEARING the bounds would
+  # silently RAISE the reachable deadline (CEILING 600 -> 18064 takes the bound from
+  # 3990s to 21454s) and get REFUSED — a legal land invocation turned into exit 2 by
+  # a flag whose whole job is to stop waiting. `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` asks
+  # for the one-shot behaviour WITHOUT touching the bounds, so the deadline and the
+  # lease relation stay exactly what the operator's own knobs imply. The explicit
+  # STALL/CEILING re-enable path is preserved unchanged.
   local wait_enabled=1
   if [ "$((10#$FIRST_CHECKS_WAIT))" -eq 0 ] \
-     && [ -z "${ADMIN_MERGE_FIRST_CHECKS_STALL:-}" ] \
-     && [ -z "${ADMIN_MERGE_FIRST_CHECKS_CEILING:-}" ]; then
+     && { [ -n "${ADMIN_MERGE_FIRST_CHECKS_ONESHOT:-}" ] \
+          || { [ -z "${ADMIN_MERGE_FIRST_CHECKS_STALL:-}" ] \
+               && [ -z "${ADMIN_MERGE_FIRST_CHECKS_CEILING:-}" ]; }; }; then
     wait_enabled=0
   fi
   local args=()
@@ -5593,7 +5646,7 @@ wait_for_first_checks() {
         # (fail-closed, as before) and the signal is marked missing, so the state
         # below can never fall through to `pending == 0` and CLEAR the wait on an
         # unreadable surface.
-        [ "$read_ok" -eq 1 ] || pending="${#pending_ids[@]}"
+        [ "$read_ok" -eq 1 ] || { pending="${#pending_ids[@]}"; FIRST_CHECKS_SIGNAL_REASON="unreadable"; }
         if [ "$read_ok" -eq 1 ]; then
           # ONE parser call for every run actually read this poll; each line is
           # filed against its OWN run id, so the skipped (cached) runs keep the
@@ -5614,7 +5667,7 @@ wait_for_first_checks() {
             # pending and marks the signal missing, exactly as the previous
             # whole-digest length check did.
             line="$(cat "$fcdir/line.$id" 2>/dev/null)"
-            if [ -z "$line" ]; then signal_ok=0; pending=$((pending + 1)); continue; fi
+            if [ -z "$line" ]; then signal_ok=0; FIRST_CHECKS_SIGNAL_REASON="unreadable"; pending=$((pending + 1)); continue; fi
             IFS=$'\t' read -r jobs max_step_run fp_run summary_run <<< "$line"
             jobs="${jobs:-unknown}"
             max_step_run="${max_step_run:-0}"
@@ -5623,7 +5676,7 @@ wait_for_first_checks() {
             # never expanded it, so it must not hold this wait. An UNREADABLE
             # count is not zero — it stays pending, fail-closed.
             [ "$jobs" = "0" ] && continue
-            [ "$jobs" = "unknown" ] && signal_ok=0
+            [ "$jobs" = "unknown" ] && { signal_ok=0; FIRST_CHECKS_SIGNAL_REASON="unreadable"; }
             pending=$((pending + 1))
             [ "$max_step_run" -gt "$max_step" ] && max_step="$max_step_run"
             [ -n "$fp" ] && fp="$fp || "
@@ -5635,6 +5688,7 @@ wait_for_first_checks() {
       elif [ "${#pending_ids[@]}" -gt "$FIRST_CHECKS_JOBS_MAX" ]; then
         pending="${#pending_ids[@]}"
         signal_ok=0
+        FIRST_CHECKS_SIGNAL_REASON="cap"
         summary="${#pending_ids[@]} run(s) still pending — more than the ${FIRST_CHECKS_JOBS_MAX} this wait observes"
       fi
     fi
@@ -5654,6 +5708,11 @@ wait_for_first_checks() {
       FIRST_CHECKS_STATE="unreadable"
       [ -n "$obs" ] || obs="the head's run list could not be read (gh error)"
       missing=$((missing + dt)); missing_streak=$((missing_streak + dt))
+      # ⛔ THE JOBS SURFACE WAS NEVER CONSULTED THIS POLL (review round 7, P2). The
+      # unreadable-UNINTERRUPTED run must break here too, or "…s consecutively" spans a
+      # poll on which the Jobs API was never asked — an over-claim about the one word
+      # that figure exists to carry.
+      streak_unreadable=0
     elif [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
       # A TERMINAL LISTING WITH AT LEAST ONE RUN CLEARS THE WAIT.
       FIRST_CHECKS_WAITED="$waited"
@@ -5661,6 +5720,10 @@ wait_for_first_checks() {
     elif [ "$total" -eq 0 ]; then
       FIRST_CHECKS_STATE="never-started"
       missing=$((missing + dt)); missing_streak=$((missing_streak + dt))
+      # ⛔ NOTHING HAS ATTACHED YET, SO NOTHING WAS UNREADABLE (review round 7, P2) —
+      # same reason as the run-list arm above: the unreadable run cannot span a poll
+      # where there was no Jobs read to fail.
+      streak_unreadable=0
     elif [ "$signal_ok" -ne 1 ]; then
       # ⛔ A MISSING SIGNAL IS NOT A STALL. The stall clock does NOT advance: the
       # absence of an observation is the absence of evidence, and reading it as
@@ -5669,9 +5732,23 @@ wait_for_first_checks() {
       # hold the lane — the same bound this wait had before, no worse.
       FIRST_CHECKS_STATE="unobservable"
       missing=$((missing + dt)); missing_streak=$((missing_streak + dt))
+      # ⛔ ONLY A FAILED READ MAY BE QUOTED AS "THE JOBS API DID NOT ANSWER" (review
+      # round 6, P2). `signal_ok` is ALSO cleared by the >JOBS_MAX cap below, where the
+      # read was DELIBERATELY NOT ATTEMPTED — so `missing` sums two different grounds and
+      # a refusal quoting it attributes cap seconds to a read failure that never happened.
+      # The reason is written by the branch that fired THIS poll (never by an earlier
+      # one), so it names this poll's ground exactly. A cap poll also BREAKS the
+      # uninterrupted-unreadable run, so the consecutive figure cannot span it.
+      if [ "${FIRST_CHECKS_SIGNAL_REASON:-}" = "unreadable" ]; then
+        missing_unreadable=$((missing_unreadable + dt))
+        streak_unreadable=$((streak_unreadable + dt))
+      else
+        streak_unreadable=0
+      fi
     else
       FIRST_CHECKS_STATE="still-running"
       missing_streak=0
+      streak_unreadable=0
       # PROMOTE the stall period from what these runs have actually shown: half of
       # a step that already took longer than the derived stall period would be a
       # false stall on a run that has demonstrably run that long.
@@ -5694,6 +5771,8 @@ wait_for_first_checks() {
     FIRST_CHECKS_QUIET="$quiet"
     FIRST_CHECKS_MISSING="$missing"
     FIRST_CHECKS_MISSING_STREAK="$missing_streak"
+    FIRST_CHECKS_MISSING_UNREADABLE="$missing_unreadable"
+    FIRST_CHECKS_STREAK_UNREADABLE="$streak_unreadable"
     FIRST_CHECKS_OBSERVED="${obs:-no run has appeared for this head yet}"
 
     # ── THE VERDICT ───────────────────────────────────────────────────────
@@ -5800,7 +5879,19 @@ wait_for_first_checks() {
       unreadable)
         info "admin-merge: … FIRST-CHECKS wait: the head's run list could not be read (${waited}s of the ${FIRST_CHECKS_WAIT}s window) $wait_word unreachable is not empty." ;;
       unobservable)
-        info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${missing_streak}s consecutively) $wait_word This wait does NOT call it a stall: an unread instrument is not a stalled run." ;;
+        # ⛔ THE REPORT MAY NOT ASSERT A READ THIS POLL DID NOT TAKE (review round 8, P2). The
+        # `unobservable` state has TWO producers — a Jobs read that FAILED, and the
+        # `> FIRST_CHECKS_JOBS_MAX` cap, where the read is DELIBERATELY NOT ATTEMPTED. `missing`
+        # sums dt from BOTH, so quoting it here told the operator the Jobs API had not answered
+        # for seconds that were spent declining to ask — and printed that claim directly above a
+        # refusal that says the read was not attempted. The refusal was keyed on the
+        # unreadable-only counters (R9/R10); this line must use the same attribution, or the
+        # assertion the PR exists to remove survives on the more frequently printed surface.
+        if [ "$FIRST_CHECKS_SIGNAL_REASON" = cap ]; then
+          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress — MORE than the ${FIRST_CHECKS_JOBS_MAX} this wait observes, so PROGRESS was deliberately NOT read (${waited}s of the ${FIRST_CHECKS_WAIT}s fallback window) $wait_word That is a WIDTH cap, not an unreadability finding: no duration is quoted for an observation this wait declined to take."
+        else
+          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing_unreadable}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${streak_unreadable}s consecutively) $wait_word This wait does NOT call it a stall: an unread instrument is not a stalled run."
+        fi ;;
       *)
         if [ "$FIRST_CHECKS_TRANSITIONS" -eq 0 ]; then
           info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, no change observed yet (${waited}s of the ${ceiling_bound}s ceiling; stall bound ${stall_bound}s) $wait_word first observation: $summary"
@@ -5976,19 +6067,125 @@ block_on_first_checks() {
       say_err "   so nothing was compared, no evidence was posted and nothing was merged."
       say_err "   Next: check gh auth/--repo/network, then re-run the rail." ;;
     *)
-      # still-running, with the Jobs surface unreadable for the legacy window.
+      # ⛔ TWO DIFFERENT STATES SHARE THIS ARM, AND THEY MUST NOT SHARE A VERDICT
+      # (review round 3, P2). `still-running` with a READABLE Jobs surface (missing=0)
+      # means "the lane had not finished when this observation was taken";
+      # `unobservable` — or `still-running` whose Jobs never answered — means "slow and
+      # wedged could not be told apart". The old text asserted the SECOND for BOTH, so the
+      # ONE-SHOT path — which takes exactly one observation of a readable, still-pending
+      # surface — refused with "the Jobs API did not answer for 0s in total, 0s
+      # consecutively", a sentence that refutes itself, on the very flag (`--no-wait`)
+      # whose job is to make the rail readable. Same defect class as §0b's "nothing may
+      # claim a measurement the code did not take".
       say_err "admin-merge: ✗ BLOCK — the FIRST-CHECKS wait expired after ${FIRST_CHECKS_WAITED}s (window ${FIRST_CHECKS_WAIT}s) — no classification attempted."
       say_err "   waited for: the lane's runs on head $head to APPEAR and reach status=completed"
       say_err "   last observed: ${FIRST_CHECKS_OBSERVED:-nothing readable}"
-      say_err "   what was missing: the lane's checks were still queued/in progress when the window"
-      say_err "   closed, and their per-job/per-step PROGRESS could not be read (the Jobs API did not"
-      say_err "   answer for ${FIRST_CHECKS_MISSING}s in total, ${FIRST_CHECKS_MISSING_STREAK}s consecutively), so slow and wedged could not be told apart."
-      say_err "   A running job is not a failure, and this is NOT a stall claim: an unread instrument"
-      say_err "   is not a stalled run."
-      say_err "   An unfinished (or absent) lane yields an EMPTY failing set, which proves nothing,"
-      say_err "   so nothing was compared, no evidence was posted and nothing was merged."
-      say_err "   Next: re-run the rail once those checks complete (its progress signal is re-read then),"
-      say_err "   or raise ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)." ;;
+      # ⛔ AND THE SPLIT IS KEYED ON THE STATE, NEVER ON THE CLOCK (review round 4, P2).
+      # `FIRST_CHECKS_MISSING` advances by `dt` in WHOLE seconds (`$SECONDS`), so a poll
+      # whose work fits inside one second leaves it at 0 while `FIRST_CHECKS_STATE` is
+      # still `unobservable` — and branching on the clock then printed "NOTHING was
+      # unreadable" about a Jobs read that FAILED. Reachable exactly where this PR lives:
+      # the ONE-SHOT path returns `OUTCOME=$FIRST_CHECKS_STATE` after one sub-second poll
+      # (above), and the plain 0-window path expires at `missing(0) -ge WAIT(0)`.
+      # The STATE is the measurement; the clock only decides whether a DURATION may be
+      # quoted — and a measured 0s is not one.
+      if [ "${FIRST_CHECKS_STATE:-}" != "still-running" ]; then
+        say_err "   what was missing: the lane's checks were still queued/in progress when the window"
+        # ⛔ `unobservable` HAS TWO PRODUCERS, SO THE STATE IS NOT THE CAUSE (review
+        # round 5, P2). `signal_ok` is cleared by a FAILED Jobs read AND by the
+        # >FIRST_CHECKS_JOBS_MAX cap, where the read is deliberately NOT ATTEMPTED —
+        # the surface is perfectly readable there and the cap's own explanation used to
+        # sit in `$summary`, which this path never printed. The ground is recorded where
+        # `signal_ok` is cleared, not re-guessed here.
+        if [ "${FIRST_CHECKS_SIGNAL_REASON:-}" = "cap" ]; then
+          say_err "   closed, and MORE THAN ${FIRST_CHECKS_JOBS_MAX} run(s) were pending at once, so their per-job/"
+          say_err "   per-step PROGRESS was deliberately NOT read on the LAST observation: at that width a"
+          say_err "   partially observed surface can report a false 'no change', which would be a false stall."
+          # ⛔ A WIDTH CAP IS NOT A READABILITY FINDING (review round 8, P2). The cap is a
+          # COUNT condition (`#pending_ids > FIRST_CHECKS_JOBS_MAX`), so on that poll the
+          # Jobs endpoint was never ASKED — and asserting "the surface was READABLE" here
+          # was a measurement the code did not take, false in exactly the outage case that
+          # matters (9 pending runs during a 403 storm reproduced it). State the WIDTH and
+          # decline the read; claim nothing either way about the endpoint's health.
+          say_err "   That is a WIDTH cap, not an unreadability finding — this wait declined to poll it, so"
+          say_err "   no duration is quoted for that observation."
+          # ⛔ A CAP POLL IS THE LAST OBSERVATION, NOT THE ONLY ONE (review round 7, P2).
+          # The cap branch used to be tested first and never consulted the unreadable
+          # seconds, so a MIXED wait that happened to END on a cap poll denied the time
+          # it had really spent blind — the round-5 defect ("whichever branch fired last
+          # decides what the operator learns") surviving in the other ordering. The
+          # number is in hand, so state it.
+          # ⛔ AND DO NOT QUOTE THE STREAK HERE (review round 8, P2): reaching this branch
+          # means the LAST poll was a cap, and a cap poll ZEROES the unreadable streak —
+          # so the figure is structurally 0 and printed beside a non-zero total, which
+          # reads as self-refutation. The total is real; the consecutive figure cannot be
+          # here, so only the total is claimed.
+          if [ "${FIRST_CHECKS_MISSING_UNREADABLE:-0}" -gt 0 ]; then
+            say_err "   ⛔ Separately, ${FIRST_CHECKS_MISSING_UNREADABLE}s of this wait DID go by with the Jobs read"
+            say_err "   failing, so the surface was not observable for that part of the window either."
+          fi
+          say_err "   Either way slow and wedged could not be told apart."
+        elif [ "${FIRST_CHECKS_MISSING_UNREADABLE:-0}" -gt 0 ]; then
+          # ⛔ THE QUOTED SECONDS ARE THE UNREADABLE-ATTRIBUTABLE ONES, never `missing`
+          # (review round 6, P2). A wait that spent some polls over the >JOBS_MAX cap and
+          # others with a genuinely failed read has a `missing` larger than the time the
+          # Jobs API actually failed to answer for; quoting it here named a ground the
+          # numbers did not come from.
+          say_err "   closed, and their per-job/per-step PROGRESS could not be read (the Jobs API did not"
+          say_err "   answer for ${FIRST_CHECKS_MISSING_UNREADABLE}s in total, ${FIRST_CHECKS_STREAK_UNREADABLE}s consecutively), so slow and wedged could not be told apart."
+        elif [ "${FIRST_CHECKS_SIGNAL_REASON:-}" = "unreadable" ]; then
+          say_err "   closed, and their per-job/per-step PROGRESS could not be read: the Jobs read FAILED"
+          say_err "   and no elapsed time was measured against it (this observation fitted inside one"
+          say_err "   second), so no duration is claimed and slow and wedged could not be told apart."
+        else
+          # ⛔ A CATCH-ALL MUST NOT ASSERT A MEASUREMENT IT DID NOT TAKE (review round 6,
+          # P2). This arm is reached only when the recorded reason is neither `cap` nor
+          # `unreadable` — i.e. a producer that recorded no ground (or one added later).
+          # The old text claimed "the Jobs read FAILED" here, which is precisely the
+          # claim-about-an-unmeasured-ground this whole block exists to stop; the same
+          # diff refuses to claim a run either way at the #10047 site for this reason.
+          say_err "   closed, and their per-job/per-step PROGRESS could not be read, and the GROUND was"
+          say_err "   not one this wait measured: no Jobs read is claimed either way, so no duration is"
+          say_err "   quoted and slow and wedged could not be told apart."
+        fi
+        say_err "   A running job is not a failure, and this is NOT a stall claim: an unread instrument"
+        say_err "   is not a stalled run."
+        say_err "   Next: re-run the rail once those checks complete (its progress signal is re-read then),"
+        say_err "   or raise ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)."
+      else
+        # THE SURFACE WAS READ **NOW**, and it is READ — so "NOTHING was unreadable" is
+        # TRUE of the whole wait here, and no `missing` figure is quoted.
+        # ⛔ THE `MISSING_UNREADABLE` FIGURE CANNOT BE NON-ZERO IN THIS BRANCH, WHICH IS
+        # WHY THERE IS NO BRANCH FOR IT (review round 9, P2). Round 5 added one on the
+        # premise "a wait that recovered from an `unobservable` poll keeps its accumulated
+        # `missing`" — right in general, but such a wait cannot reach this arm:
+        #   · `OUTCOME=still-running` is assigned in exactly ONE place, the ONE-SHOT return
+        #     (`:5782`), which returns immediately after the first verdict-reaching poll;
+        #   · a multi-poll wait that was ever `unobservable` and later reads fine expires as
+        #     `stalled` or `ceiling`, and each of those has its OWN case arm above;
+        #   · the only poll that skips the verdict is the re-derive `continue`, which
+        #     requires `total == 0` — no Jobs read, so the counter is untouched.
+        # So reaching this arm implies the LAST poll had `signal_ok=1`, and with a single
+        # verdict-reaching poll there is no earlier `unobservable` one to have advanced the
+        # counter. A defensive branch here would be dead code that READS like coverage —
+        # measured by #2465's round-9 review, which reproduced exactly that. If a future
+        # change makes a multi-poll `still-running` outcome reachable, this invariant is
+        # what that change must revisit.
+        say_err "   what was missing: the lane's checks were still queued/in progress and had not reached"
+        say_err "   status=completed when this observation was taken. NOTHING was unreadable, so no"
+        say_err "   slow-vs-wedged claim is made here."
+        say_err "   A running job is not a failure, and this is NOT a stall claim."
+        say_err "   An unfinished (or absent) lane yields an EMPTY failing set, which proves nothing,"
+        say_err "   so nothing was compared, no evidence was posted and nothing was merged."
+        if [ -n "${ADMIN_MERGE_FIRST_CHECKS_ONESHOT:-}" ]; then
+          say_err "   why only ONE observation: ADMIN_MERGE_FIRST_CHECKS_ONESHOT is set (atomic-land"
+          say_err "   --no-wait carries it), so this wait was asked NOT to wait."
+          say_err "   Next: re-run WITHOUT --no-wait once those checks complete."
+        else
+          say_err "   Next: re-run the rail once those checks complete (its progress signal is re-read then),"
+          say_err "   or raise ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)."
+        fi
+      fi ;;
   esac
 }
 
@@ -6505,19 +6702,104 @@ lane_applicable() {
   return 0
 }
 
-# lane_has_no_head_run <head> — TRUE (0) only when the watched lane PROVABLY has
-# NO run for <head>. This is what keeps the #1614 fallback a DEAD-END repair
-# rather than a trigger-shape repair: a lane that matched no trigger path but DID
-# run for the head is not a dead end (precondition 1 is satisfiable), and widening
-# there would be gratuitous. An UNREADABLE listing is NOT "no run" — fail closed,
-# no widening.
-lane_has_no_head_run() {
+# lane_no_pr_trigger <reason> — TRUE (0) only when the MEASURED applicability
+# reason is the STRUCTURAL class: the lane's own `on:` block declares neither
+# `pull_request` nor `pull_request_target`, so no push to a PR head can START it (#2465).
+#
+# ⛔ THIS CLASS DOES *NOT* SKIP THE RUN PROBE — DO NOT REINTRODUCE THAT (#1614).
+# A first cut of #2465 did: it treated "structural" as "the probe cannot decide
+# anything", dropped the filter unconditionally, and thereby reversed the RECORDED
+# #1614 dead-end gate (`f2e84b617` / PR #1619) as a side effect — a `on: push` lane
+# is a STRUCTURAL lane for this classification, yet it DOES run on the PR head's own
+# commit, and `tests/admin-merge/run.sh` arm (e) pins that such a lane keeps its
+# filter and its name in the certificate. Widening there is how "every trigger-split
+# repo silently becomes `--any-workflow`".
+#
+# WHAT THE CLASS DOES CHANGE is the policy on ONE probe answer, `unreadable`:
+#   * the STRUCTURAL class widens on it. No run of this lane can be STARTED by this
+#     PR, so the filtered wait is INERT — it can only ever clear on a run that cannot
+#     appear — and #2465's measured 3900 s burn was caused by exactly ONE failed
+#     `gh run list` (§0b runs the probe once), not by a probe that answered "has a
+#     run". Waiting longer cannot outlast a failed read.
+#   * every other class keeps the filter on it (fail closed): there a run CAN appear,
+#     so an unread answer is not an exemption.
+# The merge decision is NOT loosened either way: §4.5 grades the evaluated tree across
+# EVERY workflow and app, exactly as it does for `--any-workflow` and for the
+# FIRST-CHECKS wait's own #2862 re-derive, whose fixture pins that the dropped filter
+# reaches the SAME verdict as the operator's proven-safe escape.
+lane_no_pr_trigger() {
+  case "${1:-}" in
+    'lane-applicable: no-pr-trigger'*) return 0 ;;
+  esac
+  return 1
+}
+
+# lane_own_run_can_attach <reason> — TRUE (0) when the MEASURED applicability reason's
+# `(declared triggers: …)` clause names a trigger that can start a run OF THIS WORKFLOW
+# on an arbitrary branch tip, i.e. a run that can BE this head's run while the wait runs:
+#
+#   push                a push whose tip is $head runs it on $head
+#   workflow_dispatch   `gh workflow run <wf> --ref <branch>` runs it on that branch tip
+#
+# `workflow_call` does NOT count: a reusable workflow's checks attach under the CALLER's
+# workflow name (#1413), so filtering by the lane's OWN name can never match — that is
+# #2465's `python-ci.yml` case, and it is the one that MUST keep widening. `schedule`
+# does NOT count either: it fires on the default branch, never on a PR head.
+#
+# ⛔ AN ABSENT / UNPARSEABLE CLAUSE IS "CAN ATTACH" (returns 0, the fail-closed answer).
+# Widening is the LOOSENING direction, so an unknown trigger shape must keep the filter
+# and let §1b refuse. The other default would let a producer-side change silently
+# re-open the same fail-open (#2465 review P1) with every arm still green.
+#
+# The clause is produced by scripts/ci-workflow-pr-evaluable.sh:829-832 and is already
+# present in LANE_APPLICABILITY_REASON, so this costs no extra `gh` call.
+lane_own_run_can_attach() {
+  local reason="${1:-}" triggers="" list=""
+  case "$reason" in
+    *'(declared triggers:'*')'*)
+      triggers="${reason##*'(declared triggers:'}"
+      triggers="${triggers%%)*}"
+      ;;
+    *) return 0 ;;
+  esac
+  list=",$(printf '%s' "$triggers" | tr -d '[:space:]'),"
+  case "$list" in
+    *,push,*|*,workflow_dispatch,*) return 0 ;;
+  esac
+  return 1
+}
+
+# lane_head_run_state <head> — MEASURE whether the watched lane has a run for
+# <head>, into the THREE-valued global LANE_HEAD_RUN_STATE:
+#
+#   has-run     a run of `$WORKFLOW` is attached to <head>  → NOT a dead end
+#   none        the listing was read and is EMPTY           → provably no run
+#   unreadable  the `gh run list` read FAILED               → NOT "no run"
+#
+# ⛔ THREE STATES, NOT TWO (#2465 review). The old `lane_has_no_head_run` boolean
+# collapsed `unreadable` into `has-run`, so no caller could tell "we measured a run"
+# from "we could not measure anything" — and "we could not measure anything" is the
+# state that has to be resolved differently per class. `has-run` is the #1614 answer
+# (a lane that DID run for the head is not a dead end, precondition 1 is satisfiable,
+# and widening would be gratuitous); `none` is the dead end; `unreadable` is neither,
+# and §0b's policy for it is class-dependent — see `lane_no_pr_trigger`.
+#
+# The listing is FILTERED by `--workflow "$WORKFLOW"` on purpose: that is the very
+# predicate the FIRST-CHECKS wait applies, so "has a run" means "the filtered wait
+# can clear", which is the only reading under which keeping the filter is honest.
+lane_head_run_state() {
   local head="$1" args=() out rc=0
+  # UNREADABLE until proven otherwise: every early return leaves the fail-safe.
+  LANE_HEAD_RUN_STATE="unreadable"
   [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
   out="$($GH run list --commit "$head" --limit 1 --workflow "$WORKFLOW" \
            ${args[@]+"${args[@]}"} --json databaseId --jq '.[].databaseId' 2>/dev/null)" || rc=$?
-  [ "$rc" -eq 0 ] || return 1
-  [ -z "$out" ] || return 1
+  [ "$rc" -eq 0 ] || return 0
+  if [ -z "$out" ]; then
+    LANE_HEAD_RUN_STATE="none"
+  else
+    LANE_HEAD_RUN_STATE="has-run"
+  fi
   return 0
 }
 
@@ -9824,13 +10106,68 @@ main() {
     lane_applicable ".github/workflows/$WORKFLOW" "$head"
     case "$LANE_APPLICABILITY" in
       inapplicable)
-        # ⛔ THE FALLBACK IS FOR THE DEAD END, NOT FOR THE TRIGGER SHAPE. An
-        # inapplicable lane only DEAD-ENDS the rail when it has NO run for this
-        # head (that is what makes precondition 1 unsatisfiable). A lane that
-        # matched no trigger path but DID run for the head is not a dead end, and
-        # widening there would be gratuitous — so the probe decides, and an
-        # UNREADABLE probe fails closed (no widening).
-        if lane_has_no_head_run "$head"; then
+        # ⛔ THE FALLBACK IS FOR THE DEAD END, NOT FOR THE TRIGGER SHAPE — AND THE RUN
+        # PROBE IS STILL WHAT DECIDES IT (#1614, a RECORDED decision). An inapplicable
+        # lane only DEAD-ENDS the rail when it has NO run for this head (that is what
+        # makes precondition 1 unsatisfiable). A lane that matched no trigger path but
+        # DID run for the head is not a dead end, and widening there would be gratuitous
+        # — the gate that keeps a trigger-split repo from silently becoming
+        # `--any-workflow` (pinned by tests/admin-merge/run.sh arm (e), `f2e84b617` /
+        # PR #1619). So the probe is consulted for EVERY INAPPLICABLE class, and its
+        # THREE-valued answer decides:
+        #
+        #   has-run     → NO widening, and the lane keeps its name in the certificate.
+        #                 This holds for the STRUCTURAL class too: a `on: push` lane is
+        #                 STRUCTURAL and it DOES run on the PR head's own commit, so the
+        #                 filtered wait CAN clear. (A first cut of #2465 skipped the probe
+        #                 here and reversed #1614 as a side effect — do not reintroduce it.)
+        #   none        → widen, loudly. Waiting cannot create a run that does not exist.
+        #   unreadable  → class- AND TRIGGER-dependent, because the question that decides
+        #                 is not "does it have a PR trigger" but "can a run OF THIS
+        #                 WORKFLOW still appear on THIS head while the wait runs":
+        #                 * STRUCTURAL and the lane declares neither `push` nor
+        #                   `workflow_dispatch` — no run of this workflow can be started
+        #                   on a branch tip, so the filtered wait is INERT and one failed
+        #                   `gh run list` is not something waiting can outlast. Widen,
+        #                   loudly. THIS is #2465's measured burn (3900 s decided by one
+        #                   unread REST response); its `python-ci.yml` is exactly this
+        #                   shape (`workflow_call` only — its checks attach under a
+        #                   CALLER's name, so filtering by its OWN name can never match).
+        #                 * STRUCTURAL WITH `push` / `workflow_dispatch` — such a run CAN
+        #                   attach to this head while the wait runs (a push whose tip is
+        #                   $head, a `gh workflow run --ref`, or a rerun of a CANCELLED
+        #                   run — this repo's own cancel-in-progress produces exactly
+        #                   that), and it carries THIS workflow's name, so the filtered
+        #                   wait is still a SIGNAL. An unread answer is NOT an exemption:
+        #                   KEEP the filter and let §1b refuse — which is what
+        #                   `origin/main` did for EVERY class (#2465 review P1: widening
+        #                   here turned one transient read failure into a merge past the
+        #                   watched lane's fresh-PR race).
+        #                 * every other class — a run can appear while the wait runs: KEEP
+        #                   the filter and let §1b refuse exactly as before (fail closed).
+        # The lane is classified ONCE, here, and the FIRST-CHECKS wait consumes THAT
+        # decision (via ANY_WORKFLOW) instead of re-deriving it per poll.
+        local lane_dead_end=0 lane_structural=0 lane_probe_state="" lane_kept_why=""
+        local LANE_HEAD_RUN_STATE="unreadable"
+        if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then lane_structural=1; fi
+        lane_head_run_state "$head"
+        lane_probe_state="$LANE_HEAD_RUN_STATE"
+        case "$lane_probe_state" in
+          has-run) lane_dead_end=0 ;;
+          none)    lane_dead_end=1 ;;
+          *)
+            # `unreadable` is NOT "no run". Widen only when the lane's own run can never
+            # attach to a PR head — see the block comment above and
+            # `lane_own_run_can_attach`. That helper answers TRUE for an absent or
+            # unparseable trigger list, so an unknown trigger shape keeps the filter.
+            if [ "$lane_structural" -eq 1 ] && ! lane_own_run_can_attach "$LANE_APPLICABILITY_REASON"; then
+              lane_dead_end=1
+            else
+              lane_dead_end=0
+            fi
+            ;;
+        esac
+        if [ "$lane_dead_end" -eq 1 ]; then
           LANE_FALLBACK_FROM="$WORKFLOW"
           # ⛔ NEVER embed the fallback text in a `${VAR:-word}` default here. An
           # apostrophe inside the `word` of a parameter expansion opens a QUOTE that
@@ -9843,9 +10180,54 @@ main() {
           say_err "admin-merge: ⚠️  LANE INAPPLICABLE — falling back to the evaluated surface (this is NOT a silent widening)."
           say_err "   watched lane: '$WORKFLOW'  (workflow file: .github/workflows/$WORKFLOW at head $head)"
           say_err "   $lane_reason"
-          say_err "   Why: the lane's own 'on:' block cannot fire for THIS PR's changed set, and the"
-          say_err "   lane has NO run for head $head — waiting for CI cannot clear it. The lane is"
-          say_err "   INAPPLICABLE here, not missing."
+          # Name WHICH dead-end class fired, and on WHICH probe answer, so a reader can
+          # tell "this lane cannot run here" from "this lane has not run here yet" from
+          # "we could not read the answer" (#2465 — the first two were indistinguishable
+          # at the operator's terminal, and the cost was 65 minutes).
+          # ⛔ NOTHING BELOW MAY CLAIM A MEASUREMENT THE CODE DID NOT TAKE (review P2):
+          # the STRUCTURAL class widens on MORE THAN ONE ground and only ONE of them
+          # measured "no run", so the run clause is derived from the probe state ONCE,
+          # and an unrecognised state claims nothing (a later state added to
+          # `lane_head_run_state` must not inherit "measured" by falling through).
+          local lane_run_clause=""
+          if [ "$lane_probe_state" = none ]; then
+            lane_run_clause="the lane has NO run for head $head (MEASURED: an empty listing, not a read failure) — waiting for CI cannot clear it"
+          elif [ "$lane_probe_state" = unreadable ]; then
+            lane_run_clause="the run probe's single 'gh run list' read FAILED for head $head, so no run can be CLAIMED either way (an unreadable probe is not 'no run')"
+          else
+            lane_run_clause="the run probe's answer for head $head did not resolve ('$lane_probe_state'), so no run is CLAIMED either way"
+          fi
+          if [ "$lane_structural" -eq 1 ]; then
+            say_err "   dead-end class: STRUCTURAL — no pull_request / pull_request_target trigger exists, so no"
+            say_err "   pull_request event for head $head can START it (a push-triggered member of the class is"
+            say_err "   only started by an actual push to the branch), and $lane_run_clause."
+            if [ "$lane_probe_state" = unreadable ]; then
+              # ⛔ ACCURATE FOR THIS ARM ONLY (review P1). This block is reached on an
+              # UNREADABLE probe AND only when the lane's own `on:` names neither `push`
+              # nor `workflow_dispatch` — the two triggers that can start a run of it on a
+              # branch tip. The class lines just above describe the whole STRUCTURAL class
+              # (and stay true for a `push`-triggered lane that MEASURED no run), but THIS
+              # arm is narrower: the TRIGGER LIST, not the failed read, is what makes the
+              # filtered wait inert here. A `push`/`workflow_dispatch` member never reaches
+              # this line — it KEEPS its filter and fails closed on the same failed read,
+              # because a push whose tip is $head attaches a run to this head while the
+              # wait runs.
+              say_err "   This lane's own 'on:' declares no 'push' and no 'workflow_dispatch', so no run of"
+              say_err "   it can attach to head $head however long the wait runs — the filtered wait"
+              say_err "   cannot outlast the failed read (#2465: one failed read cost 3900 s). A"
+              say_err "   'push'/'workflow_dispatch' lane is NOT widened here: it keeps its filter."
+            fi
+          else
+            say_err "   dead-end class: NOT-RUN — the lane declares a PR trigger this changed set does not match,"
+            say_err "   and it has NO run for head $head (measured; an unreadable probe would have failed closed)."
+          fi
+          # ⛔ THE CLAUSE IS NOT REPEATED HERE (review P2). It is already the payload of the
+          # class lines above — the STRUCTURAL arm ends on it and the NOT-RUN arm states the
+          # same measurement in its own words — so printing it a second time only padded the
+          # 65-minute-burn diagnostic this PR exists to make readable. The `Why:` line is the
+          # one-line summary; the measurement belongs to the class line, once.
+          say_err "   Why: the lane's own 'on:' block cannot fire for THIS PR's changed set."
+          say_err "   The lane is INAPPLICABLE here, not missing."
           if [ -n "$WF_PR_CHANGED_PATHS" ]; then
             say_err "   changed file(s) consulted ($(printf '%s' "$WF_PR_CHANGED_PATHS" | grep -c '[^[:space:]]') total):"
             printf '%s\n' "$WF_PR_CHANGED_PATHS" | sed -n '1,10p' | sed 's/^/      /' >&2
@@ -9860,15 +10242,57 @@ main() {
           ANY_WORKFLOW=1
           wf_args=(--any-workflow)
           lane="any workflow"
+        elif [ "$lane_structural" -eq 1 ] && [ "$lane_probe_state" = has-run ]; then
+          # ── THE #1614 DEAD-END GATE HELD: the lane HAS a run for this head ─────
+          # A STRUCTURAL lane is NOT automatically a dead end. `on: push` is a member
+          # of this class and it DOES run on the PR head's own commit, so the filtered
+          # FIRST-CHECKS wait clears on that very run. Dropping the filter here would
+          # (a) drop an EVIDENCED lane out of the certificate and (b) pull unrelated
+          # workflow reds into the comparison — the gratuitous widening #1614 exists to
+          # prevent ("otherwise every trigger-split repo silently becomes
+          # `--any-workflow`", f2e84b617 / PR #1619; pinned by tests/admin-merge/run.sh
+          # arm (e)). So the filter is KEPT.
+          # SAID OUT LOUD, because #2465's confusion was silence: "this lane cannot run"
+          # and "this lane did not run" must never look the same at the operator's
+          # terminal. ⛔ The wording must not contain the sequence "LANE INAPPLICABLE":
+          # that string means "the lane was DROPPED" to a reader and to arm (e).
+          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: its 'on:' block declares no pull_request trigger, but the lane HAS a run for this head, so the filtered wait can clear and widening would drop an evidenced lane (#1614 dead-end gate, not a #2465 dead end)."
+        elif [ "$lane_probe_state" != has-run ]; then
+          # ── THE FAIL-CLOSED PATH, SAID OUT LOUD (review P2) ───────────────────
+          # This is the ONLY path that keeps the lane filter on a probe answer that is not
+          # a measured run and still lets the bounded FIRST-CHECKS wait apply in full — so
+          # it is the one remaining place #2465's symptom (a 65-minute wait that blames CI
+          # and never names the classification) is still reachable. §0b de-silenced the
+          # `unknown` arm for exactly this reason and left its sibling quiet.
+          # ⛔ It must stay FAIL-CLOSED: this class CAN start a run while the wait runs, so
+          # an unread answer is not an exemption (#1614 / §1b). Only the MESSAGE is added.
+          # ⛔ The wording must NOT contain the sequence "LANE INAPPLICABLE": that string
+          # means "the lane was DROPPED" to a reader and to `tests/admin-merge/run.sh`
+          # arm (e). This branch drops nothing — the filter is kept.
+          case "$lane_probe_state" in
+            unreadable)
+              lane_kept_why="its single 'gh run list' read FAILED for head $head, so no run can be CLAIMED either way" ;;
+            *)
+              lane_kept_why="the run probe's answer for head $head did not resolve ('$lane_probe_state')" ;;
+          esac
+          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: it declares a PR trigger this changed set does not match, and $lane_kept_why. This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears. Pass --any-workflow to compare against every workflow instead."
         fi
         ;;
       unknown)
         # Fail closed: an applicability that could not be MEASURED is not an
-        # exemption. Keep the lane filter; §1b refuses exactly as before. Quiet by
-        # design: the refusal below is the loud part, and this fires on every
-        # unreadable map (including the common case where the lane simply has no
-        # PR-relevant trigger and the file could not be fetched).
-        :
+        # exemption. Keep the lane filter; §1b refuses exactly as before.
+        # ⛔ BUT NOT SILENTLY (#2465). A quiet `unknown` is indistinguishable at the
+        # operator's terminal from a lane that is merely slow: the wait then prints
+        # "no run has appeared for head …" for the whole window and the refusal
+        # blames CI, never the unmeasured classification. One line at the point the
+        # decision is made is the difference between a 65-minute burn and a 5-second
+        # fix (`--any-workflow`), and `LANE_APPLICABILITY_REASON` already says why.
+        # ⛔ The reason is expanded as an ASSIGNED variable, never as a `${VAR:-word}`
+        # default: an apostrophe inside that `word` opens a quote bash does not close
+        # on this line (the trap the §0b fallback documents above).
+        local lane_why_unmeasured="${LANE_APPLICABILITY_REASON:-}"
+        [ -n "$lane_why_unmeasured" ] || lane_why_unmeasured="the lane applicability could not be measured"
+        info "admin-merge: … LANE APPLICABILITY UNMEASURED — keeping the lane filter '$WORKFLOW' (fail closed: an unreadable exemption is not an exemption). Reason: $lane_why_unmeasured. If this lane can in fact never attach a run to a PR head (a reusable workflow_call-only lane is the common case), pass --any-workflow: the FIRST-CHECKS wait would otherwise burn its whole window on a run that cannot exist (#2465)."
         ;;
     esac
   fi
@@ -11703,7 +12127,7 @@ ${parity_forgiven_note}"
   # the literal parity lines — never spliced into them.
   if [ -n "$LANE_FALLBACK_FROM" ]; then
     analyzed="${analyzed}
-   lane applicability fallback (#1614): the watched lane '${LANE_FALLBACK_FROM}' is INAPPLICABLE to this diff — its workflow's 'on:' block declares no pull_request / pull_request_target trigger that can fire for this PR's changed set, so no run OF that lane can attach to head $head. The lane filter was DROPPED for this run (the full evaluated surface was compared) — a MEASURED fallback, never a silent widening. A lane that SHOULD have run and produced no run still refuses at step 1b; only a lane that CANNOT run is skipped."
+   lane applicability fallback (#1614): the watched lane '${LANE_FALLBACK_FROM}' is INAPPLICABLE to this diff — its workflow's 'on:' block declares no pull_request / pull_request_target trigger that can fire for this PR's changed set, so the filtered FIRST-CHECKS wait cannot clear on a run THIS PR starts (the run probe found no run for head $head, or — for a lane this PR cannot start at all — could not be read; the classification's own reason is on stderr). The lane filter was DROPPED for this run (the full evaluated surface was compared) — a MEASURED fallback, never a silent widening. A lane that SHOULD have run and produced no run still refuses at step 1b; only a lane that CANNOT run is skipped."
   fi
 
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
