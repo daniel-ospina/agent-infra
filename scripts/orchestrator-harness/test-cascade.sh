@@ -76,7 +76,7 @@ for _f in is_num is_limit pr_in_set _wedge_min measure_ownership_sets measure_ci
           worker_log_name pr_owned \
           unowned_scan mp_reason cascade_issue_slots cascade_wait \
           cascade_level_name cascade_main_red cascade_level cascade_main_probe \
-          queue_state_token queue_state_fresh; do
+          queue_state_token queue_state_class queue_state_fresh; do
   _body="$(ex "$_f" "$ORCH")"
   if [ -z "$_body" ]; then echo "❌ could not extract $_f() from $ORCH — it moved or was reformatted"; exit 1; fi
   printf '%s\n' "$_body" >> "$FNS"
@@ -622,6 +622,14 @@ ck "a STALE 'EMPTY' record (6h) is NOT this pass's measurement — it names an u
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY 21600 | cut -d' ' -f5,6)" "0 backlog_unreadable"
 ck "…and a fresh enough EMPTY still says empty_backlog (the bound must not become a blanket refusal)" \
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY 60 | cut -d' ' -f5,6)" "0 empty_backlog"
+# ⛔ AND A DRAINED QUEUE IS NOT A BLIND ONE (agent-infra#3909 review, 5th cycle P2). `READ(n)` is a
+# SUCCESSFUL read and `PARTIAL(x)` a NAMED one, so `queue=READ(7)` beside a zero backlog — the routine
+# reap-after-read pair, since the refresh records its state and only THEN reaps consumed candidates —
+# must not be published as an "absence of attribution". That was the #1931 conflation reborn backwards.
+ck "a READ pool with a zero backlog is DRAINED, not unreadable — the read SUCCEEDED" \
+   "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 'READ(7)' | cut -d' ' -f5,6)" "0 backlog_drained"
+ck "…and a PARTIAL read with a zero backlog says so too — a named subset is still a measurement" \
+   "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 'PARTIAL(P0-blocker)' | cut -d' ' -f5,6)" "0 backlog_partial"
 ck "an UNREADABLE PR listing names the LISTING as the cause (the fail-closed arm, on the one state it decides)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
 ' - - 1 x 1 | cut -d' ' -f5,6)" "0 listing_unreadable"
@@ -1484,7 +1492,10 @@ ckin "…with the cause computed where each gate is decided, not re-derived at e
 # be satisfied by the defect (the gate without the token reads nothing; the token without the gate is
 # the bug).
 ckin "…and a zero backlog is only called empty when the refresh MEASURED an empty pool (#1931)" "$SRC_CODE" 'CASCADE_POOL_EMPTY=0'
-ckin "…measured RECENTLY, by the age-bounded sibling — an 'EMPTY*' prefix match would discard the age" "$SRC_CODE" 'queue_state_fresh && CASCADE_POOL_EMPTY=1'
+ckin "…measured RECENTLY, by the age-bounded sibling — an 'EMPTY*' prefix match would discard the age" "$SRC_CODE" '[ "$CASCADE_POOL_CLASS" = "empty" ] && CASCADE_POOL_EMPTY=1'
+ckin "…and a drained pool gets its OWN token, never the blind one" "$SRC_CODE" 'CASCADE_SLOTS_WHY="backlog_drained"'
+ckin "…as does a named partial read — a subset is still a measurement" "$SRC_CODE" 'CASCADE_SLOTS_WHY="backlog_partial"'
+ckin "…and only a genuinely blind pool falls to the unreadable token" "$SRC_CODE" 'CASCADE_SLOTS_WHY="backlog_unreadable"'
 ckin "…never on a pool nobody read — that state has its own token" "$SRC_CODE" 'CASCADE_SLOTS_WHY="backlog_unreadable"'
 
 printf '\n%s\n' "──────────────────────────────────────────────"

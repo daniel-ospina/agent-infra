@@ -231,13 +231,14 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   decides it;
 - `slots_why=` — why a zero is a zero, in the order the allocator decides: `granted` (a non-zero
   grant), `capacity` (the probe refused, so no rung resolved at all), `level` (a higher level holds the
-  room), `no_room`, `empty_backlog`, `listing_unreadable`, `backlog_unreadable`.
+  room), `no_room`, `empty_backlog`, `listing_unreadable`, then the three zero-backlog tokens
+  `backlog_drained`, `backlog_partial`, `backlog_unreadable`.
   ⛔ **`empty_backlog` REQUIRES A MEASURED EMPTY POOL** (#1931; added by the 4th review cycle of
   #3909). The backlog count is `wc -l < candidates.txt` coerced to `0` when that file cannot be read, so
   the **same zero** also arrives from a refresh whose pool listing failed — where an empty file is
   byte-identical to a fleet with nothing to do. So the arm reads `state/queue-state` (the refresh's own
   record: `EMPTY` / `READ(n)` / `PARTIAL(x)` / `UNREADABLE` / `UNKNOWN`) and only a measured `EMPTY` may
-  be called empty; every other zero-backlog state is `backlog_unreadable`. That ordering is
+  be called empty. That ordering is
   measured-before-blind on purpose: `empty_backlog` and `listing_unreadable` are each a **measurement**
   and take precedence, while `backlog_unreadable` is an *absence* of attribution and ranks below them
   (both can hold at once — the 2026-10-17 incident had both listings refused for 131 consecutive
@@ -248,6 +249,17 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   measurement — the refresh deliberately leaves the previous record standing when a pass aborts early, and
   its age is what keeps that honest. Past the bound, or with an absent/unparseable/future stamp, the cause
   is `backlog_unreadable` (unverifiable is stale, never fresh);
+  ⛔ **AND A DRAINED QUEUE IS NOT A BLIND ONE** (5th review cycle of #3909). The zero-backlog states
+  that are *not* a measured `EMPTY` are **three** facts, not one absence, because `READ(n)` is a
+  **successful** read and `PARTIAL(x)` a **named** partial read — both are measurements the record holds:
+  `backlog_drained` (`READ(n)` with the queue now spent; the routine reap-after-read pair, since the
+  refresh records its state and only *then* reaps consumed candidates), `backlog_partial`
+  (`PARTIAL(x)` — a subset, but still a measurement), and `backlog_unreadable` (`UNREADABLE` /
+  `UNKNOWN` / a stale stamp / an ungradeable one — the only genuinely blind states). Collapsing a
+  drained queue into `backlog_unreadable` would deny a measurement the record holds, which is the same
+  "the record could not distinguish" class in the opposite direction. The three are split **after**
+  `listing_unreadable`, which is the PR listing's own measured unreadability and can zero the grant on
+  its own;
 - `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room, and a measured
   `0` on every pass the valve did not fire. ⛔ It is computed in the **drain-escape block**, not the
   cascade block — that separation is the whole point of it being its own token;
