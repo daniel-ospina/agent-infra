@@ -606,6 +606,17 @@ cmd_check() {
         note "UNKNOWN: state dir $STATE does not exist — nothing has ever run here, so there is nothing to verify"
         return 2
     fi
+    # ⛔ AN EXISTING BUT UNREADABLE STATE DIR IS NOT A FLEET VERDICT (#3826 review P3). The contract at
+    # the top of this file says an unreadable state dir is `2 UNKNOWN`, but only `-d` was tested: with a
+    # mode-000 state dir the pidfile and the snapshot were invisible to `-f`/`-s`, every probe fell
+    # through, and the verb answered `DRIFT loop is NOT running (pidfile absent)` rc=1 — asserting a
+    # finding about the FLEET from a directory it could not open, which is the misattribution this file
+    # already refuses for a bad HEARTBEAT_CHECK_MAX_AGE above. MEASURED: `chmod 000` on the state dir then
+    # `check` → two DRIFT lines, rc 1. The same blindness disarms `start`'s already-running guard.
+    if [ ! -r "$STATE" ] || [ ! -x "$STATE" ]; then
+        note "UNKNOWN: state dir $STATE is not readable (or not searchable) — the probe cannot look, which is not a fleet verdict"
+        return 2
+    fi
 
     local rc=0 upid="" alive=0 ident=1
     if [ -f "$PIDFILE" ]; then

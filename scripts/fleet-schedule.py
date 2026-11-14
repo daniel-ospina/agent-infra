@@ -3657,6 +3657,11 @@ def cmd_darwin(mode):
         # read `SCHEDULE NOT VERIFIED — 0 launchd job(s) …` over a box still ticking a job this
         # repository has retired. The marker is on the JOB line, like UNMANAGED, so the count is a count
         # of jobs.
+        # ⛔ AND `⛔ CMUX-GATED` (#3826 review P2). The delegate's `--status` now refuses a template that
+        # names a cmux-gated script with a row of its own and rc 1 — the blind job #1867 is about. Left
+        # out of this scan, such a box returned 1 while the verdict read `SCHEDULE NOT VERIFIED — 0
+        # launchd job(s) …`, the exact defect the round-5/round-8 notes above record for UNMANAGED and
+        # RETIRED-INSTALLED. The marker is on the JOB line, so the count stays a count of jobs.
         JOB_MARKERS = (
             "NOT INSTALLED",
             "DRIFTED",
@@ -3664,6 +3669,7 @@ def cmd_darwin(mode):
             "⛔ UNMANAGED",
             "⛔ RETIRED-INSTALLED",
             "⛔ UNKNOWN",
+            "⛔ CMUX-GATED",
         )
         bad = [line for line in text.splitlines() if any(m in line for m in JOB_MARKERS)]
         for line in bad:

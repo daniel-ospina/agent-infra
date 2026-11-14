@@ -1547,6 +1547,13 @@ install_job() {
     printf '%s' "$rendered" > "$tmp"
     verify_targets "$tmp"
     local vrc=$?
+    # ⛔ THE REASON, CAPTURED BEFORE THE TEMP FILE GOES (#3826 review P3). `vrc` cannot distinguish a
+    # cmux refusal from a farm gap, so this arm told the operator to "fix the farm/checkout first (run
+    # sync.sh / pi-bootstrap setup.sh)" for a cmux-gated template — a remedy that provably cannot clear
+    # it, printed directly beneath the correct diagnosis. On `origin/main` that sentence was only ever
+    # emitted for genuinely missing targets.
+    local cmux_target=""
+    cmux_target="$(plist_cmux_gated_target "$tmp" || true)"
     if [ "$vrc" -ne 0 ]; then
         rm -f "$tmp"
         if [ "$vrc" -eq 2 ]; then
@@ -1575,6 +1582,15 @@ install_job() {
                 echo "        Nothing is installed for this unit." >&2
             fi
             return 0
+        fi
+        if [ -n "$cmux_target" ]; then
+            echo "  REFUSING $label: this template names a cmux-gated script ($cmux_target) —" >&2
+            echo "        it is not a farm gap and no install step fixes it: under launchd it would" >&2
+            echo "        install, load, tick and deliver NOTHING (#1867)." >&2
+            echo "        Remove the template from the set (templates/launchd/LAUNCHD-INCOMPATIBLE)," >&2
+            echo "        and run the heartbeat through its documented launch path instead:" >&2
+            echo "        bash scripts/heartbeat-launch.sh start" >&2
+            return 1
         fi
         echo "  FAIL $label: script target(s) above are missing or unreachable from launchd —" >&2
         echo "        fix the farm/checkout first (run sync.sh / pi-bootstrap setup.sh), then re-run." >&2
@@ -1697,11 +1713,16 @@ status_job() {
     # and demanded by `--status`", which this arm is what makes true.
     # ⛔ IT REPORTS A SKIP, NOT A PASS: the installed-copy variant keeps a counted marker, so a box
     # still holding one is disclosed to the verdict sentence rather than certified clean.
-    local _tcc_tmp _tcc_vrc
+    local _tcc_tmp _tcc_vrc _cmux_target=""
     if _tcc_tmp="$(mktemp 2>/dev/null)"; then
         printf '%s' "$rendered" > "$_tcc_tmp"
         _tcc_vrc=0
         verify_targets "$_tcc_tmp" >/dev/null 2>&1 || _tcc_vrc=$?
+        # ⛔ ASKED AGAIN, DELIBERATELY — NOT DERIVED FROM `_tcc_vrc` (#3826 review P2). See
+        # `plist_cmux_gated_target`'s own note: a shared `1` cannot say whether the target was MISSING
+        # (a farm gap, which --status must not turn into a permanent red) or cmux-GATED (the blind job
+        # this whole change exists to refuse). Captured before the temp file is removed.
+        _cmux_target="$(plist_cmux_gated_target "$_tcc_tmp" || true)"
         rm -f "$_tcc_tmp"
         if [ "$_tcc_vrc" -eq 2 ]; then
             if [ -f "$installed" ]; then
@@ -1710,6 +1731,22 @@ status_job() {
                 echo "  $label: NOT APPLICABLE (launchd cannot READ this unit's target — a macOS TCC root, #427; no install step changes this box's layout)"
             fi
             return 0
+        fi
+        # ⛔ A cmux-GATED TEMPLATE IS NEVER `in sync` (#3826 review P2 — a fail-open on the exact
+        # defect this change exists to catch). `verify_targets` returns 1 here, so the arms below
+        # graded its CONTENT: a byte-identical template and plist agreed, the row read
+        # `installed=loaded version=v… (in sync)`, and `--status` exited 0 — certifying a job that
+        # installs, loads, ticks and delivers NOTHING. This is not hypothetical: the blind job in
+        # #1867's own body was installed and `--status`-clean for its whole life. It is now a row of
+        # its own and a non-zero exit, so the two verbs agree about one file.
+        if [ -n "$_cmux_target" ]; then
+            echo "  ⛔ CMUX-GATED   $label: this job installs, loads and ticks, and is BLIND under launchd ($_cmux_target)"
+            echo "        the cmux socket (socketControlMode = cmuxOnly) gates on launch-chain attribution,"
+            echo "        which a launchd job never has, so it delivers NOTHING while its log reads as"
+            echo "        activity (#1867). This template is listed in templates/launchd/LAUNCHD-INCOMPATIBLE"
+            echo "        — remove it from the set; no install step makes it work."
+            echo "        Documented launch path: bash scripts/heartbeat-launch.sh start"
+            return 1
         fi
     fi
     if [ ! -f "$installed" ]; then
@@ -2062,6 +2099,29 @@ is_cmux_gated() {
     return 1
 }
 
+# plist_cmux_gated_target <plist> → prints the FIRST cmux-gated program argument; 0 when there is one.
+#
+# ⛔ THE ONE PREDICATE `install` AND `--status` BOTH CONSULT (#3826 review P2). They used to disagree
+# about the same file by construction: `verify_targets` answers `1` for BOTH "a target is missing" and
+# "a target is cmux-gated", so `status_job` could not act on the cmux case without also refusing every
+# box whose farm is incomplete — and it acted on `2` ONLY, which let the gated template fall through to
+# the content comparison and be reported `installed=loaded version=v… (in sync)` with rc 0. MEASURED on
+# the round-13 code: the rendered template naming `<repo>/scripts/heartbeat-loop.sh`, installed
+# byte-identically, printed `in sync` and STATUS_RC=0, while `install-launchd.sh` refused the SAME file
+# loudly. A shared integer cannot carry "why"; asking the manifest again can.
+plist_cmux_gated_target() {
+    local args_out kind arg
+    args_out="$(plist_program_args "$1")" || return 1
+    while IFS=$'\t' read -r kind arg; do
+        [ -n "$arg" ] || continue
+        if is_cmux_gated "$arg"; then
+            printf '%s' "$arg"
+            return 0
+        fi
+    done <<<"$args_out"
+    return 1
+}
+
 is_retired() { # $1 = label → 0 when it is listed in RETIRED
     # Capture, then grep a here-string — never `retired_labels | grep -q`: under
     # `pipefail` the label producer takes SIGPIPE when `grep` exits at its first match,
@@ -2213,10 +2273,21 @@ if [ "${1:-}" = "--status" ]; then
     # "visible" are the same set in both directions and the verdict sentence below is not a claim
     # about files nothing read.
     delegated=0
+    # ⛔ RESOLVED BEFORE COMPARING (#3826 review P2). `dirname` NEVER emits a trailing slash, so a
+    # TEXTUAL compare against `$TEMPLATES_DIR` classified this installer's own flat set as "another
+    # installer's directory" whenever the spelling differed by a trailing slash — which is exactly what
+    # shell tab-completion inserts. MEASURED with `TEMPLATES_DIR="$PWD/templates/launchd/"`: 23
+    # `DELEGATED —` rows instead of 4, every graded job appearing TWICE with contradictory verdicts
+    # (`NOT INSTALLED (template v0.2.0)` beside `DELEGATED — … installed and graded by another
+    # installer`), asserting a false ownership and a false state for an absent job while
+    # `fleet-schedule.py --verify` counted the 23 disclosures over 19 jobs it had just graded.
+    local _own_dir _tpl_dir
+    _own_dir="$(cd "$TEMPLATES_DIR" 2>/dev/null && pwd -P)" || _own_dir="${TEMPLATES_DIR%/}"
     while IFS= read -r template; do
         [ -n "$template" ] || continue
         # Anything DIRECTLY in TEMPLATES_DIR is this installer's own set — already graded above.
-        [ "$(dirname "$template")" = "$TEMPLATES_DIR" ] && continue
+        _tpl_dir="$(cd "$(dirname "$template")" 2>/dev/null && pwd -P)" || _tpl_dir="$(dirname "$template")"
+        [ "$_tpl_dir" = "$_own_dir" ] && continue
         label="$(job_label "$template")"
         if is_retired "$label"; then
             echo "  $label: RETIRED (manifest wins — template in a subdirectory; remove the template in the repo)"

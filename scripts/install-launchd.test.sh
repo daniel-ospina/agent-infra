@@ -2910,6 +2910,80 @@ set -e
 assert_eq "$RC" "1" "§17 an EMPTY manifest refuses the install (an empty gate is the same no-op as none)"
 assert_contains "$OUT" "lists no scripts" "§17 ... and says the gate is empty rather than passing everything"
 
+# ⛔ FINDING 2 (P3): `verify_targets` answers 1 for a cmux refusal, so `install_job` fell through to the
+# FARM-GAP terminal message — "fix the farm/checkout first (run sync.sh / pi-bootstrap setup.sh)" —
+# printed directly beneath the correct diagnosis. That remedy provably cannot clear a cmux-gated
+# template, so an operator follows it and the FAIL survives every re-run. On `origin/main` that sentence
+# was only ever emitted for genuinely missing targets, so the misdiagnosis is new to this change.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh" --loop 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17c the cmux refusal still exits 1 (the fix is the MESSAGE, not the verdict)"
+assert_contains "$OUT" "REFUSING com.eldato.tccprobe: this template names a cmux-gated script" "§17c ... and the terminal reason names the cmux cause"
+assert_not_contains "$OUT" "fix the farm/checkout first" "§17c ... and NEVER tells the operator to run sync.sh — a remedy that cannot clear it"
+assert_not_contains "$OUT" "missing or unreachable from launchd" "§17c ... and does not call a cmux-gated target a farm gap"
+
+# ── 17b. THE TWO VERBS MUST AGREE ABOUT ONE FILE ──────────────────────────────────────────────────
+# ⛔ FINDING 1 (P2) — A FAIL-OPEN ON #1867'S OWN DEFECT. `verify_targets` answers 1 for BOTH "a target is
+# missing" and "a target is cmux-gated", and `status_job`'s probe acted on 2 ONLY, so the gated template
+# fell through to the CONTENT comparison. With the plist installed byte-identically — the state the blind
+# box was actually in, per #1867's own body — `--status` printed `installed=loaded version=… (in sync)`
+# and exited 0, certifying the blind job as healthy, while `install-launchd.sh` refused the SAME file
+# loudly. MEASURED pre-fix: rc 0, row `in sync`.
+cmux_status_probe() { # <home> <gated-script-path> → installer --status stdout+stderr; rc is the installer's
+    local home="$1" gated="$2"
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR" "$home/Library/LaunchAgents"
+    cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$gated</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+</dict>
+</plist>
+PLIST
+    # BYTE-IDENTICAL install. ⛔ THE TRAILING NEWLINE IS THE WHOLE POINT: `status_job` compares with
+    # `cmp -s "$installed" <(printf '%s' "$rendered")`, and `printf '%s'` emits NO trailing newline —
+    # so an installed copy written by `cp` from a heredoc differs by one byte, reads DRIFTED, and the
+    # row certifies nothing. MEASURED while first writing this fixture: the pre-fix code answered rc 1
+    # `(DRIFTED (template changed — re-run installer))` and the exit-code row below passed vacuously.
+    # `$(cat …)` strips trailing newlines, which is exactly the shape the installer writes.
+    printf '%s' "$(cat "$PROBE_DIR/com.eldato.tccprobe.plist")" > "$home/Library/LaunchAgents/com.eldato.tccprobe.plist"
+    ( export HOME="$home"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$PROBE_DIR"
+      export AGENTS_DIR="$home/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" --status 2>&1 )
+}
+set +e
+OUT="$(cmux_status_probe "$PROBE_HOME" "$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh")"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17b --status REFUSES a cmux-gated template (exit 1) — pre-fix it exited 0"
+assert_contains "$OUT" "⛔ CMUX-GATED   com.eldato.tccprobe" "§17b ... with a row of its own, not a content verdict"
+assert_contains "$OUT" "socketControlMode" "§17b ... naming the socket gate that makes the job blind"
+assert_not_contains "$OUT" "in sync" "§17b ... and NEVER 'in sync' — the row that certified the blind job as healthy"
+assert_not_contains "$OUT" "installed=loaded" "§17b ... and no installed=loaded content verdict at all"
+# DIRECT control: the same fixture with a NEIGHBOURING non-gated script must still grade on CONTENT —
+# otherwise the new arm could be buying its green by refusing every template.
+mkstub "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh"
+set +e
+OUT="$(cmux_status_probe "$PROBE_HOME" "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh")"; RC=$?
+set -e
+assert_contains "$OUT" "com.eldato.tccprobe" "§17b control: a NON-gated template in the same fixture is still reported"
+assert_not_contains "$OUT" "⛔ CMUX-GATED" "§17b control: ... and is NOT refused as cmux-gated (the arm is about the script, not the directory)"
+
 
 # ── §18: an installed plist with NO template is UNMANAGED (#1867) ──────────────────────────────────
 # The blind heartbeat was installed, loaded and ticking with no template describing it, so neither the
@@ -3387,6 +3461,31 @@ assert_contains "$OUT" "com.eldato.nested: DELEGATED" "§18b ... and the walk is
 assert_not_contains "$OUT" "⛔ UNMANAGED   com.eldato.nested" "§18b ... so no bootout+rm advice is aimed at a job this repo ships"
 rm -f "$TEMPLATES/group/sub/com.eldato.nested.plist" "$STRAY_HOME/Library/LaunchAgents/com.eldato.nested.plist"
 rmdir "$TEMPLATES/group/sub" "$TEMPLATES/group" 2>/dev/null || true
+
+# ⛔ AND THE OWN-SET TEST IS ON THE RESOLVED DIRECTORY, NOT THE SPELLING (#3826 review P2). The walk
+# classified "mine vs another installer's" by comparing `dirname "$template"` — which NEVER carries a
+# trailing slash — against `$TEMPLATES_DIR` as a STRING. A spelling that differs by one slash (exactly
+# what shell tab-completion inserts) therefore made EVERY flat template read as delegated. MEASURED
+# pre-fix with `TEMPLATES_DIR="$TEMPLATES/"`: 23 `DELEGATED —` rows instead of 4, each graded job
+# appearing TWICE with contradictory verdicts (`NOT INSTALLED (template v0.2.0)` beside `DELEGATED — …
+# installed and graded by another installer`), asserting a false ownership and a false state for a job
+# that was absent — while `fleet-schedule.py --verify` counted the 23 disclosures over the 19 jobs it
+# had just graded.
+set +e
+OUT="$( export STRAY_TEMPLATES="$TEMPLATES/"; run_stray_status )"; RC=$?
+set -e
+FLAT_LABELS=0
+for _tpl in "$TEMPLATES"/*.plist; do
+    [ -f "$_tpl" ] || continue
+    FLAT_LABELS=$((FLAT_LABELS + 1))
+    _lbl="$(basename "$_tpl" .plist)"
+    assert_not_contains "$OUT" "$_lbl: DELEGATED" "§18e a trailing slash on TEMPLATES_DIR does not re-declare THIS installer's own flat template ($_lbl) as delegated"
+done
+if [ "$FLAT_LABELS" -gt 0 ]; then
+    ok "§18e the trailing-slash rows above are not vacuous ($FLAT_LABELS flat template(s))"
+else
+    bad "§18e NO flat template exists in $TEMPLATES — the trailing-slash rows proved nothing"
+fi
 
 # ── 18c. THE PER-JOB VERDICTS NOW CARRY THE EXIT CODE (#1867 review, round 9) ────────────────────
 # Two arms, because the fix has two halves that fail in opposite directions:

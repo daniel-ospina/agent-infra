@@ -301,6 +301,29 @@ OUT="$(env -u XPC_SERVICE_NAME HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" 
 assert_eq "$RC" "2" "§7 check returns UNKNOWN (2) when the state dir does not exist — never a pass"
 assert_contains "$OUT" "UNKNOWN" "§7 …and says UNKNOWN on the line a caller reads"
 
+# ⛔ AND AN EXISTING BUT UNREADABLE STATE DIR IS UNKNOWN, NOT DRIFT (#3826 review P3). The exit contract
+# at the top of `heartbeat-launch.sh` says an unreadable state dir is `2 UNKNOWN`, but only `-d` was
+# tested: with a mode-000 state dir the pidfile and the snapshot are invisible to `-f`/`-s`, every probe
+# fell through, and the verb answered `DRIFT loop is NOT running (pidfile absent)` rc=1 — asserting a
+# finding about the FLEET from a directory it could not open. MEASURED pre-fix: rc 1, two DRIFT lines.
+# The same blindness disarms `start`'s already-running guard.
+# `id -u` is tested so this row SKIPS LOUDLY as root, where mode 000 does not deny access and the
+# fixture would be vacuous.
+if [ "$(id -u)" -ne 0 ]; then
+    R="$(newroot c1r)"
+    chmod 000 "$R/agent/state"
+    set +e
+    OUT="$(env -u XPC_SERVICE_NAME HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" check 2>&1)"; RC=$?
+    set -e
+    chmod 755 "$R/agent/state"
+    assert_eq "$RC" "2" "§7b check returns UNKNOWN (2) on an EXISTING but unreadable state dir — pre-fix it was DRIFT (1)"
+    assert_contains "$OUT" "not readable" "§7b …and names the unreadable dir as the reason"
+    assert_not_contains "$OUT" "the heartbeat is not beating" "§7b …and never states a fleet finding it could not look for"
+    assert_not_contains "$OUT" "pidfile absent" "§7b …nor infers an absent pidfile from a directory it could not open"
+else
+    ok "§7b SKIPPED as root — mode 000 does not deny access there, so the fixture would be vacuous"
+fi
+
 R="$(newroot c1)"
 OUT="$(run "$R" -- check)"; RC=$?
 assert_eq "$RC" "1" "§8 a loop that is not running is DRIFT (1)"

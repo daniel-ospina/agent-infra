@@ -1166,6 +1166,24 @@ out="$(darwin_run --verify)"; rc=$?
 grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
   && ok "a RETIRED-INSTALLED-only failure is COUNTED (1 of 1), not reported as 0 jobs" \
   || bad "a RETIRED-INSTALLED-only failure printed a 0-job verdict: $out"
+# ⛔ AND THE CMUX CLASS IS COUNTED ON ITS OWN (#3826 review P2). `install-launchd.sh --status` now
+# refuses a template that names a cmux-gated script with a row of its own and rc 1 — the blind job #1867
+# is about, and the one that installs, loads, ticks and delivers NOTHING. Left out of this scan, such a
+# box returned 1 while the verdict beside it read `SCHEDULE NOT VERIFIED — 0 launchd job(s)`, the exact
+# false count the UNMANAGED and RETIRED-INSTALLED wordings were each fixed for, one class over.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⛔ CMUX-GATED   com.tortoise.heartbeat-loop: this job installs, loads and ticks, and is BLIND under launchd ($HOME/.pi/agent/scripts/heartbeat-loop.sh)" >&2
+exit 1
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
+  && ok "a CMUX-GATED-only failure is COUNTED (1 of 1), not reported as 0 jobs" \
+  || bad "a CMUX-GATED-only failure printed a 0-job verdict: $out"
+[ "$rc" -eq 1 ] && ok "…and a cmux-gated job is never reported as a verified job set" \
+  || bad "the cmux-gated-only failure returned $rc, not 1"
 cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
