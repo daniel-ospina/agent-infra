@@ -5076,6 +5076,26 @@ function _foldAnsiCStrings(body) {
     if (ch === "$" && s[i + 1] === "'") {
       let j = i + 2;
       while (j < s.length && s[j] !== "'") { if (s[j] === "\\") j++; j++; }
+      // ⛔ AN ANSI-C LITERAL IS A WORD — UNLESS A SHELL IS ASKED TO RUN IT AS A PROGRAM (round-12
+      // review, P1 — measured as a FAIL-OPEN against `origin/main`). Folding it to the opaque
+      // placeholder is right for a bare word: bash's manual §3.1.2.4 says `$'string'` expands to a
+      // single-quoted WORD, so `$'git push origin -d b'` on its own is an ARGUMENT, never a command.
+      // It is WRONG the moment the word is the operand of `sh -c` / `bash -c` / `bash -lc` / `eval`,
+      // because THAT shell decodes it and runs the text as a program — the same nested-interpreter
+      // handoff this module already models for `sh -c '…'` (`_dropUnmatchedQuote`) and for a heredoc's
+      // body. Folding there discarded the whole push, so the extractor returned `null`:
+      //
+      //   sh -c $'git push origin -d held/branch'      origin/main → ["held/branch"] → #73 CONSULTED
+      //   sh -c $'git push origin --delete held/branch'  before this → null → the DEGRADED ARM
+      //                                                 (index.ts:6094 `rawDeleteNames`) → [] → ALLOW
+      //
+      // (measured on the real handler path: for the `--delete` spelling both trees reach
+      // `block:push-delete`, so the only difference is the emptied target list — and that arm is the
+      // one that runs when the classifier fails to load, which is its entire purpose. 240 rows of an
+      // ANSI-C family sweep lost on 28 that bash really executes.)
+      // The test is the PRECEDING WORD, not a broader promise: `-c`, any short cluster ending in `c`
+      // (`-lc`, `-ic`), or `eval`. Everything else keeps the fold.
+      if (_ansiCIsProgramOperand(s.slice(0, i))) { out += s.slice(i, j < s.length ? j + 1 : s.length); i = j < s.length ? j : s.length; continue; }
       out += _SUBST_PLACEHOLDER; // one word; `$'…'` contents are not the argv text
       i = j < s.length ? j : s.length;
       continue;
@@ -5084,6 +5104,30 @@ function _foldAnsiCStrings(body) {
     out += ch;
   }
   return out;
+}
+
+/** Is the `$'…'` literal starting at `before.length` the PROGRAM operand of a shell?
+ *
+ * Looks at the text immediately preceding the literal: `eval`, an option word `-c`, or a short-option
+ * cluster ENDING in `c` (`-lc`, `-ic`) means the next word is a script the interpreter will run. A
+ * redirect or list separator between them (`sh -c >/dev/null $'…'`) does not change that, because the
+ * shell takes the first non-redirect word as its operand — so those tokens are skipped going back.
+ * Deliberately coarse: a FALSE hit only makes the text SCANNED (`sh -c $'…'` is then read the way
+ * `sh -c '…'` already is), and an over-read in a gate is the cheap direction.
+ * @param {string} before — the segment text preceding the literal
+ * @returns {boolean}
+ */
+function _ansiCIsProgramOperand(before) {
+  const words = String(before ?? "").trimEnd().split(/\s+/).filter(Boolean);
+  for (let k = words.length - 1; k >= 0 && k >= words.length - 3; k--) {
+    const w = words[k].replace(/^["']+|["']+$/g, "");
+    if (!w) continue;
+    if (w === "eval") return true;
+    if (/^-[A-Za-z]*c$/.test(w)) return true;
+    if (/^[0-9]?[<>]|^&>/.test(w)) continue; // a redirect (with or without its fd) — skip it and keep looking
+    return false; // the first REAL word back is not a program-taking form
+  }
+  return false;
 }
 
 /** Sentinels for a parenthesis that is DATA — QUOTED, ESCAPED, or inside a `${ … }` parameter

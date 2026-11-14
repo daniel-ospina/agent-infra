@@ -303,6 +303,31 @@ for (const t of ["$(…)"]) expect(`A: #653 refuses the truncated-span marker ${
 // survives and is NOT replaced by a marker.
 expect("A: an unpaired CLOSING backtick keeps the real target", extractPushDeleteBranch("echo `git push origin -d held/branch`"), ["held/branch"]);
 
+// ── Round-12 review (P1): an ANSI-C literal handed to a SHELL is a PROGRAM, not a word ────────────
+// `_foldAnsiCStrings` replaces the whole `$'…'` literal with the opaque placeholder, which is right
+// for a BARE word (bash manual §3.1.2.4: `$'string'` expands to one single-quoted WORD, so
+// `$'git push origin -d b'` alone is an ARGUMENT and runs nothing). It was WRONG when the word is the
+// operand of `sh -c` / `bash -c` / `bash -lc` / `eval`, where that shell DECODES the literal and runs
+// the text as a program. Measured: `origin/main` reported `["held/branch"]` for every row below and
+// this branch reported `null`, so `_coordinatedDeleteBlock` was never consulted — and for the
+// `--delete` spelling both trees reach `block:push-delete`, which in the DEGRADATION arm
+// (`index.ts` `rawDeleteNames = extractPushDeleteBranch(…) ?? []`) means the target list was the only
+// difference, i.e. a silent ALLOW in the arm that exists for the classifier-unavailable case.
+for (const [name, cmd] of [
+  ["`sh -c` with an ANSI-C program", "sh -c $'git push origin -d held/branch'"],
+  ["`bash -c` with an ANSI-C `--delete` program", "bash -c $'git push origin --delete held/branch'"],
+  ["`bash -lc` with an ANSI-C program", "bash -lc $'git push origin -d held/branch'"],
+  ["`env … bash -c` with an ANSI-C program", "env FOO=1 bash -c $'git push origin -d held/branch'"],
+  ["`eval` of an ANSI-C program", "eval $'git push origin -d held/branch'"],
+  ["`sh -c` ANSI-C program in a LATER segment", "git push origin HEAD:feat && sh -c $'git push origin -d held/branch'"],
+]) {
+  expect(`A: ${name} → the real target is ATTRIBUTED`, extractPushDeleteBranch(cmd), ["held/branch"]);
+}
+// ⚠️ CONTROL (not a discriminator): a BARE ANSI-C literal is a WORD passed to nothing — bash runs no
+// git at all (stub-`git` probe: 0 invocations) — so it must stay FOLDED rather than be read as a push.
+// `origin/main` reports a target here, and that report is an over-capture of a non-runnable command.
+expect("A: CONTROL — a BARE ANSI-C literal is a word, not a program", extractPushDeleteBranch("$'git push origin -d held/branch'"), null);
+
 // ── Part B — the SHIPPED gate (real index.ts tool_call handler) ───────────
 if (typeof stripTypeScriptTypes !== "function" ||
     (typeof register !== "function" && typeof registerHooks !== "function")) {
