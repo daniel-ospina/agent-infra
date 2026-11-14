@@ -447,8 +447,13 @@ FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 # the refresh on every cycle — so the bound tolerates fifteen consecutive missed refreshes before it
 # stops calling the reading a measurement. That is deliberately generous: the cost of being generous is
 # one stale `EMPTY` surviving an hour, and the cost of being tight is a healthy box reading `blind`.
-# Past it the cause is `backlog_unreadable`, because an unverifiable reading is not a
-# measurement (the same polarity `dispatch_funnel` takes for its own record).
+# ⛔ PAST THE BOUND THE CLASS IS `blind`, WHICH IS NOT THE SAME AS THE CAUSE TOKEN (review P2, 7th
+# cycle): it demotes the three zero-backlog attributions to `backlog_unreadable` *provided the arm is
+# reached at all* — a non-zero grant still says `granted` (`CASCADE_RUNG_SLOTS > 0` is arm one and never
+# consults the class), and an unreadable PR listing still says `listing_unreadable` (that arm precedes
+# the backlog ones). The earlier sentence stated it as an unconditional cause; it is a demotion within
+# the backlog arms. An unverifiable reading is not a measurement
+# (the same polarity `dispatch_funnel` takes for its own record).
 QUEUE_STATE_MAX_AGE_MIN="${QUEUE_STATE_MAX_AGE_MIN:-60}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
@@ -8499,7 +8504,12 @@ PY
   # decided nothing. Testing it first published `listing_unreadable` for a box whose measured cause was
   # `no_room`, i.e. the same "a wrong cause on the artifact a lane is briefed from" defect this token
   # exists to end, one arm over. It still wins on the one state it does decide — room AND backlog both
-  # free, so every arm above it is false and the listing is the only zero left.
+  # free, the pool not a measured-and-current EMPTY, so every arm above it is false and the listing is
+  # the only zero left. ⛔ THAT SCOPE IS LOAD-BEARING: `empty_backlog` sits ABOVE this arm, so with a
+  # zero backlog beside a measured, current `EMPTY` pool an unreadable listing yields `empty_backlog`,
+  # not this token — and the suite pins exactly that (test-cascade.sh, the MEASURED-EMPTY-vs-listing
+  # arm). The earlier wording said "room AND backlog both free" alone made every arm above false,
+  # which this PR's own test contradicts.
   # ⛔ AND A ZERO BACKLOG IS TWO DIFFERENT FACTS, ONLY ONE OF WHICH MAY BE CALLED `empty_backlog`
   # (agent-infra#3909 review, 4th cycle P1; the ruling is #1931). `CASCADE_QUEUE_DEPTH` is
   # `wc -l < candidates.txt` coerced to 0 when that file cannot be read, so a zero ALSO arrives from a
@@ -9837,7 +9847,7 @@ PY
     # and could not have been executing. The fields below separate the states that one `nothing=`
     # could not, and they are what requirement 1 of #3009 actually asks for:
     #   level=MERGE          slots=0 slots_why=level        can_spawn=1 → a HIGHER LEVEL holds the room (the ladder working)
-    #   level=NOT-MEASURED   slots=0 slots_why=capacity     can_spawn=0 → capacity refused, so the cascade never ran AT ALL
+    #   level=NOT-MEASURED   slots=0 slots_why=capacity     can_spawn=0 → capacity refused, so the LEVEL WALK never ran (the cascade block DID run — it is unconditional, and `cascade_issue_slots` zeroes the grant on `can=0`; only the ladder is gated on slots > 0). The block-never-ran case is NOT a token: it is a record with no `level=` at all.
     #   level=NOT-MEASURED   slots=0 slots_why=no_room|empty_backlog|backlog_drained|backlog_partial|backlog_unreadable|listing_unreadable
     #                                                                  → nothing above holds the room; the GRANT itself was 0
     #     ⛔ `empty_backlog` REQUIRES A MEASURED **AND CURRENT** EMPTY POOL (`state/queue-state` = `EMPTY`
