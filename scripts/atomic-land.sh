@@ -151,7 +151,21 @@
 #                       a read-only inspection.
 #   --no-wait           do not wait for the head's checks to become terminal;
 #                       hand the head to the rail as-is (its own "the head must
-#                       have been tested" precondition then decides).
+#                       have been tested" precondition then decides). ⛔ AND the
+#                       flag is CARRIED to the land step (#2465): it sets
+#                       ADMIN_MERGE_FIRST_CHECKS_WAIT=0 and
+#                       ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1 for that invocation, so the
+#                       rail's FIRST-CHECKS wait takes ONE observation and refuses by
+#                       name — instead of silently waiting its full 3900s window on a
+#                       head that a `--no-wait` caller explicitly declined to wait for.
+#                       The ONESHOT seam (not clearing the bounds) is what makes this
+#                       work with an inherited STALL/CEILING PRESENT: those bounds are
+#                       also terms of the rail's derived whole-attempt deadline, so
+#                       emptying them could refuse a legal ADMIN_MERGE_LOCK_TTL.
+#                       An explicit NON-ZERO ADMIN_MERGE_FIRST_CHECKS_WAIT in the
+#                       environment is never overridden (it asks for a bounded wait);
+#                       an explicit `0` already says what `--no-wait` says, so the carry
+#                       proceeds rather than making the flag a silent no-op.
 #   --wait-timeout S    bound on the terminal-CI wait (default 5400)
 #   --poll S            poll interval for the waits (default 30)
 #   --max-rounds N      rounds of update→verify→record→land (default 2, max 5):
@@ -2025,7 +2039,49 @@ do_land() {
   local flags=()
   if [ "$DRY_RUN" -eq 1 ]; then flags+=(--dry-run); fi
   if [ "${#MERGE_FLAGS[@]}" -gt 0 ]; then flags+=("${MERGE_FLAGS[@]}"); fi
-  bash "$ADMIN_MERGE" "$PR" ${repo_args[@]+"${repo_args[@]}"} ${flags[@]+"${flags[@]}"}
+  # ── --no-wait MUST REACH THE STEP THAT ACTUALLY WAITS (#2465) ─────────────
+  # `--no-wait` used to skip only THIS script's `[2/4] verify` and then hand the
+  # head to a land step that waits the rail's full FIRST-CHECKS window (3900s) —
+  # so a caller that explicitly asked NOT to wait still waited 65 minutes, once
+  # per round, and was told nothing. The rail has no `--no-wait` FLAG; its knob is
+  # `ADMIN_MERGE_FIRST_CHECKS_WAIT`, whose 0 seam means "one observation, no
+  # waiting" (the pre-#2090 instant refusal). Carry the caller's intent there, so
+  # `--no-wait` means the same thing at every step of the unit.
+  # ⛔ An ADMIN_MERGE_FIRST_CHECKS_WAIT ALREADY IN THE ENVIRONMENT WINS: the operator's
+  # explicit knob is a more specific instruction than a pass-through flag, and
+  # overriding it here would make the flag silently outrank the documentation.
+  # ⛔ EXCEPT WHEN IT ALREADY SAYS `0` (review round 3, P2). `WAIT=0` is the SAME
+  # instruction as `--no-wait`, so skipping the carry there made the flag a SILENT
+  # no-op: no ONESHOT, no log line, and — when a STALL/CEILING was inherited — the rail
+  # kept a LIVE bounded wait (8760s / 18064s) for a caller who declined to wait twice.
+  # Treating `0` as equivalent is not an override: it is the same intent, expressed
+  # twice, and it is what makes the one-shot seam reach the wait in every configuration.
+  local land_env=()
+  if [ "$NO_WAIT" -eq 1 ] \
+     && { [ -z "${ADMIN_MERGE_FIRST_CHECKS_WAIT:-}" ] || [ "${ADMIN_MERGE_FIRST_CHECKS_WAIT}" = 0 ]; }; then
+    land_env+=("ADMIN_MERGE_FIRST_CHECKS_WAIT=0")
+    log_line "atomic-land:     --no-wait carried to the rail: ADMIN_MERGE_FIRST_CHECKS_WAIT=0 (its FIRST-CHECKS wait takes ONE observation and refuses by name, instead of waiting up to 3900s on a head you declined to wait for)"
+    # ⛔ THE RAIL'S 0 SEAM IS CONDITIONAL — CARRYING THE WINDOW ALONE IS NOT ENOUGH
+    # (#2465 review round 2, P2). `admin-merge.sh` takes the "one observation" path
+    # only when the legacy window is 0 AND NEITHER progress bound is set, so an
+    # INHERITED STALL/CEILING leaves the wait ENABLED and bounds it there instead
+    # (defaults 8760 s / 18064 s) — a caller who explicitly declined to wait would
+    # still wait, under a log line promising the opposite. That is #2465's own defect
+    # one layer down.
+    # ⛔ AND CLEARING THE BOUNDS IS THE WRONG REMEDY. `ADMIN_MERGE_FIRST_CHECKS_CEILING`
+    # is ALSO a term of the rail's derived WHOLE-ATTEMPT bound (`rail_deadline_default`),
+    # which `rail_attempt_start` ties to `ADMIN_MERGE_LOCK_TTL` (the TTL must EXCEED it,
+    # or exit 2). Emptying it raises the reachable deadline — CEILING 600 -> 18064 takes
+    # the bound from 3990s to 21454s — so a legal operator configuration
+    # (`ADMIN_MERGE_LOCK_TTL=6000`) that used to land would REFUSE with exit 2, naming
+    # neither --no-wait nor the clearing. Measured, both ways, on this repo's rail.
+    # The rail therefore has a dedicated seam: ONESHOT asks for one observation WITHOUT
+    # touching the bounds, so the deadline and the lease relation stay exactly what the
+    # operator's own knobs imply. Carry the intent, never the arithmetic.
+    land_env+=("ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1")
+    log_line "atomic-land:     --no-wait also sets ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1: the rail's 0 seam only means 'one observation' when no progress bound is set, and clearing an inherited ADMIN_MERGE_FIRST_CHECKS_STALL/CEILING would ALSO move the derived whole-attempt deadline (CEILING is a term of it) and can be refused against ADMIN_MERGE_LOCK_TTL — so the progress bounds are left exactly as the operator set them and the one-shot intent rides its own seam"
+  fi
+  env ${land_env[@]+"${land_env[@]}"} bash "$ADMIN_MERGE" "$PR" ${repo_args[@]+"${repo_args[@]}"} ${flags[@]+"${flags[@]}"}
   return $?
 }
 
