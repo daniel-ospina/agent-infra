@@ -1236,7 +1236,7 @@ ck "the excluded key-gate.sh carries no spawn primitive, so its census exclusion
 # the arm therefore passed UNCONDITIONALLY ON ANY TREE — a false PASS in the one census whose job is to
 # be the place a second `pi` launcher cannot hide. Proved by mutation: appending `x = ["pi", "-p"]` to a
 # scratch copy of `scripts/turn-end.py` now reds this arm, where before it stayed green.
-_tn_code="$(sed 's/#.*//' "$HERE/../turn-end.py" 2>/dev/null)"
+_tn_code="$(sed 's/#.*//' "$HERE/turn-end.py" 2>/dev/null)"
 if grep -qE "[\"']pi[\"']" <<<"$_tn_code"; then rc=1; else rc=0; fi
 ck "the excluded turn-end.py is a NON-launcher (no quoted 'pi' command token; the pi token pair lives in its docstrings), so its census exclusion hides no launch path" $rc
 
