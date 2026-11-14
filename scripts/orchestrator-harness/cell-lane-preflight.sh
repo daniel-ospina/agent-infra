@@ -90,9 +90,14 @@
 # checkout is a different thing, and it has one):
 #   CELL_PREFLIGHT_REPO        the checkout to measure. Resolution order, first that EXISTS:
 #                              `--repo`, then `${CELL_PREFLIGHT_REPO}`, then `$PWD` (for a lane that is
-#                              the worktree it will build on), then the paths this repo actually
-#                              resolves cells with (`/tmp/cell-ai`, `/tmp/cell-t3`,
-#                              `${CELL_HOME}/agent-infra`), then `$HOME/tortoise`, `$HOME/agent-infra`.
+#                              the worktree it will build on), then `${CELL_HOME}/agent-infra`, then
+#                              the cell literals (`/tmp/cell-ai`, `/tmp/cell-t3`), then `$HOME/tortoise`,
+#                              `$HOME/agent-infra`. ⛔ THE ORDER IS LOAD-BEARING, so this line states
+#                              the CODE's order and not a tidier one: `${CELL_HOME}/agent-infra` must
+#                              outrank the `/tmp/cell-*` literals, because on a cell BOTH exist and the
+#                              literals name a checkout the lane does not build on — reading them first
+#                              measures the harness repo (or a live tortoise) while the lane builds the
+#                              other. `resolve_repo`'s own `tried=` note reports this same order.
 #                              Nothing found is `repo=none behind=unknown` — reported, never refused.
 #   CELL_PREFLIGHT_MAX_BEHIND  refuse when the checkout is MORE than this many commits behind
 #                              `origin/main`. Default 50.
