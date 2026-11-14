@@ -101,9 +101,15 @@ if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 # THE CONTRACT — one physical line, PER RUN, last in `$O/logs/lane-<N>.log`:
 #     outcome=<done|refused|failed|died> reason=<token> keygate=<state> lane=<N> rc=<status> utc=<timestamp>
 # ⛔ `keygate=` NAMES WHAT THE MODEL-CREDENTIAL GATE DID FOR THIS RUN (review: a bypass must be COUNTABLE). Its
-# vocabulary is closed and documented at the global's declaration below — and the field is ONE MORE THING a
-# reader can filter on: `grep -c 'keygate=off' "$O"/logs/lane-*.outcome` is the number of lanes on this box
-# whose credential assertion was switched off, which the prose `[key-gate]` line could never answer.
+# vocabulary is closed and documented at the global's declaration below. THE COUNT — one command, quoted
+# IDENTICALLY here and in the README, because two artifacts answering one question with different commands is
+# how the wrong one gets run during an incident:
+#     grep -hE '^outcome=.* keygate=off ' "$O"/logs/lane-[0-9]*.log
+# ⛔ IT READS THE LOG, NOT THE PER-RUN `.outcome` (review, P2, measured): the per-run file is written only by
+# the run that still OWNS the token, so a lane that was escape-invoked and then superseded by a later dispatch
+# writes `keygate=off` to the log only — counting from `.outcome` would report N when N+1 lanes escaped, i.e.
+# silently short in exactly the concurrent-redispatch shape the per-run file exists for. The log holds every
+# run (`^outcome=` anchored, so a transcript line that merely mentions the token cannot match).
 # ⛔ PER RUN, AND THE READ MUST BE RUN-SCOPED (review round 4/5, P2, measured). The lane log is
 # APPEND-ONLY (`tee -a` / `>>`, nothing truncates it), so a re-dispatched issue leaves the PREVIOUS
 # attempt's terminal line in the same file — and `grep '^outcome=' | tail -1` then answers "this lane has

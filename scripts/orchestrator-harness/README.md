@@ -3041,10 +3041,17 @@ finding: the bypass was visible only as prose). The vocabulary is closed and the
 | `notrun` | the gate could not produce a verdict (its probe failed, or `$O/state` was unwritable) |
 | `unreached` | the lane ended BEFORE the gate (a `repo-target` 72, an early 78, a signal during startup). Never a pass |
 
-So "how many lanes on this box had the credential assertion switched off?" is one command over the run-scoped
-files — `grep -h 'keygate=off' "$O"/logs/lane-[0-9]*.outcome` — and an absent line, or `unreached`, can never
-be read as a pass. The `[key-gate] … reason=--key-gate-off` prose line stays: the field is for instruments, the
-sentence is for the operator.
+So "how many lanes on this box had the credential assertion switched off?" is ONE command, quoted identically
+in `lane.sh`'s contract block — `grep -hE '^outcome=.* keygate=off ' "$O"/logs/lane-[0-9]*.log` — and an absent
+line, or `unreached`, can never be read as a pass. The `[key-gate] … reason=--key-gate-off` prose line stays:
+the field is for instruments, the sentence is for the operator.
+
+⛔ **IT READS THE LOG, NOT THE PER-RUN `.outcome`** (review, P2): the per-run file is written only by the run
+that still OWNS the ownership token, so an escape-invoked lane that was superseded by a later dispatch of the
+same issue writes `keygate=off` to the log only. Counting from `.outcome` would therefore report N when N+1
+lanes escaped — silently short in exactly the concurrent-redispatch shape the per-run file exists for. The
+log holds every run, and the `^outcome=` anchor keeps a transcript line that merely mentions the token from
+matching.
 
 ⛔ **THE TRAP'S COVERAGE IS NOT UNIVERSAL, AND THE GAP IS THE ONE WORTH KNOWING** (review cycle 1, P2).
 A process killed by `SIGKILL` (the OOM killer) or replaced by `exec` runs NO trap, so it writes no line
