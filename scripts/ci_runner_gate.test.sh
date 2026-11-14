@@ -1384,9 +1384,12 @@ assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated queue read relabell
 # clause's plain absence, and a `scanned`-gated rewrite, both leave it green because that arm refuses
 # at the same line whatever the note says.
 # ⛔ AND WHAT THIS ARM DOES NOT PIN: a claim about the CANDIDATE LIST'S LENGTH (review cycle 8, F1 —
-# MEASURED). This arm passes no `GH_QUEUE_ROWS_SPEC`, so the stub serves its default single head row and
-# the scan reads ONE synthesised candidate; the clause used to say "the candidate list is ONE page of
-# 100 runs" over that one-row list, and this arm asserted the phrase — pinning a falsehood. The clause
+# MEASURED). This arm passes no `GH_QUEUE_ROWS_SPEC`, so `queue_rows_field` serves its DEFAULT single
+# head row and the scan reads a ONE-ROW PAGE — the row comes from the PAGE field, NOT the synthesised
+# candidate on the degrade path (cycle 9 instrumented the branch: n=1 page rows, zero degrade hits;
+# naming the degrade shape was that cycle's own F1 defect). The clause used to say "the candidate list
+# is ONE page of 100 runs" over that one-row list, and this arm asserted the phrase — pinning a
+# falsehood. The clause
 # now claims only what the branch establishes (the READ REQUEST is at most one page, and the QUEUE is
 # deeper than a page), so the assertion below is true of the one-row list as well as of a full page.
 # The clause's own wording is a REQUIRED token (`cannot see past it`): `ONE page of` alone would also be

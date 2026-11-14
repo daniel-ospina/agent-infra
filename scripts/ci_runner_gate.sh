@@ -959,8 +959,14 @@ print(comp, len(inc))
         # about, and the sentence asserts only the READ REQUEST and the QUEUE DEPTH, the two facts the
         # `queued > QUEUE_PAGE` operand actually establishes. (The single synthesised candidate on the
         # degrade path above cannot reach here: one candidate means `scanned` tops out at 1, and
-        # `1 > bound` needs a bound of 0, which is refused by name above. The sibling SATURATED
-        # surface's `page-saturated-at-page` arm IS that shape — reachable there, not here.)
+        # `1 > bound` needs a bound of 0 — a literal `0` is refused by name above, and a `00` spelling
+        # slips that case (pre-existing, fail-closed, out of scope here). ⛔ The sibling SATURATED
+        # surface's `page-saturated-at-page` arm is NOT that shape either: it passes no
+        # `GH_QUEUE_ROWS_SPEC`, so the stub's `queue_rows_field` serves its DEFAULT single head row and
+        # the scan reads a ONE-ROW PAGE — the row comes from the PAGE field, so the degrade branch is
+        # never reached (cycle 9 instrumented it: n=1 page rows, zero degrade hits). A synthesised
+        # candidate DOES reach the saturated refusal, but only when that sole candidate carries demand
+        # — a shape no arm drives. Naming it as the arm's shape was the cycle-9 F1 defect.)
         log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing; raise QUEUE_HEAD_SCAN_MAX's default in this file, or run ONE pass by hand with CI_GATE_QUEUE_HEAD_SCAN_MAX=<n> (a farmed copy is overwritten on sync and the launchd job carries only HOME/PATH, so the env knob is a hand-run stopgap)$(if [ "$queued" -gt "$QUEUE_PAGE" ]; then printf '; this read asks for at most ONE page of %s runs and the queue is deeper than that, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"; return 2
       fi
     fi
@@ -1133,11 +1139,14 @@ print(age)
   # the same distinction the TRUNCATED branch pins from the other side with its `scanned` gate.
   # ⛔ AND IT DOES NOT CLAIM HOW MANY ROWS THE CANDIDATE LIST HELD (agent-infra#3995 review cycle 8,
   # F1). `queued > QUEUE_PAGE` proves the PAGE REQUEST could not carry the queue; it says nothing about
-  # the list the scan read, which on this branch can be ONE synthesised candidate (`queue_rows` absent
-  # but `head_run_id` present ⇒ `candidates="$head_run_id,$oldest_created"` above). Measured: the
-  # cycle-7 arm `page-saturated-at-page` drove exactly that shape and the old wording asserted "the
-  # candidate list is ONE page of 100 runs" over a ONE-row list — the misdiagnosis class this change
-  # exists to remove. The sentence now names the READ REQUEST and the QUEUE DEPTH, both established.
+  # the list the scan read, which on this branch may be as little as ONE ROW. Measured: the cycle-7 arm
+  # `page-saturated-at-page` reads a ONE-ROW PAGE — it passes no `GH_QUEUE_ROWS_SPEC`, so the stub's
+  # `queue_rows_field` serves its DEFAULT single head row, and that row comes from the PAGE field, NOT
+  # the synthesised candidate on the degrade path above (cycle 9 instrumented the branch and measured
+  # n=1 page rows, zero degrade hits; naming the degrade shape was the cycle-9 F1 defect). Over that
+  # one-row list the old wording asserted "the candidate list is ONE page of 100 runs" — the
+  # misdiagnosis class this change exists to remove. The sentence now names the READ REQUEST and the
+  # QUEUE DEPTH, both established.
   if [ "$queued" -gt "$QUEUE_PAGE" ]; then
     log "queue ($queued) is DEEPER than the read page ($QUEUE_PAGE) while the length leg did not decide (threshold $QUEUE_THRESHOLD) — the queue head cannot be measured (the page is newest-first, so its min is only a lower bound); FAIL-CLOSED, changing nothing$(if [ "$QUEUE_HEAD_SCAN_MAX" -ge "$QUEUE_PAGE" ]; then printf '; this read asks for at most ONE page of %s runs and the queue is deeper than that, so CI_GATE_QUEUE_HEAD_SCAN_MAX at or above %s cannot see past it — a deeper read is a code change, not a knob' "$QUEUE_PAGE" "$QUEUE_PAGE"; fi)"
     return 2
