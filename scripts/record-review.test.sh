@@ -3104,7 +3104,7 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:7963 at this head — RE-DERIVE it, do not trust the number: a bare
+#      (scripts/record-review.sh:8423 at this head — RE-DERIVE it, do not trust the number: a bare
 #      line citation here has rotted before, and this comment is not what makes
 #      the assertion true). One command answers it (origin/main bd1b205d is :6225):
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
@@ -4865,6 +4865,1473 @@ $VACUITY_BLOCK"
   assert_eq "$RECORD_RC" "3" "13n5 the declaration is caught in either order (rc 3)"
   [ ! -f "$(Q2 424796)" ] && ok "13n5 no record minted regardless of the two lines' order" || bad "13n5 minted a record with the declaration first"
 
+# 13n6-13n11 — THE DECLARED BLOCKING COUNT (agent-infra#2661, measured on tortoise#9859).
+# THE DEFECT: the three arms all missed a review whose own `Outcome:` field declares blocking
+# findings. Arm (1) vetoes the aborted-EXIT vocabulary (this review did not abort — it CONCLUDED
+# with blockers); arm (1b) accepts only the literal `Outcome: not-clean` SPELLING; arm (2) is
+# SUPPRESSED by the presence of an `Outcome:` field and would not have matched the text anyway. So
+# `Outcome: 3 findings — 2 blocking (P1)` was admitted and a `verdict=clean` record could be minted
+# over it — the outcome #7391/tortoise#3549 exist to prevent.
+# The authority for the rule is the file that OWNS the vocabulary
+# (`skills/code-review/references/fixer-loop.md`): "The gate clears on ZERO BLOCKING findings, not
+# on zero findings."
+#
+# ⛔ 13n6 IS THE REAL ARTIFACT, VERBATIM — `tortoise#9859` issue comment 6381081933, fetched with
+# `gh api` and pasted unchanged. It is NOT a paraphrase: the whole claim is that THIS body was
+# admitted, and a hand-written approximation of it would prove nothing about the artifact that did
+# the damage. It is carried in a QUOTED heredoc because the body is full of backticks, `$` and
+# single quotes that a shell-quoted assignment would execute or mangle.
+#
+# ⛔ THE ESCAPE VECTORS (13n7/13n10) CARRY THE #3442 BLOCK. Without it a green result would be a
+# green for the NON-VACUITY arm's reason, not for the escape's — the unrelated-row trap #3442 names.
+# The VETO vectors carry it too, so a red is attributable to (1c) and not to a second contract.
+# ⛔ THE HEREDOC LIVES IN A FUNCTION BODY, NOT IN THE SUBSTITUTION — the remedy #2248 landed and
+# `scripts/check-bash32-parse.sh` documents: bash 3.2's `$( )` scanner walks a heredoc body as
+# if it were CODE, so the unbalanced parens and quotes inside a real review comment
+# desynchronise the parse for the rest of THIS file. macOS `/bin/bash` is 3.2, so the first
+# cut of this fixture broke the platform the harness actually runs on while parsing clean on
+# bash 5 — and the suite is a shipped script, so the parse gate is right to red it.
+_n9859_real_body() { cat <<'N9859_REAL_BODY_EOF'
+## Code review — PR #9859 (@@BT@@fix/5006-near-dup-merge@@BT@@, head @@BT@@3e669aa6a@@BT@@)
+
+**Outcome: 3 findings — 2 blocking (P1), 1 documentation (P2).** Everything else I traced
+is sound; the specifics are in "Verified clean" below so the fixer does not re-derive them.
+
+Reviewed at the PR head, full files (not hunks): @@BT@@tortoise/near_dup_merge.py@@BT@@ (new, 424 lines),
+@@BT@@tortoise/extractor_v2.py@@BT@@, @@BT@@tortoise/sdk.py@@BT@@ (the @@BT@@_extract_session_v2@@BT@@ capture path),
+@@BT@@tortoise/vet_gate.py@@BT@@, @@BT@@tests/test_near_dup_merge_5006.py@@BT@@, @@BT@@config/ci-surfaces.yml@@BT@@,
+@@BT@@config/v4-mechanisms.yml@@BT@@, and the two architecture docs.
+
+---
+
+### F1 — BLOCKING (P1): the verdict→fusion routing key is clipped differently on each side, so a @@BT@@MERGE@@BT@@ verdict is silently ignored for any candidate over 1000 characters — and a duplicate Point is minted
+
+@@BT@@tortoise/extractor_v2.py:7895@@BT@@ @@BT@@_merge_flagged_contents@@BT@@ builds the key as
+
+@@BT@@@@BT@@@@BT@@python
+text = str(d.get("text") or "").strip()
+if text:
+    flagged.add(_norm(text))          # ← no [:_MAX_CONTENT] clip
+@@BT@@@@BT@@@@BT@@
+
+@@BT@@execute_embed@@BT@@ looks the flag up with a **clipped** content (@@BT@@extractor_v2.py:7030@@BT@@):
+
+@@BT@@@@BT@@@@BT@@python
+content = str(p.get("content", "")).strip()[:_MAX_CONTENT]   # _MAX_CONTENT = 1000 (line 3287)
+...
+merge_flagged=n in merge_flagged                              # line 7077
+@@BT@@@@BT@@@@BT@@
+
+@@BT@@_norm@@BT@@ (line 3248) does **no** truncation — it only lower-cases and collapses whitespace. So for a
+candidate whose content exceeds 1000 characters the two sides normalise **different strings** and
+@@BT@@n in merge_flagged@@BT@@ is @@BT@@False@@BT@@.
+
+Consequence, traced through @@BT@@classify_consolidation@@BT@@: @@BT@@merge_flagged=False@@BT@@ ⇒ the @@BT@@#9424@@BT@@ guard
+@@BT@@if not _attachments_preserved(p, point): … continue@@BT@@ refuses the fold ⇒ the claim falls to **@@BT@@ADD@@BT@@**
+⇒ a second Point is minted for a pair the arbiter marked @@BT@@MERGE@@BT@@. That is exactly the pre-#5006
+defect (de-facto duplicate) and it is **silent** — no warning, @@BT@@stats["merges"]@@BT@@ stays 0, and the
+registry row reads @@BT@@implemented@@BT@@.
+
+This is not a new convention question: @@BT@@vet_gate._normalised_text_variants@@BT@@ (@@BT@@vet_gate.py:290@@BT@@) already
+keeps **both** @@BT@@_norm(raw)@@BT@@ and @@BT@@_norm(raw[:_MAX_CONTENT])@@BT@@ precisely because the write path caps at
+1000 — the new routing function skips the mirror of that and is the only consumer of a VET decision
+that does.
+
+Same class, one line up: VET's @@BT@@text@@BT@@ is @@BT@@_item_text@@BT@@ = @@BT@@name or content@@BT@@ (@@BT@@vet_gate.py:289@@BT@@), so a
+@@BT@@points@@BT@@ item that carries a @@BT@@name@@BT@@ key keys the verdict on the **name** while @@BT@@execute_embed@@BT@@ keys on
+the **content**. @@BT@@vet_gate@@BT@@'s own docstring calls out that items can carry both keys.
+
+**Fix:** clip at the routing site (accept both variants, mirroring @@BT@@_normalised_text_variants@@BT@@), or key
+on the field the write path actually keys on.
+
+**Settlement (fixer runs this, not me):**
+@@BT@@@@BT@@@@BT@@bash
+TORTOISE_TEST_CARVE_OUT=1 uv run pytest tests/test_near_dup_merge_5006.py -q -k flagged
+# add: assert v2._merge_flagged_contents({"decisions": {"p": {"section": "points", "outcome": "MERGE",
+#        "text": "x" * 1200}}}) == frozenset({v2._norm(("x" * 1200)[:v2._MAX_CONTENT])})
+@@BT@@@@BT@@@@BT@@
+
+---
+
+### F2 — BLOCKING (P1): the fusion write applies **no** subject-channel skip, so a union name that is a subject-kind name also naming an existing @@BT@@:Object@@BT@@ gets an un-gated @@BT@@aboutObject@@BT@@ edge that capture deliberately refuses
+
+Capture's attachment pass, @@BT@@tortoise/sdk.py:12118-12131@@BT@@:
+
+@@BT@@@@BT@@@@BT@@python
+_n = name.strip()
+if _n in subject_entity_names:
+    # #1370: the binder owns the gated @@BT@@aboutSubject@@BT@@ edge; the topic channel must
+    # not produce an un-gated one, nor an id-less Object stub for a subject-kind name
+    continue
+_oid_rows = proj.g.query("MATCH (o:Object {name:$n}) RETURN o.id", …)
+@@BT@@@@BT@@@@BT@@
+
+@@BT@@apply_merge_union@@BT@@ (@@BT@@tortoise/near_dup_merge.py@@BT@@, attachment loop) has **no equivalent guard**: every
+union name is resolved with @@BT@@MATCH (o:Object {name:$n})@@BT@@ and linked via @@BT@@link_entity@@BT@@. The module's own
+docstring states the premise that makes this reachable — *"@@BT@@about_entities@@BT@@ is not object-only — the
+SUBJECT channel (team/role/person, the gated @@BT@@aboutSubject@@BT@@ edge) also contributes names to it"* — and
+then bounds the consequence to *"a subject-kind attachment … lands in @@BT@@unresolved@@BT@@ instead of being
+bound"*. **That bound is false in the coincidence case**: @@BT@@sdk.py:11849-11857@@BT@@ (F6) records explicitly
+that an @@BT@@:Object@@BT@@ may legitimately share a subject's name (that is why the skip is exact-name, not
+case-folded), and in exactly that case the fusion mints the un-gated @@BT@@aboutObject@@BT@@ edge capture's @@BT@@if
+_n in subject_entity_names: continue@@BT@@ exists to prevent (#4934 label leak).
+
+The guard is available at the call site — the merge block is @@BT@@sdk.py:12327-12332@@BT@@, inside
+@@BT@@_extract_session_v2@@BT@@, and @@BT@@subject_entity_names@@BT@@ is built at @@BT@@sdk.py:11857@@BT@@ in the same function — so
+this is a filter at the call site or a new argument, not a redesign.
+
+**Wrong outcome:** a Point gains an attachment to an Object under a subject's name — an edge the same
+capture path refuses to write on the normal (non-merge) route. The merge is supposed to *preserve*
+attachments, not add forbidden ones.
+
+---
+
+### F3 — P2 (documentation, same file this PR edits): @@BT@@vet_gate.py@@BT@@'s docstring now contradicts itself, and the axis list is one token short
+
+@@BT@@tortoise/vet_gate.py:85-88@@BT@@ still says:
+
+> A merge candidate is flagged @@BT@@MERGE@@BT@@ and **recorded in the VET evidence surface only — nothing
+> consumes it yet**: no code routes a @@BT@@MERGE@@BT@@ verdict to S3, and the merge *itself* is #5006's
+
+and @@BT@@vet_gate.py:89-96@@BT@@, added by this PR, says:
+
+> ✅ **Updated (#5006) — the verdict HAS a consumer now.**
+
+Both statements are in the same docstring, six lines apart, and the stale one was left in place. Also
+@@BT@@vet_gate.py:82-84@@BT@@ still lists @@BT@@extractor_v2.DecisionRecord@@BT@@'s consolidation axis as
+@@BT@@ADD/UPDATE/NOOP/DELETE@@BT@@ — it is five tokens now.
+
+**Why it matters here rather than as a nit:** this repo treats a record that cannot distinguish a
+deliberate ruling from an accident of history as the failure mode (@@BT@@OVERRIDES:@@BT@@/contradiction-test
+rules) — and a lane reading the first paragraph concludes the mechanism is unimplemented, which is the
+state #5006 exists to end. The fix is to delete the superseded sentence (and extend the axis list), not
+to append a third note.
+
+---
+
+### Verified clean (so the fixer does not re-open these)
+
+- **Manifest integrity** — @@BT@@config/ci-surfaces.yml@@BT@@ registers @@BT@@test_near_dup_merge_5006.py@@BT@@ exactly
+  once on the @@BT@@core@@BT@@ surface (line 3837), with the correct rationale for this repo's selector
+  (@@BT@@extractor_v2.py@@BT@@ is not a @@BT@@SHARED_MODULE@@BT@@ ⇒ a diff touching only it selects @@BT@@core@@BT@@), and a
+  @@BT@@durations@@BT@@ row (line 8076) so the #3400 coverage floor is not dropped. No duplicate entry, no
+  @@BT@@carve_out@@BT@@/@@BT@@TEST_NO_REDIRECT_STEMS@@BT@@ mirror needed: @@BT@@tests/test_embedded_lifecycle.py@@BT@@ explicitly
+  allows @@BT@@TortoiseSDK(@@BT@@ everywhere, and the redirect derives a per-path graph from @@BT@@tmp_path@@BT@@, so the
+  two graph fixtures are isolated in both the docker and embedded lanes.
+- **@@BT@@merge_flagged=False@@BT@@ really is byte-identical** to pre-#5006: both new refusal branches are
+  guarded by @@BT@@merge_flagged@@BT@@, and the final @@BT@@if best_noop is not None and (best_merge is None or …)@@BT@@
+  short-circuits on @@BT@@best_merge is None@@BT@@. The only production caller of @@BT@@classify_consolidation@@BT@@ is
+  @@BT@@execute_embed@@BT@@, so no other consumer had to learn a fifth outcome.
+- **The verdict is genuinely necessary, never sufficient**: @@BT@@near_dup_merge@@BT@@'s ladder refuses on
+  @@BT@@not flagged@@BT@@ → non-empty @@BT@@identity@@BT@@ → @@BT@@difference is not None@@BT@@ → @@BT@@below_bar@@BT@@ → @@BT@@unreadable_attachments@@BT@@
+  → @@BT@@nothing_to_union@@BT@@, and @@BT@@_boundary@@BT@@ is called once per pair in @@BT@@classify_consolidation@@BT@@ (so
+  @@BT@@difference is not None@@BT@@ already subsumes a non-empty identity set — the ladder cannot disagree with
+  the classifier).
+- **Both false-PASS fixes hold**: @@BT@@contained@@BT@@ and the id-less @@BT@@linked@@BT@@ both read @@BT@@RETURN count(*)@@BT@@, and
+  a @@BT@@MATCH@@BT@@ that resolves nothing returns 0 rather than counting the attempt. @@BT@@link_entity@@BT@@ returns
+  only 0/1 by its own contract, so @@BT@@linked@@BT@@ stays a measurement on both branches.
+- **The union's case contract is right and is pinned**: comparison case-folds (@@BT@@_entity_names@@BT@@), the
+  emitted spelling is the prior's/original, and @@BT@@apply_merge_union@@BT@@ resolves with an exact
+  @@BT@@Object {name:$n}@@BT@@ — matching @@BT@@sdk.py:12136@@BT@@. The test fixtures are capitalised so the
+  lowered-union mutation is discriminating.
+- **No vacuous test** that would pass on pre-fix code: every behavioural test either imports the new
+  module, passes @@BT@@merge_flagged=@@BT@@ (a @@BT@@TypeError@@BT@@ pre-fix), or reads @@BT@@result["merges"]@@BT@@ (a @@BT@@KeyError@@BT@@
+  pre-fix). @@BT@@TestTheCapturePathExecutesTheFusion@@BT@@ genuinely covers the one production invocation — the
+  merge block sits after @@BT@@_write_session_and_turns@@BT@@ (@@BT@@sdk.py:10565@@BT@@ before @@BT@@10746@@BT@@), so the Session
+  node exists, and a deleted block loses both the @@BT@@aboutObject@@BT@@ edges and the
+  @@BT@@(Session)-[:CONTAINS]->(Point)@@BT@@ edge the test asserts on.
+- **No injection surface**: every Cypher statement in @@BT@@near_dup_merge.py@@BT@@ is parameterised; the only
+  interpolated identifiers are literals; no @@BT@@eval@@BT@@, no file writes, no secrets.
+- **Registry/docs consistency**: @@BT@@<!-- v4-mechanism: near_dup_merge -->@@BT@@ is present in both
+  @@BT@@declared_in:@@BT@@ documents (@@BT@@EXTRACTOR-V4-ARCHITECTURE.md:1740@@BT@@, @@BT@@STORAGE-ARCHITECTURE.md:1448@@BT@@), the
+  registry row carries @@BT@@code@@BT@@/@@BT@@tests@@BT@@/@@BT@@symbols@@BT@@, and no test pins a literal implemented/absent count.
+  The stale *"The flagged verdict has no consumer yet"* sentence at
+  @@BT@@EXTRACTOR-V4-ARCHITECTURE.md:774@@BT@@ **is** updated by this PR.
+- **Inertness is declared, not hidden** — @@BT@@implemented@@BT@@ + "with no arbiter injected it is INERT" is
+  stated in the registry note, the design doc, both changelogs and the test docstring, and no
+  production caller injects @@BT@@vet_arbiter@@BT@@. Same posture VET (already @@BT@@implemented@@BT@@) ships with, so it
+  is consistent rather than a new claim.
+
+**Not run (no @@BT@@.venv@@BT@@ in this checkout; execution is the fixer's step):** @@BT@@uv run pytest@@BT@@ for the
+listed batteries, @@BT@@uv run ruff check@@BT@@, and @@BT@@tools/ci_selection.py --integrity@@BT@@. The manifest reasoning
+above is from the selector source, not from a run.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| 13n6 the guard refuses a review that DECLARES a blocking count | sed s/outcome_declares_blocking/false/ x.sh | 13n6 | rc=0, wanted 3 |
+N9859_REAL_BODY_EOF
+}
+N9859_BODY="$(_n9859_real_body)"
+# ⛔ 20h48b FORBIDS A LIVE BACKTICK ON ANY NON-COMMENT LINE OF THIS FILE (a label once EXECUTED its
+# own backticks), and the real review body is full of them. They therefore travel as `@@BT@@` and
+# are materialised here — `printf '\140'` is the same no-live-backtick trick 20h48b's own control
+# uses, and the substitution keeps the body BYTE-IDENTICAL to the artifact.
+N9859_BT="$(printf '\140')"
+N9859_BODY="${N9859_BODY//@@BT@@/$N9859_BT}"
+rm -f "$(Q2 425010)"
+EV_REF="comment:42501001" run_record_ev 425010 STUB_EVIDENCE_BODY="$N9859_BODY"
+assert_eq "$RECORD_RC" "3" "13n6 the REAL tortoise#9859 artifact — 'Outcome: 3 findings — 2 blocking (P1)' — is REFUSED (rc 3)"
+[ ! -f "$(Q2 425010)" ] && ok "13n6 no clean record minted over a review that declares 2 blocking P1s" || bad "13n6 a clean record WAS minted over a review declaring blocking findings — the #2661 false PASS"
+assert_contains "$RECORD_ERR" "DECLARES blocking findings" "13n6 …and the refusal NAMES the declaration, not a generic unverified-evidence diagnostic"
+assert_contains "$RECORD_ERR" "2 blocking" "13n6 …quoting the Outcome line, so the lane sees WHICH count blocked it"
+
+# 13n7 — THE OVER-BLOCK GUARD for the 'resolved' escape: a clean review that names its blockers as
+# CLOSED is clean evidence, and must keep recording. Without this the arm would false-refuse every
+# review that reports its fixes — the tortoise#8866 class this file has already paid for once (§13n).
+rm -f "$(Q2 425011)"
+EV_REF="comment:42501101" run_record_ev 425011 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed and re-verified.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n7 a clean outcome naming its blockers as RESOLVED still records (rc 0)"
+R13N7="$(cat "$(Q2 425011)" 2>/dev/null || true)"
+assert_contains "$R13N7" '"evidence":"comment:42501101"' "13n7 the clean artifact is what the record names"
+
+# 13n8 — A CLEAN VERDICT DOES NOT CANCEL A LIVE BLOCKER. This is the mixed declaration (the
+# §13n4/§13n5 rule, applied to the count): pasting `Outcome: CLEAN` in front of a standing blocker is
+# a declaration of a blocker, not a suppression of one.
+rm -f "$(Q2 425012)"
+EV_REF="comment:42501201" run_record_ev 425012 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) remain.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n8 'Outcome: CLEAN' does NOT cancel a declared live blocking count (rc 3)"
+[ ! -f "$(Q2 425012)" ] && ok "13n8 no record minted over a live blocker wearing a clean verdict" || bad "13n8 minted a record over a live blocking count"
+
+# 13n9 — THE PERSISTENCE QUALIFIER, on a body the (b) window does NOT carry: it has no COPLA, so
+# (b) never matches and (c) is never consulted — the veto comes from the bare `block(ing|ers?)`
+# fall-through at the end. ⛔ THIS ROW DOES NOT PIN (c), and saying it did was false: MEASURED at
+# c33ae248b, deleting the (c) clause left every row in this section green (review F2). It still earns
+# its place as "a line naming two blockers is not clean", but the (c) pin is 13n9b.
+rm -f "$(Q2 425013)"
+EV_REF="comment:42501301" run_record_ev 425013 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking fixed, 1 blocking remain.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n9 'fixed' does not excuse the blocker that is still REMAINING (rc 3)"
+[ ! -f "$(Q2 425013)" ] && ok "13n9 no record minted while one of the declared blockers remains" || bad "13n9 minted a record over the remaining blocker"
+
+# 13n9b — a VETO row that (review F2) USED TO BE the only pin on (c). It carries the COPLA 13n9
+# lacks, so (b) MATCHES and (c) is what cancels it — but F3's count predicate now vetoes it too (the
+# line declares TWO live blocking mentions), so deleting (c) leaves THIS row green. It stays because
+# "a copula body with a standing blocker is not clean" is worth a row of its own; the (c) pin is
+# 13n29, the row with ONE live mention that (c) alone can catch. ⛔ A row whose verdict also holds for
+# a second reason is not a pin for the first — calling it one is the unrelated-row trap #3442 names.
+rm -f "$(Q2 425026)"
+EV_REF="comment:42502601" run_record_ev 425026 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed, 1 blocking remains.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n9b the (c) persistence cancel stops a COPLA body from recording clean (rc 3)"
+[ ! -f "$(Q2 425026)" ] && ok "13n9b no record minted while the copula half says one blocker remains" || bad "13n9b minted a record over the remaining blocker"
+
+# 13n10 — LINE SCOPING, and it is the arm's most important over-block guard. `gh --jq @tsv` frames
+# the body with every newline as the TWO characters `\n`, so grep sees the WHOLE comment as ONE
+# line; a body-wide `outcome:.*blocking` would veto a legitimate clean review for a 'blocking' that
+# appears ten paragraphs later. This body is exactly that: a clean Outcome line, and a fixer note
+# about cycle-1 blockers far below it.
+rm -f "$(Q2 425014)"
+EV_REF="comment:42501401" run_record_ev 425014 STUB_EVIDENCE_BODY="**Outcome: CLEAN — verified.**
+
+Prose far below the declaration body: the 2 blocking findings from cycle 1 were fixed in 9f1a2b3 and
+re-verified at the same head; no follow-up is owed.
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n10 the arm is LINE-SCOPED: a 'blocking' mention far from the Outcome line does not refuse a clean review (rc 0)"
+
+# 13n11 — the singular 'blocker' spelling, and the SINGULAR case is not decoration: `blockers?` in one
+# branch and a bare `blocking` in the other is how a vocabulary arm silently covers half its inputs.
+rm -f "$(Q2 425015)"
+EV_REF="comment:42501501" run_record_ev 425015 STUB_EVIDENCE_BODY="**Outcome: 1 blocker, 3 follow-ups.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n11 the singular 'blocker' spelling is a declared blocking finding too (rc 3)"
+
+# 13n13-13n17 — THE ESCAPES ARE PREDICATED ON THE COUNT THEY ESCAPE (agent-infra#2661 review, F1).
+# The first cut's escapes were evaluated LINE-WIDE and UNPREDICATED, so a one-word variant of the very
+# artifact 13n6 refuses still recorded `clean`. All four bodies below were MEASURED admitted against
+# that head — a live blocking declaration cancelled by an unrelated token in its own follow-up clause.
+# ⛔ WHAT THESE ROWS ACTUALLY PIN, corrected at agent-infra#3902 review F5: 13n13/13n14 are VETO rows,
+# so they are satisfied by the FALL-THROUGH veto and cannot red when escape (a) is deleted (measured).
+# 13n18 is the escape's real pin. The rows are still valid behavioural assertions; only their
+# attribution was wrong, and that wrong attribution is how F1 shipped green.
+# The root is a known rule-design error: an exception must be scoped to the match it excepts, never to
+# the line it happens to share (the rule Semgrep's `pattern-not`, OPA's negation builtins and Apache
+# Traffic Server's regex guidance all state).
+#
+#   (a) matched the `non-blocking` mention and discarded the `2 blocking` declaration beside it —
+#       structurally the same defect 13n9 exists to stop, on the OTHER escape.
+#   (b) matched `closed` inside "an unclosed session" and `fixed` inside "the fixed-width clip", and
+#       would have matched a transitive "closed the socket" — a description is not a resolution.
+#
+# Each vector carries $VACUITY_BLOCK so a red is attributable to (1c) and not to a second contract.
+rm -f "$(Q2 425020)"
+EV_REF="comment:42502001" run_record_ev 425020 STUB_EVIDENCE_BODY="**Outcome: 3 findings — 2 blocking (P1), 2 non-blocking (P3).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n13 the negated escape does NOT cancel a live count on the same line (rc 3)"
+[ ! -f "$(Q2 425020)" ] && ok "13n13 no record minted over 2 blocking P1s wearing a 'non-blocking' follow-up" || bad "13n13 minted a record — escape (a) cancelled a live declaration"
+
+rm -f "$(Q2 425021)"
+EV_REF="comment:42502101" run_record_ev 425021 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) plus 3 non-blocking notes.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n14 'plus 3 non-blocking notes' does not cancel 2 declared blockers (rc 3)"
+# ⛔ 13n13 AND 13n14 DO NOT PIN ESCAPE (a), AND SAYING THEY DID WAS FALSE (agent-infra#3902 review,
+# F5 — MEASURED). Both are VETO rows, and a VETO row structurally CANNOT pin an ADMIT-ONLY escape:
+# deleting escape (a) only makes the arm veto MORE, so both stay green with `live_count` gone. They
+# earned their place as "a line naming two blockers is not clean" — the fall-through veto produces
+# that — but the escape's real pin is the OVER-BLOCK control 13n18, and `live_count`'s own pin is
+# 13n76. Kept, and re-labelled, rather than deleted: the behaviour they assert is still required.
+# The consequence of that mis-labelling is not academic: 13n18's body uses no SPELLED count, which is
+# exactly how F1 (escape (a) gated on a digit-only `live_count`) shipped green. 13n65-13n67 close
+# that hole on the VETO side and 13n76 proves the guard load-bearing.
+
+rm -f "$(Q2 425022)"
+EV_REF="comment:42502201" run_record_ev 425022 STUB_EVIDENCE_BODY="**Outcome: 1 blocking (P1), an unclosed session is leaked.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n15 'unclosed' in the finding's DESCRIPTION is not a resolution claim (rc 3)"
+
+rm -f "$(Q2 425023)"
+EV_REF="comment:42502301" run_record_ev 425023 STUB_EVIDENCE_BODY="**Outcome: 1 blocking (P1) — the fixed-width clip drops the fold.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n16 'fixed-width' is not the word 'fixed' — the verb's RIGHT boundary excludes '-' (rc 3)"
+
+rm -f "$(Q2 425024)"
+EV_REF="comment:42502401" run_record_ev 425024 STUB_EVIDENCE_BODY="**Outcome: 1 blocking (P1) — closed the socket too early.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n17 a transitive 'closed' with NO copula is a description, not a resolution (rc 3)"
+
+# 13n18 — THE OVER-BLOCK CONTROL for the whole F1 narrowing. Requiring a copula and a count must not
+# take the (a) escape with it: a clean review that only ever mentions NON-blocking findings, with no
+# live count on the line, still records. Without this vector the obvious over-correction (veto
+# anything containing "blocking") would pass every other row in this section.
+rm -f "$(Q2 425025)"
+EV_REF="comment:42502501" run_record_ev 425025 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 non-blocking (P3) findings, filed as follow-ups.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n18 a clean outcome naming only NON-blocking findings still records (rc 0)"
+
+# 13n19 — THE ROW THAT PINS `tsv_decode` (review F2). 13n10 is RESCUED by escape (b), so it stays
+# green with the decoder replaced by the identity; this body is not: a clean `Outcome:` line and, on
+# a LATER line, a blocker. Line scoping is the whole reason the decoder exists — with
+# `decoded="$1"` grep sees the framed body as ONE line, the `Outcome:` anchor and the `blocking`
+# mention land on it together, and the veto fires. Nothing else in this section exercises the framing.
+rm -f "$(Q2 425027)"
+EV_REF="comment:42502701" run_record_ev 425027 STUB_EVIDENCE_BODY="**Outcome: CLEAN — verified.**
+
+Cycle 1 had 2 blocking findings remain outstanding.
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n19 a blocker on a LATER line does not refuse a clean Outcome line — tsv_decode is load-bearing (rc 0)"
+
+# 13n20-13n24 — (b) DOES NOT READ A NEGATION (agent-infra#2661 second review, F1). `were NOT fixed`
+# is the same count with the OPPOSITE TRUTH VALUE, and the first cut matched the verb through a
+# window that spanned the `not` without reading it. All five bodies below were MEASURED admitted at
+# c33ae248b. The fix is a conjunct scoped to the count's own clause (count → copula → negation), not
+# a line-wide "does the line say not" test — see 13n25, which reds under that lazy correction.
+rm -f "$(Q2 425028)"
+EV_REF="comment:42502801" run_record_ev 425028 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were not fixed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n20 'were NOT fixed' is not a resolution — the negation inside (b)'s window is read (rc 3)"
+[ ! -f "$(Q2 425028)" ] && ok "13n20 no record minted over a negated resolution" || bad "13n20 minted a record — (b) matched through the negation"
+
+rm -f "$(Q2 425029)"
+EV_REF="comment:42502901" run_record_ev 425029 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings are not yet resolved.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n21 'are not YET resolved' is still open (rc 3)"
+
+rm -f "$(Q2 425030)"
+EV_REF="comment:42503001" run_record_ev 425030 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were being addressed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n22 'were BEING addressed' is in progress, not resolved (rc 3)"
+
+rm -f "$(Q2 425031)"
+EV_REF="comment:42503101" run_record_ev 425031 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were not addressed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n23 'were NOT addressed' is not a resolution (rc 3)"
+
+rm -f "$(Q2 425032)"
+EV_REF="comment:42503201" run_record_ev 425032 STUB_EVIDENCE_BODY="**Outcome: 3 blocking findings were never resolved.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n24 'were NEVER resolved' is not a resolution (rc 3)"
+
+# 13n25 — THE OVER-BLOCK CONTROL for the negation conjunct. The obvious over-correction is a LINE-WIDE
+# "the line says 'not'" test, which is the same unpredicated-scope error F1 fixed in (a) and (b); it
+# would refuse this genuinely clean review for a `not` in a DIFFERENT clause. The negation must be read
+# inside the count's own `;`-bounded clause, so this row reds under the lazy fix and only under it.
+rm -f "$(Q2 425033)"
+EV_REF="comment:42503301" run_record_ev 425033 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed and re-verified; the flaky retry loop is not covered, filed as a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n25 a negation in a DIFFERENT clause does not refuse a clean review (rc 0)"
+
+# 13n26-13n27 — (b) ANSWERS ONE COUNT, NOT TWO (agent-infra#2661 third review, F3). (c) is an
+# ENUMERATED synonym list for "this count is not resolved", and the DEFERRAL family is not in it —
+# so `2 blocking were fixed, 1 blocking deferred to a follow-up` escaped on the resolved half and
+# minted `clean`. The family is OPEN-ENDED (deferred / filed / waived / accepted / carried / left /
+# out of scope), so enumerating it is the same mistake one word later. The fix is the RELATIONSHIP:
+# (b) may answer exactly ONE live blocking mention, and a SECOND belongs to no escape. Both bodies
+# below were MEASURED admitted at 233982af4.
+rm -f "$(Q2 425034)"
+EV_REF="comment:42503401" run_record_ev 425034 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed, 1 blocking (P1) deferred to a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n26 the resolved half does NOT answer for a SECOND live blocking count — 'deferred' is not resolved (rc 3)"
+[ ! -f "$(Q2 425034)" ] && ok "13n26 no record minted over a deferred blocker" || bad "13n26 minted a record — the resolved half answered for a deferred blocker"
+
+rm -f "$(Q2 425035)"
+EV_REF="comment:42503501" run_record_ev 425035 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed, 1 blocking (P1) waived.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n27 'waived' is the same open-ended family as 'deferred' — the COUNT closes it, not a synonym (rc 3)"
+
+# 13n28 — THE OVER-BLOCK CONTROL for the count predicate. The obvious over-correction is to count
+# EVERY `blocking` mention, which would refuse this genuinely clean review for the `non-blocking`
+# note beside its resolved blocker — the tortoise#8866 false-refusal class, arriving from a new
+# direction. A NEGATED mention is not a live one, so this row reds under the negation-blind count.
+rm -f "$(Q2 425036)"
+EV_REF="comment:42503601" run_record_ev 425036 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed and re-verified; 4 non-blocking (P3) notes were filed as follow-ups.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n28 a NEGATED second mention is not a live blocker — the count predicate still records a resolved line (rc 0)"
+
+# 13n29 — THE ROW THAT PINS (c) NOW (review F3 moved the pin off 13n9b, which the count predicate
+# also vetoes). It has ONE live blocking mention and a persistence word OUTSIDE the resolved window,
+# so the count predicate cannot catch it and `(b)` matches: `(c)` alone cancels the escape.
+# MEASURED: deleting the (c) conjunct flips THIS row to ADMIT (rc 0) and leaves 13n9/13n9b VETO.
+rm -f "$(Q2 425037)"
+EV_REF="comment:42503701" run_record_ev 425037 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed, 1 of them remains.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n29 the (c) persistence cancel, on a line the COUNT predicate cannot catch (rc 3)"
+
+# 13n30 — THE ROW THAT PINS THE RELATIONSHIP OVER THE DIGITS. A spelled count cannot be subtracted
+# arithmetically (`one blocking` has no digit), so a digit-only version of the count predicate would
+# admit it while still passing 13n26/13n27. Counting LIVE MENTIONS answers the relationship and this
+# row is what distinguishes it from the cheaper proxy.
+rm -f "$(Q2 425038)"
+EV_REF="comment:42503801" run_record_ev 425038 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed, one blocking (P1) deferred.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n30 a SPELLED second count is still a second live blocker — the predicate counts mentions, not digits (rc 3)"
+
+# 13n31-13n35 — THE ESCAPE IS DEFAULT-DENY (agent-infra#2661 fourth review, F1+F2). Three rounds each
+# widened a regex here and each was defeated by ONE more word, because an enumerated exception list
+# can never be complete. Rounds 2-3's remaining holes, all MEASURED admitted at e2c2aaa73:
+#   F1 — a NEGATIVE SUBJECT sits BEFORE the copula, so the copula->verb negation conjunct never read
+#        it: `none were fixed` / `none of them were fixed` / `nothing was resolved` /
+#        `neither was resolved`.
+#   F2 — (b) bounded the NUMBER OF MENTIONS, never the DECLARED COUNT: `3 blocking (P1) — 2 were
+#        fixed`, `4 blocking — 3 were fixed`, `2 blocking — only one was fixed`, and
+#        `2 blocking findings were fixed; 1 of them is still with us` — whose remainder the
+#        persistence cancel could not catch, `is still with us` being outside any list.
+# The fix is polarity: the escapes no longer mean "not known to be open", they mean "affirmatively
+# closed" (declared count or a totality word as the SUBJECT, plus no second count on the line, plus
+# no negation/in-progress/persistence in the declaration's own clause). Unknown vocabulary vetoes.
+rm -f "$(Q2 425039)"
+EV_REF="comment:42503901" run_record_ev 425039 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) — none were fixed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n31 F1 a NEGATIVE SUBJECT ('none were fixed') is not a resolution — the negator sits BEFORE the copula (rc 3)"
+[ ! -f "$(Q2 425039)" ] && ok "13n31 no record minted over a negated-subject resolution" || bad "13n31 minted a record — the negator before the copula was not read"
+
+rm -f "$(Q2 425040)"
+EV_REF="comment:42504001" run_record_ev 425040 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) — nothing was resolved.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n32 F1 'nothing was resolved' is the same negated subject — refused (rc 3)"
+
+rm -f "$(Q2 425041)"
+EV_REF="comment:42504101" run_record_ev 425041 STUB_EVIDENCE_BODY="**Outcome: 3 blocking (P1) — 2 were fixed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n33 F2 a resolve count SMALLER than the declared count does not answer the declaration (rc 3)"
+[ ! -f "$(Q2 425041)" ] && ok "13n33 no record minted when 2 of 3 declared blockers are fixed" || bad "13n33 minted a record — the partial count answered the whole declaration"
+
+rm -f "$(Q2 425042)"
+EV_REF="comment:42504201" run_record_ev 425042 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) — only one was fixed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n34 F2 a SPELLED partial count ('only one') is a second count — refused by arithmetic, not by vocabulary (rc 3)"
+
+rm -f "$(Q2 425043)"
+EV_REF="comment:42504301" run_record_ev 425043 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed; 1 of them is still with us.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n35 F2 a remainder behind a ';' is still a remainder — 'is still with us' is outside any persistence list, so the SECOND COUNT closes it (rc 3)"
+[ ! -f "$(Q2 425043)" ] && ok "13n35 no record minted over a remainder named in unlisted words" || bad "13n35 minted a record — an unlisted persistence phrase escaped the cancel"
+
+# 13n36-13n37 — THE OVER-BLOCK CONTROLS for the default-deny polarity, and the reason it is worth the
+# friction. A TOTality subject is an escape even without a leading digit, so a genuinely clean
+# resolution that never spells a count is not refused for the wrong reason. Both were MEASURED
+# VETOed at e2c2aaa73 (a false refusal, the tortoise#8866 class from a new direction).
+rm -f "$(Q2 425044)"
+EV_REF="comment:42504401" run_record_ev 425044 STUB_EVIDENCE_BODY="**Outcome: CLEAN — both blockers were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n36 a TOTALITY word ('both blockers') is a subject that covers the declared set — recorded (rc 0)"
+
+rm -f "$(Q2 425045)"
+EV_REF="comment:42504501" run_record_ev 425045 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings resolved.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n37 a totality word with no copula ('all blocking findings resolved') is still an affirmative total resolution (rc 0)"
+
+# 13n38-13n39 — THE ROW THAT PINS THE MASK'S SCOPE (agent-infra#2661 fifth review, F1). Masking EVERY
+# `N blocking` before the arithmetic erased the operand the arithmetic exists to compare against:
+# `2 blocking (P1) findings were fixed; 1 blocking finding remains open` left no countable token,
+# the persistence belt is `;`-scoped so it never saw the remainder, and the line ESCAPED. It is a
+# REGRESSION, not an inherited hole — the previous head still counted live mentions and refused it.
+# ⛔ Only the FIRST `N blocking` (the DECLARATION) is masked now; a later one is a REMAINDER. These
+# rows red under the "mask every `N blocking`" mutant, which no shipped row before them could see.
+rm -f "$(Q2 425046)"
+EV_REF="comment:42504601" run_record_ev 425046 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed; 1 blocking finding remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n38 a later 'N blocking' is a REMAINDER, not part of the declaration — only the FIRST is masked (rc 3)"
+assert_contains "$RECORD_ERR" "DECLARES blocking findings" "13n38 …and the refusal NAMES the declaration, as 13n6 does, so an unrelated rc-3 arm cannot satisfy this row"
+[ ! -f "$(Q2 425046)" ] && ok "13n38 no record minted while a declared blocker is spelled as still open" || bad "13n38 minted a record — the remainder count was masked away with the declaration"
+
+rm -f "$(Q2 425047)"
+EV_REF="comment:42504701" run_record_ev 425047 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed; 1 blocking (P1) deferred to a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n39 the ';' form of 13n26 — a second declared blocker after the clause boundary is still a remainder (rc 3)"
+assert_contains "$RECORD_ERR" "DECLARES blocking findings" "13n39 …and the refusal NAMES the declaration (the reason is pinned, not just the rc)"
+
+# 13n40 — THE OVER-BLOCK CONTROL for the count predicate (fifth review, F2). A count scan that fires on
+# ANY digit refuses honest CLEAN lines that merely CITE something — a cycle number, a PR, a commit. The
+# count is this arm's business only when it GOVERNS a remainder, a resolution or a persistence word.
+# MEASURED false-refused under the bare `[1-9][0-9]*` scan.
+rm -f "$(Q2 425048)"
+EV_REF="comment:42504801" run_record_ev 425048 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking (P1) findings were fixed and re-verified in cycle 2; see #3902.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n40 a reference digit ('in cycle 2', '#3902') is not a count that governs anything — recorded (rc 0)"
+[ ! -f "$(Q2 425048)" ] && bad "13n40 the reference-digit control did not record" || ok "13n40 the reference-digit control recorded"
+
+# 13n41-13n44 — THE ROLE IS NOT A POSITION (agent-infra#2661 sixth review, F1+F2). The mask used to
+# decide which `N blocking` was the DECLARATION by POSITION ("the first"), so a TOTALITY declaration
+# — `both|all|every` + `blockers|blocking`, or `the blocking …` — carries no digit, and the first
+# `N blocking` on the line was therefore the REMAINDER: the mask erased it, the `;`-scoped belt never
+# saw the second clause, and the line minted a signed `clean`. MEASURED admitted at 54cdbcb40, i.e.
+# with all of 13n38-13n40 green — which is why those rows cannot see this. The identical sentence
+# with `2` written instead of `both` was already refused (13n38), so the fix cannot be another digit
+# rule: the arm now counts LIVE MENTIONS, which reads no digit and does not care where one sits.
+# 13n44 is the second half of the same defect and the reason the count has to be line-wide: a
+# REVERSE-ORDER persistence phrase (`the remaining blocking issue`) puts the persistence word BEFORE
+# the noun, so an order-anchored, `;`-scoped belt could not reach it from either end.
+rm -f "$(Q2 425049)"
+EV_REF="comment:42504901" run_record_ev 425049 STUB_EVIDENCE_BODY="**Outcome: CLEAN — both blocking findings were fixed; 1 blocking item remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n41 a TOTALITY declaration plus a digit remainder is a declared blocker that is still open (rc 3)"
+[ ! -f "$(Q2 425049)" ] && ok "13n41 no record minted over a totality declaration with a remainder" || bad "13n41 minted a record — the remainder was masked as if it were the declaration"
+
+rm -f "$(Q2 425050)"
+EV_REF="comment:42505001" run_record_ev 425050 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed; 1 blocking item is still open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n42 'all blocking … were fixed' with a remainder is the same fail-open — refused (rc 3)"
+
+rm -f "$(Q2 425051)"
+EV_REF="comment:42505101" run_record_ev 425051 STUB_EVIDENCE_BODY="**Outcome: CLEAN — the blocking finding was fixed; 1 blocking finding remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n43 the DEFINITE declaration ('the blocking finding') with a remainder — refused (rc 3)"
+
+rm -f "$(Q2 425052)"
+EV_REF="comment:42505201" run_record_ev 425052 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings were fixed; the remaining blocking issue is with us.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n44 a REVERSE-ORDER persistence phrase ('the remaining blocking issue') is still a second live mention (rc 3)"
+[ ! -f "$(Q2 425052)" ] && ok "13n44 no record minted over a prefix-positioned persistence phrase" || bad "13n44 minted a record — the belt is order-anchored and the count arm did not see the second mention"
+
+# 13n45-13n46 — THE OVER-BLOCK CONTROLS for the live-mention count, and the reason the count is
+# NEGATION-AWARE. `0 blocking findings remain` and `No blocking findings remain open` are the most
+# natural way an honest clean line states closure; a bare mention count would read each as a second
+# blocker and refuse a genuine clean review — the tortoise#8866 false-refusal class from a new
+# direction, which this arm has already had to correct once (13n28).
+rm -f "$(Q2 425053)"
+EV_REF="comment:42505301" run_record_ev 425053 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 1 blocking finding was fixed; 0 blocking findings remain.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n45 a ZEROED second mention ('0 blocking findings remain') is not a live blocker — recorded (rc 0)"
+
+rm -f "$(Q2 425054)"
+EV_REF="comment:42505401" run_record_ev 425054 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed and re-verified. No blocking findings remain open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n46 a NEGATED second mention ('No blocking findings remain open') is not a live blocker — recorded (rc 0)"
+
+# 13n47-13n52 — THE REGRESSION PINS FOR THE #3902 REVIEW'S F1/F3/F5, AND THEIR OVER-BLOCK
+# CONTROLS. Each veto row is a FAIL-OPEN the fresh-context review MEASURED on the shipped function
+# at 49d3c9780 (a `clean` record minted over a live blocker); each control beside it is the honest
+# clean line the FIRST cut of the fix would then have refused. They are paired on purpose: a fix
+# that closes the hole by refusing everything PASSES the veto half and reddens the control, which
+# is the direction that costs a reworded re-run rather than a merged false PASS.
+#
+# 13n47 — F1, THE SEVERITY-TAGGED REMAINDER. `P0..P3` is this repo's own vocabulary for a blocking
+# finding, and the arm's token class could not span `P1` (the `1` is not alpha), so the remainder an
+# agent would ACTUALLY write reached no arm. This is the highest-value row in the group.
+rm -f "$(Q2 425055)"
+EV_REF="comment:42505501" run_record_ev 425055 STUB_EVIDENCE_BODY="**Outcome: 3 blocking findings were fixed; 1 P0 (security) remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n47 a SEVERITY-TAGGED remainder ('1 P0 (security) remains open') is a live blocker — refused (rc 3)"
+[ ! -f "$(Q2 425055)" ] && ok "13n47 no clean record minted over a P0-tagged remainder" || bad "13n47 minted a clean record over a live P0 remainder — the #2661 false PASS, via the house vocabulary"
+
+rm -f "$(Q2 425056)"
+EV_REF="comment:42505601" run_record_ev 425056 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 P1 remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n48 a bare-severity remainder ('1 P1 remains open') is a live blocker — refused (rc 3)"
+
+# 13n49 — THE OVER-BLOCK CONTROL for 13n47/13n48: the SAME severity token, as the SUBJECT of an
+# affirmative total resolution, is clean evidence and must keep recording. Without this pair the
+# severity fix could only be checked in the veto direction.
+rm -f "$(Q2 425057)"
+EV_REF="comment:42505701" run_record_ev 425057 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 P1 blockers were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n49 a severity tag BETWEEN count and noun ('2 P1 blockers were fixed') still records (rc 0)"
+
+# 13n50 — F3, THE COLLECTIVE REMAINDER. The header CLAIMED these were counted; they were not, because
+# they lived only in the `;`-SCOPED belt and so were unreachable after the declaration's own clause
+# boundary. Placed clause-scoped first and MEASURED still escaping — this row is what pins it wide.
+rm -f "$(Q2 425058)"
+EV_REF="comment:42505801" run_record_ev 425058 STUB_EVIDENCE_BODY="**Outcome: 2 blocking findings were fixed; the rest remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n50 a COLLECTIVE remainder after the ';' ('the rest remains open') is a live blocker — refused (rc 3)"
+
+# 13n51 — THE OVER-BLOCK CONTROL for 13n50: a collective that is NOT the subject of a persistence
+# verb is ordinary prose and must not refuse the line (a line-wide bare-word scan would).
+rm -f "$(Q2 425059)"
+EV_REF="comment:42505901" run_record_ev 425059 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed and re-verified; some tests were added.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n51 a collective that governs no persistence ('some tests were added') still records (rc 0)"
+
+# 13n52 — F5, THE QUOTED DECLARATION — A **DECLARED RESIDUAL**, NOT A CLOSED HOLE (second review, F1).
+# The first cut of this row asserted rc 0, because the arm stripped backtick spans so a clean review
+# could QUOTE the measured artifact. That strip was a BYPASS and is DELETED: one backtick removed the
+# arm entirely, MEASURED regressing `**Outcome: 2 `blocking` findings were fixed; 1 P0 remains open.**`
+# and `**`Outcome:` 2 blocking findings were fixed; 1 P0 remains open.**` from VETO to ESCAPE. No
+# syntactic rule separates a quotation from a declaration — they are lexically identical — so the
+# gate keeps the SAFE polarity (refuse), and the cost is stated: a review must not reproduce a
+# blocking `Outcome:` declaration verbatim on an `Outcome:` line; describe it or cite the PR comment.
+rm -f "$(Q2 425060)"
+EV_REF="comment:42506001" run_record_ev 425060 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 P1 remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n52 RESIDUAL (documented): a verbatim blocking declaration is REFUSED even where it was meant as a quotation — the safe polarity"
+
+# 13n53-13n56 — THE SECOND REVIEW'S MEASURED F1 CLASS, AND ITS OVER-BLOCK CONTROLS. The first fix made
+# only `_OC_STILL` severity-aware, so a severity-tagged remainder phrased with a RESOLUTION or
+# IN-PROGRESS verb reached no arm at all — six vectors, MEASURED escaping on 2831db382. They are closed
+# by ONE SHAPE rule (a surviving `<count> <P0|P1>` after the declared count is masked), not by six more
+# synonyms, which is the mistake every earlier round made one word later.
+for _v53 in "1 P0 (security) was not addressed" "1 P1 partially resolved" "1 P1 not yet fixed" "1 P1 being fixed"; do
+  rm -f "$(Q2 425061)"
+  EV_REF="comment:42506101" run_record_ev 425061 STUB_EVIDENCE_BODY="**Outcome: 2 blocking findings were fixed; ${_v53}.**
+
+$VACUITY_BLOCK"
+  assert_eq "$RECORD_RC" "3" "13n53 a severity-tagged remainder through any verb ('${_v53}') is a live blocker — refused (rc 3)"
+done
+
+# 13n54 — THE OVER-BLOCK CONTROL for the shape rule: a P2/P3 count is NOT a blocking remainder, and a
+# collective that WAS resolved is not a remainder. Both were MEASURED refused by the first attempt at
+# this fix (`_OC_COLLECTIVE` carried the RESOLUTION verbs), so they are pinned here.
+rm -f "$(Q2 425062)"
+EV_REF="comment:42506201" run_record_ev 425062 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed and re-verified; 2 P3 nits filed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n54 a NON-blocking P3 count is not a remainder — recorded (rc 0)"
+
+rm -f "$(Q2 425063)"
+EV_REF="comment:42506301" run_record_ev 425063 STUB_EVIDENCE_BODY="**Outcome: CLEAN — the 1 blocking finding was fixed; the rest were addressed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n55 a collective that WAS resolved ('the rest were addressed') is not a remainder — recorded (rc 0)"
+
+# 13n56 — THE BYPASS THAT WAS DELETED, PINNED SO IT CANNOT COME BACK. Wrapping a word in inline code
+# must not hide a declaration from the arm.
+rm -f "$(Q2 425064)"
+N56_BT="$(printf '\140')"
+N56_BODY="**Outcome: 2 ${N56_BT}blocking${N56_BT} findings were fixed; 1 P0 remains open.**
+
+$VACUITY_BLOCK"
+EV_REF="comment:42506401" run_record_ev 425064 STUB_EVIDENCE_BODY="$N56_BODY"
+assert_eq "$RECORD_RC" "3" "13n56 inline code cannot hide a declaration ('2 [code-span]blocking findings … 1 P0 remains open') — refused (rc 3)"
+# 13n57-13n64 — THE HOUSE SEVERITY `P0|P1` IS A DECLARATION TOO, AND WIDTH IS NOT VOCABULARY
+# (agent-infra#3902 THIRD review, P1 + P2 — all eight vectors MEASURED against the arm extracted from
+# the shipped file and framed exactly as `gh --jq @tsv` frames a body). Two classes are pinned here,
+# and they pull in OPPOSITE directions on purpose:
+#   * 13n57/13n58 — a FAIL-OPEN. The entry gate read the NOUN `block(ing|ers?)`, so a declaration that
+#     named the house severity and never the noun was not this arm's business at all and the WHOLE arm
+#     was skipped: `2 P1 (security + evidence)` and `1 P1 (dispatch guard) remains open` both ADMITTED
+#     a clean record. `blocking` IS `P0/P1` by this file's own convention (`_OC_SEVREMAINDER`), so the
+#     fix is to admit the severity at the SAME gate and let the existing escapes/belts judge it.
+#   * 13n59/13n60 — the over-block controls for that widening. A severity form must escape on a
+#     resolution (`2 P1 were fixed`) and on a zero (`0 P1 findings`), or the widening would refuse the
+#     honest closures it exists to admit.
+#   * 13n61/13n62 — the WIDENED TAIL and the REFERENCE mask. `… findings from the review were fixed`,
+#     `… from the second cycle were fixed`, `… in scripts/record-review.sh were fixed` and
+#     `… from cycle 1 were fixed` are honest closures that the three-token, alphabetic-only run refused;
+#     an honest agent would have had to reword a true sentence to get its review recorded.
+#   * 13n63/13n64 — the remainder pair, and they are the rows that keep the whole thing honest. A
+#     surviving `<count> <P0|P1>` after the DECLARED count must still veto, whether the declaration
+#     spoke in the noun (`3 blocking (P1) … fixed; 2 P1 still open`) or in the severity alone. 13n63 is
+#     the regression pin for the "one declaration, one mask" rule: masking the severity UNCONDITIONALLY
+#     erased the remainder instead of the declaration there, and the line ESCAPED.
+rm -f "$(Q2 425065)"
+EV_REF="comment:42506501" run_record_ev 425065 STUB_EVIDENCE_BODY="**Outcome: 3 findings — 2 P1 (security + evidence), 1 P2.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n57 a declaration that names the HOUSE SEVERITY (2 P1) and never the noun 'blocking' is REFUSED (rc 3)"
+[ ! -f "$(Q2 425065)" ] && ok "13n57 no clean record minted over 2 declared P1 findings" || bad "13n57 minted a record over a P1 declaration — the entry gate only read the noun"
+
+rm -f "$(Q2 425066)"
+EV_REF="comment:42506601" run_record_ev 425066 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 1 P1 (dispatch guard) remains open.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n58 'Outcome: CLEAN' does not cancel a live P1 — the severity form of 13n8 (rc 3)"
+
+rm -f "$(Q2 425067)"
+EV_REF="comment:42506701" run_record_ev 425067 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 P1 were fixed and re-verified.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n59 OVER-BLOCK GUARD: a severity declaration whose blockers are RESOLVED still records (rc 0)"
+
+rm -f "$(Q2 425068)"
+EV_REF="comment:42506801" run_record_ev 425068 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 0 P1 findings.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n60 OVER-BLOCK GUARD: a ZEROED severity count ('0 P1 findings') records (rc 0)"
+
+rm -f "$(Q2 425069)"
+EV_REF="comment:42506901" run_record_ev 425069 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings from the review were fixed.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n61 OVER-BLOCK GUARD: an honest closure that names WHERE it fixed them records (the widened tail) (rc 0)"
+
+rm -f "$(Q2 425070)"
+EV_REF="comment:42507001" run_record_ev 425070 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings from cycle 1 were fixed and re-verified.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n62 OVER-BLOCK GUARD: 'cycle 1' is a REFERENCE, not a second count — the record still mints (rc 0)"
+
+rm -f "$(Q2 425071)"
+EV_REF="comment:42507101" run_record_ev 425071 STUB_EVIDENCE_BODY="**Outcome: 3 blocking (P1) findings were fixed; 2 P1 still open.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n63 a surviving P1 after the declaration's own resolution is a REMAINDER — refused (rc 3; pins 'one declaration, one mask')"
+
+rm -f "$(Q2 425072)"
+EV_REF="comment:42507201" run_record_ev 425072 STUB_EVIDENCE_BODY="**Outcome: 2 P1 (security) were fixed; 1 P1 remains open.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n64 a declared severity resolution does NOT cover the severity that REMAINS (rc 3)"
+
+# 13n65-13n76 — THE SIX FINDINGS OF THE agent-infra#3902 REVIEW, EACH PINNED BY A ROW THAT REDS
+# WHEN ITS FIX IS REVERTED. Every body below was MEASURED against the shipped arm at 57d19f3fa
+# BEFORE its fix existed, with the reproduction in the finding that named it:
+#   F1 (P1, fail-open) escape (a) was gated on a DIGIT-ONLY `live_count` while every belt reads
+#      `_OC_CNT`, so the sentence the header says (a) does not apply to was escapable IN WORDS.
+#   F2 (P1, fail-open) the declaration recognizer was a literal `outcome:`, so a BOLDED LABEL,
+#      a SPACED colon, or a FULL-WIDTH colon skipped arm (1c) at its own entry gate.
+#   F3 (P1, fail-open) `_OC_REFMASK` was applied to ALL of `_rest` before every remainder belt, so a
+#      NUMBERED remainder lost its count and became invisible.
+#   F4 (P2, over-block) the zeroed/negated forms required the negator ADJACENT to the noun, refusing
+#      honest clean closures (`nothing blocking`, `none of the findings are blocking`).
+# ⛔ THE FOUR CLASSES ARE ONE PATTERN, which is why they are pinned together: each is a guard whose
+# scope was narrower than the thing it guards (F1: the count vocabulary; F2: the spelling; F3: the
+# mask's reach; F4: the negator's adjacency). A row that only asserted the refusal would not prove
+# WHICH guard produced it, so the F1/F2/F3 rows are followed by a MUTATION pin.
+rm -f "$(Q2 425073)"
+EV_REF="comment:42507301" run_record_ev 425073 STUB_EVIDENCE_BODY="**Outcome: three findings — two blocking (P1), one non-blocking (P2).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n65 F1: a SPELLED declaration count feeds the live_count guard, so one 'non-blocking' cannot cancel it (rc 3)"
+
+rm -f "$(Q2 425074)"
+EV_REF="comment:42507401" run_record_ev 425074 STUB_EVIDENCE_BODY="**Outcome: two blocking (P1) findings remain; no blocking fix landed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n66 F1: a spelled live count is not cancellable by a later 'no blocking' clause (rc 3)"
+
+rm -f "$(Q2 425075)"
+EV_REF="comment:42507501" run_record_ev 425075 STUB_EVIDENCE_BODY="**Outcome: 2. blocking (P1) findings; no blocking fix landed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n67 F1: a '.' between the count and its noun does not defeat the live_count guard (rc 3)"
+
+rm -f "$(Q2 425076)"
+EV_REF="comment:42507601" run_record_ev 425076 STUB_EVIDENCE_BODY="**Outcome**: 2 blocking (P1) findings remain open.
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n68 F2: a declaration that BOLDS ITS LABEL is still read — the entry gate is not a literal 'outcome:' (rc 3)"
+
+rm -f "$(Q2 425077)"
+EV_REF="comment:42507701" run_record_ev 425077 STUB_EVIDENCE_BODY="**Outcome : 3 findings — 2 blocking (P1), 1 documentation (P2).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n69 F2: a space between the label and its colon does not skip the arm (rc 3)"
+
+rm -f "$(Q2 425078)"
+EV_REF="comment:42507801" run_record_ev 425078 STUB_EVIDENCE_BODY="**Outcome：3 findings — 2 blocking (P1), 1 documentation (P2).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n70 F2: a FULL-WIDTH colon (U+FF1A) is a declaration too (rc 3)"
+
+rm -f "$(Q2 425079)"
+EV_REF="comment:42507901" run_record_ev 425079 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; finding 1 remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n71 F3: a NUMBERED remainder keeps its count — the reference mask is scoped to a resolution (rc 3)"
+
+rm -f "$(Q2 425080)"
+EV_REF="comment:42508001" run_record_ev 425080 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; issue 1 remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n72 F3: the same for 'issue N' — the mask cannot swallow a persistence remainder (rc 3)"
+
+# ⛔ THE OVER-BLOCK CONTROLS FOR F4. These are HONEST clean closures and must still record — the
+# declared cost of this gate is a reworded re-run, but a false refusal on the most natural English
+# closure sentence is the tortoise#8866 class this file has already paid for once. All three were
+# MEASURED REFUSED at 57d19f3fa.
+rm -f "$(Q2 425081)"
+EV_REF="comment:42508101" run_record_ev 425081 STUB_EVIDENCE_BODY="**Outcome: CLEAN — nothing blocking.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n73 F4 OVER-BLOCK GUARD: 'nothing blocking' is an honest closure and records (rc 0)"
+
+rm -f "$(Q2 425082)"
+EV_REF="comment:42508201" run_record_ev 425082 STUB_EVIDENCE_BODY="**Outcome: CLEAN — none of the findings are blocking.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n74 F4 OVER-BLOCK GUARD: a negator with SCOPE around the noun records (rc 0)"
+
+rm -f "$(Q2 425083)"
+EV_REF="comment:42508301" run_record_ev 425083 STUB_EVIDENCE_BODY="**Outcome: CLEAN — checked for blocking issues; none found.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n75 F4 OVER-BLOCK GUARD: 'found none' after the noun records (rc 0)"
+
+# 13n76-13n78 — MUTATION PINS for the three P1 fail-opens. A refusal row proves A refusal happened,
+# never that THIS guard produced it, so each fix is reverted in a copy and its own row must flip to
+# ADMITTED. The sed anchors are asserted to still match, so a refactor re-pins instead of silently
+# turning the pin into a no-op.
+N_LIVECNT_MUT="$T/mutant-livecnt-narrowed.sh"
+sed 's#^    grep -qiE "(^|\[^\[:alnum:\]\])${_OC_CNT}\[\[:space:\].,:;_-\]\*(block(ing|ers?)|\\(?p\[01\]\\)?)" <<<"$line" && live_count=1$#    grep -qiE "(^|[^0-9])[1-9][0-9]*[[:space:]_-]*(block(ing|ers?)|\\(?p[01]\\)?)" <<<"$line" \&\& live_count=1#' "$RECORD" > "$N_LIVECNT_MUT"
+if cmp -s "$RECORD" "$N_LIVECNT_MUT"; then
+    bad "13n76 MUTANT: the live_count sed anchor no longer matches — re-anchor the pin rather than dropping it"
+else
+    bash -n "$N_LIVECNT_MUT" && ok "13n76 MUTANT: the digit-only live_count mutant still parses" || bad "13n76 MUTANT: the mutant does not parse"
+    NL_SAVE="$RECORD"
+    RECORD="$N_LIVECNT_MUT"
+    rm -f "$(Q2 425073)"
+    EV_REF="comment:42507301" run_record_ev 425073 STUB_EVIDENCE_BODY="**Outcome: three findings — two blocking (P1), one non-blocking (P2).**
+
+$VACUITY_BLOCK"
+    RECORD="$NL_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n76 MUTATION PIN: with live_count back to digits-only, 13n65's body is ADMITTED (rc 0) — the widening is load-bearing"
+fi
+
+N_DECL_MUT="$T/mutant-decl-literal.sh"
+sed 's#^    grep -qiE "$OC_DECL_RE" <<<"$line" || continue$#    grep -qiE "(^|[^[:alnum:]])outcome:[[:space:]]*[*[:space:]]*" <<<"$line" || continue#' "$RECORD" > "$N_DECL_MUT"
+if cmp -s "$RECORD" "$N_DECL_MUT"; then
+    bad "13n77 MUTANT: the declaration-recognizer sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_DECL_MUT" && ok "13n77 MUTANT: the literal-'outcome:' mutant still parses" || bad "13n77 MUTANT: the mutant does not parse"
+    ND_SAVE="$RECORD"
+    RECORD="$N_DECL_MUT"
+    rm -f "$(Q2 425076)"
+    EV_REF="comment:42507601" run_record_ev 425076 STUB_EVIDENCE_BODY="**Outcome**: 2 blocking (P1) findings remain open.
+
+$VACUITY_BLOCK"
+    RECORD="$ND_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n77 MUTATION PIN: with the recognizer back to a literal, 13n68's body is ADMITTED (rc 0) — the recognizer is load-bearing"
+fi
+
+N_REFMASK_MUT="$T/mutant-refmask-global.sh"
+sed 's@^  local _OC_REFMASK=.*$@  local _OC_REFMASK='"'"'s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]]+#?[0-9]+/\\1 REFCNT /g'"'"'@' "$RECORD" > "$N_REFMASK_MUT"
+if cmp -s "$RECORD" "$N_REFMASK_MUT"; then
+    bad "13n78 MUTANT: the _OC_REFMASK sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_REFMASK_MUT" && ok "13n78 MUTANT: the unscoped-refmask mutant still parses" || bad "13n78 MUTANT: the mutant does not parse"
+    NR_SAVE="$RECORD"
+    RECORD="$N_REFMASK_MUT"
+    rm -f "$(Q2 425079)"
+    EV_REF="comment:42507901" run_record_ev 425079 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; finding 1 remains open.**
+
+$VACUITY_BLOCK"
+    RECORD="$NR_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n78 MUTATION PIN: with the refmask unscoped, 13n71's body is ADMITTED (rc 0) — the scoping is load-bearing"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# 13n79-13n91 — THE THREE HOLES agent-infra#3902's SIXTH review MEASURED, AND THE PARITY GUARD THAT
+# STOPS THE SECOND ONE RECURRING. Every row below is a vector that was RE-RUN against the shipped arm
+# at 61b9e7ee0 and ADMITTED (or, for 13n85, FALSE-REFUSED) before the fix it now pins.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+# 13n79 — A TOTALITY CLAIM WITH AN EXCEPTION IS NOT A TOTALITY CLAIM (P1 fail-open, the exception
+# belt). `all blocking findings were fixed` escapes; carving an exception out of the SAME sentence
+# declares the live blocker this arm exists to refuse. Its SPELLED twin was already vetoed by
+# `_OC_SELLED`, which is the "closed for one spelling and open for the other" class #2661 names.
+rm -f "$(Q2 426001)"
+EV_REF="comment:42600101" run_record_ev 426001 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed except 1 in the retry path.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n79 'all … were fixed EXCEPT 1' declares a live blocker and is REFUSED (rc 3)"
+[ ! -f "$(Q2 426001)" ] && ok "13n79 no record minted over an exception carved out of a totality claim" || bad "13n79 minted a record over 'all … except 1' — the totality was believed with an exception in it"
+
+# 13n80-13n82 — THE PERSISTENCE TWIN'S OWN WORD LIST WAS SHORT (P1 fail-open). `_OC_PERSIST` is
+# `;`-SCOPED, so a remainder after the declaration's own `;` is its sibling's job — and the sibling was
+# missing six of the parent's words. All three of these ADMITTED at 61b9e7ee0 while their spelled twins
+# (`one was waived`, …) were vetoed, so the hole was one spelling wide.
+rm -f "$(Q2 426002)"
+EV_REF="comment:42600201" run_record_ev 426002 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 was waived.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n80 '; 1 was WAIVED' is a live remainder, not a resolution (rc 3)"
+[ ! -f "$(Q2 426002)" ] && ok "13n80 no record minted while one declared blocker was waived" || bad "13n80 minted a record over '1 was waived'"
+
+rm -f "$(Q2 426003)"
+EV_REF="comment:42600301" run_record_ev 426003 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 is a known risk.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n81 '; 1 is a KNOWN RISK' is a live remainder (rc 3)"
+[ ! -f "$(Q2 426003)" ] && ok "13n81 no record minted while one declared blocker is a known risk" || bad "13n81 minted a record over '1 is a known risk'"
+
+rm -f "$(Q2 426004)"
+EV_REF="comment:42600401" run_record_ev 426004 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 was carried to #1234.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n82 '; 1 was CARRIED TO #1234' is a live remainder (rc 3)"
+[ ! -f "$(Q2 426004)" ] && ok "13n82 no record minted while one declared blocker was carried to a follow-up issue" || bad "13n82 minted a record over '1 was carried to #1234'"
+
+# 13n83 — A COUNT HANDED ONWARD IS A REMAINDER (P1 fail-open, the hand-off predicate). `needs` is
+# neither a resolution verb nor a persistence word, and the declaration's own `blocking` noun had
+# already been masked, so `_OC_GOVERNS` had nothing to anchor on: the surviving count reached NO belt.
+rm -f "$(Q2 426005)"
+EV_REF="comment:42600501" run_record_ev 426005 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 needs a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n83 '; 1 needs a FOLLOW-UP' is a remainder, not a resolution (rc 3)"
+[ ! -f "$(Q2 426005)" ] && ok "13n83 no record minted while one declared blocker needs a follow-up" || bad "13n83 minted a record over '1 needs a follow-up'"
+
+# 13n84 — MUTATION PIN for the hand-off predicate. 13n83 could be red for another belt's reason, so the
+# predicate is removed from a copy and the same body must then be ADMITTED.
+N_HANDOFF_MUT="$T/mutant-handoff-removed.sh"
+sed 's#^  local _OC_HANDOFF=.*$#  local _OC_HANDOFF='"'"'@@NEVERMATCH@@'"'"'#' "$RECORD" > "$N_HANDOFF_MUT"
+if cmp -s "$RECORD" "$N_HANDOFF_MUT"; then
+    bad "13n84 MUTANT: the _OC_HANDOFF sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_HANDOFF_MUT" && ok "13n84 MUTANT: the hand-off-removed mutant still parses" || bad "13n84 MUTANT: the mutant does not parse"
+    NH_SAVE="$RECORD"
+    RECORD="$N_HANDOFF_MUT"
+    rm -f "$(Q2 426006)"
+    EV_REF="comment:42600601" run_record_ev 426006 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 needs a follow-up.**
+
+$VACUITY_BLOCK"
+    RECORD="$NH_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n84 MUTATION PIN: with the hand-off predicate removed, 13n83's body is ADMITTED (rc 0) — it is load-bearing"
+fi
+
+# 13n85 — THE FALSE REFUSAL THIS FIX MUST NOT CREATE (P2, the (b) token budget). An honest CLEAN
+# closure that also counts its NON-BLOCKING findings was REFUSED at 61b9e7ee0, while its near-twin
+# without the extra noun recorded: the second needs SEVEN intervening tokens against `_OC_TAIL`'s
+# `{0,6}`, so a P2/P3 count — findings that are not blockers at all — spent the escape's budget.
+rm -f "$(Q2 426007)"
+EV_REF="comment:42600701" run_record_ev 426007 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings and 3 non-blocking (P3) findings were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n85 an honest closure that ALSO counts its non-blocking findings RECORDS (rc 0)"
+R13N85="$(cat "$(Q2 426007)" 2>/dev/null || true)"
+assert_contains "$R13N85" '"verdict":"clean"' "13n85 …and the record it mints is a clean one"
+
+# 13n86 — MUTATION PIN for the (b) mask. 13n85 could be green because a WIDER tail bound admitted it, so
+# the non-blocking mask is removed from a copy and the same body must be REFUSED again.
+N_BLINE_MUT="$T/mutant-bline-unmasked.sh"
+# ⛔ THE REPLACEMENT MUST KEEP THE STRING'S CLOSING DOUBLE QUOTE. It first shipped without it, so the
+# mutant was `_bline="$(printf … | cat)` — an unterminated quote: `bash -n` rejected it, `run_record_ev`
+# returned rc 2 (a parse error), and 13n86 read that 2 as "the pin does not hold" rather than as "the
+# mutant never ran". A mutation pin whose mutant does not PARSE asserts nothing about the code it
+# mutates, so the closes-quote is load-bearing in the harness, not cosmetic.
+sed 's#^      | sed -E "s/.*NONBLK .*")"$#      | cat)"#' "$RECORD" > "$N_BLINE_MUT"
+if cmp -s "$RECORD" "$N_BLINE_MUT"; then
+    bad "13n86 MUTANT: the _bline sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_BLINE_MUT" && ok "13n86 MUTANT: the unmasked-(b) mutant still parses" || bad "13n86 MUTANT: the mutant does not parse"
+    NB_SAVE="$RECORD"
+    RECORD="$N_BLINE_MUT"
+    rm -f "$(Q2 426008)"
+    EV_REF="comment:42600801" run_record_ev 426008 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings and 3 non-blocking (P3) findings were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+    RECORD="$NB_SAVE"
+    assert_eq "$RECORD_RC" "3" "13n86 MUTATION PIN: with the non-blocking mask removed, 13n85's honest closure is REFUSED (rc 3) — the mask is load-bearing"
+fi
+
+# 13n87 — THE PARITY GUARD, and it is the direct answer to HOW 13n80-13n82 happened. `_OC_PERSIST` is
+# `;`-scoped and `_OC_STILL` is its line-wide twin; the defect was not a missing insight but an OMISSION
+# between two lists maintained by hand, so the lists are now PARSED OUT OF THE SHIPPED SCRIPT and
+# compared. This reds the day someone adds a word to one and not the other, which no behavioural vector
+# would catch (a new word in `_OC_PERSIST` alone changes no existing row).
+PARENT_WORDS="$(command grep -E '^  local _OC_PERSIST=' "$RECORD" | command sed -E 's/.*\(([^()]*)\)[^()]*$/\1/' | tr '|' '\n' | sort -u)"
+TWIN_WORDS="$(command grep -E '^  local _OC_STILL=' "$RECORD" | command sed -E 's/.*\(([^()]*)\)[^()]*$/\1/' | tr '|' '\n' | sort -u)"
+#   ⛔ THE `|| true` IS LOAD-BEARING, NOT DEFENSIVE NOISE. This harness runs under `set -euo pipefail`
+#   (line 27), and `grep -vxE` exits **1 when it selects no line** — which is exactly the CLEAN case,
+#   because the only words that ever reach it are the collective quantifiers it excludes. So without
+#   `|| true` the guard ABORTS THE SUITE precisely when parity HOLDS, printing no `ok:` and no `bad`:
+#   the harness then reports `aborted BEFORE its summary`, which reads as a broken test rather than as
+#   a passing one. MEASURED before the fix: `RC=1`, abort immediately after 13n86, no 13n87 line at all.
+#   The emptiness is tested explicitly on the next line, so swallowing the status loses nothing.
+if [ -z "$PARENT_WORDS" ] || [ -z "$TWIN_WORDS" ]; then
+    bad "13n87 PARITY: could not parse the two word lists out of the shipped script — re-anchor, do not drop"
+else
+    MISSING_WORDS="$(comm -23 <(printf '%s\n' "$PARENT_WORDS") <(printf '%s\n' "$TWIN_WORDS") \
+        | { grep -vxE 'remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending|still|some|most|several|half|rest' || true; })"
+    if [ -z "$MISSING_WORDS" ]; then
+        ok "13n87 PARITY: every non-collective word in _OC_PERSIST is also read by its line-wide twin _OC_STILL"
+    else
+        bad "13n87 PARITY: _OC_STILL is missing $(printf '%s' "$MISSING_WORDS" | tr '\n' ' ')— a remainder using it escapes after the declaration's own ';' (the 13n80-13n82 class)"
+    fi
+fi
+
+# 13n88 — MUTATION PIN for the exception predicate (13n79's own).
+N_EXCEPT_MUT="$T/mutant-except-removed.sh"
+sed 's#^  local _OC_EXCEPT=.*$#  local _OC_EXCEPT='"'"'@@NEVERMATCH@@'"'"'#' "$RECORD" > "$N_EXCEPT_MUT"
+if cmp -s "$RECORD" "$N_EXCEPT_MUT"; then
+    bad "13n88 MUTANT: the _OC_EXCEPT sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_EXCEPT_MUT" && ok "13n88 MUTANT: the exception-removed mutant still parses" || bad "13n88 MUTANT: the mutant does not parse"
+    NE_SAVE="$RECORD"
+    RECORD="$N_EXCEPT_MUT"
+    rm -f "$(Q2 426009)"
+    EV_REF="comment:42600901" run_record_ev 426009 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed except 1 in the retry path.**
+
+$VACUITY_BLOCK"
+    RECORD="$NE_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n88 MUTATION PIN: with the exception predicate removed, 13n79's body is ADMITTED (rc 0) — it is load-bearing"
+fi
+
+# 13n89 — MUTATION PIN for the twin's parity words (13n80's own): restore the SHORT list and the waived
+# remainder must ADMIT again. This is the row that would have caught the omission before a reviewer did.
+N_TWIN_MUT="$T/mutant-still-short.sh"
+sed 's@^  local _OC_STILL=.*$@  local _OC_STILL='"'"'[[:space:]]+([[][:space:]]*([[:alpha:]/._-]+[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending)'"'"'@' "$RECORD" > "$N_TWIN_MUT"
+if cmp -s "$RECORD" "$N_TWIN_MUT"; then
+    bad "13n89 MUTANT: the _OC_STILL sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_TWIN_MUT" && ok "13n89 MUTANT: the short-twin mutant still parses" || bad "13n89 MUTANT: the mutant does not parse"
+    NT_SAVE="$RECORD"
+    RECORD="$N_TWIN_MUT"
+    rm -f "$(Q2 426010)"
+    EV_REF="comment:42601001" run_record_ev 426010 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 was waived.**
+
+$VACUITY_BLOCK"
+    RECORD="$NT_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n89 MUTATION PIN: with the twin's list back to its short form, 13n80's body is ADMITTED (rc 0) — the parity is load-bearing"
+fi
+
+# 13n90-13n91 — THE OVER-BLOCK CONTROLS these predicates must NOT break. Both are honest CLEAN
+# closures the earlier rounds' widening was FOR, and each is one token away from a vector above: the
+# `#N` form is a reference, not a count, and `need a follow-up` with no count is docs work, not a
+# declared blocker. Without these, closing 13n79/13n83 by widening would be indistinguishable from
+# refusing every clean line that mentions a number.
+rm -f "$(Q2 426011)"
+EV_REF="comment:42601101" run_record_ev 426011 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed and re-verified, see #3902.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n90 a '#'-referenced issue is a REFERENCE, not a live count (rc 0)"
+
+rm -f "$(Q2 426012)"
+EV_REF="comment:42601201" run_record_ev 426012 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed; the docs need a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n91 a hand-off with NO count in it is not a declared blocking remainder (rc 0)"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# 13n92-13n106 — THE FOUR HOLES agent-infra#3902's SEVENTH review MEASURED, AND THE TWO FALSE
+# REFUSALS ONE OF THEM WAS HIDING. Every row below was RE-RUN against the shipped arm at cd640fff8
+# and did the wrong thing before the fix it now pins. The domain is adversarial: fail-open rows and
+# fail-closed rows are pinned in the SAME block on purpose, because closing one by widening is
+# indistinguishable from refusing every honest line unless both directions are asserted.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+# 13n92-13n96 — THE EXCEPTION CLASS WAS NOT CLOSED (P1 fail-open). `_OC_EXCEPT` carried 8 of the 13
+# commonest English connectives of exception, so the DIGIT form MINTED a signed `clean` while its
+# SPELLED twin was vetoed by `_OC_SELLED` — the #2661 "closed for one spelling and open for the other"
+# class, one belt over. MEASURED at cd640fff8: all five ADMITTED.
+rm -f "$(Q2 426101)"
+EV_REF="comment:42610101" run_record_ev 426101 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, save 1 in the retry path.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n92 'all … were fixed, SAVE 1' declares a live blocker (rc 3)"
+[ ! -f "$(Q2 426101)" ] && ok "13n92 no record minted over 'save 1'" || bad "13n92 minted a record over 'save 1'"
+
+rm -f "$(Q2 426102)"
+EV_REF="comment:42610201" run_record_ev 426102 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed with the exception of 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n93 'WITH THE EXCEPTION OF 1' declares a live blocker (rc 3)"
+
+rm -f "$(Q2 426103)"
+EV_REF="comment:42610301" run_record_ev 426103 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed excepting 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n94 'EXCEPTING 1' declares a live blocker (rc 3)"
+
+rm -f "$(Q2 426104)"
+EV_REF="comment:42610401" run_record_ev 426104 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed aside from 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n95 'ASIDE FROM 1' declares a live blocker (rc 3)"
+
+rm -f "$(Q2 426105)"
+EV_REF="comment:42610501" run_record_ev 426105 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed but for 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n96 'BUT FOR 1' declares a live blocker (rc 3)"
+
+# 13n97 — THE DISTANCE BOUND WAS ITSELF A FAIL-OPEN (P1). `[^.;:]{0,80}` admitted the same sentence
+# once the exception was pushed past 80 characters, which is the "one more noun defeats the width"
+# mistake this PR already fixed once (`_OC_TAIL`'s `{0,6}`). The clause boundary `[^.;:]` is the real
+# scoping, so the bound is gone rather than raised. MEASURED at cd640fff8: 118 characters ADMITTED.
+rm -f "$(Q2 426106)"
+EV_REF="comment:42610601" run_record_ev 426106 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed during the long migration of the dispatcher and the evidence reader and the merge rail, except 1 in the retry path.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n97 an exception 118 characters from its totality is still an exception (rc 3)"
+
+# 13n98-13n101 — THE HAND-OFF WAS READ IN THE ACTIVE VOICE ONLY (P2 fail-open). `needs|requires|awaits`
+# is first-person phrasing; the PASSIVE hand-off of the same surviving count reached no belt, because
+# `handed`/`goes`/`will be` is neither a resolution verb nor a persistence word. MEASURED at
+# cd640fff8: all four ADMITTED. The predicate's rule is "a count handed onward is a remainder" — voice
+# is not part of that rule.
+rm -f "$(Q2 426107)"
+EV_REF="comment:42610701" run_record_ev 426107 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 was handed off to #1234.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n98 '; 1 was HANDED OFF TO #1234' is a remainder (rc 3)"
+[ ! -f "$(Q2 426107)" ] && ok "13n98 no record minted over a passive hand-off" || bad "13n98 minted a record over '1 was handed off to #1234'"
+
+rm -f "$(Q2 426108)"
+EV_REF="comment:42610801" run_record_ev 426108 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 is handed to another PR.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n99 '; 1 is HANDED TO ANOTHER PR' is a remainder (rc 3)"
+
+rm -f "$(Q2 426109)"
+EV_REF="comment:42610901" run_record_ev 426109 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 goes to a separate issue.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n100 '; 1 GOES TO A SEPARATE ISSUE' is a remainder (rc 3)"
+
+rm -f "$(Q2 426110)"
+EV_REF="comment:42611001" run_record_ev 426110 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 will be its own PR.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n101 '; 1 WILL BE ITS OWN PR' is a remainder (rc 3)"
+
+# 13n102-13n104 — THE FALSE REFUSALS THE HAND-OFF WIDENING WAS HIDING (P2). `_OC_RESOLVES` let a
+# surviving count bring its OWN subject noun, so a second count about something else entirely read as
+# a resolution of the blocking findings and vetoed an honest closure. MEASURED at cd640fff8: all three
+# REFUSED. The rule is now SHAPE: a resolving count is a remainder only when it is ANAPHORIC (it
+# refers back to the declared findings); a count that names its own subject has changed population.
+# ⛔ THESE THREE ARE THE OVER-BLOCK CONTROLS FOR 13n98-13n101 — widening the hand-off without them
+# would be indistinguishable from refusing every clean line that mentions a number.
+for _vec in "426111|2 flaky tests were fixed" "426112|2 more tests were fixed too" "426113|3 follow-ups were resolved"; do
+    _id="${_vec%%|*}"; _tail="${_vec#*|}"
+    rm -f "$(Q2 "$_id")"
+    EV_REF="comment:${_id}01" run_record_ev "$_id" STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; ${_tail}.**
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "0" "13n10${_id#42611} a second count about a NON-blocking subject is not a remainder — '${_tail}' (rc 0)"
+done
+
+# 13n105 — MUTATION PIN for the anaphoric narrowing (13n102's own). Restore the wide token run and the
+# honest closure must REFUSE again, otherwise 13n102 could be green for an unrelated reason.
+N_RESOLVES_MUT="$T/mutant-resolves-wide.sh"
+# ⛔ THE ANCHOR IS THE MINIMAL UNIQUE FRAGMENT `)?(were` (grep -c on the shipped script reports 1), not
+# the whole assignment: a long escaped anchor is the thing that goes stale the next time the line is
+# reworded, and a stale mutation anchor is a RED test that reads as the pin holding (13n86 shipped
+# exactly that failure). The replacement re-introduces the wide token run the narrowing removed.
+sed 's#)?(were#)?(${_OC_TOK}[[:space:]]+){0,2}(were#' "$RECORD" > "$N_RESOLVES_MUT"
+if cmp -s "$RECORD" "$N_RESOLVES_MUT"; then
+    bad "13n105 MUTANT: the _OC_RESOLVES sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_RESOLVES_MUT" && ok "13n105 MUTANT: the wide-resolves mutant still parses" || bad "13n105 MUTANT: the mutant does not parse"
+    NR_SAVE="$RECORD"
+    RECORD="$N_RESOLVES_MUT"
+    rm -f "$(Q2 426114)"
+    EV_REF="comment:42611401" run_record_ev 426114 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 2 flaky tests were fixed.**
+
+$VACUITY_BLOCK"
+    RECORD="$NR_SAVE"
+    assert_eq "$RECORD_RC" "3" "13n105 MUTATION PIN: with the wide token run restored, 13n102's honest closure is REFUSED (rc 3) — the narrowing is load-bearing"
+fi
+
+# 13n106 — THE OVER-BLOCK CONTROL FOR THE PASSIVE WIDENING. A hand-off with NO count in it is docs
+# work, not a declared blocking remainder (the same polarity 13n91 pins for the active voice). Without
+# this, closing 13n98-13n101 would be indistinguishable from refusing every sentence containing
+# `handed`.
+rm -f "$(Q2 426115)"
+EV_REF="comment:42611501" run_record_ev 426115 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed; the vendor docs were handed to the team.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n106 a PASSIVE hand-off with NO count is not a declared remainder (rc 0)"
+
+# 13n107-13n108 — THE HAND-OFF WAS STILL VERB-ADJACENT, WHICH IS A ONE-NOUN DEFEAT (P1 fail-open,
+# found by attacking this round's OWN fix rather than by the reviewer). Giving the predicate the
+# passive voice closed `1 was handed off`, but the count and the hand-off verb may have a SUBJECT
+# NOUN between them — and then the predicate reached neither branch. MEASURED on the just-fixed arm:
+# both ADMITTED, while `1 needs a follow-up` / `1 was handed off` were refused. `_OC_STILL` already
+# carries a token run for exactly this reason; the hand-off predicate now uses the same shape, so a
+# remainder cannot escape by naming what it is instead of saying "it".
+rm -f "$(Q2 426116)"
+EV_REF="comment:42611601" run_record_ev 426116 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 finding needs a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n107 a NOUN between the count and the hand-off verb does not defeat it — '1 finding needs a follow-up' (rc 3)"
+[ ! -f "$(Q2 426116)" ] && ok "13n107 no record minted over a hand-off that named its subject" || bad "13n107 minted a record over '1 finding needs a follow-up'"
+
+rm -f "$(Q2 426117)"
+EV_REF="comment:42611701" run_record_ev 426117 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 finding was handed off to #1234.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n108 …and the same for the PASSIVE form with a subject noun — '1 finding was handed off to #1234' (rc 3)"
+
+# 13n109 — THE OVER-BLOCK CONTROL for the token run 13n107/13n108 added. The run is what makes a
+# noun survivable, so the guard is that it does NOT fire without a count: the identical sentence with
+# `the docs` instead of `1 finding` is docs work, not a declared blocking remainder.
+rm -f "$(Q2 426118)"
+EV_REF="comment:42611801" run_record_ev 426118 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed; the docs need a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n109 the token run does not fire without a count (rc 0)"
+
+# 13n110-13n112 — THE EXCEPTION CLASS WAS STILL A LIST, NOT A CLASS (P1 fail-opens, again found by
+# attacking this round's own fix). Three more members of the same grammatical closed class were
+# absent, and one of them was not a CONNECTIVE at all — `_OC_EXCEPT` could only see
+# `<connective> <count>`, so the equally natural `<count> exception(s)` was structurally invisible to
+# it. MEASURED on the arm as pushed in 92a6a2fe7: all three ADMITTED.
+#   `all blockers were fixed, short of 1.`            -> ADMIT   (connective absent)
+#   `all blocking findings were fixed, bar 1.`        -> ADMIT   (connective absent)
+#   `… were fixed, with 2 exceptions.`                -> ADMIT   (NOUN form, not connective+count)
+rm -f "$(Q2 426119)"
+EV_REF="comment:42611901" run_record_ev 426119 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blockers were fixed, short of 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n110 'all … fixed, SHORT OF 1' is a declared remainder (rc 3)"
+
+rm -f "$(Q2 426120)"
+EV_REF="comment:42612001" run_record_ev 426120 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, bar 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n111 'all … fixed, BAR 1' is a declared remainder (rc 3)"
+
+rm -f "$(Q2 426121)"
+EV_REF="comment:42612101" run_record_ev 426121 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, with 2 exceptions.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n112 the NOUN form '<count> exceptions' declares a remainder (rc 3)"
+
+# 13n113 — THE OVER-BLOCK CONTROL for the noun alternative 13n112 added, and the line-scoping guard
+# for the whole belt: a P2 count in a SEPARATE SENTENCE after a `.` is a different declaration, and
+# must not reach the arm (the tsv-framed body is ONE line to grep, so a predicate that crossed `.`
+# would refuse every honest closure that mentions a follow-up afterwards).
+rm -f "$(Q2 426122)"
+EV_REF="comment:42612201" run_record_ev 426122 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed. Separately, 1 P2 nit was filed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n113 a P2 count in a SEPARATE sentence does not reach the arm (rc 0)"
+
+# 13n114-13n116 — THREE MORE DECLARED REMAINDERS THAT MINTED A SIGNED `clean` (P1 fail-opens, from
+# the review of this branch's own round). Two of them are the parity guard's blind spot: 13n87 enforces
+# `_OC_PERSIST` ⊆ `_OC_STILL`, so it can prove the two lists AGREE but never that BOTH are missing a
+# word. `re-opened` was doubly invisible — the list had `open`, but `_OC_TOK` lets `-` join it into one
+# token, so `re-opened` never equalled `open`. MEASURED at 2e5defd2a: all three ADMITTED.
+rm -f "$(Q2 426123)"
+EV_REF="comment:42612301" run_record_ev 426123 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, less 2.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n114 'all … fixed, LESS 2' is a declared remainder (rc 3)"
+
+rm -f "$(Q2 426124)"
+EV_REF="comment:42612401" run_record_ev 426124 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed; 1 was re-opened.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n115 '; 1 was RE-OPENED' is a live remainder (rc 3)"
+
+rm -f "$(Q2 426125)"
+EV_REF="comment:42612501" run_record_ev 426125 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed; 1 was skipped.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n116 '; 1 was SKIPPED' is a live remainder (rc 3)"
+
+# 13n117 — THE REGRESSION THE BOUND-REMOVAL INTRODUCED (P2 false refusal), and the reason the exception
+# is now SCOPED to the match it excepts instead of merely being distance-free. Unbounding
+# `[^.;:]{0,80}` closed the distance fail-open but let the exception attach to a DIFFERENT noun phrase
+# in the same clause, so an honest closure was REFUSED at 8b244281c:
+#   `all blocking findings were fixed and re-verified against each reviewer note, and the whole
+#    documentation set in the handbook was updated except 1 typo.`   (137 chars, `except 1 typo`)
+# `1 typo` is not an exception of the BLOCKING FINDINGS, so nothing remains. The rule now reads
+# grammar, not width: the excepted count must not name its OWN population noun — a preposition,
+# an auxiliary, a persistence word, punctuation or end-of-clause must follow it. So
+# `except 1` / `except 1 in the retry path` refuse (13n79/13n97), and `except 1 typo` records.
+rm -f "$(Q2 426126)"
+EV_REF="comment:42612601" run_record_ev 426126 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed and re-verified against each reviewer note, and the whole documentation set in the handbook was updated except 1 typo.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n117 an exception that names its OWN population ('except 1 typo') is not an exception of the findings (rc 0)"
+[ -f "$(Q2 426126)" ] && ok "13n117 …and the honest closure still records" || bad "13n117 refused an honest closure whose 'except' attaches to another noun phrase"
+
+# 13n118 — MUTATION PIN for the scoping (13n117's own). Remove the scope suffix and the honest closure
+# must REFUSE again, otherwise 13n117 could be green because the connective never matched at all.
+N_SCOPE_MUT="$T/mutant-except-unscoped.sh"
+sed 's#\${_OC_EXCEPT_SCOPE}#)#' "$RECORD" > "$N_SCOPE_MUT"
+if cmp -s "$RECORD" "$N_SCOPE_MUT"; then
+    bad "13n118 MUTANT: the _OC_EXCEPT_SCOPE sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_SCOPE_MUT" && ok "13n118 MUTANT: the unscoped-exception mutant still parses" || bad "13n118 MUTANT: the mutant does not parse"
+    NS_SAVE="$RECORD"
+    RECORD="$N_SCOPE_MUT"
+    rm -f "$(Q2 426127)"
+    EV_REF="comment:42612701" run_record_ev 426127 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed and re-verified against each reviewer note, and the whole documentation set in the handbook was updated except 1 typo.**
+
+$VACUITY_BLOCK"
+    RECORD="$NS_SAVE"
+    assert_eq "$RECORD_RC" "3" "13n118 MUTATION PIN: with the exception unscoped, 13n117's honest closure is REFUSED (rc 3) — the scoping is load-bearing"
+fi
+
+# 13n119 — THE OVER-BLOCK CONTROL for the two persistence words. `skipped` and `re-opened` are read
+# CLAUSE-scoped inside _OC_PERSIST and line-wide inside _OC_STILL, so the control is that neither fires
+# without a blocking mention: a CLEAN line about skipped TESTS records.
+rm -f "$(Q2 426128)"
+EV_REF="comment:42612801" run_record_ev 426128 STUB_EVIDENCE_BODY="**Outcome: CLEAN — no blocking issues found; 2 flaky tests were skipped and 1 doc page was re-opened.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n119 'skipped'/'re-opened' with NO blocking mention is not a remainder (rc 0)"
+
+# 13n120-13n121 — A RESOLUTION THAT WAS REVERSED IS A LIVE REMAINDER (P1 fail-opens, found by
+# attacking this round's own fix). `_OC_STILL` carried persistence words, but not the verbs of
+# UNDOING — so a declared blocker that was rolled back read as resolved. MEASURED at 8ee43a197:
+# `; 1 was rolled back`, `; 1 was reverted`, `; 1 was withheld`, `; 1 got dropped` and
+# `; 1 was put back on the list` ALL ADMITTED and minted a signed `clean`.
+# ⛔ THIS IS A CLOSED GRAMMATICAL CLASS (verbs of undoing/withdrawal), not a synonym list: the same
+# shape that made `_OC_EXCEPT` a class rather than an enumeration. It is added to BOTH lists so
+# 13n87's parity guard still holds, and paren-free so that guard's list parser still parses.
+rm -f "$(Q2 426129)"
+EV_REF="comment:42612901" run_record_ev 426129 STUB_EVIDENCE_BODY="**Outcome: 2 blocking findings were fixed; 1 was rolled back.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n120 '; 1 was ROLLED BACK' is a live remainder — a reversed fix is not a fix (rc 3)"
+[ ! -f "$(Q2 426129)" ] && ok "13n120 no record minted over a rolled-back fix" || bad "13n120 minted a record over '1 was rolled back'"
+
+rm -f "$(Q2 426130)"
+EV_REF="comment:42613001" run_record_ev 426130 STUB_EVIDENCE_BODY="**Outcome: 2 blocking findings were fixed; 1 was put back on the list.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n121 '; 1 was PUT BACK on the list' is a live remainder (rc 3)"
+
+# 13n122 — THE OVER-BLOCK CONTROL for the undo class, and the one that matters most: these words are
+# now read LINE-WIDE by _OC_STILL, so the guard is that they do NOT fire without a blocking mention.
+# A CLEAN line that talks about reverted COMMITS or withdrawn DRAFTS records.
+rm -f "$(Q2 426131)"
+EV_REF="comment:42613101" run_record_ev 426131 STUB_EVIDENCE_BODY="**Outcome: CLEAN — no blocking issues found; 2 reverted commits and 1 withdrawn draft were cleaned up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n122 undo verbs with NO blocking mention do not refuse a clean line (rc 0)"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# 13n123-13n128 — THE SHAPE BELT. Six review rounds closed re-spellings by ADDING vocabulary, and
+# every round found more; the review of this branch said it outright: "Adding words cannot close this
+# class." It is right. At 35c7f03da `reverted`/`rolled back` were refused while all five bodies below
+# ADMITTED and minted a signed `clean`. So the belt no longer enumerates verbs — it reads SHAPE:
+# after the declared count is masked, a surviving count governed by a COPULA is a remainder unless
+# its own run carries a RESOLUTION verb. New words need no new vocabulary; only the closed copula set
+# and the arm's five existing resolution verbs are involved.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+# 13n123-13n125 — the three shapes a vocabulary list kept missing.
+rm -f "$(Q2 426132)"
+EV_REF="comment:42613201" run_record_ev 426132 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 1 was not merged.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n123 '; 1 was NOT MERGED' is a remainder — an un-resolution verb with no negator prefix (rc 3)"
+[ ! -f "$(Q2 426132)" ] && ok "13n123 no record minted over '1 was not merged'" || bad "13n123 minted a record over '1 was not merged'"
+
+rm -f "$(Q2 426133)"
+EV_REF="comment:42613301" run_record_ev 426133 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 1 item is routed to another PR.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n124 '; 1 item IS ROUTED to another PR' — a noun-subject hand-off the verb list missed (rc 3)"
+
+rm -f "$(Q2 426134)"
+EV_REF="comment:42613401" run_record_ev 426134 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 2 items were spun out into #1234.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n125 '; 2 items WERE SPUN OUT' — a phrasal verb no list would have carried (rc 3)"
+
+# 13n126-13n127 — the two exception slots a connective list could not see.
+rm -f "$(Q2 426135)"
+EV_REF="comment:42613501" run_record_ev 426135 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, saving 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n126 'all … fixed, SAVING 1' is a declared remainder (rc 3)"
+
+rm -f "$(Q2 426136)"
+EV_REF="comment:42613601" run_record_ev 426136 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, 1 aside.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n127 '… fixed, 1 ASIDE' — the exception word FOLLOWS the count here (rc 3)"
+
+# 13n128 — MUTATION PIN for the shape belt itself. 13n123-13n125 could be green for any other belt's
+# reason, so the copula arm is removed from a copy and the SAME bodies must then be ADMITTED.
+N_COPULA_MUT="$T/mutant-copula-removed.sh"
+sed 's#^  local _OC_COPULA=.*$#  local _OC_COPULA='"'"'@@NEVERMATCH@@'"'"'#' "$RECORD" > "$N_COPULA_MUT"
+if cmp -s "$RECORD" "$N_COPULA_MUT"; then
+    bad "13n128 MUTANT: the _OC_COPULA sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_COPULA_MUT" && ok "13n128 MUTANT: the copula-removed mutant still parses" || bad "13n128 MUTANT: the mutant does not parse"
+    NC_SAVE="$RECORD"
+    RECORD="$N_COPULA_MUT"
+    rm -f "$(Q2 426137)"
+    EV_REF="comment:42613701" run_record_ev 426137 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 1 was not merged.**
+
+$VACUITY_BLOCK"
+    RECORD="$NC_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n128 MUTATION PIN: with the copula belt removed, 13n123's body is ADMITTED (rc 0) — the shape belt is load-bearing"
+fi
+
+# 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
+# is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
+# refusal proves the refusal, never that THIS arm produced it.
+N1C_MUT="$T/mutant-1c-neutered.sh"
+sed 's#^  if outcome_declares_blocking "\$body"; then#  if false; then#' "$RECORD" > "$N1C_MUT"
+if cmp -s "$RECORD" "$N1C_MUT"; then
+    bad "13n12 MUTANT: the sed anchor no longer matches — re-anchor the pin rather than dropping it"
+else
+    bash -n "$N1C_MUT" && ok "13n12 MUTANT: the neutered-arm mutant still parses" || bad "13n12 MUTANT: the neutered-arm mutant does not parse"
+    N1C_RECORD_SAVE="$RECORD"
+    RECORD="$N1C_MUT"
+    rm -f "$(Q2 425016)"
+    EV_REF="comment:42501601" run_record_ev 425016 STUB_EVIDENCE_BODY="$N9859_BODY"
+    RECORD="$N1C_RECORD_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n12 MUTATION PIN: with (1c) neutered the REAL tortoise#9859 artifact is ADMITTED (rc 0) — the arm is load-bearing"
+fi
+
 # 13m3 — a SECOND unresolved-exit vocabulary the widened veto must cover: the
 # plan-review skill's block marker is "Requires Human Input", which the earlier
 # "require … human attention" pattern did NOT match (found in cycle 3 by reading
@@ -5914,13 +7381,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4181 :5907 :8281 :8455, plus a comment mention at :4050; `14.1c-CITE` below
+#     CITE-CHECK: :4787 :6513 :8887 :9061, plus a comment mention at :4576; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:4159) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:4619) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4181) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4787) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8281). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8887). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5946,7 +7413,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8281` / `:8455` — CITE-CHECK: :8281 :8455 — re-derived by the
+#     this head the predicates are `:8887` / `:9061` — CITE-CHECK: :8887 :9061 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6063,7 +7530,7 @@ assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marke
 #      previously claimed "`-qxF`->`-qF` at the dedup read left the suite at
 #      PASS=921 FAIL=0". THERE IS NO GREP AT THE DEDUP READ — not anchored, not
 #      unanchored: the loop compares whole bodies with `[ "$_body" = "$marker" ]`
-#      (scripts/record-review.sh:4103 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
+#      (scripts/record-review.sh:4292 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
 #      have been measured. The mutant that actually makes (b2) meaningful is replacing
 #      that equality with a SUBSTRING test (`case "$_body" in *"$marker"*)`): it
 #      reddens (b2) — which expects 1 POST and would get 0.
@@ -6848,14 +8315,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :4159) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :4398) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4181) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :4576) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :5907 :8281 :8455 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6513 :8887 :9061 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -9624,8 +11091,8 @@ targets = sys.argv[2:]
 # ⛔ A WHOLE-FILE LEXER WAS BUILT AND REJECTED — with the measurement, not as a preference.
 # Carrying quote state across lines is the only way to close the multi-line hole, and on the
 # REAL recorder it desyncs at `$(` inside a double-quoted string, because `$(` resets quoting:
-# the awk program at record-review.sh:2206 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
-# its own comment block across lines (`sed -n '2211,2220p'`), so a lexer that does not model `$(`
+# the awk program at record-review.sh:2412 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
+# its own comment block across lines (`sed -n '2423,2432p'`), so a lexer that does not model `$(`
 # re-opens a quote mid-program and reports those lines as live backticks — 26 false REDs over 12
 # lines in the prototype run (a COUNT, not a line map). Modelling `$(`,
 # `${`, `$'` and heredocs well enough to stay in sync is a bash lexer, which is a different
