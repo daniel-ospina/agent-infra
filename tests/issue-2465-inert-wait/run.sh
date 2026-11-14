@@ -13,9 +13,14 @@
 #      reversed the RECORDED #1614 dead-end gate: a `on: push` lane is STRUCTURAL and
 #      it DOES run on the PR head's own commit). The probe is THREE-valued and its
 #      answer decides — `has-run` keeps the filter and the lane's name (#1614),
-#      `none` widens, and `unreadable` widens ONLY for the structural class, which is
-#      the one class where no run can still appear while the wait runs. This file
-#      pins all three, including the #1614 arm the reversal broke.
+#      `none` widens, and `unreadable` widens ONLY where the lane's own run can never
+#      attach to the head: `STRUCTURAL` and its `on:` declares neither `push` nor
+#      `workflow_dispatch` (`lane_own_run_can_attach` — a push whose tip is the head, or a
+#      `gh workflow run --ref`, CAN put its own name on a run for the head while the wait
+#      runs, so such a member keeps the filter and fails closed). This file pins all three,
+#      including the #1614 arm the reversal broke.
+#      ⛔ AND NOT "unreadable widens for the whole STRUCTURAL class" — that was the merged
+#      first landing (`e4716a058`) and it failed open on one transient read (review P1).
 #   B. `atomic-land.sh --no-wait` skipped only its OWN `[2/4] verify` and handed the head
 #      to a land step that waited the rail's full FIRST-CHECKS window — so a caller that
 #      explicitly declined to wait still waited 65 minutes, once per round.
@@ -24,11 +29,14 @@
 # extracted from the REAL `atomic-land.sh`. Both are awk extractions over the shipped
 # files (never copies — a copy would drift), each asserted non-empty and asserted to
 # contain the fix, so a refactor that moves the seam fails loudly instead of testing
-# nothing. TWO mutation arms: (f) re-introduces the #1614 reversal in a mutant and
+# nothing. FOUR mutation arms: (f) re-introduces the #1614 reversal in a mutant and
 # shows the dead-end-gate arm goes RED there, and (h) re-spells the classifier's
 # reason prefix and shows arm (a) — the only arm the classification can change — goes
 # RED there. (h) exists because a copy of that CLASSIFIER used to be emitted inside
-# the extracted lib's body and silently shadow the extract (review P1).
+# the extracted lib's body and silently shadow the extract (review P1). The other two are
+# the helper mutants: (a5) makes 'push' unattachable, (a6) flips the absent-clause default,
+# and (a7) makes the helper name an UNATTACHABLE trigger — each counted, so a silent no-op
+# proves nothing.
 #
 # ✖ The rail's whole behaviour under the knob is pinned by `tests/admin-merge/run.sh`
 # (arm (e) there is the integration proof of the #1614 gate, arm (f) the integration
@@ -193,6 +201,34 @@ echo "(a3) STRUCTURAL + 'workflow_dispatch' + UNREADABLE probe — must KEEP the
 drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_dispatch)' unreadable
 ck "(a3) NO widening: 'gh workflow run --ref <branch>' attaches a run of THIS workflow to THIS head" \
    "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+# ⛔ THE MECHANISM MUST MATCH THE TRIGGER THE CLAUSE NAMES (round 3, P2). The clause quotes
+# the trigger the helper FOUND; a fixed parenthetical then offers "a push whose tip is $head"
+# as the way in, which a `workflow_dispatch`-only lane's `on:` block cannot do. A mechanism
+# the lane's own trigger cannot provide is a claim the code did not take.
+KEPT_A3="$(grep 'LANE KEPT' <<<"$R_ERR")"
+ck "(a3) the class clause names the MEASURED trigger it found ('workflow_dispatch')" \
+   "$(grep -q "declares 'workflow_dispatch'" <<<"$KEPT_A3" && echo 0 || echo 1)"
+ck "(a3) ⛔ it does NOT offer a PUSH as the mechanism — a workflow_dispatch-only lane has none" \
+   "$(grep -q 'a push whose tip is' <<<"$KEPT_A3" && echo 1 || echo 0)"
+ck "(a3) instead it names the mechanism that CAN start this lane ('gh workflow run --ref')" \
+   "$(grep -q 'gh workflow run --ref' <<<"$KEPT_A3" && echo 0 || echo 1)"
+
+# ── (a3b) A MULTI-TRIGGER LIST names ONLY the members that can attach (round 3, P1) ──
+# The helper accumulates `found` from a comma list, so the message quotes a JOINED value.
+# Nothing pinned its CONTENT for a list with more than one member: a mutant that appends
+# `workflow_call` to the answer survived the whole suite, and naming `workflow_call` as
+# attachable is exactly the #1413/#2465 confusion this design removes (a `workflow_call` run
+# attaches under the CALLER's name, so this lane's own name never appears on the head). It
+# also makes the multi-trigger line in the PR's own evidence a claim no arm produced.
+echo "(a3b) STRUCTURAL + 'workflow_call, workflow_dispatch' + UNREADABLE — names ONLY the attachable member"
+drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_call, workflow_dispatch)' unreadable
+ck "(a3b) NO widening: the list holds an attachable member, so the filtered wait is still a SIGNAL" \
+   "$([ "$R_ANY" = 0 ] && [ -z "$R_WFARGS" ] && echo 0 || echo 1)"
+KEPT_A3B="$(grep 'LANE KEPT' <<<"$R_ERR")"
+ck "(a3b) it names the attachable member it found ('workflow_dispatch')" \
+   "$(grep -q "declares 'workflow_dispatch'" <<<"$KEPT_A3B" && echo 0 || echo 1)"
+ck "(a3b) ⛔ it does NOT name 'workflow_call' — it cannot attach this lane's name to the head (#1413)" \
+   "$(grep -q 'workflow_call' <<<"$KEPT_A3B" && echo 1 || echo 0)"
 
 echo "(a4) STRUCTURAL + NO parseable trigger clause + UNREADABLE — the CONSERVATIVE default"
 drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request' unreadable
@@ -206,6 +242,15 @@ ck "(a4) the message says the trigger list could not be READ — it does not cla
    "$(grep -q 'could not be READ from the applicability reason' <<<"$R_ERR" && echo 0 || echo 1)"
 ck "(a4) ⛔ it does NOT print \"it declares '\" (a declared trigger it never read)" \
    "$(grep -q "it declares '" <<<"$R_ERR" && echo 1 || echo 0)"
+# ⛔ AND THE TAIL MAY NOT RE-ASSERT WHAT THE CLAUSE JUST CALLED UNREAD (round 3, P2).
+# "This class CAN still start a run while the wait runs" is the very capability this arm
+# has just said it could not establish — and the sentence repeated the "not an exemption"
+# rationale twice. Only the CONSEQUENCE may be stated here.
+KEPT_A4="$(grep 'LANE KEPT' <<<"$R_ERR")"
+ck "(a4) ⛔ the tail does NOT assert 'This class CAN still start a run' — the clause just called that unread" \
+   "$(grep -q 'This class CAN still start a run' <<<"$KEPT_A4" && echo 1 || echo 0)"
+ck "(a4) …but it still states the consequence, so the operator knows the wait applies and §1b refuses" \
+   "$(grep -q 'The bounded wait applies, and §1b refuses if no run appears' <<<"$KEPT_A4" && echo 0 || echo 1)"
 
 # ── (a5)/(a6) MUTATION PROOFS — (a2)/(a4) must discriminate on the helper ───
 # Both mutations hit ONLY lane_own_run_can_attach, counted so a silent no-op proves
@@ -251,6 +296,26 @@ HM2_ERR="$(AP_VERDICT=inapplicable \
 HM2_ANY="$(sed -n 's/^ANY_WORKFLOW=//p' <<<"$HM2_ERR")"
 ck "(a6) against the mutant (a4)'s assertion is RED (ANY_WORKFLOW='$HM2_ANY' — an unparseable trigger list widened)" \
    "$([ "$HM2_ANY" = 1 ] && echo 0 || echo 1)"
+
+echo "(a7) MUTATION: the helper names an UNATTACHABLE trigger ('workflow_call') → arm (a3b) is RED there"
+HMUT3="$TMP/helper-mutant-names-call.sh"
+awk '
+  /^lane_own_run_can_attach\(\) \{/ { inh = 1 }
+  inh && /^    \*,workflow_dispatch,\*\) found="\$\{found:\+\$found \}workflow_dispatch" ;;$/ { print "    *,workflow_dispatch,*) found=\"${found:+$found }workflow_dispatch workflow_call\" ;;"; n++; next }
+  { print }
+  inh && /^}$/ { inh = 0 }
+  END { exit (n == 1 ? 0 : 1) }
+' "$SRC" > "$HMUT3"
+ck "(a7) the mutation applied EXACTLY once to the workflow_dispatch branch" "$?"
+ck "(a7) the mutant parses (bash -n)" "$(bash -n "$HMUT3" 2>/dev/null && echo 0 || echo 1)"
+HMUT3LIB="$TMP/helper-mutant-names-call-lib.sh"
+ck "(a7) the mutant still builds a lib carrying the helper" \
+   "$(build_lib "$HMUT3" "$HMUT3LIB" && grep -q 'lane_own_run_can_attach' "$HMUT3LIB" && echo 0 || echo 1)"
+HM3_ERR="$(AP_VERDICT=inapplicable \
+  AP_REASON='lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_call, workflow_dispatch)' \
+  AP_PROBE_STATE=unreadable bash < "$HMUT3LIB" 2>&1 >/dev/null)"
+ck "(a7) against the mutant (a3b)'s assertion is RED (the message names 'workflow_call' as attachable)" \
+   "$(grep 'LANE KEPT' <<<"$HM3_ERR" | grep -q 'workflow_call' && echo 0 || echo 1)"
 
 # ── (b) STRUCTURAL class + probe that MEASURED "no run" ────────────────────
 echo "(b) STRUCTURAL (no PR trigger) + the run probe MEASURED no run — dead end on the measurement"
