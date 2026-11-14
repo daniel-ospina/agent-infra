@@ -180,7 +180,7 @@ old wording opened each line with the command, and for `com.eldato.lane-arm` and
 `fleet-schedule.py`'s verdict read `1 launchd job(s)` however many jobs there were.
 
 `fleet-schedule.py --verify` counts the verdict **markers** (`NOT INSTALLED`, `DRIFTED`, `not loaded`,
-`⛔ UNMANAGED`, `⛔ RETIRED-INSTALLED`, `⛔ UNKNOWN`), not bare words — the bare-word scan matched the
+`⛔ UNMANAGED`, `⛔ RETIRED-INSTALLED`, `⛔ UNKNOWN`, `⛔ CMUX-GATED`), not bare words — the bare-word scan matched the
 section intro too, so three undeclared jobs and one both read as `1`. **One job carries exactly ONE
 marker**, which is why the `RETIRED (manifest wins) — an installed copy ALSO survives` row does *not*
 use the word `DRIFTED`: a retired label with both a surviving template and an installed copy would
@@ -231,7 +231,8 @@ against it would conclude the heartbeat was running there.
   template may name the loop — so the heartbeat is not in it. Delivering the loop on a cell is
   **#1864's remaining half**, not something this document can assert.
 - `check` is identical on both, which is exactly how you find out: on a cell with no loop it answers
-  **DRIFT** (`not running`), never a comfortable silence.
+  **DRIFT** (`not running`) where a state dir exists, and **`2 UNKNOWN`** (`nothing has ever run
+  here`) where none does — never a comfortable silence, and never a pass.
 
 | | macOS | Linux (cloud cell) |
 |---|---|---|

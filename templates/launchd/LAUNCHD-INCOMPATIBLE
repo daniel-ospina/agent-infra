@@ -51,4 +51,12 @@
 # A ProgramArguments entry matches when its path ends with `/<entry>`. Repo-relative suffix, not
 # absolute prefix: the farmed deployment copy (`$HOME/.pi/agent/scripts/<name>`) and a worktree copy
 # must both refuse, because the gate is a property of the SCRIPT, not of where it is checked out.
+# ⛔ DECLARED RESIDUAL (agent-infra#3826): a *renamed copy or symlink* of a gated script under another
+# basename is NOT matched — there is no path resolution here, by design, because resolving would have
+# to reproduce the operator's whole filesystem to be complete. MEASURED: a symlink
+# `/tmp/…/loop-alias.sh -> <repo>/scripts/heartbeat-loop.sh`, named by a template, installs rc=0.
+# The gate catches the natural shapes — the repo path, the farmed path, a `Program`-only plist, and
+# `[/bin/bash, …/scripts/heartbeat-loop.sh]` — and a wrapper under a new name is a deliberate evasion,
+# not the accident this exists to stop. Closing it needs dev+inode comparison of the resolved target,
+# which is the follow-up, not a silent gap: it is stated here so a reader can predict it.
 scripts/heartbeat-loop.sh

@@ -342,7 +342,7 @@ EOF
     if [ -f "$KILLFILE" ]; then
         die "REFUSING: $KILLFILE is present — the loop exits at the top of its next pass, and this loop
   is launched-once (no timer restarts it).
-  Resume with:  rm -f $KILLFILE && bash $0 start"
+  Resume with:  rm -f $KILLFILE && (<this launcher>) start"
     fi
 
     # Already running is success, not a second copy. Read the pid AND prove it is the LOOP: a pidfile
@@ -450,7 +450,7 @@ EOF
             if [ -n "$upid" ]; then
                 pid_is_loop "$upid"; ident=$?
                 if [ "$ident" = 0 ]; then
-                    note "heartbeat loop started (pid $upid) — verify with: bash $0 check"
+                    note "heartbeat loop started (pid $upid) — verify with: (<this launcher>) check"
                     return 0
                 fi
             fi
@@ -471,7 +471,7 @@ cmd_stop() {
     printf 'stop requested %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$KILLFILE" 2>/dev/null \
         || die "cannot write $KILLFILE"
     note "stop requested: $KILLFILE written; the loop exits at the top of its next pass."
-    note "Resume with: rm -f $KILLFILE && bash $0 start"
+    note "Resume with: rm -f $KILLFILE && (<this launcher>) start"
 }
 
 # ── STATUS (informational) ────────────────────────────────────────────────────────────────────
