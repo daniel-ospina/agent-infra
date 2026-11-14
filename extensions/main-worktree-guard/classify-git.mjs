@@ -4766,6 +4766,18 @@ function _isPushDeleteFlagToken(a) {
 //   ~        tilde expansion at word start.
 //   \       escape — the word is not the text.
 //
+// ⛔ WHITESPACE IS DELIBERATELY *NOT* IN THIS CLASS, AND THE REASON IS A MEASURED FALSE BLOCK
+// (round-10 review, P0 F1, and the fix that replaced the first attempt). The obvious rule — "a ref
+// cannot contain whitespace, so refuse a target that does" — is TRUE and still wrong as a REFUSAL
+// RULE here, because the very same shape arrives as an ORDINARY OVER-CAPTURE: the delete arm's
+// target list includes the classifier's positionals, so a legitimate
+// `git push origin -o merge_request.title="Release 2.0" -d feat/x` carries the option VALUE as a
+// candidate target. Measured at that head: `-o "a b" -d held` and `-o "a\nb" -d held` began refusing
+// by #653 ("cannot tell WHICH branch") where the delete target was a plain literal and #73 should
+// have decided it — a false block on a real push-option form. The whitespace hazard itself is fixed
+// at its SOURCE (`_dropUnmatchedQuote`), so a target can no longer acquire a glued space in the first
+// place. This entry stays out with that reason recorded, so a later reader does not "restore" it.
+//
 // Deliberately NOT included: `,` (legal in a ref name; brace expansion is caught
 // by its own braces) and `^`/`:` (illegal in a ref name and not a shell
 // expansion — git rejects such a refspec, so it cannot delete a held branch).
@@ -4905,7 +4917,8 @@ const _NL_DATA = "\u0003";
  * already gone before this runs. Unbalanced state is handled the way bash's own parse would leave it:
  * everything after an unterminated quote/span stays inside it, so no later newline is a separator.
  *
- * ⛔ THREE WAYS THIS MASK USED TO HIDE A REAL SEPARATOR, EACH A FAIL-OPEN (round-9 review, P0 ×3).
+ * ⛔ THREE WAYS THIS MASK USED TO HIDE A REAL SEPARATOR, EACH A FAIL-OPEN (round-9 review, P0 ×3),
+ * PLUS TWO MORE FOUND BY THE ROUND-10 REVIEW (P0 ×2 — the list was called complete and was not).
  * Masking a newline that bash treats as a SEPARATOR merges two commands into one body; the second
  * command's `(`/`$(` is then read as a span OPENER, its `-d` and target are skipped as span content,
  * `extractPushDeleteBranch` returns null — and a delete of a sibling-held branch is ALLOWED. Measured
@@ -4927,6 +4940,14 @@ const _NL_DATA = "\u0003";
  *         git push origin -o ${R:-(}⏎( git push origin -d held/branch )      → ALLOWED, main BLOCKS
  *       Fixed by a STACK: `}` only closes a `${`, `)` only closes a `$(`, and inside `${ … }` a bare
  *       `(` is DATA, not a nesting level (bash: `${R:-(}` is the complete expansion yielding `(`).
+ *   (d) A PROCESS-SUBSTITUTION OPENER WAS NOT A SPAN (round-10 review, P0 F3). `<(`/`>(` pushed no
+ *       level, so a newline inside the substitution body was masked as a SEPARATOR and the capture cut:
+ *         git push origin -o <(cat ff⏎) -d held/branch    → ALLOWED (null), main BLOCKS
+ *   (e) A `$( … )` INSIDE `"…"` WAS INVISIBLE TO THE STACK (round-10 review, P0 F4). The quote arm ran
+ *       before the span arms, so the substitution's own `"` closed the ENCLOSING quote and its data
+ *       newline separated the command:
+ *         git push origin -o "$(echo "a⏎b")" -d held/branch   → ALLOWED (null), main BLOCKS
+ *       `_maskDataParens` already modelled this (`substQuotes`); the two passes now share one model.
  * @param {string} text
  * @returns {string}
  */
@@ -4934,13 +4955,32 @@ function _maskQuotedNewlines(text) {
   const s = _foldAnsiCStrings(String(text ?? ""));
   const out = [];
   let quote = null;  // ' or "
-  const spans = [];  // stack of "(" ($( … )) | "{" (${ … }) open OUTSIDE quotes
+  // ⛔ ONE STACK ENTRY PER SPAN, EACH CARRYING THE QUOTING CONTEXT TO RESTORE (round-10 review, P0
+  // F4). A flat `spans` of kind strings could not express "this `$( … )` was opened INSIDE a double
+  // quote, so bash returns to that quote at its `)`" — and the monolithic quote branch ran FIRST, so
+  // the `$(` never became a span at all and the span's inner `"` CLOSED THE ENCLOSING QUOTE:
+  //
+  //   git push origin -o "$(echo "a<LF>b")" -d hk7/branch    base → ["a","b\")","hk7/branch"] → BLOCK
+  //   git push origin -o "$(echo "a<LF>b")" -d hk7/branch    here → null                       → ALLOW
+  //
+  // `_maskDataParens` already models exactly this (`substQuotes`); the two passes disagreed on bash's
+  // quoting model and this one lost. Keeping the model in ONE place (this stack) is the fix.
+  const spans = [];  // { kind: "(" | "{", restore: "'" | '"' | null }
+  const openSpan = (kind, restore) => spans.push({ kind, restore });
   let btick = false;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     const push = (v) => out.push(v === "\n" && (quote !== null || spans.length > 0 || btick) ? _NL_DATA : v);
+    const top = spans[spans.length - 1];
     if (quote !== null) {
       if (ch === "\\" && quote === '"' && i + 1 < s.length) { out.push(ch, s[i + 1]); i++; continue; }
+      // A `$(` INSIDE DOUBLE QUOTES OPENS A SPAN IN A FRESH QUOTING CONTEXT (defect (d), F4). Bash
+      // parses the substitution body as its own command list and returns to this quote at the
+      // matching `)`. A `${` inside quotes needs no level: the enclosing quote already masks its
+      // newlines, so treating it as data here is correct and unchanged.
+      if (quote === '"' && ch === "$" && s[i + 1] === "(") {
+        openSpan("(", quote); quote = null; out.push("$("); i++; continue;
+      }
       if (ch === quote) quote = null;
       push(ch);
       continue;
@@ -4957,14 +4997,28 @@ function _maskQuotedNewlines(text) {
     }
     if (ch === "'" || ch === '"') { quote = ch; out.push(ch); continue; }
     if (ch === "`") { btick = !btick; out.push(ch); continue; }
-    if (ch === "$" && s[i + 1] === "(") { spans.push("("); out.push("$("); i++; continue; }
-    if (ch === "$" && s[i + 1] === "{") { spans.push("{"); out.push("${"); i++; continue; }
-    const top = spans[spans.length - 1];
+    if (ch === "$" && s[i + 1] === "(") { openSpan("(", null); out.push("$("); i++; continue; }
+    if (ch === "$" && s[i + 1] === "{") { openSpan("{", null); out.push("${"); i++; continue; }
     // ⛔ A BARE `(` NESTS ONLY INSIDE `$( … )`. Inside `${ … }` it is literal text, so pushing a level
     // there would make the expansion's own `}` fail to close and mask the next newline (defect (c)).
-    if (top === "(" && ch === "(") { spans.push("("); out.push(ch); continue; }
-    if (top === "(" && ch === ")") { spans.pop(); out.push(ch); continue; }
-    if (top === "{" && ch === "}") { spans.pop(); out.push(ch); continue; }
+    // ⛔ A PROCESS-SUBSTITUTION OPENER IS A SPAN (round-10 review, P0 F3). `<( list )` / `>( list )` is
+    // ONE WORD of the enclosing simple command (GNU Bash manual, Process Substitution), so a newline
+    // inside it is DATA — but the `(` was pushed only when the stack top was already `$(`, so the
+    // span was invisible and its inner newline CUT THE CAPTURE, losing the delete flag and target:
+    //
+    //   git push origin HEAD:wtfeat && git push origin -o <(cat ff<LF>) -d hk7/branch
+    //   base → ["ff",")","hk7/branch"] (BLOCK)      here → null (ALLOW)
+    //
+    // The whole `<`/`>`+`(` form is the word, so the level is pushed for both spellings; `$((` also
+    // nests through this arm (the `$(` level is already on the stack).
+    if (ch === "(" && (top?.kind === "(" || s[i - 1] === "<" || s[i - 1] === ">")) { openSpan("(", null); out.push(ch); continue; }
+    if (ch === ")" && top?.kind === "(") {
+      const done = spans.pop();
+      if (done.restore) quote = done.restore; // back to the quote the span was opened in (F4)
+      out.push(ch);
+      continue;
+    }
+    if (ch === "}" && top?.kind === "{") { spans.pop(); out.push(ch); continue; }
     push(ch);
   }
   return out.join("");
@@ -5133,6 +5187,46 @@ function _unmaskDataParens(tok) {
   return tok.replace(/[\u0001\u0002]/g, (c) => (c === _QP_L ? "(" : ")"));
 }
 
+/** Drop the ONE quote character in this segment body that has no partner.
+ *
+ * ⛔ AN UNBALANCED QUOTE IN A SEGMENT IS A CLOSER (or an opener) OF THE *OUTER* COMMAND, AND
+ * `_tokenize` SWALLOWS WHITESPACE INTO THE WORD WHILE IT IS OPEN (round-10 review, P0 F1). The
+ * capture is bounded by `;`/`&`/`|`/newlines, not by quoting, so a compound that hands the push to a
+ * shell — `sh -c 'git push origin -d held'`, `eval "…"`, `bash -c "…"` — leaves the segment body as
+ * ` origin -d held' `: the `'` that CLOSES the outer word is inside the capture, nothing in the body
+ * opened it, and `_tokenize`'s quote branch then appends `'`, ` ` and every later character to the
+ * target. `_cleanDeleteTarget` strips only ADJACENT quotes, so the target stayed `held ` — and a
+ * trailing space is not in `DELETE_TARGET_UNRESOLVABLE_RE`, so #653 did not refuse it and
+ * `_coordinatedDeleteBlock` looked up `refs/heads/held ` (an exact-key miss) and ALLOWED the delete
+ * of a branch a sibling worktree holds. MEASURED: `origin/main` returned ["held"] (BLOCK), this
+ * branch returned ["held "] (ALLOW), end-to-end through the shipped handler.
+ *
+ * Deleting the unmatched quote character restores the word exactly as bash sees it (`sh -c` strips
+ * the quotes before the inner shell ever parses the body), and it leaves every BALANCED quote
+ * untouched — a genuinely quoted ref name (`-d 'feat/x)'`) keeps its whitespace-free content.
+ * Refusing the glued form in `_cleanDeleteTarget` was tried FIRST and reverted: the same over-capture
+ * also carries push-option VALUES (`-o "Release 2.0"`), so the refusal rule turned an ordinary
+ * `-o … -d <literal>` into a false block (see `DELETE_TARGET_UNRESOLVABLE_RE`).
+ * @param {string} s
+ * @returns {string}
+ */
+function _dropUnmatchedQuote(s) {
+  let quote = null;
+  let open = -1;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') { i++; continue; }   // POSIX: `\` escapes only in `"…"`
+      if (ch === quote) { quote = null; open = -1; }
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; open = i; continue; }
+  }
+  if (quote === null || open < 0) return s;
+  return s.slice(0, open) + s.slice(open + 1);
+}
+
 /**
  * Tokenize ONE `git push` segment body, stopping where BASH ENDS THE COMMAND.
  *
@@ -5182,13 +5276,21 @@ function _unmaskDataParens(tok) {
  *      paren. `_maskDataParens` neutralises quoted, escaped AND parameter-expansion parens before
  *      tokenizing and every token is unmasked on the way out, so paren DATA can never drive the span
  *      rules.
+ *   5. ONLY A BALANCED QUOTE IS A QUOTE (round-10 review, P0 F1). The capture is bounded by LIST
+ *      SEPARATORS, not by quoting, so a quote that OPENS before `git push` (or one whose partner lies
+ *      beyond the capture) arrives here alone — and `_tokenize` then swallows the whitespace that
+ *      follows it into the word, producing the phantom `held ` that misses the #73 lookup. The
+ *      unmatched quote character is dropped before tokenizing (`_dropUnmatchedQuote`), which is what
+ *      bash's own `sh -c`/`eval` handling does to it; a BALANCED quoted word still keeps its content
+ *      (`-d 'feat/x)'` is the real ref `feat/x)`).
  * @param {string} body raw text after the `git push` word
  * @returns {string[]}
  */
 function _pushSegmentTokens(body) {
   // ANSI-C strings are folded FIRST (see `_foldAnsiCStrings`) — `_tokenize` has no `$'…'` quoting, and
-  // leaving it to guess is what let a `\'` inside one swallow the rest of the segment.
-  const toks = _tokenize(_foldBacktickSubstitutions(_maskDataParens(_foldAnsiCStrings(body))));
+  // leaving it to guess is what let a `\'` inside one swallow the rest of the segment. The unmatched
+  // quote is dropped NEXT, so every later pass works on quote-balanced text (rule 5).
+  const toks = _tokenize(_foldBacktickSubstitutions(_maskDataParens(_dropUnmatchedQuote(_foldAnsiCStrings(body)))));
   const tokens = [];
   let depth = 0; // parens OPENED inside this segment: their span is one WORD, not a boundary
   for (let i = 0; i < toks.length; i++) {
@@ -5263,7 +5365,23 @@ function _cleanDeleteTarget(x) {
   // both keeps the rule (and the message) the same shape. Two distinct substitutions in one delete
   // therefore collapse to ONE marker under the caller's dedupe; that loses which spans they were and
   // changes no verdict: every one of them is still refused.
-  if (x === _SUBST_PLACEHOLDER) return "$(…)";
+  //
+  // ⛔ CONTAINMENT, NOT EQUALITY (round-10 review, P0 F2). The exact-match arm read `x ===` and so
+  // missed every GLUED phantom: `_foldAnsiCStrings` and `_foldBacktickSubstitutions`' PAIRED arm both
+  // splice the placeholder IN PLACE, with no separator, so a substitution CONCATENATED with the ref
+  // produced one token that matched NEITHER this arm NOR `DELETE_TARGET_UNRESOLVABLE_RE` (a NUL is in
+  // no class), and it was then treated as a literal ref name:
+  //
+  //   git push origin HEAD:wtfeat && git push origin -d hk7/branch$''      base → ["hk7/branch$'"] → REFUSE
+  //   git push origin HEAD:wtfeat && git push origin -d hk7/branch$''      here → ["hk7/branch\u0000SUBST"] → ALLOW
+  //   git push origin HEAD:wtfeat ; git push origin -d `date`hk7/branch    here → ["\u0000SUBSThk7/branch"] → ALLOW
+  //
+  // (bash concatenates, so `$''hk7/branch` IS the argv word `hk7/branch`, and the delete really runs.
+  // The paired-backtick arm has the same glue on the CLOSING side; its UNPAIRED arm adds a separator
+  // on purpose, which is why only this containment rule covers both directions.) A NUL cannot occur
+  // in a shell word at all, so containment is fail-closed with no over-block: a token carrying the
+  // placeholder is not literal text and its ref name is unknowable.
+  if (x.includes(_SUBST_PLACEHOLDER)) return "$(…)";
   return x
     .replace(/^["']|["']$/g, "")   // strip surrounding quotes
     .replace(/^:+/, "")             // leading empty-source colon(s)

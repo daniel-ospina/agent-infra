@@ -223,6 +223,52 @@ expect("A: an unquoted `#` MID-WORD is not a comment", extractPushDeleteBranch("
 expect("A: a quoted brace does not close the expansion", extractPushDeleteBranch("git push origin -o ${R:-'}'x)} -d b"), ["b"]);
 expect("A: a substitution span inside a parameter expansion", extractPushDeleteBranch("git push $(echo ${R:-)}) origin -d b"), ["origin", "b"]);
 
+// ⛔ ONLY A BALANCED QUOTE IS A QUOTE (round-10 review, P0 F1). The capture is bounded by list
+// separators, NOT by quoting, so a compound that hands the push to a shell (`sh -c '…'`, `eval`) puts
+// the OUTER word's closing quote inside the segment. `_tokenize` then swallows the following
+// whitespace into the word, and the target came out as `held/branch ` — a trailing space is not in
+// `DELETE_TARGET_UNRESOLVABLE_RE`, so #653 did not refuse it and the #73 lookup asked for
+// `refs/heads/held/branch ` (an exact-key miss) and ALLOWED the delete of a sibling-held branch.
+// MEASURED before the fix: base `["held/branch"]` (BLOCK) vs this branch `["held/branch "]` (ALLOW).
+// The fix is `_dropUnmatchedQuote` — NOT a whitespace rule in the refusal class, which was tried and
+// reverted: the same over-capture carries push-option VALUES (`-o "a b"`), so refusing whitespace
+// turned an ordinary `-o … -d <literal>` into a FALSE BLOCK.
+for (const [name, cmd] of [
+  ["a `sh -c '…'` closer inside the segment", "git push origin HEAD:feat && sh -c 'git push origin -d held/branch'"],
+  ["…with a tail after the closer", "git push origin HEAD:feat && sh -c 'git push origin -d held/branch' && echo done"],
+  ["a `bash -c \"…\"` closer inside the segment", 'git push origin HEAD:feat && bash -c "git push origin -d held/branch"'],
+  ["an `eval '…'` closer inside the segment", "git push origin HEAD:feat && eval 'git push origin -d held/branch'"],
+]) {
+  expect(`A: ${name} → the real target, with NO glued whitespace`, extractPushDeleteBranch(cmd), ["held/branch"]);
+}
+// ⛔ A GLUED SUBSTITUTION PLACEHOLDER IS UNRESOLVABLE, NOT A REF (round-10 review, P0 F2). The
+// placeholder was matched by EQUALITY, so a substitution CONCATENATED with the ref (`$''held/branch` —
+// bash joins them, the argv word IS `held/branch`) produced one token that matched neither the marker
+// arm nor the refusal class, was treated as a literal ref, missed the lookup, and ALLOWED the delete.
+// `_cleanDeleteTarget` now matches CONTAINMENT: a NUL cannot occur in a shell word at all.
+for (const [name, cmd] of [
+  ["an empty ANSI-C literal GLUED after the ref", "git push origin HEAD:feat && git push origin -d held/branch$''"],
+  ["an empty ANSI-C literal GLUED before the ref", "git push origin HEAD:feat && git push origin -d $''held/branch"],
+  ["a PAIRED backtick span GLUED before the ref", "git push origin HEAD:feat ; git push origin -d `date`held/branch"],
+]) {
+  expect(`A: ${name} → the UNRESOLVABLE marker (never a literal ref)`, extractPushDeleteBranch(cmd), ["$(…)"]);
+}
+// ⛔ A PROCESS-SUBSTITUTION OPENER IS A SPAN (round-10 review, P0 F3), and a `$( … )` INSIDE `"…"`
+// opens one in a FRESH quoting context (P0 F4). Both were invisible to the newline mask, so a DATA
+// newline inside them ended the capture and the delete+target were lost (base BLOCKED, this branch
+// ALLOWED). `<( list )`/`>( list )` is ONE WORD of the outer command (bash manual, Process
+// Substitution); a substitution body is its own command list (bash manual, Command Substitution).
+for (const [name, cmd] of [
+  ["a DATA newline inside `<(`", "git push origin HEAD:feat && git push origin -o <(cat ff\n) -d held/branch"],
+  ["a DATA newline inside `>(`", "git push origin HEAD:feat && git push origin -o >(cat ff\n) -d held/branch"],
+  ["a DATA newline inside a `$( … )` opened in a double quote", 'git push origin HEAD:feat && git push origin -o "$(echo "a\nb")" -d held/branch'],
+]) {
+  expect(`A: ${name} is DATA, not a separator → the real target survives`, extractPushDeleteBranch(cmd), ["held/branch"]);
+}
+// CONTROL for F1's fix: a BALANCED quoted word keeps its content (the drop is only for the ONE
+// unmatched quote), so a genuinely quoted ref whose text ends in a paren is still the real ref.
+expect("A: a BALANCED quoted ref is untouched by the unmatched-quote drop", extractPushDeleteBranch("git push origin -d 'feat/x)'"), ["feat/x)"]);
+
 // …and the marker really is what #653 refuses, end-to-end at the seam these rows live in.
 for (const t of ["$(…)"]) expect(`A: #653 refuses the truncated-span marker ${t}`, unresolvableDeleteTargets([t]), [t]);
 // ⚠️ CONTROL (not a discriminator): a backtick with NOTHING after it in the segment is the #504
@@ -400,6 +446,24 @@ if (typeof stripTypeScriptTypes !== "function" ||
     expectTrue("D5 #3962: a newline inside QUOTES is DATA, not a separator — the delete after it still reaches #73 (CONTROL: stays green under the mask mutant)",
       refusedBy(await quiet(() => real.bash('git push origin -o "a\nb" -d held')), HOLDS),
       `handler returned ${JSON.stringify(await quiet(() => real.bash('git push origin -o "a\nb" -d held')))?.slice(0, 200)}`);
+
+    // ── Part D (round 10): the four P0 classes from the round-10 adversarial review ──────────
+    // Each row is END-TO-END through the shipped handler, and each is a shape where the pre-fix head
+    // ALLOWED a delete of the sibling-held `held` while `origin/main` BLOCKED on the real name.
+    // D6 asserts #73's OWN reason text: the correct answer is the lookup on the REAL ref, which is a
+    // different arm from #653's refusal — so a mere `block === true` cannot satisfy it.
+    expectTrue("D6 round-10 F1: a `sh -c '…'` closer no longer glues whitespace onto the target → #73 BLOCK on the REAL name",
+      refusedBy(await quiet(() => real.bash("git push origin HEAD:feat && sh -c 'git push origin -d held'")), HOLDS),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash("git push origin HEAD:feat && sh -c 'git push origin -d held'")))?.slice(0, 200)}`);
+    expectTrue("D7 round-10 F2: a GLUED substitution placeholder in the target slot is REFUSED by #653",
+      refusedBy(await quiet(() => real.bash("git push origin HEAD:feat && git push origin -d held$''")), FAIL_CLOSED),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash("git push origin HEAD:feat && git push origin -d held$''")))?.slice(0, 200)}`);
+    expectTrue("D8 round-10 F3: a DATA newline inside `<(` is not a separator → #73 BLOCK on the REAL name",
+      refusedBy(await quiet(() => real.bash("git push origin HEAD:feat && git push origin -o <(cat ff\n) -d held")), HOLDS),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash("git push origin HEAD:feat && git push origin -o <(cat ff\n) -d held")))?.slice(0, 200)}`);
+    expectTrue("D9 round-10 F4: a DATA newline inside a `$( … )` in a double quote → #73 BLOCK on the REAL name",
+      refusedBy(await quiet(() => real.bash('git push origin HEAD:feat && git push origin -o "$(echo "a\nb")" -d held')), HOLDS),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash('git push origin HEAD:feat && git push origin -o "$(echo "a\nb")" -d held')))?.slice(0, 200)}`);
 
     // ── Part E: a WORKTREE session is NOT exempt ────────────────────────────
     // The #73 arm has never been worktree-exempt, and the fleet's lanes run from
