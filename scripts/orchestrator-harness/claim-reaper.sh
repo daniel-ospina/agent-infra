@@ -15,7 +15,8 @@
 # fire for a name this box no longer answers to. A claim stamped by THIS box on an ISSUE, whose
 # controller and chain are both gone, therefore stays `held-by-live` until its lease runs out — and,
 # for a lease NOBODY CAN PARSE, it stayed that way for ever until agent-infra#3203 gave the class a
-# BOUNDED expiry in `claim_prune` (claim-commit age > `CLAIM_UNREADABLE_LEASE_MAX_AGE`, 18000 s). See
+# BOUNDED expiry in `claim_prune` (claim-commit age > `CLAIM_UNREADABLE_LEASE_MAX_AGE`, 48000 s
+# since agent-infra#4034). See
 # `claims.sh:claim_orphan_reason` and `claims.sh:claim_prune`. This tool supplies the missing half: it
 # TREATS NOTHING AS GONE WITHOUT EVIDENCE, it PRINTS that evidence, it RECORDS every release, and the
 # release itself is off by default.
@@ -32,13 +33,15 @@
 #      (claims.sh, `_claim_acquire_at`; restated in `claim_snapshot_verdict` and README §7.2b). ⇒
 #      `cr_gate_lease`: a claim whose lease this reader cannot parse is REPORTED as UNREADABLE-LEASE
 #      and NEVER released, whatever the evidence says about the holder. It is no longer ETERNAL when the
-#      claim commit's time is readable (claim_prune reaps it on the 18000 s bound) — see the AMENDED note
+#      claim commit's time is readable (claim_prune reaps it on the CLAIM_UNREADABLE_LEASE_MAX_AGE
+#      bound, 48000 s since agent-infra#4034) — see the AMENDED note
 #      below — but an UNMEASURABLE age is kept and named, so THAT case still reaches a human. This tool
 #      never decides its ending either way.
 #      ⚠️ THE MEASURED FAILURE WAS THAT CLASS: the claim reached 25 hours with nobody alive.
 #      ⚠️ AMENDED (NOT REVERSED) BY agent-infra#3203. The class is no longer "eternal", and it is no
 #      longer described as LIVE: `claim_prune` reaps it on a bounded schedule measured from the claim
-#      COMMIT (18000 s), and every reader REPORTS the abstention instead. That is a
+#      COMMIT (CLAIM_UNREADABLE_LEASE_MAX_AGE, 48000 s since agent-infra#4034), and every reader
+#      REPORTS the abstention instead. That is a
 #      REAP-side schedule set in the registry itself, and it does not license THIS tool to release on
 #      holder evidence: the STOLEN direction is still banned here, and a claim this tool cannot judge
 #      is still NAMED and left to the prune's clock.
@@ -68,8 +71,12 @@
 #   1 IDENTITY   the claim records a `<host>:<pid>` and this reader can read it. Otherwise
 #                UNIDENTIFIABLE — reported, never released. ("Probably dead" is not an identity.)
 #   2 LEASE      the lease parses (decision (a)). Otherwise UNREADABLE-LEASE — reported, never released.
-#   3 AGE        the claim's own COMMIT TIME is older than `--min-age` (default 10800s = CLAIM_ISSUE_TTL,
-#                the longest shipped lease). Otherwise TOO-YOUNG. Age is read from the claim COMMIT,
+#   3 AGE        the claim's own COMMIT TIME is older than `--min-age` (default 10800s). Otherwise
+#                TOO-YOUNG. ⛔ IT IS A BELT, NOT THE LONGEST LEASE: it was set to the longest lease of
+#                its day and has NOT followed the leases up (CLAIM_ISSUE_TTL is 48000 s and a fixer
+#                lease 37200 s since agent-infra#4034, against 18000/8400 when this was written), so
+#                do not read it as "no live claim is younger than this" — the gates below are what
+#                make a release safe, and this is the floor on waiting. Age is read from the claim COMMIT,
 #                never from a file mtime: an mtime is when this checkout last touched the ref.
 #   4 HOST       the holder's box is THIS box (its current name, its probed real name, or a FORMER name
 #                it has carried — claims.sh:claim_former_hosts). A box we cannot query is
@@ -156,7 +163,7 @@ claim-reaper.sh — release a claim ONLY when its holder is demonstrably GONE.
 
 Options
   --max N        at most N releases per pass (default 3)
-  --min-age S    claim must be older than S seconds (default 10800 = CLAIM_ISSUE_TTL)
+  --min-age S    claim must be older than S seconds (default 10800; a BELT, see the ladder)
   --repo DIR     the repository whose origin holds refs/claims/* (default: claims.sh's resolution)
   --state DIR    where releases are recorded (default: claims.sh's CLAIM_STATE_DIR). The directory
                  must EXIST and be writable for --release: an unrecorded release is not performed.

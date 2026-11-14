@@ -48,7 +48,8 @@
 #   SYSTEMCTL          `systemctl` to call  default: user manager if it answers, else `sudo -n systemctl`
 #   SUDO               sudo probe           default: `sudo -n`
 #
-# Exit codes: 0 ok · 1 failure (named) · 2 usage.
+# Exit codes: 0 ok · 1 failure (named) · 2 usage · 3 --status: installed unit carries a STALE
+#             `Environment=LANE_TIMEOUT` pin (re-run the installer on this cell to re-render it).
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -128,7 +129,7 @@ resolve_target || {
 # ⛔ THE LANE'S BOUND IS RENDERED FROM THE SEAM, NOT FROM A LOCAL LITERAL (agent-infra#2888 review,
 # P2 — verified). This used to render `${LANE_TIMEOUT:-3000}` at INSTALL time into an `Environment=` PIN,
 # and a pin WINS over the script's own default — so on every box this installer touched,
-# `ai-drainer.sh`'s `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` could never take effect and drainer
+# `ai-drainer.sh`'s `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-36000}}` could never take effect and drainer
 # lanes stayed killed at 50 min: 300 s above the 2700 s progress allowance, i.e. the censoring survived
 # on the box whose job is to drain the backlog, and raising `LANE_BACKSTOP_S` changed nothing there.
 # Resolved ONCE here, from the harness copy being installed, so the two cannot drift.
@@ -137,7 +138,7 @@ if [ -z "$DRAINER_LANE_TIMEOUT" ]; then
     DRAINER_LANE_TIMEOUT="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' \
                               "$(dirname "${BASH_SOURCE[0]}")/spawn-gate.sh" 2>/dev/null | head -1)"
 fi
-case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=7200 ;; esac
+case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=36000 ;; esac
 
 render() { # <template> <dest>
     local v tmp
@@ -174,7 +175,7 @@ render() { # <template> <dest>
 }
 
 say_status() {
-    local svc="$1" tmr="$2"
+    local svc="$1" tmr="$2" installed want
     printf 'installer target: %s (%s)\n' "$TARGET" "$UNIT_DIR"
     for u in "$svc" "$tmr"; do
         if [ -f "$UNIT_DIR/$u" ]; then printf '  %-34s installed\n' "$u"; else printf '  %-34s MISSING\n' "$u"; fi
@@ -183,10 +184,38 @@ say_status() {
         printf '  timer state: %s\n' "$($SYSTEMCTL is-active "$tmr" 2>/dev/null || true)"
         printf '  next run:    %s\n' "$($SYSTEMCTL list-timers --all "$tmr" 2>/dev/null | sed -n '2p' | sed 's/  */ /g' || true)"
     fi
+    # ⛔ A STALE `Environment=LANE_TIMEOUT` PIN IS THE #4034 DEFECT ONE LAYER OUT, AND --status COULD NOT SEE
+    # IT. The unit is rendered ONCE, at install time (see the seam block above), and an installed pin WINS
+    # over `ai-drainer.sh`'s compiled default (`LANE_TIMEOUT="${LANE_TIMEOUT:-...}"`, passed straight to the
+    # dispatcher). So a cell whose unit predates a seam change keeps dispatching at the OLD cap forever
+    # while the checkout, the docs and the tests all say the new one — and this verb reported only
+    # installed/MISSING + timer state, so such a box read healthy. Print the pin beside the value this
+    # checkout would render now, and WARN on a mismatch; exit 3 so an automated check can act on it.
+    if [ -f "$UNIT_DIR/$svc" ]; then
+        # Last occurrence wins: systemd merges repeated `Environment=` lines and the last one is what the
+        # unit sees, so reading the first would vouch for a value the box does not use.
+        installed="$(grep '^Environment=LANE_TIMEOUT=' "$UNIT_DIR/$svc" 2>/dev/null \
+                     | tail -1 | sed 's/^Environment=LANE_TIMEOUT=//' | tr -d '\r')"
+        want="${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}"
+        if [ -z "$installed" ]; then
+            printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so ai-drainer.sh falls back to its compiled default)\n'
+        else
+            printf '  LANE_TIMEOUT pin: %s s installed · %s s would be rendered now\n' "$installed" "$want"
+        fi
+        if [ -n "$installed" ] && [ "$installed" != "$want" ]; then
+            printf '  ⚠️  STALE PIN: this unit dispatches lanes at %s s, but the seam now says %s s — a rendered pin beats the\n' "$installed" "$want"
+            printf '      default, so this box keeps the old cap until the unit is re-rendered: re-run this installer\n'
+            printf '      (no arguments) on this cell.\n'
+            return 3
+        fi
+    fi
+    return 0
 }
 
 case "$MODE" in
-    --status) say_status "$UNIT_SRC_SERVICE" "$UNIT_SRC_TIMER"; exit 0 ;;
+    # exit 3 on a stale pin: distinct from 1 (failure) and 2 (usage), so `--status` is scriptable — a
+    # warning that can only be read by eye is the invisibility this verb was changed to remove.
+    --status) say_status "$UNIT_SRC_SERVICE" "$UNIT_SRC_TIMER"; exit $? ;;
     --uninstall)
         $SYSTEMCTL disable --now "$UNIT_SRC_TIMER" >/dev/null 2>&1 || true
         # ⛔ A REMOVAL THAT DID NOT HAPPEN IS NOT AN UNINSTALL. `rm -f` returning non-zero printed the

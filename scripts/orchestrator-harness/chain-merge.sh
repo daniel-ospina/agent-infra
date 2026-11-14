@@ -178,7 +178,7 @@ CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"
 # ── release the cross-box ISSUE claim (#1850) ────────────────────────────────────────────────
 # `orch-loop.sh` claimed `refs/claims/issue-<N>` when it dispatched this issue, and that claim is
 # this box's declaration that the issue is IN FLIGHT. Holding it after the chain is over would keep
-# a FREE issue undispatchable by every box until the lease ran out — up to CLAIM_ISSUE_TTL (4h) — so
+# a FREE issue undispatchable by every box until the lease ran out — up to CLAIM_ISSUE_TTL (13 h 20 m since agent-infra#4034; 4-5 h before it) — so
 # it is released on EVERY exit path: a clean merge, a failed one, and the "no PR appeared" timeout.
 #
 # ⛔ THE RELEASE IS FENCED (`--force-with-lease=<ref>:<own>`), so it refuses to delete a ref that no
@@ -206,7 +206,7 @@ release_issue_claim() {
   # "released" line. The reason lives in CLAIM_RESULT, which a subshell discards.
   CLAIM_REPO="$REPO"
   if ! . "$csh" 2>/dev/null; then
-    echo "[chain $N] ⚠️ $csh failed to source — the issue claim is NOT released (it runs to its lease, CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-14400}s)" >> "$LOG"
+    echo "[chain $N] ⚠️ $csh failed to source — the issue claim is NOT released (it runs to its lease, CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-48000}s)" >> "$LOG"
     return 0
   fi
   if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
@@ -223,14 +223,14 @@ release_issue_claim() {
   # box one lease; deleting the wrong claim duplicates work on two boxes, so this is the fail-closed
   # side of the same asymmetry as the pre-flight. Loud, and the lease still reaps it.
   if [ -z "${CHAIN_CLAIM_COMMIT:-}" ]; then
-    echo "[chain $N] ⚠️ no captured claim generation (the handover record was absent at chain start) — NOT releasing refs/claims/issue-$N: a stale chain must never delete a NEWER claim. It runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-14400}s)." >> "$LOG"
+    echo "[chain $N] ⚠️ no captured claim generation (the handover record was absent at chain start) — NOT releasing refs/claims/issue-$N: a stale chain must never delete a NEWER claim. It runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-48000}s)." >> "$LOG"
     return 0
   fi
   if out="$(claim_issue_release_record "$O" "$REPO" "$N" "${CHAIN_CLAIM_COMMIT:-}")"; then
     echo "[chain $N] released refs/claims/issue-$N" >> "$LOG"
   else
     rc=$?
-    echo "[chain $N] ⚠️ the issue claim was NOT released (rc=$rc): ${out:-${CLAIM_RESULT:-no reason given}} — it runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-14400}s)" >> "$LOG"
+    echo "[chain $N] ⚠️ the issue claim was NOT released (rc=$rc): ${out:-${CLAIM_RESULT:-no reason given}} — it runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-48000}s)" >> "$LOG"
   fi
   return 0
 }
@@ -422,14 +422,15 @@ _phase_age() {
 _PHASE_AGE="$(_phase_age)"
 # The lane's own wall clock bounds how long its marker can mean anything (LANE_TIMEOUT, +60s slack).
 # ⛔ THAT CLOCK IS `LANE_BACKSTOP_S`, NOT 3300 ANY MORE (agent-infra#2888). The wall stopped being the
-# lane's PRIMARY bound — the progress allowance (45 min) is — and the backstop above it is 7200 s. A
+# lane's PRIMARY bound — the progress allowance (45 min) is — and the backstop above it is 36000 s
+# (10 h, agent-infra#4034; it was 7200 when this block was written). A
 # literal 3300 here would declare a still-working lane's merge marker STALE at 56 minutes while the
-# lane may legitimately run to its 2 h backstop, and this block's response to a stale marker is to
+# lane may legitimately run to its 10 h backstop, and this block's response to a stale marker is to
 # DELETE it and review at the tip — i.e. two processes on one PR. `LANE_BACKSTOP_S` is exported by
 # `spawn-gate.sh`, so a lane's chain inherits the operator's override; the literal is the fallback for
 # a chain started outside a lane shell, and `lane-bound.test.sh` (i0) pins it to that seam.
-_PHASE_STALE_AFTER="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"
-case "$_PHASE_STALE_AFTER" in ''|*[!0-9]*|0[0-9]*) _PHASE_STALE_AFTER=7200 ;; esac
+_PHASE_STALE_AFTER="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-36000}}"
+case "$_PHASE_STALE_AFTER" in ''|*[!0-9]*|0[0-9]*) _PHASE_STALE_AFTER=36000 ;; esac
 _PHASE_STALE_AFTER=$(( _PHASE_STALE_AFTER + 60 ))
 if [ -f "$PR_PHASE" ] && [ "$_PHASE_AGE" -ge 0 ] && [ "$_PHASE_AGE" -gt "$_PHASE_STALE_AFTER" ]; then
   echo "[chain $N] STALE merge-phase marker (age ${_PHASE_AGE}s > lane wall limit ${_PHASE_STALE_AFTER}s) — the lane is gone; reviewing at the tip now" >> "$LOG"

@@ -1719,7 +1719,7 @@ manifest path above is what a box that is copied into every deploy should use.
 | `ORC_STATE_DIR` | unset | the explicit state dir, ranked ABOVE `O`. It exists so a launcher can name a state dir without impersonating the legacy variable. The choice is printed as `[state] dir=… src=…` at startup and as `state_src=` on every `[cap]` line. ⛔ Naming a state dir does NOT move the harness: the WORKER scripts (`fix-one.sh`, `merge-one.sh`, `stall-fix.sh`, `dispatch-merge.sh`) are resolved from `$O` when they are there and otherwise from the directory beside the running loop (that tree is `O_WORK`), and the loop refuses to start (`exit 78`, naming the missing files) when NEITHER carries them — a controller that fills its queue and then fails every dispatch with 127 reports healthy otherwise. ⛔ **AND `O_WORK` IS EXPORTED, SO THE MODULE LAYER FOLLOWS THE SAME RULE** (agent-infra#2095): `O` is now the STATE dir and is exported to every child, so every worker resolves ITS OWN modules — `claims.sh`, `repo-authority.sh`, `lane.sh`, `nonblocking-dispatch.sh` — from `$O_WORK` first and `$O` second. Without that, a state-dir instance loads no claim registry: the sweep abstains, every PR reads `claim-unreadable`, nothing is spawned, and `[cap]` still prints a healthy line. `spawn-gate.sh` searches `O_WORK` first for the same reason (its fork floor and `capacity.sh`). ⛔ **EVERY LAUNCHER CARRIES BOTH NAMES, AND THAT IS NOW CHECKED** (fresh-context review of #3846): the launchd plist renders `ORC_STATE_DIR` (empty by default — see that key's own note) *and* forwards it through `launchd-controller.sh`'s `CONTROLLER_ENV`, whose equality with the plist's key set is asserted in BOTH directions by `launchd-controller.test.sh` case E; a cell's `WORKER_ENV_NAMES` carries `O_WORK` for the same cross-boundary reason; the tmux launch line in `worker-terminal.sh` emits `O_WORK` beside `O` (and `unset`s it when the controller did not set one, so a pane cannot inherit a stale work root from the tmux server); and `launchd-controller.sh` reads its `[singleton]` refusal witness from the RESOLVED state dir, not from `$O`, so a named `ORC_STATE_DIR` cannot turn a correct refusal into a crash framing. ⚠️ A CELL's supervisor attributes a controller to a state dir by reading `O=` out of `/proc/<pid>/environ`, so a cell must keep passing `O` (it does); `ORC_STATE_DIR` alone makes the controller unattributable to its own supervisor |
 | `ORC_CONTROLLER_ORIGIN` | unset | WHO started this controller (e.g. the plist path). When set, a `MAX_LOAD` that came from the environment is labelled `plist(<origin>)` on the `[cap]` line instead of plain `env`, so a ceiling that no unit set is visible in the line that reports it |
 | `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
-| `LANE_TIMEOUT` | `7200` (via `LANE_BACKSTOP_S`) | absolute wall-clock backstop on a lane's `pi` run (s). ⛔ **IT NO LONGER HAS A LITERAL OF ITS OWN** (agent-infra#2888): it defaults to the ONE fleet default, `LANE_BACKSTOP_S` (`spawn-gate.sh`, 7200) — it was `3300` when a flat elapsed cap was the primary bound, and three separate literals is how that cap outlived the progress allowance that replaced it. `lane-bound.sh`'s PROGRESS allowance (45 min) is the PRIMARY wedge signal now; this is only the ceiling for a lane that creeps forward for ever. An explicit `LANE_TIMEOUT` still overrides it, and the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
+| `LANE_TIMEOUT` | `36000` (via `LANE_BACKSTOP_S`) | absolute wall-clock backstop on a lane's `pi` run (s). ⛔ **IT NO LONGER HAS A LITERAL OF ITS OWN** (agent-infra#2888): it defaults to the ONE fleet default, `LANE_BACKSTOP_S` (`spawn-gate.sh`, 36000 since agent-infra#4034, 7200 before it) — it was `3300` when a flat elapsed cap was the primary bound, and three separate literals is how that cap outlived the progress allowance that replaced it. `lane-bound.sh`'s PROGRESS allowance (45 min) is the PRIMARY wedge signal now; this is only the ceiling for a lane that creeps forward for ever. An explicit `LANE_TIMEOUT` still overrides it, **and an installed `ai-drainer` unit renders it into an `Environment=` pin at install time** — re-run `install-drainer-timer.sh` on a cell after this value moves (`--status` prints the pin and exits 3 on a mismatch). The issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
 | ~~`LANE_KEY_GATE`~~ | — | **RETIRED as a switch (agent-infra#3331).** It used to turn the model-credential assertion off, and that was wrong in the one way that matters: this is an ENVIRONMENT variable, so a box's `keys.env` (sourced by the cell supervisor under `set -a`) handed it to every descendant lane and the gate became a fleet-wide off switch that looked like a fixture escape — measured: a key-less lane ran to `outcome=done reason=agent-exit-0` with the suite green. The escape is `--key-gate-off` on the lane's invocation, which no environment can inject, and an invocation that used it says so on the terminal line: `keygate=off` (see the terminal-line section) — so a fixture-only escape is COUNTABLE across the fleet rather than visible only as prose in one log. Nothing reads this variable now; a value found in the environment is logged as `check=ignored` and **not** honoured, so a stale fixture is told what changed instead of silently gating |
 | `REVIEW_TIMEOUT` | `1800` | wall-clock limit on a reviewer `pi` run (s) |
 | `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
@@ -2263,42 +2263,49 @@ and the exit code **is** the next action (0 MERGED · 10 FIX_REQUIRED · 15 FIX_
 NAMES → fix, push, repeat; when green, launch the harness's per-PR chain **detached** and supervise it with
 `--watch` (short chunks — a lane blocked for 20 minutes inside one shell call reads as wedged to every
 liveness instrument we have). Supervision is **bounded and sized to what the lane can actually spend**:
-`WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (5400 + 7 × 120 + 900 = 7140 of the 7200 s
-clock), so the merge phase leaves the declared implementation reserve standing — a bound the lane itself
-reaches before its own kill, not one only a later lane could inherit.
+`WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (5400 + 247 × 120 + 900 = 35940 of the
+36000 s clock), so the merge phase leaves the declared implementation reserve standing — a bound the lane
+itself reaches before its own kill, not one only a later lane could inherit. ⛔ **AND THE ROW IS
+RECOMPUTED WITH ITS OPERAND, NOT CARRIED.** `MAX_WATCH` is DERIVED from what the clock leaves, so when
+agent-infra#4034 took `LANE_TIMEOUT` to 36000 s the chunk count moved with it — `(36000 − 5400 − 900) /
+120 = 247` — and an arithmetic row still reading `7 × 120` was the 7200 s clock's residue: the same
+stale-measurement defect this paragraph is otherwise about, one layer down. `lane-merge.sh:286-300`
+carries the same recomputation at the source.
 ⛔ **The trade is stated, because the arithmetic does not make it small — and the FIRST version of this
 paragraph got it backwards** (review cycle 7, P2 — recomputed from both trees instead of carried): it
 compared 1500 s + 7 chunks against 5400 s + 7 chunks and concluded the implementation reserve fell
 "4860 s → 960 s". Main does not ship 7 chunks; it derives **40** (`(7200−1500−900)/120`, the same
 invariant one paragraph up), so the honest row is:
 
-| | `origin/main` | this tree |
+| | `origin/main` (7200 s clock) | this tree (36000 s clock) |
 |---|---|---|
 | `WAIT_S` | 1500 | 5400 |
-| derived `MAX_WATCH` × `POLL` | 40 × 120 = 4800 | 7 × 120 = 840 |
-| merge phase's share of the clock | 6300 | 6240 |
+| derived `MAX_WATCH` × `POLL` | 40 × 120 = 4800 | 247 × 120 = 29640 |
+| merge phase's share of the clock | 6300 | 35040 |
 | left for implement → commit → push → open PR | 900 | 960 |
 
-The merge phase's share goes **down** slightly and the implementation reserve goes **up** by 60 s, so this
-constant does not starve implementation. What it costs is **supervision chunks, 40 → 7**: a 5400 s wait on
-a 7200 s clock leaves one 840 s `--watch` allowance. That is the deliberate trade — 7 chunks over a wait
-that reaches the merge phase, instead of 40 over a wait that can never be satisfied — and buying more of
-it means raising `LANE_BACKSTOP_S`, which is not this constant's decision. A lane that needs longer than
-the reserve hands off (`WAITING_CHECKS`, exit 11) and the next invocation resumes the SAME counter.
-⛔ **840 s IS THE WORST-CASE FLOOR, NOT WHAT A LANE GOT — and the floor was below the phase it supervises**
-(#3850 review, P2 — recomputed against the chain's own declared budgets). Supervision is paid AFTER the
-wait, out of whatever clock is left, so a lane whose checks settled early received the *worst case's*
-seven chunks while thousands of seconds still stood. Meanwhile the chain being supervised declares
+The implementation reserve goes **up** by 60 s, so this constant does not starve implementation, and
+what the 5× clock buys is **supervision chunks, 40 → 247**: the merge phase can out-watch its own check
+wait instead of being sized out of it. That is the deliberate trade — a wait that reaches the merge phase,
+with enough clock left to supervise it — and at the pre-#4034 7200 s clock the same change bought only
+**7** chunks (840 s of `--watch` over a 5400 s wait), which is why raising `LANE_BACKSTOP_S` was the
+cheap half of it and is what #4034 did. A lane that needs longer than the reserve hands off
+(`WAITING_CHECKS`, exit 11) and the next invocation resumes the SAME counter.
+⛔ **THE DESIGN FLOOR IS A WORST CASE, NOT WHAT A LANE GOT — and at the 7200 s clock it sat below the
+phase it supervises** (#3850 review, P2 — recomputed against the chain's own declared budgets).
+Supervision is paid AFTER the wait, out of whatever clock is left, so a lane whose checks settled early
+received only the *worst case's* allowance while thousands of seconds still stood. At the 7200 s clock
+that allowance was **840 s**, while the chain being supervised declares
 `REVIEW_TIMEOUT` = **1800 s** for its reviewer and a PR-claim lease of `REVIEW_TIMEOUT + _gw + 300` =
 **3000 s** (`claims.sh:166`, `chain-merge.sh`'s merge-phase wait 1890 s at `claims.sh:110`) — so 840 s
 could not cover a chain that was merely still reviewing, and the hand-off then posted a FALSE blocker
 (`BLOCKED_ATTEMPTS … the chain was STILL RUNNING`) that `WATCH_F` did not rewind, so every later `--watch`
 re-entered it. `MAX_WATCH` is therefore re-derived in the `--watch` path from the clock actually left —
-`(LANE_WALL_S − elapsed − one chunk) / POLL`, never below the design floor (`MAX_WATCH_FIT`, 7 chunks at the
-shipped defaults and 1 when the wall axis is off), never beyond the
+`(LANE_WALL_S − elapsed − one chunk) / POLL`, never below the design floor (`MAX_WATCH_FIT`, 247 chunks at
+the shipped 36000 s defaults and 1 when the wall axis is off), never beyond the
 watchdog's `IDLE_S` allowance (that bound WINS when it is smaller: a labelled hand-off beats an unlabelled
 kill), and skipped when `LANE_MERGE_MAX_WATCH` is pinned. A controller re-run has no lane clock, resolves
-nothing, and keeps exactly the 7 shipped chunks.
+nothing, and keeps exactly the 247 shipped chunks.
 ⛔ **AND "WALL AXIS OFF" (`LANE_TIMEOUT=0`) IS NOT READ AS A ZERO CLOCK FOR SUPERVISION EITHER** (review
 cycle 13, P2 — measured: the same arithmetic floored that lane at ONE chunk, 120 s, on a lane documented
 as unbounded, so `--watch` posted a blocker two minutes into a legitimate chain wait). With the wall axis
@@ -2316,7 +2323,7 @@ heartbeat to the lane log each poll, and **caps the wait below `IDLE_S`** when i
 heartbeat target — an uncapped wait is killed as `stalled` before it can write `WAITING_CHECKS`, which is strictly worse than the shorter bound it replaces (#3584 review, P1).
 ⛔ **And it has a THIRD bound: the lane's own REMAINING wall clock** (#3584 review, P1).
 `deadline` was `now + WAIT_S` with nothing comparing it to how much of `LANE_WALL_S` THIS lane had already
-spent, so a lane entering its merge phase more than ~1800 s in (7200 − 5400) was TERMed by
+spent, so a lane entering its merge phase more than ~1800 s in (7200 − 5400, the clock of the day) was TERMed by
 `lane-bound.sh`'s wall ceiling MID-wait — no `WAITING_CHECKS`, no verdict file, no hand-off, which
 is strictly worse than the 1500 s bound this change replaces. `lane-merge.sh` now reads the start epoch
 out of the run token `lane.sh` stamps before it spawns the agent (`$O/logs/lane-<issue>.owner`, whose
@@ -2918,8 +2925,9 @@ later.
   `env` when some other environment did, `derived:cores` when the loop computed it. A ceiling in
   force that no unit set is now visible in the line that reports it.
 
-* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (125 min,
-  deliberately ABOVE the lane's wall BACKSTOP `LANE_BACKSTOP_S` = 7200 s: a live lane inside one long
+* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (601 min
+  since agent-infra#4034, 125 min before it, deliberately ABOVE the lane's wall BACKSTOP
+  `LANE_BACKSTOP_S` = 36000 s since #4034, 7200 s before it: a live lane inside one long
   silent tool call must not read as dead and license extra dispatch. It followed the wall limit while
   the wall was the primary bound; since agent-infra#2888 the wall is only the backstop, so the window
   follows the backstop). A lane whose log was **deleted** (a `/tmp` prune can
@@ -2974,7 +2982,7 @@ measurements behind it**, never inferred from an exit status.
 
 | limit | default | what it is | what it is NOT |
 |---|---|---|---|
-| wall clock | `LANE_TIMEOUT`, 7200 s (from `LANE_BACKSTOP_S`) | a hard ceiling on the lane's total duration | not a progress signal: it cannot tell SLOW from STALLED, so alone it either kills a lane mid-merge or holds a corpse |
+| wall clock | `LANE_TIMEOUT`, 36000 s (from `LANE_BACKSTOP_S`) | a hard ceiling on the lane's total duration | not a progress signal: it cannot tell SLOW from STALLED, so alone it either kills a lane mid-merge or holds a corpse |
 | **silence** | `LANE_BOUND_IDLE_S`, **2700 s** (45 min) | **no output growth AND no CPU delta** (subtree, tolerance 0.10 s), confirmed on **two consecutive samples** | not a byte counter and not a CPU vote: **both** must be quiet, and either one advancing keeps the lane alive however long it runs. ⛔ **This row said 1200 s (20 min) and the code has defaulted to 2700 s (45 min) since `lane-bound.sh`'s `num_or "${LANE_BOUND_IDLE_S:-}" 2700` — `spawn-gate.sh`'s own comment calls it "its 45-min default" too, so the row was the stale half.** It matters beyond accuracy: `lane-merge.sh` mirrors this number to decide whether a check wait can outlive the watchdog (#3584 review, P1 — a 5400 s wait against a 1200 s allowance would be a bound no lane could reach), so a reader taking the old figure would size that cap 1500 s too low |
 
 **Why (measured 2026-10-27).** Nine lanes across two cloud cells parked with **0 bytes** of output and
@@ -4403,7 +4411,7 @@ this box's own dead claim — for every keying — and the local-pid rule then p
 reads a local absence, and calls a LIVE remote worker's PR claim orphaned: the steal direction, from a
 name that is no longer ours. The self-limiting claim holds only while the name is exclusive to this
 box. Remedy: once no outstanding claim can still carry the name (after the LONGEST ceiling across every
-keying — `CLAIM_TTL_MAX` 9600 / `CLAIM_ISSUE_TTL` 18000 / `CLAIM_BRANCH_TTL` 14400 — so 18000), delete the
+keying — `CLAIM_TTL_MAX` 43200 / `CLAIM_ISSUE_TTL` 48000 / `CLAIM_BRANCH_TTL` 14400 — so 48000), delete the
 line from `state/claim-hosts` before the name is reused elsewhere.
 
 ⚠️ **The roster is an allow list, so an INCOMPLETE one over-reaps**: a roster that names this box and merely omits a live peer declares that peer dead and re-dispatches its unexpired work across two boxes — the failure this registry exists to prevent, reached from the opposite direction. It must be COMPLETE and authoritative, which is why the deny list (`CLAIM_DEAD_HOSTS`) is the safer knob for a one-off dead host and is checked first.
@@ -4464,7 +4472,7 @@ it is never re-examined for orphanhood (those rules are a reason to stop trustin
 evidence about a *holder*), and it is no longer reported as a LIVE window — the token is
 `held-by-unreadable-lease` and the snapshot word is `claim-lease-unreadable`. The block it creates is
 BOUNDED: `claim_prune` reaps the ref once the claim's own COMMIT is older than
-`CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s = `CLAIM_ISSUE_TTL`, the longest shipped lease), naming the
+`CLAIM_UNREADABLE_LEASE_MAX_AGE` (48000 s = `CLAIM_ISSUE_TTL`, the longest shipped lease), naming the
 fault and the age on its output line; before that bound the pass NAMES it as kept instead of skipping
 it silently. Every `held by …` hold reason and every pre-flight
 COLLISION carries a machine-readable token — `held-by-live`, `held-by-orphan`,
@@ -4480,12 +4488,15 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(18000s — raised 10800s -> 14400s by #2029, whose merge phase lengthened the wait the lease must
-outlive, and 14400s -> 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s, raised from 7200s by
-#2999) and `CLAIM_ISSUE_TTL` bound what a caller may stamp. The **branch keying is its own ceiling**:
-`CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch, deliberately above
-`CLAIM_TTL_MAX` — a batch legitimately outlives the PR/merge ceiling, and clamping it to 9600 would
-expire a live batch mid-flight (the loss #3328 exists to prevent; pinned by `branch-claim.test.sh`
+(48000s — raised 10800s -> 14400s by #2029, whose merge phase lengthened the wait the lease must
+outlive, 14400s -> 18000s by #2999, and 18000s -> 48000s by agent-infra#4034 when the lane backstop went
+7200s -> 36000s) are *defaults* for their keying; `CLAIM_TTL_MAX` (43200s, raised from 7200s by
+#2999 and from 9600s by agent-infra#4034) and `CLAIM_ISSUE_TTL` bound what a caller may stamp. The **branch keying is its own ceiling**:
+`CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch — a batch
+legitimately outlives the PR/merge ceiling, and clamping it to the PR claim's 1800s default would
+expire a live batch mid-flight. (It was written as "deliberately above `CLAIM_TTL_MAX`" when that was
+9600 and clamping it to 9600 was the hazard; #4034 raised `CLAIM_TTL_MAX` to 43200, above this term,
+so the separation is structural now rather than a numeric ordering) (the loss #3328 exists to prevent; pinned by `branch-claim.test.sh`
 case 10). *(Corrected in a later round: this paragraph said 14400s for `CLAIM_ISSUE_TTL` and 7200s
 for `CLAIM_TTL_MAX`, and the branch keying was absent rather than stale — `CLAIM_TTL` (1800s) was
 never wrong.)*
@@ -4493,7 +4504,8 @@ Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
 stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300` (merge-one; `_gw` is the gate wait, 900 s at
 the defaults, so that lease is 3000 s and the clamp threshold — `CLAIM_TTL_MAX - (_gw + 300)` — is
-8400 s) and `FIX_LEASE = FIX_TIMEOUT + 1200` (fix-one): raising either timeout past its own threshold
+42000 s at the defaults) and `FIX_LEASE = FIX_TIMEOUT + 1200` (fix-one, 37200 s at the shipped
+36000 s backstop — the number that forced `CLAIM_TTL_MAX` to 43200 in agent-infra#4034): raising either timeout past its own threshold
 requires raising `CLAIM_TTL_MAX` in the same change, or the claim is clamped below the term the worker
 asked for — and past `CLAIM_TTL_MAX` itself it expires before the review it was taken for. *(Corrected: this sentence
 said `REVIEW_TIMEOUT + 1200` and a flat `CLAIM_TTL_MAX - 1200`, which was right only for the fixer and
@@ -4535,7 +4547,7 @@ only fire for a name this box no longer answers to), so a claim stamped by THIS 
 controller and chain are both gone, stays `held-by-live` until its lease runs out.
 ⛔ **AND A CLAIM WHOSE LEASE CANNOT BE PARSED IS NO LONGER THE OPERATOR'S PROBLEM ALONE
 (agent-infra#3203).** `claim_prune` now reaps that class on a bounded schedule — once the claim's own
-COMMIT is older than `CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s) — so the 25-hour, unparseable,
+COMMIT is older than `CLAIM_UNREADABLE_LEASE_MAX_AGE` (48000 s) — so the 25-hour, unparseable,
 nobody-alive ref that motivated this tool no longer needs a human. The class is still NAMED on every
 pass (`kept unreadable-lease …` / `pruned unreadable-lease …`), and THIS tool still refuses to release
 it on holder evidence alone: the schedule is the reaper's, the judgement is not this tool's.
@@ -4565,7 +4577,9 @@ claim-reaper.sh --records             # what this box has reclaimed, and why
 Every claim passes the same ladder, each rung FAIL-CLOSED: **identity** (the claim names a
 `<box>:<pid>`) → **lease** (it parses: an unparseable lease is never read as expired — an
 ABSTENTION answered before any orphan consult, per `_claim_acquire_at`) → **age** (the claim's own commit time, read with `_claim_commit_time` — the SAME reader `claim_prune` reaps on, never `git log --format=%ct`, which accepted stamps the oracle rejects and so cleared the floor for a claim minutes old — is older than `--min-age`,
-default 10800s = `CLAIM_ISSUE_TTL`) → **host** (the holder is this box, one of its former names, or a
+default 10800s — a BELT, not the longest shipped lease: `CLAIM_ISSUE_TTL` is 48000 s, so this floor
+sits far below it and did not follow the leases up (`claim-reaper.sh`'s `CR_MIN_AGE` is deliberately its
+own number, and release still requires holder-absence evidence) → **host** (the holder is this box, one of its former names, or a
 host declared on `CLAIM_DEAD_HOSTS` **with an expired lease**) → **pid** (`ps` first proves it can see
 *this* process, then reports the holder absent) → **work** (ISSUE claims only: no live process
 references the issue and none sits in a checkout carrying it — because an issue claim is minted by the
@@ -4704,7 +4718,8 @@ reap. The decisions that are not obvious:
   every exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
   §7.2d — a capacity refusal, where it exits at once rather than waiting) through
   a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
-  which is sized (`CLAIM_ISSUE_TTL`, default 4 h since #2029) to cover lane + chain — releasing early is the
+  which is sized (`CLAIM_ISSUE_TTL`, default **48000 s** since agent-infra#4034 — 4 h from #2029 to that
+  point) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on

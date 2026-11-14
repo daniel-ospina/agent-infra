@@ -47,11 +47,11 @@
 #     %CPU and log both creep forward for ever). It must sit ABOVE the progress allowance, otherwise it
 #     pre-empts it and the progress rule can never reach its verdict — which is exactly the shape that
 #     was shipped (wall 2400 < allowance 2700). The pre-emption is now WARNED about at arm time.
-#   * The DEFAULT backstop value is PROVISIONAL and is a SEAM, not a conclusion: today's `prfix`
-#     distribution is censored by the very value being replaced (every row reports the cap), so the
-#     ceiling cannot be sized from it. `agent-infra#2888` states the re-measurement that has to follow;
-#     until then the value must make the REAL distribution observable, not trim it. See
-#     `LANE_BACKSTOP_S` in `spawn-gate.sh` for the one default the shipped callers use.
+#   * The DEFAULT backstop value is a SEAM, not a conclusion: 36000 s (10 h) since agent-infra#4034,
+#     which raised it from 7200 after measuring it against 2,033 lane logs on `pi-cell-4` (2026-11-12):
+#     20 `exceeded-wallclock` vs 2 `stalled`, 12 of the 20 with `silent=0s`, i.e. the backstop was
+#     ending lanes the progress rule said were still working. See `LANE_BACKSTOP_S` in `spawn-gate.sh`
+#     for the one default the shipped callers use, and for what the number was measured against.
 #
 # ⛔ KEEPING THE WEDGE KILL — WHAT THE EVIDENCE IS, STATED SO IT CAN BE FALSIFIED.
 #   “Working slowly” = at least one of the two signals advanced inside the allowance.
@@ -83,7 +83,8 @@
 #                         bound that cannot read its own signal is not a bound (refused, exit 2).
 #     --wall <secs>       ABSOLUTE BACKSTOP. Not the primary bound (see the header): it fires whether
 #                         or not the lane was working, so it must sit above --idle. `0` disables this
-#                         axis (loudly). Default 7200 (2 h) — PROVISIONAL, an `agent-infra#2888` seam.
+#                         axis (loudly). Default 36000 (10 h) — the harness seam's own default
+#                         (`LANE_BACKSTOP_S`, agent-infra#4034), and an `agent-infra#2888` seam.
 #     --idle <secs>       PROGRESS bound: no output growth AND no CPU delta for this long. This is the
 #                         bound that decides wedged-vs-slow. Default 2700 (45 min) — the fleet's own
 #                         declared no-progress allowance, reused rather than re-derived (#2888).
@@ -168,7 +169,7 @@ done
 
 # ⛔ RESOLUTION ORDER IS FLAG → ENV → DEFAULT, AND THE FLAG WINS BY BEING PRESENT (see the parse loop
 # above, which validated and refused a non-numeric flag already).
-[ -n "$WALL_S" ]  || WALL_S="$(num_or "${LANE_BOUND_WALL_S:-}" 7200)"
+[ -n "$WALL_S" ]  || WALL_S="$(num_or "${LANE_BOUND_WALL_S:-}" 36000)"
 [ -n "$IDLE_S" ]  || IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 2700)"
 [ -n "$TOL_CS" ]  || TOL_CS="$(num_or "${LANE_BOUND_CPU_TOL_CS:-}" 10)"
 [ -n "$GRACE_S" ] || GRACE_S="$(num_or "${LANE_BOUND_GRACE_S:-}" 15)"

@@ -2000,6 +2000,34 @@ SC_EOF
   check "installer: the installed unit pins LANE_TIMEOUT to the SEAM (${SEAM_T:-?}s), not a retired 3000s literal" \
     'v="$(sed -n "s/^Environment=LANE_TIMEOUT=//p" "$T4/units/eldato-ai-drainer.service" 2>/dev/null)"; [ -n "$SEAM_T" ] && [ "$v" = "$SEAM_T" ]' \
     "rendered='$(sed -n 's/^Environment=LANE_TIMEOUT=//p' "$T4/units/eldato-ai-drainer.service" 2>/dev/null)' seam='${SEAM_T:-}'"
+  # ⛔ THE PIN IT JUST WROTE IS ONLY VISIBLE IF SOMETHING READS IT BACK (agent-infra#4034 review). The unit
+  # is rendered at INSTALL time, so a cell installed before the seam moved carries the OLD value and keeps
+  # dispatching at the old cap — and `--status` used to report only installed/MISSING + timer state, so
+  # such a box read healthy. These three arms grade the reading: matching pin → clean, stale pin → warned
+  # AND non-zero (a warning only an eye can read is the invisibility this fixes), no pin on disk → named
+  # as "no pin" rather than silently compared against an empty string.
+  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" DRAINER_STATE="$T4/state" \
+        DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status prints the INSTALLED LANE_TIMEOUT pin beside what it would render, and is clean when they agree" \
+    '[ "$rc" -eq 0 ] && grep -q "pin: ${SEAM_T:-______} s installed" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  cp "$T4/units/eldato-ai-drainer.service" "$T4/svc.bak"
+  # grep -v + printf, not `sed -i`: regenerating a fixture, and the repo's editing rules keep `sed` out of
+  # line surgery. This is a unit installed BEFORE the seam moved, which is the exact artifact in the wild.
+  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
+  printf 'Environment=LANE_TIMEOUT=7200\n' >>"$T4/units/eldato-ai-drainer.service"
+  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" DRAINER_STATE="$T4/state" \
+        DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status WARNS and exits 3 on a STALE pin (a pre-change unit still dispatching at 7200)" \
+    '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "7200 s" <<<"$out"' \
+    "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  printf 'ExecStart=/bin/true\n' >"$T4/units/eldato-ai-drainer.service"
+  out="$(PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" DRAINER_STATE="$T4/state" \
+        DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status names an ABSENT pin as absent (never compares '' and calls it clean)" \
+    '[ "$rc" -eq 0 ] && grep -q "carries no pin" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  cp "$T4/svc.bak" "$T4/units/eldato-ai-drainer.service"
 else
   bad "installer missing at $INSTALLER"
 fi

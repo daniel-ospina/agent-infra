@@ -3541,17 +3541,31 @@ terminal_wip_rescue() {
 # absolute ceiling for a lane that creeps forward for ever, so it must sit ABOVE the allowance or it
 # pre-empts it and the progress rule can never fire (shipped: 2400 < 2700 — that WAS the defect).
 #
-#   LANE_BACKSTOP_S — the ONE default, in seconds. 7200 (2 h) PROVISIONAL, per #2888: today's prfix
-#   distribution is censored by the value being replaced, so the ceiling cannot be sized from it.
-#   Landing the seam first is what makes the real distribution observable; #2888 owns the re-measure
-#   and the re-size. Env-overridable, and a typo must never silently disarm it — the `0`-means-off
+#   LANE_BACKSTOP_S — the ONE default, in seconds. 36000 (10 h), MEASURED 2026-11-12 on `pi-cell-4`
+#   over 2,033 lane logs, and NOT provisional any more (agent-infra#4034). What it was measured
+#   against: 20 `verdict=exceeded-wallclock` vs 2 `stalled` — the backstop was ending TEN TIMES more
+#   lanes than the progress bound it exists to back up, the inverse of the intent above. Of those 20
+#   wall kills 12 carried `silent=0s` and 12 `cpu_delta_cs > 0`, i.e. the watchdog's own idle
+#   detector said the lane was NOT idle when the clock ended it, so the 2700 s progress allowance
+#   never got its window; one was killed mid-`git push` holding 12 commits and four review rounds.
+#   5x is the top of #4034's 3-5x range, and it puts the wall ~13x above the allowance so a lane that
+#   is still advancing cannot be pre-empted by elapsed time before the progress rule has fired. The
+#   earlier 7200 was PROVISIONAL for a reason that no longer holds: the `prfix` distribution it sat on
+#   was CENSORED by the value being replaced (every row reported the cap), so the ceiling could not be
+#   sized from it; #2888 landed the seam to make the real distribution observable, and the number
+#   above is sized from that re-measurement. ⛔ RE-DERIVE IT FROM THE LOGS, DO NOT INHERIT THE ROUND
+#   NUMBER: the cost of the raise is stated where it bites — a lane that creeps forward for ever is
+#   bounded at 10 h instead of 2, and every lease derived from this bound moves with it (`fix-one.sh`
+#   takes it + 1200 → 37200 s), which is why `CLAIM_TTL_MAX` and `CLAIM_ISSUE_TTL` in claims.sh moved
+#   in the SAME commit (#2888's refusal at `lane_wall_bound`). Env-overridable, and a typo must never
+#   silently disarm it — the `0`-means-off
 #   convention of the `task` family is NOT applied here, because this is the default for every lane on
 #   the box and an unbounded default is indistinguishable from a typo'd one. A caller that genuinely
 #   wants no backstop passes `0` EXPLICITLY as its own argument (lane-bound treats `--wall 0` as the
 #   documented off switch, loudly).
-LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-7200}"
+LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-36000}"
 case "$LANE_BACKSTOP_S" in
-  ''|*[!0-9]*|0) LANE_BACKSTOP_S=7200 ;;
+  ''|*[!0-9]*|0) LANE_BACKSTOP_S=36000 ;;
 esac
 # ⛔ AND IT IS EXPORTED, because the lane's wall clock is a fact its CHILDREN have to be able to
 # agree with (agent-infra#2888). Two consumers outlive the lane and read this duration for themselves —
