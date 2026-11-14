@@ -2782,7 +2782,14 @@ reap_stale_workers() {
   # samples of the process table with a window between them, and that window must be paid ONCE for the
   # whole pass — a per-candidate `sleep` would stall a loaded box's cycle by N x the window, and the
   # census is usually empty.
-  local _wc=""
+  local _wc="" _census=""
+  # ⛔ THE CENSUS IS BUILT ONCE FOR THE WHOLE PASS (#3585). It used to be read here and then AGAIN per
+  # candidate in phase 2 (`wt_alive "$_cn"`), which is #3756's doing and cost a full 105-record rebuild
+  # per candidate: a pass went from 12 s (cycle 117's own `stages=reap:12`) to 27 min, and 25 reap lines
+  # took 92 min. One table answers every question this pass asks — the candidate list here, and the
+  # surface verdict below — so it is built once and passed down. `wt_alive`'s optional table argument is
+  # the SAME verdict expression over the same rows, so this removes work, never a check.
+  _census="$(wt_table)"
   while IFS="$(printf '\t')" read -r s _st; do
     case "$s" in ''|*[!A-Za-z0-9-]*) continue ;; esac
     # ⛔ `review-*` IS IN THIS LIST NOW (owner ruling 2026-11-04) AND IT WAS THE EXPENSIVE OMISSION.
@@ -2827,7 +2834,7 @@ reap_stale_workers() {
     _wc="${_wc}${s}$(printf '\t')${f}$(printf '\t')${age}$(printf '\t')${m}
 "
   done <<EOF
-$(wt_table)
+$_census
 EOF
   # ── PHASE 2: the POSITIVE-LIVENESS gate (agent-infra#2104) ────────────────────────────────────
   # Nothing below is reached on an empty pass, and nothing is reaped until this gate says so. The
@@ -2858,9 +2865,12 @@ EOF
       esac
       # The launcher's OWN answer to "is this worker's surface still there". `unknown` when the census
       # cannot answer — which is not a licence to kill, only a reason not to use the surface as proof.
+      # ⛔ answered from the table THIS PASS already built (`$_census`), not by rebuilding it (see the
+      # header of this function). `wt_alive` is the same function and the same expression: this is one
+      # census per pass, not one per candidate.
       _surf="unknown"
       if declare -f wt_alive >/dev/null 2>&1; then
-        if wt_alive "$_cn"; then _surf="alive"; else _surf="dead"; fi
+        if wt_alive "$_cn" "$_census"; then _surf="alive"; else _surf="dead"; fi
       fi
       # ⛔ THE VERDICT IS ALWAYS ASKED, INCLUDING WHEN THE PROBE READ NOTHING. An unreadable table
       # used to skip the call and default to UNKNOWN, so a record whose surface is PROVEN GONE could
@@ -2870,24 +2880,47 @@ EOF
       _wreap_verdict "$_now" "$_prev" "${_cpu:-}" "$_m" "$_surf"; _v=$?
       case "$_v" in
         0)
-          # ⛔ NAME THE REASON THE VERDICT ACTUALLY USED. There are two routes to REAP — a measured flat
-          # tree over the window, and a surface PROVEN GONE with nothing left to destroy — and printing the
-          # first one's sentence on the second route is exactly the defect this PR exists to remove: a
-          # published MEASUREMENT the probe never took (`cpu=0 -> ?cs` reads as a delta of zero). One line,
-          # whichever arm fired.
-          if [ "${_m:-0}" -gt 0 ] && [ -n "${_cpu:-}" ]; then
-            echo "[reap-worker] $_cn silent ${_ca}s and its process tree burned no CPU across the window (cpu=${_pcpu:-?} -> ${_cpu}cs, tol=${_WREAP_TOL_CS:-10}cs) -> closing its worker surface" >> "$LOG"
-          else
-            echo "[reap-worker] $_cn silent ${_ca}s, its surface is PROVEN GONE (surface=${_surf}, matched=${_m:-0}) and nothing is left to destroy -> freeing its record" >> "$LOG"
+          # ⛔ THE SURFACE IS RE-ASKED, FRESHLY, BEFORE ANYTHING IS CLOSED — AND ONLY ON THE ROUTE THAT
+          # NEEDS IT (#3585 review, P2 + P1). `_surf` is answered from the census this PASS built at entry,
+          # and `wt_close` KILLS before it verifies, so on the SURFACE route (no identity matched: `_m` 0,
+          # the stale row is the ONLY evidence) a respawned worker could be closed on a row from the wrong
+          # incarnation. Pre-#3585 `_surf` was a fresh read at verdict time, so passing the pass-entry
+          # table widened that window; the freshness the old shape got for free is bought back here.
+          # ⛔ AND IT IS SCOPED TO `_m` = 0, WHICH IS NOT COSMETIC (measured, review cycle 2). The other
+          # route to REAP is a MEASURED flat process tree over the window — #2104's primary arm, where the
+          # surface is ALIVE by definition (a hung `pi` parked at 0 CPU holds its terminal). Re-asking the
+          # surface there spares exactly the corpse that arm exists to free: the record survives for ever,
+          # its slot stays counted, and the ceilings stay saturated while the log still announces a reap.
+          # Two selftest §19 arms (the GNU-stat shape) caught that immediately; this is why the read is
+          # gated on "the surface was the sole evidence" rather than run unconditionally.
+          if [ "${_m:-0}" = "0" ] && declare -f wt_alive >/dev/null 2>&1; then
+            if declare -f wt_forget >/dev/null 2>&1; then wt_forget; fi
+            if wt_alive "$_cn"; then
+              echo "[reap-worker] $_cn was idle by the pass-entry census, but a FRESH read reports its surface ALIVE — SPARED (nothing was closed)" >> "$LOG"
+              _v=2
+            fi
           fi
-          # ⛔ A KILL THAT CANNOT BE PROVEN IS NOT A KILL. wt_close() re-reads the surface after closing
-          # and returns non-zero if the worker is still there (or UNREADABLE); the record is then KEPT
-          # so the next cycle retries. Reporting "reaped" on the strength of the close call alone would
-          # free a slot that is still occupied — the exact arithmetic that let hung workers halve the caps.
-          if wt_close "$_cn"; then
-            _wreap_forget "$_cn"
-          else
-            echo "[reap-worker] $_cn could NOT be proven gone — record kept, retried next cycle" >> "$LOG"
+          if [ "$_v" = "0" ]; then
+            # ⛔ NAME THE REASON THE VERDICT ACTUALLY USED, AND ONLY WHEN A CLOSE IS ABOUT TO HAPPEN. There
+            # are two routes to REAP — a measured flat tree over the window, and a surface PROVEN GONE with
+            # nothing left to destroy — and printing the first one's sentence on the second route is the
+            # defect this PR exists to remove (a published MEASUREMENT the probe never took: `cpu=0 -> ?cs`
+            # reads as a delta of zero). One line, whichever arm fired — and it is printed HERE, after the
+            # fresh read, so a candidate the fresh read spared never announces a close that did not happen.
+            if [ "${_m:-0}" -gt 0 ] && [ -n "${_cpu:-}" ]; then
+              echo "[reap-worker] $_cn silent ${_ca}s and its process tree burned no CPU across the window (cpu=${_pcpu:-?} -> ${_cpu}cs, tol=${_WREAP_TOL_CS:-10}cs) -> closing its worker surface" >> "$LOG"
+            else
+              echo "[reap-worker] $_cn silent ${_ca}s, its surface is PROVEN GONE (surface=${_surf}, matched=${_m:-0}) and nothing is left to destroy -> freeing its record" >> "$LOG"
+            fi
+            # ⛔ A KILL THAT CANNOT BE PROVEN IS NOT A KILL. wt_close() re-reads the surface after closing
+            # and returns non-zero if the worker is still there (or UNREADABLE); the record is then KEPT
+            # so the next cycle retries. Reporting "reaped" on the strength of the close call alone would
+            # free a slot that is still occupied — the exact arithmetic that let hung workers halve the caps.
+            if wt_close "$_cn"; then
+              _wreap_forget "$_cn"
+            else
+              echo "[reap-worker] $_cn could NOT be proven gone — record kept, retried next cycle" >> "$LOG"
+            fi
           fi ;;
         1)
           # ⛔ THIS LINE IS THE FIX. Before it, a worker logged as "silent 8287s" while its agent had

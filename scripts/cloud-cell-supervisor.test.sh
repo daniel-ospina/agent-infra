@@ -919,6 +919,18 @@ case "$CC_OUT" in
   *"agent-infra#2176"*) ok "check: the refusal carries its issue, so the remedy is findable" ;;
   *) bad "check: the refusal does not cite agent-infra#2176" ;;
 esac
+# ⛔ THE REMEDY MUST BE PASTEABLE (measured, P3): `rail_names()` prints ONE NAME PER LINE, and the
+# refusal used to interpolate it straight into `for f in $(rail_names); do …`, so the command an
+# operator is handed spanned FOUR lines — pasting it runs `for f in admin-merge.sh` and then
+# `ci-failure-set.sh` as a command (`syntax error near unexpected token`). A refusal whose own remedy
+# does not run is the same class as the false PASS this block exists to remove, and it is invisible to
+# every arm above (they grep the message for NAMES, not for the SHAPE of the command in it).
+# The expected list is DERIVED from `$RAIL_FILES` (one line, source order) rather than hand-copied, so a
+# new rail file reaches this arm the same way it reaches every fixture — the rule at the top of this file.
+case "$CC_OUT" in
+  *"for f in $RAIL_FILES"*) ok "check: the rail remedy's loop list is on ONE line, so the suggested command is pasteable" ;;
+  *) bad "check: the rail remedy is NOT pasteable — its for-f-in list is newline-separated — output: $CC_OUT" ;;
+esac
 mv -f "$F/home/.pi/agent/scripts/ci_exemption.py.off" "$F/home/.pi/agent/scripts/ci_exemption.py"
 # (b) Present but NOT executable. The lane TYPES this path, so an x-less copy is a seam nobody can
 # run — and it must not be certifiable, or the failure surfaces at step 5 instead of at the gate.
@@ -1421,6 +1433,80 @@ cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
 # Restore PH to the record: `prov` points HARNESS at whatever PH holds, and the cases below assert
 # against origin/main — leaving it on the old detached worktree would make (f) fail for the wrong
 # reason (a behind harness, not a post-seed edit).
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+
+# (e2b) `apply --pin-only` ON A CELL WHOSE CONTROLLER IS LIVE (agent-infra#2738).
+# The guard above `harness_apply` used to run BEFORE the `--pin-only` branch, so the one verb that exists
+# for a running cell was refused by it — and the refusal's own message offered `--force`, which defeats the
+# SAME guard on the SEEDING path, so `--force` stopped distinguishing "advance the pin" from "re-seed `$O`
+# under a live loop". MEASURED 2026-10-24 19:05Z on `pi-cell-3`: the pin record named `709ceb911b03` and
+# that pin directory did not exist, the repair was `apply --pin-only`, it printed
+# `FATAL: a controller is RUNNING (pid 2446252)`, and `--force` was the only way through.
+# ⛔ THE FIXTURE IS A REAL LIVE CONTROLLER, not a stubbed verdict: `seen_controller_pids`'s lock leg needs
+# a running `bash …/orch-loop.sh` whose pid an `.orch.lock` written AFTERWARDS names (the age direction
+# therefore reads "began before the lock" — a controller, not pid reuse), so the pin-only assertion below
+# cannot be satisfied by a fixture the guard simply ignores. Both directions are needed: an exemption that
+# had also DELETED the guard reddens the plain-apply assertion, and a missing exemption reddens the
+# pin-only one.
+mkdir -p "$P/lockctl"
+printf '#!/bin/sh\nsleep 300\n' > "$P/lockctl/orch-loop.sh"; chmod +x "$P/lockctl/orch-loop.sh"
+bash "$P/lockctl/orch-loop.sh" >/dev/null 2>&1 & _PIN_LIVE=$!
+sleep 0.3
+printf '%s\n' "$_PIN_LIVE" > "$P/o/.orch.lock"
+# Point the box BACK at the pre-(e) pin and hand-edit $O, so "the pin advanced" and "$O was not re-seeded"
+# are both observable rather than implied.
+# ⛔ ASSIGNING `PH` IS NOT ENOUGH — THE RECORD MUST BE MOVED TOO, OR THE ADVANCE ARM IS VACUOUS
+# (independent review of this PR, P1, and it was right). `prov` passes `HARNESS="$PH"` but the NEXT
+# `apply` re-resolves the harness from `$HARNESS_PIN_FILE`, which §(e)/(e2) left naming
+# `pin/<the tip>`: the post-call record would then already satisfy the "advanced" pattern and the arm
+# would pass over a `--pin-only` that did NOTHING. The value written here is also the exact pi-cell-3
+# shape — a record naming a pin directory that does NOT exist — so the arm exercises the repair, not a
+# no-op.
+PH="$P/pin/000000000000/scripts/orchestrator-harness"
+printf '%s\n' "$PH" > "$P/home/.harness-path"
+_REC_BEFORE="$(cat "$P/home/.harness-path" 2>/dev/null)"
+printf '\n# hand edit a pin-only would erase\n' >> "$P/o/orch-loop.sh"
+prov apply --pin-only
+[ "$PROV_RC" -eq 0 ] \
+  && ok "apply --pin-only is ALLOWED on a cell whose controller is live (the no-skew advance is reachable)" \
+  || bad "apply --pin-only was REFUSED with a live controller — the guard still gates the pin-only path (rc=$PROV_RC): $PROV_OUT"
+_PIN_AFTER="$(cat "$P/home/.harness-path" 2>/dev/null)"
+[ "$_PIN_AFTER" != "$_REC_BEFORE" ] \
+  && ok "…and it REWROTE the pin record (fixture check: it named a non-existent pin before the call)" \
+  || bad "the pin record still names '$_REC_BEFORE' — `--pin-only` exited 0 without advancing anything (the reachable-but-inert mutant)"
+case "$_PIN_AFTER" in
+  "$P/pin/$(printf '%s' "$WANT" | cut -c1-12)"/*) ok "…and the pin really advanced to origin/main under the live controller (the measured pi-cell-3 repair)" ;;
+  *) bad "--pin-only recorded '$_PIN_AFTER' instead of the pin for $WANT — the exempted path did nothing: $PROV_OUT" ;;
+esac
+grep -q 'hand edit a pin-only would erase' "$P/o/orch-loop.sh" 2>/dev/null \
+  && ok "…and it did NOT seed \$O under the live loop (the skew the guard exists to prevent is still absent)" \
+  || bad "--pin-only re-seeded \$O/orch-loop.sh — the exemption let the exempted path do the guarded thing"
+# THE GUARD IS NOT GONE — the same live controller must still refuse the SEEDING path, or the exemption
+# above is indistinguishable from having deleted the guard.
+prov apply
+[ "$PROV_RC" -ne 0 ] \
+  && ok "…while a plain apply is STILL refused with a live controller (the guard kept its seeding path)" \
+  || bad "a plain apply SEEDED the running cell's state dir — exempting --pin-only removed the guard instead of scoping it (rc=$PROV_RC): $PROV_OUT"
+case "$PROV_OUT" in
+  *"a controller is RUNNING (pid $_PIN_LIVE"*) ok "…naming the pid it can see, so the refusal is this fixture's controller" ;;
+  *) bad "the refusal did not name the live pid $_PIN_LIVE — it came from something else, so the arm above proves nothing: $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"apply --pin-only"*) ok "…and it NAMES a non-destructive remedy, so an operator is not steered to the flag that defeats the guard" ;;
+  *) bad "the refusal still offers only 'stop' and '--force' — the pi-cell-3 dead end (agent-infra#2738): $PROV_OUT" ;;
+esac
+kill -KILL "$_PIN_LIVE" 2>/dev/null; wait "$_PIN_LIVE" 2>/dev/null
+rm -f "$P/o/.orch.lock"
+# The control: with that controller gone the SAME plain apply seeds, which is what makes the two refusal
+# assertions above attributable to the live controller rather than to some other precondition of the
+# fixture.
+prov apply
+[ "$PROV_RC" -eq 0 ] \
+  && ok "…and once the controller is gone the SAME apply seeds (the refusal was the live controller, not the fixture)" \
+  || bad "a plain apply was still refused with no controller running, so the guard arms above prove nothing (rc=$PROV_RC): $PROV_OUT"
+cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
+  && ok "…and that seed erased the hand edit, so the 'did NOT seed' arm above was not vacuous" \
+  || bad "the control seed left the hand edit in \$O/orch-loop.sh, so 'did not seed' proved nothing"
 PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
 
 # (e3) STATUS must bound the self-refresh verdict by the LOOP's cycle, not an operator-shell default.
@@ -6734,6 +6820,102 @@ grep -qE 'cp "\$HERE/gh-rest/gh"' "$HERE/orchestrator-harness/install.sh" \
   && ok "install.sh carries a real CP of the adapter (the Mac half of the same seed set)" \
   || bad "install.sh no longer copies the adapter — the Mac half of the parity is gone"
 
+
+# ── §DECISION-GATE: `status` reports the owner-question gate, read-only (agent-infra#2642) ────────
+# MEASURED 2026-10-24 on agent-infra cell-1: `ask-owner.py` exited 2 on all nine owner questions it
+# was handed (no TypeSafe key on the box), so NOTHING reached the `owner-decision` queue while every
+# lane's own report said "asked". `status` is the verb an operator runs to discover a cell's state, so
+# it must answer this one — and it must READ: the WRITER is the bring-up's `check_decision_gate`, and a
+# second writer of one secret is how a repaired box and a certified box drift apart.
+say_case "§DECISION-GATE: status reports the owner-question gate, read-only"
+DG="$T/dgate"
+mkdir -p "$DG/home/.pi/agent" "$DG/bin" "$DG/o" "$DG/repo"
+printf '#!/bin/sh\nexit 1\n' > "$DG/bin/tmux"      # no session on the OPERATOR's tmux server
+chmod +x "$DG/bin/tmux"
+: > "$DG/keys.env"
+dg_sup() { PATH="$DG/bin:$PATH" CELL_HOME="$DG/home" ENV_FILE="$DG/keys.env" O="$DG/o" \
+             REPO="$DG/repo" OR="daniel-ospina/agent-infra" SCOPE=own HARNESS="" \
+             bash "$SUP" status 2>&1; }
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: MISSING"*) ok "status prints the decision-gate state when no credential exists (jev: MISSING)" ;;
+  *) bad "status does not report the missing decision-gate credential — a box that cannot queue a question still reads healthy: $OUT" ;;
+esac
+case "$OUT" in
+  *"owner queue"*) ok "…and says what it costs (questions never reach the owner queue), not just 'jev' with no meaning" ;;
+  *) bad "the MISSING line does not say what it costs: $OUT" ;;
+esac
+case "$OUT" in
+  *"cloud-cell-bringup.sh --check"*) ok "…and names the ONE command that repairs it" ;;
+  *) bad "the MISSING line does not name the repairer: $OUT" ;;
+esac
+[ ! -e "$DG/home/.pi/agent/jev-config.json" ] \
+  && ok "…and status WROTE NOTHING (the bring-up is the only writer of that credential)" \
+  || bad "status MINTED a decision-gate credential — two writers of one secret is the drift this gate prevents"
+# The store path: one hand-written 0600 store is enough, and it is read as configured.
+printf '{"apiKey":"sk_store_only","model":"jev-latest"}\n' > "$DG/home/.pi/agent/jev-config.json"
+chmod 600 "$DG/home/.pi/agent/jev-config.json"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*"jev-config.json"*) ok "status reads an existing 0600 store as configured, naming the file it read" ;;
+  *) bad "status did not read the provisioned store as configured: $OUT" ;;
+esac
+# ⛔ A WRONG-TYPED apiKey IS NOT `configured` (#2642 review). The reader stringified a truthy
+# non-string, so `{"apiKey":{"a":1}}` read as configured while `ask-owner.py` builds
+# `Bearer {'a': 1}` from the raw value and gets a 401 — the operator would be told the gate works on a
+# box where it cannot score a single question. The bring-up's `jev_store_state` and the writer
+# `write_jev_store` both already require a string; both surfaces must answer alike.
+printf '{"apiKey":{"a":1},"model":"jev-latest"}\n' > "$DG/home/.pi/agent/jev-config.json"
+chmod 600 "$DG/home/.pi/agent/jev-config.json"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*) bad "status called a wrong-typed apiKey configured — ask-owner.py cannot send it (Bearer {'a': 1} → 401), so every question is UNSCORED: $OUT" ;;
+  *"jev: MISSING"*) ok "a wrong-typed apiKey is NOT read as configured (only a JSON string is a credential the gate can send)" ;;
+  *) bad "a wrong-typed apiKey is reported as neither configured nor MISSING: $OUT" ;;
+esac
+# The FILE is the contract: an ambient export reaches no worker (tmux serves the session the SERVER's
+# environment), so it must be reported as the near-miss it is rather than as configured.
+rm -f "$DG/home/.pi/agent/jev-config.json"
+OUT="$(TYPESAFE_API_KEY=sk_ambient dg_sup)"
+case "$OUT" in
+  *"NOT in"*) ok "an AMBIENT-only key is reported as a near-miss, not as configured (a lane sources the file)" ;;
+  *"jev: configured"*) bad "status called an ambient-only key configured — that is the state a worker has no key in: $OUT" ;;
+  *) bad "an ambient-only key is reported with no explanation: $OUT" ;;
+esac
+# …and the FILE does count, because a lane sources it.
+printf 'TYPESAFE_API_KEY=sk_in_file\n' > "$DG/keys.env"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*"keys.env"*) ok "a key the keys.env FILE carries IS configured (a lane sources that file itself)" ;;
+  *) bad "a keys.env-delivered key was not read as configured: $OUT" ;;
+esac
+# ⛔ A WHITESPACE-ONLY VALUE IS NOT A KEY ON THIS SURFACE EITHER (#2642 review). The `keys.env` arm
+# tested `-n` with no trim, so a blanked key printed `jev: configured … ask-owner.py can score a
+# question` — while `ask-owner.py::_key()` strips and REJECTS the same value, takes the unkeyed branch,
+# and exits 2 on every question. That is exactly the "status certifies a dead decision gate" failure
+# this gate exists to prevent, and it is the population `status` exists for: cells brought up before
+# the gate existed, where no bring-up has run to refuse the box. The bring-up's `jev_key_var` and this
+# function's own store arm already trim; this arm must apply the same rule.
+printf 'TYPESAFE_API_KEY="   "\n' > "$DG/keys.env"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*) bad "status called a WHITESPACE-ONLY keys.env value configured — ask-owner.py strips it and rejects it, so every question exits 2 and nothing reaches the queue: $OUT" ;;
+  *"jev: MISSING"*) ok "a WHITESPACE-ONLY keys.env value is NOT configured (ask-owner.py trims it and finds no key)" ;;
+  *"NOT in"*) ok "a WHITESPACE-ONLY keys.env value is NOT configured (reported as the near-miss it is)" ;;
+  *) bad "a whitespace-only keys.env value is reported as neither configured nor MISSING: $OUT" ;;
+esac
+[ ! -e "$DG/home/.pi/agent/jev-config.json" ] \
+  && ok "…and it still WROTE NOTHING for a blank value (the bring-up remains the only writer)" \
+  || bad "status MINTED a store while judging a blank keys.env value"
+# …and the SAME rule for the ambient arm: a blank export is not a key, so it is the MISSING line's
+# business. Reporting it as "a key is set in THIS shell but NOT in the FILE" would name a near-miss that
+# does not exist (`ask-owner.py` trims it and finds no key either).
+OUT="$(TYPESAFE_API_KEY='   ' dg_sup)"
+case "$OUT" in
+  *"NOT in"*) bad "a WHITESPACE-ONLY ambient export is reported as a key set in this shell — ask-owner.py trims it and finds no key, so that near-miss does not exist: $OUT" ;;
+  *"jev: MISSING"*) ok "…a whitespace-only AMBIENT export is MISSING, not a near-miss (one trimming rule on every arm)" ;;
+  *) bad "a whitespace-only ambient export is reported as neither MISSING nor a near-miss: $OUT" ;;
+esac
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

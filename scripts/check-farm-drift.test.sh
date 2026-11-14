@@ -523,6 +523,52 @@ _old_cite2="setup.sh:10"; _old_cite2="${_old_cite2}61"
 ck $(grep -qF "$_old_cite" "$HERE/check-farm-drift.test.sh" && echo 1 || echo 0) "no citation still points at the pre-patch setup.sh line-56 numbering"
 ck $(grep -qF "$_old_cite2" "$HERE/check-farm-drift.sh" && echo 1 || echo 0) "no citation points at the pre-patch setup.sh line-61 numbering (the --pin-file call moved)"
 
+# 30. ⛔ THE FARM'S OWN SCRATCH IS NOT DRIFT (#3991). `farm_install` writes `<name>.tmp.<pid>` INSIDE
+# the directory this check grades, so the check must not call it UNSOURCED — and an INTERRUPTED install
+# leaves one behind permanently, which made the pre-fix grading a red pass (rc=3) whose printed remedy
+# ("declare it LOCAL, delete it, or retire it") no re-run could clear. Pinned BOTH ways: the scratch
+# shape passes, a near-miss that is NOT the scratch shape (no pid) still fails, and a REAL repo file
+# that happens to carry the scratch shape is still graded — the exemption is applied where nothing
+# resolves to the name, never by name alone (a name-only exemption would mask a stale copy and a lost
+# `+x` bit, which is the #10114 silent no-op this whole file exists to catch).
+C30="$TMP/c30"; mk_farm "$C30/scripts"; mkdir -p "$C30/state"
+printf 'scripts/alpha.py\nscripts/beta.sh\nscripts/fleet/gamma.py\n' > "$C30/state/farm-declared.txt"
+printf 'half a copy\n' > "$C30/scripts/alpha.py.tmp.4242"
+run "$C30/scripts"
+ck $([ "$RC" -eq 0 ] && echo 0 || echo 1) 'an interrupted install leaving NAME.tmp.PID scratch is not graded UNSOURCED (rc='"$RC"')'
+# no pipe into `grep -q` (scripts/check-no-sigpipe-grep.sh, #841/#864): capture, then test in the shell.
+c30_row="$(grep 'alpha.py.tmp.4242' "$OUT" || true)"
+case "$c30_row" in
+  *'LOCAL (scratch)'*) ck 0 '...it is reported as LOCAL (scratch) rather than silently dropped' ;;
+  *) ck 1 '...it is reported as LOCAL (scratch) rather than silently dropped (got: '"$c30_row"')' ;;
+esac
+ck $(grep -q 'alpha.py.tmp.4242' "$ERR" && echo 1 || echo 0) '...and it is never reported as drift'
+rm -f "$C30/scripts/alpha.py.tmp.4242"
+printf 'not the scratch shape\n' > "$C30/scripts/beta.sh.tmp"
+run "$C30/scripts"
+ck $([ "$RC" -eq 3 ] && echo 0 || echo 1) '...while a tmp name WITHOUT a pid is still UNSOURCED (rc='"$RC"') - the exemption is the shape, not the word'
+rm -f "$C30/scripts/beta.sh.tmp"
+# the pid suffix must be ALL digits: `foo.tmp.1-old` is a box-local file nothing explains, and grading
+# it benign would certify an UNSOURCED file at rc=0 — the one outcome this instrument must not produce.
+printf 'not a pid\n' > "$C30/scripts/foo.tmp.1-old"
+run "$C30/scripts"
+ck $([ "$RC" -eq 3 ] && echo 0 || echo 1) '...and a suffix that only STARTS with a digit is still UNSOURCED (rc='"$RC"')'
+rm -f "$C30/scripts/foo.tmp.1-old"
+# a REAL repo file named like the scratch: the source must win, so its stale bytes are STALE (rc=1),
+# never exempted. Committed here because case 30 runs after every case that uses $SEED.
+printf '#!/bin/bash\necho shadow-v1\n' > "$SRC/scripts/shadow.tmp.7"
+git -C "$SRC" -c user.email=t@t -c user.name=t add scripts/shadow.tmp.7 2>/dev/null
+git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm 'case30 shadow' 2>/dev/null
+printf 'scripts/alpha.py\nscripts/beta.sh\nscripts/fleet/gamma.py\nscripts/shadow.tmp.7\n' > "$C30/state/farm-declared.txt"
+printf '#!/bin/bash\necho shadow-STALE\n' > "$C30/scripts/shadow.tmp.7"
+run "$C30/scripts"
+ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) '...and a REAL repo file named NAME.tmp.PID is still graded, not exempted (rc='"$RC"')'
+c30_stale="$(grep 'shadow.tmp.7' "$ERR" || true)"
+case "$c30_stale" in
+  *STALE*) ck 0 '...its stale bytes are reported as STALE' ;;
+  *) ck 1 '...its stale bytes are reported as STALE (got: '"$c30_stale"')' ;;
+esac
+
 
 echo ""
 if [ "$fail" -eq 0 ]; then

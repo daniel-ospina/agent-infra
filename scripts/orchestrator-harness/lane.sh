@@ -99,7 +99,17 @@ if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 # section, which names all three causes and the artifact that tells them apart.
 #
 # THE CONTRACT — one physical line, PER RUN, last in `$O/logs/lane-<N>.log`:
-#     outcome=<done|refused|failed|died> reason=<token> lane=<N> rc=<status> utc=<timestamp>
+#     outcome=<done|refused|failed|died> reason=<token> keygate=<state> lane=<N> rc=<status> utc=<timestamp>
+# ⛔ `keygate=` NAMES WHAT THE MODEL-CREDENTIAL GATE DID FOR THIS RUN (review: a bypass must be COUNTABLE). Its
+# vocabulary is closed and documented at the global's declaration below. THE COUNT — one command, quoted
+# IDENTICALLY here and in the README, because two artifacts answering one question with different commands is
+# how the wrong one gets run during an incident:
+#     grep -hE '^outcome=.* keygate=off ' "$O"/logs/lane-[0-9]*.log
+# ⛔ IT READS THE LOG, NOT THE PER-RUN `.outcome` (review, P2, measured): the per-run file is written only by
+# the run that still OWNS the token, so a lane that was escape-invoked and then superseded by a later dispatch
+# writes `keygate=off` to the log only — counting from `.outcome` would report N when N+1 lanes escaped, i.e.
+# silently short in exactly the concurrent-redispatch shape the per-run file exists for. The log holds every
+# run (`^outcome=` anchored, so a transcript line that merely mentions the token cannot match).
 # ⛔ PER RUN, AND THE READ MUST BE RUN-SCOPED (review round 4/5, P2, measured). The lane log is
 # APPEND-ONLY (`tee -a` / `>>`, nothing truncates it), so a re-dispatched issue leaves the PREVIOUS
 # attempt's terminal line in the same file — and `grep '^outcome=' | tail -1` then answers "this lane has
@@ -142,6 +152,22 @@ LANE_RUN_TOKEN="${N:-0}.$$.$(date +%s 2>/dev/null || printf 0)"
 printf '%s\n' "$LANE_RUN_TOKEN" > "$O/logs/lane-$N.owner" 2>/dev/null || true
 rm -f "$O/logs/lane-$N.outcome" 2>/dev/null || true
 LANE_OUTCOME=""; LANE_OUTCOME_REASON=""; LANE_TERMINAL_DONE=0; LANE_LAST_STATUS=0
+# ⛔ THE KEY GATE'S STATE IS PART OF THE VERDICT (agent-infra#3331 review, most-substantive finding): the
+# escape `--key-gate-off` used to be visible only as PROSE in the log, so the readers this change ships
+# (`grep -L '^outcome='` and `cat lane-<N>.outcome`) could not tell "the credential was asserted and passed"
+# from "the assertion was switched off for this invocation". A category-A gate whose bypass is not COUNTABLE
+# is a bypass nobody can audit, so the state rides the terminal line as `keygate=<state>`.
+#
+# THE VOCABULARY IS CLOSED, and the initialiser is deliberately `unreached` (NOT a permissive default): a lane
+# that ends before the gate — a repo-target 72, an early 78, a signal during startup — must not read as
+# `checked`, and an ABSENT field must not be the thing that means "fine".
+#   checked  — the gate ran and the credential is present in the env this lane hands `pi`
+#   skipped  — the gate ran and could NOT resolve the credential name (blindness; it refuses nothing)
+#   refused  — the gate ran and refused; the lane ends here (`outcome=refused reason=key-gate:…`)
+#   off      — `--key-gate-off`: the assertion did NOT run for this invocation (the declared escape)
+#   notrun   — the gate could not produce a verdict (its probe failed, or `$O/state` was unwritable)
+#   unreached— the lane ended before the gate. Never a pass.
+LANE_KEYGATE="unreached"
 lane_outcome() { # <done|refused|failed|died> <reason-token>  — FIRST writer wins
   [ -n "${LANE_OUTCOME:-}" ] && return 0
   case "${1:-}" in
@@ -166,7 +192,7 @@ lane_terminal_line() {
   fi
   # Collapse anything that would break the one-line contract (a reason is a caller's string).
   r="$(printf '%s' "$r" | tr '\n\r\t' '   ')"
-  line="outcome=$o reason=$r lane=$N rc=${LANE_LAST_STATUS:-?} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
+  line="outcome=$o reason=$r keygate=${LANE_KEYGATE:-unreached} lane=$N rc=${LANE_LAST_STATUS:-?} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
   # The per-run verdict (see the contract above): re-owned at dispatch, so its ABSENCE — not a stale line, and
   # not an older live run's line — is what "no verdict yet" looks like.
   # ⛔ THE DECISION IS MADE FROM WHAT THE READ AT EXIT CAN SEE, AND ONLY WHEN IT CAN SEE SOMETHING (review
@@ -785,11 +811,10 @@ lane_standdown_write() { # <gate> <yield-seconds>
 # ⛔ THE OTHER HALF IS `outcome=refused`, written by the trap. A refusal that only reaches stderr is the
 # same silence one layer up: `dispatch-merge.sh` had already recorded "launched" from `nohup … &`.
 if [ "${KEY_GATE_ESCAPE:-0}" = "1" ]; then
-  # ⛔ THE DECLARED ESCAPE, AND IT ANNOUNCES ITSELF. It exists for fixtures that STUB `pi` (so the
-  # credential is not what they measure) — a fixture that inherited the box's own key would be a false
-  # GREEN on one box and a false RED on another. On a live box this line IS a bypass, and it says so in
-  # the log rather than switching the gate off quietly.
-  echo "[key-gate] lane $N check=skipped reason=--key-gate-off — the model-credential assertion is OFF for this invocation (declared escape: argv, for fixtures that stub pi; on a live box this line is a bypass and says so) (#3331)" >> "$O/logs/lane-$N.log"
+  # ⛔ THE DECLARED ESCAPE, AND IT ANNOUNCES ITSELF — ON THE TERMINAL LINE TOO (review: the prose line alone
+  # is not countable). `keygate=off` is what a scan counts; the sentence below is what an operator reads.
+  LANE_KEYGATE="off"
+  echo "[key-gate] lane $N check=skipped reason=--key-gate-off — the model-credential assertion is OFF for this invocation (declared escape: argv, for fixtures that stub pi; on a live box this line is a bypass and says so; the terminal line carries keygate=off) (#3331)" >> "$O/logs/lane-$N.log"
 else
   # ⛔ THE RETIRED ENVIRONMENT ROUTE IS REPORTED, NOT OBEYED (review, P1, measured). A box `keys.env` or a
   # controller's launchd environment can carry `LANE_KEY_GATE=0`, and the previous cut honoured it. It is
@@ -818,6 +843,7 @@ else
   # instrument-misstates-itself class this whole change exists to remove.
   KEY_GATE_OUT="$O/state/key-gate-$N-${LANE_RUN_TOKEN}.line"
   if ! { : > "$KEY_GATE_OUT"; } 2>/dev/null; then
+    LANE_KEYGATE="notrun"
     lane_outcome died "key-gate-not-run:no-outcome-file"
     echo "[lane $N] NOT started: the KEY gate could not be RUN ($O/state is not writable) — this is NOT a credential refusal and NOTHING was measured about the model, so nothing is yielded and the credential is not the suspect. Fix $O (free space / permissions; the DISK gate reports the same condition as 77) and re-dispatch." >> "$O/logs/lane-$N.log"
     echo "[lane $N] NOT started: the KEY gate could not be RUN ($O/state not writable) — see $O/logs/lane-$N.log" >&2
@@ -831,8 +857,33 @@ else
   # the agreement structural instead of a coincidence of two defaults, and it is why the gate's own
   # prefix rule is reserved for a probe that names no provider.
   key_gate_assert "lane $N" "${HOME:-}" "${PI_LANE_PROVIDER:-deepseek}" "${PI_LANE_MODEL:-deepseek-flash}" > "$KEY_GATE_OUT" 2>&1; KEY_GATE_RC=$?
+  # ⛔ THE STATE IS READ OFF THE GATE'S OWN LINE, not decided a second time (single source of truth): the gate
+  # prints `check=ok` when it measured a credential, `check=skipped` when it could not resolve the name, and
+  # `check=fail` when it refuses. Anything else means the gate produced no verdict we can classify.
+  # ⛔ VERDICT-SCOPED AND LAST, NOT FIRST (review, P1, measured). `key_gate_assert` runs the box-default
+  # COMPANION first, and that companion prints `check=warn …` on a box that pins a startup model — so a
+  # `head -1` read classified the companion's warning as the gate's answer: it matched no verdict, the
+  # fallback below turned it into `notrun`, and a lane whose gate really said `check=ok` (or refused with
+  # 82) reported `keygate=notrun` — the field misstating the gate it exists to make auditable, and sending
+  # an operator to debug the harness. The module's own contract is that the VERDICT is the last
+  # `check=` line (key-gate.sh's `key_gate_assert` header), so this reads only verdict words and takes the
+  # LAST one: a companion line can be printed before or after it without changing the answer.
+  # ⛔ NO `\|` ALTERNATION IN THE SED — BSD sed has none (this repo has already been bitten: a compact
+  # `s/\(^\|[[:space:]]\)#.*$//` silently stripped NOTHING on the Mac and the guard under it went back to
+  # counting comments). Measured on this host: the alternation form matched no line at all, so `checked` and
+  # `refused` both fell through to `notrun`. The filter is two portable steps instead — keep `check=` lines,
+  # drop the companion's `warn`, take the LAST: the verdict is the last `check=` line by the gate's own
+  # contract, and a companion line before or after it cannot change the answer.
+  case "$(sed -n 's/.*check=\([a-z]*\).*/\1/p' "$KEY_GATE_OUT" 2>/dev/null | grep -v '^warn$' | tail -1)" in
+    ok)      [ "$KEY_GATE_RC" = "0" ] && LANE_KEYGATE="checked" ;;   # `check=ok` beside a non-zero rc is no verdict
+    skipped) [ "$KEY_GATE_RC" = "0" ] && LANE_KEYGATE="skipped" ;;
+    fail)    [ "$KEY_GATE_RC" = "$KEY_GATE_REFUSED" ] && LANE_KEYGATE="refused" ;;
+  esac
   tee -a "$O/logs/lane-$N.log" < "$KEY_GATE_OUT"
   rm -f "$KEY_GATE_OUT" 2>/dev/null || true
+  # Past this point the gate RAN, so an unclassified state is the gate FAILING to produce a verdict — it must
+  # not inherit `unreached` (which means "ended before the gate") by accident.
+  [ "$LANE_KEYGATE" = "unreached" ] && LANE_KEYGATE="notrun"
   if [ "$KEY_GATE_RC" -ne 0 ] && [ "$KEY_GATE_RC" != "$KEY_GATE_REFUSED" ]; then
     # The gate itself failed (not a verdict). 78 = cannot run, and the reason names it so an operator does
     # not go looking for a credential that was never the problem.
@@ -898,6 +949,83 @@ else
     exit "$KEY_GATE_RC"
   fi
 fi
+# ── THE RUN-SCOPED OUTPUT OFFSET (agent-infra#2833) ─────────────────────────────────────────────
+# The lane log is APPEND-ONLY across runs (`tee -a` / `>>`), so any read of "what did this run's agent
+# printed" must start at the byte this run appended from. The same stale-flag class the per-run
+# verdict file closes for `outcome=`, closed here for the agent's own transcript: a PREVIOUS attempt
+# that died of a connection storm must not classify THIS attempt's exit as transport (see the
+# attribution block below for why that matters).
+LANE_AGENT_LOG_OFF=0
+if [ -r "$O/logs/lane-$N.log" ]; then
+  LANE_AGENT_LOG_OFF="$(wc -c < "$O/logs/lane-$N.log" 2>/dev/null | tr -dc '0-9')"
+fi
+LANE_AGENT_LOG_OFF="${LANE_AGENT_LOG_OFF:-0}"
+# The agent's OWN output for THIS run — never the whole file. Streamed, not buffered: a print-mode
+# transcript is tens of MB and this runs once, at exit.
+lane_run_output() {
+  [ -r "$O/logs/lane-$N.log" ] || return 0
+  tail -c "+$(( ${LANE_AGENT_LOG_OFF:-0} + 1 ))" "$O/logs/lane-$N.log" 2>/dev/null || true
+}
+# ── THE EXIT IS ATTRIBUTED TO ITS OWN CAUSE BEFORE IT IS EVER CALLED A WORK FAILURE (#2833) ─────
+# MEASURED (this fleet's own lane logs, 2026-11-11): 53 lanes exited non-zero and **all 53** were
+# recorded `outcome=failed reason=agent-exit-<rc>` — the work-failure token — including **35 (66%)**
+# that `lane-bound.sh` had ENDED at the wall-clock ceiling, every one of which carries
+# `[lane-bound] VERDICT verdict=exceeded-wallclock … signal=TERM` in the SAME log. So the artifact the
+# census reads said "the work failed" about lanes that had never been given a chance to finish, which
+# is the reading the whole issue exists to remove ("lanes die constantly, and the harness cannot even
+# say HOW they died"). The information was already measured; the terminal line threw it away.
+#
+# ⛔ THE CLASS IS CARRIED OUT OF BAND, NOT AS A NEW EXIT CODE. This issue proposed a dedicated code
+# (EX_TEMPFAIL 75). Two measured reasons it is not one: 75 is already `AGENT_LOAD_REFUSED` (a
+# REFUSAL, the opposite polarity — no agent ran), and the recorded correction in this repo after
+# #1986 is that a refusal/verdict is NOT an exit code — its value space is shared with `pi` and with
+# sysexits, and overloading it produced a false "refusal" on a verb that had FAILED. No shipped
+# caller of `lane.sh` reads its exit status for a retry decision (`dispatch-merge.sh:476` launches it
+# through `wt_spawn`, detached), so a new code would be an inert signal — the exact no-op-gate class
+# this repo's own A/B rule forbids. The terminal line IS the out-of-band carrier, and it is already
+# the documented single read (`cat $O/logs/lane-<N>.outcome`), so the retry query is one grep:
+#     grep -h '^outcome=died reason=transport-unreachable:' $O/logs/lane-*.outcome
+# ⛔ `LANE_TRANSPORT_MIN_ROTATIONS` IS THE FALSIFIER'S KNOB, and the default is deliberately NOT 1: a
+# lane that logged a single rotation and then failed on its own work is a WORK failure, and retrying
+# it burns a lane's budget for nothing. Three independent rotations of the connection pool inside one
+# run is the shape the issue measured (#1…#23), never a blip.
+case "${LANE_TRANSPORT_MIN_ROTATIONS:-}" in
+  ''|*[!0-9]*) LANE_TRANSPORT_MIN_ROTATIONS=3 ;;
+  *)           LANE_TRANSPORT_MIN_ROTATIONS="$((10#${LANE_TRANSPORT_MIN_ROTATIONS}))" ;;
+esac
+lane_transport_rotations() {
+  local n
+  n="$(lane_run_output | grep -c -- 'rotated connection pool' 2>/dev/null || true)"
+  n="$(printf '%s' "${n:-0}" | tr -dc '0-9')"
+  printf '%s\n' "${n:-0}"
+}
+# The killer, read back from the run's own bound verdict file — and, when `run_agent` could not hand
+# it over (a pre-change `$O` helper under the tolerant-reference rule), from the `[lane-bound]
+# VERDICT` line `lane-bound.sh` writes into the same log. Run-scoped for the same reason the rotation
+# read is: a previous attempt's verdict must not answer for this one.
+# ⛔ AN ALLOW-LIST, NEVER "ANYTHING THAT IS NOT EMPTY" (found in this change's own review, MEASURED on
+# the arm 9g/9h fixtures). `lane-bound.sh` emits a `VERDICT` line on EVERY path — including
+# `verdict=finished`, the line it writes when the bound watched the agent END ON ITS OWN, and
+# `verdict=unknown`, the field's own default. `spawn-gate.sh` clears `finished` out of
+# `AGENT_BOUND_VERDICT` precisely because "empty means the agent finished on its own", so a truthiness
+# test here RE-ADMITTED the word the caller had filtered: a lane that failed its OWN work was written
+# `outcome=died reason=finished`, erasing the work-failure claim that is the entire point of the
+# attribution above and handing the census a death nothing killed. `reason=unknown` is the same defect
+# the other way round — a death that names no killer, which is the blindness #2833 was filed over.
+# Only the two verdicts that NAME A BOUND may classify the exit; any other value (a future word
+# included) means NO bound ended this lane, which is the fail-safe direction: the item's work keeps the
+# claim, and a bound kill that loses its verdict line is reported as a plain non-zero exit rather than
+# as an unnamed death.
+lane_bound_killer() {
+  local v="${AGENT_BOUND_VERDICT:-}"
+  if [ -z "$v" ]; then
+    v="$(lane_run_output | sed -n 's/.*\[lane-bound\] VERDICT verdict=\([a-z-]*\).*/\1/p' 2>/dev/null | tail -1)"
+  fi
+  case "$v" in
+    stalled|exceeded-wallclock) printf '%s\n' "$v" ;;
+    *)                         : ;;
+  esac
+}
 run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
@@ -959,7 +1087,28 @@ if [ "$AGENT_STARTED" = "0" ]; then
 elif [ "$rc" = "0" ]; then
   lane_outcome done "agent-exit-0"
 else
-  lane_outcome failed "agent-exit-$rc"
+  # ── ATTRIBUTION (#2833): WHO ended this lane, before calling it a work failure ──────────────────
+  # Order matters and is not interchangeable. A bound that ended the lane is a fact about the
+  # HARNESS (retrying on this box hits the same ceiling); transport is a fact about the BOX's data
+  # path (retrying is right); the work failing is a fact about the ITEM (retrying repeats it). Fold
+  # any of the first two into the third and the census reports a work failure for a lane that never
+  # got to work — which is the reading this issue was filed over.
+  LANE_KILLER="$(lane_bound_killer)"
+  LANE_ROTATIONS="$(lane_transport_rotations)"
+  if [ -n "${LANE_KILLER:-}" ]; then
+    # `exceeded-wallclock` / `stalled` — lane-bound.sh ended it and the verdict names the bound, the
+    # silence, the CPU delta and the signal (item 4 of #2833: "the kill reason must name the killer").
+    lane_outcome died "${LANE_KILLER}"
+    echo "[lane $N] ATTRIBUTED: the agent exited $rc because a BOUND ENDED THIS LANE (verdict=${LANE_KILLER}) — this is NOT a work failure, and the bound's own line above carries the elapsed/silence/CPU readings that decided it. Do not re-dispatch the same item to the same box unchanged: the bound fires again." >> "$O/logs/lane-$N.log"
+  elif [ "${LANE_ROTATIONS:-0}" -ge "${LANE_TRANSPORT_MIN_ROTATIONS:-3}" ] 2>/dev/null; then
+    # The model/provider was unreachable for this run: the agent's own transcript carries N pool
+    # rotations, i.e. N successful recoveries that were followed by another dead connection and
+    # finally by an exit that is not about the work. RETRYABLE — the reason token says so.
+    lane_outcome died "transport-unreachable:rc$rc:rotations=$LANE_ROTATIONS"
+    echo "[lane $N] ATTRIBUTED: the agent exited $rc after $LANE_ROTATIONS connection-pool rotation(s) in THIS run — the model/provider was unreachable, so this is a TRANSPORT death, NOT a work failure. Retryable: nothing about the item is implicated. Re-dispatch it (the pool rotation count is on the terminal line) rather than treating it as a failed attempt at the work. (agent-infra#2833)" >> "$O/logs/lane-$N.log"
+  else
+    lane_outcome failed "agent-exit-$rc"
+  fi
 fi
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh

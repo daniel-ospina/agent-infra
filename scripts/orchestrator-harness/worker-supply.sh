@@ -35,6 +35,11 @@
 # (worktree, brief, cap, kind). A supervisor that grew its own spawn logic would diverge from
 # `spawn-gate.sh`'s load/disk/brief gates and stop being a supply path at all — the same reason
 # `pr-doctor.dispatch()` routes through it. `worker-supply.test.sh` asserts the invoker set.
+# ⛔ AND THE BRIEF IT REPLAYS IS REVALIDATED FIRST (agent-infra#3958). Replaying a recorded argv replays
+# the recorded brief PATH, so an order whose cached brief the gate refuses would be refused `rc=80` on
+# every pass for ever. The invariant — a refused brief never reaches the dispatcher again — is stated
+# and implemented above `brief_verdict()`; it does NOT relax the gate, and this file never composes a
+# brief.
 #
 # ⛔ IT IS NOT A MERGE AUTHORITY. It never calls `gh`, never calls `admin-merge.sh`, never records a
 # review, never reaps or kills a worker. Its only actions are: READ the records, WRITE an offer through
@@ -71,6 +76,42 @@
 #                                          equal: a late refill costs an interval, a double spawn
 #                                          destroys a running worker.
 #
+# ── AN ORDER THE PASS CAN NEVER ACT ON AGAIN IS RETIRED, NOT DEFERRED FOR EVER (#4007) ────────
+# ⛔ THE DEFECT, MEASURED (2026-12-04). The order population only ever GROWS: `pr-doctor` writes a
+# `$O/bg/<name>.started` per spawn and nothing removes one, so a box held orders for PRs that had long
+# since MERGED -- 105 distinct order PR numbers, **105 not open**, and **0 orders for the 18 live PRs**.
+# Every pass then walked those fossils: the brief gate refused 72 of them (`rc=80`) on every pass, the
+# rest had spent their `MAX_REFILLS`, and the pass ended `deferred` (rc=6) for ever -- so the pool
+# could not say anything, a `live=` count could not become non-zero, and the log read as "quiet".
+# An order the pass can NEVER act on again is not a dead order waiting for supply; it is a record about
+# work that ended. It is RETIRED: written to `worker-supply-retired.tsv` (name, reason, and the mtime of
+# the record instance that was retired), excluded from both walks, and counted as `retired=` -- never
+# deleted, and never re-offered.
+# ⛔ RETIREMENT IS TTL-BOUNDED, SO IT CANNOT LOSE LIVE WORK. Only an order whose record is older than
+# `WORKER_SUPPLY_ORDER_TTL_S` (7 days) is eligible, and only in a state this path has already decided it
+# cannot supply: its refills are SPENT, the WORKTREE it names is gone, the BRIEF it names is gone, or its
+# brief the gate REFUSES. A fresh order -- including one whose worker simply died -- is never retired, so
+# the refill path is untouched. (The worktree/brief arms are the DOMINANT measured case: 80 orders, 0
+# worktrees present -- the deterministic `prd-<n>` repair trees had been reaped, which every pass logged
+# as "the worktree recorded for the order is gone" and could never act on.)
+# ⛔ AND IT IS REVERSIBLE WITHOUT A HUMAN. `retired_row()` matches the SAME `started` record instance
+# (mtime), and `pr-doctor.py` rewrites that file UNCONDITIONALLY on every spawn -- so if the PR is still
+# open, the composer's next order writes a NEW record, the row stops matching, and the order is supplied
+# again by itself. Retirement records a fact about an instance; it never shadows a live order.
+# ⛔ IT IS NOT A PR-STATE READER. This file still never calls `gh`: "the PR is closed" is not observable
+# here, and inferring it from the network on a 60 s clock would be a new failure mode (and a second
+# opinion about a queue the doctor owns). The pass instead retires what IT cannot act on and says so;
+# the PR-state half belongs to the composer that classified the PR.
+#
+# ── A SUPERVISOR THAT WROTE NOTHING IS NOT A QUIET ONE: `status` REPORTS STALE (#4007) ────────
+# The measured shape was a supervisor alive 16 days whose log had stopped 2 days ago -- and nothing
+# anywhere said so, because the process was up and `ActiveState` was `active`. `status` therefore
+# grades the AGE of the last completed pass record against `WORKER_SUPPLY_STALE_AFTER_S` and prints
+# `beat:  ok` / `beat:  STALE`, exiting **5** on STALE so a monitor reads a verdict and not a silence.
+# The bound defaults to `5 x INTERVAL_S`, floored at 300 s (five missed passes at the shipped 60 s
+# cadence is not a slow pass, it is a dead one); it is a knob because a cell's pass over a large pool
+# is slower than the Mac's.
+#
 # ── CAPACITY COMES FROM ONE PLACE ──────────────────────────────────────────────────────────────
 # `fix + review` is the machine's own budget: `MAX_FIX` + `MAX_REVIEW` from the environment, else from
 # the SAME launchd plist `pr-doctor.capacity()` reads (`com.eldato.orchestrator-loop.plist`), else the
@@ -90,7 +131,10 @@
 #                                 record — the record is the LAST REAL PASS's evidence, and a rehearsal
 #                                 that overwrote it would destroy the only durable answer to "what did
 #                                 the supervisor actually do?"
-#   worker-supply.sh status       the last pass record + a FRESH live count, exit 0
+#   worker-supply.sh status       the last pass record + a FRESH live count + the HEARTBEAT verdict.
+#                                 Exit 0 when the last completed pass is inside the staleness bound, 5
+#                                 when it is STALE (or no pass has ever written a record here) — a
+#                                 monitor gets a verdict instead of reading a stopped log as "quiet"
 #   worker-supply.sh --help
 #
 # Exit codes (the fleet vocabulary, kept identical on purpose):
@@ -99,10 +143,16 @@
 #      the pool itself could not be read: nothing was supplied and `unknown > 0` with nothing dead
 #   3  UNDELIVERED — a refill was ATTEMPTED and no worker took it (the dispatcher refused)
 #   4  ALREADY-RUNNING — the single-instance guard holds; nothing was touched
+#   5  STALE — `status` only: the last completed pass is older than the staleness bound (or no pass has
+#      ever run here), which is what a DEAD or WEDGED supervisor looks like from outside
 #   6  DEFERRED — dead orders are still dead after the pass: the budget is full, the order has spent
 #      its refills, or its record is un-replayable. A pass that re-offered SOME and then hit a bound is
 #      DEFERRED too (a verdict about what is left, not a pass) — `refilled>0` alone is not a clean
 #      pass, which is the doctor's `dispatched 0 of M` law. The record names which bound held it.
+#      "UN-REPLAYABLE" INCLUDES A REFUSED BRIEF (agent-infra#3958): an order whose cached brief the gate
+#      refuses is not re-offered at all — it is reported as needing REGENERATION by its composer, and
+#      the record's `stale_briefs=` counts it. It is NOT `3` (nothing was attempted) and it is NOT `0`
+#      (the order is still dead).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
@@ -112,12 +162,19 @@ O="${O:-$HOME/orchestrator}"
 STATE_DIR="${WORKER_SUPPLY_STATE_DIR:-$O/state}"
 BG_DIR="${WORKER_SUPPLY_BG_DIR:-$O/bg}"
 DISPATCH="${WORKER_SUPPLY_DISPATCH:-$O/nonblocking-dispatch.sh}"
+# The brief validator. EMPTY means "resolve the copy the dispatcher will judge with" (`brief_gate_path`,
+# the same ladder `spawn-gate.sh::brief_gate_lib` walks); the knob exists so a test can grade the
+# revalidation without a second copy of the gate. An override that is not a FILE is skipped, not obeyed.
+BRIEF_GATE="${WORKER_SUPPLY_BRIEF_GATE:-}"
+BRIEF_GATE_TIMEOUT="${WORKER_SUPPLY_BRIEF_GATE_TIMEOUT_S:-30}"  # bounds ONE gate call, not the pass
 PREFIX="${WORKER_SUPPLY_PREFIX:-prd-}"                 # the worker NAMESPACE it supplies
 INTERVAL_S="${WORKER_SUPPLY_INTERVAL_S:-60}"           # --loop cadence
 MAX_REFILLS="${WORKER_SUPPLY_MAX_REFILLS:-2}"          # re-offers per ORDER (a crash loop bound)
 SPAWN_CALL_TIMEOUT="${WORKER_SUPPLY_SPAWN_TIMEOUT_S:-120}"   # bounds the DISPATCHER, not the worker
 PROBE_TIMEOUT="${WORKER_SUPPLY_PROBE_TIMEOUT_S:-60}"   # bounds one `--status` probe
 STALE_SLACK_S="${WORKER_SUPPLY_STALE_SLACK_S:-300}"    # a `running` past cap+slack is only REPORTED
+RETIRE_TTL_S="${WORKER_SUPPLY_ORDER_TTL_S:-604800}"   # 7 d: an un-actionable order older than this is RETIRED
+STALE_AFTER_S="${WORKER_SUPPLY_STALE_AFTER_S:-0}"      # 0 = derive (5 x INTERVAL_S, floored at 300)
 LOCK_MAX_S="${WORKER_SUPPLY_LOCK_MAX_S:-900}"          # an unverifiable lock is taken over after this
 LOG_MAX_BYTES="${WORKER_SUPPLY_LOG_MAX_BYTES:-262144}"
 ORCH_PLIST="${WORKER_SUPPLY_ORCH_PLIST:-$HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist}"
@@ -131,7 +188,15 @@ DEFAULT_MAX_REVIEW=10
 
 LOCK_DIR="$STATE_DIR/worker-supply.lock"
 LEDGER="$STATE_DIR/worker-supply-offers.tsv"
+RETIRED="$STATE_DIR/worker-supply-retired.tsv"
 RECORD="$STATE_DIR/worker-supply.state"
+# ⛔ A PASS THAT IS STILL WORKING MUST NOT READ AS DEAD (review P2, round 2 on #4017). `$RECORD` only
+# advances at pass END, so a legitimately long pass (up to `cap x SPAWN_CALL_TIMEOUT` on the re-offer
+# walk, plus one PROBE_TIMEOUT per order on the census walk) left the previous pass's mtime on disk for
+# its whole duration and `status` called it STALE. The START of a real pass is therefore its own marker:
+# `status` reads the newest of the two, and a start marker that is ITSELF older than the bound is a
+# WEDGED pass, not a working one. Written by real passes only — `--dry-run` still writes NOTHING.
+PASS_BEAT="$STATE_DIR/worker-supply.pass-start"
 LOG="$STATE_DIR/worker-supply.log"
 
 # ── bounded probes: perl's alarm survives `exec`, which is why it is the bound ──────────────────
@@ -217,6 +282,16 @@ knob_num WORKER_SUPPLY_PROBE_TIMEOUT_S   "$PROBE_TIMEOUT"      60      pos || PR
 knob_num WORKER_SUPPLY_STALE_SLACK_S     "$STALE_SLACK_S"      300     any || STALE_SLACK_S=300
 knob_num WORKER_SUPPLY_LOCK_MAX_S        "$LOCK_MAX_S"         900     pos || LOCK_MAX_S=900
 knob_num WORKER_SUPPLY_LOG_MAX_BYTES     "$LOG_MAX_BYTES"      262144  pos || LOG_MAX_BYTES=262144
+knob_num WORKER_SUPPLY_BRIEF_GATE_TIMEOUT_S "$BRIEF_GATE_TIMEOUT" 30    pos || BRIEF_GATE_TIMEOUT=30
+knob_num WORKER_SUPPLY_ORDER_TTL_S        "$RETIRE_TTL_S"      604800  any || RETIRE_TTL_S=604800
+knob_num WORKER_SUPPLY_STALE_AFTER_S      "$STALE_AFTER_S"     0       any || STALE_AFTER_S=0
+# 0 means DERIVE, so the derived value can never be the thing an operator set to 0 by accident: five
+# missed passes at the shipped 60 s cadence is a dead supervisor, not a slow pass -- and a floor of 300 s
+# keeps a 1 s interval from turning every normal pass into a STALE verdict.
+if [ "$STALE_AFTER_S" -eq 0 ]; then
+  STALE_AFTER_S=$(( 5 * INTERVAL_S ))
+  [ "$STALE_AFTER_S" -lt 300 ] && STALE_AFTER_S=300
+fi
 case "$PREFIX" in
   ''|*[[:space:]]*)
     log_line "knob: WORKER_SUPPLY_PREFIX='$PREFIX' is empty or contains whitespace — using 'prd-' (the order glob would match nothing, and an empty queue reads as a clean pass)"
@@ -442,14 +517,140 @@ offer_append() { # <name> <sig> <verdict>
   return 0
 }
 
-write_record() { # <decision> <orders> <live> <dead> <unknown> <cap> <fix> <review> <refilled> <why> [<complete>]
+# ── RETIREMENT: A RECORD ABOUT ONE ORDER INSTANCE, NEVER A DELETE (agent-infra#4007) ────────────
+# The declared invariant is above the CAPACITY section; these are its three verbs. The ledger row is
+# `<epoch>\t<name>\t<reason>\t<record-mtime>` -- the FOURTH field is load-bearing: it names WHICH
+# instance of the order was retired, so a composer that re-orders the PR (rewriting the record, which
+# moves its mtime) un-retires the order with no human and no second bookkeeping surface.
+retired_row() { # <name> -> prints "<epoch>\t<reason>\t<record-mtime>" for the LAST row naming <name>, rc=1 if none
+  [ -f "$RETIRED" ] || return 1
+  awk -F'\t' -v n="$1" '$2==n { e=$1; r=$3; m=$4 } END { if (e=="") exit 1; printf "%s\t%s\t%s\n", e, r, m }' \
+    "$RETIRED" 2>/dev/null
+}
+
+# RETIRE_WHY is set when the order IS retired (the reason of its last row); RET_ROW the raw row.
+order_retired() { # <name> <started-file> -> 0 retired, 1 not retired
+  local name="$1" f="$2" row rm m
+  RETIRE_WHY=""; RET_ROW=""
+  row="$(retired_row "$name")" || return 1
+  [ -n "$row" ] || return 1
+  RET_ROW="$row"
+  rm="${row##*$'\t'}"
+  m="$(mtime_of "$f")"
+  case "${rm:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "${m:-}" ] && [ "$m" = "$rm" ] || return 1
+  RETIRE_WHY="$(printf '%s' "$row" | awk -F'\t' '{ print $2 }')"
+  return 0
+}
+
+retire_order() { # <name> <started-file> <reason> -> 0 written, 1 unwritable
+  local m
+  m="$(mtime_of "$2")"
+  case "${m:-}" in ''|*[!0-9]*) return 1 ;; esac   # an unrecordable instance is not retired: it would re-appear
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$3" "$m" >> "$RETIRED" 2>/dev/null || return 1
+  return 0
+}
+
+# ── THE BRIEF IS REVALIDATED BEFORE IT IS OFFERED AGAIN (agent-infra#3958) ──────────────────
+# ⛔ THE DEFECT, MEASURED. A re-offer replays the argv `nonblocking-dispatch.sh` recorded at ACCEPT
+# time, and one of those arguments is the brief PATH. So the SAME brief file is handed to the SAME
+# gate on every pass: the gate refuses it `rc=80`, the pass reports `72 re-offer(s) refused by the
+# dispatcher`, and it does that for ever — measured on this box 2026-11-11, pass after pass
+# (`orders=100 live=0/18 dead=83 … 72 re-offer(s) refused`, 537 such lines accumulated).
+# The GENERATOR is healthy: `pr-doctor.py:4338-4340` rewrites the brief UNCONDITIONALLY on every
+# spawn, so the fossils survive only because this path never reaches that code — 100 of the 100
+# orders recorded in `$O/bg` point at a brief the current gate refuses, while the briefs pr-doctor
+# has composed recently are admitted (`research contract rendered … admitted by 1 validator(s)`).
+#
+# THE INVARIANT: a brief the gate has REFUSED is never handed to the dispatcher again. A cache whose
+# validity is never checked is not a cache, it is a fossil — the "stale flag that records a past
+# state and is never revalidated" class, here on a dispatch path.
+#
+# ⛔ IT IS NOT FIXED BY RELAXING THE GATE. The `RESEARCH FIRST`/`PREVIOUS WORK` contract exists because
+# two lanes in one day acted on a false premise (#2258, #3484); a bypass here would restore exactly
+# that failure, so the refusal STANDS and this path stops offering the fossil instead.
+# ⛔ AND IT IS NOT FIXED BY COMPOSING A BRIEF HERE. A brief is an ORDER ("re-run the checks on this
+# head", "resolve this conflict") that `pr-doctor` derives from a classification of the PR AS IT
+# STANDS NOW; splicing a fresh contract block onto an 18-day-old order would hand a worker a
+# current-LOOKING brief for work the PR may no longer need. That is inventing work, which this file
+# refuses to do (`contract_note()`'s argument one layer over) — so the brief is skipped and REPORTED
+# as needing regeneration, and the one composer (`pr-doctor`) is named as the only thing that writes it.
+# ⛔ NO LEDGER ROW IS WRITTEN FOR A SKIP, deliberately: `refills_of()` counts rows per order, so a row
+# would spend one of the order's `MAX_REFILLS` — and a regeneration is not a failed worker. (Pinned by
+# the test: an order stays re-offerable after any number of skipped passes.)
+
+brief_gate_path() { # -> the copy the DISPATCHER will judge with, or rc=1 (nothing resolved)
+  local c
+  [ -n "$BRIEF_GATE" ] && [ -f "$BRIEF_GATE" ] && { printf '%s\n' "$BRIEF_GATE"; return 0; }
+  # The ladder is `spawn-gate.sh::brief_gate_lib`'s, in ITS order (`$O` first), because the verdict this
+  # path acts on has to come from the copy that will actually judge the re-offer. A copy that merely
+  # EXISTS somewhere else is not that copy — the 6h32m stall #2708 measured.
+  for c in "${O:-}/brief-gate.sh" "$HERE/brief-gate.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh" \
+           "${HOME:-}/.pi/agent/scripts/brief-gate.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# The gate's OWN WORDS, reduced to its `missing:` list: the teaching block is ~3.5 KB and this runs on
+# a 60 s clock, once per refused order. Nothing is paraphrased — the bullets are the gate's own text.
+brief_gate_missing() { # <gate output>
+  printf '%s\n' "$1" | awk '
+    /^\[brief-gate\][[:space:]]*missing:/ { f=1; next }
+    f && /^\[brief-gate\]/ { exit }
+    f && NF { sub(/^[[:space:]]+/, ""); s = (s == "" ? $0 : s "; " $0) }
+    END { print s }'
+}
+
+# 0 = ADMITTED · 80 = REFUSED (never re-offer unchanged) · anything else = NO VERDICT.
+# ⛔ A NO VERDICT FALLS THROUGH TO THE DISPATCHER, UNCHANGED. `brief-gate.sh` exits 78 when the
+# VALIDATOR is missing and this file's own bound answers 142; neither says anything about the BRIEF.
+# The dispatcher owns that refusal (it exits 78 itself, loudly), and converting an install fault into
+# "this order needs a new brief" would name the wrong fault — the `$O`-skew lesson (#2708, #2986).
+brief_verdict() { # <brief>
+  local g out rc
+  BRIEF_GATE_WHY=""; BRIEF_GATE_USED=""
+  if ! g="$(brief_gate_path)"; then
+    BRIEF_GATE_WHY="no brief-gate.sh on any resolved root (\$O, this directory, \$AGENT_INFRA_PATH, ~/.pi/agent/scripts)"
+    return 78
+  fi
+  BRIEF_GATE_USED="$g"
+  out="$(bounded "$BRIEF_GATE_TIMEOUT" bash "$g" --check "$1" worker 2>&1)"; rc=$?
+  case "$rc" in
+    0)  return 0 ;;
+    80) BRIEF_GATE_WHY="$(brief_gate_missing "$out")"
+        [ -n "$BRIEF_GATE_WHY" ] || BRIEF_GATE_WHY="refused, and the gate printed no missing list"
+        return 80 ;;
+    *)  BRIEF_GATE_WHY="rc=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+        return "$rc" ;;
+  esac
+}
+
+# ⛔ THE LOG IS AN EVENT STREAM, NOT A CLOCK — this file's own rule, one layer out. Emitting the same
+# regeneration line for every refused order on every 60 s pass is ~100k lines a day against a 256 KB
+# rotation, so the log would be rewritten about every 18 minutes and the pass that mattered would be
+# gone. The COUNT is the durable signal (it is in `$RECORD` and in the pass line, both re-read by
+# `status`); the per-order detail is emitted once per process. A restart re-emits it — which is the
+# right amount of repetition for a condition an operator has to fix.
+STALE_LOGGED=" "
+log_once() { # <key> <message>
+  case "$STALE_LOGGED" in *" $1 "*) return 0 ;; esac
+  STALE_LOGGED="$STALE_LOGGED$1 "
+  log_line "$2"
+  return 0
+}
+
+write_record() { # <decision> <orders> <live> <dead> <unknown> <cap> <fix> <review> <refilled> <why> [<complete>] [<stale_briefs>] [<retired>]
   local tmp="$RECORD.tmp"
   {
     printf 'ts=%s\n' "$(date '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'decision=%s\n' "$1"
-    printf 'orders=%s\nlive=%s\ndead=%s\nunknown=%s\ncomplete=%s\n' "$2" "$3" "$4" "$5" "${11:-0}"
+    printf 'orders=%s\nlive=%s\ndead=%s\nunknown=%s\ncomplete=%s\nretired=%s\n' "$2" "$3" "$4" "$5" "${11:-0}" "${13:-0}"
     printf 'capacity=%s\nmax_fix=%s\nmax_review=%s\n' "$6" "$7" "$8"
     printf 'refilled=%s\nmax_refills=%s\ninterval_s=%s\nprefix=%s\n' "$9" "$MAX_REFILLS" "$INTERVAL_S" "$PREFIX"
+    printf 'stale_briefs=%s\norder_ttl_s=%s\nstale_after_s=%s\n' "${12:-0}" "$RETIRE_TTL_S" "$STALE_AFTER_S"
     printf 'reason=%s\n' "${10}"
   } > "$tmp" 2>/dev/null || return 1
   mv -f "$tmp" "$RECORD" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
@@ -460,11 +661,16 @@ write_record() { # <decision> <orders> <live> <dead> <unknown> <cap> <fix> <revi
 DRY=0
 pass() {
   local plenv orders=0 live=0 dead=0 unknown=0 cap fix review refilled=0 why="" decision=clean prev=""
-  local complete=0
-  local n_offered=0 n_dead_total=0 refused=0 budget_full=0 exhausted=0 no_record=0
-  local f name wt prompt kind stamp wt_branch rec_branch capr sig hold
+  local complete=0 retired=0 retired_new=0 ret_note="" age=0 m_age=""
+  local n_offered=0 n_dead_total=0 refused=0 budget_full=0 exhausted=0 no_record=0 stale_brief=0
+  local f name wt prompt kind stamp wt_branch rec_branch capr sig hold bgrc stale_note prev_stale
+  local wt_now prompt_now ret_reason
 
   mkdir -p "$STATE_DIR" 2>/dev/null || { log_line "REFUSING: state dir $STATE_DIR is not writable"; return 2; }
+  # see PASS_BEAT: stamped BEFORE the walks, so a long pass is visibly working rather than silent
+  if [ "$DRY" = 0 ]; then
+    { date +%s > "$PASS_BEAT.tmp"; } 2>/dev/null && mv -f "$PASS_BEAT.tmp" "$PASS_BEAT" 2>/dev/null || true
+  fi
   plenv="$STATE_DIR/.worker-supply.plistenv"
   plist_env_dump "$ORCH_PLIST" "$plenv"
   fix="$(limit_of MAX_FIX "$DEFAULT_MAX_FIX" "$plenv")"
@@ -483,6 +689,12 @@ pass() {
     [ -f "$f" ] || continue
     orders=$(( orders + 1 ))
     name="$(field "$f" name)"; [ -n "$name" ] || name="$(basename "$f" .started)"
+    # ⛔ A RETIRED ORDER IS OUT OF THE POPULATION, NOT A MISSING ONE (agent-infra#4007). It is counted
+    # (`retired=`) and it is NOT probed: there is nothing to learn from a record about work that ended,
+    # and asking the dispatcher about it on every 60 s pass is what made a live count impossible to
+    # read. `order_retired` matches the RECORD INSTANCE, so a re-ordered PR is back in the population on
+    # the very next pass with no human action.
+    if order_retired "$name" "$f"; then retired=$(( retired + 1 )); continue; fi
     ask_status "$name" "$f"
     case "$STATUS_KIND" in
       LIVE)     live=$(( live + 1 )) ;;
@@ -496,8 +708,46 @@ pass() {
   for f in "$BG_DIR/$PREFIX"*.started; do
     [ -f "$f" ] || continue
     name="$(field "$f" name)"; [ -n "$name" ] || name="$(basename "$f" .started)"
+    if order_retired "$name" "$f"; then continue; fi   # already counted retired in the census walk
     ask_status "$name" "$f"
     [ "$STATUS_KIND" = DEAD ] || continue
+    # ⛔ AN ORDER THIS PASS CAN NEVER SUPPLY IS RETIRED, NOT DEFERRED FOR EVER (agent-infra#4007).
+    # The eligibility is deliberately NARROW: this path has already decided it cannot act on the order,
+    # AND the record is older than the TTL -- so a transient crash burst can never retire an order a
+    # later pass would have supplied. THREE un-actionable states qualify, named by the reason recorded:
+    #   refills-spent   its `MAX_REFILLS` are gone -- the branch below logs this one for ever
+    #   worktree-gone   the repair tree it names is not there -- the DOMINANT measured case (80 orders,
+    #                   0 worktrees present, 2026-12-04): every pass logged "the worktree recorded for the
+    #                   order is gone" and could not act. Before this arm that line was permanent.
+    #   brief-gone      the brief file it names is not there (same shape, one field over)
+    # `brief-refused` is the fourth, and it is decided where the gate is asked (below). The retired order
+    # leaves `dead` (nothing remains to wait for) and enters `retired`; no spawn, no gate call, no ledger
+    # row, and no log line per pass -- the count is the durable signal.
+    age=0
+    if m_age="$(mtime_of "$f")" && [ -n "$m_age" ]; then age=$(( $(date +%s) - m_age )); fi
+    ret_reason=""
+    if [ "$age" -gt "$RETIRE_TTL_S" ]; then
+      wt_now="$(field "$f" worktree)"; prompt_now="$(field "$f" prompt)"
+      if [ "$(refills_of "$name")" -ge "$MAX_REFILLS" ]; then ret_reason=refills-spent
+      elif [ -z "$wt_now" ] || [ ! -d "$wt_now" ]; then ret_reason=worktree-gone
+      elif [ -z "$prompt_now" ] || [ ! -f "$prompt_now" ]; then ret_reason=brief-gone
+      fi
+    fi
+    if [ -n "$ret_reason" ]; then
+      if [ "$DRY" = 1 ]; then
+        log_line "DRY-RUN would RETIRE $name (reason=$ret_reason) — its record is ${age}s old (TTL ${RETIRE_TTL_S}s) and no pass can act on it again"
+        retired_new=$(( retired_new + 1 )); retired=$(( retired + 1 )); dead=$(( dead - 1 ))
+      elif retire_order "$name" "$f" "$ret_reason"; then
+        retired_new=$(( retired_new + 1 )); retired=$(( retired + 1 )); dead=$(( dead - 1 ))
+        log_line "$name: RETIRED (reason=$ret_reason) — its record is ${age}s old (TTL ${RETIRE_TTL_S}s) and no pass can act on it again. It leaves the pool. The composer (pr-doctor.py) re-orders the PR with a fresh record and a fresh worktree/brief if it is still open, which un-retires it (agent-infra#4007)"
+      else
+        # ⛔ AN UNWRITABLE RETIREMENT IS SAID OUT LOUD (review P2 on #4017): the order stays `dead` from the
+        # census walk, so the pass stays `deferred` -- conservative, but the REASON the fossil is still
+        # there was invisible, which is the "state nobody can act on" class this file keeps re-learning.
+        log_once "$name:retire-failed" "$name: RETIREMENT FAILED (reason=$ret_reason) — $RETIRED could not be written; the order stays dead and the pass stays DEFERRED until the state dir is writable"
+      fi
+      continue
+    fi
     if [ "$live" -ge "$cap" ]; then budget_full=$(( budget_full + 1 )); continue; fi
     if [ "$(refills_of "$name")" -ge "$MAX_REFILLS" ]; then
       exhausted=$(( exhausted + 1 ))
@@ -548,6 +798,49 @@ pass() {
       log_line "$name: not re-offered — this exact spawn instance (started=$sig) was already re-offered once"
       continue
     fi
+    # ⛔ THE BRIEF MUST STILL SATISFY THE GATE THAT WILL JUDGE IT (#3958) — the invariant is declared
+    # above `brief_verdict`. It runs AFTER the cheap skips (an exhausted, held or already-offered order
+    # never costs a subprocess) and BEFORE the dry-run branch, so a rehearsal tells the truth about the
+    # same orders a real pass would refuse.
+    brief_verdict "$prompt"; bgrc=$?
+    if [ "$bgrc" = 80 ]; then
+      # ⛔ A REFUSED BRIEF OLDER THAN THE TTL IS A FOSSIL, AND IT IS RETIRED RATHER THAN REPORTED FOR EVER
+      # (agent-infra#4007). #3958 made this pass STOP replaying the refused brief -- correct, and it left
+      # the order in the pool for ever: measured 2026-12-04, 72 orders were refused on EVERY pass and the
+      # pass could never be clean. Past the TTL the composer has had a week of passes to rewrite the brief
+      # and has not, so the record describes work that is no longer being ordered. Retirement is still
+      # reversible by construction: a new record from the composer un-retires it on the next pass.
+      if [ "$age" -gt "$RETIRE_TTL_S" ]; then
+        if [ "$DRY" = 1 ]; then
+          log_line "DRY-RUN would RETIRE $name — the brief recorded for the order is REFUSED by the brief gate (rc=80) and its record is ${age}s old (TTL ${RETIRE_TTL_S}s)"
+          retired_new=$(( retired_new + 1 )); retired=$(( retired + 1 )); dead=$(( dead - 1 ))
+        elif retire_order "$name" "$f" brief-refused; then
+          retired_new=$(( retired_new + 1 )); retired=$(( retired + 1 )); dead=$(( dead - 1 ))
+          log_line "$name: RETIRED — the brief recorded for the order is REFUSED by the brief gate (rc=80) and the record is ${age}s old (TTL ${RETIRE_TTL_S}s), so this supervisor has been unable to re-offer it for longer than the TTL. It leaves the pool. The composer (pr-doctor.py) writes a fresh brief and a fresh record if the PR is still open, which un-retires it (agent-infra#3958, #4007): $BRIEF_GATE_USED says: $(printf '%s' "$BRIEF_GATE_WHY" | cut -c1-300)"
+        else
+          # ⛔ AN UNWRITABLE RETIREMENT IS SAID OUT LOUD HERE TOO (review P3, round 2 on #4017): without
+          # this arm the order was skipped SILENTLY -- no log line, and the `continue` also skipped the
+          # `stale_brief` count, so the record's durable `stale_briefs=` lost a fossil the previous
+          # release reported as `REGENERATION REQUIRED`. A failed retirement is still a REFUSED BRIEF.
+          stale_brief=$(( stale_brief + 1 ))
+          log_once "$name:retire-failed" "$name: RETIREMENT FAILED (reason=brief-refused) — $RETIRED could not be written, so this fossil stays in the pool; it is counted in stale_briefs= and still needs REGENERATION by pr-doctor: $(printf '%s' "$BRIEF_GATE_WHY" | cut -c1-200)"
+        fi
+        continue
+      fi
+      # NOT A DISPATCH ATTEMPT, so it is not `refused`, nothing is written to the ledger, and the order
+      # keeps its refills. What it is: a brief that must be REGENERATED by its composer.
+      stale_brief=$(( stale_brief + 1 ))
+      if [ "$DRY" = 1 ]; then
+        log_line "DRY-RUN would NOT re-offer $name — the brief recorded for the order is REFUSED by the brief gate (rc=80) and re-offering it would replay it unchanged; REGENERATION REQUIRED ($BRIEF_GATE_USED says: $(printf '%s' "$BRIEF_GATE_WHY" | cut -c1-300))"
+      else
+        log_once "$name:stale" "$name: NOT re-offered — the brief recorded for the order is REFUSED by the brief gate (rc=80), and re-offering it would replay the same file the gate keeps refusing. REGENERATION REQUIRED: $BRIEF_GATE_USED says: $(printf '%s' "$BRIEF_GATE_WHY" | cut -c1-300). The composer is pr-doctor.py, which rewrites $prompt on its next spawn for this PR; this supervisor neither composes nor edits a brief (agent-infra#3958)"
+      fi
+      continue
+    fi
+    if [ "$bgrc" != 0 ]; then
+      # NO VERDICT: say so, and let the DISPATCHER own the refusal (see `brief_verdict`).
+      log_once "$name:unvalidated" "$name: the brief could not be revalidated before this offer ($BRIEF_GATE_WHY) — handing the offer to the dispatcher, which owns this refusal"
+    fi
     if [ "$DRY" = 1 ]; then
       log_line "DRY-RUN would re-offer $name in $wt (kind=$kind cap=${capr}s) — the order's worker is dead"
       n_offered=$(( n_offered + 1 )); refilled=$(( refilled + 1 ))
@@ -589,19 +882,35 @@ pass() {
   # `dispatched 0 of M` defect one layer down: a bounded pass reported as a complete one. So ANY order
   # still dead after both walks is DEFERRED (rc=6) and the reason names the bound that held it; only a
   # pass with nothing left dead may call itself refilled.
+  # ⛔ A SKIPPED FOSSIL IS A REASON THE PASS DID NOT SUPPLY, SO IT MUST APPEAR IN EVERY ARM THAT SAYS
+  # WHY (#3958). It rides in the `why` string and in the record's `stale_briefs=` so `status` — the
+  # durable answer — names it without the log.
+  [ "$stale_brief" -gt 0 ] && stale_note="$stale_brief order(s) had a brief the gate REFUSES — REGENERATION REQUIRED by pr-doctor (never re-offered unchanged, and no refill spent)"
+  [ "$retired_new" -gt 0 ] && ret_note="$retired_new order(s) RETIRED this pass — un-actionable (spent refills / worktree gone / brief gone or refused, record older than the ${RETIRE_TTL_S}s TTL); $retired retired in the population, out of the refill walk"
   if [ "$orders" -eq 0 ]; then
     decision=idle; why="no $PREFIX orders in $BG_DIR — nothing to supply (a pass that never placed an order leaves no record to refill)"
   elif [ "$refused" -gt 0 ]; then
-    decision=refused; why="$refused re-offer(s) refused by the dispatcher ($refilled accepted first)"
+    decision=refused; why="$refused re-offer(s) refused by the dispatcher ($refilled accepted first)${stale_note:+; $stale_note}"
   elif [ "$dead" -gt 0 ]; then
     decision=deferred
     local held=""
     [ "$budget_full" -gt 0 ] && held="$held, budget full ($live/$cap live) held $budget_full"
     [ "$exhausted" -gt 0 ] && held="$held, $exhausted spent their $MAX_REFILLS refill(s)"
     [ "$no_record" -gt 0 ] && held="$held, $no_record had no replayable record"
+    [ "$stale_brief" -gt 0 ] && held="$held, $stale_note"
     why="$refilled of $n_dead_total re-offered; $dead still dead${held}"
+  elif [ "$retired_new" -gt 0 ] && [ "$refilled" -eq 0 ] && [ "$unknown" -eq 0 ]; then
+    # ⛔ RETIRING IS A SUPPLY OUTCOME, NOT A NO-OP: the pool it walked is now action-free, so the pass is
+    # clean (rc=0) and SAYS what it did. Before #4007 this same pass was `deferred` (rc=6) for ever and
+    # `live=` could never become non-zero, which is the "quiet" a stopped log also produces.
+    # ⛔ AND A RETIREMENT MAY NOT BUY A CLEAN PASS OVER READS THAT FAILED (review P1 on #4017, reproduced):
+    # this arm sat ABOVE the `unreadable` arm, so a pool of two unanswerable probes plus ONE retirable
+    # fossil printed `decision=retired` and exited 0 — "nothing supplied, two reads not taken" reported as
+    # healthy, which is exactly the #2896 round-3 defect the `unreadable` arm exists to refuse. Retirement
+    # is a fact about orders we COULD read, so it only decides the verdict when every read was taken.
+    decision=retired; why="$retired_new un-actionable order(s) retired; nothing left to supply ($live/$cap live, $retired retired${stale_note:+; $stale_note})"
   elif [ "$refilled" -gt 0 ]; then
-    decision=refilled; why="$refilled of $n_dead_total dead order(s) re-offered"
+    decision=refilled; why="$refilled of $n_dead_total dead order(s) re-offered${stale_note:+; $stale_note}"
   elif [ "$live" -eq 0 ] && [ "$unknown" -gt 0 ]; then
     # ⛔ A PASS THAT SUPPLIED NOTHING BECAUSE IT COULD NOT READ THE POOL IS NOT A CLEAN PASS (review
     # #2896 round 3). Every UNKNOWN path used to fall through to the `clean` arm below, so a pass whose
@@ -612,24 +921,27 @@ pass() {
     # nothing established dead, and at least one read we could not take.
     decision=unreadable; why="no order could be supplied and $unknown read(s) could not be taken ($live/$cap live, $complete complete)"
   else
-    decision=clean; why="no dead order to refill ($live/$cap live, $complete complete, $unknown unknown)"
+    decision=clean; why="no dead order to refill ($live/$cap live, $complete complete, $unknown unknown, $retired retired)"
   fi
+  [ -n "$ret_note" ] && why="$why; $ret_note"
   # ⛔ A DRY RUN WRITES NO RECORD AND EXITS 0 (found by review). `$RECORD` is the LAST REAL PASS's
   # evidence — the durable answer to "what did the supervisor actually do?" — and a rehearsal that
   # overwrote it (its `refilled=` counting would-is, its `ts=` claiming a pass that never happened)
   # destroys exactly that. The dry run's verdict goes to stdout and nowhere else.
   if [ "$DRY" = 1 ]; then
-    log_line "DRY-RUN pass: decision=$decision orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown would-refill=$refilled — $why (no record, no ledger row, nothing spawned)"
+    log_line "DRY-RUN pass: decision=$decision orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown retired=$retired would-retire=$retired_new would-refill=$refilled stale_briefs=$stale_brief — $why (no record, no ledger row, nothing spawned)"
     return 0
   fi
   prev="$(awk -F= '$1=="decision"{ print $2; exit }' "$RECORD" 2>/dev/null || true)"
-  write_record "$decision" "$orders" "$live" "$dead" "$unknown" "$cap" "$fix" "$review" "$refilled" "$why" "$complete"
+  prev_stale="$(awk -F= '$1=="stale_briefs"{ print $2; exit }' "$RECORD" 2>/dev/null || true)"
+  write_record "$decision" "$orders" "$live" "$dead" "$unknown" "$cap" "$fix" "$review" "$refilled" "$why" "$complete" "$stale_brief" "$retired"
   # ⛔ THE LOG IS AN EVENT STREAM, NOT A CLOCK. An unchanged `idle`/`clean` pass writes NOTHING: a
   # 60 s service logging `nothing to do` 1,440 times a day is noise that hides the pass that mattered,
   # and the last-pass record (`$RECORD`, with its own `ts=`) is the heartbeat a reader checks instead.
-  # A refill and every refusal always log.
-  if [ "$decision" != "$prev" ] || [ "$refilled" -gt 0 ] || [ "$refused" -gt 0 ]; then
-    log_line "pass: $decision — orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown refilled=$refilled — $why"
+  # A refill and every refusal always log; so does a CHANGE in the fossil count (the per-order lines are
+  # emitted once per process — see `log_once`), because a supply outage whose size moves is news.
+  if [ "$decision" != "$prev" ] || [ "$refilled" -gt 0 ] || [ "$refused" -gt 0 ] || [ "$stale_brief" != "${prev_stale:-0}" ] || [ "$retired_new" -gt 0 ]; then
+    log_line "pass: $decision — orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown retired=$retired refilled=$refilled — $why"
   fi
 
   case "$decision" in
@@ -649,7 +961,8 @@ pass() {
 
 # ── status ───────────────────────────────────────────────────────────────────────────────────
 show_status() {
-  local orders=0 live=0 dead=0 unknown=0 complete=0 f name
+  local orders=0 live=0 dead=0 unknown=0 complete=0 retired=0 f name
+  local rc=0 m_age age beat=""
   if [ -f "$RECORD" ]; then
     echo "record: $RECORD"
     awk '{ printf "  %s\n", $0 }' "$RECORD"
@@ -661,6 +974,7 @@ show_status() {
     [ -f "$f" ] || continue
     orders=$(( orders + 1 ))
     name="$(field "$f" name)"; [ -n "$name" ] || name="$(basename "$f" .started)"
+    if order_retired "$name" "$f"; then retired=$(( retired + 1 )); continue; fi
     ask_status "$name" "$f"
     case "$STATUS_KIND" in LIVE) live=$(( live + 1 ));; COMPLETE) complete=$(( complete + 1 ));; DEAD) dead=$(( dead + 1 ));; *) unknown=$(( unknown + 1 ));; esac
   done
@@ -669,17 +983,53 @@ show_status() {
   fix="$(limit_of MAX_FIX "$DEFAULT_MAX_FIX" "$plenv")"
   review="$(limit_of MAX_REVIEW "$DEFAULT_MAX_REVIEW" "$plenv")"
   cap=$(( fix + review ))
-  echo "now:   orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown (fix=$fix review=$review)"
+  echo "now:   orders=$orders live=$live/$cap dead=$dead complete=$complete unknown=$unknown retired=$retired (fix=$fix review=$review)"
+  # ⛔ THE HEARTBEAT IS THE ONE READING THIS VERB EXISTS TO GIVE (agent-infra#4007). The measured shape
+  # was a supervisor alive for 16 days whose log had stopped two days earlier: every derived number read
+  # "quiet" and nothing reported the ABSENCE. A record that has not been rewritten within the staleness
+  # bound is what a DEAD or WEDGED supervisor looks like from outside, so it is named `STALE` and it
+  # EXITS 5 -- a monitor that reads the code (a lane, `set -e`, an activation grid) gets a verdict rather
+  # than an `ActiveState=active` over a loop that stopped passing.
+  # ⛔ WHICH SURFACE WON IS TRACKED EXPLICITLY, NEVER RE-DERIVED BY COMPARING THEM (review P3, round 3 on
+  # #4017, reproduced). Both mtimes are WHOLE SECONDS, and a pass that starts and finishes inside one
+  # second leaves `pass_m == rec_m`: comparing `pass_m` against `newest` then reported a COMPLETED pass as
+  # "IN PROGRESS" and suppressed the completed-pass age — the one number this verb exists to print — on a
+  # perfectly normal idle box. `beat_src` is set where the choice is made and nowhere else.
+  local rec_m pass_m newest beat_src=record
+  rec_m="$(mtime_of "$RECORD")"; pass_m="$(mtime_of "$PASS_BEAT")"
+  case "${rec_m:-}" in ''|*[!0-9]*) rec_m="" ;; esac
+  case "${pass_m:-}" in ''|*[!0-9]*) pass_m="" ;; esac
+  newest="${rec_m:-}"
+  if [ -n "$pass_m" ] && { [ -z "$newest" ] || [ "$pass_m" -gt "$newest" ]; }; then newest="$pass_m"; beat_src=pass; fi
+  if [ -n "$newest" ]; then
+    age=$(( $(date +%s) - newest ))
+    if [ "$age" -gt "$STALE_AFTER_S" ]; then
+      if [ "$beat_src" = pass ]; then
+        beat="STALE — a pass STARTED ${age}s ago and has not finished, over the ${STALE_AFTER_S}s bound: the process is WEDGED (or died mid-pass), not working"
+      else
+        beat="STALE — the last completed pass was ${age}s ago, over the ${STALE_AFTER_S}s bound: the process that should be passing is DEAD or WEDGED, not idle"
+      fi
+      rc=5
+    elif [ "$beat_src" = pass ]; then
+      beat="ok — a pass is IN PROGRESS (started ${age}s ago; the completed-pass record updates when it ends, bound ${STALE_AFTER_S}s)"
+    else
+      beat="ok — last completed pass ${age}s ago (bound ${STALE_AFTER_S}s)"
+    fi
+  else
+    beat="STALE — no pass has EVER written $RECORD or $PASS_BEAT here (bound ${STALE_AFTER_S}s); a supervisor whose record is absent has supplied nothing, and this box cannot tell a first boot from a death"
+    rc=5
+  fi
+  echo "beat:  $beat"
   # …and the knobs the process ACTUALLY resolved (post-validation): the unit renders what was asked for,
   # this line is what is enforced — the two are different facts when an override was rejected.
-  echo "knobs: interval_s=$INTERVAL_S max_refills=$MAX_REFILLS prefix=$PREFIX"
-  echo "paths: dispatcher=$DISPATCH bg=$BG_DIR ledger=$LEDGER log=$LOG"
+  echo "knobs: interval_s=$INTERVAL_S max_refills=$MAX_REFILLS prefix=$PREFIX order_ttl_s=$RETIRE_TTL_S stale_after_s=$STALE_AFTER_S"
+  echo "paths: dispatcher=$DISPATCH bg=$BG_DIR ledger=$LEDGER retired=$RETIRED log=$LOG"
   if [ -d "$LOCK_DIR" ]; then
     echo "lock:  HELD by pid $(cat "$LOCK_DIR/pid" 2>/dev/null || echo '<unknown>') ($LOCK_DIR)"
   else
     echo "lock:  free"
   fi
-  return 0
+  return "$rc"
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────────────────────
@@ -699,7 +1049,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$MODE" in
-  status) show_status; exit 0 ;;
+  status) show_status; exit $? ;;
   pass)
     lock_take || { rc=$?; [ "$rc" = 2 ] && exit 2; exit 4; }
     trap 'lock_release' EXIT

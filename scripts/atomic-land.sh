@@ -991,7 +991,13 @@ sync_review_registry() {
   # ⛔ AND THE EXIT IS TAKEN INSIDE THE SUBSTITUTION: `${PIPESTATUS[0]}` read AFTER the assignment
   # names the ASSIGNMENT's status, not the pipeline's (measured: a sync exiting 4 was reported rc=0,
   # i.e. CONVERGED — a false PASS on the one signal that says the fleet's records are UNKNOWN).
-  out="$( bash "$sync" union 2>&1 | tee /dev/stderr; exit "${PIPESTATUS[0]}" )" || rc=$?
+  # ⛔ `--dir` IS PASSED EXPLICITLY: without it the union takes `REGISTRY_SYNC_DIR` from AMBIENT env
+  # while `read_record` below reads `$HOME/.pi/agent/reviews` unconditionally. An exported
+  # `REGISTRY_SYNC_DIR` in a lane shell would then converge a directory the gate NEVER READS and
+  # still report `wrote=N` at rc 0 — a false "synced" about the gate's own registry, which is the
+  # false-converged class this whole change exists to delete (#2510 P2).
+  # `cloud-cell-bringup.sh` passes it explicitly for the same reason.
+  out="$( bash "$sync" union --dir "$HOME/.pi/agent/reviews" 2>&1 | tee /dev/stderr; exit "${PIPESTATUS[0]}" )" || rc=$?
   case "$rc" in
     0) log_line "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
        # A converged run can still carry per-record notices, and this arm used to drop every one of

@@ -104,6 +104,7 @@ WRAPPED: Tuple[Tuple[str, str, str, str], ...] = (
     ("pr_state", "ORCH_MCP_PR_STATE", "tools/fleet/pr_state.py", "python"),
     ("claim_lanes", "ORCH_MCP_CLAIM_LANES", "tools/fleet/claim_lanes.py", "python"),
     ("liveness", "ORCH_MCP_LIVENESS", "tools/fleet/liveness.py", "python"),
+    ("orphan_reap", "ORCH_MCP_ORPHAN_REAP", "scripts/orphan-reap.py", "python"),
     ("nonblocking_dispatch", "ORCH_MCP_DISPATCH",
      "scripts/orchestrator-harness/nonblocking-dispatch.sh", "bash"),
     ("record_review", "ORCH_MCP_RECORD_REVIEW", "scripts/record-review.sh", "bash"),
@@ -139,6 +140,9 @@ TOOLS: List[Dict[str, Any]] = [
             "unfinished lane. `EXPIRED` is DERIVED from the record's lease — never written. "
             "`liveness: true` adds the LANE-STATE-DECISION-TREE reading per lane (steps 1-4 as "
             "`tools/fleet/liveness.py::evaluate`, step 6 as the same function applied to the child); "
+            "`pool: true` adds the `pi` PROCESS population — the lanes that hold a record and the ones "
+            "that hold none — because a lane the registry never recorded is still a process on this "
+            "box. "
             "`tree: true` includes the child nodes. An unreadable registry returns UNMEASURED(<cmd> "
             "+ <error>), NEVER an empty list: unknown is not zero. Read-only."
         ),
@@ -152,6 +156,11 @@ TOOLS: List[Dict[str, Any]] = [
                 "liveness": {"type": "boolean",
                              "description": "add the decision-tree reading (one fleet sample; "
                                             "costs one `lane-status.py --json --sample 2`)"},
+                "pool": {"type": "boolean",
+                         "description": "add the `pi` PROCESS pool — the population no session store "
+                                        "can contain (`pi -p --no-session` leaves no transcript, #1777). "
+                                        "Costs one CPU sample window (~15 s). Omitted, the payload "
+                                        "says UNMEASURED rather than reporting zero"},
                 "tree": {"type": "boolean",
                          "description": "also verdict each lane's `task` child with the SAME function"},
             },
@@ -900,6 +909,39 @@ def parse_json(ran: Ran, what: str) -> Tuple[Optional[Any], Optional[str]]:
 # `FINDING-lane-classifier-ignores-task-children` defect the step exists to fix.
 CHILD_ABANDON_S = 30 * 60
 
+# ── the `pi` PROCESS pool: the population no session store can contain (#1777, #2921) ──────────
+# ⛔ WHY IT IS A DELTA ON `lane.list` AND NOT A THIRTEENTH NAME: #3382 §5.9 sanctions exactly this
+# shape ("EXPRESS AS A DELTA, not a new name") for a capability a shipped name can already answer a
+# wider version of. "Which lanes exist" answered from the REGISTRY alone is a partial answer: an
+# orchestrator lane runs `pi -p --no-session`, so it writes no transcript and no cmux store record and
+# is absent from every session-store population BY CONSTRUCTION. Measured 2026-10-27: 29 such
+# processes held 2.64 GB and an hour of hand-measurement was the only instrument that could see them.
+# The census itself is `scripts/orphan-reap.py --pool pi --json` — the pool's OWN owner, whose four
+# states come from `tools/fleet/liveness.py::evaluate`. This server adds NO predicate, NO store and NO
+# second vocabulary: it wraps, and it declares what the wrap could not read.
+PI_POOL = "pi-process-pool"
+PI_POOL_DECLARATION: Dict[str, Any] = {
+    "population": PI_POOL,
+    "what": "every live `pi` process on this box, whether or not any population claims it",
+    "why_it_is_needed": (
+        "an orchestrator lane runs `pi -p --no-session`, so it writes NO transcript and no cmux store "
+        "record: it is absent from every session-store population by construction (#1777). The "
+        "registry records the lanes a LAUNCHER started; a process whose launcher is gone holds none"),
+    "states": "LIVE | PARKED-REAPABLE | KEEP-HUMAN | UNVERIFIABLE (orphan-reap.py's four)",
+    "verdict_source": ("tools/fleet/liveness.py::evaluate — the ONE liveness predicate; this tool adds "
+                       "no second one and re-labels nothing"),
+    "cpu_basis": (
+        "`cpu_delta` is a SHORT WINDOW and is never progress on its own; `etime` (age) plus the "
+        "cumulative `time=` carry the whole-life duty cycle — 70 s of CPU over 23 h was once reported "
+        "as 'changed CPU' by a 30 s sample"),
+    "abstention": (
+        "`counts: null` + `error` is UNREADABLE and is NEVER '0 to reap'; a `UNVERIFIABLE` row is a "
+        "process this read could not establish, which is not a clean row"),
+    "absent_means_nothing": (
+        "a process missing from this census is not evidence about that process: it was not read"),
+    "acts": "nothing — the wrapper is a DRY-RUN census; `--apply` is the operator's, never this surface's",
+}
+
 
 class Liveness:
     """The decision tree, applied to a registry record.
@@ -1176,6 +1218,44 @@ class Registry:
     def unmeasured(self) -> str:
         return "UNMEASURED(resolve lane_registry.py + %s)" % (self.error or "unknown failure")
 
+    # ── the `pi` PROCESS pool (a delta on lane.list, not a thirteenth name) ──
+    POOL_NOT_REQUESTED = (
+        "UNMEASURED(pool + not requested: the `pi` process census costs one CPU sample window "
+        "(~15 s) — ask with pool:true). A registry answer is not a statement about processes no "
+        "registry records")
+
+    def pool(self) -> Any:
+        """Wrap `orphan-reap.py --pool pi --json` — the pool's owner, and its ONE verdict function.
+
+        ⛔ EVERY FAILURE MODE HERE KEEPS ITS OWN NAME. `counts: null` (the census could not be read) is
+        an abstention, never `{LIVE: 0, ...}`; a non-JSON document from a successful run is a PARSE
+        failure, never "the command failed"; and a missing module names the module. Collapsing any of
+        the three into a zero is the FALSE CLEAN reading that hid this population in the first place.
+        """
+        block: Dict[str, Any] = {"population": PI_POOL, "declaration": PI_POOL_DECLARATION,
+                                 "source": "scripts/orphan-reap.py --pool pi --json"}
+        if self.mods.path("orphan_reap") is None:
+            block["unmeasured"] = "UNMEASURED(resolve orphan-reap.py + %s)" % (
+                self.mods.errors.get("orphan_reap") or "not found")
+            return block
+        ran = run_module(self.mods, "orphan_reap", ["--pool", "pi", "--json"], timeout=180.0)
+        data, why = parse_payload(ran, "the `pi` process pool census")
+        if data is None:
+            block["unmeasured"] = why
+            block["exit_code"] = ran.rc
+            return block
+        if not isinstance(data, dict) or data.get("counts") is None:
+            named = data.get("error") if isinstance(data, dict) else None
+            block["unmeasured"] = "UNMEASURED(pi pool census + %s)" % (
+                named or "no counts in the document: a census that read nothing is not a census of zero")
+            block["exit_code"] = ran.rc
+            return block
+        block.update(data)
+        block["measured_at"] = _now()
+        block["population"] = PI_POOL
+        block["verdict_source"] = PI_POOL_DECLARATION["verdict_source"]
+        return block
+
     # ── lane.list ──
     def list(self, args: Dict[str, Any]) -> Tuple[bool, Any]:
         if self.module is None:
@@ -1201,6 +1281,11 @@ class Registry:
         payload["registry_sha256"] = self.sha256
         payload["instrument_sha256"] = instrument_sha(self.mods)
         self._attach(payload, rows, args)
+        # ⛔ THE POPULATION IS A SEPARATE AXIS FROM THE RECORDS, so it is reported even when the records
+        # answer fine — and when it is not asked for, the key says UNMEASURED rather than going absent
+        # (`liveness` is the precedent: an omitted reading is not a clean one).
+        payload["pool_requested"] = bool(args.get("pool"))
+        payload["pool"] = self.pool() if args.get("pool") else self.POOL_NOT_REQUESTED
         # ⛔ `local-only` IS AN ERROR ON THIS SURFACE even though records were read: the question is about
         # the FLEET, and a fallback to this box's own copies answers a narrower one.
         return payload.get("coverage") != "shared", payload

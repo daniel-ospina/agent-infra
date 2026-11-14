@@ -2990,6 +2990,186 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its helpers are extracted from
   fi
   unset -f cmux tmux kill
 fi
+# ── 15a) THE REAP PASS BUILDS THE CENSUS ONCE, NOT ONCE PER CANDIDATE (#3585) ──────────────────
+# MEASURED 2026-11-10 on the incident box: `reap_stale_workers` read the census once for the pass and
+# then AGAIN per candidate (`wt_alive "$_cn"`, added by #3756), and because the memo's window was
+# shorter than its own build NOT ONE of those reads was a hit. 89 candidates ⇒ 90 full census builds:
+# the pass took 27 min where cycle 117's own `stages=reap:12` records 12 s.
+# THE ASSERTION IS A COUNT of `cmux tree --json` invocations (the census's one daemon read), driven
+# against the SHIPPED reaper with a counting daemon. `WT_TABLE_TTL=0` on purpose: the memo is OFF, so
+# this measures the PASS's own reads and cannot be satisfied by a cache (that is the sibling arm in
+# worker-terminal.test.sh §K2).
+# ⛔ COMPARED AS A NUMBER, NEVER AS A SUBSTRING (measured while writing this). The first cut asserted
+# `case "$out" in *"calls=1"*)` — and `calls=17` MATCHES that, so the arm read GREEN on the pre-fix
+# code whose whole defect is 1 + candidates reads. A gate that cannot fail is not a gate.
+if need "$TMP/reapw.sh" "the reaper is extracted from the shipped loop"; then
+  RB="$TMP/RB"; rm -rf "$RB"; mkdir -p "$RB/state" "$RB/logs" "$RB/bin"
+  _rbw=""; _rbt=""; _rbi=0
+  _rb_rec() { # <name> — one record + its two stub rows, so the daemon reports it RUNNING
+    printf 'kind=terminal\nid=term_%s\nworkspace=ws_%s\ncwd=/tmp\n' "$1" "$1" > "$RB/state/worker-$1"
+    _rbw="$_rbw${_rbw:+,}{\"id\":\"ws_$1\",\"name\":\"wt-$1\"}"
+    _rbt="$_rbt${_rbt:+,}{\"id\":\"term_$1\",\"running\":true}"
+  }
+  # filler: a census with the shape of a real one (the build's cost is per ROW, and so is the cost of
+  # getting this wrong) — no logs, so none of them is a candidate.
+  while [ "$_rbi" -lt 40 ]; do
+    _rbi=$(( _rbi + 1 )); _rb_rec "chain-$_rbi"
+  done
+  # candidates: stale records whose SURFACE THE DAEMON REPORTS RUNNING, so every one is SPARED and
+  # `wt_close` (which owes its own post-close verification read) is never in the path — what is
+  # measured is the per-candidate census read and nothing else.
+  _rbi=0
+  while [ "$_rbi" -lt 6 ]; do
+    _rbi=$(( _rbi + 1 )); _rb_rec "merge-30$_rbi"
+    : > "$RB/logs/merge-30$_rbi.log"; touch -t 202601010000 "$RB/logs/merge-30$_rbi.log"
+  done
+  printf '{"workspaces":[%s],"screens":[],"tabs":[],"terminals":[%s]}\n' "$_rbw" "$_rbt" > "$RB/tree.json"
+  cat > "$RB/bin/cmux" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$RB/calls.log"
+[ "\${1:-}" = "tree" ] && cat "$RB/tree.json"
+exit 0
+SH
+  chmod +x "$RB/bin/cmux"; : > "$RB/calls.log"
+  _rbout="$(
+    tmux() { :; }                     # no tmux sessions, no pane pids: the tmux arm answers nothing
+    export PATH="$RB/bin:$PATH"
+    LOG="$RB/reap.log"; O="$RB"; WT_DIR="$RB/state"; STALE_MIN=1; WT_TABLE_TTL=0
+    _WREAP_WINDOW_MIN=0
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    . "$TMP/reapw.sh"
+    reap_stale_workers
+    printf 'calls %s\ndecisions %s\n' \
+      "$(grep -c '^tree' "$RB/calls.log" 2>/dev/null || true)" \
+      "$(grep -c '^\[reap-worker\] merge-' "$RB/reap.log" 2>/dev/null || true)"
+  )"
+  _rb_calls="$(printf '%s\n' "$_rbout" | sed -n 's/^calls //p' | head -1)"
+  _rb_dec="$(printf '%s\n' "$_rbout" | sed -n 's/^decisions //p' | head -1)"
+  # NON-VACUITY FIRST: if the pass walked nothing, `calls 1` would be green for a reaper that reaps
+  # nothing at all — the vacuous assertion this shard's own review history is about.
+  case "${_rb_dec:-}" in ''|*[!0-9]*) rc=1 ;; *) [ "$_rb_dec" -eq 6 ] && rc=0 || rc=1 ;; esac
+  ck "15a: the driven pass really walks every candidate (6 per-candidate decisions, got '${_rb_dec:-}')" $rc
+  case "${_rb_calls:-}" in ''|*[!0-9]*) rc=1 ;; *) [ "$_rb_calls" -eq 1 ] && rc=0 || rc=1 ;; esac
+  [ "$rc" -eq 0 ] || echo "      census builds in one reap pass: ${_rb_calls:-<none>} (want 1; pre-fix: 1 + candidates = 7)"
+  ck "15a: one reap pass costs ONE census build, whatever the candidate count (measured ${_rb_calls:-<none>})" $rc
+fi
+# ⛔ 15a2) THE PASS-ENTRY CENSUS MAY NOT AUTHORISE A KILL ON ITS OWN (#3585 review, P2).
+# `_surf` is answered from the census the PASS built, and `wt_close` KILLS before it verifies. So a row
+# that was `dead` at pass entry — a `merge-<PR>` respawned onto the same box mid-pass reuses the stale
+# log, so it is still a candidate — would authorise a close of a worker that is alive NOW. The reaper
+# therefore re-asks the surface with a FRESH read before it closes anything. Driven with a daemon that
+# answers `dead` on its first read and `alive` on every read after: the candidate must be SPARED and its
+# record must survive. On a reaper that trusts the pass-entry table, the record is deleted.
+if need "$TMP/reapw.sh" "the reaper is extracted from the shipped loop"; then
+  R2="$TMP/R2"; rm -rf "$R2"; mkdir -p "$R2/state" "$R2/logs" "$R2/bin"
+  printf 'kind=terminal\nid=term_live9\nworkspace=ws_live9\ncwd=/tmp\n' > "$R2/state/worker-merge-9009"
+  : > "$R2/logs/merge-9009.log"; touch -t 202601010000 "$R2/logs/merge-9009.log"
+  cat > "$R2/bin/cmux" <<SH
+#!/usr/bin/env bash
+# 1st read: the record's terminal is NOT in the tree (the pass-entry table says dead).
+# 2nd+ reads: it IS there and running (the worker is alive NOW).
+_n=\$(cat "$R2/n" 2>/dev/null || echo 0); _n=\$((_n+1)); printf '%s\n' "\$_n" > "$R2/n"
+case "\${1:-}" in
+  tree)
+    printf '%s\n' "\$*" >> "$R2/calls.log"
+    if [ "\$_n" -le 1 ]; then
+      printf '%s\n' '{"workspaces":[{"id":"ws_live9","name":"wt-merge-9009"}],"screens":[],"tabs":[],"terminals":[]}'
+    else
+      printf '%s\n' '{"workspaces":[{"id":"ws_live9","name":"wt-merge-9009"}],"screens":[],"tabs":[],"terminals":[{"id":"term_live9","running":true}]}'
+    fi ;;
+  # ⛔ THE KILL IS THE HARM, AND IT IS RECORDED. `wt_close` closes BEFORE it verifies, so the post-close
+  # re-read that keeps the record does not undo a surface it already destroyed. This is the artifact the
+  # arm asserts on: a reaper that trusts the pass-entry table CLOSES a live worker even when it then
+  # decides to keep the record.
+  terminal|workspace) printf '%s\n' "\$*" >> "$R2/closed.log" ;;
+esac
+exit 0
+SH
+  chmod +x "$R2/bin/cmux"; : > "$R2/calls.log"; : > "$R2/closed.log"; rm -f "$R2/n"
+  (
+    tmux() { :; }
+    export PATH="$R2/bin:$PATH"
+    LOG="$R2/reap.log"; O="$R2"; WT_DIR="$R2/state"; STALE_MIN=1; WT_TABLE_TTL=0
+    _WREAP_WINDOW_MIN=0
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    . "$TMP/reapw.sh"
+    reap_stale_workers
+  )
+  # ⛔ NOTHING MAY BE CLOSED — the record surviving is NOT the assertion (a post-close re-read keeps it
+  # even after the surface was destroyed, measured: the mutant below deletes nothing and still kills).
+  [ -s "$R2/closed.log" ] && { rc=1; echo "      CLOSED a live worker on a pass-entry 'dead' row: $(cat "$R2/closed.log")"; } || rc=0
+  ck "15a2: a worker whose surface is ALIVE on a FRESH read is NOT CLOSED (pass-entry census is not proof)" $rc
+  [ -f "$R2/state/worker-merge-9009" ] && rc=0 || { rc=1; echo "      the record was deleted"; }
+  ck "…and its record survives, so the slot is still accounted for" $rc
+  grep -q '^\[reap-worker\] merge-9009 .*FRESH read reports its surface ALIVE' "$R2/reap.log" 2>/dev/null && rc=0 || { rc=1; echo "      log: $(cat "$R2/reap.log" 2>/dev/null)"; }
+  ck "…and it SAYS SO, naming the fresh read rather than the stale row" $rc
+  [ "$(grep -c '^tree' "$R2/calls.log" 2>/dev/null || true)" -ge 2 ] && rc=0 || { rc=1; echo "      only $(grep -c '^tree' "$R2/calls.log" 2>/dev/null || true) read(s): the fresh re-read never happened"; }
+  ck "…because it really re-read the surface (≥2 census reads: the pass, then the pre-close check)" $rc
+fi
+# ⛔ 15a3) THE OTHER ROUTE TO A REAP MUST STILL REAP (#3585 review, P1 — the mirror of 15a2).
+# `_wreap_verdict` reaches REAP by TWO routes: (a) a MEASURED flat process tree over the window — the
+# #2104 arm, where the surface is ALIVE by definition, since a hung `pi` parked at 0 CPU still holds its
+# terminal — and (b) no identity matched + surface PROVEN GONE, where a stale row is the only evidence.
+# The pre-close fresh read belongs to (b) ALONE: run unconditionally it spares exactly the corpse (a)
+# exists to free, for ever, while the log still announces a reap. Driven here with a surface the daemon
+# reports ALIVE on EVERY read and a process tree measured FLAT across the window: the worker must be
+# CLOSED. An unscoped fresh read turns this green -> red (measured).
+if need "$TMP/reapw.sh" "the reaper is extracted from the shipped loop"; then
+  R3="$TMP/R3"; rm -rf "$R3"; mkdir -p "$R3/state" "$R3/logs" "$R3/bin"
+  printf 'kind=terminal\nid=term_hung1\nworkspace=ws_hung1\ncwd=/tmp\n' > "$R3/state/worker-merge-9010"
+  : > "$R3/logs/merge-9010.log"; touch -t 202601010000 "$R3/logs/merge-9010.log"
+  # The window: a baseline 10 min old, taken AFTER the log was last written (so `_wreap_prev` honours it),
+  # with an identity at the previous sighting (`pm` = 1) — the shape a hung worker is in on pass 2.
+  printf '%s 0 1\n' "$(( $(date +%s) - 600 ))" > "$R3/state/wreap-merge-9010"
+  # A STATEFUL daemon: once the terminal is closed it stops appearing in the tree, exactly as the real
+  # one behaves. Without that, `wt_close` cannot PROVE the close (its verification read is `wt_alive`),
+  # correctly returns 1, keeps the record — and the arm would fail for a reason that is the shipped
+  # safety rule working, not a scoping bug.
+  cat > "$R3/bin/cmux" <<SH
+#!/usr/bin/env bash
+case "\${1:-}" in
+  tree)
+    if [ -f "$R3/closed-once" ]; then
+      printf '%s\n' '{"workspaces":[{"id":"ws_hung1","name":"wt-merge-9010"}],"screens":[],"tabs":[],"terminals":[]}'
+    else
+      printf '%s\n' '{"workspaces":[{"id":"ws_hung1","name":"wt-merge-9010"}],"screens":[],"tabs":[],"terminals":[{"id":"term_hung1","running":true}]}'
+    fi ;;
+  terminal|workspace)
+    printf '%s\n' "\$*" >> "$R3/closed.log"; : > "$R3/closed-once" ;;
+esac
+exit 0
+SH
+  chmod +x "$R3/bin/cmux"; : > "$R3/closed.log"; rm -f "$R3/closed-once"
+  (
+    tmux() { :; }
+    export PATH="$R3/bin:$PATH"
+    LOG="$R3/reap.log"; O="$R3"; WT_DIR="$R3/state"; STALE_MIN=1; WT_TABLE_TTL=0
+    _WREAP_WINDOW_MIN=0
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh" >/dev/null 2>&1
+    # shellcheck disable=SC1090
+    . "$TMP/reapw.sh"
+    # ⛔ THE STUB GOES **AFTER** THE EXTRACTION, NOT BEFORE (measured while writing this): `reapw.sh`
+    # DEFINES `_wreap_ps`, so a stub placed above it is silently replaced by the shipped probe, the fake
+    # process never appears, `matched=0` spares the worker for the UNRELATED reason ("no identity"), and
+    # the arm reads as a scoping failure instead of a fixture bug. The probe is what a suite cannot
+    # spawn (a hung `pi`); the VERDICT stays the shipped one. `0:00.05` = 5 cs on both readings, so the
+    # delta is 0 <= tol and this is route (a).
+    _wreap_ps() { printf '%s\n' "  4242     1  0:00.05 bash $R3/state/run-merge-9010.sh"; }
+    reap_stale_workers
+  )
+  # Non-vacuity FIRST: the flat-tree route must have actually fired, or "closed" proves nothing.
+  grep -q '^\[reap-worker\] merge-9010 .*burned no CPU across the window' "$R3/reap.log" 2>/dev/null && rc=0 || { rc=1; echo "      the flat-CPU route never fired: $(cat "$R3/reap.log" 2>/dev/null | head -2)"; }
+  ck "15a3: a worker measured FLAT across the window is reaped on the CPU route (verdict reached)" $rc
+  [ -s "$R3/closed.log" ] && rc=0 || { rc=1; echo "      NOTHING was closed: an unscoped fresh surface read spared a hung worker for ever"; }
+  ck "15a3: …and it IS closed — the fresh surface read is scoped to the surface-only route" $rc
+  [ -f "$R3/state/worker-merge-9010" ] && { rc=1; echo "      record kept"; } || rc=0
+  ck "15a3: …and its record is freed (the slot the ceilings read is released)" $rc
+fi
 # ── 15b) a STALE LOG IS NOT A HUNG WORKER: the positive-liveness gate (agent-infra#2104) ───────
 # MEASURED 2026-10-19: this reaper closed a worker logged as "silent 8287s" (2.3 h) while its agent
 # had been running `bash`/`edit` calls for hours with ~200 lines of uncommitted work, and closed 7

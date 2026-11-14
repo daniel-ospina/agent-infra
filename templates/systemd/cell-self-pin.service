@@ -4,8 +4,10 @@
 # WHY THIS UNIT EXISTS AT ALL. `cloud-cell-supervisor.sh apply` refuses while a controller runs, and a
 # running fleet's controller always runs, so `apply --force --pin-only` is the path a live cell has (a
 # bare `--force` without `--pin-only` re-seeds the state dir the running controller executes from — the
-# #2215 skew). This timer is that path, taken only when the pinned HEAD and the ref tip differ (a
-# converged tick costs one `git fetch`).
+# #2215 skew). `--pin-only` used to be refused by that guard as well (agent-infra#2738), so `--force`
+# came with it; the supervisor now EXEMPTS `--pin-only` (it never touches $O), so the load-bearing flag
+# is `--pin-only` and `--force` is belt-and-braces. This timer is that path, taken only when the pinned
+# HEAD and the ref tip differ (a converged tick costs one `git fetch`).
 #
 # ⛔ IT ADVANCES THE PIN, NOT THE RUNNING PROCESS. A controller keeps the layer it STARTED on until it is
 # restarted, so a pin that is current while the process is stale is a real state — the pass says so in

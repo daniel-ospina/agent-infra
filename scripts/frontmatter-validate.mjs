@@ -486,8 +486,23 @@ export function tokenizeFrontmatter(yamlString) {
       return { nextI: startI };
     }
 
-    // block scalar header: | > with chomp/explicit-indent modifiers
-    const bm = /^([>|])([+-]?)([1-9]?)(?:[ \t]+(.*))?$/.exec(valueText);
+    // block scalar header: | > with chomp/explicit-indent modifiers.
+    // ⛔ THE TWO INDICATORS ARE LEGAL IN EITHER ORDER (YAML 1.2 §8.1.1
+    // `c-b-block-header` = `( indentation-indicator chomping-indicator |
+    // chomping-indicator indentation-indicator )`), so `|+2` (chomp-then-
+    // indent) and `|2+` (indent-then-chomp) are BOTH valid headers and both
+    // load. The single-order regex this replaces matched
+    // chomp-then-OPTIONAL-indent, so an indent-ONLY spelling always worked
+    // (`|2` — pinned accepted since before this PR by the
+    // `ok-block-explicit-indent-2` fixture; `|1` accepted by the same
+    // `[+-]?([1-9])?` branch, but pinned only by this PR's `VALUE_POOL` — the
+    // pre-PR tree carries no bare-`|1` fixture, only `|12` and `|1 token`),
+    // while every INDENT-THEN-CHOMP spelling —
+    // `|2+`, `|2-`, `>1-` — fell through to the digit guard: a P0 on a skill
+    // pi LOADS (probe yaml 2.9.0: all three load their body). Pre-existing,
+    // and it is exactly the class this guard's comment used to claim was
+    // closed; accepting the second order is what makes that claim true (#458).
+    const bm = /^([>|])(?:([+-]?)([1-9])?|([1-9])([+-])?)(?:[ \t]+(.*))?$/.exec(valueText);
     if (bm && bm[1]) {
       // #370 (P1 false negative — issue severity; the guard emits a P0 throw):
       // yaml permits ONLY a `#`-prefixed comment
@@ -499,13 +514,22 @@ export function tokenizeFrontmatter(yamlString) {
       // typed as string → gate passed → validator clean while pi dropped.
       // `| #c`, `|  #c` (whitespace run + comment) and `| ` (bare trailing
       // whitespace) are legal and must keep passing.
-      const afterWs = (bm[4] ?? '').trimStart();
+      const afterWs = (bm[6] ?? '').trimStart();
       if (afterWs !== '' && !afterWs.startsWith('#')) {
         emit({ t: TOKEN.TOKENIZE_ERROR, kind: 'block-header-trailing', line: lineNo, detail: 'non-comment token after a block scalar header' });
         return { nextI: startI };
       }
-      emit({ t: TOKEN.VALUE_BLOCK_HEADER, chomp: bm[2] || '', indent: keyIndent, line: lineNo });
-      const explicit = bm[3] ? parseInt(bm[3], 10) : null;
+      // chomp: group 2 (chomp-then-indent) or group 5 (indent-then-chomp).
+      // ⛔ WRITE-ONLY FIELD: no rule reads `chomp` (`grep -n chomp` returns
+      // comments plus this emit), so the `|| bm[5]` fallback is grammar-correct
+      // (YAML 1.2 §8.1.1, both orders) but UNOBSERVABLE — no test reddens if it
+      // is wrong. A green row in the mutation table here is silence, not
+      // coverage; do not read it as one.
+      const chomp = bm[2] || bm[5] || '';
+      emit({ t: TOKEN.VALUE_BLOCK_HEADER, chomp, indent: keyIndent, line: lineNo });
+      // explicit indent: group 3 (chomp-then-indent) or group 4 (indent-then-chomp)
+      const explicitDigit = bm[3] || bm[4] || '';
+      const explicit = explicitDigit ? parseInt(explicitDigit, 10) : null;
       return {
         nextI: startI,
         blockScalarStart: {
@@ -523,13 +547,29 @@ export function tokenizeFrontmatter(yamlString) {
       };
     }
 
-    // P2-1: `|0` / `|12` / `|+0` / `|-0` / `>0` — a block-scalar header with a
-    // DIGIT explicit-indent that the valid regex rejects ([1-9]? only) falls
-    // through to the plain-scalar path → typed as string → gate passes →
-    // validator clean while pi throws "Block scalar header includes extra
-    // characters" (probe: every digit form throws — |0 |00 |12 |+0 |-0 >0 |2x;
-    // single-digit 1-9 like `|1` is valid and handled above).
-    if (/^[>|][+-]?[0-9]+/.test(valueText)) {
+    // #369 P2-1 + #458: a value that STARTS with a block-scalar indicator but
+    // is NOT a legal header. The valid-header regex above now accepts exactly
+    // the grammar-legal spellings — `[>|]`, then the chomp and single
+    // explicit-indent indicators in EITHER order, then
+    // (whitespace-separated) nothing or a `#`-comment. Every other spelling
+    // throws in yaml (probe pi 0.85.1 / yaml 2.9.0), and each previously fell
+    // through to the plain-scalar path → typed as string → gate passed →
+    // validator clean while pi DROPPED the skill:
+    //   #369 P2-1 digit forms — `|0` `|00` `|12` `|+0` `|-0` `>0` `|2x` `|10`
+    //     → "Block scalar header includes extra characters"
+    //   #458 NO-space tails — `|x` `|comment` `>text` `|-#c` `|+x` `|1x` `|-x`
+    //     → same "extra characters" class
+    //   #458 unseparated comments — `|#c` `|#` `>#x` `|-#c`
+    //     → "Comments must be separated from other tokens by white space
+    //        characters" (a comment needs leading whitespace)
+    // Zero false positives, from the plain-scalar grammar itself: `|` and `>`
+    // are c-indicators, and `ns-plain-first` forbids a plain scalar from
+    // BEGINNING with a c-indicator (only `?` `:` `-` are allowed, and only
+    // followed by a non-space). So no value yaml resolves as a plain string
+    // starts with `|` or `>` — every such start IS a block header, and the
+    // ones that reach here are exactly the ones yaml rejects. The #370 probe
+    // reached the same conclusion empirically over the live 126-file corpus.
+    if (valueText[0] === '>' || valueText[0] === '|') {
       emit({ t: TOKEN.TOKENIZE_ERROR, kind: 'block-header', line: lineNo, detail: 'invalid block scalar header (extra characters)' });
       return { nextI: startI };
     }

@@ -302,12 +302,17 @@ assert_eq "$(printf '%s\n' "$BODY" | grep -c 'kill ' | tr -d ' ')" "0" \
 assert_contains "$BODY" "--pin-only" "T7 and it DOES use the non-disturbing advance while a controller is live"
 
 # ── T7b: the advance calls the materialiser the ONE way `apply` accepts, and only claims a move ──
-# MEASURED IN REVIEW: `apply --pin-only` alone is REFUSED whenever a controller is live ("re-run with
-# --force") — `--pin-only` does not relax that guard. The pass therefore never advanced on any running
-# cell, recorded rc=23, and reddened the unit every ten minutes while the pin stayed put. The stub here
-# reproduces the supervisor's refusal, and it MOVES the pin like the real thing does: a stub that exits 0
-# without moving anything is the other half of the same defect (a green `advanced` over an unchanged
-# pin), and the second case pins that too.
+# MEASURED IN REVIEW (and since fixed): `apply --pin-only` alone was REFUSED whenever a controller was
+# live ("re-run with --force") — the guard did not relax for `--pin-only`. The pass therefore never
+# advanced on a running cell, recorded rc=23, and reddened the unit every ten minutes while the pin
+# stayed put. ⛔ THE SUPERVISOR NOW EXEMPTS `--pin-only` FROM THAT GUARD (agent-infra#2738, because the
+# pin-only path returns before `seed_and_stamp` — the only step that touches the live `$O`), so on the
+# real verb `--force` is belt-and-braces. This case still pins the PAIR, deliberately: the stub below is
+# a hand-written double of the invocation contract, and a pass that must never redden on a healthy cell
+# must not start depending on where the guard's scope sits. The load-bearing flag is `--pin-only`; the
+# stub MOVES the pin like the real thing does, because a stub that exits 0 without moving anything is
+# the other half of the same defect (a green `advanced` over an unchanged pin), and the second case
+# pins that too.
 say_case "T7b the materialiser is called with --force --pin-only, and a no-move is not 'advanced'"
 mk_origin t7; mk_clone t7
 REPO_P="$CLONE"; MODE_P=pin
@@ -447,7 +452,14 @@ assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null)" "action
 # `<script>: line 644: executes:: command not found` and the sentence silently lost its token
 # ("and an  state always has a live controller"). Control flow was unaffected, so nothing caught it.
 # This asserts the prose survives intact, which is the only way that class is observable.
-assert_contains "$OUT" "an executes: state always has a live controller" "T24 and the refusal PROSE survives — no backtick command substitution ate the token"
+# ⛔ AND THE ANCHOR IS THE LIVE SENTENCE, WHICH MOVED (measured, base-owned): the pinned phrase was
+# removed from `REC_REMEDY` by 21e40bdaf (#3914) — the `executes:` clause was dropped from the remedy
+# sentence — so this arm reddened at a commit that changed no behaviour it protects, while the claim it
+# protects is still made, one clause earlier, by `REC_DETAIL`. Pinning the phrase that is GONE would
+# need the clause restored to the remedy; pinning the sentence that MAKES the claim keeps the guarantee
+# observable. Either way the backtick class is what this row is for: wrap any word of the sentence below
+# in backticks and it disappears from the output.
+assert_contains "$OUT" "a live controller EXECUTES a harness directory that cannot be matched to this repo" "T24 and the refusal PROSE survives — no backtick command substitution ate the token"
 # ⛔ THE REMEDY MUST BE PASTEABLE ON THE BOX IT FIRES ON (review P2, #10114). Nothing in this fleet puts
 # `cloud-cell-supervisor.sh` on PATH (`command -v` is empty on a deployed cell; the farm keeps it BESIDE
 # this pass at `~/.pi/agent/scripts/`), so a remedy naming the BARE command is `command not found`
@@ -2827,6 +2839,9 @@ printf '%s\n' 'file | deployed | source | verdict' >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'a.py' aaaa11112222 bbbb33334444 ok >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'b.py' - - 'LOCAL (declared)' >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'c.py' - - 'SYMLINK (graded via its target)' >&2
+# #3991: the installer's own scratch (`<name>.tmp.<pid>`, left by an INTERRUPTED farm) is a benign row
+# the instrument prints; a consumer that does not know the token refuses a farm that MATCHES.
+printf '%-46s | %-12s | %-12s | %s\n' 'd.py.tmp.4242' - - 'LOCAL (scratch)' >&2
 # ⛔ AND ONE LABEL WORD IN PROSE IS NOT A SUMMARY EITHER (VGATE round 32, measured: lowering the
 # summary signal's threshold from two label words to one left the suite green, so nothing pinned the
 # bound that keeps a healthy copy's passing mention of `stale` from being read as an uncountable
@@ -2836,7 +2851,7 @@ exit 0
 FARM
 chmod +x "$T/t24bp/benign-tokens.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bp/benign-tokens.sh" run_pass "$T/t24bp" 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T24 control: the instrument's benign row tokens (ok, LOCAL, SYMLINK, verdict) never refuse a match"
+assert_eq "$RC" "0" "T24 control: the instrument's benign row tokens (ok, LOCAL, LOCAL scratch, SYMLINK, verdict) never refuse a match"
 assert_contains "$(grep '^farm_n=' "$T/t24bp/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
     "T24 control: so a healthy farm with a local file and a symlink still records a proven match"
 assert_absent "$(grep '^farm_n=' "$T/t24bp/state/harness-apply.status" 2>/dev/null || true)" "not-graded" \

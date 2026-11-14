@@ -380,11 +380,20 @@ fi
 # ran for an hour exits immediately.
 if [ "$_LIVED" -lt "$RESTART_FLOOR" ]; then sleep $(( RESTART_FLOOR - _LIVED )); fi
 
-# ⛔ SAY HOW LONG IT RAN. Exiting 0 after a controller that died in two seconds is indistinguishable
-# in launchd.err from an idle box; the lifetime is the one datum that separates them. It stays exit 0
-# because a controller that ends normally is a legitimate state, so this is a diagnostic, not a
-# verdict. ⛔ THE REFUSAL IS NO LONGER ONE OF THOSE STATES (agent-infra#2095): `orch-loop.sh` exits 75
-# when another controller holds the lock and this wrapper PROPAGATES it — the two early arms above, and
-# the post-supervisor arm above them, because a refusal slower than ~2.1 s used to reach launchd as 0.
-_lc_err "the '$S' controller session ended after ${_LIVED}s (exit 0)"
+# ⛔ SAY HOW LONG IT RAN, AND SAY ONLY WHAT THIS PROCESS KNOWS. Exiting 0 after a controller that died
+# in two seconds is indistinguishable in launchd.err from an idle box; the lifetime is the one datum that
+# separates them. It stays exit 0 because a controller that ends normally is a legitimate state, so this
+# is a diagnostic, not a verdict. ⛔ THE REFUSAL IS NO LONGER ONE OF THOSE STATES (agent-infra#2095):
+# `orch-loop.sh` exits 75 when another controller holds the lock and this wrapper PROPAGATES it — the two
+# early arms above, and the post-supervisor arm above them, because a refusal slower than ~2.1 s used to
+# reach launchd as 0.
+# ⛔ AND IT NO LONGER PRINTS A NUMBER IT DOES NOT HAVE (#3585). The literal was `(exit 0)` —
+# THIS WRAPPER's status, printed beside the CONTROLLER's lifetime, where every reader took it as the
+# controller's own and this tracker carried it for several beats as "the controller ends cleanly". That
+# is the file's own false-green shape with the sign flipped: the one number that would have said "it
+# ended normally" was fabricated, and a controller that DIED landed in launchd.err looking exactly like
+# an idle box. The controller's status is not observable from here without `#{pane_dead_status}`, which
+# this launcher deliberately does not depend on (a tmux-version dependency it otherwise carries
+# nowhere), so the line names the fact it HAS and says the rest is unknown, instead of inventing a zero.
+_lc_err "the '$S' controller session ended after ${_LIVED}s (this wrapper exits 0; the controller's own status is not observable here — see the pane output above)"
 exit 0

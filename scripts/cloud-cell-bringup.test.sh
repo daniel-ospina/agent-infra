@@ -123,7 +123,12 @@ cat > "$TEMPLATES_DIR/com.test.bringup-schedule.plist" <<PLIST
 PLIST
 # `chmod -R u+w` first: one case makes a parent directory unwritable to force `rm -f` to fail, and
 # the suite must still be able to clean up after itself.
-trap 'HOME="$T/home" CELL_HOME="$T/home" TEMPLATES_DIR="$T/schedule-templates" python3 "$HERE/fleet-schedule.py" --stop >/dev/null 2>&1; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
+# ⛔ THE STUB'S LIVENESS DOUBLE IS REAPED HERE, AND ONLY WHILE ITS COMMAND IS STILL `sleep` (#3900). The suite
+# starts ONE long-lived `sleep` as the unit's MainPID, because the install verdict requires a live MainPID
+# (`install-controller-service.sh:1823`). A pid can be RECYCLED between the run and this trap, and killing
+# whatever now owns it would be worse than leaking one sleeper — so the command is re-checked before the kill,
+# exactly as install-controller-service.test.sh's own cleanup does.
+trap 'HOME="$T/home" CELL_HOME="$T/home" TEMPLATES_DIR="$T/schedule-templates" python3 "$HERE/fleet-schedule.py" --stop >/dev/null 2>&1; case "${STUB_UNIT_PID:-}" in ""|*[!0-9]*) ;; *) [ "$(ps -o comm= -p "$STUB_UNIT_PID" 2>/dev/null)" = sleep ] && kill -9 "$STUB_UNIT_PID" 2>/dev/null ;; esac; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
 
 if [ -f "$BRINGUP" ]; then ok "shipped script present: cloud-cell-bringup.sh"
 else bad "missing $BRINGUP"; echo; echo "  PASS=$PASS FAIL=$FAIL"; exit 1; fi
@@ -268,7 +273,27 @@ export CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root
 # SYSTEMD_UNIT_DIR / SWAP_SUDO / CELL_VOLATILE_ROOTS above.
 export CELL_ACCOUNT_HOME=""
 export SYSTEMCTL="$STUB/systemctl"
-printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
+# ⛔ THE STUB'S MainPID IS A *LIVE* PROCESS, NOT A LITERAL (agent-infra#3900 / #2627). The install verdict now
+# requires the unit's MainPID to be ALIVE after the proof wait (`kill -0`, `install-controller-service.sh:1823`),
+# because a heartbeat whose author is gone is the false pass that gate exists to catch. A shim answering the
+# literal `1234` models a DEAD controller on any host where 1234 is free — measured 2026-11-11: this shard went
+# red on CI with `eldato-orchestrator.service is 'active' but its MainPID 1234 is NOT live`, 23 assertions, all
+# downstream of it — while a host that HAPPENS to have a live pid 1234 would pass the same arm for the wrong
+# reason (a fixture that grades the host's process table either way). So this suite starts ONE long-lived
+# `sleep` of its own and the shim ANSWERS that pid — the shape install-controller-service.test.sh's double
+# already uses (`:217-230`): a process alive ACROSS REPEATED installs, so the idempotency arms ("install twice
+# changes nothing") are not turned into a false RED by a pid tied to one invocation.
+# ⛔ THE SUITE OWNS THE PROCESS, THE SHIM ONLY REPORTS IT — and that is deliberate. First cut had the SHIM start
+# the sleeper and record it in a file, which leaked one orphan per run: MEASURED, an invocation whose state
+# variable did not reach the shim printed `cannot create : Directory nonexistent`, STARTED a `sleep 900` anyway
+# (`&` precedes the redirect failure) and left it with no record, so the trap reaped a file that was never
+# written. A process the SUITE starts is held in a shell variable, reaped by this shell's own EXIT trap, and
+# cannot be orphaned by any child's environment; if the value ever fails to reach the shim, the shim answers
+# `MainPID=` and the install refuses LOUDLY (the MainPID-0 arm) instead of leaking silently.
+sleep 900 >/dev/null 2>&1 &
+STUB_UNIT_PID=$!
+export SYSTEMCTL_MAINPID="$STUB_UNIT_PID"
+printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=${SYSTEMCTL_MAINPID:-}" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
                      # invocation and fails closed, blocking the suite from running at all.
@@ -341,7 +366,11 @@ mk_checkout() { # <dir> <origin-url> <tag>
 git init -q "$T/cell" >/dev/null 2>&1 || { echo "fixture: git init failed" >&2; exit 1; }
 git -C "$T/cell" -c user.email=fixture@example.invalid -c user.name=fixture -c commit.gpgsign=false \
     commit -q --allow-empty -m fixture >/dev/null 2>&1 || { echo "fixture: git commit failed" >&2; exit 1; }
-printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
+# ⛔ THE DECISION-GATE KEY IS PART OF A HEALTHY CELL'S keys.env (agent-infra#2642): the bring-up now
+# REFUSES a box whose owner-question gate cannot fire, so a fixture that omits it cannot reach
+# CELL READY — and (because this home is reused) every later arm would redden behind it. The store it
+# materialises from this line is what the later arms (which rewrite $T/keys.env) inherit.
+printf 'DEEPSEEK_API_KEY=fake\nTYPESAFE_API_KEY=fake-jev-key\n' > "$T/keys.env"
 TOK="$T/tok/.gh-tok"
 printf 'ghp_FAKE_PUSH_CAPABLE_TOKEN\n' > "$TOK"   # (re-created per case; asserted deleted after)
 TOK_BODY="$(cat "$TOK")"
@@ -420,6 +449,7 @@ br() {
   # through `BR_EXTRA_ENV`, which is applied AFTER these clears.
   BR_OUT="$(env -u AGENT_INFRA_PATH -u INFRA_ROOT -u TORTOISE_REPO -u DISK_REAPER_REPOS -u GH_REPO \
             -u DEEPSEEK_API_KEY -u ANTHROPIC_API_KEY \
+            -u TYPESAFE_API_KEY -u JEV_API_KEY \
             -u HARNESS_PIN_DIR -u HARNESS_PIN_FILE \
             PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" GH_REPO="${BR_GH_REPO:-}" \
             ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
@@ -477,6 +507,24 @@ fi
 case "$BR_OUT" in
   *"CELL READY"*) ok "a clean run still reaches CELL READY" ;;
   *) bad "a clean run no longer reaches CELL READY — output: $BR_OUT" ;;
+esac
+# ⛔ THE FIXTURE'S OWN PRECONDITION, ASSERTED (#3900). The install verdict requires the unit's MainPID to be a
+# LIVE process, so the shim must model one. Without this row a regression to a literal pid reddens the shard
+# with twenty "clean run FAILED (rc=1)" arms whose cause — a dead MainPID — is named in NO assertion, which is
+# exactly how this shard was red on CI before the fix. It asks the SHIM for the answer (not the pid file the
+# shim wrote), so it grades what the installer will actually read: revert either half — `echo "MainPID=1234"` in
+# the read arm, or a `start` arm that records no live process — and this row goes red on its own.
+_ans="$("$SYSTEMCTL" show -p MainPID eldato-orchestrator.service 2>/dev/null || true)"
+_upid="${_ans#MainPID=}"
+case "${_upid:-}" in
+  ''|*[!0-9]*)
+    bad "the systemctl shim answers no numeric MainPID (got '${_ans:-<nothing>}') — the install verdict requires a LIVE MainPID, so every install arm is now decided by the host's process table (#3900)" ;;
+  *)
+    if kill -0 "$_upid" 2>/dev/null && [ "$(ps -o comm= -p "$_upid" 2>/dev/null)" = sleep ]; then
+      ok "the systemctl shim's MainPID ($_upid) is a LIVE process — the install verdict's live-pid leg is graded by a live pid, not by the host"
+    else
+      bad "the systemctl shim's MainPID $_upid is NOT a live sleep, so the install verdict is graded by the HOST's process table rather than by this fixture (#3900)"
+    fi ;;
 esac
 [ ! -e "$TOK" ] && ok "token file removed on the success path (as before the fix)" \
                 || bad "token file SURVIVED a successful run"
@@ -2678,6 +2726,359 @@ case "$MISS_OUT" in
   *"was not found"*"rc=0"*) ok "with no copy at all it reports UNVERIFIED and continues (a bare VM is a documented path)" ;;
   *) bad "an absent repo-slug.sh did not report UNVERIFIED, or refused the box: $MISS_OUT" ;;
 esac
+
+# ── the DECISION GATE's credential (agent-infra#2642) ────────────────────────────────────────────
+# MEASURED 2026-10-24 on agent-infra cell-1: nine owner questions were posted, `ask-owner.py` returned
+# exit 2 for every one (no `~/.pi/agent/jev-config.json` on ANY cell), and NOTHING reached the
+# `owner-decision` queue the owner reads. The gate was honest and the failure was silent, so the fix
+# is a bring-up that either PROVISIONS the credential or REFUSES the box by name.
+# These arms pin the three ways that can go wrong: a box certified with no credential at all, a
+# credential left in the operator's shell instead of the file a lane reads, and a repair that
+# overwrites a store holding a different key (a rotation is a decision, not a repair).
+JEVCFG="$T/home/.pi/agent/jev-config.json"
+# ⛔ ITS OWN KEYS FILE, NOT `$T/keys.env`: earlier arms REWRITE that fixture (several drop everything
+# but DEEPSEEK_API_KEY), so an arm that depended on it would be testing whatever the previous case
+# left behind — the order-dependence this suite keeps getting bitten by.
+JEVKEYS="$T/keys-withjev.env"
+printf 'DEEPSEEK_API_KEY=fake\nTYPESAFE_API_KEY=fake-jev-key\n' > "$JEVKEYS"
+
+say_case "the decision gate: a box with NO TypeSafe credential is REFUSED by name (#2642)"
+rm -f "$JEVCFG"
+printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys-nojev.env"      # no decision-gate key anywhere
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-nojev.env" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "bring-up REFUSES a box whose owner-question gate cannot fire (rc=$BR_RC)" \
+                   || bad "bring-up certified a cell that cannot gate a single question — every question it posts is UNSCORED and never queued"
+case "$BR_OUT" in
+  *"decision gate"*) ok "…and the refusal NAMES the decision gate (not 'provider failed', which sends an operator to the wrong key)" ;;
+  *) bad "the refusal does not name the decision gate: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"TYPESAFE_API_KEY"*) ok "…and prescribes the exact fix (the variable to put in keys.env)" ;;
+  *) bad "the refusal does not say what to push: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness on a box that cannot reach the owner queue" ;;
+  *) ok "does not claim CELL READY with no decision-gate credential" ;;
+esac
+[ ! -e "$JEVCFG" ] && ok "…and wrote NO store (a refusal must not mint a credential it does not have)" \
+                   || bad "a jev store appeared with no key to build it from — something guessed"
+
+say_case "the decision gate: the store is MATERIALISED from the box's own keys.env, mode 600"
+rm -f "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$JEVKEYS" br ok normal --check    # this box's keys.env carries TYPESAFE_API_KEY
+[ "$BR_RC" -eq 0 ] && ok "a box whose keys.env carries the key reaches CELL READY (non-vacuity)" \
+                   || bad "a properly provisioned box was refused (rc=$BR_RC): $BR_OUT"
+[ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "fake-jev-key" ] \
+  && ok "…the store exists and holds the key keys.env delivered" \
+  || bad "no store at $JEVCFG, or it holds the wrong key: $(cat "$JEVCFG" 2>/dev/null)"
+# ⛔ `ls -l`'s MODE STRING, not `stat`: the portability gate correctly refuses a bare GNU `stat -c`
+# (there is no box_* helper for MODE — only for mtime), and this suite runs on macOS as well.
+[ "$(ls -ld "$JEVCFG" 2>/dev/null | cut -c1-10)" = "-rw-------" ] \
+  && ok "…mode 600 (a credential on disk, not a world-readable one)" \
+  || bad "the store's mode is not 600: $(ls -ld "$JEVCFG" 2>/dev/null | cut -c1-10)"
+case "$BR_OUT" in
+  *"REPAIRED decision gate"*) ok "…and the repair is REPORTED (a silent write is a credential nobody knows exists)" ;;
+  *) bad "the materialisation was silent: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"jev: configured"*) ok "…and the configured state is reported as its own line" ;;
+  *) bad "the bring-up never reports the decision gate as configured: $BR_OUT" ;;
+esac
+
+say_case "the decision gate: an EXISTING store is never overwritten, and a rotation is NAMED"
+printf '{"apiKey":"sk_stale_in_store","model":"jev-stored"}\n' > "$JEVCFG"
+chmod 600 "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$JEVKEYS" br ok normal --check    # keys.env delivers a DIFFERENT key
+[ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "sk_stale_in_store" ] \
+  && ok "an existing stored key is NOT overwritten by the delivered one (a decision, not a repair)" \
+  || bad "the repair overwrote an existing decision-gate credential"
+[ "$(jq -r '.model // ""' "$JEVCFG" 2>/dev/null)" = "jev-stored" ] \
+  && ok "…and a field this script does not understand is PRESERVED (the laptop's store also carries 'model')" \
+  || bad "the write dropped a field it did not understand: $(cat "$JEVCFG" 2>/dev/null)"
+case "$BR_OUT" in
+  *"DIFFERENT key"*) ok "…and the shadow is reported, so a rotation is diagnosable" ;;
+  *) bad "a stored key shadows keys.env silently — an operator would rotate the wrong half: $BR_OUT" ;;
+esac
+# ⛔ THE LINE MUST NOT INVERT THE GATE'S PRECEDENCE (#2642 review). The first wording was a transplant
+# of the provider-store line ("pi reads the STORE first", which is true there): it told the operator
+# that `ask-owner.py` reads the STORE and "the stored value is the one used". `_key()` is ENV-FIRST —
+# on the normal lane path, which sources `keys.env`, the FILE's value is the one used and the stored
+# value is not. The two readers are SPLIT (lanes: file; a systemd unit or a hand-run scan: store), so
+# "the stored value wins" cannot be the takeaway. The `DIFFERENT key` grep above passes on ANY
+# wording, so this row is what pins the claim.
+case "$BR_OUT" in
+  *"reads the STORE, so the stored value is the one used"*) bad "the rotation line INVERTS the gate's order — _key() is env-first, so a lane uses the keys.env value, not the stored one: $BR_OUT" ;;
+  *"a lane sources"*"the FILE's value is the one a lane uses"*) ok "…and it states the SPLIT readers instead of naming one winner (a lane reads the file, a clean-shell reader the store)" ;;
+  *) bad "the rotation line names no precedence at all, so an operator cannot tell which value a lane uses: $BR_OUT" ;;
+esac
+printf '{"apiKey":"   "}\n' > "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$JEVKEYS" br ok normal --check
+[ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "fake-jev-key" ] \
+  && ok "a BLANK stored apiKey is repaired (a whitespace value is not a credential)" \
+  || bad "a blank apiKey was accepted as configured, or the repair skipped it: $(cat "$JEVCFG" 2>/dev/null)"
+
+say_case "the decision gate: a WRONG-TYPED apiKey is not a credential (#2642 review)"
+# ⛔ `jev_store_state` used `| tostring`, so ANY non-null value — a number, an object, an array,
+# `true` — rendered as non-empty text and the store answered `present`. The gate cannot score with
+# one: `ask-owner.py::_key()` returns the RAW JSON value, so `0`/`{}` take the unkeyed branch and
+# `{"a":1}`/`true` are sent as `Bearer {'a': 1}` / `Bearer True` and 401 — every question UNSCORED.
+# MEASURED pre-fix: the box printed `jev: configured` and `CELL READY` over a dead owner queue and
+# never repaired the store. A wrong-typed value must be `empty` (the REPAIR arm), the same rule
+# `write_jev_store` already applies to what it writes.
+for wrong in '{"apiKey":{"a":1},"model":"jev-stored"}' '{"apiKey":0}' '{"apiKey":["k"]}' '{"apiKey":true}'; do
+  printf '%s\n' "$wrong" > "$JEVCFG"
+  chmod 600 "$JEVCFG"
+  printf '%s\n' "$TOK_BODY" > "$TOK"
+  BR_ENV_FILE="$JEVKEYS" br ok normal --check      # this box's keys.env DOES deliver a usable key
+  # ⛔ NO `rc` ASSERTION HERE, DELIBERATELY. The discriminating fact is the STORE'S POST-STATE: if a
+  # wrong-typed value still read `present`, the repair arm is never reached and the store keeps a value
+  # the gate cannot send. That is rc-independent, so this arm measures the fix rather than whether the
+  # whole bring-up run can complete on this host (a box missing its harness worktree fails later, for
+  # reasons unrelated to the decision gate — the sibling cases above own that rc).
+  [ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "fake-jev-key" ] \
+    && ok "…$wrong: the wrong-typed store is REPAIRED from keys.env, not read as 'present'" \
+    || bad "…$wrong: the store still holds a value ask-owner.py cannot send, so it read as present: $(cat "$JEVCFG" 2>/dev/null)"
+  case "$BR_OUT" in
+    *"REPAIRED decision gate"*) ok "…$wrong: and the repair is REPORTED (not a silent rewrite)" ;;
+    *) bad "…$wrong: the repair was silent: $BR_OUT" ;;
+  esac
+  case "$BR_OUT" in
+    *"jev: configured"*) ok "…$wrong: and configured is claimed only AFTER the repair" ;;
+    *) bad "…$wrong: the bring-up never reported the repaired store as configured: $BR_OUT" ;;
+  esac
+  # …and a field the script does not understand survives the repair, exactly as for the blank case.
+  [ "$wrong" != '{"apiKey":{"a":1},"model":"jev-stored"}' ] \
+    || { [ "$(jq -r '.model // ""' "$JEVCFG" 2>/dev/null)" = "jev-stored" ] \
+           && ok "…and a field it does not understand ('model') is PRESERVED across the repair" \
+           || bad "the wrong-typed repair dropped a field it did not understand: $(cat "$JEVCFG" 2>/dev/null)"; }
+done
+# The other half of the mapping: with NOTHING to repair from, the box is REFUSED — never certified on
+# a store the gate cannot use, and never silently emptied of the value it holds.
+printf '{"apiKey":{"a":1}}\n' > "$JEVCFG"
+chmod 600 "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-nojev.env" br ok normal --check      # no decision-gate key anywhere to repair from
+[ "$BR_RC" -ne 0 ] \
+  && ok "…and with no key in keys.env a wrong-typed store REFUSES the box (not certified, not guessed)" \
+  || bad "a store ask-owner.py cannot use certified the box with nothing to repair it from"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness over a wrong-typed apiKey the gate cannot send" ;;
+  *) ok "…does not claim CELL READY over a wrong-typed apiKey" ;;
+esac
+[ "$(jq -c '.apiKey' "$JEVCFG" 2>/dev/null)" = '{"a":1}' ] \
+  && ok "…and the refused box's store is left EXACTLY as it was (no silent deletion of a credential file)" \
+  || bad "the refusal rewrote or emptied a store it could not repair: $(cat "$JEVCFG" 2>/dev/null)"
+
+say_case "the decision gate: an AMBIENT key is not a source, and the refusal says so"
+rm -f "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-nojev.env" BR_EXTRA_ENV="TYPESAFE_API_KEY=sk_ambient_only" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an ambient-only key does not certify the box (a lane sources the FILE, not the shell)" \
+                   || bad "the bring-up certified a cell whose only decision-gate key lives in an operator's shell"
+case "$BR_OUT" in
+  *"NOT in"*|*"ambient export reaches no lane"*) ok "…and the refusal names the near-miss, so the fix is obvious" ;;
+  *) bad "an ambient-only key is refused with no explanation of why it does not count: $BR_OUT" ;;
+esac
+[ ! -e "$JEVCFG" ] && ok "…and the ambient value was NOT materialised into the store" \
+                   || bad "the store was written from an ambient export — the image's stale-key class"
+
+# ⛔ A BLANK KEY IN keys.env IS NOT AN AMBIENT EXPORT (#2642 review, same root). keys.env is sourced
+# with `set -a`, so a blank value lands in this process — and the pre-fix ambient test took ANY
+# non-empty `printenv` as "set in THIS shell but NOT in $ENV_FILE", so the box was told to put the key
+# in the file it was already in. The box is correctly REFUSED either way; what this pins is that the
+# remedy is not a circle.
+rm -f "$JEVCFG"
+printf 'DEEPSEEK_API_KEY=fake\nTYPESAFE_API_KEY="   "\n' > "$T/keys-blankjev.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-blankjev.env" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "a BLANK TypeSafe key in keys.env does not certify the box (a whitespace value is not a credential)" \
+                   || bad "the bring-up certified a box whose only decision-gate value is whitespace"
+case "$BR_OUT" in
+  *"ambient export reaches no lane"*|*"but NOT in"*) bad "a BLANK value IN keys.env is reported as an AMBIENT export — the remedy it prints (put the key in the file) is what the operator already did: $BR_OUT" ;;
+  *) ok "…and the refusal does not misreport a blank keys.env value as an ambient-only key" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness over a blank decision-gate value" ;;
+  *) ok "…does not claim CELL READY over a blank decision-gate value" ;;
+esac
+[ ! -e "$JEVCFG" ] && ok "…and no store was minted from a blank value" \
+                   || bad "a store was written from a blank keys.env value: $(cat "$JEVCFG" 2>/dev/null)"
+
+# ── THE BOX'S REPO IS DERIVED, NEVER BAKED IN (agent-infra#2919) ────────────────────────────────
+# MEASURED on cell 4, 2026-10-27 16:29–16:38Z against origin/main 0d443381: `cloud-cell-bringup.sh:76`
+# assigned `REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"`, and `check_dispatch` hands that value to
+# the pre-flight as `OR` (the queue target). An agent-infra box was therefore refused provisioning THREE
+# TIMES IN A ROW — `NOT PROVISIONABLE: $REPO is /home/cmux/agent-infra … NOT the queue target
+# daniel-ospina/tortoise` — while every other leg reported `ok`; it passed only when the default was
+# overridden by hand, and the box had been running a TORTOISE clone to compensate. The arms below pin
+# the three things that failure needs: the slug is DERIVED from the checkout the box works, a
+# declaration still wins, and a box that can say neither is refused BY NAME (never guessed at).
+say_case "repo slug: DERIVED from the checkout's origin, never a repo name baked into the script"
+# ⛔ THE MUTATION ARM, and it is asked of the SHIPPED FILE rather than of a mutant copy: restoring
+# `REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"` (or any other repo name used as a default) is the
+# exact regression #2919 records, and this reddens on it. The pattern is anchored to an ASSIGNMENT
+# (`^REPO_SLUG=`) so this file's own prose — which quotes the pre-fix line — cannot satisfy it.
+if grep -Eq '^[[:space:]]*REPO_SLUG="?\$\{REPO_SLUG:-[A-Za-z0-9._-]+/[A-Za-z0-9._-]+' "$BRINGUP"; then
+  bad "$BRINGUP still DEFAULTS REPO_SLUG to a repo name — that is #2919 itself (a wrong target by default for every other repo)"
+else
+  ok "the shipped script carries NO default repo name for REPO_SLUG"
+fi
+if grep -q '^repo_slug_resolve() {' "$BRINGUP" && grep -q '^check_repo_slug() {' "$BRINGUP"; then
+  ok "…and the resolver it uses instead is present (repo_slug_resolve + check_repo_slug)"
+else
+  bad "the resolver is missing — nothing can derive the box's repo (agent-infra#2919)"
+fi
+# A REAL checkout per repo, because the subject IS what `git config` reports (see mk_checkout above).
+mk_checkout "$T/slug/agent-infra" https://github.com/daniel-ospina/agent-infra.git slug-ai \
+  && ok "fixture: an agent-infra checkout with a real 'origin'" \
+  || bad "fixture: could not build the agent-infra checkout"
+mk_checkout "$T/slug/tortoise" https://github.com/daniel-ospina/tortoise.git slug-t3 \
+  && ok "fixture: a tortoise checkout with a real 'origin'" \
+  || bad "fixture: could not build the tortoise checkout"
+# The sourceable copy lives beside the CURRENT repo-slug.sh (the parser and the shape rule are used by
+# name, so a fixture without them would test a degraded path instead of the shipped one).
+LIB2919="$T/clean-bringup/cloud-cell-bringup.sh"
+slug_drive() { # <declared-slug> <workdir> <declared-or>  → prints "<slug>|<source>|<rc>"
+  CELL_HOME="$T/home" bash -c '. "$1"; out=""; rc=0; out="$(repo_slug_resolve "$2" "$3" "$4")" || rc=$?; printf "%s|%s|%s\n" "$(printf "%s\n" "$out" | sed -n 1p)" "$(printf "%s\n" "$out" | sed -n 2p)" "$rc"' \
+    _ "$LIB2919" "$1" "$2" "$3" 2>&1
+}
+DERIVED="$(slug_drive "" "$T/slug/agent-infra" "")"
+case "$DERIVED" in
+  "daniel-ospina/agent-infra|derived from "*"'origin'|0") ok "an undeclared agent-infra box derives ITS own repo from WORKDIR's origin" ;;
+  *"daniel-ospina/tortoise"*) bad "an undeclared agent-infra box resolved to TORTOISE — the #2919 defect is back: $DERIVED" ;;
+  *) bad "the slug was not derived from the checkout's origin: $DERIVED" ;;
+esac
+# ⛔ NON-VACUITY: the same call on another checkpoint of the fleet must answer THAT repo, so the arm
+# above cannot be satisfied by a resolver that always says agent-infra.
+DERIVED_T3="$(slug_drive "" "$T/slug/tortoise" "")"
+case "$DERIVED_T3" in
+  "daniel-ospina/tortoise|derived from "*"'origin'|0") ok "…and a tortoise checkout derives tortoise (non-vacuity: the answer is measured, not fixed)" ;;
+  *) bad "a tortoise checkout did not derive tortoise: $DERIVED_T3" ;;
+esac
+# ⛔ `repo-slug.sh`'s own recorded rule: "An explicit OR in the environment … still WINS … but the default
+# is derived, never guessed". A declaration must never be silently overridden by whatever tree happens to
+# be on the box — that is the same silent override #2919 measured, one direction over.
+DECL="$(slug_drive "daniel-ospina/agent-infra" "$T/slug/tortoise" "")"
+case "$DECL" in
+  "daniel-ospina/agent-infra|declared in REPO_SLUG|0") ok "a declared REPO_SLUG WINS over a different checkout's origin" ;;
+  *) bad "a declared REPO_SLUG lost to the checkout's origin (or was not reported as the source): $DECL" ;;
+esac
+DECL_OR="$(slug_drive "" "$T/slug/tortoise" "daniel-ospina/agent-infra")"
+case "$DECL_OR" in
+  "daniel-ospina/agent-infra|declared in OR|0") ok "a declared OR is arm 1b — it wins too, and says so" ;;
+  *) bad "a declared OR was ignored or misreported: $DECL_OR" ;;
+esac
+# ⛔ THE ARM #2919 ASK 1 EXISTS FOR: with nothing declared and nothing to derive, the answer is a
+# REFUSAL, never a guess. A repo name here is the defect, so this arm fails on any answer that is one.
+NOTHING="$(slug_drive "" "$T/slug/absent" "")"
+case "$NOTHING" in
+  "||1") ok "with nothing declared and no checkout, the resolver REFUSES instead of guessing a repo" ;;
+  *) bad "the resolver invented an answer with nothing to resolve: $NOTHING" ;;
+esac
+BADPIN="$(slug_drive "acme/wid get" "" "")"
+case "$BADPIN" in
+  "||2") ok "a pin that is not an <owner>/<name> is rc 2 (a config error), not a silent fallback" ;;
+  *) bad "a malformed pin was not refused as a config error: $BADPIN" ;;
+esac
+case "$(slug_drive '*' "" "")" in
+  "||2") ok "…and the wildcard '*' is refused, so it cannot reach repo_identity_scan as the ANY-REPO exemption" ;;
+  *) bad "REPO_SLUG='*' passed validation — every repo under a generic name would read clean: $(slug_drive '*' '' '')" ;;
+esac
+# ── the refusal NAMES the remedy, and never the wrong-repo one (agent-infra#2919 ask 2) ──────────
+# The pre-fix message an agent-infra operator got was the PRE-FLIGHT's, whose only remedy was
+# `fix: set REPO=<a checkout of daniel-ospina/tortoise>` — i.e. fetch another repo and grade its issues
+# from this box, which is the mis-target #1901 and the GH_REPO class (#2235) exist to prevent.
+# ⛔ `env -u REPO_SLUG -u OR` IS LOAD-BEARING: this suite's own environment may carry either (a cell
+# exports them to every child), and a run that inherited one would take arm 1 and never reach the
+# refusal — the arm would then assert on a resolution it did not exercise.
+REFUSAL="$(env -u REPO_SLUG -u OR CELL_HOME="$T/home" WORKDIR="$T/slug/absent" \
+  bash -c '. "$1"; check_repo_slug; echo "rc=$?"' _ "$LIB2919" 2>&1)"
+case "$REFUSAL" in
+  *"REPO_SLUG=<owner/name of the repo THIS BOX is for>"*) ok "the refusal names the declaration that fixes it (REPO_SLUG=<this box's repo>)" ;;
+  *) bad "the refusal does not name REPO_SLUG — the operator is left to invent a remedy: $REFUSAL" ;;
+esac
+case "$REFUSAL" in
+  *"set REPO=<"*) bad "the refusal offers the WRONG-REPO remedy (point REPO at another checkout) — that is #2919 ask 2: $REFUSAL" ;;
+  *) ok "…and it does NOT invite the operator to point REPO at another repo's checkout" ;;
+esac
+case "$REFUSAL" in
+  *"rc=0"*) bad "the box was CERTIFIED with no repo at all: $REFUSAL" ;;
+  *) ok "…and a box with no resolvable repo is refused, not certified" ;;
+esac
+# The whole point of the change: an undeclared agent-infra box now RESOLVES and publishes it.
+# Driven from a FILE rather than nested `bash -c` quoting: the subject is "does a CHILD process see the
+# value", so the child has to be a real one, and a quoting accident inside the arm would read as a
+# product failure.
+cat > "$T/publish-probe.sh" <<'PROBE'
+. "$1"
+check_repo_slug >/dev/null 2>&1 || { printf 'rc=%s' "$?"; exit 0; }
+printf 'rc=0 slug=[%s] exported=[%s]' "$REPO_SLUG" "$(sh -c 'printf %s "$REPO_SLUG"')"
+PROBE
+PUBLISHED="$(env -u REPO_SLUG -u OR CELL_HOME="$T/home" WORKDIR="$T/slug/agent-infra" \
+  bash "$T/publish-probe.sh" "$LIB2919" 2>&1)"
+case "$PUBLISHED" in
+  "rc=0 slug=[daniel-ospina/agent-infra]"*) ok "check_repo_slug publishes the derived value ($PUBLISHED)" ;;
+  *) bad "the derived slug was not published: $PUBLISHED" ;;
+esac
+case "$PUBLISHED" in
+  *"exported=[daniel-ospina/agent-infra]") ok "…and EXPORTS it, so the pre-flight and the supervisor's children see it" ;;
+  *) bad "the derived slug is not exported — a child would fall back to its own idea of the repo: $PUBLISHED" ;;
+esac
+# ── the DISPATCH refusal (rc 3), the message the issue actually measured (ask 2) ─────────────────
+# A stub harness whose pre-flight refuses the way the real one does on a queue/checkout mismatch. The
+# subject is the FATAL the operator reads, not the pre-flight's own text (which has its own suite).
+mkdir -p "$T/harness-refuse"
+cat > "$T/harness-refuse/refresh-candidates.sh" <<'STUBREF'
+#!/bin/bash
+printf '%s\n' '[refresh] NOT PROVISIONABLE: $REPO is /home/cmux/agent-infra, whose origin is … — NOT the queue target daniel-ospina/tortoise'
+exit 3
+STUBREF
+DISPATCH_REF="$(CELL_HOME="$T/home" HARNESS="$T/harness-refuse" WORKDIR="$T/slug/agent-infra" REPO_SLUG="daniel-ospina/tortoise" \
+  bash -c '. "$1"; check_dispatch; echo "rc=$?"' _ "$LIB2919" 2>&1)"
+case "$DISPATCH_REF" in
+  *"REPO_SLUG='daniel-ospina/tortoise'"*) ok "the dispatch refusal NAMES the queue target it used, so the operator can tell which side is wrong" ;;
+  *) bad "the dispatch refusal does not name the queue target it used: $DISPATCH_REF" ;;
+esac
+case "$DISPATCH_REF" in
+  *"set REPO_SLUG=<that repo's owner/name>"*) ok "…and names REPO_SLUG as the remedy when this box is for another repo" ;;
+  *) bad "the dispatch refusal offers no REPO_SLUG remedy — an agent-infra box gets no way out: $DISPATCH_REF" ;;
+esac
+case "$DISPATCH_REF" in
+  *"DO NOT fix this by pointing REPO at a checkout of another repo"*) ok "…and REFUSES the wrong-repo remedy in words (the mis-target #1901 exists to prevent)" ;;
+  *) bad "the dispatch refusal does not warn against pointing REPO at another repo — that is what made an agent-infra cell grade tortoise work: $DISPATCH_REF" ;;
+esac
+# ── END TO END through the SHIPPED pre-flight: the pairing the derivation produces is ACCEPTED ────
+# The arms above test the resolver; this one runs the REAL `refresh-candidates.sh --check` to prove the
+# value it produces passes the very comparison that refused the box (the origin pairing, #1901). It is
+# the non-vacuity arm for the whole change: a resolver whose answer the pre-flight still refuses would
+# satisfy every arm above and fix nothing.
+PREFLIGHT="$HERE/orchestrator-harness/refresh-candidates.sh"
+if [ -f "$PREFLIGHT" ]; then
+  PF_DERIVED="$(REPO="$T/slug/agent-infra" OR="$(slug_drive "" "$T/slug/agent-infra" "" | cut -d'|' -f1)" \
+    O="$T/pf-derived" bash "$PREFLIGHT" --check 2>&1)" || true
+  case "$PF_DERIVED" in
+    *"NOT the queue target"*) bad "the pre-flight REFUSED the pairing its own derivation produces — the box still cannot be provisioned: $(printf '%s' "$PF_DERIVED" | tr '\n' ' ' | cut -c1-300)" ;;
+    *) ok "the REAL pre-flight accepts the derived pairing (the origin comparison that refused cell 4 is passed)" ;;
+  esac
+  # AND THE OTHER DIRECTION, so a pre-flight that simply stopped comparing could not satisfy the arm above.
+  PF_MISMATCH="$(REPO="$T/slug/agent-infra" OR="daniel-ospina/tortoise" O="$T/pf-mismatch" \
+    bash "$PREFLIGHT" --check 2>&1)" || true
+  case "$PF_MISMATCH" in
+    *"NOT the queue target"*) ok "…and it still REFUSES a queue target that is a different repo (the check is not inert)" ;;
+    *) bad "a genuinely mismatched queue target was not refused — the pairing check went inert: $(printf '%s' "$PF_MISMATCH" | tr '\n' ' ' | cut -c1-300)" ;;
+  esac
+  # …and its remedy names BOTH directions, never the wrong-repo one alone (ask 2 for the pre-flight).
+  case "$PF_MISMATCH" in
+    *"set REPO_SLUG=<that repo's owner/name>"*) ok "…and its remedy names REPO_SLUG first, not 'clone the other repo'" ;;
+    *) bad "the pre-flight's remedy still offers only 'set REPO=<a checkout of …>': $(printf '%s' "$PF_MISMATCH" | tr '\n' ' ' | cut -c1-300)" ;;
+  esac
+else
+  bad "missing $PREFLIGHT — the end-to-end pairing arm cannot run"
+fi
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIPPED=$SKIP"

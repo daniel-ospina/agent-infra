@@ -342,7 +342,19 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # before and after, the diff of the matched lines is exactly this one line, and the byte delta
 # 5720 → 5732 reconciles character for character (`1.0` twice = +4, `,"/262k"` = +8). The
 # executable-line pin below did NOT move, and the shipped egress is untouched.
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "9059128745732"
+# ⛔ RE-PINNED A SIXTH TIME 2026-11-10, DELIBERATELY, WITH THE DIFF CHECKED — and this one is an
+# ADDITIVE block in the ASK section (agent-infra#2642), not a rewrite. `ask-owner.py` now puts the
+# questions it could not score in their own bucket (`unscored=N` on both summary arms) and prints the
+# `UNSCORED — the owner queue did not receive this` sentence; the heartbeat therefore SUMS that field
+# into N_ASK (so the `ask|` lines that NAME the questions are no longer dropped when the gate scored
+# nothing) and logs one ALERT when it is non-zero. Verified when re-pinning, not assumed: the added
+# executable lines are exactly FOUR — `N_UNSCORED=…`, the `if`, the `log`, and the `fi` (589 → 593) —
+# and the block-keyword signature moved only because that `if`/`fi` pair is itself the added block.
+# NOTHING on the shipped egress moved: no `send` token was added, no `$MSG` read was added (the alert
+# goes to the LOG, never to the payload), and both block depths are unmoved. The delivered beat was
+# already carrying the field — `ASK_EV` is the scan's own last line — so no golden changed either,
+# which the byte-for-byte golden assertions below prove rather than assume.
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "31830192925781"
 # ⛔ AND THE FOOTER SIGNATURE MUST ACCEPT THE BUDGET pi ACTUALLY DRAWS (2026-10-31).
 # `_pane_has_pi` decides whether a pane is driven by pi from a footer marker, so a marker that
 # does not match the LIVE rendering reads a settled lane as unread/idle — the failure that cost a
@@ -365,7 +377,7 @@ done
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 589
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 593
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;
@@ -397,7 +409,7 @@ echo ""
 # script actually SENDS. Everything the tick reaches for is a stub under $HOME (its own
 # resolution root — SCRIPTS/STATE/SD all come from $HOME), plus a `cmux` on $PATH that
 # records the send. Nothing here touches real fleet state, and no network is used.
-sandbox(){ # sandbox <dir> <ask:0|1> [lanes:empty|busy|wait|cap|alert] [mq:none|bottleneck] [obj:ok|risk]
+sandbox(){ # sandbox <dir> <ask:0|1> [lanes:empty|busy|wait|cap|alert] [mq:none|bottleneck] [obj:ok|risk] [unscored:0|N]
   local h="$1" ask="$2" lanes="${3:-empty}" mq="${4:-none}" obj="${5:-ok}"
   # ⛔ `ws` IS COMPUTED BEFORE THE `case` THAT USES IT. The capacity row is built with the
   # orchestrator's own workspace id (the fake `cmux sessions list` reports it as live), and an
@@ -414,8 +426,24 @@ sandbox(){ # sandbox <dir> <ask:0|1> [lanes:empty|busy|wait|cap|alert] [mq:none|
   printf 'lane\tws\tsid\n' > "$h/.pi/agent/state/lane-registry.tsv"
   # Every helper the tick calls, answered offline. The default stub strings are part of the
   # GOLDEN: the delivered beats are pinned by length, so changing one changes §1's numbers.
-  printf '#!/usr/bin/env python3\nprint("ASK pass=0 bounce=%s answered=0 scan_failed=0")\n' \
-    "$ask" > "$h/.pi/agent/scripts/ask-owner.py"
+  # ⛔ `unscored` IS A SIXTH INPUT, AND IT HAS TO BE (#2642 review). No state could produce the field
+  # this change's headline claim rests on, so the claim was protected by NOTHING: `_blk_sig` cksums
+  # only lines that BEGIN with a block keyword (`N_ASK=$(printf … awk …)` does not), `_exec_lines`
+  # counts non-blank lines (editing the awk alternation leaves the count at 593), and every golden fed
+  # `bounce=` only. Measured by review: the mutant that reverts the entire semantic change
+  #   sed -i 's/ || a\[1\]=="unscored"//' scripts/orchestrator-heartbeat.sh
+  # left EVERY row green. The summary line is BYTE-IDENTICAL to the default when it is 0, because the
+  # delivered beat carries `ASK_EV` and every existing golden pins it.
+  if [ "${6:-0}" = "0" ]; then
+    printf '#!/usr/bin/env python3\nprint("ASK pass=0 bounce=%s answered=0 scan_failed=0")\n' \
+      "$ask" > "$h/.pi/agent/scripts/ask-owner.py"
+  else
+    # The real scan emits ONE `UNSCORED <repo>#<n>` line per question ABOVE the summary, then the
+    # summary. BOTH halves are load-bearing here: the count drives the alert, and the naming line is
+    # the thing the `ask|` block is supposed to carry into the log — the half review found missing.
+    printf '#!/usr/bin/env python3\nprint("UNSCORED agent-infra#2642 — the owner queue did not receive this (the cause is on the line above)")\nprint("ASK pass=0 bounce=%s answered=0 scan_failed=0 unscored=%s")\n' \
+      "$ask" "${6:-0}" > "$h/.pi/agent/scripts/ask-owner.py"
+  fi
   printf '#!/usr/bin/env python3\nprint("count=0")\n' > "$h/.pi/agent/scripts/undelivered-answers.py"
   printf '#!/usr/bin/env python3\nprint("DELIVERY 12 open PRs, 8 merged today, 8 P0/P1 PRs blocked")\n' \
     > "$h/.pi/agent/scripts/beta-progress.py"
@@ -877,6 +905,46 @@ for _pair in "alert:0:alert:none:ok" "bottleneck:0:empty:bottleneck:ok" "objecti
     fi
   fi
 done
+
+echo ""
+echo "3b. the UNSCORED state — the field the #2642 claim rests on, which NO other arm could produce"
+# ⛔ THIS IS THE ROW THE MUTANT COULD NOT REDDEN (#2642 review). The claim under test is "summing
+# `unscored` into N_ASK is what makes the questions reach the log", and nothing asserted it: the two
+# structural re-pins in §0 are blind to the awk alternation, and no golden ever carried the field.
+# This state feeds `unscored=1`, so BOTH halves fail if the sum is reverted:
+#   * the alert needs N_UNSCORED>0 (deleting the block leaves `-` and the row is silent);
+#   * the naming line needs N_ASK>0, which is ONLY true because `unscored` is summed — drop
+#     `|| a[1]=="unscored"` and N_ASK is 0, the `ask|` block is gated off, and the question that was
+#     posted and never queued disappears from the log again.
+# The alert must also stay CAUSE-NEUTRAL: `unscored` counts every exit 2, and only one of them is a
+# missing key, so a box whose key is present-but-wrong must not be told to provision it.
+if state unscored 0 empty none ok 1; then
+  body="$BODY"
+  _ulog="$STATE_HOME/.pi/agent/state/orchestrator-heartbeat.log"
+  if grep -qs 'ALERT ask-gate UNSCORED 1 question(s)' "$_ulog"; then
+    pass "unscored: the beat logged the UNSCORED alert (N_UNSCORED reached the log)"
+  else
+    fail "unscored: no 'ALERT ask-gate UNSCORED 1 question(s)' in the tick log — the field is counted and nothing acts on it"
+  fi
+  if grep -qs 'ask| UNSCORED agent-infra#2642' "$_ulog"; then
+    pass "unscored: the per-question NAMING line reached the log (the ask| block ran)"
+  else
+    fail "unscored: the naming line did NOT reach the log — 'unscored' is no longer summed into N_ASK, so the ask| block is gated off and only the count is delivered"
+  fi
+  if grep -qs 'no TypeSafe key on this box' "$_ulog"; then
+    fail "unscored: the alert asserts a cause exit 2 does not imply ('no TypeSafe key on this box') — on a box whose key is present and WRONG the operator is sent to provision a key that is already there"
+  else
+    pass "unscored: the alert does not assert a cause the count cannot know"
+  fi
+  # The delivered body must not tell the owner the question CLEARED, was SENT BACK or was ANSWERED:
+  # an unscored question did none of the three.
+  if hasi "$body" "or was unscored"; then
+    pass "unscored: the delivered QUESTIONS clause names the fourth bucket (a question in no queue)"
+  else
+    fail "unscored: the delivered QUESTIONS clause offers only CLEARED/SENT BACK/ANSWERED — it tells the owner an unscored question was handled when it is posted and unqueued"
+  fi
+  order_check unscored "$body"
+fi
 
 echo ""
 echo "4. proportionality: the quiet body is the shorter one, and the order clause is bounded"

@@ -45,6 +45,13 @@ bash scripts/rail-run.sh status <PR> (--repo owner/repo) (--run <run-id>)       
 prints the run id / log path / exact poll command, and exits. Nothing in this script waits on the
 rail, so no tool call can be capped by it.
 
+**This is the fleet's ONE background-rail verdict function.** The landing-lane CLI
+`scripts/landing/rail-bg.sh` (`start` / `wait` / `poll`) delegates here — it drives
+`scripts/atomic-land.sh` through `RAIL_RUN_RAIL`, polls `status`, and renames the resulting exit code;
+it derives no state of its own (`scripts/landing/rail-bg.test.sh` fails if it starts to). A second
+background-rail instrument with its own liveness rule and its own verdict words is what #2905 exists
+to remove, and AGENTS.md's recorded rule forbids it: *one verdict function, never a second*.
+
 State lives under `${RAIL_RUN_DIR:-${O:-$HOME/orchestrator}/state/rail-run}/<repo-key>/pr-<N>/<run-id>/`
 (`pid`, `start`, `created`, `railpid`, `railstart`, `rc`, `log`, `repo`, `host`, `rail`, `args`,
 `started`, and a `latest` pointer, which is written atomically and validated like `--run` because it is
@@ -184,6 +191,7 @@ Three stated residuals:
 
 ```bash
 bash scripts/rail-run.test.sh      # no network, no real gh, no real rail
+bash scripts/landing/rail-bg.test.sh   # the CLI over it: delegation + no second verdict rule (#2905)
 ```
 
 **249 passed, 0 failed** (`bash scripts/rail-run.test.sh`, no network; the only number asserted anywhere is the pass/fail line). The suite is mostly

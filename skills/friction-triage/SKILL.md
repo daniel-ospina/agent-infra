@@ -1,6 +1,6 @@
 ---
 name: friction-triage
-description: Use when a session postmortem or friction_events.jsonl shows friction patterns — BEFORE filing any fix issues. Triage classifies each friction (agent-error, gate-bug, design-gap, workaround-signal), clusters related events, researches root causes, and only then files scoped issues with research mandates.
+description: Use when session captures in ~/.tortoise/session-events/ show friction patterns — BEFORE filing any fix issues. Triage derives the friction signals from the recorded turns, classifies each one (agent-error, gate-bug, design-gap, workaround-signal), clusters related events, researches root causes, and only then files scoped issues with research mandates.
 domain: capability
 subjects.team: organisation-design-team
 type: Bounded
@@ -62,19 +62,54 @@ The broken pipeline produces issues that prescribe solutions before understandin
 
 ## Step 1 — Gather
 
-Read friction data. The current writer is `extensions/reflect-hook.ts` — session data lands in `~/.tortoise/session-events/<date>.jsonl` (and hosted tortoise `/v1/sessions` once hosted capture is explicitly opted in via `"cloud": true` plus a key — #803; a key alone never enables egress). Legacy eldato checkouts also write under `docs/teams/<team>/operations/`:
+**What the source actually is.** The writer is `extensions/reflect-hook.ts` (agent-infra). On every session *quit* it appends ONE JSON object per session to `~/.tortoise/session-events/<YYYY-MM-DD>.jsonl` — except an empty session, which is skipped (`Skipped — empty session`) and leaves no record. It also POSTs the same payload to hosted tortoise `POST /v1/sessions`, but ONLY when hosted capture is explicitly opted in (`"cloud": true` in `~/.pi/agent/tortoise-config.json`) **and** a key is present (a key alone never enables egress — #803). A repo narrows it with `<repo>/.pi/tortoise-capture.json` `{"cloud": false}`; `TORTOISE_CAPTURE_CLOUD=0` denies for a session. The effective state is stated at session start and again at quit, so a silent capture outage cannot be mistaken for a quiet system.
 
-```bash
-# Current source (reflect-hook):
-ls -t ~/.tortoise/session-events/*.jsonl 2>/dev/null | head -1
-cat "$(ls -t ~/.tortoise/session-events/*.jsonl 2>/dev/null | head -1)" 2>/dev/null
+⛔ **The record is a raw transcript, not a friction list.** Schema of one line (measured 2026-11-11 against `~/.tortoise/session-events/2026-11-11.jsonl`):
 
-# Legacy eldato source (if a checkout exists):
-ls -t docs/teams/*/operations/*postmortem* 2>/dev/null | head -1
-cat docs/teams/organisation-design-team/operations/friction_events.jsonl 2>/dev/null
+```
+{ "session_id": "…",
+  "conversation": [ { "role": "user"|"assistant", "content": "…" } ],  # user/assistant TEXT turns only, ≤5000 chars each, ≤1000 turns
+  "metadata": { "capturedAt", "charCount", "projectRoot", "prs": ["123", …], "source": "pi-session-quit", "team" },
+  "harness": "pi", "machine_id": "…", "model": "…" }
 ```
 
-Extract: friction types, frequencies, timestamps, double-loop flags.
+There is **no** `friction_events.jsonl` and no `docs/teams/*/operations/` postmortem feed in this fleet (`rg friction_events` matches this skill only) — that was the eldato-era `reflect.py`, retired with #94. **Do not wait for a pre-classified feed and never report "no friction found" because it is absent** — derive the signals from the turns. An agent that stops at "the feed does not exist" re-creates the silently-dead pipeline #94 removed.
+
+```bash
+DIR="${TORTOISE_FALLBACK_DIR:-$HOME/.tortoise/session-events}"
+FILES=$(ls -t "$DIR"/*.jsonl 2>/dev/null | head -3)
+[ -n "$FILES" ] || { echo "no session records in $DIR — nothing to triage; say so, do not invent"; exit 0; }
+
+# (1) One line per session: when, which repo, which PRs, how big.
+for f in $FILES; do
+  jq -r '[.session_id, .metadata.capturedAt, .metadata.projectRoot,
+          ((.metadata.prs // []) | join(",")), .metadata.charCount] | @tsv' "$f"
+done
+
+# (2) Signal VOLUME per session — one instrument hammering a lane shows up here.
+for f in $FILES; do
+  jq -r '.conversation[].content' "$f" \
+    | grep -oiE '\[VGATE\]|BLOCKED|FAIL(ED|URE)?|refus(ED|AL)|fatal:|error:' \
+    | tr 'A-Z' 'a-z' | sort | uniq -c | sort -rn \
+    | awk -v f="$(basename "$f" .jsonl)" '{printf "%s\t%5d\t%s\n", f, $1, $2}'
+done
+
+# (3) The matching TURNS, for the instruments that fired most (bounded sample).
+for f in $FILES; do
+  jq -r '.session_id as $s | .conversation[]
+         | select(.content | test("\\[VGATE\\]|BLOCKED|FAIL(ED|URE)?|refus|fatal:|error:"; "i"))
+         | [$s, .role, (.content | gsub("\\s+"; " ") | .[0:240])] | @tsv' "$f"
+done | head -100
+```
+
+**Extract these four per signal — they ARE the friction events; Step 2 classifies them:**
+
+1. **instrument** — the gate/tool that fired (`VGATE`, `review-enforcer`, `sequence-enforcer`, a red check name, a shell error).
+2. **timestamp** — the containing session's `metadata.capturedAt`. The record is per-session, so there is no per-turn timestamp; do not invent one.
+3. **frequency** — how many sessions/turns carry the same signal. One typo is not friction; 40 identical blocks is.
+4. **the cause the session itself named** — the assistant's own adjacent explanation, which is what makes a cluster traceable instead of guessed.
+
+⛔ **`double-loop` is not a field — infer it** in Step 4 from whether the session's remedy addressed the *cause* (double-loop) or worked around the *symptom* (single-loop). Nothing in the record labels it for you.
 
 ## Step 2 — Triage
 

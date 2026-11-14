@@ -1590,7 +1590,20 @@ export function ownershipAllowed({ opKind, currentBranch, baselineBranch, target
       const t = (targets || []).map((x) => (x === "HEAD" ? currentBranch : x)).filter(Boolean);
       if (t.length === 0) return false;
       if (opKind === "branch-force-delete") {
-        const own = (ownedBranches || []).filter((b) => b !== "main" && b !== "master");
+        // ⛔ THE OWNED SET ARRIVES IN TWO SHAPES (#608). index.ts's live caller
+        // passes the per-pid `Set<string>` it also hands decideM3, whose
+        // ownership arm accepts Set OR array (`.has` / `.includes`); this
+        // function assumed an ARRAY and called `.filter` on whatever it got, so
+        // a session that had renamed its own baseline in this repo — i.e. every
+        // #376 ceremony — threw `TypeError: (ownedBranches || []).filter is not
+        // a function` inside the tool_call handler, and pi blocks a tool on a
+        // handler failure: the post-ceremony `git branch -D <own branch>` was
+        // refused by a crash instead of allowed. Normalise, never branch on the
+        // caller, so both shapes keep working.
+        const ownedList = Array.isArray(ownedBranches)
+          ? ownedBranches
+          : (ownedBranches && typeof ownedBranches.has === "function" ? Array.from(ownedBranches) : []);
+        const own = ownedList.filter((b) => b !== "main" && b !== "master");
         return t.every((x) => x === baselineBranch || own.includes(x));
       }
       return t.every((x) => x === baselineBranch);

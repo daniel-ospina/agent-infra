@@ -8,7 +8,7 @@ status: live
 tags: [fleet, cmux, cells, dispatch, capacity, recovery, harness]
 summary: "How to provision, measure, recover, and dispatch on cmux cloud cells, and how work actually lands from them."
 created: 2026-10-19
-updated: 2026-11-05
+updated: 2026-11-11
 ---
 
 > ⛔ **This skill MUST be read in full — not skimmed.** Every section below is a measurement that cost a lost lane, a
@@ -286,8 +286,19 @@ derived first and refuses there — so it is the test seam's twin of this arm, s
 **rc=2, a read that did not resolve** (`UNREADABLE open-PR count` / `UNREADABLE landing rate` — each carries "(the gh read
 failed)"; a third line, `UNREADABLE landing counts for …`, guards counts that do not parse, but `land_backlog_lands` returns
 1 on any read failure and otherwise prints two integers it built itself, so that guard **cannot fire today** — do not
-diagnose a 74 as a parse problem) — box-local, so fixing that box's gh chain clears them and **a re-dispatch to a healthy box does clear them**, even
-though the gate prints the ratio remedy text for it too. A P0-blocker or a base-red repair is **exempt by evidence** and dispatches under the hold — **when the exemption read
+diagnose a 74 as a parse problem) — **env-local, NOT box-local, and the gate now names which cause it is.** Two arms of a NAMED CAUSE — a third line, `⛔ BUT FIRST: this lane's gh credential could
+NOT be resolved either (state=unresolved)`, prefixes the ratio remedy when the credential instrument is absent, and names no cause
+because it could not read one: (a) the gh chain failed while the
+lane's gh IS credentialed — fix that box's chain; (b) **no credential at all resolved for the lane**, because nothing set
+`GH_CONFIG_DIR` while `HOME` is redirected to the cell home (agent-infra#2509) — measured on `pi-cell-4` and `pi-cell-5`,
+**byte-identical refusals**, so **a re-dispatch to another healthy box does NOT clear it**: every cell redirects `HOME` the
+same way. Since #2509 `spawn-gate.sh` resolves the config dir BEFORE the gate, and `gh-auth.sh` takes ONE order — NOT gh's
+own, because two of its six stops are sources gh does not have: the TOKEN names first (they outrank every directory),
+then ambient `GH_CONFIG_DIR`, then ambient `$XDG_CONFIG_HOME/gh`, then the lane's `keys.env`, then the lane HOME's
+`~/.config/gh` (gh's own default — and `home-xdg`, exported, when XDG is set so gh would not read it), then the ACCOUNT
+home's `~/.config/gh` — and
+the refusal prints the CREDENTIAL remedy instead of the ratio one when that is the cause — do not act on `land/fix the open
+PRs` for it. If it still refuses, read the lane's `[gh-auth] state=…` line against `gh auth status` under the lane's `HOME`. A P0-blocker or a base-red repair is **exempt by evidence** and dispatches under the hold — **when the exemption read
 itself succeeds**; on the rc=2 arm it fails with the same gh chain, so a P0 *is* held until the chain is fixed (the
 gate's refusal line says so). **Idling on its own changes none of them**: for 73
 and 77 the release *is* a lane draining, so the drain has to actually complete rather than just pass time — which is why the
@@ -389,6 +400,16 @@ channel verdicts — the first one **is**, and it is listed with them only to sa
   as an owner decision, and treat it as unverified for spawn until `cmux cloud agent … -- "reply OK"` returns a `terminal_id`
   on that box afterwards. Until it is taken, **`tmux` is the surface that still starts a worker** on that box, and `cmux vm ls`
   reading `reachable linked` for a peer says nothing about whether its link opens (#2345).
+  ⛔ **The `cmux self --json` reading quoted above is NOT a daemon verdict — on a box whose daemon is answering it reads the
+  same way, i.e. it points at the owner-gated reset in #2312 on a HEALTHY box.** Measured on **pi-cell-5**, 2026-11-11T03:45Z,
+  with that box's session daemon demonstrably UP: `cmux server status` → `status running`, pid `712399`, socket
+  `/tmp/cmux-tui-1000/cloud.sock`, and `cmux tree --json` → **rc 0** with a live client entry — and in the same minute
+  `cmux self --json` **still** reported `"route": null, "reachable": false` for `self`, while all four peers carried
+  `ws://[fdbc:…]:1337/v1/link` with `"reachable": true`. `route`/`reachable` describe the link the machine is reached BY, so
+  for `self` the field is structurally empty; the CLI's own human render agrees and prints no reachability verdict there at all
+  (`cmux vm ls` → `* pi-cell-5 … running (this machine)`, same minute). So settle the daemon with `cmux server status` +
+  `cmux tree --json` and never read self's `route`/`reachable` as evidence in EITHER direction — the failure in the paragraph
+  above is established by the other two readings and the journal, not by this one.
   ⛔ **The guest-CLI advice in this bullet and every bullet above assumes the guest CLI RUNS AT ALL, and on a measured cell shape it does
   not:** `cmux: cmux-tui daemon binary not found at /root/.cmux/bin/cmux-tui` — the `cmux-tui` symlink dangling and no daemon
   process (agent-infra#2368; the same measurement as `worker-terminal.sh:168-171` and `scripts/orchestrator-harness/README.md:568`).

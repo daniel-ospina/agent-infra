@@ -1511,11 +1511,14 @@ BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null
 
 # Remote delete — server-side; run it AFTER the teardown above. The #73
 # coordinated-delete guard blocks deleting a branch still checked out in ANY
-# worktree, but it matches the LITERAL ref in the command text, so this
-# shell-variable form is not guard-matched (the teardown ordering makes it moot).
+# worktree, and it matches the LITERAL ref in the command text. ⛔ An unresolvable
+# target — "$BRANCH", a $(…) substitution, a glob, a brace expansion — is REFUSED
+# fail-closed since #653: the guard cannot tell which ref it would delete.
+#   → STEP 1: read the merged branch:   echo "git push origin --delete $BRANCH"
+#   → STEP 2: REPLACE REPLACE-WITH-PR-BRANCH below with the ref that prints, then run it.
 # "remote ref does not exist" means deleteBranchOnMerge already removed it = success.
-git push origin --delete "$BRANCH" 2>/dev/null \\
-  || echo "ℹ️ remote branch $BRANCH already deleted or unavailable"
+git push origin --delete feat/REPLACE-WITH-PR-BRANCH 2>/dev/null \\
+  || echo "⚠️ remote delete did NOT run for feat/REPLACE-WITH-PR-BRANCH — substitute the PR branch from STEP 1 and re-run, or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/<that-ref>"
 
 # Local delete — best-effort. If the worktree was removed above the branch is no
 # longer checked out, but the HUB's main-checkout branch-force-delete gate still
@@ -1554,7 +1557,7 @@ const DRIFT_GUARD_05_FENCE_MARKER = "```bash\n# BRANCH = the merged PR branch";
 // of the ceremony (skills/commit-workflow/workflow/04-merge-deploy.md:91), VERBATIM.
 // Shared by the TRUE-fixture pin below and the #482 drift guard. Line-only surface: prose
 // edits elsewhere in Step B (worktree-defer comments/echoes) must NOT red the guard.
-const MERGE_DEPLOY_STEP_B_DELETE = `git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete blocked/failed — retry after teardown or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"`;
+const MERGE_DEPLOY_STEP_B_DELETE = `git push origin --delete feat/REPLACE-WITH-PR-BRANCH 2>&1 || echo "⚠️ remote delete did NOT run for feat/REPLACE-WITH-PR-BRANCH — substitute the PR branch printed above, or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/<that-ref>"`;
 
 test("TRUE: delete-shaped forms (flag either position, :refspec, -d, multi-target, redirects, cd-prefix)", () => {
   const truePins = [
@@ -1712,7 +1715,11 @@ test("#482 drift guard: MERGE_DEPLOY_STEP_B_DELETE == the live 04-merge-deploy.m
   // Locate the delete invocation inside the fence by its stable verb+target prefix
   // (a partial edit like 2>&1 → 2>/dev/null must still find the line, then fail the
   // FULL-LINE compare below with a readable diff); compare the full line (trimEnd).
-  const delStart = docText.indexOf('git push origin --delete "$PR_BRANCH"', bodyStart);
+  // #653: the anchor is the doc's LITERAL-target delete line. The ceremony no
+  // longer deletes a shell variable (the guard refuses an unresolvable target
+  // fail-closed), so anchoring on `--delete "$PR_BRANCH"` would now be -1 and the
+  // guard would red on a doc it is supposed to keep honest.
+  const delStart = docText.indexOf('git push origin --delete feat/REPLACE-WITH-PR-BRANCH', bodyStart);
   ok(delStart !== -1 && delStart < fenceClose, "04-merge-deploy.md Step B fence must contain the remote-delete push line");
   const lineStart = docText.lastIndexOf("\n", delStart) + 1;
   const lineEnd = docText.indexOf("\n", delStart);

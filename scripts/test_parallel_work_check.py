@@ -101,16 +101,46 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _wall_clock() -> datetime:
+    """The REAL clock — bash E2E arms MUST anchor leases to this, not `NOW`.
+
+    `NOW` is a FROZEN anchor so the unit folds stay deterministic: every unit
+    test injects `now=NOW` into `run_check` and the card leases are formed
+    from the same anchor, so `lease=600` and `lease=-60` mean exactly what
+    they say. The bash E2E path (#2865) is a different contract: the wrapper
+    spawns a subprocess that computes its OWN `now` from the wall clock, and
+    there is deliberately no env knob to inject one — a collision gate whose
+    clock an environment variable can move is a fail-open vector.
+
+    A bash arm that forms its lease from `NOW` is therefore checked against
+    wall time, and once wall time passes `NOW + lease` the card reads as
+    EXPIRED. That failure is silent and it inverts the assertion: liveness is
+    the C2 blocking predicate, so the `lease=600` "LIVE lease → OVERLAP" arm
+    degrades into a second copy of the `lease=-60` "expired → CLEAR" arm and
+    pins nothing. Measured 2026-11-10, 89 days after `NOW`: the arm read
+    `C2: CLEAR  ok  options=`, and the same fixture with `lease=100000000`
+    read `C2: OVERLAP  live-touched-paths-overlap card=card-b …` — i.e. the
+    gate was correct and the fixture was stale.
+    """
+    return datetime.now(timezone.utc)
+
+
 def _card(card_id="card-a", *, issue="4904", status="running", claimed="agent-a",
           phase="scoping", touched=("src/auth.py",), lease=3600,
-          base="cafe1234") -> dict:
+          base="cafe1234", clock=None) -> dict:
+    """A board card row. `clock` anchors the lease/heartbeat timestamps.
+
+    Default `NOW` (deterministic unit folds). Bash E2E arms pass
+    `clock=_wall_clock()` — see that helper for why (#2865).
+    """
+    anchor = clock or NOW
     return {
         "id": card_id, "issue_number": issue, "status": status,
         "claimed_by": claimed, "phase": phase,
         "touched_paths": list(touched) if touched else None,
-        "lease_expires_at": _iso(NOW + timedelta(seconds=lease))
+        "lease_expires_at": _iso(anchor + timedelta(seconds=lease))
         if lease is not None else None,
-        "heartbeat_at": _iso(NOW),
+        "heartbeat_at": _iso(anchor),
         "base_commit": base,
     }
 
@@ -836,14 +866,28 @@ def test_bash_c2_expired_lease_ignored_live_overlap_blocks(tmp_path):
     sb.routes["/rest/v1/organizations"] = {
         "payload": [{"id": "org-1", "slug": "apresto"}]}
     sb.patch_routes["/rest/v1/cards"] = {"payload": [{"id": "card-a"}]}
+    # ⛔ BOTH arms anchor to the WALL clock, never to the frozen `NOW`: the
+    # bash path's subprocess computes its own `now`, so a `NOW`-anchored lease
+    # is 89 days expired by the time this suite runs and the "LIVE" arm turns
+    # into a duplicate of the expired arm (#2865). See `_wall_clock`.
+    clock = _wall_clock()
     # card-b lease EXPIRED → not live → CLEAR
-    _board(sb, [_card("card-a"), _card("card-b", lease=-60)])
+    _board(sb, [_card("card-a", clock=clock),
+                _card("card-b", lease=-60, clock=clock)])
     env = _bash_env(_url(gh), _url(sb), tmp_path, tmp_path / "token.json")
     proc = _run_bash(tmp_path, "scope", repo, env)
     assert proc.returncode == 0
     assert proc.stdout.strip().splitlines()[0].startswith("C2: CLEAR")
     # card-b lease LIVE + overlapping touched_paths → OVERLAP
-    _board(sb, [_card("card-a"), _card("card-b", lease=600)])
+    live = _card("card-b", lease=600, clock=clock)
+    # Drift guard: without this the arm below can only fail with the opaque
+    # `C2: CLEAR` assertion, which is indistinguishable from a C2 regression.
+    # Here the fixture names ITSELF as the culprit.
+    assert pwc._lease_live(live, _wall_clock()), (
+        "fixture drift: the 'LIVE' arm is not live against the wall clock "
+        f"(lease_expires_at={live['lease_expires_at']}, now={_wall_clock()}) "
+        "— anchor the fixture to _wall_clock(), not the frozen NOW (#2865)")
+    _board(sb, [_card("card-a", clock=clock), live])
     proc = _run_bash(tmp_path, "scope", repo, env)
     assert proc.returncode == 0
     line = proc.stdout.strip().splitlines()[0]

@@ -62,8 +62,15 @@ const setEq = (a, b) => a.length === b.length && [...a].sort().join() === [...b]
 
 /** block-scalar fixture — value is a canonical representation (contentIndent
  *  not stripped, chomping not applied), so the oracle asserts direction
- *  (both non-empty strings) instead of byte equality. */
-const isBlockScalarFixture = (content) => /:[ \t]*[>|](?:[+-]?[1-9]?)[ \t]*(?:#.*)?\n/.test(content);
+ *  (both non-empty strings) instead of byte equality.
+ *  ⛔ BOTH INDICATOR ORDERS (YAML 1.2 §8.1.1): `|+2` is chomp-then-indent and
+ *  `|2+` is indent-then-chomp, and BOTH are valid headers. The predicate carried
+ *  only the first order, so an indent-then-chomp fixture (`>1-`) was not
+ *  recognised as a block scalar and the leg compared byte-for-byte — the same
+ *  one-sided-predicate class #370's round-1 fix closed for comment-carrying
+ *  headers (11b73738c). The expression must mirror `frontmatter-validate.mjs`'s
+ *  header grammar, which is the point of the drift lock. */
+const isBlockScalarFixture = (content) => /:[ \t]*[>|](?:[+-]?[1-9]?|[1-9][+-]?)[ \t]*(?:#.*)?\n/.test(content);
 
 // ── pi bundle ───────────────────────────────────────────────────────────────
 let pi;
@@ -398,6 +405,44 @@ const VALUE_POOL = [
   "|1 token",
   "|- x",
   "| x # y",
+  // #458 — the NO-SPACE sibling class: indicator immediately followed by a
+  // non-grammar tail. #370 pinned the space-then-token forms above but not the
+  // adjacent boundary, which is the one the header regex never matched at all
+  // (it requires whitespace before a tail) → fell through to the plain-scalar
+  // path → typed string → gate passed → pi dropped. The legal modifier-only
+  // headers are here too: `|` and `|-` above, and bare `|1` / `|+` in the
+  // boundary block below — and `|1 #c` / `|- #c` sit on the false-positive
+  // boundary the generalized guard must not cross.
+  "|#c",
+  "|#",
+  ">#x",
+  "|x",
+  "|comment",
+  ">text",
+  "|-#c",
+  "|+x",
+  "|1x",
+  "|-x",
+  "|1 #c",
+  "|- #c",
+  // #458 review round 2 — the modifier-only headers this pool did NOT already
+  // carry: `|-` and `|` were here, bare `|1` and `|+` were not (only the
+  // ILLEGAL `|1 token`, `|+0`, `|+2+`). Both are legal and pi loads them.
+  "|1",
+  "|+",
+  // #458 review round 1 — the OTHER legal indicator order (YAML 1.2 §8.1.1
+  // permits indentation-then-chomping as well). These LOAD in yaml, so the
+  // header regex must accept them; a validator that flags them is the
+  // false-positive direction this pool now catches.
+  "|2",
+  "|2+",
+  "|2-",
+  ">1-",
+  "|2+ #c",
+  "|1+ #c",
+  // …and the illegal double-indicator forms, which must stay rejected.
+  "|+2+",
+  "|2+-",
 ];
 const KEY_POOL = ["name", "description", "steps", "other", "key", "subjects.team"];
 

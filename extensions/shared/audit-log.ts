@@ -88,7 +88,9 @@ export const GATE_EVENT_NAMES = [
   //                               above, not this one). The record exists so the non-adoption is durable and
   //                               parent-readable, not only a child's stdout line
   "gate_root_mismatch", // verification-gate #3255/#1265: a git op resolved to a root the bridge holds no
-  //                        entries for while a same-repo sibling has them — hashes cannot be compared. The
+  //                        entries for while a same-repo sibling has them — their entries are never adopted
+  //                        as this op's records (per-path content identity is a separate, matching-only
+  //                        rule — #2886's `foreign_root_blob_identical`). The
   //                        block decision is unchanged; this is the durable half of the diagnosis (AC (b))
   // #3297: the argv-level gh shim (#984) was NOT LOADED on this box, so the admin-merge gate
   // refused to certify a merge. Recorded as an EVENT, not only as console prose: row 1 of

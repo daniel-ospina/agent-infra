@@ -112,7 +112,7 @@ drive() {
       O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
       REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
       MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" "$@" \
-      bash "$LANE" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1
+      bash "${LANE_BIN:-$LANE}" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1
   LANE_RC=$?
 }
 # drivef <worktree> <extra LANE argv…> — the same, but passing ARGUMENTS. The key gate's escape is
@@ -141,8 +141,8 @@ LOG() { printf '%s\n' "$ARMDIR/o/logs/lane-3331.log"; }
 lastline() { tail -n 1 "$(LOG)" 2>/dev/null; }
 
 # ── the outcome vocabulary, read off the ARTIFACT: exactly one terminal line, last in the log ─────
-check_terminal() { # <arm-label> <expected-outcome> <expected-reason-prefix> [<expected-rc>]
-  local lab="$1" want="$2" wantwhy="$3" wantrc="${4:-}" log n last
+check_terminal() { # <arm-label> <expected-outcome> <expected-reason-prefix> [<expected-rc>] [<expected-keygate>]
+  local lab="$1" want="$2" wantwhy="$3" wantrc="${4:-}" wantkg="${5:-}" log n last
   log="$(LOG)"
   n="$(grep -c '^outcome=' "$log" 2>/dev/null || true)"
   eqv "${n:-0}" "1" "$lab: the log carries EXACTLY ONE terminal line (a log with none is the defect; two means the writer is not idempotent)"
@@ -163,6 +163,12 @@ check_terminal() { # <arm-label> <expected-outcome> <expected-reason-prefix> [<e
   # whole suite stayed green on exactly that defect.
   if [ -n "$wantrc" ]; then
     has "$last" "rc=$wantrc" "$lab: rc= reports the status the process actually exited with ($wantrc)"
+  fi
+  # ⛔ `keygate=` IS ASSERTED ON EVERY ARM THAT PASSES IT (review: the escape must be COUNTABLE). A field the
+  # writer can omit without a red is the prose-only bypass again; passing the expectation makes its absence
+  # an assertion failure, and its VALUE pins which state the run really reached.
+  if [ -n "$wantkg" ]; then
+    has "$last" "keygate=$wantkg " "$lab: the terminal line says keygate=$wantkg (what the model-credential gate did for THIS run)"
   fi
   # ⛔ THE VOCABULARY IS CLOSED. A writer that invents a fifth word records nothing an instrument can
   # count, so the four are pinned here rather than trusted.
@@ -190,7 +196,7 @@ has "$(cat "$(LOG)" 2>/dev/null)" "[key-gate] lane 3331 check=fail result=REFUSE
 has "$(cat "$(LOG)" 2>/dev/null)" 'pi -p --no-session --provider deepseek --model deepseek-flash' \
     "1b2 …and the remedy gives the exact working invocation, not \"source keys.env\""
 [ ! -s "$PI_MARK" ]; ck "1c pi was NEVER spawned — the refusal is BEFORE the agent, so no model call was spent" $?
-check_terminal "1d" refused "key-gate:credential-missing:$KEYVAR" 82
+check_terminal "1d" refused "key-gate:credential-missing:$KEYVAR" 82 refused
 # ⛔ AND THE TERMINAL TOKEN NAMES THE MODEL, NOT ONLY THE VARIABLE (agent-infra#3443). The failure this
 # gate front-runs is named after the MODEL (`No API key found for the selected model.`), so a token
 # carrying only `$VAR` sends an operator to a credential that may never have been the question — and this
@@ -383,7 +389,14 @@ eqv "$LANE_RC" "0" "1y6 --key-gate-off on the INVOCATION skips the assertion (rc
 [ -s "$PI_MARK" ]; ck "1y7 …and the agent really ran" $?
 has "$(cat "$(LOG)" 2>/dev/null)" "reason=--key-gate-off" \
     "1y8 …and the skip is LOUD and named (a silent skip is the bypass this whole change refuses)"
-check_terminal "1y9" done "agent-exit-0" 0
+check_terminal "1y9" done "agent-exit-0" 0 off
+# ⛔ THE BYPASS IS COUNTABLE ON THE TERMINAL LINE, NOT ONLY IN PROSE (the review's most substantive finding).
+# `keygate=off` is the token a fleet scan counts; the prose line above is what an operator reads. One command
+# answers "how many lanes on this box had the credential assertion switched off?".
+eqv "$(grep -c 'keygate=off ' "$ARMDIR/o/logs/lane-3331.outcome" 2>/dev/null || true)" "1" \
+    "1y10 the run-scoped verdict carries keygate=off, so a BYPASS is countable from the artifact the gate ships"
+eqv "$(grep -c 'keygate=checked ' "$ARMDIR/o/logs/lane-3331.outcome" 2>/dev/null || true)" "0" \
+    "1y11 …and an escaped run is never reported as checked (the false-pass direction)"
 
 # ── 1z: A STORED CREDENTIAL IS NOT A MISSING ONE (review round 3, P1) ────────────────────────────
 # `pi` consults `auth.json` (what `pi /login` writes) BEFORE the environment, so a provider logged in
@@ -400,7 +413,7 @@ eqv "$LANE_RC" "0" "1z a lane whose provider is logged in (auth.json, no env var
 [ -s "$PI_MARK" ]; ck "1z2 …and the agent really started" $?
 has "$(cat "$(LOG)" 2>/dev/null)" "check=skipped reason=stored-credential" \
     "1z3 …because the gate says WHICH source answered, instead of passing silently"
-check_terminal "1z4" done "agent-exit-0" 0
+check_terminal "1z4" done "agent-exit-0" 0 skipped
 [ ! -s "$ARMDIR/o/state/capacity-refused-3331" ]; ck "1z5 …and no stand-down record is written for a lane that ran" $?
 
 # ═══ 2. A LANE WHOSE AGENT RUNS AND RETURNS 0 ═══════════════════════════════════════════════════════
@@ -409,7 +422,7 @@ mk_arm done; WT="$ARMWT"
 drive "$WT" "$KEYVAR=sk_fixture"
 eqv "$LANE_RC" "0" "2a the lane exits 0"
 [ -s "$PI_MARK" ]; ck "2b the agent DID run (the gate passes what it cannot object to, and pi was spawned)" $?
-check_terminal "2c" done "agent-exit-0" 0
+check_terminal "2c" done "agent-exit-0" 0 checked
 # ⛔ THE PER-RUN VERDICT (review round 4, P2, measured). The lane LOG is append-only, so a re-dispatched
 # issue keeps the previous attempt's `outcome=` line and `tail -1` on the log can hand a reader that
 # earlier verdict while the current run is still working. The per-run sibling is what a liveness read must
@@ -609,7 +622,7 @@ pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
 export -f pi
 drive "$WT" "$KEYVAR=sk_fixture" MAX_LOAD=0
 eqv "$LANE_RC" "75" "6a a load refusal still exits 75"
-check_terminal "6b" refused "load-gate" 75
+check_terminal "6b" refused "load-gate" 75 checked
 
 # ── 6c: A GATE THAT COULD NOT RUN IS NOT A REFUSAL (review round 4, P2, measured) ────────────────
 # The gate writes its output to a file in `$O/state`, and the FIRST cut put that redirect inside the refusal
@@ -626,6 +639,11 @@ if [ "$(id -u)" != "0" ]; then
   chmod 700 "$ARMDIR/o/state" 2>/dev/null || true
   eqv "$LANE_RC" "78" "6c an UNWRITABLE \$O/state reports the gate as unable to run (78), not as a credential refusal"
   has "$(lastline)" "outcome=died reason=key-gate-not-run" "6d …and its outcome says the gate did not run"
+  # ⛔ `notrun` IS ASSERTED HERE, and that is the only arm that can produce it (review, P2): the field's
+  # "the gate broke" value used to be written but never required by any assertion, so a writer that lost
+  # the path — or an arm that simply forgot the field — stayed green. That is the same "a field omitted
+  # without a red" hole the change's own comment names for the escape.
+  has "$(lastline)" "keygate=notrun " "6d2 …and keygate=notrun says the GATE broke, not the credential"
   hasnt "$(cat "$(LOG)" 2>/dev/null)" "holds no value in the environment" "6e …and it does NOT claim the credential is missing (the credential was PRESENT here)"
   [ ! -s "$ARMDIR/o/state/capacity-refused-3331" ]; ck "6f …and nothing is yielded, because nothing was measured" $?
 else
@@ -659,9 +677,46 @@ case "$ebv" in
   *) bad "7d the dry-run refusal did not happen, so the arm measured nothing (tail: $ebv)" ;;
 esac
 eqv "$LANE_RC" "72" "7e …and exits 72"
-check_terminal "7f" refused "repo-target:REFUSED" 72
+check_terminal "7f" refused "repo-target:REFUSED" 72 unreached
 [ ! -s "$PI_MARK" ]; ck "7g …and no agent was started" $?
 unset TARGET_SLUG
+
+# ═══ 7h. THE VERDICT IS THE LAST `check=` LINE, NOT THE FIRST (review, P1, measured) ═════════════
+# `key_gate_assert` runs the box-default COMPANION before the verdict, and that companion prints
+# `check=warn …` on a box that pins a startup model. A `head -1` read classified the companion's WARNING as
+# the gate's answer: it matched no verdict, fell through to `notrun`, and a lane whose gate really said
+# `check=ok` — or really refused with 82 — reported `keygate=notrun`, i.e. the field accused the harness of a
+# bug while the credential was the problem (or was fine). Reproducing that with a real settings pin is
+# environment-dependent; the ORDER is the defect, so the stub below prints the same shape deterministically.
+mk_arm warnfirst; WT="$ARMWT"
+STUBH="$ARMDIR/harness"; mkdir -p "$STUBH"; cp "$HERE"/*.sh "$STUBH"/
+cat > "$STUBH/key-gate.sh" <<'KG'
+#!/usr/bin/env bash
+KEY_GATE_REFUSED=82
+KEY_GATE_VAR="KG_STUB_KEY"; KEY_GATE_REASON=""; KEY_GATE_MODEL="m"; KEY_GATE_PROVIDER="p"
+key_gate_assert() { # <label> [<home>] [<provider>] [<model>]
+  printf '[key-gate] %s check=warn reason=box-default-not-provisioned box_default=x model=m\n' "${1:-key-gate}"
+  if [ -n "${KG_STUB_REFUSE:-}" ]; then
+    printf '[key-gate] %s check=fail result=REFUSED reason=credential-missing var=KG_STUB_KEY provider=p model=m\n' "${1:-key-gate}"
+    return 82
+  fi
+  printf '[key-gate] %s check=ok var=KG_STUB_KEY provider=p model=m\n' "${1:-key-gate}"
+  return 0
+}
+KG
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi
+LANE_BIN="$STUBH/lane.sh" drive "$WT"
+eqv "$LANE_RC" "0" "7h1 the stub-companion lane runs"
+has "$(cat "$(LOG)" 2>/dev/null)" "check=warn reason=box-default-not-provisioned" \
+    "7h2 the fixture really printed the companion's warn line FIRST (else the arm measures nothing)"
+has "$(lastline)" "keygate=checked " "7h3 …and the terminal line still reports the VERDICT (checked), not the companion's warning nor notrun"
+: > "$PI_MARK"
+LANE_BIN="$STUBH/lane.sh" drive "$WT" "KG_STUB_REFUSE=1"
+eqv "$LANE_RC" "82" "7h4 the same stub refuses with 82 when told to"
+has "$(lastline)" "keygate=refused " "7h5 …and that refusal is reported as keygate=refused, not notrun (a warn-first refusal used to read as a harness bug)"
+[ ! -s "$PI_MARK" ]; ck "7h6 …and no agent was spawned for it" $?
+unset LANE_BIN
 
 # ═══ 8. THE VOCABULARY IS ONE SOURCE OF TRUTH ═══════════════════════════════════════════════════
 # A scanner's whole job is `grep -L '^outcome=\(done\|refused\|failed\|died\) reason=' "$O"/logs/lane-[0-9]*.log`
@@ -690,6 +745,193 @@ has " $FOUND" "done " "8a the arms produced a 'done' outcome"
 has " $FOUND" "refused " "8b …a 'refused' outcome"
 has " $FOUND" "failed " "8c …a 'failed' outcome"
 has " $FOUND" "died " "8d …a 'died' outcome (all four are reachable, not just declared)"
+
+# ═══ 9. WHO ENDED THE LANE (#2833) — attribution before any work-failure claim ═══════════════
+# MEASURED before the change (this fleet's own logs, 2026-11-11): 53 lanes exited non-zero and ALL 53
+# were `outcome=failed reason=agent-exit-<rc>`, including the 35 (66%) that `lane-bound.sh` had ended at
+# the wall ceiling — every one of those logs already carried `[lane-bound] VERDICT
+# verdict=exceeded-wallclock`. The line the census reads said "the work failed" about lanes that were
+# never allowed to finish, which is the question this issue was filed over.
+#
+# ⛔ TWO KINDS OF ARM, AND THE SPLIT IS STATED BECAUSE THE EARLIER TEXT FLATTENED IT: the behaviour
+# arms REDDEN ON THE PRE-CHANGE TREE, the six over-reach falsifiers stay GREEN there and redden under the
+# opposite mutation. Claiming all of them redden pre-change was FALSE by construction (review finding on
+# this change) and the arithmetic is checkable: `origin/main:scripts/orchestrator-harness/lane.sh:962`
+# calls EVERY non-zero exit `failed agent-exit-<rc>`, and six of these arms ask for exactly that.
+#
+#   * 9a, 9a3/9a3b and 9e are the BEHAVIOUR arms: on the pre-change tree the outputs they demand — `died
+#     reason=transport-unreachable:…`, the operator sentence that names it, and `died
+#     reason=exceeded-wallclock` — are UNREACHABLE, so they go RED there. That is the mutation the issue
+#     asks for, and it was MEASURED, not reasoned: with the attribution block reverted to `else
+#     lane_outcome failed "agent-exit-$rc"`, this suite fails exactly 7 assertions (227 passed, 7 failed)
+#     — 9a (outcome), 9a (reason), 9a2, 9a3, 9a3b, 9e, 9e2 — and 9e's mutated output is the measured
+#     defect verbatim: `outcome=failed reason=agent-exit-143` for a lane the wall ceiling had ENDED.
+#     ⛔ AND THE SAME 7 FAIL AGAINST THE REAL PRE-CHANGE FILE, not only against that reconstruction:
+#     `origin/main`'s own `lane.sh` copied into a scratch tree beside this suite gives 227 passed, 7
+#     failed, the identical seven. So the proof does not rest on the revert being faithful.
+#     9a3/9a3b were added because the fresh-context review of this change at 56123d11f recorded the hole
+#     they close: 9a2 asserts the terminal TOKEN and 9e2 asserts the BOUND branch's sentence, so deleting
+#     the TRANSPORT branch's `echo` reddened NOTHING. MEASURED at this head — deleting that one line from
+#     `lane.sh` gives 232 passed, 2 failed, and the two are exactly 9a3 and 9a3b.
+#   * 9b/9c/9d/9f/9g/9h are OVER-REACH falsifiers: GREEN on the pre-change tree BY CONSTRUCTION (it
+#     called everything `failed`, which is what they ask for). They redden under the OPPOSITE
+#     mutation — a fix that attributes too much — and every row below was RUN against this tree, not
+#     read off the source (mutant → §9 arms that redden):
+#         9b  transport threshold `-ge 0` (attribution unmetered)         → 9b 9c 9d 9g 9h
+#         9c  `LANE_TRANSPORT_MIN_ROTATIONS=1` in the sanitiser's default → 9c
+#         9d  `LANE_AGENT_LOG_OFF` never advances (whole log read)         → 9d (rotations=5, the
+#                                                                            previous run's storm)
+#         9f  `rc = 0` no longer decided first (attribution hoisted)       → 9f
+#         9g  `lane_bound_killer`'s `case` → truthiness test `[ -n "$v" ]` → 9g 9h
+#         9h  `unknown` added to the killer allow-list                     → 9h (`died reason=unknown`)
+#     9b is the broadest: an unmetered transport read converts EVERY non-zero exit into a retryable
+#     death, which is why it reddens five §9 arms at once (and, outside §9, 3b and 8c). That breadth
+#     is the point of the arm — it is the mutation that would make the fix worse than the defect.
+#     9h was reported as CONDITIONAL by that review (it can only discriminate while the fixture's
+#     `unknown` line is the LAST `[lane-bound] VERDICT` in the run, because the read is `tail -1`, and
+#     a reaped watchdog may append its own `verdict=finished`). MEASURED at this head: the allow-list
+#     mutant is caught — 9h fails with `died reason=unknown` — so the fixture's line IS the last one.
+#     The race is real in production but it did not occur here; 9g pins the unconditional half of the
+#     rule (its fixture cannot lose the comparison).
+#     A work failure must NOT become retryable (9b/9c), a PREVIOUS run's connection storm must NOT
+#     classify THIS run (9d), a lane that merely logged a blip and then completed must stay `done`
+#     (9f), and a verdict word that names no bound must not be minted as a killer (9g/9h).
+
+# 9a — the model/provider was unreachable: the agent's own transcript carries the rotations, the exit
+# is not about the work, and the terminal line says RETRYABLE instead of `failed`.
+mk_arm transport; WT="$ARMWT"
+pi() {
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #1)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #2)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #3)\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9a" died "transport-unreachable:rc1:rotations=3" 1
+case "$(lastline)" in
+  outcome=failed*) bad "9a2 a transport death is NOT reported as a work failure (got: '$(lastline)')" ;;
+  *) ok "9a2 …and it is not the work-failure token, which is the whole point: a retryable death read as a failed attempt is the treadmill #2833 measured" ;;
+esac
+
+# 9a3 — THE TRANSPORT BRANCH'S OPERATOR SENTENCE, which had NO WITNESS until this arm. The fresh-context
+# review of this change at 56123d11f recorded it as the one uncovered line: 9a2 asserts the terminal TOKEN
+# and 9e2 asserts the BOUND branch's sentence, so deleting the transport branch's `echo` reddened
+# NOTHING. It is prose behind no gate, but it is the reading that tells an operator "retry this, the item
+# is not implicated" — the remedy this change exists to deliver — so its silent removal must not pass.
+# ⛔ IT CANNOT BE SATISFIED BY THE OTHER BRANCH: 9a's fixture carries no `[lane-bound] VERDICT`, so the
+# transport arm is the only writer here that can emit 'TRANSPORT death'. Measured: deleting that one
+# `echo` from `lane.sh` reddens exactly these two assertions and nothing else.
+LOGTXT9A="$(cat "$(LOG)" 2>/dev/null)"
+has "$LOGTXT9A" 'TRANSPORT death' \
+    "9a3 …and the log names WHICH death this was, so the operator is not left decoding the token"
+has "$LOGTXT9A" 'after 3 connection-pool rotation(s)' \
+    "9a3b …and it reports the count THIS run measured, not a bare claim that it was transport"
+
+# 9b — THE FALSIFIER. A lane whose work failed, with no transport evidence, must NOT become retryable:
+# an automatic retry of a real work failure burns a lane's budget and repeats the same outcome.
+mk_arm workfail; WT="$ARMWT"
+pi() { printf 'the change is wrong\n'; return 1; }
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9b" failed "agent-exit-1" 1
+
+# 9c — THE THRESHOLD'S LOWER EDGE. One or two rotations inside a run that then failed ON ITS OWN WORK is
+# a work failure: a single rotation is a blip that the agent recovered from, and retrying on it is the
+# false-retry direction. Pinned at 2 (one below the default) rather than at 0 so a future default of 1
+# reddens here.
+mk_arm belowthresh; WT="$ARMWT"
+pi() {
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #1)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #2)\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9c" failed "agent-exit-1" 1
+
+# 9d — THE STALE-FLAG DIRECTION, which is the defect this file already closes once for `outcome=`. The
+# lane log is APPEND-ONLY across runs, so a PREVIOUS attempt that died of a connection storm leaves its
+# rotations in the file. Classifying the NEXT run's work failure as transport would silently convert
+# every subsequent real failure of that issue into an endless retry — so the read is RUN-SCOPED.
+mk_arm runsccoped; WT="$ARMWT"
+printf '%s\n' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #1)' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #2)' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #3)' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #4)' \
+  '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #5)' \
+  > "$(LOG)"
+pi() { printf 'the change is wrong\n'; return 1; }
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9d" failed "agent-exit-1" 1
+
+# 9e — THE BOUND ARM, driven END TO END rather than by hand-writing a verdict line: a real
+# `lane-bound.sh` ends a real lane at a 4 s wall ceiling, and the terminal line must name the bound that
+# killed it instead of claiming a work failure. This is item 4 of #2833 ("the kill reason must name the
+# killer") at the only surface a census reads.
+mk_arm boundkill; WT="$ARMWT"
+pi() { sleep 30; return 0; }
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture" LANE_BOUND_WALL_S=4 LANE_BOUND_POLL_S=1
+ecase="$(lastline)"
+case "$ecase" in
+  "outcome=died reason=exceeded-wallclock"*) ok "9e a lane the wall ceiling ENDED is attributed to the bound, not to its work (got: '$ecase')" ;;
+  *) bad "9e expected outcome=died reason=exceeded-wallclock, got: '$ecase'" ;;
+esac
+has "$(cat "$(LOG)" 2>/dev/null)" 'ATTRIBUTED: the agent exited' \
+    "9e2 …and the log carries the attribution line that tells an operator the bound's own readings are above it"
+
+# 9f — THE OTHER FALSIFIER: rotations that did NOT end the lane. A lane that recovered from a storm and
+# then COMPLETED is `done`, never `died reason=transport-unreachable` — retrying a lane that succeeded is
+# the most wasteful form of this bug.
+mk_arm recovered; WT="$ARMWT"
+pi() {
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #1)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #2)\n'
+  printf '[http-pool-hygiene] rotated connection pool (message_end: Connection error.; rotation #3)\n'
+  return 0
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9f" done "agent-exit-0" 0
+
+# 9g — THE THIRD FALSIFIER, AND THE ONE THAT GUARDS THE WORK-FAILURE CLAIM ITSELF: `lane-bound.sh`
+# emits a `VERDICT` line on EVERY path, including `verdict=finished` — the line it writes when the bound
+# watched the agent END ON ITS OWN. `spawn-gate.sh` therefore CLEARS `finished` out of
+# `AGENT_BOUND_VERDICT` ("empty means the agent finished on its own"), and a fallback read that accepts
+# ANY non-empty verdict re-admits exactly the word the caller had filtered: a lane that failed ITS OWN
+# WORK is then recorded `outcome=died reason=finished`, so the work-failure claim this change exists to
+# keep is erased and the census sees a death nothing killed. The arm writes the finishing line the way
+# `lane-bound.sh` writes it (into the lane log, which is what `run_agent` hands it as `--log`); WHICH of
+# the two lands is a race the caller decides (it kills the watchdog the instant the agent's `wait`
+# returns) and this arm pins the CLASSIFICATION for the case the bound wins it — the arm is about the
+# read, not the race.
+mk_arm finishedverdict; WT="$ARMWT"
+pi() {
+  printf '[lane-bound] VERDICT verdict=finished tag=lane-3331 pid=2 rc=na elapsed=1s wall_bound=2400s idle_bound=2700s silent=0s bytes=5 bytes_delta=5 cpu_cs=0 cpu_delta_cs=0 tol_cs=60 cpu_unreadable=0 signal=none\n'
+  printf 'the change is wrong\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9g" failed "agent-exit-1" 1
+
+# 9h — THE SAME ALLOW-LIST, AT ITS OTHER EDGE (the polarity rule this repo applies to every verdict
+# vocabulary): a verdict word nobody recognises is NOT a bound that ended a lane. `lane-bound.sh`'s
+# `verdict_line` defaults the field to `unknown`, so the value is reachable, and reading it as a killer
+# would mint `outcome=died reason=unknown` — a death that names no killer, which is the blindness #2833
+# was filed over, reintroduced by its own fix. Only `stalled` and `exceeded-wallclock` name a bound.
+mk_arm unknownverdict; WT="$ARMWT"
+pi() {
+  printf '[lane-bound] VERDICT verdict=unknown tag=lane-3331 pid=2 rc=na elapsed=1s wall_bound=2400s idle_bound=2700s silent=0s bytes=5 bytes_delta=5 cpu_cs=0 cpu_delta_cs=0 tol_cs=60 cpu_unreadable=0 signal=none\n'
+  printf 'the change is wrong\n'
+  return 1
+}
+export -f pi
+drive "$WT" "$KEYVAR=sk_fixture"
+check_terminal "9h" failed "agent-exit-1" 1
 
 echo
 if [ "$FAIL" -gt 0 ]; then

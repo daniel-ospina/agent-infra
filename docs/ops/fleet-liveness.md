@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-09-20
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup, workspace-ownership, dispatch-target, lane-dispatch
+aboutObjects: agent-infra, issue-1178, issue-1254, issue-4046, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup, workspace-ownership, dispatch-target, lane-dispatch
 ---
 
 # Fleet session liveness (#1178)
@@ -33,6 +33,7 @@ The artifacts, one authority:
 | `scripts/lib/pid-identity.sh` | the one **process-identity rule** — sourced by the kill-path reaper (Bash), forked as a CLI by the classifier (Python) |
 | `scripts/orphan-reap.py` | the `pi` **pool's owner**: enumerates it, binds pid↔transcript with the fence above, and authorises only the canon's `idle` (24 h). Four states, dry-run by default; `AUTHORISE_HOSTLESS_CHAINS` keeps a hostless chain report-only (#1207/#1297 option A) |
 | `scripts/orchestrator-harness/pi-done-not-exited.py` | a **launcher-contract** reaper, not a liveness verdict: it asks whether a `pi` FINISHED its turn and never exited, leaving its launcher blocked so `<tag>.rc` was never written (#2163). It imports `turn_from_jsonl`/`jsonl_state`, the pool owner's session binding, gate 2, and CPU gate/tolerance READ AT RUNTIME; the one predicate it adds is launcher ownership in two named rungs — `tag` (the launcher names the `TAG` in the process's `environ`: as a whole argument on its OWN ARGV — the shipped `lane.sh <N>` shape — by assigning it, writing `<tag>.rc`, or redirecting to the log this process holds) and `launcher` (no TAG, launcher text redirects into the held log). It also requires PRINT MODE in the launcher's text (`pi -p`/`--print`/`run_agent`), because an agent at a human's prompt reaches the same turn-ended/frozen-CPU state; a TAG neither rung ties is `weak-owner` and report-only. `/proc` is Linux-only, and every read abstains elsewhere. ⚠️ It SIGNALS nothing by default: a cell lane's chain is `hostless`, which #1207/#1297 option A keeps report-only, and the reopen agent-infra#2391 is still open — a pass that finds DONE rows without `--authorise-hostless` exits 4 |
+| `mcp-servers/orchestrator/server.py` (`lane.list {pool:true}`) | the **typed reader of the `pi` pool** (#2921): a WRAPPER over `orphan-reap.py --pool pi --json`, so the population no session store can contain is *asked* for instead of hand-measured (measured 2026-10-27: 29 such processes, 2.64 GB, an hour of hand-measurement). It adds no predicate, no state name and no store; `counts: null` renders as `UNMEASURED`, never `0 to reap`, and an unanswered pool is `UNMEASURED(pool + not requested)` rather than an absent key |
 
 The kill path (`scripts/pi-reap-idle.sh`) is a *consumer of the same identity rule*, not a second
 liveness rule: it is documented in `docs/ops/pi-idle-repl-reaper-policy.md`. **A wrong verdict
@@ -48,6 +49,57 @@ label — it produces a dispatch into the owner's own work.
 ---
 
 ## 0. Scope — this document is ONE liveness surface, not all of them
+
+### 0z. A liveness verdict is not a ROUTE — and `wedged` means two different things (#4046)
+
+A verdict answers *what state is this lane in*. A **route** answers *what do I DO with it*. They are
+different questions with different failure modes, and #4046 is exactly the cost of conflating them: one
+verdict — "looks idle" — was the answer to three different situations, one of which (a lane waiting on
+the owner) is actively harmed by it. "Continue" sent to a lane whose last turn is a QUESTION tells it
+to proceed on a premise the owner has not decided.
+
+So there is now a router, [`tools/fleet/triage.py`](../../tools/fleet/triage.py), publishing
+
+```
+user-question | wedged | idle-continue | none        (in that PRECEDENCE, which is the safety property)
+and, for wedged, a named SUBCASE: child-stuck · child-overdue · boot-prompt · model-retry ·
+tool-in-flight · open-turn-never-closes · wedged-unverified
+```
+
+Three things about it are load-bearing here, because each is a way a second classifier could creep in:
+
+1. **It publishes no liveness state.** `triage.STATES_DISJOINT` is the intersection of its route names
+   with `liveness.STATES` and a test pins it to exactly `{"wedged"}` — a route `dead` would be a second
+   verdict function, and this document (§"one verdict function") refuses that. The overlap is
+   deliberately not empty: inventing a second word for a state the fleet already decided on is worse.
+2. **It consumes, never re-derives.** `liveness.Turn` (the #1254 open-turn contract) is its only
+   source of "positively open", and `scripts/lane-status.py`'s verdict is its only source of
+   `CHILD-STUCK` / `CHILD-OVERDUE` / `LONG-TOOL` / `WEDGED`. Both directions of that borrowing are
+   pinned: if `Turn` loses `stalled`/`reason`/`abstain`, the router's suite fails rather than silently
+   misrouting every lane.
+3. **`wedged` in this document and `wedged` as a route are DIFFERENT NAMES THAT HAPPEN TO MATCH.**
+   The state asserts *the transcript shows an open turn* (#1254) and prescribes *check the process*.
+   The route names a REMEDY FAMILY, and one of its subcases — `wedged-unverified` — is precisely the
+   case where the STATE was asserted and the turn does not support it; its remedy is `inspect`, never
+   a kill. A reader who treats the two as the same thing will read `wedged-unverified` as a stronger
+   `wedged`, which is the opposite of what it is.
+
+The router's arms are [`tools/fleet/triage_arms.py`](../../tools/fleet/triage_arms.py) — one per route,
+and **each owes a proof taken at its artifact**: a `SENT` marker is a claim, not an effect. The continue
+arm proves *transcript growth inside a bound*; the question arm re-lists the workspaces and requires
+the question lane at index 0, then reads the PANE back and requires it to carry the research mandate
+(the move's return code and the text the arm typed are not artifacts); the child arms WRITE a
+hand-off record and re-read it, and signal nothing (the reaping rule is three gates, and *"report,
+do not reap"* when a read is unclear); the boot-prompt arm reuses `cmux_dispatch.py`'s own
+dismiss-and-resend and reads the pane, deciding the prompt by ORDER — a satisfied marker stays in
+scrollback for the life of the session, so presence alone reports a repaired lane as blocked.
+Every route carries `Route.proof`, and an arm naming no artifact is refused before it can run.
+
+**Where it is wired.** `scripts/turn-end.py` gates its WIP nudge on `triage.may_continue()` — the lane
+it used to nudge was one whose question was asked in a PANE and therefore never carried the
+`owner-decision` label its old guard read. `scripts/lane-route.py` is the operator CLI (`--apply` runs
+the arms and records the verdict of each). Both are stated here because a router with no consumer is
+indistinguishable, in review, from a working one.
 
 Before any state name is compared across tools: the vocabulary on this page
 (`dead | running-quiet | wedged | idle | unknown`) belongs to

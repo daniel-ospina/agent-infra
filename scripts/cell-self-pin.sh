@@ -106,12 +106,16 @@
 #
 # ── WHAT IT ACTUALLY DOES (it re-implements no activation) ─────────────────────────────────────
 # `cloud-cell-supervisor.sh apply` already fetches agent-infra main and pins a detached per-commit
-# worktree (#1745); the pin deadlock (#2700 C5) is that `apply` refuses while a controller runs, and a
+# worktree (#1745); the pin deadlock (#2700 C5) WAS that `apply` refused while a controller runs, and a
 # live cell's controller always runs — so the verb this pass calls is `apply --force --pin-only`, and it
 # calls the copy in the RESOLVED tree, not a bootstrap clone's. ⛔ BOTH FLAGS: `--pin-only` because a bare
-# `apply` dies on a running controller, and `--force` WITHOUT it re-seeds the state dir that controller is
-# executing from (the #2215 skew). `--pin-only` also writes no state stamp, so this pass reads the pinned
-# HEAD out of the RECORD the controller acts on rather than out of the stamp.
+# `apply` still dies on a running controller (it is the SEEDING path: re-seeding swaps the helpers a live
+# loop is executing — the #2215 skew), and `--force` WITHOUT it re-seeds that same state dir. `--force`
+# used to be REQUIRED for the pin-only path too — the guard refused `--pin-only` alone, which is
+# agent-infra#2738 — and since that issue the supervisor EXEMPTS `--pin-only`, so `--force` here is
+# belt-and-braces: this pass must not depend on where that guard's scope happens to sit. `--pin-only`
+# also writes no state stamp, so this pass reads the pinned HEAD out of the RECORD the controller acts
+# on rather than out of the stamp.
 set -u
 
 # ⛔ REMEMBERED BEFORE IT IS DEFAULTED, because `CELL_HOME_GIVEN` is what `print_unit` refuses on. The
@@ -229,7 +233,9 @@ loud() { # <code> <reason> [detail…]
   err "  This is a RED, not a retry: the cell's executing layer could not be identified, so nothing was"
   err "  pinned. Remedy: cd <layer> && git fetch origin main && bash <layer>/scripts/cloud-cell-supervisor.sh apply --force --pin-only"
   err "  (--pin-only, BECAUSE a live cell always runs a controller: a bare 'apply' dies on it, and a bare"
-  err "  '--force' re-seeds the state dir the running controller is executing from — the #2215 skew.)"
+  err "  '--force' re-seeds the state dir the running controller is executing from — the #2215 skew. The"
+  err "  supervisor EXEMPTS '--pin-only' from its running-controller guard since agent-infra#2738, so it is"
+  err "  the flag that matters here; '--force' is kept beside it so this remedy does not depend on that scope.)"
   exit "$code"
 }
 
@@ -469,6 +475,9 @@ do_pass() {
   # re-decided). `--pin-only`: a live cell always runs a controller, so a bare `apply` dies on it — and
   # `--force` WITHOUT it re-seeds the state dir that controller is executing from, which is a standing
   # version-skew generator. This pass only advances the pin; the next `start` seeds from it.
+  # ⛔ `--force` WAS the price of admission on this path (the guard fired on `--pin-only` too, which is
+  # agent-infra#2738); since that issue `--pin-only` is exempt from it, so `--force` is belt-and-braces
+  # here and `--pin-only` is the load-bearing flag.
   bash "$sup" apply --force --pin-only >"$O/self-pin-apply.log" 2>&1; rc=$?
   if [ "$rc" -ne 0 ]; then
     record_outcome "apply-failed rc=${rc} via ${sup}"

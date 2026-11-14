@@ -197,11 +197,13 @@ gh pr merge <PR_NUMBER> --merge
 ```bash
 PR_BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
 # Remote delete is server-side. The #73 coordinated-delete guard blocks deleting a
-# branch still checked out in ANY worktree (including your own) — but it matches the
-# LITERAL ref, so THIS shell-variable form is not guard-matched (#653). If you pass a
-# literal branch name, run the cleanup after 05-cleanup.md Step 3.8 teardown, or use
-# `gh api -X DELETE`, or the retry below.
-git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete blocked/failed — retry after teardown or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"
+# branch still checked out in ANY worktree (including your own) — and it matches the
+# LITERAL ref, so ⛔ an unresolvable target ("$PR_BRANCH", a $(…) substitution, a
+# glob, a brace expansion) is REFUSED fail-closed since #653: the guard cannot tell
+# which ref it would delete. The mitigation below is the WARN, not a bypass.
+#   → print the literal first:  echo "git push origin --delete $PR_BRANCH"
+#   → then REPLACE REPLACE-WITH-PR-BRANCH with that ref and run:
+git push origin --delete feat/REPLACE-WITH-PR-BRANCH 2>&1 || echo "⚠️ remote delete did NOT run for feat/REPLACE-WITH-PR-BRANCH — substitute the PR branch printed above, or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/<that-ref>"
 # Local delete degrades gracefully: tolerate the worktree lock, do NOT fail the ceremony.
 # `git branch -D` (not -d) so a merged-but-not-fully-reconciled local branch still cleans up.
 if git worktree list --porcelain | grep -q "branch refs/heads/$PR_BRANCH"; then
@@ -233,11 +235,12 @@ touching the default-branch worktree. If Step B's remote delete reports
 > `git push origin --delete <branch>` hits the #73 coordinated-delete guard, which
 > blocks deleting any branch checked out in ANY worktree — including the caller's
 > own (a worktree session that holds the branch therefore blocks its own remote
-> delete). The guard matches the LITERAL ref, so the shell-variable form
-> `git push origin --delete "$PR_BRANCH"` is NOT resolved by the classifier and is
-> not guard-matched. Run the cleanup AFTER the worktree teardown (05-cleanup.md
-> Step 3.8 → merged-branch cleanup, which orders teardown first), or delete the
-> remote ref via `gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/<branch>`.
+> delete). The guard matches the LITERAL ref, and since #653 an UNRESOLVABLE
+> target (`"$PR_BRANCH"`, `$(…)`, a glob, `{a,b}`) is refused FAIL-CLOSED rather
+> than looked up-and-allowed — so write the branch name OUT. Run the cleanup AFTER
+> the worktree teardown (05-cleanup.md Step 3.8 → merged-branch cleanup, which
+> orders teardown first), or delete the remote ref via
+> `gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/<branch>`.
 >
 > The local `git branch -D "$PR_BRANCH"` is best-effort: git itself refuses it
 > while the branch is checked out in this worktree (the guard's branch-force-delete

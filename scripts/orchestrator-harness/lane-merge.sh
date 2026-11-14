@@ -351,10 +351,31 @@ LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-7200}}"; is_limit "$LANE_WALL_
 # resolved once, here, and every message that renders `LANE_WALL_S` names it.
 if is_limit "${LANE_TIMEOUT:-}" && [ "${LANE_TIMEOUT}" = "${LANE_WALL_S}" ]; then
   LANE_WALL_SRC="LANE_TIMEOUT"
-elif is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N}" = "${LANE_WALL_S}" ]; then
+# ⛔ THE BACKSTOP IS THE SOURCE ONLY WHEN THE ARMING EXPRESSION WOULD ACTUALLY PICK IT (MEASURED, and it is
+# the same defect one configuration over from the one below). The test here used to be VALUE EQUALITY alone,
+# which attributes by coincidence and not by the rule: `LANE_WALL_S` is `${LANE_TIMEOUT:-…}`, so a NON-EMPTY
+# `LANE_TIMEOUT` wins the mask and the backstop is never read — yet with `LANE_TIMEOUT=abc
+# LANE_BACKSTOP_S=7200` (7200 is spawn-gate.sh:3419's own default, i.e. the value in EVERY lane's env) the
+# backstop happens to equal the shipped default, so the elif matched and every message rendered "from
+# LANE_BACKSTOP_S" while naming no malformed knob at all. `-z ${LANE_TIMEOUT}` is the resolution rule
+# itself, not a second opinion about the number: it is empty exactly when `${LANE_TIMEOUT:-…}` falls through.
+elif [ -z "${LANE_TIMEOUT:-}" ] && is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N}" = "${LANE_WALL_S}" ]; then
   LANE_WALL_SRC="LANE_BACKSTOP_S"
 else
-  LANE_WALL_SRC="no usable LANE_TIMEOUT or LANE_BACKSTOP_S, so the shipped default stands"
+  # ⛔ NAME THE KNOB THAT IS ACTUALLY AT FAULT (review, P3 — MEASURED). This branch used to say "no usable
+  # LANE_TIMEOUT or LANE_BACKSTOP_S", which sends an operator to inspect TWO knobs when exactly ONE is at
+  # fault, and asserts the other is unusable when it can be perfectly usable: `LANE_TIMEOUT=abc
+  # LANE_BACKSTOP_S=3600` printed that sentence while 3600 was a valid bound. It was not consulted because
+  # `LANE_WALL_S` above is `${LANE_TIMEOUT:-...}`, and `lane.sh:882` arms the lane with the IDENTICAL
+  # expression — so the line states the masking instead of inviting a fall-through, which would make this
+  # file's clock disagree with the armed one (the mirror-image of the bug this branch fixes).
+  if [ -n "${LANE_TIMEOUT:-}" ]; then
+    LANE_WALL_SRC="the shipped default, because LANE_TIMEOUT='${LANE_TIMEOUT}' is not a bounded integer, and LANE_BACKSTOP_S=${LANE_BACKSTOP_S:-<unset>} was NOT consulted — the arming path masks it with the same \${LANE_TIMEOUT:-…} expression"
+  elif [ -n "${LANE_BACKSTOP_S:-}" ]; then
+    LANE_WALL_SRC="the shipped default, because LANE_BACKSTOP_S='${LANE_BACKSTOP_S}' is not a bounded integer"
+  else
+    LANE_WALL_SRC="the shipped default, because neither LANE_TIMEOUT nor LANE_BACKSTOP_S is set"
+  fi
 fi
 # ⛔ THE DESIGN OPERAND IS THE CALLER'S, NOT THE ARMED ONE (review, P2 — MEASURED, and it is a false block
 # this diff would otherwise introduce). `MAX_WATCH_FIT` is derived from `LANE_WALL_S` at its own definition
@@ -693,6 +714,130 @@ if [ "$WATCH" -eq 0 ] && [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT
 fi
 printf '%s %s\n' "${ISSUE:-}" "$(date +%s)" > "$PHASE_F" 2>/dev/null || true
 
+# ── THE REPO'S REQUIRED SURFACE IS THE GATE THIS LOOP WAITS ON (#4014) ──────────────────────────
+# THE DEFECT. This loop classified EVERY check on the head's surface: any red spent a FIX round, and
+# any non-terminal attempt was waited out to the 5400 s bound — regardless of whether the repo's own
+# branch protection gates on that check at all. MEASURED on a live tortoise PR (#12171, head
+# 49840e6e): 57 check names, 24 of them still queued after 70 minutes, and exactly ONE red —
+# `agent-infra-ci / lint` — which is NOT one of tortoise's 7 required contexts, and which main cannot
+# even be compared against, because main publishes the same ruff program under a DIFFERENT name
+# (`main-lint / lint`). So a lane was told to FIX a red it had not caused and could not fix, spent
+# its rounds on it, and the owner then did the only thing the loop left open: admin-merged past CI.
+# That is the measured mechanism behind "CI is too slow to gate a merge, so merges bypass it".
+#
+# THE RULE, and it is NOT a weakening of the gate — it is the repo's OWN gate, read from the ONE home
+# that already resolves it (`repo-authority.sh::resolve_required_checks`, the same resolver
+# `merge-one.sh` and `orch-loop.sh` use, so a third opinion cannot appear here):
+#   * a REQUIRED red is a FIX_REQUIRED round, exactly as before;
+#   * a REQUIRED name that is not on the surface YET is IN FLIGHT, never green. Tortoise's
+#     `python-ci-gate` is published only when its whole needs-graph finishes, so its absence is the
+#     normal state for most of a PR's life — and a missing required check must never read as
+#     "nothing left to wait for";
+#   * a NON-required red is REPORTED (never hidden) and does not spend a round;
+#   * a NON-required in-flight job is REPORTED and is not waited for.
+# WHO MERGES IS UNCHANGED, and that is why this cannot land anything the repo's contract refuses:
+# this script never merges. `merge-one.sh` runs the repo's own authority — a gate repo merges through
+# a plain `gh pr merge`, where GitHub enforces exactly this required set (so an advisory red still
+# cannot be bypassed INTO main by anything this loop does); a rail repo goes through
+# `admin-merge.sh`, which re-reads the WHOLE surface and refuses on its own rules. What changes here
+# is only that the loop stops *fixing* and *waiting on* checks the merge contract does not gate on.
+# ⛔ FAIL-CLOSED, AND THE UNREADABLE CASE IS THE ONE THAT MATTERS. A contract that could not be read
+# is NOT treated as "nothing is required": the resolver's own fail-closed fallback is tortoise's name
+# list and is FOREIGN to every other repo, so on `REQ_SOURCE=fallback` — or with no `repo-authority.sh`
+# on this box at all — `LM_REQ_TRUSTED=0` and EVERY check on the surface counts as required, which is
+# exactly this script's behaviour before this change. A box whose protection read fails today behaves
+# as it did yesterday, loudly.
+# ⛔ THE COST IS ONE REST READ PER INVOCATION, NOT PER POLL. `required_checks` hits
+# `branches/main/protection/required_status_checks` once, before the wait loop starts — the poll inside
+# the loop is unchanged (and its un-paginated shape answers 304 free). 22 landers share one rate-limited
+# account, so one extra read at startup is the price of not waiting on 24 checks nobody requires; it is
+# the same read `merge-one.sh` already pays once per chain.
+LM_REQ=""; LM_REQ_SRC=""; LM_REQ_TRUSTED=0
+# ⛔ `--watch` MUST NOT PAY FOR IT (review P2, #4039 — verified). `--watch` never classifies a
+# check-run surface (it reads the chain's LOCAL state; the only `WATCH` tests in this file are the
+# `WAIT_S` cap guard and the `--watch` branch, both BELOW this block), so every `--watch` chunk would
+# spend one `branches/main/protection` read — the one read the harness flags ESSENTIAL and lets breach
+# the REST reserve — for a value nothing on that path consumes. `--watch` is also the highest-frequency
+# invocation (`MAX_WATCH` chunks per lane, ~22 lanes). The order is the guard, exactly as the `WAIT_S`
+# cap is deliberately ordered below the `--status` exit (`:699`). Leaving the surface unresolved here is
+# fail-closed by construction: `LM_REQ_TRUSTED` stays 0, so anything that DID classify on this path would
+# treat every check as required.
+lm_resolve_required_surface() {
+  local _ra="" _d="" _c=""
+  [ "${WATCH:-0}" -eq 0 ] || return 0
+  [ -n "${OR:-}" ] || return 0
+  _d="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || _d=""
+  # ⛔ THE CONTRACT HOME IS THE ONE THE MERGE PATH WILL SOURCE, AND `O_WORK` IS FIRST (review P3,
+  # round 3 on #4039 — the suggested reorder was CHECKED AND REFUSED, evidence below). This loop WAITS
+  # and FIXES on the names it resolves here; the merge itself is decided by `merge-one.sh`, so its home
+  # is the one that governs. `merge-one.sh:170` resolves `_M1_MOD="${O_WORK:-$O}"` and falls back to
+  # `_M1_HERE` (the directory that script lives in) — i.e. the WORK ROOT first, the script's own dir
+  # second — which is this same order. The reviewer's P3 read `merge-one.sh:149` as `$O` first, but that
+  # line is the `LANE_REPORT_GATE` source (`. "$SELF/lane-report-gate.sh"`); the repo-authority source
+  # is `:170-173`, and it prefers `O_WORK`. Reordering to `$O` first would therefore BUY exactly the
+  # cross-reader disagreement the finding is about, in the ordinary state where both copies exist and
+  # differ (a rolling deploy). `orch-loop.sh:471` does order `$O` first — that is the CONTROLLER's own
+  # copy and it is a pre-existing divergence between the two consumers, not one this file introduces;
+  # what this file owes is (a) the merge path's order and (b) NOT SILENCE, so the file it used is
+  # printed in the line below and can be compared against the controller's without reading code.
+  for _c in "${O_WORK:-}" "${O:-}" "$_d"; do
+    [ -n "$_c" ] || continue
+    if [ -f "$_c/repo-authority.sh" ]; then _ra="$_c/repo-authority.sh"; break; fi
+  done
+  if [ -z "$_ra" ]; then
+    say_err "lane-merge: no repo-authority.sh beside this script or in \$O or \${O_WORK:-} — the required-check contract cannot be read, so EVERY check on this head counts as required (fail-closed)"
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  . "$_ra" 2>/dev/null || {
+    say_err "lane-merge: $_ra did not source — EVERY check on this head counts as required (fail-closed)"
+    return 0
+  }
+  if ! command -v resolve_required_checks >/dev/null 2>&1; then
+    say_err "lane-merge: $_ra is stale (no resolve_required_checks) — EVERY check on this head counts as required (fail-closed)"
+    return 0
+  fi
+  # `REQ` in the environment is the operator/controller override the other consumers honour; capture
+  # it ONCE here because `resolve_required_checks` overwrites `REQ` with the resolved value in THIS
+  # shell (that in-place contract is what makes REQ_SOURCE readable — a command substitution would
+  # subshell it away).
+  REQ_OVERRIDE="${REQ:-}"; REQ=""
+  resolve_required_checks "$OR" >/dev/null 2>&1 || true
+  LM_REQ="${REQ:-}"; LM_REQ_SRC="${REQ_SOURCE:-}"
+  case "$LM_REQ_SRC" in
+    protection|env)
+      if [ -n "$LM_REQ" ]; then LM_REQ_TRUSTED=1; fi ;;
+  esac
+  if [ "$LM_REQ_TRUSTED" = 1 ]; then
+    say_err "lane-merge: required surface for $OR (source=$LM_REQ_SRC, contract=$_ra): $LM_REQ"
+  else
+    say_err "lane-merge: the required-check contract for $OR is UNREADABLE (source=${LM_REQ_SRC:-none}, contract=$_ra) — every check on this head is treated as required (fail-closed)"
+  fi
+  # ⛔ THE RESOLVED SET MUST NOT REACH THE CHILD AS AN OPERATOR OVERRIDE (review P2, round 3 on #4039 —
+  # reachable, not theoretical). `REQ` is the documented override variable (`repo-authority.sh:16`,
+  # `merge-one.sh:155`) and the fleet launcher EXPORTS it (`multi-repo-controller.sh:145`), and in bash
+  # an ASSIGNMENT DOES NOT CLEAR THE EXPORT ATTRIBUTE (`export FOO=bar; FOO=""; bash -c 'echo "[$FOO]"'`
+  # prints `[]`). So `REQ=""` above and the resolver's in-place `REQ="$FALLBACK_REQ"` both leave `REQ`
+  # exported, and `launch_chain` spawns the chain DETACHED with this whole environment (`nohup bash -c …`).
+  # merge-one.sh then reads OUR ANSWER as the operator's INPUT: `REQ_OVERRIDE` non-empty,
+  # `REQ_SOURCE=env`, so its UNKNOWN-contract refusal — which fires only on `fallback` with NO override
+  # (`merge-one.sh:983`) — cannot fire, and `merge_authority` answers `gate` from the fallback list (it
+  # carries `ai-review-gate`). On a RAIL repo that skips the rail and can land the change on required
+  # checks alone with no head-bound evidence: the §5.1 bypass merge-one.sh exists to prevent, reached
+  # through the parent instead of an ambient export. Hand the child what the OPERATOR supplied, never
+  # what we resolved: a usable override passes through unchanged (the controller's frozen-contract
+  # intent), and an absent/discarded one stays ABSENT so the child re-resolves — or refuses — on its own
+  # read. `REQ_OVERRIDE` is cleared for the same reason; `REQ_SOURCE` needs no handling because
+  # merge-one.sh re-resolves before it reads it.
+  case "$LM_REQ_SRC" in
+    env) REQ="${REQ_OVERRIDE:-}" ;;
+    *)   REQ="" ;;
+  esac
+  REQ_OVERRIDE=""
+  return 0
+}
+lm_resolve_required_surface
+
 # ── the two reads (injectable) ───────────────────────────────────────────────────────────────────
 # pr_read → "<state>|<merged_at>|<head_sha>|<mergeable_state>"
 # ⛔ PIPE, NOT TAB. Tab is WHITESPACE to the shell, so `IFS=<tab> read` COLLAPSES empty fields — an
@@ -745,7 +890,11 @@ checks_read() { # checks_read <head> [--full]
   local q="repos/$OR/commits/$head/check-runs?per_page=100&filter=all"
   local rows='(.check_runs[] | [(.name // ""), (.status // ""), (.conclusion // ""), (.id // 0), (.app.slug // "")] | @tsv)'
   if [ "$full" = "--full" ]; then
-    gh api "$q" --paginate --jq "$rows" 2>/dev/null
+    # ⛔ NO 2>/dev/null ON THIS ONE (#3858). The single-page poll above can stay quiet — its TOTAL row
+    # already answers "is this all of it" — but on the PAGINATED path the read's own stderr is the only
+    # place the reason a page stream stopped exists, and suppressing it left an operator looking at a
+    # held head with nothing to act on. The caller routes it to a file and prints the first line.
+    gh api "$q" --paginate --jq "$rows"
     return $?
   fi
   # One page, plus the total as a 2-field TSV row so the caller can tell "this page is all of it"
@@ -766,8 +915,8 @@ checks_read() { # checks_read <head> [--full]
 # conclusion must never fall through a gap. Newest attempt per **(app, name)** by id — a job name
 # shared across two workflows must not let one mask the other; `started_at` is nullable and is only a
 # tiebreak, and grouping by check_suite would shatter one check per re-run.
-classify() {
-  python3 - "$1" <<'PY'
+classify() { # classify <tsv-file> [required-set] [1=trusted]
+  python3 - "$1" "${2:-}" "${3:-0}" <<'PY'
 import sys
 GREEN = {"success", "neutral", "skipped"}
 NONRED = GREEN | {"cancelled", "stale"}
@@ -790,14 +939,66 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     cur = newest.get(key)
     if cur is None or cid > cur[2]:
         newest[key] = (status, conclusion, cid)
-inflight, red = 0, []
+# ── NUMBER 4014: THE REQUIRED SURFACE DECIDES WHAT IS WAITED FOR AND WHAT IS FIXED ────────────
+# `required` is the repo's own branch-protection set (space-separated) and `trusted` says whether it
+# was actually READ. Untrusted => EVERY name is required, i.e. the pre-#4014 behaviour, which is the
+# fail-closed default (see `lm_resolve_required_surface`).
+required = sys.argv[2].split() if len(sys.argv) > 2 and sys.argv[2] else []
+trusted = (len(sys.argv) > 3 and sys.argv[3] == "1")
+
+
+def _bare_is(name, wanted):
+    """Does THIS surface name name the required context `wanted`?
+
+    GitHub renders a reusable workflow's job as `<caller> / <job>` (measured: `agent-infra-ci / lint`
+    on tortoise). The REQUIRED CONTEXT is the bare name branch protection declares, so a suffixed
+    name must still match its required parent — the same normalisation `merge-one.sh` and
+    `admin-merge.sh` apply to a gate row. The direction matters: this makes MORE names count as
+    required, never fewer.
+    """
+    if name == wanted:
+        return True
+    i = name.rfind(" / ")
+    return i > 0 and name[i + 3:] == wanted
+
+
+def is_required(name):
+    """Is THIS surface check one of the repo's required contexts?"""
+    if not trusted or not required:
+        return True
+    return any(_bare_is(name, r) for r in required)
+
+
+inflight_req, red, red_req, red_adv, names = 0, [], [], [], set()
 for (app, name), (status, conclusion, _cid) in sorted(newest.items()):
+    names.add(name)
+    disp = "%s:%s" % (app, name) if app else name
+    req = is_required(name)
     if status != "completed":
-        inflight += 1
+        # Only a REQUIRED in-flight job is waited for. An advisory job still queued behind the
+        # queue is a fact about the queue, not about whether this head may proceed.
+        if req:
+            inflight_req += 1
     elif conclusion not in NONRED:
-        red.append("%s:%s" % (app, name) if app else name)
-print("INFLIGHT %d" % inflight)
+        red.append(disp)
+        (red_req if req else red_adv).append(disp)
+# A REQUIRED NAME WITH NO ROW AT ALL is neither green nor red — it has not been published yet
+# (tortoise's `python-ci-gate` appears only once its whole needs-graph finishes). It is reported
+# separately so the caller can treat it as in flight; a missing required check must never be read
+# as "nothing left to wait for".
+# ⛔ THE PRESENCE TEST IS THE *SAME* TEST AS `is_required` (review P1, #4039). The first revision
+# asked `n not in names`, so for the very shape 4014-f declares supported — required `lint`, surface
+# row `agent-infra-ci / lint` — the bare name was never in `names` and the check was reported BOTH as
+# required-and-green AND as "not published yet": `_eff` never reached 0, the loop waited out the whole
+# bound on a complete green required surface and exited `WAITING_CHECKS`, printing `(0) in flight`. Two
+# harness readers disagreed about one head. One rule now decides both questions.
+missing = [n for n in required if not any(_bare_is(x, n) for x in names)] if (trusted and required) else []
+print("INFLIGHT %d" % inflight_req)
 print("RED %s" % ",".join(red))
+if trusted and required:
+    print("REQRED %s" % ",".join(red_req))
+    print("ADVRED %s" % ",".join(red_adv))
+    print("REQMISSING %s" % ",".join(missing))
 PY
 }
 
@@ -1774,7 +1975,10 @@ esac
 # Wait for THIS head's checks to be terminal, bounded, printing progress so the lane never looks
 # wedged and so a human reading the transcript can see it is making progress and not hung.
 CHECK_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks.XXXXXX")" || exit 2
-trap 'rm -f "$CHECK_TMP"' EXIT
+# Where the FULL (paginated) check-run read's stderr lands, so a read that stopped early can say why
+# (#3858). Separate from CHECK_TMP because that one is the classifier's input.
+CHECK_ERR_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks-err.XXXXXX")" || { rm -f "$CHECK_TMP"; exit 2; }
+trap 'rm -f "$CHECK_TMP" "$CHECK_ERR_TMP"' EXIT
 # ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S **REMAINING** WALL CLOCK, NOT JUST THE WHOLE OF IT
 # (#3584 review, P1 — verified). `deadline` was `now + WAIT_S` and nothing compared it with how much of
 # `LANE_WALL_S` THIS lane had already spent. At the shipped numbers a lane entering its merge phase more
@@ -1821,7 +2025,7 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
     _watch_basis_note="an explicit LANE_MERGE_MAX_WATCH=0, which DISABLES the supervision counter"
     _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
   elif is_limit "${LANE_BACKSTOP_S_N:-}" && [ "${LANE_BACKSTOP_S_N:-0}" -gt 0 ]; then
-    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N}s), because the wall axis (LANE_TIMEOUT) is OFF"
+    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N}s), because the wall axis (${LANE_WALL_SRC}) is OFF"
     # ⛔ THE FIGURE MUST BE WHAT THE CODE WILL USE, WHICH INCLUDES THE ELAPSED SUBTRACTION (review cycle
     # 16, P3 — measured: the line printed "a FINITE 29 chunk(s)" on a lane that had spent 3400 s of its 3600 s
     # backstop, where `--watch` derives 1). `_lane_elapsed` is already resolved above for the wait clamp; this
@@ -1844,10 +2048,31 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
       fi
     fi
   else
-    _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_TIMEOUT=0) and no LANE_BACKSTOP_S is exported"
+    # ⛔ THE KNOB NAMED HERE IS THE ONE THAT RESOLVED TO 0, AND THE SENTENCE ABOUT THE BACKSTOP IS A
+    # MEASUREMENT, NOT AN ASSUMPTION (review, P3 — MEASURED both ways). `LANE_BACKSTOP_S=0` with
+    # `LANE_TIMEOUT` unset resolves `LANE_WALL_S` to 0 FROM THE BACKSTOP, yet this branch announced
+    # "LANE_TIMEOUT=0" (a variable never set) and "no LANE_BACKSTOP_S is exported" — while it was
+    # exported, as 0. `lane_wall_bound` arms `--wall 0` for that value, so it really is the OFF switch;
+    # the line must say so instead of telling an operator to set the knob they already set.
+    case "${LANE_WALL_SRC}" in
+      LANE_BACKSTOP_S)
+        _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N} is the same OFF switch lane_wall_bound honours, and LANE_TIMEOUT is unset or empty)" ;;
+      *)
+        if [ -n "${LANE_BACKSTOP_S_N:-}" ]; then
+          _watch_basis_note="no clock at all, because the wall axis is OFF (${LANE_WALL_SRC}=0) and LANE_BACKSTOP_S=${LANE_BACKSTOP_S_N} is the same OFF switch rather than a clock"
+        else
+          _watch_basis_note="no clock at all, because the wall axis is OFF (${LANE_WALL_SRC}=0) and no LANE_BACKSTOP_S is exported"
+        fi ;;
+    esac
     _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
   fi
-  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the design check wait is ${WAIT_S_DESIGN}s and it is NOT clamped by the wall clock (a WATCHDOG cap may still have reduced it to ${WAIT_S}s, and the line above says so when it did), and no wall ceiling is enforced for this lane. Reading 0 as a zero-second budget would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ AND NOTE THE OTHER AXIS: the --watch supervision allowance is NOT derived from that zero clock (review cycle 13, P2) — it comes from ${_watch_basis_note}, so it is ${_watch_supervision_note} here. Do not read this line as 'this lane has no bounds at all'."
+  # ⛔ THE HEADLINE NAMES THE KNOB THAT IS ACTUALLY OFF, NEVER A LITERAL (review, P3 — measured: a
+  # `LANE_BACKSTOP_S=0` lane was told "LANE_TIMEOUT=0 is the documented 'wall axis OFF' value" about a
+  # variable it never set, on the one line an OFF-axis operator reads). Guarded to a knob NAME so a
+  # longer source phrase can never be pasted into an `<operand>=0` sentence.
+  _wall_off_knob="LANE_TIMEOUT"
+  case "${LANE_WALL_SRC}" in LANE_TIMEOUT|LANE_BACKSTOP_S) _wall_off_knob="${LANE_WALL_SRC}" ;; esac
+  say_err "lane-merge: ${_wall_off_knob}=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the design check wait is ${WAIT_S_DESIGN}s and it is NOT clamped by the wall clock (a WATCHDOG cap may still have reduced it to ${WAIT_S}s, and the line above says so when it did), and no wall ceiling is enforced for this lane. Reading 0 as a zero-second budget would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ AND NOTE THE OTHER AXIS: the --watch supervision allowance is NOT derived from that zero clock (review cycle 13, P2) — it comes from ${_watch_basis_note}, so it is ${_watch_supervision_note} here. Do not read this line as 'this lane has no bounds at all'."
 elif [ -n "$_lane_elapsed" ]; then
   _wall_left=$(( LANE_WALL_S - _lane_elapsed - _hb_margin ))
   [ "$_wall_left" -ge 0 ] || _wall_left=0
@@ -1868,7 +2093,29 @@ fi
 _wait_t0="$(date +%s)"
 deadline=$(( _wait_t0 + WAIT_S ))
 while :; do
-  rows="$(checks_read "$HEAD")"
+  # ⛔ A CHECK-RUN READ THAT DID NOT FINISH IS NOT A MEASUREMENT — AND ON THIS LOOP IT FLIPS THE
+  # VERDICT (#3858). Both reads below hand their rows to `classify`, which derives GREEN from the rows
+  # it is GIVEN (`IF=0` + empty RED over whatever arrived) — so a read that dropped rows drops the
+  # PENDING ones with them, a head with queued runs looks terminal-and-clean, and the loop `break`s,
+  # which is the ONLY path to `launch_chain`. Measured on a fixture (issue #3858, 2026-11-09): page 2
+  # held `redjob failure`, page 1 held one green row, and origin/main launched the merge chain on that
+  # unmeasured head; the same fixture with page 2 delivered exited 10 FIX_REQUIRED. The missing page IS
+  # the difference between the two verdicts, so this is a false PASS in the merge gate, not a partial
+  # log line. The verdict was reproducible because the read's exit status was DISCARDED here and no
+  # row count was ever compared with the TOTAL the single-page read had just returned: completeness was
+  # assumed from having ASKED for more.
+  # ⛔ BOTH HALVES ARE NEEDED AND NEITHER SUBSTITUTES FOR THE OTHER: the exit status catches a read
+  # that FAILED (a secondary rate limit, a 502 on page 2, a broken pipe), and the COUNT catches one
+  # that exited 0 having silently dropped rows — which is why the exit-status fix alone is not the fix.
+  # The count assertion is also the external convention: GitHub's REST check-runs response carries
+  # `total_count`, and comparing the flattened row count against it (fail closed on a mismatch) is how
+  # a pagination is known to have ended. Same shape this repo's own graph reads adopted — a `truncated:`
+  # marker rather than silence.
+  # ⛔ FAIL-CLOSED DIRECTION: a truncated/undetermined read is HELD (IF=1, RED empty, retried next
+  # poll, reported WAITING_CHECKS at the bound) — the bucket an unreadable classification already uses.
+  # It is never green, and the loop's own bound keeps a held head from waiting for ever.
+  _read_rc=0
+  rows="$(checks_read "$HEAD")"; _read_rc=$?
   # The single-page read carries a TOTAL line so "this page is all of it" is distinguishable from
   # "there is more". Only then pay for the full paginated read (the rare case), and never let the
   # TOTAL line itself reach the classifier — a head with 0 check-runs would otherwise classify as
@@ -1877,17 +2124,42 @@ while :; do
   # would arrive with 5 fields — matching it here would read a status string as a count.
   total="$(printf '%s\n' "${rows:-}" | awk -F'\t' '$1=="TOTAL" && NF==2 {print $2; exit}')"
   rows="$(printf '%s\n' "${rows:-}" | awk -F'\t' 'NF>=4')"
-  if [ -n "${total:-}" ] && [ "$total" -gt 100 ] 2>/dev/null; then
-    rows="$(checks_read "$HEAD" --full)"
+  _undet=""; _n=0
+  if [ "$_read_rc" -ne 0 ]; then
+    # A non-zero exit can still have printed rows (the shim writes as it goes), and none of them can
+    # be trusted as the whole set. On a SUCCESSFUL single page the TOTAL row is always present, so
+    # "no TOTAL and rc 0" is not a reachable state in production and "no TOTAL" needs no arm here.
+    _undet="the single-page check-run read FAILED (exit ${_read_rc})"
+  elif [ -n "${total:-}" ] && [ "$total" -gt 100 ] 2>/dev/null; then
+    : > "$CHECK_ERR_TMP"
+    _full_rc=0
+    rows="$(checks_read "$HEAD" --full 2>"$CHECK_ERR_TMP")"; _full_rc=$?
+    # Count the rows the classifier will actually see (NF>=4, exactly its own predicate). A job name
+    # carrying an embedded newline can only ever DEFLATE this count, and a deflated count holds — the
+    # safe direction. Growth (check-runs created between the two reads) is expected and allowed.
+    _n="$(printf '%s\n' "${rows:-}" | awk -F'\t' 'NF>=4 {n++} END{print n+0}')"
+    if [ "$_full_rc" -ne 0 ]; then
+      _undet="the FULL (paginated) check-run read FAILED (exit ${_full_rc}) after ${_n} of ${total} rows"
+    elif [ "${_n:-0}" -lt "$total" ]; then
+      _undet="the FULL (paginated) check-run read returned ${_n} of ${total} rows, so it was TRUNCATED"
+    fi
   fi
-  if [ -z "${rows:-}" ]; then
+  if [ -n "$_undet" ]; then
+    log_line "… ${_undet} at head ${HEAD:0:12} — a partial read is not a measurement, so this head is HELD (a truncation never reads as green)"
+    # Say WHY the read stopped, once: the read's own stderr is the only place that reason exists.
+    if [ -s "$CHECK_ERR_TMP" ]; then
+      _why="$(head -1 "$CHECK_ERR_TMP" 2>/dev/null)"
+      [ -n "$_why" ] && say_err "lane-merge:   the read said: ${_why:0:400}"
+    fi
+    IF=1; RED=""
+  elif [ -z "${rows:-}" ]; then
     # An EMPTY check-run set is not a green set: nothing has been measured. Keep polling (this is
     # the "a queued run is not a green run" rule at its surface), and the bound below reports it.
     log_line "… no check-runs reported for head ${HEAD:0:12} yet — a queued run is not a green run"
     IF=1; RED=""
   else
     printf '%s\n' "$rows" > "$CHECK_TMP"
-    classified="$(classify "$CHECK_TMP")"
+    classified="$(classify "$CHECK_TMP" "${LM_REQ:-}" "$LM_REQ_TRUSTED")"
     # ⛔ FAIL CLOSED ON AN UNREADABLE CLASSIFICATION. A missing/broken python3 yields EMPTY output,
     # which would read as "no red, no inflight" — i.e. GREEN — and launch a merge on a head nobody
     # classified. The classifier's own contract is two lines; anything else is "I cannot judge".
@@ -1903,10 +2175,36 @@ while :; do
     fi
     IF="$(printf '%s' "$classified" | awk '/^INFLIGHT /{print $2}')"
     RED="$(printf '%s' "$classified" | awk '/^RED /{sub(/^RED /,""); print}')"
+    # ── THE REQUIRED / ADVISORY SPLIT (#4014). Only present when the contract was READ; when it
+    # was not, the classifier prints neither line and `RED_REQ` falls back to the WHOLE red set —
+    # the fail-closed default (every check required). A `REQMISSING` name is a required check that
+    # has not been published yet, and it is counted as in flight below.
+    RED_REQ="$(printf '%s' "$classified" | awk '/^REQRED /{sub(/^REQRED /,""); print}')"
+    RED_ADV="$(printf '%s' "$classified" | awk '/^ADVRED /{sub(/^ADVRED /,""); print}')"
+    REQ_MISSING="$(printf '%s' "$classified" | awk '/^REQMISSING /{sub(/^REQMISSING /,""); print}')"
+    # ⛔ A TRUNCATED SPLIT MUST NOT READ AS "EVERYTHING IS ADVISORY". The two lines above were the
+    # classifier's whole contract before #4014, so the guard below still only demands them; the SPLIT
+    # is elected here instead — absent, `RED_REQ` reverts to the WHOLE red set, which is the fail-closed
+    # direction (every red is a fix round). A crash between the prints lands here, not in a false green.
+    if [ "$LM_REQ_TRUSTED" = 1 ] && ! grep -q '^REQRED ' <<<"$classified"; then
+      say_err "lane-merge: the classifier printed no required/advisory split — treating EVERY red as required (fail-closed)"
+      LM_REQ_TRUSTED=0
+    fi
+    if [ "$LM_REQ_TRUSTED" != 1 ]; then RED_REQ="${RED:-}"; RED_ADV=""; REQ_MISSING=""; fi
   fi
   [ -n "$RED" ] && { printf '%s\n' "$(printf '%s' "$RED" | tr ',' '\n')" > "$LAST_F"
                      printf '%s\n' "${HD:-${HEAD:-}}" > "$LASTHEAD_F" 2>/dev/null || true; }
-  if [ -n "${RED:-}" ]; then
+  # ⛔ AN ADVISORY RED IS REPORTED, NEVER HIDDEN (#4014). It spends no fix round and is not waited
+  # for, but a lane that was told nothing would be the silence this file exists to abolish — and the
+  # MERGE decision is still not made here: the chain re-reads the surface through the repo's own
+  # authority (see the block that resolves `LM_REQ` above).
+  if [ -n "${RED_ADV:-}" ]; then
+    log_line "… ADVISORY (not in $OR's required set: ${LM_REQ:-none}) — reported, NOT a fix round and NOT waited for: $(printf '%s' "$RED_ADV" | tr ',' ' ')"
+  fi
+  if [ -n "${REQ_MISSING:-}" ]; then
+    log_line "… required check(s) NOT PUBLISHED YET at head ${HEAD:0:12} — a missing required check is in flight, never green: $(printf '%s' "$REQ_MISSING" | tr ',' ' ')"
+  fi
+  if [ -n "${RED_REQ:-}" ]; then
     # ── A FLAKE IS NOT A FIX (#2866) ──────────────────────────────────────────────────────────
     # Before this round spends a FIX on the red, ask the router whether the red is a red at all.
     # `RERUN-FLAKE` = the same (app, workflow, job) PASSED on an earlier attempt at THIS SAME head:
@@ -1934,18 +2232,31 @@ while :; do
       esac
     fi
     [ "${lsick_action:-}" = "RERUN-FLAKE" ] && exit 11
-    emit_fix FIX_REQUIRED "this head's own checks are RED: $(printf '%s' "$RED" | tr ',' ' ')"
+    emit_fix FIX_REQUIRED "this head's own required checks are RED: $(printf '%s' "$RED_REQ" | tr ',' ' ')"
   fi
-  [ "${IF:-0}" = "0" ] && break
+  # ⛔ THE WAIT IS ON THE REQUIRED SURFACE (#4014). `IF` is already required-only when the contract
+  # was read (untouched otherwise), and an UNPUBLISHED required name is in flight too. Continuing to
+  # sit through advisory jobs is the 24-queued-checks tax measured on #12171, and it buys nothing:
+  # no merge decision is made here.
+  _eff="${IF:-0}"
+  if [ -n "${REQ_MISSING:-}" ]; then _eff=$(( _eff + 1 )); fi
+  [ "$_eff" = "0" ] && break
   # ⛔ SAY SOMETHING WHILE YOU WAIT (measured live on this change's own PR). With every required
   # check in flight the loop printed NOTHING for up to WAIT_S — and to every liveness instrument we
   # have, a lane that has produced no output for 15 minutes is indistinguishable from a wedged one.
   # The header promises progress; this is it. Printed when the count CHANGES (so a stable wait does
   # not spam 45 identical lines) and at least once a minute otherwise.
   now="$(date +%s)"
-  if [ "${IF:-}" != "${_last_if:-}" ] || [ $(( now - ${_last_say:-0} )) -ge 60 ]; then
-    log_line "… ${IF} check(s) in flight at head ${HEAD:0:12} — waiting ($(( deadline - now ))s left in this bound)"
-    _last_if="$IF"; _last_say="$now"
+  # ⛔ THE COUNT QUOTED HERE IS THE ONE THE LOOP WAITS ON (review P3-3, #4039). `IF` is required-only
+  # and `_eff` adds the unpublished-required reason, so a line rendered from `${IF}` said
+  # `0 check(s) in flight` in the state this change creates — every present required check terminal and
+  # green, with the ONLY outstanding thing an unpublished required name. That is the same
+  # "quote the wrong operand" defect the bound line names, in the one surface a reader and the watchdog
+  # see DURING the wait — and it is the normal state for most of a wait, not a corner. The unpublished
+  # names travel with it because a reason of `0` is not a count.
+  if [ "${_eff:-}" != "${_last_if:-}" ] || [ $(( now - ${_last_say:-0} )) -ge 60 ]; then
+    log_line "… ${_eff} required check(s) outstanding at head ${HEAD:0:12}${REQ_MISSING:+ (${REQ_MISSING} not published yet)} — waiting ($(( deadline - now ))s left in this bound)"
+    _last_if="$_eff"; _last_say="$now"
   fi
   if [ "$now" -ge "$deadline" ]; then
     # In flight at the bound is NOT a failure of the lane and NOT a green: it is an unexplained
@@ -1955,9 +2266,24 @@ while :; do
     # four ways AFTER the constant is read (watchdog allowance, remaining wall clock, a lost heartbeat,
     # the seam), so a line rendered from `WAIT_S` would name a bound that never fired.
     _waited=$(( now - _wait_t0 ))
+    # ⛔ A HELD HEAD IS NOT AN IN-FLIGHT ONE (#3858). When the last read could not be completed, the
+    # in-flight count is this loop's own placeholder, so quoting it as "still in flight" would report a
+    # state nobody measured. Name the read failure instead.
+    if [ -n "${_undet:-}" ]; then
+      log_line "… this head's checks could NOT be measured after ${_waited}s (${_undet}) — re-run this script; nothing was merged"
+      disposition WAITING_CHECKS
+      verdict WAITING_CHECKS "check-run read incomplete after ${_waited}s: ${_undet}"
+      exit 11
+    fi
     log_line "… checks still IN FLIGHT (${IF}) after ${_waited}s — re-run this script; nothing was merged"
+    # ⛔ QUOTING `0` IN FLIGHT OVER A REAL CAUSE IS THE SILENCE THIS FILE ABOLISHES (review P1, #4039).
+    # An unpublished required check is an IN FLIGHT reason, not an in-flight COUNT, so a bound reached
+    # solely because it is missing would otherwise print `(0)` and send the reader after a slow CI run.
+    if [ -n "${REQ_MISSING:-}" ]; then
+      log_line "… the ONLY thing outstanding is required check(s) not published at this head: $(printf '%s' "$REQ_MISSING" | tr ',' ' ') — a required check that GitHub never reports leaves the merge blocked, so waiting is the correct direction"
+    fi
     disposition WAITING_CHECKS
-    verdict WAITING_CHECKS "checks still in flight after ${_waited}s"
+    verdict WAITING_CHECKS "checks still in flight after ${_waited}s${REQ_MISSING:+ (required and unpublished: $(printf '%s' "$REQ_MISSING" | tr ',' ' '))}"
     exit 11
   fi
   # ⛔ WATCHDOG-VISIBLE PROGRESS, EVERY POLL (#3584 review, P1 — measured). `lane_bound`'s only working
@@ -1966,8 +2292,9 @@ while :; do
   # sleep so the first poll is already covered, and unconditionally (not only when the count changes),
   # because an unchanged count is exactly the case the watchdog would read as silence.
   if [ -n "$HB_F" ]; then
-    printf '[lane-merge] heartbeat %s: %s check(s) in flight at head %s (%ss left in this bound)\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "${IF:-?}" "${HEAD:0:12}" \
+    printf '[lane-merge] heartbeat %s: %s required check(s) outstanding at head %s%s (%ss left in this bound)\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "${_eff:-?}" "${HEAD:0:12}" \
+      "${REQ_MISSING:+ (${REQ_MISSING} not published yet)}" \
       "$(( deadline - $(date +%s) ))" >> "$HB_F" 2>/dev/null || {
         say_err "lane-merge: the heartbeat target '$HB_F' became unwritable — progress is no longer visible to lane-bound.sh's ${IDLE_BOUND_S}s allowance; re-run with LANE_MERGE_HB pointing at the lane log."
         HB_F=""

@@ -1859,7 +1859,36 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 #     this equality with `ADDED: scripts/test_cmux_dispatch_path.py`, which is the attributable red
 #     the census exists for. Declared rather than filtered out: a filter on `scripts/test_*.py` would
 #     silently absorb the next suite that becomes a CALLER.
-EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/disk-admission.test.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_dispatch_path.py scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+#   * ⛔ `scripts/orchestrator-harness/gh-auth.test.sh` (#2509) is the SAME class as
+#     `capacity-transfer.test.sh` and `nonblocking-dispatch.test.sh`, one level higher: its `run_lane`
+#     arms drive the REAL `spawn-gate.sh` `run_agent`, and the gate refuses a non-compliant brief with
+#     80 (`AGENT_BRIEF_REFUSED` in `spawn-gate.sh` — NOT 74, which is `AGENT_LAND_BACKLOG`) BEFORE the code
+#     under test is reached. ⛔ CITED BY SYMBOL, NOT BY LINE — the line NUMBER was in the first cut of this
+#     sentence and the same commit's edits shifted it (review round 13, P3; the class `gh-auth.test.sh`'s
+#     header already declares: a line number in a comment about claim-accuracy is itself a claim that rots) — so the suite renders its brief fixture by CALLING
+#     `$HERE/brief-gate.sh --section lane` from its own `run_lane` rather than hard-coding a block that would
+#     drift (cited by SYMBOL too: the line number this sentence first carried had already rotted by round 15)
+#     from the gate. It dispatches no writer of its own (the `pi` it starts is a stub), so it is a
+#     REFERENCER: it joins this equality without joining the dispatch population. Undeclared it
+#     reddens the arm with `ADDED: scripts/orchestrator-harness/gh-auth.test.sh`, which is the
+#     attributable red this census exists for. Declared rather than hidden behind a filter: a filter on
+#     `*gh-auth*` would silently absorb the next suite that starts driving the gate.
+#   * ⛔ `worker-supply.sh` (#3958) is a CALLER of the gate's own verdict, and it is the FIRST one that
+#     asks a DIFFERENT question: not "may this be dispatched?" but "is the brief already cached for this
+#     order still ADMISSIBLE?". `brief_verdict()` (:517) runs the resolved copy's `--check`, and
+#     `brief_gate_path()` (:488) walks the dispatcher's OWN four-rung ladder in its order, so the
+#     supervisor's verdict and the dispatcher's are the same verdict from the same copy (#2708). It is
+#     declared rather than filtered because a filter on `*supply*` would absorb the next supervisor that
+#     revalidates: undeclared, this equality reddens with `ADDED:
+#     scripts/orchestrator-harness/worker-supply.sh`, which is exactly how it was found.
+#   * ⛔ `worker-supply.test.sh` (#3958) is a REFERENCER of the same class as `capacity-transfer.test.sh`
+#     one level up: it does not hard-code a brief, it RENDERS its healthy-path fixture by CALLING
+#     `brief-gate.sh --section worker` (:210) and then preconditions on that fixture being ADMITTED
+#     (:211-214), so the healthy-path arms grade the supervisor rather than a stub's idea of a brief.
+#     It dispatches no writer of its own (its dispatcher is a stub), so it joins this equality without
+#     joining the dispatch population. Declared rather than filtered: the filter would have to be
+#     `*worker-supply*`, which is the file the next revalidation lands in.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/disk-admission.test.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/gh-auth.test.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/orchestrator-harness/worker-supply.sh scripts/orchestrator-harness/worker-supply.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_dispatch_path.py scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"

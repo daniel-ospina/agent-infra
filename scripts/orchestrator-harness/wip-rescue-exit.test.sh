@@ -682,7 +682,7 @@ n4j_case() { # n4j_case <tag> <root> <branch> -> "push=<v> dirs=<n>"
   v="$(printf '%s' "$out" | sed -n 's/^push=//p')"
   printf 'push=%s dirs=%s' "${v:-<none>}" "$(ls -d "$d"/bounded.* 2>/dev/null | wc -l | tr -d ' ')"
 }
-n4j_ok="$(n4j_case ok "$N4E-lane" advlane)"# the lane must have FETCHED for the ancestry to be measurable — otherwise this path is
+# the lane must have FETCHED for the ancestry to be measurable — otherwise this path is
 # `verify-ancestry-unmeasured`, not `pushed`, and the arm would measure the wrong branch.
 git -C "$N4E-lane" fetch -q origin 2>/dev/null
 n4j_ok="$(n4j_case ok "$N4E-lane" advlane)"
