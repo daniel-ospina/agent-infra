@@ -5176,6 +5176,12 @@ FIRST_CHECKS_STALL_BOUND=0
 FIRST_CHECKS_CEILING_BOUND=0
 FIRST_CHECKS_MISSING=0
 FIRST_CHECKS_MISSING_STREAK=0
+# ⛔ THE UNREADABLE-ATTRIBUTABLE SECONDS, kept apart from `FIRST_CHECKS_MISSING` (review
+# round 6, P2). `missing` sums the `unobservable` time from BOTH of that state's producers,
+# so quoting it as "the Jobs API did not answer for Ns" charges the cap's seconds — where
+# the read was deliberately NOT ATTEMPTED — to a failure that never happened.
+FIRST_CHECKS_MISSING_UNREADABLE=0
+FIRST_CHECKS_STREAK_UNREADABLE=0
 # ⛔ WHY `signal_ok` WAS CLEARED, not just that it was (review round 5, P2). The
 # `unobservable` state has TWO producers: a Jobs read that FAILED, and the
 # `> FIRST_CHECKS_JOBS_MAX` cap below, where the read is DELIBERATELY NOT ATTEMPTED. A
@@ -5417,7 +5423,7 @@ PY
 # `$SECONDS` deltas, not sleep counters, because a counter is not a clock (the
 # #1395 lesson: a rail that outlived its own reported bound).
 wait_for_first_checks() {
-  local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
+  local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 missing_unreadable=0 streak_unreadable=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
   local now last_clock dt fp summary max_step digest jobs cr_slug scan_rc scan_out
   local max_step_run fp_run summary_run read_ok n_lines idx cached
   local stall_bound ceiling_bound signal_ok poll_step poll_max backoff_step remaining adv wait_word expired
@@ -5446,6 +5452,7 @@ wait_for_first_checks() {
   FIRST_CHECKS_REDERIVED=""; FIRST_CHECKS_HEAD_CHECKS=""
   FIRST_CHECKS_STATE=""; FIRST_CHECKS_LAST_CHANGE=""; FIRST_CHECKS_TRANSITIONS=0
   FIRST_CHECKS_FINGERPRINT=""; FIRST_CHECKS_MISSING=0; FIRST_CHECKS_MISSING_STREAK=0
+  FIRST_CHECKS_MISSING_UNREADABLE=0; FIRST_CHECKS_STREAK_UNREADABLE=0
   FIRST_CHECKS_SIGNAL_REASON=""
   FIRST_CHECKS_UNRESOLVED=""; FIRST_CHECKS_UNRESOLVED_UNREADABLE=0
   stall_bound="$FIRST_CHECKS_STALL"
@@ -5716,9 +5723,23 @@ wait_for_first_checks() {
       # hold the lane — the same bound this wait had before, no worse.
       FIRST_CHECKS_STATE="unobservable"
       missing=$((missing + dt)); missing_streak=$((missing_streak + dt))
+      # ⛔ ONLY A FAILED READ MAY BE QUOTED AS "THE JOBS API DID NOT ANSWER" (review
+      # round 6, P2). `signal_ok` is ALSO cleared by the >JOBS_MAX cap below, where the
+      # read was DELIBERATELY NOT ATTEMPTED — so `missing` sums two different grounds and
+      # a refusal quoting it attributes cap seconds to a read failure that never happened.
+      # The reason is written by the branch that fired THIS poll (never by an earlier
+      # one), so it names this poll's ground exactly. A cap poll also BREAKS the
+      # uninterrupted-unreadable run, so the consecutive figure cannot span it.
+      if [ "${FIRST_CHECKS_SIGNAL_REASON:-}" = "unreadable" ]; then
+        missing_unreadable=$((missing_unreadable + dt))
+        streak_unreadable=$((streak_unreadable + dt))
+      else
+        streak_unreadable=0
+      fi
     else
       FIRST_CHECKS_STATE="still-running"
       missing_streak=0
+      streak_unreadable=0
       # PROMOTE the stall period from what these runs have actually shown: half of
       # a step that already took longer than the derived stall period would be a
       # false stall on a run that has demonstrably run that long.
@@ -5741,6 +5762,8 @@ wait_for_first_checks() {
     FIRST_CHECKS_QUIET="$quiet"
     FIRST_CHECKS_MISSING="$missing"
     FIRST_CHECKS_MISSING_STREAK="$missing_streak"
+    FIRST_CHECKS_MISSING_UNREADABLE="$missing_unreadable"
+    FIRST_CHECKS_STREAK_UNREADABLE="$streak_unreadable"
     FIRST_CHECKS_OBSERVED="${obs:-no run has appeared for this head yet}"
 
     # ── THE VERDICT ───────────────────────────────────────────────────────
@@ -6059,13 +6082,28 @@ block_on_first_checks() {
           say_err "   can report a false 'no change', which would be a false stall. The Jobs surface itself"
           say_err "   was READABLE — this wait declined to poll it — so no duration is quoted for it and"
           say_err "   slow and wedged could not be told apart."
-        elif [ "${FIRST_CHECKS_MISSING:-0}" -gt 0 ]; then
+        elif [ "${FIRST_CHECKS_MISSING_UNREADABLE:-0}" -gt 0 ]; then
+          # ⛔ THE QUOTED SECONDS ARE THE UNREADABLE-ATTRIBUTABLE ONES, never `missing`
+          # (review round 6, P2). A wait that spent some polls over the >JOBS_MAX cap and
+          # others with a genuinely failed read has a `missing` larger than the time the
+          # Jobs API actually failed to answer for; quoting it here named a ground the
+          # numbers did not come from.
           say_err "   closed, and their per-job/per-step PROGRESS could not be read (the Jobs API did not"
-          say_err "   answer for ${FIRST_CHECKS_MISSING}s in total, ${FIRST_CHECKS_MISSING_STREAK}s consecutively), so slow and wedged could not be told apart."
-        else
+          say_err "   answer for ${FIRST_CHECKS_MISSING_UNREADABLE}s in total, ${FIRST_CHECKS_STREAK_UNREADABLE}s consecutively), so slow and wedged could not be told apart."
+        elif [ "${FIRST_CHECKS_SIGNAL_REASON:-}" = "unreadable" ]; then
           say_err "   closed, and their per-job/per-step PROGRESS could not be read: the Jobs read FAILED"
           say_err "   and no elapsed time was measured against it (this observation fitted inside one"
           say_err "   second), so no duration is claimed and slow and wedged could not be told apart."
+        else
+          # ⛔ A CATCH-ALL MUST NOT ASSERT A MEASUREMENT IT DID NOT TAKE (review round 6,
+          # P2). This arm is reached only when the recorded reason is neither `cap` nor
+          # `unreadable` — i.e. a producer that recorded no ground (or one added later).
+          # The old text claimed "the Jobs read FAILED" here, which is precisely the
+          # claim-about-an-unmeasured-ground this whole block exists to stop; the same
+          # diff refuses to claim a run either way at the #10047 site for this reason.
+          say_err "   closed, and their per-job/per-step PROGRESS could not be read, and the GROUND was"
+          say_err "   not one this wait measured: no Jobs read is claimed either way, so no duration is"
+          say_err "   quoted and slow and wedged could not be told apart."
         fi
         say_err "   A running job is not a failure, and this is NOT a stall claim: an unread instrument"
         say_err "   is not a stalled run."

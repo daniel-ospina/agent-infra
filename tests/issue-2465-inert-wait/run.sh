@@ -456,13 +456,26 @@ build_bofc() { # $1 = source path, $2 = output file
 }
 ck "extracted block_on_first_checks from $(basename "$SRC") — the star arm is EXECUTED, not assumed" \
    "$(build_bofc "$SRC" "$BOFC_LIB" && echo 0 || echo 1)"
-# bofc <state> <signal-reason> <missing> <missing_streak> <outcome> → refusal text
+# bofc <state> <signal-reason> <missing> <missing_streak> <outcome> [<missing_unreadable> <streak_unreadable>] → refusal text
 # BOFC_ONESHOT=<empty> drives the same refusal for a caller that did NOT decline to wait
 # (the knob is documented as "non-empty ⇒ on", so an EMPTY value is the only way to be
 # off — `=0` is truthy, which is the header's stated contract).
+# ⛔ THE UNREADABLE-ATTRIBUTABLE COUNTERS ARE INPUTS TOO (review round 6, P2). The refusal
+# quotes `FIRST_CHECKS_MISSING_UNREADABLE`/`_STREAK_UNREADABLE`, not the totals, because a
+# wait that spent polls over the >JOBS_MAX cap has a `missing` larger than the time the
+# Jobs API actually failed to answer for. When the ground IS `unreadable` the two coincide
+# (a wait whose only cause was a failed read — the common case), so they DEFAULT to the
+# totals; a MIXED wait passes them explicitly and that is the arm below that pins the fix.
 bofc() {
+  local mu su
+  mu="${6:-}"; su="${7:-}"
+  if [ -z "$mu" ]; then
+    if [ "$2" = "unreadable" ]; then mu="$3"; su="$4"; else mu=0; su=0; fi
+  fi
+  [ -n "$su" ] || su=0
   FIRST_CHECKS_OUTCOME="$5" FIRST_CHECKS_STATE="$1" FIRST_CHECKS_SIGNAL_REASON="$2" \
   FIRST_CHECKS_MISSING="$3" FIRST_CHECKS_MISSING_STREAK="$4" \
+  FIRST_CHECKS_MISSING_UNREADABLE="$mu" FIRST_CHECKS_STREAK_UNREADABLE="$su" \
   FIRST_CHECKS_WAIT=0 FIRST_CHECKS_WAITED=0 FIRST_CHECKS_JOBS_MAX=8 \
   FIRST_CHECKS_CEILING_BOUND=18064 FIRST_CHECKS_STALL_BOUND=8760 \
   FIRST_CHECKS_OBSERVED='run 123: 28 job(s): 2 completed, 26 not' \
@@ -498,6 +511,22 @@ ck "(C) …and it states the 3s it spent unreadable instead of denying it" \
 C_SLOW="$(bofc unobservable unreadable 3 1 unobservable)"
 ck "(C) CONTROL: a MEASURED 3s of unreadable reads is still quoted as a duration" \
    "$(grep -q 'answer for 3s in total, 1s consecutively' <<<"$C_SLOW" && echo 0 || echo 1)"
+# ⛔ THE MIXED WAIT (review round 6, P2). `missing` sums the `unobservable` time from BOTH
+# of that state's producers — a FAILED read and the >JOBS_MAX cap, where the read is
+# deliberately NOT ATTEMPTED. Quoting `missing` charged the cap's seconds to a read failure
+# that never happened. Here 5s of `missing` contains only 3s of genuinely unreadable time:
+# the refusal must quote 3s, and must NOT claim 5s.
+C_MIX="$(bofc unobservable unreadable 5 2 unobservable 3 1)"
+ck "(C) a MIXED wait (cap polls + failed-read polls) quotes ONLY the unreadable-attributable seconds (round 6 P2)" \
+   "$(grep -q 'answer for 3s in total, 1s consecutively' <<<"$C_MIX" && ! grep -q 'answer for 5s' <<<"$C_MIX" && echo 0 || echo 1)"
+# ⛔ AND THE CATCH-ALL MUST NOT INVENT A GROUND (review round 6, P2). With a reason that
+# is neither `cap` nor `unreadable`, the old text asserted "the Jobs read FAILED" — a
+# measurement the code did not take, the exact class this block exists to stop.
+C_UNK="$(bofc unobservable '' 2 1 unobservable)"
+ck "(C) an UNRECOGNISED ground claims NEITHER a failed read nor a duration (round 6 P2)" \
+   "$(grep -q 'the Jobs read FAILED' <<<"$C_UNK" && echo 1 || { grep -q 'did not answer for' <<<"$C_UNK" && echo 1 || echo 0; })"
+ck "(C) …and it SAYS the ground was not one this wait measured, instead of guessing" \
+   "$(grep -q 'GROUND was' <<<"$C_UNK" && echo 0 || echo 1)"
 # ⛔ THE `why only ONE observation` BLOCK IS A NEW GUARD, SO IT GETS A ROW (review
 # round 5, note). It explains a ONE-OBSERVATION refusal to the operator — the sentence
 # that must never appear for a caller who did not decline to wait.
