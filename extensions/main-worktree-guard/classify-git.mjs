@@ -5031,12 +5031,35 @@ function _cleanDeleteTarget(x) {
 // MENTIONS a push (`echo git push origin -d b`, a commit message) must keep
 // over-matching, because that is the documented fail-closed over-capture
 // (`hasPush`/`promotedFrom` are what keep it off the full path — see index.ts).
+// ⚠️ STATED LIMITS — MEASURED, and narrower than round 16's, but they exist and
+// are declared rather than assumed covered. The PARSED surface reaches
+// `sudo`/`env FOO=1`/`command`/`time`/`xargs`/`$( … )`/`bash -c '…'`/`sh -c '…'`/
+// subshells/brace groups, and the TEXT surface covers an unprefixed mention
+// anywhere. Still invisible, all three BASE-IDENTICAL (not regressions):
+//   · an `eval "…"` payload whose push also carries a global option
+//     (`eval "git push origin -d a"` IS caught by the text surface);
+//   · a BACKTICK substitution (`` `git --no-pager push origin --delete a` ``) —
+//     the walk has no backtick form, and the text surface needs literal
+//     adjacency, so `$( … )` is covered and `` `…` `` is not;
+//   · an alias the guard does not expand.
+// Closing any of them means teaching a LIST again (the drift this round removed)
+// or extending the shell walk — declared here so the next lane reads a limit
+// instead of rediscovering a fail-open.
 export function extractPushDeleteBranch(command) {
   const c = String(command ?? "").trim();
-  // CHEAP COST GATE, not a semantic one: every spelling this guard can reach
-  // carries the literal `push` token, and the shell walk below is far more
-  // expensive than one regex test on a hot `tool_call` path.
-  if (c === "" || !/\bpush\b/.test(c)) return null;
+  // ⛔ NO TEXT PRE-FILTER (review round 18, P0). A `!/\bpush\b/.test(c)` gate
+  // stood here as a cost shortcut, and it VETOED THE SURFACE THAT HAD THE ANSWER:
+  // `git pu""sh origin --delete held` and `git pu\sh …` are resolved by the
+  // parser as a real `push` with target `held`, while the literal token `push`
+  // never appears in the text — so the extractor returned null over a command the
+  // classifier had already attributed, and in DEGRADED mode (where this function
+  // is the only surface) that admitted a sibling-held delete. A cheap gate that
+  // can exclude a row the parser classifies is the same strict-subset defect this
+  // round exists to remove, so the gate is GONE; the shell walk is the filter.
+  // Cost, measured on node 24: `ls -la` 0.0003 ms, `git status` 0.0001 ms,
+  // `git push origin -d a` 0.008 ms, a 25 kB compound 2.9 ms — and the arms that
+  // call this are reached only for commands a verdict already flagged.
+  if (c === "") return null;
   const branches = [];
 
   /** Attribute every delete refspec these PUSH ARGUMENT TOKENS carry.

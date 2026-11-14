@@ -746,6 +746,24 @@ if (typeof stripTypeScriptTypes !== "function" ||
       cmd: "git stash pop && git --no-pager push origin --delete held",
       why: "round 17 P0: in degraded mode the extractor is the ONLY surface, so a global option it " +
            "cannot name is a silent exemption — MEASURED ALLOWED at round-16 head `57641dd45`" },
+    // ── review round 18 (P0): A TEXT GATE VETOED THE PARSER'S OWN ANSWER ──
+    // The round-17 extractor carried a `!/\bpush\b/.test(c)` cost shortcut. The
+    // parser resolves a QUOTED or ESCAPED verb (`git pu""sh`, `git pu\sh`) as a
+    // real `push` with target `held`, while the literal token `push` never appears
+    // in the text — so the extractor returned null over a command the classifier
+    // had already attributed, and in DEGRADED mode (extractor = the only surface)
+    // the compound was ALLOWED. Base `e4716a058` is open here for the same reason
+    // (its gate was `\bgit\s+push\b`, which the quoted verb also defeats), so
+    // these rows are declared coverage of a base-owned gap, not a regression pin.
+    { id: "D8", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: 'git stash pop && git pu""sh origin --delete held',
+      why: "round 18 P0: the parser resolves the quoted verb; a text pre-filter must never veto it" },
+    { id: "D9", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git pu\\sh origin --delete held",
+      why: "round 18 P0: the ESCAPED spelling of the same verb — the second form of the same class" },
+    { id: "D10", dir: "wt", expect: "allow",
+      cmd: 'git stash pop && git pu""sh origin --delete stale',
+      why: "round 18 CONTROL: the quoted verb with an UNHELD target stays worktree-exempt (D8 differs only by the holder)" },
     { id: "D7", dir: "wt", expect: "allow",
       cmd: "git stash pop && git --no-pager push origin --delete stale",
       why: "round 17 CONTROL: the same option-prefixed spelling with an UNHELD target stays " +
@@ -1256,28 +1274,50 @@ if (typeof stripTypeScriptTypes !== "function" ||
           expectGreen: ["P13", "P15", "B1"],
         },
         {
-          // (18) THE EXTRACTOR'S PARSED SURFACE DROPPED — the round-17 P0 put
-          // back. Round 16's mutant re-narrowed a HAND-BUILT adjacency list; round
-          // 17 deleted that list and made the extractor read the parser's own
-          // invocations, so the defect to reintroduce is now "only the text
-          // over-match is left" — which is exactly the pre-round-16 behaviour for
-          // every option-prefixed spelling (`git --no-pager push` included).
-          // The two controls (P36, D5) hold in BOTH worlds, which is what proves
-          // the rows measure target ATTRIBUTION and not session geometry.
-          label: "extractor parsed surface dropped (classify-git.mjs)",
+          // (18a) THE EXTRACTOR'S PARSED SURFACE DROPPED, FULL PATH — the
+          // round-17 P0 put back. Round 16's mutant re-narrowed a HAND-BUILT
+          // adjacency list; round 17 deleted that list and made the extractor read
+          // the parser's own invocations, so the defect to reintroduce is now
+          // "only the text over-match is left". The controls (P36, P41) hold in
+          // BOTH worlds, which is what proves these rows measure target
+          // ATTRIBUTION and not session geometry.
+          // ⛔ THE FULL-PATH AND DEGRADED LEGS ARE SEPARATE MUTANTS, and a guard
+          // below refuses any mutant that declares both: with `expectDegradedRed`
+          // the finder branch `continue`s, so a single mutant's `expectRed` rows
+          // were never asserted at all (measured: P33–P40 produced NO output line
+          // while the suite still reported green — the inert-pin class this file
+          // exists to catch, inside the file itself).
+          label: "extractor parsed surface dropped — full path (classify-git.mjs)",
           file: "classify-git.mjs",
-          // `omit` is REQUIRED for the degraded legs: without it the mutant tree
-          // loads CLEAN, the D-rows run the FULL path, and D4 stays blocked by the
-          // parsed surface — a green assertion measuring the wrong arm.
-          omit: ["shared/branch-ownership.mjs"],
           revert: dropExtractorParsed,
           expectRed: ["P33", "P34", "P35", "P37", "P38", "P39", "P40"],
           redCheck: (r) => !blocked(r),
           expectGreen: ["P36", "P41", "P31", "P29", "B10", "B7"],
-          expectDegradedRed: ["D4", "D6"],
-          expectDegradedGreen: ["D5", "D7", "D1", "D2"],
+        },
+        {
+          // (18b) THE SAME REVERT ON THE DEGRADED TREE — `omit` is REQUIRED here:
+          // without it the mutant tree loads CLEAN, the D-rows run the full path,
+          // and the assertion measures the wrong arm.
+          label: "extractor parsed surface dropped — DEGRADED (classify-git.mjs)",
+          file: "classify-git.mjs",
+          omit: ["shared/branch-ownership.mjs"],
+          revert: dropExtractorParsed,
+          expectDegradedRed: ["D4", "D6", "D8", "D9"],
+          expectDegradedGreen: ["D5", "D7", "D10", "D1", "D2"],
         },
       ];
+
+      // ⛔ ONE LEG PER MUTANT (round 18, P1). The finder below takes the
+      // `expectDegradedRed` branch and `continue`s, so a mutant declaring BOTH
+      // legs asserts only the degraded one — its `expectRed` rows never run while
+      // the suite reports green. That is the inert-pin class this file exists to
+      // catch, found inside the file itself; declared as an assertion so it
+      // cannot come back quietly.
+      for (const mut of MUTANT_PAIRS) {
+        expectTrue(`M: [${mut.label}] declares ONE leg (the degraded finder \`continue\`s, so a mutant with both legs never asserts its expectRed)`,
+          !(mut.expectDegradedRed && (mut.expectRed || mut.expectGreen)),
+          "declare the full-path rows in their own mutant beside this one");
+      }
 
       for (const mut of MUTANT_PAIRS) {
         const built = buildTree(mut.label.replace(/[^a-z0-9]+/gi, "-"), mut);

@@ -6674,9 +6674,15 @@ export default function (pi: ExtensionAPI) {
       // round 16 `extractPushDeleteBranch` required the literal `git push`
       // adjacency (`git -C . push` was invisible), and round 16 hand-taught it a
       // list of prefixes — which round 17 then found incomplete (`--no-pager`) and
-      // REPLACED with a read of the parser's own invocations. The two surfaces now
-      // agree on every real command (measured on P33–P40), so the union below is
-      // defence in depth rather than two different answers.
+      // REPLACED with a read of the parser's own invocations. On the rows these
+      // arms actually gate (P33–P40) the two surfaces now agree, so the union below
+      // is defence in depth rather than two different answers. They do NOT agree on
+      // everything, and the difference is a real command class: for a command
+      // substitution the parser reports the single marker token `$` while the text
+      // surface reports the space-split fragments (`test-653-delete-target.mjs`
+      // pins `git push origin -d $(echo held/branch)` → `["$", "$(echo",
+      // "held/branch)"]`), and each name is unresolvable, so #653 refuses — the
+      // union is what keeps that complete.
       // They are NOT identical, and the difference is kept deliberately: the
       // extractor also over-matches plain TEXT (`echo git push origin -d b`, a
       // commit message), which is the fail-closed direction for attribution but is
