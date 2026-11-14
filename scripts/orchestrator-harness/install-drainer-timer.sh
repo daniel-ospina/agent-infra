@@ -194,14 +194,32 @@ say_status() {
     if [ -f "$UNIT_DIR/$svc" ]; then
         # Last occurrence wins: systemd merges repeated `Environment=` lines and the last one is what the
         # unit sees, so reading the first would vouch for a value the box does not use.
-        installed="$(grep '^Environment=LANE_TIMEOUT=' "$UNIT_DIR/$svc" 2>/dev/null \
-                     | tail -1 | sed 's/^Environment=LANE_TIMEOUT=//' | tr -d '\r')"
+        # ⛔ ONE LINE SHAPE IS NOT "THE PIN" (review finding, P2). systemd also accepts
+        # `Environment="LANE_TIMEOUT=7200"`, `Environment = LANE_TIMEOUT=7200`, several assignments on
+        # one line (`Environment=LANE_TIMEOUT=7200 OTHER=x`), and a drop-in under `<unit>.d/*.conf` is
+        # parsed AFTER the unit file so it WINS. Reading only the anchored single-assignment form of the
+        # unit file reported every one of those as "the unit carries no pin" and exited 0 — a FALSE CLEAN
+        # in the one verb whose whole purpose is making a stale pin visible. So: every `Environment=`
+        # assignment, unit then drop-ins, quotes and whitespace normalised, last LANE_TIMEOUT wins — and a
+        # pin that is not a number is NAMED as unreadable (exit 3) instead of being read as absence.
+        installed="$( { [ -f "$UNIT_DIR/$svc" ] && cat "$UNIT_DIR/$svc"
+                        for _d in "$UNIT_DIR/$svc.d"/*.conf; do [ -f "$_d" ] && cat "$_d"; done
+                      } 2>/dev/null \
+                     | sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*//p' \
+                     | tr -d '"' | tr -d '\r' | tr ' ' '\n' \
+                     | sed -n 's/^LANE_TIMEOUT=//p' | tail -1 )"
         want="${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}"
-        if [ -z "$installed" ]; then
-            printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so ai-drainer.sh falls back to its compiled default)\n'
-        else
-            printf '  LANE_TIMEOUT pin: %s s installed · %s s would be rendered now\n' "$installed" "$want"
-        fi
+        case "$installed" in
+          '')
+            printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so ai-drainer.sh falls back to its compiled default)\n' ;;
+          *[!0-9]*)
+            printf '  ⚠️  UNREADABLE PIN: this unit sets LANE_TIMEOUT to `%s`, which is not a number of seconds. The seam\n' "$installed"
+            printf '      cannot compare against it, so the cap this box dispatches at is UNKNOWN, not healthy: re-run this\n'
+            printf '      installer (no arguments) on this cell to re-render the pin.\n'
+            return 3 ;;
+          *)
+            printf '  LANE_TIMEOUT pin: %s s installed · %s s would be rendered now\n' "$installed" "$want" ;;
+        esac
         if [ -n "$installed" ] && [ "$installed" != "$want" ]; then
             printf '  ⚠️  STALE PIN: this unit dispatches lanes at %s s, but the seam now says %s s — a rendered pin beats the\n' "$installed" "$want"
             printf '      default, so this box keeps the old cap until the unit is re-rendered: re-run this installer\n'
