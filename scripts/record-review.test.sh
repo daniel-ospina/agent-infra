@@ -5558,6 +5558,76 @@ N56_BODY="**Outcome: 2 ${N56_BT}blocking${N56_BT} findings were fixed; 1 P0 rema
 $VACUITY_BLOCK"
 EV_REF="comment:42506401" run_record_ev 425064 STUB_EVIDENCE_BODY="$N56_BODY"
 assert_eq "$RECORD_RC" "3" "13n56 inline code cannot hide a declaration ('2 [code-span]blocking findings … 1 P0 remains open') — refused (rc 3)"
+# 13n57-13n64 — THE HOUSE SEVERITY `P0|P1` IS A DECLARATION TOO, AND WIDTH IS NOT VOCABULARY
+# (agent-infra#3902 THIRD review, P1 + P2 — all eight vectors MEASURED against the arm extracted from
+# the shipped file and framed exactly as `gh --jq @tsv` frames a body). Two classes are pinned here,
+# and they pull in OPPOSITE directions on purpose:
+#   * 13n57/13n58 — a FAIL-OPEN. The entry gate read the NOUN `block(ing|ers?)`, so a declaration that
+#     named the house severity and never the noun was not this arm's business at all and the WHOLE arm
+#     was skipped: `2 P1 (security + evidence)` and `1 P1 (dispatch guard) remains open` both ADMITTED
+#     a clean record. `blocking` IS `P0/P1` by this file's own convention (`_OC_SEVREMAINDER`), so the
+#     fix is to admit the severity at the SAME gate and let the existing escapes/belts judge it.
+#   * 13n59/13n60 — the over-block controls for that widening. A severity form must escape on a
+#     resolution (`2 P1 were fixed`) and on a zero (`0 P1 findings`), or the widening would refuse the
+#     honest closures it exists to admit.
+#   * 13n61/13n62 — the WIDENED TAIL and the REFERENCE mask. `… findings from the review were fixed`,
+#     `… from the second cycle were fixed`, `… in scripts/record-review.sh were fixed` and
+#     `… from cycle 1 were fixed` are honest closures that the three-token, alphabetic-only run refused;
+#     an honest agent would have had to reword a true sentence to get its review recorded.
+#   * 13n63/13n64 — the remainder pair, and they are the rows that keep the whole thing honest. A
+#     surviving `<count> <P0|P1>` after the DECLARED count must still veto, whether the declaration
+#     spoke in the noun (`3 blocking (P1) … fixed; 2 P1 still open`) or in the severity alone. 13n63 is
+#     the regression pin for the "one declaration, one mask" rule: masking the severity UNCONDITIONALLY
+#     erased the remainder instead of the declaration there, and the line ESCAPED.
+rm -f "$(Q2 425065)"
+EV_REF="comment:42506501" run_record_ev 425065 STUB_EVIDENCE_BODY="**Outcome: 3 findings — 2 P1 (security + evidence), 1 P2.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n57 a declaration that names the HOUSE SEVERITY (2 P1) and never the noun 'blocking' is REFUSED (rc 3)"
+[ ! -f "$(Q2 425065)" ] && ok "13n57 no clean record minted over 2 declared P1 findings" || bad "13n57 minted a record over a P1 declaration — the entry gate only read the noun"
+
+rm -f "$(Q2 425066)"
+EV_REF="comment:42506601" run_record_ev 425066 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 1 P1 (dispatch guard) remains open.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n58 'Outcome: CLEAN' does not cancel a live P1 — the severity form of 13n8 (rc 3)"
+
+rm -f "$(Q2 425067)"
+EV_REF="comment:42506701" run_record_ev 425067 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 P1 were fixed and re-verified.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n59 OVER-BLOCK GUARD: a severity declaration whose blockers are RESOLVED still records (rc 0)"
+
+rm -f "$(Q2 425068)"
+EV_REF="comment:42506801" run_record_ev 425068 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 0 P1 findings.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n60 OVER-BLOCK GUARD: a ZEROED severity count ('0 P1 findings') records (rc 0)"
+
+rm -f "$(Q2 425069)"
+EV_REF="comment:42506901" run_record_ev 425069 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings from the review were fixed.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n61 OVER-BLOCK GUARD: an honest closure that names WHERE it fixed them records (the widened tail) (rc 0)"
+
+rm -f "$(Q2 425070)"
+EV_REF="comment:42507001" run_record_ev 425070 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) findings from cycle 1 were fixed and re-verified.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n62 OVER-BLOCK GUARD: 'cycle 1' is a REFERENCE, not a second count — the record still mints (rc 0)"
+
+rm -f "$(Q2 425071)"
+EV_REF="comment:42507101" run_record_ev 425071 STUB_EVIDENCE_BODY="**Outcome: 3 blocking (P1) findings were fixed; 2 P1 still open.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n63 a surviving P1 after the declaration's own resolution is a REMAINDER — refused (rc 3; pins 'one declaration, one mask')"
+
+rm -f "$(Q2 425072)"
+EV_REF="comment:42507201" run_record_ev 425072 STUB_EVIDENCE_BODY="**Outcome: 2 P1 (security) were fixed; 1 P1 remains open.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n64 a declared severity resolution does NOT cover the severity that REMAINS (rc 3)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
@@ -6624,13 +6694,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4521 :6247 :8621 :8795, plus a comment mention at :4390; `14.1c-CITE` below
+#     CITE-CHECK: :4576 :6302 :8676 :8850, plus a comment mention at :4445; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4398) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4521) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4576) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8621). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8676). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -6656,7 +6726,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8621` / `:8795` — CITE-CHECK: :8621 :8795 — re-derived by the
+#     this head the predicates are `:8676` / `:8850` — CITE-CHECK: :8676 :8850 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -7560,12 +7630,12 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
 #       and in #3168's diff the only hunk at `post_marker()` (head :4398) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4521) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :4576) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6247 :8621 :8795 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6302 :8676 :8850 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
