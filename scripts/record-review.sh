@@ -1049,6 +1049,25 @@ evidence_fetch() { # <kind> <id> -> tsv row; non-zero = unreadable
 # THE DECODER IS ONE LEFT-TO-RIGHT PASS, deliberately: the framed body's `\\n` is a LITERAL `\n` in
 # the reviewer's prose and must NOT become a line break, so the escapes are consumed as they are
 # met. A pipeline of substitutions gets that wrong in one of its two orderings.
+
+# ── ONE DECLARATION RECOGNIZER, THREE SITES (agent-infra#3902 review, F2) ─────────────────────
+# `outcome:` used to be spelled LITERALLY at three places — the arm-1c entry gate in
+# `outcome_declares_blocking`, arm (1b), and the `Outcome: clean` suppression in
+# `verify_review_evidence`. So a declaration that BOLDS ITS LABEL (`**Outcome**: …` — a more common
+# markdown idiom than bolding the value), is SPACED from its colon (`Outcome : …`), or closes with a
+# FULL-WIDTH colon (`Outcome：…`, U+FF1A) matched none of them. Arm (1c) was then SKIPPED ENTIRELY at
+# its own entry gate, and a `verdict=clean` record could be minted over a line declaring live
+# blockers — MEASURED at 57d19f3fa, all three forms ADMITTED. The same blind spot sat in (1b) and in
+# the suppression, so the three could DISAGREE about whether a declaration exists at all.
+# The header's own words already state the intent — "a declaration may be bolded, quoted, bulleted or
+# wrapped and must still be READ" — and this is exactly a bolded declaration. One recognizer, used by
+# all three, so they cannot diverge again. It tolerates the bold/italic/space run between the label
+# and the colon, a UTF-8 NBSP spacer, and either colon form. The `[^[:alnum:]]` lead (not
+# `[*[:space:]]`) is the widened anchor arm 1c already required, so a backticked or bulleted
+# declaration is still read.
+OC_NBSP=$'\xc2\xa0'
+OC_DECL_RE="(^|[^[:alnum:]])outcome[[:space:]${OC_NBSP}]*[*_[:space:]${OC_NBSP}]*([:]|[：])"
+
 tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
   LC_ALL=C awk '
     { s = (NR > 1 ? s "\n" : "") $0 }
@@ -1185,12 +1204,16 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # An affirmative TOTAL resolution: declared count, or an explicit totality word, as the subject.
   local _OC_TAIL="([[:space:]]+${_OC_TOK}){0,6}[[:space:]]+((were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2})?(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)"
   local _OC_CNT='([1-9][0-9]*|one|two|three|four|five|six|seven|eight|nine|ten)'
-  # ⛔ `BLKDECL` IS A TOTAL SUBJECT TOO (agent-infra#3902 review, F2+F4). The DECLARED count is
-  # MASKED out before the second-count arithmetic runs, which is right — but the masked text is then
-  # all the TOTAL arm can see, so `_OC_TOTAL` could never match the very declaration it exists to
-  # accept, and the digit form recorded only by accident of the mask not firing. Accepting the mask
-  # token makes the escape independent of which form (digit or spelled) the declaration used.
-  local _OC_TOTAL="(^|[^0-9])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)${_OC_TAIL}|(^|[^0-9])${_OC_CNT}[[:space:]]+\(?p[01]\)?${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?\(?p[01]\)?${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}|BLKDECL${_OC_TAIL}"
+  # ⛔ `_OC_TOTAL` IS EVALUATED ON THE UNMASKED LINE, AND IT MUST STAY THAT WAY.
+  # (agent-infra#3902 review, F6). A `BLKDECL`-as-total-subject alternative used to sit at the end of
+  # this expression, on the stated reasoning that "the masked text is then all the TOTAL arm can see".
+  # It is not: the only call site greps `$line` lowercased, and `BLKDECL` is a case-sensitive literal
+  # that is only ever WRITTEN into `_rest` — which is never passed here. So the alternative could
+  # never fire, and the comment told the next editor that a dead branch was load-bearing. It is
+  # REMOVED rather than made live: matching this against `_rest` would WIDEN the escape (the
+  # fail-open direction), while the first alternative already covers both the digit and the spelled
+  # declaration, which is why the branch was never needed.
+  local _OC_TOTAL="(^|[^0-9])${_OC_CNT}[[:space:]_-]*(${_OC_SEV}[[:space:]]+)?block(ing|ers?)${_OC_TAIL}|(^|[^0-9])${_OC_CNT}[[:space:]]+\(?p[01]\)?${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?block(ers?|ing)${_OC_TAIL}|(all|both|every)[[:space:]]+(the[[:space:]]+)?\(?p[01]\)?${_OC_TAIL}|the[[:space:]]+block(ing|ers?)[[:space:]]+[[:alpha:]-]+${_OC_TAIL}"
   # ⛔ A COLLECTIVE REMAINDER — `the rest`, `some`, `most`, `half` (agent-infra#3902 review, F3).
   # The header below CLAIMED these were counted; they were not, because they lived only in
   # `_OC_PERSIST`, which is `;`-SCOPED and so unreachable after the clause boundary. MEASURED at
@@ -1234,12 +1257,41 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # #3902`, `... (commit 30ce585)` are references, not counts); the arithmetic simply had no mask for
   # it. Masked BEFORE the `<count> <P0|P1>` remainder read, so a reference never becomes a remainder
   # either — and only the NOUN+number pair, so `2 were fixed` keeps its count.
-  local _OC_REFMASK='s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]]+#?[0-9]+/\1 REFCNT /g'
+  # ⛔ THE MASK IS SCOPED TO THE MATCH IT EXCEPTS — it is NOT a free pass for any `<noun> <n>`
+  # (agent-infra#3902 review, F3 — MEASURED fail-open). It was applied GLOBALLY to `_rest` before
+  # EVERY remainder belt, so on a line whose remainder happened to be NUMBERED with one of its own
+  # nouns the count was DELETED and the remainder became invisible:
+  #   `2 blocking (P1) findings were fixed; item 1 remains open`   -> VETOED
+  #   `2 blocking (P1) findings were fixed; finding 1 remains open` -> ADMITTED
+  #   `… ; issue 1 …` / `… ; step 2 remains unfixed …`             -> ADMITTED
+  # `remain open` is a LISTED persistence word and `1` is a COUNT, so this is OUTSIDE the residual
+  # the header declares ("an unlisted persistence phrase ... unaccompanied by any count"); the arm's
+  # positive claim is that a count is caught by ARITHMETIC, and here it was erased by a mask. The
+  # mask now requires its own CONTEXT — a reference that is the SUBJECT of a resolution verb — which
+  # is the only shape it was ever written to except. `_OC_REFMASK` is the file's own rule (a negation
+  # or exception is scoped to the match it excepts) applied to its own exception.
+  local _OC_REFMASK='s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]]+#?[0-9]+([[:space:]]+([[:alpha:]-]+[[:space:]]+){0,3}(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified))/\1REFCNT\3/g'
   local _OC_SEVREMAINDER="(^|[^[:alnum:]])${_OC_COUNT}[[:space:]]+${_OC_BSEV}"
   local _OC_STILL="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(still|remain|remains|remaining|open|outstanding|unresolved|unfixed|unaddressed|deferred|pending)"
   local _OC_SELLED='(^|[^[:alpha:]])(one|two|three|four|five|six|seven|eight|nine|ten)([^[:alpha:]]|$)'
   local _OC_SECOND_COUNT="${_OC_COUNT}(${_OC_GOVERNS}|${_OC_RESOLVES}|${_OC_STILL})|${_OC_SELLED}"
-  local _OC_ZEROED='(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)|(^|[^[:alnum:]])(no|non|zero|none)[[:space:]]*\(?p[01]\)?|(^|[^0-9])0[[:space:]]*\(?p[01]\)?'
+  # ⛔ ESCAPE (a) READS A NEGATOR WITH SCOPE, not only a negator glued to `blocking`
+  # (agent-infra#3902 review, F4 — MEASURED over-block). Every form here required the negation to be
+  # ADJACENT to the noun, so the most natural English closure shapes reached no escape and fell
+  # through to the default-deny veto:
+  #   `Outcome: CLEAN — nothing blocking.`                                       -> REFUSED
+  #   `Outcome: CLEAN — none of the findings are blocking.`                      -> REFUSED
+  #   `Outcome: CLEAN — checked for blocking issues; none found.`                -> REFUSED
+  #   `Outcome: CLEAN — I looked for blocking issues in the dispatcher and found none.` -> REFUSED
+  # These are the tortoise#8866 false-refusal class this file has already paid for once (§13n), and
+  # `nothing` was absent from the alternation entirely. The two added forms read a CLAUSE-SCOPED
+  # negator (`[^.;:]`, so it cannot reach into an unrelated sentence) and a `found none` reversal.
+  # ⛔ THEY ARE SAFE TO WIDEN PRECISELY BECAUSE OF THE `live_count` GUARD: escape (a) only fires when
+  # the line carries NO live positive count, so `2 blocking (P1), 2 non-blocking (P3)` and its
+  # spelled twin never reach here — measured, both BLOCKED from escape (a). Widening a negator
+  # WITHOUT that guard is the unpredicated-scope defect §13n13 exists to stop; with it, the only
+  # lines affected are ones that declare no blocker at all.
+  local _OC_ZEROED='(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)|(^|[^[:alnum:]])(no|non|zero|none)[[:space:]]*\(?p[01]\)?|(^|[^0-9])0[[:space:]]*\(?p[01]\)?|(^|[^[:alnum:]])(nothing|none|neither|no)[^.;:]{0,25}block(ing|ers?)|block(ing|ers?)[^.]{0,60}([[:space:]](none|nothing|zero)[[:space:]]*(found|at[[:space:]]+all|remain|remains|open|left)|[[:space:]](found|saw|observed|identified|spotted)[[:space:]]+(none|nothing|zero))'
   decoded="$(tsv_decode "$1")"
   while IFS= read -r line; do
     # Only an `Outcome:` DECLARATION is this arm's question — anchored the way arm (1b) anchors it,
@@ -1263,7 +1315,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # recognised. That gap is PRE-EXISTING (measured escaping at 49d3c9780 too), and it is a
     # fail-open in an evidence gate, so the class is widened to "not alphanumeric": a declaration
     # may be bolded, quoted, bulleted or wrapped and must still be READ.
-    grep -qiE '(^|[^[:alnum:]])outcome:[[:space:]]*[*[:space:]]*' <<<"$line" || continue
+    grep -qiE "$OC_DECL_RE" <<<"$line" || continue
     # ...and it must NAME blocking findings — by the NOUN (`blocking`, `blockers`) or by the HOUSE
     # SEVERITY that means the same thing. A declaration that does neither is not this arm's business
     # at all, so it is SKIPPED — never vetoed (13n10: `Outcome: CLEAN — verified` with the blocking
@@ -1291,7 +1343,20 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # opposed to a negated mention. Reading the severity form here too is what lets escape (a) tell
     # `Outcome: CLEAN — 2 P1 were fixed` (live count: no escape (a)) from `… 0 P1 findings` (zeroed).
     live_count=0
-    grep -qiE '(^|[^0-9])[1-9][0-9]*[[:space:]_-]*(block(ing|ers?)|\(?p[01]\)?)' <<<"$line" && live_count=1
+    # ⛔ THE GUARD MUST READ THE SAME COUNT VOCABULARY AS THE DECLARATIONS IT GUARDS
+    # (agent-infra#3902 review, F1 — MEASURED fail-open). This read DIGITS ONLY (`[1-9][0-9]*`) while
+    # every belt below reads `_OC_CNT`, which also SPELLS `one..ten`. So the sentence escape (a) is
+    # documented as NOT applying to was escapable in words — the #2661 class closed for one spelling
+    # and open for the other:
+    #   `2 blocking (P1), 2 non-blocking (P3)`                          -> VETOED
+    #   `three findings — two blocking (P1), one non-blocking (P2)`      -> ADMITTED
+    #   `two blocking (P1) findings remain; no blocking fix landed`      -> ADMITTED
+    # The old separator class `[[:space:]_-]*` also let a `.` defeat the digit form
+    # (`2. blocking (P1) findings; no blocking fix landed` -> ADMITTED), so punctuation a writer
+    # plausibly puts between a count and its noun is admitted here too.
+    # Widening this can only DISABLE an escape (it sets `live_count=1`, which turns (a) off), so it is
+    # the fail-closed direction: no line that vetoed before is admitted now.
+    grep -qiE "(^|[^[:alnum:]])${_OC_CNT}[[:space:].,:;_-]*(block(ing|ers?)|\(?p[01]\)?)" <<<"$line" && live_count=1
     # (a) ZEROED / NEGATED, and ONLY with no live positive count on the line.
     if [ "$live_count" -eq 0 ] && grep -qiE "$_OC_ZEROED" <<<"$line"; then
       continue
@@ -1795,7 +1860,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   #      an `Outcome: not clean` line, or a `Review — NOT CLEAN` header — so prose that merely
   #      discusses cleanliness (the tortoise#8866 false refusal this change exists to fix) still
   #      passes. Arm 2 is the only arm the `Outcome: clean` field may suppress.
-  if grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*[*[:space:]]*(not|non|no)[[:space:]_-]*clean|(^|[[:space:]>*-])review[[:space:]]*[—–-][[:space:]]*not[[:space:]_-]*clean' <<<"$body"; then
+  if grep -qiE "${OC_DECL_RE}[[:space:]]*[*[:space:]]*(not|non|no)[[:space:]_-]*clean|(^|[[:space:]>*-])review[[:space:]]*[—–-][[:space:]]*not[[:space:]_-]*clean" <<<"$body"; then
     echo "   $kind $id DECLARES a non-clean outcome (an explicit Outcome: not-clean, or a 'Review — NOT CLEAN' header) — it is evidence the review did not conclude clean." >&2
     return 1
   fi
@@ -1809,7 +1874,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
     echo "   $kind $id DECLARES blocking findings in its Outcome field (${OUTCOME_BLOCKING_LINE:0:160}) — the gate clears on ZERO blocking findings (skills/code-review/references/fixer-loop.md), so this artifact is evidence the review did NOT conclude clean." >&2
     return 1
   fi
-  if ! grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*(clean|\*\*clean)' <<<"$body"; then
+  if ! grep -qiE "${OC_DECL_RE}[[:space:]]*(clean|\*\*clean)" <<<"$body"; then
     if grep -qiE 'not[[:space:]_-]*clean' <<<"$body"; then
       echo "   $kind $id asserts an UNRESOLVED outcome (NOT-CLEAN, and states no explicit Outcome:) — it is evidence the review did not conclude clean." >&2
       return 1

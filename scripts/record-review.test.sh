@@ -3104,7 +3104,7 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:8152 at this head — RE-DERIVE it, do not trust the number: a bare
+#      (scripts/record-review.sh:8423 at this head — RE-DERIVE it, do not trust the number: a bare
 #      line citation here has rotted before, and this comment is not what makes
 #      the assertion true). One command answers it (origin/main bd1b205d is :6225):
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
@@ -5149,6 +5149,10 @@ assert_eq "$RECORD_RC" "3" "13n11 the singular 'blocker' spelling is a declared 
 # The first cut's escapes were evaluated LINE-WIDE and UNPREDICATED, so a one-word variant of the very
 # artifact 13n6 refuses still recorded `clean`. All four bodies below were MEASURED admitted against
 # that head — a live blocking declaration cancelled by an unrelated token in its own follow-up clause.
+# ⛔ WHAT THESE ROWS ACTUALLY PIN, corrected at agent-infra#3902 review F5: 13n13/13n14 are VETO rows,
+# so they are satisfied by the FALL-THROUGH veto and cannot red when escape (a) is deleted (measured).
+# 13n18 is the escape's real pin. The rows are still valid behavioural assertions; only their
+# attribution was wrong, and that wrong attribution is how F1 shipped green.
 # The root is a known rule-design error: an exception must be scoped to the match it excepts, never to
 # the line it happens to share (the rule Semgrep's `pattern-not`, OPA's negation builtins and Apache
 # Traffic Server's regex guidance all state).
@@ -5171,6 +5175,15 @@ EV_REF="comment:42502101" run_record_ev 425021 STUB_EVIDENCE_BODY="**Outcome: 2 
 
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "13n14 'plus 3 non-blocking notes' does not cancel 2 declared blockers (rc 3)"
+# ⛔ 13n13 AND 13n14 DO NOT PIN ESCAPE (a), AND SAYING THEY DID WAS FALSE (agent-infra#3902 review,
+# F5 — MEASURED). Both are VETO rows, and a VETO row structurally CANNOT pin an ADMIT-ONLY escape:
+# deleting escape (a) only makes the arm veto MORE, so both stay green with `live_count` gone. They
+# earned their place as "a line naming two blockers is not clean" — the fall-through veto produces
+# that — but the escape's real pin is the OVER-BLOCK control 13n18, and `live_count`'s own pin is
+# 13n76. Kept, and re-labelled, rather than deleted: the behaviour they assert is still required.
+# The consequence of that mis-labelling is not academic: 13n18's body uses no SPELLED count, which is
+# exactly how F1 (escape (a) gated on a digit-only `live_count`) shipped green. 13n65-13n67 close
+# that hole on the VETO side and 13n76 proves the guard load-bearing.
 
 rm -f "$(Q2 425022)"
 EV_REF="comment:42502201" run_record_ev 425022 STUB_EVIDENCE_BODY="**Outcome: 1 blocking (P1), an unclosed session is leaked.**
@@ -5627,6 +5640,143 @@ EV_REF="comment:42507201" run_record_ev 425072 STUB_EVIDENCE_BODY="**Outcome: 2 
 
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "13n64 a declared severity resolution does NOT cover the severity that REMAINS (rc 3)"
+
+# 13n65-13n76 — THE SIX FINDINGS OF THE agent-infra#3902 REVIEW, EACH PINNED BY A ROW THAT REDS
+# WHEN ITS FIX IS REVERTED. Every body below was MEASURED against the shipped arm at 57d19f3fa
+# BEFORE its fix existed, with the reproduction in the finding that named it:
+#   F1 (P1, fail-open) escape (a) was gated on a DIGIT-ONLY `live_count` while every belt reads
+#      `_OC_CNT`, so the sentence the header says (a) does not apply to was escapable IN WORDS.
+#   F2 (P1, fail-open) the declaration recognizer was a literal `outcome:`, so a BOLDED LABEL,
+#      a SPACED colon, or a FULL-WIDTH colon skipped arm (1c) at its own entry gate.
+#   F3 (P1, fail-open) `_OC_REFMASK` was applied to ALL of `_rest` before every remainder belt, so a
+#      NUMBERED remainder lost its count and became invisible.
+#   F4 (P2, over-block) the zeroed/negated forms required the negator ADJACENT to the noun, refusing
+#      honest clean closures (`nothing blocking`, `none of the findings are blocking`).
+# ⛔ THE FOUR CLASSES ARE ONE PATTERN, which is why they are pinned together: each is a guard whose
+# scope was narrower than the thing it guards (F1: the count vocabulary; F2: the spelling; F3: the
+# mask's reach; F4: the negator's adjacency). A row that only asserted the refusal would not prove
+# WHICH guard produced it, so the F1/F2/F3 rows are followed by a MUTATION pin.
+rm -f "$(Q2 425073)"
+EV_REF="comment:42507301" run_record_ev 425073 STUB_EVIDENCE_BODY="**Outcome: three findings — two blocking (P1), one non-blocking (P2).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n65 F1: a SPELLED declaration count feeds the live_count guard, so one 'non-blocking' cannot cancel it (rc 3)"
+
+rm -f "$(Q2 425074)"
+EV_REF="comment:42507401" run_record_ev 425074 STUB_EVIDENCE_BODY="**Outcome: two blocking (P1) findings remain; no blocking fix landed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n66 F1: a spelled live count is not cancellable by a later 'no blocking' clause (rc 3)"
+
+rm -f "$(Q2 425075)"
+EV_REF="comment:42507501" run_record_ev 425075 STUB_EVIDENCE_BODY="**Outcome: 2. blocking (P1) findings; no blocking fix landed.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n67 F1: a '.' between the count and its noun does not defeat the live_count guard (rc 3)"
+
+rm -f "$(Q2 425076)"
+EV_REF="comment:42507601" run_record_ev 425076 STUB_EVIDENCE_BODY="**Outcome**: 2 blocking (P1) findings remain open.
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n68 F2: a declaration that BOLDS ITS LABEL is still read — the entry gate is not a literal 'outcome:' (rc 3)"
+
+rm -f "$(Q2 425077)"
+EV_REF="comment:42507701" run_record_ev 425077 STUB_EVIDENCE_BODY="**Outcome : 3 findings — 2 blocking (P1), 1 documentation (P2).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n69 F2: a space between the label and its colon does not skip the arm (rc 3)"
+
+rm -f "$(Q2 425078)"
+EV_REF="comment:42507801" run_record_ev 425078 STUB_EVIDENCE_BODY="**Outcome：3 findings — 2 blocking (P1), 1 documentation (P2).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n70 F2: a FULL-WIDTH colon (U+FF1A) is a declaration too (rc 3)"
+
+rm -f "$(Q2 425079)"
+EV_REF="comment:42507901" run_record_ev 425079 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; finding 1 remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n71 F3: a NUMBERED remainder keeps its count — the reference mask is scoped to a resolution (rc 3)"
+
+rm -f "$(Q2 425080)"
+EV_REF="comment:42508001" run_record_ev 425080 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; issue 1 remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n72 F3: the same for 'issue N' — the mask cannot swallow a persistence remainder (rc 3)"
+
+# ⛔ THE OVER-BLOCK CONTROLS FOR F4. These are HONEST clean closures and must still record — the
+# declared cost of this gate is a reworded re-run, but a false refusal on the most natural English
+# closure sentence is the tortoise#8866 class this file has already paid for once. All three were
+# MEASURED REFUSED at 57d19f3fa.
+rm -f "$(Q2 425081)"
+EV_REF="comment:42508101" run_record_ev 425081 STUB_EVIDENCE_BODY="**Outcome: CLEAN — nothing blocking.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n73 F4 OVER-BLOCK GUARD: 'nothing blocking' is an honest closure and records (rc 0)"
+
+rm -f "$(Q2 425082)"
+EV_REF="comment:42508201" run_record_ev 425082 STUB_EVIDENCE_BODY="**Outcome: CLEAN — none of the findings are blocking.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n74 F4 OVER-BLOCK GUARD: a negator with SCOPE around the noun records (rc 0)"
+
+rm -f "$(Q2 425083)"
+EV_REF="comment:42508301" run_record_ev 425083 STUB_EVIDENCE_BODY="**Outcome: CLEAN — checked for blocking issues; none found.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n75 F4 OVER-BLOCK GUARD: 'found none' after the noun records (rc 0)"
+
+# 13n76-13n78 — MUTATION PINS for the three P1 fail-opens. A refusal row proves A refusal happened,
+# never that THIS guard produced it, so each fix is reverted in a copy and its own row must flip to
+# ADMITTED. The sed anchors are asserted to still match, so a refactor re-pins instead of silently
+# turning the pin into a no-op.
+N_LIVECNT_MUT="$T/mutant-livecnt-narrowed.sh"
+sed 's#^    grep -qiE "(^|\[^\[:alnum:\]\])${_OC_CNT}\[\[:space:\].,:;_-\]\*(block(ing|ers?)|\\(?p\[01\]\\)?)" <<<"$line" && live_count=1$#    grep -qiE "(^|[^0-9])[1-9][0-9]*[[:space:]_-]*(block(ing|ers?)|\\(?p[01]\\)?)" <<<"$line" \&\& live_count=1#' "$RECORD" > "$N_LIVECNT_MUT"
+if cmp -s "$RECORD" "$N_LIVECNT_MUT"; then
+    bad "13n76 MUTANT: the live_count sed anchor no longer matches — re-anchor the pin rather than dropping it"
+else
+    bash -n "$N_LIVECNT_MUT" && ok "13n76 MUTANT: the digit-only live_count mutant still parses" || bad "13n76 MUTANT: the mutant does not parse"
+    NL_SAVE="$RECORD"
+    RECORD="$N_LIVECNT_MUT"
+    rm -f "$(Q2 425073)"
+    EV_REF="comment:42507301" run_record_ev 425073 STUB_EVIDENCE_BODY="**Outcome: three findings — two blocking (P1), one non-blocking (P2).**
+
+$VACUITY_BLOCK"
+    RECORD="$NL_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n76 MUTATION PIN: with live_count back to digits-only, 13n65's body is ADMITTED (rc 0) — the widening is load-bearing"
+fi
+
+N_DECL_MUT="$T/mutant-decl-literal.sh"
+sed 's#^    grep -qiE "$OC_DECL_RE" <<<"$line" || continue$#    grep -qiE "(^|[^[:alnum:]])outcome:[[:space:]]*[*[:space:]]*" <<<"$line" || continue#' "$RECORD" > "$N_DECL_MUT"
+if cmp -s "$RECORD" "$N_DECL_MUT"; then
+    bad "13n77 MUTANT: the declaration-recognizer sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_DECL_MUT" && ok "13n77 MUTANT: the literal-'outcome:' mutant still parses" || bad "13n77 MUTANT: the mutant does not parse"
+    ND_SAVE="$RECORD"
+    RECORD="$N_DECL_MUT"
+    rm -f "$(Q2 425076)"
+    EV_REF="comment:42507601" run_record_ev 425076 STUB_EVIDENCE_BODY="**Outcome**: 2 blocking (P1) findings remain open.
+
+$VACUITY_BLOCK"
+    RECORD="$ND_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n77 MUTATION PIN: with the recognizer back to a literal, 13n68's body is ADMITTED (rc 0) — the recognizer is load-bearing"
+fi
+
+N_REFMASK_MUT="$T/mutant-refmask-global.sh"
+sed 's@^  local _OC_REFMASK=.*$@  local _OC_REFMASK='"'"'s/(^|[^[:alnum:]])(cycle|iteration|round|pass|phase|commit|step|pr|issue|review|finding)[[:space:]]+#?[0-9]+/\\1 REFCNT /g'"'"'@' "$RECORD" > "$N_REFMASK_MUT"
+if cmp -s "$RECORD" "$N_REFMASK_MUT"; then
+    bad "13n78 MUTANT: the _OC_REFMASK sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_REFMASK_MUT" && ok "13n78 MUTANT: the unscoped-refmask mutant still parses" || bad "13n78 MUTANT: the mutant does not parse"
+    NR_SAVE="$RECORD"
+    RECORD="$N_REFMASK_MUT"
+    rm -f "$(Q2 425079)"
+    EV_REF="comment:42507901" run_record_ev 425079 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; finding 1 remains open.**
+
+$VACUITY_BLOCK"
+    RECORD="$NR_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n78 MUTATION PIN: with the refmask unscoped, 13n71's body is ADMITTED (rc 0) — the scoping is load-bearing"
+fi
 
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
@@ -6694,13 +6844,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4576 :6302 :8676 :8850, plus a comment mention at :4445; `14.1c-CITE` below
+#     CITE-CHECK: :4641 :6367 :8741 :8915, plus a comment mention at :4510; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:4398) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:4619) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4576) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4641) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8676). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8741). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -6726,7 +6876,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8676` / `:8850` — CITE-CHECK: :8676 :8850 — re-derived by the
+#     this head the predicates are `:8741` / `:8915` — CITE-CHECK: :8741 :8915 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -7635,7 +7785,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6302 :8676 :8850 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6367 :8741 :8915 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
