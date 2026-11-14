@@ -1382,10 +1382,10 @@ _BOUND_OPERATOR_RE = re.compile(r"(?<![-=>])(?:[<>≤≥]=?|==)\s*$")
 #: ``<b and p99 >`` starts with a letter, so it was stripped, the operator with it,
 #: and a MOVED bound was masked into one signature — the fail-OPEN direction this
 #: strip exists to prevent. An explicit alternation of the masks actually emitted
-#: (``<ADDR>``, ``<UUID>``, ``<HEX>``, ``<HOSTPORT>``, ``<N>``, ``team_<X>``,
+#: (``<ADDR>``, ``<UUID>``, ``<HEX>``, ``<HOSTPORT>``, ``<TMP>``, ``<N>``, ``team_<X>``,
 #: ``<MEAS<n>:<unit>>``) is closed, so comparison text can never match it.
 _MASKED_TOKEN_RE = re.compile(
-    r"<(?:ADDR|UUID|HEX|HOSTPORT|N|X|MEAS\d+:[A-Za-zµμ]+)>"
+    r"<(?:ADDR|UUID|HEX|HOSTPORT|TMP|N|X|MEAS\d+:[A-Za-zµμ]+)>"
 )
 
 
@@ -1459,6 +1459,136 @@ _VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str
 )
 
 
+def _mask_mkdtemp_tail(m: re.Match[str]) -> str:
+    """Keep the test's own stable prefix; mask only the generated tail.
+
+    ``collision-preflight-iis0g3yc`` -> ``collision-preflight-<TMP>``. Replacing
+    the WHOLE component (the first draft) destroyed the prefix and collapsed
+    ``expected-…`` with ``rejected-…`` — the fail-OPEN direction, measured in
+    review round 2.
+    """
+    return f"{m.group('prefix')}-<TMP>"
+
+
+#: The TEMP-ROOT ANCHOR. ``(?<=/tmp/)`` is a five-character SUFFIX lookbehind, so
+#: it covers ``/var/tmp/`` and ``/private/tmp/`` without an arm of their own — and
+#: equally a repo-relative ``tmp/`` segment (this repo's ``.gitignore`` carries
+#: ``tmp/`` for transient e2e markers, which is the same intent: those names are
+#: transient). ``(?<=<TMP>/)`` is the COMPOSABILITY arm: a parent this group already
+#: masked. It is what makes a NESTED layout reachable — without it
+#: ``/tmp/<TMP>/collision-preflight-…`` keeps its random second component raw — and
+#: why the pass below runs to a fixed point.
+_TEMP_ROOT = r"(?:(?<=/tmp/)|(?<=<TMP>/))"
+
+#: THE PER-RUN TEMP IDENTIFIERS (#1424) — the same class as the hex run ids in
+#: the list above: a token the RUN generated, so main can never have measured
+#: THIS token, and leaving it raw makes the SUBSET rule unsatisfiable for an id
+#: main itself measures red. Measured shapes:
+#:
+#:   /tmp/tmpnnjrgwic/redis.socket                  ``tempfile`` / ``tmp_path``
+#:   /tmp/tt_s9k6lwdc/collision-preflight-iis0g3yc  pytest basetemp + mkdtemp
+#:
+#: ⛔ EVERY RULE HERE IS ANCHORED TO A TEMP PATH — with ONE deliberate exception,
+#: the ``pytest-of-<user>/pytest-<N>`` pair below, which is anchored to its own
+#: two-component GENERATOR shape because that path can live outside a temp root
+#: (a per-user basetemp) and both of its components are per-run. The anchor is
+#: load-bearing
+#: rather than tidy. A shape-only rule masks STABLE identifiers that happen to
+#: look random, which is the fail-OPEN direction: measured on this repo's own
+#: tree, a rule that is BOTH unanchored and fingerprint-free masks 271 of 430
+#: tracked directories (``docs/epics/917-lean-workflow``,
+#: ``extensions/loop-enforcer``) and 119 of 402 branch slugs
+#: (``fix/issue-3429-gh-credential``), so a PR's NEW failure in one would be
+#: exempted by main's red in another. Unanchored ALONE masks 0 tracked
+#: DIRECTORIES today (the digit/uppercase fingerprint is what excludes
+#: ``commit-workflow``-style names) while still masking 87 of 398 origin-tracking
+#: branch slugs; unanchored AND fingerprint-free masks 184 of 398 — the round-6
+#: figure of 119 was not reproducible and is withdrawn (review round 7). Quote a
+#: slug number with its population: the ref set drifts.
+#:
+#: ⛔ AND A TAIL MUST LOOK GENERATED, not merely long: a generator's draw carries a
+#: DIGIT or an UPPERCASE letter, while a test's own label is a lowercase word —
+#: ``expected-workflow`` / ``run-integration`` / ``build-cache`` stay raw, and that
+#: is what stops two different labels collapsing into one signature. Two generators
+#: are covered because the fleet runs both: Python's ``tempfile`` (width 8,
+#: ``[a-z0-9_]``) and Node's ``fs.mkdtempSync`` (width 6, mixed case).
+#:
+#: The fingerprint costs a declared fail-CLOSED residual: a DIGIT-FREE lowercase
+#: ``tempfile`` draw — measured at **7.97%** of 8-character draws over 200 000 real
+#: draws (``(27/37)**8 = 8.04%``; the all-LETTER subset is ~5.87%) — stays raw, and
+#: an all-lowercase Node draw is ~18% at width 6. Both merely block; neither can
+#: exempt a failure main never had.
+#:
+#: DECLARED COSTS, each measured rather than assumed:
+#:
+#:  * the ``tmp`` rule has NO fingerprint at all — a tempfile draw is exactly 8
+#:    characters from ``[a-z0-9_]``, so ``/tmp/tmparchives`` is a legal draw and is
+#:    masked while ``/tmp/tmpbackups`` (7) is not. Shape-correct, and stated here
+#:    because the class is wider than "digit-bearing".
+#:  * a stable component of 6–8 DIGIT-BEARING characters directly under a temp
+#:    root is indistinguishable from a draw and IS masked (``/tmp/wt-regsync2`` ->
+#:    ``/tmp/wt-<TMP>``). That is the fail-OPEN DIRECTION, so it is recorded as
+#:    such, defended only by the measurement that no pair of different failures at
+#:    one id was found differing ONLY there.
+#:  * FAIL-CLOSED: macOS ``$TMPDIR`` layouts (``/var/folders/…/T/…``) and an
+#:    underscore-containing ``mkdtemp`` prefix stay raw, so such an id keeps
+#:    blocking — except where the draw is GLUED to a letter prefix and happens to
+#:    be all-hex (``tt_abcdef12``, ``pre-a1b2c3d4.last``), which the pre-existing
+#:    ``<HEX>`` rule turns into ``<HEX>``, so that id's fate is run-dependent. A
+#:    ``tmp``-glued ``/var/folders`` draw cannot flip (the ``<HEX>`` rule's own
+#:    left guard blocks it). Also undeclared by that rule's list: an ``mkstemp``
+#:    ``suffix`` outside ``{tmp,last,lock,pid}`` (``.log``, ``.json``) stays raw and
+#:    keeps blocking.
+#:
+#: ⛔ AND THE WIDTH IS ``{8}``, NOT ``{8,}``: ``_RandomNameSequence`` emits EXACTLY
+#: 8 characters, so a longer run is not a draw at all (it is a stable name that
+#: begins with digits/letters), and masking it collapsed ``/tmp/tmpcache2024``
+#: with ``/tmp/tmpdata2024`` — the fail-OPEN direction (review round 3).
+_TEMP_NORMALIZERS: tuple[
+    tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...
+] = (
+    # pytest's DEFAULT basetemp (no ``--basetemp``): ``pytest-of-<user>/pytest-<N>``.
+    # ``<user>`` differs between a hosted runner and a cell, and ``N`` increments per
+    # SESSION, so both components are volatile and both must go — this repo sets no
+    # ``--basetemp`` anywhere in ``.github/workflows/``, so this is ITS ``tmp_path``
+    # shape (review round 4).
+    (re.compile(r"(?<=/)pytest-of-[^/\s]+/pytest-\d+"), "<TMP>"),
+    # ``tempfile`` / ``tmp_path``: the prefix is exactly ``tmp`` followed by
+    # ``_RandomNameSequence``'s 8-character draw off ``[a-z0-9_]``. The EXACT width
+    # keeps ``tmpfiles`` / ``tmp_utils`` / ``tmpcache2024`` — prose, a stable
+    # directory, a cache bucket — out; ``tmpnnjrgwic`` and ``tmpyhd2_vfw`` (an
+    # underscore draw, ~14% of real runs) are both masked.
+    (re.compile(_TEMP_ROOT + r"tmp[A-Za-z0-9_]{8}(?![0-9A-Za-z_])"), "<TMP>"),
+    # pytest's basetemp ``tt_<draw>``, with the digit requirement described above:
+    # ``tt_valid_key`` is ALSO the consumer repo's semantic API-key fixture family,
+    # and conflating "valid key rejected" with "rate-limited" under one id is the
+    # fail-OPEN outcome this gate exists to refuse.
+    (
+        re.compile(
+            _TEMP_ROOT
+            + r"tt_(?=[A-Za-z0-9_]*\d)[A-Za-z0-9_]{8}(?![0-9A-Za-z_])"
+        ),
+        "<TMP>",
+    ),
+    # ``mkdtemp(prefix=…)``: the PREFIX is the test's own stable label and only the
+    # generated TAIL is masked, so ``collision-preflight-…`` and ``pi-census-…``
+    # stay distinguishable while two draws of the same prefix converge. The tail is
+    # EXACTLY 8 characters (the generator's width — a longer tail is not a draw, and
+    # ``{8,}`` let the prefix boundary slide, collapsing ``pi-cache…`` with
+    # ``pi-census…``), must carry a digit (see above), and the delimiter lookahead
+    # keeps a FILENAME's stem out (``build-zx81kq2p.yaml`` is a file, not a dir).
+    (
+        re.compile(
+            _TEMP_ROOT
+            + r"(?P<prefix>[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*)"
+            r"-(?=[A-Za-z0-9_]*[\dA-Z])[A-Za-z0-9_]{6,8}"
+            r"(?=[/\s\"'`,;:)\]]|\.(?:tmp|last|lock|pid)(?![A-Za-z0-9])|$)"
+        ),
+        _mask_mkdtemp_tail,
+    ),
+)
+
+
 @dataclass
 class SignatureParse:
     """Signature extraction for one raw ``gh run view --log-failed`` capture.
@@ -1500,13 +1630,30 @@ def normalize_signature(text: str | None) -> str:
     """Reduce raw failure text to the STABLE part, or ``''`` if nothing survives.
 
     Whitespace is collapsed first (the same assertion is rendered at different
-    prefix widths between runs), then the closed volatile-identifier list above
-    is masked. A result of ``''`` is a REJECTION — callers must never store it as
+    prefix widths between runs), then the closed volatile-identifier lists above
+    are masked. A result of ``''`` is a REJECTION — callers must never store it as
     a signature, because an empty signature makes the subset rule vacuous.
     """
     if not text:
         return ""
     out = " ".join(str(text).split())
+    # The TEMP group runs to a FIXED POINT (bounded): masking a parent is what
+    # makes a NESTED child's ``(?<=<TMP>/)`` anchor true, and ``re.sub`` never
+    # re-scans a replacement, so one pass per nesting level is required —
+    # ``/tmp/tt_a1b2c3d4/tmpXy12Zz9q/…`` is two levels. Masks cannot feed
+    # themselves (no mask token matches a rule's shape), so this terminates; the
+    # bound is a guard for pathological depth, and a layout deeper than it stays
+    # RAW — fail-CLOSED, the direction an honest gate errs.
+    for _ in range(4):
+        before = out
+        for pattern, replacement in _TEMP_NORMALIZERS:
+            out = pattern.sub(replacement, out)
+        if out == before:
+            break
+    # …and only THEN the ids and measurements, so an all-hex random draw is
+    # masked as a temp component (<TMP>) rather than as <HEX>: the two shapes
+    # would otherwise disagree between runs and the SUBSET rule would refuse a
+    # genuinely shared red (review round 2).
     for pattern, replacement in _VOLATILE_NORMALIZERS:
         out = pattern.sub(replacement, out)
     return out.strip()

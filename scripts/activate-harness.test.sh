@@ -219,6 +219,24 @@ arm_mac() {
     done
 }
 
+# write_repair_record <decision> <reason> [epoch] [state-dir] — the PR repair loop's OWN pass record.
+# ⛔ THE ROW IS GRADED ON THIS FILE (agent-infra#4010), so a fixture box only counts as ARMED when it
+# carries one — exactly like the conflict-rebase beacon a few lines below. Its SHAPE is the loop's
+# (`pr-repair-loop.sh::write_status`): `decision` + `reason` + `epoch` + `cap`, at
+# `$O/state/pr-repair.status.json`. A helper that copied a different shape would test a file no
+# producer writes.
+write_repair_record() { # <decision> <reason> [epoch] [state-dir]
+    local dir="${4:-$FHOME/orchestrator/state}"
+    mkdir -p "$dir"
+    python3 - "$dir/pr-repair.status.json" "$1" "$2" "${3:-$(date +%s)}" <<'PY'
+import json, sys
+dst, decision, reason, epoch = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+json.dump({"cap": 3, "decision": decision, "epoch": epoch, "reason": reason,
+           "repo": "daniel-ospina/tortoise", "repo_dir": "/nonexistent/checkout",
+           "ts": "2026-01-01T00:00:00Z"}, open(dst, "w"), indent=2, sort_keys=True)
+PY
+}
+
 arm_all() { # [stamp] — the stamp must be rendered in the ZONE the box prints (T11)
     local base stamp="${1:-$NOW}"
     for base in "$FROOT"/templates/systemd/*.timer; do
@@ -231,7 +249,18 @@ arm_all() { # [stamp] — the stamp must be rendered in the ZONE the box prints 
     # Both enabled is a real finding (the pair is a race), so the fully-armed fixture must not have it.
     unit system "cell-self-pin.timer" "LoadState=loaded" "UnitFileState=disabled" "ActiveState=inactive" ""
     unit system "eldato-orchestrator.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
-    unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
+    # AND ITS ENVIRONMENT IS RENDERED, BECAUSE A REAL ONE IS: `install-repair-service.sh` always emits
+    # `Environment=O=... REPAIR_INTERVAL_S=...`. A fixture that omitted them made this row print its
+    # assumed-cadence disclosure on EVERY green grid, which reddened T31d (the sibling conflict-rebase
+    # row's "no note when the period WAS read" absence pin) from a DIFFERENT capability. Cross-row
+    # pollution is a fixture defect, not a finding.
+    unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" \
+        "Result=success" "Environment=O=$FHOME/orchestrator REPAIR_INTERVAL_S=900"
+    # ⛔ AND ITS OWN PASS RECORD, because that row is graded on it and not on `ActiveState` (#4010).
+    # Without this line the row correctly reads LATE ("active but has NEVER written a pass record") and
+    # a fully-armed cell fixture cannot reach a green grid — the same reason the conflict-rebase beacon
+    # below exists.
+    write_repair_record dispatched pass-complete
     # ⛔ AND THE REPAIR POOL'S SUPPLY HALF (#2700), which has NO `.timer` — the derivation loop cannot see
     # it, so a fully-armed CELL fixture that omits it would red T1 on a row that is correctly required.
     unit system "eldato-worker-supply.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
@@ -845,6 +874,111 @@ OUT="$(env $ISOLATE CONFLICT_REBASE_STATE="$FX/iso-state" PATH="$FX/no-date:$PAT
 assert_eq "$RC" 0 "T33 --status still exits 0 when NO date mechanism works (a format is not the datum)"
 assert_contains "$OUT" "-> $ISO_EPOCH" "T33 with no mechanism at all it degrades to the RAW EPOCH — never to '?' and never to silence"
 assert_absent   "$OUT" '-> ?' "T33 and the degraded form is the datum, not the question mark"
+
+# ── T34: the REVIEW STAGE is graded on its own last pass, not on ActiveState (#4010) ─────────
+# ⛔ THE DEFECT THIS PINS, MEASURED on a cloud cell 2026-11-12: `eldato-pr-repair.service` read
+# `active (running)` for three days while EVERY pass wrote `decision: refusing` with
+# `reason: env-file-unreadable:/tmp/cell-home/keys.env`, and this grid printed `OK … active` over it.
+# That is a false PASS on the one row that decides whether the pipeline has a reviewer at all — the
+# epic whose child this is advertises "deployed AND activated" on exactly this signal.
+# ⛔ WHY `ActiveState` CANNOT SEE IT: `pr-repair-loop.sh --loop` CONTINUES on a refusal (it does not
+# exit), so a configuration fault never converges to `failed` and the restart policy never speaks.
+# ⛔ NON-VACUITY: restoring `probe_systemd_service "eldato-pr-repair.service" "must" "-" 0` at the call
+# site takes every non-green case below back to rc 0 with the row reading OK, so these cases are the
+# row's only pin (measured: the refusing case is the one that discriminates).
+arm_all
+PLATFORM_SEAM="" SKIP_SEAM=""; EXTRA_ENV=()
+RUN --check
+assert_eq "$RC" 0 "T34 a cell whose repair loop is DISPATCHING is green"
+assert_contains "$OUT" 'last pass dispatched' "T34 and the row names the PASS, not just ActiveState"
+
+# (a) the measured shape: enabled + active + permanently refusing.
+write_repair_record refusing 'env-file-unreadable:/tmp/cell-home/keys.env'
+RUN --check
+assert_eq "$RC" 1 "T34 a unit that is ACTIVE while every pass REFUSES fails the run"
+# ⛔ READ THE STATE BY FIELD, RUNNING THE MACHINE CONTRACT (`--tsv`). The pretty table pads by NAME
+# LENGTH, so a literal carrying the wrong number of spaces cannot match any row the program can print —
+# the trap this suite's own `row_field` header records (two assertions once could not fail under ANY
+# mutation). `--tsv` is the contract: tab-separated, plus one SUMMARY line.
+RUN --check --tsv
+assert_eq "$(row_field "$OUT" eldato-pr-repair.service 3)" FAILING "T34 graded FAILING — not OK-on-ActiveState"
+RUN --check
+assert_contains "$OUT" 'env-file-unreadable:/tmp/cell-home/keys.env' "T34 and it names the loop's OWN reason"
+assert_contains "$OUT" 'install-repair-service.sh --install' "T34 with a remedy an operator can paste"
+assert_contains "$OUT" 'pass record this row read is' "T34 the remedy names the artifact the row ACTUALLY read"
+# ⛔ AND IT MUST NOT PROMISE A DIAGNOSTIC THAT DOES NOT EXIST (review round 1, P2).
+# `install-repair-service.sh::readback()` reads `is-active`/`is-enabled`/`KillMode`/`ExecStart` and
+# never the installed unit's `Environment=`, so on the very box this row exists for (a pre-#3453
+# render with HOME/ENV_FILE/O/PR_DOCTOR_REPO_DIR pointing at `/tmp/cell-home`) ALL FOUR it checks
+# agree and `--status` names no disagreement. The old sentence promised the opposite, and an operator
+# who follows a promise that cannot be kept concludes a correct `FAILING` row is spurious — the same
+# false reassurance this PR removes from the grid, relocated into its own remedy. ABSENCE is the pin.
+assert_absent "$OUT" 'names the rendered directives it disagrees with' "T34 the remedy makes no claim --status cannot keep"
+assert_contains "$OUT" 'NOT ARMED: eldato-pr-repair.service' "T34 and the summary names the row"
+
+# (b) enabled + active + NEVER PASSED: running proves the loop was started, not that a pass ran.
+rm -f "$FHOME/orchestrator/state/pr-repair.status.json"
+RUN --check
+assert_eq "$RC" 1 "T34 an active loop that has never written a pass record fails the run"
+assert_contains "$OUT" 'NEVER written a pass record' "T34 and it says which fact is missing"
+
+# (c) the freshness axis: a green record that stopped moving is LATE, and the bound is the
+# EFFECTIVE cadence (review round 2, F1): 2 x cadence + 2 x the pass's own runtime budget
+# (`REPAIR_DOCTOR_TIMEOUT_S`, default 1800). A row that only read the DECISION would call a dead
+# loop green for ever; a row that read only `3 x REPAIR_INTERVAL_S` redsin a HEALTHY one, because
+# the producer's worst legitimate gap is cadence + pass runtime (900 + 1800 = 2700 = the old bound).
+write_repair_record dispatched pass-complete "$(( $(date +%s) - 100000 ))"
+RUN --check
+assert_eq "$RC" 1 "T34 a STALE dispatched record fails the run"
+assert_contains "$OUT" 'bound 5400s' "T34 the bound is 2 x 900 + 2 x 1800 (the shipped runtime budget), not 3 x 900"
+
+# (d) the state dir is the UNIT's, never this launcher's default. A box rendered with O= elsewhere
+# writes its record there; reading $O_RES instead would red a HEALTHY box for ever (the two-paths
+# defect the conflict-rebase row already carries a fix for). The unit's OWN cadence must also be
+# what the bound is built from, so a value far from the 900 default is used here — a shared default
+# would make this case unable to discriminate.
+rm -f "$FHOME/orchestrator/state/pr-repair.status.json"
+unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" \
+    "Result=success" "Environment=O=$FX/alt-o REPAIR_INTERVAL_S=3000"
+write_repair_record dispatched pass-complete "" "$FX/alt-o/state"
+RUN --check
+assert_eq "$RC" 0 "T34 a record in the unit's OWN O= directory is read from there"
+assert_contains "$OUT" 'bound 9600s' "T34 and the bound uses the unit's REPAIR_INTERVAL_S=3000 (2 x 3000 + 2 x 1800)"
+
+# (e) TRIGGER MODE makes REPAIR_INTERVAL_S INERT (review round 2, F1 #2). The unit renders
+# `--trigger`, whose front end schedules on REPAIR_TRIGGER_BACKSTOP_S; a bound built from the
+# interval reds a healthy trigger-mode box for part of every window. The discriminator is that
+# 2400 (backstop) and 900 (interval) give different bounds, so only the backstop can produce 8400.
+unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" \
+    "Result=success" "ExecStart={ path=/x/pr-repair-loop.sh ; argv[]=/x/pr-repair-loop.sh --trigger ; }" \
+    "Environment=O=$FX/alt-o REPAIR_INTERVAL_S=900 REPAIR_TRIGGER_BACKSTOP_S=2400"
+write_repair_record dispatched pass-complete "" "$FX/alt-o/state"
+RUN --check
+assert_eq "$RC" 0 "T34 a trigger-mode unit is graded on its backstop, not on the inert interval"
+assert_contains "$OUT" 'bound 8400s' "T34 the bound is 2 x REPAIR_TRIGGER_BACKSTOP_S=2400 + 2 x 1800 (not the 900 interval)"
+assert_contains "$OUT" 'REPAIR_TRIGGER_BACKSTOP_S=2400' "T34 and the row says WHICH cadence it read"
+
+# (f) a unit that declares NO Environment= at all: BOTH fallbacks must be DISCLOSED — the record path
+# falls back to this launcher's $O_RES and the cadence to 900 s. An assumed bound printed identically
+# to a measured one is the defect the sibling row's T31/T31d pair exists to prevent one capability
+# over, so the same discipline is applied here rather than taken on trust.
+unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
+write_repair_record dispatched pass-complete
+RUN --check
+assert_eq "$RC" 0 "T34 a unit that declares no Environment= is still gradeable"
+# ⛔ THE ASSERTION MUST CARRY A SUFFIX ONLY THIS ROW CAN PRODUCE (review round 3, P2). A bare
+# `cadence UNREADABLE` is satisfied by the CONFLICT-REBASE row on every `arm_all` grid (`unit()`
+# truncates the unit file, so `FragmentPath` is gone and that row correctly discloses `assumed 1800 s`),
+# which made this assertion unable to fail even with the repair row's disclosure deleted — the exact
+# defect class this suite's own `row_field` header names, committed inside a test written to prevent
+# it. The two rows differ in the suffix: this probe prints `assumed 900s` (no space, the value it
+# applied) and the sibling prints `assumed 1800 s`. Pin the repair row's own spelling.
+assert_contains "$OUT" 'cadence UNREADABLE from the unit — assumed 900s' "T34 an assumed cadence is DISCLOSED on THIS row, not inherited from the sibling"
+assert_contains "$OUT" 'declares no O=' "T34 and so is the fallback state directory"
+
+arm_all
+RUN --check
+assert_eq "$RC" 0 "T34 and the fixture is restored healthy for anything after this case"
 
 echo "activate-harness.test.sh — passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
