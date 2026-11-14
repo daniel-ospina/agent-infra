@@ -6092,6 +6092,35 @@ EV_REF="comment:42611501" run_record_ev 426115 STUB_EVIDENCE_BODY="**Outcome: CL
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13n106 a PASSIVE hand-off with NO count is not a declared remainder (rc 0)"
 
+# 13n107-13n108 — THE HAND-OFF WAS STILL VERB-ADJACENT, WHICH IS A ONE-NOUN DEFEAT (P1 fail-open,
+# found by attacking this round's OWN fix rather than by the reviewer). Giving the predicate the
+# passive voice closed `1 was handed off`, but the count and the hand-off verb may have a SUBJECT
+# NOUN between them — and then the predicate reached neither branch. MEASURED on the just-fixed arm:
+# both ADMITTED, while `1 needs a follow-up` / `1 was handed off` were refused. `_OC_STILL` already
+# carries a token run for exactly this reason; the hand-off predicate now uses the same shape, so a
+# remainder cannot escape by naming what it is instead of saying "it".
+rm -f "$(Q2 426116)"
+EV_REF="comment:42611601" run_record_ev 426116 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 finding needs a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n107 a NOUN between the count and the hand-off verb does not defeat it — '1 finding needs a follow-up' (rc 3)"
+[ ! -f "$(Q2 426116)" ] && ok "13n107 no record minted over a hand-off that named its subject" || bad "13n107 minted a record over '1 finding needs a follow-up'"
+
+rm -f "$(Q2 426117)"
+EV_REF="comment:42611701" run_record_ev 426117 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 finding was handed off to #1234.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n108 …and the same for the PASSIVE form with a subject noun — '1 finding was handed off to #1234' (rc 3)"
+
+# 13n109 — THE OVER-BLOCK CONTROL for the token run 13n107/13n108 added. The run is what makes a
+# noun survivable, so the guard is that it does NOT fire without a count: the identical sentence with
+# `the docs` instead of `1 finding` is docs work, not a declared blocking remainder.
+rm -f "$(Q2 426118)"
+EV_REF="comment:42611801" run_record_ev 426118 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed; the docs need a follow-up.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n109 the token run does not fire without a count (rc 0)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
