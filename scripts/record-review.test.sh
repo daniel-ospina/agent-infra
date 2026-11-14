@@ -5458,6 +5458,71 @@ EV_REF="comment:42505401" run_record_ev 425054 STUB_EVIDENCE_BODY="**Outcome: CL
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13n46 a NEGATED second mention ('No blocking findings remain open') is not a live blocker — recorded (rc 0)"
 
+# 13n47-13n52 — THE REGRESSION PINS FOR THE #3902 REVIEW'S F1/F3/F5, AND THEIR OVER-BLOCK
+# CONTROLS. Each veto row is a FAIL-OPEN the fresh-context review MEASURED on the shipped function
+# at 49d3c9780 (a `clean` record minted over a live blocker); each control beside it is the honest
+# clean line the FIRST cut of the fix would then have refused. They are paired on purpose: a fix
+# that closes the hole by refusing everything PASSES the veto half and reddens the control, which
+# is the direction that costs a reworded re-run rather than a merged false PASS.
+#
+# 13n47 — F1, THE SEVERITY-TAGGED REMAINDER. `P0..P3` is this repo's own vocabulary for a blocking
+# finding, and the arm's token class could not span `P1` (the `1` is not alpha), so the remainder an
+# agent would ACTUALLY write reached no arm. This is the highest-value row in the group.
+rm -f "$(Q2 425055)"
+EV_REF="comment:42505501" run_record_ev 425055 STUB_EVIDENCE_BODY="**Outcome: 3 blocking findings were fixed; 1 P0 (security) remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n47 a SEVERITY-TAGGED remainder ('1 P0 (security) remains open') is a live blocker — refused (rc 3)"
+[ ! -f "$(Q2 425055)" ] && ok "13n47 no clean record minted over a P0-tagged remainder" || bad "13n47 minted a clean record over a live P0 remainder — the #2661 false PASS, via the house vocabulary"
+
+rm -f "$(Q2 425056)"
+EV_REF="comment:42505601" run_record_ev 425056 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) findings were fixed; 1 P1 remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n48 a bare-severity remainder ('1 P1 remains open') is a live blocker — refused (rc 3)"
+
+# 13n49 — THE OVER-BLOCK CONTROL for 13n47/13n48: the SAME severity token, as the SUBJECT of an
+# affirmative total resolution, is clean evidence and must keep recording. Without this pair the
+# severity fix could only be checked in the veto direction.
+rm -f "$(Q2 425057)"
+EV_REF="comment:42505701" run_record_ev 425057 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 P1 blockers were fixed and re-verified.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n49 a severity tag BETWEEN count and noun ('2 P1 blockers were fixed') still records (rc 0)"
+
+# 13n50 — F3, THE COLLECTIVE REMAINDER. The header CLAIMED these were counted; they were not, because
+# they lived only in the `;`-SCOPED belt and so were unreachable after the declaration's own clause
+# boundary. Placed clause-scoped first and MEASURED still escaping — this row is what pins it wide.
+rm -f "$(Q2 425058)"
+EV_REF="comment:42505801" run_record_ev 425058 STUB_EVIDENCE_BODY="**Outcome: 2 blocking findings were fixed; the rest remains open.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n50 a COLLECTIVE remainder after the ';' ('the rest remains open') is a live blocker — refused (rc 3)"
+
+# 13n51 — THE OVER-BLOCK CONTROL for 13n50: a collective that is NOT the subject of a persistence
+# verb is ordinary prose and must not refuse the line (a line-wide bare-word scan would).
+rm -f "$(Q2 425059)"
+EV_REF="comment:42505901" run_record_ev 425059 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking findings were fixed and re-verified; some tests were added.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n51 a collective that governs no persistence ('some tests were added') still records (rc 0)"
+
+# 13n52 — F5, THE QUOTED DECLARATION. Self-referential, which is how it was found: a clean review
+# that QUOTES the measured artifact was itself refused, so this change could not have been reviewed
+# by a reviewer who cited its evidence. Inline code spans are stripped for the GATE tests only.
+# ⛔ THE BACKTICK IS BUILT, NOT WRITTEN — `20h48b` forbids a live backtick on a non-comment line,
+# and it CAUGHT the first draft of this row. `printf '\140'` is the same no-live-backtick trick the
+# N9859 fixture above uses.
+N52_BT="$(printf '\140')"
+N52_BODY="Verified the arm on the measured artifact: ${N52_BT}**Outcome: 3 findings — 2 blocking (P1), 1 documentation (P2).**${N52_BT} is now refused.
+
+**Outcome: CLEAN — the quote above is a citation, not this review's declaration.**
+
+$VACUITY_BLOCK"
+rm -f "$(Q2 425060)"
+EV_REF="comment:42506001" run_record_ev 425060 STUB_EVIDENCE_BODY="$N52_BODY"
+assert_eq "$RECORD_RC" "0" "13n52 a QUOTED blocking declaration inside a clean review is a CITATION, not a declaration (rc 0)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
