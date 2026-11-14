@@ -65,9 +65,11 @@ One lane was killed mid-`git push` holding 12 commits and four review rounds.
 
 ## Residuals, stated
 
-1. `CLAIM_ISSUE_TTL` (48000) covers the default-gate merge sum (46290) with 810 s spare, but a box with
-   `GATE_POLL_SECS=60` has a merge term of 6000 and a sum of **49290 — 1290 s over**. Pre-existing (it was
-   20490 vs 18000 before), now stated correctly in `claims.sh` instead of mis-summed.
+1. `CLAIM_ISSUE_TTL` (48000) covers the default-gate merge sum (46290) with **1710 s** spare, and a box
+   with `GATE_POLL_SECS=60` (`_gw` = 1800) has a merge **term** of 3900 and a sum of 47190 — still 810 s
+   **under**. ⛔ 3900 is the merge TERM, not `_gw`; reading it as `_gw` produces 49290 and a residual no
+   shipped configuration reaches. The default stops covering the sum at `_gw` > 2610 s
+   (`GATE_POLL_SECS` > 87 at 30 tries). Before #4034 the same box was **over**: 18390 vs 18000.
 2. `claim-reaper.sh`'s `CR_MIN_AGE` (10800) is a belt, not the longest lease, and did not follow the
    leases up; release still requires holder-absence evidence and branch keys abstain. Prose corrected.
 3. The lane-bound timing arm in the flake note above.
@@ -163,7 +165,8 @@ coverage gap the review named.
    detection side (option b): `--status` now prints the installed `Environment=LANE_TIMEOUT` beside the
    value the checkout would render and exits **3** on a mismatch. The per-cell re-install remains an
    operator step — no cell was touched from this lane, and no `keys.env` was read or written.
-2. `CLAIM_ISSUE_TTL` vs a `GATE_POLL_SECS=60` box (49290 vs 48000) — unchanged, pre-existing, stated.
+2. A `GATE_POLL_SECS=60` box is 810 s UNDER (47190 vs 48000), not over; the residual only opens above
+   `_gw` = 2610 s. See residual 1 — the earlier "49290 over" reading was a mis-sum.
 3. `claim-reaper.sh`'s `CR_MIN_AGE` (10800) is a belt, not the longest lease — unchanged.
 4. The `lane-bound.test.sh` `(i1)` timing arm flakes under concurrent load (see the first report section);
    neither new arm is a timing assertion.
