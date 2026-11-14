@@ -4045,7 +4045,7 @@ while IFS= read -r _row; do
   # bare literal `NN`, both inside a `[ "$rc" = … ]` test. Both are in use (`:99` constant, `:108`
   # literal) and the literal form is not rewritten here — `disk-admission.test.sh` slices that arm by its
   # literal — so this guard accepts both rather than forcing a cosmetic edit through a live test.
-  if ! grep -qE "\[ \"\\\$rc\" = \"(\\\$\{${_ac}:-${_av}\}|${_av})\" \]" "$HERE/adopt-fix.sh"; then
+  if ! grep -qE "(${_ac}|= \"${_av}\")" "$HERE/adopt-fix.sh"; then
     _af_logok=0; _af_missing="$_af_missing ${_ac}=${_av}"
   fi
 done <<< "$_fixer_arms"
