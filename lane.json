@@ -1,0 +1,23 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-agent-infra-4076-1794656900-p3127978-54cb0918",
+  "_sha": "3d224a009220192097eb42cfc983511679df7a0f",
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794660880,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-agent-infra-4076-1794656900-p3127978-54cb0918",
+  "lease_until": 1794668680,
+  "pid": 3127978,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794656900,
+  "state": "RUNNING",
+  "tag": "prd-daniel-ospina-agent-infra-4076",
+  "worktree": "/home/cmux/agent-infra/.worktrees/prd-4076"
+}
