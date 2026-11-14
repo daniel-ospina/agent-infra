@@ -270,8 +270,8 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   precedes the backlog ones. ⛔ "DOES NOT DECIDE" IS NOT "IS NOT READ": `queue_state_class` is invoked
   unconditionally just above the arm chain, so its file read is paid on EVERY pass, `backlog=10`
   included — it simply cannot change the token there. ⛔ AND THE CLOCK IS NOT PAID ON EVERY PASS: the
-  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (`:3384` precedes
-  `:3385`), so the cost is one fork (the command substitution) on a record with no parseable stamp and
+  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (`:3389` precedes
+  `:3390`), so the cost is one fork (the command substitution) on a record with no parseable stamp and
   TWO when the stamp is usable. Fork headroom is a dispatch gate here (#2293), so the count is stated
   rather than rounded up. Whether the pool was
   read at all is one fact among several, not a verdict that overrides them. ⛔ That "future" test is a **digit

@@ -3305,7 +3305,7 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # ⛔ AND THE ZERO-BACKLOG CAUSE NEEDS ONE MORE STEP THAN "IS IT EMPTY" (agent-infra#3909 review, 5th
 # cycle P2). `READ(n)` is a SUCCESSFUL read and `PARTIAL(x)` a NAMED partial read: both are MEASUREMENTS,
 # so a zero backlog beside one must not be called blind. That pair is ROUTINE because the CONTROLLER
-# prunes dispatched ids out of `candidates.txt` (`orch-loop.sh:8159-8168`), while the refresh only ever
+# prunes dispatched ids out of `candidates.txt` (`orch-loop.sh:8164-8173`), while the refresh only ever
 # APPENDS, DEDUPES or RE-ORDERS the queue and never drops a row
 # (`refresh-candidates.sh:5776`, `:6247`, `:4531`; the file states it: "ORDER, NEVER MEMBERSHIP … never
 # adds or drops a row", `:4371`). (⛔ An earlier revision credited the REAP to the refresh — it is not
