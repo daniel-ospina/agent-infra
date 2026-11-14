@@ -11693,13 +11693,13 @@ I compared HEAD...anc as well; the symmetric difference between the two is not e
 #       Both endings are legitimate for the DIFFERENT ranges a symmetric difference states — what is NOT
 #       legitimate, and what round 8 shipped, is telling the author their three-dot claim names ZERO
 #       commits. So the row pins the property and reports which legitimate arm answered.
-if printf '%s' "$RECORD_ERR" | command grep -qF 'states an EMPTY range'; then
+if command grep -qF 'states an EMPTY range' <<<"$RECORD_ERR"; then
   bad "20h105 FALSE SENTENCE: a three-dot claim with commits was told it names ZERO commits"
 else ok "20h105 a three-dot claim with commits is never told it names zero commits"; fi
 case "$RECORD_RC" in
   0) ok "20h105 …and a mention of it alongside the stated delta range does not cost the artifact its record"
      [ -f "$(Q2 $EH217)" ] || bad "20h105 the run reported acceptance but wrote no record" ;;
-  3) if printf '%s' "$RECORD_ERR" | command grep -qF 'states a DIFFERENT range'; then
+  3) if command grep -qF 'states a DIFFERENT range' <<<"$RECORD_ERR"; then
        ok "20h105 …returned rc 3 as the range agreement it breaks (EVERY stated range is checked), not as an empty range"
      else bad "20h105 rc 3 for an unforeseen reason: read the recorder's sentence before re-baselining"; fi
      [ -f "$(Q2 $EH217)" ] && bad "20h105 FAIL-OPEN: refused but still minted a signed clean" || ok "20h105 no record was written" ;;
@@ -11753,7 +11753,7 @@ run_record_delta $EH218 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42566101" \
     STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I also checked HEAD .. zzz, which is my own typo for a ref that does not exist here."
 assert_eq "$RECORD_RC" "3" "20h106 HEAD .. zzz (a written word that does not resolve) is still REFUSED — fail-closed, as shipped"
-if printf '%s' "$RECORD_ERR" | command grep -qF 'the endpoint is omitted'; then
+if command grep -qF 'the endpoint is omitted' <<<"$RECORD_ERR"; then
   ok "20h106 and the shipped SENTENCE still calls it omitted — the declared cost this row pins (fixing it must flip this row)"
 else bad "20h106 the sentence changed: re-read the declared cost before re-baselining this row"; fi
 
