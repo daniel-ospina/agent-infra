@@ -6757,9 +6757,17 @@ lane_no_pr_trigger() {
 # attachable trigger" and WIDENED — the fail-open direction, from a list it never
 # actually parsed (`(declared triggers: push workflow_dispatch)` collapsed to one token
 # `pushworkflowdispatch`; `push-to-fork` matched nothing). The shape gate below is what
-# makes the sentence true: the producer emits a `", "`-joined list of `on:` keys
-# (scripts/ci-workflow-pr-evaluable.sh:831), so every member MUST be `[a-z0-9_]+`. Any
-# other shape is treated exactly like an ABSENT one — `unread`, fail closed.
+# makes the sentence true. ⛔ ITS GRAMMAR IS NARROWER THAN THE PRODUCER'S, DELIBERATELY
+# (round 4 review, P2): the producer joins its parsed keys with `", "`
+# (scripts/ci-workflow-pr-evaluable.sh:831) and its key grammar is
+# `[A-Za-z0-9_.-]+` (_KEY_RE, :111) — so it CAN emit `push-to-fork`, `Pull_Request`,
+# `pull_request.types` — while this gate accepts only `[a-z0-9_,]`. A member outside
+# that alphabet therefore reads `unread` and KEEPS the filter, where `origin/main` WIDENED
+# on it. That is a REAL behaviour move on a producible shape (measured: `push-to-fork`
+# and `PUSH` both widen before, keep after), it is in the fail-closed direction only, and
+# it is not claimed as a no-op. Any other shape is treated exactly like an ABSENT one —
+# `unread`, fail closed. Pinned by (a8) (the two unclassifiable shapes) and its CONTROL
+# (`workflow_call` still widens, so the gate did not eat the #2465 narrowing).
 #
 # ⛔ AND IT MUST NOT LOOK LIKE A MEASUREMENT (round 2, P2). The two grounds for "can
 # attach" are NOT the same claim — one PARSED `push`/`workflow_dispatch` out of the

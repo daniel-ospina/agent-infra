@@ -196,6 +196,15 @@ ck "(a2) the class clause names the STRUCTURAL fact AND the MEASURED trigger lis
    "$(grep -q "declares no pull_request / pull_request_target, so no such PR event can START it" <<<"$R_ERR" && grep -q "declares 'push'" <<<"$R_ERR" && echo 0 || echo 1)"
 ck "(a2) ⛔ it does NOT say 'declares a PR trigger this changed set does not match' — that would contradict the reason it just read" \
    "$(grep -q 'declares a PR trigger this changed set does not match' <<<"$R_ERR" && echo 1 || echo 0)"
+# ⛔ AND THE PUSH MECHANISM IS QUALIFIED HERE TOO (round 4, P1). (a3c) pins the qualifier
+# on the JOINED value, but `on: push`-only is the shape THIS arm exists for (it is the #1614
+# rationale), and reverting the qualifier on the single-`push` arm alone left the whole
+# suite GREEN: an unqualified "a push whose tip is $head" is exactly the claim the filter
+# qualifier exists to remove (`.github/workflows/enforce-skills.yml` is `push:
+# branches: [main]`, which can never attach a run to a non-main PR head).
+KEPT_A2="$(grep 'LANE KEPT' <<<"$R_ERR")"
+ck "(a2) ⛔ the push mechanism is qualified by ITS OWN branches/paths filter" \
+   "$(grep -q "subject to that trigger's own 'branches'/'paths' filters" <<<"$KEPT_A2" && echo 0 || echo 1)"
 
 echo "(a3) STRUCTURAL + 'workflow_dispatch' + UNREADABLE probe — must KEEP the filter"
 drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_dispatch)' unreadable
@@ -270,6 +279,13 @@ ck "(a4) ⛔ the tail does NOT assert 'This class CAN still start a run' — the
    "$(grep -q 'This class CAN still start a run' <<<"$KEPT_A4" && echo 1 || echo 0)"
 ck "(a4) …but it still states the consequence, so the operator knows the wait applies and §1b refuses" \
    "$(grep -q 'The bounded wait applies, and §1b refuses if no run appears' <<<"$KEPT_A4" && echo 0 || echo 1)"
+# ⛔ THE SAME NARROWED CLAIM IS CARRIED BY A SECOND, INDEPENDENTLY REACHABLE ARM (round 4,
+# P2). Reverting `no such PR event` back to `no PR event` on THIS arm alone also left the
+# suite GREEN — (a2) pins the phrase only on the MEASURED arm. A `pull_request_review`-only
+# lane is in this class while a PR event (a submitted review) genuinely starts it, so the
+# wide form is false on both arms; both must be pinned.
+ck "(a4) it says 'no such PR event' (the class is PR-trigger-free, not PR-event-free)" \
+   "$(grep -q 'so no such PR event can START it' <<<"$KEPT_A4" && echo 0 || echo 1)"
 
 # ── (a5)/(a6) MUTATION PROOFS — (a2)/(a4) must discriminate on the helper ───
 # Both mutations hit ONLY lane_own_run_can_attach, counted so a silent no-op proves
