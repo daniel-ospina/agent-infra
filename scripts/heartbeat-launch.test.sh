@@ -69,12 +69,22 @@ assert_not_contains() {
 command -v python3 >/dev/null 2>&1 || echo "note: no python3 on PATH — the check-probe cases below will read UNKNOWN"
 
 T="$(mktemp -d /tmp/heartbeat-launch-test.XXXXXX)"
+REACHED_SUMMARY=0
 cleanup() {
-    local p
+    local p rc=$?
     if [ -f "$T/livepids" ]; then
         while IFS= read -r p; do [ -n "$p" ] && kill "$p" 2>/dev/null; done < "$T/livepids"
     fi
     rm -rf "$T"
+    # ⛔ A RUN THAT DIES MID-SUITE MUST NOT READ AS A RUN THAT FAILED ITS ROWS (#3826). Measured on
+    # d246eead: a leaked `set -e` (see §7b) killed the suite at §8 after 54 assertions and the summary
+    # never printed — rc=1 alone cannot distinguish "one row failed" from "the last 100 rows never
+    # asserted anything", and the second is the worse reading of a red. This names the difference on
+    # the stream both a human and a shard runner look at.
+    if [ "$REACHED_SUMMARY" -ne 1 ]; then
+        echo "❌ heartbeat-launch suite ABORTED before its summary — $PASS passing, $FAIL failing; every row after the abort never ran" >&2
+    fi
+    exit "$rc"
 }
 trap cleanup EXIT
 
@@ -312,9 +322,21 @@ assert_contains "$OUT" "UNKNOWN" "§7 …and says UNKNOWN on the line a caller r
 if [ "$(id -u)" -ne 0 ]; then
     R="$(newroot c1r)"
     chmod 000 "$R/agent/state"
-    set +e
+    # ⛔ DO NOT TRANSPLANT `set +e … set -e` FROM `install-launchd.test.sh` (#3826). That file's baseline
+    # IS `set -euo pipefail`, so its window re-arms errexit and restores what it found. THIS file's
+    # baseline is `set -uo pipefail` — no errexit — so the same pair ENABLES errexit for every row after
+    # this block, and the first by-design non-zero verdict (§8's DRIFT check, below) aborts the run
+    # instead of being scored. MEASURED on d246eead: dead at §8 after 54 assertions, no summary,
+    # §8-§18 never asserted. The capture below needs no window: `RC=$?` reads a plain assignment's
+    # status, which is what every other row in this file already relies on.
+    # ⇒ ARMED ERRETXIT WOULD ABORT ON THE CAPTURE ITSELF (the probe answers rc=2 by design), so it is
+    # checked and disarmed HERE — ahead of the capture, where the leak can still be REPORTED as a row
+    # instead of truncating the run. A check after the assertion below would be dead code.
+    case $- in
+        *e*) set +e; bad "§7b …and leaves the file's baseline intact — a leaked errexit would abort the next by-design non-zero row" ;;
+        *)   ok  "§7b …and leaves the file's baseline (no errexit) exactly as it found it" ;;
+    esac
     OUT="$(env -u XPC_SERVICE_NAME HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" check 2>&1)"; RC=$?
-    set -e
     chmod 755 "$R/agent/state"
     assert_eq "$RC" "2" "§7b check returns UNKNOWN (2) on an EXISTING but unreadable state dir — pre-fix it was DRIFT (1)"
     assert_contains "$OUT" "not readable" "§7b …and names the unreadable dir as the reason"
@@ -689,6 +711,7 @@ OUT="$(env -i PATH=/usr/bin:/bin HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH
 assert_eq "$RC" "0" "§18 an explicit HEARTBEAT_PI_AGENT_DIR needs no HOME (the env seam is the documented escape)"
 
 echo ""
+REACHED_SUMMARY=1
 if [ "$FAIL" -eq 0 ]; then
     echo "✅ heartbeat-launch suite passed ($PASS assertions)"
     exit 0
