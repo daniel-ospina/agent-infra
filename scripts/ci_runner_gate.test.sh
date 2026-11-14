@@ -723,18 +723,23 @@ assert_eq "$QUEUE_HEAD_SCAN_SHIPPED" "25" \
 # `GATE_UNDER_TEST`, exactly as the bound's derivation records above, so that a mutant which merely
 # changes the constant cannot quietly re-point the arms' own fixtures at its value. The consequence is
 # that under `GATE_UNDER_TEST` a `QUEUE_PAGE` mutant does NOT reach this line: measured (cycle 9),
-# `GATE_UNDER_TEST=<gate with QUEUE_PAGE=50>` is 13 failures / 591 passed with this pin GREEN, the arms
-# reding incidentally against a 100-row fixture. What the pin protects is the IN-PLACE reversal — the
-# route that actually ships — where the derivation and the file move together:
-# MEASURED (the review derived this and got the count
-# wrong, so here is the run): with `s/^QUEUE_PAGE=100/QUEUE_PAGE=50/` in the shipped `ci_runner_gate.sh`
-# the suite is NOT green — 13 rows red — but every one of them reds INCIDENTALLY: a 60-deep serving
-# queue becomes "deeper than the read page" and refuses, so the idle-capacity and deep-queue arms fail
-# with `got: 2, want: 0` and nothing in the output names the constant that moved. The natural repair
-# for a future reader is then to edit those expected values, which is exactly how a read-page reversal
-# would ship: the behaviour rows look like fixture drift, not like a decision reversed. THIS line is the
-# one that names it (`got: 50, want: 100`). The literal is the two-sided half, the arms are the wired
-# half — the same split the bound's pin above uses, and for the same reason.
+# `GATE_UNDER_TEST=<gate with QUEUE_PAGE=50>` is 13 failures / 591 passed with this pin GREEN, the reds
+# coming from the arms against their 100-row fixtures (mostly `got: 2, want: 0`, plus
+# `ghost-window-at-exact-page`'s `unexpected: cannot see past it` — the gate's page dropped to 50 while
+# the fixture still built the shipped 100). What the pin protects is the IN-PLACE reversal — the route
+# that actually ships — where the derivation and the file move together:
+# MEASURED (cycle 9 re-measured both routes, after the first version of this paragraph contradicted
+# itself): with `s/^QUEUE_PAGE=100/QUEUE_PAGE=50/` in the shipped `ci_runner_gate.sh` the suite is NOT
+# green — 13 failures / 591 passed — and THIS line is one of the 13, printing exactly
+# `(got: 50, want: 100)`. The OTHER 12 red incidentally: a 60-deep serving queue becomes "deeper than
+# the read page" and refuses, so the idle-capacity and deep-queue arms fail with `got: 2, want: 0`.
+# ⛔ THAT SPLIT IS THE POINT, not a detail: without this line the twelve behaviour rows look like
+# fixture drift, and the natural repair for a future reader is to edit their expected values — which is
+# exactly how a read-page reversal would ship. This line is what makes the reversal read as a decision
+# reversed. (An earlier version of this paragraph said every one of the 13 was incidental and that
+# nothing named the constant — it had carried the count over from the `GATE_UNDER_TEST` run above,
+# where the pin really is green. Corrected here by measurement, not by re-wording.) The literal is the
+# two-sided half, the arms are the wired half — the same split the bound's pin above uses.
 echo "── #3995: the gate ships GitHub's per_page cap (100) — a REVERSAL must redden THIS line ──"
 assert_eq "$QUEUE_PAGE_SHIPPED" "100" \
   "the gate ships GitHub's per_page cap (100) and every ceiling note's arithmetic is about it — reversing it must redden THIS line"
