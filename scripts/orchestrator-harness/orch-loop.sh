@@ -8379,7 +8379,7 @@ PY
   # ⛔ AND A ZERO NEEDS ITS CAUSE, OR THE FIELD IS A RORSCHACH TEST (review P2). `slots=0` with the
   # capacity probe GRANTING is reached by FOUR different states, and before this token the record named
   # NONE of them: `level=NOT-MEASURED slots=0 can_spawn=1` was documented as "capacity refused", but
-  # with `can_spawn=1` that is equally a full box (`cascade_issue_slots`: `room > 0 || 0`), an EMPTY
+  # with `can_spawn=1` that is equally a full box (`cascade_issue_slots`: `room > 0 || 0`), a zero
   # candidate backlog (the grant is ceilinged by it) or an UNREADABLE PR listing (`CASCADE_UPN_UNREADABLE`).
   # A cycle idling with an empty pool therefore read as a capacity refusal — a wrong cause on the very
   # artifact a lane is briefed from. The arms are ordered CAUSE-FIRST (the earliest gate that decided
@@ -8389,20 +8389,37 @@ PY
   # ran — so it is tested after the arm that can stop it from running at all (`capacity`).
   # ⛔ AND AN ARM THAT ONLY RE-STATES A ZERO THE ALLOCATOR ALREADY PRODUCED GOES LAST (agent-infra#3909
   # review, 3rd cycle P2). `cascade_issue_slots` runs BEFORE this block's listing arm, and its zero does
-  # NOT depend on the PR listing: it withholds on `room <= 0` and is ceilinged by the (local, always
-  # readable) candidate backlog. So on a FULL box or an EMPTY backlog the listing arm re-states a zero
-  # that was already decided — it decided nothing. Testing it first published `listing_unreadable` for a
-  # box whose measured cause was `no_room`, i.e. the same "a wrong cause on the artifact a lane is
-  # briefed from" defect this token exists to end, one arm over. It still wins on the one state it does
-  # decide — room AND backlog both free, so every arm above it is false and the listing is the only
-  # zero left.
+  # NOT depend on the PR listing: it withholds on `room <= 0` and is ceilinged by the candidate backlog.
+  # So on a FULL box or a ZERO backlog the listing arm re-states a zero that was already decided — it
+  # decided nothing. Testing it first published `listing_unreadable` for a box whose measured cause was
+  # `no_room`, i.e. the same "a wrong cause on the artifact a lane is briefed from" defect this token
+  # exists to end, one arm over. It still wins on the one state it does decide — room AND backlog both
+  # free, so every arm above it is false and the listing is the only zero left.
+  # ⛔ AND A ZERO BACKLOG IS TWO DIFFERENT FACTS, ONLY ONE OF WHICH MAY BE CALLED `empty_backlog`
+  # (agent-infra#3909 review, 4th cycle P1; the ruling is #1931). `CASCADE_QUEUE_DEPTH` is
+  # `wc -l < candidates.txt` coerced to 0 when that file cannot be read, so a zero ALSO arrives from a
+  # refresh whose POOL LISTING FAILED — and an empty file is byte-identical to a fleet with nothing to
+  # do. This loop already settled that conflation in its own vocabulary (`queue_state_token`, :1931):
+  # EMPTY is "read and genuinely empty — the only answer that may mean 'no work'", UNREADABLE is "the
+  # fleet is BLIND", UNKNOWN is "no pass ever recorded a read — never EMPTY". Publishing
+  # `empty_backlog` for a pool nobody read would be that same defect reborn one field over, and it
+  # MIS-AIMS THE REMEDY: `empty_backlog` is the diagnosis whose fix is #3009 requirement 2 (widen the
+  # pool to P3/unlabelled), so a lane briefed from it would go and widen a pool that is perfectly fine.
+  # So the `empty_backlog` arm is gated on the refresh's own MEASURED EMPTY. Every other zero-backlog
+  # state is `backlog_unreadable` — an ABSENCE of attribution, not a measurement — and an absence ranks
+  # BELOW the listing's own measured unreadability (both can hold at once: the 2026-10-17 incident had
+  # both listings refused for 131 consecutive passes). Order: measured-empty → measured-blind → blind.
+  CASCADE_POOL_EMPTY=0
+  case "$(queue_state_token 2>/dev/null)" in EMPTY*) CASCADE_POOL_EMPTY=1 ;; esac
   CASCADE_SLOTS_WHY=""
   if [ "${CASCADE_RUNG_SLOTS:-0}" -gt 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="granted"
   elif [ "${CASCADE_CAN:-1}" = "0" ]; then CASCADE_SLOTS_WHY="capacity"
   elif [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ]; then CASCADE_SLOTS_WHY="level"
   elif [ "${CASCADE_ROOM:-0}" -le 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="no_room"
-  elif [ "${CASCADE_QUEUE_DEPTH:-0}" -le 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="empty_backlog"
+  elif [ "${CASCADE_QUEUE_DEPTH:-0}" -le 0 ] 2>/dev/null && [ "${CASCADE_POOL_EMPTY:-0}" = "1" ]; then
+    CASCADE_SLOTS_WHY="empty_backlog"
   elif [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; then CASCADE_SLOTS_WHY="listing_unreadable"
+  elif [ "${CASCADE_QUEUE_DEPTH:-0}" -le 0 ] 2>/dev/null; then CASCADE_SLOTS_WHY="backlog_unreadable"
   else CASCADE_SLOTS_WHY="unknown"; fi
   # [cascade:end]
   echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) list=${CASCADE_LIST:-?} level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_QUEUE_DEPTH:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
@@ -9699,12 +9716,18 @@ PY
     # could not, and they are what requirement 1 of #3009 actually asks for:
     #   level=MERGE          slots=0 slots_why=level        can_spawn=1 → a HIGHER LEVEL holds the room (the ladder working)
     #   level=NOT-MEASURED   slots=0 slots_why=capacity     can_spawn=0 → capacity refused, so the cascade never ran AT ALL
-    #   level=NOT-MEASURED   slots=0 slots_why=no_room|empty_backlog|listing_unreadable
+    #   level=NOT-MEASURED   slots=0 slots_why=no_room|empty_backlog|backlog_unreadable|listing_unreadable
     #                                                                  → nothing above holds the room; the GRANT itself was 0
+    #     ⛔ `empty_backlog` REQUIRES A MEASURED EMPTY POOL (`state/queue-state` = EMPTY, #1931). A zero
+    #     backlog arrives equally from a refresh whose pool listing FAILED, and calling THAT empty would
+    #     be the #1931 conflation in a new field — and would mis-aim its remedy (#3009 req 2, "widen the
+    #     pool") at a pool nobody read. That state is `backlog_unreadable` (an absence of attribution),
+    #     which ranks below the listing's measured unreadability because both can hold at once.
     #   level=ISSUES         slots=2 slots_why=granted      can_spawn=1 → the issue rung was granted two slots
     #   …plus escape=N on any of them → the drain escape re-granted N after the cascade withheld the room
     # ⛔ `slots_why=` EXISTS BECAUSE `slots=0` ALONE IS AMBIGUOUS (review P2). With the capacity probe
-    # GRANTING, a zero is equally a full box, an empty candidate backlog or an unreadable PR listing —
+    # GRANTING, a zero is equally a full box, a zero candidate backlog (MEASURED empty or never read —
+    # two different facts, two different tokens) or an unreadable PR listing —
     # and glossing all of those as "capacity refused" put a WRONG CAUSE on the artifact a lane is
     # briefed from (an empty pool idling read as a throttle). The token is computed where each of those
     # conditions is decided, in the cascade block above; this emit only carries it.
