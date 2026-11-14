@@ -10334,19 +10334,36 @@ main() {
               # claim this commit removed one level up: telling a `workflow_dispatch`-only lane
               # that "a push whose tip is $head" can start it asserts a mechanism its own `on:`
               # block cannot provide. Derived from the same value, per arm.
-              local lane_attach_how
+              # ⛔ AND EVERY MECHANISM IT NAMES MUST BE ONE THE TRIGGER IT JUST QUOTED CAN
+              # PROVIDE, under the filter that trigger carries (round 4, P2):
+              #   · a `push` mechanism is only as permissive as that trigger's own
+              #     `branches`/`paths` filter — `on: push: branches: [main]` cannot attach a
+              #     run to a PR head, and the filter is NOT in the reason clause, so the
+              #     qualifier is stated rather than assumed;
+              #   · an UNRECOGNISED value names NO mechanism. `found` is built from a closed
+              #     set today, so that arm exists for the next trigger someone adds — and
+              #     offering both known mechanisms for a trigger this code has not
+              #     classified is precisely the claim-without-a-measurement this clause
+              #     must never make.
+              local lane_attach_how=""
               case "$LANE_RUN_ATTACH_TRIGGERS" in
-                push) lane_attach_how="a push whose tip is $head, or a rerun of a CANCELLED run" ;;
-                workflow_dispatch) lane_attach_how="a 'gh workflow run --ref', or a rerun of a CANCELLED run" ;;
-                *) lane_attach_how="a push whose tip is $head, a 'gh workflow run --ref', or a rerun of a CANCELLED run" ;;
+                push) lane_attach_how=" (a push whose tip is $head, subject to that trigger's own 'branches'/'paths' filters, or a rerun of a CANCELLED run)" ;;
+                workflow_dispatch) lane_attach_how=" (a 'gh workflow run --ref', or a rerun of a CANCELLED run)" ;;
+                push\ workflow_dispatch) lane_attach_how=" (a push whose tip is $head, subject to that trigger's own 'branches'/'paths' filters, a 'gh workflow run --ref', or a rerun of a CANCELLED run)" ;;
+                *) lane_attach_how="" ;;
               esac
-              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no PR event can START it — but it declares '$LANE_RUN_ATTACH_TRIGGERS', which CAN attach a run of it to head $head while the wait runs ($lane_attach_how)"
+              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it — but it declares '$LANE_RUN_ATTACH_TRIGGERS', which CAN attach a run of it to head $head while the wait runs$lane_attach_how"
               lane_kept_tail="This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
             else
               # ⛔ NOT "it declares a trigger" (round 2, P2): on this path the code could not
               # READ the trigger list, so the only honest statement is that the answer is
               # unread and the filter is kept fail-closed.
-              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no PR event can START it, and its declared trigger list could not be READ from the applicability reason — so the filter is kept because an unreadable answer is not an exemption, not because a run was measured absent"
+              # ⛔ "NO SUCH PR EVENT", NOT "NO PR EVENT" (round 4, P2): this class is
+              # `triggers & {pull_request, pull_request_target} == {}` (see
+              # scripts/ci-workflow-pr-evaluable.sh:106,829-836), and a `pull_request_review`-
+              # only lane belongs to it while a PR event (a submitted review) genuinely
+              # STARTS it. The narrower, MEASURED claim is the one that belongs here.
+              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it, and its declared trigger list could not be READ from the applicability reason — so the filter is kept because an unreadable answer is not an exemption, not because a run was measured absent"
               # ⛔ AND THE TAIL MUST NOT RE-ASSERT WHAT THE CLAUSE JUST CALLED UNREAD (round 3,
               # P2). "This class CAN still start a run while the wait runs" is the fact this arm
               # has just said it could not establish, and it repeats the "not an exemption"
