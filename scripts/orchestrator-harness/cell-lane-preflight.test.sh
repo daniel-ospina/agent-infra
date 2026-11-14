@@ -213,10 +213,20 @@ make_keys() {
 # measured the CHECKOUT THE SUITE LIVES IN — a real network fetch per arm, and an `ok` line whose
 # `behind=` depended on the box. `<dir>` holds no `.git`, so these arms take the documented
 # "no checkout to measure" path deterministically, which is what they are about (the capability read).
+# ⛔ AND `<dir>` HOLDING NO `.git` IS NOT ENOUGH — THE NAME MUST BE GIVEN, NOT MERELY THE CWD (this
+# change's review, P1-2). `resolve_repo` falls through to the ABSOLUTE literals `/tmp/cell-ai` and
+# `/tmp/cell-t3` (`cell-lane-preflight.sh:234`), which exist on EVERY cell (`docs/ops/disk-consumers.md`
+# :31-33,42,46). Unsetting `CELL_HOME` drops only that one candidate, so on a cell these arms resolved a
+# LIVE production checkout: A1/A7 red whenever it is >MAX_BEHIND behind (the measured state of the boxes
+# this change is about), plus a real network `git fetch` of that checkout as a side effect of running a
+# test — against this file's "local-path remotes only, no network" contract. Naming the non-checkout
+# forces `resolve_repo`'s FIRST arm (`cell-lane-preflight.sh:226-231`), which returns `reason=not-a-checkout`
+# for the name it was given and never reaches a literal on any host. A19 pins that path independently.
 run_gate() {
   local d="$1" bound="$2"; shift 2
   OUT="$( cd "$d" && env -u DEEPSEEK_API_KEY -u CELL_HOME -u LANE_PREFLIGHT_KEYS \
-          -u CELL_PREFLIGHT_REPO -u CELL_PREFLIGHT_MAX_BEHIND -u CELL_PREFLIGHT_FETCH_BOUND \
+          CELL_PREFLIGHT_REPO="$d/no-checkout" \
+          -u CELL_PREFLIGHT_MAX_BEHIND -u CELL_PREFLIGHT_FETCH_BOUND \
           PATH="$d/bin:$PATH" HOME="$d/home" bash "$TARGET" --keys "$d/keys.env" --bound "$bound" "$@" 2>&1)"
   RC=$?
 }
