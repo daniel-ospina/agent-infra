@@ -1720,7 +1720,7 @@ manifest path above is what a box that is copied into every deploy should use.
 | `ORC_CONTROLLER_ORIGIN` | unset | WHO started this controller (e.g. the plist path). When set, a `MAX_LOAD` that came from the environment is labelled `plist(<origin>)` on the `[cap]` line instead of plain `env`, so a ceiling that no unit set is visible in the line that reports it |
 | `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
 | `LANE_TIMEOUT` | `7200` (via `LANE_BACKSTOP_S`) | absolute wall-clock backstop on a lane's `pi` run (s). ⛔ **IT NO LONGER HAS A LITERAL OF ITS OWN** (agent-infra#2888): it defaults to the ONE fleet default, `LANE_BACKSTOP_S` (`spawn-gate.sh`, 7200) — it was `3300` when a flat elapsed cap was the primary bound, and three separate literals is how that cap outlived the progress allowance that replaced it. `lane-bound.sh`'s PROGRESS allowance (45 min) is the PRIMARY wedge signal now; this is only the ceiling for a lane that creeps forward for ever. An explicit `LANE_TIMEOUT` still overrides it, and the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
-| ~~`LANE_KEY_GATE`~~ | — | **RETIRED as a switch (agent-infra#3331).** It used to turn the model-credential assertion off, and that was wrong in the one way that matters: this is an ENVIRONMENT variable, so a box's `keys.env` (sourced by the cell supervisor under `set -a`) handed it to every descendant lane and the gate became a fleet-wide off switch that looked like a fixture escape — measured: a key-less lane ran to `outcome=done reason=agent-exit-0` with the suite green. The escape is `--key-gate-off` on the lane's invocation, which no environment can inject. Nothing reads this variable now; a value found in the environment is logged as `check=ignored` and **not** honoured, so a stale fixture is told what changed instead of silently gating |
+| ~~`LANE_KEY_GATE`~~ | — | **RETIRED as a switch (agent-infra#3331).** It used to turn the model-credential assertion off, and that was wrong in the one way that matters: this is an ENVIRONMENT variable, so a box's `keys.env` (sourced by the cell supervisor under `set -a`) handed it to every descendant lane and the gate became a fleet-wide off switch that looked like a fixture escape — measured: a key-less lane ran to `outcome=done reason=agent-exit-0` with the suite green. The escape is `--key-gate-off` on the lane's invocation, which no environment can inject, and an invocation that used it says so on the terminal line: `keygate=off` (see the terminal-line section) — so a fixture-only escape is COUNTABLE across the fleet rather than visible only as prose in one log. Nothing reads this variable now; a value found in the environment is logged as `check=ignored` and **not** honoured, so a stale fixture is told what changed instead of silently gating |
 | `REVIEW_TIMEOUT` | `1800` | wall-clock limit on a reviewer `pi` run (s) |
 | `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
 | `SWEEP_MAX_AGE` | `600` | (s) the longest a `304 Not Modified` may reuse the cached PR listing before the sweep forces a full one. A completed check run does **not** reliably change the listing's ETag, so this floor is what stops a green PR sitting behind a cached "unchanged" forever (#1762) |
@@ -3026,8 +3026,25 @@ ambiguous, and the CPU counter dies with the process.
 abort, and (through the explicit signal handlers) a `TERM`/`INT`/`HUP`:
 
 ```text
-outcome=<done|refused|failed|died> reason=<token> lane=<N> rc=<status> utc=<timestamp>
+outcome=<done|refused|failed|died> reason=<token> keygate=<state> lane=<N> rc=<status> utc=<timestamp>
 ```
+
+⛔ **`keygate=` SAYS WHAT THE MODEL-CREDENTIAL GATE DID FOR THIS RUN, AND THE ESCAPE IS COUNTABLE** (review
+finding: the bypass was visible only as prose). The vocabulary is closed and there are no other values:
+
+| `keygate=` | meaning |
+|---|---|
+| `checked` | the gate ran and the credential is present in the environment this lane hands `pi` |
+| `skipped` | the gate ran and could NOT resolve the credential name (blindness — it refuses nothing; see `key-gate.sh`'s polarity rule) |
+| `refused` | the gate ran and refused; the lane ends here (`outcome=refused reason=key-gate:…`) |
+| `off` | `--key-gate-off`: the assertion did NOT run for this invocation — **the declared escape** |
+| `notrun` | the gate could not produce a verdict (its probe failed, or `$O/state` was unwritable) |
+| `unreached` | the lane ended BEFORE the gate (a `repo-target` 72, an early 78, a signal during startup). Never a pass |
+
+So "how many lanes on this box had the credential assertion switched off?" is one command over the run-scoped
+files — `grep -h 'keygate=off' "$O"/logs/lane-[0-9]*.outcome` — and an absent line, or `unreached`, can never
+be read as a pass. The `[key-gate] … reason=--key-gate-off` prose line stays: the field is for instruments, the
+sentence is for the operator.
 
 ⛔ **THE TRAP'S COVERAGE IS NOT UNIVERSAL, AND THE GAP IS THE ONE WORTH KNOWING** (review cycle 1, P2).
 A process killed by `SIGKILL` (the OOM killer) or replaced by `exec` runs NO trap, so it writes no line
