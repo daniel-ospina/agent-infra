@@ -499,6 +499,13 @@ drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <o
     if [ -n "${13:-}" ]; then
       case "${14:-0}" in
         noepoch) printf '%s\n' "${13}" > "$w/state/queue-state" ;;
+        # ⛔ `leading0` IS THE SENTINEL THAT DISCRIMINATES THE PARSE GUARD (review P3, 9th cycle).
+        # `noepoch` cannot: an empty `at` makes `[ "$at" -le "$now" ]` ERROR and the `||` takes the
+        # blind arm anyway, so that arm grades the RANGE test, not `is_num`. A leading-zero stamp is
+        # rejected by `is_num` but ACCEPTED by `[ -le ]` under a wide bound, so only this one falsifies
+        # the parse guard itself — measured: with the guard deleted, `EMPTY 0123` + bound 999999999 reads
+        # `empty` instead of `blind`.
+        leading0) printf '%s 0123\n' "${13}" > "$w/state/queue-state" ;;
         wrap)    printf '%s 9223372036854775808\n' "${13}" > "$w/state/queue-state" ;;
         *)       printf '%s %s\n' "${13}" "$(( $(date +%s) - ${14:-0} ))" > "$w/state/queue-state" ;;
       esac
@@ -643,7 +650,7 @@ ck "…and a WIDENED knob is refused as the config block refuses it (a bound can
 # ⛔ AND A DRAINED QUEUE IS NOT A BLIND ONE (agent-infra#3909 review, 5th cycle P2). `READ(n)` is a
 # SUCCESSFUL read and `PARTIAL(x)` a NAMED one, so `queue=READ(7)` beside a zero backlog must not be
 # published as an "absence of attribution" — that was the #1931 conflation reborn backwards. The pair is
-# routine because the CONTROLLER prunes dispatched ids (`orch-loop.sh:8147`) while the refresh only
+# routine because the CONTROLLER prunes dispatched ids (`orch-loop.sh:8161-8170`) while the refresh only
 # appends/dedupes/re-orders the queue and never drops a row (`refresh-candidates.sh:5776`,`:6247`,`:4371`).
 ck "a READ pool with a zero backlog is DRAINED, not unreadable — the read SUCCEEDED" \
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 'READ(7)' | cut -d' ' -f5,6)" "0 backlog_drained"
@@ -656,6 +663,13 @@ ck "…but a STALE READ record is NOT drained — a reading nobody re-took is no
 # ⛔ AND AN UNSTAMPED RECORD IS UNGRADEABLE, NOT FRESH (review P2, 6th cycle).
 ck "…and an EMPTY record with NO stamp at all is ungradeable, so never a measured empty" \
    "$(drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY noepoch | cut -d' ' -f5,6)" "0 backlog_unreadable"
+# ⛔ AND THE STAMP'S OWN PARSE GUARD NEEDS ITS OWN FALSIFIER (review P3, 9th cycle). The `noepoch` arm
+# above cannot grade `is_num`: an empty operand makes `[ -le ]` error, so the blind arm is taken by the
+# RANGE test whether or not the parse guard exists (measured — deleting the guard leaves the suite green).
+# A leading-zero stamp is the state that separates them: `is_num` rejects it, `[ -le ]` accepts it under a
+# wide bound. So this arm fails if the parse guard is removed, which is the only reason to have one.
+ck "…and a stamp the numeric parser REJECTS (leading zero) fails closed under a wide bound, not into 'empty'" \
+   "$(QUEUE_STATE_MAX_AGE_MIN=999999999 drive_block 0 2 25 0 1 '' '' - - 0 x 0 EMPTY leading0 | cut -d' ' -f5,6)" "0 backlog_unreadable"
 # ⛔ AND THE FUTURE-TEST MUST FAIL CLOSED ON A CORRUPT STAMP (review P2, 6th cycle). A stamp at or above
 # 2^63 wraps negative in arithmetic, passing a "not in the future" test and clearing the bound — so the
 # record would read FRESH forever and `empty_backlog` would be publishable permanently from one bad write.
@@ -1027,7 +1041,7 @@ ck "…and the grant is LOGGED, naming the slots it spends" \
 # number it spent, and every non-firing case must report a MEASURED 0 rather than an absence.
 ck "…and the escape PUBLISHES the grant it spent (the record's escape= reads this, not the rung's slots=)" \
    "$(esc_pair 13 5 0 0 10 2 1 1 | cut -d' ' -f3)" "2"
-ck "…a cascade that already granted 3 publishes escape=0 (the valve did not fire, and 0 is a measurement)" \
+ck "…a cascade that already granted 3 publishes escape=0 (the valve fired but RE-GRANTED nothing, and 0 is a measurement)" \
    "$(esc_pair 14 5 3 0 10 2 1 1 | cut -d' ' -f3)" "0"
 ck "…and an EMPTY backlog publishes escape=0 (the grant produced nothing, so nothing was spent)" \
    "$(esc_pair 15 5 0 0 '' 2 1 1 | cut -d' ' -f3)" "0"

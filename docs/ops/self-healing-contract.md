@@ -270,8 +270,8 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   precedes the backlog ones. ⛔ "DOES NOT DECIDE" IS NOT "IS NOT READ": `queue_state_class` is invoked
   unconditionally just above the arm chain, so its file read is paid on EVERY pass, `backlog=10`
   included — it simply cannot change the token there. ⛔ AND THE CLOCK IS NOT PAID ON EVERY PASS: the
-  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (:3384 precedes
-  :3385), so the cost is one fork (the command substitution) on a record with no parseable stamp and
+  helper returns `blind` on an ABSENT or unusable `at` *before* it spawns `date +%s` (`:3384` precedes
+  `:3385`), so the cost is one fork (the command substitution) on a record with no parseable stamp and
   TWO when the stamp is usable. Fork headroom is a dispatch gate here (#2293), so the count is stated
   rather than rounded up. Whether the pool was
   read at all is one fact among several, not a verdict that overrides them. ⛔ That "future" test is a **digit
@@ -295,12 +295,12 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   leaves a fresh record every cycle — the measured instance, `refresh-candidates.sh:778`, 2026-10-18:
   `candidates.txt: 0`, `checked.txt: 310`, pool `READ(203)`); and the plain mid-cycle window, because the
   refresh is spawned in the background, so the record can be a fresh `READ(n)` while the queue still
-  holds the previous, drained one. ⛔ **The age bound tells NONE of these three apart from a spent
-  queue.** It cannot rescue the second: an abort that runs after the write but before the replace (the pre-flight `INCOMPLETE` abort,
+  holds the previous, drained one. ⛔ **The age bound covers NONE of the three** (it covers only the
+  pre-listing budget-gate box below, which is not one of them). It cannot rescue the
+  second: an abort that runs after the write but before the replace (the pre-flight `INCOMPLETE` abort,
   `refresh-candidates.sh:6206`, and the post-listing budget reserve check, `:6175-6177`) re-writes a FRESH
-  stamp every cycle, so the bound never elapses. Nor the mid-cycle window, whose stamp is fresh by
-  construction. On the first it fires only once the *producing* refresh is itself older than the bound —
-  and there it still does not name the queue spent, it demotes the reading to `blind`. (The pre-listing budget gate, `:4075-4077`, is NOT one of the three: it exits before the
+  stamp every cycle, so the bound never elapses. Nor the third, whose stamp is fresh by
+  construction. (The pre-listing budget gate, `:4075-4077`, is NOT one of the three: it exits before the
   write and never re-writes `queue_state`, deliberately — `refresh-candidates.sh:4054-4059` — so that box
   ages out and the classifier does answer `blind`, which is the bound working. An earlier revision
   offered it as the limit and thereby contradicted itself.) Telling "spent" from "refused before
@@ -311,9 +311,13 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   token `queue=` and this decision input differ deliberately on one stamp: `queue_state_token` clamps the
   AGE to 0, not the token (an `EMPTY` record prints `EMPTY(0s)`, a `READ(7)` record prints `READ(7)(0s)`),
   while `queue_state_class` answers blind (unverifiable is not fresh). Anything that gates asks the class;
-- `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room, and a measured
-  `0` on every pass the valve did not fire. ⛔ It is computed in the **drain-escape block**, not the
-  cascade block — that separation is the whole point of it being its own token;
+- `escape=` — what the **drain escape** re-granted *after* the cascade withheld the room. ⛔ It is
+  computed in the **drain-escape block**, not the
+  cascade block — that separation is the whole point of it being its own token. ⛔ **A measured `0`
+  means the valve RE-GRANTED NOTHING, not that it did not fire** (review P2, 9th cycle): it can fire and
+  spend zero (the grant is coerced to 0 by a zero backlog), and it can fire on a pass the cascade
+  ALREADY granted (`escape=0` beside `slots=N>=1` is a real, recorded state). Only `escape>0` proves a
+  grant; `escape=0` proves only that the valve added nothing;
 - `can_spawn=` — the capacity probe's own answer.
 
 ⛔ **`slots=` and `escape=` are DIFFERENT measurements and must never be read as one**: `slots=` is the

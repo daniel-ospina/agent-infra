@@ -3304,7 +3304,7 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # ⛔ AND THE ZERO-BACKLOG CAUSE NEEDS ONE MORE STEP THAN "IS IT EMPTY" (agent-infra#3909 review, 5th
 # cycle P2). `READ(n)` is a SUCCESSFUL read and `PARTIAL(x)` a NAMED partial read: both are MEASUREMENTS,
 # so a zero backlog beside one must not be called blind. That pair is ROUTINE because the CONTROLLER
-# prunes dispatched ids out of `candidates.txt` (`orch-loop.sh:8159-8167`), while the refresh only ever
+# prunes dispatched ids out of `candidates.txt` (`orch-loop.sh:8159-8168`), while the refresh only ever
 # APPENDS, DEDUPES or RE-ORDERS the queue and never drops a row
 # (`refresh-candidates.sh:5776`, `:6247`, `:4531`; the file states it: "ORDER, NEVER MEMBERSHIP … never
 # adds or drops a row", `:4371`). (⛔ An earlier revision credited the REAP to the refresh — it is not
@@ -9235,8 +9235,12 @@ PY
     # It RE-ASSIGNS `CASCADE_ISSUE_SLOTS` above, so a record that reads that global at emit time carries
     # the escape's number under the rung's name — guaranteed, because the escape can only fire on a
     # level-HOLDS pass. This assignment is the OVERRIDE, not the measurement: the token is zeroed at
-    # the TOP of this block on every pass (see the reset there), so `escape=0` means "the valve did not
-    # fire" and cannot be confused with "the previous cycle's grant, still lying in the variable".
+    # the TOP of this block on every pass (see the reset there), so `escape=0` means the valve RE-GRANTED
+    # NOTHING — ⛔ NOT that it did not fire (review P2, 9th cycle). The valve can fire and still spend
+    # zero (the grant is coerced to 0 by a zero backlog), and it can fire on a pass the cascade ALREADY
+    # granted, so `escape=0` beside `slots=N>=1` is a real, recorded state. Only `escape>0` proves a
+    # grant, and the zeroing at the top of the block is what keeps a previous cycle's grant from being
+    # read as this one's.
     CASCADE_ESCAPE_SLOTS="${_egrant:-0}"
     # DOES THIS PASS ACTUALLY HAVE A SLOT TO SPEND? UNSET is the driver-rig/older-caller contract (the
     # escape keeps its pre-change behaviour); an explicit 0, or a grant that produced 0 because the
@@ -9911,15 +9915,15 @@ PY
     # briefed from (an empty pool idling read as a throttle). The token is computed where each of those
     # conditions is decided, in the cascade block above; this emit only carries it.
     # ⛔ `slots=` IS THE RUNG'S OWN GRANT, CAPTURED IN THE CASCADE BLOCK — NOT `CASCADE_ISSUE_SLOTS`,
-    # WHICH THE DRAIN ESCAPE RE-ASSIGNS ~650 LINES ABOVE THIS EMIT (review P1). The escape's guard
+    # WHICH THE DRAIN ESCAPE RE-ASSIGNS LATER IN THE SAME CYCLE (review P1). The escape's guard
     # requires `CASCADE_ISSUE_SLOTS <= 0`, so it can ONLY fire on a level-HOLDS pass; reading the global
     # here therefore printed `level=MERGE slots=N≥1` on exactly those cycles — a pair these comments
     # call impossible — and a reader could not tell a rung's grant from the escape's override. The two
     # are now separate fields: `slots=` is what the cascade resolved, `escape=` is what the valve spent.
     # ⛔ THEY ARE RECORDED, NOT RE-DERIVED — WITH ONE NAMED EXCEPTION (agent-infra#3909 review, 5th cycle
     # P2). `level=`, `slots=`, `escape=` and `can_spawn=` add no measurement: every value was already
-    # computed by the cascade block ~1,200 lines above this emit (and by the drain-escape block between
-    # them). The `slots_why=` POOL gate is the exception and is stated rather than glossed: telling a
+    # computed by the cascade block and the drain-escape block above this emit. The `slots_why=` POOL gate
+    # is the exception and is stated rather than glossed: telling a
     # measured empty pool from a blind one costs ONE `state/queue-state` read per pass
     # (`queue_state_class`), plus that function's own `date +%s` ONLY when the record carries a usable
     # stamp — it returns `blind` before spawning the clock on an absent/unparseable `at`. So one fork on
