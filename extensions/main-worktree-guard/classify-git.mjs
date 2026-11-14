@@ -4892,7 +4892,13 @@ function _foldBacktickSubstitutions(body) {
  * @returns {boolean}
  */
 function _rawCarriesDeleteSpelling(body) {
-  const words = String(body ?? "").split(/\s+/).filter(Boolean);
+  // ⛔ THE MASK SENTINELS ARE WORD BREAKS HERE (round-14 review). `_maskQuotedNewlines` replaces a
+  // command-list newline with `_NL_SPAN` (\u0004) so the CAPTURE survives, which means the raw text
+  // this function sees still has that character GLUED inside a word: `$(echo -d<U+0004>)` splits to
+  // `-d\u0004)` — not a flag token — and the detector reported "no delete spelling" for a push whose
+  // substitution expands to exactly `-d`. Every control sentinel the masks emit is a separator at the
+  // shell level, so they are normalised to spaces before the split.
+  const words = String(body ?? "").replace(/[\u0000-\u0008]/g, " ").split(/\s+/).filter(Boolean);
   for (const w of words) {
     const bare = w.replace(/^["']+/, "").replace(/["']+$/, "");
     if (_isPushDeleteFlagToken(bare)) return true;
@@ -5515,6 +5521,37 @@ function _pushSegmentTokens(body) {
   // into the unresolvable marker #653 refuses; dropping it there instead is the fail-open that
   // function documents.
   if (depth > 0) tokens.push(_SUBST_PLACEHOLDER);
+  // ⛔ A DELETE SPELLING THAT ARRIVED INSIDE A COLLAPSED SPAN IS UNATTRIBUTABLE, NOT ABSENT
+  // (round-14 review, P1 — measured as a FAIL-OPEN against `origin/main`). The span fold above turns a
+  // substitution's words into ONE opaque placeholder, so a delete FLAG that came out of the
+  // substitution disappears from the token list entirely and the segment looks like a plain push:
+  //
+  //   bash -c "git push origin $(echo --delete<LF>) held/branch"
+  //     bash really runs → <push><origin><--delete><held/branch>
+  //     origin/main      → pushTargets ["$(echo",")","held/branch"] → the delete arm REFUSES
+  //     before this      → []                                      → #73 never consulted → ALLOW
+  //
+  // (`origin/main` reached it by accident — its whitespace split happened to surface the flag fragment.
+  // The same accident is what this PR replaces everywhere else, so the coverage has to be restored by a
+  // RULE rather than by re-introducing the accident.) This is exactly the case the closer arm above and
+  // `_cleanDeleteTarget` already document: the delete is VISIBLE in the text and UNATTRIBUTABLE by the
+  // walk, which is what #653's policy is for — report the marker so the block REFUSES and NAMES it.
+  // ⛔ SCOPED TWICE, because an unscoped version is a false-block generator: it fires only when the
+  // walk collapsed a span AND found no delete flag of its own AND the raw text carries a delete
+  // spelling. A plain `git push origin HEAD:feat` has no placeholder; `git push origin -o $(date) -d
+  // feat/x` has its flag; and a command whose only `-d` is ordinary option TEXT still needs a span to
+  // be in the same segment, which is the ambiguous shape this is meant to catch.
+  if (!tokens.some((x) => _isPushDeleteFlagToken(x)) &&
+      tokens.includes(_SUBST_PLACEHOLDER) &&
+      _rawCarriesDeleteSpelling(body)) {
+    // The marker must be REACHABLE, and `extractPushDeleteBranch` only reports targets AFTER a delete
+    // flag — so the flag goes in with it. That is not an invention: the raw text carries a delete
+    // spelling and the shell may well expand the span into that same flag (bash: `$(echo -d)` IS
+    // `-d`), and where it does not, the marker is unresolvable and #653 refuses it with a message
+    // NAMING the word. `origin/main` reached the same refusal from a fragment of the span; reporting
+    // `$(…)` says the true thing instead — WHICH word it could not resolve.
+    tokens.push("-d", _SUBST_PLACEHOLDER);
+  }
   return tokens;
 }
 
