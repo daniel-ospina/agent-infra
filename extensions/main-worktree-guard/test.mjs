@@ -1213,6 +1213,25 @@ dexpect("parameter-expansion later-segment --delete → real target only", "git 
 // backtick. This row reddens under the quote-unaware fold (round-3 attribution table).
 wcdt("a QUOTED paren stays part of the ref name", "block:push", "git push origin main && git push origin -d 'feat/x)'", ["feat/x)"]);
 wcdt("a QUOTED backtick stays part of the ref name", "block:push", "git push origin main && git push origin -d 'feat/x`'", ["feat/x`"]);
+// ⛔ A NESTED INTERPRETER'S ESCAPING IS ONE LEVEL DEEPER THAN THIS TEXT (round-11 review, P2 fail-open
+// measured against `origin/main`). `bash -c "… \"…\" …"` de-escapes before the inner shell parses, so a
+// paren that `_maskDataParens` reads as an OPERATOR here (the `\"` before it is an escaped quote at
+// THIS level) is DATA at the level that runs the push. Depth underflowed at the span's real closer and
+// the #504 boundary discarded `-d` and its target: `wholeCommandDeleteTargets` returned `[]` where
+// `origin/main` returned `["…","held/branch"]`, and a linked-worktree session is M2-EXEMPT — so the
+// delete of a sibling-held branch was ALLOWED. The rule is NOT "un-escape and re-parse" (a second
+// parser with its own escaping bugs); it is "a closer that leaves a delete behind it is AMBIGUOUS, so
+// keep scanning" — the target below is a plain literal and is attributed as one.
+// observed target list below is `["$(…)","b"]`, not a bare `["b"]`: the span closes EARLY at the false
+// closer, so one phantom placeholder is reported alongside the real target. That is honest and it is the
+// fail-closed direction — `$(…)` is unresolvable, so #653 refuses and NAMES it, while `b` still lets the
+// #73 sibling check speak. Attribution is not overclaimed: the row asserts exactly what the walk produces.
+wcdt("a nested-interpreter ESCAPED quote cannot hide the delete", "block:push", String.raw`bash -c "git push origin -o \"$(echo \"a)b\")\" -d b"`, ["$(…)", "b"]);
+wcdt("a nested-interpreter ESCAPED quote cannot hide a --delete", "block:push", String.raw`bash -c "git push origin -o \"$(echo \"a)b\")\" --delete b"`, ["$(…)", "b"]);
+// ⚠️ CONTROL, NOT A DISCRIMINATOR: the same nesting WITHOUT a delete must stay empty. Under the
+// ambiguity rule the walk keeps scanning past the closer, so this row catches an over-read that turns
+// ordinary nested text into a target. It can only redden in the over-block direction.
+wcdt("CONTROL: the same nested-interpreter shape with no delete → none", "block:push", String.raw`bash -c "git push origin -o \"$(echo \"a)b\")\" main"`, []);
 // ⚠️ CONTROL, NOT A DISCRIMINATOR (round-3 review, finding 3): this row cannot redden under any mutant of
 // this change — it can only catch a GROSS over-block that refuses a plain push outright.
 wcdt("CONTROL: parenthesized segment with a plain push → none", "block:push", "git push origin main && (git push origin main)", []);

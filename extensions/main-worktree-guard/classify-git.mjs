@@ -4881,6 +4881,26 @@ function _foldBacktickSubstitutions(body) {
   return out + body.slice(prev);
 }
 
+/** Does the RAW segment text still carry a delete spelling anywhere?
+ *
+ * ⛔ USED ONLY TO DECIDE THAT A TRUNCATION WAS AMBIGUOUS, never to attribute a target — so a coarse
+ * whitespace split is the right instrument here: the question is "does the visible text name a
+ * delete at all", not "what is its argv word". Deliberately QUOTE-INSENSITIVE and over-inclusive,
+ * because every extra hit only turns a silent allow into #653's refusal (the fail-closed direction);
+ * a miss would turn the same allow into a delete of a sibling's branch.
+ * @param {string} body
+ * @returns {boolean}
+ */
+function _rawCarriesDeleteSpelling(body) {
+  const words = String(body ?? "").split(/\s+/).filter(Boolean);
+  for (const w of words) {
+    const bare = w.replace(/^["']+/, "").replace(/["']+$/, "");
+    if (_isPushDeleteFlagToken(bare)) return true;
+    if (bare.startsWith(":") && bare.length > 1) return true; // `:ref` — an empty-source delete
+  }
+  return false;
+}
+
 /** One opaque word standing in for a collapsed command substitution (`$( … )` / backticks).
  *  NUL cannot occur in a shell word (bash words are NUL-terminated C strings) and it matches no
  *  flag/target shape, so consumers treat it as an ordinary positional — exactly what the
@@ -5339,6 +5359,37 @@ function _pushSegmentTokens(body) {
       if (depth > 0) {
         depth--;
         if (depth === 0) tokens.push(_SUBST_PLACEHOLDER); // the span is one positional word
+        continue;
+      }
+      // ⛔ A CLOSER THAT LEAVES A DELETE BEHIND IT IS AMBIGUOUS, NOT A SAFE BOUNDARY (round-11 review,
+      // P2 — measured as a FAIL-OPEN against `origin/main`). Truncating here is right when the `)`
+      // really does close a subshell opened before `git push`. It is WRONG when the `)` only LOOKS
+      // like a closer because a nested interpreter re-parses the text at a different escaping level —
+      // `bash -c "… \"…\" …"` de-escapes one level before the inner shell parses it, so a paren that
+      // `_maskDataParens` sees as an OPERATOR (the `\"` before it is an escaped quote at THIS level)
+      // is DATA at the level that actually runs the push. Depth then underflows at the span's real
+      // closer, and everything from `-d` onward is discarded:
+      //
+      //   bash -c "git push origin -o \"$(echo \"a)b\")\" -d held/branch"
+      //     origin/main → wholeCommandDeleteTargets = ["…","held/branch"] → #73 CONSULTED → BLOCK
+      //     before this  → []                                              → #73 never consulted → ALLOW
+      //
+      // (measured: `verdict` is `block:push` on BOTH trees, so the whole gap is the empty target list —
+      // and a linked-worktree session is M2-EXEMPT, which is what makes it reachable. 64 rows of a
+      // 6,528-row differential were this one class; every one had the real `held/branch` on the base.)
+      // ⛔ The rule is deliberately NOT "un-escape the nested level and re-parse": that is a second
+      // parser with its own escaping bugs, and this module has one already. The delete is VISIBLE in
+      // the text and UNATTRIBUTABLE by the walk, which is exactly the case #653's policy calls for —
+      // report it as unresolvable so the block REFUSES and NAMES it, rather than dropping it.
+      // Scoped to a walk that attributed NO delete of its own, so a segment that already has its flag
+      // and target keeps them (the truncation is then harmless); the raw check is over-inclusive on
+      // purpose (see `_rawCarriesDeleteSpelling`) because over-blocking is the cheap direction here.
+      if (!tokens.some((x) => _isPushDeleteFlagToken(x)) && _rawCarriesDeleteSpelling(body)) {
+        // ⛔ CONTINUE, not refuse: the delete is still ahead of us in the SAME segment, so the walk can
+        // still attribute its REAL target (`held/branch`) and let #73 decide on it with its own reason.
+        // Refusing here would block the same command for a worse reason ("cannot tell WHICH branch")
+        // about a target that is in fact a plain literal. `origin/main` blocks this shape by
+        // over-capture; this blocks it by READING it, which is the outcome the PR exists to produce.
         continue;
       }
       break; // closes a subshell opened before `git push` — the #504 boundary
