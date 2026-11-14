@@ -179,6 +179,15 @@ ck "(a2) it does NOT print 'LANE INAPPLICABLE' (that string means the lane was D
    "$(grep -q 'LANE INAPPLICABLE' <<<"$R_ERR" && echo 1 || echo 0)"
 ck "(a2) ⛔ it does NOT claim the lane HAS a run — the probe never answered that" \
    "$(grep -q 'the lane HAS a run' <<<"$R_ERR" && echo 1 || echo 0)"
+# ⛔ THE CLASS CLAUSE (round 2, P2). This message is shared by BOTH classes, so a
+# STRUCTURAL lane told "it declares a PR trigger this changed set does not match" is
+# contradicted by the reason the block just consumed — and that sentence is exactly the
+# "cannot run" vs "did not run" confusion #2465 exists to remove. Pinned, because
+# nothing else in the suite looked at the clause.
+ck "(a2) the class clause names the STRUCTURAL fact (no PR trigger, but a trigger that CAN attach a run), not the NOT-RUN wording" \
+   "$(grep -q "declares no pull_request / pull_request_target, so no PR event can START it" <<<"$R_ERR" && echo 0 || echo 1)"
+ck "(a2) ⛔ it does NOT say 'declares a PR trigger this changed set does not match' — that would contradict the reason it just read" \
+   "$(grep -q 'declares a PR trigger this changed set does not match' <<<"$R_ERR" && echo 1 || echo 0)"
 
 echo "(a3) STRUCTURAL + 'workflow_dispatch' + UNREADABLE probe — must KEEP the filter"
 drive inapplicable 'lane-applicable: no-pr-trigger — declares no pull_request (declared triggers: workflow_dispatch)' unreadable
@@ -271,6 +280,10 @@ ck "(c3) …and it does NOT claim the lane was dropped ('LANE INAPPLICABLE' mean
    "$(grep -q 'LANE INAPPLICABLE' <<<"$R_ERR" && echo 1 || echo 0)"
 ck "(c3) …and it still reports the fail-closed reason, so a reader can act (§1b / --any-workflow)" \
    "$(grep -q 'fail closed' <<<"$R_ERR" && grep -q -- '--any-workflow' <<<"$R_ERR" && echo 0 || echo 1)"
+# ⛔ THE OTHER SIDE OF THE SAME CLAUSE (round 2, P2): the genuine NOT-RUN class must KEEP
+# its own wording — making the clause conditional is only correct if it still discriminates.
+ck "(c3) the class clause says the NOT-RUN fact for a paths-excluded lane (the conditional did not flatten both classes)" \
+   "$(grep -q 'declares a PR trigger this changed set does not match' <<<"$R_ERR" && echo 0 || echo 1)"
 
 # ── (g) STRUCTURAL + the lane HAS a run for the head → NO widening (#1614) ──
 # This is the RECORDED #1614 dead-end gate. A first cut of #2465 skipped the probe

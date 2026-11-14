@@ -10275,7 +10275,22 @@ main() {
             *)
               lane_kept_why="the run probe's answer for head $head did not resolve ('$lane_probe_state')" ;;
           esac
-          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: it declares a PR trigger this changed set does not match, and $lane_kept_why. This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears. Pass --any-workflow to compare against every workflow instead."
+          # ⛔ THE CLASS CLAUSE MUST MATCH THE CLASS WE ARE IN (review P2). This branch is
+          # reached by BOTH classes: a `paths-excluded` lane (a real PR trigger that
+          # matched nothing), and — since the `unreadable` narrowing — a STRUCTURAL lane
+          # that declares `push` / `workflow_dispatch`. Telling the second one it "declares
+          # a PR trigger this changed set does not match" contradicts the very reason this
+          # block just consumed (`declares no pull_request / pull_request_target`) and makes
+          # "this lane cannot run" and "this lane did not run" look the same again — which
+          # is the ONE confusion #2465 exists to remove. Derived from `lane_structural`,
+          # never re-read from the reason text.
+          local lane_trigger_clause
+          if [ "$lane_structural" -eq 1 ]; then
+            lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no PR event can START it — but it declares a trigger that CAN attach a run of it to head $head while the wait runs (a push whose tip is $head, a 'gh workflow run --ref', or a rerun of a CANCELLED run)"
+          else
+            lane_trigger_clause="it declares a PR trigger this changed set does not match"
+          fi
+          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: $lane_trigger_clause, and $lane_kept_why. This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears. Pass --any-workflow to compare against every workflow instead."
         fi
         ;;
       unknown)
