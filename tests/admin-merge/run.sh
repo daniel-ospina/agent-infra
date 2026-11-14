@@ -13316,6 +13316,14 @@ grep -q "LANE INAPPLICABLE" "$SCEN/err" \
 grep -q "no run of the lane actually TESTED" "$SCEN/err" \
   && pass "(c) …refusing with the original lane-not-tested reason" \
   || fail "(c) the refusal reason changed on the fail-closed path"
+# ⛔ THE STREAM IS PART OF THE PROPERTY (review round 8, P2). "The classification is never
+# silent again" is only pinned if the line is on the stream the rail's `info()` actually
+# writes — STDOUT (`admin-merge.sh:1395`). The unit suite's `build_lib` reroutes `info` to
+# stderr for convenience, so an arm there stays green even if the rail writes this line to a
+# file, gates it on `--quiet`, or drops it. Assert it on $SCEN/out, where a reader sees it.
+grep -q "LANE APPLICABILITY UNMEASURED" "$SCEN/out" \
+  && pass "(c) …and the UNMEASURED classification is SAID OUT LOUD on stdout, where info() writes (#2465)" \
+  || fail "(c) the unmeasured classification is silent on stdout — the #2465 symptom, now with coverage"
 
 # ── (d) THE PATH-FILTER SHAPE: a PR trigger whose filter excludes the diff ──
 # Same fallback, different measured ground (the `paths:` filter), and the message
@@ -13366,6 +13374,13 @@ grep -q "LANE INAPPLICABLE" "$SCEN/err" \
 grep -q "lane: python-ci.yml" "$SCEN/out" \
   && pass "(e) …and the certificate still names the requested lane" \
   || fail "(e) the certificate no longer names the lane that was actually used"
+# ⛔ AND IT SAYS SO ON STDOUT (review round 8, P2). Same reasoning as (c): the unit suite
+# stubs `info` onto stderr, so ONLY a rail-level stdout arm pins that the operator actually
+# sees the kept-lane decision. Without this, `LANE KEPT` could be routed to a log file or a
+# `--quiet` gate and every existing arm would stay green while the wait went silent again.
+grep -q "LANE KEPT" "$SCEN/out" \
+  && pass "(e) …and the KEPT-lane decision is SAID OUT LOUD on stdout, where info() writes (#2465)" \
+  || fail "(e) keeping the lane is silent on stdout — the decision the operator must see is not there"
 
 # ── (f) THE CLASSIFIER ITSELF: STRUCTURAL + the probe's read FAILED ─────────
 # Every arm above is INVARIANT to the classifier except this one: (a) writes an

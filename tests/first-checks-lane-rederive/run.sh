@@ -324,6 +324,44 @@ ck "(g) MUTATION: with the producer disabled the same wait quotes NO duration (t
 ck "(g) MUTATION: …it falls to the 'no elapsed time was measured against it' arm instead" \
    "$(grep -q 'no elapsed time was measured against it' <<<"$W_ERR" && echo 0 || echo 1)"
 
+# ── (h) THE CAP POLL'S REPORT MUST NOT ASSERT A READ IT DID NOT TAKE ────────
+# Review round 8, P2. `missing` sums `dt` from BOTH producers of `unobservable`: a Jobs
+# read that FAILED, and the `>FIRST_CHECKS_JOBS_MAX` cap where the read is DELIBERATELY
+# NOT ATTEMPTED. The REFUSAL was keyed on the unreadable-only counters, but the PER-POLL
+# REPORT was not — so it printed "the Jobs API did not answer for Ns" about seconds this
+# wait spent declining to ask, one line above a refusal saying exactly that. The report
+# prints on EVERY poll of a cap-held wait, so it is the surface an operator actually reads
+# (and `>8` pending runs on one head is the 403-storm shape the code documents).
+echo "(h) a >JOBS_MAX cap poll does not claim the Jobs API was unreadable"
+printf 'queued||9001|2026-10-26T03:00:00Z\nqueued||9002|2026-10-26T03:00:01Z\n' > "$SCEN/runs"
+W_WORKFLOW=python-ci.yml FC_HAVE_WF=python-ci.yml FC_CHECKS_TOTAL=0 \
+  W_WAIT=2 W_JOBS_MAX=1 drive_wait
+ck "(h) the cap is the state reached (\$W_STATE=$W_STATE, rc=$W_RC) — else this arm measures another path" \
+   "$([ "$W_STATE" = unobservable ] && echo 0 || echo 1)"
+ck "(h) the report does NOT say 'Jobs API unreadable' — no read was attempted this poll" \
+   "$(grep -q 'Jobs API unreadable' <<<"$W_ERR" && echo 1 || echo 0)"
+ck "(h) …and it names the WIDTH cap as the ground instead" \
+   "$(grep -q 'MORE than the 1' <<<"$W_ERR" && echo 0 || echo 1)"
+ck "(h) …quoting NO fallback-window duration for an observation it declined to take" \
+   "$(grep -qE 'fallback window in total' <<<"$W_ERR" && echo 1 || echo 0)"
+
+# MUTATION: disable the cap BRANCH in the EXTRACTED text and require the arm to go RED.
+# The branch is the whole fix — mutate the CONDITION, not the else-arm's counter: with the
+# branch disabled the old summed-counter report returns and the cap poll quotes a duration
+# for a read it never attempted, which is precisely the assertion above.
+LIB_MUT_H="$TMP/lib-mut-h.sh"
+sed -E 's/^( *)if \[ "\$FIRST_CHECKS_SIGNAL_REASON" = cap \]; then$/\1if false; then/' "$LIB" > "$LIB_MUT_H"
+ck "(h) MUTATION seam applied: the cap branch is now \`if false\` (exactly one line)" \
+   "$([ "$(grep -cE '^ *if false; then$' "$LIB_MUT_H")" -eq 1 ] \
+      && [ "$(grep -cE '^ *if \[ "\$FIRST_CHECKS_SIGNAL_REASON" = cap \]; then$' "$LIB_MUT_H")" -eq 0 ] \
+      && echo 0 || echo 1)"
+LIB_REAL_H="$LIB"; LIB="$LIB_MUT_H"
+W_WORKFLOW=python-ci.yml FC_HAVE_WF=python-ci.yml FC_CHECKS_TOTAL=0 \
+  W_WAIT=2 W_JOBS_MAX=1 drive_wait
+LIB="$LIB_REAL_H"
+ck "(h) MUTATION: with the cap branch disabled the REPORT quotes a duration again — the arm is load-bearing" \
+   "$(grep -qE 'fallback window in total' <<<"$W_ERR" && echo 0 || echo 1)"
+
 echo
 printf 'first-checks lane re-derive: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
