@@ -3310,13 +3310,23 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # not distinguish" class one field over — and it is a FOURTH state, not a second.
 # ⛔ BUT IT IS THE POOL READING, NOT PROOF THE QUEUE WAS SPENT (agent-infra#3909 review, 6th cycle P1).
 # `queue_state_write` runs when the LISTING completes (`refresh-candidates.sh:4257`); `candidates.txt` is
-# only rewritten much later (:6242). A pass that listed the pool and then exited BEFORE that rewrite —
-# the budget refusal (`:4077`) or the pre-flight's INCOMPLETE abort (`:6206`), both of which say of
-# themselves "an empty backlog would be a false report" — leaves a FRESH `READ(n)` beside the old,
-# possibly empty, queue file. That is not hypothetical: it is the MEASURED 2026-10-18 state this file
-# already records (`refresh-candidates.sh:778`: `candidates.txt: 0`, `checked.txt: 310`, pool READ(203)),
-# and the age bound cannot see it because the aborting pass re-writes the record every cycle. So these
-# two tokens name WHAT THE RECORD SAYS — the read succeeded, the queue file holds nothing — and not why.
+# only replaced much later (:6247). THREE states therefore leave `READ(n)` beside a zero, possibly stale,
+# queue file, and only the FIRST is a spent queue:
+#   (a) the ordinary reap-after-read — the queue this pass built was consumed (`:6242` onwards);
+#   (b) the pre-flight's INCOMPLETE abort (`:6206`) — it runs AFTER the write, so it leaves a FRESH
+#       record every cycle and the age bound below cannot see it. Measured 2026-10-18, recorded in this
+#       repo at `refresh-candidates.sh:778`: `candidates.txt: 0`, `checked.txt: 310`, pool READ(203);
+#   (c) the refresh simply has not got there yet — it is spawned in the BACKGROUND (`this file, the
+#       refresh spawn near the end of a cycle`), so mid-cycle the record can be a fresh `READ(n)` while
+#       `candidates.txt` still holds the PREVIOUS, already-drained queue. Transient and healthy.
+# ⛔ AND THE AGE BOUND DOES NOT COVER ALL OF THEM (review, 7th cycle P2 — an earlier revision of this
+# comment claimed it did): the BUDGET refusal (`refresh-candidates.sh:4075`-`:4077`) exits BEFORE the
+# listing, so it never re-writes `queue-state` at all; `refresh-candidates.sh:4054-4059` states that
+# deliberately ("`queue_state_write` CANNOT MOVE UP HERE … the heartbeat keeps the PREVIOUS reading
+# together WITH ITS AGE"). On that box the record ages out and this classifier answers `blind` — the
+# bound DOES see it. Only (b) and (c) keep a fresh stamp over an empty queue.
+# So these two tokens name WHAT THE RECORD SAYS — the read succeeded, the queue file holds nothing — and
+# not why.
 # Telling "spent" from "refused before writing" needs the pass's own completed outcome
 # (`state/refresh-last`, written by `refresh_record_write`), which this arm does not consult: a DECLARED
 # LIMIT, stated here rather than assumed away, and the reason the tokens are named for the reading rather
@@ -3333,6 +3343,14 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # drift this header forbids, so say which is which: the TOKEN is display-only (it reports what the
 # record literally says plus its age, and its unit suffix is for a human reading a log line), and the
 # CLASS is the decision input. Anything that GATES must ask the class, never the token.
+# ⛔ AND THE PARITY CLAIM ABOVE IS ABOUT THE TWO RULES, NOT ABOUT THE OTHER READER'S ARITHMETIC
+# (review, 7th cycle P2). `dispatch_funnel` states the same two rules for its own record, and implements
+# the future test as `[ $(( 10#$at )) -le $(( 10#$now )) ]` — which is FAIL-OPEN at 2^63, because the
+# wrapped operand is negative and passes a "not in the future" test (measured: an epoch of 2^63 reads
+# as this cycle's decomposition with a negative age that also clears its bound). This classifier is the
+# fix for that shape and compares as DIGITS; the funnel is unchanged and is a display-only attribution
+# that gates nothing. Stating it so a reader does not take this header as a guarantee about that arm —
+# the repair there is filed, not silently implied here.
 queue_state_class() { # -> empty | drained | partial | blind (always prints exactly one)
   # ⛔ THE BOUND IS DEFAULTED HERE, NOT JUST IN THE CONFIG BLOCK (rig, first run). A helper that
   # refuses whenever its own limit is unreadable looks identical to "the record is stale" from every

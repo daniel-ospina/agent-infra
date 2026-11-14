@@ -270,16 +270,21 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   would deny a measurement the record holds, which is the same "the record could not distinguish" class
   in the opposite direction. The three are split **after** `listing_unreadable`, which is the PR
   listing's own measured unreadability and can zero the grant on its own.
-  ⛔ **AND THEY NAME THE READING, NOT THE CAUSE** (corrected by the 6th review cycle of #3909).
-  `queue_state_write` runs when the *listing* completes, and `candidates.txt` is only rewritten much
-  later, so `READ(n)` beside a zero queue file is equally **"the queue was spent"** and **"the pass
-  listed the pool and then exited before writing the queue"** — a refused pass (budget, or the
-  pre-flight's `INCOMPLETE`) leaves precisely that pair, and the record is re-written each cycle so the
-  age bound cannot see it. The measured instance is `refresh-candidates.sh:778` (2026-10-18:
-  `candidates.txt: 0`, `checked.txt: 310`, pool `READ(203)`). Telling those two apart needs the pass's
-  own completed outcome (`state/refresh-last`), which this field does not consult — a declared limit,
-  not an assumption. So `backlog_drained` means "the record says the read succeeded and the queue holds
-  nothing", and a reader must not take it as proof the queue was consumed. ⛔ Relatedly, the display
+  ⛔ **AND THEY NAME THE READING, NOT THE CAUSE** (corrected by the 6th and 7th review cycles of #3909).
+  `queue_state_write` runs when the *listing* completes, and `candidates.txt` is only replaced much
+  later, so `READ(n)` beside a zero queue file has THREE producers and only the first is a spent queue:
+  the ordinary reap-after-read; the pre-flight's `INCOMPLETE` abort (which runs *after* the write, so it
+  leaves a fresh record every cycle — the measured instance, `refresh-candidates.sh:778`, 2026-10-18:
+  `candidates.txt: 0`, `checked.txt: 310`, pool `READ(203)`); and the plain mid-cycle window, because the
+  refresh is spawned in the background, so the record can be a fresh `READ(n)` while the queue still
+  holds the previous, drained one. ⛔ **The age bound does NOT cover all three**: the *budget* refusal
+  exits **before** the listing and never re-writes `queue_state`, deliberately — the producer says so at
+  `refresh-candidates.sh:4054-4059` ("the heartbeat keeps the PREVIOUS reading together WITH ITS AGE") —
+  so on that box the record ages out and the classifier answers `blind`. Telling "spent" from "refused
+  before writing" needs the pass's own completed outcome (`state/refresh-last`), which this field does
+  not consult — a declared limit, not an assumption. So `backlog_drained` means "the record says the
+  read succeeded and the queue holds nothing", and a reader must not take it as proof the queue was
+  consumed. ⛔ Relatedly, the display
   token `queue=` and this decision input differ deliberately on one stamp: a FUTURE `at` is clamped to
   `EMPTY(0s)` by `queue_state_token` (it reports what the record literally says) while
   `queue_state_class` answers blind (unverifiable is not fresh). Anything that gates asks the class;
