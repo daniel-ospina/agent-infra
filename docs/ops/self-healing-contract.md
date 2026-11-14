@@ -237,7 +237,9 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   #3909). The backlog count is `wc -l < candidates.txt` coerced to `0` when that file cannot be read, so
   the **same zero** also arrives from a refresh whose pool listing failed — where an empty file is
   byte-identical to a fleet with nothing to do. So the arm reads `state/queue-state` (the refresh's own
-  record: `EMPTY` / `READ(n)` / `PARTIAL(x)` / `UNREADABLE` / `UNKNOWN`) and only a measured `EMPTY` may
+  record: `EMPTY` / `READ(n)` / `PARTIAL(x)` / `UNREADABLE` — or an ABSENT or unparseable record, which
+  `queue_state_token` reports synthetically as `UNKNOWN`; `UNKNOWN` is never a value written to the file,
+  `queue_state_write` has exactly four spellings) and only a measured `EMPTY` may
   be called empty. That ordering is
   measured-before-blind on purpose: `empty_backlog` and `listing_unreadable` are each a **measurement**
   and take precedence, while `backlog_unreadable` is an *absence* of attribution and ranks below them
@@ -247,12 +249,18 @@ their condition is decided and only *recorded* at the emit; the fifth (`level=`)
   was never read. ⛔ And "measured" means **measured recently**: the gate is the record's `EMPTY` **plus** a
   current age (`QUEUE_STATE_MAX_AGE_MIN`, default 60), because a frozen reading is not this pass's
   measurement — the refresh deliberately leaves the previous record standing when a pass aborts early, and
-  its age is what keeps that honest. Past the bound, or with an absent/unparseable/future stamp, the cause
-  is `backlog_unreadable` (unverifiable is stale, never fresh). ⛔ That "future" test is a **digit
+  its age is what keeps that honest. Past the bound, or with an absent/unparseable/future stamp, the
+  reading is demoted to the `blind` class, which costs the three zero-backlog attributions their name:
+  they fall to `backlog_unreadable` (unverifiable is stale, never fresh). ⛔ THAT DEMOTION APPLIES ONLY
+  WHERE THE ARM IS REACHED: the class decides *within* the zero-backlog arms, it does not override the
+  arms above them. A non-zero grant still reads `granted` (`CASCADE_RUNG_SLOTS > 0` is the first arm and
+  never consults the class; the class is not read at all when `backlog=10`), and an unreadable PR listing
+  still reads `listing_unreadable`, because that arm precedes the backlog ones. Whether the pool was
+  read at all is one fact among several, not a verdict that overrides them. ⛔ That "future" test is a **digit
   comparison**, not arithmetic: an epoch at or above 2^63 wraps negative inside `$(( ))`, which would
   pass a "not in the future" test and then a negative age below the bound — reading a corrupt stamp as
   FRESH forever. `[` errors on an out-of-range operand and an errored test is false, so the guard
-  falls to `backlog_unreadable`; the safe direction.
+  falls to the `blind` class — hence `backlog_unreadable` in the backlog arms; the safe direction.
   ⛔ **AND A DRAINED QUEUE IS NOT A BLIND ONE** (5th review cycle of #3909). The zero-backlog states
   that are *not* a measured `EMPTY` are **three** facts, not one absence, because `READ(n)` is a
   **successful** read and `PARTIAL(x)` a **named** partial read — both are measurements the record holds:
