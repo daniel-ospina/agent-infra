@@ -1114,6 +1114,7 @@ run_admin() {
     "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
     "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
     "ADMIN_MERGE_FIRST_CHECKS_STALL=${SUITE_FIRST_CHECKS_STALL:-}"
+    "ADMIN_MERGE_FIRST_CHECKS_ONESHOT=${SUITE_FIRST_CHECKS_ONESHOT:-}"
     "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
     # #gh-quota: the backoff ceiling DEFAULTS to the poll step here, so every
     # scenario written before the backoff existed keeps its exact poll count. A
@@ -1144,6 +1145,7 @@ run_admin_here() {
     "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
     "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
     "ADMIN_MERGE_FIRST_CHECKS_STALL=${SUITE_FIRST_CHECKS_STALL:-}"
+    "ADMIN_MERGE_FIRST_CHECKS_ONESHOT=${SUITE_FIRST_CHECKS_ONESHOT:-}"
     "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
     # #gh-quota: see run_admin's copy — the backoff ceiling defaults to the poll
     # step, so a pre-existing scenario's poll count is unchanged unless it opts in.
@@ -2614,6 +2616,7 @@ run_admin_repro() {
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
     "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
     "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
+    "ADMIN_MERGE_FIRST_CHECKS_ONESHOT=${SUITE_FIRST_CHECKS_ONESHOT:-}"
     "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
     "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
   )
@@ -13313,6 +13316,14 @@ grep -q "LANE INAPPLICABLE" "$SCEN/err" \
 grep -q "no run of the lane actually TESTED" "$SCEN/err" \
   && pass "(c) …refusing with the original lane-not-tested reason" \
   || fail "(c) the refusal reason changed on the fail-closed path"
+# ⛔ THE STREAM IS PART OF THE PROPERTY (review round 8, P2). "The classification is never
+# silent again" is only pinned if the line is on the stream the rail's `info()` actually
+# writes — STDOUT (`admin-merge.sh:1395`). The unit suite's `build_lib` reroutes `info` to
+# stderr for convenience, so an arm there stays green even if the rail writes this line to a
+# file, gates it on `--quiet`, or drops it. Assert it on $SCEN/out, where a reader sees it.
+grep -q "LANE APPLICABILITY UNMEASURED" "$SCEN/out" \
+  && pass "(c) …and the UNMEASURED classification is SAID OUT LOUD on stdout, where info() writes (#2465)" \
+  || fail "(c) the unmeasured classification is silent on stdout — the #2465 symptom, now with coverage"
 
 # ── (d) THE PATH-FILTER SHAPE: a PR trigger whose filter excludes the diff ──
 # Same fallback, different measured ground (the `paths:` filter), and the message
@@ -13363,6 +13374,61 @@ grep -q "LANE INAPPLICABLE" "$SCEN/err" \
 grep -q "lane: python-ci.yml" "$SCEN/out" \
   && pass "(e) …and the certificate still names the requested lane" \
   || fail "(e) the certificate no longer names the lane that was actually used"
+# ⛔ AND IT SAYS SO ON STDOUT (review round 8, P2). Same reasoning as (c): the unit suite
+# stubs `info` onto stderr, so ONLY a rail-level stdout arm pins that the operator actually
+# sees the kept-lane decision. Without this, `LANE KEPT` could be routed to a log file or a
+# `--quiet` gate and every existing arm would stay green while the wait went silent again.
+grep -q "LANE KEPT" "$SCEN/out" \
+  && pass "(e) …and the KEPT-lane decision is SAID OUT LOUD on stdout, where info() writes (#2465)" \
+  || fail "(e) keeping the lane is silent on stdout — the decision the operator must see is not there"
+
+# ── (f) THE CLASSIFIER ITSELF: STRUCTURAL + the probe's read FAILED ─────────
+# Every arm above is INVARIANT to the classifier except this one: (a) writes an
+# EMPTY lane listing (probe → `none`, which widens on the measurement alone), (d)
+# is `paths-excluded`, and (e) is `has-run` (which never widens). The only state in
+# which `lane_no_pr_trigger` decides the outcome is `structural + unreadable`
+# (`admin-merge.sh:9913`) — #2465's MEASURED burn, one failed `gh run list` on the
+# default `workflow_call`-only lane. No arm produced it, so re-spelling the reason
+# prefix (its producer lives in ANOTHER file, `scripts/ci-workflow-pr-evaluable.sh:
+# ``lane-applicable: no-pr-trigger``, and the two are coupled only by that prefix)
+# left the whole board green while restoring the 3900 s poll #2465 was filed for.
+# This arm keys on the classification: the probe's read is failed THROUGH THE
+# COUNTED SEAM (`fail-run-list-nth`) so the parser and the wait stay readable and
+# the arm grades the DECISION, not a listing outage. The probe is §0b's FIRST
+# `gh run list`; a shift in that order reds this arm loudly (the fixture's other
+# reads would answer, and the STRUCTURAL/read-FAILED assertions would not match)
+# rather than silently decomposing into a no-op.
+new_scen lanestructunreadable
+HEAD_LF="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LF" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml "$REUSABLE_YAML"
+pr_changed_files bin/agent-infra.js tests/drift/run.sh
+printf '1\n' > "$SCEN/fail-run-list-nth"
+# The truth of this shape: the lane has no run (it cannot have one) AND the read
+# failed. Both are needed — the empty lane-filtered listing is what the mutant's
+# kept filter finds, while the fallback never reads it.
+: > "$SCEN/runs-$HEAD_LF.by-workflow.python-ci.yml"
+lane_pass "$HEAD_LF" 20051 > "$SCEN/runs-$HEAD_LF"
+lane_pass mainlane 20052 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(f) STRUCTURAL + an UNREADABLE probe is repaired: the rail falls back and proceeds (exit $rc) — #2465's burn" \
+  || { fail "(f) one failed 'gh run list' still dead-ends the rail on a workflow_call-only lane (exit $rc)"; sed 's/^/      /' "$SCEN/err" | head -25; }
+grep -q "dead-end class: STRUCTURAL" "$SCEN/err" \
+  && pass "(f) …and the classification that SELECTED the branch is named on stderr" \
+  || fail "(f) the fallback did not classify the lane as STRUCTURAL — the classifier no longer selects the branch"
+grep -q "read FAILED" "$SCEN/err" \
+  && pass "(f) …on the measured ground: the probe's READ failed, not a measured absence of runs" \
+  || fail "(f) the message does not name the failed read — the P2 regression, back again"
+grep -q "lane has NO run for head" "$SCEN/err" \
+  && fail "(f) it claims 'no run for head' although the read FAILED — an unmeasured claim" \
+  || pass "(f) …and it does NOT claim the lane has no run for the head (that answer was never read)"
+grep -q "lane: any workflow" "$SCEN/out" \
+  && pass "(f) …and the certificate was produced on the full evaluated surface" \
+  || fail "(f) the certificate still claims the inapplicable lane"
 
 # ── 68. #1623: an UNEXPANDED run is not in flight ──────────────────────────
 # GitHub can leave a workflow run `queued` FOREVER without ever creating a job for
@@ -16894,6 +16960,119 @@ if [ "$rd9b_rc" -eq 1 ] && grep -q 'REFUSED(rail-deadline:clock-unreadable' "$TM
 else
   fail "(rd9b) an unreadable clock at the guard exited $rd9b_rc and/or did not name clock-unreadable — the guard would be inert"
 fi
+
+# ⛔ RESTORE THE SHELL FLAGS THE DEADLINE SECTION CHANGED (#3294 latched `set -e`).
+# The `rail-deadline` block above turns `set -e` ON and only ever turns it OFF around its
+# own individual rail calls, so when it ends `set -e` is still IN FORCE for everything
+# below it. Everything below was written under `set -uo pipefail` (this suite's own
+# header) and calls the rail bare:
+#
+#     run_admin_here 42 >/dev/null 2>&1
+#     rc=$?
+#
+# which is correct only WITHOUT `set -e`. With it, the FIRST arm whose rail call is
+# EXPECTED to refuse (§80 (b): "a tree red with NO base counterpart STILL BLOCKS") exits
+# the whole suite on the spot: measured here, the run printed (a) and then returned 1
+# with no footer — so §80 (c)…(i) AND the `--jq` compile guard at the tail of this file
+# never executed at all, while the suite still exited RED for no named reason. A check
+# that cannot run is not a check; the footer is also the only place `failures` is
+# reported, so an abort like this is unattributable.
+# ⛔ `set +e` MUST PRECEDE every arm added below this line. A future block that wants
+# `set -e` must scope it with its own `set +e` on exit, not leave it latched.
+set +e
+
+# ── 79 (g). #2465 THE ONE-SHOT SEAM: it disables the wait with the BOUNDS STILL SET ──
+# `ADMIN_MERGE_FIRST_CHECKS_WAIT=0` is not enough on its own: the 0 seam is conditional
+# on the two progress bounds being UNSET, so a caller with an inherited
+# ADMIN_MERGE_FIRST_CHECKS_STALL/CEILING keeps a live, bounded wait. #2465's second
+# mechanism (`atomic-land.sh --no-wait`) therefore needs a way to say "one observation"
+# WITHOUT clearing those knobs — clearing them is the WRONG remedy, because
+# ADMIN_MERGE_FIRST_CHECKS_CEILING is a TERM of the derived whole-attempt bound
+# (`rail_deadline_default`) that `rail_attempt_start` ties to ADMIN_MERGE_LOCK_TTL: a
+# caller with CEILING=600 and LOCK_TTL=6000 lands fine (the bound is 3990s), and emptying
+# CEILING raises the bound to 21454s so the SAME invocation is refused with exit 2.
+# Both arms below drive the identical scenario; only ONESHOT differs.
+# (g1)/(g2) drive the identical scenario and differ only in ONESHOT; (g3)/(g4) pin the
+# two documented NON-seam configurations instead.
+echo "== 79 (g). #2465 the ONE-SHOT seam disables the wait while the progress bounds stay SET =="
+new_scen fq-oneshot
+HEAD_OS="f7fb000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_OS" > "$SCEN/head"
+# A run that is never terminal: without the seam this wait can only reach its ceiling.
+lane_queued "$HEAD_OS" 9821 > "$SCEN/runs-$HEAD_OS"
+first_checks_line queued "" "$HEAD_OS" 9821 2026-11-03T01:00:00Z > "$SCEN/first-checks-gen-1"
+first_checks_jobs_gen 9821 1 0 0
+lane_fail osmain 9822 > "$SCEN/runs-main"
+# (g1) THE CONTRAST: bounds set, NO seam — the 0 seam does NOT fire and the wait RUNS
+# to its ceiling. This is the behaviour the flag has to defeat, measured, not asserted.
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9821"
+SUITE_FIRST_CHECKS_WAIT=0 SUITE_FIRST_CHECKS_CEILING=2 SUITE_FIRST_CHECKS_STALL=900 \
+  SUITE_FIRST_CHECKS_POLL=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+os_polls_no="$(cat "$SCEN/first-checks-list-count" 2>/dev/null || echo 0)"
+# ⛔ THE DISCRIMINATOR IS THE VERDICT WORD AND THE POLL COUNT, NOT THE WORD "expired".
+# The 0-seam's refusal and the ceiling timeout BOTH say "expired after" (the 0-seam
+# falls to `block_on_first_checks`'s `*)` arm and prints "… (window 0s)"), so grepping
+# "expired" here would be a check that cannot tell the two apart — an earlier draft of
+# this arm did exactly that and reported a FALSE failure. The signals that actually
+# differ: the ceiling verdict names `(ceiling Ns)`, the 0-seam names `(window 0s)`, the
+# stall verdict says `STALLED`, and only an ENABLED wait polls more than once.
+grep -q 'FIRST-CHECKS wait expired after' "$SCEN/err" && grep -q '(ceiling' "$SCEN/err" \
+  && pass "(g1) WITHOUT the seam, bounds set + WAIT=0 still reaches a CEILING verdict — the 0 seam is conditional, so the flag needs a seam of its own" \
+  || fail "(g1) the contrast arm did not reach a ceiling verdict (and/or did not expand the wait) — then (g2) proves nothing (fixture drift)"
+[ "${os_polls_no:-0}" -ge 2 ] \
+  && pass "(g1) …and it really POLLED (${os_polls_no} run-list reads), so the comparison in (g2) is not vacuous" \
+  || fail "(g1) the contrast arm made only ${os_polls_no} poll(s) — an enabled wait must poll"
+# (g2) THE FIX: identical bounds, ONESHOT set — ONE observation, no ceiling burn.
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9821"
+_os_t0="$(date -u +%s)"
+SUITE_FIRST_CHECKS_WAIT=0 SUITE_FIRST_CHECKS_CEILING=2 SUITE_FIRST_CHECKS_STALL=900 \
+  SUITE_FIRST_CHECKS_ONESHOT=1 SUITE_FIRST_CHECKS_POLL=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+_os_t1="$(date -u +%s)"
+os_polls="$(cat "$SCEN/first-checks-list-count" 2>/dev/null || echo 0)"
+grep -q '(ceiling' "$SCEN/err" \
+  && fail "(g2) the seam did not disable the wait: a CEILING verdict still fired with the bounds set" \
+  || pass "(g2) WITH the seam the same bounds do NOT produce a ceiling verdict — the wait was disabled, not shortened"
+grep -q '(window 0s)' "$SCEN/err" \
+  && pass "(g2) …the refusal names the 0 seam (window 0s), i.e. it took the ONE-OBSERVATION path" \
+  || fail "(g2) the refusal did not name the 0 seam — the seam did not reach the wait"
+[ "${os_polls:-0}" -le 1 ] \
+  && pass "(g2) …and it took ONE observation (${os_polls} run-list read(s) in $(( _os_t1 - _os_t0 ))s) — one observation, no waiting" \
+  || fail "(g2) the seam still polled ${os_polls} times — it shortened the wait instead of disabling it"
+# (g3) NO GRATUITOUS CHANGE: an explicit STALL/CEILING with no seam still re-enables the
+# wait (the documented suite seam), so the new knob did not quietly replace it.
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9821"
+SUITE_FIRST_CHECKS_WAIT=0 SUITE_FIRST_CHECKS_CEILING=2 SUITE_FIRST_CHECKS_STALL=1 \
+  SUITE_FIRST_CHECKS_POLL=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+grep -q 'STALLED' "$SCEN/err" \
+  && pass "(g3) an explicit STALL with NO seam still re-enables the wait — the documented path is untouched" \
+  || fail "(g3) the explicit-bound path no longer waits — the new seam changed pre-existing behaviour"
+# (g4) THE SEAM IS HONOURED ONLY WITH A ZERO WINDOW. A non-zero
+# ADMIN_MERGE_FIRST_CHECKS_WAIT is the operator asking for a bounded wait, so ONESHOT must
+# NOT silently outrank it — and the documented bullet says so. Pin BOTH halves, or a future
+# change could make the knob authoritative (or fatal) with nothing to catch it: an
+# unexercised conjunction is an accidental behaviour, not a specified one.
+# ⛔ AND THE VERDICT WORD ALONE IS NOT A DISCRIMINATOR (review round 4, P2): FOUR refusal
+# paths print "FIRST-CHECKS wait expired after" — the ceiling, never-started, unreadable
+# and the `*)` arm — and the mutant this arm exists to catch (ONESHOT outranking a
+# non-zero window ⇒ `wait_enabled=0`) lands on `*)`, which prints "… expired after 0s
+# (window 2s)". A `grep` for "expired after" therefore passed on the VERY MUTANT it was
+# written to fail, which is the same flaw (g1) documents 40 lines above. The
+# discriminator is the same one (g1) uses: an ENABLED wait reaches the CEILING verdict.
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9821"
+SUITE_FIRST_CHECKS_WAIT=2 SUITE_FIRST_CHECKS_ONESHOT=1 SUITE_FIRST_CHECKS_POLL=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+grep -q 'FIRST-CHECKS wait expired after' "$SCEN/err" && grep -q '(ceiling' "$SCEN/err" \
+  && pass "(g4) ONESHOT with a NON-ZERO window is INERT (the bounded wait still runs to its ceiling) — the knob does not outrank an explicit window" \
+  || fail "(g4) ONESHOT overrode an explicit non-zero window — the documented conjunction is not what the code does"
+grep -q '(window 0s)' "$SCEN/err" \
+  && fail "(g4) …and the refusal named the 0 seam (window 0s): the one-observation path ran, not the bounded wait (this is what the (ceiling) assertion above is for)" \
+  || pass "(g4) …and it was NOT the one-observation path (no '(window 0s)' verdict)"
+# …and the zero-window half of the conjunction is (g2): WAIT=0 + bounds + ONESHOT takes one
+# observation. Pinning it again here would only duplicate (g2), so it is not re-run.
+
 
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
