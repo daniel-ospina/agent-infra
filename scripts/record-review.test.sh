@@ -6254,6 +6254,67 @@ EV_REF="comment:42613101" run_record_ev 426131 STUB_EVIDENCE_BODY="**Outcome: CL
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13n122 undo verbs with NO blocking mention do not refuse a clean line (rc 0)"
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# 13n123-13n128 — THE SHAPE BELT. Six review rounds closed re-spellings by ADDING vocabulary, and
+# every round found more; the review of this branch said it outright: "Adding words cannot close this
+# class." It is right. At 35c7f03da `reverted`/`rolled back` were refused while all five bodies below
+# ADMITTED and minted a signed `clean`. So the belt no longer enumerates verbs — it reads SHAPE:
+# after the declared count is masked, a surviving count governed by a COPULA is a remainder unless
+# its own run carries a RESOLUTION verb. New words need no new vocabulary; only the closed copula set
+# and the arm's five existing resolution verbs are involved.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+# 13n123-13n125 — the three shapes a vocabulary list kept missing.
+rm -f "$(Q2 426132)"
+EV_REF="comment:42613201" run_record_ev 426132 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 1 was not merged.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n123 '; 1 was NOT MERGED' is a remainder — an un-resolution verb with no negator prefix (rc 3)"
+[ ! -f "$(Q2 426132)" ] && ok "13n123 no record minted over '1 was not merged'" || bad "13n123 minted a record over '1 was not merged'"
+
+rm -f "$(Q2 426133)"
+EV_REF="comment:42613301" run_record_ev 426133 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 1 item is routed to another PR.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n124 '; 1 item IS ROUTED to another PR' — a noun-subject hand-off the verb list missed (rc 3)"
+
+rm -f "$(Q2 426134)"
+EV_REF="comment:42613401" run_record_ev 426134 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 2 items were spun out into #1234.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n125 '; 2 items WERE SPUN OUT' — a phrasal verb no list would have carried (rc 3)"
+
+# 13n126-13n127 — the two exception slots a connective list could not see.
+rm -f "$(Q2 426135)"
+EV_REF="comment:42613501" run_record_ev 426135 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, saving 1.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n126 'all … fixed, SAVING 1' is a declared remainder (rc 3)"
+
+rm -f "$(Q2 426136)"
+EV_REF="comment:42613601" run_record_ev 426136 STUB_EVIDENCE_BODY="**Outcome: CLEAN — all blocking findings were fixed, 1 aside.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n127 '… fixed, 1 ASIDE' — the exception word FOLLOWS the count here (rc 3)"
+
+# 13n128 — MUTATION PIN for the shape belt itself. 13n123-13n125 could be green for any other belt's
+# reason, so the copula arm is removed from a copy and the SAME bodies must then be ADMITTED.
+N_COPULA_MUT="$T/mutant-copula-removed.sh"
+sed 's#^  local _OC_COPULA=.*$#  local _OC_COPULA='"'"'@@NEVERMATCH@@'"'"'#' "$RECORD" > "$N_COPULA_MUT"
+if cmp -s "$RECORD" "$N_COPULA_MUT"; then
+    bad "13n128 MUTANT: the _OC_COPULA sed anchor no longer matches — re-anchor the pin"
+else
+    bash -n "$N_COPULA_MUT" && ok "13n128 MUTANT: the copula-removed mutant still parses" || bad "13n128 MUTANT: the mutant does not parse"
+    NC_SAVE="$RECORD"
+    RECORD="$N_COPULA_MUT"
+    rm -f "$(Q2 426137)"
+    EV_REF="comment:42613701" run_record_ev 426137 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed; 1 was not merged.**
+
+$VACUITY_BLOCK"
+    RECORD="$NC_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n128 MUTATION PIN: with the copula belt removed, 13n123's body is ADMITTED (rc 0) — the shape belt is load-bearing"
+fi
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
@@ -7320,13 +7381,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4752 :6478 :8852 :9026, plus a comment mention at :4576; `14.1c-CITE` below
+#     CITE-CHECK: :4787 :6513 :8887 :9061, plus a comment mention at :4576; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4619) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4752) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4787) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8852). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8887). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -7352,7 +7413,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8852` / `:9026` — CITE-CHECK: :8852 :9026 — re-derived by the
+#     this head the predicates are `:8887` / `:9061` — CITE-CHECK: :8887 :9061 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -8261,7 +8322,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6478 :8852 :9026 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6513 :8887 :9061 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then

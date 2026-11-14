@@ -1177,6 +1177,20 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 #             `... ; the outstanding item is with the vendor` (no count -> no belt can anchor on it);
 #           * and a remainder whose predicate is outside the closed grammatical classes this arm reads
 #             (a count, a totality, an arithmetic remainder, an exception of a totality, a hand-off).
+#           * AND (SEVENTH review, P2 — MEASURED, DECLARED rather than fixed) an exception whose
+#             excepted count is elaborated into a NON-blocker: `… were fixed except 1, a typo`, `… except
+#             1 in a comment typo` and `… except 1 which was a doc nit` are REFUSED, while the same
+#             content as `… except 1 typo` records. No syntactic rule separates "1 in the retry path" (a
+#             location of a live blocker) from "1 in a comment typo" (a non-blocker) — they are the same
+#             shape — so `_OC_EXCEPT_SCOPE` reads SCOPE, and an elaboration that looks like scope refuses.
+#             THIS IS THE FILE'S OWN STATED POLARITY, not an oversight: "a false PASS merges unreviewed
+#             code; a false refusal costs a reworded re-run." Stated here so the next reader does not
+#             "fix" it back into a fail-open.
+#         ⛔ AND THE SHAPE BELT THAT CLOSED THE OPEN VERB SET (`_OC_COPULA`) IS WHY THIS LIST CAN STOP
+#         GROWING: six rounds added vocabulary and each round found more verbs. A surviving count
+#         governed by a copula is now a remainder unless its own run resolves, so `not merged`,
+#         `omitted`, `routed`, `tracked separately`, `spun out` and everything like them are read
+#         WITHOUT being listed. Adding a synonym remains forbidden; adding a SHAPE is the sanctioned move.
 #         That is the declared cost of reading SHAPE rather than enumerating persistence vocabulary,
 #         which is the mistake every earlier round made one word later. Adding a SYNONYM stays forbidden;
 #         adding a closed grammatical PREDICATE (as `_OC_EXCEPT` and `_OC_HANDOFF` now are) is the
@@ -1343,7 +1357,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # (`[^.;:]`, which no connective can cross), so the bound is removed rather than raised. Polarity
   # decides the trade: a false PASS merges unreviewed code, a false refusal costs a reworded re-run.
   local _OC_EXCEPT_SCOPE="($|[[:space:]]*[.,;:)]|[[:space:]]+(in|on|at|to|from|with|for|of|which|that|whose|is|was|are|were|has|have|remains?|remained|open|still|left|pending|unresolved|deferred|outstanding|carried|waived|known|partial|skipped|re-?opened))"
-  local _OC_EXCEPT="(all|both|every)[^.;:]*((excepting|except[[:space:]]+for|except|excluding|barring|(^|[^[:alpha:]])bar|other[[:space:]]+than|save([[:space:]]+for)?|apart[[:space:]]+from|aside[[:space:]]+from|but[[:space:]]+for|short[[:space:]]+of|(^|[^[:alpha:]])less([[:space:]]+than)?|with[[:space:]]+the[[:space:]]+exception[[:space:]]+of|minus)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|the[[:space:]]+)?${_OC_CNT}${_OC_EXCEPT_SCOPE}|${_OC_CNT}[[:space:]]+exception)"
+  local _OC_EXCEPT="(all|both|every)[^.;:]*((excepting|except[[:space:]]+for|except|excluding|barring|(^|[^[:alpha:]])bar|other[[:space:]]+than|save([[:space:]]+for)?|apart[[:space:]]+from|aside[[:space:]]+from|but[[:space:]]+for|short[[:space:]]+of|(^|[^[:alpha:]])less([[:space:]]+than)?|saving|(^|[^[:alpha:]])aside([[:space:]]+from)?|with[[:space:]]+the[[:space:]]+exception[[:space:]]+of|minus)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|the[[:space:]]+)?${_OC_CNT}${_OC_EXCEPT_SCOPE}|${_OC_CNT}[[:space:]]+(exception|aside))"
   # ⛔ A COUNT HANDED ONWARD IS A REMAINDER, NOT A RESOLUTION (agent-infra#3902 review, P1 — MEASURED
   # fail-open). The surviving count is the SUBJECT of a hand-off predicate — it needs a follow-up, its
   # own issue, another PR — which says the finding was NOT closed. It reached no belt: `needs` is not a
@@ -1369,6 +1383,21 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
   # hand-off verbs, and the destinations a hand-off names. Still COUNT-ANCHORED (it is concatenated
   # after `_OC_COUNT`), so `the docs were handed to the vendor` (no count) stays admitted (13n91).
   local _OC_HANDOFF="[[:space:]]+(${_OC_TOK}[[:space:]]+){0,3}(((needs?|requires?|awaits?)[[:space:]]+(a[[:space:]]+|an[[:space:]]+|as[[:space:]]+an?[[:space:]]+|its[[:space:]]+own[[:space:]]+|into[[:space:]]+)?(follow[-[:space:]]?up|separate|another|its[[:space:]]+own|new[[:space:]]+(issue|pr|ticket))|(was|were|is|are|has[[:space:]]+been|have[[:space:]]+been|being)[[:space:]]+(handed([[:space:]]+off)?|passed([[:space:]]+on)?|moved|escalated|deferred|split[[:space:]]+out)[[:space:]]+(to|into|onto)[[:space:]]+(#?[0-9]+|a[[:space:]]+|an[[:space:]]+|another|its[[:space:]]+own|separate)|(goes|went|lands?)[[:space:]]+(to|into)[[:space:]]+(#?[0-9]+|a[[:space:]]+|an[[:space:]]+|another|separate)|(will[[:space:]]+be|is|becomes?)[[:space:]]+(its[[:space:]]+own|a[[:space:]]+separate|another)[[:space:]]+(issue|pr|ticket|follow[-[:space:]]?up)))"
+  # ⛔ ANY SURVIVING COUNT THAT IS THE SUBJECT OF A COPULA IS A REMAINDER UNLESS IT RESOLVES
+  # (agent-infra#3902 review, P1 — MEASURED, and the answer to "adding words cannot close this class").
+  # Every round so far closed re-spellings by ADDING vocabulary, and every round found more: at
+  # 35c7f03da `reverted`/`rolled back` were refused while `1 was not merged`, `2 were omitted`,
+  # `1 item is routed to another PR`, `1 finding will be tracked separately` and `2 items were spun
+  # out into #1234` all ADMITTED. A list cannot close an open set of verbs, so this BELT READS SHAPE:
+  # after the DECLARED count is masked out, a surviving count that is the SUBJECT of a copula
+  # (`1 was …`, `1 item is …`, `2 items were …`, `1 will be …`, `1 got …`) is a remainder UNLESS the
+  # same run carries a RESOLUTION verb. The only words this needs are the copulas and the five
+  # resolution verbs the arm already owns — both closed classes — so a new remainder verb needs no
+  # new vocabulary: it is simply "a copula whose verb is not a resolution".
+  # ⛔ THE CONTROL THAT PINS THE OTHER DIRECTION IS 13n102: `3 blocking findings were fixed; 2 flaky
+  # tests were fixed` carries a copula AND a resolution verb, so it must (and does) still record.
+  local _OC_COPULA="${_OC_COUNT}([^.;:]{0,40})(were|was|is|are|has[[:space:]]+been|have[[:space:]]+been|being|will[[:space:]]+be|got)[[:space:]]"
+  local _OC_ANYRESOLVE="${_OC_COUNT}([^.;:]{0,40})(fixed|resolved|closed|addressed|re-verified)"
   local _OC_SECOND_COUNT="${_OC_COUNT}(${_OC_GOVERNS}|${_OC_RESOLVES}|${_OC_STILL}|${_OC_HANDOFF})|${_OC_SELLED}|${_OC_EXCEPT}"
   # ⛔ ESCAPE (a) READS A NEGATOR WITH SCOPE, not only a negator glued to `blocking`
   # (agent-infra#3902 review, F4 — MEASURED over-block). Every form here required the negation to be
@@ -1514,6 +1543,12 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # vetoed the escape it should have accepted. Anchoring the count on a non-alnum boundary and
     # masking the sealed severity + the spelled form fixes both directions.
     if grep -qE "$_OC_SECOND_COUNT" <<<"$_rest"; then
+      OUTCOME_BLOCKING_LINE="$line"
+      return 0
+    fi
+    # ...and the SHAPE belt above (see `_OC_COPULA`): a surviving count governed by a copula that
+    # does not resolve is a remainder, whatever verb it used. This is what closes the open set.
+    if grep -qE "$_OC_COPULA" <<<"$_rest" && ! grep -qE "$_OC_ANYRESOLVE" <<<"$_rest"; then
       OUTCOME_BLOCKING_LINE="$line"
       return 0
     fi
