@@ -1126,15 +1126,36 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 #         nothing left to refuse it. Stated as a residual rather than papered over with another
 #         synonym: this arm reads a declared COUNT, a totality, and an arithmetic remainder.
 #       * A SECOND COUNT — any other count token ANYWHERE on the line (`[1-9][0-9]*` or a spelled
-#         `one|two|...|ten|half|some|most|several|rest`), scanned after masking the declared
-#         `[N] blocking` phrases, the priority tags `(P0..P3)` and `N non-blocking`. THIS is what
+#         `one|two|...|ten|half|some|most|several|rest`), scanned after masking the DECLARED
+#         `[N] blocking` phrase, the priority tags `(P0..P3)` and `N non-blocking`. THIS is what
 #         makes `— 2 were fixed` (declared 3), `— only one was fixed` and `; 1 of them is still
 #         with us` vetoes by ARITHMETIC rather than by vocabulary. Line-wide on purpose: a
 #         remainder must not be able to hide behind a `;`.
+#       * MORE THAN ONE LIVE BLOCKING MENTION — position-independent, and it reads NO digit
+#         (sixth review, F1+F2). The mask above decides which `N blocking` is the DECLARATION by
+#         position, but a totality declaration (`both|all|every` + `blockers|blocking`, or
+#         `the blocking …`) carries no digit at all — so on such a line the first `N blocking` WAS
+#         the remainder, the mask erased it, and `both blocking findings were fixed; 1 blocking item
+#         remains open` minted a signed `clean`. Counting LIVE MENTIONS answers the same question
+#         without reading any digit and without caring where a mention sits: exactly ONE blocking
+#         mention may stand and it must still be the total subject of (b), so a second one is a
+#         remainder whether it precedes the declaration, follows it, or crosses a `;`. A NEGATED or
+#         ZEROED mention is not a live one (`non-blocking`, `no blocking`, `none|neither|nothing`,
+#         `0|zero blocking`) — WITHOUT that guard `1 blocking finding was fixed; 0 blocking findings
+#         remain` would be refused, a false block on an honest clean line (13n45/13n46).
+#       * The persistence BELT is negation-guarded for the same reason: `No blocking findings remain
+#         open` is the most natural closure sentence there is, and the belt's `blocking … remain`
+#         shape read it as a remainder until the guard was added.
+#       ⛔ THE RESIDUAL, stated narrowly: an unlisted, NON-NEGATED persistence phrase with NO blocking
+#         mention of its own — `... were fixed except the socket leak`, `... the socket leak was left`
+#         — reaches no arm at all and ESCAPES, because once (b) has matched nothing is left to refuse
+#         it. That is the declared cost of reading a COUNT / a totality / an arithmetic remainder
+#         rather than enumerating persistence vocabulary, which is the mistake every earlier round
+#         made one word later. It is not a licence to add a synonym list.
 # What the arm deliberately does NOT judge is whether a declared blocker WAS later fixed: it reads
 # only shape — a declared count, a totality, an arithmetic remainder — never substance.
 outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line names blocking findings
-  local decoded line live_count _clause _rest
+  local decoded line live_count _clause _rest _live
   # A negated or in-progress resolution is not a resolution.
   local _OC_NOT_RESOLVED='(^|[^[:alpha:]])(none|nothing|neither|not|never)[[:space:]]+[^.;:]{0,30}(fixed|resolved|closed|addressed|re-verified)([^[:alpha:]-]|$)'
   local _OC_IN_PROGRESS='(were|was|are|is|have[[:space:]]+been)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(being|partially|partly|pending|in[[:space:]]+progress)[[:space:]]+([[:alpha:]-]+[[:space:]]+){0,2}(fixed|resolved|closed|addressed|re-verified)'
@@ -1175,12 +1196,18 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     fi
     # Everything below reads a LOWERCASED copy; the clause boundary is the first `;`.
     _clause="$(printf '%s' "${line%%;*}" | tr '[:upper:]' '[:lower:]')"
+    # A NEGATED block mention is not a blocker for ANY arm below — the persistence BELT included
+    # (agent-infra#2661 sixth review, F2's negation guard). `No blocking findings remain open` is the
+    # most natural way an honest clean line states closure, and the belt's `blocking … remain` shape
+    # read it as a remainder: a FALSE BLOCK, MEASURED at 54cdbcb40 (this row reds without the guard).
+    # Same negation class as 13n28/13n45/13n46, applied here rather than enumerated once more.
+    _clause="$(printf '%s' "$_clause" | sed -E 's/(^|[^[:alpha:]])(no|non|zero|none|neither|nothing)[[:space:]_-]*block(ing|ers?)/ NEGBLK /g; s/(^|[^0-9])0[[:space:]_-]*block(ing|ers?)/ NEGBLK /g')"
     # (c) NOTHING LEFT OVER — a negated/in-progress resolution, or a persistence qualifier.
     if grep -qE "$_OC_NOT_RESOLVED|$_OC_IN_PROGRESS|$_OC_PERSIST" <<<"$_clause"; then
       OUTCOME_BLOCKING_LINE="$line"
       return 0
     fi
-    # (c) a SECOND count, with the declared counts / priority tags / negated mentions masked out.
+    # (c) a SECOND COUNT, with the declared counts / priority tags / negated mentions masked out.
     # ⛔ MASK ONLY THE **FIRST** `N blocking` — the DECLARED count. Masking every one erased the
     # operand the arithmetic exists to compare against, so `... were fixed; 1 blocking finding
     # remains open` left no digit on the line and escaped (agent-infra#2661 fifth review, F1 — a
@@ -1190,6 +1217,29 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     _rest="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' \
       | sed -E 's/[1-9][0-9]*[[:space:]_-]*non-block(ing|ers?)/ BLKDECL /g; s/[1-9][0-9]*[[:space:]_-]*block(ing|ers?)/ BLKDECL /; s/\(p[0-3]\)/ PTAG /g')"
     if grep -qE "$_OC_SECOND_COUNT" <<<"$_rest"; then
+      OUTCOME_BLOCKING_LINE="$line"
+      return 0
+    fi
+    # (c) MORE THAN ONE LIVE BLOCKING MENTION — POSITION-INDEPENDENT (agent-infra#2661 sixth review,
+    # F1+F2). The mask above decides the DECLARATION's role by POSITION ("the first `N blocking`"),
+    # but a totality declaration -- `both|all|every` + `blockers|blocking`, or `the blocking …` --
+    # carries no DIGIT at all. On such a line the first `N blocking` IS the remainder, so the mask
+    # erased the remainder instead of the declaration and `2` never had to be written for the line
+    # to escape: MEASURED admitted at 54cdbcb40 -- `both blocking findings were fixed; 1 blocking
+    # item remains open`, `all blocking findings were fixed; 1 blocking item is still open`, and
+    # `2 blocking (P1) findings were fixed; the remaining blocking issue is with us`. Counting LIVE
+    # MENTIONS answers the same question without reading any digit and without caring where the
+    # mention sits: exactly ONE blocking mention may stand, and it must still be the total subject
+    # of (b) below. A second one is a remainder wherever it appears -- before the declaration, after
+    # it, in the same `;`-clause or a later one -- which is also what makes the reverse-order
+    # persistence phrase (`the remaining blocking issue`) reachable.
+    # ⛔ A NEGATED or ZEROED mention is not a live one (13n28): `non-blocking`, `no blocking`,
+    # `none blocking`, `neither …`, `zero blocking`, `0 blocking`. Without this the rule would
+    # refuse `1 blocking finding was fixed; 0 blocking findings remain`, an honest clean line.
+    _live="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' \
+      | sed -E 's/(^|[^[:alpha:]])(no|non|zero|none|neither|nothing)[[:space:]_-]*block(ing|ers?)/ NEGBLK /g; s/(^|[^0-9])0[[:space:]_-]*block(ing|ers?)/ NEGBLK /g' \
+      | grep -oE '(^|[^[:alpha:]])block(ing|ers?)' | wc -l | tr -d ' ')"
+    if [ "${_live:-0}" -gt 1 ]; then
       OUTCOME_BLOCKING_LINE="$line"
       return 0
     fi
