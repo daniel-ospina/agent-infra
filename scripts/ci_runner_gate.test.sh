@@ -719,8 +719,14 @@ echo "── #3995: the gate SHIPS the measured head-scan bound (25), not the fa
 assert_eq "$QUEUE_HEAD_SCAN_SHIPPED" "25" \
   "the gate ships a head-scan bound above the measured ghost population (14 on tortoise 2026-11-12, agent-infra#3995) — a REVERSAL to 5 must redden THIS line"
 # ⛔ AND THE PAGE SIZE IS PINNED LITERALLY FOR THE SAME REASON (agent-infra#3995 review cycle 8, F2).
-# `QUEUE_PAGE_SHIPPED` above is DERIVED from the gate, so every arm that depends on it FOLLOWS a mutant
-# gate and none of them can say WHY it turned red. MEASURED (the review derived this and got the count
+# `QUEUE_PAGE_SHIPPED` above is DERIVED from the SHIPPED "$GATE" — deliberately NOT from
+# `GATE_UNDER_TEST`, exactly as the bound's derivation records above, so that a mutant which merely
+# changes the constant cannot quietly re-point the arms' own fixtures at its value. The consequence is
+# that under `GATE_UNDER_TEST` a `QUEUE_PAGE` mutant does NOT reach this line: measured (cycle 9),
+# `GATE_UNDER_TEST=<gate with QUEUE_PAGE=50>` is 13 failures / 591 passed with this pin GREEN, the arms
+# reding incidentally against a 100-row fixture. What the pin protects is the IN-PLACE reversal — the
+# route that actually ships — where the derivation and the file move together:
+# MEASURED (the review derived this and got the count
 # wrong, so here is the run): with `s/^QUEUE_PAGE=100/QUEUE_PAGE=50/` in the shipped `ci_runner_gate.sh`
 # the suite is NOT green — 13 rows red — but every one of them reds INCIDENTALLY: a 60-deep serving
 # queue becomes "deeper than the read page" and refuses, so the idle-capacity and deep-queue arms fail
