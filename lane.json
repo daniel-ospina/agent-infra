@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-agent-infra-3909-1794656892-p3122821-852e8b68",
+  "_sha": "88e72ef2ae5f94e14247d61a1da54c10b55d9b8e",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-agent-infra-3909.log"
+    },
+    {
+      "kind": "branch",
+      "value": "cascade-ladder"
+    },
+    {
+      "kind": "sha",
+      "value": "f0dc2efdb8dc5ecca1be45e39882baa6c9dfbc91"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/fix-3909"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7231,
+  "ended_at": 1794664123,
+  "exit_code": 143,
+  "heartbeat_at": 1794664123,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-agent-infra-3909-1794656892-p3122821-852e8b68",
+  "lease_until": 1794671923,
+  "pid": 3122821,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794656892,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-agent-infra-3909",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-3909"
+}
