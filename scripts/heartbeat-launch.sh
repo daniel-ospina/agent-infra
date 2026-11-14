@@ -51,11 +51,12 @@
 # macOS / LINUX
 #   The cmux gate exists only where the cmux desktop app does: on a Linux cell there is no
 #   `cmuxOnly` socket and no launchd, so the same loop is LEGITIMATE there. ⛔ It is not DELIVERED
-#   there, though, and this header used to say it was: `scripts/fleet-schedule.py` (#1864) schedules
-#   the same `templates/launchd/*.plist` declarations, and no template may name this loop
-#   (`LAUNCHD-INCOMPATIBLE`), so nothing on a cell starts it — it is hand-started on both platforms,
-#   and delivering it on a cell is #1864's remaining half. Stated here because the sentence an
-#   operator reads in `--help` is the one they act on; the full table is in
+#   there, though, and this header used to say it was: `scripts/fleet-schedule.py` (#1864, CLOSED)
+#   schedules the same `templates/launchd/*.plist` declarations, and no template may name this loop
+#   (`LAUNCHD-INCOMPATIBLE`), so nothing on a cell starts it — it is hand-started on both platforms.
+#   Delivering it on a cell is **#4075**, which owns that divergence; this header said "#1864's
+#   remaining half" while #1864 was closed, i.e. it named an owner that could not act. Stated here
+#   because the sentence an operator reads in `--help` is the one they act on; the full table is in
 #   docs/ops/heartbeat-launch-path.md.
 #
 # EXIT CODES: 0 ok (or an explicit --help) · 1 refused/drift · 2 usage ERROR or cannot-answer

@@ -1770,7 +1770,11 @@ status_job() {
             ;;
         *)
             rm -f "$_tmp"
-            echo "  ⛔ UNKNOWN   $label: the rendered plist could not be READ (rc=$_cmux_rc), so whether it names a cmux-gated script cannot be answered — an unreadable unit is never a clean one"
+            if [ "$_cmux_rc" -eq 4 ]; then
+                echo "  ⛔ UNKNOWN   $label: the cmux launch-path GATE could not be evaluated (no LAUNCHD-INCOMPATIBLE manifest, or one holding no entry), so whether this unit is blind under launchd cannot be answered — a gate that cannot open is not a clean unit"
+            else
+                echo "  ⛔ UNKNOWN   $label: the rendered plist could not be READ (rc=$_cmux_rc), so whether it names a cmux-gated script cannot be answered — an unreadable unit is never a clean one"
+            fi
             return 2
             ;;
     esac
@@ -1915,9 +1919,20 @@ unmanaged_plists() {
     # The third clause keeps the fixture carve-out: a TEMPLATES_DIR override that ships no manifest of
     # its own falls back to the checkout's copy, and only a box with NO declarations anywhere (no
     # manifest AND no repo template tree) is allowed an empty foreign list.
-    _rl="$(retired_labels || true)"
+    # ⛔ AN EMPTY *FOREIGN* LIST IS STILL A REFUSAL, AND AN EMPTY *RETIRED* LIST IS NOT (#3826 review P2,
+    # round 18). Round 17 refused on both emptinesses and that was wrong in one direction:
+    # `RETIRED` is a RECORD OF REMOVALS, so "holds no entry" is its legitimate terminal state — the
+    # moment every retired job is gone. MEASURED at `f17785035` on a clean box with one byte-identical
+    # in-sync job and `RETIRED` carrying comments only: `in sync` printed for the job, THEN
+    # `⛔ UNKNOWN — the DECLARED SET … could NOT be read` and rc **2** — a permanent red, with a
+    # diagnosis that is false (the set WAS read) and a remedy (`re-run with a readable TEMPLATES_DIR`)
+    # that cannot clear it. That is the anti-pattern this file removes everywhere else.
+    # `OWNED-BY-OTHER-INSTALLERS` is the opposite: an empty one re-classifies live jobs another
+    # installer owns as strays and prints the command that DELETES them, so emptiness there is refused.
+    # The RETIRED *presence* check above is unchanged (a tree that ships templates but no readable
+    # RETIRED is mutilated, not clean); only the entry-count refusal was narrowed.
     _fl="$(foreign_labels || true)"
-    if [ -z "$_rl" ] || { [ -z "$_fl" ] && { [ -n "$(foreign_manifest)" ] || [ -d "$INFRA_ROOT/templates/launchd" ]; }; }; then
+    if [ -z "$_fl" ] && { [ -n "$(foreign_manifest)" ] || [ -d "$INFRA_ROOT/templates/launchd" ]; }; then
         return 3
     fi
     for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
@@ -2151,10 +2166,11 @@ is_cmux_gated() {
     return 1
 }
 
-# plist_cmux_gated_target <plist> → prints the FIRST cmux-gated program argument; 0 when there is one,
-# 1 when the plist was READ and names none, 3 when it could NOT be read. The three answers are distinct
-# on purpose — collapsing "could not read" into "not gated" is exactly how a pipe handed to plistlib
-# certified a blind job `in sync` (#3826 review P1, round 17).
+# plist_cmux_gated_target <plist> → prints the FIRST cmux-gated program argument;
+#   0 when there is one · 1 when the plist was READ and names none · 3 when it could NOT be read ·
+#   4 when the GATE could not be evaluated (no manifest, or an empty one). The answers are distinct on
+#   purpose — collapsing "could not read" or "could not evaluate" into "not gated" is exactly how a pipe
+#   handed to plistlib, and then a missing manifest, each certified a blind job `in sync` (#3826 P1).
 #
 # ⛔ THE ONE PREDICATE `install` AND `--status` BOTH CONSULT (#3826 review P2). They used to disagree
 # about the same file by construction: `verify_targets` answers `1` for BOTH "a target is missing" and
@@ -2170,8 +2186,24 @@ plist_cmux_gated_target() {
     # `return 1`, so a reader that failed — an unreadable plist, a temp file it could not create, or
     # (the measured regression) a PROCESS SUBSTITUTION, which plistlib cannot read because it needs a
     # seekable stream — was indistinguishable from "read it, nothing gated", and `status_job` graded
-    # the CONTENT of a blind job and certified it `in sync` rc 0. 0 = gated (target printed), 1 = read
-    # and not gated, 3 = could not read — the same three codes `plist_reader_py` already uses.
+    # the CONTENT of a blind job and certified it `in sync` rc 0. Two codes, not one:
+    #   0 = GATED (the target is printed) · 1 = READ, and it names no gated script
+    #   3 = the rendered plist could not be READ (the same code `plist_reader_py` uses)
+    #   4 = the GATE could not be EVALUATED — no LAUNCHD-INCOMPATIBLE manifest, or an EMPTY one
+    # ⛔ AND 4 IS A SEPARATE ANSWER FROM 1 (#3826 review P1, round 18). `is_cmux_gated` answers "not
+    # gated" when the manifest is missing or holds no entry (`[ -n "$gated" ] || return 1`), and on the
+    # INSTALL path that is safe because `cmux_gate_required` refuses the whole run first — but the
+    # `--status` block ENDS before that call, so `--status` inherited the answer without the gate.
+    # MEASURED at `f17785035` on a scratch INFRA_ROOT whose templates/launchd carried a GATED template
+    # and NO manifest (and again with a comments-only one), byte-identical install:
+    #   --status → `com.eldato.tccprobe: installed=loaded version=v0.0.1 (in sync)`   STATUS_RC=0
+    #   install  → `ERROR: the cmux launch-path gate cannot be evaluated`               INSTALL_RC=1
+    # — the two verbs disagreeing about one file, which is the invariant this function exists to keep.
+    # With the real manifest present the same fixture reds `⛔ CMUX-GATED` rc 1, so 4 is the missing arm,
+    # not a new behaviour. "I could not evaluate the gate" is never "this job is clean".
+    if [ -z "$(cmux_gated_scripts || true)" ]; then
+        return 4
+    fi
     args_out="$(plist_program_args "$1")" || _rc=$?
     [ "$_rc" -eq 0 ] || return 3
     while IFS=$'\t' read -r kind arg; do
@@ -2394,9 +2426,11 @@ if [ "${1:-}" = "--status" ]; then
             # again with it chmod 000): `com.eldato.ai-drainer` was reported UNMANAGED with the delete
             # command, on a box where its template was present and merely unreadable.
             echo "  ⛔ UNKNOWN — the DECLARED SET (or its exemption lists: RETIRED," >&2
-            echo "     OWNED-BY-OTHER-INSTALLERS) under $TEMPLATES_DIR could NOT be read, so every" >&2
-            echo "     installed job would be classified against an EMPTY set. Nothing was classified:" >&2
-            echo "     this is an unanswered question, not a box full of strays. Re-run with a readable" >&2
+            echo "     OWNED-BY-OTHER-INSTALLERS) under $TEMPLATES_DIR could NOT be evaluated: it could" >&2
+            echo "     not be read, or a list that must name entries holds NONE — a truncated or mangled" >&2
+            echo "     manifest is not a blank exemption list. Every installed job would then be" >&2
+            echo "     classified against an empty set. Nothing was classified: this is an unanswered" >&2
+            echo "     question, not a box full of strays. Restore the manifest(s) under" >&2
             echo "     $TEMPLATES_DIR before trusting any green — or any deletion it advises." >&2
         else
             echo "  ⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated (rc $unr_rc)." >&2
@@ -2430,7 +2464,13 @@ if [ "${1:-}" = "--status" ]; then
             [ -n "$_lbl" ] || continue
             echo "          launchctl bootout gui/$(id -u) \"$AGENTS_DIR/$_lbl.plist\" && rm -f \"$AGENTS_DIR/$_lbl.plist\"" >&2
         done <<<"$unmanaged"
-        status_rc=1
+        # ⛔ THE HIGHER ANSWER WINS, HERE TOO (#3826 review P3, round 18). This arm set 1 unconditionally,
+        # so a per-job `2 (UNKNOWN)` from the temp-file/read arms above was DOWNGRADED to 1 ("this box
+        # is wrong") — indistinguishable from a real DRIFT, and contradicting the invariant stated one
+        # loop up ("A 2 (UNKNOWN) is never downgraded to 1: the higher answer wins"). The neighbouring
+        # RETIRED-INSTALLED arm already does it this way. Fail-closed either way; the difference is
+        # what the exit status claims.
+        [ "$status_rc" -eq 0 ] && status_rc=1
     fi
     # ── RETIRED, STILL INSTALLED (round 8) — its own row class, its own exit contribution ────────
     # One line per job, carrying the verdict word, for the same reason `UNMANAGED` does: a consumer

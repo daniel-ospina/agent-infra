@@ -1058,6 +1058,41 @@ grep -q '0 launchd job(s)' <<<"$out" \
 grep -q 'named NO job' <<<"$out" \
   && ok "…it says the delegate named no job, so the operator knows nothing was measured" \
   || bad "the verdict did not explain that nothing was measured: $out"
+
+# ── 10b. A SET-LEVEL `⛔ UNKNOWN` IS NOT A JOB (#3826 review P3, round 18) ──────────────────
+# ⛔ TWO OF THE DELEGATE'S FAILING ROWS DESCRIBE THE WHOLE SET, not one unit: `⛔ UNKNOWN — the DECLARED
+# SET … could not be evaluated` and `⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated`. Both
+# carry the `⛔ UNKNOWN` marker, and this scan counted them as one launchd JOB each. MEASURED at this
+# head with an unreadable TEMPLATES_DIR (delegate rc=2, ZERO jobs classified):
+#   `SCHEDULE NOT VERIFIED — 1 launchd job(s) not installed/loaded/in sync/declared above`
+# — a count of jobs over a run that classified none, the same lie rounds 5/8 fixed in the other
+# direction. The set-level rows are told apart by the marker's ` — ` suffix; no per-job row uses it
+# (those are `⛔ UNKNOWN   <label>: …`). Excluding it is not a loosening: the delegate's non-zero exit is
+# the second half of the gate, so the verdict still FAILS — through the arm above, which is the honest
+# sentence for it. Red under the mutant that counts set-level rows as jobs.
+cp "$DARWIN_ROOT/scripts/install-launchd.sh" "$T/delegate.bak"
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+printf '%s\n' "  com.eldato.tccprobe: installed=loaded version=v0.0.1 (in sync)"
+printf '%s\n' "  ⛔ UNKNOWN — the DECLARED SET (or its exemption lists: RETIRED," \
+              "     OWNED-BY-OTHER-INSTALLERS) under /tmp/x could NOT be evaluated" >&2
+exit 2
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+[ "$rc" -eq 1 ] && ok "10b. a SET-level UNKNOWN row still FAILS the verdict (through the delegate's rc)" \
+  || bad "a set-level UNKNOWN was certified (rc=$rc): $out"
+grep -q '1 launchd job(s)' <<<"$out" \
+  && bad "a SET-level row was counted as one launchd JOB — zero jobs were classified: $out" \
+  || ok "10b. …and it is NOT counted as a launchd job (no '1 launchd job(s)' over zero classified jobs)"
+grep -q 'SET-LEVEL failure' <<<"$out" \
+  && ok "10b. …and the verdict says the SET-LEVEL row is what failed, which is what happened" \
+  || bad "10b. the verdict did not explain that the set-level row failed: $out"
+grep -qE '[0-9]+ launchd job[(]s[)]' <<<"$out" \
+  && bad "10b. the verdict claimed a job count over zero classified jobs: $out" \
+  || ok "10b. …and claims no job count at all"
+cp "$T/delegate.bak" "$DARWIN_ROOT/scripts/install-launchd.sh"; chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
 grep -q '^--status$' "$DELEGATE_RECORD" && ok "--verify asks install-launchd.sh --status (delegated, not reimplemented)" \
   || bad "--verify did not delegate --status: $(cat "$DELEGATE_RECORD" 2>/dev/null)"
 out="$(darwin_run --status)"; rc=$?
@@ -1192,9 +1227,25 @@ exit 2
 SH
 chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
 out="$(darwin_run --verify)"; rc=$?
-grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
-  && ok "an UNKNOWN-only failure is COUNTED too (the enumeration answer is a failure, not a caveat)" \
-  || bad "an UNKNOWN-only failure printed a 0-job verdict: $out"
+# ⛔ THIS ROW SAID `SCHEDULE NOT VERIFIED — 1 launchd job(s)` AND THAT COUNT WAS FALSE (#3826 review P3,
+# round 18). The delegate above emits ONE set-level row (`⛔ UNKNOWN — …could NOT be enumerated`) and
+# classifies ZERO jobs, so the verdict named a job count over a run that had none — the same family as
+# the `0 launchd job(s)` lie round 9 closed, one order of magnitude smaller. MEASURED at `f17785035`
+# with an unreadable TEMPLATES_DIR: delegate rc=2, zero jobs classified,
+# `SCHEDULE NOT VERIFIED — 1 launchd job(s) …`.
+# The INTENT of the old row is kept, and it is the part that mattered: a set-level UNKNOWN must FAIL and
+# must never read as "nothing failed" (that was round 9's complaint). It now says so in its own
+# sentence, WITH NO COUNT — so this row asserts the intent instead of the false arithmetic. Reversing a
+# recorded assertion is deliberate here and is argued in the PR (#3826, round 18) rather than silently.
+grep -q 'SCHEDULE NOT VERIFIED — the delegate reported a SET-LEVEL failure' <<<"$out" \
+  && ok "an UNKNOWN-only failure is a set-level FAILURE with its own sentence (not a caveat)" \
+  || bad "an UNKNOWN-only failure did not produce the set-level sentence: $out"
+[ "$rc" -eq 1 ] && ok "…and it exits 1 (the enumeration answer is a failure, never a green)" \
+  || bad "the UNKNOWN-only failure returned $rc, not 1"
+grep -qE '[0-9]+ launchd job[(]s[)]' <<<"$out" \
+  && bad "the set-level verdict claims a launchd JOB COUNT over zero classified jobs: $out" \
+  || ok "…and it claims NO job count, because zero jobs were classified"
+
 # ⛔ AN INSTALLED-BUT-SKIPPED JOB IS A CAVEAT, NOT A MATCH (#1867 review, round 11). `--status` reports
 # a job installed here whose template the installer would now SKIP (a placeholder stopped resolving) as
 # `⚠️ INSTALLED-SKIPPED`, deliberately rc 0: an install cannot clear it while the environment stays as

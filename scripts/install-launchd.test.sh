@@ -3020,6 +3020,67 @@ assert_contains "$OUT" "cannot create a temp file" "§17c ... and the reason, so
 assert_not_contains "$OUT" "in sync" "§17c ... and NEVER 'in sync': a unit that cannot be graded is not certified"
 assert_not_contains "$OUT" "installed=loaded" "§17c ... and no installed=loaded content verdict at all"
 
+# ── 17d. A GATE THAT CANNOT BE EVALUATED IS NOT A CLEAN UNIT (#3826 review P1, round 18) ──────────
+# ⛔ THE `--status` BLOCK ENDS BEFORE `cmux_gate_required` IS CALLED. `is_cmux_gated` answers "not
+# gated" when `templates/launchd/LAUNCHD-INCOMPATIBLE` is missing or holds no entry, and on the INSTALL
+# path that is safe because the gate refusal runs first — but `--status` inherited the answer without
+# the gate, so the two verbs disagreed about one file again. MEASURED at `f17785035` on a scratch
+# INFRA_ROOT carrying a GATED template and no manifest (and again with a comments-only one), installed
+# byte-identically:
+#   --status → `com.eldato.tccprobe: installed=loaded version=v0.0.1 (in sync)`   STATUS_RC=0
+#   install  → `ERROR: the cmux launch-path gate cannot be evaluated`               INSTALL_RC=1
+# The gate is now its OWN answer (rc 4 from `plist_cmux_gated_target` → an UNKNOWN row), so a gate that
+# cannot open is never read as a clean unit. The third arm is the control the first two need: with the
+# real manifest present this same fixture still reds ⛔ CMUX-GATED, so the arm refuses the unanswerable
+# case rather than every case.
+GATE_ROOT="$T/gate-root"; rm -rf "$GATE_ROOT"
+mkdir -p "$GATE_ROOT/scripts" "$GATE_ROOT/templates/launchd"
+cp "$INSTALLER" "$GATE_ROOT/scripts/install-launchd.sh"
+GATE_HOME="$T/gate-home"; rm -rf "$GATE_HOME"; mkdir -p "$GATE_HOME/Library/LaunchAgents" "$GATE_HOME/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$GATE_HOME/.pi/agent/scripts/probe-ok.sh"; chmod +x "$GATE_HOME/.pi/agent/scripts/probe-ok.sh"
+cat > "$GATE_ROOT/templates/launchd/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key><array><string>/bin/bash</string><string>$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh</string></array>
+</dict>
+</plist>
+PLIST
+# The two manifests the set-level guard requires, so THIS row is the gate's arm and not §18f's.
+printf 'com.eldato.orchestrator-loop\n' > "$GATE_ROOT/templates/launchd/OWNED-BY-OTHER-INSTALLERS"
+printf 'com.eldato.old\n' > "$GATE_ROOT/templates/launchd/RETIRED"
+printf '%s' "$(cat "$GATE_ROOT/templates/launchd/com.eldato.tccprobe.plist")" > "$GATE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+gate_status() {
+    ( export HOME="$GATE_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TEMPLATES_DIR AGENTS_DIR TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$GATE_ROOT/scripts/install-launchd.sh" --status 2>&1 )
+}
+for _gate_label in 'absent' 'empty'; do
+    if [ "$_gate_label" = 'absent' ]; then
+        rm -f "$GATE_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE"
+    else
+        printf '# nothing here is cmux-gated\n' > "$GATE_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE"
+    fi
+    set +e
+    OUT="$(gate_status)"; RC=$?
+    set -e
+    assert_eq "$RC" "2" "§17d a $_gate_label LAUNCHD-INCOMPATIBLE answers 2 UNKNOWN for a gated template"
+    assert_contains "$OUT" "cmux launch-path GATE could not be evaluated" "§17d ... naming the gate that could not be opened ($_gate_label)"
+    assert_not_contains "$OUT" "in sync" "§17d ... and NEVER 'in sync' over a job nobody could classify ($_gate_label)"
+done
+cp "$REPO_TEMPLATES/LAUNCHD-INCOMPATIBLE" "$GATE_ROOT/templates/launchd/"
+set +e
+OUT="$(gate_status)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17d control: the real manifest present → the SAME fixture is refused as CMUX-GATED (rc 1)"
+assert_contains "$OUT" "⛔ CMUX-GATED   com.eldato.tccprobe" "§17d ... so the new arm refuses the unanswerable case, not every case"
+
 
 # ── §18: an installed plist with NO template is UNMANAGED (#1867) ──────────────────────────────────
 # The blind heartbeat was installed, loaded and ticking with no template describing it, so neither the
@@ -3335,6 +3396,57 @@ set +e
 OUT="$(run_stray_status)"; RC=$?
 set -e
 assert_eq "$RC" "0" "§18f control: with a readable manifest and nothing unmanaged, the box is clean again"
+
+# ── 18g. AN EMPTY `RETIRED` LIST IS A TERMINAL STATE, NOT A RED (#3826 review P2, round 18) ────────
+# ⛔ THE INVERSE OF §18f, AND IT BIT. `RETIRED` is a RECORD OF REMOVALS, so "holds no entry" is its
+# legitimate terminal state — the moment every retired job is gone. Round 17 refused on emptiness for
+# BOTH lists, which on a clean box produced: `in sync` for the job, THEN
+# `⛔ UNKNOWN — the DECLARED SET … could NOT be read` and rc **2** — a PERMANENT red with a false
+# diagnosis (the set WAS read) and a remedy (`re-run with a readable TEMPLATES_DIR`) that cannot clear
+# it. MEASURED at `f17785035`. `OWNED-BY-OTHER-INSTALLERS` keeps the refusal (§18f) because an empty one
+# re-classifies live jobs into delete advice; emptiness is only dangerous where entries are owed.
+RETIRED_EMPTY_ROOT="$T/retired-empty"; rm -rf "$RETIRED_EMPTY_ROOT"
+mkdir -p "$RETIRED_EMPTY_ROOT/templates" "$RETIRED_EMPTY_ROOT/home/Library/LaunchAgents" "$RETIRED_EMPTY_ROOT/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$RETIRED_EMPTY_ROOT/home/.pi/agent/scripts/probe-ok.sh"
+chmod +x "$RETIRED_EMPTY_ROOT/home/.pi/agent/scripts/probe-ok.sh"
+cat > "$RETIRED_EMPTY_ROOT/templates/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key><array><string>/bin/bash</string><string>$RETIRED_EMPTY_ROOT/home/.pi/agent/scripts/probe-ok.sh</string></array>
+</dict>
+</plist>
+PLIST
+printf '%s' "$(cat "$RETIRED_EMPTY_ROOT/templates/com.eldato.tccprobe.plist")" > "$RETIRED_EMPTY_ROOT/home/Library/LaunchAgents/com.eldato.tccprobe.plist"
+printf 'com.eldato.orchestrator-loop\n' > "$RETIRED_EMPTY_ROOT/templates/OWNED-BY-OTHER-INSTALLERS"
+cp "$REPO_TEMPLATES/LAUNCHD-INCOMPATIBLE" "$RETIRED_EMPTY_ROOT/templates/"
+# A comments-only RETIRED: the shape a repo has the day after its last retirement is cleared.
+printf '# nothing is retired right now\n' > "$RETIRED_EMPTY_ROOT/templates/RETIRED"
+retired_empty_status() {
+    ( export HOME="$RETIRED_EMPTY_ROOT/home"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$RETIRED_EMPTY_ROOT/templates"
+      export AGENTS_DIR="$RETIRED_EMPTY_ROOT/home/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" --status 2>&1 )
+}
+if [ -f "$RETIRED_EMPTY_ROOT/templates/RETIRED" ] \
+   && [ "$(grep -cvE '^[[:space:]]*(#|$)' "$RETIRED_EMPTY_ROOT/templates/RETIRED")" = "0" ]; then
+    ok "§18g fixture: RETIRED exists and holds no entry (comments only) — the shape the arm must not refuse"
+else
+    bad "§18g fixture: RETIRED still holds an entry, so this arm would be vacuous"
+fi
+set +e
+OUT="$(retired_empty_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18g an EMPTY RETIRED on a clean in-sync box is NOT a permanent red (rc 0)"
+assert_contains "$OUT" "com.eldato.tccprobe: installed=loaded version=v0.0.1 (in sync)" "§18g ... the job is still graded on content"
+assert_not_contains "$OUT" "⛔ UNKNOWN" "§18g ... and no UNKNOWN row claims a set that WAS read could not be read"
 
 # ⛔ AND THE DECLARATION IS DRIFT-GATED, not a second hardcoded list, IN BOTH DIRECTIONS, and
 # against EVERY SPELLING an installer in this repo uses (#1867 review P1/P2, round 4).

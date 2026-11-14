@@ -450,14 +450,18 @@ assert_eq "$RC" "0" "§13b a LIVE loop with a FRESH, non-degenerate read is OK (
 assert_contains "$OUT" "0 degraded" "§13b …and the green line states the counts it read"
 # ⛔ THE VERDICT LINE'S SEPARATOR IS A SPACE ON EVERY PLATFORM (#3826 review P3). The reader emits
 # `<VERDICT>\t<detail>` and the tab was flattened with `sed 's/\t/ /'`, justified in the comment by
-# portability — while BSD/macOS `sed` does not interpret `\t` in a BRE (it matches a literal `t`), so
-# on the only platform this file exists for the substitute neither removed the tab nor left the rest of
-# the line alone. `tr '\t' ' '` is POSIX and both implementations agree about it. Discriminating shape:
-# the pre-fix code leaves the `\t` in the string, so this row reds on macOS and a naive `sed` fix would
-# red here too (it would rewrite every `t`).
+# portability — while BSD/macOS `sed` does not interpret `\t` in a BRE (it matches a literal `t`), so on
+# the only platform this file exists for the substitute neither removed the tab nor left the rest of the
+# line alone. `tr '\t' ' '` is POSIX and both implementations agree about it.
+# ⛔ DECLARED SCOPE: THIS ROW DISCRIMINATES ON BSD ONLY (#3826 review P3, round 18). GNU `sed 4.x` DOES
+# map `\t`, so on the Linux shard CI runs, reverting to `sed 's/\t/ /'` leaves this assertion green —
+# measured: `printf 'a\tb\n' | sed 's/\t/ /' | od -c` → `a   b`, no tab. So the row is a live regression
+# guard on macOS and a contract row here; it does NOT catch the idiom where CI would run it. The
+# mechanism-level gate for that class is `scripts/check-portability-traps.sh`'s table (`sed-in-place-gnu`
+# et al.) — it has no `\t`-in-a-sed-PATTERN rule yet, which is why this is declared rather than claimed.
 case "$OUT" in
-    *$'\t'*) bad "§13b …and its verdict line carries no TAB (a space separator on every platform)" ;;
-    *)        ok "§13b …and its verdict line carries no TAB (a space separator on every platform)" ;;
+    *$'\t'*) bad "§13b …and its verdict line carries no TAB — the guard is BSD-only; see the comment" ;;
+    *)        ok "§13b …and its verdict line carries no TAB — the guard is BSD-only; see the comment" ;;
 esac
 
 # ⛔ A MALFORMED BOUND IS A CONFIGURATION ANSWER, NOT A DRIFT VERDICT (#1867 review P3).

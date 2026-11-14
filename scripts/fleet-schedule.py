@@ -3671,7 +3671,25 @@ def cmd_darwin(mode):
             "⛔ UNKNOWN",
             "⛔ CMUX-GATED",
         )
-        bad = [line for line in text.splitlines() if any(m in line for m in JOB_MARKERS)]
+        # ⛔ A SET-LEVEL ROW IS NOT A JOB (#3826 review P3, round 18). Two of the delegate's failing
+        # rows describe the WHOLE SET rather than one unit — `⛔ UNKNOWN — the DECLARED SET … could not be
+        # evaluated` and `⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated`. Both carry the
+        # `⛔ UNKNOWN` marker, so this scan counted them as one launchd JOB each: MEASURED at this head
+        # with an unreadable TEMPLATES_DIR (delegate rc=2, zero jobs classified),
+        #   `SCHEDULE NOT VERIFIED — 1 launchd job(s) not installed/loaded/in sync/declared above`
+        # — a count of jobs over a run that classified none, the same lie rounds 5/8 fixed in the other
+        # direction. The set-level rows are distinguished by the marker's ` — ` suffix (an em dash after
+        # two spaces), which no per-job row uses: those are `⛔ UNKNOWN   <label>: …`.
+        # Excluding it is the honest answer, not a loosening: the delegate's non-zero exit is the second
+        # half of this gate, so a set-level UNKNOWN still FAILS the verdict — through the arm that says
+        # `the delegate exited N and named NO job`, which is exactly what happened.
+        SET_LEVEL_MARKERS = ("⛔ UNKNOWN —",)
+        set_level = [line for line in text.splitlines() if any(m in line for m in SET_LEVEL_MARKERS)]
+        bad = [
+            line
+            for line in text.splitlines()
+            if any(m in line for m in JOB_MARKERS) and not any(m in line for m in SET_LEVEL_MARKERS)
+        ]
         for line in bad:
             print("  FAIL   %s" % line.strip(), file=sys.stderr)
         # ⛔ AND A DISCLOSURE IS NOT AN "IN SYNC" (#1867 review, round 11). One row class is
@@ -3724,6 +3742,20 @@ def cmd_darwin(mode):
                     "above (UNMANAGED = installed with no template; RETIRED-INSTALLED = retired here but "
                     "still installed, cleared by the next install; UNKNOWN = the installed set could "
                     "not be enumerated)" % len(bad),
+                    file=sys.stderr,
+                )
+            elif set_level:
+                # ⛔ A SET-LEVEL FAILURE GETS ITS OWN SENTENCE, WITH NO JOB COUNT (#3826 review P3,
+                # round 18). The count above is a count of JOBS, and these rows do not name one —
+                # printing `1 launchd job(s)` over a run that classified ZERO jobs is the same lie
+                # rounds 5/8 fixed in the other direction. The sentence still cannot be read as
+                # "nothing failed" (which is what round 9's `0 launchd job(s)` complaint was about):
+                # it says the set itself is what failed.
+                print(
+                    "SCHEDULE NOT VERIFIED — the delegate reported a SET-LEVEL failure (%d row(s), "
+                    "above): it could not read or enumerate the declared set, so NO job was classified "
+                    "and nothing about the launchd job set was measured. Fix that first; no job count "
+                    "would mean anything here." % len(set_level),
                     file=sys.stderr,
                 )
             else:

@@ -140,11 +140,19 @@ certified, and a list it could not **read** never becomes a deletion instruction
   rc **2**, because both the cmux launch-path gate and the TCC target check grade the *rendered
   plist* and neither can run without one. It used to fall through to the content comparison, where a
   byte-identical **blind** job read `installed=loaded … (in sync)` and exited **0**.
-- **An exemption manifest that exists but holds NO entry** (`RETIRED`,
-  `OWNED-BY-OTHER-INSTALLERS`) is read as a mutilated list, not as "nothing is exempt": rc **2**, and
-  no `bootout … && rm -f …` is printed for anything. An empty list would otherwise re-classify every
-  job another installer of this repo owns as `UNMANAGED` and hand the operator the command that
-  **deletes** it — the exact harm `OWNED-BY-OTHER-INSTALLERS` exists to prevent.
+- **An exemption manifest that exists but holds NO entry** (`OWNED-BY-OTHER-INSTALLERS`) is read as a
+  mutilated list, not as "nothing is exempt": rc **2**, and no `bootout … && rm -f …` is printed for
+  anything. An empty list would otherwise re-classify every job another installer of this repo owns as
+  `UNMANAGED` and hand the operator the command that **deletes** it — the exact harm
+  `OWNED-BY-OTHER-INSTALLERS` exists to prevent. (`RETIRED` is the opposite and is **not** refused when
+  empty: it is a record of removals, so "holds no entry" is its legitimate terminal state — refusing it
+  made a clean in-sync box a permanent red.)
+- **A cmux gate that cannot be OPENED** — no `templates/launchd/LAUNCHD-INCOMPATIBLE`, or one holding
+  no entry — answers `⛔ UNKNOWN` rc **2**, naming the gate. `cmux_gate_required` already refused that
+  state on the **install** path, but the `--status` block ends before that call, so the two verbs
+  disagreed about one file: measured on a tree with a gated template and no manifest, **byte-identical**
+  install, `--status` read `installed=loaded … (in sync)` rc **0** while the installer refused the same
+  file. "I could not evaluate the gate" is never "this job is clean".
 
 Two label classes are **declared** and therefore never reported as `UNMANAGED`, because an alarm that
 is red on a healthy box is one operators learn to ignore:
@@ -214,6 +222,16 @@ exit code. A run that fails only on one of
 `SCHEDULE NOT VERIFIED — N launchd job(s) …` with a truthful N instead of `0`, and the delegate's own
 exit code now agrees with those rows (`--status` is non-zero whenever any job row is a failure).
 
+⛔ **And a SET-level `⛔ UNKNOWN` is never counted as a job.** Two of `--status`'s failing rows describe
+the whole set rather than one unit — `⛔ UNKNOWN — the DECLARED SET … could not be evaluated` and
+`⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated` — and both carry the marker, so the scan
+counted each as `1 launchd job(s)` over a run that classified **zero** jobs (measured with an
+unreadable `TEMPLATES_DIR`: delegate rc 2, nothing classified, verdict `1 launchd job(s)`). They are
+told apart by the marker's ` — ` suffix (no per-job row uses it: those are `⛔ UNKNOWN   <label>: …`)
+and the verdict gives them their own sentence with **no job count at all** — *"the delegate reported a
+SET-LEVEL failure … NO job was classified"* — which also keeps the property round 9 added them for: a
+count is never printed where nothing was measured, and a failure never reads as `0`.
+
 ⛔ **One marker is counted for the SENTENCE, not the exit code: `⚠️ INSTALLED-SKIPPED`.** A job that is
 installed here but whose template the installer would now SKIP — a placeholder stopped resolving, e.g.
 `SWARM_ROOT` unset in this shell — is a stale copy that will never be refreshed. It is **not** a
@@ -249,18 +267,19 @@ against it would conclude the heartbeat was running there.
 - On **macOS** the launch path is `scripts/heartbeat-launch.sh start` from a cmux-attributed shell, and
   **nothing schedules it**: a launchd job cannot pass the `cmuxOnly` gate, which is why
   `templates/launchd/LAUNCHD-INCOMPATIBLE` refuses to install any template that would name the loop.
-- On a **cell** nothing starts it either. `scripts/fleet-schedule.py` (#1864) runs the same declared
-  set from a supervised in-session loop, but that set is `templates/launchd/*.plist` — and no
-  template may name the loop — so the heartbeat is not in it. Delivering the loop on a cell is
-  **#1864's remaining half**, not something this document can assert.
+- On a **cell** nothing starts it either. `scripts/fleet-schedule.py` (#1864, **closed**) runs the
+  same declared set from a supervised in-session loop, but that set is `templates/launchd/*.plist` —
+  and no template may name the loop — so the heartbeat is not in it. Delivering the loop on a cell is
+  **#4075**, not something this document can assert: #1864 was closed for the *scheduler's* portability
+  and cannot own a remaining half, and this document previously named it as though it could.
 - `check` is identical on both, which is exactly how you find out: on a cell with no loop it answers
   **DRIFT** (`not running`) where a state dir exists, and **`2 UNKNOWN`** (`nothing has ever run
   here`) where none does — never a comfortable silence, and never a pass.
 
 | | macOS | Linux (cloud cell) |
 |---|---|---|
-| Launcher | `heartbeat-launch.sh start`, once, from a cmux-attributed shell | the same script; **nothing starts it** — no scheduler in this repo delivers the loop (see above, #1864) |
-| Scheduled layer | `install-launchd.sh` (launchd), and deliberately **not** the loop | `scripts/fleet-schedule.py` (#1864) — the **same** plist declarations, which by construction cannot include the loop |
+| Launcher | `heartbeat-launch.sh start`, once, from a cmux-attributed shell | the same script; **nothing starts it** — no scheduler in this repo delivers the loop (see above, #4075) |
+| Scheduled layer | `install-launchd.sh` (launchd), and deliberately **not** the loop | `scripts/fleet-schedule.py` (#1864, closed) — the **same** plist declarations, which by construction cannot include the loop |
 | cmux socket gate | **present** (`cmuxOnly`) → a launchd job is blind, hence `LAUNCHD-INCOMPATIBLE` | **absent** (no cmux desktop app) → a hand-started loop is legitimate here |
 | `check` | identical | identical |
 
@@ -296,7 +315,11 @@ never a second loop.
 ## Related
 
 - **#1864** — the cells' scheduled layer (the *scheduler's* portability; delivered by
-  `fleet-schedule.py`). This issue is the *heartbeat's launch path + install honesty*.
+  `fleet-schedule.py`, and **closed**). This issue is the *heartbeat's launch path + install honesty*.
+- **#4075** — the cell half: a fresh cell still gets **no heartbeat**, because #1864 (closed) can only
+  deliver timers. **#4075 owns the divergence this document states**, so criterion 3 of #1867 is
+  satisfied-by-successor rather than dropped.
+- **#4074** — nothing runs `check`; the wiring of the behaviour probe into an automated surface.
 - **#1914** — `lane-actions` idle classification (`idle` is reachable only through Step 2), the
   stale-binding half of the same blind-fleet problem.
 - **#1862** / **#1863** — the orphan reaper, restored and versioned.
