@@ -6751,10 +6751,31 @@ lane_no_pr_trigger() {
 # and let §1b refuse. The other default would let a producer-side change silently
 # re-open the same fail-open (#2465 review P1) with every arm still green.
 #
+# ⛔ AND "UNPARSEABLE" IS ENFORCED, NOT ASSUMED (round 3, P2). The prose above said an
+# unparseable list answers "can attach"; the code read a PRESENT clause as `measured`
+# whatever it contained, so a shape this helper cannot classify was read as "no
+# attachable trigger" and WIDENED — the fail-open direction, from a list it never
+# actually parsed (`(declared triggers: push workflow_dispatch)` collapsed to one token
+# `pushworkflowdispatch`; `push-to-fork` matched nothing). The shape gate below is what
+# makes the sentence true: the producer emits a `", "`-joined list of `on:` keys
+# (scripts/ci-workflow-pr-evaluable.sh:831), so every member MUST be `[a-z0-9_]+`. Any
+# other shape is treated exactly like an ABSENT one — `unread`, fail closed.
+#
+# ⛔ AND IT MUST NOT LOOK LIKE A MEASUREMENT (round 2, P2). The two grounds for "can
+# attach" are NOT the same claim — one PARSED `push`/`workflow_dispatch` out of the
+# reason, the other could not read the list at all and defaulted fail-closed. So the
+# helper also records WHICH: LANE_RUN_ATTACH_SOURCE is `measured` only when the clause
+# was present, and LANE_RUN_ATTACH_TRIGGERS names what it found (empty on the default).
+# Without that, §0b's message told an absent-clause lane that it "declares a trigger"
+# — a declaration the code never read, which is the one thing this file forbids in a
+# message (`nothing below may claim a MEASUREMENT the code did not take`).
+#
 # The clause is produced by scripts/ci-workflow-pr-evaluable.sh:829-832 and is already
 # present in LANE_APPLICABILITY_REASON, so this costs no extra `gh` call.
 lane_own_run_can_attach() {
-  local reason="${1:-}" triggers="" list=""
+  local reason="${1:-}" triggers="" norm="" list="" found=""
+  LANE_RUN_ATTACH_SOURCE="unread"
+  LANE_RUN_ATTACH_TRIGGERS=""
   case "$reason" in
     *'(declared triggers:'*')'*)
       triggers="${reason##*'(declared triggers:'}"
@@ -6762,11 +6783,25 @@ lane_own_run_can_attach() {
       ;;
     *) return 0 ;;
   esac
-  list=",$(printf '%s' "$triggers" | tr -d '[:space:]'),"
-  case "$list" in
-    *,push,*|*,workflow_dispatch,*) return 0 ;;
+  # ⛔ THE SHAPE GATE (round 3, P2). Normalise ONLY the documented delimiter, then
+  # refuse to classify anything that is not a plain `on:` key. `return 0` here is the
+  # fail-CLOSED answer (keep the filter) and leaves LANE_RUN_ATTACH_SOURCE at `unread`,
+  # so §0b's message says the list was unread instead of naming a trigger it invented.
+  norm="$(printf '%s' "$triggers" | sed -e 's/,[[:space:]]*/,/g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  case "$norm" in
+    ''|*[!a-z0-9_,]*) return 0 ;;
   esac
-  return 1
+  LANE_RUN_ATTACH_SOURCE="measured"
+  list=",$norm,"
+  case "$list" in
+    *,push,*) found="push" ;;
+  esac
+  case "$list" in
+    *,workflow_dispatch,*) found="${found:+$found }workflow_dispatch" ;;
+  esac
+  [ -n "$found" ] || return 1
+  LANE_RUN_ATTACH_TRIGGERS="$found"
+  return 0
 }
 
 # lane_head_run_state <head> — MEASURE whether the watched lane has a run for
@@ -10149,6 +10184,13 @@ main() {
         # decision (via ANY_WORKFLOW) instead of re-deriving it per poll.
         local lane_dead_end=0 lane_structural=0 lane_probe_state="" lane_kept_why=""
         local LANE_HEAD_RUN_STATE="unreadable"
+        # Dynamic scoping: the helper writes these, and they are READ only by the message
+        # below — so an absent/unparseable trigger list can be described as what it is
+        # (a fail-closed DEFAULT) instead of as a declaration that was never read.
+        local LANE_RUN_ATTACH_SOURCE="" LANE_RUN_ATTACH_TRIGGERS=""
+        # …and the MECHANISMS, derived from what was measured. A fixed list would tell a
+        # `workflow_dispatch`-only lane that "a push whose tip is $head" can attach a run
+        # of it, which is false for that lane (round 3, P2) — the same rule as above.
         if lane_no_pr_trigger "$LANE_APPLICABILITY_REASON"; then lane_structural=1; fi
         lane_head_run_state "$head"
         lane_probe_state="$LANE_HEAD_RUN_STATE"
@@ -10275,7 +10317,65 @@ main() {
             *)
               lane_kept_why="the run probe's answer for head $head did not resolve ('$lane_probe_state')" ;;
           esac
-          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: it declares a PR trigger this changed set does not match, and $lane_kept_why. This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears. Pass --any-workflow to compare against every workflow instead."
+          # ⛔ THE CLASS CLAUSE MUST MATCH THE CLASS WE ARE IN (review P2). This branch is
+          # reached by BOTH classes: a `paths-excluded` lane (a real PR trigger that
+          # matched nothing), and — since the `unreadable` narrowing — a STRUCTURAL lane
+          # that declares `push` / `workflow_dispatch`. Telling the second one it "declares
+          # a PR trigger this changed set does not match" contradicts the very reason this
+          # block just consumed (`declares no pull_request / pull_request_target`) and makes
+          # "this lane cannot run" and "this lane did not run" look the same again — which
+          # is the ONE confusion #2465 exists to remove. Derived from `lane_structural`,
+          # never re-read from the reason text.
+          local lane_trigger_clause lane_kept_tail
+          if [ "$lane_structural" -eq 1 ]; then
+            if [ "$LANE_RUN_ATTACH_SOURCE" = measured ] && [ -n "$LANE_RUN_ATTACH_TRIGGERS" ]; then
+              # ⛔ AND THE MECHANISM LIST MUST MATCH THE TRIGGER NAMED (round 3, P2). The clause
+              # quotes exactly what the helper FOUND, so a fixed parenthetical re-introduces the
+              # claim this commit removed one level up: telling a `workflow_dispatch`-only lane
+              # that "a push whose tip is $head" can start it asserts a mechanism its own `on:`
+              # block cannot provide. Derived from the same value, per arm.
+              # ⛔ AND EVERY MECHANISM IT NAMES MUST BE ONE THE TRIGGER IT JUST QUOTED CAN
+              # PROVIDE, under the filter that trigger carries (round 4, P2):
+              #   · a `push` mechanism is only as permissive as that trigger's own
+              #     `branches`/`paths` filter — `on: push: branches: [main]` cannot attach a
+              #     run to a PR head, and the filter is NOT in the reason clause, so the
+              #     qualifier is stated rather than assumed;
+              #   · an UNRECOGNISED value names NO mechanism. `found` is built from a closed
+              #     set today, so that arm exists for the next trigger someone adds — and
+              #     offering both known mechanisms for a trigger this code has not
+              #     classified is precisely the claim-without-a-measurement this clause
+              #     must never make.
+              local lane_attach_how=""
+              case "$LANE_RUN_ATTACH_TRIGGERS" in
+                push) lane_attach_how=" (a push whose tip is $head, subject to that trigger's own 'branches'/'paths' filters, or a rerun of a CANCELLED run)" ;;
+                workflow_dispatch) lane_attach_how=" (a 'gh workflow run --ref', or a rerun of a CANCELLED run)" ;;
+                push\ workflow_dispatch) lane_attach_how=" (a push whose tip is $head, subject to that trigger's own 'branches'/'paths' filters, a 'gh workflow run --ref', or a rerun of a CANCELLED run)" ;;
+                *) lane_attach_how="" ;;
+              esac
+              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it — but it declares '$LANE_RUN_ATTACH_TRIGGERS', which CAN attach a run of it to head $head while the wait runs$lane_attach_how"
+              lane_kept_tail="This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
+            else
+              # ⛔ NOT "it declares a trigger" (round 2, P2): on this path the code could not
+              # READ the trigger list, so the only honest statement is that the answer is
+              # unread and the filter is kept fail-closed.
+              # ⛔ "NO SUCH PR EVENT", NOT "NO PR EVENT" (round 4, P2): this class is
+              # `triggers & {pull_request, pull_request_target} == {}` (see
+              # scripts/ci-workflow-pr-evaluable.sh:106,829-836), and a `pull_request_review`-
+              # only lane belongs to it while a PR event (a submitted review) genuinely
+              # STARTS it. The narrower, MEASURED claim is the one that belongs here.
+              lane_trigger_clause="its 'on:' block declares no pull_request / pull_request_target, so no such PR event can START it, and its declared trigger list could not be READ from the applicability reason — so the filter is kept because an unreadable answer is not an exemption, not because a run was measured absent"
+              # ⛔ AND THE TAIL MUST NOT RE-ASSERT WHAT THE CLAUSE JUST CALLED UNREAD (round 3,
+              # P2). "This class CAN still start a run while the wait runs" is the fact this arm
+              # has just said it could not establish, and it repeats the "not an exemption"
+              # rationale a second time in the same sentence. On this arm the honest tail states
+              # only the consequence.
+              lane_kept_tail="The bounded wait applies, and §1b refuses if no run appears."
+            fi
+          else
+            lane_trigger_clause="it declares a PR trigger this changed set does not match"
+            lane_kept_tail="This class CAN still start a run while the wait runs, so an unread answer is not an exemption (fail closed): the bounded wait applies, and §1b refuses if no run appears."
+          fi
+          info "admin-merge: … LANE KEPT — keeping the watched lane '$WORKFLOW' for head $head: $lane_trigger_clause, and $lane_kept_why. $lane_kept_tail Pass --any-workflow to compare against every workflow instead."
         fi
         ;;
       unknown)
