@@ -52,7 +52,7 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
 | `admin-merge.sh` §0b `unknown` arm | was silent → prints reason + escape | same suite A(d) |
 | `admin-merge.sh` `lane_no_pr_trigger` (new helper) | reason classifier — which class §0b is in | unit: arm (a) is the attributable row, plus the single-definition guard and mutant (h) (`tests/issue-2465-inert-wait/run.sh`); integration: `tests/admin-merge/run.sh` §#1614 **arm (f)** — a `no-pr-trigger` lane whose single probe read FAILED |
 | `admin-merge.sh` FIRST-CHECKS wait | `wait_enabled` gains the `ADMIN_MERGE_FIRST_CHECKS_ONESHOT` conjunct (it may disable the wait only with a zero window, and only together with the zero window — never by touching the bounds), and the `*)` refusal is re-cut so its two states do not share a verdict. The POLL/BUDGET contract (`#2862`: spent on the attempt), the stall/ceiling bounds and §4.5 are **unchanged**. | `tests/first-checks-lane-rederive/run.sh` (37 arms, re-run) for the unchanged contract; `tests/admin-merge/run.sh` §79 (g1)-(g4) for the seam; `tests/issue-2465-inert-wait/run.sh` B1-B7 and the state-keyed text arm |
-| `atomic-land.sh` `do_land` | env carry to the land step | `tests/issue-2465-inert-wait/run.sh` B1-B6, `tests/admin-merge/run.sh` §79 (g1)-(g3) |
+| `atomic-land.sh` `do_land` | env carry to the land step | `tests/issue-2465-inert-wait/run.sh` B1-B7, `tests/admin-merge/run.sh` §79 (g1)-(g4) |
 | `tests/*/run.sh` discovery | new suite auto-wired by the glob (`scripts/run-bash-shards.sh:203`) | shard runner |
 
 ## Wiring
@@ -152,6 +152,19 @@ the §0b arm is dead code. Refuted by measurement — see the research comment.
   `block_on_first_checks` itself (extracted, no clock) with `STATE=unobservable MISSING=0` and
   asserts the unread read is named, with the `still-running MISSING=0` control asserting the
   honest branch is still reachable.
+- R10 the refusal names a CAUSE the state does not carry (review round 5, P2 — the same class as
+  R9, one producer over) — `unobservable` has TWO producers: a FAILED Jobs read, and the
+  `> FIRST_CHECKS_JOBS_MAX` cap where the read is deliberately NOT ATTEMPTED (the surface is
+  readable; the wait withholds the poll so a partial observation cannot fake "no change"). A
+  state-keyed clause therefore says "the Jobs read FAILED" about a readable surface, and the
+  cap's own explanation lived in `$summary`, which this path never printed. The mirror case is
+  wrong too: a wait that RECOVERS from an `unobservable` poll keeps its accumulated `missing`
+  (only `missing_streak` is reset), so the `still-running` clause claiming "NOTHING was
+  unreadable" is false about the WHOLE wait → `FIRST_CHECKS_SIGNAL_REASON` is recorded where
+  `signal_ok` is cleared (`cap` | `unreadable`) and the refusal derives its ground from it;
+  the recovery clause quotes the seconds it spent blind. Arms: `(C)` drives the extracted
+  `block_on_first_checks` for BOTH producers, the recovery case, and the two controls;
+  attribution is measured — against the round-4 rail exactly those four rows are RED.
 
 **Threat classes** (`gate-enforcement`): `T1` fail-open by widening the merge surface — must be
 impossible; the only widening is to the surface `--any-workflow` already selects, and §4.5

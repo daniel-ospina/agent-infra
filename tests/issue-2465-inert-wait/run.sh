@@ -427,17 +427,22 @@ ck "(B7) but an explicit NON-ZERO window still wins, carrying nothing (B3 unchan
    "$([ "$(sawk "$(land_err 1 600)" ONESHOT)" = '<unset>' ] && echo 0 || echo 1)"
 
 # ── (C) the `*)` REFUSAL MUST NOT ASSERT A MEASUREMENT IT DID NOT TAKE ──────
-# Review round 4 (P2). The `*)` arm splits two states that must not share a verdict:
-# "the surface was READ and was still pending" (`still-running`) vs "the Jobs read
-# FAILED" (`unobservable`). It used to split on `FIRST_CHECKS_MISSING`, which advances
-# by `dt` in WHOLE seconds — so on a poll whose work fits inside one second it is 0
-# while the state is `unobservable`, and the refusal reported an unread Jobs API as
-# "NOTHING was unreadable". That is reachable on exactly the `--no-wait` path this PR
-# ships, because the one-shot path returns `$FIRST_CHECKS_STATE` after ONE observation.
+# Review rounds 4 AND 5 (P2, same class, twice). The `*)` arm splits two states that must
+# not share a verdict: "the surface was READ and was still pending" (`still-running`) vs
+# "the progress signal was not available" (`unobservable`). It used to split on
+# `FIRST_CHECKS_MISSING`, which advances by `dt` in WHOLE seconds — so on a poll whose work
+# fits inside one second it is 0 while the state is `unobservable`, and the refusal
+# reported an unread Jobs API as "NOTHING was unreadable". Reachable on exactly the
+# `--no-wait` path this PR ships, because the one-shot path returns `$FIRST_CHECKS_STATE`
+# after ONE observation. Round 5 then found the STATE is not the CAUSE either:
+# `unobservable` has TWO producers — a FAILED Jobs read AND the >FIRST_CHECKS_JOBS_MAX cap,
+# where the read is deliberately NOT ATTEMPTED and the surface was perfectly readable —
+# plus a recovery case (`unobservable` → `still-running`) that keeps its accumulated
+# `missing`, so "NOTHING was unreadable" was false about the WHOLE wait.
 # The arm drives the SHIPPED `block_on_first_checks` (extracted, never copied) with an
-# explicit (state, clock) pair, so it is deterministic: no $SECONDS, no polling, no fake
-# gh. The clock is an INPUT here, which is the whole point — the defect is that the code
-# read it as a measurement.
+# explicit (state, reason, clock) triple, so it is deterministic: no $SECONDS, no polling,
+# no fake gh. Those are INPUTS here, which is the whole point — the defect was the code
+# reading one of them as a measurement of another.
 BOFC_LIB="$TMP/bofc.sh"
 build_bofc() { # $1 = source path, $2 = output file
   local src="$1" out="$2" fn
@@ -451,32 +456,58 @@ build_bofc() { # $1 = source path, $2 = output file
 }
 ck "extracted block_on_first_checks from $(basename "$SRC") — the star arm is EXECUTED, not assumed" \
    "$(build_bofc "$SRC" "$BOFC_LIB" && echo 0 || echo 1)"
-# bofc <state> <missing> <missing_streak> <outcome>  → the refusal text on stdout
+# bofc <state> <signal-reason> <missing> <missing_streak> <outcome> → refusal text
+# BOFC_ONESHOT=<empty> drives the same refusal for a caller that did NOT decline to wait
+# (the knob is documented as "non-empty ⇒ on", so an EMPTY value is the only way to be
+# off — `=0` is truthy, which is the header's stated contract).
 bofc() {
-  FIRST_CHECKS_OUTCOME="$4" FIRST_CHECKS_STATE="$1" FIRST_CHECKS_MISSING="$2" \
-  FIRST_CHECKS_MISSING_STREAK="$3" FIRST_CHECKS_WAIT=0 FIRST_CHECKS_WAITED=0 \
+  FIRST_CHECKS_OUTCOME="$5" FIRST_CHECKS_STATE="$1" FIRST_CHECKS_SIGNAL_REASON="$2" \
+  FIRST_CHECKS_MISSING="$3" FIRST_CHECKS_MISSING_STREAK="$4" \
+  FIRST_CHECKS_WAIT=0 FIRST_CHECKS_WAITED=0 FIRST_CHECKS_JOBS_MAX=8 \
   FIRST_CHECKS_CEILING_BOUND=18064 FIRST_CHECKS_STALL_BOUND=8760 \
   FIRST_CHECKS_OBSERVED='run 123: 28 job(s): 2 completed, 26 not' \
-  ADMIN_MERGE_FIRST_CHECKS_ONESHOT=1 \
+  ADMIN_MERGE_FIRST_CHECKS_ONESHOT="${BOFC_ONESHOT-1}" \
     bash < "$BOFC_LIB" 2>&1 >/dev/null
 }
 
-echo "(C) the ONE-SHOT refusal on an UNREADABLE Jobs read claims no measurement it did not take"
-C_UNREAD="$(bofc unobservable 0 0 unobservable)"
-ck "(C) an UNREADABLE Jobs read with a 0s clock does NOT claim 'NOTHING was unreadable' (review round 4 P2)" \
+echo "(C) the ONE-SHOT refusal claims only the measurement it took"
+C_UNREAD="$(bofc unobservable unreadable 0 0 unobservable)"
+ck "(C) an UNREADABLE Jobs read with a 0s clock does NOT claim 'NOTHING was unreadable' (round 4 P2)" \
    "$(grep -q 'NOTHING was unreadable' <<<"$C_UNREAD" && echo 1 || echo 0)"
 ck "(C) …and it NAMES the failed read instead (the state is the measurement, not the clock)" \
    "$(grep -q 'the Jobs read FAILED' <<<"$C_UNREAD" && echo 0 || echo 1)"
 ck "(C) …and it quotes NO duration for a read no time was measured against" \
    "$(grep -q 'did not answer for [0-9]*s in total' <<<"$C_UNREAD" && echo 1 || echo 0)"
-C_READ="$(bofc still-running 0 0 still-running)"
+C_CAP="$(bofc unobservable cap 0 0 unobservable)"
+ck "(C) the >8-pending CAP does NOT claim the Jobs read failed — the surface was READABLE and the read was withheld (round 5 P2)" \
+   "$(grep -q 'the Jobs read FAILED' <<<"$C_CAP" && echo 1 || echo 0)"
+ck "(C) …and it names the CAP as the ground, so the refusal says what actually happened" \
+   "$(grep -q 'MORE THAN 8 run' <<<"$C_CAP" && grep -q 'deliberately NOT read' <<<"$C_CAP" && echo 0 || echo 1)"
+ck "(C) …and it quotes NO duration, because none was measured against a read never attempted" \
+   "$(grep -q 'did not answer for' <<<"$C_CAP" && echo 1 || echo 0)"
+C_READ="$(bofc still-running '' 0 0 still-running)"
 ck "(C) CONTROL: a READABLE still-pending surface still says 'NOTHING was unreadable' (the honest branch is still reachable)" \
    "$(grep -q 'NOTHING was unreadable' <<<"$C_READ" && echo 0 || echo 1)"
 ck "(C) CONTROL: …and does NOT claim the Jobs read failed" \
    "$(grep -q 'the Jobs read FAILED' <<<"$C_READ" && echo 1 || echo 0)"
-C_SLOW="$(bofc unobservable 3 1 unobservable)"
+C_RECOVER="$(bofc still-running '' 3 0 still-running)"
+ck "(C) a RECOVERED surface (readable NOW, but N seconds of this wait were blind) does NOT claim 'NOTHING was unreadable' (round 5 P2)" \
+   "$(grep -q 'NOTHING was unreadable' <<<"$C_RECOVER" && echo 1 || echo 0)"
+ck "(C) …and it states the 3s it spent unreadable instead of denying it" \
+   "$(grep -q '3s of this wait went by with it UNREADABLE' <<<"$C_RECOVER" && echo 0 || echo 1)"
+C_SLOW="$(bofc unobservable unreadable 3 1 unobservable)"
 ck "(C) CONTROL: a MEASURED 3s of unreadable reads is still quoted as a duration" \
    "$(grep -q 'answer for 3s in total, 1s consecutively' <<<"$C_SLOW" && echo 0 || echo 1)"
+# ⛔ THE `why only ONE observation` BLOCK IS A NEW GUARD, SO IT GETS A ROW (review
+# round 5, note). It explains a ONE-OBSERVATION refusal to the operator — the sentence
+# that must never appear for a caller who did not decline to wait.
+C_WHY="$(bofc still-running '' 0 0 still-running)"
+ck "(C) a ONE-SHOT refusal SAYS WHY it took one observation (the operator must not have to guess)" \
+   "$(grep -q 'why only ONE observation' <<<"$C_WHY" && grep -q 'ADMIN_MERGE_FIRST_CHECKS_ONESHOT is set' <<<"$C_WHY" && echo 0 || echo 1)"
+BOFC_ONESHOT= C_NOFLAG="$(bofc still-running '' 0 0 still-running)"
+ck "(C) …and a caller who did NOT decline to wait gets no such explanation — it points at the window/knob instead" \
+   "$(grep -q 'why only ONE observation' <<<"$C_NOFLAG" && echo 1 || { grep -q 're-run the rail once those checks complete' <<<"$C_NOFLAG" && echo 0 || echo 1; })"
+
 
 echo
 printf 'issue #2465 inert wait: %s passed, %s failed\n' "$PASS" "$FAIL"
