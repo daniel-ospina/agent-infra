@@ -6649,7 +6649,10 @@ export default function (pi: ExtensionAPI) {
       // ⛔ EVERY DELETE TARGET IN THE COMPOUND MUST BE ATTRIBUTED (review round 6,
       // finding 1). `det.pushTargets` describes ONE push invocation — the FIRST —
       // because the classifier's later-segment fold-in is conditional on that
-      // invocation carrying NO delete spelling (`classify-git.mjs:4099`). So in
+      // invocation carrying NO delete spelling (`classify-git.mjs:4328`, the
+      // `deleteIdx === -1 && !hasColonTargets` guard — re-derived at round 14;
+      // this citation previously read `:4099`, which is inside the unrelated
+      // `hiddenStateSubst` doc block, the third stale citation on this PR). So in
       // `git reset --hard && git push origin --delete stale && git push origin
       // --delete held` the parsed list is `["stale"]` while the whole-command
       // extractor returns `["stale","held"]`: preferring `pushTargets` outright
@@ -6662,13 +6665,29 @@ export default function (pi: ExtensionAPI) {
       // the string extractor does not see (the `-o`/`--push-option` value
       // over-capture documented above, which errs toward BLOCKING), and adopting
       // the extractor wholesale would trade this hole for a narrower one.
+      // ⛔ AND THE PARSED INVOCATION SURFACE IS A THIRD ONE (review round 14, P0).
+      // The two surfaces above are STILL a strict subset of what the
+      // `block:push-delete` arm below attributes from: `det.pushTargets` is
+      // FIRST-invocation-scoped, and `extractPushDeleteBranch` is segment-matched
+      // on `/\bgit\s+push\b/`, so a **later** push carrying a `-C`/`-c` prefix is
+      // invisible to BOTH. Every `det.pushMutations` entry carries its own
+      // `targets` and its own `isDelete`, which is the only surface that sees it.
+      // MEASURED at `5bac9475b` against base `e4716a058`, worktree session with
+      // `held` checked out in a sibling — base BLOCKED via #73, the two-surface
+      // head ALLOWED, for all of `--delete`/`-d`/`-c`-prefixed later pushes and
+      // for the first-push-delete and stash-lead twins. This is the SAME class as
+      // the round-6 finding one line up and the round-13 finding below: a gate
+      // scoped to a strict subset of the rows it must cover.
       if (det.hasPush === true &&
           det.verdict !== "block:push-delete" &&
           det.verdict !== "block:push" && det.verdict !== "block:force-push") {
         const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)
           ? (extractPushDeleteBranch(localCommand) ?? [])
           : [];
-        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];
+        const parsedDeletes = (det.pushMutations ?? [])
+          .filter((mu: any) => mu.verb === "push" && mu.isDelete === true)
+          .flatMap((mu: any) => (Array.isArray(mu.targets) ? mu.targets : []));
+        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes, ...parsedDeletes])];
         const blocked = _coordinatedDeleteBlock(legacyDeletes);
         if (blocked) return blocked;
       }

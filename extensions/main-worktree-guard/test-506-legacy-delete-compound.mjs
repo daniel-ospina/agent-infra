@@ -602,6 +602,32 @@ if (typeof stripTypeScriptTypes !== "function" ||
       cmd: "git -C . reset --hard && git -C . push -f origin main",
       why: "round 13 CONTROL: the same compound with a RESOLVABLE push target is not #805, and " +
            "base ALLOWED it — P23 differs only by the unresolvable repo" },
+    // ── review round 14 (P0): THE LATER PUSH CARRIES A PREFIX ──
+    // The two attribution surfaces the round-6 finding produced are still a STRICT
+    // SUBSET of what the `block:push-delete` arm below attributes from
+    // (`index.ts:7088`, #605 F3): `det.pushTargets` is FIRST-invocation-scoped, and
+    // `extractPushDeleteBranch` is segment-matched on `/\bgit\s+push\b/`, so a
+    // LATER push spelled with a `-C`/`-c` prefix is invisible to BOTH. Only the
+    // parsed `det.pushMutations` entries carry that push's own targets.
+    // MEASURED at `5bac9475b` against base `e4716a058` (worktree session, `held`
+    // checked out in a sibling): base BLOCKED via #73 and the two-surface head
+    // ALLOWED. Every existing multi-push row (B16/B16b/P16) uses a NON-prefixed
+    // later push, which is exactly why the suite could not discriminate this.
+    { id: "P25", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git -C . reset --hard && git push origin -d stale && git -C . push origin --delete held",
+      why: "round 14 P0: the LATER push is prefix-spelled, so the parsed invocation targets are the " +
+           "only surface that attributes `held` — base BLOCKED this via #73, the two-surface head ALLOWED" },
+    { id: "P26", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git push origin --delete stale && git -C . push origin --delete held",
+      why: "round 14 P0: the stash-lead twin, so the row is the attribution class and not the reset arm" },
+    { id: "P27", dir: "wt", expect: "block", marker: "checked out in",
+      cmd: "git stash pop && git push origin -d stale && git -c core.pager=cat push origin --delete held",
+      why: "round 14 P0: the `-c k=v` prefix spelling of the same class (the prefix forms are a class, " +
+           "not one spelling — the round-8 lesson)" },
+    { id: "P28", dir: "wt", expect: "allow",
+      cmd: "git -C . reset --hard && git push origin -d stale && git -C . push origin --delete stale2",
+      why: "round 14 CONTROL: the same prefixed-later-push shape with a target held NOWHERE must stay " +
+           "allowed — P25 differs only by whether a sibling holds the target" },
   ];
 
   /** The DEGRADED-state pins (#506 review finding 2). The degradation-fallback
@@ -894,7 +920,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
           label: "extractor fallback removed",
           file: "index.ts",
           revert: (src) => src.replace(
-            "        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)\n          ? (extractPushDeleteBranch(localCommand) ?? [])\n          : [];\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];",
+            "        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)\n          ? (extractPushDeleteBranch(localCommand) ?? [])\n          : [];\n        const parsedDeletes = (det.pushMutations ?? [])\n          .filter((mu: any) => mu.verb === \"push\" && mu.isDelete === true)\n          .flatMap((mu: any) => (Array.isArray(mu.targets) ? mu.targets : []));\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes, ...parsedDeletes])];",
             "        const legacyDeletes = det.pushTargets; // MUTANT: no extractor fallback",
           ),
           // B6 still BLOCKS (LEGACY_BLOCK owns the reset) — the fallback's loss is
@@ -917,12 +943,12 @@ if (typeof stripTypeScriptTypes !== "function" ||
           label: "first push's targets only (round-6 finding 1 reintroduced)",
           file: "index.ts",
           revert: (src) => src.replace(
-            "        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)\n          ? (extractPushDeleteBranch(localCommand) ?? [])\n          : [];\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];",
+            "        const extractedDeletes = (det.pushTargets.length === 0 || det.isPushDelete === true)\n          ? (extractPushDeleteBranch(localCommand) ?? [])\n          : [];\n        const parsedDeletes = (det.pushMutations ?? [])\n          .filter((mu: any) => mu.verb === \"push\" && mu.isDelete === true)\n          .flatMap((mu: any) => (Array.isArray(mu.targets) ? mu.targets : []));\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes, ...parsedDeletes])];",
             "        const legacyDeletes = det.pushTargets.length > 0\n          ? det.pushTargets\n          : (extractPushDeleteBranch(localCommand) ?? []); // MUTANT: first push only",
           ),
-          expectRed: ["B16", "B16b"],
+          expectRed: ["B16", "B16b", "P25", "P26"],
           redCheck: (r) => !blocked(r),
-          expectGreen: ["B6", "B10", "B14", "B16c", "B17"],
+          expectGreen: ["B6", "B10", "B14", "B16c", "B17", "P28"],
         },
         {
           // (10) THE UNION COLLAPSED TO A REPLACE: when the extractor finds
@@ -934,12 +960,15 @@ if (typeof stripTypeScriptTypes !== "function" ||
           label: "extractor replaces the parsed targets (union collapsed)",
           file: "index.ts",
           revert: (src) => src.replace(
-            "          : [];\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])];",
+            "          : [];\n        const parsedDeletes = (det.pushMutations ?? [])\n          .filter((mu: any) => mu.verb === \"push\" && mu.isDelete === true)\n          .flatMap((mu: any) => (Array.isArray(mu.targets) ? mu.targets : []));\n        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes, ...parsedDeletes])];",
             "          : [];\n        const legacyDeletes = extractedDeletes.length > 0 ? extractedDeletes : det.pushTargets; // MUTANT: replace, not union",
           ),
           expectRed: ["B17"],
           redCheck: (r) => !blocked(r),
-          expectGreen: ["B6", "B10", "B14", "B16"],
+          // P25–P27 redden here TOO (the extractor cannot see the prefixed later
+          // push either), which is correct: this mutant is the union collapsed, so
+          // the round-14 surface goes with it. P28 is the control that must hold.
+          expectGreen: ["B6", "B10", "B14", "B16", "P28"],
         },
         {
           // (11) THE SKIMMED PASS RE-GATED ON `allow` — the round-8 defect put
@@ -1016,6 +1045,24 @@ if (typeof stripTypeScriptTypes !== "function" ||
           expectRed: ["P23"],
           redCheck: (r) => !blocked(r),
           expectGreen: ["P24", "P7", "P16"],
+        },
+        {
+          // (16) THE PARSED-INVOCATION SURFACE DROPPED — the round-14 P0 put back.
+          // Only the round-14 rows redden: P25/P26/P27 lose `held` attribution and
+          // are ADMITTED in a worktree, while EVERY earlier multi-push row stays
+          // green — B16/B16b/P16 all use a NON-prefixed later push, which the
+          // segment extractor does see. That split is the whole reason this needed
+          // its own mutant: without it the suite could not tell this hole apart
+          // from a covered one, and the hole survived thirteen rounds.
+          label: "round-14 parsed-invocation delete surface dropped (index.ts)",
+          file: "index.ts",
+          revert: (src) => src.replace(
+            "        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes, ...parsedDeletes])];",
+            "        const legacyDeletes = [...new Set([...det.pushTargets, ...extractedDeletes])]; // MUTANT: parsed surface dropped",
+          ),
+          expectRed: ["P25", "P26", "P27"],
+          redCheck: (r) => !blocked(r),
+          expectGreen: ["P28", "B16", "B16b", "B17", "P16", "B1"],
         },
         {
           // (13) THE FACT NEVER RECORDED — the classifier stops reporting what the
