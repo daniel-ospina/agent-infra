@@ -4574,6 +4574,18 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       # EVERY SPAWN, for a version skew it is not the box's fault. The env var is read by both versions,
       # so the seam is skew-safe in both directions. An operator's own `CELL_PREFLIGHT_REPO` still wins:
       # this only fills a value nobody set.
+      # ⛔ AND ONE THRESHOLD IS BEING ASKED TO MEAN TWO THINGS (review of 92ec5cd67, P2-3 — stated here,
+      # at the seam that does it, because the alternative is a knob and a knob is forbidden): the value
+      # this line names is the LANE's base worktree on the lane path (`WIP_PATH` unset → `$PWD` = a tree
+      # cut from `origin/main`), but on the FIXER path `WIP_PATH` is the PR's own worktree (`fix-one.sh`),
+      # so `code_freshness` measures a BRANCH. `CELL_PREFLIGHT_MAX_BEHIND`'s default of 50 is calibrated
+      # against BASES (a two-day-old box is not an outage); a PR that sat a week is hundreds behind BY
+      # DESIGN, and that is exactly the population a fixer is dispatched to. Such a fixer is refused
+      # before it starts (85) and the remedy it publishes is a step the refused process cannot perform,
+      # so those PRs stall until an operator integrates by hand. Named, not fixed here: a caller-settable
+      # threshold is a caller turning its own readiness field off, which this file's ENVIRONMENT block
+      # forbids by decision — #3932's ask 2 (a sanctioned fast-forward the gate itself may perform) is
+      # what removes the consequence, and it is out of scope for this change.
       _pf_line="$(CELL_PREFLIGHT_REPO="${CELL_PREFLIGHT_REPO:-${WIP_PATH:-$PWD}}" \
                     bash "$_pf_sh" --quiet --bound "${LANE_PREFLIGHT_BOUND:-45}" \
                     --provider "$lane_provider" --model "$lane_model" 2>>"$log")"
@@ -4677,6 +4689,17 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
           case "$_pf_line" in
             *behind=unknown*)
               echo "[capability-gate] WARN $label: the staleness reading is UNMEASURABLE — the line above carries behind=unknown, so this spawn is admitted with NO evidence its base is current (#3932). The reason is on that line: reason=no-checkout / reason=not-a-checkout (the probe resolved no checkout — export CELL_PREFLIGHT_REPO=<the checkout this lane builds on> to name it explicitly), reason=fetch-failed (a dead/slow remote, or a fetch killed at CELL_PREFLIGHT_FETCH_BOUND), or reason=rev-list-unreadable. This is NOT a refusal and nothing was consumed; it is the one shape in which a stale box passes this gate." >> "$log" ;;
+            # ⛔ AN OLD PROBE IS THE OTHER UNMEASURABLE SHAPE, AND IT WAS SILENT (this change's review,
+            # P2-2). A copy deployed before this field existed emits `LANE_CAPABILITY=ok host=… key=env`
+            # with NO `behind=` at all, so it matched nothing above and the spawn was admitted with no
+            # log line — while the property (g2c) is named for ("an inert staleness check is not
+            # silent") held only on the OTHER unmeasurable path. And the skew direction is the likely
+            # one, not the exotic one: `$O` is seeded FILE BY FILE (see the parse above), so a caller
+            # here routinely runs against a probe older than itself. Absence of the field is therefore
+            # reported as its own reason, never folded into "measured".
+            *behind=*) : ;;
+            *)
+              echo "[capability-gate] WARN $label: the probe produced a LANE_CAPABILITY=ok line with NO staleness field at all (reason=no-reading-field), so this spawn is admitted with NO evidence its base is current (#3932). That is HELPER/CONSUMER SKEW — the deployed cell-lane-preflight.sh predates the `repo=`/`behind=` fields (`$O` is seeded file by file, so a caller can be newer than the probe it runs), or the line was truncated. Nothing was consumed and this is not a refusal. Sync the deployed copies with a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log" ;;
           esac ;;
         *)
           # ⛔ `rc=2` IS A VERDICT, AND IT IS THE ONE THE PROBE'S OWN EXIT TABLE SAYS EVERY CALLER MUST
