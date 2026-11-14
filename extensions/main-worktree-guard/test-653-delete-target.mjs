@@ -446,6 +446,22 @@ for (const [name, cmd] of [
     "git push origin -o `echo \"x\" -d` held/branch"],
   ["`-o $(echo -d) main` — the documented fail-closed over-block (expansion is exactly `-d`)",
     `git push origin -o $(echo -d) main`],
+  // ⛔ A **MIXED** TOKEN — an UNQUOTED span ADJACENT to a QUOTED one — IS NOT ONE WORD (round-17 review
+  // cycle 3, P1, MEASURED as a FAIL-OPEN with real git). `_foldBacktickSubstitutions` splices an unquoted
+  // backtick span INLINE with no separator, so both collapses can land in ONE token; a `contains(_QS_MARK)`
+  // test then called the whole word "quoted" and the value-slot exemption fired on a word bash splits:
+  //   git push origin -o `echo "x -d held"`"$(echo )"
+  //     bash argv → push origin -o x -d held   → the unquoted half spills → REAL delete of `held`
+  //     a contains-test → exempt → null → ALLOWED (origin/main REFUSED it on the `"$(echo` fragment)
+  // A token carrying both markers takes the BARE placeholder, which the exemption rejects (fails closed).
+  ["a MIXED token: unquoted backtick span + quoted `$( )`, empty quoted half",
+    "git push origin -o `echo \"x -d held\"`\"$(echo )\""],
+  ["a MIXED token, the `--push-option` twin",
+    "git push origin --push-option `echo \"x -d held\"`\"$(echo )\""],
+  ["a MIXED token, quoted half non-empty",
+    "git push origin `echo \"x -d held\"`\"$(echo x)\""],
+  ["a MIXED token, the other order (quoted first)",
+    "git push origin -o \"$(echo x)\"`echo \" -d held\"`"],
 ]) {
   const got = extractPushDeleteBranch(cmd);
   expectTrue(`A: an UNQUOTED span in a value slot (${name}) → REFUSED, never dropped`,
@@ -877,11 +893,16 @@ if (typeof stripTypeScriptTypes !== "function" ||
         const spanBlanket = 'const _opaqueInFlagSlot = tokens.some((t, i) => _isSpanTok(t) && !_valueSlot[i]);';
         const ownNeedle = 'const _ownFlag = tokens.some((t, i) => !_valueSlot[i] && _isPushDeleteFlagToken(t));';
         const ownReplacement = 'const _ownFlag = tokens.some((t) => _isPushDeleteFlagToken(t));';
+        // ⛔ M16 — the MIXED-token rule (round-17 review cycle 3): a token that carries BOTH a bare
+        // placeholder and a quoted-span mark has an unquoted part and CAN split, so it must lose the
+        // value-slot exemption. Reverting it to "always quoted" restores the fail-open.
+        const mixedNeedle = 'const mixed = t.includes(_SUBST_PLACEHOLDER);\n      tokens.push(mixed ? _SUBST_PLACEHOLDER : _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);';
+        const mixedReplacement = 'tokens.push(_SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);';
         const cgPath = join(HERE, "classify-git.mjs");
         const cgSrc = readFileSync(cgPath, "utf-8");
         // (M15 mutates the SAME line M14 does, in the other direction, so btNeedle covers both anchors.)
         for (const [name, needle] of [["M12", qsNeedle], ["M14/M15", btNeedle],
-                                      ["M13", spanNeedle], ["M13d", ownNeedle]]) {
+                                      ["M13", spanNeedle], ["M13d", ownNeedle], ["M16", mixedNeedle]]) {
           expectTrue(`${name}: the mutation anchor is present (a stale anchor is a FAILURE, never a green)`,
             cgSrc.includes(needle), `missing ${JSON.stringify(needle)}`);
         }
@@ -917,6 +938,9 @@ if (typeof stripTypeScriptTypes !== "function" ||
             ["M13d", "own", ownNeedle, ownReplacement,
               "git push origin -o -d $(echo -d) held/branch", null,
               "the naive own-flag test restored → the PRE-EXISTING fail-open is back (all three trees said null)"],
+            ["M16", "mixed", mixedNeedle, mixedReplacement,
+              "git push origin -o `echo \"x -d held\"`\"$(echo )\"", null,
+              "the mixed-token rule reverted → a PARTLY unquoted word is exempted again (real delete, attr. nothing)"],
           ];
           for (const [name, tag, from, to, cmd, wantMutant, why] of cases) {
             const ext = await mutantExtractor(tag, from, to);

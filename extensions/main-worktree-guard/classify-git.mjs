@@ -5658,7 +5658,24 @@ function _pushSegmentTokens(body) {
     // here and belongs in the placeholder — the same treatment the BARE twin already got. The `_QUOTED`
     // suffix records the ONE thing that distinguishes it from a bare span: it will not word-split, which
     // is what makes its value-slot exemption sound (see `_QUOTED_SPAN_SUFFIX`).
-    if (t.includes(_QS_MARK)) { tokens.push(_SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX); continue; }
+    if (t.includes(_QS_MARK)) {
+      // ⛔ A MIXED TOKEN IS NOT ONE WORD (round-17 review cycle 3, P1 — measured as a FAIL-OPEN with real
+      // git). `_foldBacktickSubstitutions` splices an UNQUOTED backtick span INLINE, with no separator
+      // (by design — see its own note), so when such a span is ADJACENT to a quoted one the two collapses
+      // land in ONE token. Treating "contains a quoted span" as "is a quoted span" then discarded the
+      // half that DOES split, and the value-slot exemption fired on a word bash splits into three:
+      //
+      //   git push origin -o `echo "x -d held"`"$(echo )"
+      //     bash argv → push origin -o x -d held      (the unquoted half spills → REAL delete)
+      //     a contains-test → exempt → null → #73 never consulted → ALLOWED
+      //     origin/main → REFUSE (on the `"$(echo` fragment)   the exemption-deleted mutant → REFUSE
+      //
+      // A token carrying BOTH markers has an UNQUOTED part, so it can split and cannot be "provably the
+      // value": it takes the BARE placeholder, which the exemption rejects. Fails closed in one place.
+      const mixed = t.includes(_SUBST_PLACEHOLDER);
+      tokens.push(mixed ? _SUBST_PLACEHOLDER : _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);
+      continue;
+    }
     tokens.push(_unmaskDataParens(t));
   }
   // An UNCLOSED span is TRUNCATED, not empty (round-7 review, P0). It used to be dropped, so a
@@ -5745,6 +5762,10 @@ function _pushSegmentTokens(body) {
       //     bash argv → push origin -o x -d held/branch  (`-o` value is `x`; `-d held/branch` DELETES)
       //     a blanket exemption → null → #73 never consulted → ALLOWED, where `origin/main` and
       //     `aa5104539` both REFUSED it.
+      //     ⚠️ PROVENANCE, corrected after review: that refusal holds for the `$( … )` spelling and its
+      //     `--push-option` twin, NOT for the backtick twin `` -o `echo "x" -d` held/branch `` — there
+      //     `origin/main` returns `null` (it ALLOWED it), so closing that one is NEW coverage rather than
+      //     restored coverage. The blanket exemption arrived in `51401fc9b`.
       // The quoted/unquoted split is exactly the shell's own: a quoted span cannot spill, an unquoted one
       // can, and which word carries the spelling is unknowable — so the unquoted case fails CLOSED.
       // `_markOptionValueSlots` is the module's existing definition of the slot (the same one the target
