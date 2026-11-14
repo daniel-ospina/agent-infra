@@ -1188,7 +1188,7 @@ outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line
     # `N blocking` is a REMAINDER and must stay countable. `N non-blocking` mentions are masked
     # globally: a negated mention is not a blocker (13n28).
     _rest="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' \
-      | sed -E 's/[1-9][0-9]*[[:space:]_-]*non-block(ing|ers?)/ BLKDECL /g; s/[1-9][0-9]*[[:space:]_-]*block(ing|ers?)/ BLKDECL /g; s/\(p[0-3]\)/ PTAG /g')"
+      | sed -E 's/[1-9][0-9]*[[:space:]_-]*non-block(ing|ers?)/ BLKDECL /g; s/[1-9][0-9]*[[:space:]_-]*block(ing|ers?)/ BLKDECL /; s/\(p[0-3]\)/ PTAG /g')"
     if grep -qE "$_OC_SECOND_COUNT" <<<"$_rest"; then
       OUTCOME_BLOCKING_LINE="$line"
       return 0
