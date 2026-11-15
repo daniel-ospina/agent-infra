@@ -26,9 +26,15 @@
 # WHAT IT ASSERTS — six predicates, one line each, per PR
 # ------------------------------------------------------
 #   merged         the PR is MERGED and the merge commit's tree is readable. No merge ⇒ no landing.
-#   review_record  a review record exists (the recorder's own marker, read from the PR body or its
-#                  comments — durable and therefore CROSS-BOX; a local
-#                  ~/.pi/agent/reviews/<owner>-<repo>-<pr>.json is a fallback only).
+#   review_record  a review record exists AND is ADMITTED (the recorder's own marker, read from the PR
+#                  body or its comments — durable and therefore CROSS-BOX; a local
+#                  ~/.pi/agent/reviews/<owner>-<repo>-<pr>.json is a fallback only). Admission is the
+#                  required check's own rule, not a weaker one this file invented: a COMMENT marker must
+#                  come from `author_association ∈ OWNER|MEMBER|COLLABORATOR` and carry a `sig=` that
+#                  verifies wherever a gate key resolves (no key ⇒ the association is the admission, and
+#                  the detail says so); a record FILE must carry a `sig=` that verifies under the same
+#                  key. A body marker needs write access to the PR, and the gate's legacy unsigned
+#                  tolerance for it is kept. Anything else is REPORTED as refused, never promoted.
 #   review_bound   THE REVIEWED HEAD IS THE PR'S FINAL COMMIT — nothing was pushed to the PR after
 #                  the review. This repo squash-merges (measured 2026-11-12: PR #3996's merge commit
 #                  5de01a204 has ONE parent and head 1dc591316 is not on main), so `parents[1]` cannot
@@ -136,6 +142,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# ── snapshot modes are MUTUALLY EXCLUSIVE, and saying so is part of the contract ─────────────────
+# ⛔ `--write-snapshot DIR --from-snapshot DIR` USED TO BE A SILENT NO-OP (fresh-context review, round 8,
+# P3): the read mode won, the write target was never created, and no word was said — so an operator who
+# asked for an evidence directory got a verification with no artifact attached and nothing to notice it
+# by. Two modes that cannot both be honoured are a USAGE error (exit 3), not a preference order.
+if [ -n "$SNAPSHOT_IN" ] && [ -n "$SNAPSHOT_OUT" ]; then
+  printf 'verify-landing-chain: --from-snapshot and --write-snapshot are mutually exclusive — a run either READS a frozen snapshot or WRITES one; pick one. (Nothing was verified.)\n' >&2
+  usage
+fi
+
 # ── repo resolution ──────────────────────────────────────────────────────────────────────────────
 # ⛔ NO PRIVATE PATH DEFAULT IS ASSIGNED TO `REPO` HERE. `check-single-source.sh`'s REPO path-default
 # arm refuses exactly that shape, and it is right to: `REPO` is set ONCE per box (a launchd plist on
@@ -232,7 +248,9 @@ file_mtime() { # file_mtime <path> → ISO-8601 UTC, or EMPTY (GNU stat, then BS
 
 # pr.meta              <number> TAB <state> TAB <mergedAt|-> TAB <mergeCommit.oid|->
 # body.txt             the PR body
-# comments.txt         comment bodies, in order, separated by a <<<COMMENT>>> line
+# comments.txt         the PRODUCER frame: one record per comment, "<author_association>\x1f<body>\x1e"
+#                      (check-pipeline-compliance.sh REVIEW_COMMENTS_JQ) — the author travels WITH the
+#                      body, because a comment is the one record channel any account can write
 # record.json          this box's record file, when one exists (fallback source)
 # rail.out             the rail's output for this PR (every ATTEMPT of it, including refusals — so
 #                      its presence says "the rail was asked", and only the rail's own
@@ -254,10 +272,21 @@ fetch_one() { # fetch_one <dir> <pr>
   # time). The `.unread` sentinel keeps that distinguishable at the review_record predicate.
   store_read "$dir" body.txt \
     "$GH" pr view "$pr" --repo "$REPO" --json body --jq '.body // ""'
-  # markers ACCUMULATE in the comments across a fix round; that is where the round's history lives
+  # markers ACCUMULATE in the comments across a fix round; that is where the round's history lives.
+  # ⛔ THE COMMENTS ARE FETCHED IN THE PRODUCER'S OWN FRAME, WITH THEIR AUTHOR (fresh-context review,
+  # round 8 — BLOCKING, the false-PASS class). This read used to be
+  #   `.comments[] | "<<<COMMENT>>>\n" + (.body // "")`
+  # — no author at all, so NOTHING downstream could apply the admission rule the repo's own required
+  # check applies to exactly this artifact: on a public repo any account can post one line naming the
+  # public head sha, and this verifier would report `PASS review_record` + `PASS review_bound` and
+  # `VERDICT: ALL-MET`, exit 0 — the value the #4016 capstone closes on — over a hand-typed comment.
+  # The frame and the jq are `check-pipeline-compliance.sh`'s OWN (`REVIEW_COMMENTS_JQ`, `:711`), copied
+  # rather than re-invented, so the two readers admit the same artifact for the same reasons: one record
+  # per comment, `<author_association>\x1f<body>\x1e`. The 0x1e/0x1f bytes are stripped from the body
+  # first, so a comment cannot forge a record boundary.
   store_read "$dir" comments.txt \
     "$GH" pr view "$pr" --repo "$REPO" --json comments \
-      --jq '.comments[] | "<<<COMMENT>>>\n" + (.body // "")'
+      --jq '.[] | "\(.author_association)\u001f\(.body | gsub("[\u001e\u001f]"; ""))" + "\u001e"'
 
   rec="$HOME/.pi/agent/reviews/${OWNER}-${RNAME}-${pr}.json"
   legacy="$HOME/.pi/agent/reviews/${pr}.json"
@@ -399,31 +428,83 @@ fetch_head_surface() { # fetch_head_surface <dir> <head_sha>
 # a marker that names no repo, or another repo, is not evidence — it is SKIPPED and REPORTED, never
 # silently dropped.
 # The CHANNEL is tagged because the recorder treats the two differently: the BODY is its own CURRENT
-# statement (record-review.sh:4896-4899, "the poster APPENDS … keep the LAST"), while a marker found
-# only in a COMMENT is a weaker source (record-review.sh:1092-1094 does not accept a comment marker as
-# an artifact). `sig=` is recorded but NOT verified here, and every detail line says so.
+# statement (record-review.sh:4896-4899, "the poster APPENDS … keep the LAST"), while a comment is a
+# PUBLIC artifact any account can write.
+# ⛔ SO A COMMENT MARKER IS ADMITTED, NOT MERELY LABELLED (fresh-context review, round 8 — BLOCKING,
+# the false-PASS class this file exists to eliminate). The first cut fetched the comments with NO author,
+# admitted any line of the right shape, recorded `sig=` as prose (`sig=absent`) and never let it decide
+# anything — so a hand-typed comment at the public head sha produced `PASS review_record` AND
+# `PASS review_bound`, i.e. `VERDICT: ALL-MET` and exit 0, the value #4016's capstone closes on. The
+# repo had ALREADY decided this artifact: `check-pipeline-compliance.sh` check (c) admits a comment
+# marker only from `author_association ∈ OWNER|MEMBER|COLLABORATOR` (`:701`, `:763`) and only with a
+# `sig=` that verifies under the gate key wherever one resolves (`review_marker_sig_ok`, `:713`, `:769`);
+# its own simulations `pass 1224g`/`1224h` assert that an UNSIGNED marker comment — and an untrusted
+# author — are REFUSED, and `record-review.sh:2406` enforces the same author set. That rule is applied
+# here, unchanged, in the same order, and the residual is the gate's own: with NO key resolvable on the
+# box the association is the admission (a CI runner carries no key, so a sig-only arm would be inert
+# there — the defect #1224 exists to remove) — and that is SAID in the detail, never implied.
+# ⛔ With a key resolvable, an unsigned or non-verifying `sig=` is NOT evidence (fail closed).
+gate_key() { # the HMAC key, env first then the producer's key file — check-pipeline-compliance.sh:878
+  local k="${AI_REVIEW_GATE_KEY:-}"
+  if [ -z "$k" ] && [ -f "${HOME:-/nonexistent}/.pi/agent/.ai-review-gate-key" ]; then
+    k="$(cat "${HOME:-/nonexistent}/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+  fi
+  printf '%s' "$k" | tr -d '[:space:]'
+}
+marker_sig_ok() { # <marker line> → 0 iff its own trailing ` sig=<64hex>` verifies under the gate key
+  local text="$1" txt sig exp
+  [ -n "$GATE_KEY" ] || return 1
+  [ -n "$OPENSSL_OK" ] || return 1
+  case "$text" in *" sig="*) ;; *) return 1 ;; esac
+  txt="${text% sig=*}"; sig="${text##* sig=}"
+  case "$sig" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#sig}" -eq 64 ] || return 1
+  exp="$(printf '%s' "$txt" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null \
+    | command awk '{print $NF}' || true)"
+  [ -n "$exp" ] && [ "$exp" = "$sig" ]
+}
+# resolved ONCE, before any predicate runs, so every reader below asks the same question
+GATE_KEY="$(gate_key)"
+OPENSSL_OK=""
+command -v openssl >/dev/null 2>&1 && OPENSSL_OK=1
 record_markers() { # record_markers <dir> <pr>
-  #   MARK <channel> <verdict> <sha> <repo> <sig?>   ·   SKIP <channel> <sha> <repo-or-(none)>
+  #   MARK <chan> <verdict> <sha> <repo> <assoc|-> <marker line, verbatim>   ← this repo, admissible shape
+  #   SKIP <chan> <sha12> <repo-or-(none)>   a marker that names no repo, or another repo
+  #   DENY <chan> <sha12> <assoc|->          a COMMENT whose author is not OWNER/MEMBER/COLLABORATOR
   local dir="$1" pr="$2"
   {
-    # the BODY last, and tagged, so "the recorder's current word" is distinguishable from history
+    # ── the COMMENT channel: the producer's frame, one `<author_association>\t<body>` per comment ──
+    # A body is MULTI-LINE, so the frame is split here (`RS = \x1e`) into one line per body line, each
+    # carrying its author; the ONE parser below then handles both channels.
+    [ -s "$dir/comments.txt" ] && awk -v RS='\036' '
+      {
+        i = index($0, "\037")
+        if (i == 0) { assoc = "-"; body = $0 } else { assoc = substr($0, 1, i - 1); body = substr($0, i + 1) }
+        n = split(body, L, "\n")
+        for (k = 1; k <= n; k++) printf "COMMENT\t%s\t%s\n", assoc, L[k]
+      }' "$dir/comments.txt"
+    # the BODY last, and tagged, so "the recorder's current word" is distinguishable from history.
     # ⛔ `awk`, NOT `sed 's/^/COMMENT\t/'` (fresh-context review, round 7, P3). POSIX says an escaped
     # ORDINARY character in a sed replacement stands for itself, so a BSD/macOS sed emits `COMMENTt…`
     # and `BODYt…` (GNU's `\t`→TAB is an extension); with `-F'\t'` and
     # `index(line, "review recorded: …") != 1` NO marker would ever parse on a Mac, leaving
     # review_record/fix_round/review_bound/green_gated permanently INCONCLUSIVE on the one platform
     # the capstone is required on — while the Linux suite stayed green. `check-portability-traps.sh`
-    # has no `\t`-in-sed row, so nothing else would have caught it. `awk`'s `print "X\t" $0` is the
+    # has no `\t`-in-sed row, so nothing else would have caught it. `awk`'s `printf "X\t%s\n"` is the
     # portable form (verified: identical output on gawk, mawk, nawk and `awk --posix`).
-    [ -s "$dir/comments.txt" ] && awk '{ print "COMMENT\t" $0 }' "$dir/comments.txt"
-    printf 'BODY\t\n'
-    [ -s "$dir/body.txt" ] && awk '{ print "BODY\t" $0 }' "$dir/body.txt"
+    printf 'BODY\t-\t\n'
+    [ -s "$dir/body.txt" ] && awk '{ printf "BODY\t-\t%s\n", $0 }' "$dir/body.txt"
   } | awk -F'\t' -v pr="$pr" -v want="$REPO" '
     BEGIN { fold = tolower(want) }
     {
       chan = $1
+      # the channel and the author come from the FRAME; everything after them is the marker as it was
+      # written (tabs included), because a signature covers the bytes the recorder signed
       line = $0
       sub(/^[^\t]*\t/, "", line)
+      k = index(line, "\t")
+      assoc = (k ? substr(line, 1, k - 1) : "-")
+      line  = (k ? substr(line, k + 1) : line)
       sub(/^[[:space:]>*+\x2d]+/, "", line)
       # the recorder writes: review recorded: reviews/<pr>.json verdict=V @ <40hex> (owner/repo)
       if (index(line, "review recorded: reviews/" pr ".json verdict=") != 1) next
@@ -434,7 +515,6 @@ record_markers() { # record_markers <dir> <pr>
       if (rest !~ / @ [0-9a-f]+( |$)/) next
       s = rest; sub(/^.* @ /, "", s); sub(/ .*$/, "", s)
       if (length(s) != 40 || tolower(s) !~ /^[0-9a-f]+$/) next
-      sig = (line ~ / sig=[0-9a-f]+$/) ? "sig" : "nosig"
       repo = ""
       # the FIRST parenthesised slug-shaped group is the marker repo; text after it (findings=, sig=)
       # cannot match, because a slug-shaped group has no spaces
@@ -443,32 +523,80 @@ record_markers() { # record_markers <dir> <pr>
       }
       if (repo == "")            { printf "SKIP\t%s\t%s\t(none)\n", chan, substr(s, 1, 12); next }
       if (tolower(repo) != fold) { printf "SKIP\t%s\t%s\t%s\n",     chan, substr(s, 1, 12), repo; next }
-      printf "MARK\t%s\t%s\t%s\t%s\t%s\n", chan, v, s, repo, sig
+      # ⛔ THE AUTHOR ADMISSION, on the COMMENT channel only (check-pipeline-compliance.sh:763): a body
+      # needs write access to the PR, a comment does not — "on a public repo any account can comment,
+      # so an unattested commenter is not evidence". Left to the caller so the refusal can quote it.
+      if (chan == "COMMENT" && assoc != "OWNER" && assoc != "MEMBER" && assoc != "COLLABORATOR") {
+        printf "DENY\t%s\t%s\t%s\n", chan, substr(s, 1, 12), assoc; next
+      }
+      printf "MARK\t%s\t%s\t%s\t%s\t%s\t%s\n", chan, v, s, repo, assoc, line
     }
   '
 }
 
-# this repo, one channel: "verdict TAB sha TAB sig", oldest first
+# The admission that decides whether a matched marker is EVIDENCE: the author (already applied in the
+# parser, reported as DENY) and the SIGNATURE, which needs openssl so it is settled here.
+admitted_marks() { # <dir> <pr> → "MARK <chan> <verdict> <sha> <auth>" · "SKIP …" · "DENY <reason>"
+  local dir="$1" pr="$2" line kind rest chan v sha repo assoc text auth
+  record_markers "$dir" "$pr" | while IFS= read -r line; do
+    IFS='	' read -r kind rest <<<"$line"
+    case "$kind" in
+      MARK)
+        IFS='	' read -r chan v sha repo assoc text <<<"$rest"
+        if marker_sig_ok "$text"; then
+          auth="sig"
+        else
+          case "$chan" in
+            BODY)
+              # the body needs write access, and the gate keeps its legacy unsigned tolerance for it
+              # (check-pipeline-compliance.sh's body arm) so an in-flight PR is not stranded
+              auth="body" ;;
+            COMMENT)
+              if [ -n "$GATE_KEY" ]; then
+                printf 'DENY\tCOMMENT\t%s\tits sig= does not verify under this box gate key (no sig= at all, a different key, or edited after minting) — a comment is not evidence by shape (the gate: pass 1224g)\n' "$(printf '%s' "$sha" | cut -c1-12)"
+                continue
+              fi
+              auth="association" ;;
+            *) auth="unknown" ;;
+          esac
+        fi
+        printf 'MARK\t%s\t%s\t%s\t%s\n' "$chan" "$v" "$sha" "$auth" ;;
+      SKIP) printf 'SKIP\t%s\n' "$rest" ;;
+      DENY)
+        IFS='	' read -r chan sha assoc <<<"$rest"
+        printf 'DENY\t%s\t%s\tits author_association is %s, not OWNER/MEMBER/COLLABORATOR — on a public repo any account can comment, so an unattested commenter is not evidence (the gate own rule, pass 1224h)\n' \
+          "$chan" "$sha" "${assoc:-(absent)}" ;;
+    esac
+  done
+}
+
+# this repo, one channel: "verdict TAB sha TAB auth", oldest first
 markers_from() {
-  record_markers "$1" "$2" | awk -F'\t' -v ch="$3" \
-    '$1 == "MARK" && (ch == "*" || $2 == ch) { print $3 "\t" $4 "\t" $6 }'
+  admitted_marks "$1" "$2" | awk -F'\t' -v ch="$3" \
+    '$1 == "MARK" && (ch == "*" || $2 == ch) { print $3 "\t" $4 "\t" $5 }'
 }
 
 # the recorder's CURRENT word is the body; a comment-only marker is a declared weaker source
-last_marker() { # → "verdict TAB sha TAB source TAB sig"; empty when nothing admitted
-  local dir="$1" pr="$2" v s sig
-  v="$(markers_from "$dir" "$pr" BODY | tail -1)"
+last_marker() { # → "verdict TAB sha TAB source TAB auth"; empty when nothing admitted
+  local dir="$1" pr="$2" v
+  v="$(admitted_marks "$dir" "$pr" \
+    | awk -F'\t' '$1 == "MARK" && $2 == "BODY" { v = $3; s = $4; a = $5 } END { if (v != "") printf "%s\t%s\tbody\t%s\n", v, s, a }')"
   if [ -n "$v" ]; then
-    printf '%s\t%s\tbody\t%s\n' "$(printf '%s' "$v" | cut -f1)" "$(printf '%s' "$v" | cut -f2)" "$(printf '%s' "$v" | cut -f3)"
+    printf '%s\n' "$v"
     return 0
   fi
-  v="$(markers_from "$dir" "$pr" COMMENT | tail -1)"
+  v="$(admitted_marks "$dir" "$pr" \
+    | awk -F'\t' '$1 == "MARK" && $2 == "COMMENT" { v = $3; s = $4; a = $5 } END { if (v != "") printf "%s\t%s\tcomment\t%s\n", v, s, a }')"
   [ -n "$v" ] || return 1
-  printf '%s\t%s\tcomment\t%s\n' "$(printf '%s' "$v" | cut -f1)" "$(printf '%s' "$v" | cut -f2)" "$(printf '%s' "$v" | cut -f3)"
+  printf '%s\n' "$v"
 }
 
 skipped_markers() { # → "channel:sha:repo" for the markers refused as foreign, or empty
   record_markers "$1" "$2" | awk -F'\t' '$1 == "SKIP" { print $2 ":" $3 ":" $4 }' | paste -sd ',' -
+}
+
+denied_markers() { # → "why" for every marker-shaped artifact refused by admission, or empty
+  admitted_marks "$1" "$2" | awk -F'\t' '$1 == "DENY" { print $4 }' | paste -sd ' · ' -
 }
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -752,21 +880,49 @@ analyse() { # analyse <dir> <pr>
   # recorder's current word; a comment-only marker is a WEAKER source the recorder itself does not
   # accept as an artifact, and a box-local record file is weaker still (it is not in the PR). Every
   # one of those prints its own `source=` so a reader cannot mistake the strength of the evidence.
-  local marker rverdict rsha rsource="marker-body" rsig="" rskipped
+  local marker rverdict rsha rsource="marker-body" rsig="" rskipped rdenied rrefused=""
   marker="$(last_marker "$dir" "$pr")"
   rverdict="$(printf '%s' "$marker" | cut -f1)"
   rsha="$(printf '%s' "$marker" | cut -f2)"
   rsource="marker-$(printf '%s' "$marker" | cut -f3)"
   rsig="$(printf '%s' "$marker" | cut -f4)"
   rskipped="$(skipped_markers "$dir" "$pr")"
+  rdenied="$(denied_markers "$dir" "$pr")"
+  # ⛔ THE BOX-LOCAL RECORD FILE IS EVIDENCE ONLY WHEN ITS OWN `sig=` VERIFIES (fresh-context review,
+  # round 8 — the same admission, second channel). It is weaker than a marker in the PR (nobody can
+  # audit it: no comment, no body line), and the gate refuses an unauthenticated one outright
+  # (`review_record_eval`: no `sig` field / a non-hex `sig` / no key on the box / a `sig` that does not
+  # verify are all NON-evidence, #1224 finding 3). This reader used to read it on trust, so a
+  # hand-written file at the store path satisfied `review_record` AND `review_bound` — an unauthenticated
+  # artifact deciding the predicate the capstone closes on. Refusal is REPORTED (`rrefused`), never silent.
   if [ -z "$rsha" ] && [ -s "$dir/record.json" ]; then
+    local recpr recsig recsig_text recok=""
     rverdict="$(sed -nE 's/.*"verdict"[[:space:]]*:[[:space:]]*"([a-z-]+)".*/\1/p' "$dir/record.json" | head -1)"
     rsha="$(sed -nE 's/.*"head_sha"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "$dir/record.json" | head -1)"
     rsource="record-file(weaker: not in the PR)"
+    recpr="$(sed -nE 's/.*"pr"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$dir/record.json" | head -1)"
+    recsig="$(sed -nE 's/.*"sig"[[:space:]]*:[[:space:]]*"([0-9a-f]{64})".*/\1/p' "$dir/record.json" | head -1)"
+    if [ -z "$recsig" ]; then
+      rrefused="the box-local record file at head ${rsha:0:12} carries NO sig= field, so nothing binds its content to the review gate (the gate refuses exactly this)"
+    elif [ -z "$GATE_KEY" ]; then
+      rrefused="the box-local record file at head ${rsha:0:12} carries a sig= that cannot be VERIFIED — no AI_REVIEW_GATE_KEY in the environment or at ~/.pi/agent/.ai-review-gate-key on this box"
+    elif [ -z "$recpr" ]; then
+      rrefused="the box-local record file carries no pr field, so it attests no revision"
+    else
+      recsig_text="$(printf 'review-record:v1:%s:%s:%s:%s' "$recpr" "$rsha" "$rverdict" "$REPO")"
+      [ "$(printf '%s' "$recsig_text" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null \
+        | command awk '{print $NF}' || true)" = "$recsig" ] && recok=1
+      [ -n "$recok" ] || rrefused="the box-local record file sig= does not verify under this box gate key — written under another key, edited after minting, or minted for a different revision"
+    fi
+    if [ -n "$recok" ]; then
+      rsource="record-file(sig verified)"
+    else
+      rsha=""; rverdict=""
+    fi
   fi
 
   if [ -z "$rsha" ]; then
-    emit review_record INCONCLUSIVE "no ADMITTED review record for this PR at $REPO${rskipped:+ · refused as naming another repo: $rskipped} — the reviewed head is unknown here (a marker that names another repo is not evidence: record-review.sh refuses it, PR numbers collide across repos)"
+    emit review_record INCONCLUSIVE "no ADMITTED review record for this PR at $REPO${rskipped:+ · refused as naming another repo: $rskipped}${rdenied:+ · refused by ADMISSION: $rdenied}${rrefused:+ · $rrefused} — the reviewed head is unknown here (a marker that names another repo is not evidence: record-review.sh refuses it, PR numbers collide across repos; a comment from an unattested author or with an unverifiable sig is not evidence either: the gate refuses it)"
     emit review_bound INCONCLUSIVE "no reviewed head to bind to the landed tree"
     emit fix_round INCONCLUSIVE "no record history to read a fix round from"
     emit green_gated INCONCLUSIVE "no reviewed head, so no head to read a check surface at"
@@ -779,7 +935,7 @@ analyse() { # analyse <dir> <pr>
     # check surface uses: an unrecognised verdict is unknown, never clean.
     case "$rverdict" in
       clean|clean-micro|clean-low)
-        emit review_record PASS "verdict=$rverdict head=${rsha:0:12} source=$rsource sig=$([ "$rsig" = sig ] && echo unverified || echo absent)${rskipped:+ · refused-as-foreign:$rskipped}" ;;
+        emit review_record PASS "verdict=$rverdict head=${rsha:0:12} source=$rsource auth=$rsig${rskipped:+ · refused-as-foreign:$rskipped}${rdenied:+ · refused-by-admission:$rdenied}" ;;
       not-clean)
         emit review_record FAIL "the standing record at head ${rsha:0:12} is NOT-CLEAN (source=$rsource) — a reviewer REFUSED this revision, so no clean review covers the content that landed${rskipped:+ · refused-as-foreign:$rskipped}" ;;
       "")
@@ -807,37 +963,58 @@ analyse() { # analyse <dir> <pr>
       fi
     fi
 
-    # ── 4 fix_round — a not-clean must be superseded at a DIFFERENT head, LATER in the record ──
+    # ── 4 fix_round — the round must have CONVERGED: a clean tier at a head LATER than the last ──
+    # refusal, in the record's own history.
     # the PR's whole admitted record history, both channels, oldest first: this is HISTORY, so the
     # weaker channel is legitimate here even though it is not for the current verdict (F3).
-    local hist superseded firstnc
+    #
+    # ⛔ THE ANCHOR IS the LAST `not-clean`, NOT THE FIRST (fresh-context review, round 8 — P2, a FALSE
+    # FAIL measured by execution). The old reader took the FIRST not-clean and asked what came
+    # immediately AFTER it, so the ordinary shape `not-clean@H1 → not-clean@H2 → clean@H3` — a fix that
+    # needed two rounds and converged, the repo allows up to ten review cycles — reported
+    # `FAIL fix_round "the round did not converge"` and exit 1 while the same report printed
+    # `PASS review_record verdict=clean head=H3`. The false FAIL is the #3996 class the header says gets
+    # an instrument ignored, on capstone condition 4, for the ordinary shape of a two-round PR. What the
+    # condition asks is whether the PR's LAST refusal was answered by a clean record at a later head;
+    # "a reviewer still refuses this PR" is only true when the NEWEST marker is still not-clean.
+    local hist verdict_of lastnc
     hist="$(markers_from "$dir" "$pr" '*')"
-    firstnc="$(printf '%s\n' "$hist" | awk -F'\t' '$1 == "not-clean" { print substr($2,1,12); exit }')"
+    verdict_of=""
+    lastnc="$(printf '%s\n' "$hist" | awk -F'\t' '
+      # walk to the END: the anchor is the last refusal, and `bad` keeps that head for the differ test
+      { if ($1 == "not-clean") { last = substr($2,1,12); bad = $2 } }
+      END { if (last != "") print last }
+    ')"
     if [ -z "$hist" ]; then
       emit fix_round INCONCLUSIVE "no admitted record history for this PR on this box — a fix round cannot be read from nothing"
-    elif [ -z "$firstnc" ]; then
+    elif [ -z "$lastnc" ]; then
       emit fix_round N/A "no not-clean verdict in this PR's record history — no fix round was owed"
     else
-      # the FIRST later marker whose head differs from the not-clean one — later, not merely different
-      superseded="$(printf '%s\n' "$hist" | awk -F'\t' '
-        { if (found) { if ($2 != bad) { print $1 "@" substr($2,1,12); exit } } else if ($1 == "not-clean") { found = 1; bad = $2 } }
+      # two facts after the LAST refusal: is there a CLEAN tier at a different (later) head, and is the
+      # NEWEST marker still a refusal?
+      verdict_of="$(printf '%s\n' "$hist" | awk -F'\t' '
+        { v[NR] = $1; s[NR] = $2 }
+        END {
+          last = 0
+          for (i = 1; i <= NR; i++) if (v[i] == "not-clean") last = i
+          bad = s[last]
+          # later, not merely different: a clean marker AFTER the last refusal, at another head
+          for (i = last + 1; i <= NR; i++)
+            if ((v[i] == "clean" || v[i] == "clean-micro" || v[i] == "clean-low") && s[i] != bad) {
+              printf "CLEAN\t%s@%s\n", v[i], substr(s[i],1,12); exit
+            }
+          printf "NEWEST\t%s\n", v[NR]
+        }
       ')"
-      if [ -n "$superseded" ]; then
-        # ⛔ A SUPERSEDING `not-clean` IS NOT A FIX ROUND (round 4 F2). The old test was "a LATER marker
-        # at a DIFFERENT head", which `not-clean → not-clean` satisfies — a round in which nothing was
-        # fixed, reported as PASS by a predicate whose name asserts that something was. The superseding
-        # verdict must be a CLEAN tier; anything else means the round did not converge.
-        case "$superseded" in
-          clean@*|clean-micro@*|clean-low@*)
-            emit fix_round PASS "not-clean@$firstnc was superseded by $superseded — the verdict triggered a clean re-record at a new head" ;;
-          not-clean@*)
-            emit fix_round FAIL "not-clean@$firstnc was followed by ANOTHER not-clean ($superseded) — the round did not converge: a reviewer still refuses this PR after the fix" ;;
-          *)
-            emit fix_round INCONCLUSIVE "not-clean@$firstnc was followed by $superseded, whose verdict is not one this tool knows — the round's outcome is unknown" ;;
-        esac
-      else
-        emit fix_round FAIL "not-clean@$firstnc was never superseded by a record at a different head — no fix round followed the verdict"
-      fi
+      case "$verdict_of" in
+        CLEAN*)
+          emit fix_round PASS "not-clean@$lastnc was superseded by $(printf '%s' "$verdict_of" | cut -f2) — the verdict triggered a clean re-record at a new head" ;;
+        *$'\t'not-clean)
+          # nothing but refusals followed the last refusal: the round genuinely did not converge
+          emit fix_round FAIL "not-clean@$lastnc is the NEWEST record for this PR — the round did not converge: a reviewer still refuses this PR after the fix" ;;
+        *)
+          emit fix_round FAIL "not-clean@$lastnc was never superseded by a record at a different head — no fix round followed the verdict" ;;
+      esac
     fi
 
     # ── 5 green_gated — the surface AS THE LANDING SAW IT ──────────────────────────────────────
@@ -991,17 +1168,31 @@ if [ "$JSON" -eq 1 ]; then
     # JSON escape), while the `"\\\\\\\\"` replacement yields two on gawk and FOUR on mawk. Building
     # the escape from concatenated SINGLE-CHARACTER literals removes the replacement rules entirely:
     # verified identical on gawk, mawk, nawk and `awk --posix`.
-    function jstr(s,   o, i, c) {
+    # ⛔ AND A CONTROL BYTE IS ESCAPED TOO (fresh-context review, round 8, P3). `\\` and `"` alone left
+    # every byte below 0x20 emitted RAW — `json.load` failed with `Invalid control character at char
+    # 122` on a snapshot whose `mergedAt` carried one — so the evidence file was invalid JSON from a
+    # hand-made or foreign snapshot (the same class the suite already accepted for backslash+quote, one
+    # character set short). RFC 8259 §7 requires every character below 0x20 to be escaped; `\\u00XX`
+    # is the portable spelling here because `\\b`/`\\f`/`\\n`/`\\r`/`\\t` short forms and octal escapes
+    # vary across awks. Built from a one-character lookup table, so no numeric-to-string conversion and
+    # no format trap: verified identical on gawk, mawk and `awk --posix`.
+    function jstr(s,   o, i, c, h) {
       o = ""
       for (i = 1; i <= length(s); i++) {
         c = substr(s, i, 1)
         if (c == "\\")      o = o "\\" "\\"
         else if (c == "\"") o = o "\\" "\""
-        else                o = o c
+        else if (c in CTL)    o = o "\\u00" CTL[c]
+        else                  o = o c
       }
       return "\"" o "\""
     }
-    BEGIN { printf "{\"prs\":["; firstpr = 1 }
+    BEGIN {
+      # 0x00-0x1f, one entry per byte, the code being the two hex digits JSON wants
+      split("00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f", H, " ")
+      for (i = 1; i < 32; i++) CTL[sprintf("%c", i)] = H[i + 1]
+      printf "{\"prs\":["; firstpr = 1
+    }
     $1 == "@@PR" { if (!firstpr) printf "]}"; printf "%s{\"pr\":%s,\"checks\":[", (firstpr ? "" : ","), $2; firstpr = 0; n = 0; next }
     NF >= 3 { if (n++) printf ","; printf "{\"check\":%s,\"verdict\":%s,\"detail\":%s}", jstr($1), jstr($2), jstr($3); next }
     END { if (!firstpr) printf "]}"; printf "]}\n" }

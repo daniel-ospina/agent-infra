@@ -23,6 +23,7 @@ bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=$((fail + 1)); }
 ck()  { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
 
 T="$(mktemp -d)"; MUT="$T/mut"; trap 'rm -rf "$T"' EXIT
+mkdir -p "$T/home"   # the pinned, key-less HOME `run_verify` reads
 [ -s "$SCRIPT" ] || { bad "verify-landing-chain.sh is missing or empty"; exit 1; }
 
 # ── fixture helpers ───────────────────────────────────────────────────────────────────────────────
@@ -46,6 +47,24 @@ mk() { # mk <case-name> <pr>  → prints the snapshot root
   printf 'review recorded: reviews/%s.json verdict=clean @ %s (o/r)\n' "$pr" "$HEAD" > "$root/pr-$pr/body.txt"
   : > "$root/pr-$pr/comments.txt"
   printf '%s\n' "$root"
+}
+
+# comment <root> <pr> <author_association> <body…> — append ONE comment in the PRODUCER's frame
+# (`<author_association>\x1f<body>\x1e`, `check-pipeline-compliance.sh`'s REVIEW_COMMENTS_JQ). A fixture
+# must speak the producer's grammar: the old `<<<COMMENT>>>` line frame carried no author at all, which
+# is why nothing downstream could apply the gate's admission rule for a whole review cycle.
+comment() {
+  local root="$1" pr="$2" assoc="$3" body="$4"
+  printf '%s\037%s\036' "$assoc" "$body" >> "$root/pr-$pr/comments.txt"
+}
+TEST_KEY="a-test-gate-key"
+sign_marker() { # sign_marker <marker text> [key] → prints "… sig=<hex>", exactly as the recorder does
+  printf '%s sig=%s' "$1" \
+    "$(printf '%s' "$1" | openssl dgst -sha256 -hmac "${2:-$TEST_KEY}" 2>/dev/null | awk '{print $NF}')"
+}
+record_sig() { # record_sig <pr> <head> <verdict> <repo> [key] → the gate's canonical record HMAC
+  printf 'review-record:v1:%s:%s:%s:%s' "$1" "$2" "$3" "$4" \
+    | openssl dgst -sha256 -hmac "${5:-$TEST_KEY}" 2>/dev/null | awk '{print $NF}'
 }
 
 # group <root> <pr> <check-run id> <workflow-run-id> <job name> <status> <conclusion> <completed_at>
@@ -84,11 +103,20 @@ rail_land() {
 # asserted where the detail is the finding), and the JSON is what a report file consumes (so its SHAPE
 # is asserted where the verdict is the finding). Asserting one and reading the other is how a suite
 # passes over a report nobody can parse.
+# ⛔ HERMETIC AT THE GATE KEY TOO (fresh-context review, round 8). Since the review-record admission was
+# added, the reader verifies a marker`s `sig=` against AI_REVIEW_GATE_KEY (env first, else
+# `$HOME/.pi/agent/.ai-review-gate-key`) — and every box that MINTS review records has that key file.
+# Unpinned, the same fixture would be admitted on a dev box and refused on a CI runner, which is the
+# opposite of hermetic. So `HOME` is a fresh empty directory, and VKEY is the ONLY way a case supplies a
+# key: empty means "no key on this box" (the association is then the admission, as on a runner), a value
+# means "a key resolves here, so a sig must verify".
+VKEY=""
+run_verify() { HOME="$T/home" AI_REVIEW_GATE_KEY="$VKEY" bash "$SCRIPT" "$@"; }
 verify() { # verify <root> [extra args]  → sets OUT (text), OUTJ (json), returns the script's exit code
   local root="$1"; shift
-  OUT="$(bash "$SCRIPT" --from-snapshot "$root" --repo "$REPO_FIXTURE" "$@" 2>&1)"
+  OUT="$(run_verify --from-snapshot "$root" --repo "$REPO_FIXTURE" "$@" 2>&1)"
   rc=$?
-  OUTJ="$(bash "$SCRIPT" --from-snapshot "$root" --repo "$REPO_FIXTURE" --json "$@" 2>&1)"
+  OUTJ="$(run_verify --from-snapshot "$root" --repo "$REPO_FIXTURE" --json "$@" 2>&1)"
   return $rc
 }
 # ⛔ NO `printf | grep -q` (round 4, F1 — BLOCKING). That shape is the SIGPIPE false-negative idiom
@@ -143,7 +171,8 @@ R="$(mk no-fix-round 405)"
 printf 'review recorded: reviews/405.json verdict=not-clean @ %s (o/r) findings=2\n' "$HEAD" > "$R/pr-405/body.txt"
 run "$R" 405 9001 "CI" 1; group "$R" 405 10 9001 "unit-test" completed success "$MERGED_AT"
 verify "$R"; rc=$?
-ck "no-fix-round: fix_round FAIL" "$(has "was never superseded by a record at a different head"; echo $?)"
+ck "no-fix-round: fix_round FAIL (the only marker IS the refusal)" "$(has "is the NEWEST record for this PR"; echo $?)"
+ck "no-fix-round: …and it is not reported as a round that converged" "$(has "did not converge"; echo $?)"
 ck "no-fix-round exits 1" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
 
 # ── case 6: ⛔ THE RE-RUN LAUNDER — red completed BEFORE the merge, green AFTER. Must stay RED. ──
@@ -208,7 +237,7 @@ ck "json-escaping: …and the detail round-trips to the bytes the report printed
 # the same report rendered by a POSIX-mode awk, when this box has one: this is the read that the
 # escaped-replacement form could NOT survive, so it pins the portable-subset contract directly.
 if awk --posix 'BEGIN{}' >/dev/null 2>&1; then
-  OUTP="$(VERIFY_AWK='awk --posix' bash "$SCRIPT" --from-snapshot "$R" --repo "$REPO_FIXTURE" --json 2>&1)"
+  OUTP="$(VERIFY_AWK='awk --posix' run_verify --from-snapshot "$R" --repo "$REPO_FIXTURE" --json 2>&1)"
   ck "json-escaping: the --json emitter is valid JSON under a POSIX-mode awk too" \
     "$(printf '%s' "$OUTP" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; echo $?)"
   ck "json-escaping: …and it carries the same escaped backslash there" \
@@ -357,12 +386,44 @@ verify "$R"
 ck "unmerged: merged FAIL" "$(hasj '"check":"merged","verdict":"FAIL"'; echo $?)"
 
 # ── case 15: the record-file FALLBACK (a body with no marker) is a weaker but valid source ───────
+# ⛔ THE RECORD FILE IS EVIDENCE ONLY WHEN ITS OWN `sig=` VERIFIES (fresh-context review, round 8 — the
+# same admission, second channel). It leaves no trace on the PR — nobody can audit it — so an
+# unauthenticated file at the store path was the worst half of the false-PASS class: it satisfied
+# `review_record` AND `review_bound` from a `printf`. The gate refuses it (#1224 finding 3), so this
+# reads it the same way: signed under the box's key ⇒ PASS naming `sig verified`; unsigned, or signed
+# with no key on the box, ⇒ refused and REPORTED, never promoted.
 R="$(mk record-file-fallback 418)"
 : > "$R/pr-418/body.txt"
-printf '{"pr":418,"head_sha":"%s","verdict":"clean","repo":"o/r"}\n' "$HEAD" > "$R/pr-418/record.json"
+printf '{"pr":418,"head_sha":"%s","sig":"%s","verdict":"clean","repo":"o/r"}\n' \
+  "$HEAD" "$(record_sig 418 "$HEAD" clean o/r)" > "$R/pr-418/record.json"
 run "$R" 418 9001 "CI" 1; group "$R" 418 10 9001 "unit-test" completed success "$MERGED_AT"
-verify "$R"
-ck "record-file-fallback: review_record PASS with source=record-file" "$(has "source=record-file"; echo $?)"
+rail_land "$R" 418
+VKEY="$TEST_KEY"; verify "$R"; rc=$?; VKEY=""
+ck "record-file-fallback: a SIGNED record file is admitted, naming the verification" \
+  "$(has "source=record-file(sig verified)"; echo $?)"
+ck "record-file-fallback: …and no row FAILs (a signed record is not a refusal)" \
+  "$(has "VERDICT: NOT-ALL-MET" && echo 1 || echo 0)"
+ck "record-file-fallback: …and the run is INCOMPLETE, because a record FILE carries no marker HISTORY for fix_round to read" \
+  "$(has "VERDICT: INCOMPLETE" && echo 0 || echo 1)"
+# …and the SAME file with no sig= is refused (no key resolves here, so nothing could verify it anyway)
+R="$(mk record-file-unsigned 474)"
+: > "$R/pr-474/body.txt"
+printf '{"pr":474,"head_sha":"%s","verdict":"clean","repo":"o/r"}\n' "$HEAD" > "$R/pr-474/record.json"
+run "$R" 474 9001 "CI" 1; group "$R" 474 10 9001 "unit-test" completed success "$MERGED_AT"
+verify "$R"; rc=$?
+ck "record-file-unsigned: an UNSIGNED record file is refused, not adopted" \
+  "$(has "carries NO sig= field"; echo $?)"
+ck "record-file-unsigned: …and the run exits 2, never 0" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
+# …and a sig that does not verify under the present key is refused too (a different key / edited file)
+R="$(mk record-file-badsig 475)"
+: > "$R/pr-475/body.txt"
+printf '{"pr":475,"head_sha":"%s","sig":"%s","verdict":"clean","repo":"o/r"}\n' \
+  "$HEAD" "$(record_sig 475 "$HEAD" clean o/r "another-key")" > "$R/pr-475/record.json"
+run "$R" 475 9001 "CI" 1; group "$R" 475 10 9001 "unit-test" completed success "$MERGED_AT"
+VKEY="$TEST_KEY"; verify "$R"; rc=$?; VKEY=""
+ck "record-file-badsig: a sig that does not verify is refused" \
+  "$(has "sig= does not verify under this box gate key"; echo $?)"
+ck "record-file-badsig: …and the run exits 2, never 0" "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
 
 # ── case 16: NO record at all is INCONCLUSIVE — an absent attestation is not a clean one ─────────
 R="$(mk no-record 419)"
@@ -383,7 +444,7 @@ for p in 420 421; do
   sed -i.bak -e "s/^401/$p/" "$ROOT/pr-$p/pr.meta" 2>/dev/null || true
   rm -f "$ROOT/pr-$p"/*.bak
 done
-OUT="$(bash "$SCRIPT" --from-snapshot "$ROOT" --repo "$REPO_FIXTURE" 2>&1)"
+OUT="$(run_verify --from-snapshot "$ROOT" --repo "$REPO_FIXTURE" 2>&1)"
 n="$(printf '%s\n' "$OUT" | grep -c '^PR #')"
 ck "snapshot-auto: every PR in the snapshot is verified (saw $n of 2)" "$([ "$n" -eq 2 ] && echo 0 || echo 1)"
 
@@ -445,8 +506,7 @@ ck "F2b: an unread workflow list is INCONCLUSIVE (grouping would be unsound)" "$
 # F3 — a marker naming ANOTHER repo is not evidence for this head
 R="$(mk f3-foreign-marker 444)"
 : > "$R/pr-444/body.txt"
-printf '<<<COMMENT>>>\nreview recorded: reviews/444.json verdict=clean @ %s (someone-else/other-repo)\n' "$HEAD" \
-  > "$R/pr-444/comments.txt"
+comment "$R" 444 OWNER "$(printf 'review recorded: reviews/444.json verdict=clean @ %s (someone-else/other-repo)\n' "$HEAD")"
 run "$R" 444 9001 "CI" 1; group "$R" 444 10 9001 "unit-test" completed success "$MERGED_AT"
 verify "$R"
 ck "F3: a foreign-repo marker is REFUSED, not adopted (review_record INCONCLUSIVE)" "$(hasj '"check":"review_record","verdict":"INCONCLUSIVE"'; echo $?)"
@@ -553,7 +613,7 @@ run "$R" 448 9001 "CI" 1
 group "$R" 448 10 9001 "unit-test" completed success "$MERGED_AT"
 : > "$R/pr-448/body.txt"
 : > "$R/pr-448/body.txt.unread"
-printf '<<<COMMENT>>>\nreview recorded: reviews/448.json verdict=clean @ %s (o/r)\n' "$HEAD" > "$R/pr-448/comments.txt"
+comment "$R" 448 OWNER "$(printf 'review recorded: reviews/448.json verdict=clean @ %s (o/r)\n' "$HEAD")"
 verify "$R"; rc=$?
 ck "F3c: an unread body makes review_record INCONCLUSIVE" "$(has "the record channel(s) body.txt were NOT READ"; echo $?)"
 ck "F3c: …and it does NOT promote the comment marker to PASS" "$(has "PASS  review_record" && echo 1 || echo 0)"
@@ -579,7 +639,7 @@ ck "F3c-route: …and still exits 2, because the record is unknown" "$([ "$rc" -
 # F3b — a comment-only marker IS admitted, but declared as the weaker source the recorder refuses
 R="$(mk f3-comment-marker 445)"
 : > "$R/pr-445/body.txt"
-printf '<<<COMMENT>>>\nreview recorded: reviews/445.json verdict=clean @ %s (o/r)\n' "$HEAD" > "$R/pr-445/comments.txt"
+comment "$R" 445 OWNER "$(printf 'review recorded: reviews/445.json verdict=clean @ %s (o/r)\n' "$HEAD")"
 run "$R" 445 9001 "CI" 1; group "$R" 445 10 9001 "unit-test" completed success "$MERGED_AT"
 rail_land "$R" 445
 verify "$R"
@@ -660,7 +720,7 @@ PYEOF
   printf '%s\n' "$d/verify-landing-chain.sh"
 }
 verify_with() { # verify_with <script> <root> → sets AOUT (report) and AOUT_RC (the mutant's exit)
-  AOUT="$(bash "$1" --from-snapshot "$2" --repo "$REPO_FIXTURE" 2>&1)"
+  AOUT="$(HOME="$T/home" AI_REVIEW_GATE_KEY="$VKEY" bash "$1" --from-snapshot "$2" --repo "$REPO_FIXTURE" 2>&1)"
   AOUT_RC=$?
 }
 # A mutant that did not produce a REPORT proves nothing. 0/1/2 are the verdict ladder; 3 is usage and
@@ -757,8 +817,7 @@ MS="$(mutant f3-no-repo-filter 'if (tolower(repo) != fold) { printf "SKIP' 'if (
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-foreign-marker 435)"
 : > "$R/pr-435/body.txt"
-printf '<<<COMMENT>>>\nreview recorded: reviews/435.json verdict=clean @ %s (someone-else/other-repo)\n' "$HEAD" \
-  > "$R/pr-435/comments.txt"
+comment "$R" 435 OWNER "$(printf 'review recorded: reviews/435.json verdict=clean @ %s (someone-else/other-repo)\n' "$HEAD")"
 run "$R" 435 9001 "CI" 1; group "$R" 435 10 9001 "unit-test" completed success "$MERGED_AT"
 verify_with "$MS" "$R"
 mutation_verdict M6 "refused as naming another repo" \
@@ -833,7 +892,7 @@ rail_land "$R" 436
 run "$R" 436 9001 "CI" 1; group "$R" 436 10 9001 "unit-test" completed success "$MERGED_AT"
 : > "$R/pr-436/body.txt"
 : > "$R/pr-436/body.txt.unread"
-printf '<<<COMMENT>>>\nreview recorded: reviews/436.json verdict=clean @ %s (o/r)\n' "$HEAD" > "$R/pr-436/comments.txt"
+comment "$R" 436 OWNER "$(printf 'review recorded: reviews/436.json verdict=clean @ %s (o/r)\n' "$HEAD")"
 verify_with "$MS" "$R"
 mutation_verdict M7 "were NOT READ" \
   "reading through an unread body promotes a weaker comment marker — case F3c is discriminating"
