@@ -298,6 +298,36 @@ REG_DEF="$(sed -n 's/^DEFAULT_BUDGET_S = \([0-9][0-9]*\).*/\1/p' "$REG" | head -
 case "${REG_DEF:-}" in ''|*[!0-9]*) REG_DEF="" ;; esac
 [ -n "${REG_DEF:-}" ] && [ "$REG_DEF" = "${SEAM:-x}" ]; rc=$?
 ck "(i0) lane_registry's DEFAULT_BUDGET_S (${REG_DEF:-UNREADABLE — the arm cannot assert a lease it cannot derive}s) is the harness BACKSTOP (${SEAM:-?}s), not a stale copy that would read a live lane EXPIRED" $rc
+# ⛔ THE OTHER THREE COPIES OF THE SEAM, EACH READ FROM THE FILE THAT OWNS IT (agent-infra#4034 review,
+# P2 — verified). The PR body claimed `(i0)` pins all eight listed files; measured at `c90e1878ab84`, three
+# of them were pinned by NOTHING and the claim was therefore false:
+#   * `fix-one.sh`'s `_FIX_BOUND_FALLBACK` — BOTH of its literals (the `${LANE_BACKSTOP_S:-…}` seed and the
+#     `|| _FIX_BOUND_FALLBACK=…` coercion). This is the only path that sets `FIX_BOUND` outside a lane shell,
+#     and `FIX_LEASE` is derived from it, so a drifted fallback shortens the run AND the lease while the
+#     lease arm above (which derives from `$SEAM`) stays green.
+#   * `lane-bound.sh`'s `LANE_BOUND_WALL_S` default — the wall for every launcher that runs `lane-bound.sh`
+#     directly (`mac-lane.sh`). The ordering arm above is satisfied by 7201 as well as by 36000, so the OLD
+#     default passed it: only equality with the seam pins it.
+#   * `install-drainer-timer.sh`'s `DRAINER_LANE_TIMEOUT` fallback — the value `--status`'s
+#     `want="${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}"` resolves through when the seam is unreadable, so a
+#     drifted value renders a STALE cap and prints CLEAN, which is the false PASS exit 3 exists to remove.
+# Each arm FAILS when its literal is unreadable (never falls back to a number here: a default in the test
+# is the same defect wearing a default's clothes).
+FIX_SEED="$(sed -n 's/^[[:space:]]*_FIX_BOUND_FALLBACK="\${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/fix-one.sh" | head -1)"
+case "${FIX_SEED:-}" in ''|*[!0-9]*) FIX_SEED="" ;; esac
+[ -n "${FIX_SEED:-}" ] && [ "$FIX_SEED" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) fix-one.sh's _FIX_BOUND_FALLBACK seed (${FIX_SEED:-UNREADABLE}s) is the harness BACKSTOP (${SEAM:-?}s) — the run AND the lease derived from it cannot be shortened by a stale copy" $rc
+FIX_COERCE="$(sed -n 's/^[[:space:]]*is_limit "\$_FIX_BOUND_FALLBACK" || _FIX_BOUND_FALLBACK=\([0-9][0-9]*\).*/\1/p' "$HERE/fix-one.sh" | head -1)"
+case "${FIX_COERCE:-}" in ''|*[!0-9]*) FIX_COERCE="" ;; esac
+[ -n "${FIX_COERCE:-}" ] && [ "$FIX_COERCE" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) …and its malformed-value coercion (${FIX_COERCE:-UNREADABLE}s) is the same number, so an unparseable FIX_TIMEOUT cannot shorten the lease either" $rc
+# `WALL_DEF` is read above; this is the EQUALITY the ordering arm cannot express (7201 > 2700 too).
+[ -n "${WALL_DEF:-}" ] && [ "$WALL_DEF" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) lane-bound.sh's WALL default (${WALL_DEF:-?}s) IS the harness BACKSTOP (${SEAM:-?}s), not merely above the allowance — a launcher that runs lane-bound.sh directly takes its wall from here" $rc
+INSTALL_FB="$(sed -n 's/.*DRAINER_LANE_TIMEOUT=\([0-9][0-9]*\) ;;.*/\1/p' "$HERE/install-drainer-timer.sh" | head -1)"
+case "${INSTALL_FB:-}" in ''|*[!0-9]*) INSTALL_FB="" ;; esac
+[ -n "${INSTALL_FB:-}" ] && [ "$INSTALL_FB" = "${SEAM:-x}" ]; rc=$?
+ck "(i0) install-drainer-timer.sh's DRAINER_LANE_TIMEOUT fallback (${INSTALL_FB:-UNREADABLE}s) is the harness BACKSTOP (${SEAM:-?}s) — a drifted value would render a stale pin AND print --status clean" $rc
 REAP_LIVE="$(sed -n 's/^LIVE_MIN="${LANE_REAP_LIVE_MIN:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/lane-reap.sh" | head -1)"
 [ -n "${REAP_LIVE:-}" ] && [ $(( REAP_LIVE * 60 )) -gt "${SEAM:-0}" ]; rc=$?
 ck "(i0) the reaper's LIVE window (${REAP_LIVE:-?} min) stays above the BACKSTOP (${SEAM:-?}s) — a live lane is not counted dead for capacity" $rc
