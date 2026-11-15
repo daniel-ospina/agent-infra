@@ -5736,7 +5736,7 @@ N_LIVECNT_MUT="$T/mutant-livecnt-narrowed.sh"
 # the line, so a future separator/shape edit does NOT silently turn this pin into a no-op; only a
 # change that moves `live_count=1` onto another line does, and the `cmp -s` guard below turns THAT
 # into a red rather than a green pin.
-sed 's#^    grep -qiE "(^|\[^\[:alnum:\]\])${_OC_CNT}${_OC_SEP}.*live_count=1$#    grep -qiE "(^|[^0-9])[1-9][0-9]*[[:space:]_-]*(block(ing|ers?)|\(?p[01]\)?)" <<<"$line" \&\& live_count=1#' "$RECORD" > "$N_LIVECNT_MUT"
+sed 's#^    grep -qiE "(^|\[^\[:alnum:\]\])${_OC_CNT}${_OC_SEP}.*live_count=1$#    grep -qiE "(^|[^0-9])[1-9][0-9]*[[:space:]_-]*(block(ing|ers?)|\\(?p\[01\]\\)?)" <<<"$line" \&\& live_count=1#' "$RECORD" > "$N_LIVECNT_MUT"
 if cmp -s "$RECORD" "$N_LIVECNT_MUT"; then
     bad "13n76 MUTANT: the live_count sed anchor no longer matches — re-anchor the pin rather than dropping it"
 else
