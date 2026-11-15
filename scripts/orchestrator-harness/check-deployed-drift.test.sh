@@ -814,7 +814,7 @@ ck "10e: …and the message NAMES the extensions it looked for (not a bare '*.sh
 # down, in the row that tells the reader what to do about it. Pinned here so it cannot silently
 # regress to a single-suffix claim.
 ck "10e: …and the (c) REMEDY row names the same set, not a bare '*.sh'" \
-   "$(qF '(c) executing tree' "$OUT" && qF 'NO readable shipped file (*.sh, *.py, *.mjs)' "$OUT" && echo 0 || echo 1)"
+   "$(qF '(c) executing tree' "$OUT" && qF 'NO readable shipped file (*.sh, *.py, *.mjs, gh-app-token)' "$OUT" && echo 0 || echo 1)"
 
 # (10f) THE ARGV SPELLINGS THE POSITIONAL READ DROPPED (review of #3202). `ps -eo command=` writes the
 # `/usr/bin/env` form for a wrapped controller, and the parse this replaces required the shell at `t[1]`
@@ -1154,13 +1154,105 @@ OUT="$( cd "$TMP" && HOME="$EMPTYHOME6" CELL_HOME="" HARNESS="$D12e" HARNESS_PIN
         bash "$WIDENED" --o "$TMP/no-such-deployed" --repo "$R12" --ref main \
              --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
 ck "12e: …and the operator message names the WIDENED set, derived from the one declaration" \
-   "$(qF '*.sh, *.py, *.mjs, *.ts' "$OUT" && echo 0 || echo 1)"
+   "$(qF '*.sh, *.py, *.mjs, *.ts, gh-app-token' "$OUT" && echo 0 || echo 1)"
 # The control: the UNPATCHED script must NOT see the `.ts`, so this arm is proven to be about the
 # declaration and not about `.ts` happening to be noticed anyway.
+# ⛔ WORDED ABOUT THE DECLARATION, NOT ABOUT `.ts` (round-6 review): the subject is "the shipped
+# declaration compares only what it declares". Pinning today's three-member list would make the NEXT
+# legitimate widening — the one the comment at the declaration invites — red a row whose subject is
+# unrelated to that change.
 OUT="$( bash "$DRIFT" --o "$D12" --repo "$R12" --ref main \
         --rel scripts/orchestrator-harness --no-fetch 2>&1 )"; RC=$?
-ck "12e: …and the SHIPPED declaration does not compare .ts (rc=$RC — the fix is the declaration)" \
+ck "12e: …and the SHIPPED declaration compares only what it declares (.ts is not in it: rc=$RC)" \
    "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+
+# 12f — THE EXTENSIONLESS MEMBER IS COMPARED IN BOTH DIRECTIONS (round-6 review finding, PR #4038).
+# ⛔ THE BLIND SPOT THIS GRADES: `HARNESS_EXTS` is a SUFFIX list, so an executable harness file with no
+# suffix could never match it. `gh-app-token` is a bash script at depth 1 of the harness dir, seeded
+# into `$O` at 0755 by `install.sh:841-845` and invoked by `gh-rest/gh`, and it was compared in NEITHER
+# direction — a box running a stale or hand-placed `$O/gh-app-token` printed `OK … harness=current`,
+# rc 0. On the pre-change text BOTH red arms below are rc 0 (the name never reaches either listing), so
+# they grade the declaration rather than merely asserting that a constant exists.
+R13="$TMPR/repo13"; D13="$TMPR/run13"
+git init -q -b main "$R13" >/dev/null 2>&1 || { echo "❌ git init failed for fixture13"; exit 2; }
+mkdir -p "$R13/scripts/orchestrator-harness" "$D13"
+printf '#!/usr/bin/env bash\necho loop\n' > "$R13/scripts/orchestrator-harness/a.sh"
+printf '#!/usr/bin/env bash\nexec gh "$@"   # token v1\n' > "$R13/scripts/orchestrator-harness/gh-app-token"
+chmod +x "$R13/scripts/orchestrator-harness/a.sh" "$R13/scripts/orchestrator-harness/gh-app-token"
+( cd "$R13" && $G add -A && $G commit -q -m fixture13 ) >/dev/null 2>&1 || { echo "❌ fixture13 commit failed"; exit 2; }
+stamp13() {
+  { _pay="$( ( cd "$D13" && for f in *.sh; do $SHA_CMD "$f"; done ) | $SHA_CMD | awk '{print $1}' )"
+    printf '{\n "commit": "%s",\n "payloadSha256": "%s",\n "agentInfraDirty": false\n}\n' \
+      "$(git -C "$R13" rev-parse HEAD)" "$_pay" > "$D13/.agent-infra-stamp.json"; }
+}
+cp "$R13/scripts/orchestrator-harness/a.sh" "$R13/scripts/orchestrator-harness/gh-app-token" "$D13/"
+stamp13
+OUT="$( bash "$DRIFT" --o "$D13" --repo "$R13" --ref main --rel scripts/orchestrator-harness --no-fetch 2>&1 )"; RC=$?
+ck "12f: control — a box carrying the ref's gh-app-token is rc 0" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+printf '#!/usr/bin/env bash\nexec gh "$@"   # token v2 STALE\n' > "$D13/gh-app-token"
+OUT="$( bash "$DRIFT" --o "$D13" --repo "$R13" --ref main --rel scripts/orchestrator-harness --no-fetch 2>&1 )"; RC=$?
+ck "12f: a STALE extensionless gh-app-token is DRIFT (rc=$RC; pre-change rc 0, never compared)" \
+   "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "12f: …and it is NAMED as the file that differs" \
+   "$(qF 'gh-app-token — the deployed copy DIFFERS' "$OUT" && echo 0 || echo 1)"
+# The OTHER direction: a `$O` carrying a name the ref does not ship. Retire it at the ref and re-stamp,
+# so the only difference left is the deployed side's extra file (`$D13` keeps its stale copy on purpose).
+( cd "$R13" && $G rm -q scripts/orchestrator-harness/gh-app-token && $G commit -q -m retire-token ) >/dev/null 2>&1 \
+  || { echo "❌ fixture13 could not retire the token"; exit 2; }
+stamp13
+OUT="$( bash "$DRIFT" --o "$D13" --repo "$R13" --ref main --rel scripts/orchestrator-harness --no-fetch 2>&1 )"; RC=$?
+ck "12f: an EXTRA extensionless file in \$O is DRIFT (rc=$RC; pre-change rc 0)" \
+   "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "12f: …and it is NAMED as present-but-not-shipped" \
+   "$(qF 'gh-app-token — present in' "$OUT" && echo 0 || echo 1)"
+
+# 12g — THE CANDIDATE FILTER: a dir carrying ONLY a declared non-`.sh` file IS a harness dir
+# (round-5 review finding 1, PR #4038).
+# ⛔ THE FILTER USED TO BE `ls "$_r"/*.sh` WITH A `[ -f "$_r/orch-loop.sh" ]` FALLBACK, so a directory
+# holding only `*.py`/`*.mjs` was dropped as "not a harness dir" — including the shape #3016 case 3
+# measured (`$HOME/orchestrator` carrying only `objective.py`). No existing fixture WAS such a dir
+# (`$D11` carries `orch-loop.sh` too, which both the old glob and the fallback accept), so reverting the
+# filter left the whole suite green: an absence, invisible to every other assertion. This arm plants
+# exactly that dir, carrying only a STALE `driver.py`.
+D14="$TMPR/run14-ponly"; rm -rf "$D14"; mkdir -p "$D14"
+printf '#!/usr/bin/env python3\nprint("only local")\n' > "$D14/driver.py"
+: > "$TMP/ps-ponly"
+OUT="$( cd "$TMP" && HOME="$EMPTYHOME6" CELL_HOME="" HARNESS="$D14" HARNESS_PIN_DIR="" HARNESS_PIN_FILE="" \
+        DRIFT_PS="$PSH" PS_TABLE="$TMP/ps-ponly" \
+        bash "$DRIFT" --o "$TMP/no-such-deployed" --repo "$R11" --ref main \
+             --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
+ck "12g: a dir carrying ONLY a .py is a candidate, not dropped (rc=$RC; pre-change rc 2, no candidate)" \
+   "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "12g: …and driver.py is compared against the ref IN that dir" \
+   "$(qF 'driver.py — DIFFERS in' "$OUT" && echo 0 || echo 1)"
+ck "12g: …and the refusal that no harness dir was found did NOT fire" \
+   "$(qF 'no harness directory was found on this box' "$OUT" && echo 1 || echo 0)"
+
+# 12h — AN UNINSPECTABLE $O IS CANNOT-VERIFY (2), NOT A DRIFT (1) (round-5 finding 2 + round-6 P3,
+# PR #4038). ⛔ WHAT THIS ARM GRADES, STATED HONESTLY: the verdict, not the `[ ! -r ]||[ ! -x ]` guard —
+# measured, an unreadable and an unsearchable `$O` are BOTH already 2 without the guard, because the
+# record inside `$O` cannot be read either and record resolution answers `unknown` first. So this arm is
+# a REGRESSION PIN on the operationally important fact (an uninspectable tree is never reported as
+# drifted), and the guard's comment says the same about itself rather than claiming a fix.
+# ⛔ IT IS STILL WORTH HAVING: rc 1 here would be the worst possible answer — a MISSING line per shipped
+# file, sending an operator to redeploy a box whose contents were never read. `chmod 444` is the mode
+# that can degrade that way (the listing succeeds, `[ -f "$O/$d" ]` does not), so both modes are pinned.
+deploy
+chmod 444 "$O"
+run; _rc444=$RC; _out444="$OUT"
+chmod 755 "$O"
+ck "12h: a READ-BUT-NOT-SEARCHABLE \$O is 2 (rc=$_rc444), not one MISSING file per shipped file" \
+   "$([ "$_rc444" -eq 2 ] && echo 0 || echo 1)"
+ck "12h: …and the verdict says WHY (cannot verify), not just a non-zero code" \
+   "$(qF 'cannot verify' "$_out444" && echo 0 || echo 1)"
+deploy
+chmod 000 "$O"
+run; _rc000=$RC
+chmod 755 "$O"
+ck "12h: an UNREADABLE \$O is 2 (rc=$_rc000) on the stamp path too" \
+   "$([ "$_rc000" -eq 2 ] && echo 0 || echo 1)"
+ck "12h: …and neither mode is ever reported as 'drifted' (never a byte claim about a tree we cannot read)" \
+   "$([ "$_rc444" -ne 1 ] && [ "$_rc000" -ne 1 ] && echo 0 || echo 1)"
 
 echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"

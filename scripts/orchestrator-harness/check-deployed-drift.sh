@@ -131,7 +131,17 @@
 # ⛔ DEPTH 1 ONLY, deliberately: the `gh-rest/gh` and `gh-limit/gh` shims sit one level down. They ARE
 # covered by half 3 whenever the box carries a provenance record (its manifest is written from a
 # recursive source walk), and widening this byte arm to a recursive listing would change the "$O and
-# the checkout are the same tree" contract that README §4's `cp <harness>/* $O/` shape defines.
+# the checkout are the same tree" contract that the deploy helpers are defined against —
+# `deploy-harness.sh` copies a recursive `find . -type f` into `$O`, so the two trees ARE comparable at
+# depth 1 and only at depth 1. (An earlier draft cited "README §4's `cp <harness>/* $O/`" for this;
+# that shape is README §4 step 1's legacy `cp …*.sh` route — review finding 5, PR #4038 — and it is
+# the one documented route this widening newly reds. The contract that matters here is the helper's:
+# README §4.1 / `deploy-harness.sh:266-276`.)
+# ⛔ WHAT DEPTH 1 + THE DECLARED SET DOES **NOT** COMPARE, stated where the comparison is made rather
+# than only in the README: files at depth ≥ 2 (`retired/*`, the two `*/gh` shims), and depth-1 files
+# whose kind is in NEITHER declaration (`launchd.plist.template`, `port-provenance.txt`, the docs).
+# `HARNESS_EXTENSIONLESS` exists so that the second list is a DECISION per file, not an accident of
+# the suffix list — an executable harness file must be named there or it is not compared.
 #
 #   4a. MODE (the other half of question (b) — agent-infra#4003's post-deploy case). Every depth-1
 #      file the ref carries as `100755` — in EVERY extension of HARNESS_EXTS, because `gh-rest/gh`
@@ -485,7 +495,21 @@ fi
 # ⛔ `mjs` is in the set with no member in this directory TODAY: the pipeline's other wrappers
 # (`scripts/check-*.mjs`) are `.mjs`, and a harness wrapper added later must not need this line
 # changed before it can be compared. A declared set that only names today's files is the #4015 defect.
+# ⛔ A FUTURE `mjs` MEMBER NEEDS TWO THINGS OUTSIDE THIS FILE, named here so the author is not left to
+# discover them on a red box: `deploy-mac-orchestrator.sh`'s `is_program` (`:146`) classifies only
+# `*.sh|*.py`, and `install.sh`'s `bash -n` sweep never parses a `.mjs`. Both are deploy-time, not
+# comparison-time — declaring `mjs` here makes a `.mjs` file COMPARED, not DEPLOYED — so the arm is
+# declared ahead of need deliberately and neither file is widened by this change.
 HARNESS_EXTS="sh py mjs"
+# ⛔ EXTENSIONLESS SHIPPED FILES ARE DECLARED BY NAME, because a suffix list cannot express them and
+# an extension-only declaration silently EXCLUDES them (review finding 3, PR #4038). `gh-app-token` is
+# a bash script with no suffix, at depth 1 of this directory, seeded into `$O` at 0755 by
+# `install.sh:841-845` and invoked by `gh-rest/gh` — and before this line it was compared in NEITHER
+# direction: a stale or hand-placed `$O/gh-app-token` still read `OK … harness=current`, which is
+# #3016's blind spot in the one file class the declared set could not reach. Naming it (instead of
+# "compare every file") keeps the scoping decision: `launchd.plist.template`, `port-provenance.txt`,
+# the docs and `retired/` stay OUT of the comparison.
+HARNESS_EXTENSIONLESS="gh-app-token"
 # ⛔ DERIVED, NEVER A SECOND LITERAL (review finding 1, PR #4038). The first version of this block wrote
 # `HARNESS_EXT_RE='sh|py|mjs'` by hand beside `HARNESS_EXTS`, and then only HARNESS_EXTS_GLOB read the
 # declaration: the three COMPARISONS (the ref listing, `ship_list_dir`, the deployed listing) read the
@@ -496,6 +520,10 @@ HARNESS_EXTS="sh py mjs"
 # declaration and there is no second spelling to drift. §12e grades it behaviourally (add an extension
 # to the declaration, plant a stale file of that kind, expect a red).
 HARNESS_EXT_RE="${HARNESS_EXTS// /|}"
+# Same rule for the extensionless members: derived, never a second literal. An EMPTY declaration yields
+# `^()$`, which matches only the empty line — never every name — so an emptied list degrades to
+# "no extensionless member", not to "everything is a member".
+HARNESS_EXTENSIONLESS_RE="${HARNESS_EXTENSIONLESS// /|}"
 # The same set as an operator-facing LIST (`*.sh, *.py, *.mjs`), for the THREE messages that have to
 # say what was looked for — the `DRIFT(exec)` line, the surface arm's cannot-verify line, and the
 # `(c) executing tree` remedy row. Derived from HARNESS_EXTS so the line an operator reads cannot drift
@@ -510,6 +538,11 @@ HARNESS_EXTS_GLOB=""
 for _he in $HARNESS_EXTS; do
   HARNESS_EXTS_GLOB="${HARNESS_EXTS_GLOB:+$HARNESS_EXTS_GLOB, }*.$_he"
 done
+# …and the extensionless members, so the three messages state the WHOLE compared set: a message naming
+# fewer kinds than the check covers is the defect those messages exist to prevent.
+for _he in $HARNESS_EXTENSIONLESS; do
+  HARNESS_EXTS_GLOB="${HARNESS_EXTS_GLOB:+$HARNESS_EXTS_GLOB, }$_he"
+done
 unset _he
 # Every shipped harness file at depth 1 of <dir>, as bare basenames. Empty when the dir carries none
 # of the extensions — the CALLER decides whether emptiness is an answer or a cannot-verify, because
@@ -517,7 +550,7 @@ unset _he
 # ⛔ THIS IS A BOUNDED `ls`, NOT A WALK: a recursive listing here would descend into a deployment's
 # own subdirectories and change what the depth-1 contract compares.
 ship_list_dir() { # ship_list_dir <dir>
-  ( cd "$1" 2>/dev/null || exit 0; ls -1 2>/dev/null ) | grep -E "^[^/]+\.(${HARNESS_EXT_RE})$"
+  ( cd "$1" 2>/dev/null || exit 0; ls -1 2>/dev/null ) | grep -E "^[^/]+\.(${HARNESS_EXT_RE})$|^(${HARNESS_EXTENSIONLESS_RE})$"
 }
 
 # ── shared: the digest tools, the temp area, and every shipped file the repo carries at the ref ──
@@ -588,7 +621,7 @@ UNREC_N=0
 # `../gh-limit.py`, so a lost exec bit there is the unserialised-`gh` incident (#2041) one mode over.
 # The arm is ONE-WAY (a 100644 source is never reported), so shipping a `.py` at 100644 costs nothing.
 : > "$TMPD/mode-names"
-git -C "$REPO" ls-tree -r --name-only "$TIP" -- "$REL" 2>/dev/null | grep -E "^${REL}/[^/]+\.(${HARNESS_EXT_RE})$" > "$TMPD/repo-ship" || unknown "cannot read the harness tree at $TIP"
+git -C "$REPO" ls-tree -r --name-only "$TIP" -- "$REL" 2>/dev/null | grep -E "^${REL}/[^/]+\.(${HARNESS_EXT_RE})$|^${REL}/(${HARNESS_EXTENSIONLESS_RE})$" > "$TMPD/repo-ship" || unknown "cannot read the harness tree at $TIP"
 
 # ── 3. QUESTION (a) — does $O still hold the bytes its OWN RECORD says were deployed? ────────────
 # THE SHAPE THAT SILENTLY ATE A FIX (2026-10-28): a hand patch to `$O/merge-one.sh` was overwritten by
@@ -702,12 +735,26 @@ fi
 # knows which side changed), and repeating it as a byte difference inflates the count a reader uses to
 # judge whether the box is one bad file or many.
 if [ "$O_ABSENT" -eq 0 ]; then
-# ⛔ AN UNREADABLE $O IS CANNOT-VERIFY (exit 2), NOT "nothing to report": the two arms below read
-# this list, and an unreadable directory would make BOTH of them run zero iterations and the run
-# would print OK. An EMPTY list is a different answer — $O is readable and carries no shipped file,
-# which the second arm reports truthfully as a MISSING file for every one the repo ships.
-if [ ! -r "$O" ]; then
-  unknown "cannot list the deployed copy at $O (unreadable directory) — cannot verify"
+# ⛔ AN UNREADABLE $O IS CANNOT-VERIFY (exit 2), NOT "nothing to report". An EMPTY list is a
+# different answer — $O is readable and carries no shipped file, which the second arm reports
+# truthfully as a MISSING file for every one the repo ships.
+# ⛔ WHAT THIS GUARD ACTUALLY CHANGES — MEASURED, AND THE ANSWER IS "NOTHING TODAY" (round-5 finding 2,
+# round-6 P3, PR #4038). Both earlier drafts of this comment were wrong and are recorded rather than
+# quietly replaced. Draft 1 claimed the unguarded script would "run zero iterations and print OK": false
+# — with a mode-000 `$O` the run is already 2. Draft 2 claimed the PROV path would give 1 and this arm
+# turns it into 2: also false. Measured on this fixture at both modes (mode 000 -> rc 2, mode 444 ->
+# rc 2) the reason is the same and it is earlier than this arm: an unreadable OR unsearchable `$O`
+# cannot have its record read either, so record resolution answers `unknown … no harness record` and
+# the run is 2 before section 4 is reached. So this is NOT a fix for a live false verdict.
+# ⛔ IT IS KEPT, AND LABELLED, AS A NET: it is the only place that says out loud that an uninspectable
+# `$O` is CANNOT-VERIFY rather than "nothing to report", and it is what keeps that true if the record
+# resolution is ever reordered above this loop. `-x` is tested alongside `-r` because the dangerous
+# degradation is READ-BUT-NOT-SEARCHABLE (mode 444): `ls` succeeds, so the listing looks healthy, while
+# `[ -f "$O/$d" ]` is false for every entry — the shape that WOULD produce one MISSING line per shipped
+# file (rc 1) if it were ever reached. §12h pins rc 2 for BOTH modes; it grades the verdict, and it is
+# deliberately NOT claimed to grade this arm.
+if [ ! -r "$O" ] || [ ! -x "$O" ]; then
+  unknown "cannot list the deployed copy at $O (unreadable or unsearchable directory) — cannot verify"
 fi
 ship_list_dir "$O" > "$TMPD/deployed-ship" 2>/dev/null || : # grep's 1 (no match) is not a failure here
 
@@ -1268,7 +1315,8 @@ if [ "$SURFACE" -eq 1 ]; then
     done
   fi
   # Normalise: drop empties, dedupe, and require a REAL harness dir (a dir carrying orch-loop.sh or
-  # at least one shipped `.sh`) — a bare `ls` of an unrelated directory is not a surface.
+  # at least one shipped file of a DECLARED kind — `$HARNESS_EXTS_GLOB`) — a bare `ls` of an unrelated
+  # directory is not a surface.
   : > "$TMPD/cand"
   while IFS= read -r _d; do
     [ -n "$_d" ] || continue
