@@ -1340,6 +1340,14 @@ try {
   process.env.PATH = `${fx594ResDir}:${fx594ResPrevPath}`;
   dexpect(`#594-R4e2 a RESIDENT non-builtin (\`git ${FX594_RESIDENT}\`) is NOT alias-opaque — no alias can shadow it (P1)`,
     `git ${FX594_RESIDENT} add -P x y`, { branchState: false });
+  // ⛔ FAIL-CLOSED ON AN UNREADABLE CHILD ENV (round-11 P2). A plain `PATH=…;`
+  // ASSIGNMENT is not a `VAR=value` prefix, and the walker merges `A=1` with
+  // `export A=1` — so whether git saw it is UNKNOWN. Inheriting the guard's own
+  // PATH here is the fail-OPEN direction the round-11 fix closed (a shim git cannot
+  // find must not buy the exemption), so an unreadable env leaves the verb opaque.
+  // Over-block by design, and this row keeps it from being "tidied" into a hole.
+  dexpect(`#594-R4e4 an UNREADABLE child PATH (a \`PATH=…;\` assignment, exported-ness unknown) keeps the verb opaque (fail closed)`,
+    `PATH=/nonexistent; git ${FX594_RESIDENT} add -P x y`, { branchState: true });
 } finally {
   process.env.PATH = fx594ResPrevPath;
   try { rmSync(fx594ResDir, { recursive: true, force: true }); } catch { /* best-effort */ }
