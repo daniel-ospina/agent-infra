@@ -4902,9 +4902,29 @@ function _foldBacktickSubstitutions(body) {
  *     bash argv → [push][origin][-o][x -d y][-o][feat/from-file][HEAD:feat]   (NO delete)
  *     origin/main → allow        this head, whole-segment test → REFUSE ("$(…)")   ← FALSE BLOCK
  *
- * (2,005 rows of one class in the review's sweep.) Scanning only `${ … }`/`$( … )`/backtick BODIES
- * keeps every real case — `$(echo -d<LF>)`, `$(echo --delete<LF>)`, `` `echo -d` `` all carry the
- * spelling INSIDE the span — while text outside a span stops counting.
+ * (2,005 rows of one class in the review's sweep.) Scanning only a span's BODY keeps every real case —
+ * `$(echo -d<LF>)`, `$(echo --delete<LF>)`, `` `echo -d` `` all carry the spelling INSIDE the span —
+ * while text outside a span stops counting.
+ *
+ * ⛔ WHAT IT ACTUALLY SCANS, EXACTLY (round-18 review, P3 — the paragraph above used to claim
+ * `${ … }`/`$( … )`/backtick BODIES and the `${…}` half was never true; the loop opens a body only on
+ * `$(` and on a backtick):
+ *   SCANNED     `$( … )` (paren-matched) and `` `…` `` bodies, including inside `"…"`;
+ *   NOT SCANNED `${ … }` parameter-expansion bodies, and `$'…'` ANSI-C literals (which
+ *               `_foldAnsiCStrings` folds to a placeholder, so their TEXT is gone by the time this runs).
+ * MEASURED consequence of the `$'…'` gap — `git push origin $'-d' held/branch`, whose bash argv is
+ * `push origin -d held/branch`, i.e. a REAL delete of `held/branch`, returns `null`:
+ *   `extractPushDeleteBranch("git push origin $'-d' held/branch")` → null on `origin/main`, on the
+ *   pre-#3962 head and at this head. It is PRE-EXISTING and identical on all three (the detailed verdict
+ *   on that text is `block:push`, which is a PUSH gate, not a delete gate: the null is what stops #653
+ *   from ever seeing `held/branch`), so this is a hole to record, never a regression this change made.
+ * ⛔ AND A BLIND FIX IS A FALSE-BLOCK GENERATOR, which is why the gap is recorded instead of closed:
+ * the same scan would fire on `git push origin -o $'-d' HEAD:feat`, where the ANSI-C literal is an
+ * option VALUE (a plain push — `-o` takes `-d` as its argument), and this function has no token context
+ * to tell the two apart. Closing it needs the ANSI-C body scanned only when the literal is a WORD the
+ * shell will re-parse, i.e. the same slot-awareness `_markOptionValueSlots` provides one level up — a
+ * change to the caller's contract, not to this scanner. Until then the doc above states the truth.
+ *
  * Quoting is tracked so a backtick inside `"…"` is not read as a span opener, and the mask control
  * sentinels are normalised to spaces (a command-list newline is glued inside the word otherwise).
  * @param {string} body
@@ -5123,7 +5143,24 @@ function _maskQuotedNewlines(text) {
       i = end - 1;
       continue;
     }
-    if (ch === "'" || ch === '"') { quote = ch; quoteIsProgram = _ansiCIsProgramOperand(s.slice(0, i)); out.push(ch); continue; }
+    // ⛔ THE PROGRAM DECISION IS TAKEN AT THE LITERAL'S `$`, NOT AT ITS QUOTE (round-18 review, P1 — a
+    // measured FAIL-OPEN on the GUARDED ref). `_foldAnsiCStrings` (:5206) asks the question at the `$`
+    // and KEEPS a program operand VERBATIM; this arm then re-derived it one character later, at the
+    // `'`, where the slice ends with `$` — a word no `-c`/`eval` pattern can match — so it answered
+    // FALSE for EVERY ANSI-C program operand and re-classified the program's OWN newline as `_NL_DATA`
+    // (a word-continuation char) instead of `_NL_SPAN` (a separator). The two passes must not disagree
+    // about the same literal, so this asks at the position the fold asked at:
+    //
+    //   git push origin -d held/branch  ← from `sh -c $'git push origin -d held/branch<LF>echo done'`
+    //   before → ["held/branch\necho","done"] (target names no ref → #73 misses → ALLOW)
+    //   after  → ["held/branch","echo","done"] — same list as `origin/main` → #73 CONSULTED
+    //
+    // `$"…"` (translated string, which the fold does not special-case) is the same word, so it takes
+    // the same position. Nothing else changes: a plain `'…'`/`"…"` still asks at its own index.
+    if (ch === "'" || ch === '"') {
+      const progAt = s[i - 1] === "$" ? i - 1 : i;
+      quote = ch; quoteIsProgram = _ansiCIsProgramOperand(s.slice(0, progAt)); out.push(ch); continue;
+    }
     if (ch === "`") { btick = !btick; out.push(ch); continue; }
     if (ch === "$" && s[i + 1] === "(") { openSpan("(", null); out.push("$("); i++; continue; }
     if (ch === "$" && s[i + 1] === "{") { openSpan("{", null); out.push("${"); i++; continue; }
@@ -5295,7 +5332,12 @@ const _QS_MARK = "\u0005";
  *
  *   git push origin -o $(echo "x -d held/branch")
  *     bash argv → push origin -o x -d held/branch   (`-o` takes `x`; `-d held/branch` DELETES the ref)
- *     origin/main and the pre-5157 head refused it; a blanket value-slot exemption returned `null`.
+ *     origin/main and `51401fc9b` both REFUSED it (each on an unresolvable `held/branch\")` fragment); a
+ *     blanket value-slot exemption returned `null`.
+ *     ⚠️ PROVENANCE, corrected after review: that refusal holds for the `$( … )` spelling (and its
+ *     `--push-option` twin), NOT for the backtick twin `` -o `echo "x" -d` held/branch ``, where
+ *     `origin/main` returns `null` — i.e. it ALLOWED that one, so closing it is NEW coverage rather than
+ *     restored coverage. The blanket exemption arrived in `51401fc9b`.
  *
  * Which word of an expansion carries the spelling is UNKNOWABLE statically, so an unquoted span in a
  * value slot is treated as able to spill and the arm FIRES (#653's policy: refuse what cannot be
@@ -5673,7 +5715,19 @@ function _pushSegmentTokens(body) {
       // A token carrying BOTH markers has an UNQUOTED part, so it can split and cannot be "provably the
       // value": it takes the BARE placeholder, which the exemption rejects. Fails closed in one place.
       const mixed = t.includes(_SUBST_PLACEHOLDER);
-      tokens.push(mixed ? _SUBST_PLACEHOLDER : _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);
+      // ⛔ THE LITERAL TEXT BEFORE THE SPAN IS KEPT (round-17 review cycle 4, P2 — a false block):
+      // dropping it turned the INLINE option form into a bare span, so `-o"$(echo -d)"` — where the
+      // `-o` and its value are ONE argv word (`-o-d`), so the value cannot be a flag — lost the `-o`
+      // and was refused. The trailing `$` belongs to the `$(` opener (the mask emits `$` + `_QS_MARK`)
+      // and is not part of the word bash sees.
+      const raw = t.slice(0, t.indexOf(_QS_MARK));
+      const head = raw.endsWith("$") ? raw.slice(0, -1) : raw;
+      // What comes AFTER the span is still dropped, and that direction is SAFE rather than sloppy: the
+      // token keeps `_SUBST_PLACEHOLDER`, so any word with a suffix stays UNRESOLVABLE (`_cleanDeleteTarget`
+      // marks it, #653 refuses it) and a suffix can never turn an unknowable word into a resolvable ref
+      // name. Measured: `git push origin -d held/branch"$(cat x)"` → `["$(…)"]` (REFUSED) on this head and
+      // on the pre-fix head, vs `main`'s `["held/branch\"$(cat"]` fragment — over-refusal, not a fail-open.
+      tokens.push(mixed ? (head + _SUBST_PLACEHOLDER) : (head + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX));
       continue;
     }
     tokens.push(_unmaskDataParens(t));
@@ -5711,6 +5765,21 @@ function _pushSegmentTokens(body) {
   const _valueSlot = _markOptionValueSlots(tokens);
   const _isSpanTok = (t) => t.includes(_SUBST_PLACEHOLDER);
   const _isQuotedSpanTok = (t) => t.includes(_SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);
+  // ⛔ THE INLINE OPTION SPELLINGS ARE THE SAME WORDS AS THE SEPARATED ONES (round-17 review cycle 4, P2 —
+  // a FALSE BLOCK this PR introduced, measured against `origin/main`). `_markOptionValueSlots` models the
+  // SEPARATED slot only (`-o` then a value token), so `-o"$(echo -d)"` and `--push-option="$(echo -d)"`
+  // got no slot and the exemption could not fire — while bash sees ONE word (`-o-d`,
+  // `--push-option=-d`), i.e. `-o`'s INLINE value, which cannot be a flag:
+  //
+  //   git push origin -o"$(echo -d)" main   → argv push origin -o-d main → nothing deleted
+  //   origin/main → allow    this head (before) → REFUSE "$(…)"
+  //
+  // Narrow ON PURPOSE: only the exact `-o<VALUE>` / `--push-option=<VALUE>` forms whose value is the whole
+  // quoted span are exempted. A MERGED cluster that also carries a delete flag (`-do"$(…)"` is `-d` plus
+  // `-o` with an inline value, so `-d` IS a flag) matches neither test and keeps failing CLOSED, which is
+  // the safe direction for a form this parser does not model.
+  const _isInlineOptValue = (t) => t === "-o" + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX
+    || t === "--push-option=" + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX;
   // ⛔ ONLY A **QUOTED** SPAN CAN BE EXEMPTED FROM A VALUE SLOT (round-17 review, P1 — measured as a
   // FAIL-OPEN on the GUARDED ref). `-o`/`--push-option` consumes ONE argv word: a quoted span is exactly
   // one word, so it is provably the value and cannot be a flag — but an UNQUOTED span is word-split, so
@@ -5723,9 +5792,10 @@ function _pushSegmentTokens(body) {
   // Which expanded word carries the spelling is unknowable statically, so the unquoted case is treated as
   // ABLE TO SPILL and the arm fires (#653's policy). That is a deliberate, documented over-block on
   // `-o $(echo -d)` — whose expansion is exactly `-d`, i.e. not a push option anyone writes — and the
-  // alternative is a deleted sibling branch. The quoted spelling (`-o "$(echo -d)"`) stays exempt, which
-  // is the case the exemption was FOR.
-  const _opaqueInFlagSlot = tokens.some((t, i) => _isSpanTok(t) && !(_valueSlot[i] && _isQuotedSpanTok(t)));
+  // alternative is a deleted sibling branch. The quoted spelling (`-o "$(echo -d)"`, `-o"$(echo -d)"`)
+  // stays exempt, which is the case the exemption was FOR.
+  const _opaqueInFlagSlot = tokens.some((t, i) =>
+    _isSpanTok(t) && !((_valueSlot[i] && _isQuotedSpanTok(t)) || _isInlineOptValue(t)));
   // ⛔ "THIS SEGMENT ALREADY HAS ITS OWN DELETE FLAG" MUST BE VALUE-SLOT AWARE (round-17 review, NOTE
   // promoted — a PRE-EXISTING fail-open on the guarded ref, measured with real git on all three trees).
   // `-o`/`--push-option` consumes its argument, so an `-o -d` supplies no flag — but the raw token list

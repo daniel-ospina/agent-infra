@@ -427,6 +427,20 @@ async function partB() {
       // spelling resolves to a clean target via `pushMutations`), so the parenthesis is not what base
       // failed at, and it stays green under a full revert of the segment helper. The discriminating rows
       // are B73c/B73d/B73g/B73k-b (base) and B73e/f/h/i (intermediate revisions this PR itself shipped).
+      // ⛔ THE PR BODY CONTRADICTED THIS, AND THIS COMMENT IS THE ONE THAT IS RIGHT (round-18 review, P3
+      // — the body's "Which B73 rows discriminate against WHICH revision" lists `B73b` among the rows that
+      // discriminate against `origin/main`; that list is WRONG for B73b and the body is superseded by
+      // this measurement). MEASURED at `origin/main` on
+      // `git push origin HEAD:refs/heads/feat && (git push origin --delete held/branch)`:
+      //   verdict                = `block:push-delete`  (the SAME verdict at this head)
+      //   det.pushTargets        = ["held/branch)"]     ← the fragment this PR exists to stop reporting
+      //   pushMutations[1]       = { verb:"push", args:["origin","--delete","held/branch"], isDelete:true,
+      //                            targets:["held/branch"] }        ← CLEAN, so base already had it
+      // and `index.ts`'s `block:push-delete` arm (UNCHANGED by this PR — it is not in the diff) unions
+      // `det.pushTargets` with every `pushMutations` delete target, then runs `_coordinatedDeleteBlock`
+      // over the union. Base's union therefore contains the clean `held/branch`, the sibling worktree
+      // holds it, and base BLOCKS — through `pushMutations`, not through the parenthesis fix. A row is
+      // only a discriminator if it reddens when the change is reverted; B73b does not.
       expectTrue("B73a: later-segment `--delete` of a sibling-held branch is BLOCKED by the #73 arm (#504; wiring pin, not a discriminator)",
         isCoordBlock(d1, "held/branch"), `handler returned ${JSON.stringify(d1)?.slice(0, 200)}`);
       const d2 = await coord("d2", "git push origin HEAD:refs/heads/feat && (git push origin --delete held/branch)");
@@ -519,6 +533,23 @@ async function partB() {
       const d16 = await coord("d16", 'git push origin -o "title=$(echo "fix) bug")" -d held/branch');
       expectTrue("B73p: a `\"` INSIDE `$( … )` does not close the enclosing quote and hide the delete",
         isCoordBlock(d16, "held/branch"), `handler returned ${JSON.stringify(d16)?.slice(0, 200)}`);
+      // ⛔ ROUND-18 REVIEW (P1, end-to-end twin of the Part-A rows in `test-653-delete-target.mjs`): the
+      // ANSI-C PROGRAM flag was re-derived at the `'` of `$'…'` (one character after the `$` the folding
+      // pass asks at), so it answered FALSE for every `-c`/`eval` program operand and the program's own
+      // newline was masked as DATA instead of as a separator. The next command's first word glued onto the
+      // delete target (`held/branch\necho`), which is in NEITHER `DELETE_TARGET_UNRESOLVABLE_RE` nor the
+      // worktree map, so #73 missed and the sibling-held branch was deletable — measured ALLOWED here and
+      // BLOCKED on `origin/main` before the fix.
+      const d17 = await coord("d17", "git push origin HEAD:feat && sh -c $'git push origin -d held/branch\necho done'");
+      expectTrue("B73q: a NEWLINE inside an ANSI-C `-c` PROGRAM is a separator, so the real target reaches #73",
+        isCoordBlock(d17, "held/branch"), `handler returned ${JSON.stringify(d17)?.slice(0, 200)}`);
+      // ⛔ ROUND-18 REVIEW (P2): the span collapse DROPPED the token's non-span prefix, so `-o"$(…)"` — ONE
+      // argv word carrying the option and its value (`_markOptionValueSlots`: attached values carry their
+      // value in-token) — was re-reported as a bare positional refspec, #653 refused the marker, and a
+      // delete of a NEVER-CHECKED-OUT branch was blocked. Measured BLOCKED here and ALLOWED on `origin/main`.
+      const ok3 = await coord("ok3", "git push origin HEAD:feat && git push origin -o\"$(cat msg)\" -d never/checked-out");
+      expectTrue("B73r: an ATTACHED `-o` value does not turn a literal delete into a false #653 block",
+        ok3 === undefined, `handler returned ${JSON.stringify(ok3)?.slice(0, 200)}`);
       // Positive controls — the boundary fix must not invent targets: a delete of
       // a branch NOBODY has checked out stays allowed, and so does a plain
       // compound push (the #73 arm must not fire on it).

@@ -471,6 +471,73 @@ for (const [name, cmd] of [
 expect("A: `-o <literal> <span> -d held/branch` → the real target survives beside the marker",
   extractPushDeleteBranch(`git push origin -o "title" "$(cat f)" -d held/branch`), ["$(…)", "held/branch"]);
 
+// ── Round-18 review (P1 fail-open + P2 false block) ──────────────────────────────────────────
+// ⛔ P1 — AN ANSI-C PROGRAM'S NEWLINE IS A LIST SEPARATOR, AND THE PROGRAM FLAG WAS READ ONE
+// CHARACTER TOO LATE. `_foldAnsiCStrings` decides "is this `$'…'` the PROGRAM operand of
+// `sh -c`/`bash -c`/`eval`?" at the `$` and keeps the literal VERBATIM when it is; `_maskQuotedNewlines`
+// then re-derived the same decision at the `'`, where the preceding word is `$` — a word no
+// `-c`/`eval` pattern matches — so it answered FALSE for EVERY ANSI-C program operand and classified
+// the program's own newline as `_NL_DATA` (a word-CONTINUATION char) instead of `_NL_SPAN` (a
+// separator). The next command's first word was then glued onto the delete target:
+//
+//   sh -c $'git push origin -d held/branch<LF>echo done'
+//     bash really runs BOTH commands.  origin/main → ["held/branch","echo","done"]
+//     before this fix → ["held/branch\necho","done"]
+//
+// and that glued name is a FAIL-OPEN, not a cosmetic difference: a newline is not in
+// `DELETE_TARGET_UNRESOLVABLE_RE`, so #653 does not refuse it, and `_coordinatedDeleteBlock`'s exact
+// `refs/heads/${target}` lookup misses — measured on BOTH trees:
+//   unresolvableDeleteTargets(["held/branch\necho","done"]) → []
+// so a sibling-checked-out branch was deletable from a linked worktree (M2-exempt) where `origin/main`
+// BLOCKED. The row below is the pin: `held/branch` can only appear SPLIT OFF from `echo` once the two
+// passes agree on what the literal is.
+const ANSI_NL = "\n";
+for (const [name, cmd, want] of [
+  ["`sh -c` ANSI-C program with an interior newline", `sh -c $'git push origin -d held/branch${ANSI_NL}echo done'`, ["held/branch", "echo", "done"]],
+  ["`bash -c` ANSI-C `--delete` program with an interior newline", `bash -c $'git push origin --delete held/branch${ANSI_NL}echo done'`, ["held/branch", "echo", "done"]],
+  ["`eval` of an ANSI-C program with an interior newline", `eval $'git push origin -d held/branch${ANSI_NL}echo done'`, ["held/branch", "echo", "done"]],
+  ["`env … bash -c` ANSI-C program with an interior newline", `env FOO=1 bash -c $'git push origin -d held/branch${ANSI_NL}echo done'`, ["held/branch", "echo", "done"]],
+]) {
+  expect(`A: ${name} → the target is NOT glued to the next command`, extractPushDeleteBranch(cmd), want);
+}
+// …and the same spelling in a LATER segment reaches the later-segment arm with the real name.
+expect("A: `… && sh -c $'…<LF>…'` → the later-segment arm sees the REAL target",
+  cg.wholeCommandDeleteTargets("block:push", `git push origin HEAD:feat && sh -c $'git push origin -d held/branch${ANSI_NL}echo done'`),
+  ["held/branch", "echo", "done"]);
+// The pre-fix output is a REAL fail-open, not a naming difference — pin the reason (a property of the
+// CURRENT tree, so this row cannot go stale silently).
+expect("A: …and the GLUED pre-fix target is NOT in #653's unresolvable class (that is why it was an allow)",
+  unresolvableDeleteTargets([`held/branch${ANSI_NL}echo`, "done"]), []);
+
+// ⛔ P2 — THE SPAN COLLAPSE DISCARDED THE TOKEN'S NON-SPAN PREFIX, so an ATTACHED option value lost its
+// option and was re-reported as a bare positional refspec. `-o"$(…)"` is ONE argv word carrying BOTH the
+// option and its value (`_markOptionValueSlots`: "Inline attached values (`-doDraft`, `-odraft`,
+// `--push-option=x`) carry their value in-token … no slot"), so it is not a refspec at all:
+//
+//   git push origin -o"$(cat msg)" -d old
+//     bash argv → push origin -o<msg> -d old → deletes the plain literal `old`
+//     origin/main → ["msg)","old"] (an over-captured fragment)   before this fix → ["$(…)","old"]
+//     #653 on that list → ["$(…)"] → the later-segment/degraded arm REFUSED a command that deletes a
+//     literal `old` which no other worktree holds — a FALSE BLOCK this PR introduced.
+for (const [name, cmd] of [
+  ["`-o` short option, attached value", 'git push origin -o"$(cat msg)" -d old'],
+  ["`--push-option=` long option, attached value", 'git push origin --push-option="$(cat msg)" -d old'],
+  ["the SEPARATED twin — same argv words, so it must agree with the attached one", 'git push origin -o "$(cat msg)" -d old'],
+]) {
+  expect(`A: an ATTACHED option value is not a refspec (${name}) → only the real target`, extractPushDeleteBranch(cmd), ["old"]);
+}
+expect("A: …so #653 resolves the list (the false block's whole mechanism)",
+  unresolvableDeleteTargets(extractPushDeleteBranch('git push origin -o"$(cat msg)" -d old')), []);
+expect("A: …and the LATER-SEGMENT arm the false block ran through now sees only `old`",
+  cg.wholeCommandDeleteTargets("block:push", 'git push origin HEAD:feat && git push origin -o"$(cat msg)" -d old'), ["old"]);
+// ⚠️ CONTROLS for the same edit, in BOTH directions — the prefix must not become a way to hide a flag.
+// A MERGED cluster (`-do…`) really carries `-d`, so its delete must never disappear:
+expect("A: CONTROL — `-do<attached value> old` really IS a delete (the merged cluster keeps its flag)",
+  extractPushDeleteBranch('git push origin -do"$(cat msg)" old'), ["old"]);
+// …and an attached value that cannot be a flag must stay ALLOWED (the round-17 P2, same arm):
+expect("A: CONTROL — `-o<attached value>` is a plain push (the value is `-d`, not a flag)",
+  extractPushDeleteBranch('git push origin -o"$(echo -d)" main'), null);
+
 // ── Part B — the SHIPPED gate (real index.ts tool_call handler) ───────────
 if (typeof stripTypeScriptTypes !== "function" ||
     (typeof register !== "function" && typeof registerHooks !== "function")) {
@@ -703,6 +770,17 @@ if (typeof stripTypeScriptTypes !== "function" ||
     expectTrue("D9 round-10 F4: a DATA newline inside a `$( … )` in a double quote → #73 BLOCK on the REAL name",
       refusedBy(await quiet(() => real.bash('git push origin HEAD:feat && git push origin -o "$(echo "a\nb")" -d held')), HOLDS),
       `handler returned ${JSON.stringify(await quiet(() => real.bash('git push origin HEAD:feat && git push origin -o "$(echo "a\nb")" -d held')))?.slice(0, 200)}`);
+    // ── Part D (round 18): an ANSI-C `-c` PROGRAM's interior newline, END-TO-END ─────────────
+    // The Part-A rows above pin the extractor's LIST; this pins the arm an agent actually meets, which
+    // is the only place the two can disagree. `_foldAnsiCStrings` keeps a program operand VERBATIM, and
+    // `_maskQuotedNewlines` then re-derived "is this quote a program?" one character LATER (at the `'`,
+    // where the preceding word is `$`), so it said NO and masked the program's own newline as a
+    // word-CONTINUATION char — gluing `echo` onto the ref (`held\necho`, in NEITHER the #653
+    // unresolvable class NOR the worktree map). Measured: ALLOWED here, BLOCKED on `origin/main`.
+    expectTrue("D11 round-18 P1: a newline inside an ANSI-C `-c` PROGRAM is a separator → #73 BLOCK on the REAL name",
+      refusedBy(await quiet(() => real.bash("git push origin HEAD:feat && sh -c $'git push origin -d held\necho done'")), HOLDS),
+      `handler returned ${JSON.stringify(await quiet(() => real.bash("git push origin HEAD:feat && sh -c $'git push origin -d held\necho done'")))?.slice(0, 200)}`);
+
     // ── Part D (round 11): the `${ … }` family, end-to-end ──────────────────────────────
     // A `}` that bash treats as DATA used to close the expansion level, so the expansion's own `)`
     // arrived as the #504 operator token, the segment ended, and the delete was never refused.
