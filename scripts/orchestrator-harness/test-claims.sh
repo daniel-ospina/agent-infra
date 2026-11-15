@@ -1240,7 +1240,9 @@ ck "A75 [RED→GREEN] ...and its ref survives the pass" "^0$" "$P4CEILK"
 # the object from the last `committer` header whatever else that line carries, so a newest header with a
 # trailing token is filtered out by the `$` anchor and `tail` returns an EARLIER committer line —
 # measured: a claim `git log --format=%ct` dates as 1 s old was reaped with `the claim commit is
-# 1793991810s old, PAST the 18000s bound`. A newest header this parser cannot read must make the age
+# 1793991810s old, PAST the 18000s bound` (AS MEASURED — the bound was 18000 s then and renders 48000
+# since agent-infra#4034; A21 pins the CURRENT string, so this quote is a record, not a live expectation).
+# A newest header this parser cannot read must make the age
 # UNMEASURABLE (kept and NAMED), never fall back to older text the attacker wrote.
 P4JUNK="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a@b> 1 +0000\ncommitter a <a@b> %s +0000 junk\n\nclaim owner=weird3203 lease_until=HAVOC nonce=junk\n' "$P4NOW" "$P4NOW" \
    | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
@@ -1262,7 +1264,8 @@ ck "A78 [RED→GREEN] ...and it survives the pass instead of being reaped on an 
 # `digits [+-]dddd` pair anywhere on the line, so the same one-push attack came back through a token that
 # MATCHES: measured on the shipped file, `committer a <a@b> <NOW> +0000 1 +0000` — a claim `git log
 # --format=%ct` dates as 0 s old — made `_claim_commit_time` answer 1, and `claim_prune` DELETED it as
-# `1793991810s old, PAST the 18000s bound`. The parse is now anchored on `> ` (the ident's end), so the
+# `1793991810s old, PAST the 18000s bound` (AS MEASURED — 48000 s since agent-infra#4034, see the
+# sibling note above). The parse is now anchored on `> ` (the ident's end), so the
 # accepted stamp is the field git reads; any other `digits +-dddd` tail simply is not a match and lands
 # on rc=1 (unmeasurable -> KEPT and NAMED).
 P4FIELDFORGE="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a@b> %s +0000 1 +0000\n\nclaim owner=weird3203 lease_until=HAVOC nonce=field\n' "$P4NOW" "$P4NOW" \
