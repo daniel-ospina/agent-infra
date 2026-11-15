@@ -63,6 +63,17 @@ group() {
   printf '%s\n' "$line" >> "$d/checkruns-$HEAD.tsv"
 }
 run() { printf '%s\t%s\t%s\n' "$3" "$4" "$5" >> "$1/pr-$2/runs-$HEAD.tsv"; }
+# rail_land <root> <pr> [extra line…] — the rail's OWN landing line, verbatim from the producer:
+#   admin-merge.sh:12402  info "admin-merge: ✅ merged PR #$PR at $landed_sha (state=… confirmed via the API)"
+# A fixture must speak the PRODUCER's grammar. The first version of this suite wrote
+# `admin-merge: ok` — a line the rail never prints — and a presence-only reader PASSed on it, which is
+# exactly how the round-6 false PASS shipped and stayed invisible for five rounds.
+rail_land() {
+  local root="$1" pr="$2" l; shift 2
+  printf 'admin-merge: ✅ merged PR #%s at %s (state=MERGED confirmed via the API; branch head was %s…)\n' \
+    "$pr" "$MERGE" "${HEAD:0:12}" > "$root/pr-$pr/rail.out"
+  for l in "$@"; do printf '%s\n' "$l" >> "$root/pr-$pr/rail.out"; done
+}
 # Both surfaces are captured for every case: the TEXT report is what a human reads (so its DETAIL is
 # asserted where the detail is the finding), and the JSON is what a report file consumes (so its SHAPE
 # is asserted where the verdict is the finding). Asserting one and reading the other is how a suite
@@ -85,7 +96,7 @@ hasj() { grep -qF -- "$1" <<<"$OUTJ"; }
 # ── case 1: the clean landing — every check PASS, exit 0 ─────────────────────────────────────────
 R="$(mk clean 401)"
 run "$R" 401 9001 "CI" 1; group "$R" 401 10 9001 "unit-test" completed success "$MERGED_AT"
-printf 'admin-merge: ok\n' > "$R/pr-401/rail.out"
+rail_land "$R" 401
 verify "$R" --json; rc=$?
 ck "clean landing exits 0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
 ck "clean landing: review_bound PASS (reviewed head IS the final commit)" "$(hasj '"check":"review_bound","verdict":"PASS"'; echo $?)"
@@ -105,7 +116,7 @@ ck "pushed-after-review: review_bound FAIL" "$(has "commits pushed AFTER the rev
 # Reproduces PR #3996: head tree != merge tree, reviewed head == the PR's last commit. MUST PASS.
 R="$(mk squash-main-moved 403)"
 run "$R" 403 9001 "CI" 1; group "$R" 403 10 9001 "unit-test" completed success "$MERGED_AT"
-printf 'admin-merge: ok\n' > "$R/pr-403/rail.out"
+rail_land "$R" 403
 verify "$R"; rc=$?
 ck "squash-main-moved: review_bound PASS despite differing trees (#3996 regression)" "$(hasj '"check":"review_bound","verdict":"PASS"'; echo $?)"
 ck "squash-main-moved exits 0" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
@@ -192,12 +203,32 @@ run "$R" 413 9001 "CI" 1
 verify "$R"
 ck "surface-empty: green_gated FAIL (nothing attached is a measured zero, not an unknown)" "$(has "NOTHING had attached a verdict"; echo $?)"
 
-# ── case 13: the landing route — override is a FAIL, chain is a FAIL, rail is a PASS ─────────────
+# ── case 13: the landing route — a LANDING is proved, a refusal is not, and the chain is a FAIL ──
+# ⛔ THIS CASE WAS REBUILT IN ROUND 6, AND THE OLD SHAPE WAS THE DEFECT. It used to write
+# `admin-merge: merged via AGENT_ADMIN_MERGE_OVERRIDE=1` into `rail.out` and expect a FAIL, and to
+# treat ANY non-empty `rail.out` as the rail having landed. Both readings are text scans of a scratch
+# file the rail writes on every ATTEMPT (`auto-rail.sh:1705`, `:617`; its own `cooldown_for` parses
+# refusals out of it), so a refusal read as an override landing and an ALREADY-MERGED no-op read as a
+# landing at all — while MASKING the chain FAIL below it.
 R="$(mk route-override 414)"
 run "$R" 414 9001 "CI" 1; group "$R" 414 10 9001 "unit-test" completed success "$MERGED_AT"
-printf 'admin-merge: merged via AGENT_ADMIN_MERGE_OVERRIDE=1 (logged as admin_merge_override)\n' > "$R/pr-414/rail.out"
+rail_land "$R" 414 'audit: admin_merge_override (AGENT_ADMIN_MERGE_OVERRIDE=1)'
 verify "$R"
-ck "route-override: rail_landed FAIL (condition 6 forbids a certificate bypass)" "$(has "an admin-merge override is recorded"; echo $?)"
+ck "route-override: a LANDING that records the override is rail_landed FAIL" "$(has "together with an admin-merge override spelling"; echo $?)"
+# the same text with NO landing line in the file is a REFUSAL that merely NAMES the route
+# (admin-merge.sh:11093/11622 print `AGENT_ADMIN_MERGE_OVERRIDE=1. No evidence was posted and no merge
+# attempted.`). It must never be reported as a bypass — that is a false accusation on the one
+# predicate that decides condition 6.
+R="$(mk route-override-named-not-taken 423)"
+run "$R" 423 9001 "CI" 1; group "$R" 423 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ⛔ BLOCK — a red is visible on this tree. Landing a red tree on purpose is\n   AGENT_ADMIN_MERGE_OVERRIDE=1. No evidence was posted and no merge attempted.\n' > "$R/pr-423/rail.out"
+verify "$R"; rc=$?
+ck "route-override-named-not-taken: a refusal that NAMES the override is not an override landing" \
+  "$(has "an admin-merge override is recorded" && echo 1 || echo 0)"
+ck "route-override-named-not-taken: …and it is an INCONCLUSIVE route, never a PASS" \
+  "$(hasj '"check":"rail_landed","verdict":"INCONCLUSIVE"' && has "records NO landing of #423" && echo 0 || echo 1)"
+ck "route-override-named-not-taken: …so the run does not close the capstone (exit 2, not 0)" \
+  "$([ "$rc" -eq 2 ] && echo 0 || echo 1)"
 R="$(mk route-chain 415)"
 run "$R" 415 9001 "CI" 1; group "$R" 415 10 9001 "unit-test" completed success "$MERGED_AT"
 : > "$R/pr-415/chain.merged"
@@ -207,6 +238,23 @@ R="$(mk route-absent 416)"
 run "$R" 416 9001 "CI" 1; group "$R" 416 10 9001 "unit-test" completed success "$MERGED_AT"
 verify "$R"
 ck "route-absent: rail_landed INCONCLUSIVE (no artifact ⇒ unknown, never a pass)" "$(hasj '"check":"rail_landed","verdict":"INCONCLUSIVE"'; echo $?)"
+# ⛔ THE MASKING CASE THE OLD PREDICATE COULD NOT SEE: an earlier rail REFUSAL leaves a non-empty
+# `rail.out`, and a chain landing happened afterwards. File presence used to PASS this and swallow the
+# chain FAIL — a false PASS on condition 6, from an instrument whose exit 0 closes the capstone.
+R="$(mk route-refused-then-chain 422)"
+run "$R" 422 9001 "CI" 1; group "$R" 422 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ✅ PR #422 is ALREADY MERGED (state=MERGED, mergedAt=%s) — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt\n' "$MERGED_AT" > "$R/pr-422/rail.out"
+: > "$R/pr-422/chain.merged"
+verify "$R"; rc=$?
+ck "route-refused-then-chain: an ALREADY-MERGED no-op is not a landing, so the chain FAIL is NOT masked" \
+  "$(has "landed by the per-PR chain, not by auto-rail"; echo $?)"
+ck "route-refused-then-chain: …and the run exits 1, never 0" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+# …and the same no-op with NO chain marker is UNKNOWN, not a PASS and not a FAIL
+R="$(mk route-noop-only 424)"
+run "$R" 424 9001 "CI" 1; group "$R" 424 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ✅ PR #424 is ALREADY MERGED (state=MERGED, mergedAt=%s) — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt\n' "$MERGED_AT" > "$R/pr-424/rail.out"
+verify "$R"
+ck "route-noop-only: a no-op attempt leaves the route UNKNOWN" "$(has "records NO landing of #424"; echo $?)"
 
 # ── case 14: an unmerged PR has no landing to verify ──────────────────────────────────────────────
 R="$(mk unmerged 417)"
@@ -275,7 +323,7 @@ group "$R" 441 10 9001 "unit-test" completed success "2026-11-12T04:00:00Z"
 group "$R" 441 20 9001 "post-merge" completed success "2026-11-12T06:00:00Z"   # started after mergedAt
 awk -F'\t' 'BEGIN{OFS="\t"} $3=="post-merge" { $8="2026-11-12T05:40:00Z" } { print }' \
   "$R/pr-441/checkruns-$HEAD.tsv" > "$R/pr-441/c2" && mv "$R/pr-441/c2" "$R/pr-441/checkruns-$HEAD.tsv"
-printf 'admin-merge: ok\n' > "$R/pr-441/rail.out"
+rail_land "$R" 441
 verify "$R"
 ck "F1b: a post-merge-only group is excluded and the GREEN count is the measured 1" "$(has "1 group(s) GREEN"; echo $?)"
 
@@ -345,7 +393,12 @@ group "$R" 455 10 9001 "unit-test" completed   success "2026-11-12T04:00:00Z" "2
 group "$R" 455 20 9001 "unit-test" in_progress -       "-"                "2026-11-12T05:00:00Z"
 verify "$R"; rc=$?
 ck "F3n: a newer in-flight attempt hides the older green" "$(has "did not wait for"; echo $?)"
-ck "F3n: …and the group is never reported GREEN" "$(has "unit-test.*GREEN"; has "1 group(s) GREEN" && echo 1 || echo 0)"
+# ⛔ THE DEAD HALF IS GONE (round 6 note). The old line read
+#   "$(has "unit-test.*GREEN"; has "1 group(s) GREEN" && echo 1 || echo 0)"
+# and its FIRST call could never match anything: `has` is `grep -F` (fixed string), so the `.*` is
+# literal. It contributed nothing to the verdict while looking like an assertion — the cheap way to
+# look thorough, and exactly the class this suite exists to refuse.
+ck "F3n: …and the group is never reported GREEN" "$(has "1 group(s) GREEN" && echo 1 || echo 0)"
 ck "F3n: …so the run exits 1 (a FAIL), not 0" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
 
 # F2n — round 4's F2 (a FALSE PASS): a standing `not-clean` is not a review record. The marker was
@@ -354,7 +407,7 @@ ck "F3n: …so the run exits 1 (a FAIL), not 0" "$([ "$rc" -eq 1 ] && echo 0 || 
 R="$(mk f2n-standing-not-clean 456)"
 run "$R" 456 9001 "CI" 1
 group "$R" 456 10 9001 "unit-test" completed success "$MERGED_AT"
-printf 'admin-merge: ok\n' > "$R/pr-456/rail.out"
+rail_land "$R" 456
 printf '<<<BODY>>>\nreview recorded: reviews/456.json verdict=not-clean @ %s (o/r)\n' "$HEAD" > "$R/pr-456/body.txt"
 verify "$R"; rc=$?
 ck "F2n: a standing not-clean FAILs review_record" "$(has "FAIL  review_record"; echo $?)"
@@ -376,12 +429,14 @@ ck "F2o: …and the reason says the round did not converge" "$(has "the round di
 R="$(mk f1r-green-then-red 450)"
 run "$R" 450 9001 "CI" 1
 group "$R" 450 10 9001 "unit-test" completed success "2026-11-12T04:00:00Z"
-group "$R" 450 450 9001 "unit-test" completed failure "2026-11-12T04:30:00Z"
+group "$R" 450 20 9001 "unit-test" completed failure "2026-11-12T04:30:00Z"
 verify "$R"
 ck "F1r: a green BEFORE the merge is named as such, not as a late green" \
   "$(has "a green DID complete before mergedAt but a NEWER attempt on the same job was RED"; echo $?)"
+# ⛔ NO `|| true` ON A CHECK (round 6 note): the old line ended with it, so this assertion could never
+# FAIL — a green line that asserted nothing, on the one sentence the case is about.
 ck "F1r: …and this shape is NOT described as 'completed AFTER mergedAt'" \
-  "$(has "completed AFTER mergedAt"; has "completed AFTER mergedAt" && echo 1 || echo 0)" 2>/dev/null || true
+  "$(has "completed AFTER mergedAt" && echo 1 || echo 0)"
 
 # F1s — the mirror: a green that really did complete after the merge keeps ITS sentence (case 6 guards
 # the verdict; this guards that the two shapes are not collapsed into one wording).
@@ -421,7 +476,7 @@ ck "F3c: both channels unread names both of them" "$(has "body.txt,comments.txt"
 # answer even when GitHub cannot. A 5-row report was the shape, and the row was the one this box knows.
 R="$(mk f3c-unread-route 454)"
 run "$R" 454 9001 "CI" 1; group "$R" 454 10 9001 "unit-test" completed success "$MERGED_AT"
-printf 'admin-merge: ok\n' > "$R/pr-454/rail.out"
+rail_land "$R" 454
 : > "$R/pr-454/body.txt"; : > "$R/pr-454/body.txt.unread"
 verify "$R"; rc=$?
 ck "F3c-route: the unread path still reports rail_landed" "$(has "PASS  rail_landed"; echo $?)"
@@ -432,7 +487,7 @@ R="$(mk f3-comment-marker 445)"
 : > "$R/pr-445/body.txt"
 printf '<<<COMMENT>>>\nreview recorded: reviews/445.json verdict=clean @ %s (o/r)\n' "$HEAD" > "$R/pr-445/comments.txt"
 run "$R" 445 9001 "CI" 1; group "$R" 445 10 9001 "unit-test" completed success "$MERGED_AT"
-printf 'admin-merge: ok\n' > "$R/pr-445/rail.out"
+rail_land "$R" 445
 verify "$R"
 ck "F3b: a comment-only marker is admitted as source=marker-comment (declared weaker)" "$(has "source=marker-comment"; echo $?)"
 
@@ -442,6 +497,45 @@ run "$R" 446 9001 "CI" 1; group "$R" 446 10 9001 "unit-test" completed success "
 : > "$R/pr-446/chain.merged.out-of-window"
 verify "$R"
 ck "F4: an out-of-window chain marker leaves the route UNKNOWN, not chain-attributed" "$(has "OUTSIDE this PR's merge window"; echo $?)"
+# F4b — round 6's P3: an UNPARSEABLE `mergedAt` used to SKIP the window test entirely and admit the
+# number-keyed marker — an unusable window read as an open one, the fail-open direction F4 exists to
+# close. The fixture carries the sentinel `fetch_one` now writes in that state (a snapshot cannot
+# fetch, exactly as the F4 case above does); the sentinel's WRITER is pinned by the `chain.unusable`
+# branch in `chain_artifact`, which is the only path that can produce it.
+R="$(mk f4b-unusable-window 462)"
+run "$R" 462 9001 "CI" 1; group "$R" 462 10 9001 "unit-test" completed success "$MERGED_AT"
+printf '%s\t%s\t%s\t%s\n' 462 MERGED "not-a-timestamp" "$MERGE" > "$R/pr-462/pr.meta"
+: > "$R/pr-462/chain.merged.unusable"
+verify "$R"
+ck "F4b: an unparseable mergedAt leaves the route UNKNOWN, never 'in window'" "$(has "could not be parsed into a usable timestamp"; echo $?)"
+ck "F4b: …and the marker is NOT attributed to the chain" "$(has "landed by the per-PR chain" && echo 1 || echo 0)"
+
+# P2 — round 6's P2: a re-run whose `started_at` is KNOWN and LATER than mergedAt is a post-merge job,
+# not part of this gate. It used to be defaulted into `waited` ("the landing did not wait for it"),
+# a FALSE FAIL whose verdict flipped the moment that four-hours-later job happened to finish. Both
+# halves are asserted so the two buckets stay distinct: known-late ⇒ `later` ⇒ PASS; null ⇒ `waited`.
+R="$(mk p2-run-started-after-merge 463)"
+run "$R" 463 9001 "CI" 1
+group "$R" 463 10 9001 "unit-test" completed   success "2026-11-12T05:00:00Z" "2026-11-12T04:59:00Z"
+group "$R" 463 20 9001 "unit-test" in_progress -       "-"                "2026-11-12T09:30:00Z"
+rail_land "$R" 463
+verify "$R"; rc=$?
+ck "P2: a re-run that began AFTER mergedAt is 'not part of this gate', not a FAIL" \
+  "$(has "did not wait for" && echo 1 || echo 0)"
+# the excluded attempt does NOT vote, so the group's standing verdict is still the green that gated the
+# landing — the post-merge re-run can neither launder a red nor manufacture one.
+ck "P2: …and the group's standing verdict is still the green that gated the landing" \
+  "$(has "1 group(s) GREEN"; echo $?)"
+ck "P2: …so a correctly green-gated landing is not failed (exit 0)" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)"
+# the mirror: the SAME shape with a null `started_at` (a queued run — the API leaves it null) is still
+# fail-closed, because the absence of a timestamp is never read as "it did not exist".
+R="$(mk p2b-run-queued-null-start 464)"
+run "$R" 464 9001 "CI" 1
+group "$R" 464 10 9001 "unit-test" completed success "2026-11-12T05:00:00Z" "2026-11-12T04:59:00Z"
+group "$R" 464 20 9001 "unit-test" queued    -       "-"
+verify "$R"; rc=$?
+ck "P2b: a queued attempt with NO started_at is still 'did not wait for'" "$(has "did not wait for"; echo $?)"
+ck "P2b: …so that landing is a FAIL (exit 1)" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
 
 # ── MUTATIONS: prove every case above is DISCRIMINATING, not merely green ───────────────────────
 # ⛔ A suite that passes over BOTH the real script and a deliberately wrong one asserts nothing. Each
@@ -512,8 +606,13 @@ verify_with "$MS" "$R"
 mutation_verdict M1 "Workflow B/packaging-smoke:failure" \
   "grouping by the job name alone loses the red — case 8 is discriminating"
 
-# M2 — read the newest attempt OVERALL instead of the newest that had finished by mergedAt.
-MS="$(mutant newest-overall 'existed = (status != "completed") ||' 'existed = 1 ||' )" || bad "M2 mutation could not be applied"
+# M2 — read the newest attempt OVERALL instead of the newest one that existed by mergedAt.
+# ⛔ THE MUTATION TARGET MOVED IN ROUND 6 (the `existed` expression was rewritten for P2), and its
+# MEANING is narrower than it says: since round 5's `voted_by_merge`, admitting a later attempt can no
+# longer launder a verdict into GREEN — what it flips is the SENTENCE (a red landing explained as "a
+# green arrived late" instead of the red it was). M12 below is the pin on the VERDICT path. Both are
+# needed, and a reader must not think this one covers the exit code.
+MS="$(mutant newest-overall 'existed = (voted_by_merge ||' 'existed = (1 ||')" || bad "M2 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-newest-overall 431)"
 run "$R" 431 9001 "CI" 1
@@ -521,7 +620,7 @@ group "$R" 431 10 9001 "pipeline-compliance" completed failure "2026-11-12T04:41
 group "$R" 431 20 9001 "pipeline-compliance" completed success "2026-11-12T05:24:50Z"
 verify_with "$MS" "$R"
 mutation_verdict M2 "completed AFTER mergedAt" \
-  "reading the newest attempt overall launders the red — case 6 is discriminating"
+  "reading the newest attempt overall changes the reason a red landing is explained — case 6 is discriminating"
 
 # M3 — bind on TREE EQUALITY instead of the PR's final commit (the #3996 FALSE FAIL).
 MS="$(mutant tree-equality 'if [ "$last_commit" = "$rsha" ]; then' 'if [ "$(tree_of "$dir/commit-${rsha}.tsv")" = "$landed_tree" ]; then')" \
@@ -529,7 +628,7 @@ MS="$(mutant tree-equality 'if [ "$last_commit" = "$rsha" ]; then' 'if [ "$(tree
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-tree-equality 432)"
 run "$R" 432 9001 "CI" 1; group "$R" 432 10 9001 "unit-test" completed success "$MERGED_AT"
-printf 'admin-merge: ok\n' > "$R/pr-432/rail.out"
+rail_land "$R" 432
 verify_with "$MS" "$R"
 mutation_verdict M3 "IS the PR's final commit" \
   "tree equality fails a correct landing (the #3996 defect) — case 3 is discriminating"
@@ -625,7 +724,7 @@ MS="$(mutant unread-drops-route '    emit_rail_landed "$dir" "$pr" "$merged"' ' 
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-unread-route 453)"
 run "$R" 453 9001 "CI" 1; group "$R" 453 10 9001 "unit-test" completed success "$MERGED_AT"
-printf 'admin-merge: ok\n' > "$R/pr-453/rail.out"
+rail_land "$R" 453
 : > "$R/pr-453/body.txt"; : > "$R/pr-453/body.txt.unread"
 verify_with "$MS" "$R"
 mutation_verdict M9 "PASS  rail_landed" \
@@ -636,14 +735,55 @@ MS="$(mutant record-unread-passthrough '  if [ -n "$rc_unread" ]; then' '  if [ 
   || bad "M7 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-record-unread 436)"
-printf 'admin-merge: ok\n' > "$R/pr-436/rail.out"
+rail_land "$R" 436
 run "$R" 436 9001 "CI" 1; group "$R" 436 10 9001 "unit-test" completed success "$MERGED_AT"
 : > "$R/pr-436/body.txt"
 : > "$R/pr-436/body.txt.unread"
 printf '<<<COMMENT>>>\nreview recorded: reviews/436.json verdict=clean @ %s (o/r)\n' "$HEAD" > "$R/pr-436/comments.txt"
 verify_with "$MS" "$R"
 mutation_verdict M7 "were NOT READ" \
-  "reading through an unread body promotes a weaker comment marker — case F3b-2 is discriminating"
+  "reading through an unread body promotes a weaker comment marker — case F3c is discriminating"
+
+# M13 — decide `rail_landed` on the FILE's presence again (round 6's P1, the false PASS that survived
+# five rounds because no case ever put a refusal in `rail.out`). The mutant PASSes an ALREADY-MERGED
+# no-op as a landing and swallows the chain FAIL underneath it.
+MS="$(mutant rail-presence 'if [ -z "$landed_file" ] && grep -qE "admin-merge: .*merged PR #${pr}([^0-9]|$)" "$f" 2>/dev/null; then' 'if [ -z "$landed_file" ] && [ -s "$f" ]; then')" \
+  || bad "M13 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-rail-presence 465)"
+run "$R" 465 9001 "CI" 1; group "$R" 465 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ✅ PR #465 is ALREADY MERGED (state=MERGED, mergedAt=%s) — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt\n' "$MERGED_AT" > "$R/pr-465/rail.out"
+: > "$R/pr-465/chain.merged"
+verify_with "$MS" "$R"
+mutation_verdict M13 "landed by the per-PR chain, not by auto-rail" \
+  "file presence reads a no-op attempt as a landing and MASKS the chain FAIL — case route-refused-then-chain is discriminating"
+
+# M14 — drop the known-late `started_at` guard (round 6's P2): a re-run created AFTER the merge is
+# pulled back into `waited` and a correctly green-gated landing is reported FAIL.
+MS="$(mutant p2-started-late '      started_late = (started_at != "-" && started_at != "" && started_at > merged)' '      started_late = 0')" \
+  || bad "M14 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-started-late 466)"
+run "$R" 466 9001 "CI" 1
+group "$R" 466 10 9001 "unit-test" completed   success "2026-11-12T05:00:00Z" "2026-11-12T04:59:00Z"
+group "$R" 466 20 9001 "unit-test" in_progress -       "-"                "2026-11-12T09:30:00Z"
+verify_with "$MS" "$R"
+mutation_verdict M14 "not part of this gate" \
+  "ignoring a known post-merge start FAILs a landing that was gated correctly — case P2 is discriminating"
+
+# M15 — drop the UNUSABLE-window branch (round 6's P3): an unparseable `mergedAt` falls back to
+# "no artifact on this box", which is a different, wrong answer — the marker EXISTS and cannot be
+# attributed, and the report must say so.
+MS="$(mutant rail-unusable-branch '  elif [ -f "$dir/chain.merged.unusable" ] || [ -f "$dir/chain.verdict.unusable" ] || [ -f "$dir/merge.log.unusable" ]; then' '  elif [ 0 -eq 1 ]; then')" \
+  || bad "M15 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-rail-unusable 467)"
+run "$R" 467 9001 "CI" 1; group "$R" 467 10 9001 "unit-test" completed success "$MERGED_AT"
+printf '%s\t%s\t%s\t%s\n' 467 MERGED "not-a-timestamp" "$MERGE" > "$R/pr-467/pr.meta"
+: > "$R/pr-467/chain.merged.unusable"
+verify_with "$MS" "$R"
+mutation_verdict M15 "could not be parsed into a usable timestamp" \
+  "an unusable window is reported as an absent artifact unless its own branch exists — case F4b is discriminating"
 
 # ── summary ──────────────────────────────────────────────────────────────────────────────────────
 printf '\n%s passed, %s failed\n' "$pass" "$fail"

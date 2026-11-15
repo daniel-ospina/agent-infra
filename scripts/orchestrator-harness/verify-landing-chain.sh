@@ -50,8 +50,10 @@
 #                  a silent PASS.
 #   green_gated    at the moment of the merge the newest attempt of EVERY check group was GREEN and
 #                  completed (condition 5: the green gated the landing, not an override past a red).
-#   rail_landed    the rail landed it on its own, with no `admin_merge_override` anywhere on it
-#                  (condition 6). Artifact-only: the rail's output file, the chain's own markers.
+#   rail_landed    the rail landed it on its own, with no `admin_merge_override` recorded ON THAT
+#                  LANDING (condition 6). Artifact-only, and decided on POSITIVE evidence: the rail's
+#                  own `merged PR #<n>` line. A scratch file that exists is not a landing — a refusal
+#                  and an ALREADY-MERGED no-op leave one too (fresh-context review, round 6).
 #
 # THE SURFACE IS READ AS-OF-`mergedAt`, ON PURPOSE
 # ----------------------------------------------
@@ -219,7 +221,9 @@ file_mtime() { # file_mtime <path> → ISO-8601 UTC, or EMPTY (GNU stat, then BS
 # body.txt             the PR body
 # comments.txt         comment bodies, in order, separated by a <<<COMMENT>>> line
 # record.json          this box's record file, when one exists (fallback source)
-# rail.out             the rail's output for this PR, when this box landed it
+# rail.out             the rail's output for this PR (every ATTEMPT of it, including refusals — so
+#                      its presence says "the rail was asked", and only the rail's own
+#                      `merged PR #<n>` line inside it says it LANDED this PR)
 # chain.merged         the per-PR chain's `state/merged-<pr>.done` marker
 # chain.verdict        lane-merge.sh's machine verdict for the PR
 # merge.log            the per-PR chain's log
@@ -257,10 +261,19 @@ fetch_one() { # fetch_one <dir> <pr>
   # repo-scoped read of the PR itself — which this file already holds (`mergedAt` in pr.meta). So the
   # marker is admitted only when its own mtime is consistent with THAT merge: outside the window it is
   # ignored and the route stays unknown rather than being attributed to the wrong landing.
-  local mt mt_s mt_e
+  local mt mt_s mt_e mt_state=""
   mt="$(awk -F'\t' 'NR == 1 { print $3 }' "$dir/pr.meta" 2>/dev/null)"
   mt_s="$(iso_epoch "$mt")"
-  if [ -n "$mt_s" ]; then
+  # ⛔ AN UNUSABLE WINDOW IS NOT AN OPEN ONE (fresh-context review round 6, P3). This guard used to be
+  # `[ -n "$mt_s" ]`: when `mergedAt` could not be parsed the whole window test was SKIPPED and a
+  # PR-number-keyed marker was admitted unconditionally — the opposite of what the comment eight lines
+  # up says ('a silent empty answer from either must read as unusable rather than as in window'), and
+  # exactly the fail-open direction F4 exists to close. Three states now, and only `ok` can admit.
+  case "$mt" in
+    ""|-) : ;;
+    *) if [ -n "$mt_s" ]; then mt_state=ok; else mt_state=unusable; fi ;;
+  esac
+  if [ "$mt_state" = ok ]; then
     mt_e=$((mt_s + CHAIN_MARKER_WINDOW))
     mt_s=$((mt_s - CHAIN_MARKER_WINDOW))
   fi
@@ -268,7 +281,11 @@ fetch_one() { # fetch_one <dir> <pr>
     [ -f "$1" ] || return 1
     local f_ts f_s
     f_s=""
-    if [ -n "${mt_s:-}" ]; then
+    if [ "$mt_state" = unusable ]; then
+      : > "$dir/${2}.unusable"
+      return 1
+    fi
+    if [ "$mt_state" = ok ]; then
       f_ts="$(file_mtime "$1")"
       f_s="$(iso_epoch "$f_ts")"
       [ -n "$f_s" ] || return 1
@@ -474,21 +491,28 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
       # flattering direction, on the predicate the capstone is closed on.
       #
       # "Existed at the merge" is read fail-closed, because the API does not always say:
-      #   completed            → it existed: `completed_at` is when it voted
-      #   NOT completed        → it exists: a `queued` run has a NULL `started_at` by design, so the
-      #                          absence of a timestamp is never read as "it did not exist yet".
-      existed = (status != "completed") ||
-                (done_at != "-" && done_at != "" && done_at <= merged) ||
-                (started_at != "-" && started_at != "" && started_at <= merged)
+      #   completed     → it existed if it had voted by mergedAt, or was already running then
+      #   NOT completed → it exists, UNLESS its own `started_at` proves it began AFTER mergedAt
+      # ⛔ `started_at` LATER THAN mergedAt IS NOT "IT DID NOT EXIST" AND NOT "IT EXISTED" (round 6, P2).
+      # The previous expression defaulted EVERY non-completed attempt to `existed` and ignored a
+      # `started_at` that was present and later than the merge, so a re-run created four hours AFTER a
+      # landing read as `waited` → FAIL "did not wait for" — a FALSE FAIL whose sentence is the
+      # description of the `later` bucket itself, and whose verdict flips the moment that post-merge
+      # job happens to finish. A null `started_at` (a `queued` run) still reads as "existed": the absence of a
+      # timestamp is never read as "it did not exist yet".
+      started_late = (started_at != "-" && started_at != "" && started_at > merged)
       # ⛔ ONLY A VERDICT KNOWN BY THE MERGE COUNTS (fresh-context review, round 5 F1 — BLOCKING, a
-      # false PASS). The previous line admitted a COMPLETED attempt whose `started_at` was before the
-      # merge and then classified it by its FINAL conclusion — so a re-run that started 05:00 and went
-      # green 05:24 on a 05:05 merge was recorded as `green`, while the flag three lines below recorded
-      # the same attempt as a LATE green. The two disagreed, and the standing verdict was the one
-      # deciding the exit code. Measured: identical fixture, only `started_at` changed →
-      # 05:00 gave `VERDICT: ALL-MET` exit 0; 05:20 gave the correct FAIL. The verdict turned on when
-      # the re-run STARTED, not on what the landing SAW.
+      # false PASS). A COMPLETED attempt whose `completed_at` is after `mergedAt` had not voted then,
+      # even if its `started_at` was before: classifying it by its final conclusion recorded a re-run
+      # that started 05:00 and went green 05:24 on a 05:05 merge as `green` while the flag below
+      # recorded the same attempt as a LATE green. The two disagreed, and the standing verdict was the
+      # one deciding the exit code. Measured: identical fixture, only `started_at` changed →
+      # 05:00 gave `VERDICT: ALL-MET` exit 0; 05:20 gave the correct FAIL.
       voted_by_merge = (status == "completed" && done_at != "-" && done_at != "" && done_at <= merged)
+      if (status == "completed")
+        existed = (voted_by_merge || (started_at != "-" && started_at != "" && started_at <= merged))
+      else
+        existed = !started_late
       if (existed && (!(g in nid) || id > nid[g])) {
         nid[g] = id; ndone[g] = done_at
         if (voted_by_merge) { ncls[g] = classify(status, conc); nconc[g] = conc }
@@ -553,19 +577,56 @@ tree_of() { # tree_of <commit tsv>
 # Extracted from `analyse` so the UNREAD-record path can report it too: the route is answerable from
 # this box's own artifacts even when GitHub could not be read, and the early return used to drop the
 # row, leaving a 5-row report against the 6-row shape every other path emits (review round 3, note 2).
+#
+# ⛔ A NON-EMPTY `rail.out` IS NOT A LANDING (fresh-context review, round 6 — BLOCKING, a false PASS,
+# and the only predicate here that was decided on FILE PRESENCE rather than on a fact). `rail.out` is
+# `auto-<owner>-<repo>-<pr>.out`, the per-attempt verdict scratch file the rail's launcher writes
+# (`auto-rail.sh:1705`, `:617` — the child's whole stdout+stderr), and the rail itself parses
+# REFUSALS out of that same file (`cooldown_for`, `auto-rail.sh:569-575`). So the file's presence
+# records "the rail was asked", never "the rail merged": a DENIED/DRAFT/CONFLICTED refusal, or the
+# `ALREADY MERGED … no merge attempt` no-op, leaves a non-empty file too. Worse, because this arm was
+# tested BEFORE the chain arm, ANY earlier rail attempt masked the one decisive FAIL this predicate
+# can emit — a refused-then-chain-landed PR closed the capstone on exit 0.
+#
+# The fix is the SAME ALLOW-LIST POLARITY this file applies to check conclusions, on the rail's own
+# words: the rail prints `admin-merge: ✅ merged PR #<PR> at <sha> (state=… confirmed via the API)` on
+# a real landing (`admin-merge.sh:12399`/`:12402`) and nothing of the sort on a refusal (`:10035`
+# prints `✅ PR #N is ALREADY MERGED … no merge attempt`, which this pattern deliberately does NOT
+# match: it requires `merged PR #N`). An unrecognised artifact is UNKNOWN, never a landing.
+#
+# NO mtime WINDOW IS APPLIED TO `rail.out`, unlike the chain markers (F4), and the reason is
+# structural rather than an omission: this artifact is fetched as
+# `auto-<owner>-<repo>-<pr>.out` — repo-scoped AND PR-scoped by its NAME — and a PR lands at most
+# once, so no other repo's merge and no other landing of this number can produce it. The chain
+# markers carry none of that and therefore DO need the window.
 emit_rail_landed() { # emit_rail_landed <dir> <pr> <mergedAt>
   local dir="$1" pr="$2" merged="$3"
-  local override_found="" f
+  local landed_file="" override_file="" saw_railout="" f
+  for f in "$dir/rail.out" "$dir/merge.log" "$dir/chain.verdict"; do
+    [ -s "$f" ] || continue
+    [ "$f" = "$dir/rail.out" ] && saw_railout=1
+    # the rail's own success line, and it must name THIS PR — `([^0-9]|$)` so `#123` cannot match
+    # `#1234`. Everything else (a refusal, a DRAFT/CONFLICTED/DENIED block, an ALREADY-MERGED no-op,
+    # a bash start-failure written into the same file) is not a landing.
+    if [ -z "$landed_file" ] && grep -qE "admin-merge: .*merged PR #${pr}([^0-9]|$)" "$f" 2>/dev/null; then
+      landed_file="${f##*/}"
+    fi
+  done
   for f in "$dir/rail.out" "$dir/merge.log" "$dir/chain.verdict"; do
     [ -s "$f" ] || continue
     if grep -qE 'admin_merge_override|AGENT_ADMIN_MERGE_OVERRIDE' "$f" 2>/dev/null; then
-      override_found="${f##*/}"
+      override_file="${f##*/}"
     fi
   done
-  if [ -n "$override_found" ]; then
-    emit rail_landed FAIL "an admin-merge override is recorded ($override_found) — condition 6 forbids a landing that bypassed the certificate"
-  elif [ -s "$dir/rail.out" ]; then
-    emit rail_landed PASS "the rail's own output for this PR is on disk (rail.out) and carries no override"
+  # ⛔ THE OVERRIDE TEST IS SCOPED TO A LANDING (round 6, second direction of the same evidence model).
+  # As a bare text match it read a REFUSAL that merely NAMES the override route as an override
+  # landing — `admin-merge.sh:11093`/`:11622` print `AGENT_ADMIN_MERGE_OVERRIDE=1. No evidence was
+  # posted and no merge attempted.`, and the predicate called that a record of a bypass. Two facts are
+  # needed and both must be measured: a landing HAPPENED, and the override is recorded ON IT.
+  if [ -n "$landed_file" ] && [ -n "$override_file" ]; then
+    emit rail_landed FAIL "the rail records a LANDING of #$pr ($landed_file) together with an admin-merge override spelling in the same artifact — condition 6 forbids a landing that bypassed the certificate"
+  elif [ -n "$landed_file" ]; then
+    emit rail_landed PASS "the rail's own landing line names #$pr ($landed_file) and no override is recorded on it — the rail landed this PR on its own (admin-merge.sh:12399/12402)"
   elif [ -f "$dir/chain.merged" ] || [ -s "$dir/chain.verdict" ]; then
     emit rail_landed FAIL "landed by the per-PR chain, not by auto-rail — capstone condition 6 requires the rail to land it on its own"
   elif [ -f "$dir/chain.merged.out-of-window" ] || [ -f "$dir/chain.verdict.out-of-window" ] || [ -f "$dir/merge.log.out-of-window" ]; then
@@ -574,6 +635,14 @@ emit_rail_landed() { # emit_rail_landed <dir> <pr> <mergedAt>
     # to THIS PR's landing. Outside this PR's own merge window it is not evidence — say so, and keep
     # the route unknown rather than guessing.
     emit rail_landed INCONCLUSIVE "a PR-number-keyed chain marker exists but is OUTSIDE this PR's merge window (mergedAt=$merged, window ${CHAIN_MARKER_WINDOW}s) — it is not proof for this repo's landing (chain-merge.sh:246-251 records the same rule), so the route stays unknown"
+  elif [ -f "$dir/chain.merged.unusable" ] || [ -f "$dir/chain.verdict.unusable" ] || [ -f "$dir/merge.log.unusable" ]; then
+    # ⛔ AN UNUSABLE WINDOW IS NOT AN OPEN ONE: `mergedAt` could not be parsed, so the marker can be
+    # neither admitted nor shown to be OURS. Unknown, by construction.
+    emit rail_landed INCONCLUSIVE "a PR-number-keyed chain marker exists but mergedAt='$merged' could not be parsed into a usable timestamp — an unusable window is never 'in window' (that would admit another repo's landing), so the route stays unknown"
+  elif [ -n "$saw_railout" ]; then
+    # the file is on disk and records NO landing of this PR: a refusal, a no-op, or an attempt that did
+    # not merge. That is an unknown route, not a landing and not an override.
+    emit rail_landed INCONCLUSIVE "the rail's output for this PR is on disk (rail.out) but it records NO landing of #$pr — a refusal, an ALREADY-MERGED no-op, or an attempt that did not merge$( [ -n "$override_file" ] && printf ' (it NAMES the override route, which a refusal does: that is not an override landing)') is not evidence of who landed it, so the route stays unknown"
   else
     emit rail_landed INCONCLUSIVE "no rail or chain artifact for this PR on this box — the landing route is not readable here"
   fi
