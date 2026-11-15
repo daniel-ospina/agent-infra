@@ -334,7 +334,7 @@ vet_unit() {
     elif [ "$rc" -eq 2 ]; then
         err "REFUSING: the judge at $GP_GUARD could not GRADE the rendered $label (rc 2 — unreadable, or a declaration it cannot fold; its own line above says which). An ungradable unit is not a clean one, so it will not be installed."
     else
-        err "REFUSING: the judge at $GP_GUARD answered rc=$rc for --unit-veto — that copy does not know the flag (#4002), so the rendered $label was never vetted and will not be installed. Point GP_GUARD at a current gate-policy.sh (the one beside the templates you are rendering)."
+        err "REFUSING: the judge at $GP_GUARD answered rc=$rc for --unit-veto — either that copy predates the flag (#4002) or it could not run at all, so the rendered $label was never vetted and will not be installed. Point GP_GUARD at a current, executable gate-policy.sh (the one beside the templates you are rendering)."
     fi
     return 1
 }
