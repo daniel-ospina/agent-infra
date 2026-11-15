@@ -4574,18 +4574,19 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       # EVERY SPAWN, for a version skew it is not the box's fault. The env var is read by both versions,
       # so the seam is skew-safe in both directions. An operator's own `CELL_PREFLIGHT_REPO` still wins:
       # this only fills a value nobody set.
-      # ⛔ AND ONE THRESHOLD IS BEING ASKED TO MEAN TWO THINGS (review of 92ec5cd67, P2-3 — stated here,
-      # at the seam that does it, because the alternative is a knob and a knob is forbidden): the value
-      # this line names is the LANE's base worktree on the lane path (`WIP_PATH` unset → `$PWD` = a tree
-      # cut from `origin/main`), but on the FIXER path `WIP_PATH` is the PR's own worktree (`fix-one.sh`),
-      # so `code_freshness` measures a BRANCH. `CELL_PREFLIGHT_MAX_BEHIND`'s default of 50 is calibrated
-      # against BASES (a two-day-old box is not an outage); a PR that sat a week is hundreds behind BY
-      # DESIGN, and that is exactly the population a fixer is dispatched to. Such a fixer is refused
-      # before it starts (85) and the remedy it publishes is a step the refused process cannot perform,
-      # so those PRs stall until an operator integrates by hand. Named, not fixed here: a caller-settable
-      # threshold is a caller turning its own readiness field off, which this file's ENVIRONMENT block
-      # forbids by decision — #3932's ask 2 (a sanctioned fast-forward the gate itself may perform) is
-      # what removes the consequence, and it is out of scope for this change.
+      # ⛔ THE TREE THIS LINE NAMES IS A BASE ON ONE PATH AND A BRANCH ON THE OTHER, AND THE PROBE IS
+      # WHAT DECIDES (review of 38f24c074, P1 — resolved in `cell-lane-preflight.sh`, not here). On the
+      # LANE path `WIP_PATH` is unset and this is `$PWD`, a tree cut from `origin/main` — a BASE. On the
+      # FIXER path `WIP_PATH` is the PR's own worktree (`fix-one.sh`), so this names a BRANCH, and
+      # `HEAD..origin/main` on a branch counts MAIN'S OWN UNMERGED COMMITS, not a stale base: a PR that
+      # sat a week is hundreds behind BY DESIGN, and it is exactly the population a fixer is dispatched
+      # to. Naming it here stays right — the reading is about the tree the work lives in, and hiding it
+      # would blind the gate to the fixer path altogether. What had to change was the VERDICT drawn from
+      # it: the probe now classifies the tree (`role=base` / `role=branch`) and REFUSES only a base, so
+      # a fixer is no longer refused with a remedy it cannot perform (that was a deadlock with no
+      # self-clearing path: the only work that would advance the branch is the work the refusal blocked
+      # before it started). A branch over the threshold is REPORTED (`stale_base=1`) and ADMITTED —
+      # loudly, by the arm below, because an announced admission is the price of not refusing it.
       _pf_line="$(CELL_PREFLIGHT_REPO="${CELL_PREFLIGHT_REPO:-${WIP_PATH:-$PWD}}" \
                     bash "$_pf_sh" --quiet --bound "${LANE_PREFLIGHT_BOUND:-45}" \
                     --provider "$lane_provider" --model "$lane_model" 2>>"$log")"
@@ -4687,6 +4688,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
           # is a fixed 12 s. A gate whose measurement can be unavailable everywhere with no signal at
           # the consumer is the no-op-gate class this repo treats as category A.
           case "$_pf_line" in
+            # ⛔ A BRANCH OVER THE THRESHOLD IS ADMITTED **LOUDLY** (review of 38f24c074, P1). The probe
+            # stopped refusing it — on a branch the distance is mostly main's own unmerged commits and
+            # the fixer is the process that would integrate them, so a refusal there is a deadlock — but
+            # an announced admission is the price of not refusing it: silence here would be a readiness
+            # field that fired and nobody saw, the same defect (g2c) names on the unmeasurable path.
+            *stale_base=1*)
+              echo "[capability-gate] NOTE $label: ADMITTED, and the staleness reading is on the line above (`stale_base=1`): the checkout the probe measured is a BRANCH more than CELL_PREFLIGHT_MAX_BEHIND commits behind origin/main. It is not refused ON PURPOSE (#3932, review of 38f24c074) — on a branch that count is mostly main's own unmerged commits, and integrating them IS the assigned work; refusing it would be a deadlock the refused process can never clear. The generated brief already orders the integration ('merge origin/main' into the branch). This is NOT a refusal and nothing was consumed. A BASE checkout in this state WOULD have been refused (85)." >> "$log" ;;
             *behind=unknown*)
               echo "[capability-gate] WARN $label: the staleness reading is UNMEASURABLE — the line above carries behind=unknown, so this spawn is admitted with NO evidence its base is current (#3932). The reason is on that line: reason=no-checkout / reason=not-a-checkout (the probe resolved no checkout — export CELL_PREFLIGHT_REPO=<the checkout this lane builds on> to name it explicitly), reason=fetch-failed (a dead/slow remote, or a fetch killed at CELL_PREFLIGHT_FETCH_BOUND), or reason=rev-list-unreadable. This is NOT a refusal and nothing was consumed; it is the one shape in which a stale box passes this gate." >> "$log" ;;
             # ⛔ AN OLD PROBE IS THE OTHER UNMEASURABLE SHAPE, AND IT WAS SILENT (this change's review,
