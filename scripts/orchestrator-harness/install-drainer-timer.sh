@@ -49,7 +49,12 @@
 #   SUDO               sudo probe           default: `sudo -n`
 #
 # Exit codes: 0 ok · 1 failure (named) · 2 usage · 3 --status: installed unit carries a STALE
-#             `Environment=LANE_TIMEOUT` pin (re-run the installer on this cell to re-render it).
+#             `Environment=LANE_TIMEOUT` pin (re-run the installer on this cell to re-render it) ·
+#             4 --status: the service and/or the timer is MISSING, so this box dispatches NOTHING
+#             (`--status` used to report that as exit 0 — "no drainer at all" reading healthy on a
+#             verb whose exit code is the published contract) · 5 --status: installed, but the cap it
+#             dispatches at cannot be DETERMINED (no pin and an unreadable `ExecStart` script), which
+#             is named as unknown rather than silently graded clean.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -175,14 +180,26 @@ render() { # <template> <dest>
 }
 
 say_status() {
-    local svc="$1" tmr="$2" installed want
+    local svc="$1" tmr="$2" installed want missing=0
     printf 'installer target: %s (%s)\n' "$TARGET" "$UNIT_DIR"
     for u in "$svc" "$tmr"; do
-        if [ -f "$UNIT_DIR/$u" ]; then printf '  %-34s installed\n' "$u"; else printf '  %-34s MISSING\n' "$u"; fi
+        if [ -f "$UNIT_DIR/$u" ]; then printf '  %-34s installed\n' "$u"; else printf '  %-34s MISSING\n' "$u"; missing=1; fi
     done
     if [ -f "$UNIT_DIR/$tmr" ]; then
         printf '  timer state: %s\n' "$($SYSTEMCTL is-active "$tmr" 2>/dev/null || true)"
         printf '  next run:    %s\n' "$($SYSTEMCTL list-timers --all "$tmr" 2>/dev/null | sed -n '2p' | sed 's/  */ /g' || true)"
+    fi
+    # ⛔ "NO DRAINER AT ALL" IS NOT A CLEAN STATUS (agent-infra#4034 review, P3 — verified). The grading
+    # block below lives inside `if [ -f "$UNIT_DIR/$svc" ]` and the function ended `return 0`, so a box
+    # with NO unit printed `… MISSING` and exited 0. Once the exit code is the contract an automated
+    # check reads, that is the same false PASS the exit-3 change exists to remove, one row up its own
+    # output: "the drainer is armed at the right cap" and "this box dispatches nothing" were
+    # indistinguishable. MISSING gets its own code (4) and a named line, so the two are separable
+    # without parsing prose.
+    if [ "$missing" -eq 1 ]; then
+        printf '  ⛔ NOT ARMED: this box dispatches NOTHING at any cap — the missing unit(s) above are not\n'
+        printf '      installed. Run this installer (no arguments) on this cell to arm them.\n'
+        return 4
     fi
     # ⛔ A STALE `Environment=LANE_TIMEOUT` PIN IS THE #4034 DEFECT ONE LAYER OUT, AND --status COULD NOT SEE
     # IT. The unit is rendered ONCE, at install time (see the seam block above), and an installed pin WINS
@@ -214,9 +231,11 @@ say_status() {
             if [ -z "${exe:-}" ] || [ ! -f "${exe:-/nonexistent}" ]; then
                 printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and its ExecStart names no readable script, so the cap\n'
                 printf '      this box actually dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+                return 5
             elif [ -z "$have" ]; then
                 printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, and %s declares no readable default, so the cap this\n' "$exe"
                 printf '      box dispatches at is UNKNOWN; re-run this installer to pin it)\n'
+                return 5
             elif [ "$have" != "$want" ]; then
                 printf '  LANE_TIMEOUT pin: (none — the unit carries no pin, so it dispatches at %s s compiled into\n' "$have"
                 printf '      %s)\n' "$exe"

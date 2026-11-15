@@ -13,6 +13,18 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/lane-merge.sh"
+# ⛔ SCRUB THE AMBIENT SEAM BEFORE THE FIRST ARM (agent-infra#4034 review, P2 — the same class as
+# `ai-drainer.test.sh`'s four installer arms, MEASURED here). `run()`/`run_stub()` pass their knobs as an
+# env PREFIX, which ADDS to the inherited environment rather than replacing it — so an ambient
+# `LANE_BACKSTOP_S` (this box's controller exports `LANE_BACKSTOP_S=7200`) reaches every child and
+# silently re-arms the clock these arms assert. Measured: `bash lane-merge.test.sh` on the shipped tree
+# with `LANE_BACKSTOP_S=7200` exported → **202 passed, 5 FAILED**, all five on the 36000 s arithmetic
+# (`99999 > 36000`, `LANE_BOUND_WALL_S=0`, the 247-chunk DESIGN fit, and the two 35980-spent caps); the
+# same command with it unset → **ALL 207 lane-merge checks passed**. A suite that reds on a correctly
+# configured box teaches the next fixer to edit the assertion, which is how a gate becomes decorative.
+# The arms that DELIBERATELY exercise a seam set it on their own invocation (`LANE_TIMEOUT=1500 …`,
+# `LANE_BACKSTOP_S=` …), so scrubbing here removes the accident and keeps every intended case.
+unset LANE_BACKSTOP_S LANE_TIMEOUT
 pass=0; fail=0
 ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$1"; pass=$((pass+1)); }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=$((fail+1)); }

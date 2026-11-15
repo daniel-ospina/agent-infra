@@ -349,12 +349,24 @@ and costs model spend, so it is an explicit, per-cell operator step — the same
 reaper's arming.
 
 ⛔ `--status` ALSO PRINTS THE INSTALLED `Environment=LANE_TIMEOUT` PIN beside the value this checkout
-would render now, and exits **3** when they disagree. The unit is rendered ONCE, at install time, and an
+would render now, and its **exit code is the contract** an automated check reads:
+
+| rc | meaning |
+|---|---|
+| 0 | armed, and the cap it dispatches at provably agrees with the seam |
+| 3 | **STALE** — the installed pin (or the no-pin unit's own `ExecStart` script) disagrees with the seam |
+| 4 | **NOT ARMED** — the service and/or the timer is MISSING, so the box dispatches nothing at any cap |
+| 5 | **UNKNOWN** — installed, but the cap cannot be determined (no pin and an unreadable `ExecStart`) |
+
+The unit is rendered ONCE, at install time, and an
 installed pin WINS over `ai-drainer.sh`'s compiled default (`LANE_TIMEOUT="${LANE_TIMEOUT:-...}"`, passed
 straight to the dispatcher): so a cell whose unit predates a seam change keeps dispatching lanes at the
 OLD cap while the checkout, the docs and the tests all say the new one — verbatim #4034's defect one
 layer out, in a rendered artifact. `--status` used to report only installed/MISSING + timer state, so
-such a box read **healthy**. After any seam change, re-run the installer (no arguments) on every cell,
+such a box read **healthy**. ⛔ AND THE SAME APPLIED TO A BOX WITH NO UNIT AT ALL: that printed `MISSING`
+and exited **0**, so "the drainer is armed at the right cap" and "this box dispatches nothing" were
+indistinguishable on a verb whose exit code is what a check reads — hence rcs 4 and 5 rather than a
+named line and a zero. After any seam change, re-run the installer (no arguments) on every cell,
 then `--status` to prove the pin actually moved.
 
 The second controller on a cell is the cell supervisor's business (`cloud-cell-supervisor.sh start`

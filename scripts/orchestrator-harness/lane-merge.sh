@@ -365,7 +365,8 @@ if is_limit "${LANE_TIMEOUT:-}" && [ "${LANE_TIMEOUT}" = "${LANE_WALL_S}" ]; the
 # the same defect one configuration over from the one below). The test here used to be VALUE EQUALITY alone,
 # which attributes by coincidence and not by the rule: `LANE_WALL_S` is `${LANE_TIMEOUT:-…}`, so a NON-EMPTY
 # `LANE_TIMEOUT` wins the mask and the backstop is never read — yet with `LANE_TIMEOUT=abc
-# LANE_BACKSTOP_S=7200` (7200 is spawn-gate.sh:3419's own default, i.e. the value in EVERY lane's env) the
+# LANE_BACKSTOP_S=7200` (7200 was `spawn-gate.sh`'s own default until agent-infra#4034 raised it to
+# 36000 — i.e. it used to be the value in EVERY lane's env) the
 # backstop happens to equal the shipped default, so the elif matched and every message rendered "from
 # LANE_BACKSTOP_S" while naming no malformed knob at all. `-z ${LANE_TIMEOUT}` is the resolution rule
 # itself, not a second opinion about the number: it is empty exactly when `${LANE_TIMEOUT:-…}` falls through.
@@ -1996,8 +1997,10 @@ CHECK_ERR_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks-err.XXXXXX")" || { rm
 trap 'rm -f "$CHECK_TMP" "$CHECK_ERR_TMP"' EXIT
 # ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S **REMAINING** WALL CLOCK, NOT JUST THE WHOLE OF IT
 # (#3584 review, P1 — verified). `deadline` was `now + WAIT_S` and nothing compared it with how much of
-# `LANE_WALL_S` THIS lane had already spent. At the shipped numbers a lane entering its merge phase more
-# than ~1800 s into its run (7200 - 5400) was TERMed by `lane-bound.sh`'s WALL ceiling MID-wait: the
+# `LANE_WALL_S` THIS lane had already spent. At the numbers of the day a lane entering its merge phase
+# more than ~1800 s into its run (7200 − 5400, THE PRE-#4034 CLOCK this was measured on; the shipped
+# backstop is 36000 s now, so the same lane enters with ~30 600 s of headroom) was
+# TERMed by `lane-bound.sh`'s WALL ceiling MID-wait: the
 # `now >= deadline` arm never ran, so `WAITING_CHECKS` was never emitted, no `lanemerge-<pr>.verdict`
 # was written, and `lane.sh` printed "NO merge-phase verdict" over a lane that HAD a labelled hand-off
 # available. ⛔ THAT IS STRICTLY WORSE THAN THE 1500 s BOUND THIS CHANGE REPLACES (which reached its own

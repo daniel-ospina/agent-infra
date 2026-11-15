@@ -2015,9 +2015,10 @@ SC_EOF
   # ⛔ THE PIN IT JUST WROTE IS ONLY VISIBLE IF SOMETHING READS IT BACK (agent-infra#4034 review). The unit
   # is rendered at INSTALL time, so a cell installed before the seam moved carries the OLD value and keeps
   # dispatching at the old cap — and `--status` used to report only installed/MISSING + timer state, so
-  # such a box read healthy. These three arms grade the reading: matching pin → clean, stale pin → warned
-  # AND non-zero (a warning only an eye can read is the invisibility this fixes), no pin on disk → named
-  # as "no pin" rather than silently compared against an empty string.
+  # such a box read healthy. These arms grade the reading: matching pin → clean (0), stale pin → warned
+  # AND 3 (a warning only an eye can read is the invisibility this fixes), no pin on disk → graded
+  # against the unit's OWN `ExecStart` script rather than silently compared against an empty string, a
+  # cap that cannot be determined → UNKNOWN **and 5**, and nothing installed at all → 4.
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: --status prints the INSTALLED LANE_TIMEOUT pin beside what it would render, and is clean when they agree" \
@@ -2036,16 +2037,19 @@ SC_EOF
   printf 'ExecStart=/bin/true\n' >"$T4/units/eldato-ai-drainer.service"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
-  check "installer: --status names an ABSENT pin as absent (never compares '' and calls it clean)" \
-    '[ "$rc" -eq 0 ] && grep -q "carries no pin" <<<"$out" && ! grep -q STALE <<<"$out"' \
+  # ⛔ AND "UNKNOWN" IS NOT "CLEAN" EITHER (agent-infra#4034 review, P3). Once the exit code is the
+  # contract, a named-but-zero exit is still a false PASS to an automated check: the unit is installed
+  # but the cap it dispatches at cannot be read, so the correct answer is "not verifiably armed".
+  check "installer: --status names an ABSENT pin as absent AND exits 5 when the cap cannot be determined (never 0 = 'clean')" \
+    '[ "$rc" -eq 5 ] && grep -q "carries no pin" <<<"$out" && grep -q UNKNOWN <<<"$out" && ! grep -q STALE <<<"$out"' \
     "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
   # ⛔ "NO PIN" IS NOT "CLEAN" BY DEFAULT (agent-infra#4034 review, P3). A unit with no pin dispatches at
   # the default COMPILED INTO THE ai-drainer.sh ITS OWN `ExecStart=` NAMES — so on a box whose `$O` tree
   # predates this seam the box keeps the OLD cap while the checkout, the docs and the suite all say the
   # new one, which is the very state exit 3 exists to make automatable. Read the script the unit would
   # actually run (never the copy this checkout happens to have), and grade it: matching → clean, stale →
-  # warned AND non-zero, unreadable → named as UNKNOWN rather than silently compared against ''. The
-  # `/bin/true` arm directly above is the unreadable case and stays rc 0 for that reason.
+  # warned AND 3, unreadable → named as UNKNOWN **and 5** (not 0: once the exit code is the contract, a
+  # named-but-zero exit is still a false PASS to an automated check).
   cp "$HERE/ai-drainer.sh" "$T4/drainer-fresh.sh"
   # One ExecStart and no pin: the shape a real no-pin unit has. (Appending to `svc.bak` would leave TWO
   # ExecStart lines, which systemd rejects for a Type=simple unit — a fixture should look like the
@@ -2065,6 +2069,16 @@ SC_EOF
   check "installer: --status WARNS and exits 3 when a NO-PIN unit's ExecStart script still carries the OLD compiled default" \
     '[ "$rc" -eq 3 ] && grep -q STALE <<<"$out" && grep -q "7200 s" <<<"$out" && grep -q "carries no pin" <<<"$out"' \
     "rc=$rc · $(grep 'pin:' <<<"$out" | head -1)"
+  # ⛔ AND A BOX WITH NO UNIT AT ALL IS NOT HEALTHY (agent-infra#4034 review, P3 — verified). The whole
+  # grading block is inside `if [ -f "$UNIT_DIR/$svc" ]`, so an empty unit dir printed `… MISSING` and
+  # exited 0 — indistinguishable, to an automated check reading the published contract, from "the drainer
+  # is armed at the right cap". Verified pre-fix: rc 0 on this exact fixture.
+  mkdir -p "$T4/none"
+  out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/none" DRAINER="$DRAINER" \
+        DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
+  check "installer: --status exits 4 (not 0) when NOTHING is installed — 'no drainer at all' must not read healthy" \
+    '[ "$rc" -eq 4 ] && grep -q MISSING <<<"$out" && grep -q "NOT ARMED" <<<"$out" && ! grep -q STALE <<<"$out"' \
+    "rc=$rc · $(grep 'MISSING\|NOT ARMED' <<<"$out" | head -1)"
   cp "$T4/svc.bak" "$T4/units/eldato-ai-drainer.service"
 else
   bad "installer missing at $INSTALLER"

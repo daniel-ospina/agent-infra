@@ -1987,8 +1987,9 @@ REV_STARTED=1
 # is NOT clamped at all. It is the same stale-9600 arithmetic this PR corrects in `claims.sh` and in
 # BOTH of the README's statements of the derivation (the ceiling paragraph and, since review round 12,
 # the `REVIEW_TIMEOUT + 1200` form in the registry section — a count is not given here, because the
-# round that wrote "the third place" left a fourth live in `claim-orphan.test.sh`). What is true now: the 7200 s backstop is INSIDE the
-# headroom at the default gate wait (8400 <= 43200), so the clamp is not the reason this bound
+# round that wrote "the third place" left a fourth live in `claim-orphan.test.sh`). What is true now: the
+# shipped pair is a 36000 s backstop (agent-infra#4034) -> a 37200 s lease (`FIX_BOUND + 1200`), and
+# 37200 <= 43200 leaves 6000 s of headroom, so the clamp is not the reason this bound
 # stays at 1800 — raising it is simply a change nobody has made. The two numbers are still one
 # decision (raise `CLAIM_TTL_MAX` with the reviewer bound, in one change, with `claim-orphan.test.sh`
 # re-derived), because a bound past the threshold pins the lease at 43200 and spends the merge

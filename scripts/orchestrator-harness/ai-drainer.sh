@@ -99,7 +99,13 @@
 #     lanes is the correct answer, not overlapping ones. ⛔ AND ACROSS TICKS: a lane keeps its window
 #     for up to LANE_TIMEOUT (the 10 h backstop, ~30 ticks at the shipped 20 m cadence), so the windows
 #     LIVE lanes hold are read from their records and skipped — a tick whose ring is fully held dispatches
-#     nothing and says so.
+#     nothing and says so. ⛔ THE RING IS ONLY `SLICE_TOTAL/SLICE_WIDTH` = 7 WINDOWS WIDE, SO THE HOLD
+#     WINDOW IS THE RING'S WHOLE CAPACITY: raising the lane term 2 h → 10 h lets 7 long-running lanes
+#     hold every window for up to 10 h, and on a box whose measured `target` exceeds 7 every tick in that
+#     span logs `SKIP: nothing to add — … free_windows=0/7 …` and adds nothing. That is the correct action (fewer
+#     lanes, never overlapping ones) arriving as a long SILENT-IN-EFFECT stall: it surfaces only as a
+#     repeating SKIP line, so watch for it on a box that stops topping up with lanes still alive. The
+#     single knobs are `SLICE_TOTAL`/`SLICE_WIDTH` (more windows) or the lane term itself.
 #   * NO RUN-AWAY — the tick can never start more than `target − alive`, `target` is bounded by memory
 #     AND by the cpu ceiling, and each lane is one dispatcher call (not a fork fan-out).
 #
@@ -1815,7 +1821,12 @@ fi
 
 # ⛔ HOW MANY LANES MAY BE ADDED, and the one clamp that stops two lanes sharing a slice. With
 # `SLICE_TOTAL/SLICE_WIDTH` = 7 distinct windows, a 13th lane would land on lane 6's: fewer lanes is
-# the answer, never overlapping ones.
+# the answer, never overlapping ones. ⛔ AND BECAUSE A LIVE LANE HOLDS ITS WINDOW FOR UP TO `LANE_TIMEOUT`
+# (10 h since agent-infra#4034, 2 h before it), 7 long lanes can hold the WHOLE ring for 10 h: every tick
+# in that span logs `SKIP: nothing to add — … free_windows=0/7 …` and adds nothing, which is right (a
+# window is never shared) but reads as a
+# stall. Raise `SLICE_TOTAL`/`SLICE_WIDTH` for a box whose target exceeds 7, or accept the narrower add
+# rate — see the SLICE guard's note at the top of this file.
 slices=$((SLICE_TOTAL / SLICE_WIDTH))
 [ "$slices" -ge 1 ] || slices=1
 # ⛔ BOUND THE LOOP'S OWN RANGE. Every other derived number here is clamped; `slices` was not, and
