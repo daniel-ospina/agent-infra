@@ -62,7 +62,13 @@ group() {
   if [ -n "${9:-}" ]; then line="$line$(printf '\t%s' "$9")"; fi
   printf '%s\n' "$line" >> "$d/checkruns-$HEAD.tsv"
 }
-run() { printf '%s\t%s\t%s\n' "$3" "$4" "$5" >> "$1/pr-$2/runs-$HEAD.tsv"; }
+run() { # run <root> <pr> <run-id> <workflow name> <run attempt> [workflow path]
+  if [ -n "${6:-}" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$3" "$4" "$5" "$6" >> "$1/pr-$2/runs-$HEAD.tsv"
+  else
+    printf '%s\t%s\t%s\n' "$3" "$4" "$5" >> "$1/pr-$2/runs-$HEAD.tsv"
+  fi
+}
 # rail_land <root> <pr> [extra line…] — the rail's OWN landing line, verbatim from the producer:
 #   admin-merge.sh:12402  info "admin-merge: ✅ merged PR #$PR at $landed_sha (state=… confirmed via the API)"
 # A fixture must speak the PRODUCER's grammar. The first version of this suite wrote
@@ -168,6 +174,48 @@ group "$R" 408 20 9002 "packaging-smoke" completed failure "2026-11-12T04:00:00Z
 group "$R" 408 30 9001 "packaging-smoke" completed success "2026-11-12T04:10:00Z"
 verify "$R"; rc=$?
 ck "same-name-two-workflows: green_gated FAIL (name-only grouping would have masked the red)" "$(has "Workflow B/packaging-smoke:failure"; echo $?)"
+
+# ── case 8b: ⛔ SAME JOB NAME, TWO WORKFLOWS THAT SHARE A DISPLAY *NAME* ────────────────────────
+# Fresh-context review, round 7, P3: the workflow component was the display `name`, which a repo can
+# repeat, so two DISTINCT workflows still collapsed into one group and the newer of one masked the
+# other — case 8 was narrowed, not closed. The identity is the workflow's `path`, which is unique per
+# repo and arrives in the same payload.
+R="$(mk same-name-two-paths 472)"
+run "$R" 472 9001 "CI" 1 ".github/workflows/ci.yml"
+run "$R" 472 9002 "CI" 1 ".github/workflows/ci-mirror.yml"
+group "$R" 472 20 9002 "packaging-smoke" completed failure "2026-11-12T04:00:00Z"
+group "$R" 472 30 9001 "packaging-smoke" completed success "2026-11-12T04:10:00Z"
+verify "$R"
+ck "same-name-two-paths: two workflows sharing a DISPLAY name are still two groups" \
+  "$(has ".github/workflows/ci-mirror.yml/packaging-smoke:failure"; echo $?)"
+ck "same-name-two-paths: …so the red is not masked by the newer green" "$(has "VERDICT: NOT-ALL-MET"; echo $?)"
+
+# ── case 8c: ⛔ THE `--json` EVIDENCE PATH MUST SURVIVE A BACKSLASH AND A QUOTE ────────────────
+# Fresh-context review, round 7, P3: the escaper was `gsub(/\\/,"\\\\",o)`, and escape processing inside a
+# gsub REPLACEMENT is not portable — measured on one input backslash it yields TWO on gawk/mawk/nawk
+# defaults but ONE under `awk --posix`, i.e. a no-op that emits `\z`, which is not a JSON escape. A
+# detail carrying a quote/backslash is reachable from a malformed `mergedAt` in `pr.meta`, so this is a
+# real value path, not a hypothetical one.
+R="$(mk json-escaping 473)"
+printf '%s\t%s\t%s\t%s\n' 473 OPEN 'x"y\z' "$MERGE" > "$R/pr-473/pr.meta"
+verify "$R" --json
+ck "json-escaping: a backslash+quote in a detail is JSON-escaped, not emitted raw" \
+  "$(hasj 'mergedAt=x\"y\\z'; echo $?)"
+ck "json-escaping: …so the evidence file still parses" \
+  "$(printf '%s' "$OUTJ" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; echo $?)"
+ck "json-escaping: …and the detail round-trips to the bytes the report printed" \
+  "$(printf '%s' "$OUTJ" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(c["detail"].find("mergedAt=x\"y\\z")>=0 for p in d["prs"] for c in p["checks"]) else 1)' >/dev/null 2>&1; echo $?)"
+# the same report rendered by a POSIX-mode awk, when this box has one: this is the read that the
+# escaped-replacement form could NOT survive, so it pins the portable-subset contract directly.
+if awk --posix 'BEGIN{}' >/dev/null 2>&1; then
+  OUTP="$(VERIFY_AWK='awk --posix' bash "$SCRIPT" --from-snapshot "$R" --repo "$REPO_FIXTURE" --json 2>&1)"
+  ck "json-escaping: the --json emitter is valid JSON under a POSIX-mode awk too" \
+    "$(printf '%s' "$OUTP" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; echo $?)"
+  ck "json-escaping: …and it carries the same escaped backslash there" \
+    "$(grep -qF -- 'mergedAt=x\"y\\z' <<<"$OUTP"; echo $?)"
+else
+  ok "json-escaping: SKIPPED the POSIX-mode awk parity read — this box's awk has no --posix"
+fi
 
 # ── case 9: an UNRESOLVABLE workflow is grouped under its app, never dropped ─────────────────────
 R="$(mk no-workflow 409)"

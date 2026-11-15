@@ -71,6 +71,11 @@
 # ONE extra read per head, not one per run id. A check-run whose Actions workflow cannot be resolved
 # groups under its app slug alone; it is never dropped, because a check that forms no group can never
 # make a verdict red.
+# ⛔ THE WORKFLOW COMPONENT IS THE WORKFLOW'S `path`, NOT ITS DISPLAY `name` (fresh-context review,
+# round 7, P3). `name:` is free text a repo can repeat, so two DISTINCT workflows sharing a display
+# name collapsed into one group and the newer of one could still mask the other — case 8 was narrowed,
+# not closed. `.path` (`.github/workflows/<file>.yml`) is unique per repo and is in the same payload.
+# The display name stays the FALLBACK, so a snapshot or an older runs read still groups sensibly.
 #
 # VERDICTS — `PASS | FAIL | INCONCLUSIVE | N/A`
 # --------------------------------------------
@@ -89,6 +94,10 @@
 #                         verifies a PR it cannot reach gh for — the snapshot IS the evidence).
 #   --write-snapshot DIR  fetch into DIR and KEEP it (the artifact a capstone record attaches).
 #   --json                one JSON object on stdout, for a report or a frozen evidence file.
+#
+# ENV: VERIFY_AWK   the awk that renders `--json` (default `awk`). Set it to `awk --posix` to run the
+#                   emitter under the portable-subset rules the suite asserts; any other read in this
+#                   file is unaffected.
 #
 # EXIT: 0 every check PASS or N/A · 1 at least one FAIL · 2 no FAIL but at least one INCONCLUSIVE ·
 #       3 usage error. (The same ladder as outcome_canary.py, deliberately.)
@@ -190,6 +199,10 @@ RAIL_DIR="${RAIL_DIR:-$HOME/.pi/agent/state/rails}"
 CHAIN_MARKER_WINDOW="${CHAIN_MARKER_WINDOW:-21600}"   # 6h: generous for a slow chain, tight enough
                                                       # that another repo's merge of the same number
                                                       # (days or weeks away) can never fall inside it
+# The awk that renders the `--json` evidence. It is a seam, not a knob: the JSON emitter must hold to
+# the PORTABLE subset (no gawk-only replacement escapes), and the suite exercises exactly that by
+# pointing this at `awk --posix` for one run. Left unset it is plain `awk`, like every other read here.
+VERIFY_AWK="${VERIFY_AWK:-awk}"
 iso_epoch() { # iso_epoch <2026-11-12T05:05:55Z> → seconds since epoch, or EMPTY
   local t="${1:-}"
   case "$t" in ""|-) return 1 ;; esac
@@ -228,7 +241,7 @@ file_mtime() { # file_mtime <path> → ISO-8601 UTC, or EMPTY (GNU stat, then BS
 # chain.verdict        lane-merge.sh's machine verdict for the PR
 # merge.log            the per-PR chain's log
 # commit-<sha>.tsv     <sha> TAB <tree> TAB <comma-separated parents>
-# runs-<sha>.tsv       <run_id> TAB <workflow name> TAB <run_attempt>
+# runs-<sha>.tsv       <run_id> TAB <workflow name> TAB <run_attempt> TAB <workflow path>
 # checkruns-<sha>.tsv  <id> TAB <app> TAB <name> TAB <status> TAB <conclusion> TAB <completed_at> TAB <details_url>
 fetch_one() { # fetch_one <dir> <pr>
   local dir="$1" pr="$2" sha rail rec legacy
@@ -321,7 +334,12 @@ fetch_one() { # fetch_one <dir> <pr>
 # a MEASURED fact — a failed read became "the head carried no check-run". Writes go to `.tmp` and are
 # `mv`d only on rc 0; a failed read leaves an explicit `<name>.unread` and NO artifact, so "did not
 # read" and "read, and it was empty" stay distinguishable in every direction.
-store_read() { # store_read <dir> <name> <command…>  → 0 stored · 1 STORED but empty-ish · 2 UNREAD
+store_read() { # store_read <dir> <name> <command…>  → 0 stored (MAY be empty — a measured zero) · 2 UNREAD
+  # ⛔ THERE IS NO THIRD RESULT (fresh-context review, round 7, P3): this contract used to document
+  # `1 · STORED but empty-ish`, which the implementation NEVER returns and no caller distinguishes —
+  # an empty artifact here is a FACT ("the endpoint answered, and there is nothing attached"), which
+  # the predicates read for themselves (`surface_verdicts` prints `surface/empty` for it). Only
+  # "could not read" is a distinct state, and it is the `.unread` sentinel plus this rc.
   local dir="$1" name="$2"; shift 2
   local tmp="$dir/.tmp-$name"
   : > "$tmp" 2>/dev/null || return 2
@@ -352,7 +370,7 @@ fetch_head_surface() { # fetch_head_surface <dir> <head_sha>
   # masking case 8 exists for would become reachable through a rate limit, in the GREEN direction.
   store_read "$dir" "runs-${sha}.tsv" \
     "$GH" api "repos/$REPO/actions/runs?head_sha=${sha}&per_page=100" --paginate \
-      --jq '.workflow_runs[] | [.id, .name, .run_attempt] | @tsv' || rc_runs=$?
+      --jq '.workflow_runs[] | [.id, .name, .run_attempt, (.path // "")] | @tsv' || rc_runs=$?
   # `filter=all` is PINNED: the endpoint's default is not all (measured: 26 of 40 on a real commit),
   # so a bare read silently drops every re-run and can report a red head green.
   # `started_at` is captured because it is what separates "this check had not voted yet when the
@@ -389,9 +407,17 @@ record_markers() { # record_markers <dir> <pr>
   local dir="$1" pr="$2"
   {
     # the BODY last, and tagged, so "the recorder's current word" is distinguishable from history
-    [ -s "$dir/comments.txt" ] && sed 's/^/COMMENT\t/' "$dir/comments.txt"
+    # ⛔ `awk`, NOT `sed 's/^/COMMENT\t/'` (fresh-context review, round 7, P3). POSIX says an escaped
+    # ORDINARY character in a sed replacement stands for itself, so a BSD/macOS sed emits `COMMENTt…`
+    # and `BODYt…` (GNU's `\t`→TAB is an extension); with `-F'\t'` and
+    # `index(line, "review recorded: …") != 1` NO marker would ever parse on a Mac, leaving
+    # review_record/fix_round/review_bound/green_gated permanently INCONCLUSIVE on the one platform
+    # the capstone is required on — while the Linux suite stayed green. `check-portability-traps.sh`
+    # has no `\t`-in-sed row, so nothing else would have caught it. `awk`'s `print "X\t" $0` is the
+    # portable form (verified: identical output on gawk, mawk, nawk and `awk --posix`).
+    [ -s "$dir/comments.txt" ] && awk '{ print "COMMENT\t" $0 }' "$dir/comments.txt"
     printf 'BODY\t\n'
-    [ -s "$dir/body.txt" ] && sed 's/^/BODY\t/' "$dir/body.txt"
+    [ -s "$dir/body.txt" ] && awk '{ print "BODY\t" $0 }' "$dir/body.txt"
   } | awk -F'\t' -v pr="$pr" -v want="$REPO" '
     BEGIN { fold = tolower(want) }
     {
@@ -475,7 +501,7 @@ surface_verdicts() { # surface_verdicts <dir> <head_sha> <merged_at>
     }
     $0 == "==RUNS==" { sect = "runs"; next }
     $0 == "==CHECKS==" { sect = "checks"; next }
-    sect == "runs" && NF >= 2 { wf[$1] = $2; next }
+    sect == "runs" && NF >= 2 { wf[$1] = ($4 != "" ? $4 : $2); next }
     sect == "checks" && NF >= 7 {
       id = $1 + 0; app = $2; name = $3; status = $4; conc = $5; done_at = $6; url = $7; started_at = $8
       rid = runid_of(url); w = (rid != "" ? wf[rid] : "")
@@ -957,8 +983,24 @@ done
 
 # ── report ──────────────────────────────────────────────────────────────────────────────────────
 if [ "$JSON" -eq 1 ]; then
-  printf '%s' "$PR_BLOCKS" | awk -F'\t' '
-    function jstr(s,  o) { o = s; gsub(/\\/, "\\\\", o); gsub(/"/, "\\\"", o); return "\"" o "\"" }
+  printf '%s' "$PR_BLOCKS" | $VERIFY_AWK -F'\t' '
+    # ⛔ A CHARACTER LOOP, NOT `gsub(/\\/,"\\\\",o)` (fresh-context review, round 7, P3). Escape
+    # processing inside a gsub REPLACEMENT is not portable: measured on one input backslash, the
+    # `"\\\\"` replacement yields TWO backslashes on gawk/mawk/nawk defaults but ONE under
+    # `awk --posix` (i.e. a no-op, so a backslash in a detail emitted INVALID JSON — `\z` is not a
+    # JSON escape), while the `"\\\\\\\\"` replacement yields two on gawk and FOUR on mawk. Building
+    # the escape from concatenated SINGLE-CHARACTER literals removes the replacement rules entirely:
+    # verified identical on gawk, mawk, nawk and `awk --posix`.
+    function jstr(s,   o, i, c) {
+      o = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\")      o = o "\\" "\\"
+        else if (c == "\"") o = o "\\" "\""
+        else                o = o c
+      }
+      return "\"" o "\""
+    }
     BEGIN { printf "{\"prs\":["; firstpr = 1 }
     $1 == "@@PR" { if (!firstpr) printf "]}"; printf "%s{\"pr\":%s,\"checks\":[", (firstpr ? "" : ","), $2; firstpr = 0; n = 0; next }
     NF >= 3 { if (n++) printf ","; printf "{\"check\":%s,\"verdict\":%s,\"detail\":%s}", jstr($1), jstr($2), jstr($3); next }
