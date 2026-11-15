@@ -112,7 +112,7 @@ drive() {
       O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
       REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
       MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" "$@" \
-      bash "$LANE" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1
+      bash "${LANE_BIN:-$LANE}" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1
   LANE_RC=$?
 }
 # drivef <worktree> <extra LANE argv…> — the same, but passing ARGUMENTS. The key gate's escape is
@@ -141,8 +141,8 @@ LOG() { printf '%s\n' "$ARMDIR/o/logs/lane-3331.log"; }
 lastline() { tail -n 1 "$(LOG)" 2>/dev/null; }
 
 # ── the outcome vocabulary, read off the ARTIFACT: exactly one terminal line, last in the log ─────
-check_terminal() { # <arm-label> <expected-outcome> <expected-reason-prefix> [<expected-rc>]
-  local lab="$1" want="$2" wantwhy="$3" wantrc="${4:-}" log n last
+check_terminal() { # <arm-label> <expected-outcome> <expected-reason-prefix> [<expected-rc>] [<expected-keygate>]
+  local lab="$1" want="$2" wantwhy="$3" wantrc="${4:-}" wantkg="${5:-}" log n last
   log="$(LOG)"
   n="$(grep -c '^outcome=' "$log" 2>/dev/null || true)"
   eqv "${n:-0}" "1" "$lab: the log carries EXACTLY ONE terminal line (a log with none is the defect; two means the writer is not idempotent)"
@@ -163,6 +163,12 @@ check_terminal() { # <arm-label> <expected-outcome> <expected-reason-prefix> [<e
   # whole suite stayed green on exactly that defect.
   if [ -n "$wantrc" ]; then
     has "$last" "rc=$wantrc" "$lab: rc= reports the status the process actually exited with ($wantrc)"
+  fi
+  # ⛔ `keygate=` IS ASSERTED ON EVERY ARM THAT PASSES IT (review: the escape must be COUNTABLE). A field the
+  # writer can omit without a red is the prose-only bypass again; passing the expectation makes its absence
+  # an assertion failure, and its VALUE pins which state the run really reached.
+  if [ -n "$wantkg" ]; then
+    has "$last" "keygate=$wantkg " "$lab: the terminal line says keygate=$wantkg (what the model-credential gate did for THIS run)"
   fi
   # ⛔ THE VOCABULARY IS CLOSED. A writer that invents a fifth word records nothing an instrument can
   # count, so the four are pinned here rather than trusted.
@@ -190,7 +196,7 @@ has "$(cat "$(LOG)" 2>/dev/null)" "[key-gate] lane 3331 check=fail result=REFUSE
 has "$(cat "$(LOG)" 2>/dev/null)" 'pi -p --no-session --provider deepseek --model deepseek-flash' \
     "1b2 …and the remedy gives the exact working invocation, not \"source keys.env\""
 [ ! -s "$PI_MARK" ]; ck "1c pi was NEVER spawned — the refusal is BEFORE the agent, so no model call was spent" $?
-check_terminal "1d" refused "key-gate:credential-missing:$KEYVAR" 82
+check_terminal "1d" refused "key-gate:credential-missing:$KEYVAR" 82 refused
 # ⛔ AND THE TERMINAL TOKEN NAMES THE MODEL, NOT ONLY THE VARIABLE (agent-infra#3443). The failure this
 # gate front-runs is named after the MODEL (`No API key found for the selected model.`), so a token
 # carrying only `$VAR` sends an operator to a credential that may never have been the question — and this
@@ -383,7 +389,14 @@ eqv "$LANE_RC" "0" "1y6 --key-gate-off on the INVOCATION skips the assertion (rc
 [ -s "$PI_MARK" ]; ck "1y7 …and the agent really ran" $?
 has "$(cat "$(LOG)" 2>/dev/null)" "reason=--key-gate-off" \
     "1y8 …and the skip is LOUD and named (a silent skip is the bypass this whole change refuses)"
-check_terminal "1y9" done "agent-exit-0" 0
+check_terminal "1y9" done "agent-exit-0" 0 off
+# ⛔ THE BYPASS IS COUNTABLE ON THE TERMINAL LINE, NOT ONLY IN PROSE (the review's most substantive finding).
+# `keygate=off` is the token a fleet scan counts; the prose line above is what an operator reads. One command
+# answers "how many lanes on this box had the credential assertion switched off?".
+eqv "$(grep -c 'keygate=off ' "$ARMDIR/o/logs/lane-3331.outcome" 2>/dev/null || true)" "1" \
+    "1y10 the run-scoped verdict carries keygate=off, so a BYPASS is countable from the artifact the gate ships"
+eqv "$(grep -c 'keygate=checked ' "$ARMDIR/o/logs/lane-3331.outcome" 2>/dev/null || true)" "0" \
+    "1y11 …and an escaped run is never reported as checked (the false-pass direction)"
 
 # ── 1z: A STORED CREDENTIAL IS NOT A MISSING ONE (review round 3, P1) ────────────────────────────
 # `pi` consults `auth.json` (what `pi /login` writes) BEFORE the environment, so a provider logged in
@@ -400,7 +413,7 @@ eqv "$LANE_RC" "0" "1z a lane whose provider is logged in (auth.json, no env var
 [ -s "$PI_MARK" ]; ck "1z2 …and the agent really started" $?
 has "$(cat "$(LOG)" 2>/dev/null)" "check=skipped reason=stored-credential" \
     "1z3 …because the gate says WHICH source answered, instead of passing silently"
-check_terminal "1z4" done "agent-exit-0" 0
+check_terminal "1z4" done "agent-exit-0" 0 skipped
 [ ! -s "$ARMDIR/o/state/capacity-refused-3331" ]; ck "1z5 …and no stand-down record is written for a lane that ran" $?
 
 # ═══ 2. A LANE WHOSE AGENT RUNS AND RETURNS 0 ═══════════════════════════════════════════════════════
@@ -409,7 +422,7 @@ mk_arm done; WT="$ARMWT"
 drive "$WT" "$KEYVAR=sk_fixture"
 eqv "$LANE_RC" "0" "2a the lane exits 0"
 [ -s "$PI_MARK" ]; ck "2b the agent DID run (the gate passes what it cannot object to, and pi was spawned)" $?
-check_terminal "2c" done "agent-exit-0" 0
+check_terminal "2c" done "agent-exit-0" 0 checked
 # ⛔ THE PER-RUN VERDICT (review round 4, P2, measured). The lane LOG is append-only, so a re-dispatched
 # issue keeps the previous attempt's `outcome=` line and `tail -1` on the log can hand a reader that
 # earlier verdict while the current run is still working. The per-run sibling is what a liveness read must
@@ -609,7 +622,7 @@ pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
 export -f pi
 drive "$WT" "$KEYVAR=sk_fixture" MAX_LOAD=0
 eqv "$LANE_RC" "75" "6a a load refusal still exits 75"
-check_terminal "6b" refused "load-gate" 75
+check_terminal "6b" refused "load-gate" 75 checked
 
 # ── 6c: A GATE THAT COULD NOT RUN IS NOT A REFUSAL (review round 4, P2, measured) ────────────────
 # The gate writes its output to a file in `$O/state`, and the FIRST cut put that redirect inside the refusal
@@ -626,6 +639,11 @@ if [ "$(id -u)" != "0" ]; then
   chmod 700 "$ARMDIR/o/state" 2>/dev/null || true
   eqv "$LANE_RC" "78" "6c an UNWRITABLE \$O/state reports the gate as unable to run (78), not as a credential refusal"
   has "$(lastline)" "outcome=died reason=key-gate-not-run" "6d …and its outcome says the gate did not run"
+  # ⛔ `notrun` IS ASSERTED HERE, and that is the only arm that can produce it (review, P2): the field's
+  # "the gate broke" value used to be written but never required by any assertion, so a writer that lost
+  # the path — or an arm that simply forgot the field — stayed green. That is the same "a field omitted
+  # without a red" hole the change's own comment names for the escape.
+  has "$(lastline)" "keygate=notrun " "6d2 …and keygate=notrun says the GATE broke, not the credential"
   hasnt "$(cat "$(LOG)" 2>/dev/null)" "holds no value in the environment" "6e …and it does NOT claim the credential is missing (the credential was PRESENT here)"
   [ ! -s "$ARMDIR/o/state/capacity-refused-3331" ]; ck "6f …and nothing is yielded, because nothing was measured" $?
 else
@@ -659,9 +677,46 @@ case "$ebv" in
   *) bad "7d the dry-run refusal did not happen, so the arm measured nothing (tail: $ebv)" ;;
 esac
 eqv "$LANE_RC" "72" "7e …and exits 72"
-check_terminal "7f" refused "repo-target:REFUSED" 72
+check_terminal "7f" refused "repo-target:REFUSED" 72 unreached
 [ ! -s "$PI_MARK" ]; ck "7g …and no agent was started" $?
 unset TARGET_SLUG
+
+# ═══ 7h. THE VERDICT IS THE LAST `check=` LINE, NOT THE FIRST (review, P1, measured) ═════════════
+# `key_gate_assert` runs the box-default COMPANION before the verdict, and that companion prints
+# `check=warn …` on a box that pins a startup model. A `head -1` read classified the companion's WARNING as
+# the gate's answer: it matched no verdict, fell through to `notrun`, and a lane whose gate really said
+# `check=ok` — or really refused with 82 — reported `keygate=notrun`, i.e. the field accused the harness of a
+# bug while the credential was the problem (or was fine). Reproducing that with a real settings pin is
+# environment-dependent; the ORDER is the defect, so the stub below prints the same shape deterministically.
+mk_arm warnfirst; WT="$ARMWT"
+STUBH="$ARMDIR/harness"; mkdir -p "$STUBH"; cp "$HERE"/*.sh "$STUBH"/
+cat > "$STUBH/key-gate.sh" <<'KG'
+#!/usr/bin/env bash
+KEY_GATE_REFUSED=82
+KEY_GATE_VAR="KG_STUB_KEY"; KEY_GATE_REASON=""; KEY_GATE_MODEL="m"; KEY_GATE_PROVIDER="p"
+key_gate_assert() { # <label> [<home>] [<provider>] [<model>]
+  printf '[key-gate] %s check=warn reason=box-default-not-provisioned box_default=x model=m\n' "${1:-key-gate}"
+  if [ -n "${KG_STUB_REFUSE:-}" ]; then
+    printf '[key-gate] %s check=fail result=REFUSED reason=credential-missing var=KG_STUB_KEY provider=p model=m\n' "${1:-key-gate}"
+    return 82
+  fi
+  printf '[key-gate] %s check=ok var=KG_STUB_KEY provider=p model=m\n' "${1:-key-gate}"
+  return 0
+}
+KG
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi
+LANE_BIN="$STUBH/lane.sh" drive "$WT"
+eqv "$LANE_RC" "0" "7h1 the stub-companion lane runs"
+has "$(cat "$(LOG)" 2>/dev/null)" "check=warn reason=box-default-not-provisioned" \
+    "7h2 the fixture really printed the companion's warn line FIRST (else the arm measures nothing)"
+has "$(lastline)" "keygate=checked " "7h3 …and the terminal line still reports the VERDICT (checked), not the companion's warning nor notrun"
+: > "$PI_MARK"
+LANE_BIN="$STUBH/lane.sh" drive "$WT" "KG_STUB_REFUSE=1"
+eqv "$LANE_RC" "82" "7h4 the same stub refuses with 82 when told to"
+has "$(lastline)" "keygate=refused " "7h5 …and that refusal is reported as keygate=refused, not notrun (a warn-first refusal used to read as a harness bug)"
+[ ! -s "$PI_MARK" ]; ck "7h6 …and no agent was spawned for it" $?
+unset LANE_BIN
 
 # ═══ 8. THE VOCABULARY IS ONE SOURCE OF TRUTH ═══════════════════════════════════════════════════
 # A scanner's whole job is `grep -L '^outcome=\(done\|refused\|failed\|died\) reason=' "$O"/logs/lane-[0-9]*.log`
