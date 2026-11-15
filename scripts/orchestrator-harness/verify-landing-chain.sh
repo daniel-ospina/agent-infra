@@ -596,37 +596,66 @@ tree_of() { # tree_of <commit tsv>
 #
 # NO mtime WINDOW IS APPLIED TO `rail.out`, unlike the chain markers (F4), and the reason is
 # structural rather than an omission: this artifact is fetched as
-# `auto-<owner>-<repo>-<pr>.out` — repo-scoped AND PR-scoped by its NAME — and a PR lands at most
-# once, so no other repo's merge and no other landing of this number can produce it. The chain
-# markers carry none of that and therefore DO need the window.
+# `auto-<owner>-<repo>-<pr>.out` — repo-scoped AND PR-scoped by its NAME — and ONE attempt's words
+# only (its launcher TRUNCATES it before every launch: `auto-rail.sh:928`, `: > "$out"` then `>>`),
+# and a PR lands at most once, so no other repo's merge and no other landing of this number can
+# produce it. The chain markers carry none of that and therefore DO need the window.
+#
+# ⛔ AND `merge.log` / `chain.verdict` ARE NOT LANDING SOURCES EITHER (fresh-context review, round 7 —
+# BLOCKING: round 6 closed the `rail.out`-PRESENCE form and left the same false PASS open one layer
+# down, through CONTENT). This loop used to search all three artifacts for the landing LINE, and
+# `merge.log` is the per-PR CHAIN's own log: `merge-one.sh:122` sets `L="$O/logs/merge-$PR"` and
+# `merge-one.sh:1119-1123` runs the rail as `bash "$RAIL" "$PR" … >> "$L.log" 2>&1`, so the rail's
+# own `admin-merge: ✅ merged PR #N` line is written verbatim into the chain's log. Every CHAIN landing
+# therefore set `landed_file=merge.log`, took the PASS arm below, and left the chain FAIL UNREACHABLE
+# for the exact shape it exists for — the route reported as `auto-rail` on a landing the chain
+# performed, on the predicate whose exit 0 closes the capstone. `merge.log` carries no scope of its
+# own either: it is keyed by PR NUMBER ONLY (`lane-merge.sh:855`), so within the window another
+# repo's PR of the same number can supply a landing line (the hazard F4 closes for `merged-<PR>.done`).
+# So the rule is the SCOPE rule, not a text rule: `rail.out` is the only artifact that proves an
+# AUTO-RAIL landing, and a landing line in the chain's own artifacts proves the CHAIN route.
 emit_rail_landed() { # emit_rail_landed <dir> <pr> <mergedAt>
   local dir="$1" pr="$2" merged="$3"
-  local landed_file="" override_file="" saw_railout="" f
+  local landed_file="" chain_landing="" override_on_landing="" override_file="" saw_railout="" f
   for f in "$dir/rail.out" "$dir/merge.log" "$dir/chain.verdict"; do
     [ -s "$f" ] || continue
     [ "$f" = "$dir/rail.out" ] && saw_railout=1
-    # the rail's own success line, and it must name THIS PR — `([^0-9]|$)` so `#123` cannot match
-    # `#1234`. Everything else (a refusal, a DRAFT/CONFLICTED/DENIED block, an ALREADY-MERGED no-op,
-    # a bash start-failure written into the same file) is not a landing.
-    if [ -z "$landed_file" ] && grep -qE "admin-merge: .*merged PR #${pr}([^0-9]|$)" "$f" 2>/dev/null; then
-      landed_file="${f##*/}"
-    fi
-  done
-  for f in "$dir/rail.out" "$dir/merge.log" "$dir/chain.verdict"; do
-    [ -s "$f" ] || continue
     if grep -qE 'admin_merge_override|AGENT_ADMIN_MERGE_OVERRIDE' "$f" 2>/dev/null; then
       override_file="${f##*/}"
     fi
+    # the rail's own success line, and it must name THIS PR — `([^0-9]|$)` so `#123` cannot match
+    # `#1234`. Everything else (a refusal, a DRAFT/CONFLICTED/DENIED block, an ALREADY-MERGED no-op,
+    # a bash start-failure written into the same file) is not a landing.
+    grep -qE "admin-merge: .*merged PR #${pr}([^0-9]|$)" "$f" 2>/dev/null || continue
+    if [ "$f" = "$dir/rail.out" ]; then
+      landed_file="${f##*/}"
+      # ⛔ THE OVERRIDE IS SCOPED TO THE LANDING'S OWN ATTEMPT, and `rail.out` is that attempt by
+      # construction (truncated before every launch), so an override spelling in it IS on this
+      # landing. The chain artifacts are append-only ACROSS attempts and across heads —
+      # `merge-one.sh:1101-1105` records exactly this rule four lines above the redirect — so a PR
+      # refused once (a refusal that NAMES the audited route, `admin-merge.sh:11622`), fixed, and
+      # later landed normally would otherwise be reported as a certificate bypass: a false accusation
+      # and a false FAIL on a landing that took the ordinary route (the #3996 class).
+      grep -qE 'admin_merge_override|AGENT_ADMIN_MERGE_OVERRIDE' "$f" 2>/dev/null && override_on_landing="${f##*/}"
+    else
+      chain_landing="${f##*/}"
+    fi
   done
-  # ⛔ THE OVERRIDE TEST IS SCOPED TO A LANDING (round 6, second direction of the same evidence model).
-  # As a bare text match it read a REFUSAL that merely NAMES the override route as an override
-  # landing — `admin-merge.sh:11093`/`:11622` print `AGENT_ADMIN_MERGE_OVERRIDE=1. No evidence was
-  # posted and no merge attempted.`, and the predicate called that a record of a bypass. Two facts are
-  # needed and both must be measured: a landing HAPPENED, and the override is recorded ON IT.
-  if [ -n "$landed_file" ] && [ -n "$override_file" ]; then
-    emit rail_landed FAIL "the rail records a LANDING of #$pr ($landed_file) together with an admin-merge override spelling in the same artifact — condition 6 forbids a landing that bypassed the certificate"
+  # ⛔ TWO FACTS, BOTH MEASURED (round 6, second direction of the same evidence model): the round-6
+  # shape read a REFUSAL that merely NAMES the override route as an override landing. What the
+  # predicate needs is a landing that HAPPENED and an override recorded ON IT.
+  #
+  # ORDER: a `rail.out` landing is preferred over a chain landing line, and that is not a loophole.
+  # A PR lands at most once, so the two cannot both be true of the SAME landing: when the auto-rail
+  # merged, a later chain run of the rail reads `ALREADY MERGED` and writes NO landing line. The only
+  # way both appear is a foreign repo's same-numbered landing line in the number-keyed `merge.log`,
+  # and then `rail.out` — repo- AND PR-scoped by its name — is the one that is about THIS PR.
+  if [ -n "$landed_file" ] && [ -n "$override_on_landing" ]; then
+    emit rail_landed FAIL "the rail records a LANDING of #$pr ($landed_file) together with an admin-merge override spelling in the same attempt — condition 6 forbids a landing that bypassed the certificate"
   elif [ -n "$landed_file" ]; then
     emit rail_landed PASS "the rail's own landing line names #$pr ($landed_file) and no override is recorded on it — the rail landed this PR on its own (admin-merge.sh:12399/12402)"
+  elif [ -n "$chain_landing" ]; then
+    emit rail_landed FAIL "landed by the per-PR chain, not by auto-rail — the landing line for #$pr is in $chain_landing, which is the chain's own artifact, and the auto-rail's per-attempt scratch file (rail.out) records no landing of it; capstone condition 6 requires the rail to land it on its own"
   elif [ -f "$dir/chain.merged" ] || [ -s "$dir/chain.verdict" ]; then
     emit rail_landed FAIL "landed by the per-PR chain, not by auto-rail — capstone condition 6 requires the rail to land it on its own"
   elif [ -f "$dir/chain.merged.out-of-window" ] || [ -f "$dir/chain.verdict.out-of-window" ] || [ -f "$dir/merge.log.out-of-window" ]; then

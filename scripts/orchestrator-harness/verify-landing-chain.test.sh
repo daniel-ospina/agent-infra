@@ -255,6 +255,52 @@ run "$R" 424 9001 "CI" 1; group "$R" 424 10 9001 "unit-test" completed success "
 printf 'admin-merge: ✅ PR #424 is ALREADY MERGED (state=MERGED, mergedAt=%s) — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt\n' "$MERGED_AT" > "$R/pr-424/rail.out"
 verify "$R"
 ck "route-noop-only: a no-op attempt leaves the route UNKNOWN" "$(has "records NO landing of #424"; echo $?)"
+# ⛔ THE ROUND-6 FALSE PASS RE-OPENED THROUGH CONTENT (fresh-context review, round 7 — BLOCKING).
+# `merge.log` IS the per-PR chain's own log — `merge-one.sh:122` sets `L="$O/logs/merge-$PR"` and
+# `merge-one.sh:1119-1123` runs the rail with its stdout+stderr redirected into it — so a CHAIN landing
+# writes the rail's `admin-merge: ✅ merged PR #N at <sha>` line into the very artifact this predicate
+# used to accept as proof that auto-rail landed the PR on its own. Every chain landing then took the
+# PASS arm and the chain FAIL below it was UNREACHABLE, in the exact shape it exists for. No fixture
+# had ever written `merge.log`, which is why it survived round 6.
+R="$(mk route-chain-mergelog-alone 468)"
+run "$R" 468 9001 "CI" 1; group "$R" 468 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ✅ merged PR #468 at %s (state=MERGED confirmed via the API; branch head was %s…)\n' \
+  "$MERGE" "${HEAD:0:12}" > "$R/pr-468/merge.log"
+verify "$R"; rc=$?
+ck "route-chain-mergelog-alone: the chain's own log is not an auto-rail landing" \
+  "$(has "landed by the per-PR chain, not by auto-rail"; echo $?)"
+ck "route-chain-mergelog-alone: …the detail names the artifact the landing line came from" \
+  "$(has "is in merge.log"; echo $?)"
+ck "route-chain-mergelog-alone: …rail_landed is never PASS here" "$(has "PASS  rail_landed" && echo 1 || echo 0)"
+ck "route-chain-mergelog-alone: …so the run exits 1, never 0" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+# …and the REAL chain shape: the marker AND the log the chain's own rail run wrote.
+R="$(mk route-chain-mergelog 469)"
+run "$R" 469 9001 "CI" 1; group "$R" 469 10 9001 "unit-test" completed success "$MERGED_AT"
+: > "$R/pr-469/chain.merged"
+printf 'admin-merge: ✅ merged PR #469 at %s (state=MERGED confirmed via the API; branch head was %s…)\n[merge 469] MERGED via the rail (attempt 1)\n' \
+  "$MERGE" "${HEAD:0:12}" > "$R/pr-469/merge.log"
+verify "$R"; rc=$?
+ck "route-chain-mergelog: a chain landing is a rail_landed FAIL even with its log present" \
+  "$(has "landed by the per-PR chain, not by auto-rail"; echo $?)"
+ck "route-chain-mergelog: …never the PASS that closes the capstone" "$(has "PASS  rail_landed" && echo 1 || echo 0)"
+ck "route-chain-mergelog: …exit 1" "$([ "$rc" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ AN EARLIER ATTEMPT'S WORDS ARE NOT THIS LANDING'S (fresh-context review, round 7, finding 3).
+# The chain log is append-only across attempts and across heads (`merge-one.sh:1101-1105` records
+# exactly that rule four lines above the redirect), and a REFUSAL names the override route
+# (`admin-merge.sh:11622`: "AGENT_ADMIN_MERGE_OVERRIDE=1. No evidence was posted and no merge
+# attempted."). So a PR refused once, fixed, and then landed normally was reported as a certificate
+# BYPASS — a false accusation and a false FAIL on a correct landing (the #3996 class this predicate was
+# rewritten to stop producing).
+R="$(mk route-refusal-then-clean-landing 470)"
+run "$R" 470 9001 "CI" 1; group "$R" 470 10 9001 "unit-test" completed success "$MERGED_AT"
+rail_land "$R" 470
+printf 'admin-merge: ⛔ BLOCK — a red is visible on this tree.\n   AGENT_ADMIN_MERGE_OVERRIDE=1. No evidence was posted and no merge attempted.\n' \
+  > "$R/pr-470/merge.log"
+verify "$R"
+ck "route-refusal-then-clean-landing: a PRIOR refusal's override text does not fail this landing" \
+  "$(hasj '"check":"rail_landed","verdict":"PASS"'; echo $?)"
+ck "route-refusal-then-clean-landing: …and it is never reported as a bypass" \
+  "$(has "together with an admin-merge override spelling" && echo 1 || echo 0)"
 
 # ── case 14: an unmerged PR has no landing to verify ──────────────────────────────────────────────
 R="$(mk unmerged 417)"
@@ -745,9 +791,9 @@ mutation_verdict M7 "were NOT READ" \
   "reading through an unread body promotes a weaker comment marker — case F3c is discriminating"
 
 # M13 — decide `rail_landed` on the FILE's presence again (round 6's P1, the false PASS that survived
-# five rounds because no case ever put a refusal in `rail.out`). The mutant PASSes an ALREADY-MERGED
-# no-op as a landing and swallows the chain FAIL underneath it.
-MS="$(mutant rail-presence 'if [ -z "$landed_file" ] && grep -qE "admin-merge: .*merged PR #${pr}([^0-9]|$)" "$f" 2>/dev/null; then' 'if [ -z "$landed_file" ] && [ -s "$f" ]; then')" \
+# five rounds because no case ever put a refusal in `rail.out`). The mutant accepts ANY non-empty
+# artifact as carrying a landing and swallows the chain FAIL underneath it.
+MS="$(mutant rail-presence '    grep -qE "admin-merge: .*merged PR #${pr}([^0-9]|$)" "$f" 2>/dev/null || continue' '    grep -qE "admin-merge: .*merged PR #${pr}([^0-9]|$)" "$f" 2>/dev/null || :')" \
   || bad "M13 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
 R="$(mk mut-rail-presence 465)"
@@ -760,6 +806,13 @@ mutation_verdict M13 "landed by the per-PR chain, not by auto-rail" \
 
 # M14 — drop the known-late `started_at` guard (round 6's P2): a re-run created AFTER the merge is
 # pulled back into `waited` and a correctly green-gated landing is reported FAIL.
+# ⛔ THE NEEDLE WAS VACUOUS UNTIL ROUND 7 (fresh-context review, finding 2). It was
+# `"not part of this gate"`, a sentence this scenario NEVER prints: it is appended only from the
+# `later` bucket (groups with NO admitted attempt), and here the id-10 success completed 05:00 ≤ a
+# 05:05:55 merge, so the group's standing verdict is `green` and nothing is `later`. The mutant's grep
+# missed a string that was ABSENT FROM THE CORRECT RUN TOO, so `mutation_verdict` reported
+# "discriminating" without ever proving the mutant differs from the correct script. The needle is now
+# a line the correct run PRINTS and the mutant LOSES.
 MS="$(mutant p2-started-late '      started_late = (started_at != "-" && started_at != "" && started_at > merged)' '      started_late = 0')" \
   || bad "M14 mutation could not be applied"
 [ -n "$MS" ] || MS=/nonexistent-mutant
@@ -768,7 +821,7 @@ run "$R" 466 9001 "CI" 1
 group "$R" 466 10 9001 "unit-test" completed   success "2026-11-12T05:00:00Z" "2026-11-12T04:59:00Z"
 group "$R" 466 20 9001 "unit-test" in_progress -       "-"                "2026-11-12T09:30:00Z"
 verify_with "$MS" "$R"
-mutation_verdict M14 "not part of this gate" \
+mutation_verdict M14 "1 group(s) GREEN" \
   "ignoring a known post-merge start FAILs a landing that was gated correctly — case P2 is discriminating"
 
 # M15 — drop the UNUSABLE-window branch (round 6's P3): an unparseable `mergedAt` falls back to
@@ -784,6 +837,21 @@ printf '%s\t%s\t%s\t%s\n' 467 MERGED "not-a-timestamp" "$MERGE" > "$R/pr-467/pr.
 verify_with "$MS" "$R"
 mutation_verdict M15 "could not be parsed into a usable timestamp" \
   "an unusable window is reported as an absent artifact unless its own branch exists — case F4b is discriminating"
+
+# M16 — read a landing line in the CHAIN's own artifacts as an auto-rail landing (round 7's finding
+# 1): `merge.log` is the per-PR chain's log and `merge-one.sh` pipes the rail's own stdout into it, so
+# this is exactly the false PASS that reported every CHAIN landing as "the rail landed it on its own"
+# and left the chain FAIL unreachable.
+MS="$(mutant chain-log-as-rail '      chain_landing="${f##*/}"' '      landed_file="${f##*/}"')" \
+  || bad "M16 mutation could not be applied"
+[ -n "$MS" ] || MS=/nonexistent-mutant
+R="$(mk mut-chain-log-as-rail 471)"
+run "$R" 471 9001 "CI" 1; group "$R" 471 10 9001 "unit-test" completed success "$MERGED_AT"
+printf 'admin-merge: ✅ merged PR #471 at %s (state=MERGED confirmed via the API; branch head was %s…)\n' \
+  "$MERGE" "${HEAD:0:12}" > "$R/pr-471/merge.log"
+verify_with "$MS" "$R"
+mutation_verdict M16 "landed by the per-PR chain, not by auto-rail" \
+  "a chain landing's own log reads as an auto-rail landing — case route-chain-mergelog-alone is discriminating"
 
 # ── summary ──────────────────────────────────────────────────────────────────────────────────────
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
