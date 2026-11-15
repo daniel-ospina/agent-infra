@@ -2047,8 +2047,10 @@ SC_EOF
   # warned AND non-zero, unreadable → named as UNKNOWN rather than silently compared against ''. The
   # `/bin/true` arm directly above is the unreadable case and stays rc 0 for that reason.
   cp "$HERE/ai-drainer.sh" "$T4/drainer-fresh.sh"
-  grep -v '^Environment=LANE_TIMEOUT=' "$T4/svc.bak" >"$T4/units/eldato-ai-drainer.service"
-  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" >>"$T4/units/eldato-ai-drainer.service"
+  # One ExecStart and no pin: the shape a real no-pin unit has. (Appending to `svc.bak` would leave TWO
+  # ExecStart lines, which systemd rejects for a Type=simple unit — a fixture should look like the
+  # artifact it stands for, not like something the installer could never have written.)
+  printf 'ExecStart=/bin/bash %s\n' "$T4/drainer-fresh.sh" >"$T4/units/eldato-ai-drainer.service"
   out="$(unset LANE_TIMEOUT LANE_BACKSTOP_S; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
         DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" --status 2>&1)"; rc=$?
   check "installer: --status grades an ABSENT pin against the unit's OWN ExecStart script, and is clean when they agree" \
