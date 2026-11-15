@@ -963,7 +963,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
         // blanket "a span in a value slot is exempt" rule. That mutant is discriminating in BOTH
         // directions, which is why it carries two rows: it restores the false block on the quoted form
         // AND the fail-open on the unquoted spill.
-        const spanNeedle = 'const _opaqueInFlagSlot = tokens.some((t, i) => _isSpanTok(t) && !(_valueSlot[i] && _isQuotedSpanTok(t)));';
+        const spanNeedle = 'const _opaqueInFlagSlot = tokens.some((t, i) =>\n    _isSpanTok(t) && !((_valueSlot[i] && _isQuotedSpanTok(t)) || _isInlineOptValue(t)));';
         // Two reverts of the SAME line, because the split has two halves and each has its own failure:
         //   `always`  — the pre-P2 rule (any span fires)  → the quoted value slot is a false block again;
         //   `blanket` — a value-slot span is always exempt → the unquoted SPILL is a fail-open again.
@@ -973,14 +973,27 @@ if (typeof stripTypeScriptTypes !== "function" ||
         const ownReplacement = 'const _ownFlag = tokens.some((t) => _isPushDeleteFlagToken(t));';
         // ⛔ M16 — the MIXED-token rule (round-17 review cycle 3): a token that carries BOTH a bare
         // placeholder and a quoted-span mark has an unquoted part and CAN split, so it must lose the
-        // value-slot exemption. Reverting it to "always quoted" restores the fail-open.
-        const mixedNeedle = 'const mixed = t.includes(_SUBST_PLACEHOLDER);\n      tokens.push(mixed ? _SUBST_PLACEHOLDER : _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);';
-        const mixedReplacement = 'tokens.push(_SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);';
+        // value-slot exemption. Reverting it to "always quoted" restores the fail-open. The anchor is
+        // the PUSH line only (round-18): the `mixed` variable's own line is unchanged, so anchoring on
+        // both lines made this mutant's anchor stale the moment the push line grew the prefix.
+        const mixedNeedle = 'tokens.push(mixed ? (head + _SUBST_PLACEHOLDER) : (head + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX));';
+        const mixedReplacement = 'tokens.push(head + _SUBST_PLACEHOLDER + _QUOTED_SPAN_SUFFIX);';
+        // ⛔ M17/M18 — the ROUND-18 pins, each reverting EXACTLY ONE of that round's two decisions:
+        //   M17 `progAt` — ask "is this quote a `-c` program operand?" at the `'` again (the pre-fix
+        //       off-by-one), which glues the next command's first word onto the delete target;
+        //   M18 the span-token prefix — collapse the WHOLE token to the placeholder again, so an
+        //       attached `-o` value becomes a bare positional refspec and #653 false-blocks a literal.
+        // Both are asserted on the pure extractor for the same reason M12-M16 are (see above).
+        const progNeedle = 'const progAt = s[i - 1] === "$" ? i - 1 : i;';
+        const progReplacement = 'const progAt = i;';
+        const prefixNeedle = 'const raw = t.slice(0, t.indexOf(_QS_MARK));\n      const head = raw.endsWith("$") ? raw.slice(0, -1) : raw;';
+        const prefixReplacement = 'const head = "";';
         const cgPath = join(HERE, "classify-git.mjs");
         const cgSrc = readFileSync(cgPath, "utf-8");
         // (M15 mutates the SAME line M14 does, in the other direction, so btNeedle covers both anchors.)
         for (const [name, needle] of [["M12", qsNeedle], ["M14/M15", btNeedle],
-                                      ["M13", spanNeedle], ["M13d", ownNeedle], ["M16", mixedNeedle]]) {
+                                      ["M13", spanNeedle], ["M13d", ownNeedle], ["M16", mixedNeedle],
+                                      ["M17", progNeedle], ["M18", prefixNeedle]]) {
           expectTrue(`${name}: the mutation anchor is present (a stale anchor is a FAILURE, never a green)`,
             cgSrc.includes(needle), `missing ${JSON.stringify(needle)}`);
         }
@@ -995,7 +1008,8 @@ if (typeof stripTypeScriptTypes !== "function" ||
           return import(pathToFileURL(join(d, "main-worktree-guard", "classify-git.mjs")).href);
         };
         const allPresent = cgSrc.includes(qsNeedle) && cgSrc.includes(btNeedle)
-          && cgSrc.includes(spanNeedle) && cgSrc.includes(ownNeedle);
+          && cgSrc.includes(spanNeedle) && cgSrc.includes(ownNeedle)
+          && cgSrc.includes(mixedNeedle) && cgSrc.includes(progNeedle) && cgSrc.includes(prefixNeedle);
         if (allPresent) {
           const cases = [
             ["M12", "qs", qsNeedle, qsReplacement,
@@ -1019,6 +1033,13 @@ if (typeof stripTypeScriptTypes !== "function" ||
             ["M16", "mixed", mixedNeedle, mixedReplacement,
               "git push origin -o `echo \"x -d held\"`\"$(echo )\"", null,
               "the mixed-token rule reverted → a PARTLY unquoted word is exempted again (real delete, attr. nothing)"],
+            ["M17", "progAt", progNeedle, progReplacement,
+              `sh -c $'git push origin -d held/branch\necho done'`,
+              ["held/branch\necho", "done"],
+              "the ANSI-C program flag read at the `'` again → the next command's first word GLUES onto the target (a fail-open)"],
+            ["M18", "spanPrefix", prefixNeedle, prefixReplacement,
+              `git push origin -o"$(cat msg)" -d old`, ["$(…)", "old"],
+              "the span token's prefix discarded again → an attached `-o` value becomes a bare refspec and #653 false-blocks a literal"],
           ];
           for (const [name, tag, from, to, cmd, wantMutant, why] of cases) {
             const ext = await mutantExtractor(tag, from, to);
